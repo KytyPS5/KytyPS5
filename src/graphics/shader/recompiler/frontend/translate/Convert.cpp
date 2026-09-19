@@ -89,11 +89,12 @@ void Translator::V_CVT_16_F16(const Decoder::Instruction& inst, bool signed_valu
 	if (signed_value) {
 		const auto converted =
 		    ConvertF32ToI32Saturated(value, -32768.0f, 32768.0f, 32767.0f, 0xffff8000u, 0x7fffu);
-		Write16Bits(DestinationOperand(inst), ir.BitwiseAnd(converted, IR::U32(IR::Value(0xffffu))));
+		Write16Bits(DestinationOperand(inst),
+		            ir.BitwiseAnd(converted, IR::U32(IR::Value(0xffffu))));
 		return;
 	}
 	Write16Bits(DestinationOperand(inst),
-	         ConvertF32ToU32Saturated(value, 65536.0f, 65535.0f, 0xffffu));
+	            ConvertF32ToU32Saturated(value, 65536.0f, 65535.0f, 0xffffu));
 }
 
 void Translator::V_CVT_RPI_I32_F32(const Decoder::Instruction& inst) {
@@ -141,10 +142,10 @@ void Translator::V_CVT_OFF_F32_I4(const Decoder::Instruction& inst) {
 }
 
 void Translator::V_CVT_PKRTZ_F16_F32(const Decoder::Instruction& inst) {
-	const auto lhs = ApplyF32ResultModifiers(
-	    inst.dst, IR::F32(ReadOperand(SourceAt(inst, 0), IR::Type::F32)));
-	const auto rhs = ApplyF32ResultModifiers(
-	    inst.dst, IR::F32(ReadOperand(SourceAt(inst, 1), IR::Type::F32)));
+	const auto lhs =
+	    ApplyF32ResultModifiers(inst.dst, IR::F32(ReadOperand(SourceAt(inst, 0), IR::Type::F32)));
+	const auto rhs =
+	    ApplyF32ResultModifiers(inst.dst, IR::F32(ReadOperand(SourceAt(inst, 1), IR::Type::F32)));
 	WriteOperand(DestinationOperand(inst), ir.Emit(IR::ValueOpcode::PackFloat2x16Rtz, {lhs, rhs}));
 }
 

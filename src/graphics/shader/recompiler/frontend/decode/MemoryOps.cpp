@@ -107,11 +107,9 @@ constexpr MemoryOpcodeInfo DS_OPCODE_LIST[] = {
     {0x4du, Opcode::DS_WRITE_B64, 2, 32},        {0x4eu, Opcode::DS_WRITE2_B64, 4, 32},
     {0x4fu, Opcode::DS_WRITE2ST64_B64, 4, 32},   {0x76u, Opcode::DS_READ_B64, 2, 32},
     {0x77u, Opcode::DS_READ2_B64, 4, 32},        {0x78u, Opcode::DS_READ2ST64_B64, 4, 32},
-    {0xa1u, Opcode::DS_WRITE_B16_D16_HI, 1, 16},
-    {0xa6u, Opcode::DS_READ_U16_D16, 1, 16},
-    {0xa7u, Opcode::DS_READ_U16_D16_HI, 1, 16},
-    {0xb0u, Opcode::DS_WRITE_ADDTID_B32, 1, 32}, {0xb1u, Opcode::DS_READ_ADDTID_B32, 1, 32},
-    {0xb3u, Opcode::DS_BPERMUTE_B32, 1, 32},
+    {0xa1u, Opcode::DS_WRITE_B16_D16_HI, 1, 16}, {0xa6u, Opcode::DS_READ_U16_D16, 1, 16},
+    {0xa7u, Opcode::DS_READ_U16_D16_HI, 1, 16},  {0xb0u, Opcode::DS_WRITE_ADDTID_B32, 1, 32},
+    {0xb1u, Opcode::DS_READ_ADDTID_B32, 1, 32},  {0xb3u, Opcode::DS_BPERMUTE_B32, 1, 32},
     {0xdeu, Opcode::DS_WRITE_B96, 3, 32},        {0xdfu, Opcode::DS_WRITE_B128, 4, 32},
     {0xfeu, Opcode::DS_READ_B96, 3, 32},         {0xffu, Opcode::DS_READ_B128, 4, 32},
 };
@@ -392,8 +390,7 @@ void DecodeDs(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, 
 	}
 	if (inst.gds &&
 	    (inst.opcode == Opcode::DS_SWIZZLE_B32 || inst.opcode == Opcode::DS_BPERMUTE_B32 ||
-	     inst.opcode == Opcode::DS_WRITE_ADDTID_B32 ||
-	     inst.opcode == Opcode::DS_READ_ADDTID_B32)) {
+	     inst.opcode == Opcode::DS_WRITE_ADDTID_B32 || inst.opcode == Opcode::DS_READ_ADDTID_B32)) {
 		SetUnsupported(inst, Family::DS, opcode, "DS lane operation is available only for LDS");
 	}
 	if (inst.opcode == Opcode::DS_WRITE_ADDTID_B32 && data1 != 0u) {
@@ -421,8 +418,7 @@ void DecodeDs(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, 
 	}
 
 	DecodeVectorGpr(vdst, inst.dst);
-	if (inst.opcode == Opcode::DS_READ_U16_D16 ||
-	    inst.opcode == Opcode::DS_READ_U16_D16_HI) {
+	if (inst.opcode == Opcode::DS_READ_U16_D16 || inst.opcode == Opcode::DS_READ_U16_D16_HI) {
 		// Native D16 reads update only the selected destination half. Reuse the partial
 		// destination representation so typed IR translation preserves the other half.
 		inst.dst.sdwa_sel = inst.opcode == Opcode::DS_READ_U16_D16 ? 4u : 5u;

@@ -96,62 +96,64 @@ std::string rt_print(const char* func, const HW::RenderTarget& rt) {
 
 	dst += fmt::format("\t base.addr                       = 0x{:016x}\n", rt.base.addr);
 	dst += fmt::format("\t view.base_array_slice_index     = 0x{:08x}\n",
-	                  rt.view.base_array_slice_index);
+	                   rt.view.base_array_slice_index);
 	dst += fmt::format("\t view.last_array_slice_index     = 0x{:08x}\n",
-	                  rt.view.last_array_slice_index);
-	dst += fmt::format("\t view.current_mip_level          = 0x{:08x}\n", rt.view.current_mip_level);
+	                   rt.view.last_array_slice_index);
+	dst +=
+	    fmt::format("\t view.current_mip_level          = 0x{:08x}\n", rt.view.current_mip_level);
 	dst += fmt::format("\t info.fmask_compression_enable   = {}\n",
-	                  rt.info.fmask_compression_enable ? "true" : "false");
+	                   rt.info.fmask_compression_enable ? "true" : "false");
 
 	dst += fmt::format("\t info.fmask_data_compression_disable = {}\n",
-	                  rt.info.fmask_data_compression_disable ? "true" : "false");
+	                   rt.info.fmask_data_compression_disable ? "true" : "false");
 	dst += fmt::format("\t info.fmask_one_frag_mode        = {}\n",
-	                  rt.info.fmask_one_frag_mode ? "true" : "false");
+	                   rt.info.fmask_one_frag_mode ? "true" : "false");
 
 	dst += fmt::format("\t info.cmask_fast_clear_enable    = {}\n",
-	                  rt.info.cmask_fast_clear_enable ? "true" : "false");
+	                   rt.info.cmask_fast_clear_enable ? "true" : "false");
 	dst += fmt::format("\t info.dcc_compression_enable     = {}\n",
-	                  rt.info.dcc_compression_enable ? "true" : "false");
+	                   rt.info.dcc_compression_enable ? "true" : "false");
 	dst += fmt::format("\t info.format                     = 0x{:08x}\n",
-	                  static_cast<uint32_t>(rt.info.format));
+	                   static_cast<uint32_t>(rt.info.format));
 	dst += fmt::format("\t info.channel_type               = 0x{:08x}\n",
-	                  static_cast<uint32_t>(rt.info.channel_type));
+	                   static_cast<uint32_t>(rt.info.channel_type));
 	dst += fmt::format("\t info.channel_order              = 0x{:08x}\n",
-	                  static_cast<uint32_t>(rt.info.channel_order));
+	                   static_cast<uint32_t>(rt.info.channel_order));
 	dst += fmt::format("\t info.blend_bypa                 = {}\n",
-	                  rt.info.blend_bypass ? "true" : "false");
+	                   rt.info.blend_bypass ? "true" : "false");
 	dst += fmt::format("\t info.blend_clamp                = {}\n",
-	                  rt.info.blend_clamp ? "true" : "false");
+	                   rt.info.blend_clamp ? "true" : "false");
 	dst += fmt::format("\t info.round_mode                 = {}\n",
-	                  rt.info.round_mode ? "true" : "false");
+	                   rt.info.round_mode ? "true" : "false");
 	dst += fmt::format("\t attrib.force_dest_alpha_to_one  = {}\n",
-	                  rt.attrib.force_dest_alpha_to_one ? "true" : "false");
+	                   rt.attrib.force_dest_alpha_to_one ? "true" : "false");
 	dst += fmt::format("\t attrib.num_samples              = 0x{:08x}\n", rt.attrib.num_samples);
 	dst += fmt::format("\t attrib.num_fragments            = 0x{:08x}\n", rt.attrib.num_fragments);
 	dst += fmt::format("\t attrib2.width                   = 0x{:08x}\n", rt.attrib2.width);
 	dst += fmt::format("\t attrib2.height                  = 0x{:08x}\n", rt.attrib2.height);
-	dst += fmt::format("\t attrib2.num_mip_levels          = 0x{:08x}\n", rt.attrib2.num_mip_levels);
+	dst +=
+	    fmt::format("\t attrib2.num_mip_levels          = 0x{:08x}\n", rt.attrib2.num_mip_levels);
 	dst += fmt::format("\t attrib3.depth                   = 0x{:08x}\n", rt.attrib3.depth);
 	dst += fmt::format("\t attrib3.tile_mode               = 0x{:08x}\n",
-	                  static_cast<uint32_t>(rt.attrib3.tile_mode));
+	                   static_cast<uint32_t>(rt.attrib3.tile_mode));
 	dst += fmt::format("\t attrib3.dimension               = 0x{:08x}\n", rt.attrib3.dimension);
 	dst += fmt::format("\t attrib3.metadata_pipe_aligned   = {}\n",
-	                  rt.attrib3.metadata_pipe_aligned ? "true" : "false");
+	                   rt.attrib3.metadata_pipe_aligned ? "true" : "false");
 	dst += fmt::format("\t attrib3.write_vrs_rate_hint_to_cmask = {}\n",
-	                  rt.attrib3.write_vrs_rate_hint_to_cmask ? "true" : "false");
+	                   rt.attrib3.write_vrs_rate_hint_to_cmask ? "true" : "false");
 	dst += fmt::format("\t dcc.max_uncompressed_block_size = 0x{:08x}\n",
-	                  rt.dcc.max_uncompressed_block_size);
+	                   rt.dcc.max_uncompressed_block_size);
 	dst += fmt::format("\t dcc.max_compressed_block_size   = 0x{:08x}\n",
-	                  rt.dcc.max_compressed_block_size);
+	                   rt.dcc.max_compressed_block_size);
 	dst += fmt::format("\t dcc.color_transform             = 0x{:08x}\n", rt.dcc.color_transform);
 	dst += fmt::format("\t dcc.overwrite_combiner_disable  = {}\n",
-	                  rt.dcc.overwrite_combiner_disable ? "true" : "false");
+	                   rt.dcc.overwrite_combiner_disable ? "true" : "false");
 	dst += fmt::format("\t dcc.independent_block_size      = 0x{:02x}\n",
-	                  static_cast<uint8_t>(rt.dcc.independent_block_size));
+	                   static_cast<uint8_t>(rt.dcc.independent_block_size));
 	dst += fmt::format("\t data_write_on_dcc_clear_to_reg  = {}\n",
-	                  rt.dcc.data_write_on_dcc_clear_to_reg ? "true" : "false");
+	                   rt.dcc.data_write_on_dcc_clear_to_reg ? "true" : "false");
 	dst += fmt::format("\t dcc.dcc_clear_key_enable        = {}\n",
-	                  rt.dcc.dcc_clear_key_enable ? "true" : "false");
+	                   rt.dcc.dcc_clear_key_enable ? "true" : "false");
 	dst += fmt::format("\t cmask.addr                      = 0x{:016x}\n", rt.cmask.addr);
 	dst += fmt::format("\t fmask.addr                      = 0x{:016x}\n", rt.fmask.addr);
 	dst += fmt::format("\t clear_word0.word0               = 0x{:08x}\n", rt.clear_word0.word0);
@@ -756,8 +758,8 @@ static ScissorRect ScissorRectOffset(ScissorRect r, int x, int y) {
 }
 
 static ScissorRect ScissorRectIntersect(const ScissorRect& a, const ScissorRect& b) {
-	return {std::max(a.left, b.left), std::max(a.top, b.top),
-	        std::min(a.right, b.right), std::min(a.bottom, b.bottom)};
+	return {std::max(a.left, b.left), std::max(a.top, b.top), std::min(a.right, b.right),
+	        std::min(a.bottom, b.bottom)};
 }
 
 static ScissorRect ScissorRectClamp(ScissorRect r, uint32_t width, uint32_t height) {
@@ -808,16 +810,18 @@ ScissorRect calc_final_scissor(const HW::ScreenViewport& vp, const HW::ScanModeC
 	EXIT_IF(viewport_index >= std::size(vp.viewports));
 	ScissorRect final {vp.screen_scissor_left, vp.screen_scissor_top, vp.screen_scissor_right,
 	                   vp.screen_scissor_bottom};
-	const auto intersect = [&](ScissorRect rect, bool window_offset) {
+	const auto  intersect = [&](ScissorRect rect, bool window_offset) {
 		if (window_offset) {
 			rect = ScissorRectOffset(rect, vp.window_offset_x, vp.window_offset_y);
 		}
 		final = ScissorRectIntersect(final, rect);
 	};
 	intersect({vp.window_scissor_left, vp.window_scissor_top, vp.window_scissor_right,
-	           vp.window_scissor_bottom}, vp.window_scissor_window_offset_enable);
+	           vp.window_scissor_bottom},
+	          vp.window_scissor_window_offset_enable);
 	intersect({vp.generic_scissor_left, vp.generic_scissor_top, vp.generic_scissor_right,
-	           vp.generic_scissor_bottom}, vp.generic_scissor_window_offset_enable);
+	           vp.generic_scissor_bottom},
+	          vp.generic_scissor_window_offset_enable);
 
 	const auto& viewport = vp.viewports[viewport_index];
 	if (smc.vport_scissor_enable) {
@@ -837,7 +841,8 @@ ScissorRect calc_final_scissor(const HW::ScreenViewport& vp, const HW::ScanModeC
 				}
 
 				intersect({vp.clip_rect_left[i], vp.clip_rect_top[i], vp.clip_rect_right[i],
-				           vp.clip_rect_bottom[i]}, vp.clip_rect_window_offset_enable[i]);
+				           vp.clip_rect_bottom[i]},
+				          vp.clip_rect_window_offset_enable[i]);
 			}
 		} else {
 			static std::atomic<uint32_t> log_count {0};

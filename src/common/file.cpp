@@ -349,7 +349,7 @@ std::vector<std::byte> File::ReadWholeBuffer() {
 
 	EXIT_IF((s >> 32u) != 0);
 
-	const auto            read_size = static_cast<uint32_t>(s);
+	const auto             read_size = static_cast<uint32_t>(s);
 	std::vector<std::byte> buf(read_size);
 
 	Read(buf.data(), read_size);

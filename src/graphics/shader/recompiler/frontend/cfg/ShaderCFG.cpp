@@ -1150,8 +1150,7 @@ bool IsEnclosingLinearExit(const Graph& graph, uint32_t header, uint32_t block_i
 	       block->successors.size() == 1u) {
 		block = graph.FindBlock(block->successors.front());
 	}
-	if (block == nullptr || graph.Dominates(header, block->id) ||
-	    block->predecessors.empty()) {
+	if (block == nullptr || graph.Dominates(header, block->id) || block->predecessors.empty()) {
 		return false;
 	}
 	return std::ranges::all_of(block->predecessors, [&](uint32_t predecessor) {
@@ -1789,7 +1788,7 @@ bool RouteOneSharedArm(Graph& graph, uint32_t original_block_count, uint32_t out
 				continue;
 			}
 
-			const auto continuation = graph.FindNearestCommonPostDominator(shared, body);
+			const auto  continuation       = graph.FindNearestCommonPostDominator(shared, body);
 			const auto* continuation_block = graph.FindBlock(continuation);
 			if (continuation_block == nullptr || continuation == other ||
 			    CanReachBefore(graph, other, continuation, UINT32_MAX)) {
@@ -1808,15 +1807,15 @@ bool RouteOneSharedArm(Graph& graph, uint32_t original_block_count, uint32_t out
 				}
 			}
 			const auto first_arm = std::min(continuation, other);
-			if (outer_predecessors.empty() || inner_predecessors.empty() ||
-			    external_predecessor || first_arm >= original_block_count ||
-			    outer_id >= inner_id || inner_id >= first_arm) {
+			if (outer_predecessors.empty() || inner_predecessors.empty() || external_predecessor ||
+			    first_arm >= original_block_count || outer_id >= inner_id ||
+			    inner_id >= first_arm) {
 				continue;
 			}
 
 			const auto route_select =
 			    AppendGotoSelectBlock(graph, route_variable, other, continuation);
-			const auto inner_merge  = AppendSyntheticBranchBlock(graph, route_select);
+			const auto inner_merge = AppendSyntheticBranchBlock(graph, route_select);
 			const auto outer_continue =
 			    AppendGotoSetBlock(graph, route_variable, false, route_select);
 			const auto inner_continue =
@@ -2201,16 +2200,16 @@ bool Structurize(Graph& graph) {
 	const auto failure_kind = structured.failure_kind;
 	// Structurization inserts and renumbers blocks. Recover source identity for a
 	// semantic block; a synthetic block has no corresponding original diagnostic ID.
-	const auto* failed = structured.FindBlock(structured.failure_block);
-	const auto original = std::ranges::find_if(graph.blocks, [&](const BasicBlock& block) {
+	const auto* failed         = structured.FindBlock(structured.failure_block);
+	const auto  original       = std::ranges::find_if(graph.blocks, [&](const BasicBlock& block) {
 		return failed != nullptr && failed->inst_begin != failed->inst_end &&
 		       block.inst_begin == failed->inst_begin && block.inst_end == failed->inst_end &&
 		       block.start_pc == failed->start_pc && block.end_pc == failed->end_pc;
 	});
-	const auto failure_block = original != graph.blocks.end() ? original->id : UINT32_MAX;
-	auto failure_reason = std::move(structured.unsupported_reason);
-	Graph routed = graph;
-	const auto route_budget = static_cast<uint32_t>(graph.blocks.size());
+	const auto  failure_block  = original != graph.blocks.end() ? original->id : UINT32_MAX;
+	auto        failure_reason = std::move(structured.unsupported_reason);
+	Graph       routed         = graph;
+	const auto  route_budget   = static_cast<uint32_t>(graph.blocks.size());
 	// Apply one route at a time and retry. Eagerly routing every matching diamond can
 	// rewrite unrelated selections that were already structurally valid.
 	for (uint32_t route_variable = 0; route_variable < route_budget; route_variable++) {

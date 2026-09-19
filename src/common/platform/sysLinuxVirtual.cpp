@@ -56,9 +56,7 @@ static int get_protection_flag(Mode mode) {
 		case Mode::Execute: protect = PROT_EXEC; break;
 		case Mode::ExecuteRead: protect = PROT_EXEC | PROT_READ; break; // NOLINT
 		case Mode::ExecuteWrite:
-		case Mode::ExecuteReadWrite:
-			protect = PROT_EXEC | PROT_WRITE | PROT_READ;
-			break; // NOLINT
+		case Mode::ExecuteReadWrite: protect = PROT_EXEC | PROT_WRITE | PROT_READ; break; // NOLINT
 		case Mode::NoAccess:
 		default: protect = PROT_NONE; break;
 	}

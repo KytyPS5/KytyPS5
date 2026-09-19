@@ -55,6 +55,10 @@ static bool BindRenderDocApi(void* module) {
 	g_api = static_cast<RENDERDOC_API_1_6_0*>(api);
 	g_api->SetCaptureKeys(nullptr, 0);
 	g_api->UnloadCrashHandler();
+	g_api->SetCaptureOptionU32(eRENDERDOC_Option_CaptureCallstacks, 0);
+	g_api->SetCaptureOptionU32(eRENDERDOC_Option_VerifyBufferAccess, 0);
+	g_api->SetCaptureOptionU32(eRENDERDOC_Option_APIValidation, 0);
+	g_api->MaskOverlayBits(eRENDERDOC_Overlay_None, eRENDERDOC_Overlay_None);
 	LOGF("RenderDoc: API 1.6.0 bound\n");
 	return true;
 }
@@ -168,13 +172,17 @@ void RenderDocOnGuestFlip(RenderContext& renderer) {
 		}
 	}
 
-	// Capture boundaries follow presentation and exclude concurrent queue access.
-	Common::LockGuard render_lock(renderer.GetMutex());
-	Common::LockGuard queue_lock(renderer.GetGraphics().queue_mutex);
 	if (state == RenderDocState::Requested) {
+		Common::LockGuard render_lock(renderer.GetMutex());
+		Common::LockGuard queue_lock(renderer.GetGraphics().queue_mutex);
 		StartCapture();
 	} else {
-		const auto ok = g_api->EndFrameCapture(nullptr, nullptr);
+		uint32_t ok = 0;
+		{
+			Common::LockGuard render_lock(renderer.GetMutex());
+			Common::LockGuard queue_lock(renderer.GetGraphics().queue_mutex);
+			ok = g_api->EndFrameCapture(nullptr, nullptr);
+		}
 		g_state.store(RenderDocState::Idle, std::memory_order_release);
 		LOGF(ok != 0 ? "RenderDoc: capture finished\n" : "RenderDoc: capture failed\n");
 	}

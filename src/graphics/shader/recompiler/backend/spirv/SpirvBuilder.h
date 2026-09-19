@@ -22,7 +22,7 @@ struct TypeAnnotation {
 };
 
 struct DeferredPhi {
-	size_t word_offset    = 0;
+	size_t word_offset = 0;
 };
 
 class Builder {

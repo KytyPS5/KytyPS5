@@ -21,16 +21,28 @@ struct Lifecycle {
 
 enum class ShaderOptimizationType { None, Size, Performance };
 
-enum class LogDirection { Silent, Console, File };
+enum class LogDirection { Silent, Console, File, ConsoleAndFile };
+
+enum class LogLevel { Trace, Debug, Info, Warning, Error, Critical, Off };
+
+struct LogSinkConfig {
+	LogLevel level   = LogLevel::Info;
+	bool     enabled = true;
+};
+
+struct LogConfig {
+	LogSinkConfig console;
+	LogSinkConfig file;
+};
 
 enum class PresentMode { Fifo, Mailbox, Immediate };
 
 using Keymap = std::vector<std::string>;
 
-constexpr uint32_t DEFAULT_CONSOLE_LANGUAGE = 1;
-constexpr uint32_t MAX_CONSOLE_LANGUAGE     = 29;
-constexpr std::size_t MAX_USER_NAME_LENGTH = 16;
-constexpr int32_t DEFAULT_USER_ID           = 1000;
+constexpr uint32_t    DEFAULT_CONSOLE_LANGUAGE = 1;
+constexpr uint32_t    MAX_CONSOLE_LANGUAGE     = 29;
+constexpr std::size_t MAX_USER_NAME_LENGTH     = 16;
+constexpr int32_t     DEFAULT_USER_ID          = 1000;
 
 constexpr bool IsConfiguredUserIdValid(int32_t user_id) {
 	constexpr int32_t USER_ID_EVERYONE = 0xfe;
@@ -39,10 +51,10 @@ constexpr bool IsConfiguredUserIdValid(int32_t user_id) {
 }
 
 struct ConfigOptions {
-	uint32_t               screen_width                = 1280;
-	uint32_t               screen_height               = 720;
-	std::string            user_name                   = "Kyty";
-	int32_t                user_id                     = DEFAULT_USER_ID;
+	uint32_t               screen_width  = 1280;
+	uint32_t               screen_height = 720;
+	std::string            user_name     = "Kyty";
+	int32_t                user_id       = DEFAULT_USER_ID;
 	std::string            audio_input_device;
 	PresentMode            present_mode                = PresentMode::Mailbox;
 	int32_t                gpu_index                   = -1;
@@ -54,19 +66,20 @@ struct ConfigOptions {
 	bool                   vulkan_validation_enabled   = false;
 	bool                   shader_validation_enabled   = false;
 	ShaderOptimizationType shader_optimization_type    = ShaderOptimizationType::None;
-	LogDirection           shader_log_direction        = LogDirection::Silent;
+	LogDirection           shader_log_direction        = LogDirection::File;
 	std::filesystem::path  shader_log_folder           = "_Shaders";
 	bool                   command_buffer_dump_enabled = false;
 	std::filesystem::path  command_buffer_dump_folder  = "_Buffers";
 	bool                   graphics_debug_dump_enabled = false;
-	LogDirection           printf_direction            = LogDirection::Silent;
-	std::filesystem::path  printf_output_file          = "_kyty.txt";
-	bool                   profiler_enabled            = false;
-	bool                   spirv_debug_printf_enabled  = false;
+	LogDirection           printf_direction            = LogDirection::File;
+	std::filesystem::path  printf_output_file          = "_Kyty.txt";
+	LogConfig              log_config;
+	bool                   profiler_enabled                = false;
+	bool                   spirv_debug_printf_enabled      = false;
 	bool                   gpu_assisted_validation_enabled = false;
-	bool                   renderdoc_enabled           = false;
-	bool                   readback_linear_images      = false;
-	bool                   playgo_hack_enabled         = false;
+	bool                   renderdoc_enabled               = false;
+	bool                   readback_linear_images          = false;
+	bool                   playgo_hack_enabled             = false;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	bool red_zone_protection_enabled = false;
 #endif
@@ -75,19 +88,19 @@ struct ConfigOptions {
 
 void Load(const ConfigOptions& cfg);
 
-uint32_t GetScreenWidth();
-uint32_t GetScreenHeight();
+uint32_t           GetScreenWidth();
+uint32_t           GetScreenHeight();
 const std::string& GetUserName();
-int32_t  GetUserId();
+int32_t            GetUserId();
 const std::string& GetAudioInputDevice();
-PresentMode GetPresentMode();
-int32_t GetGpuIndex();
-bool     FullscreenEnabled();
-bool     VrEnabled();
-bool     AmdCpuEnabled();
-uint32_t GetVblankFrequency();
-uint32_t GetConsoleLanguage();
-bool     VulkanValidationEnabled();
+PresentMode        GetPresentMode();
+int32_t            GetGpuIndex();
+bool               FullscreenEnabled();
+bool               VrEnabled();
+bool               AmdCpuEnabled();
+uint32_t           GetVblankFrequency();
+uint32_t           GetConsoleLanguage();
+bool               VulkanValidationEnabled();
 
 bool                   ShaderValidationEnabled();
 ShaderOptimizationType GetShaderOptimizationType();
@@ -101,6 +114,10 @@ bool GraphicsDebugDumpEnabled();
 
 LogDirection          GetPrintfDirection();
 std::filesystem::path GetPrintfOutputFile();
+
+LogConfig     GetLogConfig();
+LogSinkConfig GetConsoleLogConfig();
+LogSinkConfig GetFileLogConfig();
 
 bool ProfilerEnabled();
 

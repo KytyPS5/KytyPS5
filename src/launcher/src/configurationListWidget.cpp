@@ -260,16 +260,17 @@ ConfigurationListWidget::~ConfigurationListWidget() {
 
 void ConfigurationListWidget::changeEvent(QEvent* event) {
 	QWidget::changeEvent(event);
-	if (event->type() == QEvent::ApplicationPaletteChange || event->type() == QEvent::PaletteChange) {
+	if (event->type() == QEvent::ApplicationPaletteChange ||
+	    event->type() == QEvent::PaletteChange) {
 		UpdateToolbarIcons();
 	}
 }
 
 void ConfigurationListWidget::UpdateToolbarIcons() {
-	const auto color = palette().color(QPalette::Window).lightness() < 128 ? QColor(Qt::white)
-	                                                                      : QColor(Qt::black);
+	const auto color =
+	    palette().color(QPalette::Window).lightness() < 128 ? QColor(Qt::white) : QColor(Qt::black);
 	const auto set_icon = [&color](QToolButton* button, const QString& resource) {
-		auto pixmap = QIcon(resource).pixmap(button->iconSize(), button->devicePixelRatioF());
+		auto     pixmap = QIcon(resource).pixmap(button->iconSize(), button->devicePixelRatioF());
 		QPainter painter(&pixmap);
 		painter.setCompositionMode(QPainter::CompositionMode_SourceIn);
 		painter.fillRect(pixmap.rect(), color);

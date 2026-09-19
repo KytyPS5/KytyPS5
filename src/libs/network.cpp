@@ -1122,8 +1122,7 @@ static int ConvertHostSockaddr(const sockaddr_storage* addr, SocketLength addrle
 		return -1;
 	}
 
-	if (addr->ss_family != AF_INET ||
-	    addrlen < static_cast<SocketLength>(sizeof(sockaddr_in))) {
+	if (addr->ss_family != AF_INET || addrlen < static_cast<SocketLength>(sizeof(sockaddr_in))) {
 		*Posix::GetErrorAddr() = Posix::POSIX_EOPNOTSUPP;
 		return -1;
 	}
@@ -2048,7 +2047,7 @@ int KYTY_SYSV_ABI Getsockopt(int s, int level, int optname, void* optval, uint32
 	}
 	if (socket_error && len >= static_cast<SocketLength>(sizeof(int))) {
 		auto* error = static_cast<int*>(optval);
-		*error = ConvertHostSocketError(*error);
+		*error      = ConvertHostSocketError(*error);
 	}
 	*optlen = static_cast<uint32_t>(len);
 	return 0;
@@ -2274,10 +2273,10 @@ int KYTY_SYSV_ABI Select(int nfds, void* readfds, void* writefds, void* exceptfd
 	FD_ZERO(&host_except);
 
 	std::vector<std::pair<int, NativeSocket>> descriptors;
-	int host_nfds = 0;
+	int                                       host_nfds = 0;
 	for (int fd = 0; fd < nfds; fd++) {
-		const bool read = GuestFdIsSet(readfds, fd);
-		const bool write = GuestFdIsSet(writefds, fd);
+		const bool read   = GuestFdIsSet(readfds, fd);
+		const bool write  = GuestFdIsSet(writefds, fd);
 		const bool except = GuestFdIsSet(exceptfds, fd);
 		if (!read && !write && !except) {
 			continue;
@@ -2288,7 +2287,7 @@ int KYTY_SYSV_ABI Select(int nfds, void* readfds, void* writefds, void* exceptfd
 			socket = fd;
 		} else
 #endif
-		if (!GetSocketBackend(fd, &socket)) {
+		    if (!GetSocketBackend(fd, &socket)) {
 			return -1;
 		}
 #if defined(_WIN32)
@@ -2315,7 +2314,7 @@ int KYTY_SYSV_ABI Select(int nfds, void* readfds, void* writefds, void* exceptfd
 		}
 	}
 
-	timeval host_timeout {};
+	timeval  host_timeout {};
 	timeval* host_timeout_ptr = nullptr;
 	if (timeout != nullptr) {
 		const auto* guest_timeout = static_cast<const NetTimeval*>(timeout);
@@ -2323,16 +2322,17 @@ int KYTY_SYSV_ABI Select(int nfds, void* readfds, void* writefds, void* exceptfd
 		    guest_timeout->tv_usec >= 1'000'000) {
 			return SetGuestSocketError(Posix::POSIX_EINVAL);
 		}
-		host_timeout.tv_sec = static_cast<decltype(host_timeout.tv_sec)>(guest_timeout->tv_sec);
+		host_timeout.tv_sec  = static_cast<decltype(host_timeout.tv_sec)>(guest_timeout->tv_sec);
 		host_timeout.tv_usec = static_cast<decltype(host_timeout.tv_usec)>(guest_timeout->tv_usec);
-		host_timeout_ptr = &host_timeout;
+		host_timeout_ptr     = &host_timeout;
 	}
 
 	int result = 0;
 #if defined(_WIN32)
 	if (descriptors.empty()) {
-		Sleep(host_timeout_ptr == nullptr ? INFINITE :
-		      static_cast<DWORD>(host_timeout.tv_sec * 1000 + host_timeout.tv_usec / 1000));
+		Sleep(host_timeout_ptr == nullptr
+		          ? INFINITE
+		          : static_cast<DWORD>(host_timeout.tv_sec * 1000 + host_timeout.tv_usec / 1000));
 	} else
 #endif
 	{
@@ -3024,8 +3024,7 @@ int KYTY_SYSV_ABI HttpCreateRequest2(int conn_id, const char* method, const char
 		return HTTP_ERROR_INVALID_VALUE;
 	}
 
-	auto id =
-	    g_net->HttpCreateRequestWithURL2(Network::Id(conn_id), method, path, content_length);
+	auto id = g_net->HttpCreateRequestWithURL2(Network::Id(conn_id), method, path, content_length);
 	return id.IsValid() ? id.ToInt() : HTTP_ERROR_OUT_OF_MEMORY;
 }
 

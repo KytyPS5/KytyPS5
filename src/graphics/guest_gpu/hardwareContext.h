@@ -981,7 +981,7 @@ public:
 	[[nodiscard]] const FsrView& GetFsrView() const { return m_fsr_view; }
 
 private:
-	FsrView m_fsr_view;
+	FsrView                 m_fsr_view;
 	Prospero::PrimitiveType m_prim_type               = Prospero::PrimitiveType::kNone;
 	uint32_t                m_index_offset            = 0;
 	uint32_t                m_object_id               = 0;
@@ -1055,8 +1055,8 @@ public:
 private:
 	static void SetUserDataAddressWord(uint64_t& address, uint32_t word, uint32_t value) {
 		const auto shift = word * 32u;
-		address = (address & ~(uint64_t {0xffffffffu} << shift)) |
-		          (static_cast<uint64_t>(value) << shift);
+		address          = (address & ~(uint64_t {0xffffffffu} << shift)) |
+		                   (static_cast<uint64_t>(value) << shift);
 	}
 
 	VertexShaderInfo  m_vs;

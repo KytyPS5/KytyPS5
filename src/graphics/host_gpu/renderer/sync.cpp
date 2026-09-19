@@ -102,8 +102,8 @@ void WriteAtEndOfPipeGds32(uint64_t submit_id, CommandBuffer& buffer, uint32_t* 
                            uint32_t dw_offset, uint32_t dw_num) {
 	EXIT_IF(dst_gpu_addr == nullptr);
 	(void)buffer.Handle();
-	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::EopWrite), submit_id,
-	                    dw_offset, dw_num, 0, 0, reinterpret_cast<uint64_t>(dst_gpu_addr));
+	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::EopWrite), submit_id, dw_offset,
+	                    dw_num, 0, 0, reinterpret_cast<uint64_t>(dst_gpu_addr));
 }
 
 void WriteAtEndOfPipe64(uint64_t submit_id, CommandBuffer& buffer, uint64_t* dst_gpu_addr,

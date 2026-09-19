@@ -2012,12 +2012,12 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 
 	uint64_t tls_handler_size = is_shared ? 0 : Jit::SafeCall::GetSize();
 	EXIT_IF(tls_handler_size > UINT64_MAX - program->base_size_aligned);
-	program->mapped_size = program->base_size_aligned + tls_handler_size;
+	program->mapped_size     = program->base_size_aligned + tls_handler_size;
 	const bool emulate_rsqrt = Config::AmdCpuEnabled();
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	const bool         protect_memory_faults   = Config::RedZoneProtectionEnabled();
-	const bool         use_red_zone_protection = protect_memory_faults || emulate_rsqrt;
+	const bool         protect_memory_faults    = Config::RedZoneProtectionEnabled();
+	const bool         use_red_zone_protection  = protect_memory_faults || emulate_rsqrt;
 	constexpr uint64_t RED_ZONE_TRAMPOLINE_SIZE = 8u * 1024u * 1024u;
 	if (use_red_zone_protection) {
 		EXIT_IF(RED_ZONE_TRAMPOLINE_SIZE > UINT64_MAX - program->mapped_size);
@@ -2065,8 +2065,8 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 
 	std::vector<std::pair<uint64_t, uint64_t>> executable_segments;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	uint64_t                                   eh_frame_header_addr = 0;
-	uint64_t                                   eh_frame_header_size = 0;
+	uint64_t eh_frame_header_addr = 0;
+	uint64_t eh_frame_header_size = 0;
 #endif
 
 	for (Elf64_Half i = 0; i < ehdr->e_phnum; i++) {
@@ -2148,9 +2148,8 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 		uint64_t reciprocal_sqrt_count = 0;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		if (use_red_zone_protection) {
-			const auto result =
-			    PatchGuestInstructions(segment_addr, segment_size, function_starts,
-			                           protect_memory_faults, emulate_rsqrt);
+			const auto result = PatchGuestInstructions(segment_addr, segment_size, function_starts,
+			                                           protect_memory_faults, emulate_rsqrt);
 			LOGF("Windows guest red-zone patching: %s, functions=%" PRIu64 ", red_zone=%" PRIu64
 			     ", memory=%" PRIu64 ", patched=%" PRIu64 ", short=%" PRIu64 ", stack=%" PRIu64
 			     ", control=%" PRIu64 ", unrelocatable=%" PRIu64 "\n",
@@ -2171,7 +2170,8 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 #endif
 		if (reciprocal_sqrt_count != 0) {
 			LOGF("Guest VRSQRTPS emulation: %s, instructions=%" PRIu64 "\n",
-			     Common::PathToString(program->file_name.filename()).c_str(), reciprocal_sqrt_count);
+			     Common::PathToString(program->file_name.filename()).c_str(),
+			     reciprocal_sqrt_count);
 		}
 	}
 

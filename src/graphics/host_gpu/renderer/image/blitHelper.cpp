@@ -75,7 +75,7 @@ vk::Pipeline BlitHelper::GetPipeline(PipelineKey key) {
 	stages[1].module = m_fragment_shader;
 	stages[1].pName  = "main";
 
-	vk::PipelineVertexInputStateCreateInfo vertex_input {};
+	vk::PipelineVertexInputStateCreateInfo   vertex_input {};
 	vk::PipelineInputAssemblyStateCreateInfo input_assembly {};
 	input_assembly.topology = vk::PrimitiveTopology::eTriangleList;
 	vk::PipelineViewportStateCreateInfo viewport {};

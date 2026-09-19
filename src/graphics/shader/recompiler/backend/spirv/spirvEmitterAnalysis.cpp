@@ -179,7 +179,7 @@ uint32_t MakeSampledImage(EmitterState& state, uint32_t resource, uint32_t sampl
 	const auto& image_resource = state.program.info.images.at(resource);
 	const auto  image          = LoadSampledImageDescriptor(state, resource);
 	const auto  sampler_id     = LoadSamplerDescriptor(state, sampler);
-	const auto  sampled_image = state.builder.AllocateId();
+	const auto  sampled_image  = state.builder.AllocateId();
 	const auto  sampled_type =
 	    state.builder.Type(spv::OpTypeSampledImage, ImageType(state, image_resource));
 	state.builder.AddFunction(spv::OpSampledImage, sampled_type, sampled_image, image, sampler_id);

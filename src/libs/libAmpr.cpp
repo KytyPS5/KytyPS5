@@ -266,7 +266,8 @@ static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) 
 }
 
 static int ResolvePathsCommon(const char* const* path_list, uint32_t count, uint32_t* ids,
-                              uint64_t* sizes, uint32_t* error_index, const char* prefix, int* results) {
+                              uint64_t* sizes, uint32_t* error_index, const char* prefix,
+                              int* results) {
 	if (path_list == nullptr || count == 0 || count > 1024 ||
 	    (ids == nullptr && sizes == nullptr && results == nullptr)) {
 		return LibKernel::KERNEL_ERROR_EINVAL;
@@ -296,8 +297,8 @@ static int ResolvePathsCommon(const char* const* path_list, uint32_t count, uint
 
 	char prefix_buf[1024] {};
 	if (prefix != nullptr) {
-		const int result = ReadGuestCString(reinterpret_cast<uint64_t>(prefix), prefix_buf,
-		                                   sizeof(prefix_buf));
+		const int result =
+		    ReadGuestCString(reinterpret_cast<uint64_t>(prefix), prefix_buf, sizeof(prefix_buf));
 		if (result != OK) {
 			return result;
 		}
@@ -308,8 +309,9 @@ static int ResolvePathsCommon(const char* const* path_list, uint32_t count, uint
 		char resolved_path[1024] {};
 		// Concatenate the prefix literally, including an empty prefix.
 		std::memcpy(resolved_path, prefix_buf, prefix_size);
-		int result = ReadGuestCString(reinterpret_cast<uint64_t>(path_list[i]),
-		                             resolved_path + prefix_size, sizeof(resolved_path) - prefix_size);
+		int result =
+		    ReadGuestCString(reinterpret_cast<uint64_t>(path_list[i]), resolved_path + prefix_size,
+		                     sizeof(resolved_path) - prefix_size);
 		if (result == OK) {
 			result = ResolveOnePath(resolved_path, ids != nullptr ? &ids[i] : nullptr,
 			                        sizes != nullptr ? &sizes[i] : nullptr);
@@ -410,8 +412,8 @@ static int KernelSyscallResult(int result) {
 	return -1;
 }
 
-static int KYTY_SYSV_ABI ResolveFilepathsToIds(const char* const* path_list, uint32_t count, uint32_t* ids,
-                                               uint32_t* error_index) {
+static int KYTY_SYSV_ABI ResolveFilepathsToIds(const char* const* path_list, uint32_t count,
+                                               uint32_t* ids, uint32_t* error_index) {
 	PRINT_NAME();
 
 	return KernelSyscallResult(AprShared::ResolvePathsCommon(path_list, count, ids, nullptr,
@@ -471,16 +473,17 @@ static int KYTY_SYSV_ABI GetFileSize(uint32_t file_id, uint64_t* size) {
 	return OK;
 }
 
-static int KYTY_SYSV_ABI ResolveFilepathsToIdsAndFileSizes(const char* const* path_list, uint32_t count,
-                                                           uint32_t* ids, uint64_t* sizes,
-                                                           uint32_t* error_index) {
+static int KYTY_SYSV_ABI ResolveFilepathsToIdsAndFileSizes(const char* const* path_list,
+                                                           uint32_t count, uint32_t* ids,
+                                                           uint64_t* sizes, uint32_t* error_index) {
 	PRINT_NAME();
 
 	return KernelSyscallResult(
 	    AprShared::ResolvePathsCommon(path_list, count, ids, sizes, error_index, nullptr, nullptr));
 }
 
-static int KYTY_SYSV_ABI ResolveFilepathsWithPrefixToIds(const char* prefix, const char* const* path_list,
+static int KYTY_SYSV_ABI ResolveFilepathsWithPrefixToIds(const char*        prefix,
+                                                         const char* const* path_list,
                                                          uint32_t count, uint32_t* ids,
                                                          uint32_t* error_index) {
 	PRINT_NAME();
@@ -489,15 +492,15 @@ static int KYTY_SYSV_ABI ResolveFilepathsWithPrefixToIds(const char* prefix, con
 	                                                         error_index, prefix, nullptr));
 }
 
-static int KYTY_SYSV_ABI ResolveFilepathsWithPrefixToIdsAndFileSizes(const char* prefix,
+static int KYTY_SYSV_ABI ResolveFilepathsWithPrefixToIdsAndFileSizes(const char*        prefix,
                                                                      const char* const* path_list,
                                                                      uint32_t count, uint32_t* ids,
                                                                      uint64_t* sizes,
                                                                      uint32_t* error_index) {
 	PRINT_NAME();
 
-	return KernelSyscallResult(AprShared::ResolvePathsCommon(path_list, count, ids, sizes,
-	                                                         error_index, prefix, nullptr));
+	return KernelSyscallResult(
+	    AprShared::ResolvePathsCommon(path_list, count, ids, sizes, error_index, prefix, nullptr));
 }
 
 static int KYTY_SYSV_ABI ResolveFilepathsToIdsForEach(const char* const* path_list, uint32_t count,
@@ -517,19 +520,19 @@ static int KYTY_SYSV_ABI ResolveFilepathsToIdsAndFileSizesForEach(const char* co
 	    AprShared::ResolvePathsCommon(path_list, count, ids, sizes, nullptr, nullptr, results));
 }
 
-static int KYTY_SYSV_ABI ResolveFilepathsWithPrefixToIdsForEach(const char* prefix,
+static int KYTY_SYSV_ABI ResolveFilepathsWithPrefixToIdsForEach(const char*        prefix,
                                                                 const char* const* path_list,
                                                                 uint32_t count, uint32_t* ids,
                                                                 int* results) {
 	PRINT_NAME();
 
-	return KernelSyscallResult(AprShared::ResolvePathsCommon(path_list, count, ids, nullptr,
-	                                                         nullptr, prefix, results));
+	return KernelSyscallResult(
+	    AprShared::ResolvePathsCommon(path_list, count, ids, nullptr, nullptr, prefix, results));
 }
 
 static int KYTY_SYSV_ABI ResolveFilepathsWithPrefixToIdsAndFileSizesForEach(
-    const char* prefix, const char* const* path_list, uint32_t count, uint32_t* ids, uint64_t* sizes,
-    int* results) {
+    const char* prefix, const char* const* path_list, uint32_t count, uint32_t* ids,
+    uint64_t* sizes, int* results) {
 	PRINT_NAME();
 
 	return KernelSyscallResult(

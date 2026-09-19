@@ -288,7 +288,9 @@ static void JsonValueCopy(JsonValue* dst, const JsonValue* src) {
 		case JsonValueTypeReal: dst->real = src->real; break;
 		case JsonValueTypeString: dst->string = JsonStringNew(*JsonStringImpl(src->string)); break;
 		case JsonValueTypeArray: dst->array = new JsonArray {JsonArrayCopy(src->array, dst)}; break;
-		case JsonValueTypeObject: dst->object = new JsonObject {JsonObjectCopy(src->object, dst)}; break;
+		case JsonValueTypeObject:
+			dst->object = new JsonObject {JsonObjectCopy(src->object, dst)};
+			break;
 		default: dst->uinteger = 0; break;
 	}
 }
@@ -917,7 +919,7 @@ static size_t KYTY_SYSV_ABI JsonArraySize(const JsonArray* self) {
 
 // The non-trivial guest iterator is returned through an explicit result pointer.
 static JsonArrayIterator* KYTY_SYSV_ABI JsonArrayBegin(JsonArrayIterator* result,
-                                                    const JsonArray* self) {
+                                                       const JsonArray*   self) {
 	PRINT_NAME();
 
 	result->position = JsonArrayImpl(self)->data();
@@ -925,7 +927,7 @@ static JsonArrayIterator* KYTY_SYSV_ABI JsonArrayBegin(JsonArrayIterator* result
 }
 
 static JsonArrayIterator* KYTY_SYSV_ABI JsonArrayEnd(JsonArrayIterator* result,
-                                                  const JsonArray* self) {
+                                                     const JsonArray*   self) {
 	PRINT_NAME();
 
 	const auto* impl = JsonArrayImpl(self);
@@ -937,7 +939,7 @@ static JsonArrayIterator* KYTY_SYSV_ABI JsonArrayEnd(JsonArrayIterator* result,
 }
 
 static bool KYTY_SYSV_ABI JsonArrayIteratorNotEqual(const JsonArrayIterator* self,
-                                                 const JsonArrayIterator* other) {
+                                                    const JsonArrayIterator* other) {
 	PRINT_NAME();
 
 	return self->position != other->position;

@@ -11,9 +11,9 @@ namespace Common {
 template <typename T>
 [[nodiscard]] constexpr T AlignUp(T value, std::size_t size) {
 	static_assert(std::is_unsigned_v<T>, "T must be an unsigned value.");
-	auto mod{static_cast<T>(value % size)};
+	auto mod {static_cast<T>(value % size)};
 	value -= mod;
-	return static_cast<T>(mod == T{0} ? value : value + size);
+	return static_cast<T>(mod == T {0} ? value : value + size);
 }
 
 template <typename T>

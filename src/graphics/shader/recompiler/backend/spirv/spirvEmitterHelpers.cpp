@@ -6,11 +6,11 @@ DppTargetLane EmitDppPermTargetLane(EmitterState& state, uint32_t subid, uint32_
                                     uint32_t lane_bits) {
 	const auto lane_mask  = (1u << lane_bits) - 1u;
 	const auto group_base = state.builder.AllocateId();
-	const auto lane      = state.builder.AllocateId();
-	const auto shift     = state.builder.AllocateId();
-	const auto selected0 = state.builder.AllocateId();
-	const auto selected  = state.builder.AllocateId();
-	const auto target    = state.builder.AllocateId();
+	const auto lane       = state.builder.AllocateId();
+	const auto shift      = state.builder.AllocateId();
+	const auto selected0  = state.builder.AllocateId();
+	const auto selected   = state.builder.AllocateId();
+	const auto target     = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpBitwiseAnd, TypeU32(state), group_base, subid,
 	                          ConstantU32(state, ~lane_mask));
 	state.builder.AddFunction(spv::OpBitwiseAnd, TypeU32(state), lane, subid,
@@ -92,7 +92,7 @@ DppTargetLane EmitDppMirrorTargetLane(EmitterState& state, uint32_t subid, bool 
 }
 
 DppTargetLane EmitDppTargetLane(EmitterState& state, const IR::DppMoveFlags& flags) {
-	const auto subid = EmitSubgroupLocalInvocationId(state);
+	const auto subid   = EmitSubgroupLocalInvocationId(state);
 	const auto control = flags.control;
 	if (flags.dpp8) {
 		return EmitDppPermTargetLane(state, subid, control, 3u);
@@ -184,8 +184,8 @@ uint32_t EmitLocalInvocationIndex(EmitterState& state) {
 
 uint32_t EmitVertexParameterComponentU32(EmitterState& state, const InputBinding& input,
                                          uint32_t component) {
-	const auto count = VertexParameterComponentCount(input);
-	const auto kind  = VertexParameterScalarKind(state, input.location);
+	const auto count       = VertexParameterComponentCount(input);
+	const auto kind        = VertexParameterScalarKind(state, input.location);
 	const auto scalar_type = VertexParameterScalarType(state, kind);
 	uint32_t   raw         = state.builder.AllocateId();
 	if (count == 1u) {

@@ -362,7 +362,8 @@ void CollectOutputs(const Program& program, ShaderStageInputInfo input_info, Sha
 						const auto output = DecodePositionExportComponent(
 						    input_info.vertex->pa_cl_vs_out_cntl, export_info.index, component);
 						if (output.viewport) {
-							AddOutput(info, StageOutputKind::ViewportIndex, 0, 0, "gl_ViewportIndex");
+							AddOutput(info, StageOutputKind::ViewportIndex, 0, 0,
+							          "gl_ViewportIndex");
 						}
 						if (output.point_size) {
 							AddOutput(info, StageOutputKind::PointSize, 0, 0, "gl_PointSize");

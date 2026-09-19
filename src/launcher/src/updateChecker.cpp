@@ -17,8 +17,7 @@
 namespace {
 
 constexpr char DEFAULT_FEED_URL[]  = "https://kytyps5.github.io/data/updates.json";
-constexpr char FALLBACK_FEED_URL[] =
-    "https://api.github.com/repos/KytyPS5/KytyPS5/releases/latest";
+constexpr char FALLBACK_FEED_URL[] = "https://api.github.com/repos/KytyPS5/KytyPS5/releases/latest";
 
 } // namespace
 
@@ -46,7 +45,8 @@ UpdateChecker::UpdateInfo UpdateChecker::ParseUpdateInfo(const QByteArray& data)
 
 	const auto root = document.object();
 	UpdateInfo info {root.value(QStringLiteral("tag")).toString(),
-	                 QUrl(root.value(QStringLiteral("html_url")).toString()), {}};
+	                 QUrl(root.value(QStringLiteral("html_url")).toString()),
+	                 {}};
 	if (info.tag.isEmpty()) {
 		info.tag = root.value(QStringLiteral("tag_name")).toString();
 	}
@@ -114,10 +114,9 @@ void UpdateChecker::ShowUpdateResult(const UpdateInfo& info, bool manual) {
 		}
 		return;
 	}
-	const auto message =
-	    tr("An update is available.\n\nCurrent: %1\nLatest: %2\n\n"
-	       "Open the release page?")
-	        .arg(QString::fromLatin1(KYTY_RELEASE_TAG), info.tag);
+	const auto message = tr("An update is available.\n\nCurrent: %1\nLatest: %2\n\n"
+	                        "Open the release page?")
+	                         .arg(QString::fromLatin1(KYTY_RELEASE_TAG), info.tag);
 	if (QMessageBox::question(m_parent, tr("KytyPS5 Update"), message,
 	                          QMessageBox::Open | QMessageBox::Cancel,
 	                          QMessageBox::Open) == QMessageBox::Open) {

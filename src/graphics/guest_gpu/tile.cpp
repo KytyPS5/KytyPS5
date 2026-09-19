@@ -360,8 +360,10 @@ bool TileGetTiledTextureLayout(const TileSurfaceDescription& description, TileSu
 		    ((description.width >> level) + texture.texel_width - 1u) / texture.texel_width, 1u);
 		mip.height = std::max(
 		    ((description.height >> level) + texture.texel_height - 1u) / texture.texel_height, 1u);
-		mip.padded_width  = Common::AlignUp(std::max(ShiftCeil(width0, level), 1u), block.block_width);
-		mip.padded_height = Common::AlignUp(std::max(ShiftCeil(height0, level), 1u), block.block_height);
+		mip.padded_width =
+		    Common::AlignUp(std::max(ShiftCeil(width0, level), 1u), block.block_width);
+		mip.padded_height =
+		    Common::AlignUp(std::max(ShiftCeil(height0, level), 1u), block.block_height);
 		mip.size = static_cast<uint64_t>(block.block_depth) * mip.padded_width * mip.padded_height *
 		           block.bytes_per_element;
 		result.block_slice_size += mip.size;
@@ -1213,9 +1215,9 @@ bool TileGetRenderTargetSize(uint32_t width, uint32_t height, uint32_t pitch,
 	return true;
 }
 
-bool TileGetDccSize(uint32_t width, uint32_t height, uint32_t slices,
-                    uint32_t bytes_per_element, uint32_t levels, Prospero::TileMode tile,
-                    TileSizeAlign& total_size, uint32_t num_fragments_log2) {
+bool TileGetDccSize(uint32_t width, uint32_t height, uint32_t slices, uint32_t bytes_per_element,
+                    uint32_t levels, Prospero::TileMode tile, TileSizeAlign& total_size,
+                    uint32_t num_fragments_log2) {
 	total_size = {};
 	if (width == 0 || height == 0 || slices == 0 || levels != 1 || num_fragments_log2 != 0 ||
 	    !std::has_single_bit(bytes_per_element) || bytes_per_element > 16 ||
@@ -1227,7 +1229,7 @@ bool TileGetDccSize(uint32_t width, uint32_t height, uint32_t slices,
 	const uint32_t coverage_bits = 20u - std::countr_zero(bytes_per_element);
 	const uint32_t block_width   = 1u << ((coverage_bits + 1u) / 2u);
 	const uint32_t block_height  = 1u << (coverage_bits / 2u);
-	const uint64_t blocks_x = (static_cast<uint64_t>(width) + block_width - 1u) / block_width;
+	const uint64_t blocks_x      = (static_cast<uint64_t>(width) + block_width - 1u) / block_width;
 	const uint64_t blocks_y = (static_cast<uint64_t>(height) + block_height - 1u) / block_height;
 	const uint64_t blocks   = blocks_x * blocks_y;
 	if (blocks > UINT32_MAX / 4096u / slices) {

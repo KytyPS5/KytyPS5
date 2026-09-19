@@ -109,7 +109,7 @@ struct Graph {
 	uint32_t          FindNearestCommonPostDominator(uint32_t block_a, uint32_t block_b) const;
 };
 
-Graph       BuildGraph(const Decoder::Program& program);
+Graph BuildGraph(const Decoder::Program& program);
 // Commits structured control flow on success; preserves the original graph with
 // failure diagnostics on failure. failure_block is an original block ID or UINT32_MAX.
 bool        Structurize(Graph& graph);

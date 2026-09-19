@@ -19,11 +19,11 @@ LIB_VERSION("Hmd2", 1, "Hmd2", 1, 1);
 
 namespace Hmd2 {
 
-constexpr int32_t ERROR_ALREADY_INITIALIZED = -1972240383; // 0x8a720001
-constexpr int32_t ERROR_NOT_INITIALIZED     = -1972240382; // 0x8a720002
-constexpr int32_t ERROR_PARAMETER_NULL      = -1972240376; // 0x8a720008
+constexpr int32_t ERROR_ALREADY_INITIALIZED              = -1972240383; // 0x8a720001
+constexpr int32_t ERROR_NOT_INITIALIZED                  = -1972240382; // 0x8a720002
+constexpr int32_t ERROR_PARAMETER_NULL                   = -1972240376; // 0x8a720008
 constexpr int32_t ERROR_REPROJECTION_ALREADY_INITIALIZED = -1972240372; // 0x8a72000c
-constexpr int32_t ERROR_REPROJECTION_IN_VR_MODE = -1972240356; // 0x8a72001c
+constexpr int32_t ERROR_REPROJECTION_IN_VR_MODE          = -1972240356; // 0x8a72001c
 
 struct SceHmd2InitializeParam {
 	void*   reserved0;
@@ -85,8 +85,8 @@ static_assert(offsetof(SceHmd2ReprojectionInitializeParam, pSeeThroughBuff) == 4
 static_assert(offsetof(SceHmd2ReprojectionInitializeParam, reprojectionTiming) == 48);
 static_assert(offsetof(SceHmd2ReprojectionInitializeParam, reserved) == 52);
 
-static std::atomic<bool> g_initialized = false;
-static std::mutex g_reprojection_mutex;
+static std::atomic<bool>               g_initialized = false;
+static std::mutex                      g_reprojection_mutex;
 static std::atomic<ReprojectionState*> g_reprojection_state {nullptr};
 
 ReprojectionState* GetReprojectionState() {
@@ -152,8 +152,8 @@ static int32_t KYTY_SYSV_ABI Hmd2GetFieldOfViewWithoutHandle(SceHmd2FieldOfView*
 	// Virtual ER15 field of view: 55/42.5/51.2/51.2 degrees.
 	// These tangents describe that geometry, not bit-exact firmware output.
 	*fov = {1.4281480312f, 0.9163311720f, 1.2437491417f, 1.2437491417f};
-	LOGF("Hmd2: FOV tangents out=%f in=%f top=%f bottom=%f\n", fov->tanOut, fov->tanIn,
-	     fov->tanTop, fov->tanBottom);
+	LOGF("Hmd2: FOV tangents out=%f in=%f top=%f bottom=%f\n", fov->tanOut, fov->tanIn, fov->tanTop,
+	     fov->tanBottom);
 	return OK;
 }
 
@@ -165,8 +165,7 @@ static Graphics::SizeAlign KYTY_SYSV_ABI Hmd2ReprojectionQueryBufferSizeAlign() 
 
 static Graphics::SizeAlign KYTY_SYSV_ABI Hmd2ReprojectionQueryDisplayBufferSizeAlign() {
 	const auto size = ReprojectionDisplaySize();
-	LOGF("Hmd2: reprojection display size=%" PRIu64 " alignment=%zu\n", size.m_size,
-	     size.m_align);
+	LOGF("Hmd2: reprojection display size=%" PRIu64 " alignment=%zu\n", size.m_size, size.m_align);
 	return size;
 }
 
@@ -181,10 +180,10 @@ Hmd2ReprojectionInitialize(const SceHmd2ReprojectionInitializeParam* param, void
 	}
 	EXIT_NOT_IMPLEMENTED(param->pSeeThroughBuff != nullptr);
 	const auto display_size = ReprojectionDisplaySize();
-	auto* state = new (param->pReprojectionBuff) ReprojectionState;
+	auto*      state        = new (param->pReprojectionBuff) ReprojectionState;
 	if (param->reprojectionTiming != 0) {
 		state->timing_us.store(static_cast<uint32_t>(param->reprojectionTiming),
-		                      std::memory_order_relaxed);
+		                       std::memory_order_relaxed);
 	}
 	g_reprojection_state.store(state, std::memory_order_release);
 	LOGF("Hmd2: reprojection initialized work=%p display=%p size=%" PRIu64 " timing=%u\n",

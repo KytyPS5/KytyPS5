@@ -231,18 +231,17 @@ constexpr VopcOpcodeInfo VOPC_OPCODE_LIST[] = {
     {0xa9u, Opcode::V_CMP_LT_U16},         {0xaau, Opcode::V_CMP_EQ_U16},
     {0xabu, Opcode::V_CMP_LE_U16},         {0xacu, Opcode::V_CMP_GT_U16},
     {0xadu, Opcode::V_CMP_NE_U16},         {0xaeu, Opcode::V_CMP_GE_U16},
-    {0xb9u, Opcode::V_CMPX_LT_U16, false},
-    {0xbcu, Opcode::V_CMPX_GT_U16},        {0xc0u, Opcode::V_CMP_F_U32},
-    {0xc1u, Opcode::V_CMP_LT_U32},         {0xc2u, Opcode::V_CMP_EQ_U32},
-    {0xc3u, Opcode::V_CMP_LE_U32},         {0xc4u, Opcode::V_CMP_GT_U32},
-    {0xc5u, Opcode::V_CMP_NE_U32},         {0xc6u, Opcode::V_CMP_GE_U32},
-    {0xc7u, Opcode::V_CMP_T_U32},          {0xa2u, Opcode::V_CMP_EQ_I64, false},
-    {0xb5u, Opcode::V_CMPX_NE_I64, false}, {0xd1u, Opcode::V_CMPX_LT_U32},
-    {0xd2u, Opcode::V_CMPX_EQ_U32},        {0xd3u, Opcode::V_CMPX_LE_U32},
-    {0xd4u, Opcode::V_CMPX_GT_U32},        {0xd5u, Opcode::V_CMPX_NE_U32},
-    {0xd6u, Opcode::V_CMPX_GE_U32},        {0xe1u, Opcode::V_CMP_LT_U64, false},
-    {0xe2u, Opcode::V_CMP_EQ_U64, false},  {0xe4u, Opcode::V_CMP_GT_U64, false},
-    {0xe5u, Opcode::V_CMP_NE_U64, false},
+    {0xb9u, Opcode::V_CMPX_LT_U16, false}, {0xbcu, Opcode::V_CMPX_GT_U16},
+    {0xc0u, Opcode::V_CMP_F_U32},          {0xc1u, Opcode::V_CMP_LT_U32},
+    {0xc2u, Opcode::V_CMP_EQ_U32},         {0xc3u, Opcode::V_CMP_LE_U32},
+    {0xc4u, Opcode::V_CMP_GT_U32},         {0xc5u, Opcode::V_CMP_NE_U32},
+    {0xc6u, Opcode::V_CMP_GE_U32},         {0xc7u, Opcode::V_CMP_T_U32},
+    {0xa2u, Opcode::V_CMP_EQ_I64, false},  {0xb5u, Opcode::V_CMPX_NE_I64, false},
+    {0xd1u, Opcode::V_CMPX_LT_U32},        {0xd2u, Opcode::V_CMPX_EQ_U32},
+    {0xd3u, Opcode::V_CMPX_LE_U32},        {0xd4u, Opcode::V_CMPX_GT_U32},
+    {0xd5u, Opcode::V_CMPX_NE_U32},        {0xd6u, Opcode::V_CMPX_GE_U32},
+    {0xe1u, Opcode::V_CMP_LT_U64, false},  {0xe2u, Opcode::V_CMP_EQ_U64, false},
+    {0xe4u, Opcode::V_CMP_GT_U64, false},  {0xe5u, Opcode::V_CMP_NE_U64, false},
     {0xf5u, Opcode::V_CMPX_NE_U64, false}, {0xc9u, Opcode::V_CMP_LT_F16},
     {0xcau, Opcode::V_CMP_EQ_F16},         {0xcbu, Opcode::V_CMP_LE_F16},
     {0xccu, Opcode::V_CMP_GT_F16},         {0xcdu, Opcode::V_CMP_LG_F16},
@@ -357,8 +356,7 @@ bool IsVop2LiteralMadOpcode(uint32_t opcode) {
 }
 
 bool IsUnsupportedVop3EncodedVop2Alias(uint32_t opcode) {
-	return IsVop2LiteralMadOpcode(opcode) || opcode == 0x02u || opcode == 0x39u ||
-	       opcode == 0x3au;
+	return IsVop2LiteralMadOpcode(opcode) || opcode == 0x02u || opcode == 0x39u || opcode == 0x3au;
 }
 
 Opcode LookupVop3Opcode(uint32_t opcode) {
@@ -516,8 +514,8 @@ struct Vop1SdwaRule {
 };
 
 constexpr Vop1SdwaRule VOP1_SDWA_RULES[] = {
-    {Opcode::V_MOV_B32, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), SdwaSelBytes() | SdwaSelWords(),
-     SdwaSelWords() | SdwaSelFull(), false},
+    {Opcode::V_MOV_B32, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(),
+     SdwaSelBytes() | SdwaSelWords(), SdwaSelWords() | SdwaSelFull(), false},
     {Opcode::V_CVT_F32_U32, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), 0, 0, false},
     {Opcode::V_CVT_F32_I32, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), 0, 0, false},
     {Opcode::V_CVT_F32_UBYTE0, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), 0, 0, false},

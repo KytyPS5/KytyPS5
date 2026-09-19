@@ -396,6 +396,12 @@ add_executable(bit_array_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(bit_array_tests PRIVATE ${inc_headers})
 
+add_executable(async_logging_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/AsyncLoggingTests.cpp"
+)
+target_link_libraries(async_logging_tests common)
+target_include_directories(async_logging_tests PRIVATE ${inc_headers})
+
 add_executable(ime_dialog_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ImeDialogTests.cpp"
 	"${KYTY_SOURCE_DIR}/libs/imeCommon.cpp"
@@ -501,7 +507,8 @@ add_kyty_full_emulator_test(virtual_memory_allocation_tests "${KYTY_TESTS_DIR}/V
 target_compile_definitions(virtual_memory_allocation_tests PRIVATE
 	KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS=1)
 
-# These tests use exceptions.
+# These tests use exceptions. GCC/Clang need an explicit opt-in; clang-cl gets
+# /EHs from config_compiler_and_linker().
 if(NOT KYTY_CLANG_CL)
 	foreach(kyty_exception_test scalar_provenance_tests resource_tracking_tests
 			virtual_memory_allocation_tests)
@@ -527,6 +534,7 @@ if(BUILD_TESTING)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
+	add_test(NAME async_logging COMMAND $<TARGET_FILE:async_logging_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
@@ -583,6 +591,7 @@ if(BUILD_TESTING)
 
 	add_custom_target(kyty_tests DEPENDS
 		ime_dialog_tests
+		async_logging_tests
 		shader_cfg_tests
 		scalar_provenance_tests
 		image_page_table_tests

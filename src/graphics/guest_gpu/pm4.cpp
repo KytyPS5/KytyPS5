@@ -60,7 +60,7 @@ constexpr auto MakeOpcodeNames() {
 	names[IT_WRITE_DATA]                = "IT_WRITE_DATA";
 	names[IT_MEM_SEMAPHORE]             = "IT_MEM_SEMAPHORE";
 	names[IT_DRAW_INDEX_INDIRECT_MULTI] = "IT_DRAW_INDEX_INDIRECT_MULTI";
-	names[IT_WAIT_REG_MEM]               = "IT_WAIT_REG_MEM";
+	names[IT_WAIT_REG_MEM]              = "IT_WAIT_REG_MEM";
 	names[IT_INDIRECT_BUFFER]           = "IT_INDIRECT_BUFFER";
 	names[IT_COPY_DATA]                 = "IT_COPY_DATA";
 	names[IT_CP_DMA]                    = "IT_CP_DMA";

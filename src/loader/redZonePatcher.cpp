@@ -172,9 +172,9 @@ uintptr_t GetRelativeTarget(const DecodedCodeInstruction& decoded) {
 
 DecodedCodeInstruction DecodeCodeInstruction(uintptr_t address, uintptr_t end) {
 	DecodedCodeInstruction decoded {.address = address};
-	const auto status = ZydisDecoderDecodeFull(&GetDecoder(), reinterpret_cast<void*>(address),
-	                                           end - address, &decoded.instruction,
-	                                           decoded.operands.data());
+	const auto             status =
+	    ZydisDecoderDecodeFull(&GetDecoder(), reinterpret_cast<void*>(address), end - address,
+	                           &decoded.instruction, decoded.operands.data());
 	if (!ZYAN_SUCCESS(status)) {
 		decoded.instruction.length = 0;
 		return decoded;
@@ -738,9 +738,9 @@ bool GenerateProtectedIndirectCall(const DecodedCodeInstruction& decoded,
 	return true;
 }
 
-void CollectRedZoneMemoryInstructions(const DecodedFunction& function,
+void CollectRedZoneMemoryInstructions(const DecodedFunction&                   function,
                                       std::map<uintptr_t, InstructionRewrite>& rewrite_sites,
-                                      RedZonePatchResult& result) {
+                                      RedZonePatchResult&                      result) {
 	if (!function.uses_red_zone) {
 		return;
 	}
@@ -783,9 +783,9 @@ struct ReciprocalSquareRootSite {
 	bool      requires_red_zone_protection;
 };
 
-void CollectReciprocalSquareRoots(const DecodedFunction& function,
-                                 std::map<uintptr_t, InstructionRewrite>& rewrite_sites,
-                                 std::vector<ReciprocalSquareRootSite>& sites) {
+void CollectReciprocalSquareRoots(const DecodedFunction&                   function,
+                                  std::map<uintptr_t, InstructionRewrite>& rewrite_sites,
+                                  std::vector<ReciprocalSquareRootSite>&   sites) {
 	for (const auto& [address, decoded]: function.instructions) {
 		if (!X64InstructionEmulator::IsReciprocalSquareRoot(decoded.instruction,
 		                                                    decoded.operands.data())) {
@@ -799,9 +799,9 @@ void CollectReciprocalSquareRoots(const DecodedFunction& function,
 	}
 }
 
-uint64_t ApplyReciprocalSquareRootPatches(const PatchModule& module,
-                                        std::span<const ReciprocalSquareRootSite> sites,
-                                        uint64_t trampoline_addr, uint64_t trampoline_size) {
+uint64_t ApplyReciprocalSquareRootPatches(const PatchModule&                        module,
+                                          std::span<const ReciprocalSquareRootSite> sites,
+                                          uint64_t trampoline_addr, uint64_t trampoline_size) {
 	// Validate every required relocation before introducing any traps.
 	for (const auto& site: sites) {
 		if (site.requires_red_zone_protection &&
@@ -814,7 +814,8 @@ uint64_t ApplyReciprocalSquareRootPatches(const PatchModule& module,
 	uint64_t patched = 0;
 	for (const auto& site: sites) {
 		if (!module.patched.contains(reinterpret_cast<u8*>(site.address))) {
-			patched += X64InstructionEmulator::PatchReciprocalSquareRoots(site.address, site.length);
+			patched +=
+			    X64InstructionEmulator::PatchReciprocalSquareRoots(site.address, site.length);
 		}
 	}
 	return patched +
@@ -822,8 +823,8 @@ uint64_t ApplyReciprocalSquareRootPatches(const PatchModule& module,
 }
 
 void RelocateRedZoneInstructions(PatchModule* module, const DecodedFunction& function,
-                                const std::map<uintptr_t, InstructionRewrite>& rewrite_sites,
-                                RedZonePatchResult& result) {
+                                 const std::map<uintptr_t, InstructionRewrite>& rewrite_sites,
+                                 RedZonePatchResult&                            result) {
 	struct RelocationSpan {
 		std::vector<const DecodedCodeInstruction*> instructions;
 		uintptr_t                                  patch_start {};
@@ -1036,7 +1037,7 @@ void RelocateRedZoneInstructions(PatchModule* module, const DecodedFunction& fun
 
 		constexpr s64 ShortJumpMin = std::numeric_limits<s8>::min();
 		constexpr s64 ShortJumpMax = std::numeric_limits<s8>::max();
-		const auto    relay_slot = std::ranges::find_if(relay_slots, [site](uintptr_t address) {
+		const auto    relay_slot   = std::ranges::find_if(relay_slots, [site](uintptr_t address) {
 			const s64 displacement =
 			    static_cast<s64>(address) - static_cast<s64>(site + ShortJumpSize);
 			return displacement >= ShortJumpMin && displacement <= ShortJumpMax;
@@ -1097,15 +1098,14 @@ void RelocateRedZoneInstructions(PatchModule* module, const DecodedFunction& fun
 					}
 				}
 				if (span.instructions.empty() ||
-				    !(span.continuation <= site ||
-				      span.patch_start >= site_span.continuation) ||
+				    !(span.continuation <= site || span.patch_start >= site_span.continuation) ||
 				    overlaps_patched_span(span.patch_start, span.continuation)) {
 					continue;
 				}
 
 				const uintptr_t relay_address = span.patch_start + NearJumpSize;
-				const s64 displacement = static_cast<s64>(relay_address) -
-				                         static_cast<s64>(short_jump_address + ShortJumpSize);
+				const s64       displacement = static_cast<s64>(relay_address) -
+				                               static_cast<s64>(short_jump_address + ShortJumpSize);
 				if (displacement < ShortJumpMin || displacement > ShortJumpMax) {
 					continue;
 				}
@@ -1127,8 +1127,7 @@ void RelocateRedZoneInstructions(PatchModule* module, const DecodedFunction& fun
 		std::map<uintptr_t, uintptr_t> relay_parent {{site, site}};
 		std::vector<uintptr_t>         relay_queue {site};
 		for (size_t queue_index = 0;
-		     !host_span && !final_relay_slot && queue_index < relay_queue.size();
-		     ++queue_index) {
+		     !host_span && !final_relay_slot && queue_index < relay_queue.size(); ++queue_index) {
 			const uintptr_t current = relay_queue[queue_index];
 			if (current != site) {
 				if (std::ranges::find(relay_slots, current) != relay_slots.end()) {
@@ -1138,8 +1137,8 @@ void RelocateRedZoneInstructions(PatchModule* module, const DecodedFunction& fun
 				}
 				const auto near_slot =
 				    std::ranges::find_if(relay_slots, [current](uintptr_t address) {
-					    const s64 displacement = static_cast<s64>(address) -
-					                             static_cast<s64>(current + ShortJumpSize);
+					    const s64 displacement =
+					        static_cast<s64>(address) - static_cast<s64>(current + ShortJumpSize);
 					    return address != current && displacement >= ShortJumpMin &&
 					           displacement <= ShortJumpMax;
 				    });
@@ -1178,10 +1177,9 @@ void RelocateRedZoneInstructions(PatchModule* module, const DecodedFunction& fun
 			continue;
 		}
 
-		const auto* site_trampoline =
-		    module->trampoline_gen.getCode() + *site_trampoline_offset;
-		auto&     patch_gen = module->patch_gen;
-		uintptr_t relay_address {};
+		const auto* site_trampoline = module->trampoline_gen.getCode() + *site_trampoline_offset;
+		auto&       patch_gen       = module->patch_gen;
+		uintptr_t   relay_address {};
 		if (final_relay_slot) {
 			relay_address = *final_relay_slot;
 			patch_gen.reset();
@@ -1206,8 +1204,7 @@ void RelocateRedZoneInstructions(PatchModule* module, const DecodedFunction& fun
 		uintptr_t jump_target = relay_address;
 		while (final_short_jump != site) {
 			patch_gen.reset();
-			patch_gen.setSize(final_short_jump -
-			                  reinterpret_cast<uintptr_t>(patch_gen.getCode()));
+			patch_gen.setSize(final_short_jump - reinterpret_cast<uintptr_t>(patch_gen.getCode()));
 			patch_gen.jmp(reinterpret_cast<void*>(jump_target),
 			              Xbyak::CodeGenerator::LabelType::T_SHORT);
 			jump_target       = final_short_jump;
@@ -1261,8 +1258,8 @@ RedZonePatchResult PatchGuestInstructions(u64 segment_addr, u64 segment_size,
 	const auto unique_end = std::ranges::unique(starts).begin();
 	starts.erase(unique_end, starts.end());
 
-	std::unique_lock lock {module->mutex};
-	const size_t trampoline_begin = module->trampoline_gen.getSize();
+	std::unique_lock                      lock {module->mutex};
+	const size_t                          trampoline_begin = module->trampoline_gen.getSize();
 	std::vector<ReciprocalSquareRootSite> reciprocal_sqrt_sites;
 	for (size_t function_index = 0; function_index < starts.size(); ++function_index) {
 		const uintptr_t function_start = starts[function_index];

@@ -211,7 +211,7 @@ private:
 			result->result = AJM_RESULT_TOO_MANY_CHANNELS;
 			return false;
 		}
-		const auto bpf      = channels * AjmBytesPerSample(m_sample_encoding);
+		const auto bpf = channels * AjmBytesPerSample(m_sample_encoding);
 		if (bpf == 0) {
 			result->result = AJM_RESULT_INVALID_PARAMETER;
 			return false;
@@ -298,20 +298,20 @@ private:
 		if (m_config_number == AJM_DEC_M4AAC_CONFIG_NUMBER_RAW && !m_raw_configured) {
 			// Only indexed stereo starts with a channel pair; the instance limit is not
 			// the stream's channel count. A leading SCE remains ambiguous.
-			const auto channels = (packet_data[0] >> 5u) == 1u
-			                          ? 2u
-			                          : std::clamp(m_max_channels, 1u, AJM_DEC_M4AAC_MAX_CHANNELS);
-			auto* extradata = av_packet_new_side_data(packet, AV_PKT_DATA_NEW_EXTRADATA, 2);
+			const auto channels  = (packet_data[0] >> 5u) == 1u
+			                           ? 2u
+			                           : std::clamp(m_max_channels, 1u, AJM_DEC_M4AAC_MAX_CHANNELS);
+			auto*      extradata = av_packet_new_side_data(packet, AV_PKT_DATA_NEW_EXTRADATA, 2);
 			if (extradata == nullptr) {
 				av_packet_free(&packet);
 				result->result = AJM_RESULT_CODEC_ERROR | AJM_RESULT_FATAL;
 				return false;
 			}
 			constexpr uint32_t audio_object_type = 2;
-			extradata[0] = static_cast<uint8_t>((audio_object_type << 3u) |
-			                                    (m_sampling_freq_index >> 1u));
-			extradata[1] = static_cast<uint8_t>(((m_sampling_freq_index & 1u) << 7u) |
-			                                    (std::min(channels, 7u) << 3u));
+			extradata[0] =
+			    static_cast<uint8_t>((audio_object_type << 3u) | (m_sampling_freq_index >> 1u));
+			extradata[1]     = static_cast<uint8_t>(((m_sampling_freq_index & 1u) << 7u) |
+			                                        (std::min(channels, 7u) << 3u));
 			m_raw_configured = true;
 		}
 
@@ -359,8 +359,8 @@ private:
 		}
 	}
 
-	const AVCodec*  m_codec               = nullptr;
-	AVCodecContext* m_codec_context       = nullptr;
+	const AVCodec*  m_codec         = nullptr;
+	AVCodecContext* m_codec_context = nullptr;
 	const uint32_t  m_max_channels;
 	uint64_t        m_flags               = 0;
 	uint32_t        m_config_number       = AJM_DEC_M4AAC_CONFIG_NUMBER_ADTS;

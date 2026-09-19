@@ -647,10 +647,10 @@ struct ErrorDialogParam {
 static_assert(sizeof(ErrorDialogParam) == 16);
 
 static std::mutex g_error_mutex;
-static int        g_error_status     = STATUS_NONE;
-static uint64_t   g_error_generation = 0;
-static uint64_t   g_error_revision   = 0;
-static int32_t    g_error_code       = 0;
+static int        g_error_status             = STATUS_NONE;
+static uint64_t   g_error_generation         = 0;
+static uint64_t   g_error_revision           = 0;
+static int32_t    g_error_code               = 0;
 static void (*g_error_visibility_callback)() = nullptr;
 
 static void SetStatus(int status, std::unique_lock<std::mutex>& lock) {

@@ -85,10 +85,10 @@ struct ControllerState {
 		uint16_t y    = 0;
 	};
 
-	uint64_t time                                  = 0;
-	uint32_t buttons                               = 0;
-	int      axes[static_cast<int>(Axis::AxisMax)] = {128, 128, 128, 128, 0, 0};
-	Touch    touch[2];
+	uint64_t             time                                  = 0;
+	uint32_t             buttons                               = 0;
+	int                  axes[static_cast<int>(Axis::AxisMax)] = {128, 128, 128, 128, 0, 0};
+	Touch                touch[2];
 	std::array<float, 3> accel {0.0f, 1.0f, 0.0f};
 	std::array<float, 3> gyro {};
 	std::array<float, 4> orientation {0.0f, 0.0f, 0.0f, 1.0f};
@@ -147,13 +147,13 @@ static void pad_fill_data(PadData* data, const ControllerState& state, bool conn
 
 	std::memset(data, 0, sizeof(*data));
 
-	data->buttons           = state.buttons;
-	data->left_stick_x      = state.axes[static_cast<int>(Axis::LeftX)];
-	data->left_stick_y      = state.axes[static_cast<int>(Axis::LeftY)];
-	data->right_stick_x     = state.axes[static_cast<int>(Axis::RightX)];
-	data->right_stick_y     = state.axes[static_cast<int>(Axis::RightY)];
-	data->analog_buttons_l2 = state.axes[static_cast<int>(Axis::TriggerLeft)];
-	data->analog_buttons_r2 = state.axes[static_cast<int>(Axis::TriggerRight)];
+	data->buttons            = state.buttons;
+	data->left_stick_x       = state.axes[static_cast<int>(Axis::LeftX)];
+	data->left_stick_y       = state.axes[static_cast<int>(Axis::LeftY)];
+	data->right_stick_x      = state.axes[static_cast<int>(Axis::RightX)];
+	data->right_stick_y      = state.axes[static_cast<int>(Axis::RightY)];
+	data->analog_buttons_l2  = state.axes[static_cast<int>(Axis::TriggerLeft)];
+	data->analog_buttons_r2  = state.axes[static_cast<int>(Axis::TriggerRight)];
 	data->acceleration_x     = state.accel[0];
 	data->acceleration_y     = state.accel[1];
 	data->acceleration_z     = state.accel[2];
@@ -528,7 +528,7 @@ void GameController::ReleaseHostPads() {
 		    pad != nullptr) {
 			if (SDL_GameControllerGetType(pad) == SDL_CONTROLLER_TYPE_PS5) {
 				DualSenseEffects effect {};
-				effect.enable_bits     = 0x0c;
+				effect.enable_bits      = 0x0c;
 				effect.right_trigger[0] = 0x05;
 				effect.left_trigger[0]  = 0x05;
 				(void)SDL_GameControllerSendEffect(pad, &effect, sizeof(effect));

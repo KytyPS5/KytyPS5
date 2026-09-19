@@ -1,8 +1,8 @@
 #ifndef EMULATOR_SRC_COMMON_SLOTVECTOR_H_
 #define EMULATOR_SRC_COMMON_SLOTVECTOR_H_
 
-#include "common/assert.h"
 #include "common/abi.h"
+#include "common/assert.h"
 
 #include <compare>
 #include <cstdint>
@@ -23,10 +23,12 @@ struct SlotId {
 	constexpr SlotId(uint32_t value, uint32_t slot_generation) noexcept
 	    : index(value), generation(slot_generation) {}
 
-	[[nodiscard]] constexpr explicit operator bool() const noexcept { return index != INVALID_INDEX; }
+	[[nodiscard]] constexpr explicit operator bool() const noexcept {
+		return index != INVALID_INDEX;
+	}
 	constexpr auto operator<=>(const SlotId&) const noexcept = default;
 
-	uint32_t index = INVALID_INDEX;
+	uint32_t index      = INVALID_INDEX;
 	uint32_t generation = 0;
 };
 
@@ -56,8 +58,8 @@ public:
 	}
 
 	[[nodiscard]] bool is_allocated(SlotId id) const noexcept {
-		return id && id.index < m_values.size() &&
-		       m_values[id.index].generation == id.generation && m_values[id.index].value.has_value();
+		return id && id.index < m_values.size() && m_values[id.index].generation == id.generation &&
+		       m_values[id.index].value.has_value();
 	}
 
 	template <typename... Args>
@@ -115,9 +117,9 @@ private:
 		uint32_t         generation = 1;
 	};
 
-	std::deque<Slot>             m_values;
-	std::vector<uint32_t>        m_free_list;
-	size_t                       m_size = 0;
+	std::deque<Slot>      m_values;
+	std::vector<uint32_t> m_free_list;
+	size_t                m_size = 0;
 };
 
 } // namespace Common

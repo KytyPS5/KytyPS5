@@ -19,9 +19,7 @@ struct ShaderParams {
 	uint64_t                  hash = 0;
 	std::span<const uint32_t> back_code;
 
-	[[nodiscard]] uint64_t Base() const {
-		return reinterpret_cast<uint64_t>(code.data());
-	}
+	[[nodiscard]] uint64_t Base() const { return reinterpret_cast<uint64_t>(code.data()); }
 };
 
 void BuildStageStaticKey(const ShaderVertexInputInfo& input_info, std::vector<uint32_t>& key);
@@ -33,10 +31,10 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 std::array<ShaderParams, 3>
 PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context& context,
                             std::array<ShaderVertexInputInfo, 3>& input_info);
-ShaderParams PrepareProgram(
-    const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,
-    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
-    ShaderPixelInputInfo&                               input_info);
+ShaderParams
+PrepareProgram(const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,
+               std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
+               ShaderPixelInputInfo&                               input_info);
 ShaderParams PrepareProgram(const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh,
                             ShaderComputeInputInfo& input_info);
 

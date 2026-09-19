@@ -144,7 +144,8 @@ uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
 		    inst.dst.dpp)
 			value = {};
 		for (uint32_t index = 0;
-		     index < std::max(inst.data_dwords, 1u) && inst.dst.reg + index < registers.size(); index++) {
+		     index < std::max(inst.data_dwords, 1u) && inst.dst.reg + index < registers.size();
+		     index++) {
 			registers[inst.dst.reg + index] = {};
 		}
 		registers.at(inst.dst.reg) = value;
@@ -323,7 +324,7 @@ void LowerTessellationMemory(IR::Program& program, const CompileOptions& options
 	LOGF("%s tessellation lowering: reads=%u writes=%u factors=%u\n",
 	     options.stage == ShaderType::Local                 ? "LS"
 	     : options.stage == ShaderType::TessellationControl ? "HS"
-	                                                       : "TES",
+	                                                        : "TES",
 	     reads, writes, factors);
 }
 

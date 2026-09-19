@@ -80,6 +80,9 @@ if(KYTY_CLANG_CL)
 	string(REGEX REPLACE "/MD" "/MT" CMAKE_C_FLAGS "${CMAKE_C_FLAGS}")
 			
 	set(KYTY_CPP_FLAGS "${KYTY_CPP_FLAGS} /utf-8 /Oy- /wd4244 /wd4305 /wd4800 /wd4345")
+	# clang-cl defaults to disabled C++ exceptions, while the Windows build uses
+	# dependencies such as Xbyak and SPIRV-Tools that require synchronous EH.
+	set(KYTY_CPP_FLAGS "${KYTY_CPP_FLAGS} /EHs")
   
 	if(KYTY_WARNINGS_ARE_ERRORS)
 		#set(KYTY_CPP_FLAGS "${KYTY_CPP_FLAGS} /WX")

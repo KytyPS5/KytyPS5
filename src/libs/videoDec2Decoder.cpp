@@ -347,8 +347,8 @@ private:
 	}
 
 	Config                    m_config;
-	AVCodecContext*           m_codec    = nullptr;
-	SwsContext*               m_sws      = nullptr;
+	AVCodecContext*           m_codec = nullptr;
+	SwsContext*               m_sws   = nullptr;
 	std::mutex                m_mutex;
 	std::unordered_set<void*> m_picture_buffers;
 };

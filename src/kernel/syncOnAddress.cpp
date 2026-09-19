@@ -48,7 +48,7 @@ struct WaitDeadline {
 };
 
 [[nodiscard]] WaitDeadline MakeDeadline(std::chrono::nanoseconds timeout) {
-	const auto now = Clock::now();
+	const auto now       = Clock::now();
 	const auto remaining = Clock::time_point::max() - now;
 	return {true, timeout >= remaining ? Clock::time_point::max() : now + timeout};
 }
@@ -70,8 +70,7 @@ struct WaitDeadline {
 		return first_wait ? 0u : UINT32_MAX;
 	}
 
-	const auto remaining =
-	    std::chrono::ceil<std::chrono::microseconds>(deadline.end - now).count();
+	const auto remaining = std::chrono::ceil<std::chrono::microseconds>(deadline.end - now).count();
 	return static_cast<uint32_t>(std::min<int64_t>(remaining, SIGNAL_POLL_MICROS));
 }
 
@@ -86,7 +85,7 @@ void PollSignals(signal_poll_func_t signal_poll) {
 template <typename T>
 int WaitLinux(volatile T* address, T expected, const WaitDeadline& deadline,
               signal_poll_func_t signal_poll) {
-	bool       first_wait = true;
+	bool first_wait = true;
 
 	for (;;) {
 		if (ReadWord(address) != expected) {

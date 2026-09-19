@@ -65,9 +65,9 @@ template <typename T>
 }
 
 [[nodiscard]] bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor,
-                                                   bool r128 = false);
-void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
-                            const ShaderTextureResource& descriptor, uint64_t size);
+                                                   bool                         r128 = false);
+void               ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
+                                          const ShaderTextureResource& descriptor, uint64_t size);
 
 } // namespace Libs::Graphics
 

@@ -64,37 +64,35 @@ bool Translator::Float16Unary(const Decoder::Instruction& inst, IR::ValueOpcode 
 }
 
 bool Translator::Float16Trig(const Decoder::Instruction& inst, IR::ValueOpcode opcode) {
-	const auto argument = ReadF16AsF32(inst.src0);
-	const auto magnitude =
-	    ir.BitwiseAnd(ir.BitCastU32(argument), IR::U32(IR::Value(0x7fffffffu)));
-	auto result = IR::F32(ir.Emit(opcode, {argument}));
+	const auto argument  = ReadF16AsF32(inst.src0);
+	const auto magnitude = ir.BitwiseAnd(ir.BitCastU32(argument), IR::U32(IR::Value(0x7fffffffu)));
+	auto       result    = IR::F32(ir.Emit(opcode, {argument}));
 	if (opcode == IR::ValueOpcode::FPSin) {
 		const auto fraction = IR::F32(ir.Emit(IR::ValueOpcode::FPFract32, {argument}));
-		const auto whole = IR::U1(
-		    ir.Emit(IR::ValueOpcode::FPOrdEqual32, {fraction, IR::Value::F32(0.0f)}));
-		const auto half = IR::U1(
-		    ir.Emit(IR::ValueOpcode::FPOrdEqual32, {fraction, IR::Value::F32(0.5f)}));
-		const auto nonzero = ir.INotEqual(magnitude, IR::U32(IR::Value(0u)));
+		const auto whole =
+		    IR::U1(ir.Emit(IR::ValueOpcode::FPOrdEqual32, {fraction, IR::Value::F32(0.0f)}));
+		const auto half =
+		    IR::U1(ir.Emit(IR::ValueOpcode::FPOrdEqual32, {fraction, IR::Value::F32(0.5f)}));
+		const auto nonzero  = ir.INotEqual(magnitude, IR::U32(IR::Value(0u)));
 		const auto cardinal = ir.LogicalOr(ir.LogicalAnd(whole, nonzero), half);
-		result = IR::F32(ir.Emit(
-		    IR::ValueOpcode::SelectF32, {cardinal, IR::Value::F32(0.0f), result}));
+		result =
+		    IR::F32(ir.Emit(IR::ValueOpcode::SelectF32, {cardinal, IR::Value::F32(0.0f), result}));
 	} else {
 		// The architectural quarter-cycle result is exactly zero. Evaluating cos(pi/2) with a
 		// rounded F32 PI can otherwise produce a half-precision subnormal instead.
 		const auto fraction = IR::F32(ir.Emit(IR::ValueOpcode::FPFract32, {argument}));
-		const auto quarter = IR::U1(
-		    ir.Emit(IR::ValueOpcode::FPOrdEqual32, {fraction, IR::Value::F32(0.25f)}));
-		const auto three_quarters = IR::U1(
-		    ir.Emit(IR::ValueOpcode::FPOrdEqual32, {fraction, IR::Value::F32(0.75f)}));
-		result = IR::F32(
-		    ir.Emit(IR::ValueOpcode::SelectF32,
-		            {ir.LogicalOr(quarter, three_quarters), IR::Value::F32(0.0f), result}));
+		const auto quarter =
+		    IR::U1(ir.Emit(IR::ValueOpcode::FPOrdEqual32, {fraction, IR::Value::F32(0.25f)}));
+		const auto three_quarters =
+		    IR::U1(ir.Emit(IR::ValueOpcode::FPOrdEqual32, {fraction, IR::Value::F32(0.75f)}));
+		result = IR::F32(ir.Emit(IR::ValueOpcode::SelectF32, {ir.LogicalOr(quarter, three_quarters),
+		                                                      IR::Value::F32(0.0f), result}));
 	}
 
 	const auto infinite = ir.IEqual(magnitude, IR::U32(IR::Value(0x7f800000u)));
 	result              = ApplyF32ResultModifiers(inst.dst, result);
-	const auto bits    = PackHalf2x16(result, IR::F32(IR::Value::F32(0.0f)));
-	const auto invalid = IR::U32(IR::Value(inst.dst.clamp ? 0u : 0xfe00u));
+	const auto bits     = PackHalf2x16(result, IR::F32(IR::Value::F32(0.0f)));
+	const auto invalid  = IR::U32(IR::Value(inst.dst.clamp ? 0u : 0xfe00u));
 	Write16Bits(DestinationOperand(inst), ir.Select(infinite, invalid, bits));
 	return true;
 }
@@ -129,7 +127,7 @@ bool Translator::FloatBinary(const Decoder::Instruction& inst, IR::ValueOpcode o
 	std::array<IR::Value, 2> args;
 	for (uint32_t index = 0; index < args.size(); index++) {
 		const auto& operand = SourceAt(inst, reverse ? 1u - index : index);
-		args[index]        = ReadOperand(operand, IR::ArgTypeOf(opcode, index));
+		args[index]         = ReadOperand(operand, IR::ArgTypeOf(opcode, index));
 	}
 	WriteOperand(DestinationOperand(inst), ir.Emit(opcode, {args[0], args[1]}));
 	return true;
@@ -140,9 +138,9 @@ bool Translator::FloatTernary(const Decoder::Instruction& inst, IR::ValueOpcode 
 	std::array<IR::Value, 3> args;
 	for (uint32_t index = 0; index < args.size(); index++) {
 		const auto& operand = accumulator && index == 2u ? inst.dst : SourceAt(inst, index);
-		const auto type    = IR::ArgTypeOf(opcode, index);
-		args[index]        = type == IR::Type::F32 && mix ? IR::Value(ReadMixF32(operand))
-		                                                  : ReadOperand(operand, type);
+		const auto  type    = IR::ArgTypeOf(opcode, index);
+		args[index]         = type == IR::Type::F32 && mix ? IR::Value(ReadMixF32(operand))
+		                                                   : ReadOperand(operand, type);
 	}
 	WriteOperand(DestinationOperand(inst), ir.Emit(opcode, {args[0], args[1], args[2]}));
 	return true;

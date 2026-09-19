@@ -7,7 +7,7 @@
 namespace Loader::X64InstructionEmulator {
 
 [[nodiscard]] bool IsReciprocalSquareRoot(const ZydisDecodedInstruction& instruction,
-                                         const ZydisDecodedOperand* operands);
+                                          const ZydisDecodedOperand*     operands);
 uint64_t           PatchReciprocalSquareRoots(uint64_t address, uint64_t size);
 [[nodiscard]] bool TryEmulate(void* native_context);
 

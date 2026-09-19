@@ -1,6 +1,5 @@
-#include "graphics/shader/shader.h"
-
 #include "common/assert.h"
+#include "graphics/shader/shader.h"
 
 namespace Libs::Graphics {
 
@@ -24,8 +23,8 @@ uint32_t ShaderPixelParameterLocation(const ShaderPixelInputInfo& info,
 	std::array<uint32_t, 64> group_locations;
 	group_locations.fill(UINT32_MAX);
 	for (const auto active_input: active_inputs) {
-		const auto mapped = ShaderPixelParameterMappedLocation(info, active_input);
-		const auto group  = mapped * 2u + ShaderPixelParameterIsFlat(info, active_input);
+		const auto mapped   = ShaderPixelParameterMappedLocation(info, active_input);
+		const auto group    = mapped * 2u + ShaderPixelParameterIsFlat(info, active_input);
 		auto&      location = group_locations[group];
 		if (location == UINT32_MAX) {
 			location = mapped;

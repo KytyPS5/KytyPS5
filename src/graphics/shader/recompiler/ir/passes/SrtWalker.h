@@ -27,7 +27,7 @@ void BuildSrtPlan(Program& program);
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
                           RuntimeValueType type = RuntimeValueType::Any);
 bool EvaluateUniformValues(const ResourcePlan& program, std::span<const Value> values,
-                            const SrtRuntime& runtime, std::span<uint32_t> results);
+                           const SrtRuntime& runtime, std::span<uint32_t> results);
 
 bool EvaluateDescriptorSource(const ResourcePlan& program, uint32_t source,
                               const SrtRuntime& runtime, DescriptorValue& result);
@@ -44,8 +44,7 @@ bool EvaluateRuntimeSources(const ResourcePlan& program, std::span<const uint32_
                             std::vector<uint32_t>& flat, std::span<const uint8_t> clean_flat_slots,
                             std::vector<uint8_t>& active_sources);
 
-bool WalkSrt(const ResourcePlan& program, const SrtRuntime& runtime,
-             std::vector<uint32_t>& flat);
+bool WalkSrt(const ResourcePlan& program, const SrtRuntime& runtime, std::vector<uint32_t>& flat);
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
 

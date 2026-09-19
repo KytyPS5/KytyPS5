@@ -115,6 +115,18 @@ std::filesystem::path GetPrintfOutputFile() {
 	return g_config->printf_output_file;
 }
 
+LogConfig GetLogConfig() {
+	return g_config->log_config;
+}
+
+LogSinkConfig GetConsoleLogConfig() {
+	return g_config->log_config.console;
+}
+
+LogSinkConfig GetFileLogConfig() {
+	return g_config->log_config.file;
+}
+
 bool ProfilerEnabled() {
 	return g_config->profiler_enabled;
 }

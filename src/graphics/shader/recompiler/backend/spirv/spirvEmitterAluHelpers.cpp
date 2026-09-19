@@ -109,7 +109,7 @@ F32Class EmitClassifyF32Bits(EmitterState& state, uint32_t bits) {
 	const auto exponent_max =
 	    EmitCompareU32Constant(state, spv::OpIEqual, exponent_bits, 0x7f800000u);
 	const auto mantissa_nonzero = EmitCompareU32Constant(state, spv::OpINotEqual, mantissa_bits, 0);
-	cls.nan  = EmitLogicalAndBool(state, exponent_max, mantissa_nonzero);
+	cls.nan                     = EmitLogicalAndBool(state, exponent_max, mantissa_nonzero);
 	cls.zero                    = EmitCompareU32Constant(state, spv::OpIEqual, abs_bits, 0);
 	return cls;
 }

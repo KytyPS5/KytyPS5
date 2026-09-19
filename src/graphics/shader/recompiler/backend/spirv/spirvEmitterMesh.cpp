@@ -147,7 +147,7 @@ void EmitMeshEntryPoint(EmitterState& state) {
 				if (output.kind == IR::StageOutputKind::Layer) {
 					continue;
 				}
-				const auto type  = MeshOutputType(state, output.kind);
+				const auto type = MeshOutputType(state, output.kind);
 				const auto value =
 				    MeshLoad(state, output.mesh_data_variable, spv::StorageClassPrivate, type,
 				             ConstantU32(state, half));

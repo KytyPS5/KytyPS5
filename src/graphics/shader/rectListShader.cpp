@@ -40,14 +40,15 @@ std::vector<Parameter> GetParameters(const ShaderVertexInputInfo& vertex_info,
 	}
 
 	std::vector<Parameter> parameters;
-	std::array<bool, 32> output_locations {};
+	std::array<bool, 32>   output_locations {};
 	for (const auto input: active_inputs) {
 		const auto input_location = ShaderPixelParameterMappedLocation(*pixel_info, input);
-		const auto output_location = ShaderPixelParameterLocation(*pixel_info, active_inputs, input);
+		const auto output_location =
+		    ShaderPixelParameterLocation(*pixel_info, active_inputs, input);
 		if ((vertex_info.stage.program->param_export_mask & (1u << input_location)) != 0 &&
 		    !output_locations[output_location]) {
-			parameters.push_back({input_location, output_location,
-			                      ShaderPixelParameterIsFlat(*pixel_info, input)});
+			parameters.push_back(
+			    {input_location, output_location, ShaderPixelParameterIsFlat(*pixel_info, input)});
 			output_locations[output_location] = true;
 		}
 	}
@@ -169,8 +170,8 @@ public:
 	std::vector<uint32_t> EmitEvaluation() {
 		DefineEntry(spv::ExecutionModelTessellationEvaluation);
 
-		const auto x     = Load(float_type, Access(ptr_input_float, tess_coord, Int(0)));
-		const auto y     = Load(float_type, Access(ptr_input_float, tess_coord, Int(1)));
+		const auto x = Load(float_type, Access(ptr_input_float, tess_coord, Int(0)));
+		const auto y = Load(float_type, Access(ptr_input_float, tess_coord, Int(1)));
 		const auto index =
 		    Result(spv::OpIAdd, int_type,
 		           Result(spv::OpIMul, int_type, Result(spv::OpConvertFToS, int_type, y), Int(2)),
@@ -223,7 +224,9 @@ private:
 
 	uint32_t Load(uint32_t type, uint32_t pointer) { return Result(spv::OpLoad, type, pointer); }
 
-	void Store(uint32_t pointer, uint32_t value) { builder.AddFunction(spv::OpStore, pointer, value); }
+	void Store(uint32_t pointer, uint32_t value) {
+		builder.AddFunction(spv::OpStore, pointer, value);
+	}
 
 	uint32_t Int(uint32_t value) { return Constant(int_type, value); }
 

@@ -19,7 +19,7 @@ struct Lifecycle {
 	static constexpr auto        emergency_shutdown = Log::Shutdown;
 };
 
-enum class Direction { Silent, Console, File };
+enum class Direction { Silent, Console, File, ConsoleAndFile };
 
 Direction GetDirection();
 bool      IsSilent();
@@ -29,6 +29,7 @@ void      WriteToConsoleAndLog(std::string_view text);
 void      WriteFatal(std::string_view text);
 void      WriteFatal(fmt::text_style style, std::string_view text);
 void      Flush();
+size_t    GetDroppedCount();
 
 namespace Color {
 

@@ -562,7 +562,7 @@ private:
 struct ReadyFrame {
 	std::unique_ptr<GuestBuffer> buffer;
 	AvPlayerFrameInfoEx          info {};
-	uint64_t                    timestamp_offset = 0;
+	uint64_t                     timestamp_offset = 0;
 };
 
 class FileStreamer {
@@ -1646,10 +1646,10 @@ private:
 	bool                                     paused                   = false;
 	bool                                     seek_video_frame_pending = false;
 	std::atomic_bool                         loop {false};
-	int32_t                                  trick_speed   = AVPLAYER_TRICK_SPEED_NORMAL;
-	uint32_t                                 sync_mode     = 0;
-	uint64_t                                 start_time_ms = 0;
-	uint64_t                                 last_audio_ts = 0;
+	int32_t                                  trick_speed             = AVPLAYER_TRICK_SPEED_NORMAL;
+	uint32_t                                 sync_mode               = 0;
+	uint64_t                                 start_time_ms           = 0;
+	uint64_t                                 last_audio_ts           = 0;
 	uint64_t                                 last_output_loop_offset = 0;
 	uint32_t                                 pending_loop_warnings   = 0;
 	std::chrono::steady_clock::time_point    clock_start {};

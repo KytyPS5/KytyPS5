@@ -260,7 +260,7 @@ vk::Pipeline TileManager::GetPipeline(uint32_t slot) {
 	const uint32_t                   values[] {1u << element_index, direction_index};
 	const vk::SpecializationMapEntry entries[] {{0, 0, 4}, {1, 4, 4}};
 	const vk::SpecializationInfo     specialization {2, entries, sizeof(values), values};
-	const auto module =
+	const auto                       module =
 	    CompileSPV({shaders[family_index].code, shaders[family_index].words}, m_graphics.device);
 	vk::PipelineShaderStageCreateInfo stage {};
 	stage.stage               = vk::ShaderStageFlagBits::eCompute;
@@ -277,19 +277,20 @@ vk::Pipeline TileManager::GetPipeline(uint32_t slot) {
 	return m_pipelines[slot];
 }
 
-void TileManager::Record(vk::Buffer source, uint64_t source_offset,
-                         uint64_t source_capacity, vk::Buffer target, uint64_t target_offset,
-                         uint64_t target_capacity, std::span<Dispatch> dispatches,
-                         bool clear_target) {
+void TileManager::Record(vk::Buffer source, uint64_t source_offset, uint64_t source_capacity,
+                         vk::Buffer target, uint64_t target_offset, uint64_t target_capacity,
+                         std::span<Dispatch> dispatches, bool clear_target) {
 	const auto&    limits = m_graphics.GetPhysicalDeviceProperties().limits;
 	const uint64_t descriptor_alignment =
 	    std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
-	const uint64_t source_descriptor_offset = Common::AlignDown(source_offset, descriptor_alignment);
-	const uint64_t target_descriptor_offset = Common::AlignDown(target_offset, descriptor_alignment);
-	const uint64_t source_base              = source_offset - source_descriptor_offset;
-	const uint64_t target_base              = target_offset - target_descriptor_offset;
-	const uint64_t source_range             = Common::AlignUp(source_base + source_capacity, 4);
-	const uint64_t target_range             = Common::AlignUp(target_base + target_capacity, 4);
+	const uint64_t source_descriptor_offset =
+	    Common::AlignDown(source_offset, descriptor_alignment);
+	const uint64_t target_descriptor_offset =
+	    Common::AlignDown(target_offset, descriptor_alignment);
+	const uint64_t source_base  = source_offset - source_descriptor_offset;
+	const uint64_t target_base  = target_offset - target_descriptor_offset;
+	const uint64_t source_range = Common::AlignUp(source_base + source_capacity, 4);
+	const uint64_t target_range = Common::AlignUp(target_base + target_capacity, 4);
 	EXIT_NOT_IMPLEMENTED(source_range > limits.maxStorageBufferRange ||
 	                     target_range > limits.maxStorageBufferRange || target_offset % 4 != 0 ||
 	                     target_capacity % 4 != 0);
@@ -371,8 +372,7 @@ TileManager::Result TileManager::Detile(vk::Buffer tiled, uint64_t tiled_offset,
 	Prepare(false, tiled_capacity, linear_capacity, infos, source_base, 0, dispatches);
 	auto scratch = AllocateScratch(Common::AlignUp(linear_capacity, 4));
 	DeferDestroy(scratch);
-	Record(tiled, tiled_offset, tiled_capacity, scratch.buffer, 0, scratch.size, dispatches,
-	       true);
+	Record(tiled, tiled_offset, tiled_capacity, scratch.buffer, 0, scratch.size, dispatches, true);
 	return {scratch.buffer, 0, linear_capacity};
 }
 
@@ -386,8 +386,8 @@ void TileManager::Tile(vk::Buffer linear, uint64_t linear_offset, uint64_t linea
 	const uint64_t        target_base = tiled_offset & (descriptor_alignment - 1);
 	std::vector<Dispatch> dispatches;
 	Prepare(true, tiled_capacity, linear_capacity, infos, source_base, target_base, dispatches);
-	Record(linear, linear_offset, linear_capacity, tiled, tiled_offset, tiled_capacity,
-	       dispatches, false);
+	Record(linear, linear_offset, linear_capacity, tiled, tiled_offset, tiled_capacity, dispatches,
+	       false);
 }
 
 void TileManager::TileImage(Image& image, std::span<const vk::BufferImageCopy> regions,
@@ -468,7 +468,7 @@ void TileManager::ConvertD16(Result source, Result target, D16Direction directio
 			code  = GPU_TILER_DEMOTE_D16_SPV;
 			words = std::size(GPU_TILER_DEMOTE_D16_SPV);
 		}
-		const auto module = CompileSPV({code, words}, m_graphics.device);
+		const auto                        module = CompileSPV({code, words}, m_graphics.device);
 		vk::PipelineShaderStageCreateInfo stage {};
 		stage.stage               = vk::ShaderStageFlagBits::eCompute;
 		stage.module              = module;

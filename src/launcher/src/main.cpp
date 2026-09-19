@@ -1,5 +1,5 @@
-#include "mainDialog.h"
 #include "launcherTheme.h"
+#include "mainDialog.h"
 
 #include <QApplication>
 

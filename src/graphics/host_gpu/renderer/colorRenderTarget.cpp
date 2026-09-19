@@ -42,14 +42,13 @@ static bool DccAlphaOnMsb(const HW::ColorInfo& info) {
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& r,
-                                              uint32_t         render_target_slice_offset,
-                                              uint32_t rt_slot, bool ignore_target_mask,
-                                              bool exact_format) {
+                                              uint32_t render_target_slice_offset, uint32_t rt_slot,
+                                              bool ignore_target_mask, bool exact_format) {
 	KYTY_PROFILER_FUNCTION();
 	const auto& hw = buffer.GetRegisters();
 
-	const auto& rt      = hw.GetRenderTarget(rt_slot);
-	auto        mask    = render_target_mask_slot(hw.GetRenderTargetMask(), rt_slot);
+	const auto& rt   = hw.GetRenderTarget(rt_slot);
+	auto        mask = render_target_mask_slot(hw.GetRenderTargetMask(), rt_slot);
 	if (ignore_target_mask && rt.base.addr != 0 && mask == 0) {
 		mask = 0x0f;
 	}
@@ -106,12 +105,12 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	const uint32_t depth = volume ? rt.attrib3.depth + 1u : 1u;
 	// For volumes, CB_COLOR_VIEW bounds exported slices; ATTRIB3 defines storage depth.
 	// The host attachment contains only the selected slices that exist in this mip.
-	const uint32_t last_layer = volume
-	                                ? std::min(rt.view.last_array_slice_index,
-	                                           std::max(depth >> rt.view.current_mip_level, 1u) - 1u)
-	                                : rt.view.last_array_slice_index;
-	const auto view = ResolveTargetViewInfo(
-	    rt.view.base_array_slice_index, last_layer, render_target_slice_offset);
+	const uint32_t last_layer =
+	    volume ? std::min(rt.view.last_array_slice_index,
+	                      std::max(depth >> rt.view.current_mip_level, 1u) - 1u)
+	           : rt.view.last_array_slice_index;
+	const auto view = ResolveTargetViewInfo(rt.view.base_array_slice_index, last_layer,
+	                                        render_target_slice_offset);
 	switch (view.type) {
 		case TargetViewType::Image2D:
 		case TargetViewType::Image2DArray: break;
@@ -140,15 +139,15 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	// Nonlinear clear values are still stored as normalized components.
 	// Fast color clears are metadata driven and must be handled explicitly when
 	// that metadata path is implemented; render-pass load must preserve contents.
-	uint32_t   width  = 0;
-	uint32_t   height = 0;
-	uint32_t   pitch  = 0;
-	uint64_t   size   = 0;
-	bool       tile   = false;
-	const bool     standard4    = rt.attrib3.tile_mode == Prospero::TileMode::kStandard4KB;
-	const bool     standard64   = rt.attrib3.tile_mode == Prospero::TileMode::kStandard64KB;
-	const bool     depth_tile   = rt.attrib3.tile_mode == Prospero::TileMode::kDepth;
-	const bool     texture_tile = standard4 || standard64 || depth_tile;
+	uint32_t   width        = 0;
+	uint32_t   height       = 0;
+	uint32_t   pitch        = 0;
+	uint64_t   size         = 0;
+	bool       tile         = false;
+	const bool standard4    = rt.attrib3.tile_mode == Prospero::TileMode::kStandard4KB;
+	const bool standard64   = rt.attrib3.tile_mode == Prospero::TileMode::kStandard64KB;
+	const bool depth_tile   = rt.attrib3.tile_mode == Prospero::TileMode::kDepth;
+	const bool texture_tile = standard4 || standard64 || depth_tile;
 
 	switch (rt.attrib3.tile_mode) {
 		case Prospero::TileMode::kLinear:
@@ -292,14 +291,14 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	}
 
 	TextureCache::ImageDesc desc {};
-	desc.type              = TextureCache::BindingType::RenderTarget;
-	desc.info.data         = {rt.base.addr, backing_size};
-	desc.info.pixel_format = target_format.format;
-	desc.info.guest_format = transfer_format;
-	desc.info.type         = image_type;
-	desc.info.extent       = {width, height, depth};
-	desc.info.resources    = {levels, volume ? 1u : view.image_layers};
-	desc.info.pitch        = pitch;
+	desc.type                 = TextureCache::BindingType::RenderTarget;
+	desc.info.data            = {rt.base.addr, backing_size};
+	desc.info.pixel_format    = target_format.format;
+	desc.info.guest_format    = transfer_format;
+	desc.info.type            = image_type;
+	desc.info.extent          = {width, height, depth};
+	desc.info.resources       = {levels, volume ? 1u : view.image_layers};
+	desc.info.pitch           = pitch;
 	desc.info.bytes_per_block = bytes_per_element;
 	desc.info.samples         = samples;
 	desc.info.tile_mode       = rt.attrib3.tile_mode;

@@ -9,6 +9,7 @@
 #include "common/threads.h"
 #include "kernel/pthread.h"
 #include "kernel/semaphore.h"
+#include "libatrac9.h"
 #include "libs/audio_internal.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -21,8 +22,6 @@
 #include <limits>
 #include <magic_enum.hpp>
 #include <vector>
-
-#include "libatrac9.h"
 
 namespace Libs::Audio {
 
@@ -93,10 +92,10 @@ public:
 	uint32_t AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking = true);
 	bool     AudioOutGetStatus(Id handle, int* type, int* channels_num);
 
-	Id       AudioInOpen(uint32_t samples_num, uint32_t freq, Format format, bool asynchronous);
-	int      AudioInClose(Id handle);
-	int      AudioInGetSilentState(Id handle);
-	int      AudioInInput(Id handle, void* dest);
+	Id  AudioInOpen(uint32_t samples_num, uint32_t freq, Format format, bool asynchronous);
+	int AudioInClose(Id handle);
+	int AudioInGetSilentState(Id handle);
+	int AudioInInput(Id handle, void* dest);
 
 	static constexpr int OUT_PORTS_MAX = 32;
 	static constexpr int IN_PORTS_MAX  = 8;
@@ -343,8 +342,8 @@ const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
 		for (uint32_t frame = 0; frame < frames; frame++) {
 			for (uint32_t ch = 0; ch < output_channels; ch++) {
 				const auto src_ch = reorder ? SDL_8CH_MAP[ch] : ch;
-				int64_t sample =
-				    static_cast<int64_t>(src[frame * channels + src_ch]) * port.volume[src_ch] / 32768;
+				int64_t    sample = static_cast<int64_t>(src[frame * channels + src_ch]) *
+				                    port.volume[src_ch] / 32768;
 				if (sample > std::numeric_limits<int16_t>::max()) {
 					sample = std::numeric_limits<int16_t>::max();
 				} else if (sample < std::numeric_limits<int16_t>::min()) {
@@ -368,8 +367,7 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking) {
 	std::vector<uint8_t> prepared_buffer;
 	const void*          prepared_data   = PrepareOutputBuffer(*port, data, &prepared_buffer);
 	const auto           output_channels = OutputChannels(*port);
-	const auto           prepared_size =
-	    BytesPerSample(port->format) * output_channels * port->samples_num;
+	const auto prepared_size = BytesPerSample(port->format) * output_channels * port->samples_num;
 
 	std::vector<uint8_t> convert_buffer;
 	const void*          queue_data = prepared_data;
@@ -612,7 +610,8 @@ void Audio::CloseSdlDevice(PortIn* port) {
 	}
 }
 
-Audio::Id Audio::AudioInOpen(uint32_t samples_num, uint32_t freq, Format format, bool asynchronous) {
+Audio::Id Audio::AudioInOpen(uint32_t samples_num, uint32_t freq, Format format,
+                             bool asynchronous) {
 	Common::LockGuard lock(m_mutex);
 
 	for (int id = 0; id < IN_PORTS_MAX; id++) {
@@ -638,8 +637,7 @@ Audio::Id Audio::AudioInOpen(uint32_t samples_num, uint32_t freq, Format format,
 }
 
 Audio::PortIn* Audio::GetAudioInPort(Id handle) {
-	if (handle.GetId() < 0 || handle.GetId() >= IN_PORTS_MAX ||
-	    !m_in_ports[handle.GetId()].used) {
+	if (handle.GetId() < 0 || handle.GetId() >= IN_PORTS_MAX || !m_in_ports[handle.GetId()].used) {
 		return nullptr;
 	}
 	return &m_in_ports[handle.GetId()];
@@ -647,7 +645,7 @@ Audio::PortIn* Audio::GetAudioInPort(Id handle) {
 
 int Audio::AudioInClose(Id handle) {
 	Common::LockGuard lock(m_mutex);
-	auto* port = GetAudioInPort(handle);
+	auto*             port = GetAudioInPort(handle);
 	if (port == nullptr) {
 		return AUDIO_IN_ERROR_INVALID_HANDLE;
 	}
@@ -932,8 +930,8 @@ namespace AudioIn {
 
 LIB_NAME("AudioIn", "AudioIn");
 
-static int OpenPort(int user_id, int type, int index, uint32_t len, uint32_t freq,
-                    uint32_t param, bool asynchronous) {
+static int OpenPort(int user_id, int type, int index, uint32_t len, uint32_t freq, uint32_t param,
+                    bool asynchronous) {
 	LOGF("\t user_id = %d\n"
 	     "\t type    = %d\n"
 	     "\t index   = %d\n"
@@ -978,14 +976,14 @@ static int OpenPort(int user_id, int type, int index, uint32_t len, uint32_t fre
 	return id.ToInt();
 }
 
-int KYTY_SYSV_ABI AudioInOpen(int user_id, int type, int index, uint32_t len,
-                              uint32_t freq, uint32_t param) {
+int KYTY_SYSV_ABI AudioInOpen(int user_id, int type, int index, uint32_t len, uint32_t freq,
+                              uint32_t param) {
 	PRINT_NAME();
 	return OpenPort(user_id, type, index, len, freq, param, false);
 }
 
-int KYTY_SYSV_ABI AudioInHqOpen(int user_id, int type, int index, uint32_t len,
-                                uint32_t freq, uint32_t param) {
+int KYTY_SYSV_ABI AudioInHqOpen(int user_id, int type, int index, uint32_t len, uint32_t freq,
+                                uint32_t param) {
 	PRINT_NAME();
 	return OpenPort(user_id, type, index, len, freq, param, true);
 }
@@ -1514,14 +1512,10 @@ namespace Ngs2 {
 
 LIB_NAME("Ngs2", "Ngs2");
 
-constexpr int32_t NGS2_ERROR_INVALID_OUT_ADDRESS =
-    static_cast<int32_t>(0x804a8010u);
-constexpr int32_t NGS2_ERROR_INVALID_WAVEFORM_DATA =
-    static_cast<int32_t>(0x804a8430u);
-constexpr int32_t NGS2_ERROR_INVALID_WAVEFORM_FORMAT =
-    static_cast<int32_t>(0x804a8431u);
-constexpr int32_t NGS2_ERROR_UNKNOWN_WAVEFORM_FORMAT =
-    static_cast<int32_t>(0x804a8432u);
+constexpr int32_t NGS2_ERROR_INVALID_OUT_ADDRESS     = static_cast<int32_t>(0x804a8010u);
+constexpr int32_t NGS2_ERROR_INVALID_WAVEFORM_DATA   = static_cast<int32_t>(0x804a8430u);
+constexpr int32_t NGS2_ERROR_INVALID_WAVEFORM_FORMAT = static_cast<int32_t>(0x804a8431u);
+constexpr int32_t NGS2_ERROR_UNKNOWN_WAVEFORM_FORMAT = static_cast<int32_t>(0x804a8432u);
 
 constexpr uint32_t NGS2_WAVEFORM_TYPE_ATRAC9 = 0x40;
 
@@ -2625,10 +2619,9 @@ static bool Ngs2FourCcEquals(const uint8_t* data, const char* four_cc) {
 }
 
 static int Ngs2ParseAtrac9Riff(const void* data, size_t data_size, Ngs2WaveformInfo* info) {
-	static constexpr uint8_t ATRAC9_GUID[16] = {0xd2, 0x42, 0xe1, 0x47, 0xba, 0x36,
-	                                            0x8d, 0x4d, 0x88, 0xfc, 0x61, 0x65,
-	                                            0x4f, 0x8c, 0x83, 0x6c};
-	const auto* bytes = static_cast<const uint8_t*>(data);
+	static constexpr uint8_t ATRAC9_GUID[16] = {0xd2, 0x42, 0xe1, 0x47, 0xba, 0x36, 0x8d, 0x4d,
+	                                            0x88, 0xfc, 0x61, 0x65, 0x4f, 0x8c, 0x83, 0x6c};
+	const auto*              bytes           = static_cast<const uint8_t*>(data);
 	if (bytes == nullptr || data_size < 12) {
 		return NGS2_ERROR_INVALID_WAVEFORM_DATA;
 	}
@@ -2642,15 +2635,15 @@ static int Ngs2ParseAtrac9Riff(const void* data, size_t data_size, Ngs2WaveformI
 	}
 	const auto riff_end = static_cast<size_t>(riff_end64);
 
-	const uint8_t* format           = nullptr;
-	const uint8_t* fact             = nullptr;
-	size_t         waveform_offset  = 0;
-	uint32_t       waveform_size    = 0;
+	const uint8_t* format          = nullptr;
+	const uint8_t* fact            = nullptr;
+	size_t         waveform_offset = 0;
+	uint32_t       waveform_size   = 0;
 
 	for (size_t offset = 12; offset + 8 <= riff_end;) {
-		const auto* chunk       = bytes + offset;
-		const auto  chunk_size  = static_cast<size_t>(Ngs2ReadLe32(chunk + 4));
-		const auto  payload     = offset + 8;
+		const auto* chunk      = bytes + offset;
+		const auto  chunk_size = static_cast<size_t>(Ngs2ReadLe32(chunk + 4));
+		const auto  payload    = offset + 8;
 		if (chunk_size > riff_end - payload) {
 			return NGS2_ERROR_INVALID_WAVEFORM_DATA;
 		}
@@ -2696,11 +2689,11 @@ static int Ngs2ParseAtrac9Riff(const void* data, size_t data_size, Ngs2WaveformI
 
 	Atrac9CodecInfo codec {};
 	void*           decoder = Atrac9GetHandle();
-	const bool valid_codec =
-	    decoder != nullptr && Atrac9InitDecoder(decoder, config.data()) == 0 &&
-	    Atrac9GetCodecInfo(decoder, &codec) == 0 && codec.channels > 0 &&
-	    codec.samplingRate > 0 && codec.superframeSize > 0 && codec.framesInSuperframe > 0 &&
-	    codec.frameSamples > 0 && codec.superframeSize % codec.framesInSuperframe == 0;
+	const bool valid_codec = decoder != nullptr && Atrac9InitDecoder(decoder, config.data()) == 0 &&
+	                         Atrac9GetCodecInfo(decoder, &codec) == 0 && codec.channels > 0 &&
+	                         codec.samplingRate > 0 && codec.superframeSize > 0 &&
+	                         codec.framesInSuperframe > 0 && codec.frameSamples > 0 &&
+	                         codec.superframeSize % codec.framesInSuperframe == 0;
 	if (decoder != nullptr) {
 		Atrac9ReleaseHandle(decoder);
 	}
@@ -2718,19 +2711,18 @@ static int Ngs2ParseAtrac9Riff(const void* data, size_t data_size, Ngs2WaveformI
 	info->format.num_channels  = static_cast<uint32_t>(codec.channels);
 	info->format.sample_rate   = static_cast<uint32_t>(codec.samplingRate);
 	std::memcpy(&info->format.config_data, config.data(), config.size());
-	info->data_offset              = static_cast<uint32_t>(waveform_offset);
-	info->data_size                = waveform_size;
-	info->num_samples              = Ngs2ReadLe32(fact);
-	info->audio_unit_size          = static_cast<uint32_t>(codec.superframeSize /
-	                                                       codec.framesInSuperframe);
-	info->num_audio_unit_samples   = static_cast<uint32_t>(codec.frameSamples);
-	info->num_audio_unit_per_frame = static_cast<uint32_t>(codec.framesInSuperframe);
-	info->audio_frame_size         = static_cast<uint32_t>(codec.superframeSize);
-	info->num_audio_frame_samples  = static_cast<uint32_t>(frame_samples);
-	info->num_delay_samples        = Ngs2ReadLe32(fact + 4);
-	info->num_blocks               = 1;
-	info->blocks[0].data_offset    = waveform_offset;
-	info->blocks[0].data_size      = waveform_size;
+	info->data_offset     = static_cast<uint32_t>(waveform_offset);
+	info->data_size       = waveform_size;
+	info->num_samples     = Ngs2ReadLe32(fact);
+	info->audio_unit_size = static_cast<uint32_t>(codec.superframeSize / codec.framesInSuperframe);
+	info->num_audio_unit_samples     = static_cast<uint32_t>(codec.frameSamples);
+	info->num_audio_unit_per_frame   = static_cast<uint32_t>(codec.framesInSuperframe);
+	info->audio_frame_size           = static_cast<uint32_t>(codec.superframeSize);
+	info->num_audio_frame_samples    = static_cast<uint32_t>(frame_samples);
+	info->num_delay_samples          = Ngs2ReadLe32(fact + 4);
+	info->num_blocks                 = 1;
+	info->blocks[0].data_offset      = waveform_offset;
+	info->blocks[0].data_size        = waveform_size;
 	info->blocks[0].num_skip_samples = Ngs2ReadLe32(fact + 8);
 	info->blocks[0].num_samples      = info->num_samples;
 	return OK;

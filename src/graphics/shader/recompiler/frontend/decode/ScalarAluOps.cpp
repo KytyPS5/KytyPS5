@@ -25,16 +25,14 @@ constexpr OpcodeMap SOP2_OPCODE_LIST[] = {
     {0x1eu, Opcode::S_LSHL_B32},        {0x1fu, Opcode::S_LSHL_B64},
     {0x20u, Opcode::S_LSHR_B32},        {0x21u, Opcode::S_LSHR_B64},
     {0x22u, Opcode::S_ASHR_I32},        {0x23u, Opcode::S_ASHR_I64},
-    {0x24u, Opcode::S_BFM_B32},
-    {0x25u, Opcode::S_BFM_B64},         {0x26u, Opcode::S_MUL_I32},
-    {0x27u, Opcode::S_BFE_U32},         {0x28u, Opcode::S_BFE_I32},
-    {0x29u, Opcode::S_BFE_U64},         {0x2cu, Opcode::S_ABSDIFF_I32},
-    {0x2eu, Opcode::S_LSHL1_ADD_U32},
+    {0x24u, Opcode::S_BFM_B32},         {0x25u, Opcode::S_BFM_B64},
+    {0x26u, Opcode::S_MUL_I32},         {0x27u, Opcode::S_BFE_U32},
+    {0x28u, Opcode::S_BFE_I32},         {0x29u, Opcode::S_BFE_U64},
+    {0x2cu, Opcode::S_ABSDIFF_I32},     {0x2eu, Opcode::S_LSHL1_ADD_U32},
     {0x2fu, Opcode::S_LSHL2_ADD_U32},   {0x30u, Opcode::S_LSHL3_ADD_U32},
     {0x31u, Opcode::S_LSHL4_ADD_U32},   {0x32u, Opcode::S_PACK_LL_B32_B16},
     {0x33u, Opcode::S_PACK_LH_B32_B16}, {0x34u, Opcode::S_PACK_HH_B32_B16},
-    {0x35u, Opcode::S_MUL_HI_U32},
-    {0x36u, Opcode::S_MUL_HI_I32},
+    {0x35u, Opcode::S_MUL_HI_U32},      {0x36u, Opcode::S_MUL_HI_I32},
 };
 
 constexpr OpcodeMap SOP1_OPCODE_LIST[] = {
@@ -79,14 +77,28 @@ constexpr OpcodeMap SOPC_OPCODE_LIST[] = {
 };
 
 constexpr OpcodeMap SOPK_OPCODE_LIST[] = {
-    {0x00u, Opcode::S_MOVK_I32},   {0x03u, Opcode::S_CMP_EQ_I32}, {0x04u, Opcode::S_CMP_LG_I32},
-    {0x05u, Opcode::S_CMP_GT_I32}, {0x06u, Opcode::S_CMP_GE_I32}, {0x07u, Opcode::S_CMP_LT_I32},
-    {0x08u, Opcode::S_CMP_LE_I32}, {0x09u, Opcode::S_CMP_EQ_U32}, {0x0au, Opcode::S_CMP_LG_U32},
-    {0x0bu, Opcode::S_CMP_GT_U32}, {0x0cu, Opcode::S_CMP_GE_U32}, {0x0du, Opcode::S_CMP_LT_U32},
-    {0x0eu, Opcode::S_CMP_LE_U32}, {0x0fu, Opcode::S_ADD_I32},    {0x10u, Opcode::S_MULK_I32},
-    {0x13u, Opcode::S_SETREG_B32}, {0x17u, Opcode::S_WAITCNT},    {0x18u, Opcode::S_WAITCNT},
-    {0x19u, Opcode::S_WAITCNT},    {0x1au, Opcode::S_WAITCNT},
-    {0x1bu, Opcode::S_SUBVECTOR_LOOP_BEGIN}, {0x1cu, Opcode::S_SUBVECTOR_LOOP_END},
+    {0x00u, Opcode::S_MOVK_I32},
+    {0x03u, Opcode::S_CMP_EQ_I32},
+    {0x04u, Opcode::S_CMP_LG_I32},
+    {0x05u, Opcode::S_CMP_GT_I32},
+    {0x06u, Opcode::S_CMP_GE_I32},
+    {0x07u, Opcode::S_CMP_LT_I32},
+    {0x08u, Opcode::S_CMP_LE_I32},
+    {0x09u, Opcode::S_CMP_EQ_U32},
+    {0x0au, Opcode::S_CMP_LG_U32},
+    {0x0bu, Opcode::S_CMP_GT_U32},
+    {0x0cu, Opcode::S_CMP_GE_U32},
+    {0x0du, Opcode::S_CMP_LT_U32},
+    {0x0eu, Opcode::S_CMP_LE_U32},
+    {0x0fu, Opcode::S_ADD_I32},
+    {0x10u, Opcode::S_MULK_I32},
+    {0x13u, Opcode::S_SETREG_B32},
+    {0x17u, Opcode::S_WAITCNT},
+    {0x18u, Opcode::S_WAITCNT},
+    {0x19u, Opcode::S_WAITCNT},
+    {0x1au, Opcode::S_WAITCNT},
+    {0x1bu, Opcode::S_SUBVECTOR_LOOP_BEGIN},
+    {0x1cu, Opcode::S_SUBVECTOR_LOOP_END},
 };
 
 constexpr OpcodeMap SOPP_OPCODE_LIST[] = {
@@ -198,8 +210,8 @@ void DecodeSopk(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	const uint32_t opcode = (word >> 23u) & 0x1fu;
 	const uint32_t sdst   = (word >> 16u) & 0x7fu;
 	const auto     imm    = opcode >= 0x09u && opcode <= 0x0eu
-	                           ? static_cast<int32_t>(word & 0xffffu)
-	                           : static_cast<int32_t>(static_cast<int16_t>(word & 0xffffu));
+	                            ? static_cast<int32_t>(word & 0xffffu)
+	                            : static_cast<int32_t>(static_cast<int16_t>(word & 0xffffu));
 
 	inst.pc              = pc;
 	inst.family          = Family::SOPK;
@@ -293,13 +305,13 @@ void DecodeSopp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	                           : static_cast<int32_t>(static_cast<int16_t>(simm));
 	inst.src_count = (inst.opcode == Opcode::S_NOP || inst.opcode == Opcode::S_WAITCNT ||
 	                  inst.opcode == Opcode::S_WAITCNT_DEPCTR || inst.opcode == Opcode::S_SLEEP ||
-	                  inst.opcode == Opcode::S_SETPRIO ||
-	                  inst.opcode == Opcode::S_SENDMSG || inst.opcode == Opcode::S_TRAP ||
-	                  inst.opcode == Opcode::S_TTRACEDATA || inst.opcode == Opcode::S_INST_PREFETCH)
+	                  inst.opcode == Opcode::S_SETPRIO || inst.opcode == Opcode::S_SENDMSG ||
+	                  inst.opcode == Opcode::S_TRAP || inst.opcode == Opcode::S_TTRACEDATA ||
+	                  inst.opcode == Opcode::S_INST_PREFETCH)
 	                     ? 1
 	                     : 0;
 	const auto branch_offset = static_cast<int32_t>(static_cast<int16_t>(simm)) * 4;
-	inst.branch_target = pc + 4u + static_cast<uint32_t>(branch_offset);
+	inst.branch_target       = pc + 4u + static_cast<uint32_t>(branch_offset);
 	SetRawWords(inst, code, word_index, 1);
 
 	if (inst.opcode == Opcode::UNSUPPORTED) {

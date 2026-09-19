@@ -21,11 +21,11 @@ enum class ImageMetadataKind : uint8_t { None, Htile, Dcc };
 
 struct ImageMetadataInfo {
 	GuestRange          range;
-	ImageMetadataKind   kind               = ImageMetadataKind::None;
-	uint32_t            control            = 0;
+	ImageMetadataKind   kind                     = ImageMetadataKind::None;
+	uint32_t            control                  = 0;
 	uint32_t            dcc_clear_word           = 0;
-	VideoOutCompression compression        = VideoOutCompression::Uncompressed;
-	bool                stencil_compressed = false;
+	VideoOutCompression compression              = VideoOutCompression::Uncompressed;
+	bool                stencil_compressed       = false;
 	bool                dcc_clear_register_valid = false;
 	bool                dcc_alpha_msb            = true;
 };
@@ -45,8 +45,8 @@ struct ImageSubresourceRange {
 };
 
 struct ImageMipInfo {
-	uint64_t offset                                 = 0;
-	uint64_t size                                   = 0;
+	uint64_t offset = 0;
+	uint64_t size   = 0;
 	// Padded dimensions in storage elements (compressed blocks for BC formats).
 	uint32_t pitch                                  = 0;
 	uint32_t height                                 = 0;
@@ -105,12 +105,12 @@ struct ImageInfo {
 		return -1;
 	}
 	[[nodiscard]] int32_t SliceOf(const ImageInfo& container, int32_t mip) const noexcept {
-		if (!IsCompatible(container) || tile_mode != container.tile_mode || type != container.type ||
-		    IsVolume() || resources.levels != 1 || resources.layers == 0 ||
-		    container.resources.layers == 0 || mip < 0 ||
+		if (!IsCompatible(container) || tile_mode != container.tile_mode ||
+		    type != container.type || IsVolume() || resources.levels != 1 ||
+		    resources.layers == 0 || container.resources.layers == 0 || mip < 0 ||
 		    static_cast<uint32_t>(mip) >= container.resources.levels ||
-		    container.resources.levels > container.mip_layout.size() ||
-		    !data.Valid() || !container.data.Valid() || data.address < container.data.address ||
+		    container.resources.levels > container.mip_layout.size() || !data.Valid() ||
+		    !container.data.Valid() || data.address < container.data.address ||
 		    data.End() > container.data.End()) {
 			return -1;
 		}

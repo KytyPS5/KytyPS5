@@ -84,9 +84,9 @@ public:
 	GameStatus game_status     = GameStatus::Unknown;
 	QString    game_comment;
 
-	Resolution             screen_resolution           = Resolution::R1280X720;
-	QString                user_name                   = "Kyty";
-	int                    user_id                     = Config::DEFAULT_USER_ID;
+	Resolution             screen_resolution = Resolution::R1280X720;
+	QString                user_name         = "Kyty";
+	int                    user_id           = Config::DEFAULT_USER_ID;
 	QString                audio_input_device;
 	PresentMode            present_mode                = PresentMode::Mailbox;
 	int                    gpu_index                   = -1;
@@ -97,12 +97,12 @@ public:
 	bool                   vulkan_validation_enabled   = false;
 	bool                   shader_validation_enabled   = true;
 	ShaderOptimizationType shader_optimization_type    = ShaderOptimizationType::Performance;
-	LogDirection           shader_log_direction        = LogDirection::Silent;
+	LogDirection           shader_log_direction        = LogDirection::File;
 	QString                shader_log_folder           = "_Shaders";
 	bool                   command_buffer_dump_enabled = false;
 	QString                command_buffer_dump_folder  = "_Buffers";
-	LogDirection           printf_direction            = LogDirection::Silent;
-	QString                printf_output_file          = "_kyty.txt";
+	LogDirection           printf_direction            = LogDirection::File;
+	QString                printf_output_file          = "_Kyty.txt";
 	bool                   profiler_enabled            = false;
 	bool                   renderdoc_enabled           = false;
 	bool                   amd_cpu_enabled             = false;

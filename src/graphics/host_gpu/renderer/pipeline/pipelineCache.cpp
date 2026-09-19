@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 
 #include "common/assert.h"
+#include "common/asyncWriter.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
@@ -30,6 +31,7 @@
 #include <spirv-tools/libspirv.hpp>
 #include <string_view>
 #include <tuple>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <xxhash.h>
@@ -92,6 +94,11 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 	Log::WriteToConsoleAndLog(message);
 }
 
+bool IsFileOutputEnabled(Config::LogDirection direction) {
+	return direction == Config::LogDirection::File ||
+	       direction == Config::LogDirection::ConsoleAndFile;
+}
+
 bool ReadShaderGuestMemory(void*, uint64_t address, uint32_t* value) {
 	return value != nullptr &&
 	       Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, value, sizeof(*value));
@@ -99,49 +106,36 @@ bool ReadShaderGuestMemory(void*, uint64_t address, uint32_t* value) {
 
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
                      const std::vector<uint32_t>& spirv) {
-	if (!Config::GraphicsDebugDumpEnabled()) {
+	if (!Config::GraphicsDebugDumpEnabled() &&
+	    !IsFileOutputEnabled(Config::GetShaderLogDirection())) {
 		return;
 	}
 	static std::atomic_int id = 0;
 	const auto path = Config::GetShaderLogFolder() / fmt::format("{:04d}_new_shader_{}_{:016x}.spv",
 	                                                             id++, stage_name, shader_hash);
-	Common::File::CreateDirectories(path.parent_path());
-	Common::File file(path);
-	if (file.IsInvalid()) {
-		const auto path_text = Common::PathToString(path);
-		LOGF_COLOR(Log::Color::BrightRed, "Can't create file: %s\n", path_text.c_str());
-		return;
-	}
-	file.Write(spirv.data(), spirv.size() * sizeof(uint32_t));
+	std::vector<uint8_t> data(reinterpret_cast<const uint8_t*>(spirv.data()),
+	                          reinterpret_cast<const uint8_t*>(spirv.data() + spirv.size()));
+	Common::AsyncWriter::EnqueueFileWrite(path, std::move(data));
 }
 
 void DumpShaderOriginal(const char* stage_name, uint64_t shader_hash,
                         std::span<const uint32_t> code, const std::string& decoded_dump) {
-	if (!Config::GraphicsDebugDumpEnabled()) {
+	if (!Config::GraphicsDebugDumpEnabled() &&
+	    !IsFileOutputEnabled(Config::GetShaderLogDirection())) {
 		return;
 	}
 	EXIT_IF(code.empty());
 	static std::atomic_int id = 0;
 	const auto base = Config::GetShaderLogFolder() / "original" /
 	                  fmt::format("{:04d}_new_shader_{}_{:016x}", id++, stage_name, shader_hash);
-	Common::File::CreateDirectories(base.parent_path());
-	for (const auto& [suffix, data, size]: {
-	         std::tuple {".bin", static_cast<const void*>(code.data()), code.size_bytes()},
-	         std::tuple {".rdna2", static_cast<const void*>(decoded_dump.data()),
-	                     decoded_dump.size()},
-	     }) {
-		if (size == 0) {
-			continue;
-		}
-		auto path = base;
-		path += suffix;
-		Common::File file(path);
-		if (file.IsInvalid()) {
-			const auto path_text = Common::PathToString(path);
-			LOGF_COLOR(Log::Color::BrightRed, "Can't create file: %s\n", path_text.c_str());
-		} else {
-			file.Write(data, size);
-		}
+
+	std::vector<uint8_t> bin_data(reinterpret_cast<const uint8_t*>(code.data()),
+	                              reinterpret_cast<const uint8_t*>(code.data()) +
+	                                  code.size_bytes());
+	Common::AsyncWriter::EnqueueFileWrite(base.string() + ".bin", std::move(bin_data));
+
+	if (!decoded_dump.empty()) {
+		Common::AsyncWriter::EnqueueFileWrite(base.string() + ".rdna2", decoded_dump);
 	}
 }
 
@@ -150,6 +144,18 @@ bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
 	if (!Config::ShaderValidationEnabled()) {
 		return true;
 	}
+
+	static std::unordered_set<uint64_t> s_validated_hashes;
+	static std::mutex                   s_validation_mutex;
+	const uint64_t spirv_hash = XXH3_64bits(spirv.data(), spirv.size() * sizeof(uint32_t));
+
+	{
+		std::lock_guard lock(s_validation_mutex);
+		if (s_validated_hashes.contains(spirv_hash)) {
+			return true;
+		}
+	}
+
 	spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_3);
 	std::string          messages;
 	tools.SetMessageConsumer([&messages](spv_message_level_t, const char*,
@@ -159,6 +165,8 @@ bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
 		                        message);
 	});
 	if (tools.Validate(spirv)) {
+		std::lock_guard lock(s_validation_mutex);
+		s_validated_hashes.insert(spirv_hash);
 		return true;
 	}
 	spvtools::SpirvTools disassembler(SPV_ENV_VULKAN_1_2);
@@ -248,6 +256,13 @@ struct PipelineCache::ProgramCache {
 		}
 		DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
 
+		if (IsFileOutputEnabled(Config::GetShaderLogDirection()) && !result.ir_dump.empty()) {
+			const auto ir_path = Config::GetShaderLogFolder() /
+			                     fmt::format("{:04d}_new_shader_{}_{:016x}.ir", next_shader_id + 1,
+			                                 stage_name, options.shader_hash);
+			Common::AsyncWriter::EnqueueFileWrite(ir_path, result.ir_dump);
+		}
+
 		const auto module = CompileSPV(result.spirv, device);
 		EXIT_IF(module == nullptr);
 		if (options.dump_ir) {
@@ -291,7 +306,8 @@ struct PipelineCache::ProgramCache {
 			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
 			    entry->second.resource_plan, runtime, resources, specialization));
 			if (const auto permutation = std::ranges::find_if(
-			        entry->second.permutations, [&](const Permutation& candidate) {
+			        entry->second.permutations,
+			        [&](const Permutation& candidate) {
 				        const auto& layout = candidate.program.bindings;
 				        return layout.push_data_start_dword ==
 				                   ShaderRecompiler::IR::PushData::StartFor(
@@ -329,7 +345,7 @@ struct PipelineCache::ProgramCache {
 		options.stage       = stage;
 		options.shader_hash = params.hash;
 		options.user_data   = params.user_data;
-		options.back_code      = params.back_code;
+		options.back_code   = params.back_code;
 		options.dump_ir     = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
 		options.early_dump  = options.dump_ir;
 		options.dump_label  = label;
@@ -524,8 +540,8 @@ void PipelineCache::Save() {
 	}
 	if (result != vk::Result::eSuccess || size == 0 ||
 	    size > std::numeric_limits<uint32_t>::max()) {
-		PipelineCacheLog("Vulkan pipeline cache: save failed ({}, {} bytes)",
-		                 vk::to_string(result), size);
+		PipelineCacheLog("Vulkan pipeline cache: save failed ({}, {} bytes)", vk::to_string(result),
+		                 size);
 		return;
 	}
 	payload.resize(size);
@@ -592,8 +608,8 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	}
 	ShaderParams pixel_params;
 	if (pixel_active) {
-		pixel_params = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
-		const auto& blend          = context.GetBlendControl(0);
+		pixel_params      = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
+		const auto& blend = context.GetBlendControl(0);
 		const auto  is_dual_source = [](uint8_t factor) {
 			return factor >= static_cast<uint8_t>(Prospero::BlendFactor::kSrc1Color) &&
 			       factor <= static_cast<uint8_t>(Prospero::BlendFactor::kOneMinusSrc1Alpha);
@@ -626,7 +642,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	Common::LockGuard lock(m_mutex);
 	uint32_t          push_data_cursor =
 	    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount : 0;
-	GraphicsPrograms  result;
+	GraphicsPrograms result;
 	if (pixel_active) {
 		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
 	}
@@ -697,8 +713,8 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 			EXIT("mixed color attachment sample counts are unsupported: %u and %u\n",
 			     attachment_samples, colors[i].desc.info.samples);
 		}
-		const auto& rt                        = ctx.GetRenderTarget(colors[i].target_slot);
-		const auto& bc                        = ctx.GetBlendControl(colors[i].target_slot);
+		const auto& rt                           = ctx.GetRenderTarget(colors[i].target_slot);
+		const auto& bc                           = ctx.GetBlendControl(colors[i].target_slot);
 		static_params.color_srcblend[slot]       = bc.color_srcblend;
 		static_params.color_comb_fcn[slot]       = bc.color_comb_fcn;
 		static_params.color_destblend[slot]      = bc.color_destblend;
@@ -757,9 +773,9 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	static_params.depth_max_bounds         = depth.depth_max_bounds;
 	const bool rect_list =
 	    command.GetUserConfig().GetPrimType() == Prospero::PrimitiveType::kRectList;
-	static_params.cull_back  = !rect_list && mc.cull_back;
-	static_params.cull_front = !rect_list && mc.cull_front;
-	static_params.face       = mc.face;
+	static_params.cull_back          = !rect_list && mc.cull_back;
+	static_params.cull_front         = !rect_list && mc.cull_front;
+	static_params.face               = mc.face;
 	static_params.provoking_vtx_last = mc.provoking_vtx_last;
 	static_params.polygon_mode =
 	    ResolvePolygonMode(mc, static_params.cull_front, static_params.cull_back);
@@ -820,9 +836,8 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	return *iter->second;
 }
 
-PipelineCache::Pipeline&
-PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
-                                  const ShaderProgram&          compute_program) {
+PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
+                                                           const ShaderProgram& compute_program) {
 	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Compute)", profiler::colors::RedA100);
 
 	EXIT_IF(!compute_program);

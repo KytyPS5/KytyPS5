@@ -14,7 +14,7 @@ namespace Loader {
 struct RedZonePatchResult {
 	uint64_t function_count                           = 0;
 	uint64_t instruction_count                        = 0;
-	uint64_t red_zone_function_count                   = 0;
+	uint64_t red_zone_function_count                  = 0;
 	uint64_t memory_instruction_count                 = 0;
 	uint64_t short_memory_instruction_count           = 0;
 	uint64_t patched_memory_instruction_count         = 0;

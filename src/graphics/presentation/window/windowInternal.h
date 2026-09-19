@@ -38,23 +38,23 @@ struct WindowContext {
 	[[nodiscard]] static vk::PhysicalDeviceVulkan12Features RequiredVulkan12Features() noexcept;
 	[[nodiscard]] static vk::PhysicalDeviceVulkan13Features RequiredVulkan13Features() noexcept;
 	[[nodiscard]] static uint32_t InitialWindowFlags(bool fullscreen) noexcept;
-	void                                                    CreateVulkan();
-	void                                                    RecreateSurface();
-	void                                                    RefreshSurfaceCapabilities();
-	void                                                    UpdateIcon();
-	void                                                    UpdateTitle();
-	void                                                    Resize(uint32_t width, uint32_t height);
-	void ProcessWindowEvent(const SDL_WindowEvent& event);
-	void ProcessDisplayEvent(const SDL_DisplayEvent& event);
-	void ProcessEvent(double time_seconds);
-	void Run();
+	void                          CreateVulkan();
+	void                          RecreateSurface();
+	void                          RefreshSurfaceCapabilities();
+	void                          UpdateIcon();
+	void                          UpdateTitle();
+	void                          Resize(uint32_t width, uint32_t height);
+	void                          ProcessWindowEvent(const SDL_WindowEvent& event);
+	void                          ProcessDisplayEvent(const SDL_DisplayEvent& event);
+	void                          ProcessEvent(double time_seconds);
+	void                          Run();
 	// SDL window operations must complete on the main thread.
 	void RunOnMainThread(std::function<void()> task);
 	void DrainMainThreadTasks();
 
 	GraphicContext                 graphic_ctx;
-	SDL_Window*                    window        = nullptr;
-	vk::SurfaceKHR                 surface       = nullptr;
+	SDL_Window*                    window  = nullptr;
+	vk::SurfaceKHR                 surface = nullptr;
 	SurfaceCapabilities            surface_capabilities;
 	std::unique_ptr<RenderContext> render_context;
 	std::unique_ptr<Presenter>     presenter;

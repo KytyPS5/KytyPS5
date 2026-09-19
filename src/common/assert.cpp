@@ -1,5 +1,6 @@
 #include "common/assert.h"
 
+#include "common/asyncWriter.h"
 #include "common/logging/log.h"
 #include "common/subsystems.h"
 #include "kytyGitVersion.h"
@@ -19,6 +20,7 @@ static std::string BuildFatalReport(const char* title, std::string_view text, co
 
 static int DbgReport(const char* title, std::string_view text, const char* file, int line) {
 	Log::WriteFatal(BuildFatalReport(title, text, file, line));
+	AsyncWriter::EmergencyFlush();
 	Subsystems::EmergencyShutdownActive();
 	return 1;
 }
@@ -43,6 +45,7 @@ int DbgExitHandler(const char* file, int line, fmt::text_style style, std::strin
 }
 
 void DbgExit(int status) {
+	AsyncWriter::EmergencyFlush();
 	Subsystems::EmergencyShutdownActive();
 	std::fflush(nullptr);
 	std::_Exit(status);

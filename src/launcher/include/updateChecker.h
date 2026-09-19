@@ -14,7 +14,7 @@ public:
 	explicit UpdateChecker(QWidget* parent);
 
 	[[nodiscard]] static bool IsSupported();
-	void Check(bool manual);
+	void                      Check(bool manual);
 
 signals:
 	void CheckingChanged(bool checking);
@@ -26,7 +26,7 @@ private:
 	void              FetchUpdateInfo(const char* url, bool fallback, bool manual);
 	void              ShowUpdateResult(const UpdateInfo& info, bool manual);
 
-	QWidget*              m_parent           = nullptr;
+	QWidget*              m_parent = nullptr;
 	QNetworkAccessManager m_network;
 	bool                  m_checking_updates = false;
 };

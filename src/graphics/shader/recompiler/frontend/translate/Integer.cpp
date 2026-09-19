@@ -154,9 +154,9 @@ bool Translator::SimpleInteger(const Decoder::Instruction& inst, IR::ValueOpcode
                                bool update_scc) {
 	std::array<IR::Value, 3> args;
 	for (uint32_t index = 0; index < inst.src_count; index++) {
-		const auto arg_type = IR::ArgTypeOf(opcode, index);
-		const auto& operand = SourceAt(inst, reverse && index < 2u ? 1u - index : index);
-		args[index]         = ReadOperand(operand, arg_type == IR::Type::Void ? type : arg_type);
+		const auto  arg_type = IR::ArgTypeOf(opcode, index);
+		const auto& operand  = SourceAt(inst, reverse && index < 2u ? 1u - index : index);
+		args[index]          = ReadOperand(operand, arg_type == IR::Type::Void ? type : arg_type);
 		if (mask_shift_count && index == 1u) {
 			args[index] = ir.BitwiseAnd(IR::U32(args[index]), IR::U32(IR::Value(31u)));
 		}
@@ -248,9 +248,9 @@ bool Translator::S_FF1_I32_B64(const Decoder::Instruction& inst) {
 
 bool Translator::V_FFBH_32(const Decoder::Instruction& inst, bool sign) {
 	const auto source = ReadU32(inst.src0);
-	const auto value  = sign ? ir.BitwiseXor(
-	                              source, ir.ShiftRightArithmetic(source, IR::U32(IR::Value(31u))))
-	                         : source;
+	const auto value =
+	    sign ? ir.BitwiseXor(source, ir.ShiftRightArithmetic(source, IR::U32(IR::Value(31u))))
+	         : source;
 	const auto msb      = IR::U32(ir.Emit(IR::ValueOpcode::FindUMsb32, {value}));
 	const auto position = ir.ISub(IR::U32(IR::Value(31u)), msb);
 	const auto result   = ir.Select(ir.INotEqual(value, IR::U32(IR::Value(0u))), position,
@@ -335,16 +335,16 @@ bool Translator::S_BITSET_B32(const Decoder::Instruction& inst, bool set) {
 }
 
 bool Translator::S_BITSET_B64(const Decoder::Instruction& inst, bool set) {
-	const auto offset    = ir.BitwiseAnd(ReadU32(inst.src0), IR::U32(IR::Value(63u)));
-	const auto word_bit  = ir.BitwiseAnd(offset, IR::U32(IR::Value(31u)));
-	const auto bit       = ir.ShiftLeftLogical(IR::U32(IR::Value(1u)), word_bit);
-	const auto old       = ReadU32Pair(inst.dst);
-	const auto low_value = set ? ir.BitwiseOr(old[0], bit)
-	                           : ir.BitwiseAnd(old[0], ir.BitwiseNot(bit));
-	const auto high_value = set ? ir.BitwiseOr(old[1], bit)
-	                            : ir.BitwiseAnd(old[1], ir.BitwiseNot(bit));
-	const auto high = IR::U1(ir.Emit(IR::ValueOpcode::UGreaterThanEqual32,
-	                                {offset, IR::Value(32u)}));
+	const auto offset   = ir.BitwiseAnd(ReadU32(inst.src0), IR::U32(IR::Value(63u)));
+	const auto word_bit = ir.BitwiseAnd(offset, IR::U32(IR::Value(31u)));
+	const auto bit      = ir.ShiftLeftLogical(IR::U32(IR::Value(1u)), word_bit);
+	const auto old      = ReadU32Pair(inst.dst);
+	const auto low_value =
+	    set ? ir.BitwiseOr(old[0], bit) : ir.BitwiseAnd(old[0], ir.BitwiseNot(bit));
+	const auto high_value =
+	    set ? ir.BitwiseOr(old[1], bit) : ir.BitwiseAnd(old[1], ir.BitwiseNot(bit));
+	const auto high =
+	    IR::U1(ir.Emit(IR::ValueOpcode::UGreaterThanEqual32, {offset, IR::Value(32u)}));
 	WriteU32Pair(inst.dst,
 	             {ir.Select(high, old[0], low_value), ir.Select(high, high_value, old[1])});
 	return true;
@@ -586,10 +586,10 @@ bool Translator::V_CNDMASK_B32(const Decoder::Instruction& inst) {
 }
 
 bool Translator::PackB16(const Decoder::Instruction& inst, bool high0, bool high1) {
-	const auto lo        = high0 ? ir.ShiftRightLogical(ReadU32(inst.src0), IR::U32(IR::Value(16u)))
-	                             : ReadU32(inst.src0);
-	const auto hi        = high1 ? ir.ShiftRightLogical(ReadU32(inst.src1), IR::U32(IR::Value(16u)))
-	                             : ReadU32(inst.src1);
+	const auto lo     = high0 ? ir.ShiftRightLogical(ReadU32(inst.src0), IR::U32(IR::Value(16u)))
+	                          : ReadU32(inst.src0);
+	const auto hi     = high1 ? ir.ShiftRightLogical(ReadU32(inst.src1), IR::U32(IR::Value(16u)))
+	                          : ReadU32(inst.src1);
 	const auto result = PackU16Lanes(lo, hi);
 	WriteOperand(DestinationOperand(inst), result);
 	return true;

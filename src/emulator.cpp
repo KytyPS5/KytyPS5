@@ -2,6 +2,8 @@
 
 #include "common/abi.h"
 #include "common/assert.h"
+#include "common/asyncWriter.h"
+#include "common/crashHandler.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
@@ -129,6 +131,8 @@ static void Init(const Config::ConfigOptions& cfg, const std::filesystem::path& 
 
 	subsystems.Initialize<Config::Lifecycle>();
 	Config::Load(cfg);
+	subsystems.Initialize<Common::CrashHandler::Lifecycle>();
+	subsystems.Initialize<Common::AsyncWriter::Lifecycle>();
 	subsystems.Initialize<Log::Lifecycle>();
 
 	if (Common::File::IsFileExisting(param_json)) {

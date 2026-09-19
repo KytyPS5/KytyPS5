@@ -1,3 +1,6 @@
+#if defined(_WIN32)
+#define SDL_MAIN_HANDLED
+#endif
 #include "SDL.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"

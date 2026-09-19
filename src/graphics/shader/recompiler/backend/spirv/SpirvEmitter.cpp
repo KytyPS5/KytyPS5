@@ -226,6 +226,7 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 				const auto& memory = program.memory_info[memory_index];
 				if (memory.kind == IR::ResourceKind::Buffer) {
 					if (memory.dynamic_buffer) {
+						requirements.subgroup_local_invocation_id = true;
 						continue;
 					}
 					if (memory.resource >= program.info.buffers.size()) {

@@ -354,21 +354,73 @@ void StoreBdaSubword(ValueEmitContext& ctx, uint32_t address, uint32_t bits, uin
 }
 
 uint32_t DynamicBufferByteAddress(ValueEmitContext& ctx, const IR::Inst& inst,
-                                  const IR::MemoryInfo& mem, uint32_t dword1) {
+                                  const IR::MemoryInfo& mem, uint32_t dword1, uint32_t dword3) {
 	auto&      state  = ctx.state;
 	const auto stride = Binary(
 	    state, spv::OpBitwiseAnd, TypeU32(state),
 	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), dword1, ConstantU32(state, 16u)),
 	    ConstantU32(state, 0x3fffu));
-	auto address = mem.offen ? ctx.Arg(inst, 2) : ConstantU32(state, 0u);
-	if (mem.idxen) {
-		const auto indexed = Binary(state, spv::OpIMul, TypeU32(state), ctx.Arg(inst, 1), stride);
-		address            = Binary(state, spv::OpIAdd, TypeU32(state), indexed, address);
-	}
+
+	const auto add_tid = Binary(
+	    state, spv::OpBitwiseAnd, TypeU32(state),
+	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), dword3, ConstantU32(state, 23u)),
+	    ConstantU32(state, 1u));
+	const auto has_add_tid =
+	    Binary(state, spv::OpINotEqual, TypeBool(state), add_tid, ConstantU32(state, 0u));
+
+	auto       index           = ctx.Arg(inst, 1);
+	const auto lane            = Binary(state, spv::OpBitwiseAnd, TypeU32(state),
+	                                    EmitSubgroupLocalInvocationId(state), ConstantU32(state, 63u));
+	const auto index_with_lane = Binary(state, spv::OpIAdd, TypeU32(state), index, lane);
+	index                      = Select(state, TypeU32(state), has_add_tid, index_with_lane, index);
+
+	auto offset = ctx.Arg(inst, 2);
 	if (mem.offset != 0u) {
-		address =
-		    Binary(state, spv::OpIAdd, TypeU32(state), address, ConstantU32(state, mem.offset));
+		offset = Binary(state, spv::OpIAdd, TypeU32(state), offset, ConstantU32(state, mem.offset));
 	}
+
+	const auto swizzle_bit =
+	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), dword1, ConstantU32(state, 31u));
+	const auto stride_nonzero =
+	    Binary(state, spv::OpINotEqual, TypeBool(state), stride, ConstantU32(state, 0u));
+	const auto swizzle_flag =
+	    Binary(state, spv::OpINotEqual, TypeBool(state), swizzle_bit, ConstantU32(state, 0u));
+	const auto has_swizzle =
+	    Binary(state, spv::OpLogicalAnd, TypeBool(state), stride_nonzero, swizzle_flag);
+
+	const auto indexed_linear = Binary(state, spv::OpIMul, TypeU32(state), index, stride);
+	const auto linear_address = Binary(state, spv::OpIAdd, TypeU32(state), indexed_linear, offset);
+
+	const auto stride_enum = Binary(
+	    state, spv::OpBitwiseAnd, TypeU32(state),
+	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), dword3, ConstantU32(state, 21u)),
+	    ConstantU32(state, 3u));
+	const auto index_stride =
+	    Binary(state, spv::OpShiftLeftLogical, TypeU32(state), ConstantU32(state, 8u), stride_enum);
+	const auto index_msb_shift =
+	    Binary(state, spv::OpIAdd, TypeU32(state), stride_enum, ConstantU32(state, 3u));
+	const auto index_msb =
+	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), index, index_msb_shift);
+	const auto index_lsb_mask =
+	    Binary(state, spv::OpISub, TypeU32(state), index_stride, ConstantU32(state, 1u));
+	const auto index_lsb = Binary(state, spv::OpBitwiseAnd, TypeU32(state), index, index_lsb_mask);
+
+	const auto offset_msb =
+	    Binary(state, spv::OpBitwiseAnd, TypeU32(state), offset, ConstantU32(state, ~3u));
+	const auto offset_lsb =
+	    Binary(state, spv::OpBitwiseAnd, TypeU32(state), offset, ConstantU32(state, 3u));
+	const auto indexed_msb = Binary(state, spv::OpIMul, TypeU32(state), index_msb, stride);
+	const auto msb = Binary(state, spv::OpIMul, TypeU32(state),
+	                        Binary(state, spv::OpIAdd, TypeU32(state), indexed_msb, offset_msb),
+	                        index_stride);
+	const auto lsb = Binary(state, spv::OpIAdd, TypeU32(state),
+	                        Binary(state, spv::OpShiftLeftLogical, TypeU32(state), index_lsb,
+	                               ConstantU32(state, 2u)),
+	                        offset_lsb);
+	const auto swizzled_address = Binary(state, spv::OpIAdd, TypeU32(state), msb, lsb);
+
+	auto address = Select(state, TypeU32(state), has_swizzle, swizzled_address, linear_address);
+
 	const auto soffset_value = inst.Arg(3).Resolve();
 	if (!soffset_value.IsImmediate() || soffset_value.GetType() != IR::Type::U32 ||
 	    soffset_value.U32() != 0u) {
@@ -387,10 +439,11 @@ uint32_t DynamicBufferGuestAddress(ValueEmitContext& ctx, const IR::Inst& inst,
 	}
 	const auto dword0 = ctx.Arg(*handle, 0);
 	const auto dword1 = ctx.Arg(*handle, 1);
+	const auto dword3 = ctx.Arg(*handle, 3);
 	const auto base_high =
 	    Binary(state, spv::OpBitwiseAnd, TypeU32(state), dword1, ConstantU32(state, 0xffffu));
 	const auto base_address = DeviceAddressFromWords(state, dword0, base_high);
-	auto       byte_offset  = DynamicBufferByteAddress(ctx, inst, mem, dword1);
+	auto       byte_offset  = DynamicBufferByteAddress(ctx, inst, mem, dword1, dword3);
 	if (component_offset != 0u) {
 		byte_offset = Binary(state, spv::OpIAdd, TypeU32(state), byte_offset,
 		                     ConstantU32(state, component_offset));

@@ -112,6 +112,8 @@ enum CompatibilityClass : uint32_t {
 	S8      = 1u << 24,
 };
 
+constexpr uint32_t BlockFormatClasses = Bc1Rgb | Bc1Rgba | Bc2 | Bc3 | Bc4 | Bc5 | Bc6h | Bc7;
+
 [[nodiscard]] uint32_t FormatClass(vk::Format format) noexcept {
 	switch (format) {
 		case vk::Format::eR4G4UnormPack8:
@@ -322,6 +324,14 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 		normalized.aspect = vk::ImageAspectFlagBits::eStencil;
 	}
 	normalized.usage = is_storage ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlags {};
+	// Guest mip tails have no host levels, so the view is mapped onto the deepest host level.
+	ImageOps::ReportMipClamp("view", info, normalized.base_level, normalized.level_count);
+	if (normalized.level_count != 0) {
+		const uint32_t host_levels = std::max(image.mip_levels, 1u);
+		normalized.base_level      = std::min(normalized.base_level, host_levels - 1u);
+		normalized.level_count =
+		    std::min(normalized.level_count, host_levels - normalized.base_level);
+	}
 	for (const auto& cached: views) {
 		if (cached.info == normalized) {
 			return cached.view;
@@ -333,9 +343,7 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 	const bool slice_view =
 	    image.image_type == vk::ImageType::e3D && (normalized.type == vk::ImageViewType::e2D ||
 	                                               normalized.type == vk::ImageViewType::e2DArray);
-	const bool levels_valid = normalized.level_count != 0 &&
-	                          normalized.base_level < image.mip_levels &&
-	                          normalized.level_count <= image.mip_levels - normalized.base_level;
+	const bool levels_valid = normalized.level_count != 0;
 	const auto view_layers  = slice_view && levels_valid
 	                              ? std::max(image.extent.depth >> normalized.base_level, 1u)
 	                              : image.layers;
@@ -355,6 +363,23 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 		     normalized.level_count, normalized.base_layer, normalized.layer_count,
 		     static_cast<vk::ImageUsageFlags::MaskType>(normalized.usage), image.mip_levels,
 		     image.layers);
+	}
+
+	// Binding an uncompressed multi-layer view to a block-compressed image requires
+	// VK_KHR_maintenance6; without it the layer count is illegal and may be misread.
+	if (static_cast<bool>(image.flags & vk::ImageCreateFlagBits::eBlockTexelViewCompatible) &&
+	    normalized.layer_count > 1 &&
+	    (ImageViewOps::FormatClass(normalized.format) & ImageViewOps::BlockFormatClasses) == 0 &&
+	    !m_graphics.supports_block_texel_view_multiple_layers) {
+		static bool logged = false;
+		if (!logged) {
+			logged = true;
+			LOGF("image view needs VK_KHR_maintenance6: image_format=%d view_format=%d type=%d "
+			     "mip=%u+%u layer=%u+%u\n",
+			     static_cast<int>(image.format), static_cast<int>(normalized.format),
+			     static_cast<int>(normalized.type), normalized.base_level, normalized.level_count,
+			     normalized.base_layer, normalized.layer_count);
+		}
 	}
 
 	vk::ImageViewUsageCreateInfo usage {};

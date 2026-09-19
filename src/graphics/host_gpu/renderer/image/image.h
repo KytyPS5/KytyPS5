@@ -175,6 +175,18 @@ namespace ImageOps {
 void                                 Validate(const ImageInfo& info);
 [[nodiscard]] Prospero::BufferFormat RenderTargetTransferFormat(uint32_t bytes_per_element);
 
+// Number of levels in the complete host mip chain for an extent. Guest tiled surfaces may describe
+// a deeper tail than the host image can hold, so every host level count is clamped to this.
+[[nodiscard]] uint32_t HostMipChainLength(vk::Extent3D extent);
+
+// Number of levels of the host image created for info, i.e. the guest count clamped to the chain.
+[[nodiscard]] uint32_t HostMipLevels(const ImageInfo& info);
+
+// Reports a request that names guest levels the host image does not have. Guest mip tails are
+// dropped on purpose; the first occurrences are logged so the clamp does not hide guest intent.
+void ReportMipClamp(const char* site, const ImageInfo& info, uint32_t base_level,
+                    uint32_t level_count);
+
 } // namespace ImageOps
 
 } // namespace Libs::Graphics

@@ -574,11 +574,20 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	vk::PhysicalDeviceVulkan11Properties properties11 {};
 	properties11.pNext = &subgroup_size_control;
 
+	vk::PhysicalDeviceMaintenance6Properties maintenance6_properties {};
+
+	const auto maintenance6_extension =
+	    HasExtension(device_extensions, VK_KHR_MAINTENANCE_6_EXTENSION_NAME);
+
 	vk::PhysicalDeviceProperties2 properties2 {};
 	properties2.pNext = &properties11;
 
 	if (graphics.mesh_shader_enabled) {
 		subgroup_size_control.pNext = &graphics.mesh_shader_properties;
+	}
+	if (maintenance6_extension) {
+		maintenance6_properties.pNext = subgroup_size_control.pNext;
+		subgroup_size_control.pNext   = &maintenance6_properties;
 	}
 	physical_device.getProperties2(&properties2);
 
@@ -598,6 +607,10 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	     graphics.compute_subgroup_size_control_enabled ? "true" : "false",
 	     graphics.SupportsComputeWave64() ? "true" : "false");
 	graphics.provoking_vertex_last_enabled = provoking_extension && provoking_vertex.provokingVertexLast;
+	graphics.supports_block_texel_view_multiple_layers =
+	    maintenance6_extension && maintenance6_properties.blockTexelViewCompatibleMultipleLayers;
+	LOGF("Vulkan block texel view multiple layers support: %s\n",
+	     graphics.supports_block_texel_view_multiple_layers ? "true" : "false");
 	graphics.attachment_feedback_loop_enabled =
 	    feedback_extensions && feedback_layout.attachmentFeedbackLoopLayout &&
 	    feedback_dynamic.attachmentFeedbackLoopDynamicState;
@@ -1059,6 +1072,7 @@ void WindowContext::CreateVulkan() {
 		for (const auto* extension: {VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
 		                             VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
 		                             VK_EXT_MESH_SHADER_EXTENSION_NAME,
+		                             VK_KHR_MAINTENANCE_6_EXTENSION_NAME,
 		                             VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME}) {
 			if (HasExtension(available_extensions, extension)) {
 				device_extensions.push_back(extension);

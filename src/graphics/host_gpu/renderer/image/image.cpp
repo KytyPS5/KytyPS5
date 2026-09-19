@@ -10,7 +10,10 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
+#include <cinttypes>
 #include <cstdint>
+#include <string_view>
 #include <xxhash.h>
 
 namespace Libs::Graphics {
@@ -123,7 +126,13 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 		const uint32_t level_count = partial ? range->level_count : info.resources.levels;
 		const uint32_t base_layer  = partial ? range->base_layer : 0;
 		const uint32_t layer_count = partial ? range->layer_count : info.resources.layers;
-		for (uint32_t level = base_level; level < base_level + level_count; level++) {
+		ImageOps::ReportMipClamp("barriers", info, base_level, level_count);
+		// Guest mip tails have no host levels, so they are mapped onto the deepest host level to
+		// keep the per-level state tracking coherent.
+		const uint32_t host_levels = std::max(backing.mip_levels, 1u);
+		const uint32_t first_level = std::min(base_level, host_levels - 1u);
+		const uint32_t level_end   = std::min(base_level + level_count, host_levels);
+		for (uint32_t level = first_level; level < level_end; level++) {
 			for (uint32_t layer = base_layer; layer < base_layer + layer_count; layer++) {
 				const auto index = level * info.resources.layers + layer;
 				EXIT_IF(index >= subresource_states.size());
@@ -368,13 +377,24 @@ void Image::CopyImage(Image& source) {
 	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
 }
 
-void Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
+bool Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
                     const ImageSubresourceRange& destination_range) {
+	const bool source_levels_missing      = source_range.base_level >= source.backing.mip_levels;
+	const bool destination_levels_missing = destination_range.base_level >= backing.mip_levels;
+	if (source_levels_missing) {
+		ImageOps::ReportMipClamp("resolve", source.info, source_range.base_level,
+		                         source_range.level_count);
+	}
+	if (destination_levels_missing) {
+		ImageOps::ReportMipClamp("resolve", info, destination_range.base_level,
+		                         destination_range.level_count);
+	}
+	if (source_levels_missing || destination_levels_missing) {
+		return false;
+	}
 	EXIT_IF(backing.samples != 1 || source.backing.image_type != vk::ImageType::e2D ||
 	        backing.image_type != vk::ImageType::e2D || source_range.level_count != 1 ||
 	        destination_range.level_count != 1 ||
-	        source_range.base_level >= source.backing.mip_levels ||
-	        destination_range.base_level >= backing.mip_levels ||
 	        source_range.base_layer >= source.backing.layers ||
 	        destination_range.base_layer >= backing.layers);
 	const auto layers       = std::min({source_range.layer_count, destination_range.layer_count,
@@ -425,6 +445,7 @@ void Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
 		command.resolveImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal,
 		                     backing.image, vk::ImageLayout::eTransferDstOptimal, region);
 	}
+	return true;
 }
 
 uint32_t Image::CopyRows(uint64_t row_size, uint32_t rows, uint64_t capacity) noexcept {
@@ -525,9 +546,12 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer) {
 	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
 }
 
-void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
-	EXIT_IF(source.backing.samples != backing.samples || mip >= backing.mip_levels ||
-	        layer >= backing.layers);
+bool Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
+	EXIT_IF(source.backing.samples != backing.samples || layer >= backing.layers);
+	if (mip >= backing.mip_levels) {
+		ImageOps::ReportMipClamp("copy-mip", info, mip, 1);
+		return false;
+	}
 	m_scheduler.EndRendering();
 	const auto width  = std::max(backing.extent.width >> mip, 1u);
 	const auto height = std::max(backing.extent.height >> mip, 1u);
@@ -556,6 +580,7 @@ void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
 	                  vk::ImageLayout::eTransferDstOptimal, copy_count, copies.data());
 	Transit(vk::ImageLayout::eGeneral,
 	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
+	return true;
 }
 
 namespace ImageOps {
@@ -649,6 +674,59 @@ Prospero::BufferFormat RenderTargetTransferFormat(uint32_t bytes_per_element) {
 	}
 }
 
+uint32_t HostMipChainLength(vk::Extent3D extent) {
+	const auto largest = std::max({extent.width, extent.height, extent.depth});
+	return largest == 0 ? 1u : static_cast<uint32_t>(std::bit_width(largest));
+}
+
+uint32_t HostMipLevels(const ImageInfo& info) {
+	return std::min(info.resources.levels, HostMipChainLength(info.extent));
+}
+
+void ReportMipClamp(const char* site, const ImageInfo& info, uint32_t base_level,
+                    uint32_t level_count) {
+	const auto host_levels = HostMipLevels(info);
+	if (base_level + level_count <= host_levels) {
+		return;
+	}
+	// Keep a per-site report budget so that a noisy site cannot consume the log and hide the
+	// others; after the first few reports only a logarithmic heartbeat keeps the total visible.
+	constexpr uint32_t verbose_reports = 4;
+	struct SiteReports {
+		const char* site  = nullptr;
+		uint32_t    count = 0;
+	};
+	static std::array<SiteReports, 8> sites {};
+	SiteReports*                      entry = nullptr;
+	for (auto& candidate: sites) {
+		if (candidate.site != nullptr && std::string_view(candidate.site) == site) {
+			entry = &candidate;
+			break;
+		}
+		if (candidate.site == nullptr) {
+			candidate.site = site;
+			entry          = &candidate;
+			break;
+		}
+	}
+	if (entry == nullptr) {
+		return;
+	}
+	entry->count++;
+	const bool heartbeat = std::has_single_bit(entry->count) && entry->count > verbose_reports;
+	if (entry->count > verbose_reports && !heartbeat) {
+		return;
+	}
+	LOGF("Image[%s]: guest mip range exceeds the host mip chain: addr=0x%010" PRIx64
+	     " type=%u format=%u extent=%ux%ux%u guest_levels=%u host_levels=%u range=%u+%u layers=%u "
+	     "samples=%u pitch=%u tile=%u reports=%u\n",
+	     site, info.data.address, static_cast<uint32_t>(info.type),
+	     static_cast<uint32_t>(info.guest_format), info.extent.width, info.extent.height,
+	     info.extent.depth, info.resources.levels, host_levels, base_level, level_count,
+	     info.resources.layers, info.samples, info.pitch, static_cast<uint32_t>(info.tile_mode),
+	     entry->count);
+}
+
 } // namespace ImageOps
 
 Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& image_info)
@@ -661,11 +739,14 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 		return;
 	}
 
+	const auto host_levels = ImageOps::HostMipLevels(info);
+	ImageOps::ReportMipClamp("create", info, 0, info.resources.levels);
+
 	vk::ImageCreateInfo create {};
 	create.flags         = ImageCreateFlags(graphics, info);
 	create.imageType     = HostImageType(info.type);
 	create.extent        = info.extent;
-	create.mipLevels     = info.resources.levels;
+	create.mipLevels     = host_levels;
 	create.arrayLayers   = info.IsVolume() ? 1u : info.resources.layers;
 	create.format        = info.pixel_format;
 	create.tiling        = vk::ImageTiling::eOptimal;

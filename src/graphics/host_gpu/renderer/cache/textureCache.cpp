@@ -695,7 +695,9 @@ void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint3
 	if (source.IsBufferModified() || source.backing.samples != destination.backing.samples) {
 		EXIT("TextureCache: invalid mip-copy ownership or sample count\n");
 	}
-	destination.CopyMip(source, mip, layer);
+	if (!destination.CopyMip(source, mip, layer)) {
+		return;
+	}
 	if (source.IsGpuModified()) {
 		destination.MarkGpuModified();
 	}
@@ -994,6 +996,14 @@ TextureCache::BuildTextureTransfer(const Image& image, BindingType binding,
 	                                       info.resources.levels, layers, info.tile_mode,
 	                                       info.data.size, allow_depth_tile, volume, owner);
 	transfer.regions = TextureBuildImageCopies(transfer.layout);
+	// The host image has fewer levels than the guest layout when the guest mip tail exceeds the
+	// host chain, and the dropped levels have no host counterpart to upload to.
+	const auto host_levels = ImageOps::HostMipLevels(info);
+	if (host_levels < info.resources.levels) {
+		std::erase_if(transfer.regions, [host_levels](const vk::BufferImageCopy& region) {
+			return region.imageSubresource.mipLevel >= host_levels;
+		});
+	}
 	if (info.IsDepth()) {
 		for (auto& region: transfer.regions) {
 			region.imageSubresource.aspectMask = vk::ImageAspectFlagBits::eDepth;
@@ -1001,7 +1011,7 @@ TextureCache::BuildTextureTransfer(const Image& image, BindingType binding,
 	}
 	if (transfer.layout.surface.description.tile_mode != Prospero::TileMode::kLinear) {
 		if (!TextureBuildGpuTileInfos(info.data.size, transfer.regions, transfer.layout,
-		                              info.resources.levels, transfer.tiles)) {
+		                              host_levels, transfer.tiles)) {
 			return transfer;
 		}
 	}
@@ -1543,21 +1553,28 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 }
 
 void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format format,
-                              const vk::ImageSubresourceRange& range, const vk::ClearValue& clear) {
+                              const vk::ImageSubresourceRange& raw_range,
+                              const vk::ClearValue&            clear) {
 	auto& image = m_slot_images[id];
 	const auto aspects = image.info.IsDepth() ? ImageViewOps::DepthAspectMask(image.backing.format)
 	                                          : vk::ImageAspectFlagBits::eColor;
-	EXIT_IF(range.baseMipLevel >= image.info.resources.levels);
+	EXIT_IF(raw_range.baseMipLevel >= image.info.resources.levels);
 	const auto layers = image.info.IsVolume()
-	                        ? std::max(image.info.extent.depth >> range.baseMipLevel, 1u)
+	                        ? std::max(image.info.extent.depth >> raw_range.baseMipLevel, 1u)
 	                        : image.backing.layers;
-	EXIT_IF(command.IsInvalid() || image.depth_id || !range.aspectMask || range.levelCount == 0 ||
-	        range.levelCount > image.info.resources.levels - range.baseMipLevel ||
-	        range.layerCount == 0 || range.baseArrayLayer >= layers ||
-	        range.layerCount > layers - range.baseArrayLayer ||
-	        (range.aspectMask & aspects) != range.aspectMask);
+	EXIT_IF(command.IsInvalid() || image.depth_id || !raw_range.aspectMask ||
+	        raw_range.levelCount == 0 ||
+	        raw_range.levelCount > image.info.resources.levels - raw_range.baseMipLevel ||
+	        raw_range.layerCount == 0 || raw_range.baseArrayLayer >= layers ||
+	        raw_range.layerCount > layers - raw_range.baseArrayLayer ||
+	        (raw_range.aspectMask & aspects) != raw_range.aspectMask);
+	// Guest mip tails have no host levels, so the range is mapped onto the deepest host level.
+	ImageOps::ReportMipClamp("clear", image.info, raw_range.baseMipLevel, raw_range.levelCount);
+	auto range         = raw_range;
+	range.baseMipLevel = std::min(range.baseMipLevel, image.backing.mip_levels - 1u);
+	range.levelCount   = std::min(range.levelCount, image.backing.mip_levels - range.baseMipLevel);
 	const bool full_image = range.aspectMask == aspects && range.baseMipLevel == 0 &&
-	                        range.levelCount == image.info.resources.levels &&
+	                        range.levelCount == image.backing.mip_levels &&
 	                        range.baseArrayLayer == 0 && range.layerCount == layers;
 	TrackImage(id);
 	if (!full_image && (image.IsBufferModified() || image.IsCpuDirty())) {
@@ -1734,16 +1751,19 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	const auto available  = buffer.Size() - buf_offset;
 	uint32_t   levels     = 0;
 	uint64_t   copy_size  = 0;
+	// Guest mip tails have no host levels, so the download is limited to the host chain.
+	const auto host_levels = ImageOps::HostMipLevels(image.info);
 	if (image.info.IsVolume()) {
 		// Volume mips contain strided block slices, so a mip's linear span cannot prove that
 		// every retained slice fits. Keep volume synchronization whole-image only.
-		if (!buffer.IsInBounds(image.info.data.address, image.info.data.size)) {
+		if (!buffer.IsInBounds(image.info.data.address, image.info.data.size) ||
+		    image.info.resources.levels > host_levels) {
 			return false;
 		}
-		levels    = image.info.resources.levels;
+		levels    = host_levels;
 		copy_size = image.info.data.size;
 	} else {
-		for (; levels < image.info.resources.levels; ++levels) {
+		for (; levels < host_levels; ++levels) {
 			const auto& mip = image.info.mip_layout[levels];
 			if (mip.size == 0 || mip.offset > available || mip.size > available - mip.offset) {
 				break;
@@ -1761,7 +1781,7 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	if (transfer.depth_target && copy_size != image.info.data.size) {
 		return false;
 	}
-	if (!transfer.depth_target && levels < image.info.resources.levels) {
+	if (!transfer.depth_target && levels < host_levels) {
 		auto& texture = transfer.texture;
 		std::erase_if(texture.regions, [levels](const vk::BufferImageCopy& region) {
 			return region.imageSubresource.mipLevel >= levels;

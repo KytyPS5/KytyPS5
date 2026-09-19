@@ -553,12 +553,12 @@ void PipelineCache::SaveInternalLocked() {
 	    !Common::File::RenameFile(temp_path, m_driver_cache_path)) {
 		PipelineCacheLog("Vulkan pipeline cache: failed to write {}",
 		                 Common::PathToString(m_driver_cache_path));
+		std::error_code remove_error;
+		std::filesystem::remove(temp_path, remove_error);
 		return;
 	}
 	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", payload.size(),
 	                 Common::PathToString(m_driver_cache_path));
-	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
-	m_driver_cache = nullptr;
 }
 
 PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(

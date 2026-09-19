@@ -366,20 +366,17 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 	}
 
 	// Binding an uncompressed multi-layer view to a block-compressed image requires
-	// VK_KHR_maintenance6; without it the layer count is illegal and may be misread.
+	// VK_KHR_maintenance6; without the capability the view cannot be expressed and the layer
+	// count must not be passed through to the driver.
 	if (static_cast<bool>(image.flags & vk::ImageCreateFlagBits::eBlockTexelViewCompatible) &&
 	    normalized.layer_count > 1 &&
 	    (ImageViewOps::FormatClass(normalized.format) & ImageViewOps::BlockFormatClasses) == 0 &&
 	    !m_graphics.supports_block_texel_view_multiple_layers) {
-		static bool logged = false;
-		if (!logged) {
-			logged = true;
-			LOGF("image view needs VK_KHR_maintenance6: image_format=%d view_format=%d type=%d "
-			     "mip=%u+%u layer=%u+%u\n",
-			     static_cast<int>(image.format), static_cast<int>(normalized.format),
-			     static_cast<int>(normalized.type), normalized.base_level, normalized.level_count,
-			     normalized.base_layer, normalized.layer_count);
-		}
+		EXIT("image view needs VK_KHR_maintenance6 blockTexelViewCompatibleMultipleLayers: "
+		     "image_format=%d view_format=%d type=%d mip=%u+%u layer=%u+%u\n",
+		     static_cast<int>(image.format), static_cast<int>(normalized.format),
+		     static_cast<int>(normalized.type), normalized.base_level, normalized.level_count,
+		     normalized.base_layer, normalized.layer_count);
 	}
 
 	vk::ImageViewUsageCreateInfo usage {};

@@ -378,10 +378,17 @@ void Image::CopyImage(Image& source) {
 
 void Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
                     const ImageSubresourceRange& destination_range) {
-	if (source_range.base_level >= source.backing.mip_levels ||
-	    destination_range.base_level >= backing.mip_levels) {
+	const bool source_levels_missing      = source_range.base_level >= source.backing.mip_levels;
+	const bool destination_levels_missing = destination_range.base_level >= backing.mip_levels;
+	if (source_levels_missing) {
+		ImageOps::ReportMipClamp("resolve", source.info, source_range.base_level,
+		                         source_range.level_count);
+	}
+	if (destination_levels_missing) {
 		ImageOps::ReportMipClamp("resolve", info, destination_range.base_level,
 		                         destination_range.level_count);
+	}
+	if (source_levels_missing || destination_levels_missing) {
 		return;
 	}
 	EXIT_IF(backing.samples != 1 || source.backing.image_type != vk::ImageType::e2D ||

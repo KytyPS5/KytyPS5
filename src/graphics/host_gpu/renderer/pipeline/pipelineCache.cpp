@@ -593,6 +593,21 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	ShaderParams pixel_params;
 	if (pixel_active) {
 		pixel_params = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
+		const auto& blend          = context.GetBlendControl(0);
+		const auto  is_dual_source = [](uint8_t factor) {
+			return factor >= static_cast<uint8_t>(Prospero::BlendFactor::kSrc1Color) &&
+			       factor <= static_cast<uint8_t>(Prospero::BlendFactor::kOneMinusSrc1Alpha);
+		};
+		pixel_info.dual_source_blending =
+		    blend.enable && !context.GetRenderTarget(0).info.blend_bypass &&
+		    (is_dual_source(blend.color_srcblend) || is_dual_source(blend.color_destblend) ||
+		     (blend.separate_alpha_blend &&
+		      (is_dual_source(blend.alpha_srcblend) || is_dual_source(blend.alpha_destblend))));
+		if (pixel_info.dual_source_blending) {
+			// MRT1 supplies a second blend source for the same render target as MRT0.
+			pixel_info.target_output_mode[1]    = pixel_info.target_output_mode[0];
+			pixel_info.target_export_mapping[1] = pixel_info.target_export_mapping[0];
+		}
 	}
 	if (context.GetClipControl().clip_disable) {
 		const auto& viewport = context.GetScreenViewport().viewports[0];

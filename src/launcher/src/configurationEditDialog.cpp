@@ -307,10 +307,6 @@ void ConfigurationEditDialog::InitGameDirectories() {
 	update_game_directory_buttons();
 }
 
-void ConfigurationEditDialog::SetTitle(const QString& str) {
-	setWindowTitle(str);
-}
-
 void ConfigurationEditDialog::SetGameDirectories(const QStringList& dirs) {
 	m_show_game_dirs = true;
 	m_game_dirs_list->clear();
@@ -401,14 +397,6 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui) {
 	info.profiler_enabled = ui.checkBox_profiler->isChecked();
 }
 
-void ConfigurationEditDialog::update_info() {
-	UpdateInfo(m_info, *m_ui);
-}
-
-void ConfigurationEditDialog::adjust_size() {
-	this->adjustSize();
-}
-
 void ConfigurationEditDialog::save() {
 	if (MandatoryLineEdit::FindEmpty(this)) {
 		QMessageBox::critical(this, tr("Save failed"), tr("Please fill all mandatory fields"));
@@ -428,7 +416,7 @@ void ConfigurationEditDialog::save() {
 		return;
 	}
 
-	update_info();
+	UpdateInfo(m_info, *m_ui);
 
 	emit accept();
 }

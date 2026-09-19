@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <mutex>
 #include <vector>
@@ -13,31 +14,27 @@ namespace Libs::Dialog::ImeDialog {
 
 namespace {
 
-constexpr int Error(uint32_t value) {
-	return static_cast<int32_t>(value);
-}
-
-constexpr int ERROR_BUSY                    = Error(0x80bc0001);
-constexpr int ERROR_INVALID_USER_ID         = Error(0x80bc0010);
-constexpr int ERROR_INVALID_TYPE            = Error(0x80bc0011);
-constexpr int ERROR_INVALID_LANGUAGES       = Error(0x80bc0012);
-constexpr int ERROR_INVALID_ENTER_LABEL     = Error(0x80bc0013);
-constexpr int ERROR_INVALID_INPUT_METHOD    = Error(0x80bc0014);
-constexpr int ERROR_INVALID_OPTION          = Error(0x80bc0015);
-constexpr int ERROR_INVALID_MAX_TEXT_LENGTH = Error(0x80bc0016);
-constexpr int ERROR_INVALID_TEXT_BUFFER     = Error(0x80bc0017);
-constexpr int ERROR_INVALID_POSX            = Error(0x80bc0018);
-constexpr int ERROR_INVALID_POSY            = Error(0x80bc0019);
-constexpr int ERROR_INVALID_HALIGN          = Error(0x80bc001a);
-constexpr int ERROR_INVALID_VALIGN          = Error(0x80bc001b);
-constexpr int ERROR_INVALID_EXTENDED        = Error(0x80bc001c);
-constexpr int ERROR_INVALID_PARAM           = Error(0x80bc0030);
-constexpr int ERROR_INVALID_ADDRESS         = Error(0x80bc0031);
-constexpr int ERROR_INVALID_RESERVED        = Error(0x80bc0032);
-constexpr int ERROR_INVALID_TITLE           = Error(0x80bc0101);
-constexpr int ERROR_NOT_RUNNING             = Error(0x80bc0105);
-constexpr int ERROR_NOT_FINISHED            = Error(0x80bc0106);
-constexpr int ERROR_NOT_IN_USE              = Error(0x80bc0107);
+constexpr int ERROR_BUSY                    = static_cast<int32_t>(0x80bc0001);
+constexpr int ERROR_INVALID_USER_ID         = static_cast<int32_t>(0x80bc0010);
+constexpr int ERROR_INVALID_TYPE            = static_cast<int32_t>(0x80bc0011);
+constexpr int ERROR_INVALID_LANGUAGES       = static_cast<int32_t>(0x80bc0012);
+constexpr int ERROR_INVALID_ENTER_LABEL     = static_cast<int32_t>(0x80bc0013);
+constexpr int ERROR_INVALID_INPUT_METHOD    = static_cast<int32_t>(0x80bc0014);
+constexpr int ERROR_INVALID_OPTION          = static_cast<int32_t>(0x80bc0015);
+constexpr int ERROR_INVALID_MAX_TEXT_LENGTH = static_cast<int32_t>(0x80bc0016);
+constexpr int ERROR_INVALID_TEXT_BUFFER     = static_cast<int32_t>(0x80bc0017);
+constexpr int ERROR_INVALID_POSX            = static_cast<int32_t>(0x80bc0018);
+constexpr int ERROR_INVALID_POSY            = static_cast<int32_t>(0x80bc0019);
+constexpr int ERROR_INVALID_HALIGN          = static_cast<int32_t>(0x80bc001a);
+constexpr int ERROR_INVALID_VALIGN          = static_cast<int32_t>(0x80bc001b);
+constexpr int ERROR_INVALID_EXTENDED        = static_cast<int32_t>(0x80bc001c);
+constexpr int ERROR_INVALID_PARAM           = static_cast<int32_t>(0x80bc0030);
+constexpr int ERROR_INVALID_ADDRESS         = static_cast<int32_t>(0x80bc0031);
+constexpr int ERROR_INVALID_RESERVED        = static_cast<int32_t>(0x80bc0032);
+constexpr int ERROR_INVALID_TITLE           = static_cast<int32_t>(0x80bc0101);
+constexpr int ERROR_NOT_RUNNING             = static_cast<int32_t>(0x80bc0105);
+constexpr int ERROR_NOT_FINISHED            = static_cast<int32_t>(0x80bc0106);
+constexpr int ERROR_NOT_IN_USE              = static_cast<int32_t>(0x80bc0107);
 
 constexpr uint32_t VALID_OPTIONS           = 0x00007bff;
 constexpr uint32_t VALID_EXTENDED_OPTIONS  = 0x00005fde;

@@ -175,6 +175,7 @@ struct ShaderPixelInputInfo {
 	bool                                           ps_depth_export_enable       = false;
 	bool                                           ps_sample_mask_export_enable = false;
 	bool                                           ps_sample_shading            = false;
+	bool                                           dual_source_blending         = false;
 	bool                                           ps_early_z                   = false;
 	bool                                           ps_execute_on_noop           = false;
 	ShaderStageRuntime                             stage;
@@ -303,7 +304,6 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data);
 void     ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info);
 void     ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info);
 void     ShaderDbgDumpInputInfo(const ShaderComputeInputInfo& info);
-bool ShaderAddressValid(uint64_t addr);
 
 } // namespace Libs::Graphics
 

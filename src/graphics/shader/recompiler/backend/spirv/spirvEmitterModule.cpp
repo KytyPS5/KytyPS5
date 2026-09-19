@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 
 #include <algorithm>
+#include <bit>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
@@ -256,14 +257,8 @@ uint32_t ConstantF32(EmitterState& state, uint32_t bits) {
 	return state.builder.Constant(spv::OpConstant, TypeF32(state), bits);
 }
 
-uint32_t FloatBits(float value) {
-	uint32_t bits = 0;
-	std::memcpy(&bits, &value, sizeof(bits));
-	return bits;
-}
-
 uint32_t ConstantF32Value(EmitterState& state, float value) {
-	return ConstantF32(state, FloatBits(value));
+	return ConstantF32(state, std::bit_cast<uint32_t>(value));
 }
 
 uint32_t ConstantBool(EmitterState& state, bool value) {
@@ -558,8 +553,17 @@ void DefineOutputs(EmitterState& state) {
 				const auto type = uint_output ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4);
 				binding.variable_id = DefineInterfaceVariable(state, type, spv::StorageClassOutput,
 				                                              binding.debug_name.c_str());
+				const bool dual_source = binding.kind == IR::StageOutputKind::Mrt &&
+				                         state.program.stage == ShaderType::Pixel &&
+				                         state.input_info.pixel->dual_source_blending;
+				EXIT_NOT_IMPLEMENTED(dual_source && binding.index > 1);
 				state.builder.AddAnnotation(spv::OpDecorate, binding.variable_id,
-				                            spv::DecorationLocation, binding.location);
+				                            spv::DecorationLocation,
+				                            dual_source ? 0u : binding.location);
+				if (dual_source) {
+					state.builder.AddAnnotation(spv::OpDecorate, binding.variable_id,
+					                            spv::DecorationIndex, binding.index);
+				}
 				break;
 			}
 		}

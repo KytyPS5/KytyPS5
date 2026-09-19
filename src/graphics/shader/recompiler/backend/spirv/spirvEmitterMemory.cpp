@@ -267,8 +267,9 @@ void StoreBdaDword(ValueEmitContext& ctx, uint32_t address, uint32_t data,
 	});
 }
 
-void StoreBdaSubword(ValueEmitContext& ctx, uint32_t address, uint32_t bits, uint32_t data) {
-	auto& state = ctx.state;
+void StoreBdaSubword(ValueEmitContext& ctx, uint32_t address, uint32_t bits, uint32_t data,
+                     bool is_volatile = false) {
+	auto&      state   = ctx.state;
 	if (bits == 16u) {
 		const auto byte =
 		    Binary(state, spv::OpBitwiseAnd, TypeU32(state),
@@ -278,12 +279,12 @@ void StoreBdaSubword(ValueEmitContext& ctx, uint32_t address, uint32_t bits, uin
 		EmitIfElseCondition(
 		    state, unaligned,
 		    [&]() {
-			    StoreBdaSubword(ctx, address, 8u, data);
+			    StoreBdaSubword(ctx, address, 8u, data, is_volatile);
 			    const auto next_addr = Binary(state, spv::OpIAdd, TypeScalarU64(state), address,
 			                                  ConstantDeviceAddress(state, 1));
 			    const auto high_byte = Binary(state, spv::OpShiftRightLogical, TypeU32(state), data,
 			                                  ConstantU32(state, 8));
-			    StoreBdaSubword(ctx, next_addr, 8u, high_byte);
+			    StoreBdaSubword(ctx, next_addr, 8u, high_byte, is_volatile);
 		    },
 		    [&]() {
 			    const auto aligned = Binary(state, spv::OpBitwiseAnd, TypeScalarU64(state), address,
@@ -295,10 +296,6 @@ void StoreBdaSubword(ValueEmitContext& ctx, uint32_t address, uint32_t bits, uin
 				    const auto pointer = state.builder.AllocateId();
 				    state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state),
 				                              pointer, bda);
-				    constexpr uint32_t alignment = sizeof(uint32_t);
-				    const auto         old       = state.builder.AllocateId();
-				    state.builder.AddFunction(spv::OpLoad, TypeU32(state), old, pointer,
-				                              spv::MemoryAccessAlignedMask, alignment);
 				    const auto shift = Binary(state, spv::OpShiftLeftLogical, TypeU32(state), byte,
 				                              ConstantU32(state, 3));
 				    const auto mask  = Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
@@ -307,13 +304,18 @@ void StoreBdaSubword(ValueEmitContext& ctx, uint32_t address, uint32_t bits, uin
 				                              Binary(state, spv::OpBitwiseAnd, TypeU32(state), data,
 				                                     ConstantU32(state, 0xffffu)),
 				                              shift);
-				    const auto merged =
-				        Binary(state, spv::OpBitwiseOr, TypeU32(state),
-				               Binary(state, spv::OpBitwiseAnd, TypeU32(state), old,
-				                      Unary(state, spv::OpNot, TypeU32(state), mask)),
-				               value);
-				    state.builder.AddFunction(spv::OpStore, pointer, merged,
-				                              spv::MemoryAccessAlignedMask, alignment);
+				    AtomicUpdate(state, pointer, IR::ResourceKind::Buffer,
+				                 [&](uint32_t old) {
+					                 return Binary(state, spv::OpBitwiseOr, TypeU32(state),
+					                               Binary(state, spv::OpBitwiseAnd, TypeU32(state),
+					                                      old,
+					                                      Unary(state, spv::OpNot, TypeU32(state),
+					                                            mask)),
+					                               value);
+				                 });
+				    if (is_volatile) {
+					    EmitDeviceAtomicMemoryBarrier(state);
+				    }
 			    });
 		    });
 		return;
@@ -328,27 +330,26 @@ void StoreBdaSubword(ValueEmitContext& ctx, uint32_t address, uint32_t bits, uin
 		const auto pointer = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer,
 		                          bda);
-		constexpr uint32_t alignment = sizeof(uint32_t);
-		const auto         old       = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpLoad, TypeU32(state), old, pointer,
-		                          spv::MemoryAccessAlignedMask, alignment);
 		const auto byte =
 		    Binary(state, spv::OpBitwiseAnd, TypeU32(state),
 		           Unary(state, spv::OpUConvert, TypeU32(state), address), ConstantU32(state, 3));
 		const auto shift =
 		    Binary(state, spv::OpShiftLeftLogical, TypeU32(state), byte, ConstantU32(state, 3));
-		const auto mask  = Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
-		                          ConstantU32(state, 0xffu), shift);
-		const auto value = Binary(
-		    state, spv::OpShiftLeftLogical, TypeU32(state),
-		    Binary(state, spv::OpBitwiseAnd, TypeU32(state), data, ConstantU32(state, 0xffu)),
-		    shift);
-		const auto merged = Binary(state, spv::OpBitwiseOr, TypeU32(state),
-		                           Binary(state, spv::OpBitwiseAnd, TypeU32(state), old,
-		                                  Unary(state, spv::OpNot, TypeU32(state), mask)),
-		                           value);
-		state.builder.AddFunction(spv::OpStore, pointer, merged, spv::MemoryAccessAlignedMask,
-		                          alignment);
+		const auto mask   = Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
+		                           ConstantU32(state, 0xffu), shift);
+		const auto value  = Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
+		                           Binary(state, spv::OpBitwiseAnd, TypeU32(state), data,
+		                                  ConstantU32(state, 0xffu)),
+		                           shift);
+		AtomicUpdate(state, pointer, IR::ResourceKind::Buffer, [&](uint32_t old) {
+			return Binary(state, spv::OpBitwiseOr, TypeU32(state),
+			              Binary(state, spv::OpBitwiseAnd, TypeU32(state), old,
+			                     Unary(state, spv::OpNot, TypeU32(state), mask)),
+			              value);
+		});
+		if (is_volatile) {
+			EmitDeviceAtomicMemoryBarrier(state);
+		}
 	});
 }
 
@@ -682,7 +683,7 @@ void StoreSubword(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo me
 	EmitIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
 		if (mem.dynamic_buffer) {
 			const auto addr = DynamicBufferGuestAddress(ctx, inst, mem);
-			StoreBdaSubword(ctx, addr, bits, ctx.Arg(inst, inst.NumArgs() - 2));
+			StoreBdaSubword(ctx, addr, bits, ctx.Arg(inst, inst.NumArgs() - 2), mem.glc);
 			return;
 		}
 		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
@@ -1163,11 +1164,11 @@ uint32_t EmitAtomic32(ValueEmitContext& ctx, const IR::Inst& inst) {
 }
 
 uint32_t EmitBufferAtomic64(ValueEmitContext& ctx, const IR::Inst& inst) {
-	const auto& mem = ctx.Memory(inst);
+	const auto& mem   = ctx.Memory(inst);
 	if (mem.dynamic_buffer) {
 		ctx.Fail(inst, "dynamic_buffer is not supported for 64-bit buffer atomics");
 	}
-	auto& state = ctx.state;
+	auto&       state = ctx.state;
 	return EmitValueOrDefaultIfCondition(
 	    state, ctx.Arg(inst, inst.NumArgs() - 1), TypeU64(state), ConstantU64(state, 0), [&]() {
 		    const auto resource = PrepareStorageBufferResourceAccess(
@@ -1195,11 +1196,11 @@ uint32_t EmitBufferAtomic64(ValueEmitContext& ctx, const IR::Inst& inst) {
 }
 
 uint32_t EmitBufferFloatAtomic(ValueEmitContext& ctx, const IR::Inst& inst) {
-	const auto& mem = ctx.Memory(inst);
+	const auto& mem       = ctx.Memory(inst);
 	if (mem.dynamic_buffer) {
 		ctx.Fail(inst, "dynamic_buffer is not supported for float buffer atomics");
 	}
-	const bool max_value = inst.GetOpcode() == IR::ValueOpcode::BufferAtomicFMax32;
+	const bool  max_value = inst.GetOpcode() == IR::ValueOpcode::BufferAtomicFMax32;
 	return EmitAtomicUpdate(ctx, inst, mem,
 	                        [max_value](EmitterState& state, uint32_t old, uint32_t value) {
 		                        return EmitFloatAtomicReplacement(state, old, value, max_value);

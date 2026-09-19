@@ -57,10 +57,10 @@ static DWORD GetCacheAccessType(sys_file_cache_type_t t) {
 	}
 
 	if (t == SYS_FILE_CACHE_SEQUENTIAL_SCAN) {
-		return SYS_FILE_CACHE_SEQUENTIAL_SCAN;
+		return FILE_FLAG_SEQUENTIAL_SCAN;
 	}
 
-	return SYS_FILE_CACHE_AUTO;
+	return FILE_ATTRIBUTE_NORMAL;
 }
 
 void SysFileRead(void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_read) {

@@ -40,7 +40,8 @@ static std::string CompleteEntryPointInterface(const std::string& source) {
 bool DerivePerVertexLayout(const std::string& vs_source, const std::string& ps_source,
                            PerVertexLayout&                 layout,
                            std::map<uint32_t, std::string>& vs_param_vars) {
-	std::regex var_re(R"(^\s*(%\S+)\s*=\s*OpVariable\s+%\S+\s+Output\s*$)", std::regex::multiline);
+	std::regex            var_re(R"(^\s*(%\S+)\s*=\s*OpVariable\s+%\S+\s+Output\s*$)",
+	                             std::regex_constants::multiline);
 	std::set<std::string> vs_outputs;
 	for (auto it = std::sregex_iterator(vs_source.begin(), vs_source.end(), var_re);
 	     it != std::sregex_iterator(); ++it) {
@@ -54,7 +55,7 @@ bool DerivePerVertexLayout(const std::string& vs_source, const std::string& ps_s
 	for (const auto& var: vs_outputs) {
 		if (var == "%outPerVertex" || var == "%gl_ClipDistance" || var == "%gl_PointSize") continue;
 		std::regex  loc_re(R"(^\s*OpDecorate\s+)" + var + R"(\s+Location\s+(\d+)\s*$)",
-		                   std::regex::multiline);
+		                   std::regex_constants::multiline);
 		std::smatch m;
 		if (std::regex_search(vs_source, m, loc_re)) {
 			uint32_t loc       = static_cast<uint32_t>(std::stoul(m[1]));
@@ -82,7 +83,8 @@ bool DerivePerVertexLayout(const std::string& vs_source, const std::string& ps_s
 		layout.record_stride_vec4 = current_slot;
 	}
 
-	std::regex pv_re(R"(^\s*OpDecorate\s+(%\S+)\s+PerVertexKHR\s*$)", std::regex::multiline);
+	std::regex               pv_re(R"(^\s*OpDecorate\s+(%\S+)\s+PerVertexKHR\s*$)",
+	                               std::regex_constants::multiline);
 	std::vector<std::string> pv_vars;
 	for (auto it = std::sregex_iterator(ps_source.begin(), ps_source.end(), pv_re);
 	     it != std::sregex_iterator(); ++it) {
@@ -92,7 +94,7 @@ bool DerivePerVertexLayout(const std::string& vs_source, const std::string& ps_s
 
 	for (const auto& pv_var: pv_vars) {
 		std::regex  loc_re(R"(^\s*OpDecorate\s+)" + pv_var + R"(\s+Location\s+(\d+)\s*$)",
-		                   std::regex::multiline);
+		                   std::regex_constants::multiline);
 		std::smatch m;
 		if (!std::regex_search(ps_source, m, loc_re)) {
 			return false;
@@ -227,7 +229,7 @@ std::string GenerateReplayVertexSpvasm(const PerVertexLayout& layout) {
 std::string LowerVertexToCompute(const std::string& source, const PerVertexLayout& layout,
                                  const std::map<uint32_t, std::string>& vs_param_vars) {
 	std::regex            var_re(R"(^\s*(%\S+)\s*=\s*OpVariable\s+%\S+\s+(Input|Output)\s*$)",
-	                             std::regex::multiline);
+	                             std::regex_constants::multiline);
 	std::set<std::string> inputs, outputs, attr_inputs;
 	for (auto it = std::sregex_iterator(source.begin(), source.end(), var_re);
 	     it != std::sregex_iterator(); ++it) {
@@ -253,17 +255,17 @@ std::string LowerVertexToCompute(const std::string& source, const PerVertexLayou
 	for (uint32_t i = 0; i < num_attrs; ++i) {
 		std::regex  var_decl(R"(^\s*%in_attr_)" + std::to_string(i) +
 		                         R"(\s*=\s*OpVariable\s+(%\S+)\s+Input\s*$)",
-		                     std::regex::multiline);
+		                     std::regex_constants::multiline);
 		std::smatch m;
 		if (std::regex_search(source, m, var_decl)) {
 			std::string ptr_type = m[1];
 			std::regex ptr_re(R"(^\s*)" + ptr_type + R"(\s*=\s*OpTypePointer\s+Input\s+(%\S+)\s*$)",
-			                  std::regex::multiline);
+			                  std::regex_constants::multiline);
 			if (std::regex_search(source, m, ptr_re)) {
 				std::string data_type = m[1];
 				std::regex  vec_re(R"(^\s*)" + data_type +
 				                       R"(\s*=\s*OpTypeVector\s+%float\s+(\d+)\s*$)",
-				                   std::regex::multiline);
+				                   std::regex_constants::multiline);
 				if (std::regex_search(source, m, vec_re)) {
 					attr_widths[i] = std::stoi(m[1]);
 				} else {
@@ -273,7 +275,8 @@ std::string LowerVertexToCompute(const std::string& source, const PerVertexLayou
 		}
 	}
 
-	std::regex  main_re(R"(^\s*OpEntryPoint\s+Vertex\s+(%\S+)\s+"main".*$)", std::regex::multiline);
+	std::regex  main_re(R"(^\s*OpEntryPoint\s+Vertex\s+(%\S+)\s+"main".*$)",
+	                    std::regex_constants::multiline);
 	std::smatch m_main;
 	if (!std::regex_search(source, m_main, main_re)) return {};
 	std::string main_name = m_main[1];
@@ -287,7 +290,8 @@ std::string LowerVertexToCompute(const std::string& source, const PerVertexLayou
 	std::regex ptr_replace(R"((OpTypePointer\s+)(Input|Output)(\s+))");
 	modified = std::regex_replace(modified, ptr_replace, "$1Private$3");
 
-	std::regex var_replace(R"((OpVariable\s+%\S+\s+)(Input|Output)(\s*$))", std::regex::multiline);
+	std::regex var_replace(R"((OpVariable\s+%\S+\s+)(Input|Output)(\s*$))",
+	                       std::regex_constants::multiline);
 	modified = std::regex_replace(modified, var_replace, "$1Private$3");
 
 	std::istringstream       iss(modified);
@@ -361,7 +365,7 @@ std::string LowerVertexToCompute(const std::string& source, const PerVertexLayou
 	std::string clip_pointer = "%capture_clip_pointer";
 	if (has_clip) {
 		std::regex  ptr_priv(R"(^\s*(%\S+)\s*=\s*OpTypePointer\s+Private\s+%float\s*$)",
-		                     std::regex::multiline);
+		                     std::regex_constants::multiline);
 		std::smatch m_priv;
 		if (std::regex_search(modified, m_priv, ptr_priv)) {
 			clip_pointer = m_priv[1];
@@ -490,7 +494,7 @@ std::string LowerVertexToCompute(const std::string& source, const PerVertexLayou
 	for (int width: {2, 3}) {
 		std::regex  vec_re(R"(^\s*(%\S+)\s*=\s*OpTypeVector\s+%uint\s+)" + std::to_string(width) +
 		                       R"(\s*$)",
-		                   std::regex::multiline);
+		                   std::regex_constants::multiline);
 		std::smatch m;
 		if (std::regex_search(source, m, vec_re)) {
 			std::string orig_id = m[1];
@@ -506,7 +510,8 @@ std::string LowerVertexToCompute(const std::string& source, const PerVertexLayou
 }
 
 std::string LowerFragmentToBufferReplay(const std::string& source, const PerVertexLayout& layout) {
-	std::regex pv_re(R"(^\s*OpDecorate\s+(%\S+)\s+PerVertexKHR\s*$)", std::regex::multiline);
+	std::regex               pv_re(R"(^\s*OpDecorate\s+(%\S+)\s+PerVertexKHR\s*$)",
+	                               std::regex_constants::multiline);
 	std::vector<std::string> pv_vars;
 	for (auto it = std::sregex_iterator(source.begin(), source.end(), pv_re);
 	     it != std::sregex_iterator(); ++it) {
@@ -526,7 +531,7 @@ std::string LowerFragmentToBufferReplay(const std::string& source, const PerVert
 
 	for (const auto& var: pv_vars) {
 		std::regex  loc_re(R"(^\s*OpDecorate\s+)" + var + R"(\s+Location\s+(\d+)\s*$)",
-		                   std::regex::multiline);
+		                   std::regex_constants::multiline);
 		std::smatch m;
 		if (!std::regex_search(source, m, loc_re)) return {};
 		int  loc     = std::stoi(m[1]);
@@ -538,28 +543,28 @@ std::string LowerFragmentToBufferReplay(const std::string& source, const PerVert
 			return {};
 
 		std::regex var_re(R"(^\s*)" + var + R"(\s*=\s*OpVariable\s+(%\S+)\s+Input\s*$)",
-		                  std::regex::multiline);
+		                  std::regex_constants::multiline);
 		if (!std::regex_search(source, m, var_re)) return {};
 		std::string ptr_type = m[1];
 
 		std::regex ptr_re(R"(^\s*)" + ptr_type + R"(\s*=\s*OpTypePointer\s+Input\s+(%\S+)\s*$)",
-		                  std::regex::multiline);
+		                  std::regex_constants::multiline);
 		if (!std::regex_search(source, m, ptr_re)) return {};
 		std::string arr_type = m[1];
 
 		std::regex arr_re(R"(^\s*)" + arr_type + R"(\s*=\s*OpTypeArray\s+(%\S+)\s+(%\S+)\s*$)",
-		                  std::regex::multiline);
+		                  std::regex_constants::multiline);
 		if (!std::regex_search(source, m, arr_re)) return {};
 		std::string vec_type   = m[1];
 		std::string size_const = m[2];
 
 		std::regex vec_detail(R"(^\s*)" + vec_type + R"(\s*=\s*OpTypeVector\s+(%\S+)\s+4\s*$)",
-		                      std::regex::multiline);
+		                      std::regex_constants::multiline);
 		if (!std::regex_search(source, m, vec_detail)) return {};
 		std::string scalar_type = m[1];
 
 		std::regex size_detail(R"(^\s*)" + size_const + R"(\s*=\s*OpConstant\s+(%\S+)\s+3\s*$)",
-		                       std::regex::multiline);
+		                       std::regex_constants::multiline);
 		if (!std::regex_search(source, m, size_detail)) return {};
 		std::string uint_type = m[1];
 

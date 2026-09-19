@@ -375,6 +375,20 @@ endfunction()
 
 add_kyty_full_emulator_test(shader_cfg_tests "${KYTY_TESTS_DIR}/shaderCfgTests.cpp")
 
+add_executable(per_vertex_transform_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/PerVertexTransformTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/perVertexTransform.cpp"
+)
+target_include_directories(per_vertex_transform_tests PRIVATE ${inc_headers})
+target_link_libraries(per_vertex_transform_tests common fmt::fmt xxhash)
+
+add_executable(per_vertex_gpu_execution_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/PerVertexGpuExecutionTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/perVertexTransform.cpp"
+)
+target_include_directories(per_vertex_gpu_execution_tests PRIVATE ${inc_headers})
+target_link_libraries(per_vertex_gpu_execution_tests Vulkan::Headers spirv-tools common fmt::fmt xxhash)
+
 add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ScalarProvenanceTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
@@ -522,6 +536,7 @@ if(BUILD_TESTING)
 	set_tests_properties(emulator_present_mode_invalid PROPERTIES WILL_FAIL TRUE)
 	add_test(NAME ime_dialog COMMAND $<TARGET_FILE:ime_dialog_tests>)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
+	add_test(NAME per_vertex_transform COMMAND $<TARGET_FILE:per_vertex_transform_tests>)
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)

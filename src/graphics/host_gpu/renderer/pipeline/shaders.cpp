@@ -177,9 +177,9 @@ static vk::BlendOp GetBlendOp(uint32_t op) {
 	return vk::BlendOp::eAdd;
 }
 
-static void AddLayoutBindings(std::vector<vk::DescriptorSetLayoutBinding>& descriptor_bindings,
+static void AddLayoutBindings(std::vector<vk::DescriptorSetLayoutBinding>&    descriptor_bindings,
                               const ShaderRecompiler::IR::CompiledShaderInfo& program,
-                              vk::ShaderStageFlagBits              stage) {
+                              vk::ShaderStageFlagBits                         stage) {
 	for (const auto& binding: program.bindings.descriptors) {
 		descriptor_bindings.push_back(
 		    {ShaderRecompiler::IR::NativeBinding(program.stage, binding.kind),
@@ -218,7 +218,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	const auto& vertex_program = programs.vertex[0];
 	const auto& pixel_program  = programs.pixel;
 	const bool  tessellation   = vertex_info.size() == 3;
-	const bool ps_active = ps_input_info != nullptr;
+	const bool  ps_active      = ps_input_info != nullptr;
 	EXIT_IF(!vertex_program || (ps_active && !pixel_program));
 	const bool with_depth = rendering.depth_format != vk::Format::eUndefined ||
 	                        rendering.stencil_format != vk::Format::eUndefined;
@@ -334,10 +334,12 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	}
 
 	vk::PipelineVertexInputStateCreateInfo vertex_input_info {};
-	vertex_input_info.vertexBindingDescriptionCount   = vertex_input.binding_count;
-	vertex_input_info.pVertexBindingDescriptions      = input_desc;
-	vertex_input_info.vertexAttributeDescriptionCount = vertex_input.attribute_count;
-	vertex_input_info.pVertexAttributeDescriptions    = input_attr;
+	vertex_input_info.vertexBindingDescriptionCount =
+	    programs.prototype_extra_layout ? 0u : vertex_input.binding_count;
+	vertex_input_info.pVertexBindingDescriptions = input_desc;
+	vertex_input_info.vertexAttributeDescriptionCount =
+	    programs.prototype_extra_layout ? 0u : vertex_input.attribute_count;
+	vertex_input_info.pVertexAttributeDescriptions = input_attr;
 
 	vk::PipelineInputAssemblyStateCreateInfo input_assembly {};
 	input_assembly.topology = static_params.topology;
@@ -375,14 +377,15 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	                     !graphics.provoking_vertex_last_enabled);
 	if (graphics.provoking_vertex_last_enabled) {
 		provoking_vertex.provokingVertexMode = static_params.provoking_vtx_last
-		    ? vk::ProvokingVertexModeEXT::eLastVertex : vk::ProvokingVertexModeEXT::eFirstVertex;
-		provoking_vertex.pNext = rasterizer.pNext;
-		rasterizer.pNext = &provoking_vertex;
+		                                           ? vk::ProvokingVertexModeEXT::eLastVertex
+		                                           : vk::ProvokingVertexModeEXT::eFirstVertex;
+		provoking_vertex.pNext               = rasterizer.pNext;
+		rasterizer.pNext                     = &provoking_vertex;
 	}
-	rasterizer.cullMode  = cull_mode;
-	rasterizer.frontFace = front_face;
+	rasterizer.cullMode    = cull_mode;
+	rasterizer.frontFace   = front_face;
 	rasterizer.polygonMode = static_params.polygon_mode;
-	rasterizer.lineWidth = 1.0f;
+	rasterizer.lineWidth   = 1.0f;
 
 	vk::PipelineMultisampleStateCreateInfo multisampling {};
 	multisampling.sampleShadingEnable  = static_params.sample_shading_enable ? VK_TRUE : VK_FALSE;
@@ -447,9 +450,11 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	const vk::PushConstantRange push_constants {graphics_stages, 0,
 	                                            ShaderRecompiler::IR::NativePushConstantSize};
 
-	vk::PipelineLayoutCreateInfo pipeline_layout_info {};
-	pipeline_layout_info.setLayoutCount         = 1;
-	pipeline_layout_info.pSetLayouts            = &pipeline.descriptor_set_layout;
+	vk::PipelineLayoutCreateInfo  pipeline_layout_info {};
+	const vk::DescriptorSetLayout layouts[] {pipeline.descriptor_set_layout,
+	                                         programs.prototype_extra_layout};
+	pipeline_layout_info.setLayoutCount         = programs.prototype_extra_layout ? 2u : 1u;
+	pipeline_layout_info.pSetLayouts            = layouts;
 	pipeline_layout_info.pushConstantRangeCount = 1;
 	pipeline_layout_info.pPushConstantRanges    = &push_constants;
 
@@ -477,24 +482,17 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 #else
 	    (static_params.depth_bounds_test_enable ? VK_TRUE : VK_FALSE);
 #endif
-	depth_stencil_info.minDepthBounds    = static_params.depth_min_bounds;
-	depth_stencil_info.maxDepthBounds    = static_params.depth_max_bounds;
+	depth_stencil_info.minDepthBounds = static_params.depth_min_bounds;
+	depth_stencil_info.maxDepthBounds = static_params.depth_max_bounds;
 
 	std::vector<vk::DynamicState> dynamic_states {
-	    vk::DynamicState::eViewportWithCount,
-	    vk::DynamicState::eScissorWithCount,
-	    vk::DynamicState::eLineWidth,
-	    vk::DynamicState::eDepthTestEnable,
-	    vk::DynamicState::eDepthWriteEnable,
-	    vk::DynamicState::eDepthCompareOp,
-	    vk::DynamicState::eDepthBiasEnable,
-	    vk::DynamicState::eDepthBias,
-	    vk::DynamicState::eStencilTestEnable,
-	    vk::DynamicState::eStencilOp,
-	    vk::DynamicState::eStencilCompareMask,
-	    vk::DynamicState::eStencilReference,
-	    vk::DynamicState::eStencilWriteMask,
-	    vk::DynamicState::eBlendConstants,
+	    vk::DynamicState::eViewportWithCount,  vk::DynamicState::eScissorWithCount,
+	    vk::DynamicState::eLineWidth,          vk::DynamicState::eDepthTestEnable,
+	    vk::DynamicState::eDepthWriteEnable,   vk::DynamicState::eDepthCompareOp,
+	    vk::DynamicState::eDepthBiasEnable,    vk::DynamicState::eDepthBias,
+	    vk::DynamicState::eStencilTestEnable,  vk::DynamicState::eStencilOp,
+	    vk::DynamicState::eStencilCompareMask, vk::DynamicState::eStencilReference,
+	    vk::DynamicState::eStencilWriteMask,   vk::DynamicState::eBlendConstants,
 	};
 #if !defined(__APPLE__)
 	if (rendering.color_count != 0) {
@@ -523,15 +521,15 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	vk::PipelineTessellationStateCreateInfo tessellation_state {};
 	tessellation_state.patchControlPoints =
 	    tessellation ? vs_input_info.tess.input_control_points : 3u;
-	pipeline_info.pTessellationState = (rect_list || tessellation) ? &tessellation_state : nullptr;
-	pipeline_info.pViewportState          = &viewport_state;
-	pipeline_info.pRasterizationState     = &rasterizer;
-	pipeline_info.pMultisampleState       = &multisampling;
-	pipeline_info.pDepthStencilState      = (with_depth ? &depth_stencil_info : nullptr);
-	pipeline_info.pColorBlendState        = &color_blending;
-	pipeline_info.pDynamicState           = &dynamic_state;
-	pipeline_info.layout                  = pipeline.pipeline_layout;
-	pipeline_info.basePipelineIndex       = -1;
+	pipeline_info.pTessellationState  = (rect_list || tessellation) ? &tessellation_state : nullptr;
+	pipeline_info.pViewportState      = &viewport_state;
+	pipeline_info.pRasterizationState = &rasterizer;
+	pipeline_info.pMultisampleState   = &multisampling;
+	pipeline_info.pDepthStencilState  = (with_depth ? &depth_stencil_info : nullptr);
+	pipeline_info.pColorBlendState    = &color_blending;
+	pipeline_info.pDynamicState       = &dynamic_state;
+	pipeline_info.layout              = pipeline.pipeline_layout;
+	pipeline_info.basePipelineIndex   = -1;
 
 	EXIT_IF(pipeline.pipeline != nullptr);
 
@@ -546,6 +544,13 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	}
 	result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info, nullptr,
 	                                                 &pipeline.pipeline);
+	if (result != vk::Result::eSuccess && driver_cache != nullptr) {
+		LOGF("PipelineTrace: vkCreateGraphicsPipelines failed with driver_cache (%s), retrying "
+		     "with nullptr\n",
+		     vk::to_string(result).c_str());
+		result = graphics.device.createGraphicsPipelines(nullptr, 1, &pipeline_info, nullptr,
+		                                                 &pipeline.pipeline);
+	}
 	if (graphics_debug_dump_enabled()) {
 		LOGF("PipelineTrace: vkCreateGraphicsPipelines done result=%s pipeline=%p\n",
 		     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
@@ -575,8 +580,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	comp_shader_stage_info.pName  = "main";
 	EXIT_IF(!input_info.stage);
 	const auto wave_size = input_info.stage.program->wave_size;
-	if (graphics.compute_subgroup_size_control_enabled &&
-	    wave_size >= graphics.min_subgroup_size && wave_size <= graphics.max_subgroup_size) {
+	if (graphics.compute_subgroup_size_control_enabled && wave_size >= graphics.min_subgroup_size &&
+	    wave_size <= graphics.max_subgroup_size) {
 		comp_subgroup_size.requiredSubgroupSize = wave_size;
 		comp_shader_stage_info.pNext            = &comp_subgroup_size;
 	}
@@ -596,10 +601,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	EXIT_IF(pipeline.pipeline_layout != nullptr);
 
-	LOGF("PipelineTrace: vkCreatePipelineLayout CS begin set_layouts=1 push_constants=%u\n",
-	     1u);
+	LOGF("PipelineTrace: vkCreatePipelineLayout CS begin set_layouts=1 push_constants=%u\n", 1u);
 	auto result = graphics.device.createPipelineLayout(&pipeline_layout_info, nullptr,
-	                                                  &pipeline.pipeline_layout);
+	                                                   &pipeline.pipeline_layout);
 	LOGF("PipelineTrace: vkCreatePipelineLayout CS done result=%s layout=%p\n",
 	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline_layout));
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
@@ -615,8 +619,15 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	LOGF("PipelineTrace: vkCreateComputePipelines begin layout=%p\n",
 	     static_cast<void*>(pipeline.pipeline_layout));
-	result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr,
-	                                                &pipeline.pipeline);
+	result =
+	    graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr, &pipeline.pipeline);
+	if (result != vk::Result::eSuccess && driver_cache != nullptr) {
+		LOGF("PipelineTrace: vkCreateComputePipelines failed with driver_cache (%s), retrying with "
+		     "nullptr\n",
+		     vk::to_string(result).c_str());
+		result =
+		    graphics.device.createComputePipelines(nullptr, 1, &info, nullptr, &pipeline.pipeline);
+	}
 	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p\n",
 	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);

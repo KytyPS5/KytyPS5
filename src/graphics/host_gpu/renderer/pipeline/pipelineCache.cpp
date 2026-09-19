@@ -5,11 +5,13 @@
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/threads.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
+#include "graphics/host_gpu/renderer/perVertexPrototype.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
@@ -22,6 +24,7 @@
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <fmt/format.h>
@@ -35,6 +38,20 @@
 #include <xxhash.h>
 
 namespace Libs::Graphics {
+
+std::string PipelineCacheTitleId() {
+	std::string title_id;
+	if ((!Loader::SystemContentParamSfoGetString("TITLE_ID", &title_id) || title_id.empty()) &&
+	    (!Loader::SystemContentParamSfoGetString("CONTENT_ID", &title_id) || title_id.empty())) {
+		return {};
+	}
+	if (!std::ranges::all_of(title_id, [](unsigned char c) {
+		    return std::isalnum(c) != 0 || c == '-' || c == '_';
+	    })) {
+		return {};
+	}
+	return title_id;
+}
 
 namespace {
 
@@ -67,22 +84,8 @@ std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties)
 		uuid[i * 2]     = hex[properties.pipelineCacheUUID[i] >> 4u];
 		uuid[i * 2 + 1] = hex[properties.pipelineCacheUUID[i] & 0xfu];
 	}
-	return fmt::format("KytyPC1:{}:{:08x}:{:08x}:{:08x}:{}\n", KYTY_GIT_REVISION,
+	return fmt::format("KytyPC2:{}:{:08x}:{:08x}:{:08x}:{}\n", KYTY_GIT_REVISION,
 	                   properties.vendorID, properties.deviceID, properties.driverVersion, uuid);
-}
-
-std::string PipelineCacheTitleId() {
-	std::string title_id;
-	if ((!Loader::SystemContentParamSfoGetString("TITLE_ID", &title_id) || title_id.empty()) &&
-	    (!Loader::SystemContentParamSfoGetString("CONTENT_ID", &title_id) || title_id.empty())) {
-		return {};
-	}
-	if (!std::ranges::all_of(title_id, [](unsigned char c) {
-		    return std::isalnum(c) != 0 || c == '-' || c == '_';
-	    })) {
-		return {};
-	}
-	return title_id;
 }
 
 template <typename... Args>
@@ -254,10 +257,12 @@ struct PipelineCache::ProgramCache {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
 			     static_cast<uint64_t>(result.spirv.size()), options.wave_size);
 		}
+		const ShaderProgram handle {.id = ++next_shader_id, .module = module};
+		RememberPerVertexPrototypeShader(options.stage, handle, result.spirv);
 		return {
 		    .specialization = std::move(specialization),
 		    .program        = std::move(result.program).TakeCompiledInfo(),
-		    .handle         = {.id = ++next_shader_id, .module = module},
+		    .handle         = handle,
 		};
 	}
 
@@ -291,7 +296,8 @@ struct PipelineCache::ProgramCache {
 			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
 			    entry->second.resource_plan, runtime, resources, specialization));
 			if (const auto permutation = std::ranges::find_if(
-			        entry->second.permutations, [&](const Permutation& candidate) {
+			        entry->second.permutations,
+			        [&](const Permutation& candidate) {
 				        const auto& layout = candidate.program.bindings;
 				        return layout.push_data_start_dword ==
 				                   ShaderRecompiler::IR::PushData::StartFor(
@@ -329,7 +335,7 @@ struct PipelineCache::ProgramCache {
 		options.stage       = stage;
 		options.shader_hash = params.hash;
 		options.user_data   = params.user_data;
-		options.back_code      = params.back_code;
+		options.back_code   = params.back_code;
 		options.dump_ir     = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
 		options.early_dump  = options.dump_ir;
 		options.dump_label  = label;
@@ -411,6 +417,7 @@ PipelineCache::~PipelineCache() {
 	destroy(m_compute_pipelines);
 	if (m_driver_cache != nullptr) {
 		m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
+		m_driver_cache = nullptr;
 	}
 }
 
@@ -419,18 +426,10 @@ void PipelineCache::InitializeDriverCache() {
 	if (title_id.empty()) {
 		return;
 	}
-	if (KYTY_BUILD != KYTY_BUILD_RELEASE) {
-		PipelineCacheLog("Vulkan pipeline cache: disabled (non-Release build)");
-		return;
-	}
 	const std::string_view git_hash     = KYTY_GIT_HASH;
 	const std::string_view git_revision = KYTY_GIT_REVISION;
-	if (git_hash == "unknown" || git_revision == "unknown") {
+	if (git_hash == "unknown" && git_revision == "unknown") {
 		PipelineCacheLog("Vulkan pipeline cache: disabled (unknown git revision)");
-		return;
-	}
-	if (git_hash.ends_with("-dirty")) {
-		PipelineCacheLog("Vulkan pipeline cache: disabled (dirty build)");
 		return;
 	}
 
@@ -447,8 +446,7 @@ void PipelineCache::InitializeDriverCache() {
 		Common::File file(m_driver_cache_path, Common::File::Mode::Read);
 		const auto   file_size = file.IsInvalid() ? 0 : file.Size();
 		const auto   signature = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
-		if (file_size >= signature.size() + sizeof(uint64_t) &&
-		    file_size <= std::numeric_limits<uint32_t>::max()) {
+		if (file_size >= signature.size() + sizeof(uint64_t) && file_size <= 256 * 1024 * 1024) {
 			std::string cached_signature(signature.size(), '\0');
 			uint64_t    payload_hash = 0;
 			initial_data.resize(file_size - signature.size() - sizeof(payload_hash));
@@ -502,6 +500,10 @@ void PipelineCache::InitializeDriverCache() {
 
 void PipelineCache::Save() {
 	Common::LockGuard lock(m_mutex);
+	SaveInternalLocked();
+}
+
+void PipelineCache::SaveInternalLocked() {
 	if (m_driver_cache == nullptr) {
 		return;
 	}
@@ -512,8 +514,7 @@ void PipelineCache::Save() {
 	for (uint32_t attempt = 0; attempt < 3; attempt++) {
 		size   = 0;
 		result = m_graphics.device.getPipelineCacheData(m_driver_cache, &size, nullptr);
-		if (result != vk::Result::eSuccess || size == 0 ||
-		    size > std::numeric_limits<uint32_t>::max()) {
+		if (result != vk::Result::eSuccess || size == 0 || size > 256 * 1024 * 1024) {
 			break;
 		}
 		payload.resize(size);
@@ -522,10 +523,9 @@ void PipelineCache::Save() {
 			break;
 		}
 	}
-	if (result != vk::Result::eSuccess || size == 0 ||
-	    size > std::numeric_limits<uint32_t>::max()) {
-		PipelineCacheLog("Vulkan pipeline cache: save failed ({}, {} bytes)",
-		                 vk::to_string(result), size);
+	if (result != vk::Result::eSuccess || size == 0 || size > 256 * 1024 * 1024) {
+		PipelineCacheLog("Vulkan pipeline cache: save failed ({}, {} bytes)", vk::to_string(result),
+		                 size);
 		return;
 	}
 	payload.resize(size);
@@ -536,8 +536,10 @@ void PipelineCache::Save() {
 		PipelineCacheLog("Vulkan pipeline cache: failed to create cache directory");
 		return;
 	}
-	auto temp_path = m_driver_cache_path;
-	temp_path += ".tmp";
+	static std::atomic<uint64_t> s_save_counter = 0;
+	const auto                   temp_path      = std::filesystem::path(
+	    m_driver_cache_path.string() +
+	    fmt::format(".tmp.{}.{}", Common::Thread::GetProcessId(), s_save_counter++));
 	Common::File file;
 	uint32_t     prefix_written  = 0;
 	uint32_t     payload_written = 0;
@@ -592,8 +594,8 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	}
 	ShaderParams pixel_params;
 	if (pixel_active) {
-		pixel_params = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
-		const auto& blend          = context.GetBlendControl(0);
+		pixel_params      = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
+		const auto& blend = context.GetBlendControl(0);
 		const auto  is_dual_source = [](uint8_t factor) {
 			return factor >= static_cast<uint8_t>(Prospero::BlendFactor::kSrc1Color) &&
 			       factor <= static_cast<uint8_t>(Prospero::BlendFactor::kOneMinusSrc1Alpha);
@@ -626,7 +628,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	Common::LockGuard lock(m_mutex);
 	uint32_t          push_data_cursor =
 	    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount : 0;
-	GraphicsPrograms  result;
+	GraphicsPrograms result;
 	if (pixel_active) {
 		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
 	}
@@ -697,8 +699,8 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 			EXIT("mixed color attachment sample counts are unsupported: %u and %u\n",
 			     attachment_samples, colors[i].desc.info.samples);
 		}
-		const auto& rt                        = ctx.GetRenderTarget(colors[i].target_slot);
-		const auto& bc                        = ctx.GetBlendControl(colors[i].target_slot);
+		const auto& rt                           = ctx.GetRenderTarget(colors[i].target_slot);
+		const auto& bc                           = ctx.GetBlendControl(colors[i].target_slot);
 		static_params.color_srcblend[slot]       = bc.color_srcblend;
 		static_params.color_comb_fcn[slot]       = bc.color_comb_fcn;
 		static_params.color_destblend[slot]      = bc.color_destblend;
@@ -757,9 +759,9 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	static_params.depth_max_bounds         = depth.depth_max_bounds;
 	const bool rect_list =
 	    command.GetUserConfig().GetPrimType() == Prospero::PrimitiveType::kRectList;
-	static_params.cull_back  = !rect_list && mc.cull_back;
-	static_params.cull_front = !rect_list && mc.cull_front;
-	static_params.face       = mc.face;
+	static_params.cull_back          = !rect_list && mc.cull_back;
+	static_params.cull_front         = !rect_list && mc.cull_front;
+	static_params.face               = mc.face;
 	static_params.provoking_vtx_last = mc.provoking_vtx_last;
 	static_params.polygon_mode =
 	    ResolvePolygonMode(mc, static_params.cull_front, static_params.cull_back);
@@ -817,12 +819,18 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
 	EXIT_IF(!inserted);
 
+	static auto last_save = std::chrono::steady_clock::now();
+	const auto  now       = std::chrono::steady_clock::now();
+	if (now - last_save >= std::chrono::milliseconds(500)) {
+		last_save = now;
+		SaveInternalLocked();
+	}
+
 	return *iter->second;
 }
 
-PipelineCache::Pipeline&
-PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
-                                  const ShaderProgram&          compute_program) {
+PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
+                                                           const ShaderProgram& compute_program) {
 	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Compute)", profiler::colors::RedA100);
 
 	EXIT_IF(!compute_program);
@@ -846,6 +854,13 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 
 	auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(cached));
 	EXIT_IF(!inserted);
+
+	static auto last_save = std::chrono::steady_clock::now();
+	const auto  now       = std::chrono::steady_clock::now();
+	if (now - last_save >= std::chrono::milliseconds(500)) {
+		last_save = now;
+		SaveInternalLocked();
+	}
 
 	return *iter->second;
 }

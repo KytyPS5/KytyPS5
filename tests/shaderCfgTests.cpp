@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
+#include "graphics/host_gpu/renderer/perVertexPrototype.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
@@ -6056,6 +6057,66 @@ void TestCustomVintrpMovTranslation() {
   Check(SpirvHasDecorationValue(mixed_linear_result.spirv, 11u, 5287u),
         "mixed linear input did not use BaryCoordNoPerspKHR");
   CheckSpirvBinaryValidates(mixed_linear_result.spirv);
+}
+
+void TestPerVertexPrototypeDetection() {
+  // The live experiment activates on any pixel shader whose recompiled module
+  // declares a per-vertex parameter input, so the scan must find the
+  // PerVertexKHR decoration the emitter writes and must ignore flat inputs.
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  const uint32_t flat_shader[] = {EncodeVintrp(2, 12, 0, 0, 2), 0xbf810000u};
+  ShaderPixelInputInfo flat_info{};
+  flat_info.input_num = 1;
+  SetIdentityInterpolatorSettings(&flat_info);
+  flat_info.interpolator_settings[0] = 0x00000400u;
+  options.input_info.pixel = &flat_info;
+  const auto flat = RecompileForTest(flat_shader, options);
+  Check(!HasPerVertexPrototypeInput(flat.spirv),
+        "flat VINTRP input was taken for a per-vertex capture input");
+  const uint32_t per_vertex_shader[] = {
+      EncodeVintrp(2, 12, 0, 3, 2), EncodeVintrp(2, 13, 0, 3, 0),
+      EncodeVintrp(2, 14, 0, 3, 1), EncodeVop2(0x03, 15, 12 + 256, 0),
+      EncodeVop2(0x03, 16, 13 + 256, 1), EncodeExp0(0x00, 0xf),
+      EncodeExp1(15, 16, 14, 12), 0xbf810000u};
+  ShaderPixelInputInfo per_vertex_info{};
+  per_vertex_info.input_num = 1;
+  per_vertex_info.ps_system_input_base = 2;
+  per_vertex_info.custom_interpolation_mask = 1;
+  per_vertex_info.ps_perspective_center_vgpr = 0;
+  SetIdentityInterpolatorSettings(&per_vertex_info);
+  per_vertex_info.interpolator_settings[0] = 0x00000420u;
+  options.input_info.pixel = &per_vertex_info;
+  const auto per_vertex = RecompileForTest(per_vertex_shader, options);
+ Check(HasPerVertexPrototypeInput(per_vertex.spirv),
+       "per-vertex parameter input was not detected");
+ CheckSpirvBinaryValidates(per_vertex.spirv);
+  // Attribute decoding for the capture pass: float32 words keep their bits, the
+  // packed unorm16 words the captured shader unpacks are scaled by 1/65535, and
+  // a short span or a format the capture cannot reproduce is refused.
+  std::array<uint8_t, 16> float_bytes{};
+  const uint32_t float_words[] = {0x3f800000u, 0x7f800001u, 0x80000000u, 0xc0490fdbu};
+  std::memcpy(float_bytes.data(), float_words, sizeof(float_words));
+  std::array<uint32_t, 4> decoded{};
+  Check(DecodePerVertexPrototypeAttribute(Prospero::BufferFormat::k32_32_32_32Float,
+                                          float_bytes, decoded) &&
+            decoded[0] == float_words[0] && decoded[1] == float_words[1] &&
+            decoded[2] == float_words[2] && decoded[3] == float_words[3],
+        "float32 attribute words did not survive decoding bit-exact");
+  const uint16_t unorm_words[] = {0xffffu, 0x0000u, 0x8000u, 0x7fffu};
+  std::array<uint8_t, 8> unorm_bytes{};
+  std::memcpy(unorm_bytes.data(), unorm_words, sizeof(unorm_words));
+  Check(DecodePerVertexPrototypeAttribute(Prospero::BufferFormat::k16_16_16_16UNorm,
+                                          unorm_bytes, decoded) &&
+            decoded[0] == 0x3f800000u && decoded[1] == 0u &&
+            decoded[2] == std::bit_cast<uint32_t>(32768.0f / 65535.0f) &&
+            decoded[3] == std::bit_cast<uint32_t>(32767.0f / 65535.0f),
+        "unorm16 attribute words were not scaled by 1/65535");
+  Check(!DecodePerVertexPrototypeAttribute(Prospero::BufferFormat::k32_32_32_32Float,
+                                           std::span<const uint8_t>(float_bytes.data(), 12u), decoded),
+        "a short attribute span was decoded");
+  Check(!DecodePerVertexPrototypeAttribute(Prospero::BufferFormat::k32_32_32_32UInt,
+                                           float_bytes, decoded),
+        "an integer attribute format was decoded");
 }
 
 void TestPerspectiveCentroidInputs() {
@@ -13507,6 +13568,7 @@ int main() {
   TestNewShaderRecompilerNativeBindingPlan();
   TestNewShaderRecompilerStageInputInfo();
   TestCustomVintrpMovTranslation();
+  TestPerVertexPrototypeDetection();
   TestPerspectiveCentroidInputs();
   TestGraphicsCreateInterpolantMapping();
   TestNewShaderRecompilerPixelPipelineEntry();

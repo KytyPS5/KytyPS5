@@ -43,6 +43,9 @@ public:
 	// The id is unique and can't be reused by another thread.
 	static int GetThreadIdUnique();
 
+	// Get current process id across platforms.
+	[[nodiscard]] static int GetProcessId();
+
 	KYTY_CLASS_NO_COPY(Thread);
 
 private:

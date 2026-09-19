@@ -502,6 +502,12 @@ void SysFileFindFiles(const std::filesystem::path& path, std::vector<sys_file_fi
 			continue;
 		}
 
+		// Skip reparse points, so a symlink or junction is never followed into a cycle
+		// during the recursive walk. Matches the lstat-based walk on Linux.
+		if ((data.dwFileAttributes & static_cast<DWORD>(FILE_ATTRIBUTE_REPARSE_POINT)) != 0u) {
+			continue;
+		}
+
 		if ((data.dwFileAttributes & static_cast<DWORD>(FILE_ATTRIBUTE_DIRECTORY)) != 0u) {
 			SysFileFindFiles(std::filesystem::path(real_path) / file_name, out);
 		} else {

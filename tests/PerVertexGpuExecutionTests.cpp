@@ -28,10 +28,6 @@
 
 namespace {
 
-constexpr const char* kDefaultDriver =
-    "/Users/carbo/Documents/Codex/2026-09-16/users-carbo-downloads-kytyps5-2026-09/work/"
-    "MoltenVK-taskless/Package/Release/MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib";
-
 [[noreturn]] void Fail(const char* message) {
     std::fprintf(stderr, "per-vertex-gpu-tests: FAILED: %s\n", message);
     std::exit(1);
@@ -136,11 +132,9 @@ void LoadDevice(VkDevice device, T& target, const char* name) {
 }
 
 Device InitDevice() {
-    void* lib = dlopen(kDefaultDriver, RTLD_NOW | RTLD_LOCAL);
-    if (lib == nullptr) {
-        lib = dlopen("libMoltenVK.dylib", RTLD_NOW | RTLD_LOCAL);
-    }
-    if (lib == nullptr) Fail("cannot load libMoltenVK.dylib");
+    const char* driver = std::getenv("SDL_VULKAN_LIBRARY");
+    void* lib = dlopen(driver != nullptr ? driver : "libMoltenVK.dylib", RTLD_NOW | RTLD_LOCAL);
+    if (lib == nullptr) Fail("cannot load MoltenVK; set SDL_VULKAN_LIBRARY to its library path");
     g_get_instance_proc_addr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(lib, "vkGetInstanceProcAddr"));
     if (!g_get_instance_proc_addr) Fail("dlsym vkGetInstanceProcAddr failed");
 
@@ -1717,6 +1711,8 @@ OpFunctionEnd
             const auto file_sz = std::filesystem::file_size(game_cache_dir / fmt::format("pv_{:016x}_{:016x}.bin", vs_hash, ps_hash));
             std::printf("PASS: Real game shader pair 69-68: Cold lowering+assembly=%lld ms, Warm cache load=%lld us (file size=%zu bytes)\n",
                         static_cast<long long>(t_cold_ms), static_cast<long long>(t_warm_us), static_cast<size_t>(file_sz));
+        } else {
+            std::printf("SKIP: Optional real shader fixtures are not present\n");
         }
     }
 

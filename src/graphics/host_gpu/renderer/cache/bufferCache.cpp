@@ -129,7 +129,50 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 
 	const auto [mapped, offset] = m_download_buffer.Map(total_size, 64);
 	if (mapped == nullptr) {
-		EXIT("BufferCache: download exceeds 32 MiB staging buffer capacity\n");
+		// Oversized download (e.g. large GC retire > 32 MiB ring): fall back to a dedicated
+		// temporary, mirroring UploadCopies(). Chunking here would also work, but a single
+		// temp keeps the packed copy layout intact.
+		auto temporary = std::make_unique<Buffer>(m_graphics, m_scheduler,
+		                                         MemoryUsage::Download, 0,
+		                                         vk::BufferUsageFlagBits::eTransferDst, total_size);
+		auto& command = m_scheduler.Current();
+		command.EndRendering();
+		const auto native = command.Handle();
+		vk::BufferMemoryBarrier before {};
+		before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+		before.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+		before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		before.buffer              = buffer.Handle();
+		before.offset              = 0;
+		before.size                = buffer.Size();
+		native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+		                       vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &before, 0,
+		                       nullptr);
+		native.copyBuffer(buffer.Handle(), temporary->Handle(),
+		                  static_cast<uint32_t>(copies.size()), copies.data());
+
+		auto after          = before;
+		after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+		after.dstAccessMask = vk::AccessFlagBits::eHostRead;
+		after.buffer        = temporary->Handle();
+		after.offset        = 0;
+		after.size          = total_size;
+		native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+		                       vk::PipelineStageFlagBits::eAllCommands |
+		                           vk::PipelineStageFlagBits::eHost,
+		                       {}, 0, nullptr, 1, &after, 0, nullptr);
+		m_scheduler.DeferPriorityOperation(
+		    [tmp = std::move(temporary), total_size, buffer_address,
+		     copies = std::move(copies)] {
+			    tmp->Invalidate(0, total_size);
+			    const auto* base = tmp->Mapped().data();
+			    for (const auto& copy: copies) {
+				    Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
+				                                          base + copy.dstOffset, copy.size);
+			    }
+		    });
+		return true;
 	}
 	m_download_buffer.Commit();
 	for (auto& copy: copies) {

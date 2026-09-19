@@ -933,6 +933,16 @@ std::string Hex(u32 value) {
   std::abort();
 }
 
+// Exit code 77 is the conventional "skipped" status for test programs; it is
+// registered as SKIP_RETURN_CODE for the Vulkan-backed tests in CMakeLists.txt
+// so a machine without a usable Vulkan environment skips them instead of
+// failing.
+[[noreturn]] void SkipEnvironment(const std::string &message) {
+  std::fprintf(stderr, "ShaderRecompilerComputeTests: skipped: %s\n",
+               message.c_str());
+  std::exit(77);
+}
+
 void Require(const char *shader_name, const char *stage, bool value,
              const std::string &message);
 
@@ -14888,8 +14898,9 @@ private:
     const auto get_instance_proc_addr =
         loader.getProcAddress<PFN_vkGetInstanceProcAddr>(
             "vkGetInstanceProcAddr");
-    Require("VulkanHarness", "dispatch", get_instance_proc_addr != nullptr,
-            "could not load the Vulkan loader");
+    if (get_instance_proc_addr == nullptr) {
+      SkipEnvironment("could not load the Vulkan loader");
+    }
     VULKAN_HPP_DEFAULT_DISPATCHER.init(get_instance_proc_addr);
 
     vk::ApplicationInfo app{};
@@ -14909,8 +14920,9 @@ private:
     RequireVk("VulkanHarness", "dispatch",
               m_instance.enumeratePhysicalDevices(&physical_count, nullptr),
               "vkEnumeratePhysicalDevices");
-    Require("VulkanHarness", "dispatch", physical_count != 0,
-            "no Vulkan physical devices");
+    if (physical_count == 0) {
+      SkipEnvironment("no Vulkan physical devices");
+    }
     std::vector<vk::PhysicalDevice> physical_devices(physical_count);
     RequireVk("VulkanHarness", "dispatch",
               m_instance.enumeratePhysicalDevices(&physical_count,
@@ -14949,8 +14961,10 @@ private:
         break;
       }
     }
-    Require("VulkanHarness", "dispatch", m_physical_device != nullptr,
-            "no Vulkan graphics+compute device with fragment barycentrics");
+    if (m_physical_device == nullptr) {
+      SkipEnvironment(
+          "no Vulkan graphics+compute device with fragment barycentrics");
+    }
     m_physical_device.getMemoryProperties(&m_memory_properties);
 
     vk::PhysicalDeviceFeatures available_features{};

@@ -967,11 +967,15 @@ void WindowContext::CreateVulkan() {
 	}
 
 	vk::PhysicalDevicePushDescriptorProperties push_descriptor_properties {};
+	vk::PhysicalDeviceDriverProperties         driver_properties {};
 	vk::PhysicalDeviceProperties2              physical_device_properties {};
 	physical_device_properties.pNext = &push_descriptor_properties;
+	push_descriptor_properties.pNext = &driver_properties;
 	graphic_ctx.physical_device.getProperties2(&physical_device_properties);
 	graphic_ctx.physical_device_properties = physical_device_properties.properties;
 	graphic_ctx.max_push_descriptors       = push_descriptor_properties.maxPushDescriptors;
+	graphic_ctx.device_address_destruction_waits_for_queue =
+	    DeviceAddressBufferDestructionWaitsForQueue(driver_properties.driverID);
 	graphic_ctx.physical_device.getMemoryProperties(&graphic_ctx.physical_device_memory_properties);
 	const auto& device_properties = graphic_ctx.GetPhysicalDeviceProperties();
 

@@ -24,8 +24,8 @@
 
 namespace Libs::Graphics {
 
-vk::Format  VulkanFormat(Prospero::BufferFormat guest_format);
-void        RequireVulkanSuccess(vk::Result result, const char* operation);
+vk::Format       VulkanFormat(Prospero::BufferFormat guest_format);
+void             RequireVulkanSuccess(vk::Result result, const char* operation);
 vk::ShaderModule CompileSPV(std::span<const uint32_t> code, vk::Device device);
 
 template <typename Handle, typename... Args>
@@ -64,6 +64,15 @@ template <typename T, typename Enumerator>
 			RequireVulkanSuccess(result, operation);
 		}
 	}
+}
+
+// MoltenVK makes every live device-address buffer resident in each command buffer that binds a
+// shader using physical storage buffer addresses, without keeping it alive. Destroying such a
+// buffer while any of those command buffers is still queued aborts them with Invalid Resource,
+// even when none of them uses the buffer. On that driver the buffer must outlive all queued work.
+[[nodiscard]] constexpr inline bool
+DeviceAddressBufferDestructionWaitsForQueue(vk::DriverId driver_id) {
+	return driver_id == vk::DriverId::eMoltenvk;
 }
 
 } // namespace Libs::Graphics

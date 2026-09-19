@@ -131,7 +131,15 @@ void BufferCache::DeleteBuffer(BufferId id) {
 	}
 	Unregister(id);
 	if (m_scheduler.Active()) {
-		m_scheduler.DeferOperation([this, id] { m_slot_buffers.erase(id); });
+		m_scheduler.DeferOperation([this, id] {
+			if (m_graphics.device_address_destruction_waits_for_queue) {
+				// Every command buffer submitted so far may reference this device-address buffer.
+				// ponytail: drains the queue per deletion batch; a per-buffer retire tick would
+				// need the driver to stop referencing buffers the work does not use.
+				m_scheduler.GetMasterSemaphore().Wait(m_scheduler.CurrentTick() - 1);
+			}
+			m_slot_buffers.erase(id);
+		});
 	} else {
 		m_slot_buffers.erase(id);
 	}
@@ -343,7 +351,8 @@ BufferCache::OverlapResult BufferCache::ResolveOverlaps(uint64_t vaddr, uint64_t
 		if (!has_stream_leap && (stream_score += buffer.StreamScore()) > StreamLeapThreshold) {
 			has_stream_leap = true;
 			// Reserve space in the incoming stream's direction of growth.
-			// The old buffer extending left of the request predicts growth to the right, and vice versa.
+			// The old buffer extending left of the request predicts growth to the right, and vice
+			// versa.
 			if (expands_left) {
 				end += std::min(StreamLeapSize, (vaddr < LOWER_ADDRESS_SIZE ? LOWER_ADDRESS_SIZE
 				                                       : LibKernel::Memory::kExtendedMemoryBase +

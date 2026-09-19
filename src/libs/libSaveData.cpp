@@ -8,6 +8,7 @@
 #include "kernel/fileSystem.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
+#include "libs/saveDataMemory.h"
 #include "libs/saveDataMountSlots.h"
 #include "loader/symbolDatabase.h"
 #include "loader/systemContent.h"
@@ -109,71 +110,10 @@ struct SaveDataMountResult {
 	int                pad;
 };
 
-struct SaveDataParam {
-	char     title[128];
-	char     sub_title[128];
-	char     detail[1024];
-	uint32_t user_param;
-	int      pad;
-	int64_t  mtime;
-	uint8_t  reserved[32];
-};
-
 struct SaveDataMountInfo {
 	uint64_t blocks;
 	uint64_t free_blocks;
 	uint8_t  reserved[32];
-};
-
-struct SaveDataIcon {
-	void*   buf;
-	size_t  buf_size;
-	size_t  data_size;
-	uint8_t reserved[32];
-};
-
-struct SaveDataMemoryData {
-	void*   buf;
-	size_t  buf_size;
-	int64_t offset;
-	uint8_t reserved[40];
-};
-
-struct SaveDataMemoryGet2 {
-	int32_t             user_id;
-	uint8_t             padding[4];
-	SaveDataMemoryData* data;
-	SaveDataParam*      param;
-	SaveDataIcon*       icon;
-	uint32_t            slot_id;
-	uint8_t             reserved[28];
-};
-
-struct SaveDataMemorySetup2 {
-	uint32_t             option;
-	int32_t              user_id;
-	size_t               memory_size;
-	size_t               icon_memory_size;
-	const SaveDataParam* init_param;
-	const SaveDataIcon*  init_icon;
-	uint32_t             slot_id;
-	uint8_t              reserved[20];
-};
-
-struct SaveDataMemorySetupResult {
-	size_t  existed_memory_size;
-	uint8_t reserved[16];
-};
-
-struct SaveDataMemorySet2 {
-	int32_t                   user_id;
-	uint8_t                   padding[4];
-	const SaveDataMemoryData* data;
-	const SaveDataParam*      param;
-	const SaveDataIcon*       icon;
-	uint32_t                  data_num;
-	uint32_t                  slot_id;
-	uint8_t                   reserved[24];
 };
 
 struct SaveDataTransferringMount {
@@ -230,26 +170,40 @@ static constexpr uint32_t SAVE_DATA_COMMIT_MODE_BACKUP_ASYNC = 1u;
 
 static constexpr uint32_t SAVE_DATA_EVENT_TYPE_UMOUNT_BACKUP_END = 1u;
 static constexpr uint32_t SAVE_DATA_EVENT_TYPE_BACKUP_END        = 2u;
+static constexpr uint32_t SAVE_DATA_EVENT_TYPE_MEMORY_SYNC_END   = 3u;
 static constexpr uint32_t SAVE_DATA_EVENT_TYPE_COMMIT_BACKUP_END = 4u;
 
-static std::vector<uint8_t>      g_save_data_memory(0x10000);
+static SaveDataMemoryStore       g_save_data_memory(SAVE_DATA_DIR);
 static int32_t                   g_next_transaction_resource = 1;
 static std::deque<SaveDataEvent> g_save_data_events;
 static SaveDataMountSlots        g_mount_slots;
 static Common::Mutex             g_mount_mutex;
+static Common::Mutex             g_event_mutex;
 
+// The title id comes from the guest's param.sfo and names a directory under SAVE_DATA_DIR, so it is
+// reduced to characters that cannot form a path component of their own before it is used (CWE-22).
 static std::string get_title_id() {
 	std::string title_id;
 	if (!Loader::SystemContentParamSfoGetString("TITLE_ID", &title_id) || title_id.empty()) {
 		title_id = "UNKNOWN";
 	}
 
-	return title_id;
+	std::string sanitized;
+	sanitized.reserve(title_id.size());
+	for (char c: title_id) {
+		if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' ||
+		    c == '-') {
+			sanitized += c;
+		}
+	}
+
+	return sanitized.empty() ? "UNKNOWN" : sanitized;
 }
 
 static void queue_save_data_event(uint32_t type, int32_t user_id,
                                   const SceSaveDataTitleId* title_id,
                                   const SceSaveDataDirName* dir_name, int32_t error_code = OK) {
+	Common::LockGuard event_lock(g_event_mutex);
 	SaveDataEvent event = {};
 	event.type          = type;
 	event.error_code    = error_code;
@@ -321,6 +275,8 @@ int KYTY_SYSV_ABI SaveDataTerminate() {
 	if (!g_mount_slots.Empty()) {
 		return SAVE_DATA_ERROR_BUSY;
 	}
+	g_save_data_memory.Clear();
+	Common::LockGuard event_lock(g_event_mutex);
 	g_save_data_events.clear();
 
 	return OK;
@@ -493,16 +449,13 @@ int KYTY_SYSV_ABI SaveDataSetupSaveDataMemory2(const SaveDataMemorySetup2* setup
 	     setup_param->option, setup_param->user_id, static_cast<uint64_t>(setup_param->memory_size),
 	     static_cast<uint64_t>(setup_param->icon_memory_size), setup_param->slot_id);
 
-	if (setup_param->memory_size > g_save_data_memory.size()) {
-		g_save_data_memory.resize(setup_param->memory_size);
+	Common::LockGuard lock(g_mount_mutex);
+	const int         error = g_save_data_memory.Setup(get_title_id(), setup_param, result);
+	if (error != OK) {
+		LOGF("\t -> error 0x%08" PRIx32 "\n", static_cast<uint32_t>(error));
 	}
 
-	if (result != nullptr) {
-		*result                     = {};
-		result->existed_memory_size = g_save_data_memory.size();
-	}
-
-	return OK;
+	return error;
 }
 
 int KYTY_SYSV_ABI SaveDataGetSaveDataMemory2(SaveDataMemoryGet2* get_param) {
@@ -521,26 +474,13 @@ int KYTY_SYSV_ABI SaveDataGetSaveDataMemory2(SaveDataMemoryGet2* get_param) {
 	     reinterpret_cast<uint64_t>(get_param->param), reinterpret_cast<uint64_t>(get_param->icon),
 	     get_param->slot_id);
 
-	if (get_param->data != nullptr) {
-		auto* data = get_param->data;
-		if (data->buf == nullptr || data->offset < 0) {
-			return SAVE_DATA_ERROR_PARAMETER;
-		}
-
-		const auto offset = static_cast<size_t>(data->offset);
-		if (offset + data->buf_size > g_save_data_memory.size()) {
-			g_save_data_memory.resize(offset + data->buf_size);
-		}
-		std::memcpy(data->buf, g_save_data_memory.data() + offset, data->buf_size);
-	}
-	if (get_param->param != nullptr) {
-		std::memset(get_param->param, 0, sizeof(*get_param->param));
-	}
-	if (get_param->icon != nullptr) {
-		get_param->icon->data_size = 0;
+	Common::LockGuard lock(g_mount_mutex);
+	const int         error = g_save_data_memory.Get(get_title_id(), get_param);
+	if (error != OK) {
+		LOGF("\t -> error 0x%08" PRIx32 "\n", static_cast<uint32_t>(error));
 	}
 
-	return OK;
+	return error;
 }
 
 int KYTY_SYSV_ABI SaveDataSetSaveDataMemory2(const SaveDataMemorySet2* set_param) {
@@ -560,23 +500,15 @@ int KYTY_SYSV_ABI SaveDataSetSaveDataMemory2(const SaveDataMemorySet2* set_param
 	     reinterpret_cast<uint64_t>(set_param->param), reinterpret_cast<uint64_t>(set_param->icon),
 	     set_param->data_num, set_param->slot_id);
 
-	const uint32_t data_num = (set_param->data_num == 0 ? 1 : set_param->data_num);
-	if (set_param->data != nullptr) {
-		for (uint32_t i = 0; i < data_num; i++) {
-			const auto& data = set_param->data[i];
-			if (data.buf == nullptr || data.offset < 0) {
-				return SAVE_DATA_ERROR_PARAMETER;
-			}
-
-			const auto offset = static_cast<size_t>(data.offset);
-			if (offset + data.buf_size > g_save_data_memory.size()) {
-				g_save_data_memory.resize(offset + data.buf_size);
-			}
-			std::memcpy(g_save_data_memory.data() + offset, data.buf, data.buf_size);
-		}
+	// Every update is published to storage before this returns, so a title that never calls
+	// sceSaveDataSyncSaveDataMemory() still keeps its progress across an exit or a crash.
+	Common::LockGuard lock(g_mount_mutex);
+	const int         error = g_save_data_memory.Set(get_title_id(), set_param);
+	if (error != OK) {
+		LOGF("\t -> error 0x%08" PRIx32 "\n", static_cast<uint32_t>(error));
 	}
 
-	return OK;
+	return error;
 }
 
 int KYTY_SYSV_ABI SaveDataTransferringMount(const SaveDataTransferringMount* mount,
@@ -760,10 +692,37 @@ int KYTY_SYSV_ABI SaveDataSaveIconByPath(const SaveDataMountPoint* mount_point, 
 	return OK;
 }
 
-int KYTY_SYSV_ABI SaveDataSyncSaveDataMemory(const void* sync_param) {
+int KYTY_SYSV_ABI SaveDataSyncSaveDataMemory(const SaveDataMemorySync* sync_param) {
 	PRINT_NAME();
 
-	LOGF("\t sync_param = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(sync_param));
+	if (sync_param == nullptr) {
+		return SAVE_DATA_ERROR_PARAMETER;
+	}
+
+	LOGF("\t user_id = %" PRId32 "\n"
+	     "\t slot_id = %" PRIu32 "\n"
+	     "\t option  = 0x%08" PRIx32 "\n",
+	     sync_param->user_id, sync_param->slot_id, sync_param->option);
+
+	Common::LockGuard lock(g_mount_mutex);
+	const auto        title = get_title_id();
+	const int         error = g_save_data_memory.Sync(title, sync_param);
+	if (error != OK) {
+		LOGF("\t -> error 0x%08" PRIx32 "\n", static_cast<uint32_t>(error));
+		return error;
+	}
+
+	// option 1 asks for a synchronous sync, which is what the store always does; option 0 is the
+	// asynchronous form, whose completion the title collects from the event queue.
+	if (sync_param->option == 0) {
+		SceSaveDataTitleId title_id {};
+		std::memcpy(title_id.data, title.data(), std::min(title.size(), sizeof(title_id.data) - 1));
+		SceSaveDataDirName directory {};
+		const auto         name = MemoryDirectoryName(sync_param->slot_id);
+		std::memcpy(directory.data, name.data(), std::min(name.size(), sizeof(directory.data) - 1));
+		queue_save_data_event(SAVE_DATA_EVENT_TYPE_MEMORY_SYNC_END, sync_param->user_id, &title_id,
+		                      &directory);
+	}
 
 	return OK;
 }
@@ -779,6 +738,7 @@ int KYTY_SYSV_ABI SaveDataGetEventResult(const void* event_param, SaveDataEvent*
 		return SAVE_DATA_ERROR_PARAMETER;
 	}
 
+	Common::LockGuard event_lock(g_event_mutex);
 	if (g_save_data_events.empty()) {
 		return SAVE_DATA_ERROR_NOT_FOUND;
 	}

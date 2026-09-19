@@ -362,7 +362,8 @@ void CollectOutputs(const Program& program, ShaderStageInputInfo input_info, Sha
 						const auto output = DecodePositionExportComponent(
 						    input_info.vertex->pa_cl_vs_out_cntl, export_info.index, component);
 						if (output.viewport) {
-							AddOutput(info, StageOutputKind::ViewportIndex, 0, 0, "gl_ViewportIndex");
+							AddOutput(info, StageOutputKind::ViewportIndex, 0, 0,
+							          "gl_ViewportIndex");
 						}
 						if (output.point_size) {
 							AddOutput(info, StageOutputKind::PointSize, 0, 0, "gl_PointSize");
@@ -425,6 +426,20 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	}
 	CollectBuiltinInputs(program, next);
 	CollectOutputs(program, input_info, next);
+	if (program.stage == ShaderType::Vertex && input_info.vertex != nullptr &&
+	    input_info.vertex->pixel_input != nullptr) {
+		uint32_t export_mask = 0;
+		for (const auto& output: next.outputs) {
+			if (output.kind == StageOutputKind::Parameter && output.index < 32u) {
+				export_mask |= 1u << output.index;
+			}
+		}
+		const auto plan =
+		    ShaderPixelParameterBuildPlan(*input_info.vertex->pixel_input, export_mask);
+		next.parameter_locations  = plan.locations;
+		next.parameter_aliases    = plan.aliases;
+		next.parameter_plan_valid = plan.valid;
+	}
 	program.info                 = std::move(next);
 	program.shader_info_complete = true;
 }

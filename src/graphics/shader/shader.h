@@ -121,8 +121,11 @@ struct ShaderTessellationInputInfo {
 	uint32_t output_topology       = 0;
 };
 
+struct ShaderPixelInputInfo;
+
 struct ShaderVertexInputInfo {
-	static constexpr int RES_MAX = 32;
+	static constexpr int        RES_MAX     = 32;
+	const ShaderPixelInputInfo* pixel_input = nullptr;
 
 	ShaderBufferResource        resources[RES_MAX];
 	ShaderVertexDestination     resources_dst[RES_MAX];
@@ -152,6 +155,12 @@ struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
 	ShaderStageRuntime stage;
 };
 
+struct ShaderPixelParameterPlan {
+	std::array<uint32_t, 32>                   locations {};
+	std::vector<std::pair<uint32_t, uint32_t>> aliases;
+	bool                                       valid = false;
+};
+
 struct ShaderPixelInputInfo {
 	uint32_t                                       interpolator_settings[32]    = {0};
 	uint32_t                                       input_num                    = 0;
@@ -177,6 +186,7 @@ struct ShaderPixelInputInfo {
 	bool                                           dual_source_blending         = false;
 	bool                                           ps_early_z                   = false;
 	bool                                           ps_execute_on_noop           = false;
+	ShaderPixelParameterPlan                       parameter_plan;
 	ShaderStageRuntime                             stage;
 
 	bool ps_single_sample = false;
@@ -200,8 +210,12 @@ inline const ShaderWorkgroupInputInfo* ShaderWorkgroupInput(ShaderType          
 }
 
 uint32_t ShaderPixelParameterMappedLocation(const ShaderPixelInputInfo& info, uint32_t input);
+ShaderPixelParameterPlan ShaderPixelParameterBuildPlan(const ShaderPixelInputInfo& info,
+                                                       uint32_t vertex_export_mask);
+std::vector<uint32_t>    ShaderPixelParameterInputs(const ShaderPixelInputInfo& info);
 uint32_t ShaderPixelParameterLocation(const ShaderPixelInputInfo& info,
-                                      std::span<const uint32_t> active_inputs, uint32_t input);
+                                      std::span<const uint32_t> active_inputs, uint32_t input,
+                                      uint32_t reserved_mask = 0);
 bool     ShaderPixelParameterIsFlat(const ShaderPixelInputInfo& info, uint32_t input);
 bool     ShaderPixelParameterIsCustom(const ShaderPixelInputInfo& info, uint32_t input);
 

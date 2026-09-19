@@ -548,6 +548,13 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 		} else {
 			state.builder.AddFunction(spv::OpStore, variable, value);
 		}
+		if (exp.kind == IR::ExportTargetKind::Parameter) {
+			for (const auto& binding: state.outputs) {
+				if (binding.alias_source == exp.index && binding.variable_id != 0) {
+					state.builder.AddFunction(spv::OpStore, binding.variable_id, value);
+				}
+			}
+		}
 	});
 }
 

@@ -210,11 +210,9 @@ static void ToggleDesktopFullscreen() {
 		return;
 	}
 
-	const auto flags = static_cast<uint32_t>(SDL_GetWindowFlags(g_window->window));
-	const bool fullscreen =
-	    (flags & static_cast<uint32_t>(SDL_WINDOW_FULLSCREEN_DESKTOP)) != 0u;
-	const auto mode =
-	    fullscreen ? 0u : static_cast<uint32_t>(SDL_WINDOW_FULLSCREEN_DESKTOP);
+	const auto flags      = static_cast<uint32_t>(SDL_GetWindowFlags(g_window->window));
+	const bool fullscreen = (flags & static_cast<uint32_t>(SDL_WINDOW_FULLSCREEN_DESKTOP)) != 0u;
+	const auto mode       = fullscreen ? 0u : static_cast<uint32_t>(SDL_WINDOW_FULLSCREEN_DESKTOP);
 	if (SDL_SetWindowFullscreen(g_window->window, mode) != 0) {
 		LOGF("Toggle fullscreen failed: %s\n", SDL_GetError());
 	}
@@ -360,8 +358,7 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 	if (f.axis) {
 		const auto axis = ControllerAxisFromSdl(f.axis_id);
 		if (axis != Controller::Axis::AxisMax) {
-			Controller::SetAxis(f.id, axis,
-			                    ControllerAxisValueFromSdl(f.axis_id, f.axis_value));
+			Controller::SetAxis(f.id, axis, ControllerAxisValueFromSdl(f.axis_id, f.axis_value));
 		}
 	}
 }
@@ -390,11 +387,38 @@ static void GameEventDidEnterForeground(WindowLoopState& game) {
 	SetPause(game, false);
 }
 
+// Updates the tracked window size, or, for a non-positive size, ignores the
+// request and marks the window as minimized instead of aborting.
 void WindowContext::Resize(uint32_t new_width, uint32_t new_height) {
-	EXIT_IF(new_width == 0 || new_height == 0);
+	// A 0-sized resize is not a bug to abort on: some window managers deliver
+	// SDL_WINDOWEVENT_RESIZED/SIZE_CHANGED with {0,0} while a window is being
+	// minimized/iconified/hidden (observed on some Linux WMs and during certain
+	// macOS window transitions; Windows typically sends only
+	// SDL_WINDOWEVENT_MINIMIZED without an accompanying 0-sized resize, but
+	// nothing guarantees that across SDL versions/drivers).
+	//
+	// Ignore the update and keep the last known-good size instead of crashing
+	// or propagating {0,0} into graphic_ctx.screen_width/height. Because the
+	// stale, last-known-positive screen_width/height are deliberately left
+	// untouched here, they are not by themselves a reliable "is the window
+	// minimized" signal (see the `minimized` member in WindowContext for why).
+	// Set that flag explicitly instead, so Swapchain::Create() has a direct
+	// signal independent of stale dimensions or of what Vulkan's
+	// surface_capabilities.currentExtent happens to report on this platform.
+	if (new_width == 0 || new_height == 0) {
+		LOGF("WindowContext::Resize(): ignoring 0-sized resize request (%" PRIu32 "x%" PRIu32
+		     "); window is likely minimized/hidden\n",
+		     new_width, new_height);
+		minimized.store(true, std::memory_order_release);
+		return;
+	}
 	Common::LockGuard lock(mutex);
 	graphic_ctx.screen_width  = new_width;
 	graphic_ctx.screen_height = new_height;
+	// A valid resize is direct proof the window is drawable again, even
+	// without an explicit SDL_WINDOWEVENT_RESTORED (some window managers go
+	// straight to a positive SDL_WINDOWEVENT_SIZE_CHANGED).
+	minimized.store(false, std::memory_order_release);
 }
 
 void WindowContext::ProcessWindowEvent(const SDL_WindowEvent& event) {
@@ -422,7 +446,22 @@ void WindowContext::ProcessWindowEvent(const SDL_WindowEvent& event) {
 			     window_event.data1, window_event.data2);
 
 			LOGF("m: %d\n", static_cast<int>(SDL_ThreadID()));
-			Resize(window_event.data1, window_event.data2);
+			// data1/data2 are Sint32; a non-positive value (0, or negative from a
+			// misbehaving driver/WM) is not a valid size to hand to Resize() as
+			// uint32_t, since a negative value would wrap around into a huge
+			// extent instead of being caught as "empty". Resize() itself also
+			// tolerates a literal {0,0}, but this keeps a negative value from
+			// ever reaching it.
+			if (window_event.data1 > 0 && window_event.data2 > 0) {
+				Resize(static_cast<uint32_t>(window_event.data1),
+				       static_cast<uint32_t>(window_event.data2));
+			} else {
+				LOGF("Window %" PRIu32 " ignoring non-positive resize %" PRId32 "x%" PRId32 "\n",
+				     window_event.windowID, window_event.data1, window_event.data2);
+				// This path bypasses Resize() entirely (the guard above never calls
+				// it), so it must set the flag itself.
+				minimized.store(true, std::memory_order_release);
+			}
 
 			break;
 
@@ -431,18 +470,37 @@ void WindowContext::ProcessWindowEvent(const SDL_WindowEvent& event) {
 			     window_event.windowID, window_event.data1, window_event.data2);
 
 			LOGF("m: %d\n", static_cast<int>(SDL_ThreadID()));
-			Resize(window_event.data1, window_event.data2);
+			if (window_event.data1 > 0 && window_event.data2 > 0) {
+				Resize(static_cast<uint32_t>(window_event.data1),
+				       static_cast<uint32_t>(window_event.data2));
+			} else {
+				LOGF("Window %" PRIu32 " ignoring non-positive size change %" PRId32 "x%" PRId32
+				     "\n",
+				     window_event.windowID, window_event.data1, window_event.data2);
+				minimized.store(true, std::memory_order_release);
+			}
 
 			break;
 
 		case SDL_WINDOWEVENT_MINIMIZED:
 			LOGF("Window %" PRIu32 " minimized\n", window_event.windowID);
+			// The most direct, timely signal that the window has no drawable area:
+			// unlike a resize event, this is guaranteed to fire on minimize on every
+			// platform SDL supports, regardless of whether a {0,0} size event also
+			// happens to accompany it.
+			minimized.store(true, std::memory_order_release);
 			break;
 		case SDL_WINDOWEVENT_MAXIMIZED:
 			LOGF("Window %" PRIu32 " maximized\n", window_event.windowID);
+			minimized.store(false, std::memory_order_release);
 			break;
 		case SDL_WINDOWEVENT_RESTORED:
 			LOGF("Window %" PRIu32 " restored\n", window_event.windowID);
+			// Optimistic: the window is drawable again. Swapchain::Create() still
+			// independently validates the real extent before creating anything, so
+			// this is just what allows it to try in the first place instead of
+			// being short-circuited by this flag.
+			minimized.store(false, std::memory_order_release);
 			break;
 		case SDL_WINDOWEVENT_ENTER:
 			LOGF("Mouse entered window %" PRIu32 "\n", window_event.windowID);
@@ -996,10 +1054,10 @@ void WindowContext::UpdateTitle() {
 	static bool has_app_ver =
 	    Loader::SystemContentParamSfoGetString("APP_VER", app_ver, sizeof(app_ver));
 	static const std::string processor_name = Common::GetSystemInfo().ProcessorName;
-	static uint64_t fps_start   = Common::Timer::QueryPerformanceCounter();
-	static uint64_t frame_num   = 0;
-	static uint64_t fps_frames  = 0;
-	static double   current_fps = 0.0;
+	static uint64_t          fps_start      = Common::Timer::QueryPerformanceCounter();
+	static uint64_t          frame_num      = 0;
+	static uint64_t          fps_frames     = 0;
+	static double            current_fps    = 0.0;
 
 #if KYTY_BUILD == KYTY_BUILD_DEBUG
 	static constexpr auto build_type = "Debug";
@@ -1021,7 +1079,7 @@ void WindowContext::UpdateTitle() {
 	}
 
 	const auto* device_name = graphic_ctx.GetPhysicalDeviceProperties().deviceName.data();
-	auto text = fmt::format(
+	auto        text        = fmt::format(
 	    "[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:.0f}", KYTY_BUILD_LABEL, build_type,
 	    (has_title ? title : ""), (has_title ? ", " : ""), (has_title_id ? title_id : ""),
 	    (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""),

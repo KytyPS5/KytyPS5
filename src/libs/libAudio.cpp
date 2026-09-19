@@ -4,11 +4,13 @@
 #include "libs/audio3d.h"
 #include "libs/audio.h"
 #include "libs/ngs2.h"
+#include "libs/errno.h"
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
 
 #include <array>
 #include <atomic>
+#include <cinttypes>
 #include <cstring>
 #include <memory>
 

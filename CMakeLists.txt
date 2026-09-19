@@ -488,6 +488,16 @@ add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 target_link_libraries(resource_tracking_tests fmt::fmt xbyak::xbyak)
 target_include_directories(resource_tracking_tests PRIVATE ${inc_headers})
 
+add_executable(unresolved_import_registration_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/UnresolvedImportRegistrationTests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/libDebug.cpp"
+	"${KYTY_SOURCE_DIR}/libs/libConvertKeycode.cpp"
+	"${KYTY_SOURCE_DIR}/loader/symbolDatabase.cpp"
+	"${KYTY_SOURCE_DIR}/loader/timer.cpp"
+)
+target_link_libraries(unresolved_import_registration_tests common fmt::fmt)
+target_include_directories(unresolved_import_registration_tests PRIVATE ${inc_headers})
+
 add_executable(audio_out2_port_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/AudioOut2PortTests.cpp"
 	"${KYTY_SOURCE_DIR}/libs/libAudio2.cpp"
@@ -643,6 +653,8 @@ if(BUILD_TESTING)
 	add_test(NAME ces COMMAND $<TARGET_FILE:ces_tests>)
 	add_test(NAME save_data_dialog COMMAND $<TARGET_FILE:save_data_dialog_tests>)
 	add_test(NAME http_uri_parse COMMAND $<TARGET_FILE:http_uri_parse_tests>)
+	add_test(NAME unresolved_import_registration
+		COMMAND $<TARGET_FILE:unresolved_import_registration_tests>)
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
 	add_test(NAME shader_recompiler_alignbyte
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --alignbyte-only)
@@ -729,6 +741,7 @@ if(BUILD_TESTING)
 		ces_tests
 		save_data_dialog_tests
 		http_uri_parse_tests
+		unresolved_import_registration_tests
 	)
 endif()
 

@@ -116,7 +116,11 @@ struct StubbedImportRecord {
 	SymbolType  type = SymbolType::Unknown;
 	BindType    bind = BindType::Unknown;
 	std::string program;
+	// Counted per symbol, so one chatty import cannot spend the budget and hide every other one.
+	std::unique_ptr<std::atomic_uint32_t> call_count = std::make_unique<std::atomic_uint32_t>(0);
 };
+
+constexpr uint32_t UNRESOLVED_STUB_LOGS_PER_SYMBOL = 8;
 
 static std::vector<StubbedImportRecord> g_stubbed_imports;
 static std::atomic_uint32_t             g_unresolved_stub_call_log_count {0};
@@ -169,8 +173,16 @@ static uint64_t AllocateUnresolvedImportThunk(uint64_t record_id) {
 
 static uint64_t RegisterStubbedImport(uint32_t index, const Program* program,
                                       const RelocationInfo& ri) {
-	for (const auto& record: g_stubbed_imports) {
+	// A stub can be registered before any program owns it, so the name is optional.
+	const auto program_name = program != nullptr ? Common::PathToString(program->file_name) : "";
+
+	for (auto& record: g_stubbed_imports) {
 		if (record.patch_vaddr == ri.vaddr) {
+			record.index   = index;
+			record.name    = ri.name;
+			record.type    = ri.type;
+			record.bind    = ri.bind;
+			record.program = program_name;
 			return record.thunk_vaddr;
 		}
 	}
@@ -181,8 +193,8 @@ static uint64_t RegisterStubbedImport(uint32_t index, const Program* program,
 	record.name        = ri.name;
 	record.type        = ri.type;
 	record.bind        = ri.bind;
-	record.program     = Common::PathToString(program->file_name);
-	g_stubbed_imports.push_back(record);
+	record.program     = program_name;
+	g_stubbed_imports.push_back(std::move(record));
 	const auto record_id                     = g_stubbed_imports.size() - 1;
 	const auto thunk                         = AllocateUnresolvedImportThunk(record_id);
 	g_stubbed_imports[record_id].thunk_vaddr = thunk;
@@ -191,20 +203,20 @@ static uint64_t RegisterStubbedImport(uint32_t index, const Program* program,
 
 static KYTY_SYSV_ABI uint64_t UnresolvedImportStub(uint64_t record_id) {
 	const auto log_index = g_unresolved_stub_call_log_count.fetch_add(1);
-	if (log_index < 1024) {
-		if (record_id < g_stubbed_imports.size()) {
-			const auto& record = g_stubbed_imports[record_id];
+	if (record_id < g_stubbed_imports.size()) {
+		const auto& record = g_stubbed_imports[record_id];
+		if (record.call_count->fetch_add(1) < UNRESOLVED_STUB_LOGS_PER_SYMBOL) {
 			printf("Unresolved import stub called: %s\n", record.name.c_str());
 			LOGF("Unresolved import stub called [%u]: patch_vaddr=0x%016" PRIx64
 			     " jmprela_index=%" PRIu32 " symbol=%s type=%s bind=%s program=%s\n",
 			     log_index, record.patch_vaddr, record.index, record.name.c_str(),
 			     magic_enum::enum_name(record.type), magic_enum::enum_name(record.bind),
 			     record.program.c_str());
-		} else {
-			printf("Unresolved import stub called: <bad-record>\n");
-			LOGF("Unresolved import stub called [%u]: record_id=%" PRIu64 " symbol=<bad-record>\n",
-			     log_index, record_id);
 		}
+	} else if (log_index < UNRESOLVED_STUB_LOGS_PER_SYMBOL) {
+		printf("Unresolved import stub called: <bad-record>\n");
+		LOGF("Unresolved import stub called [%u]: record_id=%" PRIu64 " symbol=<bad-record>\n",
+		     log_index, record_id);
 	}
 	return 0;
 }

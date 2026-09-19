@@ -22038,6 +22038,158 @@ TestCase BufferOffsetsUsePackedLaneAndStorageFallback() {
   return test;
 }
 
+TestCase DynamicBufferLoadStore() {
+  using O = ShaderOpcode;
+
+  constexpr uint64_t GuestBase = 0x0000000140000000ull;
+  std::vector<u32> code;
+
+  // 1. Load the dynamic buffer descriptor (4 dwords) from the default test buffer into s[4:7].
+  // S_BUFFER_LOAD_DWORDX4: opcode 0x0au, dst SGPR 4 (s[4:7]), sbase 24 (s[48:51]), offset 0.
+  code.push_back(EncodeSmem0(0x0au, 4, 24));
+  code.push_back(EncodeSmem1(0));
+
+  // 2. Dynamic buffer load: load dword from dynamic buffer s[4:7] at byte offset 16 into v1.
+  AppendVMovU32(&code, 20, 16);
+  code.push_back(EncodeMubuf0(0x0cu, 0, false, true)); // BUFFER_LOAD_DWORD, offen=true
+  code.push_back(EncodeMubuf1(1, 1, 20));             // dst v1, srsrc 1 (s[4:7]), vaddr v20
+
+  // 3. Modify the loaded value: v2 = v1 + 1 -> 0x12345679u
+  code.push_back(EncodeVop2(0x25, 2, InlineU32(1), 1)); // V_ADD_NC_U32: v2 = 1 + v1
+
+  // 4. Dynamic buffer store: store dword from v2 to dynamic buffer s[4:7] at byte offset 20.
+  AppendVMovU32(&code, 21, 20);
+  code.push_back(EncodeMubuf0(0x1cu, 0, false, true)); // BUFFER_STORE_DWORD, offen=true
+  code.push_back(EncodeMubuf1(2, 1, 21));             // src v2, srsrc 1 (s[4:7]), vaddr v21
+
+  // 5. Dynamic buffer subword load: load byte from dynamic buffer s[4:7] at byte offset 17 into v3.
+  // Dword 4 is 0x12345678u -> byte 0 is 0x78, byte 1 (offset 17) is 0x56.
+  AppendVMovU32(&code, 22, 17);
+  code.push_back(EncodeMubuf0(0x08u, 0, false, true)); // BUFFER_LOAD_UBYTE, offen=true
+  code.push_back(EncodeMubuf1(3, 1, 22));             // dst v3, srsrc 1 (s[4:7]), vaddr v22
+
+  // 6. Dynamic buffer subword store: store byte 0xab into dynamic buffer at byte offset 25.
+  AppendVMovLiteral(&code, 10, 0xabu);
+  AppendVMovU32(&code, 23, 25);
+  code.push_back(EncodeMubuf0(0x18u, 0, false, true)); // BUFFER_STORE_BYTE, offen=true
+  code.push_back(EncodeMubuf1(10, 1, 23));            // src v10, srsrc 1 (s[4:7]), vaddr v23
+
+  // 7. Output readback via standard output buffer s[48:51]:
+  // Store loaded v1 to dword 7, and loaded v3 to dword 8
+  AppendStoreVgpr(&code, 1, 7);
+  AppendStoreVgpr(&code, 3, 8);
+
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "DynamicBufferLoadStore";
+  test.code = std::move(code);
+
+  test.initial = {
+      static_cast<u32>(GuestBase),
+      static_cast<u32>((GuestBase >> 32u) & 0xffffu),
+      0x00010000u,
+      0u,
+      0x12345678u,
+      0u,
+      0u,
+      0u,
+      0u,
+  };
+
+  test.expected = {
+      static_cast<u32>(GuestBase),
+      static_cast<u32>((GuestBase >> 32u) & 0xffffu),
+      0x00010000u,
+      0u,
+      0x12345678u,
+      0x12345679u,
+      0x0000ab00u,
+      0x12345678u,
+      0x00000056u,
+  };
+
+  test.bda_mappings = {{GuestBase, 0}};
+  test.opcodes = {
+      O::S_BUFFER_LOAD_DWORDX4,
+      O::V_MOV_B32,
+      O::BUFFER_LOAD_DWORD,
+      O::V_ADD_NC_U32,
+      O::BUFFER_STORE_DWORD,
+      O::BUFFER_LOAD_UBYTE,
+      O::BUFFER_STORE_BYTE,
+      O::S_ENDPGM,
+  };
+  return test;
+}
+
+TestCase DynamicBufferLoadStoreDwordX4() {
+  using O = ShaderOpcode;
+
+  constexpr uint64_t GuestBase = 0x0000000150000000ull;
+  std::vector<u32> code;
+
+  // Load the dynamic buffer descriptor (4 dwords) from the default test buffer into s[4:7].
+  code.push_back(EncodeSmem0(0x0au, 4, 24));
+  code.push_back(EncodeSmem1(0));
+
+  // Dynamic vector load: BUFFER_LOAD_DWORDX4 into v[1:4] from dynamic buffer s[4:7] at byte offset 16.
+  AppendVMovU32(&code, 20, 16);
+  code.push_back(EncodeMubuf0(0x0eu, 0, false, true));
+  code.push_back(EncodeMubuf1(1, 1, 20));
+
+  // Dynamic vector store: BUFFER_STORE_DWORDX4 from v[1:4] to dynamic buffer s[4:7] at byte offset 32.
+  AppendVMovU32(&code, 21, 32);
+  code.push_back(EncodeMubuf0(0x1eu, 0, false, true));
+  code.push_back(EncodeMubuf1(1, 1, 21));
+
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "DynamicBufferLoadStoreDwordX4";
+  test.code = std::move(code);
+
+  test.initial = {
+      static_cast<u32>(GuestBase),
+      static_cast<u32>((GuestBase >> 32u) & 0xffffu),
+      0x00010000u,
+      0u,
+      0x11111111u,
+      0x22222222u,
+      0x33333333u,
+      0x44444444u,
+      0u,
+      0u,
+      0u,
+      0u,
+  };
+
+  test.expected = {
+      static_cast<u32>(GuestBase),
+      static_cast<u32>((GuestBase >> 32u) & 0xffffu),
+      0x00010000u,
+      0u,
+      0x11111111u,
+      0x22222222u,
+      0x33333333u,
+      0x44444444u,
+      0x11111111u,
+      0x22222222u,
+      0x33333333u,
+      0x44444444u,
+  };
+
+  test.bda_mappings = {{GuestBase, 0}};
+  test.opcodes = {
+      O::S_BUFFER_LOAD_DWORDX4,
+      O::V_MOV_B32,
+      O::BUFFER_LOAD_DWORDX4,
+      O::BUFFER_STORE_DWORDX4,
+      O::S_ENDPGM,
+  };
+  return test;
+}
+
 TestCase BufferLoadVariants() {
   using O = ShaderOpcode;
 
@@ -27200,6 +27352,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(ScalarLoadSignedImmediateOffsetAddsSoffset);
   AddCase(ScalarLoadAlignsComponentsAndMasksAddress);
   AddCase(BufferLoadStore);
+  AddCase(DynamicBufferLoadStore);
+  AddCase(DynamicBufferLoadStoreDwordX4);
   AddCase(BufferLoadDwordOffenIdxenUsesVaddrPlusOneOffset);
   AddCase(BufferStoreDwordOffenIdxenUsesVaddrPlusOneOffset);
   AddCase(BufferLoadDwordNoAddressFlagsIgnoresVaddr);

@@ -5,6 +5,10 @@
 
 #include <span>
 
+#ifdef KYTY_SRT_TEST_HOOKS
+#include <memory_resource>
+#endif
+
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
 class Value;
@@ -20,6 +24,14 @@ struct SrtRuntime {
 };
 
 enum class RuntimeValueType { Any, Integer };
+
+// The functions below resolve SRT slots, clean-slot flags and descriptor sources against the
+// ResourcePlan they are given, so a Value that plan does not own only evaluates meaningfully when
+// it needs none of those. It is memoized correctly either way: dense memo slots are numbered per
+// plan, so an entry records the instruction that claimed it and is reused only for that same
+// instruction. An instruction another plan cloned may claim a free slot of equal number, and takes
+// the pointer-keyed memo once another instruction owns it, so values of different plans stay as
+// distinct as their addresses.
 
 // Collects reachable ReadConst values. Immediate offsets receive compact flat-buffer slots;
 // dynamic offsets remain explicit and are never assigned a fake slot.
@@ -46,6 +58,24 @@ bool EvaluateRuntimeSources(const ResourcePlan& program, std::span<const uint32_
 
 bool WalkSrt(const ResourcePlan& program, const SrtRuntime& runtime,
              std::vector<uint32_t>& flat);
+
+#ifdef KYTY_SRT_TEST_HOOKS
+namespace SrtTestHooks {
+// Test builds only: evaluators created on the calling thread take their memo storage from
+// `resource` instead of the thread's pool; nullptr restores the pool.
+void SetMemoResource(std::pmr::memory_resource* resource);
+// Test builds only: when disabled, evaluators on the calling thread memoize every instruction
+// through the pointer-keyed map instead of the plan's dense slots. The two must agree.
+void SetDenseMemo(bool enabled);
+// Test builds only: returns the calling thread's memo arenas to a pristine state (every slot
+// invalid, counter at zero), which is the state a fresh thread starts in.
+void ResetMemoArenas();
+// Test builds only: moves the calling thread's memo counter WITHOUT invalidating any slot, so the
+// wrap is reachable. Only a value the counter could legitimately reach next is meaningful;
+// production never reuses a generation, which is precisely what the wrap must preserve.
+void SetMemoGeneration(uint32_t generation);
+} // namespace SrtTestHooks
+#endif
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
 

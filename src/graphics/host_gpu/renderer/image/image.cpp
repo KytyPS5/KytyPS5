@@ -13,6 +13,7 @@
 #include <bit>
 #include <cinttypes>
 #include <cstdint>
+#include <string_view>
 #include <xxhash.h>
 
 namespace Libs::Graphics {
@@ -376,7 +377,7 @@ void Image::CopyImage(Image& source) {
 	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
 }
 
-void Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
+bool Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
                     const ImageSubresourceRange& destination_range) {
 	const bool source_levels_missing      = source_range.base_level >= source.backing.mip_levels;
 	const bool destination_levels_missing = destination_range.base_level >= backing.mip_levels;
@@ -389,7 +390,7 @@ void Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
 		                         destination_range.level_count);
 	}
 	if (source_levels_missing || destination_levels_missing) {
-		return;
+		return false;
 	}
 	EXIT_IF(backing.samples != 1 || source.backing.image_type != vk::ImageType::e2D ||
 	        backing.image_type != vk::ImageType::e2D || source_range.level_count != 1 ||
@@ -444,6 +445,7 @@ void Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
 		command.resolveImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal,
 		                     backing.image, vk::ImageLayout::eTransferDstOptimal, region);
 	}
+	return true;
 }
 
 uint32_t Image::CopyRows(uint64_t row_size, uint32_t rows, uint64_t capacity) noexcept {
@@ -544,11 +546,11 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer) {
 	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
 }
 
-void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
+bool Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
 	EXIT_IF(source.backing.samples != backing.samples || layer >= backing.layers);
 	if (mip >= backing.mip_levels) {
 		ImageOps::ReportMipClamp("copy-mip", info, mip, 1);
-		return;
+		return false;
 	}
 	m_scheduler.EndRendering();
 	const auto width  = std::max(backing.extent.width >> mip, 1u);
@@ -578,6 +580,7 @@ void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
 	                  vk::ImageLayout::eTransferDstOptimal, copy_count, copies.data());
 	Transit(vk::ImageLayout::eGeneral,
 	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
+	return true;
 }
 
 namespace ImageOps {
@@ -686,19 +689,42 @@ void ReportMipClamp(const char* site, const ImageInfo& info, uint32_t base_level
 	if (base_level + level_count <= host_levels) {
 		return;
 	}
-	constexpr uint32_t max_reports = 32;
-	static uint32_t    reports     = 0;
-	if (reports >= max_reports) {
+	// Keep a per-site report budget so that a noisy site cannot consume the log and hide the
+	// others; after the first few reports only a logarithmic heartbeat keeps the total visible.
+	constexpr uint32_t verbose_reports = 4;
+	struct SiteReports {
+		const char* site  = nullptr;
+		uint32_t    count = 0;
+	};
+	static std::array<SiteReports, 8> sites {};
+	SiteReports*                      entry = nullptr;
+	for (auto& candidate: sites) {
+		if (candidate.site != nullptr && std::string_view(candidate.site) == site) {
+			entry = &candidate;
+			break;
+		}
+		if (candidate.site == nullptr) {
+			candidate.site = site;
+			entry          = &candidate;
+			break;
+		}
+	}
+	if (entry == nullptr) {
 		return;
 	}
-	reports++;
+	entry->count++;
+	const bool heartbeat = std::has_single_bit(entry->count) && entry->count > verbose_reports;
+	if (entry->count > verbose_reports && !heartbeat) {
+		return;
+	}
 	LOGF("Image[%s]: guest mip range exceeds the host mip chain: addr=0x%010" PRIx64
 	     " type=%u format=%u extent=%ux%ux%u guest_levels=%u host_levels=%u range=%u+%u layers=%u "
-	     "samples=%u pitch=%u tile=%u\n",
+	     "samples=%u pitch=%u tile=%u reports=%u\n",
 	     site, info.data.address, static_cast<uint32_t>(info.type),
 	     static_cast<uint32_t>(info.guest_format), info.extent.width, info.extent.height,
 	     info.extent.depth, info.resources.levels, host_levels, base_level, level_count,
-	     info.resources.layers, info.samples, info.pitch, static_cast<uint32_t>(info.tile_mode));
+	     info.resources.layers, info.samples, info.pitch, static_cast<uint32_t>(info.tile_mode),
+	     entry->count);
 }
 
 } // namespace ImageOps

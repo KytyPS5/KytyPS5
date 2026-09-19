@@ -64,10 +64,14 @@ public:
 	void Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
 	              uint64_t size);
 	void CopyImage(Image& source);
-	void Resolve(Image& source, const ImageSubresourceRange& source_range,
+	// Returns false when the guest subresource maps beyond the host mip chain: no transfer was
+	// recorded, so the caller must not claim ownership of new contents.
+	bool Resolve(Image& source, const ImageSubresourceRange& source_range,
 	             const ImageSubresourceRange& destination_range);
 	void CopyImageWithBuffer(Image& source, Buffer& buffer);
-	void CopyMip(Image& source, uint32_t mip, uint32_t layer);
+	// Returns false when the guest mip maps beyond the host mip chain: no copy was recorded, so the
+	// caller must not claim ownership of new contents.
+	bool CopyMip(Image& source, uint32_t mip, uint32_t layer);
 
 	void InvalidateCpuWrite(uint64_t vaddr, uint64_t size) {
 		if (ImageRangeOverlaps(info.data.address, info.data.size, vaddr, size)) {

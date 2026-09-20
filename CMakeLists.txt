@@ -12,6 +12,22 @@ endif()
 
 project(Kyty)
 
+find_program(SCCACHE_PROGRAM sccache)
+find_program(CCACHE_PROGRAM ccache)
+
+foreach(lang IN ITEMS C CXX)
+    # An explicitly empty launcher disables caching for this language.
+    if(NOT DEFINED CMAKE_${lang}_COMPILER_LAUNCHER)
+        if(SCCACHE_PROGRAM)
+            set(CMAKE_${lang}_COMPILER_LAUNCHER "${SCCACHE_PROGRAM}")
+            message(STATUS "sccache enabled for ${lang}: ${SCCACHE_PROGRAM}")
+        elseif(CCACHE_PROGRAM)
+            set(CMAKE_${lang}_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+            message(STATUS "ccache enabled for ${lang}: ${CCACHE_PROGRAM}")
+        endif()
+    endif()
+endforeach()
+
 set(KYTY_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src")
 set(KYTY_TESTS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/tests")
 set(KYTY_THIRD_PARTY_DIR "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty")
@@ -663,6 +679,12 @@ if(KYTY_CLANG_CL)
 	add_custom_command(TARGET kyty_emulator POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different "${KYTY_THIRD_PARTY_DIR}/winpthread/bin/libwinpthread-1.dll" $<TARGET_FILE_DIR:kyty_emulator>/libwinpthread-1.dll)
 elseif(WIN32 OR LINUX)
 	set_target_properties(kyty_emulator PROPERTIES LINK_FLAGS "${KYTY_LD_OPTIONS} -Wl,-Map=${KYTY_EMULATOR_MAP_LINK_PATH}")
+endif()
+
+if(LINUX)
+    target_link_options(kyty_emulator PRIVATE
+        $<$<CONFIG:Release>:-Wl,--strip-all>
+    )
 endif()
 
 if(APPLE)

@@ -5,6 +5,8 @@
 #include "common/threads.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/host_gpu/renderer/colorRenderTarget.h"
+#include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
@@ -53,6 +55,9 @@
 #endif
 
 namespace Libs::Graphics {
+
+bool DrawUsesSingleSample(std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth, const HW::AaConfig& aa_config);
+
 namespace {
 
 void Check(bool value, const char *text) {
@@ -3435,6 +3440,62 @@ void TestNewShaderRecompilerCapturedVop1SdwaByteConvert() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestNewShaderRecompilerVop1SdwaNotDestination() {
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+
+  const auto check_destination = [&](uint32_t modifier, uint32_t dst_sel,
+                                      uint32_t dst_unused) {
+    const uint32_t shader[] = {
+        0x7e066ef9u, modifier, EncodeExp0(0x00, 0x1),
+        EncodeExp1(3, 0, 0, 0), EncodeSopp(0x01),
+    };
+
+    ShaderRecompiler::Decoder::Instruction decoded;
+    ShaderRecompiler::Decoder::DecodeInstruction(shader, 0, decoded);
+    Check(decoded.opcode == ShaderRecompiler::Decoder::Opcode::V_NOT_B32,
+          "V_NOT_B32 SDWA opcode did not decode");
+    Check(decoded.word_count == 2u,
+          "V_NOT_B32 SDWA instruction has the wrong word count");
+    Check(decoded.dst.kind == ShaderRecompiler::Decoder::OperandKind::Vgpr &&
+              decoded.dst.reg == 3u && decoded.dst.sdwa_sel == dst_sel &&
+              decoded.dst.sdwa_dst_unused == dst_unused &&
+              decoded.dst.explicit_sdwa_dst,
+          "V_NOT_B32 SDWA destination metadata is incorrect");
+    Check(decoded.src0.kind == ShaderRecompiler::Decoder::OperandKind::Vgpr &&
+              decoded.src0.reg == 0u && decoded.src0.sdwa_sel == 6u &&
+              !decoded.src0.negate && !decoded.src0.absolute,
+          "V_NOT_B32 SDWA source metadata is incorrect");
+
+    auto result = RecompileForTest(shader, options);
+    CheckSpirvBinaryValidates(result.spirv);
+  };
+
+  check_destination(0x00061400u, 4u, 2u);
+  check_destination(0x00060500u, 5u, 0u);
+  check_destination(0x00060000u, 0u, 0u);
+
+  const auto check_rejected = [&](uint32_t modifier, const char *message) {
+    const uint32_t instruction[] = {0x7e066ef9u, modifier};
+
+    ShaderRecompiler::Decoder::Instruction decoded;
+    ShaderRecompiler::Decoder::DecodeInstruction(instruction, 0, decoded);
+    Check(decoded.word_count == 2u &&
+              decoded.opcode == ShaderRecompiler::Decoder::Opcode::UNSUPPORTED,
+          message);
+  };
+
+  check_rejected(0x00060700u, "V_NOT_B32 SDWA accepted destination selector 7");
+  check_rejected(0x00070600u, "V_NOT_B32 SDWA accepted source selector 7");
+  check_rejected(0x00061c00u,
+                 "V_NOT_B32 SDWA accepted destination unused value 3");
+  check_rejected(0x00160400u, "V_NOT_B32 SDWA accepted source negation");
+  check_rejected(0x00260400u, "V_NOT_B32 SDWA accepted source absolute");
+  check_rejected(0x00062400u, "V_NOT_B32 SDWA accepted clamp");
+  check_rejected(0x00064400u, "V_NOT_B32 SDWA accepted output modifier");
+  check_rejected(0x00000400u,
+                 "V_NOT_B32 SDWA partial destination accepted a byte source");
+}
+
 void TestNewShaderRecompilerBootB16PackedAndSdwaOpcodes() {
   const uint32_t shader[] = {
       0xd7070001u,
@@ -6113,6 +6174,13 @@ void TestPerspectiveCentroidInputs() {
           "single-sample centroid did not reuse the center barycentric builtin");
     CheckSpirvBinaryValidates(single_sample.spirv);
   }
+  HW::AaConfig aa_config{};
+  aa_config.msaa_num_samples = 0;
+  std::array<RenderColorInfo, 1> colors{};
+  colors[0].image_id = ImageId{0};
+  colors[0].desc.info.samples = 4;
+  const RenderDepthInfo depth{};
+  Check(DrawUsesSingleSample({}, depth, aa_config) && !DrawUsesSingleSample(colors, depth, aa_config), "single-sample AA config overrode a multisampled attachment");
 }
 
 void TestPsInputCountRegisterDecode() {
@@ -13516,10 +13584,14 @@ void TestCoupledVertexAliasOutput() {
 } // namespace
 } // namespace Libs::Graphics
 
-int main() {
+int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
   EnsureConfigInitialized();
+  if (argc == 2 && std::strcmp(argv[1], "--centroid-only") == 0) {
+    TestPerspectiveCentroidInputs();
+    return 0;
+  }
   TestResourceDescriptorClassification();
   TestShaderBufferResourceSize();
   TestNativeShaderResourceDependencies();
@@ -13543,6 +13615,7 @@ int main() {
   TestNewShaderRecompilerDsReadWrite2Translation();
   TestNewShaderRecompilerDsWideAndAtomicTranslation();
   TestNewShaderRecompilerCapturedVop1SdwaByteConvert();
+  TestNewShaderRecompilerVop1SdwaNotDestination();
   TestNewShaderRecompilerScalarMemoryBindingDomains();
   // Opcode semantics and optimized SPIR-V are exercised by
   // ShaderRecompilerComputeTests; keep the distinct decoder contract checks

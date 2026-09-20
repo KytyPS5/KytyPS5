@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -793,8 +794,7 @@ static void SetDrawDebugPhase(CommandBuffer& buffer, uint64_t submit_id, const D
 	                    draw.instance_count, draw.first_instance);
 }
 
-static bool GetDrawTopology(const HW::UserConfig& ucfg, bool auto_draw,
-                            vk::PrimitiveTopology& topology) {
+static bool GetDrawTopology(const HW::UserConfig& ucfg, vk::PrimitiveTopology& topology) {
 
 	topology = vk::PrimitiveTopology::ePointList;
 
@@ -817,14 +817,11 @@ static bool GetDrawTopology(const HW::UserConfig& ucfg, bool auto_draw,
 			topology = vk::PrimitiveTopology::eTriangleStrip;
 			break;
 		case Prospero::PrimitiveType::kPatch:
+			if (!Config::TessellationEnabled()) return false;
+			[[fallthrough]];
 		case Prospero::PrimitiveType::kRectList:
-			topology = vk::PrimitiveTopology::ePatchList;
-			break;
 		case Prospero::PrimitiveType::kRectListLegacy:
-			if (!auto_draw) {
-				EXIT("unknown primitive type: %u\n", static_cast<uint32_t>(ucfg.GetPrimType()));
-			}
-			topology = vk::PrimitiveTopology::eTriangleStrip;
+			topology = vk::PrimitiveTopology::ePatchList;
 			break;
 		case Prospero::PrimitiveType::kQuadListLegacy:
 			topology = vk::PrimitiveTopology::eTriangleFan;
@@ -881,6 +878,16 @@ static bool ResolvePrimitiveRestart(const CommandBuffer&         buffer,
 	return false;
 }
 
+bool DrawUsesSingleSample(std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
+                          const HW::AaConfig& aa_config) {
+	bool single_sample = std::ranges::all_of(
+	    colors, [](const auto& color) { return color.desc.info.samples == 1u; });
+	if (depth.image_id) {
+		return single_sample && depth.desc.info.samples == 1u;
+	}
+	return colors.empty() ? render_sample_count(aa_config.msaa_num_samples) == 1u : single_sample;
+}
+
 static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
                            DrawRenderState& state) {
 	auto& ctx    = buffer.GetRegisters();
@@ -903,16 +910,6 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 			        .export_mapping;
 		}
 	}
-	// Centroid equals center only when every active attachment has one sample.
-	bool single_sample = true;
-	for (uint32_t i = 0; i < state.color_count; ++i) {
-		single_sample &= state.color_info[i].desc.info.samples == 1u;
-	}
-	if (state.depth_info.image_id) {
-		single_sample &= state.depth_info.desc.info.samples == 1u;
-	} else if (state.color_count == 0) {
-		single_sample = render_sample_count(ctx.GetAaConfig().msaa_num_samples) == 1u;
-	}
 	auto& pipeline_cache = buffer.GetContext().GetPipelineCache();
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "GetGraphicsPrograms");
@@ -920,7 +917,8 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 	state.programs = pipeline_cache.GetGraphicsPrograms(
 	    vertex_shader_info, pixel_shader_info, shader_regs, ctx, buffer.GetUserConfig(),
 	    target_export_mapping, state.ps_active, state.vertex_info, state.ps_input_info,
-	    single_sample);
+	    DrawUsesSingleSample(std::span {state.color_info, state.color_count}, state.depth_info,
+	                         ctx.GetAaConfig()));
 }
 
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
@@ -957,6 +955,13 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 		LogFramebufferSkip(draw.Name(), state.color_info[0], state.depth_info, buffer,
 		                   draw.index_count, 0);
 		return false;
+	}
+	// Shader outputs identify active attachments; finalize centroid after resolving them.
+	if (state.ps_active &&
+	    state.ps_input_info.ps_single_sample !=
+	        DrawUsesSingleSample(std::span {state.color_info, state.color_count}, state.depth_info,
+	                             buffer.GetRegisters().GetAaConfig())) {
+		RefreshShaders(buffer, draw, state);
 	}
 
 	return true;
@@ -1014,8 +1019,7 @@ static void LogDrawStateIfNeeded(const CommandBuffer& buffer, const DrawCallInfo
 		return;
 	}
 
-	if (!draw.IsIndexed() &&
-	    buffer.GetUserConfig().GetPrimType() != Prospero::PrimitiveType::kRectListLegacy) {
+	if (!draw.IsIndexed() && !Prospero::IsRectList(buffer.GetUserConfig().GetPrimType())) {
 		return;
 	}
 
@@ -1028,8 +1032,7 @@ static void LogDrawStateIfNeeded(const CommandBuffer& buffer, const DrawCallInfo
 }
 
 static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_buffer,
-                               const ShaderVertexInputInfo& vs_input_info, const DrawCallInfo& draw,
-                               const DrawEmitInfo& emit) {
+                               const DrawCallInfo& draw, const DrawEmitInfo& emit) {
 	switch (ucfg.GetPrimType()) {
 		case Prospero::PrimitiveType::kPointList:
 		case Prospero::PrimitiveType::kLineList:
@@ -1038,6 +1041,7 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 		case Prospero::PrimitiveType::kTriFan:
 		case Prospero::PrimitiveType::kTriStrip:
 		case Prospero::PrimitiveType::kRectList:
+		case Prospero::PrimitiveType::kRectListLegacy:
 		case Prospero::PrimitiveType::kPatch:
 			if (draw.IsIndexed()) {
 				vk_buffer.drawIndexed(draw.index_count, draw.instance_count, 0, emit.vertex_offset,
@@ -1046,14 +1050,6 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 				vk_buffer.draw(draw.index_count, draw.instance_count, emit.first_vertex,
 				               emit.first_instance);
 			}
-			break;
-		case Prospero::PrimitiveType::kRectListLegacy:
-			if (draw.IsIndexed()) {
-				EXIT("unknown primitive type: %u\n", static_cast<uint32_t>(ucfg.GetPrimType()));
-			}
-			// Sarah
-			EXIT_NOT_IMPLEMENTED(!(draw.index_count == 3 && vs_input_info.buffers_num == 0));
-			vk_buffer.draw(4, draw.instance_count, emit.first_vertex, emit.first_instance);
 			break;
 		case Prospero::PrimitiveType::kQuadListLegacy:
 			EXIT_NOT_IMPLEMENTED((draw.index_count & 0x3u) != 0);
@@ -1198,7 +1194,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (mesh_active) {
 		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
 	} else {
-		EmitDrawPrimitives(ucfg, vk_buffer, state.vertex_info[0], draw, emit);
+		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
 	}
 
 	if (!draw.IsIndexed()) {
@@ -1274,7 +1270,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	hw_check(buffer);
 
 	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
-	if (!GetDrawTopology(ucfg, false, topology)) {
+	if (!GetDrawTopology(ucfg, topology)) {
 		return;
 	}
 
@@ -1381,7 +1377,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	                         args.instance_count, args.first_instance};
 
 	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
-	if (!GetDrawTopology(ucfg, true, topology)) {
+	if (!GetDrawTopology(ucfg, topology)) {
 		ResetBindings();
 		return;
 	}
@@ -1391,7 +1387,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 		return;
 	}
 
-	const bool rect_list = ucfg.GetPrimType() == Prospero::PrimitiveType::kRectList;
+	const bool rect_list = Prospero::IsRectList(ucfg.GetPrimType());
 	if (rect_list && state.vertex_info[0].buffers_num == 0 &&
 	    state.vertex_info[0].stage.program->param_export_mask == 0 &&
 	    state.ps_input_info.input_num != 0) {

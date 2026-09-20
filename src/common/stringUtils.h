@@ -34,6 +34,14 @@ inline std::string PathToGenericString(const std::filesystem::path& path) {
 #endif
 }
 
+inline std::filesystem::path PathFromUtf8(std::string_view text) {
+#if defined(__cpp_char8_t)
+	return std::filesystem::path(std::u8string(text.begin(), text.end()));
+#else
+	return std::filesystem::u8path(text.begin(), text.end());
+#endif
+}
+
 inline bool EqualNoCase(std::string_view lhs, std::string_view rhs) {
 	if (lhs.size() != rhs.size()) {
 		return false;

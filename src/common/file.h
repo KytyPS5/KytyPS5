@@ -30,14 +30,6 @@ class File {
 public:
 	enum class Mode { Read, Write, ReadWrite, WriteRead };
 
-	struct FindInfo {
-		std::filesystem::path path_with_name;
-		std::filesystem::path rel_path_with_name;
-		DateTime              last_access_time;
-		DateTime              last_write_time;
-		uint64_t              size;
-	};
-
 	struct DirEntry {
 		std::string name;
 		bool        is_file;
@@ -98,7 +90,6 @@ public:
 	static bool SetLastAccessAndWriteTimeUTC(const std::filesystem::path& name,
 	                                         const DateTime& access, const DateTime& write);
 
-	static std::vector<FindInfo> FindFiles(const std::filesystem::path& path);
 	static std::vector<DirEntry> GetDirEntries(const std::filesystem::path& path);
 	static bool CopyFile(const std::filesystem::path& src, const std::filesystem::path& dst);
 	static bool RenameFile(const std::filesystem::path& src, const std::filesystem::path& dst);

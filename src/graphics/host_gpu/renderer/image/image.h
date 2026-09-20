@@ -167,6 +167,8 @@ public:
 	ImageUsage       usage;
 	ImageBinding     binding;
 	bool             registered     = false;
+	// Parked: registered and collectable, but no longer an answer to an overlapping lookup.
+	bool             dormant        = false;
 	mutable uint32_t query_epoch    = 0;
 	uint64_t         track_addr     = 0;
 	uint64_t         track_addr_end = 0;

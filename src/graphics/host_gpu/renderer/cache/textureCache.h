@@ -149,6 +149,7 @@ private:
 	void                      UntrackImageTail(ImageId id);
 	void                      MarkAsMaybeDirty(ImageId id, Image& image);
 	void                      TrackImageDownload(ImageId id, Image& image);
+	[[nodiscard]] static bool SameGuestLayout(const ImageInfo& cached, const ImageInfo& requested);
 	[[nodiscard]] static bool SameBacking(const ImageInfo& cached, const ImageInfo& requested,
 	                                      bool exact_format);
 	[[nodiscard]] static BindingType UploadBinding(const Image& image);
@@ -175,6 +176,11 @@ private:
 	void UploadImage(Image& image, Buffer& source, uint64_t source_offset);
 	void DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
 	                   uint64_t destination_size, uint32_t levels);
+	// Displaces an unresolvable overlap victim: parks it when guest memory cannot reproduce it.
+	void                  RetireOverlap(ImageId id, bool abandoned);
+	[[nodiscard]] bool    ParkImage(ImageId id);
+	bool                  UnparkImage(ImageId id);
+	void                  WakeImage(ImageId id, const ImageIds& candidates);
 	void DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset);
 	void               DownloadColorRegions(Image& image, std::vector<vk::BufferImageCopy>& regions,
 	void               DownloadDepthRegions(Image& image, std::vector<vk::BufferImageCopy>& regions,

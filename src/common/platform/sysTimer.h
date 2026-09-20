@@ -5,13 +5,6 @@
 
 #include <ctime>
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#endif
-
 struct SysTimeStruct {
 	uint16_t Year;         // NOLINT(readability-identifier-naming)
 	uint16_t Month;        // NOLINT(readability-identifier-naming)
@@ -24,107 +17,11 @@ struct SysTimeStruct {
 };
 
 struct SysFileTimeStruct {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	FILETIME time;
-#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 	// Nanoseconds preserve sub-second file timestamps.
 	time_t time;
 	long   nanos;
-#endif
 	bool is_invalid;
 };
-
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-
-// NOLINTNEXTLINE(google-runtime-references)
-inline void SysFileToSystemTimeUtc(const SysFileTimeStruct& f, SysTimeStruct& t) {
-	SYSTEMTIME s;
-
-	if (f.is_invalid || (FileTimeToSystemTime(&f.time, &s) == 0)) {
-		t.is_invalid = true;
-		return;
-	}
-
-	t.is_invalid   = false;
-	t.Year         = s.wYear;
-	t.Month        = s.wMonth;
-	t.Day          = s.wDay;
-	t.Hour         = s.wHour;
-	t.Minute       = s.wMinute;
-	t.Second       = (s.wSecond == 60 ? 59 : s.wSecond);
-	t.Milliseconds = s.wMilliseconds;
-}
-
-// NOLINTNEXTLINE(google-runtime-references)
-inline void SysTimeTToSystem(time_t t, SysTimeStruct& s) {
-	SysFileTimeStruct ft {};
-	LONGLONG          ll   = Int32x32To64(t, 10000000) + 116444736000000000;
-	ft.time.dwLowDateTime  = static_cast<DWORD>(ll);
-	ft.time.dwHighDateTime = static_cast<DWORD>(static_cast<uint64_t>(ll) >> 32u);
-	ft.is_invalid          = false;
-	SysFileToSystemTimeUtc(ft, s);
-}
-
-// NOLINTNEXTLINE(google-runtime-references)
-inline void SysSystemToFileTimeUtc(const SysTimeStruct& f, SysFileTimeStruct& t) {
-	SYSTEMTIME s;
-
-	s.wYear         = f.Year;
-	s.wMonth        = f.Month;
-	s.wDay          = f.Day;
-	s.wHour         = f.Hour;
-	s.wMinute       = f.Minute;
-	s.wSecond       = f.Second;
-	s.wMilliseconds = f.Milliseconds;
-
-	t.is_invalid = (f.is_invalid || (SystemTimeToFileTime(&s, &t.time) == 0));
-}
-
-// Retrieves the current local date and time.
-// NOLINTNEXTLINE(google-runtime-references)
-inline void SysGetSystemTime(SysTimeStruct& t) {
-	SYSTEMTIME s;
-	GetLocalTime(&s);
-
-	t.is_invalid   = false;
-	t.Year         = s.wYear;
-	t.Month        = s.wMonth;
-	t.Day          = s.wDay;
-	t.Hour         = s.wHour;
-	t.Minute       = s.wMinute;
-	t.Second       = (s.wSecond == 60 ? 59 : s.wSecond);
-	t.Milliseconds = s.wMilliseconds;
-}
-
-// Retrieves the current system date and time in Coordinated Universal Time (UTC).
-// NOLINTNEXTLINE(google-runtime-references)
-inline void SysGetSystemTimeUtc(SysTimeStruct& t) {
-	SYSTEMTIME s;
-	GetSystemTime(&s);
-
-	t.is_invalid   = false;
-	t.Year         = s.wYear;
-	t.Month        = s.wMonth;
-	t.Day          = s.wDay;
-	t.Hour         = s.wHour;
-	t.Minute       = s.wMinute;
-	t.Second       = (s.wSecond == 60 ? 59 : s.wSecond);
-	t.Milliseconds = s.wMilliseconds;
-}
-
-inline void SysQueryPerformanceFrequency(uint64_t* freq) {
-	LARGE_INTEGER f;
-	QueryPerformanceFrequency(&f);
-	*freq = f.QuadPart;
-}
-
-inline void SysQueryPerformanceCounter(uint64_t* counter) {
-	LARGE_INTEGER c;
-	QueryPerformanceCounter(&c);
-	*counter = c.QuadPart;
-}
-
-#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 
 inline void SysFileToSystemTimeUtc(const SysFileTimeStruct& f, SysTimeStruct& t) {
 	struct tm i {};
@@ -215,7 +112,5 @@ inline void SysQueryPerformanceCounter(uint64_t* counter) {
 	clock_gettime(CLOCK_MONOTONIC, &now);
 	*counter = now.tv_sec * 1000000000LL + now.tv_nsec;
 }
-
-#endif
 
 #endif /* KYTY_COMMON_PLATFORM_SYSTIMER_H_ */

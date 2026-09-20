@@ -185,6 +185,47 @@ namespace {
 
 std::unique_ptr<WindowContext> g_window;
 
+// Hide the mouse cursor once it has been sitting still over the game window for this
+// long, and bring it back as soon as it moves again.
+constexpr double CURSOR_IDLE_HIDE_SECONDS = 2.5;
+constexpr int    CURSOR_IDLE_POLL_MS      = 200;
+
+struct CursorAutoHide {
+	bool   visible     = true;
+	double last_move_s = 0.0;
+};
+
+CursorAutoHide g_cursor;
+
+// Named CursorHide/CursorShow rather than Hide/ShowCursor to avoid shadowing the
+// WinAPI ShowCursor() that comes in through windows.h on the Windows build.
+void CursorHide() {
+	if (g_cursor.visible) {
+		SDL_ShowCursor(SDL_DISABLE);
+		g_cursor.visible = false;
+	}
+}
+
+void CursorShow(double time_s) {
+	g_cursor.last_move_s = time_s;
+	if (!g_cursor.visible) {
+		SDL_ShowCursor(SDL_ENABLE);
+		g_cursor.visible = true;
+	}
+}
+
+// While the cursor is visible we need to wake up every so often to notice that it hasn't
+// moved in a while; once it's hidden the next real mouse-motion event does the job.
+int CursorAutoHideWaitMs() {
+	return g_cursor.visible ? CURSOR_IDLE_POLL_MS : -1;
+}
+
+void UpdateCursorAutoHide(double time_s) {
+	if (g_cursor.visible && time_s - g_cursor.last_move_s >= CURSOR_IDLE_HIDE_SECONDS) {
+		CursorHide();
+	}
+}
+
 } // namespace
 
 constexpr const char* KYTY_SDL_WINDOW_CAPTION = "Game";
@@ -288,6 +329,10 @@ static void GameEventMouse([[maybe_unused]] const EventMouse& mb) {
 		     mb.x, mb.y);
 	}
 #endif
+
+	if (mb.motion) {
+		CursorShow(mb.timestamp_seconds);
+	}
 
 	if (mb.down || mb.up) {
 		uint8_t mouse_button = 0;
@@ -806,10 +851,12 @@ void WindowContext::Run() {
 			timer.Resume();
 		}
 
-		if (!HostInputWaitEvent(&loop.event)) {
+		if (!HostInputWaitEvent(&loop.event, CursorAutoHideWaitMs())) {
+			UpdateCursorAutoHide(timer.GetTimeS());
 			continue;
 		}
 		ProcessEvent(timer.GetTimeS());
+		UpdateCursorAutoHide(timer.GetTimeS());
 	}
 }
 
@@ -871,6 +918,9 @@ static void WindowCreate(WindowContext& context) {
 
 	SDL_SetWindowResizable(context.window, SDL_FALSE);
 	context.UpdateIcon();
+
+	// Start with the cursor hidden; it comes back the moment the mouse moves.
+	CursorHide();
 }
 
 uint32_t WindowContext::InitialWindowFlags(bool fullscreen) noexcept {

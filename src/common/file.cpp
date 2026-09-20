@@ -11,22 +11,6 @@
 #include <utility>
 #include <vector>
 
-// IWYU pragma: no_include <fileapi.h>
-// IWYU pragma: no_include <windows.h>
-// IWYU pragma: no_include <winbase.h>
-
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-#ifdef CreateDirectory
-#undef CreateDirectory
-#endif
-#ifdef DeleteFile
-#undef DeleteFile
-#endif
-#ifdef CopyFile
-#undef CopyFile
-#endif
-#endif
-
 namespace Common {
 
 namespace {
@@ -244,17 +228,6 @@ void File::Printf(const char* format, ...) {
 	s = Common::ReplaceStr(s, "\n", "\r\n");
 	Write(s.data(), static_cast<uint32_t>(s.size()));
 }
-
-static std::filesystem::path WithoutTrailingSeparator(
-	const std::filesystem::path& path) {
-		if (!path.empty() && !path.has_filename() &&
-			path != path.root_path()) {
-			return path.parent_path();
-		}
-
-		return path;
-}
-
 
 bool File::IsDirectoryExisting(const std::filesystem::path& path) {
 	return SysFileIsDirectoryExisting(WithoutTrailingSeparator(path));

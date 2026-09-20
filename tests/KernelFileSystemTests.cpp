@@ -189,20 +189,6 @@ void CheckUnicodePaths(const std::filesystem::path &root) {
   Check(fixture.Create(native_file), "create Unicode filename");
   fixture.Close();
 
-  for (const auto &directory : {unicode_root, std::filesystem::relative(unicode_root)}) {
-    // A Windows temporary directory may be on a different drive from the working directory.
-    if (directory.empty()) {
-      continue;
-    }
-    const auto files = Common::File::FindFiles(directory);
-    const auto relative_file =
-        std::filesystem::path(u8"nested/asset-\u00e9-\u65e5\u672c\u8a9e.bin");
-    Check(std::any_of(files.begin(), files.end(), [&](const auto &file) {
-            return file.path_with_name.lexically_normal() ==
-                       (directory / relative_file).lexically_normal() &&
-                   file.rel_path_with_name == relative_file;
-          }), "recursive enumeration preserves native and relative Unicode paths");
-  }
   const auto entries = Common::File::GetDirEntries(nested_root);
   Check(std::any_of(entries.begin(), entries.end(), [&](const auto &entry) {
           return entry.is_file && entry.name == GuestFilename;

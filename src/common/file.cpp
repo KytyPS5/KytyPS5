@@ -445,45 +445,6 @@ bool File::SetLastAccessAndWriteTimeUTC(const std::filesystem::path& name, const
 	return SysFileSetLastAccessAndWriteTimeUtc(name, af, wf);
 }
 
-std::vector<File::FindInfo> File::FindFiles(const std::filesystem::path& path) {
-	std::vector<sys_file_find_t> files;
-
-	SysFileFindFiles(path, files);
-
-	const auto normalized_path = path.lexically_normal();
-	std::vector<File::FindInfo> ret;
-	ret.reserve(files.size());
-
-	for (const auto& f: files) {
-		File::FindInfo r {};
-
-		r.path_with_name     = f.path_with_name;
-		r.rel_path_with_name = f.path_with_name.lexically_normal().lexically_relative(normalized_path);
-		r.size               = f.size;
-
-		SysTimeStruct at {};
-		SysTimeStruct wt {};
-
-		SysFileToSystemTimeUtc(f.last_access_time, at);
-		SysFileToSystemTimeUtc(f.last_write_time, wt);
-
-		if (!at.is_invalid && !wt.is_invalid) {
-			r.last_access_time = DateTime(Date(at.Year, at.Month, at.Day),
-			                              Time(at.Hour, at.Minute, at.Second, at.Milliseconds));
-			r.last_write_time  = DateTime(Date(wt.Year, wt.Month, wt.Day),
-			                              Time(wt.Hour, wt.Minute, wt.Second, wt.Milliseconds));
-		}
-
-		// printf("%s, %s, %" PRIu64", %s, %s\n", r.path_with_name.c_str(),
-		// r.rel_path_with_name.c_str(), r.size, r.last_access_time.ToString().c_str(),
-		// r.last_write_time.ToString().c_str());
-
-		ret.push_back(std::move(r));
-	}
-
-	return ret;
-}
-
 std::vector<File::DirEntry> File::GetDirEntries(const std::filesystem::path& path) {
 	std::vector<sys_dir_entry_t> files;
 

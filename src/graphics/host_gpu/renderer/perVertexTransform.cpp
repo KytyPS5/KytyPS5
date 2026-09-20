@@ -90,6 +90,9 @@ bool DerivePerVertexLayout(const std::string& vs_source, const std::string& ps_s
 		layout.clip_slot          = UINT32_MAX;
 		layout.record_stride_vec4 = current_slot;
 	}
+	if (layout.location_to_slot.find(31) != layout.location_to_slot.end()) {
+		return false;
+	}
 
 	std::regex pv_re(R"(^\s*OpDecorate\s+(%\S+)\s+PerVertexKHR\s*$)", kMultilineRegex);
 	std::vector<std::string> pv_vars;
@@ -789,7 +792,8 @@ bool SaveTransformedShadersToDisk(const std::filesystem::path& cache_dir, uint64
 	if (bytes_written != buffer.size() || !flushed ||
 	    !Common::File::RenameFile(temp_path, final_path)) {
 		if (Common::File::IsFileExisting(temp_path)) {
-			std::filesystem::remove(temp_path);
+			std::error_code remove_error;
+			std::filesystem::remove(temp_path, remove_error);
 		}
 		return false;
 	}
@@ -902,6 +906,7 @@ bool TryLoadTransformedShadersFromDisk(const std::filesystem::path& cache_dir, u
 	for (uint32_t i = 0; i < param_count; ++i) {
 		uint32_t loc = 0, slot = 0;
 		if (!read_bytes(&loc, sizeof(loc)) || !read_bytes(&slot, sizeof(slot))) return false;
+		if (loc == 31) return false;
 		if (slot == 0 || slot >= loaded_layout.record_stride_vec4 || slot_used[slot]) {
 			return false; // slot hors bornes ou collision
 		}

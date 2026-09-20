@@ -3,7 +3,7 @@
 // Covers:
 //   1. Generated unpack SPIR-V execution with strict CPU verification.
 //   2. Descriptor safety on non-4-byte aligned index buffers (8-bit and 16-bit indices).
-//   3. Full end-to-end chain proof: Unpack -> Capture (Compute) -> Replay (Vertex) -> Rasterization -> Fragment (PerVertexKHR).
+//   3. Full end-to-end chain proof with host-expanded 8-bit indices: Unpack -> Capture (Compute) -> Replay (Vertex) -> Rasterization -> Fragment (PerVertexKHR).
 
 #include <vulkan/vulkan.h>
 #include <dlfcn.h>
@@ -773,10 +773,26 @@ int main() {
         DispatchAndVerifyStrict("Odd 8-bit index buffer (5 elements = 5 bytes, bound=8)", push, {1, 3, 5, 0, 7});
     }
 
+    constexpr uint8_t kGuestIndices8[3] = {0, 1, 2};
+    std::array<uint16_t, 3> expanded_indices {};
+    for (uint32_t i = 0; i < expanded_indices.size(); ++i) {
+        expanded_indices[i] = kGuestIndices8[i];
+    }
+    GpuBuffer expanded_idx_buf = CreateBuffer(dev, 8, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    std::memcpy(expanded_idx_buf.mapped, expanded_indices.data(), expanded_indices.size() * sizeof(uint16_t));
+    const VkDescriptorBufferInfo expanded_idx_dbi {expanded_idx_buf.buffer, 0, 8};
+    VkWriteDescriptorSet expanded_idx_write {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    expanded_idx_write.dstSet = desc_set;
+    expanded_idx_write.dstBinding = 0;
+    expanded_idx_write.descriptorCount = 1;
+    expanded_idx_write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    expanded_idx_write.pBufferInfo = &expanded_idx_dbi;
+    vk_update_descriptor_sets(dev.device, 1, &expanded_idx_write, 0, nullptr);
+
     // =========================================================================
     // PART 3: FULL CHAIN PROOF: UNPACK -> CAPTURE -> REPLAY -> FRAGMENT (Critique 2)
     // =========================================================================
-    std::printf("\n=== Part 3: Proving Full Chain (Unpack -> Capture -> Replay -> Fragment) ===\n");
+    std::printf("\n=== Part 3: Proving Full Chain With Host-Expanded 8-Bit Indices ===\n");
 
     // Source Vertex Shader: computes position, exports out_param_0 (Location 0) and clip
     const std::string kVsSource = R"(
@@ -1033,7 +1049,7 @@ OpFunctionEnd
         push.index_count = 3;
         push.first_vertex = 0;
         push.vertex_offset = 0;
-        push.packed_flags = (0u << 16u) | (2u << 19u); // non-indexed, 2 attrs (pos, col)
+        push.packed_flags = (1u << 16u) | (1u << 17u) | (2u << 19u);
 
         VkCommandBufferBeginInfo bi {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
         Check(vk_begin_command_buffer(cmd, &bi), "begin cmd");
@@ -1633,6 +1649,20 @@ OpFunctionEnd
             std::printf("PASS: Invariant verified: slot collision with clip_slot rejected despite valid recomputed checksum\n");
         }
 
+        // Invariant F8: Location 31 is reserved for the generated primitive ID varying
+        {
+            auto corrupt = original_bytes;
+            const uint32_t occupied_location = 31;
+            std::memcpy(corrupt.data() + prot_offset + 17, &occupied_location, sizeof(occupied_location));
+            write_with_recomputed_checksum(corrupt);
+            Libs::Graphics::PerVertexLayout cl {};
+            std::vector<uint32_t> cc, cf, cr;
+            if (Libs::Graphics::TryLoadTransformedShadersFromDisk(test_dir, vs_hash, ps_hash, cl, cc, cf, cr)) {
+                Fail("Real loader accepted reserved primitive location 31 with recomputed checksum");
+            }
+            std::printf("PASS: Invariant verified: reserved primitive location 31 rejected despite valid recomputed checksum\n");
+        }
+
         // Restore original intact file and verify it loads cleanly again
         write_file_bytes(cache_file, original_bytes);
         {
@@ -1814,7 +1844,7 @@ OpFunctionEnd
     std::printf("ALL RIGOROUS GPU PER-VERTEX TESTS PASSED ON APPLE SILICON GPU (MoltenVK)\n");
     std::printf("  1. Float32/Unorm/Float16 bitwise equality for finite fixtures (NaN/Inf rejected)\n");
     std::printf("  2. Descriptor safety proven on non-4-byte aligned index buffers (6-byte 16-bit, 5-byte 8-bit)\n");
-    std::printf("  3. Full chain verified: Unpack -> Capture Compute -> Replay Vertex -> Rasterizer -> Fragment PerVertexKHR\n");
+    std::printf("  3. Full chain verified with host-expanded 8-bit indices: Unpack -> Capture Compute -> Replay Vertex -> Rasterizer -> Fragment PerVertexKHR\n");
     std::printf("  4. Pipeline cache acceleration (cold vs warm) and bytecode disk cache proven with corruption recovery\n");
     std::printf("========================================================================\n");
     return 0;

@@ -50,11 +50,11 @@ void RenderExecutor::ExecutePerVertexPrototype(uint64_t submit_id, CommandBuffer
 	uint64_t   idx_aligned_offset = 0;
 	uint32_t   index_byte_adjust  = 0;
 	uint64_t   idx_buf_available  = 0;
+	const uint32_t index_element_size =
+	    index_source.host_data != nullptr ? sizeof(uint16_t) : index_source.guest_element_size;
 	if (draw.IsIndexed()) {
-		EXIT_IF(index_source.guest_element_size != 1 && index_source.guest_element_size != 2 &&
-		        index_source.guest_element_size != 4);
-		const uint64_t idx_total_bytes =
-		    static_cast<uint64_t>(draw.index_count) * index_source.guest_element_size;
+		EXIT_IF(index_element_size != 1 && index_element_size != 2 && index_element_size != 4);
+		const uint64_t idx_total_bytes = index_source.size;
 		if (index_source.host_data != nullptr) {
 			auto&      stream  = cache.GetUtilityBuffer(MemoryUsage::Stream);
 			const auto offset  = stream.Copy(index_source.host_data, idx_total_bytes, 16);
@@ -117,8 +117,7 @@ void RenderExecutor::ExecutePerVertexPrototype(uint64_t submit_id, CommandBuffer
 
 	const uint64_t idx_bytes_raw =
 	    draw.IsIndexed()
-	        ? (static_cast<uint64_t>(draw.index_count) * index_source.guest_element_size +
-	           index_byte_adjust)
+	        ? (index_source.size + index_byte_adjust)
 	        : (vtx_total_bytes + vertex_byte_adjust);
 	const uint64_t idx_size_bounded =
 	    std::min(Common::AlignUp(idx_bytes_raw, 4), idx_buf_available);
@@ -180,9 +179,9 @@ void RenderExecutor::ExecutePerVertexPrototype(uint64_t submit_id, CommandBuffer
 	uint32_t idx_flag = 0;
 	if (draw.IsIndexed()) {
 		idx_flag = 1u;
-		if (index_source.guest_element_size == 2) {
+		if (index_element_size == 2) {
 			idx_flag |= (1u << 1u);
-		} else if (index_source.guest_element_size == 4) {
+		} else if (index_element_size == 4) {
 			idx_flag |= (2u << 1u);
 		}
 	}

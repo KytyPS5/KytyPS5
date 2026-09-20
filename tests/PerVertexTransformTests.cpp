@@ -27,6 +27,14 @@ int main() {
             std::fprintf(stderr, "FAIL: multiline PerVertex layout derivation\n");
             return EXIT_FAILURE;
         }
+        const std::string occupied_primitive_location =
+            vs + newline + "OpDecorate %param31 Location 31" + newline +
+            "%param31 = OpVariable %ptr Output";
+        if (Libs::Graphics::DerivePerVertexLayout(occupied_primitive_location, ps, layout, params)) {
+            std::fprintf(stderr, "FAIL: reserved primitive location 31 accepted\n");
+            return EXIT_FAILURE;
+        }
+
         const std::string missing_location = ps + newline + "OpDecorate %missing PerVertexKHR";
         if (Libs::Graphics::DerivePerVertexLayout(vs, missing_location, layout, params)) {
             std::fprintf(stderr, "FAIL: missing location on final line was accepted\n");

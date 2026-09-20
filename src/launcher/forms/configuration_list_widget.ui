@@ -44,16 +44,13 @@
          <property name="spacing">
           <number>4</number>
          </property>
-        <item>
+         <item>
           <widget class="QToolButton" name="refresh_button">
            <property name="minimumSize">
             <size>
              <width>36</width>
              <height>36</height>
             </size>
-           </property>
-           <property name="toolTip">
-            <string>Rescan game folders for new games</string>
            </property>
            <property name="text">
             <string/>
@@ -270,6 +267,14 @@
     </layout>
    </item>
   </layout>
+  <action name="refresh_action">
+   <property name="text">
+    <string>Refresh game list</string>
+   </property>
+   <property name="toolTip">
+    <string>Rescan game folders for new games</string>
+   </property>
+  </action>
  </widget>
  <customwidgets>
   <customwidget>

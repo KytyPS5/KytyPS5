@@ -810,6 +810,7 @@ void WindowContext::Run() {
 			continue;
 		}
 		ProcessEvent(timer.GetTimeS());
+		FrameMark;
 	}
 }
 

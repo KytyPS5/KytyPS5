@@ -9,6 +9,7 @@
 #include <fmt/format.h>
 #include <memory>
 #include <mutex>
+#include <spdlog/async.h>
 #include <spdlog/formatter.h>
 #include <spdlog/logger.h>
 #include <spdlog/sinks/basic_file_sink.h>
@@ -50,6 +51,19 @@ std::shared_ptr<spdlog::logger> MakeFileLogger(std::string                  name
 	return MakeLogger(std::move(name), std::move(sink));
 }
 
+std::shared_ptr<spdlog::logger> MakeAsyncFileLogger(std::string                  name,
+                                                    const std::filesystem::path& path) {
+	const auto parent = path.parent_path();
+	if (!parent.empty()) {
+		std::filesystem::create_directories(parent);
+	}
+
+	auto sink =
+	    std::make_shared<spdlog::sinks::basic_file_sink_mt>(path.native(), true);
+	return spdlog::create_async_nb<spdlog::sinks::basic_file_sink_mt>(
+	    std::move(name), path.native(), true);
+}
+
 static bool HasStyle(fmt::text_style style) {
 	return style != fmt::text_style {};
 }
@@ -72,10 +86,18 @@ static Direction                       g_direction   = Direction::Console;
 static std::filesystem::path           g_output_file;
 static std::mutex                      g_logger_mutex;
 static std::shared_ptr<spdlog::logger> g_logger;
+static bool                            g_thread_pool_initialized = false;
 
 void Flush() {
 	if (g_logger != nullptr) {
 		g_logger->flush();
+	}
+}
+
+static void EnsureThreadPool() {
+	if (!g_thread_pool_initialized) {
+		spdlog::init_thread_pool(8192, 1);
+		g_thread_pool_initialized = true;
 	}
 }
 
@@ -93,7 +115,9 @@ static void SetupLogger() {
 			break;
 		case Direction::File:
 			if (!g_output_file.empty()) {
-				g_logger = MakeFileLogger("kyty", g_output_file);
+				EnsureThreadPool();
+				g_logger = MakeAsyncFileLogger("kyty", g_output_file);
+				g_logger->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] [thread %t] %v");
 			}
 			break;
 	}

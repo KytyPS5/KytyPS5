@@ -21,6 +21,31 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdlib>
+
+#if defined(TRACY_ENABLE) && defined(VMA_STATS_STRING_ENABLED)
+static void* VKAPI_PTR TracyVmaAlloc(void* /*pUserData*/, size_t size, size_t alignment, VkSystemAllocationScope /*allocationScope*/) {
+	void* ptr = _aligned_malloc(size, alignment);
+	TracyAllocS(ptr, size, 12);
+	return ptr;
+}
+
+static void VKAPI_PTR TracyVmaFree(void* /*pUserData*/, void* pMemory) {
+	TracyFreeS(pMemory, 12);
+	_aligned_free(pMemory);
+}
+
+static VkAllocationCallbacks GetTracyVmaCallbacks() {
+	VkAllocationCallbacks callbacks = {};
+	callbacks.pfnAllocation = TracyVmaAlloc;
+	callbacks.pfnFree = TracyVmaFree;
+	return callbacks;
+}
+#else
+static VkAllocationCallbacks GetTracyVmaCallbacks() {
+	return {};
+}
+#endif
 
 namespace Libs::Graphics {
 
@@ -44,7 +69,8 @@ bool GraphicContext::CreateAllocator() {
 		info.flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
 	}
 
-	const auto result = static_cast<vk::Result>(vmaCreateAllocator(&info, &allocator));
+	const VkAllocationCallbacks vma_callbacks = GetTracyVmaCallbacks();
+	const auto result = static_cast<vk::Result>(vmaCreateAllocator(&info, &allocator, &vma_callbacks));
 	if (result != vk::Result::eSuccess) {
 		LOGF("vmaCreateAllocator failed: %s\n", vk::to_string(result).c_str());
 		return false;

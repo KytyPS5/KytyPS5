@@ -15,6 +15,7 @@
 #include "SDL_stdinc.h"
 #include "SDL_surface.h"
 #include "SDL_thread.h"
+#include "SDL_timer.h"
 #include "SDL_touch.h"
 #include "SDL_video.h"
 #include "SDL_vulkan.h"
@@ -197,6 +198,13 @@ struct CursorAutoHide {
 
 CursorAutoHide g_cursor;
 
+// Wall-clock seconds, independent of the game timer: that timer stops while the game is
+// paused, but the player can still wiggle the mouse during a pause, and the cursor should
+// react to that instead of getting stuck.
+double CursorTimeS() {
+	return static_cast<double>(SDL_GetTicks64()) / 1000.0;
+}
+
 // Named CursorHide/CursorShow rather than Hide/ShowCursor to avoid shadowing the
 // WinAPI ShowCursor() that comes in through windows.h on the Windows build.
 void CursorHide() {
@@ -331,7 +339,7 @@ static void GameEventMouse([[maybe_unused]] const EventMouse& mb) {
 #endif
 
 	if (mb.motion) {
-		CursorShow(mb.timestamp_seconds);
+		CursorShow(CursorTimeS());
 	}
 
 	if (mb.down || mb.up) {
@@ -852,11 +860,11 @@ void WindowContext::Run() {
 		}
 
 		if (!HostInputWaitEvent(&loop.event, CursorAutoHideWaitMs())) {
-			UpdateCursorAutoHide(timer.GetTimeS());
+			UpdateCursorAutoHide(CursorTimeS());
 			continue;
 		}
 		ProcessEvent(timer.GetTimeS());
-		UpdateCursorAutoHide(timer.GetTimeS());
+		UpdateCursorAutoHide(CursorTimeS());
 	}
 }
 

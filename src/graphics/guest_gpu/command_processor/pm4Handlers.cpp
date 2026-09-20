@@ -2017,6 +2017,14 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 		auto pfunc = g_hw_ctx_indirect_func[cmd_offset & (Pm4::CX_NUM - 1)];
 
 		if (pfunc == nullptr) {
+			if (raw_cmd_offset == 0x24au && value == 0u) {
+				static std::atomic_flag logged = ATOMIC_FLAG_INIT;
+				if (!logged.test_and_set(std::memory_order_relaxed)) {
+					Log::WriteToConsoleAndLog(
+					    "\t diagnostic: ignoring indirect CX {0x24a, 0}; hardware effect unresolved\n");
+				}
+				continue;
+			}
 			EXIT("unknown cx reg at %05" PRIx32 ": 0x%" PRIx32 "\n", num_dw - dw, cmd_offset);
 		}
 

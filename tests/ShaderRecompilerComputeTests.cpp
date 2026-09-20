@@ -9405,6 +9405,114 @@ public:
   }
 
 
+  void CheckCubeFaceStorageExpansion() {
+    constexpr const char *name = "CubeFaceStorageExpansion";
+    constexpr uintptr_t base = 0x0000000204700000ull;
+    constexpr uint64_t allocation_size = 0x10000;
+    constexpr std::array<uint32_t, 6> half_red{0x3c00, 0x4000, 0x4200,
+                                             0x4400, 0x4500, 0x4600};
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_size, 0, &direct_offset) == 0,
+            "cube-face allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_size) == 0 && mapped == reinterpret_cast<void *>(base),
+            "cube-face mapping failed");
+    std::memset(mapped, 0, allocation_size);
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(base, allocation_size);
+      auto &cache = context.GetTextureCache();
+      auto &executor = context.GetRenderExecutor();
+      for (uint32_t face = 0; face < half_red.size(); ++face) {
+        // PPSA25380 clears six single-face cube views at one guest address.
+        ShaderTextureResource descriptor{{static_cast<uint32_t>(base >> 8u),
+            0xc4700000u, 0x0001c001u, 0xb0000facu,
+            face | (face << 16u), 0x00700000u, 0, 0}};
+        TestCase test;
+        test.name = name;
+        test.has_user_data = true;
+        std::copy_n(descriptor.fields, 8, test.user_data.begin());
+        test.has_compute_info = true;
+        test.compute_info.threads_num[0] = test.compute_info.threads_num[1] = 8;
+        test.compute_info.threads_num[2] = 1;
+        test.compute_info.thread_ids_num = 2;
+        test.opcodes = {ShaderOpcode::V_MOV_B32, ShaderOpcode::IMAGE_STORE,
+                        ShaderOpcode::S_ENDPGM};
+        test.code = {EncodeVop1(0x01, 20, 256), EncodeVop1(0x01, 21, 257)};
+        AppendVMovU32(&test.code, 22, 0);
+        AppendVMovLiteral(&test.code, 0,
+                          std::bit_cast<uint32_t>(static_cast<float>(face + 1)));
+        AppendVMovLiteral(&test.code, 1, std::bit_cast<uint32_t>(0.5f));
+        AppendVMovLiteral(&test.code, 2, std::bit_cast<uint32_t>(0.25f));
+        AppendVMovLiteral(&test.code, 3, std::bit_cast<uint32_t>(1.0f));
+        test.code.push_back(EncodeMimg0(0x08, 0xf, 0, false, 5));
+        test.code.push_back(EncodeMimg1(0, 20));
+        AppendEnd(&test.code);
+        const auto compiled = CompileCase(test, SubgroupSize());
+        const auto &resource = compiled.program.info.images.at(0);
+        Require(name, "cube storage specialization", resource.cube &&
+                    resource.written && resource.dimension ==
+                        ShaderRecompiler::Decoder::ImageDimension::Dim2DArray,
+                "single-face cube store lost its array coordinates");
+        ShaderRecompiler::IR::DescriptorValue value{};
+        value.dword_count = 8;
+        std::copy_n(descriptor.fields, 8, value.dwords.begin());
+        const auto binding = RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
+        Image storage;
+        storage.view = cache.FindTexture(binding.image_id, binding.desc);
+        auto &image = cache.GetImage(binding.image_id);
+        Require(name, "face view and backing", storage.view != nullptr &&
+                    image.info.pixel_format == vk::Format::eR16G16B16A16Sfloat &&
+                    image.info.bytes_per_block == 8 &&
+                    image.info.resources.layers == face + 1 &&
+                    image.backing.layers == face + 1 &&
+                    binding.desc.view_info.type == vk::ImageViewType::e2DArray &&
+                    binding.desc.view_info.base_layer == face &&
+                    binding.desc.view_info.layer_count == 1,
+                "cube face did not expand the array or select its own layer");
+        image.Transit(vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderWrite,
+                      {}, scheduler.Current().Handle());
+        storage.layout = image.backing.state.layout;
+        scheduler.Finish();
+        Dispatch(test, compiled, {}, nullptr, nullptr, &storage);
+        cache.MarkGpuWritten(binding.image_id);
+        for (uint32_t prior = 0; prior <= face; ++prior) {
+          const auto pixels = ReadCachedTexel(name, context, binding.image_id,
+                                             {}, {8, 8, 1}, prior);
+          for (uint32_t pixel = 0; pixel < 64; ++pixel) {
+            Require(name, "stored and preserved faces",
+                    pixels[pixel * 2] == (0x38000000u | half_red[prior]) &&
+                        pixels[pixel * 2 + 1] == 0x3c003400u,
+                    "face " + std::to_string(prior) + " pixel " +
+                        std::to_string(pixel) + " changed after writing face " +
+                        std::to_string(face));
+          }
+        }
+      }
+      RenderExecutorTestAccess::ResetBindings(executor);
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    Require(name, "release",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0 &&
+                Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                    direct_offset, allocation_size) == 0,
+            "cube-face backing release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckRenderExecutorColorStandardTileDiscovery() {
     constexpr const char *name = "RenderExecutorColorStandardTile";
     constexpr uintptr_t base = 0x0000000203b00000ull;
@@ -12389,15 +12497,14 @@ public:
       const auto &image =
           compiled.program.info.images.at(binding.resources.front());
       bool supported =
-          image.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+          image.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2D ||
+          image.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
       if (resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled) {
         supported = supported ||
                     image.dimension ==
                         ShaderRecompiler::Decoder::ImageDimension::Dim1D ||
                     image.dimension ==
-                        ShaderRecompiler::Decoder::ImageDimension::Dim1DArray ||
-                    image.dimension ==
-                        ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
+                        ShaderRecompiler::Decoder::ImageDimension::Dim1DArray;
       }
       Require(test.name, "dispatch", supported,
               "unsupported image dimension needs a matching Vulkan test view");
@@ -32429,6 +32536,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--layered-image-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckUnifiedImageViewCache();
+    vulkan.CheckCubeFaceStorageExpansion();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--image-view-cache-only") == 0) {
@@ -32619,6 +32727,7 @@ int main(int argc, char **argv) {
 #endif
   vulkan.CheckUnifiedImageViewCache();
   vulkan.CheckPackedTextureComponents();
+  vulkan.CheckCubeFaceStorageExpansion();
   const auto tests = MakeCases();
   const auto graphics_tests = MakeGraphicsCases();
   CheckOpcodeCoverage(tests, graphics_tests);

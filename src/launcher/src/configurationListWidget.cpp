@@ -915,9 +915,7 @@ void ConfigurationListWidget::show_context_menu(const QPoint& pos) {
 		SelectItem(item);
 	}
 
-	QMenu menu;
-	menu.addAction(m_ui->refresh_action);
-	menu.addSeparator();
+	QMenu      menu;
 	const auto save_data_dirs = item != nullptr ? GetSaveDataDirs(item->GetInfo()) : QStringList();
 	const bool has_trophy_data =
 	    item != nullptr && TrophyViewerDialog::HasTrophyData(&item->GetInfo());

@@ -82,6 +82,11 @@ struct ShaderWorkgroupInputInfo {
 };
 
 struct ShaderMeshInputInfo: ShaderWorkgroupInputInfo {
+	// Merged passthrough programs read allocation counters from s2: 9-bit fields at offsets 22
+	// and 12.
+	static constexpr uint32_t               ALLOCATION_VERTEX_SHIFT    = 12u;
+	static constexpr uint32_t               ALLOCATION_PRIMITIVE_SHIFT = 22u;
+	bool     passthrough_alloc    = false;
 	uint32_t input_primitive      = 0;
 	uint32_t primitives_per_group = 0;
 	uint32_t vertices_per_group   = 0;

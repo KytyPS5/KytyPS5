@@ -18,6 +18,7 @@
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <cstdio>
@@ -26,6 +27,7 @@
 #include <span>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <xxhash.h>
@@ -104,6 +106,101 @@ static const ShaderBinaryInfo* GetBinaryInfo(const uint32_t* code) {
 static uint64_t GetDeclaredShaderHash(uint64_t shader_addr) {
 	const auto* header = GetBinaryInfo(reinterpret_cast<const uint32_t*>(shader_addr));
 	return header != nullptr ? (static_cast<uint64_t>(header->hash1) << 32u) | header->hash0 : 0;
+}
+
+struct MergedProtocol {
+	bool               wave_barrier      = false;
+	bool               allocation_req    = false;
+	bool               counts_primitives = false;
+	bool               counts_vertices   = false;
+	bool               exports           = false;
+	[[nodiscard]] bool Complete() const {
+		return wave_barrier && allocation_req && counts_primitives && counts_vertices && exports;
+	}
+};
+
+static MergedProtocol ScanMergedProtocol(std::span<const uint32_t> code) {
+	constexpr uint8_t kBarrier    = 1u << 0u;
+	constexpr uint8_t kAllocation = 1u << 1u;
+	constexpr uint8_t kPrimitives = 1u << 2u;
+	constexpr uint8_t kVertices   = 1u << 3u;
+	struct State {
+		uint32_t word;
+		uint8_t  protocol;
+	};
+	MergedProtocol protocol;
+	std::vector<State> pending {{0u, 0u}};
+	std::unordered_set<uint64_t> visited;
+	while (!pending.empty()) {
+		const auto state = pending.back();
+		pending.pop_back();
+		const auto key = (static_cast<uint64_t>(state.word) << 8u) | state.protocol;
+		if (state.word >= code.size() || !visited.insert(key).second)
+			continue;
+
+		std::array<uint32_t, ShaderRecompiler::Decoder::MaxInstructionRawWords> decode_words{};
+		const auto remaining = code.size() - state.word;
+		std::copy_n(code.begin() + state.word,
+		            std::min<size_t>(remaining, decode_words.size()), decode_words.begin());
+		ShaderRecompiler::Decoder::Instruction inst;
+		const auto family = ShaderRecompiler::Decoder::GetInstructionFamily(code[state.word]);
+		if (family == ShaderRecompiler::Decoder::Family::Unknown)
+			continue;
+		ShaderRecompiler::Decoder::DecodeInstruction(decode_words, 0, inst);
+		if (inst.word_count == 0 || inst.word_count > remaining)
+			continue;
+		inst.pc = state.word * sizeof(uint32_t);
+		if (ShaderRecompiler::Decoder::IsDirectBranch(inst.opcode))
+			inst.branch_target += inst.pc;
+
+		uint8_t next_protocol = state.protocol;
+		if (inst.opcode == ShaderRecompiler::Decoder::Opcode::S_BARRIER) {
+			next_protocol |= kBarrier;
+			protocol.wave_barrier = true;
+		}
+		if (inst.opcode == ShaderRecompiler::Decoder::Opcode::S_SENDMSG && inst.src0.value == 9u) {
+			next_protocol |= kAllocation;
+			protocol.allocation_req = true;
+		}
+		if (inst.opcode == ShaderRecompiler::Decoder::Opcode::S_BFE_U32 &&
+		    inst.src0.kind == ShaderRecompiler::Decoder::OperandKind::Sgpr && inst.src0.reg == 2u) {
+			const auto offset     = inst.src1.value & 0x1fu;
+			const auto field_size = (inst.src1.value >> 16u) & 0x7fu;
+			if (field_size == 9u) {
+				if (offset == 22u) {
+					next_protocol |= kPrimitives;
+					protocol.counts_primitives = true;
+				}
+				if (offset == 12u) {
+					next_protocol |= kVertices;
+					protocol.counts_vertices = true;
+				}
+			}
+		}
+		if ((next_protocol & (kPrimitives | kVertices)) == (kPrimitives | kVertices) &&
+		    (next_protocol & (kBarrier | kAllocation)) == (kBarrier | kAllocation) &&
+		    inst.opcode == ShaderRecompiler::Decoder::Opcode::EXP && inst.exp.target == 0x14u &&
+		    inst.exp.en != 0u) {
+			protocol.exports = true;
+			return protocol;
+		}
+
+		const auto next_word = state.word + inst.word_count;
+		if (inst.opcode == ShaderRecompiler::Decoder::Opcode::S_ENDPGM ||
+		    inst.opcode == ShaderRecompiler::Decoder::Opcode::S_SETPC_B64)
+			continue;
+		if (inst.opcode == ShaderRecompiler::Decoder::Opcode::S_BRANCH) {
+			if (inst.branch_target % sizeof(uint32_t) == 0u)
+				pending.push_back({inst.branch_target / 4u, next_protocol});
+			continue;
+		}
+		if (ShaderRecompiler::Decoder::IsConditionalBranch(inst.opcode) &&
+		    inst.branch_target % sizeof(uint32_t) == 0u) {
+			pending.push_back({inst.branch_target / 4u, next_protocol});
+		}
+		pending.push_back({next_word, next_protocol});
+	}
+	return protocol;
 }
 
 static ShaderParams GetShaderParams(uint64_t shader_addr, const char* label, uint64_t declared_hash,
@@ -668,6 +765,7 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 	}
 
 	key.push_back(info.mesh.threads_num[0]);
+	key.push_back(static_cast<uint32_t>(info.mesh.passthrough_alloc));
 	if (info.mesh.threads_num[0] != 0) {
 		const auto& mesh = info.mesh;
 		key.insert(key.end(), {mesh.wave_size, mesh.host_subgroup_size, mesh.lds_size_dwords,
@@ -760,7 +858,18 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 	    regs.es_regs.data_addr, "ShaderRecompiler VS",
 	    GetDeclaredShaderHash(regs.es_regs.data_addr),
 	    std::span<const uint32_t>(regs.gs_user_sgpr.value, regs.gs_regs.rsrc2.user_sgpr), data);
-	if ((context.GetShaderStages() & 0x20u) == 0) {
+	const bool passthrough_candidate = data.type == Prospero::ShaderBinaryType::kGs &&
+	                                   regs.gs_regs.data_addr == 0 && sh.m_vgtGsMaxVertOut == 0u;
+	const auto protocol =
+	    passthrough_candidate ? ScanMergedProtocol(params.code) : MergedProtocol {};
+	const bool passthrough_geometry = passthrough_candidate && protocol.Complete();
+	if (passthrough_geometry && user_config.GetPrimType() != Prospero::PrimitiveType::kTriList &&
+	    user_config.GetPrimType() != Prospero::PrimitiveType::kTriFan &&
+	    user_config.GetPrimType() != Prospero::PrimitiveType::kTriStrip) {
+		EXIT("unsupported passthrough topology: input=%u\n",
+		     static_cast<uint32_t>(user_config.GetPrimType()));
+	}
+	if ((context.GetShaderStages() & 0x20u) == 0 && !passthrough_geometry) {
 		if (!ShaderGetStaticVertexInputInfo(regs.es_regs.data_addr, regs.gs_user_sgpr,
 		                                    regs.gs_regs.rsrc2.user_sgpr, sh, data, info)) {
 			EXIT("failed to prepare vertex shader program\n");
@@ -797,6 +906,19 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 	EXIT_NOT_IMPLEMENTED(regs.gs_regs.rsrc1.gs_vgpr_component_count != 3u ||
 	                     regs.gs_regs.rsrc2.es_vgpr_component_count != 3u);
 	const auto& group = user_config.GetGeControl();
+	if (passthrough_geometry) {
+		const auto output_vertices = mesh.InputPrimitiveSize();
+		EXIT_IF(output_vertices == 0u || mesh.max_vertices == 0u);
+		mesh.threads_num[0] =
+		    ((mesh.max_vertices + mesh.wave_size - 1u) / mesh.wave_size) * mesh.wave_size;
+		mesh.threads_num[1] = mesh.threads_num[2] = 1u;
+		mesh.max_primitives       = 1u;
+		mesh.max_vertices         = output_vertices;
+		mesh.primitives_per_group = 1u;
+		mesh.vertices_per_group   = output_vertices;
+		mesh.passthrough_alloc    = true;
+		return params;
+	}
 	if ((user_config.GetPrimType() != Prospero::PrimitiveType::kPointList &&
 	     user_config.GetPrimType() != Prospero::PrimitiveType::kLineList &&
 	     user_config.GetPrimType() != Prospero::PrimitiveType::kTriFan &&

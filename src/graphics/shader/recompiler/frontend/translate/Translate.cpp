@@ -1063,8 +1063,15 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			}
 		} else if (options.stage == ShaderType::Mesh) {
 			const auto& mesh = options.input_info.vertex->mesh;
-			EXIT_NOT_IMPLEMENTED(options.wave_size != 64u || mesh.primitives_per_group == 0u ||
-			                     mesh.vertices_per_group > 64u || total_threads > 15u * 64u);
+			if ((options.wave_size != 32u && options.wave_size != 64u) ||
+			    mesh.primitives_per_group == 0u ||
+			    mesh.vertices_per_group > 64u || total_threads > 15u * options.wave_size) {
+				EXIT("unsupported mesh dimensions: wave_size=%u primitives_per_group=%u "
+				     "vertices_per_group=%u total_threads=%u\n",
+				     options.wave_size, mesh.primitives_per_group, mesh.vertices_per_group,
+				     total_threads);
+			}
+			const auto wave_size = options.wave_size;
 			const auto u32  = [](uint32_t value) { return IR::U32(IR::Value(value)); };
 			const auto draw = [&](uint32_t index) {
 				return IR::U32(
@@ -1089,17 +1096,29 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			    entry_ir.IAdd(IR::U32(entry_ir.Emit(IR::ValueOpcode::UDiv32,
 			                                       {subtract_saturate(vertices, size), step})),
 			                  u32(1)));
-			const auto wave            = entry_ir.ShiftRightLogical(local, u32(6));
-			const auto wave_base       = entry_ir.BitwiseAnd(local, u32(~63u));
-			const auto vertex_count    = minimum(subtract_saturate(vertices, wave_base), u32(64));
-			const auto primitive_count = minimum(subtract_saturate(primitives, wave_base), u32(64));
+			const auto wave       = entry_ir.ShiftRightLogical(local, u32(wave_size == 64u ? 6u : 5u));
+			const auto wave_base  = entry_ir.BitwiseAnd(local, u32(~(wave_size - 1u)));
+			const auto vertex_count =
+			    minimum(subtract_saturate(vertices, wave_base), u32(wave_size));
+			const auto primitive_count =
+			    minimum(subtract_saturate(primitives, wave_base), u32(wave_size));
 			const auto wave_info = entry_ir.BitwiseOr(entry_ir.ShiftLeftLogical(wave, u32(24)),
-			                                          u32(((total_threads + 63u) / 64u) << 28u));
+			                                          u32(((total_threads + wave_size - 1u) / wave_size)
+			                                              << 28u));
 			entry_ir.SetScalarReg(
 			    static_cast<IR::ScalarReg>(3),
 			    entry_ir.BitwiseOr(wave_info, entry_ir.BitwiseOr(entry_ir.ShiftLeftLogical(
 			                                                         primitive_count, u32(8)),
 			                                                     vertex_count)));
+			if (mesh.passthrough_alloc) {
+				entry_ir.SetScalarReg(
+				    static_cast<IR::ScalarReg>(2),
+				    entry_ir.BitwiseOr(
+				        entry_ir.ShiftLeftLogical(
+				            primitives, u32(ShaderMeshInputInfo::ALLOCATION_PRIMITIVE_SHIFT)),
+				        entry_ir.ShiftLeftLogical(
+				            vertices, u32(ShaderMeshInputInfo::ALLOCATION_VERTEX_SHIFT))));
+			}
 			// GS adjacency addresses local ES records in LDS. Fans retain the draw's
 			// center in every subgroup; strip winding follows the global primitive.
 			const auto vertex = entry_ir.IMul(local, step);
@@ -1121,11 +1140,20 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				first = entry_ir.IAdd(first, parity);
 				second = entry_ir.ISub(second, parity);
 			}
-			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(0),
-			                      entry_ir.BitwiseOr(entry_ir.ShiftLeftLogical(first, u32(2)),
-			                                         entry_ir.ShiftLeftLogical(second, u32(18))));
-			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(1),
-			                      entry_ir.ShiftLeftLogical(third, u32(2)));
+			if (mesh.passthrough_alloc) {
+				entry_ir.SetVectorReg(
+				    static_cast<IR::VectorReg>(0),
+				    entry_ir.BitwiseOr(
+				        first, entry_ir.BitwiseOr(entry_ir.ShiftLeftLogical(second, u32(10)),
+				                                  entry_ir.ShiftLeftLogical(third, u32(20)))));
+			} else {
+				entry_ir.SetVectorReg(
+				    static_cast<IR::VectorReg>(0),
+				    entry_ir.BitwiseOr(entry_ir.ShiftLeftLogical(first, u32(2)),
+				                       entry_ir.ShiftLeftLogical(second, u32(18))));
+				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(1),
+				                      entry_ir.ShiftLeftLogical(third, u32(2)));
+			}
 			const auto index_bytes  = draw(3);
 			const auto indexed      = entry_ir.INotEqual(index_bytes, u32(0));
 			const auto index_low    = draw(4);

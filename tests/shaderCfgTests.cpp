@@ -9986,6 +9986,98 @@ void TestMeshInputAssembly() {
   }
 }
 
+void TestMeshWave32Passthrough() {
+  using namespace ShaderRecompiler;
+  using namespace ShaderRecompiler::IR;
+  const uint32_t shader[] = {
+      EncodeSMovB32(12, 255), 0x1003u,
+      EncodeSMovB32(124, 12), EncodeSopp(0x10, 9),
+      EncodeExp0(0x0c, 0xf, false), EncodeExp1(0, 0, 0, 0),
+      EncodeExp0(0x14, 0x1), EncodeExp1(0, 0, 0, 0),
+      EncodeSopp(0x01),
+  };
+  ShaderVertexInputInfo input{};
+  input.logical_stage = ShaderType::Mesh;
+  input.mesh.wave_size = 32;
+  input.mesh.host_subgroup_size = 32;
+  input.mesh.threads_num[0] = 64;
+  input.mesh.threads_num[1] = input.mesh.threads_num[2] = 1;
+  input.mesh.input_primitive = static_cast<uint32_t>(Prospero::PrimitiveType::kTriList);
+  input.mesh.primitives_per_group = 1;
+  input.mesh.vertices_per_group = 3;
+  input.mesh.max_primitives = 1;
+  input.mesh.max_vertices = 3;
+  input.mesh.passthrough_alloc = true;
+  CompileOptions options{};
+  options.stage = ShaderType::Mesh;
+  options.wave_size = 32;
+  options.input_info.vertex = &input;
+  const auto result = RecompileForTest(shader, options);
+  CheckSpirvBinaryValidates(result.spirv);
+  const auto source = DisassembleSpirvBinary(result.spirv);
+  Check(source.find("OpSetMeshOutputsEXT") != std::string::npos,
+        "wave32 passthrough did not emit mesh output sizing");
+  Check(source.find("OpGroupNonUniformBallot") == std::string::npos,
+        "wave32 passthrough retained wave64 half-wave ballot");
+
+  Decoder::Program decoded;
+  CFG::Graph graph;
+  CFG::BasicBlock block;
+  block.id = 0;
+  block.terminator.kind = CFG::TerminatorKind::Return;
+  graph.blocks.push_back(std::move(block));
+  graph.entry_block = 0;
+  Frontend::TranslateOptions translate_options{};
+  translate_options.stage = ShaderType::Mesh;
+  translate_options.wave_size = 32;
+  translate_options.user_data_count = 0;
+  translate_options.input_info.vertex = &input;
+  auto program = Frontend::TranslateProgram(decoded, graph, translate_options);
+  const uint32_t draw[] = {3, 17, 5, 0, 0, 0};
+  for (auto &ir_block : program.blocks) {
+    for (auto &inst : *ir_block) {
+      if (inst.GetOpcode() == ValueOpcode::MeshDrawParameter) {
+        Check(inst.Arg(0).GetType() == Type::U32,
+              "wave32 passthrough draw parameter index is not U32");
+        inst.ReplaceUsesWith(Value(draw[inst.Arg(0).U32()]));
+      } else if (inst.GetOpcode() == ValueOpcode::GetBuiltin) {
+        const auto kind = static_cast<StageInputKind>(inst.Arg(0).U32());
+        const uint32_t value = kind == StageInputKind::LocalInvocationIndex ? 2 : 0;
+        inst.ReplaceUsesWith(Value(value));
+      }
+    }
+  }
+  RewriteToSsa(program.blocks);
+  ConstantPropagationPass(program.blocks);
+  uint32_t sgpr2 = 0;
+  uint32_t sgpr3 = 0;
+  uint32_t vgpr0 = 0;
+  for (const auto *ir_block : program.blocks) {
+    for (const auto &inst : *ir_block) {
+      if (inst.GetOpcode() == ValueOpcode::SetScalarRegister) {
+        const auto reg = RegIndex(inst.Arg(0).ScalarRegister());
+        if (reg == 2 || reg == 3) {
+          const auto value = inst.Arg(1).Resolve();
+          Check(value.IsImmediate() && value.GetType() == Type::U32,
+                "wave32 passthrough scalar ABI did not fold to a constant");
+          (reg == 2 ? sgpr2 : sgpr3) = value.U32();
+        }
+      } else if (inst.GetOpcode() == ValueOpcode::SetVectorRegister &&
+                 RegIndex(inst.Arg(0).VectorRegister()) == 0) {
+        const auto value = inst.Arg(1).Resolve();
+        Check(value.IsImmediate() && value.GetType() == Type::U32,
+              "wave32 passthrough packed indices did not fold to a constant");
+        vgpr0 = value.U32();
+      }
+    }
+  }
+  Check(sgpr2 == 0x00403000u,
+        "wave32 passthrough did not generate the s2 allocation ABI");
+  Check(sgpr3 == 0x20000103u, "wave32 passthrough changed the s3 wave/count ABI");
+  Check(vgpr0 == (6u | (7u << 10u) | (8u << 20u)),
+        "wave32 passthrough changed packed triangle indices");
+}
+
 void TestNewShaderRecompilerSetpcJumpTable() {
   const uint32_t shader[] = {
       EncodeSop2(0x07, 0, 0, 129), // s_min_u32 s0, s0, 1
@@ -13570,6 +13662,7 @@ int main() {
   TestMeshExportStorage();
   TestMergedShaderUserDataSnapshot();
   TestMeshInputAssembly();
+  TestMeshWave32Passthrough();
   TestEmbeddedFetchPreservesSharedScalarLoad();
   TestEmbeddedVertexFormatSwizzle();
   TestNewShaderRecompilerSetpcJumpTable();

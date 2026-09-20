@@ -196,6 +196,8 @@ void RenderExecutor::ExecutePerVertexPrototype(uint64_t submit_id, CommandBuffer
 		uint32_t format_kind = 0;
 		if (descriptor.Format() == Prospero::BufferFormat::k16_16_16_16Float) {
 			format_kind = 3;
+		} else if (descriptor.Format() == Prospero::BufferFormat::k16_16_16_16SNorm) {
+			format_kind = 2;
 		} else if (format_info.type == ShaderRecompiler::Format::ComponentType::Float) {
 			format_kind = 1;
 		}

@@ -88,7 +88,9 @@ bool DecodePerVertexPrototypeAttribute(Prospero::BufferFormat   format,
 	using Type      = ShaderRecompiler::Format::ComponentType;
 	if (info.component_count == 0 || info.component_count > 4 || bytes.size() < info.byte_size)
 		return false;
-	if (info.type != Type::Float && info.type != Type::Unorm) return false;
+	if (info.type != Type::Float && info.type != Type::Unorm &&
+	    !(format == Prospero::BufferFormat::k16_16_16_16SNorm && info.type == Type::Snorm))
+		return false;
 	for (uint32_t c = 0; c < info.component_count; ++c) {
 		if (info.type == Type::Float && format != Prospero::BufferFormat::k16_16_16_16Float &&
 		    info.component_bits[c] != 32)
@@ -97,6 +99,8 @@ bool DecodePerVertexPrototypeAttribute(Prospero::BufferFormat   format,
 			return false;
 		if (info.type == Type::Unorm &&
 		    (info.component_bits[c] == 0 || info.component_bits[c] > 16))
+			return false;
+		if (format == Prospero::BufferFormat::k16_16_16_16SNorm && info.component_bits[c] != 16)
 			return false;
 	}
 	for (uint32_t c = 0; c < 4; ++c) {
@@ -108,6 +112,11 @@ bool DecodePerVertexPrototypeAttribute(Prospero::BufferFormat   format,
 				value = HalfToFloatBits(raw);
 			} else if (info.type == Type::Float) {
 				std::memcpy(&value, bytes.data() + info.component_bit_offset[c] / 8, 4);
+			} else if (format == Prospero::BufferFormat::k16_16_16_16SNorm) {
+				int16_t raw = 0;
+				std::memcpy(&raw, bytes.data() + info.component_bit_offset[c] / 8, sizeof(raw));
+				value =
+				    std::bit_cast<uint32_t>(std::max(static_cast<float>(raw) / 32767.0f, -1.0f));
 			} else {
 				uint32_t raw = 0;
 				for (uint32_t bit = 0; bit < info.component_bits[c]; ++bit) {

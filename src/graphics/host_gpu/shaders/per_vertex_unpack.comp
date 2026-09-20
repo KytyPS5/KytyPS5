@@ -85,6 +85,10 @@ vec4 DecodeAttribute(uint vertex_id, uint attribute_index) {
 		uint bit_count  = (info.bit_counts >> (component << 3u)) & 0xffu;
 		if (format_kind == 1u) {
 			result[component] = uintBitsToFloat(ReadBits(byte_base, bit_offset, 32u));
+		} else if (format_kind == 2u) {
+			uint raw = ReadBits(byte_base, bit_offset, 16u);
+			int signed_raw = (raw & 0x8000u) != 0u ? int(raw & 0x7fffu) - 32768 : int(raw);
+			result[component] = max(float(signed_raw) / 32767.0, -1.0);
 		} else if (format_kind == 3u) {
 			result[component] = unpackHalf2x16(ReadBits(byte_base, bit_offset, 16u)).x;
 		} else {

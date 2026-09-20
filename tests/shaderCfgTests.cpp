@@ -6126,6 +6126,15 @@ void TestPerVertexPrototypeDetection() {
             decoded[0] == 0x3f800000u && decoded[1] == 0xc0000000u &&
             decoded[2] == 0x7f800000u && decoded[3] == 0x7fc02000u,
         "float16 normal or special words were not converted bit-exact");
+  const int16_t snorm_words[] = {INT16_MIN, INT16_MAX, 0, -16384};
+  std::array<uint8_t, 8> snorm_bytes{};
+  std::memcpy(snorm_bytes.data(), snorm_words, sizeof(snorm_words));
+  Check(DecodePerVertexPrototypeAttribute(Prospero::BufferFormat::k16_16_16_16SNorm,
+                                          snorm_bytes, decoded) &&
+            decoded[0] == 0xbf800000u && decoded[1] == 0x3f800000u &&
+            decoded[2] == 0u &&
+            decoded[3] == std::bit_cast<uint32_t>(-16384.0f / 32767.0f),
+        "snorm16 signed endpoints or intermediate value were not normalized");
   Check(!DecodePerVertexPrototypeAttribute(Prospero::BufferFormat::k32_32_32_32Float,
                                            std::span<const uint8_t>(float_bytes.data(), 12u), decoded),
         "a short attribute span was decoded");

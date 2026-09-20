@@ -615,6 +615,62 @@ int main() {
     base_push.attrs[3].bit_counts = 0x10101010u;
     base_push.attrs[3].bit_offsets = 0x30201000u;
 
+    // Generated unpack shader fixture for signed 16-bit normalization.
+    constexpr int16_t kSnormValues[4] = {INT16_MIN, INT16_MAX, 0, -16384};
+    GpuBuffer snorm_buf = CreateBuffer(dev, sizeof(kSnormValues), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    std::memcpy(snorm_buf.mapped, kSnormValues, sizeof(kSnormValues));
+    const VkDescriptorBufferInfo snorm_dbi {snorm_buf.buffer, 0, sizeof(kSnormValues)};
+    VkWriteDescriptorSet snorm_write {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    snorm_write.dstSet = desc_set;
+    snorm_write.dstBinding = 1;
+    snorm_write.descriptorCount = 1;
+    snorm_write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    snorm_write.pBufferInfo = &snorm_dbi;
+    vk_update_descriptor_sets(dev.device, 1, &snorm_write, 0, nullptr);
+    PushConstants snorm_push {};
+    snorm_push.total_invocations = 1;
+    snorm_push.index_count = 1;
+    snorm_push.vertex_stride = sizeof(kSnormValues);
+    snorm_push.num_records = 1;
+    snorm_push.packed_flags = 1u << 19u;
+    snorm_push.attrs[0].meta = (4u << 17u) | (2u << 20u);
+    snorm_push.attrs[0].bit_counts = 0x10101010u;
+    snorm_push.attrs[0].bit_offsets = 0x30201000u;
+    std::memset(id_buf.mapped, 0xcd, id_buf.size);
+    std::memset(attr_buf.mapped, 0xcd, attr_buf.size);
+    VkCommandBufferBeginInfo snorm_begin {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    Check(vk_begin_command_buffer(cmd, &snorm_begin), "vkBeginCommandBuffer SNORM16");
+    vk_cmd_bind_pipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+    vk_cmd_bind_descriptor_sets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout, 0, 1, &desc_set, 0, nullptr);
+    vk_cmd_push_constants(cmd, pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(snorm_push), &snorm_push);
+    vk_cmd_dispatch(cmd, 1, 1, 1);
+    Check(vk_end_command_buffer(cmd), "vkEndCommandBuffer SNORM16");
+    VkSubmitInfo snorm_submit {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    snorm_submit.commandBufferCount = 1;
+    snorm_submit.pCommandBuffers = &cmd;
+    Check(vk_queue_submit(dev.queue, 1, &snorm_submit, VK_NULL_HANDLE), "vkQueueSubmit SNORM16");
+    Check(vk_queue_wait_idle(dev.queue), "vkQueueWaitIdle SNORM16");
+    const float* snorm_result = reinterpret_cast<const float*>(attr_buf.mapped);
+    for (int c = 0; c < 4; ++c) {
+        const float normalized = static_cast<float>(kSnormValues[c]) / 32767.0f;
+        const float expected = normalized < -1.0f ? -1.0f : normalized;
+        const float actual = snorm_result[c];
+        const bool within_one_ulp = actual == expected || actual == std::nextafter(expected, -INFINITY) ||
+                                    actual == std::nextafter(expected, INFINITY);
+        if (!within_one_ulp) {
+            std::fprintf(stderr, "SNORM16 mismatch at component %d: expected %a got %a\n", c, expected, actual);
+            Fail("GPU SNORM16 fixture exceeded one ULP");
+        }
+    }
+    std::printf("PASS: SNORM16 GPU fixture (INT16_MIN/MAX, zero, intermediate within one ULP)\n");
+    VkWriteDescriptorSet restore_vertex_write {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    restore_vertex_write.dstSet = desc_set;
+    restore_vertex_write.dstBinding = 1;
+    restore_vertex_write.descriptorCount = 1;
+    restore_vertex_write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    restore_vertex_write.pBufferInfo = &dbi[1];
+    vk_update_descriptor_sets(dev.device, 1, &restore_vertex_write, 0, nullptr);
+
     // Test 1: Non-indexed draw with first_vertex=2, count=5
     {
         PushConstants push = base_push;

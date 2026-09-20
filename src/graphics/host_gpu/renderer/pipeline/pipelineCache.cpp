@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
+#include "graphics/host_gpu/renderer/pipeline/unfoldableSet.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
@@ -31,6 +32,7 @@
 #include <fmt/format.h>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <spirv-tools/libspirv.hpp>
 #include <string_view>
@@ -244,8 +246,12 @@ bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
 	return false;
 }
 
+// Drivers do not return from building huge dispatcher-fallback modules (RE9 lighting PS).
+constexpr size_t MaxDispatcherSpirvWords = 131072;
+
 // A VkPipelineCache cannot evict, so past this size the blob on disk stops growing.
 constexpr uint64_t MaxDriverCacheBytes = uint64_t {1} << 30u;
+
 } // namespace
 
 std::size_t PipelineCache::GraphicsPipelineKeyHash::operator()(const GraphicsPipelineKey& key) const {
@@ -280,6 +286,7 @@ struct PipelineCache::ProgramCache {
 		uint64_t              hash            = 0;
 		uint32_t              user_data_count = 0;
 		uint32_t              code_size       = 0;
+		uint32_t              unfoldable_generation = 0;
 		std::vector<uint32_t> static_state;
 
 		bool operator==(const ProgramKey&) const = default;
@@ -392,6 +399,7 @@ struct PipelineCache::ProgramCache {
 			}
 			PipelineKeyHash::Mix(hash, key.user_data_count);
 			PipelineKeyHash::Mix(hash, key.code_size);
+			PipelineKeyHash::Mix(hash, key.unfoldable_generation);
 			PipelineKeyHash::Mix(hash, key.static_state.size());
 			// Bucket same-shape static variants by source. ProgramKey equality performs the one
 			// exact state comparison needed on a stable hit without hashing the full state first.
@@ -400,6 +408,7 @@ struct PipelineCache::ProgramCache {
 	};
 
 	static constexpr std::size_t MaxStaticKeyWords = 32 + ShaderVertexInputInfo::RES_MAX * 6;
+	static constexpr uint32_t    MaxRelearnDepth   = 8;
 
 	Permutation CompilePermutation(const char*                                  stage_name,
 	                               const ShaderRecompiler::CompileOptions&      options,
@@ -407,6 +416,8 @@ struct PipelineCache::ProgramCache {
 	                               ShaderRecompiler::IR::ResourceSpecialization specialization,
 	                               uint32_t push_data_start_dword,
 	                               std::span<const uint32_t> function_code) {
+		const bool                         dispatcher  = translated.program.dispatcher_fallback;
+		const auto                         block_count = translated.program.blocks.size();
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::ShadersCompiled,
 		                                         Common::DebugCounters::Counter::ShaderCompileNs,
 		                                         Common::DebugCounters::Peak::ShaderCompileNs);
@@ -416,6 +427,15 @@ struct PipelineCache::ProgramCache {
 			Permutation rejected;
 			rejected.specialization = std::move(specialization);
 			rejected.reason         = std::move(result.status.reason);
+			return rejected;
+		}
+		if (dispatcher && result.spirv.size() > MaxDispatcherSpirvWords) {
+			Permutation rejected;
+			rejected.specialization = std::move(specialization);
+			rejected.reason         = fmt::format(
+			    "unstructured control flow emitted {} SPIR-V words over {} blocks, past the {} a "
+			    "host pipeline build is trusted with",
+			    result.spirv.size(), block_count, MaxDispatcherSpirvWords);
 			return rejected;
 		}
 		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv,
@@ -439,6 +459,32 @@ struct PipelineCache::ProgramCache {
 		};
 	}
 
+	// Guest code can be rewritten under one declared hash.
+	static uint64_t ShaderCodeKey(std::span<const uint32_t> code,
+	                              std::span<const uint32_t> back_code) {
+		auto key = XXH3_64bits(code.data(), code.size_bytes());
+		if (!back_code.empty()) {
+			const auto back = XXH3_64bits(back_code.data(), back_code.size_bytes());
+			key             = XXH3_64bits_withSeed(&back, sizeof(back), key);
+		}
+		return key;
+	}
+
+	template <typename InputInfo>
+	ShaderProgram Unmaterialized(const ShaderParams& params, InputInfo& input_info,
+	                             uint32_t& push_data_cursor, ShaderType stage, uint64_t code_size,
+	                             uint64_t code_key, std::span<const uint32_t> refused) {
+		static thread_local uint32_t depth = 0;
+		if (depth >= MaxRelearnDepth || !unfoldable.Learn(code_size, code_key, refused)) {
+			ReportUnmaterialized(stage, params.hash);
+			return {};
+		}
+		++depth;
+		auto program = Get(params, input_info, push_data_cursor);
+		--depth;
+		return program;
+	}
+
 	template <typename InputInfo>
 	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info,
 	                  uint32_t& push_data_cursor) {
@@ -457,6 +503,16 @@ struct PipelineCache::ProgramCache {
 		lookup_key.hash            = params.hash;
 		lookup_key.user_data_count = params.user_data_count;
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
+		const auto              code_size = UnfoldableCodeSize(params.code, params.back_code);
+		std::optional<uint64_t> code_key;
+		const auto              key = [&] {
+			if (!code_key.has_value()) {
+				code_key = ShaderCodeKey(params.code, params.back_code);
+			}
+			return *code_key;
+		};
+		const auto& proven               = unfoldable.Find(code_size, key);
+		lookup_key.unfoldable_generation = proven.generation;
 		BuildStageStaticKey(input_info, lookup_key.static_state);
 		auto                                         entry = programs.find(lookup_key);
 		ShaderRecompiler::IR::SrtRuntime             runtime {
@@ -516,6 +572,9 @@ struct PipelineCache::ProgramCache {
 		options.emit_debug_info = Config::GraphicsDebugDumpEnabled();
 		options.dump_label  = label;
 		options.input_info  = stage_input;
+		options.host_subgroup_size = host_subgroup_size;
+		options.unfoldable_pcs        = proven.pcs;
+		const bool channel_rebuild    = !options.unfoldable_pcs.empty();
 
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			options.user_data_base = 8;
@@ -580,6 +639,7 @@ struct PipelineCache::ProgramCache {
 		if (!entry->second.permutations.back().handle) {
 			const auto reason = std::move(entry->second.permutations.back().reason);
 			entry->second.permutations.pop_back();
+			refuse(0, reason);
 			return {};
 		}
 		input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
@@ -622,6 +682,7 @@ struct PipelineCache::ProgramCache {
 	}
 
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
+	UnfoldableSets                                              unfoldable;
 	std::unordered_set<uint64_t>                                reported_shaders;
 	std::unordered_set<uint64_t>                                stubbed_shaders;
 	ProgramKey                                                  lookup_key;

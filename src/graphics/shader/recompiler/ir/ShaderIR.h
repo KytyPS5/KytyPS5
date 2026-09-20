@@ -703,6 +703,7 @@ struct ResourcePlan {
 	bool                                capture_specialization_reads = false;
 	bool                                srt_plan_complete          = false;
 	bool                                resource_tracking_complete = false;
+	// `first_use_pc` of each resource a materialization proved the host cannot re-evaluate.
 	ShaderInfo                          info;
 	UniformFillPlan                     uniform_fill;
 	std::unique_ptr<Xbyak::CodeGenerator> srt_code;

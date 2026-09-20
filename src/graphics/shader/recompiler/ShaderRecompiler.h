@@ -31,6 +31,10 @@ struct CompileOptions {
 	std::span<const uint32_t>   user_data;
 	std::span<const uint32_t>   back_code;
 	ShaderStageInputInfo        input_info;
+	// VK_EXT_robustness2 on the device: buffer accesses then need no range test of their own.
+	bool robust_buffer_access2 = false;
+	// See IR::ResourcePlan::unfoldable_pcs.
+	std::span<const uint32_t> unfoldable_pcs;
 // A guest shader the recompiler refuses; the caller drops its draws.
 struct RecompileStatus {
 	bool        ok = true;

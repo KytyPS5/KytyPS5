@@ -942,7 +942,8 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 			     MakeIrDump(cfg_dump, ir).c_str());
 		}
 	}
-	IR::TrackResources(ir, decoded, native_cfg, options.input_info);
+	ir.robust_buffer_access2 = options.robust_buffer_access2;
+	ir.unfoldable_pcs.assign(options.unfoldable_pcs.begin(), options.unfoldable_pcs.end());
 	TranslateResult result;
 	if (!tracking.ok) {
 		result.status.ok     = false;

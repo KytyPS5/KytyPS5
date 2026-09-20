@@ -220,6 +220,8 @@ private:
 	void                      UntrackImageTail(ImageId id);
 	void                      MarkAsMaybeDirty(ImageId id, Image& image);
 	void                      TrackImageDownload(ImageId id, Image& image);
+	[[nodiscard]] static bool SameGuestLayout(const ImageInfo& cached,
+	                                          const ImageInfo& requested);
 	[[nodiscard]] static bool SameBacking(const ImageInfo& cached, const ImageInfo& requested,
 	                                      bool exact_format);
 	[[nodiscard]] static BindingType UploadBinding(const Image& image);
@@ -235,6 +237,15 @@ private:
 	[[nodiscard]] ImageId       StencilPlaneOwner(const ImageDesc& desc) const;
 	[[nodiscard]] OverlapResult ResolveOverlap(const ImageInfo& requested, BindingType binding,
 	                                           ImageId cached, ImageId merged);
+	// An overlap the lookup cannot resolve into one surface has to displace the cached image, or
+	// two owners answer for the same guest bytes and the merge loop walks both. Freeing is the
+	// cheap way to displace it, and it is correct only while guest memory can still reproduce
+	// the pixels. When it cannot, park the image instead of destroying it.
+	void                        RetireOverlap(ImageId id, bool abandoned);
+	[[nodiscard]] bool          ParkImage(ImageId id);
+	// Re-admit a parked image and put down whatever claimed its bytes while it was away.
+	bool                        UnparkImage(ImageId id);
+	void                        WakeImage(ImageId id, const ImageIds& candidates);
 	[[nodiscard]] ImageId       ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
 	                                                ImageId cached);
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);

@@ -170,6 +170,11 @@ public:
 	ImageUsage       usage;
 	ImageBinding     binding;
 	bool             registered     = false;
+	// Parked: still registered, still tracked, still collectable, but no longer an answer to an
+	// overlapping lookup. A conflicting surface took the guest bytes over; this image keeps the
+	// pixels nobody else can reproduce and steps out of the candidate walk until an exact
+	// backing match asks for it again.
+	bool             dormant        = false;
 	mutable uint32_t query_epoch    = 0;
 	uint64_t         track_addr     = 0;
 	uint64_t         track_addr_end = 0;

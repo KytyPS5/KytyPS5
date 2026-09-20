@@ -50,6 +50,35 @@ constexpr uint64_t NumFramesBeforeRemoval = 32;
 	return !image.info.IsTiled();
 }
 
+// One emergency reclaim runs with a draw half-built, so it is capped rather than allowed to sweep
+// the whole cache.
+constexpr size_t MaxEmergencyReclaimImages = 256;
+
+// Retiring an overlap victim asks a different question from SafeToDownload's, and the difference
+// only shows on a tiled image. SafeToDownload answers "may these pixels be written back to guest
+// memory", so a dirty page under the image makes it say no: the guest may have put newer bytes
+// there. Retiring asks "can anything reproduce these pixels once they are gone", and for a tiled
+// image the answer is no whatever the page says - TrackImageDownload declines one, and the only
+// thing that downloads one is the collector's eviction step, which frees it in the same pass, so
+// guest memory has never held a surviving tiled image's pixels.
+//
+// Maybe-dirty is only a suspicion: a guest write landed somewhere in the same tracker page, not
+// necessarily in the image, and RefreshImage settles it with HashGuestEdges the next time the
+// image is looked up. Freeing here destroys the image before that test can run. A definite CPU
+// write is a different matter - the guest really did put bytes there and the upload path de-tiles
+// them, so the image is reproducible and SafeToDownload's answer stands. So is a buffer-modified
+// one: those guest bytes were GPU-written and the upload path reads them back.
+//
+// RESIDENT EVIL REQUIEM's clustered light grid is the case this exists for: a 15x9x32 tiled 3D
+// surface a compute pass writes every frame, in a 64 KiB pool slot it shares with a depth target
+// and several 2D surfaces that claim the same base address. It is maybe-dirty most of the time
+// because that slot sits in a page the guest keeps writing, so every overlap used to free it and
+// the replacement decoded a zero light count for every cluster.
+[[nodiscard]] bool OverlapVictimPixelsAreUnrecoverable(const Image& image) {
+	return image.IsGpuModified() && !image.IsBufferModified() && !image.IsDefinitelyCpuDirty() &&
+	       !ImageOwnsGuestBytes(image);
+}
+
 [[nodiscard]] bool DecodeColorClear(const TextureCache::ImageDesc& desc, uint8_t code,
                                     vk::ClearColorValue& clear) {
 	const auto& metadata = desc.info.metadata;
@@ -201,8 +230,7 @@ TextureCache::~TextureCache() {
 	});
 }
 
-bool TextureCache::SameBacking(const ImageInfo& cached, const ImageInfo& requested,
-                               bool exact_format) {
+bool TextureCache::SameGuestLayout(const ImageInfo& cached, const ImageInfo& requested) {
 	if (cached.data.address != requested.data.address) {
 		return false;
 	}
@@ -225,11 +253,21 @@ bool TextureCache::SameBacking(const ImageInfo& cached, const ImageInfo& request
 	if (cached.tile_mode != requested.tile_mode) {
 		return false;
 	}
+	if (cached.type != requested.type) {
+		return false;
+	}
+	return true;
+}
+
+bool TextureCache::SameBacking(const ImageInfo& cached, const ImageInfo& requested,
+                               bool exact_format) {
+	if (!SameGuestLayout(cached, requested)) {
+		return false;
+	}
 	if (cached.GetColorTransform() != requested.GetColorTransform()) {
 		return false;
 	}
-	if (!ImageViewOps::FormatsCompatible(cached.pixel_format, requested.pixel_format) ||
-	    cached.type != requested.type) {
+	if (!ImageViewOps::FormatsCompatible(cached.pixel_format, requested.pixel_format)) {
 		return false;
 	}
 	if (exact_format && cached.pixel_format != requested.pixel_format) {
@@ -921,53 +959,86 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	return replacement_id;
 }
 
-namespace BcAlias {
-
-bool Matches(const ImageInfo& requested, const ImageInfo& cached) {
-	return requested.guest_format != cached.guest_format &&
-	       requested.IsBlock() != cached.IsBlock() &&
-	       requested.tile_mode == cached.tile_mode &&
-	       requested.bytes_per_block == cached.bytes_per_block &&
-	       requested.samples == 1 && cached.samples == 1 &&
-	       (requested.data != cached.data || requested.resources != cached.resources ||
-	        requested.BlockExtent() != cached.BlockExtent()) &&
-	       !TextureCache::SameBacking(cached, requested, false);
-}
-
-bool Publish(TextureCache& cache, Image& image) {
-	if (!cache.CanDownload(image)) {
+bool TextureCache::ParkImage(ImageId id) {
+	auto owner = m_slot_images.try_get(id);
+	if (owner == nullptr || !owner->registered || owner->dormant) {
 		return false;
 	}
-	// ObtainBuffer preserves padding and records ownership before the GPU-only transfer.
-	auto [buffer, offset] =
-	    cache.m_buffer_cache.ObtainBuffer(image.info.data.address, image.info.data.size, true);
-	cache.DownloadImage(image, *buffer, offset, image.info.data.size, image.info.resources.levels);
-	image.ClearGpuModified();
-	image.MarkBufferModified();
+	if (owner->depth_id) {
+		// A stencil proxy is reached through its depth image, not through a range lookup, so
+		// parking one would hide it from nothing and strand the association.
+		return false;
+	}
+	// Registration, page tracking and LRU membership all stay: the collector must still be able
+	// to reclaim this image, a guest write must still dirty it, and an unmap must still free it.
+	// The only thing parking removes is its standing as an answer to an overlapping lookup.
+	owner->dormant = true;
+	if (owner->binding.is_bound || owner->binding.is_target) {
+		owner->binding.needs_rebind = true;
+	}
 	return true;
 }
 
-void Resolve(TextureCache& cache, ImageId cached_id, ImageId merged_id) {
-	auto& cached = cache.m_slot_images[cached_id];
-	auto* merged = merged_id ? &cache.m_slot_images[merged_id] : nullptr;
-	// PS5 raw block images can span several packed BC mips. Transfer their complete
-	// guest bytes, including tail padding, before retiring the incompatible backing.
-	if (cached.SafeToDownload()) {
-		if (merged && merged->SafeToDownload() && !Publish(cache, *merged)) {
-			return;
-		}
-		if (!Publish(cache, cached)) {
-			return;
-		}
-		if (merged) {
-			merged->MarkBufferModified();
-		}
+// Readmits a parked image to the overlap walk, deciding nothing about what displaced it.
+bool TextureCache::UnparkImage(ImageId id) {
+	auto owner = m_slot_images.try_get(id);
+	if (owner == nullptr || !owner->dormant) {
+		return false;
 	}
-	cached.binding.needs_rebind |= cached.binding.is_bound || cached.binding.is_target;
-	cache.FreeImage(cached_id);
+	owner->dormant = false;
+	return true;
 }
 
-} // namespace BcAlias
+void TextureCache::WakeImage(ImageId id, const ImageIds& candidates) {
+	if (!UnparkImage(id)) {
+		return;
+	}
+	auto owner = m_slot_images.try_get(id);
+	const auto address = owner->info.data.address;
+	const auto size    = owner->info.data.size;
+	candidates.ForEach([&](ImageId other) {
+		if (other == id) {
+			return;
+		}
+		auto conflict = m_slot_images.try_get(other);
+		if (conflict == nullptr || conflict->dormant || !conflict->registered) {
+			return;
+		}
+		// Bindings are draw-scoped, and a draw can hold two overlapping surfaces at one address -
+		// SILENT HILL f samples a surface and its half-size twin in one compute dispatch.
+		// Displacing either makes the pair alternate forever, so neither may displace the other.
+		if (conflict->binding.is_target || conflict->binding.is_bound ||
+		    !conflict->Overlaps(address, size)) {
+			return;
+		}
+		// Whatever displaced this image is now the one displaced. Parking never destroys, so the
+		// exchange can run every frame without either surface losing its pixels.
+		(void)ParkImage(other);
+	});
+}
+
+void TextureCache::RetireOverlap(ImageId id, bool abandoned) {
+	auto owner = m_slot_images.try_get(id);
+	if (owner == nullptr || owner->dormant) {
+		return;
+	}
+	// SafeToDownload is the test for "guest memory does not hold these pixels": the image has GPU
+	// writes and nothing newer has landed underneath it. This overlap has no layout relation to
+	// copy them through - a partial overlap at a foreign offset, a different block size, a
+	// different tile mode - so freeing loses them outright, and the object drawn from this
+	// surface goes black until something renders into it again.
+	//
+	// A tiled image adds one case SafeToDownload gets wrong here, because it answers about
+	// writing back rather than about reproducing: guest memory has never held a tiled image's
+	// pixels, so a merely suspected write under it is no reason to throw them away.
+	if ((owner->SafeToDownload() || OverlapVictimPixelsAreUnrecoverable(*owner)) &&
+	    ParkImage(id)) {
+		return;
+	}
+	if (abandoned) {
+		FreeImage(id);
+	}
+}
 
 TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& requested,
                                                          BindingType binding, ImageId cached_id,
@@ -995,17 +1066,8 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		// a level into or out of the mip tail. These are separate guest layouts.
 		if (requested.tile_mode != cached.info.tile_mode ||
 		    (requested.resources == cached.info.resources &&
-		     !std::equal(requested.mip_layout.begin(), requested.mip_layout.end(),
-		                 cached.info.mip_layout.begin(),
-		                 [](const ImageMipInfo& left, const ImageMipInfo& right) {
-			                 return left.offset == right.offset && left.size == right.size &&
-			                        left.pitch == right.pitch && left.height == right.height &&
-			                        left.tail_x == right.tail_x && left.tail_y == right.tail_y &&
-			                        left.surface_z == right.surface_z;
-		                 }))) {
-			if (safe_to_delete) {
-				FreeImage(cached_id);
-			}
+		     requested.mip_layout != cached.info.mip_layout)) {
+			RetireOverlap(cached_id, safe_to_delete);
 			return {merged_id};
 		}
 		if (requested.GetColorTransform() != cached.info.GetColorTransform()) {
@@ -1088,8 +1150,10 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		FreeImage(cached_id);
 		return {merged_id};
 	}
-	if (requested.data.address >= cached.info.data.address && safe_to_delete) {
-		FreeImage(cached_id);
+	if (requested.data.address >= cached.info.data.address) {
+		// Park it rather than free it: nothing can reproduce a victim whose pixels only
+		// ever existed on the GPU, so it has to outlive the overlap that displaced it.
+		RetireOverlap(cached_id, safe_to_delete);
 	}
 	return {merged_id};
 }
@@ -1460,33 +1524,47 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
 		bool block_alias = false;
 
+		ImageId parked {};
+		ImageId parked_layout {};
 		for (const auto id: candidates) {
-			const auto& image = m_slot_images[id];
-			// Stencil descriptors name the associated plane; its depth owner supplies
-			// the native image and the canonical guest tiling.
-			if ((desc.type == BindingType::Texture || desc.type == BindingType::Storage) &&
-			    image.depth_id && image.info.data == desc.info.data &&
-			    m_slot_images[image.depth_id].info.samples == desc.info.samples &&
-			    image.info.extent == desc.info.extent && image.info.type == desc.info.type &&
-			    image.info.resources.levels >= desc.info.resources.levels &&
-			    image.info.resources.layers >= desc.info.resources.layers &&
-			    desc.info.bytes_per_block == 1 &&
-			    desc.info.guest_format == Prospero::BufferFormat::k8UInt) {
-				result = id;
-				break;
+			const auto image = m_slot_images.try_get(id);
+			if (image == nullptr) {
+				continue;
 			}
-			if (SameBacking(image.info, desc.info, exact_format)) {
-				result = id;
-			} else if (image.SafeToDownload() &&
-			           BcAlias::Matches(desc.info, image.info)) {
-				block_alias = true;
+			if (SameBacking(image->info, desc.info, exact_format)) {
+				// Exact backing is the one relation that hands a parked image back intact: same
+				// address, same size, same layout, compatible format. Prefer a live owner when
+				// there is one, so waking stays a last resort.
+				(image->dormant ? parked : result) = id;
+			} else if (image->dormant && SameGuestLayout(image->info, desc.info)) {
+				parked_layout = id;
 			}
+		}
+		if (!result && parked) {
+			WakeImage(parked, candidates);
+			result = parked;
+		}
+		// PPSA03541 alternates a pooled address between a depth T# and a colour one, which parks
+		// whichever surface it just left. An incompatible view format over the identical guest
+		// layout is not a different surface - it is the case the overlap walk resolves, and that
+		// walk cannot see a parked image. Wake it and let the walk judge it exactly as it would a
+		// live one, rather than building a second image over the same bytes.
+		if (!result && parked_layout) {
+			// Readmit it only: displacing the live surfaces here parks a binding the caller holds.
+			(void)UnparkImage(parked_layout);
 		}
 
 		int32_t view_mip   = -1;
 		int32_t view_layer = -1;
 		if (!result) {
 			for (const auto candidate: candidates) {
+				// A parked image speaks for nothing over this range, so it must not enter the
+				// walk: the loop feeds each result into the next, and a second owner would
+				// re-describe the request and retire the live image in its place.
+				const auto owner = m_slot_images.try_get(candidate);
+				if (owner == nullptr || owner->dormant) {
+					continue;
+				}
 				view_mip                = -1;
 				view_layer              = -1;
 				const auto& merged_info = result ? m_slot_images[result].info : desc.info;
@@ -1570,7 +1648,7 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 	ImageIds         matches;
 	for (const auto id: FindImagesInRegion(address, size, false)) {
 		auto owner = m_slot_images.try_get(id);
-		if (owner == nullptr || owner->info.data.address != address) {
+		if (owner == nullptr || owner->dormant || owner->info.data.address != address) {
 			continue;
 		}
 		if (ensure_valid && owner->depth_id) {
@@ -1602,13 +1680,29 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 	return selected;
 }
 
+static const char* RediscoveryReason(const Image& image) {
+	if (!image.registered) {
+		return "unregistered";
+	}
+	if (image.depth_id) {
+		return "stencil association";
+	}
+	return "pending rebind";
+}
+
 vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
 	TouchImage(image);
 	if (!image.info.data.Empty()) {
 		if (!image.registered || image.depth_id || image.binding.needs_rebind) {
-			EXIT("TextureCache: texture requires rediscovery before final acquisition\n");
+			EXIT("TextureCache: texture requires rediscovery before final acquisition: %s, "
+			     "id = %u, address = 0x%016" PRIx64 ", size = 0x%08" PRIx64
+			     ", bound = %d, target = %d, dormant = %d, registered = %d\n",
+			     RediscoveryReason(image), id.index, image.info.data.address,
+			     image.info.data.size, static_cast<int>(image.binding.is_bound),
+			     static_cast<int>(image.binding.is_target), static_cast<int>(image.dormant),
+			     static_cast<int>(image.registered));
 		}
 	}
 	if (desc.type == BindingType::Storage) {
@@ -1650,7 +1744,9 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
 	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
-		EXIT("TextureCache: color target requires rediscovery before final acquisition\n");
+		EXIT("TextureCache: color target requires rediscovery before final acquisition: %s, "
+		     "address = 0x%016" PRIx64 "\n",
+		     RediscoveryReason(image), image.info.data.address);
 	}
 	TouchImage(image);
 	image.MarkGpuModified();
@@ -1668,7 +1764,9 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
 	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
-		EXIT("TextureCache: depth target requires rediscovery before final acquisition\n");
+		EXIT("TextureCache: depth target requires rediscovery before final acquisition: %s, "
+		     "address = 0x%016" PRIx64 "\n",
+		     RediscoveryReason(image), image.info.data.address);
 	}
 	TouchImage(image);
 	image.MarkGpuModified();
@@ -1760,7 +1858,7 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 	ImageSubresourceRange subresources;
 	for (const auto id: FindImagesInRegion(address, size, false)) {
 		auto owner = m_slot_images.try_get(id);
-		if (owner == nullptr) {
+		if (owner == nullptr || owner->dormant) {
 			continue;
 		}
 		vk::ImageAspectFlags candidate {};

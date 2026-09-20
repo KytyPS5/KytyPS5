@@ -10094,6 +10094,203 @@ public:
                   !boundary_buffer_cache.HasGpuDirtyBytes(final_word_address, sizeof(uint32_t)),
               "a final-byte CPU read did not publish the GPU-owned final word");
 
+      // RESIDENT EVIL REQUIEM's menu overlaps live render targets every frame. Two rules
+      // govern what an overlap may do to the image it displaces, and it has to obey both.
+      //
+      // It must leave exactly one image owning the guest range. The merge loop in
+      // FindImage walks every image over the range in page-table order and feeds each one
+      // the result of the last, so a second owner silently changes how the first is
+      // resolved - and several branches answer an overlap with ExpandImage, which replaces
+      // the image it is handed. Sparing a victim therefore does not just add a harmless
+      // duplicate; it can get the live image reshaped or retired in its place.
+      //
+      // And it must not lose pixels. FreeImage clears the GPU-modified flag to get past
+      // DeleteImage's "resolve your contents first" assert, so a victim whose contents
+      // exist only on the GPU is destroyed outright and whatever replaces it comes up
+      // empty. Moving the pixels out before freeing is the only action that meets both
+      // rules at once.
+      // The invariant is one *reachable* owner per range, not one registered image. A parked
+      // image stays registered on purpose - the collector must still reclaim it and a guest
+      // write must still dirty it - but it is removed from the lookup candidate set, so it
+      // cannot be the second answer that made the merge loop re-describe a request.
+      const auto ImagesCovering = [&](uint64_t offset, uint64_t size) {
+        const auto found = TextureCacheTestAccess::FindImages(texture_cache, base + offset,
+                                                              size, false);
+        size_t reachable = 0;
+        for (const auto id: found) {
+          if (!texture_cache.GetImage(id).dormant) {
+            reachable++;
+          }
+        }
+        return reachable;
+      };
+      const auto AgeEveryImage = [&] {
+        // Past NumFramesBeforeRemoval, so ImageAbandoned holds for anything created above.
+        for (uint32_t frame = 0; frame < 64; frame++) {
+          texture_cache.AdvanceFrame();
+        }
+      };
+      const auto MakeRetentionTarget = [&](uint64_t offset, vk::Extent3D extent,
+                                           uint64_t size) {
+        auto desc = MakeLinearDesc(
+            base + offset, size, vk::Format::eR8G8B8A8Unorm,
+            Prospero::BufferFormat::k8_8_8_8UNorm, Prospero::ImageType::kColor2D,
+            extent, 1, 4, 1);
+        desc.type = BindingType::RenderTarget;
+        desc.view_info.usage = vk::ImageUsageFlagBits::eColorAttachment;
+        return desc;
+      };
+
+      // An aged GPU-only victim reshaped at the same base. Nothing can move its pixels:
+      // the two surfaces disagree on block extent, so no image copy relates them, and the
+      // guest-layout round-trip that would is unreachable from under m_lock. The victim
+      // therefore still goes, and what this pins is the one-owner rule.
+      constexpr uint64_t block_extent_offset = 0x2420000;
+      auto block_extent_victim =
+          MakeRetentionTarget(block_extent_offset, {16, 16, 1}, 0x400);
+      const auto block_extent_victim_id =
+          texture_cache.FindImage(block_extent_victim);
+      texture_cache.MarkGpuWritten(block_extent_victim_id);
+      auto block_extent_request = block_extent_victim;
+      block_extent_request.info.extent = {32, 8, 1};
+      block_extent_request.info.pitch = 32;
+      block_extent_request.info.mip_layout[0] = {0, 0x400, 32, 8};
+      AgeEveryImage();
+      const auto block_extent_request_id =
+          texture_cache.FindImage(block_extent_request);
+      Require(name, "re-shaped overlap leaves one owner",
+              block_extent_request_id &&
+                  block_extent_request_id != block_extent_victim_id &&
+                  ImagesCovering(block_extent_offset, 0x400) == 1,
+              "a re-shaped overlap left two images covering one guest range");
+
+      constexpr uint64_t tile_retention_offset = 0x2421000;
+      auto tile_victim =
+          MakeRetentionTarget(tile_retention_offset, {16, 16, 1}, 0x400);
+      const auto tile_victim_id = texture_cache.FindImage(tile_victim);
+      texture_cache.MarkGpuWritten(tile_victim_id);
+      auto tile_request = tile_victim;
+      tile_request.info.tile_mode = Prospero::TileMode::kStandard4KB;
+      AgeEveryImage();
+      const auto tile_request_id = texture_cache.FindImage(tile_request);
+      Require(name, "re-tiled overlap leaves one owner",
+              tile_request_id && tile_request_id != tile_victim_id &&
+                  ImagesCovering(tile_retention_offset, 0x400) == 1,
+              "a re-tiled overlap left two images covering one guest range");
+
+      // RESIDENT EVIL REQUIEM's clustered light grid: a tiled 3D surface a compute pass
+      // writes every frame, sharing a 64 KiB pool slot with a depth target and several 2D
+      // surfaces that claim the same base address. Nothing ever downloads a tiled image -
+      // TrackImageDownload and the collector both decline one - so guest memory has never
+      // held its pixels and no refresh can bring them back. A guest write elsewhere in the
+      // same tracker page only makes it *maybe* dirty, a suspicion RefreshImage settles
+      // with HashGuestEdges; but SafeToDownload counts maybe-dirty as dirty, so the retire
+      // path used to fall past the park and free the image before that test could run. The
+      // grid came back empty, every cluster decoded a zero light count, and the menu lost
+      // its analytic lighting for the rest of the session.
+      constexpr uint64_t unrecoverable_offset = 0x2423000;
+      auto unrecoverable_victim =
+          MakeRetentionTarget(unrecoverable_offset, {16, 16, 1}, 0x400);
+      unrecoverable_victim.info.tile_mode = Prospero::TileMode::kStandard4KB;
+      const auto unrecoverable_victim_id =
+          texture_cache.FindImage(unrecoverable_victim);
+      texture_cache.MarkGpuWritten(unrecoverable_victim_id);
+      // Disjoint from the image's own bytes, inside its tracker page: InvalidateCpuAliases
+      // reaches MarkAsMaybeDirty rather than InvalidateCpuWrite, which is the distinction
+      // this case turns on.
+      texture_cache.InvalidateMemory(base + unrecoverable_offset + 0x800,
+                                     sizeof(uint32_t));
+      Require(name, "tiled victim is maybe-dirty, not definitely dirty",
+              texture_cache.GetImage(unrecoverable_victim_id).IsMaybeCpuDirty() &&
+                  !texture_cache.GetImage(unrecoverable_victim_id)
+                       .IsDefinitelyCpuDirty() &&
+                  !texture_cache.GetImage(unrecoverable_victim_id).SafeToDownload(),
+              "the page write did not leave the tiled victim maybe-dirty");
+      auto unrecoverable_request = unrecoverable_victim;
+      unrecoverable_request.info.tile_mode = Prospero::TileMode::kStandard64KB;
+      AgeEveryImage();
+      const auto unrecoverable_request_id =
+          texture_cache.FindImage(unrecoverable_request);
+      Require(name, "maybe-dirty tiled victim keeps its pixels",
+              unrecoverable_request_id &&
+                  unrecoverable_request_id != unrecoverable_victim_id &&
+                  TextureCacheTestAccess::Contains(texture_cache,
+                                                   unrecoverable_victim_id) &&
+                  texture_cache.GetImage(unrecoverable_victim_id).IsGpuModified(),
+              "an overlap freed a tiled GPU-only image that nothing can reproduce");
+      Require(name, "parked tiled victim leaves one owner",
+              texture_cache.GetImage(unrecoverable_victim_id).dormant &&
+                  ImagesCovering(unrecoverable_offset, 0x400) == 1,
+              "sparing the tiled victim left two images covering one guest range");
+
+      // The dominant destroyer: a request that starts inside a cached image but is not a
+      // subresource of it. The two are separate surfaces sharing bytes, nothing relates
+      // their pixels, and freeing the cached one loses whatever exists only on the GPU.
+      // Retention is safe here because the addresses differ - every address-keyed lookup
+      // still separates them - so the surface has to come back intact, contents included,
+      // the next time the guest describes it. Survival without recovery is worth nothing.
+      constexpr uint64_t not_a_mip_offset = 0x2424000;
+      constexpr uint64_t not_a_mip_skew = 4;
+      std::memset(memory + not_a_mip_offset, 0, 32);
+      auto not_a_mip_victim =
+          MakeRetentionTarget(not_a_mip_offset, {2, 2, 1}, 16);
+      const auto not_a_mip_victim_id = texture_cache.FindImage(not_a_mip_victim);
+      TextureCacheTestAccess::ClearImage(
+          texture_cache, scheduler.Current(), not_a_mip_victim_id,
+          {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+          vk::ClearValue{
+              vk::ClearColorValue{std::array<float, 4>{1.0f, 1.0f, 1.0f, 1.0f}}});
+      // Starts inside the victim, at an offset that is not a whole number of slices, so
+      // MipOf refuses and the overlap lands in the not-a-mip branch.
+      auto not_a_mip_request =
+          MakeRetentionTarget(not_a_mip_offset + not_a_mip_skew, {2, 2, 1}, 16);
+      AgeEveryImage();
+      const auto not_a_mip_request_id =
+          texture_cache.FindImage(not_a_mip_request);
+      const bool not_a_mip_survived =
+          TextureCacheTestAccess::Contains(texture_cache, not_a_mip_victim_id);
+
+      // Exact re-description has to find the survivor again, not a fresh empty image.
+      auto not_a_mip_reclaim = not_a_mip_victim;
+      const auto not_a_mip_reclaim_id =
+          texture_cache.FindImage(not_a_mip_reclaim);
+      texture_cache.UpdateImage(not_a_mip_reclaim_id);
+      auto not_a_mip_readback = CreateHostBuffer(
+          name, 16, vk::BufferUsageFlagBits::eTransferDst,
+          std::vector<u32>{0, 0, 0, 0});
+      {
+        auto &native = texture_cache.GetImage(not_a_mip_reclaim_id);
+        auto &copy_command = scheduler.Current();
+        native.Transit(vk::ImageLayout::eTransferSrcOptimal,
+                       vk::AccessFlagBits2::eTransferRead, {},
+                       copy_command.Handle());
+        vk::BufferImageCopy reclaim_copy{};
+        reclaim_copy.imageSubresource.aspectMask = vk::ImageAspectFlagBits::eColor;
+        reclaim_copy.imageSubresource.layerCount = 1;
+        reclaim_copy.imageExtent = {2, 2, 1};
+        copy_command.Handle().copyImageToBuffer(
+            native.backing.image, vk::ImageLayout::eTransferSrcOptimal,
+            not_a_mip_readback.buffer, 1, &reclaim_copy);
+        HostReadBarrier(not_a_mip_readback.buffer, not_a_mip_readback.size,
+                        vk::PipelineStageFlagBits::eTransfer,
+                        vk::AccessFlagBits::eTransferWrite);
+      }
+      scheduler.Finish();
+      const auto not_a_mip_words = ReadBuffer(name, not_a_mip_readback, 4);
+      DestroyBuffer(&not_a_mip_readback);
+      Require(name, "not-a-mip overlap keeps the surface and its pixels",
+              not_a_mip_request_id &&
+                  not_a_mip_request_id != not_a_mip_victim_id &&
+                  not_a_mip_survived &&
+                  not_a_mip_reclaim_id == not_a_mip_victim_id &&
+                  texture_cache.GetImage(not_a_mip_reclaim_id).IsGpuModified() &&
+                  not_a_mip_words ==
+                      std::vector<u32>{0xffffffffu, 0xffffffffu, 0xffffffffu,
+                                       0xffffffffu},
+              "a not-a-mip overlap destroyed a GPU-only surface that the guest "
+              "went on to describe again");
+
+
       resources.UnmapMemory(base, allocation_size);
       scheduler.Finish();
       LibKernel::Memory::InstallGpuResources(nullptr);
@@ -30319,6 +30516,42 @@ TestCase SimpleLoop() {
            O::S_BRANCH, O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase ReadFirstLaneWithNoActiveLaneTakesLaneZero() {
+  using O = ShaderOpcode;
+
+  // v5 = the global thread index, used as the store offset; v1 = this lane's own index, so the
+  // lane readfirstlane picks is visible in the result.
+  std::vector<u32> code = {
+      EncodeVop1(0x01, 5, 4),
+      EncodeVop2(0x1a, 5, InlineU32(6), 5),
+      EncodeVop2(0x25, 5, Vgpr(0), 5),
+      EncodeVop1(0x01, 1, Vgpr(0)),
+      EncodeSop1(0x04, 126, InlineU32(0)), // s_mov_b64 exec, 0
+      EncodeVop1(0x02, 8, Vgpr(1)),        // v_readfirstlane_b32 s8, v1
+      EncodeSop1(0x04, 126, 193),          // s_mov_b64 exec, -1
+  };
+  AppendStoreSgprAtLaneDwordOffset(&code, 8, 5, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "ReadFirstLaneWithNoActiveLaneTakesLaneZero";
+  test.code = code;
+  // v_readfirstlane_b32 writes its scalar destination whatever EXEC is, and RDNA 2 names lane 0
+  // when no lane is active - so every lane stores lane 0's value, which is 0.
+  test.expected.assign(64, 0u);
+  test.opcodes = {O::V_MOV_B32, O::V_LSHLREV_B32, O::V_ADD_NC_U32, O::S_MOV_B64,
+                  O::V_READFIRSTLANE_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.group_id[0] = true;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.workgroup_register = 4;
+  test.has_compute_info = true;
+  test.dispatch_x = 1;
+  return test;
+}
+
 TestCase SharedReturnKeepsSelectedValues() {
   using O = ShaderOpcode;
 
@@ -45888,6 +46121,7 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, ImageGatherExplicitLod());
     RunCase(&vulkan, SharedReturnKeepsSelectedValues());
     RunCase(&vulkan, SiblingSharedExitKeepsCapturedConditions());
+    RunCase(&vulkan, ReadFirstLaneWithNoActiveLaneTakesLaneZero());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--position-w-only") == 0) {

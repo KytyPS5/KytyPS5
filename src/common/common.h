@@ -8,11 +8,6 @@
 #define __cplusplus 201703L
 #endif
 
-#if defined(__MINGW32__) || defined(__MINGW64__)
-// NOLINTNEXTLINE(cppcoreguidelines-macro-usage,cert-dcl51-cpp,cert-dcl37-c,bugprone-reserved-identifier)
-#define __USE_MINGW_ANSI_STDIO 1
-#endif
-
 // IWYU pragma: begin_exports
 #include <cinttypes>
 #include <cstddef>

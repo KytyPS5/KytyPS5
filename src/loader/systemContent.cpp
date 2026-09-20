@@ -647,20 +647,20 @@ uint64_t SystemContentGetFlexibleMemorySize() {
 	return sc->psf.GetFlexibleMemorySize();
 }
 
-bool SystemContentGetIconPath(std::string* path) {
-	if (path == nullptr) {
-		return false;
-	}
+bool SystemContentGetIconPath(std::filesystem::path* path) {
+    if (path == nullptr) {
+        return false;
+    }
 
-	auto* sc = Common::Singleton<SystemContent>::Instance();
+    auto* sc = Common::Singleton<SystemContent>::Instance();
 
-	if (sc->icon_path.empty()) {
-		return false;
-	}
+    if (sc->icon_path.empty()) {
+        return false;
+    }
 
-	*path = Common::PathToString(sc->icon_path);
+    *path = sc->icon_path;
 
-	return true;
+    return true;
 }
 
 bool SystemContentGetChunksNum(uint32_t* num) {

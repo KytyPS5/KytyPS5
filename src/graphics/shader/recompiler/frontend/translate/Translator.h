@@ -205,6 +205,7 @@ private:
 	bool    V_BFE_U32(const Decoder::Instruction& inst, bool sign);
 	bool    V_BFI_B32(const Decoder::Instruction& inst);
 	bool    S_BITCMP_B32(const Decoder::Instruction& inst, bool expected);
+	bool    S_BITCMP_B64(const Decoder::Instruction& inst, bool expected);
 	bool    V_ALIGNBIT_B32(const Decoder::Instruction& inst);
 	bool    V_ALIGNBYTE_B32(const Decoder::Instruction& inst);
 	bool    V_LSHL_ADD_U32(const Decoder::Instruction& inst);

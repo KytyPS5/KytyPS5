@@ -610,51 +610,6 @@ bool SysFileSetLastAccessAndWriteTimeUtc(const std::filesystem::path& name,
 	//	}
 }
 
-// Recursively collect regular files.
-void SysFileFindFiles(const std::filesystem::path& path, std::vector<sys_file_find_t>& out) {
-	auto real_path = get_internal_name(path);
-
-	DIR* dir = opendir(real_path.string().c_str());
-	if (dir == nullptr) {
-		return;
-	}
-
-	for (const dirent* entry = readdir(dir); entry != nullptr; entry = readdir(dir)) {
-		const std::string file_name(entry->d_name);
-
-		if (file_name == "." || file_name == "..") {
-			continue;
-		}
-
-		auto        child = real_path / file_name;
-		struct stat s {};
-
-		// lstat, so a symlink is never followed into a cycle during the recursive walk.
-		if (0 != lstat(child.string().c_str(), &s)) {
-			continue;
-		}
-
-		if (S_ISDIR(s.st_mode)) {
-			SysFileFindFiles(child, out);
-		} else if (S_ISREG(s.st_mode)) {
-			sys_file_find_t r {};
-
-			r.path_with_name              = child;
-			r.size                        = static_cast<uint64_t>(s.st_size);
-			r.last_access_time.is_invalid = false;
-			r.last_access_time.time       = s.st_atime;
-			r.last_access_time.nanos      = KYTY_STAT_ATIME_NS(s);
-			r.last_write_time.is_invalid  = false;
-			r.last_write_time.time        = s.st_mtime;
-			r.last_write_time.nanos       = KYTY_STAT_MTIME_NS(s);
-
-			out.push_back(r);
-		}
-	}
-
-	closedir(dir);
-}
-
 // Keep "." and ".." to match FindFirstFileW.
 void SysFileGetDents(const std::filesystem::path& path, std::vector<sys_dir_entry_t>& out) {
 	auto real_path = get_internal_name(path);

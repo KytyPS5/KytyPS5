@@ -43,9 +43,6 @@ jobs:
       - name: Setup Visual Studio environment
         uses: ilammy/msvc-dev-cmd@v1
 
-      - name: Setup Ninja
-        uses: seanmiddleditch/gha-setup-ninja@v5
-
       - name: Locate vcpkg
         id: vcpkg
         shell: pwsh
@@ -155,7 +152,7 @@ jobs:
 
       - name: Install build dependencies
         shell: bash
-        run: brew install glslang ninja
+        run: brew install glslang
 
       - name: Install Qt 6.10.3
         uses: jurplel/install-qt-action@v4
@@ -318,7 +315,6 @@ jobs:
             libxrandr-dev \
             libxss-dev \
             lld \
-            ninja-build \
             pkg-config \
             wayland-protocols
 

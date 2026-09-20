@@ -125,6 +125,7 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 		case ValueOpcode::ULessThan32:
 		case ValueOpcode::IEqual32:
 		case ValueOpcode::UGreaterThan32:
+		case ValueOpcode::SGreaterThanEqual32:
 		case ValueOpcode::INotEqual32:
 		case ValueOpcode::LogicalOr:
 		case ValueOpcode::LogicalAnd:
@@ -927,6 +928,13 @@ private:
 			case ValueOpcode::UGreaterThan32:
 				if (binary()) {
 					result = static_cast<uint32_t>(a) > static_cast<uint32_t>(b);
+					return true;
+				}
+				return false;
+			case ValueOpcode::SGreaterThanEqual32:
+				if (binary()) {
+					result = std::bit_cast<int32_t>(static_cast<uint32_t>(a)) >=
+					         std::bit_cast<int32_t>(static_cast<uint32_t>(b));
 					return true;
 				}
 				return false;

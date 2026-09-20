@@ -12831,6 +12831,7 @@ public:
     const uint32_t extent = depth_feedback ? 8 : 32;
     constexpr uintptr_t depth_address = 0x0000000204400000ull;
     constexpr uint64_t allocation_size = 0x40000;
+    constexpr uint64_t rect_address = depth_address + 0x8000;
     EnsureRuntimeContext();
     RenderContext context(m_runtime_context);
     auto &scheduler = context.GetCommandScheduler();
@@ -12864,6 +12865,15 @@ public:
       for (uint32_t x = 0; x < extent; x++) {
         static_cast<float *>(mapped)[y * 64 + x] = initial_depth(x, y);
       }
+    }
+    if (!depth_feedback && !packed_vertex_color) {
+      // Rectangle input contains three position/UV records.
+      constexpr std::array<float, 24> rect_vertices{
+          -0.75f, -0.75f, 0, 0, 0, 0, 0, 0,
+           0.75f, -0.75f, 0, 0, 1, 0, 0, 0,
+          -0.75f,  0.75f, 0, 0, 0, 1, 0, 0};
+      std::memcpy(reinterpret_cast<void *>(rect_address), rect_vertices.data(),
+                  sizeof(rect_vertices));
     }
     resources.MapMemory(depth_address, allocation_size);
     if (depth_feedback) {
@@ -13520,6 +13530,82 @@ public:
         const auto expected = component % 4 == 3 ? 0x3f800000u : 0x3e800000u;
         Require(name, "sparse MRT3 output", sparse_pixels[component] == expected,
                 "MRT3 was compacted to a different slot or clipped by unused MRT0");
+      }
+
+      // A fourth VS invocation reads beyond the descriptor instead of reconstructing the corner.
+      const ShaderBufferResource rect_buffer{{
+          static_cast<u32>(rect_address),
+          static_cast<u32>(rect_address >> 32u) | (32u << 16u), 3,
+          DstSel(4, 5, 6, 7) |
+              (static_cast<u32>(Prospero::BufferFormat::k32Float) << 12u)}};
+      static const auto rect_vertex_code = [] {
+        std::vector<u32> code{
+            EncodeMubuf0(0x0d, 0, true, false), EncodeMubuf1(0, 2, 5),
+            EncodeMubuf0(0x0d, 16, true, false), EncodeMubuf1(2, 2, 5)};
+        AppendVMovU32(&code, 4, 0);
+        AppendVMovLiteral(&code, 6, 0x3f800000u);
+        code.insert(code.end(), {EncodeExp0(0x0c, 0xf), EncodeExp1(0, 1, 4, 6),
+                                 EncodeExp0(0x20, 0xf), EncodeExp1(2, 3, 4, 6)});
+        AppendEnd(&code);
+        return code;
+      }();
+      static const auto rect_pixel_code = [] {
+        std::vector<u32> code;
+        for (u32 component = 0; component < 2; component++) {
+          code.push_back(EncodeVintrp(0, 20 + component, 0, component, 0));
+          code.push_back(EncodeVintrp(1, 20 + component, 0, component, 1));
+        }
+        AppendVMovU32(&code, 22, 0);
+        AppendVMovLiteral(&code, 23, 0x3f800000u);
+        code.insert(code.end(), {EncodeExp0(0x03, 0xf), EncodeExp1(20, 21, 22, 23)});
+        AppendEnd(&code);
+        return code;
+      }();
+      const auto rect_vs = reinterpret_cast<uint64_t>(rect_vertex_code.data());
+      const auto rect_ps = reinterpret_cast<uint64_t>(rect_pixel_code.data());
+      ShaderMapUserData(rect_vs,
+          {.type = Prospero::ShaderBinaryType::kGs, .user_data = &native_user_data,
+           .code_size_bytes = static_cast<u32>(rect_vertex_code.size() * sizeof(u32))});
+      ShaderMapUserData(rect_ps,
+          {.type = Prospero::ShaderBinaryType::kPs,
+           .code_size_bytes = static_cast<u32>(rect_pixel_code.size() * sizeof(u32))});
+      shaders.SetEsShaderBase(rect_vs);
+      shaders.SetPsShaderBase(rect_ps);
+      shaders.SetGsShaderResource2({.user_sgpr = 4});
+      for (u32 i = 0; i < 4; i++) {
+        shaders.SetGsUserSgpr(i, rect_buffer.fields[i], HW::UserSgprType::Vsharp);
+      }
+      registers.SetPsInControl(0x8001);
+      registers.SetPsInputEna(2);
+      registers.SetPsInputAddr(2);
+      registers.SetPsInputSettings(0, 0);
+      for (const auto primitive : {Prospero::PrimitiveType::kRectList,
+                                    Prospero::PrimitiveType::kRectListLegacy}) {
+        const char *rect_name = primitive == Prospero::PrimitiveType::kRectList
+                                    ? "RectListThreeRecords" : "LegacyRectListThreeRecords";
+        user_config.SetPrimitiveType(primitive);
+        registers.SetModeControl({});
+        TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), sparse_color.image_id,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
+        RenderExecutorTestAccess::DrawAuto(
+            executor, scheduler.Current(), {.vertex_count = 3, .instance_count = 1});
+        const auto pixels = ReadCachedTexel(name, context, sparse_color.image_id,
+                                            {}, {extent, extent, 1});
+        for (u32 y = 0; y < extent; y++) {
+          for (u32 x = 0; x < extent; x++) {
+            const bool inside = x >= 4 && x < 28 && y >= 4 && y < 28;
+            const auto offset = 4 * (y * extent + x);
+            const std::array<float, 4> expected{
+                inside ? (x + 0.5f - 4) / 24 : 0,
+                inside ? (y + 0.5f - 4) / 24 : 0, 0, inside ? 1.0f : 0};
+            for (u32 component = 0; component < 4; component++) {
+              Require(rect_name, "three-vertex rectangle coverage and UV",
+                  std::abs(std::bit_cast<float>(pixels[offset + component]) -
+                           expected[component]) < 0.0001f,
+                  "rectangle reconstruction lost its fourth corner or interpolated UVs");
+            }
+          }
+        }
       }
       DestroyBuffer(&stencil_readback);
 
@@ -15011,6 +15097,7 @@ private:
     Require("VulkanHarness", "graphics", available_features12.shaderOutputLayer == true,
             "vertex layer output is not supported");
     Require("VulkanHarness", "graphics", available_features.fillModeNonSolid &&
+                available_features.tessellationShader &&
                 available_depth_clip.depthClipEnable && available_clip_control.depthClipControl &&
                 available_color_write.colorWriteEnable &&
                 available_feedback_layout.attachmentFeedbackLoopLayout &&
@@ -15076,6 +15163,7 @@ private:
     device_features.sampleRateShading = true;
     device_features.shaderInt64 = true;
     device_features.fillModeNonSolid = true;
+    device_features.tessellationShader = true;
     device_info.pEnabledFeatures = &device_features;
     constexpr const char *device_extensions[] = {
         VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
@@ -16969,6 +17057,117 @@ TestCase ScalarGetpcWritesNextInstructionPc() {
           {O::S_GETPC_B64, O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase ScalarBitcmpB64DynamicOperands() {
+  using O = ShaderOpcode;
+
+  struct Input {
+    u32 low;
+    u32 high;
+    u32 index;
+  };
+  const Input inputs[] = {
+      {1u, 0u, 0u}, {0x80000000u, 0u, 31u}, {0u, 1u, 32u},
+      {0u, 0x80000000u, 63u}, {1u, 0u, 64u},
+      {0x80000000u, 0u, 95u}, {0u, 1u, 96u},
+      {0u, 0x80000000u, 127u}, {1u, 0u, 128u},
+      {0u, 0x80000000u, 0xffffffffu}, {0u, 0u, 17u},
+      {0xffffffffu, 0xffffffffu, 42u},
+      {0x89abcdefu, 0x76543210u, 4u},
+      {0x89abcdefu, 0x76543210u, 36u},
+  };
+  TestCase test;
+  test.name = "ScalarBitcmpB64DynamicOperands";
+  for (const auto &input : inputs) {
+    test.initial.insert(test.initial.end(), {input.low, input.high, input.index});
+  }
+  test.expected = test.initial;
+  for (u32 i = 0; i < std::size(inputs); ++i) {
+    // Load the value and index on the GPU so the compares cannot constant-fold.
+    for (u32 component = 0; component < 3; ++component) {
+      AppendVMovU32(&test.code, 30, (i * 3 + component) * 4);
+      AppendBufferLoadDword(&test.code, 0, 30);
+      test.code.push_back(EncodeVop1(0x02, 20 + component, Vgpr(0)));
+    }
+    const uint64_t value = uint64_t{inputs[i].low} | (uint64_t{inputs[i].high} << 32);
+    const u32 bit = static_cast<u32>((value >> (inputs[i].index & 63u)) & 1u);
+    for (u32 expected_bit = 0; expected_bit < 2; ++expected_bit) {
+      const bool scc = bit == expected_bit;
+      test.code.push_back(EncodeSopc(0x0e + expected_bit, 20, 22));
+      test.code.push_back(EncodeSop2(0x0a, 24, InlineU32(1), InlineU32(0)));
+      AppendStoreSgpr(&test.code, 24, static_cast<u32>(test.expected.size()));
+      test.expected.push_back(scc ? 1u : 0u);
+
+      // Exercise SCC-driven control flow as well as S_CSELECT_B32.
+      test.code.push_back(EncodeSopp(0x05, 2)); // s_cbranch_scc1 to the true arm.
+      test.code.push_back(EncodeSMovB32(24, InlineU32(3)));
+      test.code.push_back(EncodeSopp(0x02, 1)); // s_branch past the true arm.
+      test.code.push_back(EncodeSMovB32(24, InlineU32(7)));
+      AppendStoreSgpr(&test.code, 24, static_cast<u32>(test.expected.size()));
+      test.expected.push_back(scc ? 7u : 3u);
+    }
+  }
+  AppendEnd(&test.code);
+  test.initial.resize(test.expected.size());
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_READFIRSTLANE_B32,
+                  O::S_BITCMP0_B64, O::S_BITCMP1_B64, O::S_CSELECT_B32,
+                  O::S_CBRANCH_SCC1, O::S_BRANCH, O::S_MOV_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpBitFieldUExtract", "OpULessThan", "OpSelect"};
+  return test;
+}
+
+TestCase ScalarBitcmpB64IntegerConstants() {
+  using O = ShaderOpcode;
+
+  struct Source {
+    u32 encoding;
+    uint64_t bits;
+  };
+  // Negative integer inlines sign-extend; B64 literals zero-extend.
+  const Source sources[] = {
+      {128u, 0u}, {129u, 1u}, {192u, 64u},
+      {193u, 0xffffffffffffffffull}, {208u, 0xfffffffffffffff0ull},
+      {255u, 0xffffffffu}, {255u, 0x80000000u},
+  };
+  const u32 indices[] = {0u, 4u, 6u, 31u, 32u, 63u, 64u, 127u};
+  TestCase test;
+  test.name = "ScalarBitcmpB64IntegerConstants";
+  test.initial.assign(std::begin(indices), std::end(indices));
+  test.expected = test.initial;
+  for (u32 i = 0; i < std::size(indices); ++i) {
+    AppendVMovU32(&test.code, 30, i * 4);
+    AppendBufferLoadDword(&test.code, 0, 30);
+    test.code.push_back(EncodeVop1(0x02, 22, Vgpr(0)));
+    for (const auto &source : sources) {
+      const u32 bit = static_cast<u32>((source.bits >> (indices[i] & 63u)) & 1u);
+      for (u32 expected_bit = 0; expected_bit < 2; ++expected_bit) {
+        test.code.push_back(EncodeSopc(0x0e + expected_bit, source.encoding, 22));
+        if (source.encoding == 255u) {
+          test.code.push_back(static_cast<u32>(source.bits));
+        }
+        test.code.push_back(EncodeSop2(0x0a, 24, InlineU32(1), InlineU32(0)));
+        AppendStoreSgpr(&test.code, 24, static_cast<u32>(test.expected.size()));
+        test.expected.push_back(bit == expected_bit ? 1u : 0u);
+      }
+    }
+  }
+  // An instruction has one literal word even when both sources select it.
+  for (u32 expected_bit = 0; expected_bit < 2; ++expected_bit) {
+    test.code.push_back(EncodeSopc(0x0e + expected_bit, 255u, 255u));
+    test.code.push_back(0x8000001fu); // Select bit 31 of the same zero-extended literal.
+    test.code.push_back(EncodeSop2(0x0a, 24, InlineU32(1), InlineU32(0)));
+    AppendStoreSgpr(&test.code, 24, static_cast<u32>(test.expected.size()));
+    test.expected.push_back(expected_bit);
+  }
+  AppendEnd(&test.code);
+  test.initial.resize(test.expected.size());
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_READFIRSTLANE_B32,
+                  O::S_BITCMP0_B64, O::S_BITCMP1_B64, O::S_CSELECT_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpBitFieldUExtract"};
+  return test;
+}
+
 TestCase ScalarBitfieldPack() {
   using O = ShaderOpcode;
 
@@ -17974,6 +18173,29 @@ TestCase Vop1SdwaNotCapturedByte0Source() {
   test.decoded_counts = {{"V_NOT_B32 v2, v2.sdwa(sel=0,sext=0)", 1}};
   test.ir_counts = {{" = BitFieldUExtract ", 1}, {" = BitwiseNot32 ", 1}};
   test.required_spirv = {"OpBitFieldUExtract", "OpNot"};
+  return test;
+}
+
+TestCase Vop1SdwaNotPreservesHighWordDestination() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendBufferLoadDword(&code, 0, 30);
+  AppendVMovLiteral(&code, 3, 0xabcd5555u);
+  code.push_back(0x7e066ef9u);
+  code.push_back(0x00061400u);
+  AppendStoreVgpr(&code, 3, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "Vop1SdwaNotPreservesHighWordDestination";
+  test.code = std::move(code);
+  test.initial = {0x12345678u};
+  test.expected = {0xabcda987u};
+  test.opcodes = {O::BUFFER_LOAD_DWORD, O::V_MOV_B32, O::V_NOT_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.ir_counts = {{" = BitwiseNot32 ", 1}};
+  test.required_spirv = {"OpNot"};
   return test;
 }
 
@@ -27061,6 +27283,8 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(ScalarSubvectorLoops(64));
   AddCase(ScalarGetpcWritesNextInstructionPc);
   AddCase(ScalarBitfieldPack);
+  AddCase(ScalarBitcmpB64DynamicOperands);
+  AddCase(ScalarBitcmpB64IntegerConstants);
   AddCase(ScalarBrevB32PreservesScc);
   AddCase(ScalarBfeI32CapturedRawSignExtends);
   AddCase(BitfieldExtractWidthPastEndEdges);
@@ -27088,6 +27312,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorFfbhI32NativeAndVop3OnGpu);
   AddCase(Vop1SdwaFfblCapturedHighWordSource);
   AddCase(Vop1SdwaNotCapturedByte0Source);
+  AddCase(Vop1SdwaNotPreservesHighWordDestination);
   AddCase(Vop1SdwaMovByteDestinations);
   AddCase(Vop2SdwaSubNcExactByte2Destination);
   AddCase(Vop2SdwaAddNcCapturedHighWordDestination);

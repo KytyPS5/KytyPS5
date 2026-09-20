@@ -12,9 +12,6 @@
 #include <sys/param.h>
 #include <sys/types.h>
 #include <unistd.h>
-#if defined(__APPLE__)
-#include <libgen.h> // POSIX basename() lives here on macOS, not in <cstring>
-#endif
 
 void SysStackUsage(sys_dbg_stack_info_t& s) {
 	pid_t pid = getpid();
@@ -28,15 +25,6 @@ void SysStackUsage(sys_dbg_stack_info_t& s) {
 	// Record the reservation before the Linux /proc walk.
 	{
 		pthread_attr_t self_attr {};
-#if defined(__APPLE__)
-		void*        stack_top  = pthread_get_stackaddr_np(pthread_self());
-		const size_t stack_size = pthread_get_stacksize_np(pthread_self());
-		if (stack_top != nullptr && stack_size != 0) {
-			s.reserved_addr = reinterpret_cast<uintptr_t>(stack_top) - stack_size;
-			s.reserved_size = stack_size;
-		}
-		(void)self_attr;
-#else
 		if (pthread_getattr_np(pthread_self(), &self_attr) == 0) {
 			void*  stack_base = nullptr;
 			size_t stack_size = 0;
@@ -47,7 +35,6 @@ void SysStackUsage(sys_dbg_stack_info_t& s) {
 			}
 			pthread_attr_destroy(&self_attr);
 		}
-#endif
 	}
 
 	char str[1024];

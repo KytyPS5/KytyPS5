@@ -27,6 +27,7 @@
 #include "common/systemInfo.h"
 #include "common/threads.h"
 #include "common/timer.h"
+#include "common/stringUtils.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -45,6 +46,7 @@
 #include <string>
 #include <vector>
 #include <vulkan/vk_platform.h>
+#include <filesystem>
 
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_NO_SIMD
@@ -945,10 +947,10 @@ struct WindowIcon {
 	}
 };
 
-static void WindowLoadPngIcon(const std::string& path, WindowIcon* icon) {
+static void WindowLoadPngIcon(const std::filesystem::path& path, WindowIcon* icon) {
 	Common::File f;
 	if (!f.Open(path, Common::File::Mode::Read)) {
-		EXIT("Can't open icon file %s\n", path.c_str());
+		EXIT("Can't open icon file %s\n", Common::PathToString(path).c_str());
 	}
 
 	int width  = 0;
@@ -974,7 +976,7 @@ void WindowContext::UpdateIcon() {
 	static bool       icon_loaded = false;
 
 	if (!icon_loaded) {
-		std::string icon_path;
+		std::filesystem::path icon_path;
 		if (Loader::SystemContentGetIconPath(&icon_path)) {
 			WindowLoadPngIcon(icon_path, &icon);
 		}

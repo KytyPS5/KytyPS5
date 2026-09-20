@@ -849,8 +849,9 @@ int KYTY_SYSV_ABI AjmMemoryUnregister(uint32_t context, void* ptr) {
 int KYTY_SYSV_ABI AjmBatchInitialize(void* buffer, size_t size, AjmBatchInfo* info) {
 	PRINT_NAME();
 
-	EXIT_NOT_IMPLEMENTED(buffer == nullptr);
-	EXIT_NOT_IMPLEMENTED(info == nullptr);
+	if (buffer == nullptr || info == nullptr) {
+		return AJM_ERROR_INVALID_PARAMETER;
+	}
 
 	info->buffer           = buffer;
 	info->offset           = 0;

@@ -1246,7 +1246,7 @@ ResourcePlan ConditionalSamplerPlan(bool diamond, bool reverse, bool reverse_phi
     flag = fixture.Emit(ValueOpcode::LaneId);
   }
   fixture.program.block_info[0].condition =
-      fixture.Emit(ValueOpcode::IEqual32, {flag, Value(0u)});
+      fixture.Emit(ValueOpcode::SGreaterThanEqual32, {flag, Value(0u)});
   if (writable) {
     MemoryInfo memory;
     memory.kind = ResourceKind::Buffer;
@@ -1324,9 +1324,10 @@ void TestConditionalSamplerPhi() {
                                  .userdata = &memory,
                                  .read_specialization_memory =
                                      ReadLinearTestMemory};
-        for (uint32_t flag = 0; flag < 2; ++flag) {
-          memory.words[(0x1000 + 196) / 4] = flag;
-          const uint32_t first = (flag != 0u) != reverse ? 480 / 4 : 448 / 4;
+        // Sampler selection compares a signed value against zero.
+        for (const auto flag : {-1, 0, 1, INT32_MIN, INT32_MAX}) {
+          memory.words[(0x1000 + 196) / 4] = std::bit_cast<uint32_t>(flag);
+          const uint32_t first = (flag < 0) != reverse ? 480 / 4 : 448 / 4;
           memory.fail_address = 0x1000 + (first == 448 / 4 ? 480u : 448u);
           DescriptorValue selected;
           Check(EvaluateDescriptorSource(plan, source, runtime, selected),

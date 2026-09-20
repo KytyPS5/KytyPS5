@@ -9,6 +9,7 @@
 #include "common/threads.h"
 #include "kernel/pthread.h"
 #include "kernel/semaphore.h"
+#include "libs/ajm/atrac9_decoder.h"
 #include "libs/audio_internal.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -18,8 +19,10 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <limits>
 #include <magic_enum.hpp>
+#include <memory>
 #include <vector>
 
 #include "libatrac9.h"
@@ -1824,26 +1827,146 @@ enum class Ngs2RackType {
 	CustomSampler,
 };
 
+struct Ngs2UserFxContext {
+	void*     common;
+	void*     param;
+	void*     work;
+	uintptr_t user_data;
+	uint32_t  max_voices;
+	uint32_t  voice_index;
+	uint64_t  reserved[4] {};
+};
+
+struct Ngs2UserFxProcessContext {
+	float**     channels;
+	void*       common;
+	const void* param;
+	void*       work;
+	void*       state;
+	uintptr_t   user_data;
+	uint32_t    flags;
+	uint32_t    input_channels;
+	uint32_t    output_channels;
+	uint32_t    grain_samples;
+	uint32_t    sample_rate;
+	uint32_t    reserved {};
+	uint64_t    reserved2[4] {};
+};
+
+struct Ngs2UserFxOption {
+	Ngs2CustomModuleOption header;
+	int                    KYTY_SYSV_ABI (*setup)(Ngs2UserFxContext*);
+	int                    KYTY_SYSV_ABI (*cleanup)(Ngs2UserFxContext*);
+	uintptr_t              control;
+	int                    KYTY_SYSV_ABI (*process)(Ngs2UserFxProcessContext*);
+	size_t                 common_size;
+	size_t                 param_size;
+	size_t                 work_size;
+	uintptr_t              user_data;
+};
+
 struct Ngs2RackInternal {
-	Ngs2Internal*         ngs  = nullptr;
-	Ngs2RackInternal*     next = nullptr;
-	Ngs2RackType          type = Ngs2RackType::Sampler;
-	Ngs2RackOptionUnion   option;
-	Ngs2ContextBufferInfo buffer_info;
-	Ngs2BufferAllocator   allocator;
+	Ngs2Internal*                        ngs  = nullptr;
+	Ngs2RackInternal*                    next = nullptr;
+	Ngs2RackType                         type = Ngs2RackType::Sampler;
+	Ngs2RackOptionUnion                  option;
+	Ngs2ContextBufferInfo                buffer_info;
+	Ngs2BufferAllocator                  allocator;
+	std::array<std::vector<uint8_t>, 24> common;
+	std::array<Ngs2UserFxOption, 24>     fx {};
 };
 
 enum class Ngs2VoicePlayState { Empty, Playing, Paused, Stopped };
-
 enum class Ngs2VoicePlayEvent { None, Play, Pause, Resume, Stop, StopImm, Kill };
 
 struct Ngs2VoiceInternal {
-	Ngs2VoicePlayEvent event          = Ngs2VoicePlayEvent::None;
-	Ngs2VoicePlayState state          = Ngs2VoicePlayState::Empty;
-	Ngs2RackInternal*  rack           = nullptr;
-	uintptr_t          callback       = 0;
-	uintptr_t          callback_data  = 0;
-	uint32_t           callback_flags = 0;
+	struct Port {
+		Ngs2VoiceInternal* dest   = nullptr;
+		uint32_t           input  = 0;
+		float              volume = 1.0f;
+		int32_t            matrix = -1;
+	};
+	struct Block {
+		const uint8_t*    data;
+		Ngs2WaveformBlock info;
+		uint32_t          cursor         = 0;
+		size_t            data_cursor    = 0;
+		uint32_t          skip_remaining = info.num_skip_samples;
+	};
+	struct Module {
+		std::vector<uint8_t> param, work, state;
+		uint32_t             flags = 1;
+	};
+	Ngs2VoicePlayEvent              event          = Ngs2VoicePlayEvent::None;
+	Ngs2VoicePlayState              state          = Ngs2VoicePlayState::Empty;
+	Ngs2RackInternal*               rack           = nullptr;
+	uintptr_t                       callback       = 0;
+	uintptr_t                       callback_data  = 0;
+	uint32_t                        callback_flags = 0;
+	std::deque<Block>               blocks;
+	std::vector<Port>               ports;
+	std::vector<std::vector<float>> matrices;
+	std::vector<Module>             modules;
+	std::vector<float>              samples;
+	std::vector<float>              output_matrix;
+	uint32_t                        channels        = 0;
+	uint32_t                        output_id       = 0;
+	bool                            rendering       = false;
+	bool                            rendered        = false;
+	bool                            has_samples     = false;
+
+	std::unique_ptr<Ajm::AjmAt9Decoder> decoder;
+	std::vector<float>                 decoded_frame;
+	bool                               accepts_blocks = true;
+
+	void SetupSampler(const Ngs2WaveformFormat& format) {
+		EXIT_NOT_IMPLEMENTED(format.sample_rate != rack->ngs->option.sample_rate ||
+		                     format.frame_margin != 0 || format.frame_offset != 0);
+		channels = format.num_channels;
+		blocks.clear();
+		decoder.reset();
+		decoded_frame.clear();
+		accepts_blocks = true;
+		if (format.waveform_type == NGS2_WAVEFORM_TYPE_ATRAC9) {
+			decoder = std::make_unique<Ajm::AjmAt9Decoder>(channels, format.sample_rate,
+			                                               Ajm::AjmSampleEncoding::Float, 0);
+			const auto result =
+			    decoder->Initialize(&format.config_data, sizeof(format.config_data));
+			EXIT_NOT_IMPLEMENTED(result.result != OK);
+			EXIT_NOT_IMPLEMENTED(result.format.channel_num != channels ||
+			                     result.format.sampling_frequency != format.sample_rate);
+			Ajm::AjmSidebandDecAt9CodecInfo info {};
+			decoder->WriteCodecInfo(&info, sizeof(info), result);
+			EXIT_NOT_IMPLEMENTED(info.frame_samples > std::numeric_limits<uint16_t>::max());
+			decoded_frame.resize(info.frame_samples * channels);
+		} else {
+			EXIT_NOT_IMPLEMENTED(format.waveform_type != 0x12);
+		}
+	}
+
+	void SetMatrix(uint32_t index, const float* levels, uint32_t count) {
+		EXIT_NOT_IMPLEMENTED(index >= matrices.size());
+		matrices[index].assign(levels, levels + count);
+	}
+	void SetVolume(uint32_t index, float volume) {
+		EXIT_NOT_IMPLEMENTED(index >= ports.size());
+		ports[index].volume = volume;
+	}
+	void SetPortMatrix(uint32_t index, int32_t matrix) {
+		EXIT_NOT_IMPLEMENTED(index >= ports.size());
+		ports[index].matrix = matrix;
+	}
+	void SetEvent(uint32_t id) {
+		switch (id) {
+			case 1: event = Ngs2VoicePlayEvent::Play; break;
+			case 2: event = Ngs2VoicePlayEvent::Stop; break;
+			case 4: event = Ngs2VoicePlayEvent::StopImm; break;
+			case 8: event = Ngs2VoicePlayEvent::Kill; break;
+			case 16: event = Ngs2VoicePlayEvent::Pause; break;
+			case 32: event = Ngs2VoicePlayEvent::Resume; break;
+			default: EXIT("unknown event_id: 0x%08" PRIx32 "\n", id);
+		}
+	}
 };
 
 struct Ngs2VoiceParamHeader {
@@ -1931,6 +2054,9 @@ static Ngs2RackInternal*    g_racks_list   = nullptr;
 static std::atomic_uint32_t g_next_ngs_uid = 1;
 static Common::Mutex        g_racks_mutex;
 
+static_assert(sizeof(Ngs2UserFxContext) == 72);
+static_assert(sizeof(Ngs2UserFxProcessContext) == 104);
+static_assert(sizeof(Ngs2UserFxOption) == 72);
 static_assert(sizeof(Ngs2SystemOption) == 144);
 static_assert(sizeof(Ngs2SystemInfo) == 184);
 static_assert(sizeof(Ngs2RackOption) == 176);
@@ -2272,6 +2398,35 @@ int KYTY_SYSV_ABI Ngs2SystemDestroy(uintptr_t system_handle, Ngs2ContextBufferIn
 	return OK;
 }
 
+static void Ngs2InitModules(Ngs2RackInternal& rack) {
+	if (!Ngs2RackIsCustom(rack.type)) {
+		return;
+	}
+	const auto& custom = rack.option.custom_sampler.custom_rack_option;
+	EXIT_NOT_IMPLEMENTED(custom.num_buffers != 1);
+	auto* voices = reinterpret_cast<Ngs2VoiceInternal*>(&rack + 1);
+	for (uint32_t m = 0; m < custom.num_modules; ++m) {
+		if (custom.module[m].module_id != 0x1f) {
+			continue;
+		}
+		auto& fx = rack.fx[m];
+		fx       = *reinterpret_cast<const Ngs2UserFxOption*>(custom.module[m].option);
+		rack.common[m].resize(fx.common_size);
+		for (uint32_t i = 0; i < rack.option.common.max_voices; ++i) {
+			auto& module = voices[i].modules[m];
+			module.param.resize(fx.param_size);
+			module.work.resize(fx.work_size);
+			module.state.resize(custom.module[m].state_size);
+			if (fx.setup != nullptr) {
+				Ngs2UserFxContext context {
+				    rack.common[m].data(), module.param.data(),           module.work.data(),
+				    fx.user_data,          rack.option.common.max_voices, i};
+				EXIT_NOT_IMPLEMENTED(fx.setup(&context) != OK);
+			}
+		}
+	}
+}
+
 int KYTY_SYSV_ABI Ngs2RackCreate(uintptr_t system_handle, uint32_t rack_id,
                                  const Ngs2RackOption*        option,
                                  const Ngs2ContextBufferInfo* buffer_info, uintptr_t* handle) {
@@ -2313,7 +2468,7 @@ int KYTY_SYSV_ABI Ngs2RackCreate(uintptr_t system_handle, uint32_t rack_id,
 	     static_cast<uint64_t>(buffer_info->host_buffer_size));
 
 	auto* ngs    = reinterpret_cast<Ngs2Internal*>(system_handle);
-	auto* rack   = static_cast<Ngs2RackInternal*>(buffer_info->host_buffer);
+	auto* rack   = new (buffer_info->host_buffer) Ngs2RackInternal {};
 	auto* voices = reinterpret_cast<Ngs2VoiceInternal*>(rack + 1);
 
 	Common::LockGuard lock(ngs->mutex);
@@ -2373,10 +2528,15 @@ int KYTY_SYSV_ABI Ngs2RackCreate(uintptr_t system_handle, uint32_t rack_id,
 	}
 
 	for (uint32_t i = 0; i < option->max_voices; i++) {
-		voices[i].rack  = rack;
-		voices[i].event = Ngs2VoicePlayEvent::None;
-		voices[i].state = Ngs2VoicePlayState::Empty;
+		auto& voice = *std::construct_at(voices + i);
+		voice.rack  = rack;
+		voice.ports.resize(option->max_ports);
+		voice.matrices.resize(option->max_matrices);
+		if (Ngs2RackIsCustom(rack->type)) {
+			voice.modules.resize(rack->option.custom_sampler.custom_rack_option.num_modules);
+		}
 	}
+	Ngs2InitModules(*rack);
 
 	*handle = reinterpret_cast<uintptr_t>(rack);
 
@@ -2406,22 +2566,9 @@ int KYTY_SYSV_ABI Ngs2RackCreateWithAllocator(uintptr_t system_handle, uint32_t 
 
 	EXIT_NOT_IMPLEMENTED(option->size < sizeof(Ngs2RackOption));
 
-	LOGF("\t rack_id                = 0x%" PRIx32 "\n"
-	     "\t name                   = %.64s\n"
-	     "\t flags                  = %u\n"
-	     "\t max_grain_samples      = %u\n"
-	     "\t max_voices             = %u\n"
-	     "\t max_input_delay_blocks = %u\n"
-	     "\t max_matrices           = %u\n"
-	     "\t max_ports              = %u\n"
-	     "\t max_voice_channels     = %u\n"
-	     "\t max_output_channels    = %u\n"
-	     "\t alloc_handler          = 0x%016" PRIx64 "\n"
+	LOGF("\t alloc_handler          = 0x%016" PRIx64 "\n"
 	     "\t free_handler           = 0x%016" PRIx64 "\n"
 	     "\t user_data              = 0x%016" PRIx64 "\n",
-	     rack_id, option->name, option->flags, option->max_grain_samples, option->max_voices,
-	     option->max_input_delay_blocks, option->max_matrices, option->max_ports,
-	     option->max_voice_channels, option->max_output_channels,
 	     reinterpret_cast<uint64_t>(allocator->alloc_handler),
 	     reinterpret_cast<uint64_t>(allocator->free_handler),
 	     static_cast<uint64_t>(allocator->user_data));
@@ -2477,26 +2624,41 @@ int KYTY_SYSV_ABI Ngs2RackDestroy(uintptr_t rack_handle, Ngs2ContextBufferInfo* 
 	if (ngs == nullptr) {
 		return ERROR_INVALID_RACK_HANDLE;
 	}
-
 	Ngs2ContextBufferInfo context_buffer;
 	Ngs2BufferAllocator   allocator;
 	{
 		Common::LockGuard lock(ngs->mutex);
-		Common::LockGuard racks_lock(g_racks_mutex);
-
-		auto** link = &g_racks_list;
-		while (*link != nullptr && *link != rack) {
-			link = &(*link)->next;
+		{
+			Common::LockGuard racks_lock(g_racks_mutex);
+			auto**            link = &g_racks_list;
+			while (*link != nullptr && *link != rack) {
+				link = &(*link)->next;
+			}
+			if (*link == nullptr) {
+				return ERROR_INVALID_RACK_HANDLE;
+			}
+			*link = rack->next;
 		}
-		if (*link == nullptr) {
-			return ERROR_INVALID_RACK_HANDLE;
+		auto* voices = reinterpret_cast<Ngs2VoiceInternal*>(rack + 1);
+		for (uint32_t i = 0; i < rack->option.common.max_voices; ++i) {
+			for (size_t m = 0; m < voices[i].modules.size(); ++m) {
+				const auto& fx = rack->fx[m];
+				if (fx.cleanup != nullptr) {
+					auto&             module = voices[i].modules[m];
+					Ngs2UserFxContext context {rack->common[m].data(),
+					                           module.param.data(),
+					                           module.work.data(),
+					                           fx.user_data,
+					                           rack->option.common.max_voices,
+					                           i};
+					EXIT_NOT_IMPLEMENTED(fx.cleanup(&context) != OK);
+				}
+			}
+			std::destroy_at(voices + i);
 		}
-
-		*link          = rack->next;
 		context_buffer = rack->buffer_info;
 		allocator      = rack->allocator;
-		rack->ngs      = nullptr;
-		rack->next     = nullptr;
+		std::destroy_at(rack);
 	}
 
 	if (allocator.free_handler != nullptr) {
@@ -2539,75 +2701,231 @@ int KYTY_SYSV_ABI Ngs2RackUnlock(uintptr_t rack_handle) {
 	return OK;
 }
 
+static void Ngs2ApplyEvent(Ngs2VoiceInternal& voice) {
+	switch (voice.event) {
+		case Ngs2VoicePlayEvent::None: break;
+		case Ngs2VoicePlayEvent::Play:
+			if (voice.state == Ngs2VoicePlayState::Empty) {
+				voice.state = Ngs2VoicePlayState::Playing;
+			}
+			break;
+		case Ngs2VoicePlayEvent::Pause:
+			if (voice.state == Ngs2VoicePlayState::Playing) {
+				voice.state = Ngs2VoicePlayState::Paused;
+			}
+			break;
+		case Ngs2VoicePlayEvent::Resume:
+			if (voice.state == Ngs2VoicePlayState::Paused) {
+				voice.state = Ngs2VoicePlayState::Playing;
+			}
+			break;
+		case Ngs2VoicePlayEvent::Stop:
+			if (voice.state == Ngs2VoicePlayState::Playing) {
+				voice.state = Ngs2VoicePlayState::Stopped;
+			}
+			break;
+		case Ngs2VoicePlayEvent::StopImm:
+		case Ngs2VoicePlayEvent::Kill: voice.state = Ngs2VoicePlayState::Empty; break;
+	}
+	voice.event = Ngs2VoicePlayEvent::None;
+}
+
+static void Ngs2ConsumeSamples(Ngs2VoiceInternal& voice, uint32_t grain) {
+	uint32_t output = 0;
+	while (output < grain && !voice.blocks.empty()) {
+		auto&          block   = voice.blocks.front();
+		auto           count   = std::min(grain - output, block.info.num_samples - block.cursor);
+		const int16_t* pcm     = nullptr;
+		const float*   decoded = nullptr;
+		if (voice.decoder != nullptr) {
+			const auto skip =
+			    std::min(block.skip_remaining,
+			             static_cast<uint32_t>(voice.decoded_frame.size() / voice.channels));
+			Ajm::AjmGaplessState gapless;
+			gapless.Set({block.info.num_samples - block.cursor, static_cast<uint16_t>(skip), 0},
+			            true);
+			const auto result = voice.decoder->Decode(
+			    block.data + block.data_cursor, block.info.data_size - block.data_cursor,
+			    voice.decoded_frame.data(), voice.decoded_frame.size() * sizeof(float), false,
+			    &gapless);
+			EXIT_NOT_IMPLEMENTED(result.result != OK || result.input_consumed == 0);
+			block.data_cursor += result.input_consumed;
+			block.skip_remaining -= skip - gapless.current.skip_samples;
+			const auto decoded_samples =
+			    static_cast<uint32_t>(result.output_written / (sizeof(float) * voice.channels));
+			if (decoded_samples == 0) {
+				continue;
+			}
+			EXIT_NOT_IMPLEMENTED(decoded_samples > count);
+			count   = decoded_samples;
+			decoded = voice.decoded_frame.data();
+		} else {
+			pcm = reinterpret_cast<const int16_t*>(block.data) +
+			      (block.info.num_skip_samples + block.cursor) * voice.channels;
+		}
+		for (uint32_t c = 0; c < voice.channels; ++c) {
+			for (uint32_t i = 0; i < count; ++i) {
+				const auto index = i * voice.channels + c;
+				voice.samples[c * grain + output + i] =
+				    decoded != nullptr ? decoded[index] : pcm[index] / 32768.0f;
+			}
+		}
+		output += count;
+		block.cursor += count;
+		if (block.cursor == block.info.num_samples) {
+			struct CallbackInfo {
+				uintptr_t   data, voice;
+				uint32_t    flag, reserved;
+				uintptr_t   user;
+				const void* block_data;
+				size_t      size;
+				uint32_t    repeats, attributes;
+			} info {voice.callback_data,
+			        reinterpret_cast<uintptr_t>(&voice),
+			        1,
+			        0,
+			        block.info.user_data,
+			        block.data,
+			        block.info.data_size,
+			        0,
+			        0};
+			static_assert(sizeof(CallbackInfo) == 56);
+			voice.blocks.pop_front();
+			if (voice.blocks.empty() && !voice.accepts_blocks) {
+				voice.state = Ngs2VoicePlayState::Empty;
+			}
+			if (voice.callback != 0 && (voice.callback_flags & 1u) != 0) {
+				reinterpret_cast<void KYTY_SYSV_ABI (*)(const CallbackInfo*)>(voice.callback)(
+				    &info);
+			}
+		}
+	}
+	voice.has_samples = output != 0;
+}
+
+static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2VoiceInternal*>& voices,
+                            uint32_t grain) {
+	if (voice.rendered) {
+		return;
+	}
+	EXIT_NOT_IMPLEMENTED(voice.rendering);
+	voice.rendering = true;
+	voice.samples.assign(grain * voice.channels, 0.0f);
+	voice.has_samples = false;
+	if (voice.state == Ngs2VoicePlayState::Playing) {
+		if (voice.rack->type == Ngs2RackType::CustomSampler) {
+			Ngs2ConsumeSamples(voice, grain);
+		}
+		for (auto* source: voices) {
+			for (const auto& port: source->ports) {
+				if (port.dest != &voice || port.volume == 0.0f) {
+					continue;
+				}
+				Ngs2RenderVoice(*source, voices, grain);
+				if (!source->has_samples) {
+					continue;
+				}
+				EXIT_NOT_IMPLEMENTED(port.input != 0);
+				const auto* matrix = port.matrix < 0 ? nullptr : &source->matrices.at(port.matrix);
+				for (uint32_t dst = 0; dst < voice.channels; ++dst) {
+					for (uint32_t src = 0; src < source->channels; ++src) {
+						const float level =
+						    port.volume * (matrix == nullptr
+						                       ? (src == dst ? 1.0f : 0.0f)
+						                       : matrix->at(dst * source->channels + src));
+						for (uint32_t i = 0; i < grain; ++i) {
+							voice.samples[dst * grain + i] +=
+							    source->samples[src * grain + i] * level;
+						}
+					}
+				}
+				voice.has_samples = true;
+			}
+		}
+		if (voice.has_samples) {
+			const auto& custom = voice.rack->option.custom_sampler.custom_rack_option;
+			for (size_t m = 0; m < voice.modules.size(); ++m) {
+				EXIT_NOT_IMPLEMENTED(custom.module[m].module_id != 0x1f);
+				EXIT_NOT_IMPLEMENTED(custom.module[m].source_buffer_id != 0 ||
+				                     custom.module[m].dest_buffer_id != 0);
+				auto&               module = voice.modules[m];
+				const auto&         fx     = voice.rack->fx[m];
+				std::vector<float*> channels(voice.channels);
+				for (uint32_t c = 0; c < voice.channels; ++c) {
+					channels[c] = voice.samples.data() + c * grain;
+				}
+				Ngs2UserFxProcessContext context {channels.data(),
+				                                  voice.rack->common[m].data(),
+				                                  module.param.data(),
+				                                  module.work.data(),
+				                                  module.state.data(),
+				                                  fx.user_data,
+				                                  module.flags,
+				                                  voice.channels,
+				                                  voice.channels,
+				                                  grain,
+				                                  voice.rack->ngs->option.sample_rate};
+				EXIT_NOT_IMPLEMENTED(fx.process(&context) != OK);
+				module.flags = 0;
+			}
+		}
+	}
+	voice.rendering = false;
+	voice.rendered  = true;
+}
+
 int KYTY_SYSV_ABI Ngs2SystemRender(uintptr_t system_handle, const Ngs2RenderBufferInfo* buffer_info,
                                    uint32_t num_buffer_info) {
-	static std::atomic_uint32_t render_log_count = 0;
-	const auto log_index     = render_log_count.fetch_add(1, std::memory_order_relaxed);
-	const bool log_this_call = (log_index < 16 || (log_index % 600) == 0);
-
-	if (log_this_call) {
-		PRINT_NAME();
-		LOGF("\t call_count      = %" PRIu32 "\n", log_index + 1);
-	}
-
-	EXIT_NOT_IMPLEMENTED(buffer_info == nullptr);
-	EXIT_NOT_IMPLEMENTED(system_handle == 0);
-	EXIT_NOT_IMPLEMENTED(num_buffer_info == 0);
-
+	EXIT_NOT_IMPLEMENTED(buffer_info == nullptr || system_handle == 0 || num_buffer_info == 0);
 	auto* ngs = reinterpret_cast<Ngs2Internal*>(system_handle);
-
 	Common::LockGuard lock(ngs->mutex);
-
-	for (uint32_t i = 0; i < num_buffer_info; i++) {
+	std::vector<Ngs2VoiceInternal*> voices;
+	{
+		Common::LockGuard racks_lock(g_racks_mutex);
+		for (auto* rack = g_racks_list; rack != nullptr; rack = rack->next) {
+			if (rack->ngs != ngs) {
+				continue;
+			}
+			auto* items = reinterpret_cast<Ngs2VoiceInternal*>(rack + 1);
+			for (uint32_t i = 0; i < rack->option.common.max_voices; ++i) {
+				Ngs2ApplyEvent(items[i]);
+				items[i].rendered = false;
+				if (items[i].channels != 0) {
+					voices.push_back(items + i);
+				}
+			}
+		}
+	}
+	for (uint32_t i = 0; i < num_buffer_info; ++i) {
 		if (buffer_info[i].buffer != nullptr && buffer_info[i].buffer_size != 0) {
 			std::memset(buffer_info[i].buffer, 0, buffer_info[i].buffer_size);
 		}
 	}
-
-	Common::LockGuard racks_lock(g_racks_mutex);
-	for (auto* rack = g_racks_list; rack != nullptr; rack = rack->next) {
-		if (rack->ngs == ngs) {
-			auto* voices = reinterpret_cast<Ngs2VoiceInternal*>(rack + 1);
-
-			for (uint32_t i = 0; i < rack->option.common.max_voices; i++) {
-				auto& voice = voices[i];
-				switch (voice.event) {
-					case Ngs2VoicePlayEvent::None:
-						if (voice.state == Ngs2VoicePlayState::Playing ||
-						    voice.state == Ngs2VoicePlayState::Stopped) {
-							voice.state = Ngs2VoicePlayState::Empty;
-						}
-						break;
-					case Ngs2VoicePlayEvent::Play:
-						if (voice.state == Ngs2VoicePlayState::Empty) {
-							voice.state = Ngs2VoicePlayState::Playing;
-						}
-						break;
-					case Ngs2VoicePlayEvent::Pause:
-						if (voice.state == Ngs2VoicePlayState::Playing) {
-							voice.state = Ngs2VoicePlayState::Paused;
-						}
-						break;
-					case Ngs2VoicePlayEvent::Resume:
-						if (voice.state == Ngs2VoicePlayState::Paused) {
-							voice.state = Ngs2VoicePlayState::Playing;
-						}
-						break;
-					case Ngs2VoicePlayEvent::Stop:
-						if (voice.state == Ngs2VoicePlayState::Playing) {
-							voice.state = Ngs2VoicePlayState::Stopped;
-						}
-						break;
-					case Ngs2VoicePlayEvent::StopImm:
-					case Ngs2VoicePlayEvent::Kill: voice.state = Ngs2VoicePlayState::Empty; break;
+	const auto grain = ngs->option.num_grain_samples;
+	for (auto* voice: voices) {
+		Ngs2RenderVoice(*voice, voices, grain);
+		if (voice->rack->type != Ngs2RackType::Mastering || !voice->has_samples) {
+			continue;
+		}
+		EXIT_NOT_IMPLEMENTED(voice->output_id >= num_buffer_info);
+		const auto& output = buffer_info[voice->output_id];
+		EXIT_NOT_IMPLEMENTED(output.buffer == nullptr);
+		EXIT_NOT_IMPLEMENTED(output.waveform_type != 0x18 ||
+		                     output.num_channels != voice->channels);
+		EXIT_NOT_IMPLEMENTED(output.buffer_size < grain * output.num_channels * sizeof(float));
+		auto* pcm = static_cast<float*>(output.buffer);
+		for (uint32_t dst = 0; dst < output.num_channels; ++dst) {
+			for (uint32_t src = 0; src < voice->channels; ++src) {
+				const float level = voice->output_matrix.empty()
+				                        ? (src == dst ? 1.0f : 0.0f)
+				                        : voice->output_matrix.at(src * output.num_channels + dst);
+				for (uint32_t i = 0; i < grain; ++i) {
+					pcm[i * output.num_channels + dst] += voice->samples[src * grain + i] * level;
 				}
-				voice.event = Ngs2VoicePlayEvent::None;
 			}
 		}
 	}
-
-	ngs->render_count++;
-
+	++ngs->render_count;
 	return OK;
 }
 
@@ -2944,6 +3262,7 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 					case 0x0001: {
 						EXIT_NOT_IMPLEMENTED(param->size != sizeof(Ngs2VoiceMatrixLevelsParam));
 						const auto* ml = reinterpret_cast<const Ngs2VoiceMatrixLevelsParam*>(param);
+						voice->SetMatrix(ml->matrix_id, ml->levels, ml->num_levels);
 						LOGF("\t matrix_id  = %u\n"
 						     "\t num_levels = %u\n"
 						     "\t levels     = 0x%016" PRIx64 "\n",
@@ -2954,6 +3273,7 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 						EXIT_NOT_IMPLEMENTED(param->size != sizeof(Ngs2VoicePortVolumeParam));
 						const auto* volume =
 						    reinterpret_cast<const Ngs2VoicePortVolumeParam*>(param);
+						voice->SetVolume(volume->port, volume->level);
 						LOGF("\t port  = %u\n"
 						     "\t level = %f\n",
 						     volume->port, volume->level);
@@ -2962,6 +3282,7 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 					case 0x0003: {
 						EXIT_NOT_IMPLEMENTED(param->size != sizeof(Ngs2VoicePortMatrixParam));
 						const auto* pm = reinterpret_cast<const Ngs2VoicePortMatrixParam*>(param);
+						voice->SetPortMatrix(pm->port, pm->matrix_id);
 						LOGF("\t port      = %u\n"
 						     "\t matrix_id = %d\n",
 						     pm->port, pm->matrix_id);
@@ -2978,6 +3299,10 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 					case 0x0005: {
 						EXIT_NOT_IMPLEMENTED(param->size != sizeof(Ngs2VoicePatchParam));
 						const auto* patch = reinterpret_cast<const Ngs2VoicePatchParam*>(param);
+						EXIT_NOT_IMPLEMENTED(patch->port >= voice->ports.size());
+						voice->ports[patch->port].dest =
+						    reinterpret_cast<Ngs2VoiceInternal*>(patch->dest_handle);
+						voice->ports[patch->port].input = patch->dest_input_id;
 						LOGF("\t connect->port          = %u\n"
 						     "\t connect->dest_input_id = %u\n"
 						     "\t connect->dest_handle   = 0x%016" PRIx64 "\n",
@@ -2987,15 +3312,7 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 					case 0x0006: {
 						EXIT_NOT_IMPLEMENTED(param->size != sizeof(Ngs2VoiceEventParam));
 						const auto* event = reinterpret_cast<const Ngs2VoiceEventParam*>(param);
-						switch (event->event_id) {
-							case 0x0001: voice->event = Ngs2VoicePlayEvent::Play; break;
-							case 0x0002: voice->event = Ngs2VoicePlayEvent::Stop; break;
-							case 0x0004: voice->event = Ngs2VoicePlayEvent::StopImm; break;
-							case 0x0008: voice->event = Ngs2VoicePlayEvent::Kill; break;
-							case 0x0010: voice->event = Ngs2VoicePlayEvent::Pause; break;
-							case 0x0020: voice->event = Ngs2VoicePlayEvent::Resume; break;
-							default: EXIT("unknown event_id: 0x%08" PRIx32 "\n", event->event_id);
-						}
+						voice->SetEvent(event->event_id);
 						LOGF("\t event = %u\n", event->event_id);
 						break;
 					}
@@ -3020,24 +3337,89 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 			case 0x1000: EXIT_NOT_IMPLEMENTED(voice->rack->type != Ngs2RackType::Sampler); break;
 			case 0x2000: EXIT_NOT_IMPLEMENTED(voice->rack->type != Ngs2RackType::Submixer); break;
 			case 0x2001: EXIT_NOT_IMPLEMENTED(voice->rack->type != Ngs2RackType::Reverb); break;
-			case 0x3000: EXIT_NOT_IMPLEMENTED(voice->rack->type != Ngs2RackType::Mastering); break;
-			case 0x4000: {
-				EXIT_NOT_IMPLEMENTED(!Ngs2RackIsCustom(voice->rack->type));
-				auto cid       = param->id & 0xffffu;
-				auto module_id = (cid >> 8u) & 0xffu;
-				auto ctl_id    = (cid >> 5u) & 0x7u;
-				auto module_no = cid & 0x1fu;
-				LOGF("\t custom module_id = 0x%02" PRIx32 ", ctl_id = 0x%" PRIx32
-				     ", module_no = %" PRIu32 "\n",
-				     module_id, ctl_id, module_no);
+			case 0x3000: {
+				EXIT_NOT_IMPLEMENTED(voice->rack->type != Ngs2RackType::Mastering);
+				const auto* values = reinterpret_cast<const uint32_t*>(param + 1);
+				switch (param->id & 0xffffu) {
+					case 0: voice->channels = values[0]; break;
+					case 1: {
+						const auto* matrix =
+						    reinterpret_cast<const Ngs2VoiceMatrixLevelsParam*>(param);
+						EXIT_NOT_IMPLEMENTED(matrix->matrix_id != 5);
+						voice->output_matrix.assign(matrix->levels,
+						                            matrix->levels + matrix->num_levels);
+						break;
+					}
+					case 5: voice->output_id = values[0]; break;
+					default: EXIT("unsupported mastering control: 0x%08" PRIx32 "\n", param->id);
+				}
 				break;
 			}
-			case 0x4001:
+			case 0x4000: {
+				EXIT_NOT_IMPLEMENTED(!Ngs2RackIsCustom(voice->rack->type));
+				const auto index = param->id & 0x1fu;
+				EXIT_NOT_IMPLEMENTED((param->id & 0xffffffe0u) != 0x40001f00u ||
+				                     index >= voice->modules.size());
+				struct FxParam {
+					Ngs2VoiceParamHeader header;
+					const void*          data;
+					size_t               size;
+				};
+				const auto& fx     = *reinterpret_cast<const FxParam*>(param);
+				auto&       module = voice->modules[index];
+				EXIT_NOT_IMPLEMENTED(voice->rack->fx[index].control != 0 ||
+				                     fx.size != module.param.size());
+				std::memcpy(module.param.data(), fx.data, fx.size);
+				module.flags |= 2;
+				break;
+			}
+			case 0x4001: {
 				EXIT_NOT_IMPLEMENTED(voice->rack->type != Ngs2RackType::CustomSampler);
+				switch (param->id & 0xffffu) {
+					case 0: {
+						const auto& format =
+						    *reinterpret_cast<const Ngs2WaveformFormat*>(param + 1);
+						voice->SetupSampler(format);
+						break;
+					}
+					case 1: {
+						struct BlocksParam {
+							Ngs2VoiceParamHeader     header;
+							const uint8_t*           data;
+							uint32_t                 flags, count;
+							const Ngs2WaveformBlock* blocks;
+						};
+						const auto& blocks = *reinterpret_cast<const BlocksParam*>(param);
+						EXIT_NOT_IMPLEMENTED(!voice->accepts_blocks ||
+						                     (blocks.flags != 0 && blocks.flags != 0x11));
+						voice->accepts_blocks = (blocks.flags & 1u) != 0;
+						for (uint32_t i = 0; i < blocks.count; ++i) {
+							const auto& block = blocks.blocks[i];
+							EXIT_NOT_IMPLEMENTED(block.num_repeats != 0 || block.num_samples == 0);
+							EXIT_NOT_IMPLEMENTED(
+							    voice->decoder == nullptr &&
+							    (uint64_t(block.num_skip_samples) + block.num_samples) *
+							            voice->channels * 2 >
+							        block.data_size);
+							voice->blocks.push_back({blocks.data + block.data_offset, block});
+						}
+						break;
+					}
+					case 5:
+						EXIT_NOT_IMPLEMENTED(*reinterpret_cast<const float*>(param + 1) != 1.0f);
+						break;
+					default: EXIT("unsupported sampler control: 0x%08" PRIx32 "\n", param->id);
+				}
 				break;
-			case 0x4002:
-				EXIT_NOT_IMPLEMENTED(voice->rack->type != Ngs2RackType::CustomSubmixer);
+			}
+			case 0x4002: {
+				EXIT_NOT_IMPLEMENTED(voice->rack->type != Ngs2RackType::CustomSubmixer ||
+				                     (param->id & 0xffffu) != 0);
+				const auto* channels   = reinterpret_cast<const uint32_t*>(param + 1);
+				EXIT_NOT_IMPLEMENTED(channels[0] != channels[1]);
+				voice->channels = channels[0];
 				break;
+			}
 			case 0x4003:
 				EXIT_NOT_IMPLEMENTED(voice->rack->type != Ngs2RackType::CustomMastering);
 				break;
@@ -3055,14 +3437,44 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 }
 
 int KYTY_SYSV_ABI Ngs2VoiceRunCommands(uintptr_t voice_handle, const void* commands,
-                                       uint32_t num_commands, uint32_t flags) {
-	PRINT_NAME();
-
-	(void)voice_handle;
-	(void)commands;
-	(void)num_commands;
-	(void)flags;
-
+                                       size_t num_commands) {
+	struct Command {
+		uint32_t id;
+		uint8_t  flags, type;
+		uint16_t count;
+		union {
+			uint32_t     u;
+			int32_t      i;
+			float        f;
+			const float* levels;
+		} value;
+	};
+	auto*             voice = reinterpret_cast<Ngs2VoiceInternal*>(voice_handle);
+	Common::LockGuard lock(voice->rack->ngs->mutex);
+	const auto*       params = static_cast<const Command*>(commands);
+	for (size_t i = 0; i < num_commands; ++i) {
+		const auto& p     = params[i];
+		const auto  index = p.id >> 24;
+		switch (p.id & 0xffffffu) {
+			case 2:
+				EXIT_NOT_IMPLEMENTED(p.type != 4);
+				voice->SetEvent(p.value.u);
+				break;
+			case 5:
+				EXIT_NOT_IMPLEMENTED(p.type != 0x11);
+				voice->SetMatrix(index, p.value.levels, p.count);
+				break;
+			case 6:
+				EXIT_NOT_IMPLEMENTED(p.type != 1);
+				voice->SetVolume(index, p.value.f);
+				break;
+			case 7:
+				EXIT_NOT_IMPLEMENTED(p.type != 3);
+				voice->SetPortMatrix(index, p.value.i);
+				break;
+			default: EXIT("unknown command: 0x%08" PRIx32 "\n", p.id);
+		}
+	}
 	return OK;
 }
 

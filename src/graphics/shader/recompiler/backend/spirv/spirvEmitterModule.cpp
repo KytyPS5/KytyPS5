@@ -553,8 +553,17 @@ void DefineOutputs(EmitterState& state) {
 				const auto type = uint_output ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4);
 				binding.variable_id = DefineInterfaceVariable(state, type, spv::StorageClassOutput,
 				                                              binding.debug_name.c_str());
+				const bool dual_source = binding.kind == IR::StageOutputKind::Mrt &&
+				                         state.program.stage == ShaderType::Pixel &&
+				                         state.input_info.pixel->dual_source_blending;
+				EXIT_NOT_IMPLEMENTED(dual_source && binding.index > 1);
 				state.builder.AddAnnotation(spv::OpDecorate, binding.variable_id,
-				                            spv::DecorationLocation, binding.location);
+				                            spv::DecorationLocation,
+				                            dual_source ? 0u : binding.location);
+				if (dual_source) {
+					state.builder.AddAnnotation(spv::OpDecorate, binding.variable_id,
+					                            spv::DecorationIndex, binding.index);
+				}
 				break;
 			}
 		}

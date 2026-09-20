@@ -12831,6 +12831,7 @@ public:
     const uint32_t extent = depth_feedback ? 8 : 32;
     constexpr uintptr_t depth_address = 0x0000000204400000ull;
     constexpr uint64_t allocation_size = 0x40000;
+    constexpr uint64_t rect_address = depth_address + 0x8000;
     EnsureRuntimeContext();
     RenderContext context(m_runtime_context);
     auto &scheduler = context.GetCommandScheduler();
@@ -12864,6 +12865,15 @@ public:
       for (uint32_t x = 0; x < extent; x++) {
         static_cast<float *>(mapped)[y * 64 + x] = initial_depth(x, y);
       }
+    }
+    if (!depth_feedback && !packed_vertex_color) {
+      // Rectangle input contains three position/UV records.
+      constexpr std::array<float, 24> rect_vertices{
+          -0.75f, -0.75f, 0, 0, 0, 0, 0, 0,
+           0.75f, -0.75f, 0, 0, 1, 0, 0, 0,
+          -0.75f,  0.75f, 0, 0, 0, 1, 0, 0};
+      std::memcpy(reinterpret_cast<void *>(rect_address), rect_vertices.data(),
+                  sizeof(rect_vertices));
     }
     resources.MapMemory(depth_address, allocation_size);
     if (depth_feedback) {
@@ -13520,6 +13530,82 @@ public:
         const auto expected = component % 4 == 3 ? 0x3f800000u : 0x3e800000u;
         Require(name, "sparse MRT3 output", sparse_pixels[component] == expected,
                 "MRT3 was compacted to a different slot or clipped by unused MRT0");
+      }
+
+      // A fourth VS invocation reads beyond the descriptor instead of reconstructing the corner.
+      const ShaderBufferResource rect_buffer{{
+          static_cast<u32>(rect_address),
+          static_cast<u32>(rect_address >> 32u) | (32u << 16u), 3,
+          DstSel(4, 5, 6, 7) |
+              (static_cast<u32>(Prospero::BufferFormat::k32Float) << 12u)}};
+      static const auto rect_vertex_code = [] {
+        std::vector<u32> code{
+            EncodeMubuf0(0x0d, 0, true, false), EncodeMubuf1(0, 2, 5),
+            EncodeMubuf0(0x0d, 16, true, false), EncodeMubuf1(2, 2, 5)};
+        AppendVMovU32(&code, 4, 0);
+        AppendVMovLiteral(&code, 6, 0x3f800000u);
+        code.insert(code.end(), {EncodeExp0(0x0c, 0xf), EncodeExp1(0, 1, 4, 6),
+                                 EncodeExp0(0x20, 0xf), EncodeExp1(2, 3, 4, 6)});
+        AppendEnd(&code);
+        return code;
+      }();
+      static const auto rect_pixel_code = [] {
+        std::vector<u32> code;
+        for (u32 component = 0; component < 2; component++) {
+          code.push_back(EncodeVintrp(0, 20 + component, 0, component, 0));
+          code.push_back(EncodeVintrp(1, 20 + component, 0, component, 1));
+        }
+        AppendVMovU32(&code, 22, 0);
+        AppendVMovLiteral(&code, 23, 0x3f800000u);
+        code.insert(code.end(), {EncodeExp0(0x03, 0xf), EncodeExp1(20, 21, 22, 23)});
+        AppendEnd(&code);
+        return code;
+      }();
+      const auto rect_vs = reinterpret_cast<uint64_t>(rect_vertex_code.data());
+      const auto rect_ps = reinterpret_cast<uint64_t>(rect_pixel_code.data());
+      ShaderMapUserData(rect_vs,
+          {.type = Prospero::ShaderBinaryType::kGs, .user_data = &native_user_data,
+           .code_size_bytes = static_cast<u32>(rect_vertex_code.size() * sizeof(u32))});
+      ShaderMapUserData(rect_ps,
+          {.type = Prospero::ShaderBinaryType::kPs,
+           .code_size_bytes = static_cast<u32>(rect_pixel_code.size() * sizeof(u32))});
+      shaders.SetEsShaderBase(rect_vs);
+      shaders.SetPsShaderBase(rect_ps);
+      shaders.SetGsShaderResource2({.user_sgpr = 4});
+      for (u32 i = 0; i < 4; i++) {
+        shaders.SetGsUserSgpr(i, rect_buffer.fields[i], HW::UserSgprType::Vsharp);
+      }
+      registers.SetPsInControl(0x8001);
+      registers.SetPsInputEna(2);
+      registers.SetPsInputAddr(2);
+      registers.SetPsInputSettings(0, 0);
+      for (const auto primitive : {Prospero::PrimitiveType::kRectList,
+                                    Prospero::PrimitiveType::kRectListLegacy}) {
+        const char *rect_name = primitive == Prospero::PrimitiveType::kRectList
+                                    ? "RectListThreeRecords" : "LegacyRectListThreeRecords";
+        user_config.SetPrimitiveType(primitive);
+        registers.SetModeControl({});
+        TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), sparse_color.image_id,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
+        RenderExecutorTestAccess::DrawAuto(
+            executor, scheduler.Current(), {.vertex_count = 3, .instance_count = 1});
+        const auto pixels = ReadCachedTexel(name, context, sparse_color.image_id,
+                                            {}, {extent, extent, 1});
+        for (u32 y = 0; y < extent; y++) {
+          for (u32 x = 0; x < extent; x++) {
+            const bool inside = x >= 4 && x < 28 && y >= 4 && y < 28;
+            const auto offset = 4 * (y * extent + x);
+            const std::array<float, 4> expected{
+                inside ? (x + 0.5f - 4) / 24 : 0,
+                inside ? (y + 0.5f - 4) / 24 : 0, 0, inside ? 1.0f : 0};
+            for (u32 component = 0; component < 4; component++) {
+              Require(rect_name, "three-vertex rectangle coverage and UV",
+                  std::abs(std::bit_cast<float>(pixels[offset + component]) -
+                           expected[component]) < 0.0001f,
+                  "rectangle reconstruction lost its fourth corner or interpolated UVs");
+            }
+          }
+        }
       }
       DestroyBuffer(&stencil_readback);
 
@@ -15011,6 +15097,7 @@ private:
     Require("VulkanHarness", "graphics", available_features12.shaderOutputLayer == true,
             "vertex layer output is not supported");
     Require("VulkanHarness", "graphics", available_features.fillModeNonSolid &&
+                available_features.tessellationShader &&
                 available_depth_clip.depthClipEnable && available_clip_control.depthClipControl &&
                 available_color_write.colorWriteEnable &&
                 available_feedback_layout.attachmentFeedbackLoopLayout &&
@@ -15076,6 +15163,7 @@ private:
     device_features.sampleRateShading = true;
     device_features.shaderInt64 = true;
     device_features.fillModeNonSolid = true;
+    device_features.tessellationShader = true;
     device_info.pEnabledFeatures = &device_features;
     constexpr const char *device_extensions[] = {
         VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
@@ -15734,6 +15822,7 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   case Opcode::V_CMP_GE_F16:
   case Opcode::V_CMP_NGT_F16:
   case Opcode::V_CMP_NEQ_F16:
+  case Opcode::V_CMP_NLT_F16:
   case Opcode::V_CMPX_LT_F16:
   case Opcode::V_CMPX_EQ_F16:
   case Opcode::V_CMPX_LE_F16:
@@ -17976,6 +18065,29 @@ TestCase Vop1SdwaNotCapturedByte0Source() {
   return test;
 }
 
+TestCase Vop1SdwaNotPreservesHighWordDestination() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendBufferLoadDword(&code, 0, 30);
+  AppendVMovLiteral(&code, 3, 0xabcd5555u);
+  code.push_back(0x7e066ef9u);
+  code.push_back(0x00061400u);
+  AppendStoreVgpr(&code, 3, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "Vop1SdwaNotPreservesHighWordDestination";
+  test.code = std::move(code);
+  test.initial = {0x12345678u};
+  test.expected = {0xabcda987u};
+  test.opcodes = {O::BUFFER_LOAD_DWORD, O::V_MOV_B32, O::V_NOT_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.ir_counts = {{" = BitwiseNot32 ", 1}};
+  test.required_spirv = {"OpNot"};
+  return test;
+}
+
 TestCase Vop1SdwaMovByteDestinations() {
   using O = ShaderOpcode;
 
@@ -18156,6 +18268,109 @@ TestCase Vop3CvtPkI16I32Captured() {
                     {" = ShiftLeftLogical32 ", 1},
                     {" = BitwiseOr32 ", 1}};
   test.required_spirv = {"OpBitwiseAnd", "OpShiftLeftLogical", "OpBitwiseOr"};
+  return test;
+}
+
+TestCase Vop3MulLoU16CapturedAndSelectors() {
+  using O = ShaderOpcode;
+
+  TestCase test;
+  test.name = "Vop3MulLoU16CapturedAndSelectors";
+  // Distinct runtime halves expose source selection and prevent constant folding.
+  test.initial = {0x00138001u, 0x0005ffffu, 0xffffffffu};
+  test.expected = {0x00138001u, 0x0005ffffu, 0xffffffffu,
+                   0xa5a57fffu, 0xa5a5ffedu, 0xa5a58005u, 0xa5a5005fu,
+                   0x7fff1234u, 0xffed1234u, 0x80051234u, 0x005f1234u,
+                   0xffff0001u, 0x00231234u};
+  auto &code = test.code;
+  AppendBufferLoadDword(&code, 12, 30);
+  AppendVMovU32(&code, 30, 4);
+  AppendBufferLoadDword(&code, 24, 30);
+  u32 output = 3;
+  for (u32 selectors : {0u, 1u, 2u, 3u, 8u, 9u, 10u, 11u}) {
+    AppendVMovLiteral(&code, 2, 0xa5a51234u);
+    if (selectors == 8u) {
+      code.push_back(0xd7054002u);
+      code.push_back(0x0002310cu); // Captured v_mul_lo_u16 v2.hi, v12.lo, v24.lo.
+    } else {
+      AppendVop3(&code, 0x305, 2, Vgpr(12), Vgpr(24), 0, 0, selectors);
+    }
+    AppendStoreVgpr(&code, 2, output++);
+  }
+
+  // 0xffff * 0xffff wraps to 1; aliasing preserves the original high half.
+  AppendVMovU32(&code, 30, 8);
+  AppendBufferLoadDword(&code, 12, 30);
+  AppendVop3(&code, 0x305, 12, Vgpr(12), Vgpr(12), 0, 0, 1);
+  AppendStoreVgpr(&code, 12, output++);
+
+  AppendVMovLiteral(&code, 2, 0xa5a51234u);
+  AppendVop3(&code, 0x305, 2, 255, Vgpr(24), 0, 0, 11);
+  code.push_back(0x0007deadu); // Select literal high half: 7 * 5 = 35.
+  AppendStoreVgpr(&code, 2, output);
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_MUL_LO_U16,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"V_MUL_LO_U16", 10}};
+  test.required_spirv = {"OpIMul"};
+  return test;
+}
+
+TestCase Vop3MadI16CapturedSelectorsAndSaturation() {
+  using O = ShaderOpcode;
+  struct MadCase {
+    u32 lhs, rhs, addend, expected;
+    u32 selectors = 0;
+    bool clamp = false;
+    u32 dst = 1;
+  };
+  constexpr u32 a = 0x8000fffdu, b = 0xfffe0005u, c = 0xfff90007u;
+  const std::array<MadCase, 14> cases{{
+      {a, b, c, 0xa5a5fff8u}, // Captured: -3 * 5 + 7 = -8.
+      {a, b, c, 0x8007beefu, 9}, // Source 0 high; destination high.
+      {a, b, c, 0xa5a5000du, 2}, // Source 1 high: -3 * -2 + 7.
+      {a, b, c, 0xa5a5ffeau, 4}, // Source 2 high: -3 * 5 - 7.
+      {a, b, c, 0xfff9beefu, 15}, // All high: -32768 * -2 - 7 wraps.
+      {a, b, c, 0xfff8fffdu, 8, false, 9}, // Destination aliases source 0.
+      {0x7fffu, 1, 1, 0xa5a58000u},
+      {0x7fffu, 1, 1, 0x7fffbeefu, 8, true}, // Positive saturation.
+      {0x8000u, 1, 0xffffu, 0xa5a57fffu},
+      {0x8000u, 1, 0xffffu, 0x8000beefu, 8, true}, // Negative saturation.
+      {0x8000u, 0x8000u, 0xffffu, 0xa5a5ffffu},
+      {0x8000u, 0x8000u, 0xffffu, 0xa5a57fffu, 0, true},
+      {200, 200, 0xd8f0u, 0xa5a57530u, 0, true}, // 40000 - 10000 = 30000.
+      {200, 0xff38u, 10000, 0xa5a58ad0u, 0, true}, // -40000 + 10000 = -30000.
+  }};
+  TestCase test;
+  test.name = "Vop3MadI16CapturedSelectorsAndSaturation";
+  for (const auto &entry : cases) {
+    test.initial.insert(test.initial.end(), {entry.lhs, entry.rhs, entry.addend});
+  }
+  test.expected = test.initial;
+  auto &code = test.code;
+  for (u32 i = 0; i < cases.size(); ++i) {
+    const auto &entry = cases[i];
+    u32 offset = i * 12u;
+    for (u32 reg : {9u, 6u, 15u}) {
+      AppendVMovU32(&code, 30, offset);
+      AppendBufferLoadDword(&code, reg, 30); // Runtime inputs prevent folding.
+      offset += 4u;
+    }
+    AppendVMovLiteral(&code, 1, 0xa5a5beefu);
+    if (i == 0u) {
+      code.insert(code.end(), {0xd75e0001u, 0x043e0d09u});
+    } else {
+      AppendVop3(&code, 0x35e, entry.dst, Vgpr(9), Vgpr(6), Vgpr(15), 0,
+                  entry.selectors, entry.clamp);
+    }
+    AppendStoreVgpr(&code, entry.dst, static_cast<u32>(test.initial.size()) + i);
+    test.expected.push_back(entry.expected);
+  }
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_MAD_I16,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"V_MAD_I16", cases.size()}};
+  test.required_spirv = {"OpIMul", "OpIAdd"};
   return test;
 }
 
@@ -18993,6 +19208,37 @@ TestCase Vop3pOpselHiUsesArchitecturalSourceBits() {
           {O::V_MOV_B32, O::V_PK_FMA_F16, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase Vop3pIntegerNegationCapturedAndSelectedHalves() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 6, 0xfed4ff38u); // (-200, -300)
+  AppendVMovLiteral(&code, 3, 0x012c00c8u); // (200, 300)
+  // Captured temporal shader: NEG_LO/HI turns 0x7fff into 0xffff (-1).
+  // Adding that clamped offset must select (199,299), not collapse to (0,0).
+  code.insert(code.end(), {0xcc074107u, 0x30020cffu, 0x00007fffu});
+  code.insert(code.end(), {0xcc0a4010u, 0x18020f03u});
+  AppendStoreVgpr(&code, 7, 0);
+  AppendStoreVgpr(&code, 16, 1);
+
+  AppendVMovLiteral(&code, 0, 0x80011234u);
+  AppendVMovLiteral(&code, 1, 0xbeef5678u);
+  // Independently negate src0 low and src1 high, then reverse both the
+  // modified sources and src1 half selection. NEG flips the selected sign bit.
+  AppendVop3p(&code, 0x0a, 10, Vgpr(0), Vgpr(1), 0, 0x3, 0, 0x2, 0x1);
+  AppendVop3p(&code, 0x0a, 11, Vgpr(0), Vgpr(1), 0, 0x1, 0x2, 0x1, 0x2);
+  AppendStoreVgpr(&code, 10, 2);
+  AppendStoreVgpr(&code, 11, 3);
+  AppendEnd(&code);
+
+  return {"Vop3pIntegerNegationCapturedAndSelectedHalves",
+          code,
+          {},
+          {0xffffffffu, 0x012b00c7u, 0xbef0e8acu, 0x56795123u},
+          {O::V_MOV_B32, O::V_PK_MAX_I16, O::V_PK_ADD_U16,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+}
+
 TestCase CvtPkU8F32PacksSelectedByte() {
   using O = ShaderOpcode;
 
@@ -19683,6 +19929,62 @@ TestCase VectorPermlane16FetchInactiveFi() {
                   O::S_MOV_B64,          O::S_MOV_B32,    O::V_PERMLANE16_B32,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.compute_info.threads_num[0] = 4;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase VectorDpp8Captured(bool masked_exec) {
+  using O = ShaderOpcode;
+  constexpr u32 sentinel = 0xaaaaaaaau;
+  const u32 masks[] = {masked_exec ? 0x0f0f0f0fu : 0xffffffffu,
+                      masked_exec ? 0xf0f0f0f0u : 0xffffffffu};
+  std::vector<u32> code;
+  AppendVMovU32(&code, 5, 100);
+  code.push_back(EncodeVop2(0x25, 5, Vgpr(0), 5));
+  AppendVMovLiteral(&code, 2, sentinel);
+  AppendVMovLiteral(&code, 3, sentinel);
+  AppendSMovLiteral(&code, 126, masks[0]);
+  AppendSMovLiteral(&code, 127, masks[1]);
+  // Captured DPP8 selectors broadcast each group's upper/lower four lanes.
+  code.push_back(EncodeVop1(0x01, 2, 233));
+  code.push_back(0xfacfac05u);
+  code.push_back(EncodeVop1(0x01, 3, 233));
+  code.push_back(0x68868805u);
+  AppendSMovLiteral(&code, 126, 0xffffffffu);
+  AppendSMovLiteral(&code, 127, 0xffffffffu);
+  code.push_back(EncodeVop2(0x1a, 6, InlineU32(2), 0));
+  AppendBufferStoreDword(&code, 2, 6);
+  AppendVMovU32(&code, 7, 64u * sizeof(u32));
+  code.push_back(EncodeVop2(0x25, 6, Vgpr(7), 6));
+  AppendBufferStoreDword(&code, 3, 6);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = masked_exec ? "VectorDpp8CapturedMaskedExec"
+                          : "VectorDpp8Captured";
+  test.code = std::move(code);
+  test.expected.resize(128, sentinel);
+  for (u32 lane = 0; lane < 64; ++lane) {
+    const auto mask = masks[lane / 32u];
+    if ((mask & (1u << (lane % 32u))) == 0) {
+      continue;
+    }
+    const u32 sources[] = {(lane & ~7u) | 4u | (lane & 3u),
+                           (lane & ~7u) | (lane & 3u)};
+    for (u32 permutation = 0; permutation < 2; ++permutation) {
+      const auto source = sources[permutation];
+      test.expected[permutation * 64u + lane] =
+          (mask & (1u << (source % 32u))) != 0 ? 100u + source : 0u;
+    }
+  }
+  test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::S_MOV_B32,
+                  O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{".dpp8(", 2}};
+  test.compute_info.wave_size = 64;
+  test.compute_info.threads_num[0] = 64;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
   test.compute_info.thread_ids_num = 1;
@@ -21338,6 +21640,88 @@ TestCase VectorVopcCmpNgtF16CapturedSdwaAndEdges() {
                   O::V_CMP_NGT_F16, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.decoded_counts = {{"V_CMP_NGT_F16", cases.size()}};
   test.required_spirv = {"OpFUnordLessThanEqual"};
+  test.compute_info.wave_size = 32;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase VectorVopcCmpNltF16CapturedSdwaAndEdges() {
+  using O = ShaderOpcode;
+  enum Encoding { Captured, Compact, Vop3NegAbs, SdwaNegAbs };
+  struct CompareCase {
+    u32 packed; // Captured instruction compares low half against high half.
+    u32 expected;
+    Encoding encoding = Captured;
+    u32 exec = 1;
+  };
+  const std::array<CompareCase, 16> cases{{
+      {0x40003c00u, 0}, // +1 < +2
+      {0x3c004000u, 1}, // +2 > +1
+      {0x3c003c00u, 1}, // Equal
+      {0x80000000u, 1}, // +0 versus -0
+      {0x00008000u, 1}, // -0 versus +0
+      {0x3c007e00u, 1}, // Quiet NaN in src0: unordered GE, not ordered GE.
+      {0x7e003c00u, 1}, // Quiet NaN in src1
+      {0x3c007c01u, 1}, // Signaling NaN in src0
+      {0x7c013c00u, 1}, // Signaling NaN in src1
+      {0xfc007c00u, 1}, // +infinity versus -infinity
+      {0x7c00fc00u, 0}, // -infinity versus +infinity
+      {0x00003c00u, 0, Captured, 0}, // Inactive lane contributes no mask bit.
+      {0x40003c00u, 0, Compact},
+      {0x7e003c00u, 1, Compact},
+      {0x0000bc00u, 0, Vop3NegAbs}, // -abs(-1) < 0
+      {0x0000bc00u, 0, SdwaNegAbs},
+  }};
+  constexpr u32 sentinel = 0x89abcdefu;
+  TestCase test;
+  test.name = "VectorVopcCmpNltF16CapturedSdwaAndEdges";
+  for (const auto &entry : cases) {
+    test.initial.push_back(entry.packed);
+  }
+  test.expected = test.initial;
+  auto &code = test.code;
+  code.push_back(EncodeSMovB32(22, 2)); // Preserve the input buffer descriptor.
+  code.push_back(EncodeSMovB32(23, 3));
+  for (u32 i = 0; i < cases.size(); ++i) {
+    const auto &entry = cases[i];
+    AppendVMovU32(&code, 30, i * 4u);
+    AppendBufferLoadDword(&code, 3, 30); // Runtime input prevents constant folding.
+    AppendVMovU32(&code, 1, entry.packed >> 16u);
+    for (u32 reg : {3u, 106u, 107u}) {
+      AppendSMovLiteral(&code, reg, sentinel);
+    }
+    code.push_back(EncodeSMovB32(126, InlineU32(entry.exec)));
+    switch (entry.encoding) {
+    case Captured: code.insert(code.end(), {0x7ddc06f9u, 0x05068203u}); break;
+    case Compact: code.push_back(EncodeVopc(0xee, Vgpr(3), 1)); break;
+    case Vop3NegAbs:
+      AppendVop3(&code, 0xee, 2, Vgpr(3), Vgpr(1), 0, 1, 0, false, 0, 1);
+      break;
+    case SdwaNegAbs:
+      code.insert(code.end(), {0x7ddc06f9u, 0x05368203u});
+      break;
+    }
+    code.push_back(EncodeSMovB32(20, entry.encoding == Compact ? 106 : 2));
+    code.push_back(EncodeSMovB32(21, 3)); // Wave32 must preserve adjacent SGPR.
+    code.push_back(EncodeSMovB32(24, 126));
+    code.push_back(EncodeSMovB32(25, 127));
+    code.push_back(EncodeSMovB32(126, InlineU32(1)));
+    code.push_back(EncodeSMovB32(2, 22));
+    code.push_back(EncodeSMovB32(3, 23));
+    const u32 out = static_cast<u32>(cases.size()) + i * 6u;
+    AppendStoreSgprPair(&code, 20, out);
+    AppendStoreSgprPair(&code, 24, out + 2u);
+    AppendStoreSgprPair(&code, 106, out + 4u);
+    test.expected.insert(test.expected.end(),
+                         {entry.expected, sentinel, entry.exec, 0u,
+                          entry.encoding == Compact ? entry.expected : sentinel,
+                          sentinel});
+  }
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::BUFFER_LOAD_DWORD,
+                  O::V_CMP_NLT_F16, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"V_CMP_NLT_F16", cases.size()}};
+  test.required_spirv = {"OpFUnordGreaterThanEqual"};
   test.compute_info.wave_size = 32;
   test.has_compute_info = true;
   return test;
@@ -26815,6 +27199,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorFfbhI32NativeAndVop3OnGpu);
   AddCase(Vop1SdwaFfblCapturedHighWordSource);
   AddCase(Vop1SdwaNotCapturedByte0Source);
+  AddCase(Vop1SdwaNotPreservesHighWordDestination);
   AddCase(Vop1SdwaMovByteDestinations);
   AddCase(Vop2SdwaSubNcExactByte2Destination);
   AddCase(Vop2SdwaAddNcCapturedHighWordDestination);
@@ -26822,6 +27207,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(Vop2SdwaLshrrevCapturedByte1Source);
   AddCase(Vop2SdwaSubNcPreservesByteAndWordDestinations);
   AddCase(Vop3CvtPkI16I32Captured);
+  AddCase(Vop3MulLoU16CapturedAndSelectors);
+  AddCase(Vop3MadI16CapturedSelectorsAndSaturation);
   AddCase(Vop3Med3I16Captured);
   AddCase(Vop2SdwaMinU32PreservesWordDestination);
   AddCase(VectorShiftCountsMaskLowBits);
@@ -26845,6 +27232,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(Vop2PkFmacF16AccumulatesPackedHalvesIndependently);
   AddCase(Vop2PkFmacF16DppNegatesBothPackedHalves);
   AddCase(Vop3pOpselHiUsesArchitecturalSourceBits);
+  AddCase(Vop3pIntegerNegationCapturedAndSelectedHalves);
   AddCase(CvtPkU8F32PacksSelectedByte);
   AddCase(CvtPkrtzF16F32SubnormalRoundsTowardZero);
   AddCase(CvtPkrtzF16F32SdwaAndOutputModifiers);
@@ -26864,6 +27252,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorPermlanex16);
   AddCase(VectorPermlane16FetchInactiveZero);
   AddCase(VectorPermlane16FetchInactiveFi);
+  cases.push_back(VectorDpp8Captured(false));
+  cases.push_back(VectorDpp8Captured(true));
   AddCase(VectorDppQuadPermuteReverse);
   AddCase(VectorDppRowXmask);
   AddCase(VectorDppBankMaskPreservesDestination);
@@ -26910,6 +27300,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorVopcCmpxGtU16CapturedSdwaExecMask);
   AddCase(VectorVopcCmpxLtU16CapturedSdwaExecMask);
   AddCase(VectorVopcCmpNgtF16CapturedSdwaAndEdges);
+  AddCase(VectorVopcCmpNltF16CapturedSdwaAndEdges);
   AddCase(VectorVopcCmpxNgtF16CapturedSdwaExecMask);
   AddCase(VectorCompareInvertedMaskSelect);
   AddCase(BranchSelect);
@@ -31563,6 +31954,21 @@ int main(int argc, char **argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
+  if (argc == 2 && std::strcmp(argv[1], "--packed-integer-neg-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, Vop3pIntegerNegationCapturedAndSelectedHalves());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--dpp-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, VectorDpp8Captured(false));
+    RunCase(&vulkan, VectorDpp8Captured(true));
+    RunCase(&vulkan, VectorDppQuadPermuteReverse());
+    RunCase(&vulkan, VectorDppRowXmask());
+    RunCase(&vulkan, VectorDppBankMaskPreservesDestination());
+    RunCase(&vulkan, VectorDppBoundsControlZeroPreservesDestination());
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-snorm-store-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, BufferStoreFormatXyzwSnorm16CapturedSkinningVectors());
@@ -31605,6 +32011,11 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, VectorCompareF16Ops());
     RunCase(&vulkan, Wave32VccMasksPreserveOtherHalf());
     RunCase(&vulkan, VectorVop3FloatCompareNegSourceModifier());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--cmp-nlt-f16-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, VectorVopcCmpNltF16CapturedSdwaAndEdges());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--fract-f16-only") == 0) {
@@ -31806,6 +32217,16 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--med3-i16-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, Vop3Med3I16Captured());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--mul-lo-u16-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, Vop3MulLoU16CapturedAndSelectors());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--mad-i16-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, Vop3MadI16CapturedSelectorsAndSaturation());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--waitcnt-depctr-only") == 0) {

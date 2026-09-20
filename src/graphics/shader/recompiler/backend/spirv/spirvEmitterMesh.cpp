@@ -28,6 +28,26 @@ uint32_t MeshOutputType(EmitterState& state, IR::StageOutputKind kind) {
 	return kind == IR::StageOutputKind::Layer ? TypeU32(state) : TypeF32Vector(state, 4);
 }
 
+bool MeshOutputIsConsumed(const EmitterState& state, const OutputBinding& output) {
+	if (output.kind != IR::StageOutputKind::Parameter) {
+		return true;
+	}
+	const auto* pixel = state.input_info.vertex->pixel_input;
+	if (pixel == nullptr || pixel->input_num > std::size(pixel->interpolator_settings) ||
+	    pixel->parameter_plan.valid || !pixel->parameter_plan.aliases.empty()) {
+		return true;
+	}
+	std::array<bool, 32> consumed_locations {};
+	for (uint32_t input = 0; input < pixel->input_num; input++) {
+		const auto location = ShaderPixelParameterMappedLocation(*pixel, input);
+		if (location >= consumed_locations.size() || consumed_locations[location]) {
+			return true;
+		}
+		consumed_locations[location] = true;
+	}
+	return output.location < consumed_locations.size() && consumed_locations[output.location];
+}
+
 } // namespace
 
 void DefineMeshOutputs(EmitterState& state) {
@@ -38,15 +58,18 @@ void DefineMeshOutputs(EmitterState& state) {
 		    output.kind != IR::StageOutputKind::Layer) {
 			EXIT("unsupported mesh output kind=%u\n", static_cast<uint32_t>(output.kind));
 		}
-		const auto type    = MeshOutputType(state, output.kind);
-		output.variable_id = MeshArray(
-		    state, spv::StorageClassOutput, type,
-		    output.kind == IR::StageOutputKind::Layer ? mesh.max_primitives : mesh.max_vertices);
+		const auto type = MeshOutputType(state, output.kind);
 		// Only Layer is read by another invocation, through the primitive's provoking vertex.
 		const bool shared = output.kind == IR::StageOutputKind::Layer;
 		output.mesh_data_variable =
 		    MeshArray(state, shared ? spv::StorageClassWorkgroup : spv::StorageClassPrivate, type,
 		              shared ? mesh.max_vertices : state.lane_count);
+		if (!MeshOutputIsConsumed(state, output)) {
+			continue;
+		}
+		output.variable_id = MeshArray(
+		    state, spv::StorageClassOutput, type,
+		    output.kind == IR::StageOutputKind::Layer ? mesh.max_primitives : mesh.max_vertices);
 		state.interface_variables.push_back(output.variable_id);
 		state.builder.AddName(output.variable_id, output.debug_name.c_str());
 		if (output.kind == IR::StageOutputKind::Parameter) {
@@ -144,10 +167,10 @@ void EmitMeshEntryPoint(EmitterState& state) {
 		state.builder.AddFunction(spv::OpULessThan, TypeBool(state), is_vertex, index, vertices);
 		EmitIfCondition(state, is_vertex, [&] {
 			for (const auto& output: state.outputs) {
-				if (output.kind == IR::StageOutputKind::Layer) {
+				if (output.kind == IR::StageOutputKind::Layer || output.variable_id == 0) {
 					continue;
 				}
-				const auto type  = MeshOutputType(state, output.kind);
+				const auto type = MeshOutputType(state, output.kind);
 				const auto value =
 				    MeshLoad(state, output.mesh_data_variable, spv::StorageClassPrivate, type,
 				             ConstantU32(state, half));

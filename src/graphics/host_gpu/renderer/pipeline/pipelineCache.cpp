@@ -612,7 +612,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		}
 		pixel_info.ps_single_sample = single_sample;
 	}
-	if (!tess_active && !mesh_active) {
+	if (!tess_active) {
 		vertex_info[0].pixel_input = pixel_active ? &pixel_info : nullptr;
 	}
 	if (context.GetClipControl().clip_disable) {

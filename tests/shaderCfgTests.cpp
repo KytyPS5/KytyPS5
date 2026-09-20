@@ -9579,6 +9579,39 @@ void TestMeshExportStorage() {
     Check(private_bytes == (4u * 16u + 4u) * (64u / subgroup_size),
           "mesh vertex and primitive exports lost their separate logical-lane storage");
   }
+
+  ShaderPixelInputInfo pixel {};
+  pixel.input_num                = 2;
+  pixel.interpolator_settings[0] = 0;
+  pixel.interpolator_settings[1] = 2;
+  input.pixel_input              = &pixel;
+  mesh.max_vertices              = 190;
+  mesh.max_primitives            = 152;
+  mesh.host_subgroup_size        = 64;
+  options.back_code              = std::span {back};
+  const auto pruned = RecompileForTest(std::span {front}, options, nullptr, nullptr,
+                                       PushData::MeshDrawDwordCount);
+  CheckSpirvBinaryValidates(pruned.spirv);
+  const auto pruned_source = DisassembleSpirvBinary(pruned.spirv);
+  Check(pruned_source.find("OutputVertices 190") != std::string::npos &&
+            pruned_source.find("OutputPrimitivesEXT 152") != std::string::npos,
+        "mesh output pruning changed allocation limits");
+  Check(pruned_source.find("out_param_0") != std::string::npos &&
+            pruned_source.find("out_param_1") == std::string::npos &&
+            pruned_source.find("out_param_2") != std::string::npos,
+        "mesh output pruning did not follow pixel inputs");
+  std::vector<uint32_t> key_a, key_b;
+  BuildStageStaticKey(input, key_a);
+  pixel.interpolator_settings[1] = 1;
+  BuildStageStaticKey(input, key_b);
+  Check(key_a != key_b, "mesh key ignored pixel inputs");
+  pixel.interpolator_settings[1] = 2;
+  pixel.parameter_plan.valid     = true;
+  const auto fallback = RecompileForTest(std::span {front}, options, nullptr, nullptr,
+                                         PushData::MeshDrawDwordCount);
+  CheckSpirvBinaryValidates(fallback.spirv);
+  Check(DisassembleSpirvBinary(fallback.spirv).find("out_param_1") != std::string::npos,
+        "mesh output pruning was not conservative for alias plans");
 }
 
 void TestMergedShaderUserDataSnapshot() {

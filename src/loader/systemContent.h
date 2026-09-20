@@ -15,7 +15,7 @@ bool     SystemContentParamSfoGetInt(const char* name, int32_t* value);
 bool     SystemContentParamSfoGetString(const char* name, std::string* value);
 bool     SystemContentParamSfoGetString(const char* name, char* value, size_t value_size);
 uint64_t SystemContentGetFlexibleMemorySize();
-bool     SystemContentGetIconPath(std::string* path);
+bool     SystemContentGetIconPath(std::filesystem::path* path);
 bool     SystemContentGetChunksNum(uint32_t* num);
 
 } // namespace Loader

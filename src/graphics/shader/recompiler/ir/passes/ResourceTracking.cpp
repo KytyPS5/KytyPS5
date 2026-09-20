@@ -273,6 +273,38 @@ private:
 		return true;
 	}
 
+	static bool IsDynamicMemoryOrigin(Value value, uint32_t depth = 0) {
+		if (depth > 8) {
+			return false;
+		}
+		value            = value.Resolve();
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr) {
+			return false;
+		}
+		const auto op = inst->GetOpcode();
+		if (op == ValueOpcode::ReadConstBuffer || op == ValueOpcode::LoadAddressU32 ||
+		    BufferAccessOf(op) != BufferAccess::None ||
+		    AddressOpcodeInfoOf(op).access != AddressAccess::None) {
+			return true;
+		}
+		for (size_t i = 0; i < inst->NumArgs(); i++) {
+			if (IsDynamicMemoryOrigin(inst->Arg(i), depth + 1)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	static bool IsDynamicDescriptor(const DescriptorSource& descriptor) {
+		for (uint32_t i = 0; i < descriptor.dword_count; i++) {
+			if (IsDynamicMemoryOrigin(descriptor.dwords[i])) {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	uint32_t InternSource(const DescriptorSource& descriptor) {
 		for (uint32_t candidate = 0; candidate < m_sources.size(); candidate++) {
 			const auto& current = m_sources[candidate];
@@ -720,7 +752,24 @@ private:
 		uint32_t resource = 0;
 
 		if (buffer != BufferAccess::None) {
-			GetHandle(inst.Arg(0), ValueOpcode::GetBufferResource, 4, flags.pc, handle, source);
+			handle = inst.Arg(0).Resolve().TryInstruction();
+			if (handle == nullptr || handle->GetOpcode() != ValueOpcode::GetBufferResource) {
+				Fail(flags.pc, "memory operation requires GetBufferResource");
+			}
+			DescriptorSource descriptor;
+			MakeSource(*handle, 4u, false, false, descriptor, flags.pc);
+			uint32_t bad_dword = 0;
+			if (!ValidateSource(descriptor, bad_dword)) {
+				if (IsDynamicDescriptor(descriptor)) {
+					m_info.uses_dma                                   = true;
+					m_program.memory_info[flags.index].dynamic_buffer = true;
+					return;
+				}
+				Fail(flags.pc,
+				     fmt::format("GetBufferResource dword {} is not a valid runtime value",
+				                 bad_dword));
+			}
+			source   = InternSource(descriptor);
 			resource = AddBuffer(source, memory, op, flags.pc);
 			if (resource == UINT32_MAX) {
 				Fail(flags.pc, "buffer resource limit exceeded");

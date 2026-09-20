@@ -132,12 +132,24 @@ void ValidateNativeProgram(const IR::Program& program) {
 			              program.memory_info[index].planning_only;
 		       });
 	};
+	const auto dynamic_buffer_handle = [&](const IR::Inst& handle) {
+		return !handle.Uses().empty() &&
+		       std::ranges::any_of(handle.Uses(), [&](const IR::Use& use) {
+			       const auto op = use.user->GetOpcode();
+			       if (IR::BufferAccessOf(op) == IR::BufferAccess::None) {
+				       return false;
+			       }
+			       const auto index = use.user->Flags<IR::MemoryFlags>().index;
+			       return index < program.memory_info.size() &&
+			              program.memory_info[index].dynamic_buffer;
+		       });
+	};
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			const auto dense = inst.Flags<uint32_t>();
 			switch (inst.GetOpcode()) {
 				case IR::ValueOpcode::GetBufferResource:
-					if (planning_only_handle(inst)) {
+					if (planning_only_handle(inst) || dynamic_buffer_handle(inst)) {
 						break;
 					}
 					if (dense >= program.info.buffers.size()) {
@@ -213,6 +225,10 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 				}
 				const auto& memory = program.memory_info[memory_index];
 				if (memory.kind == IR::ResourceKind::Buffer) {
+					if (memory.dynamic_buffer) {
+						requirements.subgroup_local_invocation_id = true;
+						continue;
+					}
 					if (memory.resource >= program.info.buffers.size()) {
 						Fail(program, "buffer operation has invalid resource metadata");
 					}

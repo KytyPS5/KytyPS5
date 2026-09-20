@@ -173,7 +173,7 @@ static void pad_fill_data(PadData* data, const ControllerState& state, bool conn
 		}
 	}
 	data->connected              = connected;
-	data->timestamp              = state.time;
+	data->timestamp              = state.time != 0 ? state.time : LibKernel::KernelGetProcessTime();
 	data->connected_count        = static_cast<uint8_t>(std::min(connected_count, 255));
 	data->device_unique_data_len = 0;
 }
@@ -528,7 +528,7 @@ void GameController::ReleaseHostPads() {
 		    pad != nullptr) {
 			if (SDL_GameControllerGetType(pad) == SDL_CONTROLLER_TYPE_PS5) {
 				DualSenseEffects effect {};
-				effect.enable_bits     = 0x0c;
+				effect.enable_bits      = 0x0c;
 				effect.right_trigger[0] = 0x05;
 				effect.left_trigger[0]  = 0x05;
 				(void)SDL_GameControllerSendEffect(pad, &effect, sizeof(effect));
@@ -699,13 +699,13 @@ int KYTY_SYSV_ABI PadInit() {
 }
 
 static bool PadOpenArgsAreValid(int user_id, int type, int index) {
-	constexpr int user_id_system     = 0xff;
-	constexpr int port_type_standard = 0;
-	constexpr int port_type_special  = 2;
-	constexpr int port_type_remote   = 16;
-	const bool    personal_port =
-	    user_id == Config::GetUserId() && (type == port_type_standard || type == port_type_special);
-	const bool system_remote_control = user_id == user_id_system && type == port_type_remote;
+	constexpr int user_id_system        = 0xff;
+	constexpr int port_type_standard    = 0;
+	constexpr int port_type_special     = 2;
+	constexpr int port_type_remote      = 16;
+	const bool    personal_port         = Config::IsPrimaryUserId(user_id) &&
+	                                      (type == port_type_standard || type == port_type_special);
+	const bool    system_remote_control = user_id == user_id_system && type == port_type_remote;
 	return index == 0 && (personal_port || system_remote_control);
 }
 

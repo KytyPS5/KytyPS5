@@ -43,6 +43,10 @@ int32_t GetUserId() {
 	return g_config->user_id;
 }
 
+bool IsPrimaryUserId(int32_t user_id) {
+	return user_id == GetUserId() || user_id == 0 || user_id == 1 || user_id == 100;
+}
+
 const std::string& GetAudioInputDevice() {
 	return g_config->audio_input_device;
 }

@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
+#include "graphics/host_gpu/renderer/pipeline/unfoldableSet.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
@@ -32,6 +33,7 @@
 #include <fmt/format.h>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <stop_token>
 #include <spirv-tools/libspirv.hpp>
@@ -348,6 +350,22 @@ bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
 	return false;
 }
 
+// vkCreate*Pipelines cannot be cancelled or given a deadline, so a module the driver cannot build
+// in bounded time takes the whole session with it: RESIDENT EVIL REQUIEM's clustered-lighting
+// pixel shader emits 384046 words over 562 blocks, and the build held two cores and passed 12 GB
+// of working set without returning, freezing the guest at 0 fps until the process died. Refusing
+// the module is the only place that can be stopped, and it costs only that shader's draws.
+//
+// Size alone does not say which module that is - a 322769-word compute module of two blocks builds
+// here without trouble. The dispatcher fallback is what the driver cannot scale to: one loop whose
+// switch carries an arm per block, with a spill variable for every value that crosses one. So the
+// bound applies only to those, and it sits far above every dispatcher module measured to build
+// here, the largest of which is 3955 words.
+constexpr size_t MaxDispatcherSpirvWords = 131072;
+
+// A VkPipelineCache cannot evict, so past this size the blob on disk stops growing.
+constexpr uint64_t MaxDriverCacheBytes = uint64_t {1} << 30u;
+
 // A pipeline creation still inside the driver after this long is pathological: a healthy one
 // returns at once, while the SILENT HILL 2 loading-screen stall runs past a minute.
 constexpr std::chrono::nanoseconds PipelineStallThreshold = std::chrono::seconds {5};
@@ -541,6 +559,12 @@ struct PipelineCache::ProgramCache {
 		uint64_t              hash            = 0;
 		uint32_t              user_data_count = 0;
 		uint32_t              code_size       = 0;
+		// Bumped when a draw proves another of this shader's descriptors unfoldable. Carrying it
+		// in the key rather than erasing the old entries is deliberate: a SourceEntry owns
+		// vk::ShaderModules that command buffers already recorded may still reference, and
+		// nothing here knows when the last of those retires. A new key simply misses, translates
+		// once more with the larger proof set, and leaves the old permutations to the destructor.
+		uint32_t              unfoldable_generation = 0;
 		std::vector<uint32_t> static_state;
 
 		bool operator==(const ProgramKey&) const = default;
@@ -637,6 +661,20 @@ struct PipelineCache::ProgramCache {
 		                 hash, StageShortName(stage), pc, reason);
 	}
 
+	// Not the shader's fault and not permanent for it: one permutation was refused, the channel
+	// that asked for it is frozen, and the generation before it still draws. Deliberately does
+	// not touch `skipped_shaders` at all - the refused generation is about to be rolled back, so
+	// recording it would only leave an entry nothing can ever ask for again. One line per shader;
+	// the draw that hits the refusal is lost and the next one renders.
+	void ReportRebuildRefused(ShaderType stage, uint64_t hash, std::string_view reason) {
+		if (!reported_shaders.insert(hash).second) {
+			return;
+		}
+		PipelineCacheLog("proven-unfoldable rebuild refused, keeping the previous classification: "
+		                 "hash=0x{:016x} stage={} {}",
+		                 hash, StageShortName(stage), reason);
+	}
+
 	// Transient: materialization re-executes the descriptor chain against guest memory on every
 	// dispatch, so a failure describes this dispatch, not the shader. The draw is dropped and the
 	// next dispatch tries again - the plan is already cached, so the retry is cheap. Recording it
@@ -670,6 +708,7 @@ struct PipelineCache::ProgramCache {
 			}
 			PipelineKeyHash::Mix(hash, key.user_data_count);
 			PipelineKeyHash::Mix(hash, key.code_size);
+			PipelineKeyHash::Mix(hash, key.unfoldable_generation);
 			PipelineKeyHash::Mix(hash, key.static_state.size());
 			// Bucket same-shape static variants by source. ProgramKey equality performs the one
 			// exact state comparison needed on a stable hit without hashing the full state first.
@@ -683,8 +722,11 @@ struct PipelineCache::ProgramCache {
 	                               const ShaderRecompiler::CompileOptions&      options,
 	                               ShaderRecompiler::TranslateResult            translated,
 	                               ShaderRecompiler::IR::ResourceSpecialization specialization,
-	                               uint32_t push_data_start_dword,
-	                               std::span<const uint32_t> function_code) {
+	                               uint32_t push_data_start_dword) {
+		// Read before the program is moved into the compile: the two numbers that say why a module
+		// came out the size it did.
+		const bool     dispatcher = translated.program.dispatcher_fallback;
+		const auto     block_count = translated.program.blocks.size();
 		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 		                                               specialization, push_data_start_dword);
 		if (!result.status.ok) {
@@ -693,6 +735,15 @@ struct PipelineCache::ProgramCache {
 			Permutation rejected;
 			rejected.specialization = std::move(specialization);
 			rejected.reason         = std::move(result.status.reason);
+			return rejected;
+		}
+		if (dispatcher && result.spirv.size() > MaxDispatcherSpirvWords) {
+			Permutation rejected;
+			rejected.specialization = std::move(specialization);
+			rejected.reason         = fmt::format(
+			    "unstructured control flow emitted {} SPIR-V words over {} blocks, past the {} a "
+			    "host pipeline build is trusted with",
+			    result.spirv.size(), block_count, MaxDispatcherSpirvWords);
 			return rejected;
 		}
 		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv)) {
@@ -720,6 +771,20 @@ struct PipelineCache::ProgramCache {
 	}
 
 	template <typename InputInfo>
+	ShaderProgram Relearned(const ShaderParams& params, InputInfo& input_info,
+	                        uint32_t& push_data_cursor) {
+		static thread_local uint32_t depth    = 0;
+		static const bool            disabled = EnvSwitch("KYTY_NO_UNFOLDABLE_RETRY");
+		if (disabled || depth >= 8) {
+			return {};
+		}
+		++depth;
+		auto program = Get(params, input_info, push_data_cursor);
+		--depth;
+		return program;
+	}
+
+	template <typename InputInfo>
 	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info,
 	                  uint32_t& push_data_cursor) {
 		ShaderType stage;
@@ -733,16 +798,13 @@ struct PipelineCache::ProgramCache {
 		}
 
 		const auto user_data = std::span(params.user_data).first(params.user_data_count);
-		// A shader already rejected once is rejected for good: skip it before paying for another
-		// translation, which would otherwise repeat on every dispatch.
-		if (skipped_shaders.contains(params.hash)) {
-			return {};
-		}
-
+		const auto  code_key   = ShaderCodeKey(params.code, params.back_code);
+		auto&       proven     = unfoldable[code_key];
 		lookup_key.stage           = stage;
 		lookup_key.hash            = params.hash;
 		lookup_key.user_data_count = params.user_data_count;
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
+		lookup_key.unfoldable_generation = proven.generation;
 		BuildStageStaticKey(input_info, lookup_key.static_state);
 		// A shape already rejected once is rejected for good: skip it before paying for another
 		// translation, which would otherwise repeat on every dispatch. Built after the key because
@@ -751,6 +813,10 @@ struct PipelineCache::ProgramCache {
 			return {};
 		}
 		auto                                         entry = programs.find(lookup_key);
+		// Filled by MaterializeResources with the resources it had to bind null. Learning from it
+		// moves the generation above, so the next draw of this shader misses and re-translates
+		// with the proof in hand.
+		std::vector<uint32_t>                        reported_unfoldable;
 		ShaderRecompiler::IR::SrtRuntime             runtime {
 		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),
@@ -820,6 +886,8 @@ struct PipelineCache::ProgramCache {
 		options.early_dump  = options.dump_ir;
 		options.dump_label  = label;
 		options.input_info  = stage_input;
+		options.unfoldable_pcs = proven.pcs;
+		options.host_subgroup_size = host_subgroup_size;
 
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			options.user_data_base = 8;
@@ -868,12 +936,27 @@ struct PipelineCache::ProgramCache {
 				return {};
 			}
 		}
+		// Whether this permutation exists only because the unfoldable channel asked for it. Read
+		// before the compile, because `options.unfoldable_pcs` is a span over `proven.pcs` and a
+		// rollback below rewrites that vector.
+		const bool channel_rebuild = !options.unfoldable_pcs.empty();
 		entry->second.permutations.push_back(CompilePermutation(
 		    stage_name, options, std::move(translated), entry->second.specialization, push_data_cursor));
 		if (!entry->second.permutations.back().handle) {
 			auto rejected = std::move(entry->second.permutations.back());
 			entry->second.permutations.pop_back();
-			ReportSkipped(stage, params.hash, 0, rejected.reason);
+			// A permutation the channel asked for and the host refused must not take the shader
+			// with it. The skip set now carries the generation, so a refusal no longer disables
+			// the one before this rebuild by itself - but that generation would still never be
+			// asked for again, because `proven.generation` only moves forward. Roll it back to
+			// the generation that draws: the shot keeps the missing effect it had before the
+			// channel fired, which is the outcome the channel was trying to improve on and is
+			// strictly better than a shader that stops drawing at all.
+			if (channel_rebuild && RefuseRebuild(unfoldable.Get(key()))) {
+				ReportRebuildRefused(stage, params.hash, rejected.reason);
+				return {};
+			}
+			ReportSkipped(lookup_key, stage, params.hash, 0, rejected.reason);
 			return {};
 		}
 		const auto& permutation = entry->second.permutations.back();
@@ -969,8 +1052,30 @@ struct PipelineCache::ProgramCache {
 		}
 	}
 
+	// Identifies a shader by the words it is made of. The declared hash is not enough on its own:
+	// it is the guest's, and guest code can be rewritten under one. Hashing here is free against
+	// what it guards - the only caller is about to spend hundreds of milliseconds translating.
+	static uint64_t ShaderCodeKey(std::span<const uint32_t> code,
+	                              std::span<const uint32_t> back_code) {
+		auto key = XXH3_64bits(code.data(), code.size_bytes());
+		if (!back_code.empty()) {
+			// A merged-stage program decodes both halves into one graph, so the back half is
+			// part of what the graph is a function of.
+			const auto back = XXH3_64bits(back_code.data(), back_code.size_bytes());
+			key             = XXH3_64bits_withSeed(&back, sizeof(back), key);
+		}
+		return key;
+	}
+
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
-	std::unordered_set<uint64_t>                                skipped_shaders;
+	// What draws have proved about a shader's descriptors, keyed by the code words rather than by
+	// the declared hash: guest code is rewritten under one, and a pc recorded against the old code
+	// names nothing in the new. UnfoldableSet, Learn and RefuseRebuild live in unfoldableSet.h so
+	// the rollback can be tested without a device.
+	std::unordered_map<uint64_t, UnfoldableSet>                 unfoldable;
+	// Keyed on the whole ProgramKey: see ReportSkipped. `reported_shaders` stays on the hash, so
+	// the log still carries one line per shader however many of its shapes refuse.
+	std::unordered_set<ProgramKey, ProgramKeyHash>              skipped_shaders;
 	// Log throttle only: a hash here has been reported once, whether the cause was permanent or
 	// transient. Kept apart from skipped_shaders so a transient failure does not disable a shader.
 	std::unordered_set<uint64_t>                                reported_shaders;

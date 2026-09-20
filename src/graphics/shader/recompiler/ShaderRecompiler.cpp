@@ -887,6 +887,10 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 			     MakeIrDump(cfg_dump, ir).c_str());
 		}
 	}
+	// What an earlier draw of this shader proved the walk cannot fold. Set before tracking, which
+	// is the only pass that reads it: it is what lets a recognizer drop the guards that exist
+	// solely to avoid moving a descriptor that still resolves.
+	ir.unfoldable_pcs.assign(options.unfoldable_pcs.begin(), options.unfoldable_pcs.end());
 	auto tracking = IR::TrackResources(ir, decoded, native_cfg);
 	TranslateResult result;
 	if (!tracking.ok) {

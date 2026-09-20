@@ -556,14 +556,13 @@ struct DescriptorSource {
 	enum class SelectorKind : uint32_t { Stride, Mask };
 
 	struct IndirectDescriptor {
-		struct SelectorRead {
-			uint32_t source = UINT32_MAX;
-			uint32_t stride = 0;
-			uint32_t offset = 0;
+		// No material table at all: the key is computed in the shader and reaches the host only as
+		// feedback. There is then nothing to enumerate - a probe would have to re-execute the key,
+		// which is the one thing the host cannot do - so such a table is served from its observed
+		// keys from the first draw on.
+		static constexpr uint32_t NoMaterialTable = UINT32_MAX;
 
-			bool operator==(const SelectorRead& other) const = default;
-		};
-		std::optional<SelectorRead> selector;
+		uint32_t material_source = UINT32_MAX;
 		uint32_t table_source    = 0;
 		uint32_t table_offset    = 0;
 		uint32_t table_immediate = 0;
@@ -585,6 +584,11 @@ struct DescriptorSource {
 		// narrows the key, so the enumeration stays bounded. All ones when the shader applies
 		// none.
 		uint32_t key_mask        = 0xffffffffu;
+		// The key indexes the heap through the load's own index operand rather than through a byte
+		// offset the shader computed, so hardware supplies the record step from the heap V#.
+		// `heap_stride` is then only what the shader scaled the index by - usually 1 - and the
+		// byte step is that times the V#'s stride, which is not known until the descriptor is read.
+		bool indexed_heap = false;
 
 		bool operator==(const IndirectDescriptor& other) const = default;
 	};
@@ -683,12 +687,27 @@ struct ResourcePlan {
 	std::vector<MemoryInfo>             memory_info;
 	std::vector<DescriptorSource>       descriptor_sources;
 	std::vector<ResourceBlock>          control_flow;
+	// The control-flow description could not be built at all, so nothing is known about which
+	// sources the shader reads. Distinct from an empty description built successfully: a shader
+	// with no condition to prune on reads every source its accesses name, which is reachability
+	// information, just trivial. Only the former may leave an unreadable source null.
+	bool                                control_flow_unknown = false;
 	std::vector<SrtRead>                srt_reads;
 	bool                                requires_specialization_memory = false;
 	std::vector<std::pair<uint64_t, uint64_t>> source_reads;
 	bool                                capture_specialization_reads = false;
 	bool                                srt_plan_complete          = false;
 	bool                                resource_tracking_complete = false;
+	// Resources the materializer has *proven* the host cannot re-evaluate: it tried against real
+	// guest memory, failed, and bound null. Named by `first_use_pc`, which is a property of the
+	// code and so survives a re-translation, where a descriptor-source index would not.
+	//
+	// This is the one fact tracking cannot derive for itself. Whether a descriptor folds or
+	// degrades is decided per draw, by whether a readfirstlane's lanes agree - two shaders that
+	// are identical in every way this pass can see differ only there. So a recognizer that wants
+	// to serve a degrading descriptor from a table has to be told, and being told is what makes
+	// the relaxations it then applies sound rather than a guess.
+	std::vector<uint32_t>               unfoldable_pcs;
 	ShaderInfo                          info;
 	UniformFillPlan                     uniform_fill;
 	std::unique_ptr<Xbyak::CodeGenerator> srt_code;

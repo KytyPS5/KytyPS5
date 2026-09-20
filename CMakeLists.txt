@@ -605,6 +605,20 @@ add_kyty_full_emulator_test(virtual_memory_allocation_tests "${KYTY_TESTS_DIR}/V
 target_compile_definitions(virtual_memory_allocation_tests PRIVATE
 	KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS=1)
 
+# unfoldableSet.h is header-only and depends on nothing but the standard library, so the rollback
+# that keeps a refused rebuild from disabling a shader needs no Vulkan device either.
+add_executable(unfoldable_rebuild_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/UnfoldableRebuildTests.cpp"
+)
+target_link_libraries(unfoldable_rebuild_tests common fmt::fmt)
+target_include_directories(unfoldable_rebuild_tests PRIVATE ${inc_headers})
+
+add_executable(vram_headroom_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/VramHeadroomTests.cpp"
+)
+target_link_libraries(vram_headroom_tests common fmt::fmt)
+target_include_directories(vram_headroom_tests PRIVATE ${inc_headers})
+
 # These tests use exceptions.
 foreach(kyty_exception_test scalar_provenance_tests resource_tracking_tests
 		virtual_memory_allocation_tests)
@@ -711,6 +725,10 @@ if(BUILD_TESTING)
 	add_test(NAME buffer_cache_ranges
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-range-only)
 
+	add_test(NAME unfoldable_rebuild COMMAND $<TARGET_FILE:unfoldable_rebuild_tests>)
+
+	add_test(NAME vram_headroom COMMAND $<TARGET_FILE:vram_headroom_tests>)
+
 	add_custom_target(kyty_tests DEPENDS
 		ime_dialog_tests
 		shader_cfg_tests
@@ -742,6 +760,8 @@ if(BUILD_TESTING)
 		save_data_dialog_tests
 		http_uri_parse_tests
 		unresolved_import_registration_tests
+		unfoldable_rebuild_tests
+		vram_headroom_tests
 	)
 endif()
 

@@ -50,6 +50,12 @@ struct ResourceSpecialization {
 ResourcePlan ExtractResourcePlan(const Program& program);
 
 // Refreshes cached resources and specialization in place. A failed refresh must not be used.
+//
+// `unfoldable_pcs`, when given, receives the `first_use_pc` of every resource whose descriptor
+// source this call had to leave null because no host value stands for it. That is a measurement,
+// not a diagnostic: it is the one thing tracking cannot work out for itself, and handing it back
+// to a later translate is what lets such a resource be served from a table instead of from null.
+// See ResourcePlan::unfoldable_pcs.
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
 

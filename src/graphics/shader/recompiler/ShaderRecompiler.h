@@ -27,6 +27,10 @@ struct CompileOptions {
 	std::span<const uint32_t>   user_data;
 	std::span<const uint32_t>   back_code;
 	ShaderStageInputInfo        input_info;
+	// `first_use_pc` of every resource a previous materialization of this shader proved the host
+	// cannot re-evaluate. Empty on the first translate of a shader; the caller grows it when a
+	// draw reports a degrade and re-translates once. See ResourcePlan::unfoldable_pcs.
+	std::span<const uint32_t>   unfoldable_pcs;
 };
 
 // Why a guest shader could not be recompiled: a CFG-build or resource-tracking rejection that

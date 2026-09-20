@@ -1,7 +1,7 @@
 // PerVertexGpuExecutionTests: Standalone Vulkan harness executing the complete PerVertex pipeline
 // directly on the host Apple Silicon GPU (MoltenVK).
 // Covers:
-//   1. kUnpackSpv execution with bit-for-bit strict CPU verification (zero float tolerance, NaN/Inf rejection).
+//   1. Generated unpack SPIR-V execution with strict CPU verification.
 //   2. Descriptor safety on non-4-byte aligned index buffers (8-bit and 16-bit indices).
 //   3. Full end-to-end chain proof: Unpack -> Capture (Compute) -> Replay (Vertex) -> Rasterization -> Fragment (PerVertexKHR).
 
@@ -25,6 +25,7 @@
 #include "graphics/host_gpu/renderer/perVertexEmbeddedSpv.h"
 #include "graphics/host_gpu/renderer/perVertexTransform.h"
 #include "kytyGitVersion.h"
+#include "per_vertex_unpack_spv.h"
 
 namespace {
 
@@ -279,7 +280,7 @@ GpuBuffer CreateBuffer(const Device& dev, size_t size, VkBufferUsageFlags usage)
 
 // Guest geometry definitions
 constexpr uint32_t kNumVertices = 8;
-constexpr uint32_t kStride = 24; // Attr0: Float32 vec3 (12b), Attr1: Unorm8 vec4 (4b), Attr2: Unorm16 vec2 (4b), Pad: 4b
+constexpr uint32_t kStride = 28; // Float32x3, UNorm8x4, UNorm16x2, Float16x4
 
 constexpr float kPositions[kNumVertices][3] = {
     { -0.875f,  0.750f,  0.125f },
@@ -314,6 +315,28 @@ constexpr uint16_t kTexCoords[kNumVertices][2] = {
     {  8192, 32768 },
 };
 
+constexpr uint16_t kHalfVectors[kNumVertices][4] = {
+    {0x0000, 0x8000, 0x3c00, 0xc000},
+    {0x3800, 0xb800, 0x4000, 0x4400},
+    {0x0400, 0x0001, 0x03ff, 0x8001},
+    {0x7bff, 0xfbff, 0x3400, 0xb400},
+    {0x3c00, 0x4000, 0x4200, 0x4400},
+    {0xbc00, 0xc000, 0xc200, 0xc400},
+    {0x3000, 0xb000, 0x4800, 0xc800},
+    {0x5000, 0xd000, 0x5c00, 0xdc00},
+};
+
+constexpr uint32_t kHalfExpected[kNumVertices][4] = {
+    {0x00000000, 0x80000000, 0x3f800000, 0xc0000000},
+    {0x3f000000, 0xbf000000, 0x40000000, 0x40800000},
+    {0x38800000, 0x33800000, 0x387fc000, 0xb3800000},
+    {0x477fe000, 0xc77fe000, 0x3e800000, 0xbe800000},
+    {0x3f800000, 0x40000000, 0x40400000, 0x40800000},
+    {0xbf800000, 0xc0000000, 0xc0400000, 0xc0800000},
+    {0x3e000000, 0xbe000000, 0x41000000, 0xc1000000},
+    {0x42000000, 0xc2000000, 0x43800000, 0xc3800000},
+};
+
 // Push constant layout matching scratch/unpack.comp
 struct PushConstants {
     uint32_t total_invocations;
@@ -343,10 +366,10 @@ int main() {
     GpuBuffer vtx_buf = CreateBuffer(dev, kNumVertices * kStride, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     for (uint32_t i = 0; i < kNumVertices; ++i) {
         uint8_t* ptr = reinterpret_cast<uint8_t*>(vtx_buf.mapped) + i * kStride;
-        std::memcpy(ptr + 0, kPositions[i], 12);
-        std::memcpy(ptr + 12, kColors[i], 4);
-        std::memcpy(ptr + 16, kTexCoords[i], 4);
-        std::memset(ptr + 20, 0, 4);
+		std::memcpy(ptr + 0, kPositions[i], 12);
+		std::memcpy(ptr + 12, kColors[i], 4);
+		std::memcpy(ptr + 16, kTexCoords[i], 4);
+		std::memcpy(ptr + 20, kHalfVectors[i], 8);
     }
 
     constexpr uint16_t kIndices16[8] = { 1, 4, 2, 5, 0, 3, 7, 6 };
@@ -355,14 +378,14 @@ int main() {
 
     constexpr uint32_t kMaxInvocations = 16;
     GpuBuffer id_buf = CreateBuffer(dev, kMaxInvocations * sizeof(uint32_t) * 2, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    GpuBuffer attr_buf = CreateBuffer(dev, kMaxInvocations * 3 * sizeof(float) * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    GpuBuffer attr_buf = CreateBuffer(dev, kMaxInvocations * 4 * sizeof(float) * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
 
     // Compute Pipeline for unpack
     VkShaderModuleCreateInfo sm_info {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-    sm_info.codeSize = sizeof(Libs::Graphics::kUnpackSpv);
-    sm_info.pCode = Libs::Graphics::kUnpackSpv;
+    sm_info.codeSize = sizeof(PERVERTEX_UNPACK_SPV);
+    sm_info.pCode = PERVERTEX_UNPACK_SPV;
     VkShaderModule module = VK_NULL_HANDLE;
-    Check(vk_create_shader_module(dev.device, &sm_info, nullptr, &module), "vkCreateShaderModule kUnpackSpv");
+    Check(vk_create_shader_module(dev.device, &sm_info, nullptr, &module), "vkCreateShaderModule PERVERTEX_UNPACK_SPV");
 
     VkDescriptorSetLayoutBinding bindings[4] {};
     for (uint32_t i = 0; i < 4; ++i) {
@@ -426,7 +449,7 @@ int main() {
     VkDescriptorSet desc_set = VK_NULL_HANDLE;
     Check(vk_allocate_descriptor_sets(dev.device, &ds_alloc, &desc_set), "vkAllocateDescriptorSets");
 
-    // Dispatch helper with STRICT bit-for-bit comparison and NaN/Inf rejection
+    // Dispatch helper with strict comparison and NaN/Inf rejection
     auto DispatchAndVerifyStrict = [&](const char* test_name, const PushConstants& push,
                                        const std::vector<uint32_t>& expected_vtx_ids) {
         std::printf("--- Running GPU Test: %s ---\n", test_name);
@@ -463,8 +486,8 @@ int main() {
             }
 
             // Reject NaN and Inf across all floats returned by the GPU
-            for (uint32_t a = 0; a < 3; ++a) {
-                const float* attr_val = read_attrs + (i * 3 + a) * 4;
+        for (uint32_t a = 0; a < 4; ++a) {
+            const float* attr_val = read_attrs + (i * 4 + a) * 4;
                 for (int c = 0; c < 4; ++c) {
                     if (std::isnan(attr_val[c]) || std::isinf(attr_val[c])) {
                         std::fprintf(stderr, "CRITICAL ERROR: NaN/Inf detected at invocation %u attr %u comp %d: %f\n",
@@ -480,8 +503,8 @@ int main() {
                     std::fprintf(stderr, "Mismatch at invocation %u: expected OOB ID 0, got %u\n", i, got_vtx);
                     std::exit(1);
                 }
-                for (uint32_t a = 0; a < 3; ++a) {
-                    const float* attr_val = read_attrs + (i * 3 + a) * 4;
+            for (uint32_t a = 0; a < 4; ++a) {
+                const float* attr_val = read_attrs + (i * 4 + a) * 4;
                     if (std::bit_cast<uint32_t>(attr_val[0]) != 0u ||
                         std::bit_cast<uint32_t>(attr_val[1]) != 0u ||
                         std::bit_cast<uint32_t>(attr_val[2]) != 0u ||
@@ -497,7 +520,7 @@ int main() {
                 }
 
                 // Attribute 0: Float32 vec3 (Strict bitwise bit_cast equality)
-                const float* pos = read_attrs + (i * 3 + 0) * 4;
+        const float* pos = read_attrs + (i * 4 + 0) * 4;
                 for (int c = 0; c < 3; ++c) {
                     uint32_t got_bits = std::bit_cast<uint32_t>(pos[c]);
                     uint32_t exp_bits = std::bit_cast<uint32_t>(kPositions[exp_vtx][c]);
@@ -513,7 +536,7 @@ int main() {
                 }
 
                 // Attribute 1: Unorm8 vec4 (Strict bitwise equality with IEEE-754 division)
-                const float* col = read_attrs + (i * 3 + 1) * 4;
+        const float* col = read_attrs + (i * 4 + 1) * 4;
                 for (int c = 0; c < 4; ++c) {
                     float exp_val = static_cast<float>(kColors[exp_vtx][c]) / 255.0f;
                     uint32_t got_bits = std::bit_cast<uint32_t>(col[c]);
@@ -526,7 +549,7 @@ int main() {
                 }
 
                 // Attribute 2: Unorm16 vec2 (Strict bitwise equality with IEEE-754 division)
-                const float* uv = read_attrs + (i * 3 + 2) * 4;
+        const float* uv = read_attrs + (i * 4 + 2) * 4;
                 for (int c = 0; c < 2; ++c) {
                     float exp_val = static_cast<float>(kTexCoords[exp_vtx][c]) / 65535.0f;
                     uint32_t got_bits = std::bit_cast<uint32_t>(uv[c]);
@@ -537,14 +560,25 @@ int main() {
                         std::exit(1);
                     }
                 }
-                if (std::bit_cast<uint32_t>(uv[2]) != 0u || std::bit_cast<uint32_t>(uv[3]) != 0x3f800000u) {
-                    std::fprintf(stderr, "UV zw mismatch: exp (0, 1) got (0x%08x, 0x%08x)\n",
-                                 std::bit_cast<uint32_t>(uv[2]), std::bit_cast<uint32_t>(uv[3]));
-                    std::exit(1);
-                }
+        if (std::bit_cast<uint32_t>(uv[2]) != 0u || std::bit_cast<uint32_t>(uv[3]) != 0x3f800000u) {
+            std::fprintf(stderr, "UV zw mismatch: exp (0, 1) got (0x%08x, 0x%08x)\n",
+                         std::bit_cast<uint32_t>(uv[2]), std::bit_cast<uint32_t>(uv[3]));
+            std::exit(1);
+        }
+
+        const float* attr3 = read_attrs + (i * 4 + 3) * 4;
+        for (int c = 0; c < 4; ++c) {
+            const uint32_t got_bits = std::bit_cast<uint32_t>(attr3[c]);
+            if (got_bits != kHalfExpected[exp_vtx][c]) {
+                std::fprintf(stderr,
+                             "Float16 mismatch at vtx %u comp %d: expected 0x%08x, got 0x%08x\n",
+                             exp_vtx, c, kHalfExpected[exp_vtx][c], got_bits);
+                std::exit(1);
             }
         }
-        std::printf("PASS: %s (%u invocations bit-for-bit identical to CPU model, zero NaN)\n", test_name, push.total_invocations);
+    }
+        }
+        std::printf("PASS: %s (%u invocations match strict CPU model, zero NaN)\n", test_name, push.total_invocations);
     };
 
     // Update descriptors with 4-byte aligned ranges
@@ -569,13 +603,17 @@ int main() {
     base_push.vertex_stride = kStride;
     base_push.num_records = kNumVertices;
     base_push.first_instance = 0;
-    base_push.attrs[0].meta = (0 & 0xffffu) | (1u << 16u) | (3u << 17u);
-    base_push.attrs[1].meta = (12 & 0xffffu) | (0u << 16u) | (4u << 17u);
+    base_push.attrs[0].meta = (0 & 0xffffu) | (3u << 17u) | (1u << 20u);
+    base_push.attrs[0].bit_offsets = 0x00402000u;
+    base_push.attrs[1].meta = (12 & 0xffffu) | (4u << 17u);
     base_push.attrs[1].bit_counts = 0x08080808u;
     base_push.attrs[1].bit_offsets = 0x18100800u;
-    base_push.attrs[2].meta = (16 & 0xffffu) | (0u << 16u) | (2u << 17u);
+    base_push.attrs[2].meta = (16 & 0xffffu) | (2u << 17u);
     base_push.attrs[2].bit_counts = 0x00001010u;
     base_push.attrs[2].bit_offsets = 0x00001000u;
+    base_push.attrs[3].meta = (20 & 0xffffu) | (4u << 17u) | (3u << 20u);
+    base_push.attrs[3].bit_counts = 0x10101010u;
+    base_push.attrs[3].bit_offsets = 0x30201000u;
 
     // Test 1: Non-indexed draw with first_vertex=2, count=5
     {
@@ -584,7 +622,7 @@ int main() {
         push.index_count = 5;
         push.first_vertex = 2;
         push.vertex_offset = 0;
-        push.packed_flags = (0u << 16u) | (3u << 19u);
+        push.packed_flags = (0u << 16u) | (4u << 19u);
         DispatchAndVerifyStrict("Non-indexed draw with first_vertex=2, count=5", push, {2, 3, 4, 5, 6});
     }
 
@@ -595,7 +633,7 @@ int main() {
         push.index_count = 6;
         push.first_vertex = 0;
         push.vertex_offset = 2;
-        push.packed_flags = (0u) | (1u << 16u) | (1u << 17u) | (3u << 19u);
+        push.packed_flags = (0u) | (1u << 16u) | (1u << 17u) | (4u << 19u);
         DispatchAndVerifyStrict("Indexed draw with positive signed vertex_offset=+2", push, {3, 6, 4, 7, 2, 5});
     }
 
@@ -606,7 +644,7 @@ int main() {
         push.index_count = 6;
         push.first_vertex = 0;
         push.vertex_offset = -1;
-        push.packed_flags = (0u) | (1u << 16u) | (1u << 17u) | (3u << 19u);
+        push.packed_flags = (0u) | (1u << 16u) | (1u << 17u) | (4u << 19u);
         DispatchAndVerifyStrict("Indexed draw with negative signed vertex_offset=-1 (underflow check)", push, {0, 3, 1, 4, 0xffffffffu, 2});
     }
 
@@ -618,7 +656,7 @@ int main() {
         push.index_count = 7;
         push.first_vertex = 0;
         push.vertex_offset = 0;
-        push.packed_flags = (0u) | (1u << 16u) | (1u << 17u) | (3u << 19u);
+        push.packed_flags = (0u) | (1u << 16u) | (1u << 17u) | (4u << 19u);
         DispatchAndVerifyStrict("Strict bound check: index exceeding num_records=6", push, {1, 4, 2, 5, 0, 3, 0xffffffffu});
     }
 
@@ -649,7 +687,7 @@ int main() {
         push.index_count = 3;
         push.first_vertex = 0;
         push.vertex_offset = 0;
-        push.packed_flags = (0u) | (1u << 16u) | (1u << 17u) | (3u << 19u);
+        push.packed_flags = (0u) | (1u << 16u) | (1u << 17u) | (4u << 19u);
         DispatchAndVerifyStrict("Odd 16-bit index buffer (3 elements = 6 bytes, bound=8)", push, {2, 6, 4});
     }
 
@@ -675,7 +713,7 @@ int main() {
         push.index_count = 5;
         push.first_vertex = 0;
         push.vertex_offset = 0;
-        push.packed_flags = (0u) | (1u << 16u) | (0u << 17u) | (3u << 19u); // index_type=0 (8-bit)
+        push.packed_flags = (0u) | (1u << 16u) | (0u << 17u) | (4u << 19u); // index_type=0 (8-bit)
         DispatchAndVerifyStrict("Odd 8-bit index buffer (5 elements = 5 bytes, bound=8)", push, {1, 3, 5, 0, 7});
     }
 
@@ -1718,7 +1756,7 @@ OpFunctionEnd
 
     std::printf("\n========================================================================\n");
     std::printf("ALL RIGOROUS GPU PER-VERTEX TESTS PASSED ON APPLE SILICON GPU (MoltenVK)\n");
-    std::printf("  1. Strict bit-for-bit equality across Float32, Unorm8, Unorm16 (0 tolerance, NaN/Inf rejection)\n");
+    std::printf("  1. Float32/Unorm/Float16 bitwise equality for finite fixtures (NaN/Inf rejected)\n");
     std::printf("  2. Descriptor safety proven on non-4-byte aligned index buffers (6-byte 16-bit, 5-byte 8-bit)\n");
     std::printf("  3. Full chain verified: Unpack -> Capture Compute -> Replay Vertex -> Rasterizer -> Fragment PerVertexKHR\n");
     std::printf("  4. Pipeline cache acceleration (cold vs warm) and bytecode disk cache proven with corruption recovery\n");

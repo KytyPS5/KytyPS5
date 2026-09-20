@@ -193,11 +193,15 @@ void RenderExecutor::ExecutePerVertexPrototype(uint64_t submit_id, CommandBuffer
 		const auto&    descriptor  = vs.resources[i];
 		const auto     format_info = ShaderRecompiler::Format::GetFormatInfo(descriptor.Format());
 		const uint32_t byte_offset = vertex_byte_adjust + input.attr_offsets[i];
-		const uint32_t is_float =
-		    format_info.type == ShaderRecompiler::Format::ComponentType::Float ? 1u : 0u;
+		uint32_t format_kind = 0;
+		if (descriptor.Format() == Prospero::BufferFormat::k16_16_16_16Float) {
+			format_kind = 3;
+		} else if (format_info.type == ShaderRecompiler::Format::ComponentType::Float) {
+			format_kind = 1;
+		}
 		const uint32_t comp_count = format_info.component_count;
 		unpack_push.attrs[i].meta =
-		    (byte_offset & 0xffffu) | (is_float << 16u) | (comp_count << 17u);
+		    (byte_offset & 0xffffu) | (comp_count << 17u) | (format_kind << 20u);
 
 		uint32_t bit_counts  = 0;
 		uint32_t bit_offsets = 0;

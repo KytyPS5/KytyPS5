@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "kytyGitVersion.h"
+#include "per_vertex_unpack_spv.h"
 
 #include <algorithm>
 #include <atomic>
@@ -30,6 +31,25 @@
 
 namespace Libs::Graphics {
 namespace {
+uint32_t HalfToFloatBits(uint16_t half) {
+	const uint32_t sign     = static_cast<uint32_t>(half & 0x8000u) << 16u;
+	const uint32_t fraction = half & 0x03ffu;
+	const uint32_t exponent = (half >> 10u) & 0x1fu;
+	if (exponent == 0u) {
+		if (fraction == 0u) return sign;
+		uint32_t normalized        = fraction;
+		int32_t  unbiased_exponent = -14;
+		while ((normalized & 0x0400u) == 0u) {
+			normalized <<= 1u;
+			--unbiased_exponent;
+		}
+		return sign | (static_cast<uint32_t>(unbiased_exponent + 127) << 23u) |
+		       ((normalized & 0x03ffu) << 13u);
+	}
+	if (exponent == 0x1fu) return sign | 0x7f800000u | (fraction << 13u);
+	return sign | ((exponent - 15u + 127u) << 23u) | (fraction << 13u);
+}
+
 struct Original {
 	ShaderType            stage;
 	bool                  per_vertex;
@@ -70,7 +90,11 @@ bool DecodePerVertexPrototypeAttribute(Prospero::BufferFormat   format,
 		return false;
 	if (info.type != Type::Float && info.type != Type::Unorm) return false;
 	for (uint32_t c = 0; c < info.component_count; ++c) {
-		if (info.type == Type::Float && info.component_bits[c] != 32) return false;
+		if (info.type == Type::Float && format != Prospero::BufferFormat::k16_16_16_16Float &&
+		    info.component_bits[c] != 32)
+			return false;
+		if (format == Prospero::BufferFormat::k16_16_16_16Float && info.component_bits[c] != 16)
+			return false;
 		if (info.type == Type::Unorm &&
 		    (info.component_bits[c] == 0 || info.component_bits[c] > 16))
 			return false;
@@ -78,7 +102,11 @@ bool DecodePerVertexPrototypeAttribute(Prospero::BufferFormat   format,
 	for (uint32_t c = 0; c < 4; ++c) {
 		uint32_t value = c == 3 ? 0x3f800000u : 0u;
 		if (c < info.component_count) {
-			if (info.type == Type::Float) {
+			if (format == Prospero::BufferFormat::k16_16_16_16Float) {
+				uint16_t raw = 0;
+				std::memcpy(&raw, bytes.data() + info.component_bit_offset[c] / 8, sizeof(raw));
+				value = HalfToFloatBits(raw);
+			} else if (info.type == Type::Float) {
 				std::memcpy(&value, bytes.data() + info.component_bit_offset[c] / 8, 4);
 			} else {
 				uint32_t raw = 0;
@@ -108,9 +136,7 @@ const PerVertexUnpackPipeline* GetPerVertexUnpackPipeline(GraphicContext&   grap
                                                           vk::PipelineCache driver_cache) {
 	if (s_unpack_initialized) return &s_unpack_pipeline;
 
-	s_unpack_pipeline.module =
-	    CompileSPV(std::span<const uint32_t>(kUnpackSpv, sizeof(kUnpackSpv) / sizeof(uint32_t)),
-	               graphics.device);
+	s_unpack_pipeline.module = CompileSPV(PERVERTEX_UNPACK_SPV, graphics.device);
 
 	const vk::DescriptorSetLayoutBinding bindings[] {
 	    {0, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute},

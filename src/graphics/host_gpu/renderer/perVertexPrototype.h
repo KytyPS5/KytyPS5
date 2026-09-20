@@ -42,7 +42,7 @@ struct UnpackPushConstants {
 	uint32_t packed_flags; // word 7: [15:0] index_base_offset, [16] is_indexed, [18:17] index_type,
 	                       // [22:19] num_attributes
 	struct Attr {
-		uint32_t meta;        // [15:0] byte_offset, [16] is_float, [19:17] comp_count
+		uint32_t meta;        // [15:0] byte offset, [19:17] component count, [22:20] format kind
 		uint32_t bit_counts;  // [cnt0, cnt1, cnt2, cnt3]
 		uint32_t bit_offsets; // [off0, off1, off2, off3]
 	} attrs[8];               // words 8..31 (24 uints)

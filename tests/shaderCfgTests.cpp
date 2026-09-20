@@ -6111,6 +6111,21 @@ void TestPerVertexPrototypeDetection() {
             decoded[2] == std::bit_cast<uint32_t>(32768.0f / 65535.0f) &&
             decoded[3] == std::bit_cast<uint32_t>(32767.0f / 65535.0f),
         "unorm16 attribute words were not scaled by 1/65535");
+  const uint16_t half_words[] = {0x0000u, 0x8000u, 0x0001u, 0x03ffu};
+  std::array<uint8_t, 8> half_bytes{};
+  std::memcpy(half_bytes.data(), half_words, sizeof(half_words));
+  Check(DecodePerVertexPrototypeAttribute(Prospero::BufferFormat::k16_16_16_16Float,
+                                          half_bytes, decoded) &&
+            decoded[0] == 0x00000000u && decoded[1] == 0x80000000u &&
+            decoded[2] == 0x33800000u && decoded[3] == 0x387fc000u,
+        "float16 zero or subnormal words were not converted bit-exact");
+  const uint16_t half_special_words[] = {0x3c00u, 0xc000u, 0x7c00u, 0x7e01u};
+  std::memcpy(half_bytes.data(), half_special_words, sizeof(half_special_words));
+  Check(DecodePerVertexPrototypeAttribute(Prospero::BufferFormat::k16_16_16_16Float,
+                                          half_bytes, decoded) &&
+            decoded[0] == 0x3f800000u && decoded[1] == 0xc0000000u &&
+            decoded[2] == 0x7f800000u && decoded[3] == 0x7fc02000u,
+        "float16 normal or special words were not converted bit-exact");
   Check(!DecodePerVertexPrototypeAttribute(Prospero::BufferFormat::k32_32_32_32Float,
                                            std::span<const uint8_t>(float_bytes.data(), 12u), decoded),
         "a short attribute span was decoded");

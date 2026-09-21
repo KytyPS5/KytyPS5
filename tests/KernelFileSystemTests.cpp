@@ -25,6 +25,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace Libs::LibKernelApr {
@@ -454,11 +455,44 @@ void CheckSocketWakeup() {
         "guest PEEK and WAITALL preserve the wake bytes");
   Check(Net::Recv(reader, received.data(), received.size(), 0x40) == sizeof(payload),
         "consume wake bytes with guest WAITALL");
-#if !defined(_WIN32)
+
+#if defined(_WIN32)
+  const int nbio = 1;
+  Check(Net::Setsockopt(reader, 0xffff, 0x1200, &nbio, sizeof(nbio)) == 0,
+        "set nonblocking mode on reader socket");
+  Check(Net::Recv(reader, received.data(), received.size(), 0x42) == -1 &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EWOULDBLOCK,
+        "empty nonblocking receive with PEEK and WAITALL returns EWOULDBLOCK");
+  const int blocking = 0;
+  Check(Net::Setsockopt(reader, 0xffff, 0x1200, &blocking, sizeof(blocking)) == 0,
+        "restore blocking mode on reader socket");
+#else
   Check(Net::Recv(reader, received.data(), received.size(), 0x80) == -1 &&
             *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EWOULDBLOCK,
         "empty nonblocking receive translates guest errno");
 #endif
+
+  std::thread delayed_writer([writer, &payload]() {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    Check(Net::Send(writer, payload, 2, 0x20000) == 2,
+          "send first chunk of wake bytes");
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    Check(Net::Send(writer, payload + 2, sizeof(payload) - 2, 0x20000) ==
+              sizeof(payload) - 2,
+          "send second chunk of wake bytes");
+  });
+
+  std::array<char, sizeof(payload)> chunked_received {};
+  Check(Net::Recv(reader, chunked_received.data(), chunked_received.size(),
+                  0x42) == sizeof(payload) &&
+            std::memcmp(chunked_received.data(), payload, sizeof(payload)) == 0,
+        "guest PEEK and WAITALL waits for chunked arrival");
+  Check(Net::Recv(reader, chunked_received.data(), chunked_received.size(),
+                  0x40) == sizeof(payload) &&
+            std::memcmp(chunked_received.data(), payload, sizeof(payload)) == 0,
+        "consume chunked wake bytes with guest WAITALL");
+
+  delayed_writer.join();
   Check(Net::SocketClose(reader) == 0 && Net::SocketClose(writer) == 0,
         "close wake sockets");
   readable[reader / 64] = bit;

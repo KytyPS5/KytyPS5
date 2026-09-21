@@ -2,8 +2,12 @@
 #define EMULATOR_INCLUDE_EMULATOR_LIBS_VACONTEXT_H_
 
 #include <cstddef>
-#include <xmmintrin.h>
 
+#if defined(__x86_64__)
+#include <xmmintrin.h>
+#endif
+
+#if defined(__x86_64__)
 // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
 #define VA_ARGS                                                                                    \
 	uint64_t rdi, uint64_t rsi, uint64_t rdx, uint64_t rcx, uint64_t r8, uint64_t r9,              \
@@ -58,6 +62,88 @@ struct VaContext {
 struct VaCharX16 {
 	char x[16];
 };
+#elif defined(__aarch64__) || defined(__arm64__)
+// ARM64 calling convention: x0-x7 for integer args, v0-v7 for FP args
+// NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
+#define VA_ARGS                                                                                    \
+	uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3, uint64_t x4, uint64_t x5, uint64_t x6,      \
+	    uint64_t x7, uint64_t overflow_arg_area, double v0, double v1, double v2, double v3,        \
+	    double v4, double v5, double v6, double v7, ...
+
+// NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
+#define VA_CONTEXT(ctx)                                                                            \
+	alignas(16) VaContext ctx;                                                                     \
+	(ctx).reg_save_area.gp[0]       = x0;                                                          \
+	(ctx).reg_save_area.gp[1]       = x1;                                                          \
+	(ctx).reg_save_area.gp[2]       = x2;                                                          \
+	(ctx).reg_save_area.gp[3]       = x3;                                                          \
+	(ctx).reg_save_area.gp[4]       = x4;                                                          \
+	(ctx).reg_save_area.gp[5]       = x5;                                                          \
+	(ctx).reg_save_area.gp[6]       = x6;                                                          \
+	(ctx).reg_save_area.gp[7]       = x7;                                                          \
+	(ctx).reg_save_area.fp[0]       = v0;                                                          \
+	(ctx).reg_save_area.fp[1]       = v1;                                                          \
+	(ctx).reg_save_area.fp[2]       = v2;                                                          \
+	(ctx).reg_save_area.fp[3]       = v3;                                                          \
+	(ctx).reg_save_area.fp[4]       = v4;                                                          \
+	(ctx).reg_save_area.fp[5]       = v5;                                                          \
+	(ctx).reg_save_area.fp[6]       = v6;                                                          \
+	(ctx).reg_save_area.fp[7]       = v7;                                                          \
+	(ctx).va_list.reg_save_area     = &(ctx).reg_save_area;                                        \
+	(ctx).va_list.gp_offset         = offsetof(VaRegSave, gp);                                     \
+	(ctx).va_list.fp_offset         = offsetof(VaRegSave, fp);                                     \
+	(ctx).va_list.overflow_arg_area = &overflow_arg_area;
+
+namespace Libs {
+
+#pragma pack(1)
+
+struct VaList {
+	uint32_t gp_offset;
+	uint32_t fp_offset;
+	void*    overflow_arg_area;
+	void*    reg_save_area;
+};
+
+struct VaRegSave {
+	uint64_t gp[8];
+	uint64_t fp[8];
+};
+
+struct VaContext {
+	VaRegSave reg_save_area;
+	VaList    va_list;
+};
+
+struct VaCharX16 {
+	char x[16];
+};
+#else
+namespace Libs {
+
+#pragma pack(1)
+
+struct VaList {
+	uint32_t gp_offset;
+	uint32_t fp_offset;
+	void*    overflow_arg_area;
+	void*    reg_save_area;
+};
+
+struct VaRegSave {
+	uint64_t gp[8];
+	uint64_t fp[8];
+};
+
+struct VaContext {
+	VaRegSave reg_save_area;
+	VaList    va_list;
+};
+
+struct VaCharX16 {
+	char x[16];
+};
+#endif
 
 struct VaShortX8 {
 	short x[8]; // NOLINT(google-runtime-int)

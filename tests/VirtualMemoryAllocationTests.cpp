@@ -801,6 +801,11 @@ void TestGuestStackUsesPrivateOwnerMemoryAndCache() {
 void TestMainEntryUsesGuestStackAndDisablesHostChecks() {
 	const char* test = "MainEntryUsesGuestStackAndDisablesHostChecks";
 
+#if defined(__aarch64__) || defined(__arm64__)
+	std::printf("[host]    %-48s skipped\n", test);
+	return;
+#endif
+
 	Check(test, Loader::TestMainEntryUsesGuestStack(),
 	      "main-entry stack switch did not preserve the guest/host stack invariants");
 

@@ -462,7 +462,13 @@ static KYTY_SYSV_ABI void stack_chk_fail() {
 	PRINT_NAME();
 
 	uint64_t rsp = 0;
+#if defined(__x86_64__)
 	asm volatile("movq %%rsp, %0" : "=r"(rsp));
+#elif defined(__aarch64__) || defined(__arm64__)
+	asm volatile("mov %0, sp" : "=r"(rsp));
+#else
+#error "Unsupported architecture"
+#endif
 	dump_stack_chk_fail_context(reinterpret_cast<uint64_t>(__builtin_return_address(0)), rsp);
 
 	EXIT("stack fail!!!");
@@ -705,6 +711,7 @@ static SignalUcontext CreateSignalUcontext(
 static SignalUcontext CreateCurrentGuestCallSignalUcontext(uint64_t rip) {
 	auto ctx = CreateSignalUcontext();
 
+#if defined(__x86_64__)
 	uint64_t rsp = 0;
 	uint64_t rbp = 0;
 	uint64_t rbx = 0;
@@ -740,6 +747,14 @@ static SignalUcontext CreateCurrentGuestCallSignalUcontext(uint64_t rip) {
 	ctx.uc_mcontext.mc_r14 = r14;
 	ctx.uc_mcontext.mc_r15 = r15;
 	ctx.uc_mcontext.mc_rip = rip;
+#else
+	// ARM64: Use frame pointers
+	ctx.uc_mcontext.mc_len = sizeof(SignalMcontext);
+	uint64_t stack_marker  = 0;
+	ctx.uc_mcontext.mc_rsp = reinterpret_cast<uint64_t>(&stack_marker);
+	ctx.uc_mcontext.mc_rbp = reinterpret_cast<uint64_t>(__builtin_frame_address(0));
+	ctx.uc_mcontext.mc_rip = rip;
+#endif
 
 	return ctx;
 }
@@ -840,7 +855,7 @@ static SignalUcontext CreateSignalUcontextFromHost(const ucontext_t* host_ctx) {
 		return ctx;
 	}
 
-#if defined(__APPLE__)
+#if defined(__APPLE__) && (defined(__x86_64__) || defined(_M_X64))
 	const auto& ss = host_ctx->uc_mcontext->__ss;
 
 	ctx.uc_mcontext.mc_rdi    = ss.__rdi;
@@ -864,6 +879,33 @@ static SignalUcontext CreateSignalUcontextFromHost(const ucontext_t* host_ctx) {
 	ctx.uc_mcontext.mc_cs     = ss.__cs & 0xffffu;
 	ctx.uc_mcontext.mc_gs     = static_cast<uint16_t>(ss.__gs & 0xffffu);
 	ctx.uc_mcontext.mc_fs     = static_cast<uint16_t>(ss.__fs & 0xffffu);
+	ctx.uc_mcontext.mc_len    = sizeof(SignalMcontext);
+
+	return ctx;
+#elif defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+	const auto& ss = host_ctx->uc_mcontext->__ss;
+
+	ctx.uc_mcontext.mc_rdi    = ss.__x[0];
+	ctx.uc_mcontext.mc_rsi    = ss.__x[1];
+	ctx.uc_mcontext.mc_rdx    = ss.__x[2];
+	ctx.uc_mcontext.mc_rcx    = ss.__x[3];
+	ctx.uc_mcontext.mc_r8     = ss.__x[8];
+	ctx.uc_mcontext.mc_r9     = ss.__x[9];
+	ctx.uc_mcontext.mc_rax    = ss.__x[4];
+	ctx.uc_mcontext.mc_rbx    = ss.__x[5];
+	ctx.uc_mcontext.mc_rbp    = ss.__x[6];
+	ctx.uc_mcontext.mc_r10    = ss.__x[10];
+	ctx.uc_mcontext.mc_r11    = ss.__x[11];
+	ctx.uc_mcontext.mc_r12    = ss.__x[12];
+	ctx.uc_mcontext.mc_r13    = ss.__x[13];
+	ctx.uc_mcontext.mc_r14    = ss.__x[14];
+	ctx.uc_mcontext.mc_r15    = ss.__x[15];
+	ctx.uc_mcontext.mc_rip    = ss.__pc;
+	ctx.uc_mcontext.mc_rsp    = ss.__sp;
+	ctx.uc_mcontext.mc_rflags = ss.__cpsr;
+	ctx.uc_mcontext.mc_cs     = 0;
+	ctx.uc_mcontext.mc_gs     = 0;
+	ctx.uc_mcontext.mc_fs     = 0;
 	ctx.uc_mcontext.mc_len    = sizeof(SignalMcontext);
 
 	return ctx;
@@ -905,7 +947,7 @@ static void ApplySignalUcontextToHost(ucontext_t* dst_ctx, const SignalUcontext&
 		return;
 	}
 
-#if defined(__APPLE__)
+#if defined(__APPLE__) && (defined(__x86_64__) || defined(_M_X64))
 	auto& ss = dst_ctx->uc_mcontext->__ss;
 
 	ss.__rdi    = src_ctx.uc_mcontext.mc_rdi;
@@ -927,6 +969,28 @@ static void ApplySignalUcontextToHost(ucontext_t* dst_ctx, const SignalUcontext&
 	ss.__rsp    = src_ctx.uc_mcontext.mc_rsp;
 	ss.__rflags = src_ctx.uc_mcontext.mc_rflags;
 	// Segment selectors are left untouched; XNU validates them on sigreturn.
+#elif defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+	auto& ss = dst_ctx->uc_mcontext->__ss;
+
+	ss.__x[0]  = src_ctx.uc_mcontext.mc_rdi;
+	ss.__x[1]  = src_ctx.uc_mcontext.mc_rsi;
+	ss.__x[2]  = src_ctx.uc_mcontext.mc_rdx;
+	ss.__x[3]  = src_ctx.uc_mcontext.mc_rcx;
+	ss.__x[8]  = src_ctx.uc_mcontext.mc_r8;
+	ss.__x[9]  = src_ctx.uc_mcontext.mc_r9;
+	ss.__x[4]  = src_ctx.uc_mcontext.mc_rax;
+	ss.__x[5]  = src_ctx.uc_mcontext.mc_rbx;
+	ss.__x[6]  = src_ctx.uc_mcontext.mc_rbp;
+	ss.__x[10] = src_ctx.uc_mcontext.mc_r10;
+	ss.__x[11] = src_ctx.uc_mcontext.mc_r11;
+	ss.__x[12] = src_ctx.uc_mcontext.mc_r12;
+	ss.__x[13] = src_ctx.uc_mcontext.mc_r13;
+	ss.__x[14] = src_ctx.uc_mcontext.mc_r14;
+	ss.__x[15] = src_ctx.uc_mcontext.mc_r15;
+	ss.__pc    = src_ctx.uc_mcontext.mc_rip;
+	ss.__sp    = src_ctx.uc_mcontext.mc_rsp;
+	ss.__cpsr  = src_ctx.uc_mcontext.mc_rflags;
+	// Segment selectors not applicable on ARM64; XNU validates on sigreturn.
 #else
 	auto* gregs = dst_ctx->uc_mcontext.gregs;
 

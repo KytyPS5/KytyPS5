@@ -429,7 +429,7 @@ struct Context {
 			ymm[index] = {};
 		}
 	}
-#elif defined(__APPLE__)
+#elif defined(__APPLE__) && (defined(__x86_64__) || defined(_M_X64))
 	ucontext_t* native;
 
 	[[nodiscard]] uint64_t Rip() const {
@@ -460,6 +460,22 @@ struct Context {
 			case 15: return &fs->__fpu_xmm15;
 			default: return nullptr;
 		}
+	}
+#elif defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+	ucontext_t* native;
+
+	[[nodiscard]] uint64_t Rip() const {
+		return static_cast<uint64_t>(native->uc_mcontext->__ss.__pc);
+	}
+	void Advance(size_t length) {
+		native->uc_mcontext->__ss.__pc += static_cast<uint64_t>(length);
+	}
+	// ARM64 uses NEON registers (v0-v31) instead of XMM
+	[[nodiscard]] void* Xmm(uint8_t index) const {
+		if (index >= 32) return nullptr;
+		// NEON registers are in __ns (neon state), not __ss
+		auto* ns = &native->uc_mcontext->__ns;
+		return &ns->__v[index];
 	}
 #else
 	ucontext_t* native;
@@ -759,7 +775,7 @@ bool TryEmulate(void* native_context) {
 	}
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	Context context {static_cast<PCONTEXT>(native_context)};
-#elif defined(__APPLE__)
+#elif defined(__APPLE__) && (defined(__x86_64__) || defined(_M_X64))
 	auto* saved_context = static_cast<ucontext_t*>(native_context);
 	if (saved_context->uc_mcontext == nullptr) {
 		return false;
@@ -768,7 +784,7 @@ bool TryEmulate(void* native_context) {
 #else
 	Context context {static_cast<ucontext_t*>(native_context)};
 #endif
-#if !defined(__APPLE__)
+#if !defined(__APPLE__) || (defined(__APPLE__) && (defined(__x86_64__) || defined(_M_X64)))
 	if (TryEmulateReciprocalSquareRoot(context)) {
 		return true;
 	}

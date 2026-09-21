@@ -1,9 +1,10 @@
-#include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
-
 #include "common/assert.h"
+#include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
 #include <algorithm>
 #include <bit>
+#include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <mutex>
 #include <optional>
@@ -93,6 +94,45 @@ void StoreDispatcherPhiCopies(ValueEmitContext& ctx, const DispatcherPhiCopies& 
 	}
 }
 
+// KYTY_CS_LOOP_BUDGET: per-invocation ceiling on loop iterations over the whole module; 0 is off.
+uint32_t LoopBudgetLimit() {
+	static const uint32_t limit = [] {
+		const char* text = std::getenv("KYTY_CS_LOOP_BUDGET");
+		if (text == nullptr) {
+			return 0u;
+		}
+		const auto value = std::strtoull(text, nullptr, 0);
+		return value > 0xffffffffull ? 0xffffffffu : static_cast<uint32_t>(value);
+	}();
+	return limit;
+}
+
+// One line per guarded shader: a truncated loop is a wrong picture.
+void ReportLoopBudget(const EmitterState& state) {
+	if (state.loop_budget_limit == 0 ||
+	    (state.loop_budget_guarded == 0 && state.loop_budget_unguardable == 0)) {
+		return;
+	}
+	static std::mutex                   mutex;
+	static std::unordered_set<uint64_t> seen;
+	{
+		const std::lock_guard<std::mutex> lock(mutex);
+		if (!seen.insert(state.program.shader_hash).second) {
+			return;
+		}
+	}
+	std::fprintf(stdout,
+	             "LOOPGUARD: shader=0x%016llx budget=%u guarded=%u loops, unguardable=%u - an "
+	             "invocation that exhausts the budget returns immediately, dropping the rest of "
+	             "its work, not just the rest of the loop\n",
+	             static_cast<unsigned long long>(state.program.shader_hash),
+	             state.loop_budget_limit, state.loop_budget_guarded, state.loop_budget_unguardable);
+	std::fflush(stdout);
+}
+
+	return allowed;
+}
+
 void EmitReturn(ValueEmitContext& ctx) {
 	EmitKillIfPixelValidMaskInactive(ctx.state);
 	if (ctx.state.object_primitive_id_variable != 0) {
@@ -141,7 +181,19 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block) {
 				EmitReturn(ctx);
 				return;
 			}
-			const auto condition = ctx.Def(block->condition);
+			const auto latch     = ctx.state.loop_budget_latch.find(block);
+					// Back edge on the true arm: stay in the loop only while under budget.
+					ctx.state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(ctx.state), folded,
+					                              condition, allowed);
+				} else {
+					const auto exhausted = ctx.state.builder.AllocateId();
+					ctx.state.builder.AddFunction(spv::OpLogicalNot, TypeBool(ctx.state), exhausted,
+					                              allowed);
+					ctx.state.builder.AddFunction(spv::OpLogicalOr, TypeBool(ctx.state), folded,
+					                              condition, exhausted);
+				}
+				condition = folded;
+			}
 			emit_merge();
 			ctx.state.builder.AddFunction(spv::OpBranchConditional, condition,
 			                              true_block->Definition(), false_block->Definition());
@@ -351,15 +403,61 @@ void PatchStructuredPhis(ValueEmitContext& ctx, StructuredFunctionState& structu
 	}
 }
 
+// The charge sits in the block the header branches into, once per iteration.
+std::unordered_set<const IR::Block*> LoopChargeSites(ValueEmitContext& ctx) {
+	std::unordered_set<const IR::Block*> sites;
+		return sites;
+	}
+	const auto& program = ctx.state.program;
+	// Splitting a continue target would put an OpReturn inside its continue construct.
+		}
+	}
+			continue;
+		}
+			// A body that is the latch folds the budget into its (header, merge) branch.
+				ctx.state.loop_budget_guarded++;
+			} else if (!foldable) {
+				ctx.state.loop_budget_unguardable++;
+			}
+			continue;
+		}
+			ctx.state.loop_budget_unguardable++;
+			continue;
+		}
+			ctx.state.loop_budget_unguardable++;
+			continue;
+		}
+		if (sites.insert(body).second) {
+			ctx.state.loop_budget_guarded++;
+		}
+	}
+	return sites;
+}
+
+	const auto abort = ctx.state.builder.AllocateId();
+	const auto rest  = ctx.state.builder.AllocateId();
+	ctx.state.builder.AddFunction(spv::OpSelectionMerge, rest, spv::SelectionControlMaskNone);
+	ctx.state.builder.AddFunction(spv::OpBranchConditional, allowed, rest, abort);
+	EmitLabel(ctx.state, abort);
+	ctx.state.builder.AddFunction(spv::OpReturn);
+	EmitLabel(ctx.state, rest);
+}
+
 void EmitStructuredFunction(ValueEmitContext& ctx) {
 	const auto& program = ctx.state.program;
 	StructuredFunctionState structured;
+	const auto              charge_sites = LoopChargeSites(ctx);
 	ctx.state.builder.AddFunction(spv::OpBranch, program.blocks.front()->Definition());
 	for (size_t index = 0; index < program.blocks.size(); index++) {
 		const auto* block = program.blocks[index];
 		EmitBlock(ctx, block, [&](ValueEmitContext& lane, const IR::Inst& inst) {
 			EmitStructuredInstruction(lane, structured, inst);
 		});
+		if (ctx.state.Refused()) {
+			return;
+		}
+		if (charge_sites.contains(block)) {
+		}
 		structured.block_exit_labels.emplace(block, ctx.state.current_label);
 		EmitStructuredTerminator(ctx, block);
 	}
@@ -640,6 +738,11 @@ void EmitProgram(EmitterState& state) {
 		state.pixel_valid_mask_variable = state.builder.AllocateId();
 		state.builder.AddName(state.pixel_valid_mask_variable, "pixel_valid_mask_active");
 	}
+	// The guard exits by OpReturn, which outside compute abandons the whole invocation.
+	state.loop_budget_limit = state.program.stage == ShaderType::Compute ? LoopBudgetLimit() : 0u;
+		state.loop_budget_variable = state.builder.AllocateId();
+		state.builder.AddName(state.loop_budget_variable, "loop_budget");
+	}
 	for (const auto* block: program.blocks) {
 		// Re-emission may use a different host subgroup width and ID allocation order.
 		for (const auto& inst: *block) {
@@ -736,6 +839,11 @@ void EmitProgram(EmitterState& state) {
 		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
 		                          state.pixel_valid_mask_variable, spv::StorageClassFunction);
 	}
+	if (state.loop_budget_variable != 0) {
+		state.builder.AddFunction(spv::OpVariable,
+		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
+		                          state.loop_budget_variable, spv::StorageClassFunction);
+	}
 	for (uint32_t half = 0; half < state.lane_count; half++) {
 		auto& lane = half == 0 ? ctx : high;
 		if (state.program.dispatcher_fallback) {
@@ -765,6 +873,9 @@ void EmitProgram(EmitterState& state) {
 		state.builder.AddFunction(spv::OpStore, state.pixel_valid_mask_variable,
 		                          ConstantU32(state, 1));
 	}
+	if (state.loop_budget_variable != 0) {
+		state.builder.AddFunction(spv::OpStore, state.loop_budget_variable, ConstantU32(state, 0));
+	}
 	if (state.lds_storage_class == spv::StorageClassStorageBuffer && state.lds_variable != 0) {
 		const auto group_x = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 0);
 		const auto group_y = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 1);
@@ -792,6 +903,7 @@ void EmitProgram(EmitterState& state) {
 	if (state.program.stage == ShaderType::Mesh) {
 		EmitMeshEntryPoint(state);
 	}
+	ReportLoopBudget(state);
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter

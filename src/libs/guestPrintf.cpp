@@ -784,8 +784,12 @@ static int kyty_printf_internal(bool sn, char* sn_s, size_t sn_n, const char* fo
 	out(static_cast<char>(0), &buffer, idx < maxlen ? idx : maxlen - 1U, maxlen);
 
 	if (sn) {
-		int s = snprintf(sn_s, sn_n, "%s", buffer.data());
-		EXIT_NOT_IMPLEMENTED(static_cast<size_t>(s) >= sn_n);
+		// A zero size is a legal way to ask for the length the formatted text would need, and the
+		// host snprintf is only allowed to touch the buffer when there is one.
+		if (sn_n != 0) {
+			int s = snprintf(sn_s, sn_n, "%s", buffer.data());
+			EXIT_NOT_IMPLEMENTED(static_cast<size_t>(s) >= sn_n);
+		}
 	} else {
 		LOGF_COLOR(Log::Color::BrightMagenta, "%s", buffer.data());
 	}
@@ -796,6 +800,10 @@ static int kyty_printf_internal(bool sn, char* sn_s, size_t sn_n, const char* fo
 
 static int kyty_vprintf(const char* format, VaList* va_list) {
 	return kyty_printf_internal(false, nullptr, 0, format, va_list);
+}
+
+static int kyty_vsnprintf(char* str, size_t size, const char* format, VaList* va_list) {
+	return kyty_printf_internal(true, str, size, format, va_list);
 }
 
 static int kyty_printf_ctx(VaContext* ctx) {
@@ -832,6 +840,10 @@ guest_snprintf_ctx_func_t GetGuestSnprintfCtxFunc() {
 
 guest_vprintf_func_t GetGuestVprintfFunc() {
 	return kyty_vprintf;
+}
+
+guest_vsnprintf_func_t GetGuestVsnprintfFunc() {
+	return kyty_vsnprintf;
 }
 
 } // namespace Libs

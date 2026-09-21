@@ -926,6 +926,16 @@ static KYTY_SYSV_ABI void* libc_malloc(size_t size) {
 	return std::malloc(size);
 }
 
+static KYTY_SYSV_ABI void* libc_memchr(const void* ptr, int value, size_t num) {
+	// C's memchr returns a mutable pointer even though it takes a const one.
+	return const_cast<void*>(std::memchr(ptr, value, num));
+}
+
+static KYTY_SYSV_ABI int libc_vsnprintf(char* str, size_t size, const char* format,
+                                        VaList* va_list) {
+	return GetGuestVsnprintfFunc()(str, size, format, va_list);
+}
+
 static KYTY_SYSV_ABI void libc_free(void* ptr) {
 	std::free(ptr);
 }
@@ -1016,6 +1026,8 @@ LIB_DEFINE(InitLibC_1) {
 	LIB_FUNC("MLWl90SFWNE", LibC::cxa_operator_delete);
 
 	LIB_FUNC("gQX+4GDQjpM", LibC::libc_malloc);
+	LIB_FUNC("8u8lPzUEq+U", LibC::libc_memchr);
+	LIB_FUNC("Q2V+iqvjgC0", LibC::libc_vsnprintf);
 	LIB_FUNC("tIhsqj0qsFE", LibC::libc_free);
 	LIB_FUNC("2X5agFjKxMc", LibC::libc_calloc);
 	LIB_FUNC("Y7aJ1uydPMo", LibC::libc_realloc);

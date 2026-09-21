@@ -194,8 +194,15 @@ inline VaFloatX4 VaArg_reg_save_area_fp<VaFloatX4, 32>(VaList* l) {
 	auto* addr =
 	    reinterpret_cast<__m128*>(static_cast<uint8_t*>(l->reg_save_area) + l->fp_offset);
 	l->fp_offset += 32;
-	VaFloatX4 ret = {{addr[0].m128_f32[0], addr[0].m128_f32[1],
-	                  addr[1].m128_f32[0], addr[1].m128_f32[1]}};
+	union {
+		__m128 v;
+		float f[4];
+	} cvt0 = {addr[0]};
+	union {
+		__m128 v;
+		float f[4];
+	} cvt1 = {addr[1]};
+	VaFloatX4 ret = {{cvt0.f[0], cvt0.f[1], cvt1.f[0], cvt1.f[1]}};
 	return ret;
 }
 
@@ -204,7 +211,11 @@ inline double VaArg_double(VaList* l) {
 	if (l->fp_offset <= 112) {
 		auto* addr = reinterpret_cast<__m128*>(static_cast<uint8_t*>(l->reg_save_area) + l->fp_offset);
 		l->fp_offset += 16;
-		return addr[0].m128_f64[0];
+		union {
+			__m128 v;
+			double d[2];
+		} cvt = {addr[0]};
+		return cvt.d[0];
 	}
 	return VaArg_overflow_arg_area<double, 1, 8>(l);
 }

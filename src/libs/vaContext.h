@@ -48,8 +48,6 @@ struct VaList {
 	void*    reg_save_area;
 };
 
-// typedef float __m128 __attribute__((__vector_size__(16), __aligned__(16)));
-
 struct VaRegSave {
 	uint64_t gp[6];
 	__m128   fp[8];
@@ -190,6 +188,27 @@ T VaArg_reg_save_area_fp(VaList* l) {
 	return *addr;
 }
 
+#if defined(__x86_64__)
+template <>
+inline VaFloatX4 VaArg_reg_save_area_fp<VaFloatX4, 32>(VaList* l) {
+	auto* addr =
+	    reinterpret_cast<__m128*>(static_cast<uint8_t*>(l->reg_save_area) + l->fp_offset);
+	l->fp_offset += 32;
+	VaFloatX4 ret = {{addr[0].m128_f32[0], addr[0].m128_f32[1],
+	                  addr[1].m128_f32[0], addr[1].m128_f32[1]}};
+	return ret;
+}
+
+inline double VaArg_double(VaList* l) {
+	// 8 FP registers * 16 bytes = 128 bytes total; max valid offset is 112 (7*16)
+	if (l->fp_offset <= 112) {
+		auto* addr = reinterpret_cast<__m128*>(static_cast<uint8_t*>(l->reg_save_area) + l->fp_offset);
+		l->fp_offset += 16;
+		return addr[0].m128_f64[0];
+	}
+	return VaArg_overflow_arg_area<double, 1, 8>(l);
+}
+#elif defined(__aarch64__) || defined(__arm64__)
 template <>
 inline VaFloatX4 VaArg_reg_save_area_fp<VaFloatX4, 32>(VaList* l) {
 	auto* addr =
@@ -198,13 +217,6 @@ inline VaFloatX4 VaArg_reg_save_area_fp<VaFloatX4, 32>(VaList* l) {
 	VaFloatX4 ret = {{static_cast<float>(addr[0].lo), static_cast<float>(addr[0].hi),
 	                  static_cast<float>(addr[1].lo), static_cast<float>(addr[1].hi)}};
 	return ret;
-}
-
-inline int VaArg_int(VaList* l) {
-	if (l->gp_offset <= 40) {
-		return VaArg_reg_save_area_gp<int, 8>(l);
-	}
-	return VaArg_overflow_arg_area<int, 1, 8>(l);
 }
 
 inline double VaArg_double(VaList* l) {
@@ -216,6 +228,34 @@ inline double VaArg_double(VaList* l) {
 		return std::bit_cast<double>(bits);
 	}
 	return VaArg_overflow_arg_area<double, 1, 8>(l);
+}
+#else
+// Fallback for other architectures
+template <>
+inline VaFloatX4 VaArg_reg_save_area_fp<VaFloatX4, 32>(VaList* l) {
+	auto* addr =
+	    reinterpret_cast<uint64_t*>(static_cast<uint8_t*>(l->reg_save_area) + l->fp_offset);
+	l->fp_offset += 32;
+	VaFloatX4 ret = {{static_cast<float>(addr[0]), static_cast<float>(addr[1]),
+	                  static_cast<float>(addr[2]), static_cast<float>(addr[3])}};
+	return ret;
+}
+
+inline double VaArg_double(VaList* l) {
+	if (l->fp_offset <= 112) {
+		auto* addr = reinterpret_cast<uint64_t*>(static_cast<uint8_t*>(l->reg_save_area) + l->fp_offset);
+		l->fp_offset += 16;
+		return std::bit_cast<double>(addr[0]);
+	}
+	return VaArg_overflow_arg_area<double, 1, 8>(l);
+}
+#endif
+
+inline int VaArg_int(VaList* l) {
+	if (l->gp_offset <= 40) {
+		return VaArg_reg_save_area_gp<int, 8>(l);
+	}
+	return VaArg_overflow_arg_area<int, 1, 8>(l);
 }
 
 inline long double VaArg_long_double(VaList* l) {

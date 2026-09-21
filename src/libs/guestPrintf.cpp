@@ -434,6 +434,12 @@ static size_t _etoa(out_fct_type out, std::vector<char>* buffer, size_t idx, siz
 
 template <typename Char>
 static size_t _strnlen_s(const Char* str, size_t maxsize) {
+	// The "_s" contract this name comes from defines a null string as empty. A guest reaches here
+	// with a null whenever an unresolved import handed one back.
+	if (str == nullptr) {
+		return 0;
+	}
+
 	size_t size = 0;
 	while (size < maxsize && str[size] != 0) {
 		++size;
@@ -704,7 +710,12 @@ static int kyty_printf_internal(bool sn, char* sn_s, size_t sn_n, const char* fo
 				const size_t limit = (flags & FLAGS_PRECISION) != 0u ? precision : maxlen;
 				const char* p = VaArg_ptr<const char>(va_list);
 				std::string converted;
-				if ((flags & FLAGS_LONG) != 0u) {
+				if (p == nullptr) {
+					// glibc prints "(null)" here rather than reading address 0. A guest reaches
+					// this whenever an unresolved import handed back a null string.
+					converted = "(null)";
+					p         = converted.c_str();
+				} else if ((flags & FLAGS_LONG) != 0u) {
 					// The guest ABI uses a 16-bit code unit for wchar_t.
 					const auto* wide = reinterpret_cast<const char16_t*>(p);
 					std::u16string_view text(wide, _strnlen_s(wide, limit));

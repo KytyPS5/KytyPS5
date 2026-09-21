@@ -22,6 +22,7 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
+#include "graphics/host_gpu/renderer/refusalReport.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -143,6 +144,36 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	return result;
 }
 
+// A combination of guest descriptor words the host cannot represent is a bindable state, not an
+// emulator fault: the shader gets the 1x1 null texture and the full descriptor dump is reported
+// once per distinct descriptor rather than once per draw.
+static RefusalReporter g_texture_refusal_reports;
+
+// Reason codes keep two different refusals on the same descriptor from silencing each other.
+enum class TextureRefusal : uint32_t {
+	MipView        = 1,
+	NumericClass   = 2,
+	MsaaLayout     = 3,
+	SurfaceSize    = 4,
+	StorageTexture = 5,
+	SampledDepth   = 6,
+	ViewInfo       = 7,
+	DepthAsStorage = 8,
+};
+
+[[nodiscard]] static bool ShouldReportTextureRefusal(uint64_t address, uint64_t size,
+                                                     TextureRefusal reason,
+                                                     char (&repeat)[32]) {
+	const auto occurrences =
+	    g_texture_refusal_reports.Observe(address, size, static_cast<uint64_t>(reason));
+	repeat[0] = '\0';
+	if (occurrences == 0) {
+		return false;
+	}
+	(void)RefusalReporter::RepeatSuffix(repeat, occurrences);
+	return true;
+}
+
 bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor, bool r128) {
 	constexpr uint32_t field1_reserved_mask = 0x200fff00u;
 	constexpr uint32_t field2_reserved_mask = 0xf0003000u;
@@ -179,9 +210,9 @@ bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor, bo
 	       descriptor.TileMode() == Prospero::TileMode::kDepth;
 }
 
-static void ValidateSampledDepthBinding(const ShaderRecompiler::IR::ImageResource& resource,
-                                        const ShaderTextureResource& descriptor, const Image& image,
-                                        vk::Format view_format, uint64_t size) {
+[[nodiscard]] static bool ValidateSampledDepthBinding(
+    const ShaderRecompiler::IR::ImageResource& resource, const ShaderTextureResource& descriptor,
+    const Image& image, vk::Format view_format, uint64_t size) {
 	const bool resource_ok = IsSupportedSampledDepthResource(resource);
 	// Comparison sampling changes the host format, not the guest metadata encoding.
 	const bool encoding_ok = descriptor.TileMode() != Prospero::TileMode::kDepth ||
@@ -189,17 +220,22 @@ static void ValidateSampledDepthBinding(const ShaderRecompiler::IR::ImageResourc
 	const bool view_ok =
 	    IsSupportedSampledDepthView(image.info.pixel_format, view_format, descriptor.DstSelXYZW());
 	if (resource_ok && encoding_ok && view_ok) {
-		return;
+		return true;
+	}
+	char repeat[32] = "";
+	if (!ShouldReportTextureRefusal(descriptor.Base40(), size, TextureRefusal::SampledDepth,
+	                                repeat)) {
+		return false;
 	}
 	const auto descriptor_pitch =
 	    TileGetTexturePitch(descriptor.Format(), static_cast<uint32_t>(descriptor.Width5()) + 1u,
 	                        descriptor.TileMode());
-	EXIT("unsupported sampled depth image: resource=%d encoding=%d view=%d "
+	LOGF("unsupported sampled depth image: resource=%d encoding=%d view=%d "
 	     "class=%u numeric=%u dimension=%u mip_mode=%u read=%d written=%d atomic=%d compare=%d "
 	     "guest_format=%u swizzle=0x%03x image_format=%d view_format=%d image_layers=%u "
 	     "descriptor_type=%u base_array=%u depth=%u descriptor_pitch=%u target_pitch=%u "
 	     "addr=0x%016" PRIx64 " size=0x%016" PRIx64
-	     " dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
+	     " dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x%s\n",
 	     resource_ok, encoding_ok, view_ok,
 	     static_cast<uint32_t>(resource.resource_class),
 	     static_cast<uint32_t>(resource.numeric_class), static_cast<uint32_t>(resource.dimension),
@@ -210,7 +246,8 @@ static void ValidateSampledDepthBinding(const ShaderRecompiler::IR::ImageResourc
 	     static_cast<uint32_t>(descriptor.Type()), descriptor.BaseArray5(), descriptor.Depth(),
 	     descriptor_pitch, image.info.pitch, descriptor.Base40(), size, descriptor.fields[0],
 	     descriptor.fields[1], descriptor.fields[2], descriptor.fields[3], descriptor.fields[4],
-	     descriptor.fields[5], descriptor.fields[6], descriptor.fields[7]);
+	     descriptor.fields[5], descriptor.fields[6], descriptor.fields[7], repeat);
+	return false;
 }
 
 static bool IsSupportedStorageTextureDescriptor(const ShaderRecompiler::IR::ImageResource& resource,
@@ -305,7 +342,7 @@ static bool IsSupportedStorageTextureEncoding(const ShaderRecompiler::IR::ImageR
 	       (descriptor.fields[5] & ~field5_max_mip_mask) == field5_expected;
 }
 
-void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
+bool ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
                             const ShaderTextureResource& descriptor, uint64_t size) {
 	const auto format        = descriptor.Format();
 	const bool resource_ok   = IsSupportedStorageImageResource(resource);
@@ -327,15 +364,20 @@ void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	     (!resource.atomic || format == (resource.atomic64 ? Prospero::BufferFormat::k32_32UInt
 	                                                       : Prospero::BufferFormat::k32UInt)));
 	if (resource_ok && descriptor_ok && encoding_ok && format_ok && size != 0) {
-		return;
+		return true;
 	}
-	EXIT("unsupported storage texture: resource=%d descriptor=%d encoding=%d format=%d "
+	char repeat[32] = "";
+	if (!ShouldReportTextureRefusal(descriptor.Base40(), size, TextureRefusal::StorageTexture,
+	                                repeat)) {
+		return false;
+	}
+	LOGF("unsupported storage texture: resource=%d descriptor=%d encoding=%d format=%d "
 	     "class=%u numeric=%u dimension=%u mip_mode=%u atomic=%d compare=%d "
 	     "base_level=%u last_level=%u max_mip=%u min_lod=%u base_array=%u bc=%u msaa=%d "
 	     "depth_tile_bpe=%u swizzle_ok=%d "
 	     "addr=0x%016" PRIx64 " size=0x%016" PRIx64
 	     " extent=%ux%ux%u type=%u format=%u tile=%u swizzle=0x%03x read=%d written=%d "
-	     "dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
+	     "dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x%s\n",
 	     resource_ok, descriptor_ok, encoding_ok, format_ok,
 	     static_cast<uint32_t>(resource.resource_class),
 	     static_cast<uint32_t>(resource.numeric_class), static_cast<uint32_t>(resource.dimension),
@@ -350,7 +392,8 @@ void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	     static_cast<uint32_t>(format), static_cast<uint32_t>(descriptor.TileMode()),
 	     descriptor.DstSelXYZW(), resource.read, resource.written, descriptor.fields[0],
 	     descriptor.fields[1], descriptor.fields[2], descriptor.fields[3], descriptor.fields[4],
-	     descriptor.fields[5], descriptor.fields[6], descriptor.fields[7]);
+	     descriptor.fields[5], descriptor.fields[6], descriptor.fields[7], repeat);
+	return false;
 }
 
 static TextureCache::ImageDesc NullTextureDesc(const ShaderRecompiler::IR::ImageResource& resource,
@@ -367,7 +410,10 @@ static TextureCache::ImageDesc NullTextureDesc(const ShaderRecompiler::IR::Image
 		case Prospero::TextureNumericClass::Sint:
 			desc.info.guest_format = Prospero::BufferFormat::k32SInt;
 			break;
-		default: EXIT("null image has unsupported numeric class\n");
+		default:
+			// A float 1x1 reads as zero in every numeric class the sampler can ask for.
+			desc.info.guest_format = Prospero::BufferFormat::k32Float;
+			break;
 	}
 	desc.info.pixel_format    = VulkanFormat(desc.info.guest_format);
 	desc.info.type            = Prospero::ImageType::kColor2D;
@@ -390,10 +436,59 @@ static TextureCache::ImageDesc NullTextureDesc(const ShaderRecompiler::IR::Image
 	return desc;
 }
 
+static void PopulateTextureMipLayout(ImageInfo& info) {
+	if (info.IsVolume() && info.tile_mode != Prospero::TileMode::kLinear) {
+		TileSurfaceLayout            surface {};
+		const TileSurfaceDescription description {
+		    info.guest_format,  info.tile_mode,    TileSurfaceDimension::Dim3D, info.extent.width,
+		    info.extent.height, info.extent.depth, info.resources.levels,       1};
+		if (!TileGetTiledTextureLayout(description, surface)) {
+			EXIT("unsupported normalized volume texture layout\n");
+		}
+		for (uint32_t level = 0; level < info.resources.levels; level++) {
+			const auto& mip        = surface.mips[level];
+			info.mip_layout[level] = {
+			    mip.offset,
+			    mip.size,
+			    mip.padded_width,
+			    mip.padded_height,
+			};
+		}
+		return;
+	}
+
+	TileSizeOffset levels[16] {};
+	TilePaddedSize padded[16] {};
+	TileGetTextureSize(info.guest_format, info.extent.width, info.extent.height,
+	                   info.resources.levels, info.tile_mode, nullptr, levels, padded);
+	const auto texel_shift = info.IsBlock() ? 2u : 0u;
+	for (uint32_t level = 0; level < info.resources.levels; level++) {
+		const auto offset =
+		    levels[level].src_size != 0 ? levels[level].src_offset : levels[level].offset;
+		auto size = static_cast<uint64_t>(levels[level].src_size != 0 ? levels[level].src_size
+		                                                              : levels[level].size);
+		if (info.IsVolume()) {
+			size *= std::max(info.extent.depth >> level, 1u);
+		} else {
+			size *= info.resources.layers;
+		}
+		info.mip_layout[level] = {
+		    offset,
+		    size,
+		    padded[level].width >> texel_shift,
+		    padded[level].height >> texel_shift,
+		};
+	}
+}
+
+// A base array slice past the image's layer count, or a view dimension with no Vulkan spelling,
+// means the guest descriptor and the surface the cache found for it disagree; *refused is the only
+// signal, because no view value would be less wrong.
 static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& resource,
                                      const ShaderTextureResource& descriptor, vk::Format format,
                                      const SurfaceFormatInfo& surface_format, bool storage,
-                                     uint32_t view_levels, uint32_t image_layers) {
+                                     uint32_t view_levels, uint32_t image_layers, bool* refused) {
+	EXIT_IF(refused == nullptr);
 	ImageViewInfo view {};
 	view.format      = format;
 	view.aspect      = vk::ImageAspectFlagBits::eColor;
@@ -417,7 +512,7 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 			view.type       = vk::ImageViewType::e1D;
 			view.base_layer = descriptor.BaseArray5();
 			if (view.base_layer >= image_layers) {
-				EXIT("texture base layer is out of bounds\n");
+				*refused = true;
 			}
 			view.layer_count = 1;
 			break;
@@ -425,7 +520,8 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 			view.type       = vk::ImageViewType::e1DArray;
 			view.base_layer = descriptor.BaseArray5();
 			if (view.base_layer >= image_layers) {
-				EXIT("texture array base layer is out of bounds\n");
+				*refused = true;
+				return view;
 			}
 			view.layer_count = image_layers - view.base_layer;
 			break;
@@ -439,7 +535,8 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 			view.type       = vk::ImageViewType::e2DArray;
 			view.base_layer = descriptor.BaseArray5();
 			if (view.base_layer >= image_layers) {
-				EXIT("texture array base layer is out of bounds\n");
+				*refused = true;
+				return view;
 			}
 			view.layer_count = image_layers - view.base_layer;
 			break;
@@ -448,11 +545,16 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 			view.type       = vk::ImageViewType::e2D;
 			view.base_layer = descriptor.BaseArray5();
 			if (view.base_layer >= image_layers) {
-				EXIT("texture base layer is out of bounds\n");
+				*refused = true;
 			}
 			view.layer_count = 1;
 			break;
-		default: EXIT("unsupported texture view dimension\n");
+		default:
+			view.type        = vk::ImageViewType::e2D;
+			view.base_layer  = 0;
+			view.layer_count = 1;
+			*refused         = true;
+			break;
 	}
 	return view;
 }
@@ -524,11 +626,15 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	}
 
 	auto& texture_cache = m_context.GetTextureCache();
-	if (descriptor.IsNull()) {
+	// What a guest descriptor marked null already gets: a 1x1 surface that reads as zero.
+	const auto bind_null = [&]() -> TextureBinding {
 		auto       desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
 		                                                    : TextureCache::BindingType::Texture);
 		const auto id   = texture_cache.FindImage(desc);
 		return {id, nullptr, std::move(desc)};
+	};
+	if (descriptor.IsNull()) {
+		return bind_null();
 	}
 
 	const auto address         = descriptor.Base40();
@@ -557,17 +663,22 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	     (base_level != 0 || last_level == 0 || last_level > 3 || max_mip != last_level ||
 	      !msaa_tile || (descriptor.MsaaDepth() && !depth_tile) ||
 	      (!msaa_array && (descriptor.Depth() != 0 || descriptor.BaseArray5() != 0))))) {
-		EXIT("unsupported texture mip view: base=%u last=%u levels=%u max=%u type=%u tile=%u "
-		     "class=%u numeric=%u dimension=%u mip_mode=%u read=%d written=%d "
-		     "dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
-		     base_level, last_level, levels, descriptor.MaxMip(),
-		     static_cast<uint32_t>(descriptor.Type()), static_cast<uint32_t>(tile),
-		     static_cast<uint32_t>(resource.resource_class),
-		     static_cast<uint32_t>(resource.numeric_class),
-		     static_cast<uint32_t>(resource.dimension), static_cast<uint32_t>(resource.mip_mode),
-		     resource.read, resource.written, descriptor.fields[0], descriptor.fields[1],
-		     descriptor.fields[2], descriptor.fields[3], descriptor.fields[4], descriptor.fields[5],
-		     descriptor.fields[6], descriptor.fields[7]);
+		char repeat[32] = "";
+		if (ShouldReportTextureRefusal(address, 0, TextureRefusal::MipView, repeat)) {
+			LOGF("unsupported texture mip view: base=%u last=%u levels=%u max=%u type=%u tile=%u "
+			     "class=%u numeric=%u dimension=%u mip_mode=%u read=%d written=%d "
+			     "addr=0x%016" PRIx64 " dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x%s\n",
+			     base_level, last_level, levels, descriptor.MaxMip(),
+			     static_cast<uint32_t>(descriptor.Type()), static_cast<uint32_t>(tile),
+			     static_cast<uint32_t>(resource.resource_class),
+			     static_cast<uint32_t>(resource.numeric_class),
+			     static_cast<uint32_t>(resource.dimension),
+			     static_cast<uint32_t>(resource.mip_mode), resource.read, resource.written, address,
+			     descriptor.fields[0], descriptor.fields[1], descriptor.fields[2],
+			     descriptor.fields[3], descriptor.fields[4], descriptor.fields[5],
+			     descriptor.fields[6], descriptor.fields[7], repeat);
+		}
+		return bind_null();
 	}
 	const auto samples = multisampled ? 1u << last_level : 1u;
 	const auto depth          = static_cast<uint32_t>(descriptor.Depth()) + 1u;
@@ -579,8 +690,14 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	    storage || resource.numeric_class == Prospero::SampledTextureNumericClass(format);
 	if (!storage && resource.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled &&
 	    !sampled_numeric_class) {
-		EXIT("sampled image numeric class mismatch: numeric=%u format=%u addr=0x%016" PRIx64 "\n",
-		     static_cast<uint32_t>(resource.numeric_class), static_cast<uint32_t>(format), address);
+		char repeat[32] = "";
+		if (ShouldReportTextureRefusal(address, 0, TextureRefusal::NumericClass, repeat)) {
+			LOGF("sampled image numeric class mismatch: numeric=%u format=%u addr=0x%016" PRIx64
+			     "%s\n",
+			     static_cast<uint32_t>(resource.numeric_class), static_cast<uint32_t>(format),
+			     address, repeat);
+		}
+		return bind_null();
 	}
 
 	const bool    volume       = type == Prospero::ImageType::kColor3D;
@@ -589,6 +706,59 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	                             type == Prospero::ImageType::kColor2DMsaaArray;
 	const auto    image_layers = layered ? depth : 1u;
 	auto          view_base    = static_cast<uint32_t>(base_level);
+	if (levels > physical_levels) {
+		const TileSurfaceDescription physical {
+		    format, tile, volume ? TileSurfaceDimension::Dim3D : TileSurfaceDimension::Dim2D,
+		    width, height, volume ? depth : 1u, physical_levels, image_layers};
+		if (!ResolveTextureMipView(physical, !resource.r128 && descriptor.MetaCompress(),
+		                           view_levels, levels, view_base)) {
+			EXIT("unsupported texture mip view changes physical layout: base=%u last=%u max=%u "
+			     "extent=%ux%ux%u tile=%u\n",
+			     base_level, last_level, max_mip, width, height, depth,
+			     static_cast<uint32_t>(tile));
+		}
+	}
+	uint32_t      pitch = 0;
+	TileSizeAlign size {};
+	if (multisampled) {
+		const auto bytes = Prospero::NumBytesPerElement(format);
+		pitch            = depth_tile ? TileGetDepthPitch(width, bytes, last_level)
+		                              : TileGetRenderTargetPitch(width, bytes, last_level);
+		if (pitch == 0 || !TileGetRenderTargetSize(width, height, pitch, bytes, size, last_level) ||
+		    size.size > UINT32_MAX / image_layers) {
+			char repeat[32] = "";
+			if (ShouldReportTextureRefusal(address, samples, TextureRefusal::MsaaLayout, repeat)) {
+				LOGF("unsupported multisample texture layout: addr=0x%016" PRIx64
+				     " extent=%ux%u samples=%u pitch=%u tile=%u format=%u layers=%u%s\n",
+				     address, width, height, samples, pitch, static_cast<uint32_t>(tile),
+				     static_cast<uint32_t>(format), image_layers, repeat);
+			}
+			return bind_null();
+		}
+		size.size *= image_layers;
+	} else {
+		pitch = TileGetTexturePitch(format, width, tile);
+		TileGetTextureTotalSize(format, width, height, volume ? depth : image_layers,
+		                        physical_levels, tile, volume, size);
+	}
+	// A zero extent, a zero alignment or a base the surface's own alignment rejects all mean the
+	// descriptor does not describe a surface this tiling can lay out.
+	if (size.size == 0 || size.align == 0 ||
+	    (address & (static_cast<uint64_t>(size.align) - 1u)) != 0) {
+		char repeat[32] = "";
+		if (ShouldReportTextureRefusal(address, size.size, TextureRefusal::SurfaceSize, repeat)) {
+			LOGF("unsupported texture surface layout: addr=0x%016" PRIx64 " size=0x%x"
+			     " align=0x%x extent=%ux%ux%u levels=%u layers=%u tile=%u format=%u%s\n",
+			     address, size.size, size.align, width, height, depth,
+			     levels, image_layers, static_cast<uint32_t>(tile), static_cast<uint32_t>(format),
+			     repeat);
+		}
+		return bind_null();
+	}
+	if (storage && !ValidateStorageTexture(resource, descriptor, size.size)) {
+		return bind_null();
+	}
+
 	auto pixel_format = surface_format.vk_format;
 	if (resource.depth_compare) {
 		if (const auto* depth_format = FindGuestDepthFormatPolicy(format)) {
@@ -643,8 +813,25 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		desc.info.metadata.range         = {descriptor.MetaAddr() << 8u, metadata_size.size};
 		desc.info.metadata.dcc_alpha_msb = descriptor.DccAlphaPos();
 	}
+	if (samples > 1) {
+		desc.info.mip_layout[0] = {0, size.size, pitch, height};
+	} else {
+		PopulateTextureMipLayout(desc.info);
+	}
+	bool view_refused = false;
 	desc.view_info = TextureViewInfo(resource, descriptor, view_format, surface_format, storage,
-	                                 view_levels, desc.info.resources.layers);
+	                                 view_levels, desc.info.resources.layers, &view_refused);
+	if (view_refused) {
+		char repeat[32] = "";
+		if (ShouldReportTextureRefusal(address, size.size, TextureRefusal::ViewInfo, repeat)) {
+			LOGF("unsupported texture view: addr=0x%016" PRIx64 " dimension=%u type=%u"
+			     " base_array=%u image_layers=%u view_levels=%u format=%d%s\n",
+			     address, static_cast<uint32_t>(resource.dimension),
+			     static_cast<uint32_t>(descriptor.Type()), descriptor.BaseArray5(),
+			     desc.info.resources.layers, view_levels, static_cast<int>(view_format), repeat);
+		}
+		return bind_null();
+	}
 	desc.view_info.base_level = view_base;
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
 
@@ -656,15 +843,39 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		image = &texture_cache.GetImage(id);
 	} else if (image->info.IsDepth()) {
 		if (storage) {
-			EXIT("depth target cannot be bound as a storage image\n");
+			// A depth surface has no storage-image view on this host.
+			char repeat[32] = "";
+			if (ShouldReportTextureRefusal(address, size.size, TextureRefusal::DepthAsStorage,
+			                               repeat)) {
+				LOGF("depth target cannot be bound as a storage image: addr=0x%016" PRIx64
+				     " format=%d%s\n",
+				     address, static_cast<int>(image->info.pixel_format), repeat);
+			}
+			return bind_null();
 		}
-		ValidateSampledDepthBinding(resource, descriptor, *image, pixel_format,
-		                            desc.info.data.size);
-	} else if (storage) {
-		ValidateStorageColorView(image->info.pixel_format, view_format, descriptor.DstSelXYZW());
+		if (!ValidateSampledDepthBinding(resource, descriptor, *image, pixel_format, size.size)) {
+			return bind_null();
+		}
 	} else {
-		(void)SelectSampledColorView(image->info.pixel_format, pixel_format,
-		                             descriptor.DstSelXYZW());
+		// The surface the cache matched to this address may have been created for an incompatible
+		// format family, which is an aliasing disagreement over guest memory.
+		const bool colour_view_ok =
+		    storage ? IsSupportedStorageColorView(image->info.pixel_format, view_format,
+		                                          descriptor.DstSelXYZW())
+		            : IsSupportedSampledColorView(image->info.pixel_format, pixel_format,
+		                                          descriptor.DstSelXYZW());
+		if (!colour_view_ok) {
+			char repeat[32] = "";
+			if (ShouldReportTextureRefusal(address, size.size, TextureRefusal::ViewInfo, repeat)) {
+				LOGF("unsupported %s color view: addr=0x%016" PRIx64
+				     " image_format=%d view_format=%d swizzle=0x%03x%s\n",
+				     storage ? "storage" : "sampled", address,
+				     static_cast<int>(image->info.pixel_format),
+				     static_cast<int>(storage ? view_format : pixel_format),
+				     descriptor.DstSelXYZW(), repeat);
+			}
+			return bind_null();
+		}
 	}
 	return {id, nullptr, std::move(desc)};
 }

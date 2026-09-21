@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
+#include "graphics/host_gpu/renderer/refusalReport.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "kernel/memory.h"
 
@@ -192,6 +193,28 @@ constexpr size_t MaxEmergencyReclaimImages = 256;
 // Only an 8-bit colour sample or storage image can alias a stencil plane; a target stays its own.
 [[nodiscard]] bool IsStencilPlaneView(const Image& image) {
 	return !image.info.IsDepth() && image.info.bytes_per_block == 1 && !image.usage.render_target;
+}
+
+// Only fires where there is nothing to hand over at all: a descriptor whose address/extent pair is
+// not a range, and a frame that has exhausted its staging ring.
+RefusalReporter g_upload_source_reports;
+
+void ReportUploadSourceRefused(const Image& image) {
+	const auto& info        = image.info;
+	const auto  occurrences = g_upload_source_reports.Observe(
+        info.data.address, info.data.size, static_cast<uint64_t>(info.guest_format));
+	if (occurrences == 0) {
+		return;
+	}
+	char repeat[32] = "";
+	LOGF("TextureCache: image upload skipped addr=0x%016" PRIx64 " size=0x%016" PRIx64
+	     " guest_format=%u vk_format=%d extent=%ux%ux%u levels=%u layers=%u samples=%u tile=%u"
+	     " pitch=%u bpb=%u%s\n",
+	     info.data.address, info.data.size, static_cast<uint32_t>(info.guest_format),
+	     static_cast<int>(info.pixel_format), info.extent.width, info.extent.height,
+	     info.extent.depth, info.resources.levels, info.resources.layers, info.samples,
+	     static_cast<uint32_t>(info.tile_mode), info.pitch, info.bytes_per_block,
+	     RefusalReporter::RepeatSuffix(repeat, occurrences));
 }
 
 } // namespace
@@ -1296,7 +1319,14 @@ void TextureCache::InitializeImage(ImageId id) {
 		const auto [source, source_offset] =
 		    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
 		if (source == nullptr) {
-			EXIT("TextureCache: failed to obtain image upload source\n");
+			// The buffer cache has already named the range and why it could not serve it. Clear
+			// the guest-modified flag so the refusal costs one attempt, not one per frame.
+			ReportUploadSourceRefused(image);
+			image.ClearBufferModified();
+			if (image.IsCpuDirty()) {
+				image.RefreshComplete();
+			}
+			return;
 		}
 		UploadImage(image, *source, source_offset);
 		image.ClearBufferModified();

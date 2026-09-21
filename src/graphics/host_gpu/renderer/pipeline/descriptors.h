@@ -65,8 +65,10 @@ template <typename T>
 
 [[nodiscard]] bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor,
                                                    bool r128 = false);
-void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
-                            const ShaderTextureResource& descriptor, uint64_t size);
+// False when the guest's storage-image descriptor has no host representation; it reports the
+// refusal itself and the caller binds the null texture.
+[[nodiscard]] bool ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
+                                          const ShaderTextureResource& descriptor, uint64_t size);
 
 } // namespace Libs::Graphics
 

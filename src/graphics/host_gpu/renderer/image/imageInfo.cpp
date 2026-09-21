@@ -29,13 +29,15 @@ vk::Extent3D ImageInfo::MipExtent(uint32_t level) const {
 	        IsVolume() ? std::max(extent.depth >> level, 1u) : resources.layers};
 }
 
-void ImageInfo::UpdateSize() {
+bool ImageInfo::TryUpdateSize() {
 	EXIT_IF(guest_format == Prospero::BufferFormat::kInvalid || extent.width == 0 ||
 	        extent.height == 0 || extent.depth == 0 || resources.levels == 0 ||
 	        resources.levels > mip_layout.size() || resources.layers == 0 || samples == 0 ||
 	        !std::has_single_bit(samples));
 	TileTextureElementLayout element {};
-	EXIT_NOT_IMPLEMENTED(!TileGetTextureElementLayout(guest_format, element));
+	if (!TileGetTextureElementLayout(guest_format, element)) {
+		return false;
+	}
 	if (bytes_per_block == 0) {
 		bytes_per_block = element.bytes;
 	}
@@ -50,37 +52,48 @@ void ImageInfo::UpdateSize() {
 	first_tail_level               = 16;
 
 	if (samples > 1) {
-		EXIT_NOT_IMPLEMENTED(IsVolume() || resources.levels != 1 ||
-		                     (tile_mode != Prospero::TileMode::kDepth &&
-		                      tile_mode != Prospero::TileMode::kRenderTarget));
+		if (IsVolume() || resources.levels != 1 ||
+		    (tile_mode != Prospero::TileMode::kDepth &&
+		     tile_mode != Prospero::TileMode::kRenderTarget)) {
+			return false;
+		}
 		const auto fragments = std::countr_zero(samples);
 		if (pitch == 0) {
 			pitch = tile_mode == Prospero::TileMode::kDepth
 			            ? TileGetDepthPitch(extent.width, bytes_per_block, fragments)
 			            : TileGetRenderTargetPitch(extent.width, bytes_per_block, fragments);
 		}
-		EXIT_NOT_IMPLEMENTED(!TileGetTextureBlockLayout(guest_format, tile_mode, false, tiling));
+		if (!TileGetTextureBlockLayout(guest_format, tile_mode, false, tiling)) {
+			return false;
+		}
 		if (data.size == 0) {
 			TileSizeAlign slice {};
-			EXIT_NOT_IMPLEMENTED(!TileGetRenderTargetSize(extent.width, extent.height, pitch,
-			                                              bytes_per_block, slice, fragments));
+			if (!TileGetRenderTargetSize(extent.width, extent.height, pitch, bytes_per_block, slice,
+			                             fragments)) {
+				return false;
+			}
 			data.size = Multiply(slice.size, resources.layers);
 		}
 		EXIT_IF(data.size % resources.layers != 0);
 		tiled_slice_stride = data.size / resources.layers;
 		mip_layout[0]      = {0, data.size, pitch, extent.height};
-		return;
+		return true;
 	}
 
 	if (pitch == 0) {
 		pitch = TileGetTexturePitch(guest_format, extent.width, tile_mode);
 	}
-	EXIT_IF(pitch == 0);
+	if (pitch == 0) {
+		return false;
+	}
 	if (IsDepthPlane(*this) && resources.levels == 1) {
-		EXIT_NOT_IMPLEMENTED(IsVolume());
+		if (IsVolume()) {
+			return false;
+		}
 		if (IsTiled()) {
-			EXIT_NOT_IMPLEMENTED(
-			    !TileGetTextureBlockLayout(guest_format, tile_mode, false, tiling));
+			if (!TileGetTextureBlockLayout(guest_format, tile_mode, false, tiling)) {
+				return false;
+			}
 		}
 		if (data.size == 0) {
 			TileSizeAlign slice {};
@@ -94,7 +107,7 @@ void ImageInfo::UpdateSize() {
 		linear_slice_stride = slice;
 		tiled_slice_stride  = IsTiled() ? slice : 0;
 		mip_layout[0]       = {0, data.size, pitch, extent.height, 0, slice, pitch};
-		return;
+		return true;
 	}
 	if (!IsTiled()) {
 		TileSizeAlign  total {};
@@ -131,7 +144,9 @@ void ImageInfo::UpdateSize() {
 		                                          IsVolume() ? extent.depth : 1u,
 		                                          resources.levels,
 		                                          resources.layers};
-		EXIT_NOT_IMPLEMENTED(!TileGetTiledTextureLayout(description, surface));
+		if (!TileGetTiledTextureLayout(description, surface)) {
+			return false;
+		}
 		tiling             = surface.texture;
 		first_tail_level   = surface.first_tail_level;
 		tiled_slice_stride = surface.block_slice_size;
@@ -165,6 +180,11 @@ void ImageInfo::UpdateSize() {
 			mip_pitch         = std::max(mip_pitch >> 1u, 1u);
 		}
 	}
+	return true;
+}
+
+void ImageInfo::UpdateSize() {
+	EXIT_NOT_IMPLEMENTED(!TryUpdateSize());
 }
 
 uint64_t ImageInfo::LinearSize(uint32_t levels) const {

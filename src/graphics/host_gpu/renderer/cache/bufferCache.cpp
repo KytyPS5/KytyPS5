@@ -4,17 +4,21 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/threads.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/refusalReport.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <utility>
@@ -26,6 +30,25 @@ namespace {
 
 constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
+
+// A texture descriptor is guest data: its declared extent may outrun what the game committed, or
+// name a streaming arena released between the descriptor and the draw. The upload binds defined
+// bytes instead - real where the guest has them, zero elsewhere - and reports it.
+RefusalReporter g_image_backing_reports;
+
+void ReportImageBackingSubstitute(uint64_t vaddr, uint64_t size, uint64_t backed,
+                                  const char* substitute) {
+	const auto occurrences = g_image_backing_reports.Observe(vaddr, size, backed);
+	if (occurrences == 0) {
+		return;
+	}
+	char repeat[32] = "";
+	LOGF("BufferCache: image backing unavailable addr=0x%016" PRIx64 " size=0x%016" PRIx64
+	     " backed=0x%016" PRIx64 " bound=%s %s%s\n",
+	     vaddr, size, backed, substitute,
+	     Libs::LibKernel::Memory::DescribeGuestRange(vaddr, size).c_str(),
+	     RefusalReporter::RepeatSuffix(repeat, occurrences));
+}
 
 } // namespace
 
@@ -531,7 +554,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
-		EXIT("BufferCache: invalid image source\n");
+		ReportImageBackingSubstitute(vaddr, size, 0, "nothing(invalid-range)");
+		return {nullptr, 0};
 	}
 	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
 	if (owner != nullptr && *owner) {
@@ -547,8 +571,16 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	}
 
 	auto [staging, stage_offset] = m_staging_buffer.Map(size, 16);
-	if (staging == nullptr || !Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, staging, size)) {
-		EXIT("BufferCache: failed to read mapped guest image backing\n");
+	if (staging == nullptr) {
+		// An emulator-side shortfall, not a guest one: leave the image alone until the ring drains.
+		ReportImageBackingSubstitute(vaddr, size, 0, "nothing(staging-exhausted)");
+		return {nullptr, 0};
+	}
+	if (!Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, staging, size)) {
+		// The sparse reader is all-or-nothing: it refuses the whole span if any of it is unmapped.
+		const auto backed = Libs::LibKernel::Memory::ReadBackingPartial(vaddr, staging, size);
+		ReportImageBackingSubstitute(vaddr, size, backed,
+		                             backed == 0 ? "zeros" : "partial+zeros");
 	}
 	m_staging_buffer.Commit();
 	return {&m_staging_buffer, stage_offset};

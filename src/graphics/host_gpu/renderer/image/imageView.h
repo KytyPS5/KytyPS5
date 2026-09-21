@@ -97,6 +97,13 @@ IsSupportedSampledDepthResource(const ShaderRecompiler::IR::ImageResource& resou
 	       resource.read && !resource.written && !resource.atomic;
 }
 
+[[nodiscard]] inline bool IsSupportedStorageColorView(vk::Format image_format,
+                                                      vk::Format view_format,
+                                                      uint32_t   swizzle) noexcept {
+	return ImageViewOps::FormatsCompatible(image_format, view_format) &&
+	       IsValidImageSwizzle(swizzle);
+}
+
 inline void ValidateStorageColorView(vk::Format image_format, vk::Format view_format,
                                      uint32_t swizzle) noexcept {
 	if (!ImageViewOps::FormatsCompatible(image_format, view_format) ||

@@ -1073,6 +1073,14 @@ static int ConvertMessageFlags(int flags) {
 		return -1;
 	}
 
+#if defined(_WIN32)
+	// Winsock fails with WSAEOPNOTSUPP if MSG_PEEK and MSG_WAITALL are combined.
+	// When peeking on Windows, clear MSG_WAITALL so host recv/recvfrom succeeds while preserving socket data.
+	if ((host_flags & MSG_PEEK) != 0) {
+		host_flags &= ~MSG_WAITALL;
+	}
+#endif
+
 	return host_flags;
 }
 

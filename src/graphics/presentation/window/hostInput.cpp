@@ -348,10 +348,16 @@ bool SetRelativeMouseMode(bool enabled) {
 }
 } // namespace
 
+/** @brief Initialize the configured host-to-controller input mapping. */
 void HostInputInit() {
 	GetInputMap();
 }
 
+/**
+ * @brief Map a keyboard transition to the configured or default controller input.
+ * @param key_code SDL keycode identifying the key.
+ * @param down True for a press, false for a release.
+ */
 void HostInputKey(int key_code, bool down) {
 	const auto& map = GetInputMap();
 	if (map.Custom()) {
@@ -361,6 +367,11 @@ void HostInputKey(int key_code, bool down) {
 	}
 }
 
+/**
+ * @brief Forward a mouse-button transition through the custom input mapping.
+ * @param mouse_button SDL mouse-button identifier; zero is ignored.
+ * @param down True for a press, false for a release.
+ */
 void HostInputMouseButton(uint8_t mouse_button, bool down) {
 	const auto& map = GetInputMap();
 	if (map.Custom() && mouse_button != 0) {
@@ -368,6 +379,12 @@ void HostInputMouseButton(uint8_t mouse_button, bool down) {
 	}
 }
 
+/**
+ * @brief Toggle relative-mouse control of the emulated right stick.
+ *
+ * Disabling centers the stick and clears mouse state. Enabling starts polling
+ * only after SDL successfully enters relative mouse mode.
+ */
 void HostInputToggleMouseToJoystick() {
 	if (g_mouse.enabled) {
 		SetRelativeMouseMode(false);

@@ -29,6 +29,8 @@ namespace {
 
 constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
+constexpr uint64_t MaxFaultMappingSize = 16 * MiB;
+
 RefusalReporter g_image_backing_reports;
 
 void ReportImageBackingSubstitute(uint64_t vaddr, uint64_t size, const char* substitute) {
@@ -750,6 +752,13 @@ void BufferCache::ProcessFaultBuffer() {
 }
 
 void BufferCache::ResolveBdaFault(uint64_t vaddr, uint64_t size) {
+	const auto aligned_begin = vaddr & ~(CACHING_PAGESIZE - 1);
+	const auto aligned_end   = (vaddr + size + CACHING_PAGESIZE - 1) & ~(CACHING_PAGESIZE - 1);
+	vaddr                    = aligned_begin;
+	size                     = aligned_end - aligned_begin;
+	if (size == 0 || !GuestRange {vaddr, size}.Valid()) {
+		// A page that really faulted faults again on the next pass.
+		return;
 	}
 	RangeSet stored;
 	RangeSet missing;
@@ -757,6 +766,29 @@ void BufferCache::ResolveBdaFault(uint64_t vaddr, uint64_t size) {
 		const auto* owner = m_page_table.Find(page >> PageTable::kPageBits);
 		(owner != nullptr && *owner ? stored : missing).Add(page, CACHING_PAGESIZE);
 	}
+	// A pointer walk over a partly resident mapping can follow a zero link forever.
+	RangeSet widened;
+	missing.ForEach([&](uint64_t begin, uint64_t end) {
+		widened.Add(begin, end - begin);
+		uint64_t start  = 0;
+		uint64_t length = 0;
+		if (!Libs::LibKernel::Memory::QueryCommittedRange(begin, &start, &length) ||
+		    length > MaxFaultMappingSize) {
+			return;
+		}
+		const auto first = start & ~(CACHING_PAGESIZE - 1);
+		const auto last  = (start + length + CACHING_PAGESIZE - 1) & ~(CACHING_PAGESIZE - 1);
+		if (!GuestRange {first, last - first}.Valid()) {
+			return;
+		}
+		for (auto page = first; page < last; page += CACHING_PAGESIZE) {
+			const auto* owner = m_page_table.Find(page >> PageTable::kPageBits);
+			if (owner == nullptr || !*owner) {
+				widened.Add(page, CACHING_PAGESIZE);
+			}
+		}
+	});
+	missing = std::move(widened);
 	stored.ForEach([this](uint64_t begin, uint64_t end) {
 		m_bda_tracked_ranges.Add(begin, end - begin);
 		m_bda_unmarked_ranges.Add(begin, end - begin);

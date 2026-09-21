@@ -28,7 +28,9 @@ static void* VKAPI_PTR TracyVmaAlloc(void* /*pUserData*/, size_t size, size_t al
 #if defined(_WIN32)
 	void* ptr = _aligned_malloc(size, alignment);
 #else
-	void* ptr = aligned_alloc(alignment, size);
+	// aligned_alloc requires size to be a multiple of alignment; round up.
+	size_t aligned_size = (size + alignment - 1) & ~(alignment - 1);
+	void*  ptr          = aligned_alloc(alignment, aligned_size);
 #endif
 	TracyAllocS(ptr, size, 12);
 	return ptr;

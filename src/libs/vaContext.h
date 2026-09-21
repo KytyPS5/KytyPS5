@@ -63,12 +63,12 @@ struct VaCharX16 {
 	char x[16];
 };
 #elif defined(__aarch64__) || defined(__arm64__)
-// ARM64 calling convention: x0-x7 for integer args, v0-v7 for FP args
+// ARM64 calling convention: x0-x7 for integer args, v0-v7 for FP args (128-bit NEON registers)
 // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
 #define VA_ARGS                                                                                    \
 	uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3, uint64_t x4, uint64_t x5, uint64_t x6,      \
-	    uint64_t x7, uint64_t overflow_arg_area, double v0, double v1, double v2, double v3,        \
-	    double v4, double v5, double v6, double v7, ...
+	    uint64_t x7, uint64_t overflow_arg_area, __m128 v0, __m128 v1, __m128 v2, __m128 v3,        \
+	    __m128 v4, __m128 v5, __m128 v6, __m128 v7, ...
 
 // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
 #define VA_CONTEXT(ctx)                                                                            \
@@ -107,7 +107,7 @@ struct VaList {
 
 struct VaRegSave {
 	uint64_t gp[8];
-	uint64_t fp[8];
+	__m128   fp[8];
 };
 
 struct VaContext {
@@ -198,7 +198,8 @@ inline int VaArg_int(VaList* l) {
 }
 
 inline double VaArg_double(VaList* l) {
-	if (l->fp_offset <= 160) {
+	// 8 FP registers * 16 bytes = 128 bytes total; max valid offset is 112 (7*16)
+	if (l->fp_offset <= 112) {
 		return VaArg_reg_save_area_fp<double, 16>(l);
 	}
 	return VaArg_overflow_arg_area<double, 1, 8>(l);
@@ -276,7 +277,9 @@ inline VaIntX4 VaArg_IntX4(VaList* l) {
 }
 
 inline VaFloatX4 VaArg_FloatX4(VaList* l) {
-	if (l->fp_offset <= 144) {
+	// 8 FP registers * 16 bytes = 128 bytes; FloatX4 takes 2 registers (32 bytes)
+	// Max valid offset for first of pair is 96 (6*16), so 96+32=128
+	if (l->fp_offset <= 96) {
 		return VaArg_reg_save_area_fp<VaFloatX4, 32>(l);
 	}
 	return VaArg_overflow_arg_area<VaFloatX4, 1, 16>(l);

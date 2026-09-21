@@ -791,7 +791,10 @@ bool TryEmulate(void* native_context) {
 	return TryEmulateMonitorxMwaitx(context) || TryEmulateSse4a(context) ||
 	       TryEmulateShaNi(context);
 #else
-	return TryEmulateSse4a(context);
+	// ARM64: x86 SSE4a/SHA/Rsqrt emulators must not run on AArch64 hosts.
+	// Matching byte patterns in native ARM instructions would corrupt guest NEON state.
+	(void)context;
+	return false;
 #endif
 }
 

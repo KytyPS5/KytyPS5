@@ -847,7 +847,7 @@ static void ApplySignalUcontext(CONTEXT* dst_ctx, const SignalUcontext& src_ctx)
 }
 #endif
 
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS && defined(__x86_64__)
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS && (defined(__x86_64__) || defined(__aarch64__) || defined(__arm64__))
 
 static SignalUcontext CreateSignalUcontextFromHost(const ucontext_t* host_ctx) {
 	SignalUcontext ctx = {};
@@ -1232,7 +1232,7 @@ static int KYTY_SYSV_ABI KernelRaiseException(Pthread thread, int signum) {
 		PthreadWakeForSignal(thread);
 		CloseHandle(target_thread);
 		return OK;
-#elif defined(__x86_64__)
+#elif defined(__x86_64__) || defined(__aarch64__) || defined(__arm64__)
 		// Deliver on the target thread.
 		if (thread == PthreadSelfOrNull()) {
 			SignalDispatchScope scope;

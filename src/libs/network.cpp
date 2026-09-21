@@ -880,6 +880,7 @@ struct P2pEndpoint {
 struct SocketSlot {
 	std::shared_ptr<SocketTransport> transport;
 	std::optional<P2pEndpoint>       p2p;
+	bool                             nonblocking = false;
 };
 
 struct NetTimeval {
@@ -2125,6 +2126,8 @@ int KYTY_SYSV_ABI Setsockopt(int s, int level, int optname, const void* optval, 
 		if (ioctlsocket(socket, FIONBIO, &enabled) == SOCKET_ERROR) {
 			return SetHostSocketError();
 		}
+		Common::LockGuard lock(g_socket_mutex);
+		g_sockets[static_cast<size_t>(s)].nonblocking = (enabled != 0);
 		return 0;
 	}
 #else
@@ -2234,7 +2237,8 @@ int64_t KYTY_SYSV_ABI Recvfrom(int s, void* buf, uint64_t len, int flags, void* 
 	}
 
 	NativeSocket socket = INVALID_NATIVE_SOCKET;
-	if (!GetSocketBackend(s, &socket)) {
+	SocketSlot   slot;
+	if (!GetSocketBackend(s, &socket, &slot)) {
 		return -1;
 	}
 
@@ -2252,9 +2256,13 @@ int64_t KYTY_SYSV_ABI Recvfrom(int s, void* buf, uint64_t len, int flags, void* 
 	// ConvertMessageFlags clears MSG_WAITALL when MSG_PEEK is set on Windows.
 	// To preserve POSIX MSG_WAITALL semantics, wait until host_len bytes are pending
 	// (or until EOF / timeout / error) before issuing the native MSG_PEEK receive.
-	constexpr int guest_msg_peek    = 0x00000002;
-	constexpr int guest_msg_waitall = 0x00000040;
-	if ((flags & guest_msg_peek) != 0 && (flags & guest_msg_waitall) != 0 && host_len > 0) {
+	constexpr int guest_msg_peek     = 0x00000002;
+	constexpr int guest_msg_waitall  = 0x00000040;
+	constexpr int guest_msg_dontwait = 0x00000080;
+	const bool    is_nonblocking =
+	    slot.nonblocking || (slot.p2p && slot.p2p->nonblocking != 0) || ((flags & guest_msg_dontwait) != 0);
+	if (!is_nonblocking && (flags & guest_msg_peek) != 0 && (flags & guest_msg_waitall) != 0 &&
+	    host_len > 0) {
 		int          socket_type = 0;
 		SocketLength optlen      = sizeof(socket_type);
 		if (::getsockopt(socket, SOL_SOCKET, SO_TYPE, reinterpret_cast<char*>(&socket_type),
@@ -2277,9 +2285,13 @@ int64_t KYTY_SYSV_ABI Recvfrom(int s, void* buf, uint64_t len, int flags, void* 
 				}
 
 				WSAPOLLFD pfd {};
-				pfd.fd     = socket;
-				pfd.events = POLLRDNORM;
-				if (::WSAPoll(&pfd, 1, 0) > 0 && (pfd.revents & (POLLHUP | POLLERR)) != 0) {
+				pfd.fd                = socket;
+				pfd.events            = POLLRDNORM;
+				const int poll_result = ::WSAPoll(&pfd, 1, 0);
+				if (poll_result == SOCKET_ERROR) {
+					return SetHostSocketError();
+				}
+				if (poll_result > 0 && (pfd.revents & (POLLHUP | POLLERR)) != 0) {
 					break;
 				}
 

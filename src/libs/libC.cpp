@@ -14,6 +14,7 @@
 #include "loader/symbolDatabase.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cinttypes>
@@ -25,6 +26,7 @@
 #include <fmt/format.h>
 #include <list>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -810,6 +812,145 @@ LIB_DEFINE(InitLibcInternal_1) {
 
 namespace LibC {
 
+// C++ static-object guards, and the allocation entry points the guest expects libc to provide.
+//
+// The guard is the Itanium C++ ABI's 8-byte __cxa_guard object: byte 0 is the "initialised" flag,
+// which the guest reads inline to skip the slow path, and byte 1 is the "initialisation in
+// progress" flag. __cxa_guard_acquire returns 1 when the caller must run the initializer and 0
+// when the object is already constructed, so a stub that always answers 0 leaves every
+// function-local static in the guest uninitialised. Only Kyty writes these bytes apart from that
+// one inline read, so the release store on byte 0 is the only ordering that matters.
+
+static std::mutex                                     g_guard_mutex;
+static std::condition_variable                        g_guard_condition;
+static std::unordered_map<uint64_t*, std::thread::id> g_guard_owners;
+
+static uint8_t* GuardBytes(uint64_t* guard_object) {
+	return reinterpret_cast<uint8_t*>(guard_object);
+}
+
+static KYTY_SYSV_ABI int cxa_guard_acquire(uint64_t* guard_object) {
+	if (guard_object == nullptr) {
+		return 0;
+	}
+
+	const auto self = std::this_thread::get_id();
+
+	std::unique_lock lock(g_guard_mutex);
+
+	for (;;) {
+		if (std::atomic_ref<uint8_t>(GuardBytes(guard_object)[0]).load(std::memory_order_acquire) !=
+		    0) {
+			return 0;
+		}
+
+		const auto owner = g_guard_owners.find(guard_object);
+		if (owner == g_guard_owners.end()) {
+			g_guard_owners.emplace(guard_object, self);
+			GuardBytes(guard_object)[1] = 1;
+			return 1;
+		}
+		if (owner->second == self) {
+			EXIT("cxa_guard_acquire: recursive initialisation of the guest static at 0x%016" PRIx64
+			     "\n",
+			     reinterpret_cast<uint64_t>(guard_object));
+		}
+
+		g_guard_condition.wait(lock);
+	}
+}
+
+static KYTY_SYSV_ABI void cxa_guard_release(uint64_t* guard_object) {
+	if (guard_object == nullptr) {
+		return;
+	}
+
+	{
+		std::lock_guard lock(g_guard_mutex);
+
+		std::atomic_ref<uint8_t>(GuardBytes(guard_object)[0]).store(1, std::memory_order_release);
+		GuardBytes(guard_object)[1] = 0;
+		if (g_guard_owners.erase(guard_object) != 1u) {
+			LOGF("cxa_guard_release: unowned guest static guard at 0x%016" PRIx64 "\n",
+			     reinterpret_cast<uint64_t>(guard_object));
+		}
+	}
+
+	g_guard_condition.notify_all();
+}
+
+static KYTY_SYSV_ABI void cxa_guard_abort(uint64_t* guard_object) {
+	if (guard_object == nullptr) {
+		return;
+	}
+
+	{
+		std::lock_guard lock(g_guard_mutex);
+
+		GuardBytes(guard_object)[1] = 0;
+		if (g_guard_owners.erase(guard_object) != 1u) {
+			LOGF("cxa_guard_abort: unowned guest static guard at 0x%016" PRIx64 "\n",
+			     reinterpret_cast<uint64_t>(guard_object));
+		}
+	}
+
+	g_guard_condition.notify_all();
+}
+
+// Kyty has no guest allocator of its own, so the libc allocation entry points forward to the host
+// one. The guest's own bookkeeping reads a dlmalloc-style chunk size at [ptr - 8] and masks the low
+// bits, which is the layout glibc uses, so host pointers satisfy it.
+//
+// operator new must never return null. The C++ ABI requires it to throw std::bad_alloc instead, and
+// guest code compiled against that rule does not check the result. Kyty cannot unwind a host
+// exception through guest frames, so an exhausted heap stops with a message rather than handing the
+// guest a null it will dereference.
+
+static KYTY_SYSV_ABI void* cxa_operator_new(uint64_t size) {
+	// A zero-sized request still has to return a unique, non-null pointer.
+	auto* ptr = std::malloc(size == 0u ? 1u : static_cast<size_t>(size));
+
+	if (ptr == nullptr) {
+		EXIT("operator new: cannot allocate %" PRIu64 " bytes\n", size);
+	}
+
+	return ptr;
+}
+
+static KYTY_SYSV_ABI void cxa_operator_delete(void* ptr) {
+	std::free(ptr);
+}
+
+static KYTY_SYSV_ABI void* libc_malloc(size_t size) {
+	return std::malloc(size);
+}
+
+static KYTY_SYSV_ABI void libc_free(void* ptr) {
+	std::free(ptr);
+}
+
+static KYTY_SYSV_ABI void* libc_calloc(size_t count, size_t size) {
+	return std::calloc(count, size);
+}
+
+static KYTY_SYSV_ABI void* libc_realloc(void* ptr, size_t size) {
+	return std::realloc(ptr, size);
+}
+
+// An mspace is a named guest heap created by sceLibcMspaceCreate. The allocation itself is
+// forwarded to the host heap and the handle is ignored, so memory handed out through an mspace is
+// not confined to that mspace's address range. sceLibcMspaceCreate is deliberately left unresolved:
+// fabricating a handle whose range is never honoured would only hide the difference from whoever is
+// reading the log.
+static KYTY_SYSV_ABI void* libc_mspace_malloc(void* /*mspace*/, size_t size) {
+	return std::malloc(size);
+}
+
+static KYTY_SYSV_ABI int libc_mspace_free(void* /*mspace*/, void* ptr) {
+	std::free(ptr);
+	return 0;
+}
+
 LIB_DEFINE(InitLibC_1) {
 	LibcInternal::InitLibcInternal_1(s);
 
@@ -833,6 +974,24 @@ LIB_DEFINE(InitLibC_1) {
 	LIB_FUNC("tsvEmnenz48", LibC::cxa_atexit);
 	LIB_FUNC("H2e8t5ScQGc", LibC::cxa_finalize);
 	LIB_FUNC("DiGVep5yB5w", LibC::std_execute_once);
+
+	LIB_FUNC("3GPpjQdAMTw", LibC::cxa_guard_acquire);
+	LIB_FUNC("9rAeANT2tyE", LibC::cxa_guard_release);
+	LIB_FUNC("2emaaluWzUw", LibC::cxa_guard_abort);
+
+	// operator new and operator new[] share a signature and a meaning, as do the delete pair.
+	LIB_FUNC("fJnpuVVBbKk", LibC::cxa_operator_new);
+	LIB_FUNC("hdm0YfMa7TQ", LibC::cxa_operator_new);
+	LIB_FUNC("z+P+xCnWLBk", LibC::cxa_operator_delete);
+	LIB_FUNC("MLWl90SFWNE", LibC::cxa_operator_delete);
+
+	LIB_FUNC("gQX+4GDQjpM", LibC::libc_malloc);
+	LIB_FUNC("tIhsqj0qsFE", LibC::libc_free);
+	LIB_FUNC("2X5agFjKxMc", LibC::libc_calloc);
+	LIB_FUNC("Y7aJ1uydPMo", LibC::libc_realloc);
+
+	LIB_FUNC("OJjm-QOIHlI", LibC::libc_mspace_malloc);
+	LIB_FUNC("Vla-Z+eXlxo", LibC::libc_mspace_free);
 }
 
 } // namespace LibC

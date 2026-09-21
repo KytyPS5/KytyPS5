@@ -5,6 +5,8 @@
 #include "common/common.h"
 #include "common/virtualMemory.h"
 
+#include <array>
+#include <cstdint>
 namespace Libs::Graphics {
 class RenderContext;
 enum class PageFaultAccess;
@@ -137,6 +139,76 @@ bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t size);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
+// Reports a repeating buffer-range outcome at exponentially sparser intervals with its count.
+class BufferRangeReportPolicy {
+public:
+	struct Decision {
+		bool     report      = false;
+		uint64_t occurrences = 0;
+	};
+
+	static constexpr uint32_t WAY_COUNT  = 4;
+	static constexpr uint32_t SET_COUNT  = 64;
+	static constexpr uint32_t SLOT_COUNT = WAY_COUNT * SET_COUNT;
+
+	Decision Observe(uint64_t vaddr, uint64_t requested, uint64_t clamped) {
+		const uint32_t first  = Index(vaddr, requested) * WAY_COUNT;
+		Slot*          victim = nullptr;
+		Slot*          match  = nullptr;
+		for (uint32_t way = 0; way < WAY_COUNT; way++) {
+			auto& candidate = m_slots.at(first + way);
+			if (candidate.occurrences != 0 && candidate.vaddr == vaddr &&
+			    candidate.requested == requested) {
+				match = &candidate;
+				break;
+			}
+			if (victim == nullptr || candidate.occurrences == 0 ||
+			    (victim->occurrences != 0 && candidate.last_use < victim->last_use)) {
+				victim = &candidate;
+			}
+		}
+		const uint64_t now = ++m_clock;
+		if (match == nullptr || match->clamped != clamped) {
+			auto& slot = match != nullptr ? *match : *victim;
+			slot       = {vaddr, requested, clamped, 1, FIRST_INTERVAL, now};
+			return {true, 1};
+		}
+		auto& slot    = *match;
+		slot.last_use = now;
+		slot.occurrences++;
+		if (slot.occurrences < slot.next_report) {
+			return {false, slot.occurrences};
+		}
+		if (slot.next_report <= UINT64_MAX / INTERVAL_GROWTH) {
+			slot.next_report *= INTERVAL_GROWTH;
+		}
+		return {true, slot.occurrences};
+	}
+
+private:
+	static constexpr uint64_t FIRST_INTERVAL  = 2;
+	static constexpr uint64_t INTERVAL_GROWTH = 4;
+
+	struct Slot {
+		uint64_t vaddr       = 0;
+		uint64_t requested   = 0;
+		uint64_t clamped     = 0;
+		uint64_t occurrences = 0;
+		uint64_t next_report = 0;
+		uint64_t last_use    = 0;
+	};
+
+	static uint32_t Index(uint64_t vaddr, uint64_t requested) {
+		uint64_t mix = vaddr * 0x9e3779b97f4a7c15ull + requested;
+		mix ^= mix >> 29u;
+		mix *= 0xbf58476d1ce4e5b9ull;
+		mix ^= mix >> 32u;
+		return static_cast<uint32_t>(mix % SET_COUNT);
+	}
+
+	std::array<Slot, SLOT_COUNT> m_slots {};
+	uint64_t                     m_clock = 0;
+};
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;

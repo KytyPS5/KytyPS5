@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
+#include "graphics/host_gpu/renderer/refusalReport.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "kernel/memory.h"
 
@@ -154,6 +155,20 @@ BuildDepthCopies(const ImageInfo& info, uint64_t slice_stride, vk::ImageAspectFl
 // Only an 8-bit colour sample or storage image can alias a stencil plane; a target stays its own.
 [[nodiscard]] bool IsStencilPlaneView(const Image& image) {
 	return !image.info.IsDepth() && image.info.bytes_per_block == 1 && !image.usage.render_target;
+}
+
+RefusalReporter g_upload_source_reports;
+
+void ReportUploadSourceRefused(const Image& image) {
+	const auto& info        = image.info;
+	const auto  occurrences = g_upload_source_reports.Observe(
+	    info.data.address, info.data.size, static_cast<uint64_t>(info.guest_format));
+	if (occurrences == 0) {
+		return;
+	}
+	char repeat[32] = "";
+	LOGF("TextureCache: image upload skipped addr=0x%016" PRIx64 " size=0x%016" PRIx64 "%s\n",
+	     info.data.address, info.data.size, RefusalReporter::RepeatSuffix(repeat, occurrences));
 }
 
 } // namespace
@@ -1217,7 +1232,13 @@ void TextureCache::InitializeImage(ImageId id) {
 		const auto [source, source_offset] =
 		    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
 		if (source == nullptr) {
-			EXIT("TextureCache: failed to obtain image upload source\n");
+			// Clear the guest-modified flag so the refusal costs one attempt, not one per frame.
+			ReportUploadSourceRefused(image);
+			image.ClearBufferModified();
+			if (image.IsCpuDirty()) {
+				image.RefreshComplete();
+			}
+			return;
 		}
 		UploadImage(image, *source, source_offset);
 		image.ClearBufferModified();

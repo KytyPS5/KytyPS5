@@ -48273,6 +48273,15 @@ ShaderTextureResource AtomicStorageTextureDescriptor() {
            0x00700000u, 0x00000000u, 0x00000000u}};
 }
 
+// The validator answers with a bool, so acceptance has to be asserted.
+void RequireStorageTextureAccepted(
+    const ShaderRecompiler::IR::ImageResource &resource,
+    const ShaderTextureResource &descriptor, uint64_t size) {
+  Require("BasicStorageTexture", "supported descriptor",
+          ValidateStorageTexture(resource, descriptor, size),
+          "a supported storage descriptor was refused");
+}
+
 [[noreturn]] void RunStorageTextureDescriptorDeathCase(const char *kind) {
   auto resource = BasicStorageTextureResource();
   auto descriptor = BasicStorageTextureDescriptor();
@@ -48357,8 +48366,8 @@ ShaderTextureResource AtomicStorageTextureDescriptor() {
   } else {
     std::_Exit(0x7e);
   }
-  ValidateStorageTexture(resource, descriptor, 0x10000);
-  std::_Exit(0x7f);
+  // The exit code distinguishes refused from accepted.
+  std::_Exit(ValidateStorageTexture(resource, descriptor, 0x10000) ? 0x7f : 321);
 }
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -48369,7 +48378,7 @@ void CheckBasicStorageTextureDescriptor() {
               descriptor.Width5() + 1u == 33 &&
               descriptor.Height5() + 1u == 33 && descriptor.Depth() + 1u == 33,
           "basic 3D storage descriptor fixture is malformed");
-  ValidateStorageTexture(BasicStorageTextureResource(), descriptor, 0x10000);
+  RequireStorageTextureAccepted(BasicStorageTextureResource(), descriptor, 0x10000);
 
   const ShaderTextureResource extended{{0x204aca00u, 0xc4700000u, 0x000fc00fu,
                                         0xa1b00facu, 0x0000003fu, 0x00700000u,
@@ -48379,7 +48388,7 @@ void CheckBasicStorageTextureDescriptor() {
   Require("BasicStorageTexture", "extended descriptor",
           extended.fields[6] != 0 && extended.fields[7] != 0,
           "extended 3D storage descriptor fixture is malformed");
-  ValidateStorageTexture(extended_resource, extended, 0x400000);
+  RequireStorageTextureAccepted(extended_resource, extended, 0x400000);
 
   const auto linear = BasicLinearStorageTextureDescriptor();
   Require("BasicStorageTexture", "linear descriptor",
@@ -48388,7 +48397,7 @@ void CheckBasicStorageTextureDescriptor() {
               linear.Format() == Prospero::BufferFormat::k8_8_8_8UNorm &&
               linear.TileMode() == Prospero::TileMode::kLinear,
           "PPSA07429 linear 2D storage descriptor fixture is malformed");
-  ValidateStorageTexture(BasicLinearStorageTextureResource(), linear,
+  RequireStorageTextureAccepted(BasicLinearStorageTextureResource(), linear,
                          0x1fa4000);
 
   const auto bgra = BasicBgraStorageTextureDescriptor();
@@ -48399,7 +48408,7 @@ void CheckBasicStorageTextureDescriptor() {
               bgra.TileMode() == Prospero::TileMode::kRenderTarget &&
               bgra.DstSelXYZW() == DstSel(6, 5, 4, 7),
           "PPSA02604 BGRA 2D storage descriptor fixture is malformed");
-  ValidateStorageTexture(BasicBgraStorageTextureResource(), bgra, 0x870000);
+  RequireStorageTextureAccepted(BasicBgraStorageTextureResource(), bgra, 0x870000);
 
   const ShaderTextureResource r128{
       {0x0202e500u, 0xc8200000u, 0x010dc1dfu, 0x91b00facu, 0, 0, 0, 0}};
@@ -48412,7 +48421,7 @@ void CheckBasicStorageTextureDescriptor() {
               r128.TileMode() == Prospero::TileMode::kRenderTarget &&
               r128.DstSelXYZW() == DstSel(4, 5, 6, 7),
           "PPSA01736 R128 storage descriptor fixture is malformed");
-  ValidateStorageTexture(r128_resource, r128, 0x870000);
+  RequireStorageTextureAccepted(r128_resource, r128, 0x870000);
 
   const auto r11g11b10 = Ppsa06228R11G11B10StorageTextureDescriptor();
   Require("BasicStorageTexture", "PPSA06228 R11G11B10 descriptor",
@@ -48423,7 +48432,7 @@ void CheckBasicStorageTextureDescriptor() {
               r11g11b10.TileMode() == Prospero::TileMode::kRenderTarget &&
               r11g11b10.DstSelXYZW() == DstSel(4, 5, 6, 1),
           "PPSA06228 R11G11B10 storage descriptor fixture is malformed");
-  ValidateStorageTexture(BasicBgraStorageTextureResource(), r11g11b10,
+  RequireStorageTextureAccepted(BasicBgraStorageTextureResource(), r11g11b10,
                          0x870000);
   // The float surface gets its own image; UNORM8 texels cannot back a float view.
   ValidateStorageColorView(vk::Format::eB10G11R11UfloatPack32,
@@ -48444,7 +48453,7 @@ void CheckBasicStorageTextureDescriptor() {
               max_mip.TileMode() == Prospero::TileMode::kRenderTarget &&
               max_mip.DstSelXYZW() == DstSel(4, 5, 0, 1),
           "PPSA01530 max-mip storage descriptor fixture is malformed");
-  ValidateStorageTexture(Ppsa01530MaxMipStorageTextureResource(), max_mip,
+  RequireStorageTextureAccepted(Ppsa01530MaxMipStorageTextureResource(), max_mip,
                          0x20000);
   auto mip_one = max_mip;
   mip_one.fields[3] |= (1u << 12u) | (1u << 16u);
@@ -48452,7 +48461,7 @@ void CheckBasicStorageTextureDescriptor() {
           mip_one.BaseLevel() == 1 && mip_one.LastLevel() == 1 &&
               mip_one.MaxMip() == 5,
           "PPSA01530 mip-one storage descriptor fixture is malformed");
-  ValidateStorageTexture(Ppsa01530MaxMipStorageTextureResource(), mip_one,
+  RequireStorageTextureAccepted(Ppsa01530MaxMipStorageTextureResource(), mip_one,
                          0x20000);
 
   const auto mip_range = Ppsa01340MipRangeStorageTextureDescriptor();
@@ -48466,7 +48475,7 @@ void CheckBasicStorageTextureDescriptor() {
               mip_range.TileMode() == Prospero::TileMode::kRenderTarget &&
               mip_range.DstSelXYZW() == DstSel(4, 5, 6, 7),
           "PPSA01340 mip-range storage descriptor fixture is malformed");
-  ValidateStorageTexture(BasicBgraStorageTextureResource(), mip_range,
+  RequireStorageTextureAccepted(BasicBgraStorageTextureResource(), mip_range,
                          0xa30000);
 
   const auto overwide_mip = Ppsa01340OverwideMipStorageTextureDescriptor();
@@ -48487,7 +48496,7 @@ void CheckBasicStorageTextureDescriptor() {
   Require("BasicStorageTexture", "PPSA01340 over-wide mip footprint",
           overwide_size.size == 0x560000 && overwide_size.align == 0x10000,
           "captured nine-level Standard64KB footprint changed");
-  ValidateStorageTexture(Ppsa01530MaxMipStorageTextureResource(), overwide_mip,
+  RequireStorageTextureAccepted(Ppsa01530MaxMipStorageTextureResource(), overwide_mip,
                          overwide_size.size);
 
   const auto r16_float = Ppsa02527R16FloatStorageTextureDescriptor();
@@ -48499,7 +48508,7 @@ void CheckBasicStorageTextureDescriptor() {
               r16_float.TileMode() == Prospero::TileMode::kRenderTarget &&
               r16_float.DstSelXYZW() == DstSel(4, 0, 0, 1),
           "PPSA02527 R16F 2D storage descriptor fixture is malformed");
-  ValidateStorageTexture(BasicBgraStorageTextureResource(), r16_float,
+  RequireStorageTextureAccepted(BasicBgraStorageTextureResource(), r16_float,
                          0x480000);
 
   const auto r32_float = Ppsa02527R32FloatStorageTextureDescriptor();
@@ -48511,7 +48520,7 @@ void CheckBasicStorageTextureDescriptor() {
               r32_float.TileMode() == Prospero::TileMode::kRenderTarget &&
               r32_float.DstSelXYZW() == DstSel(4, 0, 0, 1),
           "PPSA02527 R32F 2D storage descriptor fixture is malformed");
-  ValidateStorageTexture(BasicBgraStorageTextureResource(), r32_float,
+  RequireStorageTextureAccepted(BasicBgraStorageTextureResource(), r32_float,
                          0x280000);
 
   const auto r8_unorm = Ppsa02527R8UnormStorageTextureDescriptor();
@@ -48522,7 +48531,7 @@ void CheckBasicStorageTextureDescriptor() {
               r8_unorm.TileMode() == Prospero::TileMode::kRenderTarget &&
               r8_unorm.DstSelXYZW() == DstSel(4, 0, 0, 1),
           "PPSA02527 R8 UNORM 2D storage descriptor fixture is malformed");
-  ValidateStorageTexture(BasicBgraStorageTextureResource(), r8_unorm, 0xc0000);
+  RequireStorageTextureAccepted(BasicBgraStorageTextureResource(), r8_unorm, 0xc0000);
 
   const auto yzwx = BasicYzwxStorageTextureDescriptor();
   Require("BasicStorageTexture", "YZWX descriptor",
@@ -48532,7 +48541,7 @@ void CheckBasicStorageTextureDescriptor() {
               yzwx.TileMode() == Prospero::TileMode::kLinear &&
               yzwx.DstSelXYZW() == DstSel(5, 6, 7, 4),
           "PPSA04181 linear YZWX storage descriptor fixture is malformed");
-  ValidateStorageTexture(BasicLinearStorageTextureResource(), yzwx, 0x800);
+  RequireStorageTextureAccepted(BasicLinearStorageTextureResource(), yzwx, 0x800);
   auto all_swizzles = yzwx;
   all_swizzles.fields[1] =
       (all_swizzles.fields[1] & ~0x1ff00000u) |
@@ -48543,7 +48552,7 @@ void CheckBasicStorageTextureDescriptor() {
       continue;
     }
     all_swizzles.fields[3] = (all_swizzles.fields[3] & ~0xfffu) | swizzle;
-    ValidateStorageTexture(BasicLinearStorageTextureResource(), all_swizzles,
+    RequireStorageTextureAccepted(BasicLinearStorageTextureResource(), all_swizzles,
                            0x800);
     ValidateStorageColorView(vk::Format::eR16G16B16A16Sfloat,
                              vk::Format::eR16G16B16A16Sfloat, swizzle);
@@ -48571,7 +48580,7 @@ void CheckBasicStorageTextureDescriptor() {
               cube.TileMode() == Prospero::TileMode::kRenderTarget &&
               cube.DstSelXYZW() == DstSel(4, 5, 6, 7),
           "PPSA07429 cube storage descriptor fixture is malformed");
-  ValidateStorageTexture(cube_resource, cube, 0x420000);
+  RequireStorageTextureAccepted(cube_resource, cube, 0x420000);
 
   const auto array = BasicArrayStorageTextureDescriptor();
   Require("BasicStorageTexture", "2D-array descriptor",
@@ -48583,7 +48592,7 @@ void CheckBasicStorageTextureDescriptor() {
               array.TileMode() == Prospero::TileMode::kRenderTarget &&
               array.DstSelXYZW() == DstSel(6, 5, 4, 7),
           "PPSA21268 2D-array storage descriptor fixture is malformed");
-  ValidateStorageTexture(BasicArrayStorageTextureResource(), array, 0x10000);
+  RequireStorageTextureAccepted(BasicArrayStorageTextureResource(), array, 0x10000);
   const ShaderTextureResource mip_array{{0x20268d00u, 0xc4700000u, 0x001fc01fu,
                                          0xd1b11facu, 0x00000000u, 0x00700070u,
                                          0x00000000u, 0x00000000u}};
@@ -48593,7 +48602,7 @@ void CheckBasicStorageTextureDescriptor() {
               mip_array.Type() == Prospero::ImageType::kColor2DArray &&
               mip_array.Depth() == 0 && mip_array.BaseArray5() == 0,
           "PPSA14457 mip-one 2D-array storage descriptor fixture is malformed");
-  ValidateStorageTexture(BasicArrayStorageTextureResource(), mip_array,
+  RequireStorageTextureAccepted(BasicArrayStorageTextureResource(), mip_array,
                          0x30000);
 
   const auto uint_array = BasicUintArrayStorageTextureDescriptor();
@@ -48606,7 +48615,7 @@ void CheckBasicStorageTextureDescriptor() {
               uint_array.TileMode() == Prospero::TileMode::kRenderTarget &&
               uint_array.DstSelXYZW() == DstSel(4, 0, 0, 1),
           "PPSA21268 uint 2D-array storage descriptor fixture is malformed");
-  ValidateStorageTexture(BasicUintArrayStorageTextureResource(), uint_array,
+  RequireStorageTextureAccepted(BasicUintArrayStorageTextureResource(), uint_array,
                          0x10000);
 
   const ShaderTextureResource standard256b{{
@@ -48636,7 +48645,7 @@ void CheckBasicStorageTextureDescriptor() {
               standard256b_size.size == 0x100 &&
               standard256b_size.align == 0x100,
           "captured PPSA08511 Standard256B storage descriptor is malformed");
-  ValidateStorageTexture(standard256b_resource, standard256b,
+  RequireStorageTextureAccepted(standard256b_resource, standard256b,
                          standard256b_size.size);
 
   const auto standard4kb_array = Standard4KBUintArrayStorageTextureDescriptor();
@@ -48652,7 +48661,7 @@ void CheckBasicStorageTextureDescriptor() {
           standard4kb_array.DstSelXYZW() == DstSel(4, 0, 0, 1) &&
           standard4kb_size.size == 0x1000 && standard4kb_size.align == 0x1000,
       "captured Standard4KB uint 2D-array descriptor is malformed");
-  ValidateStorageTexture(BasicUintArrayStorageTextureResource(),
+  RequireStorageTextureAccepted(BasicUintArrayStorageTextureResource(),
                          standard4kb_array, standard4kb_size.size);
 
   auto based_standard4kb_array = standard4kb_array;
@@ -48670,7 +48679,7 @@ void CheckBasicStorageTextureDescriptor() {
               based_standard4kb_size.size == 0x2000 &&
               based_standard4kb_size.align == 0x1000,
           "captured based Standard4KB array view is malformed");
-  ValidateStorageTexture(BasicUintArrayStorageTextureResource(),
+  RequireStorageTextureAccepted(BasicUintArrayStorageTextureResource(),
                          based_standard4kb_array, based_standard4kb_size.size);
 
   const auto standard64kb = Standard64KBStorageTextureDescriptor();
@@ -48687,7 +48696,7 @@ void CheckBasicStorageTextureDescriptor() {
               standard64kb_size.size == 0x10000 &&
               standard64kb_size.align == 0x10000,
           "captured Standard64KB storage descriptor is malformed");
-  ValidateStorageTexture(BasicBgraStorageTextureResource(), standard64kb,
+  RequireStorageTextureAccepted(BasicBgraStorageTextureResource(), standard64kb,
                          standard64kb_size.size);
 
   const auto uint_volume = BasicUintVolumeStorageTextureDescriptor();
@@ -48701,7 +48710,7 @@ void CheckBasicStorageTextureDescriptor() {
               uint_volume.TileMode() == Prospero::TileMode::kLinear &&
               uint_volume.DstSelXYZW() == DstSel(4, 0, 0, 0),
           "PPSA21268 uint 3D storage descriptor fixture is malformed");
-  ValidateStorageTexture(BasicUintVolumeStorageTextureResource(), uint_volume,
+  RequireStorageTextureAccepted(BasicUintVolumeStorageTextureResource(), uint_volume,
                          0x10000);
 
   const ShaderTextureResource tiled_uint_volume{
@@ -48714,7 +48723,7 @@ void CheckBasicStorageTextureDescriptor() {
               tiled_uint_volume.Type() == Prospero::ImageType::kColor3D &&
               tiled_uint_volume.TileMode() == Prospero::TileMode::kStandard4KB,
           "captured tiled uint 3D storage descriptor fixture is malformed");
-  ValidateStorageTexture(BasicUintVolumeStorageTextureResource(),
+  RequireStorageTextureAccepted(BasicUintVolumeStorageTextureResource(),
                          tiled_uint_volume, 0x2000);
 
   const auto depth_tile = Ppsa14053DepthTileStorageTextureDescriptor();
@@ -48728,7 +48737,7 @@ void CheckBasicStorageTextureDescriptor() {
               depth_tile.DstSelXYZW() == DstSel(4, 0, 0, 1),
           "PPSA14053 write-only depth-tile storage descriptor fixture is "
           "malformed");
-  ValidateStorageTexture(Ppsa14053DepthTileStorageTextureResource(), depth_tile,
+  RequireStorageTextureAccepted(Ppsa14053DepthTileStorageTextureResource(), depth_tile,
                          0x10000);
   const auto d16_depth_tile = Ppsa10112D16StorageTextureDescriptor();
   Require("BasicStorageTexture", "PPSA10112 D16 depth-tile descriptor",
@@ -48753,7 +48762,7 @@ void CheckBasicStorageTextureDescriptor() {
           d16_pitch == 256 && d16_size.size == 0x20000 &&
               d16_size.align == 0x10000,
           "PPSA10112 writable D16 depth-plane footprint is incorrect");
-  ValidateStorageTexture(BasicArrayStorageTextureResource(), d16_depth_tile,
+  RequireStorageTextureAccepted(BasicArrayStorageTextureResource(), d16_depth_tile,
                          d16_size.size);
   auto depth_tile_r32 = depth_tile;
   depth_tile_r32.fields[1] =
@@ -48765,7 +48774,7 @@ void CheckBasicStorageTextureDescriptor() {
   auto depth_tile_r32_resource = Ppsa14053DepthTileStorageTextureResource();
   depth_tile_r32_resource.dimension =
       ShaderRecompiler::Decoder::ImageDimension::Dim2D;
-  ValidateStorageTexture(depth_tile_r32_resource, depth_tile_r32, 0x10000);
+  RequireStorageTextureAccepted(depth_tile_r32_resource, depth_tile_r32, 0x10000);
   Require("BasicStorageTexture", "R32_UINT replicated write mapping",
           IsValidImageSwizzle(DstSel(4, 4, 4, 4)),
           "single-channel replicated destination selection was rejected");
@@ -48778,7 +48787,7 @@ void CheckBasicStorageTextureDescriptor() {
               atomic.Format() == Prospero::BufferFormat::k32UInt &&
               atomic.DstSelXYZW() == DstSel(4, 0, 0, 1),
           "PPSA22102 image-atomic descriptor fixture is malformed");
-  ValidateStorageTexture(AtomicStorageTextureResource(), atomic, 0x10000);
+  RequireStorageTextureAccepted(AtomicStorageTextureResource(), atomic, 0x10000);
 
   char path[MAX_PATH]{};
   Require("BasicStorageTexture", "host",
@@ -48823,7 +48832,7 @@ void CheckBasicStorageTextureDescriptor() {
     CloseHandle(process.hProcess);
     Require("BasicStorageTexture", "host", exited && exit_code == 321,
             std::string(kind) +
-                " storage descriptor did not report a fatal error");
+                " storage descriptor was not refused");
   }
   std::printf("[host]    %-32s ok\n", "BasicStorageTextureDescriptor");
 }

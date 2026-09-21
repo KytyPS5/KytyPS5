@@ -5,10 +5,12 @@
 #include "common/debugCounters.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/threads.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/refusalReport.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -27,6 +29,19 @@ namespace {
 
 constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
+RefusalReporter g_image_backing_reports;
+
+void ReportImageBackingSubstitute(uint64_t vaddr, uint64_t size, const char* substitute) {
+	const auto occurrences = g_image_backing_reports.Observe(vaddr, size, 0);
+	if (occurrences == 0) {
+		return;
+	}
+	char repeat[32] = "";
+	LOGF("BufferCache: image backing unavailable addr=0x%016" PRIx64 " size=0x%016" PRIx64
+	     " bound=%s%s\n",
+	     vaddr, size, substitute, RefusalReporter::RepeatSuffix(repeat, occurrences));
+}
+
 
 std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandScheduler& scheduler,
                                         StreamBuffer& staging, uint64_t size, uint64_t alignment,
@@ -537,7 +552,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
-		EXIT("BufferCache: invalid image source\n");
+		ReportImageBackingSubstitute(vaddr, size, "nothing");
+		return {nullptr, 0};
 	}
 	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
 	if (owner != nullptr && *owner) {
@@ -556,7 +572,11 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	    vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eStorageBuffer,
 	    [&](uint8_t* mapped, uint64_t) {
 		if (!Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, mapped, size)) {
-			EXIT("BufferCache: failed to read mapped guest image backing\n");
+			// A texture descriptor is guest data: it may overlap private memory or leave the arena.
+			if (!Libs::LibKernel::Memory::CopySparseMemory(vaddr, mapped, size)) {
+				std::memset(mapped, 0, size);
+				ReportImageBackingSubstitute(vaddr, size, "zeros");
+			}
 		}
 	});
 }

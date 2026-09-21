@@ -88,6 +88,8 @@ struct ImageInfo {
 	uint32_t first_tail_level    = 16;
 
 	void                                           UpdateSize();
+	// False where the guest layout has no host tiling; UpdateSize exits there instead.
+	[[nodiscard]] bool TryUpdateSize();
 	[[nodiscard]] uint32_t                         DataAlignment() const;
 	[[nodiscard]] uint64_t                         LinearSize(uint32_t levels = 0) const;
 	[[nodiscard]] vk::Extent3D                     MipExtent(uint32_t level) const;

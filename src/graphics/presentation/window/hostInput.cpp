@@ -408,15 +408,18 @@ int PollMouse(uint64_t now_ms) {
 }
 
 bool HostInputWaitEvent(SDL_Event* event) {
+	// Return periodically so the main loop can drain queued cross-thread work
+	// even if the backend misses the SDL_PushEvent wakeup. A presentation thread
+	// may be waiting for that work (including a window-title update).
+	const int main_task_poll_ms =
+	    std::max(1, static_cast<int>(1000u / (2u * Config::GetVblankFrequency())));
+	int timeout_ms = main_task_poll_ms;
 	if (!g_mouse.enabled || SDL_GetKeyboardFocus() == nullptr) {
 		CenterMouseStick();
-		if (SDL_WaitEvent(event) == 0) {
-			EXIT("%s\n", SDL_GetError());
-		}
-		return true;
+	} else {
+		timeout_ms = std::min(PollMouse(SDL_GetTicks64()), main_task_poll_ms);
 	}
 
-	const int timeout_ms = PollMouse(SDL_GetTicks64());
 	SDL_ClearError();
 	if (SDL_WaitEventTimeout(event, timeout_ms) != 0) {
 		return true;

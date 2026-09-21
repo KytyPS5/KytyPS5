@@ -116,6 +116,19 @@ struct RelocationInfo {
 	bool        bind_self = false;
 };
 
+// The most recent unresolved import stub call on this thread. Recorded whenever a stub has to
+// take its fallback path, so that a later guest fault caused by the value it produced can name
+// the responsible symbol. Deliberately trivially initialized: the host fault handler reads this
+// from a signal context, so it must not run TLS initialization or allocate.
+struct UnresolvedStubCallInfo {
+	bool     valid       = false;
+	uint64_t patch_vaddr = 0;
+	uint64_t index       = 0;
+	char     name[192]   = {};
+};
+
+static thread_local UnresolvedStubCallInfo g_tls_last_unresolved_stub;
+
 struct StubbedImportRecord {
 	uint32_t    index       = 0;
 	uint64_t    patch_vaddr = 0;
@@ -148,33 +161,17 @@ static bool PatchGuestMemory64(uint64_t vaddr, uint64_t value) {
 }
 
 static uint64_t AllocateUnresolvedImportThunk(uint64_t record_id) {
-	constexpr uint64_t thunk_size = 165;
-
-	if (g_unresolved_stub_thunk_pages.empty() ||
-	    g_unresolved_stub_thunk_offset + thunk_size > UNRESOLVED_STUB_PAGE_SIZE) {
-		auto page = Libs::LibKernel::Memory::AllocateRuntimeMemory(
-		    0, UNRESOLVED_STUB_PAGE_SIZE, Common::VirtualMemory::Mode::ExecuteReadWrite,
-		    "unresolved_import_thunk");
-		EXIT_NOT_IMPLEMENTED(page == 0);
-		g_unresolved_stub_thunk_pages.push_back(page);
-		g_unresolved_stub_thunk_offset = 0;
-	}
-
-	auto* code = reinterpret_cast<uint8_t*>(g_unresolved_stub_thunk_pages.back() +
-	                                        g_unresolved_stub_thunk_offset);
-	g_unresolved_stub_thunk_offset += thunk_size;
-
-	const auto target = reinterpret_cast<uint64_t>(ResolveImportStubWithId);
-	uint8_t    bytes[thunk_size] {};
-	size_t     i      = 0;
-	const auto emit   = [&](uint8_t b) { bytes[i++] = b; };
+	const auto           target = reinterpret_cast<uint64_t>(ResolveImportStubWithId);
+	std::vector<uint8_t> bytes;
+	bytes.reserve(192);
+	const auto emit   = [&](uint8_t b) { bytes.push_back(b); };
 	const auto emit64 = [&](uint64_t v) {
-		std::memcpy(bytes + i, &v, sizeof(v));
-		i += sizeof(v);
+		const auto* p = reinterpret_cast<const uint8_t*>(&v);
+		bytes.insert(bytes.end(), p, p + sizeof(v));
 	};
 	const auto emit32 = [&](uint32_t v) {
-		std::memcpy(bytes + i, &v, sizeof(v));
-		i += sizeof(v);
+		const auto* p = reinterpret_cast<const uint8_t*>(&v);
+		bytes.insert(bytes.end(), p, p + sizeof(v));
 	};
 	const auto save_xmm = [&](uint8_t reg, uint8_t offset) {
 		emit(0xf3);
@@ -258,12 +255,32 @@ static uint64_t AllocateUnresolvedImportThunk(uint64_t record_id) {
 	emit(0x0f);
 	emit(0x57);
 	emit(0xc0); // xorps xmm0, xmm0
+	// Report a null, which is what an unimplemented function has to report. Guest code that ends up
+	// calling a stubbed allocator or handle API null checks the result and takes its failure path;
+	// anything non-null here defeats that check and turns a handled failure into a fault later on.
+	// What makes a null actionable is the fault report naming the last stub called on the thread.
 	emit(0x31);
 	emit(0xc0); // xor eax, eax
 	emit(0xc3); // ret
 
-	EXIT_NOT_IMPLEMENTED(i != thunk_size);
-	std::memcpy(code, bytes, sizeof(bytes));
+	const auto thunk_size = bytes.size();
+	EXIT_NOT_IMPLEMENTED(thunk_size > UNRESOLVED_STUB_PAGE_SIZE);
+
+	if (g_unresolved_stub_thunk_pages.empty() ||
+	    g_unresolved_stub_thunk_offset + thunk_size > UNRESOLVED_STUB_PAGE_SIZE) {
+		auto page = Libs::LibKernel::Memory::AllocateRuntimeMemory(
+		    0, UNRESOLVED_STUB_PAGE_SIZE, Common::VirtualMemory::Mode::ExecuteReadWrite,
+		    "unresolved_import_thunk");
+		EXIT_NOT_IMPLEMENTED(page == 0);
+		g_unresolved_stub_thunk_pages.push_back(page);
+		g_unresolved_stub_thunk_offset = 0;
+	}
+
+	auto* code = reinterpret_cast<uint8_t*>(g_unresolved_stub_thunk_pages.back() +
+	                                        g_unresolved_stub_thunk_offset);
+	g_unresolved_stub_thunk_offset += thunk_size;
+
+	std::memcpy(code, bytes.data(), thunk_size);
 	Common::VirtualMemory::FlushInstructionCache(reinterpret_cast<uint64_t>(code), thunk_size);
 	return reinterpret_cast<uint64_t>(code);
 }
@@ -323,21 +340,37 @@ static KYTY_SYSV_ABI uint64_t ResolveImportStubWithId(uint64_t record_id) {
 	}
 
 	const auto log_index = g_unresolved_stub_call_log_count.fetch_add(1);
-	if (log_index < 1024) {
+	{
+		auto& last       = g_tls_last_unresolved_stub;
+		last.valid       = true;
+		last.patch_vaddr = 0;
+		last.index       = record_id;
+
 		if (record_id < g_stubbed_imports.size()) {
 			const auto& record = g_stubbed_imports[record_id];
-			printf("Unresolved import stub called: %s\n", record.name.c_str());
-			LOGF("Unresolved import stub called [%u]: patch_vaddr=0x%016" PRIx64
-			     " jmprela_index=%" PRIu32 " symbol=%s type=%s bind=%s program=%s\n",
-			     log_index, record.patch_vaddr, record.index, record.name.c_str(),
-			     magic_enum::enum_name(record.type), magic_enum::enum_name(record.bind),
-			     record.program.c_str());
+			last.patch_vaddr   = record.patch_vaddr;
+			std::snprintf(last.name, sizeof(last.name), "%s", record.name.c_str());
+			if (log_index < 1024) {
+				printf("Unresolved import stub called: %s\n", record.name.c_str());
+				LOGF("Unresolved import stub called [%u]: patch_vaddr=0x%016" PRIx64
+				     " jmprela_index=%" PRIu32 " symbol=%s type=%s bind=%s program=%s\n",
+				     log_index, record.patch_vaddr, record.index, record.name.c_str(),
+				     magic_enum::enum_name(record.type), magic_enum::enum_name(record.bind),
+				     record.program.c_str());
+			}
 		} else {
-			printf("Unresolved import stub called: <bad-record>\n");
-			LOGF("Unresolved import stub called [%u]: record_id=%" PRIu64 " symbol=<bad-record>\n",
-			     log_index, record_id);
+			std::snprintf(last.name, sizeof(last.name), "<bad-record>");
+			if (log_index < 1024) {
+				printf("Unresolved import stub called: <bad-record>\n");
+				LOGF("Unresolved import stub called [%u]: record_id=%" PRIu64
+				     " symbol=<bad-record>\n",
+				     log_index, record_id);
+			}
 		}
 	}
+	// 0 is the thunk's "not resolved" sentinel and must not be treated as a jump target. The thunk
+	// handles the guest-visible fallback, handing back the invalid-memory trap pointer rather than
+	// a null.
 	return 0;
 }
 
@@ -356,6 +389,10 @@ static thread_local uint8_t* g_tls_cached_main_tcb     = nullptr;
 
 static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_func_t atexit_func,
                                    void* stack_top) {
+	if (addr == 0) {
+		EXIT("RunEntry: refusing to call a NULL guest entry point\n");
+	}
+
 #if defined(__x86_64__) || defined(_M_X64)
 	auto* func = reinterpret_cast<entry_func_t>(addr);
 
@@ -835,6 +872,14 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			}
 			std::printf("\n");
 		}
+		const auto& last_stub = g_tls_last_unresolved_stub;
+		if (last_stub.valid) {
+			std::printf("last unresolved import stub on this thread: %s\n", last_stub.name);
+			std::printf("  patch_vaddr=0x%016" PRIx64 " index=%" PRIu64 "\n", last_stub.patch_vaddr,
+			            last_stub.index);
+		} else {
+			std::printf("last unresolved import stub on this thread: none\n");
+		}
 		std::fflush(stdout);
 	}
 	EXIT("Unhandled host exception: type=%u code=%u pc=0x%016" PRIx64
@@ -1024,6 +1069,16 @@ static void RelocateRecord(uint32_t index, Elf64_Rela* r, Program* program, bool
 
 	// KYTY_PROFILER_BLOCK("patch");
 
+	if (ri.resolved && ri.value == 0) {
+		// A symbol that "resolves" to address 0 would leave a zero in a GOT/PLT slot that the guest
+		// calls through. Route it through the unresolved path instead of patching the zero in.
+		LOGF("Relocate: symbol resolved to a NULL address, treating it as unresolved: "
+		     "[%016" PRIx64 "] <- 0x0000000000000000, %s, %s, %s, %s\n",
+		     ri.vaddr, ri.name.c_str(), magic_enum::enum_name(ri.type),
+		     magic_enum::enum_name(ri.bind), ri.dbg_name.c_str());
+		ri.resolved = false;
+	}
+
 	if (ri.resolved) {
 		patched = PatchGuestMemory64(ri.vaddr, ri.value);
 	} else {
@@ -1133,8 +1188,18 @@ static KYTY_SYSV_ABI uint64_t RelocateHandler(RelocateHandlerStack s) {
 	// Restore return address (for stack trace)
 	stack[-1] = reinterpret_cast<uint64_t>(RelocateHandlerReturnStub);
 
+	{
+		auto& last       = g_tls_last_unresolved_stub;
+		last.valid       = true;
+		last.patch_vaddr = 0;
+		last.index       = rel_index;
+		std::snprintf(last.name, sizeof(last.name), "%s", name.c_str());
+	}
+
 	LOGF("=== Stubbed function, returning OK ===\n[%d]\t%s\n", Common::Thread::GetThreadIdUnique(),
 	     name.c_str());
+	// Same fallback as the unresolved-import thunk: a null, because guest callers of stubbed
+	// functions null check the result.
 	return 0;
 }
 
@@ -1490,6 +1555,7 @@ void RuntimeLinker::Clear() {
 	g_unresolved_stub_thunk_offset = 0;
 	g_stubbed_imports.clear();
 	g_unresolved_stub_call_log_count.store(0);
+	g_tls_last_unresolved_stub = UnresolvedStubCallInfo {};
 	if (g_invalid_memory != 0) {
 		EXIT_IF(!Libs::LibKernel::Memory::FreeGuestMemory(g_invalid_memory, 4096));
 		g_invalid_memory = 0;
@@ -1896,6 +1962,14 @@ int RuntimeLinker::StartModule(Program* program, size_t args, const void* argp,
 	LOGF_COLOR(Log::Color::BrightYellow, "---\n--- Start module: %s\n---\n",
 	           Common::PathToString(program->file_name).c_str());
 
+	if (program->dynamic_info->init_vaddr == 0) {
+		// No DT_INIT means there is nothing to run. Calling base_vaddr here would hand control to
+		// the module header.
+		LOGF("StartModule: %s has no initializer, skipping\n",
+		     Common::PathToString(program->file_name).c_str());
+		return 0;
+	}
+
 	return reinterpret_cast<module_ini_fini_func_t>(program->dynamic_info->init_vaddr +
 	                                                program->base_vaddr)(args, argp, func);
 }
@@ -1910,6 +1984,13 @@ int RuntimeLinker::StopModule(Program* program, size_t args, const void* argp, m
 
 	LOGF_COLOR(Log::Color::BrightYellow, "---\n--- Stop module: %s\n---\n",
 	           Common::PathToString(program->file_name).c_str());
+
+	if (program->dynamic_info->fini_vaddr == 0) {
+		LOGF("StopModule: %s has no finalizer, skipping\n",
+		     Common::PathToString(program->file_name).c_str());
+		Libs::LibKernel::PthreadDeleteStaticObjects(program);
+		return 0;
+	}
 
 	int result = reinterpret_cast<module_ini_fini_func_t>(program->dynamic_info->fini_vaddr +
 	                                                      program->base_vaddr)(args, argp, func);

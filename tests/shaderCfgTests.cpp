@@ -9986,7 +9986,7 @@ void TestMeshInputAssembly() {
   }
 }
 
-void TestMeshPassthrough(uint32_t wave_size) {
+void TestMeshPassthrough(uint32_t wave_size, uint32_t lane, uint32_t expected_packed_indices) {
   using namespace ShaderRecompiler;
   using namespace ShaderRecompiler::IR;
   const uint32_t shader[] = {
@@ -10042,7 +10042,7 @@ void TestMeshPassthrough(uint32_t wave_size) {
         inst.ReplaceUsesWith(Value(draw[inst.Arg(0).U32()]));
       } else if (inst.GetOpcode() == ValueOpcode::GetBuiltin) {
         const auto kind = static_cast<StageInputKind>(inst.Arg(0).U32());
-        const uint32_t value = kind == StageInputKind::LocalInvocationIndex ? 2 : 0;
+        const uint32_t value = kind == StageInputKind::LocalInvocationIndex ? lane : 0;
         inst.ReplaceUsesWith(Value(value));
       }
     }
@@ -10075,7 +10075,7 @@ void TestMeshPassthrough(uint32_t wave_size) {
         "mesh passthrough did not generate the s2 allocation ABI");
   Check(sgpr3 == (wave_size == 64 ? 0x10000103u : 0x20000103u),
         "mesh passthrough changed the s3 wave/count ABI");
-  Check(vgpr0 == (6u | (7u << 10u) | (8u << 20u)),
+  Check(vgpr0 == expected_packed_indices,
         "mesh passthrough changed packed triangle indices");
 }
 
@@ -13663,8 +13663,14 @@ int main() {
   TestMeshExportStorage();
   TestMergedShaderUserDataSnapshot();
   TestMeshInputAssembly();
-  TestMeshPassthrough(32);
-  TestMeshPassthrough(64);
+  TestMeshPassthrough(32, 0, 0u | (1u << 10u) | (2u << 20u));
+  TestMeshPassthrough(32, 1, 3u | (4u << 10u) | (5u << 20u));
+  TestMeshPassthrough(32, 2, 6u | (7u << 10u) | (8u << 20u));
+  TestMeshPassthrough(32, 32u - 1u, 93u | (94u << 10u) | (95u << 20u));
+  TestMeshPassthrough(64, 0, 0u | (1u << 10u) | (2u << 20u));
+  TestMeshPassthrough(64, 1, 3u | (4u << 10u) | (5u << 20u));
+  TestMeshPassthrough(64, 2, 6u | (7u << 10u) | (8u << 20u));
+  TestMeshPassthrough(64, 64u - 1u, 189u | (190u << 10u) | (191u << 20u));
   TestEmbeddedFetchPreservesSharedScalarLoad();
   TestEmbeddedVertexFormatSwizzle();
   TestNewShaderRecompilerSetpcJumpTable();

@@ -174,6 +174,16 @@ struct EmitterState {
 	// Key searches emitted at a block's top level, reused by later accesses in that block.
 	std::map<std::pair<const IR::Block*, std::array<uint32_t, 4>>, uint32_t> block_key_searches;
 	uint32_t                   pixel_valid_mask_variable             = 0;
+	// Loop budget guard: when armed, every loop header this emitter can reach charges one unit
+	// against a per-invocation budget and leaves the loop when it runs out, so a runaway trip
+	// count becomes a wrong picture rather than a device lost to the watchdog.
+	uint32_t                   loop_budget_variable                  = 0;
+	uint32_t                   loop_budget_limit                     = 0;
+	uint32_t                   loop_budget_guarded                   = 0;
+	uint32_t                   loop_budget_unguardable               = 0;
+	// Latch blocks whose terminator can carry the budget, to the loop header id, so the fold knows
+	// which arm is the back edge.
+	std::unordered_map<const IR::Block*, uint32_t> loop_budget_latch;
 	uint32_t                   subgroup_local_invocation_id_variable = 0;
 	uint32_t                   per_vertex_variable                   = 0;
 	uint32_t                   point_size_variable                   = 0;

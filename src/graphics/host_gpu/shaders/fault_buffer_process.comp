@@ -7,7 +7,7 @@
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 layout(std430, binding = 0) buffer input_buf {
-    uint fault_buffer[];
+    uvec4 fault_buffer[];
 };
 
 layout(std430, binding = 1) buffer output_buf {
@@ -19,17 +19,23 @@ layout(std430, binding = 1) buffer output_buf32 {
 
 void main() {
     const uint id = gl_GlobalInvocationID.x;
-    uint word = fault_buffer[id];
-    fault_buffer[id] = 0u;
-    const uint base_bit = id * 32u;
-    while (word != 0u) {
-        const uint store_index = atomicAdd(download_buffer32[0], 1u) + 1u;
-        if (store_index >= MAX_PAGE_FAULTS) {
-            return;
+    const uvec4 words = fault_buffer[id];
+    if (all(equal(words, uvec4(0u)))) {
+        return;
+    }
+    fault_buffer[id] = uvec4(0u);
+    for (uint lane = 0u; lane < 4u; ++lane) {
+        uint word = words[lane];
+        const uint base_bit = (id * 4u + lane) * 32u;
+        while (word != 0u) {
+            const uint store_index = atomicAdd(download_buffer32[0], 1u) + 1u;
+            if (store_index >= MAX_PAGE_FAULTS) {
+                return;
+            }
+            const uint bit = findLSB(word);
+            word &= word - 1;
+            const uint page = base_bit + bit;
+            download_buffer[store_index] = uint64_t(page) << CACHING_PAGEBITS;
         }
-        const uint bit = findLSB(word);
-        word &= word - 1;
-        const uint page = base_bit + bit;
-        download_buffer[store_index] = uint64_t(page) << CACHING_PAGEBITS;
     }
 }

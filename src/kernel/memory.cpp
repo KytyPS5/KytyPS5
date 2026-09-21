@@ -917,6 +917,18 @@ uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	return clamped_size;
 }
 
+bool QueryCommittedRange(uint64_t vaddr, uint64_t* start, uint64_t* size) {
+	EXIT_IF(start == nullptr || size == nullptr);
+	VirtualRanges::Range range {};
+	if (g_virtual_ranges == nullptr || !g_virtual_ranges->Query(vaddr, 0, &range) ||
+	    !IsCommittedRangeType(range.type)) {
+		return false;
+	}
+	*start = range.start;
+	*size  = range.size;
+	return true;
+}
+
 void WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept {
 	if (!TryWriteBacking(vaddr, data, size)) {
 		EXIT("Memory: required direct-backing write failed, addr=0x%016" PRIx64

@@ -26,6 +26,7 @@
 #include <fmt/format.h>
 #include <list>
 #include <mutex>
+#include <random>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -937,6 +938,35 @@ static KYTY_SYSV_ABI void* libc_realloc(void* ptr, size_t size) {
 	return std::realloc(ptr, size);
 }
 
+// String and time entry points the guest imports from libc as well. struct tm crosses the boundary
+// in the guest's 36-byte layout.
+static KYTY_SYSV_ABI char* libc_strcpy(char* dest, const char* src) {
+	return std::strcpy(dest, src);
+}
+
+static KYTY_SYSV_ABI char* libc_strtok(char* str, const char* delim) {
+	return std::strtok(str, delim);
+}
+
+static KYTY_SYSV_ABI char* libc_asctime(const GuestTm* timeptr) {
+	if (timeptr == nullptr) {
+		return nullptr;
+	}
+
+	// asctime writes into a static buffer by contract, and the host one keeps the canonical
+	// "Www Mmm dd hh:mm:ss yyyy\n" layout without Kyty having to reproduce it.
+	const auto host = ToHostTm(*timeptr);
+
+	return std::asctime(&host);
+}
+
+// Dinkumware's std::_Random_device, which seeds the guest's random engines.
+static KYTY_SYSV_ABI uint32_t std_random_device() {
+	static std::random_device device;
+
+	return device();
+}
+
 // An mspace is a named guest heap created by sceLibcMspaceCreate. The allocation itself is
 // forwarded to the host heap and the handle is ignored, so memory handed out through an mspace is
 // not confined to that mspace's address range. sceLibcMspaceCreate is deliberately left unresolved:
@@ -992,6 +1022,11 @@ LIB_DEFINE(InitLibC_1) {
 
 	LIB_FUNC("OJjm-QOIHlI", LibC::libc_mspace_malloc);
 	LIB_FUNC("Vla-Z+eXlxo", LibC::libc_mspace_free);
+
+	LIB_FUNC("kiZSXIWd9vg", LibC::libc_strcpy);
+	LIB_FUNC("oVkZ8W8-Q8A", LibC::libc_strtok);
+	LIB_FUNC("jT3xiGpA3B4", LibC::libc_asctime);
+	LIB_FUNC("Nmtr628eA3A", LibC::std_random_device);
 }
 
 } // namespace LibC

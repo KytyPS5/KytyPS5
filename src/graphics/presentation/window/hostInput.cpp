@@ -388,6 +388,11 @@ void HostInputToggleMouseToJoystick() {
 	LOGF("Mouse to right stick: enabled (F7 to release)\n");
 }
 
+/**
+ * @brief Update the mouse-driven right stick when its next poll is due.
+ * @param now_ms Current SDL tick count in milliseconds.
+ * @return Milliseconds until the next mouse poll.
+ */
 int PollMouse(uint64_t now_ms) {
 	if (now_ms < g_mouse.next_poll) {
 		return static_cast<int>(g_mouse.next_poll - now_ms);
@@ -407,6 +412,14 @@ int PollMouse(uint64_t now_ms) {
 	return MOUSE_POLL_INTERVAL_MS;
 }
 
+/**
+ * @brief Wait for input while allowing periodic main-thread task processing.
+ *
+ * Uses the shorter of the main-task wait limit and any active mouse-poll
+ * interval. SDL errors are fatal; an ordinary timeout returns to the caller.
+ * @param event Non-null output buffer for the received SDL event.
+ * @return True when an event is received, or false when the wait times out.
+ */
 bool HostInputWaitEvent(SDL_Event* event) {
 	// Return periodically so the main loop can drain queued cross-thread work
 	// even if the backend misses the SDL_PushEvent wakeup. A presentation thread

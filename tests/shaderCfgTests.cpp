@@ -9986,7 +9986,7 @@ void TestMeshInputAssembly() {
   }
 }
 
-void TestMeshWave32Passthrough() {
+void TestMeshPassthrough(uint32_t wave_size) {
   using namespace ShaderRecompiler;
   using namespace ShaderRecompiler::IR;
   const uint32_t shader[] = {
@@ -9998,7 +9998,7 @@ void TestMeshWave32Passthrough() {
   };
   ShaderVertexInputInfo input{};
   input.logical_stage = ShaderType::Mesh;
-  input.mesh.wave_size = 32;
+  input.mesh.wave_size = wave_size;
   input.mesh.host_subgroup_size = 32;
   input.mesh.threads_num[0] = 64;
   input.mesh.threads_num[1] = input.mesh.threads_num[2] = 1;
@@ -10010,15 +10010,15 @@ void TestMeshWave32Passthrough() {
   input.mesh.passthrough_alloc = true;
   CompileOptions options{};
   options.stage = ShaderType::Mesh;
-  options.wave_size = 32;
+  options.wave_size = wave_size;
   options.input_info.vertex = &input;
   const auto result = RecompileForTest(shader, options);
   CheckSpirvBinaryValidates(result.spirv);
   const auto source = DisassembleSpirvBinary(result.spirv);
   Check(source.find("OpSetMeshOutputsEXT") != std::string::npos,
-        "wave32 passthrough did not emit mesh output sizing");
+        "mesh passthrough did not emit mesh output sizing");
   Check(source.find("OpGroupNonUniformBallot") == std::string::npos,
-        "wave32 passthrough retained wave64 half-wave ballot");
+        "mesh passthrough retained an unused half-wave ballot");
 
   Decoder::Program decoded;
   CFG::Graph graph;
@@ -10029,7 +10029,7 @@ void TestMeshWave32Passthrough() {
   graph.entry_block = 0;
   Frontend::TranslateOptions translate_options{};
   translate_options.stage = ShaderType::Mesh;
-  translate_options.wave_size = 32;
+  translate_options.wave_size = wave_size;
   translate_options.user_data_count = 0;
   translate_options.input_info.vertex = &input;
   auto program = Frontend::TranslateProgram(decoded, graph, translate_options);
@@ -10038,7 +10038,7 @@ void TestMeshWave32Passthrough() {
     for (auto &inst : *ir_block) {
       if (inst.GetOpcode() == ValueOpcode::MeshDrawParameter) {
         Check(inst.Arg(0).GetType() == Type::U32,
-              "wave32 passthrough draw parameter index is not U32");
+              "mesh passthrough draw parameter index is not U32");
         inst.ReplaceUsesWith(Value(draw[inst.Arg(0).U32()]));
       } else if (inst.GetOpcode() == ValueOpcode::GetBuiltin) {
         const auto kind = static_cast<StageInputKind>(inst.Arg(0).U32());
@@ -10059,23 +10059,24 @@ void TestMeshWave32Passthrough() {
         if (reg == 2 || reg == 3) {
           const auto value = inst.Arg(1).Resolve();
           Check(value.IsImmediate() && value.GetType() == Type::U32,
-                "wave32 passthrough scalar ABI did not fold to a constant");
+                "mesh passthrough scalar ABI did not fold to a constant");
           (reg == 2 ? sgpr2 : sgpr3) = value.U32();
         }
       } else if (inst.GetOpcode() == ValueOpcode::SetVectorRegister &&
                  RegIndex(inst.Arg(0).VectorRegister()) == 0) {
         const auto value = inst.Arg(1).Resolve();
         Check(value.IsImmediate() && value.GetType() == Type::U32,
-              "wave32 passthrough packed indices did not fold to a constant");
+              "mesh passthrough packed indices did not fold to a constant");
         vgpr0 = value.U32();
       }
     }
   }
   Check(sgpr2 == 0x00403000u,
-        "wave32 passthrough did not generate the s2 allocation ABI");
-  Check(sgpr3 == 0x20000103u, "wave32 passthrough changed the s3 wave/count ABI");
+        "mesh passthrough did not generate the s2 allocation ABI");
+  Check(sgpr3 == (wave_size == 64 ? 0x10000103u : 0x20000103u),
+        "mesh passthrough changed the s3 wave/count ABI");
   Check(vgpr0 == (6u | (7u << 10u) | (8u << 20u)),
-        "wave32 passthrough changed packed triangle indices");
+        "mesh passthrough changed packed triangle indices");
 }
 
 void TestNewShaderRecompilerSetpcJumpTable() {
@@ -13662,7 +13663,8 @@ int main() {
   TestMeshExportStorage();
   TestMergedShaderUserDataSnapshot();
   TestMeshInputAssembly();
-  TestMeshWave32Passthrough();
+  TestMeshPassthrough(32);
+  TestMeshPassthrough(64);
   TestEmbeddedFetchPreservesSharedScalarLoad();
   TestEmbeddedVertexFormatSwizzle();
   TestNewShaderRecompilerSetpcJumpTable();

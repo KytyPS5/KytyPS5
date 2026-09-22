@@ -219,6 +219,7 @@ private:
 	std::vector<uint32_t>                 m_image_occurrences;
 	std::unordered_set<uint64_t> m_unrepresentable_textures;
 	std::unordered_set<uint64_t> m_depth_tiled_reports;
+	std::unordered_set<uint64_t> m_clamped_mip_views;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

@@ -571,7 +571,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	const auto width           = static_cast<uint32_t>(descriptor.Width5()) + 1u;
 	const auto height          = static_cast<uint32_t>(descriptor.Height5()) + 1u;
 	const auto base_level      = descriptor.BaseLevel();
-	const auto last_level      = descriptor.LastLevel();
+	auto       last_level      = descriptor.LastLevel();
 	const auto type            = TextureType(descriptor);
 	const bool multisampled    = IsMultisampledTexture(type);
 	const auto max_mip         = resource.r128 ? last_level : descriptor.MaxMip();
@@ -579,11 +579,10 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	// IMAGE_STORE addresses BASE_LEVEL; only IMAGE_STORE_MIP selects other view mips.
 	const bool single_storage_mip =
 	    storage && resource.mip_mode != ShaderRecompiler::IR::ImageMipMode::DynamicStorage;
-	const auto view_levels = multisampled || single_storage_mip
-	                             ? 1u
-	                             : static_cast<uint32_t>(last_level - base_level) + 1u;
-	const auto levels =
-	    multisampled ? 1u : std::max(physical_levels, base_level + view_levels);
+	auto view_levels = multisampled || single_storage_mip
+	                       ? 1u
+	                       : static_cast<uint32_t>(last_level - base_level) + 1u;
+	auto levels = multisampled ? 1u : std::max(physical_levels, base_level + view_levels);
 	const auto tile       = descriptor.TileMode();
 	const bool depth_tile = tile == Prospero::TileMode::kDepth;
 	const bool msaa_tile  = depth_tile || tile == Prospero::TileMode::kRenderTarget;
@@ -630,10 +629,24 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		    width, height, volume ? depth : 1u, physical_levels, image_layers};
 		// Texture mip views take precedence over the resource count, but must keep its storage layout.
 		if (!TextureViewPreservesMipLayout(physical, levels)) {
-			EXIT("unsupported texture mip view changes physical layout: base=%u last=%u max=%u "
-			     "extent=%ux%ux%u tile=%u\n",
-			     base_level, last_level, max_mip, width, height, depth,
-			     static_cast<uint32_t>(tile));
+			if (base_level > max_mip) {
+				EXIT("unsupported texture mip view past the physical mips: base=%u last=%u max=%u "
+				     "extent=%ux%ux%u tile=%u\n",
+				     base_level, last_level, max_mip, width, height, depth,
+				     static_cast<uint32_t>(tile));
+			}
+			if (m_clamped_mip_views.insert(address).second) {
+				LOGF("TextureCache: mip view past the physical mips changes the layout, clamped to "
+				     "the physical mips: base=%u last=%u max=%u extent=%ux%ux%u tile=%u "
+				     "addr=0x%016" PRIx64 "\n",
+				     base_level, last_level, max_mip, width, height, depth,
+				     static_cast<uint32_t>(tile), address);
+			}
+			last_level  = static_cast<decltype(last_level)>(max_mip);
+			levels      = physical_levels;
+			view_levels = single_storage_mip
+			                  ? 1u
+			                  : static_cast<uint32_t>(last_level - base_level) + 1u;
 		}
 	}
 	uint32_t      pitch = 0;

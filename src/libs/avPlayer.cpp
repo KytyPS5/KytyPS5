@@ -852,11 +852,15 @@ public:
 		emit_event(stop_event, AVPLAYER_EVENT_STATE_STOP);
 		return 0;
 	}
-	void Pause() {
+	int Pause() {
 		std::scoped_lock lifecycle_lock(lifecycle_mutex);
 		std::lock_guard  lock(mutex);
+		if (state != State::Playing) {
+			return AVPLAYER_ERROR_OPERATION_FAILED;
+		}
 		paused     = true;
 		pause_time = std::chrono::steady_clock::now();
+		return 0;
 	}
 	void Resume() {
 		std::scoped_lock lifecycle_lock(lifecycle_mutex);
@@ -890,6 +894,9 @@ public:
 		bool             was_paused = false;
 		{
 			std::lock_guard lock(mutex);
+			if (state != State::Playing) {
+				return AVPLAYER_ERROR_OPERATION_FAILED;
+			}
 			was_paused = paused;
 		}
 		return StartImpl(ms, was_paused, true);
@@ -1682,6 +1689,7 @@ struct AvPlayerInternal {
 	AvPlayerPostInitData     post_init {};
 	bool                     auto_start        = false;
 	int32_t                  video_buffers     = 2;
+	uint32_t                 sync_mode         = 0;
 	uint32_t                 start_bandwidth   = 0;
 	uint32_t                 minimum_bandwidth = 0;
 	uint32_t                 maximum_bandwidth = 0;
@@ -1730,6 +1738,7 @@ static int add_source(AvPlayerInternal* h, const std::string& filename, AvPlayer
 	if (auto rc = s->Init(filename, type); rc < 0) {
 		return rc;
 	}
+	s->SetSync(h->sync_mode);
 	h->source = std::move(s);
 	emit_event(h->event, AVPLAYER_EVENT_STATE_READY);
 	if (h->auto_start) {
@@ -1915,9 +1924,11 @@ int KYTY_SYSV_ABI AvPlayerPause(AvPlayerInternal* h) {
 	if (h == nullptr || h->source == nullptr) {
 		return AVPLAYER_ERROR_INVALID_PARAMS;
 	}
-	h->source->Pause();
-	emit_event(h->event, AVPLAYER_EVENT_STATE_PAUSE);
-	return 0;
+	auto rc = h->source->Pause();
+	if (rc == 0) {
+		emit_event(h->event, AVPLAYER_EVENT_STATE_PAUSE);
+	}
+	return rc;
 }
 int KYTY_SYSV_ABI AvPlayerResume(AvPlayerInternal* h) {
 	PRINT_NAME();
@@ -1951,13 +1962,16 @@ int KYTY_SYSV_ABI AvPlayerSetTrickSpeed(AvPlayerInternal* h, int32_t trick_speed
 }
 int KYTY_SYSV_ABI AvPlayerSetAvSyncMode(AvPlayerInternal* h, uint32_t sync_mode) {
 	PRINT_NAME();
-	if (h == nullptr || h->source == nullptr) {
+	if (h == nullptr) {
 		return AVPLAYER_ERROR_INVALID_PARAMS;
 	}
 	if (sync_mode > 1) {
 		return AVPLAYER_ERROR_NOT_SUPPORTED;
 	}
-	h->source->SetSync(sync_mode);
+	h->sync_mode = sync_mode;
+	if (h->source != nullptr) {
+		h->source->SetSync(sync_mode);
+	}
 	return 0;
 }
 int KYTY_SYSV_ABI AvPlayerSetAvailableBandwidth(AvPlayerInternal* h, uint32_t start_bandwidth,

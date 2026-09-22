@@ -253,12 +253,12 @@ void RenderExecutor::ExecutePerVertexPrototype(uint64_t submit_id, CommandBuffer
 	                    {}, 1, &capture_barrier, 0, nullptr, 0, nullptr);
 
 	// Step 3: Graphics replay pass
-	const auto rendering =
-	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
-	                         std::optional<PreparedBindings> {pixel_bindings});
 	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(
 	    {state.color_info, state.color_count}, state.depth_info, {state.vertex_info.data(), 1},
 	    buffer, &state.ps_input_info, topology, false, programs->graphics);
+	const auto rendering =
+	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
+	                         std::optional<PreparedBindings> {pixel_bindings});
 	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
 	cmd = buffer.Handle();
 	cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipeline.pipeline_layout, 1, 1,

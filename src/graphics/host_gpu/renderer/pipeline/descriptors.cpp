@@ -1230,19 +1230,38 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 
 	if (!m_descriptor_writes.empty()) {
 		EXIT_IF(pipeline.descriptor_set_layout == nullptr);
-		if (pipeline.uses_push_descriptors) {
-			vk_buffer.pushDescriptorSetKHR(pipeline_bind_point, pipeline.pipeline_layout, 0,
-			                               static_cast<uint32_t>(m_descriptor_writes.size()),
-			                               m_descriptor_writes.data());
-		} else {
-			const auto set = m_context.GetDescriptorHeap().Commit(pipeline.descriptor_set_layout);
-			for (auto& write: m_descriptor_writes) {
-				write.dstSet = set;
+		// Stable: each write's pBufferInfo/pImageInfo point into storage that must not move.
+		const auto pixel_begin = std::stable_partition(
+		    m_descriptor_writes.begin(), m_descriptor_writes.end(),
+		    [](const vk::WriteDescriptorSet& write) {
+			    return ShaderRecompiler::IR::NativeDescriptorSetForBinding(write.dstBinding) == 0u;
+		    });
+		const auto vertex_count =
+		    static_cast<uint32_t>(std::distance(m_descriptor_writes.begin(), pixel_begin));
+		const auto pixel_count =
+		    static_cast<uint32_t>(std::distance(pixel_begin, m_descriptor_writes.end()));
+		EXIT_IF(pixel_count != 0 && pipeline.pixel_descriptor_set_layout == nullptr);
+
+		// Only set 0 can carry the push flag.
+		auto& heap = m_context.GetDescriptorHeap();
+		if (vertex_count != 0) {
+			if (pipeline.uses_push_descriptors) {
+				vk_buffer.pushDescriptorSetKHR(pipeline_bind_point, pipeline.pipeline_layout, 0,
+				                               vertex_count, m_descriptor_writes.data());
+			} else {
+				const auto set = heap.Commit(pipeline.descriptor_set_layout);
+				for (uint32_t i = 0; i < vertex_count; i++) {
+					m_descriptor_writes[i].dstSet = set;
+				}
+				m_context.GetGraphics().device.updateDescriptorSets(
+				    vertex_count, m_descriptor_writes.data(), 0, nullptr);
+				vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout, 0, 1,
+				                             &set, 0, nullptr);
 			}
-			m_context.GetGraphics().device.updateDescriptorSets(
-			    static_cast<uint32_t>(m_descriptor_writes.size()), m_descriptor_writes.data(), 0,
-			    nullptr);
-			vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout, 0, 1, &set,
+		}
+		if (pixel_count != 0) {
+			for (uint32_t i = 0; i < pixel_count; i++) {
+			}
 			                             0, nullptr);
 		}
 	}

@@ -507,41 +507,61 @@ struct RenderExecutorTestAccess {
   static PipelineCache::Pipeline
   CreateDescriptorPipeline(RenderExecutor &executor,
                            std::span<PreparedBindings *const> stages) {
-    std::vector<vk::DescriptorSetLayoutBinding> layout_bindings;
+    // One list per descriptor set: set 0 for the vertex, mesh or compute stage,
+    // set 1 for the image heap, set 2 for pixel.
+    std::vector<vk::DescriptorSetLayoutBinding>
+        layout_bindings[ShaderRecompiler::IR::NativeDescriptorSetCount];
     bool compute = false;
+    bool has_pixel = false;
     for (const auto *prepared : stages) {
       const auto &program = *prepared->runtime->program;
       compute |= program.stage == ShaderType::Compute;
+      has_pixel |= program.stage == ShaderType::Pixel;
       const auto shader_stage = program.stage == ShaderType::Vertex
                                     ? vk::ShaderStageFlagBits::eVertex
                                 : program.stage == ShaderType::Pixel
                                     ? vk::ShaderStageFlagBits::eFragment
                                     : vk::ShaderStageFlagBits::eCompute;
+      const auto set = ShaderRecompiler::IR::NativeDescriptorSet(program.stage);
       for (auto mask = program.bindings.descriptor_mask; mask != 0; mask &= mask - 1) {
         const auto index = std::countr_zero(mask);
         const auto kind = static_cast<ShaderRecompiler::IR::DescriptorBindingKind>(index);
-        layout_bindings.push_back(
+        layout_bindings[set].push_back(
             {ShaderRecompiler::IR::NativeBinding(program.stage, kind),
              NativeDescriptorType(kind), program.bindings.descriptor_counts[index], shader_stage});
       }
     }
-    vk::DescriptorSetLayoutCreateInfo descriptor_info{};
-    descriptor_info.sType = vk::StructureType::eDescriptorSetLayoutCreateInfo;
-    descriptor_info.flags =
-        vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
-    descriptor_info.bindingCount =
-        static_cast<uint32_t>(layout_bindings.size());
-    descriptor_info.pBindings = layout_bindings.data();
     PipelineCache::Pipeline pipeline{};
     auto &device = executor.m_context.GetGraphics().device;
-    EXIT_IF(device.createDescriptorSetLayout(&descriptor_info, nullptr,
-                                             &pipeline.descriptor_set_layout) !=
-            vk::Result::eSuccess);
+    const auto make_set = [&](uint32_t set) {
+      vk::DescriptorSetLayoutCreateInfo descriptor_info{};
+      descriptor_info.sType = vk::StructureType::eDescriptorSetLayoutCreateInfo;
+      descriptor_info.flags =
+          vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
+      descriptor_info.bindingCount =
+          static_cast<uint32_t>(layout_bindings[set].size());
+      descriptor_info.pBindings = layout_bindings[set].data();
+      vk::DescriptorSetLayout layout = nullptr;
+      EXIT_IF(device.createDescriptorSetLayout(&descriptor_info, nullptr, &layout) !=
+              vk::Result::eSuccess);
+      return layout;
+    };
+    pipeline.descriptor_set_layout = make_set(0);
+    if (has_pixel) {
+      pipeline.pixel_descriptor_set_layout = make_set(
+          ShaderRecompiler::IR::NativeDescriptorSet(ShaderType::Pixel));
+    }
+    const vk::DescriptorSetLayout
+        set_layouts[ShaderRecompiler::IR::NativeDescriptorSetCount] = {
+            pipeline.descriptor_set_layout,
+            executor.m_context.GetGraphics().image_heap_layout,
+            pipeline.pixel_descriptor_set_layout};
 
     vk::PipelineLayoutCreateInfo pipeline_info{};
     pipeline_info.sType = vk::StructureType::ePipelineLayoutCreateInfo;
-    pipeline_info.setLayoutCount = 1;
-    pipeline_info.pSetLayouts = &pipeline.descriptor_set_layout;
+    pipeline_info.setLayoutCount =
+        has_pixel ? ShaderRecompiler::IR::NativeDescriptorSetCount : 1u;
+    pipeline_info.pSetLayouts = set_layouts;
     const vk::PushConstantRange push_range {
         compute ? vk::ShaderStageFlags {vk::ShaderStageFlagBits::eCompute}
                 : vk::ShaderStageFlags {vk::ShaderStageFlagBits::eVertex |
@@ -564,7 +584,7 @@ struct RenderExecutorTestAccess {
     const auto bind_point = bindings.runtime->program->stage == ShaderType::Compute
                                 ? vk::PipelineBindPoint::eCompute
                                 : vk::PipelineBindPoint::eGraphics;
-    executor.CommitBindings(buffer, bind_point, pipeline, stages);
+    EXIT_IF(!executor.CommitBindings(buffer, bind_point, pipeline, stages));
     return pipeline;
   }
 
@@ -574,8 +594,8 @@ struct RenderExecutorTestAccess {
                                                 PreparedBindings &pixel) {
     std::array<PreparedBindings *, 2> stages{&vertex, &pixel};
     auto pipeline = CreateDescriptorPipeline(executor, stages);
-    executor.CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline,
-                            stages);
+    EXIT_IF(!executor.CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline,
+                                     stages));
     return pipeline;
   }
 
@@ -583,8 +603,8 @@ struct RenderExecutorTestAccess {
                              const PipelineCache::Pipeline &pipeline,
                              PreparedBindings &vertex, PreparedBindings &pixel) {
     std::array<PreparedBindings *, 2> stages{&vertex, &pixel};
-    executor.CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline,
-                            stages);
+    EXIT_IF(!executor.CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline,
+                                     stages));
   }
 
   static void DestroyDescriptorPipelines(
@@ -594,6 +614,8 @@ struct RenderExecutorTestAccess {
     for (const auto &pipeline : pipelines) {
       device.destroyPipelineLayout(pipeline.pipeline_layout, nullptr);
       device.destroyDescriptorSetLayout(pipeline.descriptor_set_layout,
+                                        nullptr);
+      device.destroyDescriptorSetLayout(pipeline.pixel_descriptor_set_layout,
                                         nullptr);
     }
   }

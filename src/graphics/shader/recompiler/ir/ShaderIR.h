@@ -403,6 +403,21 @@ constexpr uint32_t NativePushConstantSize = sizeof(PushData);
 	       group * static_cast<uint32_t>(DescriptorBindingKind::Count);
 }
 
+// The pixel stage has its own set, so a fragment library's layout depends on the pixel shader
+// alone. It follows the image heap's set; a graphics layout holds at most these sets.
+constexpr uint32_t PixelDescriptorSet       = ImageHeapSet + 1u;
+constexpr uint32_t NativeDescriptorSetCount = PixelDescriptorSet + 1u;
+
+[[nodiscard]] constexpr uint32_t NativeDescriptorSet(ShaderType stage) {
+	return stage == ShaderType::Pixel ? PixelDescriptorSet : 0u;
+}
+
+[[nodiscard]] constexpr uint32_t NativeDescriptorSetForBinding(uint32_t native_binding) {
+	return native_binding / static_cast<uint32_t>(DescriptorBindingKind::Count) == 1u
+	           ? PixelDescriptorSet
+	           : 0u;
+}
+
 [[nodiscard]] constexpr ImageResourceClass ImageBindingResourceClass(DescriptorBindingKind kind) {
 	const auto value = static_cast<uint32_t>(kind);
 	if (value >= FirstImageBinding && value < FirstStorageImageBinding) {

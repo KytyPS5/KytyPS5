@@ -4,6 +4,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/threads.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/shader.h"
@@ -44,6 +45,9 @@ struct PipelineStaticParameters {
 	uint32_t                   samples                  = 1;
 	bool                       sample_shading_enable    = false;
 	bool                       alpha_to_coverage_enable = false;
+	bool                       stencil_test_enable      = false;
+	PipelineStencilStaticState stencil_front;
+	PipelineStencilStaticState stencil_back;
 	uint32_t                   color_mask[RENDER_COLOR_ATTACHMENTS_MAX]           = {};
 	bool                       cull_front                                         = false;
 	bool                       cull_back                                          = false;
@@ -67,7 +71,50 @@ struct PipelineStaticParameters {
 static_assert(std::is_trivially_copyable_v<PipelineStaticParameters>);
 static_assert(std::is_standard_layout_v<PipelineStaticParameters>);
 static_assert(alignof(PipelineStaticParameters) == 1);
-static_assert(sizeof(PipelineStaticParameters) == 117);
+static_assert(sizeof(PipelineStaticParameters) == 150);
+
+struct FragmentLibraryKey {
+	// 0 for a depth-only pipeline, whose fragment subset has no shader stage.
+	uint64_t ps_shader_id = 0;
+	// The layout's push-constant stages, which every library of one pipeline must agree on.
+	uint32_t                   push_stages              = 0;
+	uint32_t                   samples                  = 1;
+	bool                       sample_shading_enable    = false;
+	bool                       alpha_to_coverage_enable = false;
+	bool                       stencil_test_enable      = false;
+	PipelineStencilStaticState stencil_front;
+	PipelineStencilStaticState stencil_back;
+	vk::Format                 depth_format   = vk::Format::eUndefined;
+	vk::Format                 stencil_format = vk::Format::eUndefined;
+
+	bool operator==(const FragmentLibraryKey& other) const noexcept;
+};
+
+struct FragmentLibraryKeyHash {
+	std::size_t operator()(const FragmentLibraryKey& key) const noexcept;
+};
+
+// Rect-list tessellation stages are generated from the pixel shader's inputs.
+struct PreRasterLibraryKey {
+	std::array<uint64_t, 3> vertex_shader_ids {};
+	uint64_t                rect_list_ps_shader_id = 0;
+	uint32_t                push_stages            = 0;
+	uint32_t                patch_control_points   = 0;
+	bool                    rect_list              = false;
+	bool                    negative_one_to_one    = false;
+	bool                    depth_clip_enable      = true;
+	bool                    cull_front             = false;
+	bool                    cull_back              = false;
+	bool                    face                   = false;
+	bool                    provoking_vtx_last     = false;
+	vk::PolygonMode         polygon_mode           = vk::PolygonMode::eFill;
+
+	bool operator==(const PreRasterLibraryKey& other) const noexcept = default;
+};
+
+struct PreRasterLibraryKeyHash {
+	std::size_t operator()(const PreRasterLibraryKey& key) const noexcept;
+};
 
 struct PipelineRenderingState {
 	std::array<vk::Format, RENDER_COLOR_ATTACHMENTS_MAX> color_formats {};
@@ -105,6 +152,40 @@ struct ShaderProgram {
 	explicit operator bool() const { return id != 0 && module != nullptr; }
 };
 
+template <typename Key, typename KeyHash>
+class PipelineLibraryCache {
+public:
+	explicit PipelineLibraryCache(GraphicContext& graphics): m_graphics(graphics) {}
+	~PipelineLibraryCache();
+	KYTY_CLASS_NO_COPY(PipelineLibraryCache);
+
+	struct Entry {
+		vk::Pipeline            library    = nullptr;
+		vk::PipelineLayout      layout     = nullptr;
+		vk::DescriptorSetLayout set_layout = nullptr;
+	};
+
+	[[nodiscard]] const Entry* Find(const Key& key);
+	// A race loser's entry is destroyed; returns the published one.
+	const Entry* Insert(const Key& key, const Entry& entry);
+
+private:
+	GraphicContext&                                          m_graphics;
+	std::unordered_map<Key, std::unique_ptr<Entry>, KeyHash> m_entries;
+	Common::Mutex                                            m_mutex;
+};
+
+using FragmentLibraryCache  = PipelineLibraryCache<FragmentLibraryKey, FragmentLibraryKeyHash>;
+using PreRasterLibraryCache = PipelineLibraryCache<PreRasterLibraryKey, PreRasterLibraryKeyHash>;
+
+struct PipelineLibraries {
+	explicit PipelineLibraries(GraphicContext& graphics)
+	    : fragment(graphics), pre_raster(graphics) {}
+
+	FragmentLibraryCache  fragment;
+	PreRasterLibraryCache pre_raster;
+};
+
 // The owning renderer serializes access, including saves while the GPU is running.
 class PipelineCache {
 public:
@@ -117,11 +198,19 @@ public:
 	[[nodiscard]] vk::PipelineCache DriverCache() const { return m_driver_cache; }
 
 	struct Pipeline {
-		vk::PipelineLayout      pipeline_layout       = nullptr;
-		vk::Pipeline            pipeline              = nullptr;
-		vk::DescriptorSetLayout descriptor_set_layout = nullptr;
-		bool                    uses_push_descriptors = false;
-		bool                    uses_image_heap       = false;
+		vk::PipelineLayout pipeline_layout = nullptr;
+		vk::Pipeline       pipeline        = nullptr;
+		// Owned by this pipeline; the shared pre-raster/fragment libraries live in
+		// PipelineLibraries.
+		vk::Pipeline library_vertex_input    = nullptr;
+		vk::Pipeline library_fragment_output = nullptr;
+		// Set 0: vertex, mesh or compute stage. Set 1: image heap. Set 2: pixel stage.
+		vk::DescriptorSetLayout descriptor_set_layout       = nullptr;
+		vk::DescriptorSetLayout pixel_descriptor_set_layout = nullptr;
+		// Only set 0 can be pushed: Vulkan allows one push-descriptor set layout per pipeline
+		// layout.
+		bool     uses_push_descriptors = false;
+		bool     uses_image_heap       = false;
 	};
 
 	struct GraphicsPrograms {
@@ -181,8 +270,9 @@ private:
 
 	GraphicContext&               m_graphics;
 	std::unique_ptr<ProgramCache> m_program_cache;
-	vk::PipelineCache             m_driver_cache = nullptr;
-	std::filesystem::path         m_driver_cache_path;
+	std::unique_ptr<PipelineLibraries>    m_libraries;
+	vk::PipelineCache                     m_driver_cache = nullptr;
+	std::filesystem::path                 m_driver_cache_path;
 	std::chrono::steady_clock::time_point m_next_driver_cache_save;
 	bool                                  m_driver_cache_dirty = false;
 	uint64_t                              m_build_hash         = 0;
@@ -204,6 +294,7 @@ private:
 };
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);
+// Null `libraries` builds a monolithic pipeline.
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const PipelineRenderingState&          rendering,
                             const PipelineVertexInputState&        vertex_input,
@@ -211,7 +302,6 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
                             const ShaderPixelInputInfo*            ps_input_info,
                             const PipelineCache::GraphicsPrograms& programs,
                             const PipelineStaticParameters&        static_params,
-                            vk::PipelineCache                      driver_cache);
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const ShaderComputeInputInfo& input_info,
                             vk::ShaderModule compute_module, vk::PipelineCache driver_cache);

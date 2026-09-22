@@ -35,6 +35,8 @@ struct GraphicContext {
 	// bool fp64_denorm_preserve = false; // Temporarily disabled.
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                               provoking_vertex_last_enabled         = false;
+	bool                               pipeline_library_enabled               = false;
+	bool                               pipeline_library_fast_linking          = false;
 	bool                               maintenance8_enabled                  = false;
 	bool                               conditional_rendering_enabled         = false;
 	bool                               occlusion_queries_enabled             = false;

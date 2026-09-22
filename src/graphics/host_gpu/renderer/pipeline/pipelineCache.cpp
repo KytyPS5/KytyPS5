@@ -344,8 +344,7 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourcePlan           resource_plan;
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
-		std::vector<Permutation>                    permutations;
-		bool                                       skip_dispatch = false;
+		std::vector<Permutation>                        permutations;
 	};
 
 	static const char* StageShortName(ShaderType stage) {
@@ -693,12 +692,63 @@ struct PipelineCache::ProgramCache {
 	uint64_t                                                    next_shader_id = 0;
 };
 
+template <typename Key, typename KeyHash>
+PipelineLibraryCache<Key, KeyHash>::~PipelineLibraryCache() {
+	Common::LockGuard lock(m_mutex);
+	for (const auto& [key, entry]: m_entries) {
+		(void)key;
+		m_graphics.device.destroyPipeline(entry->library, nullptr);
+		m_graphics.device.destroyPipelineLayout(entry->layout, nullptr);
+		m_graphics.device.destroyDescriptorSetLayout(entry->set_layout, nullptr);
+	}
+	m_entries.clear();
+}
+
+template <typename Key, typename KeyHash>
+const typename PipelineLibraryCache<Key, KeyHash>::Entry*
+PipelineLibraryCache<Key, KeyHash>::Find(const Key& key) {
+	Common::LockGuard lock(m_mutex);
+	const auto        iter = m_entries.find(key);
+	return iter == m_entries.end() ? nullptr : iter->second.get();
+}
+
+template <typename Key, typename KeyHash>
+const typename PipelineLibraryCache<Key, KeyHash>::Entry*
+PipelineLibraryCache<Key, KeyHash>::Insert(const Key& key, const Entry& entry) {
+	Common::LockGuard lock(m_mutex);
+	const auto        iter = m_entries.find(key);
+	if (iter != m_entries.end()) {
+		m_graphics.device.destroyPipeline(entry.library, nullptr);
+		m_graphics.device.destroyPipelineLayout(entry.layout, nullptr);
+		m_graphics.device.destroyDescriptorSetLayout(entry.set_layout, nullptr);
+		return iter->second.get();
+	}
+	auto [inserted_iter, inserted] = m_entries.emplace(key, std::make_unique<Entry>(entry));
+	EXIT_IF(!inserted);
+	return inserted_iter->second.get();
+}
+
+template class PipelineLibraryCache<FragmentLibraryKey, FragmentLibraryKeyHash>;
+template class PipelineLibraryCache<PreRasterLibraryKey, PreRasterLibraryKeyHash>;
+
 PipelineCache::PipelineCache(GraphicContext&                         graphics,
                              ShaderRecompiler::IR::ImageHeapSource* image_heap)
     : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics, image_heap)),
       m_next_driver_cache_save(std::chrono::steady_clock::now() + DriverCacheSaveInterval) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
+	if (graphics.pipeline_library_fast_linking) {
+		m_libraries = std::make_unique<PipelineLibraries>(graphics);
+	}
+}
+
+void PipelineCache::DestroyPipelineObjects(const Pipeline& pipeline) {
+	m_graphics.device.destroyPipeline(pipeline.library_vertex_input, nullptr);
+	m_graphics.device.destroyPipeline(pipeline.library_fragment_output, nullptr);
+	m_graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
+	m_graphics.device.destroyPipelineLayout(pipeline.pipeline_layout, nullptr);
+	m_graphics.device.destroyDescriptorSetLayout(pipeline.descriptor_set_layout, nullptr);
+	m_graphics.device.destroyDescriptorSetLayout(pipeline.pixel_descriptor_set_layout, nullptr);
 }
 
 PipelineCache::~PipelineCache() {
@@ -713,6 +763,8 @@ PipelineCache::~PipelineCache() {
 	};
 	destroy(m_graphics_pipelines);
 	destroy(m_compute_pipelines);
+	// After the pipelines, because a linked pipeline references its shared libraries.
+	m_libraries.reset();
 	if (m_driver_cache != nullptr) {
 		m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
 	}
@@ -1086,6 +1138,61 @@ bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other)
 	return std::memcmp(this, &other, sizeof(*this)) == 0;
 }
 
+// Field by field: the struct has padding.
+bool FragmentLibraryKey::operator==(const FragmentLibraryKey& other) const noexcept {
+	return ps_shader_id == other.ps_shader_id && push_stages == other.push_stages &&
+	       samples == other.samples && sample_shading_enable == other.sample_shading_enable &&
+	       alpha_to_coverage_enable == other.alpha_to_coverage_enable &&
+	       stencil_test_enable == other.stencil_test_enable &&
+	       std::memcmp(&stencil_front, &other.stencil_front, sizeof(stencil_front)) == 0 &&
+	       std::memcmp(&stencil_back, &other.stencil_back, sizeof(stencil_back)) == 0 &&
+	       depth_format == other.depth_format && stencil_format == other.stencil_format;
+}
+
+static void MixFragmentKey(std::size_t& hash, std::size_t value) {
+	hash ^= value + static_cast<std::size_t>(0x9e3779b97f4a7c15ull) + (hash << 6u) + (hash >> 2u);
+}
+
+std::size_t FragmentLibraryKeyHash::operator()(const FragmentLibraryKey& key) const noexcept {
+	std::size_t hash = 0;
+	MixFragmentKey(hash, static_cast<std::size_t>(key.ps_shader_id));
+	MixFragmentKey(hash, key.push_stages);
+	MixFragmentKey(hash, key.samples);
+	MixFragmentKey(hash, static_cast<std::size_t>(key.sample_shading_enable) |
+	                         (static_cast<std::size_t>(key.stencil_test_enable) << 1u) |
+	                         (static_cast<std::size_t>(key.alpha_to_coverage_enable) << 2u));
+	const auto* front = reinterpret_cast<const uint8_t*>(&key.stencil_front);
+	for (std::size_t i = 0; i < sizeof(key.stencil_front); i++) {
+		MixFragmentKey(hash, front[i]);
+	}
+	const auto* back = reinterpret_cast<const uint8_t*>(&key.stencil_back);
+	for (std::size_t i = 0; i < sizeof(key.stencil_back); i++) {
+		MixFragmentKey(hash, back[i]);
+	}
+	MixFragmentKey(hash, static_cast<std::size_t>(key.depth_format));
+	MixFragmentKey(hash, static_cast<std::size_t>(key.stencil_format));
+	return hash;
+}
+
+std::size_t PreRasterLibraryKeyHash::operator()(const PreRasterLibraryKey& key) const noexcept {
+	std::size_t hash = 0;
+	for (const auto id: key.vertex_shader_ids) {
+		MixFragmentKey(hash, static_cast<std::size_t>(id));
+	}
+	MixFragmentKey(hash, static_cast<std::size_t>(key.rect_list_ps_shader_id));
+	MixFragmentKey(hash, key.push_stages);
+	MixFragmentKey(hash, key.patch_control_points);
+	MixFragmentKey(hash, static_cast<std::size_t>(key.rect_list) |
+	                         (static_cast<std::size_t>(key.negative_one_to_one) << 1u) |
+	                         (static_cast<std::size_t>(key.depth_clip_enable) << 2u) |
+	                         (static_cast<std::size_t>(key.cull_front) << 3u) |
+	                         (static_cast<std::size_t>(key.cull_back) << 4u) |
+	                         (static_cast<std::size_t>(key.face) << 5u) |
+	                         (static_cast<std::size_t>(key.provoking_vtx_last) << 6u));
+	MixFragmentKey(hash, static_cast<std::size_t>(key.polygon_mode));
+	return hash;
+}
+
 PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
     std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
     std::span<const ShaderVertexInputInfo> vertex_info, CommandBuffer& command,
@@ -1280,6 +1387,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
 		CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vertex_info,
+		                       ps_input_info, programs, static_params, m_driver_cache,
 	}
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 

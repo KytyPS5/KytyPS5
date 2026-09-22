@@ -8,7 +8,7 @@
 namespace Libs::Graphics {
 namespace {
 
-constexpr uint32_t   DescriptorHeapCount = 1024;
+constexpr uint32_t   DescriptorHeapCount = 2048;
 constexpr std::array DescriptorPoolSizes = {
     vk::DescriptorPoolSize {vk::DescriptorType::eStorageBuffer, 16384},
     vk::DescriptorPoolSize {vk::DescriptorType::eSampledImage, 262144},

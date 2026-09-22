@@ -279,7 +279,9 @@ void DefineDescriptors(EmitterState& state) {
 			const auto variable =
 			    state.builder.DefineGlobalVariable(TypePointer(state, storage, type), storage);
 			state.builder.AddName(variable, name);
-			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationDescriptorSet, 0);
+			// Set and binding come from the functions the host writes descriptors through.
+			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationDescriptorSet,
+			                            IR::NativeDescriptorSet(state.program.stage));
 			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBinding,
 			                            IR::NativeBinding(state.program.stage, kind));
 			return variable;
@@ -350,11 +352,14 @@ void DefineDescriptors(EmitterState& state) {
 			default: {
 				EXIT_IF(IR::ImageBindingResourceClass(kind) ==
 				        IR::ImageResourceClass::None);
+				EXIT_IF(IR::ImageBindingResourceClass(kind) == IR::ImageResourceClass::None);
 				auto& definition = state.images[IR::ImageBindingIndex(kind)];
 				DefineImageArray(state, definition, *image_types[IR::ImageBindingIndex(kind)],
-				                 counts[index], 0u, IR::NativeBinding(state.program.stage, kind));
-				state.builder.AddName(definition.variable,
-				                      ("image_" + std::to_string(static_cast<uint32_t>(kind))).c_str());
+				                 counts[index], IR::NativeDescriptorSet(state.program.stage),
+				                 IR::NativeBinding(state.program.stage, kind));
+				state.builder.AddName(
+				    definition.variable,
+				    ("image_" + std::to_string(static_cast<uint32_t>(kind))).c_str());
 				break;
 			}
 		}

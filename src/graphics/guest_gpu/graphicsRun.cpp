@@ -912,17 +912,6 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 	if (!indexed) {
 		DrawIndirectArgs args {};
 		std::memcpy(&args, args_addr, sizeof(args));
-		if (args.instance_count != 1u || args.start_vertex_location != 0u ||
-		    args.start_instance_location != 0u) {
-			static std::atomic<uint32_t> log_count {0};
-			if (log_count.fetch_add(1) < 64) {
-				LOGF("\t warning: partial DrawIndirect args: vertex_count=%" PRIu32
-				     ", instance_count=%" PRIu32 ", start_vertex=%" PRIu32
-				     ", start_instance=%" PRIu32 "\n",
-				     args.vertex_count_per_instance, args.instance_count,
-				     args.start_vertex_location, args.start_instance_location);
-			}
-		}
 		m_num_instances = args.instance_count;
 		DrawIndexAuto({.vertex_count   = args.vertex_count_per_instance,
 		               .instance_count = args.instance_count,
@@ -934,16 +923,6 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 
 	DrawIndexedIndirectArgs args {};
 	std::memcpy(&args, args_addr, sizeof(args));
-	if (args.base_vertex_location != 0u || args.start_instance_location != 0u) {
-		static std::atomic<uint32_t> log_count {0};
-		if (log_count.fetch_add(1) < 64) {
-			LOGF("\t warning: partial DrawIndexIndirect args: index_count=%" PRIu32
-			     ", instance_count=%" PRIu32 ", start_index=%" PRIu32 ", base_vertex=%" PRIu32
-			     ", start_instance=%" PRIu32 "\n",
-			     args.index_count_per_instance, args.instance_count, args.start_index_location,
-			     args.base_vertex_location, args.start_instance_location);
-		}
-	}
 
 	uint64_t index_size = 0;
 	switch (m_index_type_and_size) {
@@ -1005,17 +984,6 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 
 		if (!indexed) {
 			auto* args = reinterpret_cast<const DrawIndirectArgs*>(args_addr);
-			if (args->instance_count != 1u || args->start_vertex_location != 0u ||
-			    args->start_instance_location != 0u) {
-				static std::atomic<uint32_t> log_count {0};
-				if (log_count.fetch_add(1) < 64) {
-					LOGF("\t warning: partial DrawIndirectMulti args[%u]: vertex_count=%" PRIu32
-					     ", instance_count=%" PRIu32 ", start_vertex=%" PRIu32
-					     ", start_instance=%" PRIu32 "\n",
-					     i, args->vertex_count_per_instance, args->instance_count,
-					     args->start_vertex_location, args->start_instance_location);
-				}
-			}
 			m_num_instances = args->instance_count;
 			DrawIndexAuto({.vertex_count   = args->vertex_count_per_instance,
 			               .instance_count = args->instance_count,
@@ -1026,17 +994,6 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		}
 
 		auto* args = reinterpret_cast<const DrawIndexedIndirectArgs*>(args_addr);
-		if (args->base_vertex_location != 0u || args->start_instance_location != 0u) {
-			static std::atomic<uint32_t> log_count {0};
-			if (log_count.fetch_add(1) < 64) {
-				LOGF("\t warning: partial DrawIndexIndirectMulti args[%u]: index_count=%" PRIu32
-				     ", instance_count=%" PRIu32 ", start_index=%" PRIu32 ", base_vertex=%" PRIu32
-				     ", start_instance=%" PRIu32 "\n",
-				     i, args->index_count_per_instance, args->instance_count,
-				     args->start_index_location, args->base_vertex_location,
-				     args->start_instance_location);
-			}
-		}
 
 		uint64_t index_size = 0;
 		switch (m_index_type_and_size) {

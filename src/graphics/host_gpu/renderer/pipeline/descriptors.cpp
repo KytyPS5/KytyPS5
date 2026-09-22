@@ -184,17 +184,18 @@ bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor, bo
 	}
 	const bool full = common && descriptor.fields[4] == field4_expected &&
 	                  descriptor.fields[5] == field5_expected;
-	if (!full || (descriptor.fields[6] == 0 && descriptor.fields[7] != 0) ||
+	if (!full ||
 	    (descriptor.MsaaDepth() && !IsMultisampledTexture(descriptor.Type()))) {
 		return false;
 	}
-	if (descriptor.fields[6] == 0) {
+	const auto metadata_control = descriptor.fields[6] & 0x00ffffffu;
+	if (metadata_control == 0) {
 		return true;
 	}
 	constexpr uint32_t htile_control = 0x00280000u;
 	const uint32_t expected_control  = htile_control | (descriptor.MsaaDepth() ? (1u << 10u) : 0u);
 	const auto     metadata_addr     = descriptor.MetaAddr() << 8u;
-	return (descriptor.fields[6] & 0x00ffffffu) == expected_control && metadata_addr != 0 &&
+	return metadata_control == expected_control && metadata_addr != 0 &&
 	       metadata_addr < TRACKER_ADDRESS_SIZE && (metadata_addr & 0x7fffu) == 0 &&
 	       descriptor.TileMode() == Prospero::TileMode::kDepth;
 }

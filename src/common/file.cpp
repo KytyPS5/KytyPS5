@@ -453,13 +453,8 @@ std::vector<File::DirEntry> File::GetDirEntries(const std::filesystem::path& pat
 	std::vector<File::DirEntry> ret;
 	ret.reserve(files.size());
 
-	for (const auto& f: files) {
-		File::DirEntry r {};
-
-		r.name    = f.name;
-		r.is_file = f.is_file;
-
-		ret.push_back(std::move(r));
+	for (auto& f: files) {
+		ret.emplace_back(std::move(f.name), f.is_file);
 	}
 
 	return ret;

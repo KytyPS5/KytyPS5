@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 
 #include <chrono>
 #include <cstdio>
@@ -23,7 +24,16 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
+
+namespace Libs {
+void InitLibKernel_1_FS(Loader::SymbolDatabase *symbols);
+void InitNet_1(Loader::SymbolDatabase *symbols);
+namespace LibGen5::VrrStatus {
+void InitVideoOutVrrStatus_1(Loader::SymbolDatabase *symbols);
+}
+}
 
 namespace Libs::LibKernelApr {
 void InitLibKernel_1_Apr(Loader::SymbolDatabase *symbols);
@@ -116,6 +126,213 @@ void TestSaveOpenVisibility() {
   Check(FileSystem::KernelStat(Path, &stat) == OK && stat.st_size == 0,
         "save truncation is visible before close");
   Check(FileSystem::KernelClose(truncated) == OK, "close truncated save file");
+}
+
+void TestPreadv() {
+  using FileSystem::KernelIovec;
+  using namespace Libs::LibKernel;
+  constexpr char Path[] = "/savedata0/preadv.dat";
+  constexpr std::string_view Payload = "abcdefghijklmnopqrstuvwxyz";
+  const int writer = FileSystem::KernelOpen(Path, 0x602, 0777);
+  Check(writer >= 3, "create preadv fixture");
+  Check(FileSystem::KernelWrite(writer, Payload.data(), Payload.size()) ==
+            Payload.size(),
+        "write preadv fixture");
+  Check(FileSystem::KernelClose(writer) == OK, "close preadv fixture writer");
+  const int fd = FileSystem::KernelOpen(Path, 0, 0);
+  Check(fd >= 3, "open preadv fixture for reading");
+
+  Loader::SymbolDatabase symbols;
+  Libs::InitLibKernel_1_FS(&symbols);
+  const auto *symbol = symbols.Find({"yTj62I7kw4s", "libkernel", 1, "libkernel",
+                                     1, 1, Loader::SymbolType::Func});
+  Check(symbol != nullptr,
+        "sceKernelPreadv resolves through the kernel export");
+  const auto preadv =
+      reinterpret_cast<decltype(&FileSystem::KernelPreadv)>(symbol->vaddr);
+
+  std::array<char, 3> first{};
+  std::array<char, 4> second{};
+  const KernelIovec buffers[]{{first.data(), first.size()},
+                              {nullptr, 0},
+                              {second.data(), second.size()}};
+  Check(FileSystem::KernelLseek(fd, 2, 0) == 2, "set independent file cursor");
+  Check(preadv(fd, buffers, 3, 5) == 7 &&
+            std::string_view(first.data(), first.size()) == "fgh" &&
+            std::string_view(second.data(), second.size()) == "ijkl",
+        "preadv scatters consecutive bytes from the requested offset");
+  Check(FileSystem::KernelLseek(fd, 0, 1) == 2,
+        "preadv leaves the file cursor unchanged");
+
+  first.fill('?');
+  second.fill('?');
+  Check(preadv(fd, buffers, 3, 24) == 2 &&
+            std::string_view(first.data(), first.size()) == "yz?" &&
+            std::string_view(second.data(), second.size()) == "????",
+        "short reads stop at EOF without touching subsequent buffers");
+  Check(preadv(fd, buffers, 3, Payload.size()) == 0 &&
+            preadv(fd, buffers, 3, std::numeric_limits<int64_t>::max()) == 0 &&
+            FileSystem::KernelLseek(fd, 0, 1) == 2,
+        "reads at or beyond EOF return zero and preserve the cursor");
+  Check(preadv(fd, nullptr, 0, 0) == 0,
+        "an empty vector succeeds for a readable descriptor");
+  std::array<KernelIovec, 1024> many{};
+  many.back() = {first.data(), 1};
+  Check(preadv(fd, many.data(), many.size(), 0) == 1 && first[0] == 'a',
+        "the maximum vector count accepts empty entries");
+
+  first.fill('?');
+  const KernelIovec null_buffer[]{{first.data(), 1}, {nullptr, 1}};
+  const KernelIovec oversized[]{
+      {first.data(), 1},
+      {first.data(), static_cast<size_t>(std::numeric_limits<int>::max())}};
+  const KernelIovec overflow{first.data(), std::numeric_limits<size_t>::max()};
+  Check(preadv(fd, buffers, -1, 0) == KERNEL_ERROR_EINVAL &&
+            preadv(fd, buffers, 1025, 0) == KERNEL_ERROR_EINVAL &&
+            preadv(fd, buffers, 3, -1) == KERNEL_ERROR_EINVAL &&
+            preadv(fd, oversized, 2, 0) == KERNEL_ERROR_EINVAL &&
+            preadv(fd, &overflow, 1, 0) == KERNEL_ERROR_EINVAL,
+        "invalid counts, offsets and total lengths fail without reading");
+  Check(preadv(fd, nullptr, 1, 0) == KERNEL_ERROR_EFAULT &&
+            preadv(fd, null_buffer, 2, 0) == KERNEL_ERROR_EFAULT &&
+            first[0] == '?' && FileSystem::KernelLseek(fd, 0, 1) == 2,
+        "null vector and nonempty null buffers fail without changing data or "
+        "cursor");
+  Check(preadv(-1, buffers, 3, 0) == KERNEL_ERROR_EBADF &&
+            preadv(std::numeric_limits<int>::min(), buffers, 3, 0) ==
+                KERNEL_ERROR_EBADF,
+        "invalid descriptors report EBADF");
+
+  KernelIovec aliased[]{{nullptr, sizeof(KernelIovec)}, {second.data(), 2}};
+  aliased[0].iov_base = &aliased[1];
+  Check(preadv(fd, aliased, 2, 0) == 18 && second[0] == 'q' && second[1] == 'r',
+        "buffer writes cannot overwrite the remaining vector metadata");
+
+  std::atomic<bool> start = false;
+  std::vector<std::thread> readers;
+  for (int offset = 0; offset < 4; ++offset) {
+    readers.emplace_back([&, offset] {
+      while (!start.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+      }
+      for (int iteration = 0; iteration < 100; ++iteration) {
+        std::array<char, 7> data{};
+        const KernelIovec parts[]{{data.data(), 3}, {data.data() + 3, 4}};
+        Check(preadv(fd, parts, 2, offset) == data.size() &&
+                  std::string_view(data.data(), data.size()) ==
+                      Payload.substr(offset, 7),
+              "concurrent positioned reads keep each vector contiguous");
+      }
+    });
+  }
+  start.store(true, std::memory_order_release);
+  for (int iteration = 0; iteration < 100; ++iteration) {
+    std::array<char, 26> data{};
+    Check(FileSystem::KernelLseek(fd, 0, 0) == 0 &&
+              FileSystem::KernelRead(fd, data.data(), data.size()) ==
+                  data.size() &&
+              std::string_view(data.data(), data.size()) == Payload,
+          "ordinary reads retain their position alongside preadv");
+  }
+  for (auto &reader : readers) {
+    reader.join();
+  }
+  Check(FileSystem::KernelClose(fd) == OK &&
+            preadv(fd, buffers, 3, 0) == KERNEL_ERROR_EBADF,
+        "closed descriptors report EBADF");
+  const int write_only = FileSystem::KernelOpen(Path, 1, 0);
+  Check(write_only >= 3 &&
+            preadv(write_only, buffers, 3, 0) == KERNEL_ERROR_EBADF,
+        "write-only descriptors cannot be read");
+  Check(FileSystem::KernelClose(write_only) == OK,
+        "close write-only descriptor");
+  const int directory = FileSystem::KernelOpen("/savedata0", 0x20000, 0);
+  Check(directory >= 3 &&
+            preadv(directory, buffers, 3, 0) == KERNEL_ERROR_EISDIR,
+        "positioned directory reads return an error instead of aborting");
+  Check(FileSystem::KernelClose(directory) == OK, "close preadv directory");
+}
+
+void TestPwritevAndChmod() {
+  using FileSystem::KernelIovec;
+  using namespace Libs::LibKernel;
+
+  Loader::SymbolDatabase symbols;
+  Libs::InitLibKernel_1_FS(&symbols);
+  const auto *pwritev_symbol = symbols.Find(
+      {"mBd4AfLP+u8", "libkernel", 1, "libkernel", 1, 1,
+       Loader::SymbolType::Func});
+  const auto *chmod_symbol = symbols.Find(
+      {"fgIsQ10xYVA", "libkernel", 1, "libkernel", 1, 1,
+       Loader::SymbolType::Func});
+  Check(pwritev_symbol != nullptr && chmod_symbol != nullptr,
+        "positioned vector write and chmod resolve from libkernel");
+  const auto pwritev = reinterpret_cast<decltype(&FileSystem::KernelPwritev)>(
+      pwritev_symbol->vaddr);
+  const auto chmod = reinterpret_cast<decltype(&FileSystem::KernelChmod)>(
+      chmod_symbol->vaddr);
+
+  constexpr char Path[] = "/savedata0/pwritev.dat";
+  constexpr char Payload[] = "abcdefgh";
+  const int fd = FileSystem::KernelOpen(Path, 0x602, 0777);
+  Check(fd >= 3 && FileSystem::KernelWrite(fd, Payload, sizeof(Payload) - 1) ==
+                       sizeof(Payload) - 1,
+        "create and populate pwritev fixture");
+  Check(FileSystem::KernelLseek(fd, 5, 0) == 5,
+        "set independent pwritev cursor");
+
+  char First[] = "XY";
+  char Second[] = "123";
+  const KernelIovec buffers[]{{First, sizeof(First) - 1},
+                              {Second, sizeof(Second) - 1}};
+  Check(pwritev(fd, buffers, 2, 1) == 5 &&
+            FileSystem::KernelLseek(fd, 0, 1) == 5,
+        "pwritev writes consecutive vectors at its offset and preserves the cursor");
+
+  std::array<char, sizeof(Payload) - 1> data{};
+  Check(FileSystem::KernelPread(fd, data.data(), data.size(), 0) == 8 &&
+            std::string_view(data.data(), data.size()) == "aXY123gh",
+        "pwritev writes all vectors as one positioned stream");
+  const KernelIovec invalid{nullptr, 1};
+  Check(pwritev(fd, nullptr, 1, 0) == KERNEL_ERROR_EFAULT &&
+            pwritev(fd, &invalid, 1, 0) == KERNEL_ERROR_EFAULT &&
+            pwritev(fd, buffers, -1, 0) == KERNEL_ERROR_EINVAL &&
+            pwritev(fd, buffers, 2, -1) == KERNEL_ERROR_EINVAL,
+        "pwritev validates vectors and offsets");
+  Check(FileSystem::KernelClose(fd) == OK, "close pwritev fixture");
+
+  Check(chmod(Path, 0640) == OK, "chmod updates guest-visible file permissions");
+  FileSystem::FileStat stat{};
+  Check(FileSystem::KernelStat(Path, &stat) == OK && (stat.st_mode & 0777) == 0640,
+        "stat reports permissions set by chmod");
+  Check(chmod("/savedata0/missing-chmod.dat", 0600) == KERNEL_ERROR_ENOENT,
+        "chmod reports a missing guest path");
+}
+
+void TestEntitlementKeyAndVrrImports() {
+  Loader::SymbolDatabase symbols;
+  Libs::InitNet_1(&symbols);
+  Libs::LibGen5::VrrStatus::InitVideoOutVrrStatus_1(&symbols);
+
+  const auto *entitlement_symbol = symbols.Find(
+      {"5LiMEPuW0DQ", "NpEntitlementAccess", 1, "NpEntitlementAccess", 1, 1,
+       Loader::SymbolType::Func});
+  const auto *vrr_symbol = symbols.Find(
+      {"kP2L8t3j-aM", "VideoOutVrrStatus", 1, "VideoOut", 1, 1,
+       Loader::SymbolType::Func});
+  Check(entitlement_symbol != nullptr && vrr_symbol != nullptr,
+        "entitlement-key and VideoOut VRR imports resolve through their modules");
+
+  struct UnifiedEntitlementLabel {
+    char data[17];
+    char padding[3];
+  } label{};
+  using GetEntitlementKey = KYTY_SYSV_ABI int (*)(uint32_t, const UnifiedEntitlementLabel *,
+                                                   uint8_t *);
+  const auto get_key = reinterpret_cast<GetEntitlementKey>(entitlement_symbol->vaddr);
+  uint8_t key[16]{};
+  Check(get_key(0, &label, key) == -2122514425,
+        "unknown entitlement keys report no entitlement");
 }
 
 void CheckMountRoot(const std::filesystem::path &root) {
@@ -419,6 +636,11 @@ void CheckSocketWakeup() {
         "connect wake socket");
   const int reader = Net::Accept(listener, nullptr, nullptr);
   Check(reader >= 0, "accept wake socket");
+  char ignored = 0;
+  const FileSystem::KernelIovec positioned {&ignored, 1};
+  Check(FileSystem::KernelPreadv(reader, &positioned, 1, 0) ==
+            Libs::LibKernel::KERNEL_ERROR_ESPIPE,
+        "positioned socket reads report ESPIPE without consuming data");
   Check(Net::SocketClose(listener) == 0, "close listener");
   const int enabled = 1;
   Check(Net::Setsockopt(writer, 6, 1, &enabled, sizeof(enabled)) == 0,
@@ -495,6 +717,9 @@ int main() {
   CheckDirectoryStream(temporary.Path());
   CheckAprPaths(temporary.Path());
   FileSystem::Mount(temporary.Path(), "/savedata0");
+  TestPreadv();
+  TestPwritevAndChmod();
+  TestEntitlementKeyAndVrrImports();
   TestSaveOpenVisibility();
   CheckSaveRename(temporary.Path(), "first-save");
   CheckSaveRename(temporary.Path(), "replacement-save");

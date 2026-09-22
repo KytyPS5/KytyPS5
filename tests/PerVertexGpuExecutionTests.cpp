@@ -7,8 +7,10 @@
 
 #include <vulkan/vulkan.h>
 #include <dlfcn.h>
+#include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -144,9 +146,22 @@ Device InitDevice() {
     app.pApplicationName = "PerVertexGpuExecutionTests";
     app.apiVersion = VK_API_VERSION_1_3;
 
+    auto enumerate_instance_extensions = reinterpret_cast<PFN_vkEnumerateInstanceExtensionProperties>(
+        LoadEntry(VK_NULL_HANDLE, "vkEnumerateInstanceExtensionProperties"));
+    uint32_t extension_count = 0;
+    Check(enumerate_instance_extensions(nullptr, &extension_count, nullptr), "vkEnumerateInstanceExtensionProperties");
+    std::vector<VkExtensionProperties> extensions(extension_count);
+    Check(enumerate_instance_extensions(nullptr, &extension_count, extensions.data()),
+          "vkEnumerateInstanceExtensionProperties list");
+    const bool has_portability = std::any_of(extensions.begin(), extensions.end(), [](const auto& extension) {
+        return std::strcmp(extension.extensionName, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME) == 0;
+    });
+    const char* instance_extensions[] {VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME};
     VkInstanceCreateInfo instance_info {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     instance_info.pApplicationInfo = &app;
-    instance_info.flags = VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+    instance_info.flags = has_portability ? VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR : 0;
+    instance_info.enabledExtensionCount = has_portability ? 1u : 0u;
+    instance_info.ppEnabledExtensionNames = has_portability ? instance_extensions : nullptr;
 
     Device dev;
     Check(vk_create_instance(&instance_info, nullptr, &dev.instance), "vkCreateInstance");
@@ -350,9 +365,11 @@ struct PushConstants {
     struct Attr {
         uint32_t meta;
         uint32_t bit_counts;
-        uint32_t bit_offsets;
-    } attrs[8];
+    } attrs[12];
 };
+static_assert(sizeof(PushConstants::Attr) == 8);
+static_assert(offsetof(PushConstants, attrs) == 32);
+static_assert(offsetof(PushConstants::Attr, bit_counts) == 4);
 static_assert(sizeof(PushConstants) == 128);
 
 } // namespace
@@ -378,7 +395,7 @@ int main() {
 
     constexpr uint32_t kMaxInvocations = 16;
     GpuBuffer id_buf = CreateBuffer(dev, kMaxInvocations * sizeof(uint32_t) * 2, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    GpuBuffer attr_buf = CreateBuffer(dev, kMaxInvocations * 4 * sizeof(float) * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    GpuBuffer attr_buf = CreateBuffer(dev, kMaxInvocations * 12 * sizeof(float) * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
 
     // Compute Pipeline for unpack
     VkShaderModuleCreateInfo sm_info {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
@@ -473,6 +490,7 @@ int main() {
 
         const uint32_t* read_ids = reinterpret_cast<const uint32_t*>(id_buf.mapped);
         const float* read_attrs = reinterpret_cast<const float*>(attr_buf.mapped);
+        const uint32_t attribute_count = (push.packed_flags >> 19u) & 0x0fu;
 
         for (uint32_t i = 0; i < push.total_invocations; ++i) {
             uint32_t exp_vtx = expected_vtx_ids[i];
@@ -486,8 +504,8 @@ int main() {
             }
 
             // Reject NaN and Inf across all floats returned by the GPU
-        for (uint32_t a = 0; a < 4; ++a) {
-            const float* attr_val = read_attrs + (i * 4 + a) * 4;
+        for (uint32_t a = 0; a < attribute_count; ++a) {
+            const float* attr_val = read_attrs + (i * attribute_count + a) * 4;
                 for (int c = 0; c < 4; ++c) {
                     if (std::isnan(attr_val[c]) || std::isinf(attr_val[c])) {
                         std::fprintf(stderr, "CRITICAL ERROR: NaN/Inf detected at invocation %u attr %u comp %d: %f\n",
@@ -503,8 +521,8 @@ int main() {
                     std::fprintf(stderr, "Mismatch at invocation %u: expected OOB ID 0, got %u\n", i, got_vtx);
                     std::exit(1);
                 }
-            for (uint32_t a = 0; a < 4; ++a) {
-                const float* attr_val = read_attrs + (i * 4 + a) * 4;
+            for (uint32_t a = 0; a < attribute_count; ++a) {
+                const float* attr_val = read_attrs + (i * attribute_count + a) * 4;
                     if (std::bit_cast<uint32_t>(attr_val[0]) != 0u ||
                         std::bit_cast<uint32_t>(attr_val[1]) != 0u ||
                         std::bit_cast<uint32_t>(attr_val[2]) != 0u ||
@@ -520,7 +538,7 @@ int main() {
                 }
 
                 // Attribute 0: Float32 vec3 (Strict bitwise bit_cast equality)
-        const float* pos = read_attrs + (i * 4 + 0) * 4;
+        const float* pos = read_attrs + (i * attribute_count + 0) * 4;
                 for (int c = 0; c < 3; ++c) {
                     uint32_t got_bits = std::bit_cast<uint32_t>(pos[c]);
                     uint32_t exp_bits = std::bit_cast<uint32_t>(kPositions[exp_vtx][c]);
@@ -536,7 +554,7 @@ int main() {
                 }
 
                 // Attribute 1: Unorm8 vec4 (Strict bitwise equality with IEEE-754 division)
-        const float* col = read_attrs + (i * 4 + 1) * 4;
+        const float* col = read_attrs + (i * attribute_count + 1) * 4;
                 for (int c = 0; c < 4; ++c) {
                     float exp_val = static_cast<float>(kColors[exp_vtx][c]) / 255.0f;
                     uint32_t got_bits = std::bit_cast<uint32_t>(col[c]);
@@ -549,7 +567,7 @@ int main() {
                 }
 
                 // Attribute 2: Unorm16 vec2 (Strict bitwise equality with IEEE-754 division)
-        const float* uv = read_attrs + (i * 4 + 2) * 4;
+        const float* uv = read_attrs + (i * attribute_count + 2) * 4;
                 for (int c = 0; c < 2; ++c) {
                     float exp_val = static_cast<float>(kTexCoords[exp_vtx][c]) / 65535.0f;
                     uint32_t got_bits = std::bit_cast<uint32_t>(uv[c]);
@@ -566,7 +584,7 @@ int main() {
             std::exit(1);
         }
 
-        const float* attr3 = read_attrs + (i * 4 + 3) * 4;
+        const float* attr3 = read_attrs + (i * attribute_count + 3) * 4;
         for (int c = 0; c < 4; ++c) {
             const uint32_t got_bits = std::bit_cast<uint32_t>(attr3[c]);
             if (got_bits != kHalfExpected[exp_vtx][c]) {
@@ -574,6 +592,17 @@ int main() {
                              "Float16 mismatch at vtx %u comp %d: expected 0x%08x, got 0x%08x\n",
                              exp_vtx, c, kHalfExpected[exp_vtx][c], got_bits);
                 std::exit(1);
+            }
+        }
+
+        for (uint32_t a = 4; a < attribute_count; ++a) {
+            const float* actual = read_attrs + (i * attribute_count + a) * 4;
+            const float* expected = read_attrs + (i * attribute_count + a % 4u) * 4;
+            for (int c = 0; c < 4; ++c) {
+                if (std::bit_cast<uint32_t>(actual[c]) != std::bit_cast<uint32_t>(expected[c])) {
+                    std::fprintf(stderr, "Repeated attribute mismatch at invocation %u attr %u comp %d\n", i, a, c);
+                    std::exit(1);
+                }
             }
         }
     }
@@ -604,16 +633,14 @@ int main() {
     base_push.num_records = kNumVertices;
     base_push.first_instance = 0;
     base_push.attrs[0].meta = (0 & 0xffffu) | (3u << 17u) | (1u << 20u);
-    base_push.attrs[0].bit_offsets = 0x00402000u;
+    base_push.attrs[0].bit_counts = 0x00202020u;
     base_push.attrs[1].meta = (12 & 0xffffu) | (4u << 17u);
     base_push.attrs[1].bit_counts = 0x08080808u;
-    base_push.attrs[1].bit_offsets = 0x18100800u;
     base_push.attrs[2].meta = (16 & 0xffffu) | (2u << 17u);
     base_push.attrs[2].bit_counts = 0x00001010u;
-    base_push.attrs[2].bit_offsets = 0x00001000u;
     base_push.attrs[3].meta = (20 & 0xffffu) | (4u << 17u) | (3u << 20u);
     base_push.attrs[3].bit_counts = 0x10101010u;
-    base_push.attrs[3].bit_offsets = 0x30201000u;
+    for (uint32_t i = 4; i < 12; ++i) base_push.attrs[i] = base_push.attrs[i % 4u];
 
     // Generated unpack shader fixture for signed 16-bit normalization.
     constexpr int16_t kSnormValues[4] = {INT16_MIN, INT16_MAX, 0, -16384};
@@ -635,7 +662,6 @@ int main() {
     snorm_push.packed_flags = 1u << 19u;
     snorm_push.attrs[0].meta = (4u << 17u) | (2u << 20u);
     snorm_push.attrs[0].bit_counts = 0x10101010u;
-    snorm_push.attrs[0].bit_offsets = 0x30201000u;
     std::memset(id_buf.mapped, 0xcd, id_buf.size);
     std::memset(attr_buf.mapped, 0xcd, attr_buf.size);
     VkCommandBufferBeginInfo snorm_begin {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -716,12 +742,32 @@ int main() {
         DispatchAndVerifyStrict("Strict bound check: index exceeding num_records=6", push, {1, 4, 2, 5, 0, 3, 0xffffffffu});
     }
 
+    // Test 5: Ten attributes, including descriptors 8 and 9.
+    {
+        PushConstants push = base_push;
+        push.total_invocations = 2;
+        push.index_count = 2;
+        push.first_vertex = 1;
+        push.packed_flags = 10u << 19u;
+        DispatchAndVerifyStrict("Ten attributes", push, {1, 2});
+    }
+
+    // Test 6: The full twelve-attribute push-constant ABI.
+    {
+        PushConstants push = base_push;
+        push.total_invocations = 2;
+        push.index_count = 2;
+        push.first_vertex = 1;
+        push.packed_flags = 12u << 19u;
+        DispatchAndVerifyStrict("Twelve attributes", push, {1, 2});
+    }
+
     // =========================================================================
     // PART 2: DESCRIPTOR SAFETY ON NON-4-BYTE ALIGNED INDEX BUFFERS (Critique 3)
     // =========================================================================
     std::printf("\n=== Part 2: Proving 8/16-bit Index Buffers with Non-4-Byte Sizes ===\n");
 
-    // Test 5: 16-bit indices, exactly 3 elements = 6 bytes.
+    // Test 7: 16-bit indices, exactly 3 elements = 6 bytes.
     // Descriptor range is 4-byte aligned to 8 bytes.
     // Reading 3rd index (offset 4, in 2nd 32-bit word) must not fault or corrupt.
     {
@@ -747,7 +793,7 @@ int main() {
         DispatchAndVerifyStrict("Odd 16-bit index buffer (3 elements = 6 bytes, bound=8)", push, {2, 6, 4});
     }
 
-    // Test 6: 8-bit indices, exactly 5 elements = 5 bytes.
+    // Test 8: 8-bit indices, exactly 5 elements = 5 bytes.
     // Descriptor range is 4-byte aligned to 8 bytes.
     // Reading 5th index (offset 4, at start of 2nd 32-bit word) must not fault.
     {

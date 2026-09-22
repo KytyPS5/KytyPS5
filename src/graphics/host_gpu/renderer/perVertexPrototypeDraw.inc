@@ -12,7 +12,7 @@ void RenderExecutor::ExecutePerVertexPrototype(uint64_t submit_id, CommandBuffer
 	        topology != vk::PrimitiveTopology::eTriangleList || primitive_restart_enable ||
 	        draw.index_count % 3 != 0);
 	EXIT_IF(vs.logical_stage != ShaderType::Vertex || vs.buffers_num != 1 ||
-	        vs.resources_num == 0 || vs.resources_num > 8 || HasShaderBufferWrites(vs.stage));
+	        vs.resources_num == 0 || vs.resources_num > 12 || HasShaderBufferWrites(vs.stage));
 	const auto&    input     = vs.buffers[0];
 	const uint32_t num_attrs = vs.resources_num;
 	EXIT_IF(input.stride == 0 || input.fetch_index != 0 ||
@@ -205,13 +205,10 @@ void RenderExecutor::ExecutePerVertexPrototype(uint64_t submit_id, CommandBuffer
 		    (byte_offset & 0xffffu) | (comp_count << 17u) | (format_kind << 20u);
 
 		uint32_t bit_counts  = 0;
-		uint32_t bit_offsets = 0;
 		for (uint32_t c = 0; c < 4; ++c) {
 			bit_counts |= (format_info.component_bits[c] & 0xffu) << (c * 8u);
-			bit_offsets |= (format_info.component_bit_offset[c] & 0xffu) << (c * 8u);
 		}
 		unpack_push.attrs[i].bit_counts  = bit_counts;
-		unpack_push.attrs[i].bit_offsets = bit_offsets;
 	}
 
 	auto cmd = buffer.Handle();

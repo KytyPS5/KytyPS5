@@ -5,7 +5,6 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 struct AttrDesc {
 	uint meta;        // [15:0] byte offset, [19:17] component count, [22:20] format kind
 	uint bit_counts;  // [count0, count1, count2, count3]
-	uint bit_offsets; // [offset0, offset1, offset2, offset3]
 };
 
 layout(push_constant) uniform PushConstants {
@@ -17,7 +16,7 @@ layout(push_constant) uniform PushConstants {
 	uint vertex_stride;
 	uint num_records;
 	uint packed_flags; // [15:0] index offset, [16] indexed, [18:17] index type, [22:19] attributes
-	AttrDesc attrs[8];
+	AttrDesc attrs[12];
 } push;
 
 layout(set = 0, binding = 0, std430) readonly buffer IndexBuffer {
@@ -80,8 +79,8 @@ vec4 DecodeAttribute(uint vertex_id, uint attribute_index) {
 	uint format_kind     = (info.meta >> 20u) & 7u;
 	uint byte_base       = vertex_id * push.vertex_stride + byte_offset;
 	vec4 result          = vec4(0.0, 0.0, 0.0, 1.0);
+	uint bit_offset      = 0;
 	for (uint component = 0; component < component_count; ++component) {
-		uint bit_offset = (info.bit_offsets >> (component << 3u)) & 0xffu;
 		uint bit_count  = (info.bit_counts >> (component << 3u)) & 0xffu;
 		if (format_kind == 1u) {
 			result[component] = uintBitsToFloat(ReadBits(byte_base, bit_offset, 32u));
@@ -95,6 +94,7 @@ vec4 DecodeAttribute(uint vertex_id, uint attribute_index) {
 			uint raw = ReadBits(byte_base, bit_offset, bit_count);
 			result[component] = float(raw) / float((1u << bit_count) - 1u);
 		}
+		bit_offset += bit_count;
 	}
 	return result;
 }

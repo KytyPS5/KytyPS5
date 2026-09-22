@@ -3,6 +3,7 @@
 #include "graphics/host_gpu/renderer/perVertexTransform.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 
+#include <cstddef>
 #include <map>
 #include <span>
 #include <vector>
@@ -42,11 +43,13 @@ struct UnpackPushConstants {
 	uint32_t packed_flags; // word 7: [15:0] index_base_offset, [16] is_indexed, [18:17] index_type,
 	                       // [22:19] num_attributes
 	struct Attr {
-		uint32_t meta;        // [15:0] byte offset, [19:17] component count, [22:20] format kind
-		uint32_t bit_counts;  // [cnt0, cnt1, cnt2, cnt3]
-		uint32_t bit_offsets; // [off0, off1, off2, off3]
-	} attrs[8];               // words 8..31 (24 uints)
+		uint32_t meta;       // [15:0] byte offset, [19:17] component count, [22:20] format kind
+		uint32_t bit_counts; // [cnt0, cnt1, cnt2, cnt3]
+	} attrs[12];             // words 8..31 (24 uints)
 };
+static_assert(sizeof(UnpackPushConstants::Attr) == 8);
+static_assert(offsetof(UnpackPushConstants, attrs) == 32);
+static_assert(offsetof(UnpackPushConstants::Attr, bit_counts) == 4);
 static_assert(sizeof(UnpackPushConstants) == 128);
 
 const PerVertexPrototypePrograms*

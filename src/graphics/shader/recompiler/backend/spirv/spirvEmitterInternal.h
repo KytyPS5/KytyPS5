@@ -67,6 +67,7 @@ struct SpirvRequirements {
 	bool function_scratch             = false;
 	bool pixel_valid_mask             = false;
 	bool buffer_int64_atomics         = false;
+	bool coherent_buffers             = false;
 	bool shader_clock                 = false;
 };
 
@@ -378,6 +379,7 @@ struct MemoryResourceAccess {
 	uint32_t         index_offset     = 0;
 	uint32_t         byte_offset      = 0;
 	bool             add_index_offset = false;
+	bool             coherent         = false;
 };
 
 MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::MemoryInfo& mem);

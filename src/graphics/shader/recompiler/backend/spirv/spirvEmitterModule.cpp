@@ -193,6 +193,10 @@ void DefineDescriptors(EmitterState& state) {
 			case IR::DescriptorBindingKind::Buffers:
 				state.storage_buffer_variable =
 				    Define(ArrayType(StorageBufferType(state)), "buffers");
+				if (state.requirements.coherent_buffers) {
+					state.builder.AddAnnotation(spv::OpDecorate, state.storage_buffer_variable,
+					                            spv::DecorationCoherent);
+				}
 				if (state.requirements.buffer_int64_atomics) {
 					state.storage_buffer_u64_variable =
 					    Define(ArrayType(StorageBufferU64Type(state)), "buffers_u64");

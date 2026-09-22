@@ -5,6 +5,7 @@
 #include "common/logging/log.h"
 
 #include <cstdlib>
+#include <string>
 #include <string_view>
 
 namespace Common {
@@ -26,6 +27,8 @@ int  DbgExitIfHandler(char const* expr, char const* file, int line);
 int  DbgNotImplementedHandler(char const* expr, char const* file, int line);
 void DbgExit(int status);
 #endif
+
+std::string HostBacktrace();
 
 } // namespace Common
 

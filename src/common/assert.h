@@ -4,6 +4,7 @@
 #include "common/common.h"
 #include "common/logging/log.h"
 
+#include <string>
 #include <string_view>
 
 namespace Common {
@@ -11,6 +12,9 @@ namespace Common {
 [[noreturn]] void DbgExitHandler(char const* file, int line, std::string_view text);
 [[noreturn]] void DbgExitIfHandler(char const* expr, char const* file, int line);
 [[noreturn]] void DbgNotImplementedHandler(char const* expr, char const* file, int line);
+
+// The calling thread's host stack, symbolized where the platform allows; empty elsewhere.
+std::string HostBacktrace();
 
 } // namespace Common
 

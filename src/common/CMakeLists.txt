@@ -11,6 +11,10 @@ if(KYTY_CLANG_CL)
 endif()
 
 add_library(common STATIC ${common_src} ${common_headers})
+if (WIN32)
+	# Fatal reports symbolize the host stack.
+	target_link_libraries(common PRIVATE dbghelp)
+endif()
 
 set(localization_dir "${PROJECT_SOURCE_DIR}/assets/localization")
 file(GLOB localization_catalogs CONFIGURE_DEPENDS "${localization_dir}/*.json")

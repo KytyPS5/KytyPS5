@@ -8,7 +8,12 @@
 namespace Libs::Graphics {
 namespace {
 
-constexpr uint32_t   DescriptorHeapCount = 1024;
+// Doubled when the pixel stage moved to its own descriptor set: a graphics draw now commits up to
+// two sets where it used to commit one, so the same number of draws consumes twice the sets per
+// pool. The descriptor *counts* below are untouched - the same descriptors are written, spread over
+// two sets rather than one - so this is the only dimension the split moves. Exhaustion was never a
+// failure (see below), so this is about how often a pool rotates, not whether it can.
+constexpr uint32_t   DescriptorHeapCount = 2048;
 // A set costs one descriptor per resource its shaders bind, so a pool holds size/per-set sets, not
 // DescriptorHeapCount of them; past that Commit rotates or creates a pool, which waits on the
 // master semaphore. The sampled-image entry is sized to keep the sets-per-pool it had when a

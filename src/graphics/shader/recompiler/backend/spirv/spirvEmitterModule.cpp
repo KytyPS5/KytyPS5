@@ -265,7 +265,10 @@ void DefineDescriptors(EmitterState& state) {
 			const auto variable =
 			    state.builder.DefineGlobalVariable(TypePointer(state, storage, type), storage);
 			state.builder.AddName(variable, name);
-			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationDescriptorSet, 0);
+			// Set and binding come from the same pair of functions the host writes through, so a
+			// resource decorated here and a descriptor written there cannot disagree.
+			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationDescriptorSet,
+			                            IR::NativeDescriptorSet(state.program.stage));
 			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBinding,
 			                            IR::NativeBinding(state.program.stage, kind));
 			return variable;

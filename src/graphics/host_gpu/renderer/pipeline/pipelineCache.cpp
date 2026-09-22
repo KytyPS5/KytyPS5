@@ -35,8 +35,8 @@
 #include <mutex>
 #include <optional>
 #include <span>
-#include <stop_token>
 #include <spirv-tools/libspirv.hpp>
+#include <stop_token>
 #include <string_view>
 #include <system_error>
 #include <thread>
@@ -274,7 +274,6 @@ bool ReadShaderGuestMemoryPermissive(void*, uint64_t address, std::span<uint32_t
 	}
 	std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
 	return true;
-
 }
 
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
@@ -317,8 +316,9 @@ void DumpShaderOriginal(const char* stage_name, uint64_t shader_hash,
 	}
 	EXIT_IF(code.empty());
 	static std::atomic_int id = 0;
-	const auto path = Config::GetShaderLogFolder() / "original" /
-	                  fmt::format("{:04d}_new_shader_{}_{:016x}.bin", id++, stage_name, shader_hash);
+	const auto             path =
+	    Config::GetShaderLogFolder() / "original" /
+	    fmt::format("{:04d}_new_shader_{}_{:016x}.bin", id++, stage_name, shader_hash);
 	Common::File::CreateDirectories(path.parent_path());
 	Common::File file(path);
 	if (file.IsInvalid()) {
@@ -536,7 +536,8 @@ private:
 
 } // namespace
 
-std::size_t PipelineCache::GraphicsPipelineKeyHash::operator()(const GraphicsPipelineKey& key) const {
+std::size_t
+PipelineCache::GraphicsPipelineKeyHash::operator()(const GraphicsPipelineKey& key) const {
 	std::size_t hash = 0;
 	PipelineKeyHash::Mix(hash, key.rendering.color_count);
 	for (uint32_t i = 0; i < key.rendering.color_count; i++) {
@@ -564,10 +565,10 @@ std::size_t PipelineCache::GraphicsPipelineKeyHash::operator()(const GraphicsPip
 
 struct PipelineCache::ProgramCache {
 	struct ProgramKey {
-		ShaderType            stage           = ShaderType::Unknown;
-		uint64_t              hash            = 0;
-		uint32_t              user_data_count = 0;
-		uint32_t              code_size       = 0;
+		ShaderType stage           = ShaderType::Unknown;
+		uint64_t   hash            = 0;
+		uint32_t   user_data_count = 0;
+		uint32_t   code_size       = 0;
 		// Bumped when a draw proves another of this shader's descriptors unfoldable. Carrying it
 		// in the key rather than erasing the old entries is deliberate: a SourceEntry owns
 		// vk::ShaderModules that command buffers already recorded may still reference, and
@@ -585,7 +586,7 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::CompiledShaderInfo     program;
 		ShaderProgram                                handle;
 		// Set instead of `handle` when the backend refused the program.
-		std::string                                  reason;
+		std::string reason;
 	};
 
 	struct SourceEntry {
@@ -632,7 +633,7 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourcePlan           resource_plan;
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
-		std::vector<Permutation>                    permutations;
+		std::vector<Permutation>                     permutations;
 	};
 
 	static const char* StageShortName(ShaderType stage) {
@@ -734,10 +735,10 @@ struct PipelineCache::ProgramCache {
 	                               uint32_t push_data_start_dword) {
 		// Read before the program is moved into the compile: the two numbers that say why a module
 		// came out the size it did.
-		const bool     dispatcher = translated.program.dispatcher_fallback;
-		const auto     block_count = translated.program.blocks.size();
-		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
-		                                               specialization, push_data_start_dword);
+		const bool dispatcher  = translated.program.dispatcher_fallback;
+		const auto block_count = translated.program.blocks.size();
+		auto       result = ShaderRecompiler::CompileProgram(std::move(translated), options,
+		                                                     specialization, push_data_start_dword);
 		if (!result.status.ok) {
 			// The backend refused the program. Hand back a permutation with no module; the caller
 			// reports it once and drops the shader's draws.
@@ -821,7 +822,7 @@ struct PipelineCache::ProgramCache {
 		if (skipped_shaders.contains(lookup_key)) {
 			return {};
 		}
-		auto                                         entry = programs.find(lookup_key);
+		auto entry = programs.find(lookup_key);
 		// Filled by MaterializeResources with the resources it had to bind null. Learning from it
 		// moves the generation above, so the next draw of this shader misses and re-translates
 		// with the proof in hand.
@@ -845,7 +846,8 @@ struct PipelineCache::ProgramCache {
 				return {};
 			}
 			if (const auto permutation = std::ranges::find_if(
-			        entry->second.permutations, [&](const Permutation& candidate) {
+			        entry->second.permutations,
+			        [&](const Permutation& candidate) {
 				        const auto& layout = candidate.program.bindings;
 				        return layout.push_data_start_dword ==
 				                   ShaderRecompiler::IR::PushData::StartFor(
@@ -863,7 +865,8 @@ struct PipelineCache::ProgramCache {
 			// so count which one did it and - when it was the specialization - what actually
 			// differed. This is measurement: a run's own answer to how much of its recompilation
 			// is the resource shape changing and how much is not.
-			ReportPermutationMiss(entry->second.permutations, specialization, push_data_cursor);
+			ReportPermutationMiss(entry->second.permutations, entry->second.specialization,
+			                      push_data_cursor);
 		}
 
 		ShaderStageInputInfo stage_input {};
@@ -874,33 +877,54 @@ struct PipelineCache::ProgramCache {
 		} else {
 			stage_input.compute = &input_info;
 		}
-		const char* label = nullptr;
+		const char* label      = nullptr;
 		const char* stage_name = nullptr;
 		switch (stage) {
-			case ShaderType::Vertex: label = "ShaderRecompiler VS"; stage_name = "vs"; break;
-			case ShaderType::Mesh: label = "ShaderRecompiler MS"; stage_name = "ms"; break;
-			case ShaderType::Local: label = "ShaderRecompiler LS"; stage_name = "ls"; break;
-			case ShaderType::TessellationControl: label = "ShaderRecompiler HS"; stage_name = "hs"; break;
-			case ShaderType::TessellationEvaluation: label = "ShaderRecompiler DS"; stage_name = "ds"; break;
-			case ShaderType::Pixel: label = "ShaderRecompiler PS"; stage_name = "ps"; break;
-			case ShaderType::Compute: label = "ShaderRecompiler CS"; stage_name = "cs"; break;
+			case ShaderType::Vertex:
+				label      = "ShaderRecompiler VS";
+				stage_name = "vs";
+				break;
+			case ShaderType::Mesh:
+				label      = "ShaderRecompiler MS";
+				stage_name = "ms";
+				break;
+			case ShaderType::Local:
+				label      = "ShaderRecompiler LS";
+				stage_name = "ls";
+				break;
+			case ShaderType::TessellationControl:
+				label      = "ShaderRecompiler HS";
+				stage_name = "hs";
+				break;
+			case ShaderType::TessellationEvaluation:
+				label      = "ShaderRecompiler DS";
+				stage_name = "ds";
+				break;
+			case ShaderType::Pixel:
+				label      = "ShaderRecompiler PS";
+				stage_name = "ps";
+				break;
+			case ShaderType::Compute:
+				label      = "ShaderRecompiler CS";
+				stage_name = "cs";
+				break;
 			default: EXIT("invalid pipeline shader stage\n");
 		}
 		ShaderRecompiler::CompileOptions options;
-		options.stage       = stage;
-		options.shader_hash = params.hash;
-		options.user_data   = user_data;
+		options.stage          = stage;
+		options.shader_hash    = params.hash;
+		options.user_data      = user_data;
 		options.back_code      = params.back_code;
-		options.dump_ir     = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
-		options.early_dump  = options.dump_ir;
-		options.dump_label  = label;
-		options.input_info  = stage_input;
+		options.dump_ir        = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
+		options.early_dump     = options.dump_ir;
+		options.dump_label     = label;
+		options.input_info     = stage_input;
 		options.unfoldable_pcs = proven.pcs;
 		options.host_subgroup_size = host_subgroup_size;
 
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			options.user_data_base = 8;
-			options.wave_size = input_info.wave_size;
+			options.wave_size      = input_info.wave_size;
 			if (stage == ShaderType::Mesh || stage == ShaderType::TessellationControl) {
 				options.user_data_base = 0;
 				options.wave_size = stage == ShaderType::Mesh ? input_info.mesh.wave_size : 64u;
@@ -933,9 +957,10 @@ struct PipelineCache::ProgramCache {
 			ReportStubbed(stage, params.hash);
 		}
 		if (entry == programs.end()) {
-			auto retained = source.call ? std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source)) : nullptr;
-			entry = programs.try_emplace(lookup_key,
-			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program)).first;
+			entry = programs
+			            .try_emplace(lookup_key,
+			                         ShaderRecompiler::IR::ExtractResourcePlan(translated.program))
+			            .first;
 			// A rejected plan is still cached: MaterializeResources fails on it again, so later
 			// draws take the cheap cached path instead of re-translating the shader every time.
 			if (!ShaderRecompiler::IR::MaterializeResources(
@@ -949,8 +974,9 @@ struct PipelineCache::ProgramCache {
 		// before the compile, because `options.unfoldable_pcs` is a span over `proven.pcs` and a
 		// rollback below rewrites that vector.
 		const bool channel_rebuild = !options.unfoldable_pcs.empty();
-		entry->second.permutations.push_back(CompilePermutation(
-		    stage_name, options, std::move(translated), entry->second.specialization, push_data_cursor));
+		entry->second.permutations.push_back(
+		    CompilePermutation(stage_name, options, std::move(translated),
+		                       entry->second.specialization, push_data_cursor));
 		if (!entry->second.permutations.back().handle) {
 			auto rejected = std::move(entry->second.permutations.back());
 			entry->second.permutations.pop_back();
@@ -1005,9 +1031,8 @@ struct PipelineCache::ProgramCache {
 		for (const auto& candidate: permutations) {
 			const auto& layout = candidate.program.bindings;
 			const bool  start_matches =
-			    layout.push_data_start_dword ==
-			    ShaderRecompiler::IR::PushData::StartFor(push_data_cursor,
-			                                             layout.ShaderDataDwords());
+			    layout.push_data_start_dword == ShaderRecompiler::IR::PushData::StartFor(
+			                                        push_data_cursor, layout.ShaderDataDwords());
 			if (candidate.specialization == wanted) {
 				// Same module state, rejected only for where its push data starts.
 				push_data_only = true;
@@ -1019,9 +1044,9 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 		static std::mutex                      mutex;
-		static uint64_t                        push_data_misses = 0;
+		static uint64_t                        push_data_misses      = 0;
 		static uint64_t                        specialization_misses = 0;
-		static uint64_t                        reported = 0;
+		static uint64_t                        reported              = 0;
 		static std::map<std::string, uint64_t> fields;
 		std::string                            line;
 		{
@@ -1039,8 +1064,8 @@ struct PipelineCache::ProgramCache {
 				return;
 			}
 			reported = total;
-			line     = fmt::format("PermutationMiss: push_data={} specialization={}",
-			                       push_data_misses, specialization_misses);
+			line = fmt::format("PermutationMiss: push_data={} specialization={}", push_data_misses,
+			                   specialization_misses);
 			for (const auto& [field, count]: fields) {
 				line += fmt::format(" | {}={}", field, count);
 			}
@@ -1081,21 +1106,105 @@ struct PipelineCache::ProgramCache {
 	// the declared hash: guest code is rewritten under one, and a pc recorded against the old code
 	// names nothing in the new. UnfoldableSet, Learn and RefuseRebuild live in unfoldableSet.h so
 	// the rollback can be tested without a device.
-	std::unordered_map<uint64_t, UnfoldableSet>                 unfoldable;
+	UnfoldableSets unfoldable;
 	// Keyed on the whole ProgramKey: see ReportSkipped. `reported_shaders` stays on the hash, so
 	// the log still carries one line per shader however many of its shapes refuse.
-	std::unordered_set<ProgramKey, ProgramKeyHash>              skipped_shaders;
+	std::unordered_set<ProgramKey, ProgramKeyHash> skipped_shaders;
 	// Log throttle only: a hash here has been reported once, whether the cause was permanent or
 	// transient. Kept apart from skipped_shaders so a transient failure does not disable a shader.
-	std::unordered_set<uint64_t>                                reported_shaders;
-	std::unordered_set<uint64_t>                                stubbed_shaders;
-	ProgramKey                                                  lookup_key;
+	std::unordered_set<uint64_t> reported_shaders;
+	std::unordered_set<uint64_t> stubbed_shaders;
+	ProgramKey                   lookup_key;
 	// A vertex or pixel stage has no workgroup input to carry the host subgroup width, and the
 	// translator needs it to know whether a wave64 guest mask has an upper half at all.
-	uint32_t                                                    host_subgroup_size = 64;
-	vk::Device                                                  device;
-	uint64_t                                                    next_shader_id = 0;
+	uint32_t   host_subgroup_size = 64;
+	vk::Device device;
+	uint64_t   next_shader_id = 0;
 };
+
+template <typename Key, typename KeyHash>
+PipelineLibraryCache<Key, KeyHash>::~PipelineLibraryCache() {
+	Common::LockGuard lock(m_mutex);
+	LogHitRate();
+	for (const auto& [key, entry]: m_entries) {
+		(void)key;
+		m_graphics.device.destroyPipeline(entry->library, nullptr);
+		m_graphics.device.destroyPipelineLayout(entry->layout, nullptr);
+		m_graphics.device.destroyDescriptorSetLayout(entry->set_layout, nullptr);
+	}
+	m_entries.clear();
+}
+
+template <typename Key, typename KeyHash>
+const typename PipelineLibraryCache<Key, KeyHash>::Entry*
+PipelineLibraryCache<Key, KeyHash>::Find(const Key& key) {
+	Common::LockGuard lock(m_mutex);
+	const auto        iter = m_entries.find(key);
+	if (iter == m_entries.end()) {
+		m_misses++;
+		MaybeLogHitRateLocked();
+		return nullptr;
+	}
+	m_hits++;
+	MaybeLogHitRateLocked();
+	return iter->second.get();
+}
+
+template <typename Key, typename KeyHash>
+const typename PipelineLibraryCache<Key, KeyHash>::Entry*
+PipelineLibraryCache<Key, KeyHash>::Insert(const Key& key, const Entry& entry) {
+	Common::LockGuard lock(m_mutex);
+	const auto        iter = m_entries.find(key);
+	if (iter != m_entries.end()) {
+		// Another thread built the same fragment subset while this one was inside the driver. Its
+		// entry is already published and may already be linked into a pipeline, so this one is the
+		// loser and is destroyed here rather than leaked.
+		m_graphics.device.destroyPipeline(entry.library, nullptr);
+		m_graphics.device.destroyPipelineLayout(entry.layout, nullptr);
+		m_graphics.device.destroyDescriptorSetLayout(entry.set_layout, nullptr);
+		return iter->second.get();
+	}
+	auto [inserted_iter, inserted] = m_entries.emplace(key, std::make_unique<Entry>(entry));
+	EXIT_IF(!inserted);
+	return inserted_iter->second.get();
+}
+
+template <typename Key, typename KeyHash>
+void PipelineLibraryCache<Key, KeyHash>::MaybeLogHitRateLocked() const {
+	const auto total = m_hits + m_misses;
+	if (total == 0 || (total & (total - 1u)) != 0u || total == m_reported) {
+		return;
+	}
+	m_reported = total;
+	LogHitRate();
+}
+
+template <typename Key, typename KeyHash>
+void PipelineLibraryCache<Key, KeyHash>::LogHitRate() const {
+	const auto total = m_hits + m_misses;
+	if (total == 0) {
+		return;
+	}
+	const auto since_built  = m_misses - m_reported_misses;
+	const auto since_reused = m_hits - m_reported_hits;
+	const auto since_total  = since_built + since_reused;
+	m_reported_hits         = m_hits;
+	m_reported_misses       = m_misses;
+	// Note 156 estimated 34-47 % of a run's fragment libraries would be repeats, from a static
+	// sweep of the dumped shader corpus. This is that estimate measured on the run that just ran.
+	std::printf("%s: built %" PRIu64 " | reused %" PRIu64 " | lookups %" PRIu64
+	            " | hit rate %.1f%% | since last: built %" PRIu64 " reused %" PRIu64 " (%.1f%%)\n",
+	            m_name, m_misses, m_hits, total,
+	            100.0 * static_cast<double>(m_hits) / static_cast<double>(total), since_built,
+	            since_reused,
+	            since_total == 0
+	                ? 0.0
+	                : 100.0 * static_cast<double>(since_reused) / static_cast<double>(since_total));
+	std::fflush(stdout);
+}
+
+template class PipelineLibraryCache<FragmentLibraryKey, FragmentLibraryKeyHash>;
+template class PipelineLibraryCache<PreRasterLibraryKey, PreRasterLibraryKeyHash>;
 
 PipelineCache::PipelineCache(GraphicContext& graphics)
     : m_graphics(graphics),
@@ -1103,6 +1212,20 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	EnsurePipelineStallWatchdog();
 	InitializeDriverCache();
+	if (graphics.pipeline_library_fast_linking) {
+		m_libraries = std::make_unique<PipelineLibraries>(graphics);
+	}
+}
+
+void PipelineCache::DestroyPipelineObjects(const Pipeline& pipeline) {
+	// The pre-rasterization and fragment libraries are shared and owned by PipelineLibraries; these
+	// two belong to this pipeline alone. Destroying a null handle is a no-op.
+	m_graphics.device.destroyPipeline(pipeline.library_vertex_input, nullptr);
+	m_graphics.device.destroyPipeline(pipeline.library_fragment_output, nullptr);
+	m_graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
+	m_graphics.device.destroyPipelineLayout(pipeline.pipeline_layout, nullptr);
+	m_graphics.device.destroyDescriptorSetLayout(pipeline.descriptor_set_layout, nullptr);
+	m_graphics.device.destroyDescriptorSetLayout(pipeline.pixel_descriptor_set_layout, nullptr);
 }
 
 PipelineCache::~PipelineCache() {
@@ -1117,6 +1240,8 @@ PipelineCache::~PipelineCache() {
 	};
 	destroy(m_graphics_pipelines);
 	destroy(m_compute_pipelines);
+	// After the pipelines, because a linked pipeline references its shared libraries.
+	m_libraries.reset();
 	if (m_driver_cache != nullptr) {
 		m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
 	}
@@ -1309,12 +1434,12 @@ bool PipelineCache::WriteDriverCacheLocked() {
 	}
 	if (result != vk::Result::eSuccess || size == 0 ||
 	    size > std::numeric_limits<uint32_t>::max()) {
-		PipelineCacheLog("Vulkan pipeline cache: save failed ({}, {} bytes)",
-		                 vk::to_string(result), size);
+		PipelineCacheLog("Vulkan pipeline cache: save failed ({}, {} bytes)", vk::to_string(result),
+		                 size);
 		return false;
 	}
 	payload.resize(size);
-	auto prefix = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
+	auto       prefix       = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
 	const auto payload_hash = XXH3_64bits(payload.data(), payload.size());
 	prefix.append(reinterpret_cast<const char*>(&payload_hash), sizeof(payload_hash));
 	if (!Common::File::CreateDirectories(m_driver_cache_path.parent_path())) {
@@ -1441,9 +1566,9 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		    static_cast<float>(std::min(limits.maxViewportDimensions[1], 16384u)) * 0.5f;
 		clip.enabled = true;
 	}
-	uint32_t          push_data_cursor =
+	uint32_t push_data_cursor =
 	    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount : 0;
-	GraphicsPrograms  result;
+	GraphicsPrograms result;
 	if (pixel_active) {
 		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
 		if (!result.pixel) {
@@ -1471,6 +1596,62 @@ bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other)
 	return std::memcmp(this, &other, sizeof(*this)) == 0;
 }
 
+// Field by field rather than memcmp: the struct has padding, and a library served on a padding
+// byte would be served on nothing at all.
+bool FragmentLibraryKey::operator==(const FragmentLibraryKey& other) const noexcept {
+	return ps_shader_id == other.ps_shader_id && push_stages == other.push_stages &&
+	       samples == other.samples && sample_shading_enable == other.sample_shading_enable &&
+	       stencil_test_enable == other.stencil_test_enable &&
+	       std::memcmp(&stencil_front, &other.stencil_front, sizeof(stencil_front)) == 0 &&
+	       std::memcmp(&stencil_back, &other.stencil_back, sizeof(stencil_back)) == 0 &&
+	       depth_format == other.depth_format && stencil_format == other.stencil_format;
+}
+
+// The same mix PipelineCache uses for its own keys, repeated here because that one is a private
+// nested type and this hash is not a member of anything.
+static void MixFragmentKey(std::size_t& hash, std::size_t value) {
+	hash ^= value + static_cast<std::size_t>(0x9e3779b97f4a7c15ull) + (hash << 6u) + (hash >> 2u);
+}
+
+std::size_t FragmentLibraryKeyHash::operator()(const FragmentLibraryKey& key) const noexcept {
+	std::size_t hash = 0;
+	MixFragmentKey(hash, static_cast<std::size_t>(key.ps_shader_id));
+	MixFragmentKey(hash, key.push_stages);
+	MixFragmentKey(hash, key.samples);
+	MixFragmentKey(hash, static_cast<std::size_t>(key.sample_shading_enable) |
+	                         (static_cast<std::size_t>(key.stencil_test_enable) << 1u));
+	const auto* front = reinterpret_cast<const uint8_t*>(&key.stencil_front);
+	for (std::size_t i = 0; i < sizeof(key.stencil_front); i++) {
+		MixFragmentKey(hash, front[i]);
+	}
+	const auto* back = reinterpret_cast<const uint8_t*>(&key.stencil_back);
+	for (std::size_t i = 0; i < sizeof(key.stencil_back); i++) {
+		MixFragmentKey(hash, back[i]);
+	}
+	MixFragmentKey(hash, static_cast<std::size_t>(key.depth_format));
+	MixFragmentKey(hash, static_cast<std::size_t>(key.stencil_format));
+	return hash;
+}
+
+std::size_t PreRasterLibraryKeyHash::operator()(const PreRasterLibraryKey& key) const noexcept {
+	std::size_t hash = 0;
+	for (const auto id: key.vertex_shader_ids) {
+		MixFragmentKey(hash, static_cast<std::size_t>(id));
+	}
+	MixFragmentKey(hash, static_cast<std::size_t>(key.rect_list_ps_shader_id));
+	MixFragmentKey(hash, key.push_stages);
+	MixFragmentKey(hash, key.patch_control_points);
+	MixFragmentKey(hash, static_cast<std::size_t>(key.rect_list) |
+	                         (static_cast<std::size_t>(key.negative_one_to_one) << 1u) |
+	                         (static_cast<std::size_t>(key.depth_clip_enable) << 2u) |
+	                         (static_cast<std::size_t>(key.cull_front) << 3u) |
+	                         (static_cast<std::size_t>(key.cull_back) << 4u) |
+	                         (static_cast<std::size_t>(key.face) << 5u) |
+	                         (static_cast<std::size_t>(key.provoking_vtx_last) << 6u));
+	MixFragmentKey(hash, static_cast<std::size_t>(key.polygon_mode));
+	return hash;
+}
+
 PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
     std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
     std::span<const ShaderVertexInputInfo> vertex_info, CommandBuffer& command,
@@ -1487,7 +1668,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	EXIT_IF(ps_active && !pixel_program);
 	const auto color_count = static_cast<uint32_t>(colors.size());
 
-	auto&             ctx = command.GetRegisters();
+	auto& ctx = command.GetRegisters();
 
 	const HW::ModeControl& mc = ctx.GetModeControl();
 
@@ -1517,9 +1698,9 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 			EXIT("mixed color attachment sample counts are unsupported: %u and %u\n",
 			     attachment_samples, colors[i].desc.info.samples);
 		}
-		const auto& rt                        = ctx.GetRenderTarget(colors[i].target_slot);
-		const auto& bc                        = ctx.GetBlendControl(colors[i].target_slot);
-		auto alpha_source = ShaderAlphaBlendSource::None;
+		const auto& rt           = ctx.GetRenderTarget(colors[i].target_slot);
+		const auto& bc           = ctx.GetBlendControl(colors[i].target_slot);
+		auto        alpha_source = ShaderAlphaBlendSource::None;
 		if (slot == 0 && ps_input_info != nullptr) {
 			alpha_source = ps_input_info->alpha_blend_source;
 		}
@@ -1527,7 +1708,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 		if (static_params.blend_enable[slot] && alpha_source == ShaderAlphaBlendSource::None &&
 		    ClassifyBlendMapping(bc, colors[i].export_mapping) != BlendMappingSupport::Direct) {
 			static_params.blend_enable[slot] = false;
-			static std::atomic_bool warned = false;
+			static std::atomic_bool warned   = false;
 			if (!warned.exchange(true, std::memory_order_relaxed)) {
 				Log::WriteToConsoleAndLog(fmt::format(
 				    "Warning: blending disabled for unsupported color mapping "
@@ -1609,10 +1790,10 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	if (static_params.sample_shading_enable && !m_graphics.sample_rate_shading_enabled) {
 		EXIT("Pipeline: sample-rate shading is required but unsupported by the host\n");
 	}
-	const bool rect_list = Prospero::IsRectList(command.GetUserConfig().GetPrimType());
-	static_params.cull_back  = !rect_list && mc.cull_back;
-	static_params.cull_front = !rect_list && mc.cull_front;
-	static_params.face       = mc.face;
+	const bool rect_list             = Prospero::IsRectList(command.GetUserConfig().GetPrimType());
+	static_params.cull_back          = !rect_list && mc.cull_back;
+	static_params.cull_front         = !rect_list && mc.cull_front;
+	static_params.face               = mc.face;
 	static_params.provoking_vtx_last = mc.provoking_vtx_last;
 	static_params.polygon_mode =
 	    ResolvePolygonMode(mc, static_params.cull_front, static_params.cull_back);
@@ -1625,7 +1806,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 		key.vertex_input.binding_count   = static_cast<uint8_t>(vs_input_info.buffers_num);
 		key.vertex_input.attribute_count = static_cast<uint8_t>(vs_input_info.resources_num);
 		for (int binding = 0; binding < vs_input_info.buffers_num; binding++) {
-			const auto& buffer = vs_input_info.buffers[binding];
+			const auto& buffer                 = vs_input_info.buffers[binding];
 			key.vertex_input.bindings[binding] = {.stride   = buffer.stride,
 			                                      .instance = buffer.fetch_index != 0};
 		}
@@ -1633,8 +1814,8 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 			const auto binding = vs_input_info.resources_dst[attribute].buffer_index;
 			EXIT_IF(binding < 0 || binding >= vs_input_info.buffers_num);
 			key.vertex_input.attributes[attribute] = {
-			    .offset = static_cast<uint32_t>(vs_input_info.resources[attribute].Base48() -
-			                                    vs_input_info.buffers[binding].addr),
+			    .offset  = static_cast<uint32_t>(vs_input_info.resources[attribute].Base48() -
+			                                     vs_input_info.buffers[binding].addr),
 			    .binding = static_cast<uint8_t>(binding),
 			};
 		}
@@ -1661,7 +1842,8 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 		                            ps_active ? pixel_program.hash : 0,
 		                            ps_active ? pixel_program.spirv_words : 0);
 		CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vertex_info,
-		                       ps_input_info, programs, static_params, m_driver_cache);
+		                       ps_input_info, programs, static_params, m_driver_cache,
+		                       m_libraries.get());
 	}
 
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
@@ -1677,9 +1859,8 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	return *iter->second;
 }
 
-PipelineCache::Pipeline&
-PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
-                                  const ShaderProgram&          compute_program) {
+PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
+                                                           const ShaderProgram& compute_program) {
 	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Compute)", profiler::colors::RedA100);
 
 	EXIT_IF(!compute_program);

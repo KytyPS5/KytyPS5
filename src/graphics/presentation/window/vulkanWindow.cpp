@@ -480,6 +480,23 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		feedback_layout.pNext  = &feedback_dynamic;
 		supported_features2.pNext = &feedback_layout;
 	}
+	// Optional and asked for by name rather than required, so a device without it is still
+	// usable: the renderer falls back to building pipelines monolithically. `device_extensions` is
+	// the *required* list, so availability has to be enumerated here rather than read off it.
+	const auto available_device_extensions = EnumerateVulkan<vk::ExtensionProperties>(
+	    "vkEnumerateDeviceExtensionProperties",
+	    [&](uint32_t* count, vk::ExtensionProperties* values) {
+		    return physical_device.enumerateDeviceExtensionProperties(nullptr, count, values);
+	    });
+	const bool pipeline_library_extensions =
+	    HasExtension(available_device_extensions, VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME) &&
+	    HasExtension(available_device_extensions,
+	                 VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
+	vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT graphics_pipeline_library {};
+	if (pipeline_library_extensions) {
+		graphics_pipeline_library.pNext = supported_features2.pNext;
+		supported_features2.pNext       = &graphics_pipeline_library;
+	}
 	const bool provoking_extension =
 	    HasExtension(device_extensions, VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME);
 	vk::PhysicalDeviceProvokingVertexFeaturesEXT provoking_vertex {};
@@ -537,6 +554,11 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	if (graphics.mesh_shader_enabled) {
 		subgroup_size_control.pNext = &graphics.mesh_shader_properties;
 	}
+	vk::PhysicalDeviceGraphicsPipelineLibraryPropertiesEXT graphics_pipeline_library_properties {};
+	if (pipeline_library_extensions) {
+		graphics_pipeline_library_properties.pNext = properties2.pNext;
+		properties2.pNext                          = &graphics_pipeline_library_properties;
+	}
 	physical_device.getProperties2(&properties2);
 
 	graphics.subgroup_size                 = properties11.subgroupSize;
@@ -555,6 +577,18 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	     graphics.compute_subgroup_size_control_enabled ? "true" : "false",
 	     graphics.SupportsComputeWave64() ? "true" : "false");
 	graphics.provoking_vertex_last_enabled = provoking_extension && provoking_vertex.provokingVertexLast;
+	graphics.pipeline_library_enabled =
+	    pipeline_library_extensions &&
+	    graphics_pipeline_library.graphicsPipelineLibrary == VK_TRUE;
+	// Without fast linking a link is itself a compile and nothing has moved earlier, so a
+	// host with the extension but not fast linking is treated as not having it.
+	graphics.pipeline_library_fast_linking =
+	    graphics.pipeline_library_enabled &&
+	    graphics_pipeline_library_properties.graphicsPipelineLibraryFastLinking == VK_TRUE;
+	LOGF("Vulkan pipeline library: extensions=%s feature=%s fast_linking=%s\n",
+	     pipeline_library_extensions ? "true" : "false",
+	     graphics.pipeline_library_enabled ? "true" : "false",
+	     graphics.pipeline_library_fast_linking ? "true" : "false");
 	graphics.attachment_feedback_loop_enabled =
 	    feedback_extensions && feedback_layout.attachmentFeedbackLoopLayout &&
 	    feedback_dynamic.attachmentFeedbackLoopDynamicState;
@@ -657,14 +691,19 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		image_atomic_int64.sparseImageInt64Atomics = VK_FALSE;
 		create_info.pNext = &image_atomic_int64;
 	}
-	if (graphics.depth_color_copy_enabled) {
-		maintenance8.pNext = const_cast<void*>(create_info.pNext);
-		create_info.pNext = &maintenance8;
+	vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT enable_pipeline_library {};
+	std::vector<const char*>                             enabled_extensions = device_extensions;
+	if (graphics.pipeline_library_enabled) {
+		enabled_extensions.push_back(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
+		enabled_extensions.push_back(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
+		enable_pipeline_library.graphicsPipelineLibrary = VK_TRUE;
+		enable_pipeline_library.pNext = const_cast<void*>(create_info.pNext);
+		create_info.pNext             = &enable_pipeline_library;
 	}
 	create_info.pQueueCreateInfos       = &queue_create_info;
 	create_info.queueCreateInfoCount    = 1;
-	create_info.enabledExtensionCount   = static_cast<uint32_t>(device_extensions.size());
-	create_info.ppEnabledExtensionNames = device_extensions.data();
+	create_info.enabledExtensionCount   = static_cast<uint32_t>(enabled_extensions.size());
+	create_info.ppEnabledExtensionNames = enabled_extensions.data();
 	create_info.pEnabledFeatures        = &device_features;
 
 	vk::Device device = nullptr;

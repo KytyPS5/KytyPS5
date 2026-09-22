@@ -66,6 +66,25 @@ inline constexpr TargetViewInfo ResolveTargetViewInfo(uint32_t base_layer, uint3
 	        base_layer, last_layer - base_layer + 1u, last_layer + 1u};
 }
 
+// The stencil op/compare state a pipeline bakes in, kept apart from the masks and reference the
+// command buffer sets dynamically.
+#pragma pack(push, 1)
+
+struct PipelineStencilStaticState {
+	vk::StencilOp failOp      = vk::StencilOp::eKeep;
+	vk::StencilOp passOp      = vk::StencilOp::eKeep;
+	vk::StencilOp depthFailOp = vk::StencilOp::eKeep;
+	vk::CompareOp compareOp   = vk::CompareOp::eNever;
+};
+
+struct PipelineStencilDynamicState {
+	uint32_t compareMask = 0;
+	uint32_t writeMask   = 0;
+	uint32_t reference   = 0;
+};
+
+#pragma pack(pop)
+
 } // namespace Libs::Graphics
 
 #endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_RENDERTARGET_H_

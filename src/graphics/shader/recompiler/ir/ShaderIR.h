@@ -373,6 +373,33 @@ constexpr uint32_t NativePushConstantSize = sizeof(PushData);
 	       group * static_cast<uint32_t>(DescriptorBindingKind::Count);
 }
 
+// Descriptor sets a graphics pipeline layout holds: the pixel stage has its own.
+//
+// Both stages used to share set 0, which made the whole layout a function of *both* shaders - and
+// therefore made a fragment pipeline library, whose layout must be compatible with the final
+// pipeline's, unusable with any vertex shader but the one it was built beside. Note 157 measured
+// the cost of that: 41 corpus vertex shaders carry 19 distinct binding signatures, so reuse across
+// vertex partners would have collapsed. With the pixel stage in its own set, the fragment half of
+// the layout is a function of the pixel shader alone.
+constexpr uint32_t NativeDescriptorSetCount = 2;
+
+// Where a stage's resources live. Mesh, vertex and compute share set 0 - only one of them is ever
+// present in a pipeline - and pixel has set 1.
+[[nodiscard]] constexpr uint32_t NativeDescriptorSet(ShaderType stage) {
+	return stage == ShaderType::Pixel ? 1u : 0u;
+}
+
+// The same answer from the other side, for code that holds a binding index rather than a stage.
+//
+// This is not a second implementation of the rule: `NativeBinding` already offsets the pixel stage
+// by `DescriptorBindingKind::Count`, so the index *is* the stage, and both directions read the same
+// constant. That is what keeps the SPIR-V's DescriptorSet decoration and the host's descriptor
+// writes in step - they are not two intentions that must agree, they are one function asked twice.
+// ShaderIRDescriptorSetTests locks that down in both directions.
+[[nodiscard]] constexpr uint32_t NativeDescriptorSetForBinding(uint32_t native_binding) {
+	return native_binding >= static_cast<uint32_t>(DescriptorBindingKind::Count) ? 1u : 0u;
+}
+
 [[nodiscard]] constexpr ImageResourceClass ImageBindingResourceClass(DescriptorBindingKind kind) {
 	const auto value = static_cast<uint32_t>(kind);
 	if (value >= FirstImageBinding && value < FirstStorageImageBinding) {

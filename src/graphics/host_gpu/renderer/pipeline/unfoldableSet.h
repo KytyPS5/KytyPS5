@@ -15,8 +15,7 @@ namespace Libs::Graphics {
 // materialization had to bind null because its source is selected on the GPU. A pc here is proof,
 // not a guess, so resource tracking may claim it as a runtime table on the next translation.
 //
-// Split out of PipelineCache so the rollback below can be tested without a Vulkan device, the way
-// PipelineBuildGate already is.
+// Split out of PipelineCache so the rollback below can be tested without a Vulkan device.
 //
 // The reason a rollback exists at all: claiming a proven pc changes what the backend emits, and
 // for RESIDENT EVIL REQUIEM's clustered-lighting pixel shader it emits a dispatcher module of

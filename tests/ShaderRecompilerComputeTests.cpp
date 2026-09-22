@@ -222,6 +222,22 @@ struct TextureCacheTestAccess {
     cache.ClearImage(command, id, cache.GetImage(id).backing.format, range, clear);
   }
 
+  // Mirrors the garbage collector: schedule the download, then drop ownership.
+  static bool DownloadImageMemory(TextureCache &cache, ImageId id) {
+    auto lock = Lock(cache);
+    return cache.DownloadImageMemory(id);
+  }
+
+  static void CommitGpuWrite(TextureCache &cache, ImageId id) {
+    auto lock = Lock(cache);
+    cache.CommitGpuWrite(cache.m_slot_images[id]);
+  }
+
+  static void FreeImage(TextureCache &cache, ImageId id) {
+    auto lock = Lock(cache);
+    cache.FreeImage(id);
+  }
+
   static void ConfigureGarbageCollection(TextureCache &cache,
                                          std::span<const ImageId> oldest,
                                          uint64_t tick, uint64_t pressure) {
@@ -2346,6 +2362,217 @@ public:
     scheduler.Finish();
     download.Invalidate(download_offset, 16);
     std::printf("[host]    %-32s ok\n", "StreamBufferRing");
+  }
+
+  // A freed image keeps owning its guest bytes until its deferred write-back runs. The priority
+  // runner is FIFO, so a blocking operation queued first holds that write-back pending for the
+  // whole test, with no reliance on thread timing.
+  void CheckPredicatePendingImageWriteback() {
+    constexpr const char *name = "PredicatePendingImageWriteback";
+    constexpr uint64_t base = 0x0000000204900000ull;
+    constexpr uint64_t size = 0x10000;
+    constexpr uint64_t predicate = base + 0x2000;
+    constexpr uint64_t stale = 0;
+    constexpr uint64_t written_back = 0x0000000100000001ull;
+
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    auto &gpu = context.GetGpu();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), size, size, 0,
+                &direct_offset) == 0,
+            "write-back direct-memory allocation failed");
+    void *mapped_memory = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(&mapped_memory, size, 0x3, 0x10,
+                                                           direct_offset, size) == 0 &&
+                mapped_memory == reinterpret_cast<void *>(base),
+            "write-back fixed direct-memory mapping failed");
+    context.MapMemory(base, size);
+    std::memcpy(reinterpret_cast<void *>(predicate), &stale, sizeof(stale));
+
+    std::binary_semaphore gate{0};
+    std::binary_semaphore predicate_done{0};
+    std::unique_ptr<CommandProcessor> processor;
+    uint64_t sampled = 0;
+    bool skip_result = false;
+
+    gpu.SendCommandSync([&] {
+      GraphicsInitJmpTables();
+      processor = std::make_unique<CommandProcessor>(context, 0);
+      processor->BufferInit();
+      auto &scheduler = context.GetCommandScheduler();
+      auto &textures = context.GetTextureCache();
+      auto &buffers = context.GetBufferCache();
+
+      TextureCache::ImageDesc desc{};
+      desc.type = BindingType::Texture;
+      desc.info.data = {predicate, sizeof(uint64_t)};
+      desc.info.pixel_format = vk::Format::eR8G8B8A8Uint;
+      desc.info.guest_format = Prospero::BufferFormat::k8_8_8_8UInt;
+      desc.info.type = Prospero::ImageType::kColor2D;
+      desc.info.extent = {2, 1, 1};
+      desc.info.resources = {1, 1};
+      desc.info.pitch = 2;
+      desc.info.bytes_per_block = 4;
+      desc.info.samples = 1;
+      desc.info.tile_mode = Prospero::TileMode::kLinear;
+      desc.info.mip_layout[0] = {0, sizeof(uint64_t), 2, 1};
+      desc.view_info.format = desc.info.pixel_format;
+      desc.view_info.type = vk::ImageViewType::e2D;
+      desc.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+      desc.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+      const auto id = textures.FindImage(desc);
+      Require(name, "image setup", static_cast<bool>(id), "predicate image was not created");
+
+      vk::ClearValue clear{};
+      clear.color.uint32 = std::array{1u, 0u, 0u, 0u};
+      TextureCacheTestAccess::ClearImage(textures, scheduler.Current(), id,
+                                         {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, clear);
+      TextureCacheTestAccess::CommitGpuWrite(textures, id);
+      Require(name, "image owns the predicate bytes",
+              textures.IsRegionGpuModified(predicate, sizeof(uint64_t)),
+              "a GPU-written image did not report ownership of the predicate bytes");
+
+      // Queued first, so the image write-back below cannot run while this is held.
+      scheduler.DeferPriorityOperation([&gate] { gate.acquire(); });
+      Require(name, "download scheduled",
+              TextureCacheTestAccess::DownloadImageMemory(textures, id),
+              "the image download was not scheduled");
+      TextureCacheTestAccess::FreeImage(textures, id);
+
+      uint64_t current = 0;
+      std::memcpy(&current, reinterpret_cast<const void *>(predicate), sizeof(current));
+      Require(name, "ownership dropped before write-back",
+              !textures.IsRegionGpuModified(predicate, sizeof(uint64_t)) &&
+                  !buffers.IsRegionGpuModified(predicate, sizeof(uint64_t)) &&
+                  current == stale,
+              "the freed image still reported ownership, or its bytes were already current");
+    });
+
+    gpu.SendCommand([&] {
+      processor->SetPredication(1, 3, 1, reinterpret_cast<void *>(predicate), 0);
+      skip_result = processor->ShouldSkipPredicatedPackets();
+      std::memcpy(&sampled, reinterpret_cast<const void *>(predicate), sizeof(sampled));
+      predicate_done.release();
+    });
+    const bool completed_while_pending =
+        predicate_done.try_acquire_for(std::chrono::milliseconds(500));
+    gate.release();
+    if (!completed_while_pending) {
+      predicate_done.acquire();
+    }
+    Require(name, "pending write-back",
+            !completed_while_pending,
+            "the predicate was sampled while a deferred image write-back was still pending");
+    Require(name, "written-back value",
+            !skip_result && sampled == written_back,
+            "the predicate did not observe the image write-back");
+
+    gpu.SendCommandSync([&] { processor->BufferWait(); });
+    processor.reset();
+    context.UnmapMemory(base, size);
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, size) == 0,
+            "write-back direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, size) == 0,
+            "write-back direct-memory release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  void CheckBoolPredicationSync() {
+    constexpr const char *name = "BoolPredicationSync";
+    Require(name, "classification",
+            ClassifyPredicateSync(false, false, false) == PredicateSync::None &&
+                ClassifyPredicateSync(false, false, true) == PredicateSync::Download &&
+                ClassifyPredicateSync(true, false, false) == PredicateSync::Drain &&
+                ClassifyPredicateSync(false, true, false) == PredicateSync::Drain &&
+                // Ambiguous ownership fails closed.
+                ClassifyPredicateSync(false, true, true) == PredicateSync::Drain &&
+                ClassifyPredicateSync(true, true, true) == PredicateSync::Drain,
+            "memory predicate synchronization does not follow its GPU producers");
+
+    constexpr uint64_t base = 0x0000000204800000ull;
+    constexpr uint64_t size = 0x10000;
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    auto &gpu = context.GetGpu();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), size,
+                size, 0, &direct_offset) == 0,
+            "predicate direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, size, 0x3, 0x10, direct_offset, size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "predicate fixed direct-memory mapping failed");
+    context.MapMemory(base, size);
+
+    constexpr uint64_t cpu_only = base + 0x1000;
+    constexpr uint64_t gpu_written = base + 0x4000;
+    constexpr uint64_t cpu_value = 1;
+    constexpr uint64_t stale_value = 0;
+    constexpr uint32_t gpu_word = 0x00000001u;
+    std::memcpy(reinterpret_cast<void *>(cpu_only), &cpu_value, sizeof(cpu_value));
+    std::memcpy(reinterpret_cast<void *>(gpu_written), &stale_value, sizeof(stale_value));
+
+    // SET_PREDICATION runs on the GPU thread, as in production.
+    gpu.SendCommandSync([&] {
+      GraphicsInitJmpTables();
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      auto &scheduler = context.GetCommandScheduler();
+      auto &buffers = context.GetBufferCache();
+
+      // Nothing queued can produce these bytes: read them without draining the queue.
+      auto tick = scheduler.CurrentTick();
+      processor.SetPredication(0, 3, 1, reinterpret_cast<void *>(cpu_only), 0);
+      Require(name, "no producer",
+              processor.ShouldSkipPredicatedPackets() && scheduler.CurrentTick() == tick &&
+                  !scheduler.IsFree(tick),
+              "a predicate without a queued GPU producer submitted or waited");
+
+      // A queued GPU fill owns the bytes: the predicate must see its result, not the stale
+      // CPU value, and the queued work must have completed.
+      auto dirty = buffers.ObtainBuffer(gpu_written, sizeof(uint64_t), true, false);
+      Require(name, "queued producer setup",
+              dirty.first != nullptr && buffers.IsRegionGpuModified(gpu_written, sizeof(uint64_t)),
+              "the predicate bytes did not acquire GPU ownership");
+      buffers.FillBuffer(gpu_written, sizeof(uint64_t), gpu_word, false);
+      tick = scheduler.CurrentTick();
+      processor.SetPredication(1, 3, 1, reinterpret_cast<void *>(gpu_written), 0);
+      Require(name, "queued producer",
+              !processor.ShouldSkipPredicatedPackets() && scheduler.IsFree(tick) &&
+                  !buffers.IsRegionGpuModified(gpu_written, sizeof(uint64_t)),
+              "a predicate read stale bytes ahead of the queued GPU write that owns them");
+
+      // Without the wait flag, the old no-wait behavior is kept for clean bytes too.
+      tick = scheduler.CurrentTick();
+      processor.SetPredication(1, 3, 0, reinterpret_cast<void *>(cpu_only), 0);
+      Require(name, "no-wait flag",
+              !processor.ShouldSkipPredicatedPackets() && scheduler.CurrentTick() == tick,
+              "a no-wait bool predicate submitted the open command buffer");
+      processor.BufferWait();
+    });
+
+    context.UnmapMemory(base, size);
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, size) == 0,
+            "predicate direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, size) == 0,
+            "predicate direct-memory release failed");
+    std::printf("[host]    %-32s ok\n", name);
   }
 
   void CheckGpuCommandLane() {
@@ -32518,6 +32745,16 @@ int main(int argc, char **argv) {
     vulkan.CheckGpuTilerCpuParity();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--predicate-writeback-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckPredicatePendingImageWriteback();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--bool-predication-sync-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckBoolPredicationSync();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--gpu-command-lane-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckGpuCommandLane();
@@ -32855,6 +33092,8 @@ int main(int argc, char **argv) {
   for (const auto &test : graphics_tests) {
     RunGraphicsCase(&vulkan, test);
   }
+  vulkan.CheckBoolPredicationSync();
+  vulkan.CheckPredicatePendingImageWriteback();
   vulkan.CheckGpuCommandLane();
   std::printf("ShaderRecompilerComputeTests: all cases passed\n");
   return 0;

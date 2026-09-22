@@ -901,6 +901,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		}
 		auto& target =
 		    plan.value_storage.emplace_back(source->GetOpcode(), source->Flags<uint64_t>());
+		target.SetMemoSlot(plan.memo_slot_count++);
 		cloned.emplace(source, &target);
 		if (source->GetOpcode() == ValueOpcode::Phi) {
 			for (size_t index = 0; index < source->NumArgs(); index++) {

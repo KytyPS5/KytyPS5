@@ -613,8 +613,10 @@ static void ShaderGetStaticInputInfoPS(
 	if ((active_inputs & 0x00000004u) != 0) {
 		ps_info.ps_perspective_centroid_vgpr = 2u * std::popcount(active_inputs & 0x3u);
 	}
-	for (uint32_t i = 0; i < data.num_input_semantics && i < ps_info.input_num && i < 32u; i++) {
-		const auto& semantic = data.input_semantics[i];
+	for (uint32_t i = 0; i < data.num_input_semantics && i < ps_info.input_num &&
+	                     i < ShaderMappedData::MaxInputSemantics;
+	     i++) {
+		const auto& semantic = data.input_semantics_snapshot[i];
 		if (semantic.is_custom != 0 && semantic.is_f16 == 0) {
 			ps_info.custom_interpolation_mask |= 1u << i;
 		}

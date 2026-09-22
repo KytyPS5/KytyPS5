@@ -656,6 +656,11 @@ int KYTY_SYSV_ABI AgcCreateShader(Shader** dst, void* header, const volatile voi
 	map.user_data           = h->user_data;
 	map.input_semantics     = h->input_semantics;
 	map.num_input_semantics = h->num_input_semantics;
+	if (h->input_semantics != nullptr) {
+		const auto count = std::min<uint32_t>(h->num_input_semantics,
+		                                      ShaderMappedData::MaxInputSemantics);
+		std::copy_n(h->input_semantics, count, map.input_semantics_snapshot.begin());
+	}
 	map.code_size_bytes     = h->shader_size;
 	map.scratch_size_dwords = h->scratch_size_dw_per_thread;
 

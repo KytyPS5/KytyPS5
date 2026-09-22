@@ -73,7 +73,8 @@ bool ShaderReadVertexMetadata(const ShaderMappedData& data, uint32_t max_user_sg
 	if (data.input_semantics == nullptr) {
 		return ShaderError::Fail(error, "missing vertex input semantics");
 	}
-	std::memcpy(next.input_semantics.data(), data.input_semantics, semantic_size);
+	static_assert(ShaderVertexInputInfo::RES_MAX <= ShaderMappedData::MaxInputSemantics);
+	std::memcpy(next.input_semantics.data(), data.input_semantics_snapshot.data(), semantic_size);
 	next.input_semantics_count = data.num_input_semantics;
 	metadata                   = next;
 	return true;

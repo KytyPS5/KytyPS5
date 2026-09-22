@@ -28906,9 +28906,9 @@ void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride) {
                                   .domain = 1,
                                   .partitioning = 2,
                                   .output_topology = 2};
-  AnalyzeTessellationPrograms(local, control, tess);
   Require(name, "decoded interface",
-          tess.ls_stride == ls_stride && tess.hs_stride == hs_stride,
+          AnalyzeTessellationPrograms(local, control, tess) &&
+              tess.ls_stride == ls_stride && tess.hs_stride == hs_stride,
           "captured LS and HS address arithmetic must produce distinct strides");
 
   constexpr std::array stages{ShaderType::Local, ShaderType::TessellationControl,

@@ -26,6 +26,7 @@
 #include <span>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <xxhash.h>
@@ -826,10 +827,28 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 	return params;
 }
 
-std::array<ShaderParams, 3>
-PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context& context,
-                            std::array<ShaderVertexInputInfo, 3>& input_info) {
+static std::mutex                   g_rejected_tessellation_mutex;
+static std::unordered_set<uint64_t> g_rejected_tessellation;
+
+static uint64_t TessellationProgramKey(const HW::VertexShaderInfo& regs,
+                                       const HW::ShaderRegisters&  sh) {
+	const uint64_t words[4] = {GetDeclaredShaderHash(regs.ls_regs.data_addr),
+	                           GetDeclaredShaderHash(regs.hs_regs.data_addr), sh.m_vgtLsHsConfig,
+	                           sh.m_vgtTfParam};
+	return XXH3_64bits(words, sizeof(words));
+}
+
+bool PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context& context,
+                                 std::array<ShaderVertexInputInfo, 3>& input_info,
+                                 std::array<ShaderParams, 3>&          params) {
 	const auto& sh        = context.GetShaderRegisters();
+	const auto  tess_key  = TessellationProgramKey(regs, sh);
+	{
+		std::scoped_lock lock(g_rejected_tessellation_mutex);
+		if (g_rejected_tessellation.contains(tess_key)) {
+			return false;
+		}
+	}
 	const auto  local     = ShaderGetMappedData(regs.ls_regs.data_addr, "ShaderGetInputInfoLS():");
 	const auto  control   = ShaderGetMappedData(regs.hs_regs.data_addr, "ShaderGetInputInfoHS():");
 	const auto evaluation = ShaderGetMappedData(regs.es_regs.data_addr, "ShaderGetInputInfoTES():");
@@ -842,7 +861,7 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 
 	const auto local_users      = std::span(regs.hs_user_sgpr.value, regs.hs_regs.rsrc2.user_sgpr);
 	const auto evaluation_users = std::span(regs.gs_user_sgpr.value, regs.gs_regs.rsrc2.user_sgpr);
-	std::array<ShaderParams, 3> params {
+	params = {
 	    GetShaderParams(regs.ls_regs.data_addr, "ShaderRecompiler LS",
 	                    GetDeclaredShaderHash(regs.ls_regs.data_addr), local_users, local),
 	    GetShaderParams(regs.hs_regs.data_addr, "ShaderRecompiler HS",
@@ -877,11 +896,15 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 	};
 	EXIT_IF(tess.input_control_points == 0 || tess.input_control_points > 32 ||
 	        tess.output_control_points == 0 || tess.output_control_points > 32);
-	ShaderRecompiler::AnalyzeTessellationPrograms(params[0].code, params[1].code, tess);
+	if (!ShaderRecompiler::AnalyzeTessellationPrograms(params[0].code, params[1].code, tess)) {
+		std::scoped_lock lock(g_rejected_tessellation_mutex);
+		g_rejected_tessellation.insert(tess_key);
+		return false;
+	}
 	for (auto& stage: input_info) {
 		stage.tess = tess;
 	}
-	return params;
+	return true;
 }
 
 ShaderParams PrepareProgram(

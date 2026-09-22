@@ -7,7 +7,7 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 
 // Collects immutable resource topology from typed SSA handles, interns their resolved dwords in
 // descriptor_sources, then writes dense indices to handle flags and MemoryInfo.
-void TrackResources(Program& program);
+bool TrackResources(Program& program);
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
 

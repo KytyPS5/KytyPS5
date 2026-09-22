@@ -131,7 +131,7 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	buffer_offset = 0;
 
 	const auto& [address, size, id] = source;
-	if (address == 0 || size == 0) {
+	if (address < BufferCache::CACHING_PAGESIZE || size == 0) {
 		return {context.GetBufferCache().GetBuffer(NULL_BUFFER_ID).Handle(), 0, 16};
 	}
 	const auto& graphics  = context.GetGraphics();
@@ -800,7 +800,7 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 		auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[i]);
 		const auto address = descriptor.Base48();
 		const auto requested_size = descriptor.GetSize();
-		if (address == 0 || requested_size == 0) {
+		if (address < BufferCache::CACHING_PAGESIZE || requested_size == 0) {
 			prepared.buffer_sources.push_back({});
 			continue;
 		}

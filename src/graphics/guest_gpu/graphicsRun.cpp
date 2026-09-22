@@ -720,6 +720,14 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 
 		EXIT_NOT_IMPLEMENTED(remaining_dw < 2);
 
+		if ((packet_header >> 30u) == 0u) {
+			const auto packet_dw = ((packet_header >> 16u) & 0x3fffu) + 2u;
+			EXIT_NOT_IMPLEMENTED(packet_dw > remaining_dw);
+			cursor.offset_dw += packet_dw;
+			execution.m_made_progress = true;
+			continue;
+		}
+
 		if (GraphicsRunDebugDumpEnabled()) {
 			LOGF("CP packet: offset=0x%05" PRIx32 " cmd_id=0x%08" PRIx32 " op=0x%02" PRIx32
 			     " len=%" PRIu32 "\n",

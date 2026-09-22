@@ -266,4 +266,44 @@ private:
 	bool            flush_f32_inputs;
 };
 
+inline bool& TranslationNonFatalFlag() {
+	static thread_local bool value = false;
+	return value;
+}
+
+inline bool& TranslationUnsupportedFlag() {
+	static thread_local bool value = false;
+	return value;
+}
+
+class TranslationNonFatalScope {
+public:
+	explicit TranslationNonFatalScope(bool enabled)
+	    : m_previous(TranslationNonFatalFlag()) {
+		TranslationNonFatalFlag()    = enabled;
+		TranslationUnsupportedFlag() = false;
+	}
+	~TranslationNonFatalScope() {
+		TranslationNonFatalFlag() = m_previous;
+	}
+	TranslationNonFatalScope(const TranslationNonFatalScope&)            = delete;
+	TranslationNonFatalScope& operator=(const TranslationNonFatalScope&) = delete;
+
+private:
+	bool m_previous;
+};
+
+inline void SetTranslationNonFatal(bool enabled) {
+	TranslationNonFatalFlag()    = enabled;
+	TranslationUnsupportedFlag() = false;
+}
+
+inline bool TranslationUnsupported() {
+	return TranslationUnsupportedFlag();
+}
+
+inline bool TranslationNonFatal() {
+	return TranslationNonFatalFlag();
+}
+
 } // namespace Libs::Graphics::ShaderRecompiler::Frontend

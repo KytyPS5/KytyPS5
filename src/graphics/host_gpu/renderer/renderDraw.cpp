@@ -1404,11 +1404,14 @@ bool RenderExecutor::ResolveColorTargets(CommandBuffer& buffer, uint32_t render_
 	}
 
 	auto& cache = m_context.GetTextureCache();
-	cache.MarkGpuWritten(dst.image_id);
 	auto& source      = cache.GetImage(src.image_id);
 	auto& destination = cache.GetImage(dst.image_id);
-	destination.Resolve(source, {src.guest_mip_level, 1, src.guest_array_layer, 1},
-	                    {dst.guest_mip_level, 1, dst.guest_array_layer, 1});
+	const bool resolved =
+	    destination.Resolve(source, {src.guest_mip_level, 1, src.guest_array_layer, 1},
+	                        {dst.guest_mip_level, 1, dst.guest_array_layer, 1});
+	if (resolved) {
+		cache.MarkGpuWritten(dst.image_id);
+	}
 	return true;
 }
 

@@ -23,6 +23,7 @@
 #include <cinttypes>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <span>
 #include <tuple>
@@ -1792,14 +1793,28 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	if (!image.SafeToDownload() || !CanDownload(image)) {
 		return false;
 	}
-	const auto range    = image.info.data;
-	auto&      download = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
-	auto [mapped, offset] =
-	    download.Map(range.size, std::max<uint64_t>(image.info.bytes_per_block, 4));
-	if (mapped == nullptr) {
-		EXIT("TextureCache: failed to map reusable download buffer\n");
+	const auto range = image.info.data;
+	auto&      ring  = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
+	// An image larger than the ring gets a staging buffer of its own: an image's regions cannot be
+	// cut into ring-sized pieces the way a buffer range can.
+	std::unique_ptr<Buffer> dedicated;
+	uint8_t*                mapped = nullptr;
+	uint64_t                offset = 0;
+	if (range.size > ring.Size()) {
+		dedicated = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+		                                     vk::BufferUsageFlagBits::eTransferDst |
+		                                         vk::BufferUsageFlagBits::eTransferSrc,
+		                                     range.size);
+		mapped    = dedicated->Mapped().data();
+	} else {
+		std::tie(mapped, offset) =
+		    ring.Map(range.size, std::max<uint64_t>(image.info.bytes_per_block, 4));
+		if (mapped == nullptr) {
+			EXIT("TextureCache: failed to map reusable download buffer\n");
+		}
+		ring.Commit();
 	}
-	download.Commit();
+	auto& download = dedicated ? *dedicated : ring;
 	if (!LibKernel::Memory::TryReadBacking(range.address, mapped, range.size)) {
 		return false;
 	}
@@ -1820,10 +1835,11 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                                               vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
 	                                               1, &barrier, 0, nullptr);
-	m_scheduler.DeferPriorityOperation([&download, range, mapped, offset] {
-		download.Invalidate(offset, range.size);
-		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
-	});
+	m_scheduler.DeferPriorityOperation(
+	    [&ring, owner = std::move(dedicated), range, mapped, offset] {
+		    (owner ? *owner : ring).Invalidate(offset, range.size);
+		    LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
+	    });
 	return true;
 }
 

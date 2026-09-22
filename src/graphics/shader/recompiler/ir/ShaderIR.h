@@ -27,6 +27,7 @@ enum class ResourceKind {
 	ScalarBuffer,
 	ScalarAddress,
 	Buffer,
+	IndirectBuffer,
 	Flat,
 	Global,
 	Scratch,

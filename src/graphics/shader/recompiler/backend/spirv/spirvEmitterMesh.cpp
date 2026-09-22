@@ -1,4 +1,4 @@
-#include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
+#include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -127,10 +127,7 @@ void EmitMeshEntryPoint(EmitterState& state) {
 	state.builder.AddFunction(spv::OpFunctionCall, TypeVoid(state), state.builder.AllocateId(),
 	                          state.mesh_guest_func);
 	// All guest waves finish before the uniform Vulkan allocation and output stores.
-	state.builder.AddFunction(spv::OpControlBarrier, ConstantU32(state, spv::ScopeWorkgroup),
-	                          ConstantU32(state, spv::ScopeWorkgroup),
-	                          ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask |
-	                                                 spv::MemorySemanticsWorkgroupMemoryMask));
+	EmitBarrier(state);
 	const auto vertices   = MeshLoad(state, state.mesh_allocation, spv::StorageClassWorkgroup,
 	                                 TypeU32(state), ConstantU32(state, 0));
 	const auto primitives = MeshLoad(state, state.mesh_allocation, spv::StorageClassWorkgroup,

@@ -226,6 +226,9 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 		args << "--fullscreen";
 	}
 	args << "--readback-linear-images" << BoolArg(info.readback_linear_images);
+	if (info.tessellation_enabled) {
+		args << "--tessellation";
+	}
 	args << "--vblank-frequency" << QString::number(info.vblank_frequency);
 	args << "--console-language" << QString::number(info.console_language);
 	args << "--vulkan-validation" << BoolArg(info.vulkan_validation_enabled);
@@ -490,10 +493,8 @@ void MainDialogPrivate::Run() {
 
 	m_running_item->SetRunning(true);
 
-	Configuration info;
-	info.CopyFrom(m_running_item->GetInfo());
-	info.host_input_mapping = m_ui->widget->GetHostInputMapping();
-	m_main_dialog->RunInterpreter(&m_process, info);
+	auto info = m_ui->widget->CreateConfiguration(*m_running_item);
+	m_main_dialog->RunInterpreter(&m_process, *info);
 
 	Update();
 }

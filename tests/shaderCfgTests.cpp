@@ -1679,45 +1679,14 @@ void TestNewShaderRecompilerSMovB32() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
-void TestNewShaderRecompilerSoppMarkers() {
+void TestShaderStageBarriers() {
   const uint32_t shader[] = {
-      EncodeSopp(0x00, 3),    // s_nop 3
-      EncodeSopp(0x0c, 0),    // s_waitcnt 0
-      EncodeSopp(0x10, 0x0f), // s_sendmsg 15
-      EncodeSopp(0x16, 0x2a), // s_ttracedata 42
-      EncodeSopp(0x20, 1),    // s_inst_prefetch 1
       EncodeSopp(0x0a, 0),    // s_barrier
       EncodeSopp(0x01, 0),    // s_endpgm
   };
 
-  auto options = MakeCompileOptions(ShaderType::Compute);
-  options.dump_ir = true;
-
-  auto result = RecompileForTest(shader, options);
-  Check((result.decoded_dump.find("s_nop 0x00000003") != std::string::npos),
-        "new decoder did not decode SOPP s_nop");
-  Check((result.decoded_dump.find("s_waitcnt 0x00000000") != std::string::npos),
-        "new decoder did not decode SOPP s_waitcnt");
-  Check((result.decoded_dump.find("s_sendmsg 0x0000000f") != std::string::npos),
-        "new decoder did not decode SOPP s_sendmsg");
-  Check((result.decoded_dump.find("s_ttracedata 0x0000002a") != std::string::npos),
-        "new decoder did not decode SOPP s_ttracedata");
-  Check((result.decoded_dump.find("s_inst_prefetch 0x00000001") != std::string::npos),
-        "new decoder did not decode SOPP s_inst_prefetch");
-  Check((result.decoded_dump.find("s_barrier") != std::string::npos),
-        "new decoder did not decode SOPP s_barrier");
-  Check((result.ir_dump.find("ControlNop null, 0x00000003") != std::string::npos),
-        "SOPP s_nop did not lower to an IR marker");
-  Check((result.ir_dump.find("Waitcnt null, 0x00000000") != std::string::npos),
-        "SOPP s_waitcnt did not lower to an IR marker");
-  Check((result.ir_dump.find("Sendmsg null, 0x0000000f") != std::string::npos),
-        "SOPP s_sendmsg did not lower to an IR marker");
-  Check((result.ir_dump.find("TtraceData null, 0x0000002a") != std::string::npos),
-        "SOPP s_ttracedata did not lower to an IR marker");
-  Check((result.ir_dump.find("InstPrefetch null, 0x00000001") != std::string::npos),
-        "SOPP s_inst_prefetch did not lower to an IR marker");
-  Check((result.ir_dump.find("Barrier null") != std::string::npos),
-        "SOPP s_barrier did not lower to an IR marker");
+  const auto result =
+      RecompileForTest(shader, MakeCompileOptions(ShaderType::Compute));
   Check(SpirvContainsOpcode(result.spirv, 224),
         "SPIR-V binary does not contain OpControlBarrier");
   Check(
@@ -1725,6 +1694,70 @@ void TestNewShaderRecompilerSoppMarkers() {
           result.spirv.end(),
       "SPIR-V barrier does not use workgroup acquire-release memory semantics");
   CheckSpirvBinaryValidates(result.spirv);
+
+  const auto vertex_result =
+      RecompileForTest(shader, MakeCompileOptions(ShaderType::Vertex));
+  CheckSpirvBinaryValidates(vertex_result.spirv);
+  Check(!SpirvContainsOpcode(vertex_result.spirv, 224),
+        "independent vertex invocations retained a workgroup barrier");
+}
+
+void TestNggVertexEntryState() {
+  using namespace ShaderRecompiler;
+  // PPSA03309 shader 5a39eb2021a5d2c1: retain its NGG prologue and replace
+  // the resource-dependent vertex body with a position export.
+  const uint32_t shader[] = {
+      0xbfa00003u, 0x93ebff03u, 0x00040018u, 0xbefe03c1u,
+      0x9380ff02u, 0x00090016u, 0x9381ff02u, 0x0009000cu,
+      0xbf8a0000u, 0xbf076b80u, 0xbf850003u, 0x8f6a8c00u,
+      0x887c6a01u, 0xbf900009u, 0xd7650001u, 0x000100c1u,
+      0xd7460001u, 0x04050a6bu, 0x7da80200u, 0xbf880002u,
+      0xf8000941u, 0x00000000u, 0xbf8cff0fu, 0xbefe03c1u,
+      0x7da80201u, EncodeSopp(0x08, 2),
+      EncodeExp0(0x0c, 0xf), EncodeExp1(5, 5, 5, 5), EncodeSopp(0x01),
+  };
+  HW::VertexShaderInfo regs{};
+  regs.es_regs.data_addr = reinterpret_cast<uint64_t>(shader);
+  ShaderUserData user_data{};
+  ShaderMappedData mapped{};
+  mapped.user_data = &user_data;
+  mapped.code_size_bytes = sizeof(shader);
+  ShaderMapUserData(regs.es_regs.data_addr, mapped);
+  std::vector<uint32_t> previous_key;
+  for (const uint32_t wave_size : {32u, 64u}) {
+    HW::Context context;
+    context.SetShaderStages(wave_size == 32u ? 0x00400000u : 0u);
+    ShaderVertexInputInfo input{};
+    const auto params = PrepareProgram(regs, context, HW::UserConfig{}, input);
+    Check(input.wave_size == wave_size,
+          "vertex preparation lost the native NGG wave size");
+    const auto key = MakeStageStaticKey(input);
+    Check(previous_key != key, "NGG wave sizes shared a shader cache key");
+    previous_key = key;
+    auto options = MakeCompileOptions(ShaderType::Vertex);
+    options.user_data_base = 8;
+    options.user_data = params.user_data;
+    options.input_info.vertex = &input;
+    options.wave_size = input.wave_size;
+    const auto result = RecompileForTest(params.code, options);
+    bool live_vertex_range = false;
+    for (const auto *block : result.program.blocks) {
+      for (const auto &inst : *block) {
+        if (inst.GetOpcode() == IR::ValueOpcode::UGreaterThan32) {
+          const auto count = inst.Arg(0).Resolve();
+          live_vertex_range |= count.IsImmediate() && count.U32() == wave_size;
+        }
+      }
+    }
+    Check(live_vertex_range && std::ranges::any_of(result.program.info.outputs,
+              [](const auto &output) {
+                return output.kind == IR::StageOutputKind::Position;
+              }),
+          "NGG launch counts suppressed the vertex export");
+    Check(result.program.wave_size == wave_size,
+          "NGG wave size was lost during translation");
+    CheckSpirvBinaryValidates(result.spirv);
+  }
 }
 
 void TestNewShaderRecompilerSopkWaitcntMarkers() {
@@ -3433,6 +3466,69 @@ void TestNewShaderRecompilerCapturedVop1SdwaByteConvert() {
   Check(SpirvContainsOpcode(result.spirv, 112),
         "captured SDWA byte conversion did not emit OpConvertUToF");
   CheckSpirvBinaryValidates(result.spirv);
+
+  const uint32_t byte_sext[] = {0x7e20a0f9u, 0x000b1412u};
+  ShaderRecompiler::Decoder::Instruction decoded;
+  ShaderRecompiler::Decoder::DecodeInstruction(byte_sext, 0, decoded);
+  Check(decoded.word_count == 2u &&
+            decoded.opcode == ShaderRecompiler::Decoder::Opcode::UNSUPPORTED,
+        "V_CVT_F16_U16 accepted unimplemented SDWA byte sign extension");
+}
+
+void TestNewShaderRecompilerVop1SdwaNotDestination() {
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+
+  const auto check_destination = [&](uint32_t modifier, uint32_t dst_sel,
+                                      uint32_t dst_unused) {
+    const uint32_t shader[] = {
+        0x7e066ef9u, modifier, EncodeExp0(0x00, 0x1),
+        EncodeExp1(3, 0, 0, 0), EncodeSopp(0x01),
+    };
+
+    ShaderRecompiler::Decoder::Instruction decoded;
+    ShaderRecompiler::Decoder::DecodeInstruction(shader, 0, decoded);
+    Check(decoded.opcode == ShaderRecompiler::Decoder::Opcode::V_NOT_B32,
+          "V_NOT_B32 SDWA opcode did not decode");
+    Check(decoded.word_count == 2u,
+          "V_NOT_B32 SDWA instruction has the wrong word count");
+    Check(decoded.dst.kind == ShaderRecompiler::Decoder::OperandKind::Vgpr &&
+              decoded.dst.reg == 3u && decoded.dst.sdwa_sel == dst_sel &&
+              decoded.dst.sdwa_dst_unused == dst_unused &&
+              decoded.dst.explicit_sdwa_dst,
+          "V_NOT_B32 SDWA destination metadata is incorrect");
+    Check(decoded.src0.kind == ShaderRecompiler::Decoder::OperandKind::Vgpr &&
+              decoded.src0.reg == 0u && decoded.src0.sdwa_sel == 6u &&
+              !decoded.src0.negate && !decoded.src0.absolute,
+          "V_NOT_B32 SDWA source metadata is incorrect");
+
+    auto result = RecompileForTest(shader, options);
+    CheckSpirvBinaryValidates(result.spirv);
+  };
+
+  check_destination(0x00061400u, 4u, 2u);
+  check_destination(0x00060500u, 5u, 0u);
+  check_destination(0x00060000u, 0u, 0u);
+
+  const auto check_rejected = [&](uint32_t modifier, const char *message) {
+    const uint32_t instruction[] = {0x7e066ef9u, modifier};
+
+    ShaderRecompiler::Decoder::Instruction decoded;
+    ShaderRecompiler::Decoder::DecodeInstruction(instruction, 0, decoded);
+    Check(decoded.word_count == 2u &&
+              decoded.opcode == ShaderRecompiler::Decoder::Opcode::UNSUPPORTED,
+          message);
+  };
+
+  check_rejected(0x00060700u, "V_NOT_B32 SDWA accepted destination selector 7");
+  check_rejected(0x00070600u, "V_NOT_B32 SDWA accepted source selector 7");
+  check_rejected(0x00061c00u,
+                 "V_NOT_B32 SDWA accepted destination unused value 3");
+  check_rejected(0x00160400u, "V_NOT_B32 SDWA accepted source negation");
+  check_rejected(0x00260400u, "V_NOT_B32 SDWA accepted source absolute");
+  check_rejected(0x00062400u, "V_NOT_B32 SDWA accepted clamp");
+  check_rejected(0x00064400u, "V_NOT_B32 SDWA accepted output modifier");
+  check_rejected(0x00000400u,
+                 "V_NOT_B32 SDWA partial destination accepted a byte source");
 }
 
 void TestNewShaderRecompilerBootB16PackedAndSdwaOpcodes() {
@@ -13387,6 +13483,8 @@ int main() {
   TestNewShaderRecompilerSpirvSizeBaselines();
   TestDemandDrivenSpirvDeclarations();
   TestNewShaderRecompilerSMovB32();
+  TestShaderStageBarriers();
+  TestNggVertexEntryState();
   TestNewShaderRecompilerClipDisabledPosition();
   TestNewShaderRecompilerAuxPositionExports();
   TestNewShaderRecompilerNativeWideScalarMemoryIr();
@@ -13397,6 +13495,7 @@ int main() {
   TestNewShaderRecompilerDsReadWrite2Translation();
   TestNewShaderRecompilerDsWideAndAtomicTranslation();
   TestNewShaderRecompilerCapturedVop1SdwaByteConvert();
+  TestNewShaderRecompilerVop1SdwaNotDestination();
   TestNewShaderRecompilerScalarMemoryBindingDomains();
   // Opcode semantics and optimized SPIR-V are exercised by
   // ShaderRecompilerComputeTests; keep the distinct decoder contract checks

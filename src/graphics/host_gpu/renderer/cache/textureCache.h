@@ -173,6 +173,13 @@ private:
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;
 	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
 	uint64_t         m_gc_tick                = 0;
+	// The frame the per-frame eviction budget below belongs to.
+	uint64_t         m_gc_budget_frame        = 0;
+	uint64_t         m_gc_freed_bytes_frame   = 0;
+	size_t           m_gc_freed_images_frame  = 0;
+	uint64_t         m_gc_written_back_bytes_frame = 0;
+	// Presented frames, plus one per 512 collector runs so a stretch without presents still ages.
+	[[nodiscard]] uint64_t LruClock() const noexcept;
 	bool             m_readback_linear_images = false;
 	bool             m_readback_tiled_images  = false;
 

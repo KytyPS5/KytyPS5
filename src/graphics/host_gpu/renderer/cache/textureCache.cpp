@@ -216,7 +216,7 @@ void TextureCache::RegisterImage(ImageId id) {
 		m_image_page_table[page].push_back(id);
 	});
 	image.registered = true;
-	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
+	image.lru_id     = m_lru_cache.Insert(id, LruClock());
 	m_total_used_memory += image.AccountedSize();
 }
 
@@ -267,7 +267,7 @@ void TextureCache::FreeImage(ImageId id) {
 
 void TextureCache::TouchImage(Image& image) {
 	if (image.registered) {
-		m_lru_cache.Touch(image.lru_id, m_gc_tick);
+		m_lru_cache.Touch(image.lru_id, LruClock());
 	}
 }
 
@@ -1916,41 +1916,64 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 	}
 }
 
+uint64_t TextureCache::LruClock() const noexcept {
+	return m_graphics.presented_frames.load(std::memory_order_relaxed) + m_gc_tick / 512;
+}
+
 void TextureCache::RunGarbageCollector() {
 	std::scoped_lock lock {m_lock};
-	const uint64_t   tick = m_gc_tick++;
-	if (m_graphics.CanReportMemoryUsage()) {
-		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
-	}
+	m_gc_tick++;
+	const uint64_t clock = LruClock();
+	// Pressure is judged by the cache's own image bytes: device-wide usage also counts images
+	// spilled to host memory and never falls.
 	if (m_total_used_memory < m_trigger_gc_memory) {
 		return;
 	}
+	if (m_gc_budget_frame != clock) {
+		m_gc_budget_frame             = clock;
+		m_gc_freed_bytes_frame        = 0;
+		m_gc_freed_images_frame       = 0;
+		m_gc_written_back_bytes_frame = 0;
+	}
 	const auto collect = [&](bool allow_aggressive) {
-		bool     pressured  = m_total_used_memory >= m_pressure_gc_memory;
-		bool     aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
-		uint64_t age        = 16;
-		size_t   deletions  = 10;
-		if (aggressive) {
-			age       = 160;
-			deletions = 40;
-		} else if (pressured) {
-			age       = 80;
-			deletions = 20;
+		bool pressured  = m_total_used_memory >= m_pressure_gc_memory;
+		bool aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
+		// Ages are in presented frames; an image used in the frame being recorded is never a
+		// candidate.
+		const uint64_t age = std::min<uint64_t>(aggressive ? 1 : pressured ? 4 : 16, clock);
+		constexpr uint64_t MiB             = 1024 * 1024;
+		constexpr size_t   MaxFreesInFrame = 1024;
+		uint64_t           byte_budget     = 0;
+		size_t             deletions       = 10;
+		if (pressured || aggressive) {
+			// Under pressure eviction is budgeted per frame in bytes freed, in proportion to the
+			// excess.
+			const auto threshold = aggressive ? m_critical_gc_memory : m_pressure_gc_memory;
+			const auto excess    = m_total_used_memory - threshold;
+			byte_budget = aggressive ? std::max<uint64_t>(64 * MiB, excess / 4)
+			                         : std::max<uint64_t>(16 * MiB, excess / 8);
+			if (m_gc_freed_bytes_frame >= byte_budget ||
+			    m_gc_freed_images_frame >= MaxFreesInFrame) {
+				return;
+			}
+			deletions = MaxFreesInFrame - m_gc_freed_images_frame;
 		}
-		age = std::min(age, tick);
+		const size_t visit_limit = pressured || aggressive ? deletions * 4 : deletions;
 		std::vector<ImageId> candidates;
-		candidates.reserve(deletions);
+		candidates.reserve(std::min<size_t>(visit_limit, 4096));
 		// Deleting depth recursively deletes its stencil association, so finish LRU traversal
 		// first.
-		m_lru_cache.ForEachItemBelow(tick - age, [&](ImageId id) {
+		m_lru_cache.ForEachItemBelow(clock - age, [&](ImageId id) {
 			candidates.push_back(id);
-			return candidates.size() == deletions;
+			return candidates.size() >= visit_limit || candidates.size() >= 4096;
 		});
 		for (const auto id: candidates) {
 			if (deletions == 0) {
 				break;
 			}
-			--deletions;
+			if (!(pressured || aggressive)) {
+				--deletions;
+			}
 			auto owner = m_slot_images.try_get(id);
 			if (owner == nullptr || !owner->registered || owner->depth_id) {
 				continue;
@@ -1962,7 +1985,13 @@ void TextureCache::RunGarbageCollector() {
 			}
 			if (owner->IsGpuModified()) {
 				const bool safe = owner->SafeToDownload();
-				if (safe && owner->info.IsTiled()) {
+				// Under pressure a GPU-written tiled image is written back within a per-frame
+				// budget; one that does not fit what is left waits for the next frame.
+				constexpr uint64_t WriteBackPerFrame = 256 * MiB;
+				if (safe && owner->info.IsTiled() &&
+				    (!(pressured || aggressive) ||
+				     (m_gc_written_back_bytes_frame != 0 &&
+				      m_gc_written_back_bytes_frame + owner->info.data.size > WriteBackPerFrame))) {
 					continue;
 				}
 				if (safe && !pressured) {
@@ -1971,9 +2000,21 @@ void TextureCache::RunGarbageCollector() {
 				if (safe && !DownloadImageMemory(id)) {
 					continue;
 				}
+				if (safe && owner->info.IsTiled()) {
+					m_gc_written_back_bytes_frame += owner->info.data.size;
+				}
 			}
+			const auto freed = owner->AccountedSize();
 			FreeImage(id);
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureEvictions);
+			if (pressured || aggressive) {
+				--deletions;
+				m_gc_freed_images_frame++;
+				m_gc_freed_bytes_frame += freed;
+				if (m_gc_freed_bytes_frame >= byte_budget) {
+					break;
+				}
+			}
 			if (m_total_used_memory < m_critical_gc_memory && aggressive) {
 				deletions >>= 2;
 				aggressive = false;

@@ -344,7 +344,7 @@ static KYTY_SYSV_ABI uint64_t ResolveImportStubWithId(uint64_t record_id) {
 		auto& last       = g_tls_last_unresolved_stub;
 		last.valid       = true;
 		last.patch_vaddr = 0;
-		last.index       = record_id;
+		last.index       = record.index;
 
 		if (record_id < g_stubbed_imports.size()) {
 			const auto& record = g_stubbed_imports[record_id];

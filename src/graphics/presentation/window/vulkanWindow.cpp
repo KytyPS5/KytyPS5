@@ -409,11 +409,14 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	                   vk::PhysicalDeviceShaderClockFeaturesKHR,
 	                   vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT,
 	                   vk::PhysicalDeviceConditionalRenderingFeaturesEXT,
-	                   vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR>
+	                   vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR,
+	                   vk::PhysicalDeviceFaultFeaturesEXT,
+	                   vk::PhysicalDeviceDiagnosticsConfigFeaturesNV>
 	    supported;
 	auto& [supported2, supported12, supported13, robustness2, workgroup_layout, mesh,
 	       feedback_layout, feedback_dynamic, provoking_vertex, maintenance8, shader_clock,
-	       image_atomic_int64, conditional_rendering, barycentric] = supported;
+	       image_atomic_int64, conditional_rendering, barycentric, device_fault,
+	       diagnostics_config] = supported;
 	graphics.memory_budget_ext_enabled = add(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 	add(VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME);
 	const bool extended_dynamic_state = add(VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME);
@@ -448,6 +451,14 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	}
 	if (!add(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME)) {
 		supported.unlink<vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR>();
+	}
+	// Device-loss reporting: the fault query, and on NVIDIA the shader and resource tracking its
+	// crash dump draws on.
+	if (!add(VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
+		supported.unlink<vk::PhysicalDeviceFaultFeaturesEXT>();
+	}
+	if (!add(VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME)) {
+		supported.unlink<vk::PhysicalDeviceDiagnosticsConfigFeaturesNV>();
 	}
 	Vr::OpenXrAppendExtensions(device_extensions, available_extensions, true);
 	physical_device.getFeatures2(&supported2);
@@ -521,6 +532,7 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 		    std::lround(graphics.physical_device_properties.limits.timestampPeriod * 1000.0f));
 	}
 	graphics.conditional_rendering_enabled = conditional_rendering.conditionalRendering;
+	graphics.device_fault_enabled          = device_fault.deviceFault == VK_TRUE;
 	LOGF("Vulkan maintenance8 support: %s\n",
 	     graphics.maintenance8_enabled ? "true" : "false");
 	LOGF("Vulkan depth feedback support: %s\n",
@@ -616,7 +628,13 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	    // The renderer only uses the Vulkan 1.3 core dynamic states, but RADV (Mesa 26.3) creates
 	    // its PS epilog cache only when this EXT feature is enabled and crashes in vkCmdDraw when
 	    // a depth- or stencil-writing fragment shader needs an epilog.
-	    vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT {.extendedDynamicState = VK_TRUE}};
+	    vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT {.extendedDynamicState = VK_TRUE},
+	    vk::PhysicalDeviceFaultFeaturesEXT {.deviceFault = VK_TRUE},
+	    vk::PhysicalDeviceDiagnosticsConfigFeaturesNV {.diagnosticsConfig = VK_TRUE},
+	    vk::DeviceDiagnosticsConfigCreateInfoNV {
+	        .flags = vk::DeviceDiagnosticsConfigFlagBitsNV::eEnableShaderDebugInfo |
+	                 vk::DeviceDiagnosticsConfigFlagBitsNV::eEnableResourceTracking |
+	                 vk::DeviceDiagnosticsConfigFlagBitsNV::eEnableShaderErrorReporting}};
 	if (!workgroup_layout.workgroupMemoryExplicitLayout) {
 		create.unlink<vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR>();
 	}
@@ -649,6 +667,11 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	}
 	if (!extended_dynamic_state) {
 		create.unlink<vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT>();
+	}
+	if (!graphics.device_fault_enabled) create.unlink<vk::PhysicalDeviceFaultFeaturesEXT>();
+	if (diagnostics_config.diagnosticsConfig != VK_TRUE) {
+		create.unlink<vk::PhysicalDeviceDiagnosticsConfigFeaturesNV>();
+		create.unlink<vk::DeviceDiagnosticsConfigCreateInfoNV>();
 	}
 
 	vk::Device device = nullptr;

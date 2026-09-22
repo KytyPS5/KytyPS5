@@ -20,6 +20,12 @@ struct VulkanImage;
 
 inline constexpr uint32_t VULKAN_TARGET_API_VERSION = VK_API_VERSION_1_3;
 
+struct GraphicContext;
+
+// After VK_ERROR_DEVICE_LOST: prints what VK_EXT_device_fault reports and writes its vendor binary
+// (an NVIDIA GPU crash dump) to _device_fault.nv-gpudmp.
+void DumpDeviceLossDiagnostics(GraphicContext& graphics);
+
 struct GraphicContext {
 	vk::Instance                       instance                              = nullptr;
 	vk::DebugUtilsMessengerEXT         debug_messenger                       = nullptr;
@@ -29,6 +35,7 @@ struct GraphicContext {
 	vk::Device                         device                                = nullptr;
 	VmaAllocator                       allocator                             = nullptr;
 	bool                               memory_budget_ext_enabled             = false;
+	bool                               device_fault_enabled                  = false;
 	bool                               compute_subgroup_size_control_enabled = false;
 	bool                               shader_image_int64_atomics_enabled    = false;
 	bool                               attachment_feedback_loop_enabled      = false;

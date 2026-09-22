@@ -691,6 +691,9 @@ static AjmDecodeResult AjmSetGaplessDecode(uint32_t instance, const void* gaples
 	}
 
 	state->gapless.Set(*static_cast<const AjmSidebandGaplessDecode*>(gapless_decode), reset != 0);
+	if (reset != 0) {
+		state->decoder->Reset();
+	}
 	return state->decoder->MakeResult();
 }
 

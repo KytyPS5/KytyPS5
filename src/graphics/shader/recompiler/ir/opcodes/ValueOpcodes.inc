@@ -8,6 +8,7 @@ VALUE_OPCODE(ReferenceU32, Void, U32)
 // Translation and register-state pseudo operations.
 VALUE_OPCODE(GetUserData, U32, ScalarReg)
 VALUE_OPCODE(GetShaderBase, U64)
+VALUE_OPCODE(ReadClockRealtime64, U64)
 VALUE_OPCODE(MeshDrawParameter, U32, U32)
 VALUE_OPCODE(MeshAllocate, Void, U32)
 VALUE_OPCODE(TessellationBase, U32, U32)

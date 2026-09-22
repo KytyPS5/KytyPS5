@@ -616,6 +616,10 @@ void DefineModule(EmitterState& state) {
 		state.builder.RequireCapability(spv::CapabilityInt64);
 		state.builder.RequireCapability(spv::CapabilityInt64Atomics);
 	}
+	if (state.requirements.shader_clock) {
+		state.builder.RequireCapability(spv::CapabilityShaderClockKHR);
+		state.builder.RequireExtension("SPV_KHR_shader_clock");
+	}
 	if (state.clip_distance_variable != 0) {
 		state.builder.RequireCapability(spv::CapabilityClipDistance);
 	}

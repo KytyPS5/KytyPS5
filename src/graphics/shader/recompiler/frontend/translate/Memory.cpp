@@ -891,6 +891,9 @@ bool Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::S_BUFFER_LOAD_DWORDX4:
 		case Decoder::Opcode::S_BUFFER_LOAD_DWORDX8:
 		case Decoder::Opcode::S_BUFFER_LOAD_DWORDX16: return S_LOAD(inst, false);
+		case Decoder::Opcode::S_MEMREALTIME:
+			WriteOperand(inst.dst, ir.Emit(IR::ValueOpcode::ReadClockRealtime64));
+			return true;
 
 		case Decoder::Opcode::BUFFER_LOAD_UBYTE:
 		case Decoder::Opcode::BUFFER_LOAD_SBYTE:

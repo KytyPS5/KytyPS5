@@ -97,6 +97,17 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 	Log::WriteToConsoleAndLog(message);
 }
 
+bool UsesShaderClock(const ShaderRecompiler::IR::Program& program) {
+	for (auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			if (inst.GetOpcode() == ShaderRecompiler::IR::ValueOpcode::ReadClockRealtime64) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
 bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
 	return !values.empty() &&
 	       Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, values.data(), values.size_bytes());
@@ -372,6 +383,19 @@ struct PipelineCache::ProgramCache {
 			unsupported.insert(lookup_key);
 			return ShaderProgram {};
 		}
+		if (!shader_clock && UsesShaderClock(translated.program)) {
+			if (!ShaderFailureNonFatal()) {
+				EXIT("S_MEMREALTIME needs shaderDeviceClock\n");
+			}
+			static std::atomic<uint32_t> reported = 0;
+			if (reported.fetch_add(1) < 16) {
+				LOGF("ProgramCache: skipping stage %u hash=0x%016" PRIx64
+				     ": S_MEMREALTIME needs shaderDeviceClock\n",
+				     static_cast<uint32_t>(stage), params.hash);
+			}
+			unsupported.insert(lookup_key);
+			return ShaderProgram {};
+		}
 		if (entry == programs.end()) {
 			entry = programs.try_emplace(lookup_key,
 			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program)).first;
@@ -412,7 +436,8 @@ struct PipelineCache::ProgramCache {
 		return permutation.handle;
 	}
 
-	explicit ProgramCache(vk::Device device): device(device) {
+	ProgramCache(vk::Device device, bool shader_clock)
+	    : device(device), shader_clock(shader_clock) {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 	}
 	~ProgramCache() {
@@ -428,11 +453,13 @@ struct PipelineCache::ProgramCache {
 	std::unordered_set<ProgramKey, ProgramKeyHash>              unsupported;
 	ProgramKey                                                  lookup_key;
 	vk::Device                                                  device;
+	bool                                                        shader_clock = false;
 	uint64_t                                                    next_shader_id = 0;
 };
 
 PipelineCache::PipelineCache(GraphicContext& graphics)
-    : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)) {
+    : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device,
+                                                                   graphics.shader_device_clock_enabled)) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
 }

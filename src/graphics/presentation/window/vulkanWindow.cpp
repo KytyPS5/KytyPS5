@@ -668,6 +668,19 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		provoking_vertex.pNext = const_cast<void*>(create_info.pNext);
 		provoking_vertex.transformFeedbackPreservesProvokingVertex = VK_FALSE;
 		create_info.pNext = &provoking_vertex;
+	vk::PhysicalDeviceShaderClockFeaturesKHR shader_clock {};
+	if (HasExtension(device_extensions, VK_KHR_SHADER_CLOCK_EXTENSION_NAME)) {
+		vk::PhysicalDeviceShaderClockFeaturesKHR supported_clock {};
+		vk::PhysicalDeviceFeatures2              clock_query {};
+		clock_query.pNext = &supported_clock;
+		physical_device.getFeatures2(&clock_query);
+		if (supported_clock.shaderDeviceClock) {
+			shader_clock.shaderDeviceClock       = VK_TRUE;
+			shader_clock.pNext                   = const_cast<void*>(create_info.pNext);
+			create_info.pNext                    = &shader_clock;
+			graphics.shader_device_clock_enabled = true;
+		}
+	}
 	}
 	create_info.pQueueCreateInfos       = &queue_create_info;
 	create_info.queueCreateInfoCount    = 1;
@@ -1029,6 +1042,9 @@ void WindowContext::CreateVulkan() {
 		if (HasExtension(available_extensions, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 			graphic_ctx.memory_budget_ext_enabled = true;
+		}
+		if (HasExtension(available_extensions, VK_KHR_SHADER_CLOCK_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_KHR_SHADER_CLOCK_EXTENSION_NAME);
 		}
 		for (const auto* extension: {VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
 		                             VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,

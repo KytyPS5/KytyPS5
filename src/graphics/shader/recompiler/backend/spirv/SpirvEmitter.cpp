@@ -261,6 +261,7 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 			}
 			switch (inst.GetOpcode()) {
 				case IR::ValueOpcode::Ballot: requirements.subgroup_ballot = true; break;
+				case IR::ValueOpcode::ReadClockRealtime64: requirements.shader_clock = true; break;
 				case IR::ValueOpcode::DppMoveU32:
 				case IR::ValueOpcode::ReadFirstLane:
 				case IR::ValueOpcode::ReadLane: {

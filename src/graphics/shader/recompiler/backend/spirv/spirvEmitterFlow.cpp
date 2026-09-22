@@ -720,6 +720,30 @@ uint32_t EmitGetShaderBase(ValueEmitContext& ctx) {
 	return ctx.Def(IR::Value(uint64_t {0}));
 }
 
+uint32_t EmitReadClockRealtime64(ValueEmitContext& ctx) {
+	auto&      state = ctx.state;
+	const auto clock = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpReadClockKHR, TypeU32Vector(state, 2), clock,
+	                          ConstantU32(state, spv::ScopeDevice));
+	const auto low  = state.builder.AllocateId();
+	const auto high = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), low, clock, 0);
+	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), high, clock, 1);
+	constexpr uint32_t ClockShift = 3;
+	const auto low_shifted = Binary(state, spv::OpShiftRightLogical, TypeU32(state), low,
+	                                ConstantU32(state, ClockShift));
+	const auto high_carried = Binary(state, spv::OpShiftLeftLogical, TypeU32(state), high,
+	                                 ConstantU32(state, 32u - ClockShift));
+	const auto low_result =
+	    Binary(state, spv::OpBitwiseOr, TypeU32(state), low_shifted, high_carried);
+	const auto high_result = Binary(state, spv::OpShiftRightLogical, TypeU32(state), high,
+	                                ConstantU32(state, ClockShift));
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeConstruct, TypeU64(state), result, low_result,
+	                          high_result);
+	return result;
+}
+
 void EmitUnreachable(ValueEmitContext& ctx, const IR::Inst& inst) {
 	ctx.Fail(inst, "must be lowered before SPIR-V emission");
 }

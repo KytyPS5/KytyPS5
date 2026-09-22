@@ -10,6 +10,7 @@
 #include <array>
 #include <optional>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler {
@@ -61,31 +62,35 @@ struct CompileResult {
 	RecompileStatus        status;
 };
 
-// Decoded source and typed scalar call queries are retained once per cache source.
-struct ShaderSource {
-	struct Call {
-		uint32_t instruction;
-		std::array<IR::Value, 2> target;
-	};
-	struct Linked {
-		std::vector<uint32_t> code;
-		Decoder::Program decoded;
-		std::vector<uint32_t> observed_function;
-	};
-	std::vector<uint32_t> code;
-	Decoder::Program decoded;
-	IR::ResourcePlan call_targets;
-	std::optional<Call> call;
-	std::optional<Linked> linked;
-	uint64_t revision = 0;
-	std::vector<std::pair<uint64_t, uint64_t>> reads;
+// What the structurized-CFG cache has done this session. The cache is meant to be invisible -
+// a hit and a build produce the same graph - so this is the only way a run or a test can tell the
+// two apart, and it is the number that says what the cache is worth.
+struct CfgCacheStats {
+	uint64_t hits    = 0;
+	uint64_t misses  = 0;
+	uint64_t evicted = 0;
+	uint64_t refused = 0;
+	uint64_t entries = 0;
+	uint64_t bytes   = 0;
+	uint64_t loaded   = 0;
+	uint64_t stored   = 0;
+	uint64_t rejected = 0;
+	uint64_t hits_from_file    = 0;
+	uint64_t avoided_file_us   = 0;
+	uint64_t avoided_memory_us = 0;
 };
 
-[[nodiscard]] ShaderSource PrepareShaderSource(std::span<const uint32_t> code,
-	                                           const CompileOptions& options);
-const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtRuntime& runtime);
-[[nodiscard]] TranslateResult TranslateProgram(const Decoder::Program& decoded,
-	                                           const CompileOptions& options);
+[[nodiscard]] CfgCacheStats CfgCacheStatistics();
+
+// Backs the structurized-CFG cache with a file. `stamp` must change whenever CFG::BuildGraph or
+// CFG::Structurize changes behaviour, or CFG::Graph's layout changes; 0 disables the file.
+void OpenCfgCacheFile(const std::string& path, uint64_t stamp);
+
+// Write the file out. Safe to call repeatedly; does nothing when no file is configured.
+void FlushCfgCacheFile();
+
+// Empties the in-memory cache and forgets any file. Tests only.
+void ResetCfgCacheForTest();
 
 [[nodiscard]] TranslateResult TranslateProgram(std::span<const uint32_t> code,
                                                const CompileOptions& options);

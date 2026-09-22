@@ -194,9 +194,19 @@ private:
 	// cleanly, so the cache is written while the run is still alive.
 	static constexpr std::chrono::seconds DriverCacheSavePeriod {20};
 
+	static constexpr std::chrono::seconds CfgCacheFlushPeriod {20};
+	std::chrono::steady_clock::time_point m_last_cfg_flush     = std::chrono::steady_clock::now();
+	// The recompiler's miss count as of the last flush; unchanged means the file already holds
+	// everything this session has.
+	uint64_t                              m_cfg_flushed_misses = 0;
+	bool                                  m_cfg_cache_enabled  = false;
+
 	void InitializeDriverCache();
+	void InitializeCfgCache(const std::filesystem::path& folder, const std::string& title_id);
 	bool WriteDriverCacheLocked();
 	void MaybeSaveDriverCacheLocked();
+	void FlushCfgCacheIfDirtyLocked();
+	void MaybeFlushCfgCacheLocked();
 	void DestroyPipelineObjects(const Pipeline& pipeline);
 };
 

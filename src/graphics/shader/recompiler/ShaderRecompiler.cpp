@@ -21,10 +21,16 @@
 #include <array>
 #include <chrono>
 #include <fmt/format.h>
+#include <filesystem>
+#include <fstream>
 #include <functional>
+#include <list>
 #include <map>
+#include <mutex>
 #include <span>
+#include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler {
 
@@ -32,6 +38,677 @@ namespace {
 
 const char* GetDumpLabel(const CompileOptions& options) {
 	return options.dump_label != nullptr ? options.dump_label : "ShaderRecompiler";
+}
+
+// What the CFG step decided, so a cache hit reproduces the same control flow - and the same log -
+// as the build it stands in for.
+enum class CfgOutcome { BuildRejected, Irreducible, StructurizeFailed, Structured };
+
+const char* CfgOutcomeName(CfgOutcome outcome) {
+	switch (outcome) {
+		case CfgOutcome::BuildRejected: return "build-rejected";
+		case CfgOutcome::Irreducible: return "irreducible";
+		case CfgOutcome::StructurizeFailed: return "structurize-failed";
+		case CfgOutcome::Structured: return "structured";
+	}
+	return "unknown";
+}
+
+// The heap one graph holds. An estimate, and only ever used to bound the cache, but it counts the
+// dominator and post-dominator sets explicitly because those are the term that can run away: they
+// are O(blocks) per block, so they are quadratic in a graph that nothing else about a shader makes
+// large.
+size_t GraphFootprint(const CFG::Graph& graph) {
+	const auto words = [](const std::vector<uint32_t>& value) {
+		return value.capacity() * sizeof(uint32_t);
+	};
+	size_t bytes = sizeof(CFG::Graph) + graph.unsupported_reason.capacity();
+	bytes += graph.blocks.capacity() * sizeof(CFG::BasicBlock);
+	bytes += graph.back_edges.capacity() * sizeof(CFG::BackEdge);
+	bytes += graph.natural_loops.capacity() * sizeof(CFG::NaturalLoop);
+	bytes += graph.components.capacity() * sizeof(CFG::StronglyConnectedComponent);
+	bytes += graph.expressions.capacity() * sizeof(CFG::ConditionExpression);
+	bytes += words(graph.code_table_load_pcs);
+	for (const auto& block: graph.blocks) {
+		bytes += words(block.predecessors) + words(block.successors) + words(block.dominators);
+		bytes += block.assignments.capacity() * sizeof(CFG::BasicBlock::Assignment);
+		bytes += words(block.terminator.indirect_target_pcs) +
+		         words(block.terminator.indirect_targets) +
+		         words(block.terminator.indirect_selector_values) +
+		         words(block.terminator.indirect_selector_targets);
+	}
+	for (const auto& loop: graph.natural_loops) {
+		bytes += words(loop.body_blocks);
+	}
+	for (const auto& component: graph.components) {
+		bytes += words(component.blocks) + words(component.entry_blocks);
+	}
+	return bytes;
+}
+
+uint64_t HashCodeWords(std::span<const uint32_t> front, std::span<const uint32_t> back) {
+	// FNV-1a over both bodies, with the front length folded in so that moving a word from one span
+	// to the other cannot land on the same bucket. Only a bucket selector: every hit is confirmed
+	// by comparing the words themselves, so a collision costs a comparison, never a wrong graph.
+	uint64_t hash = 0xcbf29ce484222325ull;
+	const auto mix = [&hash](uint64_t value) {
+		for (uint32_t byte = 0; byte < sizeof(value); byte++) {
+			hash ^= (value >> (byte * 8u)) & 0xffu;
+			hash *= 0x100000001b3ull;
+		}
+	};
+	mix(front.size());
+	for (const auto word: front) {
+		mix(word);
+	}
+	for (const auto word: back) {
+		mix(word);
+	}
+	return hash;
+}
+
+// CFG::Graph is a value type all the way down, so every vector serializes as a 32-bit count
+// followed by its elements, in little-endian host order.
+
+void PutU32(std::vector<uint8_t>& out, uint32_t value) {
+	out.push_back(static_cast<uint8_t>(value));
+	out.push_back(static_cast<uint8_t>(value >> 8u));
+	out.push_back(static_cast<uint8_t>(value >> 16u));
+	out.push_back(static_cast<uint8_t>(value >> 24u));
+}
+
+void PutU64(std::vector<uint8_t>& out, uint64_t value) {
+	PutU32(out, static_cast<uint32_t>(value));
+	PutU32(out, static_cast<uint32_t>(value >> 32u));
+}
+
+void PutWords(std::vector<uint8_t>& out, const std::vector<uint32_t>& words) {
+	PutU32(out, static_cast<uint32_t>(words.size()));
+	for (const auto word: words) {
+		PutU32(out, word);
+	}
+}
+
+struct Reader {
+	const uint8_t* data = nullptr;
+	size_t         size = 0;
+	size_t         at   = 0;
+	bool           ok   = true;
+
+	uint32_t U32() {
+		if (!ok || at + 4u > size) {
+			ok = false;
+			return 0;
+		}
+		const uint32_t value = static_cast<uint32_t>(data[at]) |
+		                       (static_cast<uint32_t>(data[at + 1]) << 8u) |
+		                       (static_cast<uint32_t>(data[at + 2]) << 16u) |
+		                       (static_cast<uint32_t>(data[at + 3]) << 24u);
+		at += 4u;
+		return value;
+	}
+	uint64_t U64() {
+		const auto low  = U32();
+		const auto high = U32();
+		return static_cast<uint64_t>(low) | (static_cast<uint64_t>(high) << 32u);
+	}
+	bool Count(uint32_t& out, size_t element_bytes) {
+		out = U32();
+		if (!ok || static_cast<size_t>(out) * element_bytes > size - at) {
+			ok = false;
+			return false;
+		}
+		return true;
+	}
+	std::vector<uint32_t> Words() {
+		std::vector<uint32_t> words;
+		uint32_t              count = 0;
+		if (!Count(count, 4u)) {
+			return words;
+		}
+		words.resize(count);
+		for (uint32_t i = 0; i < count; i++) {
+			words[i] = U32();
+		}
+		return words;
+	}
+};
+
+void PutTerminator(std::vector<uint8_t>& out, const CFG::Terminator& value) {
+	PutU32(out, static_cast<uint32_t>(value.kind));
+	PutU32(out, static_cast<uint32_t>(value.condition));
+	PutU32(out, value.true_block);
+	PutU32(out, value.false_block);
+	PutU32(out, value.merge_block);
+	PutU32(out, value.continue_block);
+	PutU32(out, value.indirect_pc_sgpr);
+	PutU32(out, value.indirect_selector_code);
+	PutWords(out, value.indirect_target_pcs);
+	PutWords(out, value.indirect_targets);
+	PutWords(out, value.indirect_selector_values);
+	PutWords(out, value.indirect_selector_targets);
+	PutU32(out, value.expression);
+	PutU32(out, value.loop_header ? 1u : 0u);
+}
+
+void GetTerminator(Reader& in, CFG::Terminator& value) {
+	value.kind                      = static_cast<CFG::TerminatorKind>(in.U32());
+	value.condition                 = static_cast<CFG::BranchCondition>(in.U32());
+	value.true_block                = in.U32();
+	value.false_block               = in.U32();
+	value.merge_block               = in.U32();
+	value.continue_block            = in.U32();
+	value.indirect_pc_sgpr          = in.U32();
+	value.indirect_selector_code    = in.U32();
+	value.indirect_target_pcs       = in.Words();
+	value.indirect_targets          = in.Words();
+	value.indirect_selector_values  = in.Words();
+	value.indirect_selector_targets = in.Words();
+	value.expression                = in.U32();
+	value.loop_header               = in.U32() != 0u;
+}
+
+void SerializeGraph(std::vector<uint8_t>& out, const CFG::Graph& graph) {
+	PutU32(out, static_cast<uint32_t>(graph.blocks.size()));
+	for (const auto& block: graph.blocks) {
+		PutU32(out, block.id);
+		PutU32(out, block.start_pc);
+		PutU32(out, block.end_pc);
+		PutU32(out, block.inst_begin);
+		PutU32(out, block.inst_end);
+		PutU32(out, static_cast<uint32_t>(block.assignments.size()));
+		for (const auto& assignment: block.assignments) {
+			PutU32(out, assignment.variable);
+			PutU32(out, assignment.expression);
+		}
+		PutWords(out, block.predecessors);
+		PutWords(out, block.successors);
+		PutWords(out, block.dominators);
+		PutTerminator(out, block.terminator);
+	}
+	PutU32(out, static_cast<uint32_t>(graph.expressions.size()));
+	for (const auto& expression: graph.expressions) {
+		PutU32(out, static_cast<uint32_t>(expression.op));
+		PutU32(out, expression.lhs);
+		PutU32(out, expression.rhs);
+	}
+	PutU32(out, static_cast<uint32_t>(graph.back_edges.size()));
+	for (const auto& edge: graph.back_edges) {
+		PutU32(out, edge.from);
+		PutU32(out, edge.to);
+		PutU32(out, edge.natural ? 1u : 0u);
+	}
+	PutU32(out, static_cast<uint32_t>(graph.natural_loops.size()));
+	for (const auto& loop: graph.natural_loops) {
+		PutU32(out, loop.header);
+		PutU32(out, loop.latch);
+		PutWords(out, loop.body_blocks);
+	}
+	PutU32(out, static_cast<uint32_t>(graph.components.size()));
+	for (const auto& component: graph.components) {
+		PutWords(out, component.blocks);
+		PutWords(out, component.entry_blocks);
+		PutU32(out, component.irreducible ? 1u : 0u);
+	}
+	PutWords(out, graph.code_table_load_pcs);
+	PutU32(out, graph.entry_block);
+	PutU32(out, graph.irreducible ? 1u : 0u);
+	PutU32(out, graph.unsupported ? 1u : 0u);
+	PutU32(out, static_cast<uint32_t>(graph.failure_kind));
+	PutU32(out, graph.failure_block);
+	PutU32(out, graph.failure_pc);
+	PutU32(out, static_cast<uint32_t>(graph.unsupported_reason.size()));
+	out.insert(out.end(), graph.unsupported_reason.begin(), graph.unsupported_reason.end());
+}
+
+bool DeserializeGraph(Reader& in, CFG::Graph& graph) {
+	uint32_t count = 0;
+	if (!in.Count(count, 32u)) {
+		return false;
+	}
+	graph.blocks.resize(count);
+	for (auto& block: graph.blocks) {
+		block.id         = in.U32();
+		block.start_pc   = in.U32();
+		block.end_pc     = in.U32();
+		block.inst_begin = in.U32();
+		block.inst_end   = in.U32();
+		uint32_t assignments = 0;
+		if (!in.Count(assignments, 8u)) {
+			return false;
+		}
+		block.assignments.resize(assignments);
+		for (auto& assignment: block.assignments) {
+			assignment.variable   = in.U32();
+			assignment.expression = in.U32();
+		}
+		block.predecessors = in.Words();
+		block.successors   = in.Words();
+		block.dominators   = in.Words();
+		GetTerminator(in, block.terminator);
+		if (!in.ok) {
+			return false;
+		}
+	}
+	if (!in.Count(count, 12u)) {
+		return false;
+	}
+	graph.expressions.resize(count);
+	for (auto& expression: graph.expressions) {
+		expression.op  = static_cast<CFG::ConditionExpression::Op>(in.U32());
+		expression.lhs = in.U32();
+		expression.rhs = in.U32();
+	}
+	if (!in.Count(count, 12u)) {
+		return false;
+	}
+	graph.back_edges.resize(count);
+	for (auto& edge: graph.back_edges) {
+		edge.from    = in.U32();
+		edge.to      = in.U32();
+		edge.natural = in.U32() != 0u;
+	}
+	if (!in.Count(count, 12u)) {
+		return false;
+	}
+	graph.natural_loops.resize(count);
+	for (auto& loop: graph.natural_loops) {
+		loop.header      = in.U32();
+		loop.latch       = in.U32();
+		loop.body_blocks = in.Words();
+		if (!in.ok) {
+			return false;
+		}
+	}
+	if (!in.Count(count, 12u)) {
+		return false;
+	}
+	graph.components.resize(count);
+	for (auto& component: graph.components) {
+		component.blocks      = in.Words();
+		component.entry_blocks = in.Words();
+		component.irreducible = in.U32() != 0u;
+		if (!in.ok) {
+			return false;
+		}
+	}
+	graph.code_table_load_pcs = in.Words();
+	graph.entry_block         = in.U32();
+	graph.irreducible         = in.U32() != 0u;
+	graph.unsupported         = in.U32() != 0u;
+	graph.failure_kind        = static_cast<CFG::FailureKind>(in.U32());
+	graph.failure_block       = in.U32();
+	graph.failure_pc          = in.U32();
+	uint32_t reason_size      = 0;
+	if (!in.Count(reason_size, 1u)) {
+		return false;
+	}
+	graph.unsupported_reason.assign(reinterpret_cast<const char*>(in.data + in.at), reason_size);
+	in.at += reason_size;
+	return in.ok;
+}
+
+uint64_t HashBytesFnv(const uint8_t* data, size_t size) {
+	uint64_t hash = 0xcbf29ce484222325ull;
+	for (size_t i = 0; i < size; i++) {
+		hash ^= data[i];
+		hash *= 0x100000001b3ull;
+	}
+	return hash;
+}
+
+// The structurized control-flow graph of a guest body, keyed on the body itself.
+//
+// Structurization reads nothing but the graph, and BuildGraph reads nothing but the decoded
+// program, which is a pure function of the code words. Nothing else reaches either one: not the
+// resource specialization, not the pipeline's static state, not the stage, the wave size or the
+// user data, and not the proven-unfoldable set, which is attached to the IR program after
+// translation and read only by resource tracking. So the second translation of a body - and a
+// permutation miss forces one on every draw that takes it - structurizes an identical graph from
+// identical inputs. In `story8` that was 146 of 825 structurizations and 69.3 s of its 104.9 s.
+//
+// The key is the code words themselves, compared in full on every hit. That is not caution about
+// the hash so much as about what the graph means: a block names its instructions as a half-open
+// range into the decoded program, so a graph is only meaningful beside a decode of exactly the
+// words it was built from.
+//
+// CACHE KEY INVARIANT - read this before giving BuildGraph or Structurize a new argument.
+// The key is the code words and nothing else, because as of this writing nothing else reaches
+// either pass: no configuration, no environment, no static mutable state, and none of the stage,
+// wave size, user data, resource specialization or proven-unfoldable set. **If either pass ever
+// gains an input, it must be added to this key in the same change.** Nothing here will fail if it
+// is not: a stale graph structures one shader's control flow and runs another through it, which
+// renders the wrong thing silently rather than raising anything. The test beside this
+// (TestStructurizedCfgIsCachedByBody) asserts that the stage does not split the key - it cannot
+// notice a newly added argument, and no test can.
+class CfgCache {
+public:
+	// Bounded in bytes rather than entries, because a graph's size is not a function of anything
+	// that bounds the number of shaders: the dominator sets are quadratic in the block count, so
+	// one pathological body can outweigh hundreds of ordinary ones. Measured over story7/8/9, all
+	// 680 graphs of the largest run fit in 19 MiB even at the worst-case dominator density, so this
+	// budget never evicts on this title; a title that does not fit degrades to rebuilding what it
+	// evicted, which is exactly today's behaviour, rather than to an unbounded map.
+	static constexpr size_t Budget = size_t {64} << 20u;
+	// And no single entry may take more than an eighth of it. A graph that large is worth one
+	// rebuild; flushing every useful entry to hold it is not.
+	static constexpr size_t EntryLimit = Budget / 8u;
+
+	bool Get(std::span<const uint32_t> code, std::span<const uint32_t> back_code,
+	         CFG::Graph& native, CFG::Graph& structured, CfgOutcome& outcome) {
+		const auto                        hash = HashCodeWords(code, back_code);
+		const std::lock_guard<std::mutex> lock(m_mutex);
+		const auto                        range = m_index.equal_range(hash);
+		for (auto it = range.first; it != range.second; ++it) {
+			const auto& entry = *it->second;
+			if (!std::ranges::equal(entry.code, code) ||
+			    !std::ranges::equal(entry.back_code, back_code)) {
+				continue;
+			}
+			native     = entry.native;
+			structured = entry.structured;
+			outcome    = entry.outcome;
+			if (entry.from_file) {
+				m_hits_from_file++;
+				m_avoided_file_us += entry.cost_us;
+			} else {
+				m_avoided_memory_us += entry.cost_us;
+			}
+			// Most recently used to the front, so eviction takes the body the run has stopped
+			// drawing rather than the one it draws every frame.
+			m_entries.splice(m_entries.begin(), m_entries, it->second);
+			m_hits++;
+			return true;
+		}
+		m_misses++;
+		return false;
+	}
+
+	void Put(std::span<const uint32_t> code, std::span<const uint32_t> back_code,
+	         const CFG::Graph& native, const CFG::Graph& structured, CfgOutcome outcome,
+	         uint64_t cost_us) {
+		const auto bytes = GraphFootprint(native) + GraphFootprint(structured) +
+		                   (code.size() + back_code.size()) * sizeof(uint32_t) + sizeof(Entry);
+		if (bytes > EntryLimit) {
+			m_refused++;
+			return;
+		}
+		const auto                        hash = HashCodeWords(code, back_code);
+		const std::lock_guard<std::mutex> lock(m_mutex);
+		while (m_bytes + bytes > Budget && !m_entries.empty()) {
+			Evict();
+		}
+		m_entries.push_front(Entry {.code      = {code.begin(), code.end()},
+		                            .back_code = {back_code.begin(), back_code.end()},
+		                            .native     = native,
+		                            .structured = structured,
+		                            .outcome    = outcome,
+		                            .hash      = hash,
+		                            .bytes     = bytes,
+		                            .cost_us   = cost_us,
+		                            .from_file = false});
+		m_index.emplace(hash, m_entries.begin());
+		m_bytes += bytes;
+	}
+
+	static constexpr uint64_t FileMagic = 0x3343464759544b53ull; // "SKTYFC3"
+	static constexpr size_t FileBudget = Budget;
+
+	void OpenFile(const std::string& path, uint64_t stamp) {
+		const std::lock_guard<std::mutex> lock(m_mutex);
+		m_path  = path;
+		m_stamp = stamp;
+		if (path.empty() || stamp == 0u) {
+			m_path.clear();
+			return;
+		}
+		LoadLocked();
+	}
+
+	void Flush() {
+		const std::lock_guard<std::mutex> lock(m_mutex);
+		if (m_path.empty()) {
+			return;
+		}
+		StoreLocked();
+	}
+
+	// Drops everything held in memory and forgets the file. Tests only.
+	void ResetForTest() {
+		const std::lock_guard<std::mutex> lock(m_mutex);
+		m_entries.clear();
+		m_index.clear();
+		m_bytes             = 0;
+		m_loaded            = 0;
+		m_stored            = 0;
+		m_rejected          = 0;
+		m_hits_from_file    = 0;
+		m_avoided_file_us   = 0;
+		m_avoided_memory_us = 0;
+		m_path.clear();
+		m_stamp = 0;
+	}
+
+	CfgCacheStats Stats() {
+		const std::lock_guard<std::mutex> lock(m_mutex);
+		return {.hits     = m_hits,
+		        .misses   = m_misses,
+		        .evicted  = m_evicted,
+		        .refused  = m_refused,
+		        .entries  = static_cast<uint64_t>(m_entries.size()),
+		        .bytes    = static_cast<uint64_t>(m_bytes),
+		        .loaded            = m_loaded,
+		        .stored            = m_stored,
+		        .rejected          = m_rejected,
+		        .hits_from_file    = m_hits_from_file,
+		        .avoided_file_us   = m_avoided_file_us,
+		        .avoided_memory_us = m_avoided_memory_us};
+	}
+
+	void Report(const char* label) {
+		uint64_t hits = 0;
+		uint64_t misses = 0;
+		uint64_t evicted = 0;
+		uint64_t refused = 0;
+		uint64_t hits_from_file = 0;
+		uint64_t avoided_file_ms = 0;
+		uint64_t avoided_memory_ms = 0;
+		size_t   bytes = 0;
+		size_t   entries = 0;
+		{
+			const std::lock_guard<std::mutex> lock(m_mutex);
+			const auto                        total = m_hits + m_misses;
+			// First sighting and every doubling, the way every other counter here reports.
+			if (total == 0u || (total & (total - 1u)) != 0u || total == m_reported) {
+				return;
+			}
+			m_reported = total;
+			hits       = m_hits;
+			misses     = m_misses;
+			evicted    = m_evicted;
+			refused    = m_refused;
+			bytes      = m_bytes;
+			entries    = m_entries.size();
+			hits_from_file    = m_hits_from_file;
+			avoided_file_ms   = m_avoided_file_us / 1000u;
+			avoided_memory_ms = m_avoided_memory_us / 1000u;
+		}
+		LOGF("%s CFG cache: hits=%" PRIu64 " (file %" PRIu64 ") misses=%" PRIu64 " entries=%" PRIu64
+		     " bytes=%" PRIu64 " evicted=%" PRIu64 " refused=%" PRIu64 " avoided_ms=%" PRIu64
+		     " (file %" PRIu64 ")\n",
+		     label, hits, hits_from_file, misses, static_cast<uint64_t>(entries),
+		     static_cast<uint64_t>(bytes), evicted, refused,
+		     avoided_file_ms + avoided_memory_ms, avoided_file_ms);
+	}
+
+private:
+	struct Entry {
+		std::vector<uint32_t> code;
+		std::vector<uint32_t> back_code;
+		CFG::Graph            native;
+		CFG::Graph            structured;
+		CfgOutcome            outcome = CfgOutcome::Structured;
+		uint64_t              hash    = 0;
+		size_t                bytes   = 0;
+		uint64_t              cost_us = 0;
+		bool                  from_file = false;
+	};
+
+	// Called with the lock held.
+	bool Holds(const Entry& entry) const {
+		const auto range = m_index.equal_range(entry.hash);
+		for (auto it = range.first; it != range.second; ++it) {
+			if (std::ranges::equal(it->second->code, entry.code) &&
+			    std::ranges::equal(it->second->back_code, entry.back_code)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	// Called with the lock held.
+	void LoadLocked() {
+		std::ifstream file(m_path, std::ios::binary);
+		if (!file) {
+			return;
+		}
+		std::vector<uint8_t> blob((std::istreambuf_iterator<char>(file)),
+		                          std::istreambuf_iterator<char>());
+		file.close();
+		Reader in {.data = blob.data(), .size = blob.size()};
+		if (in.U64() != FileMagic || !in.ok) {
+			return;
+		}
+		if (in.U64() != m_stamp || !in.ok) {
+			return;
+		}
+		while (in.ok && in.at < in.size) {
+			const auto payload_size = in.U32();
+			const auto checksum     = in.U64();
+			if (!in.ok || payload_size == 0u || payload_size > in.size - in.at) {
+				m_rejected++;
+				break;
+			}
+			const auto* payload = in.data + in.at;
+			if (HashBytesFnv(payload, payload_size) != checksum) {
+				m_rejected++;
+				break;
+			}
+			Reader body {.data = payload, .size = payload_size};
+			Entry  entry;
+			entry.code      = body.Words();
+			entry.back_code = body.Words();
+			entry.outcome   = static_cast<CfgOutcome>(body.U32());
+			entry.cost_us   = body.U64();
+			if (!body.ok || !DeserializeGraph(body, entry.native) ||
+			    !DeserializeGraph(body, entry.structured) || entry.code.empty()) {
+				m_rejected++;
+				break;
+			}
+			in.at += payload_size;
+			entry.hash  = HashCodeWords(entry.code, entry.back_code);
+			entry.bytes = GraphFootprint(entry.native) + GraphFootprint(entry.structured) +
+			              (entry.code.size() + entry.back_code.size()) * sizeof(uint32_t) +
+			              sizeof(Entry);
+			if (entry.bytes > EntryLimit || m_bytes + entry.bytes > Budget || Holds(entry)) {
+				continue;
+			}
+			entry.from_file = true;
+			m_bytes += entry.bytes;
+			m_entries.push_back(std::move(entry));
+			m_index.emplace(m_entries.back().hash, std::prev(m_entries.end()));
+			m_loaded++;
+		}
+	}
+
+	// Called with the lock held.
+	void StoreLocked() {
+		std::vector<uint8_t> blob;
+		PutU64(blob, FileMagic);
+		PutU64(blob, m_stamp);
+		uint64_t stored = 0;
+		for (const auto& entry: m_entries) {
+			std::vector<uint8_t> payload;
+			PutWords(payload, entry.code);
+			PutWords(payload, entry.back_code);
+			PutU32(payload, static_cast<uint32_t>(entry.outcome));
+			PutU64(payload, entry.cost_us);
+			SerializeGraph(payload, entry.native);
+			SerializeGraph(payload, entry.structured);
+			if (blob.size() + payload.size() + 12u > FileBudget) {
+				break;
+			}
+			PutU32(blob, static_cast<uint32_t>(payload.size()));
+			PutU64(blob, HashBytesFnv(payload.data(), payload.size()));
+			blob.insert(blob.end(), payload.begin(), payload.end());
+			stored++;
+		}
+		// Written beside the target and renamed over it, so the live file is only ever replaced whole.
+		std::error_code error;
+		const auto      target = std::filesystem::path(m_path);
+		if (target.has_parent_path()) {
+			std::filesystem::create_directories(target.parent_path(), error);
+		}
+		const auto temporary = std::filesystem::path(m_path + ".tmp");
+		{
+			std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
+			if (!file) {
+				return;
+			}
+			file.write(reinterpret_cast<const char*>(blob.data()),
+			           static_cast<std::streamsize>(blob.size()));
+			file.flush();
+			if (!file) {
+				file.close();
+				std::filesystem::remove(temporary, error);
+				return;
+			}
+		}
+		std::filesystem::rename(temporary, target, error);
+		if (error) {
+			std::filesystem::remove(temporary, error);
+			return;
+		}
+		m_stored = stored;
+	}
+
+	// Called with the lock held.
+	void Evict() {
+		const auto& victim = m_entries.back();
+		const auto  range  = m_index.equal_range(victim.hash);
+		for (auto it = range.first; it != range.second; ++it) {
+			if (it->second == std::prev(m_entries.end())) {
+				m_index.erase(it);
+				break;
+			}
+		}
+		m_bytes -= victim.bytes;
+		m_entries.pop_back();
+		m_evicted++;
+	}
+
+	std::mutex                                                     m_mutex;
+	std::list<Entry>                                               m_entries;
+	std::unordered_multimap<uint64_t, std::list<Entry>::iterator>  m_index;
+	size_t                                                         m_bytes    = 0;
+	uint64_t                                                       m_hits     = 0;
+	uint64_t                                                       m_misses   = 0;
+	uint64_t                                                       m_evicted  = 0;
+	uint64_t                                                       m_refused  = 0;
+	uint64_t                                                       m_reported = 0;
+	std::string                                                    m_path;
+	uint64_t                                                       m_stamp    = 0;
+	uint64_t                                                       m_loaded   = 0;
+	uint64_t                                                       m_stored   = 0;
+	uint64_t                                                       m_rejected = 0;
+	uint64_t                                                       m_hits_from_file    = 0;
+	uint64_t                                                       m_avoided_file_us   = 0;
+	uint64_t                                                       m_avoided_memory_us = 0;
+};
+
+CfgCache& StructurizedCfgCache() {
+	static CfgCache cache;
+	return cache;
 }
 
 std::string MakeIrDump(std::string_view cfg, const IR::Program& ir) {
@@ -777,21 +1454,73 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 		}
 	}
 
-	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph\n", GetDumpLabel(options),
-	     StageName(options.stage), options.shader_hash);
-	auto native_cfg = CFG::BuildGraph(decoded);
+	CFG::Graph native_cfg;
 	CFG::Graph structured_cfg;
-	auto* selected_cfg = &native_cfg;
-	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph blocks=%" PRIu64
-	     " loops=%" PRIu64 " back_edges=%" PRIu64 " elapsed_ms=%" PRIu64 "\n",
-	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
-	     static_cast<uint64_t>(native_cfg.blocks.size()),
-	     static_cast<uint64_t>(native_cfg.natural_loops.size()),
-	     static_cast<uint64_t>(native_cfg.back_edges.size()), phase_ms());
-	// A shader the CFG builder cannot model - an undecodable instruction, a branch into nothing -
-	// is dropped, not fatal. Only a build failure sets unsupported here: the irreducible path
-	// clears it inside BuildGraph, and the structurizer has not run yet.
-	if (native_cfg.unsupported) {
+	auto       cfg_outcome = CfgOutcome::Structured;
+	const auto cfg_begin   = std::chrono::steady_clock::now();
+	// Keyed by the words the program was decoded from, which include a linked SWAPPC leaf.
+	const bool cfg_cached = StructurizedCfgCache().Get(decoded.code, options.back_code, native_cfg,
+	                                                   structured_cfg, cfg_outcome);
+	if (cfg_cached) {
+		const auto& cached = cfg_outcome == CfgOutcome::Structured ? structured_cfg : native_cfg;
+		LOGF("%s CFG cache hit: stage=%s hash=0x%016" PRIx64 " outcome=%s blocks=%" PRIu64
+		     " loops=%" PRIu64 " elapsed_ms=%" PRIu64 "\n",
+		     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
+		     CfgOutcomeName(cfg_outcome), static_cast<uint64_t>(cached.blocks.size()),
+		     static_cast<uint64_t>(cached.natural_loops.size()), phase_ms());
+	} else {
+		LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph\n",
+		     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
+		native_cfg = CFG::BuildGraph(decoded);
+		LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph blocks=%" PRIu64
+		     " loops=%" PRIu64 " back_edges=%" PRIu64 " elapsed_ms=%" PRIu64 "\n",
+		     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
+		     static_cast<uint64_t>(native_cfg.blocks.size()),
+		     static_cast<uint64_t>(native_cfg.natural_loops.size()),
+		     static_cast<uint64_t>(native_cfg.back_edges.size()), phase_ms());
+		// A shader the CFG builder cannot model - an undecodable instruction, a branch into
+		// nothing - is dropped, not fatal. Only a build failure sets unsupported here: the
+		// irreducible path clears it inside BuildGraph, and the structurizer has not run yet.
+		if (native_cfg.unsupported) {
+			cfg_outcome = CfgOutcome::BuildRejected;
+		} else if (native_cfg.irreducible) {
+			cfg_outcome = CfgOutcome::Irreducible;
+			LogDispatcherFallback(options, native_cfg, "build");
+		} else {
+			LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG Structurize\n",
+			     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
+			structured_cfg = CFG::Structurize(native_cfg);
+			if (structured_cfg.unsupported) {
+				cfg_outcome                   = CfgOutcome::StructurizeFailed;
+				native_cfg.unsupported        = true;
+				native_cfg.failure_kind       = structured_cfg.failure_kind;
+				native_cfg.failure_block      = structured_cfg.failure_block;
+				native_cfg.unsupported_reason = structured_cfg.unsupported_reason;
+				structured_cfg                = {};
+				LogDispatcherFallback(options, native_cfg, "structurize");
+			} else {
+				LOGF("%s structured CFG success: blocks=%" PRIu64 "\n", GetDumpLabel(options),
+				     static_cast<uint64_t>(structured_cfg.blocks.size()));
+			}
+			const auto& selected =
+			    cfg_outcome == CfgOutcome::Structured ? structured_cfg : native_cfg;
+			LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " CFG Structurize blocks=%" PRIu64
+			     " loops=%" PRIu64 " elapsed_ms=%" PRIu64 "\n",
+			     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
+			     static_cast<uint64_t>(selected.blocks.size()),
+			     static_cast<uint64_t>(selected.natural_loops.size()), phase_ms());
+		}
+		const auto cfg_cost_us = static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::microseconds>(
+		        std::chrono::steady_clock::now() - cfg_begin)
+		        .count());
+		StructurizedCfgCache().Put(code, options.back_code, native_cfg, structured_cfg,
+		                           cfg_outcome, cfg_cost_us);
+	}
+	StructurizedCfgCache().Report(GetDumpLabel(options));
+	const auto* selected_cfg =
+	    cfg_outcome == CfgOutcome::Structured ? &structured_cfg : &native_cfg;
+	if (cfg_outcome == CfgOutcome::BuildRejected) {
 		LOGF("%s CFG build rejected: stage=%s hash=0x%016" PRIx64 " pc=0x%08" PRIx32 " %s\n",
 		     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 		     native_cfg.failure_pc, native_cfg.unsupported_reason.c_str());
@@ -805,28 +1534,11 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 		}
 		return result;
 	}
-	if (native_cfg.irreducible) {
-		LogDispatcherFallback(options, native_cfg, "build");
-	} else {
-		LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG Structurize\n",
-		     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
-		structured_cfg = CFG::Structurize(native_cfg);
-		if (structured_cfg.unsupported) {
-			native_cfg.unsupported = true;
-			native_cfg.failure_kind = structured_cfg.failure_kind;
-			native_cfg.failure_block = structured_cfg.failure_block;
-			native_cfg.unsupported_reason = structured_cfg.unsupported_reason;
-			LogDispatcherFallback(options, native_cfg, "structurize");
-		} else {
-			selected_cfg = &structured_cfg;
-			LOGF("%s structured CFG success: blocks=%" PRIu64 "\n", GetDumpLabel(options),
-			     static_cast<uint64_t>(selected_cfg->blocks.size()));
-		}
-		LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " CFG Structurize blocks=%" PRIu64
-		     " loops=%" PRIu64 " elapsed_ms=%" PRIu64 "\n",
-		     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
-		     static_cast<uint64_t>(selected_cfg->blocks.size()),
-		     static_cast<uint64_t>(selected_cfg->natural_loops.size()), phase_ms());
+	// A hit has not logged why this body falls back to the dispatcher, and the run still needs to
+	// be told - it is the difference between a shader that is structured and one that is not.
+	if (cfg_cached && cfg_outcome != CfgOutcome::Structured) {
+		LogDispatcherFallback(options, native_cfg,
+		                      cfg_outcome == CfgOutcome::Irreducible ? "build" : "structurize");
 	}
 
 	const auto& cfg = *selected_cfg;
@@ -910,6 +1622,22 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 		result.cfg_dump     = std::move(cfg_dump);
 	}
 	return result;
+}
+
+CfgCacheStats CfgCacheStatistics() {
+	return StructurizedCfgCache().Stats();
+}
+
+void OpenCfgCacheFile(const std::string& path, uint64_t stamp) {
+	StructurizedCfgCache().OpenFile(path, stamp);
+}
+
+void FlushCfgCacheFile() {
+	StructurizedCfgCache().Flush();
+}
+
+void ResetCfgCacheForTest() {
+	StructurizedCfgCache().ResetForTest();
 }
 
 CompileResult CompileProgram(TranslateResult translated, const CompileOptions& options,

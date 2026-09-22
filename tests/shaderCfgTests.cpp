@@ -16216,11 +16216,64 @@ void TestNewShaderRecompilerCfgStructuresEnteredSelectionRegion() {
 } // namespace
 } // namespace Libs::Graphics
 
+// Structurization reads the graph, and the graph reads the decoded program, which is a function
+// of the guest code words and nothing else - not the stage, not the wave size, not the user data,
+// not the resource specialization, and not the proven-unfoldable set, which is attached after
+// translation. So the second translation of one body must reuse the first one's graph, and two
+// different bodies must never share one. The second half is the one that matters: a key that
+// collapsed too far would structure one shader's control flow and run another through it.
+void TestStructurizedCfgIsCachedByBody() {
+  using namespace Libs::Graphics;
+  // S_NOP 42 ; S_ENDPGM, and a three-instruction body beside it. Distinctive immediates, so no
+  // other case in this binary can have put them in the cache first.
+  const std::array<uint32_t, 2> body{0xBF80002Au, 0xBF810000u};
+  const std::array<uint32_t, 3> other{0xBF80002Au, 0xBF80002Bu, 0xBF810000u};
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+
+  const auto before = ShaderRecompiler::CfgCacheStatistics();
+  auto cold = ShaderRecompiler::TranslateProgram(body, options);
+  const auto after_cold = ShaderRecompiler::CfgCacheStatistics();
+  Check(after_cold.misses == before.misses + 1u && after_cold.hits == before.hits,
+        "the first translation of a body did not miss the CFG cache");
+  Check(!cold.cfg_dump.empty(),
+        "the fixture did not reach a structured graph, so it proves nothing");
+
+  auto warm = ShaderRecompiler::TranslateProgram(body, options);
+  const auto after_warm = ShaderRecompiler::CfgCacheStatistics();
+  Check(after_warm.hits == after_cold.hits + 1u && after_warm.misses == after_cold.misses,
+        "the second translation of one body structurized it again");
+  Check(warm.cfg_dump == cold.cfg_dump,
+        "the cached graph is not the graph the build produced");
+  Check(warm.status.ok == cold.status.ok,
+        "a cached graph changed what the translation decided");
+
+  auto different = ShaderRecompiler::TranslateProgram(other, options);
+  const auto after_different = ShaderRecompiler::CfgCacheStatistics();
+  Check(after_different.misses == after_warm.misses + 1u &&
+            after_different.hits == after_warm.hits,
+        "a different guest body was served another body's graph");
+  Check(different.cfg_dump != cold.cfg_dump,
+        "two different bodies produced the same graph, so this case cannot tell them apart");
+
+  // The key is the body and only the body. A permutation miss changes the specialization, never
+  // the code, so it has to hit - and the stage is the same kind of input: it cannot reach the CFG
+  // either, and a key that split on it would give back most of what this cache is for.
+  auto pixel_options = MakeCompileOptions(ShaderType::Pixel);
+  pixel_options.dump_ir = true;
+  ShaderRecompiler::TranslateProgram(body, pixel_options);
+  const auto after_stage = ShaderRecompiler::CfgCacheStatistics();
+  Check(after_stage.hits == after_different.hits + 1u &&
+            after_stage.misses == after_different.misses,
+        "the same body at another stage rebuilt a graph the stage cannot affect");
+}
+
 int main() {
   using namespace Libs::Graphics;
 
   EnsureConfigInitialized();
   TestRayTracingInstructions();
+  TestStructurizedCfgIsCachedByBody();
   TestResourceDescriptorClassification();
   TestShaderBufferResourceSize();
   TestNativeShaderResourceDependencies();

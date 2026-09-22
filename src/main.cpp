@@ -166,6 +166,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			continue;
 		}
 
+		if (arg == "--stretch") {
+			options.config.window_stretch_enabled = true;
+			continue;
+		}
+
 		if (arg == "--vr") {
 			options.config.vr_enabled = true;
 			continue;

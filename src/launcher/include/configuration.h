@@ -92,6 +92,7 @@ public:
 	int                    gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
 	bool                   readback_linear_images      = false;
+	bool                   stretch_to_window           = false;
 	bool                   tessellation_enabled        = false;
 	int                    vblank_frequency            = 60;
 	int                    console_language            = DEFAULT_CONSOLE_LANGUAGE;
@@ -123,6 +124,7 @@ public:
 		gpu_index                   = other.gpu_index;
 		fullscreen_enabled          = other.fullscreen_enabled;
 		readback_linear_images      = other.readback_linear_images;
+		stretch_to_window           = other.stretch_to_window;
 		tessellation_enabled        = other.tessellation_enabled;
 		vblank_frequency            = other.vblank_frequency;
 		console_language            = other.console_language;
@@ -179,6 +181,7 @@ public:
 		KYTY_CFG_SET(shader_log_folder);
 		KYTY_CFG_SET(command_buffer_dump_enabled);
 		KYTY_CFG_SET(command_buffer_dump_folder);
+		KYTY_CFG_SET(stretch_to_window);
 		KYTY_CFG_SET(printf_direction);
 		KYTY_CFG_SET(printf_output_file);
 		KYTY_CFG_SET(profiler_enabled);
@@ -224,6 +227,7 @@ public:
 		KYTY_CFG_GET(shader_log_folder);
 		KYTY_CFG_GET(command_buffer_dump_enabled);
 		KYTY_CFG_GET(command_buffer_dump_folder);
+		KYTY_CFG_GET(stretch_to_window);
 		KYTY_CFG_GET(printf_direction);
 		KYTY_CFG_GET(printf_output_file);
 		KYTY_CFG_GET(profiler_enabled);

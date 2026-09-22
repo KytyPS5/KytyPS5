@@ -48,6 +48,7 @@ struct ConfigOptions {
 	int32_t                gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
 	bool                   vr_enabled                  = false;
+	bool                   window_stretch_enabled      = false;
 	bool                   amd_cpu_enabled             = false;
 	uint32_t               vblank_frequency            = 60;
 	uint32_t               console_language            = DEFAULT_CONSOLE_LANGUAGE;
@@ -108,6 +109,9 @@ bool ProfilerEnabled();
 bool SpirvDebugPrintfEnabled();
 
 bool GpuAssistedValidationEnabled();
+
+bool WindowStretchEnabled();
+
 
 bool RenderDocEnabled();
 bool ReadbackLinearImagesEnabled();

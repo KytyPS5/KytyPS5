@@ -213,6 +213,9 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 
 	args << "--screen-width" << r.at(0);
 	args << "--screen-height" << r.at(1);
+	if (info.stretch_to_window) {
+		args << "--stretch";
+	}
 	args << "--user-name" << info.user_name;
 	args << "--user-id" << QString::number(info.user_id);
 	if (!info.audio_input_device.isEmpty()) {

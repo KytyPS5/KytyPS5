@@ -64,6 +64,7 @@ struct ShaderBinaryInfo {
 
 static std::unique_ptr<std::unordered_map<uint64_t, ShaderMappedData>> g_shader_map;
 static std::mutex                                                      g_shader_map_mutex;
+static std::unordered_map<uint64_t, uint64_t> g_shader_hash_cache;
 
 void ShaderInit() {
 	EXIT_IF(g_shader_map != nullptr);
@@ -77,6 +78,7 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 	std::scoped_lock lock(g_shader_map_mutex);
 
 	(*g_shader_map)[addr] = data;
+	g_shader_hash_cache.erase(addr);
 }
 
 static ShaderMappedData ShaderGetMappedData(uint64_t addr, const char* label) {
@@ -102,9 +104,29 @@ static const ShaderBinaryInfo* GetBinaryInfo(const uint32_t* code) {
 	return nullptr;
 }
 
-static uint64_t GetDeclaredShaderHash(uint64_t shader_addr) {
+static uint64_t ReadDeclaredShaderHash(uint64_t shader_addr) {
 	const auto* header = GetBinaryInfo(reinterpret_cast<const uint32_t*>(shader_addr));
 	return header != nullptr ? (static_cast<uint64_t>(header->hash1) << 32u) | header->hash0 : 0;
+}
+
+static uint64_t GetDeclaredShaderHash(uint64_t shader_addr) {
+	std::scoped_lock lock(g_shader_map_mutex);
+	if (auto cached = g_shader_hash_cache.find(shader_addr); cached != g_shader_hash_cache.end()) {
+		return cached->second;
+	}
+	auto hash = ReadDeclaredShaderHash(shader_addr);
+	if (hash == 0 && g_shader_map != nullptr) {
+		if (auto iter = g_shader_map->find(shader_addr); iter != g_shader_map->end()) {
+			const auto& data = iter->second;
+			if (data.code_size_bytes != 0 && data.code_size_bytes % sizeof(uint32_t) == 0) {
+				hash = XXH3_64bits(reinterpret_cast<const void*>(shader_addr), data.code_size_bytes);
+			}
+		}
+	}
+	if (hash != 0) {
+		g_shader_hash_cache.emplace(shader_addr, hash);
+	}
+	return hash;
 }
 
 static ShaderParams GetShaderParams(uint64_t shader_addr, const char* label, uint64_t declared_hash,

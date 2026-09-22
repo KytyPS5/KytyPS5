@@ -109,8 +109,18 @@ bool UsesShaderClock(const ShaderRecompiler::IR::Program& program) {
 }
 
 bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
-	return !values.empty() &&
-	       Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, values.data(), values.size_bytes());
+	if (values.empty()) {
+		return false;
+	}
+	if (Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, values.data(),
+	                                                    values.size_bytes())) {
+		return true;
+	}
+	if (!Libs::LibKernel::Memory::TryReadBacking(address, values.data(), values.size_bytes())) {
+		return false;
+	}
+	std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
+	return true;
 }
 
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,

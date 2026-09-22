@@ -59,6 +59,15 @@ RegionManager* MemoryTracker::GetOrCreateRegion(uint64_t index) {
 	if (auto* manager = m_regions[index].load(std::memory_order_acquire); manager != nullptr) {
 		return manager;
 	}
+	// A RegionManager is born wholly CPU-dirty, so its birth is itself an upload event: the first
+	// walk that reaches it uploads the whole region. Queued on scope exit, and the whole region
+	// rather than the sub-range that happened to create it - the rest of the region is dirty too
+	// and the caller that births it need not be the one that covers it.
+	//
+	// Declared here and not at the top: the two cached-lookup returns above change no state, and a
+	// guard covering them would queue a whole region on every region lookup.
+	const BdaSyncOnExit queue_on_exit(m_bda_sync, index * TRACKER_REGION_SIZE,
+	                                  TRACKER_REGION_SIZE);
 	auto  manager = std::make_unique<RegionManager>(m_page_manager, index * TRACKER_REGION_SIZE);
 	auto* ptr     = manager.get();
 	m_region_storage.push_back(std::move(manager));
@@ -84,6 +93,7 @@ bool MemoryTracker::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 
 void MemoryTracker::MarkRegionAsCpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
+	const BdaSyncOnExit queue_on_exit(m_bda_sync, vaddr, size);
 	Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 		std::scoped_lock lock(manager->lock);
 		manager->ChangeState<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset, bytes);
@@ -108,6 +118,10 @@ void MemoryTracker::UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
 
 void MemoryTracker::UntrackMemory(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
+	// Declared before the locks, so it is destroyed after them: the queue lands once the range is
+	// settled and the region locks are gone. A drain in that window misses the range and the next
+	// one takes it, which is a drain late, not an upload lost.
+	const BdaSyncOnExit         queue_on_exit(m_bda_sync, vaddr, size);
 	std::vector<RegionManager*> managers;
 	managers.reserve((vaddr % TRACKER_REGION_SIZE + size + TRACKER_REGION_SIZE - 1) /
 	                 TRACKER_REGION_SIZE);

@@ -155,6 +155,10 @@ void BufferCache::ChangeRegister(BufferId id) {
 		    });
 		WriteDataBuffer(m_bda_pagetable_buffer, table_offset,
 		                addresses.data(), addresses.size() * sizeof(vk::DeviceAddress));
+		// A buffer that did not exist has nothing current in it: the first walk over its pages
+		// is what creates their tracker regions, which are born CPU-dirty, and uploads them.
+		// Queue after the registration, so a drain racing this sees the buffer it must fill.
+		m_memory_tracker.QueueBdaSync(buffer.CpuAddress(), buffer.Size());
 	} else {
 		const auto found = m_buffers.find(buffer.CpuAddress());
 		EXIT_IF(found == m_buffers.end() || found->second != id);
@@ -165,6 +169,8 @@ void BufferCache::ChangeRegister(BufferId id) {
 		m_bda_pagetable_buffer.Fill(table_offset,
 		                            size_pages * sizeof(vk::DeviceAddress), 0);
 		buffer.is_deleted = true;
+		// Whatever covers these pages next inherits them, and they may still be CPU-dirty.
+		m_memory_tracker.QueueBdaSync(buffer.CpuAddress(), buffer.Size());
 	}
 }
 
@@ -806,10 +812,10 @@ void BufferCache::ResolveBdaFault(uint64_t vaddr, uint64_t size) {
 	});
 }
 
-void BufferCache::MarkBdaStoresInRange(uint64_t vaddr, uint64_t size, bool all_tracked) {
+void BufferCache::MarkBdaStoresInMapped(const RangeSet& mapped, bool all_tracked) {
 	const auto& ranges = all_tracked ? m_bda_tracked_ranges : m_bda_unmarked_ranges;
-	ranges.ForEachInRange(
-	    vaddr, size, [this](uint64_t begin, uint64_t end) { MarkBdaStores(begin, end - begin); });
+	ForEachBdaMarkRange(ranges, mapped,
+	                    [this](uint64_t begin, uint64_t end) { MarkBdaStores(begin, end - begin); });
 }
 
 void BufferCache::MarkBdaStores(uint64_t vaddr, uint64_t size) {
@@ -829,6 +835,57 @@ void BufferCache::MarkBdaStores(uint64_t vaddr, uint64_t size) {
 		(void)SynchronizeBuffer(buffer, start, finish - start, true, false);
 		m_gpu_modified_ranges.Add(start, finish - start);
 	}
+}
+
+static bool BdaUploadBatchEnabled() {
+	static const bool enabled = [] {
+		const char* text = std::getenv("KYTY_NO_BDA_UPLOAD_BATCH");
+		return text == nullptr || std::strcmp(text, "0") == 0;
+	}();
+	return enabled;
+}
+
+void BufferCache::BeginUploadBatch() {
+	EXIT_IF(m_upload_batch || !m_batched_uploads.empty());
+	if (!BdaUploadBatchEnabled()) {
+		return;
+	}
+	// The staged bytes stay unsealed until the batch has recorded the copies that read them.
+	m_staging_buffer.BeginHold();
+	m_upload_batch = true;
+}
+
+void BufferCache::EndUploadBatch() {
+	if (!m_upload_batch) {
+		return;
+	}
+	m_upload_batch = false;
+	if (!m_batched_uploads.empty()) {
+		auto& command = m_scheduler.Current();
+		command.EndRendering();
+		const auto        native = command.Handle();
+		vk::MemoryBarrier before {};
+		before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite |
+		                       vk::AccessFlagBits::eTransferRead |
+		                       vk::AccessFlagBits::eTransferWrite;
+		before.dstAccessMask = vk::AccessFlagBits::eTransferWrite;
+		native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+		                       vk::PipelineStageFlagBits::eTransfer, {}, 1, &before, 0, nullptr, 0,
+		                       nullptr);
+		// The memory tracker hands out each dirty byte once, so the batch's copies are disjoint.
+		for (const auto& upload: m_batched_uploads) {
+			native.copyBuffer(upload.source, upload.destination,
+			                  static_cast<uint32_t>(upload.copies.size()), upload.copies.data());
+		}
+		vk::MemoryBarrier after {};
+		after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+		after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+		native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+		                       vk::PipelineStageFlagBits::eAllCommands, {}, 1, &after, 0, nullptr,
+		                       0, nullptr);
+		m_batched_uploads.clear();
+	}
+	m_staging_buffer.EndHold();
 }
 
 void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {

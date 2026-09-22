@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/bdaSyncSet.h"
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
 
@@ -93,6 +94,9 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	std::lock_guard lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.Add(vaddr, size);
+	// Newly mapped memory is exactly what a full walk would newly visit, and a range remapped at
+	// an address that was just unmapped has to come back. Queue after the add.
+	m_buffer_cache.QueueBdaSync(vaddr, size);
 }
 
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
@@ -116,6 +120,9 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		m_texture_cache.UnmapMemory(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
+		// Only unmapped memory may leave the set: nothing can reach it, and MapMemory puts it
+		// back if the guest remaps the same address.
+		m_buffer_cache.DropBdaSync(vaddr, size);
 	};
 	// Shutdown still owns the GPU while queued rendering drains, but its command lane no
 	// longer accepts external work. Use the guest GPU's state for the teardown route.
@@ -132,14 +139,19 @@ void RenderContext::PrepareBda(bool stores) {
 		m_bda_logged = true;
 	}
 	std::shared_lock lock(m_mapped_ranges_mutex);
-	const bool       mark = stores || m_buffer_cache.HasUnmarkedBdaStores();
-	m_mapped_ranges.ForEach([this, stores, mark](uint64_t start, uint64_t end) {
+	// Drain, do not rediscover. The synchronise half used to walk every mapped range on every
+	// DMA draw and every DMA dispatch; the set of ranges that can actually need an upload is
+	// maintained at the points that dirty a page, create a region, register a buffer or change
+	// the mapped set, so everything outside it is provably a no-op. Take the set before walking:
+	// a queue that lands during the walk belongs to the next call, never to this one.
+	const RangeSet pending = m_buffer_cache.TakeBdaSync();
+	m_buffer_cache.BeginUploadBatch();
+	ForEachBdaSyncRange(pending, m_mapped_ranges, [this](uint64_t start, uint64_t end) {
 		m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
-		if (mark) {
-			m_buffer_cache.MarkBdaStoresInRange(start, end - start, stores);
-		}
 	});
-	if (mark) {
+	m_buffer_cache.EndUploadBatch();
+	if (stores || m_buffer_cache.HasUnmarkedBdaStores()) {
+		m_buffer_cache.MarkBdaStoresInMapped(m_mapped_ranges, stores);
 		m_buffer_cache.ClearUnmarkedBdaStores();
 	}
 	m_fault_process_pending = true;
@@ -156,9 +168,7 @@ void RenderContext::RunGarbageCollector() {
 	}
 	if (m_buffer_cache.HasUnmarkedBdaStores()) {
 		std::shared_lock lock(m_mapped_ranges_mutex);
-		m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
-			m_buffer_cache.MarkBdaStoresInRange(start, end - start, false);
-		});
+		m_buffer_cache.MarkBdaStoresInMapped(m_mapped_ranges, false);
 		m_buffer_cache.ClearUnmarkedBdaStores();
 	}
 	m_texture_cache.ProcessDownloadImages();

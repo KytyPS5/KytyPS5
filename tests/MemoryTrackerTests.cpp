@@ -1,14 +1,17 @@
 #include "common/hostException.h"
 #include "common/virtualMemory.h"
+#include "graphics/host_gpu/bdaSyncSet.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <semaphore>
 #include <string>
@@ -1109,6 +1112,373 @@ void CheckDeathCase(const char *name) {
 #endif
 }
 
+// ---------------------------------------------------------------------------------------------
+// The BDA synchronise set.
+//
+// PrepareBda used to rediscover, on every DMA draw and every DMA dispatch, which mapped bytes
+// needed uploading, by walking every mapped range. It now drains a set that is appended where
+// memory actually changes hands. The only thing that makes that sound is that the set is a
+// superset of everything a full walk would have uploaded, so the cases below pin:
+//
+//   * every range a FULL walk uploads was in the set an incremental walk would have drained;
+//   * two worlds driven through the same mutations, one walked fully and one walked
+//     incrementally, upload the same bytes and end in the same ownership.
+//
+// The two worlds live at two base addresses in one tracker: the set is keyed by address, so
+// filtering the drained set by each world's mapped ranges separates them.
+// ---------------------------------------------------------------------------------------------
+
+constexpr uint64_t kBdaBlockSize = Libs::Graphics::TRACKER_REGION_SIZE * 3;
+constexpr uint64_t kBdaBaseFull = 0x0000000210000000ull;
+constexpr uint64_t kBdaBaseIncremental = 0x0000000220000000ull;
+
+struct BdaWorld {
+  MemoryTracker *tracker = nullptr;
+  uint64_t base = 0;
+  std::map<uint64_t, uint64_t> buffers;
+  RangeSet mapped;
+  RangeSet uploaded;
+};
+
+// The shape of BufferCache::SynchronizeBuffersInRange with the Vulkan half removed: the same
+// std::map walk, the same clamp, the same ForEachUploadRange call.
+void BdaSynchronizeBuffersInRange(BdaWorld &world, uint64_t vaddr, uint64_t size) {
+  const auto end = vaddr + size;
+  auto it = world.buffers.upper_bound(vaddr);
+  if (it != world.buffers.begin()) {
+    --it;
+  }
+  for (; it != world.buffers.end() && it->first < end; ++it) {
+    const auto start = std::max(it->first, vaddr);
+    const auto finish = std::min(it->first + it->second, end);
+    if (start >= finish) {
+      continue;
+    }
+    auto *uploaded = &world.uploaded;
+    world.tracker->ForEachUploadRange(
+        start, finish - start, false,
+        [uploaded](uint64_t address, uint64_t bytes) noexcept {
+          uploaded->Add(address, bytes);
+        },
+        []() noexcept {});
+  }
+}
+
+// BufferCache::CreateBuffer: overlapping buffers are absorbed into one spanning their union, so
+// a single register can unregister several. Both halves of ChangeRegister queue.
+void BdaRegisterBuffer(BdaWorld &world, uint64_t address, uint64_t size) {
+  uint64_t begin = address;
+  uint64_t end = address + size;
+  for (bool changed = true; changed;) {
+    changed = false;
+    auto it = world.buffers.lower_bound(begin);
+    if (it != world.buffers.begin() &&
+        std::prev(it)->first + std::prev(it)->second > begin) {
+      --it;
+    }
+    while (it != world.buffers.end() && it->first < end) {
+      const auto overlap_begin = it->first;
+      const auto overlap_end = it->first + it->second;
+      if (overlap_begin < begin || overlap_end > end) {
+        changed = true;
+      }
+      begin = std::min(begin, overlap_begin);
+      end = std::max(end, overlap_end);
+      it = world.buffers.erase(it);
+      world.tracker->QueueBdaSync(overlap_begin, overlap_end - overlap_begin);
+    }
+  }
+  world.buffers.emplace(begin, end - begin);
+  world.tracker->QueueBdaSync(begin, end - begin);
+}
+
+// BufferCache::RunGarbageCollector: drop GPU ownership, untrack, unregister.
+void BdaUnregisterBuffer(BdaWorld &world, uint64_t address) {
+  auto it = world.buffers.upper_bound(address);
+  if (it == world.buffers.begin()) {
+    return;
+  }
+  --it;
+  if (it->first + it->second <= address) {
+    return;
+  }
+  const auto begin = it->first;
+  const auto size = it->second;
+  world.buffers.erase(it);
+  world.tracker->UnmarkRegionAsGpuModified(begin, size);
+  world.tracker->UntrackMemory(begin, size);
+  world.tracker->QueueBdaSync(begin, size);
+}
+
+enum class BdaMutation {
+  Map,        // RenderContext::MapMemory
+  Unmap,      // RenderContext::UnmapMemory
+  Register,   // BufferCache::CreateBuffer -> Register -> ChangeRegister<true>
+  Unregister, // BufferCache::RunGarbageCollector -> UntrackMemory + Unregister
+  CpuWrite,   // BufferCache::ReadMemory(is_write = true)
+  GpuWrite,   // MarkBdaStores -> SynchronizeBuffer(is_written = true)
+  Fault,      // RenderContext::HandleFault(Write) -> BufferCache::InvalidateMemory
+};
+
+struct BdaStep {
+  BdaMutation kind;
+  uint64_t offset;
+  uint64_t size;
+  const char *name;
+};
+
+void BdaApply(BdaWorld &world, const BdaStep &step) {
+  const auto address = world.base + step.offset;
+  auto &tracker = *world.tracker;
+  const auto invalidate = [&] {
+    tracker.InvalidateRegion(address, step.size, [&] {
+      tracker.ForEachDownloadRange<true>(address, step.size,
+                                         [](uint64_t, uint64_t) noexcept {});
+      tracker.MarkRegionAsCpuModified(address, step.size);
+    });
+  };
+  switch (step.kind) {
+  case BdaMutation::Map:
+    world.mapped.Add(address, step.size);
+    tracker.QueueBdaSync(address, step.size);
+    break;
+  case BdaMutation::Unmap:
+    invalidate();
+    world.mapped.Subtract(address, step.size);
+    tracker.DropBdaSync(address, step.size);
+    break;
+  case BdaMutation::Register:
+    BdaRegisterBuffer(world, address, step.size);
+    break;
+  case BdaMutation::Unregister:
+    BdaUnregisterBuffer(world, address);
+    break;
+  case BdaMutation::CpuWrite:
+    tracker.ForEachDownloadRange<true>(address, step.size,
+                                       [](uint64_t, uint64_t) noexcept {});
+    tracker.MarkRegionAsCpuModified(address, step.size);
+    break;
+  case BdaMutation::GpuWrite:
+    tracker.ForEachUploadRange(address, step.size, true,
+                               [](uint64_t, uint64_t) noexcept {},
+                               []() noexcept {});
+    break;
+  case BdaMutation::Fault:
+    invalidate();
+    break;
+  }
+}
+
+std::vector<std::pair<uint64_t, uint64_t>> BdaNormalize(const RangeSet &set,
+                                                        uint64_t base) {
+  std::vector<std::pair<uint64_t, uint64_t>> out;
+  set.ForEach([&](uint64_t begin, uint64_t end) {
+    out.emplace_back(begin - base, end - base);
+  });
+  return out;
+}
+
+// The CPU/GPU ownership of every tracker page a shader could reach through a raw pointer: the
+// pages that are both mapped and covered by a buffer. Confined to those so the probe cannot
+// create a region and change what it is measuring.
+std::vector<std::pair<uint64_t, uint32_t>> BdaOwnership(BdaWorld &world) {
+  constexpr auto page = Libs::Graphics::TRACKER_PAGE_SIZE;
+  std::vector<std::pair<uint64_t, uint32_t>> out;
+  for (const auto &entry : world.buffers) {
+    world.mapped.ForEachInRange(
+        entry.first, entry.second, [&](uint64_t begin, uint64_t end) {
+          for (auto probe = begin & ~(page - 1); probe < end; probe += page) {
+            const uint32_t state =
+                (world.tracker->IsRegionCpuModified(probe, page) ? 1u : 0u) |
+                (world.tracker->IsRegionGpuModified(probe, page) ? 2u : 0u);
+            out.emplace_back(probe - world.base, state);
+          }
+        });
+  }
+  return out;
+}
+
+void TestBdaSyncSetMatchesFullWalk() {
+  using Libs::Graphics::ForEachBdaSyncRange;
+  using Libs::Graphics::ForEachBdaSyncRangeFull;
+  constexpr uint64_t R = Libs::Graphics::TRACKER_REGION_SIZE;
+  constexpr uint64_t P = Libs::Graphics::TRACKER_PAGE_SIZE;
+
+  TrackerHarness harness;
+  auto *memory_full = static_cast<uint8_t *>(
+      VirtualAlloc(reinterpret_cast<void *>(kBdaBaseFull), kBdaBlockSize,
+                   MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+  Check(memory_full == reinterpret_cast<void *>(kBdaBaseFull),
+        "full-walk world allocation failed");
+  auto *memory_incremental = static_cast<uint8_t *>(
+      VirtualAlloc(reinterpret_cast<void *>(kBdaBaseIncremental), kBdaBlockSize,
+                   MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+  Check(memory_incremental == reinterpret_cast<void *>(kBdaBaseIncremental),
+        "incremental world allocation failed");
+
+  BdaWorld full;
+  full.tracker = &harness.tracker;
+  full.base = kBdaBaseFull;
+  BdaWorld incremental;
+  incremental.tracker = &harness.tracker;
+  incremental.base = kBdaBaseIncremental;
+
+  const std::vector<BdaStep> script = {
+      {BdaMutation::Map, 0, R, "first map"},
+      {BdaMutation::Register, 0, R / 2, "buffer inside the mapped range"},
+      {BdaMutation::CpuWrite, P * 3, P * 2, "guest write inside the buffer"},
+      {BdaMutation::Register, R / 4, R / 2, "overlapping buffer absorbs the first"},
+      {BdaMutation::Map, R, R * 2, "map spanning two further regions"},
+      {BdaMutation::Register, R + P, R, "buffer crossing a region boundary"},
+      {BdaMutation::GpuWrite, R + P * 4, P * 8, "GPU takes pages of it"},
+      {BdaMutation::CpuWrite, R + P * 4, P * 8, "and the guest takes them back"},
+      {BdaMutation::Fault, P, P, "partial invalidation inside a buffer"},
+      {BdaMutation::Fault, R / 2 - P, P * 4, "partial invalidation across a buffer edge"},
+      {BdaMutation::Unmap, R * 2, R, "unmap the tail under a live buffer"},
+      {BdaMutation::Map, R * 2, R, "remap the same address"},
+      {BdaMutation::CpuWrite, R * 2 + P, P, "write into the remapped range"},
+      {BdaMutation::Register, R * 2, R, "buffer over the remapped range"},
+      {BdaMutation::Unregister, 0, 0, "collect the first buffer"},
+      {BdaMutation::Register, 0, P * 4, "smaller buffer at the same address"},
+      {BdaMutation::Unmap, 0, P * 2, "unmap a sub-range of a live buffer"},
+      {BdaMutation::Map, 0, P * 2, "remap that sub-range"},
+      {BdaMutation::CpuWrite, 0, P * 2, "write into it"},
+      {BdaMutation::GpuWrite, R * 2 + P * 2, P * 2, "GPU takes remapped pages"},
+      {BdaMutation::Unregister, R + P, 0, "collect the region-crossing buffer"},
+      {BdaMutation::Unmap, R, R, "unmap the middle region"},
+  };
+
+  for (const auto &step : script) {
+    BdaApply(full, step);
+    BdaApply(incremental, step);
+
+    // The drain, exactly as PrepareBda does it: take the whole set before walking.
+    const RangeSet taken = harness.tracker.TakeBdaSync();
+    RangeSet pending_full;
+    taken.ForEachInRange(kBdaBaseFull, kBdaBlockSize,
+                         [&](uint64_t begin, uint64_t end) {
+                           pending_full.Add(begin, end - begin);
+                         });
+    RangeSet pending_incremental;
+    taken.ForEachInRange(kBdaBaseIncremental, kBdaBlockSize,
+                         [&](uint64_t begin, uint64_t end) {
+                           pending_incremental.Add(begin, end - begin);
+                         });
+
+    full.uploaded.Clear();
+    incremental.uploaded.Clear();
+    ForEachBdaSyncRangeFull(full.mapped, [&](uint64_t begin, uint64_t end) {
+      BdaSynchronizeBuffersInRange(full, begin, end - begin);
+    });
+    ForEachBdaSyncRange(
+        pending_incremental, incremental.mapped,
+        [&](uint64_t begin, uint64_t end) {
+          BdaSynchronizeBuffersInRange(incremental, begin, end - begin);
+        });
+
+    // 1. Everything the full walk uploaded had been queued. Dirtiness is a per-page fact, so
+    //    the queued set is compared at tracker-page granularity.
+    RangeSet queued;
+    pending_full.ForEach([&](uint64_t begin, uint64_t end) {
+      const auto first = begin & ~(P - 1);
+      const auto last = (end + P - 1) & ~(P - 1);
+      queued.Add(first, last - first);
+    });
+    full.uploaded.ForEach([&](uint64_t begin, uint64_t end) {
+      if (!queued.Contains(begin, end - begin)) {
+        std::fprintf(stderr,
+                     "MemoryTrackerTests: step '%s' uploaded +0x%llx..+0x%llx, which the BDA "
+                     "sync set had not queued\n",
+                     step.name,
+                     static_cast<unsigned long long>(begin - kBdaBaseFull),
+                     static_cast<unsigned long long>(end - kBdaBaseFull));
+        Check(false,
+              "a full BDA walk uploaded a page the incremental set had not queued: the "
+              "mutation-point map is incomplete and that page would read as zero on the GPU");
+      }
+    });
+
+    // 2. The incremental walk uploaded the same bytes.
+    const auto uploaded_full = BdaNormalize(full.uploaded, kBdaBaseFull);
+    const auto uploaded_incremental =
+        BdaNormalize(incremental.uploaded, kBdaBaseIncremental);
+    if (uploaded_full != uploaded_incremental) {
+      std::fprintf(stderr,
+                   "MemoryTrackerTests: step '%s' uploaded %zu ranges fully, %zu "
+                   "incrementally\n",
+                   step.name, uploaded_full.size(), uploaded_incremental.size());
+      Check(false,
+            "the incremental BDA walk did not upload what the full walk uploaded");
+    }
+
+    // 3. And left the same ownership behind.
+    const auto owned_full = BdaOwnership(full);
+    const auto owned_incremental = BdaOwnership(incremental);
+    if (owned_full != owned_incremental) {
+      std::fprintf(stderr,
+                   "MemoryTrackerTests: step '%s' probed %zu / %zu pages\n", step.name,
+                   owned_full.size(), owned_incremental.size());
+      Check(false, "the incremental BDA walk left different page ownership behind");
+    }
+  }
+
+  (void)harness.tracker.TakeBdaSync();
+  Check(!harness.tracker.HasBdaSync(),
+        "the BDA sync set was not empty after being taken");
+  RangeSet nothing;
+  uint32_t walks = 0;
+  ForEachBdaSyncRange(nothing, incremental.mapped,
+                      [&](uint64_t, uint64_t) { walks++; });
+  Check(walks == 0, "a drained BDA sync set still walked a mapped range");
+
+  harness.tracker.UntrackMemory(kBdaBaseFull, kBdaBlockSize);
+  harness.tracker.UntrackMemory(kBdaBaseIncremental, kBdaBlockSize);
+  Release(memory_full);
+  Release(memory_incremental);
+}
+
+void TestBdaSyncSetOrdering() {
+  // A queue made after a drain has started belongs to the next drain, never to the running one:
+  // Take empties the set in one step, which is what stops a queue from being swallowed by a
+  // walk that has already passed its page.
+  Libs::Graphics::BdaSyncSet set;
+  set.Queue(0x1000, 0x1000);
+  const RangeSet drained = set.Take();
+  set.Queue(0x2000, 0x1000);
+  Check(drained.Contains(0x1000, 0x1000) && !drained.Intersects(0x2000, 0x1000),
+        "Take did not separate what was queued before it from what was queued after");
+  Check(!set.Empty() && set.Peek().Contains(0x2000, 0x1000),
+        "a queue made during a drain was swallowed by it");
+
+  // Drop only lets go of whole tracker pages that lie entirely inside the range.
+  constexpr uint64_t P = Libs::Graphics::TRACKER_PAGE_SIZE;
+  Libs::Graphics::BdaSyncSet partial;
+  partial.Queue(0x10000, P * 4);
+  partial.Drop(0x10000 + P / 2, P * 3);
+  const RangeSet left = partial.Take();
+  Check(left.Contains(0x10000, P) && left.Contains(0x10000 + P * 3, P) &&
+            !left.Intersects(0x10000 + P, P * 2),
+        "Drop did not keep the tracker pages an unmap only partly covered");
+}
+
+void TestBdaSyncSetPageRanges() {
+  constexpr uint64_t P = Libs::Graphics::TRACKER_PAGE_SIZE;
+  Libs::Graphics::BdaSyncSet set;
+  for (uint64_t page = 0; page < 3; page++) {
+    for (uint64_t byte = 7; byte < P; byte += 61) {
+      set.Queue(0x40000 + page * P + byte, 1);
+    }
+  }
+  set.Queue(0x80000 + P / 2, 1);
+  const RangeSet drained = set.Take();
+  size_t ranges = 0;
+  drained.ForEach([&](uint64_t, uint64_t) { ranges++; });
+  Check(!Libs::Graphics::BdaSyncSet::RoundToPages() ||
+            (ranges == 2 && drained.Contains(0x40000, P * 3) &&
+             drained.Contains(0x80000, P) && !drained.Intersects(0x40000 + P * 3, P)),
+        "scattered queues were not merged into the whole tracker pages they touch");
+}
+
 void TestFatalPaths() {
   for (const char *name : {"gpu-dirty-explicit-cpu", "reentrant-upload",
                            "recursive-tracking-lock", "non-owner-tracking-unlock"}) {
@@ -1214,6 +1584,9 @@ int main(int argc, char **argv) {
   TestDownloadDoesNotSerializeDisjointRegion();
   TestGpuUnmarkUsesRegionMask();
   TestFullRegionGpuUnmarkBatching();
+  TestBdaSyncSetOrdering();
+  TestBdaSyncSetPageRanges();
+  TestBdaSyncSetMatchesFullWalk();
   TestFatalPaths();
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
   TestFaultOnProtectedStack();

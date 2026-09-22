@@ -94,8 +94,18 @@ public:
 	// A BDA fault on an owned page can only come from a store, which promotes the page to tracked.
 	void               ResolveBdaFault(uint64_t vaddr, uint64_t size);
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
-	// Marks the tracked pages a BDA store can reach GPU-written; the caller passes mapped memory.
-	void               MarkBdaStoresInRange(uint64_t vaddr, uint64_t size, bool all_tracked);
+	// Marks the tracked pages a BDA store can reach GPU-written, restricted to mapped memory.
+	void               MarkBdaStoresInMapped(const RangeSet& mapped, bool all_tracked);
+	// The BDA synchronise set, kept by the memory tracker. PrepareBda drains it instead of
+	// rediscovering the same obligation by walking every mapped range on every DMA draw.
+	void               QueueBdaSync(uint64_t vaddr, uint64_t size) {
+		m_memory_tracker.QueueBdaSync(vaddr, size);
+	}
+	void                   DropBdaSync(uint64_t vaddr, uint64_t size) {
+		m_memory_tracker.DropBdaSync(vaddr, size);
+	}
+	[[nodiscard]] RangeSet TakeBdaSync() { return m_memory_tracker.TakeBdaSync(); }
+	[[nodiscard]] bool     HasBdaSync() const { return m_memory_tracker.HasBdaSync(); }
 	[[nodiscard]] bool HasUnmarkedBdaStores() const { return !m_bda_unmarked_ranges.Empty(); }
 	void               ClearUnmarkedBdaStores() { m_bda_unmarked_ranges.Clear(); }
 	void               RunGarbageCollector();

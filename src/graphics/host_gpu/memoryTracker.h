@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_MEMORYTRACKER_H_
 
 #include "common/assert.h"
+#include "graphics/host_gpu/bdaSyncSet.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/regionManager.h"
@@ -29,11 +30,25 @@ public:
 	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UntrackMemory(uint64_t vaddr, uint64_t size);
+
+	// The BDA synchronise set. Every transition that can leave a tracked page needing an upload
+	// is inside this class, so queueing here rather than at the callers is what makes the set
+	// impossible to forget to feed: see BdaSyncSet for why each queue follows its state change.
+	void                   QueueBdaSync(uint64_t vaddr, uint64_t size) {
+		m_bda_sync.Queue(vaddr, size);
+	}
+	void                   DropBdaSync(uint64_t vaddr, uint64_t size) { m_bda_sync.Drop(vaddr, size); }
+	[[nodiscard]] RangeSet TakeBdaSync() { return m_bda_sync.Take(); }
+	[[nodiscard]] bool     HasBdaSync() const { return !m_bda_sync.Empty(); }
+	[[nodiscard]] RangeSet PeekBdaSync() const { return m_bda_sync.Peek(); }
 	// Removes protection from a range and flushes GPU-owned data when required.
 	template <typename Flush>
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {
 		static_assert(std::is_invocable_v<Flush&>);
 		CheckNotInUploadCallback();
+		// The flushing branch leaves the CPU state change to on_flush, so the range is only
+		// settled once the whole walk has finished. Scope exit is after all of it.
+		const BdaSyncOnExit queue_on_exit(m_bda_sync, vaddr, size);
 
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			const bool should_flush = [&] {
@@ -146,6 +161,7 @@ private:
 	static void    ValidateRange(uint64_t vaddr, uint64_t size);
 	RegionManager* GetOrCreateRegion(uint64_t index);
 
+	BdaSyncSet                                    m_bda_sync;
 	std::unique_ptr<std::atomic<RegionManager*>[]> m_regions;
 	std::vector<std::unique_ptr<RegionManager>>    m_region_storage;
 	std::mutex                                     m_region_mutex;

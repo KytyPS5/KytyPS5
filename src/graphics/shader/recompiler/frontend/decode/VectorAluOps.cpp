@@ -527,8 +527,8 @@ constexpr Vop1SdwaRule VOP1_SDWA_RULES[] = {
     {Opcode::V_CVT_F32_F16, SdwaSelWords() | SdwaSelFull(), 0, 0, true},
     {Opcode::V_CVT_F16_F32, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), SdwaSelWords(),
      SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), true},
-    {Opcode::V_CVT_F16_U16, SdwaSelWords() | SdwaSelFull(), SdwaSelWords(),
-     SdwaSelWords() | SdwaSelFull(), false},
+    {Opcode::V_CVT_F16_U16, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), SdwaSelWords(),
+     SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), false},
     {Opcode::V_CVT_U16_F16, SdwaSelWords() | SdwaSelFull(), SdwaSelWords(),
      SdwaSelWords() | SdwaSelFull(), true},
     {Opcode::V_CVT_F16_I16, SdwaSelWords() | SdwaSelFull(), SdwaSelWords(),
@@ -618,13 +618,14 @@ bool SupportsVop1Clamp(Opcode opcode) {
 }
 
 bool ValidateVop1Sdwa(Instruction& inst, uint32_t opcode, uint32_t modifier) {
-	const auto dst_sel  = (modifier >> 8u) & 0x7u;
-	const auto dst_u    = (modifier >> 11u) & 0x3u;
-	const auto clamp    = (modifier >> 13u) & 0x1u;
-	const auto omod     = (modifier >> 14u) & 0x3u;
-	const auto src0_sel = (modifier >> 16u) & 0x7u;
-	const auto src0_neg = (modifier >> 20u) & 0x1u;
-	const auto src0_abs = (modifier >> 21u) & 0x1u;
+	const auto dst_sel   = (modifier >> 8u) & 0x7u;
+	const auto dst_u     = (modifier >> 11u) & 0x3u;
+	const auto clamp     = (modifier >> 13u) & 0x1u;
+	const auto omod      = (modifier >> 14u) & 0x3u;
+	const auto src0_sel  = (modifier >> 16u) & 0x7u;
+	const auto src0_sext = (modifier >> 19u) & 0x1u;
+	const auto src0_neg  = (modifier >> 20u) & 0x1u;
+	const auto src0_abs  = (modifier >> 21u) & 0x1u;
 
 	if (src0_sel > 6u || dst_sel > 6u) {
 		SetUnsupported(inst, Family::VOP1, opcode, "VOP1 SDWA selector is invalid");
@@ -640,7 +641,8 @@ bool ValidateVop1Sdwa(Instruction& inst, uint32_t opcode, uint32_t modifier) {
 		               "VOP1 SDWA destination selector is not supported");
 		return false;
 	}
-	if (!IsVop1SdwaSourceSupported(inst.opcode, src0_sel, src0_neg != 0u, src0_abs != 0u)) {
+	if (!IsVop1SdwaSourceSupported(inst.opcode, src0_sel, src0_neg != 0u, src0_abs != 0u) ||
+	    (inst.opcode == Opcode::V_CVT_F16_U16 && src0_sel <= 3u && src0_sext != 0u)) {
 		SetUnsupported(inst, Family::VOP1, opcode, "VOP1 SDWA source selector is not supported");
 		return false;
 	}

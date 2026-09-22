@@ -3,12 +3,14 @@
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <semaphore>
 #include <string>

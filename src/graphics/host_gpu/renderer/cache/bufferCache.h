@@ -91,6 +91,8 @@ public:
 	void ResolveBdaFault(uint64_t vaddr, uint64_t size);
 	void SynchronizeBda(const RangeSet& mapped);
 	void QueueBdaSync(uint64_t vaddr, uint64_t size) { m_memory_tracker.QueueBdaSync(vaddr, size); }
+	// Marks the tracked pages a BDA store can reach GPU-written, restricted to mapped memory.
+	void               MarkBdaStoresInMapped(const RangeSet& mapped, bool all_tracked);
 	[[nodiscard]] bool HasUnmarkedBdaStores() const { return !m_bda_unmarked_ranges.Empty(); }
 	void               ClearUnmarkedBdaStores() { m_bda_unmarked_ranges.Clear(); }
 	void               RunGarbageCollector();

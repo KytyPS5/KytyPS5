@@ -44,6 +44,15 @@ void ReportImageBackingSubstitute(uint64_t vaddr, uint64_t size, const char* sub
 	     vaddr, size, substitute, RefusalReporter::RepeatSuffix(repeat, occurrences));
 }
 
+// Walks the tracked set, which is far smaller than the mapped set.
+template <typename Mark>
+void ForEachBdaMarkRange(const RangeSet& tracked, const RangeSet& mapped, Mark&& mark) {
+	tracked.ForEach([&](uint64_t begin, uint64_t end) {
+		mapped.ForEachInRange(begin, end - begin,
+		                      [&](uint64_t start, uint64_t finish) { mark(start, finish); });
+	});
+}
+
 
 std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandScheduler& scheduler,
                                         StreamBuffer& staging, uint64_t size, uint64_t alignment,
@@ -151,6 +160,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 				        BDA_STORE_TRACKED_BIT;
 			    }
 		    });
+		// Queue after the registration, so a drain racing this sees the buffer it must fill.
 		m_memory_tracker.QueueBdaSync(buffer.CpuAddress(), buffer.Size());
 	} else {
 		const auto found = m_buffers.find(buffer.CpuAddress());
@@ -162,6 +172,8 @@ void BufferCache::ChangeRegister(BufferId id) {
 		m_bda_pagetable_buffer.Fill(table_offset,
 		                            size_pages * sizeof(vk::DeviceAddress), 0);
 		buffer.is_deleted = true;
+		// Whatever covers these pages next inherits them, and they may still be CPU-dirty.
+		m_memory_tracker.QueueBdaSync(buffer.CpuAddress(), buffer.Size());
 	}
 }
 
@@ -807,6 +819,12 @@ void BufferCache::ResolveBdaFault(uint64_t vaddr, uint64_t size) {
 	});
 }
 
+void BufferCache::MarkBdaStoresInMapped(const RangeSet& mapped, bool all_tracked) {
+	const auto& ranges = all_tracked ? m_bda_tracked_ranges : m_bda_unmarked_ranges;
+	ForEachBdaMarkRange(ranges, mapped, [this](uint64_t begin, uint64_t end) {
+		MarkBdaStores(begin, end - begin);
+	});
+}
 
 void BufferCache::MarkBdaStores(uint64_t vaddr, uint64_t size) {
 	const auto end = vaddr + size;

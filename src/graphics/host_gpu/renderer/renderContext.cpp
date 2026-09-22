@@ -135,6 +135,8 @@ void RenderContext::PrepareBda(bool stores) {
 	}
 	std::shared_lock lock(m_mapped_ranges_mutex);
 	m_buffer_cache.SynchronizeBda(m_mapped_ranges);
+	if (stores || m_buffer_cache.HasUnmarkedBdaStores()) {
+		m_buffer_cache.MarkBdaStoresInMapped(m_mapped_ranges, stores);
 		m_buffer_cache.ClearUnmarkedBdaStores();
 	}
 	m_fault_process_pending = true;
@@ -147,6 +149,7 @@ void RenderContext::RunGarbageCollector() {
 	}
 	if (m_buffer_cache.HasUnmarkedBdaStores()) {
 		std::shared_lock lock(m_mapped_ranges_mutex);
+		m_buffer_cache.MarkBdaStoresInMapped(m_mapped_ranges, false);
 		m_buffer_cache.ClearUnmarkedBdaStores();
 	}
 	m_texture_cache.ProcessDownloadImages();

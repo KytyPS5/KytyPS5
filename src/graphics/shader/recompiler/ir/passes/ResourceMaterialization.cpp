@@ -104,6 +104,13 @@ Prospero::BufferFormat ImageConversionFormat(Prospero::BufferFormat format) {
 	                                                      : Prospero::BufferFormat::kInvalid;
 }
 
+// The guest can sample 8-bit sRGB textures, but Vulkan only guarantees sRGB for RGBA8, so those
+// formats are stored in the linear format of the same width and the sRGB decode the guest texture
+// pipe applies to them has to be emulated by the shader.
+bool NeedsSrgbSampleDecode(Prospero::BufferFormat format) {
+	return format == Prospero::BufferFormat::k8Srgb || format == Prospero::BufferFormat::k8_8Srgb;
+}
+
 bool RequiresPointSampler(const ImageResource& image) {
 	return image.numeric_class == Prospero::TextureNumericClass::Sint ||
 	       image.conversion_format != Prospero::BufferFormat::kInvalid;
@@ -416,6 +423,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 		    .dimension                  = image.dimension,
 		    .mip_count                  = image.mip_count,
 		    .conversion_format          = image.conversion_format,
+		    .srgb_sample_decode         = image.srgb_sample_decode,
 		    .shader_swizzle             = image.shader_swizzle,
 		    .indirect_root              = image.indirect_root,
 		    .indirect_mapping_offset    = image.indirect_mapping_offset,
@@ -529,7 +537,8 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 				return SpecializationFail("FMASK requires a direct image load");
 			}
 		}
-		image.conversion_format = ImageConversionFormat(format);
+		image.conversion_format  = ImageConversionFormat(format);
+		image.srgb_sample_decode = !storage && NeedsSrgbSampleDecode(format);
 		if (storage || image.conversion_format != Prospero::BufferFormat::kInvalid) {
 			image.shader_swizzle = DescriptorImageSwizzle(descriptor);
 		}
@@ -590,17 +599,19 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 				continue;
 			}
 			if (NullImageDescriptor(next_snapshot.images[candidate])) {
-				image.numeric_class     = image_class.numeric_class;
-				image.dimension         = image_class.dimension;
-				image.mip_count         = image_class.mip_count;
-				image.conversion_format = image_class.conversion_format;
-				image.shader_swizzle    = image_class.shader_swizzle;
-				image.cube              = image_class.cube;
+				image.numeric_class      = image_class.numeric_class;
+				image.dimension          = image_class.dimension;
+				image.mip_count          = image_class.mip_count;
+				image.conversion_format  = image_class.conversion_format;
+				image.srgb_sample_decode = image_class.srgb_sample_decode;
+				image.shader_swizzle     = image_class.shader_swizzle;
+				image.cube               = image_class.cube;
 			}
 			if (image.numeric_class != image_class.numeric_class ||
 			    image.dimension != image_class.dimension ||
 			    image.mip_count != image_class.mip_count ||
 			    image.conversion_format != image_class.conversion_format ||
+			    image.srgb_sample_decode != image_class.srgb_sample_decode ||
 			    image.shader_swizzle != image_class.shader_swizzle ||
 			    image.cube != image_class.cube) {
 				return SpecializationFail(
@@ -999,6 +1010,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		image.dimension                  = source.dimension;
 		image.mip_count                  = source.mip_count;
 		image.conversion_format          = source.conversion_format;
+		image.srgb_sample_decode         = source.srgb_sample_decode;
 		image.shader_swizzle             = source.shader_swizzle;
 		image.indirect_root              = source.indirect_root;
 		image.indirect_mapping_offset    = source.indirect_mapping_offset;

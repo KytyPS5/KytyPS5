@@ -20,6 +20,7 @@ struct ResourceSpecialization {
 		Decoder::ImageDimension       dimension     = Decoder::ImageDimension::Unknown;
 		uint32_t                      mip_count     = 1;
 		Prospero::BufferFormat        conversion_format          = Prospero::BufferFormat::kInvalid;
+		bool                          srgb_sample_decode         = false;
 		uint32_t                      shader_swizzle             = ShaderImageIdentitySwizzle;
 		uint32_t                      indirect_root              = ImageResource::NoIndirectImage;
 		uint32_t                      indirect_mapping_offset    = 0;

@@ -140,6 +140,67 @@ Libs::Graphics::ShaderRecompiler::IR::ResourcePlan MixedSamplerPlan() {
   return ExtractResourcePlan(program);
 }
 
+// One sampled image whose descriptor carries `format` in the guest format
+// field, so the sRGB-decode materialization can be driven without a full guest
+// shader.
+Libs::Graphics::ShaderRecompiler::IR::ResourcePlan
+NarrowSrgbPlan(uint32_t format) {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = true;
+  program.resource_tracking_complete = true;
+  AddValueBlock(program);
+
+  DescriptorSource image;
+  image.dword_count = 8;
+  for (auto &dword : image.dwords) {
+    dword = Value(0u);
+  }
+  image.dwords[0] = Value(0x1000u);
+  image.dwords[1] = Value(format << 20u);
+  image.dwords[3] =
+      Value(static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D)
+            << 28u);
+  program.descriptor_sources.push_back(image);
+  DescriptorSource sampler;
+  sampler.dword_count = 4;
+  for (auto &dword : sampler.dwords) {
+    dword = Value(0u);
+  }
+  program.descriptor_sources.push_back(sampler);
+  program.info.images.push_back(
+      {.source = 0,
+       .resource_class = ImageResourceClass::Sampled,
+       .numeric_class = Libs::Graphics::Prospero::TextureNumericClass::Float,
+       .dimension =
+           Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension::Dim2D});
+  program.info.samplers.push_back({.source = 1});
+  program.info.sampled_pairs.push_back({.image = 0, .sampler = 0});
+  return ExtractResourcePlan(program);
+}
+
+void TestNarrowSrgbDescriptorRequestsShaderDecode() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Libs::Graphics::Prospero::BufferFormat;
+  const auto MaterializedFlag = [](BufferFormat format) {
+    auto plan = NarrowSrgbPlan(static_cast<uint32_t>(format));
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(plan, {}, snapshot, specialization),
+          "narrow format descriptor materialization failed");
+    Check(specialization.images.size() == 1,
+          "sampled image was not materialized");
+    return specialization.images[0].srgb_sample_decode;
+  };
+  Check(MaterializedFlag(BufferFormat::k8Srgb),
+        "8-bit sRGB image did not request the shader-side decode");
+  Check(MaterializedFlag(BufferFormat::k8_8Srgb),
+        "8_8 sRGB image did not request the shader-side decode");
+  Check(!MaterializedFlag(BufferFormat::k8UNorm),
+        "linear 8-bit image requested the shader-side decode");
+}
+
 void TestMappedSrtUsesDirectReaderByDefault() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   const uint32_t dword = 0x12345678;
@@ -270,6 +331,7 @@ int main() {
   TestUnbasedFlatCacheHitMaterializes();
   TestFailedMaterializationPreservesPriorStage();
   TestMixedSamplerDuplicatesTheCorrectSnapshot();
+  TestNarrowSrgbDescriptorRequestsShaderDecode();
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;
 }

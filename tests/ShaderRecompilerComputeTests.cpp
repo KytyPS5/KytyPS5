@@ -25671,6 +25671,7 @@ TestCase ImageLoadR32UintUsesIntegerSampledImage() {
   test.has_user_data = true;
   test.required_spirv = {"image_10", "OpTypeImage %uint",
                          "OpImageFetch %v4uint"};
+  test.forbidden_spirv = {"FMax", "Pow"};
   return test;
 }
 
@@ -25684,6 +25685,90 @@ TestCase ImageLoadFmaskUsesNativeSampleMapping() {
   test.sampled_image_rgba.clear();
   test.required_spirv = {"OpConstant %uint 1985229328"};
   test.forbidden_spirv = {"OpTypeImage", "OpImageFetch"};
+  return test;
+}
+
+// A narrow sRGB descriptor is stored as the linear format of the same width, so the sampler
+// never decodes it and the shader has to. The texel byte stays in the 0.04045 low branch,
+// which is a single multiply, so the readback can be compared bit-for-bit.
+TestCase ImageLoadDecodesNarrowSrgbTexel() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 2);
+  AppendVMovU32(&code, 21, 1);
+  code.push_back(EncodeMimg0(0x00, 0x1));
+  code.push_back(EncodeMimg1(0, 20));
+  AppendStoreVgpr(&code, 0, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "ImageLoadDecodesNarrowSrgbTexel";
+  test.code = code;
+  test.expected = {0x3b46eb61u};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_LOAD, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.sampled_image_rgba.assign(4, 0x0a0a0a0au);
+  test.sampled_image_format = vk::Format::eR8Unorm;
+  test.sampled_image_dwords_per_pixel = 1;
+  test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k8Srgb);
+  test.has_user_data = true;
+  test.required_spirv = {"FMax", "OpFOrdLessThanEqual %bool", "Pow"};
+  return test;
+}
+
+TestCase ImageLoadDecodesNarrowSrgbChromaPair() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 2);
+  AppendVMovU32(&code, 21, 1);
+  code.push_back(EncodeMimg0(0x00, 0x3));
+  code.push_back(EncodeMimg1(0, 20));
+  AppendStoreVgpr(&code, 0, 0);
+  AppendStoreVgpr(&code, 1, 1);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "ImageLoadDecodesNarrowSrgbChromaPair";
+  test.code = code;
+  test.expected = {0x3a9f22b4u, 0x3b1f22b4u};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_LOAD, O::BUFFER_STORE_DWORD,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.sampled_image_rgba.assign(4, 0x08040804u);
+  test.sampled_image_format = vk::Format::eR8G8Unorm;
+  test.sampled_image_dwords_per_pixel = 1;
+  test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k8_8Srgb);
+  test.has_user_data = true;
+  test.required_spirv = {"FMax", "OpFOrdLessThanEqual %bool", "Pow"};
+  return test;
+}
+
+// The linear counterpart of the same texel: no transfer sequence may be emitted, and the
+// sampler value has to pass through untouched.
+TestCase ImageLoadKeepsLinearTexelsLinear() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 2);
+  AppendVMovU32(&code, 21, 1);
+  code.push_back(EncodeMimg0(0x00, 0x1));
+  code.push_back(EncodeMimg1(0, 20));
+  AppendStoreVgpr(&code, 0, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "ImageLoadKeepsLinearTexelsLinear";
+  test.code = code;
+  test.expected = {0x3e808081u};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_LOAD, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.sampled_image_rgba.assign(4, 0x40404040u);
+  test.sampled_image_format = vk::Format::eR8Unorm;
+  test.sampled_image_dwords_per_pixel = 1;
+  test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k8UNorm);
+  test.has_user_data = true;
+  test.forbidden_spirv = {"FMax", "Pow"};
   return test;
 }
 
@@ -27743,6 +27828,9 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferAtomicFMaxContendedWorkgroup);
   AddCase(ImageLoadVariants);
   AddCase(ImageLoadR32UintUsesIntegerSampledImage);
+  AddCase(ImageLoadDecodesNarrowSrgbTexel);
+  AddCase(ImageLoadDecodesNarrowSrgbChromaPair);
+  AddCase(ImageLoadKeepsLinearTexelsLinear);
   AddCase(ImageLoadFmaskUsesNativeSampleMapping);
   AddCase(ImageLoadR32SintUsesSignedSampledImage);
   AddCase(ImageLoadPackedUintUnpacksAndSwizzles);
@@ -32282,6 +32370,13 @@ int main(int argc, char **argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
+  if (argc == 2 && std::strcmp(argv[1], "--narrow-srgb-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, ImageLoadDecodesNarrowSrgbTexel());
+    RunCase(&vulkan, ImageLoadDecodesNarrowSrgbChromaPair());
+    RunCase(&vulkan, ImageLoadKeepsLinearTexelsLinear());
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--packed-integer-neg-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, Vop3pIntegerNegationCapturedAndSelectedHalves());

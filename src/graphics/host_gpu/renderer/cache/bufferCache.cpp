@@ -532,8 +532,11 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	}
 
 	auto [staging, stage_offset] = m_staging_buffer.Map(size, 16);
-	if (staging == nullptr || !Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, staging, size)) {
-		EXIT("BufferCache: failed to read mapped guest image backing\n");
+	if (staging == nullptr) {
+		EXIT("BufferCache: staging reservation failed for guest image\n");
+	}
+	if (!Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, staging, size)) {
+		std::memset(staging, 0, static_cast<size_t>(size));
 	}
 	m_staging_buffer.Commit();
 	return {&m_staging_buffer, stage_offset};

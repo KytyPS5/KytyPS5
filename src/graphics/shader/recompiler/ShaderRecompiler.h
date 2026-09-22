@@ -15,6 +15,7 @@
 namespace Libs::Graphics::ShaderRecompiler {
 
 struct CompileOptions {
+	bool                        non_fatal = false;
 	ShaderType                  stage           = ShaderType::Compute;
 	uint32_t                    wave_size       = 64;
 	uint32_t                    user_data_base  = 0;
@@ -28,6 +29,7 @@ struct CompileOptions {
 };
 
 struct TranslateResult {
+	bool        unsupported = false;
 	IR::Program program;
 	std::string decoded_dump;
 	std::string cfg_dump;

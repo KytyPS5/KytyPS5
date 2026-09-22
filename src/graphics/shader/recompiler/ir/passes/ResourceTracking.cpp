@@ -499,7 +499,7 @@ private:
 		}
 	}
 
-	void GetHandle(Value value, ValueOpcode expected, uint32_t width, uint32_t pc, Inst*& handle,
+	bool GetHandle(Value value, ValueOpcode expected, uint32_t width, uint32_t pc, Inst*& handle,
 	               uint32_t& source, bool sampler = false, bool sample_adjust = false) {
 		handle = value.Resolve().TryInstruction();
 		if (handle == nullptr || handle->GetOpcode() != expected) {
@@ -508,21 +508,17 @@ private:
 		DescriptorSource descriptor;
 		MakeSource(*handle, width, sampler, sample_adjust, descriptor, pc);
 		uint32_t bad_dword = 0;
-		if (expected == ValueOpcode::GetImageResource) {
-			for (; bad_dword < descriptor.dword_count; bad_dword++) {
-				const auto* value = descriptor.dwords[bad_dword].Resolve().TryInstruction();
-				if (value != nullptr && value->GetOpcode() == ValueOpcode::ReadConstBuffer) {
-					Fail(pc, fmt::format("{} dword {} is not a valid runtime value",
-					                     ValueOpcodeName(expected), bad_dword));
-				}
-			}
-			bad_dword = 0;
-		}
 		if (!ValidateSource(descriptor, bad_dword)) {
+			if (expected == ValueOpcode::GetBufferResource &&
+			    std::all_of(descriptor.dwords.begin(), descriptor.dwords.begin() + width,
+			                [](Value word) { return word.Resolve().GetType() == Type::U32; })) {
+				return false;
+			}
 			Fail(pc, fmt::format("{} dword {} is not a valid runtime value",
 			                     ValueOpcodeName(expected), bad_dword));
 		}
 		source = InternSource(descriptor);
+		return true;
 	}
 
 	void ValidateAddressHandle(Value value, uint32_t pc) const {
@@ -705,7 +701,18 @@ private:
 		uint32_t resource = 0;
 
 		if (buffer != BufferAccess::None) {
-			GetHandle(inst.Arg(0), ValueOpcode::GetBufferResource, 4, flags.pc, handle, source);
+			if (!GetHandle(inst.Arg(0), ValueOpcode::GetBufferResource, 4, flags.pc, handle,
+			               source)) {
+				if (memory.kind != ResourceKind::Buffer || memory.formatted || memory.typed ||
+				    (op != ValueOpcode::LoadBufferU32x2 && op != ValueOpcode::LoadBufferU32x4)) {
+					Fail(flags.pc,
+					     "buffer descriptor is not a valid runtime value; GPU-selected access "
+					     "requires a raw DWORD x2/x4 load");
+				}
+				m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
+				m_info.uses_dma                         = true;
+				return;
+			}
 			resource = AddBuffer(source, memory, op, flags.pc);
 			if (resource == UINT32_MAX) {
 				Fail(flags.pc, "buffer resource limit exceeded");

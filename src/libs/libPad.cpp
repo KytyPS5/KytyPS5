@@ -206,6 +206,7 @@ LIB_DEFINE(InitPad_1) {
 	LIB_FUNC("rIZnR6eSpvk", Controller::PadResetOrientation);
 	LIB_FUNC("vDLMoJLde8I", PadSetTiltCorrectionState);
 	LIB_FUNC("gjP9-KQzoUk", Controller::PadGetControllerInformation);
+	LIB_FUNC("fCWdlnmB1Ks", Controller::PadIsRemoteController);
 	LIB_FUNC("hGbf2QTBmqc", PadGetExtControllerInformationStub);
 	LIB_FUNC("2JgFB2n9oUM", Controller::PadSetTriggerEffect);
 	LIB_FUNC("YndgXqQVV7c", Controller::PadReadState);

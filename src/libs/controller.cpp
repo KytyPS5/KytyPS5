@@ -812,6 +812,20 @@ int KYTY_SYSV_ABI PadGetControllerInformation(int handle, PadControllerInformati
 	return OK;
 }
 
+int KYTY_SYSV_ABI PadIsRemoteController(int handle, bool* is_remote) {
+	PRINT_NAME();
+
+	if (handle != 1) {
+		return PAD_ERROR_INVALID_HANDLE;
+	}
+	if (is_remote == nullptr) {
+		return PAD_ERROR_INVALID_ARG;
+	}
+
+	*is_remote = false;
+	return OK;
+}
+
 int KYTY_SYSV_ABI PadReadState(int handle, PadData* data) {
 	PRINT_NAME();
 

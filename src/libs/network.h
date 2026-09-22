@@ -167,11 +167,14 @@ struct NpCreateAsyncRequestParameter;
 struct NpCheckPremiumParameter;
 struct NpCheckPremiumResult;
 
+using NpStateCallbackA = KYTY_SYSV_ABI void (*)(int user_id, uint32_t state, void* userdata);
+
 int KYTY_SYSV_ABI  NpCheckCallback();
 int KYTY_SYSV_ABI  NpSetNpTitleId(const NpTitleId* title_id, const NpTitleSecret* title_secret);
 int KYTY_SYSV_ABI  NpSetContentRestriction(const NpContentRestriction* restriction);
 int KYTY_SYSV_ABI  NpRegisterStateCallback(void* callback, void* userdata);
 int KYTY_SYSV_ABI  NpUnregisterStateCallback();
+int KYTY_SYSV_ABI  NpRegisterStateCallbackA(NpStateCallbackA callback, void* userdata);
 void KYTY_SYSV_ABI NpRegisterGamePresenceCallback(void* callback, void* userdata);
 int KYTY_SYSV_ABI  NpRegisterPlusEventCallback(void* callback, void* userdata);
 int KYTY_SYSV_ABI  NpRegisterPremiumEventCallback(void* callback, void* userdata);

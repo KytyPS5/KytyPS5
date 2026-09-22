@@ -651,6 +651,7 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 	key.push_back(static_cast<uint32_t>(info.fetch_attrib_reg));
 	key.push_back(static_cast<uint32_t>(info.fetch_buffer_reg));
 	key.push_back(info.resources_num);
+	key.push_back(info.wave_size);
 	key.push_back(info.scratch_size_dwords);
 	key.push_back(info.pa_cl_vs_out_cntl);
 	key.push_back(static_cast<uint32_t>(info.clip_space.enabled));
@@ -721,6 +722,7 @@ void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>
 	key.push_back(static_cast<uint32_t>(info.ps_depth_export_enable));
 	key.push_back(static_cast<uint32_t>(info.ps_sample_mask_export_enable));
 	key.push_back(static_cast<uint32_t>(info.ps_early_z));
+	key.push_back(static_cast<uint32_t>(info.dual_source_blending));
 	key.insert(key.end(), std::begin(info.target_output_mode), std::end(info.target_output_mode));
 	for (uint32_t base = 0; base < info.target_export_mapping.size(); base += 4u) {
 		uint32_t packed = 0;
@@ -763,6 +765,7 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 		                                    regs.gs_regs.rsrc2.user_sgpr, sh, data, info)) {
 			EXIT("failed to prepare vertex shader program\n");
 		}
+		info.wave_size = (context.GetShaderStages() & 0x00400000u) != 0 ? 32u : 64u;
 		return params;
 	}
 	// NGG user SGPRs start at s8; a separately compiled GS back half also receives

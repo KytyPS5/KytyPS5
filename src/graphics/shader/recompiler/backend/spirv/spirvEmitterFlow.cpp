@@ -138,7 +138,7 @@ uint32_t EmitDppWriteCondition(ValueEmitContext& ctx, const IR::DppMoveFlags& fl
 	state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), masks_ok, bank_ok, row_ok);
 	uint32_t writable = masks_ok;
 	if (!flags.bound_control) {
-		const auto target  = EmitDppTargetLane(state, flags.control);
+		const auto target  = EmitDppTargetLane(state, flags);
 		const auto bounded = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), bounded, writable,
 		                          target.valid);
@@ -559,6 +559,10 @@ void EmitVoid(ValueEmitContext&) {}
 
 void EmitBarrier(EmitterState& state) {
 	const auto tessellation = state.program.stage == ShaderType::TessellationControl;
+	if (!tessellation && ShaderWorkgroupInput(state.program.stage, state.input_info) == nullptr) {
+		// Independent graphics invocations have no native workgroup left to synchronize.
+		return;
+	}
 	const auto memory_scope = tessellation ? spv::ScopeInvocation : spv::ScopeWorkgroup;
 	const auto semantics    = tessellation ? spv::MemorySemanticsMaskNone
 	                                       : spv::MemorySemanticsAcquireReleaseMask |
@@ -611,7 +615,7 @@ uint32_t EmitUndefU1(EmitterState& state, const IR::Inst& inst) {
 uint32_t EmitDppMoveU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&      state    = ctx.state;
 	const auto flags    = inst.Flags<IR::DppMoveFlags>();
-	const auto target   = EmitDppTargetLane(state, flags.control);
+	const auto target   = EmitDppTargetLane(state, flags);
 	const auto shuffled = ctx.Shuffle(inst, 0, target.lane);
 	if (flags.fetch_inactive) {
 		return shuffled;

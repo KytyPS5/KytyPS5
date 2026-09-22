@@ -8,6 +8,8 @@
 #include <QStringList>
 #include <QWidget>
 
+#include <memory>
+
 class ConfigurationItem;
 class CompatibilityDatabase;
 class QEvent;
@@ -30,10 +32,9 @@ public:
 	[[nodiscard]] const ConfigurationItem* GetSelectedItem() const { return m_selected_item; }
 	ConfigurationItem*                     GetSelectedItem() { return m_selected_item; }
 
-	[[nodiscard]] const QString&     GetSettingsFile() const { return m_settings_file; }
-	[[nodiscard]] const QStringList& GetHostInputMapping() const {
-		return m_global_info.host_input_mapping;
-	}
+	[[nodiscard]] const QString& GetSettingsFile() const { return m_settings_file; }
+	[[nodiscard]] std::unique_ptr<Configuration>
+	CreateConfiguration(const ConfigurationItem& item) const;
 
 	bool EnsureGameDirectory();
 	void ScanGameDirectory();
@@ -64,7 +65,6 @@ protected slots:
 	void filter_configurations(const QString& text);
 
 private:
-	void               ClearCustomSettings(ConfigurationItem* item);
 	void               SelectItem(QTreeWidgetItem* witem);
 	void               ApplyCompatibility();
 	void               UpdateToolbarIcons();

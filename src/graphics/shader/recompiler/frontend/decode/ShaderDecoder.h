@@ -73,6 +73,8 @@ enum class Opcode {
 	S_SUB_I32,
 	S_BITCMP0_B32,
 	S_BITCMP1_B32,
+	S_BITCMP0_B64,
+	S_BITCMP1_B64,
 	S_BITSET0_B32,
 	S_BITSET1_B32,
 	S_BITSET0_B64,
@@ -228,6 +230,7 @@ enum class Opcode {
 	V_CVT_PKRTZ_F16_F32,
 	V_CVT_PK_U8_F32,
 	V_MAD_F32,
+	V_MAD_I16,
 	V_MAD_I32_I24,
 	V_MAD_U32_U24,
 	V_MAD_U64_U32,
@@ -300,6 +303,7 @@ enum class Opcode {
 	V_SUBREV_NC_U32,
 	V_ADD_NC_U16,
 	V_SUB_NC_U16,
+	V_MUL_LO_U16,
 	V_MAX_U16,
 	V_MAX_I16,
 	V_MIN_U16,
@@ -380,6 +384,7 @@ enum class Opcode {
 	V_CMP_GE_F16,
 	V_CMP_NGT_F16,
 	V_CMP_NEQ_F16,
+	V_CMP_NLT_F16,
 	V_CMPX_LT_F16,
 	V_CMPX_EQ_F16,
 	V_CMPX_LE_F16,
@@ -671,6 +676,7 @@ struct Operand {
 	bool     absolute           = false;
 	bool     clamp              = false;
 	bool     dpp                = false;
+	bool     dpp8               = false;
 };
 
 struct Instruction {

@@ -208,6 +208,8 @@ bool Translator::EmitScalar(const Decoder::Instruction& inst) {
 		case O::S_BFE_U64: return S_BFE_U64(inst);
 		case O::S_BITCMP0_B32: return S_BITCMP_B32(inst, false);
 		case O::S_BITCMP1_B32: return S_BITCMP_B32(inst, true);
+		case O::S_BITCMP0_B64: return S_BITCMP_B64(inst, false);
+		case O::S_BITCMP1_B64: return S_BITCMP_B64(inst, true);
 		case O::S_PACK_LL_B32_B16: return PackB16(inst, false, false);
 		case O::S_PACK_LH_B32_B16: return PackB16(inst, false, true);
 		case O::S_PACK_HH_B32_B16: return PackB16(inst, true, true);

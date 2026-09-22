@@ -1052,7 +1052,7 @@ static int32_t KYTY_SYSV_ABI AudiodecDecode(int32_t handle, AudiodecCtrl* ctrl) 
 		ctrl->pPcmItem->uiPcmSize = static_cast<uint32_t>(result.output_written);
 		audiodec_fill_info(ctrl, decoder);
 		auto* info = static_cast<AudiodecM4aacInfo*>(ctrl->pBsiInfo);
-		info->iResult = (result.result & AJM_RESULT_CODEC_ERROR) != 0
+		info->iResult = (result.result & (AJM_RESULT_CODEC_ERROR | AJM_RESULT_TOO_MANY_CHANNELS)) != 0
 		                    ? AUDIODEC_M4AAC_RESULT_DECODE_ERROR
 		                    : (result.result & AJM_RESULT_PARTIAL_INPUT) != 0
 		                          ? AUDIODEC_M4AAC_RESULT_INSUFFICIENT_DATA : 0;

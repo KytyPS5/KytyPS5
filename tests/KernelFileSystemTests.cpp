@@ -4,12 +4,14 @@
 #include "common/logging/log.h"
 #include "common/subsystems.h"
 #include "common/threads.h"
+#include "common/stringUtils.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "kernel/fileSystem.h"
 #include "libs/errno.h"
 #include "libs/network.h"
 #include "loader/symbolDatabase.h"
 
+#include <algorithm>
 #include <array>
 
 #include <chrono>
@@ -89,6 +91,33 @@ void CheckSaveRename(const std::filesystem::path &root,
         "renamed save contents");
 }
 
+void TestSaveOpenVisibility() {
+  constexpr char Path[] = "/savedata0/visible-save.dat";
+  constexpr char Payload[] = "saved progress";
+
+  const int fd = FileSystem::KernelOpen(Path, 0xa01, 0777);
+  Check(fd >= 3, "create save file exclusively");
+  FileSystem::FileStat stat {};
+  Check(FileSystem::KernelStat(Path, &stat) == OK && stat.st_size == 0,
+        "created save file is visible before close");
+  Check(FileSystem::KernelOpen(Path, 0xa01, 0777) ==
+            Libs::LibKernel::KERNEL_ERROR_EEXIST,
+        "exclusive creation detects an open save file");
+  Check(FileSystem::KernelWrite(fd, Payload, sizeof(Payload) - 1) ==
+            sizeof(Payload) - 1,
+        "populate save file before truncation");
+  Check(FileSystem::KernelClose(fd) == OK, "close populated save file");
+  Check(FileSystem::KernelStat(Path, &stat) == OK &&
+            stat.st_size == sizeof(Payload) - 1,
+        "save file contains the truncation fixture");
+
+  const int truncated = FileSystem::KernelOpen(Path, 0x401, 0777);
+  Check(truncated >= 3, "truncate existing save file");
+  Check(FileSystem::KernelStat(Path, &stat) == OK && stat.st_size == 0,
+        "save truncation is visible before close");
+  Check(FileSystem::KernelClose(truncated) == OK, "close truncated save file");
+}
+
 void CheckMountRoot(const std::filesystem::path &root) {
   Common::File cache;
   Check(cache.Create(root / "rpf.cache"), "create directory listing fixture");
@@ -126,6 +155,80 @@ void CheckMountRoot(const std::filesystem::path &root) {
     }
   }
   FileSystem::Umount("/app0");
+  Check(FileSystem::GetRealFilename("/app0/rpf.cache") == "/app0/rpf.cache",
+        "unmount by guest path");
+  for (const auto &folder : {root, root / ""}) {
+    for (const auto &host : {root, root / ""}) {
+      FileSystem::Mount(folder, "/app0");
+      FileSystem::Umount(Common::PathToGenericString(host));
+      Check(FileSystem::GetRealFilename("/app0/rpf.cache") == "/app0/rpf.cache",
+            "unmount by host path with or without trailing separator");
+    }
+  }
+}
+
+void CheckUnicodePaths(const std::filesystem::path &root) {
+  constexpr std::string_view HostDirectory =
+      "Test\xc3\xa9-\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e";
+  constexpr std::string_view GuestFilename =
+      "asset-\xc3\xa9-\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e.bin";
+
+  const auto unicode_root =
+      root / Common::PathFromUtf8(HostDirectory);
+  const auto nested_root = unicode_root / "nested";
+
+  Check(Common::File::CreateDirectories(nested_root),
+        "create nested Unicode host directory");
+
+  CheckMountRoot(nested_root);
+
+  const auto native_file =
+      nested_root / Common::PathFromUtf8(GuestFilename);
+
+  Common::File fixture;
+  Check(fixture.Create(native_file), "create Unicode filename");
+  fixture.Close();
+
+  const auto entries = Common::File::GetDirEntries(nested_root);
+  Check(std::any_of(entries.begin(), entries.end(), [&](const auto &entry) {
+          return entry.is_file && entry.name == GuestFilename;
+        }), "directory enumeration returns UTF-8 filenames");
+
+  FileSystem::Mount(nested_root, "/app0");
+
+  const auto guest_file =
+      std::string("/app0/") + std::string(GuestFilename);
+
+  Check(FileSystem::GetRealFilename(guest_file) == native_file,
+        "resolve Unicode guest path");
+
+  const int fd = FileSystem::KernelOpen(guest_file.c_str(), 0, 0);
+  Check(fd >= 3, "open Unicode guest path");
+  Check(FileSystem::KernelClose(fd) == OK,
+        "close Unicode guest path");
+
+  FileSystem::Umount("/app0");
+}
+
+void CheckUnicodeLogPath(const std::filesystem::path &root) {
+  Config::ConfigOptions options;
+  options.printf_direction = Config::LogDirection::File;
+  options.printf_output_file = root / u8"logs-\u65e5\u672c\u8a9e-\U0001f600" / u8"log-\u00e9.txt";
+  Config::Load(options);
+  Log::Initialize();
+  constexpr std::string_view Payload = "Unicode log path\n";
+  Log::Write(Payload);
+  Log::Shutdown();
+
+  Common::File result(options.printf_output_file, Common::File::Mode::Read);
+  Check(!result.IsInvalid(), "open Unicode log file");
+  const auto data = result.ReadWholeBuffer();
+  Check(data.size() == Payload.size() &&
+            std::memcmp(data.data(), Payload.data(), data.size()) == 0,
+        "Unicode log file contains output");
+  options.printf_direction = Config::LogDirection::Silent;
+  Config::Load(options);
+  Log::Initialize();
 }
 
 void CheckDirectoryStream(const std::filesystem::path &root) {
@@ -387,9 +490,12 @@ int main() {
   TempDirectory temporary;
   FileSystem::Initialize();
   CheckMountRoot(temporary.Path());
+  CheckUnicodePaths(temporary.Path());
+  CheckUnicodeLogPath(temporary.Path());
   CheckDirectoryStream(temporary.Path());
   CheckAprPaths(temporary.Path());
   FileSystem::Mount(temporary.Path(), "/savedata0");
+  TestSaveOpenVisibility();
   CheckSaveRename(temporary.Path(), "first-save");
   CheckSaveRename(temporary.Path(), "replacement-save");
   FileSystem::Shutdown();

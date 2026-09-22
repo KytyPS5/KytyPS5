@@ -781,6 +781,7 @@ RenderContext& Presenter::Renderer() const noexcept {
 void Presenter::Present(Frame& frame, bool reuse) {
 	KYTY_PROFILER_FUNCTION();
 	m_impl->frames.ValidateForPresent(&frame, reuse);
+	m_impl->window.graphic_ctx.presented_frames.fetch_add(1, std::memory_order_relaxed);
 
 	const auto overlay_visual = GetSystemOverlayVisualState();
 	auto&      swapchain  = m_impl->swapchain;

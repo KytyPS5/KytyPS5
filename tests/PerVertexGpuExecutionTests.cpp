@@ -440,6 +440,7 @@ int main() {
     Check(vk_create_compute_pipelines(dev.device, VK_NULL_HANDLE, 1, &pipe_info, nullptr, &pipeline), "vkCreateComputePipelines");
 
     VkCommandPoolCreateInfo cp_info {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    cp_info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     cp_info.queueFamilyIndex = dev.queue_family;
     VkCommandPool cmd_pool = VK_NULL_HANDLE;
     Check(vk_create_command_pool(dev.device, &cp_info, nullptr, &cmd_pool), "vkCreateCommandPool");
@@ -689,6 +690,48 @@ int main() {
         }
     }
     std::printf("PASS: SNORM16 GPU fixture (INT16_MIN/MAX, zero, intermediate within one ULP)\n");
+    // Integer attributes travel through the vec4 buffer as raw bits, including NaN patterns.
+    GpuBuffer integer_buf = CreateBuffer(dev, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    const VkDescriptorBufferInfo integer_dbi {integer_buf.buffer, 0, 16};
+    snorm_write.pBufferInfo = &integer_dbi;
+    vk_update_descriptor_sets(dev.device, 1, &snorm_write, 0, nullptr);
+    for (uint32_t bits : {8u, 16u, 32u}) {
+        const uint32_t sign = 1u << (bits - 1u);
+        const uint32_t mask = UINT32_MAX >> (32u - bits);
+        const uint32_t raw[4] = {sign, sign - 1u, mask, 0x01000001u & mask};
+        for (uint32_t c = 0; c < 4; ++c) std::memcpy(static_cast<uint8_t*>(integer_buf.mapped) + c * bits / 8u, &raw[c], bits / 8u);
+        for (uint32_t kind : {4u, 5u}) {
+            const uint32_t expected[4] = {kind == 5u ? 0u - sign : sign, sign - 1u, kind == 5u ? UINT32_MAX : mask, raw[3]};
+            for (uint32_t count : {1u, 2u, 3u, 4u}) {
+                for (uint32_t out_of_bounds : {0u, 1u}) {
+                    PushConstants push {};
+                    push.total_invocations = push.index_count = push.num_records = 1;
+                    push.first_vertex = out_of_bounds;
+                    push.vertex_stride = bits / 2u;
+                    push.packed_flags = 1u << 19u;
+                    push.attrs[0].meta = (count << 17u) | (kind << 20u);
+                    push.attrs[0].bit_counts = bits * 0x01010101u;
+                    Check(vk_begin_command_buffer(cmd, &snorm_begin), "begin integer unpack");
+                    vk_cmd_bind_pipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+                    vk_cmd_bind_descriptor_sets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout, 0, 1, &desc_set, 0, nullptr);
+                    vk_cmd_push_constants(cmd, pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+                    vk_cmd_dispatch(cmd, 1, 1, 1);
+                    Check(vk_end_command_buffer(cmd), "end integer unpack");
+                    Check(vk_queue_submit(dev.queue, 1, &snorm_submit, VK_NULL_HANDLE), "submit integer unpack");
+                    Check(vk_queue_wait_idle(dev.queue), "wait integer unpack");
+                    const auto* actual = static_cast<const uint32_t*>(attr_buf.mapped);
+                    for (uint32_t c = 0; c < 4; ++c) {
+                        const uint32_t want = !out_of_bounds && c < count ? expected[c] : (c == 3 ? 1u : 0u);
+                        if (actual[c] != want) {
+                            std::fprintf(stderr, "integer unpack bits=%u kind=%u count=%u oob=%u component=%u: %08x != %08x\n", bits, kind, count, out_of_bounds, c, actual[c], want);
+                            Fail("integer attribute bits/defaults");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    std::puts("PASS: signed/unsigned 8/16/32-bit attributes, widths 1-4, integer defaults and OOB");
     VkWriteDescriptorSet restore_vertex_write {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     restore_vertex_write.dstSet = desc_set;
     restore_vertex_write.dstBinding = 1;
@@ -987,6 +1030,20 @@ OpFunctionEnd
 
     spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
     tools.SetMessageConsumer([](spv_message_level_t, const char*, const spv_position_t& position, const char* message) { std::fprintf(stderr, "SPIR-V line %zu: %s\n", position.index, message); });
+    for (const std::string scalar : {"%uint", "%int"}) {
+        for (uint32_t width : {1u, 2u, 3u, 4u}) {
+            std::string source = kVsSource;
+            const std::string type = width == 1u ? scalar : "%integer_attr_vector";
+            std::string declarations;
+            if (width != 1u) declarations += type + " = OpTypeVector " + scalar + " " + std::to_string(width) + "\n";
+            declarations += "%integer_attr_pointer = OpTypePointer Input " + type + "\n%in_attr_2 = OpVariable %integer_attr_pointer Input\n";
+            source.insert(source.find("%main = OpFunction"), declarations);
+            std::vector<uint32_t> words;
+            const auto capture = Libs::Graphics::LowerVertexToCompute(source, layout, vs_param_vars);
+            if (!tools.Assemble(capture, &words) || !tools.Validate(words)) Fail("integer attribute capture SPIR-V");
+        }
+    }
+    std::puts("PASS: capture SPIR-V accepts signed/unsigned scalar and vector attribute stores");
     std::vector<uint32_t> cap_spv, replay_spv, frag_spv;
     if (!tools.Assemble(cap_dis, &cap_spv, SPV_TEXT_TO_BINARY_OPTION_PRESERVE_NUMERIC_IDS)) Fail("assemble capture compute");
     if (!tools.Assemble(replay_dis, &replay_spv, SPV_TEXT_TO_BINARY_OPTION_PRESERVE_NUMERIC_IDS)) Fail("assemble replay vertex");

@@ -46,10 +46,10 @@ void RenderExecutor::ExecutePerVertexPrototype(uint64_t submit_id, CommandBuffer
 	const uint64_t vtx_aligned_offset = Common::AlignDown(vtx_offset, alignment);
 	const uint32_t vertex_byte_adjust = static_cast<uint32_t>(vtx_offset - vtx_aligned_offset);
 
-	vk::Buffer idx_vk_buf         = nullptr;
-	uint64_t   idx_aligned_offset = 0;
-	uint32_t   index_byte_adjust  = 0;
-	uint64_t   idx_buf_available  = 0;
+	vk::Buffer     idx_vk_buf         = nullptr;
+	uint64_t       idx_aligned_offset = 0;
+	uint32_t       index_byte_adjust  = 0;
+	uint64_t       idx_buf_available  = 0;
 	const uint32_t index_element_size =
 	    index_source.host_data != nullptr ? sizeof(uint16_t) : index_source.guest_element_size;
 	if (draw.IsIndexed()) {
@@ -115,10 +115,8 @@ void RenderExecutor::ExecutePerVertexPrototype(uint64_t submit_id, CommandBuffer
 	EXIT_IF(graphics.device.allocateDescriptorSets(&unpack_alloc, &unpack_set) !=
 	        vk::Result::eSuccess);
 
-	const uint64_t idx_bytes_raw =
-	    draw.IsIndexed()
-	        ? (index_source.size + index_byte_adjust)
-	        : (vtx_total_bytes + vertex_byte_adjust);
+	const uint64_t idx_bytes_raw = draw.IsIndexed() ? (index_source.size + index_byte_adjust)
+	                                                : (vtx_total_bytes + vertex_byte_adjust);
 	const uint64_t idx_size_bounded =
 	    std::min(Common::AlignUp(idx_bytes_raw, 4), idx_buf_available);
 
@@ -192,23 +190,27 @@ void RenderExecutor::ExecutePerVertexPrototype(uint64_t submit_id, CommandBuffer
 		const auto&    descriptor  = vs.resources[i];
 		const auto     format_info = ShaderRecompiler::Format::GetFormatInfo(descriptor.Format());
 		const uint32_t byte_offset = vertex_byte_adjust + input.attr_offsets[i];
-		uint32_t format_kind = 0;
+		uint32_t       format_kind = 0;
 		if (descriptor.Format() == Prospero::BufferFormat::k16_16_16_16Float) {
 			format_kind = 3;
 		} else if (descriptor.Format() == Prospero::BufferFormat::k16_16_16_16SNorm) {
 			format_kind = 2;
 		} else if (format_info.type == ShaderRecompiler::Format::ComponentType::Float) {
 			format_kind = 1;
+		} else if (format_info.type == ShaderRecompiler::Format::ComponentType::Uint) {
+			format_kind = 4;
+		} else if (format_info.type == ShaderRecompiler::Format::ComponentType::Sint) {
+			format_kind = 5;
 		}
 		const uint32_t comp_count = format_info.component_count;
 		unpack_push.attrs[i].meta =
 		    (byte_offset & 0xffffu) | (comp_count << 17u) | (format_kind << 20u);
 
-		uint32_t bit_counts  = 0;
+		uint32_t bit_counts = 0;
 		for (uint32_t c = 0; c < 4; ++c) {
 			bit_counts |= (format_info.component_bits[c] & 0xffu) << (c * 8u);
 		}
-		unpack_push.attrs[i].bit_counts  = bit_counts;
+		unpack_push.attrs[i].bit_counts = bit_counts;
 	}
 
 	auto cmd = buffer.Handle();

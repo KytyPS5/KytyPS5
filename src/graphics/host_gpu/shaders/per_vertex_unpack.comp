@@ -71,14 +71,14 @@ uint VertexIndex(uint local) {
 }
 
 vec4 DecodeAttribute(uint vertex_id, uint attribute_index) {
-	if (vertex_id == 0xffffffffu) return vec4(0.0, 0.0, 0.0, 1.0);
-
 	AttrDesc info        = push.attrs[attribute_index];
 	uint byte_offset     = info.meta & 0xffffu;
 	uint component_count = (info.meta >> 17u) & 7u;
 	uint format_kind     = (info.meta >> 20u) & 7u;
 	uint byte_base       = vertex_id * push.vertex_stride + byte_offset;
 	vec4 result          = vec4(0.0, 0.0, 0.0, 1.0);
+	if (format_kind == 4u || format_kind == 5u) result.w = uintBitsToFloat(1u);
+	if (vertex_id == 0xffffffffu) return result;
 	uint bit_offset      = 0;
 	for (uint component = 0; component < component_count; ++component) {
 		uint bit_count  = (info.bit_counts >> (component << 3u)) & 0xffu;
@@ -90,6 +90,10 @@ vec4 DecodeAttribute(uint vertex_id, uint attribute_index) {
 			result[component] = max(float(signed_raw) / 32767.0, -1.0);
 		} else if (format_kind == 3u) {
 			result[component] = unpackHalf2x16(ReadBits(byte_base, bit_offset, 16u)).x;
+		} else if (format_kind == 4u || format_kind == 5u) {
+			uint raw = ReadBits(byte_base, bit_offset, bit_count);
+			uint sign = 1u << (bit_count - 1u);
+			result[component] = uintBitsToFloat(format_kind == 5u ? (raw ^ sign) - sign : raw);
 		} else {
 			uint raw = ReadBits(byte_base, bit_offset, bit_count);
 			result[component] = float(raw) / float((1u << bit_count) - 1u);

@@ -88,10 +88,14 @@ bool DecodePerVertexPrototypeAttribute(Prospero::BufferFormat   format,
 	using Type      = ShaderRecompiler::Format::ComponentType;
 	if (info.component_count == 0 || info.component_count > 4 || bytes.size() < info.byte_size)
 		return false;
-	if (info.type != Type::Float && info.type != Type::Unorm &&
+	const bool integer = info.type == Type::Uint || info.type == Type::Sint;
+	if (info.type != Type::Float && info.type != Type::Unorm && !integer &&
 	    !(format == Prospero::BufferFormat::k16_16_16_16SNorm && info.type == Type::Snorm))
 		return false;
 	for (uint32_t c = 0; c < info.component_count; ++c) {
+		if (integer && info.component_bits[c] != 8 && info.component_bits[c] != 16 &&
+		    info.component_bits[c] != 32)
+			return false;
 		if (info.type == Type::Float && format != Prospero::BufferFormat::k16_16_16_16Float &&
 		    info.component_bits[c] != 32)
 			return false;
@@ -104,7 +108,7 @@ bool DecodePerVertexPrototypeAttribute(Prospero::BufferFormat   format,
 			return false;
 	}
 	for (uint32_t c = 0; c < 4; ++c) {
-		uint32_t value = c == 3 ? 0x3f800000u : 0u;
+		uint32_t value = c == 3 ? (integer ? 1u : 0x3f800000u) : 0u;
 		if (c < info.component_count) {
 			if (format == Prospero::BufferFormat::k16_16_16_16Float) {
 				uint16_t raw = 0;
@@ -123,8 +127,14 @@ bool DecodePerVertexPrototypeAttribute(Prospero::BufferFormat   format,
 					const auto position = info.component_bit_offset[c] + bit;
 					raw |= ((bytes[position / 8] >> (position % 8)) & 1u) << bit;
 				}
-				const auto mask = (1u << info.component_bits[c]) - 1u;
-				value = std::bit_cast<uint32_t>(static_cast<float>(raw) / static_cast<float>(mask));
+				if (integer) {
+					const auto sign = 1u << (info.component_bits[c] - 1u);
+					value           = info.type == Type::Sint ? (raw ^ sign) - sign : raw;
+				} else {
+					const auto mask = (1u << info.component_bits[c]) - 1u;
+					value =
+					    std::bit_cast<uint32_t>(static_cast<float>(raw) / static_cast<float>(mask));
+				}
 			}
 		}
 		components[c] = value;

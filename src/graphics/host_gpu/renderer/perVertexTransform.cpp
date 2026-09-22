@@ -261,28 +261,29 @@ std::string LowerVertexToCompute(const std::string& source, const PerVertexLayou
 	uint32_t output_stride = layout.record_stride_vec4;
 	bool     has_clip      = layout.has_clip;
 
-	std::vector<uint32_t> attr_widths(num_attrs, 1);
+	std::vector<uint32_t>    attr_widths(num_attrs, 1);
+	std::vector<std::string> attr_types(num_attrs), attr_scalars(num_attrs);
 	for (uint32_t i = 0; i < num_attrs; ++i) {
 		std::regex  var_decl(R"(^\s*%in_attr_)" + std::to_string(i) +
 		                         R"(\s*=\s*OpVariable\s+(%\S+)\s+Input\s*$)",
 		                     kMultilineRegex);
 		std::smatch m;
-		if (std::regex_search(source, m, var_decl)) {
-			std::string ptr_type = m[1];
-			std::regex ptr_re(R"(^\s*)" + ptr_type + R"(\s*=\s*OpTypePointer\s+Input\s+(%\S+)\s*$)",
-			                  kMultilineRegex);
-			if (std::regex_search(source, m, ptr_re)) {
-				std::string data_type = m[1];
-				std::regex  vec_re(R"(^\s*)" + data_type +
-				                       R"(\s*=\s*OpTypeVector\s+%float\s+(\d+)\s*$)",
-				                   kMultilineRegex);
-				if (std::regex_search(source, m, vec_re)) {
-					attr_widths[i] = std::stoi(m[1]);
-				} else {
-					attr_widths[i] = 1;
-				}
-			}
+		if (!std::regex_search(source, m, var_decl)) return {};
+		const std::string ptr_type = m[1];
+		std::regex ptr_re(R"(^\s*)" + ptr_type + R"(\s*=\s*OpTypePointer\s+Input\s+(%\S+)\s*$)",
+		                  kMultilineRegex);
+		if (!std::regex_search(source, m, ptr_re)) return {};
+		attr_types[i]   = m[1];
+		attr_scalars[i] = m[1];
+		std::regex vec_re(R"(^\s*)" + attr_types[i] +
+		                      R"(\s*=\s*OpTypeVector\s+(%\S+)\s+([2-4])\s*$)",
+		                  kMultilineRegex);
+		if (std::regex_search(source, m, vec_re)) {
+			attr_scalars[i] = m[1];
+			attr_widths[i]  = std::stoi(m[2]);
 		}
+		if (attr_scalars[i] != "%float" && attr_scalars[i] != "%uint" && attr_scalars[i] != "%int")
+			return {};
 	}
 
 	std::regex  main_re(R"(^\s*OpEntryPoint\s+Vertex\s+(%\S+)\s+"main".*$)", kMultilineRegex);
@@ -398,6 +399,7 @@ std::string LowerVertexToCompute(const std::string& source, const PerVertexLayou
 	    "%capture_input_base = OpIMul %uint %capture_invocation " + get_const(num_attrs),
 	    "%capture_output_base = OpIMul %uint %capture_invocation " + get_const(output_stride)};
 
+	std::map<std::string, std::string> wide_types {{"%float", "%v4float"}};
 	for (uint32_t i = 0; i < num_attrs; ++i) {
 		start.push_back("%capture_input_index_" + std::to_string(i) +
 		                " = OpIAdd %uint %capture_input_base " + get_const(i));
@@ -407,25 +409,41 @@ std::string LowerVertexToCompute(const std::string& source, const PerVertexLayou
 		                std::to_string(i));
 		start.push_back("%capture_attribute_" + std::to_string(i) +
 		                " = OpLoad %v4float %capture_input_ptr_" + std::to_string(i));
+		std::string value = "%capture_attribute_" + std::to_string(i);
+		if (attr_scalars[i] != "%float") {
+			auto [type, inserted] =
+			    wide_types.try_emplace(attr_scalars[i], "%capture_v4" + attr_scalars[i].substr(1));
+			if (inserted) {
+				std::regex  wide_re(R"(^\s*(%\S+)\s*=\s*OpTypeVector\s+)" + attr_scalars[i] +
+				                        R"(\s+4\s*$)",
+				                    kMultilineRegex);
+				std::smatch match;
+				if (std::regex_search(source, match, wide_re))
+					type->second = match[1];
+				else
+					declarations.push_back(type->second + " = OpTypeVector " + attr_scalars[i] +
+					                       " 4");
+			}
+			const std::string typed = "%capture_typed_" + std::to_string(i);
+			start.push_back(typed + " = OpBitcast " + type->second + " " + value);
+			value = typed;
+		}
 		uint32_t w = attr_widths[i];
 		if (w == 1) {
-			start.push_back("%capture_decoded_" + std::to_string(i) +
-			                " = OpCompositeExtract %float %capture_attribute_" + std::to_string(i) +
-			                " 0");
+			start.push_back("%capture_decoded_" + std::to_string(i) + " = OpCompositeExtract " +
+			                attr_types[i] + " " + value + " 0");
 			start.push_back("OpStore %in_attr_" + std::to_string(i) + " %capture_decoded_" +
 			                std::to_string(i));
 		} else if (w < 4) {
 			std::string comps;
 			for (uint32_t c = 0; c < w; ++c)
 				comps += " " + std::to_string(c);
-			start.push_back("%capture_decoded_" + std::to_string(i) + " = OpVectorShuffle %v" +
-			                std::to_string(w) + "float %capture_attribute_" + std::to_string(i) +
-			                " %capture_attribute_" + std::to_string(i) + comps);
+			start.push_back("%capture_decoded_" + std::to_string(i) + " = OpVectorShuffle " +
+			                attr_types[i] + " " + value + " " + value + comps);
 			start.push_back("OpStore %in_attr_" + std::to_string(i) + " %capture_decoded_" +
 			                std::to_string(i));
 		} else {
-			start.push_back("OpStore %in_attr_" + std::to_string(i) + " %capture_attribute_" +
-			                std::to_string(i));
+			start.push_back("OpStore %in_attr_" + std::to_string(i) + " " + value);
 		}
 	}
 

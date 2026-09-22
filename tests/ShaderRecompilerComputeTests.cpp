@@ -24002,14 +24002,14 @@ TestCase BranchVccnzUsesWaveMask() {
   return test;
 }
 
-TestCase ScalarMemRealtimeCapturedPlaceholder() {
+TestCase ScalarMemRealtimeReadsDeviceClock() {
   using O = ShaderOpcode;
   namespace D = ShaderRecompiler::Decoder;
 
   std::vector<u32> code = {0xf4940300u, 0xfa000000u};
   D::Instruction decoded;
   D::DecodeInstruction(code, 0, decoded);
-  Require("ScalarMemRealtimeCapturedPlaceholder", "decode",
+  Require("ScalarMemRealtimeReadsDeviceClock", "decode",
           decoded.opcode == O::S_MEMREALTIME && decoded.word_count == 2 &&
               decoded.dst.kind == D::OperandKind::Sgpr && decoded.dst.reg == 12 &&
               decoded.data_dwords == 2 && decoded.src_count == 0 &&
@@ -24020,11 +24020,14 @@ TestCase ScalarMemRealtimeCapturedPlaceholder() {
   code.insert(code.end(), {0xf4940300u, 0xfa000000u});
   AppendStoreSgprPair(&code, 12, 2);
   AppendEnd(&code);
-  return {"ScalarMemRealtimeCapturedPlaceholder",
-          code,
-          {},
-          {UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX},
-          {O::S_MEMREALTIME, O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  TestCase test{"ScalarMemRealtimeReadsDeviceClock",
+                code,
+                {},
+                {},
+                {O::S_MEMREALTIME, O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  test.required_spirv = {"OpReadClockKHR"};
+  test.compile_only = true;
+  return test;
 }
 
 TestCase ScalarMemoryLoadVariants() {
@@ -30240,7 +30243,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(SiblingSharedExitKeepsCapturedConditions);
   AddCase(BranchVccnzUsesWaveMask);
   AddCase(BranchVccnzUsesCarryProducedWaveMask);
-  AddCase(ScalarMemRealtimeCapturedPlaceholder);
+  AddCase(ScalarMemRealtimeReadsDeviceClock);
   AddCase(ScalarMemoryLoadVariants);
   AddCase(ScalarBufferOffsetAlignmentAndCarry);
   AddCase(ScalarLoadSignedImmediateOffsetAddsSoffset);
@@ -35062,7 +35065,7 @@ int main(int argc, char **argv) {
   CheckLeastRecentlyUsedCacheOrdering();
   if (argc == 2 && std::strcmp(argv[1], "--s-memrealtime-only") == 0) {
     VulkanHarness vulkan;
-    RunCase(&vulkan, ScalarMemRealtimeCapturedPlaceholder());
+    RunCase(&vulkan, ScalarMemRealtimeReadsDeviceClock());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--packed-integer-neg-only") == 0) {

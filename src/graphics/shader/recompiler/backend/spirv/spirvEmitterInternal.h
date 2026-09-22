@@ -69,6 +69,7 @@ struct SpirvRequirements {
 	bool buffer_int64_atomics         = false;
 	bool coherent_buffers             = false;
 	bool float64                      = false;
+	bool shader_clock                 = false;
 };
 
 SpirvRequirements AnalyzeProgramRequirements(const IR::Program& program);

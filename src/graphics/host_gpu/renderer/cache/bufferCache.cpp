@@ -112,6 +112,15 @@ void BufferCache::DeleteBuffer(BufferId id) {
 }
 
 bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	const auto capacity = m_download_buffer.Size();
+	bool       any      = false;
+	for (uint64_t offset = 0; offset < size; offset += capacity) {
+		any |= DownloadBufferWindow(buffer, vaddr + offset, std::min(capacity, size - offset));
+	}
+	return any;
+}
+
+bool BufferCache::DownloadBufferWindow(Buffer& buffer, uint64_t vaddr, uint64_t size) {
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size     = 0;
 	const auto                  buffer_address = buffer.CpuAddress();
@@ -129,8 +138,35 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	if (copies.empty()) {
 		return false;
 	}
+	const auto capacity = m_download_buffer.Size();
+	for (size_t first = 0; first < copies.size();) {
+		const auto base       = copies[first].dstOffset;
+		auto       last       = first;
+		uint64_t   batch_size = 0;
+		while (last < copies.size()) {
+			const auto end = copies[last].dstOffset - base + Common::AlignUp(copies[last].size, 64);
+			if (end > capacity) {
+				break;
+			}
+			batch_size = end;
+			last++;
+		}
+		EXIT_IF(last == first);
+		std::vector<vk::BufferCopy> batch(copies.begin() + static_cast<std::ptrdiff_t>(first),
+		                                  copies.begin() + static_cast<std::ptrdiff_t>(last));
+		for (auto& copy: batch) {
+			copy.dstOffset -= base;
+		}
+		DownloadBufferCopies(buffer, std::move(batch), batch_size);
+		first = last;
+	}
+	return true;
+}
 
-	auto [mapped, offset] = m_download_buffer.Map(total_size, 64);
+void BufferCache::DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCopy> copies,
+                                       uint64_t total_size) {
+	const auto buffer_address = buffer.CpuAddress();
+	auto [mapped, offset]     = m_download_buffer.Map(total_size, 64);
 	std::unique_ptr<Buffer> temporary;
 	if (mapped == nullptr) {
 		temporary = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
@@ -179,7 +215,6 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 			                                      mapped + (copy.dstOffset - offset), copy.size);
 		}
 	});
-	return true;
 }
 
 BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,

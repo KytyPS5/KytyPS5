@@ -17521,11 +17521,56 @@ void TestNewShaderRecompilerCfgStructuresEnteredSelectionRegion() {
 } // namespace
 } // namespace Libs::Graphics
 
+// The CFG cache is keyed by the guest code body alone.
+void TestStructurizedCfgIsCachedByBody() {
+  using namespace Libs::Graphics;
+  // Distinctive immediates, so no other case can have cached them first.
+  const std::array<uint32_t, 2> body{0xBF80002Au, 0xBF810000u};
+  const std::array<uint32_t, 3> other{0xBF80002Au, 0xBF80002Bu, 0xBF810000u};
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+
+  const auto before = ShaderRecompiler::CfgCacheStatistics();
+  auto cold = ShaderRecompiler::TranslateProgram(body, options);
+  const auto after_cold = ShaderRecompiler::CfgCacheStatistics();
+  Check(after_cold.misses == before.misses + 1u && after_cold.hits == before.hits,
+        "the first translation of a body did not miss the CFG cache");
+  Check(!cold.cfg_dump.empty(),
+        "the fixture did not reach a structured graph, so it proves nothing");
+
+  auto warm = ShaderRecompiler::TranslateProgram(body, options);
+  const auto after_warm = ShaderRecompiler::CfgCacheStatistics();
+  Check(after_warm.hits == after_cold.hits + 1u && after_warm.misses == after_cold.misses,
+        "the second translation of one body structurized it again");
+  Check(warm.cfg_dump == cold.cfg_dump,
+        "the cached graph is not the graph the build produced");
+  Check(warm.status.ok == cold.status.ok,
+        "a cached graph changed what the translation decided");
+
+  auto different = ShaderRecompiler::TranslateProgram(other, options);
+  const auto after_different = ShaderRecompiler::CfgCacheStatistics();
+  Check(after_different.misses == after_warm.misses + 1u &&
+            after_different.hits == after_warm.hits,
+        "a different guest body was served another body's graph");
+  Check(different.cfg_dump != cold.cfg_dump,
+        "two different bodies produced the same graph, so this case cannot tell them apart");
+
+  // A permutation miss or another stage changes no code, so it must hit.
+  auto pixel_options = MakeCompileOptions(ShaderType::Pixel);
+  pixel_options.dump_ir = true;
+  ShaderRecompiler::TranslateProgram(body, pixel_options);
+  const auto after_stage = ShaderRecompiler::CfgCacheStatistics();
+  Check(after_stage.hits == after_different.hits + 1u &&
+            after_stage.misses == after_different.misses,
+        "the same body at another stage rebuilt a graph the stage cannot affect");
+}
+
 int main() {
   using namespace Libs::Graphics;
 
   EnsureConfigInitialized();
   TestRayTracingInstructions();
+  TestStructurizedCfgIsCachedByBody();
   TestResourceDescriptorClassification();
   TestShaderBufferResourceSize();
   TestNativeShaderResourceDependencies();

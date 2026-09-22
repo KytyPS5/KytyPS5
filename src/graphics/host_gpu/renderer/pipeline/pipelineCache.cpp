@@ -730,6 +730,8 @@ void PipelineCache::InitializeDriverCache() {
 	m_build_hash = EmulatorBinaryHash();
 
 	const std::filesystem::path folder("_PipelineCache");
+	InitializeCfgCache(folder, title_id);
+	m_driver_cache_path     = folder / (title_id + ".bin");
 	const auto path         = Common::PathToString(m_driver_cache_path);
 	const bool cache_exists = Common::File::IsFileExisting(m_driver_cache_path);
 	if (cache_exists) {
@@ -805,7 +807,43 @@ void PipelineCache::CheckpointDriverCache() {
 	}
 }
 
+void PipelineCache::InitializeCfgCache(const std::filesystem::path& folder,
+                                       const std::string&           title_id) {
+	if (m_build_hash == 0) {
+		PipelineCacheLog("Shader CFG cache: disabled (binary could not be fingerprinted)");
+		return;
+	}
+	const auto path = folder / "cfg" / fmt::format("{}.cfgcache", title_id);
+	ShaderRecompiler::OpenCfgCacheFile(Common::PathToString(path), m_build_hash);
+	m_cfg_cache_enabled = true;
+}
+
+void PipelineCache::FlushCfgCacheIfDirtyLocked() {
+	if (!m_cfg_cache_enabled) {
+		return;
+	}
+	const auto stats = ShaderRecompiler::CfgCacheStatistics();
+	if (stats.misses == m_cfg_flushed_misses) {
+		return;
+	}
+	m_cfg_flushed_misses = stats.misses;
+	ShaderRecompiler::FlushCfgCacheFile();
+}
+
+void PipelineCache::MaybeFlushCfgCacheLocked() {
+	if (!m_cfg_cache_enabled) {
+		return;
+	}
+	const auto now = std::chrono::steady_clock::now();
+	if (now - m_last_cfg_flush < CfgCacheFlushPeriod) {
+		return;
+	}
+	m_last_cfg_flush = now;
+	FlushCfgCacheIfDirtyLocked();
+}
+
 void PipelineCache::Save() {
+	FlushCfgCacheIfDirtyLocked();
 	if (m_driver_cache == nullptr || !m_driver_cache_dirty) {
 		return;
 	}
@@ -1251,6 +1289,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
 	EXIT_IF(!inserted);
 	CheckpointDriverCache();
+	MaybeFlushCfgCacheLocked();
 
 	return *iter->second;
 }
@@ -1286,6 +1325,7 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(cached));
 	EXIT_IF(!inserted);
 	CheckpointDriverCache();
+	MaybeFlushCfgCacheLocked();
 
 	return *iter->second;
 }

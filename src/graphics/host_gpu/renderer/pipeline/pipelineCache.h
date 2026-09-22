@@ -190,8 +190,16 @@ private:
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
 
+	static constexpr std::chrono::seconds CfgCacheFlushPeriod {20};
+	std::chrono::steady_clock::time_point m_last_cfg_flush     = std::chrono::steady_clock::now();
+	uint64_t                              m_cfg_flushed_misses = 0;
+	bool                                  m_cfg_cache_enabled  = false;
+
 	void InitializeDriverCache();
 	void CheckpointDriverCache();
+	void InitializeCfgCache(const std::filesystem::path& folder, const std::string& title_id);
+	void FlushCfgCacheIfDirtyLocked();
+	void MaybeFlushCfgCacheLocked();
 	void DestroyPipelineObjects(const Pipeline& pipeline);
 };
 

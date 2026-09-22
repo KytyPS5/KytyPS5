@@ -12,6 +12,7 @@
 #include <bitset>
 #include <optional>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler {
@@ -56,6 +57,18 @@ struct CompileResult {
 	IR::Program            program;
 	RecompileStatus        status;
 };
+
+struct CfgCacheStats {
+	uint64_t hits   = 0;
+	uint64_t misses = 0;
+};
+
+[[nodiscard]] CfgCacheStats CfgCacheStatistics();
+
+// `stamp` must change whenever CFG::BuildGraph, CFG::Structurize or CFG::Graph changes; 0 disables.
+void OpenCfgCacheFile(const std::string& path, uint64_t stamp);
+
+void FlushCfgCacheFile();
 
 // Decoded source and typed scalar call queries are retained once per cache source.
 struct ShaderSource {

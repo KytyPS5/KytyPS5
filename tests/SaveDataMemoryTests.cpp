@@ -17,6 +17,7 @@
 namespace {
 std::string           g_test_title = "PPSA21564";
 std::filesystem::path g_mounted_directory;
+std::map<std::string, std::filesystem::path> g_test_mounts;
 } // namespace
 
 namespace Loader {
@@ -33,10 +34,14 @@ Common::Time GetTime() {
 } // namespace Loader
 
 namespace Libs::LibKernel::FileSystem {
-void Mount(const std::filesystem::path& directory, const std::string&) {
+void Mount(const std::filesystem::path& directory, const std::string& point) {
 	g_mounted_directory = directory;
+	g_test_mounts[point] = directory;
 }
-void Umount(const std::string&) {}
+void Umount(const std::string& point) { g_test_mounts.erase(point); }
+std::filesystem::path GetRealFilename(const std::string& point) {
+	return g_test_mounts.at(point);
+}
 } // namespace Libs::LibKernel::FileSystem
 
 namespace {
@@ -337,6 +342,7 @@ void TestClassicSavePaths() {
 		mount.user_id    = 1;
 		mount.dir_name   = &name;
 		mount.mount_mode = text == "save.1" ? 1 : 4;
+		mount.blocks     = 48;
 		SaveDataMountResult result {};
 		CHECK(SaveDataMount3(&mount, &result) == OK);
 		CHECK(g_mounted_directory == fs::path("_SaveData") / "CLASSIC" / text);
@@ -385,6 +391,70 @@ void TestClassicSavePaths() {
 	CHECK(Search(1) == names);
 }
 
+void TestSaveAllocations() {
+	Reset("CAPACITY");
+	std::array<SceSaveDataDirName, 2> names {DirName("Options"), DirName("Player")};
+	const std::array<uint64_t, 2> allocations {48, 96};
+	for (const auto blocks : {0u, 47u, 16385u}) {
+		struct SaveDataMount3 invalid {};
+		invalid.user_id = 1;
+		invalid.dir_name = &names[0];
+		invalid.mount_mode = 4;
+		invalid.blocks = blocks;
+		SaveDataMountResult result {};
+		CHECK(SaveDataMount3(&invalid, &result) == SAVE_DATA_ERROR_PARAMETER);
+		CHECK(!fs::exists("_SaveData/CAPACITY/Options"));
+	}
+	for (size_t i = 0; i < names.size(); i++) {
+		struct SaveDataMount3 mount {};
+		mount.user_id = 1;
+		mount.dir_name = &names[i];
+		mount.mount_mode = 4;
+		mount.blocks = allocations[i];
+		SaveDataMountResult result {};
+		CHECK(SaveDataMount3(&mount, &result) == OK);
+		CHECK(result.mount_status == 1);
+		std::ofstream(g_mounted_directory / "USR-DATA") << "saved payload";
+		CHECK(SaveDataUmount2(0, &result.mount_point) == OK);
+		SaveDataMountInfo info {};
+		CHECK(SaveDataGetMountInfo(&result.mount_point, &info) == SAVE_DATA_ERROR_NOT_MOUNTED);
+	}
+	Reset("CAPACITY");
+	std::array<SceSaveDataDirName, 2> found {};
+	std::array<SaveDataSearchInfo, 2> infos {};
+	SaveDataDirNameSearchCond cond {};
+	cond.user_id = 1;
+	SaveDataDirNameSearchResult search {};
+	search.dir_names = found.data();
+	search.dir_names_num = found.size();
+	search.infos = infos.data();
+	CHECK(SaveDataDirNameSearch(&cond, &search) == OK && search.set_num == 2);
+	for (size_t i = 0; i < names.size(); i++) {
+		CHECK(std::string(found[i].data) == names[i].data);
+		CHECK(infos[i].blocks == allocations[i] && infos[i].free_blocks == allocations[i]);
+		struct SaveDataMount3 mount {};
+		mount.user_id = 1;
+		mount.dir_name = &names[i];
+		mount.mount_mode = 34;
+		mount.blocks = 16384;
+		SaveDataMountResult result {};
+		CHECK(SaveDataMount3(&mount, &result) == OK && result.mount_status == 0);
+		std::ofstream(g_mounted_directory / "USR-DATA", std::ios::app) << "more data";
+		SaveDataMountInfo info {};
+		CHECK(SaveDataGetMountInfo(&result.mount_point, &info) == OK);
+		CHECK(info.blocks == allocations[i] && info.free_blocks == allocations[i]);
+		CHECK(SaveDataUmount2(0, &result.mount_point) == OK);
+	}
+	CHECK(infos[0].blocks + infos[1].blocks == 144);
+	const fs::path metadata = "_SaveData/CAPACITY/Options/sce_sys/blocks.bin";
+	fs::resize_file(metadata, 7);
+	CHECK(SaveDataDirNameSearch(&cond, &search) == SAVE_DATA_ERROR_BROKEN);
+	CHECK(fs::file_size(metadata) == 7);
+	CHECK(fs::remove(metadata));
+	CHECK(SaveDataDirNameSearch(&cond, &search) == SAVE_DATA_ERROR_BROKEN);
+	CHECK(!fs::exists(metadata));
+}
+
 void RunChild(const fs::path& executable, const char* mode) {
 #ifdef _WIN32
 	CHECK(_spawnl(_P_WAIT, executable.string().c_str(), executable.string().c_str(), mode,
@@ -425,6 +495,7 @@ int main(int argc, char** argv) {
 	TestIsolationAndSync();
 	TestFailedWritePreservesSave();
 	TestClassicSavePaths();
+	TestSaveAllocations();
 	CHECK(SaveDataTerminate() == OK);
 	fs::current_path(previous);
 	fs::remove_all(temp);

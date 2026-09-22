@@ -379,6 +379,9 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		result = graphics.queue.submit(1, &submit_info, nullptr);
 	}
 
+	if (result == vk::Result::eErrorDeviceLost) {
+		DumpDeviceLossDiagnostics(graphics);
+	}
 	if (result != vk::Result::eSuccess) {
 		ReportVulkanFatal("vkQueueSubmit", result, tick, m_command.m_debug_op,
 		                  m_command.m_debug_submit_id, m_command.m_debug_arg0,

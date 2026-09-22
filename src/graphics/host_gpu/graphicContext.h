@@ -19,6 +19,23 @@ struct VulkanImage;
 
 inline constexpr uint32_t VULKAN_TARGET_API_VERSION = VK_API_VERSION_1_3;
 
+struct DiagnosticCheckpoint {
+	uint32_t op        = 0;
+	uint64_t submit_id = 0;
+	uint32_t arg0      = 0;
+	uint32_t arg1      = 0;
+	uint32_t arg2      = 0;
+	uint32_t arg3      = 0;
+	uint64_t arg4      = 0;
+	uint64_t sequence  = 0;
+};
+
+struct GraphicContext;
+
+[[nodiscard]] const DiagnosticCheckpoint*
+RecordDiagnosticCheckpoint(const DiagnosticCheckpoint& checkpoint);
+void DumpDeviceLossDiagnostics(GraphicContext& graphics);
+
 struct GraphicContext {
 	vk::Instance                       instance                              = nullptr;
 	vk::DebugUtilsMessengerEXT         debug_messenger                       = nullptr;
@@ -28,6 +45,8 @@ struct GraphicContext {
 	vk::Device                         device                                = nullptr;
 	VmaAllocator                       allocator                             = nullptr;
 	bool                               memory_budget_ext_enabled             = false;
+	bool                               diagnostic_checkpoints_enabled        = false;
+	bool                               device_fault_enabled                  = false;
 	bool                               shader_device_clock_enabled           = false;
 	bool                               compute_subgroup_size_control_enabled = false;
 	bool                               sample_rate_shading_enabled           = false;

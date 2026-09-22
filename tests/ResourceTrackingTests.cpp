@@ -213,8 +213,11 @@ MakeIndirectImageFixture(bool malformed, uint32_t material_immediate = 0,
                       fixture->AddMemory(shared_buffer, 0x10d8));
     fixture->Emit(ValueOpcode::ReferenceU32, {load});
   }
+  const auto invocation = fixture->Emit(
+      ValueOpcode::GetBuiltin,
+      {Value(static_cast<uint32_t>(StageInputKind::GlobalInvocationId)), Value(0u)});
   const auto selector = fixture->Emit(ValueOpcode::ReadFirstLane,
-                                      {fixture->UserData(8), Value(true)});
+                                      {invocation, Value(true)});
   const auto record =
       fixture->Emit(ValueOpcode::IMul32, {selector, Value(224u)});
   const auto member = fixture->Emit(ValueOpcode::IAdd32, {record, Value(4u)});
@@ -455,6 +458,83 @@ void TestInvariantIndirectImageMaterialization() {
              "wrapped scalar immediate entered the invariant image proof");
   Check(!wrapped_immediate->program.resource_tracking_complete,
         "wrapped scalar immediate entered the invariant image proof");
+}
+
+void TestUniformScalarBufferImage() {
+  Fixture fixture(ShaderType::Pixel);
+  std::array<Value, 4> material_words;
+  std::array<Value, 4> heap_words;
+  for (uint32_t dword = 0; dword < 4; dword++) {
+    material_words[dword] = fixture.UserData(dword);
+    heap_words[dword] = fixture.UserData(dword + 4u);
+  }
+  const auto material = fixture.Buffer(material_words);
+  const auto heap = fixture.Buffer(heap_words);
+  const auto selector = fixture.Emit(ValueOpcode::ShiftLeftLogical32,
+                                     {fixture.UserData(8), Value(2u)});
+  MemoryInfo scalar;
+  scalar.kind = ResourceKind::ScalarBuffer;
+  scalar.offset = 0x40u;
+  const auto key = fixture.Emit(ValueOpcode::ReadConstBuffer,
+                                {material, selector}, fixture.AddMemory(scalar, 0x100));
+  const auto record = fixture.Emit(ValueOpcode::IMul32, {key, Value(48u)});
+  std::array<Value, 8> image_words;
+  for (uint32_t dword = 0; dword < image_words.size(); dword++) {
+    scalar.offset = 0x10u + dword * sizeof(uint32_t);
+    image_words[dword] = fixture.Emit(ValueOpcode::ReadConstBuffer,
+                                      {heap, record}, fixture.AddMemory(scalar, 0x200));
+  }
+  const auto image = fixture.Image(image_words);
+  const auto sampler = fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)});
+  MemoryInfo sample;
+  sample.kind = ResourceKind::Image;
+  sample.image_dimension = Decoder::ImageDimension::Dim2D;
+  fixture.Emit(ValueOpcode::ImageSampleRaw,
+                {image, sampler, fixture.ImageAddress()}, fixture.AddMemory(sample, 0x228));
+  fixture.PlanAndTrack();
+  const auto plan = ExtractResourcePlan(fixture.program);
+
+  std::array<uint32_t, 9> user_data{0x1000u, 0u, 0x100u, 0u,
+                                    0x2000u, 0u, 0x100u, 0u, 0u};
+  LinearTestMemory memory;
+  memory.words[0x44u / 4u] = 1u;
+  std::array<uint32_t, 8> descriptor{};
+  descriptor[0] = 0x20u;
+  descriptor[1] = static_cast<uint32_t>(
+                      Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float)
+                  << 20u;
+  descriptor[2] = 3u | (3u << 14u);
+  descriptor[3] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+                  (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D)
+                   << 28u);
+  for (uint32_t index = 0; index < 2; index++) {
+    std::copy(descriptor.begin(), descriptor.end(),
+              memory.words.begin() + (0x1010u + index * 48u) / 4u);
+    memory.words[(0x1010u + index * 48u) / 4u] += index;
+  }
+  SrtRuntime runtime{.user_data = user_data,
+                     .read_memory = ReadLinearTestMemory,
+                     .userdata = &memory,
+                     .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  const auto materializes = [&](uint32_t address) {
+    return MaterializeResources(plan, runtime, snapshot, specialization) &&
+           snapshot.images.size() == 1 && snapshot.images[0].dwords[0] == address;
+  };
+  Check(materializes(0x20u), "nested draw-uniform image descriptor did not materialize");
+  user_data[8] = 1u;
+  Check(materializes(0x21u), "changed draw selector reused the previous image descriptor");
+  memory.words[0x44u / 4u] = 0u;
+  memory.words[0x1010u / 4u] = 0x30u;
+  Check(materializes(0x30u), "changed scalar table memory reused the previous image descriptor");
+  const auto prior_snapshot = snapshot;
+  const auto prior_specialization = specialization;
+  memory.fail_address = 0x1044u;
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization) &&
+            SameResourceSnapshot(snapshot, prior_snapshot) &&
+            specialization == prior_specialization,
+        "unavailable nested image table partially changed the resource snapshot");
 }
 
 void TestComputeBufferFill() {
@@ -2013,6 +2093,7 @@ int main() {
     Run("FMASK load specialization", TestFmaskLoadSpecialization);
     Run("dynamic storage mips", TestDynamicStorageMipTracking);
     Run("invariant indirect images", TestInvariantIndirectImageMaterialization);
+    Run("draw-uniform scalar image", TestUniformScalarBufferImage);
     Run("SRT runtime", TestSrtFlatteningAndRuntimeMemoization);
     Run("dynamic SRT", TestDynamicSrtReadRemainsExplicit);
     Run("phi validation", TestPhiValidation);

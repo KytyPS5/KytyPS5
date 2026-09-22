@@ -9405,6 +9405,114 @@ public:
   }
 
 
+  void CheckCubeFaceStorageExpansion() {
+    constexpr const char *name = "CubeFaceStorageExpansion";
+    constexpr uintptr_t base = 0x0000000204700000ull;
+    constexpr uint64_t allocation_size = 0x10000;
+    constexpr std::array<uint32_t, 6> half_red{0x3c00, 0x4000, 0x4200,
+                                             0x4400, 0x4500, 0x4600};
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_size, 0, &direct_offset) == 0,
+            "cube-face allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_size) == 0 && mapped == reinterpret_cast<void *>(base),
+            "cube-face mapping failed");
+    std::memset(mapped, 0, allocation_size);
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(base, allocation_size);
+      auto &cache = context.GetTextureCache();
+      auto &executor = context.GetRenderExecutor();
+      for (uint32_t face = 0; face < half_red.size(); ++face) {
+        // PPSA25380 clears six single-face cube views at one guest address.
+        ShaderTextureResource descriptor{{static_cast<uint32_t>(base >> 8u),
+            0xc4700000u, 0x0001c001u, 0xb0000facu,
+            face | (face << 16u), 0x00700000u, 0, 0}};
+        TestCase test;
+        test.name = name;
+        test.has_user_data = true;
+        std::copy_n(descriptor.fields, 8, test.user_data.begin());
+        test.has_compute_info = true;
+        test.compute_info.threads_num[0] = test.compute_info.threads_num[1] = 8;
+        test.compute_info.threads_num[2] = 1;
+        test.compute_info.thread_ids_num = 2;
+        test.opcodes = {ShaderOpcode::V_MOV_B32, ShaderOpcode::IMAGE_STORE,
+                        ShaderOpcode::S_ENDPGM};
+        test.code = {EncodeVop1(0x01, 20, 256), EncodeVop1(0x01, 21, 257)};
+        AppendVMovU32(&test.code, 22, 0);
+        AppendVMovLiteral(&test.code, 0,
+                          std::bit_cast<uint32_t>(static_cast<float>(face + 1)));
+        AppendVMovLiteral(&test.code, 1, std::bit_cast<uint32_t>(0.5f));
+        AppendVMovLiteral(&test.code, 2, std::bit_cast<uint32_t>(0.25f));
+        AppendVMovLiteral(&test.code, 3, std::bit_cast<uint32_t>(1.0f));
+        test.code.push_back(EncodeMimg0(0x08, 0xf, 0, false, 5));
+        test.code.push_back(EncodeMimg1(0, 20));
+        AppendEnd(&test.code);
+        const auto compiled = CompileCase(test, SubgroupSize());
+        const auto &resource = compiled.program.info.images.at(0);
+        Require(name, "cube storage specialization", resource.cube &&
+                    resource.written && resource.dimension ==
+                        ShaderRecompiler::Decoder::ImageDimension::Dim2DArray,
+                "single-face cube store lost its array coordinates");
+        ShaderRecompiler::IR::DescriptorValue value{};
+        value.dword_count = 8;
+        std::copy_n(descriptor.fields, 8, value.dwords.begin());
+        const auto binding = RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
+        Image storage;
+        storage.view = cache.FindTexture(binding.image_id, binding.desc);
+        auto &image = cache.GetImage(binding.image_id);
+        Require(name, "face view and backing", storage.view != nullptr &&
+                    image.info.pixel_format == vk::Format::eR16G16B16A16Sfloat &&
+                    image.info.bytes_per_block == 8 &&
+                    image.info.resources.layers == face + 1 &&
+                    image.backing.layers == face + 1 &&
+                    binding.desc.view_info.type == vk::ImageViewType::e2DArray &&
+                    binding.desc.view_info.base_layer == face &&
+                    binding.desc.view_info.layer_count == 1,
+                "cube face did not expand the array or select its own layer");
+        image.Transit(vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderWrite,
+                      {}, scheduler.Current().Handle());
+        storage.layout = image.backing.state.layout;
+        scheduler.Finish();
+        Dispatch(test, compiled, {}, nullptr, nullptr, &storage);
+        cache.MarkGpuWritten(binding.image_id);
+        for (uint32_t prior = 0; prior <= face; ++prior) {
+          const auto pixels = ReadCachedTexel(name, context, binding.image_id,
+                                             {}, {8, 8, 1}, prior);
+          for (uint32_t pixel = 0; pixel < 64; ++pixel) {
+            Require(name, "stored and preserved faces",
+                    pixels[pixel * 2] == (0x38000000u | half_red[prior]) &&
+                        pixels[pixel * 2 + 1] == 0x3c003400u,
+                    "face " + std::to_string(prior) + " pixel " +
+                        std::to_string(pixel) + " changed after writing face " +
+                        std::to_string(face));
+          }
+        }
+      }
+      RenderExecutorTestAccess::ResetBindings(executor);
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    Require(name, "release",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0 &&
+                Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                    direct_offset, allocation_size) == 0,
+            "cube-face backing release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckRenderExecutorColorStandardTileDiscovery() {
     constexpr const char *name = "RenderExecutorColorStandardTile";
     constexpr uintptr_t base = 0x0000000203b00000ull;
@@ -12389,15 +12497,14 @@ public:
       const auto &image =
           compiled.program.info.images.at(binding.resources.front());
       bool supported =
-          image.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+          image.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2D ||
+          image.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
       if (resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled) {
         supported = supported ||
                     image.dimension ==
                         ShaderRecompiler::Decoder::ImageDimension::Dim1D ||
                     image.dimension ==
-                        ShaderRecompiler::Decoder::ImageDimension::Dim1DArray ||
-                    image.dimension ==
-                        ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
+                        ShaderRecompiler::Decoder::ImageDimension::Dim1DArray;
       }
       Require(test.name, "dispatch", supported,
               "unsupported image dimension needs a matching Vulkan test view");
@@ -19517,6 +19624,32 @@ TestCase VectorMinMaxF16Ops() {
            O::S_ENDPGM}};
 }
 
+TestCase VectorCvtF16U16ByteSource() {
+  using O = ShaderOpcode;
+
+  constexpr std::array inputs = {0xff123456u, 0x80123456u, 0x00123456u};
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 16, 0xa5a55a5au);
+  for (u32 i = 0; i < inputs.size(); i++) {
+    AppendVMovU32(&code, 30, i * 4u);
+    AppendBufferLoadDword(&code, 18, 30);
+    // Convert unsigned byte3 to FP16 word0 while preserving word1 of v16.
+    code.insert(code.end(), {0x7e20a0f9u, 0x00031412u});
+    AppendStoreVgpr(&code, 16, i);
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "VectorCvtF16U16ByteSource";
+  test.code = std::move(code);
+  test.initial.assign(inputs.begin(), inputs.end());
+  test.expected = {0xa5a55bf8u, 0xa5a55800u, 0xa5a50000u};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_CVT_F16_U16,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpBitFieldUExtract", "OpConvertUToF"};
+  return test;
+}
+
 TestCase VectorCvtU16F16Sdwa() {
   using O = ShaderOpcode;
 
@@ -22392,6 +22525,75 @@ TestCase BufferLoadDwordx4ZeroesOnlyOutOfBoundsTail() {
   test.storage_buffer_range_dwords = 4;
   test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORDX4, O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
+  return test;
+}
+
+TestCase BufferLoadsGpuSelectedDescriptors() {
+  using O = ShaderOpcode;
+  constexpr uint64_t GuestBase = 0x0000000110000000ull;
+  struct DescriptorCase {
+    u32 stride, records, mode, soffset;
+    bool swizzle, bound;
+    std::array<u32, 6> expected;
+  };
+  const DescriptorCase cases[] = {
+      {24, 2, 0, 0, false, true, {7, 8, 9, 10, 11, 12}},
+      {12, 2, 0, 0, false, true, {4, 5, 6, 0, 0, 0}},
+      {12, 2, 1, 0, false, true, {4, 5, 6, 7, 8, 9}},
+      {12, 1, 2, 0, false, true, {4, 5, 6, 7, 8, 9}},
+      {12, 0, 2, 0, false, true, {}},
+      // OOB3 checks offset + soffset, independently of index * stride.
+      {12, 20, 3, 4, false, true, {5, 6, 7, 8, 0, 0}},
+      {12, 2, 0, 0, false, false, {}},
+      // RDNA2 swizzling uses four-byte elements; soffset is added afterward.
+      {12, 2, 0, 4, true, true, {3, 11, 19, 0, 0, 0}},
+      {12, 8, 3, 4, true, true, {3, 11, 19, 0, 0, 0}},
+      {12, 4, 3, 4, true, true, {}},
+  };
+  TestCase test;
+  test.name = "BufferLoadsGpuSelectedDescriptors";
+  test.initial.resize(2048);
+  for (u32 i = 0; i < std::size(cases); ++i) {
+    const auto &input = cases[i];
+    const u32 data_offset = 4096 + i * 128;
+    // 120-byte table entries with a descriptor at byte 8, as in PPSA04677.
+    const std::array<u32, 4> descriptor{
+        static_cast<u32>(GuestBase + data_offset),
+        (input.stride << 16u) | (input.swizzle ? 1u << 31u : 0u) | 1u,
+        input.records, (input.bound ? 0x5204u : 0x204u) | (input.mode << 28u)};
+    std::copy(descriptor.begin(), descriptor.end(), test.initial.begin() + 130 + i * 30);
+    for (u32 word = 0; word < 32; ++word) {
+      test.initial[data_offset / 4 + word] = i * 100 + word + 1;
+    }
+    // Reverse the table order through a GPU load and readfirstlane, not host constants.
+    const u32 selected = static_cast<u32>(std::size(cases)) - 1 - i;
+    test.initial[64 + i] = selected;
+    AppendVMovU32(&test.code, 30, (64 + i) * 4);
+    AppendBufferLoadDword(&test.code, 0, 30);
+    test.code.push_back(EncodeVop1(0x02, 20, Vgpr(0)));
+    test.code.push_back(EncodeSop2(0x26, 20, 20, 255)); // s_mul_i32 s20, s20, 120
+    test.code.push_back(120);
+    test.code.push_back(EncodeSmem0(0x0a, 8, 0));
+    test.code.push_back(EncodeSmem1(520, 20));
+    AppendSMovLiteral(&test.code, 22, cases[selected].soffset);
+    AppendVMovU32(&test.code, 21, 1);
+    test.code.push_back(EncodeMubuf0(0x0e, 0, true, false));
+    test.code.push_back(EncodeMubuf1(0, 2, 21, 22));
+    test.code.push_back(EncodeMubuf0(0x0d, 16, true, false));
+    test.code.push_back(EncodeMubuf1(4, 2, 21, 22));
+    for (u32 component = 0; component < 6; ++component) {
+      AppendStoreVgpr(&test.code, component, i * 6 + component);
+      const u32 expected = cases[selected].expected[component];
+      test.expected.push_back(expected == 0 ? 0 : selected * 100 + expected);
+    }
+  }
+  AppendEnd(&test.code);
+  test.bda_mappings = {{GuestBase, 0}};
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::BUFFER_LOAD_DWORD,
+                  O::V_READFIRSTLANE_B32, O::S_MUL_I32, O::S_BUFFER_LOAD_DWORDX4,
+                  O::BUFFER_LOAD_DWORDX4, O::BUFFER_LOAD_DWORDX2,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpConvertUToPtr", "PhysicalStorageBuffer"};
   return test;
 }
 
@@ -27351,6 +27553,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(CvtPkrtzF16F32SdwaAndOutputModifiers);
   AddCase(PackedMinMaxF16NanAndSignedZeroEdges);
   AddCase(VectorMinMaxF16Ops);
+  AddCase(VectorCvtF16U16ByteSource);
   AddCase(VectorCvtU16F16Sdwa);
   AddCase(NativeAndSdwa16BitDestinationWrites);
   AddCase(VectorMinMaxMed3F16Ops);
@@ -27437,6 +27640,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferLoadDwordx3SnapshotsOverlappingAddress);
   AddCase(BufferLoadDwordx4SnapshotsOverlappingAddress);
   AddCase(BufferLoadDwordx4ZeroesOnlyOutOfBoundsTail);
+  AddCase(BufferLoadsGpuSelectedDescriptors);
   AddCase(BufferStoreDwordx4DropsOnlyOutOfBoundsTail);
   AddCase(BufferLoadFormatXyzwRejectsPartialRecord);
   AddCase(BufferStoreFormatXyzwDropsPartialRecord);
@@ -28994,6 +29198,17 @@ void CheckDepthTextureEncoding() {
   Require("DepthTextureEncoding", "compressed HTILE descriptor",
           IsSupportedDepthTextureEncoding(compressed_descriptor),
           "valid compressed depth descriptor required a prior depth target");
+
+  const ShaderTextureResource disabled_metadata{{
+      0x20018100u, 0xc1600000u, 0x021bc1dfu, 0x91800204u,
+      0x00000000u, 0x00700000u, 0x00000000u, 0x0020037fu,
+  }};
+  auto retained_metadata_address = compressed_descriptor;
+  retained_metadata_address.fields[6] &= 0xff000000u;
+  Require("DepthTextureEncoding", "disabled metadata with retained address",
+          IsSupportedDepthTextureEncoding(disabled_metadata) &&
+              IsSupportedDepthTextureEncoding(retained_metadata_address),
+          "uncompressed depth rejected inactive metadata address bits");
 
   const ShaderTextureResource first_use_depth{{
       0x0225fc00u, 0x01600000u, 0x00000000u, 0x91800924u,
@@ -32163,6 +32378,16 @@ int main(int argc, char **argv) {
     return 0;
   }
 #endif
+  if (argc == 2 && std::strcmp(argv[1], "--indirect-buffer-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, BufferLoadsGpuSelectedDescriptors());
+    RunCase(&vulkan, BufferLoadDwordx4SnapshotsOverlappingAddress());
+    RunCase(&vulkan, BufferLoadDwordx4ZeroesOnlyOutOfBoundsTail());
+    RunCase(&vulkan, BufferLoadDwordIdxenUsesDescriptorStride());
+    RunCase(&vulkan, BufferStoreFormatXAddTidUsesLaneIndex());
+    RunCase(&vulkan, FlatVirtualAddressRebasesGuestAllocation());
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--wave64-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, Wave32VccMasksPreserveOtherHalf());
@@ -32429,6 +32654,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--layered-image-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckUnifiedImageViewCache();
+    vulkan.CheckCubeFaceStorageExpansion();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--image-view-cache-only") == 0) {
@@ -32619,6 +32845,7 @@ int main(int argc, char **argv) {
 #endif
   vulkan.CheckUnifiedImageViewCache();
   vulkan.CheckPackedTextureComponents();
+  vulkan.CheckCubeFaceStorageExpansion();
   const auto tests = MakeCases();
   const auto graphics_tests = MakeGraphicsCases();
   CheckOpcodeCoverage(tests, graphics_tests);

@@ -27,6 +27,7 @@ namespace SaveData {
 
 // TODO(): specify dir at launcher
 static constexpr char     SAVE_DATA_DIR[]      = "_SaveData";
+static constexpr uint64_t SAVE_DATA_BLOCKS_MIN = 48;
 static constexpr uint64_t SAVE_DATA_BLOCKS_MAX = 16384;
 
 struct SceSaveDataDirName {
@@ -305,9 +306,9 @@ static bool valid_memory_range(const SaveDataMemoryData& data, size_t size) {
 	       data.buf_size <= size - static_cast<size_t>(data.offset);
 }
 
-// Keep memory.dat as raw guest bytes. Replacing a flushed temporary file protects the
+// Replacing a flushed temporary file protects the
 // previous save if writing fails or the emulator exits partway through an update.
-static int write_memory_file(const std::filesystem::path& path, const void* data, uint32_t size) {
+static int write_save_file(const std::filesystem::path& path, const void* data, uint32_t size) {
 	const auto   temporary = std::filesystem::path(path.string() + ".tmp");
 	Common::File file;
 	if (!file.Create(temporary)) {
@@ -329,6 +330,21 @@ static int write_memory_file(const std::filesystem::path& path, const void* data
 	return SAVE_DATA_ERROR_INTERNAL;
 }
 
+static int read_save_blocks(const std::filesystem::path& directory, uint64_t* blocks) {
+	Common::File file(directory / "sce_sys" / "blocks.bin", Common::File::Mode::Read);
+	if (file.IsInvalid() || file.Size() != sizeof(*blocks)) {
+		return SAVE_DATA_ERROR_BROKEN;
+	}
+	uint64_t value = 0;
+	uint32_t read = 0;
+	file.Read(&value, sizeof(value), &read);
+	if (read != sizeof(value) || value < SAVE_DATA_BLOCKS_MIN || value > SAVE_DATA_BLOCKS_MAX) {
+		return SAVE_DATA_ERROR_BROKEN;
+	}
+	*blocks = value;
+	return OK;
+}
+
 static int save_memory(const std::filesystem::path& directory, const SaveDataMemory& memory) {
 	std::error_code error;
 	std::filesystem::create_directories(directory, error);
@@ -336,10 +352,10 @@ static int save_memory(const std::filesystem::path& directory, const SaveDataMem
 		return SAVE_DATA_ERROR_INTERNAL;
 	}
 	// Display metadata is a separate host sidecar, leaving memory.dat as raw guest bytes.
-	int result = write_memory_file(directory / "param.bin", &memory.param, sizeof(memory.param));
+	int result = write_save_file(directory / "param.bin", &memory.param, sizeof(memory.param));
 	if (result == OK) {
 		result =
-		    write_memory_file(directory / "memory.dat", memory.data.data(), memory.data.size());
+		    write_save_file(directory / "memory.dat", memory.data.data(), memory.data.size());
 	}
 	return result;
 }
@@ -561,9 +577,14 @@ int KYTY_SYSV_ABI SaveDataDirNameSearch(const SaveDataDirNameSearchCond* cond,
 			result->params[i] = {};
 		}
 		if (result->infos != nullptr) {
-			result->infos[i]             = {};
-			result->infos[i].blocks      = SAVE_DATA_BLOCKS_MAX;
-			result->infos[i].free_blocks = SAVE_DATA_BLOCKS_MAX;
+			auto& info = result->infos[i];
+			info = {};
+			const int status = read_save_blocks(root / dir_list[i], &info.blocks);
+			if (status != OK) {
+				return status;
+			}
+			// Host-directory saves report their allocation as free space.
+			info.free_blocks = info.blocks;
 		}
 	}
 
@@ -621,10 +642,22 @@ int KYTY_SYSV_ABI SaveDataMount3(const SaveDataMount3* mount, SaveDataMountResul
 
 	bool created = false;
 	if ((create || create2) && !Common::File::IsDirectoryExisting(mount_dir)) {
-		Common::File::CreateDirectories(mount_dir);
+		if (mount->blocks < SAVE_DATA_BLOCKS_MIN || mount->blocks > SAVE_DATA_BLOCKS_MAX) {
+			return SAVE_DATA_ERROR_PARAMETER;
+		}
+		const auto metadata = std::filesystem::path(mount_dir) / "sce_sys";
+		std::error_code error;
+		std::filesystem::create_directories(metadata, error);
+		if (error) {
+			return SAVE_DATA_ERROR_INTERNAL;
+		}
+		const int status = write_save_file(metadata / "blocks.bin", &mount->blocks,
+		                                   sizeof(mount->blocks));
+		if (status != OK) {
+			std::filesystem::remove_all(mount_dir, error);
+			return status;
+		}
 		created = true;
-
-		EXIT_NOT_IMPLEMENTED((!Common::File::IsDirectoryExisting(mount_dir)));
 	}
 
 	return mount_save_data(slot, dir_name, mount_dir, created ? 1u : 0u, mount_result);
@@ -1101,13 +1134,23 @@ int KYTY_SYSV_ABI SaveDataGetMountInfo(const SaveDataMountPoint* mount_point,
                                        SaveDataMountInfo*        info) {
 	PRINT_NAME();
 
-	EXIT_NOT_IMPLEMENTED(mount_point == nullptr);
-	EXIT_NOT_IMPLEMENTED(info == nullptr);
-
+	if (mount_point == nullptr || info == nullptr ||
+	    std::memchr(mount_point->data, 0, sizeof(mount_point->data)) == nullptr) {
+		return SAVE_DATA_ERROR_PARAMETER;
+	}
+	Common::LockGuard lock(g_mount_mutex);
+	if (g_mount_slots.Find(mount_point->data) == SaveDataMountSlots::FULL) {
+		return SAVE_DATA_ERROR_NOT_MOUNTED;
+	}
+	uint64_t blocks = 0;
+	const int status = read_save_blocks(
+	    LibKernel::FileSystem::GetRealFilename(mount_point->data), &blocks);
+	if (status != OK) {
+		return status;
+	}
 	*info = {};
-
-	info->blocks      = SAVE_DATA_BLOCKS_MAX;
-	info->free_blocks = SAVE_DATA_BLOCKS_MAX;
+	info->blocks = blocks;
+	info->free_blocks = blocks;
 
 	return OK;
 }

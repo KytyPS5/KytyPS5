@@ -1084,6 +1084,8 @@ void Presenter::Impl::Present() {
 
 		presented_overlay_revision.store(overlay_visual.revision, std::memory_order_release);
 		window.loop.presented_frames.fetch_add(1, std::memory_order_relaxed);
+		// The buffer cache ages its entries in presented frames.
+		window.graphic_ctx.presented_frames.fetch_add(1, std::memory_order_relaxed);
 		return;
 	}
 	LOGF("Vulkan presentation retry exhausted; dropping frame\n");

@@ -838,8 +838,8 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
                                             DrawRenderState& state) {
 	m_context.GetImageHeap().BeginDraw();
 	m_context.GetPipelineCache().GetGraphicsPrograms(buffer, state);
-	// Vertex programs beyond the host mesh limits or with unsupported call targets are not
-	// compiled.
+	// Programs beyond the host mesh limits, with unsupported call targets or that the recompiler
+	// cannot translate are not compiled; GetGraphicsPrograms then leaves stage 0 unbound.
 	if (state.vertex_info[0].stage.module == nullptr) {
 		return false;
 	}

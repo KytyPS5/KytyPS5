@@ -48864,9 +48864,9 @@ void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride, u3
                                   .domain = domain,
                                   .partitioning = partitioning,
                                   .output_topology = output_topology};
-  AnalyzeTessellationPrograms(local, control, tess);
   Require(name, "decoded interface",
-          tess.ls_stride == ls_stride && tess.hs_stride == hs_stride,
+          AnalyzeTessellationPrograms(local, control, tess) &&
+              tess.ls_stride == ls_stride && tess.hs_stride == hs_stride,
           "captured LS and HS address arithmetic must produce distinct strides");
 
   Require(name, "patch constant range", tess.patch_base == 0x7fc0u && tess.patch_size == 52u,
@@ -49055,9 +49055,9 @@ void CheckTessellationPatchConstants() {
                                   .domain = 1,
                                   .partitioning = 0,
                                   .output_topology = 2};
-  AnalyzeTessellationPrograms(local, control, tess);
   Require(name, "reflected interface",
-          tess.ls_stride == ls_stride && tess.hs_stride == hs_stride &&
+          AnalyzeTessellationPrograms(local, control, tess) &&
+              tess.ls_stride == ls_stride && tess.hs_stride == hs_stride &&
               tess.patch_base == 0x7f10u && tess.patch_size == 28u,
           "b128 LS records, selected LS reads, joined and looping HS paths and CP0 patch "
           "stores must reflect the layout");
@@ -49087,14 +49087,13 @@ void CheckTessellationPatchConstants() {
   Require(name, "integer partitioning", ds.assembly.find("SpacingEqual") != std::string::npos,
           "integer partitioning must map to equal spacing");
   std::printf("[host]    %-32s ok\n", name);
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   for (const bool carried : {false, true}) {
-    ExpectFatal(carried ? "TessellationLoopCarriedAddress" : "TessellationDivergentJoin", [&] {
-      ShaderTessellationInputInfo info{.input_control_points = 3, .output_control_points = 3};
-      AnalyzeTessellationPrograms(local, make_control(!carried, carried), info);
-    });
+    ShaderTessellationInputInfo info{.input_control_points = 3, .output_control_points = 3};
+    Require(carried ? "TessellationLoopCarriedAddress" : "TessellationDivergentJoin",
+            "rejected interface",
+            !AnalyzeTessellationPrograms(local, make_control(!carried, carried), info),
+            "an HS address that differs between joined paths must reject the pair");
   }
-#endif
 }
 
 void CheckTessellationPrograms() {

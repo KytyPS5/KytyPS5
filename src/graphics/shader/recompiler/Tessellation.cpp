@@ -25,8 +25,9 @@ struct TessellationAddress {
 	bool operator==(const TessellationAddress&) const = default;
 };
 
-// Reflects the LS output stride, or the HS output stride and patch constant range.
-void ReflectTessellationLayout(const Decoder::Program& program, bool local,
+// Reflects the LS output stride, or the HS output stride and patch constant range. False when the
+// program's interface is not one the lowering models.
+bool ReflectTessellationLayout(const Decoder::Program& program, bool local,
                                ShaderTessellationInputInfo& info) {
 	using namespace Decoder;
 	using Address   = TessellationAddress;
@@ -126,12 +127,17 @@ void ReflectTessellationLayout(const Decoder::Program& program, bool local,
 			if ((local && local_store) || control_store) {
 				const auto address = read(inst.src0);
 				if (address.kind != Kind::Affine) {
-					EXIT("%s tessellation address is not affine at pc 0x%08x\n",
+					LOGF("%s tessellation address is not affine at pc 0x%08x\n",
 					     local ? "LS" : "HS", inst.pc);
+					return false;
 				}
 				if (address.coefficient != 0u) {
-					EXIT_NOT_IMPLEMENTED((address.coefficient & 3u) != 0u ||
-					                     (stride != 0u && stride != address.coefficient));
+					if ((address.coefficient & 3u) != 0u ||
+					    (stride != 0u && stride != address.coefficient)) {
+						LOGF("%s tessellation stride %u at pc 0x%08x disagrees with %u\n",
+						     local ? "LS" : "HS", address.coefficient, inst.pc, stride);
+						return false;
+					}
 					stride = address.coefficient;
 				} else if (control_store) {
 					// Control-point-independent HS outputs are patch constants.
@@ -197,13 +203,21 @@ void ReflectTessellationLayout(const Decoder::Program& program, bool local,
 			registers.at(inst.dst.reg) = value;
 		}
 	}
-	EXIT_NOT_IMPLEMENTED(!joins.empty() || stride == 0u);
+	if (!joins.empty() || stride == 0u) {
+		LOGF("%s tessellation program has %s\n", local ? "LS" : "HS",
+		     stride == 0u ? "no attribute stride" : "a branch past its exit");
+		return false;
+	}
 	(local ? info.ls_stride : info.hs_stride) = stride;
 	if (patch_end != 0u) {
-		EXIT_NOT_IMPLEMENTED(patch_begin < stride * control_points);
+		if (patch_begin < stride * control_points) {
+			LOGF("HS patch constants at 0x%x overlap the control points\n", patch_begin);
+			return false;
+		}
 		info.patch_base = patch_begin;
 		info.patch_size = patch_end - patch_begin;
 	}
+	return true;
 }
 
 const IR::Inst* TessellationBufferBase(const IR::Inst& inst) {
@@ -260,25 +274,35 @@ IR::Value ActiveAddress(IR::Block& block, IR::Block::iterator before, IR::Value 
 
 } // namespace
 
-void AnalyzeTessellationPrograms(std::span<const uint32_t> local, std::span<const uint32_t> control,
+bool AnalyzeTessellationPrograms(std::span<const uint32_t> local, std::span<const uint32_t> control,
                                  ShaderTessellationInputInfo& info) {
 	const auto       local_program = Decoder::DecodeFrontProgram(local);
 	Decoder::Program control_program;
 	Decoder::DecodeProgram(control, control_program);
-	ReflectTessellationLayout(local_program, true, info);
-	ReflectTessellationLayout(control_program, false, info);
+	if (!ReflectTessellationLayout(local_program, true, info) ||
+	    !ReflectTessellationLayout(control_program, false, info)) {
+		return false;
+	}
 	LOGF("Tessellation interface: input_cp=%u output_cp=%u ls_stride=%u hs_stride=%u "
 	     "patch_base=0x%x patch_size=%u\n",
 	     info.input_control_points, info.output_control_points, info.ls_stride, info.hs_stride,
 	     info.patch_base, info.patch_size);
+	return true;
 }
 
-void LowerTessellationMemory(IR::Program& program, const CompileOptions& options) {
+bool LowerTessellationMemory(IR::Program& program, const CompileOptions& options) {
 	using namespace IR;
 	if (options.stage != ShaderType::Local && options.stage != ShaderType::TessellationControl &&
 	    options.stage != ShaderType::TessellationEvaluation) {
-		return;
+		return true;
 	}
+	const char* stage_name = options.stage == ShaderType::Local                 ? "LS"
+	                         : options.stage == ShaderType::TessellationControl ? "HS"
+	                                                                            : "TES";
+	const auto unsupported = [&](const char* what) {
+		LOGF("%s tessellation lowering does not model %s\n", stage_name, what);
+		return false;
+	};
 	const auto& tess = options.input_info.vertex->tess;
 	// Ring addresses can reuse data VGPRs. Their inactive values are irrelevant to
 	// a store guarded by the same EXEC predicate, but must remain intact elsewhere.
@@ -307,11 +331,13 @@ void LowerTessellationMemory(IR::Program& program, const CompileOptions& options
 			Value                 address, predicate;
 			if (shared != SharedAccess::None && memory.kind == ResourceKind::Lds) {
 				write = shared == SharedAccess::Write;
-				EXIT_NOT_IMPLEMENTED(memory.data_bits != 32u ||
-				                     (options.stage == ShaderType::Local
-				                          ? !write
-				                          : options.stage != ShaderType::TessellationControl ||
-				                                shared != SharedAccess::Read));
+				if (memory.data_bits != 32u ||
+				    (options.stage == ShaderType::Local
+				         ? !write
+				         : options.stage != ShaderType::TessellationControl ||
+				               shared != SharedAccess::Read)) {
+					return unsupported("this LDS access");
+				}
 				kind       = write ? TessellationAttribute::LocalOutput
 				                   : TessellationAttribute::ControlInput;
 				components = SharedComponentCount(inst.GetOpcode());
@@ -322,30 +348,35 @@ void LowerTessellationMemory(IR::Program& program, const CompileOptions& options
 				if (base == nullptr) {
 					continue;
 				}
-				EXIT_NOT_IMPLEMENTED(memory.data_bits != 32u || memory.formatted || memory.idxen ||
-				                     !memory.offen || buffer == BufferAccess::Atomic);
+				if (memory.data_bits != 32u || memory.formatted || memory.idxen || !memory.offen ||
+				    buffer == BufferAccess::Atomic) {
+					return unsupported("this ring buffer access");
+				}
 				write      = buffer == BufferAccess::Write;
 				components = BufferComponentCount(inst.GetOpcode());
 				address    = inst.Arg(2).Resolve();
 				predicate  = inst.Arg(inst.NumArgs() - 1u);
 				if (base->Arg(0).U32() == 1u) {
-					EXIT_NOT_IMPLEMENTED(!write ||
-					                     options.stage != ShaderType::TessellationControl);
+					if (!write || options.stage != ShaderType::TessellationControl) {
+						return unsupported("a tessellation factor access outside the HS");
+					}
 					kind = TessellationAttribute::Factor;
 					factors += components;
 				} else {
 					// After its barrier, the HS may read back outputs of other control points.
 					const bool output = options.stage == ShaderType::TessellationControl;
-					EXIT_NOT_IMPLEMENTED(
-					    !output && (write || options.stage != ShaderType::TessellationEvaluation));
+					if (!output && (write || options.stage != ShaderType::TessellationEvaluation)) {
+						return unsupported("a control-point access in the wrong stage");
+					}
 					kind = output ? TessellationAttribute::ControlOutput
 					              : TessellationAttribute::EvaluationInput;
 					if (address.IsImmediate() &&
 					    address.U32() >= tess.hs_stride * tess.output_control_points) {
 						const auto begin = address.U32() + memory.offset;
-						EXIT_NOT_IMPLEMENTED(begin < tess.patch_base ||
-						                     begin + 4u * components >
-						                         tess.patch_base + tess.patch_size);
+						if (begin < tess.patch_base ||
+						    begin + 4u * components > tess.patch_base + tess.patch_size) {
+							return unsupported("a patch-constant access outside the patch range");
+						}
 						kind = output ? TessellationAttribute::PatchOutput
 						              : TessellationAttribute::PatchInput;
 						// HS read-backs must not hide misplaced patch stores from the check below.
@@ -401,13 +432,13 @@ void LowerTessellationMemory(IR::Program& program, const CompileOptions& options
 	RemoveIdentities(program);
 	EliminateDeadCode(program.blocks);
 	// Patch constant stores whose EXEC selects were not stripped would land in control points.
-	EXIT_NOT_IMPLEMENTED(options.stage == ShaderType::TessellationControl &&
-	                     tess.patch_size != 0u && patches == 0u);
-	LOGF("%s tessellation lowering: reads=%u writes=%u factors=%u patches=%u\n",
-	     options.stage == ShaderType::Local                 ? "LS"
-	     : options.stage == ShaderType::TessellationControl ? "HS"
-	                                                       : "TES",
-	     reads, writes, factors, patches);
+	if (options.stage == ShaderType::TessellationControl && tess.patch_size != 0u &&
+	    patches == 0u) {
+		return unsupported("patch-constant stores still selected by EXEC");
+	}
+	LOGF("%s tessellation lowering: reads=%u writes=%u factors=%u patches=%u\n", stage_name, reads,
+	     writes, factors, patches);
+	return true;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler

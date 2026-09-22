@@ -502,6 +502,7 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 		case ValueOpcode::BitwiseXor32: info.has_bitwise_xor = true; break;
 		case ValueOpcode::StoreCompletion: info.subgroup_barrier = true; break;
 		case ValueOpcode::BvhIntersect: info.bvh = true; break;
+		case ValueOpcode::ReadClockRealtime64: info.uses_shader_clock = true; break;
 		case ValueOpcode::ConditionRef:
 			info.subgroup_ballot |=
 			    inst.Flags<CFG::BranchCondition>() != CFG::BranchCondition::ScalarInstruction;

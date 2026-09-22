@@ -473,6 +473,7 @@ struct ShaderInfo {
 	int32_t                          instance_offset_sgpr = -1;
 	bool                            has_bitwise_xor               = false;
 	bool                            uses_dma                      = false;
+	bool                            uses_shader_clock             = false;
 	bool                            uses_swizzle                  = false;
 	bool                            uses_lds                      = false;
 	bool                            uses_gds                      = false;

@@ -22,6 +22,7 @@
 #include <cinttypes>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <span>
 #include <tuple>
@@ -1266,42 +1267,73 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	const auto metadata_base_layer = desc.view_info.base_layer;
 
 	ImageId result {};
+	int32_t view_mip   = -1;
+	int32_t view_layer = -1;
 	{
-		std::scoped_lock lock {m_lock};
-		const auto       candidates =
-		    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
+		std::unique_lock lock {m_lock};
+		const auto       lookup = [&] {
+			view_mip   = -1;
+			view_layer = -1;
+			const auto candidates =
+			    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
 
-		for (const auto id: candidates) {
-			const auto& image = m_slot_images[id];
-			if (SameBacking(image.info, desc.info, exact_format)) {
-				result = id;
-			}
-		}
-
-		int32_t view_mip   = -1;
-		int32_t view_layer = -1;
-		if (!result) {
-			for (const auto candidate: candidates) {
-				view_mip                = -1;
-				view_layer              = -1;
-				const auto& merged_info = result ? m_slot_images[result].info : desc.info;
-				const auto  overlap     = ResolveOverlap(merged_info, desc.type, candidate, result);
-				if (overlap.image) {
-					result     = overlap.image;
-					view_mip   = overlap.mip;
-					view_layer = overlap.layer;
+			for (const auto id: candidates) {
+				const auto& image = m_slot_images[id];
+				if (SameBacking(image.info, desc.info, exact_format)) {
+					result = id;
 				}
 			}
-		}
 
-		if (result) {
-			auto& resolved = m_slot_images[result];
-			if (exact_format && resolved.info.pixel_format != desc.info.pixel_format) {
-				result = {};
-			} else if (resolved.info.resources < desc.info.resources) {
-				FreeImage(result);
-				result = {};
+			if (!result) {
+				for (const auto candidate: candidates) {
+					view_mip                = -1;
+					view_layer              = -1;
+					const auto& merged_info = result ? m_slot_images[result].info : desc.info;
+					const auto  overlap =
+					    ResolveOverlap(merged_info, desc.type, candidate, result);
+					if (overlap.image) {
+						result     = overlap.image;
+						view_mip   = overlap.mip;
+						view_layer = overlap.layer;
+					}
+				}
 			}
+
+			if (result) {
+				auto& resolved = m_slot_images[result];
+				if (exact_format && resolved.info.pixel_format != desc.info.pixel_format) {
+					result = {};
+				} else if (resolved.info.resources < desc.info.resources) {
+					FreeImage(result);
+					result = {};
+				}
+			}
+		};
+		lookup();
+		if (!result && m_graphics.CanReportMemoryUsage() &&
+		    m_graphics.GetDeviceMemoryUsage() >= m_pressure_gc_memory) {
+			// Device-local heap is pressured (e.g. 4K R16 targets during streaming): drop
+			// the lock, evict stale images/buffers, then re-resolve — another thread may
+			// have inserted meanwhile. InsertImage itself still runs under the lock below.
+			// Same ordering as RenderContext::RunGarbageCollector, so no lock inversion.
+			lock.unlock();
+			const auto usage_before = m_graphics.GetDeviceMemoryUsage();
+			const auto gc_stats     = CollectGarbage();
+			m_buffer_cache.RunGarbageCollector();
+			const auto usage_after = m_graphics.GetDeviceMemoryUsage();
+			LOGF("TextureCache: pressured image miss (extent=%ux%u format=%d), GC "
+			     "device-local usage=%" PRIu64 " -> %" PRIu64 " MiB, image-accounted=%" PRIu64
+			     " MiB, candidates=%zu freed=%zu tiled=%zu dl_fail=%zu invalid=%zu age=%" PRIu64
+			     " tick=%" PRIu64 "\n",
+			     desc.info.extent.width, desc.info.extent.height,
+			     static_cast<int>(desc.info.pixel_format), usage_before / (1024 * 1024),
+			     usage_after / (1024 * 1024), gc_stats.accounted / (1024 * 1024),
+			     gc_stats.candidates, gc_stats.freed, gc_stats.skipped_tiled,
+			     gc_stats.skipped_download, gc_stats.skipped_invalid, gc_stats.age,
+			     gc_stats.tick);
+			lock.lock();
+			result = {};
+			lookup();
 		}
 		if (!result) {
 			result         = InsertImage(desc.info);
@@ -1795,7 +1827,39 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	auto [mapped, offset] =
 	    download.Map(range.size, std::max<uint64_t>(image.info.bytes_per_block, 4));
 	if (mapped == nullptr) {
-		EXIT("TextureCache: failed to map reusable download buffer\n");
+		// Staging ring is full or the range exceeds it (e.g. a 32 MiB 4K target under
+		// memory pressure): fall back to a dedicated temporary, mirroring
+		// BufferCache::UploadCopies()/DownloadBufferMemory().
+		auto temporary = std::make_unique<Buffer>(m_graphics, m_scheduler,
+		                                         MemoryUsage::Download, 0,
+		                                         vk::BufferUsageFlagBits::eTransferDst,
+		                                         range.size);
+		auto* temp_mapped = temporary->Mapped().data();
+		if (!LibKernel::Memory::TryReadBacking(range.address, temp_mapped, range.size)) {
+			return false;
+		}
+		temporary->Flush(0, range.size);
+		DownloadImage(image, *temporary, 0, range.size, std::move(transfer));
+		vk::BufferMemoryBarrier barrier {};
+		barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite |
+		                        vk::AccessFlagBits::eTransferWrite |
+		                        vk::AccessFlagBits::eShaderWrite;
+		barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+		barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.buffer              = temporary->Handle();
+		barrier.offset              = 0;
+		barrier.size                = range.size;
+		m_scheduler.EndRendering();
+		m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+		                                               vk::PipelineStageFlagBits::eHost, {}, 0,
+		                                               nullptr, 1, &barrier, 0, nullptr);
+		m_scheduler.DeferPriorityOperation(
+		    [tmp = std::move(temporary), range, temp_mapped] {
+			    tmp->Invalidate(0, range.size);
+			    LibKernel::Memory::WriteBacking(range.address, temp_mapped, range.size);
+		    });
+		return true;
 	}
 	download.Commit();
 	if (!LibKernel::Memory::TryReadBacking(range.address, mapped, range.size)) {
@@ -1943,18 +2007,32 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 }
 
 void TextureCache::RunGarbageCollector() {
+	(void)CollectGarbage();
+}
+
+TextureCache::GcStats TextureCache::CollectGarbage() {
+	GcStats stats {};
 	std::scoped_lock lock {m_lock};
 	const uint64_t   tick = m_gc_tick++;
+	stats.tick             = tick;
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
 	if (m_total_used_memory < m_trigger_gc_memory) {
-		return;
+		return stats;
 	}
 	const auto collect = [&](bool allow_aggressive) {
 		bool           pressured  = m_total_used_memory >= m_pressure_gc_memory;
 		bool           aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
 		const uint64_t age       = std::min<uint64_t>(aggressive ? 160 : pressured ? 80 : 16, tick);
+		stats.age                = std::max(stats.age, age);
+		// Hysteresis: stay aggressive until usage drops comfortably below critical,
+		// otherwise a single freed image flips the pass back to skipping tiled.
+		constexpr uint64_t kAggressiveReleaseMargin = 256ull * 1024 * 1024;
+		const uint64_t     release_threshold =
+		    m_critical_gc_memory > kAggressiveReleaseMargin
+		        ? m_critical_gc_memory - kAggressiveReleaseMargin
+		        : 0;
 		size_t         deletions = aggressive ? 40 : pressured ? 20 : 10;
 		std::vector<ImageId> candidates;
 		candidates.reserve(deletions);
@@ -1964,6 +2042,7 @@ void TextureCache::RunGarbageCollector() {
 			candidates.push_back(id);
 			return candidates.size() == deletions;
 		});
+		stats.candidates += candidates.size();
 		for (const auto id: candidates) {
 			if (deletions == 0) {
 				break;
@@ -1971,22 +2050,30 @@ void TextureCache::RunGarbageCollector() {
 			--deletions;
 			auto owner = m_slot_images.try_get(id);
 			if (owner == nullptr || !owner->registered || owner->depth_id) {
+				stats.skipped_invalid++;
 				continue;
 			}
 			if (owner->IsGpuModified()) {
 				const bool safe = SafeToDownload(*owner);
-				if (safe && owner->info.IsTiled()) {
+				// Tiled downloads go through the tiler untile path and can fail; skipping
+				// them is fine while memory allows. Under critical pressure the alternative
+				// is a hard OOM abort, so attempt the download and keep the image only if
+				// it fails.
+				if (safe && owner->info.IsTiled() && !aggressive) {
+					stats.skipped_tiled++;
 					continue;
 				}
 				if (safe && !pressured) {
 					continue;
 				}
 				if (safe && !DownloadImageMemory(id)) {
+					stats.skipped_download++;
 					continue;
 				}
 			}
 			FreeImage(id);
-			if (m_total_used_memory < m_critical_gc_memory && aggressive) {
+			stats.freed++;
+			if (m_total_used_memory < release_threshold && aggressive) {
 				deletions >>= 2;
 				aggressive = false;
 			}
@@ -2000,6 +2087,8 @@ void TextureCache::RunGarbageCollector() {
 	if (m_total_used_memory >= m_critical_gc_memory) {
 		collect(true);
 	}
+	stats.accounted = m_total_used_memory;
+	return stats;
 }
 
 void TextureCache::ProcessDownloadImages() {

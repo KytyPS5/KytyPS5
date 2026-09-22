@@ -164,6 +164,18 @@ private:
 	void               InvalidateCpuAliases(uint64_t address, uint64_t size);
 	[[nodiscard]] bool DownloadImageMemory(ImageId id);
 
+	struct GcStats {
+		size_t   candidates       = 0;
+		size_t   freed            = 0;
+		size_t   skipped_tiled    = 0;
+		size_t   skipped_download = 0;
+		size_t   skipped_invalid  = 0;
+		uint64_t age              = 0;
+		uint64_t tick             = 0;
+		uint64_t accounted        = 0;
+	};
+	[[nodiscard]] GcStats CollectGarbage();
+
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
 	TrackingSpinLock                                  m_lock;

@@ -27,9 +27,9 @@ public:
 
 	KYTY_CLASS_NO_COPY(KernelEventFlagPrivate);
 
-	void   Set(uint64_t bits);
-	void   Clear(uint64_t bits);
-	void   Cancel(uint64_t bits, int* num_waiting_threads);
+	Result Set(uint64_t bits);
+	Result Clear(uint64_t bits);
+	Result Cancel(uint64_t bits, int* num_waiting_threads);
 	Result Wait(uint64_t bits, WaitMode wait_mode, ClearMode clear_mode, uint64_t* result,
 	            uint32_t* ptr_micros);
 
@@ -57,23 +57,26 @@ struct EventFlagWaitMode {
 	KernelEventFlagPrivate::ClearMode clear = KernelEventFlagPrivate::ClearMode::None;
 };
 
-EventFlagWaitMode DecodeEventFlagWaitMode(uint32_t wait_mode) {
+// The wait mode is guest input, so an unknown value is bad input rather than a broken emulator
+// invariant. sceKernelWaitEventFlag and sceKernelPollEventFlag answer EINVAL for it.
+bool DecodeEventFlagWaitMode(uint32_t wait_mode, EventFlagWaitMode* out) {
 	EventFlagWaitMode mode;
 
 	switch (wait_mode & 0xfu) {
 		case 0x01: mode.wait = KernelEventFlagPrivate::WaitMode::And; break;
 		case 0x02: mode.wait = KernelEventFlagPrivate::WaitMode::Or; break;
-		default: EXIT("unknown mode: %u\n", wait_mode);
+		default: printf("KernelEventFlag: unknown wait mode: 0x%08x\n", wait_mode); return false;
 	}
 
 	switch (wait_mode & 0xf0u) {
 		case 0x00: mode.clear = KernelEventFlagPrivate::ClearMode::None; break;
 		case 0x10: mode.clear = KernelEventFlagPrivate::ClearMode::All; break;
 		case 0x20: mode.clear = KernelEventFlagPrivate::ClearMode::Bits; break;
-		default: EXIT("unknown mode: %u\n", wait_mode);
+		default: printf("KernelEventFlag: unknown clear mode: 0x%08x\n", wait_mode); return false;
 	}
 
-	return mode;
+	*out = mode;
+	return true;
 }
 
 } // namespace
@@ -177,10 +180,14 @@ KernelEventFlagPrivate::Result KernelEventFlagPrivate::Wait(uint64_t bits, WaitM
 	return Result::Ok;
 }
 
-void KernelEventFlagPrivate::Set(uint64_t bits) {
+KernelEventFlagPrivate::Result KernelEventFlagPrivate::Set(uint64_t bits) {
 	Common::LockGuard lock(m_mutex);
 
-	EXIT_NOT_IMPLEMENTED(m_status == Status::Deleted);
+	// Another guest thread can delete this flag while we are taking its lock. That is a guest
+	// race, not an emulator invariant: report it the way a wait on a deleted flag already does.
+	if (m_status == Status::Deleted) {
+		return Result::Deleted;
+	}
 
 	while (m_status != Status::Set) {
 		m_mutex.Unlock();
@@ -191,12 +198,18 @@ void KernelEventFlagPrivate::Set(uint64_t bits) {
 	m_bits |= bits;
 
 	m_cond_var.SignalAll();
+
+	return Result::Ok;
 }
 
-void KernelEventFlagPrivate::Clear(uint64_t bits) {
+KernelEventFlagPrivate::Result KernelEventFlagPrivate::Clear(uint64_t bits) {
 	Common::LockGuard lock(m_mutex);
 
-	EXIT_NOT_IMPLEMENTED(m_status == Status::Deleted);
+	// Another guest thread can delete this flag while we are taking its lock. That is a guest
+	// race, not an emulator invariant: report it the way a wait on a deleted flag already does.
+	if (m_status == Status::Deleted) {
+		return Result::Deleted;
+	}
 
 	while (m_status != Status::Set) {
 		m_mutex.Unlock();
@@ -205,12 +218,18 @@ void KernelEventFlagPrivate::Clear(uint64_t bits) {
 	}
 
 	m_bits &= bits;
+
+	return Result::Ok;
 }
 
-void KernelEventFlagPrivate::Cancel(uint64_t bits, int* num_waiting_threads) {
+KernelEventFlagPrivate::Result KernelEventFlagPrivate::Cancel(uint64_t bits, int* num_waiting_threads) {
 	Common::LockGuard lock(m_mutex);
 
-	EXIT_NOT_IMPLEMENTED(m_status == Status::Deleted);
+	// Another guest thread can delete this flag while we are taking its lock. That is a guest
+	// race, not an emulator invariant: report it the way a wait on a deleted flag already does.
+	if (m_status == Status::Deleted) {
+		return Result::Deleted;
+	}
 
 	while (m_status != Status::Set) {
 		m_mutex.Unlock();
@@ -234,6 +253,8 @@ void KernelEventFlagPrivate::Cancel(uint64_t bits, int* num_waiting_threads) {
 	}
 
 	m_status = Status::Set;
+
+	return Result::Ok;
 }
 
 int KYTY_SYSV_ABI KernelCreateEventFlag(KernelEventFlag* ef, const char* name, uint32_t attr,
@@ -296,8 +317,11 @@ int KYTY_SYSV_ABI KernelWaitEventFlag(KernelEventFlag ef, uint64_t bit_pattern, 
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	const auto mode   = DecodeEventFlagWaitMode(wait_mode);
-	auto       result = ef->Wait(bit_pattern, mode.wait, mode.clear, result_pat, timeout);
+	EventFlagWaitMode mode;
+	if (!DecodeEventFlagWaitMode(wait_mode, &mode)) {
+		return KERNEL_ERROR_EINVAL;
+	}
+	auto result = ef->Wait(bit_pattern, mode.wait, mode.clear, result_pat, timeout);
 
 	int ret = OK;
 
@@ -324,8 +348,11 @@ int KYTY_SYSV_ABI KernelPollEventFlag(KernelEventFlag ef, uint64_t bit_pattern, 
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	const auto mode   = DecodeEventFlagWaitMode(wait_mode);
-	auto       result = ef->Poll(bit_pattern, mode.wait, mode.clear, result_pat);
+	EventFlagWaitMode mode;
+	if (!DecodeEventFlagWaitMode(wait_mode, &mode)) {
+		return KERNEL_ERROR_EINVAL;
+	}
+	auto result = ef->Poll(bit_pattern, mode.wait, mode.clear, result_pat);
 
 	int ret = OK;
 
@@ -347,7 +374,9 @@ int KYTY_SYSV_ABI KernelSetEventFlag(KernelEventFlag ef, uint64_t bit_pattern) {
 		return KERNEL_ERROR_ESRCH;
 	}
 
-	ef->Set(bit_pattern);
+	if (ef->Set(bit_pattern) == KernelEventFlagPrivate::Result::Deleted) {
+		return KERNEL_ERROR_EACCES;
+	}
 
 	return OK;
 }
@@ -359,7 +388,9 @@ int KYTY_SYSV_ABI KernelClearEventFlag(KernelEventFlag ef, uint64_t bit_pattern)
 		return KERNEL_ERROR_ESRCH;
 	}
 
-	ef->Clear(bit_pattern);
+	if (ef->Clear(bit_pattern) == KernelEventFlagPrivate::Result::Deleted) {
+		return KERNEL_ERROR_EACCES;
+	}
 
 	return OK;
 }
@@ -372,7 +403,9 @@ int KYTY_SYSV_ABI KernelCancelEventFlag(KernelEventFlag ef, uint64_t set_pattern
 		return KERNEL_ERROR_ESRCH;
 	}
 
-	ef->Cancel(set_pattern, num_wait_threads);
+	if (ef->Cancel(set_pattern, num_wait_threads) == KernelEventFlagPrivate::Result::Deleted) {
+		return KERNEL_ERROR_EACCES;
+	}
 
 	return OK;
 }

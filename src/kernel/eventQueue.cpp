@@ -331,8 +331,12 @@ int KYTY_SYSV_ABI KernelCreateEqueue(KernelEqueue* eq, const char* name) {
 
 	{
 		Common::LockGuard lock(g_equeues_mutex);
+		// Handles are never recycled, so a guest that churns event queues can exhaust the space.
+		// That is a resource limit the guest can be told about and retry against, not an
+		// emulator invariant.
 		if (g_next_equeue > static_cast<uint64_t>(std::numeric_limits<KernelEqueue>::max())) {
-			EXIT("event queue handle space exhausted\n");
+			printf("KernelCreateEqueue: event queue handle space exhausted\n");
+			return KERNEL_ERROR_EAGAIN;
 		}
 		*eq        = static_cast<KernelEqueue>(g_next_equeue++);
 		auto owner = std::make_shared<KernelEqueuePrivate>(*eq);
@@ -411,7 +415,9 @@ int KYTY_SYSV_ABI KernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, in
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	EXIT_NOT_IMPLEMENTED(out == nullptr);
+	if (out == nullptr) {
+		return KERNEL_ERROR_EFAULT;
+	}
 
 	LOGF("\tEqueue wait: %s, caller = 0x%016" PRIx64 ", eq = 0x%016" PRIx64 ", ev = 0x%016" PRIx64
 	     ", num = %d, timo = %s, thread_id = %d\n",

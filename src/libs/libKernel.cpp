@@ -14,6 +14,7 @@
 #include "kernel/pthread.h"
 #include "kernel/semaphore.h"
 #include "kernel/syncOnAddress.h"
+#include "kernel/umtx.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "libs/network.h"
@@ -1210,8 +1211,14 @@ static KYTY_SYSV_ABI KernelModule KernelLoadStartModule(const char* module_file_
 
 	LOGF("\tmodule_file_name = %s\n", module_file_name);
 
-	EXIT_NOT_IMPLEMENTED(flags != 0);
-	EXIT_NOT_IMPLEMENTED(opt != nullptr);
+	if (flags != 0 || opt != nullptr) {
+		printf("sceKernelLoadStartModule: unsupported flags=0x%08x opt=%p\n", flags,
+		       static_cast<const void*>(opt));
+		if (res != nullptr) {
+			*res = KERNEL_ERROR_EINVAL;
+		}
+		return KERNEL_ERROR_EINVAL;
+	}
 
 	auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
 
@@ -1246,7 +1253,10 @@ static KYTY_SYSV_ABI KernelModule KernelLoadStartModule(const char* module_file_
 
 	LOGF("\tmodule_start() result = %d\n", result);
 
-	EXIT_NOT_IMPLEMENTED(result < 0);
+	// A module whose module_start() fails is the guest's problem to report, not ours to die on.
+	if (result < 0) {
+		printf("sceKernelLoadStartModule: module_start() failed: result = %d\n", result);
+	}
 
 	if (res != nullptr) {
 		*res = result;
@@ -1264,8 +1274,11 @@ static int KYTY_SYSV_ABI KernelStopUnloadModule(KernelModule handle, size_t args
 
 	auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
 
-	EXIT_NOT_IMPLEMENTED(flags != 0);
-	EXIT_NOT_IMPLEMENTED(opt != nullptr);
+	if (flags != 0 || opt != nullptr) {
+		printf("sceKernelStopUnloadModule: unsupported flags=0x%08x opt=%p\n", flags,
+		       static_cast<const void*>(opt));
+		return KERNEL_ERROR_EINVAL;
+	}
 
 	auto* program = rt->FindProgramById(handle);
 
@@ -1293,7 +1306,9 @@ static int KYTY_SYSV_ABI KernelStopUnloadModule(KernelModule handle, size_t args
 
 	LOGF("\tmodule_stop() result = %d\n", result);
 
-	EXIT_NOT_IMPLEMENTED(result < 0);
+	if (result < 0) {
+		printf("sceKernelStopUnloadModule: module_stop() failed: result = %d\n", result);
+	}
 
 	if (res != nullptr) {
 		*res = result;
@@ -1381,7 +1396,10 @@ static void KYTY_SYSV_ABI KernelRtldSetApplicationHeapAPI(void* api[]) {
 static int64_t KYTY_SYSV_ABI write(int d, const char* str, int64_t size) {
 	// PRINT_NAME();
 
-	EXIT_NOT_IMPLEMENTED(d < 0);
+	if (d < 0) {
+		*Posix::GetErrorAddr() = Posix::POSIX_EBADF;
+		return -1;
+	}
 
 	if (Network::Net::IsSocket(d)) {
 		return Network::Net::Send(d, str, static_cast<uint64_t>(size), 0);
@@ -1661,8 +1679,13 @@ static int KYTY_SYSV_ABI KernelGetModuleInfoFromAddr(uint64_t addr, int n, Modul
 	     "\tn = %d\n",
 	     addr, n);
 
-	EXIT_NOT_IMPLEMENTED(n != 2);
-	EXIT_NOT_IMPLEMENTED(r == nullptr);
+	// The only layout this knows is the two-segment ModuleInfo; anything else, and a null
+	// out-parameter, are reported the way a module lookup miss already is.
+	if (n != 2 || r == nullptr) {
+		printf("sceKernelGetModuleInfoFromAddr: unsupported request n=%d r=%p\n", n,
+		       static_cast<void*>(r));
+		return -1;
+	}
 
 	auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
 
@@ -1714,7 +1737,9 @@ static KYTY_SYSV_ABI NewReplace* KernelGetSanitizerNewReplaceExternal() {
 static KYTY_SYSV_ABI int elf_phdr_match_addr(ModuleInfo* m, uint64_t dtor_vaddr) {
 	PRINT_NAME();
 
-	EXIT_NOT_IMPLEMENTED(m == nullptr);
+	if (m == nullptr) {
+		return 0;
+	}
 
 	auto* rt     = Common::Singleton<Loader::RuntimeLinker>::Instance();
 	auto* p      = rt->FindProgramByAddr(dtor_vaddr);
@@ -1768,7 +1793,10 @@ static KYTY_SYSV_ABI void pthread_cxa_finalize(void* /*p*/) {
 void KYTY_SYSV_ABI KernelSetThreadAtexitCount(get_thread_atexit_count_func_t func) {
 	PRINT_NAME();
 
-	EXIT_NOT_IMPLEMENTED(g_get_thread_atexit_count_func != nullptr);
+	if (g_get_thread_atexit_count_func != nullptr) {
+		printf("sceKernelSetThreadAtexitCount: already registered, keeping the first hook\n");
+		return;
+	}
 
 	g_get_thread_atexit_count_func = func;
 }
@@ -1776,7 +1804,10 @@ void KYTY_SYSV_ABI KernelSetThreadAtexitCount(get_thread_atexit_count_func_t fun
 void KYTY_SYSV_ABI KernelSetThreadAtexitReport(thread_atexit_report_func_t func) {
 	PRINT_NAME();
 
-	EXIT_NOT_IMPLEMENTED(g_thread_atexit_report_func != nullptr);
+	if (g_thread_atexit_report_func != nullptr) {
+		printf("sceKernelSetThreadAtexitReport: already registered, keeping the first hook\n");
+		return;
+	}
 
 	g_thread_atexit_report_func = func;
 }
@@ -2126,37 +2157,45 @@ int KYTY_SYSV_ABI KernelSyncOnAddressWake(volatile void* address, int32_t count)
 	return LibKernel::SyncOnAddress::Wake(address, count);
 }
 
-int KYTY_SYSV_ABI UmtxOp(volatile void* address, int operation, uint64_t value,
-                           void* uaddr, const void* timeout) {
-	constexpr int UMTX_OP_WAIT = 2;
-	constexpr int UMTX_OP_WAKE = 3;
-
-	EXIT_NOT_IMPLEMENTED(uaddr != nullptr);
-
-	switch (operation) {
-		case UMTX_OP_WAIT:
-			if (timeout != nullptr) {
-				LibKernel::KernelTimespec duration {};
-				std::memcpy(&duration, timeout, sizeof(duration));
-				if (duration.tv_sec < 0 || duration.tv_nsec < 0 || duration.tv_nsec >= 1000000000) {
-					*GetErrorAddr() = POSIX_EINVAL;
-					return -1;
-				}
-				const auto max_ns = std::chrono::nanoseconds::max().count();
-				const auto timeout_ns = duration.tv_sec > (max_ns - duration.tv_nsec) / 1000000000
-				                            ? max_ns
-				                            : duration.tv_sec * 1000000000 + duration.tv_nsec;
-				return POSIX_CALL(LibKernel::SyncOnAddress::Wait64(
-				    static_cast<volatile uint64_t*>(address), value, std::chrono::nanoseconds(timeout_ns),
-				    LibKernel::KernelDispatchPendingSignalForCurrentThread));
-			}
-			return POSIX_CALL(LibKernel::SyncOnAddress::Wait64(
-			    static_cast<volatile uint64_t*>(address), value, nullptr,
-			    LibKernel::KernelDispatchPendingSignalForCurrentThread));
-		case UMTX_OP_WAKE:
-			return POSIX_CALL(LibKernel::SyncOnAddress::Wake(address, static_cast<int32_t>(value)));
-		default: EXIT("Unsupported _umtx_op operation: %d\n", operation);
+static bool UmtxClockGettime(int clock_id, int64_t* sec, int64_t* nsec) {
+	LibKernel::KernelTimespec ts {};
+	if (LibKernel::KernelClockGettime(static_cast<LibKernel::KernelClockid>(clock_id), &ts) != OK) {
+		return false;
 	}
+	*sec  = ts.tv_sec;
+	*nsec = ts.tv_nsec;
+	return true;
+}
+
+// The umutex owner word holds a thread id. Guest threads have one; a host worker thread that
+// somehow reaches this path gets a synthetic id so that it can still own a mutex distinctly.
+static uint32_t UmtxCurrentTid() {
+	const int guest_tid = LibKernel::PthreadGetthreadid();
+	if (guest_tid > 0) {
+		return static_cast<uint32_t>(guest_tid);
+	}
+
+	static std::atomic<uint32_t> next_host_tid {0x40000000u};
+	thread_local uint32_t host_tid = next_host_tid.fetch_add(1, std::memory_order_relaxed);
+	return host_tid;
+}
+
+int KYTY_SYSV_ABI UmtxOp(volatile void* address, int operation, uint64_t value, void* uaddr,
+                         void* uaddr2) {
+	static std::once_flag hooks_once;
+	std::call_once(hooks_once, []() {
+		LibKernel::Umtx::SetHooks(UmtxCurrentTid,
+		                          LibKernel::KernelDispatchPendingSignalForCurrentThread,
+		                          UmtxClockGettime);
+	});
+
+	const int error = LibKernel::Umtx::Op(const_cast<void*>(address), operation, value, uaddr,
+	                                      uaddr2);
+	if (error != OK) {
+		*GetErrorAddr() = error;
+		return -1;
+	}
+	return 0;
 }
 
 LIB_DEFINE(InitLibKernel_1_Posix) {

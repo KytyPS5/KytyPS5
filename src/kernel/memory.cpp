@@ -2268,8 +2268,10 @@ static bool UnmapPooledBackingTransactional(const std::vector<PooledMemory::Mapp
 				const bool restored       = g_guest_address_space->MapBacking(
 				    it->vaddr, it->size, it->phys_addr, mode, &failure_reason);
 				if (!restored) {
-					EXIT("pooled-memory unmap rollback failed: %s\n",
-					     GuestBackingStore::GetFailureReasonName(failure_reason));
+					// The rollback itself failed. The caller already treats this call as failed;
+					// reporting that is strictly better than killing the process.
+					printf("Memory: pooled-memory unmap rollback failed: %s\n",
+					       GuestBackingStore::GetFailureReasonName(failure_reason));
 				}
 			}
 			return false;
@@ -2282,7 +2284,9 @@ static bool UnmapPooledBackingTransactional(const std::vector<PooledMemory::Mapp
 // The ABI entry points and batch operations hold g_memory_operation_mutex.
 static int MapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags,
                              const char* name) {
-	EXIT_NOT_IMPLEMENTED(addr_in_out == nullptr);
+	if (addr_in_out == nullptr) {
+		return KERNEL_ERROR_EINVAL;
+	}
 
 	constexpr size_t   PAGE_SIZE                = 0x4000;
 	constexpr size_t   MAXIMUM_NAME_SIZE        = 32;
@@ -2326,7 +2330,10 @@ static int MapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags
 	GpuAccessMode       gpu_mode = GpuAccessMode::NoAccess;
 
 	if (!DecodeMemoryProtection(prot, &mode, &gpu_mode)) {
-		EXIT("unknown prot: %d\n", prot);
+		// Matches KernelMprotect and KernelMemoryPoolCommit, which both answer EINVAL for the
+		// same DecodeMemoryProtection failure.
+		printf("Memory: unknown prot: %d\n", prot);
+		return KERNEL_ERROR_EINVAL;
 	}
 
 	auto     in_addr         = reinterpret_cast<uint64_t>(*addr_in_out);
@@ -2582,7 +2589,8 @@ static int UnmapMemoryRange(uint64_t vaddr, size_t len) {
 			owner_unmapped = DecodeMemoryProtection(range.protection, &mode, &decoded_gpu) &&
 			                 UnmapPooledBackingTransactional(mappings, mode);
 			if (owner_unmapped && !g_pooled_memory->Release(vaddr, len, &gpu_mode)) {
-				EXIT("failed to release unmapped pooled-memory range\n");
+				printf("Memory: failed to release unmapped pooled-memory range\n");
+				return KERNEL_ERROR_EACCES;
 			}
 		}
 		if (!owner_unmapped) {
@@ -2875,7 +2883,8 @@ static int ReleaseDirectMemoryInternal(int64_t start, size_t len) {
 
 	if (g_pooled_memory->ReleaseExpansion(static_cast<uint64_t>(start), len)) {
 		if (!g_physical_memory->ReleasePoolExpansion(static_cast<uint64_t>(start), len)) {
-			EXIT("failed to release physical pool expansion\n");
+			printf("Memory: failed to release physical pool expansion\n");
+			return KERNEL_ERROR_EACCES;
 		}
 		return OK;
 	}
@@ -2892,7 +2901,13 @@ static int ReleaseDirectMemoryInternal(int64_t start, size_t len) {
 		    !g_virtual_ranges->Query(alias.map_vaddr, 0, &range) ||
 		    range.type != VirtualRangeType::Direct ||
 		    alias.map_size > range.start + range.size - alias.map_vaddr) {
-			EXIT("direct-memory alias escaped guest address-space ownership\n");
+			// The alias table and the virtual-range table disagree, which a concurrent map,
+			// unmap or protect on the same span can produce. Refuse the release and leave both
+			// tables alone rather than aborting.
+			printf("Memory: direct-memory alias escaped guest address-space ownership: "
+			       "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+			       alias.map_vaddr, alias.map_size);
+			return KERNEL_ERROR_EACCES;
 		}
 	}
 
@@ -3306,7 +3321,9 @@ int KYTY_SYSV_ABI KernelQueryMemoryProtection(void* addr, void** start, void** e
 
 	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
 
-	EXIT_NOT_IMPLEMENTED(addr == nullptr);
+	if (addr == nullptr) {
+		return KERNEL_ERROR_EINVAL;
+	}
 
 	VirtualRanges::Range range {};
 	if (!g_virtual_ranges->Query(reinterpret_cast<uint64_t>(addr), 0, &range)) {
@@ -3374,9 +3391,12 @@ static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size) {
 			return false;
 		}
 		if (range.type == VirtualRangeType::Pooled) {
-			EXIT("reserve-fixed replacement of pooled memory is unsupported: addr=0x%016" PRIx64
-			     " size=0x%016" PRIx64 "\n",
-			     replaced.range.start, replaced.range.size);
+			// MAP_FIXED over a memory pool is genuinely unsupported here, but the caller turns
+			// a false return into ENOMEM/EINVAL for the guest.
+			printf("Memory: reserve-fixed replacement of pooled memory is unsupported: "
+			       "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+			       replaced.range.start, replaced.range.size);
+			return false;
 		}
 		chunks.push_back(replaced);
 
@@ -3472,7 +3492,7 @@ static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size) {
 			           chunk.range.start, chunk.range.size,
 			           magic_enum::enum_name(chunk.range.type));
 			if (!restore_chunks()) {
-				EXIT("reserve-fixed backend-unmap rollback failed\n");
+				printf("Memory: reserve-fixed backend-unmap rollback failed\n");
 			}
 			return false;
 		}
@@ -3480,7 +3500,7 @@ static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size) {
 
 	if (!g_guest_address_space->ReserveFixed(start, size)) {
 		if (!restore_chunks()) {
-			EXIT("reserve-fixed host-reservation rollback failed\n");
+			printf("Memory: reserve-fixed host-reservation rollback failed\n");
 		}
 		return false;
 	}
@@ -3501,19 +3521,19 @@ static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size) {
 		           ", size=0x%016" PRIx64 "\n",
 		           start, size);
 		if (!restore_chunks()) {
-			EXIT("reserve-fixed range-registration rollback failed\n");
+			printf("Memory: reserve-fixed range-registration rollback failed\n");
 		}
 		auto free_start = start;
 		for (const auto& chunk: chunks) {
 			if (free_start < chunk.range.start &&
 			    !g_guest_address_space->ReleaseFree(free_start, chunk.range.start - free_start)) {
-				EXIT("reserve-fixed range-registration gap cleanup failed\n");
+				printf("Memory: reserve-fixed range-registration gap cleanup failed\n");
 			}
 			free_start = chunk.range.start + chunk.range.size;
 		}
 		if (free_start < start + size &&
 		    !g_guest_address_space->ReleaseFree(free_start, start + size - free_start)) {
-			EXIT("reserve-fixed range-registration tail cleanup failed\n");
+			printf("Memory: reserve-fixed range-registration tail cleanup failed\n");
 		}
 		return false;
 	}
@@ -3931,8 +3951,11 @@ static int ProtectMemory(const void* addr, size_t len, int prot) {
 	auto               aligned_addr = vaddr & ~(PAGE_SIZE - 1);
 	const auto         page_offset  = vaddr - aligned_addr;
 	if (len > UINT64_MAX - page_offset || len + page_offset > UINT64_MAX - (PAGE_SIZE - 1)) {
-		EXIT("memory-protection range overflows: addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
-		     vaddr, static_cast<uint64_t>(len));
+		// A guest-supplied length that overflows the page rounding is bad input.
+		printf("Memory: memory-protection range overflows: addr=0x%016" PRIx64
+		       " size=0x%016" PRIx64 "\n",
+		       vaddr, static_cast<uint64_t>(len));
+		return KERNEL_ERROR_EINVAL;
 	}
 	auto aligned_len = (len + page_offset + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
 
@@ -3950,18 +3973,23 @@ static int ProtectMemory(const void* addr, size_t len, int prot) {
 	if (!g_virtual_ranges->QuerySpan(aligned_addr, aligned_len, &old_ranges) ||
 	    std::any_of(old_ranges.begin(), old_ranges.end(),
 	                [](const auto& range) { return !IsCommittedRangeType(range.type); })) {
-		EXIT("memory-protection range is not fully mapped: addr=0x%016" PRIx64 " size=0x%016" PRIx64
-		     "\n",
-		     aligned_addr, aligned_len);
+		// A span that contains a Reserved sub-range, or nothing at all. FreeBSD answers EACCES
+		// for an mprotect over unmapped pages, and so does UnmapMemoryRange here.
+		printf("Memory: memory-protection range is not fully mapped: addr=0x%016" PRIx64
+		       " size=0x%016" PRIx64 "\n",
+		       aligned_addr, aligned_len);
+		return KERNEL_ERROR_EACCES;
 	}
 	const auto old_mode = static_cast<VirtualMemory::Mode>(
 	    old_ranges.front().protection & (PROT_CPU_READ | PROT_CPU_WRITE | PROT_CPU_EXEC));
 	bool ok = g_guest_address_space->Protect(aligned_addr, aligned_len, mode);
 
 	if (!ok) {
-		EXIT("host memory-protection update failed: addr=0x%016" PRIx64 " size=0x%016" PRIx64
-		     " prot=0x%08x\n",
-		     aligned_addr, aligned_len, prot);
+		// The host refused the protection change; the guest range keeps its old protection.
+		printf("Memory: host memory-protection update failed: addr=0x%016" PRIx64
+		       " size=0x%016" PRIx64 " prot=0x%08x\n",
+		       aligned_addr, aligned_len, prot);
+		return KERNEL_ERROR_EACCES;
 	}
 	for (const auto& old_range: old_ranges) {
 		if (old_range.type == VirtualRangeType::Direct) {
@@ -4217,11 +4245,11 @@ int KYTY_SYSV_ABI KernelMemoryPoolCommit(void* addr, size_t len, int type, int p
 	std::vector<PooledMemory::Mapping> mapped;
 	auto                               rollback = [&]() {
 		if (!UnmapPooledBackingTransactional(mapped, mode)) {
-			EXIT("failed to roll back pooled-memory backing maps\n");
+			printf("Memory: failed to roll back pooled-memory backing maps\n");
 		}
 		GpuAccessMode rollback_gpu_mode = GpuAccessMode::NoAccess;
 		if (!g_pooled_memory->Release(vaddr, len, &rollback_gpu_mode)) {
-			EXIT("failed to release pooled-memory rollback allocation\n");
+			printf("Memory: failed to release pooled-memory rollback allocation\n");
 		}
 	};
 
@@ -4283,14 +4311,16 @@ static int DecommitMemoryPoolRange(uint64_t vaddr, size_t len) {
 		return KERNEL_ERROR_EACCES;
 	}
 	if (!UnmapPooledBackingTransactional(mappings, mode)) {
-		EXIT("pooled-memory backing transaction failed after GPU unmap: addr=0x%016" PRIx64
-		     " size=0x%016" PRIx64 "\n",
-		     vaddr, len);
+		printf("Memory: pooled-memory backing transaction failed after GPU unmap: addr=0x%016" PRIx64
+		       " size=0x%016" PRIx64 "\n",
+		       vaddr, len);
+		return KERNEL_ERROR_EACCES;
 	}
 
 	GpuAccessMode gpu_mode = GpuAccessMode::NoAccess;
 	if (!g_pooled_memory->Release(vaddr, len, &gpu_mode)) {
-		EXIT("failed to release decommitted pooled-memory range\n");
+		printf("Memory: failed to release decommitted pooled-memory range\n");
+		return KERNEL_ERROR_EACCES;
 	}
 
 	g_virtual_ranges->Remove(vaddr, len);

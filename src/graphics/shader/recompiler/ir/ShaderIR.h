@@ -286,7 +286,9 @@ static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 50u);
 
 struct PushData {
 	static constexpr uint32_t DwordCount = 32;
-	static constexpr uint32_t MeshDrawDwordCount = 6;
+	// Mesh draws reserve seven dwords: index_count, vertex offset, first
+	// instance, index element size, index address, and the slice base group.
+	static constexpr uint32_t        MeshDrawDwordCount = 7;
 	static constexpr uint32_t NoStart    = UINT32_MAX;
 	std::array<uint32_t, DwordCount> dwords {};
 

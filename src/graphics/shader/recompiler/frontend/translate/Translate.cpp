@@ -1077,8 +1077,13 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				return entry_ir.ISub(lhs, minimum(lhs, rhs));
 			};
 			const auto local = builtin(IR::StageInputKind::LocalInvocationIndex);
-			const auto primitive_chunk = entry_ir.IMul(builtin(IR::StageInputKind::WorkgroupId, 0),
-			                                           u32(mesh.primitives_per_group));
+			// draw(6) carries the dispatch's base workgroup so sliced dispatches
+			// (see MeshDispatchSlice) cover the same global primitive range as a
+			// single oversized draw, keeping fan centers, strip winding and index
+			// math consistent across slices.
+			const auto primitive_chunk =
+			    entry_ir.IMul(entry_ir.IAdd(builtin(IR::StageInputKind::WorkgroupId, 0), draw(6)),
+			                  u32(mesh.primitives_per_group));
 			const auto step  = u32(mesh.InputPrimitiveStep());
 			const auto size  = u32(mesh.InputPrimitiveSize());
 			const auto chunk = entry_ir.IMul(primitive_chunk, step);

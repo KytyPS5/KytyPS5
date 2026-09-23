@@ -415,13 +415,7 @@ add_executable(per_vertex_transform_tests EXCLUDE_FROM_ALL
 target_include_directories(per_vertex_transform_tests PRIVATE ${inc_headers})
 target_link_libraries(per_vertex_transform_tests common fmt::fmt xxhash)
 
-add_executable(per_vertex_gpu_execution_tests EXCLUDE_FROM_ALL
-	"${KYTY_TESTS_DIR}/PerVertexGpuExecutionTests.cpp"
-	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/perVertexTransform.cpp"
-	"${per_vertex_shader_header}"
-)
-target_include_directories(per_vertex_gpu_execution_tests PRIVATE ${inc_headers})
-target_link_libraries(per_vertex_gpu_execution_tests Vulkan::Headers spirv-tools common fmt::fmt xxhash)
+add_kyty_full_emulator_test(per_vertex_gpu_execution_tests "${KYTY_TESTS_DIR}/PerVertexGpuExecutionTests.cpp")
 
 add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ScalarProvenanceTests.cpp"

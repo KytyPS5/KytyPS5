@@ -25,6 +25,8 @@ struct PerVertexLayout {
 
 bool DerivePerVertexLayout(const std::string& vs_source, const std::string& ps_source,
                            PerVertexLayout& layout, std::map<uint32_t, std::string>& vs_param_vars);
+bool DerivePerVertexVertexLayout(const std::string& vs_source, PerVertexLayout& layout,
+                                 std::map<uint32_t, std::string>& vs_param_vars);
 std::string GenerateReplayVertexSpvasm(const PerVertexLayout& layout);
 std::string LowerVertexToCompute(const std::string& source, const PerVertexLayout& layout,
                                  const std::map<uint32_t, std::string>& vs_param_vars);

@@ -46,9 +46,8 @@ static std::string CompleteEntryPointInterface(const std::string& source) {
 	return std::regex_replace(source, entry_re, "$1" + interfaces);
 }
 
-bool DerivePerVertexLayout(const std::string& vs_source, const std::string& ps_source,
-                           PerVertexLayout&                 layout,
-                           std::map<uint32_t, std::string>& vs_param_vars) {
+bool DerivePerVertexVertexLayout(const std::string& vs_source, PerVertexLayout& layout,
+                                 std::map<uint32_t, std::string>& vs_param_vars) {
 	std::regex var_re(R"(^\s*(%\S+)\s*=\s*OpVariable\s+%\S+\s+Output\s*$)", kMultilineRegex);
 	std::set<std::string> vs_outputs;
 	for (auto it = std::sregex_iterator(vs_source.begin(), vs_source.end(), var_re);
@@ -93,7 +92,13 @@ bool DerivePerVertexLayout(const std::string& vs_source, const std::string& ps_s
 	if (layout.location_to_slot.find(31) != layout.location_to_slot.end()) {
 		return false;
 	}
+	return true;
+}
 
+bool DerivePerVertexLayout(const std::string& vs_source, const std::string& ps_source,
+                           PerVertexLayout&                 layout,
+                           std::map<uint32_t, std::string>& vs_param_vars) {
+	if (!DerivePerVertexVertexLayout(vs_source, layout, vs_param_vars)) return false;
 	std::regex pv_re(R"(^\s*OpDecorate\s+(%\S+)\s+PerVertexKHR\s*$)", kMultilineRegex);
 	std::vector<std::string> pv_vars;
 	for (auto it = std::sregex_iterator(ps_source.begin(), ps_source.end(), pv_re);

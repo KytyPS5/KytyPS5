@@ -12,7 +12,9 @@ void RenderExecutor::ExecutePerVertexPrototype(uint64_t submit_id, CommandBuffer
 	        topology != vk::PrimitiveTopology::eTriangleList || primitive_restart_enable ||
 	        draw.index_count % 3 != 0);
 	EXIT_IF(vs.logical_stage != ShaderType::Vertex || vs.buffers_num != 1 ||
-	        vs.resources_num == 0 || vs.resources_num > 12 || HasShaderBufferWrites(vs.stage));
+	        vs.resources_num == 0 || vs.resources_num > 12);
+	const bool capture_has_writes = HasShaderBufferWrites(vs.stage);
+	EXIT_IF(capture_has_writes && !programs->native_capture);
 	const auto&    input     = vs.buffers[0];
 	const uint32_t num_attrs = vs.resources_num;
 	EXIT_IF(input.stride == 0 || input.fetch_index != 0 ||
@@ -240,7 +242,8 @@ void RenderExecutor::ExecutePerVertexPrototype(uint64_t submit_id, CommandBuffer
 	                       programs->capture_pipeline.pipeline_layout, 1, 1, &extra_set, 0,
 	                       nullptr);
 	cmd.bindPipeline(vk::PipelineBindPoint::eCompute, programs->capture_pipeline.pipeline);
-	cmd.dispatch(count, 1, 1);
+	cmd.dispatch(programs->native_capture ? (count + 63u) / 64u : count, 1, 1);
+	if (capture_has_writes) ShaderWriteBarrier(cmd, vk::PipelineStageFlagBits::eComputeShader);
 
 	// Barrier: Capture compute -> Graphics replay
 	vk::MemoryBarrier capture_barrier {};

@@ -9,15 +9,22 @@
 #include <vector>
 
 namespace Libs::Graphics {
+namespace ShaderRecompiler {
+struct CompileResult;
+struct CompileOptions;
+} // namespace ShaderRecompiler
 bool PerVertexPrototypeEnabled();
 bool HasPerVertexPrototypeInput(std::span<const uint32_t> words);
 bool DecodePerVertexPrototypeAttribute(Prospero::BufferFormat   format,
                                        std::span<const uint8_t> bytes,
                                        std::span<uint32_t, 4>   components);
-void RememberPerVertexPrototypeShader(ShaderType stage, const ShaderProgram& program,
-                                      std::span<const uint32_t> words);
+void RememberPerVertexPrototypeShader(const ShaderProgram&                    program,
+                                      const ShaderRecompiler::CompileResult&  result,
+                                      const ShaderRecompiler::CompileOptions& options,
+                                      uint32_t                                host_subgroup_size);
 
 struct PerVertexPrototypePrograms {
+	bool                            native_capture = false;
 	vk::ShaderModule                capture;
 	PipelineCache::GraphicsPrograms graphics;
 	vk::DescriptorSetLayout         extra_layout;

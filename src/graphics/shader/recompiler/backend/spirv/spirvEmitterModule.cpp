@@ -366,6 +366,11 @@ void DefineInputs(EmitterState& state) {
 	for (const auto& input: state.program.info.inputs) {
 		state.inputs.push_back({input});
 	}
+	if (state.vertex_capture != nullptr) {
+		state.inputs = {
+		    {{IR::StageInputKind::WorkgroupId, 0, 3, "gl_WorkGroupID"}},
+		    {{IR::StageInputKind::LocalInvocationIndex, 0, 1, "gl_LocalInvocationIndex"}}};
+	}
 	if (state.lane_count == 2) {
 		const auto add_builtin = [&](IR::StageInputKind kind, uint32_t components,
 		                             const char* name) {
@@ -484,14 +489,29 @@ void DefineOutputs(EmitterState& state) {
 		DefineMeshOutputs(state);
 		return;
 	}
-	if (state.program.stage == ShaderType::Vertex && clip_distance_count + cull_distance_count < 8u &&
-	    std::ranges::any_of(state.outputs, [](const OutputBinding& output) {
-		    return output.kind == IR::StageOutputKind::Position;
-	    })) {
+	if (state.program.stage == ShaderType::Vertex &&
+	    clip_distance_count + cull_distance_count < 8u &&
+	    std::ranges::any_of(
+	        state.outputs,
+	        [](const OutputBinding& output) {
+		        return output.kind == IR::StageOutputKind::Position;
+	        })) {
 		// Reserve one plane for the enabled PA_CL_CLIP_CNTL clipping-error cull.
 		state.invalid_position_clip_distance = clip_distance_count++;
 		state.outputs.push_back({{IR::StageOutputKind::ClipDistance,
 		                          state.invalid_position_clip_distance, 0, "gl_ClipDistance"}});
+	}
+	if (state.vertex_capture != nullptr) {
+		EXIT_IF(clip_distance_count > 1 || cull_distance_count != 0);
+		EXIT_IF((clip_distance_count != 0) != (state.vertex_capture->clip_slot != UINT32_MAX));
+		for (const auto& output: state.outputs) {
+			EXIT_IF(output.kind != IR::StageOutputKind::Position &&
+			        output.kind != IR::StageOutputKind::Parameter &&
+			        output.kind != IR::StageOutputKind::ClipDistance);
+			EXIT_IF(output.kind == IR::StageOutputKind::Parameter &&
+			        !state.vertex_capture->parameter_slots.contains(output.location));
+		}
+		return;
 	}
 	const auto BuiltIn = [&](uint32_t& variable, uint32_t type, const char* name,
 	                         spv::BuiltIn builtin) {
@@ -579,6 +599,7 @@ void DefineModule(EmitterState& state) {
 	DefineOutputs(state);
 	DefineTessellationInterfaces(state);
 	DefineDescriptors(state);
+	if (state.vertex_capture != nullptr) DefineVertexCapture(state);
 	if (state.requirements.function_lds) {
 		state.lds_variable = state.builder.AllocateId();
 	}
@@ -669,13 +690,16 @@ void DefineModule(EmitterState& state) {
 	// contract prevents host compilers from treating synthesized IEEE values as finite.
 	state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeSignedZeroInfNanPreserve,
 	                               32u);
-	if (const auto* cs = ShaderWorkgroupInput(state.program.stage, state.input_info)) {
-		uint32_t    local_x = state.requirements.compute_derivatives ? 2u : 1u;
-		uint32_t    local_y = state.requirements.compute_derivatives ? 2u : 1u;
-		uint32_t    local_z = 1u;
-		local_x             = cs->threads_num[0] != 0u ? cs->threads_num[0] : local_x;
-		local_y             = cs->threads_num[1] != 0u ? cs->threads_num[1] : local_y;
-		local_z             = cs->threads_num[2] != 0u ? cs->threads_num[2] : local_z;
+	if (state.vertex_capture != nullptr) {
+		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeLocalSize,
+		                               64u / state.lane_count, 1u, 1u);
+	} else if (const auto* cs = ShaderWorkgroupInput(state.program.stage, state.input_info)) {
+		uint32_t local_x = state.requirements.compute_derivatives ? 2u : 1u;
+		uint32_t local_y = state.requirements.compute_derivatives ? 2u : 1u;
+		uint32_t local_z = 1u;
+		local_x          = cs->threads_num[0] != 0u ? cs->threads_num[0] : local_x;
+		local_y          = cs->threads_num[1] != 0u ? cs->threads_num[1] : local_y;
+		local_z          = cs->threads_num[2] != 0u ? cs->threads_num[2] : local_z;
 		if (state.lane_count == 2) {
 			local_x = ((local_x * local_y * local_z + 63u) / 64u) * 32u;
 			local_y = local_z = 1u;

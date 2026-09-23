@@ -8,6 +8,8 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
+#include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "kytyGitVersion.h"
 #include "per_vertex_unpack_spv.h"
 
@@ -54,6 +56,7 @@ struct Original {
 	ShaderType            stage;
 	bool                  per_vertex;
 	std::vector<uint32_t> words;
+	std::vector<uint32_t> capture_words;
 };
 std::map<uint64_t, Original>                                        originals;
 std::map<std::pair<uint64_t, uint64_t>, PerVertexPrototypePrograms> variants;
@@ -142,12 +145,52 @@ bool DecodePerVertexPrototypeAttribute(Prospero::BufferFormat   format,
 	return true;
 }
 
-void RememberPerVertexPrototypeShader(ShaderType stage, const ShaderProgram& program,
-                                      std::span<const uint32_t> words) {
+void RememberPerVertexPrototypeShader(const ShaderProgram&                    program,
+                                      const ShaderRecompiler::CompileResult&  result,
+                                      const ShaderRecompiler::CompileOptions& options,
+                                      uint32_t                                host_subgroup_size) {
 	if (!PerVertexPrototypeEnabled()) return;
-	const bool per_vertex = stage == ShaderType::Pixel && HasPerVertexPrototypeInput(words);
+	const auto  stage      = options.stage;
+	const auto& words      = result.spirv;
+	const bool  per_vertex = stage == ShaderType::Pixel && HasPerVertexPrototypeInput(words);
 	if (stage == ShaderType::Vertex || per_vertex) {
-		originals.emplace(program.id, Original {stage, per_vertex, {words.begin(), words.end()}});
+		auto [it, inserted] =
+		    originals.emplace(program.id, Original {stage, per_vertex, words, {}});
+		if (!inserted || stage != ShaderType::Vertex) return;
+		const auto& vs = *options.input_info.vertex;
+		using namespace ShaderRecompiler;
+		// Keep unsupported capture interfaces on the existing guarded prototype path.
+		if ((host_subgroup_size != 32 && host_subgroup_size != 64) || vs.buffers_num != 1 ||
+		    vs.resources_num <= 0 || vs.resources_num > 12 ||
+		    std::ranges::any_of(result.program.info.inputs,
+		                        [&](const IR::StageInput& input) {
+			                        return (input.kind != IR::StageInputKind::VertexIndex &&
+			                                input.kind != IR::StageInputKind::InstanceIndex &&
+			                                input.kind != IR::StageInputKind::Parameter) ||
+			                               (input.kind == IR::StageInputKind::Parameter &&
+			                                input.location >=
+			                                    static_cast<uint32_t>(vs.resources_num));
+		                        }) ||
+		    std::ranges::any_of(result.program.info.outputs,
+		                        [](const IR::StageOutput& output) {
+			                        return output.kind != IR::StageOutputKind::Position &&
+			                               output.kind != IR::StageOutputKind::Parameter;
+		                        }) ||
+		    std::ranges::any_of(result.program.memory_info, [](const IR::MemoryInfo& memory) {
+			    return memory.kind == IR::ResourceKind::Lds;
+		    }))
+			return;
+		spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+		std::string          vs_source;
+		EXIT_IF(!tools.Disassemble(words, &vs_source, SPV_BINARY_TO_TEXT_OPTION_FRIENDLY_NAMES));
+		PerVertexLayout                 layout;
+		std::map<uint32_t, std::string> params;
+		if (!DerivePerVertexVertexLayout(vs_source, layout, params)) return;
+		const Spirv::VertexCaptureInfo capture {
+		    host_subgroup_size, static_cast<uint32_t>(vs.resources_num), layout.record_stride_vec4,
+		    layout.clip_slot, layout.location_to_slot};
+		it->second.capture_words = Spirv::EmitProgram(result.program, options.input_info, &capture);
+		EXIT_IF(!tools.Validate(it->second.capture_words));
 	}
 }
 
@@ -212,8 +255,11 @@ const PerVertexPrototypePrograms* GetPerVertexPrototypePrograms(
 	const auto key = std::pair {programs.vertex[0].id, programs.pixel.id};
 	if (auto it = variants.find(key); it != variants.end()) return &it->second;
 
+	// Include the capture variant (and its host wave width) in the persistent cache identity.
+	const auto& capture_source =
+	    vs->second.capture_words.empty() ? vs->second.words : vs->second.capture_words;
 	const uint64_t vs_hash =
-	    XXH3_64bits(vs->second.words.data(), vs->second.words.size() * sizeof(uint32_t));
+	    XXH3_64bits(capture_source.data(), capture_source.size() * sizeof(uint32_t));
 	const uint64_t ps_hash =
 	    XXH3_64bits(ps->second.words.data(), ps->second.words.size() * sizeof(uint32_t));
 	const auto        title_id           = PipelineCacheTitleId();
@@ -256,12 +302,15 @@ const PerVertexPrototypePrograms* GetPerVertexPrototypePrograms(
 			return nullptr;
 		}
 
-		std::string cap_dis    = LowerVertexToCompute(vs_dis, layout, vs_param_vars);
 		std::string frag_dis   = LowerFragmentToBufferReplay(ps_dis, layout);
 		std::string replay_dis = GenerateReplayVertexSpvasm(layout);
 
-		EXIT_IF(
-		    !tools.Assemble(cap_dis, &cap_words, SPV_TEXT_TO_BINARY_OPTION_PRESERVE_NUMERIC_IDS));
+		cap_words = vs->second.capture_words;
+		if (cap_words.empty()) {
+			const auto cap_dis = LowerVertexToCompute(vs_dis, layout, vs_param_vars);
+			EXIT_IF(!tools.Assemble(cap_dis, &cap_words,
+			                        SPV_TEXT_TO_BINARY_OPTION_PRESERVE_NUMERIC_IDS));
+		}
 		EXIT_IF(
 		    !tools.Assemble(frag_dis, &frag_words, SPV_TEXT_TO_BINARY_OPTION_PRESERVE_NUMERIC_IDS));
 		EXIT_IF(!tools.Assemble(replay_dis, &replay_words,
@@ -282,6 +331,7 @@ const PerVertexPrototypePrograms* GetPerVertexPrototypePrograms(
 	}
 
 	PerVertexPrototypePrograms value {};
+	value.native_capture            = !vs->second.capture_words.empty();
 	value.graphics                  = programs;
 	value.layout                    = layout;
 	value.capture                   = CompileSPV(cap_words, graphics.device);

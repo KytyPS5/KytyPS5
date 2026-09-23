@@ -26,6 +26,10 @@
 
 #include "graphics/host_gpu/renderer/perVertexEmbeddedSpv.h"
 #include "graphics/host_gpu/renderer/perVertexTransform.h"
+#include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
+#include "graphics/shader/recompiler/ir/IREmitter.h"
+#include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "kytyGitVersion.h"
 #include "per_vertex_unpack_spv.h"
 
@@ -374,7 +378,8 @@ static_assert(sizeof(PushConstants) == 128);
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    const bool wave64_capture_only = argc == 2 && std::strcmp(argv[1], "--wave64-capture-only") == 0;
     std::printf("=== Starting Rigorous PerVertex GPU Execution Proof ===\n");
     Device dev = InitDevice();
     std::printf("per-vertex-gpu-tests: Initialized Vulkan device on Apple Silicon GPU\n");
@@ -393,7 +398,7 @@ int main() {
     GpuBuffer idx_buf_16 = CreateBuffer(dev, sizeof(kIndices16), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     std::memcpy(idx_buf_16.mapped, kIndices16, sizeof(kIndices16));
 
-    constexpr uint32_t kMaxInvocations = 16;
+    const uint32_t kMaxInvocations = wave64_capture_only ? 1344u : 64u;
     GpuBuffer id_buf = CreateBuffer(dev, kMaxInvocations * sizeof(uint32_t) * 2, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     GpuBuffer attr_buf = CreateBuffer(dev, kMaxInvocations * 12 * sizeof(float) * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
 
@@ -1055,7 +1060,7 @@ OpFunctionEnd
 
     // 1. Create Captured Buffer for 3 vertices (1 triangle)
     // Stride is 3 vec4 = 48 bytes per vertex. Total 144 bytes.
-    const size_t captured_size = 3 * layout.record_stride_vec4 * sizeof(float) * 4;
+    const size_t captured_size = kMaxInvocations * layout.record_stride_vec4 * sizeof(float) * 4;
     GpuBuffer captured_buf = CreateBuffer(dev, captured_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
 
     // 2. Compute Pipeline for Capture
@@ -1220,6 +1225,129 @@ OpFunctionEnd
         if (std::bit_cast<uint32_t>(vtx_record[8]) != 0x3f800000u) Fail("Capture Clip mismatch");
     }
     std::printf("PASS: Captured Buffer verified bit-for-bit against CPU model across 3 vertices\n");
+
+    if (wave64_capture_only) {
+        using namespace Libs::Graphics;
+        using namespace ShaderRecompiler;
+        using IR::Value;
+        using O = IR::ValueOpcode;
+        IR::Program program;
+        program.stage = ShaderType::Vertex;
+        program.wave_size = 64;
+        program.srt_plan_complete = program.resource_tracking_complete = program.shader_info_complete = true;
+        program.block_storage.push_back(std::make_unique<IR::Block>());
+        program.blocks.push_back(program.block_storage.back().get());
+        program.block_info.emplace_back();
+        program.info.inputs = {{IR::StageInputKind::VertexIndex}, {IR::StageInputKind::InstanceIndex}, {IR::StageInputKind::Parameter, 0, 4}};
+        program.info.outputs = {{IR::StageOutputKind::Position}, {IR::StageOutputKind::Parameter, 0, 0}};
+        program.info.buffers.push_back({.written = true, .atomic = true});
+        program.memory_info.push_back({.kind = IR::ResourceKind::Buffer, .offen = true});
+        program.export_info = {{.kind = IR::ExportTargetKind::Position, .en = 15},
+                               {.kind = IR::ExportTargetKind::Parameter, .en = 15}};
+        IR::IREmitter emit(program.blocks.front());
+        const auto vertex = emit.Emit(O::GetBuiltin, {Value(static_cast<uint32_t>(IR::StageInputKind::VertexIndex)), Value(0u)});
+        const auto instance = emit.Emit(O::GetBuiltin, {Value(static_cast<uint32_t>(IR::StageInputKind::InstanceIndex)), Value(0u)});
+        const auto ballot = emit.Emit(O::Ballot, {Value(true)});
+        const auto low = emit.Emit(O::CompositeExtractU32x4, {ballot, Value(0u)});
+        const auto high = emit.Emit(O::CompositeExtractU32x4, {ballot, Value(1u)});
+        const auto has_high = emit.Emit(O::INotEqual32, {high, Value(0u)});
+        const auto full_high = emit.Emit(O::IEqual32, {high, Value(UINT32_MAX)});
+        const auto partial_lane = emit.Emit(O::SelectU32, {has_high, Value(32u), Value(0u)});
+        const auto source_lane = emit.Emit(O::SelectU32, {full_high, Value(63u), partial_lane});
+        const auto from_other_half = emit.Emit(O::ReadLane, {vertex, source_lane});
+        const auto resource = emit.Emit(O::GetBufferResource, {Value(0u), Value(0u), Value(0u), Value(0u)}, 0u);
+        emit.Emit(O::BufferAtomicUMax32, {resource, Value(0u), Value(0u), Value(0u), vertex, Value(true)}, IR::MemoryFlags{0});
+        // Literal true models a shader restoring all EXEC bits, including padded lanes.
+        emit.Emit(O::BufferAtomicIAdd32, {resource, Value(0u), Value(4u), Value(0u), Value(1u), Value(true)}, IR::MemoryFlags{0});
+        std::array<Value, 4> position;
+        for (uint32_t c = 0; c < 4; c++) position[c] = emit.Emit(O::GetAttribute, {Value(0u), Value(c)});
+        const auto pos = emit.Emit(O::CompositeConstructU32x4, {position[0], position[1], position[2], position[3]});
+        emit.Emit(O::SetAttribute, {pos, Value(true)}, IR::ExportFlags{0});
+        const auto param = emit.Emit(O::CompositeConstructU32x4, {from_other_half, low, high, instance});
+        emit.Emit(O::SetAttribute, {param, Value(true)}, IR::ExportFlags{1});
+        IR::AllocateBindings(program);
+        ShaderVertexInputInfo vertex_info {};
+        const Spirv::VertexCaptureInfo capture {.host_subgroup_size = 32, .num_attributes = 2,
+                                               .record_stride_vec4 = 3, .clip_slot = 2,
+                                               .parameter_slots = {{0, 1}}};
+        auto wave_capture_words = Spirv::EmitProgram(program, {.vertex = &vertex_info}, &capture);
+        if (!tools.Validate(wave_capture_words)) Fail("native wave64 capture SPIR-V");
+        auto native64_capture = capture;
+        native64_capture.host_subgroup_size = 64;
+        if (!tools.Validate(Spirv::EmitProgram(program, {.vertex = &vertex_info}, &native64_capture))) Fail("native subgroup64 capture SPIR-V");
+
+        VkShaderModuleCreateInfo wave_sm_info {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        wave_sm_info.codeSize = wave_capture_words.size() * sizeof(uint32_t);
+        wave_sm_info.pCode = wave_capture_words.data();
+        VkShaderModule wave_module = VK_NULL_HANDLE;
+        Check(vk_create_shader_module(dev.device, &wave_sm_info, nullptr, &wave_module), "create native wave64 capture module");
+        VkComputePipelineCreateInfo wave_pipe_info = cap_pipe_info;
+        wave_pipe_info.stage.module = wave_module;
+        VkPipeline wave_pipeline = VK_NULL_HANDLE;
+        Check(vk_create_compute_pipelines(dev.device, VK_NULL_HANDLE, 1, &wave_pipe_info, nullptr, &wave_pipeline), "create native wave64 capture pipeline");
+
+        for (const uint32_t count : {1u, 16u, 31u, 32u, 33u, 63u, 64u, 65u, 1296u}) {
+            auto* ids = static_cast<uint32_t*>(id_buf.mapped);
+            auto* attrs = static_cast<uint32_t*>(attr_buf.mapped);
+            for (uint32_t lane = 0; lane < kMaxInvocations; ++lane) {
+                ids[lane * 2] = 100 + lane;
+                ids[lane * 2 + 1] = 10000 + lane;
+                for (uint32_t c = 0; c < 4; c++) attrs[lane * 8 + c] = std::bit_cast<uint32_t>(float(lane * 4 + c + 1));
+            }
+            std::memset(captured_buf.mapped, 0xcd, captured_buf.size);
+            std::memset(resource_buf.mapped, 0, resource_buf.size);
+            // ArrayLength must describe the draw, not the capacity of the allocation.
+            const VkDescriptorBufferInfo ids_range {id_buf.buffer, 0, count * 8u};
+            VkWriteDescriptorSet ids_write = extra_writes[2];
+            ids_write.pBufferInfo = &ids_range;
+            vk_update_descriptor_sets(dev.device, 1, &ids_write, 0, nullptr);
+            VkCommandBufferBeginInfo begin {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+            Check(vk_begin_command_buffer(cmd, &begin), "begin native wave64 capture");
+            vk_cmd_bind_pipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, wave_pipeline);
+            vk_cmd_bind_descriptor_sets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cap_pipeline_layout, 0, 1, &resource_set, 0, nullptr);
+            vk_cmd_bind_descriptor_sets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, cap_pipeline_layout, 1, 1, &extra_set, 0, nullptr);
+            const uint32_t memory_offset = 0;
+            vk_cmd_push_constants(cmd, cap_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(memory_offset), &memory_offset);
+            vk_cmd_dispatch(cmd, (count + 63u) / 64u, 1, 1);
+            VkMemoryBarrier readback {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+            readback.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            readback.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+            vk_cmd_pipeline_barrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &readback, 0, nullptr, 0, nullptr);
+            Check(vk_end_command_buffer(cmd), "end native wave64 capture");
+            VkSubmitInfo submit {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+            submit.commandBufferCount = 1;
+            submit.pCommandBuffers = &cmd;
+            Check(vk_queue_submit(dev.queue, 1, &submit, VK_NULL_HANDLE), "submit native wave64 capture");
+            Check(vk_queue_wait_idle(dev.queue), "wait native wave64 capture");
+
+            const auto* atomic = static_cast<const uint32_t*>(resource_buf.mapped);
+            if (atomic[0] != 100 + count - 1 || atomic[1] != count) {
+                std::fprintf(stderr, "count=%u atomic max=%u count=%u\n", count, atomic[0], atomic[1]);
+                Fail("capture atomics include invalid lanes or omit a half");
+            }
+            const auto* data = static_cast<const uint32_t*>(captured_buf.mapped);
+            for (uint32_t lane = 0; lane < count; ++lane) {
+                const uint32_t wave_base = lane & ~63u;
+                const uint32_t active = std::min(64u, count - wave_base);
+                const uint64_t mask = active == 64 ? UINT64_MAX : (uint64_t{1} << active) - 1;
+                const uint32_t source = active == 64 ? 63u : active > 32 ? 32u : 0u;
+                const uint32_t expected[] {100 + wave_base + source, uint32_t(mask), uint32_t(mask >> 32), 10000 + lane};
+                for (uint32_t c = 0; c < 4; c++) {
+                    if (data[lane * 12 + c] != attrs[lane * 8 + c] || data[lane * 12 + 4 + c] != expected[c]) {
+                        std::fprintf(stderr, "count=%u lane=%u component=%u position=%08x/%08x param=%08x/%08x\n",
+                                     count, lane, c, data[lane * 12 + c], attrs[lane * 8 + c], data[lane * 12 + 4 + c], expected[c]);
+                        Fail("native capture attributes, IDs, ballot, or cross-half shuffle");
+                    }
+                }
+                if (data[lane * 12 + 8] != 0) Fail("native capture valid-position clip distance");
+            }
+            for (uint32_t i = count * 12; i < kMaxInvocations * 12; i++) {
+                if (data[i] != 0xcdcdcdcdu) Fail("native capture wrote beyond the draw");
+            }
+            std::printf("PASS: native Wave64 capture count=%u, cross-half shuffle, ballot, IDs, attributes, atomics, tail guard\n", count);
+        }
+        return 0;
+    }
 
     // 3. Setup Render Pass, Framebuffer, and Graphics Pipeline to verify Replay and Fragment
     VkAttachmentDescription color_att {};

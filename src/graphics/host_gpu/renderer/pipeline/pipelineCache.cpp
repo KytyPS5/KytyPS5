@@ -251,14 +251,14 @@ struct PipelineCache::ProgramCache {
 		}
 		DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
 
-		const auto module = CompileSPV(result.spirv, device);
+		const auto module = CompileSPV(result.spirv, graphics.device);
 		EXIT_IF(module == nullptr);
 		if (options.dump_ir) {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
 			     static_cast<uint64_t>(result.spirv.size()), options.wave_size);
 		}
 		const ShaderProgram handle {.id = ++next_shader_id, .module = module};
-		RememberPerVertexPrototypeShader(options.stage, handle, result.spirv);
+		RememberPerVertexPrototypeShader(handle, result, options, graphics.subgroup_size);
 		return {
 		    .specialization = std::move(specialization),
 		    .program        = std::move(result.program).TakeCompiledInfo(),
@@ -380,26 +380,26 @@ struct PipelineCache::ProgramCache {
 		return permutation.handle;
 	}
 
-	explicit ProgramCache(vk::Device device): device(device) {
+	explicit ProgramCache(GraphicContext& graphics): graphics(graphics) {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 	}
 	~ProgramCache() {
 		for (const auto& [key, entry]: programs) {
 			(void)key;
 			for (const auto& permutation: entry.permutations) {
-				device.destroyShaderModule(permutation.handle.module, nullptr);
+				graphics.device.destroyShaderModule(permutation.handle.module, nullptr);
 			}
 		}
 	}
 
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
 	ProgramKey                                                  lookup_key;
-	vk::Device                                                  device;
+	GraphicContext&                                             graphics;
 	uint64_t                                                    next_shader_id = 0;
 };
 
 PipelineCache::PipelineCache(GraphicContext& graphics)
-    : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device)) {
+    : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics)) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
 }

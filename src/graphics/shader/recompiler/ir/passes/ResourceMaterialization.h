@@ -39,8 +39,7 @@ struct ResourceSpecialization {
 // its values and is independent of the translated shader CFG.
 ResourcePlan ExtractResourcePlan(const Program& program);
 
-// Resolves and specializes the immutable resource plan in one transaction. On failure both
-// destinations are unchanged.
+// Refreshes cached resources and specialization in place. A failed refresh must not be used.
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
 

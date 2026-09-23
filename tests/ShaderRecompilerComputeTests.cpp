@@ -347,7 +347,7 @@ struct TextureCacheTestAccess {
   static void AssociateStencil(TextureCache &cache, ImageId depth,
                                GuestRange stencil) {
     std::lock_guard lock(cache.m_lock);
-    cache.AssociateStencil(depth, stencil);
+    (void)cache.AssociateStencil(depth, stencil);
   }
 
   static void SetLinearReadback(TextureCache &cache, bool enabled) {
@@ -1241,13 +1241,13 @@ std::array<u32, 64> MakeNativeUserData(const std::array<u32, 64> *source) {
   return data;
 }
 
-bool ReadTestMemory(void *userdata, uint64_t address, u32 *value) {
+bool ReadTestMemory(void *userdata, uint64_t address, std::span<u32> values) {
   const auto *data = static_cast<const std::vector<u32> *>(userdata);
-  if (data == nullptr || value == nullptr || address % 4u != 0 ||
-      address / 4u >= data->size()) {
+  if (data == nullptr || address % 4u != 0 || values.size() > data->size() ||
+      address / 4u > data->size() - values.size()) {
     return false;
   }
-  *value = (*data)[address / 4u];
+  std::copy_n(data->begin() + address / 4u, values.size(), values.begin());
   return true;
 }
 
@@ -1326,12 +1326,15 @@ void CheckRectListShaders() {
 
   ShaderVertexInputInfo vertex{};
   ShaderRecompiler::IR::CompiledShaderInfo vertex_program{.param_export_mask = 1u};
+  ShaderRecompiler::IR::ResourceSnapshot empty_snapshot;
   vertex.stage.program = &vertex_program;
+  vertex.stage.resources = &empty_snapshot;
   ShaderPixelInputInfo pixel{};
   pixel.input_num = 2;
   pixel.interpolator_settings[0] = 0x400u;
   pixel.interpolator_settings[1] = 0;
   pixel.stage.program = &program;
+  pixel.stage.resources = &empty_snapshot;
   std::vector<uint32_t> perspective_specialization;
   BuildStageStaticKey(pixel, perspective_specialization);
   pixel.ps_no_perspective = true;
@@ -1968,10 +1971,12 @@ public:
     pixel_program.bindings.push_data_start_dword = 0;
     pixel_program.bindings.user_data_registers = {0, 1};
     pixel_program.bindings.memory_offset_dword = 2;
-    ShaderStageRuntime vertex_runtime{.program = &vertex_program};
-    vertex_runtime.resources.user_data = {0x11111111u, 0x22222222u};
-    ShaderStageRuntime pixel_runtime{.program = &pixel_program};
-    pixel_runtime.resources.user_data = {0x33333333u, 0x44444444u};
+    ShaderRecompiler::IR::ResourceSnapshot vertex_snapshot;
+    vertex_snapshot.user_data = {0x11111111u, 0x22222222u};
+    ShaderStageRuntime vertex_runtime{&vertex_program, &vertex_snapshot};
+    ShaderRecompiler::IR::ResourceSnapshot pixel_snapshot;
+    pixel_snapshot.user_data = {0x33333333u, 0x44444444u};
+    ShaderStageRuntime pixel_runtime{&pixel_program, &pixel_snapshot};
     auto vertex = context.GetRenderExecutor().PrepareBindings(vertex_runtime);
     auto pixel = context.GetRenderExecutor().PrepareBindings(pixel_runtime);
 
@@ -2225,7 +2230,7 @@ public:
     constexpr std::array<std::pair<MemoryUsage, uint64_t>, 4> utilities{{
         {MemoryUsage::Upload, 512ull << 20},
         {MemoryUsage::Stream, 64ull << 20},
-        {MemoryUsage::Download, 32ull << 20},
+        {MemoryUsage::Download, 64ull << 20},
         {MemoryUsage::DeviceLocal, 128ull << 20},
     }};
     std::array<vk::Buffer, utilities.size()> handles{};
@@ -2256,7 +2261,7 @@ public:
                 download_probe != nullptr && download_probe_offset == 0 &&
                 &cache.GetUtilityBuffer(MemoryUsage::Download) ==
                     fixed_download &&
-                fixed_download->Size() == (32ull << 20) &&
+                fixed_download->Size() == (64ull << 20) &&
                 fixed_download->Handle() == fixed_handle,
             "oversized download replaced or corrupted the fixed shared ring");
     fixed_download->Commit();
@@ -3511,7 +3516,7 @@ public:
   void CheckBufferCacheDirtyGarbageCollection() {
     constexpr const char *name = "BufferCacheDirtyGarbageCollection";
     constexpr uintptr_t base = 0x0000000200700000ull;
-    constexpr uint64_t allocation_size = 0x2400000;
+    constexpr uint64_t allocation_size = 0x5000000;
     constexpr uint64_t allocation_alignment = 0x10000;
     constexpr uint64_t first_offset = 0x100;
     constexpr uint64_t second_offset = 0x200;
@@ -3846,7 +3851,7 @@ public:
                   &BufferCacheTestAccess::DownloadBuffer(cache) ==
                       fixed_download &&
                   download.Handle() == fixed_download_handle &&
-                  download.Size() == (32ull << 20),
+                  download.Size() == (64ull << 20),
               "wrapped fault batch published incorrect disjoint ranges");
 
       constexpr uint64_t window_size = 512 * 1024;
@@ -4150,7 +4155,7 @@ public:
               "partial invalidation lost disjoint native bytes");
 
       constexpr uint64_t large_offset = 0x10000;
-      constexpr uint64_t large_size = 32ull << 20;
+      constexpr uint64_t large_size = 64ull << 20;
       constexpr uint32_t large_value = 0x5aa55aa5u;
       constexpr uint32_t large_stale = 0x12345678u;
       std::memcpy(memory + large_offset, &large_stale, sizeof(large_stale));
@@ -4187,7 +4192,7 @@ public:
                   &BufferCacheTestAccess::DownloadBuffer(cache) ==
                       fixed_download &&
                   fixed_download->Handle() == fixed_download_handle &&
-                  fixed_download->Size() == (32ull << 20),
+                  fixed_download->Size() == (64ull << 20),
               "image acquisition replaced the shared Buffer download stream");
       std::vector<uint32_t> large_published(large_size / sizeof(uint32_t));
       Require(name, "near-capacity Buffer publication contents",
@@ -4199,13 +4204,13 @@ public:
               "near-capacity Buffer GC did not publish its complete transfer");
 
       constexpr uint64_t grouped_first_offset = 0x10000;
-      constexpr uint64_t grouped_second_offset = 0x1200000;
-      constexpr uint64_t grouped_owner_size = 17ull * 1024 * 1024;
+      constexpr uint64_t grouped_second_offset = 0x2300000;
+      constexpr uint64_t grouped_owner_size = 33ull * 1024 * 1024;
       constexpr uint32_t grouped_first_value = 0x1122aabbu;
       constexpr uint32_t grouped_second_value = 0x3344ccddu;
       constexpr uint32_t grouped_stale = 0;
-      static_assert(grouped_owner_size < (32ull << 20) &&
-                    grouped_owner_size * 2 > (32ull << 20));
+      static_assert(grouped_owner_size < (64ull << 20) &&
+                    grouped_owner_size * 2 > (64ull << 20));
       Libs::LibKernel::Memory::WriteBacking(
           base + grouped_first_offset, &grouped_stale, sizeof(grouped_stale));
       Libs::LibKernel::Memory::WriteBacking(
@@ -4499,7 +4504,8 @@ public:
             "test HTile entries were not registered in their initial state");
 
     const auto MakeInput = [](uint64_t address, bool read, bool written,
-                              ShaderRecompiler::IR::CompiledShaderInfo &program) {
+                              ShaderRecompiler::IR::CompiledShaderInfo &program,
+                              ShaderRecompiler::IR::ResourceSnapshot &snapshot) {
       program.stage = ShaderType::Compute;
       ShaderRecompiler::IR::BufferResource resource{};
       resource.read = read;
@@ -4520,14 +4526,17 @@ public:
       std::copy_n(descriptor.fields, value.dword_count, value.dwords.begin());
       ShaderComputeInputInfo input{};
       input.stage.program = &program;
-      input.stage.resources.buffers.push_back(value);
+      snapshot.buffers.push_back(value);
+      input.stage.resources = &snapshot;
       return input;
     };
     auto &executor = context.GetRenderExecutor();
     auto &command = scheduler.Current();
     ShaderRecompiler::IR::CompiledShaderInfo read_only_program{};
+    ShaderRecompiler::IR::ResourceSnapshot read_only_snapshot;
     const auto read_only_input =
-        MakeInput(read_only_meta, true, false, read_only_program);
+        MakeInput(read_only_meta, true, false, read_only_program,
+                  read_only_snapshot);
     const bool read_only_consumed =
         RenderExecutorTestAccess::TryConsumeComputeMetaClear(
             executor, read_only_input, command);
@@ -4537,8 +4546,10 @@ public:
             "a metadata read-only dispatch changed logical clear state");
 
     ShaderRecompiler::IR::CompiledShaderInfo read_write_program{};
+    ShaderRecompiler::IR::ResourceSnapshot read_write_snapshot;
     const auto read_write_input =
-        MakeInput(read_write_meta, true, true, read_write_program);
+        MakeInput(read_write_meta, true, true, read_write_program,
+                  read_write_snapshot);
     const bool read_write_consumed =
         RenderExecutorTestAccess::TryConsumeComputeMetaClear(
             executor, read_write_input, command);
@@ -4548,8 +4559,10 @@ public:
             "a metadata read/modify/write dispatch was replaced by a clear");
 
     ShaderRecompiler::IR::CompiledShaderInfo write_only_program{};
+    ShaderRecompiler::IR::ResourceSnapshot write_only_snapshot;
     const auto write_only_input =
-        MakeInput(write_only_meta, false, true, write_only_program);
+        MakeInput(write_only_meta, false, true, write_only_program,
+                  write_only_snapshot);
     const bool write_only_consumed =
         RenderExecutorTestAccess::TryConsumeComputeMetaClear(
             executor, write_only_input, command);
@@ -8691,6 +8704,181 @@ public:
     return result;
   }
 
+  void CheckNativeIndirectDispatch() {
+    constexpr const char *name = "NativeIndirectDispatch";
+    constexpr uintptr_t base = 0x0000000204600000ull;
+    constexpr uint64_t allocation_size = 0x100000;
+    constexpr uint64_t case_size = 0x10000;
+    constexpr uint32_t sentinel = 0xa5a5a5a5u;
+    struct DispatchCase {
+      std::array<uint32_t, 3> dimensions;
+      uint32_t mode;
+      uint32_t expected_threads;
+      bool transfer = false;
+    };
+    constexpr std::array cases{
+        DispatchCase{{2, 1, 1}, 0x41u, 8},
+        DispatchCase{{0, 1, 1}, 0x41u, 0},
+        DispatchCase{{1, 0, 1}, 0x41u, 0},
+        DispatchCase{{1, 1, 0}, 0x41u, 0},
+        DispatchCase{{3, 1, 1}, 0x41u, 12, true},
+        DispatchCase{{8, 1, 1}, 0x61u, 8},
+    };
+
+    // Separate DWORD descriptors preserve two owners until the indirect argument
+    // range spans them. The consumer's output aliases the second owner.
+    std::vector<u32> writer;
+    for (u32 i = 0; i < 3; i++) {
+      writer.push_back(EncodeVop1(0x01u, 1, 12u + i));
+      writer.push_back(EncodeMubuf0(0x1cu, 0, false, false));
+      writer.push_back(EncodeMubuf1(1, i, 0));
+    }
+    AppendEnd(&writer);
+    std::vector<u32> consumer;
+    AppendVop3(&consumer, 0x346u, 1, 4, InlineU32(2), Vgpr(0));
+    consumer.push_back(EncodeVop2(0x25u, 2, InlineU32(1), 1));
+    consumer.push_back(EncodeVop2(0x1au, 1, InlineU32(2), 1));
+    consumer.push_back(EncodeMubuf0(0x1cu));
+    consumer.push_back(EncodeMubuf1(2, 0, 1));
+    AppendEnd(&consumer);
+    for (const auto *code : {&writer, &consumer}) {
+      ShaderMapUserData(reinterpret_cast<uint64_t>(code->data()),
+          {.type = Prospero::ShaderBinaryType::kCs,
+           .code_size_bytes = static_cast<uint32_t>(code->size() * sizeof(u32))});
+    }
+
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, case_size, 0, &direct_offset) == 0,
+            "indirect argument allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset, case_size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "indirect argument mapping failed");
+    std::memset(mapped, 0xa5, allocation_size);
+    const auto argument_address = [&](size_t index) {
+      return base + index * case_size +
+          (cases[index].transfer ? 0x200u : BufferCache::CACHING_PAGESIZE - 4u);
+    };
+    for (size_t i = 0; i < cases.size(); i++) {
+      std::memset(reinterpret_cast<void *>(argument_address(i)), 0, 12);
+    }
+
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      auto &scheduler = context.GetCommandScheduler();
+      auto &cache = context.GetBufferCache();
+      auto &shaders = processor.GetShCtx();
+      context.MapMemory(base, allocation_size);
+      const auto set_buffer = [&](u32 sgpr, uint64_t address, u32 bytes) {
+        ShaderBufferResource descriptor{};
+        descriptor.UpdateAddress48(address);
+        descriptor.fields[2] = bytes;
+        descriptor.fields[3] = DstSel(4, 5, 6, 7) |
+            (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u);
+        for (u32 i = 0; i < 4; i++) {
+          shaders.SetCsUserSgpr(sgpr + i, descriptor.fields[i],
+                               HW::UserSgprType::Unknown);
+        }
+      };
+      for (size_t index = 0; index < cases.size(); index++) {
+        const auto &test = cases[index];
+        const auto args = argument_address(index);
+        const auto output = base + index * case_size + BufferCache::CACHING_PAGESIZE + 0x100u;
+        if (test.transfer) {
+          for (u32 i = 0; i < 3; i++) {
+            auto [buffer, offset] = cache.ObtainBuffer(args + i * 4u, 4, true);
+            buffer->Fill(offset, 4, test.dimensions[i]);
+          }
+        } else {
+          shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(writer.data()),
+                               .num_thread_x = 1, .num_thread_y = 1, .num_thread_z = 1,
+                               .wave_size = 64, .user_sgpr = 15});
+          for (u32 i = 0; i < 3; i++) {
+            set_buffer(i * 4u, args + i * 4u, 4);
+            shaders.SetCsUserSgpr(12u + i, test.dimensions[i], HW::UserSgprType::Unknown);
+          }
+          processor.DispatchDirect(1, 1, 1, 0x41u);
+        }
+        std::array<u32, 3> stale{};
+        Require(name, "GPU-only argument write",
+                LibKernel::Memory::TryReadBacking(args, stale.data(), sizeof(stale)) &&
+                    stale == std::array<u32, 3>{},
+                "argument publication changed the CPU backing before indirect dispatch");
+        const auto first_owner = BufferCacheTestAccess::PageOwner(cache, args);
+        const auto second_owner = BufferCacheTestAccess::PageOwner(cache, args + 8u);
+        if (!test.transfer) {
+          Require(name, "separate argument owners",
+                  first_owner && second_owner && first_owner != second_owner,
+                  "the indirect argument merge fixture already shared one owner");
+        }
+
+        shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(consumer.data()),
+                             .num_thread_x = 4, .num_thread_y = 1, .num_thread_z = 1,
+                             .wave_size = 64, .user_sgpr = 4, .tgid_x_en = true});
+        set_buffer(0, output, 16u * sizeof(u32));
+        const auto tick = scheduler.CurrentTick();
+        if (test.transfer) {
+          const std::array<u32, 3> packet{static_cast<u32>(args),
+                                         static_cast<u32>(args >> 32u), test.mode};
+          Require(name, "absolute indirect packet",
+                  CpOpDispatchIndirect(processor, 0xc0021600u, packet.data(), 0, 0) == 3,
+                  "the absolute indirect packet was not consumed");
+        } else {
+          processor.SetDispatchIndirectArgsBaseAddress(base + index * case_size);
+          const std::array<u32, 2> packet{
+              static_cast<u32>(BufferCache::CACHING_PAGESIZE - 4u), test.mode};
+          Require(name, "offset indirect packet",
+                  CpOpDispatchIndirect(processor, 0xc0011600u, packet.data(), 0, 0) == 2,
+                  "the offset indirect packet was not consumed");
+        }
+        if (test.mode == 0x41u) {
+          Require(name, "asynchronous indirect dispatch", scheduler.CurrentTick() == tick,
+                  "workgroup-count arguments caused a host submission or readback");
+          if (!test.transfer) {
+            const auto merged = BufferCacheTestAccess::PageOwner(cache, args);
+            Require(name, "argument/output owner merge",
+                    merged && merged != first_owner && merged != second_owner &&
+                        merged == BufferCacheTestAccess::PageOwner(cache, output),
+                    "argument discovery did not merge the consumer's buffer owner");
+          }
+        }
+        cache.ReadMemory(output, 16u * sizeof(u32));
+        std::array<u32, 16> actual{};
+        Require(name, "output readback",
+                LibKernel::Memory::TryReadBacking(output, actual.data(), sizeof(actual)),
+                "consumer output could not be read back");
+        for (u32 i = 0; i < actual.size(); i++) {
+          const auto expected = i < test.expected_threads ? i + 1u : sentinel;
+          Require(name, "indirect invocation coverage", actual[i] == expected,
+                  "case " + std::to_string(index) + " word " + std::to_string(i) +
+                      " expected " + Hex(expected) + ", got " + Hex(actual[i]));
+        }
+      }
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "indirect argument mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "indirect argument allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckRenderExecutorDccFixedClearFloat() {
     constexpr const char *name = "RenderExecutorDccFixedClearFloat";
     constexpr uintptr_t base = 0x0000000204100000ull;
@@ -9767,7 +9955,7 @@ public:
   void CheckRenderExecutorStencilBindingDiscovery() {
     constexpr const char *name = "RenderExecutorStencilBindingDiscovery";
     constexpr uintptr_t base = 0x0000000203600000ull;
-    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint64_t allocation_size = 0x1000000;
     constexpr uint64_t allocation_alignment = 0x10000;
     constexpr uint64_t depth_address = base + 0x40000;
     constexpr uint64_t stencil_address = base + 0x70000;
@@ -9892,8 +10080,9 @@ public:
         ShaderBufferResource buffer_descriptor{};
         buffer_descriptor.UpdateAddress48(buffer_address);
         buffer_descriptor.fields[2] = 0x8000;
-        ShaderStageRuntime buffer_runtime{.program = &buffer_program};
-        auto &value = buffer_runtime.resources.buffers.emplace_back();
+        ShaderRecompiler::IR::ResourceSnapshot buffer_snapshot;
+        ShaderStageRuntime buffer_runtime{&buffer_program, &buffer_snapshot};
+        auto &value = buffer_snapshot.buffers.emplace_back();
         std::memcpy(value.dwords.data(), buffer_descriptor.fields,
                     sizeof(buffer_descriptor.fields));
         value.dword_count = 4;
@@ -9963,7 +10152,7 @@ public:
       null_info.stage = null_program.stage;
       null_info.info = std::move(null_program.info);
       null_info.bindings = std::move(null_program.bindings);
-      ShaderStageRuntime null_runtime{&null_info, std::move(null_snapshot)};
+      ShaderStageRuntime null_runtime{&null_info, &null_snapshot};
       auto null_bindings = executor.PrepareBindings(null_runtime);
       executor.RebindImages(null_bindings);
       Require(name, "null descriptor count",
@@ -10085,18 +10274,39 @@ public:
                 std::end(overwide_mipped_storage.fields),
                 overwide_mipped_storage_descriptor.dwords.begin());
       overwide_mipped_storage_descriptor.dword_count = 8;
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
-      ExpectFatal("MipViewPhysicalLayoutChange", [&] {
-        auto linear_view = overwide_mipped_storage_descriptor;
-        linear_view.dwords[3] &= ~(0x1fu << 20u);
-        (void)RenderExecutorTestAccess::ResolveTexture(executor, storage_resource,
-                                                       linear_view);
-      });
-#endif
+      // The captured IMAGE_STORE addresses only BASE_LEVEL=1. Including
+      // LAST_LEVEL=4 would shift this four-mip render-target allocation.
+      auto fixed_storage_resource = storage_resource;
+      fixed_storage_resource.numeric_class = Prospero::TextureNumericClass::Float;
+      ShaderRecompiler::IR::DescriptorValue fixed_storage_descriptor{};
+      fixed_storage_descriptor.dwords = {
+          static_cast<uint32_t>((base + 0x300000) >> 8u),
+          0xc4700000u, 0x001fc7ffu, 0x91b41facu,
+          0, 0x00700030u, 0, 0};
+      fixed_storage_descriptor.dword_count = 8;
+      const auto fixed_storage_binding = RenderExecutorTestAccess::ResolveTexture(
+          executor, fixed_storage_resource, fixed_storage_descriptor);
+      Require(name, "fixed storage preserves physical mip layout",
+              fixed_storage_binding.desc.info.resources.levels == 4 &&
+                  fixed_storage_binding.desc.info.data.size == 0xb80000 &&
+                  fixed_storage_binding.desc.info.mip_layout[1].offset == 0x180000 &&
+                  fixed_storage_binding.desc.view_info.base_level == 1 &&
+                  fixed_storage_binding.desc.view_info.level_count == 1 &&
+                  texture_cache.FindTexture(fixed_storage_binding.image_id,
+                                             fixed_storage_binding.desc) != nullptr,
+              "IMAGE_STORE expanded an inaccessible mip and shifted physical storage");
       auto mipped_storage_resource = storage_resource;
       mipped_storage_resource.mip_mode =
           ShaderRecompiler::IR::ImageMipMode::DynamicStorage;
       mipped_storage_resource.mip_count = 3;
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+      ExpectFatal("MipViewPhysicalLayoutChange", [&] {
+        auto linear_view = overwide_mipped_storage_descriptor;
+        linear_view.dwords[3] &= ~(0x1fu << 20u);
+        (void)RenderExecutorTestAccess::ResolveTexture(executor, mipped_storage_resource,
+                                                       linear_view);
+      });
+#endif
       auto sampled_overwide_resource = storage_resource;
       sampled_overwide_resource.resource_class =
           ShaderRecompiler::IR::ImageResourceClass::Sampled;
@@ -10120,10 +10330,10 @@ public:
       auto sampled_overwide_resolved = RenderExecutorTestAccess::ResolveTexture(
           executor, sampled_overwide_resource,
           overwide_mipped_storage_descriptor);
-      const auto tail0 = ReadCachedTexel(name, context, overwide_mipped_storage_binding.image_id);
-      const auto tail3 = ReadCachedTexel(name, context, overwide_mipped_storage_binding.image_id,
+      const auto tail0 = ReadCachedTexel(name, context, sampled_overwide_resolved.image_id);
+      const auto tail3 = ReadCachedTexel(name, context, sampled_overwide_resolved.image_id,
                                         {}, {1, 1, 1}, 0, 3);
-      const auto tail4 = ReadCachedTexel(name, context, overwide_mipped_storage_binding.image_id,
+      const auto tail4 = ReadCachedTexel(name, context, sampled_overwide_resolved.image_id,
                                         {}, {1, 1, 1}, 0, 4);
       Require(name, "expanded tail preserves GPU and backing data",
               tail0 == std::vector<u32>{tail_gpu_value} &&
@@ -10141,7 +10351,7 @@ public:
                                 mipped_storage_descriptor,
                                 overwide_mipped_storage_descriptor,
                                 overwide_mipped_storage_descriptor};
-      ShaderStageRuntime mipped_runtime{&mipped_program, std::move(mipped_snapshot)};
+      ShaderStageRuntime mipped_runtime{&mipped_program, &mipped_snapshot};
       mipped_prepared.runtime = &mipped_runtime;
       mipped_prepared.images.push_back(
           std::move(plain_mipped_storage_binding));
@@ -10160,15 +10370,13 @@ public:
       mipped_binding.layout = vk::ImageLayout::eGeneral;
       overwide_mipped_binding.layout = vk::ImageLayout::eGeneral;
       sampled_overwide_binding.layout = vk::ImageLayout::eGeneral;
-      auto plain_view_desc = plain_mipped_binding.desc;
-      plain_view_desc.view_info.level_count = 1;
       Require(name, "dynamic storage mip views",
               plain_mipped_binding.desc.view_info.base_level == 1 &&
-                  plain_mipped_binding.desc.view_info.level_count == 3 &&
+                  plain_mipped_binding.desc.view_info.level_count == 1 &&
                   plain_mipped_binding.mip_views.empty() &&
                   plain_mipped_binding.image_view ==
                       texture_cache.FindTexture(plain_mipped_binding.image_id,
-                                                plain_view_desc) &&
+                                                plain_mipped_binding.desc) &&
                   mipped_binding.desc.info.resources.levels == 4 &&
                   mipped_binding.desc.view_info.base_level == 1 &&
                   mipped_binding.desc.view_info.level_count == 3 &&
@@ -10191,13 +10399,13 @@ public:
                   overwide_mipped_storage.MaxMip() == 3 &&
                   overwide_mipped_binding.image_id ==
                       plain_mipped_binding.image_id &&
-                  overwide_mipped_binding.desc.info.resources.levels == 5 &&
+                  overwide_mipped_binding.desc.info.resources.levels == 4 &&
                   overwide_mipped_binding.desc.view_info.base_level == 1 &&
-                  overwide_mipped_binding.desc.view_info.level_count == 4 &&
+                  overwide_mipped_binding.desc.view_info.level_count == 1 &&
                   overwide_mipped_binding.mip_views.empty() &&
                   overwide_mipped_binding.image_view ==
                       plain_mipped_binding.image_view,
-              "fixed storage view lost addressable mips in the allocated tail");
+              "fixed storage view included mips that IMAGE_STORE cannot address");
       Require(name, "over-wide sampled mip view",
               sampled_overwide_binding.image_id ==
                       plain_mipped_binding.image_id &&
@@ -10450,8 +10658,7 @@ public:
       storage_info.stage = storage_program.stage;
       storage_info.info = std::move(storage_program.info);
       storage_info.bindings = std::move(storage_program.bindings);
-      ShaderStageRuntime storage_runtime{&storage_info,
-                                         std::move(storage_snapshot)};
+      ShaderStageRuntime storage_runtime{&storage_info, &storage_snapshot};
       auto storage_discovery = executor.PrepareBindings(storage_runtime);
       const auto storage_id = storage_discovery.images[0].image_id;
       Require(name, "storage prefetch purity",
@@ -10481,8 +10688,7 @@ public:
       sampled_info.stage = sampled_program.stage;
       sampled_info.info = std::move(sampled_program.info);
       sampled_info.bindings = std::move(sampled_program.bindings);
-      ShaderStageRuntime sampled_runtime{&sampled_info,
-                                         std::move(sampled_snapshot)};
+      ShaderStageRuntime sampled_runtime{&sampled_info, &sampled_snapshot};
 
       constexpr uint64_t ordered_sampled_address = base + 0x10000;
       const uint32_t ordered_sampled_value = 0x89abcdefu;
@@ -10503,7 +10709,7 @@ public:
       ShaderRecompiler::IR::ResourceSnapshot ordered_snapshot{};
       ordered_snapshot.images.push_back(ordered_descriptor);
       ShaderStageRuntime ordered_sampled_runtime{sampled_runtime.program,
-                                                 std::move(ordered_snapshot)};
+                                                 &ordered_snapshot};
       auto ordered_bindings = RenderExecutorTestAccess::PrepareGraphicsBindings(
           executor, storage_runtime, ordered_sampled_runtime, true);
       const auto ordered_sampled_id =
@@ -10651,7 +10857,8 @@ public:
       split_program.info = std::move(split_ir.info);
       split_program.bindings = std::move(split_ir.bindings);
       PreparedBindings split_bindings{};
-      ShaderStageRuntime split_runtime{.program = &split_program};
+      ShaderRecompiler::IR::ResourceSnapshot split_snapshot;
+      ShaderStageRuntime split_runtime{&split_program, &split_snapshot};
       split_bindings.runtime = &split_runtime;
       split_bindings.images.push_back(
           {split_id, texture_cache.FindTexture(split_id, split_storage_desc),
@@ -10975,10 +11182,10 @@ public:
       registers.SetDepthControl(bounds_control);
       registers.SetRenderControl({});
       registers.SetDepthClearValue(0.375f);
-      ShaderStageRuntime bounds_vertex{&vertex_sampled_info, {}};
-      ShaderStageRuntime bounds_pixel{&sampled_info, {}};
-      bounds_vertex.resources.images.push_back(sampled_depth_value);
-      bounds_pixel.resources.images.push_back(sampled_depth_value);
+      ShaderRecompiler::IR::ResourceSnapshot bounds_snapshot;
+      bounds_snapshot.images.push_back(sampled_depth_value);
+      ShaderStageRuntime bounds_vertex{&vertex_sampled_info, &bounds_snapshot};
+      ShaderStageRuntime bounds_pixel{&sampled_info, &bounds_snapshot};
       const auto depth_texels = depth_only.desc.info.extent.width *
                                 depth_only.desc.info.extent.height;
       const auto depth_bytes = depth_texels * sizeof(uint32_t);
@@ -11323,10 +11530,12 @@ public:
                 std::end(shared_depth_descriptor.fields),
                 shared_depth_value.dwords.begin());
       shared_depth_value.dword_count = 8;
-      ShaderStageRuntime shared_depth_vertex{&vertex_sampled_info, {}};
-      ShaderStageRuntime shared_depth_pixel{&sampled_info, {}};
-      shared_depth_vertex.resources.images.push_back(shared_depth_value);
-      shared_depth_pixel.resources.images.push_back(shared_depth_value);
+      ShaderRecompiler::IR::ResourceSnapshot shared_depth_snapshot;
+      shared_depth_snapshot.images.push_back(shared_depth_value);
+      ShaderStageRuntime shared_depth_vertex{&vertex_sampled_info,
+                                              &shared_depth_snapshot};
+      ShaderStageRuntime shared_depth_pixel{&sampled_info,
+                                             &shared_depth_snapshot};
       for (const bool stencil_write : {true, false}) {
         registers.SetDepthRenderTarget(phased_depth_target);
         registers.SetRenderControl({});
@@ -11468,8 +11677,7 @@ public:
       array_descriptor.dword_count = 8;
       ShaderRecompiler::IR::ResourceSnapshot array_snapshot{};
       array_snapshot.images.push_back(array_descriptor);
-      ShaderStageRuntime array_runtime{&array_program,
-                                       std::move(array_snapshot)};
+      ShaderStageRuntime array_runtime{&array_program, &array_snapshot};
 
       auto array_binding = executor.PrepareBindings(array_runtime);
       executor.RebindImages(array_binding);
@@ -11554,8 +11762,9 @@ public:
         descriptor.fields[1] |= 4u << 16u;
         descriptor.fields[2] = buffer_size / sizeof(uint32_t);
         descriptor.fields[3] = 0x00014004u;
-        ShaderStageRuntime buffer_runtime{.program = &buffer_program};
-        auto &value = buffer_runtime.resources.buffers.emplace_back();
+        ShaderRecompiler::IR::ResourceSnapshot buffer_snapshot;
+        ShaderStageRuntime buffer_runtime{&buffer_program, &buffer_snapshot};
+        auto &value = buffer_snapshot.buffers.emplace_back();
         std::memcpy(value.dwords.data(), descriptor.fields, sizeof(descriptor.fields));
         value.dword_count = 4;
         auto buffer_bindings = executor.PrepareBindings(buffer_runtime);
@@ -11642,7 +11851,7 @@ public:
       ShaderRecompiler::IR::ResourceSnapshot colliding_msaa_snapshot{};
       colliding_msaa_snapshot.images.push_back(colliding_msaa_descriptor);
       ShaderStageRuntime colliding_msaa_runtime{
-          &colliding_msaa_program, std::move(colliding_msaa_snapshot)};
+          &colliding_msaa_program, &colliding_msaa_snapshot};
       auto colliding_msaa_binding =
           executor.PrepareBindings(colliding_msaa_runtime);
       executor.RebindImages(colliding_msaa_binding);
@@ -11701,7 +11910,7 @@ public:
       msaa_program.info.images.push_back(msaa_resource);
       ShaderRecompiler::IR::ResourceSnapshot msaa_snapshot{};
       msaa_snapshot.images.push_back(msaa_descriptor);
-      ShaderStageRuntime msaa_runtime{&msaa_program, std::move(msaa_snapshot)};
+      ShaderStageRuntime msaa_runtime{&msaa_program, &msaa_snapshot};
       auto msaa_binding = executor.PrepareBindings(msaa_runtime);
       executor.RebindImages(msaa_binding);
       const auto &resolved_msaa = msaa_binding.images[0];
@@ -11740,8 +11949,7 @@ public:
       msaa_array_program.info.images.push_back(msaa_array_resource);
       ShaderRecompiler::IR::ResourceSnapshot msaa_array_snapshot{};
       msaa_array_snapshot.images.push_back(msaa_array_descriptor);
-      ShaderStageRuntime msaa_array_runtime{&msaa_array_program,
-                                            std::move(msaa_array_snapshot)};
+      ShaderStageRuntime msaa_array_runtime{&msaa_array_program, &msaa_array_snapshot};
       auto msaa_array_binding = executor.PrepareBindings(msaa_array_runtime);
       executor.RebindImages(msaa_array_binding);
       const auto &resolved_msaa_array = msaa_array_binding.images[0];
@@ -12004,7 +12212,7 @@ public:
                 descriptor.dwords.begin());
       descriptor.dword_count = 8;
       snapshot.images.push_back(descriptor);
-      ShaderStageRuntime runtime{&program, std::move(snapshot)};
+      ShaderStageRuntime runtime{&program, &snapshot};
 
       auto prepared = context.GetRenderExecutor().PrepareBindings(runtime);
       const auto sampled_stencil_id = prepared.images[0].image_id;
@@ -12085,14 +12293,16 @@ public:
       auto stencil_translated = ShaderRecompiler::TranslateProgram(stencil_shader, stencil_options);
       auto stencil_plan = ShaderRecompiler::IR::ExtractResourcePlan(stencil_translated.program);
       ShaderRecompiler::IR::ResourceSpecialization stencil_specialization;
+      ShaderRecompiler::IR::ResourceSnapshot stencil_snapshot;
+      stencil_compute.stage.resources = &stencil_snapshot;
       Require(name, "stencil fill materialization",
           ShaderRecompiler::IR::MaterializeResources(stencil_plan,
               {.user_data = stencil_userdata, .userdata = &stencil_byte,
-               .read_specialization_memory = +[](void *data, uint64_t address, uint32_t *word) {
-                 if (address != reinterpret_cast<uint64_t>(data)) return false;
-                 *word = *static_cast<uint32_t *>(data);
+               .read_specialization_memory = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+                 if (address != reinterpret_cast<uint64_t>(data) || words.size() != 1u) return false;
+                 words[0] = *static_cast<uint32_t *>(data);
                  return true;
-               }}, stencil_compute.stage.resources, stencil_specialization),
+               }}, stencil_snapshot, stencil_specialization),
           "captured stencil shader could not resolve its clear byte");
       ShaderRecompiler::IR::ApplyResourceSpecialization(stencil_translated.program,
                                                        stencil_specialization);
@@ -12111,7 +12321,7 @@ public:
           !RenderExecutorTestAccess::TryConsumeComputeImageClear(executor, stencil_compute,
               scheduler.Current(), 2, 1, 1, 0x41u),
           "incomplete or excessive stencil dispatch was consumed");
-      auto &stencil_source = stencil_compute.stage.resources.buffers[0];
+      auto &stencil_source = stencil_snapshot.buffers[0];
       const auto clean_source = stencil_source;
       stencil_source.dwords[0] = static_cast<uint32_t>(stencil_address);
       stencil_source.dwords[1] = static_cast<uint32_t>(stencil_address >> 32) | (4u << 16);
@@ -12149,6 +12359,169 @@ public:
               !texture_cache.GetImage(depth_id).usage.storage,
           "stencil clear altered depth, lost its scalar value, or used a storage view");
       DestroyBuffer(&stencil_readback);
+
+      // Buffer writes to the independent tiled stencil plane must reach the
+      // combined native attachment, including values that are not a clear.
+      {
+        LibKernel::Memory::InstallGpuResources(&resources);
+        constexpr uint64_t plane_size = 0x10000;
+        constexpr uint64_t plane_address = base + 0x910000;
+        constexpr uint32_t texels = 6;
+        auto plane_depth = depth;
+        plane_depth.info.data = {base + 0x900000, plane_size};
+        plane_depth.info.stencil = {plane_address, plane_size};
+        plane_depth.info.extent = {3, 2, 1};
+        plane_depth.info.pitch = TileGetDepthPitch(3, sizeof(uint32_t));
+        plane_depth.info.tile_mode = Prospero::TileMode::kDepth;
+        plane_depth.info.mip_layout[0] = {0, plane_size, plane_depth.info.pitch, 2};
+        const auto plane_depth_id = texture_cache.FindImage(plane_depth);
+        auto sampled_plane = plane_depth;
+        sampled_plane.type = BindingType::Texture;
+        sampled_plane.info.data = plane_depth.info.stencil;
+        sampled_plane.info.stencil = {};
+        sampled_plane.info.metadata = {};
+        sampled_plane.info.pixel_format = vk::Format::eR8Uint;
+        sampled_plane.info.guest_format = Prospero::BufferFormat::k8UInt;
+        sampled_plane.info.bytes_per_block = 1;
+        sampled_plane.info.pitch = TileGetDepthPitch(3, 1);
+        sampled_plane.info.mip_layout[0] = {0, plane_size, sampled_plane.info.pitch, 2};
+        sampled_plane.view_info.format = vk::Format::eR8Uint;
+        sampled_plane.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+        sampled_plane.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+        const auto sampled_plane_id = texture_cache.FindImage(sampled_plane);
+        (void)texture_cache.FindTexture(sampled_plane_id, sampled_plane);
+        (void)texture_cache.FindDepthTarget(plane_depth_id, plane_depth);
+        Require(name, "sampled stencil association",
+                texture_cache.GetImage(sampled_plane_id).depth_id == plane_depth_id,
+                "depth acquisition did not associate the sampled stencil plane");
+        TextureCacheTestAccess::ClearImage(texture_cache, scheduler.Current(), plane_depth_id,
+            {vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil, 0, 1, 0, 1},
+            stencil_initial);
+
+        TileBlockLayout stencil_block{};
+        Require(name, "independent stencil tile pitch",
+            TileGetBlockLayout(TileBlockFamily::Depth64KB, 1, stencil_block) &&
+                plane_depth.info.pitch == 128 && TileGetDepthPitch(3, 1) == 256,
+            "stencil must use its own one-byte tile layout");
+        std::vector<uint32_t> plane_words(plane_size / sizeof(uint32_t), 0);
+        auto *plane_bytes = reinterpret_cast<uint8_t *>(plane_words.data());
+        std::array<uint32_t, texels> plane_offsets{};
+        for (uint32_t i = 0; i < texels; ++i) {
+          Require(name, "stencil tile offset",
+              TileGetBlockOffset(stencil_block, i % 3, i / 3, 0, plane_offsets[i]),
+              "stencil texel offset is unavailable");
+          plane_bytes[plane_offsets[i]] = static_cast<uint8_t>(0x21 + i * 7);
+        }
+        auto plane_upload = CreateHostBuffer(name, plane_size,
+            vk::BufferUsageFlagBits::eTransferSrc, plane_words);
+        ShaderRecompiler::IR::Program plane_ir{};
+        plane_ir.stage = ShaderType::Compute;
+        plane_ir.resource_tracking_complete = true;
+        auto &plane_resource = plane_ir.info.buffers.emplace_back();
+        plane_resource.written = true;
+        plane_resource.formatted = true;
+        allocate_bindings(plane_ir);
+        ShaderRecompiler::IR::CompiledShaderInfo plane_program{};
+        plane_program.stage = plane_ir.stage;
+        plane_program.info = std::move(plane_ir.info);
+        plane_program.bindings = std::move(plane_ir.bindings);
+        ShaderBufferResource plane_descriptor{};
+        plane_descriptor.UpdateAddress48(plane_address);
+        plane_descriptor.fields[1] |= 4u << 16u;
+        plane_descriptor.fields[2] = plane_size / sizeof(uint32_t);
+        plane_descriptor.fields[3] = 0x00014204u;
+        ShaderRecompiler::IR::ResourceSnapshot plane_snapshot;
+        auto &plane_value = plane_snapshot.buffers.emplace_back();
+        std::memcpy(plane_value.dwords.data(), plane_descriptor.fields,
+                    sizeof(plane_descriptor.fields));
+        plane_value.dword_count = 4;
+        const ShaderStageRuntime plane_runtime{&plane_program, &plane_snapshot};
+        auto plane_bindings = executor.PrepareBindings(plane_runtime);
+        vk::MemoryBarrier2 plane_barrier{};
+        plane_barrier.srcStageMask = plane_barrier.dstStageMask =
+            vk::PipelineStageFlagBits2::eAllCommands;
+        plane_barrier.srcAccessMask = plane_barrier.dstAccessMask =
+            vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+        vk::DependencyInfo plane_dependency{};
+        plane_dependency.memoryBarrierCount = 1;
+        plane_dependency.pMemoryBarriers = &plane_barrier;
+        const auto write_plane = [&] {
+          executor.FindBuffers(plane_bindings);
+          executor.RebindBuffers(plane_bindings);
+          const auto &plane_buffer = plane_bindings.buffers[0];
+          const vk::BufferCopy plane_copy{0, plane_buffer.offset, plane_size};
+          scheduler.Current().Handle().pipelineBarrier2(plane_dependency);
+          scheduler.Current().Handle().copyBuffer(plane_upload.buffer, plane_buffer.buffer,
+                                                  1, &plane_copy);
+          scheduler.Current().Handle().pipelineBarrier2(plane_dependency);
+          RenderExecutorTestAccess::ResetBindings(executor);
+        };
+        write_plane();
+
+        auto plane_readback = CreateHostBuffer(name, texels * 4 + 8,
+            vk::BufferUsageFlagBits::eTransferDst, {});
+        const std::array<vk::BufferImageCopy, 2> plane_copies{{
+            {0, 0, 0, {vk::ImageAspectFlagBits::eDepth, 0, 0, 1}, {}, {3, 2, 1}},
+            {texels * 4, 0, 0, {vk::ImageAspectFlagBits::eStencil, 0, 0, 1}, {}, {3, 2, 1}}}};
+        const auto check_plane = [&](const char *phase, bool native_clear) {
+          (void)texture_cache.FindDepthTarget(plane_depth_id, plane_depth);
+          texture_cache.GetImage(plane_depth_id).Download(
+              plane_copies, plane_readback.buffer, 0, plane_readback.size);
+          scheduler.Current().Handle().pipelineBarrier2(stencil_dependency);
+          scheduler.Finish();
+          const auto values = ReadBuffer(name, plane_readback, texels + 2);
+          const auto *bytes = reinterpret_cast<const uint8_t *>(values.data() + texels);
+          for (uint32_t i = 0; i < texels; ++i) {
+            Require(name, phase,
+                values[i] == std::bit_cast<uint32_t>(0.625f) &&
+                    bytes[i] == (native_clear ? 0x67 : plane_bytes[plane_offsets[i]]),
+                "stencil acquisition lost bytes or overwrote the independent depth plane");
+          }
+        };
+        check_plane("GPU stencil buffer write", false);
+        write_plane();
+        vk::ClearValue stencil_again{};
+        stencil_again.depthStencil.stencil = 0x67;
+        TextureCacheTestAccess::ClearImage(texture_cache, scheduler.Current(), plane_depth_id,
+            {vk::ImageAspectFlagBits::eStencil, 0, 1, 0, 1}, stencil_again);
+        check_plane("consumed stencil dirtiness", true);
+        check_plane("repeated clean stencil acquisition", true);
+        for (uint32_t i = 0; i < texels; ++i) {
+          plane_bytes[plane_offsets[i]] += 0x10;
+        }
+        std::memcpy(reinterpret_cast<void *>(plane_address), plane_words.data(), plane_size);
+        check_plane("CPU stencil plane write", false);
+        std::memcpy(reinterpret_cast<void *>(plane_address), plane_words.data(), plane_size);
+        TextureCacheTestAccess::ClearImage(texture_cache, scheduler.Current(), plane_depth_id,
+            {vk::ImageAspectFlagBits::eStencil, 0, 1, 0, 1}, stencil_again);
+        for (uint32_t i = 0; i < texels; ++i) {
+          plane_bytes[plane_offsets[i]] += 0x10;
+        }
+        std::memcpy(reinterpret_cast<void *>(plane_address), plane_words.data(), plane_size);
+        check_plane("CPU stencil write after native clear", false);
+        for (uint32_t i = 0; i < texels; ++i) {
+          plane_bytes[plane_offsets[i]] += 0x10;
+        }
+        std::memcpy(reinterpret_cast<void *>(plane_address), plane_words.data(), plane_size);
+        Require(name, "sampled stencil view",
+                texture_cache.FindTexture(plane_depth_id, sampled_plane) != nullptr,
+                "an associated stencil plane could not be sampled");
+        texture_cache.GetImage(plane_depth_id).Download(
+            plane_copies, plane_readback.buffer, 0, plane_readback.size);
+        scheduler.Current().Handle().pipelineBarrier2(stencil_dependency);
+        scheduler.Finish();
+        const auto sampled_values = ReadBuffer(name, plane_readback, texels + 2);
+        const auto *sampled_bytes =
+            reinterpret_cast<const uint8_t *>(sampled_values.data() + texels);
+        for (uint32_t i = 0; i < texels; ++i) {
+          Require(name, "sampled stencil plane refresh",
+                  sampled_bytes[i] == plane_bytes[plane_offsets[i]],
+                  "sampling without another depth acquisition used stale stencil bytes");
+        }
+        DestroyBuffer(&plane_readback);
+        DestroyBuffer(&plane_upload);
+        LibKernel::Memory::InstallGpuResources(nullptr);
+      }
       resources.UnmapMemory(base, allocation_size);
       scheduler.Finish();
       RenderExecutorTestAccess::DestroyDescriptorPipelines(
@@ -13050,7 +13423,9 @@ public:
     pixel_program.info = fragment.program.info;
     pixel_program.bindings = fragment.program.bindings;
     ShaderVertexInputInfo vertex{};
+    ShaderRecompiler::IR::ResourceSnapshot vertex_snapshot;
     vertex.stage.program = &vertex_program;
+    vertex.stage.resources = &vertex_snapshot;
     vertex.resources_num = 2;
     vertex.buffers_num = 1;
     vertex.buffers[0].stride = 6 * sizeof(float);
@@ -13068,7 +13443,7 @@ public:
     }
     ShaderPixelInputInfo pixel{};
     pixel.stage.program = &pixel_program;
-    pixel.stage.resources = std::move(fragment.resources);
+    pixel.stage.resources = &fragment.resources;
 
     RenderColorInfo color{};
     color.desc.type = BindingType::RenderTarget;
@@ -26144,6 +26519,48 @@ TestCase ImageSampleAndGather() {
   return test;
 }
 
+TestCase ImageCubeGradientsPreserveDerivatives() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "ImageCubeGradientsPreserveDerivatives";
+  for (u32 component = 0; component < 7u; component++) {
+    constexpr std::array values{0.125f, 0.0f, 0.0f, 0.125f,
+                                1.375f, 1.625f, 10.0f};
+    AppendVMovLiteral(&test.code, 20u + component,
+                      std::bit_cast<u32>(values[component]));
+  }
+  test.code.push_back(EncodeMimg0(0x22, 0x1, 0, false, 3));
+  test.code.push_back(EncodeMimg1(0, 20));
+  AppendStoreVgpr(&test.code, 0, 0);
+  AppendEnd(&test.code);
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k32_32_32_32Float);
+  test.user_data[1] |= 3u << 30u;
+  test.user_data[2] = 3u << 14u;
+  test.user_data[3] =
+      (static_cast<u32>(Prospero::ImageType::kCube) << 28u) | (2u << 16u);
+  test.user_data[4] = 11u;
+  test.user_data[5] = 2u << 4u;
+  test.user_data[50] = sizeof(u32);
+  test.has_user_data = true;
+  test.sampled_image_view_type = vk::ImageViewType::e2DArray;
+  test.sampled_image_layers = 12;
+  for (u32 mip = 0; mip < 3u; mip++) {
+    const auto layer_dwords = (4u >> mip) * (4u >> mip) * 4u;
+    auto &pixels = test.sampled_image_rgba_mips.emplace_back(layer_dwords * 12u);
+    for (u32 layer = 0; layer < 12u; layer++) {
+      std::fill_n(pixels.begin() + layer * layer_dwords, layer_dwords,
+                  std::bit_cast<u32>(static_cast<float>(1u + layer + 100u * mip)));
+    }
+  }
+  // Guest face 10 is host layer 8. Unmodified gradients select mip 0;
+  // applying the cube coordinate bias to gradients instead selects mip 2.
+  test.expected = {std::bit_cast<u32>(9.0f)};
+  test.required_spirv = {"OpImageSampleExplicitLod", "Grad"};
+  return test;
+}
+
 TestCase ImageGatherLodApproximatesLevelZero() {
   using O = ShaderOpcode;
   std::vector<u32> code;
@@ -26519,6 +26936,63 @@ void CheckIndirectImageKeySwitch() {
               CountText(text, "OpImageSampleExplicitLod") == 2 &&
               CountText(text, "OpIEqual") == 11,
           "dynamic image key did not use a compact two-sample switch");
+
+  program.memory_info[0].image_dimension =
+      ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
+  program.memory_info[0].image_address_components = 4;
+  for (u32 component = 0; component < 4u; component++) {
+    constexpr std::array values{1.375f, 1.625f, 10.0f, 2.0f};
+    address.SetArg(component, Value(std::bit_cast<u32>(values[component])));
+  }
+  root.indirect_resources = {0u, 1u, 2u};
+  program.info.images = {root, candidate, candidate};
+  for (const bool cube_first : {true, false}) {
+    for (u32 resource = 0; resource < 3u; resource++) {
+      auto &image_resource = program.info.images[resource];
+      image_resource.cube = resource == (cube_first ? 0u : 1u);
+      image_resource.dimension =
+          resource == (cube_first ? 1u : 0u)
+              ? ShaderRecompiler::Decoder::ImageDimension::Dim2D
+              : ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
+    }
+    program.binding_layout_complete = false;
+    AllocateBindings(program);
+    spirv = ShaderRecompiler::Spirv::EmitProgram(program, {.compute = &compute});
+    ValidateSpirv(name, spirv);
+    Require(name, "mixed SPIR-V disassembly", tools.Disassemble(spirv, &text),
+            "failed to disassemble mixed indirect image shader");
+    Require(name, "mixed key switch",
+            CountText(text, "OpImageSampleExplicitLod") == 3 &&
+                CountText(text, "OpFSub") == 2,
+            "mixed candidates lost a sample or shared cube coordinate conversion");
+
+    std::vector<std::span<const u32>> definitions(spirv[3]);
+    u32 samples = 0;
+    for (size_t offset = 5; offset < spirv.size();) {
+      const auto words = std::span<const u32>(spirv).subspan(offset, spirv[offset] >> 16u);
+      const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
+      if (opcode == spv::OpTypeVector) {
+        definitions[words[1]] = words;
+      } else if (opcode == spv::OpCompositeConstruct || opcode == spv::OpBitcast ||
+                 opcode == spv::OpConstant) {
+        definitions[words[2]] = words;
+      } else if (opcode == spv::OpImageSampleExplicitLod) {
+        const auto coord = definitions[words[4]];
+        const auto lod = definitions[words[6]];
+        const auto components = samples == (cube_first ? 1u : 0u) ? 2u : 3u;
+        Require(name, "mixed coordinate and LOD layout",
+                !coord.empty() && definitions[coord[1]][3] == components &&
+                    words[5] == spv::ImageOperandsLodMask && lod.size() == 4u &&
+                    definitions[lod[3]].size() == 4u &&
+                    definitions[lod[3]][3] == std::bit_cast<u32>(2.0f),
+                "candidate coordinates changed the instruction's LOD operand");
+        samples++;
+      }
+      offset += words.size();
+    }
+    Require(name, "mixed sample count", samples == 3u,
+            "mixed candidate switch did not retain every image");
+  }
 }
 
 TestCase ImageStoreMipSelectsPpsa01340Descriptor() {
@@ -27822,6 +28296,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageGetResinfoDmaskWidthHeight);
   AddCase(ImageGetResinfoDmaskMipLevels);
   AddCase(ImageSampleAndGather);
+  AddCase(ImageCubeGradientsPreserveDerivatives);
   AddCase(ImageGatherLodApproximatesLevelZero);
   AddCase(ImageD16GatherPacksHalfPairs);
   AddCase(ImageSampleA16SamplerCoordsOnGpu);
@@ -27929,9 +28404,9 @@ void CheckPs5GameExampleImageClearRuntimeShape() {
         .shader_base = reinterpret_cast<uint64_t>(code.data()),
         .userdata = &scalar_clear,
         .read_specialization_memory = clean_scalar
-            ? +[](void *data, uint64_t address, uint32_t *word) {
-                if (address != reinterpret_cast<uint64_t>(data)) return false;
-                *word = *static_cast<uint32_t *>(data);
+            ? +[](void *data, uint64_t address, std::span<uint32_t> words) {
+                if (address != reinterpret_cast<uint64_t>(data) || words.size() != 1u) return false;
+                words[0] = *static_cast<uint32_t *>(data);
                 return true;
               } : nullptr,
     };
@@ -27947,8 +28422,8 @@ void CheckPs5GameExampleImageClearRuntimeShape() {
 
   const auto code = MakeCode();
   auto positive = Compile(code);
-
-  compute.stage.resources = positive;
+  auto runtime_resources = positive;
+  compute.stage.resources = &runtime_resources;
   ShaderBufferResource descriptor{};
   u32 packed_clear = 0;
   uint64_t size = 0;
@@ -27961,19 +28436,19 @@ void CheckPs5GameExampleImageClearRuntimeShape() {
 
   auto wrong_index = code;
   wrong_index[0] = (wrong_index[0] & ~(0x3ffu << 16u)) | (0x347u << 16u);
-  compute.stage.resources = Compile(wrong_index);
+  runtime_resources = Compile(wrong_index);
   Require("Ps5GameExampleImageClear", "add-before-shift address",
           !ResolveComputeBufferFill(compute, 64, 1, 1, 0x61u, descriptor,
                                     packed_clear, size),
           "V_ADD_LSHL was mistaken for V_LSHL_ADD contiguous coverage");
 
   user_data[7] ^= 1u;
-  compute.stage.resources = Compile(code);
+  runtime_resources = Compile(code);
   Require("Ps5GameExampleImageClear", "non-repeated clear",
           !ResolveComputeBufferFill(compute, 64, 1, 1, 0x61u, descriptor,
                                     packed_clear, size),
           "non-uniform uint4 data was replaced with a color clear");
-  compute.stage.resources = positive;
+  runtime_resources = positive;
   compute.dispatch_threads_num[0] = 32;
   Require("Ps5GameExampleImageClear", "partial dispatch",
           !ResolveComputeBufferFill(compute, 32, 1, 1, 0x61u, descriptor,
@@ -27992,7 +28467,7 @@ void CheckPs5GameExampleImageClearRuntimeShape() {
   scalar_code.push_back(EncodeMubuf1(1, 0, 0));
   AppendEnd(&scalar_code);
   auto scalar = Compile(scalar_code);
-  compute.stage.resources = scalar;
+  runtime_resources = scalar;
   Require("Ps5GameExampleImageClear", "inline scalar fill",
           ResolveComputeBufferFill(compute, 1, 1, 1, 0x41u, descriptor,
                                    packed_clear, size) &&
@@ -28004,13 +28479,13 @@ void CheckPs5GameExampleImageClearRuntimeShape() {
                                     packed_clear, size),
           "excess invocation coverage was accepted as a fill");
   auto alias = scalar.buffers.front();
-  compute.stage.resources.buffers.push_back(alias);
+  runtime_resources.buffers.push_back(alias);
   Require("Ps5GameExampleImageClear", "aliased scalar input",
           !ResolveComputeBufferFill(compute, 1, 1, 1, 0x41u, descriptor,
                                     packed_clear, size),
           "a scalar read aliasing the destination was accepted as uniform");
-  compute.stage.resources = scalar;
-  compute.stage.resources.buffers[0].dwords[3] =
+  runtime_resources = scalar;
+  runtime_resources.buffers[0].dwords[3] =
       (static_cast<u32>(Prospero::BufferFormat::k32Float) << 12u) | 0x204u;
   Require("Ps5GameExampleImageClear", "wrong store format",
           !ResolveComputeBufferFill(compute, 1, 1, 1, 0x41u, descriptor,
@@ -28019,14 +28494,14 @@ void CheckPs5GameExampleImageClearRuntimeShape() {
   // A body change preserving every descriptor and dispatch field must change
   // the result.
   scalar_code[2] = EncodeVop1(0x01u, 1, InlineU32(7));
-  compute.stage.resources = Compile(scalar_code);
+  runtime_resources = Compile(scalar_code);
   Require("Ps5GameExampleImageClear", "changed store value",
           ResolveComputeBufferFill(compute, 1, 1, 1, 0x41u, descriptor,
                                    packed_clear, size) &&
               packed_clear == 7u,
           "clear recognition ignored the shader's actual stored value");
   scalar_code[2] = EncodeVop1(0x01u, 1, Vgpr(0));
-  compute.stage.resources = Compile(scalar_code);
+  runtime_resources = Compile(scalar_code);
   Require("Ps5GameExampleImageClear", "varying store value",
           !ResolveComputeBufferFill(compute, 1, 1, 1, 0x41u, descriptor,
                                     packed_clear, size),
@@ -28048,14 +28523,14 @@ void CheckPs5GameExampleImageClearRuntimeShape() {
   AppendEnd(&scalar_code);
   clean_scalar = true;
   auto loaded = Compile(scalar_code);
-  compute.stage.resources = loaded;
+  runtime_resources = loaded;
   Require("Ps5GameExampleImageClear", "scalar-loaded fill",
           ResolveComputeBufferFill(compute, 1, 1, 1, 0x41u, descriptor,
                                    packed_clear, size) &&
               packed_clear == scalar_clear && descriptor.Base48() == 0x200000u,
           "GTA3's scalar input was confused with its destination");
   clean_scalar = false;
-  compute.stage.resources = Compile(scalar_code);
+  runtime_resources = Compile(scalar_code);
   Require("Ps5GameExampleImageClear", "unavailable clean scalar",
           !ResolveComputeBufferFill(compute, 1, 1, 1, 0x41u, descriptor,
                                     packed_clear, size),
@@ -28349,7 +28824,7 @@ void CheckEmbeddedFetchVertexOffset() {
     program.user_data_base = result.program.user_data_base;
     program.info.vertex_offset_sgpr = result.program.info.vertex_offset_sgpr;
     vertex.stage.program = &program;
-    vertex.stage.resources = result.resources;
+    vertex.stage.resources = &result.resources;
     return ResolveDrawOffsets(index_offset, vertex).first;
   };
 
@@ -28361,7 +28836,7 @@ void CheckEmbeddedFetchVertexOffset() {
     program.info.instance_offset_sgpr =
         result.program.info.instance_offset_sgpr;
     vertex.stage.program = &program;
-    vertex.stage.resources = result.resources;
+    vertex.stage.resources = &result.resources;
     return ResolveDrawOffsets(0, vertex).second;
   };
 
@@ -32792,6 +33267,7 @@ int main(int argc, char **argv) {
     CheckDynamicRenderingState();
     VulkanHarness vulkan;
     vulkan.CheckComputeMetaClearClassification();
+    vulkan.CheckNativeIndirectDispatch();
     vulkan.CheckRenderExecutorColorVolumeDiscovery();
     vulkan.CheckRenderExecutorDccFixedClearFloat();
     vulkan.CheckSampledDccClear();
@@ -32842,6 +33318,14 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, MimgBvhIntersectRayTriangle());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--bvh-host-only") == 0) {
+    const auto test = MimgBvhIntersectRayTriangle();
+    const auto compiled = CompileCase(test);
+    Require(test.name, "BVH host compile", compiled.program.info.uses_dma,
+            "BVH shader did not use the GPU address path");
+    std::printf("[host]    %-32s ok\n", test.name);
+    return 0;
+  }
   const auto scalar_memory_cases = [] {
     return std::vector<TestCase>{ScalarMemoryLoadVariants(),
                                   ScalarLoadSignedImmediateOffsetAddsSoffset(),
@@ -32869,6 +33353,13 @@ int main(int argc, char **argv) {
               "scalar address path does not align and mask the guest base before combining it");
       std::printf("[host]    %-32s ok\n", test.name);
     }
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--indirect-image-only") == 0) {
+    CheckImageSamplerSpecialization();
+    CheckIndirectImageKeySwitch();
+    VulkanHarness vulkan;
+    RunCase(&vulkan, ImageCubeGradientsPreserveDerivatives());
     return 0;
   }
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -32904,11 +33395,6 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     vulkan.CheckUnifiedImageViewCache();
     RunCase(&vulkan, ImageStoreBgraUsesInverseSwizzle());
-    return 0;
-  }
-  if (argc == 2 && std::strcmp(argv[1], "--indirect-image-only") == 0) {
-    CheckImageSamplerSpecialization();
-    CheckIndirectImageKeySwitch();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--storage-mip-host-only") == 0) {
@@ -33010,6 +33496,7 @@ int main(int argc, char **argv) {
   vulkan.CheckGpuMappedRangeLifecycle();
   vulkan.CheckStreamBufferRing();
   vulkan.CheckGpuTilerCpuParity();
+  vulkan.CheckNativeIndirectDispatch();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
   vulkan.CheckRenderExecutorColorDiscovery();
   vulkan.CheckRenderExecutorColorVolumeDiscovery();

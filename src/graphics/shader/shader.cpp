@@ -107,21 +107,24 @@ static uint64_t GetDeclaredShaderHash(uint64_t shader_addr) {
 }
 
 static ShaderParams GetShaderParams(uint64_t shader_addr, const char* label, uint64_t declared_hash,
-	                                std::span<const uint32_t> user_data,
-	                                const ShaderMappedData& data) {
+                                    std::span<const uint32_t> user_data,
+                                    const ShaderMappedData& data, uint32_t user_data_base = 0) {
 	if (data.code_size_bytes == 0 || data.code_size_bytes % sizeof(uint32_t) != 0) {
 		EXIT("%s hash=0x%016" PRIx64 " shader=0x%016" PRIx64
 		     " has invalid AGC shader_size=0x%08" PRIx32 "\n",
 		     label, declared_hash, shader_addr, data.code_size_bytes);
 	}
-	const auto code_words = data.code_size_bytes / sizeof(uint32_t);
-	const auto code = std::span {reinterpret_cast<const uint32_t*>(shader_addr), code_words};
-	return {
-	    .code      = code,
-	    .user_data = std::vector<uint32_t>(user_data.begin(), user_data.end()),
-	    .hash      = declared_hash != 0 ? declared_hash
-	                                    : XXH3_64bits(code.data(), code.size_bytes()),
+	const auto   code_words = data.code_size_bytes / sizeof(uint32_t);
+	const auto   code = std::span {reinterpret_cast<const uint32_t*>(shader_addr), code_words};
+	ShaderParams params {
+	    .code            = code,
+	    .user_data_count = static_cast<uint32_t>(user_data.size()) + user_data_base,
+	    .hash = declared_hash != 0 ? declared_hash : XXH3_64bits(code.data(), code.size_bytes()),
 	};
+	EXIT_IF(user_data.size() > HW::UserSgprInfo::SGPRS_MAX ||
+	        params.user_data_count > params.user_data.size());
+	std::copy(user_data.begin(), user_data.end(), params.user_data.begin() + user_data_base);
+	return params;
 }
 
 #if 0
@@ -433,8 +436,8 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 			const auto                   format_raw    = static_cast<uint32_t>(format);
 			const auto                   buffer_format = format_raw >> 2u;
 			const auto                   channels      = (format_raw & 3u) + 1u;
-			static std::atomic<uint64_t> log_count      = 0;
-			auto                         log_id         = log_count.fetch_add(1);
+			static std::atomic<uint64_t> log_count     = 0;
+			auto                         log_id        = log_count.fetch_add(1);
 			if (log_id < 64) {
 				LOGF("\t PS5 vertex attrib semantic %u uses attrib format %u -> buffer "
 				     "format %u, offset %u, buffer index %zu\n",
@@ -443,8 +446,7 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 			}
 			// AGC vertex formats encode the buffer format above the two channel-count bits.
 			// The fetch prolog selects X001, XY01, XYZ1, or XYZW from that count.
-			r.fields[3] = (r.fields[3] & ~((0x7fu << 12u) | 0xfffu)) |
-			              (buffer_format << 12u) |
+			r.fields[3] = (r.fields[3] & ~((0x7fu << 12u) | 0xfffu)) | (buffer_format << 12u) |
 			              DstSel(4, channels > 1u ? 5u : 0u, channels > 2u ? 6u : 0u,
 			                     channels > 3u ? 7u : 1u);
 		}
@@ -566,14 +568,14 @@ static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserS
 static void ShaderGetStaticInputInfoPS(
     const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
-	const ShaderMappedData& data, ShaderPixelInputInfo& ps_info) {
+    const ShaderMappedData& data, ShaderPixelInputInfo& ps_info) {
 	KYTY_PROFILER_FUNCTION();
 
-	ps_info = {};
+	ps_info                     = {};
 	ps_info.scratch_size_dwords = data.scratch_size_dwords;
 
 	// SPI_PS_IN_CONTROL: NUM_INTERP occupies bits 5:0 and PS_W32_EN is bit 15.
-	ps_info.input_num            = sh.ps_in_control & 0x3fu;
+	ps_info.input_num = sh.ps_in_control & 0x3fu;
 	if ((sh.ps_in_control & 0x8000u) != 0) {
 		ps_info.wave_size = 32;
 	}
@@ -638,8 +640,8 @@ static void ShaderGetStaticInputInfoCS(const HW::ComputeShaderInfo& regs,
 	info.group_id[1]                      = regs.cs_regs.tgid_y_en != 0;
 	info.group_id[2]                      = regs.cs_regs.tgid_z_en != 0;
 	info.wave_size                        = regs.cs_regs.wave_size;
-	info.thread_ids_num      = regs.cs_regs.tidig_comp_cnt + 1;
-	info.tg_size_en          = regs.cs_regs.tg_size_en != 0;
+	info.thread_ids_num                   = regs.cs_regs.tidig_comp_cnt + 1;
+	info.tg_size_en                       = regs.cs_regs.tg_size_en != 0;
 
 	info.workgroup_register = regs.cs_regs.user_sgpr;
 }
@@ -755,12 +757,14 @@ void BuildStageStaticKey(const ShaderComputeInputInfo& info, std::vector<uint32_
 ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context& context,
                             const HW::UserConfig& user_config, ShaderVertexInputInfo& info) {
 	const auto& sh     = context.GetShaderRegisters();
-	const auto data = ShaderGetMappedData(regs.es_regs.data_addr, "ShaderGetInputInfoVS():");
+	const auto  data   = ShaderGetMappedData(regs.es_regs.data_addr, "ShaderGetInputInfoVS():");
+	const bool  merged = (context.GetShaderStages() & 0x20u) != 0;
 	auto        params = GetShaderParams(
 	    regs.es_regs.data_addr, "ShaderRecompiler VS",
 	    GetDeclaredShaderHash(regs.es_regs.data_addr),
-	    std::span<const uint32_t>(regs.gs_user_sgpr.value, regs.gs_regs.rsrc2.user_sgpr), data);
-	if ((context.GetShaderStages() & 0x20u) == 0) {
+	    std::span<const uint32_t>(regs.gs_user_sgpr.value, regs.gs_regs.rsrc2.user_sgpr), data,
+	    merged ? 8u : 0u);
+	if (!merged) {
 		if (!ShaderGetStaticVertexInputInfo(regs.es_regs.data_addr, regs.gs_user_sgpr,
 		                                    regs.gs_regs.rsrc2.user_sgpr, sh, data, info)) {
 			EXIT("failed to prepare vertex shader program\n");
@@ -770,7 +774,6 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 	}
 	// NGG user SGPRs start at s8; a separately compiled GS back half also receives
 	// its user-data pointer in s0:s1.
-	params.user_data.insert(params.user_data.begin(), 8u, 0u);
 	info                     = {};
 	info.logical_stage       = ShaderType::Mesh;
 	info.pa_cl_vs_out_cntl   = sh.m_paClVsOutCntl;
@@ -787,11 +790,11 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 		const auto back_params =
 		    GetShaderParams(regs.gs_regs.data_addr, "ShaderRecompiler GS",
 		                    GetDeclaredShaderHash(regs.gs_regs.data_addr), {}, back);
-		params.back_code = back_params.code;
-		params.user_data[0] = static_cast<uint32_t>(regs.gs_regs.user_data_addr);
-		params.user_data[1] = static_cast<uint32_t>(regs.gs_regs.user_data_addr >> 32u);
-		const uint64_t hashes[] = {params.hash, back_params.hash};
-		params.hash = XXH3_64bits(hashes, sizeof(hashes));
+		params.back_code         = back_params.code;
+		params.user_data[0]      = static_cast<uint32_t>(regs.gs_regs.user_data_addr);
+		params.user_data[1]      = static_cast<uint32_t>(regs.gs_regs.user_data_addr >> 32u);
+		const uint64_t hashes[]  = {params.hash, back_params.hash};
+		params.hash              = XXH3_64bits(hashes, sizeof(hashes));
 		mesh.scratch_size_dwords = std::max(mesh.scratch_size_dwords, back.scratch_size_dwords);
 	}
 	EXIT_NOT_IMPLEMENTED(regs.gs_regs.rsrc1.gs_vgpr_component_count != 3u ||
@@ -803,8 +806,7 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 	     user_config.GetPrimType() != Prospero::PrimitiveType::kTriStrip &&
 	     user_config.GetPrimType() != Prospero::PrimitiveType::kTriList) ||
 	    sh.m_vgtGsOutPrimType != 2u || sh.m_vgtGsMaxVertOut < 3u ||
-	    group.vertex_group_size < mesh.InputPrimitiveSize() ||
-	    mesh.max_vertices == 0u) {
+	    group.vertex_group_size < mesh.InputPrimitiveSize() || mesh.max_vertices == 0u) {
 		EXIT("unsupported GS assembly: input=%u output=%u vertices=%u GE=%u/%u max_output=%u\n",
 		     mesh.input_primitive, sh.m_vgtGsOutPrimType, sh.m_vgtGsMaxVertOut,
 		     group.primitive_group_size, group.vertex_group_size, mesh.max_vertices);
@@ -841,14 +843,13 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 	    GetShaderParams(regs.ls_regs.data_addr, "ShaderRecompiler LS",
 	                    GetDeclaredShaderHash(regs.ls_regs.data_addr), local_users, local),
 	    GetShaderParams(regs.hs_regs.data_addr, "ShaderRecompiler HS",
-	                    GetDeclaredShaderHash(regs.hs_regs.data_addr), local_users, control),
+	                    GetDeclaredShaderHash(regs.hs_regs.data_addr), local_users, control, 8u),
 	    GetShaderParams(regs.es_regs.data_addr, "ShaderRecompiler TES",
 	                    GetDeclaredShaderHash(regs.es_regs.data_addr), evaluation_users,
 	                    evaluation),
 	};
 	// The fused HS back half receives its separate user-data address in s0:s1.
 	// RDNA2 reserves s0:s7 before the native HS user SGPRs.
-	params[1].user_data.insert(params[1].user_data.begin(), 8u, 0u);
 	params[1].user_data[0] = static_cast<uint32_t>(regs.hs_regs.user_data_addr);
 	params[1].user_data[1] = static_cast<uint32_t>(regs.hs_regs.user_data_addr >> 32u);
 
@@ -880,14 +881,15 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 	return params;
 }
 
-ShaderParams PrepareProgram(
-    const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,
-    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
-    ShaderPixelInputInfo&                               ps_info) {
+ShaderParams
+PrepareProgram(const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,
+               std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
+               ShaderPixelInputInfo&                               ps_info) {
 	const auto data = ShaderGetMappedData(regs.ps_regs.data_addr, "ShaderGetInputInfoPS():");
 	ShaderGetStaticInputInfoPS(regs, sh, target_export_mapping, data, ps_info);
 	return GetShaderParams(
-	    regs.ps_regs.data_addr, "ShaderRecompiler PS", GetDeclaredShaderHash(regs.ps_regs.data_addr),
+	    regs.ps_regs.data_addr, "ShaderRecompiler PS",
+	    GetDeclaredShaderHash(regs.ps_regs.data_addr),
 	    std::span<const uint32_t>(regs.ps_user_sgpr.value, regs.ps_regs.rsrc2.user_sgpr), data);
 }
 
@@ -896,7 +898,8 @@ ShaderParams PrepareProgram(const HW::ComputeShaderInfo& regs, const HW::ShaderR
 	const auto data = ShaderGetMappedData(regs.cs_regs.data_addr, "ShaderGetInputInfoCS():");
 	ShaderGetStaticInputInfoCS(regs, sh, data, info);
 	return GetShaderParams(
-	    regs.cs_regs.data_addr, "ShaderRecompiler CS", GetDeclaredShaderHash(regs.cs_regs.data_addr),
+	    regs.cs_regs.data_addr, "ShaderRecompiler CS",
+	    GetDeclaredShaderHash(regs.cs_regs.data_addr),
 	    std::span<const uint32_t>(regs.cs_user_sgpr.value, regs.cs_regs.user_sgpr), data);
 }
 
@@ -979,10 +982,9 @@ void ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info) {
 	     "\t ps_execute_on_noop   = %s\n",
 	     info.input_num, info.ps_system_input_base, info.custom_interpolation_mask,
 	     info.ps_perspective_center_vgpr, info.ps_perspective_centroid_vgpr,
-	     info.ps_pos_x ? "true" : "false",
-	     info.ps_pos_y ? "true" : "false", info.ps_pos_z ? "true" : "false",
-	     info.ps_pos_w ? "true" : "false", info.ps_front_face ? "true" : "false",
-	     info.ps_ancillary ? "true" : "false",
+	     info.ps_pos_x ? "true" : "false", info.ps_pos_y ? "true" : "false",
+	     info.ps_pos_z ? "true" : "false", info.ps_pos_w ? "true" : "false",
+	     info.ps_front_face ? "true" : "false", info.ps_ancillary ? "true" : "false",
 	     info.ps_sample_shading ? "true" : "false", info.ps_no_perspective ? "true" : "false",
 	     info.ps_pixel_kill_enable ? "true" : "false", info.ps_early_z ? "true" : "false",
 	     info.ps_execute_on_noop ? "true" : "false");

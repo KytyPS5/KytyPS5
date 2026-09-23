@@ -1,6 +1,5 @@
 #include "libs/audio.h"
 
-#include "SDL.h"
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
@@ -9,11 +8,13 @@
 #include "common/threads.h"
 #include "kernel/pthread.h"
 #include "kernel/semaphore.h"
+#include "libatrac9.h"
 #include "libs/ajm/atrac9_decoder.h"
 #include "libs/audio_internal.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 
+#include <SDL3/SDL.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -24,8 +25,6 @@
 #include <magic_enum.hpp>
 #include <memory>
 #include <vector>
-
-#include "libatrac9.h"
 
 namespace Libs::Audio {
 
@@ -96,10 +95,10 @@ public:
 	uint32_t AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking = true);
 	bool     AudioOutGetStatus(Id handle, int* type, int* channels_num);
 
-	Id       AudioInOpen(uint32_t samples_num, uint32_t freq, Format format, bool asynchronous);
-	int      AudioInClose(Id handle);
-	int      AudioInGetSilentState(Id handle);
-	int      AudioInInput(Id handle, void* dest);
+	Id  AudioInOpen(uint32_t samples_num, uint32_t freq, Format format, bool asynchronous);
+	int AudioInClose(Id handle);
+	int AudioInGetSilentState(Id handle);
+	int AudioInInput(Id handle, void* dest);
 
 	static constexpr int OUT_PORTS_MAX = 32;
 	static constexpr int IN_PORTS_MAX  = 8;
@@ -115,8 +114,7 @@ private:
 		int      channels_num     = 0;
 		int      volume[12]       = {};
 
-		SDL_AudioDeviceID audio_device = 0;
-		SDL_AudioSpec     audio_spec   = {};
+		SDL_AudioStream* stream = nullptr;
 	};
 
 	struct PortIn {
@@ -127,7 +125,8 @@ private:
 		uint32_t          freq            = 0;
 		uint32_t          bytes_per_frame = 0;
 		uint64_t          last_input_time = 0;
-		SDL_AudioDeviceID audio_device    = 0;
+		SDL_AudioStream*  stream          = nullptr;
+		SDL_AudioDeviceID device          = 0;
 	};
 
 	PortIn* GetAudioInPort(Id handle); // Caller holds m_mutex.
@@ -242,13 +241,13 @@ uint32_t Audio::OutputChannels(const PortOut& port) {
 }
 
 SDL_AudioFormat Audio::SdlFormat(Format format) {
-	return FormatIsFloat(format) ? AUDIO_F32SYS : AUDIO_S16SYS;
+	return FormatIsFloat(format) ? SDL_AUDIO_F32 : SDL_AUDIO_S16;
 }
 
 bool Audio::OpenSdlDevice(PortOut* port) {
 	EXIT_IF(port == nullptr);
 
-	if (SDL_InitSubSystem(SDL_INIT_AUDIO) < 0) {
+	if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
 		LOGF("AudioOut: SDL audio init failed: %s\n", SDL_GetError());
 		return false;
 	}
@@ -256,37 +255,34 @@ bool Audio::OpenSdlDevice(PortOut* port) {
 	SDL_AudioSpec desired {};
 	desired.freq     = static_cast<int>(port->freq);
 	desired.format   = SdlFormat(port->format);
-	desired.channels = static_cast<Uint8>(OutputChannels(*port));
-	desired.samples  = static_cast<Uint16>(port->samples_num);
-	desired.callback = nullptr;
+	desired.channels = static_cast<int>(OutputChannels(*port));
 
-	SDL_AudioSpec obtained {};
-
-	port->audio_device =
-	    SDL_OpenAudioDevice(nullptr, 0, &desired, &obtained, SDL_AUDIO_ALLOW_ANY_CHANGE);
-	if (port->audio_device == 0) {
-		LOGF("AudioOut: SDL_OpenAudioDevice failed: %s\n", SDL_GetError());
+	port->stream =
+	    SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &desired, nullptr, nullptr);
+	if (port->stream == nullptr) {
+		LOGF("AudioOut: SDL_OpenAudioDeviceStream failed: %s\n", SDL_GetError());
+		SDL_QuitSubSystem(SDL_INIT_AUDIO);
+		return false;
+	}
+	if (!SDL_ResumeAudioStreamDevice(port->stream)) {
+		LOGF("AudioOut: SDL_ResumeAudioStreamDevice failed: %s\n", SDL_GetError());
+		CloseSdlDevice(port);
 		return false;
 	}
 
-	port->audio_spec = obtained;
-	SDL_PauseAudioDevice(port->audio_device, 0);
-
-	LOGF("AudioOut: opened SDL device (%d Hz, %u ch, format 0x%04x)\n", obtained.freq,
-	     obtained.channels, obtained.format);
+	LOGF("AudioOut: opened SDL stream (%d Hz, %d ch, format 0x%04x)\n", desired.freq,
+	     desired.channels, static_cast<unsigned>(desired.format));
 	return true;
 }
 
 void Audio::CloseSdlDevice(PortOut* port) {
 	EXIT_IF(port == nullptr);
 
-	if (port->audio_device != 0 && SDL_WasInit(SDL_INIT_AUDIO) != 0) {
-		SDL_ClearQueuedAudio(port->audio_device);
-		SDL_CloseAudioDevice(port->audio_device);
+	if (port->stream != nullptr) {
+		SDL_DestroyAudioStream(port->stream);
+		SDL_QuitSubSystem(SDL_INIT_AUDIO);
 	}
-
-	port->audio_device = 0;
-	port->audio_spec   = {};
+	port->stream = nullptr;
 }
 
 const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
@@ -346,8 +342,8 @@ const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
 		for (uint32_t frame = 0; frame < frames; frame++) {
 			for (uint32_t ch = 0; ch < output_channels; ch++) {
 				const auto src_ch = reorder ? SDL_8CH_MAP[ch] : ch;
-				int64_t sample =
-				    static_cast<int64_t>(src[frame * channels + src_ch]) * port.volume[src_ch] / 32768;
+				int64_t    sample = static_cast<int64_t>(src[frame * channels + src_ch]) *
+				                    port.volume[src_ch] / 32768;
 				if (sample > std::numeric_limits<int16_t>::max()) {
 					sample = std::numeric_limits<int16_t>::max();
 				} else if (sample < std::numeric_limits<int16_t>::min()) {
@@ -364,46 +360,14 @@ const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
 bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking) {
 	EXIT_IF(port == nullptr);
 
-	if (port->audio_device == 0 || data == nullptr) {
+	if (port->stream == nullptr || data == nullptr) {
 		return false;
 	}
 
 	std::vector<uint8_t> prepared_buffer;
 	const void*          prepared_data   = PrepareOutputBuffer(*port, data, &prepared_buffer);
 	const auto           output_channels = OutputChannels(*port);
-	const auto           prepared_size =
-	    BytesPerSample(port->format) * output_channels * port->samples_num;
-
-	std::vector<uint8_t> convert_buffer;
-	const void*          queue_data = prepared_data;
-	uint32_t             queue_size = prepared_size;
-
-	SDL_AudioCVT cvt {};
-	const int    cvt_result =
-	    SDL_BuildAudioCVT(&cvt, SdlFormat(port->format), static_cast<Uint8>(output_channels),
-	                      static_cast<int>(port->freq), port->audio_spec.format,
-	                      port->audio_spec.channels, port->audio_spec.freq);
-
-	if (cvt_result < 0) {
-		LOGF("AudioOut: SDL_BuildAudioCVT failed: %s\n", SDL_GetError());
-		return false;
-	}
-
-	if (cvt_result > 0) {
-		convert_buffer.resize(prepared_size * cvt.len_mult);
-		std::memcpy(convert_buffer.data(), prepared_data, prepared_size);
-
-		cvt.buf = convert_buffer.data();
-		cvt.len = static_cast<int>(prepared_size);
-
-		if (SDL_ConvertAudio(&cvt) < 0) {
-			LOGF("AudioOut: SDL_ConvertAudio failed: %s\n", SDL_GetError());
-			return false;
-		}
-
-		queue_data = cvt.buf;
-		queue_size = static_cast<uint32_t>(cvt.len_cvt);
-	}
+	const auto prepared_size = BytesPerSample(port->format) * output_channels * port->samples_num;
 
 	if (blocking) {
 		constexpr uint64_t target_latency_us = 40000;
@@ -411,19 +375,19 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking) {
 		const auto buffers =
 		    buffer_us != 0 ? static_cast<uint32_t>((target_latency_us + buffer_us - 1) / buffer_us)
 		                   : 2u;
-		const auto min_queued_size = queue_size * std::clamp(buffers, 2u, 16u);
+		const auto min_queued_size = prepared_size * std::clamp(buffers, 2u, 16u);
 		const auto wait_start      = LibKernel::KernelGetProcessTime();
-		while (SDL_GetQueuedAudioSize(port->audio_device) > min_queued_size) {
+		while (SDL_GetAudioStreamQueued(port->stream) > static_cast<int>(min_queued_size)) {
 			if (LibKernel::KernelGetProcessTime() - wait_start > 200000) {
-				SDL_ClearQueuedAudio(port->audio_device);
+				SDL_ClearAudioStream(port->stream);
 				break;
 			}
 			Common::Thread::SleepMicro(1000);
 		}
 	}
 
-	if (SDL_QueueAudio(port->audio_device, queue_data, queue_size) < 0) {
-		LOGF("AudioOut: SDL_QueueAudio failed: %s\n", SDL_GetError());
+	if (!SDL_PutAudioStreamData(port->stream, prepared_data, static_cast<int>(prepared_size))) {
+		LOGF("AudioOut: SDL_PutAudioStreamData failed: %s\n", SDL_GetError());
 		return false;
 	}
 
@@ -498,7 +462,7 @@ bool Audio::AudioOutHasDevice(Id handle) {
 	Common::LockGuard lock(m_mutex);
 
 	return (handle.GetId() >= 0 && handle.GetId() < OUT_PORTS_MAX &&
-	        m_out_ports[handle.GetId()].used && m_out_ports[handle.GetId()].audio_device != 0);
+	        m_out_ports[handle.GetId()].used && m_out_ports[handle.GetId()].stream != nullptr);
 }
 
 bool Audio::AudioOutGetStatus(Id handle, int* type, int* channels_num) {
@@ -557,7 +521,7 @@ uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking
 
 	bool any_port_has_device = false;
 	for (uint32_t i = 0; i < num; i++) {
-		if (m_out_ports[params[i].handle.GetId()].audio_device != 0) {
+		if (m_out_ports[params[i].handle.GetId()].stream != nullptr) {
 			any_port_has_device = true;
 			break;
 		}
@@ -583,39 +547,70 @@ uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking
 	return first_port.samples_num;
 }
 
+static bool RecordingDevicePresent(SDL_AudioDeviceID device) {
+	int                count   = 0;
+	SDL_AudioDeviceID* devices = SDL_GetAudioRecordingDevices(&count);
+	bool               present = false;
+	for (int i = 0; i < count; i++) {
+		if (devices[i] == device) {
+			present = true;
+			break;
+		}
+	}
+	SDL_free(devices);
+	return present;
+}
+
 void Audio::OpenSdlDevice(PortIn* port, Format format) {
 	const auto& name = Config::GetAudioInputDevice();
 	if (name.empty()) {
 		return;
 	}
-	if (SDL_InitSubSystem(SDL_INIT_AUDIO) < 0) {
+	if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
 		LOGF("AudioIn: SDL init failed: %s\n", SDL_GetError());
+		return;
+	}
+	int                device_count = 0;
+	SDL_AudioDeviceID* devices      = SDL_GetAudioRecordingDevices(&device_count);
+	SDL_AudioDeviceID  device       = 0;
+	for (int i = 0; i < device_count; i++) {
+		const char* device_name = SDL_GetAudioDeviceName(devices[i]);
+		if (device_name != nullptr && name == device_name) {
+			device = devices[i];
+			break;
+		}
+	}
+	SDL_free(devices);
+	if (device == 0) {
+		LOGF("AudioIn: cannot find '%s'; using silence\n", name.c_str());
+		SDL_QuitSubSystem(SDL_INIT_AUDIO);
 		return;
 	}
 	SDL_AudioSpec desired {};
 	desired.freq     = static_cast<int>(port->freq);
 	desired.format   = SdlFormat(format);
-	desired.channels = static_cast<Uint8>(port->bytes_per_frame / BytesPerSample(format));
-	desired.samples  = static_cast<Uint16>(port->samples_num);
-	// SDL converts capture data to the guest format when allowed_changes is zero.
-	port->audio_device = SDL_OpenAudioDevice(name.c_str(), 1, &desired, nullptr, 0);
-	if (port->audio_device == 0) {
+	desired.channels = static_cast<int>(port->bytes_per_frame / BytesPerSample(format));
+	port->stream     = SDL_OpenAudioDeviceStream(device, &desired, nullptr, nullptr);
+	if (port->stream == nullptr) {
 		LOGF("AudioIn: cannot open '%s': %s; using silence\n", name.c_str(), SDL_GetError());
 		SDL_QuitSubSystem(SDL_INIT_AUDIO);
 		return;
 	}
-	LOGF("AudioIn: opened '%s' (%u Hz, %u ch)\n", name.c_str(), port->freq, desired.channels);
+	port->device = device;
+	LOGF("AudioIn: opened '%s' (%u Hz, %d ch)\n", name.c_str(), port->freq, desired.channels);
 }
 
 void Audio::CloseSdlDevice(PortIn* port) {
-	if (port->audio_device != 0) {
-		SDL_CloseAudioDevice(port->audio_device);
+	if (port->stream != nullptr) {
+		SDL_DestroyAudioStream(port->stream);
 		SDL_QuitSubSystem(SDL_INIT_AUDIO);
-		port->audio_device = 0;
+		port->stream = nullptr;
+		port->device = 0;
 	}
 }
 
-Audio::Id Audio::AudioInOpen(uint32_t samples_num, uint32_t freq, Format format, bool asynchronous) {
+Audio::Id Audio::AudioInOpen(uint32_t samples_num, uint32_t freq, Format format,
+                             bool asynchronous) {
 	Common::LockGuard lock(m_mutex);
 
 	for (int id = 0; id < IN_PORTS_MAX; id++) {
@@ -641,8 +636,7 @@ Audio::Id Audio::AudioInOpen(uint32_t samples_num, uint32_t freq, Format format,
 }
 
 Audio::PortIn* Audio::GetAudioInPort(Id handle) {
-	if (handle.GetId() < 0 || handle.GetId() >= IN_PORTS_MAX ||
-	    !m_in_ports[handle.GetId()].used) {
+	if (handle.GetId() < 0 || handle.GetId() >= IN_PORTS_MAX || !m_in_ports[handle.GetId()].used) {
 		return nullptr;
 	}
 	return &m_in_ports[handle.GetId()];
@@ -650,7 +644,7 @@ Audio::PortIn* Audio::GetAudioInPort(Id handle) {
 
 int Audio::AudioInClose(Id handle) {
 	Common::LockGuard lock(m_mutex);
-	auto* port = GetAudioInPort(handle);
+	auto*             port = GetAudioInPort(handle);
 	if (port == nullptr) {
 		return AUDIO_IN_ERROR_INVALID_HANDLE;
 	}
@@ -668,8 +662,7 @@ int Audio::AudioInGetSilentState(Id handle) {
 	if (port == nullptr) {
 		return AUDIO_IN_ERROR_INVALID_HANDLE;
 	}
-	if (port->audio_device == 0 ||
-	    SDL_GetAudioDeviceStatus(port->audio_device) == SDL_AUDIO_STOPPED) {
+	if (port->stream == nullptr || !RecordingDevicePresent(port->device)) {
 		return AUDIO_IN_SILENT_STATE_DEVICE_NONE;
 	}
 	return 0;
@@ -689,9 +682,9 @@ int Audio::AudioInInput(Id handle, void* dest) {
 		port->busy = true;
 		snapshot   = *port;
 	}
-	if (snapshot.audio_device != 0 && dest != nullptr) {
-		SDL_PauseAudioDevice(snapshot.audio_device, 0);
-	}
+	bool failed =
+	    snapshot.stream != nullptr && dest != nullptr &&
+	    (!RecordingDevicePresent(snapshot.device) || !SDL_ResumeAudioStreamDevice(snapshot.stream));
 
 	const uint64_t block_time = (1000000ULL * snapshot.samples_num) / snapshot.freq;
 	uint64_t       wait_time  = 0;
@@ -699,7 +692,7 @@ int Audio::AudioInInput(Id handle, void* dest) {
 		if (dest != nullptr) {
 			wait_time = block_time;
 		}
-	} else if (snapshot.last_input_time != 0 && (snapshot.audio_device == 0 || dest == nullptr)) {
+	} else if (snapshot.last_input_time != 0 && (snapshot.stream == nullptr || dest == nullptr)) {
 		const auto now  = LibKernel::KernelGetProcessTime();
 		const auto next = snapshot.last_input_time + block_time;
 		if (next > now) {
@@ -707,32 +700,41 @@ int Audio::AudioInInput(Id handle, void* dest) {
 		}
 	}
 	Common::Thread::SleepMicro(wait_time);
-	uint32_t frames = snapshot.samples_num;
-	bool     failed = false;
+	uint32_t frames    = snapshot.samples_num;
+	bool     timed_out = false;
 	if (dest != nullptr) {
-		if (snapshot.audio_device != 0) {
-			while (!snapshot.asynchronous &&
-			       SDL_GetQueuedAudioSize(snapshot.audio_device) <
-			           frames * snapshot.bytes_per_frame &&
-			       SDL_GetAudioDeviceStatus(snapshot.audio_device) == SDL_AUDIO_PLAYING) {
+		if (snapshot.stream != nullptr && !failed) {
+			const int  requested = static_cast<int>(frames * snapshot.bytes_per_frame);
+			const auto deadline =
+			    LibKernel::KernelGetProcessTime() + std::max<uint64_t>(20000, block_time * 4);
+			const auto device    = SDL_GetAudioStreamDevice(snapshot.stream);
+			int        available = SDL_GetAudioStreamAvailable(snapshot.stream);
+			while (!snapshot.asynchronous && available >= 0 && available < requested &&
+			       device != 0 && !SDL_AudioDevicePaused(device) &&
+			       LibKernel::KernelGetProcessTime() < deadline) {
 				Common::Thread::SleepMicro(1000);
+				available = SDL_GetAudioStreamAvailable(snapshot.stream);
 			}
-			failed = SDL_GetAudioDeviceStatus(snapshot.audio_device) != SDL_AUDIO_PLAYING;
-			if (!failed) {
+			failed    = available < 0 || device == 0 || SDL_AudioDevicePaused(device);
+			timed_out = !snapshot.asynchronous && available < requested;
+			if (!failed && !timed_out) {
 				if (snapshot.asynchronous) {
 					frames = AUDIO_IN_GRAIN_MAX_ASYNC;
 				}
-				frames = SDL_DequeueAudio(snapshot.audio_device, dest,
-				                          frames * snapshot.bytes_per_frame) /
-				         snapshot.bytes_per_frame;
+				const int bytes = SDL_GetAudioStreamData(
+				    snapshot.stream, dest, static_cast<int>(frames * snapshot.bytes_per_frame));
+				failed = bytes < 0;
+				if (!failed) {
+					frames = static_cast<uint32_t>(bytes) / snapshot.bytes_per_frame;
+				}
 			}
 		}
-		if (snapshot.audio_device == 0 || failed) {
+		if (snapshot.stream == nullptr || failed || timed_out) {
 			std::memset(dest, 0, frames * snapshot.bytes_per_frame);
 		}
-	} else if (snapshot.audio_device != 0) {
-		SDL_PauseAudioDevice(snapshot.audio_device, 1);
-		SDL_ClearQueuedAudio(snapshot.audio_device);
+	} else if (snapshot.stream != nullptr) {
+		SDL_PauseAudioStreamDevice(snapshot.stream);
+		SDL_ClearAudioStream(snapshot.stream);
 	}
 	{
 		Common::LockGuard lock(m_mutex);
@@ -935,8 +937,8 @@ namespace AudioIn {
 
 LIB_NAME("AudioIn", "AudioIn");
 
-static int OpenPort(int user_id, int type, int index, uint32_t len, uint32_t freq,
-                    uint32_t param, bool asynchronous) {
+static int OpenPort(int user_id, int type, int index, uint32_t len, uint32_t freq, uint32_t param,
+                    bool asynchronous) {
 	LOGF("\t user_id = %d\n"
 	     "\t type    = %d\n"
 	     "\t index   = %d\n"
@@ -981,14 +983,14 @@ static int OpenPort(int user_id, int type, int index, uint32_t len, uint32_t fre
 	return id.ToInt();
 }
 
-int KYTY_SYSV_ABI AudioInOpen(int user_id, int type, int index, uint32_t len,
-                              uint32_t freq, uint32_t param) {
+int KYTY_SYSV_ABI AudioInOpen(int user_id, int type, int index, uint32_t len, uint32_t freq,
+                              uint32_t param) {
 	PRINT_NAME();
 	return OpenPort(user_id, type, index, len, freq, param, false);
 }
 
-int KYTY_SYSV_ABI AudioInHqOpen(int user_id, int type, int index, uint32_t len,
-                                uint32_t freq, uint32_t param) {
+int KYTY_SYSV_ABI AudioInHqOpen(int user_id, int type, int index, uint32_t len, uint32_t freq,
+                                uint32_t param) {
 	PRINT_NAME();
 	return OpenPort(user_id, type, index, len, freq, param, true);
 }
@@ -1517,14 +1519,10 @@ namespace Ngs2 {
 
 LIB_NAME("Ngs2", "Ngs2");
 
-constexpr int32_t NGS2_ERROR_INVALID_OUT_ADDRESS =
-    static_cast<int32_t>(0x804a8010u);
-constexpr int32_t NGS2_ERROR_INVALID_WAVEFORM_DATA =
-    static_cast<int32_t>(0x804a8430u);
-constexpr int32_t NGS2_ERROR_INVALID_WAVEFORM_FORMAT =
-    static_cast<int32_t>(0x804a8431u);
-constexpr int32_t NGS2_ERROR_UNKNOWN_WAVEFORM_FORMAT =
-    static_cast<int32_t>(0x804a8432u);
+constexpr int32_t NGS2_ERROR_INVALID_OUT_ADDRESS     = static_cast<int32_t>(0x804a8010u);
+constexpr int32_t NGS2_ERROR_INVALID_WAVEFORM_DATA   = static_cast<int32_t>(0x804a8430u);
+constexpr int32_t NGS2_ERROR_INVALID_WAVEFORM_FORMAT = static_cast<int32_t>(0x804a8431u);
+constexpr int32_t NGS2_ERROR_UNKNOWN_WAVEFORM_FORMAT = static_cast<int32_t>(0x804a8432u);
 
 constexpr uint32_t NGS2_WAVEFORM_TYPE_ATRAC9 = 0x40;
 
@@ -1909,15 +1907,15 @@ struct Ngs2VoiceInternal {
 	std::vector<Module>             modules;
 	std::vector<float>              samples;
 	std::vector<float>              output_matrix;
-	uint32_t                        channels        = 0;
-	uint32_t                        output_id       = 0;
-	bool                            rendering       = false;
-	bool                            rendered        = false;
-	bool                            has_samples     = false;
+	uint32_t                        channels    = 0;
+	uint32_t                        output_id   = 0;
+	bool                            rendering   = false;
+	bool                            rendered    = false;
+	bool                            has_samples = false;
 
 	std::unique_ptr<Ajm::AjmAt9Decoder> decoder;
-	std::vector<float>                 decoded_frame;
-	bool                               accepts_blocks = true;
+	std::vector<float>                  decoded_frame;
+	bool                                accepts_blocks = true;
 
 	void SetupSampler(const Ngs2WaveformFormat& format) {
 		EXIT_NOT_IMPLEMENTED(format.sample_rate != rack->ngs->option.sample_rate ||
@@ -2877,8 +2875,8 @@ static void Ngs2RenderVoice(Ngs2VoiceInternal& voice, const std::vector<Ngs2Voic
 int KYTY_SYSV_ABI Ngs2SystemRender(uintptr_t system_handle, const Ngs2RenderBufferInfo* buffer_info,
                                    uint32_t num_buffer_info) {
 	EXIT_NOT_IMPLEMENTED(buffer_info == nullptr || system_handle == 0 || num_buffer_info == 0);
-	auto* ngs = reinterpret_cast<Ngs2Internal*>(system_handle);
-	Common::LockGuard lock(ngs->mutex);
+	auto*                           ngs = reinterpret_cast<Ngs2Internal*>(system_handle);
+	Common::LockGuard               lock(ngs->mutex);
 	std::vector<Ngs2VoiceInternal*> voices;
 	{
 		Common::LockGuard racks_lock(g_racks_mutex);
@@ -2943,10 +2941,9 @@ static bool Ngs2FourCcEquals(const uint8_t* data, const char* four_cc) {
 }
 
 static int Ngs2ParseAtrac9Riff(const void* data, size_t data_size, Ngs2WaveformInfo* info) {
-	static constexpr uint8_t ATRAC9_GUID[16] = {0xd2, 0x42, 0xe1, 0x47, 0xba, 0x36,
-	                                            0x8d, 0x4d, 0x88, 0xfc, 0x61, 0x65,
-	                                            0x4f, 0x8c, 0x83, 0x6c};
-	const auto* bytes = static_cast<const uint8_t*>(data);
+	static constexpr uint8_t ATRAC9_GUID[16] = {0xd2, 0x42, 0xe1, 0x47, 0xba, 0x36, 0x8d, 0x4d,
+	                                            0x88, 0xfc, 0x61, 0x65, 0x4f, 0x8c, 0x83, 0x6c};
+	const auto*              bytes           = static_cast<const uint8_t*>(data);
 	if (bytes == nullptr || data_size < 12) {
 		return NGS2_ERROR_INVALID_WAVEFORM_DATA;
 	}
@@ -2960,15 +2957,15 @@ static int Ngs2ParseAtrac9Riff(const void* data, size_t data_size, Ngs2WaveformI
 	}
 	const auto riff_end = static_cast<size_t>(riff_end64);
 
-	const uint8_t* format           = nullptr;
-	const uint8_t* fact             = nullptr;
-	size_t         waveform_offset  = 0;
-	uint32_t       waveform_size    = 0;
+	const uint8_t* format          = nullptr;
+	const uint8_t* fact            = nullptr;
+	size_t         waveform_offset = 0;
+	uint32_t       waveform_size   = 0;
 
 	for (size_t offset = 12; offset + 8 <= riff_end;) {
-		const auto* chunk       = bytes + offset;
-		const auto  chunk_size  = static_cast<size_t>(Ngs2ReadLe32(chunk + 4));
-		const auto  payload     = offset + 8;
+		const auto* chunk      = bytes + offset;
+		const auto  chunk_size = static_cast<size_t>(Ngs2ReadLe32(chunk + 4));
+		const auto  payload    = offset + 8;
 		if (chunk_size > riff_end - payload) {
 			return NGS2_ERROR_INVALID_WAVEFORM_DATA;
 		}
@@ -3014,11 +3011,11 @@ static int Ngs2ParseAtrac9Riff(const void* data, size_t data_size, Ngs2WaveformI
 
 	Atrac9CodecInfo codec {};
 	void*           decoder = Atrac9GetHandle();
-	const bool valid_codec =
-	    decoder != nullptr && Atrac9InitDecoder(decoder, config.data()) == 0 &&
-	    Atrac9GetCodecInfo(decoder, &codec) == 0 && codec.channels > 0 &&
-	    codec.samplingRate > 0 && codec.superframeSize > 0 && codec.framesInSuperframe > 0 &&
-	    codec.frameSamples > 0 && codec.superframeSize % codec.framesInSuperframe == 0;
+	const bool valid_codec = decoder != nullptr && Atrac9InitDecoder(decoder, config.data()) == 0 &&
+	                         Atrac9GetCodecInfo(decoder, &codec) == 0 && codec.channels > 0 &&
+	                         codec.samplingRate > 0 && codec.superframeSize > 0 &&
+	                         codec.framesInSuperframe > 0 && codec.frameSamples > 0 &&
+	                         codec.superframeSize % codec.framesInSuperframe == 0;
 	if (decoder != nullptr) {
 		Atrac9ReleaseHandle(decoder);
 	}
@@ -3036,19 +3033,18 @@ static int Ngs2ParseAtrac9Riff(const void* data, size_t data_size, Ngs2WaveformI
 	info->format.num_channels  = static_cast<uint32_t>(codec.channels);
 	info->format.sample_rate   = static_cast<uint32_t>(codec.samplingRate);
 	std::memcpy(&info->format.config_data, config.data(), config.size());
-	info->data_offset              = static_cast<uint32_t>(waveform_offset);
-	info->data_size                = waveform_size;
-	info->num_samples              = Ngs2ReadLe32(fact);
-	info->audio_unit_size          = static_cast<uint32_t>(codec.superframeSize /
-	                                                       codec.framesInSuperframe);
-	info->num_audio_unit_samples   = static_cast<uint32_t>(codec.frameSamples);
-	info->num_audio_unit_per_frame = static_cast<uint32_t>(codec.framesInSuperframe);
-	info->audio_frame_size         = static_cast<uint32_t>(codec.superframeSize);
-	info->num_audio_frame_samples  = static_cast<uint32_t>(frame_samples);
-	info->num_delay_samples        = Ngs2ReadLe32(fact + 4);
-	info->num_blocks               = 1;
-	info->blocks[0].data_offset    = waveform_offset;
-	info->blocks[0].data_size      = waveform_size;
+	info->data_offset     = static_cast<uint32_t>(waveform_offset);
+	info->data_size       = waveform_size;
+	info->num_samples     = Ngs2ReadLe32(fact);
+	info->audio_unit_size = static_cast<uint32_t>(codec.superframeSize / codec.framesInSuperframe);
+	info->num_audio_unit_samples     = static_cast<uint32_t>(codec.frameSamples);
+	info->num_audio_unit_per_frame   = static_cast<uint32_t>(codec.framesInSuperframe);
+	info->audio_frame_size           = static_cast<uint32_t>(codec.superframeSize);
+	info->num_audio_frame_samples    = static_cast<uint32_t>(frame_samples);
+	info->num_delay_samples          = Ngs2ReadLe32(fact + 4);
+	info->num_blocks                 = 1;
+	info->blocks[0].data_offset      = waveform_offset;
+	info->blocks[0].data_size        = waveform_size;
 	info->blocks[0].num_skip_samples = Ngs2ReadLe32(fact + 8);
 	info->blocks[0].num_samples      = info->num_samples;
 	return OK;
@@ -3415,7 +3411,7 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 			case 0x4002: {
 				EXIT_NOT_IMPLEMENTED(voice->rack->type != Ngs2RackType::CustomSubmixer ||
 				                     (param->id & 0xffffu) != 0);
-				const auto* channels   = reinterpret_cast<const uint32_t*>(param + 1);
+				const auto* channels = reinterpret_cast<const uint32_t*>(param + 1);
 				EXIT_NOT_IMPLEMENTED(channels[0] != channels[1]);
 				voice->channels = channels[0];
 				break;

@@ -50,10 +50,12 @@ struct CompiledShaderInfo;
 } // namespace ShaderRecompiler::IR
 
 struct ShaderStageRuntime {
-	const ShaderRecompiler::IR::CompiledShaderInfo* program = nullptr;
-	ShaderRecompiler::IR::ResourceSnapshot          resources;
+	const ShaderRecompiler::IR::CompiledShaderInfo* program   = nullptr;
+	const ShaderRecompiler::IR::ResourceSnapshot*   resources = nullptr;
 
-	[[nodiscard]] explicit operator bool() const { return program != nullptr; }
+	[[nodiscard]] explicit operator bool() const {
+		return program != nullptr && resources != nullptr;
+	}
 };
 
 constexpr uint32_t DstSel(uint32_t x, uint32_t y = 0, uint32_t z = 0, uint32_t w = 0) {

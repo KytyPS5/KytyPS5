@@ -783,14 +783,13 @@ static void WindowCreate(WindowContext& context) {
 	}
 
 	SDL_SetWindowPosition(context.window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
-	SDL_SetWindowResizable(context.window, false);
 	HostInputInit(context.window);
 	InitializeSystemOverlayInput(context.window);
 	context.UpdateIcon();
 }
 
 uint32_t WindowContext::InitialWindowFlags(bool fullscreen) noexcept {
-	auto flags = static_cast<uint32_t>(SDL_WINDOW_VULKAN);
+	auto flags = static_cast<uint32_t>(SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
 	if (fullscreen) {
 		flags |= static_cast<uint32_t>(SDL_WINDOW_FULLSCREEN);
 	}

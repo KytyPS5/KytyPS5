@@ -1,7 +1,7 @@
-[submodule "3rdparty/SDL2"]
-	path = 3rdparty/SDL2
+[submodule "3rdparty/SDL3"]
+	path = 3rdparty/SDL3
 	url = https://github.com/libsdl-org/SDL.git
-	branch = SDL2
+	branch = release-3.4.x
 [submodule "3rdparty/magic_enum"]
 	path = 3rdparty/magic_enum
 	url = https://github.com/Neargye/magic_enum.git

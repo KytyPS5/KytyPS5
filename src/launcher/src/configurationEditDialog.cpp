@@ -3,7 +3,6 @@
 #include "common/emulatorConfig.h"
 #include "configuration.h"
 #include "mandatoryLineEdit.h"
-#include "SDL.h"
 
 #include <QAbstractItemView>
 #include <QCheckBox>
@@ -28,6 +27,8 @@
 #include <QTreeView>
 #include <QVBoxLayout>
 #include <QtAlgorithms>
+
+#include <SDL3/SDL.h>
 
 #if QT_CONFIG(vulkan)
 #include <QVulkanInstance>
@@ -113,8 +114,8 @@ ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* p
 	connect(m_ui->comboBox_shader_log_direction, &QComboBox::currentTextChanged, this,
 	        [this](const QString& text) {
 		        auto log = TextToEnum<Configuration::LogDirection>(text);
-		        m_ui->lineEdit_shader_log_folder->setEnabled(
-		            log == Configuration::LogDirection::File);
+		        m_ui->lineEdit_shader_log_folder->setEnabled(log ==
+		                                                     Configuration::LogDirection::File);
 	        });
 	connect(m_ui->checkBox_cmd_dump, &QCheckBox::toggled, this,
 	        [this](bool flag) { m_ui->lineEdit_cmd_dump_folder->setEnabled(flag); });
@@ -173,21 +174,22 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	microphone->clear();
 	microphone->addItem(tr("None"), QString {});
 	microphone->setToolTip(tr("Microphone used by games. None supplies silence."));
-	SDL_SetMainReady();
-	if (SDL_InitSubSystem(SDL_INIT_AUDIO) == 0) {
-		const int device_count = SDL_GetNumAudioDevices(SDL_TRUE);
+	if (SDL_InitSubSystem(SDL_INIT_AUDIO)) {
+		int                device_count = 0;
+		SDL_AudioDeviceID* devices      = SDL_GetAudioRecordingDevices(&device_count);
 		for (int i = 0; i < device_count; i++) {
-			if (const auto* device = SDL_GetAudioDeviceName(i, SDL_TRUE); device != nullptr) {
+			if (const auto* device = SDL_GetAudioDeviceName(devices[i]); device != nullptr) {
 				const auto name = QString::fromUtf8(device);
 				if (microphone->findData(name) < 0) {
 					microphone->addItem(name, name);
 				}
 			}
 		}
+		SDL_free(devices);
 		SDL_QuitSubSystem(SDL_INIT_AUDIO);
 	} else {
-		microphone->setToolTip(tr("Microphones could not be listed: %1")
-		                           .arg(QString::fromUtf8(SDL_GetError())));
+		microphone->setToolTip(
+		    tr("Microphones could not be listed: %1").arg(QString::fromUtf8(SDL_GetError())));
 	}
 	if (microphone->findData(info.audio_input_device) < 0) {
 		microphone->addItem(tr("%1 (unavailable)").arg(info.audio_input_device),
@@ -366,8 +368,8 @@ void ConfigurationEditDialog::resizeEvent(QResizeEvent* event) {
 }
 
 static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui) {
-	info.user_name = ui.lineEdit_user_name->text().trimmed();
-	info.user_id   = ui.spinBox_user_id->value();
+	info.user_name          = ui.lineEdit_user_name->text().trimmed();
+	info.user_id            = ui.spinBox_user_id->value();
 	info.audio_input_device = ui.comboBox_audio_input_device->currentData().toString();
 	info.screen_resolution =
 	    TextToEnum<Configuration::Resolution>(ui.comboBox_screen_resolution->currentText());
@@ -388,15 +390,15 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui) {
 #endif
 	info.shader_optimization_type = TextToEnum<Configuration::ShaderOptimizationType>(
 	    ui.comboBox_shader_optimization_type->currentText());
-	info.shader_log_direction = TextToEnum<Configuration::LogDirection>(
-	    ui.comboBox_shader_log_direction->currentText());
+	info.shader_log_direction =
+	    TextToEnum<Configuration::LogDirection>(ui.comboBox_shader_log_direction->currentText());
 	info.shader_log_folder           = ui.lineEdit_shader_log_folder->text();
 	info.command_buffer_dump_enabled = ui.checkBox_cmd_dump->isChecked();
 	info.command_buffer_dump_folder  = ui.lineEdit_cmd_dump_folder->text();
 	info.printf_direction =
 	    TextToEnum<Configuration::LogDirection>(ui.comboBox_printf_direction->currentText());
 	info.printf_output_file = ui.lineEdit_printf_file->text();
-	info.profiler_enabled = ui.checkBox_profiler->isChecked();
+	info.profiler_enabled   = ui.checkBox_profiler->isChecked();
 }
 
 void ConfigurationEditDialog::save() {

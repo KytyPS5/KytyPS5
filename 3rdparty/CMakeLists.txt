@@ -29,7 +29,7 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(xbyak zydis)
 
 set(SDL_SHARED OFF CACHE BOOL "" FORCE)
-add_subdirectory(SDL2)
+add_subdirectory(SDL3)
 
 add_library(Vulkan-Headers INTERFACE)
 add_library(Vulkan::Headers ALIAS Vulkan-Headers)

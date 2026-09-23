@@ -427,6 +427,12 @@ constexpr uint32_t DB_EQAA_STATIC_ANCHOR_ASSOCIATIONS_MASK  = 0x1;
 constexpr uint32_t DB_SHADER_CONTROL                             = 0x203;
 constexpr uint32_t DB_SHADER_CONTROL_Z_EXPORT_ENABLE_SHIFT       = 0;
 constexpr uint32_t DB_SHADER_CONTROL_Z_EXPORT_ENABLE_MASK        = 0x1;
+// The pixel shader exports the stencil reference through MRTZ channel 1 instead of taking it from
+// DB_STENCILREFMASK: test value in bits 7:0, op value in bits 15:8.
+constexpr uint32_t DB_SHADER_CONTROL_STENCIL_TEST_VAL_EXPORT_ENABLE_SHIFT = 1;
+constexpr uint32_t DB_SHADER_CONTROL_STENCIL_TEST_VAL_EXPORT_ENABLE_MASK  = 0x1;
+constexpr uint32_t DB_SHADER_CONTROL_STENCIL_OP_VAL_EXPORT_ENABLE_SHIFT   = 2;
+constexpr uint32_t DB_SHADER_CONTROL_STENCIL_OP_VAL_EXPORT_ENABLE_MASK    = 0x1;
 constexpr uint32_t DB_SHADER_CONTROL_Z_ORDER_SHIFT               = 4;
 constexpr uint32_t DB_SHADER_CONTROL_Z_ORDER_MASK                = 0x3;
 constexpr uint32_t DB_SHADER_CONTROL_KILL_ENABLE_SHIFT           = 6;

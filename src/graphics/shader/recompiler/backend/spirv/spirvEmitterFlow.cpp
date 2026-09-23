@@ -525,6 +525,38 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 				state.builder.AddFunction(spv::OpBitcast, TypeF32(state), f32, raw);
 				state.builder.AddFunction(spv::OpStore, state.depth_variable, f32);
 			}
+			if ((exp.en & 2u) != 0u && state.stencil_ref_variable != 0) {
+				// Vulkan has one reference per fragment, so take the half the guest enabled, preferring the op
+				// value - that is the one that reaches the plane.
+				const uint32_t shift =
+				    state.input_info.pixel->ps_stencil_op_val_export_enable ? 8u : 0u;
+				const auto raw      = ExportRawComponent(ctx, data, 1);
+				auto       selected = raw;
+				if (shift != 0) {
+					const auto shifted = state.builder.AllocateId();
+					state.builder.AddFunction(spv::OpShiftRightLogical, TypeU32(state), shifted,
+					                          raw, ConstantU32(state, shift));
+					selected = shifted;
+				}
+				const auto masked = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpBitwiseAnd, TypeU32(state), masked, selected,
+				                          ConstantU32(state, 0xffu));
+				const auto value = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpBitcast, TypeI32(state), value, masked);
+				state.builder.AddFunction(spv::OpStore, state.stencil_ref_variable, value);
+			}
+			if ((exp.en & 2u) != 0u && state.stencil_bit_pass_variable != 0) {
+				// Op value 15:8; the return path discards the fragment when this bit is clear.
+				const uint32_t bit     = 8u + state.input_info.pixel->ps_stencil_bit_pass - 1u;
+				const auto     raw     = ExportRawComponent(ctx, data, 1);
+				const auto     shifted = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpShiftRightLogical, TypeU32(state), shifted, raw,
+				                          ConstantU32(state, bit));
+				const auto keep = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpBitwiseAnd, TypeU32(state), keep, shifted,
+				                          ConstantU32(state, 1u));
+				state.builder.AddFunction(spv::OpStore, state.stencil_bit_pass_variable, keep);
+			}
 			if ((exp.en & 4u) != 0u && state.sample_mask_variable != 0) {
 				const auto raw     = ExportRawComponent(ctx, data, 2);
 				const auto value   = state.builder.AllocateId();

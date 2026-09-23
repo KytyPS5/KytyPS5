@@ -3150,7 +3150,11 @@ void GraphicsInitJmpTablesCxIndirect() {
 
 	g_hw_ctx_indirect_func[Pm4::DB_SHADER_CONTROL] = [](KYTY_HW_CTX_INDIRECT_ARGS) {
 		HW::DepthShaderControl db_shader_control {};
-		db_shader_control.other_bits = value & 0xFFFF908Eu;
+		db_shader_control.other_bits = value & 0xFFFF9088u;
+		db_shader_control.shader_stencil_test_val_export_enable =
+		    KYTY_PM4_GET(value, DB_SHADER_CONTROL, STENCIL_TEST_VAL_EXPORT_ENABLE) != 0;
+		db_shader_control.shader_stencil_op_val_export_enable =
+		    KYTY_PM4_GET(value, DB_SHADER_CONTROL, STENCIL_OP_VAL_EXPORT_ENABLE) != 0;
 		db_shader_control.conservative_z_export_value =
 		    KYTY_PM4_GET(value, DB_SHADER_CONTROL, CONSERVATIVE_Z_EXPORT);
 		db_shader_control.shader_z_behavior = KYTY_PM4_GET(value, DB_SHADER_CONTROL, Z_ORDER);

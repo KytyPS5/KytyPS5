@@ -1068,6 +1068,18 @@ void WindowContext::CreateVulkan() {
 			device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 			graphic_ctx.memory_budget_ext_enabled = true;
 		}
+		graphic_ctx.shader_stencil_export_enabled =
+		    HasExtension(available_extensions, VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME);
+		if (graphic_ctx.shader_stencil_export_enabled) {
+			device_extensions.push_back(VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME);
+			LOGF("Shader stencil export support: Yes (%s)\n",
+			     device_properties.deviceName.data());
+		} else {
+			LOGF("Shader stencil export support: No - the selected device (%s) does not "
+			     "expose %s\n",
+			     device_properties.deviceName.data(),
+			     VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME);
+		}
 		for (const auto* extension: {VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
 		                             VK_KHR_MAINTENANCE_8_EXTENSION_NAME,
 		                             VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,

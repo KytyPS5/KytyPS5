@@ -174,6 +174,7 @@ struct EmitterState {
 	// Key searches emitted at a block's top level, reused by later accesses in that block.
 	std::map<std::pair<const IR::Block*, std::array<uint32_t, 4>>, uint32_t> block_key_searches;
 	uint32_t                   pixel_valid_mask_variable             = 0;
+	uint32_t                   stencil_bit_pass_variable             = 0;
 	// Loop budget guard: when armed, every loop header this emitter can reach charges one unit
 	// against a per-invocation budget and leaves the loop when it runs out, so a runaway trip
 	// count becomes a wrong picture rather than a device lost to the watchdog.
@@ -193,6 +194,7 @@ struct EmitterState {
 	uint32_t                   layer_variable                        = 0;
 	uint32_t                   viewport_index_variable               = 0;
 	uint32_t                   depth_variable                        = 0;
+	uint32_t                   stencil_ref_variable                  = 0;
 	uint32_t                   sample_mask_variable                  = 0;
 	std::vector<InputBinding>  inputs;
 	std::vector<OutputBinding> outputs;

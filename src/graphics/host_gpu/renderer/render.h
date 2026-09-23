@@ -180,7 +180,8 @@ private:
 	void ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,
 	                              uint32_t render_target_slice_offset, uint32_t render_target_slot,
 	                              bool ignore_target_mask = false, bool exact_format = false);
-	void ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& target);
+	void               ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& target,
+	                                            uint8_t stencil_export_bits = 0);
 	[[nodiscard]] bool DepthStencilCopy(CommandBuffer& buffer);
 	[[nodiscard]] bool CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo& draw,
 	                                   const DrawEmitInfo& emit, DrawRenderState& state);

@@ -34,6 +34,9 @@ struct GraphicContext {
 	// bool fp64_denorm_preserve = false; // Temporarily disabled.
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                               provoking_vertex_last_enabled         = false;
+	// VK_EXT_shader_stencil_export; without it the guest's stencil exports are dropped before the
+	// program is compiled.
+	bool                               shader_stencil_export_enabled         = false;
 	bool                               pipeline_library_enabled              = false;
 	bool                               pipeline_library_fast_linking         = false;
 	bool                               supports_block_texel_view              = false;

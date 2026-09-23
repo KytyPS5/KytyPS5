@@ -945,7 +945,8 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "ResolveRenderDepthTarget");
 	}
-	ResolveRenderDepthTarget(buffer, state.depth_info);
+	ResolveRenderDepthTarget(buffer, state.depth_info,
+	                         state.ps_active ? state.programs.stencil_bit_mask : uint8_t {0});
 
 	if (state.color_count == 0 && !state.depth_info.image_id && !state.ps_active) {
 		LogFramebufferSkip(draw.Name(), state.color_info[0], state.depth_info, buffer,
@@ -1194,6 +1195,27 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
 	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
 	    state.programs);
+	const auto&                 stencil_export = state.depth_info.stencil_export;
+	std::array<vk::Pipeline, 8> stencil_bit_pipelines {};
+	if (stencil_export.bits != 0) {
+		EXIT_IF(!state.ps_active || mesh_active);
+		auto bit_info     = state.ps_input_info;
+		auto bit_programs = state.programs;
+		for (uint32_t bit = 0; bit < 8; bit++) {
+			if ((stencil_export.bits & (1u << bit)) == 0) {
+				continue;
+			}
+			EXIT_IF(!state.programs.stencil_bit_pixel[bit]);
+			bit_info.stage     = state.programs.stencil_bit_stage[bit];
+			bit_programs.pixel = state.programs.stencil_bit_pixel[bit];
+			stencil_bit_pipelines[bit] =
+			    m_context.GetPipelineCache()
+			        .GetGraphicsPipeline(std::span {state.color_info, state.color_count},
+			                             state.depth_info, vertex_stages, buffer, &bit_info,
+			                             topology, primitive_restart_enable, bit_programs)
+			        .pipeline;
+		}
+	}
 	vk::ImageAspectFlags feedback_aspects;
 	const auto rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
@@ -1247,15 +1269,13 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	} else {
 		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
 	}
-	if (m_context.GetIndirectKeyFeedback().HasQueued()) {
-		// Reading a table's key bitmap is a buffer copy, and a copy cannot be recorded inside a
-		// render pass instance - which is exactly where a draw leaves the command buffer. Close the
-		// pass first; the next draw reopens it. Every other transfer in the renderer already ends
-		// rendering before recording, and the compute path reaches its own Flush with rendering
-		// already ended, which is why buffer tables observe keys where image tables do not.
-		m_context.GetCommandScheduler().EndRendering();
-		m_context.GetIndirectKeyFeedback().Flush(vk_buffer);
+	if (stencil_export.bits != 0) {
+		RecordStencilExportReplay(vk_buffer, stencil_export, stencil_bit_pipelines,
+		                          rendering.num_color_attachments, [&] {
+			                          EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
+		                          });
 	}
+	// Key bitmap copies cannot sit in a render pass; the next pass end or End records them.
 
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x600u);

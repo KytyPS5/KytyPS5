@@ -8,6 +8,9 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <cstdint>
+#include <functional>
+#include <optional>
+#include <span>
 
 namespace Libs::Graphics {
 
@@ -17,6 +20,34 @@ inline constexpr bool depth_htile_stencil_acceleration_compatible(bool has_stenc
                                                                   bool htile_stencil_disabled) {
 	return !has_stencil || htile_stencil_disabled || has_htile;
 }
+
+struct StencilExportReplay {
+	uint8_t            bits             = 0;
+	vk::CompareOp      depth_compare_op = vk::CompareOp::eAlways;
+	vk::StencilOpState front;
+	vk::StencilOpState back;
+
+	[[nodiscard]] static vk::StencilOpState BitPass(const vk::StencilOpState& face, uint32_t bit);
+};
+
+struct GuestStencilFace {
+	uint8_t compare      = 0;
+	uint8_t fail         = 0;
+	uint8_t zpass        = 0;
+	uint8_t zfail        = 0;
+	uint8_t compare_mask = 0;
+	uint8_t test_value   = 0;
+	uint8_t write_mask   = 0;
+};
+
+[[nodiscard]] std::optional<StencilExportReplay>
+PlanStencilExportReplay(const GuestStencilFace& front, const GuestStencilFace& back,
+                        bool depth_test, bool depth_write, vk::CompareOp depth_compare,
+                        bool depth_bounds, const char** refusal);
+
+void RecordStencilExportReplay(vk::CommandBuffer command, const StencilExportReplay& replay,
+                               std::span<const vk::Pipeline, 8> pipelines,
+                               uint32_t color_attachments, const std::function<void()>& draw);
 
 struct RenderDepthInfo {
 	// Discovery keeps guest image information but can remap the view into a larger cache image.
@@ -34,6 +65,7 @@ struct RenderDepthInfo {
 	bool                        stencil_test_enable      = false;
 	vk::StencilOpState          stencil_front;
 	vk::StencilOpState          stencil_back;
+	StencilExportReplay         stencil_export;
 	ImageId                     image_id;
 
 	[[nodiscard]] vk::ImageAspectFlags AttachmentWriteAspects() const;

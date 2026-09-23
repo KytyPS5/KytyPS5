@@ -354,6 +354,10 @@ struct DepthShaderControl {
 	bool     shader_kill_enable          = false;
 	bool     shader_z_export_enable      = false;
 	bool     shader_mask_export_enable   = false;
+	// DB_SHADER_CONTROL bits 1 and 2: the pixel shader supplies the stencil reference through MRTZ
+	// channel 1, and DB_STENCILREFMASK is ignored for whichever of the two is exported.
+	bool     shader_stencil_test_val_export_enable = false;
+	bool     shader_stencil_op_val_export_enable   = false;
 	bool     shader_dual_export_enable   = false;
 	bool     shader_execute_on_noop      = false;
 	bool     alpha_to_mask_disable       = false;

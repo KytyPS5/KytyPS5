@@ -1556,9 +1556,46 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 
 		ImageId parked {};
 		ImageId parked_layout {};
+		const bool stencil_plane_read = desc.type == BindingType::Texture && !exact_format &&
+		                                !desc.info.IsDepth() && desc.info.bytes_per_block == 1 &&
+		                                desc.info.samples == 1 && desc.info.resources.levels == 1 &&
+		                                desc.info.resources.layers == 1;
 		for (const auto id: candidates) {
 			const auto image = m_slot_images.try_get(id);
-			if (image == nullptr) {
+			if (stencil_plane_read && image != nullptr && image->depth_id &&
+			    image->info.data.address == desc.info.data.address &&
+			    image->info.data.size != desc.info.data.size &&
+			    image->info.extent == desc.info.extent) {
+				result = id;
+				break;
+			}
+		}
+		ImageId stencil_owner {};
+		if (stencil_plane_read && !result && StencilPlaneRedirectEnabled()) {
+			stencil_owner = StencilPlaneOwner(desc);
+			if (stencil_owner && !m_slot_images[stencil_owner].binding.is_target) {
+				const auto owner_epoch = m_slot_images[stencil_owner].GpuWriteEpoch();
+				bool       newer_alias = false;
+				for (const auto id: candidates) {
+					const auto image = m_slot_images.try_get(id);
+					if (image == nullptr || image->depth_id ||
+					    image->info.data.address != desc.info.data.address) {
+						continue;
+					}
+					newer_alias |=
+					    (image->IsGpuModified() && image->GpuWriteEpoch() > owner_epoch) ||
+					    (image->IsBufferModified() && image->BufferWriteEpoch() > owner_epoch);
+				}
+				if (!newer_alias) {
+					result =
+					    AssociateStencil(stencil_owner, m_slot_images[stencil_owner].info.stencil);
+				}
+			}
+		}
+		const bool stencil_plane_found = static_cast<bool>(result);
+		for (const auto id: candidates) {
+			const auto image = m_slot_images.try_get(id);
+			if (image == nullptr || stencil_plane_found) {
 				continue;
 			}
 			if (SameBacking(image->info, desc.info, exact_format)) {

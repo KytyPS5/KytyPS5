@@ -556,10 +556,16 @@ static void ShaderGetStaticInputInfoPS(
 	ps_info.ps_pixel_kill_enable         = sh.db_shader_control.shader_kill_enable;
 	ps_info.ps_depth_export_enable       = sh.db_shader_control.shader_z_export_enable;
 	ps_info.ps_sample_mask_export_enable = sh.db_shader_control.shader_mask_export_enable;
+	ps_info.ps_stencil_test_val_export_enable =
+	    sh.db_shader_control.shader_stencil_test_val_export_enable;
+	ps_info.ps_stencil_op_val_export_enable =
+	    sh.db_shader_control.shader_stencil_op_val_export_enable;
 	ps_info.ps_early_z =
 	    (sh.db_shader_control.shader_z_behavior == 1 && !sh.db_shader_control.shader_kill_enable &&
 	     !sh.db_shader_control.shader_z_export_enable &&
-	     !sh.db_shader_control.shader_mask_export_enable);
+	     !sh.db_shader_control.shader_mask_export_enable &&
+	     !sh.db_shader_control.shader_stencil_test_val_export_enable &&
+	     !sh.db_shader_control.shader_stencil_op_val_export_enable);
 	ps_info.ps_execute_on_noop = sh.db_shader_control.shader_execute_on_noop;
 
 	for (uint32_t i = 0; i < ps_info.input_num; i++) {
@@ -676,6 +682,9 @@ void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>
 	key.push_back(static_cast<uint32_t>(info.ps_pixel_kill_enable));
 	key.push_back(static_cast<uint32_t>(info.ps_depth_export_enable));
 	key.push_back(static_cast<uint32_t>(info.ps_sample_mask_export_enable));
+	key.push_back(static_cast<uint32_t>(info.ps_stencil_test_val_export_enable));
+	key.push_back(static_cast<uint32_t>(info.ps_stencil_op_val_export_enable));
+	key.push_back(static_cast<uint32_t>(info.ps_stencil_bit_pass));
 	key.push_back(static_cast<uint32_t>(info.ps_early_z));
 	key.push_back(static_cast<uint32_t>(info.dual_source_blending));
 	key.push_back(static_cast<uint32_t>(info.alpha_blend_source));

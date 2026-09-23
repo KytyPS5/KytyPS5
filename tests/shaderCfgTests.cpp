@@ -45,6 +45,7 @@
 #include <iterator>
 #include <span>
 #include <sstream>
+#include <string_view>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -58,6 +59,12 @@
 
 namespace Libs::Graphics {
 namespace {
+
+// Upstream removed Common::ContainsStr; these tests only ever needed a substring test.
+[[nodiscard]] static bool ContainsStr(std::string_view haystack, std::string_view needle) {
+	return haystack.find(needle) != std::string_view::npos;
+}
+
 
 void Check(bool value, const char *text) {
   if (!value) {
@@ -15590,6 +15597,71 @@ void TestPixelProgramCacheBindingIdentity() {
 
 }
 
+// A pixel shader that exports a material id through MRTZ channel 1, with
+// DB_SHADER_CONTROL.STENCIL_OP_VAL_EXPORT_ENABLE set and DB_STENCILREFMASK.STENCILOPVAL at 0.
+void TestPixelStencilReferenceExport() {
+  const uint32_t shader[] = {
+      EncodeExp0(0x08, 0x3), EncodeExp1(3, 0, 0, 0), 0xbf810000u,
+  };
+
+  const auto compile = [&](ShaderPixelInputInfo &info) {
+    auto options = MakeCompileOptions(ShaderType::Pixel);
+    options.input_info.pixel = &info;
+    return RecompileForTest(shader, options);
+  };
+
+  ShaderPixelInputInfo no_export{};
+  const auto dropped = compile(no_export);
+  Check(!ContainsStr(DisassembleSpirvBinary(dropped.spirv),
+                             "FragStencilRefEXT"),
+        "MRTZ stencil channel produced a stencil reference the registers never asked for");
+
+  ShaderPixelInputInfo op_export{};
+  op_export.ps_stencil_op_val_export_enable = true;
+  const auto exported = compile(op_export);
+  const auto source = DisassembleSpirvBinary(exported.spirv);
+  Check(ContainsStr(source, "FragStencilRefEXT") &&
+            ContainsStr(source, "StencilExportEXT") &&
+            ContainsStr(source, "SPV_EXT_shader_stencil_export"),
+        "MRTZ stencil channel did not reach FragStencilRefEXT");
+  Check(ContainsStr(source, "OpShiftRightLogical"),
+        "exported stencil op value was not taken from bits 15:8");
+  CheckSpirvBinaryValidates(exported.spirv);
+
+  ShaderPixelInputInfo test_export{};
+  test_export.ps_stencil_test_val_export_enable = true;
+  const auto test_source = DisassembleSpirvBinary(compile(test_export).spirv);
+  Check(ContainsStr(test_source, "FragStencilRefEXT") &&
+            !ContainsStr(test_source, "OpShiftRightLogical"),
+        "exported stencil test value was not taken from bits 7:0");
+
+  Check(MakeStageStaticKey(no_export) != MakeStageStaticKey(op_export) &&
+            MakeStageStaticKey(op_export) != MakeStageStaticKey(test_export),
+        "pixel shader identity omitted the stencil reference export");
+
+  ShaderPixelInputInfo bit_pass{};
+  bit_pass.ps_depth_export_enable = true;
+  bit_pass.ps_stencil_bit_pass = 3;
+  const auto variant = compile(bit_pass);
+  const auto variant_source = DisassembleSpirvBinary(variant.spirv);
+  Check(!ContainsStr(variant_source, "FragStencilRefEXT") &&
+            !ContainsStr(variant_source, "StencilExportEXT"),
+        "the stencil replay variant still asks for the stencil export builtin");
+  Check(ContainsStr(variant_source, "FragDepth"),
+        "the stencil replay variant dropped the depth export it is matched by");
+  Check(ContainsStr(variant_source, "stencil_bit_pass_keep") &&
+            ContainsStr(variant_source, "OpKill") &&
+            ContainsStr(variant_source, "OpShiftRightLogical") &&
+            ContainsStr(variant_source, "OpConstant %uint 10"),
+        "the stencil replay variant does not discard on exported op value bit 2");
+  CheckSpirvBinaryValidates(variant.spirv);
+  auto other_bit = bit_pass;
+  other_bit.ps_stencil_bit_pass = 4;
+  Check(MakeStageStaticKey(bit_pass) != MakeStageStaticKey(other_bit) &&
+            MakeStageStaticKey(bit_pass) != MakeStageStaticKey(ShaderPixelInputInfo{}),
+        "pixel shader identity omitted the stencil replay bit");
+}
+
 void TestGraphicsPushConstantPlacement() {
   using BindingKind = ShaderRecompiler::IR::DescriptorBindingKind;
   constexpr uint32_t OffsetDecoration = 35;
@@ -16456,6 +16528,7 @@ int main() {
   TestNewShaderRecompilerPixelPipelineEntry();
   TestComputeLdsAllocationIdentity();
   TestPixelProgramCacheBindingIdentity();
+  TestPixelStencilReferenceExport();
   TestGraphicsPushConstantPlacement();
   TestNewShaderRecompilerUnsupportedMemoryDecode();
   TestNewShaderRecompilerCfgStructuresEnteredSelectionRegion();

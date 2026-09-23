@@ -467,10 +467,33 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 			inputs.AddBuiltin(kind);
 			break;
 		}
-		case ValueOpcode::SetAttribute: {
-			const auto index = inst.Flags<ExportFlags>().index;
-			if (index >= program.export_info.size()) {
-				return Fail("typed export metadata index is out of range");
+	}
+}
+
+void CollectOutputs(const Program& program, ShaderStageInputInfo input_info, ShaderInfo& info) {
+	const bool alpha_remap = program.stage == ShaderType::Pixel && input_info.pixel != nullptr &&
+	                         input_info.pixel->alpha_blend_source != ShaderAlphaBlendSource::None;
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			if (inst.GetOpcode() != ValueOpcode::SetAttribute) {
+				continue;
+			}
+			const auto& export_info = program.export_info[inst.Flags<ExportFlags>().index];
+			if (export_info.kind == ExportTargetKind::MrtZ) {
+				if (program.stage == ShaderType::Pixel && (export_info.en & 0x1u) != 0 &&
+				    input_info.pixel->ps_depth_export_enable) {
+					AddOutput(info, StageOutputKind::Depth, 0, 0, "gl_FragDepth");
+				}
+				if (program.stage == ShaderType::Pixel && (export_info.en & 0x4u) != 0 &&
+				    input_info.pixel->ps_sample_mask_export_enable) {
+					AddOutput(info, StageOutputKind::SampleMask, 0, 0, "gl_SampleMask");
+				}
+				if (program.stage == ShaderType::Pixel && (export_info.en & 0x2u) != 0 &&
+				    (input_info.pixel->ps_stencil_test_val_export_enable ||
+				     input_info.pixel->ps_stencil_op_val_export_enable)) {
+					AddOutput(info, StageOutputKind::Stencil, 0, 0, "gl_FragStencilRefARB");
+				}
+				continue;
 			}
 			const auto& exp = program.export_info[index];
 			if (exp.kind == ExportTargetKind::Position && exp.index != 0 && exp.en != 0 &&

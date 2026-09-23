@@ -1063,8 +1063,8 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			}
 		} else if (options.stage == ShaderType::Mesh) {
 			const auto& mesh = options.input_info.vertex->mesh;
-			EXIT_NOT_IMPLEMENTED(options.wave_size != 64u || mesh.primitives_per_group == 0u ||
-			                     mesh.vertices_per_group > 64u || total_threads > 15u * 64u);
+			EXIT_NOT_IMPLEMENTED(mesh.primitives_per_group == 0u || mesh.vertices_per_group > 64u ||
+			                     total_threads > 15u * options.wave_size);
 			const auto u32  = [](uint32_t value) { return IR::U32(IR::Value(value)); };
 			const auto draw = [&](uint32_t index) {
 				return IR::U32(
@@ -1089,12 +1089,15 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			    entry_ir.IAdd(IR::U32(entry_ir.Emit(IR::ValueOpcode::UDiv32,
 			                                       {subtract_saturate(vertices, size), step})),
 			                  u32(1)));
-			const auto wave            = entry_ir.ShiftRightLogical(local, u32(6));
-			const auto wave_base       = entry_ir.BitwiseAnd(local, u32(~63u));
-			const auto vertex_count    = minimum(subtract_saturate(vertices, wave_base), u32(64));
-			const auto primitive_count = minimum(subtract_saturate(primitives, wave_base), u32(64));
+			const auto wave = entry_ir.ShiftRightLogical(local, u32(options.wave_size == 32u ? 5u : 6u));
+			const auto wave_base = entry_ir.BitwiseAnd(local, u32(~(options.wave_size - 1u)));
+			const auto vertex_count =
+			    minimum(subtract_saturate(vertices, wave_base), u32(options.wave_size));
+			const auto primitive_count =
+			    minimum(subtract_saturate(primitives, wave_base), u32(options.wave_size));
 			const auto wave_info = entry_ir.BitwiseOr(entry_ir.ShiftLeftLogical(wave, u32(24)),
-			                                          u32(((total_threads + 63u) / 64u) << 28u));
+			                                          u32(((total_threads + options.wave_size - 1u) /
+			                                               options.wave_size) << 28u));
 			entry_ir.SetScalarReg(
 			    static_cast<IR::ScalarReg>(3),
 			    entry_ir.BitwiseOr(wave_info, entry_ir.BitwiseOr(entry_ir.ShiftLeftLogical(

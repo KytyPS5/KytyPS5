@@ -1,6 +1,5 @@
 #include "libs/controller.h"
 
-#include "SDL.h"
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
@@ -12,6 +11,7 @@
 #include "libs/libs.h"
 #include "libs/padData.h"
 
+#include <SDL3/SDL.h>
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -85,10 +85,10 @@ struct ControllerState {
 		uint16_t y    = 0;
 	};
 
-	uint64_t time                                  = 0;
-	uint32_t buttons                               = 0;
-	int      axes[static_cast<int>(Axis::AxisMax)] = {128, 128, 128, 128, 0, 0};
-	Touch    touch[2];
+	uint64_t             time                                  = 0;
+	uint32_t             buttons                               = 0;
+	int                  axes[static_cast<int>(Axis::AxisMax)] = {128, 128, 128, 128, 0, 0};
+	Touch                touch[2];
 	std::array<float, 3> accel {0.0f, 1.0f, 0.0f};
 	std::array<float, 3> gyro {};
 	std::array<float, 4> orientation {0.0f, 0.0f, 0.0f, 1.0f};
@@ -147,13 +147,13 @@ static void pad_fill_data(PadData* data, const ControllerState& state, bool conn
 
 	std::memset(data, 0, sizeof(*data));
 
-	data->buttons           = state.buttons;
-	data->left_stick_x      = state.axes[static_cast<int>(Axis::LeftX)];
-	data->left_stick_y      = state.axes[static_cast<int>(Axis::LeftY)];
-	data->right_stick_x     = state.axes[static_cast<int>(Axis::RightX)];
-	data->right_stick_y     = state.axes[static_cast<int>(Axis::RightY)];
-	data->analog_buttons_l2 = state.axes[static_cast<int>(Axis::TriggerLeft)];
-	data->analog_buttons_r2 = state.axes[static_cast<int>(Axis::TriggerRight)];
+	data->buttons            = state.buttons;
+	data->left_stick_x       = state.axes[static_cast<int>(Axis::LeftX)];
+	data->left_stick_y       = state.axes[static_cast<int>(Axis::LeftY)];
+	data->right_stick_x      = state.axes[static_cast<int>(Axis::RightX)];
+	data->right_stick_y      = state.axes[static_cast<int>(Axis::RightY)];
+	data->analog_buttons_l2  = state.axes[static_cast<int>(Axis::TriggerLeft)];
+	data->analog_buttons_r2  = state.axes[static_cast<int>(Axis::TriggerRight)];
 	data->acceleration_x     = state.accel[0];
 	data->acceleration_y     = state.accel[1];
 	data->acceleration_z     = state.accel[2];
@@ -293,11 +293,10 @@ void GameController::Connect(int id) {
 	m_connected_ids.push_back(id);
 
 	if (id != HOST_INPUT_CONTROLLER_ID) {
-		if (auto* pad = SDL_GameControllerFromInstanceID(static_cast<SDL_JoystickID>(id));
-		    pad != nullptr) {
+		if (auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(id)); pad != nullptr) {
 			for (auto sensor: {SDL_SENSOR_ACCEL, SDL_SENSOR_GYRO}) {
-				if (SDL_GameControllerHasSensor(pad, sensor) &&
-				    SDL_GameControllerSetSensorEnabled(pad, sensor, SDL_TRUE) != 0) {
+				if (SDL_GamepadHasSensor(pad, sensor) &&
+				    !SDL_SetGamepadSensorEnabled(pad, sensor, true)) {
 					LOGF("\t enabling controller sensor failed: %s\n", SDL_GetError());
 				}
 			}
@@ -519,22 +518,21 @@ void GameController::ResetInputState() {
 void GameController::ReleaseHostPads() {
 	Common::LockGuard lock(m_mutex);
 
-	std::vector<SDL_GameController*> pads;
+	std::vector<SDL_Gamepad*> pads;
 	for (const auto id: m_connected_ids) {
 		if (id == HOST_INPUT_CONTROLLER_ID) {
 			continue;
 		}
-		if (auto* pad = SDL_GameControllerFromInstanceID(static_cast<SDL_JoystickID>(id));
-		    pad != nullptr) {
-			if (SDL_GameControllerGetType(pad) == SDL_CONTROLLER_TYPE_PS5) {
+		if (auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(id)); pad != nullptr) {
+			if (SDL_GetGamepadType(pad) == SDL_GAMEPAD_TYPE_PS5) {
 				DualSenseEffects effect {};
-				effect.enable_bits     = 0x0c;
+				effect.enable_bits      = 0x0c;
 				effect.right_trigger[0] = 0x05;
 				effect.left_trigger[0]  = 0x05;
-				(void)SDL_GameControllerSendEffect(pad, &effect, sizeof(effect));
+				(void)SDL_SendGamepadEffect(pad, &effect, sizeof(effect));
 			}
-			(void)SDL_GameControllerRumble(pad, 0, 0, 0);
-			(void)SDL_GameControllerSetLED(pad, 0, 0, 0);
+			(void)SDL_RumbleGamepad(pad, 0, 0, 0);
+			(void)SDL_SetGamepadLED(pad, 0, 0, 0);
 			pads.push_back(pad);
 		}
 	}
@@ -542,7 +540,7 @@ void GameController::ReleaseHostPads() {
 	if (!pads.empty()) {
 		SDL_Delay(RELEASE_FLUSH_MS);
 		for (auto* pad: pads) {
-			SDL_GameControllerClose(pad);
+			SDL_CloseGamepad(pad);
 		}
 	}
 
@@ -556,23 +554,23 @@ void GameController::SetVibration(uint8_t large_motor, uint8_t small_motor) {
 		return;
 	}
 
-	auto* pad = SDL_GameControllerFromInstanceID(static_cast<SDL_JoystickID>(m_active_id));
+	auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(m_active_id));
 	if (pad == nullptr) {
 		return;
 	}
 
 	const auto large = static_cast<uint16_t>(large_motor * 0x101U);
 	const auto small = static_cast<uint16_t>(small_motor * 0x101U);
-	if (SDL_GameControllerRumble(pad, large, small, RUMBLE_DURATION_MS) != 0) {
+	if (!SDL_RumbleGamepad(pad, large, small, RUMBLE_DURATION_MS)) {
 		LOGF("\t rumble failed: %s\n", SDL_GetError());
 	}
 }
 
 void GameController::SetLightBar(uint8_t r, uint8_t g, uint8_t b) {
 	Common::LockGuard lock(m_mutex);
-	if (auto* pad = SDL_GameControllerFromInstanceID(static_cast<SDL_JoystickID>(m_active_id));
+	if (auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(m_active_id));
 	    pad != nullptr) {
-		(void)SDL_GameControllerSetLED(pad, r, g, b);
+		(void)SDL_SetGamepadLED(pad, r, g, b);
 	}
 }
 
@@ -599,9 +597,9 @@ bool GameController::SetTriggerEffect(const PadTriggerEffectParam& param) {
 	}
 
 	Common::LockGuard lock(m_mutex);
-	auto* pad = SDL_GameControllerFromInstanceID(static_cast<SDL_JoystickID>(m_active_id));
-	if (pad != nullptr && SDL_GameControllerGetType(pad) == SDL_CONTROLLER_TYPE_PS5) {
-		(void)SDL_GameControllerSendEffect(pad, &effect, sizeof(effect));
+	auto*             pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(m_active_id));
+	if (pad != nullptr && SDL_GetGamepadType(pad) == SDL_GAMEPAD_TYPE_PS5) {
+		(void)SDL_SendGamepadEffect(pad, &effect, sizeof(effect));
 	}
 	return true;
 }

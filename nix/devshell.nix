@@ -1,8 +1,7 @@
 { pkgs }:
 
 let
-  # Build-time dependencies. Every -dev package the bundled SDL2 probes for must
-  # be listed here, otherwise SDL2 quietly drops the audio/Wayland/udev backends.
+  # Build-time dependencies for the bundled SDL3 audio, video and input backends.
   buildDeps = with pkgs; [
     qt6.qtbase # Concurrent, Network, Widgets (launcher)
     vulkan-headers
@@ -18,6 +17,7 @@ let
     libXi
     libXrandr
     libXScrnSaver
+    libXtst
     libxkbcommon
     # Wayland
     wayland
@@ -46,6 +46,7 @@ let
     libXi
     libXrandr
     libXScrnSaver
+    libXtst
     libxkbcommon
     wayland
     libdecor

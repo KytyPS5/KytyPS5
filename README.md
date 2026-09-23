@@ -174,7 +174,7 @@ build has no working sound and no gamepad hotplug:
 sudo apt-get install --no-install-recommends \
   clang lld ninja-build cmake git glslang-tools pkg-config \
   libgl1-mesa-dev libx11-dev libxcursor-dev libxext-dev libxfixes-dev \
-  libxi-dev libxrandr-dev libxss-dev libxkbcommon-dev \
+  libxi-dev libxrandr-dev libxss-dev libxtst-dev libxkbcommon-dev \
   libasound2-dev libpulse-dev libudev-dev libdbus-1-dev libwayland-dev wayland-protocols
 ```
 

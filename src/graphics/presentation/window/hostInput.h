@@ -11,7 +11,9 @@ void               HostInputInit();
 void               HostInputKey(int key_code, bool down);
 void               HostInputMouseButton(uint8_t mouse_button, bool down);
 void               HostInputToggleMouseToJoystick();
-[[nodiscard]] bool HostInputWaitEvent(SDL_Event* event);
+// max_wait_ms caps how long we'll block even if nothing would otherwise wake us up;
+// pass -1 to wait indefinitely for the next event.
+[[nodiscard]] bool HostInputWaitEvent(SDL_Event* event, int max_wait_ms = -1);
 
 } // namespace Libs::Graphics
 

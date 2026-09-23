@@ -407,16 +407,30 @@ int PollMouse(uint64_t now_ms) {
 	return MOUSE_POLL_INTERVAL_MS;
 }
 
-bool HostInputWaitEvent(SDL_Event* event) {
+bool HostInputWaitEvent(SDL_Event* event, int max_wait_ms) {
 	if (!g_mouse.enabled || SDL_GetKeyboardFocus() == nullptr) {
 		CenterMouseStick();
-		if (SDL_WaitEvent(event) == 0) {
+		if (max_wait_ms < 0) {
+			if (SDL_WaitEvent(event) == 0) {
+				EXIT("%s\n", SDL_GetError());
+			}
+			return true;
+		}
+
+		SDL_ClearError();
+		if (SDL_WaitEventTimeout(event, max_wait_ms) != 0) {
+			return true;
+		}
+		if (SDL_GetError()[0] != '\0') {
 			EXIT("%s\n", SDL_GetError());
 		}
-		return true;
+		return false;
 	}
 
-	const int timeout_ms = PollMouse(SDL_GetTicks64());
+	int timeout_ms = PollMouse(SDL_GetTicks64());
+	if (max_wait_ms >= 0 && max_wait_ms < timeout_ms) {
+		timeout_ms = max_wait_ms;
+	}
 	SDL_ClearError();
 	if (SDL_WaitEventTimeout(event, timeout_ms) != 0) {
 		return true;

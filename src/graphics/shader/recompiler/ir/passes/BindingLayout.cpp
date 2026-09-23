@@ -132,6 +132,9 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword) {
 	}
 	const bool uses_flattened_runtime =
 	    !program.srt_reads.empty() ||
+	    std::ranges::any_of(
+	        program.info.buffers,
+	        [](const BufferResource& buffer) { return buffer.indirect_search_iterations != 0u; }) ||
 	    std::ranges::any_of(program.info.images, [](const ImageResource& image) {
 		    return image.indirect_search_iterations != 0u;
 	    });

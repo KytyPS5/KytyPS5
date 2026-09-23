@@ -83,6 +83,12 @@ static vk::StencilOpState ConvertStencilState(
 	}
 	std::array<vk::StencilOp, 3> converted {};
 	for (size_t i = 0; i < operations.size(); i++) {
+		// An unreachable stencil outcome imposes no replacement-reference constraint.
+		if ((i == 0 && compare == static_cast<uint8_t>(vk::CompareOp::eAlways)) ||
+		    (i != 0 && compare == static_cast<uint8_t>(vk::CompareOp::eNever))) {
+			converted[i] = vk::StencilOp::eKeep;
+			continue;
+		}
 		converted[i] = ConvertStencilOp(operations[i], state.writeMask, op_value);
 		if (converted[i] != vk::StencilOp::eReplace) {
 			continue;

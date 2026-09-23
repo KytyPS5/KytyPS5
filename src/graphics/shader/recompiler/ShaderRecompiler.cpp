@@ -601,7 +601,13 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	LowerTessellationMemory(ir, options);
 	IR::BuildSrtPlan(ir);
 	IR::EliminateDeadCode(ir.blocks);
-	IR::TrackResources(ir);
+	const ShaderComputeInputInfo* compute =
+	    options.stage == ShaderType::Compute ? options.input_info.compute : nullptr;
+	IR::TrackResources(ir,
+	                   compute ? std::array {compute->threads_num[0], compute->threads_num[1],
+	                                         compute->threads_num[2]}
+	                           : std::array<uint32_t, 3> {},
+	                   compute ? compute->lds_size_dwords * 4u : 0u);
 	IR::EliminateDeadCode(ir.blocks);
 	TranslateResult result;
 	result.program = std::move(ir);

@@ -29,11 +29,18 @@ struct UniformFill {
 };
 
 struct ResourceSnapshot {
+	struct AddressRange {
+		uint64_t address;
+		uint64_t size;
+	};
+
 	std::vector<DescriptorValue> buffers;
 	std::vector<DescriptorValue> images;
 	std::vector<DescriptorValue> samplers;
 	std::vector<uint32_t>        flattened_srt;
 	std::vector<uint32_t>        user_data;
+	// Runtime residency requirements; guest addresses do not specialize the shader.
+	std::vector<AddressRange>    physical_read_ranges;
 	UniformFill                 uniform_fill;
 };
 

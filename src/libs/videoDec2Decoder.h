@@ -38,6 +38,7 @@ struct FrameBuffer {
 struct Output {
 	bool     valid           = false;
 	bool     error_frame     = false;
+	bool     end_of_stream   = false;
 	bool     buffer_accepted = false;
 	uint32_t codec_type      = 0;
 	uint32_t width           = 0;
@@ -78,6 +79,7 @@ void                    Destroy(Instance* instance);
 [[nodiscard]] Result Decode(Instance* instance, const Input& input, const FrameBuffer& frame_buffer,
                             Output* output);
 [[nodiscard]] Result Flush(Instance* instance, const FrameBuffer& frame_buffer, Output* output);
+[[nodiscard]] Result Drain(Instance* instance, const FrameBuffer& frame_buffer, Output* output);
 void                 Reset(Instance* instance);
 [[nodiscard]] bool   GetPictureInfo(void* frame_buffer, PictureInfo* picture_info);
 

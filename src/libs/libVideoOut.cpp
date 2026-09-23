@@ -52,7 +52,7 @@ namespace LibGen5::VrrStatus {
 LIB_VERSION("VideoOutVrrStatus", 1, "VideoOut", 1, 1);
 
 LIB_DEFINE(InitVideoOutVrrStatus_1) {
-	LIB_FUNC("kP2L8t3j-aM", VideoOut::VideoOutGetVrrStatus);
+	LIB_FUNC("kP2L8t3j-aM", VideoOut::VideoOutAddVrrStatusFlagsPrivilege);
 }
 
 } // namespace LibGen5::VrrStatus

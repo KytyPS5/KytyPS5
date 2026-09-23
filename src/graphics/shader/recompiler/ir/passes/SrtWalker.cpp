@@ -462,10 +462,10 @@ private:
 
 SrtWalker::SrtWalker(const ResourcePlan& program, const SrtRuntime& runtime,
                      std::span<const uint8_t> clean_flat_slots, SrtWalker* clean_evaluator,
-                     Value active_mask)
+                     Value active_mask, uint32_t lane_depth)
     : m_program(program), m_runtime(runtime), m_clean_flat_slots(clean_flat_slots),
       m_clean_evaluator(clean_evaluator), m_active_mask(active_mask.Resolve()),
-      m_context(AcquireContext(program)) {}
+      m_lane_depth(lane_depth), m_context(AcquireContext(program)) {}
 
 SrtWalker::~SrtWalker() { --m_program.evaluation_depth; }
 
@@ -623,7 +623,8 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 		                      ? static_cast<uint64_t>(static_cast<uint32_t>(records))
 		                      : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
 		if (aligned > size || size - aligned < sizeof(uint32_t)) {
-			return false;
+			result = 0;
+			return true;
 		}
 		address = ((base & ~uint64_t {3}) + byte_offset) & ~uint64_t {3};
 	} else {
@@ -666,10 +667,11 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 		case ValueOpcode::GetShaderBase: result = m_runtime.shader_base; return true;
 		case ValueOpcode::Phi: return EvaluatePhi(inst, result);
 		case ValueOpcode::ReadFirstLane: {
+			if (m_lane_depth >= 16u) return false;
 			const auto clean_runtime = CleanRuntime(m_runtime);
-			SrtWalker  clean_active(m_program, clean_runtime, {}, nullptr, inst.Arg(1));
+			SrtWalker  clean_active(m_program, clean_runtime, {}, nullptr, inst.Arg(1), m_lane_depth + 1u);
 			SrtWalker  active(m_program, m_runtime, m_clean_flat_slots, &clean_active,
-			                  inst.Arg(1));
+			                  inst.Arg(1), m_lane_depth + 1u);
 			return active.EvaluateWide(inst.Arg(0), result);
 		}
 		case ValueOpcode::BitCastU32F32:
@@ -1001,6 +1003,8 @@ bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
 }
 
 std::span<const uint8_t> SrtWalker::FindActiveSources() {
+	auto& active_flat = m_program.active_flat_slots;
+	active_flat.assign(m_program.srt_reads.size(), 1u);
 	if (m_program.control_flow.empty()) {
 		return {};
 	}
@@ -1010,6 +1014,7 @@ std::span<const uint8_t> SrtWalker::FindActiveSources() {
 		for (const auto source: block.sources) {
 			active.at(source) = 0u;
 		}
+		for (const auto slot: block.flat_slots) active_flat.at(slot) = 0u;
 	}
 	auto& visited = m_program.visited_blocks;
 	auto& pending = m_program.pending_blocks;
@@ -1027,6 +1032,7 @@ std::span<const uint8_t> SrtWalker::FindActiveSources() {
 		for (const auto source: block.sources) {
 			active[source] = 1u;
 		}
+		for (const auto slot: block.flat_slots) active_flat.at(slot) = 1u;
 		uint32_t condition = 0;
 		if (!block.condition.IsEmpty() && m_runtime.read_specialization_memory != nullptr &&
 		    Evaluate(block.condition, condition)) {
@@ -1042,8 +1048,10 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 	if (!m_program.srt_plan_complete) {
 		return false;
 	}
-	flat.resize(m_program.srt_reads.size());
+	flat.assign(m_program.srt_reads.size(), 0u);
 	for (const auto& read: m_program.srt_reads) {
+		if (read.flat_offset >= flat.size()) return false;
+		if (!m_program.active_flat_slots.empty() && !m_program.active_flat_slots.at(read.flat_offset)) continue;
 		const bool clean = read.flat_offset < m_clean_flat_slots.size() &&
 		                   m_clean_flat_slots[read.flat_offset] != 0u;
 		if (clean && (m_clean_evaluator == nullptr || m_runtime.read_specialization_memory == nullptr)) {

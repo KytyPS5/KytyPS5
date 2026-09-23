@@ -348,10 +348,16 @@ bool SetRelativeMouseMode(bool enabled) {
 }
 } // namespace
 
+/** @brief Initialize the configured host-to-controller input mapping. */
 void HostInputInit() {
 	GetInputMap();
 }
 
+/**
+ * @brief Map a keyboard transition to the configured or default controller input.
+ * @param key_code SDL keycode identifying the key.
+ * @param down True for a press, false for a release.
+ */
 void HostInputKey(int key_code, bool down) {
 	const auto& map = GetInputMap();
 	if (map.Custom()) {
@@ -361,6 +367,11 @@ void HostInputKey(int key_code, bool down) {
 	}
 }
 
+/**
+ * @brief Forward a mouse-button transition through the custom input mapping.
+ * @param mouse_button SDL mouse-button identifier; zero is ignored.
+ * @param down True for a press, false for a release.
+ */
 void HostInputMouseButton(uint8_t mouse_button, bool down) {
 	const auto& map = GetInputMap();
 	if (map.Custom() && mouse_button != 0) {
@@ -368,6 +379,12 @@ void HostInputMouseButton(uint8_t mouse_button, bool down) {
 	}
 }
 
+/**
+ * @brief Toggle relative-mouse control of the emulated right stick.
+ *
+ * Disabling centers the stick and clears mouse state. Enabling starts polling
+ * only after SDL successfully enters relative mouse mode.
+ */
 void HostInputToggleMouseToJoystick() {
 	if (g_mouse.enabled) {
 		SetRelativeMouseMode(false);
@@ -388,6 +405,11 @@ void HostInputToggleMouseToJoystick() {
 	LOGF("Mouse to right stick: enabled (F7 to release)\n");
 }
 
+/**
+ * @brief Update the mouse-driven right stick when its next poll is due.
+ * @param now_ms Current SDL tick count in milliseconds.
+ * @return Milliseconds until the next mouse poll.
+ */
 int PollMouse(uint64_t now_ms) {
 	if (now_ms < g_mouse.next_poll) {
 		return static_cast<int>(g_mouse.next_poll - now_ms);
@@ -407,16 +429,27 @@ int PollMouse(uint64_t now_ms) {
 	return MOUSE_POLL_INTERVAL_MS;
 }
 
+/**
+ * @brief Wait for input while allowing periodic main-thread task processing.
+ *
+ * Uses the shorter of the main-task wait limit and any active mouse-poll
+ * interval. SDL errors are fatal; an ordinary timeout returns to the caller.
+ * @param event Non-null output buffer for the received SDL event.
+ * @return True when an event is received, or false when the wait times out.
+ */
 bool HostInputWaitEvent(SDL_Event* event) {
+	// Return periodically so the main loop can drain queued cross-thread work
+	// even if the backend misses the SDL_PushEvent wakeup. A presentation thread
+	// may be waiting for that work (including a window-title update).
+	const int main_task_poll_ms =
+	    std::max(1, static_cast<int>(1000u / (2u * Config::GetVblankFrequency())));
+	int timeout_ms = main_task_poll_ms;
 	if (!g_mouse.enabled || SDL_GetKeyboardFocus() == nullptr) {
 		CenterMouseStick();
-		if (SDL_WaitEvent(event) == 0) {
-			EXIT("%s\n", SDL_GetError());
-		}
-		return true;
+	} else {
+		timeout_ms = std::min(PollMouse(SDL_GetTicks64()), main_task_poll_ms);
 	}
 
-	const int timeout_ms = PollMouse(SDL_GetTicks64());
 	SDL_ClearError();
 	if (SDL_WaitEventTimeout(event, timeout_ms) != 0) {
 		return true;

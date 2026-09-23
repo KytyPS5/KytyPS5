@@ -24,7 +24,9 @@
 #include "loader/systemContent.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <memory>
@@ -151,6 +153,59 @@ static uint32_t VulkanFindQueueFamily(vk::PhysicalDevice device, vk::SurfaceKHR 
 	return static_cast<uint32_t>(-1);
 }
 
+// KYTY_GPU picks among the devices that already passed every check, by decimal index into the
+// enumeration order the log prints or by case-insensitive substring of a device name. Unset, the
+// preference is the last discrete GPU, else the first suitable device.
+struct GpuOverride {
+	bool        requested = false;
+	std::string text;
+	bool        by_index = false;
+	size_t      index    = 0;
+};
+
+static const GpuOverride& GetGpuOverride() {
+	static const GpuOverride g_override = []() {
+		GpuOverride result;
+		const char* text = std::getenv("KYTY_GPU");
+		if (text == nullptr || *text == '\0') {
+			return result;
+		}
+		result.requested = true;
+		result.text      = text;
+
+		constexpr size_t INDEX_LIMIT = 1024;
+		bool             digits      = true;
+		size_t           index       = 0;
+		for (const char c: result.text) {
+			if (c < '0' || c > '9') {
+				digits = false;
+				break;
+			}
+			index = (index < INDEX_LIMIT ? index * 10 + static_cast<size_t>(c - '0')
+			                             : INDEX_LIMIT);
+		}
+		if (digits) {
+			result.by_index = true;
+			result.index    = index;
+		}
+		return result;
+	}();
+	return g_override;
+}
+
+static bool GpuNameContains(const char* name, const std::string& needle) {
+	if (name == nullptr || needle.empty()) {
+		return false;
+	}
+	const std::string haystack = name;
+	const auto        found =
+	    std::search(haystack.begin(), haystack.end(), needle.begin(), needle.end(),
+	                [](unsigned char a, unsigned char b) {
+		                return std::tolower(a) == std::tolower(b);
+	                });
+	return found != haystack.end();
+}
+
 // On failure out_device is null and out_rejections says why each device was skipped.
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surface,
@@ -167,9 +222,35 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 	    });
 	EXIT_NOT_IMPLEMENTED(devices.empty());
 
+	for (size_t i = 0; i < devices.size(); i++) {
+		vk::PhysicalDeviceProperties listed {};
+		devices[i].getProperties(&listed);
+		LOGF("Vulkan physical device [%zu]: %s (%s)\n", i, listed.deviceName.data(),
+		     vk::to_string(listed.deviceType).c_str());
+	}
+
+	const auto& gpu_override = GetGpuOverride();
+	if (gpu_override.requested) {
+		if (gpu_override.by_index) {
+			LOGF("KYTY_GPU=%s: preferring the physical device at index %zu\n",
+			     gpu_override.text.c_str(), gpu_override.index);
+		} else {
+			LOGF("KYTY_GPU=%s: preferring the first physical device whose name contains that "
+			     "text (case-insensitive)\n",
+			     gpu_override.text.c_str());
+		}
+	}
+
+	std::vector<size_t> device_indices(devices.size());
+	for (size_t i = 0; i < device_indices.size(); i++) {
+		device_indices[i] = i;
+	}
+
 	if (Config::GetGpuIndex() >= 0) {
 		if (static_cast<size_t>(Config::GetGpuIndex()) < devices.size()) {
-			devices = {devices[Config::GetGpuIndex()]};
+			const auto picked = static_cast<size_t>(Config::GetGpuIndex());
+			devices           = {devices[picked]};
+			device_indices    = {picked};
 		} else {
 			LOGF("Vulkan GPU index %d is unavailable; selecting automatically\n",
 			     Config::GetGpuIndex());
@@ -179,9 +260,14 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 	vk::PhysicalDevice  best_device       = nullptr;
 	uint32_t            best_queue_family = static_cast<uint32_t>(-1);
 	SurfaceCapabilities best_capabilities;
+	size_t              best_index        = 0;
+	std::string         best_name;
+	bool                override_matched  = false;
 
-	for (const auto& device: devices) {
-		bool skip_device = false;
+	for (size_t device_slot = 0; device_slot < devices.size(); device_slot++) {
+		const auto& device       = devices[device_slot];
+		const auto  device_index = device_indices[device_slot];
+		bool        skip_device  = false;
 
 		vk::PhysicalDeviceProperties device_properties {};
 		device.getProperties(&device_properties);
@@ -400,12 +486,42 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 			continue;
 		}
 
-		if (best_device == nullptr ||
-		    device_properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu) {
+		const bool matches_override =
+		    gpu_override.requested &&
+		    (gpu_override.by_index
+		         ? device_index == gpu_override.index
+		         : GpuNameContains(device_properties.deviceName.data(), gpu_override.text));
+
+		if (matches_override && !override_matched) {
+			override_matched  = true;
 			best_device       = device;
 			best_queue_family = queue_family;
 			best_capabilities = std::move(candidate_capabilities);
+			best_index        = device_index;
+			best_name         = device_properties.deviceName.data();
+		} else if (!override_matched &&
+		           (best_device == nullptr ||
+		            device_properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu)) {
+			best_device       = device;
+			best_queue_family = queue_family;
+			best_capabilities = std::move(candidate_capabilities);
+			best_index        = device_index;
+			best_name         = device_properties.deviceName.data();
 		}
+	}
+
+	if (gpu_override.requested && !override_matched) {
+		LOGF("KYTY_GPU=%s did not match any selectable physical device %s; the default "
+		     "preference was used instead. The enumerated devices are listed above - note that "
+		     "a device rejected by a check above is not selectable, and KYTY_GPU does not "
+		     "override that.\n",
+		     gpu_override.text.c_str(),
+		     gpu_override.by_index ? "by index" : "by name substring");
+	}
+
+	if (best_device != nullptr) {
+		LOGF("Vulkan selected physical device [%zu]: %s%s\n", best_index, best_name.c_str(),
+		     override_matched ? " (chosen by KYTY_GPU)" : "");
 	}
 
 	out_device       = best_device;

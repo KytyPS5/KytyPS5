@@ -577,6 +577,26 @@ void TestClassicSaveParams() {
 	CHECK(params[0].mtime == nested_mtime);
 }
 
+void TestLegacySaves() {
+	Reset("LEGACY");
+	fs::remove_all("_SaveData/LEGACY");
+	fs::create_directories("_SaveData/LEGACY/old-slot");
+	std::ofstream("_SaveData/LEGACY/old-slot/game.save") << "saved before save metadata";
+	fs::create_directories("_SaveData/LEGACY/broken/sce_sys");
+
+	std::array<SceSaveDataDirName, 2> names {};
+	std::array<SaveDataParam, 2> params {};
+	SaveDataDirNameSearchCond cond {};
+	cond.user_id = 1;
+	SaveDataDirNameSearchResult result {};
+	result.dir_names = names.data();
+	result.dir_names_num = names.size();
+	result.params = params.data();
+	CHECK(SaveDataDirNameSearch(&cond, &result) == OK && result.set_num == 1);
+	CHECK(std::string(names[0].data) == "old-slot");
+	CHECK(params[0].title[0] == '\0' && params[0].mtime > 0);
+}
+
 void RunChild(const fs::path& executable, const char* mode) {
 #ifdef _WIN32
 	CHECK(_spawnl(_P_WAIT, executable.string().c_str(), executable.string().c_str(), mode,
@@ -619,6 +639,7 @@ int main(int argc, char** argv) {
 	TestClassicSavePaths();
 	TestSaveAllocations();
 	TestClassicSaveParams();
+	TestLegacySaves();
 	CHECK(SaveDataTerminate() == OK);
 	fs::current_path(previous);
 	fs::remove_all(temp);

@@ -87,6 +87,7 @@ struct EmitterState {
 	const SpirvRequirements                          requirements;
 	uint32_t                                         lane_count                  = 1;
 	uint32_t                                         lane_half                   = 0;
+	bool                                             packed_wave32               = false;
 	uint32_t                                         storage_buffer_variable     = 0;
 	uint32_t                                         storage_buffer_u64_variable = 0;
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> memory_byte_offsets {};
@@ -266,6 +267,8 @@ uint32_t OutputVariableForExport(const EmitterState& state, const IR::ExportInfo
 uint32_t ConstantU32(EmitterState& state, uint32_t value);
 
 uint32_t EmitSubgroupLocalInvocationId(EmitterState& state);
+uint32_t EmitPhysicalSubgroupLane(EmitterState& state, uint32_t lane);
+uint32_t EmitGuestBallot(EmitterState& state, uint32_t ballot);
 
 [[noreturn]] void ExitDescriptorBindingFailure(const EmitterState&       state,
                                                IR::DescriptorBindingKind kind, uint32_t resource,

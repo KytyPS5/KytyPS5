@@ -10089,6 +10089,101 @@ void TestMeshPassthrough(uint32_t wave_size, uint32_t lane, uint32_t expected_pa
         "mesh passthrough changed packed triangle indices");
 }
 
+void TestMeshWave32PackedSubgroupIsolation() {
+  using namespace ShaderRecompiler;
+  const uint32_t shader[] = {
+      EncodeSMovB32(12, 255), 0x1003u,
+      EncodeSMovB32(124, 12), EncodeSopp(0x10, 9),
+      EncodeVop1(0x02, 24, 5 + 256),
+      EncodeVop1(0x01, 4, 24),
+      EncodeExp0(0x0c, 0xf, false), EncodeExp1(4, 4, 4, 4),
+      EncodeExp0(0x14, 0x1), EncodeExp1(0, 0, 0, 0),
+      EncodeSopp(0x01),
+  };
+  ShaderVertexInputInfo input{};
+  input.logical_stage = ShaderType::Mesh;
+  input.mesh.wave_size = 32;
+  input.mesh.host_subgroup_size = 64;
+  input.mesh.threads_num[0] = 64;
+  input.mesh.threads_num[1] = input.mesh.threads_num[2] = 1;
+  input.mesh.input_primitive = static_cast<uint32_t>(Prospero::PrimitiveType::kTriList);
+  input.mesh.primitives_per_group = 1;
+  input.mesh.vertices_per_group = 3;
+  input.mesh.max_primitives = 1;
+  input.mesh.max_vertices = 3;
+  input.mesh.passthrough_alloc = true;
+  CompileOptions options{};
+  options.stage = ShaderType::Mesh;
+  options.wave_size = 32;
+  options.input_info.vertex = &input;
+  const auto result = RecompileForTest(shader, options);
+  CheckSpirvBinaryValidates(result.spirv);
+
+  std::unordered_map<uint32_t, std::span<const uint32_t>> definitions;
+  std::vector<std::span<const uint32_t>> shuffles;
+  for (size_t index = 5; index < result.spirv.size();) {
+    const auto length = result.spirv[index] >> 16u;
+    Check(length != 0 && index + length <= result.spirv.size(), "invalid packed-wave SPIR-V");
+    const auto instruction = std::span<const uint32_t>(result.spirv.data() + index, length);
+    const auto opcode = static_cast<spv::Op>(instruction[0] & 0xffffu);
+    if (opcode == spv::OpGroupNonUniformShuffle) {
+      shuffles.push_back(instruction);
+    }
+    if (opcode == spv::OpConstant || opcode == spv::OpLoad || opcode == spv::OpCompositeExtract ||
+        opcode == spv::OpCompositeConstruct || opcode == spv::OpSelect ||
+        opcode == spv::OpUGreaterThanEqual || opcode == spv::OpBitwiseAnd ||
+        opcode == spv::OpBitwiseOr || opcode == spv::OpGroupNonUniformBallot ||
+        opcode == spv::OpGroupNonUniformBallotFindLSB) {
+      definitions.emplace(instruction[2], instruction);
+    }
+    index += length;
+  }
+  const auto find = [&](uint32_t id, spv::Op opcode) -> std::span<const uint32_t> {
+    const auto it = definitions.find(id);
+    return it != definitions.end() && (it->second[0] & 0xffffu) == static_cast<uint32_t>(opcode)
+               ? it->second : std::span<const uint32_t>{};
+  };
+  const auto is_constant = [&](uint32_t id, uint32_t value) {
+    const auto constant = find(id, spv::OpConstant);
+    return constant.size() == 4 && constant[3] == value;
+  };
+  bool isolated = false;
+  for (const auto shuffle : shuffles) {
+    const auto lane = find(shuffle[5], spv::OpBitwiseOr);
+    if (lane.size() != 5) {
+      continue;
+    }
+    const auto local = find(lane[3], spv::OpBitwiseAnd);
+    const auto half = find(lane[4], spv::OpBitwiseAnd);
+    if (local.size() != 5 || half.size() != 5 || !is_constant(local[4], 31) ||
+        !is_constant(half[4], 32)) {
+      continue;
+    }
+    const auto first = find(local[3], spv::OpGroupNonUniformBallotFindLSB);
+    if (first.size() != 5) {
+      continue;
+    }
+    const auto ballot = find(first[4], spv::OpCompositeConstruct);
+    if (ballot.size() != 7) {
+      continue;
+    }
+    const auto selected = find(ballot[3], spv::OpSelect);
+    if (selected.size() != 6) {
+      continue;
+    }
+    const auto upper = find(selected[4], spv::OpCompositeExtract);
+    const auto lower = find(selected[5], spv::OpCompositeExtract);
+    const auto condition = find(selected[3], spv::OpUGreaterThanEqual);
+    isolated = upper.size() == 5 && lower.size() == 5 && upper[3] == lower[3] &&
+               upper[4] == 1 && lower[4] == 0 && condition.size() == 5 &&
+               is_constant(condition[4], 32);
+    if (isolated) {
+      break;
+    }
+  }
+  Check(isolated, "wave32 readfirstlane can read the other guest wave in subgroup64");
+}
+
 void TestNewShaderRecompilerSetpcJumpTable() {
   const uint32_t shader[] = {
       EncodeSop2(0x07, 0, 0, 129), // s_min_u32 s0, s0, 1
@@ -13674,6 +13769,7 @@ int main() {
   TestMeshPassthrough(64, 1, 3u | (4u << 10u) | (5u << 20u));
   TestMeshPassthrough(64, 2, 6u | (7u << 10u) | (8u << 20u));
   TestMeshPassthrough(64, 64u - 1u, 189u | (190u << 10u) | (191u << 20u));
+  TestMeshWave32PackedSubgroupIsolation();
   TestEmbeddedFetchPreservesSharedScalarLoad();
   TestEmbeddedVertexFormatSwizzle();
   TestNewShaderRecompilerSetpcJumpTable();

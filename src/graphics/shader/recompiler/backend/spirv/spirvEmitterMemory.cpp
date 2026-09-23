@@ -17,10 +17,12 @@ uint32_t EmitDsMaskedLaneRead(EmitterState& state, uint32_t source, uint32_t tar
 	}
 	const auto shuffled = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpGroupNonUniformShuffle, TypeU32(state), shuffled,
-	                          ConstantU32(state, spv::ScopeSubgroup), source, target);
+	                          ConstantU32(state, spv::ScopeSubgroup), source,
+	                          EmitPhysicalSubgroupLane(state, target));
 	const auto source_exec = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpGroupNonUniformShuffle, TypeBool(state), source_exec,
-	                          ConstantU32(state, spv::ScopeSubgroup), exec, target);
+	                          ConstantU32(state, spv::ScopeSubgroup), exec,
+	                          EmitPhysicalSubgroupLane(state, target));
 	const auto source_active =
 	    AndCondition(state, source_exec, EmitSubgroupLaneActiveBool(state, target));
 	return Select(state, TypeU32(state), source_active, shuffled, ConstantU32(state, 0));
@@ -1117,7 +1119,8 @@ uint32_t EmitAppendConsume(ValueEmitContext& ctx, const IR::Inst& inst) {
 	});
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpGroupNonUniformShuffle, TypeU32(state), result,
-	                          ConstantU32(state, spv::ScopeSubgroup), atomic, source_lane);
+	                          ConstantU32(state, spv::ScopeSubgroup), atomic,
+	                          EmitPhysicalSubgroupLane(state, source_lane));
 	return result;
 }
 

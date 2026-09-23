@@ -131,8 +131,8 @@ public:
 			const auto* inst = value.Resolve().TryInstruction();
 			return std::any_of(m_indirect_images.begin(), m_indirect_images.end(),
 			                   [&](const IndirectImagePlan& plan) {
-				return std::ranges::find(plan.reads, inst) != plan.reads.end();
-			});
+				                   return std::ranges::find(plan.reads, inst) != plan.reads.end();
+			                   });
 		});
 		m_program.descriptor_sources         = std::move(m_sources);
 		m_program.info                       = std::move(m_info);
@@ -169,7 +169,7 @@ private:
 		std::abort();
 	}
 
-	Value LowerDescriptorPhi(Value value) {
+	Value LowerDescriptorPhi(Value value, const Block* use) {
 		value           = value.Resolve();
 		const auto* phi = value.TryInstruction();
 		if (m_shader_writes || phi == nullptr || phi->GetOpcode() != ValueOpcode::Phi ||
@@ -177,16 +177,52 @@ private:
 		    m_program.blocks.size() != m_program.block_info.size()) {
 			return value;
 		}
-		for (const auto& [original, selected]: m_descriptor_selections) {
-			if (original == phi) {
-				return selected;
-			}
-		}
 		const auto* merge  = phi->Parent();
 		const auto* branch = phi->PhiBlock(0);
 		if (merge == nullptr || branch == nullptr || phi->PhiBlock(1) == nullptr ||
 		    branch == phi->PhiBlock(1)) {
 			return value;
+		}
+		// Structurization can merge the descriptor and its use predicate in parallel Phis.
+		// Match their incoming blocks to exclude only edges that cannot reach this use.
+		if (use != nullptr && use->ImmPredecessors().size() == 1u &&
+		    use->ImmPredecessors()[0] == merge) {
+			const auto merge_it = std::ranges::find(m_program.blocks, merge);
+			const auto use_it   = std::ranges::find(m_program.blocks, use);
+			if (merge_it != m_program.blocks.end() && use_it != m_program.blocks.end()) {
+				const auto& info      = m_program.block_info[merge_it - m_program.blocks.begin()];
+				const auto& term      = info.terminator;
+				const auto  id        = m_program.block_info[use_it - m_program.blocks.begin()].id;
+				const auto* condition = info.condition.Resolve().TryInstruction();
+				if (term.kind == CFG::TerminatorKind::ConditionalBranch &&
+				    term.true_block != term.false_block &&
+				    (id == term.true_block || id == term.false_block) && condition != nullptr &&
+				    condition->GetOpcode() == ValueOpcode::Phi &&
+				    condition->GetType() == Type::U1 && condition->Parent() == merge &&
+				    condition->NumArgs() == 2u && condition->NumPhiBlocks() == 2u) {
+					const bool taken = id == term.true_block;
+					for (uint32_t skipped = 0; skipped < 2u; skipped++) {
+						const auto excluded = condition->Arg(skipped).Resolve();
+						const auto included = condition->Arg(skipped ^ 1u).Resolve();
+						if (!excluded.IsImmediate() || excluded.GetType() != Type::U1 ||
+						    excluded.U1() == taken ||
+						    (included.IsImmediate() && included.U1() != taken)) {
+							continue;
+						}
+						for (uint32_t selected = 0; selected < 2u; selected++) {
+							if (phi->PhiBlock(selected) == condition->PhiBlock(skipped ^ 1u) &&
+							    phi->PhiBlock(selected ^ 1u) == condition->PhiBlock(skipped)) {
+								return phi->Arg(selected);
+							}
+						}
+					}
+				}
+			}
+		}
+		for (const auto& [original, selected]: m_descriptor_selections) {
+			if (original == phi) {
+				return selected;
+			}
 		}
 		if (branch->ImmSuccessors().size() != 2u) {
 			if (branch->ImmPredecessors().size() != 1u) {
@@ -201,11 +237,10 @@ private:
 		for (uint32_t arm = 0; arm < 2; arm++) {
 			const auto* incoming = phi->PhiBlock(arm);
 			if (incoming == merge ||
-			    (incoming != branch &&
-			     (incoming->ImmPredecessors().size() != 1u ||
-			      incoming->ImmPredecessors()[0] != branch ||
-			      incoming->ImmSuccessors().size() != 1u ||
-			      incoming->ImmSuccessors()[0] != merge))) {
+			    (incoming != branch && (incoming->ImmPredecessors().size() != 1u ||
+			                            incoming->ImmPredecessors()[0] != branch ||
+			                            incoming->ImmSuccessors().size() != 1u ||
+			                            incoming->ImmSuccessors()[0] != merge))) {
 				return value;
 			}
 			const auto* target = incoming == branch ? merge : incoming;
@@ -247,7 +282,7 @@ private:
 		}
 		descriptor.dword_count = width;
 		for (uint32_t i = 0; i < width; i++) {
-			descriptor.dwords[i] = LowerDescriptorPhi(handle.Arg(i));
+			descriptor.dwords[i] = LowerDescriptorPhi(handle.Arg(i), handle.Parent());
 		}
 		if (sample_adjust) {
 			descriptor.dwords[3] = CanonicalizeSampleAdjustDword3(descriptor.dwords[3]);
@@ -308,16 +343,27 @@ private:
 	}
 
 	const MemoryInfo* ScalarReadMemory(const Inst& read, uint32_t& index) const {
-		if (read.GetOpcode() != ValueOpcode::ReadConstBuffer || read.NumArgs() != 2u) {
+		const bool address = read.GetOpcode() == ValueOpcode::LoadAddressU32;
+		if (!(address ? read.NumArgs() == 4u
+		              : read.GetOpcode() == ValueOpcode::ReadConstBuffer && read.NumArgs() == 2u)) {
 			return nullptr;
+		}
+		if (address) {
+			const auto high    = read.Arg(2).Resolve();
+			const auto enabled = read.Arg(3).Resolve();
+			if (!high.IsImmediate() || high.GetType() != Type::U32 || high.U32() != 0u ||
+			    !enabled.IsImmediate() || enabled.GetType() != Type::U1 || !enabled.U1()) {
+				return nullptr;
+			}
 		}
 		index = read.Flags<MemoryFlags>().index;
 		if (index >= m_program.memory_info.size()) {
 			return nullptr;
 		}
 		const auto& memory = m_program.memory_info[index];
-		return memory.kind == ResourceKind::ScalarBuffer && memory.data_bits == 32u &&
-		               memory.data_dwords == 1u
+		return memory.kind ==
+		                   (address ? ResourceKind::ScalarAddress : ResourceKind::ScalarBuffer) &&
+		               memory.data_bits == 32u && memory.data_dwords == 1u
 		           ? &memory
 		           : nullptr;
 	}
@@ -340,18 +386,16 @@ private:
 		return true;
 	}
 
-	bool MakeRuntimeBufferSource(const Inst& handle, uint32_t pc, uint32_t& source,
-	                             DescriptorSource& descriptor) {
-		if (handle.GetOpcode() != ValueOpcode::GetBufferResource) {
+	bool MakeRuntimeTableSource(const Inst& handle, uint32_t pc, DescriptorSource& descriptor) {
+		const auto width = handle.GetOpcode() == ValueOpcode::GetBufferResource    ? 4u
+		                   : handle.GetOpcode() == ValueOpcode::GetAddressResource ? 2u
+		                                                                           : 0u;
+		if (width == 0u) {
 			return false;
 		}
-		MakeSource(handle, 4u, false, false, descriptor, pc);
+		MakeSource(handle, width, false, false, descriptor, pc);
 		uint32_t bad_dword = 0;
-		if (!ValidateSource(descriptor, bad_dword)) {
-			return false;
-		}
-		source = InternSource(descriptor);
-		return true;
+		return ValidateSource(descriptor, bad_dword);
 	}
 
 	bool MatchMaterialOffset(Value value, Value& selector, uint32_t& stride,
@@ -388,123 +432,201 @@ private:
 		       selector_inst->GetOpcode() == ValueOpcode::ReadFirstLane;
 	}
 
+	bool NonzeroOnEntry(Value value, const Block* block) const {
+		if (m_program.blocks.size() != m_program.block_info.size()) {
+			return false;
+		}
+		// Each unique predecessor must execute before this use. Stop at joins: an
+		// unrelated comparison is not a bound on FindILsb's zero-input sentinel.
+		for (size_t depth = 0; block != nullptr && depth < m_program.blocks.size(); ++depth) {
+			if (block->ImmPredecessors().size() != 1u) {
+				return false;
+			}
+			const auto* previous    = block->ImmPredecessors()[0];
+			const auto  current_it  = std::ranges::find(m_program.blocks, block);
+			const auto  previous_it = std::ranges::find(m_program.blocks, previous);
+			if (current_it == m_program.blocks.end() || previous_it == m_program.blocks.end()) {
+				return false;
+			}
+			const auto& info = m_program.block_info[previous_it - m_program.blocks.begin()];
+			const auto  id   = m_program.block_info[current_it - m_program.blocks.begin()].id;
+			const auto& term = info.terminator;
+			if (term.kind == CFG::TerminatorKind::ConditionalBranch &&
+			    (term.true_block == id) != (term.false_block == id)) {
+				bool        positive = term.true_block == id;
+				const auto* test     = info.condition.Resolve().TryInstruction();
+				while (test != nullptr && test->GetOpcode() == ValueOpcode::LogicalNot) {
+					positive = !positive;
+					test     = test->Arg(0).Resolve().TryInstruction();
+				}
+				if (test != nullptr && test->NumArgs() == 2u &&
+				    ((test->GetOpcode() == ValueOpcode::INotEqual32 && positive) ||
+				     (test->GetOpcode() == ValueOpcode::IEqual32 && !positive))) {
+					for (uint32_t arg = 0; arg < 2u; ++arg) {
+						uint32_t immediate;
+						if (ImmediateU32(test->Arg(arg), immediate) && immediate == 0u &&
+						    EquivalentValue(m_program, test->Arg(arg ^ 1u), value)) {
+							return true;
+						}
+					}
+				}
+			}
+			block = previous;
+		}
+		return false;
+	}
+
+	bool MatchTableOffset(Value value, Value& key, uint32_t& offset) const {
+		offset = 0;
+		for (;;) {
+			const auto* inst = value.Resolve().TryInstruction();
+			if (inst == nullptr || inst->NumArgs() != 2u) {
+				return false;
+			}
+			uint32_t immediate;
+			if (inst->GetOpcode() == ValueOpcode::ShiftLeftLogical32 &&
+			    ImmediateU32(inst->Arg(1), immediate) && immediate == 5u) {
+				key = inst->Arg(0).Resolve();
+				return key.GetType() == Type::U32;
+			}
+			if (inst->GetOpcode() != ValueOpcode::IAdd32) {
+				return false;
+			}
+			if (ImmediateU32(inst->Arg(0), immediate)) {
+				value = inst->Arg(1);
+			} else if (ImmediateU32(inst->Arg(1), immediate)) {
+				value = inst->Arg(0);
+			} else {
+				return false;
+			}
+			// These additions are shader U32 arithmetic, before the scalar memory offset.
+			offset += immediate;
+		}
+	}
+
 	bool TryMakeIndirectImage(Inst& handle, uint32_t pc, IndirectImagePlan& plan) {
 		if (handle.GetOpcode() != ValueOpcode::GetImageResource || handle.NumArgs() != 8u) {
 			return false;
 		}
-
-		std::array<Inst*, 8> heap_reads {};
-		Inst*                heap_handle = nullptr;
-		Value                heap_offset;
-		for (uint32_t dword = 0; dword < heap_reads.size(); dword++) {
-			heap_reads[dword] = handle.Arg(dword).Resolve().TryInstruction();
-			if (heap_reads[dword] == nullptr) {
+		Inst*    table_handle = nullptr;
+		Value    key;
+		uint32_t table_offset = 0;
+		for (uint32_t dword = 0; dword < plan.reads.size(); ++dword) {
+			auto* read = handle.Arg(dword).Resolve().TryInstruction();
+			if (read == nullptr) {
 				return false;
 			}
 			uint32_t    memory_index = 0;
-			const auto* memory       = ScalarReadMemory(*heap_reads[dword], memory_index);
-			if (memory == nullptr || memory->offset != dword * sizeof(uint32_t) ||
-			    !MemoryIndexBelongsTo(memory_index, *heap_reads[dword])) {
+			const auto* memory       = ScalarReadMemory(*read, memory_index);
+			if (memory == nullptr || memory->offset > INT32_MAX || (memory->offset & 3u) != 0u ||
+			    !MemoryIndexBelongsTo(memory_index, *read)) {
 				return false;
 			}
-			auto* current_handle = heap_reads[dword]->Arg(0).Resolve().TryInstruction();
+			auto*    current_handle = read->Arg(0).Resolve().TryInstruction();
+			Value    current_key;
+			uint32_t offset = 0;
 			if (current_handle == nullptr ||
-			    (heap_handle != nullptr && current_handle != heap_handle)) {
+			    current_handle->GetOpcode() != (memory->kind == ResourceKind::ScalarAddress
+			                                        ? ValueOpcode::GetAddressResource
+			                                        : ValueOpcode::GetBufferResource) ||
+			    (memory->kind == ResourceKind::ScalarAddress &&
+			     read->Parent() != handle.Parent()) ||
+			    (table_handle != nullptr &&
+			     !EquivalentValue(m_program, Value(table_handle), Value(current_handle))) ||
+			    !MatchTableOffset(read->Arg(1), current_key, offset) ||
+			    memory->offset > UINT32_MAX - offset) {
 				return false;
 			}
-			heap_handle = current_handle;
+			offset += memory->offset;
 			if (dword == 0u) {
-				heap_offset = heap_reads[dword]->Arg(1).Resolve();
-			} else if (!EquivalentValue(m_program, heap_offset, heap_reads[dword]->Arg(1))) {
+				key          = current_key;
+				table_offset = offset;
+			} else if (!EquivalentValue(m_program, key, current_key) ||
+			           static_cast<uint64_t>(table_offset) + dword * sizeof(uint32_t) != offset) {
 				return false;
 			}
-			plan.memory[dword] = memory_index;
-			plan.reads[dword]  = heap_reads[dword];
-		}
-
-		const auto* shift        = heap_offset.TryInstruction();
-		uint32_t    shift_amount = 0;
-		if (shift == nullptr || shift->GetOpcode() != ValueOpcode::ShiftLeftLogical32 ||
-		    shift->NumArgs() != 2u || !ImmediateU32(shift->Arg(1), shift_amount) ||
-		    shift_amount != 5u) {
-			return false;
-		}
-		auto* material_read = shift->Arg(0).Resolve().TryInstruction();
-		if (material_read == nullptr) {
-			return false;
-		}
-		uint32_t    material_memory_index = 0;
-		const auto* material_memory       = ScalarReadMemory(*material_read, material_memory_index);
-		if (material_memory == nullptr || material_memory->offset != 0u ||
-		    !MemoryIndexBelongsTo(material_memory_index, *material_read)) {
-			return false;
-		}
-		auto* material_handle = material_read->Arg(0).Resolve().TryInstruction();
-		if (material_handle == nullptr) {
-			return false;
-		}
-
-		Value    selector;
-		uint32_t selector_stride = 0;
-		uint32_t selector_offset = 0;
-		if (!MatchMaterialOffset(material_read->Arg(1), selector, selector_stride,
-		                         selector_offset)) {
-			return false;
-		}
-
-		const std::array<const Inst*, 1> material_users {shift};
-		std::array<const Inst*, 8>       heap_users {};
-		std::copy(heap_reads.begin(), heap_reads.end(), heap_users.begin());
-		const std::array<const Inst*, 1> image_users {&handle};
-		if (!UsesOnly(*material_read, material_users) || !UsesOnly(*shift, heap_users)) {
-			return false;
-		}
-		for (const auto* read: heap_reads) {
+			table_handle = current_handle;
+			const std::array<const Inst*, 1> image_users {&handle};
 			if (!UsesOnly(*read, image_users)) {
 				return false;
 			}
+			plan.memory[dword] = memory_index;
+			plan.reads[dword]  = read;
 		}
 
-		DescriptorSource material_source;
-		DescriptorSource heap_source;
-		uint32_t         material_source_index = 0;
-		uint32_t         heap_source_index     = 0;
-		if (!MakeRuntimeBufferSource(*material_handle, pc, material_source_index,
-		                             material_source) ||
-		    !MakeRuntimeBufferSource(*heap_handle, pc, heap_source_index, heap_source)) {
+		DescriptorSource table_source;
+		if (!MakeRuntimeTableSource(*table_handle, pc, table_source)) {
 			return false;
 		}
-
+		DescriptorSource                material_source;
+		DescriptorSource::IndirectImage indirect;
+		indirect.table_offset = table_offset;
+		if (table_source.dword_count == 2u) {
+			const auto* selector = key.Resolve().TryInstruction();
+			if (m_shader_writes || selector == nullptr ||
+			    selector->GetOpcode() != ValueOpcode::FindILsb32 || selector->NumArgs() != 1u ||
+			    !NonzeroOnEntry(selector->Arg(0), handle.Parent()) || (table_offset & 3u) != 0u ||
+			    table_offset > UINT32_MAX - (32u * 32u - 1u)) {
+				return false;
+			}
+			indirect.key_count = 32u;
+		} else {
+			auto*       material_read         = key.Resolve().TryInstruction();
+			uint32_t    material_memory_index = 0;
+			const auto* memory = material_read != nullptr
+			                         ? ScalarReadMemory(*material_read, material_memory_index)
+			                         : nullptr;
+			if (table_offset != 0u || memory == nullptr ||
+			    memory->kind != ResourceKind::ScalarBuffer || memory->offset != 0u ||
+			    !MemoryIndexBelongsTo(material_memory_index, *material_read)) {
+				return false;
+			}
+			Value selector;
+			if (!MatchMaterialOffset(material_read->Arg(1), selector, indirect.selector_stride,
+			                         indirect.selector_offset)) {
+				return false;
+			}
+			const auto* shift = plan.reads[0]->Arg(1).Resolve().TryInstruction();
+			const std::array<const Inst*, 1> material_users {shift};
+			if (!UsesOnly(*material_read, material_users) || !UsesOnly(*shift, plan.reads)) {
+				return false;
+			}
+			const auto* material_handle = material_read->Arg(0).Resolve().TryInstruction();
+			if (material_handle == nullptr ||
+			    material_handle->GetOpcode() != ValueOpcode::GetBufferResource ||
+			    !MakeRuntimeTableSource(*material_handle, pc, material_source)) {
+				return false;
+			}
+			indirect.material_source = InternSource(material_source);
+		}
+		indirect.table_source = InternSource(table_source);
 		DescriptorSource image_source;
 		image_source.dword_count = 8u;
-		std::copy(material_source.dwords.begin(), material_source.dwords.begin() + 4u,
-		          image_source.dwords.begin());
-		std::copy(heap_source.dwords.begin(), heap_source.dwords.begin() + 4u,
-		          image_source.dwords.begin() + 4u);
-		image_source.indirect_image = DescriptorSource::IndirectImage {
-		    material_source_index, heap_source_index, selector_stride, selector_offset, 0u};
-
-		plan.handle = &handle;
-		plan.source = InternSource(image_source);
-		plan.key    = Value(material_read);
-		plan.roots  = image_source.dwords;
+		image_source.dwords.fill(Value(0u));
+		std::copy_n(material_source.dwords.begin(), material_source.dword_count,
+		            image_source.dwords.begin());
+		std::copy_n(table_source.dwords.begin(), table_source.dword_count,
+		            image_source.dwords.begin() + 4u);
+		image_source.indirect_image = indirect;
+		plan.handle                 = &handle;
+		plan.source                 = InternSource(image_source);
+		plan.key                    = key;
+		plan.roots                  = image_source.dwords;
 		return true;
 	}
 
 	const IndirectImagePlan* FindIndirectImage(const Inst& handle) const {
 		const auto found =
 		    std::find_if(m_indirect_images.begin(), m_indirect_images.end(),
-		                 [&](const IndirectImagePlan& plan) {
-			    return plan.handle == &handle;
-		    });
+		                 [&](const IndirectImagePlan& plan) { return plan.handle == &handle; });
 		return found == m_indirect_images.end() ? nullptr : &*found;
 	}
 
 	bool IsIndirectPlanningMemory(uint32_t index) const {
 		return std::any_of(m_indirect_images.begin(), m_indirect_images.end(),
 		                   [&](const IndirectImagePlan& plan) {
-			return std::ranges::find(plan.memory, index) != plan.memory.end();
-		});
+			                   return std::ranges::find(plan.memory, index) != plan.memory.end();
+		                   });
 	}
 
 	void PlanIndirectImages() {

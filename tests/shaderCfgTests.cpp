@@ -109,11 +109,11 @@ ShaderRecompiler::CompileOptions MakeCompileOptions(ShaderType stage) {
   return options;
 }
 
-bool ReadHostTestMemory(void *, uint64_t address, uint32_t *value) {
-  if (address == 0 || value == nullptr) {
+bool ReadHostTestMemory(void *, uint64_t address, std::span<uint32_t> values) {
+  if (address == 0 || values.empty()) {
     return false;
   }
-  std::memcpy(value, reinterpret_cast<const void *>(address), sizeof(*value));
+  std::memcpy(values.data(), reinterpret_cast<const void *>(address), values.size_bytes());
   return true;
 }
 
@@ -155,14 +155,16 @@ void CompilePixelRuntime(const ShaderParams &params,
                          ShaderPixelInputInfo &input_info) {
   auto options = MakeCompileOptions(ShaderType::Pixel);
   options.shader_hash = params.hash;
-  options.user_data = params.user_data;
+  options.user_data = std::span(params.user_data).first(params.user_data_count);
 
   options.input_info.pixel = &input_info;
   auto result = RecompileForTest(params.code, options);
   static std::deque<ShaderRecompiler::IR::CompiledShaderInfo> programs;
+  static std::deque<ShaderRecompiler::IR::ResourceSnapshot> resources;
   programs.push_back(std::move(result.program).TakeCompiledInfo());
   input_info.stage.program = &programs.back();
-  input_info.stage.resources = std::move(result.resources);
+  resources.push_back(std::move(result.resources));
+  input_info.stage.resources = &resources.back();
 }
 
 template <typename InputInfo>
@@ -1156,20 +1158,17 @@ void TestNativeShaderResourceDependencies() {
       .info = program.info,
       .bindings = program.bindings,
   };
-  ShaderStageRuntime runtime{.program = &compiled, .resources = resources};
+  ShaderStageRuntime runtime{.program = &compiled, .resources = &resources};
   Check(HasShaderBufferWrites(runtime),
         "graphics/compute write predicate lost nonempty written buffers");
   set_buffer(0, 0, 16, 3);
   set_buffer(2, 0x2000, 0, 0);
-  runtime.resources = resources;
   Check(!HasShaderBufferWrites(runtime),
         "graphics/compute write predicate included null, empty, or read-only buffers");
   set_buffer(2, 0x2000, 0, 64);
-  runtime.resources = resources;
   Check(HasShaderBufferWrites(runtime),
         "graphics/compute write predicate lost a byte-addressed buffer");
   set_buffer(2, 0x2000, 0x3FFF, UINT32_MAX);
-  runtime.resources = resources;
   Check(HasShaderBufferWrites(runtime),
         "graphics/compute write predicate lost a maximum-size strided buffer");
 
@@ -1428,11 +1427,8 @@ void SetImageTestFormat(std::array<uint32_t, 64> *data, uint32_t srsrc,
   (*data)[format_dword] = static_cast<uint32_t>(format) << 20u;
 }
 
-bool ReadZeroTestMemory(void *, uint64_t, uint32_t *value) {
-  if (value == nullptr) {
-    return false;
-  }
-  *value = 0;
+bool ReadZeroTestMemory(void *, uint64_t, std::span<uint32_t> values) {
+  std::ranges::fill(values, 0u);
   return true;
 }
 
@@ -1738,7 +1734,7 @@ void TestNggVertexEntryState() {
     previous_key = key;
     auto options = MakeCompileOptions(ShaderType::Vertex);
     options.user_data_base = 8;
-    options.user_data = params.user_data;
+    options.user_data = std::span(params.user_data).first(params.user_data_count);
     options.input_info.vertex = &input;
     options.wave_size = input.wave_size;
     const auto result = RecompileForTest(params.code, options);
@@ -9740,7 +9736,7 @@ void TestMergedShaderUserDataSnapshot() {
   regs.gs_user_sgpr.value[0]++;
   ShaderVertexInputInfo second_input{};
   const auto second = PrepareProgram(regs, context, user_config, second_input);
-  Check(first.user_data.size() == 12 && second.user_data.size() == 12 &&
+  Check(first.user_data_count == 12 && second.user_data_count == 12 &&
             std::equal(front_data.begin(), front_data.end(), first.user_data.begin() + 8) &&
             second.user_data[8] == front_data[0] + 1,
         "merged shader parameters did not snapshot ordinary user SGPRs at s8");
@@ -9751,7 +9747,7 @@ void TestMergedShaderUserDataSnapshot() {
   CompileOptions options{};
   options.stage = ShaderType::Mesh;
   options.user_data_base = 0;
-  options.user_data = first.user_data;
+  options.user_data = std::span(first.user_data).first(first.user_data_count);
   options.input_info.vertex = &first_input;
   options.back_code = first.back_code;
   const auto translated = TranslateProgram(first.code, options);
@@ -9759,15 +9755,14 @@ void TestMergedShaderUserDataSnapshot() {
   Check(program.info.buffers.size() == 2 && program.srt_reads.size() == 4,
         "merged shader lost front user SGPRs or the back-stage SRT load");
   for (const auto *params : {&first, &second}) {
-    const IR::SrtRuntime runtime{.user_data = params->user_data,
+    const auto user_data = std::span(params->user_data).first(params->user_data_count);
+    const IR::SrtRuntime runtime{.user_data = user_data,
                                  .read_memory = ReadHostTestMemory};
     IR::DescriptorValue front_descriptor, back_descriptor;
     const auto &table = params == &first ? first_table : second_table;
-    Check(IR::EvaluateDescriptorSource(program, program.info.buffers[0].source,
-                                       runtime, front_descriptor) &&
-              IR::EvaluateDescriptorSource(program, program.info.buffers[1].source,
-                                             runtime, back_descriptor) &&
-              std::equal(params->user_data.begin() + 8, params->user_data.end(),
+    Check(IR::SrtWalker(program, runtime).EvaluateDescriptor(program.info.buffers[0].source, front_descriptor) &&
+              IR::SrtWalker(program, runtime).EvaluateDescriptor(program.info.buffers[1].source, back_descriptor) &&
+              std::equal(user_data.begin() + 8, user_data.end(),
                          front_descriptor.dwords.begin()) &&
               std::equal(table.begin(), table.end(), back_descriptor.dwords.begin()),
           "merged shader resource plan did not follow the current s0:s1 pointer and s8 data");
@@ -9785,12 +9780,27 @@ void TestMergedShaderUserDataSnapshot() {
     ShaderVertexInputInfo input{};
     const auto params = PrepareProgram(regs, context, user_config, input);
     Check(params.back_code.empty() && params.hash == XXH3_64bits(monolithic, sizeof(monolithic)) &&
-              input.mesh.scratch_size_dwords == 3 && params.user_data.size() == 12 &&
+              input.mesh.scratch_size_dwords == 3 && params.user_data_count == 12 &&
               params.user_data[0] == 0 && params.user_data[1] == 0 &&
-              std::equal(second.user_data.begin() + 8, second.user_data.end(),
+              std::equal(second.user_data.begin() + 8, second.user_data.begin() + second.user_data_count,
                          params.user_data.begin() + 8),
           "monolithic NGG shader used stale GS-back state or lost its s8 user data");
   }
+  regs.gs_regs.rsrc2.user_sgpr = HW::UserSgprInfo::SGPRS_MAX;
+  for (uint32_t i = 4; i < HW::UserSgprInfo::SGPRS_MAX; ++i) {
+    regs.gs_user_sgpr.value[i] = 0x10001000u + i;
+  }
+  ShaderVertexInputInfo full_input{};
+  const auto full = PrepareProgram(regs, context, user_config, full_input);
+  Check(full.user_data_count == 8u + HW::UserSgprInfo::SGPRS_MAX &&
+            std::ranges::all_of(std::span(full.user_data).first(8),
+                               [](uint32_t word) { return word == 0; }) &&
+            std::equal(std::begin(regs.gs_user_sgpr.value), std::end(regs.gs_user_sgpr.value),
+                       full.user_data.begin() + 8),
+        "merged shader did not preserve the full user-SGPR range after its reserved prefix");
+  regs.gs_user_sgpr.value[HW::UserSgprInfo::SGPRS_MAX - 1]++;
+  Check(full.user_data.back() == 0x10001000u + HW::UserSgprInfo::SGPRS_MAX - 1,
+        "merged shader parameters borrowed mutable register storage");
   context.SetMaxOutputPerSubgroup(256);
   context.SetGsMaxVertOut(8);
   user_config.SetPrimitiveType(Prospero::PrimitiveType::kTriFan);
@@ -12182,11 +12192,11 @@ void CheckFlattenedReadSlots(const ShaderRecompiler::IR::Program &program,
   }
 }
 
-bool ReadSrtHostDword(void *, uint64_t address, uint32_t *value) {
-  if (address == 0 || value == nullptr) {
+bool ReadSrtHostDword(void *, uint64_t address, std::span<uint32_t> values) {
+  if (address == 0 || values.empty()) {
     return false;
   }
-  std::memcpy(value, reinterpret_cast<const void *>(address), sizeof(*value));
+  std::memcpy(values.data(), reinterpret_cast<const void *>(address), values.size_bytes());
   return true;
 }
 
@@ -12195,18 +12205,17 @@ struct SrtHostRange {
   size_t count;
 };
 
-bool ReadSrtHostRangeDword(void *userdata, uint64_t address, uint32_t *value) {
+bool ReadSrtHostRangeDword(void *userdata, uint64_t address, std::span<uint32_t> values) {
   const auto *range = static_cast<const SrtHostRange *>(userdata);
-  if (range == nullptr || range->data == nullptr || range->count == 0 ||
-      value == nullptr) {
+  if (range == nullptr || range->data == nullptr || range->count == 0 || values.empty()) {
     return false;
   }
   const auto base = reinterpret_cast<uint64_t>(range->data);
   const auto size = range->count * sizeof(uint32_t);
-  if (address < base || address - base > size - sizeof(uint32_t)) {
+  if (address < base || values.size_bytes() > size || address - base > size - values.size_bytes()) {
     return false;
   }
-  std::memcpy(value, reinterpret_cast<const void *>(address), sizeof(*value));
+  std::memcpy(values.data(), reinterpret_cast<const void *>(address), values.size_bytes());
   return true;
 }
 
@@ -12375,8 +12384,7 @@ void TestTypedDescriptorRealCarryAndScalarLoads() {
   ShaderRecompiler::IR::SrtRuntime carry_runtime{carry_user_data, shader_base,
                                                  nullptr, nullptr};
   ShaderRecompiler::IR::DescriptorValue carry_value;
-  Check(ShaderRecompiler::IR::EvaluateDescriptorSource(
-            carry_ir, carry_source_index, carry_runtime, carry_value) &&
+  Check(ShaderRecompiler::IR::SrtWalker(carry_ir, carry_runtime).EvaluateDescriptor(carry_source_index, carry_value) &&
             carry_value.dwords[0] == static_cast<uint32_t>(expected_pc) &&
             carry_value.dwords[1] == static_cast<uint32_t>(expected_pc >> 32u),
         "S_GETPC shader-base or add/addc carry evaluation was incorrect");
@@ -12449,9 +12457,7 @@ void TestTypedDescriptorRealCarryAndScalarLoads() {
             TypedDescriptorSource(inline_sampler_ir,
                                   inline_sampler_ir.info.samplers[0].source) !=
                 nullptr &&
-            ShaderRecompiler::IR::EvaluateDescriptorSource(
-                inline_sampler_ir, inline_sampler_ir.info.samplers[0].source,
-                runtime, sampler) &&
+            ShaderRecompiler::IR::SrtWalker(inline_sampler_ir, runtime).EvaluateDescriptor(inline_sampler_ir.info.samplers[0].source, sampler) &&
             sampler.dwords[0] == 0 && sampler.dwords[1] == 0x00fff000u &&
             sampler.dwords[2] == 0x09500000u && sampler.dwords[3] == 0,
         "real inline sampler construction was unresolved or evaluated "
@@ -12487,7 +12493,7 @@ void TestSrtWalkerRealSmemTranslation() {
   std::vector<uint32_t> flat;
   const ShaderRecompiler::IR::SrtRuntime runtime{user_data, 0, ReadSrtHostDword,
                                                  nullptr};
-  const auto walked = ShaderRecompiler::IR::WalkSrt(ir, runtime, flat);
+  const auto walked = ShaderRecompiler::IR::SrtWalker(ir, runtime).RefreshFlatBuffer(flat);
   Check(walked, "SRT walk failed");
   Check(flat.size() == table.size() &&
             std::equal(flat.begin(), flat.end(), table.begin()),
@@ -12516,7 +12522,7 @@ void TestSrtWalkerVccBaseTranslation() {
   const ShaderRecompiler::IR::SrtRuntime runtime{user_data, 0, ReadSrtHostDword,
                                                  nullptr};
   std::vector<uint32_t> flat;
-  Check(ShaderRecompiler::IR::WalkSrt(ir, runtime, flat), "SRT walk failed");
+  Check(ShaderRecompiler::IR::SrtWalker(ir, runtime).RefreshFlatBuffer(flat), "SRT walk failed");
   Check(flat.size() == table.size() &&
             std::equal(flat.begin(), flat.end(), table.begin()),
         "typed SSA lost an SMEM base copied through VCC");
@@ -12544,18 +12550,15 @@ void TestSrtWalkerRealSBufferTranslation() {
   std::vector<uint32_t> flat;
   const ShaderRecompiler::IR::SrtRuntime runtime{user_data, 0, ReadSrtHostDword,
                                                  nullptr};
-  const auto walked = ShaderRecompiler::IR::WalkSrt(ir, runtime, flat);
+  const auto walked = ShaderRecompiler::IR::SrtWalker(ir, runtime).RefreshFlatBuffer(flat);
   Check(walked, "SRT walk failed");
   Check(flat.size() == 4 &&
             std::equal(flat.begin(), flat.end(), table.begin() + 1),
         "real S_BUFFER_LOAD walk used the wrong final alignment");
 
   user_data[10] = 4 * sizeof(uint32_t);
-  const auto flat_before_failure = flat;
-  const auto bounds_walked = ShaderRecompiler::IR::WalkSrt(ir, runtime, flat);
+  const auto bounds_walked = ShaderRecompiler::IR::SrtWalker(ir, runtime).RefreshFlatBuffer(flat);
   Check(!bounds_walked, "real S_BUFFER_LOAD walk ignored descriptor bounds");
-  Check(flat == flat_before_failure,
-        "failed real S_BUFFER_LOAD walk changed the prior flat snapshot");
   CheckFlattenedReadSlots(
       ir, 4, "real S_BUFFER_LOAD patch used the wrong flat offsets");
 
@@ -12569,7 +12572,7 @@ void TestSrtWalkerRealSBufferTranslation() {
                  static_cast<uint32_t>(std::size(negative_shader)),
                  negative_ir);
   user_data[10] = sizeof(table);
-  Check(!ShaderRecompiler::IR::WalkSrt(negative_ir, runtime, flat),
+  Check(!ShaderRecompiler::IR::SrtWalker(negative_ir, runtime).RefreshFlatBuffer(flat),
         "real S_BUFFER_LOAD walk accepted a negative immediate");
 }
 
@@ -12608,7 +12611,7 @@ void TestScalarMemorySourcesCapturedBeforeWrites() {
     const ShaderRecompiler::IR::SrtRuntime runtime{
         user_data, 0, ReadSrtHostRangeDword, &range};
     std::vector<uint32_t> flat;
-    Check(ShaderRecompiler::IR::WalkSrt(ir, runtime, flat), "SRT walk failed");
+    Check(ShaderRecompiler::IR::SrtWalker(ir, runtime).RefreshFlatBuffer(flat), "SRT walk failed");
     Check(flat.size() == table.size() &&
               std::equal(flat.begin(), flat.end(), table.begin()),
           "overlapping scalar-memory load did not capture its sources before "
@@ -12942,7 +12945,7 @@ void TestComputeLdsAllocationIdentity() {
           "COMPUTE_PGM_RSRC2 LDS allocation units were not decoded");
     auto options = MakeCompileOptions(ShaderType::Compute);
     options.shader_hash = params.hash;
-    options.user_data = params.user_data;
+    options.user_data = std::span(params.user_data).first(params.user_data_count);
     options.input_info.compute = &input_info;
     options.wave_size = input_info.wave_size;
 
@@ -13008,7 +13011,7 @@ void TestComputeLdsAllocationIdentity() {
         "AGC per-thread scratch size was not propagated");
   auto scratch_options = MakeCompileOptions(ShaderType::Compute);
   scratch_options.shader_hash = scratch_params.hash;
-  scratch_options.user_data = scratch_params.user_data;
+  scratch_options.user_data = std::span(scratch_params.user_data).first(scratch_params.user_data_count);
   scratch_options.input_info.compute = &scratch_info;
   scratch_options.wave_size = scratch_info.wave_size;
 

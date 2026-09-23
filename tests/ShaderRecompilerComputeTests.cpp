@@ -16416,6 +16416,7 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   case Opcode::DS_READ_B128:
   case Opcode::DS_WRITE_B8:
   case Opcode::DS_WRITE_B16:
+  case Opcode::DS_WRITE_B8_D16_HI:
   case Opcode::DS_WRITE_B16_D16_HI:
   case Opcode::DS_WRITE2_B32:
   case Opcode::DS_WRITE2ST64_B32:
@@ -24688,6 +24689,38 @@ TestCase DsWriteB16D16HiCapturedUsesHighHalf() {
   return test;
 }
 
+TestCase DsWriteB8D16HiWritesByteTwo() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 1, 0);
+  AppendVMovLiteral(&code, 3, 0xdeadbeefu);
+  code.push_back(EncodeDs0(0x0d));
+  code.push_back(EncodeDs1(0, 3, 1)); // ds_write_b32 v1, v3
+
+  // Every byte of the source differs, so selecting any byte but 23:16 fails.
+  AppendVMovU32(&code, 20, 1);
+  AppendVMovLiteral(&code, 2, 0x11a22233u);
+  AppendVMovLiteral(&code, 0, 0x87654321u);
+  code.push_back(EncodeDs0(0xa0));
+  code.push_back(EncodeDs1(0, 2, 20)); // ds_write_b8_d16_hi v20, v2
+
+  code.push_back(EncodeDs0(0x36));
+  code.push_back(EncodeDs1(4, 0, 1)); // ds_read_b32 v4, v1
+  AppendStoreVgpr(&code, 4, 0);
+  AppendStoreVgpr(&code, 0, 1);
+  AppendEnd(&code);
+
+  TestCase test{"DsWriteB8D16HiWritesByteTwo",
+                code,
+                std::vector<u32>(2, 0),
+                {0xdeada2efu, 0x87654321u},
+                {O::V_MOV_B32, O::DS_WRITE_B32, O::DS_WRITE_B8_D16_HI,
+                 O::DS_READ_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  test.decoded_counts = {{"DS_WRITE_B8_D16_HI", 1}};
+  return test;
+}
+
 TestCase DsReadU16D16HiCapturedPreservesLowHalf() {
   using O = ShaderOpcode;
 
@@ -24902,10 +24935,12 @@ TestCase DsAtomicNoReturnVariants() {
 
   std::vector<u32> code;
   AppendVMovU32(&code, 1, 0);
-  const u32 initial[] = {10, 10,      0xfffffff0u, 0xfffffff0u, 10,
-                         10, 0xf0f0u, 0xf000u,     0xf00fu};
-  const u32 values[] = {5, 3, 5, 5, 5, 20, 0x0ff0u, 0x0f00u, 0x00ffu};
-  const u32 ops[] = {0x00, 0x01, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b};
+  const u32 initial[] = {10, 10, 2, 1, 0, 3, 9, 0xfffffff0u, 0xfffffff0u,
+                         10, 10, 0xf0f0u, 0xf000u, 0xf00fu};
+  const u32 values[] = {5, 3, 2, 5, 2, 5, 5, 5, 5,
+                        5, 20, 0x0ff0u, 0x0f00u, 0x00ffu};
+  const u32 ops[] = {0x00, 0x01, 0x03, 0x03, 0x04, 0x04, 0x04,
+                     0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b};
   for (u32 i = 0; i < static_cast<u32>(std::size(values)); i++) {
     AppendVMovLiteral(&code, 2, initial[i]);
     code.push_back(EncodeDs0(0x0d, i * 4u));
@@ -24923,12 +24958,14 @@ TestCase DsAtomicNoReturnVariants() {
 
   return {"DsAtomicNoReturnVariants",
           code,
-          std::vector<u32>(9, 0),
-          {15, 7, 0xfffffff0u, 5, 5, 20, 0x00f0u, 0xff00u, 0xf0f0u},
+          std::vector<u32>(14, 0),
+          {15, 7, 0, 2, 2, 2, 5, 0xfffffff0u, 5, 5, 20, 0x00f0u, 0xff00u,
+           0xf0f0u},
           {O::V_MOV_B32, O::DS_WRITE_B32, O::DS_ADD_U32, O::DS_SUB_U32,
-           O::DS_MIN_I32, O::DS_MAX_I32, O::DS_MIN_U32, O::DS_MAX_U32,
-           O::DS_AND_B32, O::DS_OR_B32, O::DS_XOR_B32, O::DS_READ_B32,
-           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+           O::DS_INC_U32, O::DS_DEC_U32, O::DS_MIN_I32, O::DS_MAX_I32,
+           O::DS_MIN_U32, O::DS_MAX_U32, O::DS_AND_B32, O::DS_OR_B32,
+           O::DS_XOR_B32, O::DS_READ_B32, O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
 }
 
 TestCase DsAtomicReturnVariants() {
@@ -28177,6 +28214,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ScratchIsPrivatePerInvocation);
   AddCase(DsReadWriteVariants);
   AddCase(DsWriteB16D16HiCapturedUsesHighHalf);
+  AddCase(DsWriteB8D16HiWritesByteTwo);
   AddCase(DsReadU16D16CapturedPreservesHighHalf);
   AddCase(DsReadU16D16HiCapturedPreservesLowHalf);
   AddCase(DsAppendConsumeUsesEncodedLdsSelector);

@@ -330,11 +330,16 @@ std::vector<std::string> Search(int32_t user, const SceSaveDataTitleId* title = 
 void TestClassicSavePaths() {
 	Reset("CLASSIC");
 	const std::vector<std::string> names {"save.1", "save1", "slot@A", "slotA"};
-	fs::create_directories("_SaveData/CLASSIC/save.1");
-	{
-		std::ofstream saved("_SaveData/CLASSIC/save.1/progress");
-		saved << "save.1";
-	}
+	const auto existing = DirName("save.1");
+	struct SaveDataMount3 initial {};
+	initial.user_id = 1;
+	initial.dir_name = &existing;
+	initial.mount_mode = 4;
+	initial.blocks = 48;
+	SaveDataMountResult first {};
+	CHECK(SaveDataMount3(&initial, &first) == OK);
+	std::ofstream(g_mounted_directory / "progress") << "save.1";
+	CHECK(SaveDataUmount2(0, &first.mount_point) == OK);
 	CHECK(Search(1) == std::vector<std::string> {"save.1"});
 	for (const auto& text: names) {
 		auto                  name = DirName(text.c_str());
@@ -455,6 +460,123 @@ void TestSaveAllocations() {
 	CHECK(!fs::exists(metadata));
 }
 
+void TestClassicSaveParams() {
+	Reset("PARAMS");
+	const auto name = DirName("slot");
+	struct SaveDataMount3 mount {};
+	mount.user_id    = 1;
+	mount.dir_name   = &name;
+	mount.mount_mode = 4;
+	mount.blocks     = 48;
+	SaveDataMountResult mounted {};
+	CHECK(SaveDataMount3(&mount, &mounted) == OK);
+	SaveDataParam param {};
+	std::strcpy(param.title, "First save");
+	std::strcpy(param.sub_title, "Chapter 2");
+	std::strcpy(param.detail, "Progress");
+	param.user_param = 42;
+	CHECK(SaveDataSetParam(&mounted.mount_point, 0, nullptr, sizeof(param)) ==
+	      SAVE_DATA_ERROR_PARAMETER);
+	CHECK(SaveDataSetParam(&mounted.mount_point, 0, &param, sizeof(param) - 1) ==
+	      SAVE_DATA_ERROR_PARAMETER);
+	CHECK(SaveDataSetParam(&mounted.mount_point, 0, &param, sizeof(param)) == OK);
+	const fs::path saved = "_SaveData/PARAMS/slot";
+	CHECK(fs::exists(saved / "sce_sys/param.bin"));
+	fs::create_directory(saved / "nested");
+	std::ofstream(saved / "nested/progress") << "payload";
+	SaveDataParam loaded {};
+	size_t got = 0;
+	CHECK(SaveDataGetParam(&mounted.mount_point, 0, &loaded, sizeof(loaded), &got) == OK);
+	CHECK(got == sizeof(loaded) && std::string(loaded.title) == "First save");
+	CHECK(std::string(loaded.sub_title) == "Chapter 2" && loaded.user_param == 42);
+	CHECK(loaded.mtime > 0);
+	fs::last_write_time(saved / "nested/progress",
+	                    fs::last_write_time(saved / "sce_sys/param.bin") + std::chrono::hours(2));
+	CHECK(SaveDataGetParam(&mounted.mount_point, 0, &loaded, sizeof(loaded), nullptr) == OK);
+	const int64_t nested_mtime = loaded.mtime;
+	CHECK(nested_mtime > static_cast<int64_t>(std::time(nullptr)) + 3600);
+	fs::create_directory(saved / "sce_sys/param.bin.tmp");
+	std::strcpy(param.title, "Failed update");
+	CHECK(SaveDataSetParam(&mounted.mount_point, 0, &param, sizeof(param)) ==
+	      SAVE_DATA_ERROR_INTERNAL);
+	CHECK(fs::remove(saved / "sce_sys/param.bin.tmp"));
+	CHECK(SaveDataGetParam(&mounted.mount_point, 0, &loaded, sizeof(loaded), nullptr) == OK);
+	CHECK(std::string(loaded.title) == "First save");
+	std::strcpy(param.title, "Updated save");
+	CHECK(SaveDataSetParam(&mounted.mount_point, 0, &param, sizeof(param)) == OK);
+	CHECK(SaveDataGetParam(&mounted.mount_point, 0, &loaded, sizeof(loaded), nullptr) == OK);
+	CHECK(std::string(loaded.title) == "Updated save");
+	CHECK(SaveDataUmount2(0, &mounted.mount_point) == OK);
+	CHECK(SaveDataGetParam(&mounted.mount_point, 0, &loaded, sizeof(loaded), nullptr) ==
+	      SAVE_DATA_ERROR_NOT_MOUNTED);
+
+	Reset("OTHER");
+	SceSaveDataTitleId source_title {};
+	std::strcpy(source_title.data, "PARAMS");
+	struct SaveDataTransferringMount transfer {};
+	transfer.user_id  = 1;
+	transfer.title_id = &source_title;
+	transfer.dir_name = &name;
+	SaveDataMountResult transferred {};
+	CHECK(SaveDataTransferringMount(&transfer, &transferred) == OK);
+	CHECK(SaveDataGetParam(&transferred.mount_point, 0, &loaded, sizeof(loaded), nullptr) == OK);
+	CHECK(std::string(loaded.title) == "Updated save");
+	std::error_code alias_error;
+	fs::create_directory_symlink("PARAMS", "_SaveData/P_ALIAS", alias_error);
+	if (!alias_error) {
+		SceSaveDataTitleId alias_title {};
+		std::strcpy(alias_title.data, "P_ALIAS");
+		transfer.title_id = &alias_title;
+		SaveDataMountResult duplicate {};
+		CHECK(SaveDataTransferringMount(&transfer, &duplicate) == SAVE_DATA_ERROR_BUSY);
+		transfer.title_id = &source_title;
+		CHECK(fs::remove("_SaveData/P_ALIAS"));
+	}
+#ifdef _WIN32
+	SceSaveDataTitleId lowercase_title {};
+	std::strcpy(lowercase_title.data, "params");
+	transfer.title_id = &lowercase_title;
+	SaveDataMountResult duplicate {};
+	CHECK(SaveDataTransferringMount(&transfer, &duplicate) == SAVE_DATA_ERROR_BUSY);
+	transfer.title_id = &source_title;
+#endif
+
+	SaveDataMountResult other {};
+	CHECK(SaveDataMount3(&mount, &other) == OK);
+	std::strcpy(param.title, "Other title");
+	CHECK(SaveDataSetParam(&other.mount_point, 0, &param, sizeof(param)) == OK);
+	constexpr char typed_title[] = "Typed title";
+	CHECK(SaveDataSetParam(&other.mount_point, 1, typed_title, sizeof(typed_title)) == OK);
+	char title[32] {};
+	CHECK(SaveDataGetParam(&other.mount_point, 1, title, sizeof(title), &got) == OK);
+	CHECK(std::string(title) == typed_title && got == sizeof(typed_title));
+	const uint32_t user_param = 77;
+	CHECK(SaveDataSetParam(&other.mount_point, 4, &user_param, sizeof(user_param)) == OK);
+	CHECK(SaveDataGetParam(&other.mount_point, 0, &loaded, sizeof(loaded), nullptr) == OK);
+	CHECK(std::string(loaded.title) == typed_title && loaded.user_param == user_param);
+	CHECK(SaveDataGetParam(&other.mount_point, 5, &loaded.mtime, sizeof(loaded.mtime), nullptr) == OK);
+	CHECK(loaded.mtime > 0);
+	CHECK(SaveDataSetParam(&other.mount_point, 5, &loaded.mtime, sizeof(loaded.mtime)) ==
+	      SAVE_DATA_ERROR_PARAMETER);
+	CHECK(SaveDataGetParam(&transferred.mount_point, 0, &loaded, sizeof(loaded), nullptr) == OK);
+	CHECK(std::string(loaded.title) == "Updated save");
+	CHECK(SaveDataUmount2(0, &other.mount_point) == OK);
+	CHECK(SaveDataUmount2(0, &transferred.mount_point) == OK);
+
+	std::array<SceSaveDataDirName, 1> names {};
+	std::array<SaveDataParam, 1> params {};
+	SaveDataDirNameSearchCond cond {};
+	cond.user_id = 1;
+	cond.title_id = &source_title;
+	SaveDataDirNameSearchResult result {};
+	result.dir_names = names.data();
+	result.dir_names_num = names.size();
+	result.params = params.data();
+	CHECK(SaveDataDirNameSearch(&cond, &result) == OK && result.set_num == 1);
+	CHECK(std::string(names[0].data) == "slot" && std::string(params[0].title) == "Updated save");
+	CHECK(params[0].mtime == nested_mtime);
+}
+
 void RunChild(const fs::path& executable, const char* mode) {
 #ifdef _WIN32
 	CHECK(_spawnl(_P_WAIT, executable.string().c_str(), executable.string().c_str(), mode,
@@ -496,6 +618,7 @@ int main(int argc, char** argv) {
 	TestFailedWritePreservesSave();
 	TestClassicSavePaths();
 	TestSaveAllocations();
+	TestClassicSaveParams();
 	CHECK(SaveDataTerminate() == OK);
 	fs::current_path(previous);
 	fs::remove_all(temp);

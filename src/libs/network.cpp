@@ -46,6 +46,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -879,6 +880,7 @@ struct P2pEndpoint {
 struct SocketSlot {
 	std::shared_ptr<SocketTransport> transport;
 	std::optional<P2pEndpoint>       p2p;
+	bool                             nonblocking = false;
 };
 
 struct NetTimeval {
@@ -1040,6 +1042,17 @@ static int* P2pSocketOption(P2pEndpoint& endpoint, int option) {
 	}
 }
 
+/**
+ * @brief Converts guest socket message flags to host socket flags.
+ *
+ * Translates guest flags (MSG_PEEK, MSG_DONTROUTE, MSG_WAITALL, MSG_DONTWAIT,
+ * MSG_NOSIGNAL) to their host platform equivalents. On Windows, masks out
+ * MSG_WAITALL when MSG_PEEK is set to avoid Winsock WSAEOPNOTSUPP errors,
+ * with WAITALL semantics emulated on stream sockets in Recvfrom.
+ *
+ * @param flags Guest socket message flags.
+ * @return Converted host message flags, or -1 if an unsupported flag is present.
+ */
 static int ConvertMessageFlags(int flags) {
 	constexpr int guest_msg_peek      = 0x00000002;
 	constexpr int guest_msg_dontroute = 0x00000004;
@@ -1072,6 +1085,14 @@ static int ConvertMessageFlags(int flags) {
 		*Posix::GetErrorAddr() = Posix::POSIX_EOPNOTSUPP;
 		return -1;
 	}
+
+#if defined(_WIN32)
+	// Winsock fails with WSAEOPNOTSUPP if MSG_PEEK and MSG_WAITALL are combined.
+	// When peeking on Windows, clear MSG_WAITALL so host recv/recvfrom succeeds while preserving socket data.
+	if ((host_flags & MSG_PEEK) != 0) {
+		host_flags &= ~MSG_WAITALL;
+	}
+#endif
 
 	return host_flags;
 }
@@ -2105,6 +2126,8 @@ int KYTY_SYSV_ABI Setsockopt(int s, int level, int optname, const void* optval, 
 		if (ioctlsocket(socket, FIONBIO, &enabled) == SOCKET_ERROR) {
 			return SetHostSocketError();
 		}
+		Common::LockGuard lock(g_socket_mutex);
+		g_sockets[static_cast<size_t>(s)].nonblocking = (enabled != 0);
 		return 0;
 	}
 #else
@@ -2180,6 +2203,21 @@ int64_t KYTY_SYSV_ABI Recv(int s, void* buf, uint64_t len, int flags) {
 	return Recvfrom(s, buf, len, flags, nullptr, nullptr);
 }
 
+/**
+ * @brief Receives a message from a guest socket descriptor.
+ *
+ * Translates guest socket descriptors, buffers, and flags to host native calls.
+ * On Windows, emulates MSG_WAITALL semantics when combined with MSG_PEEK on stream
+ * sockets by awaiting the requested byte count before executing the peek.
+ *
+ * @param s Guest socket descriptor.
+ * @param buf Output buffer for received bytes.
+ * @param len Maximum number of bytes to receive.
+ * @param flags Message reception flags.
+ * @param addr Optional sockaddr buffer to receive the source address.
+ * @param addrlen Pointer to address length.
+ * @return Number of bytes received, or -1 on error.
+ */
 int64_t KYTY_SYSV_ABI Recvfrom(int s, void* buf, uint64_t len, int flags, void* addr,
                                uint32_t* addrlen) {
 	PRINT_NAME();
@@ -2199,7 +2237,8 @@ int64_t KYTY_SYSV_ABI Recvfrom(int s, void* buf, uint64_t len, int flags, void* 
 	}
 
 	NativeSocket socket = INVALID_NATIVE_SOCKET;
-	if (!GetSocketBackend(s, &socket)) {
+	SocketSlot   slot;
+	if (!GetSocketBackend(s, &socket, &slot)) {
 		return -1;
 	}
 
@@ -2210,6 +2249,93 @@ int64_t KYTY_SYSV_ABI Recvfrom(int s, void* buf, uint64_t len, int flags, void* 
 
 	const auto host_len = static_cast<SocketIoLength>(
 	    std::min<uint64_t>(len, std::numeric_limits<SocketIoLength>::max()));
+
+#if defined(_WIN32)
+	// Emulate MSG_WAITALL when combined with MSG_PEEK on stream sockets:
+	// Winsock rejects MSG_PEEK | MSG_WAITALL with WSAEOPNOTSUPP.
+	// ConvertMessageFlags clears MSG_WAITALL when MSG_PEEK is set on Windows.
+	// To preserve POSIX MSG_WAITALL semantics, wait until host_len bytes are pending
+	// (or until EOF / timeout / error) before issuing the native MSG_PEEK receive.
+	constexpr int guest_msg_peek     = 0x00000002;
+	constexpr int guest_msg_waitall  = 0x00000040;
+	constexpr int guest_msg_dontwait = 0x00000080;
+	const bool    is_nonblocking =
+	    slot.nonblocking || (slot.p2p && slot.p2p->nonblocking != 0) || ((flags & guest_msg_dontwait) != 0);
+	if (!is_nonblocking && (flags & guest_msg_peek) != 0 && (flags & guest_msg_waitall) != 0 &&
+	    host_len > 0) {
+		int          socket_type = 0;
+		SocketLength optlen      = sizeof(socket_type);
+		if (::getsockopt(socket, SOL_SOCKET, SO_TYPE, reinterpret_cast<char*>(&socket_type),
+		                 &optlen) == 0 &&
+		    socket_type == SOCK_STREAM) {
+			DWORD timeout_ms = 0;
+			int   timeo_len  = sizeof(timeout_ms);
+			if (::getsockopt(socket, SOL_SOCKET, SO_RCVTIMEO,
+			                 reinterpret_cast<char*>(&timeout_ms), &timeo_len) != 0) {
+				timeout_ms = 0;
+			}
+			const auto start_time = std::chrono::steady_clock::now();
+			while (true) {
+				u_long available = 0;
+				if (::ioctlsocket(socket, FIONREAD, &available) != 0) {
+					return SetHostSocketError();
+				}
+				if (available >= static_cast<u_long>(host_len)) {
+					break;
+				}
+
+				WSAPOLLFD pfd {};
+				pfd.fd                = socket;
+				pfd.events            = POLLRDNORM;
+				const int poll_result = ::WSAPoll(&pfd, 1, 0);
+				if (poll_result == SOCKET_ERROR) {
+					return SetHostSocketError();
+				}
+				if (poll_result > 0 && (pfd.revents & (POLLHUP | POLLERR)) != 0) {
+					break;
+				}
+
+				if (timeout_ms > 0) {
+					const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+					    std::chrono::steady_clock::now() - start_time)
+					    .count();
+					if (elapsed >= timeout_ms) {
+						*Posix::GetErrorAddr() = Posix::POSIX_EWOULDBLOCK;
+						return -1;
+					}
+				}
+
+				if (available == 0) {
+					fd_set readfds;
+					FD_ZERO(&readfds);
+					FD_SET(socket, &readfds);
+					timeval  tv {};
+					timeval* tv_ptr = nullptr;
+					if (timeout_ms > 0) {
+						const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+						    std::chrono::steady_clock::now() - start_time)
+						    .count();
+						const auto remaining = (elapsed < timeout_ms ? timeout_ms - elapsed : 0);
+						tv.tv_sec            = static_cast<long>(remaining / 1000);
+						tv.tv_usec           = static_cast<long>((remaining % 1000) * 1000);
+						tv_ptr               = &tv;
+					}
+					const int sel = ::select(0, &readfds, nullptr, nullptr, tv_ptr);
+					if (sel < 0) {
+						return SetHostSocketError();
+					}
+					if (sel == 0) {
+						*Posix::GetErrorAddr() = Posix::POSIX_EWOULDBLOCK;
+						return -1;
+					}
+				} else {
+					std::this_thread::sleep_for(std::chrono::milliseconds(1));
+				}
+			}
+		}
+	}
+#endif
+
 	sockaddr_storage host_addr {};
 	SocketLength     host_addrlen = sizeof(host_addr);
 	int64_t          result       = 0;

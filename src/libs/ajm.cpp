@@ -1196,12 +1196,6 @@ int KYTY_SYSV_ABI AjmBatchJobRunSplit(AjmBatchInfo* info, uint32_t instance, uin
 	(void)AjmGetInstanceFormat(instance, nullptr, &decoder, &gapless);
 	AjmWriteSideband(flags, sideband_output, sideband_output_size, decoder, gapless, decode_result);
 
-	LOGF("\t instance = 0x%08" PRIx32 ", flags = 0x%016" PRIx64 ", input_buffers = 0x%016" PRIx64
-	     ", input_num = 0x%016" PRIx64 ", output_buffers = 0x%016" PRIx64
-	     ", output_num = 0x%016" PRIx64 "\n",
-	     instance, flags, reinterpret_cast<uint64_t>(input_buffers),
-	     static_cast<uint64_t>(input_buffers_num), reinterpret_cast<uint64_t>(output_buffers),
-	     static_cast<uint64_t>(output_buffers_num));
 	return AjmAppendJob(info, 16 * (input_buffers_num + output_buffers_num) + 32, "run-split");
 }
 

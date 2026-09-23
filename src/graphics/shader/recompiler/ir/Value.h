@@ -121,6 +121,13 @@ public:
 	[[nodiscard]] Block*                  PhiBlock(size_t index) const;
 	[[nodiscard]] Block*                  Parent() const;
 	[[nodiscard]] const std::vector<Use>& Uses() const;
+	// Runtime indices belong to the resource plan that owns this instruction.
+	[[nodiscard]] uint32_t EvaluationIndex(uint32_t& count) const {
+		if (evaluation_index == UINT32_MAX) {
+			evaluation_index = count++;
+		}
+		return evaluation_index;
+	}
 
 	void SetParent(Block* block);
 	void SetArg(size_t index, Value value);
@@ -155,6 +162,7 @@ private:
 	std::vector<Value>  args;
 	std::vector<Block*> phi_blocks;
 	std::vector<Use>    uses;
+	mutable uint32_t    evaluation_index = UINT32_MAX;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

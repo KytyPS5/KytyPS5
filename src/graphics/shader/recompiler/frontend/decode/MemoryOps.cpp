@@ -86,6 +86,7 @@ constexpr MemoryOpcodeInfo FLAT_OPCODE_LIST[] = {
 
 constexpr MemoryOpcodeInfo DS_OPCODE_LIST[] = {
     {0x00u, Opcode::DS_ADD_U32, 1, 32},          {0x01u, Opcode::DS_SUB_U32, 1, 32},
+    {0x03u, Opcode::DS_INC_U32, 1, 32},          {0x04u, Opcode::DS_DEC_U32, 1, 32},
     {0x05u, Opcode::DS_MIN_I32, 1, 32},          {0x06u, Opcode::DS_MAX_I32, 1, 32},
     {0x07u, Opcode::DS_MIN_U32, 1, 32},          {0x08u, Opcode::DS_MAX_U32, 1, 32},
     {0x09u, Opcode::DS_AND_B32, 1, 32},          {0x0au, Opcode::DS_OR_B32, 1, 32},
@@ -166,7 +167,9 @@ bool IsDsAtomicOpcode(Opcode opcode) {
 		case Opcode::DS_ADD_RTN_U32:
 		case Opcode::DS_SUB_U32:
 		case Opcode::DS_SUB_RTN_U32:
+		case Opcode::DS_INC_U32:
 		case Opcode::DS_INC_RTN_U32:
+		case Opcode::DS_DEC_U32:
 		case Opcode::DS_DEC_RTN_U32:
 		case Opcode::DS_MIN_I32:
 		case Opcode::DS_MIN_RTN_I32:

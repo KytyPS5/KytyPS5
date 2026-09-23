@@ -24902,10 +24902,12 @@ TestCase DsAtomicNoReturnVariants() {
 
   std::vector<u32> code;
   AppendVMovU32(&code, 1, 0);
-  const u32 initial[] = {10, 10,      0xfffffff0u, 0xfffffff0u, 10,
-                         10, 0xf0f0u, 0xf000u,     0xf00fu};
-  const u32 values[] = {5, 3, 5, 5, 5, 20, 0x0ff0u, 0x0f00u, 0x00ffu};
-  const u32 ops[] = {0x00, 0x01, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b};
+  const u32 initial[] = {10, 10, 2, 1, 0, 3, 9, 0xfffffff0u, 0xfffffff0u,
+                         10, 10, 0xf0f0u, 0xf000u, 0xf00fu};
+  const u32 values[] = {5, 3, 2, 5, 2, 5, 5, 5, 5,
+                        5, 20, 0x0ff0u, 0x0f00u, 0x00ffu};
+  const u32 ops[] = {0x00, 0x01, 0x03, 0x03, 0x04, 0x04, 0x04,
+                     0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b};
   for (u32 i = 0; i < static_cast<u32>(std::size(values)); i++) {
     AppendVMovLiteral(&code, 2, initial[i]);
     code.push_back(EncodeDs0(0x0d, i * 4u));
@@ -24923,12 +24925,14 @@ TestCase DsAtomicNoReturnVariants() {
 
   return {"DsAtomicNoReturnVariants",
           code,
-          std::vector<u32>(9, 0),
-          {15, 7, 0xfffffff0u, 5, 5, 20, 0x00f0u, 0xff00u, 0xf0f0u},
+          std::vector<u32>(14, 0),
+          {15, 7, 0, 2, 2, 2, 5, 0xfffffff0u, 5, 5, 20, 0x00f0u, 0xff00u,
+           0xf0f0u},
           {O::V_MOV_B32, O::DS_WRITE_B32, O::DS_ADD_U32, O::DS_SUB_U32,
-           O::DS_MIN_I32, O::DS_MAX_I32, O::DS_MIN_U32, O::DS_MAX_U32,
-           O::DS_AND_B32, O::DS_OR_B32, O::DS_XOR_B32, O::DS_READ_B32,
-           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+           O::DS_INC_U32, O::DS_DEC_U32, O::DS_MIN_I32, O::DS_MAX_I32,
+           O::DS_MIN_U32, O::DS_MAX_U32, O::DS_AND_B32, O::DS_OR_B32,
+           O::DS_XOR_B32, O::DS_READ_B32, O::BUFFER_STORE_DWORD,
+           O::S_ENDPGM}};
 }
 
 TestCase DsAtomicReturnVariants() {

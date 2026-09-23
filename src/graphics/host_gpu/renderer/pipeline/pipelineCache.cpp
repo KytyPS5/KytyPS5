@@ -177,7 +177,8 @@ bool ReadShaderGuestRange(void*, uint64_t address, void* data, uint64_t size) {
 bool ReadShaderGuestMemory(void* userdata, uint64_t address, std::span<uint32_t> values) {
 	if (values.empty()) return false;
 	for (size_t i = 0; i < values.size(); ++i) {
-		if (!ReadShaderGuestWord(userdata, address + i * sizeof(uint32_t), &values[i])) return false;
+		if (!ReadShaderGuestWord(userdata, address + i * sizeof(uint32_t), &values[i]))
+			return false;
 	}
 	return true;
 }
@@ -291,7 +292,9 @@ struct PipelineCache::ProgramCache {
 		    : resource_plan(std::move(plan)) {}
 
 		ShaderRecompiler::IR::ResourcePlan           resource_plan;
-		std::deque<Permutation>                     permutations;
+		ShaderRecompiler::IR::ResourceSnapshot       resources;
+		ShaderRecompiler::IR::ResourceSpecialization specialization;
+		std::deque<Permutation>                      permutations;
 	};
 
 	struct ProgramKeyHash {

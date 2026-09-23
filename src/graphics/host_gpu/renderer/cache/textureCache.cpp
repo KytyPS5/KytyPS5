@@ -541,7 +541,8 @@ ImageId TextureCache::GetNullImage(const ImageDesc& desc) {
 	// so any valid speculative sample observes deterministic zero texels.
 	const auto aspect =
 	    info.IsDepth() ? vk::ImageAspectFlagBits::eDepth : vk::ImageAspectFlagBits::eColor;
-	ClearImage(m_scheduler.Current(), id, {aspect, 0, 1, 0, 1}, vk::ClearValue {});
+	ClearImage(m_scheduler.Current(), id, info.pixel_format, {aspect, 0, 1, 0, 1},
+	           vk::ClearValue {});
 	m_null_images.emplace(key, id);
 	return id;
 }

@@ -250,8 +250,7 @@ uint32_t BufferSubwordOffset(EmitterState& state, const IR::MemoryInfo& mem) {
 
 uint32_t ByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
 	if (mem.kind == IR::ResourceKind::Buffer) {
-		const auto address =
-		    BufferByteAddress(ctx, inst, mem);
+		const auto address = BufferByteAddress(ctx, inst, mem);
 		// The resource accessor adds the whole-word part of the binding offset.
 		// Preserve its low bytes here, before computing word indices and subword shifts.
 		return Binary(ctx.state, spv::OpIAdd, TypeU32(ctx.state), address,
@@ -463,14 +462,15 @@ uint32_t FormattedLoad(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Me
 }
 
 uint32_t EncodeFormattedComponent(EmitterState& state, const Format::BufferFormatInfo& info,
-                                   uint32_t component, uint32_t data) {
+                                  uint32_t component, uint32_t data) {
 	if (info.type == Format::ComponentType::Float && info.component_bits[component] == 16u) {
 		const auto value = EmitBitcastU32ToF32(state, data);
 		const auto pair  = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 2), pair, value,
-		                           ConstantF32Value(state, 0.0f));
+		                          ConstantF32Value(state, 0.0f));
 		const auto packed = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpExtInst, TypeU32(state), packed, GlslStd450(state), GLSLstd450PackHalf2x16, pair);
+		state.builder.AddFunction(spv::OpExtInst, TypeU32(state), packed, GlslStd450(state),
+		                          GLSLstd450PackHalf2x16, pair);
 		return packed;
 	}
 	const bool signed_value = info.type == Format::ComponentType::Snorm;
@@ -481,18 +481,20 @@ uint32_t EncodeFormattedComponent(EmitterState& state, const Format::BufferForma
 	const auto nan     = Binary(state, spv::OpFUnordNotEqual, TypeBool(state), value, value);
 	const auto finite  = Select(state, TypeF32(state), nan, ConstantF32Value(state, 0.0f), value);
 	const auto clamped = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), clamped, GlslStd450(state), GLSLstd450FClamp,
-	                           finite, ConstantF32Value(state, signed_value ? -1.0f : 0.0f),
-	                           ConstantF32Value(state, 1.0f));
+	state.builder.AddFunction(
+	    spv::OpExtInst, TypeF32(state), clamped, GlslStd450(state), GLSLstd450FClamp, finite,
+	    ConstantF32Value(state, signed_value ? -1.0f : 0.0f), ConstantF32Value(state, 1.0f));
 	const auto bits = info.component_bits[component];
 	const auto maximum =
 	    static_cast<float>((uint32_t {1} << (bits - (signed_value ? 1u : 0u))) - 1u);
 	const auto scaled =
 	    Binary(state, spv::OpFMul, TypeF32(state), clamped, ConstantF32Value(state, maximum));
 	const auto rounded = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), rounded, GlslStd450(state), GLSLstd450RoundEven, scaled);
-	const auto type    = signed_value ? TypeI32(state) : TypeU32(state);
-	const auto encoded = Unary(state, signed_value ? spv::OpConvertFToS : spv::OpConvertFToU, type, rounded);
+	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), rounded, GlslStd450(state),
+	                          GLSLstd450RoundEven, scaled);
+	const auto type = signed_value ? TypeI32(state) : TypeU32(state);
+	const auto encoded =
+	    Unary(state, signed_value ? spv::OpConvertFToS : spv::OpConvertFToU, type, rounded);
 	return signed_value ? Unary(state, spv::OpBitcast, TypeU32(state), encoded) : encoded;
 }
 
@@ -1041,10 +1043,9 @@ uint32_t EmitBufferAtomic64(ValueEmitContext& ctx, const IR::Inst& inst) {
 	    state, ctx.Arg(inst, inst.NumArgs() - 1), TypeU64(state), ConstantU64(state, 0), [&]() {
 		    const auto resource = PrepareStorageBufferResourceAccess(
 		        state, mem, state.storage_buffer_u64_variable, TypeStorageBufferU64Pointer(state));
-		    const auto byte_address = Binary(state, spv::OpIAdd, TypeU32(state),
-		                                     BufferByteAddress(ctx, inst, mem, ctx.Arg(inst, 1),
-		                                                       ctx.Arg(inst, 2), ctx.Arg(inst, 3)),
-		                                     resource.byte_offset);
+		    const auto byte_address =
+		        Binary(state, spv::OpIAdd, TypeU32(state), BufferByteAddress(ctx, inst, mem),
+		               resource.byte_offset);
 		    const auto index = Binary(state, spv::OpShiftRightLogical, TypeU32(state), byte_address,
 		                              ConstantU32(state, 3u));
 		    return EmitValueOrDefaultIfCondition(

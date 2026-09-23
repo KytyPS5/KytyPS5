@@ -84,8 +84,8 @@ uint32_t ByteExtent(const MemoryInfo& memory) {
 class Tracker {
 public:
 	explicit Tracker(Program& program, std::array<uint32_t, 3> local_size, uint32_t shared_bytes)
-	    : m_program(program), m_info(program.info), m_local_size(local_size),
-	      m_shared_bytes(shared_bytes) {
+	    : m_local_size(local_size), m_shared_bytes(shared_bytes), m_program(program),
+	      m_info(program.info) {
 		m_info.buffers.clear();
 		m_info.images.clear();
 		m_info.samplers.clear();
@@ -1250,6 +1250,20 @@ private:
 		return result;
 	}
 
+	bool MakeRuntimeBufferSource(const Inst& handle, uint32_t pc, uint32_t& source,
+	                             DescriptorSource& descriptor) {
+		if (handle.GetOpcode() != ValueOpcode::GetBufferResource) {
+			return false;
+		}
+		MakeSource(handle, 4u, false, false, descriptor, pc);
+		uint32_t bad_dword = 0;
+		if (!ValidateSource(descriptor, bad_dword)) {
+			return false;
+		}
+		source = InternSource(descriptor);
+		return true;
+	}
+
 	bool TryMakeDirectImage(Inst& handle, uint32_t pc, IndirectImagePlan& plan) {
 		if (handle.GetOpcode() != ValueOpcode::GetImageResource || handle.NumArgs() != 8u) {
 			return false;
@@ -1321,7 +1335,10 @@ private:
 		std::copy_n(table_source.dwords.begin(), 4, image_source.dwords.begin());
 		std::copy_n(table_source.dwords.begin(), 4, image_source.dwords.begin() + 4);
 		image_source.indirect_image =
-		    DescriptorSource::IndirectImage {.material_source = source, .table_source = source, .direct_offset = offset, .direct_address = raw_address};
+		    DescriptorSource::IndirectImage {.material_source = source,
+		                                     .table_source    = source,
+		                                     .direct_offset   = offset,
+		                                     .direct_address  = raw_address};
 		image_source.indirect_image->immediate_offset = immediate;
 		image_source.indirect_image->index_ranges     = FindIndexRanges(offset, pc);
 		plan.handle                                   = &handle;
@@ -1389,11 +1406,14 @@ private:
 		MakeSource(*handle, width, sampler, sample_adjust, descriptor, pc);
 		uint32_t bad_dword = 0;
 		if (!ValidateSource(descriptor, bad_dword)) {
-			if (expected != ValueOpcode::GetBufferResource || !MakeIndirectBuffer(*handle, descriptor, pc)) {
+			if (expected != ValueOpcode::GetBufferResource ||
+			    !MakeIndirectBuffer(*handle, descriptor, pc)) {
 				if (expected == ValueOpcode::GetBufferResource &&
 				    std::all_of(descriptor.dwords.begin(), descriptor.dwords.begin() + width,
-				                [](Value word) { return word.Resolve().GetType() == Type::U32; })) return false;
-				Fail(pc, fmt::format("{} dword {} is not a valid runtime value", ValueOpcodeName(expected), bad_dword));
+				                [](Value word) { return word.Resolve().GetType() == Type::U32; }))
+					return false;
+				Fail(pc, fmt::format("{} dword {} is not a valid runtime value",
+				                     ValueOpcodeName(expected), bad_dword));
 			}
 		}
 		source = InternSource(descriptor);
@@ -1606,7 +1626,8 @@ private:
 			}
 			ValidateAddressHandle(inst.Arg(0), flags.pc);
 			if (op == ValueOpcode::LoadAddressU32 && !memory.address_is_full &&
-			    (memory.kind == ResourceKind::ScalarAddress || memory.kind == ResourceKind::Global)) {
+			    (memory.kind == ResourceKind::ScalarAddress ||
+			     memory.kind == ResourceKind::Global)) {
 				m_program.address_read_index_ranges.emplace_back(
 				    flags.index, FindIndexRanges(inst.Arg(1), flags.pc));
 			}
@@ -1681,8 +1702,8 @@ private:
 		}
 	}
 
-	std::array<uint32_t, 3> m_local_size;
-	uint32_t m_shared_bytes;
+	std::array<uint32_t, 3>                    m_local_size;
+	uint32_t                                   m_shared_bytes;
 	Program&                                   m_program;
 	ShaderInfo                                 m_info;
 	std::vector<DescriptorSource>              m_sources;
@@ -1691,8 +1712,8 @@ private:
 	std::vector<IndirectImagePlan>             m_indirect_images;
 	std::vector<std::pair<const Inst*, Value>> m_descriptor_selections;
 	bool                                       m_shader_writes = false;
-	std::vector<std::pair<Inst*, uint32_t>> m_indirect_buffers;
-	std::vector<DescriptorSource::IndexRange> m_shared_ranges;
+	std::vector<std::pair<Inst*, uint32_t>>    m_indirect_buffers;
+	std::vector<DescriptorSource::IndexRange>  m_shared_ranges;
 };
 
 } // namespace

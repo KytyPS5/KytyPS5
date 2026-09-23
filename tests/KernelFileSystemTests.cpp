@@ -1,4 +1,6 @@
-#include "SDL.h"
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_main.h>
+
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
@@ -478,11 +480,11 @@ int main() {
   Config::Load(options);
   subsystems.Initialize<Log::Lifecycle>();
 
-  Check(SDL_InitSubSystem(SDL_INIT_VIDEO) == 0, "initialize Vulkan test video");
+  Check(SDL_InitSubSystem(SDL_INIT_VIDEO), "initialize Vulkan test video");
   auto graphics = std::make_unique<Libs::Graphics::WindowContext>();
   graphics->graphic_ctx.screen_width = 64;
   graphics->graphic_ctx.screen_height = 64;
-  graphics->window = SDL_CreateWindow("KernelFileSystemTests", 0, 0, 64, 64,
+  graphics->window = SDL_CreateWindow("KernelFileSystemTests", 64, 64,
                                       SDL_WINDOW_VULKAN | SDL_WINDOW_HIDDEN);
   Check(graphics->window != nullptr, "create hidden Vulkan test window");
   graphics->CreateVulkan();

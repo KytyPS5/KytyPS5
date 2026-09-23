@@ -15,6 +15,8 @@
 
 namespace Libs::Graphics {
 
+class StreamBuffer;
+
 class CommandScheduler {
 public:
 	CommandScheduler(RenderContext& context, GraphicContext& graphics);
@@ -37,7 +39,6 @@ public:
 	void                      PopPendingOperations();
 	void                      DrainPriorityOperations();
 	void                      WaitPriorityOperations(uint64_t tick);
-	// Guest-memory completions use the priority queue; normal callbacks maintain GPU resources.
 	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
 	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
 	[[nodiscard]] bool        HasPendingPriorityOperations();
@@ -52,6 +53,9 @@ public:
 	[[nodiscard]] MasterSemaphore& GetMasterSemaphore() noexcept { return m_master; }
 	[[nodiscard]] DynamicState&    GetDynamicState() noexcept { return m_dynamic_state; }
 	[[nodiscard]] RenderContext&   Context() const noexcept { return m_context; }
+	// See StreamBuffer::RetagWatches. A stream buffer registers for its lifetime.
+	void                           RegisterStreamBuffer(StreamBuffer* buffer);
+	void                           UnregisterStreamBuffer(StreamBuffer* buffer);
 	[[nodiscard]] GraphicContext&  Graphics() const noexcept { return m_graphics; }
 
 private:
@@ -84,8 +88,8 @@ private:
 	};
 
 	void BeginNext();
+	void RetagStreamWatches(uint64_t submitted_tick);
 	void PriorityOperationsThread(std::stop_token stop);
-	void QueueOperation(Common::UniqueFunction<void>&& operation, bool priority);
 	void RunOperation(Common::UniqueFunction<void>&& operation);
 
 	MasterSemaphore              m_master;
@@ -102,6 +106,8 @@ private:
 	bool                         m_priority_active      = false;
 	uint64_t                     m_priority_active_tick = 0;
 	OperationState               m_operation_state      = OperationState::Open;
+	std::mutex                   m_stream_buffer_mutex;
+	std::vector<StreamBuffer*>   m_stream_buffers;
 };
 
 } // namespace Libs::Graphics

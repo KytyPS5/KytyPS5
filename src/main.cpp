@@ -8,6 +8,8 @@
 #include "emulator.h"
 #include "kytyGitVersion.h"
 
+#include <SDL3/SDL_main.h>
+
 #include <charconv>
 #include <cstdio>
 #include <string_view>

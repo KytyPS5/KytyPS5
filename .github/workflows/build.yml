@@ -359,7 +359,7 @@ jobs:
             -DCMAKE_PREFIX_PATH="$Qt6_DIR" 2>&1 | tee _Build/configure.log
           exit "${PIPESTATUS[0]}"
 
-      - name: Verify SDL2 backends
+      - name: Verify SDL3 backends
         shell: bash
         run: |
           status=0

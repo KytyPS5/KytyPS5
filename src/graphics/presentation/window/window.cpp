@@ -1,23 +1,7 @@
 #include "graphics/presentation/window.h"
 
-#include "SDL.h"
-#include "SDL_error.h"
-#include "SDL_events.h"
-#include "SDL_filesystem.h"
-#include "SDL_gamecontroller.h"
-#include "SDL_hints.h"
-#include "SDL_joystick.h"
-#include "SDL_keyboard.h"
-#include "SDL_keycode.h"
-#include "SDL_mouse.h"
-#include "SDL_pixels.h"
-#include "SDL_rwops.h"
-#include "SDL_stdinc.h"
-#include "SDL_surface.h"
-#include "SDL_thread.h"
-#include "SDL_touch.h"
-#include "SDL_video.h"
-#include "SDL_vulkan.h"
+#include <SDL3/SDL.h>
+
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
@@ -72,39 +56,39 @@ struct EventKeyboard {
 
 static uint32_t ControllerButtonToPadButton(int button) {
 	switch (button) {
-		case SDL_CONTROLLER_BUTTON_A: return Controller::PAD_BUTTON_CROSS;
-		case SDL_CONTROLLER_BUTTON_B: return Controller::PAD_BUTTON_CIRCLE;
-		case SDL_CONTROLLER_BUTTON_X: return Controller::PAD_BUTTON_SQUARE;
-		case SDL_CONTROLLER_BUTTON_Y: return Controller::PAD_BUTTON_TRIANGLE;
-		case SDL_CONTROLLER_BUTTON_START: return Controller::PAD_BUTTON_OPTIONS;
-		case SDL_CONTROLLER_BUTTON_LEFTSTICK: return Controller::PAD_BUTTON_L3;
-		case SDL_CONTROLLER_BUTTON_RIGHTSTICK: return Controller::PAD_BUTTON_R3;
-		case SDL_CONTROLLER_BUTTON_LEFTSHOULDER: return Controller::PAD_BUTTON_L1;
-		case SDL_CONTROLLER_BUTTON_RIGHTSHOULDER: return Controller::PAD_BUTTON_R1;
-		case SDL_CONTROLLER_BUTTON_DPAD_UP: return Controller::PAD_BUTTON_UP;
-		case SDL_CONTROLLER_BUTTON_DPAD_DOWN: return Controller::PAD_BUTTON_DOWN;
-		case SDL_CONTROLLER_BUTTON_DPAD_LEFT: return Controller::PAD_BUTTON_LEFT;
-		case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: return Controller::PAD_BUTTON_RIGHT;
-		case SDL_CONTROLLER_BUTTON_TOUCHPAD: return Controller::PAD_BUTTON_TOUCH_PAD;
+		case SDL_GAMEPAD_BUTTON_SOUTH: return Controller::PAD_BUTTON_CROSS;
+		case SDL_GAMEPAD_BUTTON_EAST: return Controller::PAD_BUTTON_CIRCLE;
+		case SDL_GAMEPAD_BUTTON_WEST: return Controller::PAD_BUTTON_SQUARE;
+		case SDL_GAMEPAD_BUTTON_NORTH: return Controller::PAD_BUTTON_TRIANGLE;
+		case SDL_GAMEPAD_BUTTON_START: return Controller::PAD_BUTTON_OPTIONS;
+		case SDL_GAMEPAD_BUTTON_LEFT_STICK: return Controller::PAD_BUTTON_L3;
+		case SDL_GAMEPAD_BUTTON_RIGHT_STICK: return Controller::PAD_BUTTON_R3;
+		case SDL_GAMEPAD_BUTTON_LEFT_SHOULDER: return Controller::PAD_BUTTON_L1;
+		case SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER: return Controller::PAD_BUTTON_R1;
+		case SDL_GAMEPAD_BUTTON_DPAD_UP: return Controller::PAD_BUTTON_UP;
+		case SDL_GAMEPAD_BUTTON_DPAD_DOWN: return Controller::PAD_BUTTON_DOWN;
+		case SDL_GAMEPAD_BUTTON_DPAD_LEFT: return Controller::PAD_BUTTON_LEFT;
+		case SDL_GAMEPAD_BUTTON_DPAD_RIGHT: return Controller::PAD_BUTTON_RIGHT;
+		case SDL_GAMEPAD_BUTTON_TOUCHPAD: return Controller::PAD_BUTTON_TOUCH_PAD;
 		default: return 0;
 	}
 }
 
 static Controller::Axis ControllerAxisFromSdl(int axis_id) {
 	switch (axis_id) {
-		case SDL_CONTROLLER_AXIS_LEFTX: return Controller::Axis::LeftX;
-		case SDL_CONTROLLER_AXIS_LEFTY: return Controller::Axis::LeftY;
-		case SDL_CONTROLLER_AXIS_RIGHTX: return Controller::Axis::RightX;
-		case SDL_CONTROLLER_AXIS_RIGHTY: return Controller::Axis::RightY;
-		case SDL_CONTROLLER_AXIS_TRIGGERLEFT: return Controller::Axis::TriggerLeft;
-		case SDL_CONTROLLER_AXIS_TRIGGERRIGHT: return Controller::Axis::TriggerRight;
+		case SDL_GAMEPAD_AXIS_LEFTX: return Controller::Axis::LeftX;
+		case SDL_GAMEPAD_AXIS_LEFTY: return Controller::Axis::LeftY;
+		case SDL_GAMEPAD_AXIS_RIGHTX: return Controller::Axis::RightX;
+		case SDL_GAMEPAD_AXIS_RIGHTY: return Controller::Axis::RightY;
+		case SDL_GAMEPAD_AXIS_LEFT_TRIGGER: return Controller::Axis::TriggerLeft;
+		case SDL_GAMEPAD_AXIS_RIGHT_TRIGGER: return Controller::Axis::TriggerRight;
 		default: return Controller::Axis::AxisMax;
 	}
 }
 
 static bool ControllerAxisIsTrigger(int axis_id) {
-	return axis_id == SDL_CONTROLLER_AXIS_TRIGGERLEFT ||
-	       axis_id == SDL_CONTROLLER_AXIS_TRIGGERRIGHT;
+	return axis_id == SDL_GAMEPAD_AXIS_LEFT_TRIGGER ||
+	       axis_id == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER;
 }
 
 static int ControllerAxisValueFromSdl(int axis_id, int axis_value) {
@@ -165,22 +149,6 @@ struct EventController {
 	double timestamp_seconds;
 };
 
-enum class DisplayOrientation {
-	Unknown,   /* The display orientation can't be determined */
-	Landscape, /* The display is in landscape mode, with the right side up, relative to portrait
-	              mode */
-	LandscapeFlipped, /* The display is in landscape mode, with the left side up, relative to
-	                     portrait mode */
-	Portrait,         /* The display is in portrait mode */
-	PortraitFlipped,  /* The display is in portrait mode, upside down */
-
-	DisplayEventOrientation = 0xF0
-};
-
-struct EventDisplay {
-	DisplayOrientation orientation;
-};
-
 namespace {
 
 std::unique_ptr<WindowContext> g_window;
@@ -213,11 +181,8 @@ static void ToggleDesktopFullscreen() {
 	}
 
 	const auto flags = static_cast<uint32_t>(SDL_GetWindowFlags(g_window->window));
-	const bool fullscreen =
-	    (flags & static_cast<uint32_t>(SDL_WINDOW_FULLSCREEN_DESKTOP)) != 0u;
-	const auto mode =
-	    fullscreen ? 0u : static_cast<uint32_t>(SDL_WINDOW_FULLSCREEN_DESKTOP);
-	if (SDL_SetWindowFullscreen(g_window->window, mode) != 0) {
+	const bool fullscreen = (flags & SDL_WINDOW_FULLSCREEN) != 0u;
+	if (!SDL_SetWindowFullscreen(g_window->window, !fullscreen)) {
 		LOGF("Toggle fullscreen failed: %s\n", SDL_GetError());
 	}
 }
@@ -247,7 +212,7 @@ static void GameEventKeyboard(const EventKeyboard& key) {
 				break;
 			case SDLK_RETURN:
 			case SDLK_KP_ENTER:
-				if (!key.repeat && (key.mod & KMOD_ALT) != 0) {
+				if (!key.repeat && (key.mod & SDL_KMOD_ALT) != 0) {
 					ToggleDesktopFullscreen();
 					fullscreen_key = key.key_code;
 				}
@@ -340,15 +305,15 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 #endif
 
 	if (f.added) {
-		auto* pad = SDL_GameControllerOpen(f.id);
+		auto* pad = SDL_OpenGamepad(f.id);
 		EXIT_NOT_IMPLEMENTED(pad == nullptr);
-		int id = SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(pad));
+		int id = SDL_GetJoystickID(SDL_GetGamepadJoystick(pad));
 		Controller::Connect(id);
 	}
 
 	if (f.removed) {
 		Controller::Disconnect(f.id);
-		SDL_GameControllerClose(SDL_GameControllerFromInstanceID(f.id));
+		SDL_CloseGamepad(SDL_GetGamepadFromID(f.id));
 	}
 
 	if (f.down || f.up) {
@@ -400,81 +365,73 @@ void WindowContext::Resize(uint32_t new_width, uint32_t new_height) {
 
 void WindowContext::ProcessWindowEvent(const SDL_WindowEvent& event) {
 	const auto& window_event = event;
-	switch (window_event.event) {
-		case SDL_WINDOWEVENT_SHOWN:
+	switch (window_event.type) {
+		case SDL_EVENT_WINDOW_SHOWN:
 			LOGF("Window %" PRIu32 " shown\n", window_event.windowID);
 			break;
 
-		case SDL_WINDOWEVENT_HIDDEN:
+		case SDL_EVENT_WINDOW_HIDDEN:
 			LOGF("Window %" PRIu32 " hidden\n", window_event.windowID);
 			break;
 
-		case SDL_WINDOWEVENT_EXPOSED:
+		case SDL_EVENT_WINDOW_EXPOSED:
 			LOGF("Window %" PRIu32 " exposed\n", window_event.windowID);
 			break;
 
-		case SDL_WINDOWEVENT_MOVED:
+		case SDL_EVENT_WINDOW_MOVED:
 			LOGF("Window %" PRIu32 " moved to %" PRId32 ",%" PRId32 "\n", window_event.windowID,
 			     window_event.data1, window_event.data2);
 			break;
 
-		case SDL_WINDOWEVENT_RESIZED:
+		case SDL_EVENT_WINDOW_RESIZED:
 			LOGF("Window %" PRIu32 " resized to %" PRId32 "x%" PRId32 "\n", window_event.windowID,
 			     window_event.data1, window_event.data2);
-
-			LOGF("m: %d\n", static_cast<int>(SDL_ThreadID()));
-			Resize(window_event.data1, window_event.data2);
-
 			break;
 
-		case SDL_WINDOWEVENT_SIZE_CHANGED:
+		case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
 			LOGF("Window %" PRIu32 " size changed to %" PRId32 "x%" PRId32 "\n",
 			     window_event.windowID, window_event.data1, window_event.data2);
 
-			LOGF("m: %d\n", static_cast<int>(SDL_ThreadID()));
 			Resize(window_event.data1, window_event.data2);
 
 			break;
 
-		case SDL_WINDOWEVENT_MINIMIZED:
+		case SDL_EVENT_WINDOW_MINIMIZED:
 			LOGF("Window %" PRIu32 " minimized\n", window_event.windowID);
 			break;
-		case SDL_WINDOWEVENT_MAXIMIZED:
+		case SDL_EVENT_WINDOW_MAXIMIZED:
 			LOGF("Window %" PRIu32 " maximized\n", window_event.windowID);
 			break;
-		case SDL_WINDOWEVENT_RESTORED:
+		case SDL_EVENT_WINDOW_RESTORED:
 			LOGF("Window %" PRIu32 " restored\n", window_event.windowID);
 			break;
-		case SDL_WINDOWEVENT_ENTER:
+		case SDL_EVENT_WINDOW_MOUSE_ENTER:
 			LOGF("Mouse entered window %" PRIu32 "\n", window_event.windowID);
 			break;
-		case SDL_WINDOWEVENT_LEAVE:
+		case SDL_EVENT_WINDOW_MOUSE_LEAVE:
 			LOGF("Mouse left window %" PRIu32 "\n", window_event.windowID);
 			break;
-		case SDL_WINDOWEVENT_FOCUS_GAINED:
+		case SDL_EVENT_WINDOW_FOCUS_GAINED:
 			LOGF("Window %" PRIu32 " gained keyboard focus\n", window_event.windowID);
 			break;
-		case SDL_WINDOWEVENT_FOCUS_LOST:
+		case SDL_EVENT_WINDOW_FOCUS_LOST:
 			LOGF("Window %" PRIu32 " lost keyboard focus\n", window_event.windowID);
 			break;
-		case SDL_WINDOWEVENT_CLOSE:
+		case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
 			LOGF("Window %" PRIu32 " closed\n", window_event.windowID);
 			break;
 		default:
-			LOGF("Window %" PRIu32 " got unknown event %" PRIu8 "\n", window_event.windowID,
-			     window_event.event);
+			LOGF("Window %" PRIu32 " got unknown event %" PRIu32 "\n", window_event.windowID,
+			     static_cast<uint32_t>(window_event.type));
 			break;
 	}
 }
 
 void WindowContext::ProcessDisplayEvent(const SDL_DisplayEvent& display) {
-	bool sdl = false;
-
-	switch (display.event) {
-		case SDL_DISPLAYEVENT_ORIENTATION: sdl = true; [[fallthrough]];
-		case static_cast<Uint8>(DisplayOrientation::DisplayEventOrientation): {
-			LOGF("Display %" PRIu32 "[%s] changed orientation to %d - ", display.display,
-			     sdl ? "SDL" : "Kyty", static_cast<int>(display.data1));
+	switch (display.type) {
+		case SDL_EVENT_DISPLAY_ORIENTATION: {
+			LOGF("Display %" PRIu32 " changed orientation to %d - ", display.displayID,
+			     static_cast<int>(display.data1));
 
 			switch (display.data1) {
 				case SDL_ORIENTATION_UNKNOWN: LOGF("UNKNOWN\n"); break;
@@ -488,8 +445,8 @@ void WindowContext::ProcessDisplayEvent(const SDL_DisplayEvent& display) {
 			break;
 		}
 		default:
-			LOGF("Display %" PRIu32 " got unknown event 0x%" PRIx8 "\n", display.display,
-			     display.event);
+			LOGF("Display %" PRIu32 " got unknown event 0x%" PRIx32 "\n", display.displayID,
+			     static_cast<uint32_t>(display.type));
 			break;
 	}
 }
@@ -497,10 +454,9 @@ void WindowContext::ProcessDisplayEvent(const SDL_DisplayEvent& display) {
 void WindowContext::ProcessEvent(double time_s) {
 	auto& game  = loop;
 	auto* event = &game.event;
-	EXIT_IF(SDL_GetEventState(SDL_DISPLAYEVENT) != SDL_ENABLE);
-	if ((event->type == SDL_KEYDOWN || event->type == SDL_KEYUP) &&
-	    event->key.keysym.sym == SDLK_F7) {
-		if (event->type == SDL_KEYDOWN && event->key.repeat == 0) {
+	if ((event->type == SDL_EVENT_KEY_DOWN || event->type == SDL_EVENT_KEY_UP) &&
+	    event->key.key == SDLK_F7) {
+		if (event->type == SDL_EVENT_KEY_DOWN && event->key.repeat == 0) {
 			HostInputToggleMouseToJoystick();
 		}
 		return;
@@ -508,34 +464,42 @@ void WindowContext::ProcessEvent(double time_s) {
 	if (ProcessSystemOverlayInput(*event)) {
 		return;
 	}
+	if (event->type >= SDL_EVENT_WINDOW_FIRST && event->type <= SDL_EVENT_WINDOW_LAST) {
+		ProcessWindowEvent(event->window);
+		return;
+	}
+	if (event->type >= SDL_EVENT_DISPLAY_FIRST && event->type <= SDL_EVENT_DISPLAY_LAST) {
+		ProcessDisplayEvent(event->display);
+		return;
+	}
 
 	switch (event->type) {
-		case SDL_QUIT: GameEventQuit(game); break;
+		case SDL_EVENT_QUIT: GameEventQuit(game); break;
 
-		case SDL_APP_TERMINATING: GameEventTerminate(game); break;
+		case SDL_EVENT_TERMINATING: GameEventTerminate(game); break;
 
-		case SDL_APP_LOWMEMORY: GameEventLowMemory(); break;
+		case SDL_EVENT_LOW_MEMORY: GameEventLowMemory(); break;
 
-		case SDL_APP_WILLENTERBACKGROUND: GameEventWillEnterBackground(game); break;
+		case SDL_EVENT_WILL_ENTER_BACKGROUND: GameEventWillEnterBackground(game); break;
 
-		case SDL_APP_DIDENTERBACKGROUND: GameEventDidEnterBackground(); break;
+		case SDL_EVENT_DID_ENTER_BACKGROUND: GameEventDidEnterBackground(); break;
 
-		case SDL_APP_WILLENTERFOREGROUND: GameEventWillEnterForeground(); break;
+		case SDL_EVENT_WILL_ENTER_FOREGROUND: GameEventWillEnterForeground(); break;
 
-		case SDL_APP_DIDENTERFOREGROUND: GameEventDidEnterForeground(game); break;
+		case SDL_EVENT_DID_ENTER_FOREGROUND: GameEventDidEnterForeground(game); break;
 
-		case SDL_KEYDOWN:
-		case SDL_KEYUP: {
+		case SDL_EVENT_KEY_DOWN:
+		case SDL_EVENT_KEY_UP: {
 			EventKeyboard key {};
 
-			key.down              = (event->type == SDL_KEYDOWN);
-			key.up                = (event->type == SDL_KEYUP);
-			key.pressed           = (event->key.state == SDL_PRESSED);
-			key.released          = (event->key.state == SDL_RELEASED);
+			key.down              = (event->type == SDL_EVENT_KEY_DOWN);
+			key.up                = (event->type == SDL_EVENT_KEY_UP);
+			key.pressed           = event->key.down;
+			key.released          = !event->key.down;
 			key.repeat            = (event->key.repeat != 0u);
-			key.scan_code         = event->key.keysym.scancode;
-			key.key_code          = event->key.keysym.sym;
-			key.mod               = event->key.keysym.mod;
+			key.scan_code         = event->key.scancode;
+			key.key_code          = event->key.key;
+			key.mod               = event->key.mod;
 			key.timestamp_seconds = time_s;
 
 			GameEventKeyboard(key);
@@ -543,24 +507,20 @@ void WindowContext::ProcessEvent(double time_s) {
 			break;
 		}
 
-		case SDL_WINDOWEVENT: ProcessWindowEvent(event->window); break;
-
-		case SDL_DISPLAYEVENT: ProcessDisplayEvent(event->display); break;
-
-		case SDL_MOUSEBUTTONDOWN:
-		case SDL_MOUSEBUTTONUP: {
+		case SDL_EVENT_MOUSE_BUTTON_DOWN:
+		case SDL_EVENT_MOUSE_BUTTON_UP: {
 			EventMouse mb {};
 
-			mb.down              = (event->button.type == SDL_MOUSEBUTTONDOWN);
-			mb.up                = (event->button.type == SDL_MOUSEBUTTONUP);
+			mb.down              = (event->button.type == SDL_EVENT_MOUSE_BUTTON_DOWN);
+			mb.up                = (event->button.type == SDL_EVENT_MOUSE_BUTTON_UP);
 			mb.left              = (event->button.button == SDL_BUTTON_LEFT);
 			mb.middle            = (event->button.button == SDL_BUTTON_MIDDLE);
 			mb.right             = (event->button.button == SDL_BUTTON_RIGHT);
 			mb.x1                = (event->button.button == SDL_BUTTON_X1);
 			mb.x2                = (event->button.button == SDL_BUTTON_X2);
 			mb.touch             = (event->button.which == SDL_TOUCH_MOUSEID);
-			mb.pressed           = (event->button.state == SDL_PRESSED);
-			mb.released          = (event->button.state == SDL_RELEASED);
+			mb.pressed           = event->button.down;
+			mb.released          = !event->button.down;
 			mb.num_of_clicks     = event->button.clicks;
 			mb.wheel             = false;
 			mb.x                 = event->button.x;
@@ -575,7 +535,7 @@ void WindowContext::ProcessEvent(double time_s) {
 			break;
 		}
 
-		case SDL_MOUSEWHEEL: {
+		case SDL_EVENT_MOUSE_WHEEL: {
 			EventMouse mb {};
 
 			mb.down              = false;
@@ -602,7 +562,7 @@ void WindowContext::ProcessEvent(double time_s) {
 			break;
 		}
 
-		case SDL_MOUSEMOTION: {
+		case SDL_EVENT_MOUSE_MOTION: {
 			EventMouse mb {};
 
 			mb.down              = false;
@@ -629,16 +589,16 @@ void WindowContext::ProcessEvent(double time_s) {
 			break;
 		}
 
-		case SDL_FINGERMOTION:
-		case SDL_FINGERDOWN:
-		case SDL_FINGERUP: {
+		case SDL_EVENT_FINGER_MOTION:
+		case SDL_EVENT_FINGER_DOWN:
+		case SDL_EVENT_FINGER_UP: {
 			EventFinger f {};
 
-			f.down              = (event->tfinger.type == SDL_FINGERDOWN);
-			f.up                = (event->tfinger.type == SDL_FINGERUP);
-			f.motion            = (event->tfinger.type == SDL_FINGERMOTION);
-			f.finger_id         = static_cast<int>(event->tfinger.fingerId);
-			f.touch_id          = static_cast<int>(event->tfinger.touchId);
+			f.down              = (event->tfinger.type == SDL_EVENT_FINGER_DOWN);
+			f.up                = (event->tfinger.type == SDL_EVENT_FINGER_UP);
+			f.motion            = (event->tfinger.type == SDL_EVENT_FINGER_MOTION);
+			f.finger_id         = static_cast<int>(event->tfinger.fingerID);
+			f.touch_id          = static_cast<int>(event->tfinger.touchID);
 			f.x                 = event->tfinger.x;
 			f.y                 = event->tfinger.y;
 			f.dx                = event->tfinger.dx;
@@ -651,13 +611,13 @@ void WindowContext::ProcessEvent(double time_s) {
 			break;
 		}
 
-		case SDL_CONTROLLERAXISMOTION: {
+		case SDL_EVENT_GAMEPAD_AXIS_MOTION: {
 			EventController c {};
 
-			c.id                = event->caxis.which;
-			c.button            = SDL_CONTROLLER_BUTTON_INVALID;
-			c.axis_id           = event->caxis.axis;
-			c.axis_value        = event->caxis.value;
+			c.id                = event->gaxis.which;
+			c.button            = SDL_GAMEPAD_BUTTON_INVALID;
+			c.axis_id           = event->gaxis.axis;
+			c.axis_value        = event->gaxis.value;
 			c.down              = false;
 			c.up                = false;
 			c.added             = false;
@@ -673,22 +633,22 @@ void WindowContext::ProcessEvent(double time_s) {
 			break;
 		}
 
-		case SDL_CONTROLLERBUTTONDOWN:
-		case SDL_CONTROLLERBUTTONUP: {
+		case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+		case SDL_EVENT_GAMEPAD_BUTTON_UP: {
 			EventController c {};
 
-			c.id                = event->cbutton.which;
-			c.button            = event->cbutton.button;
-			c.axis_id           = SDL_CONTROLLER_AXIS_INVALID;
+			c.id                = event->gbutton.which;
+			c.button            = event->gbutton.button;
+			c.axis_id           = SDL_GAMEPAD_AXIS_INVALID;
 			c.axis_value        = 0;
-			c.down              = (event->cbutton.type == SDL_CONTROLLERBUTTONDOWN);
-			c.up                = (event->cbutton.type == SDL_CONTROLLERBUTTONUP);
+			c.down              = event->gbutton.down;
+			c.up                = !event->gbutton.down;
 			c.added             = false;
 			c.removed           = false;
 			c.remapped          = false;
 			c.axis              = false;
-			c.pressed           = (event->cbutton.state == SDL_PRESSED);
-			c.released          = (event->cbutton.state == SDL_RELEASED);
+			c.pressed           = event->gbutton.down;
+			c.released          = !event->gbutton.down;
 			c.timestamp_seconds = time_s;
 
 			GameEventController(c);
@@ -696,44 +656,44 @@ void WindowContext::ProcessEvent(double time_s) {
 			break;
 		}
 
-		case SDL_CONTROLLERTOUCHPADDOWN:
-		case SDL_CONTROLLERTOUCHPADMOTION:
-		case SDL_CONTROLLERTOUCHPADUP:
-			if (event->ctouchpad.touchpad == 0) {
-				Controller::SetTouchPad(event->ctouchpad.which, event->ctouchpad.finger,
-				                        event->ctouchpad.type != SDL_CONTROLLERTOUCHPADUP,
-				                        event->ctouchpad.x, event->ctouchpad.y);
+		case SDL_EVENT_GAMEPAD_TOUCHPAD_DOWN:
+		case SDL_EVENT_GAMEPAD_TOUCHPAD_MOTION:
+		case SDL_EVENT_GAMEPAD_TOUCHPAD_UP:
+			if (event->gtouchpad.touchpad == 0) {
+				Controller::SetTouchPad(event->gtouchpad.which, event->gtouchpad.finger,
+				                        event->gtouchpad.type != SDL_EVENT_GAMEPAD_TOUCHPAD_UP,
+				                        event->gtouchpad.x, event->gtouchpad.y);
 			}
 			break;
 
-		case SDL_CONTROLLERSENSORUPDATE: {
-			const auto& sensor = event->csensor;
+		case SDL_EVENT_GAMEPAD_SENSOR_UPDATE: {
+			const auto& sensor = event->gsensor;
 			if (sensor.sensor == SDL_SENSOR_ACCEL || sensor.sensor == SDL_SENSOR_GYRO) {
 				Controller::SetSensor(sensor.which,
 				                      sensor.sensor == SDL_SENSOR_ACCEL ? Controller::Sensor::Accel
 				                                                        : Controller::Sensor::Gyro,
 				                      sensor.data,
-				                      sensor.timestamp_us != 0
-				                          ? sensor.timestamp_us
-				                          : static_cast<uint64_t>(sensor.timestamp) * 1000);
+				                      sensor.sensor_timestamp != 0
+				                          ? sensor.sensor_timestamp / 1000
+				                          : sensor.timestamp / 1000);
 			}
 			break;
 		}
 
-		case SDL_CONTROLLERDEVICEADDED:
-		case SDL_CONTROLLERDEVICEREMOVED:
-		case SDL_CONTROLLERDEVICEREMAPPED: {
+		case SDL_EVENT_GAMEPAD_ADDED:
+		case SDL_EVENT_GAMEPAD_REMOVED:
+		case SDL_EVENT_GAMEPAD_REMAPPED: {
 			EventController c {};
 
-			c.id                = event->cdevice.which;
-			c.button            = SDL_CONTROLLER_BUTTON_INVALID;
-			c.axis_id           = SDL_CONTROLLER_AXIS_INVALID;
+			c.id                = event->gdevice.which;
+			c.button            = SDL_GAMEPAD_BUTTON_INVALID;
+			c.axis_id           = SDL_GAMEPAD_AXIS_INVALID;
 			c.axis_value        = 0;
 			c.down              = false;
 			c.up                = false;
-			c.added             = (event->cdevice.type == SDL_CONTROLLERDEVICEADDED);
-			c.removed           = (event->cdevice.type == SDL_CONTROLLERDEVICEREMOVED);
-			c.remapped          = (event->cdevice.type == SDL_CONTROLLERDEVICEREMAPPED);
+			c.added             = (event->gdevice.type == SDL_EVENT_GAMEPAD_ADDED);
+			c.removed           = (event->gdevice.type == SDL_EVENT_GAMEPAD_REMOVED);
+			c.remapped          = (event->gdevice.type == SDL_EVENT_GAMEPAD_REMAPPED);
 			c.axis              = false;
 			c.pressed           = false;
 			c.released          = false;
@@ -746,47 +706,6 @@ void WindowContext::ProcessEvent(double time_s) {
 	}
 }
 
-void WindowContext::RunOnMainThread(std::function<void()> task) {
-	if (Common::Thread::IsMainThread()) {
-		task();
-		return;
-	}
-
-	uint64_t ticket = 0;
-	{
-		Common::LockGuard lock(main_task_mutex);
-		main_tasks.push_back(std::move(task));
-		ticket = ++main_tasks_queued;
-	}
-
-	// Wake the main loop in case it is blocked in SDL_WaitEvent.
-	SDL_Event event {};
-	event.type = SDL_USEREVENT;
-	SDL_PushEvent(&event);
-
-	Common::LockGuard lock(main_task_mutex);
-	while (main_tasks_run < ticket) {
-		main_task_done.Wait(&main_task_mutex);
-	}
-}
-
-void WindowContext::DrainMainThreadTasks() {
-	std::vector<std::function<void()>> tasks;
-	{
-		Common::LockGuard lock(main_task_mutex);
-		tasks.swap(main_tasks);
-	}
-	if (tasks.empty()) {
-		return;
-	}
-	for (auto& task: tasks) {
-		task();
-	}
-	Common::LockGuard lock(main_task_mutex);
-	main_tasks_run += tasks.size();
-	main_task_done.SignalAll();
-}
-
 void WindowContext::Run() {
 	Common::Timer timer;
 	timer.Start();
@@ -796,7 +715,6 @@ void WindowContext::Run() {
 	loop.paused.store(false, std::memory_order_release);
 
 	while (!loop.need_exit) {
-		DrainMainThreadTasks();
 		if (loop.paused.load(std::memory_order_acquire)) {
 			if (!timer.IsPaused()) {
 				timer.Pause();
@@ -820,17 +738,15 @@ static void WindowCreate(WindowContext& context) {
 	int width  = static_cast<int>(context.graphic_ctx.screen_width);
 	int height = static_cast<int>(context.graphic_ctx.screen_height);
 
-	SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS4_RUMBLE, "1");
-	SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS5_RUMBLE, "1");
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	SDL_SetHint(SDL_HINT_WINDOWS_DPI_SCALING, "0");
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+	// RenderDoc can hide Wayland Vulkan surface support; prefer X11 for captures.
+	if (Config::RenderDocEnabled()) {
+		SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "x11,wayland");
+	}
 #endif
-
-	if (SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) < 0) {
+	if (!SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
 		EXIT("%s\n", SDL_GetError());
 	}
-	HostInputInit();
-	InitializeSystemOverlayInput();
 
 	LOGF("WindowCreate(): width = %d, height = %d\n", width, height);
 
@@ -840,15 +756,14 @@ static void WindowCreate(WindowContext& context) {
 	// MoltenVK loader before calling SDL_CreateWindow. Keep an explicit user
 	// override, and fall back to SDL's normal loader search when no bundle is present.
 	if (std::getenv("SDL_VULKAN_LIBRARY") == nullptr) {
-		if (char* base_path = SDL_GetBasePath(); base_path != nullptr) {
+		if (const char* base_path = SDL_GetBasePath(); base_path != nullptr) {
 			const std::string base_path_str = base_path;
-			SDL_free(base_path);
 			std::string moltenvk_path = base_path_str + "libMoltenVK.dylib";
 			if (!Common::File::IsFileExisting(moltenvk_path)) {
 				moltenvk_path = base_path_str + "../Frameworks/libMoltenVK.dylib";
 			}
 			if (Common::File::IsFileExisting(moltenvk_path) &&
-			    SDL_setenv("SDL_VULKAN_LIBRARY", moltenvk_path.c_str(), 0) == 0) {
+			    SDL_setenv_unsafe("SDL_VULKAN_LIBRARY", moltenvk_path.c_str(), 0) == 0) {
 				LOGF("Vulkan loader: %s\n", moltenvk_path.c_str());
 			}
 		}
@@ -861,21 +776,23 @@ static void WindowCreate(WindowContext& context) {
 		window_flags |= static_cast<uint32_t>(SDL_WINDOW_BORDERLESS);
 	}
 #endif
-	context.window = SDL_CreateWindow(KYTY_SDL_WINDOW_CAPTION, SDL_WINDOWPOS_CENTERED,
-	                                  SDL_WINDOWPOS_CENTERED, width, height, window_flags);
+	context.window = SDL_CreateWindow(KYTY_SDL_WINDOW_CAPTION, width, height, window_flags);
 
 	if (context.window == nullptr) {
 		EXIT("%s\n", SDL_GetError());
 	}
 
-	SDL_SetWindowResizable(context.window, SDL_FALSE);
+	SDL_SetWindowPosition(context.window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+	SDL_SetWindowResizable(context.window, false);
+	HostInputInit(context.window);
+	InitializeSystemOverlayInput(context.window);
 	context.UpdateIcon();
 }
 
 uint32_t WindowContext::InitialWindowFlags(bool fullscreen) noexcept {
 	auto flags = static_cast<uint32_t>(SDL_WINDOW_VULKAN);
 	if (fullscreen) {
-		flags |= static_cast<uint32_t>(SDL_WINDOW_FULLSCREEN_DESKTOP);
+		flags |= static_cast<uint32_t>(SDL_WINDOW_FULLSCREEN);
 	}
 	return flags;
 }
@@ -906,6 +823,7 @@ void WindowRun() {
 
 void WindowShutdown() {
 	if (g_window != nullptr) {
+		HostInputShutdown();
 		Controller::EmergencyShutdown();
 		g_window.reset();
 	}
@@ -941,7 +859,7 @@ struct WindowIcon {
 	void*        pixels  = nullptr;
 
 	~WindowIcon() {
-		SDL_FreeSurface(surface);
+		SDL_DestroySurface(surface);
 		stbi_image_free(pixels);
 	}
 };
@@ -965,8 +883,8 @@ static void WindowLoadPngIcon(const std::filesystem::path& path, WindowIcon* ico
 
 	EXIT_IF(icon->pixels == nullptr);
 
-	icon->surface = SDL_CreateRGBSurfaceWithFormatFrom(icon->pixels, width, height, 32, width * 4,
-	                                                   SDL_PIXELFORMAT_RGBA32);
+	icon->surface = SDL_CreateSurfaceFrom(width, height, SDL_PIXELFORMAT_RGBA32, icon->pixels,
+	                                      width * 4);
 	EXIT_NOT_IMPLEMENTED(icon->surface == nullptr);
 }
 
@@ -1028,7 +946,16 @@ void WindowContext::UpdateTitle() {
 	    (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""),
 	    device_name, processor_name, frame_num, current_fps);
 
-	RunOnMainThread([this, text = std::move(text)] { SDL_SetWindowTitle(window, text.c_str()); });
+	struct TitleUpdate {
+		SDL_Window*  window;
+		std::string* text;
+	} update {window, &text};
+	EXIT_IF(!SDL_RunOnMainThread(
+	    [](void* data) {
+		    auto& title = *static_cast<TitleUpdate*>(data);
+		    SDL_SetWindowTitle(title.window, title.text->c_str());
+	    },
+	    &update, true));
 }
 
 } // namespace Libs::Graphics

@@ -532,7 +532,9 @@ void Swapchain::Recreate(bool surface_lost) {
 #if defined(__APPLE__)
 		// Surface recreation goes through SDL_Vulkan_CreateSurface, which touches the
 		// window's view/layer and must run on the main thread on macOS.
-		m_window.RunOnMainThread([this] { m_window.RecreateSurface(); });
+		EXIT_IF(!SDL_RunOnMainThread(
+		    [](void* window) { static_cast<WindowContext*>(window)->RecreateSurface(); },
+		    &m_window, true));
 #else
 		m_window.RecreateSurface();
 #endif

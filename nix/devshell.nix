@@ -1,8 +1,8 @@
 { pkgs }:
 
 let
-  # Build-time dependencies. Every -dev package the bundled SDL2 probes for must
-  # be listed here, otherwise SDL2 quietly drops the audio/Wayland/udev backends.
+  # Build-time dependencies. Every -dev package the bundled SDL3 probes for must
+  # be listed here, otherwise SDL3 quietly drops the audio/Wayland/udev backends.
   buildDeps = with pkgs; [
     qt6.qtbase # Concurrent, Network, Widgets (launcher)
     vulkan-headers

@@ -166,8 +166,8 @@ The finished application and its runtime dependencies will be placed in
 
 ### Building on Linux
 
-Install the toolchain and the libraries the bundled SDL2 needs. Without the audio, Wayland and
-udev development packages SDL2 quietly configures itself without those backends, and the resulting
+Install the toolchain and the libraries the bundled SDL3 needs. Without the audio, Wayland and
+udev development packages SDL3 quietly configures itself without those backends, and the resulting
 build has no working sound and no gamepad hotplug:
 
 ```bash
@@ -204,7 +204,7 @@ The CMake source root is the repository root.
 
 ### Building on NixOS
 
-A development shell provides Clang, CMake, Ninja, Qt 6, the Vulkan headers, and the SDL2 backend
+A development shell provides Clang, CMake, Ninja, Qt 6, the Vulkan headers, and the SDL3 backend
 libraries. Enter it and configure exactly as on other Linux distributions; the shell exports
 `CMAKE_PREFIX_PATH` and `QT_PLUGIN_PATH`, so the `-DCMAKE_PREFIX_PATH="$Qt6_DIR"` argument is not
 needed:

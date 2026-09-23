@@ -1,20 +1,6 @@
-#include "SDL.h"
-#include "SDL_error.h"
-#include "SDL_events.h"
-#include "SDL_gamecontroller.h"
-#include "SDL_hints.h"
-#include "SDL_joystick.h"
-#include "SDL_keyboard.h"
-#include "SDL_keycode.h"
-#include "SDL_mouse.h"
-#include "SDL_pixels.h"
-#include "SDL_rwops.h"
-#include "SDL_stdinc.h"
-#include "SDL_surface.h"
-#include "SDL_thread.h"
-#include "SDL_touch.h"
-#include "SDL_video.h"
-#include "SDL_vulkan.h"
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_vulkan.h>
+
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
@@ -700,25 +686,13 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	return device;
 }
 
-static void VulkanGetExtensions(SDL_Window* window, VulkanExtensions& r) {
-	EXIT_IF(window == nullptr);
-
+static void VulkanGetExtensions(VulkanExtensions& r) {
 	uint32_t required_extensions_count = 0;
 
-	auto sdl_result = SDL_Vulkan_GetInstanceExtensions(window, &required_extensions_count, nullptr);
-
-	EXIT_NOT_IMPLEMENTED(sdl_result == SDL_FALSE);
+	const char* const* extensions = SDL_Vulkan_GetInstanceExtensions(&required_extensions_count);
+	EXIT_NOT_IMPLEMENTED(extensions == nullptr);
 	EXIT_NOT_IMPLEMENTED(required_extensions_count == 0);
-
-	r.required_extensions =
-	    std::vector<const char*>(required_extensions_count); // @suppress("Ambiguous problem")
-
-	sdl_result = SDL_Vulkan_GetInstanceExtensions(window, &required_extensions_count,
-	                                              r.required_extensions.data());
-
-	EXIT_NOT_IMPLEMENTED(sdl_result == SDL_FALSE);
-	EXIT_NOT_IMPLEMENTED(required_extensions_count == 0);
-	EXIT_NOT_IMPLEMENTED(required_extensions_count != r.required_extensions.size());
+	r.required_extensions.assign(extensions, extensions + required_extensions_count);
 
 	r.available_extensions =
 	    EnumerateVulkan<vk::ExtensionProperties>( // @suppress("Ambiguous problem")
@@ -899,7 +873,7 @@ void WindowContext::CreateVulkan() {
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(get_instance_proc_addr);
 
 	VulkanExtensions r;
-	VulkanGetExtensions(window, r);
+	VulkanGetExtensions(r);
 	VulkanCheckInstanceVersion();
 
 	vk::ApplicationInfo app_info {};
@@ -986,8 +960,8 @@ void WindowContext::CreateVulkan() {
 	}
 
 	vk::SurfaceKHR::CType native_surface = VK_NULL_HANDLE;
-	if (SDL_Vulkan_CreateSurface(window, static_cast<vk::Instance::CType>(graphic_ctx.instance),
-	                             &native_surface) == SDL_FALSE) {
+	if (!SDL_Vulkan_CreateSurface(window, static_cast<vk::Instance::CType>(graphic_ctx.instance),
+	                              nullptr, &native_surface)) {
 		EXIT("Could not create a Vulkan surface");
 	}
 	surface = native_surface;
@@ -1100,8 +1074,8 @@ void WindowContext::RecreateSurface() {
 		surface = nullptr;
 	}
 	vk::SurfaceKHR::CType native_surface = VK_NULL_HANDLE;
-	if (SDL_Vulkan_CreateSurface(window, static_cast<vk::Instance::CType>(graphic_ctx.instance),
-	                             &native_surface) == SDL_FALSE) {
+	if (!SDL_Vulkan_CreateSurface(window, static_cast<vk::Instance::CType>(graphic_ctx.instance),
+	                              nullptr, &native_surface)) {
 		EXIT("Could not recreate the Vulkan surface: %s\n", SDL_GetError());
 	}
 	surface = native_surface;
@@ -1137,7 +1111,7 @@ WindowContext::~WindowContext() {
 		SDL_DestroyWindow(window);
 		window = nullptr;
 	}
-	SDL_QuitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER);
+	SDL_QuitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD);
 }
 
 } // namespace Libs::Graphics

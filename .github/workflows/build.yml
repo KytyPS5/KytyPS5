@@ -314,6 +314,7 @@ jobs:
             libxkbcommon-dev \
             libxrandr-dev \
             libxss-dev \
+            libxtst-dev \
             lld \
             pkg-config \
             wayland-protocols

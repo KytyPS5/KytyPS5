@@ -234,6 +234,7 @@ Decoder::Operand MemorySourceAt(const Decoder::Instruction& decoded, uint32_t in
 				return index == 0u ? decoded.src1 : index == 1u ? decoded.src0 : decoded.src2;
 			case Decoder::Opcode::DS_WRITE_B8:
 			case Decoder::Opcode::DS_WRITE_B16:
+			case Decoder::Opcode::DS_WRITE_B8_D16_HI:
 			case Decoder::Opcode::DS_WRITE_B16_D16_HI:
 			case Decoder::Opcode::DS_WRITE_B32:
 			case Decoder::Opcode::DS_WRITE_B64:
@@ -959,8 +960,12 @@ bool Translator::EmitMemory(const Decoder::Instruction& inst) {
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicISub32, false);
 		case Decoder::Opcode::DS_SUB_RTN_U32:
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicISub32, true);
+		case Decoder::Opcode::DS_INC_U32:
+			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicInc32, false);
 		case Decoder::Opcode::DS_INC_RTN_U32:
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicInc32, true);
+		case Decoder::Opcode::DS_DEC_U32:
+			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicDec32, false);
 		case Decoder::Opcode::DS_DEC_RTN_U32:
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicDec32, true);
 		case Decoder::Opcode::DS_MIN_I32:
@@ -1074,6 +1079,7 @@ bool Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::DS_WRITE2ST64_B64: return DS_WRITE2(inst);
 		case Decoder::Opcode::DS_WRITE_B8:
 		case Decoder::Opcode::DS_WRITE_B16:
+		case Decoder::Opcode::DS_WRITE_B8_D16_HI:
 		case Decoder::Opcode::DS_WRITE_B16_D16_HI:
 		case Decoder::Opcode::DS_WRITE_B32:
 		case Decoder::Opcode::DS_WRITE_B64:

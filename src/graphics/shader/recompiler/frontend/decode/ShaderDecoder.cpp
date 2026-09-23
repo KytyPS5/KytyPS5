@@ -258,7 +258,7 @@ void DecodeScalarSource(uint32_t code, uint32_t pc, Operand& operand) {
 		case 127u: operand.kind = OperandKind::ExecHi; return;
 		case 239u: operand.kind = OperandKind::PopsExitingWaveId; return;
 		case 248u:
-			operand.kind      = OperandKind::FloatInlineConstant;
+			operand.kind  = OperandKind::FloatInlineConstant;
 			operand.value = std::bit_cast<uint32_t>(0.15915494309189535f);
 			return;
 		case 251u: operand.kind = OperandKind::VccZ; return;
@@ -666,7 +666,9 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::DS_ADD_RTN_U32:
 		case Opcode::DS_SUB_U32:
 		case Opcode::DS_SUB_RTN_U32:
+		case Opcode::DS_INC_U32:
 		case Opcode::DS_INC_RTN_U32:
+		case Opcode::DS_DEC_U32:
 		case Opcode::DS_DEC_RTN_U32:
 		case Opcode::DS_MIN_I32:
 		case Opcode::DS_MIN_RTN_I32:
@@ -701,6 +703,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::DS_READ_B128:
 		case Opcode::DS_WRITE_B8:
 		case Opcode::DS_WRITE_B16:
+		case Opcode::DS_WRITE_B8_D16_HI:
 		case Opcode::DS_WRITE_B16_D16_HI:
 		case Opcode::DS_WRITE2_B32:
 		case Opcode::DS_WRITE2ST64_B32:

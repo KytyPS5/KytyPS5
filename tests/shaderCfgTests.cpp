@@ -4800,6 +4800,23 @@ void TestNewShaderDecoderArchitecture() {
             d16_hi_write.src1.sdwa_sel == 5u,
         "DS decoder rejected the captured high-half D16 write");
 
+  // Captured from GTA V (PPSA04264) compute shader, pc 0x1598.
+  const uint32_t d16_hi_byte_write_ds[] = {0xda800200u, 0x00001413u};
+  Instruction d16_hi_byte_write;
+  ShaderRecompiler::Decoder::DecodeInstruction(d16_hi_byte_write_ds, 0u,
+                                               d16_hi_byte_write);
+  Check(d16_hi_byte_write.family == Family::DS &&
+            d16_hi_byte_write.opcode == Opcode::DS_WRITE_B8_D16_HI &&
+            d16_hi_byte_write.word_count == 2u &&
+            d16_hi_byte_write.src_count == 2u &&
+            d16_hi_byte_write.data_dwords == 1u &&
+            d16_hi_byte_write.data_bits == 8u &&
+            d16_hi_byte_write.offset == 0x200u && !d16_hi_byte_write.gds &&
+            d16_hi_byte_write.src0.reg == 19u &&
+            d16_hi_byte_write.src1.reg == 20u &&
+            d16_hi_byte_write.src1.sdwa_sel == 2u,
+        "DS decoder rejected the captured high-half byte write");
+
   constexpr uint32_t packed_source_selectors[][2] = {
       {0xcc0e0000u, 0x0c0a0300u}, // Source 0: instruction bit 59.
       {0xcc0e0000u, 0x140a0300u}, // Source 1: instruction bit 60.
@@ -10250,6 +10267,7 @@ void TestMeshInputAssembly() {
     uint32_t capacity, count, group, lane, width, address_low, base_vertex;
     uint32_t wave_info, first, second, third, byte_offset, vertex_id;
     bool fetch;
+    uint32_t wave_size = 64;
   };
   const Case cases[] = {
       {Prospero::PrimitiveType::kTriList, 14, 177, 14, 2, 2, 0x1002, UINT32_MAX,
@@ -10296,11 +10314,14 @@ void TestMeshInputAssembly() {
        0x40000c0c, 1, 0, 0, 52, 0xabcd0128, true},
       {Prospero::PrimitiveType::kPointList, 12, 265, 1, 64, 4, 0x1000, 0,
        0x41000000, 64, 0, 0, 304, 0, false},
+      {Prospero::PrimitiveType::kTriStrip, 40, 40, 0, 32, 0, 0, 11,
+       0x81000608, 32, 33, 34, 0, 43, false, 32},
   };
   for (const auto &test : cases) {
     ShaderVertexInputInfo input{};
     auto &mesh = input.mesh;
     mesh.input_primitive = static_cast<uint32_t>(test.topology);
+    mesh.wave_size = test.wave_size;
     mesh.primitives_per_group = mesh.InputPrimitiveCount(test.capacity);
     mesh.vertices_per_group = mesh.InputVertexCount(mesh.primitives_per_group);
     mesh.threads_num[0] = 256;
@@ -10314,7 +10335,7 @@ void TestMeshInputAssembly() {
     graph.entry_block = 0;
     Frontend::TranslateOptions options{};
     options.stage = ShaderType::Mesh;
-    options.wave_size = 64;
+    options.wave_size = test.wave_size;
     options.user_data_count = 0;
     options.input_info.vertex = &input;
     auto program = Frontend::TranslateProgram(decoded, graph, options);

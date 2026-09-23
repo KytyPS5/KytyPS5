@@ -108,7 +108,7 @@ static uint64_t GetDeclaredShaderHash(uint64_t shader_addr) {
 
 static ShaderParams GetShaderParams(uint64_t shader_addr, const char* label, uint64_t declared_hash,
 	                                std::span<const uint32_t> user_data,
-	                                const ShaderMappedData& data) {
+	                                const ShaderMappedData& data, uint32_t user_data_base = 0) {
 	if (data.code_size_bytes == 0 || data.code_size_bytes % sizeof(uint32_t) != 0) {
 		EXIT("%s hash=0x%016" PRIx64 " shader=0x%016" PRIx64
 		     " has invalid AGC shader_size=0x%08" PRIx32 "\n",
@@ -116,12 +116,16 @@ static ShaderParams GetShaderParams(uint64_t shader_addr, const char* label, uin
 	}
 	const auto code_words = data.code_size_bytes / sizeof(uint32_t);
 	const auto code = std::span {reinterpret_cast<const uint32_t*>(shader_addr), code_words};
-	return {
-	    .code      = code,
-	    .user_data = std::vector<uint32_t>(user_data.begin(), user_data.end()),
-	    .hash      = declared_hash != 0 ? declared_hash
-	                                    : XXH3_64bits(code.data(), code.size_bytes()),
+	ShaderParams params {
+	    .code            = code,
+	    .user_data_count = static_cast<uint32_t>(user_data.size()) + user_data_base,
+	    .hash            = declared_hash != 0 ? declared_hash
+	                                          : XXH3_64bits(code.data(), code.size_bytes()),
 	};
+	EXIT_IF(user_data.size() > HW::UserSgprInfo::SGPRS_MAX ||
+	        params.user_data_count > params.user_data.size());
+	std::copy(user_data.begin(), user_data.end(), params.user_data.begin() + user_data_base);
+	return params;
 }
 
 #if 0
@@ -756,11 +760,13 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
                             const HW::UserConfig& user_config, ShaderVertexInputInfo& info) {
 	const auto& sh     = context.GetShaderRegisters();
 	const auto data = ShaderGetMappedData(regs.es_regs.data_addr, "ShaderGetInputInfoVS():");
+	const bool merged = (context.GetShaderStages() & 0x20u) != 0;
 	auto        params = GetShaderParams(
 	    regs.es_regs.data_addr, "ShaderRecompiler VS",
 	    GetDeclaredShaderHash(regs.es_regs.data_addr),
-	    std::span<const uint32_t>(regs.gs_user_sgpr.value, regs.gs_regs.rsrc2.user_sgpr), data);
-	if ((context.GetShaderStages() & 0x20u) == 0) {
+	    std::span<const uint32_t>(regs.gs_user_sgpr.value, regs.gs_regs.rsrc2.user_sgpr), data,
+	    merged ? 8u : 0u);
+	if (!merged) {
 		if (!ShaderGetStaticVertexInputInfo(regs.es_regs.data_addr, regs.gs_user_sgpr,
 		                                    regs.gs_regs.rsrc2.user_sgpr, sh, data, info)) {
 			EXIT("failed to prepare vertex shader program\n");
@@ -770,7 +776,6 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 	}
 	// NGG user SGPRs start at s8; a separately compiled GS back half also receives
 	// its user-data pointer in s0:s1.
-	params.user_data.insert(params.user_data.begin(), 8u, 0u);
 	info                     = {};
 	info.logical_stage       = ShaderType::Mesh;
 	info.pa_cl_vs_out_cntl   = sh.m_paClVsOutCntl;
@@ -841,14 +846,13 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 	    GetShaderParams(regs.ls_regs.data_addr, "ShaderRecompiler LS",
 	                    GetDeclaredShaderHash(regs.ls_regs.data_addr), local_users, local),
 	    GetShaderParams(regs.hs_regs.data_addr, "ShaderRecompiler HS",
-	                    GetDeclaredShaderHash(regs.hs_regs.data_addr), local_users, control),
+	                    GetDeclaredShaderHash(regs.hs_regs.data_addr), local_users, control, 8u),
 	    GetShaderParams(regs.es_regs.data_addr, "ShaderRecompiler TES",
 	                    GetDeclaredShaderHash(regs.es_regs.data_addr), evaluation_users,
 	                    evaluation),
 	};
 	// The fused HS back half receives its separate user-data address in s0:s1.
 	// RDNA2 reserves s0:s7 before the native HS user SGPRs.
-	params[1].user_data.insert(params[1].user_data.begin(), 8u, 0u);
 	params[1].user_data[0] = static_cast<uint32_t>(regs.hs_regs.user_data_addr);
 	params[1].user_data[1] = static_cast<uint32_t>(regs.hs_regs.user_data_addr >> 32u);
 

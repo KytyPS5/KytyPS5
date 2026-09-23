@@ -139,10 +139,6 @@ bool TessellationEnabled() {
 	return g_config->tessellation_enabled;
 }
 
-bool WindowStretchEnabled() {
-	return g_config->window_stretch_enabled;
-}
-
 bool PlayGoHackEnabled() {
 	return g_config->playgo_hack_enabled;
 }

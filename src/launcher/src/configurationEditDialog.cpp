@@ -3,7 +3,7 @@
 #include "common/emulatorConfig.h"
 #include "configuration.h"
 #include "mandatoryLineEdit.h"
-#include "SDL.h"
+#include <SDL3/SDL.h>
 
 #include <QAbstractItemView>
 #include <QCheckBox>
@@ -173,17 +173,18 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	microphone->clear();
 	microphone->addItem(tr("None"), QString {});
 	microphone->setToolTip(tr("Microphone used by games. None supplies silence."));
-	SDL_SetMainReady();
-	if (SDL_InitSubSystem(SDL_INIT_AUDIO) == 0) {
-		const int device_count = SDL_GetNumAudioDevices(SDL_TRUE);
+	if (SDL_InitSubSystem(SDL_INIT_AUDIO)) {
+		int                device_count = 0;
+		SDL_AudioDeviceID* devices      = SDL_GetAudioRecordingDevices(&device_count);
 		for (int i = 0; i < device_count; i++) {
-			if (const auto* device = SDL_GetAudioDeviceName(i, SDL_TRUE); device != nullptr) {
+			if (const auto* device = SDL_GetAudioDeviceName(devices[i]); device != nullptr) {
 				const auto name = QString::fromUtf8(device);
 				if (microphone->findData(name) < 0) {
 					microphone->addItem(name, name);
 				}
 			}
 		}
+		SDL_free(devices);
 		SDL_QuitSubSystem(SDL_INIT_AUDIO);
 	} else {
 		microphone->setToolTip(tr("Microphones could not be listed: %1")
@@ -230,7 +231,6 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	                                                                            : 0);
 	m_ui->checkBox_fullscreen->setChecked(info.fullscreen_enabled);
 	m_ui->checkBox_readback->setChecked(info.readback_linear_images);
-	m_ui->checkBox_stretch->setChecked(info.stretch_to_window);
 	m_ui->checkBox_tessellation->setChecked(info.tessellation_enabled);
 	m_ui->spinBox_vblank_frequency->setValue(info.vblank_frequency);
 	m_ui->comboBox_console_language->clear();
@@ -377,7 +377,6 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui) {
 	info.gpu_index                 = ui.comboBox_gpu->currentIndex() - 1;
 	info.fullscreen_enabled        = ui.checkBox_fullscreen->isChecked();
 	info.readback_linear_images    = ui.checkBox_readback->isChecked();
-	info.stretch_to_window           = ui.checkBox_stretch->isChecked();
 	info.tessellation_enabled      = ui.checkBox_tessellation->isChecked();
 	info.vblank_frequency          = ui.spinBox_vblank_frequency->value();
 	info.console_language          = ui.comboBox_console_language->currentIndex();

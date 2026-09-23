@@ -551,8 +551,14 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	const bool multisampled    = IsMultisampledTexture(type);
 	const auto max_mip         = resource.r128 ? last_level : descriptor.MaxMip();
 	const auto physical_levels = multisampled ? 1u : static_cast<uint32_t>(max_mip) + 1u;
+	// IMAGE_STORE addresses BASE_LEVEL; only IMAGE_STORE_MIP selects other view mips.
+	const bool single_storage_mip =
+	    storage && resource.mip_mode != ShaderRecompiler::IR::ImageMipMode::DynamicStorage;
+	const auto view_levels = multisampled || single_storage_mip
+	                             ? 1u
+	                             : static_cast<uint32_t>(last_level - base_level) + 1u;
 	const auto levels =
-	    multisampled ? 1u : std::max(physical_levels, static_cast<uint32_t>(last_level) + 1u);
+	    multisampled ? 1u : std::max(physical_levels, base_level + view_levels);
 	const auto tile       = descriptor.TileMode();
 	const bool depth_tile = tile == Prospero::TileMode::kDepth;
 	const bool msaa_tile  = depth_tile || tile == Prospero::TileMode::kRenderTarget;
@@ -575,8 +581,6 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		     descriptor.fields[6], descriptor.fields[7]);
 	}
 	const auto samples = multisampled ? 1u << last_level : 1u;
-	const auto view_levels =
-	    multisampled ? 1u : static_cast<uint32_t>(last_level - base_level) + 1u;
 	const auto depth          = static_cast<uint32_t>(descriptor.Depth()) + 1u;
 	const auto format         = descriptor.Format();
 	const auto surface_format = TextureGetSurfaceFormatInfo(format);
@@ -749,7 +753,7 @@ PreparedBindings RenderExecutor::PrepareBindings(const ShaderStageRuntime& runti
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(!runtime);
 	const auto& program  = *runtime.program;
-	const auto& snapshot = runtime.resources;
+	const auto& snapshot = *runtime.resources;
 	PreparedBindings prepared;
 	prepared.runtime = &runtime;
 	prepared.images.reserve(program.info.images.size());
@@ -778,7 +782,7 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
 	const auto& program  = *prepared.runtime->program;
-	const auto& snapshot = prepared.runtime->resources;
+	const auto& snapshot = *prepared.runtime->resources;
 	auto&       cache    = m_context.GetBufferCache();
 
 	prepared.buffer_sources.clear();
@@ -800,7 +804,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
 	const auto& program   = *prepared.runtime->program;
-	const auto& snapshot  = prepared.runtime->resources;
+	const auto& snapshot  = *prepared.runtime->resources;
 	const auto& layout    = program.bindings;
 	EXIT_IF(prepared.buffer_sources.size() != program.info.buffers.size());
 
@@ -835,7 +839,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
 	const auto& program  = *prepared.runtime->program;
-	const auto& snapshot = prepared.runtime->resources;
+	const auto& snapshot = *prepared.runtime->resources;
 	auto&       images   = prepared.images;
 	EXIT_IF(images.size() != program.info.images.size());
 	auto& texture_cache = m_context.GetTextureCache();
@@ -867,11 +871,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 			}
 			binding.image_view = binding.mip_views.front();
 		} else {
-			auto desc = binding.desc;
-			if (desc.type == TextureCache::BindingType::Storage) {
-				desc.view_info.level_count = 1;
-			}
-			binding.image_view = texture_cache.FindTexture(binding.image_id, desc);
+			binding.image_view = texture_cache.FindTexture(binding.image_id, binding.desc);
 		}
 		auto&      image   = texture_cache.GetImage(binding.image_id);
 		const bool storage = binding.desc.type == TextureCache::BindingType::Storage;

@@ -168,12 +168,6 @@
          </widget>
         </item>
         <item row="7" column="1">
-         <widget class="QCheckBox" name="checkBox_stretch">
-          <property name="toolTip"><string>Stretch the emulator output to the window size</string></property>
-          <property name="text"><string>Stretch to window</string></property>
-         </widget>
-        </item>
-        <item row="8" column="1">
          <widget class="QCheckBox" name="checkBox_tessellation">
           <property name="toolTip"><string>Draw tessellated geometry. Disabled by default; unsupported tessellation may cause crashes.</string></property>
           <property name="text"><string>Enable tessellation support (experimental)</string></property>

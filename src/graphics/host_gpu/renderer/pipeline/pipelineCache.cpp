@@ -92,9 +92,9 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 	Log::WriteToConsoleAndLog(message);
 }
 
-bool ReadShaderGuestMemory(void*, uint64_t address, uint32_t* value) {
-	return value != nullptr &&
-	       Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, value, sizeof(*value));
+bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
+	return !values.empty() &&
+	       Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, values.data(), values.size_bytes());
 }
 
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
@@ -200,8 +200,10 @@ struct PipelineCache::ProgramCache {
 			permutations.reserve(8);
 		}
 
-		ShaderRecompiler::IR::ResourcePlan resource_plan;
-		std::vector<Permutation>           permutations;
+		ShaderRecompiler::IR::ResourcePlan           resource_plan;
+		ShaderRecompiler::IR::ResourceSnapshot       resources;
+		ShaderRecompiler::IR::ResourceSpecialization specialization;
+		std::vector<Permutation>                    permutations;
 	};
 
 	struct ProgramKeyHash {
@@ -274,33 +276,33 @@ struct PipelineCache::ProgramCache {
 			stage = ShaderType::Compute;
 		}
 
+		const auto user_data = std::span(params.user_data).first(params.user_data_count);
 		lookup_key.stage           = stage;
 		lookup_key.hash            = params.hash;
-		lookup_key.user_data_count = static_cast<uint32_t>(params.user_data.size());
+		lookup_key.user_data_count = params.user_data_count;
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, lookup_key.static_state);
 		auto                                         entry = programs.find(lookup_key);
-		ShaderRecompiler::IR::ResourceSnapshot       resources;
-		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		const ShaderRecompiler::IR::SrtRuntime       runtime {
-		    .user_data                  = params.user_data,
+		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		};
 		if (entry != programs.end()) {
 			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    entry->second.resource_plan, runtime, resources, specialization));
+			    entry->second.resource_plan, runtime, entry->second.resources,
+			    entry->second.specialization));
 			if (const auto permutation = std::ranges::find_if(
 			        entry->second.permutations, [&](const Permutation& candidate) {
 				        const auto& layout = candidate.program.bindings;
 				        return layout.push_data_start_dword ==
 				                   ShaderRecompiler::IR::PushData::StartFor(
 				                       push_data_cursor, layout.ShaderDataDwords()) &&
-				               candidate.specialization == specialization;
+				               candidate.specialization == entry->second.specialization;
 			        });
 			    permutation != entry->second.permutations.end()) {
 				input_info.stage = {.program   = &permutation->program,
-				                    .resources = std::move(resources)};
+				                    .resources = &entry->second.resources};
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
 				return permutation->handle;
 			}
@@ -328,7 +330,7 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::CompileOptions options;
 		options.stage       = stage;
 		options.shader_hash = params.hash;
-		options.user_data   = params.user_data;
+		options.user_data   = user_data;
 		options.back_code      = params.back_code;
 		options.dump_ir     = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
 		options.early_dump  = options.dump_ir;
@@ -347,15 +349,16 @@ struct PipelineCache::ProgramCache {
 		}
 		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
 		if (entry == programs.end()) {
-			auto resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime, resources,
-			                                                    specialization));
-			entry = programs.try_emplace(lookup_key, std::move(resource_plan)).first;
+			entry = programs.try_emplace(lookup_key,
+			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program)).first;
+			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
+			    entry->second.resource_plan, runtime, entry->second.resources,
+			    entry->second.specialization));
 		}
 		entry->second.permutations.push_back(CompilePermutation(
-		    params, options, std::move(translated), std::move(specialization), push_data_cursor));
+		    params, options, std::move(translated), entry->second.specialization, push_data_cursor));
 		const auto& permutation = entry->second.permutations.back();
-		input_info.stage = {.program = &permutation.program, .resources = std::move(resources)};
+		input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
 
 		std::array<size_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> counts {};

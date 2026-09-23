@@ -51,10 +51,10 @@ struct CompiledShaderInfo;
 
 struct ShaderStageRuntime {
 	const ShaderRecompiler::IR::CompiledShaderInfo* program = nullptr;
-	ShaderRecompiler::IR::ResourceSnapshot          resources;
+	const ShaderRecompiler::IR::ResourceSnapshot*   resources = nullptr;
 
 	[[nodiscard]] explicit operator bool() const {
-		return program != nullptr;
+		return program != nullptr && resources != nullptr;
 	}
 };
 

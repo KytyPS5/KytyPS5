@@ -1331,26 +1331,13 @@ KYTY_CP_OP_PARSER(CpOpDispatchIndirect) {
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0011600 && cmd_id != 0xc0021600);
 
 	if (cmd_id == 0xc0021600) {
-		struct DispatchIndirectArgs {
-			uint32_t thread_group_x;
-			uint32_t thread_group_y;
-			uint32_t thread_group_z;
-		};
-
-		auto* args = reinterpret_cast<const DispatchIndirectArgs*>(
-		    buffer[0] | (static_cast<uint64_t>(buffer[1]) << 32u));
-		uint32_t mode = buffer[2];
-
-		EXIT_NOT_IMPLEMENTED(args == nullptr);
-		cp.DispatchDirect(args->thread_group_x, args->thread_group_y, args->thread_group_z, mode);
-
+		cp.DispatchIndirect(buffer[0] | (static_cast<uint64_t>(buffer[1]) << 32u), buffer[2]);
 		return 3;
 	}
 
-	uint32_t data_offset = buffer[0];
-	uint32_t mode        = buffer[1];
-
-	cp.DispatchIndirect(data_offset, mode);
+	const auto base_addr = cp.GetDispatchIndirectArgsBaseAddress();
+	EXIT_NOT_IMPLEMENTED(base_addr == 0);
+	cp.DispatchIndirect(base_addr + buffer[0], buffer[1]);
 
 	return 2;
 }

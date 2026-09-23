@@ -63,10 +63,10 @@ uint32_t AddressF32(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::
 	           : Unary(ctx.state, spv::OpBitcast, TypeF32(ctx.state), value);
 }
 
-ImageSampleLayout Layout(const IR::MemoryInfo& mem, ImageDimension dimension) {
+ImageSampleLayout Layout(const IR::MemoryInfo& mem) {
 	ImageSampleLayout layout;
 	uint32_t          cursor = 0;
-	const auto&       info   = ImageDimensionInfoFor(dimension);
+	const auto&       info   = ImageDimensionInfoFor(mem.image_dimension);
 	if (HasFlag(mem, Decoder::ImageSampleFlagOffset)) layout.offset = cursor++;
 	if (HasFlag(mem, Decoder::ImageSampleFlagBias)) layout.bias = cursor++;
 	if (HasFlag(mem, Decoder::ImageSampleFlagCompare)) layout.dref = cursor++;
@@ -104,8 +104,7 @@ uint32_t CubeLayer(EmitterState& state, uint32_t value) {
 }
 
 uint32_t CoordF32(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::Inst& address,
-                  uint32_t first, uint32_t components) {
-	const bool cube = ctx.state.program.info.images.at(mem.resource).cube;
+                  uint32_t first, uint32_t components, bool cube = false) {
 	auto x = AddressF32(ctx, mem, address, first);
 	if (components == 1u) return x;
 	auto y = mem.image_address_components > first + 1u ? AddressF32(ctx, mem, address, first + 1u)
@@ -576,7 +575,8 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto lod       = state.builder.AllocateId();
 		state.builder.AddFunction(
 		    spv::OpImageQueryLod, TypeF32Vector(state, 2), lod, sampled,
-		    CoordF32(ctx, mem, *address, 0, ImageDimensionInfoFor(dimension).spatial_components));
+		    CoordF32(ctx, mem, *address, 0, ImageDimensionInfoFor(dimension).spatial_components,
+		             image.cube));
 		uint32_t values[4] = {ConstantU32(state, 0), ConstantU32(state, 0), ConstantU32(state, 0),
 		                      ConstantU32(state, 0)};
 		for (uint32_t index = 0; index < 2u; index++) {
@@ -637,7 +637,7 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (op == IR::ValueOpcode::ImageSampleRaw || op == IR::ValueOpcode::ImageGatherRaw) {
 		const auto  dimension      = image.dimension;
 		const auto& dimension_info = ImageDimensionInfoFor(dimension);
-		const auto  layout         = Layout(mem, dimension);
+		const auto  layout         = Layout(mem);
 		const auto  numeric_class  = image.numeric_class;
 		const bool  dref           = HasFlag(mem, Decoder::ImageSampleFlagCompare);
 		if (dref && state.program.info.images[mem.resource].conversion_format !=
@@ -645,9 +645,9 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			ctx.Fail(inst, "uses depth comparison with a packed integer image");
 			return;
 		}
-		const auto coord =
-		    CoordF32(ctx, mem, *address, layout.coord, dimension_info.coordinate_components);
 		if (op == IR::ValueOpcode::ImageGatherRaw) {
+			const auto coord = CoordF32(ctx, mem, *address, layout.coord,
+			                            dimension_info.coordinate_components, image.cube);
 			if (HasFlag(mem, Decoder::ImageSampleFlagLod)) {
 				static std::atomic_flag warned = ATOMIC_FLAG_INIT;
 				if (!warned.test_and_set(std::memory_order_relaxed)) {
@@ -752,6 +752,11 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			operands.push_back(AddressF32(ctx, mem, *address, layout.bias));
 		}
 		const auto EmitSample = [&](uint32_t resource) {
+			const auto& candidate = state.program.info.images[resource];
+			const auto coord =
+			    CoordF32(ctx, mem, *address, layout.coord,
+			             ImageDimensionInfoFor(candidate.dimension).coordinate_components,
+			             candidate.cube);
 			const auto            sampled = MakeSampledImage(state, resource, mem.sampler);
 			const auto            sample  = state.builder.AllocateId();
 			std::vector<uint32_t> sample_operands {result_type, sample, sampled, coord};

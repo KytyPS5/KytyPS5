@@ -35,11 +35,22 @@ struct BufferAddress {
 BufferAddress CalculateBufferAddress(EmitterState& state, uint32_t index, uint32_t offset,
                                      uint32_t soffset, uint32_t immediate, uint32_t stride,
                                      uint32_t swizzle, uint32_t index_stride) {
+	const auto zero = ConstantU32(state, 0);
+	const auto one  = ConstantU32(state, 1);
+	const auto add = [&](uint32_t lhs, uint32_t rhs) {
+		return lhs == zero ? rhs : rhs == zero ? lhs
+		                                      : Binary(state, spv::OpIAdd, TypeU32(state), lhs, rhs);
+	};
+	const auto mul = [&](uint32_t lhs, uint32_t rhs) {
+		return lhs == zero || rhs == zero ? zero
+		       : lhs == one              ? rhs
+		       : rhs == one              ? lhs
+		                                 : Binary(state, spv::OpIMul, TypeU32(state), lhs, rhs);
+	};
 	if (immediate != 0u) {
-		offset = Binary(state, spv::OpIAdd, TypeU32(state), offset, ConstantU32(state, immediate));
+		offset = add(offset, ConstantU32(state, immediate));
 	}
-	const auto indexed = Binary(state, spv::OpIMul, TypeU32(state), index, stride);
-	auto       address = Binary(state, spv::OpIAdd, TypeU32(state), indexed, offset);
+	auto address = add(mul(index, stride), offset);
 	if (swizzle != 0u) {
 		const auto index_shift =
 		    Binary(state, spv::OpIAdd, TypeU32(state), index_stride, ConstantU32(state, 3));
@@ -54,18 +65,12 @@ BufferAddress CalculateBufferAddress(EmitterState& state, uint32_t index, uint32
 		    Binary(state, spv::OpBitwiseAnd, TypeU32(state), offset, ConstantU32(state, ~3u));
 		const auto offset_lsb =
 		    Binary(state, spv::OpBitwiseAnd, TypeU32(state), offset, ConstantU32(state, 3u));
-		const auto indexed_msb = Binary(state, spv::OpIMul, TypeU32(state), index_msb, stride);
-		const auto msb =
-		    Binary(state, spv::OpIMul, TypeU32(state),
-		           Binary(state, spv::OpIAdd, TypeU32(state), indexed_msb, offset_msb), indices);
-		const auto lsb = Binary(state, spv::OpIAdd, TypeU32(state),
-		                        Binary(state, spv::OpShiftLeftLogical, TypeU32(state), index_lsb,
-		                               ConstantU32(state, 2u)),
-		                        offset_lsb);
-		address        = Select(state, TypeU32(state), swizzle,
-		                        Binary(state, spv::OpIAdd, TypeU32(state), msb, lsb), address);
+		const auto msb = mul(add(mul(index_msb, stride), offset_msb), indices);
+		const auto lsb = add(Binary(state, spv::OpShiftLeftLogical, TypeU32(state), index_lsb,
+		                            ConstantU32(state, 2u)), offset_lsb);
+		address = Select(state, TypeU32(state), swizzle, add(msb, lsb), address);
 	}
-	return {offset, Binary(state, spv::OpIAdd, TypeU32(state), address, soffset)};
+	return {offset, add(address, soffset)};
 }
 
 uint32_t BufferLane(EmitterState& state) {

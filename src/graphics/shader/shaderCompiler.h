@@ -3,6 +3,7 @@
 
 #include "graphics/shader/shader.h"
 
+#include <array>
 #include <span>
 #include <vector>
 
@@ -15,7 +16,8 @@ class UserConfig;
 
 struct ShaderParams {
 	std::span<const uint32_t> code;
-	std::vector<uint32_t>     user_data;
+	std::array<uint32_t, 40>  user_data {}; // 32 user SGPRs plus the merged-stage s0:s7 prefix.
+	uint32_t                  user_data_count = 0;
 	uint64_t                  hash = 0;
 	std::span<const uint32_t> back_code;
 

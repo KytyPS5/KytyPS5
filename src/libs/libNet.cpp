@@ -1528,6 +1528,10 @@ struct NpEntitlementAccessAddcontEntitlementInfo {
 	uint32_t                  download_status;
 };
 
+struct NpEntitlementAccessEntitlementKey {
+	uint8_t data[16];
+};
+
 static constexpr NpEntitlementAccessAddcontEntitlementInfo NP_ENTITLEMENT_ACCESS_ADDON_LIST[] = {
     {{{"85y-je"}, {}}, 3, 4}, // GTA V hash 0xf4315381
     {{{"5d5c48"}, {}}, 3, 4}, // GTA V hash 0x961c34b0
@@ -1614,12 +1618,31 @@ static int KYTY_SYSV_ABI NpEntitlementAccessGetAddcontEntitlementInfo(
 	return NP_ENTITLEMENT_ACCESS_ERROR_NO_ENTITLEMENT;
 }
 
+static int KYTY_SYSV_ABI NpEntitlementAccessGetEntitlementKey(
+    uint32_t service_label, const NpUnifiedEntitlementLabel* entitlement_label,
+    NpEntitlementAccessEntitlementKey* key) {
+	PRINT_NAME();
+
+	LOGF("\t service_label     = %" PRIu32 "\n"
+	     "\t entitlement_label = 0x%016" PRIx64 "\n"
+	     "\t key               = 0x%016" PRIx64 "\n",
+	     service_label, reinterpret_cast<uint64_t>(entitlement_label),
+	     reinterpret_cast<uint64_t>(key));
+
+	if (entitlement_label == nullptr || key == nullptr) {
+		return NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER;
+	}
+
+	return NP_ENTITLEMENT_ACCESS_ERROR_NO_ENTITLEMENT;
+}
+
 LIB_DEFINE(InitNet_1_NpEntitlementAccess) {
 	LIB_FUNC("jO8DM8oyego", LibNpEntitlementAccess::NpEntitlementAccessInitialize);
 	LIB_FUNC("lPDO62PpJIA", LibNpEntitlementAccess::NpEntitlementAccessGetSkuFlag);
 	LIB_FUNC("TFyU+KFBv54",
 	         LibNpEntitlementAccess::NpEntitlementAccessGetAddcontEntitlementInfoList);
 	LIB_FUNC("xddD23+8TfQ", LibNpEntitlementAccess::NpEntitlementAccessGetAddcontEntitlementInfo);
+	LIB_FUNC("5LiMEPuW0DQ", LibNpEntitlementAccess::NpEntitlementAccessGetEntitlementKey);
 }
 
 } // namespace LibNpEntitlementAccess

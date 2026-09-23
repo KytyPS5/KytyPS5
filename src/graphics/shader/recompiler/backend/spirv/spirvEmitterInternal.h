@@ -494,22 +494,18 @@ template <typename Fn>
 uint32_t EmitValueOrDefaultIfCondition(EmitterState& state, uint32_t condition, uint32_t type,
                                        uint32_t default_value, Fn&& fn) {
 	const auto then_label  = state.builder.AllocateId();
-	const auto then_exit   = state.builder.AllocateId();
-	const auto else_label  = state.builder.AllocateId();
+	const auto header     = state.current_label;
 	const auto merge_label = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone);
-	state.builder.AddFunction(spv::OpBranchConditional, condition, then_label, else_label);
+	state.builder.AddFunction(spv::OpBranchConditional, condition, then_label, merge_label);
 	EmitLabel(state, then_label);
 	const auto then_value = fn();
-	state.builder.AddFunction(spv::OpBranch, then_exit);
-	EmitLabel(state, then_exit);
-	state.builder.AddFunction(spv::OpBranch, merge_label);
-	EmitLabel(state, else_label);
+	const auto then_exit  = state.current_label;
 	state.builder.AddFunction(spv::OpBranch, merge_label);
 	EmitLabel(state, merge_label);
 	const auto value = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpPhi, type, value, then_value, then_exit, default_value,
-	                          else_label);
+	                          header);
 	return value;
 }
 

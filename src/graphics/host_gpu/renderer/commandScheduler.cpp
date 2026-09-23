@@ -4,6 +4,7 @@
 #include "common/debugCounters.h"
 #include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -227,7 +228,7 @@ void CommandScheduler::PopPendingOperations() {
 }
 
 void CommandScheduler::DeferOperation(Common::UniqueFunction<void>&& operation) {
-	QueueOperation(std::move(operation), false);
+	QueueOperation(std::move(operation), false, 0, 0);
 }
 
 void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& operation) {
@@ -253,11 +254,6 @@ void CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operation, 
 	}
 	lock.unlock();
 	operation();
-}
-
-bool CommandScheduler::HasPendingPriorityOperations() {
-	std::lock_guard lock(m_operation_mutex);
-	return !m_priority_operations.empty() || m_priority_active;
 }
 
 void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
@@ -390,7 +386,28 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	m_command.m_buffer = nullptr;
+	// Anything still charged to the tick just closed moves forward, or the ring may overwrite it.
+	RetagStreamWatches(tick);
 	return tick;
+}
+
+void CommandScheduler::RegisterStreamBuffer(StreamBuffer* buffer) {
+	EXIT_IF(buffer == nullptr);
+	std::lock_guard lock(m_stream_buffer_mutex);
+	m_stream_buffers.push_back(buffer);
+}
+
+void CommandScheduler::UnregisterStreamBuffer(StreamBuffer* buffer) {
+	std::lock_guard lock(m_stream_buffer_mutex);
+	std::erase(m_stream_buffers, buffer);
+}
+
+void CommandScheduler::RetagStreamWatches(uint64_t submitted_tick) {
+	const auto      new_tick = m_master.CurrentTick();
+	std::lock_guard lock(m_stream_buffer_mutex);
+	for (auto* buffer: m_stream_buffers) {
+		buffer->RetagWatches(submitted_tick, new_tick);
+	}
 }
 
 void CommandScheduler::BeginNext() {

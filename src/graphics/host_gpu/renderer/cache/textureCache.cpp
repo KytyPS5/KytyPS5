@@ -1229,6 +1229,8 @@ void TextureCache::InitializeImage(ImageId id) {
 	}
 	const bool upload = image.IsBufferModified() || image.IsCpuDirty();
 	if (upload) {
+		StreamHold hold(m_buffer_cache.GetUtilityBuffer(MemoryUsage::Upload),
+		                &m_buffer_cache.GetUtilityBuffer(MemoryUsage::Stream));
 		const auto [source, source_offset] =
 		    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
 		if (source == nullptr) {
@@ -2219,6 +2221,7 @@ bool TextureCache::DownloadImageBatch(Image& image, const TextureDownloadChunk& 
                                       uint64_t alignment) {
 	const GuestRange range {image.info.data.address + chunk.offset, chunk.size};
 	auto&            download = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
+	StreamHold       hold(download);
 	// Mapping past the stream's end waits for the previous batch to be written back.
 	auto [mapped, offset] = download.Map(range.size, alignment);
 	if (mapped == nullptr) {

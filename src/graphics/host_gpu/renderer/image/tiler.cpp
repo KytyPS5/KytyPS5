@@ -366,8 +366,6 @@ void TileManager::Tile(vk::Buffer linear, uint64_t linear_offset, uint64_t linea
 	const uint64_t target_base = tiled_offset & (descriptor_alignment - 1);
 	const auto     tiling =
 	    Prepare(true, tiled_capacity, linear_capacity, info, levels, source_base, target_base);
-	Record(linear, linear_offset, linear_capacity, tiled, tiled_offset, tiled_capacity, tiling,
-	       false);
 }
 
 void TileManager::TileImage(Image& image, std::span<const vk::BufferImageCopy> regions,

@@ -247,7 +247,30 @@ void Buffer::Fill(uint64_t offset, uint64_t size, uint32_t value) {
 StreamBuffer::StreamBuffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
                            uint64_t size)
     : Buffer(graphics, scheduler, usage, 0, AllFlags, size),
-      m_current_watches(WATCHES_INITIAL_RESERVE), m_previous_watches(WATCHES_INITIAL_RESERVE) {}
+      m_current_watches(WATCHES_INITIAL_RESERVE), m_previous_watches(WATCHES_INITIAL_RESERVE) {
+	Scheduler().RegisterStreamBuffer(this);
+}
+
+StreamBuffer::~StreamBuffer() {
+	Scheduler().UnregisterStreamBuffer(this);
+}
+
+// The GPU reads a reservation from the command buffer recording its consumer, so move the charge.
+void StreamBuffer::RetagWatches(uint64_t submitted_tick, uint64_t new_tick) {
+	if (submitted_tick == 0 || new_tick <= submitted_tick) {
+		return;
+	}
+	const auto retag_run = [submitted_tick, new_tick](std::vector<Watch>& watches, size_t limit) {
+		while (limit != 0 && limit <= watches.size() && watches[limit - 1].tick == submitted_tick &&
+		       !watches[limit - 1].sealed) {
+			watches[--limit].tick = new_tick;
+		}
+	};
+	retag_run(m_current_watches, m_current_watch_cursor);
+	if (m_invalidation_mark.has_value()) {
+		retag_run(m_previous_watches, *m_invalidation_mark);
+	}
+}
 
 bool StreamBuffer::NormalizeReservation(bool coherent, uint64_t atom, uint64_t& size,
                                         uint64_t& alignment) {
@@ -318,7 +341,8 @@ void StreamBuffer::Commit() {
 
 	m_offset += m_mapped_size;
 	const auto tick = Scheduler().CurrentTick();
-	if (m_current_watch_cursor != 0 && m_current_watches[m_current_watch_cursor - 1].tick == tick) {
+	if (m_current_watch_cursor != 0 && m_current_watches[m_current_watch_cursor - 1].tick == tick &&
+	    !m_current_watches[m_current_watch_cursor - 1].sealed) {
 		m_current_watches[m_current_watch_cursor - 1].upper_bound = m_offset;
 		return;
 	}
@@ -328,6 +352,27 @@ void StreamBuffer::Commit() {
 	auto& watch       = m_current_watches[m_current_watch_cursor++];
 	watch.upper_bound = m_offset;
 	watch.tick        = tick;
+	watch.sealed      = m_hold_depth == 0;
+}
+
+void StreamBuffer::EndHold() {
+	EXIT_IF(m_hold_depth == 0);
+	if (--m_hold_depth != 0) {
+		return;
+	}
+	SealFloatingWatches();
+}
+
+void StreamBuffer::SealFloatingWatches() {
+	const auto seal_run = [](std::vector<Watch>& watches, size_t limit) {
+		while (limit != 0 && limit <= watches.size() && !watches[limit - 1].sealed) {
+			watches[--limit].sealed = true;
+		}
+	};
+	seal_run(m_current_watches, m_current_watch_cursor);
+	if (m_invalidation_mark.has_value()) {
+		seal_run(m_previous_watches, *m_invalidation_mark);
+	}
 }
 
 uint64_t StreamBuffer::Copy(const void* source, uint64_t size, uint64_t alignment) {

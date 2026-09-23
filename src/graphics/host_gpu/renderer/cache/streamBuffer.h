@@ -98,11 +98,19 @@ class StreamBuffer final: public Buffer {
 public:
 	StreamBuffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
 	             uint64_t size);
+	~StreamBuffer();
 
 	[[nodiscard]] std::pair<uint8_t*, uint64_t> Map(uint64_t size, uint64_t alignment = 0,
 	                                                bool allow_wait = true);
 	void                                        Commit();
 	[[nodiscard]] uint64_t Copy(const void* source, uint64_t size, uint64_t alignment = 0);
+
+	// Called only by CommandScheduler::Submit.
+	void RetagWatches(uint64_t submitted_tick, uint64_t new_tick);
+
+	// Opened before the producer commits, closed once its consumers are recorded; holds nest.
+	void BeginHold() noexcept { m_hold_depth++; }
+	void EndHold();
 
 private:
 	friend struct StreamBufferTestAccess;
@@ -110,8 +118,11 @@ private:
 	struct Watch {
 		uint64_t tick        = 0;
 		uint64_t upper_bound = 0;
+		// Set when the last hold covering this reservation closes.
+		bool sealed = false;
 	};
 
+	void                      SealFloatingWatches();
 	[[nodiscard]] static bool NormalizeReservation(bool coherent, uint64_t atom, uint64_t& size,
 	                                               uint64_t& alignment);
 	[[nodiscard]] bool        WaitPendingOperations(const std::vector<Watch>& watches,
@@ -121,12 +132,36 @@ private:
 
 	uint64_t              m_offset      = 0;
 	uint64_t              m_mapped_size = 0;
+	uint32_t              m_hold_depth  = 0;
 	std::vector<Watch>    m_current_watches;
 	size_t                m_current_watch_cursor = 0;
 	std::optional<size_t> m_invalidation_mark;
 	std::vector<Watch>    m_previous_watches;
 	size_t                m_wait_cursor = 0;
 	uint64_t              m_wait_bound  = 0;
+};
+
+// RAII for StreamBuffer::BeginHold/EndHold; one operation can commit into two rings.
+class StreamHold final {
+public:
+	explicit StreamHold(StreamBuffer& first, StreamBuffer* second = nullptr) noexcept
+	    : m_first(&first), m_second(second) {
+		m_first->BeginHold();
+		if (m_second != nullptr) {
+			m_second->BeginHold();
+		}
+	}
+	~StreamHold() {
+		if (m_second != nullptr) {
+			m_second->EndHold();
+		}
+		m_first->EndHold();
+	}
+	KYTY_CLASS_NO_COPY(StreamHold);
+
+private:
+	StreamBuffer* m_first  = nullptr;
+	StreamBuffer* m_second = nullptr;
 };
 
 } // namespace Libs::Graphics

@@ -1682,18 +1682,10 @@ KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* stat
 	return OK;
 }
 
-KYTY_SYSV_ABI int VideoOutGetVrrStatus(int handle, int32_t* status) {
+KYTY_SYSV_ABI int VideoOutGetVrrStatus() {
 	PRINT_NAME();
 
-	if (status == nullptr) {
-		return VIDEO_OUT_ERROR_INVALID_ADDRESS;
-	}
-	if (DriverState().Get(handle) == nullptr) {
-		return VIDEO_OUT_ERROR_INVALID_HANDLE;
-	}
-
 	// Kyty currently presents at a fixed refresh rate and does not negotiate VRR.
-	*status = 0;
 	return OK;
 }
 

@@ -59,19 +59,19 @@ private:
 };
 
 struct File {
-	Common::File          f;
-	std::string           name;
-	std::filesystem::path real_name;
-	std::atomic_bool      opened;
-	std::atomic_bool      directory;
-	std::atomic_bool      readable;
-	std::atomic_bool      writable;
-	std::atomic_bool      append;
-	std::atomic_bool      sync_writes;
-	SpecialFile           special;
-	Common::Mutex         mutex;
-	std::vector<uint8_t>  dirents;
-	uint64_t              dents_offset;
+	Common::File                        f;
+	std::string                         name;
+	std::filesystem::path               real_name;
+	std::atomic_bool                    opened;
+	std::atomic_bool                    directory;
+	std::atomic_bool                    readable;
+	std::atomic_bool                    writable;
+	std::atomic_bool                    append;
+	std::atomic_bool                    sync_writes;
+	SpecialFile                         special;
+	Common::Mutex                       mutex;
+	std::vector<uint8_t>                dirents;
+	uint64_t                            dents_offset;
 };
 
 class FileDescriptors {
@@ -111,34 +111,6 @@ static void FillRandomBuffer(void* buf, size_t nbytes) {
 static void SecToTimespec(KernelTimespec* ts, double sec) {
 	ts->tv_sec  = static_cast<int64_t>(sec);
 	ts->tv_nsec = static_cast<int64_t>((sec - static_cast<double>(ts->tv_sec)) * 1000000000.0);
-}
-
-static uint16_t GetFileMode(const std::filesystem::path& path, uint16_t type) {
-	std::error_code error;
-	const auto      permissions = std::filesystem::status(path, error).permissions();
-	if (error) {
-		return static_cast<uint16_t>(type | 0000777u);
-	}
-	return static_cast<uint16_t>(type | (static_cast<uint32_t>(permissions) & 00007777u));
-}
-
-static int FileSystemErrorToKernel(const std::error_code& error) {
-	if (error == std::errc::no_such_file_or_directory) {
-		return KERNEL_ERROR_ENOENT;
-	}
-	if (error == std::errc::permission_denied || error == std::errc::operation_not_permitted) {
-		return KERNEL_ERROR_EACCES;
-	}
-	if (error == std::errc::read_only_file_system) {
-		return KERNEL_ERROR_EROFS;
-	}
-	if (error == std::errc::not_a_directory) {
-		return KERNEL_ERROR_ENOTDIR;
-	}
-	if (error == std::errc::invalid_argument) {
-		return KERNEL_ERROR_EINVAL;
-	}
-	return KERNEL_ERROR_EIO;
 }
 
 static uint64_t AlignDown(uint64_t value, uint64_t alignment) {
@@ -281,7 +253,7 @@ void FileDescriptors::CloseAll() {
 void MountPoints::Mount(const std::filesystem::path& folder, const std::string& point) {
 	Common::LockGuard lock(m_mutex);
 
-	auto point_str = Common::FixDirectorySlash(point);
+	auto point_str  = Common::FixDirectorySlash(point);
 
 	Umount(point_str);
 
@@ -299,8 +271,7 @@ void MountPoints::Umount(const std::string& folder_or_point) {
 
 	const auto it = std::find_if(
 	    m_mount_pairs.begin(), m_mount_pairs.end(), [&folder_or_point_str](const MountPair& p) {
-		    return Common::FixDirectorySlash(Common::PathToGenericString(p.dir)) ==
-		               folder_or_point_str ||
+		    return Common::FixDirectorySlash(Common::PathToGenericString(p.dir)) == folder_or_point_str ||
 		           p.point == folder_or_point_str;
 	    });
 	if (it != m_mount_pairs.end()) {
@@ -378,7 +349,8 @@ std::filesystem::path MountPoints::ResolvePath(const std::string& mounted_name) 
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		if (HasWindowsForbiddenFilenameCharacter(rel_path)) {
-			::printf("FileSystem: Windows-incompatible guest filename: %s\n", mounted_name.c_str());
+			::printf("FileSystem: Windows-incompatible guest filename: %s\n",
+			         mounted_name.c_str());
 		}
 		return p.dir / native_rel_path;
 #else
@@ -792,9 +764,8 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 	return bytes_read;
 }
 
-int64_t KYTY_SYSV_ABI KernelPreadv(int d, const KernelIovec* iov, int iovcnt, int64_t offset) {
-	PRINT_NAME();
-
+static int ValidateIovecs(const KernelIovec* iov, int iovcnt, int64_t offset,
+                          std::vector<KernelIovec>* buffers, size_t* total) {
 	constexpr int MaxIov = 1024;
 	if (iovcnt < 0 || iovcnt > MaxIov || offset < 0) {
 		return KERNEL_ERROR_EINVAL;
@@ -803,19 +774,30 @@ int64_t KYTY_SYSV_ABI KernelPreadv(int d, const KernelIovec* iov, int iovcnt, in
 		return KERNEL_ERROR_EFAULT;
 	}
 
-	std::vector<KernelIovec> buffers;
 	if (iovcnt != 0) {
-		buffers.assign(iov, iov + iovcnt);
+		buffers->assign(iov, iov + iovcnt);
 	}
-	size_t total = 0;
-	for (const auto& buffer: buffers) {
-		if (buffer.iov_len > INT_MAX - total) {
+	*total = 0;
+	for (const auto& buffer: *buffers) {
+		if (buffer.iov_len > INT_MAX - *total) {
 			return KERNEL_ERROR_EINVAL;
 		}
 		if (buffer.iov_base == nullptr && buffer.iov_len != 0) {
 			return KERNEL_ERROR_EFAULT;
 		}
-		total += buffer.iov_len;
+		*total += buffer.iov_len;
+	}
+	return OK;
+}
+
+int64_t KYTY_SYSV_ABI KernelPreadv(int d, const KernelIovec* iov, int iovcnt, int64_t offset) {
+	PRINT_NAME();
+
+	std::vector<KernelIovec> buffers;
+	size_t                   total = 0;
+	const int                error = ValidateIovecs(iov, iovcnt, offset, &buffers, &total);
+	if (error != OK) {
+		return error;
 	}
 
 	if (d < DESCRIPTOR_MIN) {
@@ -938,27 +920,11 @@ int64_t KYTY_SYSV_ABI KernelPwrite(int d, const void* buf, size_t nbytes, int64_
 int64_t KYTY_SYSV_ABI KernelPwritev(int d, const KernelIovec* iov, int iovcnt, int64_t offset) {
 	PRINT_NAME();
 
-	constexpr int MaxIov = 1024;
-	if (iovcnt < 0 || iovcnt > MaxIov || offset < 0) {
-		return KERNEL_ERROR_EINVAL;
-	}
-	if (iov == nullptr && iovcnt != 0) {
-		return KERNEL_ERROR_EFAULT;
-	}
-
 	std::vector<KernelIovec> buffers;
-	if (iovcnt != 0) {
-		buffers.assign(iov, iov + iovcnt);
-	}
-	size_t total = 0;
-	for (const auto& buffer: buffers) {
-		if (buffer.iov_len > INT_MAX - total) {
-			return KERNEL_ERROR_EINVAL;
-		}
-		if (buffer.iov_base == nullptr && buffer.iov_len != 0) {
-			return KERNEL_ERROR_EFAULT;
-		}
-		total += buffer.iov_len;
+	size_t                   total = 0;
+	const int                error = ValidateIovecs(iov, iovcnt, offset, &buffers, &total);
+	if (error != OK) {
+		return error;
 	}
 
 	if (d < DESCRIPTOR_MIN) {
@@ -987,6 +953,9 @@ int64_t KYTY_SYSV_ABI KernelPwritev(int d, const KernelIovec* iov, int iovcnt, i
 
 	const auto position = file->f.Tell();
 	const auto target   = (file->append ? file->f.Size() : static_cast<uint64_t>(offset));
+	if (target > static_cast<uint64_t>(INT64_MAX) - total) {
+		return KERNEL_ERROR_EFBIG;
+	}
 	if (!file->f.Seek(target)) {
 		return KERNEL_ERROR_EIO;
 	}
@@ -1100,7 +1069,7 @@ int KYTY_SYSV_ABI KernelStat(const char* path, FileStat* sb) {
 	EXIT_NOT_IMPLEMENTED(is_dir && is_file);
 
 	FileStat stat {};
-	stat.st_mode = GetFileMode(real_file_name, is_dir ? 0040000u : 0100000u);
+	stat.st_mode = 0000777u | (is_dir ? 0040000u : 0100000u);
 
 	auto at = Common::DateTime::FromSystemUTC();
 	auto wt = at;
@@ -1149,9 +1118,7 @@ int KYTY_SYSV_ABI KernelFstat(int d, FileStat* sb) {
 	LOGF("\tKernelFstat: %s\n", Common::PathToString(file->real_name).c_str());
 
 	FileStat stat {};
-	stat.st_mode = (file->special != SpecialFile::None
-	                    ? 0000777u
-	                    : GetFileMode(file->real_name, file->directory ? 0040000u : 0100000u));
+	stat.st_mode = 0000777u | (file->directory ? 0040000u : 0100000u);
 
 	auto at = Common::DateTime::FromSystemUTC();
 	auto wt = at;
@@ -1239,25 +1206,6 @@ int KYTY_SYSV_ABI KernelFtruncate(int d, int64_t length) {
 	LOGF("\tFtruncate (size = %" PRId64 ") file: %s\n", length,
 	     Common::PathToString(file->real_name).c_str());
 
-	return OK;
-}
-
-int KYTY_SYSV_ABI KernelChmod(const char* path, uint32_t mode) {
-	PRINT_NAME();
-
-	if (path == nullptr) {
-		return KERNEL_ERROR_EFAULT;
-	}
-
-	const auto      real_path = g_mount_points->ResolvePath(path);
-	std::error_code error;
-	std::filesystem::permissions(real_path, static_cast<std::filesystem::perms>(mode & 00007777u),
-	                             std::filesystem::perm_options::replace, error);
-	if (error) {
-		return FileSystemErrorToKernel(error);
-	}
-
-	LOGF("\t KernelChmod: %s (mode = %04" PRIo32 ")\n", path, mode & 00007777u);
 	return OK;
 }
 

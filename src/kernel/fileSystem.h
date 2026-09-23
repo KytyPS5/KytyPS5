@@ -67,7 +67,6 @@ int64_t KYTY_SYSV_ABI KernelPwritev(int d, const KernelIovec* iov, int iovcnt, i
 int64_t KYTY_SYSV_ABI KernelLseek(int d, int64_t offset, int whence);
 int KYTY_SYSV_ABI     KernelStat(const char* path, FileStat* sb);
 int KYTY_SYSV_ABI     KernelFstat(int d, FileStat* sb);
-int KYTY_SYSV_ABI     KernelChmod(const char* path, uint32_t mode);
 int KYTY_SYSV_ABI     KernelFtruncate(int d, int64_t length);
 int KYTY_SYSV_ABI     KernelUnlink(const char* path);
 int KYTY_SYSV_ABI     KernelRename(const char* from, const char* to);

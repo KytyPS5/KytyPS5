@@ -622,8 +622,9 @@ struct RenderExecutorTestAccess {
 
   static void ResolveRenderDepthTarget(RenderExecutor &executor,
                                        CommandBuffer &buffer,
-                                       RenderDepthInfo &depth) {
-    executor.ResolveRenderDepthTarget(buffer, depth);
+                                       RenderDepthInfo &depth,
+                                       uint8_t stencil_export_bits = 0) {
+    executor.ResolveRenderDepthTarget(buffer, depth, stencil_export_bits);
   }
 
   static bool DepthStencilCopy(RenderExecutor &executor, CommandBuffer &buffer) {
@@ -1571,6 +1572,7 @@ struct GraphicsCase {
   bool pixel_position_w = false;
   float vertex_clip_w = 1.0f;
   bool pixel_depth_export = false;
+  uint8_t pixel_stencil_bit_pass = 0;
   u32 pixel_perspective_sample_vgpr = UINT32_MAX;
   u32 pixel_perspective_centroid_vgpr = UINT32_MAX;
   u32 pixel_custom_interpolation_mask = 0;
@@ -2039,6 +2041,7 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
   pixel_info.ps_front_face_all_bits = test.pixel_front_face_all_bits;
   pixel_info.ps_pos_w = test.pixel_position_w;
   pixel_info.ps_depth_export_enable = test.pixel_depth_export;
+  pixel_info.ps_stencil_bit_pass = test.pixel_stencil_bit_pass;
   pixel_info.ps_system_input_base = 2;
   pixel_info.ps_perspective_sample_vgpr = test.pixel_perspective_sample_vgpr;
   pixel_info.ps_perspective_centroid_vgpr = test.pixel_perspective_centroid_vgpr;
@@ -18332,6 +18335,26 @@ public:
               "RebindImages did not acquire the associated depth owner");
       RenderExecutorTestAccess::ResetBindings(executor);
 
+      {
+        auto tiled_stencil = stencil;
+        tiled_stencil.fields[3] =
+            (tiled_stencil.fields[3] & ~(0x1fu << 20u)) |
+            (static_cast<uint32_t>(Prospero::TileMode::kStandard64KB) << 20u);
+        ShaderRecompiler::IR::ResourceSnapshot tiled_snapshot{};
+        ShaderRecompiler::IR::DescriptorValue tiled_descriptor{};
+        std::copy(std::begin(tiled_stencil.fields), std::end(tiled_stencil.fields),
+                  tiled_descriptor.dwords.begin());
+        tiled_descriptor.dword_count = 8;
+        tiled_snapshot.images.push_back(tiled_descriptor);
+        ShaderStageRuntime tiled_runtime{&program, &tiled_snapshot};
+        PreparedBindings mismatched;
+        context.GetRenderExecutor().PrepareBindings(tiled_runtime, mismatched);
+        Require(name, "mismatched stencil plane redirect",
+                mismatched.images.size() == 1 && mismatched.images[0].image_id == depth_id,
+                "a stencil T# with a different footprint did not read the depth owner");
+        RenderExecutorTestAccess::ResetBindings(executor);
+      }
+
       // Execute the captured IMAGE_STORE clear through production fill recognition.
       const std::array<uint32_t, 12> stencil_shader{
           0xd7460000u, 0x0401060cu, 0xf4201a84u, 0xfa000000u,
@@ -19838,6 +19861,7 @@ public:
     };
     auto &filled = pipeline(true, 2, 2);
     const auto draw = [&](const PipelineCache::Pipeline &selected, uint32_t vertex_count = 3,
+                          const std::function<void(vk::CommandBuffer)> &after = {},
                           std::array<u32, 4> clear_value = {}) {
       RenderExecutorTestAccess::BindRenderTarget(executor, color.image_id);
       if (depth.image_id) {
@@ -19904,6 +19928,9 @@ public:
       const vk::DeviceSize offset = 0;
       cmd.bindVertexBuffers(0, 1, &buffer.buffer, &offset);
       cmd.draw(vertex_count, 1, 0, 0);
+      if (after) {
+        after(cmd);
+      }
       command.EndRendering();
       RenderExecutorTestAccess::ResetBindings(executor);
     };
@@ -20142,6 +20169,119 @@ public:
       check_stencil("masked compare passes", false, 0xb8, 0xb9);
       check_stencil("masked compare fails", false, 0xb0, 0xb0);
 
+      {
+        struct StencilProgram {
+          CompiledShader compiled;
+          ShaderRecompiler::IR::CompiledShaderInfo info{};
+          ShaderProgram program{};
+        };
+        std::array<StencilProgram, 9> stencil_programs;
+        for (uint32_t variant = 0; variant < stencil_programs.size(); variant++) {
+          GraphicsCase stencil_case;
+          stencil_case.name = name;
+          stencil_case.pixel_depth_export = true;
+          stencil_case.pixel_stencil_bit_pass = static_cast<uint8_t>(variant);
+          auto &code = stencil_case.fragment_code;
+          code.push_back(EncodeVintrp(0, 20, 0, 0, 0));
+          code.push_back(EncodeVintrp(1, 20, 0, 0, 1));
+          code.push_back(EncodeVop2(0x08, 21, 255, 20)); // v_mul_f32 v21, 255.0, v20
+          code.push_back(0x437f0000u);
+          code.push_back(EncodeVop1(0x07, 22, Vgpr(21))); // v_cvt_u32_f32
+          code.push_back(EncodeVop1(0x06, 23, Vgpr(22))); // v_cvt_f32_u32
+          code.push_back(EncodeVop2(0x1a, 24, InlineU32(8), 22)); // op value in 15:8
+          AppendVMovLiteral(&code, 25, 0x3f000000u);
+          code.push_back(EncodeExp0(0x08, 0x3, false));
+          code.push_back(EncodeExp1(25, 24, 0, 0));
+          code.push_back(EncodeExp0(0x00, 0xf));
+          code.push_back(EncodeExp1(23, 23, 23, 23));
+          AppendEnd(&code);
+          auto &entry = stencil_programs[variant];
+          entry.compiled = CompileFragmentCase(stencil_case);
+          entry.info.stage = ShaderType::Pixel;
+          entry.info.info = entry.compiled.program.info;
+          entry.info.bindings = entry.compiled.program.bindings;
+          entry.program = ShaderProgram{0xf0000000u + variant,
+                                        CreateShaderModule(name, entry.compiled.spirv)};
+        }
+        const auto saved_pixel_stage = pixel.stage;
+        const auto saved_depth_control = stencil_control;
+        const auto saved_stencil_control = registers.GetStencilControl();
+        const auto saved_stencil_mask = registers.GetStencilMask();
+        const auto stage_of = [&](uint32_t variant) {
+          return ShaderStageRuntime{&stencil_programs[variant].info,
+                                    &stencil_programs[variant].compiled.resources};
+        };
+        const auto export_pipeline = [&](uint32_t variant) -> PipelineCache::Pipeline & {
+          auto info = pixel;
+          info.stage = stage_of(variant);
+          return context.GetPipelineCache().GetGraphicsPipeline(
+              std::span{&color, 1u}, depth, std::span{&vertex, 1u}, scheduler.Current(), &info,
+              vk::PrimitiveTopology::eTriangleList, false,
+              PipelineCache::GraphicsPrograms{{vertex_shader},
+                                              stencil_programs[variant].program});
+        };
+        const auto check_export = [&](const char *label, uint8_t zfunc, bool zwrite,
+                                      vk::CompareOp replay_compare) {
+          stencil_control = {};
+          stencil_control.z_enable = true;
+          stencil_control.z_write_enable = zwrite;
+          stencil_control.zfunc = zfunc;
+          stencil_control.stencil_enable = true;
+          stencil_control.stencilfunc = stencil_control.stencilfunc_bf =
+              static_cast<uint8_t>(vk::CompareOp::eAlways);
+          registers.SetDepthControl(stencil_control);
+          registers.SetStencilControl({0, 4, 0, 0, 4, 0});
+          // STENCILOPVAL 0x33 is ignored: the shader supplies the op value.
+          registers.SetStencilMask({0, 0, 0xff, 0x33, 0, 0, 0xff, 0x33});
+          RenderExecutorTestAccess::ResolveRenderDepthTarget(executor, scheduler.Current(), depth,
+                                                             0xff);
+          Require(name, label,
+                  depth.stencil_export.bits == 0xff &&
+                      depth.stencil_export.depth_compare_op == replay_compare &&
+                      depth.stencil_front.passOp == vk::StencilOp::eZero,
+                  "the exported op value was not planned as pass 0 ZERO plus eight replays");
+          vk::ClearValue clear{};
+          clear.depthStencil = vk::ClearDepthStencilValue{0.625f, 0x5a};
+          TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), depth.image_id,
+              {vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil, 0, 1, 0, 1},
+              clear);
+          std::array<vk::Pipeline, 8> bit_pipelines{};
+          for (uint32_t bit = 0; bit < 8; bit++) {
+            bit_pipelines[bit] = export_pipeline(bit + 1).pipeline;
+          }
+          pixel.stage = stage_of(0);
+          draw(export_pipeline(0), 3, [&](vk::CommandBuffer cmd) {
+            RecordStencilExportReplay(cmd, depth.stencil_export, bit_pipelines, 1,
+                                      [&] { cmd.draw(3, 1, 0, 0); });
+          });
+          pixel.stage = saved_pixel_stage;
+          const auto colors = read_color();
+          const auto result = read_stencil();
+          const auto *stencil_bytes = reinterpret_cast<const uint8_t *>(result.data());
+          uint32_t covered = 0;
+          uint32_t odd = 0;
+          for (uint32_t texel = 0; texel < extent * extent; ++texel) {
+            const auto value = std::bit_cast<float>(colors[texel * 4]);
+            const uint8_t expected = value != 0.0f ? static_cast<uint8_t>(value) : 0x5a;
+            covered += value != 0.0f ? 1u : 0u;
+            odd += value != 0.0f && (expected & 1u) != 0 ? 1u : 0u;
+            Require(name, label, stencil_bytes[texel] == expected,
+                    "the replayed stencil plane differs from the exported op value");
+          }
+          Require(name, label, covered > extent && odd != 0 && odd != covered,
+                  "the exported values did not vary enough to exercise the bit passes");
+        };
+        check_export("exported stencil replay, depth written",
+                     static_cast<uint8_t>(vk::CompareOp::eAlways), true, vk::CompareOp::eEqual);
+        check_export("exported stencil replay, depth read only",
+                     static_cast<uint8_t>(vk::CompareOp::eLess), false, vk::CompareOp::eLess);
+        stencil_control = saved_depth_control;
+        registers.SetDepthControl(stencil_control);
+        registers.SetStencilControl(saved_stencil_control);
+        registers.SetStencilMask(saved_stencil_mask);
+        RenderExecutorTestAccess::ResolveRenderDepthTarget(executor, scheduler.Current(), depth);
+      }
+
       // SPI_PS_IN_CONTROL must select the native wave width through the actual
       // program cache. In wave32 a low-word compare preserves scalar VCC_HI.
       static const auto native_vertex = [] {
@@ -20234,6 +20374,45 @@ public:
               wave_ids[0] != wave_ids[1] && wave_keys[0] != wave_keys[1],
               "wave32 and wave64 pixel programs shared a cache key");
 
+      {
+        const auto saved_shader_control = registers.GetShaderRegisters().db_shader_control;
+        const auto saved_depth_control = registers.GetDepthControl();
+        const auto saved_stencil_mask = registers.GetStencilMask();
+        HW::DepthShaderControl export_control = saved_shader_control;
+        export_control.shader_stencil_op_val_export_enable = true;
+        registers.SetDepthShaderControl(export_control);
+        HW::DepthControl export_depth{};
+        export_depth.backface_enable = true;
+        registers.SetDepthControl(export_depth);
+        registers.SetStencilMask({0, 0, 0x0b, 0, 0, 0, 0x30, 0});
+        std::array<ShaderVertexInputInfo, 3> export_vertex_info{};
+        ShaderPixelInputInfo export_pixel{};
+        const auto programs = context.GetPipelineCache().GetGraphicsPrograms(
+            native_vertex_regs, native_pixel_regs, registers.GetShaderRegisters(), registers,
+            user_config, export_mapping, true, export_vertex_info, export_pixel);
+        Require(name, "stencil export flags", programs.pixel &&
+                    (context.GetGraphics().shader_stencil_export_enabled ==
+                     export_pixel.ps_stencil_op_val_export_enable),
+                "the stencil export builtin survived on a host without the extension");
+        const uint8_t expected = context.GetGraphics().shader_stencil_export_enabled ? 0 : 0x3b;
+        Require(name, "stencil replay variants", programs.stencil_bit_mask == expected,
+                "the replay variants do not cover the write mask of both faces");
+        for (uint32_t bit = 0; bit < 8; bit++) {
+          if ((expected & (1u << bit)) == 0) {
+            continue;
+          }
+          const auto &stage = programs.stencil_bit_stage[bit];
+          Require(name, "stencil replay variant identity",
+                  programs.stencil_bit_pixel[bit] &&
+                      programs.stencil_bit_pixel[bit].id != programs.pixel.id &&
+                      stage.program != export_pixel.stage.program &&
+                      stage.program->bindings == export_pixel.stage.program->bindings,
+                  "a replay variant shared the pass-0 program or bound differently");
+        }
+        registers.SetDepthShaderControl(saved_shader_control);
+        registers.SetDepthControl(saved_depth_control);
+        registers.SetStencilMask(saved_stencil_mask);
+      }
       static const auto waterfall_vertex = [&] {
         std::vector<u32> code;
         AppendVMovU32(&code, 9, 0);
@@ -20354,7 +20533,7 @@ public:
           broadcast_pipeline = selected.pipeline;
         }
         constexpr std::array<float, 4> destination{0.3f, 0.3f, 0.1f, 0.2f};
-        draw(selected, 3, std::bit_cast<std::array<u32, 4>>(destination));
+        draw(selected, 3, {}, std::bit_cast<std::array<u32, 4>>(destination));
         const auto blend_pixels = read_color();
         const std::array<float, 4> expected{test.alpha, 0.35f, 0.35f, 0.5f};
         for (size_t component = 0; component < blend_pixels.size(); component++) {
@@ -49640,6 +49819,87 @@ void CheckPs5DepthRegisterDecoding() {
   std::printf("[host]    %-32s ok\n", "Ps5DepthRegisterDecoding");
 }
 
+void CheckStencilExportReplayPlan() {
+  constexpr const char *name = "StencilExportReplayPlan";
+  constexpr auto Always = static_cast<uint8_t>(vk::CompareOp::eAlways);
+  constexpr auto Equal = static_cast<uint8_t>(vk::CompareOp::eEqual);
+  constexpr auto Keep = static_cast<uint8_t>(Prospero::StencilOp::kKeep);
+  constexpr auto ReplaceOp = static_cast<uint8_t>(Prospero::StencilOp::kReplaceOp);
+  constexpr auto Xor = static_cast<uint8_t>(Prospero::StencilOp::kXor);
+
+  const GuestStencilFace tagger{Always, Keep, ReplaceOp, Keep, 0x00, 0x00, 0xff};
+  auto plan = PlanStencilExportReplay(tagger, tagger, true, true, vk::CompareOp::eAlways, false);
+  Require(name, "tagger plan",
+          plan && plan->bits == 0xff && plan->depth_compare_op == vk::CompareOp::eEqual &&
+              plan->front.passOp == vk::StencilOp::eReplace &&
+              plan->front.failOp == vk::StencilOp::eKeep &&
+              plan->front.depthFailOp == vk::StencilOp::eKeep,
+          "the measured tagger state was not replayed as eight REPLACE passes over equal depth");
+  for (uint32_t bit = 0; bit < 8; bit++) {
+    const auto pass = StencilExportReplay::BitPass(plan->front, bit);
+    Require(name, "tagger bit pass",
+            pass.writeMask == (1u << bit) && pass.reference == (1u << bit) &&
+                pass.compareOp == vk::CompareOp::eAlways &&
+                pass.passOp == vk::StencilOp::eReplace,
+            "a replay pass did not write exactly its own bit");
+  }
+
+  plan = PlanStencilExportReplay(tagger, tagger, true, false, vk::CompareOp::eLess, false);
+  Require(name, "depth read only",
+          plan && plan->depth_compare_op == vk::CompareOp::eLess,
+          "a draw that does not write depth must replay under its own depth test");
+  plan = PlanStencilExportReplay(tagger, tagger, false, false, vk::CompareOp::eNever, false);
+  Require(name, "depth test off", plan && plan->bits == 0xff,
+          "a draw without a depth test was not replayed");
+  Require(name, "not-equal depth write",
+          !PlanStencilExportReplay(tagger, tagger, true, true, vk::CompareOp::eNotEqual, false),
+          "NOT_EQUAL with depth writes cannot be reproduced by an EQUAL replay");
+  Require(name, "depth bounds with depth write",
+          !PlanStencilExportReplay(tagger, tagger, true, true, vk::CompareOp::eLess, true),
+          "depth bounds read the depth pass 0 rewrote");
+
+  const GuestStencilFace masked{Equal, Keep, ReplaceOp, Keep, 0xe0, 0x20, 0x1c};
+  plan = PlanStencilExportReplay(masked, masked, false, false, vk::CompareOp::eAlways, false);
+  Require(name, "disjoint compare",
+          plan && plan->bits == 0x1c &&
+              StencilExportReplay::BitPass(plan->front, 3).reference == (0x20u | 0x08u) &&
+              StencilExportReplay::BitPass(plan->front, 3).compareOp == vk::CompareOp::eEqual &&
+              StencilExportReplay::BitPass(plan->front, 0).writeMask == 0,
+          "a disjoint compare was not kept, or a bit outside the write mask was written");
+  const GuestStencilFace overlap{Equal, Keep, ReplaceOp, Keep, 0x0f, 0x01, 0x03};
+  Require(name, "overlapping compare",
+          !PlanStencilExportReplay(overlap, overlap, false, false, vk::CompareOp::eAlways,
+                                   false),
+          "a compare over rewritten bits cannot be re-evaluated after pass 0");
+  const GuestStencilFace fail_op{Equal, ReplaceOp, Keep, Keep, 0x00, 0x00, 0xff};
+  Require(name, "fail op consumes",
+          !PlanStencilExportReplay(fail_op, fail_op, false, false, vk::CompareOp::eAlways,
+                                   false),
+          "a fail op that consumes the exported value was accepted");
+
+  const GuestStencilFace xor_face{Always, Keep, Xor, Keep, 0x00, 0x00, 0x0f};
+  const GuestStencilFace keep_face{Always, Keep, Keep, Keep, 0x00, 0x00, 0xff};
+  plan = PlanStencilExportReplay(keep_face, xor_face, false, false, vk::CompareOp::eAlways,
+                                 false);
+  Require(name, "xor back face",
+          plan && plan->bits == 0x0f && plan->back.passOp == vk::StencilOp::eInvert &&
+              StencilExportReplay::BitPass(plan->front, 1).writeMask == 0 &&
+              StencilExportReplay::BitPass(plan->front, 1).passOp == vk::StencilOp::eKeep &&
+              StencilExportReplay::BitPass(plan->back, 1).writeMask == 0x02,
+          "per-face replay state was wrong");
+
+  RenderDepthInfo target{};
+  target.desc.view_info.format = vk::Format::eD32SfloatS8Uint;
+  target.stencil_test_enable = true;
+  target.stencil_front = {vk::StencilOp::eKeep, vk::StencilOp::eKeep, vk::StencilOp::eKeep,
+                          vk::CompareOp::eAlways, 0, 0x0f, 0};
+  target.stencil_back = target.stencil_front;
+  target.stencil_export = *plan;
+  Require(name, "replay write aspect",
+          target.AttachmentWriteAspects() == vk::ImageAspectFlagBits::eStencil,
+          "a replayed draw did not claim the stencil aspect");
+}
+
 void CheckDepthAttachmentWrites() {
   RenderDepthInfo target{};
   target.desc.view_info.format = vk::Format::eD32SfloatS8Uint;
@@ -53144,6 +53404,7 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--image-overlap-only") == 0) {
+    CheckStencilExportReplayPlan();
     CheckDepthAttachmentWrites();
     CheckDepthFeedbackAspects();
     CheckDynamicRenderingState();
@@ -53165,6 +53426,7 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--depth-feedback-only") == 0) {
+    CheckStencilExportReplayPlan();
     CheckDepthAttachmentWrites();
     CheckDepthFeedbackAspects();
     CheckDynamicRenderingState();
@@ -53412,6 +53674,7 @@ int main(int argc, char **argv) {
   CheckNativeMsaaState();
   CheckPs5DepthRegisterDecoding();
   CheckDepthHtileStencilCompatibility();
+  CheckStencilExportReplayPlan();
   CheckDepthAttachmentWrites();
   CheckDepthFeedbackAspects();
   CheckDynamicRenderingState();

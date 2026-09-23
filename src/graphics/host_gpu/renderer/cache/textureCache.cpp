@@ -1505,8 +1505,15 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
 		bool block_alias = false;
 
+		const bool stencil_plane_read = desc.type == BindingType::Texture && !exact_format &&
+		                                !desc.info.IsDepth() && desc.info.bytes_per_block == 1 &&
+		                                desc.info.samples == 1 && desc.info.resources.levels == 1 &&
+		                                desc.info.resources.layers == 1;
 		for (const auto id: candidates) {
 			const auto image = m_slot_images.try_get(id);
+			    image->info.data.address == desc.info.data.address &&
+			    image->info.data.size != desc.info.data.size &&
+			    image->info.extent == desc.info.extent) {
 				result = id;
 				break;
 			}
@@ -1514,6 +1521,14 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 				block_alias = true;
 			}
 		}
+		ImageId stencil_owner {};
+		if (stencil_plane_read && !result) {
+			stencil_owner = StencilPlaneOwner(desc);
+			}
+		}
+		const bool stencil_plane_found = static_cast<bool>(result);
+		for (const auto id: candidates) {
+			const auto image = m_slot_images.try_get(id);
 				continue;
 				// Only an exact backing match hands a parked image back; prefer a live owner.
 				(image->dormant ? parked : result) = id;

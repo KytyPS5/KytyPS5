@@ -211,6 +211,10 @@ struct ShaderPixelInputInfo {
 	bool                                           ps_pixel_kill_enable         = false;
 	bool                                           ps_depth_export_enable       = false;
 	bool                                           ps_sample_mask_export_enable = false;
+	// MRTZ channel 1 carries the stencil test value in 7:0 and the op value in 15:8.
+	bool                                           ps_stencil_test_val_export_enable = false;
+	bool                                           ps_stencil_op_val_export_enable   = false;
+	uint8_t                                        ps_stencil_bit_pass               = 0;
 	bool                                           ps_sample_shading            = false;
 	bool                                           dual_source_blending         = false;
 	bool                                           object_primitive_id          = false;

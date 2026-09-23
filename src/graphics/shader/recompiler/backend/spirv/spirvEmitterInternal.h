@@ -154,6 +154,7 @@ struct EmitterState {
 	uint32_t                   current_label                         = 0;
 	const IR::Block*           current_block                         = nullptr;
 	uint32_t                   pixel_valid_mask_variable             = 0;
+	uint32_t stencil_bit_pass_variable = 0;
 	// KYTY_CS_LOOP_BUDGET guard: loops charge a per-invocation budget and leave when it runs out.
 	uint32_t loop_budget_variable    = 0;
 	uint32_t loop_budget_limit       = 0;
@@ -171,6 +172,7 @@ struct EmitterState {
 	uint32_t                   layer_variable                        = 0;
 	uint32_t                   viewport_index_variable               = 0;
 	uint32_t                   depth_variable                        = 0;
+	uint32_t                             stencil_ref_variable                  = 0;
 	uint32_t                   object_primitive_id_variable          = 0;
 	uint32_t                   sample_mask_variable                  = 0;
 	std::vector<InputBinding>  inputs;

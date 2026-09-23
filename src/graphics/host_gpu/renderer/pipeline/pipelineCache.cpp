@@ -14,6 +14,7 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/pipeline/unfoldableSet.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -1018,6 +1019,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		}
 	}
 	ShaderParams pixel_params;
+	bool         replay_stencil_export = false;
 	if (pixel_active) {
 		pixel_params      = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
 		pixel_info.object_primitive_id = object_primitive_id;
@@ -1084,6 +1086,29 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 				pixel_info.target_export_mapping[1] = {};
 			}
 		}
+		// NVIDIA does not expose VK_EXT_shader_stencil_export.
+		if (!m_graphics.shader_stencil_export_enabled &&
+		    (pixel_info.ps_stencil_test_val_export_enable ||
+		     pixel_info.ps_stencil_op_val_export_enable)) {
+			replay_stencil_export = pixel_info.ps_stencil_op_val_export_enable &&
+			                        !pixel_info.ps_stencil_test_val_export_enable && !mesh_active;
+#if defined(__APPLE__)
+			// The replay turns colour writes off through VK_EXT_color_write_enable.
+			replay_stencil_export = false;
+#endif
+			pixel_info.ps_stencil_test_val_export_enable = false;
+			pixel_info.ps_stencil_op_val_export_enable   = false;
+			static std::atomic<bool> reported {false};
+			if (!reported.exchange(true, std::memory_order_relaxed)) {
+				LOGF("PipelineCache: guest asks for a shader stencil reference but %s is not "
+				     "exposed by the selected device (%s); %s\n",
+				     VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME,
+				     m_graphics.GetPhysicalDeviceProperties().deviceName.data(),
+				     replay_stencil_export
+				         ? "an exported op value is replayed into the plane one bit per pass"
+				         : "stencil-gated passes will test a register-stamped plane");
+			}
+		}
 	}
 	auto&       last_stage   = vertex_info[tess_active ? 2u : 0u];
 	const auto& clip_control = context.GetClipControl();
@@ -1112,15 +1137,62 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	    mesh_active, object_primitive_id, last_stage.user_clip_planes);
 	GraphicsPrograms  result;
 	if (pixel_active) {
-		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
+		const auto pixel_cursor = push_data_cursor;
+		result.pixel            = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
 		if (!result.pixel) {
 			return {};
+		}
+		if (replay_stencil_export) {
+			const auto& sm = context.GetStencilMask();
+			const auto  back =
+			    context.GetDepthControl().backface_enable ? sm.stencil_writemask_bf : uint8_t {0};
+			const auto wants = static_cast<uint8_t>(sm.stencil_writemask | back);
+			GetStencilBitPrograms(pixel_params, pixel_info, pixel_cursor, push_data_cursor, wants,
+			                      result);
 		}
 	}
 	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
 		result.vertex[i] = m_program_cache->Get(vertex_params[i], vertex_info[i], push_data_cursor);
+		}
 	}
 	return result;
+}
+
+void PipelineCache::GetStencilBitPrograms(const ShaderParams&         pixel_params,
+                                          const ShaderPixelInputInfo& pixel_info,
+                                          uint32_t pixel_cursor, uint32_t next_cursor, uint8_t bits,
+                                          GraphicsPrograms& result) {
+	const auto refuse = [&] { result.stencil_bit_mask = 0; };
+	if (bits == 0) {
+		return;
+	}
+	const auto& base = *pixel_info.stage.program;
+	if (HasShaderBufferWrites(pixel_info.stage) ||
+	    std::ranges::any_of(base.info.images, [](const auto& image) { return image.written; }) ||
+		refuse();
+		return;
+	}
+	for (uint32_t bit = 0; bit < 8; bit++) {
+		if ((bits & (1u << bit)) == 0) {
+			continue;
+		}
+		auto variant                = pixel_info;
+		variant.stage               = {};
+		variant.ps_stencil_bit_pass = static_cast<uint8_t>(bit + 1u);
+		uint32_t   cursor           = pixel_cursor;
+		const auto program          = m_program_cache->Get(pixel_params, variant, cursor);
+		if (!program || !variant.stage) {
+			refuse();
+			return;
+		}
+		if (cursor != next_cursor || !(variant.stage.program->bindings == base.bindings)) {
+			refuse();
+			return;
+		}
+		result.stencil_bit_pixel[bit] = program;
+		result.stencil_bit_stage[bit] = variant.stage;
+		result.stencil_bit_mask |= static_cast<uint8_t>(1u << bit);
+	}
 }
 
 ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,

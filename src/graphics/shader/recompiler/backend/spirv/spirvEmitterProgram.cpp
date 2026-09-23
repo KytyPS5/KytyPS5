@@ -26,18 +26,22 @@ void EmitKillIfBoolFalse(EmitterState& state, uint32_t active) {
 	EmitLabel(state, merge_label);
 }
 
-void EmitKillIfPixelValidMaskInactive(EmitterState& state) {
-	if (state.pixel_valid_mask_variable == 0) {
+void EmitKillIfVariableZero(EmitterState& state, uint32_t variable) {
+	if (variable == 0) {
 		return;
 	}
 
 	const auto mask_value = state.builder.AllocateId();
 	const auto active     = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpLoad, TypeU32(state), mask_value,
-	                          state.pixel_valid_mask_variable);
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), mask_value, variable);
 	state.builder.AddFunction(spv::OpINotEqual, TypeBool(state), active, mask_value,
 	                          ConstantU32(state, 0));
 	EmitKillIfBoolFalse(state, active);
+}
+
+void EmitKillIfPixelValidMaskInactive(EmitterState& state) {
+	EmitKillIfVariableZero(state, state.pixel_valid_mask_variable);
+	EmitKillIfVariableZero(state, state.stencil_bit_pass_variable);
 }
 
 uint32_t SpillPointerType(ValueEmitContext& ctx, IR::Type type) {
@@ -738,6 +742,15 @@ void EmitProgram(EmitterState& state) {
 		state.pixel_valid_mask_variable = state.builder.AllocateId();
 		state.builder.AddName(state.pixel_valid_mask_variable, "pixel_valid_mask_active");
 	}
+	if (state.program.stage == ShaderType::Pixel && state.input_info.pixel != nullptr &&
+	    state.input_info.pixel->ps_stencil_bit_pass != 0) {
+		if (state.input_info.pixel->ps_stencil_bit_pass > 8 || state.lane_count != 1) {
+			state.Refuse("stencil replay variant needs a bit index and one lane per invocation");
+		} else {
+			state.stencil_bit_pass_variable = state.builder.AllocateId();
+			state.builder.AddName(state.stencil_bit_pass_variable, "stencil_bit_pass_keep");
+		}
+	}
 	// The guard exits by OpReturn, which outside compute abandons the whole invocation.
 	state.loop_budget_limit = state.program.stage == ShaderType::Compute ? LoopBudgetLimit() : 0u;
 		state.loop_budget_variable = state.builder.AllocateId();
@@ -839,6 +852,11 @@ void EmitProgram(EmitterState& state) {
 		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
 		                          state.pixel_valid_mask_variable, spv::StorageClassFunction);
 	}
+	if (state.stencil_bit_pass_variable != 0) {
+		state.builder.AddFunction(spv::OpVariable,
+		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
+		                          state.stencil_bit_pass_variable, spv::StorageClassFunction);
+	}
 	if (state.loop_budget_variable != 0) {
 		state.builder.AddFunction(spv::OpVariable,
 		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
@@ -872,6 +890,10 @@ void EmitProgram(EmitterState& state) {
 	if (state.pixel_valid_mask_variable != 0) {
 		state.builder.AddFunction(spv::OpStore, state.pixel_valid_mask_variable,
 		                          ConstantU32(state, 1));
+	}
+	if (state.stencil_bit_pass_variable != 0) {
+		state.builder.AddFunction(spv::OpStore, state.stencil_bit_pass_variable,
+		                          ConstantU32(state, 0));
 	}
 	if (state.loop_budget_variable != 0) {
 		state.builder.AddFunction(spv::OpStore, state.loop_budget_variable, ConstantU32(state, 0));

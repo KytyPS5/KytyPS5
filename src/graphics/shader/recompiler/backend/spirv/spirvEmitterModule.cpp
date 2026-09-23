@@ -682,6 +682,13 @@ void DefineOutputs(EmitterState& state) {
 				binding.variable_id = BuiltIn(state.depth_variable, TypeF32(state), "gl_FragDepth",
 				                              spv::BuiltInFragDepth);
 				break;
+			case IR::StageOutputKind::Stencil:
+				state.builder.RequireExtension("SPV_EXT_shader_stencil_export");
+				state.builder.RequireCapability(spv::CapabilityStencilExportEXT);
+				binding.variable_id =
+				    BuiltIn(state.stencil_ref_variable, TypeI32(state), "gl_FragStencilRefARB",
+				            spv::BuiltInFragStencilRefEXT);
+				break;
 			case IR::StageOutputKind::SampleMask:
 				binding.variable_id =
 				    BuiltIn(state.sample_mask_variable, SampleMaskArrayType(state), "gl_SampleMask",
@@ -885,7 +892,9 @@ void DefineModule(EmitterState& state) {
 		}
 		if (state.input_info.pixel->ps_early_z && !state.input_info.pixel->ps_pixel_kill_enable &&
 		    !state.input_info.pixel->ps_depth_export_enable &&
-		    !state.input_info.pixel->ps_sample_mask_export_enable) {
+		    !state.input_info.pixel->ps_sample_mask_export_enable &&
+		    // A stencil test consuming a reference this shader computes cannot run before it.
+		    state.stencil_ref_variable == 0) {
 			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeEarlyFragmentTests);
 		}
 	}

@@ -263,6 +263,8 @@ enum class StageOutputKind {
 	Mrt,
 	ObjectPrimitiveId,
 	Depth,
+	// The per-pixel stencil reference from MRTZ channel 1; reaches Vulkan as FragStencilRefEXT.
+	Stencil,
 	SampleMask,
 	PointSize,
 	ClipDistance,

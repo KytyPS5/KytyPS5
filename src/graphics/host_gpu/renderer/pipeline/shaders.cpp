@@ -715,6 +715,10 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		    vk::DynamicState::eDepthBias,
 		};
 		std::vector<vk::DynamicState> fragment_dynamic {
+		    vk::DynamicState::eDepthTestEnable,   vk::DynamicState::eDepthWriteEnable,
+		    vk::DynamicState::eDepthCompareOp,    vk::DynamicState::eStencilCompareMask,
+		    vk::DynamicState::eStencilReference,  vk::DynamicState::eStencilWriteMask,
+		    vk::DynamicState::eStencilTestEnable, vk::DynamicState::eStencilOp,
 		};
 		std::vector<vk::DynamicState> output_dynamic {vk::DynamicState::eBlendConstants};
 #if !defined(__APPLE__)

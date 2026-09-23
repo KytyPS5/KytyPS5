@@ -138,6 +138,39 @@ bool DecodeBufferDescriptor(const DescriptorValue& descriptor, ShaderBufferResou
 	return true;
 }
 
+uint64_t ScalarBufferSize(const ShaderBufferResource& descriptor);
+
+bool ValidBufferDescriptor(const DescriptorValue& descriptor, ShaderType stage,
+                           const SrtRuntime& runtime, ShaderBufferResource& result) {
+	if (!DecodeBufferDescriptor(descriptor, result) || result.Type() != 0 ||
+	    (stage != ShaderType::Compute && result.AddTid())) {
+		return false;
+	}
+	for (uint32_t component = 0; component < 4u; component++) {
+		const auto selector = (result.DstSelXYZW() >> (component * 3u)) & 0x7u;
+		if (selector == 2u || selector == 3u) {
+			return false;
+		}
+	}
+	if (runtime.validate_memory_range == nullptr) {
+		return true;
+	}
+	// Tracking is static, so a resource that is inactive on the current path can have undefined
+	// descriptor registers. Canonicalize those values before they affect specialization.
+	const auto size = ScalarBufferSize(result);
+	return result.Base48() != 0 && size != 0 &&
+	       runtime.validate_memory_range(runtime.userdata, result.Base48(), size);
+}
+
+bool ValidSamplerDescriptor(const DescriptorValue& descriptor, ShaderSamplerResource& result) {
+	if (descriptor.dword_count != std::size(result.fields)) {
+		return false;
+	}
+	std::copy_n(descriptor.dwords.begin(), std::size(result.fields), result.fields);
+	return result.MaxAnisoRatio() <= static_cast<uint32_t>(Prospero::SamplerAnisoRatio::kSixteen) &&
+	       result.MipFilter() <= static_cast<uint32_t>(Prospero::SamplerMipFilter::kLinear);
+}
+
 const DescriptorSource* Source(const ResourcePlan& program, uint32_t source) {
 	if (source >= program.descriptor_sources.size()) {
 		return nullptr;
@@ -173,6 +206,12 @@ void MarkCleanFlatSlots(const ResourcePlan& program, const DescriptorSource* sou
 			pending.push_back(inst->Arg(arg));
 		}
 	}
+}
+
+uint64_t ScalarBufferSize(const ShaderBufferResource& descriptor) {
+	return descriptor.Stride() == 0u
+	           ? descriptor.NumRecords()
+	           : static_cast<uint64_t>(descriptor.Stride()) * descriptor.NumRecords();
 }
 
 bool ReadScalarTable(uint64_t base, uint64_t size, uint32_t dynamic_offset,
@@ -887,6 +926,11 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		if (!evaluate(program.info.buffers[i].source, snapshot.buffers[i])) {
 			return false;
 		}
+		
+		ShaderBufferResource buffer;
+		if (!ValidBufferDescriptor(snapshot.buffers[i], program.stage, runtime, buffer)) {
+			snapshot.buffers[i].dwords.fill(0);
+		}
 	}
 	snapshot.images.resize(program.info.images.size());
 	specialization.images.clear();
@@ -938,6 +982,11 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	for (uint32_t i = 0; i < program.info.samplers.size(); ++i) {
 		if (!evaluate(program.info.samplers[i].source, snapshot.samplers[i])) {
 			return false;
+		}
+
+		ShaderSamplerResource sampler;
+		if (!ValidSamplerDescriptor(snapshot.samplers[i], sampler)) {
+			snapshot.samplers[i].dwords.fill(0);
 		}
 	}
 	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());

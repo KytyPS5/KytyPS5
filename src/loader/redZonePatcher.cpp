@@ -131,6 +131,7 @@ struct DecodedCodeInstruction {
 struct DecodedFunction {
 	std::map<uintptr_t, DecodedCodeInstruction> instructions;
 	std::set<uintptr_t>                         branch_targets;
+	std::map<uintptr_t, std::vector<uintptr_t>> jump_table_targets;
 	bool                                        uses_red_zone {};
 	bool                                        has_indirect_branch {};
 	bool                                        requires_conservative_red_zone_tracking {};
@@ -144,6 +145,10 @@ struct InstructionRewrite {
 bool IsStackPointerRegister(ZydisRegister reg) {
 	return reg != ZYDIS_REGISTER_NONE &&
 	       ZydisRegisterGetLargestEnclosing(ZYDIS_MACHINE_MODE_LONG_64, reg) == ZYDIS_REGISTER_RSP;
+}
+
+bool IsFramePointerRegister(ZydisRegister reg) {
+	return reg == ZYDIS_REGISTER_RBP;
 }
 
 bool IsControlFlowTerminator(const ZydisDecodedInstruction& instruction) {
@@ -168,6 +173,23 @@ uintptr_t GetRelativeTarget(const DecodedCodeInstruction& decoded) {
 		}
 	}
 	return 0;
+}
+
+// access_start is relative to the RSP value before the instruction executes.
+void MarkRedZoneAccess(DecodedCodeInstruction& decoded, const ZydisDecodedOperand& operand,
+                       s64 access_start) {
+	const s64 access_size = std::max<s64>(operand.size / 8, 1);
+	const s64 range_start = std::max(access_start, -static_cast<s64>(GuestRedZoneSize));
+	const s64 range_end   = std::min(access_start + access_size, 0LL);
+	for (s64 offset = range_start; offset < range_end; ++offset) {
+		const size_t bit = static_cast<size_t>(offset + static_cast<s64>(GuestRedZoneSize));
+		if ((operand.actions & ZYDIS_OPERAND_ACTION_MASK_READ) != 0) {
+			decoded.red_zone_use.set(bit);
+		}
+		if ((operand.actions & ZYDIS_OPERAND_ACTION_WRITE) != 0) {
+			decoded.red_zone_def.set(bit);
+		}
+	}
 }
 
 DecodedCodeInstruction DecodeCodeInstruction(uintptr_t address, uintptr_t end) {
@@ -263,19 +285,7 @@ DecodedCodeInstruction DecodeCodeInstruction(uintptr_t address, uintptr_t end) {
 			continue;
 		}
 
-		const s64 access_start = operand.mem.disp.value;
-		const s64 access_size  = std::max<s64>(operand.size / 8, 1);
-		const s64 range_start  = std::max(access_start, -static_cast<s64>(GuestRedZoneSize));
-		const s64 range_end    = std::min(access_start + access_size, 0LL);
-		for (s64 offset = range_start; offset < range_end; ++offset) {
-			const size_t bit = static_cast<size_t>(offset + static_cast<s64>(GuestRedZoneSize));
-			if ((operand.actions & ZYDIS_OPERAND_ACTION_MASK_READ) != 0) {
-				decoded.red_zone_use.set(bit);
-			}
-			if ((operand.actions & ZYDIS_OPERAND_ACTION_WRITE) != 0) {
-				decoded.red_zone_def.set(bit);
-			}
-		}
+		MarkRedZoneAccess(decoded, operand, operand.mem.disp.value);
 	}
 	return decoded;
 }
@@ -508,11 +518,6 @@ DecodedFunction DecodeFunction(uintptr_t function_start, uintptr_t function_end,
 					break;
 				}
 
-				function.uses_red_zone |= decoded.has_red_zone_operand;
-				function.requires_conservative_red_zone_tracking |=
-				    decoded.has_unmodeled_red_zone_operand ||
-				    (decoded.changes_stack_pointer && !decoded.stack_pointer_delta.has_value());
-
 				const uintptr_t next_address  = address + decoded.instruction.length;
 				const uintptr_t branch_target = GetRelativeTarget(decoded);
 				if (branch_target >= function_start && branch_target < function_end) {
@@ -549,6 +554,7 @@ DecodedFunction DecodeFunction(uintptr_t function_start, uintptr_t function_end,
 				continue;
 			}
 			resolved_indirect_branches.insert(branch_address);
+			function.jump_table_targets[branch_address] = *targets;
 			for (const uintptr_t target: *targets) {
 				function.branch_targets.insert(target);
 				if (!visited.contains(target)) {
@@ -563,6 +569,200 @@ DecodedFunction DecodeFunction(uintptr_t function_start, uintptr_t function_end,
 	}
 	function.has_indirect_branch = indirect_branches.size() != resolved_indirect_branches.size();
 	return function;
+}
+
+template <typename Visitor>
+void ForEachSuccessor(const DecodedFunction& function, const DecodedCodeInstruction& decoded,
+                      Visitor&& visit) {
+	const uintptr_t next_address  = decoded.address + decoded.instruction.length;
+	const uintptr_t branch_target = GetRelativeTarget(decoded);
+	if (decoded.instruction.meta.category == ZYDIS_CATEGORY_COND_BR) {
+		visit(next_address);
+		visit(branch_target);
+	} else if (decoded.instruction.meta.category == ZYDIS_CATEGORY_UNCOND_BR) {
+		if (const auto table = function.jump_table_targets.find(decoded.address);
+		    table != function.jump_table_targets.end()) {
+			for (const uintptr_t target: table->second) {
+				visit(target);
+			}
+		} else {
+			visit(branch_target);
+		}
+	} else if (!IsControlFlowTerminator(decoded.instruction)) {
+		visit(next_address);
+	}
+}
+
+// RBP - RSP before an instruction executes. Frame-pointer code addresses locals through RBP,
+// and a leaf function may keep some of them below RSP, inside the guest red zone.
+struct FrameOffset {
+	enum class State : u8 { Unvisited, NotFrame, Known, Unknown };
+
+	State state = State::Unvisited;
+	s64   value {};
+
+	static FrameOffset Known(s64 offset) { return {.state = State::Known, .value = offset}; }
+
+	bool operator==(const FrameOffset&) const = default;
+};
+
+FrameOffset MergeFrameOffsets(const FrameOffset& lhs, const FrameOffset& rhs) {
+	if (lhs.state == FrameOffset::State::Unvisited) {
+		return rhs;
+	}
+	if (rhs.state == FrameOffset::State::Unvisited || lhs == rhs) {
+		return lhs;
+	}
+	return {.state = FrameOffset::State::Unknown};
+}
+
+// Epilogues restore RSP from the frame pointer; that is a known delta once RBP - RSP is known.
+std::optional<s64> ResolveStackPointerDelta(const DecodedCodeInstruction& decoded,
+                                            const FrameOffset&            frame) {
+	if (decoded.stack_pointer_delta.has_value() || !decoded.changes_stack_pointer ||
+	    frame.state != FrameOffset::State::Known) {
+		return decoded.stack_pointer_delta;
+	}
+	const auto& operands = decoded.operands;
+	switch (decoded.instruction.mnemonic) {
+		case ZYDIS_MNEMONIC_LEAVE: return frame.value + static_cast<s64>(sizeof(u64));
+		case ZYDIS_MNEMONIC_MOV:
+			if (operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+			    operands[0].reg.value == ZYDIS_REGISTER_RSP &&
+			    operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+			    IsFramePointerRegister(operands[1].reg.value)) {
+				return frame.value;
+			}
+			break;
+		case ZYDIS_MNEMONIC_LEA:
+			if (operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+			    operands[0].reg.value == ZYDIS_REGISTER_RSP &&
+			    IsFramePointerRegister(operands[1].mem.base) &&
+			    operands[1].mem.index == ZYDIS_REGISTER_NONE) {
+				return frame.value + operands[1].mem.disp.value;
+			}
+			break;
+		default: break;
+	}
+	return std::nullopt;
+}
+
+FrameOffset NextFrameOffset(const DecodedCodeInstruction& decoded, const FrameOffset& frame) {
+	const auto& operands = decoded.operands;
+	if (operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+	    IsFramePointerRegister(operands[0].reg.value)) {
+		if (decoded.instruction.mnemonic == ZYDIS_MNEMONIC_MOV &&
+		    operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+		    operands[1].reg.value == ZYDIS_REGISTER_RSP) {
+			return FrameOffset::Known(0);
+		}
+		if (decoded.instruction.mnemonic == ZYDIS_MNEMONIC_LEA &&
+		    operands[1].mem.base == ZYDIS_REGISTER_RSP &&
+		    operands[1].mem.index == ZYDIS_REGISTER_NONE) {
+			return FrameOffset::Known(operands[1].mem.disp.value);
+		}
+	}
+	if (WritesRegister(decoded, ZYDIS_REGISTER_RBP)) {
+		return {.state = FrameOffset::State::NotFrame};
+	}
+	if (frame.state != FrameOffset::State::Known || !decoded.changes_stack_pointer) {
+		return frame;
+	}
+	const auto delta = ResolveStackPointerDelta(decoded, frame);
+	return delta ? FrameOffset::Known(frame.value - *delta)
+	             : FrameOffset {.state = FrameOffset::State::Unknown};
+}
+
+// Translate RBP-relative operands into the RSP-relative red-zone model used by the liveness pass.
+void AnnotateFramePointerAccesses(DecodedCodeInstruction& decoded, const FrameOffset& frame) {
+	const auto& instruction = decoded.instruction;
+	const bool  known_frame = frame.state == FrameOffset::State::Known;
+	const bool  maybe_frame = known_frame || frame.state == FrameOffset::State::Unknown ||
+	                         frame.state == FrameOffset::State::Unvisited;
+
+	if (known_frame) {
+		decoded.stack_pointer_delta = ResolveStackPointerDelta(decoded, frame);
+
+		// Frame slots live on the guest stack, which never takes a handled access fault.
+		constexpr ZydisOperandActions MemoryAccessMask =
+		    ZYDIS_OPERAND_ACTION_MASK_READ | ZYDIS_OPERAND_ACTION_MASK_WRITE;
+		bool accesses_memory = false;
+		for (u8 index = 0; index < instruction.operand_count; ++index) {
+			const auto& operand = decoded.operands[index];
+			accesses_memory |= operand.type == ZYDIS_OPERAND_TYPE_MEMORY &&
+			                   instruction.mnemonic != ZYDIS_MNEMONIC_LEA &&
+			                   instruction.mnemonic != ZYDIS_MNEMONIC_NOP &&
+			                   (operand.actions & MemoryAccessMask) != 0 &&
+			                   !IsStackPointerRegister(operand.mem.base) &&
+			                   !IsStackPointerRegister(operand.mem.index) &&
+			                   !IsFramePointerRegister(operand.mem.base);
+		}
+		decoded.accesses_memory = accesses_memory;
+	}
+
+	for (u8 index = 0; index < instruction.operand_count_visible; ++index) {
+		const auto& operand = decoded.operands[index];
+		if (!maybe_frame || operand.type != ZYDIS_OPERAND_TYPE_MEMORY ||
+		    !IsFramePointerRegister(operand.mem.base) ||
+		    instruction.mnemonic == ZYDIS_MNEMONIC_NOP) {
+			continue;
+		}
+		if (!known_frame) {
+			if (operand.mem.disp.value < 0) {
+				decoded.has_red_zone_operand           = true;
+				decoded.has_unmodeled_red_zone_operand = true;
+			}
+			continue;
+		}
+
+		const s64 access_start = frame.value + operand.mem.disp.value;
+		if (access_start >= 0) {
+			continue;
+		}
+		decoded.has_red_zone_operand = true;
+		if (instruction.mnemonic == ZYDIS_MNEMONIC_LEA ||
+		    operand.mem.index != ZYDIS_REGISTER_NONE) {
+			decoded.has_unmodeled_red_zone_operand = true;
+			continue;
+		}
+		MarkRedZoneAccess(decoded, operand, access_start);
+	}
+}
+
+void AnalyzeFramePointerRedZone(DecodedFunction& function, uintptr_t function_start) {
+	std::map<uintptr_t, FrameOffset> frame_in;
+	std::vector<uintptr_t>           worklist;
+	const auto propagate = [&](uintptr_t address, const FrameOffset& frame) {
+		if (!function.instructions.contains(address)) {
+			return;
+		}
+		auto&      current = frame_in[address];
+		const auto merged  = MergeFrameOffsets(current, frame);
+		if (merged != current) {
+			current = merged;
+			worklist.push_back(address);
+		}
+	};
+
+	propagate(function_start, {.state = FrameOffset::State::NotFrame});
+	while (!worklist.empty()) {
+		const uintptr_t address = worklist.back();
+		worklist.pop_back();
+		const auto& decoded = function.instructions.at(address);
+		const auto  next    = NextFrameOffset(decoded, frame_in.at(address));
+		ForEachSuccessor(function, decoded,
+		                 [&](uintptr_t successor) { propagate(successor, next); });
+	}
+
+	for (auto& [address, decoded]: function.instructions) {
+		const auto frame = frame_in.find(address);
+		AnnotateFramePointerAccesses(decoded,
+		                             frame != frame_in.end() ? frame->second : FrameOffset {});
+		function.uses_red_zone |= decoded.has_red_zone_operand;
+		function.requires_conservative_red_zone_tracking |=
+		    decoded.has_unmodeled_red_zone_operand ||
+		    (decoded.changes_stack_pointer && !decoded.stack_pointer_delta.has_value());
+	}
 }
 
 RedZoneMask TranslateRedZoneMask(const RedZoneMask& mask, s64 stack_pointer_delta) {
@@ -610,23 +810,11 @@ void AnalyzeRedZoneLiveness(DecodedFunction& function) {
 		for (size_t reverse_index = instructions.size(); reverse_index-- > 0;) {
 			const auto& decoded = *instructions[reverse_index];
 			RedZoneMask live_out;
-
-			const auto add_successor = [&](uintptr_t address) {
+			ForEachSuccessor(function, decoded, [&](uintptr_t address) {
 				if (const auto successor = indices.find(address); successor != indices.end()) {
 					live_out |= live_in[successor->second];
 				}
-			};
-
-			const uintptr_t next_address  = decoded.address + decoded.instruction.length;
-			const uintptr_t branch_target = GetRelativeTarget(decoded);
-			if (decoded.instruction.meta.category == ZYDIS_CATEGORY_COND_BR) {
-				add_successor(next_address);
-				add_successor(branch_target);
-			} else if (decoded.instruction.meta.category == ZYDIS_CATEGORY_UNCOND_BR) {
-				add_successor(branch_target);
-			} else if (!IsControlFlowTerminator(decoded.instruction)) {
-				add_successor(next_address);
-			}
+			});
 
 			const RedZoneMask translated_live_out =
 			    decoded.stack_pointer_delta.has_value()
@@ -1274,6 +1462,7 @@ RedZonePatchResult PatchGuestInstructions(u64 segment_addr, u64 segment_size,
 
 		++result.function_count;
 		auto function = DecodeFunction(function_start, function_end, segment_addr, segment_end);
+		AnalyzeFramePointerRedZone(function, function_start);
 		AnalyzeRedZoneLiveness(function);
 		result.instruction_count += function.instructions.size();
 

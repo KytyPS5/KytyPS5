@@ -120,6 +120,7 @@ struct DecodedCodeInstruction {
 	RedZoneMask                                              red_zone_def {};
 	RedZoneMask                                              red_zone_live {};
 	bool                                                     accesses_memory {};
+	bool                                                     may_emulate_instruction {};
 	bool                                                     uses_stack_pointer {};
 	bool                                                     has_red_zone_operand {};
 	bool                                                     has_unmodeled_red_zone_operand {};
@@ -144,6 +145,30 @@ struct InstructionRewrite {
 bool IsStackPointerRegister(ZydisRegister reg) {
 	return reg != ZYDIS_REGISTER_NONE &&
 	       ZydisRegisterGetLargestEnclosing(ZYDIS_MACHINE_MODE_LONG_64, reg) == ZYDIS_REGISTER_RSP;
+}
+
+bool MayEmulateInstruction(ZydisMnemonic mnemonic) {
+	// Windows exception dispatch may overwrite the SysV red zone before the
+	// instruction emulator sees a register-only unsupported instruction.
+	// Keep those #UD sites protected just like ordinary memory accesses.
+	switch (mnemonic) {
+		case ZYDIS_MNEMONIC_EXTRQ:
+		case ZYDIS_MNEMONIC_INSERTQ:
+		case ZYDIS_MNEMONIC_MOVNTSD:
+		case ZYDIS_MNEMONIC_MOVNTSS:
+		case ZYDIS_MNEMONIC_CLZERO:
+		case ZYDIS_MNEMONIC_RDPRU:
+		case ZYDIS_MNEMONIC_MONITORX:
+		case ZYDIS_MNEMONIC_MWAITX:
+		case ZYDIS_MNEMONIC_SHA1NEXTE:
+		case ZYDIS_MNEMONIC_SHA1MSG1:
+		case ZYDIS_MNEMONIC_SHA1MSG2:
+		case ZYDIS_MNEMONIC_SHA1RNDS4:
+		case ZYDIS_MNEMONIC_SHA256RNDS2:
+		case ZYDIS_MNEMONIC_SHA256MSG1:
+		case ZYDIS_MNEMONIC_SHA256MSG2: return true;
+		default: return false;
+	}
 }
 
 bool IsControlFlowTerminator(const ZydisDecodedInstruction& instruction) {
@@ -179,6 +204,7 @@ DecodedCodeInstruction DecodeCodeInstruction(uintptr_t address, uintptr_t end) {
 		decoded.instruction.length = 0;
 		return decoded;
 	}
+	decoded.may_emulate_instruction = MayEmulateInstruction(decoded.instruction.mnemonic);
 
 	for (u8 index = 0; index < decoded.instruction.operand_count; ++index) {
 		const auto& operand = decoded.operands[index];
@@ -745,7 +771,8 @@ void CollectRedZoneMemoryInstructions(const DecodedFunction& function,
 		return;
 	}
 	for (const auto& [address, decoded]: function.instructions) {
-		if (!decoded.accesses_memory || !decoded.red_zone_live.any() ||
+		if ((!decoded.accesses_memory && !decoded.may_emulate_instruction) ||
+		    !decoded.red_zone_live.any() ||
 		    rewrite_sites.contains(address)) {
 			continue;
 		}
@@ -878,8 +905,10 @@ void RelocateRedZoneInstructions(PatchModule* module, const DecodedFunction& fun
 			if (rewrite == rewrite_sites.end()) {
 				continue;
 			}
-			if (rewrite->second.protect_red_zone && decoded->accesses_memory) {
-				++result.patched_memory_instruction_count;
+			if (rewrite->second.protect_red_zone) {
+				if (decoded->accesses_memory) {
+					++result.patched_memory_instruction_count;
+				}
 			}
 		}
 	};

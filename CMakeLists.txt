@@ -461,6 +461,7 @@ target_include_directories(resource_tracking_tests PRIVATE ${inc_headers})
 add_executable(audio_out2_port_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/AudioOut2PortTests.cpp"
 	"${KYTY_SOURCE_DIR}/libs/libAudio2.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
 	"${KYTY_SOURCE_DIR}/loader/timer.cpp"
 )
 target_link_libraries(audio_out2_port_tests common fmt::fmt)

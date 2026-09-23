@@ -2,6 +2,7 @@
 #include "common/common.h"
 #include "common/logging/log.h"
 #include "common/threads.h"
+#include "graphics/host_gpu/hostMemory.h"
 #include "kernel/pthread.h"
 #include "libs/audio.h"
 #include "libs/audio_internal.h"
@@ -356,14 +357,16 @@ static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, bool block
 	std::vector<AudioInternal::OutputParam> params;
 	params.reserve(AudioInternal::OUT_PORTS_MAX);
 
-	g_audioout2_port_mutex.Lock();
+	// Keep the port records alive until AudioOutOutputs has consumed both the audio handle and PCM
+	// pointer. Releasing this mutex before submitting lets AudioOut2PortDestroy clear the record
+	// and close the underlying AudioOut port while this thread is still using it.
+	Common::LockGuard lock(g_audioout2_port_mutex);
 	for (const auto& state: g_audioout2_ports) {
 		if (state.used && state.context == ctx && state.audio_handle > 0 &&
 		    state.pcm_data != nullptr && params.size() < AudioInternal::OUT_PORTS_MAX) {
 			params.push_back(AudioInternal::OutputParam {state.audio_handle, state.pcm_data});
 		}
 	}
-	g_audioout2_port_mutex.Unlock();
 
 	if (params.empty()) {
 		return;
@@ -422,6 +425,18 @@ int KYTY_SYSV_ABI AudioOut2ContextCreate(const AudioOut2ContextParam* params, vo
 
 	EXIT_NOT_IMPLEMENTED(params == nullptr);
 	EXIT_NOT_IMPLEMENTED(ctx == nullptr);
+
+	// The real AudioOut2 implementation initializes the caller-provided context arena. Leaving
+	// this memory untouched lets the guest audio worker consume allocator poison (deadbeef/afaf)
+	// as internal pointers, which later becomes an access violation on SceSndzAudioOutMain.
+	if (buffer != nullptr && buffer_size != 0) {
+		constexpr size_t MAX_CONTEXT_INIT_SIZE = 16u * 1024u * 1024u;
+		const auto       init_size = std::min(buffer_size, MAX_CONTEXT_INIT_SIZE);
+		if (!Graphics::HostMemoryRangeIsReadable(reinterpret_cast<uint64_t>(buffer), init_size)) {
+			return AUDIO_OUT2_ERROR_INVALID_PARAM;
+		}
+		std::memset(buffer, 0, init_size);
+	}
 
 	*ctx = g_audioout2_next_context.fetch_add(1, std::memory_order_relaxed);
 
@@ -663,12 +678,26 @@ int KYTY_SYSV_ABI AudioOut2PortDestroy(AudioOut2PortHandle port) {
 int KYTY_SYSV_ABI AudioOut2PortSetAttributes(AudioOut2PortHandle       port,
                                              const AudioOut2Attribute* attributes, uint32_t num) {
 	EXIT_NOT_IMPLEMENTED(num != 0 && attributes == nullptr);
+	if (num == 0) {
+		return OK;
+	}
+
+	// AudioOut2 attributes are guest-owned. Reject a malformed/stale pointer before memcpy so an
+	// invalid PCM attribute cannot terminate the emulator from the game's audio worker.
+	constexpr uint32_t MAX_ATTRIBUTES = 64;
+	if (num > MAX_ATTRIBUTES ||
+	    !Graphics::HostMemoryRangeIsReadable(reinterpret_cast<uint64_t>(attributes),
+                                          sizeof(AudioOut2Attribute) * static_cast<uint64_t>(num))) {
+		return AUDIO_OUT2_ERROR_INVALID_PARAM;
+	}
 
 	const void* pcm_data = nullptr;
 	bool        has_pcm  = false;
 	for (uint32_t i = 0; i < num; i++) {
 		if (attributes[i].attribute_id == AUDIO_OUT2_PORT_ATTRIBUTE_ID_PCM &&
-		    attributes[i].value != nullptr && attributes[i].value_size >= sizeof(AudioOut2Pcm)) {
+		    attributes[i].value != nullptr && attributes[i].value_size >= sizeof(AudioOut2Pcm) &&
+		    Graphics::HostMemoryRangeIsReadable(reinterpret_cast<uint64_t>(attributes[i].value),
+	                                            sizeof(AudioOut2Pcm))) {
 			AudioOut2Pcm pcm {};
 			std::memcpy(&pcm, attributes[i].value, sizeof(AudioOut2Pcm));
 			pcm_data = pcm.data;

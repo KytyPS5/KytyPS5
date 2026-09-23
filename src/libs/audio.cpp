@@ -7,6 +7,7 @@
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
+#include "graphics/host_gpu/hostMemory.h"
 #include "kernel/pthread.h"
 #include "kernel/semaphore.h"
 #include "libs/ajm/atrac9_decoder.h"
@@ -17,7 +18,6 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
-#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <limits>
@@ -368,6 +368,29 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking) {
 		return false;
 	}
 
+	// AudioOut2 receives PCM pointers owned by the guest. They may be stale when a guest audio
+	// worker races a port update/destroy. Validate the complete source span before SDL or the
+	// conversion path dereferences it; AudioOutOutputs holds m_mutex while reaching this point.
+	const auto frames           = static_cast<uint64_t>(port->samples_num);
+	const auto channels         = static_cast<uint64_t>(port->channels_num);
+	const auto bytes_per_sample = static_cast<uint64_t>(BytesPerSample(port->format));
+	if (frames == 0 || channels == 0 || bytes_per_sample == 0 ||
+	    channels > UINT64_MAX / bytes_per_sample ||
+	    frames > UINT64_MAX / (channels * bytes_per_sample)) {
+		return false;
+	}
+	const auto source_size = frames * channels * bytes_per_sample;
+	if (!Graphics::HostMemoryRangeIsReadable(reinterpret_cast<uint64_t>(data), source_size)) {
+		static std::atomic<uint64_t> invalid_pcm_count {0};
+		const auto count = invalid_pcm_count.fetch_add(1, std::memory_order_relaxed) + 1;
+		if (count <= 4 || (count & (count - 1)) == 0) {
+			LOGF("AudioOut: ignoring unreadable PCM buffer=0x%016" PRIx64 " size=%" PRIu64
+			     " (count=%" PRIu64 ")\n",
+			     reinterpret_cast<uint64_t>(data), source_size, count);
+		}
+		return false;
+	}
+
 	std::vector<uint8_t> prepared_buffer;
 	const void*          prepared_data   = PrepareOutputBuffer(*port, data, &prepared_buffer);
 	const auto           output_channels = OutputChannels(*port);
@@ -540,7 +563,19 @@ bool Audio::AudioOutSetVolume(Id handle, uint32_t bitflag, const int* volume) {
 
 uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking) {
 	EXIT_NOT_IMPLEMENTED(num == 0);
-	EXIT_NOT_IMPLEMENTED(!AudioOutValid(params[0].handle));
+
+	// Keep PortOut records stable while QueueSdlAudio reads them. AudioOut2 can submit audio from
+	// one guest worker while another worker destroys/recreates a port; validating first and then
+	// releasing m_mutex leaves a use-after-close window around SDL and the PCM pointer.
+	Common::LockGuard lock(m_mutex);
+	const auto         is_valid = [this](Id handle) {
+		const auto id = handle.GetId();
+		return id >= 0 && id < OUT_PORTS_MAX && m_out_ports[id].used;
+	};
+	EXIT_NOT_IMPLEMENTED(!is_valid(params[0].handle));
+	for (uint32_t i = 1; i < num; i++) {
+		EXIT_NOT_IMPLEMENTED(!is_valid(params[i].handle));
+	}
 
 	const auto& first_port = m_out_ports[params[0].handle.GetId()];
 

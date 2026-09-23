@@ -11,12 +11,16 @@
 #endif
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#include <intrin.h> // IWYU pragma: keep
 #include <windows.h> // IWYU pragma: keep
 #elif defined(__APPLE__)
 #include <sys/ucontext.h>
 #else
 #include <sched.h>
 #include <ucontext.h>
+#if defined(__x86_64__)
+#include <x86intrin.h> // IWYU pragma: keep
+#endif
 #endif
 
 namespace Loader::X64InstructionEmulator {
@@ -69,6 +73,25 @@ static uint64_t InsertBitField(uint64_t dst, uint64_t src, uint32_t length, uint
 struct XmmWords {
 	uint32_t w[4];
 };
+
+
+static uint64_t ReadHostTsc() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS || (defined(__x86_64__) && !defined(__APPLE__))
+	return __rdtsc();
+#else
+	return 0;
+#endif
+}
+
+static uint64_t EmulateRdpru(uint32_t selector) {
+	// RDPRU exposes AMD performance counters in user mode. Kyty only needs a
+	// stable monotonic source for the timing paths that use this instruction.
+	switch (selector) {
+		case 0:
+		case 1: return ReadHostTsc();
+		default: return 0;
+	}
+}
 
 static void Sha1Msg1(XmmWords& dest, const XmmWords& src2) {
 	const uint32_t w0 = dest.w[3];
@@ -380,6 +403,98 @@ static bool ResolveShaNiMemoryAddress(const uint8_t* rip, const ShaNiInsn&    in
 	return true;
 }
 
+// Decode the memory operand of the SSE4a MOVNTSS/MOVNTSD instructions. The
+// host Intel CPU raises #UD for these AMD instructions, so the exception path
+// has to reproduce the guest store without relying on the non-temporal hint.
+static bool DecodeSse4aMemoryOperand(const uint8_t* rip, size_t modrm_offset, uint8_t rex,
+                                     size_t& instruction_length) {
+	const uint8_t modrm = rip[modrm_offset];
+	const uint8_t mod   = modrm >> 6u;
+	const uint8_t rm    = modrm & 0x07u;
+	if (mod == 3u) {
+		return false;
+	}
+
+	size_t offset = modrm_offset + 1;
+	if (rm == 4u) {
+		const uint8_t sib      = rip[offset++];
+		const uint8_t base_low = sib & 0x07u;
+		const bool    has_base = mod != 0u || base_low != 5u || (rex & 0x01u) != 0;
+		if (!has_base || mod == 2u) {
+			offset += sizeof(int32_t);
+		} else if (mod == 1u) {
+			offset += sizeof(int8_t);
+		}
+	} else if (mod == 0u && rm == 5u && (rex & 0x01u) == 0) {
+		// RIP-relative addressing.
+		offset += sizeof(int32_t);
+	} else if (mod == 1u) {
+		offset += sizeof(int8_t);
+	} else if (mod == 2u) {
+		offset += sizeof(int32_t);
+	}
+
+	instruction_length = offset;
+	return true;
+}
+
+static bool ResolveSse4aMemoryAddress(const uint8_t* rip, size_t modrm_offset, uint8_t rex,
+                                      size_t instruction_length, const uint64_t (&gpr)[16],
+                                      void*& address) {
+	const uint8_t modrm = rip[modrm_offset];
+	const uint8_t mod   = modrm >> 6u;
+	const uint8_t rm    = modrm & 0x07u;
+	if (mod == 3u) {
+		return false;
+	}
+
+	size_t   offset = modrm_offset + 1;
+	uint64_t result = 0;
+
+	if (rm == 4u) {
+		const uint8_t sib       = rip[offset++];
+		const uint8_t scale     = sib >> 6u;
+		const uint8_t index_low = (sib >> 3u) & 0x07u;
+		const uint8_t base_low  = sib & 0x07u;
+		const bool    has_index = index_low != 4u || (rex & 0x02u) != 0;
+		const bool    has_base  = mod != 0u || base_low != 5u || (rex & 0x01u) != 0;
+
+		if (has_base) {
+			const uint8_t base = base_low | ((rex & 0x01u) << 3u);
+			result += gpr[base];
+		}
+		if (has_index) {
+			const uint8_t index = index_low | ((rex & 0x02u) << 2u);
+			result += gpr[index] << scale;
+		}
+		if (!has_base) {
+			int32_t displacement = 0;
+			std::memcpy(&displacement, rip + offset, sizeof(displacement));
+			result += static_cast<uint64_t>(static_cast<int64_t>(displacement));
+			offset += sizeof(displacement);
+		}
+	} else if (mod == 0u && rm == 5u && (rex & 0x01u) == 0) {
+		int32_t displacement = 0;
+		std::memcpy(&displacement, rip + offset, sizeof(displacement));
+		result = reinterpret_cast<uint64_t>(rip + instruction_length) +
+		         static_cast<uint64_t>(static_cast<int64_t>(displacement));
+	} else {
+		const uint8_t base = rm | ((rex & 0x01u) << 3u);
+		result             = gpr[base];
+	}
+
+	if (mod == 1u) {
+		result += static_cast<uint64_t>(static_cast<int64_t>(static_cast<int8_t>(rip[offset])));
+	} else if (mod == 2u) {
+		int32_t displacement = 0;
+		std::memcpy(&displacement, rip + offset, sizeof(displacement));
+		result += static_cast<uint64_t>(static_cast<int64_t>(displacement));
+	}
+
+	address = reinterpret_cast<void*>(result);
+	return true;
+}
+
 static bool ExecuteShaNiInsn(const ShaNiInsn& insn, const XmmWords& src2, const XmmWords& xmm0,
                              XmmWords& dest) {
 	if (insn.escape == 0x3a && insn.opcode == 0xcc) {
@@ -405,7 +520,35 @@ struct Context {
 
 	[[nodiscard]] uint64_t Rip() const { return native->Rip; }
 	void                   Advance(size_t length) { native->Rip += length; }
-	[[nodiscard]] void*    Xmm(uint8_t index) const { return &native->Xmm0 + index; }
+	[[nodiscard]] void*    Xmm(uint8_t index) const {
+		switch (index) {
+#define KYTY_CONTEXT_XMM_CASE(index) \
+			case index: return &native->Xmm##index;
+			KYTY_CONTEXT_XMM_CASE(0)
+			KYTY_CONTEXT_XMM_CASE(1)
+			KYTY_CONTEXT_XMM_CASE(2)
+			KYTY_CONTEXT_XMM_CASE(3)
+			KYTY_CONTEXT_XMM_CASE(4)
+			KYTY_CONTEXT_XMM_CASE(5)
+			KYTY_CONTEXT_XMM_CASE(6)
+			KYTY_CONTEXT_XMM_CASE(7)
+			KYTY_CONTEXT_XMM_CASE(8)
+			KYTY_CONTEXT_XMM_CASE(9)
+			KYTY_CONTEXT_XMM_CASE(10)
+			KYTY_CONTEXT_XMM_CASE(11)
+			KYTY_CONTEXT_XMM_CASE(12)
+			KYTY_CONTEXT_XMM_CASE(13)
+			KYTY_CONTEXT_XMM_CASE(14)
+			KYTY_CONTEXT_XMM_CASE(15)
+#undef KYTY_CONTEXT_XMM_CASE
+			default: return nullptr;
+		}
+	}
+
+	void StoreRdpru(uint64_t value) {
+		native->Rax = static_cast<uint32_t>(value);
+		native->Rdx = static_cast<uint32_t>(value >> 32u);
+	}
 
 	void LoadGprs(uint64_t (&gpr)[16]) const {
 		const uint64_t registers[] = {native->Rax, native->Rcx, native->Rdx, native->Rbx,
@@ -437,6 +580,20 @@ struct Context {
 	}
 	void Advance(size_t length) {
 		native->uc_mcontext->__ss.__rip += static_cast<uint64_t>(length);
+	}
+	void LoadGprs(uint64_t (&gpr)[16]) const {
+		const auto* ss = &native->uc_mcontext->__ss;
+		const uint64_t registers[] = {
+			static_cast<uint64_t>(ss->__rax), static_cast<uint64_t>(ss->__rcx),
+			static_cast<uint64_t>(ss->__rdx), static_cast<uint64_t>(ss->__rbx),
+			static_cast<uint64_t>(ss->__rsp), static_cast<uint64_t>(ss->__rbp),
+			static_cast<uint64_t>(ss->__rsi), static_cast<uint64_t>(ss->__rdi),
+			static_cast<uint64_t>(ss->__r8),  static_cast<uint64_t>(ss->__r9),
+			static_cast<uint64_t>(ss->__r10), static_cast<uint64_t>(ss->__r11),
+			static_cast<uint64_t>(ss->__r12), static_cast<uint64_t>(ss->__r13),
+			static_cast<uint64_t>(ss->__r14), static_cast<uint64_t>(ss->__r15),
+		};
+		std::memcpy(gpr, registers, sizeof(gpr));
 	}
 	// Darwin names the XMM file __fpu_xmm0..__fpu_xmm15 instead of exposing an array.
 	[[nodiscard]] void* Xmm(uint8_t index) const {
@@ -506,6 +663,12 @@ struct Context {
 			std::memset(state + 576 + index * 16, 0, 16);
 		}
 	}
+
+	void StoreRdpru(uint64_t value) {
+		native->uc_mcontext.gregs[REG_RAX] = static_cast<greg_t>(static_cast<uint32_t>(value));
+		native->uc_mcontext.gregs[REG_RDX] =
+		    static_cast<greg_t>(static_cast<uint32_t>(value >> 32u));
+	}
 #endif
 };
 
@@ -563,7 +726,7 @@ static bool TryEmulateShaNi(Context& context) {
 static bool TryEmulateSse4a(Context& context) {
 	const auto*   rip    = reinterpret_cast<const uint8_t*>(context.Rip());
 	const uint8_t prefix = rip[0];
-	if (prefix != 0x66 && prefix != 0xf2) {
+	if (prefix != 0x66 && prefix != 0xf2 && prefix != 0xf3) {
 		return false;
 	}
 
@@ -575,18 +738,54 @@ static bool TryEmulateSse4a(Context& context) {
 	if (rip[offset] != 0x0f) {
 		return false;
 	}
-	const bool register_extract = prefix == 0x66 && rip[offset + 1] == 0x79;
-	if (rip[offset + 1] != 0x78 && !register_extract) {
+	const uint8_t opcode           = rip[offset + 1];
+	const bool    register_extract = prefix == 0x66 && opcode == 0x79;
+	if (opcode != 0x78 && !register_extract && opcode != 0x2b) {
 		return false;
 	}
 
 	const uint8_t modrm = rip[offset + 2];
+	const uint8_t reg   = ((modrm >> 3u) & 0x07u) | ((rex & 0x04u) << 1u);
+
+	if (opcode == 0x2b) {
+		// MOVNTSD/MOVNTSS have a memory destination and an XMM source in
+		// ModRM.reg. The non-temporal hint is not guest-visible here.
+		if (prefix != 0xf2 && prefix != 0xf3) {
+			return false;
+		}
+		size_t instruction_length = 0;
+		if (!DecodeSse4aMemoryOperand(rip, offset + 2, rex, instruction_length)) {
+			return false;
+		}
+
+		uint64_t gpr[16] {};
+		context.LoadGprs(gpr);
+		void* address = nullptr;
+		if (!ResolveSse4aMemoryAddress(rip, offset + 2, rex, instruction_length, gpr, address)) {
+			return false;
+		}
+
+		auto* src_xmm = context.Xmm(reg);
+		if (src_xmm == nullptr) {
+			return false;
+		}
+		uint64_t source = 0;
+		std::memcpy(&source, src_xmm, sizeof(source));
+		if (prefix == 0xf2) {
+			std::memcpy(address, &source, sizeof(source));
+		} else {
+			const uint32_t value = static_cast<uint32_t>(source);
+			std::memcpy(address, &value, sizeof(value));
+		}
+		context.Advance(instruction_length);
+		return true;
+	}
+
 	if ((modrm & 0xc0u) != 0xc0u) {
 		return false;
 	}
 
-	const uint8_t reg = ((modrm >> 3u) & 0x07u) | ((rex & 0x04u) << 1u);
-	const uint8_t rm  = (modrm & 0x07u) | ((rex & 0x01u) << 3u);
+	const uint8_t rm = (modrm & 0x07u) | ((rex & 0x01u) << 3u);
 
 	// Immediate EXTRQ encodes its destination in r/m; the two-register form uses reg.
 	uint8_t dest_index = reg;
@@ -642,6 +841,32 @@ static bool TryEmulateMonitorxMwaitx(Context& context) {
 	}
 	context.Advance(3);
 	return true;
+}
+
+static bool TryEmulateAmdSystem(Context& context) {
+	const auto* rip = reinterpret_cast<const uint8_t*>(context.Rip());
+	if (rip[0] != 0x0f || rip[1] != 0x01) {
+		return false;
+	}
+
+	uint64_t gpr[16] {};
+	context.LoadGprs(gpr);
+	switch (rip[2]) {
+		case 0xfc: { // CLZERO: clear the 64-byte cache line containing RAX.
+			const uint64_t address = gpr[0] & ~uint64_t {63};
+			if (address == 0) {
+				return false;
+			}
+			std::memset(reinterpret_cast<void*>(address), 0, 64);
+			context.Advance(3);
+			return true;
+		}
+		case 0xfd: // RDPRU: return an approximate host counter in EDX:EAX.
+			context.StoreRdpru(EmulateRdpru(static_cast<uint32_t>(gpr[1])));
+			context.Advance(3);
+			return true;
+		default: return false;
+	}
 }
 
 static uint32_t ReciprocalSquareRoot(uint32_t bits) {
@@ -772,7 +997,8 @@ bool TryEmulate(void* native_context) {
 	if (TryEmulateReciprocalSquareRoot(context)) {
 		return true;
 	}
-	return TryEmulateMonitorxMwaitx(context) || TryEmulateSse4a(context) ||
+	return TryEmulateMonitorxMwaitx(context) || TryEmulateAmdSystem(context) ||
+	       TryEmulateSse4a(context) ||
 	       TryEmulateShaNi(context);
 #else
 	return TryEmulateSse4a(context);

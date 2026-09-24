@@ -6,11 +6,11 @@ DppTargetLane EmitDppPermTargetLane(EmitterState& state, uint32_t subid, uint32_
                                     uint32_t lane_bits) {
 	const auto lane_mask  = (1u << lane_bits) - 1u;
 	const auto group_base = state.builder.AllocateId();
-	const auto lane      = state.builder.AllocateId();
-	const auto shift     = state.builder.AllocateId();
-	const auto selected0 = state.builder.AllocateId();
-	const auto selected  = state.builder.AllocateId();
-	const auto target    = state.builder.AllocateId();
+	const auto lane       = state.builder.AllocateId();
+	const auto shift      = state.builder.AllocateId();
+	const auto selected0  = state.builder.AllocateId();
+	const auto selected   = state.builder.AllocateId();
+	const auto target     = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpBitwiseAnd, TypeU32(state), group_base, subid,
 	                          ConstantU32(state, ~lane_mask));
 	state.builder.AddFunction(spv::OpBitwiseAnd, TypeU32(state), lane, subid,
@@ -92,7 +92,7 @@ DppTargetLane EmitDppMirrorTargetLane(EmitterState& state, uint32_t subid, bool 
 }
 
 DppTargetLane EmitDppTargetLane(EmitterState& state, const IR::DppMoveFlags& flags) {
-	const auto subid = EmitSubgroupLocalInvocationId(state);
+	const auto subid   = EmitSubgroupLocalInvocationId(state);
 	const auto control = flags.control;
 	if (flags.dpp8) {
 		return EmitDppPermTargetLane(state, subid, control, 3u);
@@ -124,14 +124,49 @@ DppTargetLane EmitDppTargetLane(EmitterState& state, const IR::DppMoveFlags& fla
 	return {subid, ConstantBool(state, true)};
 }
 
-uint32_t EmitSubgroupLocalInvocationId(EmitterState& state) {
+static uint32_t EmitHostSubgroupLocalInvocationId(EmitterState& state) {
 	if (state.subgroup_local_invocation_id_variable == 0) {
 		EXIT("SubgroupLocalInvocationId was not declared before SPIR-V function emission\n");
 	}
 	const auto value = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value,
 	                          state.subgroup_local_invocation_id_variable);
+	return value;
+}
+
+uint32_t EmitSubgroupLocalInvocationId(EmitterState& state) {
+	const auto value = EmitHostSubgroupLocalInvocationId(state);
+	if (state.packed_wave32) {
+		return EmitBinaryU32(state, spv::OpBitwiseAnd, value, ConstantU32(state, 31));
+	}
 	return state.lane_half == 0 ? value : EmitAddU32(state, value, ConstantU32(state, 32));
+}
+
+uint32_t EmitPhysicalSubgroupLane(EmitterState& state, uint32_t lane) {
+	if (!state.packed_wave32) {
+		return lane;
+	}
+	const auto half = EmitBinaryU32(
+	    state, spv::OpBitwiseAnd, EmitHostSubgroupLocalInvocationId(state), ConstantU32(state, 32));
+	const auto local = EmitBinaryU32(state, spv::OpBitwiseAnd, lane, ConstantU32(state, 31));
+	return EmitBinaryU32(state, spv::OpBitwiseOr, local, half);
+}
+
+uint32_t EmitGuestBallot(EmitterState& state, uint32_t ballot) {
+	if (!state.packed_wave32) {
+		return ballot;
+	}
+	const auto low  = state.builder.AllocateId();
+	const auto high = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), low, ballot, 0);
+	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), high, ballot, 1);
+	const auto upper  = Binary(state, spv::OpUGreaterThanEqual, TypeBool(state),
+	                           EmitHostSubgroupLocalInvocationId(state), ConstantU32(state, 32));
+	const auto word   = Select(state, TypeU32(state), upper, high, low);
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 4), result, word,
+	                          ConstantU32(state, 0), ConstantU32(state, 0), ConstantU32(state, 0));
+	return result;
 }
 
 uint32_t InputVariableForKind(const EmitterState& state, IR::StageInputKind kind) {
@@ -184,8 +219,8 @@ uint32_t EmitLocalInvocationIndex(EmitterState& state) {
 
 uint32_t EmitVertexParameterComponentU32(EmitterState& state, const InputBinding& input,
                                          uint32_t component) {
-	const auto count = VertexParameterComponentCount(input);
-	const auto kind  = VertexParameterScalarKind(state, input.location);
+	const auto count       = VertexParameterComponentCount(input);
+	const auto kind        = VertexParameterScalarKind(state, input.location);
 	const auto scalar_type = VertexParameterScalarType(state, kind);
 	uint32_t   raw         = state.builder.AllocateId();
 	if (count == 1u) {
@@ -211,7 +246,7 @@ uint32_t EmitSubgroupLaneActiveBool(EmitterState& state, uint32_t lane) {
 	const auto active_ballot = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4), active_ballot,
 	                          ConstantU32(state, spv::ScopeSubgroup), ConstantBool(state, true));
-	return EmitBallotLaneActiveBool(state, active_ballot, lane);
+	return EmitBallotLaneActiveBool(state, EmitGuestBallot(state, active_ballot), lane);
 }
 uint32_t EmitBallotLaneActiveBool(EmitterState& state, uint32_t active_ballot, uint32_t lane) {
 	const auto low = state.builder.AllocateId();

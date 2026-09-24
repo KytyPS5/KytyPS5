@@ -9744,6 +9744,43 @@ void TestMergedShaderUserDataSnapshot() {
         "captured triangle-fan GS configuration lost its subgroup assembly limits");
 }
 
+void TestPassthroughShaderUserDataBase() {
+  using namespace ShaderRecompiler;
+  const uint32_t code[] = {
+      EncodeSopp(0x0a), EncodeSopp(0x10, 9),
+      EncodeSop2(0x27, 4, 2, 255), (9u << 16u) | 22u,
+      EncodeSop2(0x27, 5, 2, 255), (9u << 16u) | 12u,
+      EncodeExp0(0x14, 0x1), EncodeExp1(0, 0, 0, 0), EncodeSopp(0x01),
+  };
+  HW::VertexShaderInfo regs{};
+  regs.es_regs.data_addr = reinterpret_cast<uint64_t>(code);
+  regs.gs_regs.rsrc1.gs_vgpr_component_count = 3;
+  regs.gs_regs.rsrc2.es_vgpr_component_count = 3;
+  regs.gs_regs.rsrc2.user_sgpr = 4;
+  for (uint32_t i = 0; i < 4; ++i) regs.gs_user_sgpr.value[i] = 0x10001000u + i;
+  ShaderMappedData mapped{};
+  mapped.type = Prospero::ShaderBinaryType::kGs;
+  mapped.code_size_bytes = sizeof(code);
+  ShaderMapUserData(regs.es_regs.data_addr, mapped);
+  HW::Context context;
+  context.SetMaxOutputPerSubgroup(192);
+  HW::UserConfig user_config;
+  user_config.SetPrimitiveType(Prospero::PrimitiveType::kTriList);
+  for (const uint32_t stages : {0u, 0x00400000u}) {
+    context.SetShaderStages(stages);
+    ShaderVertexInputInfo input{};
+    const auto params = PrepareProgram(regs, context, user_config, input);
+    Check(input.logical_stage == ShaderType::Mesh && input.mesh.passthrough_alloc &&
+              input.mesh.wave_size == (stages == 0u ? 64u : 32u) &&
+              params.user_data_count == 12u &&
+              std::ranges::all_of(std::span(params.user_data).first(8),
+                                  [](uint32_t word) { return word == 0u; }) &&
+              std::equal(std::begin(regs.gs_user_sgpr.value),
+                         std::begin(regs.gs_user_sgpr.value) + 4, params.user_data.begin() + 8),
+          "passthrough shader did not place user SGPRs at s8");
+  }
+}
+
 void TestEmbeddedFetchPreservesSharedScalarLoad() {
   using namespace ShaderRecompiler;
   const uint32_t code[] = {
@@ -10024,6 +10061,194 @@ void TestMeshInputAssembly() {
               vgprs[1] == test.third * 4 && vgprs[5] == test.vertex_id && vgprs[8] == 9,
           "mesh prolog changed input assembly, wave counts, vertex ID, or instance ID");
   }
+}
+
+void TestMeshPassthrough(uint32_t wave_size, uint32_t lane, uint32_t expected_packed_indices) {
+  using namespace ShaderRecompiler;
+  using namespace ShaderRecompiler::IR;
+  const uint32_t shader[] = {
+      EncodeSMovB32(12, 255), 0x1003u,
+      EncodeSMovB32(124, 12), EncodeSopp(0x10, 9),
+      EncodeExp0(0x0c, 0xf, false), EncodeExp1(0, 0, 0, 0),
+      EncodeExp0(0x14, 0x1), EncodeExp1(0, 0, 0, 0),
+      EncodeSopp(0x01),
+  };
+  ShaderVertexInputInfo input{};
+  input.logical_stage = ShaderType::Mesh;
+  input.mesh.wave_size = wave_size;
+  input.mesh.host_subgroup_size = 32;
+  input.mesh.threads_num[0] = 64;
+  input.mesh.threads_num[1] = input.mesh.threads_num[2] = 1;
+  input.mesh.input_primitive = static_cast<uint32_t>(Prospero::PrimitiveType::kTriList);
+  input.mesh.primitives_per_group = 1;
+  input.mesh.vertices_per_group = 3;
+  input.mesh.max_primitives = 1;
+  input.mesh.max_vertices = 3;
+  input.mesh.passthrough_alloc = true;
+  CompileOptions options{};
+  options.stage = ShaderType::Mesh;
+  options.wave_size = wave_size;
+  options.input_info.vertex = &input;
+  const auto result = RecompileForTest(shader, options);
+  CheckSpirvBinaryValidates(result.spirv);
+  const auto source = DisassembleSpirvBinary(result.spirv);
+  Check(source.find("OpSetMeshOutputsEXT") != std::string::npos,
+        "mesh passthrough did not emit mesh output sizing");
+  Check(source.find("OpGroupNonUniformBallot") == std::string::npos,
+        "mesh passthrough retained an unused half-wave ballot");
+
+  Decoder::Program decoded;
+  CFG::Graph graph;
+  CFG::BasicBlock block;
+  block.id = 0;
+  block.terminator.kind = CFG::TerminatorKind::Return;
+  graph.blocks.push_back(std::move(block));
+  graph.entry_block = 0;
+  Frontend::TranslateOptions translate_options{};
+  translate_options.stage = ShaderType::Mesh;
+  translate_options.wave_size = wave_size;
+  translate_options.user_data_count = 0;
+  translate_options.input_info.vertex = &input;
+  auto program = Frontend::TranslateProgram(decoded, graph, translate_options);
+  const uint32_t draw[] = {3, 17, 5, 0, 0, 0};
+  for (auto &ir_block : program.blocks) {
+    for (auto &inst : *ir_block) {
+      if (inst.GetOpcode() == ValueOpcode::MeshDrawParameter) {
+        Check(inst.Arg(0).GetType() == Type::U32,
+              "mesh passthrough draw parameter index is not U32");
+        inst.ReplaceUsesWith(Value(draw[inst.Arg(0).U32()]));
+      } else if (inst.GetOpcode() == ValueOpcode::GetBuiltin) {
+        const auto kind = static_cast<StageInputKind>(inst.Arg(0).U32());
+        const uint32_t value = kind == StageInputKind::LocalInvocationIndex ? lane : 0;
+        inst.ReplaceUsesWith(Value(value));
+      }
+    }
+  }
+  RewriteToSsa(program.blocks);
+  ConstantPropagationPass(program.blocks);
+  uint32_t sgpr2 = 0;
+  uint32_t sgpr3 = 0;
+  uint32_t vgpr0 = 0;
+  for (const auto *ir_block : program.blocks) {
+    for (const auto &inst : *ir_block) {
+      if (inst.GetOpcode() == ValueOpcode::SetScalarRegister) {
+        const auto reg = RegIndex(inst.Arg(0).ScalarRegister());
+        if (reg == 2 || reg == 3) {
+          const auto value = inst.Arg(1).Resolve();
+          Check(value.IsImmediate() && value.GetType() == Type::U32,
+                "mesh passthrough scalar ABI did not fold to a constant");
+          (reg == 2 ? sgpr2 : sgpr3) = value.U32();
+        }
+      } else if (inst.GetOpcode() == ValueOpcode::SetVectorRegister &&
+                 RegIndex(inst.Arg(0).VectorRegister()) == 0) {
+        const auto value = inst.Arg(1).Resolve();
+        Check(value.IsImmediate() && value.GetType() == Type::U32,
+              "mesh passthrough packed indices did not fold to a constant");
+        vgpr0 = value.U32();
+      }
+    }
+  }
+  Check(sgpr2 == 0x00403000u,
+        "mesh passthrough did not generate the s2 allocation ABI");
+  Check(sgpr3 == (wave_size == 64 ? 0x10000103u : lane < 32u ? 0x20000103u : 0x21000000u),
+        "mesh passthrough changed the s3 wave/count ABI");
+  Check(vgpr0 == expected_packed_indices,
+        "mesh passthrough changed packed triangle indices");
+}
+
+void TestMeshWave32PackedSubgroupIsolation() {
+  using namespace ShaderRecompiler;
+  const uint32_t shader[] = {
+      EncodeSMovB32(12, 255), 0x1003u,
+      EncodeSMovB32(124, 12), EncodeSopp(0x10, 9),
+      EncodeVop1(0x02, 24, 5 + 256),
+      EncodeVop1(0x01, 4, 24),
+      EncodeExp0(0x0c, 0xf, false), EncodeExp1(4, 4, 4, 4),
+      EncodeExp0(0x14, 0x1), EncodeExp1(0, 0, 0, 0),
+      EncodeSopp(0x01),
+  };
+  ShaderVertexInputInfo input{};
+  input.logical_stage = ShaderType::Mesh;
+  input.mesh.wave_size = 32;
+  input.mesh.host_subgroup_size = 64;
+  input.mesh.threads_num[0] = 64;
+  input.mesh.threads_num[1] = input.mesh.threads_num[2] = 1;
+  input.mesh.input_primitive = static_cast<uint32_t>(Prospero::PrimitiveType::kTriList);
+  input.mesh.primitives_per_group = 1;
+  input.mesh.vertices_per_group = 3;
+  input.mesh.max_primitives = 1;
+  input.mesh.max_vertices = 3;
+  input.mesh.passthrough_alloc = true;
+  CompileOptions options{};
+  options.stage = ShaderType::Mesh;
+  options.wave_size = 32;
+  options.input_info.vertex = &input;
+  const auto result = RecompileForTest(shader, options);
+  CheckSpirvBinaryValidates(result.spirv);
+
+  std::unordered_map<uint32_t, std::span<const uint32_t>> definitions;
+  std::vector<std::span<const uint32_t>> shuffles;
+  for (size_t index = 5; index < result.spirv.size();) {
+    const auto length = result.spirv[index] >> 16u;
+    Check(length != 0 && index + length <= result.spirv.size(), "invalid packed-wave SPIR-V");
+    const auto instruction = std::span<const uint32_t>(result.spirv.data() + index, length);
+    const auto opcode = static_cast<spv::Op>(instruction[0] & 0xffffu);
+    if (opcode == spv::OpGroupNonUniformShuffle) {
+      shuffles.push_back(instruction);
+    }
+    if (opcode == spv::OpConstant || opcode == spv::OpLoad || opcode == spv::OpCompositeExtract ||
+        opcode == spv::OpCompositeConstruct || opcode == spv::OpSelect ||
+        opcode == spv::OpUGreaterThanEqual || opcode == spv::OpBitwiseAnd ||
+        opcode == spv::OpBitwiseOr || opcode == spv::OpGroupNonUniformBallot ||
+        opcode == spv::OpGroupNonUniformBallotFindLSB) {
+      definitions.emplace(instruction[2], instruction);
+    }
+    index += length;
+  }
+  const auto find = [&](uint32_t id, spv::Op opcode) -> std::span<const uint32_t> {
+    const auto it = definitions.find(id);
+    return it != definitions.end() && (it->second[0] & 0xffffu) == static_cast<uint32_t>(opcode)
+               ? it->second : std::span<const uint32_t>{};
+  };
+  const auto is_constant = [&](uint32_t id, uint32_t value) {
+    const auto constant = find(id, spv::OpConstant);
+    return constant.size() == 4 && constant[3] == value;
+  };
+  bool isolated = false;
+  for (const auto shuffle : shuffles) {
+    const auto lane = find(shuffle[5], spv::OpBitwiseOr);
+    if (lane.size() != 5) {
+      continue;
+    }
+    const auto local = find(lane[3], spv::OpBitwiseAnd);
+    const auto half = find(lane[4], spv::OpBitwiseAnd);
+    if (local.size() != 5 || half.size() != 5 || !is_constant(local[4], 31) ||
+        !is_constant(half[4], 32)) {
+      continue;
+    }
+    const auto first = find(local[3], spv::OpGroupNonUniformBallotFindLSB);
+    if (first.size() != 5) {
+      continue;
+    }
+    const auto ballot = find(first[4], spv::OpCompositeConstruct);
+    if (ballot.size() != 7) {
+      continue;
+    }
+    const auto selected = find(ballot[3], spv::OpSelect);
+    if (selected.size() != 6) {
+      continue;
+    }
+    const auto upper = find(selected[4], spv::OpCompositeExtract);
+    const auto lower = find(selected[5], spv::OpCompositeExtract);
+    const auto condition = find(selected[3], spv::OpUGreaterThanEqual);
+    isolated = upper.size() == 5 && lower.size() == 5 && upper[3] == lower[3] &&
+               upper[4] == 1 && lower[4] == 0 && condition.size() == 5 &&
+               is_constant(condition[4], 32);
+    if (isolated) {
+      break;
+    }
+  }
+  Check(isolated, "wave32 readfirstlane can read the other guest wave in subgroup64");
 }
 
 void TestNewShaderRecompilerSetpcJumpTable() {
@@ -13624,7 +13849,18 @@ int main() {
   TestFusedShaderHandoffPreservesRegisters();
   TestMeshExportStorage();
   TestMergedShaderUserDataSnapshot();
+  TestPassthroughShaderUserDataBase();
   TestMeshInputAssembly();
+  TestMeshPassthrough(32, 0, 0u | (1u << 10u) | (2u << 20u));
+  TestMeshPassthrough(32, 1, 3u | (4u << 10u) | (5u << 20u));
+  TestMeshPassthrough(32, 2, 6u | (7u << 10u) | (8u << 20u));
+  TestMeshPassthrough(32, 32u - 1u, 93u | (94u << 10u) | (95u << 20u));
+  TestMeshPassthrough(32, 32u, 96u | (97u << 10u) | (98u << 20u));
+  TestMeshPassthrough(64, 0, 0u | (1u << 10u) | (2u << 20u));
+  TestMeshPassthrough(64, 1, 3u | (4u << 10u) | (5u << 20u));
+  TestMeshPassthrough(64, 2, 6u | (7u << 10u) | (8u << 20u));
+  TestMeshPassthrough(64, 64u - 1u, 189u | (190u << 10u) | (191u << 20u));
+  TestMeshWave32PackedSubgroupIsolation();
   TestEmbeddedFetchPreservesSharedScalarLoad();
   TestEmbeddedVertexFormatSwizzle();
   TestNewShaderRecompilerSetpcJumpTable();

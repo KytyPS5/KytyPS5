@@ -296,19 +296,19 @@ public:
 private:
 	void Destroy();
 
-	WindowContext&              m_window;
-	vk::SwapchainKHR            m_handle = nullptr;
-	vk::Format                  m_format = vk::Format::eUndefined;
-	vk::Extent2D                m_extent {};
+	WindowContext&   m_window;
+	vk::SwapchainKHR m_handle = nullptr;
+	vk::Format       m_format = vk::Format::eUndefined;
+	vk::Extent2D     m_extent {};
 	// Drawable pixel size observed when this swapchain was created.
-	vk::Extent2D                m_window_extent {};
-	std::vector<vk::Image>      m_images;
-	std::vector<vk::ImageView>  m_image_views;
-	std::vector<vk::Semaphore>  m_image_acquired;
-	std::vector<vk::Semaphore>  m_render_complete;
+	vk::Extent2D                   m_window_extent {};
+	std::vector<vk::Image>         m_images;
+	std::vector<vk::ImageView>     m_image_views;
+	std::vector<vk::Semaphore>     m_image_acquired;
+	std::vector<vk::Semaphore>     m_render_complete;
 	std::unique_ptr<SystemOverlay> m_system_overlay;
-	uint32_t                    m_image_index = static_cast<uint32_t>(-1);
-	uint32_t                    m_frame_index = 0;
+	uint32_t                       m_image_index = static_cast<uint32_t>(-1);
+	uint32_t                       m_frame_index = 0;
 };
 
 struct Presenter::Impl {
@@ -370,7 +370,7 @@ void Swapchain::Create() {
 	EXIT_IF(m_window_extent.width == 0);
 	EXIT_IF(m_window_extent.height == 0);
 	m_window.RefreshSurfaceCapabilities();
-	const auto&       surface = m_window.surface_capabilities;
+	const auto& surface = m_window.surface_capabilities;
 	EXIT_NOT_IMPLEMENTED(surface.formats.empty());
 
 	m_extent = surface.capabilities.currentExtent;
@@ -442,7 +442,7 @@ void Swapchain::Create() {
 		LOGF("warning: requested present mode is unavailable; falling back to Fifo\n");
 		create_info.presentMode = vk::PresentModeKHR::eFifo;
 	}
-	create_info.clipped          = VK_TRUE;
+	create_info.clipped = VK_TRUE;
 	RequireVulkanSuccess(graphics.device.createSwapchainKHR(&create_info, nullptr, &m_handle),
 	                     "vkCreateSwapchainKHR");
 	EXIT_IF(m_handle == nullptr);
@@ -483,8 +483,8 @@ void Swapchain::Create() {
 		    graphics.device.createSemaphore(&semaphore_info, nullptr, &m_render_complete[i]),
 		    "create swapchain render-complete semaphore");
 	}
-	m_image_index   = static_cast<uint32_t>(-1);
-	m_frame_index   = 0;
+	m_image_index = static_cast<uint32_t>(-1);
+	m_frame_index = 0;
 }
 
 Swapchain::~Swapchain() {
@@ -544,8 +544,8 @@ void Swapchain::Recreate(bool surface_lost) {
 		// Surface recreation goes through SDL_Vulkan_CreateSurface, which touches the
 		// window's view/layer and must run on the main thread on macOS.
 		EXIT_IF(!SDL_RunOnMainThread(
-		    [](void* window) { static_cast<WindowContext*>(window)->RecreateSurface(); },
-		    &m_window, true));
+		    [](void* window) { static_cast<WindowContext*>(window)->RecreateSurface(); }, &m_window,
+		    true));
 #else
 		m_window.RecreateSurface();
 #endif
@@ -783,7 +783,7 @@ void Presenter::Present(Frame& frame, bool reuse) {
 	m_impl->frames.ValidateForPresent(&frame, reuse);
 
 	const auto overlay_visual = GetSystemOverlayVisualState();
-	auto&      swapchain  = m_impl->swapchain;
+	auto&      swapchain      = m_impl->swapchain;
 	// Some window systems keep presenting an old swapchain after a resize.
 	if (swapchain.NeedsResize()) {
 		m_impl->RecoverSwapchain(Swapchain::Status::Recreate);
@@ -796,7 +796,7 @@ void Presenter::Present(Frame& frame, bool reuse) {
 		}
 		{
 			Common::LockGuard render_lock(m_impl->renderer.GetMutex());
-			auto&             command          = m_impl->present_scheduler.BeginCommand();
+			auto&             command = m_impl->present_scheduler.BeginCommand();
 			const bool        draw_system_overlay =
 			    overlay_visual.active && swapchain.PrepareSystemOverlay();
 			swapchain.RecordPresentCommands(command, frame.image, draw_system_overlay);

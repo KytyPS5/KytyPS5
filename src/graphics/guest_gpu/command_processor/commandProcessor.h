@@ -149,8 +149,8 @@ private:
 	                      uint32_t interrupt_context_id);
 	void ProcessPm4(Pm4Execution& execution);
 	void SuspendPm4();
-	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
-	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }
+	CommandScheduler& GetScheduler() const { return m_renderer.GetCommandScheduler(); }
+	CommandBuffer&    CurrentBuffer() { return GetScheduler().Current(); }
 
 	RenderContext&   m_renderer;
 	HW::Context      m_ctx;

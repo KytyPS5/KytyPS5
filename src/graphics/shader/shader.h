@@ -50,7 +50,7 @@ struct CompiledShaderInfo;
 } // namespace ShaderRecompiler::IR
 
 struct ShaderStageRuntime {
-	const ShaderRecompiler::IR::CompiledShaderInfo* program = nullptr;
+	const ShaderRecompiler::IR::CompiledShaderInfo* program   = nullptr;
 	const ShaderRecompiler::IR::ResourceSnapshot*   resources = nullptr;
 
 	[[nodiscard]] explicit operator bool() const {
@@ -108,7 +108,8 @@ struct ShaderMeshInputInfo: ShaderWorkgroupInputInfo {
 		return vertices < size ? 0u : (vertices - size) / InputPrimitiveStep() + 1u;
 	}
 	[[nodiscard]] constexpr uint32_t InputVertexCount(uint32_t primitives) const {
-		return primitives == 0u ? 0u : (primitives - 1u) * InputPrimitiveStep() + InputPrimitiveSize();
+		return primitives == 0u ? 0u
+		                        : (primitives - 1u) * InputPrimitiveStep() + InputPrimitiveSize();
 	}
 };
 
@@ -122,26 +123,29 @@ struct ShaderTessellationInputInfo {
 	uint32_t output_topology       = 0;
 };
 
-struct ShaderVertexInputInfo {
-	static constexpr int RES_MAX = 32;
+struct ShaderPixelInputInfo;
 
-	ShaderBufferResource    resources[RES_MAX];
-	ShaderVertexDestination resources_dst[RES_MAX];
-	ShaderVertexInputBuffer buffers[RES_MAX];
-	ShaderStageRuntime      stage;
-	ShaderType                  logical_stage        = ShaderType::Vertex;
-	int                     resources_num       = 0;
-	int                     fetch_attrib_reg    = 0;
-	int                     fetch_buffer_reg    = 0;
-	int                     buffers_num         = 0;
-	uint32_t                wave_size           = 64;
-	uint32_t                scratch_size_dwords = 0;
-	uint32_t                pa_cl_vs_out_cntl    = 0;
-	ShaderClipSpaceTransform clip_space;
-	ShaderMeshInputInfo      mesh;
+struct ShaderVertexInputInfo {
+	static constexpr int        RES_MAX     = 32;
+	const ShaderPixelInputInfo* pixel_input = nullptr;
+
+	ShaderBufferResource        resources[RES_MAX];
+	ShaderVertexDestination     resources_dst[RES_MAX];
+	ShaderVertexInputBuffer     buffers[RES_MAX];
+	ShaderStageRuntime          stage;
+	ShaderType                  logical_stage       = ShaderType::Vertex;
+	int                         resources_num       = 0;
+	int                         fetch_attrib_reg    = 0;
+	int                         fetch_buffer_reg    = 0;
+	int                         buffers_num         = 0;
+	uint32_t                    wave_size           = 64;
+	uint32_t                    scratch_size_dwords = 0;
+	uint32_t                    pa_cl_vs_out_cntl   = 0;
+	ShaderClipSpaceTransform    clip_space;
+	ShaderMeshInputInfo         mesh;
 	ShaderTessellationInputInfo tess;
-	bool                    fetch_external      = false;
-	bool                    fetch_embedded      = false;
+	bool                        fetch_external = false;
+	bool                        fetch_embedded = false;
 };
 
 struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
@@ -152,6 +156,12 @@ struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
 	int                workgroup_register         = 0;
 	bool               tg_size_en                 = false;
 	ShaderStageRuntime stage;
+};
+
+struct ShaderPixelParameterPlan {
+	std::array<uint32_t, 32>                   locations {};
+	std::vector<std::pair<uint32_t, uint32_t>> aliases;
+	bool                                       valid = false;
 };
 
 struct ShaderPixelInputInfo {
@@ -179,7 +189,10 @@ struct ShaderPixelInputInfo {
 	bool                                           dual_source_blending         = false;
 	bool                                           ps_early_z                   = false;
 	bool                                           ps_execute_on_noop           = false;
+	ShaderPixelParameterPlan                       parameter_plan;
 	ShaderStageRuntime                             stage;
+
+	bool ps_single_sample = false;
 
 	bool HasPositionInput() const { return ps_pos_x || ps_pos_y || ps_pos_z || ps_pos_w; }
 };
@@ -200,8 +213,12 @@ inline const ShaderWorkgroupInputInfo* ShaderWorkgroupInput(ShaderType          
 }
 
 uint32_t ShaderPixelParameterMappedLocation(const ShaderPixelInputInfo& info, uint32_t input);
+ShaderPixelParameterPlan ShaderPixelParameterBuildPlan(const ShaderPixelInputInfo& info,
+                                                       uint32_t vertex_export_mask);
+std::vector<uint32_t>    ShaderPixelParameterInputs(const ShaderPixelInputInfo& info);
 uint32_t ShaderPixelParameterLocation(const ShaderPixelInputInfo& info,
-                                      std::span<const uint32_t> active_inputs, uint32_t input);
+                                      std::span<const uint32_t> active_inputs, uint32_t input,
+                                      uint32_t reserved_mask = 0);
 bool     ShaderPixelParameterIsFlat(const ShaderPixelInputInfo& info, uint32_t input);
 bool     ShaderPixelParameterIsCustom(const ShaderPixelInputInfo& info, uint32_t input);
 
@@ -292,19 +309,19 @@ struct Shader {
 
 struct ShaderMappedData {
 	Prospero::ShaderBinaryType type {};
-	ShaderUserData* user_data           = nullptr;
-	ShaderSemantic* input_semantics     = nullptr;
-	uint32_t        num_input_semantics = 0;
-	uint32_t        code_size_bytes     = 0;
-	uint32_t        scratch_size_dwords = 0;
+	ShaderUserData*            user_data           = nullptr;
+	ShaderSemantic*            input_semantics     = nullptr;
+	uint32_t                   num_input_semantics = 0;
+	uint32_t                   code_size_bytes     = 0;
+	uint32_t                   scratch_size_dwords = 0;
 };
 
 void ShaderInit();
 void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data);
 
-void     ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info);
-void     ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info);
-void     ShaderDbgDumpInputInfo(const ShaderComputeInputInfo& info);
+void ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info);
+void ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info);
+void ShaderDbgDumpInputInfo(const ShaderComputeInputInfo& info);
 
 } // namespace Libs::Graphics
 

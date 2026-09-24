@@ -5,6 +5,8 @@
 #include "common/threads.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/host_gpu/renderer/colorRenderTarget.h"
+#include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
@@ -53,6 +55,9 @@
 #endif
 
 namespace Libs::Graphics {
+
+bool DrawUsesSingleSample(std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth, const HW::AaConfig& aa_config);
+
 namespace {
 
 void Check(bool value, const char *text) {
@@ -6211,7 +6216,24 @@ void TestPerspectiveCentroidInputs() {
             "center pair lost its ordinary barycentric loads when centroid was enabled");
     }
     CheckSpirvBinaryValidates(result.spirv);
+    const auto multisample_key = MakeStageStaticKey(pixel);
+    pixel.ps_single_sample = true;
+    Check(multisample_key != MakeStageStaticKey(pixel), "single-sample centroid specialization missing from shader key");
+    const auto single_sample = RecompileForTest(shader, options);
+    const auto single_source = DisassembleSpirvBinary(single_sample.spirv);
+    Check(!SpirvContainsCapability(single_sample.spirv, 52u) &&
+              single_source.find("InterpolateAtCentroid") == std::string::npos &&
+              SpirvHasDecorationValue(single_sample.spirv, 11u, 5286u),
+          "single-sample centroid did not reuse the center barycentric builtin");
+    CheckSpirvBinaryValidates(single_sample.spirv);
   }
+  HW::AaConfig aa_config{};
+  aa_config.msaa_num_samples = 0;
+  std::array<RenderColorInfo, 1> colors{};
+  colors[0].image_id = ImageId{0};
+  colors[0].desc.info.samples = 4;
+  const RenderDepthInfo depth{};
+  Check(DrawUsesSingleSample({}, depth, aa_config) && !DrawUsesSingleSample(colors, depth, aa_config), "single-sample AA config overrode a multisampled attachment");
 }
 
 void TestPsInputCountRegisterDecode() {
@@ -13517,13 +13539,153 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
   CheckSpirvPhiParents(dispatcher_result.spirv);
 }
 
+std::string DecorationVariableForLocation(const std::string &text, uint32_t location) {
+  const auto needle = "Location " + std::to_string(location) + "\n";
+  size_t position = 0;
+  while ((position = text.find(needle, position)) != std::string::npos) {
+    const auto start = text.rfind("OpDecorate %", position);
+    if (start != std::string::npos && start < position) {
+      const auto id_start = start + std::strlen("OpDecorate %");
+      const auto id_end = text.find_first_of(" \n", id_start);
+      if (id_end != std::string::npos) {
+        return text.substr(id_start, id_end - id_start);
+      }
+    }
+    position += needle.size();
+  }
+  return {};
+}
+
+std::string StoredValueForVariable(const std::string &text, const std::string &variable) {
+  const auto needle = "OpStore %" + variable + " %";
+  const auto position = text.find(needle);
+  if (position == std::string::npos) {
+    return {};
+  }
+  const auto value_start = position + needle.size();
+  const auto value_end = text.find_first_of(" \n", value_start);
+  return text.substr(value_start, value_end - value_start);
+}
+
+void TestPixelParameterAliasPlan() {
+  ShaderPixelInputInfo info{};
+  info.input_num = 2;
+  SetIdentityInterpolatorSettings(&info);
+  info.interpolator_settings[1] = 0;
+  auto plan = ShaderPixelParameterBuildPlan(info, 1u);
+  Check(plan.valid && plan.locations[0] == 0 && plan.locations[1] == 0 && plan.aliases.empty(),
+        "same-mode aliases did not share a location");
+
+  info.interpolator_settings[1] = 0x400u;
+  plan = ShaderPixelParameterBuildPlan(info, 1u);
+  Check(plan.valid && plan.locations[0] == 0 && plan.locations[1] == 1 && plan.aliases.size() == 1 &&
+            plan.aliases[0] == std::pair {1u, 0u}, "flat alias did not get a copied location");
+
+  plan = ShaderPixelParameterBuildPlan(info, 3u);
+  Check(plan.valid && plan.locations[1] == 2 && plan.aliases[0] == std::pair {2u, 0u},
+        "alias location ignored an exported vertex location");
+
+  info.input_num = 1;
+  info.interpolator_settings[0] = 0x400u;
+  plan = ShaderPixelParameterBuildPlan(info, 1u);
+  Check(plan.valid && plan.locations[0] == 0 && plan.aliases.empty(),
+        "flat-only input was moved without an alias");
+
+  info.input_num = 2;
+  info.interpolator_settings[0] = 0;
+  info.interpolator_settings[1] = 20;
+  Check(!ShaderPixelParameterBuildPlan(info, 1u).valid,
+        "plan accepted an unexported vertex parameter");
+
+}
+
+void TestCoupledVertexAliasOutput() {
+  auto options = MakeCompileOptions(ShaderType::Vertex);
+  ShaderVertexInputInfo vertex_info{};
+  std::array<std::array<uint32_t, 4>, 32> buffers{};
+  buffers[2] = {0x12340000, 0, 64, 0x00027000};
+  const std::array<uint32_t, 9> attributes = {0, 0, 0, 0, 0, 0, 2, 0, 0};
+  std::array<uint32_t, 16> user_data{};
+  const uint64_t tables[] = {reinterpret_cast<uint64_t>(buffers.data()),
+                             reinterpret_cast<uint64_t>(attributes.data())};
+  std::memcpy(user_data.data() + 12, tables, sizeof(tables));
+  vertex_info.fetch_embedded = true;
+  vertex_info.fetch_buffer_reg = 12;
+  vertex_info.fetch_attrib_reg = 14;
+  vertex_info.resources_num = 1;
+  vertex_info.resources_dst[0].attr_id = 1;
+  vertex_info.resources[0].fields[1] = 12u << 16u;
+  vertex_info.resources[0].fields[2] = 1;
+  vertex_info.resources[0].fields[3] =
+      (static_cast<uint32_t>(Prospero::BufferFormat::k32_32_32Float) << 12u) | DstSel(4, 5, 6, 7);
+  vertex_info.pa_cl_vs_out_cntl = (1u << 22u) | (1u << 8u);
+
+  ShaderPixelInputInfo pixel_info{};
+  pixel_info.input_num = 2;
+  SetIdentityInterpolatorSettings(&pixel_info);
+  pixel_info.interpolator_settings[1] = 0x400u;
+  vertex_info.pixel_input = &pixel_info;
+  options.input_info.vertex = &vertex_info;
+  options.user_data_base = 8;
+  options.user_data = user_data;
+  const uint32_t shader[] = {EncodeExp0(0x0c, 0xf, false), EncodeExp1(0, 1, 2, 3),
+                             EncodeExp0(0x20, 0xf, false), EncodeExp1(0, 1, 2, 3), EncodeSopp(0x01)};
+
+  auto compiled = RecompileForTest(shader, options);
+  CheckSpirvBinaryValidates(compiled.spirv);
+  const auto text = DisassembleSpirvBinary(compiled.spirv);
+  const auto source = DecorationVariableForLocation(text, 0);
+  const auto alias = DecorationVariableForLocation(text, 1);
+  Check(!source.empty() && !alias.empty(), "vertex shader did not declare both parameter locations");
+  const auto source_value = StoredValueForVariable(text, source);
+  const auto alias_value = StoredValueForVariable(text, alias);
+  Check(!source_value.empty() && !alias_value.empty(), "vertex shader did not write both parameter locations");
+  Check(source_value == alias_value,
+        "alias output did not copy the exported parameter");
+
+  const auto info = std::move(compiled.program).TakeCompiledInfo();
+  pixel_info.parameter_plan.locations = info.info.parameter_locations;
+  pixel_info.parameter_plan.aliases = info.info.parameter_aliases;
+  pixel_info.parameter_plan.valid = info.info.parameter_plan_valid;
+  Check(pixel_info.parameter_plan.valid && pixel_info.parameter_plan.locations[1] == 1 &&
+            pixel_info.parameter_plan.aliases.size() == 1,
+        "vertex stage did not publish the alias plan");
+
+  auto pixel_options = MakeCompileOptions(ShaderType::Pixel);
+  pixel_options.input_info.pixel = &pixel_info;
+  const uint32_t pixel_shader[] = {EncodeVintrp(0, 12, 0, 0, 2), EncodeVintrp(1, 12, 0, 0, 2),
+                                   EncodeVintrp(2, 13, 1, 3, 2), EncodeVop2(0x03, 16, 12 + 256, 0),
+                                   EncodeExp0(0x00, 0xf), EncodeExp1(16, 13, 16, 13), 0xbf810000u};
+  const auto pixel = RecompileForTest(pixel_shader, pixel_options);
+  CheckSpirvBinaryValidates(pixel.spirv);
+  const auto pixel_text = DisassembleSpirvBinary(pixel.spirv);
+  const auto smooth = DecorationVariableForLocation(pixel_text, 0);
+  const auto flat = DecorationVariableForLocation(pixel_text, 1);
+  Check(!smooth.empty() && !flat.empty(), "pixel shader did not consume both parameter locations");
+  Check(pixel_text.find("OpDecorate %" + flat + " Flat") != std::string::npos,
+        "pixel alias location is not flat");
+  Check(pixel_text.find("OpDecorate %" + smooth + " Flat") == std::string::npos,
+        "pixel source location unexpectedly became flat");
+
+  std::vector<uint32_t> key_a;
+  std::vector<uint32_t> key_b;
+  BuildStageStaticKey(pixel_info, key_a);
+  pixel_info.parameter_plan.locations[1] = 2;
+  BuildStageStaticKey(pixel_info, key_b);
+  Check(key_a != key_b, "pixel cache key ignored the alias plan");
+}
+
 } // namespace
 } // namespace Libs::Graphics
 
-int main() {
+int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
   EnsureConfigInitialized();
+  if (argc == 2 && std::strcmp(argv[1], "--centroid-only") == 0) {
+    TestPerspectiveCentroidInputs();
+    return 0;
+  }
   TestResourceDescriptorClassification();
   TestShaderBufferResourceSize();
   TestNativeShaderResourceDependencies();
@@ -13661,6 +13823,8 @@ int main() {
   TestNewShaderRecompilerNativeBindingPlan();
   TestNewShaderRecompilerStageInputInfo();
   TestCustomVintrpMovTranslation();
+  TestPixelParameterAliasPlan();
+  TestCoupledVertexAliasOutput();
   TestPerspectiveCentroidInputs();
   TestGraphicsCreateInterpolantMapping();
   TestNewShaderRecompilerPixelPipelineEntry();

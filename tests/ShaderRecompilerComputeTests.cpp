@@ -9466,7 +9466,7 @@ public:
       std::memset(mapped, 0, allocation_size);
       for (uint32_t face = 0; face < layers; face++) {
         const auto depth = depth_at(face, false);
-        for (const auto address : {base, ordinary_address}) {
+      for (const uintptr_t address : {base, static_cast<uintptr_t>(ordinary_address)}) {
           std::memcpy(reinterpret_cast<void *>(address + face * 0x100),
                       &depth, sizeof(depth));
         }

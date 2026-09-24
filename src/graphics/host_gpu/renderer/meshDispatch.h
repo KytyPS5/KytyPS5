@@ -32,7 +32,8 @@ struct MeshDispatchSlice {
  * @param instances    Workgroup count in the Y dimension (guest instances).
  * @param max_groups   Host X-dimension workgroup limit.
  * @param max_instances Host Y-dimension workgroup limit.
- * @param max_total    Host total workgroup count limit.
+ * @param max_total    Host total workgroup count limit. Also caps each group
+ *                     slice, since the per-dimension X limit can exceed it.
  * @return The sub-grids covering `groups` x `instances`, or an empty vector when
  *         either count is zero.
  */
@@ -43,9 +44,9 @@ inline std::vector<MeshDispatchSlice> SplitMeshDispatch(uint32_t groups, uint32_
 	if (groups == 0u || instances == 0u) {
 		return slices;
 	}
-	const uint32_t group_stride    = std::max(1u, max_groups);
-	const uint32_t instance_stride = std::max(1u, max_instances);
 	const uint32_t total_limit     = std::max(1u, max_total);
+	const uint32_t group_stride    = std::min(std::max(1u, max_groups), total_limit);
+	const uint32_t instance_stride = std::max(1u, max_instances);
 	for (uint32_t group = 0u; group < groups; group += group_stride) {
 		const uint32_t group_count = std::min(group_stride, groups - group);
 		// The total-limit cap is shared with the instance dimension. When the

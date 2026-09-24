@@ -106,6 +106,19 @@ void TestDegenerateCounts() {
         "single-workgroup draw was not preserved");
 }
 
+void TestTotalLimitTighterThanGroupLimit() {
+  // A host can report maxMeshWorkGroupCount[0] above maxMeshWorkGroupTotalCount
+  // (the total constraint is independent per the Vulkan spec). The group chunk
+  // must be clamped to the total limit, or a single slice could exceed it.
+  const auto tighter_groups = SplitMeshDispatch(4, 1, 4, 1, 3);
+  Check(tighter_groups.size() == 2u,
+        "group stride above the total limit was not clamped");
+  CheckCoverage(tighter_groups, 4, 1, 4, 1, 3);
+  const auto mixed = SplitMeshDispatch(6, 2, 4, 2, 3);
+  Check(mixed.size() == 4u, "total-limited slicing is wrong");
+  CheckCoverage(mixed, 6, 2, 4, 2, 3);
+}
+
 void TestZeroAndTinyLimitsClampToOne() {
   // Hosts must report limits of at least one, but the splitting accepts zero
   // and treats it as one instead of dividing by zero.
@@ -126,6 +139,7 @@ int main() {
   TestGroupCountAbovePerDimensionLimit();
   TestTotalCountCapsInstanceChunks();
   TestDegenerateCounts();
+  TestTotalLimitTighterThanGroupLimit();
   TestZeroAndTinyLimitsClampToOne();
   std::puts("MeshDispatchTests: all cases passed");
   return 0;

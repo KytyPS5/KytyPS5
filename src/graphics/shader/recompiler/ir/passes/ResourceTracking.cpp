@@ -399,8 +399,12 @@ private:
 		return nullptr;
 	}
 
-	bool IsUniformLoopIndex(Value value, std::vector<const Inst*>& active, bool& saw_loop,
+	bool IsUniformLoopIndex(Value value, std::vector<const Inst*>& active,
+	                        std::vector<const Inst*>& accepted, bool& saw_loop,
 	                        bool& saw_leaf) const {
+		if (active.size() > 32u) {
+			return false;
+		}
 		value = value.Resolve();
 		if (value.IsImmediate()) {
 			if (value.GetType() != Type::U32) {
@@ -419,6 +423,9 @@ private:
 				return true;
 			}
 			return false;
+		}
+		if (std::ranges::find(accepted, inst) != accepted.end()) {
+			return true;
 		}
 		if (inst->GetOpcode() == ValueOpcode::GetUserData) {
 			if (inst->NumArgs() != 1u || inst->Arg(0).GetType() != Type::ScalarReg) {
@@ -439,19 +446,24 @@ private:
 			return false;
 		}
 		active.push_back(inst);
-		bool valid = true;
 		for (size_t index = 0; index < inst->NumArgs(); index++) {
-			valid = IsUniformLoopIndex(inst->Arg(index), active, saw_loop, saw_leaf) && valid;
+			if (!IsUniformLoopIndex(inst->Arg(index), active, accepted, saw_loop, saw_leaf)) {
+				active.pop_back();
+				return false;
+			}
 		}
 		active.pop_back();
-		return valid;
+		accepted.push_back(inst);
+		return true;
 	}
 
 	bool IsUniformLoopIndex(Value value) const {
 		std::vector<const Inst*> active;
+		std::vector<const Inst*> accepted;
 		bool                     saw_loop = false;
 		bool                     saw_leaf = false;
-		return IsUniformLoopIndex(value, active, saw_loop, saw_leaf) && saw_loop && saw_leaf;
+		return IsUniformLoopIndex(value, active, accepted, saw_loop, saw_leaf) && saw_loop &&
+		       saw_leaf;
 	}
 
 	bool MemoryIndexBelongsTo(uint32_t index, const Inst& owner) const {

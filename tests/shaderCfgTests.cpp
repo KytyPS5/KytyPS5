@@ -9408,6 +9408,41 @@ void TestCapturedBufferAtomicsX2() {
   }
 }
 
+void TestOptionalShaderHostFeatures() {
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  const uint32_t plain_shader[] = {EncodeSopp(0x01)};
+  const auto supported = RecompileForTest(plain_shader, options);
+  options.host_features = {false, false};
+  const auto limited = RecompileForTest(plain_shader, options);
+  Check(supported.spirv == limited.spirv,
+        "unused optional host features changed the shader");
+  CheckSpirvBinaryValidates(limited.spirv);
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  const uint32_t atomic_shader[] = {0xe1680018u, 0x80000000u, EncodeSopp(0x01)};
+  options.host_features = {true, false};
+  CheckSpirvBinaryValidates(RecompileForTest(atomic_shader, options).spirv);
+  options.host_features.buffer_int64_atomics = false;
+  ExpectFatal([&] { (void)RecompileForTest(atomic_shader, options); },
+              "64-bit buffer atomics were emitted without host support");
+  ShaderVertexInputInfo vertex{};
+  vertex.pa_cl_vs_out_cntl = (1u << 22u) | (1u << 8u);
+  options = MakeCompileOptions(ShaderType::Vertex);
+  options.input_info.vertex = &vertex;
+  options.host_features = {false, true};
+  const uint32_t cull_shader[] = {
+      EncodeExp0(0x0c, 0xf, false), EncodeExp1(0, 1, 2, 3),
+      EncodeExp0(0x0d, 0x1), EncodeExp1(4, 5, 6, 7), EncodeSopp(0x01),
+  };
+  const auto cull = RecompileForTest(cull_shader, options);
+  Check(SpirvContainsCapability(cull.spirv, 33u),
+        "cull-distance regression shader does not require CullDistance");
+  CheckSpirvBinaryValidates(cull.spirv);
+  options.host_features.cull_distance = false;
+  ExpectFatal([&] { (void)RecompileForTest(cull_shader, options); },
+              "cull distances were emitted without host support");
+#endif
+}
+
 void TestNewShaderRecompilerBranchConditionForms() {
   struct Case {
     uint32_t opcode;
@@ -13618,6 +13653,7 @@ int main() {
   TestNewShaderRecompilerBufferAtomicsGuardedByBounds();
   TestCapturedBufferAtomicsX2();
   TestDisabledSystemDebugBranch();
+  TestOptionalShaderHostFeatures();
   TestNewShaderRecompilerPixelImageSampleLodSelection();
   TestNewShaderRecompilerBranchConditionForms();
   TestNewShaderRecompilerSetpcBranch();

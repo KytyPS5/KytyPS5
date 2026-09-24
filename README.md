@@ -4,13 +4,13 @@
 [![Build KytyPS5 (Linux)](https://img.shields.io/github/actions/workflow/status/KytyPS5/KytyPS5/build.yml?branch=main&event=push&label=Build%20KytyPS5%20%28Linux%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
 [![Build KytyPS5 (macOS)](https://img.shields.io/github/actions/workflow/status/KytyPS5/KytyPS5/build.yml?branch=main&event=push&label=Build%20KytyPS5%20%28macOS%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
 [![Platform](https://img.shields.io/badge/platform-Windows%20x64%20%7C%20Linux%20x64%20%7C%20macOS%20x86__64-0078D4.svg)](#system-requirements)
-[![Status](https://img.shields.io/badge/status-early%20development-orange.svg)](#current-status)
+[![Status](https://img.shields.io/badge/status-active%20development-orange.svg)](#current-status)
 [![License](https://img.shields.io/badge/license-GPL--2.0-blue.svg)](LICENSE)
 
 KytyPS5 is a free and open-source PlayStation 5 emulator written in C++ for Windows and Linux,
 with experimental macOS support. It is based on a heavily modified version of
-[Kyty](https://github.com/InoriRus/Kyty). The project is in an early stage of development, so
-compatibility is limited and behavior may change significantly between builds.
+[Kyty](https://github.com/InoriRus/Kyty). The project is in active development, and behavior
+can change significantly between builds.
 
 > [!IMPORTANT]
 > KytyPS5 is not affiliated with Sony Interactive Entertainment or PlayStation. The project does
@@ -20,12 +20,12 @@ compatibility is limited and behavior may change significantly between builds.
 ## Current Status
 
 KytyPS5 can boot 2D games and a selection of 3D games, including titles built with Unreal Engine
-4/5, Unity, and custom engines. No external low-level emulation modules are currently required.
+4/5, Unity, and custom engines. External low-level emulation modules are neither required nor
+planned.
 
-Development is focused on compatibility and boot reliability.
+Development is currently focused on expanding game compatibility and improving boot reliability.
 
-Windows is the primary platform and receives the most testing. Linux builds and runs; see
-[Building on Linux](#building-on-linux).
+Windows and Linux are the primary platforms and receive the most testing.
 
 macOS support is experimental. The emulator is built for x86-64 and runs on Apple Silicon under
 Rosetta 2, with Vulkan provided by MoltenVK. A small number of titles have been verified in-game
@@ -36,8 +36,8 @@ Community game test results are available in the
 
 ## Bugs and Issues
 
-The project is in an early stage, so please be mindful when opening new issues. Expect crashes,
-graphical glitches, low compatibility, and poor performance.
+Compatibility, stability, and performance can vary between versions. You may encounter crashes
+or graphical glitches, so please include the version you tested when reporting an issue.
 
 ## Screenshots
 
@@ -370,5 +370,6 @@ licenses included with those components.
 
 - [InoriRus/Kyty](https://github.com/InoriRus/Kyty) — KytyPS5 is based on a heavily modified version
   of the original Kyty project.
-- [shadps4-emu/shadPS4](https://github.com/shadps4-emu/shadPS4) — reference for memory-model
-  understanding and the AVPlayer implementation.
+- [shadps4-emu/shadPS4](https://github.com/shadps4-emu/shadPS4) — reference for understanding PS4
+  memory behavior, GPU resource aliasing and cache coherency,
+  and the AVPlayer implementation.

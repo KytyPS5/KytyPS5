@@ -268,7 +268,143 @@ MakeIndirectImageFixture(bool malformed, uint32_t material_immediate = 0,
   return fixture;
 }
 
+std::unique_ptr<Fixture> MakeAddressBackedImageFixture() {
+  auto fixture = std::make_unique<Fixture>();
+  const auto root = fixture->Address(fixture->UserData(7), fixture->UserData(8), 0x11f0);
+  const auto load_root_word = [&](uint32_t offset, uint32_t pc) {
+    MemoryInfo memory;
+    memory.kind = ResourceKind::ScalarAddress;
+    memory.offset = offset;
+    return fixture->Emit(ValueOpcode::LoadAddressU32,
+                         {root, Value(0u), Value(0u), Value(true)},
+                         fixture->AddMemory(memory, pc));
+  };
+  std::array<Value, 4> pointer_words;
+  for (uint32_t dword = 0; dword < pointer_words.size(); dword++) {
+    pointer_words[dword] = load_root_word(dword * sizeof(uint32_t), 0x11f4);
+  }
+  const auto heap_base = fixture->Address(pointer_words[0], pointer_words[1], 0x11f8);
+  std::array<Value, 4> material_words;
+  for (uint32_t dword = 0; dword < material_words.size(); dword++) {
+    material_words[dword] = load_root_word(680u + dword * sizeof(uint32_t), 0x11fc);
+  }
+  const auto material = fixture->Buffer(material_words, 0x1200);
+  auto *entry = fixture->block;
+  auto *loop = fixture->AddBlock();
+  entry->AddBranch(loop);
+  loop->AddBranch(loop);
+  auto &selector_phi = loop->AppendNewInst(ValueOpcode::Phi, {},
+                                            static_cast<uint64_t>(Type::U32));
+  const auto carried = fixture->Emit(
+      ValueOpcode::IAdd32, {Value(&selector_phi), Value(1u)}, 0, loop);
+  selector_phi.AddPhiOperand(entry, Value(0u));
+  selector_phi.AddPhiOperand(loop, carried);
+  const auto record =
+      fixture->Emit(ValueOpcode::IMul32, {Value(&selector_phi), Value(384u)}, 0, loop);
+  MemoryInfo material_read;
+  material_read.kind = ResourceKind::ScalarBuffer;
+  material_read.offset = 368u;
+  const auto key = fixture->Emit(
+      ValueOpcode::ReadConstBuffer, {material, record},
+      fixture->AddMemory(material_read, 0x1204), loop);
+  fixture->Emit(ValueOpcode::ULessThan32, {key, Value(8u)}, 0, loop);
+  const auto key_shift = fixture->Emit(
+      ValueOpcode::ShiftLeftLogical32, {key, Value(5u)}, 0, loop);
+  const auto key_offset = fixture->Emit(
+      ValueOpcode::IAdd32, {key_shift, Value(152u)}, 0, loop);
+  std::array<Value, 8> image_words;
+  for (uint32_t dword = 0; dword < image_words.size(); dword++) {
+    MemoryInfo heap_read;
+    heap_read.kind = ResourceKind::ScalarAddress;
+    heap_read.offset = dword * sizeof(uint32_t);
+    image_words[dword] = fixture->Emit(
+      ValueOpcode::LoadAddressU32,
+      {heap_base, key_offset, Value(0u), Value(true)},
+      fixture->AddMemory(heap_read, 0x1214), loop);
+  }
+  const auto image = fixture->Emit(
+      ValueOpcode::GetImageResource,
+      {image_words[0], image_words[1], image_words[2], image_words[3], image_words[4],
+       image_words[5], image_words[6], image_words[7]},
+      MemoryFlags{0, 0x1220}, loop);
+  const auto sampler =
+      fixture->Sampler({Value(0u), Value(0u), Value(0u), Value(0u)}, 0x1220);
+  MemoryInfo sample;
+  sample.kind = ResourceKind::Image;
+  sample.image_dimension = Decoder::ImageDimension::Dim2D;
+  const auto sampled = fixture->Emit(
+      ValueOpcode::ImageSampleRaw,
+      {image, sampler, fixture->ImageAddress()}, fixture->AddMemory(sample, 0x1220), loop);
+  fixture->Emit(ValueOpcode::ReferenceU32,
+                {fixture->Emit(ValueOpcode::CompositeExtractU32x4,
+                               {sampled, Value(0u)})});
+  return fixture;
+}
+
 void TestInvariantIndirectImageMaterialization() {
+  auto address_backed = MakeAddressBackedImageFixture();
+  address_backed->PlanAndTrack();
+  Check(address_backed->program.info.images.size() == 1u,
+        "address-backed image resource was not tracked");
+  const auto& address_indirect = address_backed->program.descriptor_sources[
+      address_backed->program.info.images[0].source].indirect_image;
+  Check(address_indirect.has_value(),
+        "loop-indexed address-backed descriptor table was not recognized");
+  Check(address_backed->program.descriptor_sources[address_indirect->table_source].dword_count ==
+            2u,
+        "address-backed descriptor table pointer was not retained");
+  Check(address_indirect->selector_stride == 384u &&
+            address_indirect->selector_offset == 368u &&
+            address_indirect->table_offset == 152u,
+        "image table offsets were not combined with scalar memory metadata");
+  auto address_plan = ExtractResourcePlan(address_backed->program);
+  LinearTestMemory address_memory;
+  const auto store_address_word = [&](uint64_t address, uint32_t word) {
+    address_memory.words[(address - address_memory.base) / sizeof(uint32_t)] = word;
+  };
+  store_address_word(0x1000u, 0x2000u);
+  store_address_word(0x1000u + 680u, 0x3000u);
+  store_address_word(0x1000u + 684u, 384u << 16u);
+  store_address_word(0x1000u + 688u, 1u);
+  // A 32-bit loop index can wrap the 384-byte stride into another valid offset.
+  store_address_word(0x3000u + 112u, 6u);
+  store_address_word(0x3000u + 368u, 5u);
+  std::array<uint32_t, 8> address_image_descriptor{};
+  address_image_descriptor[0] = 0x20u;
+  address_image_descriptor[1] = static_cast<uint32_t>(
+      Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float) << 20u;
+  address_image_descriptor[2] = 3u | (3u << 14u);
+  address_image_descriptor[3] =
+      Libs::Graphics::DstSel(4, 5, 6, 7) |
+      (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+  for (uint32_t dword = 0; dword < address_image_descriptor.size(); dword++) {
+    store_address_word(0x2000u + 5u * 32u + 152u + dword * 4u,
+                       address_image_descriptor[dword]);
+    store_address_word(0x2000u + 6u * 32u + 152u + dword * 4u,
+                       address_image_descriptor[dword]);
+  }
+  std::array<uint32_t, 9> address_user_data{};
+  address_user_data[7] = 0x1000u;
+  ResourceSnapshot address_snapshot;
+  ResourceSpecialization address_specialization;
+  DescriptorValue expected_address_descriptor;
+  expected_address_descriptor.dword_count = 8u;
+  expected_address_descriptor.dwords = address_image_descriptor;
+  const SrtRuntime address_runtime{.user_data = address_user_data,
+                                   .read_memory = ReadLinearTestMemory,
+                                   .userdata = &address_memory,
+                                   .read_specialization_memory = ReadLinearTestMemory};
+  Check(MaterializeResources(address_plan, address_runtime, address_snapshot,
+                             address_specialization) &&
+            address_specialization.images.size() == 2u &&
+            address_snapshot.images.size() == 2u &&
+            address_specialization.images[0].indirect_root == 0u &&
+            address_snapshot.images[1] == expected_address_descriptor &&
+            address_snapshot.flattened_srt[
+                address_specialization.images[0].indirect_mapping_offset] == 3u &&
+            address_snapshot.flattened_srt[
+                address_specialization.images[0].indirect_mapping_offset + 5u] == 6u,
+        "address-backed indirect image descriptors were not materialized");
   auto fixture = MakeIndirectImageFixture(false);
   fixture->PlanAndTrack();
   auto resource_plan = ExtractResourcePlan(fixture->program);
@@ -527,13 +663,122 @@ void TestInvariantIndirectImageMaterialization() {
             malformed->program.descriptor_sources.empty(),
         "malformed indirect image pattern was partially accepted");
 
-  auto wrapped_immediate = MakeIndirectImageFixture(false, 4u);
+  auto wrapped_immediate = MakeIndirectImageFixture(false, UINT32_MAX);
   BuildSrtPlan(wrapped_immediate->program);
   CheckFatal([&] { TrackResources(wrapped_immediate->program); },
              "not a valid runtime value",
              "wrapped scalar immediate entered the invariant image proof");
   Check(!wrapped_immediate->program.resource_tracking_complete,
         "wrapped scalar immediate entered the invariant image proof");
+}
+
+std::unique_ptr<Fixture> MakeBufferRecordImageFixture(bool formatted) {
+  auto fixture = std::make_unique<Fixture>();
+  const auto material = fixture->Buffer({fixture->UserData(0), fixture->UserData(1),
+                                         fixture->UserData(2), fixture->UserData(3)});
+  MemoryInfo record;
+  record.kind = ResourceKind::Buffer;
+  record.data_bits = 32u;
+  record.data_dwords = 3u;
+  record.formatted = formatted;
+  const auto loaded = fixture->Emit(
+      ValueOpcode::LoadBufferU32x3,
+      {material, fixture->UserData(6), Value(0u), Value(0u), Value(true)},
+      fixture->AddMemory(record, 0x60));
+  const auto component = fixture->Emit(ValueOpcode::CompositeExtractU32x3,
+                                       {loaded, Value(2u)});
+  const auto key = fixture->Emit(ValueOpcode::ReadLane,
+                                 {component, Value(0u)});
+  const auto table = fixture->Address(fixture->UserData(4), fixture->UserData(5));
+  const auto offset = fixture->Emit(ValueOpcode::ShiftLeftLogical32,
+                                   {key, Value(5u)});
+  std::array<Value, 8> words;
+  for (uint32_t dword = 0; dword < words.size(); dword++) {
+    MemoryInfo entry;
+    entry.kind = ResourceKind::ScalarAddress;
+    entry.data_bits = 32u;
+    entry.data_dwords = 1u;
+    entry.offset = dword * 4u;
+    words[dword] = fixture->Emit(
+        ValueOpcode::LoadAddressU32,
+        {table, offset, Value(0u), Value(true)},
+        fixture->AddMemory(entry, 0x70));
+  }
+  const auto image = fixture->Image(words, 0x70);
+  MemoryInfo query;
+  query.kind = ResourceKind::Image;
+  query.image_dimension = Decoder::ImageDimension::Dim2D;
+  fixture->Emit(ValueOpcode::ImageQueryDimensions,
+                {image, fixture->ImageAddress()}, fixture->AddMemory(query, 0x70));
+  const auto reused_image = fixture->Image(words, 0x74);
+  fixture->Emit(ValueOpcode::ImageQueryDimensions,
+                {reused_image, fixture->ImageAddress()}, fixture->AddMemory(query, 0x74));
+  const auto output = fixture->Buffer({fixture->UserData(7), fixture->UserData(8),
+                                       fixture->UserData(9), fixture->UserData(10)});
+  MemoryInfo store;
+  store.kind = ResourceKind::Buffer;
+  fixture->Emit(ValueOpcode::StoreBufferU32,
+                {output, Value(0u), Value(0u), Value(0u), Value(1u), Value(true)},
+                fixture->AddMemory(store, 0x78));
+  return fixture;
+}
+
+void TestBufferRecordImageKey() {
+  auto formatted = MakeBufferRecordImageFixture(true);
+  BuildSrtPlan(formatted->program);
+  CheckFatal([&] { TrackResources(formatted->program); },
+             "not a valid runtime value",
+             "formatted vector load was accepted as a raw record key");
+
+  auto fixture = MakeBufferRecordImageFixture(false);
+  fixture->PlanAndTrack();
+  Check(fixture->program.info.images.size() == 1u,
+        "record-key image was not tracked");
+  const auto &indirect = fixture->program.descriptor_sources[
+      fixture->program.info.images[0].source].indirect_image;
+  Check(indirect.has_value() && indirect->record_key &&
+            indirect->selector_offset == 8u,
+        "lane-selected buffer record was not recognized as an image key");
+
+  auto plan = ExtractResourcePlan(fixture->program);
+  LinearTestMemory memory;
+  memory.words[1] = 3u; // A wrapped U32 index reaches byte 4 with stride 12.
+  memory.words[2] = 1u;
+  memory.words[5] = 2u;
+  std::array<uint32_t, 8> descriptor{};
+  descriptor[0] = 0x20u;
+  descriptor[1] = static_cast<uint32_t>(
+      Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float) << 20u;
+  descriptor[2] = 3u | (3u << 14u);
+  descriptor[3] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+      (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+  for (uint32_t key_value = 1u; key_value <= 3u; key_value++) {
+    for (uint32_t dword = 0; dword < descriptor.size(); dword++) {
+      memory.words[(0x2000u - memory.base) / 4u + key_value * 8u + dword] =
+          descriptor[dword];
+    }
+    memory.words[(0x2000u - memory.base) / 4u + key_value * 8u] += key_value;
+  }
+  std::array<uint32_t, 11> user_data{0x1000u, 12u << 16u, 2u, 0u,
+                                     0x2000u, 0u, 0u, 0x4000u,
+                                     4u << 16u, 1u, 0u};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  const SrtRuntime runtime{.user_data = user_data,
+                           .userdata = &memory,
+                           .read_specialization_memory = ReadLinearTestMemory};
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.images.size() == 4u &&
+            snapshot.flattened_srt.size() >= 9u &&
+            snapshot.flattened_srt[0] == 4u &&
+            snapshot.flattened_srt[1] == 0u &&
+            snapshot.flattened_srt[3] == 1u &&
+            snapshot.flattened_srt[5] == 2u &&
+            snapshot.flattened_srt[7] == 3u,
+        "wrapped buffer record keys were not materialized");
+  user_data[7] = 0x1000u;
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+        "written buffer alias with a record key was accepted");
 }
 
 void TestGuardedDirectImageTable() {
@@ -2890,6 +3135,7 @@ int main() {
     Run("FMASK load specialization", TestFmaskLoadSpecialization);
     Run("dynamic storage mips", TestDynamicStorageMipTracking);
     Run("invariant indirect images", TestInvariantIndirectImageMaterialization);
+    Run("buffer record image key", TestBufferRecordImageKey);
     Run("guarded direct image table", TestGuardedDirectImageTable);
     Run("bounded compute image loop", TestBoundedComputeImageLoop);
     Run("uniformized material image keys", TestUniformizedMaterialImageKeys);

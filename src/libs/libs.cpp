@@ -6,6 +6,18 @@
 
 namespace Libs {
 
+void PrintName(const char* library, const char* module, const char* function) {
+	if (Log::GetDirection() != Log::Direction::Silent) {
+		const auto elapsed_ms      = static_cast<uint64_t>(Loader::Timer::GetTimeMs());
+		const auto print_name_time = fmt::format(
+		    "{:02}:{:02}:{:02}.{:03}", elapsed_ms / 3600000, (elapsed_ms / 60000) % 60,
+		    (elapsed_ms / 1000) % 60, elapsed_ms % 1000);
+		LOGF_COLOR(Log::Color::Cyan, "[%d][%s] %s::%s::%s()\n",
+		           Common::Thread::GetThreadIdUnique(), print_name_time.c_str(), library, module,
+		           function);
+	}
+}
+
 namespace LibContentDelete {
 LIB_DEFINE(InitContentDelete_1);
 } // namespace LibContentDelete

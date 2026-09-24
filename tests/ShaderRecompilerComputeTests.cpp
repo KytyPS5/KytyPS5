@@ -18527,6 +18527,25 @@ TestCase ScalarWqmB32Masks(u32 wave_size) {
       store_marker(lo, hi);
     }
   }
+  for (u32 base : {106u, 126u}) {
+    for (u32 half : {0u, 1u}) {
+      AppendVMovU32(&code, 2, 0);
+      code.push_back(EncodeSMovB32(107, InlineU32(0)));
+      code.push_back(EncodeVopc(0xc2, InlineU32(3), 0)); // Only lane 3.
+      code.push_back(EncodeSop1(0x04, base, 106));
+      code.push_back(EncodeSop1(0x09, base + half, base + (half ^ 1u)));
+      code.push_back(EncodeSMovB32(20, base));
+      code.push_back(EncodeSMovB32(21, base + 1));
+      code.push_back(EncodeSop1(0x04, 126, base));
+      AppendVMovU32(&code, 2, 9);
+      code.push_back(EncodeSop1(0x04, 126, 193));
+      const u32 lo = half == 0 ? 0u : 8u;
+      const u32 hi = half == 0 ? 0u : 0xfu;
+      store_scalar(20, lo);
+      store_scalar(21, hi);
+      store_marker(lo, hi);
+    }
+  }
   AppendEnd(&code);
   test.initial.resize(test.expected.size());
   test.opcodes = {O::S_WQM_B32, O::S_MOV_B32, O::S_MOV_B64, O::S_CMP_EQ_U32,
@@ -18596,8 +18615,21 @@ TestCase ScalarWqmB64PreservesPartialMasks() {
   code.push_back(EncodeSop1(0x0a, 10, 8));
   code.push_back(EncodeSop1(0x04, 126, 10));
   AppendStoreVgprAtLaneDwordOffset(&code, 2, 0, offset);
+  code.push_back(EncodeSop1(0x04, 126, 16));
+  for (u32 source : {253u, 127u, 107u}) {
+    if (source == 253u) {
+      code.push_back(EncodeSopc(0x06, InlineU32(1), InlineU32(1))); // SCC=1.
+    } else {
+      AppendSMovLiteral(&code, source - 1, ~0u);
+      code.push_back(EncodeSMovB32(source, InlineU32(1)));
+    }
+    code.push_back(EncodeSop1(0x0a, 126, source));
+    offset += 64;
+    AppendStoreVgprAtLaneDwordOffset(&code, 2, 0, offset);
+    code.push_back(EncodeSop1(0x04, 126, 16));
+  }
   AppendEnd(&code);
-  test.initial.assign(256, 0xdeadbeef);
+  test.initial.assign(448, 0xdeadbeef);
   test.expected = test.initial;
   for (u32 lane = 0; lane < 64; ++lane) {
     for (u32 region = 0; region < 3; ++region) {
@@ -18606,9 +18638,12 @@ TestCase ScalarWqmB64PreservesPartialMasks() {
     if ((lane >= 4 && lane < 8) || (lane >= 32 && lane < 36)) {
       test.expected[192 + lane] = 9;
     }
+    for (u32 region = 4; region < 7; ++region) {
+      if (lane < 4) test.expected[region * 64 + lane] = 9;
+    }
   }
   test.opcodes = {O::S_MOV_B64, O::S_MOV_B32, O::S_WQM_B64, O::V_MOV_B32,
-                  O::V_CMP_EQ_U32, O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD,
+                  O::V_CMP_EQ_U32, O::S_CMP_EQ_U32, O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
   test.compute_info.threads_num[0] = 64;
   test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;

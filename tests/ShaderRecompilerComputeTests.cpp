@@ -409,10 +409,11 @@ struct RenderExecutorTestAccess {
                                       const ShaderStageRuntime &pixel,
                                       bool pixel_active) {
     RenderExecutor::GraphicsBindings result;
-    result.vertex[0] = executor.PrepareBindings(vertex);
+    executor.PrepareBindings(vertex, result.vertex[0]);
     std::array<PreparedBindings *, 2> stages{&result.vertex[0], nullptr};
     if (pixel_active) {
-      result.pixel.emplace(executor.PrepareBindings(pixel));
+      result.pixel.emplace();
+      executor.PrepareBindings(pixel, *result.pixel);
       stages[1] = &*result.pixel;
     }
     executor.PrepareGraphicsBindings(
@@ -544,8 +545,15 @@ struct RenderExecutorTestAccess {
                                           RenderColorInfo *colors,
                                           uint32_t color_count,
                                           RenderDepthInfo &depth,
-                                          const std::optional<PreparedBindings> &pixel = std::nullopt) {
-    return executor.AcquireRenderTargets(buffer, colors, color_count, depth, pixel);
+                                          std::span<PreparedBindings *const> stages = {},
+                                          vk::ImageAspectFlags *feedback_out = nullptr) {
+    vk::ImageAspectFlags feedback;
+    auto state = executor.AcquireRenderTargets(buffer, colors, color_count, depth,
+                                               feedback, stages);
+    if (feedback_out != nullptr) {
+      *feedback_out = feedback;
+    }
+    return state;
   }
 
   static void ResetBindings(RenderExecutor &executor) {
@@ -1977,16 +1985,37 @@ public:
     ShaderRecompiler::IR::ResourceSnapshot pixel_snapshot;
     pixel_snapshot.user_data = {0x33333333u, 0x44444444u};
     ShaderStageRuntime pixel_runtime{&pixel_program, &pixel_snapshot};
-    auto vertex = context.GetRenderExecutor().PrepareBindings(vertex_runtime);
-    auto pixel = context.GetRenderExecutor().PrepareBindings(pixel_runtime);
+    PreparedBindings vertex;
+    PreparedBindings pixel;
+    auto &executor = context.GetRenderExecutor();
+    executor.PrepareBindings(vertex_runtime, vertex);
+    executor.PrepareBindings(pixel_runtime, pixel);
+    const auto *vertex_storage = vertex.shader_data.data();
+    const auto *pixel_storage = pixel.shader_data.data();
+    vertex.buffer_sources.push_back({});
+    vertex.buffers.push_back({});
+    vertex.gds.offset = 1;
+    vertex.flattened_srt.offset = 1;
+    vertex.shader_data_buffer.offset = 1;
+    vertex_snapshot.user_data = {0x55555555u, 0x66666666u};
+    pixel_snapshot.user_data = {0x77777777u, 0x88888888u};
+    executor.PrepareBindings(vertex_runtime, vertex);
+    executor.PrepareBindings(pixel_runtime, pixel);
+    Require(name, "prepared binding scratch",
+            vertex.shader_data.data() == vertex_storage &&
+                pixel.shader_data.data() == pixel_storage &&
+                vertex.buffer_sources.empty() && vertex.buffers.empty() &&
+                vertex.gds.offset == 0 && vertex.flattened_srt.offset == 0 &&
+                vertex.shader_data_buffer.offset == 0,
+            "repeated shader binding preparation allocated or retained stale state");
 
     const auto pipeline = RenderExecutorTestAccess::CommitBindings(
         context.GetRenderExecutor(), scheduler.Current(), vertex, pixel);
     Require(name, "shared push data",
             vertex.shader_data ==
-                    std::vector<uint32_t>{0x11111111u, 0x22222222u} &&
+                    std::vector<uint32_t>{0x55555555u, 0x66666666u} &&
                 pixel.shader_data ==
-                    std::vector<uint32_t>{0x33333333u, 0x44444444u},
+                    std::vector<uint32_t>{0x77777777u, 0x88888888u},
             "graphics stages did not commit their shared push data");
     scheduler.Finish();
     RenderExecutorTestAccess::DestroyDescriptorPipelines(
@@ -10086,7 +10115,8 @@ public:
         std::memcpy(value.dwords.data(), buffer_descriptor.fields,
                     sizeof(buffer_descriptor.fields));
         value.dword_count = 4;
-        auto buffer_bindings = executor.PrepareBindings(buffer_runtime);
+        PreparedBindings buffer_bindings;
+        executor.PrepareBindings(buffer_runtime, buffer_bindings);
         executor.FindBuffers(buffer_bindings);
         const auto original_id = buffer_bindings.buffer_sources[0].id;
 
@@ -10153,7 +10183,8 @@ public:
       null_info.info = std::move(null_program.info);
       null_info.bindings = std::move(null_program.bindings);
       ShaderStageRuntime null_runtime{&null_info, &null_snapshot};
-      auto null_bindings = executor.PrepareBindings(null_runtime);
+      PreparedBindings null_bindings;
+      executor.PrepareBindings(null_runtime, null_bindings);
       executor.RebindImages(null_bindings);
       Require(name, "null descriptor count",
               null_bindings.images.size() == 3,
@@ -10415,6 +10446,19 @@ public:
                   sampled_overwide_binding.mip_views.empty() &&
                   sampled_overwide_binding.image_view != nullptr,
               "sampled view lost addressable mips in the allocated tail");
+      const auto *image_storage = mipped_prepared.images.data();
+      const auto *mip_storage = mipped_prepared.images[1].mip_views.data();
+      executor.PrepareBindings(mipped_runtime, mipped_prepared);
+      Require(name, "prepared mip scratch",
+              mipped_prepared.images.data() == image_storage &&
+                  mipped_prepared.images[1].mip_views.empty() &&
+                  mipped_prepared.images[1].mip_views.capacity() >= 3,
+              "repeated image preparation retained stale mip views or reallocated scratch");
+      executor.RebindImages(mipped_prepared);
+      Require(name, "prepared mip views rebound",
+              mipped_prepared.images[1].mip_views.size() == 3 &&
+                  mipped_prepared.images[1].mip_views.data() == mip_storage,
+              "reused image scratch did not rebuild dynamic storage mip views");
       // Streaming T# clamps apply after S# max LOD, without changing the view
       // base.
       {
@@ -10659,7 +10703,8 @@ public:
       storage_info.info = std::move(storage_program.info);
       storage_info.bindings = std::move(storage_program.bindings);
       ShaderStageRuntime storage_runtime{&storage_info, &storage_snapshot};
-      auto storage_discovery = executor.PrepareBindings(storage_runtime);
+      PreparedBindings storage_discovery;
+      executor.PrepareBindings(storage_runtime, storage_discovery);
       const auto storage_id = storage_discovery.images[0].image_id;
       Require(name, "storage prefetch purity",
               storage_discovery.images[0].image_view == nullptr &&
@@ -10886,6 +10931,95 @@ public:
                   vk::ImageLayout::eShaderReadOnlyOptimal,
           "descriptor layouts were queried after a later mip transition "
           "instead of being captured at each binding");
+
+      auto disjoint_depth_desc = split_desc;
+      disjoint_depth_desc.type = BindingType::DepthTarget;
+      disjoint_depth_desc.info.data.address = base + 0xe00000;
+      disjoint_depth_desc.info.pixel_format = vk::Format::eD32Sfloat;
+      disjoint_depth_desc.info.guest_format = Prospero::BufferFormat::k32Float;
+      disjoint_depth_desc.view_info.format = vk::Format::eD32Sfloat;
+      disjoint_depth_desc.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+      disjoint_depth_desc.view_info.level_count = 1;
+      disjoint_depth_desc.view_info.usage =
+          vk::ImageUsageFlagBits::eDepthStencilAttachment;
+      const auto disjoint_depth_id = texture_cache.FindImage(disjoint_depth_desc);
+      auto disjoint_sampled_desc = disjoint_depth_desc;
+      disjoint_sampled_desc.type = BindingType::Texture;
+      disjoint_sampled_desc.view_info.base_level = 1;
+      disjoint_sampled_desc.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+      const auto disjoint_sampled_view =
+          texture_cache.FindTexture(disjoint_depth_id, disjoint_sampled_desc);
+      RenderDepthInfo disjoint_depth{};
+      disjoint_depth.desc = disjoint_depth_desc;
+      disjoint_depth.image_id = disjoint_depth_id;
+      disjoint_depth.depth_test_enable = true;
+      disjoint_depth.depth_write_enable = true;
+      disjoint_depth.depth_compare_op = vk::CompareOp::eAlways;
+      PreparedBindings disjoint_binding{};
+      disjoint_binding.runtime = &sampled_runtime;
+      disjoint_binding.images.push_back(
+          {disjoint_depth_id, disjoint_sampled_view, disjoint_sampled_desc});
+      RenderExecutorTestAccess::BindRenderTarget(executor, disjoint_depth_id);
+      vk::ImageAspectFlags disjoint_feedback;
+      std::array<PreparedBindings *, 1> disjoint_stages{&disjoint_binding};
+      RenderColorInfo no_disjoint_color{};
+      const auto disjoint_rendering = RenderExecutorTestAccess::AcquireRenderTargets(
+          executor, scheduler.Current(), &no_disjoint_color, 0, disjoint_depth,
+          disjoint_stages, &disjoint_feedback);
+      descriptor_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
+          executor, scheduler.Current(), disjoint_binding));
+      const auto &disjoint_image = texture_cache.GetImage(disjoint_depth_id);
+      Require(name, "disjoint depth sampling during depth writes",
+              !disjoint_feedback &&
+                  disjoint_rendering.depth_stencil_attachment.image_layout ==
+                      vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT &&
+                  disjoint_binding.images[0].layout ==
+                      disjoint_rendering.depth_stencil_attachment.image_layout &&
+                  disjoint_image.backing.state.layout ==
+                      disjoint_rendering.depth_stencil_attachment.image_layout &&
+                  disjoint_image.backing.subresource_states.empty(),
+              "disjoint sampling used inconsistent image layouts or enabled feedback");
+      RenderExecutorTestAccess::ResetBindings(executor);
+
+      auto overlapping_sampled_desc = disjoint_sampled_desc;
+      overlapping_sampled_desc.view_info.base_level = 0;
+      const auto overlapping_view = texture_cache.FindTexture(
+          disjoint_depth_id, overlapping_sampled_desc);
+      ShaderRecompiler::IR::Program depth_views_ir{};
+      depth_views_ir.stage = ShaderType::Pixel;
+      depth_views_ir.resource_tracking_complete = true;
+      depth_views_ir.info.images = {sampled_resource, sampled_resource};
+      allocate_bindings(depth_views_ir);
+      ShaderRecompiler::IR::CompiledShaderInfo depth_views_program{};
+      depth_views_program.stage = depth_views_ir.stage;
+      depth_views_program.info = std::move(depth_views_ir.info);
+      depth_views_program.bindings = std::move(depth_views_ir.bindings);
+      ShaderRecompiler::IR::ResourceSnapshot depth_views_snapshot;
+      ShaderStageRuntime depth_views_runtime{&depth_views_program, &depth_views_snapshot};
+      PreparedBindings depth_views_binding{};
+      depth_views_binding.runtime = &depth_views_runtime;
+      depth_views_binding.images.push_back(
+          {disjoint_depth_id, overlapping_view, overlapping_sampled_desc});
+      depth_views_binding.images.push_back(
+          {disjoint_depth_id, disjoint_sampled_view, disjoint_sampled_desc});
+      RenderExecutorTestAccess::BindRenderTarget(executor, disjoint_depth_id);
+      std::array<PreparedBindings *, 1> depth_views_stages{&depth_views_binding};
+      vk::ImageAspectFlags depth_views_feedback;
+      const auto depth_views_rendering = RenderExecutorTestAccess::AcquireRenderTargets(
+          executor, scheduler.Current(), &no_disjoint_color, 0, disjoint_depth,
+          depth_views_stages, &depth_views_feedback);
+      descriptor_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
+          executor, scheduler.Current(), depth_views_binding));
+      Require(name, "overlapping and disjoint depth views",
+              overlapping_view != nullptr &&
+                  depth_views_feedback == vk::ImageAspectFlagBits::eDepth &&
+                  depth_views_rendering.depth_stencil_attachment.image_layout ==
+                      vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT &&
+                  MakeImageInfo(depth_views_binding.images[0]).imageLayout ==
+                      depth_views_rendering.depth_stencil_attachment.image_layout &&
+                  MakeImageInfo(depth_views_binding.images[1]).imageLayout ==
+                      depth_views_rendering.depth_stencil_attachment.image_layout,
+              "two depth views chose different descriptor layouts or feedback aspects");
 
       Libs::LibKernel::Memory::WriteBacking(
           storage_address, &storage_stale_value, sizeof(storage_stale_value));
@@ -11213,26 +11347,35 @@ public:
             executor, scheduler.Current(), bounds_depth);
         auto bounds_bindings = RenderExecutorTestAccess::PrepareGraphicsBindings(
             executor, bounds_vertex, bounds_pixel, true);
+        std::array<PreparedBindings *, 2> bounds_stages{
+            &bounds_bindings.vertex[0], &*bounds_bindings.pixel};
+        vk::ImageAspectFlags bounds_feedback;
         const auto bounds_rendering = RenderExecutorTestAccess::AcquireRenderTargets(
-            executor, scheduler.Current(), &no_color, 0, bounds_depth, bounds_bindings.pixel);
+            executor, scheduler.Current(), &no_color, 0, bounds_depth,
+            bounds_stages, &bounds_feedback);
         descriptor_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
             executor, scheduler.Current(), bounds_bindings.vertex[0], *bounds_bindings.pixel));
         const auto &vertex_depth = bounds_bindings.vertex[0].images[0];
         const auto &pixel_depth = bounds_bindings.pixel->images[0];
-        constexpr auto readonly_layout = vk::ImageLayout::eDepthReadOnlyOptimal;
-        Require(name, "deferred clear with sampled read-only depth bounds",
+        const auto expected_layout = pass == 0
+            ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
+            : vk::ImageLayout::eDepthReadOnlyOptimal;
+        Require(name, "deferred clear with sampled depth bounds",
                 bounds_depth.image_id == depth_only.image_id &&
                     bounds_depth.depth_bounds_test_enable &&
                     !bounds_depth.depth_write_enable &&
                     bounds_depth.depth_load_clear_enable == (pass == 0) &&
                     !texture_cache.IsMetaCleared(depth_only_htile_address, 0) &&
-                    bounds_rendering.depth_stencil_attachment.image_layout == readonly_layout &&
+                    bounds_feedback == (pass == 0
+                                            ? vk::ImageAspectFlagBits::eDepth
+                                            : vk::ImageAspectFlags{}) &&
+                    bounds_rendering.depth_stencil_attachment.image_layout == expected_layout &&
                     bounds_rendering.depth_stencil_attachment.depth_clear == (pass == 0) &&
                     vertex_depth.image_id == depth_only.image_id &&
                     pixel_depth.image_id == depth_only.image_id &&
-                    MakeImageInfo(vertex_depth).imageLayout == readonly_layout &&
-                    MakeImageInfo(pixel_depth).imageLayout == readonly_layout,
-                "deferred clear changed guest depth writes, sampled layouts, or repeated");
+                    MakeImageInfo(vertex_depth).imageLayout == expected_layout &&
+                    MakeImageInfo(pixel_depth).imageLayout == expected_layout,
+                "a deferred clear sampled by vertex and pixel stages missed depth feedback");
         scheduler.BeginRendering(bounds_rendering);
         scheduler.EndRendering();
         RenderExecutorTestAccess::ResetBindings(executor);
@@ -11555,35 +11698,50 @@ public:
         auto shared_bindings =
             RenderExecutorTestAccess::PrepareGraphicsBindings(
                 executor, shared_depth_vertex, shared_depth_pixel, true);
+        auto& shared_image = texture_cache.GetImage(shared_depth.image_id);
+        auto stencil_view_info = shared_depth.desc.view_info;
+        stencil_view_info.aspect = vk::ImageAspectFlagBits::eStencil;
+        stencil_view_info.usage = vk::ImageUsageFlagBits::eSampled;
+        const auto stencil_view = shared_image.FindView(stencil_view_info);
+        auto& pixel_image = shared_bindings.pixel->images[0];
+        pixel_image.image_view = stencil_view;
+        pixel_image.desc.view_info = stencil_view_info;
+        std::array<PreparedBindings *, 2> shared_stages{
+            &shared_bindings.vertex[0], &*shared_bindings.pixel};
+        vk::ImageAspectFlags shared_feedback;
         const auto shared_rendering =
             RenderExecutorTestAccess::AcquireRenderTargets(
-                executor, scheduler.Current(), &no_color, 0, shared_depth, shared_bindings.pixel);
+                executor, scheduler.Current(), &no_color, 0, shared_depth,
+                shared_stages, &shared_feedback);
         descriptor_pipelines.push_back(RenderExecutorTestAccess::CommitBindings(
             executor, scheduler.Current(), shared_bindings.vertex[0],
             *shared_bindings.pixel));
         const auto expected_layout =
             stencil_write
-                ? vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal
+                ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
                 : vk::ImageLayout::eDepthStencilReadOnlyOptimal;
         const auto expected_access =
             vk::AccessFlagBits2::eShaderRead |
             vk::AccessFlagBits2::eDepthStencilAttachmentRead |
             vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
-        const auto &shared_image = texture_cache.GetImage(shared_depth.image_id);
         const auto &vertex_image = shared_bindings.vertex[0].images[0];
-        const auto &pixel_image = shared_bindings.pixel->images[0];
         Require(name, "sampled depth and stencil attachment layout",
                 shared_depth.image_id == phased_depth.image_id &&
+                    stencil_view != nullptr &&
+                    shared_feedback == (stencil_write
+                                            ? vk::ImageAspectFlagBits::eStencil
+                                            : vk::ImageAspectFlags{}) &&
                     vertex_image.image_id == shared_depth.image_id &&
                     pixel_image.image_id == shared_depth.image_id &&
+                    pixel_image.image_view == stencil_view &&
                     MakeImageInfo(vertex_image).imageLayout == expected_layout &&
                     MakeImageInfo(pixel_image).imageLayout == expected_layout &&
                     shared_rendering.depth_stencil_attachment.image_layout ==
                         expected_layout &&
                     shared_image.backing.state.layout == expected_layout &&
                     shared_image.backing.state.access_mask == expected_access,
-                "a shader alias replaced the depth/stencil attachment layout "
-                "or dropped an attachment access");
+                "stencil sampling and writes lost the feedback aspect, shared "
+                "layout, or attachment access");
         scheduler.BeginRendering(shared_rendering);
         scheduler.EndRendering();
         RenderExecutorTestAccess::ResetBindings(executor);
@@ -11679,7 +11837,8 @@ public:
       array_snapshot.images.push_back(array_descriptor);
       ShaderStageRuntime array_runtime{&array_program, &array_snapshot};
 
-      auto array_binding = executor.PrepareBindings(array_runtime);
+      PreparedBindings array_binding;
+      executor.PrepareBindings(array_runtime, array_binding);
       executor.RebindImages(array_binding);
       const auto expanded_array_id = array_binding.images[0].image_id;
       const auto &expanded_array = texture_cache.GetImage(expanded_array_id);
@@ -11767,7 +11926,8 @@ public:
         auto &value = buffer_snapshot.buffers.emplace_back();
         std::memcpy(value.dwords.data(), descriptor.fields, sizeof(descriptor.fields));
         value.dword_count = 4;
-        auto buffer_bindings = executor.PrepareBindings(buffer_runtime);
+        PreparedBindings buffer_bindings;
+        executor.PrepareBindings(buffer_runtime, buffer_bindings);
         std::array stages{&buffer_bindings};
         RenderColorInfo target{};
         target.desc = array_target;
@@ -11852,8 +12012,8 @@ public:
       colliding_msaa_snapshot.images.push_back(colliding_msaa_descriptor);
       ShaderStageRuntime colliding_msaa_runtime{
           &colliding_msaa_program, &colliding_msaa_snapshot};
-      auto colliding_msaa_binding =
-          executor.PrepareBindings(colliding_msaa_runtime);
+      PreparedBindings colliding_msaa_binding;
+      executor.PrepareBindings(colliding_msaa_runtime, colliding_msaa_binding);
       executor.RebindImages(colliding_msaa_binding);
       const auto &resolved_colliding_msaa =
           colliding_msaa_binding.images[0];
@@ -11911,7 +12071,8 @@ public:
       ShaderRecompiler::IR::ResourceSnapshot msaa_snapshot{};
       msaa_snapshot.images.push_back(msaa_descriptor);
       ShaderStageRuntime msaa_runtime{&msaa_program, &msaa_snapshot};
-      auto msaa_binding = executor.PrepareBindings(msaa_runtime);
+      PreparedBindings msaa_binding;
+      executor.PrepareBindings(msaa_runtime, msaa_binding);
       executor.RebindImages(msaa_binding);
       const auto &resolved_msaa = msaa_binding.images[0];
       Require(
@@ -11950,7 +12111,8 @@ public:
       ShaderRecompiler::IR::ResourceSnapshot msaa_array_snapshot{};
       msaa_array_snapshot.images.push_back(msaa_array_descriptor);
       ShaderStageRuntime msaa_array_runtime{&msaa_array_program, &msaa_array_snapshot};
-      auto msaa_array_binding = executor.PrepareBindings(msaa_array_runtime);
+      PreparedBindings msaa_array_binding;
+      executor.PrepareBindings(msaa_array_runtime, msaa_array_binding);
       executor.RebindImages(msaa_array_binding);
       const auto &resolved_msaa_array = msaa_array_binding.images[0];
       Require(name, "MSAA array backing expansion",
@@ -12214,7 +12376,8 @@ public:
       snapshot.images.push_back(descriptor);
       ShaderStageRuntime runtime{&program, &snapshot};
 
-      auto prepared = context.GetRenderExecutor().PrepareBindings(runtime);
+      PreparedBindings prepared;
+      context.GetRenderExecutor().PrepareBindings(runtime, prepared);
       const auto sampled_stencil_id = prepared.images[0].image_id;
       Require(name, "first stencil discovery",
               prepared.images.size() == 1 &&
@@ -12246,7 +12409,8 @@ public:
               "at the stencil guest address");
       RenderExecutorTestAccess::ResetBindings(executor);
 
-      auto redirected = context.GetRenderExecutor().PrepareBindings(runtime);
+      PreparedBindings redirected;
+      context.GetRenderExecutor().PrepareBindings(runtime, redirected);
       Require(name, "redirected owner discovery",
               redirected.images.size() == 1 &&
                   redirected.images[0].image_id == depth_id &&
@@ -12436,7 +12600,8 @@ public:
                     sizeof(plane_descriptor.fields));
         plane_value.dword_count = 4;
         const ShaderStageRuntime plane_runtime{&plane_program, &plane_snapshot};
-        auto plane_bindings = executor.PrepareBindings(plane_runtime);
+        PreparedBindings plane_bindings;
+        executor.PrepareBindings(plane_runtime, plane_bindings);
         vk::MemoryBarrier2 plane_barrier{};
         plane_barrier.srcStageMask = plane_barrier.dstStageMask =
             vk::PipelineStageFlagBits2::eAllCommands;
@@ -13502,12 +13667,18 @@ public:
               !depth_feedback || bindings.pixel->images[0].image_id == depth.image_id,
               "the fragment must sample the depth attachment's native image");
       auto &command = scheduler.Current();
+      vk::ImageAspectFlags feedback_aspects;
+      std::array<PreparedBindings *, 2> stages{
+          &bindings.vertex[0], &*bindings.pixel};
       auto rendering = RenderExecutorTestAccess::AcquireRenderTargets(
-          executor, command, &color, 1, depth, bindings.pixel);
+          executor, command, &color, 1, depth, stages, &feedback_aspects);
       const bool feedback_enabled = rendering.depth_stencil_attachment.image_layout ==
                                     vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT;
       Require(name, "per-draw depth feedback",
-              feedback_enabled == (depth_feedback && depth.depth_write_enable),
+              feedback_enabled == (depth_feedback && depth.depth_write_enable) &&
+                  feedback_aspects == (feedback_enabled
+                                          ? vk::ImageAspectFlagBits::eDepth
+                                          : vk::ImageAspectFlags{}),
               "feedback was not selected only for an overlapping fragment depth read/write");
       RenderExecutorTestAccess::CommitBindings(
           executor, command, selected, bindings.vertex[0], *bindings.pixel);
@@ -13540,9 +13711,7 @@ public:
       }
       const vk::Bool32 write = true;
       cmd.setColorWriteEnableEXT(1, &write);
-      cmd.setAttachmentFeedbackLoopEnableEXT(
-          feedback_enabled ? vk::ImageAspectFlags{vk::ImageAspectFlagBits::eDepth}
-                           : vk::ImageAspectFlags{});
+      cmd.setAttachmentFeedbackLoopEnableEXT(feedback_aspects);
       const vk::DeviceSize offset = 0;
       cmd.bindVertexBuffers(0, 1, &buffer.buffer, &offset);
       cmd.draw(vertex_count, 1, 0, 0);
@@ -16611,6 +16780,32 @@ TestCase Shifts() {
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase ScalarZeroShiftWithRuntimeCount() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code = {
+      EncodeSop2(0x20, 8, InlineU32(0), 4),
+      EncodeSop2(0x20, 9, 6, 4),
+  };
+  AppendStoreSgpr(&code, 8, 0);
+  AppendStoreSgpr(&code, 9, 1);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "ScalarZeroShiftWithRuntimeCount";
+  test.code = std::move(code);
+  test.expected = {0, 0x40000000u};
+  test.opcodes = {O::S_LSHR_B32, O::V_MOV_B32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.user_data = MakeStructuredStorageBufferData(0, 2 * sizeof(u32));
+  test.user_data[4] = 33;
+  test.user_data[6] = 0x80000000u;
+  test.has_user_data = true;
+  test.ir_counts = {{" = ShiftRightLogical32 ", 1}};
+  test.required_spirv = {"OpShiftRightLogical"};
+  return test;
+}
+
 TestCase ExactPushConstantExtent() {
   using O = ShaderOpcode;
 
@@ -18333,6 +18528,25 @@ TestCase ScalarWqmB32Masks(u32 wave_size) {
       store_marker(lo, hi);
     }
   }
+  for (u32 base : {106u, 126u}) {
+    for (u32 half : {0u, 1u}) {
+      AppendVMovU32(&code, 2, 0);
+      code.push_back(EncodeSMovB32(107, InlineU32(0)));
+      code.push_back(EncodeVopc(0xc2, InlineU32(3), 0)); // Only lane 3.
+      code.push_back(EncodeSop1(0x04, base, 106));
+      code.push_back(EncodeSop1(0x09, base + half, base + (half ^ 1u)));
+      code.push_back(EncodeSMovB32(20, base));
+      code.push_back(EncodeSMovB32(21, base + 1));
+      code.push_back(EncodeSop1(0x04, 126, base));
+      AppendVMovU32(&code, 2, 9);
+      code.push_back(EncodeSop1(0x04, 126, 193));
+      const u32 lo = half == 0 ? 0u : 8u;
+      const u32 hi = half == 0 ? 0u : 0xfu;
+      store_scalar(20, lo);
+      store_scalar(21, hi);
+      store_marker(lo, hi);
+    }
+  }
   AppendEnd(&code);
   test.initial.resize(test.expected.size());
   test.opcodes = {O::S_WQM_B32, O::S_MOV_B32, O::S_MOV_B64, O::S_CMP_EQ_U32,
@@ -18402,8 +18616,21 @@ TestCase ScalarWqmB64PreservesPartialMasks() {
   code.push_back(EncodeSop1(0x0a, 10, 8));
   code.push_back(EncodeSop1(0x04, 126, 10));
   AppendStoreVgprAtLaneDwordOffset(&code, 2, 0, offset);
+  code.push_back(EncodeSop1(0x04, 126, 16));
+  for (u32 source : {253u, 127u, 107u}) {
+    if (source == 253u) {
+      code.push_back(EncodeSopc(0x06, InlineU32(1), InlineU32(1))); // SCC=1.
+    } else {
+      AppendSMovLiteral(&code, source - 1, ~0u);
+      code.push_back(EncodeSMovB32(source, InlineU32(1)));
+    }
+    code.push_back(EncodeSop1(0x0a, 126, source));
+    offset += 64;
+    AppendStoreVgprAtLaneDwordOffset(&code, 2, 0, offset);
+    code.push_back(EncodeSop1(0x04, 126, 16));
+  }
   AppendEnd(&code);
-  test.initial.assign(256, 0xdeadbeef);
+  test.initial.assign(448, 0xdeadbeef);
   test.expected = test.initial;
   for (u32 lane = 0; lane < 64; ++lane) {
     for (u32 region = 0; region < 3; ++region) {
@@ -18412,9 +18639,12 @@ TestCase ScalarWqmB64PreservesPartialMasks() {
     if ((lane >= 4 && lane < 8) || (lane >= 32 && lane < 36)) {
       test.expected[192 + lane] = 9;
     }
+    for (u32 region = 4; region < 7; ++region) {
+      if (lane < 4) test.expected[region * 64 + lane] = 9;
+    }
   }
   test.opcodes = {O::S_MOV_B64, O::S_MOV_B32, O::S_WQM_B64, O::V_MOV_B32,
-                  O::V_CMP_EQ_U32, O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD,
+                  O::V_CMP_EQ_U32, O::S_CMP_EQ_U32, O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
   test.compute_info.threads_num[0] = 64;
   test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
@@ -20470,6 +20700,43 @@ TestCase VectorLaneWave32RuntimeSelectorWraps() {
   test.compute_info.wave_size = 32;
   test.compute_info.thread_ids_num = 1;
   test.compute_info.workgroup_register = 4;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase VectorReadlaneSelectsTwoKeysWithinWave() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  code.push_back(EncodeVop2(0x16, 1, InlineU32(4), 0)); // lanes 0..15: 0, 16..31: 1
+  AppendVop3(&code, 0x360, 20, Vgpr(1), InlineU32(0));
+  AppendVop3(&code, 0x360, 21, Vgpr(1), InlineU32(16));
+  AppendVMovU32(&code, 2, 0);
+  AppendVMovU32(&code, 3, 11);
+  AppendVMovU32(&code, 4, 22);
+  code.push_back(EncodeVopc(0xc2, 20, 1)); // selected lane 0 key == local key
+  code.push_back(EncodeVop2(0x01, 2, Vgpr(2), 3));
+  code.push_back(EncodeVopc(0xc2, 21, 1)); // selected lane 16 key == local key
+  code.push_back(EncodeVop2(0x01, 2, Vgpr(2), 4));
+  AppendStoreVgprAtLaneDwordOffset(&code, 2, 0, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "VectorReadlaneSelectsTwoKeysWithinWave";
+  test.code = std::move(code);
+  test.expected.resize(32);
+  std::fill_n(test.expected.begin(), 16, 11u);
+  std::fill_n(test.expected.begin() + 16, 16, 22u);
+  test.opcodes = {O::V_LSHRREV_B32, O::V_READLANE_B32, O::V_MOV_B32,
+                  O::V_CMP_EQ_U32, O::V_CNDMASK_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"V_READLANE_B32", 2}};
+  test.required_spirv = {"OpGroupNonUniformShuffle"};
+  test.compute_info.threads_num[0] = 32;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.wave_size = 32;
+  test.compute_info.thread_ids_num = 1;
   test.has_compute_info = true;
   return test;
 }
@@ -23449,6 +23716,38 @@ TestCase BufferStoreFormatXResource16UintPreservesAdjacentLanes() {
   test.user_data = MakeStructuredStorageBufferData(2, 64, false, 11);
   test.has_user_data = true;
   test.required_spirv = {"OpAtomicLoad", "OpAtomicCompareExchange"};
+  return test;
+}
+
+TestCase BufferStoreFormatXyzwFloat16ConvertsComponents() {
+  using O = ShaderOpcode;
+
+  // This finite F32 has low bits 0x7e63, which form an F16 NaN if truncated.
+  constexpr std::array<float, 8> values = {
+      std::bit_cast<float>(0x3f807e63u), -2.0f, 0.5f, 0.25f,
+      -4.0f, 3.0f, 0.0f, 2.0f};
+  std::vector<u32> code;
+  for (u32 record = 0; record < 2; record++) {
+    for (u32 component = 0; component < 4; component++) {
+      AppendVMovLiteral(&code, component,
+                        std::bit_cast<u32>(values[record * 4 + component]));
+    }
+    AppendVMovU32(&code, 20, record);
+    code.push_back(EncodeMubuf0(0x07u, 0, true, false));
+    code.push_back(EncodeMubuf1(0, 0, 20));
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "BufferStoreFormatXyzwFloat16ConvertsComponents";
+  test.code = std::move(code);
+  test.initial = std::vector<u32>(4, 0xdeadbeefu);
+  test.expected = {0xc0003c04u, 0x34003800u, 0x4200c400u, 0x40000000u};
+  test.user_data = MakeStructuredStorageBufferData(
+      8, 2, false, BufferFormat(Prospero::BufferFormat::k16_16_16_16Float));
+  test.has_user_data = true;
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_XYZW, O::S_ENDPGM};
+  test.required_spirv = {"PackHalf2x16"};
   return test;
 }
 
@@ -28034,6 +28333,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(IntegerAddSubMul);
   AddCase(BitwiseOps);
   AddCase(Shifts);
+  AddCase(ScalarZeroShiftWithRuntimeCount);
   AddCase(ExactPushConstantExtent);
   AddCase(ScalarShiftCountsMaskLowBits);
   AddCase(Rdna2ScalarOpcodes);
@@ -28140,6 +28440,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorWritelaneIgnoresExecMask);
   AddCase(VectorReadlaneFromInactiveWrittenLane);
   AddCase(VectorLaneWave32RuntimeSelectorWraps);
+  AddCase(VectorReadlaneSelectsTwoKeysWithinWave);
   AddCase(VectorPermlanex16);
   AddCase(VectorPermlane16FetchInactiveZero);
   AddCase(VectorPermlane16FetchInactiveFi);
@@ -28233,6 +28534,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferFormatStoreVariants);
   AddCase(BufferStoreFormatXResource16UintWritesHalfword);
   AddCase(BufferStoreFormatXResource16UintPreservesAdjacentLanes);
+  AddCase(BufferStoreFormatXyzwFloat16ConvertsComponents);
   AddCase(BufferStoreFormatXyzwSnorm16CapturedSkinningVectors);
   AddCase(BufferStoreFormatXSnorm16ClampsRoundsAndPreservesHalfwords);
   AddCase(BufferLoadFormatXResource8UintZeroExtendsByte);
@@ -31121,6 +31423,81 @@ void CheckDepthAttachmentWrites() {
   std::printf("[host]    %-32s ok\n", "DepthAttachmentWrites");
 }
 
+void CheckDepthFeedbackAspects() {
+  RenderDepthInfo target{};
+  target.desc.view_info.format = vk::Format::eD32SfloatS8Uint;
+  target.desc.view_info.base_level = 1;
+  target.desc.view_info.level_count = 2;
+  target.desc.view_info.base_layer = 3;
+  target.desc.view_info.layer_count = 2;
+  target.depth_test_enable = true;
+  target.depth_write_enable = true;
+  target.depth_compare_op = vk::CompareOp::eAlways;
+  target.stencil_test_enable = true;
+  target.stencil_front = {vk::StencilOp::eKeep, vk::StencilOp::eReplace,
+                          vk::StencilOp::eKeep, vk::CompareOp::eAlways, 0xff, 0xff, 0};
+  target.stencil_back = target.stencil_front;
+
+  auto sampled = target.desc.view_info;
+  const auto feedback = [&](const ImageViewInfo& view) {
+    return DepthFeedbackAspects(target.AttachmentWriteAspects(),
+                                target.desc.view_info, view);
+  };
+  sampled.aspect = vk::ImageAspectFlagBits::eDepth;
+  Require("DepthFeedbackAspects", "sampled writable depth",
+          feedback(sampled) == vk::ImageAspectFlagBits::eDepth,
+          "overlapping depth sampling did not request depth feedback");
+  sampled.aspect = vk::ImageAspectFlagBits::eStencil;
+  Require("DepthFeedbackAspects", "sampled writable stencil",
+          feedback(sampled) == vk::ImageAspectFlagBits::eStencil,
+          "overlapping stencil sampling did not request stencil feedback");
+  sampled.aspect = vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
+  Require("DepthFeedbackAspects", "both writable aspects",
+          feedback(sampled) == sampled.aspect,
+          "combined depth/stencil sampling lost a writable aspect");
+
+  target.depth_write_enable = false;
+  Require("DepthFeedbackAspects", "read-only depth",
+          feedback(sampled) == vk::ImageAspectFlagBits::eStencil,
+          "read-only depth was included in stencil feedback");
+  target.depth_write_enable = true;
+  target.stencil_test_enable = false;
+  Require("DepthFeedbackAspects", "read-only stencil",
+          feedback(sampled) == vk::ImageAspectFlagBits::eDepth,
+          "read-only stencil was included in depth feedback");
+
+  sampled.aspect = vk::ImageAspectFlagBits::eStencil;
+  Require("DepthFeedbackAspects", "sampled read-only aspect",
+          !feedback(sampled),
+          "sampling a read-only stencil requested feedback for depth writes");
+  sampled.aspect = vk::ImageAspectFlagBits::eDepth;
+  sampled.base_level = 3;
+  Require("DepthFeedbackAspects", "disjoint mip",
+          !feedback(sampled),
+          "disjoint mip ranges requested depth feedback");
+  sampled.base_level = 2;
+  sampled.base_layer = 5;
+  Require("DepthFeedbackAspects", "disjoint layer",
+          !feedback(sampled),
+          "disjoint layer ranges requested depth feedback");
+  sampled.base_layer = 4;
+  Require("DepthFeedbackAspects", "overlapping range boundary",
+          feedback(sampled) == vk::ImageAspectFlagBits::eDepth,
+          "overlapping mip and layer boundaries missed depth feedback");
+  target.depth_write_enable = false;
+  target.depth_load_clear_enable = true;
+  Require("DepthFeedbackAspects", "depth clear only",
+          feedback(sampled) == vk::ImageAspectFlagBits::eDepth,
+          "a sampled depth attachment clear missed feedback");
+  target.depth_load_clear_enable = false;
+  target.stencil_clear_enable = true;
+  sampled.aspect = vk::ImageAspectFlagBits::eStencil;
+  Require("DepthFeedbackAspects", "stencil clear only",
+          feedback(sampled) == vk::ImageAspectFlagBits::eStencil,
+          "a sampled stencil attachment clear missed feedback");
+  std::printf("[host]    %-32s ok\n", "DepthFeedbackAspects");
+}
+
 void CheckDynamicRenderingState() {
   RenderState first{};
   first.width = 64;
@@ -31168,10 +31545,10 @@ void CheckDynamicRenderingState() {
               vk::ImageLayout::eDepthStencilReadOnlyOptimal,
           "fully read-only depth/stencil used a writable layout");
   attachment.depth_load_clear_enable = true;
-  Require("DynamicRenderingState", "read-only deferred depth clear",
+  Require("DynamicRenderingState", "deferred depth clear layout",
           depth_attachment_layout(attachment) ==
-              vk::ImageLayout::eDepthStencilReadOnlyOptimal,
-          "a load clear changed the guest depth-write layout");
+              vk::ImageLayout::eDepthAttachmentStencilReadOnlyOptimal,
+          "a depth load clear used a read-only attachment layout");
   attachment.depth_test_enable = true;
   attachment.depth_write_enable = true;
   Require("DynamicRenderingState", "depth-write stencil-read layout",
@@ -32969,6 +33346,11 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, BufferFormatStoreVariants());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--buffer-float16-store-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, BufferStoreFormatXyzwFloat16ConvertsComponents());
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--s-ashr-i64-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, ScalarAshrI64Edges(false));
@@ -33192,6 +33574,11 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, VectorAlignByteUsesFiveBitByteOffset());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--zero-shift-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, ScalarZeroShiftWithRuntimeCount());
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--sdwa-mov-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, Vop1SdwaMovByteDestinations());
@@ -33268,6 +33655,7 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--image-overlap-only") == 0) {
     CheckDepthAttachmentWrites();
+    CheckDepthFeedbackAspects();
     CheckDynamicRenderingState();
     VulkanHarness vulkan;
     vulkan.CheckRasterization(false);
@@ -33283,6 +33671,12 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--draw-offset-only") == 0) {
     CheckEmbeddedFetchVertexOffset();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--depth-feedback-only") == 0) {
+    CheckDepthAttachmentWrites();
+    CheckDepthFeedbackAspects();
+    CheckDynamicRenderingState();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--polygon-mode-only") == 0) {
@@ -33400,6 +33794,11 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, ImageCubeGradientsPreserveDerivatives());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--readlane-key-guard-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, VectorReadlaneSelectsTwoKeysWithinWave());
+    return 0;
+  }
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
   if (argc == 2 && std::strcmp(argv[1], "--reverse-rt-death") == 0) {
     RunReverseRenderTargetDeathCase();
@@ -33482,6 +33881,7 @@ int main(int argc, char **argv) {
   CheckPs5DepthRegisterDecoding();
   CheckDepthHtileStencilCompatibility();
   CheckDepthAttachmentWrites();
+  CheckDepthFeedbackAspects();
   CheckDynamicRenderingState();
   CheckDepthTargetFootprints();
   CheckSlotVectorLifetime();
@@ -33491,6 +33891,7 @@ int main(int argc, char **argv) {
     return 2;
   }
   CheckShaderRecompilerFatalContracts();
+  CheckDepthFeedbackAspects();
   VulkanHarness vulkan;
 #endif
   CheckImageSamplerSpecialization();

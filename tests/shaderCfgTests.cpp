@@ -4635,6 +4635,108 @@ void TestNewShaderRecompilerCapturedVopcSdwaCmpxLtU16() {
         "V_CMPX_LT_U16 accepted an unsupported DPP encoding");
 }
 
+void TestNewShaderRecompilerCmpxEqU16() {
+  using namespace ShaderRecompiler;
+
+  const uint32_t compact[] = {
+      0x7d740300u, // v_cmpx_eq_u16 exec_lo, v0, v1
+      EncodeSopp(0x01),
+  };
+  Decoder::Instruction decoded;
+  Decoder::DecodeInstruction(compact, 0u, decoded);
+  Check(decoded.family == Decoder::Family::VOPC &&
+            decoded.opcode == Decoder::Opcode::V_CMPX_EQ_U16 &&
+            decoded.opcode_id == 0xbau && decoded.word_count == 1u &&
+            decoded.dst.kind == Decoder::OperandKind::ExecLo &&
+            decoded.src_count == 2u && decoded.src0.kind == Decoder::OperandKind::Vgpr &&
+            decoded.src0.reg == 0u && decoded.src1.kind == Decoder::OperandKind::Vgpr &&
+            decoded.src1.reg == 1u,
+        "decoder rejected compact V_CMPX_EQ_U16");
+
+  Decoder::Program program;
+  Decoder::DecodeProgram(compact, program);
+  const auto graph = CFG::BuildGraph(program);
+  Check(!graph.unsupported, "V_CMPX_EQ_U16 still fails CFG construction");
+
+  ShaderPixelInputInfo pixel{};
+  Frontend::TranslateOptions translate_options{};
+  translate_options.stage = ShaderType::Pixel;
+  translate_options.wave_size = 64u;
+  translate_options.input_info.pixel = &pixel;
+  const auto translated =
+      Frontend::TranslateProgram(program, graph, translate_options);
+  uint32_t equality_compares = 0u;
+  uint32_t exec_updates = 0u;
+  uint32_t exec_lo_updates = 0u;
+  uint32_t exec_hi_updates = 0u;
+  for (const auto *block : translated.blocks) {
+    for (const auto &inst : *block) {
+      equality_compares +=
+          inst.GetOpcode() == IR::ValueOpcode::IEqual32 ? 1u : 0u;
+      if (inst.GetOpcode() == IR::ValueOpcode::SetExec &&
+          !inst.Arg(0).Resolve().IsImmediate()) {
+        exec_updates++;
+      }
+      if (inst.GetOpcode() == IR::ValueOpcode::SetExecLo &&
+          !inst.Arg(0).Resolve().IsImmediate()) {
+        exec_lo_updates++;
+      }
+      if (inst.GetOpcode() == IR::ValueOpcode::SetExecHi &&
+          !inst.Arg(0).Resolve().IsImmediate()) {
+        exec_hi_updates++;
+      }
+    }
+  }
+  Check(equality_compares == 1u && exec_updates == 1u && exec_lo_updates >= 1u &&
+            exec_hi_updates >= 1u,
+        "V_CMPX_EQ_U16 did not lower to equality plus CMPX EXEC updates");
+
+  auto result = RecompileForTest(compact, MakeCompileOptions(ShaderType::Pixel));
+  Check((result.decoded_dump.find("V_CMPX_EQ_U16 exec_lo, v0, v1") != std::string::npos),
+        "V_CMPX_EQ_U16 is missing from the decoded dump");
+  CheckSpirvBinaryValidates(result.spirv);
+
+  const uint32_t sdwa[] = {
+      EncodeVopc(0xbau, 249u, 1u),
+      EncodeVopcSdwa(0u),
+      EncodeSopp(0x01),
+  };
+  Decoder::DecodeInstruction(sdwa, 0u, decoded);
+  Check(decoded.family == Decoder::Family::VOPC &&
+            decoded.opcode == Decoder::Opcode::V_CMPX_EQ_U16 &&
+            decoded.opcode_id == 0xbau && decoded.word_count == 2u &&
+            decoded.dst.kind == Decoder::OperandKind::ExecLo &&
+            decoded.src0.kind == Decoder::OperandKind::Vgpr && decoded.src0.reg == 0u &&
+            decoded.src1.kind == Decoder::OperandKind::Vgpr && decoded.src1.reg == 1u,
+        "decoder rejected SDWA V_CMPX_EQ_U16");
+  result = RecompileForTest(sdwa, MakeCompileOptions(ShaderType::Pixel));
+  Check((result.decoded_dump.find("V_CMPX_EQ_U16 exec_lo, v0") != std::string::npos),
+        "SDWA V_CMPX_EQ_U16 is missing from the decoded dump");
+  CheckSpirvBinaryValidates(result.spirv);
+
+  const uint32_t vop3[] = {
+      0xd4ba007eu,
+      0x00020300u,
+      EncodeSopp(0x01),
+  };
+  Decoder::DecodeInstruction(vop3, 0u, decoded);
+  Check(decoded.family == Decoder::Family::VOP3 &&
+            decoded.opcode == Decoder::Opcode::V_CMPX_EQ_U16 &&
+            decoded.dst.kind == Decoder::OperandKind::ExecLo &&
+            decoded.src0.kind == Decoder::OperandKind::Vgpr && decoded.src0.reg == 0u &&
+            decoded.src1.kind == Decoder::OperandKind::Vgpr && decoded.src1.reg == 1u,
+        "decoder rejected VOP3 V_CMPX_EQ_U16");
+  result = RecompileForTest(vop3, MakeCompileOptions(ShaderType::Pixel));
+  CheckSpirvBinaryValidates(result.spirv);
+
+  const uint32_t dpp[] = {EncodeVopc(0xbau, 250u, 1u), EncodeVop2Dpp(0u)};
+  Decoder::DecodeInstruction(dpp, 0u, decoded);
+  Check(decoded.opcode == Decoder::Opcode::UNSUPPORTED &&
+            (decoded.unsupported_reason.find("VOPC DPP modifier is not supported for opcode") !=
+             std::string::npos),
+        "V_CMPX_EQ_U16 accepted an unsupported DPP encoding");
+}
+
 void TestNewShaderRecompilerIrLookupMissFailsExplicitly() {
   namespace Decoder = ShaderRecompiler::Decoder;
   namespace CFG = ShaderRecompiler::CFG;
@@ -13564,6 +13666,7 @@ int main() {
   TestSopkCompareImmediateExtension();
   TestNewShaderRecompilerCapturedVopcSdwaCmpxClass();
   TestNewShaderRecompilerCapturedVopcSdwaCmpxLtU16();
+  TestNewShaderRecompilerCmpxEqU16();
   TestNewShaderRecompilerIrLookupMissFailsExplicitly();
   TestNewShaderRecompilerRejectsDppOn64BitCompares();
   TestPsInputCountRegisterDecode();

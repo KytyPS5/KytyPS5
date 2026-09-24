@@ -23,6 +23,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <future>
 #include <limits>
 #include <memory>
 #include <string>
@@ -532,6 +533,97 @@ void CheckSocketWakeup() {
             *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EBADF &&
             readable[reader / 64] == bit,
         "closed descriptor fails without clearing input fd_set");
+
+#if defined(_WIN32)
+  // FreeBSD accept(2) inherits O_NONBLOCK from the listening socket. Keep the native
+  // accepted socket and the emulator's guest-mode bookkeeping in agreement.
+  std::array<uint8_t, 16> inherited_address {16, 2, 0, 0, 127, 0, 0, 1};
+  const int inherited_listener = Net::Socket(2, 1, 0);
+  Check(inherited_listener >= 0 &&
+            Net::Bind(inherited_listener, inherited_address.data(),
+                      inherited_address.size()) == 0 &&
+            Net::Listen(inherited_listener, 1) == 0,
+        "create listener for accepted-mode test");
+  uint32_t inherited_address_size = inherited_address.size();
+  Check(Net::Getsockname(inherited_listener, inherited_address.data(),
+                         &inherited_address_size) == 0,
+        "get accepted-mode listener port");
+  const int inherited_writer = Net::Socket(2, 1, 0);
+  const int inherited_nonblocking = 1;
+  Check(Net::Setsockopt(inherited_listener, 0xffff, 0x1200, &inherited_nonblocking,
+                        sizeof(inherited_nonblocking)) == 0 &&
+            Net::Connect(inherited_writer, inherited_address.data(),
+                         inherited_address_size) == 0,
+        "connect to nonblocking listener");
+  const int inherited_reader = Net::Accept(inherited_listener, nullptr, nullptr);
+  Check(inherited_reader >= 0, "accept nonblocking listener socket");
+  Check(Net::Send(inherited_writer, text, prefix_length, 0) == prefix_length,
+        "send accepted-mode prefix");
+  std::array<char, text_length> inherited_message {};
+  auto inherited_receive = std::async(std::launch::async, [&] {
+    return Net::Recv(inherited_reader, inherited_message.data(), inherited_message.size(),
+                     0x42);
+  });
+  const bool returned_before_completion =
+      inherited_receive.wait_for(std::chrono::milliseconds(250)) ==
+      std::future_status::ready;
+  Check(Net::Send(inherited_writer, text + prefix_length,
+                  text_length - prefix_length, 0) == text_length - prefix_length,
+        "send accepted-mode suffix");
+  const int64_t inherited_result = inherited_receive.get();
+  Check(returned_before_completion && inherited_result == prefix_length &&
+            std::memcmp(inherited_message.data(), text, prefix_length) == 0,
+        "accepted nonblocking PEEK and WAITALL returns the prefix");
+  Check(Net::Recv(inherited_reader, inherited_message.data(), inherited_message.size(), 0) ==
+            text_length,
+        "consume accepted-mode peeked message");
+  Check(Net::SocketClose(inherited_reader) == 0 &&
+            Net::SocketClose(inherited_writer) == 0 &&
+            Net::SocketClose(inherited_listener) == 0,
+        "close accepted-mode sockets");
+#endif
+
+  // A zero-length datagram peek still has to report its source address on Winsock.
+  std::array<uint8_t, 16> datagram_address {16, 2, 0, 0, 127, 0, 0, 1};
+  const int datagram_receiver = Net::Socket(2, 2, 0);
+  Check(datagram_receiver >= 0 &&
+            Net::Bind(datagram_receiver, datagram_address.data(),
+                      datagram_address.size()) == 0,
+        "create datagram receiver");
+  uint32_t datagram_address_size = datagram_address.size();
+  Check(Net::Getsockname(datagram_receiver, datagram_address.data(),
+                         &datagram_address_size) == 0,
+        "get datagram receiver port");
+  const int datagram_sender = Net::Socket(2, 2, 0);
+  std::array<uint8_t, 16> datagram_sender_address {16, 2, 0, 0, 127, 0, 0, 1};
+  Check(datagram_sender >= 0 &&
+            Net::Bind(datagram_sender, datagram_sender_address.data(),
+                      datagram_sender_address.size()) == 0,
+        "bind datagram sender");
+  uint32_t datagram_sender_address_size = datagram_sender_address.size();
+  Check(Net::Getsockname(datagram_sender, datagram_sender_address.data(),
+                         &datagram_sender_address_size) == 0,
+        "get datagram sender port");
+  const char empty_datagram = 0;
+  Check(Net::Sendto(datagram_sender, &empty_datagram, 0, 0, datagram_address.data(),
+                    datagram_address.size()) == 0,
+        "send zero-length datagram");
+  std::array<uint8_t, 16> datagram_source {};
+  uint32_t datagram_source_size = datagram_source.size();
+  std::array<char, 1> datagram_buffer {};
+  Check(Net::Recvfrom(datagram_receiver, datagram_buffer.data(), 0, 0x42,
+                      datagram_source.data(), &datagram_source_size) == 0 &&
+            datagram_source_size == datagram_sender_address.size() &&
+            std::memcmp(datagram_source.data(), datagram_sender_address.data(),
+                        datagram_sender_address.size()) == 0,
+        "zero-length datagram PEEK and WAITALL reports its source");
+  datagram_source_size = datagram_source.size();
+  Check(Net::Recvfrom(datagram_receiver, datagram_buffer.data(), datagram_buffer.size(), 0,
+                      datagram_source.data(), &datagram_source_size) == 0,
+        "consume zero-length datagram");
+  Check(Net::SocketClose(datagram_sender) == 0 &&
+            Net::SocketClose(datagram_receiver) == 0,
+        "close datagram sockets");
 }
 
 } // namespace

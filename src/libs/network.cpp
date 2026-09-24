@@ -1109,7 +1109,9 @@ static bool SocketIsStream(NativeSocket socket) {
 
 // A peek never consumes, so the buffered prefix keeps the socket readable and a poll would
 // return immediately. The retries are paced instead, and the poll is only used to notice a
-// closed or reset peer, which ends the wait with the short read the guest expects.
+// closed or reset peer, which ends the wait with the short read the guest expects. A blocking
+// MSG_WAITALL may otherwise wait indefinitely: that is the requested semantics when a peer
+// stays open but sends only a prefix, so imposing an arbitrary timeout would truncate it.
 static short PollSocket(NativeSocket socket) {
 	WSAPOLLFD event {};
 	event.fd     = socket;
@@ -1143,8 +1145,23 @@ static int64_t RecvPeekWaitAll(NativeSocket socket, bool nonblocking, bool no_wa
 	}
 	bool peer_closed = false;
 	for (;;) {
-		const int64_t peeked = RecvHost(socket, buf, host_len, MSG_PEEK, host_addr, host_addrlen);
+		char                 scratch = 0;
+		char*                peek_buf = buf;
+		SocketIoLength       peek_len = host_len;
+		if (peek_len == 0 && host_addr != nullptr && !SocketIsStream(socket)) {
+			// Winsock may reject a zero-length datagram peek before filling from. A
+			// one-byte scratch buffer keeps MSG_PEEK semantics while obtaining the source.
+			peek_buf = &scratch;
+			peek_len = 1;
+		}
+		const int64_t peeked =
+		    RecvHost(socket, peek_buf, peek_len, MSG_PEEK, host_addr, host_addrlen);
 		if (peeked < 0) {
+			if (WSAGetLastError() == WSAEMSGSIZE) {
+				// Winsock copied a truncated datagram prefix, but a zero-length peek can also
+				// report the non-empty message this way. The outer receive maps both to len.
+				return host_len;
+			}
 			return SetHostSocketError();
 		}
 		if (peeked >= host_len || peeked == 0 || peer_closed || nonblocking || no_wait ||
@@ -1989,7 +2006,8 @@ int KYTY_SYSV_ABI Accept(int s, void* addr, uint32_t* addrlen) {
 	     s, reinterpret_cast<uint64_t>(addr), reinterpret_cast<uint64_t>(addrlen));
 
 	NativeSocket socket = INVALID_NATIVE_SOCKET;
-	if (!GetSocketBackend(s, &socket)) {
+	SocketSlot   state;
+	if (!GetSocketBackend(s, &socket, &state)) {
 		return -1;
 	}
 
@@ -2001,8 +2019,17 @@ int KYTY_SYSV_ABI Accept(int s, void* addr, uint32_t* addrlen) {
 		return SetHostSocketError();
 	}
 
-	auto      transport = std::make_shared<SocketTransport>(accepted);
-	const int fd        = AllocSocketFd(transport);
+	auto transport = std::make_shared<SocketTransport>(accepted);
+#if defined(_WIN32)
+	// FreeBSD accept(2) inherits O_NONBLOCK. Keep both the native Winsock mode and the
+	// guest-side flag in sync so later PEEK | WAITALL calls preserve that behavior.
+	u_long nonblocking = state.transport->nonblocking ? 1 : 0;
+	if (ioctlsocket(accepted, FIONBIO, &nonblocking) == SOCKET_ERROR) {
+		return SetHostSocketError();
+	}
+	transport->nonblocking = nonblocking != 0;
+#endif
+	const int fd = AllocSocketFd(transport);
 	if (fd < 0) {
 		*Posix::GetErrorAddr() = Posix::POSIX_EMFILE;
 		return -1;

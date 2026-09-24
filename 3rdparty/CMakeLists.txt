@@ -1,7 +1,5 @@
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 
-add_subdirectory(cpuinfo)
-
 include(FetchContent)
 
 # The Bluetooth DualSense transports speaker audio as fixed-size Opus packets.

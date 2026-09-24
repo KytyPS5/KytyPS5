@@ -565,8 +565,7 @@ void CheckSocketWakeup() {
                      0x42);
   });
   const bool returned_before_completion =
-      inherited_receive.wait_for(std::chrono::milliseconds(250)) ==
-      std::future_status::ready;
+      inherited_receive.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
   Check(Net::Send(inherited_writer, text + prefix_length,
                   text_length - prefix_length, 0) == text_length - prefix_length,
         "send accepted-mode suffix");

@@ -67,7 +67,14 @@ struct MemoryInfo {
 	bool                    image_r128                                            = false;
 	bool                    idxen                                                 = false;
 	bool                    offen                                                 = false;
+	bool                    coherent                                              = false;
 	bool                    planning_only                                         = false;
+
+	[[nodiscard]] bool SupportsIndirectBufferLoad(ValueOpcode opcode) const {
+		return !formatted && !typed && data_bits == 32u &&
+		       (opcode == ValueOpcode::LoadBufferU32x2 || opcode == ValueOpcode::LoadBufferU32x3 ||
+		        opcode == ValueOpcode::LoadBufferU32x4);
+	}
 
 	bool operator==(const MemoryInfo& other) const = default;
 };

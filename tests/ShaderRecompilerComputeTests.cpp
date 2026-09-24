@@ -19018,6 +19018,52 @@ TestCase Vop2SdwaAshrrevCapturedWord0SignExtends() {
   return test;
 }
 
+TestCase Vop2SdwaMaxI32CapturedHighWord(u32 wave_size) {
+  using O = ShaderOpcode;
+  struct MaxCase { u32 lhs, packed_rhs, expected, exec = 1; };
+  constexpr std::array<MaxCase, 9> cases{{
+      {0xfffffffbu, 0xfffe1234u, 0xfffffffeu}, // -5 versus sign-extended -2.
+      {0xffffffffu, 0x80007fffu, 0xffffffffu},
+      {3, 0x0007ffffu, 7},                  // Ignore the low word.
+      {0xffffffffu, 0x0000ffffu, 0},
+      {0x80000000u, 0x80000000u, 0xffff8000u},
+      {0x7fffffffu, 0x8000ffffu, 0x7fffffffu},
+      {0x0000ffffu, 0x7fffffffu, 0x0000ffffu}, // Source 0 stays 32-bit.
+      {0x00007fffu, 0x7fff8000u, 0x00007fffu},
+      {0x80000001u, 0x7fff0123u, 0x80000001u, 0}, // Inactive destination.
+  }};
+  TestCase test;
+  test.name = wave_size == 64 ? "Vop2SdwaMaxI32HighWordWave64"
+                             : "Vop2SdwaMaxI32HighWordWave32";
+  for (const auto &entry : cases) {
+    test.initial.insert(test.initial.end(), {entry.lhs, entry.packed_rhs});
+  }
+  test.initial.resize(cases.size() * 3u, 0xdeadbeefu);
+  test.expected = test.initial;
+  auto &code = test.code;
+  for (u32 i = 0; i < cases.size(); ++i) {
+    AppendVMovU32(&code, 30, i * 8u);
+    AppendBufferLoadDword(&code, 11, 30);
+    AppendVMovU32(&code, 30, i * 8u + 4u);
+    AppendBufferLoadDword(&code, 22, 30);
+    code.push_back(EncodeSMovB32(126, InlineU32(cases[i].exec)));
+    // Exact game encoding: v11 = max(v11, sign_extend(v22.word1)).
+    code.insert(code.end(), {0x24162cf9u, 0x0d06060bu});
+    code.push_back(EncodeSMovB32(126, InlineU32(1)));
+    const u32 out = cases.size() * 2u + i;
+    AppendStoreVgpr(&code, 11, out);
+    test.expected[out] = cases[i].expected;
+  }
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::BUFFER_LOAD_DWORD,
+                  O::V_MAX_I32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"V_MAX_I32 v11, v11, v22.sdwa(sel=5,sext=1)", cases.size()}};
+  test.required_spirv = {"OpBitFieldSExtract"};
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase Vop2SdwaLshrrevCapturedByte1Source() {
   using O = ShaderOpcode;
 
@@ -22783,6 +22829,31 @@ TestCase BranchVccnzUsesWaveMask() {
   return test;
 }
 
+TestCase ScalarMemRealtimeCapturedPlaceholder() {
+  using O = ShaderOpcode;
+  namespace D = ShaderRecompiler::Decoder;
+
+  std::vector<u32> code = {0xf4940300u, 0xfa000000u};
+  D::Instruction decoded;
+  D::DecodeInstruction(code, 0, decoded);
+  Require("ScalarMemRealtimeCapturedPlaceholder", "decode",
+          decoded.opcode == O::S_MEMREALTIME && decoded.word_count == 2 &&
+              decoded.dst.kind == D::OperandKind::Sgpr && decoded.dst.reg == 12 &&
+              decoded.data_dwords == 2 && decoded.src_count == 0 &&
+              decoded.src0.kind == D::OperandKind::Unknown &&
+              decoded.src1.kind == D::OperandKind::Unknown,
+          "captured clock instruction must write s12:s13 without memory operands");
+  AppendStoreSgprPair(&code, 12, 0);
+  code.insert(code.end(), {0xf4940300u, 0xfa000000u});
+  AppendStoreSgprPair(&code, 12, 2);
+  AppendEnd(&code);
+  return {"ScalarMemRealtimeCapturedPlaceholder",
+          code,
+          {},
+          {UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX},
+          {O::S_MEMREALTIME, O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+}
+
 TestCase ScalarMemoryLoadVariants() {
   using O = ShaderOpcode;
 
@@ -23171,7 +23242,7 @@ TestCase BufferLoadDwordx4ZeroesOnlyOutOfBoundsTail() {
   return test;
 }
 
-TestCase BufferLoadsGpuSelectedDescriptors() {
+TestCase BufferLoadsGpuSelectedDescriptors(bool xyz) {
   using O = ShaderOpcode;
   constexpr uint64_t GuestBase = 0x0000000110000000ull;
   struct DescriptorCase {
@@ -23181,6 +23252,8 @@ TestCase BufferLoadsGpuSelectedDescriptors() {
   };
   const DescriptorCase cases[] = {
       {24, 2, 0, 0, false, true, {7, 8, 9, 10, 11, 12}},
+      // PPSA01417 selects XYZ vertices from a table of stride-16 descriptors.
+      {16, 2, 0, 0, false, true, {5, 6, 7, 8, 0, 0}},
       {12, 2, 0, 0, false, true, {4, 5, 6, 0, 0, 0}},
       {12, 2, 1, 0, false, true, {4, 5, 6, 7, 8, 9}},
       {12, 1, 2, 0, false, true, {4, 5, 6, 7, 8, 9}},
@@ -23194,7 +23267,8 @@ TestCase BufferLoadsGpuSelectedDescriptors() {
       {12, 4, 3, 4, true, true, {}},
   };
   TestCase test;
-  test.name = "BufferLoadsGpuSelectedDescriptors";
+  test.name = xyz ? "BufferLoadDwordx3GpuSelectedDescriptors"
+                  : "BufferLoadsGpuSelectedDescriptors";
   test.initial.resize(2048);
   for (u32 i = 0; i < std::size(cases); ++i) {
     const auto &input = cases[i];
@@ -23220,10 +23294,10 @@ TestCase BufferLoadsGpuSelectedDescriptors() {
     test.code.push_back(EncodeSmem1(520, 20));
     AppendSMovLiteral(&test.code, 22, cases[selected].soffset);
     AppendVMovU32(&test.code, 21, 1);
-    test.code.push_back(EncodeMubuf0(0x0e, 0, true, false));
+    test.code.push_back(EncodeMubuf0(xyz ? 0x0f : 0x0e, 0, true, false));
     test.code.push_back(EncodeMubuf1(0, 2, 21, 22));
-    test.code.push_back(EncodeMubuf0(0x0d, 16, true, false));
-    test.code.push_back(EncodeMubuf1(4, 2, 21, 22));
+    test.code.push_back(EncodeMubuf0(xyz ? 0x0f : 0x0d, xyz ? 12 : 16, true, false));
+    test.code.push_back(EncodeMubuf1(xyz ? 3 : 4, 2, 21, 22));
     for (u32 component = 0; component < 6; ++component) {
       AppendStoreVgpr(&test.code, component, i * 6 + component);
       const u32 expected = cases[selected].expected[component];
@@ -23234,10 +23308,22 @@ TestCase BufferLoadsGpuSelectedDescriptors() {
   test.bda_mappings = {{GuestBase, 0}};
   test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::BUFFER_LOAD_DWORD,
                   O::V_READFIRSTLANE_B32, O::S_MUL_I32, O::S_BUFFER_LOAD_DWORDX4,
-                  O::BUFFER_LOAD_DWORDX4, O::BUFFER_LOAD_DWORDX2,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  if (xyz) {
+    test.opcodes.push_back(O::BUFFER_LOAD_DWORDX3);
+  } else {
+    test.opcodes.insert(test.opcodes.end(), {O::BUFFER_LOAD_DWORDX4, O::BUFFER_LOAD_DWORDX2});
+  }
   test.required_spirv = {"OpConvertUToPtr", "PhysicalStorageBuffer"};
   return test;
+}
+
+TestCase BufferLoadsGpuSelectedDescriptors() {
+  return BufferLoadsGpuSelectedDescriptors(false);
+}
+
+TestCase BufferLoadDwordx3GpuSelectedDescriptors() {
+  return BufferLoadsGpuSelectedDescriptors(true);
 }
 
 TestCase BufferStoreDwordx4DropsOnlyOutOfBoundsTail() {
@@ -25905,6 +25991,76 @@ TestCase Wave64AppendConsumeHighHalf() {
   return test;
 }
 
+TestCase BufferWorkgroupPublication(u32 wave_size, bool dlc_only = false) {
+  using O = ShaderOpcode;
+  constexpr u32 groups = 31;
+  TestCase test;
+  test.name = dlc_only ? "BufferWorkgroupPublicationDlc"
+             : wave_size == 64 ? "BufferWorkgroupPublicationWave64"
+                               : "BufferWorkgroupPublicationWave32";
+  auto &code = test.code;
+  // Allocate work in execution order so every polled predecessor has started.
+  // Only one lane per workgroup owns a ticket and publishes its prefix total.
+  code.push_back(EncodeSop1(0x04, 126, InlineU32(1)));
+  AppendVMovU32(&code, 1, 1);
+  AppendVMovU32(&code, 20, 0);
+  AppendBufferStoreOpcode(&code, 0x32, 1, 20, true);
+  code.push_back(EncodeVop1(0x02, 20, Vgpr(1)));
+  code.push_back(EncodeVop2(0x1a, 20, InlineU32(2), 1));
+  AppendVMovU32(&code, 2, 0);
+  code.push_back(EncodeSMovB32(21, InlineU32(0)));
+  AppendSMovLiteral(&code, 22, 1000000);
+  code.push_back(EncodeSopc(0x06, 20, InlineU32(0)));
+  const auto first_ticket = code.size();
+  code.push_back(0);
+
+  const auto poll = code.size();
+  code.push_back(EncodeMubuf0(0x0c, 0, false, true, !dlc_only) | (1u << 15u));
+  code.push_back(EncodeMubuf1(2, 12, 20));
+  code.push_back(EncodeSopp(0x0c, 0)); // S_WAITCNT vmcnt(0).
+  code.push_back(EncodeVop1(0x02, 23, Vgpr(2)));
+  code.push_back(EncodeSopc(0x07, 23, InlineU32(0)));
+  const auto ready = code.size();
+  code.push_back(0);
+  code.push_back(EncodeSop2(0x00, 21, 21, InlineU32(1)));
+  code.push_back(EncodeSopc(0x0a, 21, 22));
+  code.push_back(EncodeSopp(0x05, static_cast<u32>(poll - code.size() - 1)));
+  // A broken poll reports an incorrect result instead of hanging the test GPU.
+  AppendVMovLiteral(&code, 2, 0x80000000u);
+  const auto publish = code.size();
+  code[first_ticket] = EncodeSopp(0x05, publish - first_ticket - 1);
+  code[ready] = EncodeSopp(0x05, publish - ready - 1);
+  code.push_back(EncodeVop2(0x25, 2, Vgpr(1), 2));
+  code.push_back(EncodeVop2(0x25, 2, InlineU32(1), 2));
+  code.push_back(EncodeVop2(0x25, 20, InlineU32(4), 20));
+  // RDNA2 stores publish to L2 even without GLC/DLC on the producer.
+  AppendBufferStoreDword(&code, 2, 20);
+  AppendEnd(&code);
+
+  test.initial.assign(groups + 1, 0);
+  test.expected = {groups};
+  for (u32 ticket = 0; ticket < groups; ++ticket) {
+    test.expected.push_back((ticket + 1) * (ticket + 2) / 2);
+  }
+  test.opcodes = {O::S_MOV_B64, O::S_MOV_B32, O::V_MOV_B32,
+                  O::BUFFER_ATOMIC_ADD, O::V_READFIRSTLANE_B32,
+                  O::V_LSHLREV_B32, O::S_CMP_EQ_U32, O::S_CMP_LG_U32,
+                  O::S_CMP_LT_U32, O::S_CBRANCH_SCC1, O::S_ADD_U32,
+                  O::S_WAITCNT, O::BUFFER_LOAD_DWORD, O::V_ADD_NC_U32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"Coherent", "Volatile", "OpAtomicIAdd", "OpLoopMerge"};
+  test.compute_info.threads_num[0] = wave_size;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  test.dispatch_x = groups;
+  // DLC alone does not bypass RDNA2's L0, so only check its translated policy.
+  test.compile_only = dlc_only;
+  return test;
+}
+
 TestCase BufferAtomicVariants() {
   using O = ShaderOpcode;
 
@@ -28265,6 +28421,9 @@ std::vector<TestCase> MakeCases() {
   auto AddCase = [&cases](TestCase (*factory)()) {
     cases.push_back(factory());
   };
+  cases.push_back(BufferWorkgroupPublication(32));
+  cases.push_back(BufferWorkgroupPublication(64));
+  cases.push_back(BufferWorkgroupPublication(32, true));
 
   AddCase(IntegerAddSubMul);
   AddCase(BitwiseOps);
@@ -28330,6 +28489,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(Vop2SdwaSubNcExactByte2Destination);
   AddCase(Vop2SdwaAddNcCapturedHighWordDestination);
   AddCase(Vop2SdwaAshrrevCapturedWord0SignExtends);
+  cases.push_back(Vop2SdwaMaxI32CapturedHighWord(32));
+  cases.push_back(Vop2SdwaMaxI32CapturedHighWord(64));
   AddCase(Vop2SdwaLshrrevCapturedByte1Source);
   AddCase(Vop2SdwaSubNcPreservesByteAndWordDestinations);
   AddCase(Vop3CvtPkI16I32Captured);
@@ -28436,6 +28597,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(SharedReturnKeepsSelectedValues);
   AddCase(BranchVccnzUsesWaveMask);
   AddCase(BranchVccnzUsesCarryProducedWaveMask);
+  AddCase(ScalarMemRealtimeCapturedPlaceholder);
   AddCase(ScalarMemoryLoadVariants);
   AddCase(ScalarLoadSignedImmediateOffsetAddsSoffset);
   AddCase(ScalarLoadAlignsComponentsAndMasksAddress);
@@ -28453,6 +28615,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferLoadDwordx4SnapshotsOverlappingAddress);
   AddCase(BufferLoadDwordx4ZeroesOnlyOutOfBoundsTail);
   AddCase(BufferLoadsGpuSelectedDescriptors);
+  AddCase(BufferLoadDwordx3GpuSelectedDescriptors);
   AddCase(BufferStoreDwordx4DropsOnlyOutOfBoundsTail);
   AddCase(BufferLoadFormatXyzwRejectsPartialRecord);
   AddCase(BufferStoreFormatXyzwDropsPartialRecord);
@@ -33172,6 +33335,11 @@ int main(int argc, char **argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
+  if (argc == 2 && std::strcmp(argv[1], "--s-memrealtime-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, ScalarMemRealtimeCapturedPlaceholder());
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--packed-integer-neg-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, Vop3pIntegerNegationCapturedAndSelectedHalves());
@@ -33276,6 +33444,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--indirect-buffer-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, BufferLoadsGpuSelectedDescriptors());
+    RunCase(&vulkan, BufferLoadDwordx3GpuSelectedDescriptors());
     RunCase(&vulkan, BufferLoadDwordx4SnapshotsOverlappingAddress());
     RunCase(&vulkan, BufferLoadDwordx4ZeroesOnlyOutOfBoundsTail());
     RunCase(&vulkan, BufferLoadDwordIdxenUsesDescriptorStride());
@@ -33383,6 +33552,14 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, BufferOffsetsUsePackedLaneAndStorageFallback());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--buffer-publication-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, BufferWorkgroupPublication(32));
+    RunCase(&vulkan, BufferWorkgroupPublication(64));
+    RunCase(&vulkan, BufferWorkgroupPublication(32, true));
+    RunCase(&vulkan, BufferAtomicVariants());
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cmpswap-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, BufferAtomicCmpSwapExactRaw());
@@ -33440,6 +33617,13 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--sdwa-ashr-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, Vop2SdwaAshrrevCapturedWord0SignExtends());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--sdwa-max-i32-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, Vop2SdwaMaxI32CapturedHighWord(32));
+    RunCase(&vulkan, Vop2SdwaMaxI32CapturedHighWord(64));
+    RunCase(&vulkan, VectorIntegerOps());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--sdwa-addc-only") == 0) {

@@ -7,6 +7,8 @@
 #include "common/threads.h"
 #include "loader/timer.h" // IWYU pragma: keep
 
+#include <fmt/format.h>
+
 // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
 #define PRINT_NAME_ENABLED g_print_name
 
@@ -50,7 +52,10 @@
 #define PRINT_NAME()                                                                               \
 	if (PRINT_NAME_ENABLED) {                                                                      \
 		if (Log::GetDirection() != Log::Direction::Silent) {                                       \
-			const auto print_name_time = Loader::Timer::GetTime().ToString("HH24:MI:SS.FFF");      \
+			const auto elapsed_ms      = static_cast<uint64_t>(Loader::Timer::GetTimeMs());        \
+			const auto print_name_time = fmt::format(                                              \
+			    "{:02}:{:02}:{:02}.{:03}", elapsed_ms / 3600000, (elapsed_ms / 60000) % 60,        \
+			    (elapsed_ms / 1000) % 60, elapsed_ms % 1000);                                      \
 			LOGF_COLOR(Log::Color::Cyan, "[%d][%s] %s::%s::%s()\n",                                \
 			           Common::Thread::GetThreadIdUnique(), print_name_time.c_str(), g_library,    \
 			           g_module, __func__);                                                        \

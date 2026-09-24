@@ -388,6 +388,8 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 
 	EXIT_IF(attrib == nullptr || buffer == nullptr);
 
+	const bool debug_dump = Config::GraphicsDebugDumpEnabled();
+
 	for (uint32_t i = 0; i < num_input_semantics; i++) {
 		const auto& in = input_semantics[i];
 
@@ -396,7 +398,7 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 		uint32_t reg  = in.hardware_mapping;
 		uint32_t size = in.size_in_elements;
 
-		if (Config::GraphicsDebugDumpEnabled()) {
+		if (debug_dump) {
 			LOGF("reg = %u, size = %u, va[%u] = 0x%08" PRIx32 "\n", reg, size, i,
 			     attrib[in.semantic]);
 		}

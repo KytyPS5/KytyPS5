@@ -86,7 +86,9 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 	}
 	const auto array_index =
 	    ResourceForDescriptor(state, IR::DescriptorBindingKind::Buffers, mem.resource);
-	MemoryResourceAccess access {.kind = mem.kind};
+	MemoryResourceAccess access {
+	    .kind = mem.kind,
+	    .memory_access = mem.coherent ? spv::MemoryAccessVolatileMask : spv::MemoryAccessMaskNone};
 	access.object_pointer = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpAccessChain, pointer_type, access.object_pointer, variable,
 	                          ConstantU32(state, array_index));

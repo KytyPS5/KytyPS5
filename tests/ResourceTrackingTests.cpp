@@ -268,7 +268,9 @@ MakeIndirectImageFixture(bool malformed, uint32_t material_immediate = 0,
   return fixture;
 }
 
-std::unique_ptr<Fixture> MakeAddressBackedImageFixture() {
+std::unique_ptr<Fixture> MakeAddressBackedImageFixture(uint32_t selector_depth = 0u,
+                                                      bool shared_selector = true,
+                                                      bool invalid_selector_leaf = false) {
   auto fixture = std::make_unique<Fixture>();
   const auto root = fixture->Address(fixture->UserData(7), fixture->UserData(8), 0x11f0);
   const auto load_root_word = [&](uint32_t offset, uint32_t pc) {
@@ -299,8 +301,21 @@ std::unique_ptr<Fixture> MakeAddressBackedImageFixture() {
       ValueOpcode::IAdd32, {Value(&selector_phi), Value(1u)}, 0, loop);
   selector_phi.AddPhiOperand(entry, Value(0u));
   selector_phi.AddPhiOperand(loop, carried);
-  const auto record =
-      fixture->Emit(ValueOpcode::IMul32, {Value(&selector_phi), Value(384u)}, 0, loop);
+  Value selector(&selector_phi);
+  if (invalid_selector_leaf) {
+    const auto invocation = fixture->Emit(
+        ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::GlobalInvocationId)), Value(0u)}, 0,
+        loop);
+    selector = fixture->Emit(ValueOpcode::ReadFirstLane,
+                             {invocation, Value(true)}, 0, loop);
+  }
+  for (uint32_t depth = 0; depth < selector_depth; depth++) {
+    selector = fixture->Emit(ValueOpcode::IAdd32,
+                             {selector, shared_selector ? selector : Value(1u)}, 0, loop);
+  }
+  const auto record = fixture->Emit(
+      ValueOpcode::IMul32, {selector, Value(384u)}, 0, loop);
   MemoryInfo material_read;
   material_read.kind = ResourceKind::ScalarBuffer;
   material_read.offset = 368u;
@@ -670,6 +685,24 @@ void TestInvariantIndirectImageMaterialization() {
              "wrapped scalar immediate entered the invariant image proof");
   Check(!wrapped_immediate->program.resource_tracking_complete,
         "wrapped scalar immediate entered the invariant image proof");
+}
+
+void TestSharedUniformLoopIndex() {
+  auto shared = MakeAddressBackedImageFixture(24u);
+  shared->PlanAndTrack();
+  Check(shared->program.info.images.size() == 1u,
+        "shared uniform loop selector was not recognized");
+
+  auto deep = MakeAddressBackedImageFixture(40u, false);
+  BuildSrtPlan(deep->program);
+  CheckFatal([&] { TrackResources(deep->program); }, "not a valid runtime value",
+             "deep uniform loop selector exceeded the traversal limit");
+
+  auto invalid_shared = MakeAddressBackedImageFixture(24u, true, true);
+  BuildSrtPlan(invalid_shared->program);
+  CheckFatal([&] { TrackResources(invalid_shared->program); },
+             "not a valid runtime value",
+             "invalid shared selector was not rejected promptly");
 }
 
 std::unique_ptr<Fixture> MakeBufferRecordImageFixture(bool formatted) {
@@ -3160,6 +3193,7 @@ int main() {
     Run("FMASK load specialization", TestFmaskLoadSpecialization);
     Run("dynamic storage mips", TestDynamicStorageMipTracking);
     Run("invariant indirect images", TestInvariantIndirectImageMaterialization);
+    Run("shared uniform loop index", TestSharedUniformLoopIndex);
     Run("buffer record image key", TestBufferRecordImageKey);
     Run("guarded direct image table", TestGuardedDirectImageTable);
     Run("bounded compute image loop", TestBoundedComputeImageLoop);

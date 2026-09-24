@@ -486,6 +486,10 @@ void CheckSocketWakeup() {
   // MSG_DONTWAIT must never wait for the rest of the message.
   Check(Net::Send(writer, text, prefix_length, 0) == prefix_length,
         "send bytes for the non-waiting peek");
+  readable[reader / 64] = bit;
+  Check(Net::Select(reader + 1, readable.data(), nullptr, nullptr,
+                    deadline.data()) == 1,
+        "non-waiting peek bytes are readable");
   Check(Net::Recv(reader, message.data(), message.size(), 0xc2) == prefix_length,
         "guest MSG_DONTWAIT PEEK and WAITALL returns the buffered prefix");
   Check(Net::Recv(reader, message.data(), prefix_length, 0) == prefix_length,
@@ -499,6 +503,10 @@ void CheckSocketWakeup() {
         "enable the guest non-blocking socket");
   Check(Net::Send(writer, text, prefix_length, 0) == prefix_length,
         "send bytes for the non-blocking socket peek");
+  readable[reader / 64] = bit;
+  Check(Net::Select(reader + 1, readable.data(), nullptr, nullptr,
+                    deadline.data()) == 1,
+        "non-blocking socket peek bytes are readable");
   Check(Net::Recv(reader, message.data(), message.size(), 0x42) == prefix_length,
         "non-blocking socket PEEK and WAITALL returns the buffered prefix");
   Check(Net::Recv(reader, message.data(), prefix_length, 0) == prefix_length,

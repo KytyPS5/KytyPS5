@@ -179,9 +179,8 @@ static HW::RenderControl DecodeRenderControl(uint32_t value) {
 	r.stencil_compress_disable =
 	    KYTY_PM4_GET(value, DB_RENDER_CONTROL, STENCIL_COMPRESS_DISABLE) != 0;
 	r.depth_compress_disable = KYTY_PM4_GET(value, DB_RENDER_CONTROL, DEPTH_COMPRESS_DISABLE) != 0;
-	r.copy_depth_to_color = KYTY_PM4_GET(value, DB_RENDER_CONTROL, COPY_DEPTH_TO_COLOR) != 0;
-	r.copy_stencil_to_color =
-	    KYTY_PM4_GET(value, DB_RENDER_CONTROL, COPY_STENCIL_TO_COLOR) != 0;
+	r.copy_depth_to_color    = KYTY_PM4_GET(value, DB_RENDER_CONTROL, COPY_DEPTH_TO_COLOR) != 0;
+	r.copy_stencil_to_color  = KYTY_PM4_GET(value, DB_RENDER_CONTROL, COPY_STENCIL_TO_COLOR) != 0;
 	r.copy_centroid          = KYTY_PM4_GET(value, DB_RENDER_CONTROL, COPY_CENTROID) != 0;
 	r.copy_sample            = KYTY_PM4_GET(value, DB_RENDER_CONTROL, COPY_SAMPLE);
 	EXIT_NOT_IMPLEMENTED(r.copy_depth_to_color || r.copy_stencil_to_color);
@@ -316,7 +315,7 @@ static void HwCtxSetDepthBoundsRegister(CommandProcessor& cp, uint32_t cmd_offse
 }
 
 static void HwCtxSetDepthMetadataRegister(CommandProcessor& cp, uint32_t cmd_offset,
-                                         uint32_t value) {
+                                          uint32_t value) {
 	if (cmd_offset == Pm4::DB_RENDER_OVERRIDE) {
 		HW::DepthRenderOverride control;
 		control.force_z_valid       = (value & 0x20000000u) != 0;
@@ -602,9 +601,9 @@ static void HwCtxSetDepthShadingRateEncodingRegister(CommandProcessor& cp, uint3
 	    KYTY_PM4_GET(value, DB_SHADING_RATE_ENCODING, SHADING_RATE_ENCODING);
 	EXIT_NOT_IMPLEMENTED(shading_rate_encoding > 2u);
 
-	auto& ctx                       = cp.GetCtx();
-	auto  target                    = ctx.GetDepthRenderTarget();
-	target.shading_rate_encoding    = static_cast<uint8_t>(shading_rate_encoding);
+	auto& ctx                    = cp.GetCtx();
+	auto  target                 = ctx.GetDepthRenderTarget();
+	target.shading_rate_encoding = static_cast<uint8_t>(shading_rate_encoding);
 	ctx.SetDepthRenderTarget(target);
 }
 
@@ -1017,8 +1016,8 @@ static void HwShSetCsRegister(CommandProcessor& cp, uint32_t cmd_offset, uint32_
 		case Pm4::COMPUTE_PGM_RSRC1:
 			cs_regs.vgprs =
 			    (value >> Pm4::COMPUTE_PGM_RSRC1_VGPRS_SHIFT) & Pm4::COMPUTE_PGM_RSRC1_VGPRS_MASK;
-			cs_regs.priority = (value >> Pm4::COMPUTE_PGM_RSRC1_PRIORITY_SHIFT) &
-			                   Pm4::COMPUTE_PGM_RSRC1_PRIORITY_MASK;
+			cs_regs.priority      = (value >> Pm4::COMPUTE_PGM_RSRC1_PRIORITY_SHIFT) &
+			                        Pm4::COMPUTE_PGM_RSRC1_PRIORITY_MASK;
 			cs_regs.float_mode    = (value >> Pm4::COMPUTE_PGM_RSRC1_FLOAT_MODE_SHIFT) &
 			                        Pm4::COMPUTE_PGM_RSRC1_FLOAT_MODE_MASK;
 			cs_regs.dx10_clamp    = ((value >> Pm4::COMPUTE_PGM_RSRC1_DX10_CLAMP_SHIFT) &
@@ -1054,9 +1053,8 @@ static void HwShSetCsRegister(CommandProcessor& cp, uint32_t cmd_offset, uint32_
 			                         Pm4::COMPUTE_PGM_RSRC2_LDS_SIZE_MASK;
 			break;
 		case Pm4::COMPUTE_PGM_RSRC3:
-			cs_regs.shared_vgprs =
-			    (value >> Pm4::COMPUTE_PGM_RSRC3_SHARED_VGPRS_SHIFT) &
-			    Pm4::COMPUTE_PGM_RSRC3_SHARED_VGPRS_MASK;
+			cs_regs.shared_vgprs = (value >> Pm4::COMPUTE_PGM_RSRC3_SHARED_VGPRS_SHIFT) &
+			                       Pm4::COMPUTE_PGM_RSRC3_SHARED_VGPRS_MASK;
 			break;
 		case Pm4::COMPUTE_NUM_THREAD_X: cs_regs.num_thread_x = value; break;
 		case Pm4::COMPUTE_NUM_THREAD_Y: cs_regs.num_thread_y = value; break;
@@ -1168,7 +1166,7 @@ static bool HwShIsUserAccumulatorRange(uint32_t first, uint32_t count, uint32_t 
 }
 
 static void HwShIgnoreUserAccumulatorRegister([[maybe_unused]] uint32_t cmd_offset,
-                                               uint32_t value) {
+                                              uint32_t                  value) {
 	EXIT_NOT_IMPLEMENTED((value & ~0x7fu) != 0);
 }
 
@@ -2007,8 +2005,8 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 			if (raw_cmd_offset == 0x24au && value == 0u) {
 				static std::atomic_flag logged = ATOMIC_FLAG_INIT;
 				if (!logged.test_and_set(std::memory_order_relaxed)) {
-					Log::WriteToConsoleAndLog(
-					    "\t diagnostic: ignoring indirect CX {0x24a, 0}; hardware effect unresolved\n");
+					Log::WriteToConsoleAndLog("\t diagnostic: ignoring indirect CX {0x24a, 0}; "
+					                          "hardware effect unresolved\n");
 				}
 				continue;
 			}
@@ -2544,7 +2542,7 @@ template <typename T>
 static uint32_t CpOpWaitRegMemSized(CommandProcessor& cp, uint32_t cmd_id, const uint32_t* buffer) {
 	static_assert(sizeof(T) == sizeof(uint32_t) || sizeof(T) == sizeof(uint64_t));
 
-	constexpr auto value_dw = static_cast<uint32_t>(sizeof(T) / sizeof(uint32_t));
+	constexpr auto value_dw   = static_cast<uint32_t>(sizeof(T) / sizeof(uint32_t));
 	constexpr auto payload_dw = 4u + value_dw * 2u;
 	constexpr auto packet_dw  = payload_dw + 1u;
 	constexpr auto opcode =
@@ -2554,7 +2552,7 @@ static uint32_t CpOpWaitRegMemSized(CommandProcessor& cp, uint32_t cmd_id, const
 	EXIT_NOT_IMPLEMENTED(KYTY_PM4_LEN(cmd_id) != packet_dw);
 
 	constexpr auto address_align_mask = (sizeof(T) == sizeof(uint32_t) ? 0x3u : 0x7u);
-	auto  ctrl = buffer[0];
+	auto           ctrl               = buffer[0];
 	auto* addr = reinterpret_cast<const T*>((buffer[1] & ~address_align_mask) |
 	                                        (static_cast<uint64_t>(buffer[2] & 0x3ffffu) << 32u));
 	auto  ref  = CpOpWaitRegMemReadValue<T>(buffer + 3u);
@@ -2740,10 +2738,9 @@ void GraphicsInitJmpTablesCxIndirect() {
 			    KYTY_PM4_GET(value, CB_COLOR0_DCC_CONTROL, INDEPENDENT_128B_BLOCKS) != 0;
 			EXIT_NOT_IMPLEMENTED(independent_64b && independent_128b);
 			dcc.independent_block_size =
-			    independent_64b
-			        ? HW::ColorDccControl::IndependentBlockSize::Bytes64
-			        : independent_128b ? HW::ColorDccControl::IndependentBlockSize::Bytes128
-			                           : HW::ColorDccControl::IndependentBlockSize::Disabled;
+			    independent_64b    ? HW::ColorDccControl::IndependentBlockSize::Bytes64
+			    : independent_128b ? HW::ColorDccControl::IndependentBlockSize::Bytes128
+			                       : HW::ColorDccControl::IndependentBlockSize::Disabled;
 			cp.GetCtx().SetColorDccControl(slot, dcc);
 		};
 	}
@@ -3606,17 +3603,11 @@ void GraphicsInitJmpTablesShIndirect() {
 	}
 	for (uint32_t slot = 0; slot < 4; slot++) {
 		g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_ACCUM_PS_0 + slot] =
-		    [](KYTY_HW_SH_INDIRECT_ARGS) {
-			    HwShIgnoreUserAccumulatorRegister(cmd_offset, value);
-		    };
+		    [](KYTY_HW_SH_INDIRECT_ARGS) { HwShIgnoreUserAccumulatorRegister(cmd_offset, value); };
 		g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_ACCUM_ESGS_0 + slot] =
-		    [](KYTY_HW_SH_INDIRECT_ARGS) {
-			    HwShIgnoreUserAccumulatorRegister(cmd_offset, value);
-		    };
+		    [](KYTY_HW_SH_INDIRECT_ARGS) { HwShIgnoreUserAccumulatorRegister(cmd_offset, value); };
 		g_hw_sh_indirect_func[Pm4::SPI_SHADER_USER_ACCUM_LSHS_0 + slot] =
-		    [](KYTY_HW_SH_INDIRECT_ARGS) {
-			    HwShIgnoreUserAccumulatorRegister(cmd_offset, value);
-		    };
+		    [](KYTY_HW_SH_INDIRECT_ARGS) { HwShIgnoreUserAccumulatorRegister(cmd_offset, value); };
 	}
 	g_hw_sh_indirect_func[Pm4::SPI_SHADER_PACE_ID_PS] = [](KYTY_HW_SH_INDIRECT_ARGS) {
 		HwShIgnoreShaderRegister(cmd_offset, value);

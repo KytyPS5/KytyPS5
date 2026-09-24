@@ -9440,7 +9440,7 @@ public:
     constexpr const char *name = "ComparisonDepthTexture";
     constexpr uintptr_t base = 0x0000000204200000ull;
     constexpr uint64_t allocation_size = 0x20000;
-    constexpr uint64_t ordinary_address = base + 0x10000;
+    constexpr uintptr_t ordinary_address = base + 0x10000;
     constexpr std::array<uint16_t, 6> depths{0, 13107, 26214, 39321, 52428, 65535};
     constexpr std::array<float, 5> references{0.1f, 0.3f, 0.5f, 0.7f, 0.9f};
     EnsureRuntimeContext();

@@ -1,6 +1,5 @@
 #include "libs/audio.h"
 
-#include <SDL3/SDL.h>
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
@@ -10,6 +9,7 @@
 #include "libs/errno.h"
 #include "libs/libs.h"
 
+#include <SDL3/SDL.h>
 #include <algorithm>
 #include <cstring>
 #include <limits>
@@ -85,10 +85,10 @@ public:
 	uint32_t AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking = true);
 	bool     AudioOutGetStatus(Id handle, int* type, int* channels_num);
 
-	Id       AudioInOpen(uint32_t samples_num, uint32_t freq, Format format, bool asynchronous);
-	int      AudioInClose(Id handle);
-	int      AudioInGetSilentState(Id handle);
-	int      AudioInInput(Id handle, void* dest);
+	Id  AudioInOpen(uint32_t samples_num, uint32_t freq, Format format, bool asynchronous);
+	int AudioInClose(Id handle);
+	int AudioInGetSilentState(Id handle);
+	int AudioInInput(Id handle, void* dest);
 
 	static constexpr int OUT_PORTS_MAX = 32;
 	static constexpr int IN_PORTS_MAX  = 8;
@@ -247,8 +247,8 @@ bool Audio::OpenSdlDevice(PortOut* port) {
 	desired.format   = SdlFormat(port->format);
 	desired.channels = static_cast<int>(OutputChannels(*port));
 
-	port->stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &desired, nullptr,
-	                                         nullptr);
+	port->stream =
+	    SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &desired, nullptr, nullptr);
 	if (port->stream == nullptr) {
 		LOGF("AudioOut: SDL_OpenAudioDeviceStream failed: %s\n", SDL_GetError());
 		SDL_QuitSubSystem(SDL_INIT_AUDIO);
@@ -332,8 +332,8 @@ const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
 		for (uint32_t frame = 0; frame < frames; frame++) {
 			for (uint32_t ch = 0; ch < output_channels; ch++) {
 				const auto src_ch = reorder ? SDL_8CH_MAP[ch] : ch;
-				int64_t sample =
-				    static_cast<int64_t>(src[frame * channels + src_ch]) * port.volume[src_ch] / 32768;
+				int64_t    sample = static_cast<int64_t>(src[frame * channels + src_ch]) *
+				                    port.volume[src_ch] / 32768;
 				if (sample > std::numeric_limits<int16_t>::max()) {
 					sample = std::numeric_limits<int16_t>::max();
 				} else if (sample < std::numeric_limits<int16_t>::min()) {
@@ -357,8 +357,7 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking) {
 	std::vector<uint8_t> prepared_buffer;
 	const void*          prepared_data   = PrepareOutputBuffer(*port, data, &prepared_buffer);
 	const auto           output_channels = OutputChannels(*port);
-	const auto           prepared_size =
-	    BytesPerSample(port->format) * output_channels * port->samples_num;
+	const auto prepared_size = BytesPerSample(port->format) * output_channels * port->samples_num;
 
 	if (blocking) {
 		constexpr uint64_t target_latency_us = 40000;
@@ -600,7 +599,8 @@ void Audio::CloseSdlDevice(PortIn* port) {
 	}
 }
 
-Audio::Id Audio::AudioInOpen(uint32_t samples_num, uint32_t freq, Format format, bool asynchronous) {
+Audio::Id Audio::AudioInOpen(uint32_t samples_num, uint32_t freq, Format format,
+                             bool asynchronous) {
 	Common::LockGuard lock(m_mutex);
 
 	for (int id = 0; id < IN_PORTS_MAX; id++) {
@@ -626,8 +626,7 @@ Audio::Id Audio::AudioInOpen(uint32_t samples_num, uint32_t freq, Format format,
 }
 
 Audio::PortIn* Audio::GetAudioInPort(Id handle) {
-	if (handle.GetId() < 0 || handle.GetId() >= IN_PORTS_MAX ||
-	    !m_in_ports[handle.GetId()].used) {
+	if (handle.GetId() < 0 || handle.GetId() >= IN_PORTS_MAX || !m_in_ports[handle.GetId()].used) {
 		return nullptr;
 	}
 	return &m_in_ports[handle.GetId()];
@@ -635,7 +634,7 @@ Audio::PortIn* Audio::GetAudioInPort(Id handle) {
 
 int Audio::AudioInClose(Id handle) {
 	Common::LockGuard lock(m_mutex);
-	auto* port = GetAudioInPort(handle);
+	auto*             port = GetAudioInPort(handle);
 	if (port == nullptr) {
 		return AUDIO_IN_ERROR_INVALID_HANDLE;
 	}
@@ -673,9 +672,9 @@ int Audio::AudioInInput(Id handle, void* dest) {
 		port->busy = true;
 		snapshot   = *port;
 	}
-	bool failed = snapshot.stream != nullptr && dest != nullptr &&
-	              (!RecordingDevicePresent(snapshot.device) ||
-	               !SDL_ResumeAudioStreamDevice(snapshot.stream));
+	bool failed =
+	    snapshot.stream != nullptr && dest != nullptr &&
+	    (!RecordingDevicePresent(snapshot.device) || !SDL_ResumeAudioStreamDevice(snapshot.stream));
 
 	const uint64_t block_time = (1000000ULL * snapshot.samples_num) / snapshot.freq;
 	uint64_t       wait_time  = 0;
@@ -691,23 +690,22 @@ int Audio::AudioInInput(Id handle, void* dest) {
 		}
 	}
 	Common::Thread::SleepMicro(wait_time);
-	uint32_t frames = snapshot.samples_num;
+	uint32_t frames    = snapshot.samples_num;
 	bool     timed_out = false;
 	if (dest != nullptr) {
 		if (snapshot.stream != nullptr && !failed) {
-			const int requested = static_cast<int>(frames * snapshot.bytes_per_frame);
-			const auto deadline = LibKernel::KernelGetProcessTime() +
-			                      std::max<uint64_t>(20000, block_time * 4);
-			const auto device = SDL_GetAudioStreamDevice(snapshot.stream);
+			const int  requested = static_cast<int>(frames * snapshot.bytes_per_frame);
+			const auto deadline =
+			    LibKernel::KernelGetProcessTime() + std::max<uint64_t>(20000, block_time * 4);
+			const auto device    = SDL_GetAudioStreamDevice(snapshot.stream);
 			int        available = SDL_GetAudioStreamAvailable(snapshot.stream);
-			while (!snapshot.asynchronous && available >= 0 &&
-			       available < requested &&
+			while (!snapshot.asynchronous && available >= 0 && available < requested &&
 			       device != 0 && !SDL_AudioDevicePaused(device) &&
 			       LibKernel::KernelGetProcessTime() < deadline) {
 				Common::Thread::SleepMicro(1000);
 				available = SDL_GetAudioStreamAvailable(snapshot.stream);
 			}
-			failed = available < 0 || device == 0 || SDL_AudioDevicePaused(device);
+			failed    = available < 0 || device == 0 || SDL_AudioDevicePaused(device);
 			timed_out = !snapshot.asynchronous && available < requested;
 			if (!failed && !timed_out) {
 				if (snapshot.asynchronous) {
@@ -929,8 +927,8 @@ namespace AudioIn {
 
 LIB_NAME("AudioIn", "AudioIn");
 
-static int OpenPort(int user_id, int type, int index, uint32_t len, uint32_t freq,
-                    uint32_t param, bool asynchronous) {
+static int OpenPort(int user_id, int type, int index, uint32_t len, uint32_t freq, uint32_t param,
+                    bool asynchronous) {
 	LOGF("\t user_id = %d\n"
 	     "\t type    = %d\n"
 	     "\t index   = %d\n"
@@ -975,14 +973,14 @@ static int OpenPort(int user_id, int type, int index, uint32_t len, uint32_t fre
 	return id.ToInt();
 }
 
-int KYTY_SYSV_ABI AudioInOpen(int user_id, int type, int index, uint32_t len,
-                              uint32_t freq, uint32_t param) {
+int KYTY_SYSV_ABI AudioInOpen(int user_id, int type, int index, uint32_t len, uint32_t freq,
+                              uint32_t param) {
 	PRINT_NAME();
 	return OpenPort(user_id, type, index, len, freq, param, false);
 }
 
-int KYTY_SYSV_ABI AudioInHqOpen(int user_id, int type, int index, uint32_t len,
-                                uint32_t freq, uint32_t param) {
+int KYTY_SYSV_ABI AudioInHqOpen(int user_id, int type, int index, uint32_t len, uint32_t freq,
+                                uint32_t param) {
 	PRINT_NAME();
 	return OpenPort(user_id, type, index, len, freq, param, true);
 }

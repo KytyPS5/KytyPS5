@@ -27,6 +27,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace Libs::LibKernelApr {
@@ -456,13 +457,75 @@ void CheckSocketWakeup() {
         "guest PEEK and WAITALL preserve the wake bytes");
   Check(Net::Recv(reader, received.data(), received.size(), 0x40) == sizeof(payload),
         "consume wake bytes with guest WAITALL");
+
+  // A full message split across writes must still complete a WAITALL receive, and the
+  // peeked bytes have to survive for the following receive.
+  const char text[] = "fragment";
+  constexpr std::size_t text_length = 8;    // without the terminator
+  constexpr std::size_t prefix_length = 5;  // deliberately short of text_length
+  Check(Net::Send(writer, text, text_length / 2, 0) == text_length / 2,
+        "send the first fragment");
+  const char* const second_fragment = text + text_length / 2;
+  const std::size_t second_length   = text_length - text_length / 2;
+  std::thread peer([&writer, second_fragment, second_length] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    Net::Send(writer, second_fragment, second_length, 0);
+  });
+  std::array<char, text_length> message {};
+  Check(Net::Recv(reader, message.data(), message.size(), 0x42) == message.size() &&
+            std::memcmp(message.data(), text, text_length) == 0,
+        "guest PEEK and WAITALL waits for a fragmented message");
+  peer.join();
+  Check(Net::Recv(reader, message.data(), message.size(), 0) == message.size() &&
+            std::memcmp(message.data(), text, text_length) == 0,
+        "peeked bytes stay available for the following receive");
+  Check(Net::Recv(reader, message.data(), 0, 0x42) == 0,
+        "zero length guest PEEK and WAITALL succeeds");
+
+  // MSG_DONTWAIT must never wait for the rest of the message.
+  Check(Net::Send(writer, text, prefix_length, 0) == prefix_length,
+        "send bytes for the non-waiting peek");
+  Check(Net::Recv(reader, message.data(), message.size(), 0xc2) == prefix_length,
+        "guest MSG_DONTWAIT PEEK and WAITALL returns the buffered prefix");
+  Check(Net::Recv(reader, message.data(), prefix_length, 0) == prefix_length,
+        "consume the non-waiting peek prefix");
+  Check(Net::Recv(reader, message.data(), message.size(), 0xc2) == -1 &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EWOULDBLOCK,
+        "empty guest MSG_DONTWAIT PEEK and WAITALL translates guest errno");
+#if defined(_WIN32)
+  const int nonblocking = 1;
+  Check(Net::Setsockopt(reader, 0xffff, 0x1200, &nonblocking, sizeof(nonblocking)) == 0,
+        "enable the guest non-blocking socket");
+  Check(Net::Send(writer, text, prefix_length, 0) == prefix_length,
+        "send bytes for the non-blocking socket peek");
+  Check(Net::Recv(reader, message.data(), message.size(), 0x42) == prefix_length,
+        "non-blocking socket PEEK and WAITALL returns the buffered prefix");
+  Check(Net::Recv(reader, message.data(), prefix_length, 0) == prefix_length,
+        "consume the non-blocking socket peek prefix");
+  const int blocking = 0;
+  Check(Net::Setsockopt(reader, 0xffff, 0x1200, &blocking, sizeof(blocking)) == 0,
+        "restore the guest blocking socket");
+#endif
 #if !defined(_WIN32)
   Check(Net::Recv(reader, received.data(), received.size(), 0x80) == -1 &&
             *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EWOULDBLOCK,
         "empty nonblocking receive translates guest errno");
 #endif
-  Check(Net::SocketClose(reader) == 0 && Net::SocketClose(writer) == 0,
-        "close wake sockets");
+  // A peer that closes before the requested length ends the wait with the buffered bytes.
+  Check(Net::Send(writer, text, prefix_length, 0) == prefix_length,
+        "send the final message");
+  Check(Net::SocketClose(writer) == 0, "close the writer to signal end of file");
+  std::array<char, 16> tail {};
+  Check(Net::Recv(reader, tail.data(), tail.size(), 0x42) == prefix_length &&
+            std::memcmp(tail.data(), text, prefix_length) == 0,
+        "guest PEEK and WAITALL returns a short read at end of file");
+  Check(Net::Recv(reader, tail.data(), tail.size(), 0x42) == prefix_length,
+        "short peek at end of file keeps the bytes queued");
+  Check(Net::Recv(reader, tail.data(), tail.size(), 0) == prefix_length,
+        "consume the end of file bytes");
+  Check(Net::Recv(reader, tail.data(), tail.size(), 0x42) == 0,
+        "guest PEEK and WAITALL reports end of file");
+  Check(Net::SocketClose(reader) == 0, "close the wake reader");
   readable[reader / 64] = bit;
   Check(Net::Select(reader + 1, readable.data(), nullptr, nullptr,
                     immediate.data()) == -1 &&

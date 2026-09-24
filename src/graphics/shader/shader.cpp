@@ -199,16 +199,22 @@ static MergedProtocol ScanMergedProtocol(std::span<const uint32_t> code) {
 	return protocol;
 }
 
-static ShaderParams GetShaderParams(uint64_t shader_addr, const char* label, uint64_t declared_hash,
-                                    std::span<const uint32_t> user_data,
-                                    const ShaderMappedData& data, uint32_t user_data_base = 0) {
+static std::span<const uint32_t> GetShaderCode(uint64_t shader_addr, const char* label,
+                                               uint64_t                declared_hash,
+                                               const ShaderMappedData& data) {
 	if (data.code_size_bytes == 0 || data.code_size_bytes % sizeof(uint32_t) != 0) {
 		EXIT("%s hash=0x%016" PRIx64 " shader=0x%016" PRIx64
 		     " has invalid AGC shader_size=0x%08" PRIx32 "\n",
 		     label, declared_hash, shader_addr, data.code_size_bytes);
 	}
-	const auto   code_words = data.code_size_bytes / sizeof(uint32_t);
-	const auto   code = std::span {reinterpret_cast<const uint32_t*>(shader_addr), code_words};
+	const auto code_words = data.code_size_bytes / sizeof(uint32_t);
+	return std::span {reinterpret_cast<const uint32_t*>(shader_addr), code_words};
+}
+
+static ShaderParams GetShaderParams(uint64_t shader_addr, const char* label, uint64_t declared_hash,
+                                    std::span<const uint32_t> user_data,
+                                    const ShaderMappedData& data, uint32_t user_data_base = 0) {
+	const auto   code = GetShaderCode(shader_addr, label, declared_hash, data);
 	ShaderParams params {
 	    .code            = code,
 	    .user_data_count = static_cast<uint32_t>(user_data.size()) + user_data_base,
@@ -853,16 +859,19 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 	const auto& sh     = context.GetShaderRegisters();
 	const auto  data   = ShaderGetMappedData(regs.es_regs.data_addr, "ShaderGetInputInfoVS():");
 	const bool  merged = (context.GetShaderStages() & 0x20u) != 0;
-	auto        params = GetShaderParams(
-	    regs.es_regs.data_addr, "ShaderRecompiler VS",
-	    GetDeclaredShaderHash(regs.es_regs.data_addr),
-	    std::span<const uint32_t>(regs.gs_user_sgpr.value, regs.gs_regs.rsrc2.user_sgpr), data,
-	    merged ? 8u : 0u);
-	const bool passthrough_candidate = data.type == Prospero::ShaderBinaryType::kGs &&
-	                                   regs.gs_regs.data_addr == 0 && sh.m_vgtGsMaxVertOut == 0u;
-	const auto protocol =
-	    passthrough_candidate ? ScanMergedProtocol(params.code) : MergedProtocol {};
+	const bool  passthrough_candidate = data.type == Prospero::ShaderBinaryType::kGs &&
+	                                    regs.gs_regs.data_addr == 0 && sh.m_vgtGsMaxVertOut == 0u;
+	const auto  declared_hash         = GetDeclaredShaderHash(regs.es_regs.data_addr);
+	const auto  protocol =
+	    passthrough_candidate
+	        ? ScanMergedProtocol(
+	              GetShaderCode(regs.es_regs.data_addr, "ShaderRecompiler VS", declared_hash, data))
+	        : MergedProtocol {};
 	const bool passthrough_geometry = passthrough_candidate && protocol.Complete();
+	auto       params               = GetShaderParams(
+	    regs.es_regs.data_addr, "ShaderRecompiler VS", declared_hash,
+	    std::span<const uint32_t>(regs.gs_user_sgpr.value, regs.gs_regs.rsrc2.user_sgpr), data,
+	    merged || passthrough_geometry ? 8u : 0u);
 	if (passthrough_geometry && user_config.GetPrimType() != Prospero::PrimitiveType::kTriList &&
 	    user_config.GetPrimType() != Prospero::PrimitiveType::kTriFan &&
 	    user_config.GetPrimType() != Prospero::PrimitiveType::kTriStrip) {

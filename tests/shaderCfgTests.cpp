@@ -9735,6 +9735,43 @@ void TestMergedShaderUserDataSnapshot() {
         "captured triangle-fan GS configuration lost its subgroup assembly limits");
 }
 
+void TestPassthroughShaderUserDataBase() {
+  using namespace ShaderRecompiler;
+  const uint32_t code[] = {
+      EncodeSopp(0x0a), EncodeSopp(0x10, 9),
+      EncodeSop2(0x27, 4, 2, 255), (9u << 16u) | 22u,
+      EncodeSop2(0x27, 5, 2, 255), (9u << 16u) | 12u,
+      EncodeExp0(0x14, 0x1), EncodeExp1(0, 0, 0, 0), EncodeSopp(0x01),
+  };
+  HW::VertexShaderInfo regs{};
+  regs.es_regs.data_addr = reinterpret_cast<uint64_t>(code);
+  regs.gs_regs.rsrc1.gs_vgpr_component_count = 3;
+  regs.gs_regs.rsrc2.es_vgpr_component_count = 3;
+  regs.gs_regs.rsrc2.user_sgpr = 4;
+  for (uint32_t i = 0; i < 4; ++i) regs.gs_user_sgpr.value[i] = 0x10001000u + i;
+  ShaderMappedData mapped{};
+  mapped.type = Prospero::ShaderBinaryType::kGs;
+  mapped.code_size_bytes = sizeof(code);
+  ShaderMapUserData(regs.es_regs.data_addr, mapped);
+  HW::Context context;
+  context.SetMaxOutputPerSubgroup(192);
+  HW::UserConfig user_config;
+  user_config.SetPrimitiveType(Prospero::PrimitiveType::kTriList);
+  for (const uint32_t stages : {0u, 0x00400000u}) {
+    context.SetShaderStages(stages);
+    ShaderVertexInputInfo input{};
+    const auto params = PrepareProgram(regs, context, user_config, input);
+    Check(input.logical_stage == ShaderType::Mesh && input.mesh.passthrough_alloc &&
+              input.mesh.wave_size == (stages == 0u ? 64u : 32u) &&
+              params.user_data_count == 12u &&
+              std::ranges::all_of(std::span(params.user_data).first(8),
+                                  [](uint32_t word) { return word == 0u; }) &&
+              std::equal(std::begin(regs.gs_user_sgpr.value),
+                         std::begin(regs.gs_user_sgpr.value) + 4, params.user_data.begin() + 8),
+          "passthrough shader did not place user SGPRs at s8");
+  }
+}
+
 void TestEmbeddedFetchPreservesSharedScalarLoad() {
   using namespace ShaderRecompiler;
   const uint32_t code[] = {
@@ -10104,7 +10141,7 @@ void TestMeshPassthrough(uint32_t wave_size, uint32_t lane, uint32_t expected_pa
   }
   Check(sgpr2 == 0x00403000u,
         "mesh passthrough did not generate the s2 allocation ABI");
-  Check(sgpr3 == (wave_size == 64 ? 0x10000103u : 0x20000103u),
+  Check(sgpr3 == (wave_size == 64 ? 0x10000103u : lane < 32u ? 0x20000103u : 0x21000000u),
         "mesh passthrough changed the s3 wave/count ABI");
   Check(vgpr0 == expected_packed_indices,
         "mesh passthrough changed packed triangle indices");
@@ -13781,11 +13818,13 @@ int main() {
   TestFusedShaderHandoffPreservesRegisters();
   TestMeshExportStorage();
   TestMergedShaderUserDataSnapshot();
+  TestPassthroughShaderUserDataBase();
   TestMeshInputAssembly();
   TestMeshPassthrough(32, 0, 0u | (1u << 10u) | (2u << 20u));
   TestMeshPassthrough(32, 1, 3u | (4u << 10u) | (5u << 20u));
   TestMeshPassthrough(32, 2, 6u | (7u << 10u) | (8u << 20u));
   TestMeshPassthrough(32, 32u - 1u, 93u | (94u << 10u) | (95u << 20u));
+  TestMeshPassthrough(32, 32u, 96u | (97u << 10u) | (98u << 20u));
   TestMeshPassthrough(64, 0, 0u | (1u << 10u) | (2u << 20u));
   TestMeshPassthrough(64, 1, 3u | (4u << 10u) | (5u << 20u));
   TestMeshPassthrough(64, 2, 6u | (7u << 10u) | (8u << 20u));

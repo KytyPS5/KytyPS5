@@ -118,6 +118,31 @@ bool IsRuntimeSelect(ValueOpcode op) {
 	       op == ValueOpcode::SelectF32;
 }
 
+uint32_t DescriptorLoadDwords(ValueOpcode op) {
+	switch (op) {
+		case ValueOpcode::LoadBufferU32x2: return 2u;
+		case ValueOpcode::LoadBufferU32x4: return 4u;
+		default: return 0u;
+	}
+}
+
+// A V# held in a buffer, read by one uniform DWORDX2/X4 load with no index or per-lane offset.
+bool IsDescriptorLoad(const ResourcePlan& values, const Inst& inst) {
+	const auto dwords = DescriptorLoadDwords(inst.GetOpcode());
+	if (dwords == 0u || inst.NumArgs() != 5u || inst.Arg(4).GetType() != Type::U1) {
+		return false;
+	}
+	const auto index = inst.Flags<MemoryFlags>().index;
+	if (index >= values.memory_info.size()) {
+		return false;
+	}
+	const auto& memory = values.memory_info[index];
+	return memory.kind == ResourceKind::Buffer && !memory.typed && !memory.formatted &&
+	       !memory.idxen && !memory.offen && memory.data_bits == 32u &&
+	       memory.data_dwords == dwords && memory.component_index == 0u &&
+	       inst.Arg(1).Resolve() == Value(0u) && inst.Arg(2).Resolve() == Value(0u);
+}
+
 bool IsRuntimeUniformOp(ValueOpcode op) {
 	switch (op) {
 		case ValueOpcode::ConditionRef:
@@ -129,6 +154,7 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 		case ValueOpcode::CompositeExtractU64:
 		case ValueOpcode::CompositeConstructU32x2:
 		case ValueOpcode::CompositeExtractU32x2:
+		case ValueOpcode::CompositeExtractU32x4:
 		case ValueOpcode::BitFieldInsert:
 		case ValueOpcode::BitFieldUExtract:
 		case ValueOpcode::BitFieldSExtract:
@@ -137,8 +163,11 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 		case ValueOpcode::ISub32:
 		case ValueOpcode::ISub64:
 		case ValueOpcode::IMul32:
+		case ValueOpcode::SMulHi:
 		case ValueOpcode::UMulHi:
 		case ValueOpcode::UMin32:
+		case ValueOpcode::SMin32:
+		case ValueOpcode::SMax32:
 		case ValueOpcode::UMax32:
 		case ValueOpcode::ShiftLeftLogical32:
 		case ValueOpcode::ShiftLeftLogical64:
@@ -160,10 +189,17 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 		case ValueOpcode::SelectU32:
 		case ValueOpcode::SelectF32:
 		case ValueOpcode::ULessThan32:
+		case ValueOpcode::ULessThan64:
 		case ValueOpcode::ULessThanEqual32:
+		case ValueOpcode::SLessThan32:
+		case ValueOpcode::SLessThan64:
+		case ValueOpcode::SLessThanEqual32:
 		case ValueOpcode::IEqual32:
 		case ValueOpcode::IEqual64:
 		case ValueOpcode::UGreaterThan32:
+		case ValueOpcode::UGreaterThan64:
+		case ValueOpcode::UGreaterThanEqual32:
+		case ValueOpcode::SGreaterThan32:
 		case ValueOpcode::SGreaterThanEqual32:
 		case ValueOpcode::INotEqual32:
 		case ValueOpcode::INotEqual64:
@@ -171,14 +207,206 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 		case ValueOpcode::LogicalAnd:
 		case ValueOpcode::LogicalXor:
 		case ValueOpcode::LogicalNot:
+		case ValueOpcode::FPAbs32:
+		case ValueOpcode::FPNeg32:
+		case ValueOpcode::FPSaturate32:
+		case ValueOpcode::FPRoundEven32:
+		case ValueOpcode::FPFloor32:
+		case ValueOpcode::FPCeil32:
+		case ValueOpcode::FPFract32:
+		case ValueOpcode::FPSqrt:
+		case ValueOpcode::FPRecip32:
+		case ValueOpcode::FPRecipSqrt32:
+		case ValueOpcode::FPExp2:
+		case ValueOpcode::FPLog2:
+		case ValueOpcode::FPFma32:
+		case ValueOpcode::FPMad32:
+		case ValueOpcode::FPMinTri32:
+		case ValueOpcode::FPMaxTri32:
+		case ValueOpcode::FPMedTri32:
+		case ValueOpcode::FPLdexp:
+		case ValueOpcode::FPAdd32:
+		case ValueOpcode::FPSub32:
+		case ValueOpcode::FPMin32:
+		case ValueOpcode::FPMax32:
+		case ValueOpcode::FPOrdEqual32:
+		case ValueOpcode::FPUnordEqual32:
+		case ValueOpcode::FPOrdNotEqual32:
+		case ValueOpcode::FPUnordNotEqual32:
+		case ValueOpcode::FPOrdLessThan32:
+		case ValueOpcode::FPUnordLessThan32:
+		case ValueOpcode::FPOrdGreaterThan32:
+		case ValueOpcode::FPUnordGreaterThan32:
 		case ValueOpcode::FPOrdLessThanEqual32:
+		case ValueOpcode::FPUnordLessThanEqual32:
 		case ValueOpcode::FPOrdGreaterThanEqual32:
+		case ValueOpcode::FPUnordGreaterThanEqual32:
 		case ValueOpcode::FPIsNan32:
 		case ValueOpcode::FPMul32:
 		case ValueOpcode::FPRecipIFlag32:
 		case ValueOpcode::FPTrunc32: return true;
 		default: return false;
 	}
+}
+
+// Ops whose rule reads exactly this many operands, in order, before anything else.
+uint32_t PlainArgCount(ValueOpcode op) {
+	switch (op) {
+		case ValueOpcode::ConditionRef:
+		case ValueOpcode::BitCastU32F32:
+		case ValueOpcode::BitCastF32U32:
+		case ValueOpcode::ConvertU32F32:
+		case ValueOpcode::ConvertF32U32:
+		case ValueOpcode::BitwiseNot32:
+		case ValueOpcode::BitReverse32:
+		case ValueOpcode::BitCount32:
+		case ValueOpcode::FindUMsb32:
+		case ValueOpcode::FindILsb32:
+		case ValueOpcode::WqmU64:
+		case ValueOpcode::LogicalNot:
+		case ValueOpcode::FPAbs32:
+		case ValueOpcode::FPNeg32:
+		case ValueOpcode::FPSaturate32:
+		case ValueOpcode::FPRoundEven32:
+		case ValueOpcode::FPFloor32:
+		case ValueOpcode::FPCeil32:
+		case ValueOpcode::FPFract32:
+		case ValueOpcode::FPSqrt:
+		case ValueOpcode::FPRecip32:
+		case ValueOpcode::FPRecipSqrt32:
+		case ValueOpcode::FPExp2:
+		case ValueOpcode::FPLog2:
+		case ValueOpcode::FPIsNan32:
+		case ValueOpcode::FPRecipIFlag32:
+		case ValueOpcode::FPTrunc32: return 1;
+		case ValueOpcode::CompositeConstructU64:
+		case ValueOpcode::CompositeConstructU32x2:
+		case ValueOpcode::IAdd32:
+		case ValueOpcode::IAdd64:
+		case ValueOpcode::ISub32:
+		case ValueOpcode::ISub64:
+		case ValueOpcode::IMul32:
+		case ValueOpcode::SMulHi:
+		case ValueOpcode::UMulHi:
+		case ValueOpcode::UMin32:
+		case ValueOpcode::SMin32:
+		case ValueOpcode::SMax32:
+		case ValueOpcode::UMax32:
+		case ValueOpcode::ShiftLeftLogical32:
+		case ValueOpcode::ShiftLeftLogical64:
+		case ValueOpcode::ShiftRightLogical32:
+		case ValueOpcode::ShiftRightLogical64:
+		case ValueOpcode::ShiftRightArithmetic32:
+		case ValueOpcode::ShiftRightArithmetic64:
+		case ValueOpcode::BitwiseAnd32:
+		case ValueOpcode::BitwiseAnd64:
+		case ValueOpcode::BitwiseOr32:
+		case ValueOpcode::BitwiseXor32:
+		case ValueOpcode::IEqual32:
+		case ValueOpcode::INotEqual32:
+		case ValueOpcode::IEqual64:
+		case ValueOpcode::INotEqual64:
+		case ValueOpcode::ULessThan32:
+		case ValueOpcode::ULessThan64:
+		case ValueOpcode::ULessThanEqual32:
+		case ValueOpcode::UGreaterThan32:
+		case ValueOpcode::UGreaterThan64:
+		case ValueOpcode::UGreaterThanEqual32:
+		case ValueOpcode::SLessThan32:
+		case ValueOpcode::SLessThan64:
+		case ValueOpcode::SLessThanEqual32:
+		case ValueOpcode::SGreaterThan32:
+		case ValueOpcode::SGreaterThanEqual32:
+		case ValueOpcode::LogicalAnd:
+		case ValueOpcode::LogicalOr:
+		case ValueOpcode::LogicalXor:
+		case ValueOpcode::FPLdexp:
+		case ValueOpcode::FPAdd32:
+		case ValueOpcode::FPSub32:
+		case ValueOpcode::FPMul32:
+		case ValueOpcode::FPMin32:
+		case ValueOpcode::FPMax32:
+		case ValueOpcode::FPOrdEqual32:
+		case ValueOpcode::FPUnordEqual32:
+		case ValueOpcode::FPOrdNotEqual32:
+		case ValueOpcode::FPUnordNotEqual32:
+		case ValueOpcode::FPOrdLessThan32:
+		case ValueOpcode::FPUnordLessThan32:
+		case ValueOpcode::FPOrdGreaterThan32:
+		case ValueOpcode::FPUnordGreaterThan32:
+		case ValueOpcode::FPOrdLessThanEqual32:
+		case ValueOpcode::FPUnordLessThanEqual32:
+		case ValueOpcode::FPOrdGreaterThanEqual32:
+		case ValueOpcode::FPUnordGreaterThanEqual32: return 2;
+		case ValueOpcode::BitFieldUExtract:
+		case ValueOpcode::BitFieldSExtract:
+		case ValueOpcode::FPFma32:
+		case ValueOpcode::FPMad32:
+		case ValueOpcode::FPMinTri32:
+		case ValueOpcode::FPMaxTri32:
+		case ValueOpcode::FPMedTri32: return 3;
+		case ValueOpcode::BitFieldInsert: return 4;
+		default: return 0;
+	}
+}
+
+// The rule's operand order: ULessThan32 reads its bound first.
+uint32_t ChainArgument(ValueOpcode op, uint32_t step) {
+	return op == ValueOpcode::ULessThan32 ? 1u - step : step;
+}
+
+// An operand value that decides the result on its own, as the rule would short-circuit.
+bool DecidesResult(ValueOpcode op, uint32_t argument, uint64_t value) {
+	switch (op) {
+		case ValueOpcode::LogicalAnd:
+		case ValueOpcode::ULessThanEqual32: return argument == 0u && value == 0u;
+		case ValueOpcode::LogicalOr: return argument == 0u && value != 0u;
+		case ValueOpcode::ULessThan32: return argument == 1u && static_cast<uint32_t>(value) == 0u;
+		default: return false;
+	}
+}
+
+// Whether the rule can still succeed after this operand failed.
+bool ToleratesFailedOperand(ValueOpcode op) {
+	return op == ValueOpcode::LogicalAnd || op == ValueOpcode::LogicalOr;
+}
+
+// Whether a predicate reads nothing but the lane index and constants.
+bool IsClosedPredicate(Value root) {
+	std::vector<const Inst*>        pending;
+	std::unordered_set<const Inst*> seen;
+	const auto                      push = [&](Value value) {
+		const auto* inst = value.Resolve().TryInstruction();
+		if (inst != nullptr && seen.insert(inst).second) pending.push_back(inst);
+	};
+	push(root);
+	while (!pending.empty()) {
+		const auto* inst = pending.back();
+		pending.pop_back();
+		const auto op    = inst->GetOpcode();
+		const auto plain = PlainArgCount(op);
+		bool       pure  = plain != 0 && inst->NumArgs() >= plain;
+		switch (op) {
+			case ValueOpcode::LaneId:
+			case ValueOpcode::Ballot:
+			case ValueOpcode::SelectU1:
+			case ValueOpcode::SelectU32:
+			case ValueOpcode::SelectF32:
+			case ValueOpcode::CompositeExtractU64: pure = true; break;
+			case ValueOpcode::CompositeExtractU32x4: {
+				const auto* source =
+				    inst->NumArgs() == 2 ? inst->Arg(0).ResolveInstruction() : nullptr;
+				pure = source != nullptr && source->GetOpcode() == ValueOpcode::Ballot;
+				break;
+			}
+			default: break;
+		}
+		if (!pure) return false;
+		for (size_t index = 0; index < inst->NumArgs(); index++) {
+			push(inst->Arg(index));
+		}
+	}
+	return true;
 }
 
 class RuntimeValidator {
@@ -190,6 +418,20 @@ public:
 	bool Run(Value value) { return Validate(value); }
 
 private:
+	// Operands are walked on an explicit stack: integer chains run tens of thousands deep.
+	struct Scope {
+		Value active_mask;
+		bool  lane_bound                     = false;
+		bool  operator==(const Scope&) const = default;
+	};
+	struct Frame {
+		const Inst* inst;
+		Scope       scope;
+		uint32_t    next;
+		uint32_t    count;
+		bool        require_uniform;
+	};
+
 	bool ValidateArguments(const Inst& inst, bool require_uniform) {
 		for (size_t index = 0; index < inst.NumArgs(); index++) {
 			if (!Validate(inst.Arg(index), require_uniform)) return false;
@@ -306,6 +548,13 @@ private:
 			}
 			return finish(Validate(invariant));
 		}
+		if (op == ValueOpcode::Ballot) {
+			// Re-executed per lane and every lane counts: an all-true mask, not the enclosing one.
+			if (inst->NumArgs() != 1 || inst->Arg(0).GetType() != Type::U1) {
+				return finish(false);
+			}
+			return finish(under_mask(Value(true), inst->Arg(0), true));
+		}
 		if (op == ValueOpcode::LaneId) {
 			// Only a ballot re-executes its predicate per lane; elsewhere the value varies per
 			// lane.
@@ -319,11 +568,7 @@ private:
 			if (m_type != RuntimeValueType::Any && !Validate(inst->Arg(1), false)) {
 				return finish(false);
 			}
-			const auto active_mask = m_active_mask;
-			m_active_mask          = inst->Arg(1).Resolve();
-			const bool valid       = Validate(inst->Arg(0));
-			m_active_mask          = active_mask;
-			return finish(valid);
+			return finish(under_mask(inst->Arg(1).Resolve(), inst->Arg(0), false));
 		}
 		if (op == ValueOpcode::GetSrtResource) {
 			if (inst->NumArgs() != 0) {
@@ -346,16 +591,35 @@ private:
 				return finish(Validate(inst->Arg(0)) &&
 				              ((!m_active_mask.IsEmpty() && guard == m_active_mask) || Validate(guard)));
 			}
+		} else if (DescriptorLoadDwords(op) != 0u) {
+			if (!IsDescriptorLoad(m_program, *inst) ||
+			    inst->Arg(0).ResolveInstruction() == nullptr ||
+			    inst->Arg(0).ResolveInstruction()->GetOpcode() != ValueOpcode::GetBufferResource) {
+			}
+			const auto guard = inst->Arg(4).Resolve();
+			return finish(
+			    Validate(inst->Arg(0)) && Validate(inst->Arg(3)) &&
+			    ((!m_active_mask.IsEmpty() && guard == m_active_mask) || Validate(guard)));
 		} else if (op == ValueOpcode::CompositeExtractU64) {
 			const auto index = inst->NumArgs() == 2 ? inst->Arg(1).Resolve() : Value {};
 			if (!index.IsImmediate() || index.GetType() != Type::U32 || index.U32() >= 2u) {
 				return finish(false);
 			}
-		} else if (op == ValueOpcode::CompositeExtractU32x2) {
+		} else if (op == ValueOpcode::CompositeExtractU32x2 ||
+		           op == ValueOpcode::CompositeExtractU32x4) {
 			const auto* source = inst->NumArgs() == 2 ? inst->Arg(0).ResolveInstruction() : nullptr;
 			const auto  index  = inst->NumArgs() == 2 ? inst->Arg(1).Resolve() : Value {};
+			const bool  wide   = op == ValueOpcode::CompositeExtractU32x4;
 			if (source == nullptr || !index.IsImmediate() || index.GetType() != Type::U32 ||
-			    index.U32() >= 2u || source->GetOpcode() != ValueOpcode::CompositeConstructU32x2) {
+			    index.U32() >= (wide ? 4u : 2u)) {
+				return finish(false);
+			}
+			const auto producer = source->GetOpcode();
+			const bool known =
+			    wide ? producer == ValueOpcode::Ballot || producer == ValueOpcode::LoadBufferU32x4
+			         : producer == ValueOpcode::CompositeConstructU32x2 ||
+			               producer == ValueOpcode::LoadBufferU32x2;
+			if (!known) {
 				return finish(false);
 			}
 		}
@@ -713,11 +977,14 @@ bool SrtWalker::EvaluatePhi(const Inst& inst, uint64_t& result) {
 bool SrtWalker::EvaluateExtract(const Inst& inst, uint64_t& result) {
 	const auto index = inst.Arg(1).Resolve();
 	if (!index.IsImmediate() || index.GetType() != Type::U32) {
-		return false;
+		return Refuse(SrtRefusal::UnsupportedOperand);
 	}
 	const auto component = index.U32();
+	if (inst.GetOpcode() == ValueOpcode::CompositeExtractU32x4) {
+		return EvaluateExtractU32x4(inst, component, result);
+	}
 	if (component >= 2u) {
-		return false;
+		return Refuse(SrtRefusal::UnsupportedOperand);
 	}
 	if (inst.GetOpcode() == ValueOpcode::CompositeExtractU64) {
 		uint64_t packed = 0;
@@ -729,21 +996,43 @@ bool SrtWalker::EvaluateExtract(const Inst& inst, uint64_t& result) {
 	}
 	const auto* source = inst.Arg(0).ResolveInstruction();
 	if (source == nullptr) {
-		return false;
+		return Refuse(SrtRefusal::UnsupportedOperand);
 	}
 	if (source->GetOpcode() == ValueOpcode::CompositeConstructU32x2) {
 		return EvaluateWide(source->Arg(component), result);
 	}
-	return false;
+	if (source->GetOpcode() == ValueOpcode::LoadBufferU32x2 &&
+	    IsDescriptorLoad(m_program, *source)) {
+		if (m_clean_evaluator != nullptr && m_clean_evaluator->m_active_mask == m_active_mask) {
+			return Delegate(*m_clean_evaluator, Value(const_cast<Inst*>(&inst)), result);
+		}
+		return EvaluateRawRead(*source, result, component * sizeof(uint32_t));
+	}
 }
 
-bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
-	const auto flags = inst.Flags<SrtReadFlags>();
-	if (flags.index >= m_program.memory_info.size()) {
 		return false;
+	const auto* source = inst.Arg(0).ResolveInstruction();
+	if (source == nullptr || component >= 4u) {
+		return Refuse(SrtRefusal::UnsupportedOperand);
 	}
 	const auto& mem    = m_program.memory_info[flags.index];
-	const bool vector = inst.GetOpcode() == ValueOpcode::LoadBufferU32;
+	if (source->GetOpcode() == ValueOpcode::Ballot) {
+		// The ballot packs lanes 0-31 and 32-63 into the low two dwords; the upper two are zero.
+		uint64_t mask = 0;
+		if (!Arg(inst, 0, mask)) {
+			return false;
+		}
+		result = component < 2u ? static_cast<uint32_t>(mask >> (component * 32u)) : 0u;
+		return true;
+	}
+	if (source->GetOpcode() == ValueOpcode::LoadBufferU32x4 &&
+	    IsDescriptorLoad(m_program, *source)) {
+		if (m_clean_evaluator != nullptr && m_clean_evaluator->m_active_mask == m_active_mask) {
+			return Delegate(*m_clean_evaluator, Value(const_cast<Inst*>(&inst)), result);
+		}
+		return EvaluateRawRead(*source, result, component * sizeof(uint32_t));
+	}
+	return Refuse(SrtRefusal::UnsupportedOperand);
 	const auto guard = vector ? inst.Arg(4).Resolve() : Value {};
 	if (vector && (guard.IsImmediate() || guard != m_active_mask)) {
 		uint64_t enabled = 0;
@@ -762,9 +1051,6 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 	uint64_t offset = 0;
 		return false;
 	}
-	const auto base      = ((high << 32u) | static_cast<uint32_t>(low)) & AddressMask;
-	const auto immediate = static_cast<int64_t>(static_cast<int32_t>(mem.offset));
-	uint64_t   address   = 0;
 		uint64_t records = 0;
 		uint64_t word3   = 0;
 		if (handle->NumArgs() != 4u || !Arg(*handle, 2, records) || !Arg(*handle, 3, word3)) {
@@ -813,6 +1099,12 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 	const auto ternary = [&]() {
 		return Arg(inst, 0, a) && Arg(inst, 1, b) && Arg(inst, 2, c);
 	};
+		return std::bit_cast<int32_t>(static_cast<uint32_t>(value));
+	};
+	const auto f32 = [](float value) {
+		return static_cast<uint64_t>(std::bit_cast<uint32_t>(value));
+	};
+	const auto nan2 = [&]() { return std::isnan(Float32(a)) || std::isnan(Float32(b)); };
 	switch (inst.GetOpcode()) {
 		case ValueOpcode::GetUserData: {
 			const auto reg = RegIndex(inst.Arg(0).ScalarRegister());
@@ -849,12 +1141,31 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 			m_lane->dependent = true;
 			result            = m_lane->lane;
 			return true;
+		case ValueOpcode::ReadConst: {
+			const auto slot = inst.Arg(1).Resolve();
+			if (!slot.IsImmediate() || slot.GetType() != Type::U32 ||
+			    slot.U32() >= m_program.srt_reads.size()) {
+				return false;
+			}
+			// A flat slot is also refreshed outside any lane sweep, so it must hold without a lane.
+			auto* lane       = m_lane;
+			auto* suspended  = m_suspended_lane;
+			m_suspended_lane = DependenceScope();
+			m_lane           = nullptr;
+			const SrtReadSlotScope scope(slot.U32());
+			const bool read  = EvaluateWide(m_program.srt_reads[slot.U32()].value, result);
+			m_lane           = lane;
+			m_suspended_lane = suspended;
+			return read;
 		}
 		case ValueOpcode::BitCastU32F32:
 		case ValueOpcode::BitCastF32U32: return Arg(inst, 0, result);
 		case ValueOpcode::CompositeExtractU64:
-		case ValueOpcode::CompositeExtractU32x2: return EvaluateExtract(inst, result);
+		case ValueOpcode::CompositeExtractU32x2:
+		case ValueOpcode::CompositeExtractU32x4: return EvaluateExtract(inst, result);
 		case ValueOpcode::CompositeConstructU64:
+		// A U32x2 packs into the same 64-bit word the extract cases read back.
+		case ValueOpcode::CompositeConstructU32x2:
 			if (!binary()) {
 				return false;
 			}
@@ -869,6 +1180,7 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 				    (inst.Flags<SrtReadFlags>().clean != 0u ||
 				     (inst.GetOpcode() == ValueOpcode::LoadBufferU32 &&
 				      m_clean_evaluator->m_active_mask == m_active_mask))) {
+					return Delegate(*m_clean_evaluator, Value(const_cast<Inst*>(&inst)), result);
 				}
 				return EvaluateRawRead(inst, result);
 			}
@@ -909,12 +1221,28 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 				return true;
 			}
 			return false;
+		case ValueOpcode::SMulHi:
+			if (binary()) {
+				const auto product = static_cast<int64_t>(s32(a)) * static_cast<int64_t>(s32(b));
+				result             = static_cast<uint32_t>(static_cast<uint64_t>(product) >> 32u);
+				return true;
+			}
+			return false;
 		case ValueOpcode::UMin32:
 		case ValueOpcode::UMax32:
 			if (binary()) {
 				result = inst.GetOpcode() == ValueOpcode::UMin32
 				    ? std::min(static_cast<uint32_t>(a), static_cast<uint32_t>(b))
 				    : std::max(static_cast<uint32_t>(a), static_cast<uint32_t>(b));
+				return true;
+			}
+			return false;
+		case ValueOpcode::SMin32:
+		case ValueOpcode::SMax32:
+			if (binary()) {
+				result = static_cast<uint32_t>(inst.GetOpcode() == ValueOpcode::SMin32
+				                                   ? std::min(s32(a), s32(b))
+				                                   : std::max(s32(a), s32(b)));
 				return true;
 			}
 			return false;
@@ -977,6 +1305,83 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 				return true;
 			}
 			return false;
+		case ValueOpcode::FPAbs32:
+		case ValueOpcode::FPNeg32:
+		case ValueOpcode::FPSaturate32:
+		case ValueOpcode::FPRoundEven32:
+		case ValueOpcode::FPFloor32:
+		case ValueOpcode::FPCeil32:
+		case ValueOpcode::FPFract32:
+		case ValueOpcode::FPSqrt:
+		case ValueOpcode::FPRecip32:
+		case ValueOpcode::FPRecipSqrt32:
+		case ValueOpcode::FPExp2:
+		case ValueOpcode::FPLog2: {
+			if (!Arg(inst, 0, a)) return false;
+			const auto x = Float32(a);
+			switch (inst.GetOpcode()) {
+				case ValueOpcode::FPAbs32: result = f32(std::fabs(x)); break;
+				case ValueOpcode::FPNeg32: result = f32(-x); break;
+				case ValueOpcode::FPSaturate32: result = f32(std::clamp(x, 0.0f, 1.0f)); break;
+				case ValueOpcode::FPRoundEven32: result = f32(std::nearbyint(x)); break;
+				case ValueOpcode::FPFloor32: result = f32(std::floor(x)); break;
+				case ValueOpcode::FPCeil32: result = f32(std::ceil(x)); break;
+				case ValueOpcode::FPFract32: result = f32(x - std::floor(x)); break;
+				case ValueOpcode::FPSqrt: result = f32(std::sqrt(x)); break;
+				case ValueOpcode::FPRecip32: result = f32(1.0f / x); break;
+				case ValueOpcode::FPRecipSqrt32: result = f32(1.0f / std::sqrt(x)); break;
+				case ValueOpcode::FPExp2: result = f32(std::exp2(x)); break;
+				default: result = f32(std::log2(x)); break;
+			}
+			return true;
+		}
+		case ValueOpcode::FPFma32:
+		case ValueOpcode::FPMad32:
+		case ValueOpcode::FPMinTri32:
+		case ValueOpcode::FPMaxTri32:
+		case ValueOpcode::FPMedTri32: {
+			if (!ternary()) return false;
+			const auto x  = Float32(a);
+			const auto y  = Float32(b);
+			const auto z  = Float32(c);
+			const auto lo = std::fmin(std::fmin(x, y), z);
+			const auto hi = std::fmax(std::fmax(x, y), z);
+			switch (inst.GetOpcode()) {
+				case ValueOpcode::FPMinTri32: result = f32(lo); break;
+				case ValueOpcode::FPMaxTri32: result = f32(hi); break;
+				case ValueOpcode::FPMedTri32: result = f32(x + y + z - lo - hi); break;
+				default: result = f32(x * y + z); break;
+			}
+			return true;
+		}
+		case ValueOpcode::FPLdexp:
+			if (binary()) {
+				result = f32(std::ldexp(Float32(a), s32(b)));
+				return true;
+			}
+			return false;
+		case ValueOpcode::FPAdd32:
+		case ValueOpcode::FPSub32:
+		case ValueOpcode::FPMin32:
+		case ValueOpcode::FPMax32:
+		case ValueOpcode::FPOrdEqual32:
+		case ValueOpcode::FPOrdNotEqual32:
+		case ValueOpcode::FPOrdLessThan32:
+		case ValueOpcode::FPOrdGreaterThan32:
+		case ValueOpcode::FPUnordEqual32:
+		case ValueOpcode::FPUnordNotEqual32:
+		case ValueOpcode::FPUnordLessThan32:
+		case ValueOpcode::FPUnordGreaterThan32:
+		case ValueOpcode::FPUnordLessThanEqual32:
+		case ValueOpcode::FPUnordGreaterThanEqual32: {
+			if (!binary()) return false;
+			const auto x = Float32(a);
+			const auto y = Float32(b);
+			switch (inst.GetOpcode()) {
+				case ValueOpcode::FPAdd32: result = f32(x + y); break;
+				case ValueOpcode::FPSub32: result = f32(x - y); break;
+			return true;
+		}
 		case ValueOpcode::BitwiseAnd32:
 			if (binary()) {
 				result = static_cast<uint32_t>(a & b);
@@ -1147,7 +1552,7 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 		case ValueOpcode::SelectU1:
 		case ValueOpcode::SelectF32: {
 			auto& predicate = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;
-			if (predicate.EvaluateWide(inst.Arg(0), a)) {
+			if (Delegate(predicate, inst.Arg(0), a)) {
 				return Arg(inst, a != 0u ? 1u : 2u, result);
 			}
 			return false;
@@ -1199,10 +1604,36 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 				return true;
 			}
 			return false;
+		case ValueOpcode::UGreaterThanEqual32:
+			if (binary()) {
+				result = static_cast<uint32_t>(a) >= static_cast<uint32_t>(b);
+				return true;
+			}
+			return false;
+		case ValueOpcode::ULessThan64:
+		case ValueOpcode::UGreaterThan64:
+			if (binary()) {
+				result = inst.GetOpcode() == ValueOpcode::ULessThan64 ? a < b : a > b;
+				return true;
+			}
+			return false;
+		case ValueOpcode::SLessThan64:
+			if (binary()) {
+				result = std::bit_cast<int64_t>(a) < std::bit_cast<int64_t>(b);
+				return true;
+			}
+			return false;
+		case ValueOpcode::SLessThan32:
+		case ValueOpcode::SLessThanEqual32:
+		case ValueOpcode::SGreaterThan32:
 		case ValueOpcode::SGreaterThanEqual32:
 			if (binary()) {
-				result = std::bit_cast<int32_t>(static_cast<uint32_t>(a)) >=
-				         std::bit_cast<int32_t>(static_cast<uint32_t>(b));
+				switch (inst.GetOpcode()) {
+					case ValueOpcode::SLessThan32: result = s32(a) < s32(b); break;
+					case ValueOpcode::SLessThanEqual32: result = s32(a) <= s32(b); break;
+					case ValueOpcode::SGreaterThan32: result = s32(a) > s32(b); break;
+					default: result = s32(a) >= s32(b); break;
+				}
 				return true;
 			}
 			return false;
@@ -1252,13 +1683,15 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 			}
 			return false;
 		case ValueOpcode::UndefU1:
-		case ValueOpcode::UndefU32: return false;
+		case ValueOpcode::UndefU32: return Refuse(SrtRefusal::UndefinedValue);
 		default: break;
 	}
-	return false;
+	return Refuse(SrtRefusal::UnsupportedOpcode);
 }
 bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
+	m_refusal = SrtRefusal::None;
 	if (source >= m_program.descriptor_sources.size()) {
+		m_refusal = SrtRefusal::UnsupportedOperand;
 		return false;
 	}
 	const auto& descriptor = m_program.descriptor_sources[source];

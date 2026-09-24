@@ -8923,6 +8923,8 @@ bool StoresDecodedInShader(const Program &program) {
   });
 }
 
+
+// A captured scalar read of a written buffer leaves the overlap list only if no store precedes it.
 } // namespace
 
 int main() {

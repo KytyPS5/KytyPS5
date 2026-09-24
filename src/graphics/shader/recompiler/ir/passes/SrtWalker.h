@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <span>
+#include <string_view>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
@@ -85,6 +86,12 @@ void CompileSrtWalker(ResourcePlan& program);
 // Uses the strict reader for values that affect shader specialization.
 SrtRuntime CleanRuntime(SrtRuntime runtime);
 
+// The lane a per-lane sweep is on; `dependent` is set once a walk asks for it.
+struct LaneScope {
+	uint32_t lane      = 0;
+	bool     dependent = false;
+};
+
 // Nonnegative affine coefficients: element zero is constant, remaining elements are
 // caller-selected leaves. Runtime range proofs must additionally exclude U32 wrap.
 template <size_t Size>
@@ -151,7 +158,6 @@ private:
 	bool Arg(const Inst& inst, size_t index, uint64_t& result);
 	bool EvaluatePhi(const Inst& inst, uint64_t& result);
 	bool EvaluateExtract(const Inst& inst, uint64_t& result);
-	bool EvaluateRawRead(const Inst& inst, uint64_t& result);
 	bool EvaluateInst(const Inst& inst, uint64_t& result);
 
 	const ResourcePlan&              m_program;

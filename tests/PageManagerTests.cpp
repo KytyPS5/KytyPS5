@@ -673,6 +673,40 @@ void CheckDeathCase(const char *name) {
 #endif
 }
 
+// A guest mprotect replaces the whole host protection, dropping the watch it knows nothing about.
+void TestReapplyProtectionAfterGuestProtect() {
+  PageManager manager;
+  const auto page_size = manager.GetPageSize();
+  auto *memory = Allocate(page_size * 2);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+
+  manager.UpdatePageWatchers<true>(address, page_size);
+  Check(Protection(memory) == PAGE_READONLY, "write watch did not protect the page");
+
+  DWORD previous = 0;
+  Check(VirtualProtect(memory, page_size * 2, PAGE_READWRITE, &previous) != 0,
+        "guest protection change failed");
+  Check(IsWritable(memory), "guest protection change did not take effect");
+
+  manager.ReapplyProtection(address, page_size * 2,
+                            Common::VirtualMemory::Mode::ReadWrite);
+  Check(Protection(memory) == PAGE_READONLY,
+        "watched page stayed writable after a guest protection change");
+  Check(IsWritable(memory + page_size),
+        "unwatched page was protected by the reapply");
+
+  // The guest asked for less than the watch needs, so its intent must survive.
+  Check(VirtualProtect(memory, page_size, PAGE_NOACCESS, &previous) != 0,
+        "guest no-access change failed");
+  manager.ReapplyProtection(address, page_size,
+                            Common::VirtualMemory::Mode::NoAccess);
+  Check(Protection(memory) == PAGE_NOACCESS,
+        "reapply weakened a guest no-access range to the watch protection");
+
+  manager.UpdatePageWatchers<false>(address, page_size);
+  Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
+}
+
 void TestFatalPaths() {
   for (const char *name :
        {"invalid-range", "unknown-untrack", "destructor-watch",
@@ -704,7 +738,7 @@ int main(int argc, char **argv) {
   TestRegionMaskWatcherRanges();
   TestRegionEndpointBatching();
   TestReadWriteWatcherInteractions();
-  TestConcurrentSharedWatchers();
+  TestReapplyProtectionAfterGuestProtect();
   TestFatalPaths();
   std::puts("PageManagerTests: all cases passed");
   return 0;

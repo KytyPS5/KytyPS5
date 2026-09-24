@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_PAGEMANAGER_H_
 
 #include "common/common.h"
+#include "common/virtualMemory.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 
 #include <memory>
@@ -24,6 +25,10 @@ public:
 	void UpdatePageWatchers(uint64_t vaddr, uint64_t size);
 	template <bool track, bool is_read = false>
 	void UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& mask);
+
+	// Guest protection changes replace the whole host protection, dropping the transient
+	// watch. Re-narrow the watched pages, never past what the guest just asked for.
+	void ReapplyProtection(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode guest_mode);
 
 private:
 	struct Impl;

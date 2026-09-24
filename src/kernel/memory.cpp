@@ -97,6 +97,15 @@ static void UnmapGpuRange(uint64_t vaddr, uint64_t size) {
 	GetGpuResources().UnmapMemory(vaddr, size);
 }
 
+// A guest protection change replaces the whole host protection, which drops the write watch the
+// GPU caches rely on. Without this the host stops learning about CPU writes to the range.
+static void ProtectGpuRange(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
+	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
+		return;
+	}
+	GetGpuResources().ProtectMemory(vaddr, size, mode);
+}
+
 static bool DecodeMemoryProtection(int prot, VirtualMemory::Mode* mode, GpuAccessMode* gpu_mode) {
 	EXIT_IF(mode == nullptr);
 	EXIT_IF(gpu_mode == nullptr);
@@ -4000,6 +4009,7 @@ static int ProtectMemory(const void* addr, size_t len, int prot) {
 		}
 	}
 	g_virtual_ranges->Protect(aligned_addr, aligned_len, prot);
+	ProtectGpuRange(aligned_addr, aligned_len, mode);
 
 	LOGF("\t prot: %s -> %s\n", magic_enum::enum_name(old_mode), magic_enum::enum_name(mode));
 

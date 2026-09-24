@@ -99,6 +99,11 @@ void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	m_buffer_cache.QueueBdaSync(vaddr, size);
 }
 
+void RenderContext::ProtectMemory(uint64_t vaddr, uint64_t size,
+                                  Common::VirtualMemory::Mode mode) {
+	m_page_manager.ReapplyProtection(vaddr, size, mode);
+}
+
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	if (CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported memory unmap from an asynchronous GPU completion, "

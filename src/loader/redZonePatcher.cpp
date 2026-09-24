@@ -23,6 +23,7 @@
 #include <unordered_set>
 #include <vector>
 #if defined(_WIN32)
+#include <windows.h> // IWYU pragma: keep
 #include <xbyak/xbyak.h>
 #include <xbyak/xbyak_util.h>
 #endif
@@ -306,10 +307,22 @@ bool WritesRegister(const DecodedCodeInstruction& decoded, ZydisRegister reg) {
 	    });
 }
 
+bool IsReadableRange(uintptr_t address, size_t size) {
+	for (uintptr_t current = address; current < address + size;) {
+		MEMORY_BASIC_INFORMATION info {};
+		if (VirtualQuery(reinterpret_cast<const void*>(current), &info, sizeof(info)) == 0 ||
+		    info.State != MEM_COMMIT || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
+			return false;
+		}
+		current = reinterpret_cast<uintptr_t>(info.BaseAddress) + info.RegionSize;
+	}
+	return true;
+}
+
 std::optional<std::vector<uintptr_t>>
 ResolveBoundedJumpTable(const DecodedFunction& function, uintptr_t branch_address,
-                        uintptr_t function_start, uintptr_t function_end, uintptr_t segment_start,
-                        uintptr_t segment_end) {
+                        uintptr_t function_start, uintptr_t function_end, uintptr_t data_start,
+                        uintptr_t data_end) {
 	const auto branch = function.instructions.find(branch_address);
 	if (branch == function.instructions.end() ||
 	    branch->second.instruction.mnemonic != ZYDIS_MNEMONIC_JMP ||
@@ -463,8 +476,9 @@ ResolveBoundedJumpTable(const DecodedFunction& function, uintptr_t branch_addres
 
 	std::optional<std::vector<uintptr_t>> resolved_targets;
 	for (const uintptr_t table_address: table_candidates) {
-		if (table_address < segment_start || table_address > segment_end ||
-		    *table_size > (segment_end - table_address) / sizeof(s32)) {
+		if (table_address < data_start || table_address > data_end ||
+		    *table_size > (data_end - table_address) / sizeof(s32) ||
+		    !IsReadableRange(table_address, *table_size * sizeof(s32))) {
 			continue;
 		}
 
@@ -498,7 +512,7 @@ ResolveBoundedJumpTable(const DecodedFunction& function, uintptr_t branch_addres
 }
 
 DecodedFunction DecodeFunction(uintptr_t function_start, uintptr_t function_end,
-                               uintptr_t segment_start, uintptr_t segment_end) {
+                               uintptr_t data_start, uintptr_t data_end) {
 	DecodedFunction               function;
 	std::vector<uintptr_t>        blocks {function_start};
 	std::unordered_set<uintptr_t> visited;
@@ -549,7 +563,7 @@ DecodedFunction DecodeFunction(uintptr_t function_start, uintptr_t function_end,
 				continue;
 			}
 			const auto targets = ResolveBoundedJumpTable(function, branch_address, function_start,
-			                                             function_end, segment_start, segment_end);
+			                                             function_end, data_start, data_end);
 			if (!targets) {
 				continue;
 			}
@@ -1461,7 +1475,10 @@ RedZonePatchResult PatchGuestInstructions(u64 segment_addr, u64 segment_size,
 		}
 
 		++result.function_count;
-		auto function = DecodeFunction(function_start, function_end, segment_addr, segment_end);
+		// Jump tables usually live in a read-only data segment, not beside the code.
+		auto function =
+		    DecodeFunction(function_start, function_end, reinterpret_cast<uintptr_t>(module->start),
+		                   reinterpret_cast<uintptr_t>(module->end));
 		AnalyzeFramePointerRedZone(function, function_start);
 		AnalyzeRedZoneLiveness(function);
 		result.instruction_count += function.instructions.size();

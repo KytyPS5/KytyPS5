@@ -169,6 +169,7 @@ bool ValidSamplerDescriptor(const DescriptorValue& descriptor, ShaderSamplerReso
 	std::copy_n(descriptor.dwords.begin(), std::size(result.fields), result.fields);
 	return result.MaxAnisoRatio() <= static_cast<uint32_t>(Prospero::SamplerAnisoRatio::kSixteen) &&
 	       result.MipFilter() <= static_cast<uint32_t>(Prospero::SamplerMipFilter::kLinear);
+}
 struct ReadCapture {
 	SrtRuntime                                  source;
 	std::vector<std::pair<uint64_t, uint64_t>>& ranges;

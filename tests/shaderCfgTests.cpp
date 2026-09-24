@@ -4398,6 +4398,28 @@ void TestNewShaderDecoderArchitecture() {
             image.image_nsa_dwords == 3u,
         "single-instruction decoder lost the MIMG NSA length");
 
+  // Captured from the Astro Bot compute shader at pc 0x2190. Gfx11 maps
+  // opcode 0xe6 to IMAGE_BVH_INTERSECT_RAY, not to a counter-range operation.
+  const uint32_t mimg_bvh[] = {0xf1989f07u, 0x00040505u, 0x4442413du,
+                               0x4543403eu, 0x00004746u};
+  Instruction bvh;
+  ShaderRecompiler::Decoder::DecodeInstruction(mimg_bvh, 0u, bvh);
+  Check(bvh.family == Family::MIMG && bvh.opcode == Opcode::UNSUPPORTED &&
+            bvh.opcode_id == 0xe6u && bvh.word_count == 5u &&
+            bvh.raw[0] == mimg_bvh[0] && bvh.raw[4] == mimg_bvh[4],
+        "captured gfx11 BVH image instruction was not classified as unsupported");
+  const auto bvh_text = InstructionToString(bvh);
+  Check(bvh_text.find("IMAGE_BVH_INTERSECT_RAY") != std::string::npos &&
+            bvh_text.find("BVH traversal backend") != std::string::npos,
+        "gfx11 BVH image instruction did not explain the missing traversal backend");
+
+  const uint32_t mimg_bvh64[] = {EncodeMimg0(0xe7u, 0x1u), EncodeMimg1(4u, 0u, 0u, 0u)};
+  Instruction bvh64;
+  ShaderRecompiler::Decoder::DecodeInstruction(mimg_bvh64, 0u, bvh64);
+  Check(bvh64.opcode == Opcode::UNSUPPORTED && bvh64.opcode_id == 0xe7u &&
+            InstructionToString(bvh64).find("BVH64") != std::string::npos,
+        "gfx11 BVH64 image instruction did not retain an explicit unsupported reason");
+
   const uint32_t ds_code[] = {EncodeDs0(0x36) | (1u << 17u),
                               EncodeDs1(2, 0, 1)};
   Instruction ds;

@@ -237,6 +237,18 @@ uint32_t DecodeMimgSampleFlags(const MimgSampleInfo* sample, const MimgGatherInf
 	return 0;
 }
 
+// Gfx11 uses these opcodes for BVH ray traversal. There is no safe image lowering;
+// keep the decode boundary explicit until a traversal backend exists.
+const char* MimgUnsupportedReason(uint32_t opcode) {
+	switch (opcode) {
+		case 0xe6u:
+			return "MIMG IMAGE_BVH_INTERSECT_RAY (gfx11) requires a BVH traversal backend";
+		case 0xe7u:
+			return "MIMG BVH64 ray-intersection form (0xe7) requires a BVH traversal backend";
+		default: return "MIMG opcode is not implemented";
+	}
+}
+
 uint32_t DecodeMimgAddressComponents(uint32_t opcode, ImageDimension dimension,
                                      const MimgSampleInfo* sample, const MimgGatherInfo* gather,
                                      const Detail::OpcodeMap* atomic) {
@@ -347,7 +359,7 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	SetRawWords(inst, code, word_index, word_count);
 
 	if (inst.opcode == Opcode::UNSUPPORTED) {
-		SetUnsupported(inst, Family::MIMG, opcode, "MIMG opcode is not implemented");
+		SetUnsupported(inst, Family::MIMG, opcode, MimgUnsupportedReason(opcode));
 	}
 	if (gather != nullptr && !std::has_single_bit(inst.dmask)) {
 		SetUnsupported(inst, Family::MIMG, opcode,

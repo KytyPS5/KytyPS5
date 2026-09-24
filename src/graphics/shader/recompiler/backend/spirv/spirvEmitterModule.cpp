@@ -201,6 +201,16 @@ void DefineDescriptors(EmitterState& state) {
 					state.builder.AddAnnotation(spv::OpDecorate, state.storage_buffer_u64_variable,
 					                            spv::DecorationAliased);
 				}
+				if (state.requirements.coherent_buffers) {
+					// RDNA2 stores publish to L2 even without GLC; every alias of the buffer
+					// must participate in visibility for cache-bypassing polling loads.
+					state.builder.AddAnnotation(spv::OpDecorate, state.storage_buffer_variable,
+					                            spv::DecorationCoherent);
+					if (state.storage_buffer_u64_variable != 0) {
+						state.builder.AddAnnotation(spv::OpDecorate, state.storage_buffer_u64_variable,
+						                            spv::DecorationCoherent);
+					}
+				}
 				break;
 			case IR::DescriptorBindingKind::BdaPagetable:
 				state.bda_pagetable_variable = Define(StorageBufferU64Type(state), "bda_pagetable");

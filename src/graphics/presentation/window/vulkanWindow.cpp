@@ -238,6 +238,10 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 #endif
 		}
 #if !defined(__APPLE__)
+		if (device_features2.features.depthClamp != VK_TRUE) {
+			LOGF("depthClamp is not supported\n");
+			skip_device = true;
+		}
 		if (fragment_barycentric.fragmentShaderBarycentric != VK_TRUE) {
 			LOGF("fragmentShaderBarycentric is not supported\n");
 			skip_device = true;
@@ -607,6 +611,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	device_features.robustBufferAccess       = VK_TRUE;
 #if !defined(__APPLE__)
 	device_features.depthBounds = VK_TRUE; // unsupported by MoltenVK
+	device_features.depthClamp  = VK_TRUE;
 #endif
 	device_features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
 	device_features.shaderImageGatherExtended            = VK_TRUE;

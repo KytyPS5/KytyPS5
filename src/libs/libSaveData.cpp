@@ -384,6 +384,11 @@ static std::filesystem::path save_param_path(const std::filesystem::path& direct
 	return directory / "sce_sys" / "param.bin";
 }
 
+static bool is_legacy_save(const std::filesystem::path& directory) {
+	std::error_code error;
+	return !std::filesystem::exists(directory / "sce_sys", error) && !error;
+}
+
 static int64_t newest_save_time(const std::filesystem::path& directory) {
 	int64_t mtime = 0;
 	std::error_code error;
@@ -408,7 +413,10 @@ static int64_t newest_save_time(const std::filesystem::path& directory) {
 
 static int load_save_param(const std::filesystem::path& directory, SaveDataParam* param) {
 	*param = {};
-	const int status = read_save_param(save_param_path(directory), param);
+	int status = read_save_param(save_param_path(directory), param);
+	if (status == SAVE_DATA_ERROR_NOT_FOUND && is_legacy_save(directory)) {
+		status = OK;
+	}
 	if (status == OK) {
 		param->mtime = newest_save_time(directory);
 	}
@@ -597,7 +605,8 @@ int KYTY_SYSV_ABI SaveDataDirNameSearch(const SaveDataDirNameSearchCond* cond,
 		for (const auto& entry: Common::File::GetDirEntries(root)) {
 			if (!entry.is_file && entry.name != "." && entry.name != ".." &&
 			    !entry.name.starts_with("sce_") && valid_path_component(entry.name) &&
-			    Common::File::IsFileExisting(save_param_path(root / entry.name))) {
+			    (Common::File::IsFileExisting(save_param_path(root / entry.name)) ||
+			     is_legacy_save(root / entry.name))) {
 				if (cond->dir_name == nullptr || cond->dir_name->data[0] == '\0' ||
 				    dir_name_match(Common::ToLower(entry.name).c_str(),
 				                   Common::ToLower(std::string(cond->dir_name->data)).c_str())) {

@@ -193,6 +193,10 @@ void DefineDescriptors(EmitterState& state) {
 			case IR::DescriptorBindingKind::Buffers:
 				state.storage_buffer_variable =
 				    Define(ArrayType(StorageBufferType(state)), "buffers");
+				if (state.requirements.coherent_buffers) {
+					state.builder.AddAnnotation(spv::OpDecorate, state.storage_buffer_variable,
+					                            spv::DecorationCoherent);
+				}
 				if (state.requirements.buffer_int64_atomics) {
 					state.storage_buffer_u64_variable =
 					    Define(ArrayType(StorageBufferU64Type(state)), "buffers_u64");
@@ -615,6 +619,10 @@ void DefineModule(EmitterState& state) {
 	if (state.requirements.buffer_int64_atomics) {
 		state.builder.RequireCapability(spv::CapabilityInt64);
 		state.builder.RequireCapability(spv::CapabilityInt64Atomics);
+	}
+	if (state.requirements.shader_clock) {
+		state.builder.RequireCapability(spv::CapabilityShaderClockKHR);
+		state.builder.RequireExtension("SPV_KHR_shader_clock");
 	}
 	if (state.clip_distance_variable != 0) {
 		state.builder.RequireCapability(spv::CapabilityClipDistance);

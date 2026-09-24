@@ -68,6 +68,7 @@ struct MemoryInfo {
 	bool                    idxen                                                 = false;
 	bool                    offen                                                 = false;
 	bool                    planning_only                                         = false;
+	bool                    coherent                                              = false;
 
 	bool operator==(const MemoryInfo& other) const = default;
 };

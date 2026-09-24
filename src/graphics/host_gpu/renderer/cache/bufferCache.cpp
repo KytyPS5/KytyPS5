@@ -69,7 +69,8 @@ void BufferCache::ChangeRegister(BufferId id) {
 		(void)it;
 		EXIT_IF(!inserted);
 		m_total_used_memory += buffer.Size();
-		buffer.lru_id = m_lru_cache.Insert(id, m_gc_tick);
+		g_cpu_dirty_epoch.fetch_add(1, std::memory_order_release);
+		buffer.lru_id = m_lru_cache.Insert(id, LruClock());
 		std::vector<vk::DeviceAddress> addresses;
 		addresses.reserve(size_pages);
 		for (uint64_t i = 0; i < size_pages; ++i) {
@@ -92,7 +93,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 
 void BufferCache::TouchBuffer(const Buffer& buffer) {
 	if (!buffer.is_deleted) {
-		m_lru_cache.Touch(buffer.lru_id, m_gc_tick);
+		m_lru_cache.Touch(buffer.lru_id, LruClock());
 	}
 }
 
@@ -109,6 +110,15 @@ void BufferCache::DeleteBuffer(BufferId id) {
 }
 
 bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	const auto capacity = m_download_buffer.Size();
+	bool       any      = false;
+	for (uint64_t offset = 0; offset < size; offset += capacity) {
+		any |= DownloadBufferWindow(buffer, vaddr + offset, std::min(capacity, size - offset));
+	}
+	return any;
+}
+
+bool BufferCache::DownloadBufferWindow(Buffer& buffer, uint64_t vaddr, uint64_t size) {
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size     = 0;
 	const auto                  buffer_address = buffer.CpuAddress();
@@ -126,7 +136,34 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	if (copies.empty()) {
 		return false;
 	}
+	const auto capacity = m_download_buffer.Size();
+	for (size_t first = 0; first < copies.size();) {
+		const auto base       = copies[first].dstOffset;
+		auto       last       = first;
+		uint64_t   batch_size = 0;
+		while (last < copies.size()) {
+			const auto end = copies[last].dstOffset - base + Common::AlignUp(copies[last].size, 64);
+			if (end > capacity) {
+				break;
+			}
+			batch_size = end;
+			last++;
+		}
+		EXIT_IF(last == first);
+		std::vector<vk::BufferCopy> batch(copies.begin() + static_cast<std::ptrdiff_t>(first),
+		                                  copies.begin() + static_cast<std::ptrdiff_t>(last));
+		for (auto& copy: batch) {
+			copy.dstOffset -= base;
+		}
+		DownloadBufferCopies(buffer, std::move(batch), batch_size);
+		first = last;
+	}
+	return true;
+}
 
+void BufferCache::DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCopy> copies,
+                                       uint64_t total_size) {
+	const auto buffer_address = buffer.CpuAddress();
 	const auto [mapped, offset] = m_download_buffer.Map(total_size, 64);
 	if (mapped == nullptr) {
 		EXIT("BufferCache: download exceeds 64 MiB staging buffer capacity\n");
@@ -171,7 +208,6 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 			                                      mapped + (copy.dstOffset - offset), copy.size);
 		}
 	});
-	return true;
 }
 
 BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
@@ -484,9 +520,12 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	}
 
 	auto [staging, stage_offset] = m_staging_buffer.Map(size, 16);
-	if (staging == nullptr || (!Libs::LibKernel::Memory::TryReadBacking(vaddr, staging, size) &&
-	                           !Libs::LibKernel::Memory::TryReadPrtBacking(vaddr, staging, size))) {
-		EXIT("BufferCache: failed to read mapped guest image backing\n");
+	if (staging == nullptr) {
+		EXIT("BufferCache: staging reservation failed for guest image\n");
+	}
+	if (!Libs::LibKernel::Memory::TryReadBacking(vaddr, staging, size) &&
+	    !Libs::LibKernel::Memory::TryReadPrtBacking(vaddr, staging, size)) {
+		std::memset(staging, 0, static_cast<size_t>(size));
 	}
 	m_staging_buffer.Commit();
 	return {&m_staging_buffer, stage_offset};
@@ -578,30 +617,32 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionCpuModified(vaddr, size);
 }
 
+uint64_t BufferCache::LruClock() const noexcept {
+	return m_graphics.presented_frames.load(std::memory_order_relaxed) + m_gc_tick / 512;
+}
+
 void BufferCache::RunGarbageCollector() {
-	const auto tick = m_gc_tick++;
-	if (m_graphics.CanReportMemoryUsage()) {
-		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
-	}
+	m_gc_tick++;
+	const auto clock = LruClock();
 	if (m_total_used_memory < m_trigger_gc_memory) {
 		return;
 	}
 
 	const bool     aggressive = m_total_used_memory >= m_critical_gc_memory;
-	const uint64_t age        = std::min<uint64_t>(aggressive ? 80 : 160, tick);
+	const uint64_t age        = std::min<uint64_t>(aggressive ? 2 : 4, clock);
 	const size_t   limit      = aggressive ? 64 : 32;
 
 	std::vector<BufferId> dirty_buffers;
 	size_t                retire_count = 0;
-	m_lru_cache.ForEachItemBelow(tick - age, [&](BufferId id) {
+	m_lru_cache.ForEachItemBelow(clock - age, [&](BufferId id) {
 		auto& buffer = m_slot_buffers[id];
 		EXIT_IF(buffer.is_deleted);
+		if (buffer.CpuAddress() == 0) {
+			return false;
+		}
 		m_memory_tracker.ValidateGpuDirtyOwnership(m_gpu_modified_ranges, buffer.CpuAddress(),
 		                                           buffer.Size(), "garbage collection");
 		const bool dirty = m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size());
-		if (dirty && !aggressive) {
-			return false;
-		}
 		if (dirty) {
 			EXIT_IF(!DownloadBufferMemory(buffer, buffer.CpuAddress(), buffer.Size()));
 			dirty_buffers.push_back(id);

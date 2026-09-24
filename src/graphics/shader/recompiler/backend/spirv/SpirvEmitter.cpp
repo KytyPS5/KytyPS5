@@ -230,6 +230,7 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 					if (memory.resource >= program.info.buffers.size()) {
 						Fail(program, "buffer operation has invalid resource metadata");
 					}
+					requirements.coherent_buffers |= memory.coherent;
 					if ((program.info.buffers[memory.resource].packed_stride & (1u << 20u)) != 0u) {
 						if (program.stage != ShaderType::Compute) {
 							Fail(program, "buffer ADD_TID is only valid for compute shaders");
@@ -261,6 +262,7 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 			}
 			switch (inst.GetOpcode()) {
 				case IR::ValueOpcode::Ballot: requirements.subgroup_ballot = true; break;
+				case IR::ValueOpcode::ReadClockRealtime64: requirements.shader_clock = true; break;
 				case IR::ValueOpcode::DppMoveU32:
 				case IR::ValueOpcode::ReadFirstLane:
 				case IR::ValueOpcode::ReadLane: {

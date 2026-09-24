@@ -26,6 +26,7 @@
 #include <span>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <xxhash.h>
@@ -63,6 +64,7 @@ struct ShaderBinaryInfo {
 
 static std::unique_ptr<std::unordered_map<uint64_t, ShaderMappedData>> g_shader_map;
 static std::mutex                                                      g_shader_map_mutex;
+static std::unordered_map<uint64_t, uint64_t> g_shader_hash_cache;
 
 void ShaderInit() {
 	EXIT_IF(g_shader_map != nullptr);
@@ -76,6 +78,7 @@ void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data) {
 	std::scoped_lock lock(g_shader_map_mutex);
 
 	(*g_shader_map)[addr] = data;
+	g_shader_hash_cache.erase(addr);
 }
 
 static ShaderMappedData ShaderGetMappedData(uint64_t addr, const char* label) {
@@ -101,9 +104,29 @@ static const ShaderBinaryInfo* GetBinaryInfo(const uint32_t* code) {
 	return nullptr;
 }
 
-static uint64_t GetDeclaredShaderHash(uint64_t shader_addr) {
+static uint64_t ReadDeclaredShaderHash(uint64_t shader_addr) {
 	const auto* header = GetBinaryInfo(reinterpret_cast<const uint32_t*>(shader_addr));
 	return header != nullptr ? (static_cast<uint64_t>(header->hash1) << 32u) | header->hash0 : 0;
+}
+
+static uint64_t GetDeclaredShaderHash(uint64_t shader_addr) {
+	std::scoped_lock lock(g_shader_map_mutex);
+	if (auto cached = g_shader_hash_cache.find(shader_addr); cached != g_shader_hash_cache.end()) {
+		return cached->second;
+	}
+	auto hash = ReadDeclaredShaderHash(shader_addr);
+	if (hash == 0 && g_shader_map != nullptr) {
+		if (auto iter = g_shader_map->find(shader_addr); iter != g_shader_map->end()) {
+			const auto& data = iter->second;
+			if (data.code_size_bytes != 0 && data.code_size_bytes % sizeof(uint32_t) == 0) {
+				hash = XXH3_64bits(reinterpret_cast<const void*>(shader_addr), data.code_size_bytes);
+			}
+		}
+	}
+	if (hash != 0) {
+		g_shader_hash_cache.emplace(shader_addr, hash);
+	}
+	return hash;
 }
 
 static ShaderParams GetShaderParams(uint64_t shader_addr, const char* label, uint64_t declared_hash,
@@ -590,8 +613,10 @@ static void ShaderGetStaticInputInfoPS(
 	if ((active_inputs & 0x00000004u) != 0) {
 		ps_info.ps_perspective_centroid_vgpr = 2u * std::popcount(active_inputs & 0x3u);
 	}
-	for (uint32_t i = 0; i < data.num_input_semantics && i < ps_info.input_num && i < 32u; i++) {
-		const auto& semantic = data.input_semantics[i];
+	for (uint32_t i = 0; i < data.num_input_semantics && i < ps_info.input_num &&
+	                     i < ShaderMappedData::MaxInputSemantics;
+	     i++) {
+		const auto& semantic = data.input_semantics_snapshot[i];
 		if (semantic.is_custom != 0 && semantic.is_f16 == 0) {
 			ps_info.custom_interpolation_mask |= 1u << i;
 		}
@@ -826,10 +851,28 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 	return params;
 }
 
-std::array<ShaderParams, 3>
-PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context& context,
-                            std::array<ShaderVertexInputInfo, 3>& input_info) {
+static std::mutex                   g_rejected_tessellation_mutex;
+static std::unordered_set<uint64_t> g_rejected_tessellation;
+
+static uint64_t TessellationProgramKey(const HW::VertexShaderInfo& regs,
+                                       const HW::ShaderRegisters&  sh) {
+	const uint64_t words[4] = {GetDeclaredShaderHash(regs.ls_regs.data_addr),
+	                           GetDeclaredShaderHash(regs.hs_regs.data_addr), sh.m_vgtLsHsConfig,
+	                           sh.m_vgtTfParam};
+	return XXH3_64bits(words, sizeof(words));
+}
+
+bool PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context& context,
+                                 std::array<ShaderVertexInputInfo, 3>& input_info,
+                                 std::array<ShaderParams, 3>&          params) {
 	const auto& sh        = context.GetShaderRegisters();
+	const auto  tess_key  = TessellationProgramKey(regs, sh);
+	{
+		std::scoped_lock lock(g_rejected_tessellation_mutex);
+		if (g_rejected_tessellation.contains(tess_key)) {
+			return false;
+		}
+	}
 	const auto  local     = ShaderGetMappedData(regs.ls_regs.data_addr, "ShaderGetInputInfoLS():");
 	const auto  control   = ShaderGetMappedData(regs.hs_regs.data_addr, "ShaderGetInputInfoHS():");
 	const auto evaluation = ShaderGetMappedData(regs.es_regs.data_addr, "ShaderGetInputInfoTES():");
@@ -842,7 +885,7 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 
 	const auto local_users      = std::span(regs.hs_user_sgpr.value, regs.hs_regs.rsrc2.user_sgpr);
 	const auto evaluation_users = std::span(regs.gs_user_sgpr.value, regs.gs_regs.rsrc2.user_sgpr);
-	std::array<ShaderParams, 3> params {
+	params = {
 	    GetShaderParams(regs.ls_regs.data_addr, "ShaderRecompiler LS",
 	                    GetDeclaredShaderHash(regs.ls_regs.data_addr), local_users, local),
 	    GetShaderParams(regs.hs_regs.data_addr, "ShaderRecompiler HS",
@@ -877,11 +920,15 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 	};
 	EXIT_IF(tess.input_control_points == 0 || tess.input_control_points > 32 ||
 	        tess.output_control_points == 0 || tess.output_control_points > 32);
-	ShaderRecompiler::AnalyzeTessellationPrograms(params[0].code, params[1].code, tess);
+	if (!ShaderRecompiler::AnalyzeTessellationPrograms(params[0].code, params[1].code, tess)) {
+		std::scoped_lock lock(g_rejected_tessellation_mutex);
+		g_rejected_tessellation.insert(tess_key);
+		return false;
+	}
 	for (auto& stage: input_info) {
 		stage.tess = tess;
 	}
-	return params;
+	return true;
 }
 
 ShaderParams PrepareProgram(

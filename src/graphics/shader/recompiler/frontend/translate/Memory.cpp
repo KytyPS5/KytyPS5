@@ -123,6 +123,7 @@ IR::MemoryInfo MemoryInfoFromDecoded(const Decoder::Instruction& decoded) {
 	memory.image_r128    = decoded.image_r128;
 	memory.idxen         = decoded.idxen;
 	memory.offen         = decoded.offen;
+	memory.coherent      = decoded.glc || decoded.slc;
 	memory.resource      = ResourceIndexFromOperand(decoded.src1);
 	memory.sampler       = ResourceIndexFromOperand(decoded.src2);
 	if (memory.kind == ResourceKind::ScalarBuffer) {
@@ -891,6 +892,9 @@ bool Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::S_BUFFER_LOAD_DWORDX4:
 		case Decoder::Opcode::S_BUFFER_LOAD_DWORDX8:
 		case Decoder::Opcode::S_BUFFER_LOAD_DWORDX16: return S_LOAD(inst, false);
+		case Decoder::Opcode::S_MEMREALTIME:
+			WriteOperand(inst.dst, ir.Emit(IR::ValueOpcode::ReadClockRealtime64));
+			return true;
 
 		case Decoder::Opcode::BUFFER_LOAD_UBYTE:
 		case Decoder::Opcode::BUFFER_LOAD_SBYTE:

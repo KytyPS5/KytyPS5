@@ -40,7 +40,7 @@ constexpr Vop2OpcodeInfo VOP2_OPCODE_LIST[] = {
     {0x0fu, Opcode::V_MIN_F32},
     {0x10u, Opcode::V_MAX_F32},
     {0x11u, Opcode::V_MIN_I32},
-    {0x12u, Opcode::V_MAX_I32},
+    {0x12u, Opcode::V_MAX_I32, Vop2SdwaProfile::IntegerFullDestination},
     {0x13u, Opcode::V_MIN_U32, Vop2SdwaProfile::IntegerPartialDestination},
     {0x14u, Opcode::V_MAX_U32, Vop2SdwaProfile::IntegerFullDestination},
     {0x15u, Opcode::V_LSHR_B32},

@@ -13707,6 +13707,7 @@ void TestCoupledVertexAliasOutput() {
   BuildStageStaticKey(pixel_info, key_b);
   Check(key_a != key_b, "pixel cache key ignored the alias plan");
 }
+#include "ShaderRayTracingTests.inc"
 
 } // namespace
 } // namespace Libs::Graphics
@@ -13719,6 +13720,7 @@ int main(int argc, char **argv) {
     TestPerspectiveCentroidInputs();
     return 0;
   }
+  TestRayTracingDispatchDetection();
   TestResourceDescriptorClassification();
   TestShaderBufferResourceSize();
   TestNativeShaderResourceDependencies();

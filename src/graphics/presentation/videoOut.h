@@ -87,7 +87,6 @@ KYTY_SYSV_ABI int VideoOutGetEventData(const LibKernel::EventQueue::KernelEvent*
 KYTY_SYSV_ABI int VideoOutGetEventCount(const LibKernel::EventQueue::KernelEvent* ev);
 KYTY_SYSV_ABI int VideoOutWaitVblank(int handle);
 KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* status);
-KYTY_SYSV_ABI int VideoOutGetVrrStatus(int handle, int32_t* status);
 KYTY_SYSV_ABI int VideoOutInitializeOutputOptions(VideoOutOutputOptions* options);
 KYTY_SYSV_ABI int VideoOutIsOutputSupported(int handle, uint64_t mode,
                                             const VideoOutOutputOptions* options,

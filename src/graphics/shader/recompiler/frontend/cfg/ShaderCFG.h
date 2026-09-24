@@ -5,6 +5,7 @@
 #include "common/stringUtils.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 
+#include <string_view>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::CFG {
@@ -109,7 +110,8 @@ struct Graph {
 	uint32_t          FindNearestCommonPostDominator(uint32_t block_a, uint32_t block_b) const;
 };
 
-Graph       BuildGraph(const Decoder::Program& program);
+// context is prepended to fatal diagnostics, e.g. "CS hash=0x...".
+Graph       BuildGraph(const Decoder::Program& program, std::string_view context = {});
 // Commits structured control flow on success; preserves the original graph with
 // failure diagnostics on failure. failure_block is an original block ID or UINT32_MAX.
 bool        Structurize(Graph& graph);

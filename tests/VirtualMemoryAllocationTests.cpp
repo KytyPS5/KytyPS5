@@ -462,6 +462,89 @@ void TestPrtBackingReadPreservesSparseResidency() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestPrtReadDuringDirectCommit() {
+	const char*        test       = "PrtReadDuringDirectCommit";
+	constexpr uint64_t chunk_size = SceKernelMemoryPoolCommitLen;
+	constexpr uint64_t chunks     = 32;
+	constexpr uint64_t size       = chunk_size * chunks;
+	int64_t            physical   = -1;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+	            0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), size, chunk_size,
+	            SceKernelMtypeC, &physical),
+	        "KernelAllocateDirectMemory");
+	void* arena = reinterpret_cast<void*>(0x1000000000ull);
+	CheckOk(test, Libs::LibKernel::Memory::KernelReserveVirtualRange(&arena, size, 0, size),
+	        "KernelReserveVirtualRange");
+	const auto base = reinterpret_cast<uint64_t>(arena);
+	CheckOk(test, Libs::LibKernel::Memory::KernelSetPrtAperture(2, arena, size),
+	        "KernelSetPrtAperture");
+	const auto map_chunk = [&](uint64_t index) {
+		void* address = reinterpret_cast<void*>(base + index * chunk_size);
+		return Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
+		    &address, chunk_size, SceKernelProtCpuRw, SceKernelMapFixed,
+		    physical + static_cast<int64_t>(index * chunk_size), chunk_size, "prt_direct");
+	};
+	CheckOk(test, map_chunk(0), "KernelMapNamedDirectMemory(first)");
+	CheckOk(test, map_chunk(chunks - 1), "KernelMapNamedDirectMemory(last)");
+	std::memset(reinterpret_cast<void*>(base), 0x3c, chunk_size);
+	std::memset(reinterpret_cast<void*>(base + (chunks - 1) * chunk_size), 0xa7, chunk_size);
+
+	std::vector<uint8_t> bytes(size, 0x5a);
+	Check(test, Libs::LibKernel::Memory::TryReadPrtBacking(base, bytes.data(), size),
+	      "PRT read rejected a partly committed direct mapping");
+	Check(test, bytes.front() == 0x3c && bytes[chunk_size] == 0 && bytes.back() == 0xa7,
+	      "PRT read lost resident bytes or sparse zeros");
+	Libs::LibKernel::Memory::TestFailNextVirtualRangeReplacement();
+	CheckFailed(test, map_chunk(1), "KernelMapNamedDirectMemory(injected replacement failure)");
+	ExpectRange(test, Query(test, base + chunk_size), base + chunk_size,
+	            base + (chunks - 1) * chunk_size, 0, 0, 0, 0, 0, "anon");
+	Check(test, !Libs::LibKernel::Memory::TryReadBacking(base + chunk_size, bytes.data(),
+	                                                    chunk_size) &&
+	                Libs::LibKernel::Memory::TryReadPrtBacking(base, bytes.data(), size) &&
+	                bytes[chunk_size] == 0,
+	      "failed direct publication did not restore sparse reservation and backing");
+
+	std::atomic<bool>     started {false};
+	std::atomic<bool>     stop {false};
+	std::atomic<bool>     read_failed {false};
+	std::atomic<uint32_t> reads {0};
+	std::thread reader([&] {
+		std::vector<uint8_t> snapshot(size);
+		started.store(true, std::memory_order_release);
+		while (!stop.load(std::memory_order_acquire)) {
+			if (!Libs::LibKernel::Memory::TryReadPrtBacking(base, snapshot.data(), size) ||
+			    snapshot.front() != 0x3c || snapshot.back() != 0xa7) {
+				read_failed.store(true, std::memory_order_relaxed);
+			}
+			reads.fetch_add(1, std::memory_order_relaxed);
+		}
+	});
+	while (!started.load(std::memory_order_acquire)) {
+		std::this_thread::yield();
+	}
+	int map_result = OK;
+	for (uint64_t index = 1; index + 1 < chunks; ++index) {
+		map_result = map_chunk(index);
+		if (map_result != OK) {
+			break;
+		}
+	}
+	stop.store(true, std::memory_order_release);
+	reader.join();
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelSetPrtAperture(2, nullptr, 0),
+	        "KernelSetPrtAperture(clear)");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, size), "KernelMunmap");
+	CheckOk(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(physical, size),
+	        "KernelReleaseDirectMemory");
+	CheckOk(test, map_result, "KernelMapNamedDirectMemory(middle)");
+	Check(test, reads.load(std::memory_order_relaxed) != 0 &&
+	                !read_failed.load(std::memory_order_relaxed),
+	      "PRT read observed a gap while direct backing was committed");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestGuestAddressSpaceHasNoFixedFallback() {
 	const char* test            = "GuestAddressSpaceHasNoFixedFallback";
 	const auto  unowned_address = reinterpret_cast<void*>(0x10000);
@@ -3031,6 +3114,7 @@ int main(int argc, char** argv) {
 	RunTest(TestProsperoArgumentAndInfoSizeContracts);
 	RunTest(TestGuestAddressSpaceOwnsReservationsBeforeBacking);
 	RunTest(TestPrtBackingReadPreservesSparseResidency);
+	RunTest(TestPrtReadDuringDirectCommit);
 	RunTest(TestGuestAddressSpaceHasNoFixedFallback);
 	RunTest(TestGuestFreeRangeSearchDoesNotUnderflow);
 	RunTest(TestFlexibleMemoryCapacityIsBootFixed);

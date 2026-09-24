@@ -463,9 +463,9 @@ struct DescriptorSource {
 		uint32_t table_source    = 0;
 		uint32_t selector_stride = 0;
 		uint32_t selector_offset = 0;
-		uint32_t key_arg         = 0;
 		uint32_t table_offset    = 0;
-		uint32_t key_count       = 0;
+		Value    key_count;
+		Value    selector_mask;
 
 		bool operator==(const IndirectImage& other) const = default;
 	};
@@ -534,25 +534,27 @@ struct ResourcePlan {
 	uint64_t                      shader_hash     = 0;
 	uint32_t                      user_data_base  = 0;
 	uint32_t                      user_data_count = 64;
-	std::list<Inst>               value_storage;
-	std::vector<MemoryInfo>       memory_info;
-	std::vector<DescriptorSource> descriptor_sources;
-	std::vector<ResourceBlock>    control_flow;
-	std::vector<SrtRead>          srt_reads;
-	std::vector<uint8_t>          clean_flat_slots;
-	bool                          requires_specialization_memory = false;
-	bool                          srt_plan_complete              = false;
-	bool                          resource_tracking_complete     = false;
-	ShaderInfo                    info;
-	UniformFillPlan               uniform_fill;
+	std::list<Inst>                     value_storage;
+	std::vector<MemoryInfo>             memory_info;
+	std::vector<DescriptorSource>       descriptor_sources;
+	std::vector<ResourceBlock>          control_flow;
+	std::vector<SrtRead>                srt_reads;
+	std::vector<uint8_t>                clean_flat_slots;
+	bool                                requires_specialization_memory = false;
+	bool                                has_address_writes = false;
+	bool                                srt_plan_complete          = false;
+	bool                                resource_tracking_complete = false;
+	ShaderInfo                          info;
+	UniformFillPlan                     uniform_fill;
 	// GPU-thread scratch for nested clean/EXEC memos, activity and material keys.
 	mutable std::deque<EvaluationContext> evaluation_contexts;
-	mutable uint32_t                      evaluation_value_count = 0;
-	mutable uint32_t                      evaluation_depth       = 0;
-	mutable std::vector<uint8_t>          active_sources;
-	mutable std::vector<uint8_t>          visited_blocks;
-	mutable std::vector<uint32_t>         pending_blocks;
-	mutable std::vector<uint32_t>         material_keys;
+	mutable uint32_t                       evaluation_value_count = 0;
+	mutable uint32_t                       evaluation_depth       = 0;
+	mutable std::vector<uint8_t>            active_sources;
+	mutable std::vector<uint8_t>            visited_blocks;
+	mutable std::vector<uint32_t>           pending_blocks;
+	mutable std::vector<uint32_t>           material_keys;
+	mutable std::vector<std::pair<uint64_t, uint64_t>> specialization_reads;
 };
 
 struct Program: ResourcePlan {

@@ -1,6 +1,8 @@
 #include "common/assert.h"
 #include "graphics/shader/shader.h"
 
+#include <algorithm>
+
 namespace Libs::Graphics {
 
 namespace {

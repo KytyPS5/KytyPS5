@@ -576,7 +576,8 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 
 	LogShaderPhase("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph\n", GetDumpLabel(options),
 	     StageName(options.stage), options.shader_hash);
-	auto cfg = CFG::BuildGraph(decoded);
+	auto cfg = CFG::BuildGraph(
+	    decoded, fmt::format("{} hash=0x{:016x}", StageName(options.stage), options.shader_hash));
 	LogShaderPhase("%s phase end: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph blocks=%" PRIu64
 	     " loops=%" PRIu64 " back_edges=%" PRIu64 " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,

@@ -1184,7 +1184,9 @@ static int64_t RecvPeekWaitAll(NativeSocket socket, bool nonblocking, bool no_wa
 		}
 		if (peeked >= host_len || peeked == 0 || peer_closed || nonblocking || no_wait ||
 		    !SocketIsStream(socket)) {
-			return peeked;
+			// A zero-length datagram peek uses a one-byte scratch buffer to obtain the
+			// source address. Never report that scratch byte as data to the guest.
+			return host_len == 0 ? 0 : peeked;
 		}
 		peer_closed = WaitForPeekedBytes(socket);
 	}
@@ -2033,6 +2035,9 @@ int KYTY_SYSV_ABI Accept(int s, void* addr, uint32_t* addrlen) {
 	SocketSlot   state;
 	if (!GetSocketBackend(s, &socket, &state)) {
 		return -1;
+	}
+	if (state.p2p) {
+		return SetGuestSocketError(Posix::POSIX_EOPNOTSUPP);
 	}
 
 	sockaddr_storage host_addr {};

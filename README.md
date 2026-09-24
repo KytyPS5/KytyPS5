@@ -79,7 +79,7 @@ or graphical glitches, so please include the version you tested when reporting a
 ## Contributing
 
 Testing games and submitting detailed bug reports are useful ways to contribute. Search existing
-issues first, then use the **Game Emulation Bug Report** template and attach the complete log file.
+issues first, then use the **Game Emulation Status Report** template and attach the complete log file.
 
 Code contributions should be focused, build successfully on the platforms they touch, and include
 relevant tests where practical. Windows is the primary target, so a change that alters shared code
@@ -132,7 +132,7 @@ the Vulkan/SPIR-V validation rules.
 ### Build requirements (Windows)
 
 - Git
-- CMake 3.12 or newer
+- CMake 3.22.1 or newer
 - Ninja
 - Visual Studio 2022 or Build Tools 2022 with the **Desktop development with C++** workload and
   **C++ Clang tools for Windows** component
@@ -180,6 +180,10 @@ sudo apt-get install --no-install-recommends \
 
 Qt 6 (Concurrent, Network, Widgets) is also required — either the distribution packages
 (`qt6-base-dev`) or an official Qt installation.
+
+Qt is only needed for the launcher. To build without it, configure with
+`-DKYTY_BUILD_LAUNCHER=OFF` and build `kyty_emulator` (plus `kyty_tests` for the regression
+tests) instead of `launcher`.
 
 ```bash
 git submodule update --init --recursive

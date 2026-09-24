@@ -13611,6 +13611,8 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
   CheckSpirvPhiParents(dispatcher_result.spirv);
 }
 
+#include "ShaderRayTracingTests.inc"
+
 } // namespace
 } // namespace Libs::Graphics
 
@@ -13622,6 +13624,7 @@ int main(int argc, char** argv) {
     TestPerVertexPrototypeDetection();
     return 0;
   }
+  TestRayTracingDispatchDetection();
   TestResourceDescriptorClassification();
   TestShaderBufferResourceSize();
   TestNativeShaderResourceDependencies();

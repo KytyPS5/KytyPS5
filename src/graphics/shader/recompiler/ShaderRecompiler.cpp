@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <fmt/format.h>
 #include <map>
@@ -523,6 +524,20 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(decoded.instructions.size()), phase_ms());
 
+	// Temporary workaround for games that compile ray-tracing shaders before
+	// the player can select a mode without ray tracing.
+	if (options.stage == ShaderType::Compute && decoded.has_bvh) {
+		static std::atomic_flag warned = ATOMIC_FLAG_INIT;
+		if (!warned.test_and_set(std::memory_order_relaxed)) {
+			const auto& bvh = decoded.instructions.back();
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "Warning: ray tracing is not implemented; skipping compute dispatches containing "
+			    "BVH intersection instructions (shader=0x{:016x}, pc=0x{:08x}, opcode=0x{:02x}).\n",
+			    options.shader_hash, bvh.pc, bvh.opcode_id));
+		}
+		return {.skip_dispatch = true};
+	}
+
 	std::string decoded_dump;
 	if (options.dump_ir) {
 		decoded_dump = Decoder::ProgramToString(decoded);
@@ -615,6 +630,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 CompileResult CompileProgram(TranslateResult translated, const CompileOptions& options,
                              const IR::ResourceSpecialization& specialization,
                              uint32_t push_data_start_dword) {
+	EXIT_IF(translated.skip_dispatch);
 	const auto emit_begin = std::chrono::steady_clock::now();
 	auto& ir = translated.program;
 	IR::ApplyResourceSpecialization(ir, specialization);

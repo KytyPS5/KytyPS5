@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
+
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
@@ -195,11 +196,17 @@ bool FoldCompositeExtract(Inst& inst, ValueOpcode construct, size_t components) 
 }
 
 void FoldInstruction(Block& block, Block::iterator instruction,
-                      std::unordered_set<Inst*>& lowered_ancillary) {
+                     std::unordered_set<Inst*>& lowered_ancillary) {
 	auto& inst = *instruction;
 	switch (inst.GetOpcode()) {
 		case ValueOpcode::Phi: FoldPhi(inst); return;
 		case ValueOpcode::SelectU1:
+			if (!FoldSelect(inst) && IsImmediate(Arg(inst, 2), Type::U1) && !Arg(inst, 2).U1()) {
+				auto result = block.PrependNewInst(instruction, ValueOpcode::LogicalAnd,
+				                                   {Arg(inst, 0), Arg(inst, 1)});
+				Replace(inst, Value(&*result));
+			}
+			return;
 		case ValueOpcode::SelectU32:
 		case ValueOpcode::SelectF32: FoldSelect(inst); return;
 		case ValueOpcode::BitFieldInsert: {
@@ -227,7 +234,7 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			const auto value  = Arg(inst, 0);
 			const auto offset = Arg(inst, 1);
 			const auto count  = Arg(inst, 2);
-			auto* source = value.TryInstruction();
+			auto*      source = value.TryInstruction();
 			if (source != nullptr && source->GetOpcode() == ValueOpcode::ShiftLeftLogical32 &&
 			    IsImmediate(offset, Type::U32) && IsImmediate(count, Type::U32)) {
 				const auto shift = Arg(*source, 1);
@@ -239,16 +246,19 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			}
 			if (source != nullptr && source->GetOpcode() == ValueOpcode::GetBuiltin &&
 			    source->Arg(0) == Value(static_cast<uint32_t>(StageInputKind::PackedAncillary)) &&
-			    IsImmediate(offset, Type::U32) && IsImmediate(count, Type::U32) && count.U32() != 0u) {
+			    IsImmediate(offset, Type::U32) && IsImmediate(count, Type::U32) &&
+			    count.U32() != 0u) {
 				constexpr struct {
 					uint32_t       start;
 					uint32_t       end;
 					StageInputKind kind;
-				} fields[] = {{8u, 12u, StageInputKind::SampleId}, {16u, 27u, StageInputKind::Layer}};
+				} fields[] = {{8u, 12u, StageInputKind::SampleId},
+				              {16u, 27u, StageInputKind::Layer}};
 				for (const auto& field: fields) {
 					if (offset.U32() >= field.start && offset.U32() < field.end &&
 					    count.U32() <= field.end - offset.U32()) {
-						// Preserve extraction and sign extension while exposing only the used field.
+						// Preserve extraction and sign extension while exposing only the used
+						// field.
 						const auto input = block.PrependNewInst(
 						    instruction, ValueOpcode::GetBuiltin,
 						    {Value(static_cast<uint32_t>(field.kind)), Value(0u)});
@@ -431,6 +441,10 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			return;
 		case ValueOpcode::ShiftRightLogical32:
 			if (!FoldU32(inst, [](uint32_t a, uint32_t b) { return a >> (b & 31u); })) {
+				if (IsImmediate(Arg(inst, 0), Type::U32) && Arg(inst, 0).U32() == 0u) {
+					Replace(inst, Value(0u));
+					return;
+				}
 				const auto shift = Arg(inst, 1);
 				if (IsImmediate(shift, Type::U32) && (shift.U32() & 31u) == 0u) {
 					Replace(inst, Arg(inst, 0));
@@ -571,8 +585,25 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			return;
 		case ValueOpcode::LogicalAnd:
 			if (!FoldLogical(inst, [](bool a, bool b) { return a && b; })) {
-				const auto lhs = Arg(inst, 0);
-				const auto rhs = Arg(inst, 1);
+				const auto lhs      = Arg(inst, 0);
+				const auto rhs      = Arg(inst, 1);
+				const auto simplify = [&](Value assumption, Value expression) {
+					const auto* disjunction = expression.TryInstruction();
+					if (disjunction == nullptr ||
+					    disjunction->GetOpcode() != ValueOpcode::LogicalOr) {
+						return false;
+					}
+					for (uint32_t i = 0; i < 2u; ++i) {
+						const auto* inverse = disjunction->Arg(i).Resolve().TryInstruction();
+						if (inverse != nullptr && inverse->GetOpcode() == ValueOpcode::LogicalNot &&
+						    inverse->Arg(0).Resolve() == assumption) {
+							inst.SetArg(assumption == lhs ? 1u : 0u, disjunction->Arg(i ^ 1u));
+							return true;
+						}
+					}
+					return false;
+				};
+				if (simplify(lhs, rhs) || simplify(rhs, lhs)) return;
 				if (IsImmediate(lhs, Type::U1)) {
 					Replace(inst, lhs.U1() ? rhs : lhs);
 				} else if (IsImmediate(rhs, Type::U1)) {

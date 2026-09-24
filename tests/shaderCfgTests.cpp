@@ -6711,9 +6711,9 @@ void TestNewShaderRecompilerFormattedStoreUsesRuntimeArrayLengthOnly() {
   Check(result.resources.buffers.size() == 1 &&
             result.resources.buffers[0].dwords[2] == 5u,
         "formatted store test did not preserve descriptor NumRecords");
-  Check((result.decoded_dump.find("buffer_store_format_x") != std::string::npos),
+  Check((result.decoded_dump.find("BUFFER_STORE_FORMAT_X") != std::string::npos),
         "formatted store regression did not decode buffer_store_format_x");
-  Check((result.ir_dump.find("typed=0 formatted=1") != std::string::npos),
+  Check((result.decoded_dump.find("typed=0 formatted=1") != std::string::npos),
         "formatted store regression did not preserve formatted metadata");
   CheckSpirvBinaryValidates(result.spirv);
 
@@ -6723,6 +6723,15 @@ void TestNewShaderRecompilerFormattedStoreUsesRuntimeArrayLengthOnly() {
   Check(
       !SpirvSourceHasInstructionUsing(source, "OpULessThan", "%uint_5"),
       "formatted store SPIR-V baked descriptor NumRecords into a store guard");
+
+  user_data[1] = 8u << 16u;
+  user_data[3] = static_cast<uint32_t>(Prospero::BufferFormat::k16_16_16_16Float) << 12u;
+  options.user_data = user_data;
+  result = RecompileForTest(shader, options);
+  Check((DisassembleSpirvBinary(result.spirv).find("PackHalf2x16") !=
+         std::string::npos),
+        "formatted half-float store did not convert F32 to F16");
+  CheckSpirvBinaryValidates(result.spirv);
 }
 
 void TestNewShaderRecompilerTypedBufferTranslation() {
@@ -13740,6 +13749,7 @@ int main() {
   TestNewShaderRecompilerNativeWideBufferIr();
   TestNewShaderRecompilerScalarB64LaneTranslation();
   TestNewShaderRecompilerMubufFormatTranslation();
+  TestNewShaderRecompilerFormattedStoreUsesRuntimeArrayLengthOnly();
   TestNewShaderRecompilerTypedBufferTranslation();
   TestNewShaderRecompilerDsReadWrite2Translation();
   TestNewShaderRecompilerDsWideAndAtomicTranslation();

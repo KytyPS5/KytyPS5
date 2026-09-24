@@ -1032,7 +1032,74 @@ static NtQueueApcThreadExFunc GetNtQueueApcThreadEx() {
 	return nt_queue_apc_thread_ex;
 }
 
+// Windows builds a user APC frame directly below the interrupted RSP, but SysV guest code may keep
+// live locals in the 128-byte red zone there. Before a signal APC is queued at guest code, the
+// target's RSP is moved below the red zone and RIP parked on "ret 0x80", which undoes the move in
+// one instruction. The APC handler undoes it itself when the APC arrives first.
+constexpr uint64_t SIGNAL_RED_ZONE_SKIP = 128 + sizeof(uint64_t);
+
+static uint64_t GetSignalRedZoneStub() {
+	static const uint64_t stub = []() -> uint64_t {
+		constexpr SIZE_T size = 0x1000;
+		auto*            code = static_cast<uint8_t*>(
+		    VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+		if (code == nullptr) {
+			return 0;
+		}
+		code[0]   = 0xc2; // ret 0x80
+		code[1]   = 0x80;
+		code[2]   = 0x00;
+		DWORD old = 0;
+		if (VirtualProtect(code, size, PAGE_EXECUTE_READ, &old) == FALSE) {
+			return 0;
+		}
+		FlushInstructionCache(GetCurrentProcess(), code, size);
+		return reinterpret_cast<uint64_t>(code);
+	}();
+	return stub;
+}
+
+// The target must be suspended, so nothing here may take a lock it could hold (the stub is
+// created beforehand). Returns true when its guest red zone is out of the APC's way.
+static bool ParkThreadBelowGuestRedZone(HANDLE thread, uint64_t stub) {
+	if (stub == 0) {
+		return false;
+	}
+	CONTEXT context {};
+	context.ContextFlags = CONTEXT_CONTROL;
+	if (GetThreadContext(thread, &context) == FALSE) {
+		return false;
+	}
+	if (context.Rip == stub) {
+		return true; // An earlier signal already parked it.
+	}
+	if (!IsGuestCodeAddress(context.Rip)) {
+		return false; // Host code follows the Windows ABI and has no red zone.
+	}
+	const uint64_t parked_rsp = context.Rsp - SIGNAL_RED_ZONE_SKIP;
+	const uint64_t resume_rip = context.Rip;
+	if (WriteProcessMemory(GetCurrentProcess(), reinterpret_cast<void*>(parked_rsp), &resume_rip,
+	                       sizeof(resume_rip), nullptr) == FALSE) {
+		return false;
+	}
+	context.Rsp = parked_rsp;
+	context.Rip = stub;
+	return SetThreadContext(thread, &context) != FALSE;
+}
+
+static void UnparkSignalContext(PCONTEXT context) {
+	const uint64_t stub = GetSignalRedZoneStub();
+	if (context != nullptr && stub != 0 && context->Rip == stub) {
+		context->Rip = *reinterpret_cast<const uint64_t*>(context->Rsp);
+		context->Rsp += SIGNAL_RED_ZONE_SKIP;
+	}
+}
+
 static void SignalApcHandler(void* arg1, void* arg2, void* /*arg3*/, PCONTEXT context) {
+	// Resume at the interrupted guest instruction, not the parking stub, and show the handler the
+	// real guest context.
+	UnparkSignalContext(context);
+
 	auto*      thread = static_cast<Pthread>(arg1);
 	const auto signum = static_cast<int>(reinterpret_cast<intptr_t>(arg2));
 	if (!PthreadTakePendingSignal(thread, signum)) {
@@ -1143,7 +1210,8 @@ static int KYTY_SYSV_ABI KernelRaiseException(Pthread thread, int signum) {
 		}
 
 		HANDLE target_thread =
-		    OpenThread(THREAD_SET_CONTEXT, FALSE, static_cast<DWORD>(target_thread_id));
+		    OpenThread(THREAD_SET_CONTEXT | THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME, FALSE,
+		               static_cast<DWORD>(target_thread_id));
 		if (target_thread == nullptr) {
 			return KERNEL_ERROR_EINVAL;
 		}
@@ -1152,9 +1220,18 @@ static int KYTY_SYSV_ABI KernelRaiseException(Pthread thread, int signum) {
 		KytyUserApcOption option {};
 		option.UserApcFlags = KytyQueueUserApcFlagsSpecialUserApc;
 
+		// Queue while suspended so the APC is delivered at the parked context on resume.
+		const uint64_t red_zone_stub = GetSignalRedZoneStub();
+		const bool     suspended     = SuspendThread(target_thread) != static_cast<DWORD>(-1);
+		if (suspended) {
+			ParkThreadBelowGuestRedZone(target_thread, red_zone_stub);
+		}
 		const auto status =
 		    nt_queue_apc_thread_ex(target_thread, option, SignalApcHandler, thread,
 		                           reinterpret_cast<void*>(static_cast<intptr_t>(signum)), nullptr);
+		if (suspended) {
+			ResumeThread(target_thread);
+		}
 
 		if (status != 0) {
 			PthreadTakePendingSignal(thread, signum);

@@ -231,7 +231,7 @@ constexpr VopcOpcodeInfo VOPC_OPCODE_LIST[] = {
     {0xa9u, Opcode::V_CMP_LT_U16},         {0xaau, Opcode::V_CMP_EQ_U16},
     {0xabu, Opcode::V_CMP_LE_U16},         {0xacu, Opcode::V_CMP_GT_U16},
     {0xadu, Opcode::V_CMP_NE_U16},         {0xaeu, Opcode::V_CMP_GE_U16},
-    {0xb9u, Opcode::V_CMPX_LT_U16, false},
+    {0xb9u, Opcode::V_CMPX_LT_U16, false}, {0xbau, Opcode::V_CMPX_EQ_U16, false},
     {0xbcu, Opcode::V_CMPX_GT_U16},        {0xc0u, Opcode::V_CMP_F_U32},
     {0xc1u, Opcode::V_CMP_LT_U32},         {0xc2u, Opcode::V_CMP_EQ_U32},
     {0xc3u, Opcode::V_CMP_LE_U32},         {0xc4u, Opcode::V_CMP_GT_U32},
@@ -1454,6 +1454,7 @@ bool IsVopcCompareExec(Opcode opcode) {
 		case Opcode::V_CMPX_NE_I64:
 		case Opcode::V_CMPX_NE_U64:
 		case Opcode::V_CMPX_LT_U16:
+		case Opcode::V_CMPX_EQ_U16:
 		case Opcode::V_CMPX_GT_U16:
 		case Opcode::V_CMPX_LT_F16:
 		case Opcode::V_CMPX_EQ_F16:

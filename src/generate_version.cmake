@@ -38,4 +38,25 @@ if(GIT_EXECUTABLE)
 		endif()
 	endif()
 endif()
+
+set(PER_VERTEX_SOURCES
+	"${GIT_WORKING_DIRECTORY}/src/graphics/host_gpu/renderer/perVertexTransform.h"
+	"${GIT_WORKING_DIRECTORY}/src/graphics/host_gpu/renderer/perVertexTransform.cpp"
+	"${GIT_WORKING_DIRECTORY}/src/graphics/host_gpu/renderer/perVertexEmbeddedSpv.h"
+	"${GIT_WORKING_DIRECTORY}/src/graphics/host_gpu/renderer/perVertexPrototype.h"
+	"${GIT_WORKING_DIRECTORY}/src/graphics/host_gpu/renderer/perVertexPrototype.cpp"
+)
+set(PER_VERTEX_COMBINED_HASH "")
+foreach(src ${PER_VERTEX_SOURCES})
+	if(EXISTS "${src}")
+		file(SHA256 "${src}" SRC_HASH)
+		string(APPEND PER_VERTEX_COMBINED_HASH "${SRC_HASH}")
+	endif()
+endforeach()
+if(PER_VERTEX_COMBINED_HASH STREQUAL "")
+	set(KYTY_PER_VERTEX_TRANSFORM_SIGNATURE "none")
+else()
+	string(SHA256 KYTY_PER_VERTEX_TRANSFORM_SIGNATURE "${PER_VERTEX_COMBINED_HASH}")
+endif()
+
 configure_file("${INPUT_FILE}" "${OUTPUT_FILE}")

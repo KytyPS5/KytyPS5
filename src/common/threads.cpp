@@ -19,6 +19,12 @@
 #include <ctime>
 #endif
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
+
 #include <sstream>
 #include <string>
 #include <thread>
@@ -418,6 +424,14 @@ void CondVar::SignalAll() {
 int Thread::GetThreadIdUnique() {
 	static thread_local int tid = ++g_thread_counter;
 	return tid;
+}
+
+int Thread::GetProcessId() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	return _getpid();
+#else
+	return static_cast<int>(getpid());
+#endif
 }
 
 } // namespace Common

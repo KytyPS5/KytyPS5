@@ -280,6 +280,21 @@ foreach(shader_name IN LISTS gpu_tiler_shader_names)
 	list(APPEND gpu_tiler_shader_headers "${shader_header}")
 endforeach()
 
+set(per_vertex_shader_source "${gpu_tiler_shader_dir}/per_vertex_unpack.comp")
+set(per_vertex_shader_generated_dir "${PROJECT_BINARY_DIR}/per_vertex_shaders")
+set(per_vertex_shader_spv "${per_vertex_shader_generated_dir}/per_vertex_unpack.spv")
+set(per_vertex_shader_header "${per_vertex_shader_generated_dir}/per_vertex_unpack_spv.h")
+add_custom_command(
+	OUTPUT "${per_vertex_shader_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${per_vertex_shader_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.2 -Os
+		-o "${per_vertex_shader_spv}" "${per_vertex_shader_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${per_vertex_shader_spv} -DOUTPUT=${per_vertex_shader_header}
+		-DSYMBOL=PERVERTEX_UNPACK_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${per_vertex_shader_source}"
+	VERBATIM
+)
+
 set(fault_buffer_shader_source "${gpu_tiler_shader_dir}/fault_buffer_process.comp")
 set(fault_buffer_shader_spv "${gpu_tiler_generated_dir}/fault_buffer_process.spv")
 set(fault_buffer_shader_header "${gpu_tiler_generated_dir}/fault_buffer_process_spv.h")
@@ -320,6 +335,7 @@ foreach(shader_source IN LISTS gpu_blit_shader_sources)
 	list(APPEND gpu_blit_shader_headers "${shader_header}")
 endforeach()
 list(APPEND kyty_emulator_src ${gpu_blit_shader_headers})
+list(APPEND kyty_emulator_src "${per_vertex_shader_header}")
 
 list(APPEND kyty_emulator_src
 	"${KYTY_SOURCE_DIR}/emulator.h"
@@ -341,6 +357,7 @@ endif()
 
 set(inc_headers
 	${KYTY_SOURCE_DIR}
+	${per_vertex_shader_generated_dir}
 	${KYTY_THIRD_PARTY_DIR}/VulkanMemoryAllocator/include
 	${KYTY_THIRD_PARTY_DIR}/SPIRV-Tools/include
 	${KYTY_THIRD_PARTY_DIR}/SPIRV-Headers/include
@@ -389,6 +406,15 @@ function(configure_macos_guest_address_space target)
 endfunction()
 
 add_kyty_full_emulator_test(shader_cfg_tests "${KYTY_TESTS_DIR}/shaderCfgTests.cpp")
+
+add_executable(per_vertex_transform_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/PerVertexTransformTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/perVertexTransform.cpp"
+)
+target_include_directories(per_vertex_transform_tests PRIVATE ${inc_headers})
+target_link_libraries(per_vertex_transform_tests common fmt::fmt xxhash)
+
+add_kyty_full_emulator_test(per_vertex_gpu_execution_tests "${KYTY_TESTS_DIR}/PerVertexGpuExecutionTests.cpp")
 
 add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ScalarProvenanceTests.cpp"
@@ -543,6 +569,7 @@ if(BUILD_TESTING)
 	set_tests_properties(emulator_present_mode_invalid PROPERTIES WILL_FAIL TRUE)
 	add_test(NAME ime_dialog COMMAND $<TARGET_FILE:ime_dialog_tests>)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
+	add_test(NAME per_vertex_transform COMMAND $<TARGET_FILE:per_vertex_transform_tests>)
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)

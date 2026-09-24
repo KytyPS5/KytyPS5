@@ -3786,7 +3786,8 @@ static int KYTY_SYSV_ABI GameLiveStreamingGetCurrentStatus2(GameLiveStreamingSta
 	return OK;
 }
 
-static int KYTY_SYSV_ABI GameLiveStreamingGetSocialFeedbackMessagesCount(int type, uint32_t* count) {
+static int KYTY_SYSV_ABI GameLiveStreamingGetSocialFeedbackMessagesCount(int       type,
+                                                                         uint32_t* count) {
 	PRINT_NAME();
 
 	if (type < 1 || type > 3 || count == nullptr) {

@@ -80,9 +80,9 @@ void ValidateNativeProgram(const IR::Program& program) {
 	}
 	const bool uses_flattened_runtime =
 	    !program.srt_reads.empty() ||
-	     std::ranges::any_of(program.info.images, [](const IR::ImageResource& image) {
-		     return image.indirect_search_iterations != 0u;
-	     });
+	    std::ranges::any_of(program.info.images, [](const IR::ImageResource& image) {
+		    return image.indirect_search_iterations != 0u;
+	    });
 	if (uses_flattened_runtime) {
 		Expect(Kind::FlattenedSrt);
 	}
@@ -105,7 +105,7 @@ void ValidateNativeProgram(const IR::Program& program) {
 		}
 	}
 	const auto has_shader_data_storage = present[static_cast<size_t>(Kind::ShaderData)];
-	const auto shader_data_dwords = program.bindings.ShaderDataDwords();
+	const auto shader_data_dwords      = program.bindings.ShaderDataDwords();
 	if ((program.bindings.UsesPushData() &&
 	     !IR::PushData::CanFit(program.bindings.push_data_start_dword, shader_data_dwords)) ||
 	    program.bindings.memory_offset_dword != program.bindings.user_data_registers.size() ||
@@ -304,8 +304,7 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 					if (index >= program.export_info.size()) {
 						Fail(program, "attribute export has invalid metadata");
 					}
-					if (program.stage == ShaderType::Pixel &&
-					    program.export_info[index].vm) {
+					if (program.stage == ShaderType::Pixel && program.export_info[index].vm) {
 						requirements.pixel_valid_mask = true;
 					}
 					break;
@@ -317,8 +316,8 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 	return requirements;
 }
 
-std::vector<uint32_t> EmitProgram(const IR::Program& program,
-                                  ShaderStageInputInfo input_info) {
+std::vector<uint32_t> EmitProgram(const IR::Program& program, ShaderStageInputInfo input_info,
+                                  const VertexCaptureInfo* vertex_capture) {
 	using namespace Emitter;
 
 	if (program.stage != ShaderType::Compute && program.stage != ShaderType::Vertex &&
@@ -334,15 +333,27 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 	ValidateNativeProgram(program);
 	IR::ValidateProgram(program, true);
 	EmitterState state(program, input_info);
+	state.vertex_capture  = vertex_capture;
 	const auto* workgroup = ShaderWorkgroupInput(program.stage, input_info);
 	state.lane_count =
 	    workgroup != nullptr && program.wave_size == 64u && workgroup->host_subgroup_size == 32u
 	        ? 2u
 	        : 1u;
+	if (vertex_capture != nullptr) {
+		if (program.stage != ShaderType::Vertex || input_info.vertex == nullptr ||
+		    (vertex_capture->host_subgroup_size != 32 &&
+		     vertex_capture->host_subgroup_size != 64)) {
+			Fail(program, "invalid vertex capture stage or host subgroup size");
+		}
+		state.lane_count =
+		    program.wave_size == 64 && vertex_capture->host_subgroup_size == 32 ? 2u : 1u;
+	}
 	DefineModule(state);
 	EmitProgram(state);
-	state.builder.AddEntryPoint(ExecutionModelForStage(state.program.stage), state.main_func,
-	                            "main", state.interface_variables);
+	state.builder.AddEntryPoint(vertex_capture != nullptr
+	                                ? spv::ExecutionModelGLCompute
+	                                : ExecutionModelForStage(state.program.stage),
+	                            state.main_func, "main", state.interface_variables);
 
 	return state.builder.Build();
 }

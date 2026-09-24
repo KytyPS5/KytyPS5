@@ -1,0 +1,120 @@
+#version 450
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+struct AttrDesc {
+	uint meta;        // [15:0] byte offset, [19:17] component count, [22:20] format kind
+	uint bit_counts;  // [count0, count1, count2, count3]
+};
+
+layout(push_constant) uniform PushConstants {
+	uint total_invocations;
+	uint index_count;
+	uint first_vertex;
+	int  vertex_offset;
+	uint first_instance;
+	uint vertex_stride;
+	uint num_records;
+	uint packed_flags; // [15:0] index offset, [16] indexed, [18:17] index type, [22:19] attributes
+	AttrDesc attrs[12];
+} push;
+
+layout(set = 0, binding = 0, std430) readonly buffer IndexBuffer {
+	uint raw_indices[];
+} index_buffer;
+
+layout(set = 0, binding = 1, std430) readonly buffer VertexBuffer {
+	uint raw_vertices[];
+} vertex_buffer;
+
+layout(set = 0, binding = 2, std430) writeonly buffer IdBuffer {
+	uvec2 ids[];
+} id_buffer;
+
+layout(set = 0, binding = 3, std430) writeonly buffer AttributeBuffer {
+	vec4 attributes[];
+} attribute_buffer;
+
+uint ReadBits(uint byte_base, uint bit_offset, uint bit_count) {
+	uint total_bit = (byte_base << 3u) + bit_offset;
+	uint word      = total_bit >> 5u;
+	uint shift     = total_bit & 31u;
+	uint value     = vertex_buffer.raw_vertices[word] >> shift;
+	if (shift + bit_count > 32u) {
+		value |= vertex_buffer.raw_vertices[word + 1u] << (32u - shift);
+	}
+	return bit_count == 32u ? value : value & ((1u << bit_count) - 1u);
+}
+
+uint VertexIndex(uint local) {
+	if (((push.packed_flags >> 16u) & 1u) == 0u) {
+		uint index = push.first_vertex + local;
+		return index < push.num_records ? index : 0xffffffffu;
+	}
+
+	uint index_type = (push.packed_flags >> 17u) & 3u;
+	uint byte_offset = push.packed_flags & 0xffffu;
+	uint raw_index;
+	if (index_type == 1u) {
+		uint address = byte_offset + (local << 1u);
+		raw_index = (index_buffer.raw_indices[address >> 2u] >> ((address & 2u) << 3u)) & 0xffffu;
+	} else if (index_type == 2u) {
+		uint address = byte_offset + (local << 2u);
+		raw_index = index_buffer.raw_indices[address >> 2u];
+	} else {
+		uint address = byte_offset + local;
+		raw_index = (index_buffer.raw_indices[address >> 2u] >> ((address & 3u) << 3u)) & 0xffu;
+	}
+
+	int adjusted = int(raw_index) + push.vertex_offset;
+	return adjusted >= 0 && uint(adjusted) < push.num_records ? uint(adjusted) : 0xffffffffu;
+}
+
+vec4 DecodeAttribute(uint vertex_id, uint attribute_index) {
+	AttrDesc info        = push.attrs[attribute_index];
+	uint byte_offset     = info.meta & 0xffffu;
+	uint component_count = (info.meta >> 17u) & 7u;
+	uint format_kind     = (info.meta >> 20u) & 7u;
+	uint byte_base       = vertex_id * push.vertex_stride + byte_offset;
+	vec4 result          = vec4(0.0, 0.0, 0.0, 1.0);
+	if (format_kind == 4u || format_kind == 5u) result.w = uintBitsToFloat(1u);
+	if (vertex_id == 0xffffffffu) return result;
+	uint bit_offset      = 0;
+	for (uint component = 0; component < component_count; ++component) {
+		uint bit_count  = (info.bit_counts >> (component << 3u)) & 0xffu;
+		if (format_kind == 1u) {
+			result[component] = uintBitsToFloat(ReadBits(byte_base, bit_offset, 32u));
+		} else if (format_kind == 2u) {
+			uint raw = ReadBits(byte_base, bit_offset, 16u);
+			int signed_raw = (raw & 0x8000u) != 0u ? int(raw & 0x7fffu) - 32768 : int(raw);
+			result[component] = max(float(signed_raw) / 32767.0, -1.0);
+		} else if (format_kind == 3u) {
+			result[component] = unpackHalf2x16(ReadBits(byte_base, bit_offset, 16u)).x;
+		} else if (format_kind == 4u || format_kind == 5u) {
+			uint raw = ReadBits(byte_base, bit_offset, bit_count);
+			uint sign = 1u << (bit_count - 1u);
+			result[component] = uintBitsToFloat(format_kind == 5u ? (raw ^ sign) - sign : raw);
+		} else {
+			uint raw = ReadBits(byte_base, bit_offset, bit_count);
+			result[component] = float(raw) / float((1u << bit_count) - 1u);
+		}
+		bit_offset += bit_count;
+	}
+	return result;
+}
+
+void main() {
+	uint invocation = gl_GlobalInvocationID.x;
+	if (invocation >= push.total_invocations) return;
+
+	uint local     = invocation % push.index_count;
+	uint instance  = push.first_instance + invocation / push.index_count;
+	uint vertex_id = VertexIndex(local);
+	id_buffer.ids[invocation] = uvec2(vertex_id != 0xffffffffu ? vertex_id : 0u, instance);
+
+	uint attribute_count = (push.packed_flags >> 19u) & 0x0fu;
+	uint output_base     = invocation * attribute_count;
+	for (uint attr = 0; attr < attribute_count; ++attr) {
+		attribute_buffer.attributes[output_base + attr] = DecodeAttribute(vertex_id, attr);
+	}
+}

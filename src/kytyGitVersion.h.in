@@ -5,6 +5,8 @@
 #define KYTY_GIT_HASH "@KYTY_GIT_HASH@"
 // Full commit identity used for compatibility checks.
 #define KYTY_GIT_REVISION "@KYTY_GIT_REVISION@"
+// Hash of per-vertex transformation source files to invalidate cache during local WIP development.
+#define KYTY_PER_VERTEX_TRANSFORM_SIGNATURE "@KYTY_PER_VERTEX_TRANSFORM_SIGNATURE@"
 
 /* Build provenance, shown in the window title and in crash reports. */
 #if defined(KYTY_OFFICIAL_BUILD)

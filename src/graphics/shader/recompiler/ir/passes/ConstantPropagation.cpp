@@ -200,6 +200,13 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 	switch (inst.GetOpcode()) {
 		case ValueOpcode::Phi: FoldPhi(inst); return;
 		case ValueOpcode::SelectU1:
+			if (!FoldSelect(inst) && IsImmediate(Arg(inst, 2), Type::U1) &&
+			    !Arg(inst, 2).U1()) {
+				auto result = block.PrependNewInst(instruction, ValueOpcode::LogicalAnd,
+				                                   {Arg(inst, 0), Arg(inst, 1)});
+				Replace(inst, Value(&*result));
+			}
+			return;
 		case ValueOpcode::SelectU32:
 		case ValueOpcode::SelectF32: FoldSelect(inst); return;
 		case ValueOpcode::BitFieldInsert: {
@@ -431,6 +438,10 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			return;
 		case ValueOpcode::ShiftRightLogical32:
 			if (!FoldU32(inst, [](uint32_t a, uint32_t b) { return a >> (b & 31u); })) {
+				if (IsImmediate(Arg(inst, 0), Type::U32) && Arg(inst, 0).U32() == 0u) {
+					Replace(inst, Value(0u));
+					return;
+				}
 				const auto shift = Arg(inst, 1);
 				if (IsImmediate(shift, Type::U32) && (shift.U32() & 31u) == 0u) {
 					Replace(inst, Arg(inst, 0));
@@ -573,6 +584,23 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			if (!FoldLogical(inst, [](bool a, bool b) { return a && b; })) {
 				const auto lhs = Arg(inst, 0);
 				const auto rhs = Arg(inst, 1);
+				const auto simplify = [&](Value assumption, Value expression) {
+					const auto* disjunction = expression.TryInstruction();
+					if (disjunction == nullptr || disjunction->GetOpcode() != ValueOpcode::LogicalOr) {
+						return false;
+					}
+					for (uint32_t i = 0; i < 2u; ++i) {
+						const auto* inverse = disjunction->Arg(i).Resolve().TryInstruction();
+						if (inverse != nullptr && inverse->GetOpcode() == ValueOpcode::LogicalNot &&
+						    inverse->Arg(0).Resolve() == assumption) {
+							inst.SetArg(assumption == lhs ? 1u : 0u,
+							            disjunction->Arg(i ^ 1u));
+							return true;
+						}
+					}
+					return false;
+				};
+				if (simplify(lhs, rhs) || simplify(rhs, lhs)) return;
 				if (IsImmediate(lhs, Type::U1)) {
 					Replace(inst, lhs.U1() ? rhs : lhs);
 				} else if (IsImmediate(rhs, Type::U1)) {

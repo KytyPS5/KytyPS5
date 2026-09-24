@@ -44,8 +44,8 @@ graphical glitches, low compatibility, and poor performance.
 <table align="center">
   <tr>
     <td align="center">
-      <strong>Disgaea 6</strong><br>
-      <img src="docs/screenshots/ps5-01.png" width="300" alt="Disgaea 6 running in KytyPS5">
+      <strong>Astro Bot</strong><br>
+      <img src="docs/screenshots/ps5-01.png" width="300" alt="Astro Bot running in KytyPS5">
     </td>
     <td align="center">
       <strong>Dreaming Sarah</strong><br>
@@ -64,12 +64,12 @@ graphical glitches, low compatibility, and poor performance.
   </tr>
   <tr>
     <td align="center">
-      <strong>Hellboy</strong><br>
-      <img src="docs/screenshots/ps5-02.png" width="300" alt="Hellboy running in KytyPS5">
+      <strong>Demon's Souls</strong><br>
+      <img src="docs/screenshots/ps5-02.png" width="300" alt="Demon's Souls running in KytyPS5">
     </td>
     <td align="center">
-      <strong>Paleo Pines</strong><br>
-      <img src="docs/screenshots/ps5-06.png" width="300" alt="Paleo Pines running in KytyPS5">
+      <strong>Hellboy</strong><br>
+      <img src="docs/screenshots/ps5-06.png" width="300" alt="Hellboy running in KytyPS5">
     </td>
   </tr>
 </table>

@@ -131,6 +131,29 @@ void TestZeroAndTinyLimitsClampToOne() {
   CheckCoverage(tiny_limits, 3, 300, 2, 1, 2);
 }
 
+void TestNonDividingStridesConsumeExactRemainders() {
+  // Strides are host limits that need not divide the guest counts (e.g. a
+  // stride of 2 against odd group/instance counts). Each iteration must
+  // consume exactly the count it covers: with groups or instances == UINT32_MAX
+  // (odd) and a host-reported stride of 2, advancing by the raw stride would
+  // wrap the uint32 counter and loop forever. The full UINT32_MAX input cannot
+  // be enumerated in a unit test, but termination depends on the exact
+  // remainders verified here.
+  const auto slices = SplitMeshDispatch(7, 5, 2, 2, 10);
+  CheckCoverage(slices, 7, 5, 2, 2, 10);
+  const auto &tail = slices.back();
+  Check(tail.group_offset == 6u && tail.group_count == 1u,
+        "trailing group remainder is wrong");
+  bool saw_last_remainder = false;
+  for (const auto &slice : slices) {
+    if (slice.group_offset == 6u && slice.instance_offset == 4u) {
+      Check(slice.instance_count == 1u, "trailing instance remainder is wrong");
+      saw_last_remainder = true;
+    }
+  }
+  Check(saw_last_remainder, "trailing instance remainder is missing");
+}
+
 } // namespace
 
 int main() {
@@ -141,6 +164,7 @@ int main() {
   TestDegenerateCounts();
   TestTotalLimitTighterThanGroupLimit();
   TestZeroAndTinyLimitsClampToOne();
+  TestNonDividingStridesConsumeExactRemainders();
   std::puts("MeshDispatchTests: all cases passed");
   return 0;
 }

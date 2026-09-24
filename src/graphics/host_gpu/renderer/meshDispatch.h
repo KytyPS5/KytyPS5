@@ -47,7 +47,11 @@ inline std::vector<MeshDispatchSlice> SplitMeshDispatch(uint32_t groups, uint32_
 	const uint32_t total_limit     = std::max(1u, max_total);
 	const uint32_t group_stride    = std::min(std::max(1u, max_groups), total_limit);
 	const uint32_t instance_stride = std::max(1u, max_instances);
-	for (uint32_t group = 0u; group < groups; group += group_stride) {
+	// Each loop advances by the count it actually consumed, never by the raw
+	// stride: the strides are host limits that need not divide the guest count,
+	// and adding them directly can wrap a uint32 counter (e.g. groups ==
+	// UINT32_MAX with stride 2 never reaches the terminating value).
+	for (uint32_t group = 0u; group < groups;) {
 		const uint32_t group_count = std::min(group_stride, groups - group);
 		// The total-limit cap is shared with the instance dimension. When the
 		// remaining instance range already fits under that cap together with
@@ -57,10 +61,12 @@ inline std::vector<MeshDispatchSlice> SplitMeshDispatch(uint32_t groups, uint32_
 			instance_chunk = std::max(1u, total_limit / group_count);
 			instance_chunk = std::min(instance_chunk, instance_stride);
 		}
-		for (uint32_t instance = 0u; instance < instances; instance += instance_chunk) {
-			slices.push_back(
-			    {group, group_count, instance, std::min(instance_chunk, instances - instance)});
+		for (uint32_t instance = 0u; instance < instances;) {
+			const uint32_t instance_count = std::min(instance_chunk, instances - instance);
+			slices.push_back({group, group_count, instance, instance_count});
+			instance += instance_count;
 		}
+		group += group_count;
 	}
 	return slices;
 }

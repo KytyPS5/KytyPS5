@@ -171,6 +171,13 @@ void Presenter::Frame::Configure(GraphicContext& graphics, vk::Extent2D extent, 
 		EXIT("unsupported prepared frame, extent=%ux%u format=%d\n", extent.width, extent.height,
 		     static_cast<int>(format));
 	}
+	auto&      dst        = image;
+	const bool compatible = dst.image != nullptr && dst.extent.width == extent.width &&
+	                        dst.extent.height == extent.height && dst.format == format;
+	if (compatible) {
+		return;
+	}
+
 	const auto features = graphics.GetFormatProperties(format).optimalTilingFeatures;
 	const auto required =
 	    vk::FormatFeatureFlagBits::eBlitSrc | vk::FormatFeatureFlagBits::eSampledImageFilterLinear |
@@ -180,12 +187,6 @@ void Presenter::Frame::Configure(GraphicContext& graphics, vk::Extent2D extent, 
 		     static_cast<int>(format), static_cast<vk::FormatFeatureFlags::MaskType>(features));
 	}
 
-	auto&      dst        = image;
-	const bool compatible = dst.image != nullptr && dst.extent.width == extent.width &&
-	                        dst.extent.height == extent.height && dst.format == format;
-	if (compatible) {
-		return;
-	}
 	if (dst.image != nullptr) {
 		graphics.DeleteImage(dst);
 	}

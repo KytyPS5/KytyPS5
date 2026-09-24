@@ -1210,7 +1210,9 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 		}
 		// Native expanded keys own consumption. Existing buffer tracking publishes this CPU
 		// write to future GPU readers; FillBuffer can fault and must run outside the texture lock.
-		m_buffer_cache.FillBuffer(address, slice_size, UINT32_MAX, false);
+		if (desc.type != BindingType::VideoOut) {
+			m_buffer_cache.FillBuffer(address, slice_size, UINT32_MAX, false);
+		}
 	}
 }
 
@@ -1331,16 +1333,6 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			}
 		}
 		auto& image = m_slot_images[result];
-		if (desc.type == BindingType::VideoOut &&
-		    desc.info.metadata.compression != VideoOutCompression::Uncompressed) {
-			const bool guest_dirty = image.IsBufferModified() || image.IsCpuDirty();
-			const bool native_current =
-			    (image.usage.render_target || image.IsGpuModified()) && !guest_dirty;
-			if (!native_current) {
-				EXIT("TextureCache: compressed video-out read requires clean native GPU "
-				     "contents\n");
-			}
-		}
 		if (view_mip >= 0) {
 			desc.view_info.base_level = static_cast<uint32_t>(view_mip);
 		}
@@ -1351,6 +1343,18 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		TouchImage(image);
 	}
 	MaterializeDccClear(result, desc, metadata_base_layer);
+	if (desc.type == BindingType::VideoOut &&
+	    desc.info.metadata.compression != VideoOutCompression::Uncompressed) {
+		std::scoped_lock lock {m_lock};
+		const auto& image = m_slot_images[result];
+		const bool guest_dirty = image.IsBufferModified() || image.IsCpuDirty();
+		const bool native_current =
+		    (image.usage.render_target || image.IsGpuModified()) && !guest_dirty;
+		if (!native_current) {
+			EXIT("TextureCache: compressed video-out read requires clean native GPU "
+			     "contents\n");
+		}
+	}
 	return result;
 }
 

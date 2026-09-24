@@ -565,7 +565,12 @@ Graphics::ImageInfo BufferAttributeGroup::ImageInfo(const VideoOutBuffer& buffer
 	info.bgra16          = pixel_format.bgra16;
 	info.mip_layout[0]   = {0, total.size, pitch, attribute.height};
 	if (compression != Graphics::VideoOutCompression::Uncompressed) {
-		info.metadata.range       = {buffer.metadata_address, 0};
+		Graphics::TileSizeAlign dcc_size {};
+		if (!Graphics::TileGetDccSize(attribute.width, attribute.height, 1,
+		                              pixel_format.bytes_per_element, 1, tile_mode, dcc_size)) {
+			EXIT("invalid video-out DCC footprint\n");
+		}
+		info.metadata.range       = {buffer.metadata_address, dcc_size.size};
 		info.metadata.kind        = Graphics::ImageMetadataKind::Dcc;
 		info.metadata.control     = attribute.dcc_control;
 		info.metadata.compression = compression;

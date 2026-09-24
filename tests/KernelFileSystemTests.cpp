@@ -620,9 +620,36 @@ void CheckSocketWakeup() {
   Check(Net::Recvfrom(datagram_receiver, datagram_buffer.data(), datagram_buffer.size(), 0,
                       datagram_source.data(), &datagram_source_size) == 0,
         "consume zero-length datagram");
+
+  // Winsock needs a one-byte scratch buffer to obtain the source of a zero-length peek.
+  // A queued one-byte datagram must still be reported as a zero-length receive.
+  constexpr char one_byte_datagram = 'x';
+  Check(Net::Sendto(datagram_sender, &one_byte_datagram, sizeof(one_byte_datagram), 0,
+                    datagram_address.data(), datagram_address.size()) == 1,
+        "send one-byte datagram");
+  datagram_source_size = datagram_source.size();
+  Check(Net::Recvfrom(datagram_receiver, datagram_buffer.data(), 0, 0x42,
+                      datagram_source.data(), &datagram_source_size) == 0 &&
+            datagram_source_size == datagram_sender_address.size() &&
+            std::memcmp(datagram_source.data(), datagram_sender_address.data(),
+                        datagram_sender_address.size()) == 0,
+        "zero-length peek does not report scratch data");
+  datagram_source_size = datagram_source.size();
+  Check(Net::Recvfrom(datagram_receiver, datagram_buffer.data(), datagram_buffer.size(), 0,
+                      datagram_source.data(), &datagram_source_size) == 1 &&
+            datagram_buffer[0] == one_byte_datagram,
+        "consume one-byte datagram after zero-length peek");
   Check(Net::SocketClose(datagram_sender) == 0 &&
             Net::SocketClose(datagram_receiver) == 0,
         "close datagram sockets");
+
+  // P2P descriptors share a datagram transport but do not support native accept.
+  const int p2p_socket = Net::Socket(2, 6, 0);
+  Check(p2p_socket >= 0, "create P2P datagram socket");
+  Check(Net::Accept(p2p_socket, nullptr, nullptr) == -1 &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EOPNOTSUPP,
+        "reject accept on P2P datagram socket");
+  Check(Net::SocketClose(p2p_socket) == 0, "close P2P datagram socket");
 }
 
 } // namespace

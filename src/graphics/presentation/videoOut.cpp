@@ -1556,7 +1556,9 @@ KYTY_SYSV_ABI int VideoOutIsFlipPending(int handle) {
 	VideoOutFlipStatus status {};
 	DriverState().GetFlipQueue().GetFlipStatus(*ctx, status);
 
-	LOGF("\t flipPendingNum = %d\n", status.flipPendingNum);
+	if (Config::GraphicsDebugDumpEnabled()) {
+		LOGF("\t flipPendingNum = %d\n", status.flipPendingNum);
+	}
 
 	return status.flipPendingNum;
 }

@@ -1,3 +1,5 @@
+// The test provides its own entry point, so SDL must not rename main() to SDL_main().
+#define SDL_MAIN_HANDLED
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
 
@@ -21,10 +23,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <future>
 #include <limits>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace Libs::LibKernelApr {
@@ -454,19 +458,171 @@ void CheckSocketWakeup() {
         "guest PEEK and WAITALL preserve the wake bytes");
   Check(Net::Recv(reader, received.data(), received.size(), 0x40) == sizeof(payload),
         "consume wake bytes with guest WAITALL");
+
+  // A full message split across writes must still complete a WAITALL receive, and the
+  // peeked bytes have to survive for the following receive.
+  const char text[] = "fragment";
+  constexpr std::size_t text_length = 8;    // without the terminator
+  constexpr std::size_t prefix_length = 5;  // deliberately short of text_length
+  Check(Net::Send(writer, text, text_length / 2, 0) == text_length / 2,
+        "send the first fragment");
+  const char* const second_fragment = text + text_length / 2;
+  const std::size_t second_length   = text_length - text_length / 2;
+  std::thread peer([&writer, second_fragment, second_length] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    Net::Send(writer, second_fragment, second_length, 0);
+  });
+  std::array<char, text_length> message {};
+  Check(Net::Recv(reader, message.data(), message.size(), 0x42) == message.size() &&
+            std::memcmp(message.data(), text, text_length) == 0,
+        "guest PEEK and WAITALL waits for a fragmented message");
+  peer.join();
+  Check(Net::Recv(reader, message.data(), message.size(), 0) == message.size() &&
+            std::memcmp(message.data(), text, text_length) == 0,
+        "peeked bytes stay available for the following receive");
+  Check(Net::Recv(reader, message.data(), 0, 0x42) == 0,
+        "zero length guest PEEK and WAITALL succeeds");
+
+  // MSG_DONTWAIT must never wait for the rest of the message.
+  Check(Net::Send(writer, text, prefix_length, 0) == prefix_length,
+        "send bytes for the non-waiting peek");
+  Check(Net::Recv(reader, message.data(), message.size(), 0xc2) == prefix_length,
+        "guest MSG_DONTWAIT PEEK and WAITALL returns the buffered prefix");
+  Check(Net::Recv(reader, message.data(), prefix_length, 0) == prefix_length,
+        "consume the non-waiting peek prefix");
+  Check(Net::Recv(reader, message.data(), message.size(), 0xc2) == -1 &&
+            *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EWOULDBLOCK,
+        "empty guest MSG_DONTWAIT PEEK and WAITALL translates guest errno");
+#if defined(_WIN32)
+  const int nonblocking = 1;
+  Check(Net::Setsockopt(reader, 0xffff, 0x1200, &nonblocking, sizeof(nonblocking)) == 0,
+        "enable the guest non-blocking socket");
+  Check(Net::Send(writer, text, prefix_length, 0) == prefix_length,
+        "send bytes for the non-blocking socket peek");
+  Check(Net::Recv(reader, message.data(), message.size(), 0x42) == prefix_length,
+        "non-blocking socket PEEK and WAITALL returns the buffered prefix");
+  Check(Net::Recv(reader, message.data(), prefix_length, 0) == prefix_length,
+        "consume the non-blocking socket peek prefix");
+  const int blocking = 0;
+  Check(Net::Setsockopt(reader, 0xffff, 0x1200, &blocking, sizeof(blocking)) == 0,
+        "restore the guest blocking socket");
+#endif
 #if !defined(_WIN32)
   Check(Net::Recv(reader, received.data(), received.size(), 0x80) == -1 &&
             *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EWOULDBLOCK,
         "empty nonblocking receive translates guest errno");
 #endif
-  Check(Net::SocketClose(reader) == 0 && Net::SocketClose(writer) == 0,
-        "close wake sockets");
+  // A peer that closes before the requested length ends the wait with the buffered bytes.
+  Check(Net::Send(writer, text, prefix_length, 0) == prefix_length,
+        "send the final message");
+  Check(Net::SocketClose(writer) == 0, "close the writer to signal end of file");
+  std::array<char, 16> tail {};
+  Check(Net::Recv(reader, tail.data(), tail.size(), 0x42) == prefix_length &&
+            std::memcmp(tail.data(), text, prefix_length) == 0,
+        "guest PEEK and WAITALL returns a short read at end of file");
+  Check(Net::Recv(reader, tail.data(), tail.size(), 0x42) == prefix_length,
+        "short peek at end of file keeps the bytes queued");
+  Check(Net::Recv(reader, tail.data(), tail.size(), 0) == prefix_length,
+        "consume the end of file bytes");
+  Check(Net::Recv(reader, tail.data(), tail.size(), 0x42) == 0,
+        "guest PEEK and WAITALL reports end of file");
+  Check(Net::SocketClose(reader) == 0, "close the wake reader");
   readable[reader / 64] = bit;
   Check(Net::Select(reader + 1, readable.data(), nullptr, nullptr,
                     immediate.data()) == -1 &&
             *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EBADF &&
             readable[reader / 64] == bit,
         "closed descriptor fails without clearing input fd_set");
+
+#if defined(_WIN32)
+  // FreeBSD accept(2) inherits O_NONBLOCK from the listening socket. Keep the native
+  // accepted socket and the emulator's guest-mode bookkeeping in agreement.
+  std::array<uint8_t, 16> inherited_address {16, 2, 0, 0, 127, 0, 0, 1};
+  const int inherited_listener = Net::Socket(2, 1, 0);
+  Check(inherited_listener >= 0 &&
+            Net::Bind(inherited_listener, inherited_address.data(),
+                      inherited_address.size()) == 0 &&
+            Net::Listen(inherited_listener, 1) == 0,
+        "create listener for accepted-mode test");
+  uint32_t inherited_address_size = inherited_address.size();
+  Check(Net::Getsockname(inherited_listener, inherited_address.data(),
+                         &inherited_address_size) == 0,
+        "get accepted-mode listener port");
+  const int inherited_writer = Net::Socket(2, 1, 0);
+  const int inherited_nonblocking = 1;
+  Check(Net::Setsockopt(inherited_listener, 0xffff, 0x1200, &inherited_nonblocking,
+                        sizeof(inherited_nonblocking)) == 0 &&
+            Net::Connect(inherited_writer, inherited_address.data(),
+                         inherited_address_size) == 0,
+        "connect to nonblocking listener");
+  const int inherited_reader = Net::Accept(inherited_listener, nullptr, nullptr);
+  Check(inherited_reader >= 0, "accept nonblocking listener socket");
+  Check(Net::Send(inherited_writer, text, prefix_length, 0) == prefix_length,
+        "send accepted-mode prefix");
+  std::array<char, text_length> inherited_message {};
+  auto inherited_receive = std::async(std::launch::async, [&] {
+    return Net::Recv(inherited_reader, inherited_message.data(), inherited_message.size(),
+                     0x42);
+  });
+  const bool returned_before_completion =
+      inherited_receive.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+  Check(Net::Send(inherited_writer, text + prefix_length,
+                  text_length - prefix_length, 0) == text_length - prefix_length,
+        "send accepted-mode suffix");
+  const int64_t inherited_result = inherited_receive.get();
+  Check(returned_before_completion && inherited_result == prefix_length &&
+            std::memcmp(inherited_message.data(), text, prefix_length) == 0,
+        "accepted nonblocking PEEK and WAITALL returns the prefix");
+  Check(Net::Recv(inherited_reader, inherited_message.data(), inherited_message.size(), 0) ==
+            text_length,
+        "consume accepted-mode peeked message");
+  Check(Net::SocketClose(inherited_reader) == 0 &&
+            Net::SocketClose(inherited_writer) == 0 &&
+            Net::SocketClose(inherited_listener) == 0,
+        "close accepted-mode sockets");
+#endif
+
+  // A zero-length datagram peek still has to report its source address on Winsock.
+  std::array<uint8_t, 16> datagram_address {16, 2, 0, 0, 127, 0, 0, 1};
+  const int datagram_receiver = Net::Socket(2, 2, 0);
+  Check(datagram_receiver >= 0 &&
+            Net::Bind(datagram_receiver, datagram_address.data(),
+                      datagram_address.size()) == 0,
+        "create datagram receiver");
+  uint32_t datagram_address_size = datagram_address.size();
+  Check(Net::Getsockname(datagram_receiver, datagram_address.data(),
+                         &datagram_address_size) == 0,
+        "get datagram receiver port");
+  const int datagram_sender = Net::Socket(2, 2, 0);
+  std::array<uint8_t, 16> datagram_sender_address {16, 2, 0, 0, 127, 0, 0, 1};
+  Check(datagram_sender >= 0 &&
+            Net::Bind(datagram_sender, datagram_sender_address.data(),
+                      datagram_sender_address.size()) == 0,
+        "bind datagram sender");
+  uint32_t datagram_sender_address_size = datagram_sender_address.size();
+  Check(Net::Getsockname(datagram_sender, datagram_sender_address.data(),
+                         &datagram_sender_address_size) == 0,
+        "get datagram sender port");
+  const char empty_datagram = 0;
+  Check(Net::Sendto(datagram_sender, &empty_datagram, 0, 0, datagram_address.data(),
+                    datagram_address.size()) == 0,
+        "send zero-length datagram");
+  std::array<uint8_t, 16> datagram_source {};
+  uint32_t datagram_source_size = datagram_source.size();
+  std::array<char, 1> datagram_buffer {};
+  Check(Net::Recvfrom(datagram_receiver, datagram_buffer.data(), 0, 0x42,
+                      datagram_source.data(), &datagram_source_size) == 0 &&
+            datagram_source_size == datagram_sender_address.size() &&
+            std::memcmp(datagram_source.data(), datagram_sender_address.data(),
+                        datagram_sender_address.size()) == 0,
+        "zero-length datagram PEEK and WAITALL reports its source");
+  datagram_source_size = datagram_source.size();
+  Check(Net::Recvfrom(datagram_receiver, datagram_buffer.data(), datagram_buffer.size(), 0,
+                      datagram_source.data(), &datagram_source_size) == 0,
+        "consume zero-length datagram");
+  Check(Net::SocketClose(datagram_sender) == 0 &&
+            Net::SocketClose(datagram_receiver) == 0,
+        "close datagram sockets");
 }
 
 } // namespace

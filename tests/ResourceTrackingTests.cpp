@@ -614,7 +614,8 @@ void TestGuardedDirectImageTable() {
     const auto &indirect = fixture.program.descriptor_sources[source].indirect_image;
     Check(indirect && indirect->material_source == UINT32_MAX &&
               indirect->selector_stride == 0u && indirect->table_offset == 344u &&
-              indirect->key_count == 32u &&
+              indirect->key_count.Resolve().IsImmediate() &&
+              indirect->key_count.Resolve().U32() == 32u &&
               fixture.program.descriptor_sources[indirect->table_source].dword_count == 2u,
           "guarded direct image table lost its pointer or proven selector range");
     return ExtractResourcePlan(fixture.program);
@@ -697,6 +698,390 @@ void TestGuardedDirectImageTable() {
   Check(!MaterializeResources(plan, runtime, snapshot, specialization) &&
             endpoint.watched_reads == 0u,
         "batched descriptor read crossed the 48-bit endpoint");
+}
+
+void TestBoundedComputeImageLoop() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  enum class Variant {
+    Bounded, WrongGuard, EntryBypass, ExitBypass, GuardBlock, WrongStep
+  };
+  const auto make_plan = [](Variant variant) {
+    Fixture fixture;
+    auto *entry = fixture.block;
+    auto *header = fixture.AddBlock();
+    auto *body = fixture.AddBlock();
+    auto *latch = fixture.AddBlock();
+    auto *exit = fixture.AddBlock();
+    entry->AddBranch(header);
+    header->AddBranch(exit);
+    header->AddBranch(body);
+    body->AddBranch(latch);
+    latch->AddBranch(header);
+    if (variant == Variant::EntryBypass) entry->AddBranch(body);
+    if (variant == Variant::ExitBypass) exit->AddBranch(body);
+    fixture.program.block_info[0].terminator = {
+        .kind = variant == Variant::EntryBypass ? CFG::TerminatorKind::ConditionalBranch
+                                               : CFG::TerminatorKind::Branch,
+        .true_block = 1u, .false_block = 2u};
+    fixture.program.block_info[1].terminator = {
+        .kind = CFG::TerminatorKind::ConditionalBranch,
+        .true_block = 4u, .false_block = 2u};
+    fixture.program.block_info[2].terminator = {
+        .kind = CFG::TerminatorKind::Branch, .true_block = 3u};
+    fixture.program.block_info[3].terminator = {
+        .kind = CFG::TerminatorKind::Branch, .true_block = 1u};
+    fixture.program.block_info[4].terminator = {
+        .kind = variant == Variant::ExitBypass ? CFG::TerminatorKind::Branch
+                                              : CFG::TerminatorKind::Return,
+        .true_block = 2u};
+
+    auto &phi = header->AppendNewInst(ValueOpcode::Phi, {},
+                                      static_cast<uint64_t>(Type::U32));
+    const auto key = Value(&phi);
+    const auto count = fixture.UserData(2);
+    const auto in_range = fixture.Emit(ValueOpcode::SLessThan32,
+                                       {variant == Variant::WrongGuard
+                                            ? Value(0u) : key,
+                                        count}, 0, header);
+    const auto allowed = fixture.Emit(ValueOpcode::LogicalAnd,
+                                      {in_range, Value(true)}, 0, header);
+    fixture.program.block_info[1].condition =
+        fixture.Emit(ValueOpcode::LogicalNot, {allowed}, 0, header);
+    const auto step = fixture.Emit(ValueOpcode::IAdd32,
+                                   {key, Value(variant == Variant::WrongStep ? 2u : 1u)},
+                                   0, latch);
+    phi.AddPhiOperand(entry, Value(0u));
+    phi.AddPhiOperand(latch, step);
+
+    fixture.block = variant == Variant::GuardBlock ? header : body;
+    const auto table = fixture.Address(fixture.UserData(0), fixture.UserData(1));
+    const auto offset = fixture.Emit(ValueOpcode::IAdd32,
+        {fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)}),
+         Value(0x6b0u)});
+    std::array<Value, 8> words;
+    for (uint32_t word = 0; word < words.size(); ++word) {
+      MemoryInfo memory;
+      memory.kind = ResourceKind::ScalarAddress;
+      memory.offset = word * sizeof(uint32_t);
+      words[word] = fixture.Emit(
+          ValueOpcode::LoadAddressU32,
+          {table, offset, Value(0u), Value(true)},
+          fixture.AddMemory(memory, 0x29c));
+    }
+    const auto image = fixture.Image(words, 0x29c);
+    const auto sampler = fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)});
+    MemoryInfo sample;
+    sample.kind = ResourceKind::Image;
+    sample.image_dimension = Decoder::ImageDimension::Dim2D;
+    fixture.Emit(ValueOpcode::ImageSampleRaw,
+                 {image, sampler, fixture.ImageAddress()},
+                 fixture.AddMemory(sample, 0x29c));
+    fixture.PlanAndTrack();
+    const auto source = fixture.program.info.images[0].source;
+    const auto &indirect = fixture.program.descriptor_sources[source].indirect_image;
+    Check(indirect && indirect->material_source == UINT32_MAX &&
+              indirect->table_offset == 0x6b0u &&
+              indirect->key_count.Resolve() == count.Resolve(),
+          "bounded compute loop lost its runtime image count");
+    return ExtractResourcePlan(fixture.program);
+  };
+
+  auto plan = make_plan(Variant::Bounded);
+  CheckFatal([&] { make_plan(Variant::WrongGuard); },
+             "not a valid runtime value",
+             "compute image loop accepted an unrelated guard");
+  CheckFatal([&] { make_plan(Variant::EntryBypass); },
+             "not a valid runtime value",
+             "compute image loop accepted an entry bypass");
+  CheckFatal([&] { make_plan(Variant::ExitBypass); },
+             "not a valid runtime value",
+             "compute image loop accepted an exit bypass");
+  CheckFatal([&] { make_plan(Variant::GuardBlock); },
+             "not a valid runtime value",
+             "compute image loop accepted a descriptor read before the guard");
+  CheckFatal([&] { make_plan(Variant::WrongStep); },
+             "not a valid runtime value",
+             "compute image loop accepted a two-step induction");
+
+  LinearTestMemory memory;
+  const auto table = 0x1800u + 0x6b0u;
+  for (uint32_t key = 0; key < 3u; ++key) {
+    const auto word = (table - memory.base) / 4u + key * 8u;
+    memory.words[word] = 0x100u + key;
+    memory.words[word + 1u] = static_cast<uint32_t>(
+        Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float) << 20u;
+    memory.words[word + 3u] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+        (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+  }
+  std::array<uint32_t, 3> user_data{0x1800u, 0u, 2u};
+  SrtRuntime runtime{.user_data = user_data,
+                     .read_memory = ReadLinearTestMemory,
+                     .userdata = &memory,
+                     .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  for (const uint32_t count : {2u, 3u, 2u}) {
+    user_data[2] = count;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              snapshot.images.size() == count &&
+              specialization.images.size() == count &&
+              snapshot.flattened_srt[
+                  specialization.images[0].indirect_mapping_offset] == count &&
+              snapshot.images.back().dwords[0] == 0x100u + count - 1u,
+          "compute image table did not refresh for a changed loop bound");
+  }
+  for (const uint32_t count : {0u, UINT32_MAX}) {
+    user_data[2] = count;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              snapshot.images.size() == 1u &&
+              specialization.images.size() == 1u &&
+              std::ranges::all_of(snapshot.images[0].dwords,
+                                  [](uint32_t word) { return word == 0u; }) &&
+              specialization.images[0].indirect_root ==
+                  ImageResource::NoIndirectImage &&
+              specialization.images[0].indirect_search_iterations == 0u,
+          "empty compute loop bound retained unreachable image candidates");
+  }
+  user_data[2] = 65537u;
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+        "oversized compute loop bound was accepted for image enumeration");
+}
+
+void TestUniformizedMaterialImageKeys() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  const auto make_plan = [](bool wrong_update, bool wrong_equality) {
+    Fixture fixture;
+    auto *entry = fixture.block;
+    auto *header = fixture.AddBlock();
+    auto *inactive = fixture.AddBlock();
+    auto *sentinel = fixture.AddBlock();
+    auto *bit = fixture.AddBlock();
+    auto *merge = fixture.AddBlock();
+    auto *choose = fixture.AddBlock();
+    auto *sample = fixture.AddBlock();
+    auto *done = fixture.AddBlock();
+    entry->AddBranch(header);
+    header->AddBranch(inactive);
+    inactive->AddBranch(merge);
+    inactive->AddBranch(sentinel);
+    sentinel->AddBranch(merge);
+    sentinel->AddBranch(bit);
+    bit->AddBranch(header);
+    bit->AddBranch(merge);
+    merge->AddBranch(choose);
+    choose->AddBranch(sample);
+    choose->AddBranch(done);
+    sample->AddBranch(done);
+    fixture.program.block_info[0].terminator = {
+        .kind = CFG::TerminatorKind::Branch, .true_block = 1u};
+    fixture.program.block_info[1].terminator = {
+        .kind = CFG::TerminatorKind::Branch, .true_block = 2u};
+    const auto active_on_entry = fixture.Emit(
+        ValueOpcode::INotEqual32, {fixture.UserData(5u), Value(0u)}, 0, entry);
+    auto &active_phi = header->AppendNewInst(
+        ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U1));
+    auto &mask_phi = header->AppendNewInst(
+        ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+    const auto mask = Value(&mask_phi);
+    const auto active = Value(&active_phi);
+    fixture.program.block_info[2].condition = fixture.Emit(
+        ValueOpcode::LogicalNot, {active}, 0, inactive);
+    fixture.program.block_info[2].terminator = {
+        .kind = CFG::TerminatorKind::ConditionalBranch,
+        .true_block = 5u, .false_block = 3u};
+    const auto nonzero = fixture.Emit(
+        ValueOpcode::INotEqual32, {Value(0u), mask}, 0, sentinel);
+    const auto bit_guard = fixture.Emit(
+        ValueOpcode::LogicalAnd, {active, nonzero}, 0, sentinel);
+    fixture.program.block_info[3].condition = fixture.Emit(
+        ValueOpcode::LogicalNot, {bit_guard}, 0, sentinel);
+    fixture.program.block_info[3].terminator = {
+        .kind = CFG::TerminatorKind::ConditionalBranch,
+        .true_block = 5u, .false_block = 4u};
+    const auto first = fixture.Emit(ValueOpcode::FindILsb32, {mask}, 0, bit);
+    const auto position = fixture.Emit(
+        ValueOpcode::BitwiseAnd32, {first, Value(31u)}, 0, bit);
+    const auto one_bit = fixture.Emit(
+        ValueOpcode::ShiftLeftLogical32, {Value(1u), position}, 0, bit);
+    const auto cleared = fixture.Emit(
+        wrong_update ? ValueOpcode::BitwiseOr32 : ValueOpcode::BitwiseXor32,
+        {mask, one_bit}, 0, bit);
+    const auto continuation = fixture.Emit(
+        ValueOpcode::LogicalAnd, {bit_guard, active_on_entry}, 0, bit);
+    fixture.program.block_info[4].condition = continuation;
+    fixture.program.block_info[4].terminator = {
+        .kind = CFG::TerminatorKind::ConditionalBranch,
+        .true_block = 1u, .false_block = 5u};
+    active_phi.AddPhiOperand(entry, active_on_entry);
+    active_phi.AddPhiOperand(bit, continuation);
+    mask_phi.AddPhiOperand(entry, fixture.UserData(4u));
+    mask_phi.AddPhiOperand(bit, cleared);
+    const auto arbitrary = fixture.UserData(6u);
+    const auto sentinel_index = fixture.Emit(
+        ValueOpcode::SelectU32, {active, Value(32u), arbitrary}, 0, sentinel);
+    const auto bit_index = fixture.Emit(
+        ValueOpcode::SelectU32, {bit_guard, first, sentinel_index}, 0, bit);
+    auto &index_phi = merge->AppendNewInst(
+        ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+    index_phi.AddPhiOperand(inactive, arbitrary);
+    index_phi.AddPhiOperand(sentinel, sentinel_index);
+    index_phi.AddPhiOperand(bit, bit_index);
+    const auto index = Value(&index_phi);
+    const auto below = fixture.Emit(
+        ValueOpcode::SGreaterThan32, {Value(32u), index}, 0, merge);
+    const auto material_guard = fixture.Emit(
+        ValueOpcode::LogicalAnd, {active_on_entry, below}, 0, merge);
+    fixture.program.block_info[5].terminator = {
+        .kind = CFG::TerminatorKind::Branch, .true_block = 6u};
+    const auto scaled = fixture.Emit(
+        ValueOpcode::ShiftLeftLogical32, {index, Value(4u)}, 0, choose);
+    const auto selected_scale = fixture.Emit(
+        ValueOpcode::SelectU32, {material_guard, scaled, Value(0u)}, 0, choose);
+    const auto times_eight = fixture.Emit(
+        ValueOpcode::ShiftLeftLogical32, {selected_scale, Value(3u)}, 0, choose);
+    const auto times_nine = fixture.Emit(
+        ValueOpcode::IAdd32, {times_eight, selected_scale}, 0, choose);
+    const auto material_offset = fixture.Emit(
+        ValueOpcode::SelectU32,
+        {material_guard,
+         fixture.Emit(ValueOpcode::IAdd32,
+                      {times_nine, Value(0xc00u)}, 0, choose),
+         times_nine}, 0, choose);
+    const auto base = fixture.Address(fixture.UserData(0u), fixture.UserData(1u));
+    MemoryInfo material_memory;
+    material_memory.kind = ResourceKind::Global;
+    const auto loaded = fixture.Emit(
+        ValueOpcode::LoadAddressU32,
+        {base, material_offset, Value(0u), material_guard},
+        fixture.AddMemory(material_memory, 0x1a88u), choose);
+    const auto local = fixture.Emit(
+        ValueOpcode::SelectU32, {material_guard, loaded, arbitrary}, 0, choose);
+    const auto key = fixture.Emit(
+        ValueOpcode::ReadLane, {local, Value(0u)}, 0, choose);
+    const auto compared = fixture.Emit(
+        ValueOpcode::IEqual32,
+        {key, wrong_equality ? arbitrary : local}, 0, choose);
+    const auto sample_guard = fixture.Emit(
+        ValueOpcode::LogicalAnd, {material_guard, compared}, 0, choose);
+    fixture.program.block_info[6].condition = fixture.Emit(
+        ValueOpcode::LogicalNot, {sample_guard}, 0, choose);
+    fixture.program.block_info[6].terminator = {
+        .kind = CFG::TerminatorKind::ConditionalBranch,
+        .true_block = 8u, .false_block = 7u};
+    const auto table_offset = fixture.Emit(
+        ValueOpcode::IAdd32,
+        {fixture.Emit(ValueOpcode::ShiftLeftLogical32,
+                      {key, Value(5u)}, 0, sample), Value(0x20e0u)}, 0, sample);
+    std::array<Value, 8> words;
+    for (uint32_t word = 0; word < words.size(); ++word) {
+      MemoryInfo memory;
+      memory.kind = ResourceKind::ScalarAddress;
+      memory.offset = word * 4u;
+      words[word] = fixture.Emit(
+          ValueOpcode::LoadAddressU32,
+          {base, table_offset, Value(0u), Value(true)},
+          fixture.AddMemory(memory, 0x1accu), sample);
+    }
+    const auto image = fixture.Emit(
+        ValueOpcode::GetImageResource,
+        {words[0], words[1], words[2], words[3],
+         words[4], words[5], words[6], words[7]}, 0, sample);
+    const auto sampler = fixture.Emit(
+        ValueOpcode::GetSamplerResource,
+        {Value(0u), Value(0u), Value(0u), Value(0u)}, 0, sample);
+    const auto address = fixture.Emit(
+        ValueOpcode::MakeImageAddress,
+        {Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
+         Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
+         Value(0u)}, 0, sample);
+    MemoryInfo image_memory;
+    image_memory.kind = ResourceKind::Image;
+    image_memory.image_dimension = Decoder::ImageDimension::Dim2D;
+    fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, address},
+                 fixture.AddMemory(image_memory, 0x1aecu), sample);
+    fixture.program.block_info[7].terminator = {
+        .kind = CFG::TerminatorKind::Branch, .true_block = 8u};
+    fixture.program.block_info[8].terminator.kind = CFG::TerminatorKind::Return;
+    const auto output = fixture.Emit(
+        ValueOpcode::GetBufferResource,
+        {fixture.UserData(8u), fixture.UserData(9u),
+         fixture.UserData(10u), fixture.UserData(11u)}, 0, done);
+    MemoryInfo output_memory;
+    output_memory.kind = ResourceKind::Buffer;
+    fixture.Emit(ValueOpcode::StoreBufferU32,
+                 {output, Value(0u), Value(0u), Value(0u),
+                  Value(1u), Value(true)},
+                 fixture.AddMemory(output_memory, 0x1b00u), done);
+    fixture.PlanAndTrack();
+    const auto source = fixture.program.info.images[0].source;
+    const auto &indirect = fixture.program.descriptor_sources[source].indirect_image;
+    Check(indirect && indirect->selector_stride == 0x90u &&
+              indirect->selector_offset == 0xc00u &&
+              indirect->table_offset == 0x20e0u &&
+              !indirect->selector_mask.IsEmpty() &&
+              indirect->key_count.Resolve().IsImmediate() &&
+              indirect->key_count.Resolve().U32() == 32u,
+          "uniformized image key lost its finite material range");
+    return ExtractResourcePlan(fixture.program);
+  };
+  auto plan = make_plan(false, false);
+  Check(plan.requires_specialization_memory &&
+            plan.descriptor_sources[plan.info.images[0].source]
+                .indirect_image->selector_mask.Resolve().TryInstruction() != nullptr,
+        "uniformized image mask did not survive extraction");
+  LinearTestMemory memory;
+  memory.words.resize(0x23000u / 4u);
+  constexpr uint64_t base = 0x1000u;
+  constexpr uint64_t first_material = base + 0xc00u + 2u * 0x90u;
+  constexpr uint64_t second_material = base + 0xc00u + 29u * 0x90u;
+  constexpr uint64_t first_table = base + 0x20e0u + 7u * 32u;
+  constexpr uint64_t second_table = base + 0x20e0u + 4096u * 32u;
+  memory.words[(first_material - base) / 4u] = 7u;
+  memory.words[(second_material - base) / 4u] = 4096u;
+  const auto set_descriptor = [&](uint64_t address, uint32_t color) {
+    const auto word = (address - base) / 4u;
+    memory.words[word] = color;
+    memory.words[word + 1u] = static_cast<uint32_t>(
+        Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float) << 20u;
+    memory.words[word + 3u] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+        (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+  };
+  set_descriptor(first_table, 0x200u);
+  set_descriptor(second_table, 0x400u);
+  std::array<uint32_t, 12> user_data{};
+  user_data[0] = base;
+  user_data[4] = (1u << 2u) | (1u << 29u);
+  user_data[5] = 1u;
+  user_data[8] = 0x400000u;
+  user_data[9] = 16u << 16u;
+  user_data[10] = 1u;
+  memory.fail_address = base + 0xc00u + 3u * 0x90u;
+  const SrtRuntime runtime{
+      .user_data = user_data, .read_memory = ReadLinearTestMemory,
+      .userdata = &memory,
+      .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.images.size() == 2u &&
+            memory.reads == 4u && memory.descriptor_reads == 2u &&
+            snapshot.flattened_srt[
+                specialization.images[0].indirect_mapping_offset] == 2u &&
+            snapshot.flattened_srt[
+                specialization.images[0].indirect_mapping_offset + 1u] == 7u &&
+            snapshot.flattened_srt[
+                specialization.images[0].indirect_mapping_offset + 3u] == 4096u,
+        "material mask did not limit sparse descriptor reads");
+  user_data[8] = first_material;
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+        "written buffer alias with a material key was accepted");
+  user_data[8] = first_table;
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+        "written buffer alias with an image record was accepted");
+  CheckFatal([&] { make_plan(true, false); }, "not a valid runtime value",
+             "non-clearing material mask was accepted");
+  CheckFatal([&] { make_plan(false, true); }, "not a valid runtime value",
+             "unrelated ReadLane key was accepted");
 }
 
 void TestImageDescriptorFields() {
@@ -2506,6 +2891,8 @@ int main() {
     Run("dynamic storage mips", TestDynamicStorageMipTracking);
     Run("invariant indirect images", TestInvariantIndirectImageMaterialization);
     Run("guarded direct image table", TestGuardedDirectImageTable);
+    Run("bounded compute image loop", TestBoundedComputeImageLoop);
+    Run("uniformized material image keys", TestUniformizedMaterialImageKeys);
     Run("image descriptor fields", TestImageDescriptorFields);
     Run("draw-uniform scalar image", TestUniformScalarBufferImage);
     Run("SRT runtime", TestSrtFlatteningAndRuntimeMemoization);

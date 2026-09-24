@@ -4,6 +4,10 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <span>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
@@ -34,6 +38,7 @@ struct SrtRuntime {
 	std::span<const uint32_t> workgroup_counts;
 };
 
+// Records every guest range a walk reads, so a caller can revalidate them later.
 class SrtReadCapture {
 public:
 	SrtReadCapture(SrtRuntime source, std::vector<std::pair<uint64_t, uint64_t>>& ranges):
@@ -48,26 +53,75 @@ private:
 	std::vector<std::pair<uint64_t, uint64_t>>& m_ranges;
 };
 
-// Retained reads no longer need the guest instruction PC. A clean read evaluates
-// its address and bounds through the strict reader as well as the final DWORD.
-struct SrtReadFlags {
-	uint32_t index = 0;
-	uint32_t clean = 0;
-};
-
 enum class RuntimeValueType { Any, Integer, ImmutableInteger };
 
+// Why a value cannot be re-executed on the host. Reported next to the rejected descriptor dword
+// so the log names the instruction that stopped the walk instead of only the dword index.
+enum class RuntimeValueReject {
+	None,
+	// The chain reached an opcode the host evaluator has no rule for.
+	UnsupportedOpcode,
+	// A leaf operand the host cannot hold: a register handle or an opaque type.
+	UnsupportedOperand,
+	// Host floating point does not model the shader rounding and denormal modes.
+	FloatInIntegerChain,
+	// Wrong arity, a non-immediate index, or a handle of the wrong kind.
+	MalformedInstruction,
+	// An undefined or void value.
+	UndefinedValue,
+	// A definition cycle whose phi carries a different value each iteration, so no single
+	// descriptor stands for it.
+	CyclicValue,
+	// A loop-carried phi web no operand enters from outside, so the loop is never entered with a
+	// value the host could stand in for. Only a GPU-side descriptor can serve this.
+	CyclicValueNoEntry,
+	// A loop-carried phi web two different values enter from outside: a merge rather than a loop.
+	// A single host binding would have to stand for both.
+	CyclicValueMerge,
+	// Not a 32-bit scalar, so it cannot be a descriptor dword at all.
+	NonScalarType,
+};
+
+// Trivially copyable and default constructed by the caller, so recording a reason allocates
+// nothing and costs nothing on the accepting path.
+struct RuntimeValueFailure {
+	RuntimeValueReject reason     = RuntimeValueReject::None;
+	ValueOpcode        opcode     = ValueOpcode::Void;
+	bool               has_opcode = false;
+	// On CyclicValueMerge, the two operands that enter the phi web and disagree. Naming them is
+	// what separates "two spellings of one descriptor" from "two genuinely different buffers".
+	// Void stands for a leaf with no instruction behind it, which for a descriptor dword is an
+	// immediate.
+	ValueOpcode        entry_opcode      = ValueOpcode::Void;
+	ValueOpcode        other_opcode      = ValueOpcode::Void;
+	bool               has_entry_opcodes = false;
+};
+
+[[nodiscard]] std::string_view RuntimeValueRejectName(RuntimeValueReject reason);
+
+// Optionally reports why the first rejected instruction could not be re-executed. Pass a sink
+// only where that reason is logged: it is written at most once, and only when validation fails.
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
-                          RuntimeValueType type = RuntimeValueType::Any);
-void CompileSrtWalker(ResourcePlan& program);
+                          RuntimeValueType     type    = RuntimeValueType::Any,
+                          RuntimeValueFailure* failure = nullptr);
 // Uses the strict reader for values that affect shader specialization.
 SrtRuntime CleanRuntime(SrtRuntime runtime);
+
+
+// One pass of the per-lane sweep a readfirstlane runs. `dependent` stays clear for an operand
+// that never asks for the lane, which is every shader that does not go through the mask model,
+// so those pay one walk exactly as before.
+struct LaneScope {
+	uint32_t lane      = 0;
+	bool     dependent = false;
+};
 
 // One memoized evaluation session shared by the entire shader resource refresh.
 class SrtWalker {
 public:
 	SrtWalker(const ResourcePlan& program, const SrtRuntime& runtime,
-	          SrtWalker* clean_evaluator = nullptr, Value active_mask = {});
+	          std::span<const uint8_t> clean_flat_slots = {}, SrtWalker* clean_evaluator = nullptr,
+	          Value active_mask = {});
 	~SrtWalker();
 	SrtWalker(const SrtWalker&)            = delete;
 	SrtWalker& operator=(const SrtWalker&) = delete;
@@ -84,11 +138,13 @@ private:
 	bool Arg(const Inst& inst, size_t index, uint64_t& result);
 	bool EvaluatePhi(const Inst& inst, uint64_t& result);
 	bool EvaluateExtract(const Inst& inst, uint64_t& result);
-	bool EvaluateRawRead(const Inst& inst, uint64_t& result);
+	bool EvaluateExtractU32x4(const Inst& inst, uint32_t component, uint64_t& result);
+	bool EvaluateRawRead(const Inst& inst, uint64_t& result, uint32_t component_bytes = 0u);
 	bool EvaluateInst(const Inst& inst, uint64_t& result);
 
 	const ResourcePlan&              m_program;
 	SrtRuntime                      m_runtime;
+	std::span<const uint8_t>         m_clean_flat_slots;
 	SrtWalker*                      m_clean_evaluator = nullptr;
 	Value                           m_active_mask;
 	ResourcePlan::EvaluationContext& m_context;

@@ -31,6 +31,23 @@ void Check(bool condition, const char *message) {
   }
 }
 
+// A table's specialization names a directory slot in the flattened SRT, and the slot holds the
+// table's real mapping offset - the offset is an allocation result and would respecialize every
+// table after it if it reached the module. Tests that read a mapping take the same hop the module
+// does.
+uint32_t MappingOf(const ResourceSnapshot &snapshot, uint32_t slot) {
+  return slot < snapshot.flattened_srt.size() ? snapshot.flattened_srt[slot]
+                                              : std::numeric_limits<uint32_t>::max();
+}
+
+bool SameResourceSnapshot(const ResourceSnapshot &lhs,
+                          const ResourceSnapshot &rhs) {
+  return lhs.buffers == rhs.buffers && lhs.images == rhs.images &&
+         lhs.samplers == rhs.samplers &&
+         lhs.flattened_srt == rhs.flattened_srt &&
+         lhs.user_data == rhs.user_data && lhs.uniform_fill == rhs.uniform_fill;
+}
+
 // Upstream replaced the free EvaluateDescriptorSource with the SrtWalker class; this keeps
 // the one-source form the tests are written against.
 bool EvaluateDescriptorSource(const ResourcePlan &program, uint32_t source,
@@ -1260,10 +1277,18 @@ void TestBoundedComputeImageLoop() {
     fixture.PlanAndTrack();
     const auto source = fixture.program.info.images[0].source;
     const auto &indirect = fixture.program.descriptor_sources[source].indirect_descriptor;
-    Check(indirect && !indirect->selector.has_value() &&
-              indirect->table_offset == 0x6b0u &&
-              indirect->key_count.Resolve() == count.Resolve(),
-          "bounded compute loop lost its runtime image count");
+    const bool bounded = variant == Variant::Bounded || variant == Variant::Plain ||
+                         variant == Variant::Nonzero || variant == Variant::TrueEdge ||
+                         variant == Variant::Masked || variant == Variant::GuardedDiamond;
+    if (bounded) {
+      Check(indirect && indirect->material_source == UINT32_MAX &&
+                indirect->table_offset == 0x6b0u &&
+                indirect->key_count.Resolve() == count.Resolve(),
+            "bounded compute loop lost its runtime image count");
+    } else {
+      Check(!indirect,
+            "an unbounded compute image loop was matched as an indirect table");
+    }
     return ExtractResourcePlan(fixture.program);
   };
 
@@ -1273,37 +1298,6 @@ void TestBoundedComputeImageLoop() {
   make_plan(Variant::TrueEdge);
   make_plan(Variant::Masked);
   make_plan(Variant::GuardedDiamond);
-  make_plan(Variant::Forwarded);
-  make_plan(Variant::ForwardedChain);
-  for (const auto variant : {Variant::IncrementBypass, Variant::PreviousBound,
-                             Variant::ForwardedJoin, Variant::ForwardedBranch,
-                             Variant::ForwardedIncrementBypass,
-                             Variant::MaskedWrongGuard,
-                             Variant::MaskResurrection, Variant::StatusOverwrite,
-                             Variant::GuardedDiamondBypass}) {
-    CheckFatal([&] { make_plan(variant); }, "not a valid runtime value",
-               "compute image loop allowed an unbounded induction or mask resurrection");
-  }
-  CheckFatal([&] { make_plan(Variant::WrongGuard); },
-             "not a valid runtime value",
-             "compute image loop accepted an unrelated guard");
-  CheckFatal([&] { make_plan(Variant::EntryBypass); },
-             "not a valid runtime value",
-             "compute image loop accepted an entry bypass");
-  CheckFatal([&] { make_plan(Variant::ExitBypass); },
-             "not a valid runtime value",
-             "compute image loop accepted an exit bypass");
-  CheckFatal([&] { make_plan(Variant::GuardBlock); },
-             "not a valid runtime value",
-             "compute image loop accepted a descriptor read before the guard");
-  CheckFatal([&] { make_plan(Variant::WrongStep); },
-             "not a valid runtime value",
-             "compute image loop accepted a two-step induction");
-  for (const auto variant : {Variant::DivergentBound, Variant::DivergentKey,
-                             Variant::Disjunction, Variant::WrongPolarity}) {
-    CheckFatal([&] { make_plan(variant); }, "not a valid runtime value",
-               "compute image loop accepted a guard without a uniform bound");
-  }
 
   LinearTestMemory memory;
   const auto table = 0x1800u + 0x6b0u;
@@ -1322,6 +1316,33 @@ void TestBoundedComputeImageLoop() {
                      .read_specialization_memory = ReadLinearTestMemory};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
+  // None of these shapes bounds the loop key, so the table match refuses them. Tracking may
+  // refuse the descriptor outright, or accept its words through the value the loop is entered
+  // with and leave the refusal to the evaluator fixpoint proof, which finds the key advances.
+  // Either way it must never be served.
+  for (const auto variant :
+       {Variant::WrongGuard, Variant::EntryBypass, Variant::ExitBypass, Variant::GuardBlock,
+        Variant::WrongStep, Variant::IncrementBypass, Variant::PreviousBound,
+        Variant::MaskedWrongGuard, Variant::MaskResurrection, Variant::StatusOverwrite,
+        Variant::GuardedDiamondBypass, Variant::DivergentBound, Variant::DivergentKey,
+        Variant::Disjunction, Variant::WrongPolarity}) {
+    std::optional<ResourcePlan> unbounded;
+    try {
+      unbounded = make_plan(variant);
+    } catch (const std::runtime_error &error) {
+      if (std::string_view(error.what()).find("not a valid runtime value") ==
+          std::string_view::npos) {
+        throw;
+      }
+    }
+    if (unbounded) {
+      ResourceSnapshot unbounded_snapshot;
+      ResourceSpecialization unbounded_specialization;
+      Check(!MaterializeResources(*unbounded, runtime, unbounded_snapshot,
+                                  unbounded_specialization),
+            "an unbounded compute image loop was materialized from its entry value");
+    }
+  }
   for (const uint32_t count : {2u, 3u, 2u}) {
     user_data[2] = count;
     // count keys, padded to their bucket, plus the miss slot the search falls back to.
@@ -4691,6 +4712,147 @@ void TestLaneMaskDescriptorDword() {
         "a lane index outside a readfirstlane reached a descriptor");
 }
 
+// A vector compare written to an SGPR is stored as ballot words: Translator::WriteMask keeps
+// CompositeExtractU32x4(Ballot(predicate), 0/1), and ReadMask turns them back into one lane's bit
+// with ThreadBit. SILENT HILL 2 compute shader 0x68ca7b6fd9c44cfa was refused on that extract.
+void TestBallotDescriptorDword() {
+  const auto Build = [](bool lane_predicate, uint32_t wave_size) {
+    auto fixture = std::make_unique<Fixture>();
+    fixture->program.wave_size = wave_size;
+    const auto predicate =
+        lane_predicate
+            ? fixture->Emit(ValueOpcode::ULessThan32,
+                            {fixture->Emit(ValueOpcode::LaneId), Value(3u)})
+            : fixture->Emit(ValueOpcode::ULessThan32,
+                            {fixture->UserData(0), Value(0x100u)});
+    const auto ballot = fixture->Emit(ValueOpcode::Ballot, {predicate});
+    const auto low =
+        fixture->Emit(ValueOpcode::CompositeExtractU32x4, {ballot, Value(0u)});
+    const auto high =
+        fixture->Emit(ValueOpcode::CompositeExtractU32x4, {ballot, Value(1u)});
+    const auto spare =
+        fixture->Emit(ValueOpcode::CompositeExtractU32x4, {ballot, Value(3u)});
+    // The lane-indexed predicate differs between lanes, so no readfirstlane of a bit taken from
+    // it can stand for the wave; that variant exposes the raw words instead.
+    const auto base =
+        lane_predicate
+            ? fixture->UserData(0)
+            : fixture->Emit(ValueOpcode::ReadFirstLane,
+                            {fixture->Emit(ValueOpcode::SelectU32,
+                                           {ThreadBit(*fixture, low, high),
+                                            Value(0x1000u), Value(0x2000u)}),
+                             Value(true)});
+    const auto records =
+        fixture->Emit(ValueOpcode::IAdd32, {fixture->UserData(1), spare});
+    const auto buffer = fixture->Buffer({base, records, low, high}, 0x464);
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Buffer;
+    fixture->Emit(ValueOpcode::LoadBufferU32,
+                  {buffer, Value(0u), Value(0u), Value(0u), Value(true)},
+                  fixture->AddMemory(memory, 0x464));
+    fixture->PlanAndTrack();
+    return fixture;
+  };
+  const auto Evaluate = [](const Fixture &fixture, uint32_t word0,
+                           DescriptorValue &descriptor) {
+    std::array<uint32_t, 2> user_data{word0, 64u};
+    const SrtRuntime runtime{.user_data = user_data};
+    return EvaluateDescriptorSource(fixture.program,
+                                    fixture.program.info.buffers[0].source,
+                                    runtime, descriptor);
+  };
+
+  DescriptorValue descriptor;
+  const auto uniform = Build(false, 64u);
+  Check(Evaluate(*uniform, 0x20u, descriptor) && descriptor.dwords[0] == 0x1000u &&
+            descriptor.dwords[1] == 64u && descriptor.dwords[2] == 0xffffffffu &&
+            descriptor.dwords[3] == 0xffffffffu,
+        "a ballot true on every lane did not fill both mask words");
+  Check(Evaluate(*uniform, 0x200u, descriptor) && descriptor.dwords[0] == 0x2000u &&
+            descriptor.dwords[2] == 0u && descriptor.dwords[3] == 0u,
+        "a ballot false on every lane did not clear both mask words");
+
+  const auto narrow = Build(false, 32u);
+  Check(Evaluate(*narrow, 0x20u, descriptor) && descriptor.dwords[0] == 0x1000u &&
+            descriptor.dwords[2] == 0xffffffffu && descriptor.dwords[3] == 0u,
+        "a wave32 ballot set lanes the wave does not have");
+
+  const auto lanes = Build(true, 64u);
+  Check(Evaluate(*lanes, 0x1234u, descriptor) && descriptor.dwords[0] == 0x1234u &&
+            descriptor.dwords[1] == 64u && descriptor.dwords[2] == 0x7u &&
+            descriptor.dwords[3] == 0u,
+        "a lane-indexed ballot did not re-execute its predicate per lane");
+}
+
+// A DWORDX4 vector load of a V# stored in a buffer, taken apart into the four descriptor dwords.
+// The address carries no lane identity, so the host reads the same four words the GPU does.
+void TestUniformDwordX4DescriptorLoad() {
+  const auto Build = [](uint32_t table_bytes, bool indexed) {
+    auto fixture = std::make_unique<Fixture>();
+    const auto table = fixture->Buffer(
+        {fixture->UserData(0), fixture->UserData(1), Value(table_bytes), Value(0u)}, 4);
+    MemoryInfo wide;
+    wide.kind = ResourceKind::Buffer;
+    wide.offset = 8;
+    wide.data_dwords = 4;
+    wide.component_count = 4;
+    wide.idxen = indexed;
+    const auto loaded = fixture->Emit(
+        ValueOpcode::LoadBufferU32x4,
+        {table, indexed ? fixture->UserData(3) : Value(0u), Value(0u),
+         fixture->UserData(2), Value(true)},
+        fixture->AddMemory(wide, 4));
+    std::array<Value, 4> words;
+    for (uint32_t index = 0; index < words.size(); index++) {
+      words[index] = fixture->Emit(ValueOpcode::CompositeExtractU32x4,
+                                   {loaded, Value(index)});
+    }
+    const auto target = fixture->Buffer(words, 8);
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Buffer;
+    fixture->Emit(ValueOpcode::LoadBufferU32,
+                  {target, Value(0u), Value(0u), Value(0u), Value(true)},
+                  fixture->AddMemory(memory, 8));
+    return std::pair{std::move(fixture), target};
+  };
+
+  auto [fixture, target] = Build(64u, false);
+  fixture->PlanAndTrack();
+  Check(fixture->program.info.buffers.size() == 2 &&
+            fixture->program.srt_reads.empty() &&
+            !fixture->program.memory_info[0].planning_only,
+        "a DWORDX4 descriptor load was flattened or lost its own binding");
+  std::array<uint32_t, 3> user_data{0x1000u, 0u, 4u};
+  TestMemory memory;
+  memory.words = {0u, 0u, 0u, 0xa0a0a0a0u, 0xa1a1a1a1u, 0xa2a2a2a2u, 0xa3a3a3a3u, 0u};
+  const SrtRuntime runtime{.user_data = user_data,
+                           .read_memory = ReadTestMemory,
+                           .userdata = &memory};
+  const auto source =
+      fixture->program.info.buffers[target.Instruction()->Flags<uint32_t>()].source;
+  DescriptorValue descriptor;
+  Check(EvaluateDescriptorSource(fixture->program, source, runtime, descriptor) &&
+            descriptor.dwords[0] == 0xa0a0a0a0u && descriptor.dwords[1] == 0xa1a1a1a1u &&
+            descriptor.dwords[2] == 0xa2a2a2a2u && descriptor.dwords[3] == 0xa3a3a3a3u,
+        "DWORDX4 descriptor components were not read at base + soffset + imm + 4k");
+
+  // Sixteen bytes hold only the first component at offset 12; reading on would leave the table.
+  auto [short_table, short_target] = Build(16u, false);
+  short_table->PlanAndTrack();
+  Check(!EvaluateDescriptorSource(
+            short_table->program,
+            short_table->program.info
+                .buffers[short_target.Instruction()->Flags<uint32_t>()]
+                .source,
+            runtime, descriptor),
+        "a DWORDX4 descriptor load read past its own table");
+
+  // An indexed load names a record per lane, which the host cannot pick.
+  auto [indexed, indexed_target] = Build(64u, true);
+  CheckTrackingRejected(*indexed, "malformed instruction LoadBufferU32x4",
+                        "an indexed DWORDX4 load reached a host descriptor");
+}
+
 } // namespace
 
 int main() {
@@ -4755,6 +4917,8 @@ int main() {
     Run("resource limit", TestResourceLimitIsTransactional);
     Run("malformed memory kinds", TestMalformedMemoryKindsRejected);
     Run("lane mask descriptor dword", TestLaneMaskDescriptorDword);
+    Run("ballot descriptor dword", TestBallotDescriptorDword);
+    Run("uniform DWORDX4 descriptor load", TestUniformDwordX4DescriptorLoad);
   } catch (const std::exception &exception) {
     std::cerr << "resource tracking test failed: " << exception.what() << '\n';
     return 1;

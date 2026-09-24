@@ -22508,11 +22508,11 @@ TestCase VectorVopcCmpxEqU16SdwaCompactVop3ExecMask() {
       {0xaaaa5555u, 0xbbbb5555u, 1, 1},
       {0x00000000u, 0x00000001u, 1, 0},
       {0x0000ffffu, 0x00000000u, 1, 0},
-      {0x7fff8000u, 0x00018000u, 1, 0}, // Sign bit alone does not make these equal.
+      {0x7fff8000u, 0x00018000u, 1, 1}, // Equal low halves despite different high halves.
       {0x00000000u, 0x00010000u, 1, 1},
       {0x12340001u, 0x12340002u, 1, 0, 1},
       {0x00008000u, 0x0000ffffu, 1, 0, 2},
-      {0x0001ffffu, 0x12340001u, 1, 1, 3},
+      {0x0001ffffu, 0x12340001u, 1, 0, 3}, // Sign-extended low halves differ.
       {0x00000001u, 0x00010001u, 0, 0}, // CMPX cannot reactivate an inactive lane.
   }};
   constexpr u32 vcc_hi = 0x89abcdefu;

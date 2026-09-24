@@ -6805,9 +6805,9 @@ void TestNewShaderRecompilerFormattedStoreUsesRuntimeArrayLengthOnly() {
   Check(result.resources.buffers.size() == 1 &&
             result.resources.buffers[0].dwords[2] == 5u,
         "formatted store test did not preserve descriptor NumRecords");
-  Check((result.decoded_dump.find("buffer_store_format_x") != std::string::npos),
+  Check((result.decoded_dump.find("BUFFER_STORE_FORMAT_X") != std::string::npos),
         "formatted store regression did not decode buffer_store_format_x");
-  Check((result.ir_dump.find("typed=0 formatted=1") != std::string::npos),
+  Check((result.decoded_dump.find("typed=0 formatted=1") != std::string::npos),
         "formatted store regression did not preserve formatted metadata");
   CheckSpirvBinaryValidates(result.spirv);
 
@@ -6817,6 +6817,15 @@ void TestNewShaderRecompilerFormattedStoreUsesRuntimeArrayLengthOnly() {
   Check(
       !SpirvSourceHasInstructionUsing(source, "OpULessThan", "%uint_5"),
       "formatted store SPIR-V baked descriptor NumRecords into a store guard");
+
+  user_data[1] = 8u << 16u;
+  user_data[3] = static_cast<uint32_t>(Prospero::BufferFormat::k16_16_16_16Float) << 12u;
+  options.user_data = user_data;
+  result = RecompileForTest(shader, options);
+  Check((DisassembleSpirvBinary(result.spirv).find("PackHalf2x16") !=
+         std::string::npos),
+        "formatted half-float store did not convert F32 to F16");
+  CheckSpirvBinaryValidates(result.spirv);
 }
 
 void TestNewShaderRecompilerTypedBufferTranslation() {
@@ -11593,6 +11602,27 @@ void TestNewShaderRecompilerVertexExportUsesInvocationExecMask() {
 }
 
 void TestNewShaderRecompilerPerInvocationMasksWithoutMirrors() {
+  for (uint32_t wave_size : {32u, 64u}) {
+    for (uint32_t opcode : {0x09u, 0x0au}) {
+      for (uint32_t source : {126u, 8u}) {
+        const uint32_t pixel_shader[] = {
+            EncodeSop1(0x04, 8, 126), // Save the entry live mask.
+            EncodeSop1(opcode, 126, source),
+            EncodeVop1(0x01, 0, 242), // v_mov_b32 v0, 1.0
+            EncodeExp0(0x00, 0x1), EncodeExp1(0, 0, 0, 0),
+            EncodeSopp(0x01),
+        };
+        auto pixel_options = MakeCompileOptions(ShaderType::Pixel);
+        pixel_options.wave_size = wave_size;
+        const auto pixel_result = RecompileForTest(pixel_shader, pixel_options);
+        CheckSpirvBinaryValidates(pixel_result.spirv);
+        Check(DisassembleSpirvBinary(pixel_result.spirv).find("OpGroupNonUniformBallot") ==
+                  std::string::npos,
+              "entry WQM lost the known live predicate through a scalar ballot");
+      }
+    }
+  }
+
   const uint32_t local_shader[] = {
       EncodeVopc(0xc1, 5 + 256, 8),    // v_cmp_lt_u32 vcc, v5, v8
       EncodeSop2(0x0f, 2, 126, 106),   // s_and_b64 s[2:3], exec, vcc
@@ -13613,6 +13643,7 @@ int main(int argc, char** argv) {
   TestNewShaderRecompilerNativeWideBufferIr();
   TestNewShaderRecompilerScalarB64LaneTranslation();
   TestNewShaderRecompilerMubufFormatTranslation();
+  TestNewShaderRecompilerFormattedStoreUsesRuntimeArrayLengthOnly();
   TestNewShaderRecompilerTypedBufferTranslation();
   TestNewShaderRecompilerDsReadWrite2Translation();
   TestNewShaderRecompilerDsWideAndAtomicTranslation();

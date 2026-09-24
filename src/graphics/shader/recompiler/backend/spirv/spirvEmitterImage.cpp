@@ -784,11 +784,11 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		                         ? &state.program.descriptor_sources[image.source]
 		                         : nullptr;
 		if (handle == nullptr || source == nullptr || !source->indirect_image.has_value() ||
-		    source->indirect_image->key_arg >= handle->NumArgs()) {
+		    handle->NumArgs() == 0u) {
 			ctx.Fail(inst, "has invalid indirect image key provenance");
 			return;
 		}
-		const auto key = ctx.Def(handle->Arg(source->indirect_image->key_arg));
+		const auto key = ctx.Def(handle->Arg(0));
 		if (state.flattened_srt_variable == 0 || image.indirect_search_iterations == 0u ||
 		    image.indirect_resources.size() < 2u) {
 			ctx.Fail(inst, "has no indirect image runtime mapping");

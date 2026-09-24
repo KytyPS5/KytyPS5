@@ -160,10 +160,10 @@ public:
 	void DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
 	                      uint32_t mode);
 
-	[[nodiscard]] PreparedBindings PrepareBindings(const ShaderStageRuntime& runtime);
-	void                           FindBuffers(PreparedBindings& bindings);
-	void                           RebindBuffers(PreparedBindings& bindings);
-	void                           RebindImages(PreparedBindings& bindings);
+	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
+	void FindBuffers(PreparedBindings& bindings);
+	void RebindBuffers(PreparedBindings& bindings);
+	void RebindImages(PreparedBindings& bindings);
 	void CommitBindings(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
 	                    const PipelineCache::Pipeline&     pipeline,
 	                    std::span<PreparedBindings* const> bindings);
@@ -198,23 +198,25 @@ private:
 	                               vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
 	                               const DrawIndexBufferSource& index_source,
 	                               bool                         primitive_restart_enable);
-	[[nodiscard]] RenderState
-	AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors, uint32_t color_count,
-	                     RenderDepthInfo&                       depth,
-	                     const std::optional<PreparedBindings>& pixel = std::nullopt);
-	[[nodiscard]] bool ResolveColorTargets(CommandBuffer& buffer,
-	                                       uint32_t       render_target_slice_offset);
-	void               BindImage(ImageId id, bool storage);
-	void               BindRenderTarget(ImageId id);
-	void               ResetBindings();
-	[[nodiscard]] bool TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
-	                                              const CommandBuffer&          buffer);
-	[[nodiscard]] bool TryConsumeComputeImageClear(const ShaderComputeInputInfo& input,
-	                                               CommandBuffer& command, uint32_t group_x,
-	                                               uint32_t group_y, uint32_t group_z,
-	                                               uint32_t mode);
+	[[nodiscard]] RenderState AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
+	                                               uint32_t color_count, RenderDepthInfo& depth,
+	                                               vk::ImageAspectFlags& feedback_aspects,
+	                                               std::span<PreparedBindings* const> stages = {});
+	[[nodiscard]] bool        ResolveColorTargets(CommandBuffer& buffer,
+	                                              uint32_t       render_target_slice_offset);
+	void                      BindImage(ImageId id, bool storage);
+	void                      BindRenderTarget(ImageId id);
+	void                      ResetBindings();
+	[[nodiscard]] bool        TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
+	                                                     const CommandBuffer&          buffer);
+	[[nodiscard]] bool        TryConsumeComputeImageClear(const ShaderComputeInputInfo& input,
+	                                                      CommandBuffer& command, uint32_t group_x,
+	                                                      uint32_t group_y, uint32_t group_z,
+	                                                      uint32_t mode);
 
 	RenderContext&                        m_context;
+	GraphicsBindings                      m_graphics_bindings;
+	PreparedBindings                      m_compute_bindings;
 	std::vector<ImageId>                  m_bound_images;
 	std::vector<vk::DescriptorBufferInfo> m_descriptor_buffers;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;

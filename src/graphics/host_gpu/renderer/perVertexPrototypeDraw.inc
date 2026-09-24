@@ -82,8 +82,10 @@ void RenderExecutor::ExecutePerVertexPrototype(uint64_t submit_id, CommandBuffer
 		idx_buf_available  = vtx_buf_ptr->Size();
 	}
 
-	PreparedBindings  vertex_bindings = PrepareBindings(vs.stage);
-	PreparedBindings  pixel_bindings  = PrepareBindings(state.ps_input_info.stage);
+	PreparedBindings vertex_bindings;
+	PreparedBindings pixel_bindings;
+	PrepareBindings(vs.stage, vertex_bindings);
+	PrepareBindings(state.ps_input_info.stage, pixel_bindings);
 	PreparedBindings* stages[] {&vertex_bindings, &pixel_bindings};
 	PrepareGraphicsBindings(stages, {state.color_info, state.color_count});
 
@@ -258,20 +260,16 @@ void RenderExecutor::ExecutePerVertexPrototype(uint64_t submit_id, CommandBuffer
 	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(
 	    {state.color_info, state.color_count}, state.depth_info, {state.vertex_info.data(), 1},
 	    buffer, &state.ps_input_info, topology, false, programs->graphics);
-	const auto rendering =
-	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
-	                         std::optional<PreparedBindings> {pixel_bindings});
+	vk::ImageAspectFlags feedback_aspects;
+	const auto rendering = AcquireRenderTargets(buffer, state.color_info, state.color_count,
+	                                            state.depth_info, feedback_aspects, stages);
 	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
 	cmd = buffer.Handle();
 	cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipeline.pipeline_layout, 1, 1,
 	                       &extra_set, 0, nullptr);
 	SetGraphicsDynamicParams(buffer, cmd, vs, state.depth_info, rendering);
 	if (graphics.attachment_feedback_loop_enabled)
-		cmd.setAttachmentFeedbackLoopEnableEXT(
-		    rendering.depth_stencil_attachment.image_layout ==
-		            vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
-		        ? vk::ImageAspectFlags {vk::ImageAspectFlagBits::eDepth}
-		        : vk::ImageAspectFlags {});
+		cmd.setAttachmentFeedbackLoopEnableEXT(feedback_aspects);
 	scheduler.BeginRendering(rendering);
 	cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
 	cmd.draw(count, 1, 0, 0);

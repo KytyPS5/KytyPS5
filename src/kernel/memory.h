@@ -190,6 +190,7 @@ void     TestFailNextPhysicalMemoryUnmap();
 void     TestFailPhysicalMemoryUnmapAfter(uint32_t successful_unmaps);
 void     TestFailGuestBackingStoreUnmapAfter(uint32_t successful_unmaps);
 void     TestFailNextFixedReserveRangeRegistration();
+void     TestFailNextVirtualRangeReplacement();
 bool     TestPlaceholderRangeIsFree(uint64_t vaddr, uint64_t size);
 bool     TestGuestAddressRangeIsOwned(uint64_t vaddr, uint64_t size);
 bool     TestGuestBackingOutsideAddressSpace();

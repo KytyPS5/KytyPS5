@@ -14,10 +14,12 @@
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/frontend/translate/Translate.h"
+#include "graphics/shader/recompiler/frontend/translate/Translator.h"
 #include "graphics/shader/recompiler/ir/IREmitter.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
+#include "graphics/shader/recompiler/ir/passes/DynamicBuffer.h"
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
@@ -33,6 +35,7 @@
 #include <array>
 #include <bit>
 #include <cstdint>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -4177,6 +4180,273 @@ void TestScalarAshrI64Decoder() {
   Check((ProgramToString(program).find("S_ASHR_I64 s6, s4, s2") != std::string::npos),
         "S_ASHR_I64 is missing from the decoded dump");
 }
+// Execute the emitted instruction IR, so these fixtures exercise the lowering itself.
+void TestBvhIntersections() {
+  using namespace ShaderRecompiler;
+  using IR::ValueOpcode;
+  const uint32_t code[] = {0xf1989f07u, 0x00040505u, 0x4442413du, 0x4543403eu, 0x00004746u};
+  Decoder::Instruction decoded;
+  Decoder::DecodeInstruction(code, 0, decoded);
+  IR::Program program;
+  IR::Block block;
+  Frontend::Translator translator(program, &block, 256);
+  translator.TranslateInstruction(decoded);
+  const auto bits = [](float f) { return std::bit_cast<uint32_t>(f); };
+  const auto fp = [](uint64_t u) { return std::bit_cast<float>(static_cast<uint32_t>(u)); };
+  const uint32_t addresses[] = {5, 61, 65, 66, 68, 62, 64, 67, 69, 70, 71};
+  float ray[] = {100, .25f, .25f, -1, 0, 0, 1, INFINITY, INFINITY, 1};
+  auto run = [&](uint32_t node, const std::vector<uint32_t>& words, bool active = true, bool sort = false, uint32_t last_node = 1023, bool null = false) {
+    std::array<uint32_t, 256> vgpr{};
+    std::array<uint32_t, 128> sgpr{};
+    // Nonzero base and a carry across the low address dword exercise full guest addresses.
+    constexpr uint64_t base = 0x12fffff000ull;
+    sgpr[16] = null ? 0 : static_cast<uint32_t>(base >> 8);
+    sgpr[17] = static_cast<uint32_t>(base >> 40) | (sort ? 0x80000000u : 0u);
+    sgpr[18] = last_node;
+    sgpr[19] = 0x81000000u;
+    vgpr[5] = node;
+    for (uint32_t i = 0; i < std::size(ray); i++) vgpr[addresses[i + 1]] = bits(ray[i]);
+    const auto initial = vgpr;
+    std::unordered_map<const IR::Inst*, uint64_t> values;
+    auto get = [&](IR::Value value) -> uint64_t {
+      if (!value.IsImmediate()) return values.at(value.Instruction());
+      switch (value.GetType()) {
+      case IR::Type::U1: return value.U1();
+      case IR::Type::U16: return value.U16();
+      case IR::Type::F16: return value.F16Bits();
+      case IR::Type::U32: return value.U32();
+      case IR::Type::U64: return value.U64();
+      case IR::Type::F32: return bits(value.F32Value());
+      case IR::Type::ScalarReg: return IR::RegIndex(value.ScalarRegister());
+      case IR::Type::VectorReg: return IR::RegIndex(value.VectorRegister());
+      default: Check(false, "unexpected BVH test immediate"); return 0;
+      }
+    };
+    for (const auto& inst : block.Instructions()) {
+      uint64_t a = inst.NumArgs() > 0 ? get(inst.Arg(0)) : 0;
+      uint64_t b = inst.NumArgs() > 1 ? get(inst.Arg(1)) : 0;
+      uint64_t c = inst.NumArgs() > 2 ? get(inst.Arg(2)) : 0;
+      uint64_t result = 0;
+      switch (inst.GetOpcode()) {
+      case ValueOpcode::GetScalarRegister: result = sgpr.at(a); break;
+      case ValueOpcode::GetVectorRegister: result = vgpr.at(a); break;
+      case ValueOpcode::SetVectorRegister: vgpr.at(a) = b; break;
+      case ValueOpcode::GetExec: result = active; break;
+      case ValueOpcode::Identity:
+      case ValueOpcode::BitCastF32U32:
+      case ValueOpcode::BitCastU32F32:
+      case ValueOpcode::BitCastF16U16: result = a; break;
+      case ValueOpcode::ConvertU16U32: result = static_cast<uint16_t>(a); break;
+      case ValueOpcode::ConvertF32F16: {
+        const uint32_t exponent = (a >> 10) & 31, fraction = a & 1023;
+        const float magnitude = exponent == 31 ? (fraction ? NAN : INFINITY) :
+            std::ldexp(static_cast<float>(fraction + (exponent ? 1024 : 0)), exponent ? static_cast<int>(exponent) - 25 : -24);
+        result = bits((a & 0x8000) ? -magnitude : magnitude);
+        break;
+      }
+      case ValueOpcode::ConvertF32U32: result = bits(static_cast<float>(a)); break;
+      case ValueOpcode::SelectU1:
+      case ValueOpcode::SelectU32:
+      case ValueOpcode::SelectF32: result = a ? b : c; break;
+      case ValueOpcode::IAdd32: result = static_cast<uint32_t>(a + b); break;
+      case ValueOpcode::ISub32: result = static_cast<uint32_t>(a - b); break;
+      case ValueOpcode::IMul32: result = static_cast<uint32_t>(a * b); break;
+      case ValueOpcode::IAdd64: result = a + b; break;
+      case ValueOpcode::ISub64: result = a - b; break;
+      case ValueOpcode::ShiftLeftLogical32: result = static_cast<uint32_t>(a) << (b & 31); break;
+      case ValueOpcode::ShiftRightLogical32: result = static_cast<uint32_t>(a) >> (b & 31); break;
+      case ValueOpcode::ShiftLeftLogical64: result = a << b; break;
+      case ValueOpcode::ShiftRightLogical64: result = a >> b; break;
+      case ValueOpcode::BitwiseAnd32:
+      case ValueOpcode::BitwiseAnd64: result = a & b; break;
+      case ValueOpcode::BitwiseOr32: result = a | b; break;
+      case ValueOpcode::BitwiseNot32: result = static_cast<uint32_t>(~a); break;
+      case ValueOpcode::IEqual32:
+      case ValueOpcode::IEqual64: result = a == b; break;
+      case ValueOpcode::INotEqual32: result = a != b; break;
+      case ValueOpcode::ULessThan32:
+      case ValueOpcode::ULessThan64: result = a < b; break;
+      case ValueOpcode::ULessThanEqual32: result = a <= b; break;
+      case ValueOpcode::UGreaterThan32:
+      case ValueOpcode::UGreaterThan64: result = a > b; break;
+      case ValueOpcode::UGreaterThanEqual32: result = a >= b; break;
+      case ValueOpcode::LogicalAnd: result = a && b; break;
+      case ValueOpcode::LogicalOr: result = a || b; break;
+      case ValueOpcode::LogicalNot: result = !a; break;
+      case ValueOpcode::FPAdd32: result = bits(fp(a) + fp(b)); break;
+      case ValueOpcode::FPSub32: result = bits(fp(a) - fp(b)); break;
+      case ValueOpcode::FPMul32: result = bits(fp(a) * fp(b)); break;
+      case ValueOpcode::FPRecip32: result = bits(1.0f / fp(a)); break;
+      case ValueOpcode::FPMin32: result = bits(std::fmin(fp(a), fp(b))); break;
+      case ValueOpcode::FPMax32: result = bits(std::fmax(fp(a), fp(b))); break;
+      case ValueOpcode::FPAbs32: result = bits(std::fabs(fp(a))); break;
+      case ValueOpcode::FPOrdEqual32: result = fp(a) == fp(b); break;
+      case ValueOpcode::FPOrdNotEqual32: result = !std::isnan(fp(a)) && !std::isnan(fp(b)) && fp(a) != fp(b); break;
+      case ValueOpcode::FPOrdLessThan32: result = fp(a) < fp(b); break;
+      case ValueOpcode::FPOrdLessThanEqual32: result = fp(a) <= fp(b); break;
+      case ValueOpcode::FPOrdGreaterThan32: result = fp(a) > fp(b); break;
+      case ValueOpcode::FPOrdGreaterThanEqual32: result = fp(a) >= fp(b); break;
+      case ValueOpcode::FPIsNan32: result = std::isnan(fp(a)); break;
+      case ValueOpcode::CompositeConstructU64: result = a | (b << 32); break;
+      case ValueOpcode::CompositeExtractU64: result = static_cast<uint32_t>(a >> (b * 32)); break;
+      case ValueOpcode::ValidateBvhDescriptor:
+      case ValueOpcode::GetAddressResource: break;
+      case ValueOpcode::LoadAddressU32: {
+        if (!get(inst.Arg(3))) break;
+        const auto& memory = program.memory_info.at(inst.Flags<IR::MemoryFlags>().index);
+        const uint64_t address = b + (c << 32) + memory.offset;
+        const uint64_t offset = address - base - (static_cast<uint64_t>(node & ~7u) << 3);
+        Check(memory.address_is_full && offset % 4 == 0 && offset / 4 < words.size(), "BVH load escaped its node");
+        result = words.at(offset / 4);
+        break;
+      }
+      default: std::fprintf(stderr, "BVH evaluator missing %s\n", IR::ValueOpcodeName(inst.GetOpcode())); Check(false, "unhandled BVH IR opcode");
+      }
+      values[&inst] = result;
+    }
+    if (!active) Check(vgpr == initial, "BVH modified inactive lane registers");
+    return std::array<uint32_t, 4>{vgpr[5], vgpr[6], vgpr[7], vgpr[8]};
+  };
+  std::vector<uint32_t> triangle(16);
+  triangle[3] = bits(1); triangle[7] = bits(1); // (0,0,0), (1,0,0), (0,1,0)
+  triangle[9] = bits(1); triangle[10] = bits(1); // quad fourth vertex
+  triangle[15] = 0x0909; // I,J for each triangle
+  auto hit = run(0x200u, triangle);
+  Check(fp(hit[0]) / fp(hit[1]) == 1 && fp(hit[2]) / fp(hit[1]) == .25f && fp(hit[3]) / fp(hit[1]) == .25f, "BVH triangle intersection numerators");
+  auto miss = run(0x201u, triangle);
+  Check(std::isinf(fp(miss[0])) && fp(miss[1]) == 1, "BVH triangle pair selection");
+  run(0x200u, {}, false);
+  const std::array<uint32_t, 4> no_children{0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff};
+  Check(run(0x200u, {}, true, false, 63) == no_children, "BVH out-of-range triangle was read");
+  Check(run(0x200u, {}, true, false, 1023, true) == no_children, "null BVH was read");
+  Check(run(0x206u, {}) == no_children, "BVH user-defined node was read");
+  triangle[15] = 2;
+  hit = run(0x200u, triangle);
+  Check(fp(hit[2]) / fp(hit[1]) == .25f && fp(hit[3]) / fp(hit[1]) == .5f, "BVH barycentric remapping");
+  triangle[15] = 0x0909;
+  ray[1] = .75f; ray[2] = .75f;
+  hit = run(0x201u, triangle);
+  Check(fp(hit[0]) / fp(hit[1]) == 1 && fp(hit[2]) / fp(hit[1]) == .5f && fp(hit[3]) / fp(hit[1]) == .25f, "BVH second triangle hit");
+  ray[1] = .25f; ray[2] = .25f; ray[3] = 1; ray[6] = -1; ray[9] = -1;
+  hit = run(0x200u, triangle);
+  Check(fp(hit[0]) / fp(hit[1]) == 1 && fp(hit[2]) / fp(hit[1]) == .25f, "BVH reversed triangle winding");
+  ray[3] = -1; ray[6] = 1; ray[9] = 1;
+  std::vector<uint32_t> box(28);
+  for (uint32_t child = 0; child < 4; child++) {
+    box[child] = 0x100u + child;
+    const uint32_t start = 4 + 6 * child;
+    box[start] = bits(0); box[start + 1] = bits(0); box[start + 2] = bits(4.0f - child);
+    box[start + 3] = bits(1); box[start + 4] = bits(1); box[start + 5] = bits(5.0f - child);
+  }
+  Check(run(0x205u, box) == std::array<uint32_t, 4>{0x100, 0x101, 0x102, 0x103}, "BVH unsorted box intersections");
+  Check(run(0x205u, box, true, true) == std::array<uint32_t, 4>{0x103, 0x102, 0x101, 0x100}, "BVH distance sorting");
+  Check(run(0x205u, std::vector<uint32_t>(16), true, false, 64) == no_children, "BVH wide node ran past descriptor size");
+  ray[0] = 0;
+  Check(run(0x205u, box) == no_children, "BVH box ignored ray extent");
+  ray[0] = 100;
+  box[6] = bits(-3); box[9] = bits(-2);
+  Check(run(0x205u, box, true, true) == std::array<uint32_t, 4>{0x103, 0x102, 0x101, 0xffffffff}, "BVH sorting must put misses after hits");
+  box[4] = bits(2); // parallel ray outside first child's x slab
+  Check(run(0x205u, box)[0] == 0xffffffffu, "BVH parallel slab miss");
+  std::vector<uint32_t> box16(16);
+  for (uint32_t child = 0; child < 4; child++) {
+    box16[child] = child + 1;
+    box16[4 + 3 * child] = 0; // min x/y
+    box16[5 + 3 * child] = 0x3c000000u; // min z=0, max x=1
+    box16[6 + 3 * child] = 0x3c003c00u; // max y/z=1
+  }
+  Check(run(0x204u, box16) == std::array<uint32_t, 4>{1, 2, 3, 4}, "BVH half-float bounds");
+}
+
+void TestBvhResourceMaterialization() {
+  using namespace ShaderRecompiler;
+  const uint32_t shader[] = {0xf1989f07u, 0x00040505u, 0x4442413du, 0x4543403eu, 0x00004746u,
+      EncodeMubuf0(0x1f, 0, false), EncodeMubuf1(5, 0, 0), 0xbf810000u};
+  std::array<uint32_t, 64> data{};
+  data[0] = 0x1000; data[1] = 4u << 16; data[2] = 64; data[3] = 0x00027000;
+  data[16] = 0x200; data[18] = 1; data[19] = 0x81000000;
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.user_data = data;
+  auto translated = TranslateProgram(shader, options);
+  auto plan = IR::ExtractResourcePlan(translated.program);
+  Check(plan.bvh_sources.size() == 1 && plan.info.images.empty() && plan.info.uses_dma,
+        "BVH descriptor was not kept separate from image resources");
+  IR::ResourceSnapshot resources;
+  IR::ResourceSpecialization specialization;
+  IR::SrtRuntime runtime{.user_data = data};
+  Check(IR::MaterializeResources(plan, runtime, resources, specialization), "valid BVH descriptor did not materialize");
+  auto compiled = CompileProgram(std::move(translated), options, specialization, 0);
+  CheckSpirvBinaryValidates(compiled.spirv);
+  // A shader may fix the mode bits while retaining a GPU-dependent size/base.
+  const uint32_t fixed_flags_shader[] = {
+      EncodeSop2(0x0e, 19, 19, 255), 0x3ffu,
+      EncodeSop2(0x10, 19, 19, 255), 0x81000000u,
+      0xf1989f07u, 0x00040505u, 0x4442413du, 0x4543403eu, 0x00004746u,
+      EncodeMubuf0(0x1f, 0, false), EncodeMubuf1(5, 0, 0), 0xbf810000u};
+  auto fixed = TranslateProgram(fixed_flags_shader, options);
+  Check(fixed.program.bvh_sources.empty(), "proven BVH flags still forced dynamic pointers onto the CPU");
+  auto fixed_plan = IR::ExtractResourcePlan(fixed.program);
+  Check(IR::MaterializeResources(fixed_plan, runtime, resources, specialization), "fixed BVH flags failed materialization");
+  CheckSpirvBinaryValidates(CompileProgram(std::move(fixed), options, specialization, 0).spirv);
+  auto unproven = TranslateProgram(std::span(fixed_flags_shader).subspan(2), options);
+  Check(unproven.program.bvh_sources.size() == 1, "unknown BVH type bits bypassed validation");
+  data[19] = 0x80000000;
+  Check(!IR::MaterializeResources(plan, runtime, resources, specialization), "unsupported BVH triangle mode was accepted");
+  data[19] = 0x71000000;
+  Check(!IR::MaterializeResources(plan, runtime, resources, specialization), "invalid BVH type was accepted");
+  data[16] = 0;
+  Check(IR::MaterializeResources(plan, runtime, resources, specialization), "null BVH descriptor was rejected");
+}
+
+void TestDynamicScalarBufferAddress() {
+  using namespace ShaderRecompiler;
+  const auto check = [](uint64_t base_address, uint32_t stride, uint32_t records, uint32_t offset, uint32_t immediate, uint64_t expected_address, bool expected_active, bool dynamic = true, uint32_t descriptor_type = 0) {
+    IR::Program program;
+    program.stage = ShaderType::Compute;
+    program.block_storage.push_back(std::make_unique<IR::Block>());
+    auto* block = program.block_storage.back().get();
+    program.blocks.push_back(block);
+    IR::IREmitter ir(block);
+    auto& base = block->AppendNewInst(IR::ValueOpcode::Phi);
+    base.SetFlags(IR::Type::U32);
+    base.AddPhiOperand(block, IR::Value(static_cast<uint32_t>(base_address)));
+    base.AddPhiOperand(block, IR::Value(static_cast<uint32_t>(base_address) + 4u));
+    const auto resource = ir.Emit(IR::ValueOpcode::GetBufferResource,
+        {IR::Value(&base), IR::Value(static_cast<uint32_t>(base_address >> 32) | (stride << 16)), IR::Value(records), IR::Value(descriptor_type)});
+    IR::MemoryInfo memory;
+    memory.kind = IR::ResourceKind::ScalarBuffer;
+    memory.offset = immediate;
+    program.memory_info.push_back(memory);
+    const auto read = ir.Emit(IR::ValueOpcode::ReadConstBuffer, {resource, IR::Value(offset)}, IR::MemoryFlags{.index = 0, .pc = 0x40});
+    ir.Emit(IR::ValueOpcode::ReferenceU32, {read});
+    if (!dynamic) base.ReplaceUsesWith(IR::Value(static_cast<uint32_t>(base_address)));
+    Check(IR::LowerDynamicBufferReads(program) == (dynamic ? 1u : 0u), "scalar buffer lowering eligibility mismatch");
+    if (!dynamic) return;
+    base.ReplaceUsesWith(IR::Value(static_cast<uint32_t>(base_address)));
+    const IR::Inst* load = nullptr;
+    for (const auto& inst : *block) if (inst.GetOpcode() == IR::ValueOpcode::LoadAddressU32) load = &inst;
+    Check(load != nullptr, "dynamic scalar buffer has no GPU address load");
+    const std::array values{load->Arg(1), load->Arg(2), load->Arg(3)};
+    std::array<uint32_t, 3> result{};
+    IR::SrtWalker walker(program, {});
+    for (size_t i = 0; i < values.size(); ++i) {
+      Check(walker.Evaluate(values[i], result[i]), "dynamic buffer address could not be evaluated");
+    }
+    const auto& lowered_memory = program.memory_info.at(load->Flags<IR::MemoryFlags>().index);
+    Check(lowered_memory.address_is_full && lowered_memory.kind == IR::ResourceKind::Flat,
+          "dynamic buffer did not use the full GPU address");
+    Check((static_cast<uint64_t>(result[1]) << 32 | result[0]) + lowered_memory.offset == expected_address,
+          "dynamic buffer address/alignment/carry mismatch");
+    Check((result[2] != 0) == expected_active, "dynamic buffer bounds predicate mismatch");
+  };
+  check(0x12fffffffcu, 4, 2, 6, 0, 0x1300000000u, true, false);
+  check(0x12fffffffcu, 4, 2, 6, 0, 0x1300000000u, true);
+  check(0x12fffffffcu, 4, 2, 8, 0, 0x1300000004u, false);
+  check(0x1200000000u, 0, 4, 0, 0, 0x1200000000u, false, true, 0x40000000u);
+  check(0x1200000000u, 0, 0, 0, 0, 0x1200000000u, false);
+  check(0x1200000000u, 4, 0xffffffffu, 0xfffffffcu, 0, 0x12fffffffcu, true);
+  check(0x1200000000u, 0, 8, 0xfffffffcu, 8, 0x1200000004u, true);
+}
 
 void TestNewShaderDecoderArchitecture() {
   using namespace ShaderRecompiler::Decoder;
@@ -4397,6 +4667,78 @@ void TestNewShaderDecoderArchitecture() {
   Check(image.family == Family::MIMG && image.word_count == 5u &&
             image.image_nsa_dwords == 3u,
         "single-instruction decoder lost the MIMG NSA length");
+
+  // MIMG 230/231 are the ray-tracing BVH intersect ops, never image_sample variants: no sampler
+  // operand, dmask fixed at 0xf, and an address list fixed by the opcode (ISA 8.2.10). Routing
+  // them through the image path would resolve the BVH T# as an image descriptor.
+  const uint32_t bvh_captured[] = {0xf1989f07u, 0x00040505u, 0x4442413du, 0x4543403eu,
+                                   0x00004746u};
+  Instruction bvh;
+  ShaderRecompiler::Decoder::DecodeInstruction(bvh_captured, 0u, bvh);
+  Check(bvh.family == Family::MIMG && bvh.opcode == Opcode::IMAGE_BVH_INTERSECT_RAY &&
+            bvh.opcode_id == 0xe6u && bvh.src_count == 2u && bvh.word_count == 5u && bvh.image_nsa_dwords == 3u &&
+            bvh.image_address_components == 11u && bvh.image_r128 &&
+            bvh.image_dimension == ImageDimension::Dim1D && bvh.dmask == 0xfu &&
+            bvh.image_sample_flags == 0u,
+        "captured image_bvh_intersect_ray did not decode as a ray cast");
+  Check(bvh.image_nsa_addr[0] == 0x3du && bvh.image_nsa_addr[3] == 0x44u &&
+            bvh.image_nsa_addr[4] == 0x3eu && bvh.image_nsa_addr[8] == 0x46u &&
+            bvh.image_nsa_addr[9] == 0x47u,
+        "captured image_bvh_intersect_ray NSA address bytes decoded out of order");
+
+  const uint32_t bvh64[] = {EncodeMimg0(0xe7, 0xf, false, 0) | (1u << 15u),
+                            EncodeMimg1(4, 0, 0, 8)};
+  Instruction bvh64_inst;
+  ShaderRecompiler::Decoder::DecodeInstruction(bvh64, 0u, bvh64_inst);
+  Check(bvh64_inst.opcode == Opcode::IMAGE_BVH64_INTERSECT_RAY &&
+            bvh64_inst.image_address_components == 12u,
+        "image_bvh64_intersect_ray did not take the 64-bit node pointer address count");
+
+  // A16 half-packs the direction pair and drops three address dwords; traversal cannot read it.
+  const uint32_t bvh_a16[] = {EncodeMimg0(0xe6, 0xf, false, 0) | (1u << 15u),
+                              EncodeMimg1(4, 0, 0, 8, true)};
+  Instruction bvh_a16_inst;
+  ShaderRecompiler::Decoder::DecodeInstruction(bvh_a16, 0u, bvh_a16_inst);
+  Check(bvh_a16_inst.opcode == Opcode::UNSUPPORTED &&
+            bvh_a16_inst.image_address_components == 8u &&
+            bvh_a16_inst.image_sample_flags == ImageSampleFlagA16 &&
+            (bvh_a16_inst.unsupported_reason.find("A16") != std::string::npos),
+        "A16-packed image_bvh_intersect_ray was not rejected explicitly");
+
+  const uint32_t bvh64_a16[] = {EncodeMimg0(0xe7, 0xf, false, 0) | (1u << 15u),
+                                EncodeMimg1(4, 0, 0, 8, true)};
+  Instruction bvh64_a16_inst;
+  ShaderRecompiler::Decoder::DecodeInstruction(bvh64_a16, 0u, bvh64_a16_inst);
+  Check(bvh64_a16_inst.image_address_components == 9u &&
+            (bvh64_a16_inst.unsupported_reason.find("A16") != std::string::npos),
+        "A16-packed image_bvh64_intersect_ray was not rejected explicitly");
+
+  // Contiguous addressing and every NSA length: the address count follows the opcode, while the
+  // NSA bytes carry register indexes, up to 12 (MaxImageNsaAddressComponents).
+  for (uint32_t nsa = 0; nsa <= 3u; nsa++) {
+    const uint32_t bvh_nsa[] = {EncodeMimg0(0xe6, 0xf, false, 0) | (1u << 15u) | (nsa << 1u),
+                                EncodeMimg1(4, 0, 0, 8), 0x03020100u, 0x07060504u, 0x0b0a0908u};
+    Instruction swept;
+    ShaderRecompiler::Decoder::DecodeInstruction(bvh_nsa, 0u, swept);
+    Check(swept.opcode == Opcode::IMAGE_BVH_INTERSECT_RAY && swept.word_count == 2u + nsa &&
+              swept.image_nsa_dwords == nsa && swept.image_address_components == 11u,
+          "image_bvh_intersect_ray NSA length changed the word or address count");
+    for (uint32_t i = 0; i < nsa * 4u; i++) {
+      Check(swept.image_nsa_addr[i] == i,
+            "image_bvh_intersect_ray NSA byte index decoded out of order");
+    }
+    Check(nsa == 3u || swept.image_nsa_addr[nsa * 4u] == 0u,
+          "image_bvh_intersect_ray NSA data ran past its declared dwords");
+  }
+
+  // Packed A16 operands remain explicitly unsupported.
+  const uint32_t bvh_a16_program[] = {EncodeMimg0(0xe6, 0xf, false, 0) | (1u << 15u) | (3u << 1u),
+                                      EncodeMimg1(4, 0, 0, 8, true), 0x03020100u, 0x07060504u,
+                                      0x0b0a0908u, 0xbf810000u};
+  CheckNewDecoderUnsupported(bvh_a16_program, static_cast<uint32_t>(std::size(bvh_a16_program)),
+                             "MIMG", "0xe6");
+
+
 
   const uint32_t ds_code[] = {EncodeDs0(0x36) | (1u << 17u),
                               EncodeDs1(2, 0, 1)};
@@ -7698,9 +8040,10 @@ void TestNewShaderRecompilerCfgLoopHeaderDynamicScalarBufferLoadStructured() {
 
   auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
-  ExpectFatal([&] { (void)RecompileForTest(shader, options); },
-              "self-modifying scalar-buffer descriptor did not terminate "
-              "compilation");
+  const auto result = RecompileForTest(shader, options);
+  Check(result.program.info.uses_dma && (result.ir_dump.find("LoadAddressU32") != std::string::npos),
+        "loop-dependent scalar-buffer descriptor did not stay on the GPU");
+  CheckSpirvBinaryValidates(result.spirv);
 }
 
 void TestNewShaderRecompilerCfgLoopHeaderBufferLoadDispatcher() {
@@ -7881,6 +8224,27 @@ void TestNewShaderRecompilerCfgLoopEarlyBreakNoSelection() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestNewShaderRecompilerCfgLoopExitTailSelection() {
+	const uint32_t shader[] = {
+	    EncodeSopc(0x0a, 0, 129),    // loop: s_cmp_lt_u32 s0, 1
+	    EncodeSopp(0x04, 4),         // exit through tail A, not the loop merge
+	    EncodeSopc(0x0a, 1, 129),    // second exit condition
+	    EncodeSopp(0x04, 4),         // exit through tail B
+	    EncodeSop2(0x00, 0, 0, 129), // loop work
+	    EncodeSopp(0x02, 0xfffau),   // backedge -> loop
+	    EncodeSMovB32(2, 129),       // tail A
+	    EncodeSopp(0x02, 2),         // tail A -> merge
+	    EncodeSMovB32(3, 129),       // tail B
+	    EncodeSopp(0x02, 0),         // tail B -> merge
+	    0xbf810000u,                 // common loop merge
+	};
+	auto options = MakeCompileOptions(ShaderType::Compute);
+	auto result  = RecompileForTest(shader, options);
+	Check(result.program.dispatcher_fallback || SpirvContainsOpcode(result.spirv, 247),
+	      "loop exit tails were emitted as merge-free loop-control branches");
+	CheckSpirvBinaryValidates(result.spirv);
+}
+
 void TestNewShaderRecompilerCfgNestedLoopNonlocalExitDispatcher() {
   const uint32_t shader[] = {
       EncodeSopc(0x0a, 0, 129),    // outer loop: s_cmp_lt_u32 s0, 1
@@ -7936,53 +8300,54 @@ void TestNewShaderRecompilerCfgNestedLoopLocalExitNoSelection() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
-void TestNewShaderRecompilerCfgNestedLoopExitTailMergeSplit() {
-  const uint32_t shader[] = {
-      EncodeSopc(0x0a, 0, 129),    // outer loop: s_cmp_lt_u32 s0, 1
-      EncodeSopp(0x04, 11),        // outer exit -> end
-      EncodeSopc(0x06, 1, 1),      // inner loop first exit condition
-      EncodeSopp(0x05, 3),         // first inner exit -> tail A
-      EncodeSopc(0x06, 2, 2),      // inner loop second exit condition
-      EncodeSopp(0x05, 3),         // second inner exit -> tail B
-      EncodeSopp(0x02, 0xfffbu),   // inner backedge
-      EncodeSMovB32(3, 129),       // tail A
-      EncodeSopp(0x02, 2),         // tail A -> outer continue
-      EncodeSMovB32(4, 129),       // tail B
-      EncodeSopp(0x02, 0),         // tail B -> outer continue
-      EncodeSop2(0x00, 0, 0, 129), // outer continue: s_add_u32 s0, s0, 1
-      EncodeSopp(0x02, 0xfff3u),   // outer backedge
-      0xbf810000u,
-  };
+void TestNewShaderRecompilerCfgNestedLoopExitTailDispatcher() {
+	const uint32_t shader[] = {
+	    EncodeSopc(0x0a, 0, 129),    // outer loop: s_cmp_lt_u32 s0, 1
+	    EncodeSopp(0x04, 11),        // outer exit -> end
+	    EncodeSopc(0x06, 1, 1),      // inner loop first exit condition
+	    EncodeSopp(0x05, 3),         // first inner exit -> tail A
+	    EncodeSopc(0x06, 2, 2),      // inner loop second exit condition
+	    EncodeSopp(0x05, 3),         // second inner exit -> tail B
+	    EncodeSopp(0x02, 0xfffbu),   // inner backedge
+	    EncodeSMovB32(3, 129),       // tail A
+	    EncodeSopp(0x02, 2),         // tail A -> outer continue
+	    EncodeSMovB32(4, 129),       // tail B
+	    EncodeSopp(0x02, 0),         // tail B -> outer continue
+	    EncodeSop2(0x00, 0, 0, 129), // outer continue: s_add_u32 s0, s0, 1
+	    EncodeSopp(0x02, 0xfff3u),   // outer backedge
+	    0xbf810000u,
+	};
 
-  ShaderRecompiler::Decoder::Program program;
-  ShaderRecompiler::Decoder::DecodeProgram(std::span{shader}, program);
+	ShaderRecompiler::Decoder::Program program;
+	ShaderRecompiler::Decoder::DecodeProgram(std::span {shader}, program);
 
-  ShaderRecompiler::CFG::Graph graph;
-  graph = ShaderRecompiler::CFG::BuildGraph(program);
-  const auto original_block_count = graph.blocks.size();
-  Check(ShaderRecompiler::CFG::Structurize(graph),
-        graph.unsupported_reason.c_str());
-  Check(graph.blocks.size() > original_block_count,
-        "nested loop exit tails did not create a private inner merge");
-
-  const auto *outer_header = graph.FindBlockByPc(0);
-  const auto *inner_header = graph.FindBlockByPc(8);
-  Check(outer_header != nullptr && inner_header != nullptr &&
-            outer_header->terminator.loop_header &&
-            inner_header->terminator.loop_header,
-        "nested loop exit-tail fixture did not retain both loop headers");
-  Check(inner_header->terminator.merge_block !=
-            outer_header->terminator.continue_block,
-        "inner loop merge still aliases the outer continue target");
-  const auto *inner_merge =
-      graph.FindBlock(inner_header->terminator.merge_block);
-  Check(inner_merge != nullptr &&
-            inner_merge->inst_begin == inner_merge->inst_end &&
-            inner_merge->terminator.kind ==
-                ShaderRecompiler::CFG::TerminatorKind::Branch &&
-            inner_merge->terminator.true_block ==
-                outer_header->terminator.continue_block,
-        "private inner merge does not forward to the outer continue target");
+	ShaderRecompiler::CFG::Graph graph;
+	graph               = ShaderRecompiler::CFG::BuildGraph(program);
+	const auto original = graph;
+	// Accepting this as structured previously emitted a merge-free conditional
+	// branch to an exit tail. A private loop merge alone does not structure it.
+	Check(!ShaderRecompiler::CFG::Structurize(graph) && graph.unsupported &&
+	          graph.failure_kind == ShaderRecompiler::CFG::FailureKind::StructuredControlFlow,
+	      "nested loop exit tails did not select structured-control-flow fallback");
+	Check(CfgInstructionCoverage(graph, program.instructions.size()) ==
+	          CfgInstructionCoverage(original, program.instructions.size()),
+	      "nested exit-tail fallback changed semantic instruction coverage");
+	auto topology               = graph;
+	topology.unsupported        = original.unsupported;
+	topology.failure_kind       = original.failure_kind;
+	topology.failure_block      = original.failure_block;
+	topology.unsupported_reason = original.unsupported_reason;
+	Check(ShaderRecompiler::CFG::GraphToString(topology) ==
+	          ShaderRecompiler::CFG::GraphToString(original),
+	      "nested exit-tail fallback changed CFG topology or analyses");
+	auto options = MakeCompileOptions(ShaderType::Compute);
+	auto result  = RecompileForTest(shader, options);
+	Check(result.program.dispatcher_fallback &&
+	          result.program.fallback_reason == graph.unsupported_reason &&
+	          SpirvContainsOpcode(result.spirv, 251),
+	      "nested exit tails did not compile through the dispatcher");
+	CheckSpirvPhiParents(result.spirv);
+	CheckSpirvBinaryValidates(result.spirv);
 }
 
 void TestNewShaderRecompilerCfgMixedContinueNonmergeExitDispatcher() {
@@ -13557,6 +13922,9 @@ int main() {
   // here.
   TestScalarAshrI64Decoder();
   TestNewShaderDecoderArchitecture();
+  TestBvhIntersections();
+  TestBvhResourceMaterialization();
+  TestDynamicScalarBufferAddress();
   TestImageAddressOperands();
   TestSopkCompareImmediateExtension();
   TestNewShaderRecompilerCapturedVopcSdwaCmpxClass();
@@ -13584,9 +13952,10 @@ int main() {
   TestNewShaderRecompilerCfgLoopHeaderDsRead2B64Structured();
   TestNewShaderRecompilerCfgSharedOuterAndLoopMerge();
   TestNewShaderRecompilerCfgLoopEarlyBreakNoSelection();
+  TestNewShaderRecompilerCfgLoopExitTailSelection();
   TestNewShaderRecompilerCfgNestedLoopNonlocalExitDispatcher();
   TestNewShaderRecompilerCfgNestedLoopLocalExitNoSelection();
-  TestNewShaderRecompilerCfgNestedLoopExitTailMergeSplit();
+  TestNewShaderRecompilerCfgNestedLoopExitTailDispatcher();
   TestNewShaderRecompilerCfgMixedContinueNonmergeExitDispatcher();
   TestNewShaderRecompilerCfgConditionalLatchNoSelection();
   TestNewShaderRecompilerCfgDirectConditionalLatchNoSelection();

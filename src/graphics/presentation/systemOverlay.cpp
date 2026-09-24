@@ -1,7 +1,5 @@
 #include "graphics/presentation/systemOverlay.h"
 
-#include <SDL3/SDL.h>
-
 #include "common/assert.h"
 #include "common/stringUtils.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -12,6 +10,7 @@
 #include "libs/ime.h"
 #include "libs/imeDialog.h"
 
+#include <SDL3/SDL.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -29,8 +28,8 @@ namespace Libs::Graphics {
 
 namespace {
 
-namespace CoreIme   = Libs::Ime;
-namespace DialogIme = Libs::Dialog::ImeDialog;
+namespace CoreIme     = Libs::Ime;
+namespace DialogIme   = Libs::Dialog::ImeDialog;
 namespace ErrorDialog = Libs::Dialog::ErrorDialog;
 
 namespace Ime {
@@ -170,14 +169,14 @@ bool                         g_input_reset_requested      = false;
 uint16_t                     g_last_external_keycode      = 0;
 uint32_t                     g_last_external_status       = 0;
 OverlaySession               g_input_session;
-bool                         g_input_active               = false;
-bool                         g_input_controller           = false;
-bool                         g_input_keyboard             = false;
-bool                         g_input_multiline            = false;
-bool                         g_input_lifecycle_active     = false;
-bool                         g_controller_captured        = false;
+bool                         g_input_active           = false;
+bool                         g_input_controller       = false;
+bool                         g_input_keyboard         = false;
+bool                         g_input_multiline        = false;
+bool                         g_input_lifecycle_active = false;
+bool                         g_controller_captured    = false;
 OverlaySession               g_session;
-SDL_Window*                  g_input_window               = nullptr;
+SDL_Window*                  g_input_window = nullptr;
 
 void ClearInputEvents() {
 	std::scoped_lock lock(g_input_mutex);
@@ -516,7 +515,8 @@ bool ProcessSystemOverlayInput(const SDL_Event& event) {
 	if (controller_event && !g_input_controller) {
 		return false;
 	}
-	const bool keyboard_event = event.type == SDL_EVENT_TEXT_INPUT || event.type == SDL_EVENT_TEXT_EDITING ||
+	const bool keyboard_event = event.type == SDL_EVENT_TEXT_INPUT ||
+	                            event.type == SDL_EVENT_TEXT_EDITING ||
 	                            event.type == SDL_EVENT_KEY_DOWN || event.type == SDL_EVENT_KEY_UP;
 	if (keyboard_event && !g_input_keyboard) {
 		return false;
@@ -544,8 +544,8 @@ bool ProcessSystemOverlayInput(const SDL_Event& event) {
 		case SDL_EVENT_KEY_DOWN: {
 			g_last_external_keycode = static_cast<uint16_t>(event.key.scancode);
 			g_last_external_status  = ExternalKeyStatus(event.key.mod, false);
-			auto action = Ime::ExternalAction::Text;
-			bool queue  = true;
+			auto action             = Ime::ExternalAction::Text;
+			bool queue              = true;
 			if (event.key.key == SDLK_BACKSPACE) {
 				action = Ime::ExternalAction::Backspace;
 			} else if (event.key.key == SDLK_LEFT) {

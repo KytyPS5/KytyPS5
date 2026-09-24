@@ -51,15 +51,7 @@
 // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
 #define PRINT_NAME()                                                                               \
 	if (PRINT_NAME_ENABLED) {                                                                      \
-		if (Log::GetDirection() != Log::Direction::Silent) {                                       \
-			const auto elapsed_ms      = static_cast<uint64_t>(Loader::Timer::GetTimeMs());        \
-			const auto print_name_time = fmt::format(                                              \
-			    "{:02}:{:02}:{:02}.{:03}", elapsed_ms / 3600000, (elapsed_ms / 60000) % 60,        \
-			    (elapsed_ms / 1000) % 60, elapsed_ms % 1000);                                      \
-			LOGF_COLOR(Log::Color::Cyan, "[%d][%s] %s::%s::%s()\n",                                \
-			           Common::Thread::GetThreadIdUnique(), print_name_time.c_str(), g_library,    \
-			           g_module, __func__);                                                        \
-		}                                                                                          \
+		Libs::PrintName(g_library, g_module, __func__);                                              \
 	}
 
 namespace Loader {
@@ -67,6 +59,19 @@ class SymbolDatabase;
 } // namespace Loader
 
 namespace Libs {
+
+// Keep the formatting path from inflating fiber functions' stack frames under LTO.
+[[gnu::noinline]] inline void PrintName(const char* library, const char* module, const char* function) {
+	if (Log::GetDirection() != Log::Direction::Silent) {
+		const auto elapsed_ms      = static_cast<uint64_t>(Loader::Timer::GetTimeMs());
+		const auto print_name_time = fmt::format(
+		    "{:02}:{:02}:{:02}.{:03}", elapsed_ms / 3600000, (elapsed_ms / 60000) % 60,
+		    (elapsed_ms / 1000) % 60, elapsed_ms % 1000);
+		LOGF_COLOR(Log::Color::Cyan, "[%d][%s] %s::%s::%s()\n",
+		           Common::Thread::GetThreadIdUnique(), print_name_time.c_str(), library, module,
+		           function);
+	}
+}
 
 void InitAll(Loader::SymbolDatabase* s);
 

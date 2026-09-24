@@ -51,16 +51,73 @@ constexpr DWORD FILE_SHARE_POSIX = static_cast<DWORD>(FILE_SHARE_READ) |
                                    static_cast<DWORD>(FILE_SHARE_WRITE) |
                                    static_cast<DWORD>(FILE_SHARE_DELETE);
 
+static std::wstring ToExtendedPath(const std::filesystem::path& path) {
+	if (path.empty()) {
+		return {};
+	}
+
+	std::wstring wide = path.wstring();
+
+	for (auto& c: wide) {
+		if (c == L'/') {
+			c = L'\\';
+		}
+	}
+
+	if (wide.rfind(L"\\\\?\\", 0) == 0 || wide.rfind(L"\\\\.\\", 0) == 0) {
+		return wide;
+	}
+
+	DWORD required = GetFullPathNameW(wide.c_str(), 0, nullptr, nullptr);
+	if (required > 0) {
+		std::wstring full_path(required, L'\0');
+		DWORD len = GetFullPathNameW(wide.c_str(), required, full_path.data(), nullptr);
+		if (len > 0) {
+			full_path.resize(len);
+			for (auto& c: full_path) {
+				if (c == L'/') {
+					c = L'\\';
+				}
+			}
+			if (full_path.rfind(L"\\\\?\\", 0) == 0 || full_path.rfind(L"\\\\.\\", 0) == 0) {
+				return full_path;
+			}
+			if (full_path.size() >= 2 && full_path[0] == L'\\' && full_path[1] == L'\\') {
+				return L"\\\\?\\UNC\\" + full_path.substr(2);
+			}
+			if (full_path.size() >= 2 &&
+			    ((full_path[0] >= L'a' && full_path[0] <= L'z') ||
+			     (full_path[0] >= L'A' && full_path[0] <= L'Z')) &&
+			    full_path[1] == L':') {
+				return L"\\\\?\\" + full_path;
+			}
+			return full_path;
+		}
+	}
+
+	if (wide.size() >= 2 && wide[0] == L'\\' && wide[1] == L'\\') {
+		return L"\\\\?\\UNC\\" + wide.substr(2);
+	}
+	if (wide.size() >= 2 &&
+	    ((wide[0] >= L'a' && wide[0] <= L'z') || (wide[0] >= L'A' && wide[0] <= L'Z')) &&
+	    wide[1] == L':') {
+		return L"\\\\?\\" + wide;
+	}
+
+	return wide;
+}
+
 static DWORD GetCacheAccessType(sys_file_cache_type_t t) {
+	DWORD flags = FILE_FLAG_BACKUP_SEMANTICS;
 	if (t == SYS_FILE_CACHE_RANDOM_ACCESS) {
-		return FILE_FLAG_RANDOM_ACCESS;
+		return flags | FILE_FLAG_RANDOM_ACCESS;
 	}
 
 	if (t == SYS_FILE_CACHE_SEQUENTIAL_SCAN) {
-		return FILE_FLAG_SEQUENTIAL_SCAN;
+		return flags | FILE_FLAG_SEQUENTIAL_SCAN;
 	}
 
-	return FILE_ATTRIBUTE_NORMAL;
+	return flags | FILE_ATTRIBUTE_NORMAL;
 }
 
 void SysFileRead(void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_read) {
@@ -139,15 +196,20 @@ void SysFileWrite(const void* data, uint32_t size, sys_file_t& f, uint32_t* byte
 sys_file_t* SysFileCreate(const std::filesystem::path& file_name) {
 	auto* ret = new sys_file_t;
 
-	auto   wide   = file_name.wstring();
+	auto   wide   = ToExtendedPath(file_name);
 	HANDLE h_file = nullptr;
 	h_file = CreateFileW(wide.c_str(),
 	                     static_cast<DWORD>(GENERIC_READ) | static_cast<DWORD>(GENERIC_WRITE) |
 	                         static_cast<DWORD>(DELETE),
 	                     FILE_SHARE_POSIX, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
 
+	if (h_file == INVALID_HANDLE_VALUE) {
+		ret->type = SYS_FILE_ERROR;
+	} else {
+		ret->type = SYS_FILE_FILE;
+	}
+
 	ret->handle = h_file;
-	ret->type   = SYS_FILE_FILE;
 
 	return ret;
 }
@@ -155,7 +217,7 @@ sys_file_t* SysFileCreate(const std::filesystem::path& file_name) {
 sys_file_t* SysFileOpenR(const std::filesystem::path& file_name, sys_file_cache_type_t cache_type) {
 	auto* ret = new sys_file_t;
 
-	auto   wide   = file_name.wstring();
+	auto   wide   = ToExtendedPath(file_name);
 	HANDLE h_file = nullptr;
 	h_file = CreateFileW(wide.c_str(), GENERIC_READ, FILE_SHARE_POSIX, nullptr, OPEN_EXISTING,
 	                     GetCacheAccessType(cache_type), nullptr);
@@ -198,7 +260,7 @@ sys_file_t* SysFileCreate() {
 sys_file_t* SysFileOpenW(const std::filesystem::path& file_name, sys_file_cache_type_t cache_type) {
 	auto* ret = new sys_file_t;
 
-	auto   wide   = file_name.wstring();
+	auto   wide   = ToExtendedPath(file_name);
 	HANDLE h_file = nullptr;
 	h_file        = CreateFileW(
 	    wide.c_str(), static_cast<DWORD>(GENERIC_WRITE) | static_cast<DWORD>(DELETE),
@@ -219,7 +281,7 @@ sys_file_t* SysFileOpenRw(const std::filesystem::path& file_name,
                           sys_file_cache_type_t        cache_type) {
 	auto* ret = new sys_file_t;
 
-	auto   wide   = file_name.wstring();
+	auto   wide   = ToExtendedPath(file_name);
 	HANDLE h_file = nullptr;
 	h_file = CreateFileW(wide.c_str(),
 	                     static_cast<DWORD>(GENERIC_READ) | static_cast<DWORD>(GENERIC_WRITE) |
@@ -270,7 +332,7 @@ uint64_t SysFileSize(const std::filesystem::path& file_name) {
 	LARGE_INTEGER             s;
 	WIN32_FILE_ATTRIBUTE_DATA a;
 
-	auto wide = file_name.wstring();
+	auto wide = ToExtendedPath(file_name);
 	if (GetFileAttributesExW(wide.c_str(), GetFileExInfoStandard, &a) == 0) {
 		return 0;
 	}
@@ -346,31 +408,31 @@ bool SysFileIsError(sys_file_t& f) {
 }
 
 bool SysFileIsDirectoryExisting(const std::filesystem::path& path) {
-	auto  wide = path.wstring();
+	auto  wide = ToExtendedPath(path);
 	DWORD a    = GetFileAttributesW(wide.c_str());
 	return a != INVALID_FILE_ATTRIBUTES &&
 	       ((a & static_cast<DWORD>(FILE_ATTRIBUTE_DIRECTORY)) != 0u);
 }
 
 bool SysFileIsFileExisting(const std::filesystem::path& name) {
-	auto  wide = name.wstring();
+	auto  wide = ToExtendedPath(name);
 	DWORD a    = GetFileAttributesW(wide.c_str());
 	return a != INVALID_FILE_ATTRIBUTES &&
 	       ((a & static_cast<DWORD>(FILE_ATTRIBUTE_DIRECTORY)) == 0u);
 }
 
 bool SysFileCreateDirectory(const std::filesystem::path& path) {
-	auto wide = path.wstring();
+	auto wide = ToExtendedPath(path);
 	return CreateDirectoryW(wide.c_str(), nullptr) != 0;
 }
 
 bool SysFileDeleteDirectory(const std::filesystem::path& path) {
-	auto wide = path.wstring();
+	auto wide = ToExtendedPath(path);
 	return RemoveDirectoryW(wide.c_str()) != 0;
 }
 
 bool SysFileDeleteFile(const std::filesystem::path& name) {
-	auto wide = name.wstring();
+	auto wide = ToExtendedPath(name);
 	return DeleteFileW(wide.c_str()) != 0;
 }
 
@@ -402,8 +464,6 @@ SysFileTimeStruct SysFileGetLastWriteTimeUtc(const std::filesystem::path& name) 
 
 void SysFileGetLastAccessAndWriteTimeUtc(const std::filesystem::path& name, SysFileTimeStruct& a,
                                          SysFileTimeStruct& w) {
-	// TODO() open file with dwDesiredAccess = 0
-	// TODO() open directory
 	sys_file_t* f = SysFileOpenR(name);
 	a.is_invalid  = w.is_invalid =
 	    (f->type == SYS_FILE_ERROR || (GetFileTime(f->handle, nullptr, &a.time, &w.time) == 0));
@@ -477,10 +537,14 @@ bool SysFileSetLastAccessAndWriteTimeUtc(const std::filesystem::path& name,
 }
 
 void SysFileGetDents(const std::filesystem::path& path, std::vector<sys_dir_entry_t>& out) {
-	const auto pattern = path / L"*";
+	auto extended = ToExtendedPath(path);
+	if (!extended.empty() && extended.back() != L'\\') {
+		extended += L'\\';
+	}
+	extended += L'*';
 
 	WIN32_FIND_DATAW data {};
-	HANDLE h = FindFirstFileW(pattern.c_str(), &data);
+	HANDLE h = FindFirstFileW(extended.c_str(), &data);
 
 	if (h == INVALID_HANDLE_VALUE) {
 		return;
@@ -502,21 +566,23 @@ void SysFileGetDents(const std::filesystem::path& path, std::vector<sys_dir_entr
 }
 
 bool SysFileCopyFile(const std::filesystem::path& src, const std::filesystem::path& dst) {
-	auto src_wide = src.wstring();
-	auto dst_wide = dst.wstring();
+	auto src_wide = ToExtendedPath(src);
+	auto dst_wide = ToExtendedPath(dst);
 	return CopyFileW(src_wide.c_str(), dst_wide.c_str(), FALSE) != 0;
 }
 
 bool SysFileRenameFile(const std::filesystem::path& src, const std::filesystem::path& dst) {
-	auto src_wide = src.wstring();
-	auto dst_wide = dst.wstring();
+	auto src_wide = ToExtendedPath(src);
+	auto dst_wide = ToExtendedPath(dst);
 	return MoveFileW(src_wide.c_str(), dst_wide.c_str()) != 0;
 }
 
 void SysFileRemoveReadonly(const std::filesystem::path& name) {
-	auto wide = name.wstring();
-	SetFileAttributesW(wide.c_str(), GetFileAttributesW(wide.c_str()) &
-	                                     (~static_cast<DWORD>(FILE_ATTRIBUTE_READONLY)));
+	auto  wide  = ToExtendedPath(name);
+	DWORD attrs = GetFileAttributesW(wide.c_str());
+	if (attrs != INVALID_FILE_ATTRIBUTES) {
+		SetFileAttributesW(wide.c_str(), attrs & (~static_cast<DWORD>(FILE_ATTRIBUTE_READONLY)));
+	}
 }
 
 #endif

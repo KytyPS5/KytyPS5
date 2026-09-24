@@ -1,7 +1,5 @@
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 
-add_subdirectory(cpuinfo)
-
 # The Windows guest red-zone patcher needs a decoder/encoder and a small
 # trampoline assembler. Pin the same revisions used by shadPS4's implementation.
 include(FetchContent)

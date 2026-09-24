@@ -14,8 +14,6 @@ add_library(common STATIC ${common_src} ${common_headers})
 
 target_include_directories(common
 	PUBLIC ${KYTY_SOURCE_DIR}
-	PRIVATE
-		${KYTY_THIRD_PARTY_DIR}/cpuinfo/include
 )
 
 target_link_libraries(common
@@ -23,7 +21,6 @@ target_link_libraries(common
 		fmt::fmt
 		Tracy::TracyClient
 	PRIVATE
-		cpuinfo
 		kyty_git_version
 		spdlog::spdlog
 )

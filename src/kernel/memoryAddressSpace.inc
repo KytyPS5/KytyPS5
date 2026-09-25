@@ -7,6 +7,11 @@ static constexpr uint64_t HOST_SYSTEM_RESERVED_MIN = HOST_SYSTEM_MANAGED_MAX + 1
 #if defined(__APPLE__) && (defined(__x86_64__) || defined(_M_X64))
 static constexpr uint64_t HOST_SYSTEM_RESERVED_MAX = 0x0fbfffffffull;
 static constexpr uint64_t HOST_USER_MIN            = 0x7000000000ull;
+#elif defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+// On macOS ARM64, the kernel restricts low virtual address mappings.
+// Skip the fixed low-address system regions and start from HOST_USER_MIN.
+static constexpr uint64_t HOST_SYSTEM_RESERVED_MAX = 0x0fffffffffull;
+static constexpr uint64_t HOST_USER_MIN            = 0x1000000000ull;
 #else
 static constexpr uint64_t HOST_SYSTEM_RESERVED_MAX = 0x0fffffffffull;
 static constexpr uint64_t HOST_USER_MIN            = 0x1000000000ull;
@@ -1122,6 +1127,14 @@ private:
 		    {HOST_USER_MIN, HOST_USER_MAX + 1u},
 		}};
 
+	size_t region_start_idx = 0;
+
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+		// On macOS ARM64, skip low system regions (below 4GB) which the kernel
+		// rejects for fixed mmap. Start guest address space from HOST_USER_MIN (64GB).
+		region_start_idx = 2;
+#endif
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
 		std::vector<std::pair<uint64_t, uint64_t>> occupied;
 		FILE*                                      maps = fopen("/proc/self/maps", "r");
@@ -1190,25 +1203,139 @@ private:
 				reserve_range(current, region_end);
 			}
 		}
-#else
-		for (const auto& [start, end]: regions) {
+#elif defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+		// On macOS ARM64, don't try to reserve the entire address space upfront.
+		// Instead, find existing mappings using mach_vm_region and only reserve free gaps.
+		// This avoids kernel limits on total VM reservations.
+
+		// Collect existing mappings
+		std::vector<std::pair<uint64_t, uint64_t>> occupied;
+		mach_vm_address_t region_addr = 0;
+		mach_vm_size_t region_size = 0;
+		vm_region_basic_info_data_64_t info {};
+		mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+		mach_port_t object_name = MACH_PORT_NULL;
+
+		while (true) {
+			kern_return_t kr = mach_vm_region(mach_task_self(), &region_addr, &region_size,
+			                                 VM_REGION_BASIC_INFO_64,
+			                                 reinterpret_cast<vm_region_info_t>(&info),
+			                                 &count, &object_name);
+			if (kr != KERN_SUCCESS || region_size == 0) {
+				break;
+			}
+			const uint64_t mapping_start = region_addr;
+			const uint64_t mapping_end = region_addr + region_size;
+			if (mapping_end > mapping_start) {
+				occupied.emplace_back(mapping_start, mapping_end);
+			}
+			region_addr = mapping_end;
+		}
+
+		// Start from HOST_USER_MIN (64GB) to avoid low system regions
+		region_start_idx = 2;
+
+		auto reserve_range = [this](uint64_t start, uint64_t end) {
+			start = AlignUp(start, PageSize());
+			end   = AlignDown(end, PageSize());
+			if (start == 0 || end <= start) {
+				return;
+			}
+
+			const auto size = end - start;
 			int flags = MAP_PRIVATE | MAP_ANON | MAP_NORESERVE;
 #if defined(KYTY_LINKED_GUEST_ADDRESS_SPACE)
 			flags |= MAP_FIXED;
 #elif defined(MAP_FIXED_NOREPLACE)
 			flags |= MAP_FIXED_NOREPLACE;
 #endif
-			void* ptr = mmap(reinterpret_cast<void*>(start), end - start, PROT_NONE, flags, -1, 0);
+
+			void* ptr = mmap(reinterpret_cast<void*>(start), size, PROT_NONE, flags, -1, 0);
 			if (ptr == MAP_FAILED || reinterpret_cast<uint64_t>(ptr) != start) {
 				if (ptr != MAP_FAILED) {
-					munmap(ptr, end - start);
+					munmap(ptr, size);
 				}
-				EXIT("failed to reserve guest address space at 0x%016" PRIx64
-				     ", size 0x%016" PRIx64 "\n",
-				     start, end - start);
+				return;
 			}
-			AddFreeUnlocked(start, end - start);
-			m_owned.emplace_back(start, end - start);
+
+			AddFreeUnlocked(start, size);
+			m_owned.emplace_back(start, size);
+		};
+
+		for (size_t i = region_start_idx; i < regions.size(); ++i) {
+			const auto [region_start, region_end] = regions[i];
+			auto current = region_start;
+
+			for (const auto& [mapping_start, mapping_end]: occupied) {
+				if (mapping_end <= current) {
+					continue;
+				}
+				if (mapping_start >= region_end) {
+					break;
+				}
+
+				if (mapping_start > current) {
+					reserve_range(current, std::min(mapping_start, region_end));
+				}
+
+				current = std::max(current, mapping_end);
+				if (current >= region_end) {
+					break;
+				}
+			}
+
+			if (current < region_end) {
+				reserve_range(current, region_end);
+			}
+		}
+#else
+		for (size_t i = region_start_idx; i < regions.size(); ++i) {
+			const auto& [start, end] = regions[i];
+			const uint64_t region_size = end - start;
+
+			// On macOS ARM64, the HOST_USER region (64GB-1003GB) is too large for a single mmap.
+			// Break it into smaller chunks to avoid kernel limits.
+			const uint64_t max_chunk_size = (1ull << 34); // 16 GB per mmap call
+			if (region_size > max_chunk_size) {
+				for (uint64_t chunk_start = start; chunk_start < end; chunk_start += max_chunk_size) {
+					const uint64_t chunk_end = std::min(chunk_start + max_chunk_size, end);
+					int flags = MAP_PRIVATE | MAP_ANON | MAP_NORESERVE;
+#if defined(KYTY_LINKED_GUEST_ADDRESS_SPACE)
+					flags |= MAP_FIXED;
+#elif defined(MAP_FIXED_NOREPLACE)
+					flags |= MAP_FIXED_NOREPLACE;
+#endif
+					void* ptr = mmap(reinterpret_cast<void*>(chunk_start), chunk_end - chunk_start, PROT_NONE, flags, -1, 0);
+					if (ptr == MAP_FAILED || reinterpret_cast<uint64_t>(ptr) != chunk_start) {
+						if (ptr != MAP_FAILED) {
+							munmap(ptr, chunk_end - chunk_start);
+						}
+						EXIT("failed to reserve guest address space at 0x%016" PRIx64
+						     ", size 0x%016" PRIx64 "\n",
+						     chunk_start, chunk_end - chunk_start);
+					}
+					AddFreeUnlocked(chunk_start, chunk_end - chunk_start);
+					m_owned.emplace_back(chunk_start, chunk_end - chunk_start);
+				}
+			} else {
+				int flags = MAP_PRIVATE | MAP_ANON | MAP_NORESERVE;
+#if defined(KYTY_LINKED_GUEST_ADDRESS_SPACE)
+				flags |= MAP_FIXED;
+#elif defined(MAP_FIXED_NOREPLACE)
+				flags |= MAP_FIXED_NOREPLACE;
+#endif
+				void* ptr = mmap(reinterpret_cast<void*>(start), region_size, PROT_NONE, flags, -1, 0);
+				if (ptr == MAP_FAILED || reinterpret_cast<uint64_t>(ptr) != start) {
+					if (ptr != MAP_FAILED) {
+						munmap(ptr, region_size);
+					}
+					EXIT("failed to reserve guest address space at 0x%016" PRIx64
+					     ", size 0x%016" PRIx64 "\n",
+					     start, region_size);
+				}
+				AddFreeUnlocked(start, region_size);
+				m_owned.emplace_back(start, region_size);
+			}
 		}
 #endif
 #endif

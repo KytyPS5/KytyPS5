@@ -941,6 +941,7 @@ static KYTY_SYSV_ABI void* RunOnGuestStack(void* arg, pthread_entry_func_t func,
 
 	return ret;
 #else
+	// ARM64: Guest context switching not implemented - call directly
 	(void)stack_top;
 	return func(arg);
 #endif

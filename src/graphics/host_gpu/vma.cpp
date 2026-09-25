@@ -21,6 +21,39 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdlib>
+
+#if defined(TRACY_ENABLE) && defined(VMA_STATS_STRING_ENABLED)
+static void* VKAPI_PTR TracyVmaAlloc(void* /*pUserData*/, size_t size, size_t alignment, VkSystemAllocationScope /*allocationScope*/) {
+#if defined(_WIN32)
+	void* ptr = _aligned_malloc(size, alignment);
+#else
+	// aligned_alloc requires size to be a multiple of alignment; round up.
+	size_t aligned_size = (size + alignment - 1) & ~(alignment - 1);
+	void*  ptr          = aligned_alloc(alignment, aligned_size);
+#endif
+	TracyAllocS(ptr, size, 12);
+	return ptr;
+}
+
+static void VKAPI_PTR TracyVmaFree(void* /*pUserData*/, void* pMemory) {
+	TracyFreeS(pMemory, 12);
+#if defined(_WIN32)
+	_aligned_free(pMemory);
+#else
+	free(pMemory);
+#endif
+}
+
+static VkAllocationCallbacks GetTracyVmaCallbacks() {
+	VkAllocationCallbacks callbacks = {};
+	callbacks.pfnAllocation = TracyVmaAlloc;
+	callbacks.pfnFree = TracyVmaFree;
+	return callbacks;
+}
+
+static const VkAllocationCallbacks g_tracy_vma_callbacks = GetTracyVmaCallbacks();
+#endif
 
 namespace Libs::Graphics {
 
@@ -43,6 +76,9 @@ bool GraphicContext::CreateAllocator() {
 	if (memory_budget_ext_enabled) {
 		info.flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
 	}
+#if defined(TRACY_ENABLE) && defined(VMA_STATS_STRING_ENABLED)
+	info.pAllocationCallbacks = &g_tracy_vma_callbacks;
+#endif
 
 	const auto result = static_cast<vk::Result>(vmaCreateAllocator(&info, &allocator));
 	if (result != vk::Result::eSuccess) {

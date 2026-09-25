@@ -2,8 +2,13 @@
 #define EMULATOR_INCLUDE_EMULATOR_LIBS_VACONTEXT_H_
 
 #include <cstddef>
-#include <xmmintrin.h>
+#include <bit>
 
+#if defined(__x86_64__)
+#include <xmmintrin.h>
+#endif
+
+#if defined(__x86_64__)
 // NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
 #define VA_ARGS                                                                                    \
 	uint64_t rdi, uint64_t rsi, uint64_t rdx, uint64_t rcx, uint64_t r8, uint64_t r9,              \
@@ -43,8 +48,6 @@ struct VaList {
 	void*    reg_save_area;
 };
 
-// typedef float __m128 __attribute__((__vector_size__(16), __aligned__(16)));
-
 struct VaRegSave {
 	uint64_t gp[6];
 	__m128   fp[8];
@@ -58,6 +61,96 @@ struct VaContext {
 struct VaCharX16 {
 	char x[16];
 };
+#elif defined(__aarch64__) || defined(__arm64__)
+// ARM64 calling convention: x0-x7 for integer args, v0-v7 for FP args (128-bit NEON registers)
+// Use portable 16-byte type instead of x86 __m128 intrinsic
+// NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
+#define VA_ARGS                                                                                    \
+	uint64_t x0, uint64_t x1, uint64_t x2, uint64_t x3, uint64_t x4, uint64_t x5, uint64_t x6,      \
+	    uint64_t x7, uint64_t overflow_arg_area, uint64_t v0_lo, uint64_t v0_hi,                     \
+	    uint64_t v1_lo, uint64_t v1_hi, uint64_t v2_lo, uint64_t v2_hi, uint64_t v3_lo,             \
+	    uint64_t v3_hi, uint64_t v4_lo, uint64_t v4_hi, uint64_t v5_lo, uint64_t v5_hi,             \
+	    uint64_t v6_lo, uint64_t v6_hi, uint64_t v7_lo, uint64_t v7_hi, ...
+
+// NOLINTNEXTLINE(cppcoreguidelines-macro-usage)
+#define VA_CONTEXT(ctx)                                                                            \
+	alignas(16) VaContext ctx;                                                                     \
+	(ctx).reg_save_area.gp[0]       = x0;                                                          \
+	(ctx).reg_save_area.gp[1]       = x1;                                                          \
+	(ctx).reg_save_area.gp[2]       = x2;                                                          \
+	(ctx).reg_save_area.gp[3]       = x3;                                                          \
+	(ctx).reg_save_area.gp[4]       = x4;                                                          \
+	(ctx).reg_save_area.gp[5]       = x5;                                                          \
+	(ctx).reg_save_area.gp[6]       = x6;                                                          \
+	(ctx).reg_save_area.gp[7]       = x7;                                                          \
+	(ctx).reg_save_area.fp[0].lo    = v0_lo; (ctx).reg_save_area.fp[0].hi = v0_hi;                 \
+	(ctx).reg_save_area.fp[1].lo    = v1_lo; (ctx).reg_save_area.fp[1].hi = v1_hi;                 \
+	(ctx).reg_save_area.fp[2].lo    = v2_lo; (ctx).reg_save_area.fp[2].hi = v2_hi;                 \
+	(ctx).reg_save_area.fp[3].lo    = v3_lo; (ctx).reg_save_area.fp[3].hi = v3_hi;                 \
+	(ctx).reg_save_area.fp[4].lo    = v4_lo; (ctx).reg_save_area.fp[4].hi = v4_hi;                 \
+	(ctx).reg_save_area.fp[5].lo    = v5_lo; (ctx).reg_save_area.fp[5].hi = v5_hi;                 \
+	(ctx).reg_save_area.fp[6].lo    = v6_lo; (ctx).reg_save_area.fp[6].hi = v6_hi;                 \
+	(ctx).reg_save_area.fp[7].lo    = v7_lo; (ctx).reg_save_area.fp[7].hi = v7_hi;                 \
+	(ctx).va_list.reg_save_area     = &(ctx).reg_save_area;                                        \
+	(ctx).va_list.gp_offset         = offsetof(VaRegSave, gp);                                     \
+	(ctx).va_list.fp_offset         = offsetof(VaRegSave, fp);                                     \
+	(ctx).va_list.overflow_arg_area = &overflow_arg_area;
+
+namespace Libs {
+
+#pragma pack(1)
+
+struct VaList {
+	uint32_t gp_offset;
+	uint32_t fp_offset;
+	void*    overflow_arg_area;
+	void*    reg_save_area;
+};
+
+struct VaFpReg {
+	uint64_t lo;
+	uint64_t hi;
+};
+
+struct VaRegSave {
+	uint64_t gp[8];
+	VaFpReg  fp[8];
+};
+
+struct VaContext {
+	VaRegSave reg_save_area;
+	VaList    va_list;
+};
+
+struct VaCharX16 {
+	char x[16];
+};
+#else
+namespace Libs {
+
+#pragma pack(1)
+
+struct VaList {
+	uint32_t gp_offset;
+	uint32_t fp_offset;
+	void*    overflow_arg_area;
+	void*    reg_save_area;
+};
+
+struct VaRegSave {
+	uint64_t gp[8];
+	uint64_t fp[8];
+};
+
+struct VaContext {
+	VaRegSave reg_save_area;
+	VaList    va_list;
+};
+
+struct VaCharX16 {
+	char x[16];
+};
+#endif
 
 struct VaShortX8 {
 	short x[8]; // NOLINT(google-runtime-int)
@@ -95,27 +188,85 @@ T VaArg_reg_save_area_fp(VaList* l) {
 	return *addr;
 }
 
+#if defined(__x86_64__)
 template <>
 inline VaFloatX4 VaArg_reg_save_area_fp<VaFloatX4, 32>(VaList* l) {
 	auto* addr =
-	    reinterpret_cast<VaFloatX4*>(static_cast<uint8_t*>(l->reg_save_area) + l->fp_offset);
+	    reinterpret_cast<__m128*>(static_cast<uint8_t*>(l->reg_save_area) + l->fp_offset);
 	l->fp_offset += 32;
-	VaFloatX4 ret = {{addr[0].x[0], addr[0].x[1], addr[1].x[0], addr[1].x[1]}};
+	union {
+		__m128 v;
+		float f[4];
+	} cvt0 = {addr[0]};
+	union {
+		__m128 v;
+		float f[4];
+	} cvt1 = {addr[1]};
+	VaFloatX4 ret = {{cvt0.f[0], cvt0.f[1], cvt1.f[0], cvt1.f[1]}};
 	return ret;
 }
+
+inline double VaArg_double(VaList* l) {
+	// 8 FP registers * 16 bytes = 128 bytes total; max valid offset is 112 (7*16)
+	if (l->fp_offset <= 112) {
+		auto* addr = reinterpret_cast<__m128*>(static_cast<uint8_t*>(l->reg_save_area) + l->fp_offset);
+		l->fp_offset += 16;
+		union {
+			__m128 v;
+			double d[2];
+		} cvt = {addr[0]};
+		return cvt.d[0];
+	}
+	return VaArg_overflow_arg_area<double, 1, 8>(l);
+}
+#elif defined(__aarch64__) || defined(__arm64__)
+template <>
+inline VaFloatX4 VaArg_reg_save_area_fp<VaFloatX4, 32>(VaList* l) {
+	auto* addr =
+	    reinterpret_cast<VaFpReg*>(static_cast<uint8_t*>(l->reg_save_area) + l->fp_offset);
+	l->fp_offset += 32;
+	VaFloatX4 ret = {{static_cast<float>(addr[0].lo), static_cast<float>(addr[0].hi),
+	                  static_cast<float>(addr[1].lo), static_cast<float>(addr[1].hi)}};
+	return ret;
+}
+
+inline double VaArg_double(VaList* l) {
+	// 8 FP registers * 16 bytes = 128 bytes total; max valid offset is 112 (7*16)
+	if (l->fp_offset <= 112) {
+		auto* addr = reinterpret_cast<VaFpReg*>(static_cast<uint8_t*>(l->reg_save_area) + l->fp_offset);
+		l->fp_offset += 16;
+		uint64_t bits = addr[0].lo;
+		return std::bit_cast<double>(bits);
+	}
+	return VaArg_overflow_arg_area<double, 1, 8>(l);
+}
+#else
+// Fallback for other architectures
+template <>
+inline VaFloatX4 VaArg_reg_save_area_fp<VaFloatX4, 32>(VaList* l) {
+	auto* addr =
+	    reinterpret_cast<uint64_t*>(static_cast<uint8_t*>(l->reg_save_area) + l->fp_offset);
+	l->fp_offset += 32;
+	VaFloatX4 ret = {{static_cast<float>(addr[0]), static_cast<float>(addr[1]),
+	                  static_cast<float>(addr[2]), static_cast<float>(addr[3])}};
+	return ret;
+}
+
+inline double VaArg_double(VaList* l) {
+	if (l->fp_offset <= 112) {
+		auto* addr = reinterpret_cast<uint64_t*>(static_cast<uint8_t*>(l->reg_save_area) + l->fp_offset);
+		l->fp_offset += 16;
+		return std::bit_cast<double>(addr[0]);
+	}
+	return VaArg_overflow_arg_area<double, 1, 8>(l);
+}
+#endif
 
 inline int VaArg_int(VaList* l) {
 	if (l->gp_offset <= 40) {
 		return VaArg_reg_save_area_gp<int, 8>(l);
 	}
 	return VaArg_overflow_arg_area<int, 1, 8>(l);
-}
-
-inline double VaArg_double(VaList* l) {
-	if (l->fp_offset <= 160) {
-		return VaArg_reg_save_area_fp<double, 16>(l);
-	}
-	return VaArg_overflow_arg_area<double, 1, 8>(l);
 }
 
 inline long double VaArg_long_double(VaList* l) {
@@ -190,7 +341,9 @@ inline VaIntX4 VaArg_IntX4(VaList* l) {
 }
 
 inline VaFloatX4 VaArg_FloatX4(VaList* l) {
-	if (l->fp_offset <= 144) {
+	// 8 FP registers * 16 bytes = 128 bytes; FloatX4 takes 2 registers (32 bytes)
+	// Max valid offset for first of pair is 96 (6*16), so 96+32=128
+	if (l->fp_offset <= 96) {
 		return VaArg_reg_save_area_fp<VaFloatX4, 32>(l);
 	}
 	return VaArg_overflow_arg_area<VaFloatX4, 1, 16>(l);

@@ -804,6 +804,7 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 
 	int64_t total_wait = 0;
 	while (!token.stop_requested()) {
+		FrameMark;
 		const auto sleep_begin = Common::Timer::QueryPerformanceCounter();
 		if (total_wait > 0) {
 			const auto remaining_us =

@@ -73,11 +73,11 @@ std::string FormatMemory(const Instruction& inst) {
 		text += OperandToString(*sources[i]);
 	}
 	text += fmt::format(" ; offset={} offset2={} dwords={} bits={} dfmt={} nfmt={} signed={} "
-	                    "typed={} formatted={} segment={} glc={} slc={} idxen={} offen={}",
+	                    "typed={} formatted={} segment={} glc={} dlc={} slc={} idxen={} offen={}",
 	                    inst.offset, inst.secondary_offset, inst.data_dwords, inst.data_bits,
 	                    inst.data_format, inst.number_format, inst.data_signed ? 1u : 0u,
 	                    inst.typed ? 1u : 0u, inst.formatted ? 1u : 0u, inst.memory_segment,
-	                    inst.glc ? 1u : 0u, inst.slc ? 1u : 0u, inst.idxen ? 1u : 0u,
+	                    inst.glc ? 1u : 0u, inst.dlc ? 1u : 0u, inst.slc ? 1u : 0u, inst.idxen ? 1u : 0u,
 	                    inst.offen ? 1u : 0u);
 	return text;
 }
@@ -403,6 +403,7 @@ void DecodeProgram(std::span<const uint32_t> code, Program& program) {
 	program.instructions.clear();
 	program.instructions.reserve(code.size());
 	program.code = code;
+	program.has_bvh = false;
 
 	std::vector<bool> branch_targets;
 	for (uint32_t word_index = 0; word_index < code.size();) {
@@ -411,6 +412,10 @@ void DecodeProgram(std::span<const uint32_t> code, Program& program) {
 
 		const auto& inst = program.instructions.back();
 		word_index += inst.word_count;
+		if (inst.family == Family::MIMG && (inst.opcode_id == 0xe6u || inst.opcode_id == 0xe7u)) {
+			program.has_bvh = true;
+			return;
+		}
 
 		if (IsDirectBranch(inst.opcode)) {
 			const auto target_index = inst.branch_target / sizeof(uint32_t);

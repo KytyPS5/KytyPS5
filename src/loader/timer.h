@@ -1,14 +1,10 @@
 #ifndef EMULATOR_INCLUDE_EMULATOR_LOADER_TIMER_H_
 #define EMULATOR_INCLUDE_EMULATOR_LOADER_TIMER_H_
 
-#include "common/abi.h"
-#include "common/common.h"
-#include "common/dateTime.h"
 namespace Loader::Timer {
 
-void         Start();
-double       GetTimeMs();
-Common::Time GetTime();
+void   Start();
+double GetTimeMs();
 
 struct Lifecycle {
 	static constexpr const char* name       = "Timer";

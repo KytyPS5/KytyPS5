@@ -473,15 +473,6 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		}
 		const auto image_view = cache.FindRenderTarget(target.image_id, target.desc);
 		auto&      image      = cache.GetImage(target.image_id);
-		SetVulkanObjectNameF(m_context.GetGraphics().device, image.backing.image,
-		                     "Kyty.MRT{}.Image[guest=0x{:016x} size=0x{:x} format={}]",
-		                     target.target_slot, image.info.data.address, image.info.data.size,
-		                     static_cast<uint32_t>(image.info.pixel_format));
-		SetVulkanObjectNameF(m_context.GetGraphics().device, image_view,
-		                     "Kyty.MRT{}.View[guest=0x{:016x} mip={} layer={}+{}]",
-		                     target.target_slot, image.info.data.address,
-		                     target.desc.view_info.base_level, target.desc.view_info.base_layer,
-		                     target.desc.view_info.layer_count);
 		EXIT_IF(image.backing.samples != target.desc.info.samples || image_view == nullptr);
 		const auto& view   = target.desc.view_info;
 		const auto  layout = image.binding.is_bound ? vk::ImageLayout::eGeneral
@@ -522,14 +513,6 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			EXIT("failed to consume HTile clear state\n");
 		}
 		auto& image = cache.GetImage(depth.image_id);
-		SetVulkanObjectNameF(m_context.GetGraphics().device, image.backing.image,
-		                     "Kyty.DepthTarget.Image[guest=0x{:016x} size=0x{:x} format={}]",
-		                     image.info.data.address, image.info.data.size,
-		                     static_cast<uint32_t>(image.info.pixel_format));
-		SetVulkanObjectNameF(m_context.GetGraphics().device, image_view,
-		                     "Kyty.DepthTarget.View[guest=0x{:016x} layer={}+{}]",
-		                     image.info.data.address, depth.desc.view_info.base_layer,
-		                     depth.desc.view_info.layer_count);
 		EXIT_IF(image_view == nullptr || image.backing.samples != depth.desc.info.samples);
 		const auto draw_writes = depth.AttachmentWriteAspects();
 		vk::ImageAspectFlags sampled_aspects;
@@ -686,11 +669,13 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 	        vs_input_info.buffers_num > ShaderVertexInputInfo::RES_MAX);
 
 	// Collect the non-empty guest vertex ranges.
+	std::array<uint64_t, ShaderVertexInputInfo::RES_MAX>          sizes {};
 	std::array<VertexBufferRange, ShaderVertexInputInfo::RES_MAX> ranges {};
 	uint32_t                                                      range_count = 0;
 	for (int i = 0; i < vs_input_info.buffers_num; i++) {
 		const auto& vertex = vs_input_info.buffers[i];
 		const auto  size   = VertexBufferDescriptorSize(vertex, vs_input_info);
+		sizes[i]           = size;
 		if (size == 0) {
 			continue;
 		}
@@ -739,7 +724,7 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 	vk::Buffer null_buffer = nullptr;
 	for (int i = 0; i < vs_input_info.buffers_num; i++) {
 		const auto& vertex = vs_input_info.buffers[i];
-		const auto  size   = VertexBufferDescriptorSize(vertex, vs_input_info);
+		const auto  size   = sizes[i];
 		if (size == 0) {
 			if (null_buffer == nullptr) {
 				null_buffer = cache.GetBuffer(NULL_BUFFER_ID).Handle();

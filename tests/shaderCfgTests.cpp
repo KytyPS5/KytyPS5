@@ -7855,6 +7855,44 @@ void TestNewShaderRecompilerCfgSharedOuterAndLoopMerge() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestNewShaderRecompilerCfgLoopExitSharedWithSelection() {
+  const uint32_t shader[] = {
+      EncodeSopc(0x0a, 0, 129),    // loop condition
+      EncodeSopp(0x04, 10),        // loop exit -> end
+      EncodeSopc(0x06, 1, 1),      // selection within the loop
+      EncodeSopp(0x05, 3),         // choose either arm
+      EncodeSopc(0x06, 2, 2),      // first arm
+      EncodeSopp(0x04, 6),         // first arm -> shared end
+      EncodeSopp(0x02, 3),         // first arm -> repeat
+      EncodeSopc(0x06, 3, 3),      // second arm
+      EncodeSopp(0x04, 3),         // second arm -> shared end
+      EncodeSopp(0x02, 0),         // second arm -> repeat
+      EncodeSop2(0x00, 0, 0, 129), // repeat work
+      EncodeSopp(0x02, 0xfff4u),  // backedge
+      0xbf810000u,
+  };
+
+  ShaderRecompiler::Decoder::Program decoded;
+  ShaderRecompiler::Decoder::DecodeProgram(std::span{shader}, decoded);
+  auto graph = ShaderRecompiler::CFG::BuildGraph(decoded);
+  const auto block_count = graph.blocks.size();
+  const auto coverage = CfgInstructionCoverage(graph, decoded.instructions.size());
+  Check(block_count == 8u && graph.natural_loops.size() == 1u,
+        "shared loop-exit fixture has the wrong native CFG");
+  Check(!ShaderRecompiler::CFG::Structurize(graph) &&
+            graph.unsupported_reason.find("duplicate structured merge block") !=
+                std::string::npos,
+        "shared loop exit did not terminate at its structured merge conflict");
+  Check(graph.blocks.size() == block_count &&
+            CfgInstructionCoverage(graph, decoded.instructions.size()) == coverage,
+        "shared loop-exit fallback changed semantic instruction coverage");
+
+  auto result = RecompileForTest(shader, MakeCompileOptions(ShaderType::Compute));
+  Check(result.program.dispatcher_fallback && SpirvContainsOpcode(result.spirv, 251),
+        "shared loop exit did not emit its dispatcher fallback");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
 void TestNewShaderRecompilerCfgLoopEarlyBreakNoSelection() {
   const uint32_t shader[] = {
       EncodeSopc(0x0a, 0, 129),    // loop: s_cmp_lt_u32 s0, 1
@@ -13517,6 +13555,8 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
   CheckSpirvPhiParents(dispatcher_result.spirv);
 }
 
+#include "ShaderRayTracingTests.inc"
+
 } // namespace
 } // namespace Libs::Graphics
 
@@ -13524,6 +13564,7 @@ int main() {
   using namespace Libs::Graphics;
 
   EnsureConfigInitialized();
+  TestRayTracingDispatchDetection();
   TestResourceDescriptorClassification();
   TestShaderBufferResourceSize();
   TestNativeShaderResourceDependencies();
@@ -13583,6 +13624,7 @@ int main() {
   TestNewShaderRecompilerCfgLoopHeaderDsReadStructured();
   TestNewShaderRecompilerCfgLoopHeaderDsRead2B64Structured();
   TestNewShaderRecompilerCfgSharedOuterAndLoopMerge();
+  TestNewShaderRecompilerCfgLoopExitSharedWithSelection();
   TestNewShaderRecompilerCfgLoopEarlyBreakNoSelection();
   TestNewShaderRecompilerCfgNestedLoopNonlocalExitDispatcher();
   TestNewShaderRecompilerCfgNestedLoopLocalExitNoSelection();

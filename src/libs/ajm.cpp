@@ -682,16 +682,9 @@ static AjmDecodeResult AjmControlInstance(uint32_t instance, uint64_t flags,
 
 static AjmDecodeResult AjmSetGaplessDecode(uint32_t instance, const void* gapless_decode,
                                            int reset) {
-	std::scoped_lock lock(g_ajm_instances_mutex);
-	auto*            state = AjmFindInstanceLocked(instance);
-	if (state == nullptr || state->decoder == nullptr || gapless_decode == nullptr) {
-		AjmDecodeResult result {};
-		result.result = AJM_RESULT_INVALID_PARAMETER;
-		return result;
-	}
-
-	state->gapless.Set(*static_cast<const AjmSidebandGaplessDecode*>(gapless_decode), reset != 0);
-	return state->decoder->MakeResult();
+	const auto flags = AJM_FLAG_SIDEBAND_GAPLESS | (reset != 0 ? AJM_FLAG_CONTROL_RESET : 0);
+	return AjmControlInstance(instance, flags, gapless_decode, sizeof(AjmSidebandGaplessDecode),
+	                          nullptr, nullptr);
 }
 
 static AjmDecodeResult AjmGetGaplessDecode(uint32_t                  instance,
@@ -930,18 +923,8 @@ int KYTY_SYSV_ABI AjmBatchJobClearContext(AjmBatchInfo* info, uint32_t instance,
 	PRINT_NAME();
 	EXIT_NOT_IMPLEMENTED(info == nullptr);
 
-	AjmDecodeResult decode_result {};
-	{
-		std::scoped_lock lock(g_ajm_instances_mutex);
-		auto*            state = AjmFindInstanceLocked(instance);
-		if (state != nullptr && state->decoder != nullptr) {
-			state->gapless.Reset();
-			state->decoder->Reset();
-			decode_result = state->decoder->MakeResult();
-		} else {
-			decode_result.result = AJM_RESULT_INVALID_PARAMETER;
-		}
-	}
+	const auto decode_result =
+	    AjmControlInstance(instance, AJM_FLAG_CONTROL_RESET, nullptr, 0, nullptr, nullptr);
 
 	AjmWriteResult(result, AJM_SIDEBAND_RESULT_SIZE, decode_result);
 	LOGF("\t instance = 0x%08" PRIx32 "\n", instance);

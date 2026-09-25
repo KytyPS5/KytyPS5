@@ -227,6 +227,7 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 					requirements.subgroup_local_invocation_id = true;
 				}
 				if (memory.kind == IR::ResourceKind::Buffer) {
+					requirements.coherent_buffers |= memory.coherent;
 					if (memory.resource >= program.info.buffers.size()) {
 						Fail(program, "buffer operation has invalid resource metadata");
 					}

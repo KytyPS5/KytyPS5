@@ -204,6 +204,7 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		std::vector<Permutation>                    permutations;
+		bool                                        skip_dispatch = false;
 	};
 
 	struct ProgramKeyHash {
@@ -283,6 +284,9 @@ struct PipelineCache::ProgramCache {
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, lookup_key.static_state);
 		auto                                         entry = programs.find(lookup_key);
+		if (entry != programs.end() && entry->second.skip_dispatch) {
+			return {};
+		}
 		const ShaderRecompiler::IR::SrtRuntime       runtime {
 		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),
@@ -348,6 +352,11 @@ struct PipelineCache::ProgramCache {
 			options.wave_size = input_info.wave_size;
 		}
 		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
+		if (translated.skip_dispatch) {
+			entry = programs.try_emplace(lookup_key, ShaderRecompiler::IR::ResourcePlan {}).first;
+			entry->second.skip_dispatch = true;
+			return {};
+		}
 		if (entry == programs.end()) {
 			entry = programs.try_emplace(lookup_key,
 			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program)).first;

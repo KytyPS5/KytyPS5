@@ -354,6 +354,7 @@ enum class Opcode {
 	V_CMPX_GT_F32,
 	V_CMPX_LG_F32,
 	V_CMPX_GE_F32,
+	V_CMPX_O_F32,
 	V_CMPX_NGE_F32,
 	V_CMPX_NLG_F32,
 	V_CMPX_NGT_F32,
@@ -404,6 +405,7 @@ enum class Opcode {
 	V_CMP_LE_U16,
 	V_CMP_GT_U16,
 	V_CMPX_LT_U16,
+	V_CMPX_EQ_U16,
 	V_CMPX_GT_U16,
 	V_CMP_NE_U16,
 	V_CMP_GE_U16,
@@ -439,6 +441,7 @@ enum class Opcode {
 	S_BUFFER_LOAD_DWORDX4,
 	S_BUFFER_LOAD_DWORDX8,
 	S_BUFFER_LOAD_DWORDX16,
+	S_MEMREALTIME,
 	BUFFER_LOAD_FORMAT_X,
 	BUFFER_LOAD_FORMAT_XY,
 	BUFFER_LOAD_FORMAT_XYZ,
@@ -711,6 +714,7 @@ struct Instruction {
 	bool           formatted                                    = false;
 	bool           gds                                          = false;
 	bool           glc                                          = false;
+	bool           dlc                                          = false;
 	bool           slc                                          = false;
 	bool           idxen                                        = false;
 	bool           offen                                        = false;
@@ -729,6 +733,7 @@ struct Instruction {
 struct Program {
 	std::span<const uint32_t> code;
 	std::vector<Instruction>  instructions;
+	bool                     has_bvh = false;
 };
 
 // Code spans are trusted to contain complete instructions, valid branch targets, and 32-bit PCs.

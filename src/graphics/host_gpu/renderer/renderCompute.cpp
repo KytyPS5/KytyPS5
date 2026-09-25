@@ -523,8 +523,16 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 	ShaderComputeInputInfo input_info {};
+	// Workgroup-axis bounded SRT snapshots need the same guest grid the dispatch
+	// will use. Thread-dimension packs already redirect to DispatchDirect; here
+	// the indirect args are group counts and are CPU-readable guest memory.
+	const auto* args = reinterpret_cast<const vk::DispatchIndirectCommand*>(args_addr);
+	const auto guest_groups = ShaderRecompiler::ComputeGuestWorkgroups(
+	    {args->x, args->y, args->z},
+	    {cs_regs.cs_regs.num_thread_x, cs_regs.cs_regs.num_thread_y,
+	     cs_regs.cs_regs.num_thread_z}, false);
 	const auto compute_program = m_context.GetPipelineCache().GetComputeProgram(
-	    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
+	    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info, guest_groups);
 	if (!compute_program) {
 		// Temporary until RT is implemented.
 		return;

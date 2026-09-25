@@ -1162,12 +1162,12 @@ void TextureCache::InitializeImage(ImageId id, const ImageDesc* description) {
 		const auto mapped_size =
 		    LibKernel::Memory::TryClampRangeSize(upload_range.address, upload_range.size);
 		if (mapped_size < upload_range.size) {
-			LOGF("TextureUploadLayout binding=%s addr=0x%016" PRIx64
+			LOGF("TextureUploadLayout binding=%u addr=0x%016" PRIx64
 			     " size=0x%016" PRIx64 " upload=0x%016" PRIx64 "+0x%016" PRIx64
 			     " mapped=0x%016" PRIx64
 			     " extent=%ux%ux%u pitch=%u levels=%u layers=%u samples=%u"
 			     " type=%u tile=%u format=%u guest=%u bpb=%u view=%u+%u/%u+%u\n",
-			     BindingTypeName(desc.type), image.info.data.address, image.info.data.size,
+			     static_cast<uint32_t>(desc.type), image.info.data.address, image.info.data.size,
 			     upload_range.address, upload_range.size, mapped_size, image.info.extent.width,
 			     image.info.extent.height,
 			     image.info.extent.depth, image.info.pitch, image.info.resources.levels,

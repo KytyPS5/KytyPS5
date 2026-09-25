@@ -622,9 +622,21 @@ void StoreSubword(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo me
 
 void StoreWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource, uint32_t index,
                        uint32_t data) {
-	ctx.state.builder.AddFunction(spv::OpStore,
-	                              EmitMemoryElementPointer(ctx.state, resource, index), data,
-	                              resource.memory_access);
+	auto& state = ctx.state;
+	if (UsesPackedLds64(state, resource)) {
+		AtomicUpdatePackedLdsWord(state, resource.object_pointer, index,
+		                         [&](uint32_t) { return data; });
+		return;
+	}
+	const auto pointer = EmitMemoryElementPointer(state, resource, index);
+	if (resource.kind == IR::ResourceKind::Lds && LdsHasCompetingInvocations(state)) {
+		// Guest LDS serializes competing DWORD writes. Plain Vulkan stores would
+		// race even when all active lanes write the same value.
+		state.builder.AddFunction({OpAtomicStore, pointer, ConstantU32(state, ScopeWorkgroup),
+		                           ConstantU32(state, MemorySemanticsNone), data});
+	} else {
+		state.builder.AddFunction(spv::OpStore, pointer, data, resource.memory_access);
+	}
 }
 
 void StoreWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
@@ -704,14 +716,56 @@ uint32_t EmitAtomicAccess(ValueEmitContext& ctx, const IR::Inst& inst,
 	});
 }
 
+uint32_t EmitSharedAtomicReplacement(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t old) {
+	auto&      state  = ctx.state;
+	const auto source = ctx.Arg(inst, inst.NumArgs() - 2);
+	switch (inst.GetOpcode()) {
+		case IR::ValueOpcode::SharedAtomicSwap32: return source;
+		case IR::ValueOpcode::SharedAtomicIAdd32:
+			return Binary(state, OpIAdd, TypeU32(state), old, source);
+		case IR::ValueOpcode::SharedAtomicISub32:
+			return Binary(state, OpISub, TypeU32(state), old, source);
+		case IR::ValueOpcode::SharedAtomicSMin32:
+			return Select(state, TypeU32(state),
+			              Binary(state, OpSLessThan, TypeBool(state), source, old), source, old);
+		case IR::ValueOpcode::SharedAtomicUMin32:
+			return Select(state, TypeU32(state),
+			              Binary(state, OpULessThan, TypeBool(state), source, old), source, old);
+		case IR::ValueOpcode::SharedAtomicSMax32:
+			return Select(state, TypeU32(state),
+			              Binary(state, OpSGreaterThan, TypeBool(state), source, old), source, old);
+		case IR::ValueOpcode::SharedAtomicUMax32:
+			return Select(state, TypeU32(state),
+			              Binary(state, OpUGreaterThan, TypeBool(state), source, old), source, old);
+		case IR::ValueOpcode::SharedAtomicAnd32:
+			return Binary(state, OpBitwiseAnd, TypeU32(state), old, source);
+		case IR::ValueOpcode::SharedAtomicOr32:
+			return Binary(state, OpBitwiseOr, TypeU32(state), old, source);
+		case IR::ValueOpcode::SharedAtomicXor32:
+			return Binary(state, OpBitwiseXor, TypeU32(state), old, source);
+		default: ctx.Fail(inst, "unsupported packed LDS atomic operation");
+	}
+}
+
 template <typename Fn>
 uint32_t EmitAtomicUpdate(ValueEmitContext& ctx, const IR::Inst& inst,
                           const IR::MemoryInfo& mem, Fn&& replacement) {
 	const auto value = ctx.Arg(inst, inst.NumArgs() - 2);
-	return EmitAtomicAccess(ctx, inst, mem, [&](uint32_t pointer) {
-		return AtomicUpdate(ctx.state, pointer, mem.kind, [&](uint32_t old) {
-			return replacement(ctx.state, old, value);
-		});
+	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
+		const auto access = PrepareMemoryElement(ctx, mem, DwordIndex(ctx, inst, mem));
+		return EmitValueOrZeroIfCondition(
+		    ctx.state, EmitMemoryElementInBounds(ctx.state, access.resource, access.index), [&]() {
+			    if (UsesPackedLds64(ctx.state, access.resource)) {
+				    return AtomicUpdatePackedLdsWord(
+				        ctx.state, access.resource.object_pointer, access.index,
+				        [&](uint32_t old) { return replacement(ctx.state, old, value); });
+			    }
+			    return AtomicUpdate(ctx.state,
+			                        EmitMemoryElementPointer(ctx.state, access.resource, access.index),
+			                        mem.kind, [&](uint32_t old) {
+				                        return replacement(ctx.state, old, value);
+			                        });
+		    });
 	});
 }
 
@@ -1308,19 +1362,31 @@ void DefineGetBdaPointer(EmitterState& state) {
 
 uint32_t EmitAtomic32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto& mem = ctx.Memory(inst);
-	return EmitAtomicAccess(ctx, inst, mem, [&](uint32_t pointer) {
-		const auto scope =
-		    mem.kind == IR::ResourceKind::Lds ? spv::ScopeWorkgroup : spv::ScopeDevice;
-		const auto old = EmitAtomicOperation(ctx, inst, pointer, scope);
-		if (mem.kind == IR::ResourceKind::Lds) {
-			const auto semantics =
-			    spv::MemorySemanticsAcquireReleaseMask | spv::MemorySemanticsWorkgroupMemoryMask;
-			ctx.state.builder.AddFunction(spv::OpMemoryBarrier, ConstantU32(ctx.state, scope),
-			                              ConstantU32(ctx.state, semantics));
-		} else {
-			EmitDeviceAtomicMemoryBarrier(ctx.state);
-		}
-		return old;
+	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
+		const auto access = PrepareMemoryElement(ctx, mem, DwordIndex(ctx, inst, mem));
+		return EmitValueOrZeroIfCondition(
+		    ctx.state, EmitMemoryElementInBounds(ctx.state, access.resource, access.index), [&]() {
+			    if (UsesPackedLds64(ctx.state, access.resource)) {
+				    return AtomicUpdatePackedLdsWord(
+				        ctx.state, access.resource.object_pointer, access.index,
+				        [&](uint32_t old) { return EmitSharedAtomicReplacement(ctx, inst, old); });
+			    }
+			    const auto scope =
+			        mem.kind == IR::ResourceKind::Lds ? spv::ScopeWorkgroup : spv::ScopeDevice;
+			    const auto pointer =
+			        EmitMemoryElementPointer(ctx.state, access.resource, access.index);
+			    const auto old = EmitAtomicOperation(ctx, inst, pointer, scope);
+			    if (mem.kind == IR::ResourceKind::Lds) {
+				    const auto semantics = spv::MemorySemanticsAcquireReleaseMask |
+				                           spv::MemorySemanticsWorkgroupMemoryMask;
+				    ctx.state.builder.AddFunction(spv::OpMemoryBarrier,
+				                                  ConstantU32(ctx.state, scope),
+				                                  ConstantU32(ctx.state, semantics));
+			    } else {
+				    EmitDeviceAtomicMemoryBarrier(ctx.state);
+			    }
+			    return old;
+		    });
 	});
 }
 
@@ -1374,22 +1440,44 @@ void EmitSharedFloatAtomic(ValueEmitContext& ctx, const IR::Inst& inst) {
 			    const auto data = ctx.state.builder.AllocateId();
 			    ctx.state.builder.AddFunction(spv::OpLoad, TypeU32(ctx.state), data,
 			                                  ctx.scratch_u32_variable);
-			    AtomicUpdate(
-			        ctx.state, EmitMemoryElementPointer(ctx.state, access.resource, access.index),
-			        mem.kind, [&](uint32_t old) {
-				        const auto old_f =
-				            Unary(ctx.state, spv::OpBitcast, TypeF32(ctx.state), old);
-				        const auto compare_f =
-				            Unary(ctx.state, spv::OpBitcast, TypeF32(ctx.state), ctx.Arg(inst, 2));
-				        const auto data_f =
-				            Unary(ctx.state, spv::OpBitcast, TypeF32(ctx.state), data);
-				        const auto compare = Binary(
-				            ctx.state, max_value ? spv::OpFOrdGreaterThan : spv::OpFOrdLessThan,
-				            TypeBool(ctx.state), max_value ? old_f : compare_f,
-				            max_value ? compare_f : old_f);
-				        return Unary(ctx.state, spv::OpBitcast, TypeU32(ctx.state),
-				                     Select(ctx.state, TypeF32(ctx.state), compare, data_f, old_f));
-			        });
+			    if (UsesPackedLds64(ctx.state, access.resource)) {
+				    AtomicUpdatePackedLdsWord(ctx.state, access.resource.object_pointer,
+				                              access.index, [&](uint32_t old) {
+					        const auto old_f =
+					            Unary(ctx.state, spv::OpBitcast, TypeF32(ctx.state), old);
+					        const auto compare_f =
+					            Unary(ctx.state, spv::OpBitcast, TypeF32(ctx.state), ctx.Arg(inst, 2));
+					        const auto data_f =
+					            Unary(ctx.state, spv::OpBitcast, TypeF32(ctx.state), data);
+					        const auto compare = Binary(
+					            ctx.state,
+					            max_value ? spv::OpFOrdGreaterThan : spv::OpFOrdLessThan,
+					            TypeBool(ctx.state), max_value ? old_f : compare_f,
+					            max_value ? compare_f : old_f);
+					        return Unary(ctx.state, spv::OpBitcast, TypeU32(ctx.state),
+					                     Select(ctx.state, TypeF32(ctx.state), compare, data_f,
+					                            old_f));
+				        });
+			    } else {
+				    AtomicUpdate(
+				        ctx.state, EmitMemoryElementPointer(ctx.state, access.resource, access.index),
+				        mem.kind, [&](uint32_t old) {
+					        const auto old_f =
+					            Unary(ctx.state, spv::OpBitcast, TypeF32(ctx.state), old);
+					        const auto compare_f =
+					            Unary(ctx.state, spv::OpBitcast, TypeF32(ctx.state), ctx.Arg(inst, 2));
+					        const auto data_f =
+					            Unary(ctx.state, spv::OpBitcast, TypeF32(ctx.state), data);
+					        const auto compare = Binary(
+					            ctx.state,
+					            max_value ? spv::OpFOrdGreaterThan : spv::OpFOrdLessThan,
+					            TypeBool(ctx.state), max_value ? old_f : compare_f,
+					            max_value ? compare_f : old_f);
+					        return Unary(ctx.state, spv::OpBitcast, TypeU32(ctx.state),
+					                     Select(ctx.state, TypeF32(ctx.state), compare, data_f,
+					                            old_f));
+				        });
+			    }
 		    });
 	});
 }

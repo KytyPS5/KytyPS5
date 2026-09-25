@@ -56,8 +56,7 @@ void Translator::S_SAVEEXEC(const Decoder::Instruction& inst, IR::ValueOpcode op
 		const auto rhs = negate_source ? ir.BitwiseNot(src) : src;
 		IR::U32 result;
 		switch (operation) {
-			case IR::ValueOpcode::BitwiseAnd32: result = ir.BitwiseAnd(lhs, rhs); break;
-			case IR::ValueOpcode::BitwiseOr32:
+			case IR::ValueOpcode::LogicalAnd: result = ir.BitwiseAnd(lhs, rhs); break;
 			case IR::ValueOpcode::LogicalOr: result = ir.BitwiseOr(lhs, rhs); break;
 			default: EXIT("unsupported SAVEEXEC operation");
 		}
@@ -70,13 +69,7 @@ void Translator::S_SAVEEXEC(const Decoder::Instruction& inst, IR::ValueOpcode op
 	const auto src    = ReadMask(inst.src0);
 	const auto lhs    = negate_exec ? ir.LogicalNot(old) : old;
 	const auto rhs    = negate_source ? ir.LogicalNot(src) : src;
-	IR::U1 result;
-	switch (operation) {
-		case IR::ValueOpcode::BitwiseAnd32: result = ir.LogicalAnd(lhs, rhs); break;
-		case IR::ValueOpcode::BitwiseOr32:
-		case IR::ValueOpcode::LogicalOr: result = ir.LogicalOr(lhs, rhs); break;
-		default: EXIT("unsupported SAVEEXEC operation");
-	}
+	const auto result = IR::U1(ir.Emit(operation, {lhs, rhs}));
 	WriteMask(inst.dst, old, true);
 	const auto mask = BallotMask(result);
 	ir.SetExec(result);

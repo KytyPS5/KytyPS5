@@ -5958,7 +5958,7 @@ void TestFiniteSelectorSrtMaterialization() {
 enum class ActiveFiniteScenario {
   ValidLow, ValidHigh, ValidOr, MissingGuard, WrongEdge, BypassGuard,
   DifferentMask, ConstantBits, WrongBallotHalf, VaryingWord,
-  EarlyExit, CyclicControl,
+  EarlyExit, CyclicControl, UnrelatedEarlyExit,
 };
 
 FiniteSelectorFixture MakeActiveFiniteSelectorFixture(ActiveFiniteScenario scenario) {
@@ -5973,6 +5973,9 @@ FiniteSelectorFixture MakeActiveFiniteSelectorFixture(ActiveFiniteScenario scena
   auto* after_guard = body;
   if (scenario == ActiveFiniteScenario::EarlyExit) {
     after_guard = f.AddBlock();
+  }
+  if (scenario == ActiveFiniteScenario::UnrelatedEarlyExit) {
+    f.AddBlock(); // early exit target; referenced by id below
   }
   const auto branch = [&](uint32_t from, uint32_t to) {
     f.program.blocks[from]->AddBranch(f.program.blocks[to]);
@@ -6041,12 +6044,20 @@ FiniteSelectorFixture MakeActiveFiniteSelectorFixture(ActiveFiniteScenario scena
   const auto body_id = 2u;
   const auto exit_id = 3u;
   const auto after_id = scenario == ActiveFiniteScenario::EarlyExit ? 4u : body_id;
+  const auto early_exit_id =
+      scenario == ActiveFiniteScenario::UnrelatedEarlyExit ? 4u : UINT32_MAX;
   if (scenario == ActiveFiniteScenario::MissingGuard) {
     branch(0u, body_id);
     f.program.block_info[guard_id].terminator.kind = CFG::TerminatorKind::Return;
   } else if (scenario == ActiveFiniteScenario::BypassGuard) {
     conditional(0u, guard_id, body_id, branch_choice);
     conditional(guard_id, exit_id, body_id, empty);
+  } else if (scenario == ActiveFiniteScenario::UnrelatedEarlyExit) {
+    // Unrelated early return before the mask guard must not block proving the
+    // nonempty path that reaches ReadFirstLane (Ghost of Yōtei 86da pattern).
+    conditional(0u, early_exit_id, guard_id, branch_choice);
+    conditional(guard_id, exit_id, after_id, empty);
+    f.program.block_info[early_exit_id].terminator.kind = CFG::TerminatorKind::Return;
   } else {
     branch(0u, guard_id);
     conditional(guard_id,
@@ -6111,7 +6122,8 @@ void TestFiniteSelectorActiveMaskProof() {
   }
   std::cout << "finite selector active-mask rejection boundaries passed: 9\n";
   for (auto scenario : {ActiveFiniteScenario::ValidLow, ActiveFiniteScenario::ValidHigh,
-                        ActiveFiniteScenario::ValidOr}) {
+                        ActiveFiniteScenario::ValidOr,
+                        ActiveFiniteScenario::UnrelatedEarlyExit}) {
     auto test = MakeActiveFiniteSelectorFixture(scenario);
     const auto proof =
         ProveBoundedSrtRead(test.fixture->program, *test.words[0].ResolveInstruction());
@@ -6125,7 +6137,7 @@ void TestFiniteSelectorActiveMaskProof() {
               test.fixture->program.bounded_srt_reads.size() == 4u,
           "guarded finite selector did not produce one correlated descriptor table");
   }
-  std::cout << "finite selector active-mask positives passed: 3\n";
+  std::cout << "finite selector active-mask positives passed: 4\n";
 }
 
 

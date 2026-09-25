@@ -133,6 +133,13 @@ uint32_t TypeU32ArrayPointer(EmitterState& state, spv::StorageClass storage_clas
 	return TypePointer(state, storage_class, array);
 }
 
+uint32_t TypeScalarU64ArrayPointer(EmitterState& state, uint32_t storage_class,
+                                   uint32_t elements) {
+	const auto count = ConstantU32(state, std::max(elements, 1u));
+	const auto array = state.builder.Type(spv::OpTypeArray, TypeScalarU64(state), count);
+	return TypePointer(state, storage_class, array);
+}
+
 uint32_t TypeU32ElementPointer(EmitterState& state, spv::StorageClass storage_class) {
 	return TypePointer(state, storage_class, TypeU32(state));
 }

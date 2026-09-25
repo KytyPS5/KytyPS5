@@ -1153,25 +1153,70 @@ private:
 		return true;
 	}
 
+	bool IsBallotZeroGuard(Value condition, Value active) const {
+		condition = condition.Resolve();
+		active = active.Resolve();
+		const auto* equal = condition.TryInstruction();
+		if (equal == nullptr || equal->GetOpcode() != ValueOpcode::IEqual32 ||
+		    equal->NumArgs() != 2u) return false;
+		Value combined;
+		if (Immediate(equal->Arg(0), 0u)) combined = equal->Arg(1).Resolve();
+		else if (Immediate(equal->Arg(1), 0u)) combined = equal->Arg(0).Resolve();
+		else return false;
+		const auto* bit_or = combined.TryInstruction();
+		if (bit_or == nullptr || bit_or->GetOpcode() != ValueOpcode::BitwiseOr32 ||
+		    bit_or->NumArgs() != 2u) return false;
+		const auto left = bit_or->Arg(0).Resolve();
+		const auto right = bit_or->Arg(1).Resolve();
+		const auto extract = [&](Value value, uint32_t component) -> const Inst* {
+			const auto* inst = value.TryInstruction();
+			if (inst == nullptr || inst->GetOpcode() != ValueOpcode::CompositeExtractU32x4 ||
+			    inst->NumArgs() != 2u) return nullptr;
+			const auto index = inst->Arg(1).Resolve();
+			if (!index.IsImmediate() || index.GetType() != Type::U32 || index.U32() != component)
+				return nullptr;
+			const auto* ballot = inst->Arg(0).Resolve().TryInstruction();
+			if (ballot == nullptr || ballot->GetOpcode() != ValueOpcode::Ballot ||
+			    ballot->NumArgs() != 1u || ballot->Arg(0).Resolve() != active)
+				return nullptr;
+			return ballot;
+		};
+		const auto* left_ballot = extract(left, 0u);
+		const auto* right_ballot = extract(right, 1u);
+		return left_ballot != nullptr && left_ballot == right_ballot;
+	}
+
 	bool ProveActiveMaskNonempty(const Inst& read_first_lane, Value active) const {
-		if (read_first_lane.Parent() == nullptr || !m_ids.contains(read_first_lane.Parent())) return false;
+		if (read_first_lane.Parent() == nullptr || !m_ids.contains(read_first_lane.Parent()))
+			return false;
 		std::unordered_set<const Block*> graph_active;
 		std::unordered_set<const Block*> graph_complete;
 		if (GraphHasCycle(m_program.blocks.front(), graph_active, graph_complete)) return false;
+		active = active.Resolve();
 		Value low, high;
-		if (!ParseThreadBit(active, low, high)) return false;
-		std::unordered_set<const Inst*> low_visiting;
-		std::unordered_set<const Inst*> high_visiting;
-		const auto low_proof = ProveMaskWord(low, 0u, low_visiting);
-		const auto high_proof = ProveMaskWord(high, 1u, high_visiting);
-		if (!low_proof.uniform || !low_proof.subset || !high_proof.uniform || !high_proof.subset)
-			return false;
+		bool classic_words = false;
+		if (ParseThreadBit(active, low, high)) {
+			std::unordered_set<const Inst*> low_visiting;
+			std::unordered_set<const Inst*> high_visiting;
+			const auto low_proof = ProveMaskWord(low, 0u, low_visiting);
+			const auto high_proof = ProveMaskWord(high, 1u, high_visiting);
+			classic_words = low_proof.uniform && low_proof.subset && high_proof.uniform &&
+			                high_proof.subset;
+		}
+		// The empty/nonempty guard must dominate the ReadFirstLane use. Requiring
+		// the guard to post-dominate the shader entry rejects real shaders that
+		// exit early on unrelated paths before this descriptor selection.
+		// Accept either the classic thread-bit/low|high EXEC guard or a Ballot(active)
+		// emptiness check on the exact ReadFirstLane mask.
 		for (const auto* guard : m_program.blocks) {
 			const auto& info = m_program.block_info[m_ids.at(guard)];
-			if (info.terminator.kind != CFG::TerminatorKind::ConditionalBranch ||
-			    !IsZeroMaskGuard(info.condition, low, high)) continue;
+			if (info.terminator.kind != CFG::TerminatorKind::ConditionalBranch) continue;
+			const bool classic =
+			    classic_words && IsZeroMaskGuard(info.condition, low, high);
+			const bool ballot = IsBallotZeroGuard(info.condition, active);
+			if (!classic && !ballot) continue;
 			const auto* nonempty = m_by_id.at(info.terminator.false_block);
-			if (!PostDominates(guard, m_program.blocks.front()) ||
+			if (!Dominates(guard, read_first_lane.Parent()) ||
 			    !Dominates(nonempty, read_first_lane.Parent()) ||
 			    !PostDominates(read_first_lane.Parent(), nonempty)) continue;
 			return true;

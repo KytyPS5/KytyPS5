@@ -9096,6 +9096,36 @@ void TestNewShaderRecompilerCfgDirectConditionalLatchNoSelection() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+// Nested branch inside a direct conditional latch must not leave the SPIR-V
+// continue target on the guest body when that body also contains divergent
+// control flow. Empty-header / latch-at-body matches DirectConditionalLatch;
+// wave64-on-wave32 host forces split emission like the Yōtei blocker.
+void TestNewShaderRecompilerCfgDirectConditionalLatchNestedSelection() {
+  const uint32_t shader[] = {
+      EncodeSopp(0x02, 0),       // loop header -> body/latch
+      EncodeSopc(0x06, 1, 1),    // nested: s_cmp_eq_u32 s1, s1
+      EncodeSopp(0x04, 1),       // nested exit skips the then-arm
+      EncodeSMovB32(2, 129),     // nested then-arm
+      EncodeSopc(0x06, 0, 0),    // latch: s_cmp_eq_u32 s0, s0
+      EncodeSopp(0x05, 0xfffau), // backedge -> loop header, else fall to end
+      0xbf810000u,
+  };
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+  options.wave_size = 64;
+  options.compute_workgroup_limits.native_subgroup_size = 32;
+
+  auto result = RecompileForTest(shader, options);
+  Check((result.ir_dump.find("mode=structured") != std::string::npos),
+        "nested selection latch did not stay on structured path");
+  Check(SpirvInstructionOpcodeCount(result.spirv, 246) != 0,
+        "nested selection latch SPIR-V lacks OpLoopMerge");
+  Check(SpirvInstructionOpcodeCount(result.spirv, 251) == 0,
+        "nested selection latch unexpectedly used dispatcher OpSwitch");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
 void TestNewShaderRecompilerCfgLoopEarlyContinuesNoSelection() {
   const uint32_t shader[] = {
       EncodeSMovB32(0, 128),       // s0 = 0
@@ -17873,6 +17903,13 @@ int main(int argc, char* argv[]) {
     std::puts("KYTY_PARTITIONED_GRAPHICS_LOOP_PASS");
     return 0;
   }
+  if (argc == 2 &&
+      std::strcmp(argv[1], "--direct-conditional-latch-nested-selection-only") ==
+          0) {
+    Libs::Graphics::TestNewShaderRecompilerCfgDirectConditionalLatchNestedSelection();
+    std::puts("KYTY_DIRECT_CONDITIONAL_LATCH_NESTED_SELECTION_PASS");
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--cooperative-scalar-read-branch-only") == 0) {
     Libs::Graphics::TestCooperativeWave64ScalarReadBranchUniformity();
     return 0;
@@ -18075,6 +18112,7 @@ int main(int argc, char* argv[]) {
   TestNewShaderRecompilerCfgMixedContinueNonmergeExitDispatcher();
   TestNewShaderRecompilerCfgConditionalLatchNoSelection();
   TestNewShaderRecompilerCfgDirectConditionalLatchNoSelection();
+  TestNewShaderRecompilerCfgDirectConditionalLatchNestedSelection();
   TestNewShaderRecompilerCfgLoopEarlyContinuesNoSelection();
   TestNewShaderRecompilerCfgLoopGatewaySelection();
   TestNewShaderRecompilerCfgConditionalLoopHeaderSelection();

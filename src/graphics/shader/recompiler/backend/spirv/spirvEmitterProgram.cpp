@@ -103,8 +103,9 @@ const IR::Block* TargetBlock(const IR::Program& program, uint32_t id) {
 }
 
 // Move only a proved simple while-loop's SPIR-V continue target past its
-// guest body. Generated bounds checks in that body can terminate invalid paths
-// with OpUnreachable; those paths must not belong to the continue construct.
+// guest body. Generated bounds checks and nested selections in that body can
+// open paths that are not structurally post-dominated by the back-edge; those
+// paths must not belong to the continue construct.
 // More general early-continue/nested-selection graphs retain their existing
 // targets: moving them requires restructuring the selection exits as well.
 const IR::Block* DedicatedContinueBody(const IR::Program& program, const IR::Block* header,
@@ -124,15 +125,32 @@ const IR::Block* DedicatedContinueBody(const IR::Program& program, const IR::Blo
 		       &program.block_info[static_cast<size_t>(found - program.blocks.begin())];
 	};
 	const auto* body_info = info_for(body);
-	if (body_info == nullptr || body_info->terminator.loop_header ||
-	    body_info->terminator.kind != CFG::TerminatorKind::Branch ||
-	    TargetBlock(program, body_info->terminator.true_block) != header) {
+	if (body_info == nullptr || body_info->terminator.loop_header) {
 		return nullptr;
 	}
+	const auto latch_returns_to_header = [&]() {
+		const auto& term = body_info->terminator;
+		if (term.kind == CFG::TerminatorKind::Branch) {
+			return TargetBlock(program, term.true_block) == header;
+		}
+		if (term.kind != CFG::TerminatorKind::ConditionalBranch || body_info->condition.IsEmpty()) {
+			return false;
+		}
+		const auto* on_true = TargetBlock(program, term.true_block);
+		const auto* on_false = TargetBlock(program, term.false_block);
+		return (on_true == header && on_false == merge) || (on_true == merge && on_false == header);
+	};
+	if (!latch_returns_to_header()) {
+		return nullptr;
+	}
+	const auto single_pred_from = [&](const IR::Block* block, const IR::Block* pred) {
+		const auto predecessors = block->ImmPredecessors();
+		return predecessors.size() == 1u && predecessors.front() == pred;
+	};
 	std::unordered_set<const IR::Block*> visited;
 	const auto* guard = header;
 	for (;;) {
-		if (guard == body || guard == merge || !visited.insert(guard).second) {
+		if (guard == merge || !visited.insert(guard).second) {
 			return nullptr;
 		}
 		const auto* info = info_for(guard);
@@ -148,15 +166,21 @@ const IR::Block* DedicatedContinueBody(const IR::Program& program, const IR::Blo
 			    !((on_true == body && on_false == merge) || (on_true == merge && on_false == body))) {
 				return nullptr;
 			}
-			const auto predecessors = body->ImmPredecessors();
-			return predecessors.size() == 1u && predecessors.front() == guard ? body : nullptr;
+			return single_pred_from(body, guard) ? body : nullptr;
 		}
 		if (term.kind != CFG::TerminatorKind::Branch) {
 			return nullptr;
 		}
 		const auto* next = TargetBlock(program, term.true_block);
-		if (next == nullptr || next->ImmPredecessors().size() != 1u ||
-		    next->ImmPredecessors().front() != guard) {
+		if (next == nullptr) {
+			return nullptr;
+		}
+		// Empty header that branches straight into the latch/body: still a
+		// simple while with the exit test on the latch.
+		if (next == body) {
+			return single_pred_from(body, guard) ? body : nullptr;
+		}
+		if (next->ImmPredecessors().size() != 1u || next->ImmPredecessors().front() != guard) {
 			return nullptr;
 		}
 		guard = next;

@@ -3,6 +3,45 @@
 Обновлено **25 сентября 2026 года**. Игра: **Ghost of Yōtei, PPSA26344**.
 Рабочая ветка — `yotei-windows-bringup` в локальном fork `fxpw/KytyPS5`.
 
+Checkpoint ballot active-mask + SAVEEXEC + loop continue + LDS u64
+**25 сентября 2026 года** (dirty tree поверх `ab644239`): закрыты четыре
+последовательных runtime blocker без title/hash branching.
+
+1. Address-backed **buffer** `86da5eb7…` PC `0x530`: `ProveActiveMaskNonempty`
+   принимает ballot-zero guard (`Ballot(active)==0`) и `Dominates(guard, read)`.
+   `--finite-selector-active-proof-only` RED→GREEN (4 positives / 9 boundaries);
+   exact audit buffers=4. Логи `_Build/merge-validation-20260925/86da-final-audit.*`,
+   `finite-active-clean.*`.
+2. Merge-регрессия SAVEEXEC: Scalar передаёт `LogicalAnd`/`LogicalOr`, а
+   `S_SAVEEXEC` после конфликта ждал `BitwiseAnd32`. Восстановлен путь main
+   (`Logical*` + `Emit` для B64). RED:
+   `--compute-case ScalarSaveexecSccIsWaveUniform`; соседи ORN2/raw PASS.
+   Game run `_Build/runs/yotei-integrated-20260925-181803-91f939` останавливался
+   на `unsupported SAVEEXEC` в `f00717de…`; после фикса шейдер проходит.
+3. SPIR-V continue CFG `7291c10b…`: empty-header / conditional latch — тело было
+   continue target при вложенных SelectionMerge. `DedicatedContinueBody` принимает
+   latch `ConditionalBranch(header|merge)` и прямой `Branch` header→body.
+   RED: game validation
+   «continue … not structurally post dominated by the back-edge»; после фикса
+   emit words≈25998 без validation fail. Селектор
+   `--direct-conditional-latch-nested-selection-only` и
+   `--buffer-descriptor-loop-only` PASS.
+4. LDS `e94e0c58…`: `PackedLds64Pointer` индексировал `lds_dwords` (u32) как ulong.
+   Восстановлены `lds_qwords` (`TypeScalarU64ArrayPointer`) при
+   `shared_int64_atomics`, packed store/atomic пути и
+   `shaderSharedInt64Atomics` в required Vulkan 1.2 features. Game run
+   `_Build/runs/yotei-integrated-20260925-183704-d75ba2` уже не падает на
+   AccessChain; следующий отказ был VUID SharedInt64Atomics (до enable feature).
+
+Ограниченные GPUAV-lite retries: frame 173 (SAVEEXEC) → 178 (7291 CFG) → 193
+(e94e AccessChain) → 200 (SharedInt64 VUID) → 186 после enable feature.
+Run `_Build/runs/yotei-integrated-20260925-183912-301bdc`: VS 7 / PS 6 / CS 55,
+`shown=0`, Fatal на `MaterializeResources` для CS `40395313615abcc8` (ImageWrite
+по SRT `GetImageResource` / ReadConst 0x92…0x99) в TrackResources. Меню/gameplay
+**PENDING**. Следующий шаг — RED materialization для этого image SRT без
+фиктивного binding. Внешние PR целиком не мержились: #811 image side уже в
+ветке; correctness очередь — текущие shared fixes, не #506/#373.
+
 Checkpoint конфликтов draft [#497](https://github.com/KytyPS5/KytyPS5/pull/497)
 **25 сентября 2026 года**, head `e1c6502d`: влит реальный `upstream/main` до tip
 `5ce4f083` (NGS2/ATRAC9 audio, void translator dispatch, `V_CMPX_O_F32`, sync/EOP
@@ -10,10 +49,8 @@ Checkpoint конфликтов draft [#497](https://github.com/KytyPS5/KytyPS5/
 title/hash branching: void/`Logical*` SAVEEXEC и NGS2-тесты взяты с main;
 CMPX/F64 покрытие и address-backed/`protected_image` materialization сохранены.
 GitHub: `mergeable=true`, `mergeable_state=unstable` (CI, не dirty). Случайный
-gitlink `3rdparty/SDL2` из merge убран отдельным коммитом. Новые rendered frames,
-меню и gameplay на этой ревизии **PENDING**; игровой blocker по-прежнему
-address-backed **buffer** `86da5eb7…` (см. ниже). Обзор полезных внешних PR —
-`docs/open-pr-usefulness-review.md`.
+gitlink `3rdparty/SDL2` из merge убран отдельным коммитом. Обзор полезных
+внешних PR — `docs/open-pr-usefulness-review.md`.
 
 Checkpoint интеграции upstream PR #811 **25 сентября 2026 года**: конфликты с
 текущей архитектурой resource plan/materialization разрешены без потери
@@ -26,8 +63,6 @@ loop index, buffer record image key) — **PASS**; логи
 `_Build/merge-validation-20260925/pr811-address-backed-green.*`. Полный
 `TestInvariantIndirectImageMaterialization` по-прежнему упирается в уже
 зафиксированный долг wrapped scalar immediate (`docs/emulator-test-debt.md`).
-Текущий игровой blocker `86da5eb7…` (address-backed **buffer** descriptor) этим
-PR не закрыт; новые rendered frames **PENDING**.
 
 Checkpoint buffer-table emitter **25 сентября 2026 года**, исходный код
 `2fa67d53` (native build выполнен до commit и имеет штамп `0e481ca-dirty`): существующий

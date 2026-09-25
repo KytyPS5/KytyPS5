@@ -101,10 +101,20 @@ static void EnsureLdsStorage(EmitterState& state) {
 	if (ShaderWorkgroupInput(state.program.stage, state.input_info) == nullptr) {
 		EXIT("function LDS was not prepared before SPIR-V function emission\n");
 	}
-	state.lds_variable = state.builder.DefineGlobalVariable(
-	    TypeU32ArrayPointer(state, spv::StorageClassWorkgroup, LdsDwordCount(state)),
-	    spv::StorageClassWorkgroup);
-	state.builder.AddName(state.lds_variable, "lds_dwords");
+	// 64-bit shared atomics require a genuine u64 Workgroup array. Indexing a
+	// u32 array with an OpTypePointer-to-ulong AccessChain is invalid SPIR-V.
+	if (state.requirements.shared_int64_atomics) {
+		state.lds_variable = state.builder.DefineGlobalVariable(
+		    TypeScalarU64ArrayPointer(state, spv::StorageClassWorkgroup,
+		                              (LdsDwordCount(state) + 1u) / 2u),
+		    spv::StorageClassWorkgroup);
+		state.builder.AddName(state.lds_variable, "lds_qwords");
+	} else {
+		state.lds_variable = state.builder.DefineGlobalVariable(
+		    TypeU32ArrayPointer(state, spv::StorageClassWorkgroup, LdsDwordCount(state)),
+		    spv::StorageClassWorkgroup);
+		state.builder.AddName(state.lds_variable, "lds_dwords");
+	}
 }
 
 MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,

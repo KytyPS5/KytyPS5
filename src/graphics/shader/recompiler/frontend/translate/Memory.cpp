@@ -441,7 +441,9 @@ void Translator::BUFFER_LOAD(const Decoder::Instruction& inst) {
 		switch (memory.data_dwords) {
 			case 1u: opcode = IR::ValueOpcode::LoadBufferU32; break;
 			case 2u: opcode = IR::ValueOpcode::LoadBufferU32x2; break;
-			default: return false;
+			default:
+				EXIT("opcode %s at pc 0x%08x has unsupported formatted buffer load dword count %u",
+				     Decoder::InstructionToString(inst).c_str(), inst.pc, memory.data_dwords);
 		}
 	} else switch (bits) {
 		case 8u: opcode = IR::ValueOpcode::LoadBufferU8; break;
@@ -509,7 +511,9 @@ void Translator::BUFFER_STORE(const Decoder::Instruction& inst) {
 				value  = ir.Emit(IR::ValueOpcode::CompositeConstructU32x2,
 				                 {data, ReadU32(OffsetOperand(data_src, 1u))});
 				break;
-			default: return false;
+			default:
+				EXIT("opcode %s at pc 0x%08x has unsupported formatted buffer store dword count %u",
+				     Decoder::InstructionToString(inst).c_str(), inst.pc, memory.data_dwords);
 		}
 	} else switch (memory.data_bits) {
 		case 8u:

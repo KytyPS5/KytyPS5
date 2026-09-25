@@ -8,8 +8,9 @@
 текущей ветки `yotei-windows-bringup` @ `e1c6502d` (draft
 [#497](https://github.com/KytyPS5/KytyPS5/pull/497), base `main` tip `5ce4f083`).
 #497 снова **mergeable** после merge `upstream/main`; `mergeable_state=unstable`
-означает CI, не конфликты. Игровой blocker: address-backed **buffer**
-`86da5eb7…` (image side #811 уже в ветке). Меню/gameplay **PENDING**.
+означает CI, не конфликты. Игровой blocker **25.09 вечер**: `MaterializeResources` на CS
+`40395313615abcc8` (после закрытия 86da ballot / SAVEEXEC / 7291 continue /
+e94e LDS u64). Меню/gameplay **PENDING**.
 
 ### Уже в текущей ветке (не тащить повторно)
 

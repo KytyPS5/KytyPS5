@@ -57,17 +57,21 @@ buffer descriptors + VOP2 DPP8 / split-wave64 Ballot **26 сентября 2026 
    `EmitWaveBallot`. GREEN. Коммит `55f7b047`.
 6. Game retry `_Build/runs/yotei-integrated-20260925-214903-b1087e`
    (SHA `23c9063a…`, frame 170, `shown=0`, flips 0/0): **нет** SPIR-V validation /
-   `--- Error ---`; `4e7da7be` больше не блокирует. Watchdog
-   `Shown frame 0 did not advance for 120 seconds` во время compile CS
-   `623128a1533602b1` (decode→CFG). Меню/gameplay / first shown frame
+   `--- Error ---`; `4e7da7be` больше не блокирует. Watchdog 120s во время
+   compile CS `623128a1`. Long retry
+   `_Build/runs/yotei-integrated-20260925-215227-da3924` (тот же SHA,
+   FrameWatchdog 420s): **`shown=250`**, flips gpu 251 / prepared 251 /
+   ready 251, support 505 — первый rendered/shown progress. Затем fatal
+   SPIR-V validation на CS `5f3fdf61a7ca4a20`:
+   `ID %658 defined in block %655 does not dominate use in block %664`
+   (LocalSize 16×16×1, cooperative wave64 helpers present). Меню/gameplay
    **PENDING**.
 
 Предыдущие закрытые blockers (коммит `5af1cbb6`): ballot active-mask
 `86da5eb7`, SAVEEXEC `Logical*` `f00717de`, dedicated continue `7291c10b`,
-LDS u64/`shaderSharedInt64Atomics` `e94e0c58`. Следующий шаг — выяснить,
-почему `shown` остаётся 0 при растущем frame (present/VideoOut), либо
-удлинить watchdog и снять следующий runtime fatal после тяжёлых CS.
-Ветка запушена на `origin/yotei-windows-bringup` (`55f7b047`).
+LDS u64/`shaderSharedInt64Atomics` `e94e0c58`. Следующий шаг — RED CFG/SPIR-V
+dominance для `5f3fdf61` (phi / block order), без title branching.
+Ветка на `origin/yotei-windows-bringup` (`1f6d08d8` + `55f7b047`).
 
 Checkpoint ballot active-mask + SAVEEXEC + loop continue + LDS u64
 **25 сентября 2026 года** (`5af1cbb6` поверх `ab644239`): закрыты четыре

@@ -4,10 +4,12 @@
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "kernel/memory.h"
+#include "kernel/pthread.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cinttypes>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -191,6 +193,20 @@ struct PageManager::Impl {
 	}
 
 	void Protect(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode) noexcept {
+		uint64_t stack_start = 0;
+		uint64_t stack_end   = 0;
+		if (mode != Common::VirtualMemory::Mode::ReadWrite &&
+		    Libs::LibKernel::FindLiveGuestStack(vaddr, size, &stack_start, &stack_end)) {
+			static std::atomic<uint32_t> reports {0};
+			if (reports.fetch_add(1, std::memory_order_relaxed) < 16) {
+				std::printf("PageManager: refusing to protect 0x%016" PRIx64 "+0x%" PRIx64
+				            " (mode 0x%x): overlaps live guest stack 0x%016" PRIx64
+				            "-0x%016" PRIx64 "\n",
+				            vaddr, size, static_cast<uint32_t>(mode), stack_start, stack_end);
+				std::fflush(stdout);
+			}
+			return;
+		}
 		if (!Libs::LibKernel::Memory::ProtectGuestHostMemory(vaddr, size, mode)) {
 			Fatal("address-space protection failed at 0x%016" PRIx64 ", mode=0x%08" PRIx32, vaddr,
 			      static_cast<uint32_t>(mode));

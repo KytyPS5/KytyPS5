@@ -1758,17 +1758,30 @@ static int KYTY_SYSV_ABI KernelGetModuleInfoFromAddr(uint64_t addr, int n, Modul
 	return 0;
 }
 
-static void KYTY_SYSV_ABI KernelDebugRaiseExceptionOnReleaseMode(int /*c1*/, int /*c2*/) {
+static void KYTY_SYSV_ABI KernelDebugRaiseExceptionOnReleaseMode(int c1, int c2) {
 	PRINT_NAME();
+	std::printf("Guest sceKernelDebugRaiseExceptionOnReleaseMode(0x%08x, 0x%08x) from 0x%016" PRIx64
+	            "\n",
+	            static_cast<uint32_t>(c1), static_cast<uint32_t>(c2),
+	            reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+	std::fflush(stdout);
 }
 
-static void KYTY_SYSV_ABI KernelDebugRaiseException(int /*c1*/, int /*c2*/) {
+static void KYTY_SYSV_ABI KernelDebugRaiseException(int c1, int c2) {
 	PRINT_NAME();
+	std::printf("Guest sceKernelDebugRaiseException(0x%08x, 0x%08x) from 0x%016" PRIx64 "\n",
+	            static_cast<uint32_t>(c1), static_cast<uint32_t>(c2),
+	            reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+	std::fflush(stdout);
 }
 
 static void KYTY_SYSV_ABI exit(int code) {
 	PRINT_NAME();
 
+	std::printf("Guest libkernel exit(%d / 0x%08x) called from 0x%016" PRIx64 "\n", code,
+	            static_cast<uint32_t>(code),
+	            reinterpret_cast<uint64_t>(__builtin_return_address(0)));
+	std::fflush(stdout);
 	::exit(code);
 }
 
@@ -2636,6 +2649,13 @@ int32_t KYTY_SYSV_ABI FiberInitialize(FiberObject* fiber, const char* name, Fibe
 
 	if (addr_context != nullptr) {
 		*static_cast<uint64_t*>(addr_context) = FIBER_STACK_MAGIC;
+		LibKernel::RegisterLiveStack(addr_context, size_context);
+		static std::atomic<uint32_t> fiber_reports {0};
+		if (fiber_reports.fetch_add(1, std::memory_order_relaxed) < 4) {
+			std::printf("Fiber stack registered: %s 0x%016" PRIx64 "+0x%" PRIx64 "\n", name,
+			            reinterpret_cast<uint64_t>(addr_context), size_context);
+			std::fflush(stdout);
+		}
 	}
 
 	LOGF("\t fiber init: %s, entry = 0x%016" PRIx64 ", context = 0x%016" PRIx64 ", size = %" PRIu64
@@ -2687,6 +2707,7 @@ int32_t KYTY_SYSV_ABI FiberFinalize(FiberObject* fiber) {
 	if (!FiberCompareExchangeState(fiber, FIBER_STATE_IDLE, FIBER_STATE_TERMINATED)) {
 		return FIBER_ERROR_STATE;
 	}
+	LibKernel::UnregisterLiveStack(fiber->addr_context);
 
 	return OK;
 }

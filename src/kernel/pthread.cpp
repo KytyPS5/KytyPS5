@@ -660,6 +660,47 @@ static size_t RoundStackSize(size_t size) {
 	return ((size + PTHREAD_STACK_PAGE - 1) / PTHREAD_STACK_PAGE) * PTHREAD_STACK_PAGE;
 }
 
+// Every live guest stack, so memory tracking never write-protects one: Windows writes the
+// exception frame onto the faulting thread's stack, and a protected stack page leaves it nowhere
+// to go, so the kernel ends the process without running any handler.
+static Common::Mutex                              g_live_stacks_mutex;
+static std::vector<std::pair<uint64_t, uint64_t>> g_live_stacks;
+
+void RegisterLiveStack(const void* addr, size_t size) {
+	if (addr == nullptr || size == 0) {
+		return;
+	}
+	const auto start = reinterpret_cast<uint64_t>(addr);
+	{
+		Common::LockGuard lock(g_live_stacks_mutex);
+		g_live_stacks.emplace_back(start, start + size);
+	}
+	// A stack carved from memory that GPU tracking already write-protected must become writable
+	// before the thread or fiber runs on it; the tracker will not protect it again.
+	constexpr uint64_t PAGE = 0x1000;
+	const uint64_t     first = start & ~(PAGE - 1);
+	const uint64_t     last  = (start + size + PAGE - 1) & ~(PAGE - 1);
+	(void)Memory::ProtectGuestHostMemory(first, last - first, Common::VirtualMemory::Mode::ReadWrite);
+}
+
+void UnregisterLiveStack(const void* addr) {
+	const auto        start = reinterpret_cast<uint64_t>(addr);
+	Common::LockGuard lock(g_live_stacks_mutex);
+	std::erase_if(g_live_stacks, [start](const auto& range) { return range.first == start; });
+}
+
+bool FindLiveGuestStack(uint64_t addr, uint64_t size, uint64_t* stack_start, uint64_t* stack_end) {
+	Common::LockGuard lock(g_live_stacks_mutex);
+	for (const auto& [start, end]: g_live_stacks) {
+		if (addr < end && start < addr + size) {
+			*stack_start = start;
+			*stack_end   = end;
+			return true;
+		}
+	}
+	return false;
+}
+
 static int CreateGuestStack(PthreadAttr attr) {
 	if (attr == nullptr) {
 		return KERNEL_ERROR_EINVAL;
@@ -670,12 +711,24 @@ static int CreateGuestStack(PthreadAttr attr) {
 		attr->stack_user     = true;
 		attr->stack_map_addr = 0;
 		attr->stack_map_size = 0;
+		RegisterLiveStack(attr->stack_addr, attr->stack_size);
 		return OK;
 	}
 
 	const auto stack_size = RoundStackSize(attr->stack_size);
 	const auto guard_size = RoundStackSize(attr->guard_size);
-	const auto map_size   = stack_size + guard_size;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// Windows delivers exceptions on the faulting thread's own stack, so the exception frame and
+	// the host fault handler (which may call into the GPU driver) run below the guest's RSP.
+	// Games size worker stacks for the PS5, where that never happens; running out here makes
+	// Windows kill the process without any report. Keep a hidden host-only area between the
+	// guard and the stack the guest sees.
+	constexpr size_t HOST_STACK_SLACK = 0x80000;
+#else
+	constexpr size_t HOST_STACK_SLACK = 0;
+#endif
+	const auto reserve_size = guard_size + HOST_STACK_SLACK;
+	const auto map_size     = stack_size + reserve_size;
 
 	uint64_t stack_addr = 0;
 	bool     cached     = false;
@@ -684,8 +737,8 @@ static int CreateGuestStack(PthreadAttr attr) {
 
 		auto cached_stack =
 		    std::find_if(g_guest_stack_cache.begin(), g_guest_stack_cache.end(),
-		                 [map_size, guard_size](const auto& stack) {
-			                 return stack.map_size == map_size && stack.guard_size == guard_size;
+		                 [map_size, reserve_size](const auto& stack) {
+			                 return stack.map_size == map_size && stack.guard_size == reserve_size;
 		                 });
 		if (cached_stack != g_guest_stack_cache.end()) {
 			stack_addr = cached_stack->address;
@@ -720,18 +773,22 @@ static int CreateGuestStack(PthreadAttr attr) {
 		}
 	}
 
-	attr->stack_addr     = reinterpret_cast<void*>(stack_addr + guard_size);
+	attr->stack_addr     = reinterpret_cast<void*>(stack_addr + reserve_size);
 	attr->stack_size     = stack_size;
 	attr->stack_user     = false;
 	attr->stack_map_addr = stack_addr;
 	attr->stack_map_size = map_size;
 
 	std::memset(attr->stack_addr, 0, stack_size);
+	RegisterLiveStack(attr->stack_addr, stack_size);
 
 	return OK;
 }
 
 static void FreeGuestStack(PthreadAttr attr) {
+	if (attr != nullptr) {
+		UnregisterLiveStack(attr->stack_addr);
+	}
 	if (attr == nullptr || attr->stack_user || attr->stack_map_addr == 0 ||
 	    attr->stack_map_size == 0) {
 		return;

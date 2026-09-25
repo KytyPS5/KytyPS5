@@ -3,7 +3,8 @@
 Обновлено **25 сентября 2026 года**. Игра: **Ghost of Yōtei, PPSA26344**.
 Рабочая ветка — `yotei-windows-bringup` в локальном fork `fxpw/KytyPS5`.
 
-Checkpoint buffer-table emitter **25 сентября 2026 года**: существующий
+Checkpoint buffer-table emitter **25 сентября 2026 года**, исходный код
+`2fa67d53` (native build выполнен до commit и имеет штамп `0e481ca-dirty`): существующий
 `--buffer-descriptor-loop-only` до исправления воспроизвёл отказ SPIR-V emitter
 `resource=UINT32_MAX` на таблице native buffer descriptors. Теперь каждый
 ограниченный runtime selector выбирает конкретный специализированный ресурс;
@@ -25,6 +26,11 @@ Native Windows build/install и неизменённые GPU selectors
 address-backed buffer descriptor и общая коррекция tracking/materialization
 с сохранением guard, диапазонов и проверки alias; новые rendered frames
 **PENDING**.
+Повтор `_Build/runs/yotei-integrated-20260925-124926-24004d` достиг frame 198,
+`shown=0` и подтвердил тот же отказ на PC `0x530`. Существующий
+`--finite-selector-active-proof-only` PASS (3 допустимых случая и 9 границ
+отказа): при пустом EXEC произвольное старое значение selector нельзя
+безусловно считать ограниченным.
 
 Checkpoint следующего ограниченного запуска **25 сентября 2026 года**:
 после `da92d369` (fork CI [36133265663](https://github.com/fxpw/KytyPS5/actions/runs/36133265663):

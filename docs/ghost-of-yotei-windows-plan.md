@@ -1,10 +1,11 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
-Обновлено **25 сентября 2026 года**. Игра: **Ghost of Yōtei, PPSA26344**.
+Обновлено **26 сентября 2026 года**. Игра: **Ghost of Yōtei, PPSA26344**.
 Рабочая ветка — `yotei-windows-bringup` в локальном fork `fxpw/KytyPS5`.
 
 Checkpoint materialization + VOPC `0xbd` + LDS atomic return + workgroup
-buffer descriptors **25 сентября 2026 года**, источник `777bce5d`:
+buffer descriptors + VOP2 DPP8 / split-wave64 Ballot **26 сентября 2026 года**,
+источник `55f7b047` (поверх `0a323df7` / `777bce5d`):
 
 1. Indirect compute `DispatchIndirect` не передавал `guest_workgroups` в
    `GetComputeProgram` / materialization. Workgroup-axis bounded SRT для CS
@@ -42,13 +43,31 @@ buffer descriptors **25 сентября 2026 года**, источник `777b
    Game retry `_Build/runs/yotei-integrated-20260925-193948-f02429`
    (SHA `2876ac9a…`, frame 182, VS8/PS11/CS81, `shown=0`) прошёл `8368b02a`;
    следующий fatal — `unsupported scalar source operand 0xe9` at PC `0x10c`
-   (`ShaderDecoder.cpp`).
+   на CS `4e7da7be` (`ShaderDecoder.cpp`).
+5. `0xe9` / SRC0=233 на VOP2 — не scalar aperture, а **DPP8 escape** (как у
+   VOP1/VOPC). Соседние слова `0xfa` уже шли в DPP16; VOP2 не обрабатывал
+   233/234. RED `--vop2-dpp8-add-f32-only` → EXIT `0xe9`; GREEN после
+   `DecodeVop2Dpp8`/`Fi`. Коммит `0a323df7`. Retry
+   `_Build/runs/yotei-integrated-20260925-213801-699f5c` прошёл decode `4e7da7be`
+   и упал на SPIR-V validation:
+   `OpGroupNonUniformBallot` без `CapabilityGroupNonUniformBallot` (split
+   wave64 объявлял только Arithmetic). DS swizzle/`EmitSubgroupLaneActiveBool`
+   эмитил bare Ballot. RED `--split-wave64-swizzle-ballot-only` → missing
+   capability 64; fix: Ballot cap при любом `subgroup_ballot` + route через
+   `EmitWaveBallot`. GREEN. Коммит `55f7b047`.
+6. Game retry `_Build/runs/yotei-integrated-20260925-214903-b1087e`
+   (SHA `23c9063a…`, frame 170, `shown=0`, flips 0/0): **нет** SPIR-V validation /
+   `--- Error ---`; `4e7da7be` больше не блокирует. Watchdog
+   `Shown frame 0 did not advance for 120 seconds` во время compile CS
+   `623128a1533602b1` (decode→CFG). Меню/gameplay / first shown frame
+   **PENDING**.
 
 Предыдущие закрытые blockers (коммит `5af1cbb6`): ballot active-mask
 `86da5eb7`, SAVEEXEC `Logical*` `f00717de`, dedicated continue `7291c10b`,
-LDS u64/`shaderSharedInt64Atomics` `e94e0c58`. Меню/gameplay **PENDING**.
-Следующий шаг — RED decoder для scalar operand `0xe9`. Внешние PR целиком не
-мержились.
+LDS u64/`shaderSharedInt64Atomics` `e94e0c58`. Следующий шаг — выяснить,
+почему `shown` остаётся 0 при растущем frame (present/VideoOut), либо
+удлинить watchdog и снять следующий runtime fatal после тяжёлых CS.
+Ветка запушена на `origin/yotei-windows-bringup` (`55f7b047`).
 
 Checkpoint ballot active-mask + SAVEEXEC + loop continue + LDS u64
 **25 сентября 2026 года** (`5af1cbb6` поверх `ab644239`): закрыты четыре

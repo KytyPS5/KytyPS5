@@ -2579,6 +2579,9 @@ int KYTY_SYSV_ABI KernelMunmap(uint64_t vaddr, size_t len) {
 		mapped_chunks.emplace_back(current, chunk_size);
 		current += chunk_size;
 	}
+	if (mapped_chunks.empty()) {
+		return KERNEL_ERROR_EACCES;
+	}
 	for (const auto& [chunk_addr, chunk_size]: mapped_chunks) {
 		UnmapGpuRange(chunk_addr, chunk_size);
 		const int result = UnmapMemoryRange(chunk_addr, chunk_size);

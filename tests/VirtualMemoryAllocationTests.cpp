@@ -1522,6 +1522,9 @@ void TestMunmapReservedSpanWithReleasedHole() {
 	        "KernelMunmap(full span with hole)");
 	ExpectUnmapped(test, base);
 	ExpectUnmapped(test, base + SceKernelPageSize * 2);
+	Check(test,
+	      Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize * 3) == ErrorAccess,
+	      "KernelMunmap accepted an entirely released span");
 	std::printf("[host]    %-48s ok\n", test);
 }
 

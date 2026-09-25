@@ -335,10 +335,53 @@ BufferCache::~BufferCache() {
 	}
 }
 
+void BufferCache::ForgetKnownFills(uint64_t vaddr, uint64_t size) {
+	std::lock_guard lock(m_known_fills_mutex);
+	const uint64_t  end = vaddr + size;
+	auto            it  = m_known_fills.lower_bound(vaddr);
+	if (it != m_known_fills.begin() && std::prev(it)->second.end > vaddr) {
+		--it;
+	}
+	while (it != m_known_fills.end() && it->first < end) {
+		const auto start = it->first;
+		const auto fill  = it->second;
+		it               = m_known_fills.erase(it);
+		// Keep the parts of a fill outside the forgotten range.
+		if (start < vaddr) {
+			m_known_fills.emplace(start, KnownFill {vaddr, fill.value});
+		}
+		if (fill.end > end) {
+			it = m_known_fills.emplace(end, KnownFill {fill.end, fill.value}).first;
+			++it;
+		}
+	}
+}
+
+void BufferCache::RecordKnownFill(uint64_t vaddr, uint64_t size, uint32_t value) {
+	ForgetKnownFills(vaddr, size);
+	std::lock_guard lock(m_known_fills_mutex);
+	m_known_fills[vaddr] = KnownFill {vaddr + size, value};
+}
+
+bool BufferCache::TryGetKnownFill(uint64_t vaddr, uint64_t size, uint32_t* value) {
+	std::lock_guard lock(m_known_fills_mutex);
+	auto            it = m_known_fills.upper_bound(vaddr);
+	if (it == m_known_fills.begin()) {
+		return false;
+	}
+	--it;
+	if (it->first > vaddr || it->second.end < vaddr + size) {
+		return false;
+	}
+	*value = it->second.value;
+	return true;
+}
+
 void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid memory-invalidation range\n");
 	}
+	ForgetKnownFills(vaddr, size);
 	m_memory_tracker.InvalidateRegion(vaddr, size,
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
 }
@@ -585,6 +628,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
 		buffer.last_gpu_write_tick = m_scheduler.CurrentTick();
+		ForgetKnownFills(vaddr, size);
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }
@@ -640,6 +684,7 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	m_texture_cache.InvalidateMemoryFromGPU(vaddr, size);
 	auto [dst, dst_offset] = ObtainBuffer(vaddr, size, true, true);
 	dst->Fill(dst_offset, size, value);
+	RecordKnownFill(vaddr, size, value);
 }
 
 void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,

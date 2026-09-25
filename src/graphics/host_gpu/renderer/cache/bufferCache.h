@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include <map>
+#include <mutex>
 #include <span>
 #include <utility>
 #include <vector>
@@ -67,6 +68,11 @@ public:
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+	// True when [vaddr, vaddr + size) was last written, on the GPU, by one fill with *value.
+	// Lets callers use GPU-resident fill results without draining the GPU to read them back.
+	[[nodiscard]] bool TryGetKnownFill(uint64_t vaddr, uint64_t size, uint32_t* value);
+	// Records that the GPU work recorded last filled [vaddr, vaddr + size) with value.
+	void RecordKnownFill(uint64_t vaddr, uint64_t size, uint32_t value);
 	void               ProcessFaultBuffer();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	void               RunGarbageCollector();
@@ -138,6 +144,14 @@ private:
 	vk::CommandBuffer m_readback_command   = nullptr;
 	vk::Semaphore     m_readback_semaphore = nullptr;
 	uint64_t          m_readback_tick      = 0;
+
+	struct KnownFill {
+		uint64_t end;
+		uint32_t value;
+	};
+	void                                 ForgetKnownFills(uint64_t vaddr, uint64_t size);
+	std::mutex                           m_known_fills_mutex;
+	std::map<uint64_t, KnownFill>        m_known_fills;
 };
 
 } // namespace Libs::Graphics

@@ -1493,10 +1493,15 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& i
 				if (candidate_sampler == nullptr || candidate_sampler->dword_count != 4u) {
 					return SpecializationFail("inline image has an invalid sampler source");
 				}
-				if (pair != nullptr && pair->sampler != candidate.sampler &&
-				    (sampler->inline_descriptor.has_value() || candidate_sampler->inline_descriptor.has_value())) {
-					return SpecializationFail(fmt::format(
-					    "inline image at pc 0x{:08x} mixes dynamic sampler sources", image.first_use_pc));
+				if (pair != nullptr && pair->sampler != candidate.sampler) {
+					if (sampler->inline_descriptor.has_value() &&
+					    candidate_sampler->inline_descriptor.has_value()) {
+						return SpecializationFail(fmt::format(
+						    "inline image at pc 0x{:08x} mixes dynamic sampler sources", image.first_use_pc));
+					}
+					// Only the dynamic sampler follows the image's live inline key.
+					// Ordinary sampler uses keep their own fixed resource binding.
+					if (sampler->inline_descriptor.has_value()) continue;
 				}
 				pair = &candidate;
 				sampler = candidate_sampler;
@@ -2014,8 +2019,10 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 			if (indirect ? image.indirect_root != pair.image : index != pair.image) {
 				continue;
 			}
-			const auto sampler = image.indirect_sampler != UINT32_MAX
-			                         ? image.indirect_sampler : pair.sampler;
+			const bool dynamic_pair = image.indirect_sampler != UINT32_MAX &&
+			                          image.indirect_sampler < next_specialization.sampler_origins.size() &&
+			                          next_specialization.sampler_origins[image.indirect_sampler] == pair.sampler;
+			const auto sampler = dynamic_pair ? image.indirect_sampler : pair.sampler;
 			if (sampler >= sampler_info.samplers.size()) {
 				return SpecializationFail("sampled pair has an invalid sampler resource");
 			}

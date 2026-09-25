@@ -37,6 +37,7 @@ using namespace Libs::Graphics::ShaderRecompiler::IR;
 using Libs::Graphics::ShaderComputeInputInfo;
 using Libs::Graphics::ShaderType;
 namespace Decoder = Libs::Graphics::ShaderRecompiler::Decoder;
+namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
 
 void Check(bool condition, const char *message) {
   if (!condition) {
@@ -2127,6 +2128,58 @@ void TestDynamicSrtReadRemainsExplicit() {
             fixture.program.bindings.ShaderDataDwords() ==
                 fixture.program.bindings.memory_offset_dword + 1u,
         "unified memory-offset layout is inconsistent");
+}
+
+void TestConditionalScalarAddressReadRemainsRuntime() {
+  const auto check = [](bool conditional) {
+    Fixture fixture;
+    auto *entry = fixture.block;
+    auto *read_block = conditional ? fixture.AddBlock() : entry;
+    auto *exit = fixture.AddBlock();
+    if (conditional) {
+      entry->AddBranch(read_block);
+      entry->AddBranch(exit);
+      fixture.program.block_info[0].condition = fixture.UserData(2);
+      fixture.program.block_info[0].terminator = {
+          .kind = CFG::TerminatorKind::ConditionalBranch,
+          .true_block = 1u, .false_block = 2u};
+      read_block->AddBranch(exit);
+      fixture.program.block_info[1].terminator = {
+          .kind = CFG::TerminatorKind::Branch, .true_block = 2u};
+      fixture.program.block_info[2].terminator.kind = CFG::TerminatorKind::Return;
+    } else {
+      entry->AddBranch(exit);
+      fixture.program.block_info[0].terminator = {
+          .kind = CFG::TerminatorKind::Branch, .true_block = 1u};
+      fixture.program.block_info[1].terminator.kind = CFG::TerminatorKind::Return;
+    }
+    const auto address = fixture.Address(fixture.UserData(0), fixture.UserData(1));
+    const auto read = fixture.Emit(
+        ValueOpcode::LoadAddressU32,
+        {address, Value(0u), Value(0u), Value(true)},
+        fixture.AddMemory({.kind = ResourceKind::ScalarAddress}, 0x39dcu),
+        read_block);
+    fixture.Emit(ValueOpcode::ReferenceU32, {read}, 0u, read_block);
+    fixture.PlanAndTrack();
+    Check(conditional ? fixture.program.srt_reads.empty()
+                      : fixture.program.srt_reads.size() == 1u,
+          "conditional scalar address read was eagerly flattened");
+    const std::array<uint32_t, 3> user_data{0u, 0u, 0u};
+    const auto plan = ExtractResourcePlan(fixture.program);
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    const bool accepted = MaterializeResources(
+        plan, {.user_data = user_data, .read_memory = RejectTestMemory},
+        snapshot, specialization);
+    Check(accepted == conditional,
+          "null optional read affected materialization or mandatory read was accepted");
+    if (conditional) {
+      Check(read.ResolveInstruction()->GetOpcode() == ValueOpcode::LoadAddressU32,
+            "conditional scalar address read lost its guarded runtime operation");
+    }
+  };
+  check(true);
+  check(false);
 }
 
 enum class BoundedSrtScenario {
@@ -4235,6 +4288,84 @@ void TestInlineImageUniformSamplers() {
         "applied image-only specialization lost ordinary sampler bindings");
 }
 
+void TestInlineImageMixedDynamicAndOrdinarySamplers() {
+  for (const bool reverse_pairs : {false, true}) {
+    auto fixture = MakeInlineDescriptorFixture();
+    const auto image = std::ranges::find_if(*fixture->block, [](const Inst &inst) {
+      return inst.GetOpcode() == ValueOpcode::GetImageResource;
+    });
+    Check(image != fixture->block->end(), "mixed sampler fixture lost its image");
+    const auto ordinary = fixture->Sampler(
+        {Value(146u), Value(0x00fff000u), Value(0x05000000u), Value(0u)}, 0x5d0u);
+    MemoryInfo sample;
+    sample.kind = ResourceKind::Image;
+    sample.image_dimension = Decoder::ImageDimension::Dim2D;
+    sample.image_r128 = true;
+    const auto sampled = fixture->Emit(
+        ValueOpcode::ImageSampleRaw,
+        {Value(&*image), ordinary, fixture->ImageAddress()},
+        fixture->AddMemory(sample, 0x5d0u));
+    fixture->Emit(ValueOpcode::ReferenceU32,
+                  {fixture->Emit(ValueOpcode::CompositeExtractU32x4,
+                                 {sampled, Value(0u)})});
+    fixture->PlanAndTrack();
+    auto plan = ExtractResourcePlan(fixture->program);
+    Check(plan.info.images.size() == 1u && plan.info.samplers.size() == 2u &&
+              plan.info.sampled_pairs.size() == 2u,
+          "mixed sampler fixture did not retain both pairings");
+    if (reverse_pairs) {
+      std::swap(plan.info.sampled_pairs[0], plan.info.sampled_pairs[1]);
+    }
+
+    const std::array<uint32_t, 8> user_data{
+        0x1000u, 872u << 16u, 2u, 0u, 0x2000u, 0u, 16u, 0u};
+    LinearTestMemory memory;
+    DescriptorValue image_descriptor;
+    image_descriptor.dword_count = 8u;
+    image_descriptor.dwords[0] = 0x20u;
+    image_descriptor.dwords[1] =
+        static_cast<uint32_t>(Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float)
+        << 20u;
+    image_descriptor.dwords[2] = 3u | (3u << 14u);
+    image_descriptor.dwords[3] =
+        Libs::Graphics::DstSel(4, 5, 6, 7) |
+        (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+    for (uint32_t record = 0u; record < 2u; record++) {
+      for (uint32_t word = 0u; word < 4u; word++) {
+        memory.words[(record * 872u + 136u) / 4u + word] =
+            word == 0u ? record + 1u : 0u;
+        memory.words[(record * 872u + 152u) / 4u + word] =
+            image_descriptor.dwords[word];
+      }
+    }
+    SrtRuntime runtime{.user_data = user_data,
+                       .userdata = &memory,
+                       .read_specialization_memory = ReadLinearTestMemory};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization),
+          "mixed dynamic and ordinary sampler uses were rejected");
+    Check(snapshot.samplers.size() >= 3u &&
+              specialization.sampled_pairs.size() ==
+                  specialization.images.size() * 2u,
+          "mixed sampler specialization dropped an image/sampler pairing");
+    for (uint32_t image_index = 0u; image_index < specialization.images.size(); image_index++) {
+      const auto dynamic_sampler = specialization.images[image_index].indirect_sampler;
+      Check(dynamic_sampler < snapshot.samplers.size() &&
+                snapshot.samplers[dynamic_sampler].dwords[0] <= 2u,
+            "mixed sampler image lost its dynamic sampler candidate");
+      for (const uint32_t sampler_index : {1u, dynamic_sampler}) {
+        Check(std::ranges::any_of(
+                  specialization.sampled_pairs,
+                  [&](const SampledResourcePair &pair) {
+                    return pair.image == image_index && pair.sampler == sampler_index;
+                  }),
+              "mixed sampler image selected the wrong sampler for a sampled use");
+      }
+    }
+  }
+}
+
 void TestInlineImageResourceLimits() {
   auto fixture = MakeInlineDescriptorFixture(true);
   fixture->PlanAndTrack();
@@ -6155,6 +6286,22 @@ void TestSrtRawFallbackReadability() {
 
 int main(int argc, char** argv) {
   try {
+    if (argc == 2 && std::strcmp(argv[1], "--conditional-scalar-address-only") == 0) {
+      TestConditionalScalarAddressReadRemainsRuntime();
+      std::cout << "KYTY_CONDITIONAL_SCALAR_ADDRESS_PASS\n";
+      return 0;
+    }
+    if (argc == 2 && std::strcmp(argv[1], "--inline-image-mixed-samplers-only") == 0) {
+      TestInlineImageMixedDynamicAndOrdinarySamplers();
+      std::cout << "KYTY_INLINE_IMAGE_MIXED_SAMPLERS_PASS\n";
+      return 0;
+    }
+    if (argc == 2 && std::strcmp(argv[1], "--inline-image-sampler-pairs-only") == 0) {
+      TestInlineImageUniformSamplers();
+      TestInlineImageMixedDynamicAndOrdinarySamplers();
+      std::cout << "KYTY_INLINE_IMAGE_SAMPLER_PAIRS_PASS\n";
+      return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--heterogeneous-indirect-images-only") == 0) {
       TestHeterogeneousIndirectImageDimensions();
       TestHeterogeneousIndirectImageViewSwizzles();
@@ -6252,6 +6399,7 @@ int main(int argc, char** argv) {
     Run("descriptor format provenance", TestDescriptorFormattedBufferProvenance);
     Run("runtime unsigned min", TestRuntimeUnsignedMinDescriptor);
     Run("images and samplers", TestImagesSamplersAndAliases);
+    Run("inline image mixed samplers", TestInlineImageMixedDynamicAndOrdinarySamplers);
     Run("SampleAdjust sampler scratch", TestSampleAdjustSamplerScratch);
     Run("FMASK load specialization", TestFmaskLoadSpecialization);
     Run("dynamic storage mips", TestDynamicStorageMipTracking);
@@ -6264,6 +6412,7 @@ int main(int argc, char** argv) {
     Run("SRT runtime", TestSrtFlatteningAndRuntimeMemoization);
     Run("raw fallback readability", TestSrtRawFallbackReadability);
     Run("dynamic SRT", TestDynamicSrtReadRemainsExplicit);
+    Run("conditional scalar address read", TestConditionalScalarAddressReadRemainsRuntime);
     Run("finite selector SRT proof", TestFiniteSelectorSrtProof);
     Run("finite selector SRT materialization", TestFiniteSelectorSrtMaterialization);
     Run("finite selector active-mask proof", TestFiniteSelectorActiveMaskProof);

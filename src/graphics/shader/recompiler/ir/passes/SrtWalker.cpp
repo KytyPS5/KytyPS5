@@ -362,7 +362,22 @@ public:
 				}
 			}
 		}
+		// Eagerly snapshot ordinary scalar-address reads only along an unavoidable
+		// entry chain. A read behind a conditional branch must execute at runtime:
+		// its address can be null while the guest skips that branch. Descriptor
+		// dependencies were already collected above and still require specialization.
+		std::unordered_set<const Block*> unavoidable;
+		if (!m_program.blocks.empty()) {
+			for (auto* block = m_program.blocks.front();
+			     block != nullptr && unavoidable.insert(block).second;) {
+				const auto successors = block->ImmSuccessors();
+				if (successors.size() != 1u ||
+				    successors.front()->ImmPredecessors().size() != 1u) break;
+				block = successors.front();
+			}
+		}
 		for (auto* block: m_program.blocks) {
+			if (!unavoidable.contains(block)) continue;
 			for (auto& inst: *block) {
 				if (inst.GetOpcode() == ValueOpcode::LoadAddressU32 && IsRawRead(m_program, inst) &&
 				    inst.Arg(1).Resolve().IsImmediate() &&

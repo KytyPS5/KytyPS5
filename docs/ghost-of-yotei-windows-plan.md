@@ -3,9 +3,30 @@
 Обновлено **25 сентября 2026 года**. Игра: **Ghost of Yōtei, PPSA26344**.
 Рабочая ветка — `yotei-windows-bringup` в локальном fork `fxpw/KytyPS5`.
 
+Checkpoint следующего ограниченного запуска **25 сентября 2026 года**:
+после `da92d369` (fork CI [36133265663](https://github.com/fxpw/KytyPS5/actions/runs/36133265663):
+Windows/Linux/macOS PASS на точном SHA) исправлены две следующие общие причины
+отказа. Неизбежные scalar-address SRT reads по-прежнему снимаются в snapshot,
+а чтение внутри условной ветки остаётся runtime-операцией: нулевой указатель
+в пропущенной ветке больше не останавливает materialization. При inline image
+с динамическим и обычным sampler каждая sampled-связка сохраняет свой sampler;
+разные динамические источники по-прежнему запрещены. Неизменённые после
+исправления регрессии `--conditional-scalar-address-only` и
+`--inline-image-mixed-samplers-only` PASS, соседние ordinary/dynamic sampler
+связки PASS. Native Windows build/install и шесть профильных CTest — **6/6 PASS**;
+логи в `_Build/merge-validation-20260925/`.
+
+GPUAV-lite run `_Build/runs/yotei-integrated-20260925-122507-cd0bd8` прошёл
+оба прежних materialization-отказа, дошёл до guest frame 175 (`shown=0`) и
+остановился на новом compute shader `d8959888aafd2552`: SPIR-V emitter не
+находит binding для buffer resource `UINT32_MAX`. Это текущий runtime blocker.
+Новые rendered frames, меню и gameplay на интегрированном коде **PENDING**.
+Следующий шаг — воспроизвести и исправить resource tracking для этого shader
+без подстановки фиктивного binding, затем повторить bounded game/readback.
+
 Checkpoint повторной сборки **25 сентября 2026 года**: базой служит
-`4e20c90` с локальными regression-first исправлениями после интеграции;
-финальный SHA и CI нужно зафиксировать после push. Native Windows build и
+`4e20c90` с regression-first исправлениями после интеграции; они отправлены
+как `da92d369`. Native Windows build и
 установка прошли. Декодер вновь принимает `MIMG 0x1e/0x1f` (float image
 atomic FMIN/FMAX); R32F backing получает совместимый `R32Uint` storage view
 для атомика. Скалярные переходы EXEC/VCC проверяют всю 32/64-битную маску,
@@ -21,14 +42,14 @@ precheck (`a766-ir-audit-green`).
 Ограниченные GPUAV-lite повторы с shader validation последовательно прошли
 ранние отказы: `MIMG 0x1f`, неверный UINT/SFLOAT view, branch `a766`,
 ошибку типа SPIR-V в `a766` и WQM branch `34be6ffcc212383c`.
-Последний run `_Build/runs/yotei-integrated-20260925-120320-100a79`
+Run `_Build/runs/yotei-integrated-20260925-120320-100a79`
 достиг компиляции 28 compute-шейдеров и остановился на materialization
 `8968b4b53e5a246a` до показа кадра. Временная диагностика (не входит в
 исправление) локализовала невычисляемый SRT flat slot 209: физическое чтение
 `LoadAddressU32` по адресу 0 при PC `0x39dc` в ветке с нулевым указателем.
 Нельзя подставлять нулевое значение или убирать проверку: нужно доказать,
 почему этот путь активен и как корректно обрабатывать условный runtime read.
-Новые rendered frames, меню и gameplay на интегрированном коде пока **PENDING**;
+На этом checkpoint новые rendered frames, меню и gameplay были **PENDING**;
 подтверждённый старый spinner на `96611fe` описан ниже.
 
 Checkpoint интеграции **25 сентября 2026 года**: исходные коммиты удалённой

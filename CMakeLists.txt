@@ -629,6 +629,7 @@ if(BUILD_TESTING)
 		virtual_memory_allocation_tests
 		audio_out2_port_tests
 		ngs2_sampler_tests
+		save_data_memory_tests
 	)
 endif()
 

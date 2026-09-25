@@ -2010,6 +2010,10 @@ constexpr uint32_t EncodeVop2Dpp(uint32_t src0, uint32_t dpp_ctrl = 0,
          ((bank_mask & 0xfu) << 24u) | ((row_mask & 0xfu) << 28u);
 }
 
+constexpr uint32_t EncodeVop2Dpp8(uint32_t src0, uint32_t lane_selectors) {
+  return (src0 & 0xffu) | ((lane_selectors & 0xffffffu) << 8u);
+}
+
 constexpr uint32_t EncodeVopc(uint32_t opcode, uint32_t src0, uint32_t src1) {
   return (0x3eu << 25u) | ((opcode & 0xffu) << 17u) | ((src1 & 0xffu) << 9u) |
          (src0 & 0x1ffu);
@@ -5235,6 +5239,76 @@ void TestNewShaderRecompilerRejectsDppOn64BitCompares() {
     Check((compare.unsupported_reason.find("VOPC DPP modifier is not supported for opcode") != std::string::npos),
           "64-bit VOPC DPP rejection reason was not explicit");
   }
+}
+
+void TestNewShaderRecompilerCapturedVop2Dpp8AddF32() {
+  using namespace ShaderRecompiler;
+
+  // Captured shape from Yōtei CS 4e7da7be @ PC 0x10c: VOP2 V_ADD_F32 with
+  // SRC0=233 (DPP8) plus lane-selector control word — not a scalar aperture.
+  const uint32_t shader[] = {
+      EncodeVop2(0x03u, 16u, 233u, 15u),
+      EncodeVop2Dpp8(15u, 0x6db6dbu),
+      EncodeSopp(0x01),
+  };
+
+  Decoder::Instruction decoded;
+  Decoder::DecodeInstruction(shader, 0u, decoded);
+  Check(decoded.family == Decoder::Family::VOP2 &&
+            decoded.opcode == Decoder::Opcode::V_ADD_F32 &&
+            decoded.opcode_id == 0x03u && decoded.word_count == 2u &&
+            std::min(decoded.word_count, Decoder::MaxInstructionRawWords) == 2u &&
+            decoded.dst.kind == Decoder::OperandKind::Vgpr && decoded.dst.reg == 16u &&
+            decoded.src_count == 2u &&
+            decoded.src0.kind == Decoder::OperandKind::Vgpr && decoded.src0.reg == 15u &&
+            decoded.src0.dpp8 && decoded.src0.dpp8_lane_selectors == 0x6db6dbu &&
+            !decoded.src0.dpp8_fetch_inactive &&
+            decoded.src1.kind == Decoder::OperandKind::Vgpr && decoded.src1.reg == 15u,
+        "decoder rejected captured VOP2 DPP8 V_ADD_F32 fields");
+
+  const uint32_t fi_neighbor[] = {
+      EncodeVop2(0x03u, 17u, 234u, 16u),
+      EncodeVop2Dpp8(16u, 0x6db6dbu),
+      EncodeSopp(0x01),
+  };
+  Decoder::Instruction fi_decoded;
+  Decoder::DecodeInstruction(fi_neighbor, 0u, fi_decoded);
+  Check(fi_decoded.opcode == Decoder::Opcode::V_ADD_F32 && fi_decoded.word_count == 2u &&
+            fi_decoded.src0.dpp8 && fi_decoded.src0.dpp8_fetch_inactive &&
+            fi_decoded.src0.dpp8_lane_selectors == 0x6db6dbu &&
+            fi_decoded.src0.reg == 16u && fi_decoded.src1.reg == 16u &&
+            fi_decoded.dst.reg == 17u,
+        "VOP2 DPP8 FI (SRC0=234) neighbor did not decode fetch-inactive selectors");
+
+  Decoder::Program program;
+  CFG::Graph graph;
+  IR::Program ir;
+  ShaderComputeInputInfo compute{};
+  Frontend::TranslateOptions translate_options{};
+  translate_options.stage = ShaderType::Compute;
+  translate_options.wave_size = 64u;
+  translate_options.input_info.compute = &compute;
+  Decoder::DecodeProgram(shader, program);
+  graph = CFG::BuildGraph(program);
+  ir = Frontend::TranslateProgram(program, graph, translate_options);
+  uint32_t dpp8_moves = 0u;
+  uint32_t fp_adds = 0u;
+  for (const auto *block : ir.blocks) {
+    for (const auto &inst : *block) {
+      dpp8_moves += inst.GetOpcode() == IR::ValueOpcode::Dpp8MoveU32 ? 1u : 0u;
+      fp_adds += inst.GetOpcode() == IR::ValueOpcode::FPAdd32 ? 1u : 0u;
+    }
+  }
+  Check(dpp8_moves >= 1u && fp_adds >= 1u,
+        "captured VOP2 DPP8 V_ADD_F32 did not lower to Dpp8MoveU32 plus FPAdd32");
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  auto result = RecompileForTest(shader, options);
+  Check((std::string_view(result.decoded_dump).find(
+                            "V_ADD_F32 v16, v15.dpp8(sel=0x6db6db,fi=0), v15") !=
+         std::string_view::npos),
+        "captured VOP2 DPP8 V_ADD_F32 was not present in the decoded dump");
+  CheckSpirvBinaryValidates(result.spirv);
 }
 
 void TestNewShaderRecompilerCapturedVopcCmpxNeU16() {
@@ -18082,6 +18156,13 @@ int main(int argc, char* argv[]) {
     return 0;
   }
 
+  if (argc == 2 && std::strcmp(argv[1], "--vop2-dpp8-add-f32-only") == 0) {
+    EnsureConfigInitialized();
+    TestNewShaderRecompilerCapturedVop2Dpp8AddF32();
+    std::puts("KYTY_VOP2_DPP8_ADD_F32_PASS");
+    return 0;
+  }
+
   if (argc == 2 && std::strcmp(argv[1], "--vopc-cmpx-ne-u16-only") == 0) {
     EnsureConfigInitialized();
     TestNewShaderRecompilerCapturedVopcCmpxNeU16();
@@ -18169,6 +18250,7 @@ int main(int argc, char* argv[]) {
   TestSopkCompareImmediateExtension();
   TestNewShaderRecompilerCapturedVopcSdwaCmpxClass();
   TestNewShaderRecompilerCapturedVopcSdwaCmpxLtU16();
+  TestNewShaderRecompilerCapturedVop2Dpp8AddF32();
   TestNewShaderRecompilerIrLookupMissFailsExplicitly();
   TestNewShaderRecompilerRejectsDppOn64BitCompares();
   TestNewShaderRecompilerRejectsF64IntegerConversionModifiers();

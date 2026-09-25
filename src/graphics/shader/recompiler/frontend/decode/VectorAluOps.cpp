@@ -1226,6 +1226,34 @@ void DecodeVopcDpp8Fi(uint32_t pc, std::span<const uint32_t> code, uint32_t word
 	DecodeVopcDpp8Impl(pc, code, word_index, opcode, vsrc1, inst, true);
 }
 
+void DecodeVop2Dpp8Impl(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
+                        uint32_t opcode, uint32_t vdst, uint32_t vsrc1, Instruction& inst,
+                        bool fetch_inactive) {
+	const auto modifier = code[word_index + 1u];
+	const auto src0     = modifier & 0xffu;
+	SetRawWords(inst, code, word_index, 2);
+	if (inst.opcode == Opcode::UNSUPPORTED) {
+		SetUnsupported(inst, Family::VOP2, opcode, "VOP2 opcode is not implemented");
+		return;
+	}
+
+	DecodeVectorGpr(vdst, inst.dst);
+	DecodeVectorGpr(vsrc1, inst.src1);
+	DecodeVectorGpr(src0, inst.src0);
+	ApplyDpp8Modifier(inst.src0, modifier, fetch_inactive);
+	FinalizeVop2Instruction(code, word_index, inst);
+}
+
+void DecodeVop2Dpp8(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
+                    uint32_t opcode, uint32_t vdst, uint32_t vsrc1, Instruction& inst) {
+	DecodeVop2Dpp8Impl(pc, code, word_index, opcode, vdst, vsrc1, inst, false);
+}
+
+void DecodeVop2Dpp8Fi(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
+                      uint32_t opcode, uint32_t vdst, uint32_t vsrc1, Instruction& inst) {
+	DecodeVop2Dpp8Impl(pc, code, word_index, opcode, vdst, vsrc1, inst, true);
+}
+
 uint32_t NativeVop3SourceCount(Opcode opcode) {
 	switch (opcode) {
 		case Opcode::V_MUL_F64:
@@ -1560,6 +1588,8 @@ void DecodeVop2(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 		return;
 	}
 	switch (src0) {
+		case 233u: DecodeVop2Dpp8(pc, code, word_index, opcode, vdst, vsrc1, inst); return;
+		case 234u: DecodeVop2Dpp8Fi(pc, code, word_index, opcode, vdst, vsrc1, inst); return;
 		case 249u: DecodeVop2Sdwa(pc, code, word_index, opcode, vdst, vsrc1, inst); return;
 		case 250u: DecodeVop2Dpp(pc, code, word_index, opcode, vdst, vsrc1, inst); return;
 		default: break;

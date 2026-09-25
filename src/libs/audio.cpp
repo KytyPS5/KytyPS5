@@ -11,6 +11,7 @@
 #include "libs/libs.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <magic_enum.hpp>
@@ -363,7 +364,13 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking) {
 
 	uint32_t min_queued_size = 0;
 	if (blocking) {
-		constexpr uint64_t target_latency_us = 40000;
+		// A deeper queue rides out emulator stalls (pipeline compiles, GPU readbacks) that would
+		// otherwise drain it and crackle. KYTY_AUDIO_LATENCY_MS overrides the 100 ms default.
+		static const uint64_t target_latency_us = [] {
+			const char* value = std::getenv("KYTY_AUDIO_LATENCY_MS");
+			const auto  ms    = value != nullptr ? std::strtoull(value, nullptr, 10) : 0;
+			return (ms >= 10 && ms <= 1000 ? ms : 100) * 1000ull;
+		}();
 		const auto buffer_us = port->freq != 0 ? (1000000ULL * port->samples_num) / port->freq : 0;
 		const auto buffers =
 		    buffer_us != 0 ? static_cast<uint32_t>((target_latency_us + buffer_us - 1) / buffer_us)

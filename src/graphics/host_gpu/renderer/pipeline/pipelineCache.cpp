@@ -518,6 +518,30 @@ void PipelineCache::Save() {
 	if (m_driver_cache == nullptr) {
 		return;
 	}
+	WriteSnapshotLocked();
+	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
+	m_driver_cache = nullptr;
+}
+
+void PipelineCache::MaybeSnapshotLocked() {
+	if (m_driver_cache == nullptr) {
+		return;
+	}
+	m_snapshot_pending = true;
+	constexpr auto Interval = std::chrono::seconds(30);
+	const auto     now      = std::chrono::steady_clock::now();
+	if (now - m_last_snapshot < Interval) {
+		return;
+	}
+	m_last_snapshot = now;
+	WriteSnapshotLocked();
+}
+
+void PipelineCache::WriteSnapshotLocked() {
+	if (m_driver_cache == nullptr || !m_snapshot_pending) {
+		return;
+	}
+	m_snapshot_pending = false;
 
 	size_t               size = 0;
 	vk::Result           result;
@@ -568,8 +592,6 @@ void PipelineCache::Save() {
 	}
 	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", payload.size(),
 	                 Common::PathToString(m_driver_cache_path));
-	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
-	m_driver_cache = nullptr;
 }
 
 PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
@@ -828,6 +850,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 
 	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
 	EXIT_IF(!inserted);
+	MaybeSnapshotLocked();
 
 	return *iter->second;
 }
@@ -857,6 +880,7 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
 
 	auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(cached));
+	MaybeSnapshotLocked();
 	EXIT_IF(!inserted);
 
 	return *iter->second;

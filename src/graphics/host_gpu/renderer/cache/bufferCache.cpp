@@ -405,18 +405,24 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		const auto window_begin = std::max(Common::AlignDown(vaddr, WindowSize), buffer_begin);
 		const auto window_end = std::min(std::max(window_begin + WindowSize, vaddr + size), buffer_end);
 
+		// Large reads (PPSA10595's stage select) exceed the 64 MiB staging buffer, so read back in
+		// chunks that each complete before the next reuses the staging space. Once one chunk has
+		// submitted the recording command buffer, the rest take the submitted-work path.
 		// Experiment switch: KYTY_SLOW_READBACK=1 always drains the recording command buffer.
-		static const bool slow_readback = std::getenv("KYTY_SLOW_READBACK") != nullptr;
-		if (!slow_readback && buffer.last_gpu_write_tick < m_scheduler.CurrentTick()) {
-			if (ReadbackSubmitted(buffer, window_begin, window_end - window_begin)) {
-				m_memory_tracker.UnmarkRegionAsGpuModified(window_begin,
-				                                           window_end - window_begin);
+		static const bool  slow_readback = std::getenv("KYTY_SLOW_READBACK") != nullptr;
+		constexpr uint64_t ChunkSize     = 8 * 1024 * 1024;
+		for (uint64_t chunk = window_begin; chunk < window_end; chunk += ChunkSize) {
+			const auto chunk_size = std::min(ChunkSize, window_end - chunk);
+			if (!slow_readback && buffer.last_gpu_write_tick < m_scheduler.CurrentTick()) {
+				if (ReadbackSubmitted(buffer, chunk, chunk_size)) {
+					m_memory_tracker.UnmarkRegionAsGpuModified(chunk, chunk_size);
+				}
+			} else if (DownloadBufferMemory(buffer, chunk, chunk_size)) {
+				const auto tick = m_scheduler.CurrentTick();
+				m_scheduler.Wait(tick);
+				m_scheduler.WaitPriorityOperations(tick);
+				m_memory_tracker.UnmarkRegionAsGpuModified(chunk, chunk_size);
 			}
-		} else if (DownloadBufferMemory(buffer, window_begin, window_end - window_begin)) {
-			const auto tick = m_scheduler.CurrentTick();
-			m_scheduler.Wait(tick);
-			m_scheduler.WaitPriorityOperations(tick);
-			m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
 		}
 		if (is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);

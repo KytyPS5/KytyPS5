@@ -563,7 +563,7 @@ std::string ProveSplitWaveConvergence(const IR::Program& program, bool partition
 						is_uniform &= uniform(inst->Arg(arg));
 				}
 			} else if (op == O::LaneId || op == O::DppMoveU32 || op == O::Dpp8MoveU32 ||
-			    op == O::Permlane16U32 || op == O::WriteLane || op == O::WqmU64 ||
+			    op == O::Permlane16U32 || op == O::WriteLane ||
 			    op == O::UndefU1 || op == O::UndefU8 || op == O::UndefU16 ||
 			    op == O::UndefU32 || op == O::UndefU64 || IsGuestRead(op) || IsGuestAtomic(op)) {
 				is_uniform = false;

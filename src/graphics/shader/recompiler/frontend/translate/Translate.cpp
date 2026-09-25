@@ -792,10 +792,18 @@ void Translator::AddBranchCondition(const CFG::BasicBlock& source, IR::BlockInfo
 		case CFG::BranchCondition::Always: condition = IR::U1(IR::Value(true)); break;
 		case CFG::BranchCondition::SccZero: condition = ir.LogicalNot(ir.GetScc()); break;
 		case CFG::BranchCondition::SccNonZero: condition = ir.GetScc(); break;
-		case CFG::BranchCondition::VccZero: condition = ir.LogicalNot(ir.GetVcc()); break;
-		case CFG::BranchCondition::VccNonZero: condition = ir.GetVcc(); break;
-		case CFG::BranchCondition::ExecZero: condition = ir.LogicalNot(ir.GetExec()); break;
-		case CFG::BranchCondition::ExecNonZero: condition = ir.GetExec(); break;
+		case CFG::BranchCondition::VccZero:
+			condition = MaskIsZero(ir.GetVccLo(), ir.GetVccHi());
+			break;
+		case CFG::BranchCondition::VccNonZero:
+			condition = ir.LogicalNot(MaskIsZero(ir.GetVccLo(), ir.GetVccHi()));
+			break;
+		case CFG::BranchCondition::ExecZero:
+			condition = MaskIsZero(ir.GetExecLo(), ir.GetExecHi());
+			break;
+		case CFG::BranchCondition::ExecNonZero:
+			condition = ir.LogicalNot(MaskIsZero(ir.GetExecLo(), ir.GetExecHi()));
+			break;
 		case CFG::BranchCondition::ScalarInstruction:
 			EXIT_IF(instruction_branch_condition.IsEmpty());
 			condition = instruction_branch_condition;

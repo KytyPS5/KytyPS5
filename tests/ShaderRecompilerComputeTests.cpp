@@ -12607,6 +12607,80 @@ void CheckSampledHtileArrayClearDiscovery() {
     // depth is a borrowed view; its owner stays alive in the runtime cache.
   }
 
+  void CheckFloatImageAtomicView() {
+    constexpr const char *name = "FloatImageAtomicView";
+    constexpr uintptr_t base = 0x0000000204e00000ull;
+    constexpr uint64_t bytes = 0x10000;
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                bytes, bytes, 0, &direct_offset) == 0,
+            "R32F image allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, bytes, 0x3, 0x10, direct_offset, bytes) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "R32F image mapping failed");
+    std::memset(mapped, 0, bytes);
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(base, bytes);
+      auto &cache = context.GetTextureCache();
+      auto &executor = context.GetRenderExecutor();
+      ShaderTextureResource descriptor{};
+      descriptor.fields[0] = static_cast<uint32_t>(base >> 8u);
+      descriptor.fields[1] = static_cast<uint32_t>(base >> 40u) |
+          (static_cast<uint32_t>(Prospero::BufferFormat::k32Float) << 20u) |
+          (3u << 30u);
+      descriptor.fields[2] = 15u | (63u << 14u);
+      descriptor.fields[3] = DstSel(4, 5, 6, 7) |
+          (static_cast<uint32_t>(Prospero::TileMode::kRenderTarget) << 20u) |
+          (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u);
+      descriptor.fields[5] = 0x00700000u;
+      ShaderRecompiler::IR::DescriptorValue value{};
+      value.dword_count = 8;
+      std::copy_n(descriptor.fields, 8, value.dwords.begin());
+      ShaderRecompiler::IR::ImageResource resource{};
+      resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Storage;
+      resource.numeric_class = Prospero::TextureNumericClass::Float;
+      resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      resource.written = true;
+      const auto ordinary = RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
+      Require(name, "ordinary view",
+              ordinary.desc.view_info.format == vk::Format::eR32Sfloat,
+              "ordinary R32F storage lost its float view");
+      resource.numeric_class = Prospero::TextureNumericClass::Uint;
+      resource.read = true;
+      resource.atomic = true;
+      const auto atomic = RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
+      Require(name, "atomic raw view",
+              atomic.image_id == ordinary.image_id &&
+                  atomic.desc.info.pixel_format == vk::Format::eR32Sfloat &&
+                  atomic.desc.view_info.format == vk::Format::eR32Uint,
+              "float image atomic did not select a UINT view of its R32F backing");
+      Require(name, "actual atomic view",
+              cache.FindTexture(atomic.image_id, atomic.desc) != nullptr,
+              "float image atomic could not create its UINT view");
+      context.UnmapMemory(base, bytes);
+      scheduler.Finish();
+    }
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, bytes) == 0,
+            "R32F image unmap failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, bytes) == 0,
+            "R32F image release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckStorageColorComparisonPromotion() {
     constexpr const char *name = "StorageColorComparisonPromotion";
     constexpr uintptr_t base = 0x0000000203e00000ull;
@@ -42226,6 +42300,20 @@ int main(int argc, char **argv) {
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
+  if (argc == 2 && std::strcmp(argv[1], "--float-image-atomic-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, ImageAtomicFminSpecialValues());
+    RunCase(&vulkan, ImageAtomicFmaxSpecialValues());
+    RunCase(&vulkan, ImageAtomicFmaxCapturedGlcVariants());
+    RunCase(&vulkan, ImageAtomicFminContended());
+    RunCase(&vulkan, ImageAtomicFmaxContended());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--float-image-atomic-view-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckFloatImageAtomicView();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--gpu-sync-diagnostic-only") == 0) {
     CheckGpuSyncDiagnosticFilters();
     return 0;

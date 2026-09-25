@@ -698,7 +698,11 @@ static NormalizedTextureDescriptor NormalizeTextureDescriptor(const ShaderRecomp
 			pixel_format = depth_format->depth_attachment_format;
 		}
 	}
-	const auto storage_view_format = storage && format == Prospero::BufferFormat::k32SInt
+	// Float image atomics use a raw UINT CAS on the R32F texel bits. Keep the
+	// backing format for ordinary views, but bind a UINT view for the atomic shader.
+	const auto storage_view_format = storage &&
+	    (format == Prospero::BufferFormat::k32SInt ||
+	     (resource.atomic && format == Prospero::BufferFormat::k32Float))
 	                                     ? vk::Format::eR32Uint
 	                                     : SrgbStorageViewFormat(pixel_format);
 	const auto unorm_compare_format = !storage && resource.depth_compare &&

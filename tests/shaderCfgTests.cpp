@@ -6774,6 +6774,28 @@ void TestNewShaderRecompilerImageAtomicTranslation() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestFloatImageAtomicDecoder() {
+  for (const auto [opcode, expected] : {
+           std::pair{0x1eu, ShaderRecompiler::Decoder::Opcode::IMAGE_ATOMIC_FMIN},
+           std::pair{0x1fu, ShaderRecompiler::Decoder::Opcode::IMAGE_ATOMIC_FMAX},
+       }) {
+    for (const bool glc : {false, true}) {
+      const uint32_t shader[] = {
+          EncodeMimg0(opcode, 0x1, glc),
+          EncodeMimg1(5, 8, 0, 1),
+          0xbf810000u,
+      };
+      ShaderRecompiler::Decoder::Program decoded;
+      ShaderRecompiler::Decoder::DecodeProgram(std::span{shader}, decoded);
+      Check(decoded.instructions.size() == 2u &&
+                decoded.instructions[0].opcode == expected &&
+                decoded.instructions[0].glc == glc &&
+                decoded.instructions[0].image_address_components == 2u,
+            "float image atomic decoder lost opcode, GLC or 2D address width");
+    }
+  }
+}
+
 void TestNewShaderRecompilerVintrpTranslation() {
   const uint32_t shader[] = {
       EncodeVintrp(0, 10, 1, 2, 4), // v_interp_p1_f32 v10, v4, attr1.z
@@ -10575,6 +10597,113 @@ void TestCooperativeWave64ScalarReadBranchUniformity() {
   }
 }
 
+void TestCooperativeWave64WqmMaskBranchUniformity() {
+  using F = CooperativeExecutionFixture;
+  using O = F::O;
+  using V = F::V;
+  for (const bool ballot_mask : {true, false}) {
+    F f({128, 1, 1});
+    const auto predicate = f.Emit(0, O::ULessThan32, {f.lane, V(32u)});
+    V source;
+    if (ballot_mask) {
+      const auto ballot = f.Emit(0, O::Ballot, {predicate});
+      const auto low = f.Emit(0, O::CompositeExtractU32x4, {ballot, V(0u)});
+      const auto high = f.Emit(0, O::CompositeExtractU32x4, {ballot, V(1u)});
+      source = f.Emit(0, O::CompositeConstructU64, {low, high});
+    } else {
+      source = f.Emit(0, O::CompositeConstructU64, {f.lane, V(0u)});
+    }
+    const auto wqm = f.Emit(0, O::WqmU64, {source});
+    const auto low = f.Emit(0, O::CompositeExtractU64, {wqm, V(0u)});
+    const auto condition = f.Emit(0, O::IEqual32, {low, V(0u)});
+    f.Emit(0, O::Barrier);
+    const auto taken = f.AddBlock();
+    const auto other = f.AddBlock();
+    const auto finish = f.AddBlock();
+    f.Conditional(0, taken, other, condition);
+    f.Branch(taken, finish);
+    f.Branch(other, finish);
+    f.KeepWave(finish);
+    const auto plan = f.Plan();
+    if (ballot_mask) {
+      Check(plan.error.empty() && plan.IsCooperativeWave64(),
+            "WQM of a wave-wide ballot mask was rejected as a varying branch");
+    } else {
+      Check(!plan.error.empty() &&
+                std::string_view(plan.error).find("wave-uniform branch") !=
+                    std::string_view::npos,
+            "WQM of a per-lane value incorrectly proved a uniform branch");
+    }
+  }
+}
+
+void TestScalarMaskBranchUsesWholeWave() {
+  using namespace ShaderRecompiler;
+  namespace IR = ShaderRecompiler::IR;
+  for (const uint32_t wave_size : {32u, 64u}) {
+    for (const uint32_t opcode : {0x06u, 0x07u, 0x08u, 0x09u}) {
+      const bool vcc = opcode < 0x08u;
+      const bool nonzero = (opcode & 1u) != 0u;
+      const uint32_t mask_reg = vcc ? 106u : 126u;
+      const uint32_t shader[] = {
+          EncodeSMovB32(mask_reg, 129),
+          EncodeSMovB32(mask_reg + 1u, 128),
+          EncodeSopp(opcode, 1),
+          EncodeSMovB32(0, 129),
+          EncodeSopp(0x01),
+      };
+      Decoder::Program decoded;
+      Decoder::DecodeProgram(shader, decoded);
+      auto graph = CFG::BuildGraph(decoded);
+      ShaderComputeInputInfo compute{};
+      Frontend::TranslateOptions options{};
+      options.stage = ShaderType::Compute;
+      options.wave_size = wave_size;
+      options.input_info.compute = &compute;
+      auto program = Frontend::TranslateProgram(decoded, graph, options);
+      IR::Value condition;
+      for (const auto &info : program.block_info) {
+        if (info.terminator.kind == CFG::TerminatorKind::ConditionalBranch) {
+          condition = info.condition;
+          break;
+        }
+      }
+      Check(!condition.IsEmpty() && !condition.Resolve().IsImmediate(),
+            "scalar mask branch lost its condition");
+      auto *root = condition.ResolveInstruction();
+      Check(root != nullptr, "scalar mask branch lost its condition");
+      if (nonzero) {
+        Check(root->GetOpcode() == IR::ValueOpcode::LogicalNot,
+              "nonzero scalar mask branch did not invert the zero test");
+        root = root->Arg(0).ResolveInstruction();
+      }
+      Check(root != nullptr && root->GetOpcode() == IR::ValueOpcode::IEqual32,
+            "scalar mask branch is lane-varying instead of testing the whole mask");
+      auto *mask = root->Arg(0).ResolveInstruction();
+      Check(mask != nullptr, "scalar mask branch lost its mask source");
+      if (wave_size == 64u) {
+        Check(mask->GetOpcode() == IR::ValueOpcode::BitwiseOr32,
+              "wave64 scalar mask branch ignored the upper mask half");
+        const auto *low = mask->Arg(0).ResolveInstruction();
+        const auto *high = mask->Arg(1).ResolveInstruction();
+        Check(low != nullptr && high != nullptr &&
+                  low->GetOpcode() == (vcc ? IR::ValueOpcode::GetVccLo
+                                          : IR::ValueOpcode::GetExecLo) &&
+                  high->GetOpcode() == (vcc ? IR::ValueOpcode::GetVccHi
+                                           : IR::ValueOpcode::GetExecHi),
+              "wave64 scalar mask branch read the wrong mask halves");
+      } else {
+        Check(mask->GetOpcode() == (vcc ? IR::ValueOpcode::GetVccLo
+                                         : IR::ValueOpcode::GetExecLo),
+              "wave32 scalar mask branch read the wrong low mask");
+      }
+      Check(root->Arg(1).Resolve().IsImmediate() &&
+                root->Arg(1).Resolve().U32() == 0u,
+            "scalar mask branch did not compare its mask against zero");
+    }
+  }
+}
+
 void TestCooperativeWave64LegacyBarrierInsertionScope() {
   using F=CooperativeExecutionFixture;
   using O=F::O;
@@ -10713,6 +10842,47 @@ void TestCooperativeWave64CollectivesUseSharedFunctions() {
   const auto variable_count = SpirvInstructionOpcodeCount(compiled.spirv, 59u);
   Check(variable_count <= 9u,
         "non-overlapping cooperative values did not reuse spill slots");
+}
+
+void TestSplitWave64PermlaneExecMaskSpirv() {
+  using namespace ShaderRecompiler;
+  using O = IR::ValueOpcode;
+  IR::Program program;
+  program.stage = ShaderType::Compute;
+  program.wave_size = 64u;
+  auto *block = AddExecutionPlanBlock(program);
+  program.block_info[0].terminator.kind = CFG::TerminatorKind::Return;
+  auto &lane = block->AppendNewInst(O::LaneId);
+  auto &active = block->AppendNewInst(O::ULessThan32,
+                                      {IR::Value(&lane), IR::Value(32u)});
+  block->AppendNewInst(O::Barrier);
+  auto &permlane = block->AppendNewInst(
+      O::Permlane16U32,
+      {IR::Value(&lane), IR::Value(0x76543210u), IR::Value(0x01234567u),
+       IR::Value(&active)});
+  block->AppendNewInst(O::ReferenceU32, {IR::Value(&permlane)});
+  IR::ValidateProgram(program, true);
+  IR::BuildSrtPlan(program);
+  IR::TrackResources(program);
+
+  ShaderComputeInputInfo compute{};
+  compute.threads_num[0] = 128u;
+  compute.threads_num[1] = compute.threads_num[2] = 1u;
+  compute.wave_size = 64u;
+  compute.needs_lds_barriers = true;
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.wave_size = 64u;
+  options.input_info.compute = &compute;
+  options.compute_workgroup_limits = {{1024, 1024, 64}, 1024, 32, false};
+  const auto plan = PlanComputeExecution(
+      program, options.input_info, options.compute_workgroup_limits);
+  Check(plan.error.empty() && plan.IsCooperativeWave64(),
+        ("permlane EXEC mask fixture did not enter cooperative wave64: " +
+         plan.error).c_str());
+  TranslateResult translated;
+  translated.program = std::move(program);
+  const auto compiled = CompileProgram(std::move(translated), options, {}, 0u);
+  CheckSpirvBinaryValidates(compiled.spirv);
 }
 
 void TestCooperativeWave64CrossBlockSpillReuse() {
@@ -17669,6 +17839,21 @@ int main(int argc, char* argv[]) {
     Libs::Graphics::TestCooperativeWave64ScalarReadBranchUniformity();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--cooperative-wqm-mask-branch-only") == 0) {
+    Libs::Graphics::TestCooperativeWave64WqmMaskBranchUniformity();
+    std::puts("KYTY_COOPERATIVE_WQM_MASK_BRANCH_PASS");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--scalar-mask-branch-only") == 0) {
+    Libs::Graphics::TestScalarMaskBranchUsesWholeWave();
+    std::puts("KYTY_SCALAR_MASK_BRANCH_PASS");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--split-wave64-permlane-exec-only") == 0) {
+    Libs::Graphics::TestSplitWave64PermlaneExecMaskSpirv();
+    std::puts("KYTY_SPLIT_WAVE64_PERMLANE_EXEC_PASS");
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--gds-append-admission-only") == 0) {
     Libs::Graphics::TestComputeExecutionGdsAppendAdmission();
     std::puts("KYTY_GDS_APPEND_ADMISSION_PASS");
@@ -17752,6 +17937,12 @@ int main(int argc, char* argv[]) {
     TestNewShaderRecompilerMubufFormatTranslation();
     TestNewShaderRecompilerCapturedMubufStoreFormatD16();
     std::puts("KYTY_MUBUF_STORE_FORMAT_D16_PASS");
+    return 0;
+  }
+
+  if (argc == 2 && std::strcmp(argv[1], "--float-image-atomic-decode-only") == 0) {
+    TestFloatImageAtomicDecoder();
+    std::puts("KYTY_FLOAT_IMAGE_ATOMIC_DECODE_PASS");
     return 0;
   }
 
@@ -17892,9 +18083,12 @@ int main(int argc, char* argv[]) {
   TestCooperativeWave64BarrierOrderAndControl();
   TestCooperativeWave64OperationBoundaries();
   TestCooperativeWave64ScalarReadBranchUniformity();
+  TestCooperativeWave64WqmMaskBranchUniformity();
+  TestScalarMaskBranchUsesWholeWave();
   TestCooperativeWave64LegacyBarrierInsertionScope();
   TestCooperativeWave64ConsecutiveLdsReadsSharePhase();
   TestCooperativeWave64CollectivesUseSharedFunctions();
+  TestSplitWave64PermlaneExecMaskSpirv();
   TestCooperativeWave64CrossBlockSpillReuse();
   TestCooperativeWave64BufferCycleVisibility();
   TestCooperativeWave64AutomaticBufferCyclePromotion();

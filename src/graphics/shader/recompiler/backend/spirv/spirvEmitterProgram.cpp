@@ -795,7 +795,22 @@ uint32_t ValueEmitContext::FirstLane(uint32_t ballot) {
 }
 
 uint32_t ValueEmitContext::Shuffle(const IR::Inst& inst, size_t index, uint32_t lane) {
-	if (state.compute_execution.IsSplitWave64()) return EmitWaveReadLane(state, Arg(inst, index), lane);
+	if (state.compute_execution.IsSplitWave64()) {
+		const auto source = Arg(inst, index);
+		if (inst.Arg(index).GetType() != IR::Type::U1) {
+			return EmitWaveReadLane(state, source, lane);
+		}
+		// The shared wave64 lane exchange stores u32 words. Preserve boolean
+		// predicates as 0/1 while crossing the two native subgroups.
+		const auto word = state.builder.AllocateId();
+		state.builder.AddFunction({OpSelect, TypeU32(state), word, source,
+		                           ConstantU32(state, 1), ConstantU32(state, 0)});
+		const auto shuffled = EmitWaveReadLane(state, word, lane);
+		const auto predicate = state.builder.AllocateId();
+		state.builder.AddFunction({OpINotEqual, TypeBool(state), predicate, shuffled,
+		                           ConstantU32(state, 0)});
+		return predicate;
+	}
 	const auto type  = TypeId(state, inst.Arg(index).GetType());
 	const auto scope = ConstantU32(state, spv::ScopeSubgroup);
 	const auto low   = state.builder.AllocateId();

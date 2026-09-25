@@ -406,6 +406,16 @@ add_executable(page_manager_tests EXCLUDE_FROM_ALL
 target_link_libraries(page_manager_tests common)
 target_include_directories(page_manager_tests PRIVATE ${inc_headers})
 
+add_executable(shader_precompile_record_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ShaderPrecompileRecordTests.cpp"
+)
+target_include_directories(shader_precompile_record_tests PRIVATE ${inc_headers})
+
+add_executable(overlay_revision_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/OverlayRevisionTests.cpp"
+)
+target_include_directories(overlay_revision_tests PRIVATE ${inc_headers})
+
 add_executable(bit_array_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/BitArrayTests.cpp"
 )
@@ -555,6 +565,8 @@ if(BUILD_TESTING)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
+	add_test(NAME shader_precompile_record COMMAND $<TARGET_FILE:shader_precompile_record_tests>)
+	add_test(NAME overlay_revision COMMAND $<TARGET_FILE:overlay_revision_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
@@ -619,6 +631,8 @@ if(BUILD_TESTING)
 		memory_tracker_tests
 		page_manager_tests
 		bit_array_tests
+		shader_precompile_record_tests
+		overlay_revision_tests
 		shader_vertex_metadata_tests
 		resource_materialization_tests
 		resource_tracking_tests

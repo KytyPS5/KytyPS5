@@ -3,14 +3,18 @@
 #include <SDL3/SDL.h>
 
 #include "common/assert.h"
+#include "common/file.h"
 #include "common/stringUtils.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineCompileProgress.h"
 #include "imgui.h"
 #include "imgui_impl_vulkan.h"
 #include "libs/controller.h"
 #include "libs/dialog.h"
 #include "libs/ime.h"
 #include "libs/imeDialog.h"
+#include "loader/systemContent.h"
+#include "stb_image.h"
 
 #include <algorithm>
 #include <array>
@@ -18,19 +22,22 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <deque>
+#include <filesystem>
 #include <mutex>
 #include <span>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace Libs::Graphics {
 
 namespace {
 
-namespace CoreIme   = Libs::Ime;
-namespace DialogIme = Libs::Dialog::ImeDialog;
+namespace CoreIme     = Libs::Ime;
+namespace DialogIme   = Libs::Dialog::ImeDialog;
 namespace ErrorDialog = Libs::Dialog::ErrorDialog;
 
 namespace Ime {
@@ -170,12 +177,12 @@ bool                         g_input_reset_requested      = false;
 uint16_t                     g_last_external_keycode      = 0;
 uint32_t                     g_last_external_status       = 0;
 OverlaySession               g_input_session;
-bool                         g_input_active               = false;
-bool                         g_input_controller           = false;
-bool                         g_input_keyboard             = false;
-bool                         g_input_multiline            = false;
-bool                         g_input_lifecycle_active     = false;
-bool                         g_controller_captured        = false;
+bool                         g_input_active           = false;
+bool                         g_input_controller       = false;
+bool                         g_input_keyboard         = false;
+bool                         g_input_multiline        = false;
+bool                         g_input_lifecycle_active = false;
+bool                         g_controller_captured    = false;
 OverlaySession               g_session;
 SDL_Window*                  g_input_window               = nullptr;
 
@@ -464,11 +471,14 @@ void ShutdownSystemOverlayInput() {
 }
 
 SystemOverlayVisualState GetSystemOverlayVisualState() noexcept {
-	const auto core   = CoreIme::GetVisualState();
-	const auto dialog = DialogIme::GetVisualState();
-	const auto error  = ErrorDialog::GetVisualState();
-	return {core.active || dialog.active || error.active,
-	        core.revision + dialog.revision + error.revision};
+	const auto core      = CoreIme::GetVisualState();
+	const auto dialog    = DialogIme::GetVisualState();
+	const auto error     = ErrorDialog::GetVisualState();
+	const auto compile   = PipelineCompileProgress::GetSnapshot();
+	const bool compiling = PipelineCompileProgress::ShouldShowOverlay(compile);
+	return {core.active || dialog.active || error.active || compiling,
+	        core.revision + dialog.revision + error.revision +
+	            PipelineCompileProgress::OverlayRevision(compile)};
 }
 
 bool ProcessSystemOverlayInput(const SDL_Event& event) {
@@ -854,7 +864,7 @@ struct SystemOverlay::Impl {
 		} else {
 			const float  glyph_width = std::max(ImGui::CalcTextSize("M").x, 1.0f);
 			const size_t columns     = std::max<size_t>(
-			    8, static_cast<size_t>(ImGui::GetContentRegionAvail().x / glyph_width));
+                8, static_cast<size_t>(ImGui::GetContentRegionAvail().x / glyph_width));
 			const size_t lines =
 			    std::max<size_t>(1, static_cast<size_t>(ImGui::GetContentRegionAvail().y /
 			                                            ImGui::GetTextLineHeightWithSpacing()));
@@ -945,26 +955,314 @@ struct SystemOverlay::Impl {
 		}
 	}
 
+	// Deliberately independent of OverlaySession/OverlayKind: unlike Ime/Error, this has no
+	// guest-driven modal state, needs no input capture, and should never compete with either of
+	// them for exclusivity -- it's an ambient corner HUD, not a dialog.
+	// ImGui's built-in bitmap font pixelates badly at panel sizes and the project ships no font of
+	// its own, so borrow the platform's. Falls back to the built-in face when none is found.
+	// ImGui's built-in bitmap font pixelates badly at panel sizes and the project ships no font of
+	// its own, so borrow the platform's. Falls back to the built-in face when none is found.
+	// ImGui's built-in bitmap font pixelates badly at panel sizes and the project ships no font of
+	// its own, so borrow the platform's. Falls back to the built-in face when none is found.
+	ImFont* LoadOverlayFont() {
+		static ImFont* font = []() -> ImFont* {
+			static const char* const candidates[] = {
+			    "C:/Windows/Fonts/segoeui.ttf",
+			    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+			    "/System/Library/Fonts/Helvetica.ttc",
+			};
+			for (const char* path: candidates) {
+				std::error_code ec;
+				if (std::filesystem::exists(path, ec)) {
+					return ImGui::GetIO().Fonts->AddFontFromFileTTF(path, 32.0f);
+				}
+			}
+			return nullptr;
+		}();
+		return font;
+	}
+
+	struct OverlayIcon {
+		ImFontAtlasRectId id = ImFontAtlasRectId_Invalid;
+	};
+
+	// stbi_load() opens the path itself through fopen(), which on Windows resolves it in the ANSI
+	// code page and fails for any title whose icon sits behind a non-ASCII path. Common::File goes
+	// through CreateFileW, so the bytes are read here and decoded from memory instead.
+	static std::vector<uint8_t> ReadImageBytes(const std::filesystem::path& path) {
+		Common::File file;
+		if (!file.Open(path, Common::File::Mode::Read)) {
+			return {};
+		}
+		std::vector<uint8_t> bytes(static_cast<size_t>(file.Size()));
+		uint32_t             read = 0;
+		file.Read(bytes.data(), static_cast<uint32_t>(bytes.size()), &read);
+		file.Close();
+		bytes.resize(read);
+		return bytes;
+	}
+
+	// Packed into the font atlas rather than uploaded as its own image: no VkImage, no staging
+	// buffer and nothing to release. The pixels would be lost if the atlas were ever rebuilt, which
+	// cannot happen here because the font is loaded once at startup and never changes.
+	OverlayIcon LoadGameIcon() {
+		static OverlayIcon icon = []() -> OverlayIcon {
+			std::filesystem::path path;
+			if (!Loader::SystemContentGetIconPath(&path) || path.empty()) {
+				return {};
+			}
+			const auto     png    = ReadImageBytes(path);
+			int            w      = 0;
+			int            h      = 0;
+			int            comp   = 0;
+			unsigned char* pixels =
+			    stbi_load_from_memory(png.data(), static_cast<int>(png.size()), &w, &h, &comp, 4);
+			if (pixels == nullptr || w <= 0 || h <= 0) {
+				stbi_image_free(pixels);
+				return {};
+			}
+			ImFontAtlas*            atlas = ImGui::GetIO().Fonts;
+			const ImFontAtlasRectId id    = atlas->AddCustomRect(w, h);
+			ImFontAtlasRect         rect {};
+			if (id == ImFontAtlasRectId_Invalid || !atlas->GetCustomRect(id, &rect) ||
+			    atlas->TexData == nullptr || atlas->TexData->BytesPerPixel != 4) {
+				stbi_image_free(pixels);
+				return {};
+			}
+			for (int y = 0; y < h; y++) {
+				std::memcpy(atlas->TexData->GetPixelsAt(rect.x, rect.y + y),
+				            pixels + static_cast<size_t>(y) * static_cast<size_t>(w) * 4u,
+				            static_cast<size_t>(w) * 4u);
+			}
+			stbi_image_free(pixels);
+			return {id};
+		}();
+		return icon;
+	}
+
+	// pic0.png is the key art the launcher already shows; downscaled before packing so it cannot
+	// blow up the font atlas that carries it.
+	static ImFontAtlasRectId PackPng(const std::filesystem::path& path, int max_dim, int* out_w,
+	                                 int* out_h) {
+		const auto     png    = ReadImageBytes(path);
+		int            w      = 0;
+		int            h      = 0;
+		int            comp   = 0;
+		unsigned char* pixels =
+		    stbi_load_from_memory(png.data(), static_cast<int>(png.size()), &w, &h, &comp, 4);
+		if (pixels == nullptr || w <= 0 || h <= 0) {
+			stbi_image_free(pixels);
+			return ImFontAtlasRectId_Invalid;
+		}
+		int step = 1;
+		while (w / step > max_dim || h / step > max_dim) {
+			step++;
+		}
+		const int               dw    = w / step;
+		const int               dh    = h / step;
+		ImFontAtlas*            atlas = ImGui::GetIO().Fonts;
+		const ImFontAtlasRectId id    = atlas->AddCustomRect(dw, dh);
+		ImFontAtlasRect         rect {};
+		if (id == ImFontAtlasRectId_Invalid || !atlas->GetCustomRect(id, &rect) ||
+		    atlas->TexData == nullptr || atlas->TexData->BytesPerPixel != 4) {
+			stbi_image_free(pixels);
+			return ImFontAtlasRectId_Invalid;
+		}
+		for (int y = 0; y < dh; y++) {
+			auto* dst =
+			    static_cast<unsigned char*>(atlas->TexData->GetPixelsAt(rect.x, rect.y + y));
+			for (int x = 0; x < dw; x++) {
+				unsigned int acc[4] = {0, 0, 0, 0};
+				for (int sy = 0; sy < step; sy++) {
+					for (int sx = 0; sx < step; sx++) {
+						const unsigned char* src =
+						    pixels + ((static_cast<size_t>(y) * step + sy) * w +
+						              (static_cast<size_t>(x) * step + sx)) *
+						                 4u;
+						for (int ch = 0; ch < 4; ch++) {
+							acc[ch] += src[ch];
+						}
+					}
+				}
+				const unsigned int n =
+				    static_cast<unsigned int>(step) * static_cast<unsigned int>(step);
+				for (int ch = 0; ch < 4; ch++) {
+					dst[x * 4 + ch] = static_cast<unsigned char>(acc[ch] / n);
+				}
+			}
+		}
+		stbi_image_free(pixels);
+		if (out_w != nullptr) {
+			*out_w = dw;
+		}
+		if (out_h != nullptr) {
+			*out_h = dh;
+		}
+		return id;
+	}
+
+	static ImFontAtlasRectId LoadGameBanner() {
+		static ImFontAtlasRectId id = []() -> ImFontAtlasRectId {
+			std::filesystem::path icon_path;
+			if (!Loader::SystemContentGetIconPath(&icon_path) || icon_path.empty()) {
+				return ImFontAtlasRectId_Invalid;
+			}
+			const auto      banner = icon_path.parent_path() / "pic0.png";
+			std::error_code ec;
+			if (!std::filesystem::exists(banner, ec)) {
+				return ImFontAtlasRectId_Invalid;
+			}
+			return PackPng(banner, 1024, nullptr, nullptr);
+		}();
+		return id;
+	}
+	std::string GroupDigits(uint64_t value) {
+		const std::string digits = std::to_string(value);
+		std::string       out;
+		out.reserve(digits.size() + digits.size() / 3);
+		for (size_t i = 0; i < digits.size(); i++) {
+			if (i != 0 && (digits.size() - i) % 3 == 0) {
+				out.push_back(',');
+			}
+			out.push_back(digits[i]);
+		}
+		return out;
+	}
+
+	void DrawCompileProgress(const PipelineCompileProgress::Snapshot& progress,
+	                         vk::Extent2D                             frame_extent) {
+		const ImVec2  display(static_cast<float>(frame_extent.width),
+		                      static_cast<float>(frame_extent.height));
+		const float   scale = std::max(std::min(display.x / 1280.0f, display.y / 720.0f), 0.5f);
+		ImFont* const font  = LoadOverlayFont();
+		const ImVec4  dim {0.68f, 0.70f, 0.74f, 1.0f};
+		const ImVec4  faint {0.55f, 0.57f, 0.61f, 1.0f};
+		const ImVec4  white {1.0f, 1.0f, 1.0f, 1.0f};
+
+		const ImFontAtlasRectId banner = LoadGameBanner();
+		ImFontAtlasRect         banner_rect {};
+		if (banner != ImFontAtlasRectId_Invalid &&
+		    ImGui::GetIO().Fonts->GetCustomRect(banner, &banner_rect)) {
+			ImGui::GetBackgroundDrawList()->AddImage(ImGui::GetIO().Fonts->TexRef,
+			                                         ImVec2(0.0f, 0.0f), display, banner_rect.uv0,
+			                                         banner_rect.uv1);
+			ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0.0f, 0.0f), display,
+			                                              IM_COL32(0, 0, 0, 90));
+		}
+		ImGui::SetNextWindowPos({display.x * 0.5f, display.y * 0.5f}, ImGuiCond_Always,
+		                        {0.5f, 0.5f});
+		ImGui::SetNextWindowSize({720.0f * scale, 0.0f}, ImGuiCond_Always);
+		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {26.0f * scale, 26.0f * scale});
+		ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {0.0f, 8.0f * scale});
+		ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 18.0f * scale);
+		ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.0f * scale);
+		ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.10f, 0.11f, 0.12f, 0.90f));
+		ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(0.62f, 0.78f, 0.95f, 1.0f));
+		ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(1.0f, 1.0f, 1.0f, 0.16f));
+		constexpr ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+		                                   ImGuiWindowFlags_NoSavedSettings |
+		                                   ImGuiWindowFlags_NoInputs;
+		ImGui::Begin("##Loading", nullptr, flags);
+
+		const OverlayIcon icon = LoadGameIcon();
+		ImFontAtlasRect   icon_rect {};
+		if (icon.id != ImFontAtlasRectId_Invalid &&
+		    ImGui::GetIO().Fonts->GetCustomRect(icon.id, &icon_rect)) {
+			const float side = 134.0f * scale;
+			ImGui::Image(ImGui::GetIO().Fonts->TexRef, ImVec2(side, side), icon_rect.uv0,
+			             icon_rect.uv1);
+			ImGui::SameLine(0.0f, 22.0f * scale);
+		}
+
+		ImGui::BeginGroup();
+		const float content_w = ImGui::GetContentRegionAvail().x;
+
+		ImGui::PushFont(font, 30.0f * scale);
+		ImGui::TextColored(white, "%s",
+		                   progress.title.empty() ? "Loading" : progress.title.c_str());
+		ImGui::PopFont();
+
+		ImGui::PushFont(font, 19.0f * scale);
+		ImGui::TextColored(dim, "Preparing shaders");
+		ImGui::PopFont();
+
+		ImGui::Dummy(ImVec2(0.0f, 6.0f * scale));
+
+		const bool     have_total = progress.estimated_total > 0;
+		const uint64_t done       = PipelineCompileProgress::OverlayCompletedOfTotal(progress);
+		ImGui::PushFont(font, 22.0f * scale);
+		if (have_total) {
+			const std::string counts =
+			    GroupDigits(done) + "  /  " + GroupDigits(progress.estimated_total);
+			ImGui::TextColored(white, "%s", counts.c_str());
+			const int percent = static_cast<int>(done * 100u / progress.estimated_total);
+			const std::string pct   = std::to_string(percent) + "%";
+			const float       pct_w = ImGui::CalcTextSize(pct.c_str()).x;
+			ImGui::SameLine();
+			ImGui::SetCursorPosX(ImGui::GetCursorStartPos().x + content_w - pct_w);
+			ImGui::TextColored(dim, "%s", pct.c_str());
+		} else {
+			ImGui::TextColored(white, "%s", GroupDigits(progress.compiled).c_str());
+		}
+		ImGui::PopFont();
+
+		// A cold run has no idea how many shaders the title needs, so an indeterminate sweep is the
+		// only honest bar; ImGui draws one for any negative fraction.
+		const float fraction = have_total ? static_cast<float>(done) /
+		                                        static_cast<float>(progress.estimated_total)
+		                                  : -1.0f * static_cast<float>(ImGui::GetTime());
+		ImGui::ProgressBar(fraction, ImVec2(content_w, 8.0f * scale), "");
+
+		ImGui::Dummy(ImVec2(0.0f, 4.0f * scale));
+		ImGui::PushFont(font, 17.0f * scale);
+		ImGui::TextColored(dim, "Compiling GPU pipelines");
+		if (have_total && done > 0 && progress.compile_elapsed_ms > 0) {
+			const uint64_t remaining_ms =
+			    progress.compile_elapsed_ms * (progress.estimated_total - done) / done;
+			const uint64_t seconds = remaining_ms / 1000u;
+			if (seconds >= 60u) {
+				ImGui::TextColored(faint, "Shader cache  -  %llum %llus remaining",
+				                   static_cast<unsigned long long>(seconds / 60u),
+				                   static_cast<unsigned long long>(seconds % 60u));
+			} else {
+				ImGui::TextColored(faint, "Shader cache  -  %llus remaining",
+				                   static_cast<unsigned long long>(seconds));
+			}
+		} else {
+			ImGui::TextColored(faint, "Shader cache  -  building");
+		}
+		ImGui::PopFont();
+		ImGui::EndGroup();
+
+		ImGui::End();
+		ImGui::PopStyleColor(3);
+		ImGui::PopStyleVar(4);
+	}
 	bool PrepareFrame(vk::Extent2D frame_extent, vk::Format format, uint32_t image_count) {
 		OverlaySnapshot snapshot;
-		if (!GetOverlaySnapshot(&snapshot)) {
+		const bool      has_dialog   = GetOverlaySnapshot(&snapshot);
+		const auto      compile      = PipelineCompileProgress::GetSnapshot();
+		const bool      show_compile = PipelineCompileProgress::ShouldShowOverlay(compile);
+		if (!has_dialog && !show_compile) {
 			return false;
 		}
 		const auto prepared_session = snapshot.session;
 		EnsureVulkan(format, image_count);
-		if (session != snapshot.session) {
-			session       = snapshot.session;
-			focus_pending = true;
-			shift         = (snapshot.ime.option & Ime::OPTION_NO_AUTO_CAPITALIZE) == 0;
-			symbol_mode   = false;
-			panel_offset  = {};
-			right_stick   = {};
-			auto& io      = ImGui::GetIO();
-			io.ClearEventsQueue();
-			io.ClearInputKeys();
-			io.ClearInputMouse();
+		if (has_dialog) {
+			if (session != snapshot.session) {
+				session       = snapshot.session;
+				focus_pending = true;
+				shift         = (snapshot.ime.option & Ime::OPTION_NO_AUTO_CAPITALIZE) == 0;
+				symbol_mode   = false;
+				panel_offset  = {};
+				right_stick   = {};
+				auto& io      = ImGui::GetIO();
+				io.ClearEventsQueue();
+				io.ClearInputKeys();
+				io.ClearInputMouse();
+			}
+			DrainInput(snapshot.session);
 		}
-		DrainInput(snapshot.session);
 
 		auto& io       = ImGui::GetIO();
 		io.DisplaySize = {static_cast<float>(frame_extent.width),
@@ -975,16 +1273,26 @@ struct SystemOverlay::Impl {
 		                     : std::clamp(std::chrono::duration<float>(now - last_frame).count(),
 		                                  1.0f / 1000.0f, 0.1f);
 		last_frame     = now;
+		LoadOverlayFont(); // atlas changes must land outside a frame
+		LoadGameIcon();
+		LoadGameBanner(); // before NewFrame
 		ImGui_ImplVulkan_NewFrame();
 		ImGui::NewFrame();
-		if (!GetOverlaySnapshot(&snapshot) || snapshot.session != prepared_session) {
+		const bool dialog_still_valid =
+		    has_dialog && GetOverlaySnapshot(&snapshot) && snapshot.session == prepared_session;
+		if (dialog_still_valid) {
+			if (snapshot.session.kind == OverlayKind::Error) {
+				DrawError(snapshot.error, frame_extent);
+			} else {
+				DrawIme(snapshot.ime, frame_extent);
+			}
+		}
+		if (show_compile) {
+			DrawCompileProgress(compile, frame_extent);
+		}
+		if (!dialog_still_valid && !show_compile) {
 			ImGui::EndFrame();
 			return false;
-		}
-		if (snapshot.session.kind == OverlayKind::Error) {
-			DrawError(snapshot.error, frame_extent);
-		} else {
-			DrawIme(snapshot.ime, frame_extent);
 		}
 		ImGui::Render();
 		extent = frame_extent;

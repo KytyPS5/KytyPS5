@@ -6,3 +6,9 @@ _Build/vscode-clang/
 _Build/
 cmake-build-debug/
 _PipelineCache/
+coldrun.ps1
+warmboot.ps1
+*.log
+full_log.txt
+_SaveData/
+*.bak

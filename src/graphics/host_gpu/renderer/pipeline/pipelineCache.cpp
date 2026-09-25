@@ -10,6 +10,8 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineCompileProgress.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderPrecompile.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
@@ -22,6 +24,7 @@
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <charconv>
 #include <cstdio>
 #include <cstring>
 #include <fmt/format.h>
@@ -85,6 +88,50 @@ std::string PipelineCacheTitleId() {
 	return title_id;
 }
 
+// A separate small sidecar file, deliberately not folded into the main pipeline cache's own
+// signature-checked binary layout: it's an estimate of how many pipelines this title needs,
+// used to show real progress on the *next* cold rebuild. It stays useful even when the main
+// cache is invalidated (a different build can still need roughly the same number of pipelines),
+// so it must not be gated by, or mixed into the hash of, the data that check invalidates.
+std::filesystem::path CompileCountPath(const std::filesystem::path& driver_cache_path) {
+	auto path = driver_cache_path;
+	path.replace_extension(".count");
+	return path;
+}
+
+uint64_t ReadCompileCountEstimate(const std::filesystem::path& path) {
+	if (!Common::File::IsFileExisting(path)) {
+		return 0;
+	}
+	Common::File file(path, Common::File::Mode::Read);
+	if (file.IsInvalid()) {
+		return 0;
+	}
+	std::string text(static_cast<size_t>(file.Size()), '\0');
+	uint32_t    read = 0;
+	file.Read(text.data(), static_cast<uint32_t>(text.size()), &read);
+	file.Close();
+	text.resize(read);
+	uint64_t value       = 0;
+	const auto [ptr, ec] = std::from_chars(text.data(), text.data() + text.size(), value);
+	return ec == std::errc {} ? value : 0;
+}
+
+void WriteCompileCountEstimate(const std::filesystem::path& path, uint64_t count) {
+	if (count == 0) {
+		return;
+	}
+	const auto   text = std::to_string(count);
+	Common::File file;
+	if (!file.Create(path)) {
+		return;
+	}
+	uint32_t written = 0;
+	file.Write(text.data(), static_cast<uint32_t>(text.size()), &written);
+	file.Flush();
+	file.Close();
+}
+
 template <typename... Args>
 void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 	auto message = fmt::format(format, std::forward<Args>(args)...);
@@ -121,8 +168,8 @@ void DumpShaderOriginal(const char* stage_name, uint64_t shader_hash,
 		return;
 	}
 	EXIT_IF(code.empty());
-	static std::atomic_int id = 0;
-	const auto base = Config::GetShaderLogFolder() / "original" /
+	static std::atomic_int id   = 0;
+	const auto             base = Config::GetShaderLogFolder() / "original" /
 	                  fmt::format("{:04d}_new_shader_{}_{:016x}", id++, stage_name, shader_hash);
 	Common::File::CreateDirectories(base.parent_path());
 	for (const auto& [suffix, data, size]: {
@@ -297,7 +344,8 @@ struct PipelineCache::ProgramCache {
 			    entry->second.resource_plan, runtime, entry->second.resources,
 			    entry->second.specialization));
 			if (const auto permutation = std::ranges::find_if(
-			        entry->second.permutations, [&](const Permutation& candidate) {
+			        entry->second.permutations,
+			        [&](const Permutation& candidate) {
 				        const auto& layout = candidate.program.bindings;
 				        return layout.push_data_start_dword ==
 				                   ShaderRecompiler::IR::PushData::StartFor(
@@ -368,6 +416,8 @@ struct PipelineCache::ProgramCache {
 		    params, options, std::move(translated), entry->second.specialization, push_data_cursor));
 		const auto& permutation = entry->second.permutations.back();
 		input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
+		ShaderPrecompile::Record(params, options, permutation.specialization, push_data_cursor,
+		                         input_info);
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
 
 		std::array<size_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> counts {};
@@ -411,6 +461,9 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 }
 
 PipelineCache::~PipelineCache() {
+	// Joined before Save() rather than by the member destructor below: the replay thread is still
+	// creating shader modules and bumping the compiled count that Save() persists as the estimate.
+	WaitForPrecompile();
 	Save();
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& [key, pipeline]: pipelines) {
@@ -442,12 +495,37 @@ void PipelineCache::InitializeDriverCache() {
 		PipelineCacheLog("Vulkan pipeline cache: disabled (unknown git revision)");
 		return;
 	}
-	if (git_hash.ends_with("-dirty")) {
-		PipelineCacheLog("Vulkan pipeline cache: disabled (dirty build)");
-		return;
+	m_driver_cache_path = std::filesystem::path("_PipelineCache") / (title_id + ".bin");
+	// Independent of whether the main cache below validates, and of a dirty local build:
+	// a different build still needs roughly the number of pipelines the last run did.
+	PipelineCompileProgress::SetEstimatedTotal(
+	    ReadCompileCountEstimate(CompileCountPath(m_driver_cache_path)));
+
+	{
+		const auto shader_set =
+		    std::filesystem::path(m_driver_cache_path).replace_extension(".shaders");
+		// Replayed permutations go straight into the program cache, so the guest lookups that
+		// follow are hits and never record them again. Appending is what keeps them: the set
+		// this run writes is the previous one plus whatever it newly needed. Only a set that
+		// did not load at all -- absent, another build's, or corrupt -- is rewritten.
+		auto records = ShaderPrecompile::Load(shader_set, KYTY_GIT_REVISION);
+		ShaderPrecompile::Open(shader_set, KYTY_GIT_REVISION, !records.empty());
+		if (!records.empty()) {
+			PipelineCompileProgress::SetPrecompiling(true);
+			m_precompile_done.store(false, std::memory_order_release);
+			m_precompile_thread = std::jthread([this, records = std::move(records)]() mutable {
+				ReplayPrecompiled(std::move(records));
+			});
+		}
 	}
 
-	m_driver_cache_path     = std::filesystem::path("_PipelineCache") / (title_id + ".bin");
+	if (git_hash.ends_with("-dirty")) {
+		PipelineCacheLog("Vulkan pipeline cache: disabled (dirty build)");
+		// A dirty build loads no cache, so this run compiles everything the title needs and
+		// its count is a valid estimate for the next one.
+		m_cache_was_cold = true;
+		return;
+	}
 	const auto path         = Common::PathToString(m_driver_cache_path);
 	const bool cache_exists = Common::File::IsFileExisting(m_driver_cache_path);
 	if (cache_exists) {
@@ -487,6 +565,10 @@ void PipelineCache::InitializeDriverCache() {
 			PipelineCacheLog("Vulkan pipeline cache: invalidating {} (invalid file size)", path);
 		}
 	}
+	// Only a genuine cold start (no usable prior data) means "compiled this run" will end up
+	// counting everything the title needs; a warm run that hits just one or two incidental new
+	// shaders must not overwrite a good prior estimate with that small number in Save() below.
+	m_cache_was_cold = initial_data.empty();
 
 	vk::PipelineCacheCreateInfo create {};
 	create.initialDataSize = initial_data.size();
@@ -513,8 +595,102 @@ void PipelineCache::InitializeDriverCache() {
 	}
 }
 
+// Replays the set recorded by a previous run. One thread is enough: the whole compile workload
+// for this title measures around a second of CPU, so a pool would add contention for nothing.
+// Held by the guest's first shader lookup so the title cannot draw before the recorded set is
+// in place. This is what keeps the loading panel to exactly one phase.
+void PipelineCache::WaitForPrecompile() {
+	if (m_precompile_done.load(std::memory_order_acquire)) {
+		return;
+	}
+	std::scoped_lock lock(m_precompile_join_mutex);
+	if (m_precompile_thread.joinable()) {
+		m_precompile_thread.join();
+	}
+	m_precompile_done.store(true, std::memory_order_release);
+}
+
+void PipelineCache::ReplayPrecompiled(std::vector<ShaderPrecompile::PermutationRecord> records) {
+	PipelineCompileProgress::SetEstimatedTotal(records.size());
+
+	for (const auto& record: records) {
+		ShaderParams params {};
+		if (record.user_data.size() > params.user_data.size()) {
+			continue;
+		}
+		params.code = std::span<const uint32_t>(record.code.data(), record.code.size());
+		params.back_code =
+		    std::span<const uint32_t>(record.back_code.data(), record.back_code.size());
+		std::ranges::copy(record.user_data, params.user_data.begin());
+		params.user_data_count = static_cast<uint32_t>(record.user_data.size());
+		params.hash            = record.hash;
+
+		ShaderRecompiler::CompileOptions options;
+		options.stage          = record.stage;
+		options.shader_hash    = record.hash;
+		options.user_data      = std::span(params.user_data).first(params.user_data_count);
+		options.back_code      = params.back_code;
+		options.user_data_base = record.user_data_base;
+		options.wave_size      = record.wave_size;
+		options.dump_label     = "ShaderPrecompile";
+
+		ProgramCache::ProgramKey key;
+		key.stage           = record.stage;
+		key.hash            = record.hash;
+		key.user_data_count = params.user_data_count;
+		key.code_size       = static_cast<uint32_t>(record.code.size());
+
+		ShaderStageInputInfo stage_input {};
+		auto                 info = record.info;
+		if (auto* vertex = std::get_if<ShaderVertexInputInfo>(&info); vertex != nullptr) {
+			stage_input.vertex = vertex;
+			BuildStageStaticKey(*vertex, key.static_state);
+		} else if (auto* pixel = std::get_if<ShaderPixelInputInfo>(&info); pixel != nullptr) {
+			stage_input.pixel = pixel;
+			BuildStageStaticKey(*pixel, key.static_state);
+		} else {
+			auto* compute       = std::get_if<ShaderComputeInputInfo>(&info);
+			stage_input.compute = compute;
+			BuildStageStaticKey(*compute, key.static_state);
+		}
+		options.input_info = stage_input;
+
+		PipelineCompileProgress::ReportCompileStarted();
+		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
+		if (translated.skip_dispatch) {
+			// Mirrors the live lookup: CompileProgram refuses these, and the entry makes the guest's
+			// own lookup skip the dispatch instead of translating it again.
+			Common::LockGuard lock(m_mutex);
+			m_program_cache->programs.try_emplace(key, ShaderRecompiler::IR::ResourcePlan {})
+			    .first->second.skip_dispatch = true;
+			PipelineCompileProgress::ReportCompileFinished();
+			continue;
+		}
+		auto plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+
+		Common::LockGuard lock(m_mutex);
+		auto              entry = m_program_cache->programs.find(key);
+		if (entry == m_program_cache->programs.end()) {
+			entry = m_program_cache->programs.try_emplace(key, std::move(plan)).first;
+		}
+		entry->second.permutations.push_back(m_program_cache->CompilePermutation(
+		    params, options, std::move(translated), record.specialization,
+		    record.push_data_start_dword));
+		PipelineCompileProgress::ReportCompileFinished();
+	}
+	PipelineCompileProgress::SetPrecompiling(false);
+	PipelineCacheLog("Shader precompile: replayed {} shader(s)", records.size());
+}
 void PipelineCache::Save() {
+	ShaderPrecompile::Close();
 	Common::LockGuard lock(m_mutex);
+	if (m_cache_was_cold) {
+		// The estimate is written even when no driver cache exists, so the directory the
+		// main save path creates below may not be there yet.
+		Common::File::CreateDirectories(m_driver_cache_path.parent_path());
+		WriteCompileCountEstimate(CompileCountPath(m_driver_cache_path),
+		                          PipelineCompileProgress::GetSnapshot().compiled);
+	}
 	if (m_driver_cache == nullptr) {
 		return;
 	}
@@ -537,8 +713,8 @@ void PipelineCache::Save() {
 	}
 	if (result != vk::Result::eSuccess || size == 0 ||
 	    size > std::numeric_limits<uint32_t>::max()) {
-		PipelineCacheLog("Vulkan pipeline cache: save failed ({}, {} bytes)",
-		                 vk::to_string(result), size);
+		PipelineCacheLog("Vulkan pipeline cache: save failed ({}, {} bytes)", vk::to_string(result),
+		                 size);
 		return;
 	}
 	payload.resize(size);
@@ -577,6 +753,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping, bool pixel_active,
     std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info) {
+	WaitForPrecompile();
 	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
 	std::array<ShaderParams, 3> vertex_params;
 	if (tess_active) {
@@ -605,11 +782,11 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	}
 	ShaderParams pixel_params;
 	if (pixel_active) {
-		pixel_params = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
-		const auto& blend          = context.GetBlendControl(0);
+		pixel_params      = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
+		const auto& blend = context.GetBlendControl(0);
 		const auto  is_dual_source = [](uint8_t factor) {
-			return factor >= static_cast<uint8_t>(Prospero::BlendFactor::kSrc1Color) &&
-			       factor <= static_cast<uint8_t>(Prospero::BlendFactor::kOneMinusSrc1Alpha);
+            return factor >= static_cast<uint8_t>(Prospero::BlendFactor::kSrc1Color) &&
+                   factor <= static_cast<uint8_t>(Prospero::BlendFactor::kOneMinusSrc1Alpha);
 		};
 		pixel_info.dual_source_blending =
 		    blend.enable && !context.GetRenderTarget(0).info.blend_bypass &&
@@ -638,8 +815,8 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	}
 	Common::LockGuard lock(m_mutex);
 	uint32_t          push_data_cursor =
-	    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount : 0;
-	GraphicsPrograms  result;
+        mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount : 0;
+	GraphicsPrograms result;
 	if (pixel_active) {
 		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
 	}
@@ -652,6 +829,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
                                                const HW::ShaderRegisters&   sh,
                                                ShaderComputeInputInfo&      input_info) {
+	WaitForPrecompile();
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
 	const auto        params      = PrepareProgram(regs, sh, input_info);
 	Common::LockGuard lock(m_mutex);
@@ -710,8 +888,8 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 			EXIT("mixed color attachment sample counts are unsupported: %u and %u\n",
 			     attachment_samples, colors[i].desc.info.samples);
 		}
-		const auto& rt                        = ctx.GetRenderTarget(colors[i].target_slot);
-		const auto& bc                        = ctx.GetBlendControl(colors[i].target_slot);
+		const auto& rt                           = ctx.GetRenderTarget(colors[i].target_slot);
+		const auto& bc                           = ctx.GetBlendControl(colors[i].target_slot);
 		static_params.color_srcblend[slot]       = bc.color_srcblend;
 		static_params.color_comb_fcn[slot]       = bc.color_comb_fcn;
 		static_params.color_destblend[slot]      = bc.color_destblend;
@@ -819,8 +997,10 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 
 	auto cached = std::make_unique<Pipeline>();
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
+	PipelineCompileProgress::ReportCompileStarted();
 	CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vertex_info,
 	                       ps_input_info, programs, static_params, m_driver_cache);
+	PipelineCompileProgress::ReportCompileFinished();
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
@@ -832,33 +1012,33 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	return *iter->second;
 }
 
-PipelineCache::Pipeline&
-PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
-                                  const ShaderProgram&          compute_program) {
-	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Compute)", profiler::colors::RedA100);
+PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
+                                                           const ShaderProgram& compute_program) {
+KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Compute)", profiler::colors::RedA100);
 
-	EXIT_IF(!compute_program);
+EXIT_IF(!compute_program);
 
-	Common::LockGuard lock(m_mutex);
+Common::LockGuard lock(m_mutex);
 
-	if (auto iter = m_compute_pipelines.find(compute_program.id);
-	    iter != m_compute_pipelines.end()) {
-		return *iter->second;
-	}
+if (auto iter = m_compute_pipelines.find(compute_program.id);
+    iter != m_compute_pipelines.end()) {
+return *iter->second;
+}
 
-	if (graphics_debug_dump_enabled()) {
-		ShaderDbgDumpInputInfo(input_info);
-	}
+if (graphics_debug_dump_enabled()) {
+ShaderDbgDumpInputInfo(input_info);
+}
 
-	auto cached = std::make_unique<Pipeline>();
-	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache);
+PipelineCompileProgress::ReportCompileStarted();
+auto cached = std::make_unique<Pipeline>();
+CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache);
+PipelineCompileProgress::ReportCompileFinished();
 
-	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
-	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
+EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
+EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
 
-	auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(cached));
-	EXIT_IF(!inserted);
-
-	return *iter->second;
+auto& result = *cached;
+m_compute_pipelines.emplace(compute_program.id, std::move(cached));
+return result;
 }
 } // namespace Libs::Graphics

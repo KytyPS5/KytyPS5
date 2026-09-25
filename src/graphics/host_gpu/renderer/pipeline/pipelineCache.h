@@ -5,16 +5,21 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/threads.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderPrecompile.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/shader.h"
 
+#include <atomic>
 #include <cstddef>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <span>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace Libs::Graphics {
 
@@ -33,29 +38,29 @@ struct ComputeShaderInfo;
 #pragma pack(push, 1)
 
 struct PipelineStaticParameters {
-	bool                       negative_one_to_one      = false;
-	bool                       depth_clip_enable        = true;
-	vk::PrimitiveTopology      topology                 = vk::PrimitiveTopology::ePointList;
-	bool                       primitive_restart_enable = false;
-	uint32_t                   samples                  = 1;
-	bool                       sample_shading_enable    = false;
-	bool                       depth_bounds_test_enable = false;
-	float                      depth_min_bounds         = 0.0f;
-	float                      depth_max_bounds         = 0.0f;
-	uint32_t                   color_mask[RENDER_COLOR_ATTACHMENTS_MAX]           = {};
-	bool                       cull_front                                         = false;
-	bool                       cull_back                                          = false;
-	bool                       face                                               = false;
-	bool                       provoking_vtx_last                                 = false;
-	vk::PolygonMode            polygon_mode                                       = vk::PolygonMode::eFill;
-	uint8_t                    color_srcblend[RENDER_COLOR_ATTACHMENTS_MAX]       = {};
-	uint8_t                    color_comb_fcn[RENDER_COLOR_ATTACHMENTS_MAX]       = {};
-	uint8_t                    color_destblend[RENDER_COLOR_ATTACHMENTS_MAX]      = {};
-	uint8_t                    alpha_srcblend[RENDER_COLOR_ATTACHMENTS_MAX]       = {};
-	uint8_t                    alpha_comb_fcn[RENDER_COLOR_ATTACHMENTS_MAX]       = {};
-	uint8_t                    alpha_destblend[RENDER_COLOR_ATTACHMENTS_MAX]      = {};
-	bool                       separate_alpha_blend[RENDER_COLOR_ATTACHMENTS_MAX] = {};
-	bool                       blend_enable[RENDER_COLOR_ATTACHMENTS_MAX]         = {};
+	bool                  negative_one_to_one      = false;
+	bool                  depth_clip_enable        = true;
+	vk::PrimitiveTopology topology                 = vk::PrimitiveTopology::ePointList;
+	bool                  primitive_restart_enable = false;
+	uint32_t              samples                  = 1;
+	bool                  sample_shading_enable    = false;
+	bool                  depth_bounds_test_enable = false;
+	float                 depth_min_bounds         = 0.0f;
+	float                 depth_max_bounds         = 0.0f;
+	uint32_t              color_mask[RENDER_COLOR_ATTACHMENTS_MAX]      = {};
+	bool                  cull_front                                    = false;
+	bool                  cull_back                                     = false;
+	bool                  face                                          = false;
+	bool                  provoking_vtx_last                            = false;
+	vk::PolygonMode       polygon_mode                                  = vk::PolygonMode::eFill;
+	uint8_t               color_srcblend[RENDER_COLOR_ATTACHMENTS_MAX]  = {};
+	uint8_t               color_comb_fcn[RENDER_COLOR_ATTACHMENTS_MAX]  = {};
+	uint8_t               color_destblend[RENDER_COLOR_ATTACHMENTS_MAX] = {};
+	uint8_t               alpha_srcblend[RENDER_COLOR_ATTACHMENTS_MAX]  = {};
+	uint8_t               alpha_comb_fcn[RENDER_COLOR_ATTACHMENTS_MAX]  = {};
+	uint8_t               alpha_destblend[RENDER_COLOR_ATTACHMENTS_MAX] = {};
+	bool                  separate_alpha_blend[RENDER_COLOR_ATTACHMENTS_MAX] = {};
+	bool                  blend_enable[RENDER_COLOR_ATTACHMENTS_MAX]         = {};
 
 	bool operator==(const PipelineStaticParameters& other) const noexcept;
 };
@@ -119,18 +124,18 @@ public:
 
 	struct GraphicsPrograms {
 		std::array<ShaderProgram, 3> vertex;
-		ShaderProgram pixel;
+		ShaderProgram                pixel;
 
 		[[nodiscard]] uint32_t VertexStageCount() const { return vertex[1] ? 3u : 1u; }
 	};
 
 	GraphicsPrograms
-	GetGraphicsPrograms(const HW::VertexShaderInfo& vertex_regs,
-	                    const HW::PixelShaderInfo& pixel_regs, const HW::ShaderRegisters& sh,
-	                    const HW::Context& context, const HW::UserConfig& user_config,
-	                    std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
-	                    bool pixel_active, std::array<ShaderVertexInputInfo, 3>& vertex_info,
-	                    ShaderPixelInputInfo& pixel_info);
+	              GetGraphicsPrograms(const HW::VertexShaderInfo& vertex_regs,
+	                                  const HW::PixelShaderInfo& pixel_regs, const HW::ShaderRegisters& sh,
+	                                  const HW::Context& context, const HW::UserConfig& user_config,
+	                                  std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
+	                                  bool pixel_active, std::array<ShaderVertexInputInfo, 3>& vertex_info,
+	                                  ShaderPixelInputInfo& pixel_info);
 	ShaderProgram GetComputeProgram(const HW::ComputeShaderInfo& regs,
 	                                const HW::ShaderRegisters&   sh,
 	                                ShaderComputeInputInfo&      input_info);
@@ -141,6 +146,7 @@ public:
 	                              CommandBuffer& command, const ShaderPixelInputInfo* ps_input_info,
 	                              vk::PrimitiveTopology topology, bool primitive_restart_enable,
 	                              const GraphicsPrograms& programs);
+
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	                             const ShaderProgram&          compute_program);
 
@@ -211,12 +217,21 @@ private:
 	std::unique_ptr<ProgramCache> m_program_cache;
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;
+	// Set once in InitializeDriverCache(); see its use in Save().
+	bool m_cache_was_cold = false;
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
 	Common::Mutex m_mutex;
 
-	void InitializeDriverCache();
+	void              InitializeDriverCache();
+	void              ReplayPrecompiled(std::vector<ShaderPrecompile::PermutationRecord> records);
+	void              WaitForPrecompile();
+	std::atomic<bool> m_precompile_done {true};
+	std::mutex        m_precompile_join_mutex;
+	// Declared last so its destructor joins before the program cache it writes into. The
+	// destructor also joins it explicitly, ahead of the teardown in its own body.
+	std::jthread m_precompile_thread;
 };
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);

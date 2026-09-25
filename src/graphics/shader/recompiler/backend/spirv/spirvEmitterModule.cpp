@@ -714,8 +714,9 @@ void DefineModule(EmitterState& state) {
 	if (state.compute_execution.IsSplitWave64() && state.requirements.subgroup_ballot) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformArithmetic);
 	}
-	if (state.lane_count == 2 ||
-	    (state.requirements.subgroup_ballot && !state.compute_execution.IsSplitWave64())) {
+	if (state.lane_count == 2 || state.requirements.subgroup_ballot) {
+		// Split wave64 still emits OpGroupNonUniformBallot for native halves and for
+		// non-split paths; Arithmetic alone is not enough for the Ballot opcode.
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformBallot);
 	}
 	if (state.requirements.subgroup_shuffle) {

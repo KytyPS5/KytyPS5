@@ -275,10 +275,10 @@ uint32_t EmitVertexParameterComponentU32(EmitterState& state, const InputBinding
 }
 
 uint32_t EmitSubgroupLaneActiveBool(EmitterState& state, uint32_t lane) {
-	const auto active_ballot = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4), active_ballot,
-	                          ConstantU32(state, spv::ScopeSubgroup), ConstantBool(state, true));
-	return EmitBallotLaneActiveBool(state, active_ballot, lane);
+	// Route through the wave ballot helper so split/cooperative wave64 uses the
+	// admitted workgroup aggregate instead of a bare 32-lane subgroup ballot.
+	return EmitBallotLaneActiveBool(state, EmitWaveBallot(state, ConstantBool(state, true)),
+	                                lane);
 }
 uint32_t EmitBallotLaneActiveBool(EmitterState& state, uint32_t active_ballot, uint32_t lane) {
 	const auto low = state.builder.AllocateId();

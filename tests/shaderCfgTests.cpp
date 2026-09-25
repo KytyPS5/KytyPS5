@@ -11027,6 +11027,49 @@ void TestSplitWave64PermlaneExecMaskSpirv() {
   CheckSpirvBinaryValidates(compiled.spirv);
 }
 
+void TestSplitWave64SwizzleDeclaresBallotCapability() {
+  using namespace ShaderRecompiler;
+  using O = IR::ValueOpcode;
+  IR::Program program;
+  program.stage = ShaderType::Compute;
+  program.wave_size = 64u;
+  auto *block = AddExecutionPlanBlock(program);
+  program.block_info[0].terminator.kind = CFG::TerminatorKind::Return;
+  auto &lane = block->AppendNewInst(O::LaneId);
+  // Guest barrier forces the multi-wave workgroup onto cooperative split wave64,
+  // matching the Yōtei path where DS swizzle emission previously emitted a bare
+  // OpGroupNonUniformBallot without CapabilityGroupNonUniformBallot.
+  block->AppendNewInst(O::Barrier);
+  auto &swizzled = block->AppendNewInst(O::SwizzleU32,
+                                        {IR::Value(&lane), IR::Value(0x00e0u),
+                                         IR::Value(true)});
+  block->AppendNewInst(O::ReferenceU32, {IR::Value(&swizzled)});
+  IR::ValidateProgram(program, true);
+  IR::BuildSrtPlan(program);
+  IR::TrackResources(program);
+
+  ShaderComputeInputInfo compute{};
+  compute.threads_num[0] = 128u;
+  compute.threads_num[1] = compute.threads_num[2] = 1u;
+  compute.wave_size = 64u;
+  compute.needs_lds_barriers = true;
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.wave_size = 64u;
+  options.input_info.compute = &compute;
+  options.compute_workgroup_limits = {{1024, 1024, 64}, 1024, 32, false};
+  const auto plan = PlanComputeExecution(
+      program, options.input_info, options.compute_workgroup_limits);
+  Check(plan.error.empty() && plan.IsCooperativeWave64(),
+        ("swizzle ballot fixture did not enter cooperative wave64: " + plan.error)
+            .c_str());
+  TranslateResult translated;
+  translated.program = std::move(program);
+  const auto compiled = CompileProgram(std::move(translated), options, {}, 0u);
+  Check(SpirvContainsCapability(compiled.spirv, 64u),
+        "split wave64 swizzle SPIR-V omitted CapabilityGroupNonUniformBallot");
+  CheckSpirvBinaryValidates(compiled.spirv);
+}
+
 void TestCooperativeWave64CrossBlockSpillReuse() {
   using F = CooperativeExecutionFixture;
   using O = F::O;
@@ -18086,6 +18129,11 @@ int main(int argc, char* argv[]) {
     std::puts("KYTY_SPLIT_WAVE64_PERMLANE_EXEC_PASS");
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--split-wave64-swizzle-ballot-only") == 0) {
+    Libs::Graphics::TestSplitWave64SwizzleDeclaresBallotCapability();
+    std::puts("KYTY_SPLIT_WAVE64_SWIZZLE_BALLOT_PASS");
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--gds-append-admission-only") == 0) {
     Libs::Graphics::TestComputeExecutionGdsAppendAdmission();
     std::puts("KYTY_GDS_APPEND_ADMISSION_PASS");
@@ -18337,6 +18385,7 @@ int main(int argc, char* argv[]) {
   TestCooperativeWave64ConsecutiveLdsReadsSharePhase();
   TestCooperativeWave64CollectivesUseSharedFunctions();
   TestSplitWave64PermlaneExecMaskSpirv();
+  TestSplitWave64SwizzleDeclaresBallotCapability();
   TestCooperativeWave64CrossBlockSpillReuse();
   TestCooperativeWave64BufferCycleVisibility();
   TestCooperativeWave64AutomaticBufferCyclePromotion();

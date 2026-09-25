@@ -390,6 +390,103 @@ endfunction()
 
 add_kyty_full_emulator_test(shader_cfg_tests "${KYTY_TESTS_DIR}/shaderCfgTests.cpp")
 
+# A test function that is defined but never called from main() silently provides no coverage, and
+# that had happened 43 times in this file. Work out which definitions have no call after main()
+# and fail the configure step when the result is not exactly the list documented below, so the gap
+# cannot grow unnoticed.
+#
+# These are knowingly dormant: each asserts decoder, translator or SPIR-V emission behaviour that
+# is not implemented yet. Wiring one up means implementing what it asserts rather than weakening
+# the assertion, and its name should be dropped from this list in the same change.
+set(kyty_shader_cfg_known_dormant
+	TestNewShaderRecompilerSopkWaitcntMarkers
+	TestNewShaderRecompilerRdna2ScalarOpcodes
+	TestNewShaderRecompilerScalarVectorAlu
+	TestNewShaderRecompilerMoreAluFamilies
+	TestNewShaderRecompilerExpandedAluBatch
+	TestNewShaderRecompilerVop3pPackedF16
+	TestNewShaderRecompilerStagedShaderOps
+	TestNewShaderRecompilerBootF16UnaryOpcodes
+	TestNewShaderRecompilerBootB16PackedAndSdwaOpcodes
+	TestNewShaderRecompilerScalarB64Alu
+	TestNewShaderRecompilerSignedCompareAlu
+	TestNewShaderRecompilerSignedMinShiftAlu
+	TestNewShaderRecompilerScalarBitfieldAlu
+	TestNewShaderRecompilerMemoryFamilyTranslation
+	TestNewShaderRecompilerImageQueryTranslation
+	TestNewShaderRecompilerCubeSampleCoordinates
+	TestNewShaderRecompilerImageSampleVariants
+	TestNewShaderRecompilerImageSampleA16SamplerCoords
+	TestNewShaderRecompilerImageSampleOpcodeAliases
+	TestNewShaderRecompilerImageSampleA16ExceptionComponents
+	TestNewShaderRecompilerImageLoadA16UintCoords
+	TestNewShaderRecompilerImageViewDimensions
+	TestNewShaderRecompilerStorageImage1DDescriptorVariants
+	TestNewShaderRecompilerNullImageUsesCanonical2DView
+	TestNewShaderRecompilerImageGatherVariants
+	TestNewShaderRecompilerImageLoadVariants
+	TestNewShaderRecompilerImageLoad2DMsaa
+	TestNewShaderRecompilerImageStoreTranslation
+	TestNewShaderRecompilerStorageImage3DDescriptorVariant
+	TestNewShaderRecompilerStorageImage2DDescriptorOverridesMimg3D
+	TestNewShaderRecompilerImageAtomicTranslation
+	TestNewShaderRecompilerVintrpTranslation
+	TestNewShaderRecompilerBufferSignedLoadTranslation
+	TestNewShaderRecompilerBufferSubDwordStoreTranslation
+	TestNewShaderRecompilerFlatOldBackedTranslation
+	TestNewShaderRecompilerFlatSignedLoadTranslation
+	TestNewShaderRecompilerFlatStoreTranslation
+	TestNewShaderRecompilerAtomicTranslation
+	TestNewShaderRecompilerDsSubDwordTranslation
+	TestNewShaderRecompilerDsSwizzleTranslation
+	TestNewShaderRecompilerDsAddtidTranslation
+	TestNewShaderRecompilerDsFloatMinMaxTranslation
+	TestNewShaderRecompilerExpVertexOutputs
+)
+file(READ "${KYTY_TESTS_DIR}/shaderCfgTests.cpp" kyty_shader_cfg_source)
+file(READ "${KYTY_TESTS_DIR}/ShaderRayTracingTests.inc" kyty_shader_cfg_included)
+# file(READ) alone does not make CMake reconfigure when the file is edited, so the guard would
+# only run when something unrelated touched the build. Register the sources as configure-time
+# dependencies to make editing them re-run it.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${KYTY_TESTS_DIR}/shaderCfgTests.cpp" "${KYTY_TESTS_DIR}/ShaderRayTracingTests.inc")
+# Only the "void TestName" prefix is matched, deliberately. CMake strips a backslash before "(" in
+# a quoted argument, so a pattern ending in an escaped paren pair silently degrades into an empty
+# capture group, and recovering the name would then need a backreference. Stripping the matched
+# prefix needs no backreference at all.
+string(REGEX MATCHALL "void[ \t]+Test[A-Za-z0-9_]+" kyty_shader_cfg_defined_raw "${kyty_shader_cfg_source}${kyty_shader_cfg_included}")
+string(REGEX REPLACE "void[ \t]+" "" kyty_shader_cfg_defined "${kyty_shader_cfg_defined_raw}")
+list(REMOVE_DUPLICATES kyty_shader_cfg_defined)
+# The calls live after main(). Each name is looked up directly instead of matching a call pattern,
+# so the check does not depend on how a call happens to be spelled.
+string(FIND "${kyty_shader_cfg_source}" "int main(" kyty_shader_cfg_main_pos)
+math(EXPR kyty_shader_cfg_main_pos "${kyty_shader_cfg_main_pos} - 1")
+string(SUBSTRING "${kyty_shader_cfg_source}" ${kyty_shader_cfg_main_pos} -1 kyty_shader_cfg_main)
+set(kyty_shader_cfg_dormant "")
+foreach(kyty_shader_cfg_name ${kyty_shader_cfg_defined})
+	string(FIND "${kyty_shader_cfg_main}" "${kyty_shader_cfg_name}();" kyty_shader_cfg_at)
+	if(kyty_shader_cfg_at EQUAL -1)
+		list(APPEND kyty_shader_cfg_dormant ${kyty_shader_cfg_name})
+	endif()
+endforeach()
+list(SORT kyty_shader_cfg_dormant)
+set(kyty_shader_cfg_known_dormant_sorted ${kyty_shader_cfg_known_dormant})
+list(SORT kyty_shader_cfg_known_dormant_sorted)
+if(NOT kyty_shader_cfg_dormant STREQUAL kyty_shader_cfg_known_dormant_sorted)
+	set(kyty_shader_cfg_unaccounted ${kyty_shader_cfg_dormant})
+	list(REMOVE_ITEM kyty_shader_cfg_unaccounted ${kyty_shader_cfg_known_dormant_sorted})
+	set(kyty_shader_cfg_resurrected ${kyty_shader_cfg_known_dormant_sorted})
+	list(REMOVE_ITEM kyty_shader_cfg_resurrected ${kyty_shader_cfg_dormant})
+	string(REPLACE ";" "\n  " kyty_shader_cfg_unaccounted_text "${kyty_shader_cfg_unaccounted}")
+	string(REPLACE ";" "\n  " kyty_shader_cfg_resurrected_text "${kyty_shader_cfg_resurrected}")
+	message(FATAL_ERROR
+		"tests/shaderCfgTests.cpp: the test functions defined but never called from main() do not"
+		" match kyty_shader_cfg_known_dormant.\n"
+		"  defined but never called, not in the list:\n  ${kyty_shader_cfg_unaccounted_text}\n"
+		"  in the list, but now called from main():\n  ${kyty_shader_cfg_resurrected_text}\n"
+		"Call every new test from main(), or add it to the list when it asserts behaviour that is"
+		" not implemented yet.")
+endif()
+
 add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ScalarProvenanceTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"

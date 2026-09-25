@@ -2646,6 +2646,36 @@ void TestModuleRelocationUsesWritableHostMapping() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestGuestFaultFrameAttribution() {
+	const char* test = "GuestFaultFrameAttribution";
+
+	// The point of the fault report is naming the module, so check the exact rendering
+	// instead of only that some text came out.
+	Check(test, Loader::FormatGuestFrame("libngs2.so", 0x900000000ull, 0x900001234ull) ==
+	                    "libngs2.so+0x0000000000001234",
+	      "attributed guest frame did not render as module+offset");
+	Check(test, Loader::FormatGuestFrame("libSndZAudio.so", 0x900f00000ull, 0x900f00000ull) ==
+	                    "libSndZAudio.so+0x0000000000000000",
+	      "guest frame at the module base lost its zero offset");
+	Check(test, Loader::FormatGuestFrame("libc.so", 0x0ull, 0xffffffffffffffffull) ==
+	                    "libc.so+0xffffffffffffffff",
+	      "guest frame at the top of the address space lost its offset");
+
+	// An unattributable address must render as nothing, so the caller can print
+	// module=<unknown> rather than an empty-looking label.
+	Check(test, Loader::FormatGuestFrame(nullptr, 0x900000000ull, 0x900001234ull).empty(),
+	      "null module name produced a frame label");
+	Check(test, Loader::FormatGuestFrame("", 0x900000000ull, 0x900001234ull).empty(),
+	      "empty module name produced a frame label");
+
+	// A caller that passes an address below the base must not print a wrapped offset.
+	Check(test, Loader::FormatGuestFrame("libfoo.so", 0x900001000ull, 0x900000000ull) ==
+	                    "libfoo.so+0x0000000000000000",
+	      "guest frame below the module base wrapped its offset");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 #if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 volatile sig_atomic_t g_rsqrt_traps = 0;
 
@@ -3162,6 +3192,7 @@ int main(int argc, char** argv) {
 	RunTest(TestMemoryPoolCommitDecommitQueryFlags);
 	RunTest(TestProgramMemoryAllocationAndProtection);
 	RunTest(TestModuleRelocationUsesWritableHostMapping);
+	RunTest(TestGuestFaultFrameAttribution);
 
 	if (g_failed_tests != 0) {
 		std::printf("VirtualMemoryAllocationTests: %d case(s) failed\n", g_failed_tests);

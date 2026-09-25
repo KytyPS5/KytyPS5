@@ -655,6 +655,35 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 	return true;
 }
 
+// Defined further down, next to the other module-name helpers.
+static std::string GetProgramModuleName(const Program* program);
+
+// Render an already-resolved frame. Kept free of loader state so the unit tests can drive it
+// directly. The offset is clamped because a wrapped value in a fatal report is worse than a
+// zero offset.
+std::string FormatGuestFrame(const char* module_name, uint64_t base_vaddr, uint64_t vaddr) {
+	const std::string name = module_name != nullptr ? std::string(module_name) : std::string();
+	if (name.empty()) {
+		return std::string();
+	}
+	char text[32];
+	std::snprintf(text, sizeof(text), "+0x%016" PRIx64,
+	              vaddr >= base_vaddr ? vaddr - base_vaddr : 0);
+	return name + text;
+}
+
+// Print "0x<addr> module+0xoffset", or "module=<unknown>" when the address is unattributable.
+static void ReportGuestAddress(RuntimeLinker* linker, uint64_t vaddr) {
+	Program* p = linker != nullptr ? linker->TryFindProgramByAddr(vaddr) : nullptr;
+	if (p == nullptr) {
+		std::printf("0x%016" PRIx64 " module=<unknown>\n", vaddr);
+		return;
+	}
+	const std::string name = GetProgramModuleName(p);
+	std::printf("0x%016" PRIx64 " %s\n", vaddr,
+	            FormatGuestFrame(name.c_str(), p->base_vaddr, vaddr).c_str());
+}
+
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
 	const auto* info = &exception_info;
 
@@ -695,6 +724,12 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		            info->rax, info->rbx, info->rcx, info->rdx, info->rsi, info->rdi, info->rbp,
 		            info->rsp, info->r8, info->r9, info->r10, info->r11, info->r12, info->r13,
 		            info->r14, info->r15);
+		// Name the module that faulted before anything else. Game-compatibility reports quote this
+		// log verbatim, and a bare address leaves the reader to guess which of the game's modules
+		// is at fault.
+		auto* linker = RuntimeLinker::Current();
+		std::printf("fault pc: ");
+		ReportGuestAddress(linker, info->exception_address);
 		if (IsReadableRange(info->exception_address - 48, 96)) {
 			const auto* code = reinterpret_cast<const uint8_t*>(info->exception_address - 48);
 			std::printf("code (pc-48 .. pc+48, fault at byte 48):");
@@ -703,11 +738,33 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			}
 			std::printf("\n");
 		}
+		// Walk the frame-pointer chain the way guest abort() does, so the report names the guest
+		// call chain instead of leaving a raw word dump. Guest code is not built with frame
+		// pointers everywhere, so an empty walk is a legitimate result, not a failure.
+		{
+			void*     frames[20];
+			const int depth =
+			    WalkGuestStack(info->rbp, info->rsp, frames, static_cast<int>(std::size(frames)));
+			std::printf("backtrace: %d frame(s)\n", depth);
+			for (int i = 0; i < depth; i++) {
+				std::printf("  #%d ", i);
+				ReportGuestAddress(linker, reinterpret_cast<uint64_t>(frames[i]));
+			}
+		}
 		if (IsReadableRange(info->rsp, 32 * sizeof(uint64_t))) {
 			const auto* stack = reinterpret_cast<const uint64_t*>(info->rsp);
 			std::printf("stack:");
 			for (int i = 0; i < 32; i++) {
-				std::printf("%s %016" PRIx64, (i % 4 == 0) ? "\n " : "", stack[i]);
+				// Annotate the words that resolve to a loaded module. The raw value is always
+				// printed, so an unresolved word stays as informative as it was before.
+				Program* p = linker != nullptr ? linker->TryFindProgramByAddr(stack[i]) : nullptr;
+				if (p != nullptr) {
+					const std::string name = GetProgramModuleName(p);
+					std::printf("%s %016" PRIx64 " <- %s", (i % 4 == 0) ? "\n " : "", stack[i],
+					            FormatGuestFrame(name.c_str(), p->base_vaddr, stack[i]).c_str());
+				} else {
+					std::printf("%s %016" PRIx64, (i % 4 == 0) ? "\n " : "", stack[i]);
+				}
 			}
 			std::printf("\n");
 		}
@@ -1178,12 +1235,20 @@ void RuntimeLinker::UnloadProgram(Program* program) {
 	DeleteProgram(program);
 }
 
+RuntimeLinker* RuntimeLinker::s_current = nullptr;
+
 RuntimeLinker::RuntimeLinker(): m_symbols(std::make_unique<SymbolDatabase>()) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	s_current = this;
 }
 
 RuntimeLinker::~RuntimeLinker() {
+	s_current = nullptr;
 	Clear();
+}
+
+RuntimeLinker* RuntimeLinker::Current() {
+	return s_current;
 }
 
 Program* RuntimeLinker::LoadProgram(const std::filesystem::path& elf_name) {
@@ -1493,6 +1558,42 @@ Program* RuntimeLinker::FindProgramByFileName(const std::filesystem::path& elf_n
 	}
 
 	return nullptr;
+}
+
+// Same segment walk as FindProgramByAddr, but usable from the fatal fault reporter: it takes
+// no lock when the linker is busy, tolerates a program whose Elf64 is not loaded yet and never
+// raises, so a crash report cannot hang or recurse inside its own handler.
+Program* RuntimeLinker::TryFindProgramByAddr(uint64_t vaddr) {
+	if (!m_mutex.TryLock()) {
+		return nullptr;
+	}
+	Program* found = nullptr;
+	for (auto* p: m_programs) {
+		if (p == nullptr || p->elf == nullptr) {
+			continue;
+		}
+		const auto* ehdr = p->elf->GetEhdr();
+		const auto* phdr = p->elf->GetPhdr();
+		if (ehdr == nullptr || phdr == nullptr) {
+			continue;
+		}
+		for (Elf64_Half i = 0; i < ehdr->e_phnum; i++) {
+			if (phdr[i].p_memsz != 0 &&
+			    (phdr[i].p_type == PT_LOAD || phdr[i].p_type == PT_OS_RELRO)) {
+				const uint64_t segment_addr = phdr[i].p_vaddr + p->base_vaddr;
+				const uint64_t segment_size = GetAlignedSize(phdr + i);
+				if (vaddr >= segment_addr && vaddr < segment_addr + segment_size) {
+					found = p;
+					break;
+				}
+			}
+		}
+		if (found != nullptr) {
+			break;
+		}
+	}
+	m_mutex.Unlock();
+	return found;
 }
 
 Program* RuntimeLinker::FindProgramByAddr(uint64_t vaddr) {

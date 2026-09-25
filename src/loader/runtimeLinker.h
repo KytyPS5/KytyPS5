@@ -144,6 +144,17 @@ public:
 
 	KYTY_CLASS_NO_COPY(RuntimeLinker);
 
+	// The live linker, or nullptr when nothing has been linked yet. Common::Singleton<>::
+	// Instance() constructs on demand, which the fatal fault reporter must not do: allocating
+	// inside an exception handler can fault again and wedge the reporting thread.
+	static RuntimeLinker* Current();
+
+	// FindProgramByAddr for fatal-diagnostic paths. Returns nullptr when m_mutex is held by
+	// another thread (a guest fault can land on a thread that already owns it) and skips
+	// programs that are still half-loaded. Never calls EXIT_* or dereferences a null Elf64,
+	// so it is safe to run from the exception handler.
+	Program* TryFindProgramByAddr(uint64_t vaddr);
+
 	void DbgDump(const std::string& folder);
 
 	Program* LoadProgram(const std::filesystem::path& elf_name);
@@ -201,7 +212,14 @@ private:
 	application_heap_malloc_func_t         m_application_heap_malloc         = nullptr;
 	application_heap_free_func_t           m_application_heap_free           = nullptr;
 	application_heap_posix_memalign_func_t m_application_heap_posix_memalign = nullptr;
+
+	static RuntimeLinker* s_current;
 };
+
+// Render a guest address as "module+0xoffset" for a fatal-diagnostic report, or an empty
+// string when the address could not be attributed to a module. Pure, so the unit tests cover
+// the formatting and the offset clamp without loading a program.
+std::string FormatGuestFrame(const char* module_name, uint64_t base_vaddr, uint64_t vaddr);
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 bool TestMainEntryUsesGuestStack();

@@ -549,8 +549,9 @@ uint32_t PackImageTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32
 
 uint32_t StoreTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t data,
                     Prospero::TextureNumericClass numeric_class) {
-	const bool integer = numeric_class == Prospero::TextureNumericClass::Uint || numeric_class == Prospero::TextureNumericClass::Sint;
-		const auto swizzle = ctx.state.program.info.images[mem.resource].shader_swizzle;
+	const bool integer = numeric_class == Prospero::TextureNumericClass::Uint ||
+	                     numeric_class == Prospero::TextureNumericClass::Sint;
+	const auto swizzle = ctx.state.program.info.images[mem.resource].shader_swizzle;
 	uint32_t   values[4] {};
 	const auto dmask = mem.dmask != 0u ? mem.dmask : 1u;
 	for (uint32_t component = 0; component < 4u; component++) {
@@ -570,16 +571,21 @@ uint32_t StoreTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t d
 				             ConstantU32(ctx.state, 0xffffu));
 			}
 		}
-		values[component] = integer ? raw
-		                    : mem.data_bits == 16u
-		                        ? EmitF16BitsToF32(ctx.state, raw)
-		                        : Unary(ctx.state, spv::OpBitcast, TypeF32(ctx.state), raw);
+		if (!integer) {
+			values[component] = mem.data_bits == 16u ? EmitF16BitsToF32(ctx.state, raw)
+			                                         : Unary(ctx.state, spv::OpBitcast, TypeF32(ctx.state),
+			                                                 raw);
+		} else if (numeric_class == Prospero::TextureNumericClass::Sint) {
+			// OpTypeImage Sampled Type is signed int; texel components must match.
+			values[component] = Unary(ctx.state, spv::OpBitcast, TypeI32(ctx.state), raw);
+		} else {
+			values[component] = raw;
+		}
 	}
 	const auto texel = ctx.state.builder.AllocateId();
 	ctx.state.builder.AddFunction(spv::OpCompositeConstruct,
-	                              integer ? TypeU32Vector(ctx.state, 4)
-	                                      : TypeF32Vector(ctx.state, 4),
-	                              texel, values[0], values[1], values[2], values[3]);
+	                              ImageVectorType(ctx.state, numeric_class, 4), texel, values[0],
+	                              values[1], values[2], values[3]);
 	return PackImageTexel(ctx, mem, texel);
 }
 

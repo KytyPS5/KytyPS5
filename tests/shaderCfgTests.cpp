@@ -6680,6 +6680,66 @@ void TestNewShaderRecompilerImageStoreTranslation() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+std::array<uint32_t, 64>
+StorageImageTestUserData(Prospero::BufferFormat format,
+                         Prospero::ImageType type = Prospero::ImageType::kColor2D) {
+	// ImageTestUserData fills dword2 with UINT32_MAX, which trips reserved-bit
+	// rejection and collapses to a null descriptor (Float Sampled Type). Storage
+	// numeric-class contracts need a ValidImageDescriptor with the guest format.
+	std::array<uint32_t, 64> data{};
+	data[0] = 0x1000u;
+	data[1] = static_cast<uint32_t>(format) << 20u;
+	data[2] = 255u | (255u << 14u);
+	data[3] = static_cast<uint32_t>(type) << 28u;
+	return data;
+}
+
+void TestNewShaderRecompilerSintStorageImageWriteTexelType() {
+	// Host binds signed R32 storage through a raw R32Uint view. Specialization must
+	// advertise Uint Sampled Type so OpImageWrite texels match (Yōtei CS 753c552f).
+	// Other Sint storage formats keep signed OpTypeImage and signed texel vectors.
+	const uint32_t shader[] = {
+	    EncodeMimg0(0x08, 0xf),
+	    EncodeMimg1(20, 0, 0, 4), // image_store
+	    0xbf810000u,
+	};
+	{
+		auto user_data = StorageImageTestUserData(Prospero::BufferFormat::k32SInt);
+		auto options = MakeCompileOptions(ShaderType::Compute);
+		options.user_data = user_data;
+		auto result = RecompileForTest(shader, options);
+		const auto cls = result.program.info.images.empty()
+		                     ? 99u
+		                     : static_cast<uint32_t>(result.program.info.images[0].numeric_class);
+		Check(result.program.info.images.size() == 1u &&
+		          result.program.info.images[0].numeric_class ==
+		              Prospero::TextureNumericClass::Uint &&
+		          result.program.info.images[0].resource_class ==
+		              ShaderRecompiler::IR::ImageResourceClass::Storage,
+		      ("R32 Sint storage was not specialized to the raw Uint host view; class=" +
+		       std::to_string(cls))
+		          .c_str());
+		Check(SpirvContainsOpcode(result.spirv, 99),
+		      "R32 Sint storage image store omitted OpImageWrite");
+		CheckSpirvBinaryValidates(result.spirv);
+	}
+	{
+		auto user_data = StorageImageTestUserData(Prospero::BufferFormat::k8_8_8_8SInt);
+		auto options = MakeCompileOptions(ShaderType::Compute);
+		options.user_data = user_data;
+		auto result = RecompileForTest(shader, options);
+		Check(result.program.info.images.size() == 1u &&
+		          result.program.info.images[0].numeric_class ==
+		              Prospero::TextureNumericClass::Sint &&
+		          result.program.info.images[0].resource_class ==
+		              ShaderRecompiler::IR::ImageResourceClass::Storage,
+		      "RGBA8 Sint storage lost signed Sampled Type metadata");
+		Check(SpirvContainsOpcode(result.spirv, 99),
+		      "RGBA8 Sint storage image store omitted OpImageWrite");
+		CheckSpirvBinaryValidates(result.spirv);
+	}
+}
+
 void TestNewShaderRecompilerStorageImage3DDescriptorVariant() {
   constexpr uint32_t ImageTypeColor3D = 10;
   constexpr uint32_t ImageFormatRgba16f = 71;
@@ -18044,6 +18104,11 @@ int main(int argc, char* argv[]) {
   if (argc == 2 && std::strcmp(argv[1], "--cooperative-pipeline-flags-only") == 0) {
     Libs::Graphics::TestCooperativePipelineDisablesDriverOptimization();
     std::puts("KYTY_COOPERATIVE_PIPELINE_FLAGS_PASS");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--sint-storage-image-write-only") == 0) {
+    Libs::Graphics::TestNewShaderRecompilerSintStorageImageWriteTexelType();
+    std::puts("KYTY_SINT_STORAGE_IMAGE_WRITE_PASS");
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--cooperative-guard-dominance-only") == 0) {

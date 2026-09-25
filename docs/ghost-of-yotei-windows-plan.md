@@ -3,8 +3,8 @@
 Обновлено **26 сентября 2026 года**. Игра: **Ghost of Yōtei, PPSA26344**.
 Рабочая ветка — `yotei-windows-bringup` в локальном fork `fxpw/KytyPS5`.
 
-Checkpoint cooperative Guard dominance + first shown frames **26 сентября 2026 года**,
-источник `9f383769` + dominance fix (рабочее дерево):
+Checkpoint R32 Sint storage ImageWrite + Guard dominance **26 сентября 2026 года**,
+источник `daa8b94a` + ImageWrite fix (рабочее дерево):
 
 1. После Ballot/`shown=250` run `da3924` fatal SPIR-V dominance на CS
    `5f3fdf61a7ca4a20`: `%658` в Guard then `%655` использовался в следующем
@@ -13,13 +13,19 @@ Checkpoint cooperative Guard dominance + first shown frames **26 сентябр�
    `--cooperative-guard-dominance-only`. Fix: spill каждого runtime leaf в
    cooperative + всегда reload из Function storage; `LoadBoundedFlatWord`
    экспортирует load через `OpPhi`. GREEN. Emit `5f3fdf61` words≈150584 без
-   dominance fail.
+   dominance fail. Коммит `daa8b94a`.
 2. Game retry `_Build/runs/yotei-integrated-20260925-222331-24108b`
    (SHA `29330c15…`, frame 280, `shown=103`): **`5f3fdf61` больше не блокирует**.
    Следующий fatal — CS `753c552fae650ec4`:
    `Expected Image 'Sampled Type' to be the same as Texel components`
-   на `OpImageWrite` (storage image Sampled=sint, texel=uint vec4).
-   Меню/gameplay **PENDING**.
+   на `OpImageWrite` (host binds `k32SInt` storage as `R32Uint`, specialization
+   kept Sint Sampled Type while StoreTexel emitted uint).
+3. RED `--sint-storage-image-write-only` без remap → `class=3` (Sint) на валидном
+   T#; GREEN после `k32SInt` storage → Uint Sampled Type в materialization +
+   StoreTexel bitcast/I32 vector для оставшихся Sint formats
+   (`KYTY_SINT_STORAGE_IMAGE_WRITE_PASS`). Меню/gameplay **PENDING** — нужен
+   game retry.
+4. Следующий шаг: install + long yotei retry; chase next fatal.
 
 Checkpoint materialization + VOPC `0xbd` + LDS atomic return + workgroup
 buffer descriptors + VOP2 DPP8 / split-wave64 Ballot **26 сентября 2026 года**,

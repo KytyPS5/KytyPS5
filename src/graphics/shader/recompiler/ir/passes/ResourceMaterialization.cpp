@@ -1921,8 +1921,13 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 		}
 		// Float image atomics use a CAS loop on raw R32Uint texels. Keep the
 		// specialized SPIR-V image type consistent with the host atomic view.
+		// Signed R32 storage likewise binds a raw R32Uint host view so bit-preserving
+		// image_store matches OpTypeImage Sampled Type with unsigned texels.
 		image.numeric_class = base.atomic ? Prospero::TextureNumericClass::Uint
 		                                  : Prospero::SampledTextureNumericClass(format);
+		if (storage && !base.atomic && format == Prospero::BufferFormat::k32SInt) {
+			image.numeric_class = Prospero::TextureNumericClass::Uint;
+		}
 
 		// Check if depth-compare is requested but format doesn't support it on Vulkan
 		if (base.depth_compare && !storage) {

@@ -14,6 +14,7 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cinttypes>
 #include <cstring>
 #include <memory>
@@ -108,10 +109,10 @@ void BufferCache::DeleteBuffer(BufferId id) {
 	}
 }
 
-bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
-	std::vector<vk::BufferCopy> copies;
-	uint64_t                    total_size     = 0;
-	const auto                  buffer_address = buffer.CpuAddress();
+bool BufferCache::CollectDownloadCopies(Buffer& buffer, uint64_t vaddr, uint64_t size,
+                                        std::vector<vk::BufferCopy>& copies,
+                                        uint64_t&                    total_size) {
+	const auto buffer_address = buffer.CpuAddress();
 	m_memory_tracker.ForEachDownloadRange<false>(
 	    vaddr, size, [&](uint64_t address, uint64_t bytes) noexcept {
 		    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, address, bytes,
@@ -123,7 +124,115 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		    });
 		    m_gpu_modified_ranges.Subtract(address, bytes);
 	    });
-	if (copies.empty()) {
+	return !copies.empty();
+}
+
+bool BufferCache::ReadbackSubmitted(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	std::vector<vk::BufferCopy> copies;
+	uint64_t                    total_size = 0;
+	if (!CollectDownloadCopies(buffer, vaddr, size, copies, total_size)) {
+		return false;
+	}
+	const auto [mapped, offset] = m_download_buffer.Map(total_size, 64);
+	if (mapped == nullptr) {
+		EXIT("BufferCache: download exceeds 64 MiB staging buffer capacity\n");
+	}
+	m_download_buffer.Commit();
+	for (auto& copy: copies) {
+		copy.dstOffset += offset;
+	}
+
+	const auto device = m_graphics.device;
+	if (m_readback_pool == nullptr) {
+		vk::CommandPoolCreateInfo pool_info {};
+		pool_info.flags            = vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
+		pool_info.queueFamilyIndex = m_graphics.queue_family;
+		EXIT_IF(device.createCommandPool(&pool_info, nullptr, &m_readback_pool) !=
+		        vk::Result::eSuccess);
+		vk::CommandBufferAllocateInfo alloc_info {};
+		alloc_info.commandPool        = m_readback_pool;
+		alloc_info.level              = vk::CommandBufferLevel::ePrimary;
+		alloc_info.commandBufferCount = 1;
+		EXIT_IF(device.allocateCommandBuffers(&alloc_info, &m_readback_command) !=
+		        vk::Result::eSuccess);
+		vk::SemaphoreTypeCreateInfo type_info {};
+		type_info.semaphoreType = vk::SemaphoreType::eTimeline;
+		vk::SemaphoreCreateInfo semaphore_info {};
+		semaphore_info.pNext = &type_info;
+		EXIT_IF(device.createSemaphore(&semaphore_info, nullptr, &m_readback_semaphore) !=
+		        vk::Result::eSuccess);
+	}
+
+	const auto command = m_readback_command;
+	command.reset({});
+	vk::CommandBufferBeginInfo begin_info {};
+	begin_info.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
+	EXIT_IF(command.begin(&begin_info) != vk::Result::eSuccess);
+	// A barrier's first scope covers everything submitted earlier to this queue, including the
+	// already submitted command buffers that wrote this range.
+	vk::BufferMemoryBarrier before {};
+	before.srcAccessMask       = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	before.dstAccessMask       = vk::AccessFlagBits::eTransferRead;
+	before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	before.buffer              = buffer.Handle();
+	before.offset              = 0;
+	before.size                = buffer.Size();
+	command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                        vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, &before, 0,
+	                        nullptr);
+	command.copyBuffer(buffer.Handle(), m_download_buffer.Handle(),
+	                   static_cast<uint32_t>(copies.size()), copies.data());
+	auto after          = before;
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eHostRead;
+	after.buffer        = m_download_buffer.Handle();
+	after.offset        = offset;
+	after.size          = total_size;
+	command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
+	                        {}, 0, nullptr, 1, &after, 0, nullptr);
+	EXIT_IF(command.end() != vk::Result::eSuccess);
+
+	const uint64_t                  signal_value = ++m_readback_tick;
+	vk::TimelineSemaphoreSubmitInfo timeline_info {};
+	timeline_info.signalSemaphoreValueCount = 1;
+	timeline_info.pSignalSemaphoreValues    = &signal_value;
+	vk::SubmitInfo submit_info {};
+	submit_info.pNext                = &timeline_info;
+	submit_info.commandBufferCount   = 1;
+	submit_info.pCommandBuffers      = &command;
+	submit_info.signalSemaphoreCount = 1;
+	submit_info.pSignalSemaphores    = &m_readback_semaphore;
+	{
+		Common::LockGuard lock(m_graphics.queue_mutex);
+		const auto        result = m_graphics.queue.submit(1, &submit_info, nullptr);
+		if (result != vk::Result::eSuccess) {
+			EXIT("BufferCache: readback submit failed: %s\n", vk::to_string(result).c_str());
+		}
+	}
+	vk::SemaphoreWaitInfo wait_info {};
+	wait_info.semaphoreCount = 1;
+	wait_info.pSemaphores    = &m_readback_semaphore;
+	wait_info.pValues        = &signal_value;
+	const auto wait_result   = device.waitSemaphores(&wait_info, UINT64_MAX);
+	if (wait_result != vk::Result::eSuccess) {
+		EXIT("BufferCache: readback wait failed: %s\n", vk::to_string(wait_result).c_str());
+	}
+
+	m_download_buffer.Invalidate(offset, total_size);
+	const auto buffer_address = buffer.CpuAddress();
+	for (const auto& copy: copies) {
+		Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
+		                                      mapped + (copy.dstOffset - offset), copy.size);
+	}
+	return true;
+}
+
+bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	std::vector<vk::BufferCopy> copies;
+	uint64_t                    total_size     = 0;
+	const auto                  buffer_address = buffer.CpuAddress();
+	if (!CollectDownloadCopies(buffer, vaddr, size, copies, total_size)) {
 		return false;
 	}
 
@@ -220,6 +329,10 @@ BufferCache::~BufferCache() {
 		}
 	}
 	m_buffers.clear();
+	if (m_readback_pool != nullptr) {
+		m_graphics.device.destroySemaphore(m_readback_semaphore, nullptr);
+		m_graphics.device.destroyCommandPool(m_readback_pool, nullptr);
+	}
 }
 
 void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
@@ -249,7 +362,14 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		const auto window_begin = std::max(Common::AlignDown(vaddr, WindowSize), buffer_begin);
 		const auto window_end = std::min(std::max(window_begin + WindowSize, vaddr + size), buffer_end);
 
-		if (DownloadBufferMemory(buffer, window_begin, window_end - window_begin)) {
+		// Experiment switch: KYTY_SLOW_READBACK=1 always drains the recording command buffer.
+		static const bool slow_readback = std::getenv("KYTY_SLOW_READBACK") != nullptr;
+		if (!slow_readback && buffer.last_gpu_write_tick < m_scheduler.CurrentTick()) {
+			if (ReadbackSubmitted(buffer, window_begin, window_end - window_begin)) {
+				m_memory_tracker.UnmarkRegionAsGpuModified(window_begin,
+				                                           window_end - window_begin);
+			}
+		} else if (DownloadBufferMemory(buffer, window_begin, window_end - window_begin)) {
 			const auto tick = m_scheduler.CurrentTick();
 			m_scheduler.Wait(tick);
 			m_scheduler.WaitPriorityOperations(tick);
@@ -356,6 +476,8 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 		const auto old_id = (it++)->second;
 		JoinOverlap(id, old_id, !overlap.has_stream_leap);
 	}
+	// Merged contents are copied by the command buffer being recorded.
+	m_slot_buffers[id].last_gpu_write_tick = m_scheduler.CurrentTick();
 	Register(id);
 	return id;
 }
@@ -462,6 +584,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
+		buffer.last_gpu_write_tick = m_scheduler.CurrentTick();
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }

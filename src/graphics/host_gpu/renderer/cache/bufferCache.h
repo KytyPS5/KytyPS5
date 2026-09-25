@@ -107,6 +107,12 @@ private:
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	// Queues backing publication; callers wait before clearing dirty pages or reusing their data.
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool CollectDownloadCopies(Buffer& buffer, uint64_t vaddr, uint64_t size,
+	                                         std::vector<vk::BufferCopy>& copies,
+	                                         uint64_t&                    total_size);
+	// Reads back GPU writes that were already submitted on a separate command buffer, so the
+	// CPU waits only for that work instead of flushing and draining the one being recorded.
+	[[nodiscard]] bool ReadbackSubmitted(Buffer& buffer, uint64_t vaddr, uint64_t size);
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
@@ -128,6 +134,10 @@ private:
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;
+	vk::CommandPool   m_readback_pool      = nullptr;
+	vk::CommandBuffer m_readback_command   = nullptr;
+	vk::Semaphore     m_readback_semaphore = nullptr;
+	uint64_t          m_readback_tick      = 0;
 };
 
 } // namespace Libs::Graphics

@@ -72,6 +72,8 @@ public:
 	bool   is_deleted   = false;
 	int    stream_score = 0;
 	size_t lru_id       = 0;
+	// Tick of the last command buffer that may have written this buffer on the GPU.
+	uint64_t last_gpu_write_tick = 0;
 
 protected:
 	[[nodiscard]] GraphicContext&   Graphics() const noexcept { return *m_graphics; }

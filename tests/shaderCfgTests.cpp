@@ -5933,6 +5933,61 @@ void TestNewShaderRecompilerImageAtomicTranslation() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestNewShaderRecompilerImageFloatAtomicTranslation() {
+  const uint32_t shader[] = {
+      EncodeMimg0(0x1e, 0x1, true),
+      EncodeMimg1(58, 0, 0, 1), // image_atomic_fmin
+      EncodeMimg0(0x1f, 0x1, true),
+      EncodeMimg1(59, 0, 0, 1), // image_atomic_fmax
+      0xbf810000u,
+  };
+
+  auto user_data = ImageTestUserData();
+  // A k32Float storage descriptor must still be accepted for atomic images: the
+  // R32ui ABI keeps float min/max bit-exact through an integer compare-exchange.
+  SetImageTestFormat(&user_data, 0, Prospero::BufferFormat::k32Float);
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+  options.user_data = user_data;
+
+  auto result = RecompileForTest(shader, options);
+  Check((result.decoded_dump.find("IMAGE_ATOMIC_FMIN") != std::string::npos),
+        "new decoder did not decode MIMG image atomic fmin");
+  Check((result.decoded_dump.find("IMAGE_ATOMIC_FMAX") != std::string::npos),
+        "new decoder did not decode MIMG image atomic fmax");
+  Check((result.ir_dump.find("ImageAtomicFMin32") != std::string::npos),
+        "image_atomic_fmin did not lower to float image atomic IR");
+  Check((result.ir_dump.find("ImageAtomicFMax32") != std::string::npos),
+        "image_atomic_fmax did not lower to float image atomic IR");
+  Check(!result.program.info.images.empty() &&
+            result.program.info.images[0].atomic &&
+            result.program.info.images[0].numeric_class ==
+                Prospero::TextureNumericClass::Uint,
+        "k32Float atomic image did not keep the uint storage-image ABI");
+  Check(SpirvContainsOpcode(result.spirv, 60),
+        "float image atomic SPIR-V binary does not contain OpImageTexelPointer");
+  Check(SpirvContainsOpcode(result.spirv, 230),
+        "float image atomic SPIR-V binary does not contain "
+        "OpAtomicCompareExchange");
+  Check(SpirvContainsOpcode(result.spirv, 227),
+        "float image atomic SPIR-V binary does not contain OpAtomicLoad");
+  Check(SpirvContainsOpcode(result.spirv, 225),
+        "float image atomic SPIR-V binary does not contain OpMemoryBarrier");
+  const auto source = DisassembleSpirvBinary(result.spirv);
+  Check((source.find("R32ui") != std::string::npos),
+        "float image atomic SPIR-V is not an R32ui storage image");
+  // Ordered float min/max must not fall back to a direct integer atomic.
+  Check(!SpirvContainsOpcode(result.spirv, 229) &&
+            !SpirvContainsOpcode(result.spirv, 234) &&
+            !SpirvContainsOpcode(result.spirv, 237) &&
+            !SpirvContainsOpcode(result.spirv, 239) &&
+            !SpirvContainsOpcode(result.spirv, 240) &&
+            !SpirvContainsOpcode(result.spirv, 241) &&
+            !SpirvContainsOpcode(result.spirv, 242),
+        "float image atomic unexpectedly emitted a direct integer atomic");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
 void TestNewShaderRecompilerVintrpTranslation() {
   const uint32_t shader[] = {
       EncodeVintrp(0, 10, 1, 2, 4), // v_interp_p1_f32 v10, v4, attr1.z
@@ -13613,6 +13668,7 @@ int main() {
   TestNewShaderRecompilerCfgIfElse();
   TestNewShaderRecompilerCfgConsecutiveNativePhis();
   TestNewShaderRecompilerStructuredU64Phi();
+  TestNewShaderRecompilerImageFloatAtomicTranslation();
   TestNewShaderRecompilerCfgTerminalExitMergePS();
   TestNewShaderRecompilerCfgPostEndTargetMergePS();
   TestNewShaderRecompilerCfgLoopBreakContinue();

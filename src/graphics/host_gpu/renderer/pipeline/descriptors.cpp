@@ -334,9 +334,11 @@ void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	const bool uint_resource    = resource.numeric_class == Prospero::TextureNumericClass::Uint;
 	const bool raw_sint_storage = format == Prospero::BufferFormat::k32SInt && uint_resource &&
 	                              resource.written && !resource.read && !resource.atomic;
+	const bool float_atomic     = resource.atomic && uint_resource &&
+	                              format == Prospero::BufferFormat::k32Float;
 	const auto numeric_class = Prospero::SampledTextureNumericClass(format);
 	const bool format_ok =
-	    raw_sint_storage ||
+	    raw_sint_storage || float_atomic ||
 	    (numeric_class != Prospero::TextureNumericClass::Unsupported &&
 	     numeric_class != Prospero::TextureNumericClass::Sint &&
 	     uint_resource == (numeric_class == Prospero::TextureNumericClass::Uint) &&
@@ -640,9 +642,12 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 			pixel_format = depth_format->depth_attachment_format;
 		}
 	}
-	const auto storage_view_format = storage && format == Prospero::BufferFormat::k32SInt
-	                                     ? vk::Format::eR32Uint
-	                                     : SrgbStorageViewFormat(pixel_format);
+	const bool atomic_uint_view = storage &&
+	                              (resource.atomic && format == Prospero::BufferFormat::k32Float);
+	const auto storage_view_format =
+	    storage && (format == Prospero::BufferFormat::k32SInt || atomic_uint_view)
+	        ? vk::Format::eR32Uint
+	        : SrgbStorageViewFormat(pixel_format);
 	const auto view_format         = storage && storage_view_format != vk::Format::eUndefined
 	                                     ? storage_view_format
 	                                     : pixel_format;

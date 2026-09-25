@@ -271,6 +271,8 @@ inline constexpr auto EmitImageAtomicUMax32    = EmitImage;
 inline constexpr auto EmitImageAtomicAnd32     = EmitImage;
 inline constexpr auto EmitImageAtomicOr32      = EmitImage;
 inline constexpr auto EmitImageAtomicXor32     = EmitImage;
+inline constexpr auto EmitImageAtomicFMin32     = EmitImage;
+inline constexpr auto EmitImageAtomicFMax32     = EmitImage;
 void                  EmitUnreachable(ValueEmitContext& ctx, const IR::Inst& inst);
 inline constexpr auto EmitPhi                        = EmitUnreachable;
 inline constexpr auto EmitTessellationBase           = EmitUnreachable;

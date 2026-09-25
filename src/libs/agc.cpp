@@ -685,7 +685,9 @@ static void capture_registered_shader(const Shader& shader) {
 	static uint64_t registrations = 0;
 	const std::scoped_lock lock(capture_mutex);
 	registrations++;
+#if defined(__cpp_exceptions)
 	try {
+#endif
 		constexpr std::array stages {"cs", "ps", "gs", "hs", "gs_front", "hs_front",
 		                             "gs_back", "hs_back", "fs"};
 		const auto* stage = shader.type < stages.size() ? stages[shader.type] : "unknown";
@@ -844,10 +846,12 @@ static void capture_registered_shader(const Shader& shader) {
 		     " unique=%zu stage=%s hash=%016" PRIx64 " bytes=%u file=%s\n",
 		     registrations, captured.size(), stage, declared_hash != 0u ? declared_hash : content_hash,
 		     shader.shader_size, stem.c_str());
+#if defined(__cpp_exceptions)
 	} catch (const std::exception& error) {
 		LOGF("shader registration capture failed: registration=%" PRIu64 " reason=%s\n",
 		     registrations, error.what());
 	}
+#endif
 }
 
 int KYTY_SYSV_ABI AgcCreateShader(Shader** dst, void* header, const volatile void* code) {

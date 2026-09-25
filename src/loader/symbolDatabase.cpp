@@ -13,6 +13,13 @@ static std::string UpdateName(const std::string& str) {
 	return str.starts_with(LIB_PREFIX) ? Common::RemoveFirst(str, 6) : str;
 }
 
+static std::string NameTypeKey(const std::string& name, SymbolType type) {
+	std::string key = name;
+	key.push_back('\0');
+	key.push_back(static_cast<char>(type));
+	return key;
+}
+
 std::string SymbolDatabase::GenerateName(const SymbolResolve& s) {
 	auto library = UpdateName(s.library);
 	auto module  = UpdateName(s.module);
@@ -22,11 +29,7 @@ std::string SymbolDatabase::GenerateName(const SymbolResolve& s) {
 }
 
 void SymbolDatabase::Add(const SymbolResolve& s, uint64_t vaddr) {
-	SymbolRecord r {};
-	r.name  = GenerateName(s);
-	r.vaddr = vaddr;
-	m_map.insert_or_assign(r.name, m_symbols.size());
-	m_symbols.push_back(r);
+	Add(s, vaddr, {});
 }
 
 void SymbolDatabase::Add(const SymbolResolve& s, uint64_t vaddr, const std::string& dbg_name) {
@@ -35,6 +38,7 @@ void SymbolDatabase::Add(const SymbolResolve& s, uint64_t vaddr, const std::stri
 	r.vaddr    = vaddr;
 	r.dbg_name = dbg_name;
 	m_map.insert_or_assign(r.name, m_symbols.size());
+	m_name_type_map.try_emplace(NameTypeKey(s.name, s.type), m_symbols.size());
 	m_symbols.push_back(r);
 }
 
@@ -66,29 +70,12 @@ const SymbolRecord* SymbolDatabase::Find(const SymbolResolve& s) const {
 }
 
 const SymbolRecord* SymbolDatabase::FindByNid(const std::string& nid, SymbolType type) const {
-	auto prefix = nid + "[";
-	auto suffix = fmt::format("[{}]", magic_enum::enum_name(type));
-
-	for (const auto& symbol: m_symbols) {
-		if (symbol.name.starts_with(prefix) && symbol.name.ends_with(suffix)) {
-			return &symbol;
-		}
-	}
-
-	return nullptr;
+	auto it = m_name_type_map.find(NameTypeKey(nid, type));
+	return it == m_name_type_map.end() ? nullptr : &m_symbols[it->second];
 }
 
 const SymbolRecord* SymbolDatabase::FindByName(const std::string& name, SymbolType type) const {
-	auto prefix = name + "[";
-	auto suffix = fmt::format("[{}]", magic_enum::enum_name(type));
-
-	for (const auto& symbol: m_symbols) {
-		if (symbol.name.starts_with(prefix) && symbol.name.ends_with(suffix)) {
-			return &symbol;
-		}
-	}
-
-	return nullptr;
+	return FindByNid(name, type);
 }
 
 } // namespace Loader

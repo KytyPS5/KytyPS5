@@ -55,6 +55,8 @@ public:
 private:
 	std::vector<SymbolRecord>               m_symbols;
 	std::unordered_map<std::string, size_t> m_map;
+	// The first export with a given name and type wins, as in the original scan.
+	std::unordered_map<std::string, size_t> m_name_type_map;
 };
 
 } // namespace Loader

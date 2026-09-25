@@ -3,6 +3,18 @@
 Обновлено **25 сентября 2026 года**. Игра: **Ghost of Yōtei, PPSA26344**.
 Рабочая ветка — `yotei-windows-bringup` в локальном fork `fxpw/KytyPS5`.
 
+Checkpoint конфликтов draft [#497](https://github.com/KytyPS5/KytyPS5/pull/497)
+**25 сентября 2026 года**, head `e1c6502d`: влит реальный `upstream/main` до tip
+`5ce4f083` (NGS2/ATRAC9 audio, void translator dispatch, `V_CMPX_O_F32`, sync/EOP
+и прочие коммиты main после `5a705dd`). Конфликты с bringup разрешены без
+title/hash branching: void/`Logical*` SAVEEXEC и NGS2-тесты взяты с main;
+CMPX/F64 покрытие и address-backed/`protected_image` materialization сохранены.
+GitHub: `mergeable=true`, `mergeable_state=unstable` (CI, не dirty). Случайный
+gitlink `3rdparty/SDL2` из merge убран отдельным коммитом. Новые rendered frames,
+меню и gameplay на этой ревизии **PENDING**; игровой blocker по-прежнему
+address-backed **buffer** `86da5eb7…` (см. ниже). Обзор полезных внешних PR —
+`docs/open-pr-usefulness-review.md`.
+
 Checkpoint интеграции upstream PR #811 **25 сентября 2026 года**: конфликты с
 текущей архитектурой resource plan/materialization разрешены без потери
 `memory_limit_dword`, bounded SRT, cooperative wave64 и прочих локальных полей.

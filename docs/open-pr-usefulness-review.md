@@ -1,6 +1,54 @@
-Дата обзора: **8 сентября 2026 года**
+Дата обзора: **8 сентября 2026 года** · обновление статуса: **25 сентября 2026**
 
 # Открытые PR KytyPS5: что полезно для текущего bring-up
+
+## Обновление 25 сентября 2026
+
+Снимок не пересобирает весь каталог из 68 PR: ниже — дельта относительно
+текущей ветки `yotei-windows-bringup` @ `e1c6502d` (draft
+[#497](https://github.com/KytyPS5/KytyPS5/pull/497), base `main` tip `5ce4f083`).
+#497 снова **mergeable** после merge `upstream/main`; `mergeable_state=unstable`
+означает CI, не конфликты. Игровой blocker: address-backed **buffer**
+`86da5eb7…` (image side #811 уже в ветке). Меню/gameplay **PENDING**.
+
+### Уже в текущей ветке (не тащить повторно)
+
+| Источник | Статус |
+| --- | --- |
+| [#497](https://github.com/KytyPS5/KytyPS5/pull/497) | **current integration:** head `e1c6502d`, synced to main `5ce4f083`. |
+| [#811](https://github.com/KytyPS5/KytyPS5/pull/811) address-backed images | **covered selectively** в `c1a4f853` (`record_key` / `protected_image` / `--address-backed-indirect-only` GREEN). Upstream PR ещё open и dirty vs main — целый re-merge не нужен; buffer-key класс остаётся нашим RED. |
+| Main tip `5ce4f083` и предшественники в merge | NGS2/ATRAC9 (#825 и соседние audio), void translator + `V_CMPX_O_F32`, sync/EOP, CFG/tests — уже в #497. |
+| Selective ports #798/#799/#812/#820 | Уже в ветке (см. plan); повтор не нужен. |
+
+### Смержены в upstream main после 20 сентября (полезные пересечения)
+
+Брать только если на ветке ещё нет эквивалента и есть свой RED; многие уже
+пришли через merge main в #497:
+
+- [#816](https://github.com/KytyPS5/KytyPS5/pull/816) `V_CMPX_EQ_U16` — ISA coverage рядом с нашим `V_CMPX_NE_U16` / O_F32; проверить corpus, не дублировать.
+- [#801](https://github.com/KytyPS5/KytyPS5/pull/801) live predicates / whole-quad — пересекается с WQM/cooperative; смотреть только при новом predicate RED.
+- [#790](https://github.com/KytyPS5/KytyPS5/pull/790)/[#794](https://github.com/KytyPS5/KytyPS5/pull/794) DS_INC/DEC и `DS_WRITE_B8_D16_HI` — LDS/GDS completeness; у нас уже есть live-return INC/DEC RTN для wave64.
+- [#807](https://github.com/KytyPS5/KytyPS5/pull/807) hoist loop-invariant draw/attrib — **P2 performance**, после correctness.
+- [#825](https://github.com/KytyPS5/KytyPS5/pull/825)/[#822](https://github.com/KytyPS5/KytyPS5/pull/822) NGS2/AudioOut — уже в tip main / #497; не shader blocker.
+- [#772](https://github.com/KytyPS5/KytyPS5/pull/772)/[#511](https://github.com/KytyPS5/KytyPS5/pull/511)/[#679](https://github.com/KytyPS5/KytyPS5/pull/679) loader/kernel/timer — **separate/P2**, не кадр.
+- [#763](https://github.com/KytyPS5/KytyPS5/pull/763)/[#787](https://github.com/KytyPS5/KytyPS5/pull/787) resize/SDL3 — WSI/deps, не bring-up pixel.
+
+### Закрыты без merge (из старого P1-списка)
+
+- [#383](https://github.com/KytyPS5/KytyPS5/pull/383) heterogeneous images — **closed unmerged**; нужные подклассы у нас уже selective; не воскрешать целиком.
+- [#468](https://github.com/KytyPS5/KytyPS5/pull/468) `S_WQM_B32` — **closed unmerged**; numeric WQM на ветке шире; при новом decode gap — свой RED, не старый PR.
+- [#500](https://github.com/KytyPS5/KytyPS5/pull/500) Demon's Souls bundle — **closed unmerged**; по-прежнему **do not merge whole**.
+
+### Ещё открытые кандидаты (без полного re-triage)
+
+Очередь correctness для текущего blocker не меняется: address-backed **buffer**
+descriptor / tracking, затем соседние resource frontiers. Из старого списка по
+GitHub на 25.09 ещё open как минимум [#506](https://github.com/KytyPS5/KytyPS5/pull/506)
+(FPS/scheduling, dirty, split-first) и [#811](https://github.com/KytyPS5/KytyPS5/pull/811)
+(image side уже покрыт). Полный каталог ниже — исторический снимок 8.09; строки
+**covered**/**merged into main** выше имеют приоритет над таблицей.
+
+---
 
 Снимок GitHub: **68 открытых PR** на 8 сентября 2026 года. Два из них draft:
 [#470](https://github.com/KytyPS5/KytyPS5/pull/470) и
@@ -55,14 +103,15 @@ decoder gap `VOPC 0xbd` (`V_CMPX_NE_U16`) в frame 222. Checkpoint `5aaf3b4`
 исполняющегося кадра. Последующие shared fixes прошли MUBUF `0x87` и довели
 запуск до ненулевого loading spinner; полноценная сцена ещё не получена.
 
-Самые полезные следующие кандидаты:
+Самые полезные следующие кандидаты (**25.09**):
 
-1. **#383 — heterogeneous indirect images.** Нужные достигнутые sampled и storage
-   подклассы уже выборочно перенесены, synthetic/runtime GREEN; целый PR больше не
-   нужен. Оставшиеся hunks рассматривать только при новом exact RED.
-2. **#468 — `S_WQM_B32`.** Это подтверждённый decode gap двух shader manifests.
-   Нужен адаптированный numeric/raw-word вариант с RED/GREEN, а не прямой перенос
-   старой boolean-модели.
+0. **Address-backed buffer descriptor / tracking** (runtime blocker `86da5eb7…`).
+   Image side из #811 уже в ветке; нужен отдельный RED для buffer-key, не re-merge
+   #811. Это важнее любого старого open-PR из списка ниже.
+1. **#383 — heterogeneous indirect images.** Upstream **closed without merge**.
+   Нужные подклассы уже selective на ветке; целый PR не воскрешать.
+2. **#468 — `S_WQM_B32`.** Upstream **closed without merge**. Numeric WQM на ветке
+   шире; при новом decode gap — свой RED, не старый PR.
 3. **#373 — сохранение GPU-authored storage images при GC.** Это реальный общий
    класс потери единственной актуальной копии изображения и потенциальная причина
    чёрных/испорченных текстур. Он не доказан причиной текущего Yōtei-кадра, но
@@ -79,9 +128,11 @@ decoder gap `VOPC 0xbd` (`V_CMPX_NE_U16`) в frame 222. Checkpoint `5aaf3b4`
    мусорные vertex attributes. Нужны отдельные регрессии.
 7. **#420/#461/#483/#484/#506 — производительность.** Они не создадут правильный
    кадр, но могут существенно ускорить длинный поиск последовательных блокеров.
-   Сначала профилировать текущую ветку; #506 разделить как минимум на четыре
-   независимых изменения (RELEASE_MEM batching, GC threshold, read-only barrier,
-   block descriptor reads).
+   Сначала профилировать текущую ветку; #506 (ещё open, dirty) разделить как
+   минимум на четыре независимых изменения (RELEASE_MEM batching, GC threshold,
+   read-only barrier, block descriptor reads). Из смерженного main после 20.09
+   смотреть #807 (draw/attrib hoist) только как P2 после correctness; #801/#816
+   — только при новом predicate/CMPX RED.
 8. **#509 — только отдельные части.** Custom primitive-restart remap и устранение
    write-watcher accumulation заслуживают самостоятельных RED. Весь PR переносить
    нельзя: fallback reserved/invalid vertex selectors в ноль скрывает unsupported
@@ -167,7 +218,7 @@ decoder gap `VOPC 0xbd` (`V_CMPX_NE_U16`) в frame 222. Checkpoint `5aaf3b4`
 | [#376 BC storage aliases](https://github.com/KytyPS5/KytyPS5/pull/376) | **P2:** полезно для compressed storage aliases, но текущий целевой surface не BC. |
 | [#377 1D-array RT tests](https://github.com/KytyPS5/KytyPS5/pull/377) | **test:** production не меняет; хороший соседний regression test. |
 | [#379 ELF/SELF bounds](https://github.com/KytyPS5/KytyPS5/pull/379) | **P2/separate:** полезная loader hardening и retail aligned-tail compatibility; текущие модули уже загружаются. |
-| [#383 heterogeneous indirect images](https://github.com/KytyPS5/KytyPS5/pull/383) | **covered selectively:** достигнутые sampled dimension/swizzle и storage write specialization подклассы перенесены с более строгими current rules; не merge whole. |
+| [#383 heterogeneous indirect images](https://github.com/KytyPS5/KytyPS5/pull/383) | **closed unmerged (25.09) / covered selectively:** достигнутые sampled dimension/swizzle и storage write specialization подклассы уже на ветке; не воскрешать PR. |
 | [#402 library tracing flag](https://github.com/KytyPS5/KytyPS5/pull/402) | **diagnostic:** полезен для массовой диагностики library calls, без изменения guest behavior. |
 | [#403 NaN saturate](https://github.com/KytyPS5/KytyPS5/pull/403) | **P2:** корректная явная NaN semantics; пересекается с #430, выбрать один минимальный вариант после RED. |
 | [#409 unhandled crash reporting](https://github.com/KytyPS5/KytyPS5/pull/409) | **diagnostic P1:** ценно для длинных запусков и silent termination; проверить reentrancy/flush отдельно. |
@@ -196,7 +247,7 @@ decoder gap `VOPC 0xbd` (`V_CMPX_NE_U16`) в frame 222. Checkpoint `5aaf3b4`
 | [#464 vertex buffer descriptor size](https://github.com/KytyPS5/KytyPS5/pull/464) | **P1:** небольшой общий bounds fix, полезный против мусорных vertex attributes. |
 | [#465 removed ES/LS registers](https://github.com/KytyPS5/KytyPS5/pull/465) | **P2:** общий GFX10 register-hole fix, подтверждён другим title; не текущий Yōtei blocker. |
 | [#467 SSE4a EXTRQ/INSERTQ](https://github.com/KytyPS5/KytyPS5/pull/467) | **P2/separate:** полезная CPU/loader compatibility, если guest реально исполняет register forms. |
-| [#468 `S_WQM_B32`](https://github.com/KytyPS5/KytyPS5/pull/468) | **P1:** лучший подтверждённый следующий shader decode candidate; нужен numeric adaptation. |
+| [#468 `S_WQM_B32`](https://github.com/KytyPS5/KytyPS5/pull/468) | **closed unmerged (25.09):** numeric WQM на ветке шире старой boolean-модели; при новом decode gap — свой RED, не revive PR. |
 | [#470 EXEC/VCC ballots](https://github.com/KytyPS5/KytyPS5/pull/470) | **covered/draft:** текущая numeric split-wave64 модель шире; не накладывать старую ветку. |
 | [#473 SRT readable-region cache](https://github.com/KytyPS5/KytyPS5/pull/473) | **P2 performance:** ускоряет raw fallback; основной game path использует bounded callbacks, поэтому сначала профиль. |
 | [#476 sub-DWORD storage offsets](https://github.com/KytyPS5/KytyPS5/pull/476) | **covered/adapted:** текущая версия уже строже по admission и имеет overflow/atomic guards. |
@@ -206,8 +257,8 @@ decoder gap `VOPC 0xbd` (`V_CMPX_NE_U16`) в frame 222. Checkpoint `5aaf3b4`
 | [#488 minimized window crash](https://github.com/KytyPS5/KytyPS5/pull/488) | **P2/separate:** полезный WSI fix, но не влияет на обычный не-minimized запуск. |
 | [#490 float image atomics](https://github.com/KytyPS5/KytyPS5/pull/490) | **covered:** production semantics уже в ветке; текущий PR head лишь другая актуализация того же класса. |
 | [#493 opt-in BVH stub](https://github.com/KytyPS5/KytyPS5/pull/493) | **diagnostic only:** decode/message полезны; always-miss не является реализацией ray tracing и не нужен Yōtei сейчас. |
-| [#497 current Yōtei draft](https://github.com/KytyPS5/KytyPS5/pull/497) | **current integration:** checkpoint `f1776f0` закрывает `V_CMPX_NE_U16` и главный `6cc64dee…` CFG compile stall; runtime дошёл до MUBUF `0x87`, nonzero RGB pending. |
-| [#500 Demon's Souls shader work](https://github.com/KytyPS5/KytyPS5/pull/500) | **partly covered/do not merge whole:** часть уже перенесена; оставшиеся typed stores, indirect sync/dispatch, stencil upload и null handling брать только по отдельному RED. |
+| [#497 current Yōtei draft](https://github.com/KytyPS5/KytyPS5/pull/497) | **current integration (25.09):** head `e1c6502d`, mergeable vs main `5ce4f083`; #811 image side + main audio/translator in tree; runtime blocker address-backed buffer `86da5eb7…`; nonzero menu/gameplay still PENDING (spinner proven on older `96611fe`). |
+| [#500 Demon's Souls shader work](https://github.com/KytyPS5/KytyPS5/pull/500) | **closed unmerged (25.09) / partly covered:** часть уже перенесена; остаток только по отдельному RED, не revive whole. |
 | [#503 negative printf precision](https://github.com/KytyPS5/KytyPS5/pull/503) | **P2/separate:** корректный libc fix с хорошим focused coverage; не связан с renderer/shader failure. |
 | [#504 rejected-open descriptor leak](https://github.com/KytyPS5/KytyPS5/pull/504) | **P2/separate:** однострочный kernel cleanup с тестами; полезен глобально, не текущему run. |
 | [#506 GPU scheduling/cache FPS](https://github.com/KytyPS5/KytyPS5/pull/506) | **P1 performance after correctness, split first:** четыре полезных идеи, но они не устраняют измеренный shader-driver stall; разные correctness/race contracts, не cherry-pick одним блоком. |

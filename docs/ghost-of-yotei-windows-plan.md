@@ -3,8 +3,34 @@
 Обновлено **25 сентября 2026 года**. Игра: **Ghost of Yōtei, PPSA26344**.
 Рабочая ветка — `yotei-windows-bringup` в локальном fork `fxpw/KytyPS5`.
 
+Checkpoint materialization + VOPC `0xbd` restore **25 сентября 2026 года**,
+источник `ba8530b4` (поверх `6a58b494`):
+
+1. Indirect compute `DispatchIndirect` не передавал `guest_workgroups` в
+   `GetComputeProgram` / materialization. Workgroup-axis bounded SRT для CS
+   `40395313615abcc8` требовал реальных grid counts; direct path уже имел их.
+   Коммит `6a58b494` читает indirect args и вызывает `ComputeGuestWorkgroups`
+   до materialize. Run `_Build/runs/yotei-integrated-20260925-191542-2194df`
+   прошёл прежний Materialize fatal; следующий отказ — CFG unsupported
+   `VOPC 0xbd` на CS `a0c48e952fde451a` PC `0x228` (frame 209, VS7/PS6/CS56,
+   `shown=0`).
+2. Merge с upstream `5a705dd` вернул соседние `V_CMPX_{LT,EQ}_U16` (`0xb9`/`0xba`)
+   и вытеснил ранее добавленный `V_CMPX_NE_U16` (`0xbd`) из `VOPC_OPCODE_LIST`,
+   хотя translate/`IsVopcCompareExec` и focused test остались. RED:
+   `shader_cfg_tests --vopc-cmpx-ne-u16-only` →
+   `decoder rejected captured VOPC V_CMPX_NE_U16 fields`
+   (`_Build/logs/vopc-cmpx-ne-u16-red.*`). После восстановления `{0xbdu, …}` —
+   GREEN `KYTY_VOPC_CMPX_NE_U16_PASS`; сосед `--vopc-sdwa-cmpx-ge-i16-only` PASS.
+
+Предыдущие закрытые blockers (коммит `5af1cbb6`): ballot active-mask
+`86da5eb7`, SAVEEXEC `Logical*` `f00717de`, dedicated continue `7291c10b`,
+LDS u64/`shaderSharedInt64Atomics` `e94e0c58`. Меню/gameplay **PENDING**.
+Следующий шаг — native install + bounded GPUAV-lite retry; доказать проход
+`a0c48e952fde451a` и зафиксировать следующий fatal. Внешние PR целиком не
+мержились; correctness очередь — shared ISA/materialization, не #506/#373.
+
 Checkpoint ballot active-mask + SAVEEXEC + loop continue + LDS u64
-**25 сентября 2026 года** (dirty tree поверх `ab644239`): закрыты четыре
+**25 сентября 2026 года** (`5af1cbb6` поверх `ab644239`): закрыты четыре
 последовательных runtime blocker без title/hash branching.
 
 1. Address-backed **buffer** `86da5eb7…` PC `0x530`: `ProveActiveMaskNonempty`
@@ -34,12 +60,11 @@ Checkpoint ballot active-mask + SAVEEXEC + loop continue + LDS u64
    AccessChain; следующий отказ был VUID SharedInt64Atomics (до enable feature).
 
 Ограниченные GPUAV-lite retries: frame 173 (SAVEEXEC) → 178 (7291 CFG) → 193
-(e94e AccessChain) → 200 (SharedInt64 VUID) → 186 после enable feature.
+(e94e AccessChain) → 200 (SharedInt64 VUID) → 186 после enable feature →
+209 после indirect guest_workgroups (`2194df`, VOPC `0xbd`).
 Run `_Build/runs/yotei-integrated-20260925-183912-301bdc`: VS 7 / PS 6 / CS 55,
-`shown=0`, Fatal на `MaterializeResources` для CS `40395313615abcc8` (ImageWrite
-по SRT `GetImageResource` / ReadConst 0x92…0x99) в TrackResources. Меню/gameplay
-**PENDING**. Следующий шаг — RED materialization для этого image SRT без
-фиктивного binding. Внешние PR целиком не мержились: #811 image side уже в
+`shown=0`, Fatal на `MaterializeResources` для CS `40395313615abcc8` —
+**FIXED** в `6a58b494`. Внешние PR целиком не мержились: #811 image side уже в
 ветке; correctness очередь — текущие shared fixes, не #506/#373.
 
 Checkpoint конфликтов draft [#497](https://github.com/KytyPS5/KytyPS5/pull/497)

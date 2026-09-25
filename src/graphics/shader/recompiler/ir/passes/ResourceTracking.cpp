@@ -592,7 +592,7 @@ private:
 				return false;
 			}
 		}
-		descriptor.bounded_buffer.emplace();
+		descriptor.bounded_buffer = DescriptorSource::BoundedBuffer{};
 		descriptor.bounded_buffer->expression = true;
 		descriptor.bounded_buffer->selector_group =
 		    InternBoundedSelector(dependencies.front()->proof.index);
@@ -634,7 +634,7 @@ private:
 				return false;
 			}
 		}
-		descriptor.bounded_image.emplace();
+		descriptor.bounded_image = DescriptorSource::BoundedImage{};
 		descriptor.bounded_image->expression = true;
 		descriptor.bounded_image->selector_group =
 		    InternBoundedSelector(dependencies.front()->proof.index);
@@ -783,7 +783,7 @@ private:
 		if (!CollectWaveImageCandidates(values, candidates, visiting, completed) ||
 		    candidates.empty()) return false;
 
-		descriptor.bounded_image.emplace();
+		descriptor.bounded_image = DescriptorSource::BoundedImage{};
 		descriptor.bounded_image->wave_uniform = true;
 		descriptor.bounded_image->wave_candidates = std::move(candidates);
 		descriptor.bounded_image->key_arg = 0u;
@@ -948,7 +948,7 @@ private:
 		descriptor.dword_count = 4u;
 		descriptor.dwords.fill(Value(0u));
 		descriptor.dwords[0] = key;
-		descriptor.bounded_buffer.emplace();
+		descriptor.bounded_buffer = DescriptorSource::BoundedBuffer{};
 		descriptor.bounded_buffer->wave_uniform = true;
 		descriptor.bounded_buffer->wave_candidates.assign(candidates.begin(), candidates.end());
 		descriptor.bounded_buffer->key_arg = 0u;
@@ -988,7 +988,7 @@ private:
 				return false;
 			}
 		}
-		descriptor.bounded_sampler.emplace();
+		descriptor.bounded_sampler = DescriptorSource::BoundedSampler{};
 		descriptor.bounded_sampler->selector_group =
 		    InternBoundedSelector(dependencies.front()->proof.index);
 		for (const auto* dependency: dependencies)
@@ -1076,7 +1076,7 @@ private:
 		descriptor.dwords[2] = words[0]->proof.count;
 		for (uint32_t word = 3; word < descriptor.dword_count; ++word)
 			descriptor.dwords[word] = Value(0u);
-		descriptor.bounded_image.emplace();
+		descriptor.bounded_image = DescriptorSource::BoundedImage{};
 		descriptor.bounded_image->selector_group = InternBoundedSelector(words[0]->proof.index);
 		for (uint32_t word = 0; word < words.size(); ++word)
 			descriptor.bounded_image->reads[word] = words[word]->read_id;

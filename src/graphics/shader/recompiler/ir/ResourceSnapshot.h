@@ -16,6 +16,13 @@ struct DescriptorValue {
 	}
 };
 
+struct ResourceReadRange {
+	uint64_t address = 0;
+	uint64_t size    = 0;
+
+	bool operator==(const ResourceReadRange&) const = default;
+};
+
 enum class UniformFillKind { None, Buffer, Image };
 
 struct UniformFill {

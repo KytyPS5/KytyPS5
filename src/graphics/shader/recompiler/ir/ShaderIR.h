@@ -293,7 +293,7 @@ struct StageOutput {
 inline constexpr uint32_t FirstImageBinding           = 1u;
 inline constexpr uint32_t FirstComparisonImageBinding = 22u;
 inline constexpr uint32_t FirstStorageImageBinding    = 29u;
-inline constexpr uint32_t ImageBindingCount           = 43u;
+inline constexpr uint32_t ImageBindingCount           = 48u;
 
 enum class DescriptorBindingKind : uint32_t {
 	Buffers  = 0u,
@@ -652,6 +652,10 @@ struct UniformFillPlan {
 // Resource analysis retained by the shader cache. It owns immutable descriptor/SRT,
 // condition and fill values without translated blocks, plus reusable evaluation scratch.
 struct ResourcePlan {
+	static constexpr uint8_t FlatSlotOrdinary = 0u;
+	static constexpr uint8_t FlatSlotClean = 1u;
+	static constexpr uint8_t FlatSlotDeferred = 2u;
+
 	struct EvaluationContext {
 		struct Entry {
 			uint64_t value      = 0;
@@ -677,6 +681,7 @@ struct ResourcePlan {
 	std::list<Inst>                     value_storage;
 	std::vector<MemoryInfo>             memory_info;
 	std::vector<DescriptorSource>       descriptor_sources;
+	std::vector<uint32_t>               materialization_sources;
 	std::vector<ResourceBlock>          control_flow;
 	std::vector<SrtRead>                srt_reads;
 	std::vector<BoundedSrtRead>          bounded_srt_reads;
@@ -685,6 +690,7 @@ struct ResourcePlan {
 	std::vector<uint8_t>                clean_flat_slots;
 	bool                                requires_specialization_memory = false;
 	bool                                has_address_writes = false;
+	bool                                bounded_srt_reads_precede_writes = false;
 	bool                                srt_plan_complete          = false;
 	bool                                resource_tracking_complete = false;
 	ShaderInfo                          info;

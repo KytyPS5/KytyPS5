@@ -394,6 +394,7 @@ void CollectOutputs(const Program& program, ShaderStageInputInfo input_info, Sha
 		}
 	}
 	if (program.stage == ShaderType::Vertex) {
+		const auto* vertex = input_info.vertex;
 		if (vertex->linked_param_count > ShaderVertexInputInfo::PARAM_LINK_MAX) {
 			return Fail("vertex parameter link count is out of range");
 		}

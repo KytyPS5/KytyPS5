@@ -3,11 +3,17 @@
 
 #include <cstdint>
 
+struct SDL_Window;
+union SDL_Event;
+
 namespace Libs::Graphics {
 
-void HostInputInit();
-void HostInputKey(int key_code, bool down);
-void HostInputMouseButton(uint8_t mouse_button, bool down);
+void               HostInputInit(SDL_Window* window);
+void               HostInputShutdown();
+void               HostInputKey(int key_code, bool down);
+void               HostInputMouseButton(uint8_t mouse_button, bool down);
+void               HostInputToggleMouseToJoystick();
+[[nodiscard]] bool HostInputWaitEvent(SDL_Event* event);
 
 } // namespace Libs::Graphics
 

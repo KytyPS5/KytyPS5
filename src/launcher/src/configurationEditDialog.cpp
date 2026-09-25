@@ -1,21 +1,26 @@
 #include "configurationEditDialog.h"
 
+#include "common/emulatorConfig.h"
 #include "configuration.h"
 #include "mandatoryLineEdit.h"
+#include <SDL3/SDL.h>
 
 #include <QAbstractItemView>
 #include <QCheckBox>
 #include <QComboBox>
+#include <QCoreApplication>
 #include <QDir>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QLayout>
+#include <QLineEdit>
 #include <QListView>
 #include <QListWidget>
 #include <QMessageBox>
 #include <QPushButton>
+#include <QResizeEvent>
 #include <QSettings>
 #include <QSpinBox>
 #include <QStyle>
@@ -23,6 +28,11 @@
 #include <QTreeView>
 #include <QVBoxLayout>
 #include <QtAlgorithms>
+
+#if QT_CONFIG(vulkan)
+#include <QVulkanInstance>
+#include <QVulkanWindow>
+#endif
 
 #include "ui_configuration_edit_dialog.h"
 
@@ -98,12 +108,13 @@ ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* p
 	InitGameDirectories();
 
 	connect(m_ui->ok_button, &QPushButton::clicked, this, &ConfigurationEditDialog::save);
+	connect(m_ui->cancel_button, &QPushButton::clicked, this, &QDialog::reject);
 	connect(m_ui->clear_button, &QPushButton::clicked, this, &ConfigurationEditDialog::clear);
 	connect(m_ui->comboBox_shader_log_direction, &QComboBox::currentTextChanged, this,
 	        [this](const QString& text) {
-		        auto log = TextToEnum<Configuration::ShaderLogDirection>(text);
+		        auto log = TextToEnum<Configuration::LogDirection>(text);
 		        m_ui->lineEdit_shader_log_folder->setEnabled(
-		            log == Configuration::ShaderLogDirection::File);
+		            log == Configuration::LogDirection::File);
 	        });
 	connect(m_ui->checkBox_cmd_dump, &QCheckBox::toggled, this,
 	        [this](bool flag) { m_ui->lineEdit_cmd_dump_folder->setEnabled(flag); });
@@ -113,7 +124,10 @@ ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* p
 		        m_ui->lineEdit_printf_file->setEnabled(log == Configuration::LogDirection::File);
 	        });
 
-	layout()->setSizeConstraint(QLayout::SetFixedSize);
+	// Keep the controls at a usable minimum while allowing the settings window
+	// and its expanding fields to use any additional space the user gives them.
+	layout()->setSizeConstraint(QLayout::SetMinimumSize);
+	setSizeGripEnabled(true);
 
 	restoreGeometry(g_last_geometry);
 
@@ -152,8 +166,72 @@ static void ListInit(QComboBox* combo, T value) {
 }
 
 void ConfigurationEditDialog::Init(const Configuration& info) {
+	m_ui->lineEdit_user_name->setMaxLength(static_cast<int>(Config::MAX_USER_NAME_LENGTH));
+	m_ui->lineEdit_user_name->setText(info.user_name);
+	m_ui->spinBox_user_id->setValue(info.user_id);
+	auto* microphone = m_ui->comboBox_audio_input_device;
+	microphone->clear();
+	microphone->addItem(tr("None"), QString {});
+	microphone->setToolTip(tr("Microphone used by games. None supplies silence."));
+	if (SDL_InitSubSystem(SDL_INIT_AUDIO)) {
+		int                device_count = 0;
+		SDL_AudioDeviceID* devices      = SDL_GetAudioRecordingDevices(&device_count);
+		for (int i = 0; i < device_count; i++) {
+			if (const auto* device = SDL_GetAudioDeviceName(devices[i]); device != nullptr) {
+				const auto name = QString::fromUtf8(device);
+				if (microphone->findData(name) < 0) {
+					microphone->addItem(name, name);
+				}
+			}
+		}
+		SDL_free(devices);
+		SDL_QuitSubSystem(SDL_INIT_AUDIO);
+	} else {
+		microphone->setToolTip(tr("Microphones could not be listed: %1")
+		                           .arg(QString::fromUtf8(SDL_GetError())));
+	}
+	if (microphone->findData(info.audio_input_device) < 0) {
+		microphone->addItem(tr("%1 (unavailable)").arg(info.audio_input_device),
+		                    info.audio_input_device);
+	}
+	microphone->setCurrentIndex(microphone->findData(info.audio_input_device));
 	ListInit(m_ui->comboBox_screen_resolution, info.screen_resolution);
+	ListInit(m_ui->comboBox_present_mode, info.present_mode);
+	m_ui->comboBox_gpu->clear();
+	m_ui->comboBox_gpu->addItem(tr("Auto"));
+	// Keep Auto when Qt is built without Vulkan support.
+#if QT_CONFIG(vulkan)
+#if defined(__APPLE__)
+	if (!qEnvironmentVariableIsSet("QT_VULKAN_LIB")) {
+		const auto base    = QCoreApplication::applicationDirPath();
+		auto       library = base + "/libMoltenVK.dylib";
+		if (!QFileInfo::exists(library)) {
+			library = base + "/../Frameworks/libMoltenVK.dylib";
+		}
+		if (QFileInfo::exists(library)) {
+			qputenv("QT_VULKAN_LIB", library.toUtf8());
+		}
+	}
+#endif
+	QVulkanInstance instance;
+	instance.setApiVersion(QVersionNumber(1, 3, 0));
+#if !defined(__APPLE__) && QT_VERSION >= QT_VERSION_CHECK(6, 6, 0)
+	instance.setFlags(QVulkanInstance::NoPortabilityDrivers);
+#endif
+	if (instance.create()) {
+		QVulkanWindow window;
+		window.setVulkanInstance(&instance);
+		for (const auto& device: window.availablePhysicalDevices()) {
+			m_ui->comboBox_gpu->addItem(QString::fromUtf8(device.deviceName));
+		}
+	}
+#endif
+	m_ui->comboBox_gpu->setCurrentIndex(
+	    info.gpu_index >= 0 && info.gpu_index < m_ui->comboBox_gpu->count() - 1 ? info.gpu_index + 1
+	                                                                            : 0);
 	m_ui->checkBox_fullscreen->setChecked(info.fullscreen_enabled);
+	m_ui->checkBox_readback->setChecked(info.readback_linear_images);
+	m_ui->checkBox_tessellation->setChecked(info.tessellation_enabled);
 	m_ui->spinBox_vblank_frequency->setValue(info.vblank_frequency);
 	m_ui->comboBox_console_language->clear();
 	m_ui->comboBox_console_language->addItems(CONSOLE_LANGUAGE_NAMES);
@@ -164,6 +242,10 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->checkBox_shader_validation->setChecked(info.shader_validation_enabled);
 	m_ui->checkBox_vulkan_validation->setChecked(info.vulkan_validation_enabled);
 	m_ui->checkBox_renderdoc_capture->setChecked(info.renderdoc_enabled);
+	m_ui->checkBox_amd_cpu->setChecked(info.amd_cpu_enabled);
+#if defined(__APPLE__)
+	m_ui->checkBox_amd_cpu->setVisible(false);
+#endif
 #if defined(_WIN32)
 	m_ui->checkBox_red_zone_protection->setChecked(info.red_zone_protection_enabled);
 #else
@@ -173,7 +255,7 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	ListInit(m_ui->comboBox_shader_log_direction, info.shader_log_direction);
 	m_ui->lineEdit_shader_log_folder->setText(info.shader_log_folder);
 	m_ui->lineEdit_shader_log_folder->setEnabled(info.shader_log_direction ==
-	                                             Configuration::ShaderLogDirection::File);
+	                                             Configuration::LogDirection::File);
 	m_ui->checkBox_cmd_dump->setChecked(info.command_buffer_dump_enabled);
 	m_ui->lineEdit_cmd_dump_folder->setText(info.command_buffer_dump_folder);
 	m_ui->lineEdit_cmd_dump_folder->setEnabled(info.command_buffer_dump_enabled);
@@ -181,7 +263,7 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->lineEdit_printf_file->setText(info.printf_output_file);
 	m_ui->lineEdit_printf_file->setEnabled(info.printf_direction ==
 	                                       Configuration::LogDirection::File);
-	ListInit(m_ui->comboBox_profiler_direction, info.profiler_direction);
+	m_ui->checkBox_profiler->setChecked(info.profiler_enabled);
 }
 
 void ConfigurationEditDialog::InitGameDirectories() {
@@ -227,10 +309,6 @@ void ConfigurationEditDialog::InitGameDirectories() {
 	update_game_directory_buttons();
 }
 
-void ConfigurationEditDialog::SetTitle(const QString& str) {
-	setWindowTitle(str);
-}
-
 void ConfigurationEditDialog::SetGameDirectories(const QStringList& dirs) {
 	m_show_game_dirs = true;
 	m_game_dirs_list->clear();
@@ -242,7 +320,8 @@ void ConfigurationEditDialog::SetGameDirectories(const QStringList& dirs) {
 
 	m_game_dirs_group->setVisible(true);
 	update_game_directory_buttons();
-	adjustSize();
+	layout()->activate();
+	resize(size().expandedTo(minimumSizeHint()));
 }
 
 QStringList ConfigurationEditDialog::GetGameDirectories() const {
@@ -282,21 +361,35 @@ void ConfigurationEditDialog::moveEvent(QMoveEvent* event) {
 	g_last_geometry = saveGeometry();
 }
 
+void ConfigurationEditDialog::resizeEvent(QResizeEvent* event) {
+	QDialog::resizeEvent(event);
+	g_last_geometry = saveGeometry();
+}
+
 static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui) {
+	info.user_name = ui.lineEdit_user_name->text().trimmed();
+	info.user_id   = ui.spinBox_user_id->value();
+	info.audio_input_device = ui.comboBox_audio_input_device->currentData().toString();
 	info.screen_resolution =
 	    TextToEnum<Configuration::Resolution>(ui.comboBox_screen_resolution->currentText());
+	info.present_mode =
+	    TextToEnum<Configuration::PresentMode>(ui.comboBox_present_mode->currentText());
+	info.gpu_index                 = ui.comboBox_gpu->currentIndex() - 1;
 	info.fullscreen_enabled        = ui.checkBox_fullscreen->isChecked();
+	info.readback_linear_images    = ui.checkBox_readback->isChecked();
+	info.tessellation_enabled      = ui.checkBox_tessellation->isChecked();
 	info.vblank_frequency          = ui.spinBox_vblank_frequency->value();
 	info.console_language          = ui.comboBox_console_language->currentIndex();
 	info.vulkan_validation_enabled = ui.checkBox_vulkan_validation->isChecked();
 	info.shader_validation_enabled = ui.checkBox_shader_validation->isChecked();
 	info.renderdoc_enabled         = ui.checkBox_renderdoc_capture->isChecked();
+	info.amd_cpu_enabled           = ui.checkBox_amd_cpu->isChecked();
 #if defined(_WIN32)
 	info.red_zone_protection_enabled = ui.checkBox_red_zone_protection->isChecked();
 #endif
 	info.shader_optimization_type = TextToEnum<Configuration::ShaderOptimizationType>(
 	    ui.comboBox_shader_optimization_type->currentText());
-	info.shader_log_direction = TextToEnum<Configuration::ShaderLogDirection>(
+	info.shader_log_direction = TextToEnum<Configuration::LogDirection>(
 	    ui.comboBox_shader_log_direction->currentText());
 	info.shader_log_folder           = ui.lineEdit_shader_log_folder->text();
 	info.command_buffer_dump_enabled = ui.checkBox_cmd_dump->isChecked();
@@ -304,16 +397,7 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui) {
 	info.printf_direction =
 	    TextToEnum<Configuration::LogDirection>(ui.comboBox_printf_direction->currentText());
 	info.printf_output_file = ui.lineEdit_printf_file->text();
-	info.profiler_direction =
-	    TextToEnum<Configuration::ProfilerDirection>(ui.comboBox_profiler_direction->currentText());
-}
-
-void ConfigurationEditDialog::update_info() {
-	UpdateInfo(m_info, *m_ui);
-}
-
-void ConfigurationEditDialog::adjust_size() {
-	this->adjustSize();
+	info.profiler_enabled = ui.checkBox_profiler->isChecked();
 }
 
 void ConfigurationEditDialog::save() {
@@ -322,7 +406,20 @@ void ConfigurationEditDialog::save() {
 		return;
 	}
 
-	update_info();
+	const auto user_name = m_ui->lineEdit_user_name->text().trimmed();
+	if (user_name.isEmpty() || user_name.toUtf8().size() > Config::MAX_USER_NAME_LENGTH) {
+		QMessageBox::critical(this, tr("Save failed"),
+		                      tr("User name must contain 1-16 UTF-8 bytes"));
+		return;
+	}
+	m_ui->lineEdit_user_name->setText(user_name);
+	if (!Config::IsConfiguredUserIdValid(m_ui->spinBox_user_id->value())) {
+		QMessageBox::critical(this, tr("Save failed"),
+		                      tr("User ID cannot be 254 (everyone) or 255 (system)"));
+		return;
+	}
+
+	UpdateInfo(m_info, *m_ui);
 
 	emit accept();
 }

@@ -6,17 +6,11 @@
 #include <algorithm>
 #include <cstdint>
 #include <map>
-#include <vector>
 
 namespace Libs::Graphics {
 
 class RangeSet final {
 public:
-	struct Range {
-		uint64_t address = 0;
-		uint64_t size    = 0;
-	};
-
 	void Add(uint64_t address, uint64_t size) {
 		const auto end = End(address, size);
 		auto       it  = m_ranges.lower_bound(address);
@@ -53,10 +47,22 @@ public:
 		}
 	}
 
-	[[nodiscard]] std::vector<Range> Intersections(uint64_t address, uint64_t size) const {
-		std::vector<Range> result;
-		ForEachIntersection(address, size, [&result](Range range) { result.push_back(range); });
-		return result;
+	void Clear() { m_ranges.clear(); }
+
+	template <typename Func>
+	void ForEach(Func&& func) const {
+		for (const auto& [begin, end]: m_ranges) {
+			func(begin, end);
+		}
+	}
+
+	[[nodiscard]] bool Intersects(uint64_t address, uint64_t size) const {
+		const auto end = End(address, size);
+		auto       it  = m_ranges.lower_bound(address);
+		if (it != m_ranges.begin() && std::prev(it)->second > address) {
+			return true;
+		}
+		return it != m_ranges.end() && it->first < end;
 	}
 
 	[[nodiscard]] bool Contains(uint64_t address, uint64_t size) const {
@@ -70,7 +76,7 @@ public:
 	}
 
 	template <typename Func>
-	void ForEachIntersection(uint64_t address, uint64_t size, Func&& func) const {
+	void ForEachInRange(uint64_t address, uint64_t size, Func&& func) const {
 		const auto end = End(address, size);
 		auto       it  = m_ranges.upper_bound(address);
 		if (it != m_ranges.begin()) {
@@ -80,7 +86,7 @@ public:
 			const auto begin = std::max(address, it->first);
 			const auto last  = std::min(end, it->second);
 			if (begin < last) {
-				func(Range {begin, last - begin});
+				func(begin, last);
 			}
 		}
 	}
@@ -89,7 +95,7 @@ public:
 
 private:
 	static uint64_t End(uint64_t address, uint64_t size) {
-		if (address == 0 || size == 0 || size > UINT64_MAX - address) {
+		if (size == 0 || size > UINT64_MAX - address) {
 			EXIT("invalid range-set address or size\n");
 		}
 		return address + size;

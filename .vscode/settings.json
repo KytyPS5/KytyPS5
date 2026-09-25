@@ -2,15 +2,17 @@
     "cmake.sourceDirectory": "${workspaceFolder}",
     "cmake.buildDirectory": "${workspaceFolder}/_Build/vscode-clang",
     "cmake.generator": "Ninja",
+    "cmake.useVsDeveloperEnvironment": "always",
     "cmake.environment": {
         "CC": "clang-cl",
-        "CXX": "clang-cl",
-        "PATH": "${env:ProgramFiles}/Microsoft Visual Studio/18/Community/VC/Tools/Llvm/x64/bin;${env:ProgramFiles}/Microsoft Visual Studio/18/Community/Common7/IDE/CommonExtensions/Microsoft/CMake/Ninja;${env:PATH}"
+        "CXX": "clang-cl"
     },
     "cmake.configureSettings": {
         "CMAKE_C_COMPILER": "clang-cl",
         "CMAKE_CXX_COMPILER": "clang-cl",
         "CMAKE_PREFIX_PATH": "C:/Qt/6.11.0/msvc2022_64"
-    }
+    },
+    "C_Cpp.default.intelliSenseMode": "windows-clang-x64",
+    "C_Cpp.default.compileCommands": "${workspaceFolder}/_Build/vscode-clang/compile_commands.json",
+    "C_Cpp.default.cppStandard": "c++20"
 }
-

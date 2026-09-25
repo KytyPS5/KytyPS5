@@ -12,7 +12,24 @@ namespace ImageViewOps {
 
 [[nodiscard]] vk::ImageAspectFlags DepthAspectMask(vk::Format format);
 [[nodiscard]] bool                 FormatsCompatible(vk::Format base, vk::Format view) noexcept;
+
+[[nodiscard]] inline bool IsFormatDepthCompatible(vk::Format format) noexcept {
+	switch (format) {
+		case vk::Format::eD32Sfloat:
+		case vk::Format::eR32Sfloat:
+		case vk::Format::eR32Uint:
+		case vk::Format::eD16Unorm:
+		case vk::Format::eR16Unorm: return true;
+		default: return false;
+	}
+}
 } // namespace ImageViewOps
+
+[[nodiscard]] inline bool IsSupportedSampledDepthFormat(vk::Format image_format,
+                                                        vk::Format view_format) noexcept {
+	return DepthAspectTransferFormat(image_format) != vk::Format::eUndefined &&
+	       ImageViewOps::IsFormatDepthCompatible(view_format);
+}
 
 [[nodiscard]] inline bool IsValidImageSwizzle(uint32_t swizzle) noexcept {
 	if ((swizzle & ~0xfffu) != 0) {
@@ -75,32 +92,19 @@ SelectSampledColorView(vk::Format image_format, vk::Format view_format, uint32_t
 	}
 }
 
-[[nodiscard]] inline uint32_t
-SelectSampledDepthView(vk::Format image_format, vk::Format view_format, uint32_t swizzle) noexcept {
-	if (IsSupportedSampledDepthView(image_format, view_format, swizzle)) {
-		return swizzle;
-	}
-	EXIT("unsupported sampled depth image view: image_format=%d view_format=%d swizzle=0x%03x\n",
-	     static_cast<int>(image_format), static_cast<int>(view_format), swizzle);
-}
-
 [[nodiscard]] inline bool
 IsSupportedSampledDepthResource(const ShaderRecompiler::IR::ImageResource& resource) noexcept {
-	return resource.kind == ShaderRecompiler::IR::ResourceKind::Image &&
-	       (resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2D ||
-	        resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DArray ||
-	        resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaa ||
-	        resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaaArray) &&
-	       resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::None && resource.read &&
+	if (resource.resource_class != ShaderRecompiler::IR::ImageResourceClass::Sampled) {
+		return false;
+	}
+	if (resource.numeric_class == Prospero::TextureNumericClass::Unsupported) {
+		return false;
+	}
+	if (resource.numeric_class != Prospero::TextureNumericClass::Float && resource.depth_compare) {
+		return false;
+	}
+	return resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::None && resource.read &&
 	       !resource.written && !resource.atomic;
-}
-
-[[nodiscard]] inline bool
-IsSupportedSampledDepthUintResource(const ShaderRecompiler::IR::ImageResource& resource) noexcept {
-	return resource.kind == ShaderRecompiler::IR::ResourceKind::ImageUint &&
-	       resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2D &&
-	       resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::None && resource.read &&
-	       !resource.written && !resource.atomic && !resource.depth_compare;
 }
 
 inline void ValidateStorageColorView(vk::Format image_format, vk::Format view_format,
@@ -113,28 +117,33 @@ inline void ValidateStorageColorView(vk::Format image_format, vk::Format view_fo
 
 [[nodiscard]] inline bool
 IsSupportedStorageImageResource(const ShaderRecompiler::IR::ImageResource& resource) noexcept {
-	return (resource.kind == ShaderRecompiler::IR::ResourceKind::StorageImage ||
-	        resource.kind == ShaderRecompiler::IR::ResourceKind::StorageImageUint) &&
+	return resource.resource_class == ShaderRecompiler::IR::ImageResourceClass::Storage &&
+	       (resource.numeric_class == Prospero::TextureNumericClass::Float ||
+	        resource.numeric_class == Prospero::TextureNumericClass::Uint) &&
 	       (resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim1D ||
 	        resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim1DArray ||
 	        resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2D ||
 	        resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim3D ||
 	        resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DArray) &&
-	       resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::None && resource.written &&
+	       ((resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::None &&
+	         resource.mip_count == 1u) ||
+	        (resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::DynamicStorage &&
+	         resource.mip_count != 0u)) &&
+	       resource.written &&
 	       (!resource.atomic ||
-	        (resource.kind == ShaderRecompiler::IR::ResourceKind::StorageImageUint &&
-	         resource.read)) &&
+	        (resource.numeric_class == Prospero::TextureNumericClass::Uint && resource.read)) &&
 	       !resource.depth_compare;
 }
 
 inline void
 ValidateStorageImageResource(const ShaderRecompiler::IR::ImageResource& resource) noexcept {
 	if (!IsSupportedStorageImageResource(resource)) {
-		EXIT("unsupported storage color image resource: kind=%u dimension=%u mip=%u "
+		EXIT("unsupported storage color image resource: class=%u numeric=%u dimension=%u mip=%u "
 		     "read=%d written=%d atomic=%d depth_compare=%d\n",
-		     static_cast<uint32_t>(resource.kind), static_cast<uint32_t>(resource.dimension),
-		     static_cast<uint32_t>(resource.mip_mode), resource.read, resource.written,
-		     resource.atomic, resource.depth_compare);
+		     static_cast<uint32_t>(resource.resource_class),
+		     static_cast<uint32_t>(resource.numeric_class),
+		     static_cast<uint32_t>(resource.dimension), static_cast<uint32_t>(resource.mip_mode),
+		     resource.read, resource.written, resource.atomic, resource.depth_compare);
 	}
 }
 

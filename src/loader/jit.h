@@ -7,53 +7,6 @@ namespace Loader::Jit {
 
 #pragma pack(1)
 
-struct JmpWithIndex {
-	void SetIndex(uint32_t index) { *reinterpret_cast<uint32_t*>(&code[1]) = index; }
-
-	void SetFunc(void* handler) {
-		auto func_addr = reinterpret_cast<int64_t>(handler);
-		auto rip_addr  = reinterpret_cast<int64_t>(&code[10]);
-		auto offset64  = func_addr - rip_addr;
-		auto offset32  = static_cast<uint32_t>(static_cast<uint64_t>(offset64) & 0xffffffffu);
-
-		*reinterpret_cast<uint32_t*>(&code[6]) = offset32;
-	}
-
-	static uint64_t GetSize() { return 16; }
-
-	// 68 00 00 00 00          push     <index>
-	// E9 E0 FF FF FF          jmp      <handler>
-	uint8_t code[16] = {0x68, 0x00, 0x00, 0x00, 0x00, 0xE9, 0x00, 0x00,
-	                    0x00, 0x00, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
-};
-
-struct CallPlt {
-	explicit CallPlt(uint32_t table_size) {
-		for (uint32_t index = 0; index < table_size; index++) {
-			auto* c = new (&code[32] + JmpWithIndex::GetSize() * index) JmpWithIndex;
-			c->SetIndex(index);
-			c->SetFunc(this);
-		}
-	}
-
-	void SetPltGot(uint64_t vaddr) { *reinterpret_cast<uint64_t*>(&code[2]) = vaddr; }
-
-	uint64_t GetAddr(uint32_t index) {
-		return reinterpret_cast<uint64_t>(&code[32] + JmpWithIndex::GetSize() * index);
-	}
-
-	static uint64_t GetSize(uint32_t table_size) {
-		return 32 + JmpWithIndex::GetSize() * table_size;
-	}
-
-	// 0:  49 bb 88 77 66 55 44    movabs r11,0x1122334455667788
-	// 7:  33 22 11
-	// a:  41 ff 73 08             push   QWORD PTR [r11+0x8]
-	// e:  41 ff 63 10             jmp    QWORD PTR [r11+0x10]
-	uint8_t code[32] = {0x49, 0xBB, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x41, 0xFF,
-	                    0x73, 0x08, 0x41, 0xFF, 0x63, 0x10, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
-};
-
 struct JmpRax {
 	template <class Handler>
 	void SetFunc(Handler func) {
@@ -69,21 +22,22 @@ struct Call9 {
 	template <class Handler>
 	void SetFunc(Handler func) {
 		auto func_addr = reinterpret_cast<int64_t>(reinterpret_cast<void*>(func));
-		auto rip_addr  = reinterpret_cast<int64_t>(&code[5]);
+		auto rip_addr  = reinterpret_cast<int64_t>(&code[6]);
 		auto offset64  = func_addr - rip_addr;
 		auto offset32  = static_cast<uint32_t>(static_cast<uint64_t>(offset64) & 0xffffffffu);
 
-		*reinterpret_cast<uint32_t*>(&code[1]) = offset32;
+		*reinterpret_cast<uint32_t*>(&code[2]) = offset32;
 	}
 
-	void SetOutputReg(uint8_t reg) { code[7] = 0xc0u | (reg & 7u); }
+	void SetOutputReg(uint8_t reg) { code[8] = 0xc0u | (reg & 7u); }
 
 	static uint64_t GetSize() { return 9; }
 
-	// call func
+	// rex.w; call func
 	// mov rax,rax
-	// nop
-	uint8_t code[9] = {0xE8, 0x00, 0x00, 0x00, 0x00, 0x48, 0x89, 0xC0, 0x90};
+	// REX.W is required because AMD processors honor a retained 0x66 operand-size
+	// prefix on a near call and would otherwise execute callw.
+	uint8_t code[9] = {0x48, 0xE8, 0x00, 0x00, 0x00, 0x00, 0x48, 0x89, 0xC0};
 };
 
 struct TlsRegStub {

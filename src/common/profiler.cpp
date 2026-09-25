@@ -55,19 +55,13 @@ void SetThreadName(const char* name) {
 }
 
 void Initialize() {
-	switch (Config::GetProfilerDirection()) {
-		case Config::ProfilerDirection::Network:
-			if (!tracy::ProfilerAvailable()) {
-				tracy::StartupProfiler();
-				TracySetProgramName("KytyPS5");
-				::printf("Tracy profiler enabled: client %d.%d.%d, protocol %u, "
-				         "broadcast %u, connect to 127.0.0.1:8086\n",
-				         tracy::Version::Major, tracy::Version::Minor, tracy::Version::Patch,
-				         tracy::ProtocolVersion, tracy::BroadcastVersion);
-			}
-			break;
-		case Config::ProfilerDirection::None:
-		default: break;
+	if (Config::ProfilerEnabled() && !tracy::ProfilerAvailable()) {
+		tracy::StartupProfiler();
+		TracySetProgramName("KytyPS5");
+		::printf("Tracy profiler enabled: client %d.%d.%d, protocol %u, "
+		         "broadcast %u, connect to 127.0.0.1:8086\n",
+		         tracy::Version::Major, tracy::Version::Minor, tracy::Version::Patch,
+		         tracy::ProtocolVersion, tracy::BroadcastVersion);
 	}
 }
 

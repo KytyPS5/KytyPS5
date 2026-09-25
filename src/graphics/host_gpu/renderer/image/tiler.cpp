@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
+#include "common/alignment.h"
 #include "common/assert.h"
 #include "gpu_tiler_shaders/gpu_tiler_demote_d16_spv.h"
 #include "gpu_tiler_shaders/gpu_tiler_depth_spv.h"
@@ -40,7 +41,6 @@ TileManager::TileManager(GraphicContext& graphics, CommandScheduler& scheduler,
 	               nullptr};
 
 	vk::DescriptorSetLayoutCreateInfo descriptor_info {};
-	descriptor_info.sType        = vk::StructureType::eDescriptorSetLayoutCreateInfo;
 	descriptor_info.flags        = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
 	descriptor_info.bindingCount = static_cast<uint32_t>(bindings.size());
 	descriptor_info.pBindings    = bindings.data();
@@ -50,7 +50,6 @@ TileManager::TileManager(GraphicContext& graphics, CommandScheduler& scheduler,
 
 	const vk::PushConstantRange  push_range {vk::ShaderStageFlagBits::eCompute, 0, sizeof(Push)};
 	vk::PipelineLayoutCreateInfo layout_info {};
-	layout_info.sType                  = vk::StructureType::ePipelineLayoutCreateInfo;
 	layout_info.setLayoutCount         = 1;
 	layout_info.pSetLayouts            = &m_descriptor_layout;
 	layout_info.pushConstantRangeCount = 1;
@@ -92,11 +91,9 @@ TileManager::~TileManager() {
 TileManager::Scratch TileManager::AllocateScratch(uint64_t size) {
 	EXIT_IF(size == 0);
 	vk::BufferCreateInfo create {};
-	create.sType = vk::StructureType::eBufferCreateInfo;
 	create.size  = size;
 	create.usage = vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc |
 	               vk::BufferUsageFlagBits::eTransferDst;
-	create.sharingMode = vk::SharingMode::eExclusive;
 
 	VmaAllocationCreateInfo allocate {};
 	allocate.usage       = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
@@ -225,7 +222,7 @@ void TileManager::Prepare(bool tile, uint64_t tiled_capacity, uint64_t linear_ca
 
 	const uint64_t uniform_alignment =
 	    std::max<uint64_t>(limits.minUniformBufferOffsetAlignment, 1);
-	const uint64_t stride = (sizeof(Push) + uniform_alignment - 1) & ~(uniform_alignment - 1);
+	const uint64_t stride = Common::AlignUp<uint64_t>(sizeof(Push), uniform_alignment);
 	EXIT_NOT_IMPLEMENTED(dispatches.size() > UINT64_MAX / stride);
 	const uint64_t bytes  = dispatches.size() * stride;
 	auto [mapped, offset] = m_stream_buffer.Map(bytes, uniform_alignment);
@@ -263,21 +260,14 @@ vk::Pipeline TileManager::GetPipeline(uint32_t slot) {
 	const uint32_t                   values[] {1u << element_index, direction_index};
 	const vk::SpecializationMapEntry entries[] {{0, 0, 4}, {1, 4, 4}};
 	const vk::SpecializationInfo     specialization {2, entries, sizeof(values), values};
-	vk::ShaderModuleCreateInfo       module_info {};
-	module_info.sType       = vk::StructureType::eShaderModuleCreateInfo;
-	module_info.codeSize    = shaders[family_index].words * sizeof(uint32_t);
-	module_info.pCode       = shaders[family_index].code;
-	vk::ShaderModule module = nullptr;
-	RequireVulkanSuccess(m_graphics.device.createShaderModule(&module_info, nullptr, &module),
-	                     "create TileManager shader module");
+	const auto module =
+	    CompileSPV({shaders[family_index].code, shaders[family_index].words}, m_graphics.device);
 	vk::PipelineShaderStageCreateInfo stage {};
-	stage.sType               = vk::StructureType::ePipelineShaderStageCreateInfo;
 	stage.stage               = vk::ShaderStageFlagBits::eCompute;
 	stage.module              = module;
 	stage.pName               = "main";
 	stage.pSpecializationInfo = &specialization;
 	vk::ComputePipelineCreateInfo create {};
-	create.sType  = vk::StructureType::eComputePipelineCreateInfo;
 	create.stage  = stage;
 	create.layout = m_pipeline_layout;
 	const auto result =
@@ -287,19 +277,19 @@ vk::Pipeline TileManager::GetPipeline(uint32_t slot) {
 	return m_pipelines[slot];
 }
 
-void TileManager::Record(bool tile, vk::Buffer source, uint64_t source_offset,
+void TileManager::Record(vk::Buffer source, uint64_t source_offset,
                          uint64_t source_capacity, vk::Buffer target, uint64_t target_offset,
                          uint64_t target_capacity, std::span<Dispatch> dispatches,
                          bool clear_target) {
 	const auto&    limits = m_graphics.GetPhysicalDeviceProperties().limits;
 	const uint64_t descriptor_alignment =
 	    std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
-	const uint64_t source_descriptor_offset = source_offset & ~(descriptor_alignment - 1);
-	const uint64_t target_descriptor_offset = target_offset & ~(descriptor_alignment - 1);
+	const uint64_t source_descriptor_offset = Common::AlignDown(source_offset, descriptor_alignment);
+	const uint64_t target_descriptor_offset = Common::AlignDown(target_offset, descriptor_alignment);
 	const uint64_t source_base              = source_offset - source_descriptor_offset;
 	const uint64_t target_base              = target_offset - target_descriptor_offset;
-	const uint64_t source_range             = (source_base + source_capacity + 3u) & ~uint64_t {3};
-	const uint64_t target_range             = (target_base + target_capacity + 3u) & ~uint64_t {3};
+	const uint64_t source_range             = Common::AlignUp(source_base + source_capacity, 4);
+	const uint64_t target_range             = Common::AlignUp(target_base + target_capacity, 4);
 	EXIT_NOT_IMPLEMENTED(source_range > limits.maxStorageBufferRange ||
 	                     target_range > limits.maxStorageBufferRange || target_offset % 4 != 0 ||
 	                     target_capacity % 4 != 0);
@@ -307,7 +297,6 @@ void TileManager::Record(bool tile, vk::Buffer source, uint64_t source_offset,
 	m_scheduler.EndRendering();
 	auto                    command = m_scheduler.Current().Handle();
 	vk::BufferMemoryBarrier barriers[3] {};
-	barriers[0].sType         = vk::StructureType::eBufferMemoryBarrier;
 	barriers[0].srcAccessMask = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eHostWrite;
 	barriers[0].dstAccessMask = vk::AccessFlagBits::eShaderRead;
 	barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -316,7 +305,6 @@ void TileManager::Record(bool tile, vk::Buffer source, uint64_t source_offset,
 	barriers[0].offset              = source_offset;
 	barriers[0].size                = source_capacity;
 	barriers[1]                     = barriers[0];
-	barriers[1].srcAccessMask = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eHostWrite;
 	barriers[1].dstAccessMask =
 	    clear_target ? vk::AccessFlagBits::eTransferWrite
 	                 : vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
@@ -352,7 +340,6 @@ void TileManager::Record(bool tile, vk::Buffer source, uint64_t source_offset,
 		const vk::DescriptorBufferInfo        infos[] {source_info, target_info, params_info};
 		std::array<vk::WriteDescriptorSet, 3> writes {};
 		for (uint32_t index = 0; index < writes.size(); index++) {
-			writes[index].sType           = vk::StructureType::eWriteDescriptorSet;
 			writes[index].dstBinding      = index;
 			writes[index].descriptorCount = 1;
 			writes[index].descriptorType  = index == 2 ? vk::DescriptorType::eUniformBuffer
@@ -382,9 +369,9 @@ TileManager::Result TileManager::Detile(vk::Buffer tiled, uint64_t tiled_offset,
 	const uint64_t        source_base = tiled_offset & (descriptor_alignment - 1);
 	std::vector<Dispatch> dispatches;
 	Prepare(false, tiled_capacity, linear_capacity, infos, source_base, 0, dispatches);
-	auto scratch = AllocateScratch((linear_capacity + 3u) & ~uint64_t {3});
+	auto scratch = AllocateScratch(Common::AlignUp(linear_capacity, 4));
 	DeferDestroy(scratch);
-	Record(false, tiled, tiled_offset, tiled_capacity, scratch.buffer, 0, scratch.size, dispatches,
+	Record(tiled, tiled_offset, tiled_capacity, scratch.buffer, 0, scratch.size, dispatches,
 	       true);
 	return {scratch.buffer, 0, linear_capacity};
 }
@@ -399,7 +386,7 @@ void TileManager::Tile(vk::Buffer linear, uint64_t linear_offset, uint64_t linea
 	const uint64_t        target_base = tiled_offset & (descriptor_alignment - 1);
 	std::vector<Dispatch> dispatches;
 	Prepare(true, tiled_capacity, linear_capacity, infos, source_base, target_base, dispatches);
-	Record(true, linear, linear_offset, linear_capacity, tiled, tiled_offset, tiled_capacity,
+	Record(linear, linear_offset, linear_capacity, tiled, tiled_offset, tiled_capacity,
 	       dispatches, false);
 }
 
@@ -416,19 +403,19 @@ void TileManager::TileImage(Image& image, std::span<const vk::BufferImageCopy> r
 	// Reserve all stream parameters before creating a scheduler-lived scratch dependency:
 	// StreamBuffer::Map is allowed to submit the current tick when it wraps.
 	Prepare(true, tiled_capacity, linear_capacity, infos, 0, target_base, dispatches);
-	auto linear = AllocateScratch((linear_capacity + 3u) & ~uint64_t {3});
+	auto linear = AllocateScratch(Common::AlignUp(linear_capacity, 4));
 	DeferDestroy(linear);
 	image.Download(regions, linear.buffer, 0, linear.size);
 	Result source {linear.buffer, 0, linear.size};
 	if (transform == ColorTransform::SwapBgra16) {
 		source = SwapBgra16(source);
 	}
-	Record(true, source.buffer, source.offset, linear_capacity, tiled, tiled_offset, tiled_capacity,
+	Record(source.buffer, source.offset, linear_capacity, tiled, tiled_offset, tiled_capacity,
 	       dispatches, false);
 }
 
 TileManager::Result TileManager::GetScratchBuffer(uint64_t size) {
-	auto scratch = AllocateScratch((size + 3u) & ~uint64_t {3});
+	auto scratch = AllocateScratch(Common::AlignUp(size, 4));
 	DeferDestroy(scratch);
 	return {scratch.buffer, 0, scratch.size};
 }
@@ -436,11 +423,11 @@ TileManager::Result TileManager::GetScratchBuffer(uint64_t size) {
 TileManager::StorageBinding TileManager::BindStorage(Result buffer, uint64_t size) const {
 	const auto& limits            = m_graphics.GetPhysicalDeviceProperties().limits;
 	const auto  alignment         = std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
-	const auto  descriptor_offset = buffer.offset - buffer.offset % alignment;
+	const auto  descriptor_offset = Common::AlignDown(buffer.offset, alignment);
 	const auto  base              = buffer.offset - descriptor_offset;
 	EXIT_IF(buffer.buffer == nullptr || size == 0 || buffer.size < size || base > UINT32_MAX ||
 	        size > UINT64_MAX - base || base + size > UINT64_MAX - 3);
-	const auto range = (base + size + 3) & ~uint64_t {3};
+	const auto range = Common::AlignUp(base + size, 4);
 	EXIT_IF(range > limits.maxStorageBufferRange || range > UINT32_MAX);
 	return {{buffer.buffer, descriptor_offset, range}, static_cast<uint32_t>(base)};
 }
@@ -481,21 +468,13 @@ void TileManager::ConvertD16(Result source, Result target, D16Direction directio
 			code  = GPU_TILER_DEMOTE_D16_SPV;
 			words = std::size(GPU_TILER_DEMOTE_D16_SPV);
 		}
-		vk::ShaderModuleCreateInfo module_info {};
-		module_info.sType       = vk::StructureType::eShaderModuleCreateInfo;
-		module_info.codeSize    = words * sizeof(uint32_t);
-		module_info.pCode       = code;
-		vk::ShaderModule module = nullptr;
-		RequireVulkanSuccess(m_graphics.device.createShaderModule(&module_info, nullptr, &module),
-		                     "create D16 conversion shader module");
+		const auto module = CompileSPV({code, words}, m_graphics.device);
 		vk::PipelineShaderStageCreateInfo stage {};
-		stage.sType               = vk::StructureType::ePipelineShaderStageCreateInfo;
 		stage.stage               = vk::ShaderStageFlagBits::eCompute;
 		stage.module              = module;
 		stage.pName               = "main";
 		stage.pSpecializationInfo = &specialization;
 		vk::ComputePipelineCreateInfo create {};
-		create.sType  = vk::StructureType::eComputePipelineCreateInfo;
 		create.stage  = stage;
 		create.layout = m_pipeline_layout;
 		const auto result =
@@ -525,14 +504,13 @@ void TileManager::ConvertD16(Result source, Result target, D16Direction directio
 	const auto target_required = required(layout.height, layout.layers, layout.target_row_stride,
 	                                      layout.target_slice_stride, target_active);
 	EXIT_IF(source_required > UINT64_MAX - 3 || target_required > UINT64_MAX - 3);
-	const auto source_barrier_size = (source_required + 3) & ~uint64_t {3};
-	const auto target_barrier_size = (target_required + 3) & ~uint64_t {3};
+	const auto source_barrier_size = Common::AlignUp(source_required, 4);
+	const auto target_barrier_size = Common::AlignUp(target_required, 4);
 	EXIT_IF(source.size < source_barrier_size || target.size < target_barrier_size);
 
 	m_scheduler.EndRendering();
 	auto                    command = m_scheduler.Current().Handle();
 	vk::BufferMemoryBarrier barriers[2] {};
-	barriers[0].sType               = vk::StructureType::eBufferMemoryBarrier;
 	barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	barriers[0].buffer              = source.buffer;
@@ -542,7 +520,6 @@ void TileManager::ConvertD16(Result source, Result target, D16Direction directio
 	                            vk::AccessFlagBits::eTransferWrite |
 	                            vk::AccessFlagBits::eShaderWrite;
 	barriers[0].dstAccessMask = vk::AccessFlagBits::eShaderRead;
-	barriers[1].sType         = vk::StructureType::eBufferMemoryBarrier;
 	barriers[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	barriers[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	barriers[1].buffer              = target.buffer;
@@ -596,7 +573,6 @@ void TileManager::ConvertD16(Result source, Result target, D16Direction directio
 			};
 			std::array<vk::WriteDescriptorSet, 2> writes {};
 			for (uint32_t index = 0; index < writes.size(); index++) {
-				writes[index].sType           = vk::StructureType::eWriteDescriptorSet;
 				writes[index].dstBinding      = index;
 				writes[index].descriptorCount = 1;
 				writes[index].descriptorType  = vk::DescriptorType::eStorageBuffer;
@@ -626,20 +602,12 @@ void TileManager::ConvertD16(Result source, Result target, D16Direction directio
 
 void TileManager::SwapBgra16(Result input, Result output, uint32_t pixels) {
 	if (m_swap_bgra16 == nullptr) {
-		vk::ShaderModuleCreateInfo module_info {};
-		module_info.sType       = vk::StructureType::eShaderModuleCreateInfo;
-		module_info.codeSize    = std::size(GPU_TILER_SWAP_BGRA16_SPV) * sizeof(uint32_t);
-		module_info.pCode       = GPU_TILER_SWAP_BGRA16_SPV;
-		vk::ShaderModule module = nullptr;
-		RequireVulkanSuccess(m_graphics.device.createShaderModule(&module_info, nullptr, &module),
-		                     "create BGRA16 swap shader module");
+		const auto module = CompileSPV(GPU_TILER_SWAP_BGRA16_SPV, m_graphics.device);
 		vk::PipelineShaderStageCreateInfo stage {};
-		stage.sType  = vk::StructureType::ePipelineShaderStageCreateInfo;
 		stage.stage  = vk::ShaderStageFlagBits::eCompute;
 		stage.module = module;
 		stage.pName  = "main";
 		vk::ComputePipelineCreateInfo create {};
-		create.sType  = vk::StructureType::eComputePipelineCreateInfo;
 		create.stage  = stage;
 		create.layout = m_pipeline_layout;
 		const auto result =
@@ -658,7 +626,6 @@ void TileManager::SwapBgra16(Result input, Result output, uint32_t pixels) {
 	};
 	std::array<vk::WriteDescriptorSet, 2> writes {};
 	for (uint32_t index = 0; index < writes.size(); index++) {
-		writes[index].sType           = vk::StructureType::eWriteDescriptorSet;
 		writes[index].dstBinding      = index;
 		writes[index].descriptorCount = 1;
 		writes[index].descriptorType  = vk::DescriptorType::eStorageBuffer;
@@ -666,7 +633,6 @@ void TileManager::SwapBgra16(Result input, Result output, uint32_t pixels) {
 	}
 	vk::BufferMemoryBarrier barriers[2] {};
 	for (uint32_t index = 0; index < 2; index++) {
-		barriers[index].sType               = vk::StructureType::eBufferMemoryBarrier;
 		barriers[index].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 		barriers[index].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 		barriers[index].buffer              = infos[index].buffer;

@@ -4,13 +4,13 @@
 [![Build KytyPS5 (Linux)](https://img.shields.io/github/actions/workflow/status/KytyPS5/KytyPS5/build.yml?branch=main&event=push&label=Build%20KytyPS5%20%28Linux%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
 [![Build KytyPS5 (macOS)](https://img.shields.io/github/actions/workflow/status/KytyPS5/KytyPS5/build.yml?branch=main&event=push&label=Build%20KytyPS5%20%28macOS%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
 [![Platform](https://img.shields.io/badge/platform-Windows%20x64%20%7C%20Linux%20x64%20%7C%20macOS%20x86__64-0078D4.svg)](#system-requirements)
-[![Status](https://img.shields.io/badge/status-early%20development-orange.svg)](#current-status)
+[![Status](https://img.shields.io/badge/status-active%20development-orange.svg)](#current-status)
 [![License](https://img.shields.io/badge/license-GPL--2.0-blue.svg)](LICENSE)
 
 KytyPS5 is a free and open-source PlayStation 5 emulator written in C++ for Windows and Linux,
 with experimental macOS support. It is based on a heavily modified version of
-[Kyty](https://github.com/InoriRus/Kyty). The project is in an early stage of development, so
-compatibility is limited and behavior may change significantly between builds.
+[Kyty](https://github.com/InoriRus/Kyty). The project is in active development, and behavior
+can change significantly between builds.
 
 > [!IMPORTANT]
 > KytyPS5 is not affiliated with Sony Interactive Entertainment or PlayStation. The project does
@@ -20,12 +20,12 @@ compatibility is limited and behavior may change significantly between builds.
 ## Current Status
 
 KytyPS5 can boot 2D games and a selection of 3D games, including titles built with Unreal Engine
-4/5, Unity, and custom engines. No external low-level emulation modules are currently required.
+4/5, Unity, and custom engines. External low-level emulation modules are neither required nor
+planned.
 
-Development is focused on compatibility and boot reliability.
+Development is currently focused on expanding game compatibility and improving boot reliability.
 
-Windows is the primary platform and receives the most testing. Linux builds and runs; see
-[Building on Linux](#building-on-linux).
+Windows and Linux are the primary platforms and receive the most testing.
 
 macOS support is experimental. The emulator is built for x86-64 and runs on Apple Silicon under
 Rosetta 2, with Vulkan provided by MoltenVK. A small number of titles have been verified in-game
@@ -36,16 +36,16 @@ Community game test results are available in the
 
 ## Bugs and Issues
 
-The project is in an early stage, so please be mindful when opening new issues. Expect crashes,
-graphical glitches, low compatibility, and poor performance.
+Compatibility, stability, and performance can vary between versions. You may encounter crashes
+or graphical glitches, so please include the version you tested when reporting an issue.
 
 ## Screenshots
 
 <table align="center">
   <tr>
     <td align="center">
-      <strong>Disgaea 6</strong><br>
-      <img src="docs/screenshots/ps5-01.png" width="300" alt="Disgaea 6 running in KytyPS5">
+      <strong>Astro Bot</strong><br>
+      <img src="docs/screenshots/ps5-01.png" width="300" alt="Astro Bot running in KytyPS5">
     </td>
     <td align="center">
       <strong>Dreaming Sarah</strong><br>
@@ -55,7 +55,7 @@ graphical glitches, low compatibility, and poor performance.
   <tr>
     <td align="center">
       <strong>Neptunia ReVerse</strong><br>
-      <img src="docs/screenshots/ps5-04.png" width="300" alt="Minecraft Legends running in KytyPS5">
+      <img src="docs/screenshots/ps5-04.png" width="300" alt="Neptunia ReVerse running in KytyPS5">
     </td>
     <td align="center">
       <strong>SILENT HILL: The Short Message</strong><br>
@@ -64,12 +64,12 @@ graphical glitches, low compatibility, and poor performance.
   </tr>
   <tr>
     <td align="center">
-      <strong>Hellboy</strong><br>
-      <img src="docs/screenshots/ps5-02.png" width="300" alt="Disgaea 6 running in KytyPS5">
+      <strong>Demon's Souls</strong><br>
+      <img src="docs/screenshots/ps5-02.png" width="300" alt="Demon's Souls running in KytyPS5">
     </td>
     <td align="center">
-      <strong>Paleo Pines</strong><br>
-      <img src="docs/screenshots/ps5-06.png" width="300" alt="Dreaming Sarah running in KytyPS5">
+      <strong>Hellboy</strong><br>
+      <img src="docs/screenshots/ps5-06.png" width="300" alt="Hellboy running in KytyPS5">
     </td>
   </tr>
 </table>
@@ -79,7 +79,7 @@ graphical glitches, low compatibility, and poor performance.
 ## Contributing
 
 Testing games and submitting detailed bug reports are useful ways to contribute. Search existing
-issues first, then use the **Game Emulation Bug Report** template and attach the complete log file.
+issues first, then use the **Game Emulation Status Report** template and attach the complete log file.
 
 Code contributions should be focused, build successfully on the platforms they touch, and include
 relevant tests where practical. Windows is the primary target, so a change that alters shared code
@@ -90,8 +90,14 @@ starting a large change.
 
 Set up the clang-format hook after cloning:
 
-```powershell
-python -m pip install pre-commit
+Install `pre-commit` using the method appropriate for your platform:
+
+- **Arch Linux / CachyOS:** `sudo pacman -S pre-commit`
+- **Other Linux / macOS / Windows:** `python -m pip install pre-commit`
+
+Then install the Git hook:
+
+```bash
 python -m pre_commit install --install-hooks
 ```
 
@@ -126,11 +132,12 @@ the Vulkan/SPIR-V validation rules.
 ### Build requirements (Windows)
 
 - Git
-- CMake 3.12 or newer
+- CMake 3.22.1 or newer
 - Ninja
 - Visual Studio 2022 or Build Tools 2022 with the **Desktop development with C++** workload and
   **C++ Clang tools for Windows** component
 - Qt 6 for MSVC 2022 64-bit, including Concurrent, Network, and Widgets
+- [glslang](https://github.com/KhronosGroup/glslang/releases) (`glslangValidator`) on `PATH`
 
 The Microsoft C++ compiler (`cl.exe`) is not supported; use `clang-cl`.
 
@@ -159,19 +166,19 @@ The finished application and its runtime dependencies will be placed in
 
 ### Building on Linux
 
-Install the toolchain and the libraries the bundled SDL2 needs. Without the audio, Wayland and
-udev development packages SDL2 quietly configures itself without those backends, and the resulting
+Install the toolchain and the libraries the bundled SDL3 needs. Without the audio, Wayland and
+udev development packages SDL3 quietly configures itself without those backends, and the resulting
 build has no working sound and no gamepad hotplug:
 
 ```bash
 sudo apt-get install --no-install-recommends \
-  clang lld ninja-build cmake git glslang-tools \
+  clang lld ninja-build cmake git glslang-tools pkg-config \
   libgl1-mesa-dev libx11-dev libxcursor-dev libxext-dev libxfixes-dev \
-  libxi-dev libxrandr-dev libxss-dev libxkbcommon-dev \
+  libxi-dev libxrandr-dev libxss-dev libxtst-dev libxkbcommon-dev \
   libasound2-dev libpulse-dev libudev-dev libdbus-1-dev libwayland-dev wayland-protocols
 ```
 
-Qt 6 (Concurrent, Network, Widgets) is also required — either the distribution packages
+Qt 6 (Concurrent, Network, Widgets) is required for the launcher — either the distribution packages
 (`qt6-base-dev`) or an official Qt installation.
 
 ```bash
@@ -186,12 +193,48 @@ cmake --install _Build/linux --prefix _Build/linux/install
 ```
 
 The install step copies the Qt libraries and plugins next to the binaries, so
-`_Build/linux/install` runs without a matching system Qt.
+`_Build/linux/install` runs without a matching system Qt. FFmpeg is linked statically
+from the pinned [KytyPS5 FFmpeg core](https://github.com/KytyPS5/ext-ffmpeg-core)
+release, including VP9 and WebM support. System FFmpeg packages are not required.
+
+To build `kyty_emulator` and the `kyty_tests` target without Qt, use a separate build directory:
+
+```bash
+git submodule update --init --recursive
+
+cmake -S . -B _Build/linux-no-qt -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+  -DKYTY_BUILD_LAUNCHER=OFF
+
+cmake --build _Build/linux-no-qt --target kyty_emulator kyty_tests --parallel
+```
 
 As on Windows, the MSVC compiler is not used; Clang is required. `cl.exe` is rejected at configure
 time.
 
 The CMake source root is the repository root.
+
+### Building on NixOS
+
+A development shell provides Clang, CMake, Ninja, Qt 6, the Vulkan headers, and the SDL3 backend
+libraries. Enter it and configure exactly as on other Linux distributions; the shell exports
+`CMAKE_PREFIX_PATH` and `QT_PLUGIN_PATH`, so the `-DCMAKE_PREFIX_PATH="$Qt6_DIR"` argument is not
+needed:
+
+```bash
+nix-shell # or: nix develop
+git submodule update --init --recursive
+
+cmake -S . -B _Build/linux -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+
+cmake --build _Build/linux --target launcher --parallel
+cmake --install _Build/linux --prefix _Build/linux/install
+```
+
+The configure step downloads the FFmpeg prebuilts and the `xbyak`/`zydis` sources, so it needs
+network access; a fully sandboxed `nix build` would require vendoring those inputs. A Vulkan 1.3
+driver must be available at runtime (on NixOS, `hardware.graphics.enable = true`).
 
 ### Building on macOS
 
@@ -220,17 +263,23 @@ cmake --install _Build/macos --prefix _Build/macos/install
 ```
 
 The build re-signs `kyty_emulator` with the JIT entitlements it needs to execute translated
-guest code; no manual signing step is required.
+guest code; no manual signing step is required. When the launcher is built, the install
+also produces `_Build/macos/install/KytyPS5.app` — double-click to launch the GUI.
+A flat `kyty_emulator` is kept for CLI usage.
 
 Vulkan comes from MoltenVK. Download `MoltenVK-macos.tar` from the
 [MoltenVK releases](https://github.com/KhronosGroup/MoltenVK/releases), then copy
-`MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib` next to `kyty_emulator` and ad-hoc sign it:
+`MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib` next to the flat `kyty_emulator`
+(and, for the bundle, into `KytyPS5.app/Contents/Frameworks/`) and ad-hoc sign it:
 
 ```bash
 codesign --force --sign - _Build/macos/install/libMoltenVK.dylib
+# For the bundle (if present):
+codesign --force --sign - _Build/macos/install/KytyPS5.app/Contents/Frameworks/libMoltenVK.dylib
+codesign --force --sign - _Build/macos/install/KytyPS5.app
 ```
 
-Release archives already include a signed `libMoltenVK.dylib`.
+Release archives already include a signed `libMoltenVK.dylib` (both flat and inside the bundle).
 
 ### Regression tests
 
@@ -274,6 +323,10 @@ To use the graphical launcher:
 ./_Build/linux/install/launcher
 ```
 
+```bash
+open _Build/macos/install/KytyPS5.app  # or double-click in Finder
+```
+
 On first launch, add one or more game folders in the global settings. The launcher searches those
 folders recursively for game directories containing `eboot.bin`. Select a detected game and run it
 from the game list.
@@ -288,12 +341,17 @@ The emulator can also be started directly with a legally obtained game directory
 ./_Build/linux/install/kyty_emulator --game "/games/ExampleGame"
 ```
 
-On macOS, point SDL at the MoltenVK library explicitly; the hardened runtime prevents it from
-being picked up from the executable's directory:
+On macOS, the adjacent flat or app-bundled `libMoltenVK.dylib` is found automatically; no
+environment variable is required:
 
 ```bash
-cd _Build/macos/install
-SDL_VULKAN_LIBRARY="$PWD/libMoltenVK.dylib" ./kyty_emulator --game "/games/ExampleGame"
+./_Build/macos/install/kyty_emulator --game "/games/ExampleGame"
+```
+
+To override the Vulkan loader, set `SDL_VULKAN_LIBRARY`:
+
+```bash
+SDL_VULKAN_LIBRARY=/path/to/libMoltenVK.dylib ./kyty_emulator --game "/games/ExampleGame"
 ```
 
 Run `kyty_emulator --help` to see the available graphics, logging, validation, profiling, and
@@ -324,5 +382,6 @@ licenses included with those components.
 
 - [InoriRus/Kyty](https://github.com/InoriRus/Kyty) — KytyPS5 is based on a heavily modified version
   of the original Kyty project.
-- [shadps4-emu/shadPS4](https://github.com/shadps4-emu/shadPS4) — reference for memory-model
-  understanding and the AVPlayer implementation.
+- [shadps4-emu/shadPS4](https://github.com/shadps4-emu/shadPS4) — reference for understanding PS4
+  memory behavior, GPU resource aliasing and cache coherency,
+  and the AVPlayer implementation.

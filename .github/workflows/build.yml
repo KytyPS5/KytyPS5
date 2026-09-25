@@ -6,7 +6,12 @@ on:
     branches: [ main, master ]
   pull_request:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
+  SCCACHE_GHA_ENABLED: "true"
   KYTY_BUILD_ORIGIN: ${{ github.repository != 'KytyPS5/KytyPS5' && 'Fork' || github.event_name == 'push' && 'Official' || 'Source' }}
   KYTY_BUILD_REPOSITORY: ${{ github.repository }}
 
@@ -37,9 +42,6 @@ jobs:
 
       - name: Setup Visual Studio environment
         uses: ilammy/msvc-dev-cmd@v1
-
-      - name: Setup Ninja
-        uses: seanmiddleditch/gha-setup-ninja@v5
 
       - name: Locate vcpkg
         id: vcpkg
@@ -78,6 +80,9 @@ jobs:
           arch: win64_msvc2022_64
           cache: true
 
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+
       - name: Verify toolchain
         shell: cmd
         run: |
@@ -100,17 +105,22 @@ jobs:
             -DKYTY_RELEASE_TAG=${{ needs.metadata.outputs.release_tag }} ^
             -DCMAKE_C_COMPILER=clang-cl ^
             -DCMAKE_CXX_COMPILER=clang-cl ^
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache ^
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache ^
             -DCMAKE_PREFIX_PATH="%Qt6_DIR%"
 
       - name: Build
         shell: cmd
         run: |
-          cmake --build _Build/windows --target launcher audio_out2_port_tests ime_dialog_tests virtual_memory_allocation_tests --parallel
+          cmake --build _Build/windows --target launcher ^
+            audio_out2_port_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests ^
+            resource_tracking_tests scalar_provenance_tests ^
+            resource_materialization_tests shader_vertex_metadata_tests --parallel
 
       - name: Test
         shell: cmd
         run: |
-          ctest --test-dir _Build/windows --output-on-failure -R "^(audio_out2_port|ime_dialog|virtual_memory_allocation)$"
+          ctest --test-dir _Build/windows --output-on-failure -R "^(audio_out2_port|ime_dialog|lru_cache|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|virtual_memory_allocation)$"
 
       - name: Install
         shell: cmd
@@ -145,7 +155,7 @@ jobs:
 
       - name: Install build dependencies
         shell: bash
-        run: brew install glslang ninja
+        run: brew install glslang
 
       - name: Install Qt 6.10.3
         uses: jurplel/install-qt-action@v4
@@ -155,6 +165,9 @@ jobs:
           target: desktop
           arch: clang_64
           cache: true
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
 
       - name: Verify toolchain
         shell: bash
@@ -180,20 +193,24 @@ jobs:
             -DCMAKE_OSX_ARCHITECTURES=x86_64 \
             -DCMAKE_C_COMPILER=clang \
             -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache \
             -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR"
 
       - name: Build
         shell: bash
         run: |
           cmake --build _Build/macos \
-            --target launcher audio_out2_port_tests ime_dialog_tests virtual_memory_allocation_tests \
+            --target launcher audio_out2_port_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests \
+              resource_tracking_tests scalar_provenance_tests \
+              resource_materialization_tests shader_vertex_metadata_tests \
             --parallel
 
       - name: Test
         shell: bash
         run: |
           ctest --test-dir _Build/macos --output-on-failure \
-            -R '^(audio_out2_port|ime_dialog|virtual_memory_allocation)$'
+            -R '^(audio_out2_port|ime_dialog|lru_cache|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|virtual_memory_allocation)$'
 
       - name: Install
         shell: bash
@@ -208,34 +225,66 @@ jobs:
         run: |
           archive="$RUNNER_TEMP/MoltenVK-macos.tar"
           package="$RUNNER_TEMP/MoltenVK"
+          install_dir="_Build/macos/install"
+          app_dir="$install_dir/KytyPS5.app"
+          moltenvk="$install_dir/libMoltenVK.dylib"
           curl --fail --location --retry 3 \
             --output "$archive" \
             "https://github.com/KhronosGroup/MoltenVK/releases/download/$MOLTENVK_VERSION/MoltenVK-macos.tar"
           echo "$MOLTENVK_SHA256  $archive" | shasum -a 256 --check
           tar -xf "$archive" -C "$RUNNER_TEMP"
+          test -d "$app_dir"
           install -m 755 \
             "$package/MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib" \
-            _Build/macos/install/libMoltenVK.dylib
-          install -m 644 "$package/LICENSE" _Build/macos/install/LICENSE.MoltenVK
-          codesign --force --sign - --timestamp=none _Build/macos/install/libMoltenVK.dylib
+            "$moltenvk"
+          install -m 644 "$package/LICENSE" "$install_dir/LICENSE.MoltenVK"
+          codesign --force --sign - --timestamp=none "$moltenvk"
+          install -d -m 755 "$app_dir/Contents/Frameworks" "$app_dir/Contents/Resources"
+          install -m 755 "$moltenvk" "$app_dir/Contents/Frameworks/libMoltenVK.dylib"
+          install -m 644 "$package/LICENSE" "$app_dir/Contents/Resources/LICENSE.MoltenVK"
+          codesign --force --sign - --timestamp=none "$app_dir"
 
       - name: Verify artifacts
         shell: bash
         run: |
-          file _Build/macos/install/launcher
-          file _Build/macos/install/kyty_emulator
-          file _Build/macos/install/libMoltenVK.dylib
-          lipo _Build/macos/install/launcher -verify_arch x86_64
-          lipo _Build/macos/install/kyty_emulator -verify_arch x86_64
-          lipo _Build/macos/install/libMoltenVK.dylib -verify_arch x86_64
-          codesign --verify --strict _Build/macos/install/kyty_emulator
-          codesign --verify --strict _Build/macos/install/libMoltenVK.dylib
+          install_dir="_Build/macos/install"
+          app_dir="$install_dir/KytyPS5.app"
+          test -d "$app_dir"
+          for binary in \
+            "$install_dir/kyty_emulator" \
+            "$install_dir/libMoltenVK.dylib" \
+            "$app_dir/Contents/MacOS/KytyPS5" \
+            "$app_dir/Contents/MacOS/kyty_emulator" \
+            "$app_dir/Contents/Frameworks/libMoltenVK.dylib"; do
+            file "$binary"
+            lipo "$binary" -verify_arch x86_64
+          done
+          for binary in \
+            "$install_dir/kyty_emulator" \
+            "$install_dir/libMoltenVK.dylib" \
+            "$app_dir/Contents/MacOS/KytyPS5" \
+            "$app_dir/Contents/MacOS/kyty_emulator" \
+            "$app_dir/Contents/Frameworks/libMoltenVK.dylib"; do
+            codesign --verify --strict "$binary"
+          done
+          codesign --verify --deep --strict --verbose=2 "$app_dir"
+
+      - name: Package macOS artifacts
+        shell: bash
+        run: |
+          install_dir="_Build/macos/install"
+          archive="$RUNNER_TEMP/KytyPS5-macOS-x86_64.zip"
+          (
+            cd "$install_dir"
+            zip -qry "$archive" .
+          )
+          unzip -t "$archive"
 
       - name: Upload macOS artifacts
         uses: actions/upload-artifact@v4
         with:
           name: KytyPS5-macOS-x86_64
-          path: _Build/macos/install/**
+          path: ${{ runner.temp }}/KytyPS5-macOS-x86_64.zip
           if-no-files-found: error
 
   linux:
@@ -270,8 +319,9 @@ jobs:
             libxkbcommon-dev \
             libxrandr-dev \
             libxss-dev \
+            libxtst-dev \
             lld \
-            ninja-build \
+            pkg-config \
             wayland-protocols
 
       - name: Install Qt 6.10.3
@@ -282,6 +332,9 @@ jobs:
           target: desktop
           arch: linux_gcc_64
           cache: true
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
 
       - name: Verify toolchain
         shell: bash
@@ -307,10 +360,12 @@ jobs:
             -DKYTY_RELEASE_TAG="${{ needs.metadata.outputs.release_tag }}" \
             -DCMAKE_C_COMPILER=clang \
             -DCMAKE_CXX_COMPILER=clang++ \
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache \
             -DCMAKE_PREFIX_PATH="$Qt6_DIR" 2>&1 | tee _Build/configure.log
           exit "${PIPESTATUS[0]}"
 
-      - name: Verify SDL2 backends
+      - name: Verify SDL3 backends
         shell: bash
         run: |
           status=0
@@ -329,14 +384,16 @@ jobs:
         run: |
           cmake --build _Build/linux \
             --target launcher page_manager_tests memory_tracker_tests \
-              audio_out2_port_tests ime_dialog_tests virtual_memory_allocation_tests \
+              audio_out2_port_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests \
+              resource_tracking_tests scalar_provenance_tests \
+              resource_materialization_tests shader_vertex_metadata_tests \
             --parallel
 
       - name: Test
         shell: bash
         run: |
           ctest --test-dir _Build/linux --output-on-failure \
-            -R '^(audio_out2_port|ime_dialog|page_manager|memory_tracker|virtual_memory_allocation)$'
+            -R '^(audio_out2_port|ime_dialog|lru_cache|memory_tracker|page_manager|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|virtual_memory_allocation)$'
 
       - name: Install
         shell: bash
@@ -424,16 +481,9 @@ jobs:
         if: needs.macos.result == 'success'
         shell: bash
         run: |
-          macos_dir="artifacts/KytyPS5-macOS-x86_64"
-          test -d "$macos_dir"
-          chmod a+x \
-            "$macos_dir/launcher" \
-            "$macos_dir/kyty_emulator" \
-            "$macos_dir/libMoltenVK.dylib"
-          (
-            cd "$macos_dir"
-            zip -r "$GITHUB_WORKSPACE/$RELEASE_NAME-macOS-x86_64.zip" .
-          )
+          macos_archive="artifacts/KytyPS5-macOS-x86_64/KytyPS5-macOS-x86_64.zip"
+          test -f "$macos_archive"
+          cp "$macos_archive" "$RELEASE_NAME-macOS-x86_64.zip"
 
       - name: Package Linux build
         if: needs.linux.result == 'success'

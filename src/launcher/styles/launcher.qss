@@ -1,0 +1,108 @@
+GameListTreeWidget#cfgs_list {
+    background: transparent;
+    border: 1px solid palette(mid);
+    color: palette(text);
+    outline: 0;
+}
+
+GameListTreeWidget#cfgs_list::item {
+    background: transparent;
+    border-bottom: 1px solid palette(mid);
+    padding: 4px;
+}
+
+GameListTreeWidget#cfgs_list::item:selected {
+    background: palette(highlight);
+    color: palette(highlighted-text);
+}
+
+GameListTreeWidget#cfgs_list QHeaderView::section {
+    background: palette(button);
+    color: palette(button-text);
+    border: 0;
+    border-right: 1px solid palette(mid);
+    border-bottom: 1px solid palette(mid);
+    padding: 5px 6px;
+}
+
+QLineEdit#search_line_edit {
+    background: palette(base);
+    border: 1px solid palette(mid);
+    border-radius: 4px;
+    color: palette(text);
+    padding: 5px 8px;
+    selection-background-color: palette(highlight);
+    selection-color: palette(highlighted-text);
+}
+
+QLineEdit#search_line_edit:focus {
+    border-color: palette(highlight);
+}
+
+QToolButton#global_settings_button,
+QToolButton#input_mapping_button,
+QToolButton#edit_button,
+QToolButton#delete_button {
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 5px;
+    padding: 3px;
+}
+
+QToolButton#global_settings_button:hover,
+QToolButton#input_mapping_button:hover,
+QToolButton#edit_button:hover,
+QToolButton#delete_button:hover {
+    background: palette(button);
+    border-color: palette(mid);
+}
+
+QToolButton#global_settings_button:pressed,
+QToolButton#input_mapping_button:pressed,
+QToolButton#edit_button:pressed,
+QToolButton#delete_button:pressed {
+    background: palette(midlight);
+}
+
+QComboBox#game_status_editor {
+    background: transparent;
+    border: 0;
+    color: palette(text);
+    padding-left: 2px;
+}
+
+QComboBox#game_status_editor:focus {
+    background: palette(button);
+    border-radius: 3px;
+}
+
+QComboBox#game_status_editor::drop-down {
+    border: 0;
+}
+
+QComboBox#game_status_editor QAbstractItemView {
+    background: palette(base);
+    color: palette(text);
+    selection-background-color: palette(highlight);
+    selection-color: palette(highlighted-text);
+}
+
+QLineEdit#game_comment_editor {
+    background: transparent;
+    border: 0;
+    color: palette(text);
+    padding-left: 2px;
+    selection-background-color: palette(highlight);
+    selection-color: palette(highlighted-text);
+}
+
+QLineEdit#game_comment_editor:focus {
+    background: palette(base);
+    border: 1px solid palette(mid);
+    border-radius: 3px;
+}
+
+QLabel#game_status_indicator {
+    border: 1px solid palette(base);
+    border-radius: 6px;
+}

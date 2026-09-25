@@ -14,6 +14,7 @@ namespace CommonDialog = Dialog::CommonDialog;
 
 LIB_DEFINE(InitDialog_1_CommonDialog) {
 	LIB_FUNC("uoUpLGNkygk", CommonDialog::CommonDialogInitialize);
+	LIB_FUNC("BQ3tey0JmQM", CommonDialog::CommonDialogIsUsed);
 }
 
 } // namespace LibCommonDialog

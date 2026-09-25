@@ -78,7 +78,7 @@ static int KYTY_SYSV_ABI RtcCheckValid(const RtcDateTime* time) {
 	return OK;
 }
 
-static int RtcGetDaysInMonth(int year, int month) {
+static int GetDaysInMonth(int year, int month) {
 	if (year <= 0 || year > 9999) {
 		return RTC_ERROR_INVALID_YEAR;
 	}
@@ -106,7 +106,7 @@ static int KYTY_SYSV_ABI RtcIsLeapYear(int year) {
 static int KYTY_SYSV_ABI RtcGetDayOfWeek(int year, int month, int day) {
 	PRINT_NAME();
 
-	const auto days = RtcGetDaysInMonth(year, month);
+	const auto days = GetDaysInMonth(year, month);
 	if (days < 0) {
 		return days;
 	}
@@ -118,10 +118,10 @@ static int KYTY_SYSV_ABI RtcGetDayOfWeek(int year, int month, int day) {
 	return (dow == 7 ? 0 : dow);
 }
 
-static int KYTY_SYSV_ABI RtcGetDaysInMonthExport(int year, int month) {
+static int KYTY_SYSV_ABI RtcGetDaysInMonth(int year, int month) {
 	PRINT_NAME();
 
-	return RtcGetDaysInMonth(year, month);
+	return GetDaysInMonth(year, month);
 }
 
 static int KYTY_SYSV_ABI RtcGetTickResolution() {
@@ -549,7 +549,7 @@ static int KYTY_SYSV_ABI RtcTickAddWeeks(RtcTick* dst, const RtcTick* src, int32
 
 } // namespace Rtc
 
-LIB_DEFINE(InitRtc_1_Rtc) {
+LIB_DEFINE(InitRtc_1) {
 	LIB_FUNC("lPEBYdVX0XQ", Rtc::RtcCheckValid);
 	LIB_FUNC("8Yr143yEnRo", Rtc::RtcConvertLocalTimeToUtc);
 	LIB_FUNC("M1TvFst-jrM", Rtc::RtcConvertUtcToLocalTime);
@@ -560,7 +560,7 @@ LIB_DEFINE(InitRtc_1_Rtc) {
 	LIB_FUNC("zO9UL3qIINQ", Rtc::RtcGetCurrentNetworkTick);
 	LIB_FUNC("CyIK-i4XdgQ", Rtc::RtcGetDayOfWeek);
 	LIB_FUNC("Ug8pCwQvh0c", Rtc::RtcIsLeapYear);
-	LIB_FUNC("3O7Ln8AqJ1o", Rtc::RtcGetDaysInMonthExport);
+	LIB_FUNC("3O7Ln8AqJ1o", Rtc::RtcGetDaysInMonth);
 	LIB_FUNC("8w-H19ip48I", Rtc::RtcGetTick);
 	LIB_FUNC("jMNwqYr4R-k", Rtc::RtcGetTickResolution);
 	LIB_FUNC("BtqmpTRXHgk", Rtc::RtcGetTime_t);
@@ -579,9 +579,5 @@ LIB_DEFINE(InitRtc_1_Rtc) {
 }
 
 } // namespace LibRtc
-
-LIB_DEFINE(InitRtc_1) {
-	LibRtc::InitRtc_1_Rtc(s);
-}
 
 } // namespace Libs

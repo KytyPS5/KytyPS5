@@ -1,17 +1,14 @@
 #ifndef EMULATOR_INCLUDE_EMULATOR_GRAPHICS_RENDERDOC_H_
 #define EMULATOR_INCLUDE_EMULATOR_GRAPHICS_RENDERDOC_H_
 
-#include "common/common.h"
-#include "graphics/host_gpu/vulkanCommon.h"
-
-struct SDL_Window;
-
 namespace Libs::Graphics {
 
+class RenderContext;
+
 void RenderDocInit();
-void RenderDocSetActiveWindow(vk::Instance instance, SDL_Window* window);
 void RenderDocRequestCapture();
-void RenderDocOnPresent();
+// Called by the presentation thread after releasing video-out locks.
+void RenderDocOnGuestFlip(RenderContext& renderer);
 
 } // namespace Libs::Graphics
 

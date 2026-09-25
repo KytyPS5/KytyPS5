@@ -39,6 +39,10 @@ using Handler = bool (*)(const ExceptionInfo&);
 
 bool InstallHandler(Handler handler);
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+bool InitializeThreadSignalStack();
+#endif
+
 } // namespace Common::HostException
 
 #endif /* KYTY_COMMON_HOST_EXCEPTION_H_ */

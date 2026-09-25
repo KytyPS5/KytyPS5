@@ -1,6 +1,5 @@
 #include "common/common.h"
 #include "common/logging/log.h"
-#include "common/magicEnum.h"
 #include "common/stringUtils.h"
 #include "kernel/fileSystem.h"
 #include "kernel/pthread.h"
@@ -16,6 +15,7 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <magic_enum.hpp>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -117,6 +117,13 @@ struct AvPlayerEventReplacement {
 	void*                 object_pointer = nullptr;
 	AvPlayerEventCallback event_callback = nullptr;
 };
+static void emit_event(AvPlayerEventReplacement event, int32_t id, void* data = nullptr) {
+	if (event.event_callback != nullptr) {
+		LOGF("\t event_id = %d\n", id);
+		event.event_callback(event.object_pointer, id, 0, data);
+	}
+}
+
 struct AvPlayerUri {
 	const char* name   = nullptr;
 	uint32_t    length = 0;
@@ -384,6 +391,16 @@ static bool codec_is_supported_for_source(AvPlayerSourceType source_type, AVMedi
 	}
 }
 
+static const AVCodec* find_decoder(AVCodecID codec_id) {
+	const auto* decoder = avcodec_find_decoder(codec_id);
+	if (decoder == nullptr && codec_id == AV_CODEC_ID_VP9) {
+		Log::WriteToConsoleAndLog(
+		    "WARNING: AvPlayer: The game requested VP9 video, but FFmpeg has no VP9 "
+		    "decoder. Use FFmpeg with VP9 decoding enabled.\n");
+	}
+	return decoder;
+}
+
 struct PacketDeleter {
 	void operator()(AVPacket* packet) const { av_packet_free(&packet); }
 };
@@ -552,6 +569,7 @@ private:
 struct ReadyFrame {
 	std::unique_ptr<GuestBuffer> buffer;
 	AvPlayerFrameInfoEx          info {};
+	uint64_t                    timestamp_offset = 0;
 };
 
 class FileStreamer {
@@ -628,9 +646,9 @@ private:
 
 class Source {
 public:
-	Source(AvPlayerMemAllocator m, AvPlayerFileReplacement f, int32_t video_buffers, bool vdec2,
-	       uint32_t demux_buffer_size)
-	    : mem(m), file(f),
+	Source(AvPlayerMemAllocator m, AvPlayerFileReplacement f, AvPlayerEventReplacement e,
+	       int32_t video_buffers, bool vdec2, uint32_t demux_buffer_size)
+	    : mem(m), file(f), event(e),
 	      max_video_buffers(std::clamp(video_buffers <= 0 ? 2 : video_buffers, 2, 16)),
 	      use_vdec2(vdec2),
 	      video_packets(
@@ -688,7 +706,7 @@ public:
 	int Enable(uint32_t id) {
 		std::scoped_lock lifecycle_lock(lifecycle_mutex);
 		std::lock_guard  state_lock(mutex);
-		if (!stopped) {
+		if (state == State::Playing) {
 			return AVPLAYER_ERROR_OPERATION_FAILED;
 		}
 		if (fmt == nullptr || id >= fmt->nb_streams) {
@@ -706,7 +724,7 @@ public:
 	int Disable(uint32_t id) {
 		std::scoped_lock lifecycle_lock(lifecycle_mutex);
 		std::lock_guard  state_lock(mutex);
-		if (!stopped) {
+		if (state == State::Playing) {
 			return AVPLAYER_ERROR_OPERATION_FAILED;
 		}
 		if (video_id == static_cast<int>(id)) {
@@ -737,9 +755,11 @@ public:
 				return AVPLAYER_ERROR_OPERATION_FAILED;
 			}
 			time       = CurrentTimeNoLock();
-			restart    = !stopped;
+			restart    = state == State::Playing;
 			was_paused = paused;
-			stopped    = true;
+			if (restart) {
+				state = State::Ready;
+			}
 		}
 		if (restart) {
 			StopWorkers();
@@ -760,7 +780,7 @@ public:
 	int StartImpl(uint64_t ms, bool paused_after_start = false, bool show_seek_frame = false) {
 		{
 			std::lock_guard lock(mutex);
-			stopped = true;
+			state = State::Ready;
 		}
 		StopWorkers();
 		interrupt_io = false;
@@ -773,14 +793,17 @@ public:
 				AutoEnable();
 			}
 			if (!video_id && !audio_id) {
+				state = State::Stopped;
 				return AVPLAYER_ERROR_OPERATION_FAILED;
 			}
 			if (!OpenCodecs()) {
 				ResetNoLock(true);
+				state = State::Stopped;
 				return AVPLAYER_ERROR_OPERATION_FAILED;
 			}
 			if (!AllocateBuffers()) {
 				ResetNoLock(true);
+				state = State::Stopped;
 				return AVPLAYER_ERROR_NO_MEMORY;
 			}
 			SeekNoLock(ms);
@@ -791,12 +814,11 @@ public:
 			pause_time    = clock_start;
 			seek_video_frame_pending =
 			    paused_after_start && show_seek_frame && video_id.has_value();
-			stopped = false;
 		}
 
 		if (!StartWorkers()) {
 			std::lock_guard lock(mutex);
-			stopped = true;
+			state = State::Stopped;
 			ResetNoLock(true);
 			result = AVPLAYER_ERROR_OPERATION_FAILED;
 		}
@@ -806,28 +828,39 @@ public:
 		return result;
 	}
 	int Stop() {
-		std::scoped_lock lifecycle_lock(lifecycle_mutex);
-		bool             was_playing_video = false;
+		bool                     was_playing_video = false;
+		AvPlayerEventReplacement stop_event {};
 		{
-			std::lock_guard lock(mutex);
-			was_playing_video = !stopped && video_id.has_value();
-			stopped           = true;
-		}
-		StopWorkers();
-		{
-			std::lock_guard lock(mutex);
-			ResetNoLock();
+			std::scoped_lock lifecycle_lock(lifecycle_mutex);
+			{
+				std::lock_guard lock(mutex);
+				if (state == State::Playing) {
+					was_playing_video = video_id.has_value();
+					stop_event        = event;
+				}
+				state = State::Stopped;
+			}
+			StopWorkers();
+			{
+				std::lock_guard lock(mutex);
+				ResetNoLock();
+			}
 		}
 		if (was_playing_video) {
 			::printf("AvPlayer video stopped\n");
 		}
+		emit_event(stop_event, AVPLAYER_EVENT_STATE_STOP);
 		return 0;
 	}
-	void Pause() {
+	int Pause() {
 		std::scoped_lock lifecycle_lock(lifecycle_mutex);
 		std::lock_guard  lock(mutex);
+		if (state != State::Playing) {
+			return AVPLAYER_ERROR_OPERATION_FAILED;
+		}
 		paused     = true;
 		pause_time = std::chrono::steady_clock::now();
+		return 0;
 	}
 	void Resume() {
 		std::scoped_lock lifecycle_lock(lifecycle_mutex);
@@ -849,9 +882,8 @@ public:
 	}
 	bool Active() const {
 		std::lock_guard lock(mutex);
-		return !stopped && !pipeline_failed &&
-		       (!demux_eof || !video_done || !audio_done || !video_frames.Empty() ||
-		        !audio_frames.Empty());
+		return state == State::Ready ||
+		       (state == State::Playing && !pipeline_failed && !DrainedNoLock());
 	}
 	uint64_t CurrentTime() const {
 		std::lock_guard lock(mutex);
@@ -862,12 +894,15 @@ public:
 		bool             was_paused = false;
 		{
 			std::lock_guard lock(mutex);
+			if (state != State::Playing) {
+				return AVPLAYER_ERROR_OPERATION_FAILED;
+			}
 			was_paused = paused;
 		}
 		return StartImpl(ms, was_paused, true);
 	}
 	uint64_t CurrentTimeNoLock() const {
-		if (stopped) {
+		if (state != State::Playing) {
 			return 0;
 		}
 		using namespace std::chrono;
@@ -904,7 +939,7 @@ public:
 			return false;
 		}
 		std::lock_guard lock(mutex);
-		if (stopped || !video_id) {
+		if (state != State::Playing || !video_id) {
 			return false;
 		}
 		const bool deliver_seek_frame = paused && seek_video_frame_pending;
@@ -933,6 +968,7 @@ public:
 		}
 		current_video = std::move(*frame);
 		*out          = current_video->info;
+		RecordLoopBoundary(*current_video);
 		if (deliver_seek_frame) {
 			seek_video_frame_pending = false;
 		}
@@ -943,7 +979,8 @@ public:
 			return false;
 		}
 		std::lock_guard lock(mutex);
-		if (paused || stopped || !audio_id || trick_speed != AVPLAYER_TRICK_SPEED_NORMAL) {
+		if (paused || state != State::Playing || !audio_id ||
+		    trick_speed != AVPLAYER_TRICK_SPEED_NORMAL) {
 			return false;
 		}
 		auto frame = audio_frames.TryPop();
@@ -963,11 +1000,31 @@ public:
 		std::memcpy(out->details.audio.language_code,
 		            current_audio->info.details.audio.language_code, 4);
 		last_audio_ts = out->time_stamp;
+		RecordLoopBoundary(*current_audio);
 		return true;
 	}
-	std::optional<int32_t> TakeWarning() { return warnings.TryPop(); }
+	std::optional<int32_t> TakeWarning() {
+		std::lock_guard lock(mutex);
+		if (pending_loop_warnings == 0) {
+			return std::nullopt;
+		}
+		--pending_loop_warnings;
+		return AVPLAYER_WARNING_LOOPING_BACK;
+	}
 
 private:
+	enum class State { Ready, Playing, Stopped };
+
+	bool DrainedNoLock() const {
+		return demux_eof && video_done && audio_done && video_frames.Empty() &&
+		       audio_frames.Empty();
+	}
+	void RecordLoopBoundary(const ReadyFrame& frame) {
+		if (frame.timestamp_offset > last_output_loop_offset) {
+			last_output_loop_offset = frame.timestamp_offset;
+			++pending_loop_warnings;
+		}
+	}
 	void Close() {
 		Stop();
 		if (fmt != nullptr) {
@@ -976,23 +1033,17 @@ private:
 		streamer.reset();
 	}
 	void ResetNoLock(bool retain_output_buffers = false) {
-		std::optional<ReadyFrame>                delivered_video;
-		std::optional<ReadyFrame>                delivered_audio;
-		std::deque<std::unique_ptr<GuestBuffer>> in_flight_video;
-		if (retain_output_buffers) {
-			delivered_video = std::move(current_video);
-			delivered_audio = std::move(current_audio);
-			in_flight_video = std::move(retired_video);
-		}
 		video_packets.Clear();
 		audio_packets.Clear();
 		video_frames.Clear();
 		audio_frames.Clear();
 		video_buffers.Clear();
 		audio_buffers.Clear();
-		retired_video.clear();
-		current_video.reset();
-		current_audio.reset();
+		if (!retain_output_buffers) {
+			retired_video.clear();
+			current_video.reset();
+			current_audio.reset();
+		}
 		if (sws != nullptr) {
 			sws_freeContext(sws);
 			sws = nullptr;
@@ -1014,9 +1065,8 @@ private:
 		audio_done               = true;
 		seek_video_frame_pending = false;
 		last_audio_ts            = 0;
-		current_video            = std::move(delivered_video);
-		current_audio            = std::move(delivered_audio);
-		retired_video            = std::move(in_flight_video);
+		last_output_loop_offset  = 0;
+		pending_loop_warnings    = 0;
 	}
 	void AutoEnable() {
 		for (uint32_t i = 0; i < fmt->nb_streams; i++) {
@@ -1046,7 +1096,7 @@ private:
 			     static_cast<int>(s->codecpar->codec_id), static_cast<uint32_t>(source_type));
 			return false;
 		}
-		if (avcodec_find_decoder(s->codecpar->codec_id) == nullptr) {
+		if (find_decoder(s->codecpar->codec_id) == nullptr) {
 			LOGF("\t decoder not found: stream=%d codec=%d\n", id,
 			     static_cast<int>(s->codecpar->codec_id));
 			return false;
@@ -1055,7 +1105,7 @@ private:
 	}
 	bool OpenCodec(int id, AVCodecContext** out) {
 		auto* s   = fmt->streams[id];
-		auto* dec = avcodec_find_decoder(s->codecpar->codec_id);
+		auto* dec = find_decoder(s->codecpar->codec_id);
 		if (dec == nullptr) {
 			LOGF("\t avcodec_find_decoder failed: stream=%d codec=%d\n", id,
 			     static_cast<int>(s->codecpar->codec_id));
@@ -1146,6 +1196,7 @@ private:
 		return true;
 	}
 	bool StartWorkers() {
+		std::unique_lock lock(mutex);
 		worker_stop     = false;
 		interrupt_io    = false;
 		pipeline_failed = false;
@@ -1155,9 +1206,11 @@ private:
 		if ((video_id && !CreateWorker(video_thread, VideoDecoderEntry, "AvPlayerVideoDecoder")) ||
 		    (audio_id && !CreateWorker(audio_thread, AudioDecoderEntry, "AvPlayerAudioDecoder")) ||
 		    !CreateWorker(demux_thread, DemuxEntry, "AvPlayerDemuxer")) {
+			lock.unlock();
 			StopWorkers();
 			return false;
 		}
+		state = State::Playing;
 		return true;
 	}
 	void NotifyWorkers() {
@@ -1167,8 +1220,11 @@ private:
 		audio_buffers.Notify();
 	}
 	void StopWorkers() {
-		worker_stop  = true;
-		interrupt_io = true;
+		{
+			std::lock_guard lock(mutex);
+			worker_stop  = true;
+			interrupt_io = true;
+		}
 		NotifyWorkers();
 		if (demux_thread != nullptr) {
 			LibKernel::PthreadJoin(demux_thread, nullptr);
@@ -1184,9 +1240,12 @@ private:
 		}
 	}
 	void FailPipeline() {
-		pipeline_failed = true;
-		worker_stop     = true;
-		interrupt_io    = true;
+		{
+			std::lock_guard lock(mutex);
+			pipeline_failed = true;
+			worker_stop     = true;
+			interrupt_io    = true;
+		}
 		NotifyWorkers();
 	}
 	void Demux() {
@@ -1220,7 +1279,6 @@ private:
 					if (avformat_seek_file(fmt, stream, INT64_MIN, 0, INT64_MAX, 0) < 0) {
 						break;
 					}
-					warnings.Push(AVPLAYER_WARNING_LOOPING_BACK);
 					continue;
 				}
 				if (result != AVERROR_EOF && !worker_stop) {
@@ -1340,6 +1398,7 @@ private:
 				return false;
 			}
 			ready.info.time_stamp += timestamp_offset;
+			ready.timestamp_offset = timestamp_offset;
 			frames.Push(std::move(ready));
 			av_frame_free(&frame);
 		}
@@ -1353,15 +1412,8 @@ private:
 		return use_vdec2 ? static_cast<uint32_t>(s->codecpar->height)
 		                 : align_up(static_cast<uint32_t>(s->codecpar->height), 16);
 	}
-	float Aspect(AVStream* s) const {
-		if (s->codecpar->height == 0) {
-			return 0.0f;
-		}
-		double r = static_cast<double>(s->codecpar->width) / s->codecpar->height;
-		if (s->sample_aspect_ratio.num > 0 && s->sample_aspect_ratio.den > 0) {
-			r *= av_q2d(s->sample_aspect_ratio);
-		}
-		return static_cast<float>(r);
+	float Aspect(AVRational ratio) const {
+		return ratio.num > 0 && ratio.den > 0 ? static_cast<float>(av_q2d(ratio)) : 0.0f;
 	}
 	uint64_t Duration(AVStream* s) const {
 		return s->duration != AV_NOPTS_VALUE
@@ -1374,14 +1426,14 @@ private:
 		std::memset(v, 0, sizeof(*v));
 		v->width        = Width(s);
 		v->height       = Height(s);
-		v->aspect_ratio = Aspect(s);
+		v->aspect_ratio = Aspect(s->sample_aspect_ratio);
 		lang(v->language_code, s->metadata);
 	}
-	void FillVideoEx(AVStream* s, AvPlayerVideoEx* v) const {
+	void FillVideoEx(AVStream* s, AvPlayerVideoEx* v, AVRational aspect) const {
 		std::memset(v, 0, sizeof(*v));
 		v->width                 = Width(s);
 		v->height                = Height(s);
-		v->aspect_ratio          = Aspect(s);
+		v->aspect_ratio          = Aspect(aspect);
 		v->pitch                 = VideoPitch(s);
 		v->luma_bit_depth        = 8;
 		v->chroma_bit_depth      = 8;
@@ -1417,7 +1469,7 @@ private:
 					FillVideo(s, &d->video);
 				}
 				if (ex) {
-					FillVideoEx(s, &ex->video);
+					FillVideoEx(s, &ex->video, s->sample_aspect_ratio);
 				}
 				break;
 			case AVMEDIA_TYPE_AUDIO:
@@ -1502,7 +1554,7 @@ private:
 		info->time_stamp = to_ms(
 		    src->best_effort_timestamp != AV_NOPTS_VALUE ? src->best_effort_timestamp : src->pts,
 		    s->time_base);
-		FillVideoEx(s, &info->details.video);
+		FillVideoEx(s, &info->details.video, src->sample_aspect_ratio);
 		info->details.video.crop_left_offset = static_cast<uint32_t>(src->crop_left);
 		info->details.video.crop_right_offset =
 		    static_cast<uint32_t>(src->crop_right + (pitch - src->width));
@@ -1579,6 +1631,7 @@ private:
 	}
 	AvPlayerMemAllocator                     mem;
 	AvPlayerFileReplacement                  file;
+	AvPlayerEventReplacement                 event;
 	int                                      max_video_buffers = 2;
 	bool                                     use_vdec2         = false;
 	AvPlayerSourceType                       source_type       = AvPlayerSourceUnknown;
@@ -1603,7 +1656,6 @@ private:
 	std::optional<ReadyFrame>                current_video;
 	std::optional<ReadyFrame>                current_audio;
 	std::deque<std::unique_ptr<GuestBuffer>> retired_video;
-	WorkQueue<int32_t>                       warnings;
 	LibKernel::Pthread                       demux_thread = nullptr;
 	LibKernel::Pthread                       video_thread = nullptr;
 	LibKernel::Pthread                       audio_thread = nullptr;
@@ -1615,7 +1667,7 @@ private:
 	std::atomic_bool                         audio_done {true};
 	std::mutex                               lifecycle_mutex;
 	mutable std::mutex                       mutex;
-	bool                                     stopped                  = true;
+	State                                    state                    = State::Ready;
 	bool                                     paused                   = false;
 	bool                                     seek_video_frame_pending = false;
 	std::atomic_bool                         loop {false};
@@ -1623,6 +1675,8 @@ private:
 	uint32_t                                 sync_mode     = 0;
 	uint64_t                                 start_time_ms = 0;
 	uint64_t                                 last_audio_ts = 0;
+	uint64_t                                 last_output_loop_offset = 0;
+	uint32_t                                 pending_loop_warnings   = 0;
 	std::chrono::steady_clock::time_point    clock_start {};
 	std::chrono::steady_clock::time_point    pause_time {};
 	std::chrono::steady_clock::duration      paused_extra {};
@@ -1635,6 +1689,7 @@ struct AvPlayerInternal {
 	AvPlayerPostInitData     post_init {};
 	bool                     auto_start        = false;
 	int32_t                  video_buffers     = 2;
+	uint32_t                 sync_mode         = 0;
 	uint32_t                 start_bandwidth   = 0;
 	uint32_t                 minimum_bandwidth = 0;
 	uint32_t                 maximum_bandwidth = 0;
@@ -1644,19 +1699,13 @@ struct AvPlayerInternal {
 static bool valid_allocators(const AvPlayerMemAllocator& m) {
 	return m.allocate && m.deallocate && m.allocate_texture && m.deallocate_texture;
 }
-static void emit_event(AvPlayerInternal* h, int32_t id, void* data = nullptr) {
-	if (h != nullptr && h->event.event_callback != nullptr) {
-		LOGF("\t event_id = %d\n", id);
-		h->event.event_callback(h->event.object_pointer, id, 0, data);
-	}
-}
 static void pump_warnings(AvPlayerInternal* h) {
 	if (h == nullptr || h->source == nullptr) {
 		return;
 	}
 	while (auto w = h->source->TakeWarning()) {
 		int32_t warning = *w;
-		emit_event(h, AVPLAYER_EVENT_WARNING_ID, &warning);
+		emit_event(h->event, AVPLAYER_EVENT_WARNING_ID, &warning);
 	}
 }
 static AvPlayerInternal* create_player(const AvPlayerMemAllocator&     mem,
@@ -1670,7 +1719,7 @@ static AvPlayerInternal* create_player(const AvPlayerMemAllocator&     mem,
 	h->mem           = mem;
 	h->file          = file;
 	h->event         = event;
-	h->auto_start    = auto_start;
+	h->auto_start    = auto_start || event.event_callback == nullptr;
 	h->video_buffers = std::clamp(video_buffers <= 0 ? 2 : video_buffers, 2, 16);
 	h->post_init.demux_video_buffer_size = 4 * 1024 * 1024;
 	return h;
@@ -1684,17 +1733,18 @@ static int add_source(AvPlayerInternal* h, const std::string& filename, AvPlayer
 	}
 	bool vdec2 =
 	    h->post_init.video_decoder_init.decoder_type.video_type == AvPlayerVideoDecoderSoftware2;
-	auto s = std::make_unique<Source>(h->mem, h->file, h->video_buffers, vdec2,
+	auto s = std::make_unique<Source>(h->mem, h->file, h->event, h->video_buffers, vdec2,
 	                                  h->post_init.demux_video_buffer_size);
 	if (auto rc = s->Init(filename, type); rc < 0) {
 		return rc;
 	}
+	s->SetSync(h->sync_mode);
 	h->source = std::move(s);
-	emit_event(h, AVPLAYER_EVENT_STATE_READY);
+	emit_event(h->event, AVPLAYER_EVENT_STATE_READY);
 	if (h->auto_start) {
 		auto rc = h->source->Start();
 		if (rc == 0) {
-			emit_event(h, AVPLAYER_EVENT_STATE_PLAY);
+			emit_event(h->event, AVPLAYER_EVENT_STATE_PLAY);
 		}
 		return rc;
 	}
@@ -1729,7 +1779,7 @@ static void log_init_common(const AvPlayerMemAllocator& mem, const AvPlayerFileR
 	     "= %d\n\t base_priority                   "
 	     "      = %u\n\t auto_start                            = %u\n\t default_language           "
 	     "           = %s\n",
-	     Common::EnumName(debug_level).c_str(), buffers, priority, auto_start,
+	     magic_enum::enum_name(debug_level), buffers, priority, auto_start,
 	     language == nullptr ? "(null)" : language);
 }
 
@@ -1843,7 +1893,7 @@ int KYTY_SYSV_ABI AvPlayerStart(AvPlayerInternal* h) {
 	}
 	auto rc = h->source->Start();
 	if (rc == 0) {
-		emit_event(h, AVPLAYER_EVENT_STATE_PLAY);
+		emit_event(h->event, AVPLAYER_EVENT_STATE_PLAY);
 	}
 	return rc;
 }
@@ -1858,7 +1908,7 @@ int KYTY_SYSV_ABI AvPlayerStartEx(AvPlayerInternal* h, const void* start_info_ex
 	        : static_cast<const AvPlayerStartInfoEx*>(start_info_ex)->start_time_milliseconds;
 	auto rc = h->source->Start(ms);
 	if (rc == 0) {
-		emit_event(h, AVPLAYER_EVENT_STATE_PLAY);
+		emit_event(h->event, AVPLAYER_EVENT_STATE_PLAY);
 	}
 	return rc;
 }
@@ -1867,18 +1917,18 @@ int KYTY_SYSV_ABI AvPlayerStop(AvPlayerInternal* h) {
 	if (h == nullptr || h->source == nullptr) {
 		return AVPLAYER_ERROR_INVALID_PARAMS;
 	}
-	auto rc = h->source->Stop();
-	emit_event(h, AVPLAYER_EVENT_STATE_STOP);
-	return rc;
+	return h->source->Stop();
 }
 int KYTY_SYSV_ABI AvPlayerPause(AvPlayerInternal* h) {
 	PRINT_NAME();
 	if (h == nullptr || h->source == nullptr) {
 		return AVPLAYER_ERROR_INVALID_PARAMS;
 	}
-	h->source->Pause();
-	emit_event(h, AVPLAYER_EVENT_STATE_PAUSE);
-	return 0;
+	auto rc = h->source->Pause();
+	if (rc == 0) {
+		emit_event(h->event, AVPLAYER_EVENT_STATE_PAUSE);
+	}
+	return rc;
 }
 int KYTY_SYSV_ABI AvPlayerResume(AvPlayerInternal* h) {
 	PRINT_NAME();
@@ -1886,7 +1936,7 @@ int KYTY_SYSV_ABI AvPlayerResume(AvPlayerInternal* h) {
 		return AVPLAYER_ERROR_INVALID_PARAMS;
 	}
 	h->source->Resume();
-	emit_event(h, AVPLAYER_EVENT_STATE_PLAY);
+	emit_event(h->event, AVPLAYER_EVENT_STATE_PLAY);
 	return 0;
 }
 int KYTY_SYSV_ABI AvPlayerSetLooping(AvPlayerInternal* h, Bool loop) {
@@ -1912,13 +1962,16 @@ int KYTY_SYSV_ABI AvPlayerSetTrickSpeed(AvPlayerInternal* h, int32_t trick_speed
 }
 int KYTY_SYSV_ABI AvPlayerSetAvSyncMode(AvPlayerInternal* h, uint32_t sync_mode) {
 	PRINT_NAME();
-	if (h == nullptr || h->source == nullptr) {
+	if (h == nullptr) {
 		return AVPLAYER_ERROR_INVALID_PARAMS;
 	}
 	if (sync_mode > 1) {
 		return AVPLAYER_ERROR_NOT_SUPPORTED;
 	}
-	h->source->SetSync(sync_mode);
+	h->sync_mode = sync_mode;
+	if (h->source != nullptr) {
+		h->source->SetSync(sync_mode);
+	}
 	return 0;
 }
 int KYTY_SYSV_ABI AvPlayerSetAvailableBandwidth(AvPlayerInternal* h, uint32_t start_bandwidth,
@@ -1951,6 +2004,7 @@ Bool KYTY_SYSV_ABI AvPlayerGetVideoData(AvPlayerInternal* h, AvPlayerFrameInfo* 
 	video_info->details.video.height       = ex.details.video.height;
 	video_info->details.video.aspect_ratio = ex.details.video.aspect_ratio;
 	std::memcpy(video_info->details.video.language_code, ex.details.video.language_code, 4);
+	pump_warnings(h);
 	return 1;
 }
 Bool KYTY_SYSV_ABI AvPlayerGetVideoDataEx(AvPlayerInternal* h, AvPlayerFrameInfoEx* video_info) {
@@ -1973,7 +2027,7 @@ Bool KYTY_SYSV_ABI AvPlayerGetAudioData(AvPlayerInternal* h, AvPlayerFrameInfo* 
 }
 Bool KYTY_SYSV_ABI AvPlayerIsActive(AvPlayerInternal* h) {
 	PRINT_NAME();
-	return h != nullptr && h->source != nullptr && h->source->Active() ? 1 : 0;
+	return h != nullptr && (h->source == nullptr || h->source->Active());
 }
 uint64_t KYTY_SYSV_ABI AvPlayerCurrentTime(AvPlayerInternal* h) {
 	PRINT_NAME();
@@ -1987,7 +2041,7 @@ int KYTY_SYSV_ABI AvPlayerJumpToTime(AvPlayerInternal* h, uint64_t time_ms) {
 	auto rc = h->source->Jump(time_ms);
 	if (rc == 0) {
 		int32_t w = AVPLAYER_WARNING_JUMP_COMPLETE;
-		emit_event(h, AVPLAYER_EVENT_WARNING_ID, &w);
+		emit_event(h->event, AVPLAYER_EVENT_WARNING_ID, &w);
 	}
 	return rc;
 }

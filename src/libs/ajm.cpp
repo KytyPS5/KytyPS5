@@ -1,6 +1,10 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/logging/log.h"
+#include "libs/ajm/aac_decoder.h"
+#include "libs/ajm/atrac9_decoder.h"
+#include "libs/ajm/decoder.h"
+#include "libs/ajm/mp3_decoder.h"
 #include "libs/audio.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -58,47 +62,6 @@ struct AjmSidebandMFrame {
 	uint32_t reserved;
 };
 
-struct AjmSidebandFormat {
-	uint32_t channel_num;
-	uint32_t channel_mask;
-	uint32_t sampling_frequency;
-	uint32_t sample_encoding;
-	uint32_t bitrate;
-	uint32_t reserved;
-};
-
-struct AjmSidebandGaplessDecode {
-	uint32_t total_samples;
-	uint16_t skip_samples;
-	uint16_t skipped_samples;
-};
-
-struct AjmGaplessState {
-	AjmSidebandGaplessDecode init {};
-	AjmSidebandGaplessDecode current {};
-
-	[[nodiscard]] bool HasSampleLimit() const {
-		return init.total_samples != 0 &&
-		       init.total_samples != std::numeric_limits<uint32_t>::max();
-	}
-
-	[[nodiscard]] bool IsEnd() const { return HasSampleLimit() && current.total_samples == 0; }
-
-	void Reset() {
-		current                 = init;
-		current.skipped_samples = 0;
-	}
-
-	void Set(const AjmSidebandGaplessDecode& params, bool reset) {
-		init.total_samples = params.total_samples;
-		init.skip_samples  = params.skip_samples;
-		if (reset || (current.total_samples == 0 && current.skip_samples == 0 &&
-		              current.skipped_samples == 0)) {
-			Reset();
-		}
-	}
-};
-
 struct AjmSidebandResampleInfo {
 	float    ratio;
 	int32_t  num_samples;
@@ -130,34 +93,10 @@ enum class AjmCodec : uint32_t {
 	DecOpus          = 24,
 };
 
-enum class AjmSampleEncoding : uint32_t {
-	S16   = 0,
-	S32   = 1,
-	Float = 2,
-};
-
-struct AjmDecodeResult {
-	int32_t           result                = OK;
-	int32_t           internal_result       = OK;
-	size_t            input_consumed        = 0;
-	size_t            output_written        = 0;
-	uint64_t          total_decoded_samples = 0;
-	uint32_t          frames                = 0;
-	uint32_t          frames_per_packet     = 0;
-	AjmSidebandFormat format {};
-};
-
 constexpr int32_t AJM_ERROR_INVALID_CONTEXT     = static_cast<int32_t>(0x80930002u);
 constexpr int32_t AJM_ERROR_INVALID_PARAMETER   = static_cast<int32_t>(0x80930005u);
 constexpr int32_t AJM_ERROR_CODEC_NOT_SUPPORTED = static_cast<int32_t>(0x80930008u);
 constexpr int32_t AJM_ERROR_JOB_CREATION        = static_cast<int32_t>(0x80930012u);
-constexpr int32_t AJM_RESULT_NOT_INITIALIZED    = 0x00000001;
-constexpr int32_t AJM_RESULT_INVALID_DATA       = 0x00000002;
-constexpr int32_t AJM_RESULT_INVALID_PARAMETER  = 0x00000004;
-constexpr int32_t AJM_RESULT_PARTIAL_INPUT      = 0x00000008;
-constexpr int32_t AJM_RESULT_NOT_ENOUGH_ROOM    = 0x00000010;
-constexpr int32_t AJM_RESULT_CODEC_ERROR        = 0x40000000;
-constexpr int32_t AJM_RESULT_FATAL              = static_cast<int32_t>(0x80000000u);
 constexpr size_t  AJM_JOB_CONTROL_SIZE          = 48;
 constexpr size_t  AJM_JOB_RUN_SIZE              = 64;
 constexpr size_t  AJM_JOB_GET_STATISTICS_SIZE =
@@ -181,7 +120,6 @@ constexpr uint64_t AJM_FLAG_SIDEBAND_STREAM           = 1ull << 47u;
 constexpr uint64_t AJM_INSTANCE_FLAG_FORMAT_OFFSET    = 7u;
 constexpr uint64_t AJM_INSTANCE_FLAG_FORMAT_MASK      = 0x7u;
 constexpr uint64_t AJM_INSTANCE_FLAG_MAX_CHANNEL_MASK = 0x7fu;
-constexpr uint64_t AJM_INSTANCE_FLAG_CODEC_OFFSET     = 32u;
 constexpr uint32_t AJM_DEC_OPUS_MAX_CHANNELS_FOR_10CH = 10;
 constexpr uint32_t AJM_DEC_OPUS_FRAME_SAMPLES         = 960;
 
@@ -204,41 +142,6 @@ static AjmSampleEncoding AjmGetFlagSampleEncoding(uint64_t flags) {
 	return AjmSampleEncoding::S16;
 }
 
-static size_t AjmBytesPerSample(AjmSampleEncoding encoding) {
-	switch (encoding) {
-		case AjmSampleEncoding::S16: return sizeof(int16_t);
-		case AjmSampleEncoding::S32: return sizeof(int32_t);
-		case AjmSampleEncoding::Float: return sizeof(float);
-		default: EXIT("unsupported AJM PCM sample encoding %u\n", static_cast<uint32_t>(encoding));
-	}
-	return sizeof(int16_t);
-}
-
-static uint32_t AjmChannelMask(uint32_t channels) {
-	switch (channels) {
-		case 1: return 0x4;
-		case 2: return 0x3;
-		case 3: return 0x7;
-		case 4: return 0x33;
-		case 5: return 0x607;
-		case 6: return 0x60f;
-		case 7: return 0x70f;
-		case 8: return 0x63f;
-		default: return 0;
-	}
-}
-
-static AjmSidebandFormat AjmMakeFormat(uint32_t channels, uint32_t sample_rate,
-                                       AjmSampleEncoding encoding) {
-	AjmSidebandFormat format {};
-	format.channel_num        = channels;
-	format.channel_mask       = AjmChannelMask(channels);
-	format.sampling_frequency = sample_rate;
-	format.sample_encoding    = static_cast<uint32_t>(encoding);
-	format.bitrate            = 0;
-	return format;
-}
-
 static const char* AjmCodecName(uint32_t codec) {
 	switch (codec) {
 		case static_cast<uint32_t>(AjmCodec::DecMp3): return "MP3 decoder";
@@ -254,67 +157,6 @@ static const char* AjmCodecName(uint32_t codec) {
 		default: return "unknown";
 	}
 }
-
-class AjmDecoder {
-public:
-	AjmDecoder(uint32_t channels, uint32_t sample_rate, AjmSampleEncoding encoding)
-	    : m_channels(channels), m_sample_rate(sample_rate), m_sample_encoding(encoding) {}
-	virtual ~AjmDecoder() = default;
-
-	KYTY_CLASS_NO_COPY(AjmDecoder);
-
-	virtual AjmDecodeResult Initialize(const void* codec_parameters, size_t codec_parameters_size) {
-		(void)codec_parameters;
-		(void)codec_parameters_size;
-		return MakeResult();
-	}
-
-	virtual void Reset() { m_total_decoded_samples = 0; }
-
-	virtual AjmDecodeResult Decode(const void* input, size_t input_size, void* output,
-	                               size_t output_size, bool multiple_frames,
-	                               AjmGaplessState* gapless) = 0;
-
-	virtual void WriteCodecInfo(void* output, size_t output_size,
-	                            const AjmDecodeResult& result) const {
-		(void)output;
-		(void)output_size;
-		(void)result;
-	}
-
-	[[nodiscard]] virtual size_t CodecInfoSize() const { return 0; }
-
-	[[nodiscard]] virtual AjmSidebandFormat GetFormat() const {
-		return AjmMakeFormat(m_channels, m_sample_rate, m_sample_encoding);
-	}
-
-	[[nodiscard]] AjmDecodeResult MakeResult() const {
-		AjmDecodeResult result {};
-		result.total_decoded_samples = m_total_decoded_samples;
-		result.format                = GetFormat();
-		return result;
-	}
-
-protected:
-	void SetFormat(uint32_t channels, uint32_t sample_rate, AjmSampleEncoding encoding) {
-		m_channels        = channels;
-		m_sample_rate     = sample_rate;
-		m_sample_encoding = encoding;
-	}
-
-	uint32_t          m_channels              = 2;
-	uint32_t          m_sample_rate           = 48000;
-	AjmSampleEncoding m_sample_encoding       = AjmSampleEncoding::S16;
-	uint64_t          m_total_decoded_samples = 0;
-};
-
-} // namespace Libs::Audio::Ajm
-
-#include "libs/ajm/aac_decoder.h"
-#include "libs/ajm/atrac9_decoder.h"
-#include "libs/ajm/mp3_decoder.h"
-
-namespace Libs::Audio::Ajm {
 
 static_assert(sizeof(AjmDecAt9ConfigDataInfo) == 20);
 
@@ -815,6 +657,16 @@ static AjmDecodeResult AjmControlInstance(uint32_t instance, uint64_t flags,
 	}
 
 	AjmDecodeResult result = decoder->MakeResult();
+	if ((flags & AJM_FLAG_SIDEBAND_GAPLESS) != 0) {
+		if (sideband_input == nullptr || sideband_input_size < AJM_SIDEBAND_GAPLESS_SIZE) {
+			result.result = AJM_RESULT_INVALID_PARAMETER;
+			return result;
+		}
+		state->gapless.Set(*static_cast<const AjmSidebandGaplessDecode*>(sideband_input),
+		                   (flags & AJM_FLAG_CONTROL_RESET) != 0);
+		sideband_input = static_cast<const uint8_t*>(sideband_input) + AJM_SIDEBAND_GAPLESS_SIZE;
+		sideband_input_size -= AJM_SIDEBAND_GAPLESS_SIZE;
+	}
 	if ((flags & AJM_FLAG_CONTROL_RESET) != 0) {
 		state->gapless.Reset();
 		decoder->Reset();
@@ -830,16 +682,9 @@ static AjmDecodeResult AjmControlInstance(uint32_t instance, uint64_t flags,
 
 static AjmDecodeResult AjmSetGaplessDecode(uint32_t instance, const void* gapless_decode,
                                            int reset) {
-	std::scoped_lock lock(g_ajm_instances_mutex);
-	auto*            state = AjmFindInstanceLocked(instance);
-	if (state == nullptr || state->decoder == nullptr || gapless_decode == nullptr) {
-		AjmDecodeResult result {};
-		result.result = AJM_RESULT_INVALID_PARAMETER;
-		return result;
-	}
-
-	state->gapless.Set(*static_cast<const AjmSidebandGaplessDecode*>(gapless_decode), reset != 0);
-	return state->decoder->MakeResult();
+	const auto flags = AJM_FLAG_SIDEBAND_GAPLESS | (reset != 0 ? AJM_FLAG_CONTROL_RESET : 0);
+	return AjmControlInstance(instance, flags, gapless_decode, sizeof(AjmSidebandGaplessDecode),
+	                          nullptr, nullptr);
 }
 
 static AjmDecodeResult AjmGetGaplessDecode(uint32_t                  instance,
@@ -997,8 +842,9 @@ int KYTY_SYSV_ABI AjmMemoryUnregister(uint32_t context, void* ptr) {
 int KYTY_SYSV_ABI AjmBatchInitialize(void* buffer, size_t size, AjmBatchInfo* info) {
 	PRINT_NAME();
 
-	EXIT_NOT_IMPLEMENTED(buffer == nullptr);
-	EXIT_NOT_IMPLEMENTED(info == nullptr);
+	if (buffer == nullptr || info == nullptr) {
+		return AJM_ERROR_INVALID_PARAMETER;
+	}
 
 	info->buffer           = buffer;
 	info->offset           = 0;
@@ -1077,18 +923,8 @@ int KYTY_SYSV_ABI AjmBatchJobClearContext(AjmBatchInfo* info, uint32_t instance,
 	PRINT_NAME();
 	EXIT_NOT_IMPLEMENTED(info == nullptr);
 
-	AjmDecodeResult decode_result {};
-	{
-		std::scoped_lock lock(g_ajm_instances_mutex);
-		auto*            state = AjmFindInstanceLocked(instance);
-		if (state != nullptr && state->decoder != nullptr) {
-			state->gapless.Reset();
-			state->decoder->Reset();
-			decode_result = state->decoder->MakeResult();
-		} else {
-			decode_result.result = AJM_RESULT_INVALID_PARAMETER;
-		}
-	}
+	const auto decode_result =
+	    AjmControlInstance(instance, AJM_FLAG_CONTROL_RESET, nullptr, 0, nullptr, nullptr);
 
 	AjmWriteResult(result, AJM_SIDEBAND_RESULT_SIZE, decode_result);
 	LOGF("\t instance = 0x%08" PRIx32 "\n", instance);
@@ -1343,12 +1179,6 @@ int KYTY_SYSV_ABI AjmBatchJobRunSplit(AjmBatchInfo* info, uint32_t instance, uin
 	(void)AjmGetInstanceFormat(instance, nullptr, &decoder, &gapless);
 	AjmWriteSideband(flags, sideband_output, sideband_output_size, decoder, gapless, decode_result);
 
-	LOGF("\t instance = 0x%08" PRIx32 ", flags = 0x%016" PRIx64 ", input_buffers = 0x%016" PRIx64
-	     ", input_num = 0x%016" PRIx64 ", output_buffers = 0x%016" PRIx64
-	     ", output_num = 0x%016" PRIx64 "\n",
-	     instance, flags, reinterpret_cast<uint64_t>(input_buffers),
-	     static_cast<uint64_t>(input_buffers_num), reinterpret_cast<uint64_t>(output_buffers),
-	     static_cast<uint64_t>(output_buffers_num));
 	return AjmAppendJob(info, 16 * (input_buffers_num + output_buffers_num) + 32, "run-split");
 }
 

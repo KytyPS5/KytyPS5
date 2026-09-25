@@ -1,7 +1,6 @@
 #include "loader/systemContent.h"
 
 #include "common/assert.h"
-#include "common/byteBuffer.h"
 #include "common/common.h"
 #include "common/file.h"
 #include "common/logging/log.h"
@@ -121,7 +120,7 @@ void Psf::OpenJson(const std::filesystem::path& file_name) {
 	}
 
 	auto buf = f.ReadWholeBuffer();
-	if (buf.Size() == 0) {
+	if (buf.empty()) {
 		LOGF("invalid json file: %s\n", Common::PathToString(file_name).c_str());
 		f.Close();
 		return;
@@ -131,8 +130,8 @@ void Psf::OpenJson(const std::filesystem::path& file_name) {
 	std::vector<std::string> localized_languages;
 	std::vector<std::string> localized_titles;
 
-	const auto* json_begin = reinterpret_cast<const char*>(buf.GetDataConst());
-	const auto* json_end   = json_begin + buf.Size();
+	const auto* json_begin = reinterpret_cast<const char*>(buf.data());
+	const auto* json_end   = json_begin + buf.size();
 	auto        param_json = nlohmann::ordered_json::parse(json_begin, json_end, nullptr, false);
 	if (param_json.is_discarded() || !param_json.is_object()) {
 		LOGF("invalid json file: %s\n", Common::PathToString(file_name).c_str());
@@ -165,6 +164,7 @@ void Psf::OpenJson(const std::filesystem::path& file_name) {
 	add_string_param("contentId", "CONTENT_ID");
 	add_string_param("contentVersion", "APP_VER");
 	add_string_param("appVersion", "APP_VER");
+	add_int_param("attribute3", "ATTRIBUTE3");
 	add_int_param("userDefinedParam1", "USER_DEFINED_PARAM_1");
 	add_int_param("userDefinedParam2", "USER_DEFINED_PARAM_2");
 	add_int_param("userDefinedParam3", "USER_DEFINED_PARAM_3");
@@ -432,12 +432,12 @@ void PlayGo::OpenChunkDefs(const std::filesystem::path& file_name) {
 	auto buf = f.ReadWholeBuffer();
 	f.Close();
 
-	if (buf.Size() == 0) {
+	if (buf.empty()) {
 		LOGF("invalid file: %s\n", Common::PathToString(file_name).c_str());
 		return;
 	}
 
-	const std::string_view xml(reinterpret_cast<const char*>(buf.GetDataConst()), buf.Size());
+	const std::string_view xml(reinterpret_cast<const char*>(buf.data()), buf.size());
 
 	uint32_t max_chunk_id = 0;
 	bool     found        = false;
@@ -509,9 +509,9 @@ void PlayGo::OpenChunkManifest(const std::filesystem::path& file_name) {
 	bool              chunks[1000] {};
 	uint32_t          max_chunk_id = 0;
 	bool              found        = false;
-	const auto*       data         = buf.GetDataConst();
+	const auto*       data         = buf.data();
 
-	for (size_t pos = 0; pos + sizeof(id_field) + sizeof(uint32_t) <= buf.Size(); pos++) {
+	for (size_t pos = 0; pos + sizeof(id_field) + sizeof(uint32_t) <= buf.size(); pos++) {
 		if (std::memcmp(data + pos, id_field, sizeof(id_field)) != 0) {
 			continue;
 		}
@@ -648,20 +648,20 @@ uint64_t SystemContentGetFlexibleMemorySize() {
 	return sc->psf.GetFlexibleMemorySize();
 }
 
-bool SystemContentGetIconPath(std::string* path) {
-	if (path == nullptr) {
-		return false;
-	}
+bool SystemContentGetIconPath(std::filesystem::path* path) {
+    if (path == nullptr) {
+        return false;
+    }
 
-	auto* sc = Common::Singleton<SystemContent>::Instance();
+    auto* sc = Common::Singleton<SystemContent>::Instance();
 
-	if (sc->icon_path.empty()) {
-		return false;
-	}
+    if (sc->icon_path.empty()) {
+        return false;
+    }
 
-	*path = Common::PathToString(sc->icon_path);
+    *path = sc->icon_path;
 
-	return true;
+    return true;
 }
 
 bool SystemContentGetChunksNum(uint32_t* num) {

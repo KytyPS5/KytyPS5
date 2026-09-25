@@ -7,11 +7,13 @@ namespace Libs::Controller {
 
 void Initialize();
 void Shutdown();
+void EmergencyShutdown();
 
 struct Lifecycle {
-	static constexpr const char* name       = "Controller";
-	static constexpr auto        initialize = Libs::Controller::Initialize;
-	static constexpr auto        shutdown   = Libs::Controller::Shutdown;
+	static constexpr const char* name               = "Controller";
+	static constexpr auto        initialize         = Libs::Controller::Initialize;
+	static constexpr auto        shutdown           = Libs::Controller::Shutdown;
+	static constexpr auto        emergency_shutdown = Libs::Controller::EmergencyShutdown;
 };
 
 constexpr int HOST_INPUT_CONTROLLER_ID = -1000;
@@ -44,21 +46,33 @@ enum class Axis {
 	AxisMax
 };
 
+enum class Sensor { Accel, Gyro };
+
 struct PadControllerInformation;
 struct PadData;
 struct PadVibrationParam;
 struct PadLightBarParam;
+struct PadTriggerEffectParam;
 
 inline int controller_get_axis(int min, int max, int value) {
 	int v = (255 * (value - min)) / (max - min);
-	return (v < 0 ? 0 : (v > 255 ? 255 : v));
+	if (v < 0) {
+		return 0;
+	}
+	if (v > 255) {
+		return 255;
+	}
+	return v;
 }
 
-void ControllerConnect(int id);
-void ControllerDisconnect(int id);
-void ControllerButton(int id, uint32_t button, bool down);
-void ControllerAxis(int id, Axis axis, int value);
-void ControllerResetInputState();
+void Connect(int id);
+void Disconnect(int id);
+void SetButton(int id, uint32_t button, bool down);
+void SetAxis(int id, Axis axis, int value);
+void SetRightStick(int id, int x, int y);
+void SetTouchPad(int id, int finger, bool down, float x, float y);
+void SetSensor(int id, Sensor sensor, const float* data, uint64_t time_us);
+void ResetInputState();
 
 int KYTY_SYSV_ABI PadInit();
 int KYTY_SYSV_ABI PadOpen(int user_id, int type, int index, const void* param);
@@ -67,9 +81,11 @@ int KYTY_SYSV_ABI PadSetMotionSensorState(int handle, bool enable);
 int KYTY_SYSV_ABI PadSetAngularVelocityDeadbandState(int handle, bool enable);
 int KYTY_SYSV_ABI PadResetOrientation(int handle);
 int KYTY_SYSV_ABI PadGetControllerInformation(int handle, PadControllerInformation* info);
+int KYTY_SYSV_ABI PadIsRemoteController(int handle, bool* is_remote);
 int KYTY_SYSV_ABI PadReadState(int handle, PadData* data);
 int KYTY_SYSV_ABI PadRead(int handle, PadData* data, int num);
 int KYTY_SYSV_ABI PadSetVibration(int handle, const PadVibrationParam* param);
+int KYTY_SYSV_ABI PadSetTriggerEffect(int handle, const PadTriggerEffectParam* param);
 int KYTY_SYSV_ABI PadResetLightBar(int handle);
 int KYTY_SYSV_ABI PadSetLightBar(int handle, const PadLightBarParam* param);
 

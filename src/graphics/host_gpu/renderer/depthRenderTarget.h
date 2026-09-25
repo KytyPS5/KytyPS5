@@ -11,34 +11,21 @@
 
 namespace Libs::Graphics {
 
-class RenderCommandBuffer;
-
+// Without a stencil plane, Hi-Stencil fields are inactive. An active plane is compatible when
+// Hi-Stencil is disabled or HTile backing is present.
 inline constexpr bool depth_htile_stencil_acceleration_compatible(bool has_stencil, bool has_htile,
                                                                   bool htile_stencil_disabled) {
-	return htile_stencil_disabled || (has_stencil && has_htile);
+	return !has_stencil || htile_stencil_disabled || has_htile;
 }
 
 struct RenderDepthInfo {
+	// Discovery keeps guest image information but can remap the view into a larger cache image.
 	TextureCache::ImageDesc     desc;
-	vk::Format                  format                   = vk::Format::eUndefined;
-	uint32_t                    width                    = 0;
-	uint32_t                    height                   = 0;
-	uint32_t                    samples                  = 1;
-	bool                        htile                    = false;
-	uint64_t                    depth_buffer_size        = 0;
-	uint64_t                    depth_buffer_vaddr       = 0;
-	uint64_t                    depth_tile_swizzle       = 0;
-	uint64_t                    stencil_buffer_size      = 0;
-	uint64_t                    stencil_buffer_vaddr     = 0;
-	uint64_t                    stencil_tile_swizzle     = 0;
-	uint64_t                    htile_buffer_size        = 0;
-	uint64_t                    htile_buffer_vaddr       = 0;
-	uint64_t                    htile_tile_swizzle       = 0;
 	bool                        depth_clear_enable       = false;
 	bool                        depth_load_clear_enable  = false;
-	bool                        depth_meta_clear_enable  = false;
 	float                       depth_clear_value        = 0.0f;
 	bool                        depth_test_enable        = false;
+	// Effective draw writes; discovery applies test, target-write and clear controls.
 	bool                        depth_write_enable       = false;
 	vk::CompareOp               depth_compare_op         = vk::CompareOp::eNever;
 	bool                        depth_bounds_test_enable = false;
@@ -47,28 +34,48 @@ struct RenderDepthInfo {
 	bool                        stencil_clear_enable     = false;
 	uint8_t                     stencil_clear_value      = 0;
 	bool                        stencil_test_enable      = false;
-	PipelineStencilStaticState  stencil_static_front;
-	PipelineStencilStaticState  stencil_static_back;
-	PipelineStencilDynamicState stencil_dynamic_front;
-	PipelineStencilDynamicState stencil_dynamic_back;
+	vk::StencilOpState          stencil_front;
+	vk::StencilOpState          stencil_back;
 	ImageId                     image_id;
-	vk::ImageView               image_view = nullptr;
-	uint64_t                    vaddr[3]   = {};
-	uint64_t                    size[3]    = {};
-	int                         vaddr_num  = 0;
 
 	[[nodiscard]] vk::ImageAspectFlags AttachmentWriteAspects() const;
 };
 
-inline bool depth_attachment_read_only(const RenderDepthInfo& depth) {
-	return !depth.AttachmentWriteAspects();
+inline vk::ImageAspectFlags DepthFeedbackAspects(vk::ImageAspectFlags draw_writes,
+                                                 const ImageViewInfo& target,
+                                                 const ImageViewInfo& sampled) {
+	if (!ImageRangeOverlaps(target.base_level, target.level_count, sampled.base_level,
+	                        sampled.level_count) ||
+	    !ImageRangeOverlaps(target.base_layer, target.layer_count, sampled.base_layer,
+	                        sampled.layer_count)) {
+		return {};
+	}
+	return draw_writes & sampled.aspect;
+}
+
+inline vk::ImageAspectFlags DepthReadableAspects(vk::ImageLayout layout) {
+	switch (layout) {
+		case vk::ImageLayout::eDepthReadOnlyOptimal:
+		case vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal:
+			return vk::ImageAspectFlagBits::eDepth;
+		case vk::ImageLayout::eStencilReadOnlyOptimal:
+		case vk::ImageLayout::eDepthAttachmentStencilReadOnlyOptimal:
+			return vk::ImageAspectFlagBits::eStencil;
+		case vk::ImageLayout::eDepthStencilReadOnlyOptimal:
+		case vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT:
+		case vk::ImageLayout::eGeneral:
+			return vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
+		default:
+			return {};
+	}
 }
 
 inline vk::ImageLayout depth_attachment_layout(const RenderDepthInfo& depth) {
-	const auto available     = ImageViewOps::DepthAspectMask(depth.format);
+	const auto available     = ImageViewOps::DepthAspectMask(depth.desc.view_info.format);
 	const auto writes        = depth.AttachmentWriteAspects();
 	const bool has_depth     = static_cast<bool>(available & vk::ImageAspectFlagBits::eDepth);
 	const bool has_stencil   = static_cast<bool>(available & vk::ImageAspectFlagBits::eStencil);
+	// The attachment layout must permit load clears as well as draw writes.
 	const bool depth_write   = static_cast<bool>(writes & vk::ImageAspectFlagBits::eDepth);
 	const bool stencil_write = static_cast<bool>(writes & vk::ImageAspectFlagBits::eStencil);
 	if (!has_stencil) {

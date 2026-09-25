@@ -11,6 +11,7 @@
 #include "loader/symbolDatabase.h"
 
 #include <algorithm>
+#include <cstring>
 #include <vector>
 
 namespace Libs {

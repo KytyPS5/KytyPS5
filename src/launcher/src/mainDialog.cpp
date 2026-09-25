@@ -1,13 +1,14 @@
 #include "mainDialog.h"
 
-#include "common.h"
 #include "configuration.h"
 #include "configurationItem.h"
 #include "configurationListWidget.h"
 #include "patchesDialog.h"
+#include "updateChecker.h"
 
 #include <QApplication>
 #include <QByteArray>
+#include <QCheckBox>
 #include <QDialog>
 #include <QDir>
 #include <QFile>
@@ -15,6 +16,8 @@
 #include <QIODevice>
 #include <QLabel>
 #include <QMessageBox>
+#include <QObject>
+#include <QPointer>
 #include <QProcess>
 #include <QRadioButton>
 #include <QRegularExpression>
@@ -23,6 +26,8 @@
 #include <QTextStream>
 #include <QVariant>
 #include <QtCore>
+
+#include <cstdint>
 
 #include "ui_main_dialog.h"
 
@@ -53,21 +58,10 @@ constexpr DWORD CMD_Y_CHARS = 1000;
 #endif
 constexpr char SETTINGS_MAIN_DIALOG[]        = "MainDialog";
 constexpr char SETTINGS_MAIN_LAST_GEOMETRY[] = "geometry";
-
-class DetachableProcess: public QProcess {
-	Q_OBJECT;
-
-public:
-	explicit DetachableProcess(QObject* parent = nullptr): QProcess(parent) {}
-	void Detach() {
-		this->waitForStarted();
-		setProcessState(QProcess::NotRunning);
-	}
-};
+constexpr char SETTINGS_CHECK_UPDATES[]       = "check_updates_on_startup";
 
 class MainDialogPrivate: public QObject {
 	Q_OBJECT
-	KYTY_QT_CLASS_NO_COPY(MainDialogPrivate);
 
 public:
 	explicit MainDialogPrivate(QObject* parent = nullptr): QObject(parent) {}
@@ -88,17 +82,20 @@ public:
 
 private:
 	static QByteArray g_last_geometry;
+	static bool       g_check_updates_on_startup;
 
-	Ui::MainDialog* m_ui          = {nullptr};
-	MainDialog*     m_main_dialog = nullptr;
+	Ui::MainDialog* m_ui             = {nullptr};
+	MainDialog*     m_main_dialog    = nullptr;
+	UpdateChecker*  m_update_checker = nullptr;
 	QString         m_interpreter;
 
-	/*DetachableProcess*/ QProcess m_process;
+	QProcess m_process;
 
-	ConfigurationItem* m_running_item = nullptr;
+	QPointer<ConfigurationItem> m_running_item;
 };
 
 QByteArray MainDialogPrivate::g_last_geometry;
+bool       MainDialogPrivate::g_check_updates_on_startup = true;
 
 MainDialog::MainDialog(QWidget* parent): QDialog(parent), m_p(new MainDialogPrivate(this)) {
 	m_p->Setup(this);
@@ -113,7 +110,10 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 	m_ui->setupUi(main_dialog);
 
 	m_main_dialog = main_dialog;
-	m_ui->widget->SetMainDialog(main_dialog);
+	m_update_checker = new UpdateChecker(main_dialog);
+	m_ui->check_updates_on_startup->setChecked(g_check_updates_on_startup);
+	m_ui->check_updates_link->setVisible(UpdateChecker::IsSupported());
+	m_ui->check_updates_on_startup->setVisible(UpdateChecker::IsSupported());
 
 	main_dialog->setWindowFlags(Qt::Dialog /*| Qt::MSWindowsFixedSizeDialogHint*/);
 
@@ -121,6 +121,14 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 	        Qt::QueuedConnection);
 	connect(m_ui->widget, &ConfigurationListWidget::Select, this, &MainDialogPrivate::Update);
 	connect(m_ui->widget, &ConfigurationListWidget::Run, this, &MainDialogPrivate::Run);
+	connect(m_ui->check_updates_link, &QLabel::linkActivated, this,
+	        [this](const QString&) { m_update_checker->Check(true); });
+	connect(m_update_checker, &UpdateChecker::CheckingChanged, m_ui->check_updates_link,
+	        &QLabel::setDisabled);
+	connect(m_ui->check_updates_on_startup, &QCheckBox::toggled, this, [this](bool checked) {
+		g_check_updates_on_startup = checked;
+		m_ui->widget->WriteSettings();
+	});
 	connect(main_dialog, &MainDialog::Resize, [this]() {
 		g_last_geometry = m_main_dialog->saveGeometry();
 		m_ui->widget->WriteSettings();
@@ -134,8 +142,6 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 		        }
 		        Update();
 	        });
-
-	// connect(main_dialog, &MainDialog::Quit, [=]() { m_process.Detach(); });
 
 	m_ui->label_settings_file->setText(tr("Settings file: ") + m_ui->widget->GetSettingsFile());
 
@@ -180,14 +186,17 @@ void MainDialogPrivate::FindInterpreter() {
 		return;
 	}
 
-	if (!m_ui->widget->EnsureGameDirectory()) {
-		QApplication::quit();
-		return;
-	}
+	// Prompt for a game folder when none are configured, but keep the launcher
+	// open if the user dismisses the dialog (quitting here can segfault during
+	// nested modal shutdown / background compatibility load).
+	m_ui->widget->EnsureGameDirectory();
 
 	m_ui->label_settings_file->setText(tr("Settings file: ") + m_ui->widget->GetSettingsFile());
 
 	Update();
+	if (m_ui->check_updates_on_startup->isChecked()) {
+		m_update_checker->Check(false);
+	}
 }
 
 static QString BoolArg(bool value) {
@@ -204,8 +213,21 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 
 	args << "--screen-width" << r.at(0);
 	args << "--screen-height" << r.at(1);
+	args << "--user-name" << info.user_name;
+	args << "--user-id" << QString::number(info.user_id);
+	if (!info.audio_input_device.isEmpty()) {
+		args << "--mic" << info.audio_input_device;
+	}
+	args << "--present-mode" << EnumToText(info.present_mode);
+	if (info.gpu_index >= 0) {
+		args << "--gpu" << QString::number(info.gpu_index);
+	}
 	if (info.fullscreen_enabled) {
 		args << "--fullscreen";
+	}
+	args << "--readback-linear-images" << BoolArg(info.readback_linear_images);
+	if (info.tessellation_enabled) {
+		args << "--tessellation";
 	}
 	args << "--vblank-frequency" << QString::number(info.vblank_frequency);
 	args << "--console-language" << QString::number(info.console_language);
@@ -218,8 +240,13 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	args << "--command-buffer-dump-folder" << info.command_buffer_dump_folder;
 	args << "--printf-direction" << EnumToText(info.printf_direction);
 	args << "--printf-output-file" << info.printf_output_file;
-	args << "--profiler-direction" << EnumToText(info.profiler_direction);
+	if (info.profiler_enabled) {
+		args << "--profile";
+	}
 	args << "--spirv-debug-printf" << "false";
+	if (info.amd_cpu_enabled) {
+		args << "--amd-cpu";
+	}
 #if defined(_WIN32)
 	if (info.red_zone_protection_enabled) {
 		args << "--redzone";
@@ -335,6 +362,23 @@ static bool FindTerminal(QString* program, QStringList* prefix) {
 }
 #endif
 
+#if defined(_WIN32)
+// Quote one token for cmd.exe so paths with spaces survive /K parsing.
+static QString WinCmdQuote(QString value) {
+	value.replace(QLatin1Char('"'), QStringLiteral("\\\""));
+	return QLatin1Char('"') + value + QLatin1Char('"');
+}
+
+static QString BuildWinCmdKCommand(const QString& interpreter, const QStringList& args) {
+	QString command = WinCmdQuote(QDir::toNativeSeparators(interpreter));
+	for (const auto& arg: args) {
+		command += QLatin1Char(' ');
+		command += WinCmdQuote(arg);
+	}
+	return command;
+}
+#endif
+
 void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
 	const auto& interpreter = m_p->GetInterpreter();
 
@@ -359,22 +403,23 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
 	{
 		QString     terminal;
 		QStringList terminal_prefix;
+		// Pass the script as a file argument (not bash -c) so paths with spaces work.
 		if (FindTerminal(&terminal, &terminal_prefix)) {
 			process->setProgram(terminal);
-			process->setArguments(terminal_prefix + QStringList {"bash", "-c", bash_file_name});
+			process->setArguments(terminal_prefix + QStringList {"bash", bash_file_name});
 		} else {
 			// Run without a terminal as a fallback.
 			process->setProgram(QStringLiteral("bash"));
-			process->setArguments({QStringLiteral("-c"), bash_file_name});
+			process->setArguments({bash_file_name});
 		}
 	}
 #elif defined(_WIN32)
 	{
+		// Use nativeArguments so Qt does not re-quote the /K command string.
 		process->setProgram(CMD_EXE);
-		QStringList process_args;
-		process_args << QStringLiteral("/K") << interpreter;
-		process_args += args;
-		process->setArguments(process_args);
+		process->setArguments({});
+		process->setNativeArguments(QStringLiteral("/K \"") +
+		                            BuildWinCmdKCommand(interpreter, args) + QLatin1Char('"'));
 	}
 #else
 	process->setProgram(interpreter);
@@ -426,6 +471,7 @@ void MainDialogPrivate::WriteSettings(QSettings& s) {
 	if (!g_last_geometry.isEmpty()) {
 		s.setValue(SETTINGS_MAIN_LAST_GEOMETRY, g_last_geometry);
 	}
+	s.setValue(SETTINGS_CHECK_UPDATES, g_check_updates_on_startup);
 
 	s.endGroup();
 }
@@ -434,6 +480,7 @@ void MainDialogPrivate::ReadSettings(QSettings& s) {
 	s.beginGroup(SETTINGS_MAIN_DIALOG);
 
 	g_last_geometry = s.value(SETTINGS_MAIN_LAST_GEOMETRY, g_last_geometry).toByteArray();
+	g_check_updates_on_startup = s.value(SETTINGS_CHECK_UPDATES, true).toBool();
 
 	s.endGroup();
 }
@@ -446,10 +493,8 @@ void MainDialogPrivate::Run() {
 
 	m_running_item->SetRunning(true);
 
-	Configuration info;
-	info.CopyFrom(m_running_item->GetInfo());
-	info.host_input_mapping = m_ui->widget->GetHostInputMapping();
-	m_main_dialog->RunInterpreter(&m_process, info);
+	auto info = m_ui->widget->CreateConfiguration(*m_running_item);
+	m_main_dialog->RunInterpreter(&m_process, *info);
 
 	Update();
 }

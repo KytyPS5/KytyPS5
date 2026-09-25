@@ -110,6 +110,38 @@ void TestValueChangeAndWake() {
   Check(result == OK, "a value change plus wake releases the waiter");
 }
 
+void TestNanosecondTimeout() {
+  uint64_t word = 0;
+  const auto start = std::chrono::steady_clock::now();
+  Check(Wait64(&word, 0, std::chrono::milliseconds(1)) ==
+            Libs::LibKernel::KERNEL_ERROR_ETIMEDOUT,
+        "64-bit timespec wait expires");
+  Check(std::chrono::steady_clock::now() - start >= std::chrono::milliseconds(1),
+        "timespec wait preserves its deadline");
+  Check(Wait64(&word, 0, std::chrono::nanoseconds(0)) ==
+            Libs::LibKernel::KERNEL_ERROR_ETIMEDOUT,
+        "zero timespec polls a matching value");
+  Check(Wait64(&word, 1, std::chrono::nanoseconds(0)) == OK,
+        "zero timespec succeeds on mismatch");
+
+  g_signal_poll_count.store(0, std::memory_order_relaxed);
+  std::atomic<bool> returned{false};
+  std::thread waker([&] {
+    while (g_signal_poll_count.load(std::memory_order_relaxed) < 2 &&
+           !returned.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+    Store(&word, UINT64_C(0x100000000));
+    Check(Wake(&word, 1) == OK, "wake releases a long timespec wait");
+  });
+  const int result = Wait64(&word, 0, std::chrono::nanoseconds::max(), CountSignalPoll);
+  returned.store(true, std::memory_order_release);
+  waker.join();
+  Check(result == OK, "long timespec wait does not overflow its deadline");
+  Check(g_signal_poll_count.load(std::memory_order_relaxed) > 1,
+        "timespec wait continues polling guest signals");
+}
+
 void TestWakeOneThenAll() {
   constexpr int WAITER_COUNT = 4;
   uint32_t word = 0;
@@ -260,6 +292,7 @@ int main() {
   TestMismatchReturnsImmediately();
   TestTimeout();
   TestValueChangeAndWake();
+  TestNanosecondTimeout();
   TestWakeOneThenAll();
   TestAddressesAreIsolated();
   TestCompareRegisterWakeRace();

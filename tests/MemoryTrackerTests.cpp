@@ -1,3 +1,4 @@
+#include "common/hostException.h"
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
@@ -11,6 +12,7 @@
 #include <semaphore>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -21,6 +23,7 @@
 #undef min
 #undef max
 #else
+#include <csignal>
 #include <map>
 #include <sys/mman.h>
 #include <sys/wait.h>
@@ -29,9 +32,11 @@
 
 namespace {
 
+using Libs::Graphics::GuestRange;
 using Libs::Graphics::MemoryTracker;
 using Libs::Graphics::PageManager;
 using Libs::Graphics::RangeSet;
+using Libs::Graphics::TRACKER_ADDRESS_SIZE;
 
 void Check(bool value, const char *text) {
   if (!value) {
@@ -174,13 +179,10 @@ uint8_t *Allocate(PageManager &manager, uint64_t pages) {
       VirtualAlloc(reinterpret_cast<void *>(base), size,
                    MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
   Check(memory == reinterpret_cast<void *>(base), "fixed VirtualAlloc failed");
-  manager.OnGpuMap(base, size);
   return memory;
 }
 
-void Release(PageManager &manager, uint8_t *memory, uint64_t size) {
-  const auto address = reinterpret_cast<uint64_t>(memory);
-  manager.OnGpuUnmap(address, size);
+void Release(uint8_t *memory) {
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 
@@ -191,17 +193,48 @@ void TestRangeSet() {
   ranges.Add(0x1200, 0x40);
   Check(ranges.Contains(0x1010, 0xe0) && !ranges.Contains(0x1010, 0x200),
         "range set containment did not require full coverage");
-  auto intersections = ranges.Intersections(0x1070, 0x1b0);
-  Check(intersections.size() == 2 && intersections[0].address == 0x1070 &&
-            intersections[0].size == 0x90 &&
-            intersections[1].address == 0x1200 && intersections[1].size == 0x20,
+  Check(ranges.Intersects(0x0fff, 2) && ranges.Intersects(0x11ff, 2) &&
+            !ranges.Intersects(0x1100, 0x100) &&
+            !ranges.Intersects(0x1240, 1),
+        "range set intersection did not preserve half-open boundaries");
+  std::vector<std::pair<uint64_t, uint64_t>> intersections;
+  ranges.ForEachInRange(0x1070, 0x1b0, [&](uint64_t start, uint64_t end) {
+    intersections.emplace_back(start, end);
+  });
+  Check(intersections.size() == 2 && intersections[0].first == 0x1070 &&
+            intersections[0].second == 0x1100 &&
+            intersections[1].first == 0x1200 && intersections[1].second == 0x1220,
         "range set did not merge and intersect exact byte ranges");
   ranges.Subtract(0x1040, 0x1e0);
-  intersections = ranges.Intersections(0x1000, 0x300);
-  Check(intersections.size() == 2 && intersections[0].address == 0x1000 &&
-            intersections[0].size == 0x40 &&
-            intersections[1].address == 0x1220 && intersections[1].size == 0x20,
+  intersections.clear();
+  ranges.ForEachInRange(0x1000, 0x300, [&](uint64_t start, uint64_t end) {
+    intersections.emplace_back(start, end);
+  });
+  Check(intersections.size() == 2 && intersections[0].first == 0x1000 &&
+            intersections[0].second == 0x1040 &&
+            intersections[1].first == 0x1220 && intersections[1].second == 0x1240,
         "range set subtraction did not preserve both exact tails");
+}
+
+void TestGuestRange() {
+  constexpr GuestRange empty{};
+  constexpr GuestRange first_byte{1, 1};
+  constexpr GuestRange last_byte{TRACKER_ADDRESS_SIZE - 1, 1};
+
+  static_assert(empty.Empty() && !empty.Valid() && empty.ValidOrEmpty());
+  static_assert(!first_byte.Empty() && first_byte.Valid() &&
+                first_byte.ValidOrEmpty() && first_byte.End() == 2);
+  static_assert(last_byte.Valid() && last_byte.End() == TRACKER_ADDRESS_SIZE);
+
+  Check(!GuestRange{0, 1}.Empty() && !GuestRange{0, 1}.ValidOrEmpty(),
+        "zero-address nonempty guest range is rejected");
+  Check(!GuestRange{1, 0}.Empty() && !GuestRange{1, 0}.ValidOrEmpty(),
+        "nonzero-address empty guest range is rejected");
+  Check(!GuestRange{TRACKER_ADDRESS_SIZE, 1}.Valid(),
+        "first address beyond the guest range is rejected");
+  Check(!GuestRange{TRACKER_ADDRESS_SIZE - 1, 2}.Valid(),
+        "guest range crossing the address-space end is rejected");
+  Check(!GuestRange{UINT64_MAX, 2}.Valid(), "wrapping guest range is rejected");
 }
 
 void TestQueriesDoNotRequireMappedOwnership() {
@@ -242,7 +275,7 @@ void TestConcurrentRegionPublication() {
   second.join();
 
   tracker.UntrackMemory(address, page_size);
-  Release(page_manager, memory, page_size);
+  Release(memory);
   Check(cpu_dirty_results.load(std::memory_order_relaxed) == 2,
         "concurrent region publication lost initial CPU ownership");
 }
@@ -276,7 +309,7 @@ void TestCpuDirtyUpload() {
   Check(tracker.IsRegionCpuModified(address, page_size) && IsWritable(memory),
         "explicit CPU dirtiness did not release write protection");
   tracker.UntrackMemory(address, page_size * 2);
-  Release(page_manager, memory, page_size * 2);
+  Release(memory);
 }
 
 void TestRangeInvalidation() {
@@ -291,7 +324,6 @@ void TestRangeInvalidation() {
   Check(memory == reinterpret_cast<void *>(base),
         "range invalidation allocation failed");
   const auto address = reinterpret_cast<uint64_t>(memory);
-  page_manager.OnGpuMap(address, size);
 
   tracker.ForEachUploadRange(
       address, size, true, [](uint64_t, uint64_t) noexcept {},
@@ -313,7 +345,7 @@ void TestRangeInvalidation() {
   Check(flushes == 1,
         "clean range invalidation unnecessarily requested a GPU flush");
   tracker.UntrackMemory(address, size);
-  Release(page_manager, memory, size);
+  Release(memory);
 }
 
 void TestGpuReacquisitionAfterInvalidation() {
@@ -360,7 +392,7 @@ void TestGpuReacquisitionAfterInvalidation() {
   tracker.UnmarkRegionAsGpuModified(address, page_size);
   tracker.MarkRegionAsCpuModified(address, page_size);
   tracker.UntrackMemory(address, page_size);
-  Release(page_manager, memory, page_size);
+  Release(memory);
 }
 
 void TestGpuDirtyBits() {
@@ -384,7 +416,7 @@ void TestGpuDirtyBits() {
         "GPU dirty state did not restore write-only tracking");
   tracker.MarkRegionAsCpuModified(address, page_size);
   tracker.UntrackMemory(address, page_size * 2);
-  Release(page_manager, memory, page_size * 2);
+  Release(memory);
 }
 
 void TestExactDirtyIntervalsSharingTrackerPage() {
@@ -411,7 +443,7 @@ void TestExactDirtyIntervalsSharingTrackerPage() {
         "disjoint byte dirtiness duplicated the page watcher");
 
   exact_dirty.Subtract(address + 64, 16);
-  if (exact_dirty.Intersections(address, page_size).empty()) {
+  if (!exact_dirty.Intersects(address, page_size)) {
     tracker.UnmarkRegionAsGpuModified(address, page_size);
   }
   Check(g_protection_calls == 1 &&
@@ -420,7 +452,7 @@ void TestExactDirtyIntervalsSharingTrackerPage() {
         "draining one exact interval prematurely released its shared page");
 
   exact_dirty.Subtract(address + 192, 32);
-  if (exact_dirty.Intersections(address, page_size).empty()) {
+  if (!exact_dirty.Intersects(address, page_size)) {
     tracker.UnmarkRegionAsGpuModified(address, page_size);
   }
   Check(g_protection_calls == 2 &&
@@ -429,7 +461,7 @@ void TestExactDirtyIntervalsSharingTrackerPage() {
         "draining the final exact interval did not release its tracker page");
 
   tracker.UntrackMemory(address, page_size);
-  Release(page_manager, memory, page_size);
+  Release(memory);
 }
 
 void TestGpuDownloadProtectionMirrors() {
@@ -446,28 +478,31 @@ void TestGpuDownloadProtectionMirrors() {
   tracker.MarkRegionAsGpuModified(address + 16, 32);
   tracker.MarkRegionAsGpuModified(address + page_size * 2 + 16, 32);
 
-  std::vector<RangeSet::Range> visited;
+  std::vector<std::pair<uint64_t, uint64_t>> visited;
   ResetProtectionLog();
   tracker.ForEachDownloadRange<false>(
       address, page_size * 3,
       [&](uint64_t range_address, uint64_t range_size) noexcept {
         visited.push_back({range_address, range_size});
       });
-  Check(visited.size() == 2 && visited[0].address == address &&
-            visited[0].size == page_size &&
-            visited[1].address == address + page_size * 2 &&
-            visited[1].size == page_size && g_protection_calls == 0 &&
+  Check(visited.size() == 2 && visited[0].first == address &&
+            visited[0].second == page_size &&
+            visited[1].first == address + page_size * 2 &&
+            visited[1].second == page_size && g_protection_calls == 0 &&
             tracker.IsRegionGpuModified(address, page_size * 3),
         "non-clearing download changed protection or lost sparse ranges");
 
   visited.clear();
+  bool protected_during_download = false;
   tracker.ForEachDownloadRange<true>(
       address + 16, 32,
       [&](uint64_t range_address, uint64_t range_size) noexcept {
+        protected_during_download = Protection(memory) == PAGE_NOACCESS;
         visited.push_back({range_address, range_size});
       });
-  Check(visited.size() == 1 && visited[0].address == address &&
-            visited[0].size == page_size && g_protection_log.size() == 1 &&
+  Check(protected_during_download && visited.size() == 1 &&
+            visited[0].first == address &&
+            visited[0].second == page_size && g_protection_log.size() == 1 &&
             g_protection_log[0].address == address &&
             g_protection_log[0].size == page_size &&
             g_protection_log[0].mode == Common::VirtualMemory::Mode::Read &&
@@ -502,7 +537,7 @@ void TestGpuDownloadProtectionMirrors() {
       "CPU-dirty transition did not release only its write watcher");
 
   tracker.UntrackMemory(address, page_size * 4);
-  Release(page_manager, memory, page_size * 4);
+  Release(memory);
 }
 
 void TestCrossRegionUpload() {
@@ -518,7 +553,6 @@ void TestCrossRegionUpload() {
   Check(memory == reinterpret_cast<void *>(base), "fixed VirtualAlloc failed");
   const auto address = reinterpret_cast<uint64_t>(memory);
   const auto boundary = (address + region_size - 1) & ~(region_size - 1);
-  page_manager.OnGpuMap(address, region_size * 2);
   uint32_t ranges = 0;
   tracker.ForEachUploadRange(
       boundary - page_size, page_size * 2, false,
@@ -530,7 +564,7 @@ void TestCrossRegionUpload() {
         "cross-region upload did not clear and protect both regions");
   tracker.MarkRegionAsCpuModified(boundary - page_size, page_size * 2);
   tracker.UntrackMemory(address, region_size * 2);
-  Release(page_manager, memory, region_size * 2);
+  Release(memory);
 }
 
 void TestUploadDoesNotSerializeDisjointRegion() {
@@ -580,7 +614,7 @@ void TestUploadDoesNotSerializeDisjointRegion() {
   tracker.UnmarkRegionAsGpuModified(allocation_base, page_size);
   tracker.MarkRegionAsCpuModified(allocation_base, page_size);
   tracker.UntrackMemory(allocation_base, region_size * 2);
-  Release(page_manager, memory, region_size * 2);
+  Release(memory);
   Check(completed_while_upload_blocked &&
             query_result.load(std::memory_order_relaxed),
         "upload callback serialized an unrelated tracker region");
@@ -610,11 +644,14 @@ void TestDownloadDoesNotSerializeDisjointRegion() {
   std::binary_semaphore finish_download{0};
   std::binary_semaphore mutation_finished{0};
   std::jthread downloader([&] {
-    tracker.ForEachDownloadRange<false>(allocation_base, page_size,
-                                        [&](uint64_t, uint64_t) noexcept {
-                                          download_entered.release();
-                                          finish_download.acquire();
-                                        });
+    tracker.ForEachDownloadRange<false>(
+        allocation_base, second_region + page_size - allocation_base,
+        [&](uint64_t address, uint64_t) noexcept {
+          if (address == allocation_base) {
+            download_entered.release();
+            finish_download.acquire();
+          }
+        });
   });
   download_entered.acquire();
   std::jthread mutation([&] {
@@ -636,7 +673,7 @@ void TestDownloadDoesNotSerializeDisjointRegion() {
   tracker.MarkRegionAsCpuModified(allocation_base, page_size);
   tracker.MarkRegionAsCpuModified(second_region, page_size);
   tracker.UntrackMemory(allocation_base, region_size * 2);
-  Release(page_manager, memory, region_size * 2);
+  Release(memory);
   Check(completed_while_download_blocked && both_gpu_owned,
         "download callback serialized an unrelated tracker region");
 }
@@ -699,7 +736,7 @@ void TestGpuUnmarkUsesRegionMask() {
         "cross-region GPU unmark did not use one update per 4 MiB region");
 
   tracker.UntrackMemory(allocation_base, region_size * 2);
-  Release(page_manager, memory, region_size * 2);
+  Release(memory);
 }
 
 void TestFullRegionGpuUnmarkBatching() {
@@ -740,7 +777,7 @@ void TestFullRegionGpuUnmarkBatching() {
       "full-region GPU unmark did not use one exact 4 MiB protection request");
 
   tracker.UntrackMemory(allocation_base, region_size * 2);
-  Release(page_manager, memory, region_size * 2);
+  Release(memory);
 }
 
 [[noreturn]] void RunDeathCase(const char *name) {
@@ -810,6 +847,68 @@ void TestFatalPaths() {
   }
 }
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+void *g_fault_stack = nullptr;
+constexpr size_t FAULT_STACK_SIZE = 64 * 1024;
+volatile sig_atomic_t g_stack_faults = 0;
+
+bool HandleStackFault(const Common::HostException::ExceptionInfo &info) {
+  using namespace Common::HostException;
+  stack_t active_stack{};
+  const auto fault_address = reinterpret_cast<uintptr_t>(g_fault_stack) +
+                             FAULT_STACK_SIZE - sizeof(uintptr_t);
+  if (info.type != ExceptionType::AccessViolation ||
+      info.access_violation_type != AccessViolationType::Write ||
+      info.access_violation_vaddr != fault_address ||
+      ::sigaltstack(nullptr, &active_stack) != 0 ||
+      (active_stack.ss_flags & SS_ONSTACK) == 0) {
+    std::_Exit(1);
+  }
+  g_stack_faults = 1;
+  return ::mprotect(g_fault_stack, FAULT_STACK_SIZE,
+                    PROT_READ | PROT_WRITE) == 0;
+}
+
+// A stack write must fault before any signal frame can use the protected stack.
+__attribute__((naked)) void WriteProtectedStack(void *) {
+  asm volatile("mov %rsp, %rax\n"
+               "mov %rdi, %rsp\n"
+               "push %rax\n"
+               "pop %rsp\n"
+               "ret\n");
+}
+
+void TestFaultOnProtectedStack() {
+  const pid_t pid = ::fork();
+  Check(pid >= 0, "stack fault fork failed");
+  if (pid == 0) {
+    std::thread worker([] {
+      Check(Common::HostException::InitializeThreadSignalStack(),
+            "initialize thread signal stack failed");
+      Check(Common::HostException::InstallHandler(HandleStackFault),
+            "install stack fault handler failed");
+      g_fault_stack = ::mmap(nullptr, FAULT_STACK_SIZE, PROT_READ,
+                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+      Check(g_fault_stack != MAP_FAILED, "allocate protected stack failed");
+      WriteProtectedStack(static_cast<char *>(g_fault_stack) + FAULT_STACK_SIZE);
+      Check(g_stack_faults == 1, "protected stack write did not resume");
+      struct sigaction action{};
+      Check(::sigaction(SIGSEGV, nullptr, &action) == 0 &&
+                action.sa_handler != SIG_DFL,
+            "stack fault reset the process handler");
+      Check(::munmap(g_fault_stack, FAULT_STACK_SIZE) == 0,
+            "release protected stack failed");
+    });
+    worker.join();
+    std::_Exit(0);
+  }
+  int status = 0;
+  Check(::waitpid(pid, &status, 0) == pid && WIFEXITED(status) &&
+            WEXITSTATUS(status) == 0,
+        "fault on a protected stack did not recover");
+}
+#endif
+
 } // namespace
 
 namespace Libs::LibKernel::Memory {
@@ -825,6 +924,7 @@ int main(int argc, char **argv) {
   if (argc == 3 && std::strcmp(argv[1], "--death") == 0) {
     RunDeathCase(argv[2]);
   }
+  TestGuestRange();
   TestRangeSet();
   TestQueriesDoNotRequireMappedOwnership();
   TestConcurrentRegionPublication();
@@ -840,6 +940,9 @@ int main(int argc, char **argv) {
   TestGpuUnmarkUsesRegionMask();
   TestFullRegionGpuUnmarkBatching();
   TestFatalPaths();
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+  TestFaultOnProtectedStack();
+#endif
   std::puts("MemoryTrackerTests: all cases passed");
   return 0;
 }

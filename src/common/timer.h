@@ -24,12 +24,6 @@ public:
 	// return time in seconds
 	[[nodiscard]] double GetTimeS() const;
 
-	// return time in ticks
-	[[nodiscard]] uint64_t GetTicks() const;
-
-	// return ticks frequency
-	[[nodiscard]] uint64_t GetFrequency() const;
-
 	KYTY_CLASS_NO_COPY(Timer);
 
 	[[nodiscard]] static uint64_t QueryPerformanceFrequency();

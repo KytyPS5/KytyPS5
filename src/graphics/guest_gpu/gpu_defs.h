@@ -26,6 +26,10 @@ enum class PrimitiveType : uint32_t {
 	kPolygon            = 21,
 };
 
+constexpr bool IsRectList(PrimitiveType type) {
+	return type == PrimitiveType::kRectList || type == PrimitiveType::kRectListLegacy;
+}
+
 enum class IndexType : uint32_t {
 	kIndex16 = 0,
 	kIndex32 = 1,
@@ -407,7 +411,19 @@ enum class BufferFormat : uint32_t {
 	k5_5_5_1UNorm       = 134,
 	k1_5_5_5UNorm       = 135,
 	k4_4_4_4UNorm       = 136,
+	kFmask8_S2_F1       = 156,
+	kFmask8_S4_F1       = 157,
+	kFmask8_S8_F1       = 158,
+	kFmask8_S2_F2       = 159,
+	kFmask8_S4_F2       = 160,
 	kFmask8_S4_F4       = 161,
+	kFmask16_S16_F1     = 162,
+	kFmask16_S8_F2      = 163,
+	kFmask32_S16_F2     = 164,
+	kFmask32_S8_F4      = 165,
+	kFmask32_S8_F8      = 166,
+	kFmask64_S16_F4     = 167,
+	kFmask64_S16_F8     = 168,
 	kBc1UNorm           = 169,
 	kBc1Srgb            = 170,
 	kBc2UNorm           = 171,

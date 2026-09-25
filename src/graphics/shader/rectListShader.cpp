@@ -1,10 +1,9 @@
 #include "graphics/shader/rectListShader.h"
 
 #include "common/assert.h"
-#include "graphics/shader/recompiler/emitter/SpirvBuilder.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shader.h"
-#include "spirv/unified1/spirv.hpp11"
 
 #include <array>
 #include <bit>
@@ -18,11 +17,6 @@ namespace {
 using ShaderRecompiler::Spirv::Builder;
 
 constexpr uint32_t SpirvVersion15 = 0x00010500u;
-
-template <typename T>
-constexpr uint32_t Word(T value) {
-	return static_cast<uint32_t>(value);
-}
 
 struct Parameter {
 	uint32_t input_location  = 0;
@@ -46,12 +40,15 @@ std::vector<Parameter> GetParameters(const ShaderVertexInputInfo& vertex_info,
 	}
 
 	std::vector<Parameter> parameters;
+	std::array<bool, 32> output_locations {};
 	for (const auto input: active_inputs) {
 		const auto input_location = ShaderPixelParameterMappedLocation(*pixel_info, input);
-		if ((vertex_info.param_export_mask & (1u << input_location)) != 0) {
-			parameters.push_back({input_location,
-			                      ShaderPixelParameterLocation(*pixel_info, active_inputs, input),
+		const auto output_location = ShaderPixelParameterLocation(*pixel_info, active_inputs, input);
+		if ((vertex_info.stage.program->param_export_mask & (1u << input_location)) != 0 &&
+		    !output_locations[output_location]) {
+			parameters.push_back({input_location, output_location,
 			                      ShaderPixelParameterIsFlat(*pixel_info, input)});
+			output_locations[output_location] = true;
 		}
 	}
 	return parameters;
@@ -61,37 +58,36 @@ class RectListEmitter {
 public:
 	RectListEmitter(const std::vector<Parameter>& parameters_, spv::ExecutionModel model)
 	    : parameters(parameters_) {
-		builder.AddMemoryModel(
-		    {Word(spv::AddressingModel::Logical), Word(spv::MemoryModel::GLSL450)});
+		builder.AddMemoryModel(spv::AddressingModelLogical, spv::MemoryModelGLSL450);
 
-		void_type       = Type(spv::Op::OpTypeVoid);
-		uint_type       = Type(spv::Op::OpTypeInt, 32u, 0u);
-		int_type        = Type(spv::Op::OpTypeInt, 32u, 1u);
-		float_type      = Type(spv::Op::OpTypeFloat, 32u);
-		vec4_float_type = Type(spv::Op::OpTypeVector, float_type, 4u);
-		function_type   = Type(spv::Op::OpTypeFunction, void_type);
+		void_type       = builder.Type(spv::OpTypeVoid);
+		uint_type       = builder.Type(spv::OpTypeInt, 32u, 0u);
+		int_type        = builder.Type(spv::OpTypeInt, 32u, 1u);
+		float_type      = builder.Type(spv::OpTypeFloat, 32u);
+		vec4_float_type = builder.Type(spv::OpTypeVector, float_type, 4u);
+		function_type   = builder.Type(spv::OpTypeFunction, void_type);
 
-		per_vertex_type = Type(spv::Op::OpTypeStruct, vec4_float_type);
-		builder.AddAnnotation({Word(spv::Op::OpMemberDecorate), per_vertex_type, 0u,
-		                       Word(spv::Decoration::BuiltIn), Word(spv::BuiltIn::Position)});
-		builder.AddAnnotation(
-		    {Word(spv::Op::OpDecorate), per_vertex_type, Word(spv::Decoration::Block)});
+		per_vertex_type = builder.DecoratedType(
+		    spv::OpTypeStruct,
+		    {{spv::OpMemberDecorate, {0u, spv::DecorationBuiltIn, spv::BuiltInPosition}},
+		     {spv::OpDecorate, {spv::DecorationBlock}}},
+		    vec4_float_type);
 
-		ptr_input_vec4_float  = Pointer(spv::StorageClass::Input, vec4_float_type);
-		ptr_output_vec4_float = Pointer(spv::StorageClass::Output, vec4_float_type);
-		if (model == spv::ExecutionModel::TessellationControl) {
-			bool_type        = Type(spv::Op::OpTypeBool);
-			vec2_bool_type   = Type(spv::Op::OpTypeVector, bool_type, 2u);
-			vec2_float_type  = Type(spv::Op::OpTypeVector, float_type, 2u);
-			ptr_output_float = Pointer(spv::StorageClass::Output, float_type);
+		ptr_input_vec4_float  = Pointer(spv::StorageClassInput, vec4_float_type);
+		ptr_output_vec4_float = Pointer(spv::StorageClassOutput, vec4_float_type);
+		if (model == spv::ExecutionModelTessellationControl) {
+			bool_type        = builder.Type(spv::OpTypeBool);
+			vec2_bool_type   = builder.Type(spv::OpTypeVector, bool_type, 2u);
+			vec2_float_type  = builder.Type(spv::OpTypeVector, float_type, 2u);
+			ptr_output_float = Pointer(spv::StorageClassOutput, float_type);
 		} else {
-			vec3_float_type = Type(spv::Op::OpTypeVector, float_type, 3u);
-			ptr_input_float = Pointer(spv::StorageClass::Input, float_type);
+			vec3_float_type = builder.Type(spv::OpTypeVector, float_type, 3u);
+			ptr_input_float = Pointer(spv::StorageClassInput, float_type);
 		}
 	}
 
 	std::vector<uint32_t> EmitControl() {
-		DefineEntry(spv::ExecutionModel::TessellationControl);
+		DefineEntry(spv::ExecutionModelTessellationControl);
 		const auto float_one = Constant(float_type, std::bit_cast<uint32_t>(1.0f));
 
 		for (uint32_t i = 0; i < 4; i++) {
@@ -109,11 +105,11 @@ public:
 
 		std::array<uint32_t, 3> coordinate_equal {};
 		for (uint32_t i = 0; i < coordinate_equal.size(); i++) {
-			const auto left  = Result(spv::Op::OpVectorShuffle, vec2_float_type, positions[i],
-			                          positions[i], 0u, 1u);
-			const auto right = Result(spv::Op::OpVectorShuffle, vec2_float_type,
+			const auto left =
+			    Result(spv::OpVectorShuffle, vec2_float_type, positions[i], positions[i], 0u, 1u);
+			const auto right = Result(spv::OpVectorShuffle, vec2_float_type,
 			                          positions[(i + 1u) % 3u], positions[(i + 1u) % 3u], 0u, 1u);
-			coordinate_equal[i] = Result(spv::Op::OpFOrdEqual, vec2_bool_type, left, right);
+			coordinate_equal[i] = Result(spv::OpFOrdEqual, vec2_bool_type, left, right);
 		}
 
 		std::array<uint32_t, 3> barycentric {};
@@ -121,30 +117,29 @@ public:
 		const auto float_minus_one = Constant(float_type, std::bit_cast<uint32_t>(-1.0f));
 		for (uint32_t i = 0; i < edge_vertex.size(); i++) {
 			const auto previous = (i + 2u) % 3u;
-			const auto xy       = Result(
-			    spv::Op::OpLogicalAnd, bool_type,
-			    Result(spv::Op::OpCompositeExtract, bool_type, coordinate_equal[i], 0u),
-			    Result(spv::Op::OpCompositeExtract, bool_type, coordinate_equal[previous], 1u));
-			const auto yx = Result(
-			    spv::Op::OpLogicalAnd, bool_type,
-			    Result(spv::Op::OpCompositeExtract, bool_type, coordinate_equal[i], 1u),
-			    Result(spv::Op::OpCompositeExtract, bool_type, coordinate_equal[previous], 0u));
-			edge_vertex[i] = Result(spv::Op::OpLogicalOr, bool_type, xy, yx);
+			const auto xy =
+			    Result(spv::OpLogicalAnd, bool_type,
+			           Result(spv::OpCompositeExtract, bool_type, coordinate_equal[i], 0u),
+			           Result(spv::OpCompositeExtract, bool_type, coordinate_equal[previous], 1u));
+			const auto yx =
+			    Result(spv::OpLogicalAnd, bool_type,
+			           Result(spv::OpCompositeExtract, bool_type, coordinate_equal[i], 1u),
+			           Result(spv::OpCompositeExtract, bool_type, coordinate_equal[previous], 0u));
+			edge_vertex[i] = Result(spv::OpLogicalOr, bool_type, xy, yx);
 			barycentric[i] =
-			    Result(spv::Op::OpSelect, float_type, edge_vertex[i], float_minus_one, float_one);
+			    Result(spv::OpSelect, float_type, edge_vertex[i], float_minus_one, float_one);
 		}
 
-		auto vertex_index = Result(spv::Op::OpSelect, int_type, edge_vertex[2], Int(2), Int(0));
-		vertex_index = Result(spv::Op::OpSelect, int_type, edge_vertex[1], Int(1), vertex_index);
+		auto vertex_index = Result(spv::OpSelect, int_type, edge_vertex[2], Int(2), Int(0));
+		vertex_index      = Result(spv::OpSelect, int_type, edge_vertex[1], Int(1), vertex_index);
 		const auto invocation = Load(int_type, invocation_id);
-		const auto is_fourth  = Result(spv::Op::OpIEqual, bool_type, invocation, Int(3));
-		const auto index =
-		    Result(spv::Op::OpSMod, int_type,
-		           Result(spv::Op::OpIAdd, int_type, vertex_index, invocation), Int(3));
+		const auto is_fourth  = Result(spv::OpIEqual, bool_type, invocation, Int(3));
+		const auto index = Result(spv::OpSMod, int_type,
+		                          Result(spv::OpIAdd, int_type, vertex_index, invocation), Int(3));
 
 		const auto position3 = Interpolate(positions[0], positions[1], positions[2], barycentric);
 		const auto position =
-		    Result(spv::Op::OpSelect, vec4_float_type, is_fourth, position3,
+		    Result(spv::OpSelect, vec4_float_type, is_fourth, position3,
 		           Load(vec4_float_type, Access(ptr_input_vec4_float, gl_in, index, Int(0))));
 		Store(Access(ptr_output_vec4_float, gl_out, invocation, Int(0)), position);
 
@@ -161,25 +156,25 @@ public:
 			    Load(vec4_float_type, Access(ptr_input_vec4_float, inputs[i], Int(2)));
 			const auto input3 = Interpolate(input0, input1, input2, barycentric);
 			const auto value =
-			    Result(spv::Op::OpSelect, vec4_float_type, is_fourth, input3,
+			    Result(spv::OpSelect, vec4_float_type, is_fourth, input3,
 			           Load(vec4_float_type, Access(ptr_input_vec4_float, inputs[i], index)));
 			Store(Access(ptr_output_vec4_float, outputs[i], invocation), value);
 		}
 
-		Emit(spv::Op::OpReturn);
-		Emit(spv::Op::OpFunctionEnd);
+		builder.AddFunction(spv::OpReturn);
+		builder.AddFunction(spv::OpFunctionEnd);
 		return builder.Build();
 	}
 
 	std::vector<uint32_t> EmitEvaluation() {
-		DefineEntry(spv::ExecutionModel::TessellationEvaluation);
+		DefineEntry(spv::ExecutionModelTessellationEvaluation);
 
 		const auto x     = Load(float_type, Access(ptr_input_float, tess_coord, Int(0)));
 		const auto y     = Load(float_type, Access(ptr_input_float, tess_coord, Int(1)));
-		const auto index = Result(
-		    spv::Op::OpIAdd, int_type,
-		    Result(spv::Op::OpIMul, int_type, Result(spv::Op::OpConvertFToS, int_type, y), Int(2)),
-		    Result(spv::Op::OpConvertFToS, int_type, x));
+		const auto index =
+		    Result(spv::OpIAdd, int_type,
+		           Result(spv::OpIMul, int_type, Result(spv::OpConvertFToS, int_type, y), Int(2)),
+		           Result(spv::OpConvertFToS, int_type, x));
 
 		const auto position =
 		    Load(vec4_float_type, Access(ptr_input_vec4_float, gl_in, index, Int(0)));
@@ -189,120 +184,89 @@ public:
 			      Load(vec4_float_type, Access(ptr_input_vec4_float, inputs[i], index)));
 		}
 
-		Emit(spv::Op::OpReturn);
-		Emit(spv::Op::OpFunctionEnd);
+		builder.AddFunction(spv::OpReturn);
+		builder.AddFunction(spv::OpFunctionEnd);
 		return builder.Build();
 	}
 
 private:
-	template <typename... Args>
-	uint32_t Type(spv::Op opcode, Args... operands) {
-		const auto id = builder.AllocateId();
-		builder.AddType({Word(opcode), id, Word(operands)...});
-		return id;
-	}
-
 	uint32_t Constant(uint32_t type, uint32_t value) {
-		const auto id = builder.AllocateId();
-		builder.AddType({Word(spv::Op::OpConstant), type, id, value});
-		return id;
+		return builder.Constant(spv::OpConstant, type, value);
 	}
 
 	uint32_t Pointer(spv::StorageClass storage, uint32_t type) {
-		return Type(spv::Op::OpTypePointer, storage, type);
+		return builder.Type(spv::OpTypePointer, storage, type);
 	}
 
 	uint32_t Array(uint32_t type, uint32_t size) {
-		return Type(spv::Op::OpTypeArray, type, Uint(size));
+		return builder.Type(spv::OpTypeArray, type, Uint(size));
 	}
 
 	template <typename... Args>
 	uint32_t Result(spv::Op opcode, uint32_t type, Args... operands) {
 		const auto id = builder.AllocateId();
-		builder.AddFunction({Word(opcode), type, id, Word(operands)...});
+		builder.AddFunction(opcode, type, id, operands...);
 		return id;
 	}
 
 	template <typename... Args>
 	uint32_t ResultWithoutType(spv::Op opcode, Args... operands) {
 		const auto id = builder.AllocateId();
-		builder.AddFunction({Word(opcode), id, Word(operands)...});
+		builder.AddFunction(opcode, id, operands...);
 		return id;
-	}
-
-	template <typename... Args>
-	void Emit(spv::Op opcode, Args... operands) {
-		builder.AddFunction({Word(opcode), Word(operands)...});
 	}
 
 	template <typename... Args>
 	uint32_t Access(uint32_t pointer_type, uint32_t base, Args... indices) {
-		return Result(spv::Op::OpAccessChain, pointer_type, base, Word(indices)...);
+		return Result(spv::OpAccessChain, pointer_type, base, indices...);
 	}
 
-	uint32_t Load(uint32_t type, uint32_t pointer) {
-		return Result(spv::Op::OpLoad, type, pointer);
-	}
+	uint32_t Load(uint32_t type, uint32_t pointer) { return Result(spv::OpLoad, type, pointer); }
 
-	void Store(uint32_t pointer, uint32_t value) { Emit(spv::Op::OpStore, pointer, value); }
+	void Store(uint32_t pointer, uint32_t value) { builder.AddFunction(spv::OpStore, pointer, value); }
 
-	uint32_t Int(uint32_t value) {
-		auto& id = int_constants[value];
-		if (id == 0) {
-			id = Constant(int_type, value);
-		}
-		return id;
-	}
+	uint32_t Int(uint32_t value) { return Constant(int_type, value); }
 
-	uint32_t Uint(uint32_t value) {
-		auto& id = uint_constants[value];
-		if (id == 0) {
-			id = Constant(uint_type, value);
-		}
-		return id;
-	}
+	uint32_t Uint(uint32_t value) { return Constant(uint_type, value); }
 
 	uint32_t AddInterface(spv::StorageClass storage, uint32_t type) {
-		const auto variable = builder.AllocateId();
-		builder.AddType(
-		    {Word(spv::Op::OpVariable), Pointer(storage, type), variable, Word(storage)});
+		const auto variable = builder.DefineGlobalVariable(Pointer(storage, type), storage);
 		interfaces.push_back(variable);
 		return variable;
 	}
 
 	void Decorate(uint32_t target, spv::Decoration decoration, uint32_t value) {
-		builder.AddAnnotation({Word(spv::Op::OpDecorate), target, Word(decoration), value});
+		builder.AddAnnotation(spv::OpDecorate, target, decoration, value);
 	}
 
 	void DefineEntry(spv::ExecutionModel model) {
-		builder.AddCapability({Word(spv::Capability::Shader)});
-		builder.AddCapability({Word(spv::Capability::Tessellation)});
-		main = Result(spv::Op::OpFunction, void_type, spv::FunctionControlMask::MaskNone,
-		              function_type);
-		if (model == spv::ExecutionModel::TessellationControl) {
-			builder.AddExecutionMode({main, Word(spv::ExecutionMode::OutputVertices), 4u});
+		builder.RequireCapability(spv::CapabilityShader);
+		builder.RequireCapability(spv::CapabilityTessellation);
+		main = Result(spv::OpFunction, void_type, spv::FunctionControlMaskNone, function_type);
+		if (model == spv::ExecutionModelTessellationControl) {
+			builder.AddExecutionMode(main, spv::ExecutionModeOutputVertices, 4u);
 		} else {
-			builder.AddExecutionMode({main, Word(spv::ExecutionMode::Quads)});
-			builder.AddExecutionMode({main, Word(spv::ExecutionMode::SpacingEqual)});
-			builder.AddExecutionMode({main, Word(spv::ExecutionMode::VertexOrderCw)});
+			builder.AddExecutionMode(main, spv::ExecutionModeQuads);
+			builder.AddExecutionMode(main, spv::ExecutionModeSpacingEqual);
+			builder.AddExecutionMode(main, spv::ExecutionModeVertexOrderCw);
 		}
 		DefineInputs(model);
 		DefineOutputs(model);
-		builder.AddEntryPoint(Word(model), main, "main", interfaces);
-		ResultWithoutType(spv::Op::OpLabel);
+		builder.AddEntryPoint(model, main, "main", interfaces);
+		ResultWithoutType(spv::OpLabel);
 	}
 
 	void DefineInputs(spv::ExecutionModel model) {
-		const auto tess_control = model == spv::ExecutionModel::TessellationControl;
+		const auto tess_control = model == spv::ExecutionModelTessellationControl;
 		if (tess_control) {
-			invocation_id = AddInterface(spv::StorageClass::Input, int_type);
-			Decorate(invocation_id, spv::Decoration::BuiltIn, Word(spv::BuiltIn::InvocationId));
+			invocation_id = AddInterface(spv::StorageClassInput, int_type);
+			Decorate(invocation_id, spv::DecorationBuiltIn, spv::BuiltInInvocationId);
 		} else {
-			tess_coord = AddInterface(spv::StorageClass::Input, vec3_float_type);
-			Decorate(tess_coord, spv::Decoration::BuiltIn, Word(spv::BuiltIn::TessCoord));
+			tess_coord = AddInterface(spv::StorageClassInput, vec3_float_type);
+			Decorate(tess_coord, spv::DecorationBuiltIn, spv::BuiltInTessCoord);
 		}
 		gl_in =
-		    AddInterface(spv::StorageClass::Input, Array(per_vertex_type, tess_control ? 3u : 4u));
+		    AddInterface(spv::StorageClassInput, Array(per_vertex_type, tess_control ? 3u : 4u));
 
 		inputs.resize(parameters.size());
 		std::array<uint32_t, ShaderVertexInputInfo::RES_MAX> locations {};
@@ -313,44 +277,42 @@ private:
 				inputs[i] = locations[location];
 				continue;
 			}
-			inputs[i] = AddInterface(spv::StorageClass::Input,
+			inputs[i] = AddInterface(spv::StorageClassInput,
 			                         Array(vec4_float_type, tess_control ? 3u : 4u));
-			Decorate(inputs[i], spv::Decoration::Location, location);
+			Decorate(inputs[i], spv::DecorationLocation, location);
 			locations[location] = inputs[i];
 		}
 	}
 
 	void DefineOutputs(spv::ExecutionModel model) {
-		const auto tess_control = model == spv::ExecutionModel::TessellationControl;
+		const auto tess_control = model == spv::ExecutionModelTessellationControl;
 		if (tess_control) {
-			gl_out     = AddInterface(spv::StorageClass::Output, Array(per_vertex_type, 4u));
-			tess_inner = AddInterface(spv::StorageClass::Output, Array(float_type, 2u));
-			Decorate(tess_inner, spv::Decoration::BuiltIn, Word(spv::BuiltIn::TessLevelInner));
-			builder.AddAnnotation(
-			    {Word(spv::Op::OpDecorate), tess_inner, Word(spv::Decoration::Patch)});
-			tess_outer = AddInterface(spv::StorageClass::Output, Array(float_type, 4u));
-			Decorate(tess_outer, spv::Decoration::BuiltIn, Word(spv::BuiltIn::TessLevelOuter));
-			builder.AddAnnotation(
-			    {Word(spv::Op::OpDecorate), tess_outer, Word(spv::Decoration::Patch)});
+			gl_out     = AddInterface(spv::StorageClassOutput, Array(per_vertex_type, 4u));
+			tess_inner = AddInterface(spv::StorageClassOutput, Array(float_type, 2u));
+			Decorate(tess_inner, spv::DecorationBuiltIn, spv::BuiltInTessLevelInner);
+			builder.AddAnnotation(spv::OpDecorate, tess_inner, spv::DecorationPatch);
+			tess_outer = AddInterface(spv::StorageClassOutput, Array(float_type, 4u));
+			Decorate(tess_outer, spv::DecorationBuiltIn, spv::BuiltInTessLevelOuter);
+			builder.AddAnnotation(spv::OpDecorate, tess_outer, spv::DecorationPatch);
 		} else {
-			gl_out = AddInterface(spv::StorageClass::Output, per_vertex_type);
+			gl_out = AddInterface(spv::StorageClassOutput, per_vertex_type);
 		}
 
 		outputs.resize(parameters.size());
 		for (uint32_t i = 0; i < parameters.size(); i++) {
-			outputs[i] = AddInterface(spv::StorageClass::Output,
+			outputs[i] = AddInterface(spv::StorageClassOutput,
 			                          tess_control ? Array(vec4_float_type, 4u) : vec4_float_type);
-			Decorate(outputs[i], spv::Decoration::Location, parameters[i].output_location);
+			Decorate(outputs[i], spv::DecorationLocation, parameters[i].output_location);
 		}
 	}
 
 	uint32_t Interpolate(uint32_t v0, uint32_t v1, uint32_t v2,
 	                     const std::array<uint32_t, 3>& barycentric) {
-		const auto p0 = Result(spv::Op::OpVectorTimesScalar, vec4_float_type, v0, barycentric[0]);
-		const auto p1 = Result(spv::Op::OpVectorTimesScalar, vec4_float_type, v1, barycentric[1]);
-		const auto p2 = Result(spv::Op::OpVectorTimesScalar, vec4_float_type, v2, barycentric[2]);
-		return Result(spv::Op::OpFAdd, vec4_float_type, p0,
-		              Result(spv::Op::OpFAdd, vec4_float_type, p1, p2));
+		const auto p0 = Result(spv::OpVectorTimesScalar, vec4_float_type, v0, barycentric[0]);
+		const auto p1 = Result(spv::OpVectorTimesScalar, vec4_float_type, v1, barycentric[1]);
+		const auto p2 = Result(spv::OpVectorTimesScalar, vec4_float_type, v2, barycentric[2]);
+		return Result(spv::OpFAdd, vec4_float_type, p0,
+		              Result(spv::OpFAdd, vec4_float_type, p1, p2));
 	}
 
 	Builder                       builder {SpirvVersion15};
@@ -358,8 +320,6 @@ private:
 	std::vector<uint32_t>         interfaces;
 	std::vector<uint32_t>         inputs;
 	std::vector<uint32_t>         outputs;
-	std::array<uint32_t, 5>       int_constants {};
-	std::array<uint32_t, 5>       uint_constants {};
 	uint32_t                      main                  = 0;
 	uint32_t                      void_type             = 0;
 	uint32_t                      bool_type             = 0;
@@ -389,8 +349,8 @@ private:
 RectListShaders BuildRectListShaders(const ShaderVertexInputInfo& vertex_info,
                                      const ShaderPixelInputInfo*  pixel_info) {
 	const auto      parameters = GetParameters(vertex_info, pixel_info);
-	RectListEmitter control(parameters, spv::ExecutionModel::TessellationControl);
-	RectListEmitter evaluation(parameters, spv::ExecutionModel::TessellationEvaluation);
+	RectListEmitter control(parameters, spv::ExecutionModelTessellationControl);
+	RectListEmitter evaluation(parameters, spv::ExecutionModelTessellationEvaluation);
 	return {control.EmitControl(), evaluation.EmitEvaluation()};
 }
 

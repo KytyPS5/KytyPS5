@@ -26,6 +26,28 @@ struct BufferFormatInfo {
 	bool                   packed_bitfield         = false;
 };
 
+enum class FormattedSourceKind { Memory, Zero, One, Invalid };
+
+struct FormattedSource {
+	FormattedSourceKind kind      = FormattedSourceKind::Zero;
+	uint32_t            component = 0;
+};
+
+constexpr FormattedSource ResolveFormattedSource(const BufferFormatInfo& info, uint32_t selector) {
+	if (selector == 0u) return {};
+	if (selector == 1u) return {FormattedSourceKind::One, 0};
+	if (selector < 4u || selector > 7u || info.component_count == 0u) {
+		return {FormattedSourceKind::Invalid, 0};
+	}
+	// Formatted decoding expands source channels before applying the swizzle.
+	return {FormattedSourceKind::Memory, (selector - 4u) % info.component_count};
+}
+
+constexpr uint32_t FormattedConstantBits(const BufferFormatInfo& info, FormattedSourceKind kind) {
+	if (kind != FormattedSourceKind::One) return 0;
+	return info.type == ComponentType::Uint || info.type == ComponentType::Sint ? 1u : 0x3f800000u;
+}
+
 constexpr Prospero::BufferFormat DecodeTBufferFormat(uint32_t data_format, uint32_t number_format) {
 	return static_cast<Prospero::BufferFormat>(((number_format & 0x7u) << 4u) |
 	                                           (data_format & 0xfu));
@@ -216,26 +238,11 @@ constexpr BufferFormatInfo GetFormatInfo(Prospero::BufferFormat format) {
 	}
 }
 
-constexpr bool IsKnownFormat(Prospero::BufferFormat format) {
-	return GetFormatInfo(format).type != ComponentType::Unknown;
-}
-
-constexpr uint32_t GetFormatComponentCount(Prospero::BufferFormat format) {
-	return GetFormatInfo(format).component_count;
-}
-
-constexpr uint32_t GetFormatComponentByteOffset(Prospero::BufferFormat format, uint32_t component) {
-	const auto info = GetFormatInfo(format);
+constexpr uint32_t GetFormatComponentByteOffset(const BufferFormatInfo& info, uint32_t component) {
 	if (component >= info.component_count) {
 		return 0;
 	}
 	return info.packed_bitfield ? 0u : info.component_bit_offset[component] / 8u;
-}
-
-constexpr bool CanUseTypedBufferLoad(Prospero::BufferFormat format) {
-	const auto info = GetFormatInfo(format);
-	return info.type != ComponentType::Unknown && !info.packed_bitfield &&
-	       info.component_bits[0] == 32u;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Format

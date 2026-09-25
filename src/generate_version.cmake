@@ -1,5 +1,6 @@
 set(KYTY_GIT_VERSION "unknown")
 set(KYTY_GIT_HASH "unknown")
+set(KYTY_GIT_REVISION "unknown")
 if(GIT_EXECUTABLE)
 	execute_process(
 		COMMAND "${GIT_EXECUTABLE}" describe --tags --always --dirty
@@ -14,16 +15,18 @@ if(GIT_EXECUTABLE)
 	endif()
 
 	execute_process(
-		COMMAND "${GIT_EXECUTABLE}" rev-parse --short=7 HEAD
+		COMMAND "${GIT_EXECUTABLE}" rev-parse HEAD
 		WORKING_DIRECTORY "${GIT_WORKING_DIRECTORY}"
-		OUTPUT_VARIABLE KYTY_GIT_HASH
+		OUTPUT_VARIABLE KYTY_GIT_REVISION
 		OUTPUT_STRIP_TRAILING_WHITESPACE
 		RESULT_VARIABLE GIT_HASH_RESULT
 		ERROR_QUIET
 	)
 	if(NOT GIT_HASH_RESULT EQUAL 0)
 		set(KYTY_GIT_HASH "unknown")
+		set(KYTY_GIT_REVISION "unknown")
 	else()
+		string(SUBSTRING "${KYTY_GIT_REVISION}" 0 7 KYTY_GIT_HASH)
 		execute_process(
 			COMMAND "${GIT_EXECUTABLE}" diff-index --quiet HEAD --
 			WORKING_DIRECTORY "${GIT_WORKING_DIRECTORY}"

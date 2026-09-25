@@ -1,6 +1,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "libs/errno.h"
@@ -23,6 +24,7 @@ static constexpr int8_t   PLAYGO_LOCUS_LOCAL_FAST       = 3;
 static constexpr int32_t  PLAYGO_INSTALL_SPEED_FULL     = 2;
 static constexpr int32_t  PLAYGO_OPTIONAL_TYPE_LANGUAGE = 0;
 static constexpr int32_t  PLAYGO_OPTIONAL_TYPE_SCENARIO = 1;
+static constexpr uint32_t PLAYGO_DEFAULT_CHUNKS_NUM     = 1000;
 static constexpr uint64_t PLAYGO_LANGUAGE_MASK_ALL      = 0xffffffffffffffffull;
 static constexpr uint64_t PLAYGO_SCENARIO_MASK_ALL      = 0x1full;
 
@@ -52,14 +54,7 @@ union PlayGoOptionalChunk {
 };
 
 static bool ensure_chunks_loaded() {
-	if (g_chunks_num != 0) {
-		return true;
-	}
-	if (!Loader::SystemContentGetChunksNum(&g_chunks_num)) {
-		LOGF("Warning: assume that chunks count is 1\n");
-		g_chunks_num = 1;
-	}
-	return g_chunks_num != 0;
+	return g_chunks_num != 0 || Loader::SystemContentGetChunksNum(&g_chunks_num);
 }
 
 static bool is_valid_chunk(uint16_t chunk_id) {
@@ -103,6 +98,11 @@ int KYTY_SYSV_ABI PlayGoInitialize(const PlayGoInitParams* init) {
 	     "\t reserved = %" PRId32 "\n",
 	     reinterpret_cast<uint64_t>(init->buf_addr), init->buf_size, init->reserved);
 
+	if (Config::PlayGoHackEnabled() && !ensure_chunks_loaded()) {
+		g_chunks_num = PLAYGO_DEFAULT_CHUNKS_NUM;
+		LOGF("\t playgo_hack chunks = %" PRIu32 "\n", g_chunks_num);
+	}
+
 	return OK;
 }
 
@@ -121,10 +121,11 @@ int KYTY_SYSV_ABI PlayGoOpen(int* out_handle, const void* param) {
 	if (param != nullptr) {
 		return PLAYGO_ERROR_INVALID_ARGUMENT;
 	}
+	if (!ensure_chunks_loaded()) {
+		return PLAYGO_ERROR_NOT_SUPPORT_PLAYGO;
+	}
 
 	*out_handle = PLAYGO_HANDLE;
-
-	ensure_chunks_loaded();
 
 	return OK;
 }

@@ -2,18 +2,20 @@
 
 #include <atomic>
 #include <cstdio>
-#include <cstdlib>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h> // IWYU pragma: keep
-#elif defined(__APPLE__)
+#else
+#include <algorithm>
 #include <csignal>
+#include <cstdlib>
+#include <initializer_list>
+#include <unistd.h>
+#if defined(__APPLE__)
 #include <sys/ucontext.h>
 #else
-#include <csignal>
-#include <initializer_list>
 #include <ucontext.h> // IWYU pragma: keep
-#include <unistd.h>
+#endif
 #endif
 
 // IWYU pragma: no_include <errhandlingapi.h>
@@ -28,54 +30,59 @@ namespace Common::HostException {
 
 static std::atomic<Handler> g_handler {nullptr};
 static std::atomic_uint32_t g_install_state {0};
-static thread_local bool    g_in_exception_filter = false;
 
 static_assert(decltype(g_handler)::is_always_lock_free);
 static_assert(decltype(g_install_state)::is_always_lock_free);
-
-[[noreturn]] static void FailFast(const char* reason) noexcept {
-	std::fputs("HostException fail-fast: ", stderr);
-	std::fputs(reason != nullptr ? reason : "unspecified", stderr);
-	std::fputc('\n', stderr);
-	std::fflush(stderr);
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	TerminateProcess(GetCurrentProcess(), static_cast<UINT>(EXCEPTION_NONCONTINUABLE_EXCEPTION));
 #endif
-	std::_Exit(321);
-}
 
-class FilterScope final {
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+
+// macOS uses the same POSIX platform setting and needs a signal stack too.
+class ThreadSignalStack {
 public:
-	FilterScope() noexcept {
-		if (g_in_exception_filter) {
-			FailFast("nested exception while resolving a host fault");
+	ThreadSignalStack() {
+		const auto page_size = static_cast<size_t>(::getpagesize());
+		const auto stack_size =
+		    (std::max<size_t>(64 * 1024, MINSIGSTKSZ) + page_size - 1) & ~(page_size - 1);
+		if (::posix_memalign(&m_memory, page_size, stack_size) != 0) {
+			return;
 		}
-		g_in_exception_filter = true;
+
+		stack_t stack {};
+		stack.ss_sp   = m_memory;
+		stack.ss_size = stack_size;
+		if (::sigaltstack(&stack, &m_previous) != 0) {
+			std::free(m_memory);
+			m_memory = nullptr;
+		}
 	}
 
-	~FilterScope() { g_in_exception_filter = false; }
+	~ThreadSignalStack() {
+		if (m_memory != nullptr && ::sigaltstack(&m_previous, nullptr) == 0) {
+			std::free(m_memory);
+		}
+	}
 
-	KYTY_CLASS_NO_COPY(FilterScope);
+	[[nodiscard]] bool IsInitialized() const { return m_memory != nullptr; }
+
+	KYTY_CLASS_NO_COPY(ThreadSignalStack)
+
+private:
+	void*   m_memory = nullptr;
+	stack_t m_previous {};
 };
 
-static Handler LoadInstalledHandler() noexcept {
-	if (g_install_state.load(std::memory_order_acquire) == 0) {
-		FailFast("host exception handler is not installed");
-	}
-
-	const auto handler = g_handler.load(std::memory_order_acquire);
-	if (handler == nullptr) {
-		FailFast("host exception callback is null");
-	}
-	return handler;
+bool InitializeThreadSignalStack() {
+	// Keep fault handling off guest stacks, which GPU tracking can make read-only.
+	thread_local ThreadSignalStack signal_stack;
+	return signal_stack.IsInitialized();
 }
+
 #endif
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 
-static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) {
-	FilterScope filter_scope;
-
+static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) noexcept {
 	auto* exception_record = exception->ExceptionRecord;
 
 	if (exception_record->ExceptionCode == DBG_PRINTEXCEPTION_C ||
@@ -105,12 +112,6 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) {
 	} else if (exception_record->ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION) {
 		info.type = ExceptionType::IllegalInstruction;
 	} else {
-		printf("Unhandled win exception: code=0x%08" PRIx32 ", addr=0x%016" PRIx64
-		       ", rip=0x%016" PRIx64 ", rsp=0x%016" PRIx64 ", rbp=0x%016" PRIx64 "\n",
-		       static_cast<uint32_t>(exception_record->ExceptionCode),
-		       reinterpret_cast<uint64_t>(exception_record->ExceptionAddress),
-		       exception->ContextRecord->Rip, exception->ContextRecord->Rsp,
-		       exception->ContextRecord->Rbp);
 		return EXCEPTION_CONTINUE_SEARCH;
 	}
 
@@ -131,27 +132,20 @@ static LONG WINAPI ExceptionFilter(PEXCEPTION_POINTERS exception) {
 	info.r14 = exception->ContextRecord->R14;
 	info.r15 = exception->ContextRecord->R15;
 
-	const auto handler = LoadInstalledHandler();
-
-	return handler(info) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+	const auto handler = g_handler.load(std::memory_order_acquire);
+	if (handler != nullptr && handler(info)) {
+		return EXCEPTION_CONTINUE_EXECUTION;
+	}
+	return EXCEPTION_CONTINUE_SEARCH;
 }
 
 #elif defined(__APPLE__)
 
 static std::atomic<Handler> g_handler {nullptr};
 static std::atomic_uint32_t g_install_state {0};
-static thread_local bool    g_in_exception_filter = false;
 
 static_assert(decltype(g_handler)::is_always_lock_free);
 static_assert(decltype(g_install_state)::is_always_lock_free);
-
-[[noreturn]] static void FailFast(const char* reason) noexcept {
-	std::fputs("HostException fail-fast: ", stderr);
-	std::fputs(reason != nullptr ? reason : "unspecified", stderr);
-	std::fputc('\n', stderr);
-	std::fflush(stderr);
-	std::_Exit(321);
-}
 
 // Translate the x86-64 page-fault error code (mcontext __es.__err) into an access type.
 // bit 1 (0x2) = write, bit 4 (0x10) = instruction fetch, otherwise a read.
@@ -170,11 +164,6 @@ static AccessViolationType DecodeAccess(uint64_t err) {
 // re-executing the faulting instruction against the now-fixed protection. An unresolved
 // fault restores the default disposition so the retry terminates the process.
 static void SignalHandler(int sig, siginfo_t* si, void* uctx) {
-	if (g_in_exception_filter) {
-		FailFast("nested exception while resolving a host fault");
-	}
-	g_in_exception_filter = true;
-
 	auto*       uc = static_cast<ucontext_t*>(uctx);
 	const auto* mc = uc->uc_mcontext;
 	const auto& ss = mc->__ss;
@@ -210,14 +199,7 @@ static void SignalHandler(int sig, siginfo_t* si, void* uctx) {
 	info.r15 = ss.__r15;
 
 	const auto handler = g_handler.load(std::memory_order_acquire);
-	if (handler == nullptr) {
-		FailFast("host exception callback is null");
-	}
-
-	const bool resolved   = handler(info);
-	g_in_exception_filter = false;
-
-	if (resolved) {
+	if (handler != nullptr && handler(info)) {
 		return; // retry the faulting instruction against the fixed mapping
 	}
 
@@ -244,8 +226,6 @@ static void ChainToDefault(int signal_number) noexcept {
 }
 
 static void SignalHandler(int signal_number, siginfo_t* signal_info, void* native_context) {
-	FilterScope filter_scope;
-
 	auto* context = static_cast<ucontext_t*>(native_context);
 	auto* gregs   = context->uc_mcontext.gregs;
 
@@ -289,9 +269,8 @@ static void SignalHandler(int signal_number, siginfo_t* signal_info, void* nativ
 	info.r14 = static_cast<uint64_t>(gregs[REG_R14]);
 	info.r15 = static_cast<uint64_t>(gregs[REG_R15]);
 
-	const auto handler = LoadInstalledHandler();
-
-	if (handler(info)) {
+	const auto handler = g_handler.load(std::memory_order_acquire);
+	if (handler != nullptr && handler(info)) {
 		return;
 	}
 
@@ -313,7 +292,7 @@ bool InstallHandler(Handler handler) {
 	g_handler.store(handler, std::memory_order_release);
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	if (AddVectoredExceptionHandler(1, ExceptionFilter) == nullptr) {
+	if (AddVectoredExceptionHandler(0, ExceptionFilter) == nullptr) {
 		g_handler.store(nullptr, std::memory_order_release);
 		g_install_state.store(0, std::memory_order_release);
 		printf("AddVectoredExceptionHandler() failed\n");
@@ -322,7 +301,7 @@ bool InstallHandler(Handler handler) {
 #elif defined(__APPLE__)
 	struct sigaction sa {};
 	sa.sa_sigaction = SignalHandler;
-	sa.sa_flags     = SA_SIGINFO;
+	sa.sa_flags     = SA_SIGINFO | SA_ONSTACK;
 	sigemptyset(&sa.sa_mask);
 	// The guest signal-dispatch path (KernelRaiseException) interrupts threads with
 	// SIGUSR1; block it while a fault is being resolved so a stop-the-world request
@@ -343,8 +322,7 @@ bool InstallHandler(Handler handler) {
 	struct sigaction action {};
 	action.sa_sigaction = SignalHandler;
 	sigemptyset(&action.sa_mask);
-	// Fault resolution needs the normal thread stack.
-	action.sa_flags = SA_SIGINFO | SA_RESTART;
+	action.sa_flags = SA_SIGINFO | SA_RESTART | SA_ONSTACK;
 
 	for (const int signal_number: {SIGSEGV, SIGBUS, SIGILL}) {
 		if (::sigaction(signal_number, &action, nullptr) != 0) {

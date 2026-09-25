@@ -5,7 +5,6 @@
 
 #include <array>
 #include <cstdint>
-#include <type_traits>
 
 namespace Libs::Graphics {
 
@@ -66,41 +65,6 @@ inline constexpr TargetViewInfo ResolveTargetViewInfo(uint32_t base_layer, uint3
 	return {base_layer == last_layer ? TargetViewType::Image2D : TargetViewType::Image2DArray,
 	        base_layer, last_layer - base_layer + 1u, last_layer + 1u};
 }
-
-#pragma pack(push, 1)
-
-struct PipelineStencilStaticState {
-	vk::StencilOp failOp      = vk::StencilOp::eKeep;
-	vk::StencilOp passOp      = vk::StencilOp::eKeep;
-	vk::StencilOp depthFailOp = vk::StencilOp::eKeep;
-	vk::CompareOp compareOp   = vk::CompareOp::eNever;
-};
-
-struct PipelineStencilDynamicState {
-	uint32_t compareMask = 0;
-	uint32_t writeMask   = 0;
-	uint32_t reference   = 0;
-};
-
-#pragma pack(pop)
-
-inline constexpr bool stencil_face_accesses_attachment(const PipelineStencilStaticState&  state,
-                                                       const PipelineStencilDynamicState& dynamic) {
-	return state.compareOp != vk::CompareOp::eAlways ||
-	       (dynamic.writeMask != 0 &&
-	        (state.failOp != vk::StencilOp::eKeep || state.passOp != vk::StencilOp::eKeep ||
-	         state.depthFailOp != vk::StencilOp::eKeep));
-}
-
-static_assert(std::is_trivially_copyable_v<PipelineStencilStaticState>);
-static_assert(std::is_standard_layout_v<PipelineStencilStaticState>);
-static_assert(alignof(PipelineStencilStaticState) == 1);
-static_assert(sizeof(PipelineStencilStaticState) ==
-              sizeof(vk::StencilOp) * 3 + sizeof(vk::CompareOp));
-static_assert(std::is_trivially_copyable_v<PipelineStencilDynamicState>);
-static_assert(std::is_standard_layout_v<PipelineStencilDynamicState>);
-static_assert(alignof(PipelineStencilDynamicState) == 1);
-static_assert(sizeof(PipelineStencilDynamicState) == sizeof(uint32_t) * 3);
 
 } // namespace Libs::Graphics
 

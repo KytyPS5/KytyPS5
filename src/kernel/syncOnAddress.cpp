@@ -47,11 +47,17 @@ struct WaitDeadline {
 	Clock::time_point end {};
 };
 
+[[nodiscard]] WaitDeadline MakeDeadline(std::chrono::nanoseconds timeout) {
+	const auto now = Clock::now();
+	const auto remaining = Clock::time_point::max() - now;
+	return {true, timeout >= remaining ? Clock::time_point::max() : now + timeout};
+}
+
 [[nodiscard]] WaitDeadline MakeDeadline(const uint32_t* timeout_micros) {
 	if (timeout_micros == nullptr) {
 		return {};
 	}
-	return {true, Clock::now() + std::chrono::microseconds(*timeout_micros)};
+	return MakeDeadline(std::chrono::microseconds(*timeout_micros));
 }
 
 [[nodiscard]] uint32_t GetWaitSliceMicros(const WaitDeadline& deadline, bool first_wait) {
@@ -65,7 +71,7 @@ struct WaitDeadline {
 	}
 
 	const auto remaining =
-	    std::chrono::duration_cast<std::chrono::microseconds>(deadline.end - now).count();
+	    std::chrono::ceil<std::chrono::microseconds>(deadline.end - now).count();
 	return static_cast<uint32_t>(std::min<int64_t>(remaining, SIGNAL_POLL_MICROS));
 }
 
@@ -78,9 +84,8 @@ void PollSignals(signal_poll_func_t signal_poll) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
 
 template <typename T>
-int WaitLinux(volatile T* address, T expected, const uint32_t* timeout_micros,
+int WaitLinux(volatile T* address, T expected, const WaitDeadline& deadline,
               signal_poll_func_t signal_poll) {
-	const auto deadline   = MakeDeadline(timeout_micros);
 	bool       first_wait = true;
 
 	for (;;) {
@@ -185,11 +190,10 @@ void UnregisterPortableWaiter(volatile void*                               addre
 }
 
 template <typename T>
-int WaitPortable(volatile T* address, T expected, const uint32_t* timeout_micros,
+int WaitPortable(volatile T* address, T expected, const WaitDeadline& deadline,
                  signal_poll_func_t signal_poll) {
 	PortableWaiter waiter;
 	auto           entry      = RegisterPortableWaiter(address, &waiter);
-	const auto     deadline   = MakeDeadline(timeout_micros);
 	bool           first_wait = true;
 	int            result     = OK;
 
@@ -250,7 +254,7 @@ int WakePortable(volatile void* address, int32_t count) {
 }
 
 template <typename T>
-int WaitImpl(volatile T* address, T expected, const uint32_t* timeout_micros,
+int WaitImpl(volatile T* address, T expected, const WaitDeadline& deadline,
              signal_poll_func_t signal_poll) {
 	if (!IsValidWaitAddress(address)) {
 		return KERNEL_ERROR_EINVAL;
@@ -258,9 +262,9 @@ int WaitImpl(volatile T* address, T expected, const uint32_t* timeout_micros,
 
 	int result = OK;
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
-	result = WaitLinux(address, expected, timeout_micros, signal_poll);
+	result = WaitLinux(address, expected, deadline, signal_poll);
 #else
-	result = WaitPortable(address, expected, timeout_micros, signal_poll);
+	result = WaitPortable(address, expected, deadline, signal_poll);
 #endif
 	PollSignals(signal_poll);
 	return result;
@@ -270,12 +274,17 @@ int WaitImpl(volatile T* address, T expected, const uint32_t* timeout_micros,
 
 int Wait32(volatile uint32_t* address, uint32_t expected, const uint32_t* timeout_micros,
            signal_poll_func_t signal_poll) {
-	return WaitImpl(address, expected, timeout_micros, signal_poll);
+	return WaitImpl(address, expected, MakeDeadline(timeout_micros), signal_poll);
 }
 
 int Wait64(volatile uint64_t* address, uint64_t expected, const uint32_t* timeout_micros,
            signal_poll_func_t signal_poll) {
-	return WaitImpl(address, expected, timeout_micros, signal_poll);
+	return WaitImpl(address, expected, MakeDeadline(timeout_micros), signal_poll);
+}
+
+int Wait64(volatile uint64_t* address, uint64_t expected, std::chrono::nanoseconds timeout,
+           signal_poll_func_t signal_poll) {
+	return WaitImpl(address, expected, MakeDeadline(timeout), signal_poll);
 }
 
 int Wake(volatile void* address, int32_t count) {

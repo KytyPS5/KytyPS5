@@ -4,7 +4,7 @@
 Рабочая ветка — `yotei-windows-bringup` в локальном fork `fxpw/KytyPS5`.
 
 Checkpoint R32 Sint storage ImageWrite + Guard dominance **26 сентября 2026 года**,
-источник `daa8b94a` + ImageWrite fix (рабочее дерево):
+источник `938b8f55`:
 
 1. После Ballot/`shown=250` run `da3924` fatal SPIR-V dominance на CS
    `5f3fdf61a7ca4a20`: `%658` в Guard then `%655` использовался в следующем
@@ -23,9 +23,14 @@ Checkpoint R32 Sint storage ImageWrite + Guard dominance **26 сентября 2
 3. RED `--sint-storage-image-write-only` без remap → `class=3` (Sint) на валидном
    T#; GREEN после `k32SInt` storage → Uint Sampled Type в materialization +
    StoreTexel bitcast/I32 vector для оставшихся Sint formats
-   (`KYTY_SINT_STORAGE_IMAGE_WRITE_PASS`). Меню/gameplay **PENDING** — нужен
-   game retry.
-4. Следующий шаг: install + long yotei retry; chase next fatal.
+   (`KYTY_SINT_STORAGE_IMAGE_WRITE_PASS`). Коммит `938b8f55`.
+4. Game retry `_Build/runs/yotei-integrated-20260925-225027-369159`
+   (SHA `a31579bf…`, frame 302, `shown=117`, flips gpu 118): **`753c552f` /
+   Sampled Type больше не блокирует**. Fatal:
+   `MaterializeResources` → `runtime SRT evaluation failed` на CS
+   `8457901d80b91921` (stderr). Меню/gameplay **PENDING**.
+5. Следующий шаг: RED/GREEN для `RefreshFlatBuffer` / SRT walk на
+   `8457901d`, без title branching.
 
 Checkpoint materialization + VOPC `0xbd` + LDS atomic return + workgroup
 buffer descriptors + VOP2 DPP8 / split-wave64 Ballot **26 сентября 2026 года**,

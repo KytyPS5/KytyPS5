@@ -1490,8 +1490,12 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& i
 		values.push_back(value);
 	}
 	std::vector<uint32_t> flattened_srt;
-	if (!walker.RefreshFlatBuffer(flattened_srt))
-		return SpecializationFail("runtime SRT evaluation failed");
+	if (!walker.RefreshFlatBuffer(flattened_srt)) {
+		const auto& detail = walker.LastFlatError();
+		return SpecializationFail(detail.empty() ? "runtime SRT evaluation failed"
+		                                         : fmt::format("runtime SRT evaluation failed: {}",
+		                                                       detail));
+	}
 	auto& next = snapshot.resources;
 	const auto& fill = program.uniform_fill;
 	std::array<uint32_t, 4> stored {};

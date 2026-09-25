@@ -3,34 +3,20 @@
 Обновлено **26 сентября 2026 года**. Игра: **Ghost of Yōtei, PPSA26344**.
 Рабочая ветка — `yotei-windows-bringup` в локальном fork `fxpw/KytyPS5`.
 
-Checkpoint R32 Sint storage ImageWrite + Guard dominance **26 сентября 2026 года**,
-источник `938b8f55`:
+Checkpoint deferred flat SRT + R32 Sint ImageWrite **26 сентября 2026 года**,
+источник `3c27d988` + deferred-flat fix (рабочее дерево):
 
-1. После Ballot/`shown=250` run `da3924` fatal SPIR-V dominance на CS
-   `5f3fdf61a7ca4a20`: `%658` в Guard then `%655` использовался в следующем
-   Guard `%664` с тем же `active`. Phase-liveness оставлял same-phase SSA без
-   spill, а `Def` возвращал прямой id через Guard. RED:
-   `--cooperative-guard-dominance-only`. Fix: spill каждого runtime leaf в
-   cooperative + всегда reload из Function storage; `LoadBoundedFlatWord`
-   экспортирует load через `OpPhi`. GREEN. Emit `5f3fdf61` words≈150584 без
-   dominance fail. Коммит `daa8b94a`.
-2. Game retry `_Build/runs/yotei-integrated-20260925-222331-24108b`
-   (SHA `29330c15…`, frame 280, `shown=103`): **`5f3fdf61` больше не блокирует**.
-   Следующий fatal — CS `753c552fae650ec4`:
-   `Expected Image 'Sampled Type' to be the same as Texel components`
-   на `OpImageWrite` (host binds `k32SInt` storage as `R32Uint`, specialization
-   kept Sint Sampled Type while StoreTexel emitted uint).
-3. RED `--sint-storage-image-write-only` без remap → `class=3` (Sint) на валидном
-   T#; GREEN после `k32SInt` storage → Uint Sampled Type в materialization +
-   StoreTexel bitcast/I32 vector для оставшихся Sint formats
-   (`KYTY_SINT_STORAGE_IMAGE_WRITE_PASS`). Коммит `938b8f55`.
-4. Game retry `_Build/runs/yotei-integrated-20260925-225027-369159`
-   (SHA `a31579bf…`, frame 302, `shown=117`, flips gpu 118): **`753c552f` /
-   Sampled Type больше не блокирует**. Fatal:
+1. Guard dominance `5f3fdf61` закрыт (`daa8b94a`). ImageWrite Sampled Type на
+   `753c552f` закрыт (`938b8f55`): storage `k32SInt` → Uint Sampled Type.
+2. Game retry `_Build/runs/yotei-integrated-20260925-225027-369159`
+   (SHA `a31579bf…`, frame 302, `shown=117`): **`753c552f` снят**. Fatal
    `MaterializeResources` → `runtime SRT evaluation failed` на CS
-   `8457901d80b91921` (stderr). Меню/gameplay **PENDING**.
-5. Следующий шаг: RED/GREEN для `RefreshFlatBuffer` / SRT walk на
-   `8457901d`, без title branching.
+   `8457901d80b91921`. Диагностика: flat slot 8 = `LoadAddressU32`,
+   `slot_kind=FlatSlotDeferred`, eager `RefreshFlatBuffer` трогал GPU-selected
+   адрес. Fix: пропускать `FlatSlotDeferred` (placeholder 0); `ReadConst`
+   использует clean evaluator только для `FlatSlotClean`. RED/GREEN
+   `scalar_provenance_tests` (`TestDeferredFlatSlotSkipsEagerEvaluation`).
+3. Меню/gameplay **PENDING** — нужен game retry после install.
 
 Checkpoint materialization + VOPC `0xbd` + LDS atomic return + workgroup
 buffer descriptors + VOP2 DPP8 / split-wave64 Ballot **26 сентября 2026 года**,

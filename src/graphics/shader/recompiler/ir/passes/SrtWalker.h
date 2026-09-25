@@ -6,6 +6,7 @@
 #include <array>
 #include <optional>
 #include <span>
+#include <string>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
@@ -109,6 +110,10 @@ private:
 	std::span<const uint32_t>       m_bounded_flat;
 	std::optional<uint32_t>         m_bounded_candidate;
 	ResourcePlan::EvaluationContext& m_context;
+	std::string                     m_last_flat_error;
+
+public:
+	[[nodiscard]] const std::string& LastFlatError() const { return m_last_flat_error; }
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

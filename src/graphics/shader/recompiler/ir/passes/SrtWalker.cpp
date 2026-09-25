@@ -1704,7 +1704,8 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 				return false;
 			}
 			if (slot.U32() < m_clean_flat_slots.size() &&
-			    m_clean_flat_slots[slot.U32()] != 0u && m_clean_evaluator != nullptr) {
+			    m_clean_flat_slots[slot.U32()] == ResourcePlan::FlatSlotClean &&
+			    m_clean_evaluator != nullptr) {
 				return m_clean_evaluator->EvaluateWide(m_program.srt_reads[slot.U32()].value,
 				                                       result);
 			}
@@ -2070,18 +2071,57 @@ std::span<const uint8_t> SrtWalker::FindActiveSources() {
 }
 
 bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
+	m_last_flat_error.clear();
 	if (!m_program.srt_plan_complete) {
+		m_last_flat_error = "SRT plan is incomplete";
 		return false;
 	}
 	flat.resize(m_program.srt_reads.size());
 	for (const auto& read: m_program.srt_reads) {
-		const bool clean = read.flat_offset < m_clean_flat_slots.size() &&
-		                   m_clean_flat_slots[read.flat_offset] != 0u;
+		const auto slot_kind = read.flat_offset < m_clean_flat_slots.size()
+		                           ? m_clean_flat_slots[read.flat_offset]
+		                           : 0u;
+		// Expression slots that depend on ReadBoundedSrtU32 are filled after the
+		// bounded snapshot materializes. Eager evaluation would touch GPU-selected
+		// addresses before their coefficients exist.
+		if (slot_kind == ResourcePlan::FlatSlotDeferred) {
+			flat[read.flat_offset] = 0u;
+			continue;
+		}
+		const bool clean = slot_kind == ResourcePlan::FlatSlotClean;
 		if (clean && (m_clean_evaluator == nullptr || m_runtime.read_specialization_memory == nullptr)) {
+			m_last_flat_error = fmt::format(
+			    "clean flat slot {} lacks specialization reader (evaluator={} memory={})",
+			    read.flat_offset, m_clean_evaluator != nullptr,
+			    m_runtime.read_specialization_memory != nullptr);
 			return false;
 		}
 		auto& evaluator = clean ? *m_clean_evaluator : *this;
-		if (read.flat_offset >= flat.size() || !evaluator.Evaluate(read.value, flat[read.flat_offset])) {
+		if (read.flat_offset >= flat.size()) {
+			m_last_flat_error =
+			    fmt::format("flat slot {} exceeds resized buffer {}", read.flat_offset, flat.size());
+			return false;
+		}
+		if (!evaluator.Evaluate(read.value, flat[read.flat_offset])) {
+			const auto* inst = read.value.Resolve().TryInstruction();
+			std::string detail;
+			if (inst != nullptr && (inst->GetOpcode() == ValueOpcode::LoadAddressU32 ||
+			                        inst->GetOpcode() == ValueOpcode::ReadConstBuffer)) {
+				const auto index = inst->Flags<MemoryFlags>().index;
+				const auto kind = index < m_program.memory_info.size()
+				                      ? static_cast<uint32_t>(m_program.memory_info[index].kind)
+				                      : UINT32_MAX;
+				const auto planning = index < m_program.memory_info.size() &&
+				                      m_program.memory_info[index].planning_only;
+				detail = fmt::format(" raw={} kind={} planning={} slot_kind={}",
+				                     IsRawRead(m_program, *inst), kind, planning, slot_kind);
+			}
+			m_last_flat_error = fmt::format(
+			    "flat slot {} evaluation failed (clean={} opcode={} args={} workgroups={}{})",
+			    read.flat_offset, clean,
+			    inst != nullptr ? static_cast<uint32_t>(inst->GetOpcode()) : UINT32_MAX,
+			    inst != nullptr ? inst->NumArgs() : 0u,
+			    m_runtime.compute_workgroups.has_value(), detail);
 			return false;
 		}
 	}

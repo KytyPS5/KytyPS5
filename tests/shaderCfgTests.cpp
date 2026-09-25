@@ -11070,6 +11070,42 @@ void TestSplitWave64SwizzleDeclaresBallotCapability() {
   CheckSpirvBinaryValidates(compiled.spirv);
 }
 
+void TestCooperativeWave64GuardDominanceSpills() {
+  // Same-phase SSA must not escape a cooperative Guard into a later sibling
+  // selection with the same active mask. A collective opens a new Guard while
+  // earlier ordinary values remain live for later arithmetic; spilling every
+  // runtime leaf and always reloading from Function storage keeps SPIR-V
+  // dominance valid (Yōtei CS 5f3fdf61).
+  using F = CooperativeExecutionFixture;
+  using O = F::O;
+  using V = F::V;
+  namespace IR = ShaderRecompiler::IR;
+  F f({256, 1, 1});
+  const auto base = f.Emit(0, O::IAdd32, {f.local, V(4u)});
+  const auto scaled = f.Emit(0, O::IMul32, {base, V(16u)});
+  const auto predicate = f.Emit(0, O::ULessThan32, {f.lane, V(32u)});
+  const auto ballot = f.Emit(0, O::Ballot, {predicate});
+  const auto low = f.Emit(0, O::CompositeExtractU32x4, {ballot, V(0u)});
+  f.Emit(0, O::Barrier);
+  const auto address = f.Emit(0, O::IAdd32, {scaled, low});
+  f.Emit(0, O::ReferenceU32, {address});
+  f.Emit(0, O::ReferenceU32, {base});
+  const auto plan = f.Plan();
+  Check(plan.error.empty() && plan.IsCooperativeWave64(),
+        "guard-dominance fixture did not enter cooperative scheduling");
+  IR::BuildSrtPlan(f.program);
+  IR::TrackResources(f.program);
+  ShaderRecompiler::TranslateResult translated;
+  translated.program = std::move(f.program);
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.wave_size = 64u;
+  options.input_info.compute = &f.compute;
+  options.compute_workgroup_limits = f.limits;
+  const auto compiled =
+      ShaderRecompiler::CompileProgram(std::move(translated), options, {}, 0u);
+  CheckSpirvBinaryValidates(compiled.spirv);
+}
+
 void TestCooperativeWave64CrossBlockSpillReuse() {
   using F = CooperativeExecutionFixture;
   using O = F::O;
@@ -18008,6 +18044,11 @@ int main(int argc, char* argv[]) {
   if (argc == 2 && std::strcmp(argv[1], "--cooperative-pipeline-flags-only") == 0) {
     Libs::Graphics::TestCooperativePipelineDisablesDriverOptimization();
     std::puts("KYTY_COOPERATIVE_PIPELINE_FLAGS_PASS");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--cooperative-guard-dominance-only") == 0) {
+    Libs::Graphics::TestCooperativeWave64GuardDominanceSpills();
+    std::puts("KYTY_COOPERATIVE_GUARD_DOMINANCE_PASS");
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--cooperative-spill-reuse-only") == 0) {

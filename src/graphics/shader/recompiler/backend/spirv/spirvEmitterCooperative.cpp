@@ -219,7 +219,6 @@ CooperativeFunctionState PrepareCooperativeFunction(ValueEmitContext& ctx) {
 			}
 		}
 	}
-	std::unordered_set<const IR::Inst*> branch_conditions;
 	std::unordered_map<const IR::Inst*, uint32_t> branch_condition_uses;
 	std::unordered_map<const IR::Inst*, uint32_t> positions;
 	std::unordered_map<const IR::Block*, std::pair<uint32_t, uint32_t>> block_ranges;
@@ -232,7 +231,6 @@ CooperativeFunctionState PrepareCooperativeFunction(ValueEmitContext& ctx) {
 	for (size_t index = 0; index < ctx.program.block_info.size(); ++index) {
 		const auto& block = ctx.program.block_info[index];
 		if (const auto* condition = block.condition.Resolve().TryInstruction(); condition != nullptr) {
-			branch_conditions.insert(condition);
 			if (index < ctx.program.blocks.size()) {
 				const auto use = block_ranges.at(ctx.program.blocks[index]).second;
 				auto [found, inserted] = branch_condition_uses.emplace(condition, use);
@@ -270,24 +268,14 @@ CooperativeFunctionState PrepareCooperativeFunction(ValueEmitContext& ctx) {
 	for (const auto* block : ctx.program.blocks) {
 		std::unordered_set<uint32_t> block_phi_slots;
 		for (const auto& inst : *block) {
-			// Opaque resource/address recipes are compile-time structures. Runtime
-			// values need Function storage only when a scheduler phase, CFG edge, or
-			// Phi assignment can separate their definition from a consumer.
+			// Opaque resource/address recipes are compile-time structures. Planning-only
+			// raw SRT reads never execute. Every other runtime leaf needs Function
+			// storage: cooperative emission can open a new Guard for the same phase
+			// (scalar reads, collectives, LDS rendezvous), and a same-phase SSA value
+			// defined in one selection does not dominate a later sibling selection.
 			if (TypeId(ctx.state, inst.GetType()) == 0) continue;
 			if ((inst.GetOpcode() == O::LoadAddressU32 || inst.GetOpcode() == O::ReadConstBuffer) &&
 			    ctx.Memory(inst).planning_only) continue;
-			const auto phase = function.phases.find(&inst);
-			bool spill = inst.GetOpcode() == O::Phi || IsRuntimeScalarRead(ctx, inst) ||
-			             branch_conditions.contains(&inst) || phase == function.phases.end();
-			for (const auto& use : inst.Uses()) {
-				const auto user_phase = function.phases.find(use.user);
-				if (phase == function.phases.end() || user_phase == function.phases.end() ||
-				    user_phase->second != phase->second) {
-					spill = true;
-					break;
-				}
-			}
-			if (!spill) continue;
 
 			const auto start = positions.at(&inst);
 			auto       end = start;

@@ -3,6 +3,24 @@
 Обновлено **26 сентября 2026 года**. Игра: **Ghost of Yōtei, PPSA26344**.
 Рабочая ветка — `yotei-windows-bringup` в локальном fork `fxpw/KytyPS5`.
 
+Checkpoint cooperative Guard dominance + first shown frames **26 сентября 2026 года**,
+источник `9f383769` + dominance fix (рабочее дерево):
+
+1. После Ballot/`shown=250` run `da3924` fatal SPIR-V dominance на CS
+   `5f3fdf61a7ca4a20`: `%658` в Guard then `%655` использовался в следующем
+   Guard `%664` с тем же `active`. Phase-liveness оставлял same-phase SSA без
+   spill, а `Def` возвращал прямой id через Guard. RED:
+   `--cooperative-guard-dominance-only`. Fix: spill каждого runtime leaf в
+   cooperative + всегда reload из Function storage; `LoadBoundedFlatWord`
+   экспортирует load через `OpPhi`. GREEN. Emit `5f3fdf61` words≈150584 без
+   dominance fail.
+2. Game retry `_Build/runs/yotei-integrated-20260925-222331-24108b`
+   (SHA `29330c15…`, frame 280, `shown=103`): **`5f3fdf61` больше не блокирует**.
+   Следующий fatal — CS `753c552fae650ec4`:
+   `Expected Image 'Sampled Type' to be the same as Texel components`
+   на `OpImageWrite` (storage image Sampled=sint, texel=uint vec4).
+   Меню/gameplay **PENDING**.
+
 Checkpoint materialization + VOPC `0xbd` + LDS atomic return + workgroup
 buffer descriptors + VOP2 DPP8 / split-wave64 Ballot **26 сентября 2026 года**,
 источник `55f7b047` (поверх `0a323df7` / `777bce5d`):

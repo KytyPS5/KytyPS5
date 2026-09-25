@@ -769,14 +769,9 @@ uint32_t ValueEmitContext::Def(IR::Value value) {
 	}
 	if (cooperative_spills != nullptr) {
 		if (const auto slot = cooperative_spills->find(inst); slot != cooperative_spills->end()) {
-			if (cooperative_phase != 0 && cooperative_phases != nullptr) {
-				const auto phase  = cooperative_phases->find(inst);
-				const auto direct = definitions.find(inst);
-				if (phase != cooperative_phases->end() && phase->second == cooperative_phase &&
-				    direct != definitions.end()) {
-					return direct->second;
-				}
-			}
+			// Never return the defining Guard's SSA across a later selection with the
+			// same active mask. Same-phase liveness does not imply the same structured
+			// region once scalar reads, collectives or phase splits open a new Guard.
 			const auto type = TypeId(state, inst->GetType());
 			const auto loaded = state.builder.AllocateId();
 			state.builder.AddFunction({OpLoad, type, loaded, slot->second});

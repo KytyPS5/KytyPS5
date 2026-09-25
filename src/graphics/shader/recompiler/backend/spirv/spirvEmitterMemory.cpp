@@ -1282,24 +1282,21 @@ uint32_t LoadBoundedFlatWord(EmitterState& state, uint32_t index,
 	}
 	const auto valid = Binary(state, OpULessThan, TypeBool(state), index,
 	                          ConstantU32(state, count));
-	const auto load_label = state.builder.AllocateId();
-	const auto invalid_label = state.builder.AllocateId();
-	const auto merge_label = state.builder.AllocateId();
-	state.builder.AddFunction({OpSelectionMerge, merge_label, SelectionControlNone});
-	state.builder.AddFunction({OpBranchConditional, valid, load_label, invalid_label});
-	EmitLabel(state, invalid_label);
-	state.builder.AddFunction({OpUnreachable});
-	EmitLabel(state, load_label);
-	const auto offset = Binary(state, OpIAdd, TypeU32(state), index,
-	                           ConstantU32(state, flat_offset));
-	const auto pointer = state.builder.AllocateId();
-	const auto value = state.builder.AllocateId();
-	state.builder.AddFunction({OpAccessChain, TypeStorageBufferElementPointer(state), pointer,
-	                           state.flattened_srt_variable, ConstantU32(state, 0), offset});
-	state.builder.AddFunction({OpLoad, TypeU32(state), value, pointer});
-	state.builder.AddFunction({OpBranch, merge_label});
-	EmitLabel(state, merge_label);
-	return value;
+	// Export the load through OpPhi. A value defined only in the taken arm does
+	// not dominate the merge, even when the false arm is unreachable.
+	return EmitValueOrDefaultIfCondition(
+	    state, valid, TypeU32(state), state.builder.Constant(OpUndef, TypeU32(state), {}),
+	    [&]() {
+		    const auto offset = Binary(state, OpIAdd, TypeU32(state), index,
+		                               ConstantU32(state, flat_offset));
+		    const auto pointer = state.builder.AllocateId();
+		    const auto value = state.builder.AllocateId();
+		    state.builder.AddFunction({OpAccessChain, TypeStorageBufferElementPointer(state),
+		                               pointer, state.flattened_srt_variable, ConstantU32(state, 0),
+		                               offset});
+		    state.builder.AddFunction({OpLoad, TypeU32(state), value, pointer});
+		    return value;
+	    });
 }
 
 

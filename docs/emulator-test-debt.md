@@ -4,25 +4,41 @@ This file records regression coverage deferred during fast launch bring-up. Each
 describes a guest contract rather than a title-specific workaround. Deferred tests must
 be added before the corresponding fixes are proposed upstream.
 
-## Full-suite failures retained after upstream sync
+## Current Windows regression status after branch reconciliation
 
-Status: Windows CI-equivalent tests pass; extended local CTest is 46/51 after
-merge `a309653` (`upstream/main` at `0b4e78c`).
+Status at source revision `9a29c306` (25 September 2026): native Windows
+`launcher` + `kyty_tests` build passed. The three required Windows CI tests
+and three neighboring memory/kernel/resource tests passed 6/6. Logs are in
+`_Build/merge-validation-20260925/final-full-build.*` and `final-tests.*`.
+The full registered 55-test suite was not run; do not carry forward the old
+46/51 result as a current result.
 
-The remaining failures are outside the three-test Windows CI gate and were not
-hidden or disabled during conflict resolution:
+The bounded extended CPU run (`extended-cpu-tests.*`) passed 1/3:
 
-- `shader_cfg`: exact `wide-buffer` SPIR-V budget is stale (actual 831 words / 216
-  instructions versus 807 / 211).
-- `scalar_provenance`: out-of-bounds constant-buffer walk is not transactional.
-- `resource_tracking`: invariant indirect-image proof admits a wrapped scalar
-  immediate; this is the pre-existing debt already tracked below.
-- `shader_recompiler_compute` and `texture_cache_image_overlap`: ordinary sampled
-  aliases do not consistently retain/rebind the live comparison-depth owner.
+- `scalar_provenance` now passes.
+- `shader_cfg` passes the earlier wide-buffer budget check and the restored
+  SAVEEXEC mask operation, then fails `nested-tail routing changed semantic
+  instruction coverage`. This test and CFG implementation already existed at
+  the pre-integration branch head; the newly reached failure needs its own
+  unchanged regression and CFG-level correction.
+- `resource_tracking` still fails because the invariant indirect-image proof
+  admits a wrapped scalar immediate. This failure was recorded before the
+  current integration.
 
-Resolve these as separate regression-first mechanisms. They are not evidence
-against the newly merged DS bounded atomics, DB render override, APR, CES or
-buffer-cache changes, whose focused tests pass.
+Additional resource selectors `finite-selector-srt-proof-only`,
+`finite-selector-srt-materialization-only` and
+`workgroup-srt-materialization-only` fail. Their logs are under
+`_Build/merge-validation-20260925/resource7-*`. The finite selector checks
+expose missing rejection of unproved selection and writable descriptor-source
+overlap; the workgroup check exposes an exceeded combined probe budget. These
+results are not included in the 1/3 CTest count and need independent fixes.
+The earlier `shader_recompiler_compute` and `texture_cache_image_overlap`
+sampled-alias failures were not rechecked on this revision.
+
+For history, the 9 September merge `a309653` of `upstream/main` at `0b4e78c`
+had 46/51 extended CTest passes, with wide-buffer, scalar-provenance,
+resource-tracking and two sampled-alias failures. Keep historical and current
+results separate when judging launch readiness.
 
 ## Cooperative wave64 read-only LDS phase batching
 

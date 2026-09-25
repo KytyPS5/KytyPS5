@@ -1,7 +1,32 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
-Обновлено **9 сентября 2026 года**. Игра: **Ghost of Yōtei, PPSA26344**.
+Обновлено **25 сентября 2026 года**. Игра: **Ghost of Yōtei, PPSA26344**.
 Рабочая ветка — `yotei-windows-bringup` в локальном fork `fxpw/KytyPS5`.
+
+Checkpoint интеграции **25 сентября 2026 года**: исходные коммиты удалённой
+ветки сопоставлены с перенесённой историей (`_Build/merge-validation-20260925/
+origin-rebase-range-diff.txt`), а восстановленные после ребейза интерфейсы
+шейдеров, ресурсов и Windows runtime закреплены в `47ef501f`. История удалённой
+ветки включена merge-коммитом без force push. Выборочно перенесены upstream PR
+#798 (таргет тестов сохранений), #799 (stage/hash в ошибках CFG), #812
+(инструкция по сборке без Qt) и #820 (обнуление повторно выделенной direct memory).
+Для #820 неизменённый тест сначала воспроизвёл чтение старых байтов, затем
+полностью прошёл после исправления; логи `pr820-red` и `pr820-green` находятся в
+`_Build/merge-validation-20260925/`.
+
+Проверенный кодовый checkpoint `9a29c306`: native Windows build `launcher` и
+`kyty_tests` прошёл (`final-full-build`), шесть профильных CTest, включая три
+обязательных Windows CI, прошли **6/6** (`final-tests`). Расширенная CPU-проверка
+прошла **1/3** (`extended-cpu-tests`): `scalar_provenance` GREEN,
+`shader_cfg` останавливается на nested-tail CFG instruction coverage, а
+`resource_tracking` — на wrapped scalar immediate в invariant-image proof.
+Другие дополнительные selector-проверки ресурсов также требуют отдельной
+правки; они перечислены в `docs/emulator-test-debt.md`. Полный набор 55 CTest
+и игра на этой ревизии **не запускались**. Подтверждённый rendered-frame
+результат ниже относится к старой ревизии `96611fe`; меню и gameplay для
+текущего кода остаются **PENDING**. Следующий шаг — regression-first исправить
+оставшиеся CFG/resource failures, затем выполнить ограниченный GPU/game retry
+с сохранением логов и source readback.
 
 Checkpoint синхронизации **9 сентября 2026, 15:55 UTC**: merge-коммит
 `a309653` включает `upstream/main` до `0b4e78c` и устраняет конфликты PR #497

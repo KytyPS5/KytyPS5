@@ -178,12 +178,8 @@ sudo apt-get install --no-install-recommends \
   libasound2-dev libpulse-dev libudev-dev libdbus-1-dev libwayland-dev wayland-protocols
 ```
 
-Qt 6 (Concurrent, Network, Widgets) is also required — either the distribution packages
+Qt 6 (Concurrent, Network, Widgets) is required for the launcher — either the distribution packages
 (`qt6-base-dev`) or an official Qt installation.
-
-Qt is only needed for the launcher. To build without it, configure with
-`-DKYTY_BUILD_LAUNCHER=OFF` and build `kyty_emulator` (plus `kyty_tests` for the regression
-tests) instead of `launcher`.
 
 ```bash
 git submodule update --init --recursive
@@ -200,6 +196,18 @@ The install step copies the Qt libraries and plugins next to the binaries, so
 `_Build/linux/install` runs without a matching system Qt. FFmpeg is linked statically
 from the pinned [KytyPS5 FFmpeg core](https://github.com/KytyPS5/ext-ffmpeg-core)
 release, including VP9 and WebM support. System FFmpeg packages are not required.
+
+To build `kyty_emulator` and the `kyty_tests` target without Qt, use a separate build directory:
+
+```bash
+git submodule update --init --recursive
+
+cmake -S . -B _Build/linux-no-qt -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+  -DKYTY_BUILD_LAUNCHER=OFF
+
+cmake --build _Build/linux-no-qt --target kyty_emulator kyty_tests --parallel
+```
 
 As on Windows, the MSVC compiler is not used; Clang is required. `cl.exe` is rejected at configure
 time.

@@ -3,8 +3,8 @@
 Обновлено **25 сентября 2026 года**. Игра: **Ghost of Yōtei, PPSA26344**.
 Рабочая ветка — `yotei-windows-bringup` в локальном fork `fxpw/KytyPS5`.
 
-Checkpoint materialization + VOPC `0xbd` restore **25 сентября 2026 года**,
-источник `ba8530b4` (поверх `6a58b494`):
+Checkpoint materialization + VOPC `0xbd` + LDS atomic return **25 сентября 2026 года**,
+источник `faca6d52` (поверх `ba8530b4` / `6a58b494`):
 
 1. Indirect compute `DispatchIndirect` не передавал `guest_workgroups` в
    `GetComputeProgram` / materialization. Workgroup-axis bounded SRT для CS
@@ -21,13 +21,30 @@ Checkpoint materialization + VOPC `0xbd` restore **25 сентября 2026 го
    `decoder rejected captured VOPC V_CMPX_NE_U16 fields`
    (`_Build/logs/vopc-cmpx-ne-u16-red.*`). После восстановления `{0xbdu, …}` —
    GREEN `KYTY_VOPC_CMPX_NE_U16_PASS`; сосед `--vopc-sdwa-cmpx-ge-i16-only` PASS.
+   Коммит `ba8530b4`.
+3. После restore run `_Build/runs/yotei-integrated-20260925-192322-a2a957`
+   (SHA `e9b5fdc8…`, frame 180, VS6/PS12/CS114, `shown=0`) прошёл decode
+   `a0c48e` и остановился на
+   `wave64 splitting does not support live atomic return values` для
+   `SharedAtomicIAdd32`. RED `--single-wave64-lds-atomic-return-only`;
+   admission acyclic single-wave LDS returns (как buffer atomics);
+   GDS/cyclic/cooperative live returns по-прежнему rejected. GREEN +
+   neighbor GDS admission PASS; audit `a0c48e` →
+   `compute_execution_precheck` `not_rejected` / `split_wave64=true`
+   (`_Build/logs/lds-atomic-return-*.log`, `a0c48e-audit-green.log`).
+   Game retry `_Build/runs/yotei-integrated-20260925-193049-d265cc`
+   (SHA `45738f15…`, frame 181, runtime VS7/PS6/CS58, `shown=0`) прошёл
+   `a0c48e`; следующий fatal —
+   `GetBufferResource dword 0 is not a valid runtime value (root=ReadConstBuffer)`
+   на CS `8368b02a85651dd8` PC `0x378`.
 
 Предыдущие закрытые blockers (коммит `5af1cbb6`): ballot active-mask
 `86da5eb7`, SAVEEXEC `Logical*` `f00717de`, dedicated continue `7291c10b`,
 LDS u64/`shaderSharedInt64Atomics` `e94e0c58`. Меню/gameplay **PENDING**.
-Следующий шаг — native install + bounded GPUAV-lite retry; доказать проход
-`a0c48e952fde451a` и зафиксировать следующий fatal. Внешние PR целиком не
-мержились; correctness очередь — shared ISA/materialization, не #506/#373.
+Следующий шаг — RED resource tracking для `ReadConstBuffer` →
+`GetBufferResource` dword 0 на `8368b02a` без фиктивных descriptor values.
+Внешние PR целиком не мержились; correctness очередь — shared
+ISA/materialization/execution plan, не #506/#373.
 
 Checkpoint ballot active-mask + SAVEEXEC + loop continue + LDS u64
 **25 сентября 2026 года** (`5af1cbb6` поверх `ab644239`): закрыты четыре

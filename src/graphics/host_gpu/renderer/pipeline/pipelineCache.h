@@ -135,7 +135,7 @@ public:
 	ShaderProgram GetComputeProgram(const HW::ComputeShaderInfo& regs,
 	                                const HW::ShaderRegisters&   sh,
 	                                ShaderComputeInputInfo&      input_info,
-	                                const std::array<uint32_t, 3>& guest_workgroups);
+	                                std::optional<std::array<uint32_t, 3>> guest_workgroups = std::nullopt);
 
 	Pipeline& GetGraphicsPipeline(std::span<const RenderColorInfo>       colors,
 	                              const RenderDepthInfo&                 depth,

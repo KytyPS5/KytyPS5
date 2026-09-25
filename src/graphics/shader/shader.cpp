@@ -525,8 +525,6 @@ static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserS
 	KYTY_PROFILER_FUNCTION();
 
 	info = {};
-	info.initial_fp_state = {true, regs.gs_regs.rsrc1.float_mode, regs.gs_regs.rsrc1.ieee_mode,
-	                         regs.gs_regs.rsrc1.dx10_clamp};
 
 	info.pa_cl_vs_out_cntl = sh.m_paClVsOutCntl;
 
@@ -639,6 +637,8 @@ static void ShaderGetStaticInputInfoCS(const HW::ComputeShaderInfo& regs,
 	info                                  = {};
 	info.dispatch_thread_dimensions       = dispatch_thread_dimensions;
 	info.host_subgroup_size               = host_subgroup_size;
+	info.initial_fp_state = {true, regs.cs_regs.float_mode, regs.cs_regs.ieee_mode,
+	                         regs.cs_regs.dx10_clamp};
 	info.threads_num[0]                   = regs.cs_regs.num_thread_x;
 	info.threads_num[1]                   = regs.cs_regs.num_thread_y;
 	info.threads_num[2]                   = regs.cs_regs.num_thread_z;
@@ -786,6 +786,8 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 		                                    regs.gs_regs.rsrc2.user_sgpr, sh, data, info)) {
 			EXIT("failed to prepare vertex shader program\n");
 		}
+	info.initial_fp_state = {true, regs.gs_regs.rsrc1.float_mode, regs.gs_regs.rsrc1.ieee_mode,
+	                         regs.gs_regs.rsrc1.dx10_clamp};
 		info.wave_size = (context.GetShaderStages() & 0x00400000u) != 0 ? 32u : 64u;
 		return params;
 	}

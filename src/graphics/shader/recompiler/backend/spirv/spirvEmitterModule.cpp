@@ -197,7 +197,7 @@ void DefineDescriptors(EmitterState& state) {
 			case IR::DescriptorBindingKind::Buffers:
 				state.storage_buffer_variable =
 				    Define(ArrayType(StorageBufferType(state)), "buffers");
-				if (state.requirements.buffer_int64_atomics) {
+				if (state.requirements.buffer_int64_atomics || state.requirements.shared_int64_atomics) {
 					state.storage_buffer_u64_variable =
 					    Define(ArrayType(StorageBufferU64Type(state)), "buffers_u64");
 					state.builder.AddAnnotation(spv::OpDecorate, state.storage_buffer_variable,
@@ -380,7 +380,8 @@ void DefineInputs(EmitterState& state) {
 	for (const auto& input: state.program.info.inputs) {
 		state.inputs.push_back({input});
 	}
-	if (state.lane_count == 2) {
+	if (state.lane_count == 2 || state.compute_execution.IsSplitWave64() ||
+	    state.compute_workgroup.IsReshaped()) {
 		const auto add_builtin = [&](IR::StageInputKind kind, uint32_t components,
 		                             const char* name) {
 			if (std::ranges::none_of(state.inputs, [kind](const InputBinding& input) {
@@ -390,7 +391,7 @@ void DefineInputs(EmitterState& state) {
 			}
 		};
 		add_builtin(IR::StageInputKind::LocalInvocationIndex, 1, "gl_LocalInvocationIndex");
-		if (std::ranges::any_of(state.inputs, [](const InputBinding& input) {
+		if (state.compute_execution.wave_partition_factor > 1u || std::ranges::any_of(state.inputs, [](const InputBinding& input) {
 			    return input.kind == IR::StageInputKind::GlobalInvocationId;
 		    })) {
 			add_builtin(IR::StageInputKind::WorkgroupId, 3, "gl_WorkGroupID");
@@ -593,6 +594,47 @@ void DefineModule(EmitterState& state) {
 	DefineOutputs(state);
 	DefineTessellationInterfaces(state);
 	DefineDescriptors(state);
+	if (state.compute_execution.IsSplitWave64()) {
+		uint32_t scratch_dwords = 64;
+		if (state.compute_execution.IsCooperativeWave64()) {
+			scratch_dwords = 1;
+			for (const auto size: state.compute_execution.layout.host_size) {
+				EXIT_IF(size == 0 || scratch_dwords > UINT32_MAX / size);
+				scratch_dwords *= size;
+			}
+			EXIT_IF(scratch_dwords % 64u != 0u);
+		}
+		uint32_t ballot_dwords = 0;
+		if (state.requirements.subgroup_ballot) {
+			const auto wave_count =
+			    state.compute_execution.IsCooperativeWave64() ? scratch_dwords / 64u : 1u;
+			EXIT_IF(wave_count > UINT32_MAX / 2u);
+			ballot_dwords = wave_count * 2u;
+		}
+		EXIT_IF(scratch_dwords > UINT32_MAX - ballot_dwords);
+		// Without WorkgroupMemoryExplicitLayoutKHR, Workgroup variables alias.
+		// Guest LDS and split-wave scratch must occupy disjoint indices of one
+		// u32 array. 64-bit LDS atomics keep a separate u64 array.
+		uint32_t lds_dwords = 0;
+		if (!state.requirements.function_lds && !state.requirements.shared_int64_atomics &&
+		    HasGuestLdsAccess(state.program)) {
+			lds_dwords = LdsDwordCount(state);
+			EXIT_IF(lds_dwords > UINT32_MAX - scratch_dwords - ballot_dwords);
+		}
+		state.wave_scratch_base_dwords = lds_dwords;
+		state.wave_ballot_base_dwords = scratch_dwords;
+		state.wave_scratch_variable = state.builder.DefineGlobalVariable(
+		    TypeU32ArrayPointer(state, spv::StorageClassWorkgroup,
+		                        lds_dwords + scratch_dwords + ballot_dwords),
+		    StorageClassWorkgroup);
+		if (lds_dwords != 0) {
+			state.lds_variable = state.wave_scratch_variable;
+			state.builder.AddName(state.lds_variable, "lds_dwords");
+		} else {
+			state.builder.AddName(state.wave_scratch_variable, "wave64_collective_scratch");
+		}
+	}
+
 	if (state.requirements.function_lds) {
 		state.lds_variable = state.builder.AllocateId();
 	}
@@ -621,12 +663,20 @@ void DefineModule(EmitterState& state) {
 
 	state.builder.RequireCapability(spv::CapabilityShader);
 	state.builder.RequireCapability(spv::CapabilitySignedZeroInfNanPreserve);
+	if (state.f64_certificate.needs_native64) {
+		state.builder.RequireCapability(CapabilityFloat64);
+		state.builder.RequireCapability(CapabilityRoundingModeRTE);
+	}
+	if (state.f64_certificate.needs_fma64) {
+		state.builder.RequireCapability(CapabilityFMAKHR);
+		state.builder.RequireExtension("SPV_KHR_fma");
+	}
 	if (state.program.info.uses_dma) {
 		state.builder.RequireCapability(spv::CapabilityInt64);
 		state.builder.RequireCapability(spv::CapabilityPhysicalStorageBufferAddresses);
 		state.builder.RequireExtension("SPV_KHR_physical_storage_buffer");
 	}
-	if (state.requirements.buffer_int64_atomics) {
+	if (state.requirements.buffer_int64_atomics || state.requirements.shared_int64_atomics) {
 		state.builder.RequireCapability(spv::CapabilityInt64);
 		state.builder.RequireCapability(spv::CapabilityInt64Atomics);
 	}
@@ -654,7 +704,11 @@ void DefineModule(EmitterState& state) {
 	    state.requirements.subgroup_shuffle || state.requirements.subgroup_local_invocation_id) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
 	}
-	if (state.lane_count == 2 || state.requirements.subgroup_ballot) {
+	if (state.compute_execution.IsSplitWave64() && state.requirements.subgroup_ballot) {
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniformArithmetic);
+	}
+	if (state.lane_count == 2 ||
+	    (state.requirements.subgroup_ballot && !state.compute_execution.IsSplitWave64())) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformBallot);
 	}
 	if (state.requirements.subgroup_shuffle) {
@@ -683,6 +737,10 @@ void DefineModule(EmitterState& state) {
 	// contract prevents host compilers from treating synthesized IEEE values as finite.
 	state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeSignedZeroInfNanPreserve,
 	                               32u);
+	if (state.f64_certificate.needs_native64) {
+		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeSignedZeroInfNanPreserve, 64u);
+		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeRoundingModeRTE, 64u);
+	}
 	if (const auto* cs = ShaderWorkgroupInput(state.program.stage, state.input_info)) {
 		uint32_t    local_x = state.requirements.compute_derivatives ? 2u : 1u;
 		uint32_t    local_y = state.requirements.compute_derivatives ? 2u : 1u;
@@ -697,6 +755,11 @@ void DefineModule(EmitterState& state) {
 				local_y = local_x / 2u;
 				local_x = 2u;
 			}
+		}
+		if (state.program.stage == ShaderType::Compute && state.lane_count == 1) {
+			local_x = state.compute_execution.layout.host_size[0];
+			local_y = state.compute_execution.layout.host_size[1];
+			local_z = state.compute_execution.layout.host_size[2];
 		}
 		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeLocalSize, local_x,
 		                               local_y, local_z);

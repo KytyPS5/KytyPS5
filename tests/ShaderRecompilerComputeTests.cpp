@@ -1,3 +1,5 @@
+#include "graphics/shader/recompiler/ComputeExecution.h"
+#include <deque>
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/hostException.h"
@@ -1545,7 +1547,9 @@ void CheckSpirvText(const TestCase &test, const std::vector<u32> &spirv) {
   }
 }
 
-CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
+CompiledShader CompileCase(const TestCase &test,
+    const ShaderRecompiler::ComputeWorkgroupLimits& workgroup_limits = {},
+    const ShaderRecompiler::ShaderHostProfile& host_profile = {}) {
   auto user_data =
       MakeNativeUserData(test.has_user_data ? &test.user_data : nullptr);
   const auto uses_image =
@@ -1566,7 +1570,9 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   options.stage = ShaderType::Compute;
   options.dump_ir = true;
   auto compute_info = test.compute_info;
-  compute_info.host_subgroup_size = host_subgroup_size;
+  compute_info.host_subgroup_size = workgroup_limits.can_require_subgroup_size_64 ? 64u : workgroup_limits.native_subgroup_size;
+  options.compute_workgroup_limits = workgroup_limits;
+  options.host_profile = host_profile;
   options.input_info.compute = &compute_info;
   options.user_data = user_data;
 
@@ -2034,6 +2040,10 @@ public:
   };
 
   [[nodiscard]] vk::Device Device() const { return m_device; }
+  void CheckValidation(const char* name) const {
+    Require(name, "GPU-assisted validation", m_validation_errors.load() == 0u,
+            "validation reported an error; see the GPUAV callback log");
+  }
   [[nodiscard]] u32 SubgroupSize() const {
     vk::PhysicalDeviceSubgroupProperties subgroup{};
     vk::PhysicalDeviceProperties2 properties{};
@@ -2041,6 +2051,18 @@ public:
     m_physical_device.getProperties2(&properties);
     return subgroup.subgroupSize;
   }
+  [[nodiscard]] ShaderRecompiler::ComputeWorkgroupLimits WorkgroupLimits() const {
+    const auto properties = m_physical_device.getProperties();
+    ShaderRecompiler::ComputeWorkgroupLimits limits;
+    for (size_t axis = 0; axis < 3; ++axis) limits.max_size[axis] = properties.limits.maxComputeWorkGroupSize[axis];
+    limits.max_invocations = properties.limits.maxComputeWorkGroupInvocations;
+    limits.max_shared_memory_bytes = properties.limits.maxComputeSharedMemorySize;
+    limits.native_subgroup_size = SubgroupSize();
+    // This harness does not enable subgroup-size-control on its device.
+    limits.can_require_subgroup_size_64 = false;
+    return limits;
+  }
+  [[nodiscard]] const ShaderRecompiler::ShaderHostProfile& HostProfile() const { return m_shader_host_profile; }
   [[nodiscard]] GraphicContext &RuntimeContext() {
     EnsureRuntimeContext();
     return m_runtime_context;
@@ -4841,13 +4863,14 @@ public:
       const uint64_t address = write_only_meta + (i + 1u) * 0x100u;
       TextureCacheTestAccess::RegisterHtileMeta(texture_cache, address);
       ShaderRecompiler::IR::CompiledShaderInfo snapshot_program{};
-      auto snapshot_input = MakeInput(address, false, true, snapshot_program);
+      ShaderRecompiler::IR::ResourceSnapshot snapshot_resources;
+      auto snapshot_input = MakeInput(address, false, true, snapshot_program, snapshot_resources);
       if (scenario.bounded) {
         snapshot_program.info.bounded_srt_reads.push_back({1u, 0u});
-        snapshot_input.stage.resources.flattened_srt.push_back(0x13579bdfu);
+        snapshot_resources.flattened_srt.push_back(0x13579bdfu);
       }
       if (scenario.immutable) {
-        snapshot_input.stage.resources.immutable_srt_ranges.push_back(
+        snapshot_resources.immutable_srt_ranges.push_back(
             {scenario.overlaps_output ? address : address + 0x100000u,
              sizeof(uint32_t)});
       }
@@ -9786,7 +9809,7 @@ public:
           }
         }
         AppendEnd(&test.code);
-        const auto compiled = CompileCase(test, SubgroupSize());
+        const auto compiled = CompileCase(test, WorkgroupLimits(), HostProfile());
         ShaderRecompiler::IR::DescriptorValue value{};
         value.dword_count = 8;
         std::copy_n(descriptor.fields, 8, value.dwords.begin());
@@ -9916,7 +9939,7 @@ public:
         }
       }
       AppendEnd(&test.code);
-      const auto compiled = CompileCase(test, SubgroupSize());
+      const auto compiled = CompileCase(test, WorkgroupLimits(), HostProfile());
       Require(name, "comparison resource", compiled.program.info.images.size() == 1 &&
                   compiled.program.info.images[0].depth_compare &&
                   compiled.program.info.images[0].cube == cube &&
@@ -10074,7 +10097,7 @@ public:
         test.code.push_back(EncodeMimg0(0x08, 0xf, 0, false, 5));
         test.code.push_back(EncodeMimg1(0, 20));
         AppendEnd(&test.code);
-        const auto compiled = CompileCase(test, SubgroupSize());
+        const auto compiled = CompileCase(test, WorkgroupLimits(), HostProfile());
         const auto &resource = compiled.program.info.images.at(0);
         Require(name, "cube storage specialization", resource.cube &&
                     resource.written && resource.dimension ==
@@ -10663,7 +10686,7 @@ OpFunctionEnd
   HW::UserConfig user_config{};
   HW::Shader shaders{};
   scheduler.Begin(registers, user_config, shaders);
-  auto& resources = context.GetGpuResources();
+  auto& resources = context;
   auto& cache = resources.GetTextureCache();
   auto& executor = context.GetRenderExecutor();
   resources.MapMemory(base, allocation_size);
@@ -10740,15 +10763,17 @@ OpFunctionEnd
   auto second_info = compile_info(
       ShaderType::Pixel,
       std::vector{compare_first ? storage_resource : compare_resource});
+  std::deque<ShaderRecompiler::IR::ResourceSnapshot> runtime_snapshots;
   const auto runtime = [&](const CompiledShaderInfo& info) {
-    ShaderStageRuntime result{.program = &info};
-    result.resources.images.assign(info.info.images.size(), image_value);
+    auto& result_snapshot = runtime_snapshots.emplace_back();
+    ShaderStageRuntime result{.program = &info, .resources = &result_snapshot};
+    result_snapshot.images.assign(info.info.images.size(), image_value);
     if (!info.info.samplers.empty()) {
       DescriptorValue sampler{};
       sampler.dword_count = 4;
       // LESS comparison, nearest, normalized coordinates, clamp to edge.
       sampler.dwords[0] = (1u << 12u) | 2u | (2u << 3u) | (2u << 6u);
-      result.resources.samplers.push_back(sampler);
+      result_snapshot.samplers.push_back(sampler);
     }
     return result;
   };
@@ -10758,7 +10783,8 @@ OpFunctionEnd
   std::fflush(stdout);
   if (same_compute) {
     // Public production entry; no new TestAccess hook is needed.
-    (void)executor.PrepareBindings(first);
+    PreparedBindings bindings;
+    executor.PrepareBindings(first, bindings);
   } else {
     (void)RenderExecutorTestAccess::PrepareGraphicsBindings(
         executor, first, second, true);
@@ -10809,7 +10835,7 @@ OpFunctionEnd
   HW::UserConfig user_config{};
   HW::Shader shaders{};
   scheduler.Begin(registers, user_config, shaders);
-  auto& resources = context.GetGpuResources();
+  auto& resources = context;
   auto& cache = resources.GetTextureCache();
   auto& executor = context.GetRenderExecutor();
   resources.MapMemory(base, allocation_size);
@@ -10932,7 +10958,7 @@ OpFunctionEnd
   HW::UserConfig user_config{};
   HW::Shader shaders{};
   scheduler.Begin(registers, user_config, shaders);
-  auto& resources = context.GetGpuResources();
+  auto& resources = context;
   auto& cache = resources.GetTextureCache();
   auto& executor = context.GetRenderExecutor();
   resources.MapMemory(base, allocation_size);
@@ -11025,28 +11051,30 @@ OpFunctionEnd
   auto second_info = compile_info(
       ShaderType::Pixel,
       std::vector{compare_first ? other_resource : compare_resource});
+  std::deque<ShaderRecompiler::IR::ResourceSnapshot> runtime_snapshots;
   const auto runtime = [&](const CompiledShaderInfo& info) {
-    ShaderStageRuntime result{.program = &info};
+    auto& result_snapshot = runtime_snapshots.emplace_back();
+    ShaderStageRuntime result{.program = &info, .resources = &result_snapshot};
     for (const auto& image : info.info.images) {
-      result.resources.images.push_back(image.depth_compare ? image_value : other_value);
+      result_snapshot.images.push_back(image.depth_compare ? image_value : other_value);
     }
     if (!info.info.samplers.empty()) {
       DescriptorValue sampler{};
       sampler.dword_count = 4;
       // LESS comparison, nearest, normalized coordinates, clamp to edge.
       sampler.dwords[0] = (1u << 12u) | 2u | (2u << 3u) | (2u << 6u);
-      result.resources.samplers.push_back(sampler);
+      result_snapshot.samplers.push_back(sampler);
     }
     return result;
   };
   const auto first = runtime(first_info);
   const auto second = runtime(second_info);
   const auto check = [&](const PreparedBindings& bindings) {
-    const auto& images = bindings.program->info.images;
-    Require(name, mode, bindings.resources.images.size() == images.size(),
+    const auto& images = bindings.runtime->program->info.images;
+    Require(name, mode, bindings.images.size() == images.size(),
             "actual renderer omitted an image binding");
     for (uint32_t i = 0; i < images.size(); ++i) {
-      const auto& bound = bindings.resources.images[i];
+      const auto& bound = bindings.images[i];
       const auto expected_base = images[i].depth_compare || !disjoint
                                      ? base : base + image_size;
       const auto expected_type = images[i].written
@@ -11080,18 +11108,19 @@ OpFunctionEnd
   std::printf("KYTY_COMPARISON_POSITIVE_READY %s\n", mode);
   std::fflush(stdout);
   if (same_compute) {
-    auto bindings = executor.PrepareBindings(first);
+    PreparedBindings bindings;
+      executor.PrepareBindings(first, bindings);
     // This is the normal second image stage of compute binding preparation.
     executor.RebindImages(bindings);
     check(bindings);
-    check_pair(bindings.resources.images[0], bindings.resources.images[1]);
+    check_pair(bindings.images[0], bindings.images[1]);
   } else {
     auto bindings = RenderExecutorTestAccess::PrepareGraphicsBindings(
         executor, first, second, true);
     Require(name, mode, bindings.pixel.has_value(), "pixel stage was omitted");
-    check(bindings.vertex);
+    check(bindings.vertex[0]);
     check(*bindings.pixel);
-    check_pair(bindings.vertex.resources.images[0], bindings.pixel->resources.images[0]);
+    check_pair(bindings.vertex[0].images[0], bindings.pixel->images[0]);
   }
   // Successful positives must also tolerate the commands they recorded.
   // This differs from the negative child, which must never submit bad copies.
@@ -11138,7 +11167,7 @@ void CheckNativeHtileArraySubset() {
     HW::Shader shaders{};
     scheduler.Begin(registers, user_config, shaders);
     context.InitializeGpu(nullptr);
-    auto& resources = context.GetGpuResources();
+    auto& resources = context;
     auto& cache = context.GetTextureCache();
     auto& executor = context.GetRenderExecutor();
     resources.MapMemory(base, allocation_size);
@@ -11272,7 +11301,7 @@ void CheckNativeHtileArraySubset() {
         }
       }
     }
-    resources.SetGpu(nullptr);
+
     resources.UnmapMemory(base, allocation_size);
     scheduler.Finish();
     context.ShutdownGpu();
@@ -11349,7 +11378,7 @@ void CheckSampledHtileClearDiscovery(const char* negative_scenario = nullptr) {
     // Coherent metadata acquisition uses BufferCache::ReadMemory, which must
     // serialize through this real context's GPU command worker.
     context.InitializeGpu(nullptr);
-    auto& resources = context.GetGpuResources();
+    auto& resources = context;
     auto& cache = context.GetTextureCache();
     auto& buffers = context.GetBufferCache();
     auto& executor = context.GetRenderExecutor();
@@ -11380,7 +11409,7 @@ void CheckSampledHtileClearDiscovery(const char* negative_scenario = nullptr) {
     resource.depth_compare = true;
     Require(name, "first sampled discovery",
             !cache.IsMeta(metadata_address) &&
-                !cache.QueryRegion(base, depth_size).image_bytes &&
+                TextureCacheTestAccess::FindImages(cache, base, depth_size, false).empty() &&
                 descriptor.MetaAddr() << 8u == metadata_address,
             "fixture accidentally acquired a prior depth/metadata owner");
 
@@ -11411,6 +11440,8 @@ void CheckSampledHtileClearDiscovery(const char* negative_scenario = nullptr) {
       std::copy_n(pattern_descriptor.fields, raw.dword_count,
                   raw.dwords.begin());
       ShaderComputeInputInfo pattern{};
+      ShaderRecompiler::IR::ResourceSnapshot pattern_snapshot;
+      pattern.stage.resources = &pattern_snapshot;
       pattern.threads_num[0] = words_per_group;
       pattern.threads_num[1] = 1;
       pattern.threads_num[2] = 1;
@@ -11418,8 +11449,8 @@ void CheckSampledHtileClearDiscovery(const char* negative_scenario = nullptr) {
       pattern.thread_ids_num = 1;
       pattern.wave_size = 64;
       pattern.stage.program = &pattern_program;
-      pattern.stage.resources.buffers.push_back(raw);
-      auto& user_data = pattern.stage.resources.user_data;
+      pattern_snapshot.buffers.push_back(raw);
+      auto& user_data = pattern_snapshot.user_data;
       user_data.resize(10);
       std::copy_n(pattern_descriptor.fields, raw.dword_count,
                   user_data.begin());
@@ -11434,7 +11465,7 @@ void CheckSampledHtileClearDiscovery(const char* negative_scenario = nullptr) {
       const uint32_t group_count =
           (word_count + words_per_group - 1) / words_per_group;
       Require(name, "pattern HTile producer",
-              ResolveComputeImageClear(pattern, group_count, 1, 1, 0x41u,
+              ResolveComputeBufferFill(pattern, group_count, 1, 1, 0x41u,
                                        resolved_descriptor, resolved_clear,
                                        resolved_size) &&
                   resolved_descriptor.Base48() == metadata_address &&
@@ -11447,7 +11478,7 @@ void CheckSampledHtileClearDiscovery(const char* negative_scenario = nullptr) {
       resolved_clear = 0x87654321u;
       resolved_size = 0x123456789abcdef0ull;
       Require(name, "partial pattern coverage",
-              !ResolveComputeImageClear(partial, group_count - 1, 1, 1, 0x41u,
+              !ResolveComputeBufferFill(partial, group_count - 1, 1, 1, 0x41u,
                                         resolved_descriptor, resolved_clear,
                                         resolved_size) &&
                   resolved_descriptor.fields[0] == 0x12345678u &&
@@ -11455,17 +11486,21 @@ void CheckSampledHtileClearDiscovery(const char* negative_scenario = nullptr) {
                   resolved_size == 0x123456789abcdef0ull,
               "partial pattern dispatch was consumed or changed outputs");
       auto nonuniform = pattern;
-      nonuniform.stage.resources.user_data[5] ^= 1u;
+      auto nonuniform_snapshot = pattern_snapshot;
+      nonuniform.stage.resources = &nonuniform_snapshot;
+      nonuniform_snapshot.user_data[5] ^= 1u;
       Require(name, "nonuniform pattern",
-              !ResolveComputeImageClear(nonuniform, group_count, 1, 1, 0x41u,
+              !ResolveComputeBufferFill(nonuniform, group_count, 1, 1, 0x41u,
                                         resolved_descriptor, resolved_clear,
                                         resolved_size),
               "nonuniform dword pattern was consumed as a clear");
       auto snapshot = pattern;
-      snapshot.stage.resources.immutable_srt_ranges.push_back(
+      auto snapshot_resources = pattern_snapshot;
+      snapshot.stage.resources = &snapshot_resources;
+      snapshot_resources.immutable_srt_ranges.push_back(
           {metadata_address + metadata_size, sizeof(uint32_t)});
       Require(name, "snapshot-dependent pattern",
-              !ResolveComputeImageClear(snapshot, group_count, 1, 1, 0x41u,
+              !ResolveComputeBufferFill(snapshot, group_count, 1, 1, 0x41u,
                                         resolved_descriptor, resolved_clear,
                                         resolved_size),
               "snapshot-dependent pattern write was consumed as a clear");
@@ -11655,7 +11690,7 @@ void CheckSampledHtileClearDiscovery(const char* negative_scenario = nullptr) {
     }
     // Match existing runtime buffer fixtures: detach callbacks before unmap,
     // finish recorded work, then stop the worker before context destruction.
-    resources.SetGpu(nullptr);
+
     resources.UnmapMemory(base, allocation_size);
     scheduler.Finish();
     context.ShutdownGpu();
@@ -11724,7 +11759,7 @@ void CheckSampledHtileArrayClearDiscovery() {
     HW::Shader shaders{};
     scheduler.Begin(registers, user_config, shaders);
     context.InitializeGpu(nullptr);
-    auto& resources = context.GetGpuResources();
+    auto& resources = context;
     auto& cache = context.GetTextureCache();
     auto& buffers = context.GetBufferCache();
     auto& executor = context.GetRenderExecutor();
@@ -11817,7 +11852,7 @@ void CheckSampledHtileArrayClearDiscovery() {
         }
       }
     }
-    resources.SetGpu(nullptr);
+
     resources.UnmapMemory(base, allocation_size);
     scheduler.Finish();
     context.ShutdownGpu();
@@ -11878,7 +11913,7 @@ void CheckSampledHtileArrayClearDiscovery() {
       HW::Shader shaders{};
       scheduler.Begin(registers, user_config, shaders);
       context.InitializeGpu(nullptr);
-      auto& resources = context.GetGpuResources();
+      auto& resources = context;
       resources.MapMemory(base, allocation_size);
       auto& executor = context.GetRenderExecutor();
       // Make the backing origin explicit; NativeStorageBuffer must preserve the
@@ -11895,7 +11930,8 @@ void CheckSampledHtileArrayClearDiscovery() {
       program.stage = ShaderType::Compute;
       program.resource_tracking_complete = true;
       program.shader_info_complete = true;
-      ShaderStageRuntime runtime{};
+      ShaderRecompiler::IR::ResourceSnapshot runtime_snapshot;
+      ShaderStageRuntime runtime{.resources = &runtime_snapshot};
       for (uint32_t index = 0; index < offsets.size(); ++index) {
         BufferResource info{};
         info.written = index != 3u;
@@ -11926,7 +11962,7 @@ void CheckSampledHtileArrayClearDiscovery() {
         DescriptorValue value{};
         value.dword_count = 4u;
         std::copy(std::begin(descriptor.fields), std::end(descriptor.fields), value.dwords.begin());
-        runtime.resources.buffers.push_back(value);
+        runtime_snapshot.buffers.push_back(value);
       }
       AllocateBindings(program);
       CompiledShaderInfo info{};
@@ -11939,7 +11975,8 @@ void CheckSampledHtileArrayClearDiscovery() {
       else
         std::printf("KYTY_BYTE_OFFSET_BINDING_READY\n");
       std::fflush(stdout);
-      auto prepared = executor.PrepareBindings(runtime);
+      PreparedBindings prepared;
+      executor.PrepareBindings(runtime, prepared);
       executor.FindBuffers(prepared);
       executor.RebindBuffers(prepared);
       if (boundary) {
@@ -11951,10 +11988,10 @@ void CheckSampledHtileArrayClearDiscovery() {
         std::fflush(nullptr);
         std::_Exit(0);
       }
-      Require(name, "binding count", prepared.resources.buffers.size() == offsets.size(),
+      Require(name, "binding count", prepared.buffers.size() == offsets.size(),
               "byte-offset renderer omitted a declared resource");
       for (uint32_t index = 0; index < offsets.size(); ++index) {
-        const auto& view = prepared.resources.buffers[index];
+        const auto& view = prepared.buffers[index];
         const uint64_t byte_offset = static_cast<uint64_t>(backing_offset) + offsets[index];
         const uint64_t aligned_offset = byte_offset - byte_offset % alignment;
         const uint64_t adjustment = byte_offset - aligned_offset;
@@ -11969,13 +12006,13 @@ void CheckSampledHtileArrayClearDiscovery() {
                 view.buffer == backing_handle && view.offset == aligned_offset &&
                     view.range == byte_limit + padding &&
                     observed_adjustment == adjustment &&
-                    prepared.buffer_sources[index].first.Base48() == base + offsets[index],
+                    prepared.buffer_sources[index].address == base + offsets[index],
                 "renderer lost the low byte offset, changed the range, or applied the offset twice");
       }
       scheduler.Finish();
       scheduler.DrainPriorityOperations();
       RenderExecutorTestAccess::ResetBindings(executor);
-      resources.SetGpu(nullptr);
+
       resources.UnmapMemory(base, allocation_size);
       scheduler.Finish();
       context.ShutdownGpu();
@@ -12037,7 +12074,7 @@ void CheckSampledHtileArrayClearDiscovery() {
       HW::Shader shaders{};
       scheduler.Begin(registers,user_config,shaders);
       context.InitializeGpu(nullptr);
-      auto& resources = context.GetGpuResources();
+      auto& resources = context;
       resources.MapMemory(base,allocation_size);
       auto& executor = context.GetRenderExecutor();
 
@@ -12048,8 +12085,9 @@ void CheckSampledHtileArrayClearDiscovery() {
       program.info.uses_dma = selected == "dma-read" || selected == "dma-write";
       program.info.writes_dma = selected == "dma-write";
       program.info.bounded_srt_reads.push_back({1u,0u});
-      ShaderStageRuntime runtime{};
-      runtime.resources.flattened_srt = {0x13579bdfu};
+      ShaderRecompiler::IR::ResourceSnapshot runtime_snapshot;
+      ShaderStageRuntime runtime{.resources = &runtime_snapshot};
+      runtime_snapshot.flattened_srt = {0x13579bdfu};
       constexpr uint32_t buffer_size = 256u;
       const uint64_t writer_size = image_writer ? image_layout.size
                                    : stride_zero_writer ? 16u
@@ -12060,10 +12098,10 @@ void CheckSampledHtileArrayClearDiscovery() {
       if (selected == "range-overflow") source={UINT64_MAX-3u,8u};
       if (selected == "range-48bit") source={uint64_t{1}<<48u,4u};
       if (selected == "range-zero") source={0u,4u};
-      runtime.resources.immutable_srt_ranges.push_back(source);
+      runtime_snapshot.immutable_srt_ranges.push_back(source);
       if (source.size==sizeof(uint32_t) && source.address>=base &&
           source.address-base<=allocation_size-sizeof(uint32_t)) {
-        const uint32_t snapshotted_word=runtime.resources.flattened_srt[0];
+        const uint32_t snapshotted_word=runtime_snapshot.flattened_srt[0];
         std::memcpy(reinterpret_cast<void*>(source.address),&snapshotted_word,sizeof(snapshotted_word));
       }
       if (buffer_writer) {
@@ -12080,7 +12118,7 @@ void CheckSampledHtileArrayClearDiscovery() {
         DescriptorValue value{};
         value.dword_count=4u;
         std::copy(std::begin(buffer.fields),std::end(buffer.fields),value.dwords.begin());
-        runtime.resources.buffers.push_back(value);
+        runtime_snapshot.buffers.push_back(value);
       }
       if (image_writer) {
         ImageResource info{};
@@ -12100,7 +12138,7 @@ void CheckSampledHtileArrayClearDiscovery() {
         DescriptorValue value{};
         value.dword_count=8u;
         std::copy(std::begin(image.fields),std::end(image.fields),value.dwords.begin());
-        runtime.resources.images.push_back(value);
+        runtime_snapshot.images.push_back(value);
       }
       AllocateBindings(program);
       CompiledShaderInfo info{};
@@ -12118,29 +12156,31 @@ void CheckSampledHtileArrayClearDiscovery() {
       pixel_info.stage=ShaderType::Pixel;
       pixel_info.info=std::move(pixel_program.info);
       pixel_info.bindings=std::move(pixel_program.bindings);
-      ShaderStageRuntime pixel_runtime{.program=&pixel_info};
+      ShaderRecompiler::IR::ResourceSnapshot pixel_snapshot;
+      ShaderStageRuntime pixel_runtime{.program=&pixel_info, .resources=&pixel_snapshot};
       std::printf("KYTY_IMMUTABLE_SRT_READY %s\n",mode);
       std::fflush(stdout);
       if (graphics) {
         (void)RenderExecutorTestAccess::PrepareGraphicsBindings(executor,runtime,pixel_runtime,true);
       } else {
-        auto prepared=executor.PrepareBindings(runtime);
+        PreparedBindings prepared;
+        executor.PrepareBindings(runtime, prepared);
         if (scenario.allowed) {
           executor.FindBuffers(prepared);
           executor.RebindBuffers(prepared);
           executor.RebindImages(prepared);
-          Require(name,mode,prepared.resources.buffers.size()==info.info.buffers.size() &&
-                      prepared.resources.images.size()==info.info.images.size(),
+          Require(name,mode,prepared.buffers.size()==info.info.buffers.size() &&
+                      prepared.images.size()==info.info.images.size(),
                   "disjoint immutable snapshot suppressed a declared writable resource");
           if (buffer_writer) {
             const auto expected_size = stride_zero_writer ? 16u : buffer_size;
-            Require(name,mode,prepared.resources.buffers[0].buffer!=nullptr &&
-                        prepared.resources.buffers[0].range==expected_size &&
-                        prepared.buffer_sources[0].first.Base48()==base,
+            Require(name,mode,prepared.buffers[0].buffer!=nullptr &&
+                        prepared.buffers[0].range==expected_size &&
+                        prepared.buffer_sources[0].address==base,
                     "disjoint buffer writer was omitted or rebound to a different extent");
           }
           if (image_writer) {
-            const auto& binding=prepared.resources.images[0];
+            const auto& binding=prepared.images[0];
             const auto& image=context.GetTextureCache().GetImage(binding.image_id);
             Require(name,mode,binding.image_view!=nullptr && image.info.data.address==base &&
                         image.info.data.size==image_layout.size,
@@ -12156,7 +12196,7 @@ void CheckSampledHtileArrayClearDiscovery() {
       scheduler.Finish();
       scheduler.DrainPriorityOperations();
       RenderExecutorTestAccess::ResetBindings(executor);
-      resources.SetGpu(nullptr);
+
       resources.UnmapMemory(base,allocation_size);
       scheduler.Finish();
       context.ShutdownGpu();
@@ -12218,7 +12258,7 @@ void CheckSampledHtileArrayClearDiscovery() {
       HW::Shader shaders{};
       scheduler.Begin(registers, user_config, shaders);
       context.InitializeGpu(nullptr);
-      auto& resources = context.GetGpuResources();
+      auto& resources = context;
       auto& cache = context.GetTextureCache();
       auto& buffers = context.GetBufferCache();
       auto& executor = context.GetRenderExecutor();
@@ -12279,7 +12319,7 @@ void CheckSampledHtileArrayClearDiscovery() {
       buffer_resource.written = true;
 
       Require(name, "unowned sampled input", !cache.IsMeta(metadata_address) &&
-                  !cache.QueryRegion(base, depth_size).image_bytes,
+                  TextureCacheTestAccess::FindImages(cache, base, depth_size, false).empty(),
               "sampled HTile fixture acquired an earlier image owner");
       // Force one native owner for both logically disjoint ranges in the
       // shared variant. A widened metadata drain must not consume the later
@@ -12329,22 +12369,24 @@ void CheckSampledHtileArrayClearDiscovery() {
                                  !scenario.graphics || scenario.writer_first);
       auto second_info = make_info(ShaderType::Pixel, scenario.writer_first,
                                    !scenario.writer_first);
-      const auto runtime = [&](const CompiledShaderInfo& info) {
-        ShaderStageRuntime result{.program = &info};
+      std::deque<ShaderRecompiler::IR::ResourceSnapshot> runtime_snapshots;
+  const auto runtime = [&](const CompiledShaderInfo& info) {
+        auto& result_snapshot = runtime_snapshots.emplace_back();
+    ShaderStageRuntime result{.program = &info, .resources = &result_snapshot};
         for (const auto& image : info.info.images) {
-          result.resources.images.push_back(image.written ? write_value : read_value);
+          result_snapshot.images.push_back(image.written ? write_value : read_value);
         }
-        result.resources.buffers.assign(info.info.buffers.size(), buffer_value);
+        result_snapshot.buffers.assign(info.info.buffers.size(), buffer_value);
         return result;
       };
       const auto first = runtime(first_info);
       const auto second = runtime(second_info);
-      BufferView preserved_write_view{};
+      vk::DescriptorBufferInfo preserved_write_view{};
       const auto check_allowed = [&](const PreparedBindings& prepared) {
-        Require(name, mode, prepared.resources.images.size() == prepared.program->info.images.size() &&
-                    prepared.resources.buffers.size() == prepared.program->info.buffers.size(),
+        Require(name, mode, prepared.images.size() == prepared.runtime->program->info.images.size() &&
+                    prepared.buffers.size() == prepared.runtime->program->info.buffers.size(),
                 "allowed HTile bindings omitted a declared resource");
-        for (const auto& image : prepared.resources.images) {
+        for (const auto& image : prepared.images) {
           const auto& native = cache.GetImage(image.image_id);
           Require(name, mode, image.image_view != nullptr &&
                       native.backing.format == vk::Format::eD32Sfloat &&
@@ -12353,19 +12395,20 @@ void CheckSampledHtileArrayClearDiscovery() {
                       native.info.metadata.range.size == metadata_size,
                   "allowed ordinary read did not retain the native HTile depth owner");
         }
-        for (size_t i = 0; i < prepared.resources.buffers.size(); ++i) {
-          const auto& buffer = prepared.resources.buffers[i];
+        for (size_t i = 0; i < prepared.buffers.size(); ++i) {
+          const auto& buffer = prepared.buffers[i];
           preserved_write_view = buffer;
           Require(name, mode, buffer.buffer != nullptr && buffer.range >= buffer_size &&
-                      prepared.buffer_sources[i].first.Base48() == independent_metadata_address &&
-                      prepared.buffer_sources[i].first.NumRecords() == metadata_size,
+                      prepared.buffer_sources[i].address == independent_metadata_address &&
+                      prepared.buffer_sources[i].size == metadata_size,
                   "allowed adjacent metadata buffer was omitted or rebound to the wrong range");
         }
       };
       std::printf("KYTY_SAMPLED_HTILE_ALIAS_READY %s\n", mode);
       std::fflush(stdout);
       if (!scenario.graphics) {
-        auto prepared = executor.PrepareBindings(first);
+        PreparedBindings prepared;
+      executor.PrepareBindings(first, prepared);
         if (scenario.disjoint) {
           executor.FindBuffers(prepared);
           executor.RebindBuffers(prepared);
@@ -12376,7 +12419,7 @@ void CheckSampledHtileArrayClearDiscovery() {
         auto prepared = RenderExecutorTestAccess::PrepareGraphicsBindings(executor, first, second, true);
         if (scenario.disjoint) {
           Require(name, mode, prepared.pixel.has_value(), "allowed pixel stage was omitted");
-          check_allowed(prepared.vertex);
+          check_allowed(prepared.vertex[0]);
           check_allowed(*prepared.pixel);
         }
       }
@@ -12424,7 +12467,7 @@ void CheckSampledHtileArrayClearDiscovery() {
       scheduler.Finish();
       scheduler.DrainPriorityOperations();
       RenderExecutorTestAccess::ResetBindings(executor);
-      resources.SetGpu(nullptr);
+
       resources.UnmapMemory(base, allocation_size);
       scheduler.Finish();
       context.ShutdownGpu();
@@ -12620,7 +12663,7 @@ void CheckSampledHtileArrayClearDiscovery() {
       HW::Shader shaders{};
       scheduler.Begin(registers, user_config, shaders);
 
-      auto &resources = context.GetGpuResources();
+      auto &resources = context;
       auto &texture_cache = resources.GetTextureCache();
       auto &executor = context.GetRenderExecutor();
       resources.MapMemory(base, allocation_size);
@@ -13261,7 +13304,7 @@ void CheckSampledHtileArrayClearDiscovery() {
         lod_test.code.push_back(EncodeMimg1(0, 20, 0, 2));
         AppendStoreVgpr(&lod_test.code, 0, 0);
         AppendEnd(&lod_test.code);
-        const auto lod_program = CompileCase(lod_test, SubgroupSize());
+        const auto lod_program = CompileCase(lod_test, WorkgroupLimits(), HostProfile());
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
         ExpectFatal("TextureMinLodBeyondView", [&] {
           auto invalid_lod = lod_descriptor;
@@ -14391,7 +14434,7 @@ void CheckSampledHtileArrayClearDiscovery() {
       }
       AppendEnd(&copy_sample_test.code);
       const auto copy_sample_program =
-          CompileCase(copy_sample_test, SubgroupSize());
+          CompileCase(copy_sample_test, WorkgroupLimits(), HostProfile());
       ShaderRecompiler::IR::DescriptorValue copy_sample_value{};
       copy_sample_value.dword_count = 8;
       std::copy_n(copy_sample_descriptor.fields, 8,
@@ -15503,7 +15546,7 @@ void CheckSampledHtileArrayClearDiscovery() {
       HW::UserConfig user_config{};
       HW::Shader shaders{};
       scheduler.Begin(registers, user_config, shaders);
-      auto &resources = context.GetGpuResources();
+      auto &resources = context;
       auto &texture_cache = resources.GetTextureCache();
       auto &executor = context.GetRenderExecutor();
       resources.MapMemory(base, allocation_size);
@@ -15529,9 +15572,9 @@ void CheckSampledHtileArrayClearDiscovery() {
 
       RenderDepthInfo depth{};
       RenderExecutorTestAccess::ResolveRenderDepthTarget(
-          executor, 1, scheduler.Current(), depth);
+          executor, scheduler.Current(), depth);
       Require(name, "writable depth fixture",
-              depth.image_id && depth.format == vk::Format::eD32Sfloat &&
+              depth.image_id && depth.desc.info.pixel_format == vk::Format::eD32Sfloat &&
                   depth.depth_write_enable &&
                   depth.AttachmentWriteAspects() ==
                       vk::ImageAspectFlagBits::eDepth,
@@ -15567,9 +15610,9 @@ void CheckSampledHtileArrayClearDiscovery() {
       program.bindings = std::move(ir.bindings);
       ShaderRecompiler::IR::ResourceSnapshot snapshot{};
       PreparedBindings bindings{};
-      bindings.program = &program;
-      bindings.snapshot = &snapshot;
-      bindings.resources.images.push_back(
+      ShaderStageRuntime bindings_runtime{&program, &snapshot};
+      bindings.runtime = &bindings_runtime;
+      bindings.images.push_back(
           {depth.image_id, sampled_view, sampled_desc});
 
       RenderExecutorTestAccess::BindImage(executor, depth.image_id, false);
@@ -15582,9 +15625,9 @@ void CheckSampledHtileArrayClearDiscovery() {
       Require(name, "sampled writable depth shared layout",
               rendering.depth_stencil_attachment.image_layout ==
                       vk::ImageLayout::eGeneral &&
-                  bindings.resources.images[0].layout ==
+                  bindings.images[0].layout ==
                       vk::ImageLayout::eGeneral &&
-                  MakeImageInfo(bindings.resources.images[0]).imageLayout ==
+                  MakeImageInfo(bindings.images[0], 0).imageLayout ==
                       vk::ImageLayout::eGeneral &&
                   image.backing.state.layout == vk::ImageLayout::eGeneral,
               "a sampled depth image was transitioned away from its writable "
@@ -18826,6 +18869,7 @@ private:
     device_features.shaderInt64 = true;
     device_features.fillModeNonSolid = true;
     device_features.tessellationShader = true;
+    device_features.shaderFloat64 = available_features.shaderFloat64;
     device_info.pEnabledFeatures = &device_features;
     std::vector<const char *> device_extensions = {
         VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
@@ -18838,8 +18882,32 @@ private:
         VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME,
         VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
         VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME};
-    device_info.enabledExtensionCount = std::size(device_extensions);
-    device_info.ppEnabledExtensionNames = device_extensions;
+    const auto available_extensions = EnumerateVulkan<vk::ExtensionProperties>(
+        "vkEnumerateDeviceExtensionProperties", [&](uint32_t* count, vk::ExtensionProperties* values) {
+          return m_physical_device.enumerateDeviceExtensionProperties(nullptr, count, values);
+        });
+    m_depth_range_unrestricted_enabled = std::ranges::any_of(available_extensions, [](const auto& extension) {
+      return std::strcmp(extension.extensionName.data(), VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME) == 0;
+    });
+    if (m_depth_range_unrestricted_enabled)
+      device_extensions.push_back(VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME);
+    const bool shader_fma_available = std::ranges::any_of(available_extensions, [](const auto& extension) {
+      return std::strcmp(extension.extensionName.data(), VK_KHR_SHADER_FMA_EXTENSION_NAME) == 0;
+    });
+    vk::PhysicalDeviceShaderFmaFeaturesKHR enabled_fma{};
+    if (shader_fma_available) {
+      vk::PhysicalDeviceShaderFmaFeaturesKHR supported_fma{};
+      vk::PhysicalDeviceFeatures2 query{};
+      query.pNext = &supported_fma;
+      m_physical_device.getFeatures2(&query);
+      enabled_fma.shaderFmaFloat64 = device_features.shaderFloat64 == VK_TRUE
+                                         ? supported_fma.shaderFmaFloat64 : VK_FALSE;
+      enabled_fma.pNext = const_cast<void*>(device_info.pNext);
+      device_info.pNext = &enabled_fma;
+      device_extensions.push_back(VK_KHR_SHADER_FMA_EXTENSION_NAME);
+    }
+    device_info.enabledExtensionCount = static_cast<uint32_t>(device_extensions.size());
+    device_info.ppEnabledExtensionNames = device_extensions.data();
     RequireVk("VulkanHarness", "dispatch",
               m_physical_device.createDevice(&device_info, nullptr, &m_device),
               "vkCreateDevice");
@@ -19270,7 +19338,7 @@ void CompareGraphicsWords(const GraphicsCase &test,
 }
 
 void RunCase(VulkanHarness *vulkan, const TestCase &test) {
-  auto compiled = CompileCase(test, vulkan != nullptr ? vulkan->SubgroupSize() : 64u);
+  auto compiled = CompileCase(test, vulkan != nullptr ? vulkan->WorkgroupLimits() : ShaderRecompiler::ComputeWorkgroupLimits{}, vulkan != nullptr ? vulkan->HostProfile() : ShaderRecompiler::ShaderHostProfile{});
   if (test.image_descriptor_swizzle != DstSel(4, 5, 6, 7) &&
       !compiled.program.info.images.empty()) {
     Require(test.name, "resource specialization",
@@ -34549,7 +34617,7 @@ void CheckIndirectStorageImageWriteSwitch() {
          .cube = resource.cube});
   }
   ShaderComputeInputInfo compute{};
-  ShaderRecompiler::Spirv::AnalyzeProgramRequirements(program);
+  ShaderRecompiler::Spirv::CollectSpirvRequirements(program);
   auto spirv = ShaderRecompiler::Spirv::EmitProgram(
       program, {.compute = &compute}, {}, {}, specialization);
   ValidateSpirv(name, spirv);

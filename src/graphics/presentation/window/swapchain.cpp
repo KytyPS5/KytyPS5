@@ -331,6 +331,9 @@ private:
 };
 
 struct Presenter::Impl {
+	uint64_t present_readback_count = 0;
+	uint64_t present_readback_frame = 0;
+	uint64_t present_source_trace_count = 0;
 	explicit Impl(WindowContext& owner)
 	    : renderer(*owner.render_context), window(owner), swapchain(owner),
 	      present_scheduler(renderer, owner.graphic_ctx), frames(owner, present_scheduler) {

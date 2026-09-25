@@ -46,6 +46,22 @@ namespace Libs::Graphics {
 
 namespace {
 
+constexpr uint32_t DriverCacheCheckpointInterval = 16;
+
+bool IsLowerHex(std::string_view value, size_t expected_size) {
+	return value.size() == expected_size &&
+	       std::ranges::all_of(value, [](unsigned char c) {
+		       return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+	       });
+}
+
+bool IsDriverCacheBuildIdentityUsable(std::string_view git_hash,
+                                      std::string_view git_revision,
+                                      std::string_view worktree_fingerprint) {
+	return git_hash != "unknown" && IsLowerHex(git_revision, 40) &&
+	       IsLowerHex(worktree_fingerprint, 64);
+}
+
 vk::PolygonMode ResolvePolygonMode(const HW::ModeControl& mode, bool cull_front, bool cull_back) {
 	// CxPrimitiveSetup::PolygonMode disables both per-face modes when it is zero.
 	if (mode.poly_mode == 0) {
@@ -148,6 +164,10 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 	Log::WriteToConsoleAndLog(message);
 }
 
+bool ReadShaderBacking(void*, uint64_t address, std::span<uint32_t> values) {
+ return !values.empty() && Libs::LibKernel::Memory::TryReadBacking(address, values.data(), values.size_bytes());
+}
+
 bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
 	return !values.empty() &&
 	       Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, values.data(), values.size_bytes());
@@ -190,7 +210,9 @@ void CaptureDispatchedShader(const ShaderParams& params,
 		    {"wave_size", options.wave_size},
 		    {"user_data_base", options.user_data_base},
 		    {"user_data_count", options.user_data.size()},
-		    {"scratch_dwords", options.scratch_dwords},
+		    {"scratch_dwords", options.input_info.compute ? options.input_info.compute->scratch_size_dwords :
+ options.input_info.pixel ? options.input_info.pixel->scratch_size_dwords :
+ options.input_info.vertex ? options.input_info.vertex->scratch_size_dwords : 0u},
 		    {"metadata_complete", false},
 		    {"host_profile", {{"known", options.host_profile.known},
 		                      {"float64", options.host_profile.float64},
@@ -215,7 +237,6 @@ void CaptureDispatchedShader(const ShaderParams& params,
 			    {"scratch_size_dwords", input.scratch_size_dwords},
 			    {"group_id", std::array {input.group_id[0], input.group_id[1], input.group_id[2]}},
 			    {"dispatch_thread_dimensions", input.dispatch_thread_dimensions},
-			    {"needs_lds_barriers", input.needs_lds_barriers},
 			    {"wave_size", input.wave_size},
 			    {"thread_ids_num", input.thread_ids_num},
 			    {"workgroup_register", input.workgroup_register},
@@ -518,7 +539,7 @@ struct PipelineCache::ProgramCache {
 		const char* optimization_trace = std::getenv("KYTY_SPIRV_OPTIMIZATION_TRACE");
 		uint32_t    wave_partition_factor = 1;
 		bool        cooperative_wave64    = false;
-		if constexpr (Stage == ShaderType::Compute) {
+		if (options.stage == ShaderType::Compute) {
 			if (optimization_trace != nullptr && *optimization_trace != '\0') {
 				std::printf("ComputePlanBegin: hash=0x%016" PRIx64 "\n", options.shader_hash);
 				std::fflush(stdout);
@@ -587,7 +608,7 @@ struct PipelineCache::ProgramCache {
 
 		const auto module = CompileSPV(result.spirv, device);
 		EXIT_IF(module == nullptr);
-		SetVulkanObjectNameF(device, module, "{}", ShaderModuleDebugName(Stage, options.shader_hash));
+		SetVulkanObjectNameF(device, module, "{}", ShaderModuleDebugName(options.stage, options.shader_hash));
 		if (options.dump_ir) {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
 			     static_cast<uint64_t>(result.spirv.size()), options.wave_size);
@@ -604,7 +625,8 @@ struct PipelineCache::ProgramCache {
 
 	template <typename InputInfo>
 	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info,
-	                  uint32_t& push_data_cursor) {
+	                  uint32_t& push_data_cursor,
+ std::optional<std::array<uint32_t, 3>> guest_workgroups = std::nullopt) {
 		ShaderType stage;
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			stage = input_info.logical_stage;
@@ -681,6 +703,8 @@ struct PipelineCache::ProgramCache {
 		options.early_dump  = options.dump_ir;
 		options.dump_label  = label;
 		options.input_info  = stage_input;
+		options.host_profile = host_profile;
+		options.compute_workgroup_limits = compute_workgroup_limits;
 
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			options.user_data_base = 8;
@@ -752,6 +776,8 @@ struct PipelineCache::ProgramCache {
 	}
 
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
+	ShaderRecompiler::ShaderHostProfile host_profile;
+	ShaderRecompiler::ComputeWorkgroupLimits compute_workgroup_limits;
 	ProgramKey                                                  lookup_key;
 	vk::Device                                                  device;
 	uint64_t                                                    next_shader_id = 0;
@@ -910,7 +936,7 @@ bool PipelineCache::SaveDriverCacheLocked(bool checkpoint) {
 	    size > std::numeric_limits<uint32_t>::max()) {
 		PipelineCacheLog("Vulkan pipeline cache: save failed ({}, {} bytes)",
 		                 vk::to_string(result), size);
-		return;
+		return false;
 	}
 	payload.resize(size);
 	auto       prefix       = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
@@ -1032,7 +1058,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	uint32_t          push_data_cursor =
 	    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount : 0;
 	GraphicsPrograms  result;
-	vertex_info.linked_param_count = 0;
+	vertex_info[tess_active ? 2u : 0u].linked_param_count = 0;
 	if (pixel_active) {
 		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
 		std::vector<uint32_t> active_inputs;
@@ -1046,18 +1072,18 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 			const auto location = ShaderPixelParameterLocation(pixel_info, active_inputs, input);
 			EXIT_IF(source >= 32u || location >= 32u);
 			bool duplicate = false;
-			for (uint32_t i = 0; i < vertex_info.linked_param_count; ++i) {
-				if (vertex_info.linked_param_sources[i] == source &&
-				    vertex_info.linked_param_locations[i] == location) {
+			for (uint32_t i = 0; i < vertex_info[tess_active ? 2u : 0u].linked_param_count; ++i) {
+				if (vertex_info[tess_active ? 2u : 0u].linked_param_sources[i] == source &&
+				    vertex_info[tess_active ? 2u : 0u].linked_param_locations[i] == location) {
 					duplicate = true;
 					break;
 				}
 			}
 			if (!duplicate) {
-				EXIT_IF(vertex_info.linked_param_count >= ShaderVertexInputInfo::PARAM_LINK_MAX);
-				const auto link = vertex_info.linked_param_count++;
-				vertex_info.linked_param_sources[link]   = source;
-				vertex_info.linked_param_locations[link] = location;
+				EXIT_IF(vertex_info[tess_active ? 2u : 0u].linked_param_count >= ShaderVertexInputInfo::PARAM_LINK_MAX);
+				const auto link = vertex_info[tess_active ? 2u : 0u].linked_param_count++;
+				vertex_info[tess_active ? 2u : 0u].linked_param_sources[link]   = source;
+				vertex_info[tess_active ? 2u : 0u].linked_param_locations[link] = location;
 			}
 		}
 	}
@@ -1069,7 +1095,8 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 
 ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
                                                const HW::ShaderRegisters&   sh,
-                                               ShaderComputeInputInfo&      input_info) {
+                                               ShaderComputeInputInfo&      input_info,
+ std::optional<std::array<uint32_t, 3>> guest_workgroups) {
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
 	const auto        params      = PrepareProgram(regs, sh, input_info);
 	Common::LockGuard lock(m_mutex);

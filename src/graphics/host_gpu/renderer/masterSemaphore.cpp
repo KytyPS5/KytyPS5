@@ -38,7 +38,7 @@ void MasterSemaphore::Refresh() {
 		     " result=%s (%d) counter=%" PRIu64 " current_tick=%" PRIu64 "\n",
 		     result == vk::Result::eSuccess ? "returned an unissued timeline value" : "failed",
 		     std::bit_cast<uint64_t>(static_cast<VkSemaphore>(m_semaphore)),
-		     VulkanToString(result).c_str(), static_cast<int>(result), counter, current);
+		     vk::to_string(result).c_str(), static_cast<int>(result), counter, current);
 		return;
 	}
 
@@ -69,7 +69,7 @@ void MasterSemaphore::Wait(uint64_t tick) {
 		     " result=%s (%d) wait_tick=%" PRIu64 " current_tick=%" PRIu64
 		     " known_gpu_tick=%" PRIu64 "\n",
 		     std::bit_cast<uint64_t>(static_cast<VkSemaphore>(m_semaphore)),
-		     VulkanToString(result).c_str(), static_cast<int>(result), tick, CurrentTick(),
+		     vk::to_string(result).c_str(), static_cast<int>(result), tick, CurrentTick(),
 		     KnownGpuTick());
 		return;
 	}

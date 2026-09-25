@@ -706,7 +706,22 @@ struct ResourcePlan {
 	mutable std::vector<std::pair<uint64_t, uint64_t>> specialization_reads;
 };
 
+struct SpirvRequirements {
+	bool subgroup_ballot              = false;
+	bool subgroup_shuffle             = false;
+	bool subgroup_local_invocation_id = false;
+	bool compute_derivatives          = false;
+	bool image_gather_extended        = false;
+	bool function_lds                 = false;
+	bool function_scratch             = false;
+	bool pixel_valid_mask             = false;
+	bool buffer_int64_atomics         = false;
+	bool shared_int64_atomics = false;
+	bool coherent_buffers             = false;
+};
+
 struct Program: ResourcePlan {
+	std::optional<SpirvRequirements> spirv_requirements;
 	Program() = default;
 	~Program();
 

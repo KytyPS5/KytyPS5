@@ -188,7 +188,7 @@ int RunShaderBatchAudit(int argc, char* argv[]) {
     Common::InitializeThreads();
     subsystems.Initialize<Config::Lifecycle>();
     Config::ConfigOptions config;
-    config.printf_direction = Config::OutputDirection::Silent;
+    config.printf_direction = Config::LogDirection::Silent;
     Config::Load(config);
     subsystems.Initialize<Log::Lifecycle>();
     ShaderInit();
@@ -270,7 +270,7 @@ int RunShaderBatchAudit(int argc, char* argv[]) {
       options.user_data = user_data;
       options.shader_hash = manifest.contains("shader_hash") ? HexValue(manifest.at("shader_hash"))
                             : XXH3_64bits(code.data(), size);
-      options.scratch_dwords = manifest.at("scratch_dwords");
+      info.scratch_size_dwords = manifest.at("scratch_dwords");
       const bool dump_ir = std::getenv("KYTY_SHADER_AUDIT_DUMP_IR") != nullptr;
       options.dump_ir = dump_ir;
       options.early_dump = dump_ir;

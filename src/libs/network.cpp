@@ -2203,10 +2203,16 @@ int64_t KYTY_SYSV_ABI Recvfrom(int s, void* buf, uint64_t len, int flags, void* 
 		return -1;
 	}
 
-	const int host_flags = ConvertMessageFlags(flags);
+	int host_flags = ConvertMessageFlags(flags);
 	if (host_flags < 0) {
 		return -1;
 	}
+
+#if defined(_WIN32)
+	// BSD PEEK returns available bytes even with WAITALL; Winsock rejects this
+	// combination (WSAEOPNOTSUPP). Preserve PEEK without consuming the stream.
+	if ((host_flags & MSG_PEEK) != 0) host_flags &= ~MSG_WAITALL;
+#endif
 
 	const auto host_len = static_cast<SocketIoLength>(
 	    std::min<uint64_t>(len, std::numeric_limits<SocketIoLength>::max()));

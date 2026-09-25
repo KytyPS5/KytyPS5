@@ -179,31 +179,31 @@ uint32_t EmitNativeFma64(EmitterState& state, uint32_t a, uint32_t b, uint32_t c
 	// independently of whether a host extends SignedZeroInfNanPreserve to
 	// the recently introduced OpFmaKHR operation.
 	const auto to_pair = [&](uint32_t value) {
-		return ExtractPair(state, NewUnary(state, OpBitcast, TypeU64(state), value));
+		return ExtractPair(state, Unary(state, OpBitcast, TypeU64(state), value));
 	};
 	const auto is_zero = [&](Pair value) {
-		const auto magnitude_high = NewBinary(state, OpBitwiseAnd, TypeU32(state),
+		const auto magnitude_high = Binary(state, OpBitwiseAnd, TypeU32(state),
 		                                      value.high, ConstantU32(state, 0x7fffffffu));
-		const auto magnitude = NewBinary(state, OpBitwiseOr, TypeU32(state),
+		const auto magnitude = Binary(state, OpBitwiseOr, TypeU32(state),
 		                                 value.low, magnitude_high);
-		return NewBinary(state, OpIEqual, TypeBool(state), magnitude, ConstantU32(state, 0u));
+		return Binary(state, OpIEqual, TypeBool(state), magnitude, ConstantU32(state, 0u));
 	};
 	const auto lhs = to_pair(a);
 	const auto rhs = to_pair(b);
 	const auto addend = to_pair(c);
 	const auto output = to_pair(result);
-	const auto product_zero = NewBinary(state, OpLogicalOr, TypeBool(state),
+	const auto product_zero = Binary(state, OpLogicalOr, TypeBool(state),
 	                                    is_zero(lhs), is_zero(rhs));
-	const auto product_sign = NewBinary(state, OpBitwiseXor, TypeU32(state), lhs.high, rhs.high);
-	const auto common_sign = NewBinary(state, OpBitwiseAnd, TypeU32(state), product_sign,
-	                                   NewBinary(state, OpBitwiseAnd, TypeU32(state),
+	const auto product_sign = Binary(state, OpBitwiseXor, TypeU32(state), lhs.high, rhs.high);
+	const auto common_sign = Binary(state, OpBitwiseAnd, TypeU32(state), product_sign,
+	                                   Binary(state, OpBitwiseAnd, TypeU32(state),
 	                                             addend.high, ConstantU32(state, 0x80000000u)));
-	const auto both_zero = NewBinary(state, OpLogicalAnd, TypeBool(state),
+	const auto both_zero = Binary(state, OpLogicalAnd, TypeBool(state),
 	                                 product_zero, is_zero(addend));
-	const auto zero_sign = NewSelect(state, TypeU32(state), both_zero, common_sign,
+	const auto zero_sign = Select(state, TypeU32(state), both_zero, common_sign,
 	                                 ConstantU32(state, 0u));
-	const auto high = NewSelect(state, TypeU32(state), is_zero(output), zero_sign, output.high);
-	return NewUnary(state, OpBitcast, TypeNativeF64(state), MakePair(state, output.low, high));
+	const auto high = Select(state, TypeU32(state), is_zero(output), zero_sign, output.high);
+	return Unary(state, OpBitcast, TypeNativeF64(state), MakePair(state, output.low, high));
 }
 
 uint32_t EmitNativeReciprocal64(EmitterState& state, uint32_t source) {
@@ -214,9 +214,9 @@ uint32_t EmitNativeReciprocal64(EmitterState& state, uint32_t source) {
 	// quadratically, meeting RDNA2 RCP_F64's 2^29 binary64-ULP bound. The input
 	// certificate restricts this path to proved nonzero converted32 integers;
 	// all correction operands/results are zero or normal in that range.
-	const auto estimate = NewBinary(state, OpFDiv, type, one, source);
+	const auto estimate = Binary(state, OpFDiv, type, one, source);
 	state.builder.AddAnnotation({OpDecorate, estimate, DecorationNoContraction});
-	const auto negative_source = NewUnary(state, OpFNegate, type, source);
+	const auto negative_source = Unary(state, OpFNegate, type, source);
 	const auto residual = EmitNativeFma64(state, negative_source, estimate, one);
 	return EmitNativeFma64(state, estimate, residual, estimate);
 }
@@ -228,34 +228,34 @@ uint32_t EmitIntegerToF64(EmitterState& state, uint32_t source, bool signed_valu
 	const auto type = TypeU32(state);
 	const auto zero = ConstantU32(state, 0);
 	const auto sign = signed_value
-	                      ? NewBinary(state, OpBitwiseAnd, type, source,
+	                      ? Binary(state, OpBitwiseAnd, type, source,
 	                                  ConstantU32(state, 0x80000000u))
 	                      : zero;
-	const auto negative = NewBinary(state, OpINotEqual, TypeBool(state), sign, zero);
+	const auto negative = Binary(state, OpINotEqual, TypeBool(state), sign, zero);
 	// Unsigned subtraction also handles the magnitude of INT32_MIN exactly.
 	const auto magnitude = signed_value
-	                           ? NewSelect(state, type, negative,
-	                                       NewBinary(state, OpISub, type, zero, source), source)
+	                           ? Select(state, type, negative,
+	                                       Binary(state, OpISub, type, zero, source), source)
 	                           : source;
-	const auto nonzero = NewBinary(state, OpINotEqual, TypeBool(state), magnitude, zero);
+	const auto nonzero = Binary(state, OpINotEqual, TypeBool(state), magnitude, zero);
 	const auto msb_i = EmitExt(state, TypeI32(state), GlslFindUMsb, {magnitude});
-	const auto msb_u = NewUnary(state, OpBitcast, type, msb_i);
+	const auto msb_u = Unary(state, OpBitcast, type, msb_i);
 	// FindUMsb(0) is -1. Sanitize before computing any shift, rather than
 	// selecting away an out-of-range shift result afterward.
-	const auto msb = NewSelect(state, type, nonzero, msb_u, zero);
-	const auto shift = NewBinary(state, OpISub, type, ConstantU32(state, 31), msb);
-	const auto normalized = NewBinary(state, OpShiftLeftLogical, type, magnitude, shift);
-	const auto exponent = NewBinary(
+	const auto msb = Select(state, type, nonzero, msb_u, zero);
+	const auto shift = Binary(state, OpISub, type, ConstantU32(state, 31), msb);
+	const auto normalized = Binary(state, OpShiftLeftLogical, type, magnitude, shift);
+	const auto exponent = Binary(
 	    state, OpShiftLeftLogical, type,
-	    NewBinary(state, OpIAdd, type, msb, ConstantU32(state, 1023)), ConstantU32(state, 20));
-	const auto fraction_high = NewBinary(
+	    Binary(state, OpIAdd, type, msb, ConstantU32(state, 1023)), ConstantU32(state, 20));
+	const auto fraction_high = Binary(
 	    state, OpBitwiseAnd, type,
-	    NewBinary(state, OpShiftRightLogical, type, normalized, ConstantU32(state, 11)),
+	    Binary(state, OpShiftRightLogical, type, normalized, ConstantU32(state, 11)),
 	    ConstantU32(state, 0xfffffu));
-	const auto high = NewBinary(state, OpBitwiseOr, type, sign,
-	                            NewBinary(state, OpBitwiseOr, type, exponent, fraction_high));
-	const auto low = NewBinary(state, OpShiftLeftLogical, type, normalized, ConstantU32(state, 21));
-	return MakePair(state, low, NewSelect(state, type, nonzero, high, zero));
+	const auto high = Binary(state, OpBitwiseOr, type, sign,
+	                            Binary(state, OpBitwiseOr, type, exponent, fraction_high));
+	const auto low = Binary(state, OpShiftLeftLogical, type, normalized, ConstantU32(state, 21));
+	return MakePair(state, low, Select(state, type, nonzero, high, zero));
 }
 
 uint32_t EmitF32ToU32(EmitterState& state, uint32_t src, bool signed_value) {
@@ -623,5 +623,75 @@ uint32_t EmitFPCos(EmitterState& state, uint32_t arg0) {
 	source = Binary(state, spv::OpFMul, TypeF32(state), source, ConstantF32(state, 0x40c90fdbu));
 	return EmitExt(state, TypeF32(state), GLSLstd450Cos, {source});
 }
+
+void EmitF64Operation(ValueEmitContext& ctx, const IR::Inst& inst) {
+ auto& state = ctx.state;
+ const auto op = inst.GetOpcode();
+ switch(op) {
+		case IR::ValueOpcode::FPAbs64:
+		case IR::ValueOpcode::FPNeg64: {
+			const auto source = ExtractPair(state, ctx.Arg(inst, 0));
+			const bool absolute = op == IR::ValueOpcode::FPAbs64;
+			const auto high = Binary(state, absolute ? OpBitwiseAnd : OpBitwiseXor,
+			                            TypeU32(state), source.high,
+			                            ConstantU32(state, absolute ? 0x7fffffffu : 0x80000000u));
+			ctx.Define(inst, MakePair(state, source.low, high));
+			return;
+		}
+		case IR::ValueOpcode::FPMul64:
+		case IR::ValueOpcode::FPFma64:
+		case IR::ValueOpcode::FPRecip64:
+		case IR::ValueOpcode::ConvertF32F64: {
+			const auto arg64 = [&](size_t index) {
+				return Unary(state, OpBitcast, TypeNativeF64(state), ctx.Arg(inst, index));
+			};
+			uint32_t result = 0;
+			if (op == IR::ValueOpcode::FPMul64) {
+				// SPV_KHR_fma guarantees precision at the result width. Under RTE,
+				// FMA(a,b,-0) is a correctly rounded multiply, including either sign
+				// of an exact zero product. Keep it independently rounded before
+				// a later guest FMA rather than relying on generic double FMul's
+				// weaker minimum-precision guarantee.
+				const auto negative_zero = state.builder.Constant(
+				    OpConstant, TypeNativeF64(state), {0u, 0x80000000u});
+				result = EmitNativeFma64(state, arg64(0), arg64(1), negative_zero);
+			} else if (op == IR::ValueOpcode::FPFma64) {
+				result = EmitNativeFma64(state, arg64(0), arg64(1), arg64(2));
+			} else if (op == IR::ValueOpcode::FPRecip64) {
+				result = EmitNativeReciprocal64(state, arg64(0));
+			} else {
+				const auto converted = Unary(state, OpFConvert, TypeF32(state), arg64(0));
+				state.builder.AddAnnotation({OpDecorate, converted, DecorationNoContraction});
+				// Explicitly preserve signed zero even when the host's Float32 zero-sign
+				// guarantee is absent; the finite-range proof handles all nonzero inputs.
+				const auto source = ExtractPair(state, ctx.Arg(inst, 0));
+				const auto magnitude_high = Binary(state, OpBitwiseAnd, TypeU32(state),
+				                                      source.high, ConstantU32(state, 0x7fffffffu));
+				const auto magnitude = Binary(state, OpBitwiseOr, TypeU32(state),
+				                                 source.low, magnitude_high);
+				const auto zero = Binary(state, OpIEqual, TypeBool(state), magnitude,
+				                            ConstantU32(state, 0u));
+				const auto sign = Binary(state, OpBitwiseAnd, TypeU32(state), source.high,
+				                            ConstantU32(state, 0x80000000u));
+				const auto bits = Select(state, TypeU32(state), zero, sign,
+				                            Unary(state, OpBitcast, TypeU32(state), converted));
+				ctx.Define(inst, Unary(state, OpBitcast, TypeF32(state), bits));
+				return;
+			}
+			ctx.Define(inst, Unary(state, OpBitcast, TypeU64(state), result));
+			return;
+		}
+
+ default: ctx.Fail(inst, "invalid binary64 operation");
+ }
+}
+void EmitFPAbs64(ValueEmitContext& ctx, const IR::Inst& inst) { EmitF64Operation(ctx, inst); }
+void EmitFPNeg64(ValueEmitContext& ctx, const IR::Inst& inst) { EmitF64Operation(ctx, inst); }
+void EmitFPMul64(ValueEmitContext& ctx, const IR::Inst& inst) { EmitF64Operation(ctx, inst); }
+void EmitFPFma64(ValueEmitContext& ctx, const IR::Inst& inst) { EmitF64Operation(ctx, inst); }
+void EmitFPRecip64(ValueEmitContext& ctx, const IR::Inst& inst) { EmitF64Operation(ctx, inst); }
+void EmitConvertF32F64(ValueEmitContext& ctx, const IR::Inst& inst) { EmitF64Operation(ctx, inst); }
+uint32_t EmitConvertF64S32(EmitterState& state, uint32_t source) { return EmitIntegerToF64(state, source, true); }
+uint32_t EmitConvertF64U32(EmitterState& state, uint32_t source) { return EmitIntegerToF64(state, source, false); }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter

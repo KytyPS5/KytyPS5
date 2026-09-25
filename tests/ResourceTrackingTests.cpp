@@ -445,6 +445,9 @@ void TestInvariantIndirectImageMaterialization() {
           Libs::Graphics::Prospero::BufferFormat::k32_32_32_32UInt)
           << 20u |
       (3u << 30u);
+  // Numeric-class rejection applies when the operation cannot preserve raw bits.
+  // Raw sampled-image tables are covered separately by heterogeneous admission tests.
+  resource_plan.info.images[0].heterogeneous_numeric_compatible = false;
   Check(!MaterializeResources(resource_plan, runtime, mixed_snapshot,
                               mixed_specialization),
         "indirect images with different numeric classes were accepted");

@@ -1185,6 +1185,12 @@ void DecodeVopcDpp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_in
 	ReadLiteralOperands(code, word_index, inst);
 }
 
+void ApplyDpp8Modifier(Operand& operand, uint32_t modifier, bool fetch_inactive) {
+ operand.dpp8 = true;
+ operand.dpp8_lane_selectors = (modifier >> 8u) & 0xffffffu;
+ operand.dpp8_fetch_inactive = fetch_inactive;
+}
+
 void DecodeVopcDpp8Impl(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
                         uint32_t opcode, uint32_t vsrc1, Instruction& inst, bool fetch_inactive) {
 	const auto modifier = code[word_index + 1u];
@@ -1581,6 +1587,13 @@ void DecodeVop1(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	if (inst.opcode == Opcode::V_NOP) {
 		inst.dst.kind  = OperandKind::Null;
 		inst.src_count = 0;
+		return;
+	}
+	if ((inst.opcode == Opcode::V_CVT_F64_I32 || inst.opcode == Opcode::V_CVT_F64_U32) &&
+	    (src0 == 233u || src0 == 234u || src0 == 249u || src0 == 250u)) {
+		SetRawWords(inst, code, word_index, 2);
+		SetUnsupported(inst, Family::VOP1, opcode,
+		               "FP64 integer conversion DPP/DPP8/SDWA is not supported");
 		return;
 	}
 	switch (src0) {

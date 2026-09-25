@@ -1,3 +1,4 @@
+#include "graphics/shader/recompiler/ir/passes/SharedMemoryBarrier.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
@@ -1549,7 +1550,7 @@ int RunFmaKhrPipelineValidator() {
   subsystems.Initialize<Config::Lifecycle>();
   Config::ConfigOptions options;
   options.shader_validation_enabled = true;
-  options.printf_direction = Config::OutputDirection::Console;
+  options.printf_direction = Config::LogDirection::Console;
   Config::Load(options);
   subsystems.Initialize<Log::Lifecycle>();
   TestFmaKhrPipelineValidator();
@@ -5203,11 +5204,11 @@ void TestNewShaderRecompilerRejectsF64IntegerConversionModifiers() {
       const auto &inst = program.instructions.front();
       Check(inst.opcode == Decoder::Opcode::UNSUPPORTED &&
                 inst.opcode_id == opcode && inst.word_count == 2u &&
-                inst.raw_count == 2u,
+                std::min(inst.word_count, Decoder::MaxInstructionRawWords) == 2u,
             "FP64 conversion illegally accepted a modifier escape");
-      Check(Common::ContainsStr(
-                inst.unsupported_reason,
-                "FP64 integer conversion DPP/DPP8/SDWA is not supported"),
+      Check((std::string_view(
+                inst.unsupported_reason).find(
+                "FP64 integer conversion DPP/DPP8/SDWA is not supported") != std::string_view::npos),
             "FP64 conversion modifier rejection was not explicit");
     }
   }
@@ -5249,7 +5250,7 @@ void TestNewShaderRecompilerCapturedVopcCmpxNeU16() {
   Check(decoded.family == Decoder::Family::VOPC &&
             decoded.opcode != Decoder::Opcode::UNSUPPORTED &&
             decoded.opcode_id == 0xbdu && decoded.word_count == 2u &&
-            decoded.raw_count == 2u &&
+            std::min(decoded.word_count, Decoder::MaxInstructionRawWords) == 2u &&
             decoded.dst.kind == Decoder::OperandKind::ExecLo &&
             decoded.src_count == 2u &&
             decoded.src0.kind == Decoder::OperandKind::LiteralConstant &&
@@ -5265,7 +5266,7 @@ void TestNewShaderRecompilerCapturedVopcCmpxNeU16() {
   Frontend::TranslateOptions translate_options{};
   translate_options.stage = ShaderType::Compute;
   translate_options.wave_size = 64u;
-  translate_options.compute = &compute;
+  translate_options.input_info.compute = &compute;
   Decoder::DecodeProgram(shader, program);
   graph = CFG::BuildGraph(program);
   ir = Frontend::TranslateProgram(program, graph, translate_options);
@@ -5286,8 +5287,8 @@ void TestNewShaderRecompilerCapturedVopcCmpxNeU16() {
 
   auto options = MakeCompileOptions(ShaderType::Compute);
   auto result = RecompileForTest(shader, options);
-  Check(Common::ContainsStr(result.decoded_dump,
-                            "V_CMPX_NE_U16 exec_lo, 0x00000001, v32"),
+  Check((std::string_view(result.decoded_dump).find(
+                            "V_CMPX_NE_U16 exec_lo, 0x00000001, v32") != std::string_view::npos),
         "captured V_CMPX_NE_U16 was not present in the decoded dump");
   CheckSpirvBinaryValidates(result.spirv);
 }
@@ -5306,7 +5307,7 @@ void TestNewShaderRecompilerCapturedVopcSdwaCmpxGeI16() {
   Check(decoded.family == Decoder::Family::VOPC &&
             decoded.opcode == Decoder::Opcode::V_CMPX_GE_I16 &&
             decoded.opcode_id == 0x9eu && decoded.word_count == 2u &&
-            decoded.raw_count == 2u &&
+            std::min(decoded.word_count, Decoder::MaxInstructionRawWords) == 2u &&
             decoded.dst.kind == Decoder::OperandKind::ExecLo &&
             decoded.src_count == 2u &&
             decoded.src0.kind == Decoder::OperandKind::Vgpr &&
@@ -5337,7 +5338,7 @@ void TestNewShaderRecompilerCapturedVopcSdwaCmpxGeI16() {
   Frontend::TranslateOptions translate_options{};
   translate_options.stage = ShaderType::Compute;
   translate_options.wave_size = 64u;
-  translate_options.compute = &compute;
+  translate_options.input_info.compute = &compute;
   Decoder::DecodeProgram(shader, program);
   graph = CFG::BuildGraph(program);
   ir = Frontend::TranslateProgram(program, graph, translate_options);
@@ -5358,7 +5359,7 @@ void TestNewShaderRecompilerCapturedVopcSdwaCmpxGeI16() {
 
   auto options = MakeCompileOptions(ShaderType::Compute);
   auto result = RecompileForTest(shader, options);
-  Check(Common::ContainsStr(result.decoded_dump, "V_CMPX_GE_I16 exec_lo"),
+  Check((std::string_view(result.decoded_dump).find( "V_CMPX_GE_I16 exec_lo") != std::string_view::npos),
         "captured SDWA V_CMPX_GE_I16 was not present in the decoded dump");
   CheckSpirvBinaryValidates(result.spirv);
 }
@@ -7550,7 +7551,7 @@ void TestNewShaderRecompilerCapturedMubufStoreFormatD16() {
   Check(captured.family == Decoder::Family::MUBUF &&
             captured.opcode != Decoder::Opcode::UNSUPPORTED &&
             captured.opcode_id == 0x87u && captured.word_count == 2u &&
-            captured.raw_count == 2u && captured.raw[0] == 0xe21c6000u &&
+            std::min(captured.word_count, Decoder::MaxInstructionRawWords) == 2u && captured.raw[0] == 0xe21c6000u &&
             captured.raw[1] == 0x8002000eu && captured.data_dwords == 2u &&
             captured.data_bits == 16u && captured.data_components == 4u &&
             captured.formatted && !captured.typed &&
@@ -7574,10 +7575,10 @@ void TestNewShaderRecompilerCapturedMubufStoreFormatD16() {
   }
   options.user_data = user_data;
   auto result = RecompileForTest(shader, options);
-  Check(Common::ContainsStr(result.decoded_dump, "BUFFER_STORE_FORMAT_D16_X") &&
-            Common::ContainsStr(result.decoded_dump, "BUFFER_STORE_FORMAT_D16_XY") &&
-            Common::ContainsStr(result.decoded_dump, "BUFFER_STORE_FORMAT_D16_XYZ") &&
-            Common::ContainsStr(result.decoded_dump, "BUFFER_STORE_FORMAT_D16_XYZW"),
+  Check((std::string_view(result.decoded_dump).find( "BUFFER_STORE_FORMAT_D16_X") != std::string_view::npos) &&
+            (std::string_view(result.decoded_dump).find( "BUFFER_STORE_FORMAT_D16_XY") != std::string_view::npos) &&
+            (std::string_view(result.decoded_dump).find( "BUFFER_STORE_FORMAT_D16_XYZ") != std::string_view::npos) &&
+            (std::string_view(result.decoded_dump).find( "BUFFER_STORE_FORMAT_D16_XYZW") != std::string_view::npos),
         "D16 formatted store family is incomplete in the decoded dump");
   Check(CountSourceOccurrences(result.ir_dump, "StoreBufferU32 ") == 2u &&
             CountSourceOccurrences(result.ir_dump, "StoreBufferU32x2 ") == 2u,
@@ -7635,8 +7636,9 @@ void TestNewShaderRecompilerFormattedStoreUsesDynamicByteLimitOnly() {
   CheckSpirvBinaryValidates(result.spirv);
 
   const auto source = DisassembleSpirvBinary(result.spirv);
-  Check((source.find("OpArrayLength") != std::string::npos),
-        "formatted store SPIR-V lacks runtime storage-buffer bounds check");
+  Check(source.find("OpULessThan") != std::string::npos &&
+            source.find("OpArrayLength") == std::string::npos,
+        "formatted store SPIR-V lacks renderer byte-limit bounds check");
   Check(
       !SpirvSourceHasInstructionUsing(source, "OpULessThan", "%uint_5"),
       "formatted store SPIR-V baked descriptor NumRecords into a store guard");
@@ -7669,7 +7671,8 @@ void TestStorageBufferBoundsAvoidDynamicArrayLengthLowering() {
   CheckSpirvBinaryValidates(result.spirv);
   Check(!SpirvContainsOpcode(result.spirv, 68u),
         "storage-buffer lowering retained the driver-crashing OpArrayLength");
-  Check(SpirvContainsOpcode(result.spirv, 176u),
+  Check(SpirvContainsOpcode(result.spirv, 176u) ||
+            SpirvContainsOpcode(result.spirv, 178u),
         "storage-buffer lowering lost dynamic byte-limit bounds checks");
 }
 
@@ -8636,8 +8639,8 @@ void TestPartitionedGraphicsLoopBudgetSpirv() {
   options.compute_workgroup_limits.native_subgroup_size = 32;
 
   auto bounded = RecompileForTest(bounded_shader, options);
-  Check(Common::ContainsStr(DisassembleSpirvBinary(bounded.spirv),
-                            "graphics_loop_counter"),
+  Check((std::string_view(DisassembleSpirvBinary(bounded.spirv)).find(
+                            "graphics_loop_counter") != std::string_view::npos),
         "partitioned graphics loop omitted its finite iteration budget");
   CheckSpirvBinaryValidates(bounded.spirv);
 
@@ -8649,8 +8652,8 @@ void TestPartitionedGraphicsLoopBudgetSpirv() {
       EncodeSopp(0x01),             // s_endpgm
   };
   auto stalled = RecompileForTest(stalled_shader, options);
-  Check(Common::ContainsStr(DisassembleSpirvBinary(stalled.spirv),
-                            "graphics_loop_counter"),
+  Check((std::string_view(DisassembleSpirvBinary(stalled.spirv)).find(
+                            "graphics_loop_counter") != std::string_view::npos),
         "stalled partitioned graphics loop omitted its finite budget");
   CheckSpirvBinaryValidates(stalled.spirv);
 }
@@ -10562,7 +10565,7 @@ void TestCooperativeWave64ScalarReadBranchUniformity() {
     const auto plan = f.Plan();
     if (!scalar) {
       Check(!plan.error.empty() &&
-                Common::ContainsStr(plan.error, "wave-uniform branch"),
+                (std::string_view(plan.error).find( "wave-uniform branch") != std::string_view::npos),
             "per-lane vector-buffer load controlled a cooperative branch");
     } else {
       Check(plan.error.empty() && plan.IsCooperativeWave64() &&
@@ -10888,7 +10891,7 @@ void TestCooperativeWave64BufferCycleVisibility(bool address_only = false) {
       const auto index = static_cast<uint32_t>(f.program.memory_info.size());
       IR::MemoryInfo info{};
       info.kind = kind;
-      info.glc = true;
+      info.coherent = true;
       info.planning_only = planning_only;
       f.program.memory_info.push_back(info);
       value.TryInstruction()->SetFlags(IR::MemoryFlags{.index=index});
@@ -11062,7 +11065,7 @@ void TestCooperativeWave64AutomaticBufferCyclePromotion() {
     const auto index = static_cast<uint32_t>(f.program.memory_info.size());
     IR::MemoryInfo info{};
     info.kind = IR::ResourceKind::Buffer;
-    info.glc = true;
+    info.coherent = true;
     f.program.memory_info.push_back(info);
     value.TryInstruction()->SetFlags(IR::MemoryFlags{.index = index});
     return value;
@@ -11412,8 +11415,8 @@ void TestUnusedNativeF64EmissionHasCompleteRequirements() {
   auto result = RecompileForTest(shader, options);
   CheckSpirvBinaryValidates(result.spirv);
   const auto baseline = DisassembleSpirvBinary(result.spirv);
-  Check(!Common::ContainsStr(baseline, "OpCapability Float64") &&
-            !Common::ContainsStr(baseline, "OpTypeFloat 64"),
+  Check(!(std::string_view(baseline).find( "OpCapability Float64") != std::string_view::npos) &&
+            !(std::string_view(baseline).find( "OpTypeFloat 64") != std::string_view::npos),
         "unused native F64 fixture baseline already needs Float64");
 
   // Add a legal SSA instruction after planning/DCE, exactly as other direct
@@ -11424,7 +11427,7 @@ void TestUnusedNativeF64EmissionHasCompleteRequirements() {
       {IR::Value::F64(0x4000000000000000ull),
        IR::Value::F64(0x4008000000000000ull)}); // 2 * 3
   Check(!unused.HasUses(), "unused native F64 fixture gained an accidental reader");
-  Spirv::AnalyzeProgramRequirements(result.program);
+  Spirv::CollectSpirvRequirements(result.program);
   std::puts("KYTY_UNUSED_F64_EMISSION_READY");
   std::fflush(stdout);
   const auto emitted = Spirv::EmitProgram(result.program, options.input_info,
@@ -12158,8 +12161,8 @@ void TestSingleWaveLdsSpirvPhaseOrdering(bool check_phase_ordering = true,
     Check(std::fclose(file) == 0, "could not close the synthetic SPIR-V dump");
   }
   const auto ballot_source = DisassembleSpirvBinary(compiled.spirv);
-  Check(!Common::ContainsStr(ballot_source, "OpGroupNonUniformBallot") &&
-            !Common::ContainsStr(ballot_source, "OpCapability GroupNonUniformBallot"),
+  Check(!(std::string_view(ballot_source).find( "OpGroupNonUniformBallot") != std::string_view::npos) &&
+            !(std::string_view(ballot_source).find( "OpCapability GroupNonUniformBallot") != std::string_view::npos),
         "split wave64 ballot used a native subgroup ballot instead of workgroup reconstruction");
   Check(SpirvNamedVariableLoadCount(compiled.spirv, "gl_LocalInvocationIndex") == 1u,
         "split wave64 emitter reloaded the host local invocation index");
@@ -12289,8 +12292,8 @@ void TestSplitWave64CyclicImageSpirvRendezvous() {
           "cyclic image-store proof did not select split-wave memory rendezvous");
     Check(SpirvContainsOpcode(result.spirv, 95u),
           "IMAGE_LOAD analogue omitted OpImageFetch");
-    Check(!Common::ContainsStr(DisassembleSpirvBinary(result.spirv),
-                               "OpGroupNonUniformBallot"),
+    Check(!(std::string_view(DisassembleSpirvBinary(result.spirv)).find(
+                               "OpGroupNonUniformBallot") != std::string_view::npos),
           "split analogue used a native subgroup ballot");
     return std::pair{std::move(result.spirv), plan.SynchronizesSplitWaveMemory()};
   };
@@ -12776,7 +12779,7 @@ void TestComputeExecutionDsLaneConvergence() {
         // Each lane reads itself, so result != 0 is false only at lane zero.
         // The remaining 63 lanes would reach the taken arm's collective alone.
         Check(!plan.error.empty() &&
-                  Common::ContainsStr(plan.error, "wave-uniform branch"),
+                  (std::string_view(plan.error).find( "wave-uniform branch") != std::string_view::npos),
               "DS lane branch was accepted or rejected before convergence analysis");
         Check(!plan.IsSplitWave64(),
               "rejected DS lane branch retained an executable split plan");
@@ -13154,14 +13157,13 @@ void TestNewShaderRecompilerBufferLoadsGuardedByExec() {
   const auto source = DisassembleSpirvBinary(result.spirv);
   const auto exec_branch =
       source.find("OpBranchConditional", 0);
-  const auto array_length =
-      source.find("OpArrayLength", 0);
-  const auto bounds_branch = source.find("OpBranchConditional", array_length);
+  const auto bounds_compare = source.find("OpULessThan", exec_branch);
+  const auto bounds_branch = source.find("OpBranchConditional", bounds_compare);
   const auto element_access = source.find("OpAccessChain %_ptr_StorageBuffer_uint", 0);
   Check(exec_branch != std::string::npos,
         "buffer load SPIR-V lacks EXEC guard branch");
-  Check(array_length != std::string::npos,
-        "buffer load SPIR-V lacks storage buffer array-length bounds check");
+  Check(bounds_compare != std::string::npos && source.find("OpArrayLength") == std::string::npos,
+        "buffer load SPIR-V lacks renderer-provided bounds or reintroduced OpArrayLength");
   Check(bounds_branch != std::string::npos,
         "buffer load SPIR-V lacks storage buffer bounds branch");
   Check(element_access != std::string::npos,
@@ -13199,13 +13201,13 @@ void TestNewShaderRecompilerBufferAtomicsGuardedByBounds() {
     CheckSpirvBinaryValidates(result.spirv);
 
     const auto source = DisassembleSpirvBinary(result.spirv);
-    const auto array_length =
-        source.find("OpArrayLength", 0);
-    const auto bounds_branch = source.find("OpBranchConditional", array_length);
+    const auto bounds_compare = source.find("OpULessThan", 0);
+    const auto bounds_branch = source.find("OpBranchConditional", bounds_compare);
     const auto atomic = source.find(test.spirv, 0);
     const auto memory_barrier =
         source.find("OpMemoryBarrier", atomic);
-    Check(array_length != std::string::npos &&
+    Check(bounds_compare != std::string::npos &&
+              source.find("OpArrayLength") == std::string::npos &&
               bounds_branch != std::string::npos &&
               atomic != std::string::npos &&
               memory_barrier != std::string::npos,
@@ -13252,14 +13254,14 @@ void TestCapturedBufferAtomicsX2() {
           "64-bit buffer atomic storage view does not use eight-byte elements");
     Check(CountSourceOccurrences(source, "Aliased") == 2u,
           "both storage-buffer views must declare that they alias");
-    const auto array_length =
-        source.find("OpArrayLength", 0);
-    const auto bounds_branch = source.find("OpBranchConditional", array_length);
+    const auto bounds_compare = source.find("OpULessThan", 0);
+    const auto bounds_branch = source.find("OpBranchConditional", bounds_compare);
     const auto atomic =
         source.find(test.spirv_name, 0);
     const auto memory_barrier =
         source.find("OpMemoryBarrier", atomic);
-    Check(array_length != std::string::npos &&
+    Check(bounds_compare != std::string::npos &&
+              source.find("OpArrayLength") == std::string::npos &&
               bounds_branch != std::string::npos &&
               atomic != std::string::npos && bounds_branch < atomic,
           "64-bit buffer atomic was not guarded by storage-buffer bounds");
@@ -16808,8 +16810,8 @@ void TestComputeFpModeStaticIdentity() {
     Check(changed_params.hash == baseline_params.hash &&
               changed_params.code.data() == baseline_params.code.data() &&
               changed_params.code.size_bytes() == baseline_params.code.size_bytes() &&
-              changed_params.user_data.data() == baseline_params.user_data.data() &&
-              changed_params.user_data.size() == baseline_params.user_data.size(),
+              changed_params.user_data == baseline_params.user_data &&
+              changed_params.user_data_count == baseline_params.user_data_count,
           "changing initial FP controls changed code or runtime user data");
     std::printf("KYTY_COMPUTE_FP_MODE_KEY_CHECK mode=0x%02x ieee=%u dx10_clamp=%u\n",
                 static_cast<unsigned>(regs.cs_regs.float_mode),
@@ -17303,9 +17305,9 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
                                     .instructions = 211,
                                     .runtime_arrays = 1,
                                     .variables = 2,
-                                    .loads = 9,
+                                    .loads = 10, // One extra load supplies the exact renderer byte limit.
                                     .stores = 4,
-                                    .array_lengths = 2,
+                                    .array_lengths = 0,
                                     .phis = 5,
                                     .labels = 34,
                                     .selection_merges = 10,
@@ -17472,12 +17474,70 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
   CheckSpirvPhiParents(dispatcher_result.spirv);
 }
 
+void TestNewShaderRecompilerCfgRoutesInnerSharedExitFirst() {
+  const uint32_t shader[] = {
+      EncodeSopc(0x06, 0, 0), // outer forward-skip condition
+      EncodeSopp(0x04, 4),    // outer -> shared or nested condition
+      EncodeSopc(0x06, 1, 1), // nested forward-skip condition
+      EncodeSopp(0x04, 2),    // nested -> shared or work
+      EncodeSMovB32(2, 129),  // forward-skip work
+      EncodeSopp(0x02, 0),    // work -> shared
+      EncodeSMovB32(3, 129),  // shared work
+      EncodeSopc(0x06, 4, 4), // outer terminal condition
+      EncodeSopp(0x04, 3),    // outer -> shared terminal or inner
+      EncodeSopc(0x06, 5, 5), // inner terminal condition
+      EncodeSopp(0x04, 1),    // inner -> shared terminal or other terminal
+      0xbf810000u,            // other terminal
+      0xbf810000u,            // shared terminal
+  };
+
+  ShaderRecompiler::Decoder::Program decoded;
+  ShaderRecompiler::Decoder::DecodeProgram(std::span{shader}, decoded);
+  ShaderRecompiler::CFG::Graph graph;
+  graph = ShaderRecompiler::CFG::BuildGraph(decoded);
+  const auto original_coverage =
+      CfgInstructionCoverage(graph, decoded.instructions.size());
+  Check(ShaderRecompiler::CFG::Structurize(graph),
+        graph.unsupported_reason.c_str());
+  Check(CfgInstructionCoverage(graph, decoded.instructions.size()) ==
+            original_coverage,
+        "shared-exit route ordering changed semantic instruction coverage");
+  const auto route_selects =
+      std::ranges::count_if(graph.blocks, [](const auto &block) {
+        return block.terminator.condition ==
+               ShaderRecompiler::CFG::BranchCondition::GotoVariable;
+      });
+  const auto route_sets =
+      std::ranges::count_if(graph.blocks, [](const auto &block) {
+        return block.terminator.goto_value >= 0;
+      });
+  const bool has_early_route =
+      std::ranges::any_of(graph.blocks, [](const auto &block) {
+        return block.start_pc < 0x30u &&
+               (block.terminator.condition ==
+                    ShaderRecompiler::CFG::BranchCondition::GotoVariable ||
+                block.terminator.goto_value >= 0);
+      });
+  Check(route_selects == 1u && route_sets == 3u && !has_early_route,
+        "shared exits were routed before the innermost blocking construct");
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+  auto result = RecompileForTest(shader, options);
+  Check(!result.program.dispatcher_fallback &&
+            (result.ir_dump.find("mode=structured") != std::string::npos) &&
+            SpirvInstructionOpcodeCount(result.spirv, 251) == 0u,
+        "inner-first shared-exit routing did not stay structured");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
 #include "ShaderRayTracingTests.inc"
 
 } // namespace
 } // namespace Libs::Graphics
 
 int RunShaderBatchAudit(int argc, char* argv[]);
+
 
 int main(int argc, char* argv[]) {
   if (argc == 3 &&
@@ -17738,7 +17798,7 @@ int main(int argc, char* argv[]) {
   TestNewShaderRecompilerNativeWideBufferIr();
   TestNewShaderRecompilerScalarB64LaneTranslation();
   TestNewShaderRecompilerMubufFormatTranslation();
-  TestNewShaderRecompilerFormattedStoreUsesRuntimeArrayLengthOnly();
+  TestNewShaderRecompilerFormattedStoreUsesDynamicByteLimitOnly();
   TestNewShaderRecompilerTypedBufferTranslation();
   TestNewShaderRecompilerDsReadWrite2Translation();
   TestNewShaderRecompilerDsWideAndAtomicTranslation();

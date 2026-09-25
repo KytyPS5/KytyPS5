@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/ir/passes/SharedMemoryBarrier.h"
 #include "graphics/shader/recompiler/Tessellation.h"
 
 #include "common/assert.h"
@@ -653,6 +654,9 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		IR::RemoveIdentities(ir.blocks);
 		IR::EliminateDeadCode(ir.blocks);
 	}
+	if (options.stage == ShaderType::Compute && options.input_info.compute != nullptr) {
+		IR::InsertSharedMemoryBarriers(ir, ir.wave_size, *options.input_info.compute);
+	}
 	LowerTessellationMemory(ir, options);
 	IR::BuildSrtPlan(ir);
 	IR::EliminateDeadCode(ir.blocks);
@@ -697,6 +701,7 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 
 	IR::CollectShaderInfo(ir, options.input_info);
 	IR::AllocateBindings(ir, push_data_start_dword);
+	Spirv::CollectSpirvRequirements(ir);
 	std::string ir_dump;
 	if (options.dump_ir) {
 		const auto instruction_count = CountIrInstructions(ir);
@@ -713,7 +718,7 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram\n",
 	     GetDumpLabel(options), StageName(ir.stage), ir.shader_hash);
-	auto spirv = Spirv::EmitProgram(ir, options.input_info);
+	auto spirv = Spirv::EmitProgram(ir, options.input_info, options.compute_workgroup_limits, options.host_profile, specialization);
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram words=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(ir.stage), ir.shader_hash,

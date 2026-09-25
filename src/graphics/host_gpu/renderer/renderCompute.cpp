@@ -77,7 +77,7 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 		ShaderBufferResource fill_descriptor {};
 		uint32_t             fill_value = 0;
 		uint64_t             fill_size  = 0;
-		const bool uniform_fill = ResolveComputeImageClear(
+		const bool uniform_fill = ResolveComputeBufferFill(
 		    input, group_x, group_y, group_z, mode, fill_descriptor, fill_value, fill_size);
 		for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 			const auto& resource = program.info.buffers[i];
@@ -279,7 +279,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	    {cs_regs.cs_regs.num_thread_x, cs_regs.cs_regs.num_thread_y,
 	     cs_regs.cs_regs.num_thread_z}, use_thread_dimensions);
 	const auto compute_program =
-	    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
+	    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info, guest_groups);
 	if (!compute_program) {
 		// Temporary until RT is implemented.
 		return;
@@ -292,7 +292,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	const auto& program   = *input_info.stage.program;
 	const auto& resources = *input_info.stage.resources;
-	if (TryConsumeComputeMetaClear(input_info, buffer)) {
+	if (TryConsumeComputeMetaClear(input_info, buffer, thread_group_x, thread_group_y, thread_group_z, mode)) {
 		ResetBindings();
 		return;
 	}
@@ -432,14 +432,14 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		const auto address = std::strtoull(readback_address, &end, 0);
 		static std::atomic<uint32_t> readback_count = 0;
 		if (end != readback_address && *end == '\0') {
-			for (const auto& binding: bindings.resources.images) {
+			for (const auto& binding: bindings.images) {
 				if (binding.desc.type != TextureCache::BindingType::Storage ||
 				    binding.desc.info.data.address != address ||
 				    readback_count.fetch_add(1, std::memory_order_relaxed) >= 16) {
 					continue;
 				}
 				const bool scheduled =
-				    m_context.GetTextureCache().TryDownloadImage(binding.image_id);
+				    ([&] { auto& cache = m_context.GetTextureCache(); std::scoped_lock lock(cache.m_lock); return cache.DownloadImageMemory(binding.image_id); })();
 				LOGF("ComputeReadback: shader=0x%016" PRIx64 " addr=0x%016" PRIx64
 				     " scheduled=%d\n",
 				     input_info.stage.program->shader_hash, address, scheduled ? 1 : 0);
@@ -454,20 +454,20 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 						input_address = std::strtoull(input_address_text, &input_address_end, 0);
 					}
 					for (uint32_t image_index = 0;
-					     image_index < bindings.resources.images.size(); image_index++) {
+					     image_index < bindings.images.size(); image_index++) {
 						const auto& image = program.info.images[image_index];
 						if (image.resource_class !=
 						    ShaderRecompiler::IR::ImageResourceClass::Sampled) {
 							continue;
 						}
-						const auto& input = bindings.resources.images[image_index];
+						const auto& input = bindings.images[image_index];
 						if (input_address_text != nullptr &&
 						    (input_address_end == input_address_text || *input_address_end != '\0' ||
 						     input.desc.info.data.address != input_address)) {
 							continue;
 						}
 						const bool input_scheduled =
-						    m_context.GetTextureCache().TryDownloadImage(input.image_id);
+						    ([&] { auto& cache = m_context.GetTextureCache(); std::scoped_lock lock(cache.m_lock); return cache.DownloadImageMemory(input.image_id); })();
 						LOGF("ComputeReadbackInput: shader=0x%016" PRIx64
 						     " index=%u addr=0x%016" PRIx64 " scheduled=%d\n",
 						     input_info.stage.program->shader_hash, image_index,

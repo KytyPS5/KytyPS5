@@ -288,6 +288,55 @@ PreparedMemoryElement PrepareMemoryElement(ValueEmitContext& ctx, const IR::Memo
 	return {.resource = resource, .index = index};
 }
 
+bool UsesPackedLds64(const EmitterState& state, const MemoryResourceAccess& resource) {
+	return resource.kind == IR::ResourceKind::Lds && state.requirements.shared_int64_atomics;
+}
+
+uint32_t PackedLds64Pointer(EmitterState& state, uint32_t object_pointer,
+                            uint32_t dword_index) {
+	const auto packed_index = Binary(state, OpShiftRightLogical, TypeU32(state), dword_index,
+	                                 ConstantU32(state, 1u));
+	const auto pointer = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {OpAccessChain, TypePointer(state, StorageClassWorkgroup, TypeScalarU64(state)), pointer,
+	     object_pointer, packed_index});
+	return pointer;
+}
+
+uint32_t PackedLdsWordIndex(EmitterState& state, uint32_t dword_index) {
+	return Binary(state, OpBitwiseAnd, TypeU32(state), dword_index, ConstantU32(state, 1u));
+}
+
+uint32_t ExtractPackedLdsWord(EmitterState& state, uint32_t packed_value,
+                              uint32_t dword_index) {
+	const auto words = Unary(state, OpBitcast, TypeU64(state), packed_value);
+	const auto word  = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {OpVectorExtractDynamic, TypeU32(state), word, words, PackedLdsWordIndex(state, dword_index)});
+	return word;
+}
+
+uint32_t ReplacePackedLdsWord(EmitterState& state, uint32_t packed_value,
+                              uint32_t dword_index, uint32_t word) {
+	const auto words   = Unary(state, OpBitcast, TypeU64(state), packed_value);
+	const auto updated = state.builder.AllocateId();
+	state.builder.AddFunction({OpVectorInsertDynamic, TypeU64(state), updated, words, word,
+	                           PackedLdsWordIndex(state, dword_index)});
+	return Unary(state, OpBitcast, TypeScalarU64(state), updated);
+}
+
+template <typename Fn>
+uint32_t AtomicUpdatePackedLdsWord(EmitterState& state, uint32_t object_pointer,
+                                   uint32_t dword_index, Fn&& desired) {
+	const auto old_packed = AtomicUpdateTyped(
+	    state, PackedLds64Pointer(state, object_pointer, dword_index), IR::ResourceKind::Lds,
+	    TypeScalarU64(state), [&](uint32_t packed) {
+		    const auto old_word = ExtractPackedLdsWord(state, packed, dword_index);
+		    return ReplacePackedLdsWord(state, packed, dword_index, desired(old_word));
+	    });
+	return ExtractPackedLdsWord(state, old_packed, dword_index);
+}
+
 uint32_t LoadWordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& resource,
                           uint32_t index);
 
@@ -519,7 +568,7 @@ bool LdsHasCompetingInvocations(const EmitterState& state) {
 void StoreSubwordInBounds(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
                           const MemoryResourceAccess& resource, uint32_t address, uint32_t index,
                           uint32_t bits, uint32_t data) {
-	const auto pointer = EmitMemoryElementPointer(ctx.state, resource, index);
+
 	const auto shift   = Binary(ctx.state, spv::OpShiftLeftLogical, TypeU32(ctx.state),
 	                            Binary(ctx.state, spv::OpBitwiseAnd, TypeU32(ctx.state), address,
 	                                   ConstantU32(ctx.state, 3)),
@@ -600,6 +649,7 @@ spv::Op SpirvAtomicOpcode(IR::ValueOpcode opcode) {
 		case IR::ValueOpcode::BufferAtomicSwap64:
 		case IR::ValueOpcode::SharedAtomicSwap32: return spv::OpAtomicExchange;
 		case IR::ValueOpcode::BufferAtomicIAdd32:
+		case IR::ValueOpcode::SharedAtomicIAdd64:
 		case IR::ValueOpcode::SharedAtomicIAdd32: return spv::OpAtomicIAdd;
 		case IR::ValueOpcode::BufferAtomicISub32:
 		case IR::ValueOpcode::SharedAtomicISub32: return spv::OpAtomicISub;
@@ -615,6 +665,7 @@ spv::Op SpirvAtomicOpcode(IR::ValueOpcode opcode) {
 		case IR::ValueOpcode::SharedAtomicAnd32: return spv::OpAtomicAnd;
 		case IR::ValueOpcode::BufferAtomicOr32:
 		case IR::ValueOpcode::BufferAtomicOr64:
+		case IR::ValueOpcode::SharedAtomicOr64:
 		case IR::ValueOpcode::SharedAtomicOr32: return spv::OpAtomicOr;
 		case IR::ValueOpcode::BufferAtomicXor32:
 		case IR::ValueOpcode::SharedAtomicXor32: return spv::OpAtomicXor;
@@ -825,8 +876,8 @@ uint32_t LoadFormattedD16(ValueEmitContext& ctx, const IR::Inst& inst,
 	return EmitValueOrDefaultIfCondition(
 	    state, ctx.Arg(inst, inst.NumArgs() - 1), type, zero, [&]() {
 		    const auto resource = PrepareMemoryResourceAccess(state, mem);
-		    const auto format   = BufferFormat(ctx, inst, mem);
-		    if (!Format::IsKnownFormat(format)) {
+		    const auto format   = BufferFormat(ctx, mem);
+		    if (!Prospero::IsKnownFormat(format)) {
 			    std::array<uint32_t, 4> raw {};
 			    for (uint32_t word = 0; word < packed_words; word++) {
 				    raw[word] =
@@ -835,7 +886,7 @@ uint32_t LoadFormattedD16(ValueEmitContext& ctx, const IR::Inst& inst,
 			    return packed_words == 1u ? raw[0]
 			                                  : ConstructU32Composite(state, packed_words, raw);
 		    }
-		    const auto plan = PrepareFormattedMemory(ctx, inst, mem, resource,
+		    const auto plan = PrepareFormattedMemory(ctx, inst, mem, resource, Format::GetFormatInfo(format),
 		                                             mem.component_count, FormattedAccess::Load);
 		    const auto result = [&](bool in_bounds) {
 			    std::array<uint32_t, 4> values {};
@@ -873,7 +924,7 @@ void StoreFormattedInBounds(ValueEmitContext& ctx, const IR::Inst& inst,
 		StoreSubwordInBounds(ctx, mem, plan.resource, plan.addresses[component],
 		                     plan.indices[component], bits, data);
 	} else {
-		StoreWordInBounds(ctx, inst, mem, plan.resource, plan.indices[component], data);
+		StoreWordInBounds(ctx, plan.resource, plan.indices[component], data);
 	}
 }
 
@@ -889,10 +940,61 @@ void FormattedStore(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Memor
 		const auto plan = PrepareFormattedMemory(ctx, inst, mem, resource, info, 1u,
 		                                         FormattedAccess::Store);
 		EmitIfCondition(ctx.state, plan.in_bounds, [&]() {
-			StoreFormattedInBounds(ctx, mem, plan, 0u, data);
+			StoreFormattedInBounds(ctx, inst, mem, plan, 0u, data);
 		});
 	});
 }
+
+void StoreFormattedD16(ValueEmitContext& ctx, const IR::Inst& inst,
+                       const IR::MemoryInfo& mem, uint32_t packed_words) {
+	auto& state = ctx.state;
+	EmitIfCondition(state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
+		const auto resource = PrepareMemoryResourceAccess(state, mem);
+		const auto packed   = ctx.Arg(inst, inst.NumArgs() - 2);
+		const auto format   = BufferFormat(ctx, mem);
+		if (!Prospero::IsKnownFormat(format)) {
+			for (uint32_t word = 0; word < packed_words; word++) {
+				uint32_t data = packed;
+				if (packed_words != 1u) {
+					data = state.builder.AllocateId();
+					state.builder.AddFunction(
+					    {OpCompositeExtract, TypeU32(state), data, packed, word});
+				}
+				StoreWordPrepared(ctx, inst, RebaseRawComponent(mem, word), resource, data);
+			}
+			return;
+		}
+
+		const auto plan = PrepareFormattedMemory(ctx, inst, mem, resource, Format::GetFormatInfo(format),
+		                                         mem.component_count, FormattedAccess::Store);
+		EmitIfCondition(state, plan.in_bounds, [&]() {
+			const auto count = std::min(mem.component_count, plan.info.component_count);
+			for (uint32_t component = 0; component < count; component++) {
+				const auto word = component / 2u;
+				uint32_t data = packed;
+				if (packed_words != 1u) {
+					data = state.builder.AllocateId();
+					state.builder.AddFunction(
+					    {OpCompositeExtract, TypeU32(state), data, packed, word});
+				}
+				if ((component & 1u) != 0u) {
+					data = Binary(state, OpShiftRightLogical, TypeU32(state), data,
+					              ConstantU32(state, 16u));
+				}
+				data = Binary(state, OpBitwiseAnd, TypeU32(state), data,
+				              ConstantU32(state, 0xffffu));
+				if (plan.info.type == Format::ComponentType::Sint) {
+					data = SignExtendSubword(state, data, 16u);
+				} else if (plan.info.type != Format::ComponentType::Uint) {
+					data = EmitF16BitsToF32(state, data);
+				}
+				data = PackFormatComponent(state, plan.info, component, data);
+				StoreFormattedInBounds(ctx, inst, mem, plan, component, data);
+			}
+		});
+	});
+}
+
 
 uint32_t LoadIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
 	auto&       state   = ctx.state;
@@ -1023,7 +1125,7 @@ void StoreWideBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t compo
 					const auto data = state.builder.AllocateId();
 					state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), data,
 					                          composite, component);
-					StoreFormattedInBounds(ctx, mem, plan, component, data);
+					StoreFormattedInBounds(ctx, inst, mem, plan, component, data);
 				}
 			});
 			return;
@@ -1082,6 +1184,70 @@ void StoreWideShared(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t compo
 		}
 	});
 }
+
+void EmitSharedAtomic64(ValueEmitContext& ctx, const IR::Inst& inst,
+                        const IR::MemoryInfo& mem) {
+	auto& state = ctx.state;
+	if (mem.kind != IR::ResourceKind::Lds || state.stage != ShaderType::Compute ||
+	    !state.requirements.shared_int64_atomics) {
+		ctx.Fail(inst, "64-bit shared atomic has no packed compute LDS storage");
+	}
+	EmitIfCondition(state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
+		const auto access = PrepareMemoryElement(ctx, mem, DwordIndex(ctx, inst, mem));
+		const auto high_index =
+		    Binary(state, OpIAdd, TypeU32(state), access.index, ConstantU32(state, 1u));
+		const auto in_bounds =
+		    AndCondition(state, EmitMemoryElementInBounds(state, access.resource, access.index),
+		                 EmitMemoryElementInBounds(state, access.resource, high_index));
+		EmitIfCondition(state, in_bounds, [&]() {
+			const auto value = Unary(state, OpBitcast, TypeScalarU64(state),
+			                         ctx.Arg(inst, inst.NumArgs() - 2));
+			const auto old = state.builder.AllocateId();
+			state.builder.AddFunction(
+			    {static_cast<uint32_t>(SpirvAtomicOpcode(inst.GetOpcode())), TypeScalarU64(state), old,
+			     PackedLds64Pointer(state, access.resource.object_pointer, access.index),
+			     ConstantU32(state, ScopeWorkgroup),
+			     ConstantU32(state, MemorySemanticsNone), value});
+			const auto semantics = MemorySemanticsAcquireRelease | MemorySemanticsWorkgroupMemory;
+			state.builder.AddFunction({OpMemoryBarrier, ConstantU32(state, ScopeWorkgroup),
+			                           ConstantU32(state, semantics)});
+		});
+	});
+}
+
+
+uint32_t LoadBoundedFlatWord(EmitterState& state, uint32_t index,
+                            uint32_t count, uint32_t flat_offset) {
+	if (count == 0) {
+		// A proved zero-trip loop cannot execute this instruction. Do not
+		// create a resource or invent a readable table for that unreachable path.
+		return state.builder.Constant(OpUndef, TypeU32(state), {});
+	}
+	if (state.flattened_srt_variable == 0 || flat_offset > UINT32_MAX - (count - 1u)) {
+		EXIT("bounded SRT layout has no valid flattened table\n");
+	}
+	const auto valid = Binary(state, OpULessThan, TypeBool(state), index,
+	                          ConstantU32(state, count));
+	const auto load_label = state.builder.AllocateId();
+	const auto invalid_label = state.builder.AllocateId();
+	const auto merge_label = state.builder.AllocateId();
+	state.builder.AddFunction({OpSelectionMerge, merge_label, SelectionControlNone});
+	state.builder.AddFunction({OpBranchConditional, valid, load_label, invalid_label});
+	EmitLabel(state, invalid_label);
+	state.builder.AddFunction({OpUnreachable});
+	EmitLabel(state, load_label);
+	const auto offset = Binary(state, OpIAdd, TypeU32(state), index,
+	                           ConstantU32(state, flat_offset));
+	const auto pointer = state.builder.AllocateId();
+	const auto value = state.builder.AllocateId();
+	state.builder.AddFunction({OpAccessChain, TypeStorageBufferElementPointer(state), pointer,
+	                           state.flattened_srt_variable, ConstantU32(state, 0), offset});
+	state.builder.AddFunction({OpLoad, TypeU32(state), value, pointer});
+	state.builder.AddFunction({OpBranch, merge_label});
+	EmitLabel(state, merge_label);
+	return value;
+}
+
 
 } // namespace
 
@@ -1390,5 +1556,14 @@ uint32_t EmitBpermuteU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto target = Binary(state, spv::OpBitwiseOr, TypeU32(state), base, index);
 	return EmitDsMaskedLaneRead(state, source, target, ctx.Arg(inst, 2));
 }
+
+uint32_t EmitReadBoundedSrtU32(ValueEmitContext& ctx, const IR::Inst& inst) {
+ const auto id = inst.Flags<uint32_t>();
+ if (id >= ctx.state.program.info.bounded_srt_reads.size()) ctx.Fail(inst, "bounded SRT read specialization is missing");
+ const auto& layout = ctx.state.program.info.bounded_srt_reads[id];
+ return LoadBoundedFlatWord(ctx.state, ctx.Arg(inst, 0), layout.count, layout.flat_offset);
+}
+void EmitSharedAtomicIAdd64(ValueEmitContext& ctx, const IR::Inst& inst) { EmitSharedAtomic64(ctx, inst, ctx.Memory(inst)); }
+void EmitSharedAtomicOr64(ValueEmitContext& ctx, const IR::Inst& inst) { EmitSharedAtomic64(ctx, inst, ctx.Memory(inst)); }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter

@@ -563,6 +563,14 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		supported_features2.pNext = &provoking_vertex;
 	}
 	physical_device.getFeatures2(&supported_features2);
+	const bool shader_fma_ext_enabled =
+	    HasExtension(device_extensions, VK_KHR_SHADER_FMA_EXTENSION_NAME);
+	vk::PhysicalDeviceShaderFmaFeaturesKHR supported_fma {};
+	if (shader_fma_ext_enabled) {
+		vk::PhysicalDeviceFeatures2 fma_query {};
+		fma_query.pNext = &supported_fma;
+		physical_device.getFeatures2(&fma_query);
+	}
 	graphics.mesh_shader_enabled = mesh_extension && supported_mesh.meshShader;
 
 	vk::PhysicalDeviceSubgroupSizeControlProperties subgroup_size_control {};

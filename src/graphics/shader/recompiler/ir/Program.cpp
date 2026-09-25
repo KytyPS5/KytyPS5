@@ -458,8 +458,12 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 				    !memory.SupportsIndirectBufferLoad(inst.GetOpcode())) {
 					return Fail("indirect buffer requires a raw DWORD x2/x3/x4 load");
 				}
+				const bool packed_d16 = memory.kind == ResourceKind::Buffer &&
+				                        memory.formatted && memory.data_bits == 16u &&
+				                        memory.component_count > memory.data_dwords &&
+				                        memory.component_count <= memory.data_dwords * 2u;
 				if (buffer_components > 1u &&
-				    (!vector_buffer || memory.data_bits != 32u ||
+				    (!vector_buffer || (memory.data_bits != 32u && !packed_d16) ||
 				     memory.data_dwords != buffer_components || memory.component_index != 0u)) {
 					return Fail(fmt::format("{} has inconsistent native-wide metadata",
 					                        ValueOpcodeName(inst.GetOpcode())));

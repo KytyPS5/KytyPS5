@@ -1127,6 +1127,44 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 	upload(copies, linear);
 }
 
+GuestRange TextureCache::SelectUploadRange(const ImageInfo& info,
+                                           const ImageViewInfo& view) noexcept {
+	if (!info.data.Valid() || info.IsVolume() || info.resources.levels == 0 ||
+	    info.resources.levels > info.mip_layout.size() || info.resources.layers != 1 ||
+	    view.level_count == 0 || view.base_level >= info.resources.levels ||
+	    view.level_count > info.resources.levels - view.base_level || view.layer_count == 0 ||
+	    view.base_layer >= info.resources.layers ||
+	    view.layer_count > info.resources.layers - view.base_layer) {
+		return info.data;
+	}
+	uint64_t begin = UINT64_MAX;
+	uint64_t end   = 0;
+	for (uint32_t level = view.base_level; level < view.base_level + view.level_count; ++level) {
+		const auto& mip = info.mip_layout[level];
+		if (mip.size == 0 || mip.size % info.resources.layers != 0) {
+			return info.data;
+		}
+		const auto layer_size = mip.size;
+		if (view.base_layer > (UINT64_MAX - mip.offset) / layer_size) {
+			return info.data;
+		}
+		const auto mip_begin = mip.offset + layer_size * view.base_layer;
+		if (view.layer_count > (UINT64_MAX - mip_begin) / layer_size) {
+			return info.data;
+		}
+		const auto mip_end = mip_begin + layer_size * view.layer_count;
+		if (mip_begin > info.data.size || mip_end > info.data.size) {
+			return info.data;
+		}
+		begin = std::min(begin, mip_begin);
+		end   = std::max(end, mip_end);
+	}
+	if (begin == UINT64_MAX || begin >= end || begin > UINT64_MAX - info.data.address) {
+		return info.data;
+	}
+	return {info.data.address + begin, end - begin};
+}
+
 void TextureCache::InitializeImage(ImageId id, const ImageDesc* description) {
 	const ImageDesc desc = description != nullptr ? *description : ImageDesc {};
 	auto& image = m_slot_images[id];

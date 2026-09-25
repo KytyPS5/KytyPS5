@@ -69,9 +69,10 @@ bool BufferUsesDwordOffset(const EmitterState& state, const IR::MemoryInfo& mem)
 }
 
 void EmitMemoryOffsets(EmitterState& state) {
+	uint32_t word = 0;
 	for (uint32_t i = 0; i < state.program.bindings.memory_offset_count; i++) {
-		const auto word =
-		    EmitShaderDataDwordLoad(state, state.program.bindings.memory_offset_dword + i / 4u);
+		if (i % 4u == 0u)
+			word = EmitShaderDataDwordLoad(state, state.program.bindings.memory_offset_dword + i / 4u);
 		const auto shift             = ConstantU32(state, (i % 4u) * 8u);
 		state.memory_byte_offsets[i] = EmitBinaryU32(
 		    state, spv::OpBitwiseAnd, EmitBinaryU32(state, spv::OpShiftRightLogical, word, shift),
@@ -125,9 +126,9 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 	                          ConstantU32(state, array_index));
 	access.byte_offset = state.memory_byte_offsets[array_index];
 	access.byte_limit  = state.memory_byte_limits[array_index];
-	access.length      = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpArrayLength, TypeU32(state), access.length,
-	                          access.object_pointer, 0);
+	// Use the exact renderer-published byte bound; avoid driver-sensitive
+	// OpArrayLength on an array of storage-buffer descriptors.
+	access.length = EmitStorageBufferElementCount(state, access.byte_limit, element_shift);
 	return access;
 }
 
@@ -566,4 +567,10 @@ uint32_t EmitDsSwizzleTargetLane(EmitterState& state, uint32_t subid, uint32_t c
 	return target;
 }
 
+uint32_t EmitTBufferBitcastU32ToF32(EmitterState& state, uint32_t value) {
+ return Unary(state, spv::OpBitcast, TypeF32(state), value);
+}
+uint32_t EmitTBufferCompareU32Constant(EmitterState& state, uint32_t opcode, uint32_t value, uint32_t constant) {
+ return Binary(state, opcode, TypeBool(state), value, ConstantU32(state, constant));
+}
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter

@@ -126,10 +126,22 @@ static bool IsMultisampledTexture(Prospero::ImageType type) {
 	       type == Prospero::ImageType::kColor2DMsaaArray;
 }
 
+static bool SupportsFormattedStorageOffset(
+    const ShaderRecompiler::IR::BufferResource& resource) {
+	if (!resource.descriptor_formatted_only || !resource.formatted || resource.scalar ||
+	    resource.atomic) return false;
+	return true;
+}
+
+static bool SupportsScalarStorageOffset(const ShaderRecompiler::IR::BufferResource& resource) {
+	return resource.scalar && resource.read && !resource.written && !resource.atomic &&
+	       !resource.formatted;
+}
+
 static vk::DescriptorBufferInfo
 NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource& source,
                     const ShaderRecompiler::IR::BufferResource& resource, ShaderType stage,
-                    uint32_t slot, uint32_t& buffer_offset) {
+                    uint32_t slot, uint32_t& buffer_offset, uint32_t& buffer_limit) {
 	buffer_offset = 0;
 	buffer_limit  = 0;
 
@@ -148,7 +160,7 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	const auto adjustment     = offset - aligned_offset;
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
 	const bool byte_adjustment = adjustment % sizeof(uint32_t) != 0;
-	if ((byte_adjustment && !SupportsFormattedStorageOffset(descriptor, resource) &&
+	if ((byte_adjustment && !SupportsFormattedStorageOffset(resource) &&
 	     !SupportsScalarStorageOffset(resource)) ||
 	    adjustment >= 256 || adjustment > max_range || size > max_range - adjustment) {
 		EXIT("storage buffer offset adjustment is unsupported: stage=%u slot=%u guest=0x%016" PRIx64
@@ -156,7 +168,7 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 		     " alignment=0x%016" PRIx64 " aligned_offset=0x%016" PRIx64
 		     " adjustment=0x%016" PRIx64 " max_range=0x%016" PRIx64
 		     " formatted=%d descriptor_formatted_only=%d scalar=%d atomic=%d written=%d\n",
-		     static_cast<uint32_t>(stage), slot, address, requested_size, size,
+		     static_cast<uint32_t>(stage), slot, address, size, size,
 		     static_cast<uint64_t>(offset), static_cast<uint64_t>(alignment),
 		     static_cast<uint64_t>(aligned_offset), static_cast<uint64_t>(adjustment),
 		     static_cast<uint64_t>(max_range), resource.formatted,
@@ -173,7 +185,8 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 		     static_cast<uint64_t>(aligned_offset), buffer->Size());
 	}
 	buffer_offset = static_cast<uint32_t>(adjustment);
-	const vk::DescriptorBufferInfo result {buffer->Handle(), aligned_offset, size + adjustment};
+	buffer_limit = static_cast<uint32_t>(byte_limit);
+	const vk::DescriptorBufferInfo result {buffer->Handle(), aligned_offset, byte_limit + padding};
 	if (resource.written) {
 		context.GetTextureCache().InvalidateMemoryFromGPU(address, size);
 	}
@@ -552,7 +565,13 @@ static bool TextureViewPreservesMipLayout(const TileSurfaceDescription& descript
 	                  std::begin(view.mips));
 }
 
-TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
+struct NormalizedTextureDescriptor {
+ ShaderTextureResource descriptor;
+ TextureCache::ImageDesc desc;
+ bool shader_conversion = false;
+};
+
+static NormalizedTextureDescriptor NormalizeTextureDescriptor(const ShaderRecompiler::IR::ImageResource&   resource,
                                               const ShaderRecompiler::IR::DescriptorValue& value) {
 	auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
 	const bool storage = resource.written;
@@ -789,7 +808,7 @@ static void ValidateImmutableSrtWriteAliases(
 	std::vector<GuestRange> reads;
 	for (const auto* stage: stages) {
 		EXIT_IF(stage == nullptr || !*stage);
-		for (const auto& source: stage->resources.immutable_srt_ranges) {
+		for (const auto& source: stage->resources->immutable_srt_ranges) {
 			const GuestRange range {source.address, source.size};
 			if (!range.Valid()) {
 				EXIT("immutable SRT snapshot has an invalid range: address=0x%016" PRIx64
@@ -809,8 +828,8 @@ static void ValidateImmutableSrtWriteAliases(
 			EXIT("immutable SRT snapshot requires compute without DMA writes: stage=%u dma_write=%d\n",
 			     static_cast<uint32_t>(stage->program->stage), info.writes_dma);
 		}
-		if (stage->resources.buffers.size() != info.buffers.size() ||
-		    stage->resources.images.size() != info.images.size()) {
+		if (stage->resources->buffers.size() != info.buffers.size() ||
+		    stage->resources->images.size() != info.images.size()) {
 			EXIT("immutable SRT snapshot resource counts disagree\n");
 		}
 	}
@@ -841,7 +860,7 @@ static void ValidateImmutableSrtWriteAliases(
 				continue;
 			}
 			resource.written = true; // An atomic access has the storage write footprint too.
-			const auto normalized = NormalizeTextureDescriptor(resource, stage->resources.images[index]);
+			const auto normalized = NormalizeTextureDescriptor(resource, stage->resources->images[index]);
 			if (!normalized.descriptor.IsNull()) {
 				// This is the same full padded allocation (all mips/layers/depth)
 				// ResolveTexture will expose, not merely its selected view texels.
@@ -853,7 +872,7 @@ static void ValidateImmutableSrtWriteAliases(
 			if (!resource.written && !resource.atomic) {
 				continue;
 			}
-			const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(stage->resources.buffers[index]);
+			const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(stage->resources->buffers[index]);
 			const uint64_t address = descriptor.Base48();
 			const uint64_t stride = descriptor.Stride();
 			const uint64_t records = descriptor.NumRecords();
@@ -877,14 +896,14 @@ static void ValidateSampledHtileWriteAliases(
 	for (const auto* stage: stages) {
 		EXIT_IF(stage == nullptr || !*stage);
 		const auto& images = stage->program->info.images;
-		EXIT_IF(stage->resources.images.size() != images.size());
+		EXIT_IF(stage->resources->images.size() != images.size());
 		for (uint32_t index = 0; index < images.size(); ++index) {
 			const auto& image = images[index];
 			if (!image.read || image.written || image.atomic ||
 			    image.numeric_class != Prospero::TextureNumericClass::Float) {
 				continue;
 			}
-			auto normalized = NormalizeTextureDescriptor(image, stage->resources.images[index]);
+			auto normalized = NormalizeTextureDescriptor(image, stage->resources->images[index]);
 			if (NormalizeSampledHtileRead(image, normalized)) {
 				reads.push_back({normalized.desc.info.data, normalized.desc.info.metadata.range});
 			}
@@ -915,18 +934,18 @@ static void ValidateSampledHtileWriteAliases(
 			if (!image.written && !image.atomic) {
 				continue;
 			}
-			const auto normalized = NormalizeTextureDescriptor(image, stage->resources.images[index]);
+			const auto normalized = NormalizeTextureDescriptor(image, stage->resources->images[index]);
 			if (!normalized.descriptor.IsNull()) {
 				validate_write(normalized.desc.info.data);
 			}
 		}
-		EXIT_IF(stage->resources.buffers.size() != info.buffers.size());
+		EXIT_IF(stage->resources->buffers.size() != info.buffers.size());
 		for (uint32_t index = 0; index < info.buffers.size(); ++index) {
 			if (!info.buffers[index].written && !info.buffers[index].atomic) {
 				continue;
 			}
 			const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(
-			    stage->resources.buffers[index]);
+			    stage->resources->buffers[index]);
 			const uint64_t address = descriptor.Base48();
 			const uint64_t records = descriptor.NumRecords();
 			const uint64_t stride = descriptor.Stride();
@@ -948,7 +967,7 @@ static void ValidateComparisonStorageAliases(
 	for (const auto* stage: stages) {
 		EXIT_IF(stage == nullptr || !*stage);
 		const auto& images = stage->program->info.images;
-		EXIT_IF(stage->resources.images.size() != images.size());
+		EXIT_IF(stage->resources->images.size() != images.size());
 		for (const auto& image: images) {
 			has_comparison |= image.depth_compare;
 			has_write |= image.written || image.atomic;
@@ -978,7 +997,7 @@ static void ValidateComparisonStorageAliases(
 			// that ResolveTexture will hand to the cache. Do not compare only
 			// base-address equality or the shader's selected view rectangle.
 			const auto normalized = NormalizeTextureDescriptor(
-			    image, stage->resources.images[index]);
+			    image, stage->resources->images[index]);
 			if (normalized.descriptor.IsNull()) {
 				continue;
 			}
@@ -1053,7 +1072,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		if (storage) {
 			EXIT("depth target cannot be bound as a storage image\n");
 		}
-		ValidateSampledDepthBinding(resource, descriptor, *image, pixel_format, size.size);
+		ValidateSampledDepthBinding(resource, descriptor, *image, pixel_format, desc.info.data.size);
 	} else if (storage) {
 		ValidateStorageColorView(image->info.pixel_format, view_format, descriptor.DstSelXYZW());
 	} else {
@@ -1168,7 +1187,7 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 		auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[i]);
 		const auto address = descriptor.Base48();
-		const auto requested_size = descriptor.GetSize();
+		const auto requested_size = program.info.buffers[i].LimitDescriptorSize(descriptor.Stride(), descriptor.GetSize());
 		if (address == 0 || requested_size == 0) {
 			prepared.buffer_sources.push_back({});
 			continue;
@@ -1198,9 +1217,10 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	};
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 		uint32_t buffer_offset = 0;
+		uint32_t buffer_limit = 0;
 		prepared.buffers.push_back(NativeStorageBuffer(m_context, prepared.buffer_sources[i],
 		                                               program.info.buffers[i], program.stage, i,
-		                                               buffer_offset));
+		                                               buffer_offset, buffer_limit));
 		pack_memory_offset(i, buffer_offset);
 		prepared.shader_data[layout.memory_limit_dword + i] = buffer_limit;
 	}

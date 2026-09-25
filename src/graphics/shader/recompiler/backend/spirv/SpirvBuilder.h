@@ -89,6 +89,16 @@ public:
 
 	[[nodiscard]] std::vector<uint32_t> Build() const;
 
+	void AddFunction(std::initializer_list<uint32_t> words) { AddFunction(std::span<const uint32_t>(words.begin(), words.size())); }
+	uint32_t Type(uint32_t opcode, std::initializer_list<uint32_t> operands) { return Type(static_cast<spv::Op>(opcode), std::span<const uint32_t>(operands.begin(), operands.size())); }
+	uint32_t Constant(uint32_t opcode, uint32_t type, std::initializer_list<uint32_t> operands) { return Constant(static_cast<spv::Op>(opcode), type, std::span<const uint32_t>(operands.begin(), operands.size())); }
+	void AddFunction(uint32_t opcode, std::initializer_list<uint32_t> operands) { AddFunction(static_cast<spv::Op>(opcode), std::span<const uint32_t>(operands.begin(), operands.size())); }
+	void AddAnnotation(uint32_t opcode, std::initializer_list<uint32_t> operands) { AddAnnotation(static_cast<spv::Op>(opcode), std::span<const uint32_t>(operands.begin(), operands.size())); }
+	void AddAnnotation(std::initializer_list<uint32_t> words) { AddAnnotation(static_cast<spv::Op>(*words.begin()), std::span<const uint32_t>(words.begin()+1, words.size()-1)); }
+	void RequireCapability(uint32_t capability) { RequireCapability(static_cast<spv::Capability>(capability)); }
+	uint32_t DefineGlobalVariable(uint32_t pointer_type, uint32_t storage_class) { return DefineGlobalVariable(pointer_type, static_cast<spv::StorageClass>(storage_class)); }
+	void DefineGlobalVariable(uint32_t id, uint32_t pointer_type, uint32_t storage_class) { DefineGlobalVariable(id, pointer_type, static_cast<spv::StorageClass>(storage_class)); }
+
 private:
 	static void AppendOperand(std::vector<uint32_t>& words, uint32_t value) {
 		words.push_back(value);

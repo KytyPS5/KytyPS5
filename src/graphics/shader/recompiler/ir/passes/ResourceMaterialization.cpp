@@ -1426,14 +1426,30 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& i
 	    input_runtime.read_specialization_memory == nullptr) {
 		return SpecializationFail("coherent specialization memory reader is unavailable");
 	}
+	const auto clean_runtime = CleanRuntime(runtime);
+	SrtWalker clean(program, clean_runtime);
+	SrtWalker walker(program, runtime, program.clean_flat_slots, &clean);
 	std::vector<DescriptorValue> values;
-	std::vector<uint32_t>        flattened_srt;
-	if (!EvaluateRuntimeSources(program, program.materialization_sources, runtime, values,
-	                            flattened_srt, program.clean_flat_slots)) {
-		return SpecializationFail("runtime descriptor/SRT evaluation failed");
+	values.reserve(program.materialization_sources.size());
+	for (const auto source : program.materialization_sources) {
+		DescriptorValue value;
+		if (!walker.EvaluateDescriptor(source, value))
+			return SpecializationFail("runtime descriptor evaluation failed");
+		values.push_back(value);
 	}
-
-	auto& next   = snapshot.resources;
+	std::vector<uint32_t> flattened_srt;
+	if (!walker.RefreshFlatBuffer(flattened_srt))
+		return SpecializationFail("runtime SRT evaluation failed");
+	auto& next = snapshot.resources;
+	const auto& fill = program.uniform_fill;
+	std::array<uint32_t, 4> stored {};
+	bool uniform_fill = fill.fill.words != 0;
+	for (uint32_t i = 0; i < fill.fill.words && uniform_fill; ++i)
+		uniform_fill = clean.Evaluate(fill.values[i], stored[i]) && stored[i] == stored[0];
+	if (uniform_fill) {
+		next.uniform_fill = fill.fill;
+		next.uniform_fill.value = stored[0];
+	}
 	auto  cursor = values.begin();
 	next.buffers.resize(program.info.buffers.size());
 	snapshot.inline_buffers.resize(program.info.buffers.size());
@@ -1521,8 +1537,6 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& i
 			}
 		} else if (source != nullptr && source->indirect_image.has_value()) {
 			const auto& indirect = *source->indirect_image;
-			const auto clean_runtime = CleanRuntime(runtime);
-			SrtWalker clean(program, clean_runtime);
 			DescriptorValue material, heap;
 			if ((indirect.material_source != UINT32_MAX &&
 			     !clean.EvaluateDescriptor(indirect.material_source, material)) ||
@@ -1920,7 +1934,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 			      !root_info.depth_compare) ||
 			     heterogeneous_storage_write);
 			const bool heterogeneous_dimension =
-			    image.dimension != image_class.dimension &&
+			    (image.dimension != image_class.dimension || image.cube != image_class.cube) &&
 			    ((root_info.resource_class == ImageResourceClass::Sampled &&
 			      !root_info.depth_compare) ||
 			     heterogeneous_storage_write);
@@ -1942,7 +1956,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 			    image.conversion_format != image_class.conversion_format ||
 			    (image.shader_swizzle != image_class.shader_swizzle &&
 			     !heterogeneous_view_swizzle) ||
-			    image.cube != image_class.cube ||
+			    (image.cube != image_class.cube && !heterogeneous_dimension) ||
 			    image.needs_manual_depth_compare != image_class.needs_manual_depth_compare) {
 				return SpecializationFail(
 				    fmt::format(
@@ -2030,8 +2044,10 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 	if (!ValidateSnapshotBufferWrites(program, runtime, next_snapshot, next_specialization)) {
 		return false;
 	}
-	specialization       = std::move(next_specialization);
-	specialized_snapshot = std::move(next_snapshot);
+	ImageRemap(next_specialization).Apply(next_snapshot.images);
+	// Commit only after validation; copy assignment reuses same-shape output capacity.
+	specialization       = next_specialization;
+	specialized_snapshot = next_snapshot;
 	return true;
 }
 
@@ -2332,6 +2348,10 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		auto& target          = plan.descriptor_sources.emplace_back();
 		target.dword_count    = source.dword_count;
 		target.indirect_image = source.indirect_image;
+		if (target.indirect_image.has_value()) {
+			target.indirect_image->key_count = Clone(target.indirect_image->key_count);
+			target.indirect_image->selector_mask = Clone(target.indirect_image->selector_mask);
+		}
 		target.inline_descriptor = source.inline_descriptor;
 		target.bounded_buffer = source.bounded_buffer;
 		target.bounded_image = source.bounded_image;
@@ -2344,6 +2364,11 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	for (const auto& read: program.srt_reads) {
 		plan.srt_reads.push_back({Clone(read.value), read.flat_offset});
 	}
+	plan.control_flow = ResourceControlFlow(program);
+	for (auto& block : plan.control_flow) block.condition = Clone(block.condition);
+	plan.uniform_fill = AnalyzeUniformFill(program);
+	for (uint32_t i = 0; i < plan.uniform_fill.fill.words; ++i)
+		plan.uniform_fill.values[i] = Clone(plan.uniform_fill.values[i]);
 	plan.materialization_sources.reserve(plan.info.buffers.size() + plan.info.images.size() +
 	                                     plan.info.samplers.size());
 	for (const auto& buffer: plan.info.buffers) {
@@ -2616,6 +2641,36 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 			        inst.GetOpcode() != ValueOpcode::ImageWrite);
 		}
 	}
+	const ImageRemap image_remap(specialization);
+	for (auto* block: program.blocks) {
+		for (auto& inst: *block) {
+			if (inst.GetOpcode() == ValueOpcode::GetImageResource) {
+				inst.SetFlags(image_remap[inst.Flags<uint32_t>()]);
+			}
+		}
+	}
+	for (auto& memory: memory_info) {
+		if (memory.kind == ResourceKind::Image && !memory.planning_only) {
+			memory.resource = image_remap[memory.resource];
+		}
+	}
+	for (auto& buffer: buffers) {
+		if (buffer.image_alias != BufferResource::NoImageAlias) {
+			buffer.image_alias = image_remap[buffer.image_alias];
+		}
+	}
+	for (auto& pair: sampled_pairs) {
+		pair.image = image_remap[pair.image];
+	}
+	for (auto& image: images) {
+		if (image.indirect_root != ImageResource::NoIndirectImage) {
+			image.indirect_root = image_remap[image.indirect_root];
+		}
+		for (auto& resource: image.indirect_resources) {
+			resource = image_remap[resource];
+		}
+	}
+	image_remap.Apply(images);
 	program.info.bounded_srt_reads = specialization.bounded_srt_reads;
 	program.info.buffer_tables = specialization.buffer_tables;
 	program.info.buffers       = std::move(buffers);

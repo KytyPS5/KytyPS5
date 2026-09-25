@@ -301,4 +301,21 @@ inline constexpr auto EmitSetVccHi                   = EmitUnreachable;
 inline constexpr auto EmitGetM0                      = EmitUnreachable;
 inline constexpr auto EmitSetM0                      = EmitUnreachable;
 
+void EmitFPAbs64(ValueEmitContext& ctx, const IR::Inst& inst);
+void EmitFPNeg64(ValueEmitContext& ctx, const IR::Inst& inst);
+void EmitFPMul64(ValueEmitContext& ctx, const IR::Inst& inst);
+void EmitFPFma64(ValueEmitContext& ctx, const IR::Inst& inst);
+void EmitFPRecip64(ValueEmitContext& ctx, const IR::Inst& inst);
+void EmitConvertF32F64(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t EmitConvertF64S32(EmitterState& state, uint32_t source);
+uint32_t EmitConvertF64U32(EmitterState& state, uint32_t source);
+inline constexpr auto EmitCompositeConstructF64 = EmitCompositeConstructU64;
+inline constexpr auto EmitCompositeExtractF64 = EmitCompositeExtractU64;
+void EmitDpp8MoveU32(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t EmitDpp8UpdateU32(EmitterState& state, uint32_t value, uint32_t previous, uint32_t active);
+uint32_t EmitReadBoundedSrtU32(ValueEmitContext& ctx, const IR::Inst& inst);
+void EmitSharedAtomicIAdd64(ValueEmitContext& ctx, const IR::Inst& inst);
+void EmitSharedAtomicOr64(ValueEmitContext& ctx, const IR::Inst& inst);
+inline constexpr auto EmitImageAtomicFMin32 = EmitImage;
+inline constexpr auto EmitImageAtomicFMax32 = EmitImage;
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter

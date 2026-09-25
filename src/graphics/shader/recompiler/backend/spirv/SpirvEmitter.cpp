@@ -246,9 +246,9 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 				if (memory.kind == IR::ResourceKind::IndirectBuffer) {
 					requirements.subgroup_local_invocation_id = true;
 				}
-				if (memory.kind == IR::ResourceKind::Buffer) {
+				const auto inspect_candidate = [&](uint32_t resource) {
 					requirements.coherent_buffers |= memory.coherent;
-					if (memory.resource >= program.info.buffers.size()) {
+					if (resource >= program.info.buffers.size()) {
 						Fail(program, "buffer operation has invalid resource metadata");
 					}
 					if (IR::BufferAccessOf(inst.GetOpcode()) == IR::BufferAccess::Atomic &&
@@ -363,6 +363,8 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 	return requirements;
 }
 
+void CollectSpirvRequirements(IR::Program& program) { program.spirv_requirements = Emitter::AnalyzeProgramRequirements(program); }
+
 std::vector<uint32_t> EmitProgram(const IR::Program& program, ShaderStageInputInfo input_info,
                                   const ComputeWorkgroupLimits& compute_workgroup_limits,
                                   const ShaderHostProfile& host_profile,
@@ -393,10 +395,20 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program, ShaderStageInputIn
 	if (!f64.error.empty()) {
 		Fail(program, f64.error.c_str());
 	}
-	EmitterState state(program, input_info);
+	EmitterState state(program, input_info, specialization);
+	state.f64_certificate = f64;
+	state.stage = program.stage;
+	state.wave_size = program.wave_size;
+	state.native_subgroup_size = compute_workgroup_limits.native_subgroup_size;
+	if (program.stage == ShaderType::Compute) {
+		state.compute_execution = PlanComputeExecution(program, input_info, compute_workgroup_limits);
+		if (!state.compute_execution.error.empty()) Fail(program, state.compute_execution.error.c_str());
+		state.compute_workgroup = state.compute_execution.layout;
+	}
 	const auto* workgroup = ShaderWorkgroupInput(program.stage, input_info);
 	state.lane_count =
-	    workgroup != nullptr && program.wave_size == 64u && workgroup->host_subgroup_size == 32u
+	    !state.compute_execution.IsSplitWave64() && workgroup != nullptr &&
+	    program.wave_size == 64u && workgroup->host_subgroup_size == 32u
 	        ? 2u
 	        : 1u;
 	DefineModule(state);

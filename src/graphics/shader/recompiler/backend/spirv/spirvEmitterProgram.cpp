@@ -192,7 +192,24 @@ uint32_t BranchCondition(ValueEmitContext& ctx, const IR::BlockInfo& info) {
 	return result;
 }
 
-void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
+uint32_t EmitGraphicsLoopWithinBudget(ValueEmitContext& ctx) {
+	auto& state = ctx.state;
+	EXIT_IF(state.graphics_loop_counter_variable == 0);
+	constexpr uint32_t MaxGraphicsLoopIterations = 256;
+	const auto counter = state.builder.AllocateId();
+	const auto within  = state.builder.AllocateId();
+	const auto next    = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {OpLoad, TypeU32(state), counter, state.graphics_loop_counter_variable});
+	state.builder.AddFunction({OpULessThan, TypeBool(state), within, counter,
+	                           ConstantU32(state, MaxGraphicsLoopIterations)});
+	state.builder.AddFunction(
+	    {OpIAdd, TypeU32(state), next, counter, ConstantU32(state, 1)});
+	state.builder.AddFunction({OpStore, state.graphics_loop_counter_variable, next});
+	return within;
+}
+
+void EmitStructuredTerminator(ValueEmitContext& ctx, StructuredFunctionState& structured, const IR::Block* block,
                               const IR::BlockInfo& info) {
 	const auto& program = ctx.state.program;
 	const auto& term       = info.terminator;
@@ -228,6 +245,10 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
 				merge  = loop->second.second;
 			}
 			emit_merge();
+			if (within != 0) {
+			 ctx.state.builder.AddFunction(spv::OpBranchConditional, within, ctx.Label(target), ctx.Label(merge));
+			 return;
+			}
 			ctx.state.builder.AddFunction(spv::OpBranch, ctx.Label(target));
 			return;
 		}
@@ -238,7 +259,27 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
 				EmitReturn(ctx);
 				return;
 			}
-			const auto condition = BranchCondition(ctx, info);
+			auto condition = BranchCondition(ctx, info);
+			if (const auto loop = structured.budgeted_loop_continues.find(block);
+			    loop != structured.budgeted_loop_continues.end()) {
+				const auto* header = loop->second.first;
+				const auto* merge  = loop->second.second;
+				const auto  within = EmitGraphicsLoopWithinBudget(ctx);
+				if (true_block == header && false_block == merge) {
+					const auto guarded = ctx.state.builder.AllocateId();
+					ctx.state.builder.AddFunction(
+					    {OpLogicalAnd, TypeBool(ctx.state), guarded, condition, within});
+					condition = guarded;
+				} else if (true_block == merge && false_block == header) {
+					const auto outside = ctx.state.builder.AllocateId();
+					ctx.state.builder.AddFunction(
+					    {OpLogicalNot, TypeBool(ctx.state), outside, within});
+					const auto guarded = ctx.state.builder.AllocateId();
+					ctx.state.builder.AddFunction(
+					    {OpLogicalOr, TypeBool(ctx.state), guarded, condition, outside});
+					condition = guarded;
+				}
+			}
 			emit_merge();
 			ctx.state.builder.AddFunction(spv::OpBranchConditional, condition,
 			                              ctx.Label(true_block), ctx.Label(false_block));
@@ -347,11 +388,64 @@ void Invoke(Return (*emit)(Context&, Args...), ValueEmitContext& ctx, const IR::
 void EmitDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
 	switch (inst.GetOpcode()) {
 #define VALUE_OPCODE(name, ...)                                                                    \
-	case IR::ValueOpcode::name: return Invoke(Emit##name, ctx, inst);
+	case IR::ValueOpcode::name: Invoke(Emit##name, ctx, inst); break;
 #include "graphics/shader/recompiler/ir/opcodes/ValueOpcodes.inc"
 #undef VALUE_OPCODE
 		default: ctx.Fail(inst, "has no direct SPIR-V emitter");
 	}
+		const auto shared_access = IR::SharedAccessOf(inst.GetOpcode());
+		const auto buffer_access = IR::BufferAccessOf(inst.GetOpcode());
+		const auto address_access = IR::AddressOpcodeInfoOf(inst.GetOpcode()).access;
+		const auto image_access = IR::ImageOpcodeInfoOf(inst.GetOpcode()).access;
+		if (ctx.state.compute_execution.IsSplitWave64() &&
+		    !ctx.state.compute_execution.IsCooperativeWave64() &&
+		    shared_access != IR::SharedAccess::None) {
+			// The planner admits LDS only when one complete guest wave remains
+			// one host workgroup and every branch is wave-uniform. Finish each
+			// DS instruction across both native halves, including reads before
+			// a later overwrite. EXEC and bounds guards have merged at this point,
+			// so inactive lanes also reach the barrier. Guest LDS and collective
+			// scratch are distinct Workgroup variables covered by these semantics.
+			auto& state = ctx.state;
+			state.builder.AddFunction({OpControlBarrier, ConstantU32(state, ScopeWorkgroup),
+			                           ConstantU32(state, ScopeWorkgroup), ConstantU32(state,
+			                           MemorySemanticsAcquireRelease | MemorySemanticsWorkgroupMemory)});
+		}
+		bool planning_only = false;
+		if (inst.GetOpcode() == IR::ValueOpcode::LoadAddressU32 ||
+		    inst.GetOpcode() == IR::ValueOpcode::ReadConstBuffer) {
+			const auto index = inst.Flags<IR::MemoryFlags>().index;
+			planning_only = index < ctx.state.program.memory_info.size() &&
+			                ctx.state.program.memory_info[index].planning_only;
+		}
+		// Sampled fetches and other reads consume already-published values.
+		// Attaching ImageMemory control barriers to OpImageFetch inside loops
+		// is not required for split-half write→read order and aborts some
+		// native32 compilers. Rendezvous only after operations that publish.
+		const bool publishes_external =
+		    buffer_access == IR::BufferAccess::Write ||
+		    buffer_access == IR::BufferAccess::Atomic ||
+		    address_access == IR::AddressAccess::Write ||
+		    image_access == IR::ImageAccess::Write ||
+		    image_access == IR::ImageAccess::Atomic;
+		if (ctx.state.compute_execution.SynchronizesSplitWaveMemory() &&
+		    publishes_external && !planning_only) {
+			auto& state = ctx.state;
+			uint32_t semantics = MemorySemanticsAcquireRelease;
+			if (buffer_access == IR::BufferAccess::Write ||
+			    buffer_access == IR::BufferAccess::Atomic ||
+			    address_access == IR::AddressAccess::Write) {
+				semantics |= MemorySemanticsUniformMemory;
+			}
+			if (image_access == IR::ImageAccess::Write ||
+			    image_access == IR::ImageAccess::Atomic) {
+				semantics |= MemorySemanticsImageMemory;
+			}
+			state.builder.AddFunction({OpControlBarrier, ConstantU32(state, ScopeWorkgroup),
+			                           ConstantU32(state, ScopeDevice),
+			                           ConstantU32(state, semantics)});
+		}
+
 }
 
 void EmitStructuredInstruction(ValueEmitContext& ctx, StructuredFunctionState& structured,
@@ -437,6 +531,21 @@ void PatchStructuredPhis(ValueEmitContext& ctx, StructuredFunctionState& structu
 void EmitStructuredFunction(ValueEmitContext& ctx) {
 	const auto& program = ctx.state.program;
 	StructuredFunctionState structured;
+	for (size_t index = 0; index < ctx.program.blocks.size(); index++) {
+		const auto& info = ctx.program.block_info[index];
+		if (const auto* body = DedicatedContinueBody(ctx.program, ctx.program.blocks[index], info);
+		    body != nullptr) {
+			structured.dedicated_continues.insert(body);
+		}
+		if (ctx.state.graphics_loop_counter_variable != 0 && info.terminator.loop_header) {
+			const auto* header = ctx.program.blocks[index];
+			const auto* merge  = TargetBlock(ctx.program, info.terminator.merge_block);
+			const auto* cont   = TargetBlock(ctx.program, info.terminator.continue_block);
+			if (merge != nullptr && cont != nullptr) {
+				structured.budgeted_loop_continues.emplace(cont, std::pair {header, merge});
+			}
+		}
+	}
 	ctx.state.builder.AddFunction(spv::OpBranch, ctx.Label(program.blocks.front()));
 	for (size_t index = 0; index < program.blocks.size(); index++) {
 		const auto* block = program.blocks[index];
@@ -455,7 +564,7 @@ void EmitStructuredFunction(ValueEmitContext& ctx) {
 		// Header Phis must name the actual back-edge label after the body and
 		// its generated selections, including a dedicated continue bridge when needed.
 		structured.block_exit_labels.emplace(block, ctx.state.current_label);
-		EmitStructuredTerminator(ctx, block, program.block_info[index]);
+		EmitStructuredTerminator(ctx, structured, block, program.block_info[index]);
 	}
 	PatchStructuredPhis(ctx, structured);
 }
@@ -557,6 +666,57 @@ uint32_t ValueEmitContext::Def(IR::Value value) {
 	if (inst == nullptr) {
 		Fail("direct SPIR-V emitter received a non-value argument");
 	}
+	if (cooperative_spills != nullptr) {
+		if (const auto slot = cooperative_spills->find(inst); slot != cooperative_spills->end()) {
+			if (cooperative_phase != 0 && cooperative_phases != nullptr) {
+				const auto phase  = cooperative_phases->find(inst);
+				const auto direct = definitions.find(inst);
+				if (phase != cooperative_phases->end() && phase->second == cooperative_phase &&
+				    direct != definitions.end()) {
+					return direct->second;
+				}
+			}
+			const auto type = TypeId(state, inst->GetType());
+			const auto loaded = state.builder.AllocateId();
+			state.builder.AddFunction({OpLoad, type, loaded, slot->second});
+			if (cooperative_collective_active == 0) return loaded;
+			// Other guest waves participate only in the physical rendezvous.
+			// Their uninitialized/stale private values must not affect even the
+			// temporary collective's control flow. No guest state is committed.
+			if (inst->GetType() == IR::Type::U32x2) {
+				std::array<uint32_t, 2> selected_words{};
+				for (uint32_t word = 0; word < 2; ++word) {
+					const auto raw = state.builder.AllocateId();
+					selected_words[word] = state.builder.AllocateId();
+					state.builder.AddFunction({OpCompositeExtract, TypeU32(state), raw, loaded, word});
+					state.builder.AddFunction({OpSelect, TypeU32(state), selected_words[word],
+					                           cooperative_collective_active, raw, ConstantU32(state, 0)});
+				}
+				const auto pair = state.builder.AllocateId();
+				state.builder.AddFunction({OpCompositeConstruct, type, pair, selected_words[0], selected_words[1]});
+				return pair;
+			}
+			uint32_t components = 1;
+			switch (inst->GetType()) {
+				case IR::Type::U64: case IR::Type::F64: case IR::Type::F32x2:
+					components = 2; break;
+				case IR::Type::U32x3: components = 3; break;
+				case IR::Type::U32x4: components = 4; break;
+				default: break;
+			}
+			uint32_t condition = cooperative_collective_active;
+			if (components != 1) {
+				condition = state.builder.AllocateId();
+				std::vector<uint32_t> words{OpCompositeConstruct, TypeBoolVector(state, components), condition};
+				words.insert(words.end(), components, cooperative_collective_active);
+				state.builder.AddFunction(words);
+			}
+			const auto selected = state.builder.AllocateId();
+			state.builder.AddFunction({OpSelect, type, selected, condition, loaded,
+			                           state.builder.Constant(spv::OpConstantNull, type)});
+			return selected;
+		}
+	}
 	if (dispatcher_spills != nullptr && state.current_block != nullptr &&
 	    inst->Parent() != state.current_block) {
 		if (const auto found = dispatcher_spills->find(inst); found != dispatcher_spills->end()) {
@@ -584,6 +744,7 @@ uint32_t ValueEmitContext::HalfArg(const IR::Inst& inst, size_t index, uint32_t 
 }
 
 uint32_t ValueEmitContext::Ballot(IR::Value predicate) {
+	if (state.compute_execution.IsSplitWave64()) return EmitWaveBallot(state, Def(predicate));
 	const auto ballot_type = TypeU32Vector(state, 4);
 	const auto scope       = ConstantU32(state, spv::ScopeSubgroup);
 	const auto low         = state.builder.AllocateId();
@@ -607,6 +768,7 @@ uint32_t ValueEmitContext::Ballot(IR::Value predicate) {
 }
 
 uint32_t ValueEmitContext::FirstLane(uint32_t ballot) {
+	if (state.compute_execution.IsSplitWave64()) return EmitWaveFindFirst(state, ballot);
 	if (other_half == nullptr) {
 		const auto result = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpGroupNonUniformBallotFindLSB, TypeU32(state), result,
@@ -633,6 +795,7 @@ uint32_t ValueEmitContext::FirstLane(uint32_t ballot) {
 }
 
 uint32_t ValueEmitContext::Shuffle(const IR::Inst& inst, size_t index, uint32_t lane) {
+	if (state.compute_execution.IsSplitWave64()) return EmitWaveReadLane(state, Arg(inst, index), lane);
 	const auto type  = TypeId(state, inst.Arg(index).GetType());
 	const auto scope = ConstantU32(state, spv::ScopeSubgroup);
 	const auto low   = state.builder.AllocateId();
@@ -729,6 +892,7 @@ void EmitProgram(EmitterState& state) {
 		high.half       = 1;
 	}
 	std::optional<DispatcherFunctionState> dispatcher;
+	std::optional<CooperativeFunctionState> cooperative;
 	if (state.program.stage == ShaderType::Pixel && state.requirements.pixel_valid_mask) {
 		state.pixel_valid_mask_variable = state.builder.AllocateId();
 		state.builder.AddName(state.pixel_valid_mask_variable, "pixel_valid_mask_active");
@@ -862,6 +1026,12 @@ void EmitProgram(EmitterState& state) {
 			                          lane.scratch_u32_variable, spv::StorageClassFunction);
 		}
 	}
+	if (state.graphics_loop_counter_variable != 0) {
+		state.builder.AddFunction(spv::OpVariable,
+		    TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
+		    state.graphics_loop_counter_variable, spv::StorageClassFunction);
+	}
+	if (cooperative) DeclareCooperativeFunctionVariables(ctx, *cooperative);
 	if (state.gds_variable != 0) {
 		state.gds_length = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpArrayLength, TypeU32(state), state.gds_length,
@@ -875,6 +1045,7 @@ void EmitProgram(EmitterState& state) {
 		state.builder.AddFunction(
 		    {OpStore, state.graphics_loop_counter_variable, ConstantU32(state, 0)});
 	}
+	if (state.compute_execution.IsSplitWave64()) EmitHostLocalInvocationIndex(state);
 	EmitMemoryOffsets(state);
 	if (program.blocks.empty()) {
 		EmitReturn(ctx);
@@ -890,5 +1061,7 @@ void EmitProgram(EmitterState& state) {
 		EmitMeshEntryPoint(state);
 	}
 }
+
+void EmitDirectValueInstruction(ValueEmitContext& ctx, const IR::Inst& inst) { EmitDirectInstruction(ctx, inst); }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter

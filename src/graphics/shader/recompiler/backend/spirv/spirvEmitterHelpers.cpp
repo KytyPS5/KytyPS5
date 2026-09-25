@@ -234,8 +234,12 @@ uint32_t EmitHostLocalInvocationIndex(EmitterState& state) {
 	if (variable == 0) {
 		return ConstantU32(state, 0);
 	}
-	const auto value = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, variable);
+	uint32_t value = state.host_local_invocation_index;
+	if (value == 0) {
+		value = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, variable);
+		if (state.compute_execution.IsSplitWave64()) state.host_local_invocation_index = value;
+	}
 	if (state.lane_count == 2) {
 		const auto wave_base =
 		    EmitBinaryU32(state, spv::OpBitwiseAnd, value, ConstantU32(state, ~31u));
@@ -311,4 +315,23 @@ uint32_t EmitBallotLaneActiveBool(EmitterState& state, uint32_t active_ballot, u
 	return ret;
 }
 
+uint32_t EmitLocalInvocationIndex(EmitterState& state) {
+	const auto local = EmitHostLocalInvocationIndex(state);
+	if (!state.compute_execution.IsSplitWave64() || state.compute_execution.wave_partition_factor == 1)
+		return local;
+	const auto variable = InputVariableForKind(state, IR::StageInputKind::WorkgroupId);
+	EXIT_IF(variable == 0);
+	const auto pointer = state.builder.AllocateId();
+	const auto host_group_x = state.builder.AllocateId();
+	state.builder.AddFunction({OpAccessChain, TypePointer(state, StorageClassInput, TypeU32(state)),
+	                           pointer, variable, ConstantU32(state, 0)});
+	state.builder.AddFunction({OpLoad, TypeU32(state), host_group_x, pointer});
+	const auto wave = EmitBinaryU32(state, OpUMod, host_group_x,
+	                                ConstantU32(state, state.compute_execution.wave_partition_factor));
+	const auto offset = EmitBinaryU32(state, OpIMul, wave, ConstantU32(state, 64));
+	return EmitBinaryU32(state, OpIAdd, offset, local);
+}
+
+
+uint32_t EmitTrueBool(EmitterState& state) { return ConstantBool(state, true); }
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter

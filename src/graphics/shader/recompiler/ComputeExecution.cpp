@@ -87,7 +87,7 @@ bool IsSupportedSplitOperation(O op) {
 		case O::GetUserData: case O::GetShaderBase: case O::GetBuiltin:
 		case O::UndefU1: case O::UndefU8: case O::UndefU16: case O::UndefU32: case O::UndefU64:
 		case O::LaneId: case O::Ballot: case O::ReadLane: case O::ReadFirstLane: case O::WriteLane:
-		case O::WqmMask: case O::DppMoveU32: case O::DppUpdateU32:
+		case O::WqmU64: case O::DppMoveU32: case O::DppUpdateU32:
 		case O::Dpp8MoveU32: case O::Dpp8UpdateU32: case O::Permlane16U32:
 		case O::SwizzleU32: case O::BpermuteU32: case O::DataAppend:
 		case O::ControlNop: case O::Waitcnt: case O::Barrier: return true;
@@ -101,7 +101,7 @@ bool HasWaveOperations(const IR::Program& program) {
 	for (const auto* block : program.blocks) for (const auto& inst : *block) {
 		switch (inst.GetOpcode()) {
 			case O::Ballot: case O::LaneId: case O::ReadLane: case O::ReadFirstLane:
-			case O::WriteLane: case O::WqmMask: case O::DppMoveU32: case O::DppUpdateU32:
+			case O::WriteLane: case O::WqmU64: case O::DppMoveU32: case O::DppUpdateU32:
 			case O::Dpp8MoveU32: case O::Dpp8UpdateU32: case O::Permlane16U32:
 			case O::SwizzleU32: case O::BpermuteU32: case O::DataAppend: case O::DataConsume: return true;
 			default: break;
@@ -563,7 +563,7 @@ std::string ProveSplitWaveConvergence(const IR::Program& program, bool partition
 						is_uniform &= uniform(inst->Arg(arg));
 				}
 			} else if (op == O::LaneId || op == O::DppMoveU32 || op == O::Dpp8MoveU32 ||
-			    op == O::Permlane16U32 || op == O::WriteLane || op == O::WqmMask ||
+			    op == O::Permlane16U32 || op == O::WriteLane || op == O::WqmU64 ||
 			    op == O::UndefU1 || op == O::UndefU8 || op == O::UndefU16 ||
 			    op == O::UndefU32 || op == O::UndefU64 || IsGuestRead(op) || IsGuestAtomic(op)) {
 				is_uniform = false;

@@ -17,12 +17,6 @@ struct Segment {
 	uint32_t barrier_successor = Finished;
 };
 
-uint32_t Binary(EmitterState& state, uint32_t opcode, uint32_t type, uint32_t lhs, uint32_t rhs) {
-	const auto id = state.builder.AllocateId();
-	state.builder.AddFunction({opcode, type, id, lhs, rhs});
-	return id;
-}
-
 uint32_t Select(EmitterState& state, uint32_t condition, uint32_t yes, uint32_t no) {
 	const auto id = state.builder.AllocateId();
 	state.builder.AddFunction({OpSelect, TypeU32(state), id, condition, yes, no});
@@ -62,7 +56,7 @@ void Guard(EmitterState& state, uint32_t active, Body&& body) {
 
 bool IsCollective(O op) {
 	switch (op) {
-		case O::Ballot: case O::ReadLane: case O::ReadFirstLane: case O::WqmMask:
+		case O::Ballot: case O::ReadLane: case O::ReadFirstLane: case O::WqmU64:
 		case O::DppMoveU32: case O::Dpp8MoveU32: case O::Permlane16U32:
 		case O::SwizzleU32: case O::BpermuteU32: return true;
 		default: return false;
@@ -279,7 +273,7 @@ CooperativeFunctionState PrepareCooperativeFunction(ValueEmitContext& ctx) {
 			// Opaque resource/address recipes are compile-time structures. Runtime
 			// values need Function storage only when a scheduler phase, CFG edge, or
 			// Phi assignment can separate their definition from a consumer.
-			if (ctx.TypeId(inst.GetType()) == 0) continue;
+			if (TypeId(ctx.state, inst.GetType()) == 0) continue;
 			if ((inst.GetOpcode() == O::LoadAddressU32 || inst.GetOpcode() == O::ReadConstBuffer) &&
 			    ctx.Memory(inst).planning_only) continue;
 			const auto phase = function.phases.find(&inst);
@@ -385,7 +379,7 @@ void DeclareCooperativeFunctionVariables(ValueEmitContext& ctx, const Cooperativ
 		if (const auto found = function.spills.find(&inst);
 		    found != function.spills.end() && declared.insert(found->second).second)
 			ctx.state.builder.AddFunction({OpVariable,
-			    TypePointer(ctx.state, StorageClassFunction, ctx.TypeId(inst.GetType())),
+			    TypePointer(ctx.state, StorageClassFunction, TypeId(ctx.state, inst.GetType())),
 			    found->second, StorageClassFunction});
 	}
 }

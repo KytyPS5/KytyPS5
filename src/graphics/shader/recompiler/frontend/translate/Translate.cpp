@@ -20,6 +20,11 @@ static IR::DppMoveFlags DppFlags(const Decoder::Operand& operand) {
 	};
 }
 
+IR::U1 Translator::MaskIsZero(IR::U32 low, IR::U32 high) {
+ const auto mask = program.wave_size == 64u ? ir.BitwiseOr(low, high) : low;
+ return ir.IEqual(mask, IR::U32(IR::Value(0u)));
+}
+
 const Decoder::Operand& Translator::SourceAt(const Decoder::Instruction& inst, uint32_t index) {
 	switch (index) {
 		case 0: return inst.src0;

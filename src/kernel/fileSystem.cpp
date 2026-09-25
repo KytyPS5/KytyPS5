@@ -4,6 +4,7 @@
 #include "common/common.h"
 #include "common/dateTime.h"
 #include "common/emulatorConfig.h"
+#include "common/exfatImage.h"
 #include "common/file.h"
 #include "common/hash.h"
 #include "common/logging/log.h"
@@ -346,6 +347,17 @@ std::filesystem::path MountPoints::ResolvePath(const std::string& mounted_name) 
 		}
 
 		const auto native_rel_path = Common::PathFromUtf8(rel_path);
+		if (Common::IsExfatImagePath(p.dir)) {
+			for (const auto& component: native_rel_path) {
+				if (component == "..") {
+					return p.dir / "__invalid_exfat_path__";
+				}
+			}
+			if (native_rel_path.is_absolute()) {
+				return p.dir / "__invalid_exfat_path__";
+			}
+			return p.dir / native_rel_path;
+		}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		if (HasWindowsForbiddenFilenameCharacter(rel_path)) {

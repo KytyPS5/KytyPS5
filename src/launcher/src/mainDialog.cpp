@@ -259,8 +259,8 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 		args << "--rd";
 	}
 
-	QString game = info.basedir;
-	if (!info.elf.isEmpty()) {
+	QString game = info.image_file.isEmpty() ? info.basedir : info.image_file;
+	if (info.image_file.isEmpty() && !info.elf.isEmpty()) {
 		game = QDir(info.basedir).filePath(info.elf);
 	}
 	args << "--game" << game;

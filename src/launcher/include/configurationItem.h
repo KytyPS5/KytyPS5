@@ -2,6 +2,8 @@
 #define CONFIGURATION_ITEM_H
 
 #include <QObject>
+#include <QIcon>
+#include <QString>
 #include <QTreeWidgetItem>
 
 #include <memory>
@@ -40,6 +42,9 @@ private:
 	QLabel*                        m_status_indicator = nullptr;
 	QWidget*                       m_status_widget    = nullptr;
 	QLineEdit*                     m_comment_edit     = nullptr;
+	QIcon                          m_image_icon;
+	QString                        m_image_icon_path;
+	bool                           m_image_icon_checked = false;
 };
 
 #endif // CONFIGURATION_ITEM_H

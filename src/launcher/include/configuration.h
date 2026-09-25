@@ -79,6 +79,7 @@ public:
 	QString    gameVersion; /* appVersion / contentVersion from sce_sys/param.json */
 	QString    firmwareVer; /* requiredSystemSoftwareVersion from sce_sys/param.json */
 	QString    basedir;     /* Game base directory */
+	QString    image_file;  /* Raw exFAT image, empty for extracted games */
 	QString    game_path;   /* Launcher-unique game path */
 	bool       custom_settings = false;
 	GameStatus game_status     = GameStatus::Unknown;
@@ -150,6 +151,7 @@ public:
 		gameVersion     = other.gameVersion;
 		firmwareVer     = other.firmwareVer;
 		basedir         = other.basedir;
+		image_file      = other.image_file;
 		game_path       = other.game_path;
 		custom_settings = other.custom_settings;
 		game_status     = other.game_status;
@@ -159,6 +161,7 @@ public:
 	void WriteSettings(QSettings* s) const {
 		KYTY_CFG_SET(name);
 		KYTY_CFG_SET(basedir);
+		KYTY_CFG_SET(image_file);
 		KYTY_CFG_SET(game_path);
 		KYTY_CFG_SET(custom_settings);
 		KYTY_CFG_SET(screen_resolution);
@@ -194,6 +197,7 @@ public:
 	void ReadSettings(QSettings* s) {
 		KYTY_CFG_GET(name);
 		KYTY_CFG_GET(basedir);
+		image_file = s->value("image_file").toString();
 		KYTY_CFG_GET(game_path);
 		KYTY_CFG_GET(custom_settings);
 		KYTY_CFG_GET(screen_resolution);

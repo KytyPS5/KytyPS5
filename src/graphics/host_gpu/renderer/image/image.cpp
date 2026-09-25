@@ -320,9 +320,13 @@ void Image::CopyImage(Image& source) {
 	EXIT_IF(source.backing.samples != backing.samples);
 	m_scheduler.EndRendering();
 	const uint32_t levels     = std::min(source.backing.mip_levels, backing.mip_levels);
-	const uint32_t base_depth = backing.image_type == vk::ImageType::e3D
-	                                ? backing.extent.depth
-	                                : source.backing.extent.depth;
+	// Between two volumes copy only the depth both have: a volume can be replaced by a deeper one.
+	const uint32_t base_depth =
+	    backing.image_type == vk::ImageType::e3D
+	        ? (source.backing.image_type == vk::ImageType::e3D
+	               ? std::min(backing.extent.depth, source.backing.extent.depth)
+	               : backing.extent.depth)
+	        : source.backing.extent.depth;
 	const auto     source_aspect =
 	    FullAspectMask(source.backing.format) & ~vk::ImageAspectFlagBits::eStencil;
 	const auto destination_aspect =

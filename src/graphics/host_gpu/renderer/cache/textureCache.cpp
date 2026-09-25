@@ -828,6 +828,15 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		      requested.resources.layers == cached.info.resources.layers))) {
 			return {ExpandImage(requested, cached_id)};
 		}
+		// The same memory reused for a deeper volume (PPSA10595 stage load: a 3D texture growing
+		// from 9 MiB to 24 MiB with equal pitch, height, format and levels).
+		if (requested.IsVolume() && cached.info.IsVolume() &&
+		    requested.pixel_format == cached.info.pixel_format &&
+		    requested.resources == cached.info.resources &&
+		    requested.extent.depth > cached.info.extent.depth &&
+		    requested.data.size > cached.info.data.size) {
+			return {ExpandImage(requested, cached_id)};
+		}
 		if (requested.pixel_format != cached.info.pixel_format ||
 		    requested.data.size <= cached.info.data.size) {
 			const auto result_id = merged_id ? merged_id : cached_id;

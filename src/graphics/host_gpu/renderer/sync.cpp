@@ -168,9 +168,9 @@ uint64_t PrepareVideoOutFlip(CommandBuffer& buffer, int handle, int index, int f
 			return request_id;
 		}
 		if (result != VideoOut::VIDEO_OUT_ERROR_FLIP_QUEUE_FULL) {
-			EXIT("GPU flip submission failed, result=%d handle=%d index=%d mode=%d arg=%" PRId64
-			     "\n",
-			     result, handle, index, flip_mode, flip_arg);
+			EXIT("GPU flip submission failed, result=%d (0x%08" PRIx32
+			     ") handle=%d index=%d mode=%d arg=%" PRId64 "\n",
+			     result, static_cast<uint32_t>(result), handle, index, flip_mode, flip_arg);
 		}
 		video_out.WaitForSubmitSlot();
 	}

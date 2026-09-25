@@ -27,7 +27,8 @@ public:
 	[[nodiscard]] bool           IsGuestPaused() const noexcept;
 	[[nodiscard]] bool           NeedsSystemOverlayRefresh() const noexcept;
 	[[nodiscard]] RenderContext& Renderer() const noexcept;
-	void                         Present(Frame& frame, bool reuse = false);
+	void                         Present(Frame& frame, bool reuse = false,
+	                                     Frame* overlay = nullptr);
 	void                         Discard(Frame& frame);
 
 private:

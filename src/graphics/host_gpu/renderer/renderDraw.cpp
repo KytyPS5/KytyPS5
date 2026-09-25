@@ -709,9 +709,17 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 	for (uint32_t i = 0; i < merged_count; i++) {
 		auto& range = merged_ranges[i];
 		// PPSA20298
+		if (!Libs::LibKernel::Memory::IsSpanMapped(range.base_address, range.RequestedSize())) {
+			LOGF("\t unmapped vertex range: base=0x%016" PRIx64 " size=0x%" PRIx64 "\n",
+			     range.base_address, range.RequestedSize());
+		}
 		const auto size =
 		    Libs::LibKernel::Memory::ClampRangeSize(range.base_address, range.RequestedSize());
 		range.acquired_end = range.base_address + size;
+		if (size == 0) {
+			range.binding = {&cache.GetBuffer(NULL_BUFFER_ID), 0};
+			continue;
+		}
 		range.binding      = cache.ObtainBuffer(range.base_address, size, false);
 		SetVulkanObjectNameF(
 		    buffer.GetContext().GetGraphics().device, range.binding.first->Handle(),
@@ -740,8 +748,13 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 			                                       vertex.addr < value.acquired_end;
 		                                });
 		if (range == merged_ranges.begin() + merged_count) {
-			EXIT("vertex buffer address is outside the acquired range: addr=0x%016" PRIx64 "\n",
-			     vertex.addr);
+			if (null_buffer == nullptr) {
+				null_buffer = cache.GetBuffer(NULL_BUFFER_ID).Handle();
+			}
+			prepared.buffers[i] = null_buffer;
+			prepared.offsets[i] = 0;
+			prepared.sizes[i]   = 0;
+			continue;
 		}
 
 		prepared.buffers[i] = range->binding.first->Handle();

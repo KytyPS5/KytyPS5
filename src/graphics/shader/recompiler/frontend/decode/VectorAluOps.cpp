@@ -525,6 +525,8 @@ constexpr Vop1SdwaRule VOP1_SDWA_RULES[] = {
     {Opcode::V_NOT_B32, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), SdwaSelBytes() | SdwaSelWords(),
      SdwaSelFull(), false},
     {Opcode::V_FFBL_B32, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), 0, 0, false},
+    {Opcode::V_FFBH_U32, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), 0, 0, false},
+    {Opcode::V_FFBH_I32, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), 0, 0, false},
     {Opcode::V_CVT_F32_F16, SdwaSelWords() | SdwaSelFull(), 0, 0, true},
     {Opcode::V_CVT_F16_F32, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), SdwaSelWords(),
      SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), true},
@@ -1400,6 +1402,11 @@ bool HasUnsupportedNativeVop3Modifiers(Opcode opcode, bool permlane, bool mad_mi
 	}
 	switch (opcode) {
 		case Opcode::V_LDEXP_F32: return (abs & ~1u) != 0u || op_sel != 0u || (neg & ~1u) != 0u;
+		case Opcode::V_CUBEID_F32:
+		case Opcode::V_CUBESC_F32:
+		case Opcode::V_CUBETC_F32:
+		case Opcode::V_CUBEMA_F32:
+			return op_sel != 0u;
 		case Opcode::V_CNDMASK_B32:
 			return (abs & ~0x3u) != 0u || op_sel != 0u || clamp != 0u || omod != 0u ||
 			       (neg & ~0x3u) != 0u;

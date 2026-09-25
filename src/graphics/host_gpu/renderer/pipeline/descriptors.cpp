@@ -804,7 +804,16 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 			prepared.buffer_sources.push_back({});
 			continue;
 		}
+		if (!Libs::LibKernel::Memory::IsSpanMapped(address, requested_size)) {
+			LOGF("\t unmapped buffer descriptor: index=%u address=0x%016" PRIx64
+			     " requested_size=0x%" PRIx64 "\n",
+			     i, address, requested_size);
+		}
 		const auto size = Libs::LibKernel::Memory::ClampRangeSize(address, requested_size);
+		if (size == 0) {
+			prepared.buffer_sources.push_back({});
+			continue;
+		}
 		prepared.buffer_sources.push_back({address, size, cache.FindBuffer(address, size)});
 	}
 }

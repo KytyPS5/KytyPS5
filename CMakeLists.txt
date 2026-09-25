@@ -301,6 +301,7 @@ set(gpu_blit_generated_dir "${PROJECT_BINARY_DIR}/gpu_blit_shaders")
 set(gpu_blit_shader_sources
 	"${gpu_tiler_shader_dir}/gpu_blit_fs_triangle.vert"
 	"${gpu_tiler_shader_dir}/gpu_blit_color_to_ms_depth.frag"
+	"${gpu_tiler_shader_dir}/gpu_blit_texture_overlay.frag"
 )
 foreach(shader_source IN LISTS gpu_blit_shader_sources)
 	get_filename_component(shader_name "${shader_source}" NAME_WE)

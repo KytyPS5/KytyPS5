@@ -767,6 +767,11 @@ void BufferCache::RunGarbageCollector() {
 
 	std::vector<BufferId> dirty_buffers;
 	size_t                retire_count = 0;
+	// All downloads queued here share the 64 MiB staging buffer within one command buffer, so
+	// keep a round's total below it. Dirty buffers that do not fit stay cached for a later round
+	// (PPSA10595's stage load retired more than 64 MiB at once and exited).
+	constexpr uint64_t DownloadBudget = 48ull * 1024 * 1024;
+	uint64_t           download_bytes = 0;
 	m_lru_cache.ForEachItemBelow(tick - age, [&](BufferId id) {
 		auto& buffer = m_slot_buffers[id];
 		EXIT_IF(buffer.is_deleted);
@@ -777,6 +782,10 @@ void BufferCache::RunGarbageCollector() {
 			return false;
 		}
 		if (dirty) {
+			if (buffer.Size() > DownloadBudget - download_bytes) {
+				return false;
+			}
+			download_bytes += buffer.Size();
 			EXIT_IF(!DownloadBufferMemory(buffer, buffer.CpuAddress(), buffer.Size()));
 			dirty_buffers.push_back(id);
 		} else {

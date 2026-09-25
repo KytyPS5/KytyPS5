@@ -429,19 +429,28 @@ std::string ProveSplitWaveConvergence(const IR::Program& program, bool partition
 				if (op == O::DataAppend) cyclic_appends.push_back(&inst);
 			}
 			// A single complete guest wave remains one 64-invocation host workgroup.
-			// An acyclic device-buffer atomic therefore produces one lane-local old
-			// value exactly where the direct emitter defines it; native subgroup
+			// An acyclic device-buffer or LDS atomic therefore produces one lane-local
+			// old value exactly where the direct emitter defines it; native subgroup
 			// splitting does not duplicate or transfer that value between phases.
-			// Keep cyclic, partitioned, cooperative and LDS returns behind their
+			// Keep cyclic, partitioned, cooperative and GDS returns behind their
 			// separate ordering/publication proofs.
 			const bool direct_single_wave_buffer_atomic_return =
 			    !partitions_guest_workgroup && !cooperative && !cyclic.contains(block) &&
 			    IR::BufferAccessOf(op) == IR::BufferAccess::Atomic;
+			const auto shared_index = inst.Flags<IR::MemoryFlags>().index;
+			const bool direct_single_wave_lds_atomic_return =
+			    !partitions_guest_workgroup && !cooperative && !cyclic.contains(block) &&
+			    IR::SharedAccessOf(op) == IR::SharedAccess::Atomic &&
+			    IsSupportedSharedAtomic(op) &&
+			    shared_index < program.memory_info.size() &&
+			    program.memory_info[shared_index].kind == IR::ResourceKind::Lds;
 			const bool cooperative_image_atomic_return =
 			    cooperative && IR::ImageOpcodeInfoOf(op).access == IR::ImageAccess::Atomic;
-			if (!direct_single_wave_buffer_atomic_return && !cooperative_image_atomic_return &&
+			if (!direct_single_wave_buffer_atomic_return && !direct_single_wave_lds_atomic_return &&
+			    !cooperative_image_atomic_return &&
 			    (IsGuestAtomic(op) || IR::SharedAccessOf(op) == IR::SharedAccess::Atomic) && inst.HasUses())
-				return "wave64 splitting does not support live atomic return values";
+				return "wave64 splitting does not support live atomic return values for " +
+				       std::string(IR::ValueOpcodeName(op));
 		}
 	}
 	for (const auto& block : program.block_info) {

@@ -12798,7 +12798,11 @@ void TestComputeExecutionSingleWaveLds() {
       const auto plan = PlanComputeExecution(program,input,limits);
       // Multi-wave LDS/barriers now require a cooperative, unpartitioned
       // host group; all other rejected resource/control classes stay rejected.
-      const bool accepted = scenario == Scenario::Lds || scenario == Scenario::BarrierOnly;
+      // Acyclic LDS atomics with live returns match the single-wave buffer
+      // atomic contract: one host workgroup owns the whole guest wave.
+      const bool single_wave = WorkgroupInvocationCount(shape) == 64u;
+      const bool accepted = scenario == Scenario::Lds || scenario == Scenario::BarrierOnly ||
+                            (scenario == Scenario::LiveAtomic && single_wave);
       if (accepted) {
         Check(plan.error.empty() && plan.IsSplitWave64() && plan.wave_partition_factor == 1 &&
                   plan.layout.guest_size == shape &&
@@ -12855,6 +12859,85 @@ void TestComputeExecutionSingleWaveGdsAtomic() {
     } else {
       Check(!plan.error.empty() && !plan.IsSplitWave64(),
             "GDS atomic admission accepted a live return, multiwave use, or GDS read");
+    }
+  }
+}
+
+void TestComputeExecutionSingleWaveLdsAtomicReturn() {
+  using namespace ShaderRecompiler;
+  using O = IR::ValueOpcode;
+  const ComputeWorkgroupLimits limits{{1024, 1024, 64}, 1024, 32, false};
+  enum class Scenario { SingleWaveFlat, SingleWaveGrid, Multiwave, Cyclic };
+  for (const auto scenario :
+       {Scenario::SingleWaveFlat, Scenario::SingleWaveGrid, Scenario::Multiwave,
+        Scenario::Cyclic}) {
+    IR::Program program;
+    program.stage = ShaderType::Compute;
+    program.wave_size = 64;
+    auto* entry = AddExecutionPlanBlock(program);
+    auto* body = entry;
+    if (scenario == Scenario::Cyclic) {
+      body = AddExecutionPlanBlock(program);
+      auto* exit = AddExecutionPlanBlock(program);
+      entry->AddBranch(body);
+      program.block_info[0].terminator.kind = CFG::TerminatorKind::Branch;
+      program.block_info[0].terminator.true_block = 1;
+      body->AddBranch(body);
+      body->AddBranch(exit);
+      program.block_info[1].terminator.kind = CFG::TerminatorKind::ConditionalBranch;
+      program.block_info[1].terminator.true_block = 1;
+      program.block_info[1].terminator.false_block = 2;
+      program.block_info[1].terminator.loop_header = true;
+      auto& lane = entry->AppendNewInst(O::LaneId);
+      auto& cond = body->AppendNewInst(O::IEqual32, {IR::Value(&lane), IR::Value(0u)});
+      auto& ballot = body->AppendNewInst(O::Ballot, {IR::Value(&cond)});
+      auto& low = body->AppendNewInst(O::CompositeExtractU32x4,
+                                      {IR::Value(&ballot), IR::Value(0u)});
+      auto& uniform = body->AppendNewInst(O::INotEqual32, {IR::Value(&low), IR::Value(0u)});
+      program.block_info[1].condition = IR::Value(&uniform);
+    } else {
+      entry->AppendNewInst(O::Ballot, {IR::Value(true)});
+    }
+    IR::MemoryInfo memory{};
+    memory.kind = IR::ResourceKind::Lds;
+    program.memory_info.push_back(memory);
+    auto& atomic = body->AppendNewInst(O::SharedAtomicIAdd32,
+                                       {IR::Value(0u), IR::Value(1u), IR::Value(true)});
+    atomic.SetFlags(IR::MemoryFlags{.index = 0u, .pc = 0x228u});
+    body->AppendNewInst(O::ReferenceU32, {IR::Value(&atomic)});
+    IR::ValidateProgram(program, true);
+
+    ShaderComputeInputInfo compute{};
+    if (scenario == Scenario::SingleWaveGrid) {
+      compute.threads_num[0] = 8u;
+      compute.threads_num[1] = 8u;
+      compute.threads_num[2] = 1u;
+    } else if (scenario == Scenario::Multiwave) {
+      compute.threads_num[0] = 8u;
+      compute.threads_num[1] = 8u;
+      compute.threads_num[2] = 2u;
+    } else {
+      compute.threads_num[0] = 64u;
+      compute.threads_num[1] = compute.threads_num[2] = 1u;
+    }
+    compute.wave_size = 64u;
+    compute.lds_size_dwords = 64u;
+    ShaderStageInputInfo input{};
+    input.compute = &compute;
+    const auto plan = PlanComputeExecution(program, input, limits);
+    const bool accept = scenario == Scenario::SingleWaveFlat ||
+                        scenario == Scenario::SingleWaveGrid;
+    if (accept) {
+      Check(plan.error.empty() && plan.IsSplitWave64() && !plan.IsCooperativeWave64() &&
+                plan.wave_partition_factor == 1u,
+            "acyclic single-wave LDS atomic return lost its split-wave64 plan");
+    } else {
+      Check(!plan.error.empty(),
+            "LDS atomic return admission accepted a multiwave or cyclic use");
+      Check(std::string_view(plan.error).find("live atomic return") != std::string_view::npos ||
+                std::string_view(plan.error).find("cooperative") != std::string_view::npos ||
+                std::string_view(plan.error).find("shared") != std::string_view::npos,
+            "multiwave/cyclic LDS atomic return rejected for an unrelated reason");
     }
   }
 }
@@ -17939,6 +18022,12 @@ int main(int argc, char* argv[]) {
     std::puts("KYTY_SINGLE_WAVE64_GDS_ATOMIC_ADMISSION_PASS");
     return 0;
   }
+  if (argc == 2 &&
+      std::strcmp(argv[1], "--single-wave64-lds-atomic-return-only") == 0) {
+    Libs::Graphics::TestComputeExecutionSingleWaveLdsAtomicReturn();
+    std::puts("KYTY_SINGLE_WAVE64_LDS_ATOMIC_RETURN_PASS");
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--unused-f64-emission-only") == 0) {
     Libs::Graphics::TestUnusedNativeF64EmissionHasCompleteRequirements();
     return 0;
@@ -18171,6 +18260,7 @@ int main(int argc, char* argv[]) {
   TestCooperativeWave64AutomaticBufferCyclePromotion();
   TestComputeExecutionSingleWaveLds();
   TestComputeExecutionSingleWaveGdsAtomic();
+  TestComputeExecutionSingleWaveLdsAtomicReturn();
   TestComputeExecutionUnusedMemoryDeclarations();
   TestComputeExecutionRejectsActualStorageAndSynchronization();
   TestComputeExecutionDsLaneConvergence();

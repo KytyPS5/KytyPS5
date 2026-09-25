@@ -421,33 +421,62 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 		keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
 	} else {
 		ShaderBufferResource material;
-		if (!DecodeBufferDescriptor(material_value, material) || table_value.dword_count != 4u ||
-		    material.Stride() != indirect.selector_stride) {
+		if (!DecodeBufferDescriptor(material_value, material) ||
+		    (table_value.dword_count != 2u && table_value.dword_count != 4u) ||
+		    (!indirect.record_key && material.Stride() != indirect.selector_stride)) {
 			return false;
 		}
-		// Enumerate every wrapped scalar-buffer offset that can pass the descriptor bounds.
-		const auto step = std::gcd<uint64_t>(indirect.selector_stride, uint64_t {1} << 32u);
-		const auto residue = static_cast<uint64_t>(indirect.selector_offset) % step;
-		const auto limit = std::min<uint64_t>(UINT32_MAX, material.GetSize() + 3u);
-		const auto probe_count = residue <= limit ? (limit - residue) / step + 1u : 0u;
-		if (probe_count > MaxIndirectImageProbes) {
-			return false;
-		}
-		keys.reserve(static_cast<size_t>(probe_count) + 1u);
-		keys.push_back(0u);
-		for (uint64_t offset = residue; offset <= limit && probe_count != 0u; offset += step) {
-			uint32_t key = 0;
-			if (!ReadScalarTable(material.Base48(), material.GetSize(),
-			                     static_cast<uint32_t>(offset), runtime, {&key, 1})) {
+		if (indirect.record_key) {
+			const auto stride = material.Stride();
+			if (stride == 0u || material.SwizzleEnabled() || material.AddTid() ||
+			    material.IndexStride() != 0u || indirect.selector_offset > stride ||
+			    stride - indirect.selector_offset < 4u || material.GetSize() > UINT32_MAX) {
 				return false;
 			}
-			keys.push_back(key);
-			if (limit - offset < step) {
-				break;
+			// The 32-bit index multiplication can wrap into any offset in this residue class.
+			const auto step        = std::gcd<uint64_t>(stride, uint64_t {1} << 32u);
+			const auto residue     = static_cast<uint64_t>(indirect.selector_offset) % step;
+			const auto limit       = std::min<uint64_t>(UINT32_MAX, material.GetSize() + 3u);
+			const auto probe_count = residue <= limit ? (limit - residue) / step + 1u : 0u;
+			if (probe_count > MaxIndirectImageProbes) {
+				return false;
 			}
+			keys.reserve(static_cast<size_t>(probe_count) + 1u);
+			keys.push_back(0u); // Out-of-bounds buffer reads can select the zero key.
+			for (uint64_t index = 0; index < probe_count; index++) {
+				const auto offset = residue + index * step;
+				uint32_t   key    = 0;
+				if (!ReadScalarTable(material.Base48(), material.GetSize(),
+				                     static_cast<uint32_t>(offset), runtime, {&key, 1})) {
+					return false;
+				}
+				keys.push_back(key);
+			}
+			std::ranges::sort(keys);
+			keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+		} else {
+			// Enumerate every wrapped scalar-buffer offset that can pass the descriptor bounds.
+			const auto step = std::gcd<uint64_t>(indirect.selector_stride, uint64_t {1} << 32u);
+			const auto residue = static_cast<uint64_t>(indirect.selector_offset) % step;
+			const auto limit = std::min<uint64_t>(UINT32_MAX, material.GetSize() + 3u);
+			const auto probe_count = residue <= limit ? (limit - residue) / step + 1u : 0u;
+			if (probe_count > MaxIndirectImageProbes) {
+				return false;
+			}
+			keys.reserve(static_cast<size_t>(probe_count) + 1u);
+			keys.push_back(0u);
+			for (uint64_t index = 0; index < probe_count; index++) {
+				const auto offset = residue + index * step;
+				uint32_t   key    = 0;
+				if (!ReadScalarTable(material.Base48(), material.GetSize(),
+				                     static_cast<uint32_t>(offset), runtime, {&key, 1})) {
+					return false;
+				}
+				keys.push_back(key);
+			}
+			std::ranges::sort(keys);
+			keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
 		}
-		std::ranges::sort(keys);
-		keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
 	}
 
 	IndirectImage next;
@@ -1414,15 +1443,38 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& i
 	if (!program.resource_tracking_complete) {
 		return SpecializationFail("resource plan is incomplete");
 	}
+	const bool protected_image = std::ranges::any_of(program.info.images, [&](const auto& image) {
+		const auto* source = Source(program, image.source);
+		return source != nullptr && source->indirect_image.has_value() &&
+		       (!source->indirect_image->selector_mask.IsEmpty() ||
+		        source->indirect_image->record_key);
+	});
+	if (protected_image && (program.has_address_writes ||
+	                        std::ranges::any_of(program.info.images, &ImageResource::written))) {
+		return SpecializationFail(
+		    "protected indirect image conflicts with address or image writes");
+	}
+	const bool capture_reads =
+	    protected_image && std::ranges::any_of(program.info.buffers, &BufferResource::written);
 
 	SnapshotReader reader {input_runtime};
-	SrtRuntime runtime = input_runtime;
-	if (!program.bounded_srt_reads.empty()) {
+	auto&        reads = program.specialization_reads;
+	ReadCapture  capture {input_runtime, reads};
+	SrtRuntime   runtime = input_runtime;
+	if (capture_reads) {
+		reads.clear();
+		runtime.userdata                   = &capture;
+		runtime.read_specialization_memory = CaptureStrictRead;
+		if (runtime.read_memory != nullptr) {
+			runtime.read_memory = CaptureOrdinaryRead;
+		}
+	} else if (!program.bounded_srt_reads.empty()) {
 		runtime.userdata = &reader;
 		runtime.read_memory = SnapshotReader::Ordinary;
 		runtime.read_specialization_memory = SnapshotReader::Clean;
 	}
-	if ((program.requires_specialization_memory || !program.bounded_srt_reads.empty()) &&
+	if ((program.requires_specialization_memory || !program.bounded_srt_reads.empty() ||
+	     capture_reads) &&
 	    input_runtime.read_specialization_memory == nullptr) {
 		return SpecializationFail("coherent specialization memory reader is unavailable");
 	}
@@ -1472,6 +1524,20 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& i
 				return SpecializationFail("buffer materialization source list is incomplete");
 			}
 			next.buffers[index] = *cursor++;
+		}
+	}
+	if (capture_reads) {
+		for (uint32_t i = 0; i < program.info.buffers.size(); ++i) {
+			const auto& buffer = program.info.buffers[i];
+			if (!buffer.written) {
+				continue;
+			}
+			DescriptorValue strict;
+			if (!clean.EvaluateDescriptor(buffer.source, strict) ||
+			    strict != next.buffers[i]) {
+				return SpecializationFail(
+				    "written buffer descriptor changed under protected image capture");
+			}
 		}
 	}
 	next.flattened_srt = std::move(flattened_srt);
@@ -1616,6 +1682,10 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& i
 	}
 	if (!program.bounded_srt_reads.empty()) {
 		reader.Finish(next);
+	}
+	if (capture_reads && !WrittenBuffersDisjoint(program, next, reads)) {
+		return SpecializationFail(
+		    "written buffer aliases protected image specialization reads");
 	}
 	next.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
 	return true;

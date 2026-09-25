@@ -3,6 +3,20 @@
 Обновлено **25 сентября 2026 года**. Игра: **Ghost of Yōtei, PPSA26344**.
 Рабочая ветка — `yotei-windows-bringup` в локальном fork `fxpw/KytyPS5`.
 
+Checkpoint интеграции upstream PR #811 **25 сентября 2026 года**: конфликты с
+текущей архитектурой resource plan/materialization разрешены без потери
+`memory_limit_dword`, bounded SRT, cooperative wave64 и прочих локальных полей.
+В общую materialization перенесены address-backed / `record_key` probes, допуск
+таблицы pointer `dword_count==2` и защита `protected_image` (masked или
+`record_key`) с capture/alias-check для записываемых буферов. Селектор
+`--address-backed-indirect-only` (address-backed materialize, shared uniform
+loop index, buffer record image key) — **PASS**; логи
+`_Build/merge-validation-20260925/pr811-address-backed-green.*`. Полный
+`TestInvariantIndirectImageMaterialization` по-прежнему упирается в уже
+зафиксированный долг wrapped scalar immediate (`docs/emulator-test-debt.md`).
+Текущий игровой blocker `86da5eb7…` (address-backed **buffer** descriptor) этим
+PR не закрыт; новые rendered frames **PENDING**.
+
 Checkpoint buffer-table emitter **25 сентября 2026 года**, исходный код
 `2fa67d53` (native build выполнен до commit и имеет штамп `0e481ca-dirty`): существующий
 `--buffer-descriptor-loop-only` до исправления воспроизвёл отказ SPIR-V emitter

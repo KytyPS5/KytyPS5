@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
@@ -1005,6 +1006,143 @@ void PthreadDeleteStaticObjects(Loader::Program* program) {
 	pthread_static_objects->DeleteObjects(program);
 }
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+static DWORD_PTR GetHostAffinityFromGuestMask(KernelCpumask guest_mask) {
+	if (guest_mask == 0) {
+		return 0;
+	}
+
+	DWORD_PTR process_affinity = 0;
+	DWORD_PTR system_affinity  = 0;
+	if (GetProcessAffinityMask(GetCurrentProcess(), &process_affinity, &system_affinity) == 0 ||
+	    process_affinity == 0) {
+		SYSTEM_INFO sys_info;
+		GetSystemInfo(&sys_info);
+		DWORD num_cpus = sys_info.dwNumberOfProcessors;
+		process_affinity =
+		    (num_cpus >= sizeof(DWORD_PTR) * 8) ? ~DWORD_PTR(0) : ((DWORD_PTR(1) << num_cpus) - 1);
+	}
+
+	std::vector<int> host_cpus;
+	for (int i = 0; i < static_cast<int>(sizeof(DWORD_PTR) * 8); ++i) {
+		if ((process_affinity & (DWORD_PTR(1) << i)) != 0) {
+			host_cpus.push_back(i);
+		}
+	}
+
+	if (host_cpus.empty()) {
+		return process_affinity;
+	}
+
+	DWORD_PTR host_mask = 0;
+	for (int guest_cpu = 0; guest_cpu < 64; ++guest_cpu) {
+		if ((guest_mask & (KernelCpumask(1) << guest_cpu)) != 0) {
+			int mapped_host_cpu = host_cpus[guest_cpu % host_cpus.size()];
+			host_mask |= (DWORD_PTR(1) << mapped_host_cpu);
+		}
+	}
+
+	return host_mask != 0 ? host_mask : process_affinity;
+}
+
+static void ApplyHostThreadAffinity(Pthread thread) {
+	if (thread == nullptr || thread->attr == nullptr) {
+		return;
+	}
+
+	KernelCpumask guest_mask = thread->attr->affinity;
+	if (guest_mask == 0) {
+		return;
+	}
+
+	DWORD_PTR host_mask = GetHostAffinityFromGuestMask(guest_mask);
+	if (host_mask == 0) {
+		return;
+	}
+
+	LOGF("\tApplyHostThreadAffinity: thread '%s', guest_mask=0x%016" PRIx64 ", host_mask=0x%016" PRIx64 "\n",
+	     thread->name.c_str(), static_cast<uint64_t>(guest_mask), static_cast<uint64_t>(host_mask));
+
+	if (thread == g_pthread_self ||
+	    thread->host_thread_id == static_cast<uint64_t>(GetCurrentThreadId())) {
+		SetThreadAffinityMask(GetCurrentThread(), host_mask);
+		if (std::has_single_bit(guest_mask)) {
+			int guest_cpu = std::countr_zero(guest_mask);
+			DWORD_PTR process_affinity = 0;
+			DWORD_PTR system_affinity  = 0;
+			if (GetProcessAffinityMask(GetCurrentProcess(), &process_affinity, &system_affinity) != 0 &&
+			    process_affinity != 0) {
+				std::vector<int> host_cpus;
+				for (int i = 0; i < static_cast<int>(sizeof(DWORD_PTR) * 8); ++i) {
+					if ((process_affinity & (DWORD_PTR(1) << i)) != 0) {
+						host_cpus.push_back(i);
+					}
+				}
+				if (!host_cpus.empty()) {
+					SetThreadIdealProcessor(GetCurrentThread(),
+					                        static_cast<DWORD>(host_cpus[guest_cpu % host_cpus.size()]));
+				}
+			}
+		}
+	} else if (thread->host_thread_id != 0) {
+		HANDLE h = OpenThread(THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, FALSE,
+		                      static_cast<DWORD>(thread->host_thread_id));
+		if (h != nullptr) {
+			SetThreadAffinityMask(h, host_mask);
+			if (std::has_single_bit(guest_mask)) {
+				int guest_cpu = std::countr_zero(guest_mask);
+				DWORD_PTR process_affinity = 0;
+				DWORD_PTR system_affinity  = 0;
+				if (GetProcessAffinityMask(GetCurrentProcess(), &process_affinity, &system_affinity) != 0 &&
+				    process_affinity != 0) {
+					std::vector<int> host_cpus;
+					for (int i = 0; i < static_cast<int>(sizeof(DWORD_PTR) * 8); ++i) {
+						if ((process_affinity & (DWORD_PTR(1) << i)) != 0) {
+							host_cpus.push_back(i);
+						}
+					}
+					if (!host_cpus.empty()) {
+						SetThreadIdealProcessor(h,
+						                        static_cast<DWORD>(host_cpus[guest_cpu % host_cpus.size()]));
+					}
+				}
+			}
+			CloseHandle(h);
+		}
+	}
+}
+#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+static void ApplyHostThreadAffinity(Pthread thread) {
+	if (thread == nullptr || thread->attr == nullptr) {
+		return;
+	}
+
+	KernelCpumask guest_mask = thread->attr->affinity;
+	if (guest_mask == 0) {
+		return;
+	}
+
+	int num_host_cpus = sysconf(_SC_NPROCESSORS_ONLN);
+	if (num_host_cpus <= 0) {
+		num_host_cpus = 1;
+	}
+
+	cpu_set_t cpuset;
+	CPU_ZERO(&cpuset);
+	for (int guest_cpu = 0; guest_cpu < 64; ++guest_cpu) {
+		if ((guest_mask & (KernelCpumask(1) << guest_cpu)) != 0) {
+			int mapped = guest_cpu % num_host_cpus;
+			CPU_SET(mapped, &cpuset);
+		}
+	}
+
+	pthread_setaffinity_np(thread->p, sizeof(cpu_set_t), &cpuset);
+}
+#else
+static void ApplyHostThreadAffinity(Pthread /*thread*/) {
+}
+#endif
+
 void PthreadInitSelfForMainThread() {
 	EXIT_IF(g_pthread_self != nullptr);
 
@@ -1035,6 +1173,8 @@ void PthreadInitSelfForMainThread() {
 #endif
 	g_pthread_self->host_thread_id = os_thread_id;
 	g_pthread_main                 = g_pthread_self;
+
+	ApplyHostThreadAffinity(g_pthread_self);
 
 	LOGF("\tPthread main self: id = %d, os_thread_id = %" PRIu64 ", stack_addr = 0x%016" PRIx64
 	     ", stack_size = %" PRIu64 "\n",
@@ -3212,6 +3352,8 @@ static void* RunThread(void* arg) {
 #endif
 	thread->host_thread_id = os_thread_id;
 
+	ApplyHostThreadAffinity(thread);
+
 	LOGF("\tPthread run begin: %s, id = %d, os_thread_id = %" PRIu64 ", entry = 0x%016" PRIx64
 	     ", arg = 0x%016" PRIx64 ", stack_addr = 0x%016" PRIx64 ", stack_size = %" PRIu64 "\n",
 	     thread->name.c_str(), thread->unique_id, os_thread_id,
@@ -3384,6 +3526,9 @@ int KYTY_SYSV_ABI PthreadSetaffinity(Pthread thread, KernelCpumask mask) {
 	}
 
 	auto result = PthreadAttrSetaffinity(&thread->attr, mask);
+	if (result == OK) {
+		ApplyHostThreadAffinity(thread);
+	}
 
 	return result;
 }
@@ -3399,6 +3544,38 @@ int KYTY_SYSV_ABI PthreadGetaffinity(Pthread thread, KernelCpumask* mask) {
 	}
 
 	return PthreadAttrGetaffinity(&thread->attr, mask);
+}
+
+int KYTY_SYSV_ABI PthreadGetCurrentCpu() {
+	PRINT_NAME();
+
+	if (g_pthread_self != nullptr) {
+		if (g_pthread_self->attr != nullptr) {
+			KernelCpumask aff = g_pthread_self->attr->affinity;
+			if (aff != 0 && std::has_single_bit(aff)) {
+				return std::countr_zero(aff);
+			}
+		}
+
+		const auto& name = g_pthread_self->name;
+		auto cpu_pos = name.rfind("CPU");
+		if (cpu_pos != std::string::npos && cpu_pos + 3 < name.size()) {
+			char* end_ptr = nullptr;
+			long cpu_num = std::strtol(name.c_str() + cpu_pos + 3, &end_ptr, 10);
+			if (end_ptr != name.c_str() + cpu_pos + 3 && cpu_num >= 0 && cpu_num < 64) {
+				return static_cast<int>(cpu_num);
+			}
+		}
+	}
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	return static_cast<int>(GetCurrentProcessorNumber() % 14);
+#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+	int cpu = sched_getcpu();
+	return cpu >= 0 ? (cpu % 14) : 0;
+#else
+	return 0;
+#endif
 }
 
 int KYTY_SYSV_ABI PthreadSetcancelstate(int state, int* old_state) {

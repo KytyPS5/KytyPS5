@@ -1800,7 +1800,7 @@ int KYTY_SYSV_ABI KernelRtldThreadAtexitDecrement(uint64_t* /*c*/) {
 static KYTY_SYSV_ABI int KernelGetCurrentCpu() {
 	PRINT_NAME();
 
-	return 0;
+	return LibKernel::PthreadGetCurrentCpu();
 }
 
 int KYTY_SYSV_ABI clock_gettime(int clock_id, LibKernel::KernelTimespec* time) {

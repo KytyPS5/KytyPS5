@@ -409,6 +409,17 @@ private:
 		return ValidateSource(descriptor, bad_dword);
 	}
 
+	/**
+	 * @brief Matches an offset expression for a material buffer load against an expected pattern.
+	 *
+	 * Pattern: (selector * stride) + offset, where selector is read from first lane.
+	 *
+	 * @param value The offset Value expression to match.
+	 * @param selector Output Value containing the lane-uniform selector.
+	 * @param stride Output stride in bytes.
+	 * @param offset Output base offset in bytes.
+	 * @return true if expression matches the indirect material pattern, false otherwise.
+	 */
 	bool MatchMaterialOffset(Value value, Value& selector, uint32_t& stride,
 	                         uint32_t& offset) const {
 		value           = value.Resolve();
@@ -864,6 +875,16 @@ private:
 		return {};
 	}
 
+	/**
+	 * @brief Attempts to construct an indirect image resource plan from an image handle instruction.
+	 *
+	 * Analyzes candidate descriptor table and material buffer reads to prove invariant indirect access.
+	 *
+	 * @param handle GetImageResource instruction.
+	 * @param pc Program counter associated with the handle.
+	 * @param plan Output indirect image plan.
+	 * @return true if an indirect image plan was successfully formed, false otherwise.
+	 */
 	bool TryMakeIndirectImage(Inst& handle, uint32_t pc, IndirectImagePlan& plan) {
 		if (handle.GetOpcode() != ValueOpcode::GetImageResource || handle.NumArgs() != 8u) {
 			return false;
@@ -942,14 +963,17 @@ private:
 			const auto* memory = material_read != nullptr
 			                         ? ScalarReadMemory(*material_read, material_memory_index) : nullptr;
 			if (table_offset != 0u || memory == nullptr || memory->kind != ResourceKind::ScalarBuffer ||
-			    memory->offset != 0u || !MemoryIndexBelongsTo(material_memory_index, *material_read)) {
+			    memory->offset > INT32_MAX || (memory->offset & 3u) != 0u ||
+			    !MemoryIndexBelongsTo(material_memory_index, *material_read)) {
 				return false;
 			}
 			Value selector;
 			if (!MatchMaterialOffset(material_read->Arg(1), selector, indirect.selector_stride,
-			                         indirect.selector_offset)) {
+			                         indirect.selector_offset) ||
+			    memory->offset > UINT32_MAX - indirect.selector_offset) {
 				return false;
 			}
+			indirect.selector_offset += memory->offset;
 			const auto* shift = plan.reads[0]->Arg(1).Resolve().TryInstruction();
 			const std::array<const Inst*, 1> material_users {shift};
 			if (!UsesOnly(*material_read, material_users) || !UsesOnly(*shift, plan.reads)) {

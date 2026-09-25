@@ -45,7 +45,7 @@ public:
 	explicit GuestBackingStore(uint64_t size): m_size(size) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		m_handle = CreateFileMappingA(
-		    INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_COMMIT,
+		    INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_RESERVE,
 		    static_cast<DWORD>(m_size >> 32u), static_cast<DWORD>(m_size & 0xffffffffu), nullptr);
 		if (m_handle == nullptr) {
 			LOGF_COLOR(Log::Color::Red,
@@ -162,6 +162,12 @@ public:
 		if (!IsAvailable() || !RangeOk(backing_offset, size)) {
 			return false;
 		}
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (VirtualAlloc(m_backing_base + backing_offset, size, MEM_COMMIT, PAGE_READWRITE) ==
+		    nullptr) {
+			return false;
+		}
+#endif
 		std::memset(m_backing_base + backing_offset, 0, size);
 		return true;
 	}
@@ -372,6 +378,7 @@ public:
 				m_maps.emplace(old.vaddr, old);
 				return false;
 			}
+			VirtualAlloc(m_backing_base + old.backing_offset, old.size, MEM_RESET, PAGE_READWRITE);
 			if (placeholder_preserved != nullptr) {
 				*placeholder_preserved = true;
 			}
@@ -398,6 +405,8 @@ public:
 				     ok;
 			}
 			if (ok) {
+				VirtualAlloc(m_backing_base + old.backing_offset + (vaddr - old.vaddr), size,
+				             MEM_RESET, PAGE_READWRITE);
 				if (placeholder_preserved != nullptr) {
 					*placeholder_preserved = true;
 				}
@@ -583,6 +592,12 @@ private:
 			return nullptr;
 		}
 
+		if (VirtualAlloc(ptr, size, MEM_COMMIT, map_protect) == nullptr) {
+			UnmapViewOfFile2(GetCurrentProcess(), ptr, MEM_PRESERVE_PLACEHOLDER);
+			SetFailure(failure_reason, FailureReason::ProtectFailed);
+			return nullptr;
+		}
+
 		if (!ApplyProtection(ptr, size, mode)) {
 			UnmapViewOfFile2(GetCurrentProcess(), ptr, MEM_PRESERVE_PLACEHOLDER);
 			SetFailure(failure_reason, FailureReason::ProtectFailed);
@@ -651,14 +666,8 @@ public:
 		ReserveGuestRegions();
 		m_backing = new GuestBackingStore(backing_size);
 		if (!m_backing->IsAvailable()) {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-			EXIT("could not reserve %" PRIu64 " MB for guest direct memory. Windows commits\n"
-			     "this up front, so the paging file is usually what needs to be larger.\n",
-			     backing_size / (1024U * 1024U));
-#else
 			EXIT("could not reserve %" PRIu64 " MB for guest direct memory\n",
 			     backing_size / (1024U * 1024U));
-#endif
 		}
 	}
 

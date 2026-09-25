@@ -1758,6 +1758,54 @@ void TestLargeDirectMapAliasesAcrossChunks() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestOnDemandPhysicalMemoryCommitment() {
+	const char*        test = "OnDemandPhysicalMemoryCommitment";
+	constexpr uint64_t size = 0x200000; // 2 MiB
+
+	int64_t phys_addr = 0;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+	            0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), size, 0x10000,
+	            SceKernelMtypeC, &phys_addr),
+	        "KernelAllocateDirectMemory");
+
+	void* address = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
+	            &address, size, SceKernelProtCpuRw, 0, phys_addr, 0x10000, "on_demand_direct"),
+	        "KernelMapNamedDirectMemory");
+
+	// Verify write and read work correctly through the on-demand mapped view
+	auto* ptr = static_cast<uint64_t*>(address);
+	ptr[0] = 0xdeadbeefcafebabeull;
+	ptr[size / sizeof(uint64_t) - 1] = 0x0123456789abcdefull;
+	Check(test, ptr[0] == 0xdeadbeefcafebabeull, "written value at start did not match");
+	Check(test, ptr[size / sizeof(uint64_t) - 1] == 0x0123456789abcdefull,
+	      "written value at end did not match");
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// Verify mapped view is committed
+	MEMORY_BASIC_INFORMATION mbi {};
+	Check(test, VirtualQuery(address, &mbi, sizeof(mbi)) != 0, "VirtualQuery(mapped) failed");
+	Check(test, mbi.State == MEM_COMMIT, "mapped memory is not in MEM_COMMIT state");
+#endif
+
+	// Unmap and verify that placeholder is restored to reserved state
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMunmap(reinterpret_cast<uint64_t>(address), size),
+	        "KernelMunmap");
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	Check(test, VirtualQuery(address, &mbi, sizeof(mbi)) != 0, "VirtualQuery(unmapped) failed");
+	Check(test, mbi.State == MEM_RESERVE, "unmapped memory placeholder is not in MEM_RESERVE state");
+#endif
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(phys_addr, size),
+	        "KernelReleaseDirectMemory");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestHintlessDirectMapUsesCanonicalGuestBase() {
 	// Mirrors the allocation Sony's libc.prx makes for its internal heap: 4 MiB of
 	// direct memory, 2 MiB aligned, mapped with no address hint. The PS5 kernel never
@@ -3147,6 +3195,7 @@ int main(int argc, char** argv) {
 	RunTest(TestDirectAlignmentStaysWithinSearchRange);
 	RunTest(TestDefaultDirectMapUsesSystemAddressRange);
 	RunTest(TestLargeDirectMapAliasesAcrossChunks);
+	RunTest(TestOnDemandPhysicalMemoryCommitment);
 	RunTest(TestHintlessDirectMapUsesCanonicalGuestBase);
 	RunTest(TestDirectMemoryContentPersistsAcrossRemap);
 	RunTest(TestDirectMapUnmapReusesHostAddress);

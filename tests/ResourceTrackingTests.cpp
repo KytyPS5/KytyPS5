@@ -528,12 +528,21 @@ void TestInvariantIndirectImageMaterialization() {
         "malformed indirect image pattern was partially accepted");
 
   auto wrapped_immediate = MakeIndirectImageFixture(false, 4u);
-  BuildSrtPlan(wrapped_immediate->program);
-  CheckFatal([&] { TrackResources(wrapped_immediate->program); },
-             "not a valid runtime value",
-             "wrapped scalar immediate entered the invariant image proof");
-  Check(!wrapped_immediate->program.resource_tracking_complete,
-        "wrapped scalar immediate entered the invariant image proof");
+  wrapped_immediate->PlanAndTrack();
+  Check(wrapped_immediate->program.resource_tracking_complete,
+        "wrapped scalar immediate was rejected");
+  Check(wrapped_immediate->program.info.images.size() == 1,
+        "wrapped scalar immediate did not produce an image");
+  const auto wrapped_source = wrapped_immediate->program.info.images[0].source;
+  Check(wrapped_source < wrapped_immediate->program.descriptor_sources.size() &&
+            wrapped_immediate->program.descriptor_sources[wrapped_source]
+                .indirect_image.has_value(),
+        "wrapped scalar immediate lost its indirect image source");
+  const auto &wrapped_indirect =
+      *wrapped_immediate->program.descriptor_sources[wrapped_source].indirect_image;
+  Check(wrapped_indirect.selector_offset == 8u &&
+            wrapped_indirect.selector_stride == 224u,
+        "wrapped scalar immediate did not incorporate memory offset into selector offset");
 }
 
 void TestGuardedDirectImageTable() {

@@ -51,6 +51,14 @@ constexpr DWORD FILE_SHARE_POSIX = static_cast<DWORD>(FILE_SHARE_READ) |
                                    static_cast<DWORD>(FILE_SHARE_WRITE) |
                                    static_cast<DWORD>(FILE_SHARE_DELETE);
 
+/**
+ * @brief Converts a filesystem path to an extended Windows path (with \\?\ or \\?\UNC\ prefix).
+ *
+ * This allows path lengths to exceed MAX_PATH (260 characters).
+ *
+ * @param path Input filesystem path.
+ * @return Extended-length wide string path formatted for Win32 Unicode APIs.
+ */
 static std::wstring ToExtendedPath(const std::filesystem::path& path) {
 	if (path.empty()) {
 		return {};
@@ -107,17 +115,38 @@ static std::wstring ToExtendedPath(const std::filesystem::path& path) {
 	return wide;
 }
 
+/**
+ * @brief Opens a file or directory handle specifically for querying or updating metadata/timestamps.
+ *
+ * Uses FILE_FLAG_BACKUP_SEMANTICS to permit opening directory handles without exposing directory
+ * handles to regular file read/write APIs.
+ *
+ * @param name Filesystem path to the file or directory.
+ * @param desired_access Win32 access mask (e.g. FILE_READ_ATTRIBUTES or FILE_WRITE_ATTRIBUTES).
+ * @return Win32 HANDLE to the opened file or directory, or INVALID_HANDLE_VALUE on failure.
+ */
+static HANDLE OpenPathForMetadata(const std::filesystem::path& name, DWORD desired_access) {
+	auto wide = ToExtendedPath(name);
+	return CreateFileW(wide.c_str(), desired_access, FILE_SHARE_POSIX, nullptr, OPEN_EXISTING,
+	                   FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+}
+
+/**
+ * @brief Converts emulator cache hint flags to Win32 file access flags.
+ *
+ * @param t Cache hint type.
+ * @return DWORD Win32 flags for CreateFileW.
+ */
 static DWORD GetCacheAccessType(sys_file_cache_type_t t) {
-	DWORD flags = FILE_FLAG_BACKUP_SEMANTICS;
 	if (t == SYS_FILE_CACHE_RANDOM_ACCESS) {
-		return flags | FILE_FLAG_RANDOM_ACCESS;
+		return FILE_FLAG_RANDOM_ACCESS;
 	}
 
 	if (t == SYS_FILE_CACHE_SEQUENTIAL_SCAN) {
-		return flags | FILE_FLAG_SEQUENTIAL_SCAN;
+		return FILE_FLAG_SEQUENTIAL_SCAN;
 	}
 
-	return flags | FILE_ATTRIBUTE_NORMAL;
+	return FILE_ATTRIBUTE_NORMAL;
 }
 
 void SysFileRead(void* data, uint32_t size, sys_file_t& f, uint32_t* bytes_read) {
@@ -193,6 +222,12 @@ void SysFileWrite(const void* data, uint32_t size, sys_file_t& f, uint32_t* byte
 	}
 }
 
+/**
+ * @brief Creates a new file or truncates an existing file.
+ *
+ * @param file_name Path to the file.
+ * @return sys_file_t* Pointer to the allocated file descriptor.
+ */
 sys_file_t* SysFileCreate(const std::filesystem::path& file_name) {
 	auto* ret = new sys_file_t;
 
@@ -214,6 +249,13 @@ sys_file_t* SysFileCreate(const std::filesystem::path& file_name) {
 	return ret;
 }
 
+/**
+ * @brief Opens an existing file for reading.
+ *
+ * @param file_name Path to the file.
+ * @param cache_type Cache hint for file buffering.
+ * @return sys_file_t* Pointer to the allocated file descriptor.
+ */
 sys_file_t* SysFileOpenR(const std::filesystem::path& file_name, sys_file_cache_type_t cache_type) {
 	auto* ret = new sys_file_t;
 
@@ -257,6 +299,13 @@ sys_file_t* SysFileCreate() {
 	return ret;
 }
 
+/**
+ * @brief Opens an existing file for writing.
+ *
+ * @param file_name Path to the file.
+ * @param cache_type Cache hint for file buffering.
+ * @return sys_file_t* Pointer to the allocated file descriptor.
+ */
 sys_file_t* SysFileOpenW(const std::filesystem::path& file_name, sys_file_cache_type_t cache_type) {
 	auto* ret = new sys_file_t;
 
@@ -277,6 +326,13 @@ sys_file_t* SysFileOpenW(const std::filesystem::path& file_name, sys_file_cache_
 	return ret;
 }
 
+/**
+ * @brief Opens an existing file for reading and writing.
+ *
+ * @param file_name Path to the file.
+ * @param cache_type Cache hint for file buffering.
+ * @return sys_file_t* Pointer to the allocated file descriptor.
+ */
 sys_file_t* SysFileOpenRw(const std::filesystem::path& file_name,
                           sys_file_cache_type_t        cache_type) {
 	auto* ret = new sys_file_t;
@@ -328,6 +384,12 @@ uint64_t SysFileSize(sys_file_t& f) {
 	return 0;
 }
 
+/**
+ * @brief Retrieves the size of a file by path in bytes.
+ *
+ * @param file_name Path to the file.
+ * @return File size in bytes, or 0 if retrieval fails.
+ */
 uint64_t SysFileSize(const std::filesystem::path& file_name) {
 	LARGE_INTEGER             s;
 	WIN32_FILE_ATTRIBUTE_DATA a;
@@ -407,6 +469,12 @@ bool SysFileIsError(sys_file_t& f) {
 	       (f.type == SYS_FILE_FILE && f.handle == INVALID_HANDLE_VALUE);
 }
 
+/**
+ * @brief Checks if a directory exists at the given path.
+ *
+ * @param path Path to check.
+ * @return true if the directory exists, false otherwise.
+ */
 bool SysFileIsDirectoryExisting(const std::filesystem::path& path) {
 	auto  wide = ToExtendedPath(path);
 	DWORD a    = GetFileAttributesW(wide.c_str());
@@ -414,6 +482,12 @@ bool SysFileIsDirectoryExisting(const std::filesystem::path& path) {
 	       ((a & static_cast<DWORD>(FILE_ATTRIBUTE_DIRECTORY)) != 0u);
 }
 
+/**
+ * @brief Checks if a regular file exists at the given path.
+ *
+ * @param name Path to check.
+ * @return true if the file exists, false otherwise.
+ */
 bool SysFileIsFileExisting(const std::filesystem::path& name) {
 	auto  wide = ToExtendedPath(name);
 	DWORD a    = GetFileAttributesW(wide.c_str());
@@ -421,16 +495,34 @@ bool SysFileIsFileExisting(const std::filesystem::path& name) {
 	       ((a & static_cast<DWORD>(FILE_ATTRIBUTE_DIRECTORY)) == 0u);
 }
 
+/**
+ * @brief Creates a directory on the filesystem.
+ *
+ * @param path Directory path to create.
+ * @return true on success, false on failure.
+ */
 bool SysFileCreateDirectory(const std::filesystem::path& path) {
 	auto wide = ToExtendedPath(path);
 	return CreateDirectoryW(wide.c_str(), nullptr) != 0;
 }
 
+/**
+ * @brief Deletes a directory from the filesystem.
+ *
+ * @param path Directory path to remove.
+ * @return true on success, false on failure.
+ */
 bool SysFileDeleteDirectory(const std::filesystem::path& path) {
 	auto wide = ToExtendedPath(path);
 	return RemoveDirectoryW(wide.c_str()) != 0;
 }
 
+/**
+ * @brief Deletes a regular file from the filesystem.
+ *
+ * @param name Path to the file to delete.
+ * @return true on success, false on failure.
+ */
 bool SysFileDeleteFile(const std::filesystem::path& name) {
 	auto wide = ToExtendedPath(name);
 	return DeleteFileW(wide.c_str()) != 0;
@@ -444,32 +536,64 @@ bool SysFileFlush(sys_file_t& f) {
 	return false;
 }
 
+/**
+ * @brief Retrieves the last access time in UTC for a file or directory.
+ *
+ * @param name Path to the file or directory.
+ * @return SysFileTimeStruct with timestamp or marked invalid.
+ */
 SysFileTimeStruct SysFileGetLastAccessTimeUtc(const std::filesystem::path& name) {
 	SysFileTimeStruct r {};
-	sys_file_t*       f = SysFileOpenR(name);
+	HANDLE            h = OpenPathForMetadata(name, FILE_READ_ATTRIBUTES);
 	r.is_invalid =
-	    (f->type == SYS_FILE_ERROR || (GetFileTime(f->handle, nullptr, &r.time, nullptr) == 0));
-	SysFileClose(f);
+	    (h == INVALID_HANDLE_VALUE || (GetFileTime(h, nullptr, &r.time, nullptr) == 0));
+	if (h != INVALID_HANDLE_VALUE) {
+		CloseHandle(h);
+	}
 	return r;
 }
 
+/**
+ * @brief Retrieves the last write time in UTC for a file or directory.
+ *
+ * @param name Path to the file or directory.
+ * @return SysFileTimeStruct with timestamp or marked invalid.
+ */
 SysFileTimeStruct SysFileGetLastWriteTimeUtc(const std::filesystem::path& name) {
 	SysFileTimeStruct r {};
-	sys_file_t*       f = SysFileOpenR(name);
+	HANDLE            h = OpenPathForMetadata(name, FILE_READ_ATTRIBUTES);
 	r.is_invalid =
-	    (f->type == SYS_FILE_ERROR || (GetFileTime(f->handle, nullptr, nullptr, &r.time) == 0));
-	SysFileClose(f);
+	    (h == INVALID_HANDLE_VALUE || (GetFileTime(h, nullptr, nullptr, &r.time) == 0));
+	if (h != INVALID_HANDLE_VALUE) {
+		CloseHandle(h);
+	}
 	return r;
 }
 
+/**
+ * @brief Retrieves both last access and last write times in UTC for a file or directory.
+ *
+ * @param name Path to the file or directory.
+ * @param a Output struct for access time.
+ * @param w Output struct for write time.
+ */
 void SysFileGetLastAccessAndWriteTimeUtc(const std::filesystem::path& name, SysFileTimeStruct& a,
                                          SysFileTimeStruct& w) {
-	sys_file_t* f = SysFileOpenR(name);
-	a.is_invalid  = w.is_invalid =
-	    (f->type == SYS_FILE_ERROR || (GetFileTime(f->handle, nullptr, &a.time, &w.time) == 0));
-	SysFileClose(f);
+	HANDLE h = OpenPathForMetadata(name, FILE_READ_ATTRIBUTES);
+	a.is_invalid = w.is_invalid =
+	    (h == INVALID_HANDLE_VALUE || (GetFileTime(h, nullptr, &a.time, &w.time) == 0));
+	if (h != INVALID_HANDLE_VALUE) {
+		CloseHandle(h);
+	}
 }
 
+/**
+ * @brief Retrieves last access and last write times from an already open file descriptor.
+ *
+ * @param f Open file descriptor.
+ * @param a Output struct for access time.
+ * @param w Output struct for write time.
+ */
 void SysFileGetLastAccessAndWriteTimeUtc(sys_file_t& f, SysFileTimeStruct& a,
                                          SysFileTimeStruct& w) {
 	if (f.type == SYS_FILE_FILE) {
@@ -484,58 +608,80 @@ void SysFileGetLastAccessAndWriteTimeUtc(sys_file_t& f, SysFileTimeStruct& a,
 	}
 }
 
+/**
+ * @brief Sets the last access time in UTC for a file or directory.
+ *
+ * @param name Path to the file or directory.
+ * @param access New access timestamp.
+ * @return true on success, false on failure.
+ */
 bool SysFileSetLastAccessTimeUtc(const std::filesystem::path& name, SysFileTimeStruct& access) {
 	if (access.is_invalid) {
 		return false;
 	}
 
-	bool ok = true;
+	HANDLE h = OpenPathForMetadata(name, FILE_WRITE_ATTRIBUTES);
+	if (h == INVALID_HANDLE_VALUE) {
+		return false;
+	}
 
-	sys_file_t* f = SysFileOpenW(name);
-
-	ok = !(f->type == SYS_FILE_ERROR ||
-	       (SetFileTime(f->handle, nullptr, &access.time, nullptr) == 0));
-
-	SysFileClose(f);
-
+	bool ok = (SetFileTime(h, nullptr, &access.time, nullptr) != 0);
+	CloseHandle(h);
 	return ok;
 }
 
+/**
+ * @brief Sets the last write time in UTC for a file or directory.
+ *
+ * @param name Path to the file or directory.
+ * @param write New write timestamp.
+ * @return true on success, false on failure.
+ */
 bool SysFileSetLastWriteTimeUtc(const std::filesystem::path& name, SysFileTimeStruct& write) {
 	if (write.is_invalid) {
 		return false;
 	}
 
-	bool ok = true;
+	HANDLE h = OpenPathForMetadata(name, FILE_WRITE_ATTRIBUTES);
+	if (h == INVALID_HANDLE_VALUE) {
+		return false;
+	}
 
-	sys_file_t* f = SysFileOpenW(name);
-
-	ok = !(f->type == SYS_FILE_ERROR ||
-	       (SetFileTime(f->handle, nullptr, nullptr, &write.time) == 0));
-
-	SysFileClose(f);
-
+	bool ok = (SetFileTime(h, nullptr, nullptr, &write.time) != 0);
+	CloseHandle(h);
 	return ok;
 }
 
+/**
+ * @brief Sets both last access and last write times in UTC for a file or directory.
+ *
+ * @param name Path to the file or directory.
+ * @param access New access timestamp.
+ * @param write New write timestamp.
+ * @return true on success, false on failure.
+ */
 bool SysFileSetLastAccessAndWriteTimeUtc(const std::filesystem::path& name,
                                          SysFileTimeStruct& access, SysFileTimeStruct& write) {
 	if (access.is_invalid || write.is_invalid) {
 		return false;
 	}
 
-	bool ok = true;
+	HANDLE h = OpenPathForMetadata(name, FILE_WRITE_ATTRIBUTES);
+	if (h == INVALID_HANDLE_VALUE) {
+		return false;
+	}
 
-	sys_file_t* f = SysFileOpenW(name);
-
-	ok = !(f->type == SYS_FILE_ERROR ||
-	       (SetFileTime(f->handle, nullptr, &access.time, &write.time) == 0));
-
-	SysFileClose(f);
-
+	bool ok = (SetFileTime(h, nullptr, &access.time, &write.time) != 0);
+	CloseHandle(h);
 	return ok;
 }
 
+/**
+ * @brief Enumerates directory entries for a given path.
+ *
+ * @param path Directory path to enumerate.
+ * @param out Vector populated with discovered directory entries.
+ */
 void SysFileGetDents(const std::filesystem::path& path, std::vector<sys_dir_entry_t>& out) {
 	auto extended = ToExtendedPath(path);
 	if (!extended.empty() && extended.back() != L'\\') {
@@ -565,18 +711,37 @@ void SysFileGetDents(const std::filesystem::path& path, std::vector<sys_dir_entr
 	FindClose(h);
 }
 
+/**
+ * @brief Copies a file from source path to destination path.
+ *
+ * @param src Source file path.
+ * @param dst Destination file path.
+ * @return true on success, false on failure.
+ */
 bool SysFileCopyFile(const std::filesystem::path& src, const std::filesystem::path& dst) {
 	auto src_wide = ToExtendedPath(src);
 	auto dst_wide = ToExtendedPath(dst);
 	return CopyFileW(src_wide.c_str(), dst_wide.c_str(), FALSE) != 0;
 }
 
+/**
+ * @brief Renames or moves a file or directory.
+ *
+ * @param src Source path.
+ * @param dst Destination path.
+ * @return true on success, false on failure.
+ */
 bool SysFileRenameFile(const std::filesystem::path& src, const std::filesystem::path& dst) {
 	auto src_wide = ToExtendedPath(src);
 	auto dst_wide = ToExtendedPath(dst);
 	return MoveFileW(src_wide.c_str(), dst_wide.c_str()) != 0;
 }
 
+/**
+ * @brief Clears the read-only attribute from a file or directory.
+ *
+ * @param name Path to the file or directory.
+ */
 void SysFileRemoveReadonly(const std::filesystem::path& name) {
 	auto  wide  = ToExtendedPath(name);
 	DWORD attrs = GetFileAttributesW(wide.c_str());

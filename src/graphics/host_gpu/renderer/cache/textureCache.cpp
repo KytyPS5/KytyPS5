@@ -1127,7 +1127,8 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 	upload(copies, linear);
 }
 
-void TextureCache::InitializeImage(ImageId id) {
+void TextureCache::InitializeImage(ImageId id, const ImageDesc* description) {
+	const ImageDesc desc = description != nullptr ? *description : ImageDesc {};
 	auto& image = m_slot_images[id];
 	if (image.sampled_htile_clear_import) {
 		EXIT("sampled HTile import cannot upload raw depth backing\n");
@@ -1147,7 +1148,7 @@ void TextureCache::InitializeImage(ImageId id) {
 	}
 	const bool upload = image.IsBufferModified() || image.IsCpuDirty();
 	if (upload) {
-		const auto upload_range = desc.type == BindingType::Texture || desc.type == BindingType::Storage
+		const auto upload_range = description != nullptr && (desc.type == BindingType::Texture || desc.type == BindingType::Storage)
 		                              ? SelectUploadRange(image.info, desc.view_info)
 		                              : image.info.data;
 		const auto mapped_size =
@@ -1395,9 +1396,9 @@ ImageId TextureCache::FindSampledHtileImage(ImageDesc& desc) {
 	    requested.pitch == TileGetTexturePitch(requested.guest_format, requested.extent.width,
 	                                           requested.tile_mode);
 	const bool data_mapped =
-	    m_scheduler.Context().GetGpuResources().IsMapped(requested.data.address, requested.data.size);
+	    m_scheduler.Context().IsMapped(requested.data.address, requested.data.size);
 	const bool metadata_mapped =
-	    m_scheduler.Context().GetGpuResources().IsMapped(metadata.address, metadata.size);
+	    m_scheduler.Context().IsMapped(metadata.address, metadata.size);
 	if (!shape || !data_mapped || !metadata_mapped) {
 		EXIT("unsupported sampled HTile clear import geometry or mapping: shape=%d "
 		     "data_mapped=%d metadata_mapped=%d data=0x%016" PRIx64 "+0x%016" PRIx64
@@ -1438,7 +1439,7 @@ ImageId TextureCache::FindSampledHtileImage(ImageDesc& desc) {
 		TouchImage(image);
 		return existing_native;
 	}
-	if (QueryRegion(metadata.address, metadata.size).gpu_image_bytes ||
+	if (IsRegionGpuModified(metadata.address, metadata.size) ||
 	    m_buffer_cache.HasGpuDirtyBytes(requested.data.address, requested.data.size)) {
 		EXIT("sampled HTile import has unsupported GPU image or raw-buffer ownership\n");
 	}
@@ -1452,7 +1453,7 @@ ImageId TextureCache::FindSampledHtileImage(ImageDesc& desc) {
 		}
 		std::vector<uint32_t> words(metadata.size / sizeof(uint32_t));
 		if (m_buffer_cache.HasGpuDirtyBytes(metadata.address, metadata.size) ||
-		    QueryRegion(metadata.address, metadata.size).gpu_image_bytes ||
+		    IsRegionGpuModified(metadata.address, metadata.size) ||
 		    !LibKernel::Memory::TryReadBacking(metadata.address, words.data(), metadata.size)) {
 			EXIT("sampled HTile metadata is not coherent and readable\n");
 		}
@@ -2240,12 +2241,14 @@ bool TextureCache::IsMeta(uint64_t address) {
 	return found != m_surface_metas.end();
 }
 
-bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice) {
+bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice, uint32_t* fill_value, bool* fill_known) {
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
 	if (found == m_surface_metas.end() || slice >= 32) {
 		return false;
 	}
+	if (fill_value != nullptr) *fill_value = found->second.fill_value;
+	if (fill_known != nullptr) *fill_known = found->second.fill_known;
 	return (found->second.clear_mask & (1u << slice)) != 0;
 }
 
@@ -2263,8 +2266,7 @@ bool TextureCache::ClearMeta(uint64_t address) {
 bool TextureCache::ClearMeta(uint64_t address, uint32_t fill_value) {
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
-	if (found == m_surface_metas.end() || found->second.type == MetaDataInfo::Type::PendingDcc ||
-	    found->second.type == MetaDataInfo::Type::Dcc) {
+	if (found == m_surface_metas.end()) {
 		return false;
 	}
 	found->second.clear_mask = UINT32_MAX;

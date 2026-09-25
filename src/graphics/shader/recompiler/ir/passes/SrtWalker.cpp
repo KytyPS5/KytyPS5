@@ -2038,6 +2038,20 @@ bool EvaluateDescriptorSource(const ResourcePlan& program, uint32_t source,
 	return evaluator.EvaluateDescriptor(source, result);
 }
 
+bool EvaluateDescriptorSources(const ResourcePlan& program, std::span<const uint32_t> sources,
+                               const SrtRuntime& runtime, std::vector<DescriptorValue>& results) {
+	SrtWalker evaluator(program, runtime);
+	std::vector<DescriptorValue> next;
+	next.reserve(sources.size());
+	for (const auto source : sources) {
+		DescriptorValue value;
+		if (!evaluator.EvaluateDescriptor(source, value)) return false;
+		next.push_back(value);
+	}
+	results = std::move(next);
+	return true;
+}
+
 bool EvaluateBoundedDescriptorSource(const ResourcePlan& program, uint32_t source,
                                      const SrtRuntime& runtime,
                                      std::span<const BoundedSrtLayout> layouts,

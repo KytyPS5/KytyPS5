@@ -29,6 +29,7 @@ struct ResourceSpecialization {
 		uint32_t                      indirect_sampler           = UINT32_MAX;
 		bool                          cube                       = false;
 		bool                          fmask                      = false;
+		bool                          needs_manual_depth_compare = false;
 		bool                          operator==(const Image&) const = default;
 	};
 

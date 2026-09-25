@@ -367,10 +367,9 @@ bool ReadScalarTable(uint64_t base, uint64_t size, uint32_t dynamic_offset,
 bool MaterializeIndirectImage(const ResourcePlan& program,
                               const DescriptorSource::IndirectImage& indirect,
                               const DescriptorValue& material_value,
-                              const DescriptorValue& table_value, uint32_t image_index,
+                              const DescriptorValue& table_value, bool r128,
                               const SrtRuntime& runtime, SrtWalker& clean,
-                              ResourceSnapshot& snapshot,
-                              ResourceSpecialization& specialization) {
+                              IndirectImage& result) {
 	uint64_t table_base = 0;
 	uint64_t table_size = UINT64_MAX; // Scalar addresses have no buffer descriptor bounds.
 	ShaderBufferResource table;
@@ -451,51 +450,30 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 		keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
 	}
 
-	const auto children_begin = snapshot.images.size();
-	const auto mapping_offset = snapshot.flattened_srt.size();
-	const auto root_image = specialization.images[image_index];
-	snapshot.flattened_srt.resize(mapping_offset + 1u + keys.size() * 2u);
-	snapshot.flattened_srt[mapping_offset] = static_cast<uint32_t>(keys.size());
-	for (uint32_t entry = 0; entry < keys.size(); ++entry) {
-		const auto key = keys[entry];
+	IndirectImage next;
+	next.keys = keys;
+	for (const auto key : next.keys) {
 		DescriptorValue candidate;
 		candidate.dword_count = 8u;
 		const auto table_offset = (key << 5u) + indirect.table_offset;
-		if (!ReadScalarTable(table_base, table_size, table_offset, runtime, candidate.dwords)) {
-			return false;
+		if (!ReadScalarTable(table_base, table_size, table_offset, runtime, candidate.dwords)) return false;
+		if (NullImageDescriptor(candidate) || !ValidImageDescriptor(candidate, r128)) candidate.dwords.fill(0);
+		const auto found = std::ranges::find(next.descriptors, candidate);
+		const auto ordinal = static_cast<uint32_t>(found - next.descriptors.begin());
+		if (found == next.descriptors.end()) {
+			if (next.descriptors.size() >= ShaderInfo::MaxImages) return false;
+			next.descriptors.push_back(candidate);
 		}
-		if (NullImageDescriptor(candidate) ||
-		    !ValidImageDescriptor(candidate, program.info.images[image_index].r128)) {
-			candidate.dwords.fill(0);
-		}
-		uint32_t ordinal = 0;
-		if (entry == 0) {
-			snapshot.images[image_index] = candidate;
-		} else if (snapshot.images[image_index] != candidate) {
-			const auto found = std::find(snapshot.images.begin() + children_begin,
-			                             snapshot.images.end(), candidate);
-			ordinal = static_cast<uint32_t>(found - snapshot.images.begin() - children_begin + 1u);
-			if (found == snapshot.images.end()) {
-				if (snapshot.images.size() >= ShaderInfo::MaxImages) {
-					return false;
-				}
-				snapshot.images.push_back(candidate);
-				auto child = root_image;
-				child.indirect_root = image_index;
-				specialization.images.push_back(child);
-			}
-		}
-		snapshot.flattened_srt[mapping_offset + 1u + entry * 2u] = key;
-		snapshot.flattened_srt[mapping_offset + 2u + entry * 2u] = ordinal;
+		next.candidates.push_back(ordinal);
 	}
-	if (snapshot.images.size() == children_begin) {
-		snapshot.flattened_srt.resize(mapping_offset);
-	} else {
-		auto& root = specialization.images[image_index];
-		root.indirect_root = image_index;
-		root.indirect_mapping_offset = static_cast<uint32_t>(mapping_offset);
-		root.indirect_search_iterations = std::bit_width(keys.size());
+	if (next.keys.empty()) {
+		DescriptorValue empty;
+		empty.dword_count = 8u;
+		next.keys.push_back(0u);
+		next.candidates.push_back(0u);
+		next.descriptors.push_back(empty);
 	}
+	result = std::move(next);
 	return true;
 }
 
@@ -1542,19 +1520,18 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& i
 				snapshot.indirect_images.push_back(std::move(table));
 			}
 		} else if (source != nullptr && source->indirect_image.has_value()) {
-			const std::array requests {source->indirect_image->material_source,
-			                           source->indirect_image->heap_source};
-			SrtRuntime       clean_runtime = runtime;
-			clean_runtime.read_memory      = runtime.read_specialization_memory;
-			std::vector<DescriptorValue> tables;
-			if (!EvaluateDescriptorSources(program, requests, clean_runtime, tables)) {
+			const auto& indirect = *source->indirect_image;
+			const auto clean_runtime = CleanRuntime(runtime);
+			SrtWalker clean(program, clean_runtime);
+			DescriptorValue material, heap;
+			if ((indirect.material_source != UINT32_MAX &&
+			     !clean.EvaluateDescriptor(indirect.material_source, material)) ||
+			    !clean.EvaluateDescriptor(indirect.table_source, heap)) {
 				return SpecializationFail("indirect image table source evaluation failed");
 			}
-			const auto&   material = tables[0];
-			const auto&   heap     = tables[1];
 			IndirectImage table;
-			if (!MaterializeIndirectImage(*source->indirect_image, material, heap, image.r128,
-			                              runtime, table)) {
+			if (!MaterializeIndirectImage(program, indirect, material, heap, image.r128,
+			                              clean_runtime, clean, table)) {
 				return SpecializationFail("indirect image table materialization failed");
 			}
 			next.images[image_index] = table.descriptors[table.candidates[0]];
@@ -1787,7 +1764,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 		} else if (!swizzle) {
 			packed_stride &= ~(3u << 16u);
 		}
-		specialization.buffers.push_back({
+		next_specialization.buffers.push_back({
 		    .packed_stride     = packed_stride,
 		    .descriptor_format = base_buffer.formatted
 		                             ? descriptor.Format()
@@ -1796,9 +1773,9 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 		        base_buffer.formatted ? descriptor.DstSelXYZW() : DstSel(4, 5, 6, 7),
 		});
 	}
-	for (uint32_t i = 0; i < specialization.images.size(); i++) {
-		const auto& descriptor = snapshot.images[i];
-		auto&       image      = specialization.images[i];
+	for (uint32_t i = 0; i < next_specialization.images.size(); i++) {
+		const auto& descriptor = next_snapshot.images[i];
+		auto&       image      = next_specialization.images[i];
 		const auto  base_index = i < program.info.images.size() ? i : image.indirect_root;
 		if (base_index >= program.info.images.size()) {
 			return SpecializationFail(fmt::format("image resource {} has an invalid root", i));
@@ -1881,29 +1858,29 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 			                static_cast<uint32_t>(format)));
 		}
 	}
-	for (uint32_t root_index = 0; root_index < specialization.images.size(); root_index++) {
-		auto& root = specialization.images[root_index];
+	for (uint32_t root_index = 0; root_index < next_specialization.images.size(); root_index++) {
+		auto& root = next_specialization.images[root_index];
 		if (root.indirect_root != root_index) {
 			continue;
 		}
-		const auto key_count = root.indirect_mapping_offset < snapshot.flattened_srt.size()
-		                           ? snapshot.flattened_srt[root.indirect_mapping_offset]
+		const auto key_count = root.indirect_mapping_offset < next_snapshot.flattened_srt.size()
+		                           ? next_snapshot.flattened_srt[root.indirect_mapping_offset]
 		                           : 0u;
 		if (root.indirect_search_iterations == 0u || key_count == 0u ||
 		    static_cast<size_t>(root.indirect_mapping_offset) + 1u +
 		            static_cast<size_t>(key_count) * 2u >
-		        snapshot.flattened_srt.size()) {
+		        next_snapshot.flattened_srt.size()) {
 			return SpecializationFail("indirect image specialization has an invalid key mapping");
 		}
 		uint32_t exemplar       = ImageResource::NoIndirectImage;
 		uint32_t resource_count = 0;
-		for (uint32_t resource = 0; resource < specialization.images.size(); resource++) {
-			if (specialization.images[resource].indirect_root != root_index) {
+		for (uint32_t resource = 0; resource < next_specialization.images.size(); resource++) {
+			if (next_specialization.images[resource].indirect_root != root_index) {
 				continue;
 			}
 			resource_count++;
 			if (exemplar == ImageResource::NoIndirectImage &&
-			    !NullImageDescriptor(snapshot.images[resource])) {
+			    !NullImageDescriptor(next_snapshot.images[resource])) {
 				exemplar = resource;
 			}
 		}
@@ -2599,8 +2576,9 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 			}
 		}
 	}
-	for (const auto* block: program.blocks) {
-		for (const auto& inst: *block) {
+	for (auto* block: program.blocks) {
+		for (auto it = block->begin(); it != block->end(); ++it) {
+			auto& inst = *it;
 			const auto image_opcode = ImageOpcodeInfoOf(inst.GetOpcode());
 			if (image_opcode.access == ImageAccess::None) {
 				continue;

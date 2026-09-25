@@ -60,6 +60,8 @@ bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
 SrtRuntime CleanRuntime(SrtRuntime runtime);
 bool EvaluateDescriptorSource(const ResourcePlan& program, uint32_t source,
                               const SrtRuntime& runtime, DescriptorValue& result);
+bool EvaluateDescriptorSources(const ResourcePlan& program, std::span<const uint32_t> sources,
+                               const SrtRuntime& runtime, std::vector<DescriptorValue>& results);
 bool EvaluateBoundedDescriptorSource(const ResourcePlan& program, uint32_t source,
                                      const SrtRuntime& runtime,
                                      std::span<const BoundedSrtLayout> layouts,

@@ -578,10 +578,6 @@ private:
 		}
 		if (dependencies.empty()) return false;
 		const auto& first = m_bounded_srt_reads[dependencies.front()->read_id];
-		if (first.workgroup_axis != UINT32_MAX) {
-			rejection = "descriptor dependency is indexed by a workgroup axis";
-			return false;
-		}
 		for (const auto* dependency: dependencies) {
 			const auto& read = m_bounded_srt_reads[dependency->read_id];
 			if (dependency->proof.index != dependencies.front()->proof.index ||
@@ -620,6 +616,10 @@ private:
 		}
 		if (dependencies.empty()) return false;
 		const auto& first = m_bounded_srt_reads[dependencies.front()->read_id];
+		// Workgroup-axis snapshots currently cover buffer descriptor candidates
+		// and scalar payloads. Image/sampler expression tables stay on the
+		// ordinary (non-workgroup) selector path until their emitter contract
+		// has a matching regression.
 		if (first.workgroup_axis != UINT32_MAX) {
 			rejection = "descriptor dependency is indexed by a workgroup axis";
 			return false;
@@ -1012,15 +1012,15 @@ private:
 				return reject(fmt::format("column {} is not a proved bounded read", word));
 		}
 		const auto& first = m_bounded_srt_reads[words[0]->read_id];
-		// Workgroup snapshots currently cover scalar payloads, not descriptor candidates.
-		if (first.workgroup_axis != UINT32_MAX)
-			return reject("column 0 is indexed by a workgroup axis");
+		// Workgroup-axis columns may form one descriptor candidate per dispatch
+		// index when the four DWORDs share axis, address roots and consecutive
+		// memory offsets. Scalar coefficient snapshots remain the non-descriptor path.
 		for (uint32_t word = 1; word < words.size(); ++word) {
 			const auto& next = m_bounded_srt_reads[words[word]->read_id];
 			if (words[word]->proof.index != words[0]->proof.index ||
 			    first.address_source != next.address_source || first.count_source != next.count_source ||
 			    first.count_signed != next.count_signed ||
-			    next.workgroup_axis != UINT32_MAX ||
+			    next.workgroup_axis != first.workgroup_axis ||
 			    first.offset_scale != next.offset_scale || first.offset_bias != next.offset_bias ||
 			    next.memory_offset != first.memory_offset + word * sizeof(uint32_t))
 				return reject(fmt::format(

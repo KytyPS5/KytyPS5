@@ -1251,6 +1251,11 @@ uint32_t LoadBoundedFlatWord(EmitterState& state, uint32_t index,
 
 } // namespace
 
+uint32_t EmitBoundedFlatWord(EmitterState& state, uint32_t index, uint32_t count,
+                             uint32_t flat_offset) {
+	return LoadBoundedFlatWord(state, index, count, flat_offset);
+}
+
 void DefineGetBdaPointer(EmitterState& state) {
 	if (!state.program.info.uses_dma) {
 		return;

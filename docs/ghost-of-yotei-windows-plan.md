@@ -3,6 +3,29 @@
 Обновлено **25 сентября 2026 года**. Игра: **Ghost of Yōtei, PPSA26344**.
 Рабочая ветка — `yotei-windows-bringup` в локальном fork `fxpw/KytyPS5`.
 
+Checkpoint buffer-table emitter **25 сентября 2026 года**: существующий
+`--buffer-descriptor-loop-only` до исправления воспроизвёл отказ SPIR-V emitter
+`resource=UINT32_MAX` на таблице native buffer descriptors. Теперь каждый
+ограниченный runtime selector выбирает конкретный специализированный ресурс;
+его stride, границы и byte offsets не смешиваются с другими кандидатами.
+Continue у простого цикла указывает на отдельный блок после сгенерированных
+проверок таблицы, поэтому вложенный `OpUnreachable` не нарушает SPIR-V CFG.
+Native Windows build/install и неизменённые GPU selectors
+`--buffer-descriptor-loop-only` (две записи) и
+`--buffer-descriptor-neighbors-only` (чтение и нулевой цикл) — **PASS**;
+логи `_Build/merge-validation-20260925/buffer-table-*` и `d895-*`.
+
+Ограниченный GPUAV-lite game run
+`_Build/runs/yotei-integrated-20260925-124349-f8a36b` дошёл до guest frame 95,
+`shown=0`, и остановился на другом, более раннем compute shader
+`86da5eb7b8257bb0`: в PC `0x530` четыре `LoadAddressU32` формируют
+`GetBufferResource` по вычисляемому ключу, который resource tracking не может
+доказать. Прогресс точного `d8959888aafd2552` в этом run не проверен, потому
+что запуск остановился раньше. Следующий шаг — synthetic RED для
+address-backed buffer descriptor и общая коррекция tracking/materialization
+с сохранением guard, диапазонов и проверки alias; новые rendered frames
+**PENDING**.
+
 Checkpoint следующего ограниченного запуска **25 сентября 2026 года**:
 после `da92d369` (fork CI [36133265663](https://github.com/fxpw/KytyPS5/actions/runs/36133265663):
 Windows/Linux/macOS PASS на точном SHA) исправлены две следующие общие причины

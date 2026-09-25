@@ -886,6 +886,8 @@ void EmitShiftRightLogicalU64Values(EmitterState& state, uint32_t low, uint32_t 
 bool EmitValueAlu(ValueEmitContext& ctx, const IR::Inst& inst);
 bool EmitValueFlow(ValueEmitContext& ctx, const IR::Inst& inst);
 bool EmitValueMemory(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t EmitBoundedFlatWord(EmitterState& state, uint32_t index, uint32_t count,
+                             uint32_t flat_offset);
 bool EmitValueImage(ValueEmitContext& ctx, const IR::Inst& inst);
 
 template <typename Fn>

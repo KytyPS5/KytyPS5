@@ -56,7 +56,7 @@ struct DeferredContinuePatch {
 };
 
 struct StructuredFunctionState {
-	std::unordered_set<const IR::Block*>           dedicated_continues;
+	std::unordered_map<const IR::Block*, uint32_t> dedicated_continues;
 	std::unordered_map<const IR::Block*,
 	                   std::pair<const IR::Block*, const IR::Block*>>
 	    budgeted_loop_continues;
@@ -218,7 +218,10 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, StructuredFunctionState& st
 			const auto* merge = TargetBlock(program, term.merge_block);
 			const auto* cont  = TargetBlock(program, term.continue_block);
 			if (merge != nullptr && cont != nullptr) {
-				ctx.state.builder.AddFunction(spv::OpLoopMerge, ctx.Label(merge), ctx.Label(cont),
+				const auto bridge = structured.dedicated_continues.find(cont);
+				const auto continue_label = bridge == structured.dedicated_continues.end()
+				                                ? ctx.Label(cont) : bridge->second;
+				ctx.state.builder.AddFunction(spv::OpLoopMerge, ctx.Label(merge), continue_label,
 				                              spv::LoopControlMaskNone);
 			}
 		} else if (term.kind == CFG::TerminatorKind::ConditionalBranch &&
@@ -385,7 +388,7 @@ void Invoke(Return (*emit)(Context&, Args...), ValueEmitContext& ctx, const IR::
 	}(std::index_sequence_for<Args...> {});
 }
 
-void EmitDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
+void EmitRawDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
 	switch (inst.GetOpcode()) {
 #define VALUE_OPCODE(name, ...)                                                                    \
 	case IR::ValueOpcode::name: Invoke(Emit##name, ctx, inst); break;
@@ -393,6 +396,82 @@ void EmitDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
 #undef VALUE_OPCODE
 		default: ctx.Fail(inst, "has no direct SPIR-V emitter");
 	}
+}
+
+// A bounded descriptor is a runtime choice among fully specialized native
+// buffers. Emit each access against its own descriptor metadata so formats,
+// strides, bounds, and byte offsets remain tied to the selected resource.
+bool EmitBoundedBufferMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
+	if (IR::BufferAccessOf(inst.GetOpcode()) == IR::BufferAccess::None) return false;
+	const auto memory = ctx.Memory(inst);
+	if (memory.buffer_table == UINT32_MAX) return false;
+	auto& state = ctx.state;
+	if (memory.buffer_table >= state.program.info.buffer_tables.size()) {
+		ctx.Fail(inst, "bounded buffer table specialization is missing");
+	}
+	const auto& table = state.program.info.buffer_tables[memory.buffer_table];
+	const bool has_result = inst.GetType() != IR::Type::Void;
+	if (table.count == 0) {
+		if (!table.resources.empty()) ctx.Fail(inst, "empty bounded buffer table retained candidates");
+		if (has_result) ctx.Define(inst, state.builder.Constant(OpUndef, TypeId(state, inst.GetType()), {}));
+		return true;
+	}
+	const auto* handle = inst.Arg(0).ResolveInstruction();
+	if (handle == nullptr || handle->GetOpcode() != IR::ValueOpcode::GetBufferResource ||
+	    table.resources.empty()) {
+		ctx.Fail(inst, "bounded buffer table has no index or typed candidates");
+	}
+	const auto selected = EmitBoundedFlatWord(state, ctx.Arg(*handle, 0), table.count,
+	                                          table.mapping_flat_offset);
+	const auto merge_label = state.builder.AllocateId();
+	const auto invalid_label = state.builder.AllocateId();
+	const auto result = has_result ? ctx.Result(inst) : 0u;
+	std::vector<uint32_t> labels;
+	std::vector<uint32_t> switch_words {OpSwitch, selected, invalid_label};
+	for (const auto resource: table.resources) {
+		if (resource >= state.program.info.buffers.size() ||
+		    std::count(table.resources.begin(), table.resources.end(), resource) != 1) {
+			ctx.Fail(inst, "bounded buffer table contains an invalid candidate");
+		}
+		labels.push_back(state.builder.AllocateId());
+		switch_words.push_back(resource);
+		switch_words.push_back(labels.back());
+	}
+	state.builder.AddFunction({OpSelectionMerge, merge_label, SelectionControlNone});
+	state.builder.AddFunction(switch_words);
+	EmitLabel(state, invalid_label);
+	state.builder.AddFunction({OpUnreachable});
+	std::vector<uint32_t> phi {OpPhi, has_result ? TypeId(state, inst.GetType()) : 0u, result};
+	const auto* previous_inst = ctx.memory_override_inst;
+	const auto* previous_memory = ctx.memory_override;
+	for (size_t candidate = 0; candidate < table.resources.size(); ++candidate) {
+		EmitLabel(state, labels[candidate]);
+		auto specialized = memory;
+		specialized.resource = table.resources[candidate];
+		specialized.buffer_table = UINT32_MAX;
+		ctx.memory_override_inst = &inst;
+		ctx.memory_override = &specialized;
+		ctx.definitions.erase(&inst);
+		EmitRawDirectInstruction(ctx, inst);
+		if (has_result) {
+			phi.push_back(ctx.definitions.at(&inst));
+			phi.push_back(state.current_label);
+		}
+		state.builder.AddFunction({OpBranch, merge_label});
+	}
+	ctx.memory_override_inst = previous_inst;
+	ctx.memory_override = previous_memory;
+	ctx.definitions.erase(&inst);
+	EmitLabel(state, merge_label);
+	if (has_result) {
+		state.builder.AddFunction(phi);
+		ctx.definitions.emplace(&inst, result);
+	}
+	return true;
+}
+
+void EmitDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
+	if (!EmitBoundedBufferMemory(ctx, inst)) EmitRawDirectInstruction(ctx, inst);
 		const auto shared_access = IR::SharedAccessOf(inst.GetOpcode());
 		const auto buffer_access = IR::BufferAccessOf(inst.GetOpcode());
 		const auto address_access = IR::AddressOpcodeInfoOf(inst.GetOpcode()).access;
@@ -535,7 +614,7 @@ void EmitStructuredFunction(ValueEmitContext& ctx) {
 		const auto& info = ctx.program.block_info[index];
 		if (const auto* body = DedicatedContinueBody(ctx.program, ctx.program.blocks[index], info);
 		    body != nullptr) {
-			structured.dedicated_continues.insert(body);
+			structured.dedicated_continues.emplace(body, ctx.state.builder.AllocateId());
 		}
 		if (ctx.state.graphics_loop_counter_variable != 0 && info.terminator.loop_header) {
 			const auto* header = ctx.program.blocks[index];
@@ -552,14 +631,12 @@ void EmitStructuredFunction(ValueEmitContext& ctx) {
 		EmitBlock(ctx, block, [&](ValueEmitContext& lane, const IR::Inst& inst) {
 			EmitStructuredInstruction(lane, structured, inst);
 		});
-		if (structured.dedicated_continues.contains(block) &&
-		    ctx.state.current_label != ctx.Label(block)) {
+		if (const auto bridge = structured.dedicated_continues.find(block);
+		    bridge != structured.dedicated_continues.end()) {
 			// A generated selection/loop merge cannot also be this loop's
 			// continue target: its construct must remain inside the loop body.
-			// Keep the bridge only when emission actually split the IR block.
-			const auto continue_label = ctx.state.builder.AllocateId();
-			ctx.state.builder.AddFunction({OpBranch, continue_label});
-			EmitLabel(ctx.state, continue_label);
+			ctx.state.builder.AddFunction({OpBranch, bridge->second});
+			EmitLabel(ctx.state, bridge->second);
 		}
 		// Header Phis must name the actual back-edge label after the body and
 		// its generated selections, including a dedicated continue bridge when needed.
@@ -873,6 +950,7 @@ const IR::Inst* ValueEmitContext::ImageAddress(IR::Value value) {
 }
 
 const IR::MemoryInfo& ValueEmitContext::Memory(const IR::Inst& inst) const {
+	if (memory_override_inst == &inst && memory_override != nullptr) return *memory_override;
 	return state.program.memory_info.at(inst.Flags<IR::MemoryFlags>().index);
 }
 

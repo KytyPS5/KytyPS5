@@ -108,6 +108,17 @@ void BufferCache::DeleteBuffer(BufferId id) {
 	}
 }
 
+/**
+ * @brief Downloads GPU-modified buffer ranges back to CPU guest memory.
+ *
+ * Slices large modified spans into bounded chunks and batches transfers so they do not
+ * exceed staging buffer capacity, then defers invalidation and backing writeback.
+ *
+ * @param buffer Source GPU buffer to download from.
+ * @param vaddr Guest virtual address of the requested download range.
+ * @param size Size in bytes of the requested download range.
+ * @return true if any modified ranges were found and scheduled for download, false otherwise.
+ */
 bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
 	struct DownloadSlice {
 		uint64_t src_offset;

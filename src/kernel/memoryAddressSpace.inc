@@ -42,6 +42,14 @@ public:
 		AddressRangeUnavailable,
 	};
 
+	/**
+	 * @brief Constructs the backing store for guest physical direct memory.
+	 *
+	 * On Windows, reserves address space using SEC_RESERVE so pagefile commitment
+	 * is performed lazily on demand rather than upfront.
+	 *
+	 * @param size Total physical backing size to reserve in bytes.
+	 */
 	explicit GuestBackingStore(uint64_t size): m_size(size) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		m_handle = CreateFileMappingA(
@@ -158,6 +166,13 @@ public:
 
 	[[nodiscard]] uint64_t GetBackingSize() const { return m_size; }
 
+	/**
+	 * @brief Commits on demand and clears a range of physical backing memory.
+	 *
+	 * @param backing_offset Offset in bytes within the backing store.
+	 * @param size Number of bytes to commit and zero.
+	 * @return true if the range was successfully committed and cleared, false otherwise.
+	 */
 	bool ZeroRange(uint64_t backing_offset, uint64_t size) {
 		if (!IsAvailable() || !RangeOk(backing_offset, size)) {
 			return false;
@@ -333,6 +348,14 @@ public:
 		return true;
 	}
 
+	/**
+	 * @brief Unmaps a single mapped view in the guest address space, preserving the placeholder.
+	 *
+	 * @param vaddr Guest virtual address to unmap.
+	 * @param size Size of the range to unmap in bytes.
+	 * @param placeholder_preserved Optional output indicating whether the placeholder was preserved.
+	 * @return true if unmapping succeeded, false otherwise.
+	 */
 	bool UnmapOne(uint64_t vaddr, uint64_t size, bool* placeholder_preserved = nullptr) {
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
 		if (g_test_backing_store_unmaps_before_failure == 0) {
@@ -378,7 +401,6 @@ public:
 				m_maps.emplace(old.vaddr, old);
 				return false;
 			}
-			VirtualAlloc(m_backing_base + old.backing_offset, old.size, MEM_RESET, PAGE_READWRITE);
 			if (placeholder_preserved != nullptr) {
 				*placeholder_preserved = true;
 			}
@@ -405,8 +427,6 @@ public:
 				     ok;
 			}
 			if (ok) {
-				VirtualAlloc(m_backing_base + old.backing_offset + (vaddr - old.vaddr), size,
-				             MEM_RESET, PAGE_READWRITE);
 				if (placeholder_preserved != nullptr) {
 					*placeholder_preserved = true;
 				}
@@ -577,6 +597,16 @@ private:
 		                   MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) != 0;
 	}
 
+	/**
+	 * @brief Replaces an existing virtual address placeholder with a committed view of backing memory.
+	 *
+	 * @param vaddr Target guest virtual address.
+	 * @param size Size of the mapping in bytes.
+	 * @param backing_offset Offset into the backing section to map.
+	 * @param mode Desired memory access protection mode.
+	 * @param failure_reason Optional output pointer for failure diagnostics.
+	 * @return Pointer to mapped region on success, nullptr on failure.
+	 */
 	void* ReplacePlaceholderView(uint64_t vaddr, uint64_t size, uint64_t backing_offset,
 	                             VirtualMemory::Mode mode, FailureReason* failure_reason) {
 		const DWORD map_protect =
@@ -657,6 +687,11 @@ private:
 
 class GuestAddressSpace {
 public:
+	/**
+	 * @brief Initializes the guest virtual address space and backing store.
+	 *
+	 * @param backing_size Total backing memory size in bytes.
+	 */
 	explicit GuestAddressSpace(uint64_t backing_size) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		SYSTEM_INFO info {};

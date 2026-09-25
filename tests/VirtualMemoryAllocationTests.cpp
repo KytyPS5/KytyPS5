@@ -1758,6 +1758,9 @@ void TestLargeDirectMapAliasesAcrossChunks() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+/**
+ * @brief Tests on-demand commitment of physical direct memory and placeholder retention on unmap.
+ */
 void TestOnDemandPhysicalMemoryCommitment() {
 	const char*        test = "OnDemandPhysicalMemoryCommitment";
 	constexpr uint64_t size = 0x200000; // 2 MiB

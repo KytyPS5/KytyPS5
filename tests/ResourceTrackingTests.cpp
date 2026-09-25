@@ -268,6 +268,9 @@ MakeIndirectImageFixture(bool malformed, uint32_t material_immediate = 0,
   return fixture;
 }
 
+/**
+ * @brief Tests invariant indirect image materialization with non-zero scalar buffer offsets.
+ */
 void TestInvariantIndirectImageMaterialization() {
   auto fixture = MakeIndirectImageFixture(false);
   fixture->PlanAndTrack();

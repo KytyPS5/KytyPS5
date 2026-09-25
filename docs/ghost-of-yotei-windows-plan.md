@@ -3,20 +3,18 @@
 Обновлено **26 сентября 2026 года**. Игра: **Ghost of Yōtei, PPSA26344**.
 Рабочая ветка — `yotei-windows-bringup` в локальном fork `fxpw/KytyPS5`.
 
-Checkpoint deferred flat SRT + expression null rows **26 сентября 2026 года**,
-источник `eb8cc3a5` + expression-null (рабочее дерево):
+Checkpoint dense image/pair budget + Materialize path **26 сентября 2026 года**,
+источник `ba183b7c` + MaxImages/MaxSampledPairs=512 (рабочее дерево):
 
-1. Guard dominance `5f3fdf61` (`daa8b94a`) и ImageWrite `753c552f` (`938b8f55`)
-   закрыты.
-2. `RefreshFlatBuffer` больше не вычисляет `FlatSlotDeferred` (`eb8cc3a5`).
-   Game `_Build/runs/yotei-integrated-20260925-231010-c7d243` прошёл SRT walk;
-   следующий отказ — `bounded buffer expression 8 candidate 6 cannot be evaluated`.
-3. Unevaluable expression candidates → null descriptor (как foreign dense rows).
-   Game `_Build/runs/yotei-integrated-20260925-231516-b694aa` (SHA `6dcc778a…`,
-   frame 296, `shown=117`): **`8457901d` Materialize снят**. Fatal на PS
-   `f8927c09f4b928c7`: `inline sampled pairs exceed the dense image resource
-   limit (size=23184 stride=368 probes=255 pairs=52 images=115)`.
-4. Меню/gameplay **PENDING**.
+1. `8457901d` закрыт: deferred flat skip (`eb8cc3a5`) + null unevaluable
+   expression candidates (`ba183b7c`).
+2. PS `f8927c09` упирался в `MaxImages=64` / `MaxSampledPairs=64` при
+   probes=255 → pairs≈52 / images≈115. Лимиты подняты до 512 (контракт
+   bring-up). Game `_Build/runs/yotei-integrated-20260925-232709-4df601`
+   (SHA `4b35d0ce…`, frame 306, `shown=114`): **`f8927c09` Emit SPIR-V
+   words≈297386**. Следующий fatal — VS `4c26e33f93a0ef40`:
+   `runtime descriptor evaluation failed` на Materialize.
+3. Меню/gameplay **PENDING**.
 
 Checkpoint materialization + VOPC `0xbd` + LDS atomic return + workgroup
 buffer descriptors + VOP2 DPP8 / split-wave64 Ballot **26 сентября 2026 года**,

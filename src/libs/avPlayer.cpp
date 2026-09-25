@@ -1719,7 +1719,7 @@ static AvPlayerInternal* create_player(const AvPlayerMemAllocator&     mem,
 	h->mem           = mem;
 	h->file          = file;
 	h->event         = event;
-	h->auto_start    = auto_start;
+	h->auto_start    = auto_start || event.event_callback == nullptr;
 	h->video_buffers = std::clamp(video_buffers <= 0 ? 2 : video_buffers, 2, 16);
 	h->post_init.demux_video_buffer_size = 4 * 1024 * 1024;
 	return h;

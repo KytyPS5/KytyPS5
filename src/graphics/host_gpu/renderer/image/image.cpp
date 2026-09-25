@@ -690,6 +690,12 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 		     create.extent.width, create.extent.height, create.extent.depth,
 		     static_cast<int>(create.format), create.arrayLayers, create.mipLevels);
 	}
+	SetVulkanObjectNameF(
+	    graphics.device, backing.image,
+	    "Kyty.Image[guest=0x{:016x} size=0x{:x} extent={}x{}x{} format={} mips={} layers={} samples={}]",
+	    info.data.address, info.data.size, info.extent.width, info.extent.height, info.extent.depth,
+	    static_cast<uint32_t>(info.pixel_format), info.resources.levels, info.resources.layers,
+	    info.samples);
 }
 
 uint64_t Image::HashGuestEdges() const {

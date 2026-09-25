@@ -2002,6 +2002,32 @@ int KYTY_SYSV_ABI Getsockname(int s, void* addr, uint32_t* addrlen) {
 	return result;
 }
 
+int KYTY_SYSV_ABI Getpeername(int s, void* addr, uint32_t* addrlen) {
+	PRINT_NAME();
+
+	LOGF("\t s       = %d\n"
+	     "\t addr    = 0x%016" PRIx64 "\n"
+	     "\t addrlen = 0x%016" PRIx64 "\n",
+	     s, reinterpret_cast<uint64_t>(addr), reinterpret_cast<uint64_t>(addrlen));
+
+	NativeSocket socket = INVALID_NATIVE_SOCKET;
+	SocketSlot   state;
+	if (!GetSocketBackend(s, &socket, &state)) {
+		return SetGuestSocketError(Posix::POSIX_ENOTCONN);
+	}
+	if (addr == nullptr || addrlen == nullptr) {
+		return SetGuestSocketError(Posix::POSIX_EFAULT);
+	}
+
+	sockaddr_storage host_addr {};
+	SocketLength     host_addrlen = sizeof(host_addr);
+	if (::getpeername(socket, reinterpret_cast<sockaddr*>(&host_addr), &host_addrlen) != 0) {
+		return SetHostSocketError();
+	}
+
+	return ConvertHostSockaddr(&host_addr, host_addrlen, addr, addrlen);
+}
+
 int KYTY_SYSV_ABI Getsockopt(int s, int level, int optname, void* optval, uint32_t* optlen) {
 	PRINT_NAME();
 

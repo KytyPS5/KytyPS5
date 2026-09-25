@@ -1390,6 +1390,15 @@ bool SplitSharedMergeBlock(Graph& graph, uint32_t merge,
 	if (construct_predecessors.empty() || (!force_split && !has_external_predecessor)) {
 		return false;
 	}
+	if (construct_predecessors.size() == 1u) {
+		const auto* predecessor = graph.FindBlock(construct_predecessors.front());
+		if (predecessor != nullptr && predecessor->inst_begin == predecessor->inst_end &&
+		    predecessor->terminator.kind == TerminatorKind::Branch &&
+		    predecessor->terminator.true_block == merge &&
+		    predecessor->start_pc == merge_block->start_pc) {
+			return false;
+		}
+	}
 	const auto synthetic_merge = AppendSyntheticBranchBlock(graph, merge);
 	auto*      synthetic_block = graph.FindBlock(synthetic_merge);
 	if (synthetic_block != nullptr) {

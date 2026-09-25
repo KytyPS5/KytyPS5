@@ -1346,8 +1346,9 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 			}
 			break;
 		case 0x02:
+		case 0x04:
 			if constexpr (sizeof(T) == sizeof(uint32_t)) {
-				if (eop_event_type == 0x2f && event_index == 0x06) {
+				if (event_write_source == 0x02 && eop_event_type == 0x2f && event_index == 0x06) {
 					switch (cache_action) {
 						case 0x00: write32(false); return;
 						case 0x38: write32(true); return;
@@ -1355,6 +1356,9 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 					}
 				}
 			} else {
+				if (event_write_source == 0x04) {
+					value = Sync::ReadReferenceClock();
+				}
 				auto write64 = [&](bool with_writeback) {
 					auto* dst = static_cast<uint64_t*>(dst_gpu_addr);
 					std::memcpy(dst, &value, sizeof(value));
@@ -1411,7 +1415,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 							case 0x14:
 							case 0x28:
 								if (((eop_event_type == 0x04 || eop_event_type == 0x28) &&
-								     event_index == 0x05 && !with_interrupt) ||
+								     event_index == 0x05) ||
 								    (event_index == 0x00)) {
 									write64(true);
 									return;
@@ -1436,45 +1440,6 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 					case 0x3b:
 						if (eop_event_type == 0x04 && event_index == 0x05 && with_interrupt) {
 							write64(true);
-							return;
-						}
-						break;
-					default: break;
-				}
-			}
-			break;
-		case 0x04:
-			if constexpr (sizeof(T) == sizeof(uint64_t)) {
-				const auto clock = Sync::ReadReferenceClock();
-				auto*      dst   = static_cast<uint64_t*>(dst_gpu_addr);
-				std::memcpy(dst, &clock, sizeof(clock));
-				switch (cache_action) {
-					case 0x00:
-						if ((eop_event_type == 0x04 && event_index == 0x05) ||
-						    (eop_event_type == 0x28 && event_index == 0x00)) {
-							if (with_interrupt) {
-								Sync::WriteAtEndOfPipeWithInterrupt64(
-								    m_submit_id, command, dst, clock, m_interrupt_event_id,
-								    interrupt_context_id);
-							} else {
-								Sync::WriteAtEndOfPipeClockCounter(m_submit_id, command,
-								                                   dst, clock);
-							}
-							return;
-						}
-						break;
-					case 0x38:
-						if ((eop_event_type == 0x04 &&
-						     (event_index == 0x00 || event_index == 0x05)) ||
-						    (eop_event_type == 0x28 && event_index == 0x00)) {
-							if (with_interrupt) {
-								Sync::WriteAtEndOfPipeWithInterruptWriteBack64(
-								    m_submit_id, command, dst, clock, m_interrupt_event_id,
-								    interrupt_context_id);
-							} else {
-								Sync::WriteAtEndOfPipeClockCounterWithWriteBack(
-								    m_submit_id, command, dst, clock);
-							}
 							return;
 						}
 						break;

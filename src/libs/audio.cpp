@@ -101,6 +101,7 @@ private:
 		uint32_t freq             = 0;
 		Format   format           = Format::Unknown;
 		uint64_t last_output_time = 0;
+		bool     queue_primed     = false;
 		int      channels_num     = 0;
 		int      volume[12]       = {};
 
@@ -360,26 +361,44 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking) {
 	const auto           prepared_size =
 	    BytesPerSample(port->format) * output_channels * port->samples_num;
 
+	uint32_t min_queued_size = 0;
 	if (blocking) {
 		constexpr uint64_t target_latency_us = 40000;
 		const auto buffer_us = port->freq != 0 ? (1000000ULL * port->samples_num) / port->freq : 0;
 		const auto buffers =
 		    buffer_us != 0 ? static_cast<uint32_t>((target_latency_us + buffer_us - 1) / buffer_us)
 		                   : 2u;
-		const auto min_queued_size = prepared_size * std::clamp(buffers, 2u, 16u);
+		min_queued_size           = prepared_size * std::clamp(buffers, 2u, 16u);
 		const auto wait_start      = LibKernel::KernelGetProcessTime();
-		while (SDL_GetAudioStreamQueued(port->stream) > static_cast<int>(min_queued_size)) {
+		auto queued                = SDL_GetAudioStreamQueued(port->stream);
+		if (queued < static_cast<int>(prepared_size)) {
+			port->queue_primed = false;
+		}
+		while (queued > static_cast<int>(min_queued_size)) {
 			if (LibKernel::KernelGetProcessTime() - wait_start > 200000) {
 				SDL_ClearAudioStream(port->stream);
+				port->queue_primed = false;
 				break;
 			}
 			Common::Thread::SleepMicro(1000);
+			queued = SDL_GetAudioStreamQueued(port->stream);
+		}
+		if (port->queue_primed) {
+			const auto next_time = port->last_output_time + buffer_us;
+			const auto now       = LibKernel::KernelGetProcessTime();
+			if (next_time > now) {
+				Common::Thread::SleepMicro(next_time - now);
+			}
 		}
 	}
 
 	if (!SDL_PutAudioStreamData(port->stream, prepared_data, static_cast<int>(prepared_size))) {
 		LOGF("AudioOut: SDL_PutAudioStreamData failed: %s\n", SDL_GetError());
 		return false;
+	}
+	if (blocking && !port->queue_primed &&
+	    SDL_GetAudioStreamQueued(port->stream) >= static_cast<int>(min_queued_size)) {
+		port->queue_primed = true;
 	}
 
 	return true;

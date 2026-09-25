@@ -2,351 +2,352 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
-bool Translator::EmitVector(const Decoder::Instruction& inst) {
+void Translator::EmitVector(const Decoder::Instruction& inst) {
 	using O = Decoder::Opcode;
 	switch (inst.opcode) {
-		case O::V_NOP: return true;
-		case O::V_ADD_I32: ADD_U32(inst, true, false); return true;
-		case O::V_ADDC_U32: ADD_U32(inst, true, true); return true;
-		case O::V_SUB_I32: SUB_U32(inst, true, false); return true;
-		case O::V_SUBREV_I32: SUB_U32(inst, true, true); return true;
-		case O::V_SUB_CO_CI_U32: SUBB_U32(inst, true, false); return true;
-		case O::V_SUBREV_CO_CI_U32: SUBB_U32(inst, true, true); return true;
+		case O::V_NOP: return;
+		case O::V_ADD_I32: ADD_U32(inst, true, false); return;
+		case O::V_ADDC_U32: ADD_U32(inst, true, true); return;
+		case O::V_SUB_I32: SUB_U32(inst, true, false); return;
+		case O::V_SUBREV_I32: SUB_U32(inst, true, true); return;
+		case O::V_SUB_CO_CI_U32: SUBB_U32(inst, true, false); return;
+		case O::V_SUBREV_CO_CI_U32: SUBB_U32(inst, true, true); return;
 
-		case O::V_MOV_B32: MOV_B32(inst, true); return true;
-		case O::V_MOVRELS_B32: V_MOVRELS_B32(inst); return true;
-		case O::V_MOVRELD_B32: V_MOVRELD_B32(inst); return true;
-		case O::V_READFIRSTLANE_B32: V_READFIRSTLANE_B32(inst); return true;
-		case O::V_READLANE_B32: V_READLANE_B32(inst); return true;
-		case O::V_WRITELANE_B32: V_WRITELANE_B32(inst); return true;
-		case O::V_PERMLANE16_B32: V_PERMLANE16_B32(inst, false); return true;
-		case O::V_PERMLANEX16_B32: V_PERMLANE16_B32(inst, true); return true;
+		case O::V_MOV_B32: MOV_B32(inst, true); return;
+		case O::V_MOVRELS_B32: V_MOVRELS_B32(inst); return;
+		case O::V_MOVRELD_B32: V_MOVRELD_B32(inst); return;
+		case O::V_READFIRSTLANE_B32: V_READFIRSTLANE_B32(inst); return;
+		case O::V_READLANE_B32: V_READLANE_B32(inst); return;
+		case O::V_WRITELANE_B32: V_WRITELANE_B32(inst); return;
+		case O::V_PERMLANE16_B32: V_PERMLANE16_B32(inst, false); return;
+		case O::V_PERMLANEX16_B32: V_PERMLANE16_B32(inst, true); return;
 
 		case O::V_CMP_F_I32:
-		case O::V_CMP_F_U32: EmitCompareConstant(inst, false, false, false); return true;
+		case O::V_CMP_F_U32: EmitCompareConstant(inst, false, false, false); return;
 		case O::V_CMP_T_I32:
-		case O::V_CMP_T_U32: EmitCompareConstant(inst, true, false, false); return true;
+		case O::V_CMP_T_U32: EmitCompareConstant(inst, true, false, false); return;
 		case O::V_CMP_EQ_U32:
 		case O::V_CMP_EQ_I32:
 			EmitIntegerCompare(inst, IR::ValueOpcode::IEqual32, IR::Type::U32, false, false);
-			return true;
+			return;
 		case O::V_CMPX_EQ_U32:
 		case O::V_CMPX_EQ_I32:
 			EmitIntegerCompare(inst, IR::ValueOpcode::IEqual32, IR::Type::U32, false, true);
-			return true;
+			return;
 		case O::V_CMP_NE_U32:
 		case O::V_CMP_NE_I32:
 			EmitIntegerCompare(inst, IR::ValueOpcode::INotEqual32, IR::Type::U32, false, false);
-			return true;
+			return;
 		case O::V_CMPX_NE_U32:
 		case O::V_CMPX_NE_I32:
 			EmitIntegerCompare(inst, IR::ValueOpcode::INotEqual32, IR::Type::U32, false, true);
-			return true;
+			return;
 		case O::V_CMP_GT_U32:
 			EmitIntegerCompare(inst, IR::ValueOpcode::UGreaterThan32, IR::Type::U32, false, false);
-			return true;
+			return;
 		case O::V_CMPX_GT_U32:
 			EmitIntegerCompare(inst, IR::ValueOpcode::UGreaterThan32, IR::Type::U32, false, true);
-			return true;
+			return;
 		case O::V_CMP_GE_U32:
 			EmitIntegerCompare(inst, IR::ValueOpcode::UGreaterThanEqual32, IR::Type::U32, false,
 			                   false);
-			return true;
+			return;
 		case O::V_CMPX_GE_U32:
 			EmitIntegerCompare(inst, IR::ValueOpcode::UGreaterThanEqual32, IR::Type::U32, false,
 			                   true);
-			return true;
+			return;
 		case O::V_CMP_LT_U32:
 			EmitIntegerCompare(inst, IR::ValueOpcode::ULessThan32, IR::Type::U32, false, false);
-			return true;
+			return;
 		case O::V_CMPX_LT_U32:
 			EmitIntegerCompare(inst, IR::ValueOpcode::ULessThan32, IR::Type::U32, false, true);
-			return true;
+			return;
 		case O::V_CMP_LE_U32:
 			EmitIntegerCompare(inst, IR::ValueOpcode::ULessThanEqual32, IR::Type::U32, false,
 			                   false);
-			return true;
+			return;
 		case O::V_CMPX_LE_U32:
 			EmitIntegerCompare(inst, IR::ValueOpcode::ULessThanEqual32, IR::Type::U32, false, true);
-			return true;
+			return;
 		case O::V_CMP_GT_I32:
 			EmitIntegerCompare(inst, IR::ValueOpcode::SGreaterThan32, IR::Type::U32, false, false);
-			return true;
+			return;
 		case O::V_CMPX_GT_I32:
 			EmitIntegerCompare(inst, IR::ValueOpcode::SGreaterThan32, IR::Type::U32, false, true);
-			return true;
+			return;
 		case O::V_CMP_GE_I32:
 			EmitIntegerCompare(inst, IR::ValueOpcode::SGreaterThanEqual32, IR::Type::U32, false,
 			                   false);
-			return true;
+			return;
 		case O::V_CMPX_GE_I32:
 			EmitIntegerCompare(inst, IR::ValueOpcode::SGreaterThanEqual32, IR::Type::U32, false,
 			                   true);
-			return true;
+			return;
 		case O::V_CMP_LT_I32:
 			EmitIntegerCompare(inst, IR::ValueOpcode::SLessThan32, IR::Type::U32, false, false);
-			return true;
+			return;
 		case O::V_CMPX_LT_I32:
 			EmitIntegerCompare(inst, IR::ValueOpcode::SLessThan32, IR::Type::U32, false, true);
-			return true;
+			return;
 		case O::V_CMP_LE_I32:
 			EmitIntegerCompare(inst, IR::ValueOpcode::SLessThanEqual32, IR::Type::U32, false,
 			                   false);
-			return true;
+			return;
 		case O::V_CMPX_LE_I32:
 			EmitIntegerCompare(inst, IR::ValueOpcode::SLessThanEqual32, IR::Type::U32, false, true);
-			return true;
+			return;
 		case O::V_CMP_EQ_I64:
 		case O::V_CMP_EQ_U64:
 			EmitIntegerCompare(inst, IR::ValueOpcode::IEqual64, IR::Type::U64, false, false);
-			return true;
+			return;
 		case O::V_CMP_LT_U64:
 			EmitIntegerCompare(inst, IR::ValueOpcode::ULessThan64, IR::Type::U64, false, false);
-			return true;
+			return;
 		case O::V_CMP_GT_U64:
 			EmitIntegerCompare(inst, IR::ValueOpcode::UGreaterThan64, IR::Type::U64, false, false);
-			return true;
+			return;
 		case O::V_CMP_NE_U64:
 			EmitIntegerCompare(inst, IR::ValueOpcode::INotEqual64, IR::Type::U64, false, false);
-			return true;
+			return;
 		case O::V_CMPX_NE_I64:
 		case O::V_CMPX_NE_U64:
 			EmitIntegerCompare(inst, IR::ValueOpcode::INotEqual64, IR::Type::U64, false, true);
-			return true;
+			return;
 
 		case O::V_CMP_EQ_U16:
 			EmitInteger16Compare(inst, IR::ValueOpcode::IEqual32, false, false);
-			return true;
+			return;
 		case O::V_CMP_EQ_I16:
 			EmitInteger16Compare(inst, IR::ValueOpcode::IEqual32, true, false);
-			return true;
+			return;
 		case O::V_CMPX_EQ_I16:
 			EmitInteger16Compare(inst, IR::ValueOpcode::IEqual32, true, true);
-			return true;
+			return;
 		case O::V_CMP_NE_U16:
 			EmitInteger16Compare(inst, IR::ValueOpcode::INotEqual32, false, false);
-			return true;
+			return;
 		case O::V_CMPX_NE_U16:
 			EmitInteger16Compare(inst, IR::ValueOpcode::INotEqual32, false, true);
-			return true;
+			return;
 		case O::V_CMP_NE_I16:
 			EmitInteger16Compare(inst, IR::ValueOpcode::INotEqual32, true, false);
-			return true;
+			return;
 		case O::V_CMPX_NE_I16:
 			EmitInteger16Compare(inst, IR::ValueOpcode::INotEqual32, true, true);
-			return true;
+			return;
 		case O::V_CMP_GT_U16:
 			EmitInteger16Compare(inst, IR::ValueOpcode::UGreaterThan32, false, false);
-			return true;
+			return;
 		case O::V_CMPX_GT_U16:
 			EmitInteger16Compare(inst, IR::ValueOpcode::UGreaterThan32, false, true);
-			return true;
+			return;
 		case O::V_CMP_GE_U16:
 			EmitInteger16Compare(inst, IR::ValueOpcode::UGreaterThanEqual32, false, false);
-			return true;
+			return;
 		case O::V_CMP_LT_U16:
 			EmitInteger16Compare(inst, IR::ValueOpcode::ULessThan32, false, false);
-			return true;
+			return;
 		case O::V_CMPX_LT_U16:
 			EmitInteger16Compare(inst, IR::ValueOpcode::ULessThan32, false, true);
-			return true;
+			return;
 		case O::V_CMPX_EQ_U16:
 			EmitInteger16Compare(inst, IR::ValueOpcode::IEqual32, false, true);
-			return true;
+			return;
 		case O::V_CMP_LE_U16:
 			EmitInteger16Compare(inst, IR::ValueOpcode::ULessThanEqual32, false, false);
-			return true;
+			return;
 		case O::V_CMP_GT_I16:
 			EmitInteger16Compare(inst, IR::ValueOpcode::SGreaterThan32, true, false);
-			return true;
+			return;
 		case O::V_CMPX_GT_I16:
 			EmitInteger16Compare(inst, IR::ValueOpcode::SGreaterThan32, true, true);
-			return true;
+			return;
 		case O::V_CMP_GE_I16:
 			EmitInteger16Compare(inst, IR::ValueOpcode::SGreaterThanEqual32, true, false);
-			return true;
+			return;
 		case O::V_CMPX_GE_I16:
 			EmitInteger16Compare(inst, IR::ValueOpcode::SGreaterThanEqual32, true, true);
-			return true;
+			return;
 		case O::V_CMP_LT_I16:
 			EmitInteger16Compare(inst, IR::ValueOpcode::SLessThan32, true, false);
-			return true;
+			return;
 		case O::V_CMPX_LT_I16:
 			EmitInteger16Compare(inst, IR::ValueOpcode::SLessThan32, true, true);
-			return true;
+			return;
 		case O::V_CMP_LE_I16:
 			EmitInteger16Compare(inst, IR::ValueOpcode::SLessThanEqual32, true, false);
-			return true;
+			return;
 		case O::V_CMPX_LE_I16:
 			EmitInteger16Compare(inst, IR::ValueOpcode::SLessThanEqual32, true, true);
-			return true;
+			return;
 
-		case O::V_CMP_F_F32: EmitCompareConstant(inst, false, false, false); return true;
-		case O::V_CMP_TRU_F32: EmitCompareConstant(inst, true, false, false); return true;
+		case O::V_CMP_F_F32: EmitCompareConstant(inst, false, false, false); return;
+		case O::V_CMP_TRU_F32: EmitCompareConstant(inst, true, false, false); return;
 		case O::V_CMP_EQ_F32:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPOrdEqual32, false, false);
-			return true;
+			return;
 		case O::V_CMPX_EQ_F32:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPOrdEqual32, false, true);
-			return true;
+			return;
 		case O::V_CMP_LG_F32:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPOrdNotEqual32, false, false);
-			return true;
+			return;
 		case O::V_CMPX_LG_F32:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPOrdNotEqual32, false, true);
-			return true;
+			return;
 		case O::V_CMP_GT_F32:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPOrdGreaterThan32, false, false);
-			return true;
+			return;
 		case O::V_CMPX_GT_F32:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPOrdGreaterThan32, false, true);
-			return true;
+			return;
 		case O::V_CMP_GE_F32:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPOrdGreaterThanEqual32, false, false);
-			return true;
+			return;
 		case O::V_CMPX_GE_F32:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPOrdGreaterThanEqual32, false, true);
-			return true;
+			return;
 		case O::V_CMP_LT_F32:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPOrdLessThan32, false, false);
-			return true;
+			return;
 		case O::V_CMPX_LT_F32:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPOrdLessThan32, false, true);
-			return true;
+			return;
 		case O::V_CMP_LE_F32:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPOrdLessThanEqual32, false, false);
-			return true;
+			return;
 		case O::V_CMPX_LE_F32:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPOrdLessThanEqual32, false, true);
-			return true;
+			return;
 		case O::V_CMP_NLG_F32:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPUnordEqual32, false, false);
-			return true;
+			return;
 		case O::V_CMPX_NLG_F32:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPUnordEqual32, false, true);
-			return true;
+			return;
 		case O::V_CMP_NEQ_F32:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPUnordNotEqual32, false, false);
-			return true;
+			return;
 		case O::V_CMPX_NEQ_F32:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPUnordNotEqual32, false, true);
-			return true;
+			return;
 		case O::V_CMP_NLE_F32:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPUnordGreaterThan32, false, false);
-			return true;
+			return;
 		case O::V_CMPX_NLE_F32:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPUnordGreaterThan32, false, true);
-			return true;
+			return;
 		case O::V_CMP_NLT_F32:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPUnordGreaterThanEqual32, false, false);
-			return true;
+			return;
 		case O::V_CMPX_NLT_F32:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPUnordGreaterThanEqual32, false, true);
-			return true;
+			return;
 		case O::V_CMP_NGE_F32:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPUnordLessThan32, false, false);
-			return true;
+			return;
 		case O::V_CMPX_NGE_F32:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPUnordLessThan32, false, true);
-			return true;
+			return;
 		case O::V_CMP_NGT_F32:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPUnordLessThanEqual32, false, false);
-			return true;
+			return;
 		case O::V_CMPX_NGT_F32:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPUnordLessThanEqual32, false, true);
-			return true;
+			return;
 		case O::V_CMP_EQ_F16:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPOrdEqual32, true, false);
-			return true;
+			return;
 		case O::V_CMPX_EQ_F16:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPOrdEqual32, true, true);
-			return true;
+			return;
 		case O::V_CMP_LG_F16:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPOrdNotEqual32, true, false);
-			return true;
+			return;
 		case O::V_CMP_GT_F16:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPOrdGreaterThan32, true, false);
-			return true;
+			return;
 		case O::V_CMPX_GT_F16:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPOrdGreaterThan32, true, true);
-			return true;
+			return;
 		case O::V_CMP_GE_F16:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPOrdGreaterThanEqual32, true, false);
-			return true;
+			return;
 		case O::V_CMPX_GE_F16:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPOrdGreaterThanEqual32, true, true);
-			return true;
+			return;
 		case O::V_CMP_LT_F16:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPOrdLessThan32, true, false);
-			return true;
+			return;
 		case O::V_CMPX_LT_F16:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPOrdLessThan32, true, true);
-			return true;
+			return;
 		case O::V_CMP_LE_F16:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPOrdLessThanEqual32, true, false);
-			return true;
+			return;
 		case O::V_CMPX_LE_F16:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPOrdLessThanEqual32, true, true);
-			return true;
+			return;
 		case O::V_CMP_NGT_F16:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPUnordLessThanEqual32, true, false);
-			return true;
+			return;
 		case O::V_CMPX_NGT_F16:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPUnordLessThanEqual32, true, true);
-			return true;
+			return;
 		case O::V_CMPX_NLE_F16:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPUnordGreaterThan32, true, true);
-			return true;
+			return;
 		case O::V_CMP_NEQ_F16:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPUnordNotEqual32, true, false);
-			return true;
+			return;
 		case O::V_CMPX_NEQ_F16:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPUnordNotEqual32, true, true);
-			return true;
+			return;
 		case O::V_CMP_NLT_F16:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPUnordGreaterThanEqual32, true, false);
-			return true;
+			return;
 		case O::V_CMPX_NLT_F16:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPUnordGreaterThanEqual32, true, true);
-			return true;
-		case O::V_CMP_O_F32: EmitFloatOrderedCompare(inst, true); return true;
-		case O::V_CMP_U_F32: EmitFloatOrderedCompare(inst, false); return true;
-		case O::V_CMP_CLASS_F32: EmitFloatClassCompare(inst, false); return true;
-		case O::V_CMPX_CLASS_F32: EmitFloatClassCompare(inst, true); return true;
+			return;
+		case O::V_CMP_O_F32: EmitFloatOrderedCompare(inst, true, false); return;
+		case O::V_CMP_U_F32: EmitFloatOrderedCompare(inst, false, false); return;
+		case O::V_CMPX_O_F32: EmitFloatOrderedCompare(inst, true, true); return;
+		case O::V_CMP_CLASS_F32: EmitFloatClassCompare(inst, false); return;
+		case O::V_CMPX_CLASS_F32: EmitFloatClassCompare(inst, true); return;
 
-		case O::V_CVT_F32_UBYTE0: V_CVT_F32_UBYTE(inst, 0); return true;
-		case O::V_CVT_F32_UBYTE1: V_CVT_F32_UBYTE(inst, 1); return true;
-		case O::V_CVT_F32_UBYTE2: V_CVT_F32_UBYTE(inst, 2); return true;
-		case O::V_CVT_F32_UBYTE3: V_CVT_F32_UBYTE(inst, 3); return true;
-		case O::V_CVT_F64_I32: V_CVT_F64_32(inst, true); return true;
-		case O::V_CVT_F64_U32: V_CVT_F64_32(inst, false); return true;
+		case O::V_CVT_F32_UBYTE0: V_CVT_F32_UBYTE(inst, 0); return;
+		case O::V_CVT_F32_UBYTE1: V_CVT_F32_UBYTE(inst, 1); return;
+		case O::V_CVT_F32_UBYTE2: V_CVT_F32_UBYTE(inst, 2); return;
+		case O::V_CVT_F32_UBYTE3: V_CVT_F32_UBYTE(inst, 3); return;
+		case O::V_CVT_F64_I32: V_CVT_F64_32(inst, true); return;
+		case O::V_CVT_F64_U32: V_CVT_F64_32(inst, false); return;
 		case O::V_CVT_F32_F64: return FloatUnary(inst, IR::ValueOpcode::ConvertF32F64);
 		case O::V_RCP_F64: return FloatUnary(inst, IR::ValueOpcode::FPRecip64);
 		case O::V_MUL_F64: return FloatBinary(inst, IR::ValueOpcode::FPMul64, false);
 		case O::V_FMA_F64: return FloatTernary(inst, IR::ValueOpcode::FPFma64, false, false);
-		case O::V_CVT_F32_U32: V_CVT_F32_U32(inst); return true;
-		case O::V_CVT_F32_I32: V_CVT_F32_I32(inst); return true;
-		case O::V_CVT_U32_F32: V_CVT_U32_F32(inst); return true;
-		case O::V_CVT_I32_F32: V_CVT_I32_F32(inst); return true;
-		case O::V_CVT_F16_F32: V_CVT_F16_F32(inst); return true;
-		case O::V_CVT_F32_F16: V_CVT_F32_F16(inst); return true;
-		case O::V_CVT_F16_U16: V_CVT_F16_16(inst, false); return true;
-		case O::V_CVT_F16_I16: V_CVT_F16_16(inst, true); return true;
-		case O::V_CVT_U16_F16: V_CVT_16_F16(inst, false); return true;
-		case O::V_CVT_I16_F16: V_CVT_16_F16(inst, true); return true;
-		case O::V_CVT_RPI_I32_F32: V_CVT_RPI_I32_F32(inst); return true;
-		case O::V_CVT_FLR_I32_F32: V_CVT_FLR_I32_F32(inst); return true;
-		case O::V_FREXP_EXP_I32_F32: V_FREXP_EXP_I32_F32(inst); return true;
-		case O::V_CVT_OFF_F32_I4: V_CVT_OFF_F32_I4(inst); return true;
-		case O::V_CVT_PKRTZ_F16_F32: V_CVT_PKRTZ_F16_F32(inst); return true;
+		case O::V_CVT_F32_U32: V_CVT_F32_U32(inst); return;
+		case O::V_CVT_F32_I32: V_CVT_F32_I32(inst); return;
+		case O::V_CVT_U32_F32: V_CVT_U32_F32(inst); return;
+		case O::V_CVT_I32_F32: V_CVT_I32_F32(inst); return;
+		case O::V_CVT_F16_F32: V_CVT_F16_F32(inst); return;
+		case O::V_CVT_F32_F16: V_CVT_F32_F16(inst); return;
+		case O::V_CVT_F16_U16: V_CVT_F16_16(inst, false); return;
+		case O::V_CVT_F16_I16: V_CVT_F16_16(inst, true); return;
+		case O::V_CVT_U16_F16: V_CVT_16_F16(inst, false); return;
+		case O::V_CVT_I16_F16: V_CVT_16_F16(inst, true); return;
+		case O::V_CVT_RPI_I32_F32: V_CVT_RPI_I32_F32(inst); return;
+		case O::V_CVT_FLR_I32_F32: V_CVT_FLR_I32_F32(inst); return;
+		case O::V_FREXP_EXP_I32_F32: V_FREXP_EXP_I32_F32(inst); return;
+		case O::V_CVT_OFF_F32_I4: V_CVT_OFF_F32_I4(inst); return;
+		case O::V_CVT_PKRTZ_F16_F32: V_CVT_PKRTZ_F16_F32(inst); return;
 		case O::V_CVT_PKNORM_I16_F32:
 			V_CVT_PKNORM_F32(inst, IR::ValueOpcode::PackSnorm2x16);
-			return true;
+			return;
 		case O::V_CVT_PKNORM_U16_F32:
 			V_CVT_PKNORM_F32(inst, IR::ValueOpcode::PackUnorm2x16);
-			return true;
-		case O::V_CVT_PK_U8_F32: V_CVT_PK_U8_F32(inst); return true;
-		case O::V_PACK_B32_F16: V_PACK_B32_F16(inst); return true;
+			return;
+		case O::V_CVT_PK_U8_F32: V_CVT_PK_U8_F32(inst); return;
+		case O::V_PACK_B32_F16: V_PACK_B32_F16(inst); return;
 		case O::V_CVT_PK_U16_U32:
 		case O::V_CVT_PK_I16_I32: return PackB16(inst, false, false);
 
@@ -567,7 +568,7 @@ bool Translator::EmitVector(const Decoder::Instruction& inst) {
 		case O::V_XAD_U32: return V_XAD_U32(inst);
 		case O::V_LSHL_OR_B32: return V_LSHL_OR_B32(inst);
 		case O::V_CNDMASK_B32: return V_CNDMASK_B32(inst);
-		default: return false;
+		default: return FailMissingTranslation(inst);
 	}
 }
 

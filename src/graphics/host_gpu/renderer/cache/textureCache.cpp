@@ -111,36 +111,6 @@ constexpr uint64_t NumFramesBeforeRemoval = 32;
 	return true;
 }
 
-[[nodiscard]] const char* BindingTypeName(TextureCache::BindingType type) {
-	switch (type) {
-		case TextureCache::BindingType::Texture: return "Texture";
-		case TextureCache::BindingType::Storage: return "StorageTexture";
-		case TextureCache::BindingType::RenderTarget: return "ColorTarget";
-		case TextureCache::BindingType::DepthTarget: return "DepthTarget";
-		case TextureCache::BindingType::VideoOut: return "VideoOut";
-	}
-	return "Image";
-}
-
-void NameImageBinding(GraphicContext& graphics, Image& image, vk::ImageView view,
-                      TextureCache::BindingType type, const ImageViewInfo& view_info) {
-	const auto* role = BindingTypeName(type);
-	SetVulkanObjectNameF(
-	    graphics.device, image.backing.image,
-	    "Kyty.{}.Image[guest=0x{:016x} size=0x{:x} extent={}x{}x{} format={} mips={} layers={} "
-	    "samples={}]",
-	    role, image.info.data.address, image.info.data.size, image.info.extent.width,
-	    image.info.extent.height, image.info.extent.depth,
-	    static_cast<uint32_t>(image.info.pixel_format), image.info.resources.levels,
-	    image.info.resources.layers, image.info.samples);
-	SetVulkanObjectNameF(
-	    graphics.device, view,
-	    "Kyty.{}.View[guest=0x{:016x} format={} aspect=0x{:x} mip={}+{} layer={}+{}]", role,
-	    image.info.data.address, static_cast<uint32_t>(view_info.format),
-	    static_cast<vk::ImageAspectFlags::MaskType>(view_info.aspect), view_info.base_level,
-	    view_info.level_count, view_info.base_layer, view_info.layer_count);
-}
-
 [[nodiscard]] std::vector<vk::BufferImageCopy> BuildDepthCopies(const ImageInfo& info,
                                                               uint64_t slice_stride,
                                                               vk::ImageAspectFlags aspect) {
@@ -1734,9 +1704,7 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 			break;
 		default: EXIT("TextureCache: invalid texture binding\n");
 	}
-	const auto view = image.FindView(desc.view_info);
-	NameImageBinding(m_graphics, image, view, desc.type, desc.view_info);
-	return view;
+	return image.FindView(desc.view_info);
 }
 
 vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) {
@@ -1757,9 +1725,7 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 	RefreshImage(id);
 	CommitGpuWrite(image);
 	TrackImageDownload(id, image);
-	const auto view = image.FindView(desc.view_info);
-	NameImageBinding(m_graphics, image, view, desc.type, desc.view_info);
-	return view;
+	return image.FindView(desc.view_info);
 }
 
 vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
@@ -1789,9 +1755,7 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	if (desc.info.HasStencil()) {
 		RefreshImage(AssociateStencil(id, desc.info.stencil));
 	}
-	const auto view = image.FindView(desc.view_info);
-	NameImageBinding(m_graphics, image, view, desc.type, desc.view_info);
-	return view;
+	return image.FindView(desc.view_info);
 }
 
 void TextureCache::MarkGpuWritten(ImageId id) {

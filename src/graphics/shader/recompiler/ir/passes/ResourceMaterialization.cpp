@@ -943,9 +943,12 @@ bool MaterializeBoundedBufferExpressions(const ResourcePlan& program, const SrtR
 			        program, program.info.buffers[logical].source, clean_runtime,
 			        snapshot.bounded_srt_reads, snapshot.resources.flattened_srt, candidate,
 			        descriptor)) {
-				return SpecializationFail(fmt::format(
-				    "bounded buffer expression {} candidate {} cannot be evaluated", logical,
-				    candidate));
+				// Expression tables enumerate every proved selector value before the
+				// shader runs. Unselected rows can resolve to foreign/unmapped loads;
+				// keep the switch width and bind the same null candidate used for
+				// unaddressable dense-table rows.
+				descriptor = {};
+				descriptor.dword_count = source->dword_count;
 			}
 			candidates.push_back(descriptor);
 		}
@@ -989,9 +992,8 @@ bool MaterializeBoundedImageExpressions(const ResourcePlan& program, const SrtRu
 			        program, program.info.images[logical].source, clean_runtime,
 			        snapshot.bounded_srt_reads, snapshot.resources.flattened_srt, candidate,
 			        descriptor)) {
-				return SpecializationFail(fmt::format(
-				    "bounded image expression {} candidate {} cannot be evaluated", logical,
-				    candidate));
+				descriptor = {};
+				descriptor.dword_count = source->dword_count;
 			}
 			candidates.push_back(descriptor);
 		}
@@ -1033,9 +1035,8 @@ bool MaterializeBoundedSamplerExpressions(const ResourcePlan& program, const Srt
 			        program, program.info.samplers[logical].source, clean_runtime,
 			        snapshot.bounded_srt_reads, snapshot.resources.flattened_srt, candidate,
 			        descriptor)) {
-				return SpecializationFail(fmt::format(
-				    "bounded sampler expression {} candidate {} cannot be evaluated", logical,
-				    candidate));
+				descriptor = {};
+				descriptor.dword_count = source->dword_count;
 			}
 			candidates.push_back(descriptor);
 		}

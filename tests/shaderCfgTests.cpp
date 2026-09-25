@@ -3475,7 +3475,7 @@ void TestNewShaderRecompilerVop1SdwaNotDestination() {
   auto options = MakeCompileOptions(ShaderType::Pixel);
 
   const auto check_destination = [&](uint32_t modifier, uint32_t dst_sel,
-                                      uint32_t dst_unused) {
+                                      uint32_t dst_unused, uint32_t src_sel = 6u) {
     const uint32_t shader[] = {
         0x7e066ef9u, modifier, EncodeExp0(0x00, 0x1),
         EncodeExp1(3, 0, 0, 0), EncodeSopp(0x01),
@@ -3493,7 +3493,7 @@ void TestNewShaderRecompilerVop1SdwaNotDestination() {
               decoded.dst.explicit_sdwa_dst,
           "V_NOT_B32 SDWA destination metadata is incorrect");
     Check(decoded.src0.kind == ShaderRecompiler::Decoder::OperandKind::Vgpr &&
-              decoded.src0.reg == 0u && decoded.src0.sdwa_sel == 6u &&
+              decoded.src0.reg == 0u && decoded.src0.sdwa_sel == src_sel &&
               !decoded.src0.negate && !decoded.src0.absolute,
           "V_NOT_B32 SDWA source metadata is incorrect");
 
@@ -3504,6 +3504,10 @@ void TestNewShaderRecompilerVop1SdwaNotDestination() {
   check_destination(0x00061400u, 4u, 2u);
   check_destination(0x00060500u, 5u, 0u);
   check_destination(0x00060000u, 0u, 0u);
+  // Partial destinations combine with partial sources, e.g. PPSA10595's
+  // v_not_b32 v28.word0, v8.word1 with UNUSED_PRESERVE.
+  check_destination(0x00051400u, 4u, 2u, 5u);
+  check_destination(0x00000400u, 4u, 0u, 0u);
 
   const auto check_rejected = [&](uint32_t modifier, const char *message) {
     const uint32_t instruction[] = {0x7e066ef9u, modifier};
@@ -3523,8 +3527,6 @@ void TestNewShaderRecompilerVop1SdwaNotDestination() {
   check_rejected(0x00260400u, "V_NOT_B32 SDWA accepted source absolute");
   check_rejected(0x00062400u, "V_NOT_B32 SDWA accepted clamp");
   check_rejected(0x00064400u, "V_NOT_B32 SDWA accepted output modifier");
-  check_rejected(0x00000400u,
-                 "V_NOT_B32 SDWA partial destination accepted a byte source");
 }
 
 void TestNewShaderRecompilerBootB16PackedAndSdwaOpcodes() {

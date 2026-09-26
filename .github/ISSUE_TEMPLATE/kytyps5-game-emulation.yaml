@@ -1,6 +1,7 @@
 name: Game Emulation Status Report
 description: Submit a KytyPS5 game compatibility result, including boot, rendering, audio, input, or gameplay behavior.
 title: "[GAME STATUS]: "
+labels: ["Game Status"]
 body:
   - type: markdown
     attributes:

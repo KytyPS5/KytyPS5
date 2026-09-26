@@ -1,5 +1,7 @@
 #include "loader/runtimeLinker.h"
 
+#include "loader/x64InstructionDecoder.h"
+
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
@@ -655,6 +657,31 @@ static bool IsReadableRange(uint64_t addr, uint64_t size) {
 	return true;
 }
 
+// Copy the faulting thread's register file into the shape the decoder expects. The reporter owns
+// every value it prints, so the decoder never has to reach for host state.
+static Loader::GuestX64Registers GuestRegistersFromInfo(
+    const Common::HostException::ExceptionInfo& info) {
+	return Loader::GuestX64Registers {
+	    .rip = info.exception_address,
+	    .rax = info.rax,
+	    .rbx = info.rbx,
+	    .rcx = info.rcx,
+	    .rdx = info.rdx,
+	    .rsi = info.rsi,
+	    .rdi = info.rdi,
+	    .rbp = info.rbp,
+	    .rsp = info.rsp,
+	    .r8  = info.r8,
+	    .r9  = info.r9,
+	    .r10 = info.r10,
+	    .r11 = info.r11,
+	    .r12 = info.r12,
+	    .r13 = info.r13,
+	    .r14 = info.r14,
+	    .r15 = info.r15,
+	};
+}
+
 // Defined further down, next to the other module-name helpers.
 static std::string GetProgramModuleName(const Program* program);
 
@@ -674,14 +701,15 @@ std::string FormatGuestFrame(const char* module_name, uint64_t base_vaddr, uint6
 
 // Print "0x<addr> module+0xoffset", or "module=<unknown>" when the address is unattributable.
 static void ReportGuestAddress(RuntimeLinker* linker, uint64_t vaddr) {
-	Program* p = linker != nullptr ? linker->TryFindProgramByAddr(vaddr) : nullptr;
-	if (p == nullptr) {
+	const RuntimeLinker::GuestModuleInfo info =
+	    linker != nullptr ? linker->TryDescribeProgramByAddr(vaddr)
+	                      : RuntimeLinker::GuestModuleInfo{};
+	if (!info.found) {
 		std::printf("0x%016" PRIx64 " module=<unknown>\n", vaddr);
 		return;
 	}
-	const std::string name = GetProgramModuleName(p);
 	std::printf("0x%016" PRIx64 " %s\n", vaddr,
-	            FormatGuestFrame(name.c_str(), p->base_vaddr, vaddr).c_str());
+	            FormatGuestFrame(info.name.c_str(), info.base_vaddr, vaddr).c_str());
 }
 
 static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exception_info) {
@@ -731,6 +759,25 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		std::printf("fault pc: ");
 		ReportGuestAddress(linker, info->exception_address);
 		if (IsReadableRange(info->exception_address - 48, 96)) {
+			// The raw bytes below need hand decoding. Decode the faulting instruction as well and
+			// resolve its memory operand against the register file, so the report names the address
+			// the guest asked for rather than only the register combination that produced it.
+			// 48 verified bytes follow the pc and the longest x86-64 instruction is 15, so the
+			// decoder is never allowed to read past what was checked.
+			const auto faulting = Loader::DecodeGuestFaultingInstruction(
+			    reinterpret_cast<const uint8_t*>(info->exception_address), 48,
+			    GuestRegistersFromInfo(*info));
+			if (faulting.decoded) {
+				std::printf("fault insn: %s (len %u%s%s)\n", faulting.text, faulting.length,
+			            faulting.reads_memory ? ", read" : "",
+			            faulting.writes_memory ? ", write" : "");
+				if (faulting.reads_memory || faulting.writes_memory) {
+					std::printf("fault addr from insn: 0x%016" PRIx64 "\n",
+					            faulting.effective_address);
+				}
+			} else {
+				std::printf("fault insn: %s\n", faulting.text);
+			}
 			const auto* code = reinterpret_cast<const uint8_t*>(info->exception_address - 48);
 			std::printf("code (pc-48 .. pc+48, fault at byte 48):");
 			for (int i = 0; i < 96; i++) {
@@ -757,13 +804,16 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			for (int i = 0; i < 32; i++) {
 				// Annotate the words that resolve to a loaded module. The raw value is always
 				// printed, so an unresolved word stays as informative as it was before.
-				Program* p = linker != nullptr ? linker->TryFindProgramByAddr(stack[i]) : nullptr;
-				if (p != nullptr) {
-					const std::string name = GetProgramModuleName(p);
-					std::printf("%s %016" PRIx64 " <- %s", (i % 4 == 0) ? "\n " : "", stack[i],
-					            FormatGuestFrame(name.c_str(), p->base_vaddr, stack[i]).c_str());
+				const RuntimeLinker::GuestModuleInfo info =
+				    linker != nullptr ? linker->TryDescribeProgramByAddr(stack[i])
+				                           : RuntimeLinker::GuestModuleInfo{};
+				if (info.found) {
+					const std::string frame =
+					    FormatGuestFrame(info.name.c_str(), info.base_vaddr, stack[i]).c_str();
+					std::printf("%s %016" PRIx64 " <- %s", (i % 4 == 0) ? "\nn " : "", stack[i],
+					            frame.c_str());
 				} else {
-					std::printf("%s %016" PRIx64, (i % 4 == 0) ? "\n " : "", stack[i]);
+					std::printf("%s %016" PRIx64, (i % 4 == 0) ? "\nn " : "", stack[i]);
 				}
 			}
 			std::printf("\n");
@@ -1235,20 +1285,20 @@ void RuntimeLinker::UnloadProgram(Program* program) {
 	DeleteProgram(program);
 }
 
-RuntimeLinker* RuntimeLinker::s_current = nullptr;
+std::atomic<RuntimeLinker*> RuntimeLinker::s_current {nullptr};
 
 RuntimeLinker::RuntimeLinker(): m_symbols(std::make_unique<SymbolDatabase>()) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
-	s_current = this;
+	s_current.store(this);
 }
 
 RuntimeLinker::~RuntimeLinker() {
-	s_current = nullptr;
+	s_current.store(nullptr);
 	Clear();
 }
 
 RuntimeLinker* RuntimeLinker::Current() {
-	return s_current;
+	return s_current.load();
 }
 
 Program* RuntimeLinker::LoadProgram(const std::filesystem::path& elf_name) {
@@ -1563,9 +1613,10 @@ Program* RuntimeLinker::FindProgramByFileName(const std::filesystem::path& elf_n
 // Same segment walk as FindProgramByAddr, but usable from the fatal fault reporter: it takes
 // no lock when the linker is busy, tolerates a program whose Elf64 is not loaded yet and never
 // raises, so a crash report cannot hang or recurse inside its own handler.
-Program* RuntimeLinker::TryFindProgramByAddr(uint64_t vaddr) {
+RuntimeLinker::GuestModuleInfo RuntimeLinker::TryDescribeProgramByAddr(uint64_t vaddr) {
+	GuestModuleInfo info;
 	if (!m_mutex.TryLock()) {
-		return nullptr;
+		return info;
 	}
 	Program* found = nullptr;
 	for (auto* p: m_programs) {
@@ -1592,8 +1643,14 @@ Program* RuntimeLinker::TryFindProgramByAddr(uint64_t vaddr) {
 			break;
 		}
 	}
+	if (found != nullptr) {
+		// Copy what the report needs while the lock is still held.
+		info.found      = true;
+		info.name       = GetProgramModuleName(found);
+		info.base_vaddr = found->base_vaddr;
+	}
 	m_mutex.Unlock();
-	return found;
+	return info;
 }
 
 Program* RuntimeLinker::FindProgramByAddr(uint64_t vaddr) {

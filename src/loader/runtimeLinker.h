@@ -7,6 +7,7 @@
 #include "common/threads.h"
 #include "loader/symbolDatabase.h"
 
+#include <atomic>
 #include <filesystem>
 #include <memory>
 #include <unordered_map>
@@ -144,16 +145,26 @@ public:
 
 	KYTY_CLASS_NO_COPY(RuntimeLinker);
 
-	// The live linker, or nullptr when nothing has been linked yet. Common::Singleton<>::
+	// The live linker, or nullptr when nothing has been linked yet. The load is atomic
+	// because a fault can be reported from any thread. Common::Singleton<>::
 	// Instance() constructs on demand, which the fatal fault reporter must not do: allocating
 	// inside an exception handler can fault again and wedge the reporting thread.
 	static RuntimeLinker* Current();
 
-	// FindProgramByAddr for fatal-diagnostic paths. Returns nullptr when m_mutex is held by
-	// another thread (a guest fault can land on a thread that already owns it) and skips
-	// programs that are still half-loaded. Never calls EXIT_* or dereferences a null Elf64,
-	// so it is safe to run from the exception handler.
-	Program* TryFindProgramByAddr(uint64_t vaddr);
+	// What the fatal-diagnostic paths need in order to attribute an address to a module.
+	// The name and base are captured while the program is still loaded, because reporting
+	// runs outside the linker lock and UnloadProgram can free the program beforehand.
+	struct GuestModuleInfo {
+		bool        found = false;
+		std::string name;
+		uint64_t    base_vaddr = 0;
+	};
+
+	// FindProgramByAddr for fatal-diagnostic paths. Reports an empty result when m_mutex is
+	// held by another thread (a guest fault can land on a thread that already owns it) and
+	// skips programs that are still half-loaded. Never calls EXIT_* or dereferences a null
+	// Elf64, so it is safe to run from the exception handler.
+	GuestModuleInfo TryDescribeProgramByAddr(uint64_t vaddr);
 
 	void DbgDump(const std::string& folder);
 
@@ -213,7 +224,9 @@ private:
 	application_heap_free_func_t           m_application_heap_free           = nullptr;
 	application_heap_posix_memalign_func_t m_application_heap_posix_memalign = nullptr;
 
-	static RuntimeLinker* s_current;
+	// Read from the fatal fault reporter on whatever thread took the fault, so publication
+	// and teardown are atomic.
+	static std::atomic<RuntimeLinker*> s_current;
 };
 
 // Render a guest address as "module+0xoffset" for a fatal-diagnostic report, or an empty

@@ -11,10 +11,15 @@ Checkpoint Flip queue lock-order (Reserve cfg→m_mutex ABBA) **26 сентяб�
 2. Реальный ABBA: `ReserveFlipRequest` держал `cfg.mutex` → `Reserve(m_mutex)`,
    а Flip publish берёт `m_mutex` → `cfg.mutex`. Title `GetDiagnostics` тоже
    брал `m_mutex` внутри Present до `shown++`.
-3. Фикс: Reserve всегда `m_mutex` затем `cfg.mutex`; title после publish +
-   heartbeat PresentThread; pstg=13 FlipPublishWait; GetDiagnostics без
-   блокирующего Lock.
-4. Game retry PENDING на этом checkpoint. Меню/gameplay PENDING.
+3. Фикс `fd614ef1`: Reserve всегда `m_mutex` затем `cfg.mutex`; title после
+   publish + heartbeat PresentThread; pstg=13 FlipPublishWait; GetDiagnostics
+   без блокирующего Lock.
+4. Game `_Build/runs/yotei-integrated-20260926-051020-presentfix`: **present
+   soft-stall снят** — ready=shown=137, pstg=10 (VblankEnd), PresentThread
+   ~60fps (frame→44k). Новый стопор: guest/GPU перестал вызывать
+   `CommandProcessor::Flip` (ровно 137); Sync after-complete balanced; нет
+   Fatal/Materialize. Следующее: почему CP/guest останавливает flip submit
+   (~submit=790). Меню/gameplay PENDING.
 
 Checkpoint present soft-stall (shown≈130 / ready=shown+1) **26 сентября 2026 года**:
 

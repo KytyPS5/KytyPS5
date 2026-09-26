@@ -278,9 +278,15 @@ public:
 	~Swapchain();
 	KYTY_CLASS_NO_COPY(Swapchain);
 
-	void                 Create();
-	void                 Recreate(bool surface_lost = false);
+	// Both return false when the surface has no drawable area (a minimised window reports a
+	// zero extent); the swapchain is then left destroyed and must be retried later.
+	[[nodiscard]] bool   Create();
+	[[nodiscard]] bool   Recreate(bool surface_lost = false);
+	[[nodiscard]] bool   IsCreated() const noexcept { return m_handle != nullptr; }
 	[[nodiscard]] bool   NeedsResize() const;
+	// Set by an eSuboptimalKHR acquire or present: that frame is presented as usual and the
+	// swapchain is recreated afterwards, so no acquired image or semaphore signal is abandoned.
+	[[nodiscard]] bool   RecreatePending() const noexcept { return m_recreate_pending; }
 	[[nodiscard]] Status AcquireNextImage();
 	[[nodiscard]] bool   PrepareSystemOverlay();
 	void                 RecordPresentCommands(CommandBuffer& command, VulkanImage& source,
@@ -309,6 +315,7 @@ private:
 	std::unique_ptr<SystemOverlay> m_system_overlay;
 	uint32_t                    m_image_index = static_cast<uint32_t>(-1);
 	uint32_t                    m_frame_index = 0;
+	bool                        m_recreate_pending = false;
 };
 
 struct Presenter::Impl {
@@ -316,15 +323,32 @@ struct Presenter::Impl {
 	    : renderer(*owner.render_context), window(owner), swapchain(owner),
 	      present_scheduler(renderer, owner.graphic_ctx), frames(owner, present_scheduler) {
 		EXIT_IF(owner.render_context == nullptr);
-		swapchain.Create();
+		if (!swapchain.Create()) {
+			EXIT("cannot create the initial swapchain: the window has no drawable area\n");
+		}
 		frames.Initialize(swapchain.ImageCount(), swapchain.Format());
 	}
 
-	void RecoverSwapchain(Swapchain::Status status) {
-		LOGF("Recovering Vulkan swapchain%s\n",
-		     status == Swapchain::Status::SurfaceLost ? " and surface" : "");
-		swapchain.Recreate(status == Swapchain::Status::SurfaceLost);
+	// Returns false when the surface has no drawable area (for example a minimised window):
+	// the swapchain stays destroyed and presentation is retried on a later frame.
+	bool RecoverSwapchain(Swapchain::Status status) {
+		const bool surface_lost = status == Swapchain::Status::SurfaceLost;
+		if (!presentation_suspended) {
+			LOGF("Recovering Vulkan swapchain%s\n", surface_lost ? " and surface" : "");
+		}
+		if (!swapchain.Recreate(surface_lost)) {
+			if (!presentation_suspended) {
+				LOGF("Vulkan surface has no drawable area; presentation is suspended\n");
+				presentation_suspended = true;
+			}
+			return false;
+		}
+		if (presentation_suspended) {
+			LOGF("Vulkan surface is drawable again; presentation resumed\n");
+			presentation_suspended = false;
+		}
 		frames.SetFormat(swapchain.Format());
+		return true;
 	}
 
 	Image& ResolveSurface(const ImageInfo& info) {
@@ -354,9 +378,10 @@ struct Presenter::Impl {
 	CommandScheduler      present_scheduler;
 	FramePool             frames;
 	std::atomic<uint64_t> presented_overlay_revision {0};
+	bool                  presentation_suspended = false;
 };
 
-void Swapchain::Create() {
+bool Swapchain::Create() {
 	auto& graphics = m_window.graphic_ctx;
 	EXIT_IF(graphics.device == nullptr);
 	EXIT_IF(m_window.surface == nullptr);
@@ -373,14 +398,21 @@ void Swapchain::Create() {
 	const auto&       surface = m_window.surface_capabilities;
 	EXIT_NOT_IMPLEMENTED(surface.formats.empty());
 
+	// The special currentExtent means the surface follows the swapchain size, so the window
+	// size is used. Either way the extent must stay within the surface limits; a minimised
+	// window reports a zero extent, which vkCreateSwapchainKHR rejects.
 	m_extent = surface.capabilities.currentExtent;
-	if (m_extent.width == std::numeric_limits<uint32_t>::max()) {
-		m_extent.width =
-		    std::clamp(m_window_extent.width, surface.capabilities.minImageExtent.width,
-		               surface.capabilities.maxImageExtent.width);
-		m_extent.height =
-		    std::clamp(m_window_extent.height, surface.capabilities.minImageExtent.height,
-		               surface.capabilities.maxImageExtent.height);
+	if (m_extent.width == std::numeric_limits<uint32_t>::max() ||
+	    m_extent.height == std::numeric_limits<uint32_t>::max()) {
+		m_extent = m_window_extent;
+	}
+	m_extent.width  = std::clamp(m_extent.width, surface.capabilities.minImageExtent.width,
+	                             surface.capabilities.maxImageExtent.width);
+	m_extent.height = std::clamp(m_extent.height, surface.capabilities.minImageExtent.height,
+	                             surface.capabilities.maxImageExtent.height);
+	if (m_extent.width == 0 || m_extent.height == 0) {
+		m_extent = {};
+		return false;
 	}
 	uint32_t image_count = surface.capabilities.minImageCount + 1;
 	if (surface.capabilities.maxImageCount != 0) {
@@ -485,6 +517,7 @@ void Swapchain::Create() {
 	}
 	m_image_index   = static_cast<uint32_t>(-1);
 	m_frame_index   = 0;
+	return true;
 }
 
 Swapchain::~Swapchain() {
@@ -492,6 +525,7 @@ Swapchain::~Swapchain() {
 }
 
 void Swapchain::Destroy() {
+	m_recreate_pending = false;
 	if (m_handle == nullptr && m_image_acquired.empty() && m_render_complete.empty() &&
 	    m_image_views.empty()) {
 		return;
@@ -537,7 +571,7 @@ void Swapchain::Destroy() {
 	m_render_complete.clear();
 }
 
-void Swapchain::Recreate(bool surface_lost) {
+bool Swapchain::Recreate(bool surface_lost) {
 	Destroy();
 	if (surface_lost) {
 #if defined(__APPLE__)
@@ -550,7 +584,7 @@ void Swapchain::Recreate(bool surface_lost) {
 		m_window.RecreateSurface();
 #endif
 	}
-	Create();
+	return Create();
 }
 
 bool Swapchain::NeedsResize() const {
@@ -568,8 +602,11 @@ Swapchain::Status Swapchain::AcquireNextImage() {
 	switch (result) {
 		case vk::Result::eSuccess: break;
 		case vk::Result::eSuboptimalKHR:
+			// The image was acquired and its semaphore will be signaled, so the frame must be
+			// presented before the swapchain (and that semaphore) can be recreated.
 			LOGF("vkAcquireNextImageKHR returned vk::Result::eSuboptimalKHR\n");
-			return Status::Recreate;
+			m_recreate_pending = true;
+			break;
 		case vk::Result::eErrorOutOfDateKHR:
 			LOGF("vkAcquireNextImageKHR returned vk::Result::eErrorOutOfDateKHR\n");
 			return Status::Recreate;
@@ -700,8 +737,10 @@ Swapchain::Status Swapchain::Present() {
 	switch (result) {
 		case vk::Result::eSuccess: break;
 		case vk::Result::eSuboptimalKHR:
+			// The frame was queued for presentation; recreate the swapchain afterwards.
 			LOGF("vkQueuePresentKHR returned vk::Result::eSuboptimalKHR\n");
-			return Status::Recreate;
+			m_recreate_pending = true;
+			break;
 		case vk::Result::eErrorOutOfDateKHR:
 			LOGF("vkQueuePresentKHR returned vk::Result::eErrorOutOfDateKHR\n");
 			return Status::Recreate;
@@ -783,15 +822,24 @@ void Presenter::Present(Frame& frame, bool reuse) {
 	m_impl->frames.ValidateForPresent(&frame, reuse);
 
 	const auto overlay_visual = GetSystemOverlayVisualState();
-	auto&      swapchain  = m_impl->swapchain;
-	// Some window systems keep presenting an old swapchain after a resize.
-	if (swapchain.NeedsResize()) {
-		m_impl->RecoverSwapchain(Swapchain::Status::Recreate);
+	auto&      swapchain      = m_impl->swapchain;
+	// Without a drawable surface area nothing is presented; the frame stays the last one so it
+	// can be shown once the window is visible again.
+	const auto suspend = [&] { m_impl->frames.Release(&frame, true); };
+	// Some window systems keep presenting an old swapchain after a resize. A swapchain that
+	// could not be created for lack of a drawable area is retried on every frame.
+	if ((!swapchain.IsCreated() || swapchain.NeedsResize()) &&
+	    !m_impl->RecoverSwapchain(Swapchain::Status::Recreate)) {
+		suspend();
+		return;
 	}
 	for (uint32_t attempt = 0; attempt < 2; attempt++) {
 		auto status = swapchain.AcquireNextImage();
 		if (status != Swapchain::Status::Success) {
-			m_impl->RecoverSwapchain(status);
+			if (!m_impl->RecoverSwapchain(status)) {
+				suspend();
+				return;
+			}
 			continue;
 		}
 		{
@@ -804,7 +852,10 @@ void Presenter::Present(Frame& frame, bool reuse) {
 		}
 		status = swapchain.Present();
 		if (status != Swapchain::Status::Success) {
-			m_impl->RecoverSwapchain(status);
+			if (!m_impl->RecoverSwapchain(status)) {
+				suspend();
+				return;
+			}
 			continue;
 		}
 
@@ -812,6 +863,10 @@ void Presenter::Present(Frame& frame, bool reuse) {
 		                                         std::memory_order_release);
 		m_impl->window.UpdateTitle();
 		m_impl->frames.Release(&frame, true);
+		if (swapchain.RecreatePending()) {
+			// eSuboptimalKHR: the frame is on its way to the screen; refresh the swapchain now.
+			(void)m_impl->RecoverSwapchain(Swapchain::Status::Recreate);
+		}
 		return;
 	}
 	LOGF("Vulkan presentation retry exhausted; dropping frame\n");

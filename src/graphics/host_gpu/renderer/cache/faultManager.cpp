@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <atomic>
 #include <bit>
 #include <cinttypes>
 #include <cstring>
@@ -89,7 +90,9 @@ void FaultManager::ProcessFaultBuffer() {
 	pre_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
 	pre_barrier.srcAccessMask = vk::AccessFlagBits2::eShaderWrite;
 	pre_barrier.dstStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
-	pre_barrier.dstAccessMask = vk::AccessFlagBits2::eShaderRead;
+	// The parser reads every fault word and clears it.
+	pre_barrier.dstAccessMask =
+	    vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite;
 	pre_barrier.buffer        = m_fault_buffer.Handle();
 	pre_barrier.offset        = 0;
 	pre_barrier.size           = m_fault_buffer.Size();
@@ -97,7 +100,9 @@ void FaultManager::ProcessFaultBuffer() {
 	post_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
 	post_barrier.srcAccessMask = vk::AccessFlagBits2::eShaderWrite;
 	post_barrier.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
-	post_barrier.dstAccessMask = vk::AccessFlagBits2::eShaderWrite;
+	// Guest shaders record a fault with a read-modify-write of the fault word.
+	post_barrier.dstAccessMask =
+	    vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite;
 
 	const vk::DescriptorBufferInfo infos[] {
 	    {m_fault_buffer.Handle(), 0, m_fault_buffer.Size()},
@@ -132,7 +137,18 @@ void FaultManager::ProcessFaultBuffer() {
 		m_download_buffer.Invalidate(offset, PageFaultAreaSize);
 		RangeSet    fault_ranges;
 		const auto* faults = std::bit_cast<const uint64_t*>(mapped);
-		const auto  count  = static_cast<uint32_t>(faults[0]);
+		// The shader keeps counting faults it had no room to store, so the counter can exceed
+		// the area's capacity; only the stored entries may be read.
+		auto count = static_cast<uint32_t>(faults[0]);
+		if (count > MaxPageFaults - 1) {
+			static std::atomic_bool logged = false;
+			if (!logged.exchange(true, std::memory_order_relaxed)) {
+				LOGF("warning: %u page faults exceed the fault buffer capacity of %zu; excess "
+				     "faults are dropped\n",
+				     count, MaxPageFaults - 1);
+			}
+			count = static_cast<uint32_t>(MaxPageFaults - 1);
+		}
 		for (uint32_t index = 1; index <= count; ++index) {
 			fault_ranges.Add(faults[index], BufferCache::CACHING_PAGESIZE);
 			LOGF("Accessed non-GPU cached memory at 0x%016" PRIx64 "\n", faults[index]);

@@ -24,10 +24,20 @@ public:
 	~SamplerCache();
 	KYTY_CLASS_NO_COPY(SamplerCache);
 
-	vk::Sampler GetSampler(const ShaderSamplerResource& r);
+	// Sampler state that the descriptor alone does not determine.
+	struct Variant {
+		// The shader samples with depth comparison. GCN encodes NEVER as zero, so the compare
+		// function field cannot tell comparison sampling apart from plain sampling.
+		bool depth_compare = false;
+		// The sampled image views have an integer format and need the INT border colours.
+		bool integer_border = false;
+	};
+
+	vk::Sampler GetSampler(const ShaderSamplerResource& r, Variant variant);
 
 private:
-	using SamplerKey = std::array<uint32_t, 4>;
+	// The descriptor words followed by the variant bits.
+	using SamplerKey = std::array<uint32_t, 5>;
 
 	struct SamplerKeyHash {
 		std::size_t operator()(const SamplerKey& key) const {

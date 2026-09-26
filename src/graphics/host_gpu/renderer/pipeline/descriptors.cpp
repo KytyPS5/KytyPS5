@@ -702,14 +702,41 @@ static vk::Sampler NativeSampler(RenderContext&                       context,
                                  const ShaderRecompiler::IR::CompiledShaderInfo& program,
                                  uint32_t index,
                                  const ShaderRecompiler::IR::DescriptorValue& value) {
-	auto descriptor = DecodeNativeDescriptor<ShaderSamplerResource>(value);
-	if (!program.info.samplers[index].depth_compare) {
+	auto        descriptor = DecodeNativeDescriptor<ShaderSamplerResource>(value);
+	const auto& sampler    = program.info.samplers[index];
+	if (!sampler.depth_compare) {
 		descriptor.fields[0] &= ~(0x7u << 12u);
 	}
-	if (program.info.samplers[index].force_point_filtering) {
+	if (sampler.force_point_filtering) {
 		descriptor.SetPointFiltering();
 	}
-	return context.GetSamplerCache().GetSampler(descriptor);
+	SamplerCache::Variant variant {};
+	variant.depth_compare = sampler.depth_compare;
+	// Border colours must match the numeric type of the sampled views. A sampler that is
+	// shared by integer and non-integer images keeps the float variants.
+	bool integer_images = false;
+	bool other_images   = false;
+	for (const auto& pair: program.info.sampled_pairs) {
+		if (pair.sampler != index) {
+			continue;
+		}
+		EXIT_IF(pair.image >= program.info.images.size());
+		switch (program.info.images[pair.image].numeric_class) {
+			case Prospero::TextureNumericClass::Uint:
+			case Prospero::TextureNumericClass::Sint: integer_images = true; break;
+			default: other_images = true; break;
+		}
+	}
+	variant.integer_border = integer_images && !other_images;
+	if (integer_images && other_images) {
+		static std::atomic_bool logged = false;
+		if (!logged.exchange(true, std::memory_order_relaxed)) {
+			LOGF("warning: sampler %u is shared by integer and non-integer images; its border "
+			     "colour follows the non-integer ones\n",
+			     index);
+		}
+	}
+	return context.GetSamplerCache().GetSampler(descriptor, variant);
 }
 
 static vk::DescriptorBufferInfo NativeUpload(RenderContext&            context,

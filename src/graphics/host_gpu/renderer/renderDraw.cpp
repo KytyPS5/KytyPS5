@@ -396,10 +396,16 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 
 	vk_buffer.setStencilTestEnable(depth.stencil_test_enable ? VK_TRUE : VK_FALSE);
 	if (depth.stencil_test_enable) {
+		// The attachment layout comes from the same write analysis: when no reachable stencil
+		// operation writes, the stencil aspect is bound read-only and Vulkan then requires a zero
+		// write mask (VUID-vkCmdDraw-None-06887). Every operation that can run is KEEP in that
+		// case, so the guest mask makes no difference to the result.
+		const bool stencil_read_only =
+		    !(depth.AttachmentWriteAspects() & vk::ImageAspectFlagBits::eStencil);
 		const auto set_stencil = [&](vk::StencilFaceFlagBits face, const vk::StencilOpState& state) {
 			vk_buffer.setStencilOp(face, state.failOp, state.passOp, state.depthFailOp, state.compareOp);
 			vk_buffer.setStencilCompareMask(face, state.compareMask);
-			vk_buffer.setStencilWriteMask(face, state.writeMask);
+			vk_buffer.setStencilWriteMask(face, stencil_read_only ? 0u : state.writeMask);
 			vk_buffer.setStencilReference(face, state.reference);
 		};
 		set_stencil(vk::StencilFaceFlagBits::eFront, depth.stencil_front);
@@ -1133,15 +1139,15 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                        vk::ShaderStageFlagBits::eMeshEXT |
 		                            vk::ShaderStageFlagBits::eFragment,
 		                        0, sizeof(draw_data), draw_data);
+	};
+	if (mesh_active) {
+		push_mesh_draw_data(mesh_slices.front());
 	} else {
 		CommitIndexBuffer(vk_buffer, index_binding);
 	}
 
 	SetGraphicsDynamicParams(buffer, vk_buffer, vertex_stages.back(), state.depth_info, rendering);
 	if (m_context.GetGraphics().attachment_feedback_loop_enabled) {
-	};
-	if (mesh_active) {
-		push_mesh_draw_data(mesh_slices.front());
 		vk_buffer.setAttachmentFeedbackLoopEnableEXT(feedback_aspects);
 	}
 

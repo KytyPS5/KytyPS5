@@ -14,10 +14,12 @@ SamplerCache::~SamplerCache() {
 	}
 }
 
-vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
+vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r, Variant variant) {
 	Common::LockGuard lock(m_mutex);
 
-	const SamplerKey key {r.fields[0], r.fields[1], r.fields[2], r.fields[3]};
+	const uint32_t variant_bits =
+	    (variant.depth_compare ? 1u : 0u) | (variant.integer_border ? 2u : 0u);
+	const SamplerKey key {r.fields[0], r.fields[1], r.fields[2], r.fields[3], variant_bits};
 	if (auto iter = m_samplers.find(key); iter != m_samplers.end()) {
 		return iter->second;
 	}
@@ -95,23 +97,30 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
 		return vk::SamplerAddressMode::eClampToBorder;
 	};
 
-	vk::BorderColor border = vk::BorderColor::eIntTransparentBlack;
+	// The border colour variant must match the numeric type of the sampled view.
+	const bool      integer = variant.integer_border;
+	vk::BorderColor border =
+	    integer ? vk::BorderColor::eIntTransparentBlack : vk::BorderColor::eFloatTransparentBlack;
 	switch (static_cast<Prospero::SamplerBorderColor>(r.BorderColorType())) {
 		case Prospero::SamplerBorderColor::kTransBlack:
-			border = vk::BorderColor::eIntTransparentBlack;
+			border = integer ? vk::BorderColor::eIntTransparentBlack
+			                 : vk::BorderColor::eFloatTransparentBlack;
 			break;
 		case Prospero::SamplerBorderColor::kOpaqueBlack:
-			border = vk::BorderColor::eIntOpaqueBlack;
+			border =
+			    integer ? vk::BorderColor::eIntOpaqueBlack : vk::BorderColor::eFloatOpaqueBlack;
 			break;
 		case Prospero::SamplerBorderColor::kOpaqueWhite:
-			border = vk::BorderColor::eIntOpaqueWhite;
+			border =
+			    integer ? vk::BorderColor::eIntOpaqueWhite : vk::BorderColor::eFloatOpaqueWhite;
 			break;
 		case Prospero::SamplerBorderColor::kFromTable:
 			LOGF(
 			    "temporary: approximating table border color as transparent black, index = %" PRIu16
 			    "\n",
 			    r.BorderColorPtr());
-			border = vk::BorderColor::eIntTransparentBlack;
+			border = integer ? vk::BorderColor::eIntTransparentBlack
+			                 : vk::BorderColor::eFloatTransparentBlack;
 			break;
 		default: EXIT("unknown border color: %d", static_cast<int>(r.BorderColorType()));
 	}
@@ -129,8 +138,12 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
 	    static_cast<float>(static_cast<int16_t>((r.LodBias() ^ 0x2000u) - 0x2000u)) / 256.0f;
 	sampler_info.anisotropyEnable        = (aniso ? VK_TRUE : VK_FALSE);
 	sampler_info.maxAnisotropy           = aniso_ratio;
-	sampler_info.compareEnable           = (r.DepthCompareFunc() != 0 ? VK_TRUE : VK_FALSE);
-	sampler_info.compareOp               = static_cast<vk::CompareOp>(r.DepthCompareFunc());
+	// Comparison sampling follows the shader's use of the sampler: the descriptor's compare
+	// function encodes NEVER as zero, so it cannot enable comparison on its own.
+	sampler_info.compareEnable           = (variant.depth_compare ? VK_TRUE : VK_FALSE);
+	sampler_info.compareOp               = variant.depth_compare
+	                                           ? static_cast<vk::CompareOp>(r.DepthCompareFunc())
+	                                           : vk::CompareOp::eNever;
 	sampler_info.minLod                  = min_lod;
 	sampler_info.maxLod                  = max_lod;
 	sampler_info.borderColor             = border;

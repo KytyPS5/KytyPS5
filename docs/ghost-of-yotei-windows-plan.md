@@ -22,8 +22,12 @@ Checkpoint Flip queue lock-order (Reserve cfg→m_mutex ABBA) **26 сентяб�
 5. Retries `…-052812` / `…-053958` + WaitFlipDone/WaitRegMem logs: после
    последнего `Flip()`+`WriteAtEndOfPipe64(refclock)` нет ни WaitFlipDone,
    ни WaitRegMem — DCB просто кончается, guest больше не сабмитит GPU.
-   Present здоров. Следующее: почему CPU/equeue не продолжает кадр после
-   Flip event (listeners? kevent?). Меню/gameplay PENDING.
+   Present здоров. `TriggerVideoOutEvents Flip listeners=0` (игра не зовёт
+   AddFlipEvent).
+6. **277× unresolved stub** `gWT7X8H0bYs` (VideoOutGetVrrStatus) — NID был в
+   тесте, но не в `LIB_FUNC`. Фикс: зарегистрировать GetVrrStatus + Initialize.
+   RED/GREEN: `shader_cfg_tests --videoout-vrr-status-only`. Game retry PENDING.
+   Меню/gameplay PENDING.
 
 Checkpoint present soft-stall (shown≈130 / ready=shown+1) **26 сентября 2026 года**:
 

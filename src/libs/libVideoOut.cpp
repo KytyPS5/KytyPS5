@@ -52,14 +52,9 @@ namespace LibGen5::VrrStatus {
 
 LIB_VERSION("VideoOutVrrStatus", 1, "VideoOut", 1, 1);
 
-static KYTY_SYSV_ABI int VideoOutVrrStatus_kP2L8t3j_aM() {
-	// The observed guest call passes no arguments.
-	// Return success for Kyty's fixed-refresh path.
-	return OK;
-}
-
 LIB_DEFINE(InitVideoOutVrrStatus_1) {
-	LIB_FUNC("kP2L8t3j-aM", VideoOutVrrStatus_kP2L8t3j_aM);
+	LIB_FUNC("kP2L8t3j-aM", VideoOut::VideoOutVrrStatusInitialize);
+	LIB_FUNC("gWT7X8H0bYs", VideoOut::VideoOutGetVrrStatus);
 }
 
 } // namespace LibGen5::VrrStatus

@@ -65,10 +65,11 @@ Checkpoint Flip queue lock-order (Reserve cfg→m_mutex ABBA) **26 сентяб�
 15. Warm `…-073326`: **shown=166 hang** — CS `54904fb419d79e49` (~755k SPIR-V)
     `vkCreateComputePipelines` ~278 с, затем **4× полный recompile** того же
     hash (specialization churn). Watchdog 900s. Prepared readback RGB=0/A=3.
-16. Merge `upstream/main` (`fd2e15ee`): конфликты PR —
+16. Merge `upstream/main` (`fd2e15ee`): конфликты PR #497 —
     `CMakeLists.txt` (оба набора тестов), `ShaderIR.h` (`MaxBuffers=64` +
     `MaxImages=512`), `ResourceTrackingTests.cpp` (64-buffer layout +
-    transactional limits). present-fix → **2560×1440** (primary display).
+    transactional limits). Запушено: PR **MERGEABLE**. present-fix →
+    **2560×1440 + `--fullscreen`**.
 
 Checkpoint present soft-stall (shown≈130 / ready=shown+1) **26 сентября 2026 года**:
 

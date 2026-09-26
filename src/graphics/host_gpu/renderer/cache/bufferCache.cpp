@@ -167,8 +167,22 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	                                    copies = std::move(copies)] {
 		m_download_buffer.Invalidate(offset, total_size);
 		for (const auto& copy: copies) {
-			Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
-			                                      mapped + (copy.dstOffset - offset), copy.size);
+			const auto guest = buffer_address + copy.srcOffset;
+			const auto host  = mapped + (copy.dstOffset - offset);
+			const auto writable =
+			    Libs::LibKernel::Memory::TryClampRangeSize(guest, copy.size);
+			if (writable == 0) {
+				LOGF("BufferCache: skipped GPU download into unmapped guest "
+				     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+				     guest, copy.size);
+				continue;
+			}
+			if (writable != copy.size) {
+				LOGF("BufferCache: clamped GPU download addr=0x%016" PRIx64
+				     " size=0x%016" PRIx64 " to 0x%016" PRIx64 "\n",
+				     guest, copy.size, writable);
+			}
+			Libs::LibKernel::Memory::WriteBacking(guest, host, writable);
 		}
 	});
 	return true;

@@ -814,6 +814,8 @@ void VideoOutDriver::Impl::VblankEnd() {
 void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 	const auto frequency = Common::Timer::QueryPerformanceFrequency();
 	EXIT_IF(frequency == 0);
+	LOGF("PresentThread: pacing clamp enabled (max sleep 1 vblank)\n");
+	Log::Flush();
 
 	int64_t total_wait = 0;
 	while (!token.stop_requested()) {

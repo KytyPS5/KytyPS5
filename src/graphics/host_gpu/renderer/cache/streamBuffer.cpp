@@ -236,6 +236,16 @@ bool StreamBuffer::NormalizeReservation(bool coherent, uint64_t atom, uint64_t& 
 	return true;
 }
 
+uint64_t StreamBuffer::MaxReservation() const {
+	const auto atom = Graphics().physical_device_properties.limits.nonCoherentAtomSize;
+	if (IsCoherent() || atom == 0) {
+		return Size();
+	}
+	// Map rounds a non-coherent reservation up to a whole atom before comparing it with
+	// the buffer size, so the largest size that still maps is the buffer rounded down.
+	return Common::AlignDown(Size(), atom);
+}
+
 std::pair<uint8_t*, uint64_t> StreamBuffer::Map(uint64_t size, uint64_t alignment,
                                                 bool allow_wait) {
 	if (Mapped().empty()) {

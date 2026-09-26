@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <unordered_map>
 #include <utility>
 
@@ -225,9 +226,28 @@ IR::Value Translator::ReadOperand(const Decoder::Operand& operand, IR::Type type
 		}
 		return ir.INotEqual(ReadRawU32(operand), IR::U32(IR::Value(0u)));
 	}
-	if (type == IR::Type::U64) {
-		const auto pair = ReadU32Pair(operand);
-		return ir.ConstructU64(pair[0], pair[1]);
+	if (type == IR::Type::U64 || type == IR::Type::F64) {
+		auto pair = ReadU32Pair(operand);
+		if (type == IR::Type::F64) {
+			if (operand.kind == Decoder::OperandKind::LiteralConstant) {
+				pair = {IR::U32(IR::Value(0u)), IR::U32(IR::Value(operand.value))};
+			} else if (operand.kind == Decoder::OperandKind::FloatInlineConstant) {
+				const auto bits = operand.value == 0x3e22f983u
+				                      ? 0x3fc45f306dc9c882ull
+				                      : std::bit_cast<uint64_t>(static_cast<double>(
+				                            std::bit_cast<float>(operand.value)));
+				pair            = {IR::U32(IR::Value(static_cast<uint32_t>(bits))),
+				                   IR::U32(IR::Value(static_cast<uint32_t>(bits >> 32u)))};
+			}
+			if (operand.absolute) {
+				pair[1] = ir.BitwiseAnd(pair[1], IR::U32(IR::Value(0x7fffffffu)));
+			}
+			if (operand.negate) {
+				pair[1] = ir.BitwiseXor(pair[1], IR::U32(IR::Value(0x80000000u)));
+			}
+		}
+		const auto bits = ir.ConstructU64(pair[0], pair[1]);
+		return type == IR::Type::F64 ? ir.Emit(IR::ValueOpcode::BitCastF64U64, {bits}) : IR::Value(bits);
 	}
 	auto bits = ApplyBitSourceModifiers(operand, ReadRawU32(operand));
 	if (TypesOverlap(type, IR::Type::F32) && !TypesOverlap(type, IR::Type::U32)) {
@@ -402,6 +422,10 @@ void Translator::WriteOperand(const Decoder::Operand& operand, IR::Value value) 
 		const auto bits = IR::U16(ir.Emit(IR::ValueOpcode::BitCastU16F16, {value}));
 		Write16Bits(operand, IR::U32(ir.Emit(IR::ValueOpcode::ConvertU32U16, {bits})));
 		return;
+	}
+	if (type == IR::Type::F64) {
+		value = ir.Emit(IR::ValueOpcode::BitCastU64F64, {value});
+		type  = IR::Type::U64;
 	}
 	if (type == IR::Type::U64) {
 		WriteU32Pair(operand, {ir.CompositeExtract(value, 0), ir.CompositeExtract(value, 1)});
@@ -842,6 +866,14 @@ void IncludeInstructionVectorRegisters(const Decoder::Instruction& inst, uint32_
 	include_vector(inst.src1);
 	include_vector(inst.src2);
 	include_vector(inst.src3);
+	switch (inst.opcode) {
+		case Decoder::Opcode::V_CVT_F64_I32: include_vector(inst.dst, 2u); break;
+		case Decoder::Opcode::V_FMA_F64: include_vector(inst.src2, 2u); [[fallthrough]];
+		case Decoder::Opcode::V_MUL_F64: include_vector(inst.src1, 2u); [[fallthrough]];
+		case Decoder::Opcode::V_RCP_F64: include_vector(inst.dst, 2u); [[fallthrough]];
+		case Decoder::Opcode::V_CVT_F32_F64: include_vector(inst.src0, 2u); break;
+		default: break;
+	}
 	if (inst.family == Decoder::Family::DS) {
 		switch (inst.opcode) {
 			case Decoder::Opcode::DS_WRITE_B64:

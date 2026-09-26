@@ -47,6 +47,10 @@ uint32_t TypeF32(EmitterState& state) {
 	return state.builder.Type(spv::OpTypeFloat, 32);
 }
 
+uint32_t TypeF64(EmitterState& state) {
+	return state.builder.Type(spv::OpTypeFloat, 64);
+}
+
 uint32_t TypeU32Vector(EmitterState& state, uint32_t components) {
 	return state.builder.Type(spv::OpTypeVector, TypeU32(state), components);
 }
@@ -679,6 +683,19 @@ void DefineModule(EmitterState& state) {
 	// contract prevents host compilers from treating synthesized IEEE values as finite.
 	state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeSignedZeroInfNanPreserve,
 	                               32u);
+	if (state.requirements.float64) {
+		EXIT_NOT_IMPLEMENTED(state.program.stage != ShaderType::Compute);
+		EXIT_NOT_IMPLEMENTED(state.input_info.compute->float_mode != 0xc0);
+		// MODE=0xc0 uses round-to-nearest-even and preserves FP64 input/output denormals.
+		state.builder.RequireCapability(spv::CapabilityFloat64);
+		state.builder.RequireCapability(spv::CapabilityRoundingModeRTE);
+		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeSignedZeroInfNanPreserve,
+		                               64u);
+		// FP64 denormal preservation is temporarily disabled.
+		// state.builder.RequireCapability(spv::CapabilityDenormPreserve);
+		// state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeDenormPreserve, 64u);
+		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeRoundingModeRTE, 32u);
+	}
 	if (const auto* cs = ShaderWorkgroupInput(state.program.stage, state.input_info)) {
 		uint32_t    local_x = state.requirements.compute_derivatives ? 2u : 1u;
 		uint32_t    local_y = state.requirements.compute_derivatives ? 2u : 1u;

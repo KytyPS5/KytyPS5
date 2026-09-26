@@ -13,13 +13,22 @@ inline constexpr auto EmitConvertU32U16 = EmitBitCastU16F16;
 inline constexpr auto EmitConvertU32U8  = EmitBitCastU16F16;
 inline constexpr auto EmitBitCastU32F32 = EmitBitCastU16F16;
 EMIT_NATIVE(BitCastF32U32, OpBitcast, F32, uint32_t)
+EMIT_NATIVE(BitCastU64F64, OpBitcast, U64, uint32_t)
+EMIT_NATIVE(BitCastF64U64, OpBitcast, F64, uint32_t)
 uint32_t              EmitConvertU16U32(EmitterState& state, uint32_t arg0);
 uint32_t              EmitConvertU8U32(EmitterState& state, uint32_t arg0);
 uint32_t              EmitConvertF16F32(EmitterState& state, uint32_t arg0);
 inline constexpr auto EmitConvertF32F16 = EmitF16BitsToF32;
 uint32_t              EmitConvertS32F32(EmitterState& state, uint32_t arg0);
 uint32_t              EmitConvertU32F32(EmitterState& state, uint32_t arg0);
-uint32_t              EmitConvertF32S32(EmitterState& state, uint32_t arg0);
+template <IR::Type type>
+uint32_t EmitConvertSigned32ToFloat(EmitterState& state, uint32_t arg0) {
+	const auto signed_value = Unary(state, spv::OpBitcast, TypeI32(state), arg0);
+	return EmitNative<spv::OpConvertSToF, type>(state, signed_value);
+}
+inline constexpr auto EmitConvertF32S32 = EmitConvertSigned32ToFloat<IR::Type::F32>;
+inline constexpr auto EmitConvertF64S32 = EmitConvertSigned32ToFloat<IR::Type::F64>;
+uint32_t              EmitConvertF32F64(EmitterState& state, uint32_t arg0);
 EMIT_NATIVE(ConvertF32U32, OpConvertUToF, F32, uint32_t)
 EMIT_NATIVE(CompositeConstructU64, OpCompositeConstruct, U64, uint32_t, uint32_t)
 EMIT_NATIVE(CompositeConstructU32x2, OpCompositeConstruct, U32x2, uint32_t, uint32_t)
@@ -120,6 +129,10 @@ inline constexpr auto EmitFPCmpClass32 = EmitClassMaskF32;
 EMIT_NATIVE(FPAdd32, OpFAdd, F32, uint32_t, uint32_t)
 EMIT_NATIVE(FPSub32, OpFSub, F32, uint32_t, uint32_t)
 EMIT_NATIVE(FPMul32, OpFMul, F32, uint32_t, uint32_t)
+EMIT_NATIVE(FPMul64, OpFMul, F64, uint32_t, uint32_t)
+inline constexpr auto EmitFPFma64 =
+    EmitGlsl<GLSLstd450Fma, IR::Type::F64, uint32_t, uint32_t, uint32_t>;
+uint32_t              EmitFPRecip64(EmitterState& state, uint32_t arg0);
 inline constexpr auto EmitFPFma32 =
     EmitGlsl<GLSLstd450Fma, IR::Type::F32, uint32_t, uint32_t, uint32_t>;
 uint32_t EmitFPMin32(EmitterState& state, uint32_t arg0, uint32_t arg1);
@@ -271,6 +284,8 @@ inline constexpr auto EmitImageAtomicUMax32    = EmitImage;
 inline constexpr auto EmitImageAtomicAnd32     = EmitImage;
 inline constexpr auto EmitImageAtomicOr32      = EmitImage;
 inline constexpr auto EmitImageAtomicXor32     = EmitImage;
+inline constexpr auto EmitImageAtomicFMin32    = EmitImage;
+inline constexpr auto EmitImageAtomicFMax32    = EmitImage;
 void                  EmitUnreachable(ValueEmitContext& ctx, const IR::Inst& inst);
 inline constexpr auto EmitPhi                        = EmitUnreachable;
 inline constexpr auto EmitTessellationBase           = EmitUnreachable;

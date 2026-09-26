@@ -27,6 +27,7 @@ enum class Type : uint32_t {
 	ImageResource   = 1u << 17u,
 	SamplerResource = 1u << 18u,
 	ImageAddress    = 1u << 19u,
+	F64             = 1u << 20u,
 };
 
 constexpr Type operator|(Type lhs, Type rhs) {

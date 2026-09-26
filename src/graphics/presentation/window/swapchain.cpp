@@ -947,6 +947,10 @@ RenderContext& Presenter::Renderer() const noexcept {
 	return m_impl->renderer;
 }
 
+void Presenter::UpdateWindowTitle() {
+	m_impl->window.UpdateTitle();
+}
+
 void Presenter::Present(Frame& frame, bool reuse) {
 	KYTY_PROFILER_FUNCTION();
 	m_impl->frames.ValidateForPresent(&frame, reuse);
@@ -1021,7 +1025,9 @@ void Presenter::Present(Frame& frame, bool reuse) {
 		VideoOut::SetPresentStage(VideoOut::kPresentStagePresentDone);
 		m_impl->presented_overlay_revision.store(overlay_visual.revision,
 		                                         std::memory_order_release);
-		m_impl->window.UpdateTitle();
+		// Title is refreshed by Flip after shown++ (and PresentThread heartbeat).
+		// Updating here sampled ready=shown+1 and took FlipQueue::m_mutex via
+		// GetDiagnostics while Flip still needed that mutex to publish.
 		m_impl->frames.Release(&frame, true);
 		return;
 	}

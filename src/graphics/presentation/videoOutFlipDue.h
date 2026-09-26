@@ -52,6 +52,7 @@ inline constexpr uint32_t kPresentStagePresentQueue   = 9;
 inline constexpr uint32_t kPresentStageVblankEnd      = 10;
 inline constexpr uint32_t kPresentStagePresentDone    = 11;
 inline constexpr uint32_t kPresentStageFlipPublish    = 12;
+inline constexpr uint32_t kPresentStageFlipPublishWait = 13;
 
 inline std::atomic<uint32_t>& PresentStageFlag() noexcept {
 	static std::atomic<uint32_t> stage {0};

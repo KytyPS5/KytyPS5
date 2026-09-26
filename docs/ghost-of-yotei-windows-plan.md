@@ -3,6 +3,19 @@
 Обновлено **26 сентября 2026 года**. Игра: **Ghost of Yōtei, PPSA26344**.
 Рабочая ветка — `yotei-windows-bringup` в локальном fork `fxpw/KytyPS5`.
 
+Checkpoint Flip queue lock-order (Reserve cfg→m_mutex ABBA) **26 сентября 2026 года**:
+
+1. `bd6ee368` (unlock cfg before publish) не снял soft-stall:
+   `_Build/runs/yotei-integrated-20260926-045245-presentfix` — shown=125 /
+   ready=126 / stale pstg=11 на 300s (title застывал на PresentDone).
+2. Реальный ABBA: `ReserveFlipRequest` держал `cfg.mutex` → `Reserve(m_mutex)`,
+   а Flip publish берёт `m_mutex` → `cfg.mutex`. Title `GetDiagnostics` тоже
+   брал `m_mutex` внутри Present до `shown++`.
+3. Фикс: Reserve всегда `m_mutex` затем `cfg.mutex`; title после publish +
+   heartbeat PresentThread; pstg=13 FlipPublishWait; GetDiagnostics без
+   блокирующего Lock.
+4. Game retry PENDING на этом checkpoint. Меню/gameplay PENDING.
+
 Checkpoint present soft-stall (shown≈130 / ready=shown+1) **26 сентября 2026 года**:
 
 1. Корневая гипотеза по `_Build/runs/yotei-integrated-20260926-023701-fb471f`:

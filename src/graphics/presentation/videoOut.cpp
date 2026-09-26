@@ -203,8 +203,8 @@ public:
 	~FlipQueue();
 	KYTY_CLASS_NO_COPY(FlipQueue);
 
-	bool Reserve(VideoOutConfig& cfg, int index, int64_t flip_arg, FlipRequestSource source,
-	             uint64_t& request_id);
+	int Reserve(VideoOutConfig& cfg, int index, int64_t flip_arg, FlipRequestSource source,
+	            uint64_t& request_id);
 	void Cancel(VideoOutConfig& cfg);
 	void Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer);
 	void Complete(uint64_t request_id);
@@ -518,15 +518,11 @@ static int ReserveFlipRequest(VideoOutDriver::Impl& driver, int handle, int inde
 		return VIDEO_OUT_ERROR_INVALID_INDEX;
 	}
 
-	Common::LockGuard lock(video_out->mutex);
-	if (video_out->closing ||
-	    (!IsSpecialBufferIndex(index) && !video_out->buffers[index].Occupied())) {
-		return VIDEO_OUT_ERROR_INVALID_INDEX;
-	}
-	if (!driver.GetFlipQueue().Reserve(*video_out, index, flip_arg, source, request_id)) {
-		return VIDEO_OUT_ERROR_FLIP_QUEUE_FULL;
-	}
-	return OK;
+	// Do not hold cfg.mutex across FlipQueue::Reserve. Reserve takes m_mutex then
+	// cfg.mutex (canonical order). Holding cfg first deadlocks against Flip publish
+	// (m_mutex → cfg) and against title diagnostics that used to take m_mutex inside
+	// Present before shown was published.
+	return driver.GetFlipQueue().Reserve(*video_out, index, flip_arg, source, request_id);
 }
 
 Graphics::ImageInfo BufferAttributeGroup::ImageInfo(const VideoOutBuffer& buffer) const {
@@ -894,18 +890,25 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 		}
 		SetPresentStage(kPresentStageVblankEnd);
 		VblankEnd();
+		// Keep pstg/shown live even when Flip returns without presenting so the
+		// soft-stall watchdog samples the current stage instead of a stale title.
+		m_presenter.UpdateWindowTitle();
 
 		const auto frame_end = Common::Timer::QueryPerformanceCounter();
 		total_wait += static_cast<int64_t>(period) - static_cast<int64_t>(frame_end - frame_begin);
 	}
 }
 
-bool FlipQueue::Reserve(VideoOutConfig& cfg, int index, int64_t flip_arg, FlipRequestSource source,
-                        uint64_t& request_id) {
+int FlipQueue::Reserve(VideoOutConfig& cfg, int index, int64_t flip_arg, FlipRequestSource source,
+                       uint64_t& request_id) {
 	Common::LockGuard lock(m_mutex);
-
+	Common::LockGuard cfg_lock(cfg.mutex);
+	if (cfg.closing ||
+	    (!IsSpecialBufferIndex(index) && !cfg.buffers[index].Occupied())) {
+		return VIDEO_OUT_ERROR_INVALID_INDEX;
+	}
 	if (m_requests.size() + m_cpu_requests.size() >= VIDEO_OUT_FLIP_QUEUE_CAPACITY) {
-		return false;
+		return VIDEO_OUT_ERROR_FLIP_QUEUE_FULL;
 	}
 	auto& pending = source == FlipRequestSource::GpuEop ? m_requests : m_cpu_requests;
 
@@ -934,7 +937,7 @@ bool FlipQueue::Reserve(VideoOutConfig& cfg, int index, int64_t flip_arg, FlipRe
 		cfg.flip_status.gcQueueNum++;
 	}
 
-	return true;
+	return OK;
 }
 
 FlipQueue::~FlipQueue() {
@@ -1206,8 +1209,23 @@ bool FlipQueue::Flip(uint32_t micros) {
 
 	m_presenter.Present(*r.frame);
 
+	SetPresentStage(kPresentStageFlipPublishWait);
+	// Prefer TryLock so a stuck holder cannot freeze PresentThread silently:
+	// title heartbeat keeps showing pstg=13 while we wait.
+	for (uint32_t spin = 0;; spin++) {
+		if (m_mutex.TryLock()) {
+			break;
+		}
+		if (spin > 0 && (spin % 1000u) == 0u) {
+			LOGF("FlipQueue::Flip publish waiting for queue mutex id=%" PRIu64
+			     " shown_pending spin=%u\n",
+			     r.id, spin);
+			Log::Flush();
+			m_presenter.UpdateWindowTitle();
+		}
+		Common::Thread::SleepMicro(1000);
+	}
 	SetPresentStage(kPresentStageFlipPublish);
-	m_mutex.Lock();
 	if (m_requests.empty() || m_requests.front().id != r.id ||
 	    m_requests.front().state != RequestState::Presenting) {
 		EXIT("video-out flip queue changed while processing its front request\n");
@@ -1237,6 +1255,8 @@ bool FlipQueue::Flip(uint32_t micros) {
 	TriggerVideoOutEvents(*r.cfg, VideoOutEventKind::Flip, reinterpret_cast<void*>(r.flip_arg));
 	r.cfg->mutex.Unlock();
 
+	m_presenter.UpdateWindowTitle();
+
 	Graphics::RenderDocOnGuestFlip(m_presenter.Renderer());
 
 	if (Config::GraphicsDebugDumpEnabled() &&
@@ -1254,8 +1274,17 @@ void FlipQueue::GetFlipStatus(VideoOutConfig& cfg, VideoOutFlipStatus& out) {
 }
 
 VideoOutDiagnostics FlipQueue::GetDiagnostics() {
-	Common::LockGuard lock(m_mutex);
-	return m_diagnostics;
+	VideoOutDiagnostics out {};
+	// Never block the present/title path on the flip-queue mutex: Flip publish
+	// and Reserve take that lock, and a blocking GetDiagnostics from Present
+	// used to form cfg↔queue ABBA stalls.
+	if (m_mutex.TryLock()) {
+		out = m_diagnostics;
+		m_mutex.Unlock();
+	} else {
+		out = m_diagnostics;
+	}
+	return out;
 }
 
 void FlipQueue::RecordOutputStatus(uint32_t resolution) {

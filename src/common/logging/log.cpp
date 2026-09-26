@@ -11,12 +11,16 @@
 #include <mutex>
 #include <spdlog/formatter.h>
 #include <spdlog/logger.h>
-#include <spdlog/sinks/basic_file_sink.h>
 #include <spdlog/sinks/null_sink.h>
+#include <spdlog/sinks/rotating_file_sink.h>
 #include <spdlog/sinks/stdout_sinks.h>
 #include <string_view>
 
 namespace {
+
+// Cap printf log growth so reports stay usable (see issue #200).
+constexpr std::size_t kMaxLogFileSize = 64ull * 1024 * 1024;
+constexpr std::size_t kMaxLogFiles    = 3;
 
 class RawFormatter final: public spdlog::formatter {
 public:
@@ -45,8 +49,14 @@ std::shared_ptr<spdlog::logger> MakeFileLogger(std::string                  name
 		std::filesystem::create_directories(parent);
 	}
 
+<<<<<<< HEAD
+	// rotate_on_open matches the old truncate-on-open "fresh file each run" behavior.
+	auto sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
+	    Common::PathToString(path), kMaxLogFileSize, kMaxLogFiles, true);
+=======
 	auto sink =
 	    std::make_shared<spdlog::sinks::basic_file_sink_mt>(path.native(), true);
+>>>>>>> upstream/main
 	return MakeLogger(std::move(name), std::move(sink));
 }
 

@@ -13,15 +13,14 @@ Checkpoint bounded SRT unmapped/coherent reads **26 сентября 2026 год
    (`_Build/logs/bounded-unmapped-{red,green}.*`).
 2. Specialization reads use `TryReadGpuCoherentBacking` (drain GPU-dirty
    buffer bytes on GPU thread; texture-modified still rejected).
-3. Game `_Build/runs/yotei-integrated-20260926-010013-2cb43e`
-   (SHA `bff21ebc…` / `84cbbb85`-dirty, frame 305, **shown=120**, flips gpu 121,
-   prepared/ready 121): Materialize fatal `0x5000f37f80` снят. Watchdog 600s:
-   shown не двигался. `GpuDispatchSync` после последнего flip продолжает
-   `after-complete` с малым `elapsed_us` — стопор не в Sync-waited
-   `DispatchDirect`. Скорее present/VideoOut (`ready` впереди `shown`).
-   Без Sync+GPUAV lite — `exit -2147483645` (breakpoint) на shown=0.
-4. Меню/gameplay **PENDING**. Следующий фокус: почему Flip/Present не
-   забирает Ready-запрос после ~120.
+3. Game `_Build/runs/yotei-integrated-20260926-014926-100df0` (и соседние
+   Sync+GPUAV lite): Materialize fatal снят; стопор **shown≈120–130**.
+   `Presenter::Present` доходит до `end` — hang не в acquire/present.
+   `FlipQueue::Flip front not Ready id=… state=1 (Recording) queue=1`: EOP-flip
+   застрял после `Prepare`, до `CompleteFlip` (priority op после GPU tick).
+   Без Sync+GPUAV — breakpoint `exit -2147483645` на shown=0.
+4. Меню/gameplay **PENDING**. Следующий фокус: почему GPU EOP не доводит
+   Recording→Ready (графический CB / DeferPriorityOperation CompleteFlip).
 
 Checkpoint planning_only SRT zeros + dense budgets **26 сентября 2026 года**,
 источник `1cdc1998` / `37584633`:

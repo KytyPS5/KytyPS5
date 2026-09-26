@@ -1140,6 +1140,13 @@ bool FlipQueue::Flip(uint32_t micros) {
 		EXIT("video-out flip queue processing is already active\n");
 	}
 	if (m_requests.front().state != RequestState::Ready) {
+		static std::atomic<uint32_t> not_ready_logs {0};
+		if (not_ready_logs.fetch_add(1, std::memory_order_relaxed) < 64) {
+			LOGF("FlipQueue::Flip front not Ready id=%" PRIu64 " state=%u queue=%zu\n",
+			     m_requests.front().id, static_cast<uint32_t>(m_requests.front().state),
+			     m_requests.size());
+			Log::Flush();
+		}
 		m_mutex.Unlock();
 		return false;
 	}
@@ -1149,6 +1156,14 @@ bool FlipQueue::Flip(uint32_t micros) {
 
 	r.cfg->mutex.Lock();
 	if (!IsFlipDueLocked(*r.cfg, r.generation)) {
+		static std::atomic<uint32_t> not_due_logs {0};
+		if (not_due_logs.fetch_add(1, std::memory_order_relaxed) < 64) {
+			LOGF("FlipQueue::Flip not due id=%" PRIu64 " flip_rate=%d vblank=%" PRIu64
+			     " opened=%d closing=%d gen=%" PRIu64 "/%" PRIu64 "\n",
+			     r.id, r.cfg->flip_rate, r.cfg->vblank_status.count, r.cfg->opened ? 1 : 0,
+			     r.cfg->closing ? 1 : 0, r.generation, r.cfg->generation);
+			Log::Flush();
+		}
 		r.cfg->mutex.Unlock();
 		Common::LockGuard queue_lock(m_mutex);
 		m_processing = false;

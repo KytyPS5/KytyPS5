@@ -42,6 +42,17 @@ int32_t KYTY_SYSV_ABI SupplementaryFilter(char16_t *out_text,
   return 0;
 }
 
+int32_t KYTY_SYSV_ABI NewlineFilter(char16_t *out_text,
+                                    uint32_t *out_length,
+                                    const char16_t *, uint32_t) {
+  CHECK(*out_length >= 3);
+  out_text[0] = u'a';
+  out_text[1] = u'\n';
+  out_text[2] = u'b';
+  *out_length = 3;
+  return 0;
+}
+
 int KYTY_SYSV_ABI KeyboardFilter(const Ime::Keycode *source,
                                  uint16_t *out_keycode, uint32_t *out_status,
                                  void *) {
@@ -174,6 +185,16 @@ void TestValidation() {
   Ime::Result result{};
   CHECK(Ime::ImeDialogGetResult(&result) == 0);
   CHECK(Ime::ImeDialogTerm() == 0);
+
+  std::array<char16_t, 32> single_line{u'a', u'\n', u'b'};
+  param = MakeParam(single_line.data());
+  CHECK(Ime::ImeDialogInit(&param, nullptr) ==
+        static_cast<int32_t>(0x80bc0017));
+  param.option = Ime::OPTION_MULTILINE;
+  CHECK(Ime::ImeDialogInit(&param, nullptr) == 0);
+  CHECK(Ime::ImeDialogAbort() == 0);
+  CHECK(Ime::ImeDialogGetResult(&result) == 0);
+  CHECK(Ime::ImeDialogTerm() == 0);
 }
 
 void TestFilteringAndInputPolicy() {
@@ -304,6 +325,68 @@ void TestFilteredCursorBoundary() {
   CHECK(Ime::ImeDialogTerm() == 0);
 }
 
+void TestFilteredNewlinePolicy() {
+  std::array<char16_t, 32> text{};
+  auto param = MakeParam(text.data());
+  param.filter = NewlineFilter;
+  CHECK(Ime::ImeDialogInit(&param, nullptr) == 0);
+  Ime::HostSnapshot snapshot;
+  CHECK(Ime::GetHostSnapshot(&snapshot));
+  CHECK(Ime::HostInsertText(snapshot.generation, u"x"));
+  CHECK(Ime::ImeDialogGetStatus() == static_cast<int>(Ime::Status::Running));
+  CHECK(std::u16string(text.data()) == u"x");
+  CHECK(Ime::HostCancel(snapshot.generation));
+  Ime::Result result{};
+  CHECK(Ime::ImeDialogGetResult(&result) == 0);
+  CHECK(Ime::ImeDialogTerm() == 0);
+
+  text.fill(u'\0');
+  param = MakeParam(text.data());
+  param.option = Ime::OPTION_MULTILINE;
+  param.filter = NewlineFilter;
+  CHECK(Ime::ImeDialogInit(&param, nullptr) == 0);
+  CHECK(Ime::GetHostSnapshot(&snapshot));
+  CHECK(Ime::HostInsertText(snapshot.generation, u"x"));
+  CHECK(Ime::ImeDialogGetStatus() == static_cast<int>(Ime::Status::Running));
+  CHECK(std::u16string(text.data()) == u"a\nb");
+  CHECK(Ime::HostCancel(snapshot.generation));
+  CHECK(Ime::ImeDialogGetResult(&result) == 0);
+  CHECK(Ime::ImeDialogTerm() == 0);
+}
+
+void TestVisualRevisionTracksEdits() {
+  std::array<char16_t, 32> text{u'a', u'b'};
+  auto param = MakeParam(text.data());
+  CHECK(Ime::ImeDialogInit(&param, nullptr) == 0);
+  Ime::HostSnapshot snapshot;
+  CHECK(Ime::GetHostSnapshot(&snapshot));
+
+  auto visual = Ime::GetVisualState();
+  CHECK(visual.active);
+  const auto initial_revision = visual.revision;
+  CHECK(Ime::HostMoveCursor(snapshot.generation, -1));
+  visual = Ime::GetVisualState();
+  CHECK(visual.revision > initial_revision);
+
+  const auto cursor_revision = visual.revision;
+  CHECK(Ime::HostInsertText(snapshot.generation, u"x"));
+  visual = Ime::GetVisualState();
+  CHECK(visual.revision > cursor_revision);
+
+  const auto insert_revision = visual.revision;
+  CHECK(Ime::HostBackspace(snapshot.generation));
+  visual = Ime::GetVisualState();
+  CHECK(visual.revision > insert_revision);
+
+  const auto backspace_revision = visual.revision;
+  CHECK(!Ime::HostMoveCursor(snapshot.generation, 0));
+  CHECK(Ime::GetVisualState().revision == backspace_revision);
+  CHECK(Ime::HostCancel(snapshot.generation));
+  Ime::Result result{};
+  CHECK(Ime::ImeDialogGetResult(&result) == 0);
+  CHECK(Ime::ImeDialogTerm() == 0);
+}
+
 } // namespace
 
 int main() {
@@ -314,5 +397,7 @@ int main() {
   TestFilteringAndInputPolicy();
   TestExternalKeyboardFilter();
   TestFilteredCursorBoundary();
+  TestFilteredNewlinePolicy();
+  TestVisualRevisionTracksEdits();
   return 0;
 }

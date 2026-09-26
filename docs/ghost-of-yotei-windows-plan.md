@@ -3,6 +3,22 @@
 Обновлено **26 сентября 2026 года**. Игра: **Ghost of Yōtei, PPSA26344**.
 Рабочая ветка — `yotei-windows-bringup` в локальном fork `fxpw/KytyPS5`.
 
+Checkpoint present soft-stall (shown≈130 / ready=shown+1) **26 сентября 2026 года**:
+
+1. Корневая гипотеза по `_Build/runs/yotei-integrated-20260926-023701-fb471f`:
+   Present-поток блокировался в `UpdateTitle` → `SDL_RunOnMainThread(..., true)`,
+   пока window loop не качает события; GPU продолжал Sync, `ready=131`,
+   `shown=130` на 300s watchdog.
+2. `UpdateTitle` больше не ждёт main thread: pending title + `SDL_PushEvent`
+   wake, apply в `WindowContext::Run`.
+3. `FlipQueue::Flip` не держит `cfg.mutex` через весь `Present`.
+4. `vkAcquireNextImageKHR` timeout 1s → recreate (вместо infinite wait).
+5. `flip_rate` pacing: relative к `last_presented_vblank` (не absolute
+   `count % (rate+1)`), чтобы Ready не голодал на odd-phase.
+   RED/GREEN: `video_out_flip_due_tests` (`VideoOutFlipDueTests.cpp`).
+6. Game retry Sync+GPUAV lite — PENDING после install этого checkpoint.
+7. Меню/gameplay **PENDING**.
+
 Checkpoint bounded SRT unmapped/coherent reads **26 сентября 2026 года**,
 источник `84cbbb85` (локально; `git push` на origin таймаутится к github.com:443):
 

@@ -705,12 +705,18 @@ bool Swapchain::NeedsResize() const {
 
 Swapchain::Status Swapchain::AcquireNextImage() {
 	EXIT_IF(m_handle == nullptr || m_frame_index >= m_image_acquired.size());
-	m_image_index     = static_cast<uint32_t>(-1);
-	const auto result = m_window.graphic_ctx.device.acquireNextImageKHR(
-	    m_handle, std::numeric_limits<uint64_t>::max(), m_image_acquired[m_frame_index], nullptr,
-	    &m_image_index);
+	m_image_index = static_cast<uint32_t>(-1);
+	// Bound acquire so a drained swapchain cannot freeze the present thread (and
+	// therefore VideoOut Flip) indefinitely while the GPU continues submitting.
+	constexpr uint64_t kAcquireTimeoutNs = 1'000'000'000ull;
+	const auto         result            = m_window.graphic_ctx.device.acquireNextImageKHR(
+        m_handle, kAcquireTimeoutNs, m_image_acquired[m_frame_index], nullptr, &m_image_index);
 	switch (result) {
 		case vk::Result::eSuccess: break;
+		case vk::Result::eTimeout:
+			LOGF("vkAcquireNextImageKHR timed out after 1s; recreating swapchain\n");
+			Log::Flush();
+			return Status::Recreate;
 		case vk::Result::eSuboptimalKHR:
 			LOGF("vkAcquireNextImageKHR returned vk::Result::eSuboptimalKHR\n");
 			return Status::Recreate;
@@ -934,7 +940,7 @@ void Presenter::Present(Frame& frame, bool reuse) {
 	if (swapchain.NeedsResize()) {
 		m_impl->RecoverSwapchain(Swapchain::Status::Recreate);
 	}
-	for (uint32_t attempt = 0; attempt < 2; attempt++) {
+	for (uint32_t attempt = 0; attempt < 4; attempt++) {
 		auto status = swapchain.AcquireNextImage();
 		if (status != Swapchain::Status::Success) {
 			m_impl->RecoverSwapchain(status);

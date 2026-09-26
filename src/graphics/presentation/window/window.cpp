@@ -716,6 +716,7 @@ void WindowContext::Run() {
 	loop.paused.store(false, std::memory_order_release);
 
 	while (!loop.need_exit) {
+		ApplyPendingTitle();
 		if (loop.paused.load(std::memory_order_acquire)) {
 			if (!timer.IsPaused()) {
 				timer.Pause();
@@ -953,16 +954,32 @@ void WindowContext::UpdateTitle() {
 	    video_out.last_output_resolution, video_out.output_support_calls,
 	    video_out.last_output_mode, video_out.last_output_support);
 
-	struct TitleUpdate {
-		SDL_Window*  window;
-		std::string* text;
-	} update {window, &text};
-	EXIT_IF(!SDL_RunOnMainThread(
-	    [](void* data) {
-		    auto& title = *static_cast<TitleUpdate*>(data);
-		    SDL_SetWindowTitle(title.window, title.text->c_str());
-	    },
-	    &update, true));
+	// Never block the present thread on the window thread. A blocking
+	// SDL_RunOnMainThread here soft-stalls VideoOut while the GPU keeps running
+	// (ready=shown+1, shown frozen) whenever the main loop is not pumping.
+	{
+		Common::LockGuard lock(title_mutex);
+		pending_title = std::move(text);
+		title_dirty   = true;
+	}
+	SDL_Event wake {};
+	wake.type = SDL_EVENT_USER;
+	SDL_PushEvent(&wake);
+}
+
+void WindowContext::ApplyPendingTitle() {
+	std::string text;
+	{
+		Common::LockGuard lock(title_mutex);
+		if (!title_dirty) {
+			return;
+		}
+		text        = std::move(pending_title);
+		title_dirty = false;
+	}
+	if (window != nullptr) {
+		SDL_SetWindowTitle(window, text.c_str());
+	}
 }
 
 } // namespace Libs::Graphics

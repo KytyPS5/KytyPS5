@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/renderDoc.h"
+#include "graphics/presentation/videoOutFlipDue.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -184,6 +185,7 @@ struct VideoOutConfig {
 	bool                                opened      = false;
 	bool                                closing     = false;
 	int                                 flip_rate   = 0;
+	uint64_t                            last_presented_vblank = kNoPresentedVblank;
 	uint64_t                            output_mode = VIDEO_OUT_OUTPUT_MODE_DEFAULT;
 	float                               gamma       = 1.0f;
 	VideoOutFlipStatus                  flip_status;
@@ -488,9 +490,7 @@ static bool IsFlipDueLocked(const VideoOutConfig& cfg, uint64_t generation) {
 	if (!cfg.opened || cfg.closing || cfg.generation != generation) {
 		return false;
 	}
-	const int interval = cfg.flip_rate + 1;
-
-	return interval <= 1 || (cfg.vblank_status.count % static_cast<uint64_t>(interval)) == 0;
+	return IsFlipDueAtVblank(cfg.vblank_status.count, cfg.flip_rate, cfg.last_presented_vblank);
 }
 
 static bool IsValidBufferIndex(int index) {
@@ -679,6 +679,7 @@ int VideoOutDriver::Impl::Open(int bus_type, int index) {
 	config.flip_status.flipArg       = -1;
 	config.flip_status.currentBuffer = -1;
 	config.flip_status.count         = 0;
+	config.last_presented_vblank     = kNoPresentedVblank;
 	config.pre_vblank_status         = VideoOutVblankStatus();
 	config.vblank_status             = VideoOutVblankStatus();
 
@@ -715,6 +716,7 @@ bool VideoOutDriver::Impl::Close(int handle) {
 			output_mode_events = std::move(config.events->output_mode);
 		}
 		config.flip_rate = 0;
+		config.last_presented_vblank = kNoPresentedVblank;
 
 		for (const auto& buffer: config.buffers) {
 			if (buffer.Occupied() &&
@@ -1159,9 +1161,10 @@ bool FlipQueue::Flip(uint32_t micros) {
 		static std::atomic<uint32_t> not_due_logs {0};
 		if (not_due_logs.fetch_add(1, std::memory_order_relaxed) < 64) {
 			LOGF("FlipQueue::Flip not due id=%" PRIu64 " flip_rate=%d vblank=%" PRIu64
-			     " opened=%d closing=%d gen=%" PRIu64 "/%" PRIu64 "\n",
-			     r.id, r.cfg->flip_rate, r.cfg->vblank_status.count, r.cfg->opened ? 1 : 0,
-			     r.cfg->closing ? 1 : 0, r.generation, r.cfg->generation);
+			     " last_presented_vblank=%" PRIu64 " opened=%d closing=%d gen=%" PRIu64
+			     "/%" PRIu64 "\n",
+			     r.id, r.cfg->flip_rate, r.cfg->vblank_status.count, r.cfg->last_presented_vblank,
+			     r.cfg->opened ? 1 : 0, r.cfg->closing ? 1 : 0, r.generation, r.cfg->generation);
 			Log::Flush();
 		}
 		r.cfg->mutex.Unlock();
@@ -1170,6 +1173,10 @@ bool FlipQueue::Flip(uint32_t micros) {
 		m_done_cond_var.SignalAll();
 		return false;
 	}
+	// Do not hold the config mutex across Present: title updates and swapchain
+	// recovery must not block guest VideoOut waits for the duration of vsync.
+	const uint64_t present_vblank = r.cfg->vblank_status.count;
+	r.cfg->mutex.Unlock();
 
 	m_mutex.Lock();
 	if (m_requests.empty() || m_requests.front().id != r.id ||
@@ -1181,6 +1188,7 @@ bool FlipQueue::Flip(uint32_t micros) {
 
 	m_presenter.Present(*r.frame);
 
+	r.cfg->mutex.Lock();
 	m_mutex.Lock();
 	if (m_requests.empty() || m_requests.front().id != r.id ||
 	    m_requests.front().state != RequestState::Presenting) {
@@ -1188,6 +1196,7 @@ bool FlipQueue::Flip(uint32_t micros) {
 	}
 	m_requests.pop_front();
 
+	r.cfg->last_presented_vblank                = present_vblank;
 	r.cfg->flip_status.count++;
 	r.cfg->flip_status.processTime              = LibKernel::KernelGetProcessTime();
 	r.cfg->flip_status.processTimeCounter       = LibKernel::KernelGetProcessTimeCounter();

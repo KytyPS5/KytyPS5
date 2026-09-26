@@ -21,8 +21,14 @@ Checkpoint present soft-stall (shown≈130 / ready=shown+1) **26 сентябр�
    (shown рос с обновлением title до **121**), затем снова soft-stall
    `ready=122/shown=121` на 300s — Present ждёт `renderer.GetMutex`,
    удерживаемый GPU compile/materialize. Следующий фикс: TryLock timeout 5s.
-7. Game retry после mutex-bound Present — PENDING.
-8. Меню/gameplay **PENDING**.
+7. Коммиты `2b08434a` / `b60b9283` / `fcd1711b`: mutex TryLock 5s, poll
+   `acquireNextImage` timeout=0, cfg.mutex снова держится через Present
+   (отпускание давало interleave со guest vblank wait).
+8. Retries `…-032603` / `…-034036` / `…-035330`: максимум **shown=137** /
+   ready=138, watchdog 180s; presentKHR begin/end сходятся (не hang в
+   presentKHR). Soft-stall Present/Flip **ещё не закрыт**.
+9. Меню/gameplay **PENDING**. Branch ahead локально; push к github:443
+   таймаутится.
 
 Checkpoint bounded SRT unmapped/coherent reads **26 сентября 2026 года**,
 источник `84cbbb85` (локально; `git push` на origin таймаутится к github.com:443):

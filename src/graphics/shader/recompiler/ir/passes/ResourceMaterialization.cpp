@@ -269,6 +269,26 @@ bool MaterializeIndirectImage(const ResourcePlan&                    program,
 		}
 		keys.resize(key_count);
 		std::iota(keys.begin(), keys.end(), 0u);
+	} else if (indirect.address_key) {
+		if (material_value.dword_count != 2u || table_value.dword_count != 2u ||
+		    indirect.address_key_count == 0u ||
+		    indirect.address_key_count > MaxIndirectImageProbes ||
+		    uint64_t {indirect.selector_offset} +
+		            uint64_t {indirect.address_key_count} * sizeof(uint32_t) >
+		        uint64_t {UINT32_MAX} + 1u) {
+			return false;
+		}
+		const auto material_base =
+		    (static_cast<uint64_t>(material_value.dwords[1]) << 32u) | material_value.dwords[0];
+		std::vector<uint32_t> words(indirect.address_key_count);
+		if (!ReadScalarTable(material_base, UINT64_MAX, indirect.selector_offset, runtime, words))
+			return false;
+		keys.reserve(words.size());
+		for (const auto word: words) {
+			keys.push_back(word * indirect.key_scale + indirect.key_bias);
+		}
+		std::ranges::sort(keys);
+		keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
 	} else if (!indirect.selector_mask.IsEmpty()) {
 		uint32_t mask  = 0;
 		uint32_t count = 0;
@@ -1002,7 +1022,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		const auto* source = Source(program, image.source);
 		return source != nullptr && source->indirect_image.has_value() &&
 		       (!source->indirect_image->selector_mask.IsEmpty() ||
-		        source->indirect_image->record_key);
+		        source->indirect_image->record_key || source->indirect_image->address_key);
 	});
 	if (protected_image && (program.has_address_writes ||
 	                        std::ranges::any_of(program.info.images, &ImageResource::written))) {

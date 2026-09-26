@@ -471,7 +471,11 @@ struct DescriptorSource {
 		uint32_t table_offset    = 0;
 		Value    key_count;
 		Value    selector_mask;
-		bool     record_key = false;
+		bool     record_key        = false;
+		bool     address_key       = false;
+		uint32_t address_key_count = 0;
+		uint32_t key_scale         = 1;
+		uint32_t key_bias          = 0;
 
 		bool operator==(const IndirectImage& other) const = default;
 	};

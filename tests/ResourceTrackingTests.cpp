@@ -748,6 +748,156 @@ void TestSharedUniformLoopIndex() {
              "invalid shared selector was not rejected promptly");
 }
 
+void TestBoundedAddressImageKeys() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  Fixture fixture;
+  auto *entry = fixture.block;
+  auto *header = fixture.AddBlock();
+  auto *body = fixture.AddBlock();
+  auto *exit = fixture.AddBlock();
+  entry->AddBranch(header);
+  header->AddBranch(body);
+  header->AddBranch(exit);
+  body->AddBranch(header);
+  fixture.program.block_info[0].terminator = {
+      .kind = CFG::TerminatorKind::Branch, .true_block = 1u};
+  fixture.program.block_info[1].terminator = {
+      .kind = CFG::TerminatorKind::ConditionalBranch,
+      .true_block = 2u, .false_block = 3u};
+  fixture.program.block_info[2].terminator = {
+      .kind = CFG::TerminatorKind::Branch, .true_block = 1u};
+  fixture.program.block_info[3].terminator.kind = CFG::TerminatorKind::Return;
+
+  const auto active = fixture.Emit(
+      ValueOpcode::INotEqual32, {fixture.UserData(3), Value(0u)}, 0, entry);
+  auto &loop = header->AppendNewInst(ValueOpcode::Phi, {},
+                                      static_cast<uint64_t>(Type::U1));
+  const auto next = fixture.Emit(ValueOpcode::LogicalAnd,
+                                 {Value(&loop), active}, 0, body);
+  loop.AddPhiOperand(entry, active);
+  loop.AddPhiOperand(body, next);
+  fixture.program.block_info[1].condition = Value(&loop);
+
+  const auto pointer = fixture.Address(fixture.UserData(0),
+                                        fixture.UserData(1), 0x20);
+  const auto clamped = fixture.Emit(ValueOpcode::UMin32,
+                                    {fixture.UserData(2), Value(7u)}, 0, entry);
+  const auto record = fixture.Emit(ValueOpcode::ShiftRightArithmetic32,
+                                   {clamped, Value(2u)}, 0, entry);
+  const auto record_offset = fixture.Emit(ValueOpcode::IAdd32,
+      {fixture.Emit(ValueOpcode::ShiftLeftLogical32,
+                    {record, Value(4u)}, 0, entry), Value(16u)}, 0, entry);
+  const auto offset = fixture.Emit(ValueOpcode::SelectU32,
+                                   {active, record_offset, Value(0u)}, 0, entry);
+  std::array<Value, 4> reads;
+  for (uint32_t index = 0; index < reads.size(); ++index) {
+    MemoryInfo memory;
+    memory.kind = ResourceKind::ScalarAddress;
+    memory.offset = index * 4u;
+    reads[index] = fixture.Emit(ValueOpcode::LoadAddressU32,
+                                {pointer, offset, Value(0u), active},
+                                fixture.AddMemory(memory, 0x30), entry);
+  }
+  const auto selected = fixture.Emit(
+      ValueOpcode::SelectU32,
+      {fixture.Emit(ValueOpcode::INotEqual32,
+                    {fixture.UserData(6), Value(0u)}, 0, entry),
+       fixture.Emit(ValueOpcode::SelectU32,
+                    {fixture.Emit(ValueOpcode::INotEqual32,
+                                  {fixture.UserData(4), Value(0u)}, 0, entry),
+                     reads[0],
+                     fixture.Emit(ValueOpcode::SelectU32,
+                                  {fixture.Emit(ValueOpcode::INotEqual32,
+                                                {fixture.UserData(5), Value(0u)}, 0, entry),
+                                   reads[1], reads[2]}, 0, entry)}, 0, entry),
+       reads[3]}, 0, entry);
+  const auto eight = fixture.Emit(ValueOpcode::ShiftLeftLogical32,
+                                  {selected, Value(3u)}, 0, entry);
+  const auto three = fixture.Emit(ValueOpcode::IAdd32,
+      {fixture.Emit(ValueOpcode::ShiftLeftLogical32,
+                    {eight, Value(1u)}, 0, entry), eight}, 0, entry);
+  const auto key_value = fixture.Emit(ValueOpcode::SelectU32,
+      {active, fixture.Emit(ValueOpcode::IAdd32,
+                            {Value(13u), three}, 0, entry), Value(0u)}, 0, entry);
+  const auto key = fixture.Emit(ValueOpcode::ReadFirstLane,
+                                {key_value, Value(&loop)}, 0, body);
+  const auto table_offset = fixture.Emit(ValueOpcode::IAdd32,
+      {fixture.Emit(ValueOpcode::ShiftLeftLogical32,
+                    {key, Value(5u)}, 0, body), Value(0x200u)}, 0, body);
+  std::array<Value, 8> image_words;
+  for (uint32_t dword = 0; dword < image_words.size(); ++dword) {
+    MemoryInfo memory;
+    memory.kind = ResourceKind::ScalarAddress;
+    memory.offset = dword * 4u;
+    image_words[dword] = fixture.Emit(ValueOpcode::LoadAddressU32,
+        {pointer, table_offset, Value(0u), Value(true)},
+        fixture.AddMemory(memory, 0x50), body);
+  }
+  fixture.block = body;
+  const auto image = fixture.Image(image_words, 0x50);
+  const auto sampler = fixture.Sampler(
+      {Value(0u), Value(0u), Value(0u), Value(0u)});
+  MemoryInfo sample;
+  sample.kind = ResourceKind::Image;
+  sample.image_dimension = Decoder::ImageDimension::Dim2D;
+  fixture.Emit(ValueOpcode::ImageSampleRaw,
+               {image, sampler, fixture.ImageAddress()},
+               fixture.AddMemory(sample, 0x50), body);
+  const auto output = fixture.Buffer(
+      {fixture.UserData(7), fixture.UserData(8), fixture.UserData(9),
+       fixture.UserData(10)});
+  MemoryInfo store;
+  store.kind = ResourceKind::Buffer;
+  fixture.Emit(ValueOpcode::StoreBufferU32,
+               {output, Value(0u), Value(0u), Value(0u), Value(1u),
+                Value(true)}, fixture.AddMemory(store, 0x60), body);
+  fixture.PlanAndTrack();
+  Check(fixture.program.info.buffers.size() == 1u &&
+            fixture.program.info.buffers[0].written,
+        "address-key fixture lost its written buffer");
+  const auto &indirect = fixture.program.descriptor_sources[
+      fixture.program.info.images.at(0).source].indirect_image;
+  Check(indirect && indirect->address_key &&
+            indirect->selector_offset == 16u &&
+            indirect->address_key_count == 8u &&
+            indirect->key_scale == 24u && indirect->key_bias == 13u,
+        "bounded address-key table was not recognized");
+
+  auto plan = ExtractResourcePlan(fixture.program);
+  LinearTestMemory memory;
+  for (uint32_t index = 0; index < 8u; ++index) {
+    memory.words[4u + index] = index & 1u;
+  }
+  std::array<uint32_t, 8> descriptor{};
+  descriptor[0] = 0x400u;
+  descriptor[1] = static_cast<uint32_t>(
+      Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float) << 20u;
+  descriptor[2] = 3u | (3u << 14u);
+  descriptor[3] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+      (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+  for (const uint32_t key : {13u, 37u}) {
+    const auto index = (0x200u + key * 32u) / 4u;
+    std::copy(descriptor.begin(), descriptor.end(), memory.words.begin() + index);
+    memory.words[index] += key;
+  }
+  std::array<uint32_t, 11> user_data{0x1000u, 0u, 7u, 1u, 1u, 0u, 1u,
+                                     0x3000u, 4u << 16u, 1u, 0u};
+  const SrtRuntime runtime{.user_data = user_data,
+                           .userdata = &memory,
+                           .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.images.size() == 2u &&
+            snapshot.flattened_srt[specialization.images[0].indirect_mapping_offset] == 2u &&
+            snapshot.flattened_srt[specialization.images[0].indirect_mapping_offset + 1u] == 13u &&
+            snapshot.flattened_srt[specialization.images[0].indirect_mapping_offset + 3u] == 37u,
+        "bounded address keys were not materialized");
+  user_data[7] = 0x1010u;
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+        "write overlapping the address-key source was accepted");
+}
+
 std::unique_ptr<Fixture> MakeBufferRecordImageFixture(bool formatted) {
   auto fixture = std::make_unique<Fixture>();
   const auto material = fixture->Buffer({fixture->UserData(0), fixture->UserData(1),
@@ -3243,6 +3393,7 @@ int main() {
     Run("dynamic storage mips", TestDynamicStorageMipTracking);
     Run("invariant indirect images", TestInvariantIndirectImageMaterialization);
     Run("shared uniform loop index", TestSharedUniformLoopIndex);
+    Run("bounded address image keys", TestBoundedAddressImageKeys);
     Run("buffer record image key", TestBufferRecordImageKey);
     Run("guarded direct image table", TestGuardedDirectImageTable);
     Run("bounded compute image loop", TestBoundedComputeImageLoop);

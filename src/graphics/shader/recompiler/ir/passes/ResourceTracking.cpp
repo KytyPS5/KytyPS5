@@ -5,7 +5,9 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <algorithm>
+#include <bit>
 #include <fmt/format.h>
+#include <ranges>
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -320,7 +322,9 @@ private:
 				if (a.material_source != b.material_source || a.table_source != b.table_source ||
 				    a.selector_stride != b.selector_stride ||
 				    a.selector_offset != b.selector_offset || a.table_offset != b.table_offset ||
-				    a.record_key != b.record_key ||
+				    a.record_key != b.record_key || a.address_key != b.address_key ||
+				    a.address_key_count != b.address_key_count || a.key_scale != b.key_scale ||
+				    a.key_bias != b.key_bias ||
 				    !EquivalentValue(m_program, a.key_count, b.key_count) ||
 				    a.selector_mask.IsEmpty() != b.selector_mask.IsEmpty() ||
 				    (!a.selector_mask.IsEmpty() &&
@@ -728,6 +732,206 @@ private:
 		       (Implies(inst->Arg(0), required) || Implies(inst->Arg(1), required));
 	}
 
+	bool ImpliesLoopGuard(Value guard, Value required, std::vector<const Inst*>& active,
+	                      uint32_t depth = 0) const {
+		if (depth > 32u) return false;
+		guard    = guard.Resolve();
+		required = required.Resolve();
+		if (EquivalentValue(m_program, guard, required)) return true;
+		const auto* inst = guard.TryInstruction();
+		if (inst == nullptr) return false;
+		if (std::ranges::find(active, inst) != active.end()) {
+			if (inst->GetOpcode() != ValueOpcode::Phi) return false;
+			for (size_t index = 0; index < inst->NumArgs(); index++) {
+				if (EquivalentValue(m_program, inst->Arg(index), required)) return true;
+			}
+			return false;
+		}
+		active.push_back(inst);
+		bool result = false;
+		if (inst->GetOpcode() == ValueOpcode::LogicalAnd && inst->NumArgs() == 2u) {
+			result = ImpliesLoopGuard(inst->Arg(0), required, active, depth + 1u) ||
+			         ImpliesLoopGuard(inst->Arg(1), required, active, depth + 1u);
+		} else if (inst->GetOpcode() == ValueOpcode::Phi && inst->NumArgs() != 0u) {
+			result = std::ranges::all_of(
+			    std::views::iota(size_t {0}, inst->NumArgs()), [&](size_t index) {
+				    return ImpliesLoopGuard(inst->Arg(index), required, active, depth + 1u);
+			    });
+		}
+		active.pop_back();
+		return result;
+	}
+
+	bool ImpliesLoopGuard(Value guard, Value required) const {
+		std::vector<const Inst*> active;
+		return ImpliesLoopGuard(guard, required, active);
+	}
+
+	struct U32Bounds {
+		uint32_t low       = 0;
+		uint32_t high      = 0;
+		uint32_t zero_bits = 0;
+	};
+
+	bool BoundU32(Value value, Value guard, U32Bounds& bounds, uint32_t depth = 0) const {
+		if (depth > 24u) return false;
+		uint32_t immediate = 0;
+		if (ImmediateU32(value, immediate)) {
+			bounds = {immediate, immediate, static_cast<uint32_t>(std::countr_zero(immediate))};
+			return true;
+		}
+		const auto* inst = value.Resolve().TryInstruction();
+		if (inst == nullptr) return false;
+		const auto op = inst->GetOpcode();
+		if (op == ValueOpcode::SelectU32 && inst->NumArgs() == 3u) {
+			return ImpliesLoopGuard(guard, inst->Arg(0)) &&
+			       BoundU32(inst->Arg(1), guard, bounds, depth + 1u);
+		}
+		if (inst->NumArgs() != 2u) return false;
+		if (op == ValueOpcode::UMin32 &&
+		    (ImmediateU32(inst->Arg(0), immediate) || ImmediateU32(inst->Arg(1), immediate))) {
+			bounds = {0u, immediate, 0u};
+			return true;
+		}
+		if (op == ValueOpcode::IAdd32) {
+			U32Bounds left, right;
+			if (!BoundU32(inst->Arg(0), guard, left, depth + 1u) ||
+			    !BoundU32(inst->Arg(1), guard, right, depth + 1u) ||
+			    uint64_t {left.high} + right.high > UINT32_MAX)
+				return false;
+			bounds = {left.low + right.low, left.high + right.high,
+			          std::min(left.zero_bits, right.zero_bits)};
+			return true;
+		}
+		if (!ImmediateU32(inst->Arg(1), immediate) || immediate >= 32u ||
+		    !BoundU32(inst->Arg(0), guard, bounds, depth + 1u))
+			return false;
+		if (op == ValueOpcode::ShiftRightArithmetic32 && bounds.high <= INT32_MAX) {
+			bounds = {bounds.low >> immediate, bounds.high >> immediate,
+			          bounds.zero_bits > immediate ? bounds.zero_bits - immediate : 0u};
+			return true;
+		}
+		if (op == ValueOpcode::ShiftLeftLogical32 &&
+		    (uint64_t {bounds.high} << immediate) <= UINT32_MAX) {
+			bounds = {bounds.low << immediate, bounds.high << immediate,
+			          std::min(32u, bounds.zero_bits + immediate)};
+			return true;
+		}
+		return false;
+	}
+
+	struct AddressKeyReads {
+		std::vector<const Inst*> reads;
+		uint32_t                 scale = 0;
+		uint32_t                 bias  = 0;
+	};
+
+	bool CollectAddressKeyReads(Value value, Value guard, uint32_t scale, uint32_t bias,
+	                            AddressKeyReads& result, uint32_t depth = 0) const {
+		if (depth > 32u || result.reads.size() > 16u) return false;
+		const auto* inst = value.Resolve().TryInstruction();
+		if (inst == nullptr) return false;
+		const auto op = inst->GetOpcode();
+		if (op == ValueOpcode::ReadFirstLane && inst->NumArgs() >= 2u &&
+		    ImpliesLoopGuard(guard, inst->Arg(1))) {
+			return CollectAddressKeyReads(inst->Arg(0), guard, scale, bias, result, depth + 1u);
+		}
+		if (op == ValueOpcode::SelectU32 && inst->NumArgs() == 3u) {
+			if (ImpliesLoopGuard(guard, inst->Arg(0))) {
+				return CollectAddressKeyReads(inst->Arg(1), guard, scale, bias, result, depth + 1u);
+			}
+			return CollectAddressKeyReads(inst->Arg(1), guard, scale, bias, result, depth + 1u) &&
+			       CollectAddressKeyReads(inst->Arg(2), guard, scale, bias, result, depth + 1u);
+		}
+		if (op == ValueOpcode::IAdd32 && inst->NumArgs() == 2u) {
+			uint32_t immediate = 0;
+			if (ImmediateU32(inst->Arg(0), immediate)) {
+				return CollectAddressKeyReads(inst->Arg(1), guard, scale, bias + scale * immediate,
+				                              result, depth + 1u);
+			}
+			if (ImmediateU32(inst->Arg(1), immediate)) {
+				return CollectAddressKeyReads(inst->Arg(0), guard, scale, bias + scale * immediate,
+				                              result, depth + 1u);
+			}
+			for (uint32_t side = 0; side < 2u; side++) {
+				const auto  base  = inst->Arg(side ^ 1u).Resolve();
+				const auto* shift = inst->Arg(side).Resolve().TryInstruction();
+				if (shift != nullptr && shift->GetOpcode() == ValueOpcode::ShiftLeftLogical32 &&
+				    shift->NumArgs() == 2u && ImmediateU32(shift->Arg(1), immediate) &&
+				    immediate < 32u && EquivalentValue(m_program, shift->Arg(0), base)) {
+					return CollectAddressKeyReads(base, guard, scale * ((1u << immediate) + 1u),
+					                              bias, result, depth + 1u);
+				}
+			}
+			return false;
+		}
+		if (op == ValueOpcode::ShiftLeftLogical32 && inst->NumArgs() == 2u) {
+			uint32_t shift = 0;
+			return ImmediateU32(inst->Arg(1), shift) && shift < 32u &&
+			       CollectAddressKeyReads(inst->Arg(0), guard, scale * (1u << shift), bias, result,
+			                              depth + 1u);
+		}
+		if (op != ValueOpcode::LoadAddressU32 || inst->NumArgs() != 4u ||
+		    result.reads.size() == 16u)
+			return false;
+		const auto enabled = inst->Arg(3).Resolve();
+		uint32_t   high    = 1u;
+		if (!ImmediateU32(inst->Arg(2), high) || high != 0u ||
+		    (!(enabled.IsImmediate() && enabled.GetType() == Type::U1 && enabled.U1()) &&
+		     !ImpliesLoopGuard(guard, enabled)))
+			return false;
+		const auto index = inst->Flags<MemoryFlags>().index;
+		if (index >= m_program.memory_info.size()) return false;
+		const auto& memory = m_program.memory_info[index];
+		if (memory.kind != ResourceKind::ScalarAddress || memory.data_bits != 32u ||
+		    memory.data_dwords != 1u)
+			return false;
+		if (result.reads.empty()) {
+			result.scale = scale;
+			result.bias  = bias;
+		} else if (result.scale != scale || result.bias != bias) {
+			return false;
+		}
+		result.reads.push_back(inst);
+		return true;
+	}
+
+	bool MatchAddressMaterialKey(Value key, const Inst& image, uint32_t pc,
+	                             DescriptorSource&                material_source,
+	                             DescriptorSource::IndirectImage& indirect) {
+		const auto guard = PositiveUseGuard(image.Parent());
+		if (guard.IsEmpty()) return false;
+		AddressKeyReads reads;
+		if (!CollectAddressKeyReads(key, guard, 1u, 0u, reads) || reads.reads.empty()) return false;
+		const Inst* material_handle = nullptr;
+		uint32_t    first           = UINT32_MAX;
+		uint32_t    last            = 0u;
+		for (const auto* read: reads.reads) {
+			const auto* handle = read->Arg(0).Resolve().TryInstruction();
+			if (handle == nullptr || handle->GetOpcode() != ValueOpcode::GetAddressResource ||
+			    (material_handle != nullptr &&
+			     !EquivalentValue(m_program, Value(const_cast<Inst*>(material_handle)),
+			                      Value(const_cast<Inst*>(handle)))))
+				return false;
+			material_handle = handle;
+			U32Bounds range;
+			if (!BoundU32(read->Arg(1), guard, range) || range.zero_bits < 2u) return false;
+			const auto offset = m_program.memory_info[read->Flags<MemoryFlags>().index].offset;
+			if (uint64_t {range.high} + offset > UINT32_MAX) return false;
+			first = std::min(first, range.low + offset);
+			last  = std::max(last, range.high + offset);
+		}
+		if ((first & 3u) != 0u || (last & 3u) != 0u || (last - first) / 4u + 1u > 65536u ||
+		    !MakeRuntimeTableSource(*material_handle, pc, material_source))
+			return false;
+		indirect.selector_offset   = first;
+		indirect.address_key_count = (last - first) / 4u + 1u;
+		indirect.key_scale         = reads.scale;
+		indirect.key_bias          = reads.bias;
+		indirect.address_key       = true;
+		return true;
+	}
+
 	Value EqualLocalKey(Value guard, Value key) const {
 		guard            = SimplifyGuard(guard);
 		const auto* inst = guard.TryInstruction();
@@ -1099,7 +1303,9 @@ private:
 		}
 		if (known_key_count) {
 			// The key range was proven by the bit scan, loop bound, or guarded mask.
-		} else if (MatchBufferRecordKey(key, pc, material_source, indirect)) {
+		} else if (MatchBufferRecordKey(key, pc, material_source, indirect) ||
+		           (table_source.dword_count == 2u &&
+		            MatchAddressMaterialKey(key, handle, pc, material_source, indirect))) {
 			indirect.material_source = InternSource(material_source);
 		} else {
 			auto*       material_read         = UnderlyingRead(key);

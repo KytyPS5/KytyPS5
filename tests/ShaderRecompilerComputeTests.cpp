@@ -27825,6 +27825,166 @@ void CheckIndirectImageKeySwitch() {
     Require(name, "mixed sample count", samples == 3u,
             "mixed candidate switch did not retain every image");
   }
+
+  for (const bool source_3d : {false, true}) {
+    for (const bool reverse_candidates : {false, true}) {
+      program.memory_info[0].image_dimension =
+          source_3d ? ShaderRecompiler::Decoder::ImageDimension::Dim3D
+                    : ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      program.memory_info[0].image_address_components = source_3d ? 4u : 3u;
+      address.SetArg(0u, Value(std::bit_cast<u32>(1.375f)));
+      address.SetArg(1u, Value(std::bit_cast<u32>(1.625f)));
+      address.SetArg(2u, Value(std::bit_cast<u32>(source_3d ? 0.75f : 2.0f)));
+      address.SetArg(3u, Value(std::bit_cast<u32>(2.0f)));
+      program.info.images = {root, candidate};
+      program.info.images[0].dimension =
+          ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      program.info.images[1].dimension =
+          ShaderRecompiler::Decoder::ImageDimension::Dim3D;
+      if (reverse_candidates) {
+        std::swap(program.info.images[0].dimension, program.info.images[1].dimension);
+      }
+      program.info.images[0].cube = false;
+      program.info.images[1].cube = false;
+      program.info.images[0].indirect_resources = {0u, 1u};
+      program.binding_layout_complete = false;
+      AllocateBindings(program);
+      spirv = ShaderRecompiler::Spirv::EmitProgram(program, {.compute = &compute});
+      ValidateSpirv(name, spirv);
+      Require(name, "2D/3D SPIR-V disassembly", tools.Disassemble(spirv, &text),
+              "failed to disassemble 2D/3D indirect image shader");
+      std::vector<std::span<const u32>> definitions(spirv[3]);
+      u32 samples = 0;
+      for (size_t offset = 5; offset < spirv.size();) {
+        const auto words = std::span<const u32>(spirv).subspan(offset, spirv[offset] >> 16u);
+        const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
+        if (opcode == spv::OpCompositeConstruct || opcode == spv::OpBitcast ||
+            opcode == spv::OpConstant) {
+          definitions[words[2]] = words;
+        } else if (opcode == spv::OpImageSampleExplicitLod) {
+          const auto coord = definitions[words[4]];
+          const auto lod = definitions[words[6]];
+          const bool is_3d = program.info.images[samples].dimension ==
+              ShaderRecompiler::Decoder::ImageDimension::Dim3D;
+          const auto z = coord.size() == 6u ? definitions[coord[5]] : std::span<const u32>{};
+          const auto z_value = z.size() == 4u && (z[0] & 0xffffu) == spv::OpBitcast
+              ? definitions[z[3]] : z;
+          Require(name, "2D/3D sample coordinates",
+                  !coord.empty() &&
+                      (!is_3d ||
+                       (z_value.size() == 4u &&
+                        z_value[3] == std::bit_cast<u32>(source_3d ? 0.75f : 0.0f))) &&
+                      lod.size() == 4u && !definitions[lod[3]].empty() &&
+                      definitions[lod[3]][3] == std::bit_cast<u32>(2.0f),
+                  "candidate depth coordinate or LOD did not follow the instruction layout");
+          samples++;
+        }
+        offset += words.size();
+      }
+      Require(name, "2D/3D sample count", samples == 2u,
+              "2D/3D candidate switch did not retain both images");
+    }
+  }
+
+  // Dimension queries must follow the same key mapping as samples, including array size.
+  program.info.images = {root, candidate};
+  program.info.images[0].indirect_resources = {0u, 1u};
+  program.info.images[1].dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
+  MemoryInfo query_memory{};
+  query_memory.kind = ResourceKind::Image;
+  query_memory.image_dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+  query_memory.image_address_components = 1u;
+  program.memory_info.push_back(query_memory);
+  auto &query_address = block->AppendNewInst(
+      ValueOpcode::MakeImageAddress,
+      {Value(1u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
+       Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u)});
+  auto &query = block->AppendNewInst(ValueOpcode::ImageQueryDimensions,
+                                    {Value(&image), Value(&query_address)});
+  query.SetFlags(MemoryFlags{1u, 0x70u});
+  auto &width = block->AppendNewInst(ValueOpcode::CompositeExtractU32x4,
+                                    {Value(&query), Value(0u)});
+  block->AppendNewInst(ValueOpcode::ReferenceU32, {Value(&width)});
+  program.binding_layout_complete = false;
+  AllocateBindings(program);
+  spirv = ShaderRecompiler::Spirv::EmitProgram(program, {.compute = &compute});
+  ValidateSpirv(name, spirv);
+  Require(name, "indirect dimension query disassembly", tools.Disassemble(spirv, &text),
+          "failed to disassemble indirect dimension queries");
+  Require(name, "indirect dimension query switch",
+          CountText(text, "OpImageQuerySizeLod") == 2 &&
+              CountText(text, "OpImageQueryLevels") == 2 &&
+              CountText(text, "OpSwitch") == 2 && CountText(text, "OpPhi") == 2,
+          "dimension query did not select each candidate's size and mip count");
+  std::vector<u32> vector_widths(spirv[3]);
+  u32 queries = 0;
+  for (size_t offset = 5; offset < spirv.size();) {
+    const auto words = std::span<const u32>(spirv).subspan(offset, spirv[offset] >> 16u);
+    const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
+    if (opcode == spv::OpTypeVector) vector_widths[words[1]] = words[3];
+    if (opcode == spv::OpImageQuerySizeLod) {
+      Require(name, "candidate-specific query dimensions",
+              vector_widths[words[1]] == (queries == 0u ? 2u : 3u),
+              "dimension query reused the root descriptor for an array candidate");
+      queries++;
+    }
+    offset += words.size();
+  }
+  Require(name, "dimension query count", queries == 2u,
+          "dimension query dropped a candidate");
+
+  // A 2D read followed by a mip operand must not use that mip as a 3D coordinate.
+  program.info.images[1].dimension = ShaderRecompiler::Decoder::ImageDimension::Dim3D;
+  MemoryInfo read_memory{};
+  read_memory.kind = ResourceKind::Image;
+  read_memory.image_dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+  read_memory.image_address_components = 3u;
+  read_memory.image_has_mip = true;
+  program.memory_info.push_back(read_memory);
+  auto &read_address = block->AppendNewInst(
+      ValueOpcode::MakeImageAddress,
+      {Value(5u), Value(6u), Value(2u), Value(0u), Value(0u), Value(0u),
+       Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u)});
+  auto &read_enabled = block->AppendNewInst(ValueOpcode::IEqual32,
+                                             {Value(&key), Value(0u)});
+  auto &read = block->AppendNewInst(ValueOpcode::ImageRead,
+                                   {Value(&image), Value(&read_address), Value(&read_enabled)});
+  read.SetFlags(MemoryFlags{2u, 0xa4u});
+  auto &texel = block->AppendNewInst(ValueOpcode::CompositeExtractU32x4,
+                                    {Value(&read), Value(0u)});
+  block->AppendNewInst(ValueOpcode::ReferenceU32, {Value(&texel)});
+  program.binding_layout_complete = false;
+  AllocateBindings(program);
+  spirv = ShaderRecompiler::Spirv::EmitProgram(program, {.compute = &compute});
+  ValidateSpirv(name, spirv);
+  Require(name, "indirect image read disassembly", tools.Disassemble(spirv, &text),
+          "failed to disassemble indirect image reads");
+  Require(name, "indirect image read switch",
+          CountText(text, "OpImageFetch") == 2 && CountText(text, "OpSwitch") == 3,
+          "image read did not select both descriptor candidates");
+  std::vector<std::span<const u32>> read_definitions(spirv[3]);
+  u32 fetches = 0;
+  for (size_t offset = 5; offset < spirv.size();) {
+    const auto words = std::span<const u32>(spirv).subspan(offset, spirv[offset] >> 16u);
+    const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
+    if (opcode == spv::OpCompositeConstruct || opcode == spv::OpConstant) {
+      read_definitions[words[2]] = words;
+    } else if (opcode == spv::OpImageFetch) {
+      const auto coord = read_definitions[words[4]];
+      const auto lod = read_definitions[words[6]];
+      const bool correct_coord = fetches == 0u ? coord.size() == 5u
+                                     : coord.size() == 6u &&
+                                           !read_definitions[coord[5]].empty() &&
+                                           read_definitions[coord[5]][3] == 0u;
+      Require(name, "indirect read coordinates and mip",
+              correct_coord && lod.size() == 4u && lod[3] == 2u,
+              "image read used the mip as a coordinate or queried the wrong level");
+      fetches++;
+    }
+    offset += words.size();
+  }
+  Require(name, "indirect read count", fetches == 2u,
+          "image read did not fetch from both candidates");
 }
 
 TestCase ImageStoreMipSelectsPpsa01340Descriptor() {

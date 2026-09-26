@@ -46,6 +46,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -863,6 +864,10 @@ struct SocketTransport {
 #endif
 	}
 	NativeSocket socket;
+#if defined(_WIN32)
+	// Winsock cannot report the current mode, so the guest blocking mode is tracked here.
+	std::atomic_bool nonblocking {false};
+#endif
 };
 
 struct P2pEndpoint {
@@ -1040,13 +1045,13 @@ static int* P2pSocketOption(P2pEndpoint& endpoint, int option) {
 	}
 }
 
-static int ConvertMessageFlags(int flags) {
-	constexpr int guest_msg_peek      = 0x00000002;
-	constexpr int guest_msg_dontroute = 0x00000004;
-	constexpr int guest_msg_waitall   = 0x00000040;
-	constexpr int guest_msg_dontwait  = 0x00000080;
-	constexpr int guest_msg_nosignal  = 0x00020000;
+constexpr int guest_msg_peek      = 0x00000002;
+constexpr int guest_msg_dontroute = 0x00000004;
+constexpr int guest_msg_waitall   = 0x00000040;
+constexpr int guest_msg_dontwait  = 0x00000080;
+constexpr int guest_msg_nosignal  = 0x00020000;
 
+static int ConvertMessageFlags(int flags) {
 	int host_flags = 0;
 	if ((flags & guest_msg_peek) != 0) {
 		host_flags |= MSG_PEEK;
@@ -1075,6 +1080,105 @@ static int ConvertMessageFlags(int flags) {
 
 	return host_flags;
 }
+
+static int64_t RecvHost(NativeSocket socket, char* buf, SocketIoLength host_len, int host_flags,
+                        sockaddr_storage* host_addr, SocketLength* host_addrlen) {
+	if (host_addr == nullptr) {
+		return ::recv(socket, buf, host_len, host_flags);
+	}
+	return ::recvfrom(socket, buf, host_len, host_flags, reinterpret_cast<sockaddr*>(host_addr),
+	                  host_addrlen);
+}
+
+#if defined(_WIN32)
+static bool IsSocketNonBlocking(int guest_fd) {
+	Common::LockGuard lock(g_socket_mutex);
+	if (guest_fd < 0 || guest_fd >= SOCKET_FD_MAX) {
+		return false;
+	}
+	const auto& slot = g_sockets[static_cast<size_t>(guest_fd)];
+	return slot.transport != nullptr && slot.transport->nonblocking;
+}
+
+static bool SocketIsStream(NativeSocket socket) {
+	int          type = 0;
+	SocketLength len  = sizeof(type);
+	return getsockopt(socket, SOL_SOCKET, SO_TYPE, reinterpret_cast<char*>(&type), &len) == 0 &&
+	       type == SOCK_STREAM;
+}
+
+// A peek never consumes, so the buffered prefix keeps the socket readable and a poll would
+// return immediately. The retries are paced instead, and the poll is only used to notice a
+// closed or reset peer, which ends the wait with the short read the guest expects. A blocking
+// MSG_WAITALL may otherwise wait indefinitely: that is the requested semantics when a peer
+// stays open but sends only a prefix, so imposing an arbitrary timeout would truncate it.
+static short PollSocket(NativeSocket socket) {
+	WSAPOLLFD event {};
+	event.fd     = socket;
+	event.events = POLLRDNORM;
+	return WSAPoll(&event, 1, 0) > 0 ? event.revents : 0;
+}
+
+static bool WaitForPeekedBytes(NativeSocket socket) {
+	std::this_thread::sleep_for(std::chrono::milliseconds(1));
+	constexpr short terminal_events = POLLHUP | POLLERR;
+	return (PollSocket(socket) & terminal_events) != 0;
+}
+
+// Winsock rejects MSG_PEEK | MSG_WAITALL with WSAEOPNOTSUPP, so the requested length is
+// waited for by peeking until it is buffered. Datagram sockets ignore MSG_WAITALL and
+// non-blocking sockets hand back whatever arrived, matching the guest (FreeBSD) behaviour.
+static int64_t RecvPeekWaitAll(NativeSocket socket, bool nonblocking, bool no_wait, char* buf,
+                               SocketIoLength host_len, sockaddr_storage* host_addr,
+                               SocketLength* host_addrlen) {
+	if (host_len == 0 && (host_addr == nullptr || SocketIsStream(socket))) {
+		// Winsock blocks on a zero length receive from an empty stream socket, while the
+		// guest expects an immediate zero. Datagram peeks still report the source address.
+		return 0;
+	}
+	if (no_wait && !nonblocking) {
+		// Winsock has no MSG_DONTWAIT, so readiness decides whether a peek may run at all.
+		constexpr short input_events = POLLRDNORM | POLLHUP | POLLERR;
+		if ((PollSocket(socket) & input_events) == 0) {
+			return SetGuestSocketError(Posix::POSIX_EWOULDBLOCK);
+		}
+	}
+	bool peer_closed = false;
+	for (;;) {
+		char                 scratch = 0;
+		char*                peek_buf = buf;
+		SocketIoLength       peek_len = host_len;
+		if (peek_len == 0 && host_addr != nullptr && !SocketIsStream(socket)) {
+			// Winsock may reject a zero-length datagram peek before filling from. A
+			// one-byte scratch buffer keeps MSG_PEEK semantics while obtaining the source.
+			peek_buf = &scratch;
+			peek_len = 1;
+		}
+		const int64_t peeked =
+		    RecvHost(socket, peek_buf, peek_len, MSG_PEEK, host_addr, host_addrlen);
+		if (peeked < 0) {
+			if (WSAGetLastError() == WSAEMSGSIZE) {
+				// Winsock copied a truncated datagram prefix, but a zero-length peek can also
+				// report the non-empty message this way. The outer receive maps both to len.
+				return host_len;
+			}
+			return SetHostSocketError();
+		}
+		if (peeked >= host_len || peeked == 0 || peer_closed || nonblocking || no_wait ||
+		    !SocketIsStream(socket)) {
+			// A zero-length datagram peek uses a one-byte scratch buffer to obtain the
+			// source address. Never report that scratch byte as data to the guest.
+			return host_len == 0 ? 0 : peeked;
+		}
+		peer_closed = WaitForPeekedBytes(socket);
+		if (peer_closed) {
+			// Winsock can report the terminal event before recv(MSG_PEEK) exposes EOF.
+			// Preserve the already-buffered prefix instead of turning it into WSAECONNRESET.
+			return peeked;
+		}
+	}
+}
+#endif
 
 static int ConvertGuestSockaddr(const void* addr, uint32_t addrlen, sockaddr_storage* out,
                                 SocketLength* out_len) {
@@ -1909,8 +2013,12 @@ int KYTY_SYSV_ABI Accept(int s, void* addr, uint32_t* addrlen) {
 	     s, reinterpret_cast<uint64_t>(addr), reinterpret_cast<uint64_t>(addrlen));
 
 	NativeSocket socket = INVALID_NATIVE_SOCKET;
-	if (!GetSocketBackend(s, &socket)) {
+	SocketSlot   state;
+	if (!GetSocketBackend(s, &socket, &state)) {
 		return -1;
+	}
+	if (state.p2p) {
+		return SetGuestSocketError(Posix::POSIX_EOPNOTSUPP);
 	}
 
 	sockaddr_storage host_addr {};
@@ -1921,8 +2029,17 @@ int KYTY_SYSV_ABI Accept(int s, void* addr, uint32_t* addrlen) {
 		return SetHostSocketError();
 	}
 
-	auto      transport = std::make_shared<SocketTransport>(accepted);
-	const int fd        = AllocSocketFd(transport);
+	auto transport = std::make_shared<SocketTransport>(accepted);
+#if defined(_WIN32)
+	// FreeBSD accept(2) inherits O_NONBLOCK. Keep both the native Winsock mode and the
+	// guest-side flag in sync so later PEEK | WAITALL calls preserve that behavior.
+	u_long nonblocking = state.transport->nonblocking ? 1 : 0;
+	if (ioctlsocket(accepted, FIONBIO, &nonblocking) == SOCKET_ERROR) {
+		return SetHostSocketError();
+	}
+	transport->nonblocking = nonblocking != 0;
+#endif
+	const int fd = AllocSocketFd(transport);
 	if (fd < 0) {
 		*Posix::GetErrorAddr() = Posix::POSIX_EMFILE;
 		return -1;
@@ -2105,6 +2222,7 @@ int KYTY_SYSV_ABI Setsockopt(int s, int level, int optname, const void* optval, 
 		if (ioctlsocket(socket, FIONBIO, &enabled) == SOCKET_ERROR) {
 			return SetHostSocketError();
 		}
+		state.transport->nonblocking = enabled != 0;
 		return 0;
 	}
 #else
@@ -2210,15 +2328,26 @@ int64_t KYTY_SYSV_ABI Recvfrom(int s, void* buf, uint64_t len, int flags, void* 
 
 	const auto host_len = static_cast<SocketIoLength>(
 	    std::min<uint64_t>(len, std::numeric_limits<SocketIoLength>::max()));
-	sockaddr_storage host_addr {};
-	SocketLength     host_addrlen = sizeof(host_addr);
-	int64_t          result       = 0;
-	if (addr == nullptr) {
-		result = ::recv(socket, static_cast<char*>(buf), host_len, host_flags);
+	sockaddr_storage  host_addr {};
+	SocketLength      host_addrlen = sizeof(host_addr);
+	sockaddr_storage* source_addr  = addr != nullptr ? &host_addr : nullptr;
+	int64_t           result       = 0;
+#if defined(_WIN32)
+	if ((host_flags & (MSG_PEEK | MSG_WAITALL)) == (MSG_PEEK | MSG_WAITALL)) {
+		result = RecvPeekWaitAll(socket, IsSocketNonBlocking(s), (flags & guest_msg_dontwait) != 0,
+		                         static_cast<char*>(buf), host_len, source_addr, &host_addrlen);
+		if (result < 0) {
+			// RecvPeekWaitAll reports guest errors itself.
+			return -1;
+		}
 	} else {
-		result = ::recvfrom(socket, static_cast<char*>(buf), host_len, host_flags,
-		                    reinterpret_cast<sockaddr*>(&host_addr), &host_addrlen);
+		result = RecvHost(socket, static_cast<char*>(buf), host_len, host_flags, source_addr,
+		                  &host_addrlen);
 	}
+#else
+	result =
+	    RecvHost(socket, static_cast<char*>(buf), host_len, host_flags, source_addr, &host_addrlen);
+#endif
 #if defined(_WIN32)
 	if (result < 0 && WSAGetLastError() == WSAEMSGSIZE) {
 		// Winsock copied the datagram prefix; POSIX reports its length as success.

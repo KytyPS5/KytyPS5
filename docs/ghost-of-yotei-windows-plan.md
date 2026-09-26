@@ -70,6 +70,11 @@ Checkpoint Flip queue lock-order (Reserve cfg→m_mutex ABBA) **26 сентяб�
     `MaxImages=512`), `ResourceTrackingTests.cpp` (64-buffer layout +
     transactional limits). Запушено: PR **MERGEABLE**. present-fix →
     **2560×1440 + `--fullscreen`**.
+17. **Первый ненулевой кадр доказан** (`fb1cc8b`, warm pipeline cache):
+    `_Build/runs/yotei-integrated-20260926-081515-presentfix-gpuav` —
+    prepared **frame=250** `colored=10` max RGB `45/45/45` (spinner);
+    frame 251–276 растут до `colored=108` / max `546/525/546`. shown=277,
+    auto-stop `colored-proven` ~147 с. Меню/gameplay **PENDING**.
 
 Checkpoint present soft-stall (shown≈130 / ready=shown+1) **26 сентября 2026 года**:
 

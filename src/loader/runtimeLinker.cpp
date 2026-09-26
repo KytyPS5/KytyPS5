@@ -699,6 +699,14 @@ std::string FormatGuestFrame(const char* module_name, uint64_t base_vaddr, uint6
 	return name + text;
 }
 
+// Serializes fault reporting against RuntimeLinker teardown. A report can run on any
+// thread while the main thread destroys the linker, so publication and teardown are
+// gated together: the reporter takes it with TryLock and never blocks, while the
+// destructor takes it for real and waits for in-flight reports to drain. Without this an
+// atomic s_current is not enough, because a report can still be holding a pointer to a
+// linker whose state is being freed underneath it.
+static Common::Mutex g_report_gate;
+
 // Print "0x<addr> module+0xoffset", or "module=<unknown>" when the address is unattributable.
 static void ReportGuestAddress(RuntimeLinker* linker, uint64_t vaddr) {
 	const RuntimeLinker::GuestModuleInfo info =
@@ -737,7 +745,17 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 	// Report whatever guest context can be read safely before terminating: which guest thread
 	// faulted, the register file, the faulting code bytes and the top of its stack.
 	{
-		char thread_name[64] = "(host thread)";
+		// Hold the gate for the whole attribution pass so the linker cannot be destroyed
+		// while it is being read. Testing s_current first leaves the gate untouched when
+		// nothing has been linked, so a fault that arrives before this file is
+		// dynamically initialised never touches it. Re-reading the pointer under the
+		// gate is what makes the pairing safe: if the destructor cleared it in between,
+		// the re-read returns null and attribution is skipped rather than reading a
+		// linker that is being destroyed. TryLock, not Lock, because a fault must never
+		// block; losing the race only costs the module names.
+		const bool gate_held = RuntimeLinker::Current() != nullptr && g_report_gate.TryLock();
+		auto*       linker    = gate_held ? RuntimeLinker::Current() : nullptr;
+		char        thread_name[64] = "(host thread)";
 		if (auto self = Libs::LibKernel::PthreadSelfOrNull(); self != nullptr) {
 			if (Libs::LibKernel::PthreadGetname(self, thread_name) != 0) {
 				std::snprintf(thread_name, sizeof(thread_name), "(unnamed guest thread)");
@@ -755,7 +773,6 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		// Name the module that faulted before anything else. Game-compatibility reports quote this
 		// log verbatim, and a bare address leaves the reader to guess which of the game's modules
 		// is at fault.
-		auto* linker = RuntimeLinker::Current();
 		std::printf("fault pc: ");
 		ReportGuestAddress(linker, info->exception_address);
 		if (IsReadableRange(info->exception_address - 48, 96)) {
@@ -819,6 +836,9 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			std::printf("\n");
 		}
 		std::fflush(stdout);
+		if (gate_held) {
+			g_report_gate.Unlock();
+		}
 	}
 	EXIT("Unhandled host exception: type=%u code=%u pc=0x%016" PRIx64
 	     " access=%u address=0x%016" PRIx64 "\n",
@@ -1293,7 +1313,13 @@ RuntimeLinker::RuntimeLinker(): m_symbols(std::make_unique<SymbolDatabase>()) {
 }
 
 RuntimeLinker::~RuntimeLinker() {
-	s_current.store(nullptr);
+	{
+		// Wait for any in-flight fault report to stop reading this object before the state it
+		// walks is freed. Clearing the pointer under the gate means a later report sees
+		// null and skips attribution rather than touching freed memory.
+		Common::LockGuard lock(g_report_gate);
+		s_current.store(nullptr);
+	}
 	Clear();
 }
 

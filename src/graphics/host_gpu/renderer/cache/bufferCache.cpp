@@ -484,8 +484,24 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	}
 
 	auto [staging, stage_offset] = m_staging_buffer.Map(size, 16);
-	if (staging == nullptr || (!Libs::LibKernel::Memory::TryReadBacking(vaddr, staging, size) &&
-	                           !Libs::LibKernel::Memory::TryReadPrtBacking(vaddr, staging, size))) {
+	if (staging == nullptr) {
+		// Map refuses a reservation larger than the staging buffer instead of waiting for
+		// space, so an oversized image upload cannot use the shared one. Copy the guest data
+		// into a private temporary of exactly this size instead, and let its deferred release
+		// retire the buffer after the upload, as UploadCopies already does for buffer uploads.
+		auto temporary = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Upload, 0,
+		                                         vk::BufferUsageFlagBits::eTransferSrc, size);
+		auto* storage  = temporary.get();
+		if (!Libs::LibKernel::Memory::TryReadBacking(vaddr, storage->Mapped().data(), size) &&
+		    !Libs::LibKernel::Memory::TryReadPrtBacking(vaddr, storage->Mapped().data(), size)) {
+			EXIT("BufferCache: failed to read mapped guest image backing\n");
+		}
+		storage->Flush(0, size);
+		m_scheduler.DeferOperation([owner = std::move(temporary)]() mutable { owner.reset(); });
+		return {storage, 0};
+	}
+	if (!Libs::LibKernel::Memory::TryReadBacking(vaddr, staging, size) &&
+	    !Libs::LibKernel::Memory::TryReadPrtBacking(vaddr, staging, size)) {
 		EXIT("BufferCache: failed to read mapped guest image backing\n");
 	}
 	m_staging_buffer.Commit();

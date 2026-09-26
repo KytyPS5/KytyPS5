@@ -1261,14 +1261,14 @@ private:
 			return UINT32_MAX;
 		}
 		ImageResource image;
-		image.source             = source;
-		image.first_use_pc       = pc;
-		image.resource_class     = resource_class;
-		image.dimension          = memory.image_dimension;
-		image.mip_mode           = mip;
-		image.depth_compare      = depth;
-		image.r128               = memory.image_r128;
-		image.simple_2d_sampling = true;
+		image.source                = source;
+		image.first_use_pc          = pc;
+		image.resource_class        = resource_class;
+		image.dimension             = memory.image_dimension;
+		image.mip_mode              = mip;
+		image.depth_compare         = depth;
+		image.r128                  = memory.image_r128;
+		image.simple_2d_3d_sampling = true;
 		Merge(image, memory, op, pc);
 		m_info.images.push_back(image);
 		return static_cast<uint32_t>(m_info.images.size() - 1);
@@ -1278,9 +1278,10 @@ private:
 		const auto access = ImageOpcodeInfoOf(op).access;
 		const bool atomic = access == ImageAccess::Atomic;
 		const bool write  = access == ImageAccess::Write || atomic;
-		image.simple_2d_sampling &=
+		image.simple_2d_3d_sampling &=
 		    op == ValueOpcode::ImageSampleRaw &&
-		    memory.image_dimension == Decoder::ImageDimension::Dim2D &&
+		    (memory.image_dimension == Decoder::ImageDimension::Dim2D ||
+		     memory.image_dimension == Decoder::ImageDimension::Dim3D) &&
 		    (memory.image_sample_flags &
 		     (Decoder::ImageSampleFlagDerivative | Decoder::ImageSampleFlagOffset |
 		      Decoder::ImageSampleFlagCompare)) == 0u;

@@ -27667,51 +27667,65 @@ void CheckIndirectImageKeySwitch() {
             "mixed candidate switch did not retain every image");
   }
 
-  program.memory_info[0].image_dimension =
-      ShaderRecompiler::Decoder::ImageDimension::Dim2D;
-  program.memory_info[0].image_address_components = 3;
-  address.SetArg(0u, Value(std::bit_cast<u32>(1.375f)));
-  address.SetArg(1u, Value(std::bit_cast<u32>(1.625f)));
-  address.SetArg(2u, Value(std::bit_cast<u32>(2.0f)));
-  program.info.images = {root, candidate};
-  program.info.images[0].dimension =
-      ShaderRecompiler::Decoder::ImageDimension::Dim2D;
-  program.info.images[1].dimension =
-      ShaderRecompiler::Decoder::ImageDimension::Dim3D;
-  program.info.images[0].cube = false;
-  program.info.images[1].cube = false;
-  program.info.images[0].indirect_resources = {0u, 1u};
-  program.binding_layout_complete = false;
-  AllocateBindings(program);
-  spirv = ShaderRecompiler::Spirv::EmitProgram(program, {.compute = &compute});
-  ValidateSpirv(name, spirv);
-  Require(name, "2D/3D SPIR-V disassembly", tools.Disassemble(spirv, &text),
-          "failed to disassemble 2D/3D indirect image shader");
-  std::vector<std::span<const u32>> definitions(spirv[3]);
-  u32 samples = 0;
-  for (size_t offset = 5; offset < spirv.size();) {
-    const auto words = std::span<const u32>(spirv).subspan(offset, spirv[offset] >> 16u);
-    const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
-    if (opcode == spv::OpCompositeConstruct || opcode == spv::OpBitcast ||
-        opcode == spv::OpConstant) {
-      definitions[words[2]] = words;
-    } else if (opcode == spv::OpImageSampleExplicitLod) {
-      const auto coord = definitions[words[4]];
-      const auto lod = definitions[words[6]];
-      Require(name, "2D/3D sample coordinates",
-              !coord.empty() &&
-                  (samples != 1u ||
-                   (coord.size() == 6u && !definitions[coord[5]].empty() &&
-                    definitions[coord[5]][3] == 0u)) &&
-                  lod.size() == 4u && !definitions[lod[3]].empty() &&
-                  definitions[lod[3]][3] == std::bit_cast<u32>(2.0f),
-              "3D candidate used the 2D instruction's LOD as a depth coordinate");
-      samples++;
+  for (const bool source_3d : {false, true}) {
+    for (const bool reverse_candidates : {false, true}) {
+      program.memory_info[0].image_dimension =
+          source_3d ? ShaderRecompiler::Decoder::ImageDimension::Dim3D
+                    : ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      program.memory_info[0].image_address_components = source_3d ? 4u : 3u;
+      address.SetArg(0u, Value(std::bit_cast<u32>(1.375f)));
+      address.SetArg(1u, Value(std::bit_cast<u32>(1.625f)));
+      address.SetArg(2u, Value(std::bit_cast<u32>(source_3d ? 0.75f : 2.0f)));
+      address.SetArg(3u, Value(std::bit_cast<u32>(2.0f)));
+      program.info.images = {root, candidate};
+      program.info.images[0].dimension =
+          ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      program.info.images[1].dimension =
+          ShaderRecompiler::Decoder::ImageDimension::Dim3D;
+      if (reverse_candidates) {
+        std::swap(program.info.images[0].dimension, program.info.images[1].dimension);
+      }
+      program.info.images[0].cube = false;
+      program.info.images[1].cube = false;
+      program.info.images[0].indirect_resources = {0u, 1u};
+      program.binding_layout_complete = false;
+      AllocateBindings(program);
+      spirv = ShaderRecompiler::Spirv::EmitProgram(program, {.compute = &compute});
+      ValidateSpirv(name, spirv);
+      Require(name, "2D/3D SPIR-V disassembly", tools.Disassemble(spirv, &text),
+              "failed to disassemble 2D/3D indirect image shader");
+      std::vector<std::span<const u32>> definitions(spirv[3]);
+      u32 samples = 0;
+      for (size_t offset = 5; offset < spirv.size();) {
+        const auto words = std::span<const u32>(spirv).subspan(offset, spirv[offset] >> 16u);
+        const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
+        if (opcode == spv::OpCompositeConstruct || opcode == spv::OpBitcast ||
+            opcode == spv::OpConstant) {
+          definitions[words[2]] = words;
+        } else if (opcode == spv::OpImageSampleExplicitLod) {
+          const auto coord = definitions[words[4]];
+          const auto lod = definitions[words[6]];
+          const bool is_3d = program.info.images[samples].dimension ==
+              ShaderRecompiler::Decoder::ImageDimension::Dim3D;
+          const auto z = coord.size() == 6u ? definitions[coord[5]] : std::span<const u32>{};
+          const auto z_value = z.size() == 4u && (z[0] & 0xffffu) == spv::OpBitcast
+              ? definitions[z[3]] : z;
+          Require(name, "2D/3D sample coordinates",
+                  !coord.empty() &&
+                      (!is_3d ||
+                       (z_value.size() == 4u &&
+                        z_value[3] == std::bit_cast<u32>(source_3d ? 0.75f : 0.0f))) &&
+                      lod.size() == 4u && !definitions[lod[3]].empty() &&
+                      definitions[lod[3]][3] == std::bit_cast<u32>(2.0f),
+                  "candidate depth coordinate or LOD did not follow the instruction layout");
+          samples++;
+        }
+        offset += words.size();
+      }
+      Require(name, "2D/3D sample count", samples == 2u,
+              "2D/3D candidate switch did not retain both images");
     }
-    offset += words.size();
   }
-  Require(name, "2D/3D sample count", samples == 2u,
-          "2D/3D candidate switch did not retain both images");
 }
 
 TestCase ImageStoreMipSelectsPpsa01340Descriptor() {

@@ -755,11 +755,12 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			operands.push_back(AddressF32(ctx, mem, *address, layout.bias));
 		}
 		const auto EmitSample = [&](uint32_t resource) {
+			// The instruction defines the supplied coordinates, independently of candidate order.
 			const auto& candidate = state.program.info.images[resource];
-			const auto  coord =
-			    CoordF32(ctx, mem, *address, layout.coord,
-			             ImageDimensionInfoFor(candidate.dimension).coordinate_components,
-			             candidate.cube, dimension_info.coordinate_components);
+			const auto  coord     = CoordF32(
+			    ctx, mem, *address, layout.coord,
+			    ImageDimensionInfoFor(candidate.dimension).coordinate_components, candidate.cube,
+			    ImageDimensionInfoFor(mem.image_dimension).coordinate_components);
 			const auto            sampled = MakeSampledImage(state, resource, mem.sampler);
 			const auto            sample  = state.builder.AllocateId();
 			std::vector<uint32_t> sample_operands {result_type, sample, sampled, coord};

@@ -583,7 +583,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			return SpecializationFail("indirect image specialization has no typed candidate");
 		}
 		const auto& image_class = specialization.images[exemplar];
-		const bool  allow_2d_3d = program.info.images[root_index].simple_2d_sampling;
+		const bool  allow_2d_3d = program.info.images[root_index].simple_2d_3d_sampling;
 		const auto  is_2d       = [](Decoder::ImageDimension dimension) {
 			return dimension == Decoder::ImageDimension::Dim2D ||
 			       dimension == Decoder::ImageDimension::Dim2DArray;
@@ -614,17 +614,27 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			    image.mip_count != image_class.mip_count ||
 			    image.conversion_format != image_class.conversion_format ||
 			    image.shader_swizzle != image_class.shader_swizzle) {
-				const auto& expected = snapshot.images[exemplar].dwords;
-				const auto& actual   = snapshot.images[candidate].dwords;
+				const auto& expected     = snapshot.images[exemplar].dwords;
+				const auto& actual       = snapshot.images[candidate].dwords;
+				uint32_t    sample_flags = 0;
+				for (const auto& memory: program.memory_info) {
+					if (memory.kind == ResourceKind::Image && memory.resource == root_index &&
+					    !memory.planning_only) {
+						sample_flags |= memory.image_sample_flags;
+					}
+				}
 				return SpecializationFail(fmt::format(
-				    "indirect image table at pc 0x{:08x} has incompatible candidates: "
+				    "indirect image table at pc 0x{:08x} has incompatible candidates "
+				    "(instruction dimension={}, sample flags=0x{:x}, simple sampling={}): "
 				    "exemplar {} class={} dimension={} cube={} mips={} conversion={} "
 				    "swizzle={:03x} descriptor={:08x},{:08x},{:08x},{:08x},"
 				    "{:08x},{:08x},{:08x},{:08x}; "
 				    "candidate {} class={} dimension={} cube={} mips={} conversion={} "
 				    "swizzle={:03x} descriptor={:08x},{:08x},{:08x},{:08x},"
 				    "{:08x},{:08x},{:08x},{:08x}",
-				    program.info.images[root_index].first_use_pc, exemplar,
+				    program.info.images[root_index].first_use_pc,
+				    static_cast<uint32_t>(program.info.images[root_index].dimension), sample_flags,
+				    program.info.images[root_index].simple_2d_3d_sampling, exemplar,
 				    static_cast<uint32_t>(image_class.numeric_class),
 				    static_cast<uint32_t>(image_class.dimension), image_class.cube,
 				    image_class.mip_count, static_cast<uint32_t>(image_class.conversion_format),

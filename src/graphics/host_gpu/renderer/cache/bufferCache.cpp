@@ -130,15 +130,18 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	// could never be mapped and used to abort the process here. Stage it in batches instead:
 	// each reserves its own region, and the stream keeps that region reserved until its
 	// deferred write-back has consumed it, so consecutive batches cannot overlap.
-	auto& command = m_scheduler.Current();
-	command.EndRendering();
-	const auto native = command.Handle();
 	for (const auto& batch: SplitBufferDownload(ranges, m_download_buffer.MaxReservation(), 64)) {
 		const auto [mapped, offset] = m_download_buffer.Map(batch.total_size, 64);
 		if (mapped == nullptr) {
 			EXIT("BufferCache: download batch could not be staged\n");
 		}
 		m_download_buffer.Commit();
+		// Map can wait for a pending use of the staging buffer to retire. Waiting submits the
+		// current command buffer and begins a new one, so re-read the handle after every Map
+		// instead of recording later batches into a handle captured before the loop.
+		auto& command = m_scheduler.Current();
+		command.EndRendering();
+		const auto native = command.Handle();
 		std::vector<vk::BufferCopy> copies;
 		copies.reserve(batch.copies.size());
 		for (const auto& copy: batch.copies) {

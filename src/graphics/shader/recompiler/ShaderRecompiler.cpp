@@ -537,6 +537,15 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		}
 		return {.skip_dispatch = true};
 	}
+	if (decoded.has_bvh) {
+		static std::atomic_flag warned = ATOMIC_FLAG_INIT;
+		if (!warned.test_and_set(std::memory_order_relaxed)) {
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "Warning: ray tracing is not implemented; BVH intersections in {} shader "
+			    "0x{:016x} report a miss, so the ray-traced effect is disabled.\n",
+			    StageName(options.stage), options.shader_hash));
+		}
+	}
 
 	std::string decoded_dump;
 	if (options.dump_ir) {

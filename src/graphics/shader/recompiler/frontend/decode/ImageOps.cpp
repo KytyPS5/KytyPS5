@@ -204,6 +204,10 @@ constexpr auto MIMG_SAMPLE_OPS = Detail::MakeOpcodeTable<0x100>(MIMG_SAMPLE_OPCO
 constexpr auto MIMG_GATHER_OPS = Detail::MakeOpcodeTable<0x100>(MIMG_GATHER_OPCODE_LIST);
 constexpr auto MIMG_ATOMIC_OPS = Detail::MakeOpcodeTable<0x100>(MIMG_ATOMIC_OPCODE_LIST);
 
+constexpr bool IsBvhOpcode(Opcode opcode) {
+	return opcode == Opcode::IMAGE_BVH_INTERSECT_RAY || opcode == Opcode::IMAGE_BVH64_INTERSECT_RAY;
+}
+
 Opcode DecodeMimgOpcode(uint32_t opcode, const MimgSampleInfo* sample, const MimgGatherInfo* gather,
                         const Detail::OpcodeMap* atomic) {
 	if (sample != nullptr) {
@@ -223,6 +227,8 @@ Opcode DecodeMimgOpcode(uint32_t opcode, const MimgSampleInfo* sample, const Mim
 		case 0x09u: return Opcode::IMAGE_STORE_MIP;
 		case 0x0eu: return Opcode::IMAGE_GET_RESINFO;
 		case 0x60u: return Opcode::IMAGE_GET_LOD;
+		case 0xe6u: return Opcode::IMAGE_BVH_INTERSECT_RAY;
+		case 0xe7u: return Opcode::IMAGE_BVH64_INTERSECT_RAY;
 		default: return Opcode::UNSUPPORTED;
 	}
 }
@@ -257,6 +263,10 @@ uint32_t DecodeMimgAddressComponents(uint32_t opcode, ImageDimension dimension,
 		case 0x00u:
 		case 0x08u:
 		case 0x60u: return ImageCoordComponents(dimension);
+		// node pointer, ray extent, origin xyz, direction xyz, inverse direction xyz
+		case 0xe6u: return 11u;
+		// 64-bit node pointer, ray extent, origin xyz, direction xyz, inverse direction xyz
+		case 0xe7u: return 12u;
 		default: return 0;
 	}
 }
@@ -344,6 +354,17 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	}
 	inst.image_address_components =
 	    DecodeMimgAddressComponents(opcode, dimension, sample, gather, atomic);
+	if (IsBvhOpcode(inst.opcode)) {
+		// BVH intersections ignore dmask and always return four dwords. With A16 the
+		// direction and inverse direction are packed as halves (three dwords each become
+		// three dwords total), so the address shrinks by three dwords.
+		inst.data_components = 4u;
+		inst.data_bits       = 32u;
+		inst.data_dwords     = 4u;
+		if (a16) {
+			inst.image_address_components -= 3u;
+		}
+	}
 	SetRawWords(inst, code, word_index, word_count);
 
 	if (inst.opcode == Opcode::UNSUPPORTED) {

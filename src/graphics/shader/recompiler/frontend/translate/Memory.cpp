@@ -651,6 +651,17 @@ void Translator::IMAGE_GET_LOD(const Decoder::Instruction& inst) {
 	WriteImageComponents(inst.dst, result, memory, 2u);
 }
 
+void Translator::IMAGE_BVH_INTERSECT_RAY(const Decoder::Instruction& inst) {
+	// Hardware ray tracing is not implemented. Report a miss: every child pointer of a box
+	// node reads as the invalid node (0xffffffff) so guest traversal loops pop their stack
+	// and terminate, and a triangle node yields a NaN hit distance that fails any
+	// closest-hit comparison. This keeps ray-traced titles running with the effect
+	// disabled instead of aborting shader compilation.
+	for (uint32_t index = 0; index < 4u; index++) {
+		WriteOperand(OffsetOperand(inst.dst, index), IR::Value(0xffffffffu));
+	}
+}
+
 void Translator::IMAGE_LOAD(const Decoder::Instruction& inst) {
 	const auto memory   = MemoryInfoFromDecoded(inst);
 	const auto resource = GetImageResource(memory);
@@ -1045,6 +1056,8 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 
 		case Decoder::Opcode::IMAGE_GET_RESINFO: return IMAGE_GET_RESINFO(inst);
 		case Decoder::Opcode::IMAGE_GET_LOD: return IMAGE_GET_LOD(inst);
+		case Decoder::Opcode::IMAGE_BVH_INTERSECT_RAY:
+		case Decoder::Opcode::IMAGE_BVH64_INTERSECT_RAY: return IMAGE_BVH_INTERSECT_RAY(inst);
 		case Decoder::Opcode::IMAGE_LOAD:
 		case Decoder::Opcode::IMAGE_LOAD_MIP: return IMAGE_LOAD(inst);
 		case Decoder::Opcode::IMAGE_STORE:

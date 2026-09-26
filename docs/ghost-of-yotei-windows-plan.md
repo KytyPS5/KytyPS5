@@ -50,6 +50,11 @@ Checkpoint Flip queue lock-order (Reserve cfg→m_mutex ABBA) **26 сентяб�
     `origin/main`=`c47c3d55`, `upstream/main`=`5ce4f083` — оба ancestors of
     `yotei-windows-bringup` (`3d117be3`+); `merge-tree` → 0 CONFLICT. Удалённый
     main новее локального refs — не проверен, пока нет сети.
+13. **Скорость до spinner**: present-fix переведён на
+    `--shader-optimization-type None` (Performance давал ~241 с SPIR-V optimizer
+    на холодном старте). GPUAV+instrumentation обязателен (без него
+    `b90e2024` → nvgpucomp `0x80000003`). Цель readback: colored>0 около
+    prepared frame ~236.
 
 Checkpoint present soft-stall (shown≈130 / ready=shown+1) **26 сентября 2026 года**:
 

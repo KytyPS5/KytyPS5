@@ -86,7 +86,11 @@ ShaderRecompiler::CompileOptions MakeCompileOptions(ShaderType stage) {
   static const ShaderVertexInputInfo vertex{};
   static const ShaderPixelInputInfo pixel{};
   static const ShaderComputeInputInfo compute{};
-  static const std::array<uint32_t, 64> user_data{};
+  static const auto user_data = [] {
+    std::array<uint32_t, 64> data{};
+    data[3] = 3u << 28u; // Default fixture buffer uses raw offset bounds.
+    return data;
+  }();
 
   ShaderRecompiler::CompileOptions options;
   options.stage = stage;
@@ -6512,6 +6516,7 @@ void TestNewShaderRecompilerNativeWideScalarMemoryIr() {
 
 void TestNewShaderRecompilerNativeWideBufferIr() {
   const uint32_t shader[] = {
+      EncodeSMovB32(83, 255), 3u << 28u, // Raw bounds for the s[80:83] fixture.
       EncodeMubuf0(0x0d, 0),
       EncodeMubuf1(0, 20, 1), // buffer_load_dwordx2 v[0:1]
       EncodeMubuf0(0x1d, 16),

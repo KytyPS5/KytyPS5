@@ -798,9 +798,14 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 	auto&       cache    = m_context.GetBufferCache();
 
 	prepared.buffer_sources.clear();
-	prepared.buffer_sources.reserve(program.info.buffers.size());
-	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
-		auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[i]);
+	const auto& layout = program.bindings;
+	if (layout.memory_offset_count == 0) {
+		return;
+	}
+	const auto& resources = layout.descriptors.front().resources;
+	prepared.buffer_sources.reserve(resources.size());
+	for (const auto resource: resources) {
+		auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[resource]);
 		const auto address = descriptor.Base48();
 		const auto requested_size = descriptor.GetSize();
 		if (address == 0 || requested_size == 0) {
@@ -818,10 +823,10 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	const auto& program   = *prepared.runtime->program;
 	const auto& snapshot  = *prepared.runtime->resources;
 	const auto& layout    = program.bindings;
-	EXIT_IF(prepared.buffer_sources.size() != program.info.buffers.size());
+	EXIT_IF(prepared.buffer_sources.size() != layout.memory_offset_count);
 
 	prepared.buffers.clear();
-	prepared.buffers.reserve(program.info.buffers.size());
+	prepared.buffers.reserve(layout.memory_offset_count);
 	EXIT_IF(prepared.shader_data.size() != layout.ShaderDataDwords());
 	std::fill(prepared.shader_data.begin() + layout.memory_offset_dword,
 	          prepared.shader_data.end(), 0);
@@ -830,11 +835,12 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		const auto shift = (index % 4u) * 8u;
 		prepared.shader_data[dword] |= offset << shift;
 	};
-	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+	for (uint32_t i = 0; i < layout.memory_offset_count; i++) {
+		const auto resource = layout.descriptors.front().resources[i];
 		uint32_t buffer_offset = 0;
 		prepared.buffers.push_back(NativeStorageBuffer(m_context, prepared.buffer_sources[i],
-		                                               program.info.buffers[i], program.stage, i,
-		                                               buffer_offset));
+		                                               program.info.buffers[resource],
+		                                               program.stage, resource, buffer_offset));
 		pack_memory_offset(i, buffer_offset);
 	}
 	if (ShaderRecompiler::IR::FindBinding(
@@ -1045,8 +1051,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			} else {
 				switch (binding.kind) {
 					case BindingKind::Buffers:
-						for (const auto resource: binding.resources) {
-							const auto& view = descriptors.buffers.at(resource);
+						EXIT_IF(descriptors.buffers.size() != binding.resources.size());
+						for (const auto& view: descriptors.buffers) {
 							EXIT_IF(view.buffer == nullptr);
 							m_descriptor_buffers.push_back(view);
 						}

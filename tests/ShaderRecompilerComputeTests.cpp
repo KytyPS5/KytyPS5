@@ -1208,6 +1208,7 @@ struct TestCase {
   std::vector<std::pair<std::string, size_t>> decoded_counts;
   std::vector<std::pair<std::string, size_t>> ir_counts;
   u32 expected_storage_mip_descriptors = 0;
+  std::optional<std::vector<u32>> expected_buffer_resources;
 };
 
 struct GraphicsCase {
@@ -1241,7 +1242,9 @@ struct CompiledShader {
 
 std::array<u32, 64> MakeNativeUserData(const std::array<u32, 64> *source) {
   std::array<u32, 64> data{};
+  data[3] = 3u << 28u;
   data[50] = 1u << 20u;
+  data[51] = 3u << 28u;
   if (source != nullptr) {
     data = *source;
   }
@@ -1564,18 +1567,26 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
           "recompiler returned empty SPIR-V");
   ValidateSpirv(test.name, result.spirv);
   CheckSpirvText(test, result.spirv);
+  const auto *buffer_binding = ShaderRecompiler::IR::FindBinding(
+      result.program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::Buffers);
+  if (test.expected_buffer_resources) {
+    Require(test.name, "live buffer bindings",
+            buffer_binding != nullptr &&
+                buffer_binding->resources == *test.expected_buffer_resources,
+            "dead buffer changed the surviving descriptor order");
+  }
   std::vector<u32> packed_user_data;
   for (const auto reg : result.program.bindings.user_data_registers) {
     packed_user_data.push_back(
         resources.user_data[reg - result.program.user_data_base]);
   }
   packed_user_data.resize(result.program.bindings.ShaderDataDwords());
-  const auto buffer_count =
-      static_cast<u32>(result.program.info.buffers.size());
+  const auto buffer_count = result.program.bindings.memory_offset_count;
   for (u32 i = 0; i < buffer_count; i++) {
     u32 offset = 0;
-    if (i < test.storage_buffer_offsets.size()) {
-      offset = test.storage_buffer_offsets[i];
+    const auto resource = buffer_binding->resources[i];
+    if (resource < test.storage_buffer_offsets.size()) {
+      offset = test.storage_buffer_offsets[resource];
     }
     Require(test.name, "shader data", offset % sizeof(u32) == 0 && offset < 256,
             "storage buffer offset is not representable");
@@ -1593,7 +1604,8 @@ std::array<u32, 64> MakeStructuredStorageBufferData(u32 stride_bytes,
   std::array<u32, 64> data{};
   data[1] = (stride_bytes & 0x3fffu) << 16u;
   data[2] = num_records;
-  data[3] = DstSel(4, 5, 6, 7) | (1u << 24u);
+  data[3] = DstSel(4, 5, 6, 7) | (1u << 24u) |
+            (stride_bytes == 0 ? 3u << 28u : 0u);
   if (add_tid) {
     data[3] |= 1u << 23u;
   }
@@ -13233,8 +13245,9 @@ public:
         info.offset = 0;
         info.range = buffer.size;
         if (test.storage_buffer_range_dwords != 0) {
-          const auto offset = i < test.storage_buffer_offsets.size()
-                                  ? test.storage_buffer_offsets[i]
+          const auto resource = buffers->resources[i];
+          const auto offset = resource < test.storage_buffer_offsets.size()
+                                  ? test.storage_buffer_offsets[resource]
                                   : 0u;
           info.range = static_cast<vk::DeviceSize>(
               test.storage_buffer_range_dwords * sizeof(u32) + offset);
@@ -24559,6 +24572,113 @@ TestCase BufferStoreFormatXDropsOutOfRangeRecord() {
   return test;
 }
 
+TestCase TBufferCapturedZeroStrideOob(bool raw_bounds = false, bool scalar = false) {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = scalar ? "TBufferZeroStrideOobPreservesScalarRead"
+                    : raw_bounds ? "TBufferZeroStrideRawBoundsStillLoads"
+                                 : "TBufferCapturedZeroStrideOob";
+  test.initial = {0x11223344u, 0x55667788u, 0x99aabbccu, 0xddeeff00u,
+                  0x12345678u, 0xdeadbeefu, 0xdeadbeefu};
+  test.expected = test.initial;
+  for (u32 i = 0; i < 4; i++) {
+    test.expected[1 + i] = raw_bounds ? test.initial[i] : 0u;
+  }
+  test.expected[5] = test.initial[4];
+  if (scalar) test.expected[6] = test.initial[0];
+  test.user_data = MakeStructuredStorageBufferData(4, test.initial.size());
+  std::copy_n(test.user_data.begin(), 4, test.user_data.begin() + 4);
+  test.user_data[4] = 0x2000u;
+  // Captured HITMAN descriptor in s[32:35]: mode 0, zero stride, arbitrary base.
+  test.user_data[32] = 0x4a398620u;
+  test.user_data[33] = 0;
+  test.user_data[34] = 0x2b5u;
+  test.user_data[35] = 0x0004d000u | (raw_bounds ? 3u << 28u : 0u);
+  test.has_user_data = true;
+  test.storage_buffer_offsets = {0, 0, 16};
+  test.expected_buffer_resources = raw_bounds || scalar
+                                       ? std::vector<u32>{0, 1, 2}
+                                       : std::vector<u32>{0, 2};
+  auto &code = test.code;
+  AppendVMovLiteral(&code, 0, test.initial[0]);
+  AppendStoreVgpr(&code, 0, 0); // Keep resource zero before the removed middle slot.
+  AppendVMovU32(&code, 30, 0);
+  code.push_back(0xea6b2000u);
+  code.push_back(0x8008191eu); // Exact pc 0x47c: typed float4, s[32:35], v30.
+  AppendVMovU32(&code, 20, 0);
+  code.push_back(EncodeMubuf0(0x0cu));
+  code.push_back(EncodeMubuf1(33, 1, 20));
+  if (scalar) {
+    code.push_back(EncodeSmem0(0x08u, 40, 16));
+    code.push_back(EncodeSmem1(0));
+    code.push_back(EncodeVop1(0x01u, 32, 40));
+  }
+  for (u32 i = 0; i < 4; i++) AppendStoreVgpr(&code, 25 + i, 1 + i);
+  AppendStoreVgpr(&code, 33, 5);
+  if (scalar) AppendStoreVgpr(&code, 32, 6);
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32, O::TBUFFER_LOAD_FORMAT_XYZW,
+                  O::BUFFER_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  if (scalar) test.opcodes.push_back(O::S_BUFFER_LOAD_DWORD);
+  test.ir_counts = {{"LoadBufferU32x4", raw_bounds ? 1u : 0u}};
+  return test;
+}
+
+TestCase BufferZeroStrideOobFormatsAndWidths() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "BufferZeroStrideOobFormatsAndWidths";
+  test.initial = std::vector<u32>(20, 0xdeadbeefu);
+  test.expected = std::vector<u32>(20, 0);
+  test.expected[10] = 0x3f800000u;
+  test.expected[12] = 0x3f800000u;
+  test.expected[14] = 1;
+  test.expected[16] = 1;
+  test.expected[18] = 0xabcdef01u;
+  test.expected[19] = 0xdeadbeefu;
+  test.user_data = MakeStructuredStorageBufferData(4, 20);
+  for (u32 base : {4u, 8u}) {
+    test.user_data[base] = 0x4a398620u;
+    test.user_data[base + 2] = 0x2b5u;
+    const u32 format = base == 4 ? 77u : 75u; // Four 32-bit float or unsigned integer components.
+    test.user_data[base + 3] = (format << 12u) | DstSel(1, 4, 1, 0);
+  }
+  test.has_user_data = true;
+  test.expected_buffer_resources = std::vector<u32>{0};
+  auto &code = test.code;
+  AppendVMovU32(&code, 0, 0);
+  AppendStoreVgpr(&code, 0, 0);
+  AppendVMovU32(&code, 20, 0);
+  u32 destination = 0;
+  for (const auto [opcode, width] :
+       {std::pair{0x08u, 1u}, {0x0au, 1u}, {0x0cu, 1u}, {0x0du, 2u}, {0x0fu, 3u}}) {
+    code.push_back(EncodeMubuf0(opcode));
+    code.push_back(EncodeMubuf1(destination, 1, 20));
+    destination += width;
+  }
+  AppendVMovU32(&code, 8, 0);
+  AppendVMovU32(&code, 9, 0);
+  for (u32 base : {1u, 2u}) {
+    code.push_back(EncodeMubuf0(0x03u));
+    code.push_back(EncodeMubuf1(base == 1 ? 10 : 14, base, 20));
+  }
+  AppendVMovLiteral(&code, 18, 0xabcdef01u);
+  code.push_back(EncodeSop1(0x04u, 60, 126u)); // Preserve the partial wave's active lanes.
+  code.push_back(EncodeSop1(0x04u, 126, InlineU32(0)));
+  code.push_back(EncodeMubuf0(0x00u));
+  code.push_back(EncodeMubuf1(18, 1, 20));
+  code.push_back(EncodeSop1(0x04u, 126, 60u));
+  for (u32 i = 0; i < 19; i++) AppendStoreVgpr(&code, i, i);
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B64, O::BUFFER_LOAD_UBYTE,
+                  O::BUFFER_LOAD_USHORT, O::BUFFER_LOAD_DWORD,
+                  O::BUFFER_LOAD_DWORDX2, O::BUFFER_LOAD_DWORDX3,
+                  O::BUFFER_LOAD_FORMAT_X, O::BUFFER_LOAD_FORMAT_XYZW,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.ir_counts = {{"LoadBuffer", 0}};
+  return test;
+}
+
 TestCase TBufferLoadVariants() {
   using O = ShaderOpcode;
 
@@ -29231,6 +29351,10 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferStoreFormatXAddTidUsesLaneIndex);
   AddCase(BufferStoreFormatXDropsOutOfRangeRecord);
   AddCase(TBufferLoadVariants);
+  AddCase([] { return TBufferCapturedZeroStrideOob(); });
+  AddCase([] { return TBufferCapturedZeroStrideOob(true); });
+  AddCase([] { return TBufferCapturedZeroStrideOob(false, true); });
+  AddCase(BufferZeroStrideOobFormatsAndWidths);
   AddCase(TBufferLoadFormatXyzwSnapshotsOverlappingAddress);
   AddCase(TBufferLoadFormatXyzwPackedSnapshotsOverlappingAddress);
   AddCase(TBufferLoadFormatX8UintZeroExtendsByte);
@@ -34229,6 +34353,15 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     RunCase(&vulkan, CubeIdCapturedNegationAndOutputScale());
     RunCase(&vulkan, VectorFloatSpecialOps());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--zero-stride-oob-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, TBufferCapturedZeroStrideOob());
+    RunCase(&vulkan, TBufferCapturedZeroStrideOob(true));
+    RunCase(&vulkan, TBufferCapturedZeroStrideOob(false, true));
+    RunCase(&vulkan, BufferZeroStrideOobFormatsAndWidths());
+    RunCase(&vulkan, TBufferLoadFormatXIdxenUsesDescriptorStride());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--sdwa-ashr-only") == 0) {

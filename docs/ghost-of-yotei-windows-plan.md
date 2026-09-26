@@ -104,6 +104,11 @@ Checkpoint Flip queue lock-order (Reserve cfg→m_mutex ABBA) **26 сентяб�
     `MaterializeResources` fail в `ProgramCache::Get` (specialization refresh).
     Меню **PENDING**; следующий шаг — явный `LastResourceSpecializationError` в
     Fatal и RED на этот fail-closed путь.
+23. `…-101557`: Fatal reason printed —
+    `bounded buffer 3 exceeds the dense buffer limit (... buffers=65 limit=64)`
+    for CS `0x8457901d80b91921`. Raise shared `ShaderInfo::MaxBuffers` 64→128
+    (device DescriptorBudget remains the hard host gate). Menu still **PENDING**.
+
 
 Checkpoint present soft-stall (shown≈130 / ready=shown+1) **26 сентября 2026 года**:
 

@@ -19,12 +19,13 @@ Checkpoint bounded SRT unmapped/coherent reads **26 сентября 2026 год
    `FlipQueue::Flip front not Ready id=… state=1 (Recording) queue=1`: EOP-flip
    застрял после `Prepare`, до `CompleteFlip` (priority op после GPU tick).
 4. Коммит `59d8f991`: `FlushAndWait` + Flip ждут priority ops → Recording→Ready.
-   Game `_Build/runs/yotei-integrated-20260926-020045-97830d`: **shown=132**,
-   `front not Ready=0`. Новый fatal:
-   `BufferCache: failed to read mapped guest image backing`
-   `addr=0x000000a80d7c0000 size=0x2ab000 clamped=0xc0000`
-   (staging=1 registered=0 cpu_dirty=1 gpu_dirty=0).
-5. Меню/gameplay **PENDING**. Push на origin пока таймаутится (github:443).
+5. Коммиты `4cd0c88a`/`ae6eb916`: `ObtainBufferForImage` читает clamped mapped
+   prefix и zero-fill хвост. Game
+   `_Build/runs/yotei-integrated-20260926-021939-ac206d` (**shown=134**): image
+   backing fatal снят. Новый:
+   `Memory: required direct-backing write failed addr=0x200000208 size=0x10`.
+6. Меню/gameplay **PENDING**. `git push` на origin таймаутится (github:443);
+   ветка локально ahead.
 
 Checkpoint planning_only SRT zeros + dense budgets **26 сентября 2026 года**,
 источник `1cdc1998` / `37584633`:

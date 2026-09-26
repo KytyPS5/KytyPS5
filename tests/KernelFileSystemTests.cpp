@@ -17,6 +17,7 @@
 #include <array>
 
 #include <chrono>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -29,6 +30,10 @@
 
 namespace Libs::LibKernelApr {
 void InitLibKernel_1_Apr(Loader::SymbolDatabase *symbols);
+}
+
+namespace Libs::LibNet {
+void InitNet_1_Net(Loader::SymbolDatabase *symbols);
 }
 
 namespace {
@@ -407,6 +412,22 @@ void CheckAprPaths(const std::filesystem::path &root) {
 
 void CheckSocketWakeup() {
   namespace Net = Libs::Network::Net;
+  Loader::SymbolDatabase symbols;
+  Libs::LibNet::InitNet_1_Net(&symbols);
+  const auto *send_symbol = symbols.Find(
+      {"beRjXBn-z+o", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
+  const auto *recv_symbol = symbols.Find(
+      {"9wO9XrMsNhc", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
+  const auto *errno_symbol = symbols.Find(
+      {"HQOwnfMGipQ", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
+  Check(send_symbol && recv_symbol && errno_symbol,
+        "Net send, receive and errno exports resolve with the guest ABI versions");
+  using Send = int (KYTY_SYSV_ABI *)(int, const void *, size_t, int);
+  using Recv = int (KYTY_SYSV_ABI *)(int, void *, size_t, int);
+  using Errno = int *(KYTY_SYSV_ABI *)();
+  const auto net_send = reinterpret_cast<Send>(send_symbol->vaddr);
+  const auto net_recv = reinterpret_cast<Recv>(recv_symbol->vaddr);
+  auto *net_errno = reinterpret_cast<Errno>(errno_symbol->vaddr)();
   // Guest sockaddr_in: length, family, network-order port/address, padding.
   std::array<uint8_t, 16> address {16, 2, 0, 0, 127, 0, 0, 1};
   const int listener = Net::Socket(2, 1, 0);
@@ -441,26 +462,61 @@ void CheckSocketWakeup() {
                     immediate.data()) == 0 && readable[reader / 64] == 0,
         "empty socket is not readable");
   const char payload[] = "wake";
-  Check(Net::Send(writer, payload, sizeof(payload), 0x20000) == sizeof(payload),
-        "send wake bytes with guest MSG_NOSIGNAL");
+  *net_errno = Libs::Posix::POSIX_EINVAL;
+  Check(net_send(writer, payload, sizeof(payload), 0) == sizeof(payload) &&
+            *net_errno == Libs::Posix::POSIX_EINVAL,
+        "Net send forwards bytes and preserves errno on success");
   readable[reader / 64] = bit;
   const std::array<int64_t, 2> deadline {1, 0};
   Check(Net::Select(reader + 1, readable.data(), nullptr, nullptr,
                     deadline.data()) == 1 && readable[reader / 64] == bit,
         "select reports the guest descriptor after wake");
   std::array<char, sizeof(payload)> received {};
-  Check(Net::Recv(reader, received.data(), received.size(), 0x42) == sizeof(payload) &&
+  Check(net_recv(reader, received.data(), received.size(), 0x42) == sizeof(payload) &&
+            std::memcmp(received.data(), payload, sizeof(payload)) == 0 &&
+            *net_errno == Libs::Posix::POSIX_EINVAL,
+        "Net receive forwards PEEK and WAITALL without consuming bytes");
+  received.fill(0);
+  Check(net_recv(reader, received.data(), received.size(), 0x40) == sizeof(payload) &&
             std::memcmp(received.data(), payload, sizeof(payload)) == 0,
-        "guest PEEK and WAITALL preserve the wake bytes");
-  Check(Net::Recv(reader, received.data(), received.size(), 0x40) == sizeof(payload),
-        "consume wake bytes with guest WAITALL");
+        "Net receive consumes the same bytes after peeking");
 #if !defined(_WIN32)
   Check(Net::Recv(reader, received.data(), received.size(), 0x80) == -1 &&
             *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EWOULDBLOCK,
         "empty nonblocking receive translates guest errno");
+  Check(net_recv(reader, received.data(), received.size(), 0x80) ==
+            Libs::Network::NET_ERROR_EWOULDBLOCK &&
+            *net_errno == Libs::Posix::POSIX_EWOULDBLOCK,
+        "Net nonblocking receive translates POSIX failure and Net errno");
 #endif
-  Check(Net::SocketClose(reader) == 0 && Net::SocketClose(writer) == 0,
-        "close wake sockets");
+  Check(net_send(-1, payload, sizeof(payload), 0) == Libs::Network::NET_ERROR_EBADF &&
+            *net_errno == Libs::Posix::POSIX_EBADF,
+        "Net send translates an invalid socket instead of returning POSIX minus one");
+  Check(net_recv(reader, nullptr, received.size(), 0) == Libs::Network::NET_ERROR_EFAULT &&
+            *net_errno == Libs::Posix::POSIX_EFAULT,
+        "Net receive translates an invalid output buffer");
+  Check(net_send(writer, payload, sizeof(payload), 0x100000) ==
+            Libs::Network::NET_ERROR_EOPNOTSUPP &&
+            *net_errno == Libs::Posix::POSIX_EOPNOTSUPP,
+        "Net send preserves the backend's unsupported crypto flag error");
+#if defined(__linux__)
+  const int disconnected = Net::Socket(2, 1, 0);
+  Check(disconnected >= 0, "create unconnected socket for broken pipe check");
+  const auto previous_sigpipe = std::signal(SIGPIPE, SIG_DFL);
+  Check(previous_sigpipe != SIG_ERR, "set default SIGPIPE disposition for Net send");
+  const auto broken_send = net_send(disconnected, payload, sizeof(payload), 0);
+  std::signal(SIGPIPE, previous_sigpipe);
+  Check(broken_send == Libs::Network::NET_ERROR_EPIPE &&
+            *net_errno == Libs::Posix::POSIX_EPIPE,
+        "Net send reports a broken pipe without raising host SIGPIPE");
+  Check(Net::SocketClose(disconnected) == 0, "close unconnected socket");
+#endif
+  Check(Net::SocketClose(writer) == 0, "close wake writer");
+  *net_errno = Libs::Posix::POSIX_EINVAL;
+  Check(net_recv(reader, received.data(), received.size(), 0) == 0 &&
+            *net_errno == Libs::Posix::POSIX_EINVAL,
+        "Net receive returns EOF without replacing errno");
+  Check(Net::SocketClose(reader) == 0, "close wake reader");
   readable[reader / 64] = bit;
   Check(Net::Select(reader + 1, readable.data(), nullptr, nullptr,
                     immediate.data()) == -1 &&

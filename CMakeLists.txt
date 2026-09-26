@@ -494,6 +494,8 @@ target_include_directories(event_queue_lifetime_tests PRIVATE ${inc_headers})
 add_kyty_full_emulator_test(kernel_file_system_tests
 	"${KYTY_TESTS_DIR}/KernelFileSystemTests.cpp")
 
+add_kyty_full_emulator_test(av_player_tests "${KYTY_TESTS_DIR}/AvPlayerTests.cpp")
+
 add_executable(sync_on_address_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SyncOnAddressTests.cpp"
 	"${KYTY_SOURCE_DIR}/kernel/syncOnAddress.cpp"
@@ -570,6 +572,9 @@ if(BUILD_TESTING)
 	add_test(NAME audio_out2_port COMMAND $<TARGET_FILE:audio_out2_port_tests>)
 	add_test(NAME ngs2_sampler COMMAND $<TARGET_FILE:ngs2_sampler_tests>)
 	add_test(NAME save_data_memory COMMAND $<TARGET_FILE:save_data_memory_tests>)
+	add_test(NAME av_player COMMAND $<TARGET_FILE:av_player_tests>)
+	# The test encodes its clip with the bundled FFmpeg and skips when that cannot.
+	set_tests_properties(av_player PROPERTIES SKIP_RETURN_CODE 77)
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
 	add_test(NAME shader_recompiler_alignbyte
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --alignbyte-only)
@@ -637,6 +642,7 @@ if(BUILD_TESTING)
 		audio_out2_port_tests
 		ngs2_sampler_tests
 		save_data_memory_tests
+		av_player_tests
 	)
 endif()
 

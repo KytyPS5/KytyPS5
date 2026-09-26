@@ -6157,7 +6157,11 @@ public:
                   !texture_cache.GetImage(fault_a_image).IsTracked() &&
                   !texture_cache.GetImage(fault_b_image).IsTracked() &&
                   texture_cache.GetImage(fault_a_image).IsMaybeCpuDirty() &&
-                  texture_cache.GetImage(fault_b_image).IsMaybeCpuDirty(),
+                  texture_cache.GetImage(fault_b_image).IsMaybeCpuDirty() &&
+                  texture_cache.IsRegionGpuModified(base + 0x8000,
+                                                    sizeof(fault_a)) &&
+                  texture_cache.IsRegionGpuModified(base + 0x8010,
+                                                    sizeof(fault_b)),
               "a byte-disjoint CPU write discarded authoritative images");
       const auto retracked_a = texture_cache.FindImage(fault_a_desc);
       const auto retracked_b = texture_cache.FindImage(fault_b_desc);
@@ -6182,6 +6186,13 @@ public:
                   texture_cache.GetImage(fault_b_image).IsGpuModified() &&
                   texture_cache.GetImage(fault_b_image).IsDefinitelyCpuDirty(),
               "the surviving image was not protected after its alias retired");
+      // The CPU store supersedes the rendered bytes, so guest memory is
+      // authoritative for them until the image is refreshed from it.
+      Require(
+          name, "CPU-overwritten image releases GPU ownership",
+          !texture_cache.IsRegionGpuModified(base + 0x8010, sizeof(fault_b)) &&
+              texture_cache.IsRegionGpuModified(base + 0x8000, sizeof(fault_a)),
+          "an image overwritten by the CPU kept its GPU ownership");
       constexpr uint32_t fault_b_cpu = 0xa5a6a7a8u;
       std::memcpy(memory + 0x8010, &fault_b_cpu, sizeof(fault_b_cpu));
       const auto refreshed_b = texture_cache.FindImage(fault_b_desc);
@@ -6190,7 +6201,8 @@ public:
           name, "same-page survivor refresh",
           refreshed_b == fault_b_image &&
               !texture_cache.GetImage(fault_b_image).IsDefinitelyCpuDirty() &&
-              texture_cache.GetImage(fault_b_image).IsGpuModified(),
+              texture_cache.GetImage(fault_b_image).IsGpuModified() &&
+              texture_cache.IsRegionGpuModified(base + 0x8010, sizeof(fault_b)),
           "the surviving image could not reconcile its CPU write");
 
       constexpr uint64_t publish_image_offset = 0x26000;

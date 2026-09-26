@@ -1,6 +1,10 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
 
+#include <cstdlib>
+#include <unordered_set>
+#include <mutex>
+
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
@@ -14,6 +18,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
@@ -823,6 +828,22 @@ static VKAPI_ATTR vk::Bool32 VKAPI_CALL VulkanDebugMessengerCallback(
 		default: severity_str = "?";
 	}
 
+	// Diagnostic switch: KYTY_VALIDATION_NONFATAL=1 prints validation errors instead of exiting,
+	// so a run can collect every error, not only the first.
+	static const bool nonfatal = std::getenv("KYTY_VALIDATION_NONFATAL") != nullptr;
+	if (error && nonfatal) {
+		static std::mutex                      seen_mutex;
+		static std::unordered_set<std::string> seen;
+		const std::string id = callback_data->pMessageIdName != nullptr
+		                           ? callback_data->pMessageIdName
+		                           : std::string(callback_data->pMessage).substr(0, 120);
+		std::lock_guard lock(seen_mutex);
+		if (seen.size() < 300 && seen.insert(id).second) {
+			std::printf("[Vulkan][E]: %s\n", callback_data->pMessage);
+			std::fflush(stdout);
+		}
+		return VK_FALSE;
+	}
 	if (error) {
 		EXIT_COLOR(severity_style, "[Vulkan][%s][%u]: %s\n", severity_str,
 		           static_cast<uint32_t>(message_types), callback_data->pMessage);
@@ -1061,6 +1082,8 @@ void WindowContext::CreateVulkan() {
 		}
 	}
 
+	ShaderRecompiler::SetMaxLdsBytes(
+	    graphic_ctx.physical_device.getProperties().limits.maxComputeSharedMemorySize);
 	graphic_ctx.device = VulkanCreateDevice(graphic_ctx, device_extensions);
 	if (graphic_ctx.device == nullptr) {
 		EXIT("Could not create device");

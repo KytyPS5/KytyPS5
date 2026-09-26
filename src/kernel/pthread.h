@@ -91,6 +91,9 @@ int KYTY_SYSV_ABI PthreadMutexUnlock(PthreadMutex* mutex);
 
 Pthread KYTY_SYSV_ABI PthreadSelf();
 Pthread               PthreadSelfOrNull();
+bool FindLiveGuestStack(uint64_t addr, uint64_t size, uint64_t* stack_start, uint64_t* stack_end);
+void RegisterLiveStack(const void* addr, size_t size);
+void UnregisterLiveStack(const void* addr);
 Pthread               PthreadSwapSelfForSignal(Pthread thread);
 int KYTY_SYSV_ABI     PthreadCreate(Pthread* thread, const PthreadAttr* attr,
                                     pthread_entry_func_t entry, void* arg, const char* name);

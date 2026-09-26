@@ -2,6 +2,8 @@
 
 #include <SDL3/SDL.h>
 
+#include <cstdio>
+
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
@@ -305,10 +307,17 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 #endif
 
 	if (f.added) {
+		// A hot-plugged device SDL reports but cannot open (e.g. a Bluetooth HID device) is
+		// simply not a usable pad; ignore it instead of ending the game.
 		auto* pad = SDL_OpenGamepad(f.id);
-		EXIT_NOT_IMPLEMENTED(pad == nullptr);
-		int id = SDL_GetJoystickID(SDL_GetGamepadJoystick(pad));
-		Controller::Connect(id);
+		if (pad == nullptr) {
+			std::printf("Controller: ignoring gamepad %d that could not be opened: %s\n", f.id,
+			            SDL_GetError());
+			std::fflush(stdout);
+		} else {
+			int id = SDL_GetJoystickID(SDL_GetGamepadJoystick(pad));
+			Controller::Connect(id);
+		}
 	}
 
 	if (f.removed) {

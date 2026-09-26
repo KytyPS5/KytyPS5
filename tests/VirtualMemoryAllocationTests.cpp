@@ -186,9 +186,9 @@ LONG CALLBACK RedZoneFaultHandler(EXCEPTION_POINTERS* exception) {
 	return EXCEPTION_CONTINUE_EXECUTION;
 }
 
-void TestWindowsGuestRedZoneStaticPatcher() {
-	const char* test = "WindowsGuestRedZoneStaticPatcher";
-	constexpr uint64_t SENTINEL = 0x1122334455667788ull;
+// The code must store a sentinel in the red zone at rsp-0x18, fault on [rdi], then return 1
+// only if the sentinel survived.
+void RunRedZonePatcherCase(const char* test, const std::vector<uint8_t>& code) {
 	constexpr uint64_t CODE_SIZE = 0x4000;
 	constexpr uint64_t TRAMPOLINE_SIZE = 0x4000;
 	const auto mapping = Libs::LibKernel::Memory::AllocateProgramMemory(
@@ -196,25 +196,6 @@ void TestWindowsGuestRedZoneStaticPatcher() {
 	    Common::VirtualMemory::Mode::ExecuteReadWrite, "red_zone_patcher_test");
 	Check(test, mapping != 0, "failed to allocate patch test code");
 
-	std::vector<uint8_t> code;
-	const auto emit = [&code](std::initializer_list<uint8_t> bytes) {
-		code.insert(code.end(), bytes.begin(), bytes.end());
-	};
-	const auto emit64 = [&code](uint64_t value) {
-		const auto offset = code.size();
-		code.resize(offset + sizeof(value));
-		std::memcpy(code.data() + offset, &value, sizeof(value));
-	};
-	emit({0x48, 0xb8});
-	emit64(SENTINEL);                         // movabs rax, sentinel
-	emit({0x48, 0x89, 0x44, 0x24, 0xe8});     // mov [rsp-0x18], rax
-	emit({0x48, 0x8b, 0x07});                 // mov rax, [rdi] (faultable, 3 bytes)
-	emit({0x48, 0x8b, 0x44, 0x24, 0xe8});     // mov rax, [rsp-0x18]
-	emit({0x48, 0xb9});
-	emit64(SENTINEL);                         // movabs rcx, sentinel
-	emit({0x48, 0x39, 0xc8});                 // cmp rax, rcx
-	emit({0x0f, 0x94, 0xc0});                 // sete al
-	emit({0x0f, 0xb6, 0xc0, 0xc3});           // movzx eax, al; ret
 	Check(test, code.size() < CODE_SIZE, "generated patch test code is too large");
 	std::memcpy(reinterpret_cast<void*>(mapping), code.data(), code.size());
 	Check(test, Common::VirtualMemory::FlushInstructionCache(mapping, code.size()),
@@ -255,9 +236,54 @@ void TestWindowsGuestRedZoneStaticPatcher() {
 	Check(test, freed, "failed to free patch test code");
 	std::printf("[host]    %-48s ok\n", test);
 }
+
+void TestWindowsGuestRedZoneStaticPatcher() {
+	constexpr uint64_t SENTINEL = 0x1122334455667788ull;
+	std::vector<uint8_t> code;
+	const auto emit = [&code](std::initializer_list<uint8_t> bytes) {
+		code.insert(code.end(), bytes.begin(), bytes.end());
+	};
+	const auto emit64 = [&code](uint64_t value) {
+		const auto offset = code.size();
+		code.resize(offset + sizeof(value));
+		std::memcpy(code.data() + offset, &value, sizeof(value));
+	};
+	emit({0x48, 0xb8});
+	emit64(SENTINEL);                         // movabs rax, sentinel
+	emit({0x48, 0x89, 0x44, 0x24, 0xe8});     // mov [rsp-0x18], rax
+	emit({0x48, 0x8b, 0x07});                 // mov rax, [rdi] (faultable, 3 bytes)
+	emit({0x48, 0x8b, 0x44, 0x24, 0xe8});     // mov rax, [rsp-0x18]
+	emit({0x48, 0xb9});
+	emit64(SENTINEL);                         // movabs rcx, sentinel
+	emit({0x48, 0x39, 0xc8});                 // cmp rax, rcx
+	emit({0x0f, 0x94, 0xc0});                 // sete al
+	emit({0x0f, 0xb6, 0xc0, 0xc3});           // movzx eax, al; ret
+	RunRedZonePatcherCase("WindowsGuestRedZoneStaticPatcher", code);
+
+	// Frame-pointer leaf functions address red-zone locals through RBP, below the allocated
+	// frame, so RBP - RSP has to be tracked to see the red-zone use.
+	code.clear();
+	emit({0x55});                             // push rbp
+	emit({0x48, 0x89, 0xe5});                 // mov rbp, rsp
+	emit({0x48, 0x83, 0xec, 0x10});           // sub rsp, 0x10
+	emit({0x48, 0xb8});
+	emit64(SENTINEL);                         // movabs rax, sentinel
+	emit({0x48, 0x89, 0x45, 0xd8});           // mov [rbp-0x28], rax (rsp-0x18)
+	emit({0x48, 0x8b, 0x07});                 // mov rax, [rdi] (faultable, 3 bytes)
+	emit({0x48, 0x8b, 0x45, 0xd8});           // mov rax, [rbp-0x28]
+	emit({0x48, 0xb9});
+	emit64(SENTINEL);                         // movabs rcx, sentinel
+	emit({0x48, 0x39, 0xc8});                 // cmp rax, rcx
+	emit({0x0f, 0x94, 0xc0});                 // sete al
+	emit({0x0f, 0xb6, 0xc0});                 // movzx eax, al
+	emit({0x48, 0x89, 0xec});                 // mov rsp, rbp
+	emit({0x5d, 0xc3});                       // pop rbp; ret
+	RunRedZonePatcherCase("WindowsGuestFramePointerRedZoneStaticPatcher", code);
+}
 #else
 void TestWindowsGuestRedZoneStaticPatcher() {
 	std::printf("[host]    %-48s skipped\n", "WindowsGuestRedZoneStaticPatcher");
+	std::printf("[host]    %-48s skipped\n", "WindowsGuestFramePointerRedZoneStaticPatcher");
 }
 #endif
 

@@ -1,4 +1,8 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
+#include "graphics/shader/recompiler/ShaderRecompiler.h"
+
+#include <algorithm>
+#include <atomic>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
@@ -58,9 +62,14 @@ void EmitMemoryOffsets(EmitterState& state) {
 	}
 }
 
+static std::atomic<uint32_t> g_max_lds_dwords {65536u / 4u};
+
 uint32_t LdsDwordCount(const EmitterState& state) {
 	const auto* workgroup = ShaderWorkgroupInput(state.program.stage, state.input_info);
-	return workgroup != nullptr ? workgroup->lds_size_dwords : 8192u;
+	const auto  requested = workgroup != nullptr ? workgroup->lds_size_dwords : 8192u;
+	// A pipeline declaring more shared memory than the device supports is invalid and made the
+	// NVIDIA device lost (PPSA10595 asks for 56 KiB; RTX 40 allows 48 KiB in Vulkan).
+	return std::min(requested, g_max_lds_dwords.load(std::memory_order_relaxed));
 }
 
 static void EnsureLdsStorage(EmitterState& state) {
@@ -379,3 +388,13 @@ uint32_t EmitDsSwizzleTargetLane(EmitterState& state, uint32_t subid, uint32_t c
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter
+
+namespace Libs::Graphics::ShaderRecompiler {
+
+void SetMaxLdsBytes(uint32_t bytes) {
+	if (bytes >= 4u) {
+		Spirv::Emitter::g_max_lds_dwords.store(bytes / 4u, std::memory_order_relaxed);
+	}
+}
+
+} // namespace Libs::Graphics::ShaderRecompiler

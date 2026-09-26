@@ -828,6 +828,15 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		      requested.resources.layers == cached.info.resources.layers))) {
 			return {ExpandImage(requested, cached_id)};
 		}
+		// The same memory reused for a deeper volume (PPSA10595 stage load: a 3D texture growing
+		// from 9 MiB to 24 MiB with equal pitch, height, format and levels).
+		if (requested.IsVolume() && cached.info.IsVolume() &&
+		    requested.pixel_format == cached.info.pixel_format &&
+		    requested.resources == cached.info.resources &&
+		    requested.extent.depth > cached.info.extent.depth &&
+		    requested.data.size > cached.info.data.size) {
+			return {ExpandImage(requested, cached_id)};
+		}
 		if (requested.pixel_format != cached.info.pixel_format ||
 		    requested.data.size <= cached.info.data.size) {
 			const auto result_id = merged_id ? merged_id : cached_id;
@@ -1151,26 +1160,35 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 	}
 	// Finish native metadata writes before reading backing bytes. This can submit the scheduler,
 	// so discovery runs before final draw uploads and never holds the texture lock across it.
-	if (m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
+	const bool gpu_modified = m_buffer_cache.IsRegionGpuModified(range.address, range.size);
+	// A GPU-resident uniform fill needs no readback: its value is already known.
+	uint32_t   fill_value   = 0;
+	const bool known_fill   = gpu_modified &&
+	                        m_buffer_cache.TryGetKnownFill(range.address, range.size, &fill_value) &&
+	                        (fill_value & 0xffu) * 0x01010101u == fill_value;
+	if (gpu_modified && !known_fill) {
 		m_buffer_cache.ReadMemory(range.address, range.size, false);
 	}
 	const auto slice_size = range.size / layers;
 	for (uint32_t slice = 0; slice < count; slice++) {
 		const auto address = range.address + slice_size * (first + slice);
-		uint8_t code = 0;
-		if (!LibKernel::Memory::TryReadBacking(address, &code, sizeof(code))) {
+		uint8_t code = static_cast<uint8_t>(fill_value);
+		if (!known_fill && !LibKernel::Memory::TryReadBacking(address, &code, sizeof(code))) {
 			EXIT("TextureCache: failed to read DCC metadata backing\n");
 		}
 		vk::ClearValue clear {};
 		if (!DecodeDccClear(desc, code, clear.color)) {
 			continue;
 		}
-		std::vector<uint8_t> bytes(slice_size);
-		if (!LibKernel::Memory::TryReadBacking(address, bytes.data(), bytes.size())) {
-			EXIT("TextureCache: failed to read DCC metadata slice\n");
-		}
-		if (!std::all_of(bytes.begin(), bytes.end(), [code](uint8_t byte) { return byte == code; })) {
-			continue;
+		if (!known_fill) {
+			std::vector<uint8_t> bytes(slice_size);
+			if (!LibKernel::Memory::TryReadBacking(address, bytes.data(), bytes.size())) {
+				EXIT("TextureCache: failed to read DCC metadata slice\n");
+			}
+			if (!std::all_of(bytes.begin(), bytes.end(),
+			                 [code](uint8_t byte) { return byte == code; })) {
+				continue;
+			}
 		}
 		{
 			std::scoped_lock lock {m_lock};

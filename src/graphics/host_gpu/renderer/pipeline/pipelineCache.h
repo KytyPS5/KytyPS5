@@ -10,6 +10,7 @@
 #include "graphics/shader/shader.h"
 
 #include <cstddef>
+#include <chrono>
 #include <filesystem>
 #include <memory>
 #include <span>
@@ -215,8 +216,14 @@ private:
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
 	Common::Mutex m_mutex;
+	// Emulated games often end without a clean window close, so the driver cache is also written
+	// periodically while new pipelines are being compiled. Callers hold m_mutex.
+	std::chrono::steady_clock::time_point m_last_snapshot = std::chrono::steady_clock::now();
+	bool                                  m_snapshot_pending = false;
 
 	void InitializeDriverCache();
+	void WriteSnapshotLocked();
+	void MaybeSnapshotLocked();
 };
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);

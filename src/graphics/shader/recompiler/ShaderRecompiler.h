@@ -45,6 +45,10 @@ struct CompileResult {
                                            const IR::ResourceSpecialization& specialization,
 	                                       uint32_t push_data_start_dword = 0);
 
+// Largest workgroup shared memory the host device allows (maxComputeSharedMemorySize). Guest
+// shaders sized for the PS5's 64 KiB are clamped to it; LDS accesses are bounds-checked.
+void SetMaxLdsBytes(uint32_t bytes);
+
 } // namespace Libs::Graphics::ShaderRecompiler
 
 #endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_SHADERRECOMPILER_H_ */

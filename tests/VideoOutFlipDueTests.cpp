@@ -61,6 +61,20 @@ void TestRateTwoSpacing() {
 	Check(IsFlipDueAtVblank(6, 2, 3), "rate 2 due after interval");
 }
 
+void TestPresentPacingCreditIsBounded() {
+	using Libs::VideoOut::ClampPresentPacingWait;
+	// Absolute sleep used to clamp only to UINT32_MAX us (~4295s). Accumulated
+	// credit from fast overlays must not exceed one refresh period.
+	constexpr uint64_t period = 16'666;
+	Check(ClampPresentPacingWait(0, period) == 0, "zero wait unchanged");
+	Check(ClampPresentPacingWait(period / 2, period) == static_cast<int64_t>(period / 2),
+	      "sub-period credit unchanged");
+	Check(ClampPresentPacingWait(static_cast<int64_t>(period) * 1000, period) ==
+	          static_cast<int64_t>(period),
+	      "huge credit must clamp to one period");
+	Check(ClampPresentPacingWait(-50, period) == -50, "debt unchanged");
+}
+
 } // namespace
 
 int main() {
@@ -69,6 +83,7 @@ int main() {
 	TestRateOneRequiresIntervalSinceLastPresent();
 	TestRelativeDoesNotStarveOddPhase();
 	TestRateTwoSpacing();
+	TestPresentPacingCreditIsBounded();
 	std::printf("VideoOutFlipDueTests: all checks passed\n");
 	return 0;
 }

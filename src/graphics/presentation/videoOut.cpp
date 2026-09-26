@@ -817,21 +817,27 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 
 	int64_t total_wait = 0;
 	while (!token.stop_requested()) {
+		const auto refresh = std::max(Config::GetVblankFrequency(), 1u);
+		const auto period  = std::max(frequency / refresh, uint64_t {1});
+		// Fast overlay presents accumulate pacing credit. Sleeping the full
+		// credit (up to ~UINT32_MAX us) freezes Flip while Ready frames wait and
+		// the GPU keeps running — the shown≈ready-1 soft-stall shape.
+		total_wait = ClampPresentPacingWait(total_wait, period);
+
 		const auto sleep_begin = Common::Timer::QueryPerformanceCounter();
 		if (total_wait > 0) {
 			const auto remaining_us =
 			    (static_cast<uint64_t>(total_wait) * 1000000u + frequency - 1) / frequency;
+			const auto period_us =
+			    (period * 1000000u + frequency - 1) / frequency;
 			Common::Thread::SleepMicro(static_cast<uint32_t>(
-			    std::clamp<uint64_t>(remaining_us, 1, std::numeric_limits<uint32_t>::max())));
+			    std::clamp<uint64_t>(remaining_us, 1, std::max<uint64_t>(period_us, 1))));
 		}
 		if (token.stop_requested()) {
 			break;
 		}
 		const auto frame_begin = Common::Timer::QueryPerformanceCounter();
 		total_wait -= static_cast<int64_t>(frame_begin - sleep_begin);
-
-		const auto refresh = std::max(Config::GetVblankFrequency(), 1u);
-		const auto period  = std::max(frequency / refresh, uint64_t {1});
 
 		if (m_presenter.IsGuestPaused()) {
 			if (auto* frame = m_presenter.PrepareLastFrame(); frame != nullptr) {

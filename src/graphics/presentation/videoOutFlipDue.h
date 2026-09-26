@@ -27,6 +27,17 @@ inline constexpr uint64_t kNoPresentedVblank = std::numeric_limits<uint64_t>::ma
 	return (vblank_count - last_presented_vblank) >= interval;
 }
 
+// Present-thread pacing credit from fast frames must not grow without bound:
+// sleeping the full credit freezes Flip while Ready frames wait.
+[[nodiscard]] constexpr int64_t ClampPresentPacingWait(int64_t total_wait,
+                                                       uint64_t period_ticks) noexcept {
+	if (period_ticks == 0) {
+		return 0;
+	}
+	const auto period = static_cast<int64_t>(period_ticks);
+	return total_wait > period ? period : total_wait;
+}
+
 } // namespace Libs::VideoOut
 
 #endif // EMULATOR_SRC_GRAPHICS_PRESENTATION_VIDEOOUTFLIPDUE_H_

@@ -27726,6 +27726,54 @@ void CheckIndirectImageKeySwitch() {
               "2D/3D candidate switch did not retain both images");
     }
   }
+
+  // Dimension queries must follow the same key mapping as samples, including array size.
+  program.info.images = {root, candidate};
+  program.info.images[0].indirect_resources = {0u, 1u};
+  program.info.images[1].dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
+  MemoryInfo query_memory{};
+  query_memory.kind = ResourceKind::Image;
+  query_memory.image_dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+  query_memory.image_address_components = 1u;
+  program.memory_info.push_back(query_memory);
+  auto &query_address = block->AppendNewInst(
+      ValueOpcode::MakeImageAddress,
+      {Value(1u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
+       Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u)});
+  auto &query = block->AppendNewInst(ValueOpcode::ImageQueryDimensions,
+                                    {Value(&image), Value(&query_address)});
+  query.SetFlags(MemoryFlags{1u, 0x70u});
+  auto &width = block->AppendNewInst(ValueOpcode::CompositeExtractU32x4,
+                                    {Value(&query), Value(0u)});
+  block->AppendNewInst(ValueOpcode::ReferenceU32, {Value(&width)});
+  program.binding_layout_complete = false;
+  AllocateBindings(program);
+  spirv = ShaderRecompiler::Spirv::EmitProgram(program, {.compute = &compute});
+  ValidateSpirv(name, spirv);
+  Require(name, "indirect dimension query disassembly", tools.Disassemble(spirv, &text),
+          "failed to disassemble indirect dimension queries");
+  Require(name, "indirect dimension query switch",
+          CountText(text, "OpImageQuerySizeLod") == 2 &&
+              CountText(text, "OpImageQueryLevels") == 2 &&
+              CountText(text, "OpSwitch") == 2 && CountText(text, "OpPhi") == 2,
+          "dimension query did not select each candidate's size and mip count");
+  std::vector<u32> vector_widths(spirv[3]);
+  u32 queries = 0;
+  for (size_t offset = 5; offset < spirv.size();) {
+    const auto words = std::span<const u32>(spirv).subspan(offset, spirv[offset] >> 16u);
+    const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
+    if (opcode == spv::OpTypeVector) vector_widths[words[1]] = words[3];
+    if (opcode == spv::OpImageQuerySizeLod) {
+      Require(name, "candidate-specific query dimensions",
+              vector_widths[words[1]] == (queries == 0u ? 2u : 3u),
+              "dimension query reused the root descriptor for an array candidate");
+      queries++;
+    }
+    offset += words.size();
+  }
+  Require(name, "dimension query count", queries == 2u,
+          "dimension query dropped a candidate");
+
 }
 
 TestCase ImageStoreMipSelectsPpsa01340Descriptor() {

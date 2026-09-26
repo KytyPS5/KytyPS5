@@ -1222,7 +1222,8 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 				memory.sampler = sampler_plan.point_sampler[memory.sampler];
 			}
 			if (image.indirect_root == memory.resource &&
-			    inst.GetOpcode() != ValueOpcode::ImageSampleRaw) {
+			    inst.GetOpcode() != ValueOpcode::ImageSampleRaw &&
+			    inst.GetOpcode() != ValueOpcode::ImageQueryDimensions) {
 				EXIT("unsupported indirect image operation: shader=0x%016llx pc=0x%08x "
 				     "opcode=%s resource=%u instruction_dimension=%u sample_flags=0x%x "
 				     "candidates=%zu",

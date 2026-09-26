@@ -852,6 +852,9 @@ void TestBufferRecordImageKey() {
             snapshot.flattened_srt[5] == 2u &&
             snapshot.flattened_srt[7] == 3u,
         "wrapped buffer record keys were not materialized");
+  ApplyResourceSpecialization(fixture->program, specialization);
+  Check(fixture->program.info.images[0].indirect_resources.size() == 4u,
+        "dimension query specialization discarded its runtime candidates");
   user_data[7] = 0x1000u;
   Check(!MaterializeResources(plan, runtime, snapshot, specialization),
         "written buffer alias with a record key was accepted");

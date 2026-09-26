@@ -6,13 +6,13 @@
 
 GitHub REST `state=open&per_page=100` (paginate) → **113** открытых PR
 (range #148–#845, drafts=5).
-Сравнение с `yotei-windows-bringup` @ `6fb832f8` (draft
+Сравнение с `yotei-windows-bringup` @ `b2035d7c`+ (draft
 [#497](https://github.com/KytyPS5/KytyPS5/pull/497), base `main` tip `fd2e15ee`).
 
 **Runtime на tip:** первый ненулевой кадр (spinner) доказан
 `…-081515-presentfix-gpuav` prepared frame 250. Меню/gameplay **PENDING**.
-Текущий cost — GPUAV `vkCreateComputePipelines` на CS `54904fb4`
-(~755k SPIR-V, specialization churn).
+Long run `…-081840`: watchdog **shown=159** — CS `54904fb4` 4× CreatePipeline
+~287–295 с под GPUAV (4-й begin без done). EXIT large transfer **не** hit.
 
 Это triage по title/files/метаданным всех 113 PR + deeper file look на
 shader/GPU/Windows candidates. Не утверждение, что все 113 собраны и
@@ -21,9 +21,14 @@ shader/GPU/Windows candidates. Не утверждение, что все 113 с
 ### Короткий вывод (актуально)
 
 - Готового чужого PR «целиком → меню Yōtei» **нет**.
+- **Merge 26.09 после `…-081840`:** ничего не влито в #497 — ни один open PR
+  не снимает specialization churn `54904` без собственного RED / conflict
+  resolve. `#718` CONFLICTING + cold no-op + revision-keyed; `#842–#845`
+  только when EXIT observed.
 - Лучшие **performance** кандидаты после correctness: **#718** (precompile
-  recorded shaders), **#628** (SRT memo), **#735** (uniform readlane elim),
-  куски **#506/#767** только после split + RED.
+  recorded shaders — только warm 2nd+ boot, не текущий wall), **#628** (SRT
+  memo, CONFLICTING), **#735** (uniform readlane elim, MERGEABLE но не
+  CreatePipeline), куски **#506/#767** только после split + RED.
 - Лучшие **correctness when observed**: **#845/#844/#842** (stage large
   upload/download вместо EXIT), **#537** (publish linear storage before CPU),
   **#638** (memory-pressure GC), **#793** (mesh draw split), **#761**
@@ -37,17 +42,19 @@ shader/GPU/Windows candidates. Не утверждение, что все 113 с
 
 | Источник | Статус |
 | --- | --- |
-| [#497](https://github.com/KytyPS5/KytyPS5/pull/497) | **current:** head `6fb832f8`, MERGEABLE vs `fd2e15ee`. |
+| [#497](https://github.com/KytyPS5/KytyPS5/pull/497) | **current:** tip after docs refresh; MERGEABLE vs `fd2e15ee`. |
 | [#811](https://github.com/KytyPS5/KytyPS5/pull/811) images | **covered selectively**; buffer-key остаётся локальным RED. |
 | Main `fd2e15ee` | audio/NGS2, translator void/`V_CMPX_O_F32`, MaxBuffers=64, lru_cache tests, CI recompiler tests. |
 | Present/Vrr/HTile/readback 26.09 | soft-stall, GetVrrStatus, native HTile owner, post-EOP present readback. |
 
 ### Рекомендуемая очередь (меню)
 
-1. Long run past spinner → первый menu frame; логировать Fatal/CreatePipeline.
-2. Shared reduce CS `54904` SPIR-V / specialization churn (`emulator-test-debt.md`).
-3. Если CreatePipeline cold/warm всё ещё минуты — оценить **#718** precompile с
-   pipeline-cache identity RED (без title branching).
+1. Shared RED: specialization identity / SPIR-V size для CS `54904` class
+   (`emulator-test-debt.md`) — главный блокер past spinner.
+2. Повторить long run только после снижения CreatePipeline cost или с
+   bound watchdog, достаточным на N permutations (~5 мин × N).
+3. **#718** — только после conflict resolve + identity RED; не ожидать
+   ускорения cold / текущего hung mid-compile.
 4. Если hit EXIT на large upload/download — RED + selective **#842/#844/#845**.
 5. Не трогать mega-bundles (#780/#833/#767) до точного shared RED.
 
@@ -99,7 +106,7 @@ shader/GPU/Windows candidates. Не утверждение, что все 113 с
 | [#721](https://github.com/KytyPS5/KytyPS5/pull/721) |  | carbonimax | **separate**: MoltenVK BDA buffer lifetime. | vulkan: keep MoltenVK device-address buffers alive through queued work |
 | [#720](https://github.com/KytyPS5/KytyPS5/pull/720) |  | nomolao2-cell | **do not merge whole**: Astro Bot Intel CPU compat. | Astro Bot Intel CPU compatibility fixes |
 | [#719](https://github.com/KytyPS5/KytyPS5/pull/719) |  | Ekt0re | **diagnostic**: async logger + crash handler. | feat(logging): add asynchronous logger and crash handler |
-| [#718](https://github.com/KytyPS5/KytyPS5/pull/718) |  | FirasDev | **P1 performance**: precompile recorded shader set before title; directly targets cold CreatePipeline stalls (54904 class). Needs identity/cache RED. | graphics: precompile the recorded shader set before the title runs |
+| [#718](https://github.com/KytyPS5/KytyPS5/pull/718) |  | FirasDev | **P1 later / not now**: precompile recorded set — warm 2nd+ boot only; cold unchanged; keyed on `KYTY_GIT_REVISION`; CONFLICTING vs tip (`CMakeLists`/`pipelineCache`/`window`). Does not cut mid-run 54904 GPUAV CreatePipeline (~290 s×N). Needs identity RED before port. | graphics: precompile the recorded shader set before the title runs |
 | [#717](https://github.com/KytyPS5/KytyPS5/pull/717) |  | YuhiAida | **P2**: clamp host mip levels / layered block views. | graphics: clamp host mip levels and gate layered block views |
 | [#715](https://github.com/KytyPS5/KytyPS5/pull/715) |  | carbonimax | **do not merge whole**: native GPU PerVertex replay + shader caches prototype. | graphics: prototype native GPU PerVertex replay and shader caches |
 | [#709](https://github.com/KytyPS5/KytyPS5/pull/709) |  | Ekt0re | **P2**: zero-sized/minimized surface crash. | Fix: Prevent crash when window has zero-sized/minimized surface |
@@ -247,7 +254,7 @@ shader/GPU/Windows candidates. Не утверждение, что все 113 с
 | [#488 minimized window crash](https://github.com/KytyPS5/KytyPS5/pull/488) | **P2/separate:** полезный WSI fix, но не влияет на обычный не-minimized запуск. |
 | [#490 float image atomics](https://github.com/KytyPS5/KytyPS5/pull/490) | **covered:** production semantics уже в ветке; текущий PR head лишь другая актуализация того же класса. |
 | [#493 opt-in BVH stub](https://github.com/KytyPS5/KytyPS5/pull/493) | **diagnostic only:** decode/message полезны; always-miss не является реализацией ray tracing и не нужен Yōtei сейчас. |
-| [#497 current Yōtei draft](https://github.com/KytyPS5/KytyPS5/pull/497) | **current integration (26.09):** head `6fb832f8`, MERGEABLE vs main `fd2e15ee`; spinner proven; menu PENDING; see top snapshot for queue. |
+| [#497 current Yōtei draft](https://github.com/KytyPS5/KytyPS5/pull/497) | **current integration (26.09):** MERGEABLE vs main `fd2e15ee`; spinner proven (`…-081515`); long-run watchdog shown=159 on 54904 (`…-081840`); **no foreign PR merged** this pass; menu PENDING. |
 | [#500 Demon's Souls shader work](https://github.com/KytyPS5/KytyPS5/pull/500) | **closed unmerged (25.09) / partly covered:** часть уже перенесена; остаток только по отдельному RED, не revive whole. |
 | [#503 negative printf precision](https://github.com/KytyPS5/KytyPS5/pull/503) | **P2/separate:** корректный libc fix с хорошим focused coverage; не связан с renderer/shader failure. |
 | [#504 rejected-open descriptor leak](https://github.com/KytyPS5/KytyPS5/pull/504) | **P2/separate:** однострочный kernel cleanup с тестами; полезен глобально, не текущему run. |

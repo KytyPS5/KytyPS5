@@ -79,6 +79,20 @@ Checkpoint Flip queue lock-order (Reserve cfg→m_mutex ABBA) **26 сентяб�
     8.09). Каталог в `docs/open-pr-usefulness-review.md` полный; очередь к меню
     — long run + `54904` compile cost; кандидаты #718/#842–#845/#537/#761 только
     с RED, без whole mega-bundles.
+19. Long run past spinner `…-081840-presentfix-gpuav` (rev `23e4fd74` /
+    binary `fb1cc8b`, ContinueAfterColored, Timeout 2400 / watchdog 900):
+    **frame watchdog** — `shown=prepared=ready=159` не двигался 900 с;
+    `sawColored=false` (readbackStart=240 не достигнут). CS `54904fb419d79e49`
+    (~755k SPIR-V) **4× specialization recompile**: CreatePipeline
+    `elapsed_ms≈289750 / 295490 / 286829` + 4-й `begin` без `done` на Kill.
+    Fatal/EXIT на large upload/download **не** наблюдались. Меню **PENDING**.
+20. **Merge decision 26.09 (после #19):** чужой PR в ветку **не** вливался.
+    `#718` (precompile) — CONFLICTING vs tip (`CMakeLists`, `pipelineCache`,
+    `window`); cold boot не ускоряет; ключ `KYTY_GIT_REVISION` сбрасывает set
+    на каждый commit; под GPUAV минуты CreatePipeline просто переедут на boot.
+    `#842/#844/#845` — MERGEABLE, но EXIT не hit. Mega-bundles не трогать.
+    Следующее: shared RED на specialization churn / SPIR-V size `54904`, не
+    слепой merge.
 
 Checkpoint present soft-stall (shown≈130 / ready=shown+1) **26 сентября 2026 года**:
 
@@ -697,7 +711,7 @@ flowchart TD
 | 8 | Исполнение GPU | Bind ресурсов, barriers, draw/dispatch и ожидание выполнения. | Синхронные timing-прогоны отдельно от обычной асинхронной проверки. | **PASS для достигнутого пути.** Run `672af1f` дошёл до frame 222 без `ErrorDeviceLost`; завершился сам на явном unsupported opcode следующего shader. |
 | 9 | VideoOut | Готовая гостевая поверхность ставится в очередь flip и передаётся presentation path. | `prepared/ready/shown`, flip counters, отсутствие зависшего процесса после timeout. | **PASS механически.** Последний запуск: 193 GPU flips, 192 shown. Это ещё не доказывает полезные пиксели. |
 | 10 | Содержимое поверхности | До преобразования и swapchain читаются пиксели source image. | GPU readback: размеры, формат, min/max RGB/A. | **PASS для первого ненулевого изображения.** На `96611fe` readback остаётся чёрным до source frame 235; frame 236 уже содержит 10 ненулевых RGB pixels, а frame 242 — 214. Артефакт: `_Build/analysis/yotei-present-none-96611fe-20260909.txt`. |
-| 11 | Видимый кадр | Swapchain показывает ненулевое изображение, затем должны появиться меню и ввод. | Screenshot/readback + стабильный прогон без fatal/VUID. | **PARTIAL (26.09 tip):** spinner на prepared frame 250 (`…-081515-presentfix-gpuav`, `colored=10`→108). Исторический screenshot `yotei-first-nonzero-96611fe.png`. Меню/gameplay **PENDING**. |
+| 11 | Видимый кадр | Swapchain показывает ненулевое изображение, затем должны появиться меню и ввод. | Screenshot/readback + стабильный прогон без fatal/VUID. | **PARTIAL (26.09 tip):** spinner на prepared frame 250 (`…-081515-presentfix-gpuav`, `colored=10`→108). Long run `…-081840` → watchdog shown=159 на 4× `54904` CreatePipeline (~290 с). Исторический screenshot `yotei-first-nonzero-96611fe.png`. Меню/gameplay **PENDING**. |
 
 ### Где кэшируются шейдеры и что это даёт
 

@@ -65,8 +65,9 @@ Remaining debt:
   without changing workgroup scratch, dynamic-uniformity or barrier semantics.
 - Ratchet exact synthetic module size and validate that bounded pipeline creation no
   longer exceeds several minutes under GPUAV instrumentation before claiming menu
-  progress. Game evidence 26.09: CS `54904fb419d79e49` still costs ~20–278 s per
-  `vkCreateComputePipelines` and can recompile multiple specialization variants.
+  progress. Game evidence 26.09 `…-081840`: CS `54904fb419d79e49` did **4×**
+  specialization CreatePipeline ≈290/295/287 s under GPUAV+instr; watchdog
+  shown=159 before spinner readback.
 
 ## Compressed video-out metadata on a native render-target alias
 
@@ -1421,7 +1422,12 @@ Remaining validation:
   menu or gameplay until a recognizable full scene / menu frame is captured.
 - Continue bounded runs past spinner (`ContinueAfterColored`); record the first
   post-spinner compile, resource, GPU execution, or presentation blocker.
-  Large CS `54904fb419d79e49` still dominates CreatePipeline time under GPUAV
-  (multi-minute compiles / specialization churn).
+  Evidence 26.09 `…-081840-presentfix-gpuav`: frame watchdog at **shown=159**
+  while CS `54904fb419d79e49` did **4×** specialization recompile —
+  `vkCreateComputePipelines` ≈289.8 / 295.5 / 286.8 s, fourth `begin` without
+  `done` at Kill. ReadbackStart=240 never reached (`sawColored=false`).
+- Debt for shared fix: specialization-stable pipeline identity and/or smaller
+  SPIR-V for this reduce-class CS under GPUAV instrumentation — not a title
+  branch and not “merge #718 first” (cold boot unchanged; conflicts).
 - Re-run the accumulated shader/GPU test debt before upstream submission; the
   rendered-pixel milestone does not waive neighboring regressions.

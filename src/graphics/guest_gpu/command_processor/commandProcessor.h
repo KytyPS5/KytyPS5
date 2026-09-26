@@ -16,6 +16,26 @@ bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t f
 
 enum class Pm4ProcessResult { Complete, Blocked };
 
+// How a memory predicate must be brought up to date with queued GPU work before it is read.
+enum class PredicateSync { None, Download, Drain };
+
+[[nodiscard]] constexpr PredicateSync ClassifyPredicateSync(bool image_gpu_modified,
+                                                            bool pending_image_writeback,
+                                                            bool buffer_gpu_dirty) {
+	// Image-backed bytes have no CPU read barrier, so every queued write must finish first.
+	// A freed image no longer reports ownership while its deferred write-back is still queued,
+	// so that write-back keeps the bytes owned until it runs.
+	if (image_gpu_modified || pending_image_writeback) {
+		return PredicateSync::Drain;
+	}
+	// A tracked buffer write downloads through the queued work that produced it.
+	if (buffer_gpu_dirty) {
+		return PredicateSync::Download;
+	}
+	// Queued GPU work changes guest memory only through those tracked writes.
+	return PredicateSync::None;
+}
+
 enum class ContextStateOperation : uint32_t {
 	Clear     = 0,
 	Push      = 1,
@@ -149,6 +169,7 @@ private:
 	                      uint32_t interrupt_context_id);
 	void ProcessPm4(Pm4Execution& execution);
 	void SuspendPm4();
+	void SynchronizePredicate(uint64_t address, uint64_t size);
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
 	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }
 

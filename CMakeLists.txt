@@ -587,6 +587,10 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --stream-buffer-only)
 	add_test(NAME gpu_command_lane
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-command-lane-only)
+	add_test(NAME pm4_predicate_writeback
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --predicate-writeback-only)
+	add_test(NAME pm4_bool_predication_sync
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --bool-predication-sync-only)
 	add_test(NAME pm4_context_state
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --context-state-only)
 	add_test(NAME gpu_tiler

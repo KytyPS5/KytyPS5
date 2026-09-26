@@ -1833,11 +1833,30 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                                               vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
 	                                               1, &barrier, 0, nullptr);
-	m_scheduler.DeferPriorityOperation([&download, range, mapped, offset] {
+	{
+		std::lock_guard lock {m_pending_download_mutex};
+		m_pending_downloads.push_back(range);
+	}
+	m_scheduler.DeferPriorityOperation([this, &download, range, mapped, offset] {
 		download.Invalidate(offset, range.size);
 		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
+		std::lock_guard lock {m_pending_download_mutex};
+		const auto      pending = std::ranges::find(m_pending_downloads, range);
+		if (pending != m_pending_downloads.end()) {
+			m_pending_downloads.erase(pending);
+		}
 	});
 	return true;
+}
+
+bool TextureCache::HasPendingDownload(uint64_t address, uint64_t size) {
+	if (!GuestRange {address, size}.Valid()) {
+		return false;
+	}
+	std::lock_guard lock {m_pending_download_mutex};
+	return std::ranges::any_of(m_pending_downloads, [address, size](const GuestRange& pending) {
+		return pending.address < address + size && address < pending.End();
+	});
 }
 
 void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {

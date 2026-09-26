@@ -469,6 +469,89 @@ void CheckSocketWakeup() {
         "closed descriptor fails without clearing input fd_set");
 }
 
+void CheckDirectoryRename(const std::filesystem::path &root) {
+  Check(FileSystem::KernelMkdir("/savedata0/rename-src", 0777) == OK,
+        "create source directory");
+  const int entry =
+      FileSystem::KernelOpen("/savedata0/rename-src/entry.dat", 0x601, 0777);
+  Check(entry >= 3 && FileSystem::KernelClose(entry) == OK,
+        "create an entry inside the source directory");
+
+  Check(FileSystem::KernelRename("/savedata0/rename-src",
+                                 "/savedata0/rename-dst") == OK,
+        "rename a directory");
+  Check(!std::filesystem::exists(root / "rename-src") &&
+            std::filesystem::is_directory(root / "rename-dst") &&
+            std::filesystem::is_regular_file(root / "rename-dst" / "entry.dat"),
+        "renamed directory keeps its entries");
+
+  Check(FileSystem::KernelMkdir("/savedata0/rename-empty", 0777) == OK,
+        "create empty destination directory");
+  Check(FileSystem::KernelRename("/savedata0/rename-dst",
+                                 "/savedata0/rename-empty") == OK,
+        "rename a directory over an empty directory");
+  Check(!std::filesystem::exists(root / "rename-dst") &&
+            std::filesystem::is_regular_file(root / "rename-empty" /
+                                             "entry.dat"),
+        "directory replaces the empty destination");
+
+  Check(FileSystem::KernelMkdir("/savedata0/rename-src", 0777) == OK,
+        "recreate source directory");
+  Check(FileSystem::KernelRename("/savedata0/rename-src",
+                                 "/savedata0/rename-empty") ==
+            Libs::LibKernel::KERNEL_ERROR_ENOTEMPTY,
+        "renaming over a populated directory reports ENOTEMPTY");
+  Check(std::filesystem::is_directory(root / "rename-src") &&
+            std::filesystem::is_regular_file(root / "rename-empty" /
+                                             "entry.dat"),
+        "failed directory rename leaves both directories intact");
+
+  Check(FileSystem::KernelRename("/savedata0/rename-empty/entry.dat",
+                                 "/savedata0/rename-src") ==
+            Libs::LibKernel::KERNEL_ERROR_EISDIR,
+        "renaming a file over a directory reports EISDIR");
+  Check(FileSystem::KernelRename("/savedata0/rename-src",
+                                 "/savedata0/rename-empty/entry.dat") ==
+            Libs::LibKernel::KERNEL_ERROR_ENOTDIR,
+        "renaming a directory over a file reports ENOTDIR");
+  Check(FileSystem::KernelRename("/savedata0/rename-missing",
+                                 "/savedata0/rename-src") ==
+            Libs::LibKernel::KERNEL_ERROR_ENOENT,
+        "renaming a missing path reports ENOENT");
+}
+
+void CheckDirectoryOpenErrors() {
+  constexpr char Directory[] = "/savedata0/open-dir";
+  Check(FileSystem::KernelMkdir(Directory, 0777) == OK,
+        "create directory open fixture");
+  const int probe = FileSystem::KernelOpen(Directory, 0, 0);
+  Check(probe >= 3 && FileSystem::KernelClose(probe) == OK,
+        "open directory read-only");
+
+  Check(FileSystem::KernelOpen(Directory, 2, 0) ==
+            Libs::LibKernel::KERNEL_ERROR_EISDIR,
+        "opening a directory with O_RDWR reports EISDIR");
+  Check(FileSystem::KernelOpen(Directory, 1, 0) ==
+            Libs::LibKernel::KERNEL_ERROR_EISDIR,
+        "opening a directory with O_WRONLY reports EISDIR");
+  Check(FileSystem::KernelOpen(Directory, 0x200, 0777) ==
+            Libs::LibKernel::KERNEL_ERROR_EISDIR,
+        "O_CREAT on an existing directory reports EISDIR");
+  Check(FileSystem::KernelOpen(Directory, 0x00020000 | 2, 0) ==
+            Libs::LibKernel::KERNEL_ERROR_EISDIR,
+        "O_DIRECTORY with O_RDWR reports EISDIR");
+  Check(FileSystem::KernelOpen(Directory, 0x00020000 | 0x200, 0777) ==
+            Libs::LibKernel::KERNEL_ERROR_EISDIR,
+        "O_DIRECTORY with O_CREAT reports EISDIR");
+  Check(FileSystem::KernelOpen(Directory, 3, 0) ==
+            Libs::LibKernel::KERNEL_ERROR_EINVAL,
+        "access mode 3 reports EINVAL");
+
+  const int again = FileSystem::KernelOpen(Directory, 0, 0);
+  Check(again == probe, "failed directory opens release their descriptors");
+  Check(FileSystem::KernelClose(again) == OK, "close directory open fixture");
+}
+
 } // namespace
 
 int main() {
@@ -500,6 +583,8 @@ int main() {
   TestSaveOpenVisibility();
   CheckSaveRename(temporary.Path(), "first-save");
   CheckSaveRename(temporary.Path(), "replacement-save");
+  CheckDirectoryRename(temporary.Path());
+  CheckDirectoryOpenErrors();
   FileSystem::Shutdown();
   CheckSocketWakeup();
   graphics.reset();

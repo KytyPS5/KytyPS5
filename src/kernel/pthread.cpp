@@ -1716,8 +1716,14 @@ int KYTY_SYSV_ABI PthreadMutexInit(PthreadMutex* mutex, const PthreadMutexattr* 
 int KYTY_SYSV_ABI PthreadMutexDestroy(PthreadMutex* mutex) {
 	// Hot path for Python/Ren'Py startup; keep this quiet unless it fails.
 
-	if (mutex == nullptr || *mutex == nullptr) {
+	if (mutex == nullptr) {
 		return KERNEL_ERROR_EINVAL;
+	}
+
+	// A never-used static initializer (PTHREAD_MUTEX_INITIALIZER, or the adaptive variant
+	// that CreateObject() recognises as 1) has nothing to destroy; FreeBSD returns 0.
+	if (*mutex == nullptr || *mutex == reinterpret_cast<PthreadMutex>(static_cast<uintptr_t>(1))) {
+		return OK;
 	}
 
 	int result = ((*mutex)->owner == nullptr ? 0 : EBUSY);
@@ -2262,7 +2268,10 @@ int KYTY_SYSV_ABI PthreadRwlockDestroy(PthreadRwlock* rwlock) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	EXIT_NOT_IMPLEMENTED(*rwlock == nullptr);
+	// A never-used static initializer has nothing to destroy; FreeBSD returns 0.
+	if (*rwlock == nullptr) {
+		return OK;
+	}
 
 	{
 		std::lock_guard lock((*rwlock)->m);
@@ -2501,6 +2510,11 @@ int KYTY_SYSV_ABI PthreadRwlockTryrdlock(PthreadRwlock* rwlock) {
 
 int KYTY_SYSV_ABI PthreadRwlockTrywrlock(PthreadRwlock* rwlock) {
 	PRINT_NAME();
+
+	auto* pthread_static_objects = g_pthread_context->GetPthreadStaticObjects();
+
+	rwlock = static_cast<PthreadRwlock*>(
+	    pthread_static_objects->CreateObject(rwlock, PthreadStaticObject::Type::Rwlock));
 
 	if (rwlock == nullptr) {
 		return KERNEL_ERROR_EINVAL;
@@ -2745,7 +2759,10 @@ int KYTY_SYSV_ABI PthreadCondDestroy(PthreadCond* cond) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	EXIT_NOT_IMPLEMENTED(*cond == nullptr);
+	// A never-used static initializer has nothing to destroy; FreeBSD returns 0.
+	if (*cond == nullptr) {
+		return OK;
+	}
 
 	int result = 0;
 

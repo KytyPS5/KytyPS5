@@ -3727,18 +3727,22 @@ int KYTY_SYSV_ABI KernelMprotect(const void* addr, size_t len, int prot) {
 	if (!g_virtual_ranges->QuerySpan(aligned_addr, aligned_len, &old_ranges) ||
 	    std::any_of(old_ranges.begin(), old_ranges.end(),
 	                [](const auto& range) { return !IsCommittedRangeType(range.type); })) {
-		EXIT("memory-protection range is not fully mapped: addr=0x%016" PRIx64 " size=0x%016" PRIx64
-		     "\n",
-		     aligned_addr, aligned_len);
+		LOGF_COLOR(Log::Color::Red,
+		           "\t memory-protection range is not fully mapped: addr=0x%016" PRIx64
+		           " size=0x%016" PRIx64 "\n",
+		           aligned_addr, aligned_len);
+		return KERNEL_ERROR_ENOMEM;
 	}
 	const auto old_mode = static_cast<VirtualMemory::Mode>(
 	    old_ranges.front().protection & (PROT_CPU_READ | PROT_CPU_WRITE | PROT_CPU_EXEC));
 	bool ok = g_guest_address_space->Protect(aligned_addr, aligned_len, mode);
 
 	if (!ok) {
-		EXIT("host memory-protection update failed: addr=0x%016" PRIx64 " size=0x%016" PRIx64
-		     " prot=0x%08x\n",
-		     aligned_addr, aligned_len, prot);
+		LOGF_COLOR(Log::Color::Red,
+		           "\t host memory-protection update failed: addr=0x%016" PRIx64
+		           " size=0x%016" PRIx64 " prot=0x%08x\n",
+		           aligned_addr, aligned_len, prot);
+		return KERNEL_ERROR_EACCES;
 	}
 	for (const auto& old_range: old_ranges) {
 		if (old_range.type == VirtualRangeType::Direct) {
@@ -3938,15 +3942,20 @@ int KYTY_SYSV_ABI KernelMemoryPoolReserve(void* addr_in, size_t len, size_t alig
 	const auto reserve_alignment = (alignment != 0 ? alignment : POOL_RESERVE_ALIGNMENT);
 	const int  ret = KernelReserveVirtualRange(&out_addr, len, flags, reserve_alignment);
 	if (ret == OK) {
-		const auto           out_vaddr = reinterpret_cast<uint64_t>(out_addr);
-		VirtualRanges::Range reserved_range {};
-		if (!g_virtual_ranges->Query(out_vaddr, 0, &reserved_range) ||
-		    reserved_range.start != out_vaddr || reserved_range.size != len ||
-		    !IsReservedRangeType(reserved_range.type)) {
+		const auto out_vaddr = reinterpret_cast<uint64_t>(out_addr);
+		// The new reservation may have been merged with an adjacent plain reservation, so
+		// validate the span instead of requiring a range with exactly this identity.
+		std::vector<VirtualRanges::Range> reserved_spans;
+		if (!g_virtual_ranges->QuerySpan(out_vaddr, len, &reserved_spans) ||
+		    reserved_spans.empty() ||
+		    std::any_of(reserved_spans.begin(), reserved_spans.end(), [](const auto& range) {
+			    return range.type != VirtualRangeType::Reserved;
+		    })) {
 			return KERNEL_ERROR_EBUSY;
 		}
 		if (!g_virtual_ranges->ReplaceSpan(out_vaddr, len, VirtualRangeType::Reserved, 0, 0, 0,
-		                                   VirtualRangeType::PoolReserved, reserved_range.name)) {
+		                                   VirtualRangeType::PoolReserved,
+		                                   reserved_spans.front().name)) {
 			return KERNEL_ERROR_EBUSY;
 		}
 		*addr_out = out_addr;

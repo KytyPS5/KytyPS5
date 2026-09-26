@@ -428,10 +428,47 @@ void TestConcurrentDelete() {
 	}
 }
 
+void TestLevelUserEventReportedOncePerWait() {
+	EventQueue::KernelEqueue queue = EventQueue::KERNEL_EQUEUE_INVALID;
+	Check(EventQueue::KernelCreateEqueue(&queue, "level-user-event") == OK,
+	      "create level user event queue");
+	Check(EventQueue::KernelAddUserEvent(queue, 5) == OK, "add level user event");
+	Check(EventQueue::KernelAddUserEventEdge(queue, 6) == OK, "add edge user event");
+	Check(EventQueue::KernelTriggerUserEvent(queue, 5, reinterpret_cast<void*>(0x55)) == OK,
+	      "trigger level user event");
+	Check(EventQueue::KernelTriggerUserEvent(queue, 6, reinterpret_cast<void*>(0x66)) == OK,
+	      "trigger edge user event");
+
+	EventQueue::KernelEvent         events[8] {};
+	int                             out     = 0;
+	Libs::LibKernel::KernelUseconds timeout = 0;
+	Check(EventQueue::KernelWaitEqueue(queue, events, 8, &out, &timeout) == OK,
+	      "poll triggered user events");
+	Check(out == 2, "each triggered user event is reported once per wait");
+	Check(events[0].ident == 5 && events[0].filter == EventQueue::KERNEL_EVFILT_USER &&
+	          events[0].udata == reinterpret_cast<void*>(0x55),
+	      "level user event payload");
+	Check(events[1].ident == 6 && events[1].filter == EventQueue::KERNEL_EVFILT_USER &&
+	          events[1].udata == reinterpret_cast<void*>(0x66),
+	      "edge user event payload");
+	Check(events[2].ident == 0 && events[2].filter == 0 && events[2].udata == nullptr,
+	      "level user event is not duplicated into the remaining slots");
+
+	Check(EventQueue::KernelWaitEqueue(queue, events, 8, &out, &timeout) == OK && out == 1 &&
+	          events[0].ident == 5,
+	      "level user event stays triggered while the edge event is cleared");
+	Check(EventQueue::KernelDeleteUserEvent(queue, 5) == OK, "delete level user event");
+	Check(EventQueue::KernelWaitEqueue(queue, events, 8, &out, &timeout) ==
+	          Libs::LibKernel::KERNEL_ERROR_ETIMEDOUT,
+	      "nothing remains triggered after deleting the level user event");
+	Check(EventQueue::KernelDeleteEqueue(queue) == OK, "delete level user event queue");
+}
+
 } // namespace
 
 int main() {
 	TestDuplicateAddPreservesEventState();
+	TestLevelUserEventReportedOncePerWait();
 	TestCallbackStateOutlivesPort();
 	TestCallbackOwnsPayload();
 	TestPinnedClose();

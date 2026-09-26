@@ -432,11 +432,13 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 		case 0: rw_mode = Common::File::Mode::Read; break;
 		case 1: rw_mode = Common::File::Mode::Write; break;
 		case 2: rw_mode = Common::File::Mode::ReadWrite; break;
-		default: EXIT("invalid flag_u: %u\n", flags_u);
+		default: return KERNEL_ERROR_EINVAL;
 	}
 
-	EXIT_NOT_IMPLEMENTED(directory && rw_mode != Common::File::Mode::Read);
-	EXIT_NOT_IMPLEMENTED(directory && (trunc || creat));
+	// Directories can only be opened read-only, and never created or truncated.
+	if (directory && (rw_mode != Common::File::Mode::Read || trunc || creat)) {
+		return KERNEL_ERROR_EISDIR;
+	}
 
 	int   descriptor = g_files->CreateDescriptor();
 	auto* file       = g_files->GetFile(descriptor);
@@ -482,8 +484,10 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 			return KERNEL_ERROR_ENOTDIR;
 		}
 
-		EXIT_NOT_IMPLEMENTED(!directory && rw_mode != Common::File::Mode::Read);
-		EXIT_NOT_IMPLEMENTED(!directory && (trunc || creat));
+		if (rw_mode != Common::File::Mode::Read || trunc || creat) {
+			g_files->DeleteDescriptor(descriptor);
+			return KERNEL_ERROR_EISDIR;
+		}
 
 		const auto entries = Common::File::GetDirEntries(file->real_name);
 		file->dirents      = PackDirents(entries);
@@ -1243,6 +1247,12 @@ int KYTY_SYSV_ABI KernelUnlink(const char* path) {
 	return OK;
 }
 
+static bool IsDirectoryEmpty(const std::filesystem::path& path) {
+	const auto entries = Common::File::GetDirEntries(path);
+	return std::none_of(entries.begin(), entries.end(),
+	                    [](const auto& entry) { return entry.name != "." && entry.name != ".."; });
+}
+
 int KYTY_SYSV_ABI KernelRename(const char* from, const char* to) {
 	PRINT_NAME();
 
@@ -1255,14 +1265,38 @@ int KYTY_SYSV_ABI KernelRename(const char* from, const char* to) {
 	auto real_from = g_mount_points->ResolvePath(from_path);
 	auto real_to   = g_mount_points->ResolvePath(to_path);
 
-	if (!Common::File::IsFileExisting(real_from)) {
+	const bool from_is_dir  = Common::File::IsDirectoryExisting(real_from);
+	const bool from_is_file = Common::File::IsFileExisting(real_from);
+
+	if (!from_is_dir && !from_is_file) {
 		return KERNEL_ERROR_ENOENT;
 	}
 
 	Common::File::CreateDirectories(real_to.parent_path());
 
-	if (Common::File::IsFileExisting(real_to)) {
-		Common::File::DeleteFile(real_to);
+	const bool to_is_dir  = Common::File::IsDirectoryExisting(real_to);
+	const bool to_is_file = Common::File::IsFileExisting(real_to);
+
+	if (from_is_dir) {
+		if (to_is_file) {
+			return KERNEL_ERROR_ENOTDIR;
+		}
+		if (to_is_dir) {
+			// A directory may only replace an empty directory.
+			if (!IsDirectoryEmpty(real_to)) {
+				return KERNEL_ERROR_ENOTEMPTY;
+			}
+			if (!Common::File::DeleteDirectory(real_to)) {
+				return KERNEL_ERROR_EIO;
+			}
+		}
+	} else {
+		if (to_is_dir) {
+			return KERNEL_ERROR_EISDIR;
+		}
+		if (to_is_file) {
+			Common::File::DeleteFile(real_to);
+		}
 	}
 
 	if (!Common::File::RenameFile(real_from, real_to)) {

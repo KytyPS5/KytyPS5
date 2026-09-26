@@ -121,6 +121,9 @@ int KernelEqueuePrivate::GetTriggeredEvents(KernelEvent* ev, int num) {
 				event.event = event.pending_events.front();
 				event.pending_events.pop_front();
 				event.triggered = true;
+			} else {
+				// A level-triggered event stays triggered; report it once per call.
+				break;
 			}
 
 			if (ret >= num) {

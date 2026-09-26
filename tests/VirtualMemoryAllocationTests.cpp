@@ -2592,6 +2592,36 @@ void TestMemoryPoolCommitDecommitQueryFlags() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestMemoryPoolReserveAdjacentToPlainReservation() {
+	const char*        test = "MemoryPoolReserveAdjacentToPlainReservation";
+	constexpr uint64_t len  = SceKernelMemoryPoolReserveLen;
+
+	void* plain = reinterpret_cast<void*>(0x1000000000ull);
+	CheckOk(test, Libs::LibKernel::Memory::KernelReserveVirtualRange(&plain, len, 0, len),
+	        "KernelReserveVirtualRange(plain)");
+	const auto base = reinterpret_cast<uint64_t>(plain);
+	ExpectRange(test, Query(test, base), base, base + len, 0, 0, 0, 0, 0);
+
+	// Pool-reserve the range immediately after the plain reservation. Both start out as
+	// "anon" reservations, so the range bookkeeping merges them into one span before the
+	// pool reservation is retyped.
+	void* pool = reinterpret_cast<void*>(base + len);
+	CheckOk(test, Libs::LibKernel::Memory::KernelMemoryPoolReserve(pool, len, 0, 0, &pool),
+	        "KernelMemoryPoolReserve(adjacent)");
+	const auto pool_base = reinterpret_cast<uint64_t>(pool);
+	Check(test, pool_base == base + len,
+	      "pool reservation did not land immediately after the plain reservation");
+
+	ExpectRange(test, Query(test, pool_base), pool_base, pool_base + len, 0, 0, 0, 1, 0);
+	ExpectRange(test, Query(test, base), base, base + len, 0, 0, 0, 0, 0);
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(pool_base, len),
+	        "KernelMunmap(pool reserve)");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, len), "KernelMunmap(plain reserve)");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestProgramMemoryAllocationAndProtection() {
 	const char* test = "ProgramMemoryAllocationAndProtection";
 	const auto  size = SceKernelPageSize * 3;
@@ -3160,6 +3190,7 @@ int main(int argc, char** argv) {
 	RunTest(TestFragmentedMemoryPoolBacking);
 	RunTest(TestMemoryPoolMultiRangeDecommit);
 	RunTest(TestMemoryPoolCommitDecommitQueryFlags);
+	RunTest(TestMemoryPoolReserveAdjacentToPlainReservation);
 	RunTest(TestProgramMemoryAllocationAndProtection);
 	RunTest(TestModuleRelocationUsesWritableHostMapping);
 

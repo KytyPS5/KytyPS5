@@ -39,11 +39,10 @@ public:
 	}
 
 private:
-	enum class Status { Set, Canceled, Deleted };
-
 	Common::Mutex   m_mutex;
 	Common::CondVar m_cond_var;
-	Status          m_status          = Status::Set;
+	uint64_t        m_cancel_epoch    = 0;
+	bool            m_deleted         = false;
 	int             m_waiting_threads = 0;
 	std::string     m_name;
 	bool            m_single_thread = false;
@@ -81,13 +80,7 @@ EventFlagWaitMode DecodeEventFlagWaitMode(uint32_t wait_mode) {
 KernelEventFlagPrivate::~KernelEventFlagPrivate() {
 	Common::LockGuard lock(m_mutex);
 
-	while (m_status != Status::Set) {
-		m_mutex.Unlock();
-		Common::Thread::SleepMicro(10);
-		m_mutex.Lock();
-	}
-
-	m_status = Status::Deleted;
+	m_deleted = true;
 
 	m_cond_var.SignalAll();
 
@@ -126,6 +119,14 @@ KernelEventFlagPrivate::Result KernelEventFlagPrivate::Wait(uint64_t bits, WaitM
 
 	while (!((wait_mode == WaitMode::And && (m_bits & bits) == bits) ||
 	         (wait_mode == WaitMode::Or && (m_bits & bits) != 0))) {
+		if (m_deleted) {
+			if (result != nullptr) {
+				*result = m_bits;
+			}
+			update_timeout();
+			return Result::Deleted;
+		}
+
 		if ((elapsed >= micros && !infinitely)) {
 			if (result != nullptr) {
 				*result = m_bits;
@@ -133,6 +134,8 @@ KernelEventFlagPrivate::Result KernelEventFlagPrivate::Wait(uint64_t bits, WaitM
 			update_timeout();
 			return Result::TimedOut;
 		}
+
+		const auto cancel_epoch = m_cancel_epoch;
 
 		m_waiting_threads++;
 
@@ -146,20 +149,20 @@ KernelEventFlagPrivate::Result KernelEventFlagPrivate::Wait(uint64_t bits, WaitM
 
 		elapsed = static_cast<uint32_t>(t.GetTimeS() * 1000000.0);
 
-		switch (m_status) {
-			case Status::Canceled:
-				if (result != nullptr) {
-					*result = m_bits;
-				}
-				update_timeout();
-				return Result::Canceled;
-			case Status::Deleted:
-				if (result != nullptr) {
-					*result = m_bits;
-				}
-				update_timeout();
-				return Result::Deleted;
-			case Status::Set: break;
+		if (m_deleted) {
+			if (result != nullptr) {
+				*result = m_bits;
+			}
+			update_timeout();
+			return Result::Deleted;
+		}
+
+		if (m_cancel_epoch != cancel_epoch) {
+			if (result != nullptr) {
+				*result = m_bits;
+			}
+			update_timeout();
+			return Result::Canceled;
 		}
 	}
 
@@ -180,13 +183,7 @@ KernelEventFlagPrivate::Result KernelEventFlagPrivate::Wait(uint64_t bits, WaitM
 void KernelEventFlagPrivate::Set(uint64_t bits) {
 	Common::LockGuard lock(m_mutex);
 
-	EXIT_NOT_IMPLEMENTED(m_status == Status::Deleted);
-
-	while (m_status != Status::Set) {
-		m_mutex.Unlock();
-		Common::Thread::SleepMicro(10);
-		m_mutex.Lock();
-	}
+	EXIT_NOT_IMPLEMENTED(m_deleted);
 
 	m_bits |= bits;
 
@@ -196,13 +193,7 @@ void KernelEventFlagPrivate::Set(uint64_t bits) {
 void KernelEventFlagPrivate::Clear(uint64_t bits) {
 	Common::LockGuard lock(m_mutex);
 
-	EXIT_NOT_IMPLEMENTED(m_status == Status::Deleted);
-
-	while (m_status != Status::Set) {
-		m_mutex.Unlock();
-		Common::Thread::SleepMicro(10);
-		m_mutex.Lock();
-	}
+	EXIT_NOT_IMPLEMENTED(m_deleted);
 
 	m_bits &= bits;
 }
@@ -210,30 +201,20 @@ void KernelEventFlagPrivate::Clear(uint64_t bits) {
 void KernelEventFlagPrivate::Cancel(uint64_t bits, int* num_waiting_threads) {
 	Common::LockGuard lock(m_mutex);
 
-	EXIT_NOT_IMPLEMENTED(m_status == Status::Deleted);
-
-	while (m_status != Status::Set) {
-		m_mutex.Unlock();
-		Common::Thread::SleepMicro(10);
-		m_mutex.Lock();
-	}
+	EXIT_NOT_IMPLEMENTED(m_deleted);
 
 	if (num_waiting_threads != nullptr) {
 		*num_waiting_threads = m_waiting_threads;
 	}
 
-	m_status = Status::Canceled;
-	m_bits   = bits;
+	m_bits = bits;
+
+	// Every thread blocked in Wait() observes the epoch change and returns Canceled, so
+	// there is nothing to wait for here. Spinning on m_waiting_threads would deadlock
+	// against a waiter that re-enters Wait() before the cancel is observed.
+	m_cancel_epoch++;
 
 	m_cond_var.SignalAll();
-
-	while (m_waiting_threads > 0) {
-		m_mutex.Unlock();
-		Common::Thread::SleepMicro(10);
-		m_mutex.Lock();
-	}
-
-	m_status = Status::Set;
 }
 
 int KYTY_SYSV_ABI KernelCreateEventFlag(KernelEventFlag* ef, const char* name, uint32_t attr,

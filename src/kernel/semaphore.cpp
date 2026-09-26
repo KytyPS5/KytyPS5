@@ -137,7 +137,7 @@ KernelSemaPrivate::Result KernelSemaPrivate::Signal(int signal_count) {
 		return Result::Deleted;
 	}
 
-	if (m_count + signal_count > m_max_count) {
+	if (signal_count <= 0 || signal_count > m_max_count - m_count) {
 		return Result::InvalCount;
 	}
 

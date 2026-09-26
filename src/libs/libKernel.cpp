@@ -2114,22 +2114,76 @@ int KYTY_SYSV_ABI KernelSyncOnAddressWake(volatile void* address, int32_t count)
 	return LibKernel::SyncOnAddress::Wake(address, count);
 }
 
+// FreeBSD _umtx_op(UMTX_OP_WAIT): uaddr carries the size of the structure that uaddr2
+// (timeout) points at, either a plain timespec or a struct _umtx_time.
+struct UmtxTime {
+	LibKernel::KernelTimespec timeout;
+	uint32_t                  flags;
+	uint32_t                  clockid;
+};
+
+static_assert(sizeof(UmtxTime) == 24, "struct _umtx_time layout drifted");
+
+static LibKernel::KernelClockid UmtxWaitClock(uint32_t clockid) {
+	// The monotonic family (CLOCK_MONOTONIC, CLOCK_UPTIME* and CLOCK_MONOTONIC_*) is read as
+	// CLOCK_MONOTONIC; everything else, including unknown ids, is treated as CLOCK_REALTIME.
+	switch (clockid) {
+		case 4:
+		case 5:
+		case 7:
+		case 8:
+		case 11:
+		case 12: return 4;
+		default: return 0;
+	}
+}
+
 int KYTY_SYSV_ABI UmtxOp(volatile void* address, int operation, uint64_t value,
                            void* uaddr, const void* timeout) {
-	constexpr int UMTX_OP_WAIT = 2;
-	constexpr int UMTX_OP_WAKE = 3;
-
-	EXIT_NOT_IMPLEMENTED(uaddr != nullptr);
+	constexpr int      UMTX_OP_WAIT = 2;
+	constexpr int      UMTX_OP_WAKE = 3;
+	constexpr uint32_t UMTX_ABSTIME = 0x01;
 
 	switch (operation) {
 		case UMTX_OP_WAIT:
 			if (timeout != nullptr) {
-				LibKernel::KernelTimespec duration {};
-				std::memcpy(&duration, timeout, sizeof(duration));
+				const auto timeout_size = reinterpret_cast<uintptr_t>(uaddr);
+				if (timeout_size != sizeof(LibKernel::KernelTimespec) &&
+				    timeout_size != sizeof(UmtxTime)) {
+					*GetErrorAddr() = POSIX_EINVAL;
+					return -1;
+				}
+
+				UmtxTime umtx_time {};
+				std::memcpy(&umtx_time, timeout, timeout_size);
+
+				LibKernel::KernelTimespec duration = umtx_time.timeout;
 				if (duration.tv_sec < 0 || duration.tv_nsec < 0 || duration.tv_nsec >= 1000000000) {
 					*GetErrorAddr() = POSIX_EINVAL;
 					return -1;
 				}
+
+				if (timeout_size == sizeof(UmtxTime) && (umtx_time.flags & UMTX_ABSTIME) != 0) {
+					// Convert the absolute deadline into a relative timeout; an already
+					// expired deadline becomes an immediate poll.
+					LibKernel::KernelTimespec now {};
+					if (LibKernel::KernelClockGettime(UmtxWaitClock(umtx_time.clockid), &now) !=
+					    OK) {
+						*GetErrorAddr() = POSIX_EINVAL;
+						return -1;
+					}
+					duration.tv_sec -= now.tv_sec;
+					duration.tv_nsec -= now.tv_nsec;
+					if (duration.tv_nsec < 0) {
+						duration.tv_sec--;
+						duration.tv_nsec += 1000000000;
+					}
+					if (duration.tv_sec < 0) {
+						duration.tv_sec  = 0;
+						duration.tv_nsec = 0;
+					}
+				}
+
 				const auto max_ns = std::chrono::nanoseconds::max().count();
 				const auto timeout_ns = duration.tv_sec > (max_ns - duration.tv_nsec) / 1000000000
 				                            ? max_ns

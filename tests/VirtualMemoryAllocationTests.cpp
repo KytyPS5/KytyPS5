@@ -9,6 +9,8 @@
 #include "libs/errno.h"
 #include "loader/redZonePatcher.h"
 #include "loader/runtimeLinker.h"
+
+#include "loader/x64InstructionDecoder.h"
 #include "loader/systemContent.h"
 #include "loader/x64InstructionEmulator.h"
 
@@ -2646,6 +2648,137 @@ void TestModuleRelocationUsesWritableHostMapping() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+// Decode a short guest instruction and return the result, for the cases below.
+static Loader::GuestFaultingInstruction DecodeGuest(const std::vector<uint8_t>& code,
+                                                    const Loader::GuestX64Registers& registers) {
+	return Loader::DecodeGuestFaultingInstruction(code.data(), code.size(), registers);
+}
+
+// A text comparison that reports both sides, so a mismatch says what it actually produced
+// instead of only that it did not match.
+static bool TextIs(const char* test, const Loader::GuestFaultingInstruction& decoded,
+                   const char* expected) {
+	if (decoded.decoded && std::strcmp(decoded.text, expected) == 0) {
+		return true;
+	}
+	std::printf("          text mismatch: expected \"%s\", got \"%s\" (decoded=%d len=%u)\n",
+	            expected, decoded.text, static_cast<int>(decoded.decoded), decoded.length);
+	Check(test, false, "decoded instruction text did not match");
+	return false;
+}
+
+void TestGuestFaultInstructionDecoding() {
+	const char* test = "GuestFaultInstructionDecoding";
+
+	// A base-register load is the case #835 hit: a read of 0xffffffffffffffff out of a register
+	// that was itself zero. The point of the feature is that the report shows the resolved
+	// address, not just "[rbx-0x1]".
+	{
+		Loader::GuestX64Registers registers {};
+		registers.rip = 0x9000006a1ull;
+		registers.rbx = 0;
+		// mov rbx, qword ptr [rbx - 0x1]
+		const auto decoded = DecodeGuest({0x48, 0x8b, 0x5b, 0xff}, registers);
+		TextIs(test, decoded, "mov rbx, qword ptr [0xffffffffffffffff]");
+		Check(test, decoded.length == 4 && decoded.reads_memory && !decoded.writes_memory &&
+		                  decoded.effective_address == 0xffffffffffffffffull,
+	      "base-register load reported the wrong length, direction or address");
+	}
+
+	// RIP-relative loads anchor past the end of the instruction, so the length matters.
+	{
+		Loader::GuestX64Registers registers {};
+		registers.rip = 0x900000000ull;
+		// mov rax, qword ptr [rip + 0x10]
+		const auto decoded = DecodeGuest({0x48, 0x8b, 0x05, 0x10, 0x00, 0x00, 0x00}, registers);
+		Check(test, decoded.decoded && decoded.reads_memory &&
+		                  decoded.effective_address == 0x900000017ull,
+	      "rip-relative load did not anchor past the end of the instruction");
+	}
+
+	// SIB addressing: base + index * scale + displacement.
+	{
+		Loader::GuestX64Registers registers {};
+		registers.rbx = 0x1000;
+		registers.rcx = 0x10;
+		// mov rax, qword ptr [rbx + rcx*4 + 0x8]
+		const auto decoded = DecodeGuest({0x48, 0x8b, 0x44, 0x8b, 0x08}, registers);
+		Check(test, decoded.decoded && decoded.reads_memory &&
+		                  decoded.effective_address == 0x1048ull,
+	      "sib load did not apply base, scale and displacement");
+	}
+
+	// LEA names an address without reading it, so it must not be reported as the memory access
+	// that faulted.
+	{
+		Loader::GuestX64Registers registers {};
+		registers.rbx = 0x2000;
+		// lea rax, [rbx + 0x10]
+		const auto decoded = DecodeGuest({0x48, 0x8d, 0x43, 0x10}, registers);
+		TextIs(test, decoded, "lea rax, qword ptr [0x0000000000002010]");
+		Check(test, !decoded.reads_memory && !decoded.writes_memory,
+	      "lea was reported as a memory access");
+	}
+
+	// A register-only instruction has no memory operand at all.
+	{
+		Loader::GuestX64Registers registers {};
+		registers.rax = 1;
+		registers.rbx = 2;
+		// add rax, rbx
+		const auto decoded = DecodeGuest({0x48, 0x01, 0xd8}, registers);
+		TextIs(test, decoded, "add rax, rbx");
+		Check(test, !decoded.reads_memory && !decoded.writes_memory,
+	      "register-only instruction claimed a memory access");
+	}
+
+	// A store is a write, and #835's pc decodes to this instruction, so it also pins the
+	// behaviour for a guest trap: decoded, named, and with no memory access to report.
+	{
+		Loader::GuestX64Registers registers {};
+		registers.rcx = 0x10;
+		// mov qword ptr [rcx], rax
+		const auto store = DecodeGuest({0x48, 0x89, 0x01}, registers);
+		Check(test, store.writes_memory && !store.reads_memory &&
+		                  store.effective_address == 0x10ull,
+	      "store was not reported as a write at its resolved address");
+		// int 0x41
+		const auto trap = DecodeGuest({0xcd, 0x41}, registers);
+		Check(test, trap.decoded && trap.length == 2,
+	      "int 0x41 did not decode");
+		Check(test, !trap.reads_memory && !trap.writes_memory,
+	      "int 0x41 was reported as a memory access");
+	}
+
+	// A relative call resolves to an absolute target, which is worth having in a crash report.
+	{
+		Loader::GuestX64Registers registers {};
+		registers.rip = 0x1000;
+		// call rel32 +0x10, 5 bytes long, so the target is rip + 5 + 0x10
+		const auto decoded = DecodeGuest({0xe8, 0x10, 0x00, 0x00, 0x00}, registers);
+		TextIs(test, decoded, "call 0x0000000000001015");
+		Check(test, !decoded.reads_memory && !decoded.writes_memory,
+		      "relative call claimed a memory access");
+	}
+
+	// Truncated or absent input must be reported, not guessed at, and must not read past the
+	// buffer it was handed.
+	{
+		Loader::GuestX64Registers registers {};
+		const auto empty  = DecodeGuest({}, registers);
+		const auto nullp  = Loader::DecodeGuestFaultingInstruction(nullptr, 16, registers);
+		// mov rax, qword ptr [rip + 0x10] cut short after the opcode and modrm
+		const auto shorty = DecodeGuest({0x48, 0x8b, 0x05}, registers);
+		Check(test, !empty.decoded && !nullp.decoded && !shorty.decoded,
+	      "undecodable input was reported as a decoded instruction");
+		Check(test, std::strstr(empty.text, "no readable") != nullptr &&
+		                  std::strstr(nullp.text, "no readable") != nullptr,
+	      "absent input did not say so");
+	}
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestGuestFaultFrameAttribution() {
 	const char* test = "GuestFaultFrameAttribution";
 
@@ -3193,6 +3326,7 @@ int main(int argc, char** argv) {
 	RunTest(TestProgramMemoryAllocationAndProtection);
 	RunTest(TestModuleRelocationUsesWritableHostMapping);
 	RunTest(TestGuestFaultFrameAttribution);
+	RunTest(TestGuestFaultInstructionDecoding);
 
 	if (g_failed_tests != 0) {
 		std::printf("VirtualMemoryAllocationTests: %d case(s) failed\n", g_failed_tests);

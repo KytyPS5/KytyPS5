@@ -365,15 +365,25 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 		usage.usage &= ~vk::ImageUsageFlagBits::eStorage;
 	}
 	vk::ImageViewMinLodCreateInfoEXT min_lod {};
+	uint32_t                         base_level  = normalized.base_level;
+	uint32_t                         level_count = normalized.level_count;
 	if (normalized.min_lod != 0 && m_graphics.image_view_min_lod_enabled) {
 		min_lod.minLod = static_cast<float>(normalized.base_level) +
 		                 static_cast<float>(normalized.min_lod) / 256.0f;
 		usage.pNext    = &min_lod;
 	} else if (normalized.min_lod != 0) {
+		// Without VK_EXT_image_view_min_lod the whole levels of the clamp are folded into the
+		// view base instead: a computed LOD below the clamp then lands on the clamped level, as
+		// it would with the extension (which may floor the clamp too), and streamed textures
+		// never sample below their resident mips. Explicit levels above the clamp shift by the
+		// same amount, which the extension would not do.
+		const auto skipped = std::min(normalized.min_lod / 256u, level_count - 1u);
+		base_level += skipped;
+		level_count -= skipped;
 		static std::atomic_bool warned = false;
 		if (!warned.exchange(true, std::memory_order_relaxed)) {
-			LOGF("Image view minimum LOD clamps are ignored: the device lacks "
-			     "VK_EXT_image_view_min_lod\n");
+			LOGF("Image view minimum LOD clamps are approximated by rebasing the view: the "
+			     "device lacks VK_EXT_image_view_min_lod\n");
 		}
 	}
 	vk::ImageViewCreateInfo create {};
@@ -383,8 +393,8 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 	create.format                          = normalized.format;
 	create.components                      = normalized.mapping;
 	create.subresourceRange.aspectMask     = normalized.aspect;
-	create.subresourceRange.baseMipLevel   = normalized.base_level;
-	create.subresourceRange.levelCount     = normalized.level_count;
+	create.subresourceRange.baseMipLevel   = base_level;
+	create.subresourceRange.levelCount     = level_count;
 	create.subresourceRange.baseArrayLayer = normalized.base_layer;
 	create.subresourceRange.layerCount     = normalized.layer_count;
 

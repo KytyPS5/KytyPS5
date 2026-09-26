@@ -3,18 +3,20 @@
 layout(constant_id = 0) const uint ELEMENT_BYTES = 4u;
 layout(constant_id = 1) const uint TILE = 0u;
 const uint BLOCK_BYTES = 65536u;
+#include "gpu_tiler_element.inc"
 #include "gpu_tiler_standard64.inc"
 uvec3 block_extent() {
 	uint width = ELEMENT_BYTES <= 2 ? 256u : (ELEMENT_BYTES <= 8 ? 128u : 64u);
 	return uvec3(width, BLOCK_BYTES / (width * ELEMENT_BYTES), 1u);
 }
 uint block_offset(uvec3 p) {
-	uvec4 s = ELEMENT_BYTES == 1 ? uvec4(7, 7, 6, 6) :
-	          ELEMENT_BYTES == 2 ? uvec4(7, 6, 6, 5) :
-	          ELEMENT_BYTES == 4 ? uvec4(6, 6, 5, 5) :
-	          ELEMENT_BYTES == 8 ? uvec4(6, 5, 5, 4) : uvec4(5, 5, 4, 4);
-	uint delta = (((p.x >> s.x) & 1u) << 8) ^ (((p.y >> s.y) & 1u) << 9) ^
-	             (((p.x >> s.z) & 1u) << 10) ^ (((p.y >> s.w) & 1u) << 11);
+	// Source bit of x/y/x/y for offset bits 8..11, per element size 1, 2, 4, 8, 16.
+	uint s0 = element_select(7, 7, 6, 6, 5);
+	uint s1 = element_select(7, 6, 6, 5, 5);
+	uint s2 = element_select(6, 6, 5, 5, 4);
+	uint s3 = element_select(6, 5, 5, 4, 4);
+	uint delta = (((p.x >> s0) & 1u) << 8) ^ (((p.y >> s1) & 1u) << 9) ^
+	             (((p.x >> s2) & 1u) << 10) ^ (((p.y >> s3) & 1u) << 11);
 	return standard64_offset(p.xy) ^ delta;
 }
 #include "gpu_tiler_common.inc"

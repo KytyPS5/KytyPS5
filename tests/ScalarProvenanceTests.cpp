@@ -511,6 +511,128 @@ void TestOptimizationPipeline() {
         "elimination regressed");
 }
 
+// Translator::ThreadBit lowers ReadMask into ((word >> (lane & 31)) & 1) != 0.
+// A uniform all-ones or zero word makes that test lane-independent.
+Value EmitThreadBit(Fixture &fixture, Value word, Value shift,
+                    Value bit_mask = Value(1u), bool commuted = false) {
+  const auto shifted =
+      fixture.Emit(ValueOpcode::ShiftRightLogical32, {word, shift});
+  const auto bit =
+      commuted ? fixture.Emit(ValueOpcode::BitwiseAnd32, {bit_mask, shifted})
+               : fixture.Emit(ValueOpcode::BitwiseAnd32, {shifted, bit_mask});
+  const auto test = fixture.Emit(ValueOpcode::INotEqual32, {bit, Value(0u)});
+  fixture.Emit(ValueOpcode::Reference, {test});
+  return test;
+}
+
+Value EmitBoundedLaneShift(Fixture &fixture, bool commuted = false) {
+  const auto lane = fixture.Emit(ValueOpcode::LaneId);
+  return commuted ? fixture.Emit(ValueOpcode::BitwiseAnd32, {Value(31u), lane})
+                  : fixture.Emit(ValueOpcode::BitwiseAnd32, {lane, Value(31u)});
+}
+
+// Dead-code elimination frees folded instructions, so only read the surviving
+// Reference root rather than a Value that may have been destroyed.
+Value ReferencedBitTest(const Block &block) {
+  for (const auto &instruction : block.Instructions()) {
+    if (instruction.GetOpcode() == ValueOpcode::Reference) {
+      return instruction.Arg(0).Resolve();
+    }
+  }
+  throw std::runtime_error("thread-bit fixture lost its Reference root");
+}
+
+bool ContainsLaneId(const Block &block) {
+  for (const auto &instruction : block.Instructions()) {
+    if (instruction.GetOpcode() == ValueOpcode::LaneId) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void TestThreadBitConstantLaneMask() {
+  {
+    Fixture fixture;
+    EmitThreadBit(fixture, Value(0xffffffffu), EmitBoundedLaneShift(fixture));
+    ConstantPropagationPass(fixture.program.blocks);
+    RemoveIdentities(fixture.program.blocks);
+    EliminateDeadCode(fixture.program.blocks);
+    Check(ReferencedBitTest(fixture.BlockAt()) == Value(true) &&
+              !ContainsLaneId(fixture.BlockAt()),
+          "all-ones lane mask bit test was not folded to true, or its lane "
+          "arithmetic survived dead-code elimination");
+  }
+  {
+    Fixture fixture;
+    EmitThreadBit(fixture, Value(0u), EmitBoundedLaneShift(fixture));
+    ConstantPropagationPass(fixture.program.blocks);
+    RemoveIdentities(fixture.program.blocks);
+    EliminateDeadCode(fixture.program.blocks);
+    Check(ReferencedBitTest(fixture.BlockAt()) == Value(false) &&
+              !ContainsLaneId(fixture.BlockAt()),
+          "zero lane mask bit test was not folded to false, or its lane "
+          "arithmetic survived dead-code elimination");
+  }
+  {
+    Fixture fixture;
+    EmitThreadBit(fixture, Value(0xffffffffu), EmitBoundedLaneShift(fixture, true), Value(1u), true);
+    ConstantPropagationPass(fixture.program.blocks);
+    RemoveIdentities(fixture.program.blocks);
+    EliminateDeadCode(fixture.program.blocks);
+    Check(ReferencedBitTest(fixture.BlockAt()) == Value(true) &&
+              !ContainsLaneId(fixture.BlockAt()),
+          "all-ones lane mask bit test with commuted and operands was not "
+          "folded to true, or its lane arithmetic survived dead-code "
+          "elimination");
+  }
+  {
+    Fixture fixture;
+    EmitThreadBit(fixture, Value(0x0f0f0f0fu), EmitBoundedLaneShift(fixture));
+    ConstantPropagationPass(fixture.program.blocks);
+    RemoveIdentities(fixture.program.blocks);
+    EliminateDeadCode(fixture.program.blocks);
+    Check(!ReferencedBitTest(fixture.BlockAt()).IsImmediate() &&
+              ContainsLaneId(fixture.BlockAt()),
+          "mixed lane mask bit test was folded instead of staying per-lane");
+  }
+  {
+    Fixture fixture;
+    const auto runtime = fixture.Emit(ValueOpcode::GetUserData,
+                                      {Value(static_cast<ScalarReg>(2))});
+    EmitThreadBit(fixture, runtime, EmitBoundedLaneShift(fixture));
+    ConstantPropagationPass(fixture.program.blocks);
+    RemoveIdentities(fixture.program.blocks);
+    EliminateDeadCode(fixture.program.blocks);
+    Check(!ReferencedBitTest(fixture.BlockAt()).IsImmediate() &&
+              ContainsLaneId(fixture.BlockAt()),
+          "dynamic lane mask bit test was folded instead of staying per-lane");
+  }
+  {
+    Fixture fixture;
+    EmitThreadBit(fixture, Value(0xffffffffu), EmitBoundedLaneShift(fixture),
+                  Value(2u));
+    ConstantPropagationPass(fixture.program.blocks);
+    RemoveIdentities(fixture.program.blocks);
+    EliminateDeadCode(fixture.program.blocks);
+    Check(!ReferencedBitTest(fixture.BlockAt()).IsImmediate() &&
+              ContainsLaneId(fixture.BlockAt()),
+          "all-ones lane mask with a wider output bit was folded instead of "
+          "staying per-lane");
+  }
+  {
+    Fixture fixture;
+    const auto lane = fixture.Emit(ValueOpcode::LaneId);
+    EmitThreadBit(fixture, Value(0xffffffffu), lane);
+    ConstantPropagationPass(fixture.program.blocks);
+    RemoveIdentities(fixture.program.blocks);
+    EliminateDeadCode(fixture.program.blocks);
+    Check(!ReferencedBitTest(fixture.BlockAt()).IsImmediate() &&
+              ContainsLaneId(fixture.BlockAt()),
+          "unbounded lane shift was folded instead of staying per-lane");
+  }
+}
+
 void TestControlFlowValueSurvivesReadLaneFolding() {
   Fixture fixture(3);
   auto *entry = fixture.program.blocks[0];
@@ -595,6 +717,7 @@ int main() {
     TestConstantBufferBounds();
     TestReadLaneElimination();
     TestOptimizationPipeline();
+    TestThreadBitConstantLaneMask();
     TestControlFlowValueSurvivesReadLaneFolding();
     TestUndefinedRuntimeValueFails();
     std::cout << "TypedValuePlanningTests: all cases passed\n";

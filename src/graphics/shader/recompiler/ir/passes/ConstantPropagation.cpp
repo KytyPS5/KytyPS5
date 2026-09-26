@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
+
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
@@ -52,6 +53,44 @@ bool FoldU64Shift(Inst& inst, Function function) {
 	}
 	Replace(inst, Value(static_cast<uint64_t>(function(value.U64(), shift.U32()))));
 	return true;
+}
+
+// True when a U32 shift count is known to be within 0..31, so a shift by it stays in range for
+// a 32 bit word and cannot reach the undefined out of range behaviour of the emitted shift.
+bool IsShiftCountBounded0To31(Value shift) {
+	const auto bounded = [](Value value) {
+		return IsImmediate(value, Type::U32) && value.U32() < 32u;
+	};
+	if (bounded(shift)) {
+		return true;
+	}
+	auto* producer = shift.TryInstruction();
+	return producer != nullptr && producer->GetOpcode() == ValueOpcode::BitwiseAnd32 &&
+	       (bounded(Arg(*producer, 0)) || bounded(Arg(*producer, 1)));
+}
+
+// Folds ((word >> shift) & 1) when the constant word is all zeros or all ones: every bit of such
+// a word is the same, so the tested bit holds for any in range shift and the lane query behind
+// the shift dies with the test. Only the test folds, an all ones word shifted by a dynamic
+// amount is not that word.
+bool FoldU32ShiftedBitTest(Inst& inst) {
+	const auto test = [&inst](Value bit, Value shifted) {
+		if (!IsImmediate(bit, Type::U32) || bit.U32() != 1u) {
+			return false;
+		}
+		auto* producer = shifted.TryInstruction();
+		if (producer == nullptr || producer->GetOpcode() != ValueOpcode::ShiftRightLogical32 ||
+		    !IsShiftCountBounded0To31(Arg(*producer, 1))) {
+			return false;
+		}
+		const auto word = Arg(*producer, 0);
+		if (!IsImmediate(word, Type::U32) || (word.U32() != 0u && word.U32() != UINT32_MAX)) {
+			return false;
+		}
+		Replace(inst, Value(word.U32() == 0u ? 0u : 1u));
+		return true;
+	};
+	return test(Arg(inst, 0), Arg(inst, 1)) || test(Arg(inst, 1), Arg(inst, 0));
 }
 
 template <typename Function>
@@ -195,7 +234,7 @@ bool FoldCompositeExtract(Inst& inst, ValueOpcode construct, size_t components) 
 }
 
 void FoldInstruction(Block& block, Block::iterator instruction,
-                      std::unordered_set<Inst*>& lowered_ancillary) {
+                     std::unordered_set<Inst*>& lowered_ancillary) {
 	auto& inst = *instruction;
 	switch (inst.GetOpcode()) {
 		case ValueOpcode::Phi: FoldPhi(inst); return;
@@ -234,7 +273,7 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			const auto value  = Arg(inst, 0);
 			const auto offset = Arg(inst, 1);
 			const auto count  = Arg(inst, 2);
-			auto* source = value.TryInstruction();
+			auto*      source = value.TryInstruction();
 			if (source != nullptr && source->GetOpcode() == ValueOpcode::ShiftLeftLogical32 &&
 			    IsImmediate(offset, Type::U32) && IsImmediate(count, Type::U32)) {
 				const auto shift = Arg(*source, 1);
@@ -246,16 +285,19 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			}
 			if (source != nullptr && source->GetOpcode() == ValueOpcode::GetBuiltin &&
 			    source->Arg(0) == Value(static_cast<uint32_t>(StageInputKind::PackedAncillary)) &&
-			    IsImmediate(offset, Type::U32) && IsImmediate(count, Type::U32) && count.U32() != 0u) {
+			    IsImmediate(offset, Type::U32) && IsImmediate(count, Type::U32) &&
+			    count.U32() != 0u) {
 				constexpr struct {
 					uint32_t       start;
 					uint32_t       end;
 					StageInputKind kind;
-				} fields[] = {{8u, 12u, StageInputKind::SampleId}, {16u, 27u, StageInputKind::Layer}};
+				} fields[] = {{8u, 12u, StageInputKind::SampleId},
+				              {16u, 27u, StageInputKind::Layer}};
 				for (const auto& field: fields) {
 					if (offset.U32() >= field.start && offset.U32() < field.end &&
 					    count.U32() <= field.end - offset.U32()) {
-						// Preserve extraction and sign extension while exposing only the used field.
+						// Preserve extraction and sign extension while exposing only the used
+						// field.
 						const auto input = block.PrependNewInst(
 						    instruction, ValueOpcode::GetBuiltin,
 						    {Value(static_cast<uint32_t>(field.kind)), Value(0u)});
@@ -475,8 +517,9 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			});
 			return;
 		case ValueOpcode::BitwiseAnd32:
-			if (!FoldU32(inst, [](uint32_t a, uint32_t b) { return a & b; })) {
-				ReplaceBinaryIdentity(inst, Type::U32, 0xffffffffu);
+			if (!FoldU32(inst, [](uint32_t a, uint32_t b) { return a & b; }) &&
+			    !ReplaceBinaryIdentity(inst, Type::U32, 0xffffffffu)) {
+				FoldU32ShiftedBitTest(inst);
 			}
 			return;
 		case ValueOpcode::BitwiseAnd64:

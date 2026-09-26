@@ -4,7 +4,7 @@
 Рабочая ветка — `yotei-windows-bringup` в локальном fork `fxpw/KytyPS5`.
 
 Checkpoint bounded SRT unmapped/coherent reads **26 сентября 2026 года**,
-источник working tree поверх `37584633`:
+источник `84cbbb85` (локально; `git push` на origin таймаутится к github.com:443):
 
 1. Dense bounded scalar snapshots: unmapped rows (`clamp==0`) → zero word;
    mapped-but-dirty still reject. `SnapshotReader` forwards clamp to caller's
@@ -13,11 +13,15 @@ Checkpoint bounded SRT unmapped/coherent reads **26 сентября 2026 год
    (`_Build/logs/bounded-unmapped-{red,green}.*`).
 2. Specialization reads use `TryReadGpuCoherentBacking` (drain GPU-dirty
    buffer bytes on GPU thread; texture-modified still rejected).
-3. Game `_Build/runs/yotei-integrated-20260926-002157-8def42`
-   (SHA dirty/`37584633`+, frame 299, **shown=122**, flips gpu 123): прежний
-   Materialize fatal `0x5000f37f80` снят. Watchdog: shown 122 не двигался
-   420s; в хвосте лога повторный Emit CS `34e090c623ad611c` /
-   `6cc64dee32dc7094`. Меню/gameplay **PENDING**.
+3. Game `_Build/runs/yotei-integrated-20260926-010013-2cb43e`
+   (SHA `bff21ebc…` / `84cbbb85`-dirty, frame 305, **shown=120**, flips gpu 121,
+   prepared/ready 121): Materialize fatal `0x5000f37f80` снят. Watchdog 600s:
+   shown не двигался. `GpuDispatchSync` после последнего flip продолжает
+   `after-complete` с малым `elapsed_us` — стопор не в Sync-waited
+   `DispatchDirect`. Скорее present/VideoOut (`ready` впереди `shown`).
+   Без Sync+GPUAV lite — `exit -2147483645` (breakpoint) на shown=0.
+4. Меню/gameplay **PENDING**. Следующий фокус: почему Flip/Present не
+   забирает Ready-запрос после ~120.
 
 Checkpoint planning_only SRT zeros + dense budgets **26 сентября 2026 года**,
 источник `1cdc1998` / `37584633`:

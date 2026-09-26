@@ -1,4 +1,6 @@
 #include "common/common.h"
+#include "common/exfatImage.h"
+#include "common/file.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "kernel/fileSystem.h"
@@ -8,6 +10,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <cctype>
 #include <condition_variable>
 #include <cstddef>
@@ -575,11 +578,12 @@ struct ReadyFrame {
 class FileStreamer {
 public:
 	explicit FileStreamer(AvPlayerFileReplacement f): file(f) {}
+	FileStreamer() = default;
 	~FileStreamer() {
 		if (ctx != nullptr) {
 			avio_context_free(&ctx);
 		}
-		if (opened && file.close != nullptr) {
+		if (opened && !host_file && file.close != nullptr) {
 			file.close(file.object_pointer);
 		}
 	}
@@ -593,6 +597,20 @@ public:
 		}
 		opened = true;
 		size   = file.size(file.object_pointer);
+		return InitContext();
+	}
+	bool InitHost(const std::filesystem::path& path) {
+		if (!host_stream.Open(path, Common::File::Mode::Read)) {
+			return false;
+		}
+		host_file = true;
+		size = host_stream.Size();
+		return InitContext();
+	}
+	AVIOContext* Context() const { return ctx; }
+
+private:
+	bool InitContext() {
 		if (size == 0) {
 			return false;
 		}
@@ -603,17 +621,24 @@ public:
 		ctx = avio_alloc_context(buf, 4096, 0, this, Read, nullptr, Seek);
 		return ctx != nullptr;
 	}
-	AVIOContext* Context() const { return ctx; }
-
-private:
 	static int Read(void* opaque, uint8_t* buf, int len) {
 		auto* s = static_cast<FileStreamer*>(opaque);
 		if (s->pos >= s->size) {
 			return AVERROR_EOF;
 		}
 		len = static_cast<int>(std::min<uint64_t>(len, s->size - s->pos));
-		auto r =
-		    s->file.read_offset(s->file.object_pointer, buf, s->pos, static_cast<uint32_t>(len));
+		int r = 0;
+		if (s->host_file) {
+			uint32_t count = 0;
+			if (!s->host_stream.Seek(s->pos)) {
+				return AVERROR(EIO);
+			}
+			s->host_stream.Read(buf, static_cast<uint32_t>(len), &count);
+			r = static_cast<int>(count);
+		} else {
+			r = s->file.read_offset(s->file.object_pointer, buf, s->pos,
+			                         static_cast<uint32_t>(len));
+		}
 		if (r <= 0) {
 			return r == 0 ? AVERROR_EOF : r;
 		}
@@ -638,6 +663,8 @@ private:
 		return p;
 	}
 	AvPlayerFileReplacement file;
+	Common::File            host_stream;
+	bool                    host_file = false;
 	bool                    opened = false;
 	uint64_t                pos    = 0;
 	uint64_t                size   = 0;
@@ -688,11 +715,26 @@ public:
 			}
 		} else {
 			auto real     = LibKernel::FileSystem::GetRealFilename(std::string(path.c_str()));
+			std::shared_ptr<Common::ExfatImage> image;
+			std::string relative;
+			if (Common::ResolveExfatPath(real, &image, &relative)) {
+				streamer = std::make_unique<FileStreamer>();
+				if (!streamer->InitHost(real)) {
+					avformat_free_context(raw);
+					return AVPLAYER_ERROR_OPERATION_FAILED;
+				}
+				raw->pb = streamer->Context();
+				if (auto rc = avformat_open_input(&raw, nullptr, nullptr, nullptr); rc < 0) {
+					LOGF("\t avformat_open_input image failed: %s\n", fferr(rc).c_str());
+					return AVPLAYER_ERROR_OPERATION_FAILED;
+				}
+			} else {
 			auto real_str = Common::PathToString(real);
 			if (auto rc = avformat_open_input(&raw, real_str.c_str(), nullptr, nullptr); rc < 0) {
 				LOGF("\t avformat_open_input failed: %s path=%s\n", fferr(rc).c_str(),
 				     real_str.c_str());
 				return AVPLAYER_ERROR_OPERATION_FAILED;
+			}
 			}
 		}
 		fmt = raw;

@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/exfatImage.h"
 #include "common/platform/sysFileIO.h"
 #include "common/platform/sysTimer.h"
 #include "common/stringUtils.h"
@@ -62,6 +63,9 @@ SysFileTimeStruct DateTimeToFileTimeUtc(const DateTime& date_time) {
 
 struct File::FilePrivate {
 	sys_file_t* f;
+	std::shared_ptr<ExfatImage> image;
+	ExfatImage::Entry entry;
+	uint64_t position = 0;
 };
 
 File::File(): m_p(std::make_unique<FilePrivate>()) {
@@ -85,11 +89,16 @@ File::File(const std::filesystem::path& name, Mode mode): m_p(std::make_unique<F
 }
 
 bool File::IsInvalid() const {
-	return m_p->f == nullptr;
+	return m_p->f == nullptr && m_p->image == nullptr;
 }
 
 bool File::Create(const std::filesystem::path& name) {
-	EXIT_IF(m_p->f != nullptr);
+	EXIT_IF(!IsInvalid());
+	std::shared_ptr<ExfatImage> image;
+	std::string relative;
+	if (ResolveExfatPath(name, &image, &relative)) {
+		return false;
+	}
 
 	m_file_name = name;
 
@@ -104,9 +113,20 @@ bool File::Create(const std::filesystem::path& name) {
 }
 
 bool File::Open(const std::filesystem::path& name, Mode mode) {
-	EXIT_IF(m_p->f != nullptr);
+	EXIT_IF(!IsInvalid());
 
 	m_file_name = name;
+	std::shared_ptr<ExfatImage> image;
+	std::string relative;
+	if (ResolveExfatPath(name, &image, &relative)) {
+		if (mode != Mode::Read || !image->Find(relative, &m_p->entry) || m_p->entry.directory ||
+		    !image->PrepareForRead(&m_p->entry)) {
+			return false;
+		}
+		m_p->image = std::move(image);
+		m_p->position = 0;
+		return true;
+	}
 
 	switch (mode) {
 		case Mode::Read: m_p->f = SysFileOpenR(name); break;
@@ -124,7 +144,7 @@ bool File::Open(const std::filesystem::path& name, Mode mode) {
 }
 
 bool File::OpenInMem(void* buf, uint32_t buf_size) {
-	EXIT_IF(m_p->f != nullptr);
+	EXIT_IF(!IsInvalid());
 
 	m_p->f = SysFileOpen(static_cast<uint8_t*>(buf), buf_size);
 
@@ -137,7 +157,7 @@ bool File::OpenInMem(void* buf, uint32_t buf_size) {
 }
 
 bool File::CreateInMem() {
-	EXIT_IF(m_p->f != nullptr);
+	EXIT_IF(!IsInvalid());
 
 	m_p->f = SysFileCreate();
 
@@ -150,6 +170,8 @@ bool File::CreateInMem() {
 }
 
 void File::Close() {
+	m_p->image.reset();
+	m_p->position = 0;
 	if (m_p->f != nullptr) {
 		SysFileClose(m_p->f);
 		m_p->f = nullptr;
@@ -157,6 +179,9 @@ void File::Close() {
 }
 
 uint64_t File::Size() const {
+	if (m_p->image != nullptr) {
+		return m_p->entry.data_length;
+	}
 	EXIT_IF(m_p->f == nullptr);
 
 	if (m_p->f == nullptr) {
@@ -167,40 +192,70 @@ uint64_t File::Size() const {
 }
 
 uint64_t File::Remaining() const {
-	EXIT_IF(m_p->f == nullptr);
-
-	return Size() - Tell();
+	EXIT_IF(IsInvalid());
+	const auto size = Size();
+	const auto pos  = Tell();
+	return pos < size ? size - pos : 0;
 }
 
 uint64_t File::Size(const std::filesystem::path& name) {
+	std::shared_ptr<ExfatImage> image;
+	std::string relative;
+	if (ResolveExfatPath(name, &image, &relative)) {
+		ExfatImage::Entry entry;
+		return image->Find(relative, &entry) ? entry.data_length : 0;
+	}
 	return SysFileSize(name);
 }
 
 bool File::Seek(uint64_t offset) {
+	if (m_p->image != nullptr) {
+		m_p->position = offset;
+		return true;
+	}
 	EXIT_IF(m_p->f == nullptr);
 
 	return SysFileSeek(*m_p->f, offset);
 }
 
 bool File::Truncate(uint64_t size) {
+	if (m_p->image != nullptr) {
+		return false;
+	}
 	EXIT_IF(m_p->f == nullptr);
 
 	return SysFileTruncate(*m_p->f, size);
 }
 
 bool File::Unlink() {
+	if (m_p->image != nullptr) {
+		return false;
+	}
 	EXIT_IF(m_p->f == nullptr);
 
 	return SysFileUnlink(*m_p->f, m_file_name);
 }
 
 uint64_t File::Tell() const {
+	if (m_p->image != nullptr) {
+		return m_p->position;
+	}
 	EXIT_IF(m_p->f == nullptr);
 
 	return SysFileTell(*m_p->f);
 }
 
 void File::Read(void* data, uint32_t size, uint32_t* bytes_read) {
+	if (m_p->image != nullptr) {
+		uint32_t count = 0;
+		if (m_p->image->Read(m_p->entry, m_p->position, data, size, &count)) {
+			m_p->position += count;
+		}
+		if (bytes_read != nullptr) {
+			*bytes_read = count;
+		}
+		return;
+	}
 	EXIT_IF(m_p->f == nullptr);
 
 	if (m_p->f != nullptr) {
@@ -209,6 +264,12 @@ void File::Read(void* data, uint32_t size, uint32_t* bytes_read) {
 }
 
 void File::Write(const void* data, uint32_t size, uint32_t* bytes_written) {
+	if (m_p->image != nullptr) {
+		if (bytes_written != nullptr) {
+			*bytes_written = 0;
+		}
+		return;
+	}
 	EXIT_IF(m_p->f == nullptr);
 
 	SysFileWrite(data, size, *m_p->f, bytes_written);
@@ -257,10 +318,22 @@ static std::filesystem::path WithoutTrailingSeparator(
 
 
 bool File::IsDirectoryExisting(const std::filesystem::path& path) {
+	std::shared_ptr<ExfatImage> image;
+	std::string relative;
+	if (ResolveExfatPath(path, &image, &relative)) {
+		ExfatImage::Entry entry;
+		return image->Find(relative, &entry) && entry.directory;
+	}
 	return SysFileIsDirectoryExisting(WithoutTrailingSeparator(path));
 }
 
 bool File::IsFileExisting(const std::filesystem::path& name) {
+	std::shared_ptr<ExfatImage> image;
+	std::string relative;
+	if (ResolveExfatPath(name, &image, &relative)) {
+		ExfatImage::Entry entry;
+		return image->Find(relative, &entry) && !entry.directory;
+	}
 	return SysFileIsFileExisting(name);
 }
 
@@ -326,6 +399,9 @@ bool File::DeleteFile(
 }
 
 bool File::Flush() {
+	if (m_p->image != nullptr) {
+		return true;
+	}
 	EXIT_IF(m_p->f == nullptr);
 
 	return SysFileFlush(*m_p->f);
@@ -371,6 +447,12 @@ DateTime File::GetLastWriteTimeUTC(const std::filesystem::path& name) {
 
 void File::GetLastAccessAndWriteTimeUTC(const std::filesystem::path& name, DateTime* access,
                                         DateTime* write) {
+	std::shared_ptr<ExfatImage> image;
+	std::string relative;
+	if (ResolveExfatPath(name, &image, &relative)) {
+		*access = *write = DateTime::FromSystemUTC();
+		return;
+	}
 	EXIT_IF(access == nullptr);
 	EXIT_IF(write == nullptr);
 
@@ -398,6 +480,10 @@ void File::GetLastAccessAndWriteTimeUTC(const std::filesystem::path& name, DateT
 void File::GetLastAccessAndWriteTimeUTC(DateTime* access, DateTime* write) {
 	EXIT_IF(access == nullptr);
 	EXIT_IF(write == nullptr);
+	if (m_p->image != nullptr) {
+		*access = *write = DateTime::FromSystemUTC();
+		return;
+	}
 
 	EXIT_IF(m_p->f == nullptr);
 
@@ -446,6 +532,20 @@ bool File::SetLastAccessAndWriteTimeUTC(const std::filesystem::path& name, const
 }
 
 std::vector<File::DirEntry> File::GetDirEntries(const std::filesystem::path& path) {
+	std::shared_ptr<ExfatImage> image;
+	std::string relative;
+	if (ResolveExfatPath(path, &image, &relative)) {
+		std::vector<ExfatImage::Entry> entries;
+		if (!image->List(relative, &entries)) {
+			return {};
+		}
+		std::vector<DirEntry> result;
+		result.reserve(entries.size());
+		for (const auto& entry: entries) {
+			result.push_back({entry.name, !entry.directory});
+		}
+		return result;
+	}
 	std::vector<sys_dir_entry_t> files;
 
 	SysFileGetDents(path, files);

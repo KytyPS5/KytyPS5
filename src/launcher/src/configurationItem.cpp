@@ -1,5 +1,8 @@
 #include "configurationItem.h"
 
+#include "common/exfatImage.h"
+#include "common/stringUtils.h"
+
 #include "configuration.h"
 
 #include <QApplication>
@@ -13,6 +16,7 @@
 #include <QIcon>
 #include <QLabel>
 #include <QLineEdit>
+#include <QPixmap>
 #include <QLocale>
 #include <QSize>
 #include <QStringList>
@@ -169,7 +173,10 @@ ConfigurationItem::ConfigurationItem(std::unique_ptr<Configuration> info, QTreeW
 		}
 		watcher->deleteLater();
 	});
-	watcher->setFuture(QtConcurrent::run([path = m_info->basedir]() -> qint64 {
+	watcher->setFuture(QtConcurrent::run([path = m_info->basedir, image = m_info->image_file]() -> qint64 {
+		if (!image.isEmpty()) {
+			return QFileInfo(image).size();
+		}
 		if (path.isEmpty() || !QDir(path).exists()) {
 			return -1;
 		}
@@ -267,8 +274,29 @@ void ConfigurationItem::SetCompatibilityEditable(bool editable) {
 }
 
 void ConfigurationItem::UpdateIcon() {
+	if (!m_info->image_file.isEmpty()) {
+		if (!m_image_icon_checked || m_image_icon_path != m_info->image_file) {
+			m_image_icon_checked = true;
+			m_image_icon_path = m_info->image_file;
+			m_image_icon = QIcon();
+			Common::ExfatImage image;
+			std::string error;
+			std::vector<uint8_t> bytes;
+			if (image.Open(Common::PathFromUtf8(m_info->image_file.toUtf8().toStdString()), &error) &&
+			    image.ReadFile("sce_sys/icon0.png", 8 * 1024 * 1024, &bytes, &error)) {
+				QPixmap pixmap;
+				if (pixmap.loadFromData(bytes.data(), static_cast<uint>(bytes.size()))) {
+					m_image_icon = QIcon(pixmap);
+				}
+			}
+		}
+		if (!m_image_icon.isNull()) {
+			setIcon(NameColumn, m_image_icon);
+			return;
+		}
+	}
 	const QString icon_file = QDir(m_info->basedir).filePath(QStringLiteral("sce_sys/icon0.png"));
-	if (QFileInfo::exists(icon_file)) {
+	if (m_info->image_file.isEmpty() && QFileInfo::exists(icon_file)) {
 		setIcon(NameColumn, QIcon(icon_file));
 		return;
 	}

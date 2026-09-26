@@ -1,5 +1,8 @@
 #include "configurationListWidget.h"
 
+#include "common/exfatImage.h"
+#include "common/stringUtils.h"
+
 #include "compatibilityDatabase.h"
 #include "configuration.h"
 #include "configurationEditDialog.h"
@@ -128,7 +131,7 @@ static QStringList SettingsStringList(const QVariant& value) {
 }
 
 static QString GetPic0Path(const Configuration& info) {
-	if (info.basedir.isEmpty()) {
+	if (info.basedir.isEmpty() || !info.image_file.isEmpty()) {
 		return {};
 	}
 
@@ -490,17 +493,12 @@ static QString GetFirmwareVersion(const QJsonObject& root) {
 	return version;
 }
 
-static GameMetadata GetGameMetadata(const QString& param_file, const QString& fallback) {
+static GameMetadata ParseGameMetadata(const QByteArray& json, const QString& fallback) {
 	GameMetadata ret;
 	ret.title_name = fallback;
 
-	QFile param(param_file);
-	if (!param.open(QIODevice::ReadOnly)) {
-		return ret;
-	}
-
 	QJsonParseError parse_error;
-	const auto      doc = QJsonDocument::fromJson(param.readAll(), &parse_error);
+	const auto      doc = QJsonDocument::fromJson(json, &parse_error);
 	if (parse_error.error != QJsonParseError::NoError || !doc.isObject()) {
 		return ret;
 	}
@@ -519,6 +517,32 @@ static GameMetadata GetGameMetadata(const QString& param_file, const QString& fa
 	ret.firmwareVer = GetFirmwareVersion(root);
 
 	return ret;
+}
+
+static GameMetadata GetGameMetadata(const QString& param_file, const QString& fallback) {
+	QFile param(param_file);
+	if (param.open(QIODevice::ReadOnly)) {
+		return ParseGameMetadata(param.readAll(), fallback);
+	}
+	GameMetadata metadata;
+	metadata.title_name = fallback;
+	return metadata;
+}
+
+static bool GetImageMetadata(const QString& image_file, GameMetadata* metadata) {
+	Common::ExfatImage image;
+	std::string error;
+	const auto path = Common::PathFromUtf8(image_file.toUtf8().toStdString());
+	std::vector<uint8_t> json;
+	Common::ExfatImage::Entry elf;
+	if (!image.Open(path, &error) || !image.Find("eboot.bin", &elf) || elf.directory ||
+	    !image.ReadFile("sce_sys/param.json", 4 * 1024 * 1024, &json, &error)) {
+		return false;
+	}
+	*metadata = ParseGameMetadata(QByteArray(reinterpret_cast<const char*>(json.data()),
+	                                         static_cast<int>(json.size())),
+	                              QFileInfo(image_file).completeBaseName());
+	return true;
 }
 
 static void SetGameFiles(Configuration& info, const QString& game_dir, const QString& game_path,
@@ -609,6 +633,69 @@ void ConfigurationListWidget::ScanGameDirectory() {
 
 	const QString eboot_name = QStringLiteral("eboot.bin");
 	QSet<QString> found_games;
+	auto add_game = [&](const QString& game_path, const QString& legacy_game_path,
+	                    const QString& base_dir, const QString& image_file,
+	                    const GameMetadata& metadata) {
+		const QString game_key = PathKey(game_path);
+		if (game_key.isEmpty() || found_games.contains(game_key)) {
+			return;
+		}
+		found_games.insert(game_key);
+
+		auto info = std::make_unique<Configuration>();
+		info->custom_settings =
+		    FindCustomInfo(&m_custom_infos, game_path, legacy_game_path) != nullptr;
+		SetGameFiles(*info, base_dir, game_path, metadata);
+		info->image_file = image_file;
+		const auto* compatibility = m_compatibility->Find(info->title_id);
+		if (compatibility != nullptr) {
+			info->game_status  = compatibility->status;
+			info->game_comment = compatibility->comment;
+		}
+
+		if (auto* item = running_items.value(game_key); item != nullptr) {
+			const QSignalBlocker status_blocker(item->GetStatusCombo());
+			item->GetInfo().CopyGameInfoFrom(*info);
+			item->Update();
+			item->SetCompatibilityEditable(m_compatibility->IsLocal() &&
+			                               !item->GetInfo().title_id.trimmed().isEmpty());
+			return;
+		}
+
+		auto* item = new ConfigurationItem(std::move(info), m_ui->cfgs_list);
+		item->SetCompatibilityEditable(m_compatibility->IsLocal() &&
+		                               !item->GetInfo().title_id.trimmed().isEmpty());
+		connect(item->GetStatusCombo(), &QComboBox::currentIndexChanged, item,
+		        [this, item](int /*index*/) {
+			        if (!m_compatibility->IsLocal()) {
+				        return;
+			        }
+			        const auto& title_id = item->GetInfo().title_id;
+			        if (title_id.trimmed().isEmpty()) {
+				        return;
+			        }
+			        item->GetInfo().game_status = static_cast<Configuration::GameStatus>(
+			            item->GetStatusCombo()->currentData().toInt());
+			        item->Update();
+			        m_compatibility->SetStatus(title_id, item->GetInfo().game_status);
+			        m_ui->cfgs_list->setCurrentItem(item);
+			        SelectItem(item);
+		        });
+		connect(item->GetCommentEdit(), &QLineEdit::editingFinished, item, [this, item]() {
+			if (!m_compatibility->IsLocal()) {
+				return;
+			}
+			const auto& title_id = item->GetInfo().title_id;
+			if (title_id.trimmed().isEmpty()) {
+				return;
+			}
+			item->GetInfo().game_comment = item->GetCommentEdit()->text();
+			item->Update();
+			m_compatibility->SetComment(title_id, item->GetInfo().game_comment);
+			m_ui->cfgs_list->setCurrentItem(item);
+			SelectItem(item);
+		});
+	};
 
 	for (const auto& root_path: m_game_dirs) {
 		QDir root(root_path);
@@ -616,86 +703,33 @@ void ConfigurationListWidget::ScanGameDirectory() {
 			continue;
 		}
 
-		QList<QDir> pending_dirs;
-		const auto  root_subdirs =
-		    root.entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot | QDir::NoSymLinks);
-		for (const auto& subdir: root_subdirs) {
-			pending_dirs.append(QDir(subdir.absoluteFilePath()));
-		}
+		QList<QDir> pending_dirs {root};
 
 		while (!pending_dirs.isEmpty()) {
 			QDir game_dir = pending_dirs.takeFirst();
 
-			if (game_dir.exists(eboot_name)) {
-				const QString game_path        = NormalizeGameDirectory(game_dir.absolutePath());
-				const QString legacy_game_path = root.relativeFilePath(game_dir.absolutePath());
-				const QString game_key         = PathKey(game_path);
-				if (game_key.isEmpty() || found_games.contains(game_key)) {
+			const auto images = game_dir.entryInfoList(QDir::Files | QDir::NoSymLinks);
+			for (const auto& candidate: images) {
+				if (candidate.suffix().compare(QStringLiteral("exfat"), Qt::CaseInsensitive) != 0) {
 					continue;
 				}
-				found_games.insert(game_key);
-
-				auto metadata = GetGameMetadata(
-				    game_dir.filePath(QStringLiteral("sce_sys/param.json")), game_dir.dirName());
-
-				auto info = std::make_unique<Configuration>();
-				info->custom_settings =
-				    FindCustomInfo(&m_custom_infos, game_path, legacy_game_path) != nullptr;
-				SetGameFiles(*info, game_dir.absolutePath(), game_path, metadata);
-				const auto* compatibility = m_compatibility->Find(info->title_id);
-				if (compatibility != nullptr) {
-					info->game_status  = compatibility->status;
-					info->game_comment = compatibility->comment;
-				}
-
-				if (auto* item = running_items.value(game_key); item != nullptr) {
-					// Refresh metadata without losing the running row's identity.
-					const QSignalBlocker status_blocker(item->GetStatusCombo());
-					item->GetInfo().CopyGameInfoFrom(*info);
-					item->Update();
-					item->SetCompatibilityEditable(m_compatibility->IsLocal() &&
-					                               !item->GetInfo().title_id.trimmed().isEmpty());
+				GameMetadata metadata;
+				if (!GetImageMetadata(candidate.absoluteFilePath(), &metadata)) {
 					continue;
 				}
-
-				auto* item = new ConfigurationItem(std::move(info), m_ui->cfgs_list);
-				item->SetCompatibilityEditable(m_compatibility->IsLocal() &&
-				                               !item->GetInfo().title_id.trimmed().isEmpty());
-				connect(item->GetStatusCombo(), &QComboBox::currentIndexChanged, item,
-				        [this, item](int /*index*/) {
-					        if (!m_compatibility->IsLocal()) {
-						        return;
-					        }
-
-					        const auto& title_id = item->GetInfo().title_id;
-					        if (title_id.trimmed().isEmpty()) {
-						        return;
-					        }
-					        item->GetInfo().game_status = static_cast<Configuration::GameStatus>(
-					            item->GetStatusCombo()->currentData().toInt());
-					        item->Update();
-					        m_compatibility->SetStatus(title_id, item->GetInfo().game_status);
-					        m_ui->cfgs_list->setCurrentItem(item);
-					        SelectItem(item);
-				        });
-				connect(item->GetCommentEdit(), &QLineEdit::editingFinished, item, [this, item]() {
-					if (!m_compatibility->IsLocal()) {
-						return;
-					}
-
-					const auto& title_id = item->GetInfo().title_id;
-					if (title_id.trimmed().isEmpty()) {
-						return;
-					}
-					item->GetInfo().game_comment = item->GetCommentEdit()->text();
-					item->Update();
-					m_compatibility->SetComment(title_id, item->GetInfo().game_comment);
-					m_ui->cfgs_list->setCurrentItem(item);
-					SelectItem(item);
-				});
-				continue;
+				const auto image_path = candidate.absoluteFilePath();
+				add_game(image_path, root.relativeFilePath(image_path), game_dir.absolutePath(),
+				         image_path, metadata);
 			}
 
+			if (game_dir.exists(eboot_name)) {
+				const auto game_path = NormalizeGameDirectory(game_dir.absolutePath());
+				const auto metadata = GetGameMetadata(
+				    game_dir.filePath(QStringLiteral("sce_sys/param.json")), game_dir.dirName());
+				add_game(game_path, root.relativeFilePath(game_dir.absolutePath()),
+				         game_dir.absolutePath(), {}, metadata);
+				continue;
+			}
 			const auto subdirs =
 			    game_dir.entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot | QDir::NoSymLinks);
 			for (const auto& subdir: subdirs) {

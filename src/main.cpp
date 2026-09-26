@@ -2,6 +2,7 @@
 #include "common/dateTime.h"
 #include "common/debug.h"
 #include "common/file.h"
+#include "common/exfatImage.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
@@ -40,9 +41,9 @@ static std::string GetBuildString() {
 
 static void PrintUsage() {
 	::printf("%s\n", GetBuildString().c_str());
-	::printf("kyty_emulator --game <dir|elf> [options]\n\n");
+	::printf("kyty_emulator --game <dir|elf|exfat> [options]\n\n");
 	::printf("Options:\n");
-	::printf("  --game <dir|elf>                     Game directory or ELF to load.\n");
+	::printf("  --game <dir|elf|exfat>               Game directory, ELF, or raw exFAT image.\n");
 	::printf("  --game-patch <json>                  ETAHen cheat file.\n");
 	::printf("  --screen-width <num>                 Window width. Default: 1280.\n");
 	::printf("  --screen-height <num>                Window height. Default: 720.\n");
@@ -239,6 +240,14 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 
 			if (Common::File::IsDirectoryExisting(path)) {
 				options.app0_dir = path;
+				options.elf      = "/app0/eboot.bin";
+			} else if (Common::File::IsFileExisting(path) && Common::IsExfatImagePath(path)) {
+				std::string error;
+				if (!Common::MountExfatImage(path, &error)) {
+					::printf("cannot open exFAT image: %s\n", error.c_str());
+					return false;
+				}
+				options.app0_dir = std::filesystem::absolute(path);
 				options.elf      = "/app0/eboot.bin";
 			} else if (Common::File::IsFileExisting(path)) {
 				options.app0_dir = path.parent_path();

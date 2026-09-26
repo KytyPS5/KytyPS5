@@ -178,6 +178,10 @@ void CommandScheduler::Flush(SubmitInfo& submit) {
 void CommandScheduler::FlushAndWait() {
 	const auto tick = Submit();
 	m_master.Wait(tick);
+	// EOP flip completion and other priority callbacks are queued against this tick.
+	// Sync diagnostics and GPU-dirty downloads already wait here; VideoOut Recording
+	// must reach Ready before the next guest submission observes a stuck front.
+	WaitPriorityOperations(tick);
 	BeginNext();
 }
 

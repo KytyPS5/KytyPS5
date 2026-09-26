@@ -75,6 +75,10 @@ Checkpoint Flip queue lock-order (Reserve cfg→m_mutex ABBA) **26 сентяб�
     prepared **frame=250** `colored=10` max RGB `45/45/45` (spinner);
     frame 251–276 растут до `colored=108` / max `546/525/546`. shown=277,
     auto-stop `colored-proven` ~147 с. Меню/gameplay **PENDING**.
+18. Open-PR review **переснят 26.09**: GitHub **113** open (было 68 в снимке
+    8.09). Каталог в `docs/open-pr-usefulness-review.md` полный; очередь к меню
+    — long run + `54904` compile cost; кандидаты #718/#842–#845/#537/#761 только
+    с RED, без whole mega-bundles.
 
 Checkpoint present soft-stall (shown≈130 / ready=shown+1) **26 сентября 2026 года**:
 

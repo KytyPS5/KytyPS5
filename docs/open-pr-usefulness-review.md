@@ -1,195 +1,182 @@
-Дата обзора: **8 сентября 2026 года** · обновление статуса: **26 сентября 2026**
+Дата обзора: **8 сентября 2026 года** · полный переснимок: **26 сентября 2026**
 
 # Открытые PR KytyPS5: что полезно для текущего bring-up
 
-## Обновление 26 сентября 2026
+## Полный переснимок 26 сентября 2026 (113 open)
 
-Снимок не пересобирает весь каталог из 68 PR: ниже — дельта относительно
-текущей ветки `yotei-windows-bringup` @ `23e4fd74` (draft
+GitHub REST `state=open&per_page=100` (paginate) → **113** открытых PR
+(range #148–#845, drafts=5).
+Сравнение с `yotei-windows-bringup` @ `6fb832f8` (draft
 [#497](https://github.com/KytyPS5/KytyPS5/pull/497), base `main` tip `fd2e15ee`).
-#497 снова **MERGEABLE** после merge `upstream/main` (`fd2e15ee`); конфликты
-`CMakeLists.txt` / `ShaderIR.h` / `ResourceTrackingTests.cpp` разрешены.
-**Первый ненулевой кадр на текущем tip доказан** (`…-081515-presentfix-gpuav`,
-prepared frame 250, spinner). Меню/gameplay **PENDING**. Крупный CS `54904fb4`
-под GPUAV всё ещё дорог (CreatePipeline / specialization churn).
+
+**Runtime на tip:** первый ненулевой кадр (spinner) доказан
+`…-081515-presentfix-gpuav` prepared frame 250. Меню/gameplay **PENDING**.
+Текущий cost — GPUAV `vkCreateComputePipelines` на CS `54904fb4`
+(~755k SPIR-V, specialization churn).
+
+Это triage по title/files/метаданным всех 113 PR + deeper file look на
+shader/GPU/Windows candidates. Не утверждение, что все 113 собраны и
+прогнаны на GPU.
+
+### Короткий вывод (актуально)
+
+- Готового чужого PR «целиком → меню Yōtei» **нет**.
+- Лучшие **performance** кандидаты после correctness: **#718** (precompile
+  recorded shaders), **#628** (SRT memo), **#735** (uniform readlane elim),
+  куски **#506/#767** только после split + RED.
+- Лучшие **correctness when observed**: **#845/#844/#842** (stage large
+  upload/download вместо EXIT), **#537** (publish linear storage before CPU),
+  **#638** (memory-pressure GC), **#793** (mesh draw split), **#761**
+  (fragment-helper ballots) — только с собственным RED.
+- **Не merge whole:** #833, #780, #767, #789, #512, #558, #555, #715, #654,
+  #720, #747, draft #599/#613.
+- **#811** image side уже selective на #497; re-merge не нужен.
+- **#837** float image atomics: сначала доказать gap vs уже влитый #490 class.
 
 ### Уже в текущей ветке (не тащить повторно)
 
 | Источник | Статус |
 | --- | --- |
-| [#497](https://github.com/KytyPS5/KytyPS5/pull/497) | **current integration:** head `23e4fd74`, synced to main `fd2e15ee`. |
-| [#811](https://github.com/KytyPS5/KytyPS5/pull/811) address-backed images | **covered selectively** в `c1a4f853` (`record_key` / `protected_image` / `--address-backed-indirect-only` GREEN). Upstream PR ещё open и dirty vs main — целый re-merge не нужен; buffer-key класс остаётся нашим RED. |
-| Main tip `fd2e15ee` и предшественники в merge | NGS2/ATRAC9, void translator + `V_CMPX_O_F32`, sync/EOP, CFG/tests, `MaxBuffers=64`, `lru_cache` tests, CI recompiler unit tests — уже в #497. |
-| Selective ports #798/#799/#812/#820 | Уже в ветке (см. plan); повтор не нужен. |
-| Present soft-stall / VrrStatus / HTile native / post-EOP readback | Уже в ветке 26.09; не тащить повторно. |
+| [#497](https://github.com/KytyPS5/KytyPS5/pull/497) | **current:** head `6fb832f8`, MERGEABLE vs `fd2e15ee`. |
+| [#811](https://github.com/KytyPS5/KytyPS5/pull/811) images | **covered selectively**; buffer-key остаётся локальным RED. |
+| Main `fd2e15ee` | audio/NGS2, translator void/`V_CMPX_O_F32`, MaxBuffers=64, lru_cache tests, CI recompiler tests. |
+| Present/Vrr/HTile/readback 26.09 | soft-stall, GetVrrStatus, native HTile owner, post-EOP present readback. |
 
-### Смержены в upstream main после 20 сентября (полезные пересечения)
+### Рекомендуемая очередь (меню)
 
-Брать только если на ветке ещё нет эквивалента и есть свой RED; многие уже
-пришли через merge main в #497:
+1. Long run past spinner → первый menu frame; логировать Fatal/CreatePipeline.
+2. Shared reduce CS `54904` SPIR-V / specialization churn (`emulator-test-debt.md`).
+3. Если CreatePipeline cold/warm всё ещё минуты — оценить **#718** precompile с
+   pipeline-cache identity RED (без title branching).
+4. Если hit EXIT на large upload/download — RED + selective **#842/#844/#845**.
+5. Не трогать mega-bundles (#780/#833/#767) до точного shared RED.
 
-- [#816](https://github.com/KytyPS5/KytyPS5/pull/816) `V_CMPX_EQ_U16` — ISA coverage рядом с нашим `V_CMPX_NE_U16` / O_F32; проверить corpus, не дублировать.
-- [#801](https://github.com/KytyPS5/KytyPS5/pull/801) live predicates / whole-quad — пересекается с WQM/cooperative; смотреть только при новом predicate RED.
-- [#790](https://github.com/KytyPS5/KytyPS5/pull/790)/[#794](https://github.com/KytyPS5/KytyPS5/pull/794) DS_INC/DEC и `DS_WRITE_B8_D16_HI` — LDS/GDS completeness; у нас уже есть live-return INC/DEC RTN для wave64.
-- [#807](https://github.com/KytyPS5/KytyPS5/pull/807) hoist loop-invariant draw/attrib — **P2 performance**, после correctness.
-- [#825](https://github.com/KytyPS5/KytyPS5/pull/825)/[#822](https://github.com/KytyPS5/KytyPS5/pull/822) NGS2/AudioOut — уже в tip main / #497; не shader blocker.
-- [#772](https://github.com/KytyPS5/KytyPS5/pull/772)/[#511](https://github.com/KytyPS5/KytyPS5/pull/511)/[#679](https://github.com/KytyPS5/KytyPS5/pull/679) loader/kernel/timer — **separate/P2**, не кадр.
-- [#763](https://github.com/KytyPS5/KytyPS5/pull/763)/[#787](https://github.com/KytyPS5/KytyPS5/pull/787) resize/SDL3 — WSI/deps, не bring-up pixel.
+### Каталог всех 113 open PR (26.09)
 
-### Закрыты без merge (из старого P1-списка)
+Обозначения: **P1** / **P2** / **covered** / **diagnostic** / **separate** /
+**do not merge whole** / **test** / **draft**. Для PR ≤509 без новой пометки
+сохранена оценка из снимка 8.09 (ниже); для ≥510 — оценка этого переснимка.
 
-- [#383](https://github.com/KytyPS5/KytyPS5/pull/383) heterogeneous images — **closed unmerged**; нужные подклассы у нас уже selective; не воскрешать целиком.
-- [#468](https://github.com/KytyPS5/KytyPS5/pull/468) `S_WQM_B32` — **closed unmerged**; numeric WQM на ветке шире; при новом decode gap — свой RED, не старый PR.
-- [#500](https://github.com/KytyPS5/KytyPS5/pull/500) Demon's Souls bundle — **closed unmerged**; по-прежнему **do not merge whole**.
+| PR | Draft | Author | Оценка | Title |
+| --- | --- | --- | --- | --- |
+| [#845](https://github.com/KytyPS5/KytyPS5/pull/845) |  | theantipopau | **P1 when observed**: oversized image readback staging; fail-closed EXIT→private buffer. Take only with RED for large readback abort. | gpu: stage oversized image readbacks in a private buffer instead of exiting |
+| [#844](https://github.com/KytyPS5/KytyPS5/pull/844) |  | theantipopau | **P1 when observed**: oversized image upload staging; same class as #845 for uploads. | gpu: stage oversized image uploads in a private buffer instead of exiting |
+| [#843](https://github.com/KytyPS5/KytyPS5/pull/843) |  | Cosmo | **separate**: DualSense haptics from vibration ports; not menu pixel path. | audio: play DualSense haptics from vibration audio ports |
+| [#842](https://github.com/KytyPS5/KytyPS5/pull/842) |  | theantipopau | **P1 when observed**: batched buffer downloads instead of abort; relevant if Yōtei hits large download EXIT. | gpu: stage buffer downloads in batches instead of aborting on a large one |
+| [#841](https://github.com/KytyPS5/KytyPS5/pull/841) |  | 6d4m | **separate**: AudioOut write serialization; not frame blocker. | audio: serialize blocking writes per output port |
+| [#840](https://github.com/KytyPS5/KytyPS5/pull/840) |  | theantipopau | **test**: dormant VOP3 lane-read guards; useful neighbor coverage, no runtime claim. | tests: wire dormant VOP3 lane-read check and guard new dormant tests |
+| [#839](https://github.com/KytyPS5/KytyPS5/pull/839) |  | ew-sudo | **P2/separate**: SSE4a EXTRQ trampolines; useful if guest hits SSE4a on host without it (#467 class). | loader: replace SSE4a EXTRQ with native trampolines on hosts without SSE4a |
+| [#838](https://github.com/KytyPS5/KytyPS5/pull/838) |  | ew-sudo | **P2 Windows**: retry Windows file reads via bounce buffer on protected guest pages. | common: retry Windows file reads through a bounce buffer when the guest buffer is protected |
+| [#837](https://github.com/KytyPS5/KytyPS5/pull/837) |  | theantipopau | **covered/check**: MIMG float FMIN/FMAX — production class likely already on bring-up; verify before port. | shader: support MIMG float image atomics (FMIN/FMAX) |
+| [#836](https://github.com/KytyPS5/KytyPS5/pull/836) |  | theantipopau | **diagnostic P2**: guest fault → module+backtrace; helps long-run diagnosis. | loader: attribute guest faults to modules and print a backtrace |
+| [#834](https://github.com/KytyPS5/KytyPS5/pull/834) |  | Pcniado | **separate**: exFAT raw image boot; not retail PKG path for Yōtei. | loader: boot titles from a raw exFAT image |
+| [#833](https://github.com/KytyPS5/KytyPS5/pull/833) |  | hamzashakir99 | **do not merge whole**: Tekken 8 Windows stability bundle (cache/pipeline/pageManager); extract only with own RED. | Windows stability fixes found while bringing up Tekken 8 (PPSA10595) |
+| [#827](https://github.com/KytyPS5/KytyPS5/pull/827) |  | Pcniado | **P2/separate**: munmap across reservation holes; kernel completeness. | kernel: allow munmap across released reservation holes |
+| [#820](https://github.com/KytyPS5/KytyPS5/pull/820) |  | 6d4m | **covered?**: zero freshly allocated direct memory — may already be in tip via main; verify before port. | kernel: zero freshly allocated direct memory |
+| [#818](https://github.com/KytyPS5/KytyPS5/pull/818) |  | leonardosth | **P2 Windows**: long paths + resource-tracking non-zero; mixed bundle, split first. | Support long paths on Windows and handle non-zero resource tracking o… |
+| [#811](https://github.com/KytyPS5/KytyPS5/pull/811) |  | tototomate123 | **covered selectively**: address-backed images already selective on #497; buffer-key still local RED, not re-merge whole. | shader: handle address-backed indirect image descriptors |
+| [#808](https://github.com/KytyPS5/KytyPS5/pull/808) |  | romainhedouin | **separate**: drop cpuinfo dependency; build hygiene. | common: drop the cpuinfo dependency |
+| [#799](https://github.com/KytyPS5/KytyPS5/pull/799) |  | theantipopau | **covered?**: CFG stage/hash in failures — check if already in tip. | Report the shader stage and hash in CFG build failures |
+| [#797](https://github.com/KytyPS5/KytyPS5/pull/797) |  | theantipopau | **P2/separate**: Windows MSG_PEEK/WAITALL; network/tests. | Fix Windows MSG_PEEK and MSG_WAITALL receive handling |
+| [#795](https://github.com/KytyPS5/KytyPS5/pull/795) |  | DenizSAHIN570 | **P2**: tiler avoid uvec4 specialization-constant selects; take if tiler VUID/driver bug appears. | graphics: avoid uvec4 specialization-constant selects in the GPU tiler shaders |
+| [#793](https://github.com/KytyPS5/KytyPS5/pull/793) |  | prompterror | **P1 when observed**: split oversized mesh draws to host limits; RED for mesh oversize. | renderer: split oversized mesh draws into host-limit slices |
+| [#789](https://github.com/KytyPS5/KytyPS5/pull/789) |  | Spincial | **do not merge whole**: FNAF memory/SRT/pipeline bundle; title-led. | FNAF: Security Breach Memory Fixes. |
+| [#780](https://github.com/KytyPS5/KytyPS5/pull/780) |  | itsmemac | **do not merge whole**: Spider-Man Miles Morales gameplay mega-bundle; extract only proven shared hunks. | Spider-Man: Miles Morales to gameplay: recompiler, PM4, cache, AMPR and diagnostics fixes |
+| [#767](https://github.com/KytyPS5/KytyPS5/pull/767) |  | Akyy78 | **do not merge whole**: Perf/60fps experimental; scheduling/SRT mix — split after correctness. | Perf/60fps experimental |
+| [#764](https://github.com/KytyPS5/KytyPS5/pull/764) |  | ElijaOwO | **separate**: HttpUriParse empty query. | Fix empty query handling in HttpUriParse |
+| [#761](https://github.com/KytyPS5/KytyPS5/pull/761) |  | carbonimax | **P1 selective**: exclude fragment helpers from ballots; shared FS correctness — needs RED. | shader: exclude fragment helpers from ballots |
+| [#756](https://github.com/KytyPS5/KytyPS5/pull/756) |  | Ofacy | **separate**: GitHub issue template label. | Add appropriate label to Game Emulation Status Report template |
+| [#751](https://github.com/KytyPS5/KytyPS5/pull/751) |  | rudy-07 | **P2/separate**: Windows PEEK/WAITALL (peer of #797/#508). | net: resolve guest PEEK and WAITALL flags on Windows |
+| [#749](https://github.com/KytyPS5/KytyPS5/pull/749) |  | herrMirto | **P2**: bound SDL event waits for main-thread tasks; WSI responsiveness. | Bound SDL event waits to keep main-thread tasks responsive |
+| [#748](https://github.com/KytyPS5/KytyPS5/pull/748) |  | TYFALY | **separate**: macOS ARM64/Tracy/CMake. | Fix macOS ARM64, Tracy integration, and CMake improvements |
+| [#747](https://github.com/KytyPS5/KytyPS5/pull/747) |  | vanshrana369 | **do not merge whole**: Astrobot raytracing. | Astrobot raytracing |
+| [#741](https://github.com/KytyPS5/KytyPS5/pull/741) |  | carbonimax | **P2**: prune unused mesh outputs. | graphics: prune unused mesh outputs |
+| [#740](https://github.com/KytyPS5/KytyPS5/pull/740) |  | Kody-Schram | **separate**: Linux file locations. | Fix Linux file locations |
+| [#735](https://github.com/KytyPS5/KytyPS5/pull/735) |  | carbonimax | **P2 performance**: eliminate uniform read-first-lane; profile first. | shader: eliminate uniform read-first-lane operations |
+| [#732](https://github.com/KytyPS5/KytyPS5/pull/732) |  | anatoliikuc | **separate**: auto-hide cursor. | auto-hide cursor on idle and start (window) |
+| [#727](https://github.com/KytyPS5/KytyPS5/pull/727) |  | carbonimax | **P2**: wave32 NGG passthrough; not current wave64 Yōtei path. | Support wave32 NGG passthrough programs |
+| [#724](https://github.com/KytyPS5/KytyPS5/pull/724) |  | Aspenini | **separate**: Zarchive loading. | Zarchive Loading |
+| [#721](https://github.com/KytyPS5/KytyPS5/pull/721) |  | carbonimax | **separate**: MoltenVK BDA buffer lifetime. | vulkan: keep MoltenVK device-address buffers alive through queued work |
+| [#720](https://github.com/KytyPS5/KytyPS5/pull/720) |  | nomolao2-cell | **do not merge whole**: Astro Bot Intel CPU compat. | Astro Bot Intel CPU compatibility fixes |
+| [#719](https://github.com/KytyPS5/KytyPS5/pull/719) |  | Ekt0re | **diagnostic**: async logger + crash handler. | feat(logging): add asynchronous logger and crash handler |
+| [#718](https://github.com/KytyPS5/KytyPS5/pull/718) |  | FirasDev | **P1 performance**: precompile recorded shader set before title; directly targets cold CreatePipeline stalls (54904 class). Needs identity/cache RED. | graphics: precompile the recorded shader set before the title runs |
+| [#717](https://github.com/KytyPS5/KytyPS5/pull/717) |  | YuhiAida | **P2**: clamp host mip levels / layered block views. | graphics: clamp host mip levels and gate layered block views |
+| [#715](https://github.com/KytyPS5/KytyPS5/pull/715) |  | carbonimax | **do not merge whole**: native GPU PerVertex replay + shader caches prototype. | graphics: prototype native GPU PerVertex replay and shader caches |
+| [#709](https://github.com/KytyPS5/KytyPS5/pull/709) |  | Ekt0re | **P2**: zero-sized/minimized surface crash. | Fix: Prevent crash when window has zero-sized/minimized surface |
+| [#706](https://github.com/KytyPS5/KytyPS5/pull/706) |  | YuhiAida | **P2**: emulate sRGB decode for narrow formats (#415 class). | shader: emulate the sRGB decode of narrow sRGB sampled formats |
+| [#702](https://github.com/KytyPS5/KytyPS5/pull/702) |  | MehmetCambaz | **P2 performance**: avoid unnecessary GPU drains for bool predicates. | graphics: avoid unnecessary GPU drains for bool predicates |
+| [#693](https://github.com/KytyPS5/KytyPS5/pull/693) |  | 1OO1O11O | **P2**: 64-bit COPY_DATA immediates + indexed event queue. | Preserve 64-bit COPY_DATA immediates and add indexed event queue lookup |
+| [#691](https://github.com/KytyPS5/KytyPS5/pull/691) |  | 1OO1O11O | **separate**: IME dialog validation. | Fix IME dialog validation and redraw tracking |
+| [#690](https://github.com/KytyPS5/KytyPS5/pull/690) |  | bipinkrish | **P1 selective**: dynamic buffer descriptors + memory ops; needs RED, do not merge tests blindly. | add dynamic buffer descriptor support, enhance memory operations, and add compute tests |
+| [#685](https://github.com/KytyPS5/KytyPS5/pull/685) |  | carbonimax | **separate**: MoltenVK descriptor sets. | vulkan: use descriptor sets for MoltenVK shader pipelines |
+| [#666](https://github.com/KytyPS5/KytyPS5/pull/666) |  | c0sxm0s | **separate**: launcher update feed. | launcher: keep primary update feed answer when the fallback request f… |
+| [#654](https://github.com/KytyPS5/KytyPS5/pull/654) |  | shadowbeat070 | **do not merge whole**: Silent Hill bringup. | Silent hill bringup |
+| [#643](https://github.com/KytyPS5/KytyPS5/pull/643) |  | carbonimax | **P2**: centroid/vertex-pixel interpolation. | shader: align centroid and vertex-pixel interpolation |
+| [#640](https://github.com/KytyPS5/KytyPS5/pull/640) |  | carbonimax | **do not merge whole / RT**: software BVH MIMG 0xe6; not Yōtei menu path. | shader: implement software BVH ray intersection for MIMG 0xe6 |
+| [#638](https://github.com/KytyPS5/KytyPS5/pull/638) |  | bipinkrish | **P1 when observed**: on-demand GC + fallback downloads under GPU memory pressure. | handle GPU memory pressure with on-demand GC and fallback downloads |
+| [#637](https://github.com/KytyPS5/KytyPS5/pull/637) |  | carbonimax | **P2**: fold constant lane-mask bit tests. | shader: fold constant lane-mask bit tests |
+| [#633](https://github.com/KytyPS5/KytyPS5/pull/633) |  | carbonimax | **separate**: macOS startup without optional Vulkan features. | macOS: allow startup without optional Vulkan shader features |
+| [#628](https://github.com/KytyPS5/KytyPS5/pull/628) |  | MehmetCambaz | **P1 performance**: SRT evaluator memo by dense plan slots (#484 class). | graphics: index the SRT evaluator memo by dense plan slots |
+| [#618](https://github.com/KytyPS5/KytyPS5/pull/618) |  | LordixDemon | **P2/separate**: Windows futex via WaitOnAddress. | kernel: implement native Windows futex via WaitOnAddress |
+| [#616](https://github.com/KytyPS5/KytyPS5/pull/616) |  | bipinkrish | **P2/separate**: PRX symbol resolution / user ID alias. | fix: PRX symbol resolution and user ID aliasing |
+| [#613](https://github.com/KytyPS5/KytyPS5/pull/613) | yes | psnwd | **draft/do not merge whole**: Beast of Reincarnation graphics shader fixes. | Graphics shader fixes (Game: Beast of Reincarnation) |
+| [#607](https://github.com/KytyPS5/KytyPS5/pull/607) |  | psnwd | **separate**: PSVR2 stubs. | vr: stub Hmd2/VrTracker2, opt-in PSVR2 video out |
+| [#603](https://github.com/KytyPS5/KytyPS5/pull/603) |  | Absolute93 | **test P1**: CI CPU regressions on hosted runners. | ci: run CPU regressions and cache compilation on hosted runners |
+| [#602](https://github.com/KytyPS5/KytyPS5/pull/602) | yes | Ekt0re | **draft/separate**: DualSense via keyboard. | Translation of DualSense commands using keyboard keys |
+| [#599](https://github.com/KytyPS5/KytyPS5/pull/599) | yes | chenxiao07 | **draft/do not merge whole**: AI Demons Souls experiments reference. | Reference: AI-assisted Demon's Souls CPU and rendering experiments |
+| [#565](https://github.com/KytyPS5/KytyPS5/pull/565) |  | psnwd | **test**: kernel filesystem test on Windows. | tests: link the kernel filesystem test on Windows |
+| [#563](https://github.com/KytyPS5/KytyPS5/pull/563) |  | psnwd | **diagnostic P2**: module+cause for guest fault (peer #836). | loader: report the module and cause behind a guest fault |
+| [#562](https://github.com/KytyPS5/KytyPS5/pull/562) |  | MehmetCambaz | **P2**: BDA upload from CPU-dirty hints. | graphics: find BDA upload work from CPU-dirty hints |
+| [#558](https://github.com/KytyPS5/KytyPS5/pull/558) |  | defektu | **do not merge whole**: Astro Bot RT + SRT plan bug. | Astro Bot: ray tracing, and the SRT plan bug that dropped its lighting |
+| [#555](https://github.com/KytyPS5/KytyPS5/pull/555) |  | FirasDev | **do not merge whole**: BVH resource classification / RT crash. | shader: fix BVH resource classification and specialization crash |
+| [#553](https://github.com/KytyPS5/KytyPS5/pull/553) |  | psnwd | **separate**: launcher input icons. | launcher: show controller and key icons in the input mapping dialog |
+| [#537](https://github.com/KytyPS5/KytyPS5/pull/537) |  | CheesyPoofs346 | **P1 when observed**: publish linear storage images before CPU access; black/stale texture class. | renderer: publish linear storage images before CPU access |
+| [#536](https://github.com/KytyPS5/KytyPS5/pull/536) |  | SaifMalik0162 | **separate**: macOS aggregate test build. | Fix macOS aggregate test build |
+| [#532](https://github.com/KytyPS5/KytyPS5/pull/532) | yes | CheesyPoofs346 | **draft/P1 selective**: finalize bindings after range-changing ops. | renderer: finalize bindings after every range-changing operation |
+| [#512](https://github.com/KytyPS5/KytyPS5/pull/512) |  | Almo7aya | **do not merge whole**: Uncharted 4 compat mega-bundle. | Improve Uncharted 4 compat shaders, GPU execution, media playback |
+| [#508](https://github.com/KytyPS5/KytyPS5/pull/508) |  | FirasDev | **P2/separate**: Windows PEEK+WAITALL | net: drop MSG_WAITALL when combined with MSG_PEEK on Windows |
+| [#506](https://github.com/KytyPS5/KytyPS5/pull/506) |  | Techx3 | **P1 perf split first**: GPU scheduling/cache FPS | renderer: reduce FPS overhead in GPU scheduling and resource caching |
+| [#497](https://github.com/KytyPS5/KytyPS5/pull/497) | yes | fxpw | **current integration**: yotei-windows-bringup draft; spinner proven; menu PENDING. | WIP: advance Ghost of Yōtei bring-up on Windows |
+| [#490](https://github.com/KytyPS5/KytyPS5/pull/490) |  | francoisatt | **see 8.09 catalog**: historical row below if still listed | shader: IMAGE_ATOMIC_FMIN/FMAX (MIMG 0x1e/0x1f) |
+| [#484](https://github.com/KytyPS5/KytyPS5/pull/484) |  | Leclowndu93150 | **see 8.09 catalog**: historical row below if still listed | shader: reuse SRT evaluator scratch between draws |
+| [#483](https://github.com/KytyPS5/KytyPS5/pull/483) |  | Leclowndu93150 | **see 8.09 catalog**: historical row below if still listed | renderer: skip GPU sync when unmapping non-GPU memory |
+| [#476](https://github.com/KytyPS5/KytyPS5/pull/476) |  | MehmetCambaz | **see 8.09 catalog**: historical row below if still listed | renderer: preserve byte offsets for sub-dword storage buffers |
+| [#473](https://github.com/KytyPS5/KytyPS5/pull/473) |  | brandostrong | **see 8.09 catalog**: historical row below if still listed | shader: query host readability once per region during the SRT walk |
+| [#463](https://github.com/KytyPS5/KytyPS5/pull/463) |  | brandostrong | **see 8.09 catalog**: historical row below if still listed | shader: wave32 lane-mask and compare writes leave vcc_hi and exec_hi untouched |
+| [#462](https://github.com/KytyPS5/KytyPS5/pull/462) |  | brandostrong | **see 8.09 catalog**: historical row below if still listed | shader: storage image writes skip out-of-range texels |
+| [#461](https://github.com/KytyPS5/KytyPS5/pull/461) |  | brandostrong | **see 8.09 catalog**: historical row below if still listed | cfg: sweep post-dominators in reverse block order |
+| [#459](https://github.com/KytyPS5/KytyPS5/pull/459) |  | brandostrong | **see 8.09 catalog**: historical row below if still listed | shader: do not dereference an unresolved descriptor address |
+| [#458](https://github.com/KytyPS5/KytyPS5/pull/458) |  | brandostrong | **see 8.09 catalog**: historical row below if still listed | shader: support the remaining wave32 SAVEEXEC variants |
+| [#448](https://github.com/KytyPS5/KytyPS5/pull/448) |  | MehmetCambaz | **see 8.09 catalog**: historical row below if still listed | shader: apply a storage buffer's host offset at byte granularity |
+| [#443](https://github.com/KytyPS5/KytyPS5/pull/443) |  | MehmetCambaz | **see 8.09 catalog**: historical row below if still listed | renderer: do not treat leftover depth-view write disables as a bound … |
+| [#431](https://github.com/KytyPS5/KytyPS5/pull/431) |  | brandostrong | **see 8.09 catalog**: historical row below if still listed | graphics: resolve table border colors from the guest border color table |
+| [#429](https://github.com/KytyPS5/KytyPS5/pull/429) |  | brandostrong | **see 8.09 catalog**: historical row below if still listed | graphics: materialize CMask fast clears and decode wide clear values |
+| [#420](https://github.com/KytyPS5/KytyPS5/pull/420) |  | MehmetCambaz | **see 8.09 catalog**: historical row below if still listed | shader: cut the allocations done for every draw call |
+| [#409](https://github.com/KytyPS5/KytyPS5/pull/409) |  | MehmetCambaz | **see 8.09 catalog**: historical row below if still listed | common: report crashes that reach no handler |
+| [#403](https://github.com/KytyPS5/KytyPS5/pull/403) |  | brandostrong | **see 8.09 catalog**: historical row below if still listed | shader: return zero from the clamp output modifier for NaN |
+| [#402](https://github.com/KytyPS5/KytyPS5/pull/402) |  | MehmetCambaz | **see 8.09 catalog**: historical row below if still listed | libs: make the per-library tracing flag reach the traced code |
+| [#379](https://github.com/KytyPS5/KytyPS5/pull/379) |  | Techx3 | **see 8.09 catalog**: historical row below if still listed | loader: validate ELF/SELF bounds with aligned-tail compatibility |
+| [#377](https://github.com/KytyPS5/KytyPS5/pull/377) |  | Techx3 | **see 8.09 catalog**: historical row below if still listed | tests: cover 1D-array color render targets |
+| [#375](https://github.com/KytyPS5/KytyPS5/pull/375) |  | Techx3 | **see 8.09 catalog**: historical row below if still listed | renderer: clamp render area to attachment mip views |
+| [#374](https://github.com/KytyPS5/KytyPS5/pull/374) |  | Techx3 | **see 8.09 catalog**: historical row below if still listed | renderer: clamp image copies to shared extents |
+| [#373](https://github.com/KytyPS5/KytyPS5/pull/373) |  | Techx3 | **see 8.09 catalog**: historical row below if still listed | renderer: preserve GPU-authored storage images during GC |
+| [#369](https://github.com/KytyPS5/KytyPS5/pull/369) |  | Techx3 | **see 8.09 catalog**: historical row below if still listed | shader: honor FP16 overflow mode across shader stages |
+| [#367](https://github.com/KytyPS5/KytyPS5/pull/367) |  | Techx3 | **see 8.09 catalog**: historical row below if still listed | shader: honor DX10_CLAMP NaN mode across shader stages |
+| [#362](https://github.com/KytyPS5/KytyPS5/pull/362) |  | Techx3 | **see 8.09 catalog**: historical row below if still listed | shader: make FP16 round-to-even deterministic |
+| [#353](https://github.com/KytyPS5/KytyPS5/pull/353) |  | Techx3 | **see 8.09 catalog**: historical row below if still listed | shader: ignore unreachable descriptor Phi inputs |
+| [#344](https://github.com/KytyPS5/KytyPS5/pull/344) |  | Techx3 | **see 8.09 catalog**: historical row below if still listed | kernel: implement POSIX file metadata APIs |
+| [#340](https://github.com/KytyPS5/KytyPS5/pull/340) |  | foufouadi | **see 8.09 catalog**: historical row below if still listed | shader: implement Yotei boot shader blockers |
+| [#338](https://github.com/KytyPS5/KytyPS5/pull/338) |  | foufouadi | **see 8.09 catalog**: historical row below if still listed | shader: IMAGE_ATOMIC_FMIN/FMAX + DPP8 (Ghost of Yōtei boot) |
+| [#322](https://github.com/KytyPS5/KytyPS5/pull/322) |  | chaitan3 | **see 8.09 catalog**: historical row below if still listed | Fix crash dialog when running the emulator under wine on linux |
+| [#247](https://github.com/KytyPS5/KytyPS5/pull/247) |  | Hashim1999164 | **see 8.09 catalog**: historical row below if still listed | logging: rotate printf log files to cap report size |
+| [#241](https://github.com/KytyPS5/KytyPS5/pull/241) |  | Pouare514 | **see 8.09 catalog**: historical row below if still listed | fix: SAMPLE_C color sampling, GPU write-watch, and Windows CET guest stacks |
+| [#167](https://github.com/KytyPS5/KytyPS5/pull/167) |  | Death-Whispers-U | **see 8.09 catalog**: historical row below if still listed | Decode sRGB in the shader for formats the host image cannot carry |
+| [#148](https://github.com/KytyPS5/KytyPS5/pull/148) |  | Stepz97 | **see 8.09 catalog**: historical row below if still listed | macOS boot hang after "Relocate program": ProtectGuestMemory applies guest-only protection to the host mapping (regression from #135) |
 
-### Ещё открытые кандидаты (без полного re-triage)
-
-Очередь correctness для текущего blocker: long run past spinner → menu frame;
-тяжёлый CS `54904fb4` CreatePipeline под GPUAV и specialization churn. Из старого
-списка по GitHub на 26.09 ещё open как минимум [#506](https://github.com/KytyPS5/KytyPS5/pull/506)
-(FPS/scheduling, dirty, split-first) и [#811](https://github.com/KytyPS5/KytyPS5/pull/811)
-(image side уже покрыт). Полный каталог ниже — исторический снимок 8.09; строки
-**covered**/**merged into main** выше имеют приоритет над таблицей.
 
 ---
 
-Снимок GitHub: **68 открытых PR** на 8 сентября 2026 года. Два из них draft:
-[#470](https://github.com/KytyPS5/KytyPS5/pull/470) и
-[#497](https://github.com/KytyPS5/KytyPS5/pull/497). Сравнение выполнено с веткой
-`yotei-windows-bringup`: первоначальный обзор — на `b247c0f`, runtime-уточнения
-ниже — после `90fed2b`, selective image ports и performance/runtime checkpoint
-`f1776f0`.
-
-Статус после обзора, **9 сентября 2026 года**: selective shared fixes и
-последующие cooperative-wave оптимизации довели игру до первого доказанного
-ненулевого изображения. На `96611fe` source frame 236 содержит ненулевой RGB,
-а сохранённый screenshot показывает белый loading spinner. Это закрывает только
-milestone первого rendered pixel; меню и gameplay остаются **PENDING**.
-
-Проверены метаданные, описания и состав diff всех 68 PR. Для shader/renderer,
-новых PR #493/#497/#500/#503/#504/#506/#508/#509 и кандидатов, пересекающихся
-с текущим запуском, дополнительно просмотрены изменения кода и текущее состояние
-ветки. Это triage и адресный code review, а не утверждение, что все 68 веток
-собраны и прогнаны. Авторские игровые результаты считаются подсказкой, а не нашей
-верификацией.
-
-## Короткий вывод
-
-Готового чужого PR, который можно целиком влить и получить меню Ghost of Yōtei,
-**нет**. Первый ненулевой кадр (spinner) на текущем tip `23e4fd74` уже доказан
-своим bring-up (`…-081515`). Следующий milestone — **первый кадр меню**; текущий
-runtime cost — GPUAV CreatePipeline на больших cooperative CS (`54904fb4`).
-Исторический вывод про PC `0x656c` / signed loop `6cc64dee` ниже сохранён как
-контекст 8–9 сентября, не как актуальный blocker.
-
-Нужный общий bounded-read proof уже существовал, но был безусловно отключён для
-dispatcher CFG. В `90fed2b` dispatcher теперь строит и проверяет полный CFG и
-использует тот же строгий proof. Неизменённый synthetic RED, точный manifest и
-игра проходят PC `0x656c`. Новый первый fatal — `indirect image table` с
-несовместимыми candidates на PC `0x7c4`. В `22242aa` перенесён только доказанный
-dimension-only подкласс из **#383**; игра проходит его и останавливается на новом
-PC `0x78b8`, где дополнительно различается shader swizzle (`0x24c/0`).
-
-Последующие selective shared fixes закрыли candidate-specific sampled swizzle,
-indirect storage writes и runtime specialization; целиком #383 вливать больше не
-нужно. Run `672af1f` прошёл эти resource frontiers и сам завершился на новом
-decoder gap `VOPC 0xbd` (`V_CMPX_NE_U16`) в frame 222. Checkpoint `5aaf3b4`
-закрывает его общим ISA lowering. Новый полный shader audit даёт **741/825**
-вместо 714/825; обе прежние группы `0xbd` (19 compact + 7 SDWA) исчезли.
-
-Последующий checkpoint `f1776f0` устранил измеренный compile-time blocker без
-переноса performance bundle: `6cc64dee…` теперь structured, exact audit занимает
-около 3,45 с вместо 13,02 с, а полный corpus — 37,851 с вместо 57,019 с.
-Сопоставимый GPUAV-lite game run дошёл до нового фронтира за 145 с вместо 1123 с
-(примерно 7,7x быстрее). Поэтому быстрый перенос #506 не был нужен для той
-паузы: его RELEASE_MEM/barrier/GC идеи относятся к scheduling overhead уже
-исполняющегося кадра. Последующие shared fixes прошли MUBUF `0x87` и довели
-запуск до ненулевого loading spinner; полноценная сцена ещё не получена.
-
-Самые полезные следующие кандидаты (**25.09**):
-
-0. **Address-backed buffer descriptor / tracking** (runtime blocker `86da5eb7…`).
-   Image side из #811 уже в ветке; нужен отдельный RED для buffer-key, не re-merge
-   #811. Это важнее любого старого open-PR из списка ниже.
-1. **#383 — heterogeneous indirect images.** Upstream **closed without merge**.
-   Нужные подклассы уже selective на ветке; целый PR не воскрешать.
-2. **#468 — `S_WQM_B32`.** Upstream **closed without merge**. Numeric WQM на ветке
-   шире; при новом decode gap — свой RED, не старый PR.
-3. **#373 — сохранение GPU-authored storage images при GC.** Это реальный общий
-   класс потери единственной актуальной копии изображения и потенциальная причина
-   чёрных/испорченных текстур. Он не доказан причиной текущего Yōtei-кадра, но
-   correctness-защита важнее одной лишь отсрочки GC из #506.
-4. **#463 — сохранение `vcc_hi`/`exec_hi` в wave32.** Может устранить shader loop
-   hang/device loss; сначала нужен точный sentinel RED по ISA, потому что старый
-   обзор не принял утверждение о footprint записи без проверки.
-5. **#429 — CMask fast clears.** Общая недостающая renderer-семантика, способная
-   оставлять цветовые поверхности пустыми. В последнем изученном Yōtei trace у
-   целевого пути `cmask_fast_clear_enable=false` и `cmask=0`, поэтому это не
-   объяснение текущего кадра; брать при первом фактическом CMask producer.
-6. **#462 и #464 — OOB image stores и точный размер vertex buffer.** Небольшие
-   общие correctness-кандидаты, которые предотвращают undefined Vulkan access и
-   мусорные vertex attributes. Нужны отдельные регрессии.
-7. **#420/#461/#483/#484/#506 — производительность.** Они не создадут правильный
-   кадр, но могут существенно ускорить длинный поиск последовательных блокеров.
-   Сначала профилировать текущую ветку; #506 (ещё open, dirty) разделить как
-   минимум на четыре независимых изменения (RELEASE_MEM batching, GC threshold,
-   read-only barrier, block descriptor reads). Из смерженного main после 20.09
-   смотреть #807 (draw/attrib hoist) только как P2 после correctness; #801/#816
-   — только при новом predicate/CMPX RED.
-8. **#509 — только отдельные части.** Custom primitive-restart remap и устранение
-   write-watcher accumulation заслуживают самостоятельных RED. Весь PR переносить
-   нельзя: fallback reserved/invalid vertex selectors в ноль скрывает unsupported
-   guest semantics, а большая несвязанная переработка descriptors не имеет
-   изолированных тестов на нашей ветке.
-9. **#409/#402/#447 — диагностика и CI.** Не исправляют игру напрямую, но уменьшают
-   немые падения, делают library tracing рабочим и запускают CPU recompiler tests
-   в CI. Это полезная инфраструктура для массового поиска ошибок.
-
-## Что уже покрыто текущей веткой
-
-- #338/#340/#490: IMAGE_ATOMIC_FMIN/FMAX и DPP8 перенесены и расширены native
-  regression-тестами; повторный merge не нужен.
-- #361/#470: logical lane ID и numeric EXEC/VCC/ballot покрыты более широкой
-  split-wave64 моделью. Draft #470 накладывать нельзя.
-- #457: локальный предел уже заменён `MaxImages=512` и проверками реальных Vulkan
-  layout/device limits; слепое `32 -> 64` слабее текущего решения.
-- #459: unreadable raw SRT fallback закрыт коммитом `1224cc8`.
-- #460: текущий `Evaluator` уже делает `m_visiting.pop_back()` на failure; заявленный
-  latent cleanup присутствует.
-- Signed runtime-loop proof для scalar-buffer descriptor tables уже был в
-  `BoundedReadProof`; `90fed2b` применяет его к dispatcher только после построения
-  и полной проверки guest CFG. Отдельный перенос этой части из другого PR не нужен.
-- #448/#476: byte/sub-DWORD storage offset адаптирован более узко и безопасно в
-  `5c7661d`, с сохранением unsupported границ.
-- #446: stencil discovery fixture в текущих тестах уже задаёт
-  `htile_stencil_disabled=false` явно.
-- #497 — это собственный draft текущей ветки. Он является местом интеграции, а не
-  внешним источником ещё одного исправления.
-- Из #500 уже выборочно перенесены нужные для достигнутого пути идеи: DWORD pattern
-  clear/HTILE, sampled-depth layout и связанные общие механизмы. Остаток #500 надо
-  рассматривать по одному commit только после соответствующего RED.
-- Полный повторный shader audit после runtime `V_CMPX_NE_U16` сохранён в
-  `_Build/shader-audits/yotei-current-20260908-vopc-bd/report.json`: 741/825,
-  84 pending. Corpus failures остаются очередью независимых механизмов, а не
-  основанием сливать какой-либо большой PR целиком.
-
-## Что не следует переносить целиком
-
-- **#353:** pruning descriptor Phi имеет структурный контрпример с обходным путём;
-  immediate-successor check недостаточен без edge-dominance proof.
-- **#427:** широкий bundle содержит skip/non-fatal обходы и старую fixed-scratch
-  wave64 модель, которая не решает текущую multi-wave scheduling семантику.
-- **#450:** полезная идея BDA prefetch смешана с ownership/readback рисками;
-  short-circuit может пропустить второй набор pointers, а image-owner separation
-  требует более строгого теста.
-- **#477:** большой bundle подменяет несовместимые non-null descriptor candidates
-  exemplar-значениями. Это нарушает требование не фабриковать guest resources.
-- **#493:** always-miss BVH stub допустим только как явно включаемая диагностика.
-  Он не реализует ray tracing и не должен становиться production default.
-- **#509:** полезные primitive-restart и watcher hunks отделить от fallback-to-zero
-  и остальных renderer/shader изменений.
-
-## Полный каталог 68 открытых PR
+## Исторический детальный каталог (снимок 8.09; PR ≤509)
 
 Обозначения: **P1** — рассмотреть скоро отдельным regression-first изменением;
 **P2** — полезный общий механизм, но нет связи с текущим симптомом; **covered** —
@@ -260,7 +247,7 @@ decoder gap `VOPC 0xbd` (`V_CMPX_NE_U16`) в frame 222. Checkpoint `5aaf3b4`
 | [#488 minimized window crash](https://github.com/KytyPS5/KytyPS5/pull/488) | **P2/separate:** полезный WSI fix, но не влияет на обычный не-minimized запуск. |
 | [#490 float image atomics](https://github.com/KytyPS5/KytyPS5/pull/490) | **covered:** production semantics уже в ветке; текущий PR head лишь другая актуализация того же класса. |
 | [#493 opt-in BVH stub](https://github.com/KytyPS5/KytyPS5/pull/493) | **diagnostic only:** decode/message полезны; always-miss не является реализацией ray tracing и не нужен Yōtei сейчас. |
-| [#497 current Yōtei draft](https://github.com/KytyPS5/KytyPS5/pull/497) | **current integration (26.09):** head `23e4fd74`, MERGEABLE vs main `fd2e15ee`; spinner/nonzero prepared frame 250 proven on current tip (`…-081515`); menu/gameplay PENDING; GPUAV CreatePipeline cost on CS `54904fb4` remains. |
+| [#497 current Yōtei draft](https://github.com/KytyPS5/KytyPS5/pull/497) | **current integration (26.09):** head `6fb832f8`, MERGEABLE vs main `fd2e15ee`; spinner proven; menu PENDING; see top snapshot for queue. |
 | [#500 Demon's Souls shader work](https://github.com/KytyPS5/KytyPS5/pull/500) | **closed unmerged (25.09) / partly covered:** часть уже перенесена; остаток только по отдельному RED, не revive whole. |
 | [#503 negative printf precision](https://github.com/KytyPS5/KytyPS5/pull/503) | **P2/separate:** корректный libc fix с хорошим focused coverage; не связан с renderer/shader failure. |
 | [#504 rejected-open descriptor leak](https://github.com/KytyPS5/KytyPS5/pull/504) | **P2/separate:** однострочный kernel cleanup с тестами; полезен глобально, не текущему run. |
@@ -268,30 +255,10 @@ decoder gap `VOPC 0xbd` (`V_CMPX_NE_U16`) в frame 222. Checkpoint `5aaf3b4`
 | [#508 Windows PEEK+WAITALL](https://github.com/KytyPS5/KytyPS5/pull/508) | **P2/separate:** чинит Windows test/socket compatibility; workaround не является полной WAITALL emulation. |
 | [#509 primitive restart/watcher/vertex](https://github.com/KytyPS5/KytyPS5/pull/509) | **P1 selective/do not merge whole:** custom restart и watcher lifecycle полезны; fallback invalid selectors в ноль неприемлем без доказательства. |
 
-## Рекомендуемая очередь без конфликтов со вторым агентом
+## Проверки переснимка 26.09
 
-1. Long run past spinner (`ContinueAfterColored`) до первого menu frame; фиксировать
-   post-spinner Fatal / CreatePipeline hang / resource admission без title branching.
-2. Для CS `54904fb4`: уменьшить SPIR-V / specialization churn (shared wave64
-   collectives, bounded CreatePipeline) — см. `emulator-test-debt.md`.
-3. Сохранять оставшиеся corpus failures как независимый backlog; поднимать
-   конкретную группу раньше runtime frontier только при доказанной общей
-   correctness-зависимости.
-4. После первого menu frame измерить #461, #420, #484, #483 и части #506 по
-   отдельности. Scheduling-порты не смешивать с opcode correctness.
-5. #509 разрезать на независимые primitive-restart, watcher-lifetime,
-   storage-view validation и selector-semantics задачи. Последнюю оставить
-   unsupported до появления спецификации/RED, не заменять произвольным нулём.
-
-## Проверки этого обзора
-
-- GitHub REST: `state=open`, `per_page=100`, получено 68 PR.
-- Все 68 head refs получены как `refs/remotes/upstream/open-pr/<number>` без
-  переключения рабочей ветки.
-- Сверены названия, draft state, body, base/head SHA и changed-file sets.
-- Первоначальный PR triage был read-only. Runtime-уточнение проверено synthetic
-  RED/GREEN, exact-manifest audit и bounded native game run на `90fed2b`.
-- Game run `_Build/runs/yotei-integrated-20260908-140320-cf909d` достиг frame 139,
-  124 shown frames и сменил fatal с PC `0x656c` на indirect image table PC `0x7c4`.
-- Последние runtime-логи использованы только для отрицательной проверки CMask:
-  найдено `cmask_fast_clear_enable=false`, `cmask=0` на изученном target path.
+- GitHub REST: `GET /repos/KytyPS5/KytyPS5/pulls?state=open&per_page=100` paginated → **113** PR.
+- Inventory TSV: `_Build` local `/tmp/open-prs-20260926.tsv` (not committed); numbers 148–845.
+- Changed-file sets fetched for interest set #497/#506/#509/#512/#532/#537/#555/#558/#562/#618/#628/#638/#640/#685/#690/#702/#706/#715/#717/#718/#727/#735/#741/#761/#767/#780/#789/#793/#795/#797/#799/#808/#811/#818/#820/#827/#833–#845.
+- No full checkout/build of all 113 heads; triage is metadata+paths+Yōtei runtime context.
+- Author game claims are hints, not our verification.

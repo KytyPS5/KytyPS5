@@ -1221,8 +1221,16 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 				EXIT_IF(sampler_plan.point_sampler[memory.sampler] == UINT32_MAX);
 				memory.sampler = sampler_plan.point_sampler[memory.sampler];
 			}
-			EXIT_IF(image.indirect_root == memory.resource &&
-			        inst.GetOpcode() != ValueOpcode::ImageSampleRaw);
+			if (image.indirect_root == memory.resource &&
+			    inst.GetOpcode() != ValueOpcode::ImageSampleRaw) {
+				EXIT("unsupported indirect image operation: shader=0x%016llx pc=0x%08x "
+				     "opcode=%s resource=%u instruction_dimension=%u sample_flags=0x%x "
+				     "candidates=%zu",
+				     static_cast<unsigned long long>(program.shader_hash),
+				     inst.Flags<MemoryFlags>().pc, ValueOpcodeName(inst.GetOpcode()),
+				     memory.resource, static_cast<uint32_t>(memory.image_dimension),
+				     memory.image_sample_flags, image.indirect_resources.size());
+			}
 		}
 	}
 	for (auto* block: program.blocks) {

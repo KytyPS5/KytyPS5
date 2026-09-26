@@ -82,8 +82,6 @@ runtime cost — GPUAV CreatePipeline на больших cooperative CS (`54904
 Исторический вывод про PC `0x656c` / signed loop `6cc64dee` ниже сохранён как
 контекст 8–9 сентября, не как актуальный blocker.
 
-а не constant guarded selector из регрессии `b247c0f`.
-
 Нужный общий bounded-read proof уже существовал, но был безусловно отключён для
 dispatcher CFG. В `90fed2b` dispatcher теперь строит и проверяет полный CFG и
 использует тот же строгий proof. Неизменённый synthetic RED, точный manifest и

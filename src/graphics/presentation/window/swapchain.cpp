@@ -4,6 +4,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/threads.h"
+#include "common/timer.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -706,33 +707,48 @@ bool Swapchain::NeedsResize() const {
 Swapchain::Status Swapchain::AcquireNextImage() {
 	EXIT_IF(m_handle == nullptr || m_frame_index >= m_image_acquired.size());
 	m_image_index = static_cast<uint32_t>(-1);
-	// Bound acquire so a drained swapchain cannot freeze the present thread (and
-	// therefore VideoOut Flip) indefinitely while the GPU continues submitting.
-	constexpr uint64_t kAcquireTimeoutNs = 1'000'000'000ull;
-	const auto         result            = m_window.graphic_ctx.device.acquireNextImageKHR(
-        m_handle, kAcquireTimeoutNs, m_image_acquired[m_frame_index], nullptr, &m_image_index);
-	switch (result) {
-		case vk::Result::eSuccess: break;
-		case vk::Result::eTimeout:
-			LOGF("vkAcquireNextImageKHR timed out after 1s; recreating swapchain\n");
-			Log::Flush();
-			return Status::Recreate;
-		case vk::Result::eSuboptimalKHR:
-			LOGF("vkAcquireNextImageKHR returned vk::Result::eSuboptimalKHR\n");
-			return Status::Recreate;
-		case vk::Result::eErrorOutOfDateKHR:
-			LOGF("vkAcquireNextImageKHR returned vk::Result::eErrorOutOfDateKHR\n");
-			return Status::Recreate;
-		case vk::Result::eErrorUnknown:
-			LOGF("vkAcquireNextImageKHR returned vk::Result::eErrorUnknown\n");
-			return Status::Recreate;
-		case vk::Result::eErrorSurfaceLostKHR:
-			LOGF("vkAcquireNextImageKHR returned vk::Result::eErrorSurfaceLostKHR\n");
-			return Status::SurfaceLost;
-		default: EXIT("vkAcquireNextImageKHR failed: %s\n", vk::to_string(result).c_str());
+	// Poll with timeout=0: some drivers do not reliably wake an unbounded or
+	// long acquireNextImage wait while the GPU keeps submitting, which freezes
+	// VideoOut Flip (ready=shown+1) without Fatal.
+	constexpr uint32_t kAcquirePollLimitMs = 1000;
+	const auto         begin               = Common::Timer::QueryPerformanceCounter();
+	const auto         frequency           = Common::Timer::QueryPerformanceFrequency();
+	for (;;) {
+		const auto result = m_window.graphic_ctx.device.acquireNextImageKHR(
+		    m_handle, 0, m_image_acquired[m_frame_index], nullptr, &m_image_index);
+		switch (result) {
+			case vk::Result::eSuccess:
+				EXIT_IF(m_image_index >= m_images.size());
+				return Status::Success;
+			case vk::Result::eTimeout: {
+				const auto now = Common::Timer::QueryPerformanceCounter();
+				const auto elapsed_ms =
+				    frequency == 0 ? kAcquirePollLimitMs
+				                   : static_cast<uint32_t>((now - begin) * 1000u / frequency);
+				if (elapsed_ms >= kAcquirePollLimitMs) {
+					LOGF("vkAcquireNextImageKHR timed out after %ums; recreating swapchain\n",
+					     elapsed_ms);
+					Log::Flush();
+					return Status::Recreate;
+				}
+				Common::Thread::SleepMicro(1000);
+				continue;
+			}
+			case vk::Result::eSuboptimalKHR:
+				LOGF("vkAcquireNextImageKHR returned vk::Result::eSuboptimalKHR\n");
+				return Status::Recreate;
+			case vk::Result::eErrorOutOfDateKHR:
+				LOGF("vkAcquireNextImageKHR returned vk::Result::eErrorOutOfDateKHR\n");
+				return Status::Recreate;
+			case vk::Result::eErrorUnknown:
+				LOGF("vkAcquireNextImageKHR returned vk::Result::eErrorUnknown\n");
+				return Status::Recreate;
+			case vk::Result::eErrorSurfaceLostKHR:
+				LOGF("vkAcquireNextImageKHR returned vk::Result::eErrorSurfaceLostKHR\n");
+				return Status::SurfaceLost;
+			default: EXIT("vkAcquireNextImageKHR failed: %s\n", vk::to_string(result).c_str());
+		}
 	}
-	EXIT_IF(m_image_index >= m_images.size());
-	return Status::Success;
 }
 
 bool Swapchain::PrepareSystemOverlay() {
@@ -845,7 +861,12 @@ Swapchain::Status Swapchain::Present() {
 	vk::Result result;
 	{
 		Common::LockGuard lock(m_window.graphic_ctx.queue_mutex);
+		LOGF("Present: vkQueuePresentKHR begin image=%u frame_slot=%u\n", m_image_index,
+		     m_frame_index);
+		Log::Flush();
 		result = m_window.graphic_ctx.queue.presentKHR(&present);
+		LOGF("Present: vkQueuePresentKHR end result=%s\n", vk::to_string(result).c_str());
+		Log::Flush();
 	}
 	switch (result) {
 		case vk::Result::eSuccess: break;
@@ -957,12 +978,31 @@ void Presenter::Present(Frame& frame, bool reuse) {
 			m_impl->frames.Release(&frame, reuse);
 			return;
 		}
+		// Do not hold the renderer mutex across acquire: a drained swapchain can
+		// wait while GPU work that frees images also needs this mutex.
+		m_impl->renderer.GetMutex().Unlock();
 
 		auto status = swapchain.AcquireNextImage();
 		if (status != Swapchain::Status::Success) {
-			m_impl->renderer.GetMutex().Unlock();
 			m_impl->RecoverSwapchain(status);
 			continue;
+		}
+
+		locked = false;
+		for (uint32_t spin = 0; spin < 5000; spin++) {
+			if (m_impl->renderer.GetMutex().TryLock()) {
+				locked = true;
+				break;
+			}
+			Common::Thread::SleepMicro(1000);
+		}
+		if (!locked) {
+			LOGF("Present: timed out waiting for renderer mutex after acquire; "
+			     "recreating swapchain and dropping frame\n");
+			Log::Flush();
+			m_impl->RecoverSwapchain(Swapchain::Status::Recreate);
+			m_impl->frames.Release(&frame, reuse);
+			return;
 		}
 		auto&      command = m_impl->present_scheduler.BeginCommand();
 		const bool draw_system_overlay =

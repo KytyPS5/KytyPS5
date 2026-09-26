@@ -41,6 +41,15 @@ Checkpoint Flip queue lock-order (Reserve cfg→m_mutex ABBA) **26 сентяб�
    shown не рос → frame watchdog Kill. `PipelineTrace: begin` есть, `done` нет.
 10. Следующее: Sync present-fix **без GPUAV** + elapsed на CreatePipeline;
     если pipeline создаётся — гнать следующий fatal. Меню/gameplay PENDING.
+11. **FPS без картинки (26 сен)**: shown/ready растут ~60fps, `last≥0`, окно
+    чёрное — Present blit жив, guest surface пустая (исторически RGB=0/A=3 до
+    spinner на `96611fe`). Readback в `PrepareFrame` крашил (0xC0000409): copy
+    ещё не submitted. Перенесён в `Present` после EOP Complete; формат
+    `A2R10G10B10` добавлен. Доказать pixel stats, затем producer RT.
+12. **Конфликты с main (локальные refs, fetch github:443 timeout)**:
+    `origin/main`=`c47c3d55`, `upstream/main`=`5ce4f083` — оба ancestors of
+    `yotei-windows-bringup` (`3d117be3`+); `merge-tree` → 0 CONFLICT. Удалённый
+    main новее локального refs — не проверен, пока нет сети.
 
 Checkpoint present soft-stall (shown≈130 / ready=shown+1) **26 сентября 2026 года**:
 

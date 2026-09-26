@@ -382,6 +382,7 @@ struct Presenter::Impl {
 			return;
 		}
 		if (capture_format != vk::Format::eA2B10G10R10UnormPack32 &&
+		    capture_format != vk::Format::eA2R10G10B10UnormPack32 &&
 		    capture_format != vk::Format::eR8G8B8A8Unorm &&
 		    capture_format != vk::Format::eB8G8R8A8Unorm &&
 		    capture_format != vk::Format::eR8G8B8A8Srgb &&
@@ -428,6 +429,12 @@ struct Presenter::Impl {
 				std::memcpy(&packed, bytes.data() + static_cast<size_t>(offset), sizeof(packed));
 				values = {packed & 0x3ffu, (packed >> 10u) & 0x3ffu,
 				          (packed >> 20u) & 0x3ffu, packed >> 30u};
+			} else if (capture_format == vk::Format::eA2R10G10B10UnormPack32) {
+				uint32_t packed = 0;
+				std::memcpy(&packed, bytes.data() + static_cast<size_t>(offset), sizeof(packed));
+				// A2R10G10B10_PACK32: B in bits 0-9, G 10-19, R 20-29, A 30-31.
+				values = {(packed >> 20u) & 0x3ffu, (packed >> 10u) & 0x3ffu,
+				          packed & 0x3ffu, packed >> 30u};
 			} else {
 				for (uint32_t channel = 0; channel < 4; channel++) {
 					values[channel] = bytes[static_cast<size_t>(offset + channel)];
@@ -1008,6 +1015,10 @@ void Presenter::Present(Frame& frame, bool reuse) {
 			return;
 		}
 		VideoOut::SetPresentStage(VideoOut::kPresentStagePresentSubmit);
+		// Guest CopyFrom runs on the flip EOP command buffer, which is complete by
+		// Present. Sample prepared pixels here — not inside PrepareFrame, where the
+		// copy is still only recorded and a nested present_scheduler submit crashes.
+		m_impl->CapturePreparedFrame(frame);
 		auto&      command = m_impl->present_scheduler.BeginCommand();
 		const bool draw_system_overlay =
 		    overlay_visual.active && swapchain.PrepareSystemOverlay();

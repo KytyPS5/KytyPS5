@@ -6,8 +6,10 @@
 
 #include <cstdlib>
 #include <iostream>
+#include <iterator>
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace {
 
@@ -89,6 +91,23 @@ bool ReadMemory(void *userdata, uint64_t address, std::span<uint32_t> values) {
   }
   memory.reads++;
   return true;
+}
+
+bool DependsOn(Value value, Value target, std::unordered_set<Inst *> &visited) {
+  value = value.Resolve();
+  target = target.Resolve();
+  if (value == target) return true;
+  auto *inst = value.TryInstruction();
+  if (inst == nullptr || !visited.insert(inst).second) return false;
+  for (size_t index = 0; index < inst->NumArgs(); index++) {
+    if (DependsOn(inst->Arg(index), target, visited)) return true;
+  }
+  return false;
+}
+
+bool DependsOn(Value value, Value target) {
+  std::unordered_set<Inst *> visited;
+  return DependsOn(value, target, visited);
 }
 
 Value Address(Fixture &fixture, Value low, Value high, uint32_t block = 0) {
@@ -490,6 +509,108 @@ void TestReadLaneElimination() {
   fixture.Emit(ValueOpcode::IAdd32, {dynamic, Value(1u)});
   Check(EliminateReadLane(fixture.program, 64).rewritten_reads == 0,
         "dynamic-lane read was rewritten unsafely");
+
+  const auto memory = fixture.AddMemory(ResourceKind::ScalarBuffer);
+  const auto buffer = fixture.Emit(ValueOpcode::GetBufferResource,
+                                   {Value(0x3000u), Value(0u), Value(16u), Value(0u)});
+  const auto scalar = fixture.EmitMemory(ValueOpcode::ReadConstBuffer,
+                                         {buffer, Value(0u)}, memory);
+  Check(ValidateRuntimeValue(fixture.program, scalar, RuntimeValueType::Integer),
+        "scalar constant-buffer root was not proven uniform");
+  const auto exec = fixture.Emit(ValueOpcode::GetExec);
+  const auto varying_old_byte = fixture.Emit(ValueOpcode::GetVectorRegister,
+                                             {Value(static_cast<VectorReg>(4))});
+  const auto computed_byte_f32 = fixture.Emit(
+      ValueOpcode::ConvertF32U32,
+      {fixture.Emit(ValueOpcode::BitwiseAnd32,
+                    {fixture.Emit(ValueOpcode::ShiftRightLogical32,
+                                  {scalar, Value(8u)}),
+                     Value(0xffu)})});
+  const auto computed_byte = fixture.Emit(ValueOpcode::BitCastU32F32,
+                                          {computed_byte_f32});
+  const auto masked_byte = fixture.Emit(ValueOpcode::SelectU32,
+                                        {exec, computed_byte, varying_old_byte});
+  const auto reciprocal = fixture.Emit(
+      ValueOpcode::FPRecipIFlag32,
+      {fixture.Emit(ValueOpcode::BitCastF32U32, {masked_byte})});
+  const auto reciprocal_bits = fixture.Emit(ValueOpcode::BitCastU32F32,
+                                            {reciprocal});
+  const auto varying_old_reciprocal = fixture.Emit(ValueOpcode::GetVectorRegister,
+                                                   {Value(static_cast<VectorReg>(5))});
+  const auto masked_reciprocal_bits = fixture.Emit(
+      ValueOpcode::SelectU32,
+      {exec, reciprocal_bits, varying_old_reciprocal});
+  const auto masked_reciprocal = fixture.Emit(
+      ValueOpcode::BitCastF32U32, {masked_reciprocal_bits});
+  const auto product = fixture.Emit(ValueOpcode::FPMul32,
+                                    {masked_reciprocal, Value::F32(2.0f)});
+  const auto zero = Value::F32(0.0f);
+  const auto nan = fixture.Emit(ValueOpcode::FPIsNan32, {product});
+  const auto low = fixture.Emit(ValueOpcode::FPOrdLessThanEqual32, {product, zero});
+  const auto high = fixture.Emit(ValueOpcode::FPOrdGreaterThanEqual32,
+                                 {product, Value::F32(4294967296.0f)});
+  const auto truncated = fixture.Emit(ValueOpcode::FPTrunc32, {product});
+  const auto safe_low = fixture.Emit(ValueOpcode::SelectF32,
+                                     {fixture.Emit(ValueOpcode::LogicalOr, {nan, low}), zero,
+                                      truncated});
+  const auto safe = fixture.Emit(ValueOpcode::SelectF32,
+                                 {high, Value::F32(4294967040.0f), safe_low});
+  const auto converted = fixture.Emit(ValueOpcode::ConvertU32F32, {safe});
+  const auto computed = fixture.Emit(ValueOpcode::SelectU32,
+                                     {high, Value(UINT32_MAX), converted});
+  const auto varying_old_outer = fixture.Emit(ValueOpcode::GetVectorRegister,
+                                              {Value(static_cast<VectorReg>(6))});
+  const auto masked_outer = fixture.Emit(ValueOpcode::SelectU32,
+                                         {exec, computed, varying_old_outer});
+  const auto first = fixture.Emit(ValueOpcode::ReadFirstLane, {masked_outer, exec});
+  const auto uniform_use = fixture.Emit(ValueOpcode::IAdd32, {first, Value(1u)});
+  ValidateProgram(fixture.program, false);
+  const auto nested_stats = EliminateReadLane(fixture.program, 64);
+  ValidateProgram(fixture.program, false);
+  const auto rewritten = uniform_use.ResolveInstruction()->Arg(0).Resolve();
+  Check(nested_stats.rewritten_reads == 1 && DependsOn(rewritten, scalar) &&
+            !DependsOn(rewritten, masked_byte) &&
+            !DependsOn(rewritten, masked_reciprocal_bits) &&
+            !DependsOn(rewritten, masked_outer) &&
+            !DependsOn(rewritten, varying_old_byte) &&
+            !DependsOn(rewritten, varying_old_reciprocal) &&
+            !DependsOn(rewritten, varying_old_outer),
+        "nested EXEC-masked first-lane chain was not reconstructed");
+
+  const auto varying = fixture.Emit(ValueOpcode::GetVectorRegister,
+                                    {Value(static_cast<VectorReg>(7))});
+  const auto varying_masked = fixture.Emit(ValueOpcode::SelectU32, {exec, varying, varying_old_outer});
+  const auto varying_first = fixture.Emit(ValueOpcode::ReadFirstLane,
+                                          {varying_masked, exec});
+  const auto varying_use = fixture.Emit(ValueOpcode::IAdd32, {varying_first, Value(1u)});
+  Check(EliminateReadLane(fixture.program, 64).rewritten_reads == 0 &&
+            varying_use.ResolveInstruction()->Arg(0).Resolve() == varying_first.Resolve(),
+        "lane-varying first-lane source was rewritten unsafely");
+
+  Fixture refusal;
+  const auto refusal_exec = refusal.Emit(ValueOpcode::GetExec);
+  const auto cloneable = refusal.Emit(ValueOpcode::FPMul32,
+                                      {Value::F32(2.0f), Value::F32(3.0f)});
+  const auto cloneable_bits = refusal.Emit(ValueOpcode::BitCastU32F32,
+                                           {cloneable});
+  const auto refusal_varying = refusal.Emit(ValueOpcode::GetVectorRegister,
+                                            {Value(static_cast<VectorReg>(1))});
+  const auto partial = refusal.Emit(ValueOpcode::IAdd32,
+                                    {cloneable_bits, refusal_varying});
+  const auto refusal_old = refusal.Emit(ValueOpcode::GetVectorRegister,
+                                        {Value(static_cast<VectorReg>(2))});
+  const auto refusal_masked = refusal.Emit(ValueOpcode::SelectU32,
+                                           {refusal_exec, partial, refusal_old});
+  const auto refusal_first = refusal.Emit(ValueOpcode::ReadFirstLane,
+                                          {refusal_masked, refusal_exec});
+  const auto refusal_use = refusal.Emit(ValueOpcode::IAdd32, {refusal_first, Value(1u)});
+  ValidateProgram(refusal.program, false);
+  const auto before = std::distance(refusal.BlockAt().begin(), refusal.BlockAt().end());
+  Check(EliminateReadLane(refusal.program, 64).rewritten_reads == 0 &&
+            std::distance(refusal.BlockAt().begin(), refusal.BlockAt().end()) == before &&
+            refusal_use.ResolveInstruction()->Arg(0).Resolve() == refusal_first.Resolve(),
+        "failed first-lane proof modified the IR");
+  ValidateProgram(refusal.program, false);
 }
 
 void TestOptimizationPipeline() {

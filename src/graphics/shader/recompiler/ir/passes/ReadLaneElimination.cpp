@@ -1,5 +1,7 @@
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 
+#include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
+
 #include <algorithm>
 
 #include <queue>
@@ -15,6 +17,106 @@ struct ChainResult {
 	Value value;
 	Inst* write = nullptr;
 };
+
+bool IsLaneInvariantOpcode(ValueOpcode opcode) {
+	switch (opcode) {
+		case ValueOpcode::BitCastU32F32:
+		case ValueOpcode::BitCastF32U32:
+		case ValueOpcode::ConvertF32U32:
+		case ValueOpcode::ConvertU32F32:
+		case ValueOpcode::IAdd32:
+		case ValueOpcode::IMul32:
+		case ValueOpcode::BitwiseAnd32:
+		case ValueOpcode::ShiftRightLogical32:
+		case ValueOpcode::FPRecip32:
+		case ValueOpcode::FPRecipIFlag32:
+		case ValueOpcode::FPMul32:
+		case ValueOpcode::FPIsNan32:
+		case ValueOpcode::FPOrdLessThanEqual32:
+		case ValueOpcode::FPOrdGreaterThanEqual32:
+		case ValueOpcode::FPTrunc32:
+		case ValueOpcode::LogicalOr:
+		case ValueOpcode::SelectF32:
+		case ValueOpcode::SelectU32: return true;
+		default: return false;
+	}
+}
+
+bool CanRebuildLaneInvariant(const Program& program, Value value, Value exec,
+                             std::unordered_map<Inst*, bool>& memo,
+                             std::unordered_set<Inst*>&       visiting) {
+	value = value.Resolve();
+	if (value.IsImmediate()) return true;
+	auto* inst = value.TryInstruction();
+	if (inst == nullptr) return false;
+	if (const auto it = memo.find(inst); it != memo.end()) return it->second;
+	if (!visiting.insert(inst).second) return false;
+
+	bool result = false;
+	if (inst->GetOpcode() == ValueOpcode::GetUserData ||
+	    inst->GetOpcode() == ValueOpcode::GetShaderBase ||
+	    inst->GetOpcode() == ValueOpcode::GetScalarRegister) {
+		result = true;
+	} else if (inst->GetOpcode() == ValueOpcode::ReadConstBuffer) {
+		result = ValidateRuntimeValue(program, value, RuntimeValueType::Integer);
+	} else if (inst->GetOpcode() == ValueOpcode::SelectU32 &&
+	           inst->Arg(0).Resolve() == exec.Resolve()) {
+		result = CanRebuildLaneInvariant(program, inst->Arg(1), exec, memo, visiting);
+	} else if (IsLaneInvariantOpcode(inst->GetOpcode())) {
+		result = true;
+		for (size_t index = 0; result && index < inst->NumArgs(); index++) {
+			result = CanRebuildLaneInvariant(program, inst->Arg(index), exec, memo, visiting);
+		}
+	}
+
+	visiting.erase(inst);
+	memo.emplace(inst, result);
+	return result;
+}
+
+Value CloneLaneInvariant(Inst& inst, Block& block, Block::iterator insertion_point,
+                         const std::vector<Value>& args) {
+	const auto opcode = inst.GetOpcode();
+	const auto flags  = inst.Flags<uint64_t>();
+	switch (args.size()) {
+		case 0: return Value(&*block.PrependNewInst(insertion_point, opcode, {}, flags));
+		case 1: return Value(&*block.PrependNewInst(insertion_point, opcode, {args[0]}, flags));
+		case 2:
+			return Value(
+			    &*block.PrependNewInst(insertion_point, opcode, {args[0], args[1]}, flags));
+		case 3:
+			return Value(&*block.PrependNewInst(insertion_point, opcode,
+			                                    {args[0], args[1], args[2]}, flags));
+		default: EXIT("unsupported lane-invariant opcode arity");
+	}
+	return {};
+}
+
+Value RebuildLaneInvariant(Value value, Value exec, Block& block, Block::iterator insertion_point,
+                           std::unordered_map<Inst*, Value>& memo) {
+	value = value.Resolve();
+	if (value.IsImmediate()) return value;
+	auto* inst = value.ResolveInstruction();
+	if (const auto it = memo.find(inst); it != memo.end()) return it->second;
+	if (inst->GetOpcode() == ValueOpcode::GetUserData ||
+	    inst->GetOpcode() == ValueOpcode::GetShaderBase ||
+	    inst->GetOpcode() == ValueOpcode::GetScalarRegister ||
+	    inst->GetOpcode() == ValueOpcode::ReadConstBuffer) {
+		return value;
+	}
+	if (inst->GetOpcode() == ValueOpcode::SelectU32 && inst->Arg(0).Resolve() == exec.Resolve()) {
+		return RebuildLaneInvariant(inst->Arg(1), exec, block, insertion_point, memo);
+	}
+
+	std::vector<Value> args;
+	args.reserve(inst->NumArgs());
+	for (size_t index = 0; index < inst->NumArgs(); index++) {
+		args.push_back(RebuildLaneInvariant(inst->Arg(index), exec, block, insertion_point, memo));
+	}
+	const auto rebuilt = CloneLaneInvariant(*inst, block, insertion_point, args);
+	memo.emplace(inst, rebuilt);
+	return rebuilt;
+}
 
 ChainResult SearchChain(Value value, uint32_t lane, uint32_t wave_size) {
 	for (;;) {
@@ -109,6 +211,25 @@ ReadLaneStats EliminateReadLane(Program& program, uint32_t wave_size) {
 
 	for (auto* block: program.blocks) {
 		for (auto& inst: *block) {
+			if (inst.GetOpcode() == ValueOpcode::ReadFirstLane) {
+				const auto                      source = inst.Arg(0);
+				const auto                      exec   = inst.Arg(1);
+				std::unordered_map<Inst*, bool> validation_memo;
+				std::unordered_set<Inst*>       visiting;
+				if (!CanRebuildLaneInvariant(program, source, exec, validation_memo, visiting)) {
+					continue;
+				}
+				auto* current_block = inst.Parent();
+				auto  insertion_point =
+				    std::find_if(current_block->begin(), current_block->end(),
+				                 [&](const Inst& candidate) { return &candidate == &inst; });
+				std::unordered_map<Inst*, Value> rebuild_memo;
+				const auto rebuilt = RebuildLaneInvariant(source, exec, *current_block,
+				                                          insertion_point, rebuild_memo);
+				inst.ReplaceUsesWith(rebuilt);
+				stats.rewritten_reads++;
+				continue;
+			}
 			if (inst.GetOpcode() != ValueOpcode::ReadLane) {
 				continue;
 			}

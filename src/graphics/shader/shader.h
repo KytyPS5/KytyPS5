@@ -154,6 +154,13 @@ struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
 	ShaderStageRuntime stage;
 };
 
+// Whether pixel shaders may read raw per-vertex attributes and barycentric coordinates
+// (VK_KHR_fragment_shader_barycentric). Set from the host device; new pixel input
+// descriptions default to it. Without it the host interpolates every attribute and V_INTERP
+// results are the interpolated values, which approximates custom interpolation.
+bool DefaultHostBarycentrics();
+void SetDefaultHostBarycentrics(bool enabled);
+
 struct ShaderPixelInputInfo {
 	uint32_t                                       interpolator_settings[32]    = {0};
 	uint32_t                                       input_num                    = 0;
@@ -179,6 +186,7 @@ struct ShaderPixelInputInfo {
 	bool                                           dual_source_blending         = false;
 	bool                                           ps_early_z                   = false;
 	bool                                           ps_execute_on_noop           = false;
+	bool                                           host_barycentrics = DefaultHostBarycentrics();
 	ShaderStageRuntime                             stage;
 
 	bool HasPositionInput() const { return ps_pos_x || ps_pos_y || ps_pos_z || ps_pos_w; }

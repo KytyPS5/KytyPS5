@@ -1,6 +1,3 @@
-#include <SDL3/SDL.h>
-#include <SDL3/SDL_vulkan.h>
-
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
@@ -19,10 +16,13 @@
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
 #include "graphics/presentation/window/windowInternal.h"
+#include "graphics/shader/shader.h"
 #include "kernel/memory.h"
 #include "libs/controller.h"
 #include "loader/systemContent.h"
 
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_vulkan.h>
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -55,6 +55,8 @@ vk::PhysicalDeviceVulkan12Features WindowContext::RequiredVulkan12Features() noe
 	features.shaderOutputViewportIndex = VK_TRUE;
 	features.bufferDeviceAddress       = VK_TRUE;
 	features.shaderBufferInt64Atomics  = VK_TRUE;
+	// The renderer binds depth-only and stencil-only attachment layouts.
+	features.separateDepthStencilLayouts = VK_TRUE;
 	return features;
 }
 
@@ -235,7 +237,9 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 #endif
 		}
 		if (image_view_min_lod.minLod != VK_TRUE) {
-			reject("image view minLod is not supported");
+			// Optional: guest minimum-LOD clamps are ignored without it.
+			LOGF(
+			    "image view minLod is not supported; texture minimum LOD clamps will be ignored\n");
 		}
 
 		if (depth_clip_control.depthClipControl != VK_TRUE) {
@@ -253,7 +257,10 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 			reject("depthClamp is not supported");
 		}
 		if (fragment_barycentric.fragmentShaderBarycentric != VK_TRUE) {
-			reject("fragmentShaderBarycentric is not supported");
+			// Optional: pixel shader inputs are then interpolated by the host instead of
+			// from the raw vertex attributes (custom interpolation is approximated).
+			LOGF("fragmentShaderBarycentric is not supported; pixel inputs will be interpolated "
+			     "by the host\n");
 		}
 #endif
 
@@ -280,6 +287,10 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		if (required_features12.shaderBufferInt64Atomics == VK_TRUE &&
 		    features12.shaderBufferInt64Atomics != VK_TRUE) {
 			reject("shaderBufferInt64Atomics is not supported");
+		}
+		if (required_features12.separateDepthStencilLayouts == VK_TRUE &&
+		    features12.separateDepthStencilLayouts != VK_TRUE) {
+			reject("separateDepthStencilLayouts is not supported");
 		}
 		if (features13.robustImageAccess != VK_TRUE) {
 			reject("robustImageAccess is not supported");
@@ -486,13 +497,17 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	vk::PhysicalDeviceDepthClipControlFeaturesEXT depth_clip_control {};
 	vk::PhysicalDeviceImageViewMinLodFeaturesEXT  image_view_min_lod {};
 	image_view_min_lod.minLod = VK_TRUE;
-	depth_clip_control.pNext  = &image_view_min_lod;
 	// MoltenVK lacks VK_EXT_depth_clip_enable and VK_EXT_color_write_enable, so drop those
 	// feature structs from the chain on macOS (the renderer falls back to default depth
-	// clipping and static color-write masks).
+	// clipping and static color-write masks). The min-LOD struct is chained only when the
+	// device offers the extension.
 #if !defined(__APPLE__)
-	image_view_min_lod.pNext = &depth_clip_enable;
+	void* const clip_chain = &depth_clip_enable;
+#else
+	void* const clip_chain = nullptr;
 #endif
+	image_view_min_lod.pNext            = clip_chain;
+	depth_clip_control.pNext            = clip_chain; // min LOD is inserted below if supported
 	depth_clip_control.depthClipControl = VK_TRUE;
 
 	auto features12  = WindowContext::RequiredVulkan12Features();
@@ -531,8 +546,33 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		provoking_vertex.pNext = supported_features2.pNext;
 		supported_features2.pNext = &provoking_vertex;
 	}
+	const bool min_lod_extension =
+	    HasExtension(device_extensions, VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
+	vk::PhysicalDeviceImageViewMinLodFeaturesEXT supported_min_lod {};
+	if (min_lod_extension) {
+		supported_min_lod.pNext   = supported_features2.pNext;
+		supported_features2.pNext = &supported_min_lod;
+	}
+	const bool barycentric_extension =
+	    HasExtension(device_extensions, VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
+	vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR supported_barycentric {};
+	if (barycentric_extension) {
+		supported_barycentric.pNext = supported_features2.pNext;
+		supported_features2.pNext   = &supported_barycentric;
+	}
 	physical_device.getFeatures2(&supported_features2);
 	graphics.mesh_shader_enabled = mesh_extension && supported_mesh.meshShader;
+	graphics.image_view_min_lod_enabled = min_lod_extension && supported_min_lod.minLod == VK_TRUE;
+	if (graphics.image_view_min_lod_enabled) {
+		depth_clip_control.pNext = &image_view_min_lod;
+	}
+	graphics.fragment_shader_barycentric_enabled =
+	    barycentric_extension && supported_barycentric.fragmentShaderBarycentric == VK_TRUE;
+	// Pixel input descriptions built from now on default to the host's capability.
+	SetDefaultHostBarycentrics(graphics.fragment_shader_barycentric_enabled);
+	LOGF("Vulkan fragment shader barycentrics: %s, image view min LOD: %s\n",
+	     graphics.fragment_shader_barycentric_enabled ? "true" : "false",
+	     graphics.image_view_min_lod_enabled ? "true" : "false");
 
 	vk::PhysicalDeviceSubgroupSizeControlProperties subgroup_size_control {};
 
@@ -608,15 +648,16 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	graphics.sample_rate_shading_enabled                 = true;
 	device_features.shaderInt64 = VK_TRUE;
 
-	vk::PhysicalDeviceRobustness2FeaturesEXT robustness2 {};
-#if defined(__APPLE__)
-	robustness2.pNext = &features12;
-#else
+	vk::PhysicalDeviceRobustness2FeaturesEXT               robustness2 {};
 	vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR fragment_barycentric {};
 	fragment_barycentric.pNext                     = &features12;
 	fragment_barycentric.fragmentShaderBarycentric = VK_TRUE;
-	robustness2.pNext                              = &fragment_barycentric;
-#endif
+	// Chained only when the device supports the feature; the recompiler then interpolates
+	// pixel inputs on the host instead of from raw vertex attributes.
+	void* const barycentric_chain = graphics.fragment_shader_barycentric_enabled
+	                                    ? static_cast<void*>(&fragment_barycentric)
+	                                    : static_cast<void*>(&features12);
+	robustness2.pNext             = barycentric_chain;
 	if (robustness2_ext_enabled) {
 		robustness2.robustBufferAccess2 = supported_robustness2.robustBufferAccess2;
 		robustness2.robustImageAccess2  = supported_robustness2.robustImageAccess2;
@@ -624,13 +665,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	}
 
 	auto features13 = WindowContext::RequiredVulkan13Features();
-#if defined(__APPLE__)
-	features13.pNext = robustness2_ext_enabled ? static_cast<void*>(&robustness2)
-	                                           : static_cast<void*>(&features12);
-#else
-	features13.pNext = robustness2_ext_enabled ? static_cast<void*>(&robustness2)
-	                                           : static_cast<void*>(&fragment_barycentric);
-#endif
+	features13.pNext =
+	    robustness2_ext_enabled ? static_cast<void*>(&robustness2) : barycentric_chain;
 	features13.robustImageAccess   = supported_features13.robustImageAccess;
 	features13.subgroupSizeControl =
 	    graphics.compute_subgroup_size_control_enabled ? VK_TRUE : VK_FALSE;
@@ -952,8 +988,7 @@ void WindowContext::CreateVulkan() {
 
 	std::vector<const char*> device_extensions = {
 	    VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME,
-	    VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
-	    "VK_KHR_maintenance1"};
+	    VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME, "VK_KHR_maintenance1"};
 
 #if defined(__APPLE__)
 	// MoltenVK lacks VK_EXT_depth_clip_enable and VK_EXT_color_write_enable; the renderer
@@ -963,7 +998,6 @@ void WindowContext::CreateVulkan() {
 #else
 	device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
 	device_extensions.push_back(VK_EXT_COLOR_WRITE_ENABLE_EXTENSION_NAME);
-	device_extensions.push_back(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
 #endif
 
 #ifdef KYTY_ENABLE_DEBUG_PRINTF
@@ -1019,10 +1053,12 @@ void WindowContext::CreateVulkan() {
 			device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 			graphic_ctx.memory_budget_ext_enabled = true;
 		}
-		for (const auto* extension: {VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
-		                             VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
-		                             VK_EXT_MESH_SHADER_EXTENSION_NAME,
-		                             VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME}) {
+		// Optional extensions: the renderer degrades without them (see GraphicContext).
+		for (const auto* extension:
+		     {VK_EXT_ROBUSTNESS_2_EXTENSION_NAME, VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
+		      VK_EXT_MESH_SHADER_EXTENSION_NAME, VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME,
+		      VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME,
+		      VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME}) {
 			if (HasExtension(available_extensions, extension)) {
 				device_extensions.push_back(extension);
 			}

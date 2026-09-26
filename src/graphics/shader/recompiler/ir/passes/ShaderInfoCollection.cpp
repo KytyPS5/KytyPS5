@@ -226,6 +226,12 @@ void CollectPixelInputs(const Program& program, const ShaderPixelInputInfo* pixe
 			}
 		}
 	}
+	// Without host barycentrics every input is interpolated by the host: V_INTERP_MOV
+	// then yields the interpolated value (or the flat provoking-vertex value) and no
+	// per-vertex arrays or gl_BaryCoord inputs are declared.
+	if (!pixel->host_barycentrics) {
+		per_vertex.fill(false);
+	}
 	// Aliases of a vertex output share one SPIR-V interface variable. If any
 	// alias reads raw vertices, interpolate the other aliases from those too.
 	for (uint32_t input = 0; input < pixel->input_num; input++) {
@@ -268,7 +274,12 @@ void CollectComputeInputs(const ShaderComputeInputInfo* compute, ShaderInfo& inf
 	}
 }
 
-void CollectBuiltinInputs(const Program& program, ShaderInfo& info) {
+void CollectBuiltinInputs(const Program& program, ShaderStageInputInfo input_info,
+                          ShaderInfo& info) {
+	// Without host barycentrics a pixel shader has no source for the I/J VGPRs: the loads stay
+	// in the program and the backend yields zero for an input that was never declared.
+	const bool barycentrics = program.stage != ShaderType::Pixel || input_info.pixel == nullptr ||
+	                          input_info.pixel->host_barycentrics;
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			if (program.stage == ShaderType::TessellationControl &&
@@ -301,10 +312,14 @@ void CollectBuiltinInputs(const Program& program, ShaderInfo& info) {
 				case StageInputKind::SampleId: AddInput(info, kind, 0, 1, "gl_SampleID"); break;
 				case StageInputKind::BaryCoordSmooth:
 				case StageInputKind::BaryCoordSmoothCentroid:
-					AddInput(info, StageInputKind::BaryCoordSmooth, 0, 3, "gl_BaryCoordKHR");
+					if (barycentrics) {
+						AddInput(info, StageInputKind::BaryCoordSmooth, 0, 3, "gl_BaryCoordKHR");
+					}
 					break;
 				case StageInputKind::BaryCoordNoPerspective:
-					AddInput(info, kind, 0, 3, "gl_BaryCoordNoPerspKHR");
+					if (barycentrics) {
+						AddInput(info, kind, 0, 3, "gl_BaryCoordNoPerspKHR");
+					}
 					break;
 				case StageInputKind::WorkgroupId:
 					AddInput(info, kind, 0, 3, "gl_WorkGroupID");
@@ -423,7 +438,7 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 		case ShaderType::Compute: CollectComputeInputs(input_info.compute, next); break;
 		default: return Fail("unsupported shader stage for info collection");
 	}
-	CollectBuiltinInputs(program, next);
+	CollectBuiltinInputs(program, input_info, next);
 	CollectOutputs(program, input_info, next);
 	program.info                 = std::move(next);
 	program.shader_info_complete = true;

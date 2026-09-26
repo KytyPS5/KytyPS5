@@ -15612,6 +15612,8 @@ private:
     m_runtime_context.queue = m_queue;
     m_runtime_context.attachment_feedback_loop_enabled = true;
     m_runtime_context.provoking_vertex_last_enabled = true;
+    m_runtime_context.fragment_shader_barycentric_enabled = m_fragment_barycentrics;
+    m_runtime_context.image_view_min_lod_enabled = m_image_view_min_lod;
     const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info{
         .format = vk::Format::eBc1RgbaUnormBlock,
         .type = vk::ImageType::e2D,
@@ -15696,22 +15698,28 @@ private:
           features.sType = vk::StructureType::ePhysicalDeviceFeatures2;
           features.pNext = &barycentric;
           physical.getFeatures2(&features);
-          if (barycentric.fragmentShaderBarycentric != true ||
-              features.features.shaderInt64 != true ||
+          if (features.features.shaderInt64 != true ||
               features12.bufferDeviceAddress != true) {
             continue;
           }
-          m_physical_device = physical;
-          m_queue_family = i;
+          // Prefer a device with fragment barycentrics (the console-accurate pixel input
+          // path); fall back to the host-interpolated path otherwise, like the renderer.
+          const bool has_barycentrics = barycentric.fragmentShaderBarycentric == true;
+          if (m_physical_device == nullptr || (has_barycentrics && !m_fragment_barycentrics)) {
+            m_physical_device = physical;
+            m_queue_family = i;
+            m_fragment_barycentrics = has_barycentrics;
+          }
           break;
         }
       }
-      if (m_physical_device != nullptr) {
+      if (m_physical_device != nullptr && m_fragment_barycentrics) {
         break;
       }
     }
     Require("VulkanHarness", "dispatch", m_physical_device != nullptr,
-            "no Vulkan graphics+compute device with fragment barycentrics");
+            "no Vulkan graphics+compute device with shaderInt64 and bufferDeviceAddress");
+    SetDefaultHostBarycentrics(m_fragment_barycentrics);
     m_physical_device.getMemoryProperties(&m_memory_properties);
 
     vk::PhysicalDeviceFeatures available_features{};
@@ -15767,8 +15775,7 @@ private:
     Require("VulkanHarness", "dispatch",
             available_features12.bufferDeviceAddress == true,
             "bufferDeviceAddress is not supported");
-    Require("VulkanHarness", "dispatch", available_min_lod.minLod == true,
-            "image view minimum LOD is not supported");
+    m_image_view_min_lod = available_min_lod.minLod == true;
     Require("VulkanHarness", "graphics", available_features12.shaderOutputLayer == true,
             "vertex layer output is not supported");
     Require("VulkanHarness", "graphics", available_features.fillModeNonSolid &&
@@ -15797,6 +15804,7 @@ private:
     device_features12.timelineSemaphore = true;
     device_features12.bufferDeviceAddress = true;
     device_features12.shaderOutputLayer = true;
+    device_features12.separateDepthStencilLayouts = true;
     vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR barycentric{};
     barycentric.sType = vk::StructureType::ePhysicalDeviceFragmentShaderBarycentricFeaturesKHR;
     barycentric.pNext = &device_features12;
@@ -15804,7 +15812,8 @@ private:
     vk::PhysicalDeviceVulkan13Features device_features13{};
     device_features13.sType =
         vk::StructureType::ePhysicalDeviceVulkan13Features;
-    device_features13.pNext = &barycentric;
+    device_features13.pNext = m_fragment_barycentrics ? static_cast<void *>(&barycentric)
+                                                      : static_cast<void *>(&device_features12);
     device_features13.dynamicRendering = true;
     device_features13.synchronization2 = true;
     vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR derivatives{};
@@ -15831,7 +15840,8 @@ private:
     vk::PhysicalDeviceImageViewMinLodFeaturesEXT min_lod{};
     min_lod.pNext = &provoking_vertex;
     min_lod.minLod = true;
-    device_info.pNext = &min_lod;
+    device_info.pNext = m_image_view_min_lod ? static_cast<void *>(&min_lod)
+                                             : static_cast<void *>(&provoking_vertex);
     vk::PhysicalDeviceFeatures device_features{};
     device_features.shaderStorageImageWriteWithoutFormat = true;
     device_features.shaderImageGatherExtended = true;
@@ -15840,19 +15850,23 @@ private:
     device_features.fillModeNonSolid = true;
     device_features.tessellationShader = true;
     device_info.pEnabledFeatures = &device_features;
-    constexpr const char *device_extensions[] = {
+    std::vector<const char *> device_extensions = {
         VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
         VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME,
-        VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME,
         VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME,
         VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME,
         VK_EXT_COLOR_WRITE_ENABLE_EXTENSION_NAME,
         VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME,
         VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME,
-        VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
-        VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME};
-    device_info.enabledExtensionCount = std::size(device_extensions);
-    device_info.ppEnabledExtensionNames = device_extensions;
+        VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME};
+    if (m_fragment_barycentrics) {
+      device_extensions.push_back(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
+    }
+    if (m_image_view_min_lod) {
+      device_extensions.push_back(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
+    }
+    device_info.enabledExtensionCount = static_cast<u32>(device_extensions.size());
+    device_info.ppEnabledExtensionNames = device_extensions.data();
     RequireVk("VulkanHarness", "dispatch",
               m_physical_device.createDevice(&device_info, nullptr, &m_device),
               "vkCreateDevice");
@@ -16177,6 +16191,8 @@ private:
   Buffer m_bda_pagetable_buffer;
   Buffer m_fault_buffer;
   GraphicContext m_runtime_context{};
+  bool m_fragment_barycentrics = false;
+  bool m_image_view_min_lod = false;
   std::unique_ptr<RenderContext> m_renderer;
 };
 

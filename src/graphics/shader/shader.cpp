@@ -689,10 +689,21 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 	}
 }
 
+static std::atomic_bool g_default_host_barycentrics {true};
+
+bool DefaultHostBarycentrics() {
+	return g_default_host_barycentrics.load(std::memory_order_relaxed);
+}
+
+void SetDefaultHostBarycentrics(bool enabled) {
+	g_default_host_barycentrics.store(enabled, std::memory_order_relaxed);
+}
+
 void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>& key) {
 	EXIT_IF(info.input_num > std::size(info.interpolator_settings));
 	key.clear();
 	key.push_back(info.scratch_size_dwords);
+	key.push_back(static_cast<uint32_t>(info.host_barycentrics));
 	key.push_back(info.input_num);
 	key.push_back(info.wave_size);
 	key.push_back(info.ps_system_input_base);
@@ -964,16 +975,16 @@ void ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info) {
 	     "\t ps_no_perspective    = %s\n"
 	     "\t ps_pixel_kill_enable = %s\n"
 	     "\t ps_early_z           = %s\n"
-	     "\t ps_execute_on_noop   = %s\n",
+	     "\t ps_execute_on_noop   = %s\n"
+	     "\t host_barycentrics    = %s\n",
 	     info.input_num, info.ps_system_input_base, info.custom_interpolation_mask,
 	     info.ps_perspective_center_vgpr, info.ps_perspective_centroid_vgpr,
-	     info.ps_pos_x ? "true" : "false",
-	     info.ps_pos_y ? "true" : "false", info.ps_pos_z ? "true" : "false",
-	     info.ps_pos_w ? "true" : "false", info.ps_front_face ? "true" : "false",
-	     info.ps_ancillary ? "true" : "false",
+	     info.ps_pos_x ? "true" : "false", info.ps_pos_y ? "true" : "false",
+	     info.ps_pos_z ? "true" : "false", info.ps_pos_w ? "true" : "false",
+	     info.ps_front_face ? "true" : "false", info.ps_ancillary ? "true" : "false",
 	     info.ps_sample_shading ? "true" : "false", info.ps_no_perspective ? "true" : "false",
 	     info.ps_pixel_kill_enable ? "true" : "false", info.ps_early_z ? "true" : "false",
-	     info.ps_execute_on_noop ? "true" : "false");
+	     info.ps_execute_on_noop ? "true" : "false", info.host_barycentrics ? "true" : "false");
 
 	for (uint32_t i = 0; i < info.input_num; i++) {
 		LOGF("\t interpolator_settings[%u] = %u\n", i, info.interpolator_settings[i]);

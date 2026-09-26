@@ -30,6 +30,11 @@ struct GraphicContext {
 	bool                               compute_subgroup_size_control_enabled = false;
 	bool                               sample_rate_shading_enabled           = false;
 	bool                                      depth_bounds_enabled                   = false;
+	// VK_KHR_fragment_shader_barycentric: pixel shaders read raw per-vertex attributes and
+	// interpolate them like the console. Without it the host interpolates the attributes.
+	bool fragment_shader_barycentric_enabled = false;
+	// VK_EXT_image_view_min_lod: guest T# minimum LOD clamps; ignored without it.
+	bool                                      image_view_min_lod_enabled             = false;
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                               provoking_vertex_last_enabled         = false;
 	bool                               supports_block_texel_view              = false;

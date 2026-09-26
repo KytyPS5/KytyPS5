@@ -641,6 +641,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount : 0;
 	GraphicsPrograms  result;
 	if (pixel_active) {
+		pixel_info.host_barycentrics = m_graphics.fragment_shader_barycentric_enabled;
 		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
 	}
 	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {

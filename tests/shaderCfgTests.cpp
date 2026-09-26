@@ -6060,6 +6060,60 @@ void TestNewShaderRecompilerVintrpTranslation() {
   CheckSpirvBinaryValidates(no_perspective_result.spirv);
 }
 
+// Hosts without VK_KHR_fragment_shader_barycentric interpolate every pixel input themselves:
+// a shader that reads raw vertices through custom interpolation and the I/J VGPRs must then
+// compile without per-vertex inputs, gl_BaryCoordKHR or the capability.
+void TestPixelInputsWithoutHostBarycentrics() {
+  const uint32_t shader[] = {
+      EncodeVintrp(2, 12, 0, 3, 2),      EncodeVintrp(2, 13, 0, 3, 0),
+      EncodeVintrp(2, 14, 0, 3, 1),      EncodeVop2(0x03, 15, 12 + 256, 0),
+      EncodeVop2(0x03, 16, 13 + 256, 1), EncodeExp0(0x00, 0xf),
+      EncodeExp1(15, 16, 14, 12),        0xbf810000u,
+  };
+  for (const bool host_barycentrics : {true, false}) {
+    ShaderPixelInputInfo ps_info{};
+    ps_info.input_num = 1;
+    ps_info.ps_system_input_base = 2;
+    ps_info.custom_interpolation_mask = 1;
+    ps_info.ps_perspective_center_vgpr = 0;
+    SetIdentityInterpolatorSettings(&ps_info);
+    ps_info.interpolator_settings[0] = 0x00000420u;
+    ps_info.host_barycentrics = host_barycentrics;
+
+    auto options = MakeCompileOptions(ShaderType::Pixel);
+    options.input_info.pixel = &ps_info;
+    auto result = RecompileForTest(shader, options);
+    CheckSpirvBinaryValidates(result.spirv);
+    const bool capability = SpirvContainsCapability(result.spirv, 5284u);
+    const bool per_vertex =
+        SpirvHasDecorationValueWithDecoration(result.spirv, 30u, 0u, 5285u);
+    const bool bary_coord = SpirvHasDecorationValue(result.spirv, 11u, 5286u);
+    Check(capability == host_barycentrics && per_vertex == host_barycentrics &&
+              bary_coord == host_barycentrics,
+          host_barycentrics
+              ? "pixel shader with host barycentrics did not read raw per-vertex inputs"
+              : "pixel shader without host barycentrics still requires the barycentric extension");
+    Check(ProgramInputCount(result.program,
+                            ShaderRecompiler::IR::StageInputKind::Parameter) == 1,
+          "host-interpolated pixel shader lost its parameter input");
+    Check(SpirvHasDecorationValue(result.spirv, 30u, 0u),
+          "host-interpolated pixel shader lost the attribute location");
+    Check(ProgramInputCount(result.program,
+                            ShaderRecompiler::IR::StageInputKind::BaryCoordSmooth) ==
+              (host_barycentrics ? 1u : 0u),
+          "barycentric builtin input did not follow the host capability");
+  }
+  // New pixel input descriptions follow the device capability recorded at device creation.
+  const bool previous = DefaultHostBarycentrics();
+  SetDefaultHostBarycentrics(false);
+  Check(!ShaderPixelInputInfo{}.host_barycentrics,
+        "pixel input info ignored a host without barycentrics");
+  SetDefaultHostBarycentrics(true);
+  Check(ShaderPixelInputInfo{}.host_barycentrics,
+        "pixel input info ignored a host with barycentrics");
+  SetDefaultHostBarycentrics(previous);
+}
+
 void TestCustomVintrpMovTranslation() {
   const uint32_t shader[] = {
       EncodeVintrp(2, 12, 0, 3, 2),      EncodeVintrp(2, 13, 0, 3, 0),
@@ -13766,6 +13820,7 @@ int main() {
   TestNewShaderRecompilerNativeBindingPlan();
   TestNewShaderRecompilerStageInputInfo();
   TestCustomVintrpMovTranslation();
+  TestPixelInputsWithoutHostBarycentrics();
   TestPerspectiveCentroidInputs();
   TestGraphicsCreateInterpolantMapping();
   TestNewShaderRecompilerPixelPipelineEntry();

@@ -4,6 +4,8 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 
+#include <atomic>
+
 namespace Libs::Graphics {
 
 namespace {
@@ -363,10 +365,16 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 		usage.usage &= ~vk::ImageUsageFlagBits::eStorage;
 	}
 	vk::ImageViewMinLodCreateInfoEXT min_lod {};
-	if (normalized.min_lod != 0) {
+	if (normalized.min_lod != 0 && m_graphics.image_view_min_lod_enabled) {
 		min_lod.minLod = static_cast<float>(normalized.base_level) +
 		                 static_cast<float>(normalized.min_lod) / 256.0f;
 		usage.pNext    = &min_lod;
+	} else if (normalized.min_lod != 0) {
+		static std::atomic_bool warned = false;
+		if (!warned.exchange(true, std::memory_order_relaxed)) {
+			LOGF("Image view minimum LOD clamps are ignored: the device lacks "
+			     "VK_EXT_image_view_min_lod\n");
+		}
 	}
 	vk::ImageViewCreateInfo create {};
 	create.pNext                           = &usage;

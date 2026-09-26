@@ -371,6 +371,8 @@ function(add_kyty_full_emulator_test target source)
 	endif()
 	if (KYTY_CLANG_CL)
 		target_link_libraries(${target} onecore)
+		# Match kyty_emulator: large shader specialization retranslate needs >1 MiB stack.
+		target_link_options(${target} PRIVATE "/STACK:16777216")
 		add_custom_command(TARGET ${target} POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different "${KYTY_THIRD_PARTY_DIR}/winpthread/bin/libwinpthread-1.dll" $<TARGET_FILE_DIR:${target}>/libwinpthread-1.dll)
 	endif()
 	# The macOS x86_64 guest address space needs its .zerofill segments anchored
@@ -591,6 +593,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_cfg_tests> --spirv-optimization-only)
 	add_test(NAME pipeline_cache_identity
 		COMMAND $<TARGET_FILE:shader_cfg_tests> --pipeline-cache-identity-only)
+	add_test(NAME spirv_permutation_reuse
+		COMMAND $<TARGET_FILE:shader_cfg_tests> --spirv-permutation-reuse-only)
 	if(WIN32)
 		add_test(NAME shader_f64_admission
 		         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --f64-admission-only)
@@ -755,6 +759,9 @@ if(KYTY_CLANG_CL)
 	target_link_options(kyty_emulator PRIVATE
 		"/DYNAMICBASE:NO"
 		"/DEBUG:FULL"
+		# Deep CFG/IR recursion on large compute specializations (Yōtei CS 54904
+		# class) overflows the default 1 MiB Windows stack with STATUS_STACK_OVERFLOW.
+		"/STACK:16777216"
 		"/PDB:${KYTY_EMULATOR_PDB_LINK_PATH}"
 		"/lldmap:${KYTY_EMULATOR_MAP_LINK_PATH}"
 	)

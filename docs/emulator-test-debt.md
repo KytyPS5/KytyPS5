@@ -1426,8 +1426,10 @@ Remaining validation:
   while CS `54904fb419d79e49` did **4×** specialization recompile —
   `vkCreateComputePipelines` ≈289.8 / 295.5 / 286.8 s, fourth `begin` without
   `done` at Kill. ReadbackStart=240 never reached (`sawColored=false`).
-- Debt for shared fix: specialization-stable pipeline identity and/or smaller
-  SPIR-V for this reduce-class CS under GPUAV instrumentation — not a title
-  branch and not “merge #718 first” (cold boot unchanged; conflicts).
+- After `/STACK:16777216` + SPIR-V permutation reuse (`…-093517`): reached
+  **shown=197**, then Fatal `MaterializeResources` (exit 321). Menu still pending.
+- Debt for shared fix: print/use `LastResourceSpecializationError` on that Fatal;
+  continue specialization-stable pipeline identity / smaller SPIR-V under GPUAV —
+  not a title branch and not “merge #718 first”.
 - Re-run the accumulated shader/GPU test debt before upstream submission; the
   rendered-pixel milestone does not waive neighboring regressions.

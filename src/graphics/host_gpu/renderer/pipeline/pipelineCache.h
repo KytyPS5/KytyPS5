@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <type_traits>
@@ -244,6 +245,13 @@ bool IsDriverCacheBuildIdentityUsableForTest(std::string_view git_hash,
                                              std::string_view worktree_fingerprint);
 bool IsDriverCacheSignatureCompatibleForTest(std::string_view cached_signature,
                                              std::string_view expected_signature);
+
+// Returns the existing ShaderProgram.id when a specialization miss emits SPIR-V
+// that is already resident. Empty when the binary is new and Create*Pipelines
+// must run. Used by ProgramCache permutation reuse and a focused RED/GREEN.
+[[nodiscard]] std::optional<uint64_t> FindReusableShaderProgramIdForTest(
+    std::span<const uint64_t> existing_spirv_hashes, std::span<const uint64_t> existing_program_ids,
+    uint64_t spirv_hash);
 
 } // namespace Libs::Graphics
 

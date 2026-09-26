@@ -75,6 +75,9 @@ bool IsDriverCacheBuildIdentityUsableForTest(
     std::string_view worktree_fingerprint);
 bool IsDriverCacheSignatureCompatibleForTest(
     std::string_view cached_signature, std::string_view expected_signature);
+std::optional<uint64_t> FindReusableShaderProgramIdForTest(
+    std::span<const uint64_t> existing_spirv_hashes, std::span<const uint64_t> existing_program_ids,
+    uint64_t spirv_hash);
 std::string ShaderModuleDebugNameForTest(ShaderType stage, uint64_t shader_hash);
 bool ComputePipelineDisablesOptimizationForTest(bool cooperative_wave64);
 namespace {
@@ -248,6 +251,29 @@ void TestDriverPipelineCacheBuildIdentity() {
             !IsDriverCacheBuildIdentityUsableForTest(
                 "0123456-dirty", revision, "1234"),
         "driver cache accepted an incomplete build identity");
+}
+
+void TestSpirvPermutationReuseIdentity() {
+  // Specialization miss with a byte-identical SPIR-V must reuse the existing
+  // ShaderProgram.id so vkCreate*Pipelines is not repeated (Yōtei CS 54904
+  // cycle-4 class: same word count after a distinct ResourceSpecialization).
+  constexpr uint64_t first_hash = 0x1111111111111111ull;
+  constexpr uint64_t second_hash = 0x2222222222222222ull;
+  constexpr uint64_t first_id = 7;
+  constexpr uint64_t second_id = 11;
+  const uint64_t hashes[] = {first_hash, second_hash};
+  const uint64_t ids[] = {first_id, second_id};
+
+  Check(!FindReusableShaderProgramIdForTest(hashes, ids, 0xdeadull).has_value(),
+        "unknown SPIR-V hash reused a ShaderProgram.id");
+  const auto reused = FindReusableShaderProgramIdForTest(hashes, ids, second_hash);
+  Check(reused.has_value() && *reused == second_id,
+        "identical SPIR-V hash did not reuse the resident ShaderProgram.id");
+  const auto first = FindReusableShaderProgramIdForTest(hashes, ids, first_hash);
+  Check(first.has_value() && *first == first_id,
+        "first SPIR-V hash did not reuse its ShaderProgram.id");
+  Check(!FindReusableShaderProgramIdForTest({}, {}, first_hash).has_value(),
+        "empty permutation set reused a ShaderProgram.id");
 }
 
 void TestDriverPipelineCacheRevisionCompatibility() {
@@ -18134,6 +18160,11 @@ int main(int argc, char* argv[]) {
     std::puts("KYTY_PIPELINE_CACHE_IDENTITY_PASS");
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--spirv-permutation-reuse-only") == 0) {
+    Libs::Graphics::TestSpirvPermutationReuseIdentity();
+    std::puts("KYTY_SPIRV_PERMUTATION_REUSE_PASS");
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--videoout-vrr-status-only") == 0) {
     Libs::Graphics::TestVideoOutVrrStatusLibraryContract();
     std::puts("KYTY_VIDEOOUT_VRR_STATUS_PASS");
@@ -18555,6 +18586,7 @@ int main(int argc, char* argv[]) {
   TestComputeFpModeStaticIdentity();
   TestComputeLdsAllocationIdentity();
   TestPixelProgramCacheBindingIdentity();
+  TestSpirvPermutationReuseIdentity();
   TestGraphicsPushConstantPlacement();
   TestNewShaderRecompilerUnsupportedMemoryDecode();
 

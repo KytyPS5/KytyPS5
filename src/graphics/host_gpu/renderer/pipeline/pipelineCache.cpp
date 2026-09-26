@@ -472,6 +472,18 @@ std::string ShaderModuleDebugNameForTest(ShaderType stage, uint64_t shader_hash)
 	return ShaderModuleDebugName(stage, shader_hash);
 }
 
+std::optional<uint64_t> FindReusableShaderProgramIdForTest(
+    std::span<const uint64_t> existing_spirv_hashes, std::span<const uint64_t> existing_program_ids,
+    uint64_t spirv_hash) {
+	EXIT_IF(existing_spirv_hashes.size() != existing_program_ids.size());
+	for (size_t index = 0; index < existing_spirv_hashes.size(); ++index) {
+		if (existing_spirv_hashes[index] == spirv_hash) {
+			return existing_program_ids[index];
+		}
+	}
+	return std::nullopt;
+}
+
 struct PipelineCache::ProgramCache {
 	struct ProgramKey {
 		ShaderType            stage           = ShaderType::Unknown;
@@ -487,6 +499,8 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		ShaderRecompiler::IR::CompiledShaderInfo     program;
 		ShaderProgram                                handle;
+		uint64_t                                     spirv_hash  = 0;
+		bool                                         owns_module = true;
 	};
 
 	struct SourceEntry {
@@ -525,7 +539,8 @@ struct PipelineCache::ProgramCache {
 	                               const ShaderRecompiler::CompileOptions&      options,
 	                               ShaderRecompiler::TranslateResult            translated,
 	                               ShaderRecompiler::IR::ResourceSpecialization specialization,
-	                               uint32_t push_data_start_dword) {
+	                               uint32_t push_data_start_dword,
+	                               const std::vector<Permutation>& siblings) {
 		const char* stage_name = nullptr;
 		switch (options.stage) {
 			case ShaderType::Vertex: stage_name = "vs"; break;
@@ -609,9 +624,41 @@ struct PipelineCache::ProgramCache {
 		}
 		DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
 
-		const auto module = CompileSPV(result.spirv, device);
-		EXIT_IF(module == nullptr);
-		SetVulkanObjectNameF(device, module, "{}", ShaderModuleDebugName(options.stage, options.shader_hash));
+		const uint64_t spirv_hash =
+		    XXH3_64bits(result.spirv.data(), result.spirv.size() * sizeof(uint32_t));
+		std::vector<uint64_t> sibling_hashes;
+		std::vector<uint64_t> sibling_ids;
+		sibling_hashes.reserve(siblings.size());
+		sibling_ids.reserve(siblings.size());
+		for (const auto& sibling: siblings) {
+			sibling_hashes.push_back(sibling.spirv_hash);
+			sibling_ids.push_back(sibling.handle.id);
+		}
+		const auto reused_id =
+		    FindReusableShaderProgramIdForTest(sibling_hashes, sibling_ids, spirv_hash);
+		ShaderProgram handle {};
+		bool          owns_module = true;
+		if (reused_id.has_value()) {
+			const auto sibling = std::ranges::find_if(
+			    siblings, [&](const Permutation& candidate) {
+				    return candidate.handle.id == *reused_id;
+			    });
+			EXIT_IF(sibling == siblings.end());
+			handle      = sibling->handle;
+			owns_module = false;
+			std::printf(
+			    "SpirvReuse: stage=%s hash=0x%016" PRIx64
+			    " words=%zu spirv_hash=0x%016" PRIx64 " program_id=%" PRIu64 " prior_perms=%zu\n",
+			    stage_name, options.shader_hash, result.spirv.size(), spirv_hash, handle.id,
+			    siblings.size());
+			std::fflush(stdout);
+		} else {
+			handle.module = CompileSPV(result.spirv, device);
+			EXIT_IF(handle.module == nullptr);
+			handle.id = ++next_shader_id;
+			SetVulkanObjectNameF(device, handle.module, "{}",
+			                     ShaderModuleDebugName(options.stage, options.shader_hash));
+		}
 		if (options.dump_ir) {
 			LOGF("%s SPIR-V words=%" PRIu64 " wave_size=%u\n", options.dump_label,
 			     static_cast<uint64_t>(result.spirv.size()), options.wave_size);
@@ -622,7 +669,9 @@ struct PipelineCache::ProgramCache {
 		return {
 		    .specialization = std::move(specialization),
 		    .program        = std::move(compiled_info),
-		    .handle         = {.id = ++next_shader_id, .module = module},
+		    .handle         = handle,
+		    .spirv_hash     = spirv_hash,
+		    .owns_module    = owns_module,
 		};
 	}
 
@@ -659,9 +708,14 @@ struct PipelineCache::ProgramCache {
 		    .clamp_memory_range         = ClampShaderGuestMemory,
 		};
 		if (entry != programs.end()) {
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    entry->second.resource_plan, runtime, entry->second.resources,
-			    entry->second.specialization));
+			if (!ShaderRecompiler::IR::MaterializeResources(
+			        entry->second.resource_plan, runtime, entry->second.resources,
+			        entry->second.specialization)) {
+				const auto reason = ShaderRecompiler::IR::LastResourceSpecializationError();
+				EXIT("MaterializeResources failed for stage=%u hash=0x%016" PRIx64 ": %.*s\n",
+				     static_cast<unsigned>(stage), params.hash, static_cast<int>(reason.size()),
+				     reason.data());
+			}
 			if (const auto permutation = std::ranges::find_if(
 			        entry->second.permutations, [&](const Permutation& candidate) {
 				        const auto& layout = candidate.program.bindings;
@@ -676,6 +730,14 @@ struct PipelineCache::ProgramCache {
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
 				return permutation->handle;
 			}
+			const auto& specialization = entry->second.specialization;
+			std::printf(
+			    "SpecializationMiss: stage=%u hash=0x%016" PRIx64
+			    " buffers=%zu images=%zu sampled_pairs=%zu bounded_srt=%zu prior_perms=%zu\n",
+			    static_cast<unsigned>(stage), params.hash, specialization.buffers.size(),
+			    specialization.images.size(), specialization.sampled_pairs.size(),
+			    specialization.bounded_srt_reads.size(), entry->second.permutations.size());
+			std::fflush(stdout);
 		}
 
 		ShaderStageInputInfo stage_input {};
@@ -729,12 +791,18 @@ struct PipelineCache::ProgramCache {
 		if (entry == programs.end()) {
 			entry = programs.try_emplace(lookup_key,
 			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program)).first;
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    entry->second.resource_plan, runtime, entry->second.resources,
-			    entry->second.specialization));
+			if (!ShaderRecompiler::IR::MaterializeResources(
+			        entry->second.resource_plan, runtime, entry->second.resources,
+			        entry->second.specialization)) {
+				const auto reason = ShaderRecompiler::IR::LastResourceSpecializationError();
+				EXIT("MaterializeResources failed for stage=%u hash=0x%016" PRIx64 ": %.*s\n",
+				     static_cast<unsigned>(stage), params.hash, static_cast<int>(reason.size()),
+				     reason.data());
+			}
 		}
 		entry->second.permutations.push_back(CompilePermutation(
-		    params, options, std::move(translated), entry->second.specialization, push_data_cursor));
+		    params, options, std::move(translated), entry->second.specialization, push_data_cursor,
+		    entry->second.permutations));
 		const auto& permutation = entry->second.permutations.back();
 		input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
@@ -773,7 +841,9 @@ struct PipelineCache::ProgramCache {
 		for (const auto& [key, entry]: programs) {
 			(void)key;
 			for (const auto& permutation: entry.permutations) {
-				device.destroyShaderModule(permutation.handle.module, nullptr);
+				if (permutation.owns_module) {
+					device.destroyShaderModule(permutation.handle.module, nullptr);
+				}
 			}
 		}
 	}

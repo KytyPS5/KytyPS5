@@ -93,6 +93,17 @@ Checkpoint Flip queue lock-order (Reserve cfg→m_mutex ABBA) **26 сентяб�
     `#842/#844/#845` — MERGEABLE, но EXIT не hit. Mega-bundles не трогать.
     Следующее: shared RED на specialization churn / SPIR-V size `54904`, не
     слепой merge.
+21. Long run `…-090122` (watchdog 3600): прошёл первый CreatePipeline `54904`
+    (`shown` 154→160), затем **STATUS_STACK_OVERFLOW** (`exit=-1073741571`) на
+    `shown=164` при повторном TranslateProgram. Фикс: `/STACK:16777216` для
+    clang-cl `kyty_emulator` / full-emulator tests + SPIR-V permutation reuse
+    (одинаковый XXH3 → тот же `ShaderProgram.id`, без второго CreatePipeline).
+    RED/GREEN: `shader_cfg_tests --spirv-permutation-reuse-only`.
+22. Long run `…-093517` (dirty tip с #21): **shown=197** (раньше crash 164 /
+    watchdog 159). Exit **321** —
+    `MaterializeResources` fail в `ProgramCache::Get` (specialization refresh).
+    Меню **PENDING**; следующий шаг — явный `LastResourceSpecializationError` в
+    Fatal и RED на этот fail-closed путь.
 
 Checkpoint present soft-stall (shown≈130 / ready=shown+1) **26 сентября 2026 года**:
 

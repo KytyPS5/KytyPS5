@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "libs/ajm/atrac9_init.h"
 #include "libs/ajm/decoder.h"
 
 #include <algorithm>
@@ -278,7 +279,7 @@ private:
 		std::memcpy(m_config_data, config_data, ATRAC9_CONFIG_DATA_SIZE);
 		m_has_config = true;
 
-		const int init_ret = Atrac9InitDecoder(m_handle, m_config_data);
+		const int init_ret = AjmAtrac9InitDecoder(m_handle, m_config_data);
 		if (init_ret != 0) {
 			m_is_initialized        = false;
 			result->result          = AJM_RESULT_CODEC_ERROR | AJM_RESULT_INVALID_DATA;

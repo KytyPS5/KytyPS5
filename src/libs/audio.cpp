@@ -34,6 +34,9 @@ constexpr uint32_t AUDIO_OUT_PARAM_FORMAT_MASK = 0x000000ffu;
 constexpr int      AUDIO_IN_SILENT_STATE_DEVICE_NONE = 0x1;
 constexpr uint32_t AUDIO_IN_GRAIN_MAX_ASYNC          = 384;
 
+// How long AudioOutClose waits for an output that is still pacing SDL outside the lock.
+constexpr uint64_t AUDIO_OUT_CLOSE_BUSY_WAIT_US = 2000000;
+
 static bool audio_out_port_type_is_valid(int type) {
 	return (type >= AUDIO_OUT_PORT_TYPE_MAIN && type <= AUDIO_OUT_PORT_TYPE_PADSPK) ||
 	       type == AUDIO_OUT_PORT_TYPE_VIBRATION || type == AUDIO_OUT_PORT_TYPE_AUDIO3D ||
@@ -104,6 +107,12 @@ private:
 		bool     queue_primed     = false;
 		int      channels_num     = 0;
 		int      volume[12]       = {};
+		// Outputs in flight outside m_mutex; AudioOutClose waits for them before tearing the port
+		// down.
+		int busy = 0;
+		// Bumped on every open, so a finished output does not write its pacing state into a port
+		// that was closed and reopened in the same slot meanwhile.
+		uint32_t generation = 0;
 
 		SDL_AudioStream* stream = nullptr;
 	};
@@ -122,9 +131,11 @@ private:
 
 	PortIn* GetAudioInPort(Id handle); // Caller holds m_mutex.
 
-	Common::Mutex m_mutex;
-	PortOut       m_out_ports[OUT_PORTS_MAX];
-	PortIn        m_in_ports[IN_PORTS_MAX];
+	Common::Mutex   m_mutex;
+	Common::CondVar m_out_cond; // Signalled when an output releases its ports (PortOut::busy).
+	uint32_t        m_out_generation = 0;
+	PortOut         m_out_ports[OUT_PORTS_MAX];
+	PortIn          m_in_ports[IN_PORTS_MAX];
 
 	static bool            FormatIsFloat(Format format);
 	static bool            FormatIsStd(Format format);
@@ -436,6 +447,8 @@ Audio::Id Audio::AudioOutOpen(int type, uint32_t samples_num, uint32_t freq, For
 			port.freq             = freq;
 			port.format           = format;
 			port.last_output_time = 0;
+			port.busy             = 0;
+			port.generation       = ++m_out_generation;
 
 			switch (format) {
 				case Format::Signed16bitMono:
@@ -468,16 +481,33 @@ Audio::Id Audio::AudioOutOpen(int type, uint32_t samples_num, uint32_t freq, For
 bool Audio::AudioOutClose(Id handle) {
 	Common::LockGuard lock(m_mutex);
 
-	if (AudioOutValid(handle)) {
-		auto& port = m_out_ports[handle.GetId()];
-
-		CloseSdlDevice(&port);
-		port = {};
-
-		return true;
+	if (!AudioOutValid(handle)) {
+		return false;
 	}
 
-	return false;
+	auto&      port       = m_out_ports[handle.GetId()];
+	const auto generation = port.generation;
+
+	// AudioOutOutputs pins the port while it paces SDL outside m_mutex. Destroying the stream (or
+	// zeroing freq) under it would crash that thread, so wait for the output to finish first. The
+	// wait is bounded so a stalled device cannot hang the closing thread forever.
+	const auto deadline = LibKernel::KernelGetProcessTime() + AUDIO_OUT_CLOSE_BUSY_WAIT_US;
+	while (port.busy > 0 && port.used && port.generation == generation) {
+		if (LibKernel::KernelGetProcessTime() >= deadline) {
+			LOGF("AudioOut: closing port %d while an output is still in flight\n", handle.ToInt());
+			break;
+		}
+		m_out_cond.WaitFor(&m_mutex, 10000);
+	}
+	if (!port.used || port.generation != generation) {
+		// Closed by another thread while this one waited.
+		return false;
+	}
+
+	CloseSdlDevice(&port);
+	port = {};
+
+	return true;
 }
 
 bool Audio::AudioOutValid(Id handle) {
@@ -533,24 +563,55 @@ bool Audio::AudioOutSetVolume(Id handle, uint32_t bitflag, const int* volume) {
 
 uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking) {
 	EXIT_NOT_IMPLEMENTED(num == 0);
-	EXIT_NOT_IMPLEMENTED(!AudioOutValid(params[0].handle));
+	EXIT_NOT_IMPLEMENTED(num > static_cast<uint32_t>(OUT_PORTS_MAX));
 
-	const auto& first_port = m_out_ports[params[0].handle.GetId()];
+	// The SDL pacing below sleeps for up to a block plus the queue timeout, so it runs outside
+	// m_mutex. Work on a snapshot of each port taken under the lock, and pin the ports (busy) so a
+	// concurrent AudioOutClose cannot destroy a stream, or zero the freq divisor, this thread is
+	// still using.
+	struct Output {
+		PortOut*    port = nullptr;
+		PortOut     snapshot;
+		const void* data = nullptr;
+	};
+	Output   outputs[OUT_PORTS_MAX];
+	uint32_t outputs_num = 0;
 
-	uint64_t block_time   = (1000000 * first_port.samples_num) / first_port.freq;
+	{
+		Common::LockGuard lock(m_mutex);
+
+		if (!AudioOutValid(params[0].handle)) {
+			// Closed between the caller's validation and here.
+			return 0;
+		}
+
+		for (uint32_t i = 0; i < num; i++) {
+			if (!AudioOutValid(params[i].handle)) {
+				continue;
+			}
+			auto& port = m_out_ports[params[i].handle.GetId()];
+			port.busy++;
+			outputs[outputs_num++] = Output {&port, port, params[i].data};
+		}
+	}
+
+	const auto& first_port = outputs[0].snapshot;
+
+	uint64_t block_time =
+	    (first_port.freq != 0 ? (1000000 * first_port.samples_num) / first_port.freq : 0);
 	uint64_t current_time = LibKernel::KernelGetProcessTime();
 
 	uint64_t max_wait_time = 0;
 
-	for (uint32_t i = 0; i < num; i++) {
-		uint64_t next_time = m_out_ports[params[i].handle.GetId()].last_output_time + block_time;
+	for (uint32_t i = 0; i < outputs_num; i++) {
+		uint64_t next_time = outputs[i].snapshot.last_output_time + block_time;
 		uint64_t wait_time = (next_time > current_time ? next_time - current_time : 0);
 		max_wait_time      = (wait_time > max_wait_time ? wait_time : max_wait_time);
 	}
 
 	bool any_port_has_device = false;
-	for (uint32_t i = 0; i < num; i++) {
-		if (m_out_ports[params[i].handle.GetId()].stream != nullptr) {
+	for (uint32_t i = 0; i < outputs_num; i++) {
+		if (outputs[i].snapshot.stream != nullptr) {
 			any_port_has_device = true;
 			break;
 		}
@@ -563,15 +624,15 @@ uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking
 		Common::Thread::SleepMicro(max_wait_time);
 	}
 
-	for (uint32_t i = 0; i < num; i++) {
-		auto&      port          = m_out_ports[params[i].handle.GetId()];
+	for (uint32_t i = 0; i < outputs_num; i++) {
+		auto&      port          = outputs[i].snapshot;
 		const bool primed_before = port.queue_primed;
 
-		if (params[i].data == nullptr) {
+		if (outputs[i].data == nullptr) {
 			// A NULL buffer asks to wait until the port's queued output has been played.
 			DrainSdlAudio(&port);
 		} else {
-			QueueSdlAudio(&port, params[i].data, blocking);
+			QueueSdlAudio(&port, outputs[i].data, blocking);
 		}
 
 		// Keep an absolute schedule while the queue is primed, so sleep overshoot does not stretch
@@ -586,6 +647,26 @@ uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking
 			port.last_output_time = now;
 		}
 	}
+
+	{
+		Common::LockGuard lock(m_mutex);
+		for (uint32_t i = 0; i < outputs_num; i++) {
+			auto* port = outputs[i].port;
+			// Only the port this output pinned: a close that gave up waiting may have reset the
+			// slot, or a new port may have been opened in it.
+			if (port->generation != outputs[i].snapshot.generation) {
+				continue;
+			}
+			if (port->busy > 0) {
+				port->busy--;
+			}
+			if (port->used) {
+				port->queue_primed     = outputs[i].snapshot.queue_primed;
+				port->last_output_time = outputs[i].snapshot.last_output_time;
+			}
+		}
+	}
+	m_out_cond.SignalAll();
 
 	return (params[0].data != nullptr ? first_port.samples_num : 0);
 }

@@ -35,6 +35,42 @@ static constexpr uint32_t AJM_DEC_M4AAC_CONFIG_NUMBER_RAW       = 2;
 static constexpr uint32_t AJM_DEC_M4AAC_CONFIG_NUMBER_SAF       = 3;
 static constexpr uint32_t AJM_DEC_M4AAC_MAX_CHANNELS            = 8;
 static constexpr uint32_t AJM_DEC_M4AAC_MAX_SAMPLING_FREQ_INDEX = 11;
+static constexpr uint32_t AJM_DEC_M4AAC_FRAME_SAMPLES           = 1024;
+static constexpr size_t   AJM_DEC_M4AAC_ADTS_HEADER_SIZE        = 7;
+
+struct AjmAdtsHeader {
+	uint32_t frame_length = 0; // Header, CRC and raw data blocks together.
+	uint32_t channels     = 0; // 0 when the channel configuration is carried in a PCE.
+};
+
+// ADTS header: syncword (12) id (1) layer (2) protection_absent (1) profile (2)
+// sampling_frequency_index (4) private (1) channel_configuration (3) original (1) home (1)
+// copyright_id (1) copyright_start (1) frame_length (13) buffer_fullness (11) raw_data_blocks (2),
+// followed by a 16-bit CRC when protection_absent is 0.
+static bool AjmParseAdtsHeader(const uint8_t* data, size_t size, AjmAdtsHeader* out) {
+	if (data == nullptr || size < AJM_DEC_M4AAC_ADTS_HEADER_SIZE || out == nullptr) {
+		return false;
+	}
+	if (data[0] != 0xffu || (data[1] & 0xf6u) != 0xf0u) {
+		return false;
+	}
+
+	const bool     protection_absent = (data[1] & 0x1u) != 0;
+	const uint32_t frame_length      = (static_cast<uint32_t>(data[3] & 0x3u) << 11u) |
+	                              (static_cast<uint32_t>(data[4]) << 3u) |
+	                              (static_cast<uint32_t>(data[5]) >> 5u);
+	const auto header_size = AJM_DEC_M4AAC_ADTS_HEADER_SIZE + (protection_absent ? 0u : 2u);
+	if (frame_length < header_size) {
+		return false;
+	}
+
+	static constexpr uint32_t CHANNELS[8]    = {0, 1, 2, 3, 4, 5, 6, 8};
+	const auto                channel_config = ((data[2] & 0x1u) << 2u) | (data[3] >> 6u);
+
+	out->frame_length = frame_length;
+	out->channels     = CHANNELS[channel_config];
+	return true;
+}
 
 class AjmAacDecoder final: public AjmDecoder {
 public:
@@ -95,6 +131,7 @@ public:
 		m_total_decoded_samples = 0;
 		m_bitrate               = 0;
 		m_channels              = 0;
+		m_frame_samples         = AJM_DEC_M4AAC_FRAME_SAMPLES;
 		m_raw_configured        = false;
 		if (m_config_number == AJM_DEC_M4AAC_CONFIG_NUMBER_RAW) {
 			m_sample_rate = SamplingRateFromIndex(m_sampling_freq_index);
@@ -106,7 +143,6 @@ public:
 
 	AjmDecodeResult Decode(const void* input, size_t input_size, void* output, size_t output_size,
 	                       bool multiple_frames, AjmGaplessState* gapless) override {
-		(void)multiple_frames;
 		auto result = MakeResult();
 
 		if (!m_is_initialized) {
@@ -126,21 +162,57 @@ public:
 			return result;
 		}
 
-		size_t output_offset = 0;
-		if (!DecodePacket(static_cast<const uint8_t*>(input), static_cast<int>(input_size), output,
-		                  output_size, &output_offset, gapless, &result)) {
-			result.input_consumed        = input_size;
-			result.output_written        = output_offset;
-			result.total_decoded_samples = m_total_decoded_samples;
-			result.format                = GetFormat();
-			return result;
+		const auto* input_bytes   = static_cast<const uint8_t*>(input);
+		size_t      input_offset  = 0;
+		size_t      output_offset = 0;
+		bool        delivered     = false;
+
+		// FFmpeg decodes one access unit per packet. ADTS input is split along the frame_length
+		// field, so a job carrying several frames does not lose every frame but the first; RAW and
+		// SAF input has no framing to split on and stays one access unit per job. Either way an
+		// access unit is only handed over once its PCM is known to fit: a frame decoded without
+		// room for its output would be lost together with the input reported as consumed.
+		while (input_offset < input_size) {
+			const auto    remaining = input_size - input_offset;
+			AjmAdtsHeader header {};
+			size_t        packet_size = remaining;
+			if (m_config_number == AJM_DEC_M4AAC_CONFIG_NUMBER_ADTS) {
+				if (AjmParseAdtsHeader(input_bytes + input_offset, remaining, &header)) {
+					if (header.frame_length > remaining) {
+						break; // The frame continues in the next job.
+					}
+					packet_size = header.frame_length;
+				} else if (remaining < AJM_DEC_M4AAC_ADTS_HEADER_SIZE || delivered) {
+					break; // A truncated header, or bytes after the frames already handled.
+				}
+				// Otherwise the job is not ADTS-framed at all; hand it over whole, as before.
+			}
+
+			const auto frame_output_bytes = PredictFrameOutputBytes(header.channels, gapless);
+			const auto output_room =
+			    (output != nullptr && output_offset < output_size ? output_size - output_offset
+			                                                      : 0);
+			if (frame_output_bytes > output_room) {
+				if (!delivered) {
+					result.result = AJM_RESULT_NOT_ENOUGH_ROOM;
+				}
+				break;
+			}
+
+			const bool ok = DecodePacket(input_bytes + input_offset, static_cast<int>(packet_size),
+			                             output, output_size, &output_offset, gapless, &result);
+			input_offset += packet_size;
+			delivered = true;
+			if (!ok || !multiple_frames || m_config_number != AJM_DEC_M4AAC_CONFIG_NUMBER_ADTS) {
+				break;
+			}
 		}
 
 		if (result.frames == 0 && result.result == OK) {
 			result.result = AJM_RESULT_PARTIAL_INPUT;
 		}
 
-		result.input_consumed        = input_size;
+		result.input_consumed        = input_offset;
 		result.output_written        = output_offset;
 		result.total_decoded_samples = m_total_decoded_samples;
 		result.format                = GetFormat();
@@ -184,6 +256,28 @@ private:
 		}
 	}
 
+	// PCM bytes the next access unit will produce once the start-up delay and the gapless window
+	// are applied. The channel count comes from the ADTS header when there is one, else from the
+	// last frame; the sample count from the last frame (2048 once SBR is active), else a plain AAC
+	// frame. Guessing low is the safe side: the frame then falls back to the partial write in
+	// WriteFrame instead of being refused for room it did not need.
+	[[nodiscard]] size_t PredictFrameOutputBytes(uint32_t               header_channels,
+	                                             const AjmGaplessState* gapless) const {
+		if (m_skip_frames > 0) {
+			return 0;
+		}
+		const auto channels = (header_channels != 0 ? header_channels : std::max(m_channels, 1u));
+		auto       samples  = m_frame_samples;
+		if (gapless != nullptr) {
+			samples -= std::min<uint32_t>(samples, gapless->current.skip_samples);
+			if (gapless->HasSampleLimit()) {
+				samples = std::min<uint32_t>(samples, gapless->current.total_samples);
+			}
+		}
+		return static_cast<size_t>(samples) * static_cast<size_t>(channels) *
+		       AjmBytesPerSample(m_sample_encoding);
+	}
+
 	void OpenDecoder() {
 		if (m_codec == nullptr) {
 			return;
@@ -219,6 +313,7 @@ private:
 
 		SetFormat(channels, static_cast<uint32_t>(std::max(frame->sample_rate, 1)),
 		          m_sample_encoding);
+		m_frame_samples = static_cast<uint32_t>(std::max(frame->nb_samples, 1));
 		if (m_codec_context != nullptr && m_codec_context->bit_rate > 0) {
 			m_bitrate = static_cast<uint32_t>(m_codec_context->bit_rate);
 		}
@@ -366,6 +461,7 @@ private:
 	uint32_t        m_config_number       = AJM_DEC_M4AAC_CONFIG_NUMBER_ADTS;
 	uint32_t        m_sampling_freq_index = 3;
 	uint32_t        m_skip_frames         = 2;
+	uint32_t        m_frame_samples       = AJM_DEC_M4AAC_FRAME_SAMPLES;
 	uint32_t        m_bitrate             = 0;
 	bool            m_is_initialized      = false;
 	bool            m_raw_configured      = false;

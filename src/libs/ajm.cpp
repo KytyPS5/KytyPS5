@@ -3,6 +3,7 @@
 #include "common/logging/log.h"
 #include "libs/ajm/aac_decoder.h"
 #include "libs/ajm/atrac9_decoder.h"
+#include "libs/ajm/atrac9_init.h"
 #include "libs/ajm/decoder.h"
 #include "libs/ajm/mp3_decoder.h"
 #include "libs/audio.h"
@@ -177,7 +178,7 @@ int KYTY_SYSV_ABI AjmDecAt9ParseConfigData(const void*              config_data,
 	uint8_t config[ATRAC9_CONFIG_DATA_SIZE] {};
 	std::memcpy(config, config_data, sizeof(config));
 	Atrac9CodecInfo codec_info {};
-	const int       init_result = Atrac9InitDecoder(handle, config);
+	const int       init_result = AjmAtrac9InitDecoder(handle, config);
 	const int       info_result =
 	    init_result == 0 ? Atrac9GetCodecInfo(handle, &codec_info) : init_result;
 	Atrac9ReleaseHandle(handle);

@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
@@ -27,6 +28,8 @@ size_t                            g_capture_bytes = 0;
 int                               g_next_device  = 1;
 int                               g_open_waiters = 0;
 bool                              g_block_opens  = false;
+int                               g_output_waiters = 0;
+bool                              g_block_outputs  = false;
 
 void Check(bool value, const char* text) {
 	if (!value) {
@@ -130,6 +133,39 @@ void ReleaseDeviceOpens() {
 int LiveDeviceCount() {
 	std::lock_guard lock(g_device_mutex);
 	return static_cast<int>(g_live_devices.size());
+}
+
+void BlockDeviceOutputs() {
+	std::lock_guard lock(g_device_mutex);
+	g_output_waiters = 0;
+	g_block_outputs  = true;
+}
+
+void WaitForDeviceOutputs(int count) {
+	std::unique_lock lock(g_device_mutex);
+	g_device_cv.wait(lock, [count]() { return g_output_waiters >= count; });
+}
+
+void ReleaseDeviceOutputs() {
+	std::lock_guard lock(g_device_mutex);
+	g_block_outputs = false;
+	g_device_cv.notify_all();
+}
+
+// Runs `func` on its own thread and fails the test if it has not returned within a few seconds,
+// so a call that deadlocks behind a blocked push aborts with a message instead of hanging.
+template <class Func>
+void CheckCompletes(Func func, const char* text) {
+	std::atomic<bool> done {false};
+	std::thread       runner([&]() {
+		func();
+		done = true;
+	});
+	for (int i = 0; i < 500 && !done; i++) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(10));
+	}
+	Check(done, text);
+	runner.join();
 }
 
 void SetPcm(AudioOut2::AudioOut2PortHandle port, const void* data) {
@@ -376,6 +412,81 @@ void TestPcmCopiedBeforeScratchBufferReuse() {
 	AudioOut2::AudioOut2ContextDestroy(context);
 }
 
+void TestBlockedPushDoesNotStallOtherPorts() {
+	const auto context = CreateContext();
+	const auto param   = MakeParam();
+	AudioOut2::AudioOut2PortHandle pushed = 0;
+	AudioOut2::AudioOut2PortHandle other  = 0;
+	Check(AudioOut2::AudioOut2PortCreate(context, AsParam(&param), &pushed) == OK,
+	      "pushed port create failed");
+	Check(AudioOut2::AudioOut2PortCreate(context, AsParam(&param), &other) == OK,
+	      "other port create failed");
+
+	uint32_t pcm[512] {};
+	SetPcm(pushed, pcm);
+	ResetOutputCalls();
+
+	// Park a synchronous push inside the backend, as a real device does while pacing its queue.
+	BlockDeviceOutputs();
+	std::thread pusher(
+	    [&]() { Check(AudioOut2::AudioOut2ContextPush(context, 1) == OK, "blocked push failed"); });
+	WaitForDeviceOutputs(1);
+
+	// Port calls from other threads must not queue up behind the parked push.
+	CheckCompletes(
+	    [&]() {
+		    PortState state {};
+		    Check(AudioOut2::AudioOut2PortGetState(other, AsState(&state)) == OK,
+		          "port state query failed during a blocked push");
+		    SetPcm(other, pcm);
+		    AudioOut2::AudioOut2PortHandle created = 0;
+		    Check(AudioOut2::AudioOut2PortCreate(context, AsParam(&param), &created) == OK,
+		          "port create failed during a blocked push");
+		    AudioOut2::AudioOut2PortDestroy(created);
+	    },
+	    "port calls stalled behind a push blocked in the backend");
+
+	ReleaseDeviceOutputs();
+	pusher.join();
+	Check(OutputCalls().size() == 1, "blocked push did not reach the backend exactly once");
+
+	AudioOut2::AudioOut2PortDestroy(pushed);
+	AudioOut2::AudioOut2PortDestroy(other);
+	AudioOut2::AudioOut2ContextDestroy(context);
+}
+
+void TestPushesOnOneContextStayOrdered() {
+	const auto context = CreateContext();
+	const auto param   = MakeParam();
+	AudioOut2::AudioOut2PortHandle port = 0;
+	Check(AudioOut2::AudioOut2PortCreate(context, AsParam(&param), &port) == OK,
+	      "device port create failed");
+
+	uint32_t pcm[512] {};
+	SetPcm(port, pcm);
+	ResetOutputCalls();
+
+	BlockDeviceOutputs();
+	std::thread first(
+	    [&]() { Check(AudioOut2::AudioOut2ContextPush(context, 1) == OK, "first push failed"); });
+	WaitForDeviceOutputs(1);
+	std::thread second(
+	    [&]() { Check(AudioOut2::AudioOut2ContextPush(context, 1) == OK, "second push failed"); });
+
+	// The second push has to wait for the first one's grain to leave the backend, or the port's
+	// grains could reach the device out of order now that the lock is not held across the wait.
+	std::this_thread::sleep_for(std::chrono::milliseconds(100));
+	Check(OutputCalls().size() == 1, "second push entered the backend while the first was in it");
+
+	ReleaseDeviceOutputs();
+	first.join();
+	second.join();
+	Check(OutputCalls().size() == 2, "second push never reached the backend");
+
+	AudioOut2::AudioOut2PortDestroy(port);
+	AudioOut2::AudioOut2ContextDestroy(context);
+}
+
 } // namespace
 
 namespace Libs::Audio::AudioInternal {
@@ -413,7 +524,7 @@ bool AudioOutHasDevice(int handle) {
 }
 
 uint32_t AudioOutOutputs(const OutputParam* params, uint32_t num, bool blocking) {
-	std::lock_guard lock(g_device_mutex);
+	std::unique_lock lock(g_device_mutex);
 	g_output_blocking.push_back(blocking);
 	if (g_capture_bytes != 0) {
 		for (uint32_t i = 0; i < num; i++) {
@@ -421,6 +532,9 @@ uint32_t AudioOutOutputs(const OutputParam* params, uint32_t num, bool blocking)
 			g_output_pcm.emplace_back(bytes, bytes + g_capture_bytes);
 		}
 	}
+	g_output_waiters++;
+	g_device_cv.notify_all();
+	g_device_cv.wait(lock, []() { return !g_block_outputs; });
 	return 0;
 }
 
@@ -445,6 +559,8 @@ int main() {
 	TestAsynchronousDevicePushKeepsQueueBounded();
 	TestHandleWithoutPcmDoesNotBypassQueue();
 	TestPcmCopiedBeforeScratchBufferReuse();
+	TestBlockedPushDoesNotStallOtherPorts();
+	TestPushesOnOneContextStayOrdered();
 	std::printf("AudioOut2PortTests: all cases passed\n");
 	return 0;
 }

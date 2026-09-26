@@ -3,7 +3,9 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/threads.h"
+#include "libatrac9.h"
 #include "libs/ajm/atrac9_decoder.h"
+#include "libs/ajm/atrac9_init.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 
@@ -19,8 +21,6 @@
 #include <memory>
 #include <numbers>
 #include <vector>
-
-#include "libatrac9.h"
 
 namespace Libs::Audio {
 
@@ -1941,11 +1941,11 @@ static bool Ngs2GetAtrac9CodecInfo(std::array<uint8_t, ATRAC9_CONFIG_DATA_SIZE> 
 		return false;
 	}
 	void* decoder = Atrac9GetHandle();
-	const bool valid = decoder != nullptr && Atrac9InitDecoder(decoder, config.data()) == 0 &&
-	                   Atrac9GetCodecInfo(decoder, &codec) == 0 && codec.channels > 0 &&
-	                   codec.samplingRate > 0 && codec.superframeSize > 0 &&
-	                   codec.framesInSuperframe > 0 && codec.frameSamples > 0 &&
-	                   codec.superframeSize % codec.framesInSuperframe == 0;
+	const bool valid =
+	    decoder != nullptr && Ajm::AjmAtrac9InitDecoder(decoder, config.data()) == 0 &&
+	    Atrac9GetCodecInfo(decoder, &codec) == 0 && codec.channels > 0 && codec.samplingRate > 0 &&
+	    codec.superframeSize > 0 && codec.framesInSuperframe > 0 && codec.frameSamples > 0 &&
+	    codec.superframeSize % codec.framesInSuperframe == 0;
 	if (decoder != nullptr) {
 		Atrac9ReleaseHandle(decoder);
 	}

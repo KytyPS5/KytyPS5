@@ -189,6 +189,8 @@ struct AudioOut2PortStateEntry {
 	AudioInternal::Format  audio_format  = AudioInternal::Format::Unknown;
 	int                    audio_handle  = 0;
 	std::vector<uint8_t>   pcm_data;
+	// Set while a push has this port's PCM in the backend, outside g_audioout2_port_mutex.
+	bool busy = false;
 };
 
 struct AudioOut2SpeakerArrayState {
@@ -209,6 +211,7 @@ struct AudioOut2LatencyState {
 static Common::Mutex                              g_audioout2_context_mutex;
 static std::array<AudioOut2ContextState, 16>      g_audioout2_contexts;
 static Common::Mutex                              g_audioout2_port_mutex;
+static Common::CondVar                            g_audioout2_port_cond; // A port's busy cleared.
 static std::array<AudioOut2PortStateEntry, 256>   g_audioout2_ports;
 static Common::Mutex                              g_audioout2_speaker_array_mutex;
 static std::array<AudioOut2SpeakerArrayState, 32> g_audioout2_speaker_arrays;
@@ -359,23 +362,59 @@ static bool audioout2_context_has_queueable_device(AudioOut2ContextHandle ctx) {
 }
 
 static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, bool blocking) {
-	// The backend consumes the buffers synchronously, but can block while pacing SDL's queue.
-	// Keep both PCM storage and port handles alive until it returns.
+	// The backend consumes the buffers synchronously, but can block for a grain plus its queue
+	// timeout while pacing SDL. Holding the port table lock across that stalls every
+	// sceAudioOut2Port* call from other threads, so copy the PCM and handles out under the lock,
+	// mark the ports busy, and run the backend with the lock released.
 	std::vector<AudioInternal::OutputParam> params;
+	std::vector<std::vector<uint8_t>>       pcm;
+	std::vector<AudioOut2PortHandle>        busy_ports;
 	params.reserve(AudioInternal::OUT_PORTS_MAX);
+	pcm.reserve(AudioInternal::OUT_PORTS_MAX); // Keeps the data pointers below stable.
+	busy_ports.reserve(AudioInternal::OUT_PORTS_MAX);
 
-	Common::LockGuard lock(g_audioout2_port_mutex);
-	for (const auto& state: g_audioout2_ports) {
+	g_audioout2_port_mutex.Lock();
+	// A push for this context that is still in the backend has to finish first, so each port's
+	// grains reach the device in submission order.
+	for (;;) {
+		bool busy = false;
+		for (const auto& state: g_audioout2_ports) {
+			if (state.used && state.context == ctx && state.busy) {
+				busy = true;
+				break;
+			}
+		}
+		if (!busy) {
+			break;
+		}
+		g_audioout2_port_cond.WaitFor(&g_audioout2_port_mutex, 10000);
+	}
+	for (auto& state: g_audioout2_ports) {
 		if (state.used && state.context == ctx && state.audio_handle > 0 &&
 		    !state.pcm_data.empty() && params.size() < AudioInternal::OUT_PORTS_MAX) {
-			params.push_back(AudioInternal::OutputParam {state.audio_handle, state.pcm_data.data()});
+			state.busy = true;
+			busy_ports.push_back(state.handle);
+			pcm.push_back(state.pcm_data);
+			params.push_back(AudioInternal::OutputParam {state.audio_handle, pcm.back().data()});
 		}
 	}
+	g_audioout2_port_mutex.Unlock();
 
-	if (!params.empty()) {
-		(void)AudioInternal::AudioOutOutputs(params.data(), static_cast<uint32_t>(params.size()),
-		                                     blocking);
+	if (params.empty()) {
+		return;
 	}
+
+	(void)AudioInternal::AudioOutOutputs(params.data(), static_cast<uint32_t>(params.size()),
+	                                     blocking);
+
+	g_audioout2_port_mutex.Lock();
+	for (const auto handle: busy_ports) {
+		if (auto* state = audioout2_find_port_locked(handle); state != nullptr) {
+			state->busy = false;
+		}
+	}
+	g_audioout2_port_mutex.Unlock();
+	g_audioout2_port_cond.SignalAll();
 }
 
 static void audioout2_close_audio_handle(int audio_handle) {

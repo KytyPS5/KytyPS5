@@ -66,6 +66,9 @@ struct Binding {
 };
 
 constexpr int              MOUSE_POLL_INTERVAL_MS = 33;
+// The host cursor hides over the game window after this much inactivity and returns on
+// mouse motion, so titles that draw their own pointer are not shadowed by the OS one.
+constexpr uint64_t         CURSOR_HIDE_DELAY_MS   = 3000;
 constexpr std::string_view MOUSE_SENSITIVITY      = "MouseSensitivity=";
 
 struct MouseJoystickState {
@@ -76,6 +79,12 @@ struct MouseJoystickState {
 
 MouseJoystickState g_mouse;
 SDL_Window*        g_mouse_window = nullptr;
+
+struct CursorState {
+	bool     visible = true;
+	uint64_t hide_at = 0; // SDL tick at which the visible cursor auto-hides
+};
+CursorState g_cursor;
 
 std::size_t ControlFromName(std::string_view name) {
 	const auto info = std::find_if(CONTROL_INFO.begin(), CONTROL_INFO.end(),
@@ -335,6 +344,40 @@ void CenterMouseStick() {
 	g_mouse.output = false;
 }
 
+void ShowCursorForAWhile(uint64_t now_ms) {
+	if (!g_cursor.visible) {
+		SDL_ShowCursor();
+		g_cursor.visible = true;
+	}
+	g_cursor.hide_at = now_ms + CURSOR_HIDE_DELAY_MS;
+}
+
+// Returns the SDL_WaitEventTimeout timeout that lets the loop wake up to hide the cursor,
+// hiding it when the idle period has already elapsed; -1 waits indefinitely.
+int CursorWaitTimeout(uint64_t now_ms) {
+	if (!g_cursor.visible) {
+		return -1;
+	}
+	if (now_ms >= g_cursor.hide_at) {
+		SDL_HideCursor();
+		g_cursor.visible = false;
+		return -1;
+	}
+	return static_cast<int>(std::min<uint64_t>(g_cursor.hide_at - now_ms, INT32_MAX));
+}
+
+bool CursorActivityEvent(const SDL_Event& event) {
+	switch (event.type) {
+		case SDL_EVENT_MOUSE_MOTION: return event.motion.which != SDL_TOUCH_MOUSEID;
+		case SDL_EVENT_MOUSE_BUTTON_DOWN:
+		case SDL_EVENT_MOUSE_BUTTON_UP: return event.button.which != SDL_TOUCH_MOUSEID;
+		case SDL_EVENT_MOUSE_WHEEL: return event.wheel.which != SDL_TOUCH_MOUSEID;
+		case SDL_EVENT_WINDOW_FOCUS_LOST:
+		case SDL_EVENT_WINDOW_MOUSE_LEAVE: return true;
+		default: return false;
+	}
+}
+
 bool SetRelativeMouseMode(bool enabled) {
 	if (SDL_SetWindowRelativeMouseMode(g_mouse_window, enabled)) {
 		return true;
@@ -366,6 +409,8 @@ int PollMouse(uint64_t now_ms) {
 void HostInputInit(SDL_Window* window) {
 	GetInputMap();
 	g_mouse_window = window;
+	g_cursor       = {};
+	ShowCursorForAWhile(SDL_GetTicks());
 }
 
 void HostInputShutdown() {
@@ -374,6 +419,10 @@ void HostInputShutdown() {
 		CenterMouseStick();
 		g_mouse = {};
 	}
+	if (!g_cursor.visible) {
+		SDL_ShowCursor();
+	}
+	g_cursor       = {};
 	g_mouse_window = nullptr;
 }
 
@@ -398,6 +447,7 @@ void HostInputToggleMouseToJoystick() {
 		SetRelativeMouseMode(false);
 		CenterMouseStick();
 		g_mouse = {};
+		ShowCursorForAWhile(SDL_GetTicks());
 		LOGF("Mouse to right stick: disabled\n");
 		return;
 	}
@@ -414,9 +464,10 @@ bool HostInputWaitEvent(SDL_Event* event) {
 	if (!g_mouse.enabled || SDL_GetKeyboardFocus() != g_mouse_window) {
 		g_mouse.next_poll = 0;
 		CenterMouseStick();
-		has_event = SDL_WaitEvent(event);
-		if (!has_event) {
-			EXIT("%s\n", SDL_GetError());
+		// Wake up without an event when it is time to hide the idle cursor.
+		has_event = SDL_WaitEventTimeout(event, CursorWaitTimeout(SDL_GetTicks()));
+		if (has_event && CursorActivityEvent(*event)) {
+			ShowCursorForAWhile(SDL_GetTicks());
 		}
 	} else {
 		if (g_mouse.next_poll == 0) {

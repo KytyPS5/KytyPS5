@@ -17,8 +17,10 @@ static uint32_t ShiftCeil(uint32_t value, uint32_t shift) {
 	return static_cast<uint32_t>((static_cast<uint64_t>(value) + (1ull << shift) - 1ull) >> shift);
 }
 
+// Linear rows are padded to 64 texels, capped at 256 bytes. Crash Bandicoot 4 writes its 1920- and
+// 640-wide R8 and R8G8 video planes with unpadded rows.
 static uint32_t CalcLinearBlockWidth(uint32_t bytes_per_element) {
-	return 256u / bytes_per_element;
+	return std::min(64u, 256u / bytes_per_element);
 }
 
 static uint32_t CalcLinearAlignedLevelPitch(uint32_t base_width, uint32_t base_height,

@@ -7,6 +7,16 @@
 #include <array>
 #include <cstring>
 
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 namespace Libs {
 
 namespace LibCes {
@@ -192,6 +202,62 @@ static constexpr int  CES_ERROR_UNASSIGNED_CODE    = static_cast<int>(0x805c0020
 static constexpr int  CES_ERROR_INVALID_DST_BUFFER = static_cast<int>(0x805c0030u);
 static constexpr int  CES_ERROR_DST_BUFFER_END     = static_cast<int>(0x805c0031u);
 
+#if defined(_WIN32)
+// Windows code page of a profile encoding, or 0 when the profile has none.
+static UINT CesWindowsCodePage(const char* encoding) {
+	return encoding == CP932 ? 932 : 0;
+}
+
+// Converts with the Windows code page tables (SDL's built-in iconv has no code pages), one
+// character at a time so that partial output, destination truncation and the failing position
+// match the iconv path.
+static int ConvertMbcsToUtf8WithCodePage(UINT code_page, const uint8_t* source, size_t source_size,
+                                         bool bounded_end, uint8_t* destination,
+                                         uint32_t destination_max, bool measure, size_t* input_left,
+                                         size_t* produced) {
+	int    result = 0;
+	size_t offset = 0;
+	while (offset < source_size) {
+		const uint8_t lead      = source[offset];
+		const size_t  char_size = IsDBCSLeadByteEx(code_page, lead) != 0 ? 2 : 1;
+		if (offset + char_size > source_size) {
+			result = bounded_end ? CES_ERROR_SRC_BUFFER_END : CES_ERROR_INVALID_ENCODE;
+			break;
+		}
+		wchar_t   wide[4] {};
+		const int wide_len = MultiByteToWideChar(code_page, MB_ERR_INVALID_CHARS,
+		                                         reinterpret_cast<const char*>(source + offset),
+		                                         static_cast<int>(char_size), wide, 4);
+		if (wide_len <= 0) {
+			const uint8_t trail = char_size == 2 ? source[offset + 1] : 0;
+			const bool    valid_trail =
+			    (trail >= 0x40 && trail <= 0x7e) || (trail >= 0x80 && trail <= 0xfc);
+			result = char_size == 2 && valid_trail ? CES_ERROR_UNASSIGNED_CODE
+			                                       : CES_ERROR_INVALID_ENCODE;
+			break;
+		}
+		char      utf8[8] {};
+		const int utf8_len = WideCharToMultiByte(CP_UTF8, 0, wide, wide_len, utf8,
+		                                         static_cast<int>(sizeof(utf8)), nullptr, nullptr);
+		if (utf8_len <= 0) {
+			result = CES_ERROR_INVALID_ENCODE;
+			break;
+		}
+		if (!measure) {
+			if (*produced + static_cast<size_t>(utf8_len) + 1 > destination_max) {
+				result = CES_ERROR_DST_BUFFER_END;
+				break;
+			}
+			std::memcpy(destination + *produced, utf8, static_cast<size_t>(utf8_len));
+		}
+		*produced += static_cast<size_t>(utf8_len);
+		offset += char_size;
+	}
+	*input_left = source_size - offset;
+	return result;
+}
+#endif
+
 static CesProfile* KYTY_SYSV_ABI CesUcsProfileInitSJis1997Cp932(CesProfile* sheet) {
 	PRINT_NAME();
 	if (sheet != nullptr) {
@@ -246,38 +312,54 @@ static int ConvertMbcsToUtf8(CesContext* context, const uint8_t* source, uint32_
 		++source_size;
 	}
 	const bool bounded_end = source_max != 0 && source_size == source_max;
-	const auto converter   = SDL_iconv_open("UTF-8", context->profile->encoding);
-	EXIT_IF(converter == reinterpret_cast<SDL_iconv_t>(-1));
-
-	const char*           input      = reinterpret_cast<const char*>(source);
-	size_t                input_left = source_size;
-	size_t                produced   = 0;
-	int                   result     = 0;
-	std::array<char, 256> scratch;
-	do {
-		char* output = measure ? scratch.data() : reinterpret_cast<char*>(destination) + produced;
-		const size_t capacity    = measure ? scratch.size() : destination_max - 1 - produced;
-		size_t       output_left = capacity;
-		const auto   status      = SDL_iconv(converter, &input, &input_left, &output, &output_left);
-		produced += capacity - output_left;
-		if (status == SDL_ICONV_E2BIG) {
-			if (measure) {
-				continue;
-			}
-			result = CES_ERROR_DST_BUFFER_END;
-		} else if (status == SDL_ICONV_EINVAL) {
-			result = bounded_end ? CES_ERROR_SRC_BUFFER_END : CES_ERROR_INVALID_ENCODE;
-		} else if (status == SDL_ICONV_EILSEQ || status == SDL_ICONV_ERROR) {
-			const auto* code = reinterpret_cast<const uint8_t*>(input);
-			const bool  lead =
-			    (code[0] >= 0x81 && code[0] <= 0x9f) || (code[0] >= 0xe0 && code[0] <= 0xfc);
-			const bool trail = input_left >= 2 && ((code[1] >= 0x40 && code[1] <= 0x7e) ||
-			                                       (code[1] >= 0x80 && code[1] <= 0xfc));
-			result           = lead && trail ? CES_ERROR_UNASSIGNED_CODE : CES_ERROR_INVALID_ENCODE;
+	size_t     input_left  = source_size;
+	size_t     produced    = 0;
+	int        result      = 0;
+	bool       converted   = false;
+#if defined(_WIN32)
+	if (const UINT code_page = CesWindowsCodePage(context->profile->encoding); code_page != 0) {
+		result =
+		    ConvertMbcsToUtf8WithCodePage(code_page, source, source_size, bounded_end, destination,
+		                                  destination_max, measure, &input_left, &produced);
+		converted = true;
+	}
+#endif
+	if (!converted) {
+		// SDL's built-in iconv (SDL_SYSTEM_ICONV off) has no code page tables; report an
+		// unsupported profile instead of terminating the emulator.
+		const auto converter = SDL_iconv_open("UTF-8", context->profile->encoding);
+		if (converter == reinterpret_cast<SDL_iconv_t>(-1)) {
+			return CES_ERROR_INVALID_PROFILE;
 		}
-		break;
-	} while (input_left != 0);
-	SDL_iconv_close(converter);
+
+		const char*           input = reinterpret_cast<const char*>(source);
+		std::array<char, 256> scratch;
+		do {
+			char* output =
+			    measure ? scratch.data() : reinterpret_cast<char*>(destination) + produced;
+			const size_t capacity    = measure ? scratch.size() : destination_max - 1 - produced;
+			size_t       output_left = capacity;
+			const auto   status = SDL_iconv(converter, &input, &input_left, &output, &output_left);
+			produced += capacity - output_left;
+			if (status == SDL_ICONV_E2BIG) {
+				if (measure) {
+					continue;
+				}
+				result = CES_ERROR_DST_BUFFER_END;
+			} else if (status == SDL_ICONV_EINVAL) {
+				result = bounded_end ? CES_ERROR_SRC_BUFFER_END : CES_ERROR_INVALID_ENCODE;
+			} else if (status == SDL_ICONV_EILSEQ || status == SDL_ICONV_ERROR) {
+				const auto* code = reinterpret_cast<const uint8_t*>(input);
+				const bool  lead =
+				    (code[0] >= 0x81 && code[0] <= 0x9f) || (code[0] >= 0xe0 && code[0] <= 0xfc);
+				const bool trail = input_left >= 2 && ((code[1] >= 0x40 && code[1] <= 0x7e) ||
+				                                       (code[1] >= 0x80 && code[1] <= 0xfc));
+				result = lead && trail ? CES_ERROR_UNASSIGNED_CODE : CES_ERROR_INVALID_ENCODE;
+			}
+			break;
+		} while (input_left != 0);
+		SDL_iconv_close(converter);
+	}
 
 	if (!measure) {
 		destination[produced] = 0;

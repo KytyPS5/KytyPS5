@@ -1460,14 +1460,12 @@ const char* KYTY_SYSV_ABI NetInetNtop(int af, const void* src, char* dst, uint32
 int KYTY_SYSV_ABI NetEtherNtostr(const NetEtherAddr* n, char* str, size_t len) {
 	PRINT_NAME();
 
-	NetEtherAddr zero {};
+	if (n == nullptr || str == nullptr || len < 18) {
+		return NET_ERROR_EINVAL;
+	}
 
-	EXIT_NOT_IMPLEMENTED(len != 18);
-	EXIT_NOT_IMPLEMENTED(n == nullptr);
-	EXIT_NOT_IMPLEMENTED(str == nullptr);
-	EXIT_NOT_IMPLEMENTED(memcmp(n->data, zero.data, sizeof(zero.data)) != 0);
-
-	strcpy(str, "00:00:00:00:00:00"); // NOLINT
+	std::snprintf(str, len, "%02x:%02x:%02x:%02x:%02x:%02x", n->data[0], n->data[1], n->data[2],
+	              n->data[3], n->data[4], n->data[5]);
 
 	return OK;
 }
@@ -2023,6 +2021,63 @@ int KYTY_SYSV_ABI Getsockname(int s, void* addr, uint32_t* addrlen) {
 	return result;
 }
 
+#if !defined(_WIN32)
+// Guest (FreeBSD) socket option numbers.
+constexpr int ORBIS_SOL_SOCKET   = 0xffff;
+constexpr int ORBIS_SO_REUSEADDR = 0x0004;
+constexpr int ORBIS_SO_KEEPALIVE = 0x0008;
+constexpr int ORBIS_SO_BROADCAST = 0x0020;
+constexpr int ORBIS_SO_LINGER    = 0x0080;
+constexpr int ORBIS_SO_REUSEPORT = 0x0200;
+constexpr int ORBIS_SO_SNDBUF    = 0x1001;
+constexpr int ORBIS_SO_RCVBUF    = 0x1002;
+constexpr int ORBIS_SO_SNDTIMEO  = 0x1005;
+constexpr int ORBIS_SO_RCVTIMEO  = 0x1006;
+constexpr int ORBIS_SO_ERROR     = 0x1007;
+constexpr int ORBIS_SO_NBIO      = 0x1200;
+constexpr int ORBIS_IPPROTO_TCP  = 6;
+constexpr int ORBIS_TCP_NODELAY  = 1;
+
+// Same layout as the host struct linger on POSIX systems.
+struct NetLinger {
+	int32_t l_onoff;
+	int32_t l_linger;
+};
+
+struct HostSocketOption {
+	enum class Kind { Int, Linger, Timeval };
+	int  level = 0;
+	int  name  = 0;
+	Kind kind  = Kind::Int;
+};
+
+// Maps a guest socket option to the host one. SO_NBIO has no host option; the callers
+// implement it with fcntl(O_NONBLOCK).
+static bool ConvertSocketOption(int level, int optname, HostSocketOption* out) {
+	using Kind = HostSocketOption::Kind;
+	if (level == ORBIS_SOL_SOCKET) {
+		switch (optname) {
+			case ORBIS_SO_REUSEADDR: *out = {SOL_SOCKET, SO_REUSEADDR, Kind::Int}; return true;
+			case ORBIS_SO_KEEPALIVE: *out = {SOL_SOCKET, SO_KEEPALIVE, Kind::Int}; return true;
+			case ORBIS_SO_BROADCAST: *out = {SOL_SOCKET, SO_BROADCAST, Kind::Int}; return true;
+			case ORBIS_SO_LINGER: *out = {SOL_SOCKET, SO_LINGER, Kind::Linger}; return true;
+			case ORBIS_SO_REUSEPORT: *out = {SOL_SOCKET, SO_REUSEPORT, Kind::Int}; return true;
+			case ORBIS_SO_SNDBUF: *out = {SOL_SOCKET, SO_SNDBUF, Kind::Int}; return true;
+			case ORBIS_SO_RCVBUF: *out = {SOL_SOCKET, SO_RCVBUF, Kind::Int}; return true;
+			case ORBIS_SO_SNDTIMEO: *out = {SOL_SOCKET, SO_SNDTIMEO, Kind::Timeval}; return true;
+			case ORBIS_SO_RCVTIMEO: *out = {SOL_SOCKET, SO_RCVTIMEO, Kind::Timeval}; return true;
+			case ORBIS_SO_ERROR: *out = {SOL_SOCKET, SO_ERROR, Kind::Int}; return true;
+			default: return false;
+		}
+	}
+	if (level == ORBIS_IPPROTO_TCP && optname == ORBIS_TCP_NODELAY) {
+		*out = {IPPROTO_TCP, TCP_NODELAY, Kind::Int};
+		return true;
+	}
+	return false;
+}
+#endif
+
 int KYTY_SYSV_ABI Getsockopt(int s, int level, int optname, void* optval, uint32_t* optlen) {
 	PRINT_NAME();
 
@@ -2055,9 +2110,57 @@ int KYTY_SYSV_ABI Getsockopt(int s, int level, int optname, void* optval, uint32
 	// Guest socket options: SOL_SOCKET=0xffff, SO_ERROR=0x1007.
 	const bool socket_error = (level == 0xffff && optname == 0x1007);
 #if !defined(_WIN32)
-	if (!socket_error) {
+	if (level == ORBIS_SOL_SOCKET && optname == ORBIS_SO_NBIO) {
+		if (*optlen < sizeof(int)) {
+			return SetGuestSocketError(Posix::POSIX_EINVAL);
+		}
+		const int flags = ::fcntl(socket, F_GETFL, 0);
+		if (flags < 0) {
+			return SetHostSocketError();
+		}
+		const int enabled = (flags & O_NONBLOCK) != 0 ? 1 : 0;
+		std::memcpy(optval, &enabled, sizeof(enabled));
+		*optlen = sizeof(enabled);
+		return 0;
+	}
+	HostSocketOption option {};
+	if (!ConvertSocketOption(level, optname, &option)) {
 		return SetGuestSocketError(Posix::POSIX_ENOPROTOOPT);
 	}
+	switch (option.kind) {
+		case HostSocketOption::Kind::Linger: {
+			if (*optlen < sizeof(NetLinger)) {
+				return SetGuestSocketError(Posix::POSIX_EINVAL);
+			}
+			linger       host {};
+			SocketLength host_len = sizeof(host);
+			if (::getsockopt(socket, option.level, option.name, &host, &host_len) != 0) {
+				return SetHostSocketError();
+			}
+			const NetLinger guest {host.l_onoff, host.l_linger};
+			std::memcpy(optval, &guest, sizeof(guest));
+			*optlen = sizeof(guest);
+			return 0;
+		}
+		case HostSocketOption::Kind::Timeval: {
+			if (*optlen < sizeof(NetTimeval)) {
+				return SetGuestSocketError(Posix::POSIX_EINVAL);
+			}
+			timeval      host {};
+			SocketLength host_len = sizeof(host);
+			if (::getsockopt(socket, option.level, option.name, &host, &host_len) != 0) {
+				return SetHostSocketError();
+			}
+			const NetTimeval guest {static_cast<int64_t>(host.tv_sec),
+			                        static_cast<int64_t>(host.tv_usec)};
+			std::memcpy(optval, &guest, sizeof(guest));
+			*optlen = sizeof(guest);
+			return 0;
+		}
+		case HostSocketOption::Kind::Int: break;
+	}
+	level   = option.level;
+	optname = option.name;
 #endif
 	if (socket_error) {
 		optname = SO_ERROR;
@@ -2069,7 +2172,7 @@ int KYTY_SYSV_ABI Getsockopt(int s, int level, int optname, void* optval, uint32
 	}
 	if (socket_error && len >= static_cast<SocketLength>(sizeof(int))) {
 		auto* error = static_cast<int*>(optval);
-		*error = ConvertHostSocketError(*error);
+		*error      = ConvertHostSocketError(*error);
 	}
 	*optlen = static_cast<uint32_t>(len);
 	return 0;
@@ -2130,12 +2233,62 @@ int KYTY_SYSV_ABI Setsockopt(int s, int level, int optname, const void* optval, 
 		return 0;
 	}
 #else
-	// Guest TCP options: IPPROTO_TCP=6, TCP_NODELAY=1.
-	if (level != 6 || optname != 1) {
+	if (level == ORBIS_SOL_SOCKET && optname == ORBIS_SO_NBIO) {
+		if (optlen < sizeof(int)) {
+			return SetGuestSocketError(Posix::POSIX_EINVAL);
+		}
+		int enabled = 0;
+		std::memcpy(&enabled, optval, sizeof(enabled));
+		const int flags = ::fcntl(socket, F_GETFL, 0);
+		if (flags < 0 ||
+		    ::fcntl(socket, F_SETFL, enabled != 0 ? (flags | O_NONBLOCK) : (flags & ~O_NONBLOCK)) !=
+		        0) {
+			return SetHostSocketError();
+		}
+		SetNativeSocketNonblocking(s, enabled != 0);
+		return 0;
+	}
+	HostSocketOption option {};
+	if (!ConvertSocketOption(level, optname, &option) ||
+	    (option.level == SOL_SOCKET && option.name == SO_ERROR)) {
 		return SetGuestSocketError(Posix::POSIX_ENOPROTOOPT);
 	}
-	level   = IPPROTO_TCP;
-	optname = TCP_NODELAY;
+	switch (option.kind) {
+		case HostSocketOption::Kind::Linger: {
+			if (optlen < sizeof(NetLinger)) {
+				return SetGuestSocketError(Posix::POSIX_EINVAL);
+			}
+			NetLinger guest {};
+			std::memcpy(&guest, optval, sizeof(guest));
+			const linger host {guest.l_onoff, guest.l_linger};
+			if (::setsockopt(socket, option.level, option.name, &host, sizeof(host)) != 0) {
+				return SetHostSocketError();
+			}
+			return 0;
+		}
+		case HostSocketOption::Kind::Timeval: {
+			if (optlen < sizeof(NetTimeval)) {
+				return SetGuestSocketError(Posix::POSIX_EINVAL);
+			}
+			NetTimeval guest {};
+			std::memcpy(&guest, optval, sizeof(guest));
+			timeval host {};
+			host.tv_sec  = static_cast<decltype(host.tv_sec)>(guest.tv_sec);
+			host.tv_usec = static_cast<decltype(host.tv_usec)>(guest.tv_usec);
+			if (::setsockopt(socket, option.level, option.name, &host, sizeof(host)) != 0) {
+				return SetHostSocketError();
+			}
+			return 0;
+		}
+		case HostSocketOption::Kind::Int:
+			if (optlen < sizeof(int)) {
+				return SetGuestSocketError(Posix::POSIX_EINVAL);
+			}
+			optlen = sizeof(int);
+			break;
+	}
+	level   = option.level;
+	optname = option.name;
 #endif
 
 	if (::setsockopt(socket, ConvertSocketOptionLevel(level), optname,

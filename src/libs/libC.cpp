@@ -636,9 +636,13 @@ static KYTY_SYSV_ABI int snprintf(VA_ARGS) {
 int KYTY_SYSV_ABI fflush(FILE* stream) {
 	PRINT_NAME();
 
-	EXIT_NOT_IMPLEMENTED(stream != stdout);
+	// Only the standard streams are backed by host stdio; flushing any other guest FILE is a
+	// no-op (NULL flushes every host stream, as in C).
+	if (stream == nullptr || stream == stdout || stream == stderr) {
+		return ::fflush(stream);
+	}
 
-	return ::fflush(stream);
+	return 0;
 }
 
 void* KYTY_SYSV_ABI memset(void* s, int c, size_t n) {

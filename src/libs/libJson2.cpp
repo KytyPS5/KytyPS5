@@ -4,7 +4,9 @@
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
 
+#include <cmath>
 #include <cstddef>
+#include <cstdio>
 #include <cstring>
 #include <map>
 #include <nlohmann/json.hpp>
@@ -279,18 +281,26 @@ static void JsonValueCopy(JsonValue* dst, const JsonValue* src) {
 		return;
 	}
 
-	JsonValueClear(dst);
-	dst->type = src->type;
+	// The source may be a descendant of dst, so build the copy before clearing dst. Children
+	// of arrays and objects are parented to dst directly.
+	JsonValue copy {};
+	JsonValueInit(&copy);
+	copy.type = src->type;
 	switch (src->type) {
-		case JsonValueTypeBoolean: dst->boolean = src->boolean; break;
-		case JsonValueTypeInteger: dst->integer = src->integer; break;
-		case JsonValueTypeUInteger: dst->uinteger = src->uinteger; break;
-		case JsonValueTypeReal: dst->real = src->real; break;
-		case JsonValueTypeString: dst->string = JsonStringNew(*JsonStringImpl(src->string)); break;
-		case JsonValueTypeArray: dst->array = new JsonArray {JsonArrayCopy(src->array, dst)}; break;
-		case JsonValueTypeObject: dst->object = new JsonObject {JsonObjectCopy(src->object, dst)}; break;
-		default: dst->uinteger = 0; break;
+		case JsonValueTypeBoolean: copy.boolean = src->boolean; break;
+		case JsonValueTypeInteger: copy.integer = src->integer; break;
+		case JsonValueTypeUInteger: copy.uinteger = src->uinteger; break;
+		case JsonValueTypeReal: copy.real = src->real; break;
+		case JsonValueTypeString: copy.string = JsonStringNew(*JsonStringImpl(src->string)); break;
+		case JsonValueTypeArray: copy.array = new JsonArray {JsonArrayCopy(src->array, dst)}; break;
+		case JsonValueTypeObject:
+			copy.object = new JsonObject {JsonObjectCopy(src->object, dst)};
+			break;
+		default: copy.uinteger = 0; break;
 	}
+
+	JsonValueClear(dst);
+	*dst = copy;
 }
 
 static JsonValue* JsonObjectLookup(JsonObject* object, const std::string& key, bool create) {
@@ -375,6 +385,44 @@ static bool JsonValueFromNlohmann(JsonValue* out, const nlohmann::json& value) {
 	return false;
 }
 
+// Emits a JSON string literal escaped per RFC 8259.
+static void JsonSerializeString(const std::string& value, std::string* out) {
+	out->push_back('"');
+	for (const char ch: value) {
+		switch (ch) {
+			case '"': out->append("\\\""); break;
+			case '\\': out->append("\\\\"); break;
+			case '\b': out->append("\\b"); break;
+			case '\f': out->append("\\f"); break;
+			case '\n': out->append("\\n"); break;
+			case '\r': out->append("\\r"); break;
+			case '\t': out->append("\\t"); break;
+			default:
+				if (static_cast<unsigned char>(ch) < 0x20) {
+					char escaped[8];
+					std::snprintf(escaped, sizeof(escaped), "\\u%04x",
+					              static_cast<unsigned int>(static_cast<unsigned char>(ch)));
+					out->append(escaped);
+				} else {
+					out->push_back(ch);
+				}
+				break;
+		}
+	}
+	out->push_back('"');
+}
+
+// Emits a real with round-trip precision; JSON has no representation for NaN or infinity.
+static void JsonSerializeReal(double value, std::string* out) {
+	if (std::isnan(value) || std::isinf(value)) {
+		out->append("null");
+		return;
+	}
+	char text[32];
+	std::snprintf(text, sizeof(text), "%.17g", value);
+	out->append(text);
+}
+
 static void JsonSerializeValue(const JsonValue* value, std::string* out) {
 	if (value == nullptr) {
 		out->append("null");
@@ -384,12 +432,8 @@ static void JsonSerializeValue(const JsonValue* value, std::string* out) {
 		case JsonValueTypeBoolean: out->append(value->boolean ? "true" : "false"); break;
 		case JsonValueTypeInteger: out->append(std::to_string(value->integer)); break;
 		case JsonValueTypeUInteger: out->append(std::to_string(value->uinteger)); break;
-		case JsonValueTypeReal: out->append(std::to_string(value->real)); break;
-		case JsonValueTypeString:
-			out->push_back('"');
-			out->append(*JsonStringImpl(value->string));
-			out->push_back('"');
-			break;
+		case JsonValueTypeReal: JsonSerializeReal(value->real, out); break;
+		case JsonValueTypeString: JsonSerializeString(*JsonStringImpl(value->string), out); break;
 		case JsonValueTypeArray: {
 			out->push_back('[');
 			bool first = true;
@@ -411,9 +455,8 @@ static void JsonSerializeValue(const JsonValue* value, std::string* out) {
 					out->push_back(',');
 				}
 				first = false;
-				out->push_back('"');
-				out->append(item.first);
-				out->append("\":");
+				JsonSerializeString(item.first, out);
+				out->push_back(':');
 				JsonSerializeValue(item.second, out);
 			}
 			out->push_back('}');

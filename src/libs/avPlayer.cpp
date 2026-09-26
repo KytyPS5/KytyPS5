@@ -1011,6 +1011,24 @@ public:
 		--pending_loop_warnings;
 		return AVPLAYER_WARNING_LOOPING_BACK;
 	}
+	// Reports, once, that playback ended on its own: the pipeline drained (not while looping)
+	// or failed while playing. The caller emits AVPLAYER_EVENT_STATE_STOP outside the mutex,
+	// as Stop() does; a later Stop() finds the state already Stopped and stays silent.
+	std::optional<AvPlayerEventReplacement> TakeNaturalStop() {
+		bool was_playing_video = false;
+		{
+			std::lock_guard lock(mutex);
+			if (state != State::Playing || !(pipeline_failed || DrainedNoLock())) {
+				return std::nullopt;
+			}
+			state             = State::Stopped;
+			was_playing_video = video_id.has_value();
+		}
+		if (was_playing_video) {
+			::printf("AvPlayer video finished playing\n");
+		}
+		return event;
+	}
 
 private:
 	enum class State { Ready, Playing, Stopped };
@@ -1699,13 +1717,17 @@ struct AvPlayerInternal {
 static bool valid_allocators(const AvPlayerMemAllocator& m) {
 	return m.allocate && m.deallocate && m.allocate_texture && m.deallocate_texture;
 }
-static void pump_warnings(AvPlayerInternal* h) {
+static void pump_events(AvPlayerInternal* h) {
 	if (h == nullptr || h->source == nullptr) {
 		return;
 	}
 	while (auto w = h->source->TakeWarning()) {
 		int32_t warning = *w;
 		emit_event(h->event, AVPLAYER_EVENT_WARNING_ID, &warning);
+	}
+	// Playback that ends by itself reports STOP exactly once, like an explicit Stop().
+	if (auto stop = h->source->TakeNaturalStop()) {
+		emit_event(*stop, AVPLAYER_EVENT_STATE_STOP);
 	}
 }
 static AvPlayerInternal* create_player(const AvPlayerMemAllocator&     mem,
@@ -1994,7 +2016,7 @@ Bool KYTY_SYSV_ABI AvPlayerGetVideoData(AvPlayerInternal* h, AvPlayerFrameInfo* 
 	}
 	AvPlayerFrameInfoEx ex {};
 	if (!h->source->Video(&ex)) {
-		pump_warnings(h);
+		pump_events(h);
 		return 0;
 	}
 	std::memset(video_info, 0, sizeof(*video_info));
@@ -2004,7 +2026,7 @@ Bool KYTY_SYSV_ABI AvPlayerGetVideoData(AvPlayerInternal* h, AvPlayerFrameInfo* 
 	video_info->details.video.height       = ex.details.video.height;
 	video_info->details.video.aspect_ratio = ex.details.video.aspect_ratio;
 	std::memcpy(video_info->details.video.language_code, ex.details.video.language_code, 4);
-	pump_warnings(h);
+	pump_events(h);
 	return 1;
 }
 Bool KYTY_SYSV_ABI AvPlayerGetVideoDataEx(AvPlayerInternal* h, AvPlayerFrameInfoEx* video_info) {
@@ -2013,7 +2035,7 @@ Bool KYTY_SYSV_ABI AvPlayerGetVideoDataEx(AvPlayerInternal* h, AvPlayerFrameInfo
 		return 0;
 	}
 	auto ok = h->source->Video(video_info) ? 1 : 0;
-	pump_warnings(h);
+	pump_events(h);
 	return ok;
 }
 Bool KYTY_SYSV_ABI AvPlayerGetAudioData(AvPlayerInternal* h, AvPlayerFrameInfo* audio_info) {
@@ -2022,12 +2044,20 @@ Bool KYTY_SYSV_ABI AvPlayerGetAudioData(AvPlayerInternal* h, AvPlayerFrameInfo* 
 		return 0;
 	}
 	auto ok = h->source->Audio(audio_info) ? 1 : 0;
-	pump_warnings(h);
+	pump_events(h);
 	return ok;
 }
 Bool KYTY_SYSV_ABI AvPlayerIsActive(AvPlayerInternal* h) {
 	PRINT_NAME();
-	return h != nullptr && (h->source == nullptr || h->source->Active());
+	if (h == nullptr) {
+		return 0;
+	}
+	if (h->source == nullptr) {
+		return 1;
+	}
+	const Bool active = h->source->Active() ? 1 : 0;
+	pump_events(h);
+	return active;
 }
 uint64_t KYTY_SYSV_ABI AvPlayerCurrentTime(AvPlayerInternal* h) {
 	PRINT_NAME();

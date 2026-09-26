@@ -66,11 +66,13 @@ struct UltQueueDataResourcePoolState {
 
 struct UltQueueState {
 	std::mutex                       mutex;
+	std::condition_variable          not_full;
 	std::deque<std::vector<uint8_t>> items;
 	uint64_t                         data_size    = 0;
 	uint32_t                         capacity     = 0;
 	void*                            waiting_pool = nullptr;
 	void*                            data_pool    = nullptr;
+	bool                             alive        = true;
 };
 
 struct UltRuntimeState {
@@ -123,6 +125,7 @@ static int KYTY_SYSV_ABI UltFinalize() {
 	PRINT_NAME();
 
 	std::vector<std::shared_ptr<UltSemaphoreState>> semaphores;
+	std::vector<std::shared_ptr<UltQueueState>>     queues;
 	{
 		std::scoped_lock lock(g_ult_mutex);
 		semaphores.reserve(g_ult_semaphores.size());
@@ -131,6 +134,13 @@ static int KYTY_SYSV_ABI UltFinalize() {
 			std::scoped_lock state_lock(state->mutex);
 			state->alive = false;
 			semaphores.push_back(state);
+		}
+		queues.reserve(g_ult_queues.size());
+		for (auto& entry: g_ult_queues) {
+			auto&            state = entry.second;
+			std::scoped_lock state_lock(state->mutex);
+			state->alive = false;
+			queues.push_back(state);
 		}
 		g_ult_semaphores.clear();
 		g_ult_mutexes.clear();
@@ -142,6 +152,9 @@ static int KYTY_SYSV_ABI UltFinalize() {
 	}
 	for (const auto& state: semaphores) {
 		state->available.notify_all();
+	}
+	for (const auto& state: queues) {
+		state->not_full.notify_all();
 	}
 
 	return OK;
@@ -437,15 +450,17 @@ static int KYTY_SYSV_ABI UltQueuePush(void* queue, const void* data) {
 		return ULT_ERROR_NULL;
 	}
 
-	std::scoped_lock lock(state->mutex);
-	if (state->capacity != 0 && state->items.size() >= state->capacity) {
-		static std::atomic<uint32_t> log_count {0};
-		if (log_count.fetch_add(1) < 32) {
-			LOGF("\t queue full, dropping pushed item: queue=0x%016" PRIx64 " capacity=%" PRIu32
-			     " data_size=0x%016" PRIx64 "\n",
-			     reinterpret_cast<uint64_t>(queue), state->capacity, state->data_size);
+	std::unique_lock lock(state->mutex);
+	if (!state->alive) {
+		return ULT_ERROR_STATE;
+	}
+	// sceUltQueuePush blocks until the queue has room; only TryPush reports AGAIN.
+	if (state->capacity != 0) {
+		state->not_full.wait(
+		    lock, [&] { return !state->alive || state->items.size() < state->capacity; });
+		if (!state->alive) {
+			return ULT_ERROR_STATE;
 		}
-		return OK;
 	}
 
 	auto& item = state->items.emplace_back(static_cast<size_t>(state->data_size));
@@ -468,13 +483,17 @@ static int KYTY_SYSV_ABI UltQueueTryPop(void* queue, void* data) {
 		return ULT_ERROR_NULL;
 	}
 
-	std::scoped_lock lock(state->mutex);
-	if (state->items.empty()) {
-		return ULT_ERROR_AGAIN;
+	std::vector<uint8_t> item;
+	{
+		std::scoped_lock lock(state->mutex);
+		if (state->items.empty()) {
+			return ULT_ERROR_AGAIN;
+		}
+		item = std::move(state->items.front());
+		state->items.pop_front();
 	}
+	state->not_full.notify_one();
 
-	auto item = std::move(state->items.front());
-	state->items.pop_front();
 	if (!item.empty()) {
 		std::memcpy(data, item.data(), item.size());
 	}

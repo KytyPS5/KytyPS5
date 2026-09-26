@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <limits>
 #include <mutex>
 #include <unordered_map>
@@ -78,6 +79,7 @@ public:
 
 	~Instance() {
 		ClearPictureMetadata();
+		FreePendingFrames();
 		if (m_sws != nullptr) {
 			sws_freeContext(m_sws);
 		}
@@ -153,19 +155,27 @@ public:
 		const PacketMetadata metadata {input.pts, input.dts, input.attached_data};
 		std::memcpy(packet->opaque_ref->data, &metadata, sizeof(metadata));
 
-		bool have_pending_frame = false;
-		result                  = avcodec_send_packet(m_codec, packet);
-		if (result == AVERROR(EAGAIN)) {
-			result = avcodec_receive_frame(m_codec, frame);
+		// A decoder that still holds output rejects new input with EAGAIN. Drain its pictures
+		// into the pending list (oldest first) until the packet is accepted, so none is lost.
+		result = avcodec_send_packet(m_codec, packet);
+		while (result == AVERROR(EAGAIN)) {
+			AVFrame* drained = av_frame_alloc();
+			if (drained == nullptr) {
+				av_packet_free(&packet);
+				av_frame_free(&frame);
+				return Result::ApiFail;
+			}
+			result = avcodec_receive_frame(m_codec, drained);
 			if (result < 0) {
 				LOGF("Videodec2: decoder rejected an AU while no output was available: %s (%d)\n",
 				     AvErrorString(result), result);
+				av_frame_free(&drained);
 				av_packet_free(&packet);
 				av_frame_free(&frame);
 				return Result::AccessUnit;
 			}
-			have_pending_frame = true;
-			result             = avcodec_send_packet(m_codec, packet);
+			m_pending_frames.push_back(drained);
+			result = avcodec_send_packet(m_codec, packet);
 		}
 		if (result < 0) {
 			LOGF("Videodec2: avcodec_send_packet failed: %s (%d)\n", AvErrorString(result), result);
@@ -175,7 +185,13 @@ public:
 		}
 
 		Result decode_result = Result::Ok;
-		if (!have_pending_frame) {
+		if (!m_pending_frames.empty()) {
+			// Deliver the oldest pending picture; later ones go out on the following calls.
+			AVFrame* pending = m_pending_frames.front();
+			m_pending_frames.pop_front();
+			decode_result = CopyFrame(pending, frame_buffer, output);
+			av_frame_free(&pending);
+		} else {
 			result = avcodec_receive_frame(m_codec, frame);
 			if (result != AVERROR(EAGAIN) && result != AVERROR_EOF) {
 				if (result < 0) {
@@ -186,8 +202,6 @@ public:
 					decode_result = CopyFrame(frame, frame_buffer, output);
 				}
 			}
-		} else {
-			decode_result = CopyFrame(frame, frame_buffer, output);
 		}
 
 		av_packet_free(&packet);
@@ -198,6 +212,14 @@ public:
 	[[nodiscard]] Result FlushOutput(const FrameBuffer& frame_buffer, Output* output) {
 		std::scoped_lock lock(m_mutex);
 		*output = {};
+
+		if (!m_pending_frames.empty()) {
+			AVFrame* pending = m_pending_frames.front();
+			m_pending_frames.pop_front();
+			const auto result = CopyFrame(pending, frame_buffer, output);
+			av_frame_free(&pending);
+			return result;
+		}
 
 		AVFrame* frame = av_frame_alloc();
 		if (frame == nullptr) {
@@ -225,6 +247,7 @@ public:
 	void ResetDecoder() {
 		std::scoped_lock lock(m_mutex);
 		avcodec_flush_buffers(m_codec);
+		FreePendingFrames();
 		ClearPictureMetadata();
 	}
 
@@ -346,11 +369,19 @@ private:
 		m_picture_buffers.clear();
 	}
 
+	void FreePendingFrames() {
+		for (auto* pending: m_pending_frames) {
+			av_frame_free(&pending);
+		}
+		m_pending_frames.clear();
+	}
+
 	Config                    m_config;
-	AVCodecContext*           m_codec    = nullptr;
-	SwsContext*               m_sws      = nullptr;
+	AVCodecContext*           m_codec = nullptr;
+	SwsContext*               m_sws   = nullptr;
 	std::mutex                m_mutex;
 	std::unordered_set<void*> m_picture_buffers;
+	std::deque<AVFrame*>      m_pending_frames; // received while pushing a rejected packet
 };
 
 bool IsCodecSupported(uint32_t codec_type) {

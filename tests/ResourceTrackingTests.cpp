@@ -3736,6 +3736,35 @@ void TestGraphicsPushConstantLayout() {
 }
 
 void TestResourceLimitIsTransactional() {
+  // Upstream MaxBuffers=64 contract: exact capacity must survive CollectShaderInfo
+  // and AllocateBindings without truncating the dense buffer table.
+  {
+    Fixture accepted;
+    MemoryInfo accepted_memory;
+    accepted_memory.kind = ResourceKind::Buffer;
+    for (uint32_t index = 0; index < ShaderInfo::MaxBuffers; index++) {
+      const auto handle = accepted.Buffer(
+          {Value(index), Value(index + 1u), Value(index + 2u), Value(index + 3u)},
+          index * 4u);
+      accepted.Emit(ValueOpcode::LoadBufferU32,
+                    {handle, Value(0u), Value(0u), Value(0u), Value(true)},
+                    accepted.AddMemory(accepted_memory, index * 4u));
+    }
+    accepted.PlanAndTrack();
+    Check(accepted.program.info.buffers.size() == ShaderInfo::MaxBuffers &&
+              accepted.program.descriptor_sources.size() == ShaderInfo::MaxBuffers &&
+              accepted.program.memory_info.back().resource == ShaderInfo::MaxBuffers - 1u,
+          "compute shader did not retain all MaxBuffers distinct buffers");
+    ShaderComputeInputInfo compute{};
+    CollectShaderInfo(accepted.program, {.compute = &compute});
+    AllocateBindings(accepted.program);
+    const auto *binding = FindBinding(accepted.program.bindings,
+                                      DescriptorBindingKind::Buffers);
+    Check(binding != nullptr && binding->resources.size() == ShaderInfo::MaxBuffers &&
+              accepted.program.bindings.memory_offset_count == ShaderInfo::MaxBuffers,
+          "compute shader binding layout truncated MaxBuffers buffers");
+  }
+
   enum class Limit { Buffers, Images, Samplers, Pairs };
   struct Case {
     Limit kind;

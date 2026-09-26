@@ -4196,8 +4196,6 @@ void TestNewShaderRecompilerVop1SdwaNotDestination() {
   check_rejected(0x00260400u, "V_NOT_B32 SDWA accepted source absolute");
   check_rejected(0x00062400u, "V_NOT_B32 SDWA accepted clamp");
   check_rejected(0x00064400u, "V_NOT_B32 SDWA accepted output modifier");
-  check_rejected(0x00000400u,
-                 "V_NOT_B32 SDWA partial destination accepted a byte source");
 }
 
 void TestNewShaderRecompilerBootB16PackedAndSdwaOpcodes() {

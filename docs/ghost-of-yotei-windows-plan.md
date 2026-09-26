@@ -62,6 +62,13 @@ Checkpoint Flip queue lock-order (Reserve cfg→m_mutex ABBA) **26 сентяб�
     повтор (тот же blob), без core validation (`-NoVulkanValidation`),
     Timeout 1800 / ReadbackStart 130; параллельно снять зависимость от
     GPUAV для `b90e` (корневой ускоритель до spinner).
+15. Warm `…-073326`: **shown=166 hang** — CS `54904fb419d79e49` (~755k SPIR-V)
+    `vkCreateComputePipelines` ~278 с, затем **4× полный recompile** того же
+    hash (specialization churn). Watchdog 900s. Prepared readback RGB=0/A=3.
+16. Merge `upstream/main` (`fd2e15ee`): конфликты PR —
+    `CMakeLists.txt` (оба набора тестов), `ShaderIR.h` (`MaxBuffers=64` +
+    `MaxImages=512`), `ResourceTrackingTests.cpp` (64-buffer layout +
+    transactional limits). present-fix → **2560×1440** (primary display).
 
 Checkpoint present soft-stall (shown≈130 / ready=shown+1) **26 сентября 2026 года**:
 

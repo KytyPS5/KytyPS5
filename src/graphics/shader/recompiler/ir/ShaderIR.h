@@ -482,7 +482,7 @@ struct BufferTableLayout {
 };
 
 struct ShaderInfo {
-	static constexpr uint32_t MaxBuffers      = 32;
+	static constexpr uint32_t MaxBuffers      = 64;
 	// Inline sampled tables (Yōtei PS f8927c09) expand to ~115 dense images /
 	// pairs after selector-limited probes; keep a compiler budget of 512 with
 	// device checks (documented Yōtei bring-up contract).

@@ -409,16 +409,6 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 		uint32_t offset      = (attrib[in.semantic] >> 14u) & 0xfffu;
 		uint32_t fetch_index = (attrib[in.semantic] >> 26u) & 0x1u;
 
-		if (fetch_index != 0) {
-			static std::atomic<uint64_t> log_count = 0;
-			auto                         log_id    = log_count.fetch_add(1);
-			if (log_id < 64) {
-				LOGF("\t temporary: PS5 vertex attrib semantic %u uses fetch index %u, buffer "
-				     "index %zu\n",
-				     static_cast<uint32_t>(in.semantic), fetch_index, index);
-			}
-		}
-
 		EXIT_NOT_IMPLEMENTED(index >= ShaderVertexInputInfo::RES_MAX);
 
 		const auto* sharp = &buffer[index * 4];
@@ -439,14 +429,6 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 			const auto                   format_raw    = static_cast<uint32_t>(format);
 			const auto                   buffer_format = format_raw >> 2u;
 			const auto                   channels      = (format_raw & 3u) + 1u;
-			static std::atomic<uint64_t> log_count      = 0;
-			auto                         log_id         = log_count.fetch_add(1);
-			if (log_id < 64) {
-				LOGF("\t PS5 vertex attrib semantic %u uses attrib format %u -> buffer "
-				     "format %u, offset %u, buffer index %zu\n",
-				     static_cast<uint32_t>(in.semantic), static_cast<uint32_t>(format),
-				     static_cast<uint32_t>(buffer_format), offset, index);
-			}
 			// AGC vertex formats encode the buffer format above the two channel-count bits.
 			// The fetch prolog selects X001, XY01, XYZ1, or XYZW from that count.
 			r.fields[3] = (r.fields[3] & ~((0x7fu << 12u) | 0xfffu)) |

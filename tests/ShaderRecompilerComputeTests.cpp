@@ -23180,6 +23180,38 @@ TestCase Vop1SdwaNotPreservesHighWordDestination() {
   return test;
 }
 
+TestCase Vop1SdwaNotPartialSourcesAndDestinations() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendBufferLoadDword(&code, 8, 30);
+  AppendVMovLiteral(&code, 28, 0xabcd5555u);
+  code.push_back(EncodeVop1(0x37, 28, 249));
+  code.push_back(EncodeVop1Sdwa(8, 4, 2, 5)); // v28.word0 = ~v8.word1, preserve word1
+  AppendStoreVgpr(&code, 28, 0);
+
+  AppendVMovLiteral(&code, 3, 0xa1b2c3d4u);
+  code.push_back(EncodeVop1(0x37, 3, 249));
+  code.push_back(EncodeVop1Sdwa(8, 2, 2, 0)); // v3.byte2 = ~v8.byte0, preserve others
+  AppendStoreVgpr(&code, 3, 1);
+
+  code.push_back(EncodeVop1(0x37, 4, 249));
+  code.push_back(EncodeVop1Sdwa(8, 0, 0, 0)); // v4.byte0 = ~v8.byte0, zero others
+  AppendStoreVgpr(&code, 4, 2);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "Vop1SdwaNotPartialSourcesAndDestinations";
+  test.code = std::move(code);
+  test.initial = {0x12345678u, 0u, 0u};
+  test.expected = {0xabcdedcbu, 0xa187c3d4u, 0x00000087u};
+  test.opcodes = {O::BUFFER_LOAD_DWORD, O::V_MOV_B32, O::V_NOT_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"V_NOT_B32", 3u}};
+  test.required_spirv = {"OpBitFieldUExtract", "OpNot"};
+  return test;
+}
+
 TestCase Vop1SdwaMovByteDestinations() {
   using O = ShaderOpcode;
 
@@ -36612,6 +36644,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(Vop1SdwaFfblCapturedHighWordSource);
   AddCase(Vop1SdwaNotCapturedByte0Source);
   AddCase(Vop1SdwaNotPreservesHighWordDestination);
+  AddCase(Vop1SdwaNotPartialSourcesAndDestinations);
   AddCase(Vop1SdwaMovByteDestinations);
   AddCase(Vop2SdwaSubNcExactByte2Destination);
   AddCase(Vop2SdwaAddNcCapturedHighWordDestination);

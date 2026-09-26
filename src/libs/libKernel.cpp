@@ -1226,6 +1226,7 @@ static KYTY_SYSV_ABI KernelModule KernelLoadStartModule(const char* module_file_
 
 	auto* program = rt->FindProgramByFileName(module_path);
 	if (program != nullptr) {
+		++program->load_count;
 		if (res != nullptr) {
 			*res = OK;
 		}
@@ -1240,6 +1241,7 @@ static KYTY_SYSV_ABI KernelModule KernelLoadStartModule(const char* module_file_
 
 	rt->RelocateProgram(program);
 
+	program->load_count = 1;
 	int result = rt->StartModule(program, args, argp, nullptr);
 
 	LOGF("\tmodule_start() result = %d\n", result);
@@ -1269,6 +1271,11 @@ static int KYTY_SYSV_ABI KernelStopUnloadModule(KernelModule handle, size_t args
 
 	if (program == nullptr) {
 		LOGF("\tinvalid module handle = %" PRId32 "\n", handle);
+		return KERNEL_ERROR_ESRCH;
+	}
+
+	if (program->load_count > 1) {
+		--program->load_count;
 		return OK;
 	}
 

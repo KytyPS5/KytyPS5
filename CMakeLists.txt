@@ -423,6 +423,11 @@ add_executable(descriptor_budget_tests EXCLUDE_FROM_ALL
 target_include_directories(descriptor_budget_tests PRIVATE ${inc_headers})
 target_link_libraries(descriptor_budget_tests Vulkan::Headers)
 
+add_executable(lru_cache_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/LruCacheTests.cpp"
+)
+target_include_directories(lru_cache_tests PRIVATE ${inc_headers})
+
 add_executable(ime_dialog_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ImeDialogTests.cpp"
 	"${KYTY_SOURCE_DIR}/libs/imeCommon.cpp"
@@ -601,6 +606,7 @@ if(BUILD_TESTING)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
 	add_test(NAME video_out_flip_due COMMAND $<TARGET_FILE:video_out_flip_due_tests>)
 	add_test(NAME descriptor_budget COMMAND $<TARGET_FILE:descriptor_budget_tests>)
+	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
@@ -684,6 +690,7 @@ if(BUILD_TESTING)
 		bit_array_tests
 		video_out_flip_due_tests
 		descriptor_budget_tests
+		lru_cache_tests
 		shader_vertex_metadata_tests
 		resource_materialization_tests
 		resource_tracking_tests
@@ -695,6 +702,7 @@ if(BUILD_TESTING)
 		audio_out2_port_tests
 		save_data_memory_tests
 		ngs2_sampler_tests
+		save_data_memory_tests
 	)
 endif()
 

@@ -607,9 +607,26 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			    image.mip_count != image_class.mip_count ||
 			    image.conversion_format != image_class.conversion_format ||
 			    image.shader_swizzle != image_class.shader_swizzle) {
-				return SpecializationFail(
-				    fmt::format("indirect image table at pc 0x{:08x} has incompatible candidates",
-				                program.info.images[root_index].first_use_pc));
+				const auto& expected = snapshot.images[exemplar].dwords;
+				const auto& actual   = snapshot.images[candidate].dwords;
+				return SpecializationFail(fmt::format(
+				    "indirect image table at pc 0x{:08x} has incompatible candidates: "
+				    "exemplar {} class={} dimension={} cube={} mips={} conversion={} "
+				    "swizzle={:03x} descriptor={:08x},{:08x},{:08x},{:08x},"
+				    "{:08x},{:08x},{:08x},{:08x}; "
+				    "candidate {} class={} dimension={} cube={} mips={} conversion={} "
+				    "swizzle={:03x} descriptor={:08x},{:08x},{:08x},{:08x},"
+				    "{:08x},{:08x},{:08x},{:08x}",
+				    program.info.images[root_index].first_use_pc, exemplar,
+				    static_cast<uint32_t>(image_class.numeric_class),
+				    static_cast<uint32_t>(image_class.dimension), image_class.cube,
+				    image_class.mip_count, static_cast<uint32_t>(image_class.conversion_format),
+				    image_class.shader_swizzle, expected[0], expected[1], expected[2], expected[3],
+				    expected[4], expected[5], expected[6], expected[7], candidate,
+				    static_cast<uint32_t>(image.numeric_class),
+				    static_cast<uint32_t>(image.dimension), image.cube, image.mip_count,
+				    static_cast<uint32_t>(image.conversion_format), image.shader_swizzle, actual[0],
+				    actual[1], actual[2], actual[3], actual[4], actual[5], actual[6], actual[7]));
 			}
 		}
 	}

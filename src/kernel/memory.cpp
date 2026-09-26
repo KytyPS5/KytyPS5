@@ -2553,12 +2553,43 @@ int KYTY_SYSV_ABI KernelMunmap(uint64_t vaddr, size_t len) {
 	if (len == 0 || UINT64_MAX - vaddr < len) {
 		return KERNEL_ERROR_EINVAL;
 	}
-	std::vector<VirtualRanges::Range> ranges;
-	if (!g_virtual_ranges->QuerySpan(vaddr, len, &ranges)) {
+	// A reserved span can contain pages that were unmapped earlier. Validate those holes
+	// against the host address space, then release each remaining tracked mapping.
+	// Do not treat an arbitrary untracked address as a successful unmap.
+	const auto end = vaddr + len;
+	std::vector<std::pair<uint64_t, uint64_t>> mapped_chunks;
+	auto current = vaddr;
+	while (current < end) {
+		VirtualRanges::Range range {};
+		if (!g_virtual_ranges->Query(current, 1, &range) || range.start >= end) {
+			if (!g_guest_address_space->ReleaseFree(current, end - current)) {
+				return KERNEL_ERROR_EACCES;
+			}
+			break;
+		}
+		if (current < range.start) {
+			const auto gap_size = range.start - current;
+			if (!g_guest_address_space->ReleaseFree(current, gap_size)) {
+				return KERNEL_ERROR_EACCES;
+			}
+			current = range.start;
+			continue;
+		}
+		const auto chunk_size = std::min<uint64_t>(end - current, range.size - (current - range.start));
+		mapped_chunks.emplace_back(current, chunk_size);
+		current += chunk_size;
+	}
+	if (mapped_chunks.empty()) {
 		return KERNEL_ERROR_EACCES;
 	}
-	UnmapGpuRange(vaddr, len);
-	return UnmapMemoryRange(vaddr, len);
+	for (const auto& [chunk_addr, chunk_size]: mapped_chunks) {
+		UnmapGpuRange(chunk_addr, chunk_size);
+		const int result = UnmapMemoryRange(chunk_addr, chunk_size);
+		if (result != OK) {
+			return result;
+		}
+	}
+	return OK;
 }
 
 size_t KYTY_SYSV_ABI KernelGetDirectMemorySize() {

@@ -202,9 +202,13 @@ struct ThreadPrivate {
 	ThreadPrivate(thread_func_t f, void* a): func(f), arg(a), m_thread(&Run, this) {}
 
 	static void Run(ThreadPrivate* t) {
-		t->unique_id = Thread::GetThreadIdUnique();
-		t->started   = true;
-		t->func(t->arg);
+		// The owner may Detach() and destroy this object as soon as `started` is
+		// observed, so copy everything the thread needs before publishing it.
+		const auto func = t->func;
+		auto*      arg  = t->arg;
+		t->unique_id    = Thread::GetThreadIdUnique();
+		t->started      = true;
+		func(arg);
 	}
 
 	thread_func_t    func;

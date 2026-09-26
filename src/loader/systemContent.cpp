@@ -172,7 +172,8 @@ void Psf::OpenJson(const std::filesystem::path& file_name) {
 
 	if (auto kernel = param_json.find("kernel");
 	    kernel != param_json.end() && kernel->is_object()) {
-		if (auto it = kernel->find("flexibleMemorySize"); it != kernel->end()) {
+		if (auto it = kernel->find("flexibleMemorySize");
+		    it != kernel->end() && it->is_number_unsigned()) {
 			m_flexible_memory_size = it->get<uint64_t>();
 		}
 	}

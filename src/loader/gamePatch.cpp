@@ -9,12 +9,14 @@
 #include "loader/systemContent.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <memory>
 #include <nlohmann/json.hpp>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -57,9 +59,33 @@ bool ParseBytes(const std::string& text, std::vector<uint8_t>* bytes) {
 
 	bytes->resize(text.size() / 2);
 	for (size_t index = 0; index < bytes->size(); index++) {
+		const auto high = std::isxdigit(static_cast<unsigned char>(text[index * 2]));
+		const auto low  = std::isxdigit(static_cast<unsigned char>(text[index * 2 + 1]));
+		if (high == 0 || low == 0) {
+			return false;
+		}
 		(*bytes)[index] = static_cast<uint8_t>(std::stoul(text.substr(index * 2, 2), nullptr, 16));
 	}
 	return true;
+}
+
+bool ParseHexAddress(const std::string& text, uint64_t* address) {
+	std::string_view digits = text;
+	if (digits.starts_with("0x") || digits.starts_with("0X")) {
+		digits.remove_prefix(2);
+	}
+	if (digits.empty() || digits.size() > 16 ||
+	    !std::all_of(digits.begin(), digits.end(),
+	                 [](char c) { return std::isxdigit(static_cast<unsigned char>(c)) != 0; })) {
+		return false;
+	}
+	*address = std::stoull(std::string(digits), nullptr, 16);
+	return true;
+}
+
+const std::string* StringField(const Json& object, const char* key) {
+	const auto it = object.find(key);
+	return it != object.end() && it->is_string() ? &it->get_ref<const std::string&>() : nullptr;
 }
 
 bool LoadPlan(const std::filesystem::path& path, Plan* plan, std::string* error) {
@@ -68,28 +94,55 @@ bool LoadPlan(const std::filesystem::path& path, Plan* plan, std::string* error)
 		return Fail(error, "could not read cheat file");
 	}
 
+	// The file is user-supplied; every field is validated so a malformed cheat file reports
+	// an error instead of throwing through the loader.
 	const auto root = Json::parse(file, nullptr, false);
-	if (!root.is_object() || !root.contains("id") || !root.contains("version") ||
-	    !root.contains("process") || !root.contains("mods")) {
-		return Fail(error, "expected a GoldHEN-style mods JSON file");
+	if (!root.is_object()) {
+		return Fail(error, "cheat file is not valid JSON");
 	}
-	plan->title_id = root["id"].get<std::string>();
-	plan->version  = root["version"].get<std::string>();
-	plan->process  = root["process"].get<std::string>();
+	const auto* title_id = StringField(root, "id");
+	const auto* version  = StringField(root, "version");
+	const auto* process  = StringField(root, "process");
+	const auto  mods     = root.find("mods");
+	if (title_id == nullptr || version == nullptr || process == nullptr || mods == root.end() ||
+	    !mods->is_array()) {
+		return Fail(error, "expected a GoldHEN-style mods JSON file with string \"id\", "
+		                   "\"version\", \"process\" and a \"mods\" array");
+	}
+	plan->title_id = *title_id;
+	plan->version  = *version;
+	plan->process  = *process;
 
-	for (const auto& mod: root["mods"]) {
-		if (!mod.value("enabled", true)) {
+	for (const auto& mod: *mods) {
+		if (!mod.is_object()) {
+			return Fail(error, "every entry of \"mods\" must be an object");
+		}
+		const auto enabled = mod.find("enabled");
+		if (enabled != mod.end() && enabled->is_boolean() && !enabled->get<bool>()) {
 			continue;
 		}
-		const auto name = mod["name"].get<std::string>();
-		plan->mod_names.push_back(name);
-		for (const auto& entry: mod["memory"]) {
-			Write write;
-			write.source_address = std::stoull(entry["offset"].get<std::string>(), nullptr, 16);
-			if (!ParseBytes(entry["off"].get<std::string>(), &write.off) ||
-			    !ParseBytes(entry["on"].get<std::string>(), &write.on) ||
+		const auto* name   = StringField(mod, "name");
+		const auto  memory = mod.find("memory");
+		if (memory == mod.end() || !memory->is_array()) {
+			return Fail(error, "mod \"" + (name != nullptr ? *name : std::string("?")) +
+			                       "\" has no \"memory\" array");
+		}
+		plan->mod_names.push_back(name != nullptr ? *name : std::string("unnamed"));
+		for (const auto& entry: *memory) {
+			const auto* offset = entry.is_object() ? StringField(entry, "offset") : nullptr;
+			const auto* off    = entry.is_object() ? StringField(entry, "off") : nullptr;
+			const auto* on     = entry.is_object() ? StringField(entry, "on") : nullptr;
+			Write       write;
+			if (offset == nullptr || off == nullptr || on == nullptr ||
+			    !ParseHexAddress(*offset, &write.source_address)) {
+				return Fail(error, "mod \"" + plan->mod_names.back() +
+				                       "\" has a memory entry without string \"offset\", "
+				                       "\"off\" and \"on\" hex fields");
+			}
+			if (!ParseBytes(*off, &write.off) || !ParseBytes(*on, &write.on) ||
 			    write.off.size() != write.on.size()) {
-				return Fail(error, "invalid mod memory bytes");
+				return Fail(error, "mod \"" + plan->mod_names.back() +
+				                       "\" has invalid memory bytes at offset " + *offset);
 			}
 			plan->writes.push_back(std::move(write));
 		}
@@ -122,8 +175,9 @@ void Translate(const Program& program, uint64_t source_base, uint64_t source_add
 }
 
 bool IsInsideProgram(const Program& program, uint64_t address, size_t size) {
-	return size != 0 && address >= program.base_vaddr &&
-	       address + size <= program.base_vaddr + program.mapped_size;
+	// Written without address + size, which wraps for translated addresses near 2^64.
+	return size != 0 && address >= program.base_vaddr && size <= program.mapped_size &&
+	       address - program.base_vaddr <= program.mapped_size - size;
 }
 
 bool IsZero(const std::vector<uint8_t>& bytes) {

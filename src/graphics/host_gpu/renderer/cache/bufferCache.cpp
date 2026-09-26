@@ -494,8 +494,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 		filled = Libs::LibKernel::Memory::TryReadBacking(vaddr, staging, mapped) ||
 		         Libs::LibKernel::Memory::TryReadPrtBacking(vaddr, staging, mapped);
 		if (filled && mapped < size) {
-			std::memset(static_cast<std::byte*>(staging) + mapped, 0,
-			            static_cast<size_t>(size - mapped));
+			std::memset(staging + mapped, 0, static_cast<size_t>(size - mapped));
 		}
 	}
 	if (!filled) {

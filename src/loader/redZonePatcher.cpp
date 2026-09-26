@@ -139,6 +139,7 @@ struct DecodedFunction {
 struct InstructionRewrite {
 	bool protect_red_zone {};
 	bool protected_indirect_call {};
+	bool emulate_sse4a {};
 };
 
 bool IsStackPointerRegister(ZydisRegister reg) {
@@ -738,6 +739,94 @@ bool GenerateProtectedIndirectCall(const DecodedCodeInstruction& decoded,
 	return true;
 }
 
+// Native replacement for the AMD-only SSE4a EXTRQ instruction on hosts without SSE4a.
+// Adapted from shadPS4 src/core/cpu_patches.cpp (GenerateEXTRQ).
+bool IsXmmRegister(const ZydisDecodedOperand& operand) {
+	return operand.type == ZYDIS_OPERAND_TYPE_REGISTER &&
+	       operand.reg.value >= ZYDIS_REGISTER_XMM0 && operand.reg.value <= ZYDIS_REGISTER_XMM15;
+}
+
+bool IsSupportedExtrq(const DecodedCodeInstruction& decoded) {
+	if (decoded.instruction.mnemonic != ZYDIS_MNEMONIC_EXTRQ ||
+	    !IsXmmRegister(decoded.operands[0])) {
+		return false;
+	}
+	const bool immediate_form = decoded.operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
+	                            decoded.operands[2].type == ZYDIS_OPERAND_TYPE_IMMEDIATE;
+	return immediate_form || IsXmmRegister(decoded.operands[1]);
+}
+
+void GenerateExtrq(const DecodedCodeInstruction& decoded, Xbyak::CodeGenerator& c) {
+	const auto&      ops = decoded.operands;
+	const Xbyak::Xmm dst(ops[0].reg.value - ZYDIS_REGISTER_XMM0);
+	const bool       immediate_form =
+	    ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE && ops[2].type == ZYDIS_OPERAND_TYPE_IMMEDIATE;
+
+	// Step over the guest red zone and preserve every register and flag the sequence uses.
+	c.lea(rsp, ptr[rsp - GuestRedZoneSize]);
+	c.pushfq();
+	c.push(rax);
+	c.push(rcx);
+	c.push(rdx);
+
+	if (immediate_form) {
+		u32       length = static_cast<u32>(ops[1].imm.value.u & 0x3f);
+		const u32 index  = static_cast<u32>(ops[2].imm.value.u & 0x3f);
+		if (length == 0) {
+			length = 64;
+		}
+		const u64 mask =
+		    (length >= 64 || length + index > 64) ? ~u64 {0} : ((u64 {1} << length) - 1);
+		c.movq(rax, dst);
+		if (index != 0) {
+			c.shr(rax, static_cast<int>(index));
+		}
+		c.mov(rdx, mask);
+		c.and_(rax, rdx);
+	} else {
+		const Xbyak::Xmm src(ops[1].reg.value - ZYDIS_REGISTER_XMM0);
+		Xbyak::Label     length_zero;
+		Xbyak::Label     mask_done;
+		c.movq(rax, src); // bits 0-5: length, bits 8-13: index
+		c.mov(rcx, rax);
+		c.and_(ecx, 0x3f);
+		c.jz(length_zero);
+		c.mov(rdx, 1); // mask = (1 << length) - 1
+		c.shl(rdx, cl);
+		c.dec(rdx);
+		c.jmp(mask_done);
+		c.L(length_zero);
+		c.mov(rdx, ~u64 {0}); // a length of 0 means 64 bits
+		c.L(mask_done);
+		c.shr(rax, 8);
+		c.and_(eax, 0x3f);
+		c.mov(ecx, eax); // cl = index
+		c.movq(rax, dst);
+		c.shr(rax, cl);
+		c.and_(rax, rdx);
+	}
+
+	// Legacy SSE2 MOVQ clears bits 64-127 like the trap emulator does, and leaves the upper
+	// YMM half untouched (unlike VMOVQ).
+	c.movq(dst, rax);
+	c.pop(rdx);
+	c.pop(rcx);
+	c.pop(rax);
+	c.popfq();
+	c.lea(rsp, ptr[rsp + GuestRedZoneSize]);
+}
+
+void CollectSse4a(const DecodedFunction&                   function,
+                  std::map<uintptr_t, InstructionRewrite>& rewrite_sites,
+                  std::vector<uintptr_t>&                  sites) {
+	for (const auto& [address, decoded]: function.instructions) {
+		if (IsSupportedExtrq(decoded)) {
+			rewrite_sites[address].emulate_sse4a = true;
+			sites.push_back(address);
+		}
+	}
+}
+
 void CollectRedZoneMemoryInstructions(const DecodedFunction& function,
                                       std::map<uintptr_t, InstructionRewrite>& rewrite_sites,
                                       RedZonePatchResult& result) {
@@ -847,7 +936,11 @@ void RelocateRedZoneInstructions(PatchModule* module, const DecodedFunction& fun
 				if (protect_red_zone) {
 					module->trampoline_gen.lea(rsp, ptr[rsp - GuestRedZoneSize]);
 				}
-				if (protected_indirect_call) {
+				const bool emulate_sse4a =
+				    rewrite != rewrite_sites.end() && rewrite->second.emulate_sse4a;
+				if (emulate_sse4a) {
+					GenerateExtrq(*decoded, module->trampoline_gen);
+				} else if (protected_indirect_call) {
 					if (!GenerateProtectedIndirectCall(*decoded, module->trampoline_gen)) {
 						module->trampoline_gen.setSize(trampoline_offset);
 						return std::nullopt;
@@ -1264,6 +1357,9 @@ RedZonePatchResult PatchGuestInstructions(u64 segment_addr, u64 segment_size,
 	std::unique_lock lock {module->mutex};
 	const size_t trampoline_begin = module->trampoline_gen.getSize();
 	std::vector<ReciprocalSquareRootSite> reciprocal_sqrt_sites;
+
+	static const bool      host_lacks_sse4a = !Xbyak::util::Cpu().has(Xbyak::util::Cpu::tSSE4a);
+	std::vector<uintptr_t> sse4a_sites;
 	for (size_t function_index = 0; function_index < starts.size(); ++function_index) {
 		const uintptr_t function_start = starts[function_index];
 		const uintptr_t function_end =
@@ -1289,6 +1385,9 @@ RedZonePatchResult PatchGuestInstructions(u64 segment_addr, u64 segment_size,
 		if (emulate_rsqrt) {
 			CollectReciprocalSquareRoots(function, rewrite_sites, reciprocal_sqrt_sites);
 		}
+		if (host_lacks_sse4a) {
+			CollectSse4a(function, rewrite_sites, sse4a_sites);
+		}
 		if (!rewrite_sites.empty()) {
 			RelocateRedZoneInstructions(module, function, rewrite_sites, result);
 		}
@@ -1301,6 +1400,14 @@ RedZonePatchResult PatchGuestInstructions(u64 segment_addr, u64 segment_size,
 	if (emulate_rsqrt) {
 		result.reciprocal_sqrt_instruction_count = ApplyReciprocalSquareRootPatches(
 		    *module, reciprocal_sqrt_sites, trampoline_addr, trampoline_size);
+	}
+	if (!sse4a_sites.empty()) {
+		u64 sse4a_patched = 0;
+		for (const auto address: sse4a_sites) {
+			sse4a_patched += module->patched.contains(reinterpret_cast<u8*>(address)) ? 1 : 0;
+		}
+		LOGF("SSE4a EXTRQ native patching: found=%zu, patched=%" PRIu64 "\n", sse4a_sites.size(),
+		     sse4a_patched);
 	}
 	Common::VirtualMemory::FlushInstructionCache(segment_addr, segment_size);
 	if (trampoline_size != 0) {

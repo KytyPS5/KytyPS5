@@ -1,0 +1,89 @@
+name: Sync KytyPS5 Upstream
+
+on:
+  workflow_dispatch:
+    inputs:
+      create_pr:
+        description: Create an upstream-sync pull request when changes are found
+        required: true
+        default: true
+        type: boolean
+  schedule:
+    - cron: '17 2 * * *'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    name: Fetch upstream and prepare sync PR
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork main
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Configure git
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        shell: bash
+        run: |
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream https://github.com/KytyPS5/KytyPS5.git
+          git fetch --prune --tags upstream main
+
+      - name: Create sync branch
+        id: meta
+        shell: bash
+        run: |
+          local_sha="$(git rev-parse "origin/${{ github.event.repository.default_branch }}")"
+          upstream_sha="$(git rev-parse upstream/main)"
+          echo "local_sha=$local_sha" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=$upstream_sha" >> "$GITHUB_OUTPUT"
+          if [ "$local_sha" = "$upstream_sha" ]; then
+            echo "Fork main already matches upstream/main."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          branch="upstream-sync/$(date -u +'%Y%m%d-%H%M%S')-${GITHUB_RUN_NUMBER}"
+          git switch -c "$branch" "origin/${{ github.event.repository.default_branch }}"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+
+      - name: Merge upstream main
+        if: steps.meta.outputs.changed == 'true'
+        shell: bash
+        run: |
+          git merge --no-edit --no-ff upstream/main
+
+      - name: Push sync branch
+        if: steps.meta.outputs.changed == 'true'
+        env:
+          BRANCH: ${{ steps.meta.outputs.branch }}
+        shell: bash
+        run: |
+          git push --set-upstream origin "$BRANCH"
+
+      - name: Create pull request
+        if: steps.meta.outputs.changed == 'true' && (github.event_name == 'schedule' || inputs.create_pr == true)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ steps.meta.outputs.branch }}
+          UPSTREAM_SHA: ${{ steps.meta.outputs.upstream_sha }}
+          LOCAL_SHA: ${{ steps.meta.outputs.local_sha }}
+        shell: bash
+        run: |
+          gh pr create \
+            --repo "$GITHUB_REPOSITORY" \
+            --base "${{ github.event.repository.default_branch }}" \
+            --head "$BRANCH" \
+            --title "Sync KytyPS5 upstream: ${UPSTREAM_SHA:0:7}" \
+            --body "This PR merges upstream KytyPS5/KytyPS5 main into the fork.\n\nFork base: ${LOCAL_SHA}\nUpstream: ${UPSTREAM_SHA}\n\nThe normal Build and Release workflow should validate this PR." \
+            --draft=false

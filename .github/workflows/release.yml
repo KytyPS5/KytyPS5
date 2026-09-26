@@ -1,0 +1,47 @@
+name: Manual KytyPS5 Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Branch or tag to build and release
+        required: true
+        default: main
+        type: string
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  dispatch:
+    name: Build selected ref and create release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch build workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+        shell: bash
+        run: |
+          gh workflow run build.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref "$SOURCE_REF" \
+            -f create_release=true
+
+      - name: Watch build and release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+        shell: bash
+        run: |
+          for _ in $(seq 1 30); do
+            run_id="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow build.yml --branch "$SOURCE_REF" --limit 1 --json databaseId --jq '.[0].databaseId // empty')"
+            if [ -n "$run_id" ]; then
+              gh run watch "$run_id" --repo "$GITHUB_REPOSITORY" --exit-status
+              exit $?
+            fi
+            sleep 2
+          done
+          echo "Timed out waiting for build workflow." >&2
+          exit 1

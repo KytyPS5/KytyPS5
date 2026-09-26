@@ -475,10 +475,17 @@ void CheckSocketWakeup() {
         "send the first fragment");
   const char* const second_fragment = text + text_length / 2;
   const std::size_t second_length   = text_length - text_length / 2;
-  int64_t second_send_result = -1;
+  int64_t second_send_result        = -1;
   std::thread peer([&writer, second_fragment, second_length, &second_send_result] {
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     second_send_result = Net::Send(writer, second_fragment, second_length, 0);
+    if (second_send_result != static_cast<int64_t>(second_length)) {
+      // A short or failed send would strand the blocking receive below. The writer is
+      // still open, so no end of stream ever arrives and the peek loop would spin
+      // forever instead of failing. Half-close this end so the reader sees EOF and
+      // the receive returns the short prefix, which fails the check below.
+      Net::Shutdown(writer, 1);
+    }
   });
   std::array<char, text_length> message {};
   Check(Net::Recv(reader, message.data(), message.size(), 0x42) == message.size() &&

@@ -29,9 +29,13 @@ Checkpoint present soft-stall (shown≈130 / ready=shown+1) **26 сентябр�
    presentKHR). Корневая причина: `PresentThread` SleepMicro на весь
    накопленный pacing credit (до ~UINT32_MAX us).
 9. Коммит clamp pacing ≤ 1 vblank period + тест `ClampPresentPacingWait`.
-   Game retry — PENDING.
-10. Меню/gameplay **PENDING**. Branch ahead локально; push к github:443
-   таймаутится.
+   Маркер `PresentThread: pacing clamp enabled` подтверждён в
+   `_Build/runs/yotei-integrated-20260926-041932-presentfix` — **stall всё
+   равно shown=133/ready=134 на 300s**. Значит корень не (только) sleep credit.
+10. Mailbox present-mode retry `…-043153`: stall **shown=122/ready=123** —
+    не специфично для FIFO presentKHR.
+11. Меню/gameplay **PENDING**. Следующее: heartbeat стадии PresentThread /
+    Flip при Ready>N секунд (где именно стоим). Branch ahead локально.
 
 Checkpoint bounded SRT unmapped/coherent reads **26 сентября 2026 года**,
 источник `84cbbb85` (локально; `git push` на origin таймаутится к github.com:443):

@@ -950,9 +950,6 @@ public:
 			if (deliver_seek_frame || sync_mode != 0) {
 				return true;
 			}
-			if (audio_id) {
-				return candidate.info.time_stamp <= AudioClockNoLock();
-			}
 			auto now = CurrentTimeNoLock();
 			return now == 0 || candidate.info.time_stamp <= now;
 		});
@@ -999,8 +996,9 @@ public:
 		out->details.audio.size          = current_audio->info.details.audio.size;
 		std::memcpy(out->details.audio.language_code,
 		            current_audio->info.details.audio.language_code, 4);
-		last_audio_ts       = out->time_stamp;
-		last_audio_clock_ms = CurrentTimeNoLock();
+		start_time_ms = out->time_stamp;
+		clock_start   = std::chrono::steady_clock::now();
+		paused_extra  = {};
 		RecordLoopBoundary(*current_audio);
 		return true;
 	}
@@ -1019,15 +1017,6 @@ private:
 	bool DrainedNoLock() const {
 		return demux_eof && video_done && audio_done && video_frames.Empty() &&
 		       audio_frames.Empty();
-	}
-	// Audio paces video. Once every audio frame has been consumed its clock keeps running, so
-	// video that outlasts the audio track is still presented and the source drains.
-	uint64_t AudioClockNoLock() const {
-		if (!audio_done || !audio_frames.Empty()) {
-			return last_audio_ts;
-		}
-		const auto now = CurrentTimeNoLock();
-		return last_audio_ts + (now > last_audio_clock_ms ? now - last_audio_clock_ms : 0);
 	}
 	void RecordLoopBoundary(const ReadyFrame& frame) {
 		if (frame.timestamp_offset > last_output_loop_offset) {
@@ -1074,8 +1063,6 @@ private:
 		video_done               = true;
 		audio_done               = true;
 		seek_video_frame_pending = false;
-		last_audio_ts            = 0;
-		last_audio_clock_ms      = 0;
 		last_output_loop_offset  = 0;
 		pending_loop_warnings    = 0;
 	}
@@ -1706,8 +1693,6 @@ private:
 	int32_t                                  trick_speed   = AVPLAYER_TRICK_SPEED_NORMAL;
 	uint32_t                                 sync_mode     = 0;
 	uint64_t                                 start_time_ms = 0;
-	uint64_t                                 last_audio_ts = 0;
-	uint64_t                                 last_audio_clock_ms     = 0;
 	uint64_t                                 last_output_loop_offset = 0;
 	uint32_t                                 pending_loop_warnings   = 0;
 	std::chrono::steady_clock::time_point    clock_start {};

@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/renderDoc.h"
+#include "graphics/presentation/videoOutFlipDue.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -184,6 +185,7 @@ struct VideoOutConfig {
 	bool                                opened      = false;
 	bool                                closing     = false;
 	int                                 flip_rate   = 0;
+	uint64_t                            last_presented_vblank = kNoPresentedVblank;
 	uint64_t                            output_mode = VIDEO_OUT_OUTPUT_MODE_DEFAULT;
 	float                               gamma       = 1.0f;
 	VideoOutFlipStatus                  flip_status;
@@ -201,14 +203,17 @@ public:
 	~FlipQueue();
 	KYTY_CLASS_NO_COPY(FlipQueue);
 
-	bool Reserve(VideoOutConfig& cfg, int index, int64_t flip_arg, FlipRequestSource source,
-	             uint64_t& request_id);
+	int Reserve(VideoOutConfig& cfg, int index, int64_t flip_arg, FlipRequestSource source,
+	            uint64_t& request_id);
 	void Cancel(VideoOutConfig& cfg);
 	void Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer);
 	void Complete(uint64_t request_id);
 	void WaitForSubmitSlot();
 	bool Flip(uint32_t micros);
 	void GetFlipStatus(VideoOutConfig& cfg, VideoOutFlipStatus& out);
+	[[nodiscard]] VideoOutDiagnostics GetDiagnostics();
+	void RecordOutputStatus(uint32_t resolution);
+	void RecordOutputSupport(uint64_t mode, int supported);
 	void Wait(VideoOutConfig& cfg, int index);
 
 private:
@@ -236,6 +241,7 @@ private:
 	std::list<Request>   m_cancelled_requests;
 	bool                 m_processing      = false;
 	uint64_t             m_next_request_id = 1;
+	VideoOutDiagnostics  m_diagnostics;
 };
 
 struct VideoOutDriver::Impl {
@@ -374,6 +380,15 @@ static void TriggerVideoOutEvents(VideoOutConfig& video_out, VideoOutEventKind k
 		EXIT_NOT_IMPLEMENTED(result != OK && result != LibKernel::KERNEL_ERROR_EBADF &&
 		                     result != LibKernel::KERNEL_ERROR_ENOENT);
 	}
+	if (kind == VideoOutEventKind::Flip) {
+		static std::atomic<uint32_t> flip_event_logs {0};
+		const auto                   n = flip_event_logs.fetch_add(1, std::memory_order_relaxed);
+		if (n < 32 || (n % 64u) == 0u) {
+			LOGF("TriggerVideoOutEvents Flip listeners=%zu arg=%" PRId64 " n=%u\n", queues.size(),
+			     reinterpret_cast<int64_t>(trigger_data), n);
+			Log::Flush();
+		}
+	}
 }
 
 static void DeleteVideoOutEvents(const VideoOutEventQueues& queues, VideoOutEventKind kind) {
@@ -484,9 +499,7 @@ static bool IsFlipDueLocked(const VideoOutConfig& cfg, uint64_t generation) {
 	if (!cfg.opened || cfg.closing || cfg.generation != generation) {
 		return false;
 	}
-	const int interval = cfg.flip_rate + 1;
-
-	return interval <= 1 || (cfg.vblank_status.count % static_cast<uint64_t>(interval)) == 0;
+	return IsFlipDueAtVblank(cfg.vblank_status.count, cfg.flip_rate, cfg.last_presented_vblank);
 }
 
 static bool IsValidBufferIndex(int index) {
@@ -514,15 +527,11 @@ static int ReserveFlipRequest(VideoOutDriver::Impl& driver, int handle, int inde
 		return VIDEO_OUT_ERROR_INVALID_INDEX;
 	}
 
-	Common::LockGuard lock(video_out->mutex);
-	if (video_out->closing ||
-	    (!IsSpecialBufferIndex(index) && !video_out->buffers[index].Occupied())) {
-		return VIDEO_OUT_ERROR_INVALID_INDEX;
-	}
-	if (!driver.GetFlipQueue().Reserve(*video_out, index, flip_arg, source, request_id)) {
-		return VIDEO_OUT_ERROR_FLIP_QUEUE_FULL;
-	}
-	return OK;
+	// Do not hold cfg.mutex across FlipQueue::Reserve. Reserve takes m_mutex then
+	// cfg.mutex (canonical order). Holding cfg first deadlocks against Flip publish
+	// (m_mutex → cfg) and against title diagnostics that used to take m_mutex inside
+	// Present before shown was published.
+	return driver.GetFlipQueue().Reserve(*video_out, index, flip_arg, source, request_id);
 }
 
 Graphics::ImageInfo BufferAttributeGroup::ImageInfo(const VideoOutBuffer& buffer) const {
@@ -611,6 +620,15 @@ void VideoOutShutdown() {
 	g_video_out_driver.reset();
 }
 
+VideoOutDiagnostics VideoOutGetDiagnostics() {
+	if (g_video_out_driver == nullptr) {
+		return {};
+	}
+	auto diagnostics              = g_video_out_driver->State().GetFlipQueue().GetDiagnostics();
+	diagnostics.present_stage = GetPresentStage();
+	return diagnostics;
+}
+
 VideoOutDriver::Impl::~Impl() {
 	if (m_present_thread.joinable()) {
 		m_present_thread.request_stop();
@@ -668,6 +686,7 @@ int VideoOutDriver::Impl::Open(int bus_type, int index) {
 	config.flip_status.flipArg       = -1;
 	config.flip_status.currentBuffer = -1;
 	config.flip_status.count         = 0;
+	config.last_presented_vblank     = kNoPresentedVblank;
 	config.pre_vblank_status         = VideoOutVblankStatus();
 	config.vblank_status             = VideoOutVblankStatus();
 
@@ -704,6 +723,7 @@ bool VideoOutDriver::Impl::Close(int handle) {
 			output_mode_events = std::move(config.events->output_mode);
 		}
 		config.flip_rate = 0;
+		config.last_presented_vblank = kNoPresentedVblank;
 
 		for (const auto& buffer: config.buffers) {
 			if (buffer.Occupied() &&
@@ -801,24 +821,33 @@ void VideoOutDriver::Impl::VblankEnd() {
 void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 	const auto frequency = Common::Timer::QueryPerformanceFrequency();
 	EXIT_IF(frequency == 0);
+	LOGF("PresentThread: pacing clamp enabled (max sleep 1 vblank)\n");
+	Log::Flush();
 
 	int64_t total_wait = 0;
 	while (!token.stop_requested()) {
+		const auto refresh = std::max(Config::GetVblankFrequency(), 1u);
+		const auto period  = std::max(frequency / refresh, uint64_t {1});
+		// Fast overlay presents accumulate pacing credit. Sleeping the full
+		// credit (up to ~UINT32_MAX us) freezes Flip while Ready frames wait and
+		// the GPU keeps running — the shown≈ready-1 soft-stall shape.
+		total_wait = ClampPresentPacingWait(total_wait, period);
+
+		SetPresentStage(kPresentStageSleep);
 		const auto sleep_begin = Common::Timer::QueryPerformanceCounter();
 		if (total_wait > 0) {
 			const auto remaining_us =
 			    (static_cast<uint64_t>(total_wait) * 1000000u + frequency - 1) / frequency;
+			const auto period_us =
+			    (period * 1000000u + frequency - 1) / frequency;
 			Common::Thread::SleepMicro(static_cast<uint32_t>(
-			    std::clamp<uint64_t>(remaining_us, 1, std::numeric_limits<uint32_t>::max())));
+			    std::clamp<uint64_t>(remaining_us, 1, std::max<uint64_t>(period_us, 1))));
 		}
 		if (token.stop_requested()) {
 			break;
 		}
 		const auto frame_begin = Common::Timer::QueryPerformanceCounter();
 		total_wait -= static_cast<int64_t>(frame_begin - sleep_begin);
-
-		const auto refresh = std::max(Config::GetVblankFrequency(), 1u);
-		const auto period  = std::max(frequency / refresh, uint64_t {1});
 
 		if (m_presenter.IsGuestPaused()) {
 			if (auto* frame = m_presenter.PrepareLastFrame(); frame != nullptr) {
@@ -830,7 +859,9 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 			continue;
 		}
 
+		SetPresentStage(kPresentStageVblankBegin);
 		VblankBegin();
+		SetPresentStage(kPresentStageFlipEnter);
 		bool presented = m_flip_queue.Flip(0);
 		if (!presented && m_presenter.NeedsSystemOverlayRefresh()) {
 			if (auto* frame = m_presenter.PrepareLastFrame(); frame != nullptr) {
@@ -866,19 +897,27 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 				m_presenter.Present(blank);
 			}
 		}
+		SetPresentStage(kPresentStageVblankEnd);
 		VblankEnd();
+		// Keep pstg/shown live even when Flip returns without presenting so the
+		// soft-stall watchdog samples the current stage instead of a stale title.
+		m_presenter.UpdateWindowTitle();
 
 		const auto frame_end = Common::Timer::QueryPerformanceCounter();
 		total_wait += static_cast<int64_t>(period) - static_cast<int64_t>(frame_end - frame_begin);
 	}
 }
 
-bool FlipQueue::Reserve(VideoOutConfig& cfg, int index, int64_t flip_arg, FlipRequestSource source,
-                        uint64_t& request_id) {
+int FlipQueue::Reserve(VideoOutConfig& cfg, int index, int64_t flip_arg, FlipRequestSource source,
+                       uint64_t& request_id) {
 	Common::LockGuard lock(m_mutex);
-
+	Common::LockGuard cfg_lock(cfg.mutex);
+	if (cfg.closing ||
+	    (!IsSpecialBufferIndex(index) && !cfg.buffers[index].Occupied())) {
+		return VIDEO_OUT_ERROR_INVALID_INDEX;
+	}
 	if (m_requests.size() + m_cpu_requests.size() >= VIDEO_OUT_FLIP_QUEUE_CAPACITY) {
-		return false;
+		return VIDEO_OUT_ERROR_FLIP_QUEUE_FULL;
 	}
 	auto& pending = source == FlipRequestSource::GpuEop ? m_requests : m_cpu_requests;
 
@@ -894,6 +933,12 @@ bool FlipQueue::Reserve(VideoOutConfig& cfg, int index, int64_t flip_arg, FlipRe
 
 	pending.push_back(r);
 	request_id = r.id;
+	m_diagnostics.last_submitted_index = index;
+	if (source == FlipRequestSource::GpuEop) {
+		m_diagnostics.gpu_submitted++;
+	} else {
+		m_diagnostics.cpu_submitted++;
+	}
 
 	cfg.flip_status.flipPendingNum = static_cast<int>(m_requests.size() + m_cpu_requests.size());
 	cfg.flip_status.submitProcessTimeCounter = r.submit_ptc;
@@ -901,7 +946,7 @@ bool FlipQueue::Reserve(VideoOutConfig& cfg, int index, int64_t flip_arg, FlipRe
 		cfg.flip_status.gcQueueNum++;
 	}
 
-	return true;
+	return OK;
 }
 
 FlipQueue::~FlipQueue() {
@@ -1051,6 +1096,7 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 		EXIT("video-out request changed while recording, id=%" PRIu64 "\n", request_id);
 	}
 	prepared->frame = frame;
+	m_diagnostics.prepared++;
 }
 
 void FlipQueue::Complete(uint64_t request_id) {
@@ -1063,6 +1109,7 @@ void FlipQueue::Complete(uint64_t request_id) {
 			EXIT("completed GPU flip has no prepared recording, id=%" PRIu64 "\n", request_id);
 		}
 		request->state = RequestState::Ready;
+		m_diagnostics.ready++;
 		m_submit_cond_var.Signal();
 		m_mutex.Unlock();
 		return;
@@ -1121,6 +1168,14 @@ bool FlipQueue::Flip(uint32_t micros) {
 		EXIT("video-out flip queue processing is already active\n");
 	}
 	if (m_requests.front().state != RequestState::Ready) {
+		SetPresentStage(kPresentStageFlipNotReady);
+		static std::atomic<uint32_t> not_ready_logs {0};
+		if (not_ready_logs.fetch_add(1, std::memory_order_relaxed) < 64) {
+			LOGF("FlipQueue::Flip front not Ready id=%" PRIu64 " state=%u queue=%zu\n",
+			     m_requests.front().id, static_cast<uint32_t>(m_requests.front().state),
+			     m_requests.size());
+			Log::Flush();
+		}
 		m_mutex.Unlock();
 		return false;
 	}
@@ -1130,12 +1185,28 @@ bool FlipQueue::Flip(uint32_t micros) {
 
 	r.cfg->mutex.Lock();
 	if (!IsFlipDueLocked(*r.cfg, r.generation)) {
+		SetPresentStage(kPresentStageFlipNotDue);
+		static std::atomic<uint32_t> not_due_logs {0};
+		if (not_due_logs.fetch_add(1, std::memory_order_relaxed) < 64) {
+			LOGF("FlipQueue::Flip not due id=%" PRIu64 " flip_rate=%d vblank=%" PRIu64
+			     " last_presented_vblank=%" PRIu64 " opened=%d closing=%d gen=%" PRIu64
+			     "/%" PRIu64 "\n",
+			     r.id, r.cfg->flip_rate, r.cfg->vblank_status.count, r.cfg->last_presented_vblank,
+			     r.cfg->opened ? 1 : 0, r.cfg->closing ? 1 : 0, r.generation, r.cfg->generation);
+			Log::Flush();
+		}
 		r.cfg->mutex.Unlock();
 		Common::LockGuard queue_lock(m_mutex);
 		m_processing = false;
 		m_done_cond_var.SignalAll();
 		return false;
 	}
+	const uint64_t present_vblank = r.cfg->vblank_status.count;
+	// Never hold cfg.mutex while acquiring the flip-queue mutex: Prepare locks
+	// m_mutex then cfg.mutex, and Soft-stall samples show PresentDone (pstg=11)
+	// with shown not yet incremented — Flip blocked on m_mutex while still
+	// holding cfg across Present.
+	r.cfg->mutex.Unlock();
 
 	m_mutex.Lock();
 	if (m_requests.empty() || m_requests.front().id != r.id ||
@@ -1147,30 +1218,53 @@ bool FlipQueue::Flip(uint32_t micros) {
 
 	m_presenter.Present(*r.frame);
 
-	m_mutex.Lock();
+	SetPresentStage(kPresentStageFlipPublishWait);
+	// Prefer TryLock so a stuck holder cannot freeze PresentThread silently:
+	// title heartbeat keeps showing pstg=13 while we wait.
+	for (uint32_t spin = 0;; spin++) {
+		if (m_mutex.TryLock()) {
+			break;
+		}
+		if (spin > 0 && (spin % 1000u) == 0u) {
+			LOGF("FlipQueue::Flip publish waiting for queue mutex id=%" PRIu64
+			     " shown_pending spin=%u\n",
+			     r.id, spin);
+			Log::Flush();
+			m_presenter.UpdateWindowTitle();
+		}
+		Common::Thread::SleepMicro(1000);
+	}
+	SetPresentStage(kPresentStageFlipPublish);
 	if (m_requests.empty() || m_requests.front().id != r.id ||
 	    m_requests.front().state != RequestState::Presenting) {
 		EXIT("video-out flip queue changed while processing its front request\n");
 	}
 	m_requests.pop_front();
+	m_diagnostics.presented++;
+	m_diagnostics.last_presented_index = r.index;
+	const int flip_pending =
+	    static_cast<int>(m_requests.size() + m_cpu_requests.size());
+	m_processing = false;
+	m_done_cond_var.SignalAll();
+	m_submit_slot_cond_var.Signal();
+	m_mutex.Unlock();
 
+	r.cfg->mutex.Lock();
+	r.cfg->last_presented_vblank                = present_vblank;
 	r.cfg->flip_status.count++;
 	r.cfg->flip_status.processTime              = LibKernel::KernelGetProcessTime();
 	r.cfg->flip_status.processTimeCounter       = LibKernel::KernelGetProcessTimeCounter();
 	r.cfg->flip_status.submitProcessTimeCounter = r.submit_ptc;
 	r.cfg->flip_status.flipArg                  = r.flip_arg;
 	r.cfg->flip_status.currentBuffer            = r.index;
-	r.cfg->flip_status.flipPendingNum = static_cast<int>(m_requests.size() + m_cpu_requests.size());
+	r.cfg->flip_status.flipPendingNum           = flip_pending;
 	if (r.source == FlipRequestSource::GpuEop && r.cfg->flip_status.gcQueueNum > 0) {
 		r.cfg->flip_status.gcQueueNum--;
 	}
 	TriggerVideoOutEvents(*r.cfg, VideoOutEventKind::Flip, reinterpret_cast<void*>(r.flip_arg));
-
-	m_processing = false;
-	m_done_cond_var.SignalAll();
-	m_submit_slot_cond_var.Signal();
-	m_mutex.Unlock();
 	r.cfg->mutex.Unlock();
+
+	m_presenter.UpdateWindowTitle();
 
 	Graphics::RenderDocOnGuestFlip(m_presenter.Renderer());
 
@@ -1186,6 +1280,33 @@ void FlipQueue::GetFlipStatus(VideoOutConfig& cfg, VideoOutFlipStatus& out) {
 	Common::LockGuard lock(cfg.mutex);
 
 	out = cfg.flip_status;
+}
+
+VideoOutDiagnostics FlipQueue::GetDiagnostics() {
+	VideoOutDiagnostics out {};
+	// Never block the present/title path on the flip-queue mutex: Flip publish
+	// and Reserve take that lock, and a blocking GetDiagnostics from Present
+	// used to form cfg↔queue ABBA stalls.
+	if (m_mutex.TryLock()) {
+		out = m_diagnostics;
+		m_mutex.Unlock();
+	} else {
+		out = m_diagnostics;
+	}
+	return out;
+}
+
+void FlipQueue::RecordOutputStatus(uint32_t resolution) {
+	Common::LockGuard lock(m_mutex);
+	m_diagnostics.output_status_calls++;
+	m_diagnostics.last_output_resolution = resolution;
+}
+
+void FlipQueue::RecordOutputSupport(uint64_t mode, int supported) {
+	Common::LockGuard lock(m_mutex);
+	m_diagnostics.output_support_calls++;
+	m_diagnostics.last_output_mode    = mode;
+	m_diagnostics.last_output_support = supported;
 }
 
 KYTY_SYSV_ABI int VideoOutOpen(int user_id, int bus_type, int index, const void* param) {
@@ -1478,6 +1599,32 @@ KYTY_SYSV_ABI int VideoOutSubmitFlip(int handle, int index, int flip_mode, int64
 	return OK;
 }
 
+struct VideoOutVrrStatus {
+	std::array<uint8_t, 0x80> data;
+};
+
+static_assert(sizeof(VideoOutVrrStatus) == 0x80);
+
+KYTY_SYSV_ABI int VideoOutVrrStatusInitialize() {
+	PRINT_NAME();
+	return OK;
+}
+
+KYTY_SYSV_ABI int VideoOutGetVrrStatus(int handle, VideoOutVrrStatus* status) {
+	PRINT_NAME();
+
+	if (status == nullptr) {
+		return VIDEO_OUT_ERROR_INVALID_ADDRESS;
+	}
+
+	// Kyty currently presents at a fixed refresh rate. A zeroed status reports
+	// that no VRR range or active VRR mode is available, while initializing the
+	// complete ABI output rather than leaving guest stack bytes undefined.
+	(void)handle;
+	*status = {};
+	return OK;
+}
+
 int VideoOutDriver::SubmitFlipFromGpu(Graphics::CommandBuffer& buffer, int handle, int index,
                                       int flip_mode, int64_t flip_arg, uint64_t& request_id) {
 	EXIT_IF(buffer.IsInvalid());
@@ -1662,13 +1809,21 @@ KYTY_SYSV_ABI int VideoOutWaitVblank(int handle) {
 
 KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* status) {
 	PRINT_NAME();
+	const bool trace_output_status = std::getenv("KYTY_VIDEO_OUT_TRACE") != nullptr;
 
 	if (status == nullptr) {
+		if (trace_output_status) {
+			std::printf("VideoOutGetOutputStatus: handle=%d status=null result=invalid-address\n",
+			            handle);
+		}
 		return VIDEO_OUT_ERROR_INVALID_ADDRESS;
 	}
 
 	auto* ctx = DriverState().Get(handle);
 	if (ctx == nullptr) {
+		if (trace_output_status) {
+			std::printf("VideoOutGetOutputStatus: handle=%d result=invalid-handle\n", handle);
+		}
 		return VIDEO_OUT_ERROR_INVALID_HANDLE;
 	}
 
@@ -1688,6 +1843,11 @@ KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* stat
 	status->reserved[1] = 0;
 	status->reserved[2] = 0;
 	ctx->mutex.Unlock();
+	if (trace_output_status) {
+		std::printf("VideoOutGetOutputStatus: handle=%d size=%ux%u resolution=%u\n", handle,
+		            ctx->width, ctx->height, status->resolution);
+	}
+	DriverState().GetFlipQueue().RecordOutputStatus(status->resolution);
 
 	return OK;
 }
@@ -1741,11 +1901,12 @@ KYTY_SYSV_ABI int VideoOutIsOutputSupported(int handle, uint64_t mode,
 		return result;
 	}
 
-	if (mode == VIDEO_OUT_OUTPUT_MODE_119_88HZ) {
-		return (Config::GetVblankFrequency() >= 119 ? VIDEO_OUT_TRUE : VIDEO_OUT_FALSE);
-	}
-
-	return VIDEO_OUT_TRUE;
+	const int supported = mode == VIDEO_OUT_OUTPUT_MODE_119_88HZ
+	                          ? (Config::GetVblankFrequency() >= 119 ? VIDEO_OUT_TRUE
+	                                                                     : VIDEO_OUT_FALSE)
+	                          : VIDEO_OUT_TRUE;
+	DriverState().GetFlipQueue().RecordOutputSupport(mode, supported);
+	return supported;
 }
 
 KYTY_SYSV_ABI int VideoOutConfigureOutput(int handle, uint64_t mode,

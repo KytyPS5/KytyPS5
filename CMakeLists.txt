@@ -371,6 +371,8 @@ function(add_kyty_full_emulator_test target source)
 	endif()
 	if (KYTY_CLANG_CL)
 		target_link_libraries(${target} onecore)
+		# Match kyty_emulator: large shader specialization retranslate needs >1 MiB stack.
+		target_link_options(${target} PRIVATE "/STACK:16777216")
 		add_custom_command(TARGET ${target} POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different "${KYTY_THIRD_PARTY_DIR}/winpthread/bin/libwinpthread-1.dll" $<TARGET_FILE_DIR:${target}>/libwinpthread-1.dll)
 	endif()
 	# The macOS x86_64 guest address space needs its .zerofill segments anchored
@@ -389,6 +391,7 @@ function(configure_macos_guest_address_space target)
 endfunction()
 
 add_kyty_full_emulator_test(shader_cfg_tests "${KYTY_TESTS_DIR}/shaderCfgTests.cpp")
+target_sources(shader_cfg_tests PRIVATE "${KYTY_TESTS_DIR}/ShaderBatchAudit.cpp")
 
 add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ScalarProvenanceTests.cpp"
@@ -410,6 +413,17 @@ add_executable(bit_array_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/BitArrayTests.cpp"
 )
 target_include_directories(bit_array_tests PRIVATE ${inc_headers})
+
+add_executable(video_out_flip_due_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/VideoOutFlipDueTests.cpp"
+)
+target_include_directories(video_out_flip_due_tests PRIVATE ${inc_headers})
+
+add_executable(descriptor_budget_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/DescriptorBudgetTests.cpp"
+)
+target_include_directories(descriptor_budget_tests PRIVATE ${inc_headers})
+target_link_libraries(descriptor_budget_tests Vulkan::Headers)
 
 add_executable(lru_cache_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/LruCacheTests.cpp"
@@ -439,13 +453,16 @@ add_executable(shader_vertex_metadata_tests EXCLUDE_FROM_ALL
 target_include_directories(shader_vertex_metadata_tests PRIVATE ${inc_headers})
 
 add_executable(resource_materialization_tests EXCLUDE_FROM_ALL
+	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/tile.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/image/textureCommon.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/vulkanCommon.cpp"
 	"${KYTY_TESTS_DIR}/ResourceMaterializationTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/guest_gpu/gpu_format.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
 )
-target_link_libraries(resource_materialization_tests fmt::fmt)
+target_link_libraries(resource_materialization_tests fmt::fmt Vulkan::Headers common)
 target_include_directories(resource_materialization_tests PRIVATE ${inc_headers})
 
 add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
@@ -459,7 +476,7 @@ add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ShaderInfoCollection.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/BindingLayout.cpp"
 )
-target_link_libraries(resource_tracking_tests fmt::fmt)
+target_link_libraries(resource_tracking_tests fmt::fmt Vulkan::Headers)
 target_include_directories(resource_tracking_tests PRIVATE ${inc_headers})
 
 add_executable(audio_out2_port_tests EXCLUDE_FROM_ALL
@@ -543,6 +560,9 @@ if(NOT KYTY_CLANG_CL)
 endif()
 
 if(BUILD_TESTING)
+	find_package(Python3 REQUIRED COMPONENTS Interpreter)
+	add_test(NAME shader_corpus_extractor
+	         COMMAND ${Python3_EXECUTABLE} "${KYTY_TESTS_DIR}/ExtractShaderCorpusTests.py")
 	add_test(NAME emulator_user_name_cli
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --user-name 1234567890123456)
 	add_test(NAME emulator_user_name_too_long
@@ -555,11 +575,41 @@ if(BUILD_TESTING)
 	set_tests_properties(emulator_present_mode_invalid PROPERTIES WILL_FAIL TRUE)
 	add_test(NAME ime_dialog COMMAND $<TARGET_FILE:ime_dialog_tests>)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
+	add_test(NAME shader_audit_metadata
+	         COMMAND ${Python3_EXECUTABLE} "${KYTY_TESTS_DIR}/ShaderAuditMetadataTests.py"
+	                 $<TARGET_FILE:shader_cfg_tests>
+	                 --output-root "${CMAKE_CURRENT_BINARY_DIR}/shader-audit-metadata")
+	set_tests_properties(shader_audit_metadata PROPERTIES TIMEOUT 900 RUN_SERIAL TRUE)
+	add_test(NAME shader_audit_compute
+	         COMMAND ${Python3_EXECUTABLE} "${KYTY_TESTS_DIR}/ShaderAuditComputeTests.py"
+	                 $<TARGET_FILE:shader_cfg_tests>
+	                 --output-root "${CMAKE_CURRENT_BINARY_DIR}/shader-audit-compute")
+	set_tests_properties(shader_audit_compute PROPERTIES TIMEOUT 600 RUN_SERIAL TRUE)
+	add_test(NAME shader_fma_khr_validator COMMAND $<TARGET_FILE:shader_cfg_tests> --fma-khr-validator-only)
+	set_tests_properties(shader_fma_khr_validator PROPERTIES TIMEOUT 30)
+	add_test(NAME videoout_vrr_status
+		COMMAND $<TARGET_FILE:shader_cfg_tests> --videoout-vrr-status-only)
+	add_test(NAME shader_spirv_optimization
+		COMMAND $<TARGET_FILE:shader_cfg_tests> --spirv-optimization-only)
+	add_test(NAME pipeline_cache_identity
+		COMMAND $<TARGET_FILE:shader_cfg_tests> --pipeline-cache-identity-only)
+	add_test(NAME spirv_permutation_reuse
+		COMMAND $<TARGET_FILE:shader_cfg_tests> --spirv-permutation-reuse-only)
+	if(WIN32)
+		add_test(NAME shader_f64_admission
+		         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --f64-admission-only)
+		set_tests_properties(shader_f64_admission PROPERTIES TIMEOUT 480 RUN_SERIAL TRUE)
+	else()
+		add_test(NAME shader_f64_admission
+		         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --f64-admission-positive-only)
+	endif()
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
+	add_test(NAME video_out_flip_due COMMAND $<TARGET_FILE:video_out_flip_due_tests>)
+	add_test(NAME descriptor_budget COMMAND $<TARGET_FILE:descriptor_budget_tests>)
 	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
@@ -608,6 +658,23 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-gc-only)
 
 	if(WIN32)
+		add_test(NAME sampled_htile_clear_import
+			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --sampled-htile-clear-only)
+		add_test(NAME sampled_htile_array_clear_import
+			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --sampled-htile-array-clear-only)
+		add_test(NAME native_htile_array_subset
+			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --native-htile-subset-only)
+		add_test(NAME shader_immutable_srt_binding_admission
+			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --immutable-srt-binding-admission-only)
+		set_tests_properties(shader_immutable_srt_binding_admission PROPERTIES TIMEOUT 360 RUN_SERIAL TRUE)
+		add_test(NAME sampled_htile_write_admission
+			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --sampled-htile-write-admission-only)
+		add_test(NAME sampled_htile_admission
+			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --sampled-htile-admission-only)
+		set_tests_properties(sampled_htile_clear_import sampled_htile_array_clear_import
+			native_htile_array_subset PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE)
+		set_tests_properties(sampled_htile_admission PROPERTIES TIMEOUT 150 RUN_SERIAL TRUE)
+		set_tests_properties(sampled_htile_write_admission PROPERTIES TIMEOUT 450 RUN_SERIAL TRUE)
 		# These tests still depend on the Windows multisample-depth path.
 		add_test(NAME texture_cache_image_overlap
 			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-overlap-only)
@@ -625,6 +692,8 @@ if(BUILD_TESTING)
 		memory_tracker_tests
 		page_manager_tests
 		bit_array_tests
+		video_out_flip_due_tests
+		descriptor_budget_tests
 		lru_cache_tests
 		shader_vertex_metadata_tests
 		resource_materialization_tests
@@ -635,6 +704,7 @@ if(BUILD_TESTING)
 		shader_recompiler_compute_tests
 		virtual_memory_allocation_tests
 		audio_out2_port_tests
+		save_data_memory_tests
 		ngs2_sampler_tests
 		save_data_memory_tests
 	)
@@ -689,6 +759,9 @@ if(KYTY_CLANG_CL)
 	target_link_options(kyty_emulator PRIVATE
 		"/DYNAMICBASE:NO"
 		"/DEBUG:FULL"
+		# Deep CFG/IR recursion on large compute specializations (Yōtei CS 54904
+		# class) overflows the default 1 MiB Windows stack with STATUS_STACK_OVERFLOW.
+		"/STACK:16777216"
 		"/PDB:${KYTY_EMULATOR_PDB_LINK_PATH}"
 		"/lldmap:${KYTY_EMULATOR_MAP_LINK_PATH}"
 	)

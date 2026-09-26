@@ -2,6 +2,9 @@
 
 #include "common/assert.h"
 #include "graphics/guest_gpu/gpu_format.h"
+#include "graphics/host_gpu/renderer/image/imageInfo.h"
+#include "graphics/host_gpu/renderer/image/textureCommon.h"
+#include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shaderBindings.h"
 
@@ -13,17 +16,53 @@
 #include <fmt/format.h>
 #include <functional>
 #include <numeric>
+#include <string>
 #include <unordered_set>
+#include <unordered_map>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
 
 constexpr uint64_t AddressMask            = 0x0000ffffffffffffull;
+constexpr uint64_t RegisteredBufferAddressLimit = uint64_t{1} << 40u;
 constexpr uint64_t MaxIndirectImageProbes = 65536u;
+// A 16-bit selector can feed multiple descriptors and their address expressions.
+// Bound each selector domain independently, then apply an explicit memory budget
+// to the whole coherent transaction instead of treating the first 65,536 words
+// as a semantic limit. This includes 256 full-width selector columns.
+constexpr uint64_t MaxBoundedSnapshotBytes = 64u * 1024u * 1024u;
+constexpr uint64_t MaxBoundedSnapshotWords = MaxBoundedSnapshotBytes / sizeof(uint32_t);
+
+thread_local std::string g_last_specialization_error;
+
+struct IndirectImage {
+	uint32_t                     resource = 0;
+	uint32_t                     sampler_resource = UINT32_MAX;
+	uint64_t                     buffer_size = 0;
+	uint64_t                     probe_count = 0;
+	uint32_t                     selector_stride = 0;
+	std::vector<uint32_t>        keys;
+	std::vector<uint32_t>        candidates;
+	std::vector<DescriptorValue> descriptors;
+	std::vector<DescriptorValue> samplers;
+};
+
+struct MaterializedSnapshot {
+	ResourceSnapshot           resources;
+	std::vector<IndirectImage> indirect_images;
+	std::vector<std::vector<DescriptorValue>> inline_buffers;
+	std::vector<BoundedSrtLayout> bounded_srt_reads;
+	std::vector<std::vector<DescriptorValue>> bounded_buffer_expressions;
+	std::vector<std::vector<DescriptorValue>> bounded_image_expressions;
+	std::vector<std::vector<DescriptorValue>> bounded_sampler_expressions;
+	std::vector<uint8_t> bounded_sampler_consumed;
+};
 
 bool SpecializationFail(std::string_view message) {
+	g_last_specialization_error.assign(message);
 	std::fprintf(stderr, "shader resource specialization failed: %.*s\n",
 	             static_cast<int>(message.size()), message.data());
+	std::fflush(stderr);
 	return false;
 }
 
@@ -71,8 +110,7 @@ bool ValidImageDescriptor(const DescriptorValue& descriptor, bool r128 = false) 
 	}
 	const auto type   = static_cast<Prospero::ImageType>((descriptor.dwords[3] >> 28u) & 0xfu);
 	const auto format = static_cast<Prospero::BufferFormat>((descriptor.dwords[1] >> 20u) & 0x1ffu);
-	if (type < Prospero::ImageType::kColor1D || format == Prospero::BufferFormat::kInvalid ||
-	    format > Prospero::BufferFormat::kBc7Srgb) {
+	if (type < Prospero::ImageType::kColor1D || !Prospero::IsKnownFormat(format)) {
 		return false;
 	}
 	if (r128 && type != Prospero::ImageType::kColor1D && type != Prospero::ImageType::kColor2D &&
@@ -107,12 +145,14 @@ Prospero::BufferFormat ImageConversionFormat(Prospero::BufferFormat format) {
 }
 
 bool RequiresPointSampler(const ImageResource& image) {
-	return image.numeric_class == Prospero::TextureNumericClass::Sint ||
+	return image.numeric_class == Prospero::TextureNumericClass::Uint ||
+	       image.numeric_class == Prospero::TextureNumericClass::Sint ||
 	       image.conversion_format != Prospero::BufferFormat::kInvalid;
 }
 
 bool RequiresPointSampler(const ResourceSpecialization::Image& image) {
-	return image.numeric_class == Prospero::TextureNumericClass::Sint ||
+	return image.numeric_class == Prospero::TextureNumericClass::Uint ||
+	       image.numeric_class == Prospero::TextureNumericClass::Sint ||
 	       image.conversion_format != Prospero::BufferFormat::kInvalid;
 }
 
@@ -211,7 +251,7 @@ void MarkCleanFlatSlots(const ResourcePlan& program, const DescriptorSource* sou
 		if (inst->GetOpcode() == ValueOpcode::ReadConst) {
 			const auto slot = inst->Arg(1).Resolve();
 			if (slot.IsImmediate() && slot.GetType() == Type::U32 && slot.U32() < slots.size()) {
-				slots[slot.U32()] = 1u;
+				slots[slot.U32()] = ResourcePlan::FlatSlotClean;
 				pending.push_back(program.srt_reads[slot.U32()].value);
 			}
 			continue;
@@ -222,10 +262,93 @@ void MarkCleanFlatSlots(const ResourcePlan& program, const DescriptorSource* sou
 	}
 }
 
+void MarkDeferredFlatSlots(const ResourcePlan& program, const DescriptorSource* source,
+	                       std::span<uint8_t> slots) {
+	if (source == nullptr) return;
+	std::vector<const Inst*> visiting;
+	std::function<bool(Value)> depends_on_bounded = [&](Value value) {
+		value = value.Resolve();
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr) return false;
+		if (inst->GetOpcode() == ValueOpcode::ReadBoundedSrtU32) return true;
+		if (std::ranges::find(visiting, inst) != visiting.end()) return false;
+		visiting.push_back(inst);
+		bool dependent = false;
+		if (inst->GetOpcode() == ValueOpcode::ReadConst && inst->NumArgs() == 2u) {
+			const auto slot = inst->Arg(1).Resolve();
+			if (slot.IsImmediate() && slot.GetType() == Type::U32 &&
+			    slot.U32() < program.srt_reads.size() && slot.U32() < slots.size()) {
+				dependent = depends_on_bounded(program.srt_reads[slot.U32()].value);
+				if (dependent) slots[slot.U32()] = ResourcePlan::FlatSlotDeferred;
+			}
+		} else {
+			for (uint32_t arg = 0; arg < inst->NumArgs(); ++arg)
+				dependent = depends_on_bounded(inst->Arg(arg)) || dependent;
+		}
+		visiting.pop_back();
+		return dependent;
+	};
+	for (uint32_t word = 0; word < source->dword_count; ++word)
+		depends_on_bounded(source->dwords[word]);
+}
+
+uint64_t ScalarBufferSize(const ShaderBufferResource& descriptor) {
+	return descriptor.Stride() == 0u
+	           ? descriptor.NumRecords()
+	           : static_cast<uint64_t>(descriptor.Stride()) * descriptor.NumRecords();
+}
+
+bool CanonicalizeEnumeratedBufferDescriptor(DescriptorValue& value, const SrtRuntime& runtime) {
+	ShaderBufferResource descriptor;
+	if (!DecodeBufferDescriptor(value, descriptor)) {
+		return false;
+	}
+	// Finite selector proofs enumerate every possible table row before the
+	// shader runs.  Guest tables can share storage with unrelated payloads, so
+	// an unselected row can decode to a 48-bit address that the renderer cannot
+	// register.  Keep the switch topology stable, but make that foreign row the
+	// same safe null candidate used by native descriptor binding.
+	// RDNA2 buffer descriptor bits 115:116 and 121:123 are reserved.  Random
+	// payload can otherwise resemble a small-address, very large buffer and
+	// reach native binding even though it is not a legal descriptor.
+	constexpr uint32_t reserved_word3_mask = 0x0e180000u;
+	const auto address = descriptor.Base48();
+	const auto size    = ScalarBufferSize(descriptor);
+	if (address >= RegisteredBufferAddressLimit ||
+	    (descriptor.fields[3] & reserved_word3_mask) != 0u ||
+	    (address != 0u && size != 0u && runtime.clamp_memory_range != nullptr &&
+	     runtime.clamp_memory_range(runtime.userdata, address, size) == 0u)) {
+		value.dwords.fill(0u);
+	}
+	return true;
+}
+
+bool ReadSpecializationWord(const SrtRuntime& runtime, uint64_t address, uint32_t& word) {
+	return runtime.read_specialization_memory != nullptr &&
+	       runtime.read_specialization_memory(runtime.userdata, address, {&word, 1u});
+}
+
+bool ReadScalarBufferWord(const ShaderBufferResource& descriptor, uint32_t dynamic_offset,
+                          uint32_t immediate_offset, const SrtRuntime& runtime, uint32_t& word) {
+	const auto byte_offset = static_cast<uint64_t>(dynamic_offset) + immediate_offset;
+	const auto aligned     = byte_offset & ~uint64_t {3};
+	const auto size        = ScalarBufferSize(descriptor);
+	if (aligned > size || size - aligned < sizeof(uint32_t)) {
+		word = 0;
+		return true;
+	}
+	const auto base = descriptor.Base48() & ~uint64_t {3};
+	if (aligned > AddressMask - base) {
+		return false;
+	}
+	return ReadSpecializationWord(runtime, base + aligned, word);
+}
+
 bool ReadScalarTable(uint64_t base, uint64_t size, uint32_t dynamic_offset,
                      const SrtRuntime& runtime, std::span<uint32_t> words) {
 	const auto offset = static_cast<uint64_t>(dynamic_offset) & ~uint64_t {3};
-	const auto count = std::min<uint64_t>(words.size(), offset < size ? (size - offset) / 4u : 0u);
+	const auto count =
+	    std::min<uint64_t>(words.size(), offset < size ? (size - offset) / 4u : 0u);
 	std::ranges::fill(words.subspan(count), 0u);
 	if (count == 0u) {
 		return true;
@@ -235,7 +358,7 @@ bool ReadScalarTable(uint64_t base, uint64_t size, uint32_t dynamic_offset,
 		return false;
 	}
 	const auto address = base + offset;
-	const auto prefix = words.first(count);
+	const auto prefix  = words.first(count);
 	return prefix.size_bytes() - 1u <= AddressMask - address &&
 	       runtime.read_specialization_memory != nullptr &&
 	       runtime.read_specialization_memory(runtime.userdata, address, prefix);
@@ -244,10 +367,9 @@ bool ReadScalarTable(uint64_t base, uint64_t size, uint32_t dynamic_offset,
 bool MaterializeIndirectImage(const ResourcePlan& program,
                               const DescriptorSource::IndirectImage& indirect,
                               const DescriptorValue& material_value,
-                              const DescriptorValue& table_value, uint32_t image_index,
+                              const DescriptorValue& table_value, bool r128,
                               const SrtRuntime& runtime, SrtWalker& clean,
-                              ResourceSnapshot& snapshot,
-                              ResourceSpecialization& specialization) {
+                              IndirectImage& result) {
 	uint64_t table_base = 0;
 	uint64_t table_size = UINT64_MAX; // Scalar addresses have no buffer descriptor bounds.
 	ShaderBufferResource table;
@@ -299,84 +421,1318 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 		keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
 	} else {
 		ShaderBufferResource material;
-		if (!DecodeBufferDescriptor(material_value, material) || table_value.dword_count != 4u ||
-		    material.Stride() != indirect.selector_stride) {
+		if (!DecodeBufferDescriptor(material_value, material) ||
+		    (table_value.dword_count != 2u && table_value.dword_count != 4u) ||
+		    (!indirect.record_key && material.Stride() != indirect.selector_stride)) {
 			return false;
 		}
-		// Enumerate every wrapped scalar-buffer offset that can pass the descriptor bounds.
-		const auto step = std::gcd<uint64_t>(indirect.selector_stride, uint64_t {1} << 32u);
-		const auto residue = static_cast<uint64_t>(indirect.selector_offset) % step;
-		const auto limit = std::min<uint64_t>(UINT32_MAX, material.GetSize() + 3u);
-		const auto probe_count = residue <= limit ? (limit - residue) / step + 1u : 0u;
-		if (probe_count > MaxIndirectImageProbes) {
-			return false;
-		}
-		keys.reserve(static_cast<size_t>(probe_count) + 1u);
-		keys.push_back(0u);
-		for (uint64_t offset = residue; offset <= limit && probe_count != 0u; offset += step) {
-			uint32_t key = 0;
-			if (!ReadScalarTable(material.Base48(), material.GetSize(),
-			                     static_cast<uint32_t>(offset), runtime, {&key, 1})) {
+		if (indirect.record_key) {
+			const auto stride = material.Stride();
+			if (stride == 0u || material.SwizzleEnabled() || material.AddTid() ||
+			    material.IndexStride() != 0u || indirect.selector_offset > stride ||
+			    stride - indirect.selector_offset < 4u || material.GetSize() > UINT32_MAX) {
 				return false;
 			}
-			keys.push_back(key);
-			if (limit - offset < step) {
-				break;
+			// The 32-bit index multiplication can wrap into any offset in this residue class.
+			const auto step        = std::gcd<uint64_t>(stride, uint64_t {1} << 32u);
+			const auto residue     = static_cast<uint64_t>(indirect.selector_offset) % step;
+			const auto limit       = std::min<uint64_t>(UINT32_MAX, material.GetSize() + 3u);
+			const auto probe_count = residue <= limit ? (limit - residue) / step + 1u : 0u;
+			if (probe_count > MaxIndirectImageProbes) {
+				return false;
 			}
+			keys.reserve(static_cast<size_t>(probe_count) + 1u);
+			keys.push_back(0u); // Out-of-bounds buffer reads can select the zero key.
+			for (uint64_t index = 0; index < probe_count; index++) {
+				const auto offset = residue + index * step;
+				uint32_t   key    = 0;
+				if (!ReadScalarTable(material.Base48(), material.GetSize(),
+				                     static_cast<uint32_t>(offset), runtime, {&key, 1})) {
+					return false;
+				}
+				keys.push_back(key);
+			}
+			std::ranges::sort(keys);
+			keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+		} else {
+			// Enumerate every wrapped scalar-buffer offset that can pass the descriptor bounds.
+			const auto step = std::gcd<uint64_t>(indirect.selector_stride, uint64_t {1} << 32u);
+			const auto residue = static_cast<uint64_t>(indirect.selector_offset) % step;
+			const auto limit = std::min<uint64_t>(UINT32_MAX, material.GetSize() + 3u);
+			const auto probe_count = residue <= limit ? (limit - residue) / step + 1u : 0u;
+			if (probe_count > MaxIndirectImageProbes) {
+				return false;
+			}
+			keys.reserve(static_cast<size_t>(probe_count) + 1u);
+			keys.push_back(0u);
+			for (uint64_t index = 0; index < probe_count; index++) {
+				const auto offset = residue + index * step;
+				uint32_t   key    = 0;
+				if (!ReadScalarTable(material.Base48(), material.GetSize(),
+				                     static_cast<uint32_t>(offset), runtime, {&key, 1})) {
+					return false;
+				}
+				keys.push_back(key);
+			}
+			std::ranges::sort(keys);
+			keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
 		}
-		std::ranges::sort(keys);
-		keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
 	}
 
-	const auto children_begin = snapshot.images.size();
-	const auto mapping_offset = snapshot.flattened_srt.size();
-	const auto root_image = specialization.images[image_index];
-	snapshot.flattened_srt.resize(mapping_offset + 1u + keys.size() * 2u);
-	snapshot.flattened_srt[mapping_offset] = static_cast<uint32_t>(keys.size());
-	for (uint32_t entry = 0; entry < keys.size(); ++entry) {
-		const auto key = keys[entry];
+	IndirectImage next;
+	next.keys = keys;
+	for (const auto key : next.keys) {
 		DescriptorValue candidate;
 		candidate.dword_count = 8u;
 		const auto table_offset = (key << 5u) + indirect.table_offset;
-		if (!ReadScalarTable(table_base, table_size, table_offset, runtime, candidate.dwords)) {
+		if (!ReadScalarTable(table_base, table_size, table_offset, runtime, candidate.dwords)) return false;
+		if (NullImageDescriptor(candidate) || !ValidImageDescriptor(candidate, r128)) candidate.dwords.fill(0);
+		const auto found = std::ranges::find(next.descriptors, candidate);
+		const auto ordinal = static_cast<uint32_t>(found - next.descriptors.begin());
+		if (found == next.descriptors.end()) {
+			if (next.descriptors.size() >= ShaderInfo::MaxImages) return false;
+			next.descriptors.push_back(candidate);
+		}
+		next.candidates.push_back(ordinal);
+	}
+	if (next.keys.empty()) {
+		DescriptorValue empty;
+		empty.dword_count = 8u;
+		next.keys.push_back(0u);
+		next.candidates.push_back(0u);
+		next.descriptors.push_back(empty);
+	}
+	result = std::move(next);
+	return true;
+}
+
+bool ReadInlineImageTable(const DescriptorSource::InlineDescriptor::ImageTable& table,
+                          const DescriptorValue& address_value, uint32_t index,
+                          const SrtRuntime& runtime, DescriptorValue& result) {
+	if (address_value.dword_count != 2u) {
+		return false;
+	}
+	const auto base = ((static_cast<uint64_t>(address_value.dwords[1]) << 32u) |
+	                   address_value.dwords[0]) & AddressMask & ~uint64_t {3};
+	// Match SrtWalker::EvaluateRawRead: align the signed immediate and unsigned scalar
+	// offset separately, then add them to the aligned 48-bit address without wrapping.
+	const auto immediate = static_cast<int64_t>(static_cast<int32_t>(table.table_offset));
+	const auto relative = (immediate & ~int64_t {3}) + static_cast<int64_t>(index << 5u);
+	uint64_t address = 0;
+	if (relative < 0) {
+		const auto magnitude = uint64_t {0} - static_cast<uint64_t>(relative);
+		if (magnitude > base) {
 			return false;
 		}
-		if (NullImageDescriptor(candidate) ||
-		    !ValidImageDescriptor(candidate, program.info.images[image_index].r128)) {
-			candidate.dwords.fill(0);
+		address = base - magnitude;
+	} else {
+		if (static_cast<uint64_t>(relative) > AddressMask - base) {
+			return false;
 		}
-		uint32_t ordinal = 0;
-		if (entry == 0) {
-			snapshot.images[image_index] = candidate;
-		} else if (snapshot.images[image_index] != candidate) {
-			const auto found = std::find(snapshot.images.begin() + children_begin,
-			                             snapshot.images.end(), candidate);
-			ordinal = static_cast<uint32_t>(found - snapshot.images.begin() - children_begin + 1u);
-			if (found == snapshot.images.end()) {
-				if (snapshot.images.size() >= ShaderInfo::MaxImages) {
-					return false;
-				}
-				snapshot.images.push_back(candidate);
-				auto child = root_image;
-				child.indirect_root = image_index;
-				specialization.images.push_back(child);
+		address = base + static_cast<uint64_t>(relative);
+	}
+	if (address > AddressMask - 31u) {
+		return false;
+	}
+	DescriptorValue next;
+	next.dword_count = 8u;
+	for (uint32_t dword = 0; dword < 8u; dword++) {
+		if (!ReadSpecializationWord(runtime, address + dword * 4u, next.dwords[dword])) {
+			return false;
+		}
+	}
+	if (NullImageDescriptor(next) || !ValidImageDescriptor(next)) {
+		next.dwords.fill(0u);
+	}
+	result = next;
+	return true;
+}
+
+bool MaterializeInlineImage(const DescriptorSource::InlineDescriptor& image,
+                            const DescriptorSource::InlineDescriptor* sampler,
+                            const DescriptorValue& buffer_value,
+                            const DescriptorValue* table_address, uint32_t pc,
+                            const SrtRuntime& runtime, IndirectImage& result) {
+	ShaderBufferResource buffer;
+	if (!DecodeBufferDescriptor(buffer_value, buffer) || image.selector_stride == 0u ||
+	    (image.descriptor_dwords != 4u && image.descriptor_dwords != 8u) ||
+	    image.descriptor_offset > UINT32_MAX - (image.descriptor_dwords - 1u) * 4u ||
+	    (sampler != nullptr && (image.buffer_source != sampler->buffer_source ||
+	                            image.selector_stride != sampler->selector_stride ||
+	                            image.selector_limit != sampler->selector_limit ||
+	                            sampler->descriptor_dwords != 4u ||
+	                            sampler->descriptor_offset > UINT32_MAX - 12u ||
+	                            sampler->image_table.has_value()))) {
+		return SpecializationFail(fmt::format("inline sampled pair at pc 0x{:08x} has invalid metadata", pc));
+	}
+	if (buffer.Type() != 0u) {
+		return SpecializationFail(fmt::format(
+		    "inline sampled pair at pc 0x{:08x}: invalid scalar-buffer descriptor type={}",
+		    pc, buffer.Type()));
+	}
+	if (image.image_table.has_value() &&
+	    (table_address == nullptr || image.image_table->index_shift >= 32u ||
+	     image.image_table->index_mask > 255u ||
+	     static_cast<int64_t>(static_cast<int32_t>(image.image_table->table_offset)) + 28 > INT32_MAX)) {
+		return SpecializationFail(fmt::format(
+		    "inline image table at pc 0x{:08x} requires a bounded 8-bit index and valid raw address metadata", pc));
+	}
+	const auto size = ScalarBufferSize(buffer);
+	const auto step = image.selector_limit != 0u
+	                      ? static_cast<uint64_t>(image.selector_stride)
+	                      : std::gcd<uint64_t>(image.selector_stride, uint64_t {1} << 32u);
+	const auto first_offset = sampler != nullptr
+	                              ? std::min(image.descriptor_offset, sampler->descriptor_offset)
+	                              : image.descriptor_offset;
+	// The live key is the wrapped U32 multiplication result. Enumerating only record starts
+	// would miss wrap aliases: for stride 872 every multiple of eight is reachable.
+	// Match ReadScalarBufferWord's widened immediate addition and independent dword bounds.
+	const auto last_byte = size >= 4u ? ((size - 4u) & ~uint64_t {3}) + 3u : 0u;
+	const auto probe_count = image.selector_limit != 0u
+	                             ? static_cast<uint64_t>(image.selector_limit)
+	                             : size >= 4u && last_byte >= first_offset
+	                                   ? std::min<uint64_t>(UINT32_MAX,
+	                                                        last_byte - first_offset) /
+	                                             step +
+	                                         1u
+	                                   : 0u;
+	const auto fail = [&](std::string_view reason, size_t pairs) {
+		return SpecializationFail(fmt::format(
+		    "inline sampled pair at pc 0x{:08x}: {} (size={} stride={} buffer_stride={} probes={} pairs={})",
+		    pc, reason, size, image.selector_stride, buffer.Stride(), probe_count, pairs));
+	};
+	if (probe_count > MaxIndirectImageProbes) {
+		return fail("probe limit exceeded", 0u);
+	}
+	IndirectImage next;
+	DescriptorValue default_image;
+	next.buffer_size = size;
+	next.probe_count = probe_count;
+	next.selector_stride = image.selector_stride;
+	default_image.dword_count = 8u;
+	DescriptorValue null_sampler;
+	null_sampler.dword_count = 4u;
+	std::array<std::optional<DescriptorValue>, 256> table_images;
+	const auto table_image = [&](uint32_t word, DescriptorValue& descriptor) {
+		const auto& table = *image.image_table;
+		const auto index = (word >> table.index_shift) & table.index_mask;
+		if (!table_images[index].has_value()) {
+			DescriptorValue value;
+			if (!ReadInlineImageTable(table, *table_address, index, runtime, value)) {
+				return false;
+			}
+			table_images[index] = value;
+		}
+		descriptor = *table_images[index];
+		return true;
+	};
+	if (image.image_table.has_value() && !table_image(0u, default_image)) {
+		return fail("default image table entry is unavailable, GPU-dirty, or outside the address range", 0u);
+	}
+	// An out-of-bounds material selector reads zero. Dependent tables therefore default to
+	// table[0], which can be a valid image; direct inline descriptors default to a null image.
+	next.descriptors.push_back(default_image);
+	next.samplers.push_back(null_sampler);
+	next.keys.reserve(static_cast<size_t>(probe_count));
+	next.candidates.reserve(static_cast<size_t>(probe_count));
+	for (uint64_t probe = 0; probe < probe_count; probe++) {
+		const auto key = static_cast<uint32_t>(probe * step);
+		auto candidate_image = default_image;
+		auto candidate_sampler = null_sampler;
+		if (image.image_table.has_value()) {
+			uint32_t selector_word = 0;
+			if (!ReadScalarBufferWord(buffer, key, image.descriptor_offset, runtime, selector_word) ||
+			    !table_image(selector_word, candidate_image)) {
+				return fail("image table descriptor memory is unavailable, GPU-dirty, or outside the address range",
+				            next.descriptors.size());
 			}
 		}
-		snapshot.flattened_srt[mapping_offset + 1u + entry * 2u] = key;
-		snapshot.flattened_srt[mapping_offset + 2u + entry * 2u] = ordinal;
+		if (!image.image_table.has_value()) {
+			for (uint32_t dword = 0; dword < image.descriptor_dwords; dword++) {
+				if (!ReadScalarBufferWord(buffer, key, image.descriptor_offset + dword * 4u,
+				                          runtime, candidate_image.dwords[dword])) {
+					return fail("image descriptor memory is unavailable or GPU-dirty", next.descriptors.size());
+				}
+			}
+		}
+		if (sampler != nullptr) {
+			for (uint32_t dword = 0; dword < 4u; dword++) {
+				if (!ReadScalarBufferWord(buffer, key, sampler->descriptor_offset + dword * 4u,
+				                          runtime, candidate_sampler.dwords[dword])) {
+					return fail("sampler descriptor memory is unavailable or GPU-dirty", next.descriptors.size());
+				}
+			}
+		}
+		if (NullImageDescriptor(candidate_image) ||
+		    !ValidImageDescriptor(candidate_image,
+		                          !image.image_table.has_value() && image.descriptor_dwords == 4u)) {
+			candidate_image.dwords.fill(0u);
+		}
+		// Invalid or null image records cannot be sampled meaningfully. The sampler bits beside
+		// them are frequently unrelated material data when a wrapped selector lands between
+		// records, and retaining those bits creates distinct Vulkan resources for the same null
+		// result. Canonicalize the whole sampled pair so only valid images consume sampler slots.
+		if (sampler != nullptr && NullImageDescriptor(candidate_image)) {
+			candidate_sampler = null_sampler;
+		}
+		size_t candidate = 0;
+		while (candidate < next.descriptors.size() &&
+		       (next.descriptors[candidate] != candidate_image ||
+		        next.samplers[candidate] != candidate_sampler)) {
+			candidate++;
+		}
+		if (candidate == next.descriptors.size()) {
+			if (candidate >= ShaderInfo::MaxImages) {
+				return fail("candidate pair limit exceeded", candidate + 1u);
+			}
+			next.descriptors.push_back(candidate_image);
+			next.samplers.push_back(candidate_sampler);
+		}
+		if (candidate != 0u) {
+			next.keys.push_back(key);
+			next.candidates.push_back(static_cast<uint32_t>(candidate));
+		}
 	}
-	if (snapshot.images.size() == children_begin) {
-		snapshot.flattened_srt.resize(mapping_offset);
-	} else {
-		auto& root = specialization.images[image_index];
-		root.indirect_root = image_index;
-		root.indirect_mapping_offset = static_cast<uint32_t>(mapping_offset);
-		root.indirect_search_iterations = std::bit_width(keys.size());
+	if (sampler == nullptr) {
+		next.samplers.clear();
+	}
+	result = std::move(next);
+	return true;
+}
+
+bool MaterializeInlineBuffer(const DescriptorSource::InlineDescriptor& table,
+                             const DescriptorValue& table_value, uint32_t pc,
+                             const SrtRuntime& runtime,
+                             std::vector<DescriptorValue>& result) {
+	ShaderBufferResource buffer;
+	if (!DecodeBufferDescriptor(table_value, buffer) || table.selector_stride == 0u ||
+	    table.selector_limit == 0u || table.descriptor_dwords != 4u ||
+	    table.image_table.has_value() || table.descriptor_offset > UINT32_MAX - 12u) {
+		return SpecializationFail(fmt::format(
+		    "inline buffer table at pc 0x{:08x} has invalid metadata", pc));
+	}
+	if (buffer.Type() != 0u || table.selector_limit > MaxIndirectImageProbes) {
+		return SpecializationFail(fmt::format(
+		    "inline buffer table at pc 0x{:08x} has invalid scalar source or candidate count",
+		    pc));
+	}
+	std::vector<DescriptorValue> candidates;
+	candidates.reserve(table.selector_limit);
+	for (uint32_t selector = 0; selector < table.selector_limit; ++selector) {
+		const auto key = static_cast<uint32_t>(
+		    static_cast<uint64_t>(selector) * table.selector_stride);
+		DescriptorValue descriptor;
+		descriptor.dword_count = 4u;
+		for (uint32_t dword = 0; dword < descriptor.dword_count; ++dword) {
+			if (!ReadScalarBufferWord(buffer, key,
+			                          table.descriptor_offset + dword * sizeof(uint32_t),
+			                          runtime, descriptor.dwords[dword])) {
+				return SpecializationFail(fmt::format(
+				    "inline buffer table at pc 0x{:08x} cannot read candidate {}", pc,
+				    selector));
+			}
+		}
+		candidates.push_back(descriptor);
+	}
+	result = std::move(candidates);
+	return true;
+}
+
+// This cache makes every clean read of the same source DWORD observe the same snapshot,
+// including count/address chains shared with ordinary flattened SRT slots.
+struct SnapshotReader {
+	const SrtRuntime& runtime;
+	std::unordered_map<uint64_t, uint32_t> words;
+
+	static bool Clean(void* userdata, uint64_t address, std::span<uint32_t> results) {
+		auto& self = *static_cast<SnapshotReader*>(userdata);
+		if (results.empty() ||
+		    address > AddressMask - (results.size_bytes() - 1u) ||
+		    self.runtime.read_specialization_memory == nullptr) {
+			return false;
+		}
+		for (size_t index = 0; index < results.size(); ++index) {
+			const auto word_address = address + index * sizeof(uint32_t);
+			if (const auto found = self.words.find(word_address); found != self.words.end()) {
+				results[index] = found->second;
+				continue;
+			}
+			uint32_t word = 0;
+			if (!self.runtime.read_specialization_memory(
+			        self.runtime.userdata, word_address, {&word, 1u})) {
+				return false;
+			}
+			self.words.emplace(word_address, word);
+			results[index] = word;
+		}
+		return true;
+	}
+
+	static bool Ordinary(void* userdata, uint64_t address, std::span<uint32_t> results) {
+		auto& self = *static_cast<SnapshotReader*>(userdata);
+		if (self.runtime.read_memory != nullptr) {
+			return self.runtime.read_memory(self.runtime.userdata, address, results);
+		}
+		// Preserve the existing evaluator fallback for callers without an ordinary reader.
+		std::memcpy(results.data(), reinterpret_cast<const void*>(address), results.size_bytes());
+		return true;
+	}
+
+	// Keep clamp queries on the caller's userdata; SnapshotReader only owns the
+	// specialization/ordinary read callbacks while the bounded snapshot runs.
+	static uint64_t Clamp(void* userdata, uint64_t address, uint64_t size) {
+		auto& self = *static_cast<SnapshotReader*>(userdata);
+		if (self.runtime.clamp_memory_range == nullptr) {
+			return size;
+		}
+		return self.runtime.clamp_memory_range(self.runtime.userdata, address, size);
+	}
+
+	void Finish(ResourceSnapshot& snapshot) const {
+		std::vector<uint64_t> addresses;
+		addresses.reserve(words.size());
+		for (const auto& [address, word]: words) {
+			(void)word;
+			addresses.push_back(address);
+		}
+		std::ranges::sort(addresses);
+		for (const auto address: addresses) {
+			if (!snapshot.immutable_srt_ranges.empty()) {
+				auto& last = snapshot.immutable_srt_ranges.back();
+				if (address <= last.address + last.size) {
+					last.size = std::max(last.address + last.size, address + 4u) - last.address;
+					continue;
+				}
+			}
+			snapshot.immutable_srt_ranges.push_back({address, 4u});
+		}
+	}
+};
+
+bool MaterializeBoundedReads(const ResourcePlan& program, const SrtRuntime& runtime,
+                             MaterializedSnapshot& snapshot) {
+	if (program.bounded_srt_reads.empty()) {
+		return true;
+	}
+	if (program.stage != ShaderType::Compute || program.info.writes_dma) {
+		return SpecializationFail("bounded SRT snapshots require compute without DMA writes");
+	}
+	SrtRuntime clean_runtime = runtime;
+	clean_runtime.read_memory = runtime.read_specialization_memory;
+	uint64_t snapshot_words = 0;
+	for (uint32_t id = 0; id < program.bounded_srt_reads.size(); id++) {
+		const auto& read = program.bounded_srt_reads[id];
+		const auto* address_source = Source(program, read.address_source);
+		if (address_source == nullptr ||
+		    (address_source->dword_count != 2u && address_source->dword_count != 4u)) {
+			return SpecializationFail("bounded SRT read has invalid address source width");
+		}
+		uint32_t size = 0;
+		if (read.workgroup_axis != UINT32_MAX) {
+			if (read.workgroup_axis >= 3u || read.count_source != UINT32_MAX ||
+			    !runtime.compute_workgroups.has_value()) {
+				return SpecializationFail(fmt::format(
+				    "bounded SRT read {} requires actual guest workgroup counts and a valid axis", id));
+			}
+			const auto& groups = *runtime.compute_workgroups;
+			// A zero in any axis creates no invocations, hence no coefficient reads.
+			// These are guest counts, before host wave partitioning, not local sizes.
+			if (std::ranges::all_of(groups, [](uint32_t count) { return count != 0u; })) {
+				size = groups[read.workgroup_axis];
+			}
+		} else {
+			const auto* count_source = Source(program, read.count_source);
+			if (count_source == nullptr || count_source->dword_count != 1u) {
+				return SpecializationFail("bounded SRT read has invalid count source width");
+			}
+			DescriptorValue count;
+			if (!EvaluateDescriptorSource(program, read.count_source, clean_runtime, count)) {
+				return SpecializationFail(fmt::format("bounded SRT read {} cannot snapshot its count", id));
+			}
+			const auto raw_count = count.dwords[0];
+			size = read.count_signed && static_cast<int32_t>(raw_count) <= 0 ? 0u : raw_count;
+		}
+		if (size > MaxIndirectImageProbes ||
+		    snapshot_words > MaxBoundedSnapshotWords - uint64_t{size} ||
+		    snapshot.resources.flattened_srt.size() > UINT32_MAX - uint64_t{size}) {
+			return SpecializationFail(fmt::format(
+			    "bounded SRT read {} exceeds the candidate/snapshot limit "
+			    "(count={} stride={} bias={} words={} candidate_limit={} word_limit={})",
+			    id, size, read.offset_scale, read.offset_bias, snapshot_words + uint64_t{size},
+			    MaxIndirectImageProbes, MaxBoundedSnapshotWords));
+		}
+		snapshot_words += size;
+		auto& flat = snapshot.resources.flattened_srt;
+		const auto start = static_cast<uint32_t>(flat.size());
+		snapshot.bounded_srt_reads.push_back({size, start});
+		if (size == 0u) {
+			continue; // The proved guard makes the read unreachable; do not dereference its table.
+		}
+		DescriptorValue address_words;
+		if (!EvaluateDescriptorSource(program, read.address_source, clean_runtime, address_words)) {
+			return SpecializationFail(fmt::format("bounded SRT read {} cannot snapshot its address", id));
+		}
+		const uint64_t base = (((uint64_t{address_words.dwords[1]} << 32u) |
+		                        address_words.dwords[0]) & AddressMask) & ~uint64_t{3};
+		const int64_t immediate = static_cast<int64_t>(static_cast<int32_t>(read.memory_offset));
+		for (uint32_t index = 0; index < size; index++) {
+			const uint32_t dynamic = index * read.offset_scale + read.offset_bias;
+			int64_t offset = 0;
+			if (address_source->dword_count == 4u) {
+				if (immediate < 0) {
+					return SpecializationFail(fmt::format(
+					    "bounded buffer read {} has a negative immediate offset", id));
+				}
+				const uint64_t byte_offset = static_cast<uint64_t>(immediate) + dynamic;
+				const uint64_t aligned = byte_offset & ~uint64_t{3};
+				const uint32_t stride = (address_words.dwords[1] >> 16u) & 0x3fffu;
+				const uint64_t bytes = stride == 0u
+				                           ? uint64_t{address_words.dwords[2]}
+				                           : uint64_t{stride} * address_words.dwords[2];
+				if (aligned > bytes || bytes - aligned < sizeof(uint32_t)) {
+					// Scalar buffer loads return zero outside the descriptor extent. Preserve that
+					// guest result in the candidate snapshot without touching host memory.
+					flat.push_back(0u);
+					continue;
+				}
+				offset = static_cast<int64_t>(aligned);
+			} else {
+				offset = (immediate & ~int64_t{3}) +
+				         static_cast<int64_t>(dynamic & ~uint32_t{3});
+			}
+			if ((offset < 0 && base < static_cast<uint64_t>(-offset)) ||
+			    (offset >= 0 && base > AddressMask - static_cast<uint64_t>(offset))) {
+				return SpecializationFail(fmt::format("bounded SRT read {} index {} overflows its 48-bit address", id, index));
+			}
+			const uint64_t address = offset < 0 ? base - static_cast<uint64_t>(-offset)
+			                                    : base + static_cast<uint64_t>(offset);
+			if (address > AddressMask - 3u) {
+				return SpecializationFail(fmt::format(
+				    "bounded SRT read {} index {} cannot address 0x{:x} for a 32-bit word", id, index,
+				    address));
+			}
+			// Dense workgroup / selector snapshots enumerate every proved index.
+			// Unmapped foreign rows keep table width with a zero word — same guest
+			// result as a scalar buffer load past its mapped extent.
+			if (runtime.clamp_memory_range != nullptr &&
+			    runtime.clamp_memory_range(runtime.userdata, address, sizeof(uint32_t)) == 0u) {
+				flat.push_back(0u);
+				continue;
+			}
+			uint32_t word = 0;
+			if (!ReadSpecializationWord(runtime, address, word)) {
+				return SpecializationFail(fmt::format(
+				    "bounded SRT read {} index {} cannot read coherent source at 0x{:x}", id, index,
+				    address));
+			}
+			flat.push_back(word);
+		}
+	}
+	return true;
+}
+
+bool MaterializeBoundedBufferExpressions(const ResourcePlan& program, const SrtRuntime& runtime,
+	                                      MaterializedSnapshot& snapshot) {
+	snapshot.bounded_buffer_expressions.resize(program.info.buffers.size());
+	SrtRuntime clean_runtime = runtime;
+	clean_runtime.read_memory = runtime.read_specialization_memory;
+	for (uint32_t logical = 0; logical < program.info.buffers.size(); ++logical) {
+		const auto* source = Source(program, program.info.buffers[logical].source);
+		if (source == nullptr || !source->bounded_buffer.has_value() ||
+		    !source->bounded_buffer->expression) {
+			continue;
+		}
+		const auto& bounded = *source->bounded_buffer;
+		if (source->dword_count != 4u || bounded.key_arg != 0u ||
+		    bounded.dependencies.empty()) {
+			return SpecializationFail("bounded buffer expression has invalid metadata");
+		}
+		const auto first = bounded.dependencies.front();
+		if (first >= snapshot.bounded_srt_reads.size()) {
+			return SpecializationFail("bounded buffer expression has an invalid dependency");
+		}
+		const auto count = snapshot.bounded_srt_reads[first].count;
+		for (const auto dependency: bounded.dependencies) {
+			if (dependency >= snapshot.bounded_srt_reads.size() ||
+			    snapshot.bounded_srt_reads[dependency].count != count) {
+				return SpecializationFail(
+				    "bounded buffer expression dependencies have different candidate counts");
+			}
+		}
+		auto& candidates = snapshot.bounded_buffer_expressions[logical];
+		candidates.reserve(count);
+		for (uint32_t candidate = 0; candidate < count; ++candidate) {
+			DescriptorValue descriptor;
+			if (!EvaluateBoundedDescriptorSource(
+			        program, program.info.buffers[logical].source, clean_runtime,
+			        snapshot.bounded_srt_reads, snapshot.resources.flattened_srt, candidate,
+			        descriptor)) {
+				// Expression tables enumerate every proved selector value before the
+				// shader runs. Unselected rows can resolve to foreign/unmapped loads;
+				// keep the switch width and bind the same null candidate used for
+				// unaddressable dense-table rows.
+				descriptor = {};
+				descriptor.dword_count = source->dword_count;
+			}
+			candidates.push_back(descriptor);
+		}
+	}
+	return true;
+}
+
+bool MaterializeBoundedImageExpressions(const ResourcePlan& program, const SrtRuntime& runtime,
+	                                     MaterializedSnapshot& snapshot) {
+	snapshot.bounded_image_expressions.resize(program.info.images.size());
+	SrtRuntime clean_runtime = runtime;
+	clean_runtime.read_memory = runtime.read_specialization_memory;
+	for (uint32_t logical = 0; logical < program.info.images.size(); ++logical) {
+		const auto* source = Source(program, program.info.images[logical].source);
+		if (source == nullptr || !source->bounded_image.has_value() ||
+		    !source->bounded_image->expression || source->bounded_image->wave_uniform) {
+			continue;
+		}
+		const auto& bounded = *source->bounded_image;
+		if (source->dword_count != 8u || bounded.key_arg != 0u ||
+		    bounded.dependencies.empty()) {
+			return SpecializationFail("bounded image expression has invalid metadata");
+		}
+		const auto first = bounded.dependencies.front();
+		if (first >= snapshot.bounded_srt_reads.size()) {
+			return SpecializationFail("bounded image expression has an invalid dependency");
+		}
+		const auto count = snapshot.bounded_srt_reads[first].count;
+		for (const auto dependency: bounded.dependencies) {
+			if (dependency >= snapshot.bounded_srt_reads.size() ||
+			    snapshot.bounded_srt_reads[dependency].count != count) {
+				return SpecializationFail(
+				    "bounded image expression dependencies have different candidate counts");
+			}
+		}
+		auto& candidates = snapshot.bounded_image_expressions[logical];
+		candidates.reserve(count);
+		for (uint32_t candidate = 0; candidate < count; ++candidate) {
+			DescriptorValue descriptor;
+			if (!EvaluateBoundedDescriptorSource(
+			        program, program.info.images[logical].source, clean_runtime,
+			        snapshot.bounded_srt_reads, snapshot.resources.flattened_srt, candidate,
+			        descriptor)) {
+				descriptor = {};
+				descriptor.dword_count = source->dword_count;
+			}
+			candidates.push_back(descriptor);
+		}
+	}
+	return true;
+}
+
+bool MaterializeBoundedSamplerExpressions(const ResourcePlan& program, const SrtRuntime& runtime,
+	                                       MaterializedSnapshot& snapshot) {
+	snapshot.bounded_sampler_expressions.resize(program.info.samplers.size());
+	snapshot.bounded_sampler_consumed.resize(program.info.samplers.size());
+	SrtRuntime clean_runtime = runtime;
+	clean_runtime.read_memory = runtime.read_specialization_memory;
+	for (uint32_t logical = 0; logical < program.info.samplers.size(); ++logical) {
+		const auto* source = Source(program, program.info.samplers[logical].source);
+		if (source == nullptr || !source->bounded_sampler.has_value()) continue;
+		const auto& bounded = *source->bounded_sampler;
+		if (source->dword_count != 4u || bounded.key_arg != 0u ||
+		    bounded.selector_group == UINT32_MAX || bounded.dependencies.empty()) {
+			return SpecializationFail("bounded sampler expression has invalid metadata");
+		}
+		const auto first = bounded.dependencies.front();
+		if (first >= snapshot.bounded_srt_reads.size()) {
+			return SpecializationFail("bounded sampler expression has an invalid dependency");
+		}
+		const auto count = snapshot.bounded_srt_reads[first].count;
+		for (const auto dependency: bounded.dependencies) {
+			if (dependency >= snapshot.bounded_srt_reads.size() ||
+			    snapshot.bounded_srt_reads[dependency].count != count) {
+				return SpecializationFail(
+				    "bounded sampler expression dependencies have different candidate counts");
+			}
+		}
+		auto& candidates = snapshot.bounded_sampler_expressions[logical];
+		candidates.reserve(count);
+		for (uint32_t candidate = 0; candidate < count; ++candidate) {
+			DescriptorValue descriptor;
+			if (!EvaluateBoundedDescriptorSource(
+			        program, program.info.samplers[logical].source, clean_runtime,
+			        snapshot.bounded_srt_reads, snapshot.resources.flattened_srt, candidate,
+			        descriptor)) {
+				descriptor = {};
+				descriptor.dword_count = source->dword_count;
+			}
+			candidates.push_back(descriptor);
+		}
+		if (!candidates.empty()) snapshot.resources.samplers[logical] = candidates.front();
+	}
+	return true;
+}
+
+bool MaterializeBoundedImages(const ResourcePlan& program, MaterializedSnapshot& snapshot) {
+	for (uint32_t logical = 0; logical < program.info.images.size(); ++logical) {
+		const auto* source = Source(program, program.info.images[logical].source);
+		if (source == nullptr || !source->bounded_image.has_value()) {
+			continue;
+		}
+		const auto& bounded = *source->bounded_image;
+		if (source->dword_count != 8u || bounded.key_arg >= source->dword_count ||
+		    (bounded.wave_uniform
+		         ? bounded.wave_candidates.empty()
+		         : bounded.selector_group == UINT32_MAX || program.bounded_srt_reads.empty())) {
+			return SpecializationFail("bounded image has invalid source metadata");
+		}
+		uint32_t count = 0;
+		if (bounded.wave_uniform) {
+			count = static_cast<uint32_t>(bounded.wave_candidates.size());
+		} else if (bounded.expression) {
+			if (logical >= snapshot.bounded_image_expressions.size()) {
+				return SpecializationFail("bounded image expression candidates are missing");
+			}
+			count = static_cast<uint32_t>(snapshot.bounded_image_expressions[logical].size());
+		} else {
+			const auto first_read = bounded.reads[0];
+			if (first_read >= snapshot.bounded_srt_reads.size()) {
+				return SpecializationFail("bounded image has an invalid read column");
+			}
+			const auto& first = program.bounded_srt_reads[first_read];
+			count = snapshot.bounded_srt_reads[first_read].count;
+			for (uint32_t word = 0; word < bounded.reads.size(); ++word) {
+				const auto read_id = bounded.reads[word];
+				const auto expected_offset = uint64_t {first.memory_offset} +
+				                             uint64_t {word} * sizeof(uint32_t);
+				if (read_id >= snapshot.bounded_srt_reads.size() ||
+				    snapshot.bounded_srt_reads[read_id].count != count ||
+				    program.bounded_srt_reads[read_id].count_source != first.count_source ||
+				    program.bounded_srt_reads[read_id].address_source != first.address_source ||
+				    program.bounded_srt_reads[read_id].count_signed != first.count_signed ||
+				    program.bounded_srt_reads[read_id].workgroup_axis != UINT32_MAX ||
+				    program.bounded_srt_reads[read_id].offset_scale != first.offset_scale ||
+				    program.bounded_srt_reads[read_id].offset_bias != first.offset_bias ||
+				    program.bounded_srt_reads[read_id].memory_offset != expected_offset) {
+					return SpecializationFail(
+					    "bounded image columns do not form a correlated eight-word descriptor");
+				}
+			}
+		}
+
+		uint32_t bounded_sampler = UINT32_MAX;
+		for (const auto& pair: program.info.sampled_pairs) {
+			if (pair.image != logical || pair.sampler >= program.info.samplers.size()) continue;
+			const auto* sampler_source = Source(program, program.info.samplers[pair.sampler].source);
+			if (sampler_source == nullptr || !sampler_source->bounded_sampler.has_value()) continue;
+			const auto& sampler = *sampler_source->bounded_sampler;
+			if (bounded.wave_uniform) {
+				return SpecializationFail(
+				    "wave-uniform image cannot share an indexed bounded sampler");
+			}
+			if (sampler.selector_group != bounded.selector_group) {
+				return SpecializationFail(fmt::format(
+				    "bounded image {} and sampler {} use different selectors", logical, pair.sampler));
+			}
+			if (bounded_sampler != UINT32_MAX && bounded_sampler != pair.sampler) {
+				return SpecializationFail(
+				    "one bounded image is paired with multiple bounded sampler tables");
+			}
+			bounded_sampler = pair.sampler;
+		}
+
+		IndirectImage table;
+		table.resource = logical;
+		table.probe_count = count;
+		if (bounded_sampler != UINT32_MAX) {
+			if (bounded_sampler >= snapshot.bounded_sampler_expressions.size() ||
+			    snapshot.bounded_sampler_expressions[bounded_sampler].size() != count) {
+				return SpecializationFail(
+				    "bounded image and sampler tables have different candidate counts");
+			}
+			table.sampler_resource = bounded_sampler;
+			snapshot.bounded_sampler_consumed[bounded_sampler] = 1u;
+		}
+		table.keys.reserve(count);
+		table.candidates.reserve(count);
+		table.descriptors.reserve(std::min<size_t>(count, ShaderInfo::MaxImages));
+		for (uint32_t index = 0; index < count; ++index) {
+			DescriptorValue descriptor;
+			if (bounded.wave_uniform) {
+				descriptor.dword_count = 8u;
+				for (uint32_t word = 0; word < descriptor.dword_count; ++word) {
+					const auto& candidate = bounded.wave_candidates[index][word];
+					if (candidate.immediate) {
+						descriptor.dwords[word] = candidate.value;
+						continue;
+					}
+					if (candidate.value >= program.srt_reads.size()) {
+						return SpecializationFail(
+						    "wave-uniform image candidate has an invalid flat SRT slot");
+					}
+					const auto flat = program.srt_reads[candidate.value].flat_offset;
+					if (flat >= snapshot.resources.flattened_srt.size()) {
+						return SpecializationFail(
+						    "wave-uniform image candidate exceeds its flat SRT snapshot");
+					}
+					descriptor.dwords[word] = snapshot.resources.flattened_srt[flat];
+				}
+			} else if (bounded.expression) {
+				descriptor = snapshot.bounded_image_expressions[logical][index];
+			} else {
+				descriptor.dword_count = 8u;
+				for (uint32_t word = 0; word < bounded.reads.size(); ++word) {
+					const auto& layout = snapshot.bounded_srt_reads[bounded.reads[word]];
+					const auto flat_index = uint64_t {layout.flat_offset} + index;
+					if (flat_index >= snapshot.resources.flattened_srt.size()) {
+						return SpecializationFail("bounded image column exceeds its captured snapshot");
+					}
+					descriptor.dwords[word] =
+					    snapshot.resources.flattened_srt[static_cast<size_t>(flat_index)];
+				}
+			}
+			const auto key = descriptor.dwords[bounded.key_arg];
+			if (NullImageDescriptor(descriptor) ||
+			    !ValidImageDescriptor(descriptor, program.info.images[logical].r128)) {
+				descriptor.dwords.fill(0u);
+			}
+			const DescriptorValue* sampler = bounded_sampler == UINT32_MAX
+			                                     ? nullptr
+			                                     : &snapshot.bounded_sampler_expressions[bounded_sampler][index];
+			uint32_t candidate = 0;
+			while (candidate < table.descriptors.size() &&
+			       (table.descriptors[candidate] != descriptor ||
+			        (sampler != nullptr && table.samplers[candidate] != *sampler))) {
+				++candidate;
+			}
+			if (candidate == table.descriptors.size()) {
+				if (table.descriptors.size() >= ShaderInfo::MaxImages) {
+					return SpecializationFail("bounded image table exceeds the dense image limit");
+				}
+				table.descriptors.push_back(descriptor);
+				if (sampler != nullptr) table.samplers.push_back(*sampler);
+				candidate = static_cast<uint32_t>(table.descriptors.size() - 1u);
+			}
+			if (bounded.wave_uniform) {
+				const auto existing_key = std::ranges::find(table.keys, key);
+				if (existing_key != table.keys.end()) {
+					const auto mapping = static_cast<size_t>(existing_key - table.keys.begin());
+					if (mapping >= table.candidates.size() ||
+					    table.candidates[mapping] != candidate) {
+						return SpecializationFail(
+						    "wave-uniform image candidates have an ambiguous key DWORD");
+					}
+					continue;
+				}
+			}
+			table.keys.push_back(bounded.wave_uniform ? key : index);
+			table.candidates.push_back(candidate);
+		}
+		if (table.descriptors.empty()) {
+			DescriptorValue null_descriptor;
+			null_descriptor.dword_count = 8u;
+			snapshot.resources.images[logical] = null_descriptor;
+			continue;
+		}
+		snapshot.resources.images[logical] = table.descriptors[0];
+		if (table.descriptors.size() > 1u) {
+			snapshot.indirect_images.push_back(std::move(table));
+		}
+	}
+	for (uint32_t sampler = 0; sampler < program.info.samplers.size(); ++sampler) {
+		const auto* source = Source(program, program.info.samplers[sampler].source);
+		if (source != nullptr && source->bounded_sampler.has_value() &&
+		    (sampler >= snapshot.bounded_sampler_consumed.size() ||
+		     snapshot.bounded_sampler_consumed[sampler] == 0u)) {
+			return SpecializationFail(fmt::format(
+			    "bounded sampler {} has no correlated bounded image", sampler));
+		}
+	}
+	return true;
+}
+
+bool ExpandBufferTables(const ResourcePlan& program, const MaterializedSnapshot& materialized,
+                        const SrtRuntime& runtime, ResourceSnapshot& snapshot,
+                        ResourceSpecialization& specialization) {
+	std::vector<DescriptorValue> buffers;
+	specialization.bounded_srt_reads = materialized.bounded_srt_reads;
+	if (!program.bounded_srt_reads.empty() ||
+	    std::ranges::any_of(program.info.buffers, [&](const BufferResource& buffer) {
+		    const auto* source = Source(program, buffer.source);
+		    return source != nullptr && (source->bounded_buffer.has_value() ||
+		                                 source->inline_descriptor.has_value());
+	    })) {
+		specialization.buffer_tables.resize(program.info.buffers.size());
+	}
+	for (uint32_t logical = 0; logical < program.info.buffers.size(); logical++) {
+		const auto* source = Source(program, program.info.buffers[logical].source);
+		const bool inline_table = source != nullptr && source->inline_descriptor.has_value();
+		if (source == nullptr ||
+		    (!source->bounded_buffer.has_value() && !inline_table)) {
+			buffers.push_back(snapshot.buffers[logical]);
+			specialization.buffer_origins.push_back(logical);
+			continue;
+		}
+		uint32_t count = 0;
+		uint32_t diagnostic_stride = 0;
+		if (inline_table) {
+			const auto& inline_descriptor = *source->inline_descriptor;
+			if (source->dword_count != 4u || inline_descriptor.key_arg != 0u ||
+			    logical >= materialized.inline_buffers.size()) {
+				return SpecializationFail("inline buffer has invalid source metadata");
+			}
+			count = static_cast<uint32_t>(materialized.inline_buffers[logical].size());
+			diagnostic_stride = inline_descriptor.selector_stride;
+		} else if (source->bounded_buffer->wave_uniform) {
+			const auto& bounded = *source->bounded_buffer;
+			if (source->dword_count != 4u || bounded.key_arg != 0u ||
+			    bounded.wave_candidates.empty() || bounded.expression) {
+				return SpecializationFail("wave-uniform buffer has invalid source metadata");
+			}
+			count = static_cast<uint32_t>(bounded.wave_candidates.size());
+		} else if (source->bounded_buffer->expression) {
+			const auto& bounded = *source->bounded_buffer;
+			if (source->dword_count != 4u || bounded.key_arg != 0u ||
+			    program.bounded_srt_reads.empty()) {
+				return SpecializationFail("bounded buffer has invalid source metadata");
+			}
+			if (logical >= materialized.bounded_buffer_expressions.size()) {
+				return SpecializationFail("bounded buffer expression candidates are missing");
+			}
+			count = static_cast<uint32_t>(materialized.bounded_buffer_expressions[logical].size());
+		} else {
+			const auto& bounded = *source->bounded_buffer;
+			if (source->dword_count != 4u || bounded.key_arg != 0u ||
+			    program.bounded_srt_reads.empty()) {
+				return SpecializationFail("bounded buffer has invalid source metadata");
+			}
+			const auto first_read = bounded.reads[0];
+			if (first_read >= specialization.bounded_srt_reads.size()) {
+				return SpecializationFail("bounded buffer has an invalid read column");
+			}
+			const auto& first = program.bounded_srt_reads[first_read];
+			count = specialization.bounded_srt_reads[first_read].count;
+			diagnostic_stride = first.offset_scale;
+			for (uint32_t word = 0; word < bounded.reads.size(); word++) {
+				const auto read_id = bounded.reads[word];
+				if (read_id >= specialization.bounded_srt_reads.size() ||
+				    specialization.bounded_srt_reads[read_id].count != count ||
+				    program.bounded_srt_reads[read_id].count_source != first.count_source ||
+				    program.bounded_srt_reads[read_id].address_source != first.address_source ||
+				    program.bounded_srt_reads[read_id].count_signed != first.count_signed ||
+				    program.bounded_srt_reads[read_id].offset_scale != first.offset_scale ||
+				    program.bounded_srt_reads[read_id].offset_bias != first.offset_bias ||
+				    program.bounded_srt_reads[read_id].memory_offset !=
+				        uint64_t{first.memory_offset} + word * sizeof(uint32_t)) {
+					return SpecializationFail(
+					    "bounded buffer columns do not form a correlated four-word descriptor");
+				}
+			}
+		}
+		auto& table = specialization.buffer_tables[logical];
+		table.count = count;
+		if (snapshot.flattened_srt.size() > UINT32_MAX - uint64_t{count}) {
+			return SpecializationFail("bounded buffer mapping exceeds the flat address limit");
+		}
+		table.mapping_flat_offset = static_cast<uint32_t>(snapshot.flattened_srt.size());
+		for (uint32_t index = 0; index < count; index++) {
+			DescriptorValue descriptor;
+			if (inline_table) {
+				descriptor = materialized.inline_buffers[logical][index];
+			} else if (source->bounded_buffer->wave_uniform) {
+				descriptor.dword_count = 4u;
+				const auto& bounded = *source->bounded_buffer;
+				for (uint32_t word = 0; word < descriptor.dword_count; ++word) {
+					const auto& candidate = bounded.wave_candidates[index][word];
+					if (candidate.immediate) {
+						descriptor.dwords[word] = candidate.value;
+						continue;
+					}
+					if (candidate.value >= program.srt_reads.size()) {
+						return SpecializationFail(
+						    "wave-uniform buffer candidate has an invalid flat SRT slot");
+					}
+					const auto flat = program.srt_reads[candidate.value].flat_offset;
+					if (flat >= snapshot.flattened_srt.size()) {
+						return SpecializationFail(
+						    "wave-uniform buffer candidate exceeds its flat SRT snapshot");
+					}
+					descriptor.dwords[word] = snapshot.flattened_srt[flat];
+				}
+			} else if (source->bounded_buffer->expression) {
+				descriptor = materialized.bounded_buffer_expressions[logical][index];
+			} else {
+				const auto& bounded = *source->bounded_buffer;
+				descriptor.dword_count = 4u;
+				for (uint32_t word = 0; word < 4u; word++) {
+					const auto& layout = specialization.bounded_srt_reads[bounded.reads[word]];
+					descriptor.dwords[word] = snapshot.flattened_srt[layout.flat_offset + index];
+				}
+			}
+			if (!CanonicalizeEnumeratedBufferDescriptor(descriptor, runtime)) {
+				return SpecializationFail("enumerated buffer candidate has invalid descriptor width");
+			}
+			auto candidate = std::ranges::find_if(table.resources, [&](uint32_t resource) {
+				return buffers[resource] == descriptor;
+			});
+			uint32_t resource = 0;
+			if (candidate == table.resources.end()) {
+				if (buffers.size() >= ShaderInfo::MaxBuffers) {
+					return SpecializationFail(fmt::format(
+					    "bounded buffer {} exceeds the dense buffer limit (count={} stride={} candidates={} buffers={} limit={})",
+					    logical, count, diagnostic_stride, table.resources.size() + 1u,
+					    buffers.size() + 1u, ShaderInfo::MaxBuffers));
+				}
+				resource = static_cast<uint32_t>(buffers.size());
+				buffers.push_back(descriptor);
+				specialization.buffer_origins.push_back(logical);
+				table.resources.push_back(resource);
+			} else {
+				resource = *candidate;
+			}
+			snapshot.flattened_srt.push_back(resource);
+		}
+	}
+	if (buffers.size() > ShaderInfo::MaxBuffers) {
+		return SpecializationFail("specialized buffers exceed the dense buffer limit");
+	}
+	snapshot.buffers = std::move(buffers);
+	return true;
+}
+
+bool ValidateSnapshotBufferWrites(const ResourcePlan& program, const SrtRuntime& runtime,
+                                  const ResourceSnapshot& snapshot,
+                                  const ResourceSpecialization& specialization) {
+	if (snapshot.immutable_srt_ranges.empty()) {
+		return true;
+	}
+	if (program.bounded_srt_reads_precede_writes) {
+		return true;
+	}
+	for (uint32_t resource = 0; resource < snapshot.buffers.size(); resource++) {
+		const auto& metadata = program.info.buffers[specialization.buffer_origins[resource]];
+		if ((!metadata.written && !metadata.atomic) || metadata.image_alias != BufferResource::NoImageAlias) {
+			continue; // Renderer also checks actual padded image allocations before any binding mutation.
+		}
+		ShaderBufferResource descriptor;
+		if (!DecodeBufferDescriptor(snapshot.buffers[resource], descriptor)) {
+			return SpecializationFail("bounded SRT buffer writer has invalid descriptor width");
+		}
+		const auto address = descriptor.Base48();
+		const auto size = ScalarBufferSize(descriptor);
+		if (descriptor.Type() != 0u || address == 0u || size == 0u) {
+			continue;
+		}
+		if (address >= RegisteredBufferAddressLimit) {
+			return SpecializationFail(fmt::format(
+			    "bounded SRT buffer writer {} base 0x{:x} exceeds the registered 40-bit address range "
+			    "(origin={} first_use_pc=0x{:08x} size={} descriptor={:08x}:{:08x}:{:08x}:{:08x})",
+			    resource, address, specialization.buffer_origins[resource], metadata.first_use_pc, size,
+			    descriptor.fields[0], descriptor.fields[1], descriptor.fields[2], descriptor.fields[3]));
+		}
+		// Buffer descriptors may conservatively declare more records than the mapped VMA.
+		// Match NativeStorageBuffer's exact contiguous mapped prefix when the renderer supplied
+		// its address-space query. Offline callers retain the conservative 40-bit fallback.
+		const auto requested_writable_size =
+		    metadata.LimitDescriptorSize(descriptor.Stride(), size);
+		uint64_t writable_size =
+		    std::min(requested_writable_size, RegisteredBufferAddressLimit - address);
+		if (runtime.clamp_memory_range != nullptr) {
+			const auto mapped = runtime.clamp_memory_range(runtime.userdata, address,
+			                                                    requested_writable_size);
+			if (mapped > requested_writable_size) {
+				return SpecializationFail("buffer range clamp exceeded the requested descriptor size");
+			}
+			writable_size = mapped;
+		}
+		const auto write_end = address + writable_size;
+		for (const auto& read: snapshot.immutable_srt_ranges) {
+			if (address < read.address + read.size && read.address < write_end) {
+				return SpecializationFail(fmt::format(
+				    "immutable SRT snapshot overlaps writable buffer {} "
+				    "(source=0x{:x}+{} writer=0x{:x}+{} mapped={} origin={} first_use_pc=0x{:08x} "
+				    "max_byte_extent={} stride={} records={} formatted={} descriptor_formatted_only={} "
+				    "scalar={} atomic={} descriptor={:08x}:{:08x}:{:08x}:{:08x})",
+				    resource, read.address, read.size, address, size, writable_size,
+				    specialization.buffer_origins[resource], metadata.first_use_pc,
+				    metadata.max_byte_extent, descriptor.Stride(), descriptor.NumRecords(),
+				    metadata.formatted, metadata.descriptor_formatted_only, metadata.scalar,
+				    metadata.atomic, descriptor.fields[0], descriptor.fields[1],
+				    descriptor.fields[2], descriptor.fields[3]));
+			}
+		}
 	}
 	return true;
 }
 
 } // namespace
+
+static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& input_runtime,
+                                MaterializedSnapshot& snapshot) {
+	if (!program.resource_tracking_complete) {
+		return SpecializationFail("resource plan is incomplete");
+	}
+	const bool protected_image = std::ranges::any_of(program.info.images, [&](const auto& image) {
+		const auto* source = Source(program, image.source);
+		return source != nullptr && source->indirect_image.has_value() &&
+		       (!source->indirect_image->selector_mask.IsEmpty() ||
+		        source->indirect_image->record_key);
+	});
+	if (protected_image && (program.has_address_writes ||
+	                        std::ranges::any_of(program.info.images, &ImageResource::written))) {
+		return SpecializationFail(
+		    "protected indirect image conflicts with address or image writes");
+	}
+	const bool capture_reads =
+	    protected_image && std::ranges::any_of(program.info.buffers, &BufferResource::written);
+
+	SnapshotReader reader {input_runtime};
+	auto&        reads = program.specialization_reads;
+	ReadCapture  capture {input_runtime, reads};
+	SrtRuntime   runtime = input_runtime;
+	if (capture_reads) {
+		reads.clear();
+		runtime.userdata                   = &capture;
+		runtime.read_specialization_memory = CaptureStrictRead;
+		if (runtime.read_memory != nullptr) {
+			runtime.read_memory = CaptureOrdinaryRead;
+		}
+	} else if (!program.bounded_srt_reads.empty()) {
+		runtime.userdata = &reader;
+		runtime.read_memory = SnapshotReader::Ordinary;
+		runtime.read_specialization_memory = SnapshotReader::Clean;
+		if (input_runtime.clamp_memory_range != nullptr) {
+			runtime.clamp_memory_range = SnapshotReader::Clamp;
+		}
+	}
+	if ((program.requires_specialization_memory || !program.bounded_srt_reads.empty() ||
+	     capture_reads) &&
+	    input_runtime.read_specialization_memory == nullptr) {
+		return SpecializationFail("coherent specialization memory reader is unavailable");
+	}
+	const auto clean_runtime = CleanRuntime(runtime);
+	SrtWalker clean(program, clean_runtime);
+	SrtWalker walker(program, runtime, program.clean_flat_slots, &clean);
+	std::vector<DescriptorValue> values;
+	values.reserve(program.materialization_sources.size());
+	for (const auto source : program.materialization_sources) {
+		DescriptorValue value;
+		if (!walker.EvaluateDescriptor(source, value)) {
+			const auto* desc = Source(program, source);
+			const auto& detail = walker.LastFlatError();
+			return SpecializationFail(fmt::format(
+			    "runtime descriptor evaluation failed (source={} dwords={} "
+			    "inline={} bounded_buffer={} bounded_image={} indirect={}{})",
+			    source, desc != nullptr ? desc->dword_count : 0u,
+			    desc != nullptr && desc->inline_descriptor.has_value(),
+			    desc != nullptr && desc->bounded_buffer.has_value(),
+			    desc != nullptr && desc->bounded_image.has_value(),
+			    desc != nullptr && desc->indirect_image.has_value(),
+			    detail.empty() ? "" : fmt::format(" detail={}", detail)));
+		}
+		values.push_back(value);
+	}
+	std::vector<uint32_t> flattened_srt;
+	if (!walker.RefreshFlatBuffer(flattened_srt)) {
+		const auto& detail = walker.LastFlatError();
+		return SpecializationFail(detail.empty() ? "runtime SRT evaluation failed"
+		                                         : fmt::format("runtime SRT evaluation failed: {}",
+		                                                       detail));
+	}
+	auto& next = snapshot.resources;
+	const auto& fill = program.uniform_fill;
+	std::array<uint32_t, 4> stored {};
+	bool uniform_fill = fill.fill.words != 0;
+	for (uint32_t i = 0; i < fill.fill.words && uniform_fill; ++i)
+		uniform_fill = clean.Evaluate(fill.values[i], stored[i]) && stored[i] == stored[0];
+	if (uniform_fill) {
+		next.uniform_fill = fill.fill;
+		next.uniform_fill.value = stored[0];
+	}
+	auto  cursor = values.begin();
+	next.buffers.resize(program.info.buffers.size());
+	snapshot.inline_buffers.resize(program.info.buffers.size());
+	for (uint32_t index = 0; index < program.info.buffers.size(); index++) {
+		const auto* source = Source(program, program.info.buffers[index].source);
+		if (source != nullptr && source->inline_descriptor.has_value()) {
+			const std::array requests {source->inline_descriptor->buffer_source};
+			SrtRuntime clean_runtime = runtime;
+			clean_runtime.read_memory = runtime.read_specialization_memory;
+			std::vector<DescriptorValue> table_source;
+			if (!EvaluateDescriptorSources(program, requests, clean_runtime, table_source) ||
+			    table_source.size() != 1u ||
+			    !MaterializeInlineBuffer(*source->inline_descriptor, table_source[0],
+			                             program.info.buffers[index].first_use_pc, runtime,
+			                             snapshot.inline_buffers[index])) {
+				return SpecializationFail("inline buffer table materialization failed");
+			}
+		} else if (source == nullptr || !source->bounded_buffer.has_value()) {
+			if (cursor == values.end()) {
+				return SpecializationFail("buffer materialization source list is incomplete");
+			}
+			next.buffers[index] = *cursor++;
+		}
+	}
+	if (capture_reads) {
+		for (uint32_t i = 0; i < program.info.buffers.size(); ++i) {
+			const auto& buffer = program.info.buffers[i];
+			if (!buffer.written) {
+				continue;
+			}
+			DescriptorValue strict;
+			if (!clean.EvaluateDescriptor(buffer.source, strict) ||
+			    strict != next.buffers[i]) {
+				return SpecializationFail(
+				    "written buffer descriptor changed under protected image capture");
+			}
+		}
+	}
+	next.flattened_srt = std::move(flattened_srt);
+	next.images.resize(program.info.images.size());
+	for (uint32_t image_index = 0; image_index < program.info.images.size(); image_index++) {
+		const auto& image  = program.info.images[image_index];
+		const auto* source = Source(program, image.source);
+		if (source != nullptr && source->inline_descriptor.has_value()) {
+			const SampledResourcePair* pair = nullptr;
+			const DescriptorSource* sampler = nullptr;
+			for (const auto& candidate: program.info.sampled_pairs) {
+				if (candidate.image != image_index) {
+					continue;
+				}
+				if (candidate.sampler >= program.info.samplers.size()) {
+					return SpecializationFail("inline image references a missing sampler");
+				}
+				const auto* candidate_sampler = Source(program, program.info.samplers[candidate.sampler].source);
+				if (candidate_sampler == nullptr || candidate_sampler->dword_count != 4u) {
+					return SpecializationFail("inline image has an invalid sampler source");
+				}
+				if (pair != nullptr && pair->sampler != candidate.sampler) {
+					if (sampler->inline_descriptor.has_value() &&
+					    candidate_sampler->inline_descriptor.has_value()) {
+						return SpecializationFail(fmt::format(
+						    "inline image at pc 0x{:08x} mixes dynamic sampler sources", image.first_use_pc));
+					}
+					// Only the dynamic sampler follows the image's live inline key.
+					// Ordinary sampler uses keep their own fixed resource binding.
+					if (sampler->inline_descriptor.has_value()) continue;
+				}
+				pair = &candidate;
+				sampler = candidate_sampler;
+			}
+			const bool expects_r128 = !source->inline_descriptor->image_table.has_value() &&
+			                          source->inline_descriptor->descriptor_dwords == 4u;
+			if (image.r128 != expects_r128 ||
+			    image.resource_class != ImageResourceClass::Sampled ||
+			    pair == nullptr || pair->sampler >= program.info.samplers.size()) {
+				return SpecializationFail(fmt::format(
+				    "inline image at pc 0x{:08x} has an invalid sampled descriptor width", image.first_use_pc));
+			}
+			const auto* inline_sampler = sampler->inline_descriptor.has_value()
+			                                 ? &*sampler->inline_descriptor : nullptr;
+			std::vector<uint32_t> requests {source->inline_descriptor->buffer_source};
+			if (source->inline_descriptor->image_table.has_value()) {
+				requests.push_back(source->inline_descriptor->image_table->address_source);
+			}
+			SrtRuntime clean_runtime = runtime;
+			clean_runtime.read_memory = runtime.read_specialization_memory;
+			std::vector<DescriptorValue> tables;
+			if (!EvaluateDescriptorSources(program, requests, clean_runtime, tables)) {
+				return SpecializationFail(fmt::format(
+				    "inline sampled pair at pc 0x{:08x}: buffer or table address descriptor is unavailable or GPU-dirty",
+				    image.first_use_pc));
+			}
+			IndirectImage table;
+			if (!MaterializeInlineImage(*source->inline_descriptor, inline_sampler,
+			                            tables[0], tables.size() > 1u ? &tables[1] : nullptr,
+			                            image.first_use_pc, runtime, table)) {
+				return false;
+			}
+			next.images[image_index] = table.descriptors[0];
+			if (table.descriptors.size() > 1u) {
+				table.resource = image_index;
+				table.sampler_resource = inline_sampler != nullptr ? pair->sampler : UINT32_MAX;
+				snapshot.indirect_images.push_back(std::move(table));
+			}
+		} else if (source != nullptr && source->indirect_image.has_value()) {
+			const auto& indirect = *source->indirect_image;
+			DescriptorValue material, heap;
+			if ((indirect.material_source != UINT32_MAX &&
+			     !clean.EvaluateDescriptor(indirect.material_source, material)) ||
+			    !clean.EvaluateDescriptor(indirect.table_source, heap)) {
+				return SpecializationFail("indirect image table source evaluation failed");
+			}
+			IndirectImage table;
+			if (!MaterializeIndirectImage(program, indirect, material, heap, image.r128,
+			                              clean_runtime, clean, table)) {
+				return SpecializationFail("indirect image table materialization failed");
+			}
+			next.images[image_index] = table.descriptors[table.candidates[0]];
+			if (table.descriptors.size() > 1u) {
+				table.resource = image_index;
+				snapshot.indirect_images.push_back(std::move(table));
+			}
+		} else if (source == nullptr || !source->bounded_image.has_value()) {
+			if (cursor == values.end()) {
+				return SpecializationFail("image materialization source list is incomplete");
+			}
+			auto descriptor = *cursor++;
+			if (!ValidImageDescriptor(descriptor, image.r128)) {
+				descriptor.dwords.fill(0);
+			}
+			next.images[image_index] = descriptor;
+		}
+	}
+	next.samplers.resize(program.info.samplers.size());
+	for (uint32_t index = 0; index < program.info.samplers.size(); index++) {
+		const auto* source = Source(program, program.info.samplers[index].source);
+		if (source != nullptr && (source->inline_descriptor.has_value() ||
+		                          source->bounded_sampler.has_value())) {
+			next.samplers[index].dword_count = 4u;
+		} else {
+			if (cursor == values.end()) {
+				return SpecializationFail("sampler materialization source list is incomplete");
+			}
+			next.samplers[index] = *cursor++;
+		}
+	}
+	for (const auto& pair: program.info.sampled_pairs) {
+		if (pair.image >= program.info.images.size() || pair.sampler >= program.info.samplers.size()) {
+			return SpecializationFail("sampled pair references a missing resource");
+		}
+		const auto* sampler = Source(program, program.info.samplers[pair.sampler].source);
+		const auto* image = Source(program, program.info.images[pair.image].source);
+		if (sampler != nullptr && sampler->inline_descriptor.has_value() &&
+		    (image == nullptr || !image->inline_descriptor.has_value())) {
+			return SpecializationFail(fmt::format(
+			    "inline sampler at pc 0x{:08x} requires a matching inline image", pair.first_use_pc));
+		}
+	}
+	if (cursor != values.end()) {
+		return SpecializationFail(fmt::format(
+		    "runtime descriptor source count does not match resources (unused={})",
+		    std::distance(cursor, values.end())));
+	}
+	if (!MaterializeBoundedReads(program, runtime, snapshot)) {
+		return SpecializationFail("bounded SRT materialization failed");
+	}
+	if (!MaterializeBoundedBufferExpressions(program, runtime, snapshot)) {
+		return SpecializationFail("bounded buffer expression materialization failed");
+	}
+	if (!MaterializeBoundedImageExpressions(program, runtime, snapshot)) {
+		return SpecializationFail("bounded image expression materialization failed");
+	}
+	if (!MaterializeBoundedSamplerExpressions(program, runtime, snapshot)) {
+		return SpecializationFail("bounded sampler expression materialization failed");
+	}
+	if (!MaterializeBoundedImages(program, snapshot)) {
+		return SpecializationFail("bounded image materialization failed");
+	}
+	if (!program.bounded_srt_reads.empty()) {
+		reader.Finish(next);
+	}
+	if (capture_reads && !WrittenBuffersDisjoint(program, next, reads)) {
+		return SpecializationFail(
+		    "written buffer aliases protected image specialization reads");
+	}
+	next.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
+	return true;
+}
 
 struct SamplerPlan {
 	std::array<uint32_t, ShaderInfo::MaxSamplers> point_sampler {};
@@ -417,12 +1773,113 @@ private:
 template <typename Images>
 bool BuildSamplerPlan(const ShaderInfo& base, const Images& images, SamplerPlan& plan);
 
-static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSnapshot& snapshot,
+static bool BuildResourceSpecialization(const ResourcePlan& program, MaterializedSnapshot snapshot,
+                                        const SrtRuntime& runtime,
+                                        ResourceSnapshot&       specialized_snapshot,
                                         ResourceSpecialization& specialization) {
-	specialization.buffers.clear();
-	specialization.buffers.reserve(program.info.buffers.size());
-	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
-		auto&                descriptor_value = snapshot.buffers[i];
+	auto                   next_snapshot = std::move(snapshot.resources);
+	ResourceSpecialization next_specialization;
+	if (!ExpandBufferTables(program, snapshot, runtime, next_snapshot, next_specialization)) {
+		return false;
+	}
+	next_specialization.buffers.reserve(next_snapshot.buffers.size());
+	next_specialization.sampler_origins.resize(program.info.samplers.size());
+	std::iota(next_specialization.sampler_origins.begin(),
+	          next_specialization.sampler_origins.end(), 0u);
+	size_t image_count   = program.info.images.size();
+	size_t mapping_words = 0;
+	for (const auto& table: snapshot.indirect_images) {
+		if (table.resource >= program.info.images.size() || table.descriptors.size() < 2u ||
+		    image_count + table.descriptors.size() - 1u > ShaderInfo::MaxImages) {
+			if (table.selector_stride != 0u) {
+				return SpecializationFail(fmt::format(
+				    "inline sampled pairs exceed the dense image resource limit (size={} stride={} probes={} pairs={} images={})",
+				    table.buffer_size, table.selector_stride, table.probe_count,
+				    table.descriptors.size(), image_count + table.descriptors.size() - 1u));
+			}
+			return SpecializationFail(
+			    "indirect image candidates exceed the dense image resource limit");
+		}
+		image_count += table.descriptors.size() - 1u;
+		mapping_words += 1u + table.keys.size() * 2u;
+	}
+	next_snapshot.images.reserve(image_count);
+	next_snapshot.flattened_srt.reserve(next_snapshot.flattened_srt.size() + mapping_words);
+	next_specialization.images.reserve(image_count);
+	for (const auto& image: program.info.images) {
+		next_specialization.images.push_back({
+		    .numeric_class              = image.numeric_class,
+		    .dimension                  = image.dimension,
+		    .mip_count                  = image.mip_count,
+		    .conversion_format          = image.conversion_format,
+		    .shader_swizzle             = image.shader_swizzle,
+		    .indirect_root              = image.indirect_root,
+		    .indirect_mapping_offset    = image.indirect_mapping_offset,
+		    .indirect_search_iterations = image.indirect_search_iterations,
+		    .indirect_sampler           = image.indirect_sampler,
+		    .cube                       = image.cube,
+		    .needs_manual_depth_compare = false,
+		});
+	}
+	for (const auto& table: snapshot.indirect_images) {
+		const auto root_image = next_specialization.images[table.resource];
+		std::vector<uint32_t> candidate_samplers(table.descriptors.size(), UINT32_MAX);
+		if (table.sampler_resource != UINT32_MAX) {
+			if (table.sampler_resource >= program.info.samplers.size() ||
+			    table.samplers.size() != table.descriptors.size()) {
+				return SpecializationFail("inline sampled pair has an invalid sampler table");
+			}
+			for (uint32_t candidate = 0; candidate < table.samplers.size(); candidate++) {
+				uint32_t sampler = 0;
+				while (sampler < next_specialization.sampler_origins.size() &&
+				       (next_specialization.sampler_origins[sampler] != table.sampler_resource ||
+				        next_snapshot.samplers[sampler] != table.samplers[candidate])) {
+					sampler++;
+				}
+				if (sampler == next_specialization.sampler_origins.size()) {
+					if (sampler >= ShaderInfo::MaxSamplers) {
+						return SpecializationFail(fmt::format(
+						    "inline sampled pair at pc 0x{:08x} exceeds the sampler limit (size={} stride={} probes={} pairs={} samplers={})",
+						    program.info.images[table.resource].first_use_pc,
+						    table.buffer_size, table.selector_stride, table.probe_count,
+						    table.descriptors.size(), sampler + 1u));
+					}
+					next_specialization.sampler_origins.push_back(table.sampler_resource);
+					next_snapshot.samplers.push_back(table.samplers[candidate]);
+				}
+				candidate_samplers[candidate] = sampler;
+			}
+		}
+		for (uint32_t candidate = 1; candidate < table.descriptors.size(); candidate++) {
+			auto image          = root_image;
+			image.indirect_root = table.resource;
+			image.indirect_sampler = candidate_samplers[candidate];
+			next_specialization.images.push_back(image);
+			next_snapshot.images.push_back(table.descriptors[candidate]);
+		}
+		auto& root                      = next_specialization.images[table.resource];
+		root.indirect_root              = table.resource;
+		root.indirect_sampler           = candidate_samplers[0];
+		root.indirect_mapping_offset    = static_cast<uint32_t>(next_snapshot.flattened_srt.size());
+		root.indirect_search_iterations = std::bit_width(table.keys.size());
+		next_snapshot.flattened_srt.resize(next_snapshot.flattened_srt.size() + 1u +
+		                                   table.keys.size() * 2u);
+		std::vector<uint32_t> order(table.keys.size());
+		std::iota(order.begin(), order.end(), 0u);
+		std::ranges::sort(order, {}, [&](uint32_t index) { return table.keys[index]; });
+		next_snapshot.flattened_srt[root.indirect_mapping_offset] =
+		    static_cast<uint32_t>(table.keys.size());
+		for (uint32_t entry = 0; entry < order.size(); entry++) {
+			const auto source                   = order[entry];
+			const auto offset                   = root.indirect_mapping_offset + 1u + entry * 2u;
+			next_snapshot.flattened_srt[offset] = table.keys[source];
+			next_snapshot.flattened_srt[offset + 1] = table.candidates[source];
+		}
+		next_snapshot.images[table.resource] = table.descriptors[0];
+	}
+	for (uint32_t i = 0; i < next_snapshot.buffers.size(); i++) {
+		const auto& base_buffer = program.info.buffers[next_specialization.buffer_origins[i]];
+		auto&                descriptor_value = next_snapshot.buffers[i];
 		ShaderBufferResource descriptor;
 		if (!DecodeBufferDescriptor(descriptor_value, descriptor)) {
 			return SpecializationFail(fmt::format("buffer descriptor {} has invalid width", i));
@@ -439,18 +1896,18 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		} else if (!swizzle) {
 			packed_stride &= ~(3u << 16u);
 		}
-		specialization.buffers.push_back({
+		next_specialization.buffers.push_back({
 		    .packed_stride     = packed_stride,
-		    .descriptor_format = program.info.buffers[i].formatted
+		    .descriptor_format = base_buffer.formatted
 		                             ? descriptor.Format()
 		                             : Prospero::BufferFormat::kInvalid,
 		    .descriptor_swizzle =
-		        program.info.buffers[i].formatted ? descriptor.DstSelXYZW() : DstSel(4, 5, 6, 7),
+		        base_buffer.formatted ? descriptor.DstSelXYZW() : DstSel(4, 5, 6, 7),
 		});
 	}
-	for (uint32_t i = 0; i < specialization.images.size(); i++) {
-		const auto& descriptor = snapshot.images[i];
-		auto&       image      = specialization.images[i];
+	for (uint32_t i = 0; i < next_specialization.images.size(); i++) {
+		const auto& descriptor = next_snapshot.images[i];
+		auto&       image      = next_specialization.images[i];
 		const auto  base_index = i < program.info.images.size() ? i : image.indirect_root;
 		if (base_index >= program.info.images.size()) {
 			return SpecializationFail(fmt::format("image resource {} has an invalid root", i));
@@ -485,7 +1942,8 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		image.cube      = DescriptorIsCube(descriptor);
 		const auto format =
 		    static_cast<Prospero::BufferFormat>((descriptor.dwords[1] >> 20u) & 0x1ffu);
-		if (base.atomic && format != Prospero::BufferFormat::k32UInt) {
+		if (base.atomic && format != Prospero::BufferFormat::k32UInt &&
+		    format != Prospero::BufferFormat::k32Float) {
 			return SpecializationFail(
 			    fmt::format("atomic image descriptor {} uses unsupported format {}", i,
 			                static_cast<uint32_t>(format)));
@@ -504,98 +1962,217 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		if (storage || image.conversion_format != Prospero::BufferFormat::kInvalid) {
 			image.shader_swizzle = DescriptorImageSwizzle(descriptor);
 		}
-		const bool raw_sint_storage = storage && format == Prospero::BufferFormat::k32SInt &&
-		                              base.written && !base.read && !base.atomic;
-		image.numeric_class         = Prospero::SampledTextureNumericClass(format);
+		// Float image atomics use a CAS loop on raw R32Uint texels. Keep the
+		// specialized SPIR-V image type consistent with the host atomic view.
+		// Signed R32 storage likewise binds a raw R32Uint host view so bit-preserving
+		// image_store matches OpTypeImage Sampled Type with unsigned texels.
+		image.numeric_class = base.atomic ? Prospero::TextureNumericClass::Uint
+		                                  : Prospero::SampledTextureNumericClass(format);
+		if (storage && !base.atomic && format == Prospero::BufferFormat::k32SInt) {
+			image.numeric_class = Prospero::TextureNumericClass::Uint;
+		}
+
+		// Check if depth-compare is requested but format doesn't support it on Vulkan
+		if (base.depth_compare && !storage) {
+			const auto surface_format = TextureGetSurfaceFormatInfo(format);
+			if (!IsDepthComparisonSupported(surface_format.vk_format)) {
+				// Format doesn't support native depth-compare, enable manual emulation
+				image.needs_manual_depth_compare = true;
+				image.shader_swizzle             = DescriptorImageSwizzle(descriptor);
+			}
+		}
 		if (storage) {
-			if ((!raw_sint_storage && image.numeric_class == Prospero::TextureNumericClass::Sint) ||
-			    image.numeric_class == Prospero::TextureNumericClass::Unsupported) {
+			if (image.numeric_class == Prospero::TextureNumericClass::Unsupported) {
 				return SpecializationFail(
 				    fmt::format("storage image descriptor {} uses unsupported format {}", i,
 				                static_cast<uint32_t>(format)));
 			}
-			if (raw_sint_storage) {
-				image.numeric_class = Prospero::TextureNumericClass::Uint;
-			}
 		} else if (image.numeric_class == Prospero::TextureNumericClass::Unsupported ||
-		           (base.depth_compare &&
+		           (base.depth_compare && !image.needs_manual_depth_compare &&
 		            image.numeric_class != Prospero::TextureNumericClass::Float)) {
 			return SpecializationFail(
 			    fmt::format("sampled image descriptor {} uses unsupported format {}", i,
 			                static_cast<uint32_t>(format)));
 		}
 	}
-	for (uint32_t root_index = 0; root_index < specialization.images.size(); root_index++) {
-		auto& root = specialization.images[root_index];
+	for (uint32_t root_index = 0; root_index < next_specialization.images.size(); root_index++) {
+		auto& root = next_specialization.images[root_index];
 		if (root.indirect_root != root_index) {
 			continue;
 		}
-		const auto key_count = root.indirect_mapping_offset < snapshot.flattened_srt.size()
-		                           ? snapshot.flattened_srt[root.indirect_mapping_offset]
+		const auto key_count = root.indirect_mapping_offset < next_snapshot.flattened_srt.size()
+		                           ? next_snapshot.flattened_srt[root.indirect_mapping_offset]
 		                           : 0u;
-		if (root.indirect_search_iterations == 0u || key_count < 2u ||
+		if (root.indirect_search_iterations == 0u || key_count == 0u ||
 		    static_cast<size_t>(root.indirect_mapping_offset) + 1u +
 		            static_cast<size_t>(key_count) * 2u >
-		        snapshot.flattened_srt.size()) {
+		        next_snapshot.flattened_srt.size()) {
 			return SpecializationFail("indirect image specialization has an invalid key mapping");
 		}
 		uint32_t exemplar       = ImageResource::NoIndirectImage;
 		uint32_t resource_count = 0;
-		for (uint32_t resource = 0; resource < specialization.images.size(); resource++) {
-			if (specialization.images[resource].indirect_root != root_index) {
+		for (uint32_t resource = 0; resource < next_specialization.images.size(); resource++) {
+			if (next_specialization.images[resource].indirect_root != root_index) {
 				continue;
 			}
 			resource_count++;
 			if (exemplar == ImageResource::NoIndirectImage &&
-			    !NullImageDescriptor(snapshot.images[resource])) {
+			    !NullImageDescriptor(next_snapshot.images[resource])) {
 				exemplar = resource;
 			}
+		}
+		const auto* root_source = Source(program, program.info.images[root_index].source);
+		if (exemplar == ImageResource::NoIndirectImage && root_source != nullptr &&
+		    root_source->inline_descriptor.has_value()) {
+			// Distinct samplers can accompany only null images. Keep the normal null image
+			// class instead of requiring an arbitrary non-null descriptor for this table.
+			exemplar = root_index;
 		}
 		if (resource_count < 2u || exemplar == ImageResource::NoIndirectImage) {
 			return SpecializationFail("indirect image specialization has no typed candidate");
 		}
-		const auto& image_class = specialization.images[exemplar];
-		const auto is_2d = [](Decoder::ImageDimension dimension) {
-			return dimension == Decoder::ImageDimension::Dim2D ||
-			       dimension == Decoder::ImageDimension::Dim2DArray;
-		};
-		for (uint32_t candidate = 0; candidate < specialization.images.size(); candidate++) {
-			auto& image = specialization.images[candidate];
+		const auto& image_class = next_specialization.images[exemplar];
+		const auto& root_info   = program.info.images[root_index];
+		for (uint32_t candidate = 0; candidate < next_specialization.images.size(); candidate++) {
+			auto& image = next_specialization.images[candidate];
 			if (image.indirect_root != root_index) {
 				continue;
 			}
-			if (NullImageDescriptor(snapshot.images[candidate])) {
-				image.numeric_class     = image_class.numeric_class;
-				image.dimension         = image_class.dimension;
-				image.mip_count         = image_class.mip_count;
-				image.conversion_format = image_class.conversion_format;
-				image.shader_swizzle    = image_class.shader_swizzle;
-				image.cube              = image_class.cube;
+			if (NullImageDescriptor(next_snapshot.images[candidate])) {
+				image.numeric_class              = image_class.numeric_class;
+				image.dimension                  = image_class.dimension;
+				image.mip_count                  = image_class.mip_count;
+				image.conversion_format          = image_class.conversion_format;
+				image.shader_swizzle             = image_class.shader_swizzle;
+				image.cube                       = image_class.cube;
+				image.needs_manual_depth_compare = image_class.needs_manual_depth_compare;
 			}
-			const bool same_coordinates = image.dimension == image_class.dimension &&
-			                              image.cube == image_class.cube;
-			if (image.numeric_class != image_class.numeric_class ||
-			    (!same_coordinates && !(is_2d(image.dimension) && is_2d(image_class.dimension))) ||
+			const bool heterogeneous_storage_write =
+			    root_info.resource_class == ImageResourceClass::Storage && root_info.written &&
+			    !root_info.atomic;
+			const bool heterogeneous_numeric =
+			    image.numeric_class != image_class.numeric_class &&
+			    root_info.heterogeneous_numeric_compatible &&
+			    ((root_info.resource_class == ImageResourceClass::Sampled &&
+			      !root_info.depth_compare) ||
+			     heterogeneous_storage_write);
+			const bool heterogeneous_dimension =
+			    (image.dimension != image_class.dimension || image.cube != image_class.cube) &&
+			    ((root_info.resource_class == ImageResourceClass::Sampled &&
+			      !root_info.depth_compare) ||
+			     heterogeneous_storage_write);
+			// Ordinary sampled descriptors apply DstSel through each candidate's native
+			// image-view component mapping. Shader-converted and manual-comparison images
+			// instead consume shader_swizzle in SPIR-V. Storage writes are emitted once per
+			// runtime candidate, so each branch applies its own inverse store swizzle.
+			const bool heterogeneous_view_swizzle =
+			    image.shader_swizzle != image_class.shader_swizzle &&
+			    ((root_info.resource_class == ImageResourceClass::Sampled &&
+			      !root_info.depth_compare &&
+			      image.conversion_format == Prospero::BufferFormat::kInvalid &&
+			      image_class.conversion_format == Prospero::BufferFormat::kInvalid &&
+			      !image.needs_manual_depth_compare && !image_class.needs_manual_depth_compare) ||
+			     heterogeneous_storage_write);
+			if ((image.numeric_class != image_class.numeric_class && !heterogeneous_numeric) ||
+			    (image.dimension != image_class.dimension && !heterogeneous_dimension) ||
 			    image.mip_count != image_class.mip_count ||
 			    image.conversion_format != image_class.conversion_format ||
-			    image.shader_swizzle != image_class.shader_swizzle) {
+			    (image.shader_swizzle != image_class.shader_swizzle &&
+			     !heterogeneous_view_swizzle) ||
+			    (image.cube != image_class.cube && !heterogeneous_dimension) ||
+			    image.needs_manual_depth_compare != image_class.needs_manual_depth_compare) {
 				return SpecializationFail(
-				    fmt::format("indirect image table at pc 0x{:08x} has incompatible candidates",
-				                program.info.images[root_index].first_use_pc));
+				    fmt::format(
+				        "indirect image table at pc 0x{:08x} has incompatible candidates: "
+				        "exemplar={} candidate={} numeric={}/{} dimension={}/{} mip_count={}/{} "
+				        "conversion={}/{} swizzle=0x{:08x}/0x{:08x} cube={}/{} manual_compare={}/{} "
+				        "descriptor=[{:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x}]",
+				        program.info.images[root_index].first_use_pc, exemplar, candidate,
+				        static_cast<uint32_t>(image_class.numeric_class),
+				        static_cast<uint32_t>(image.numeric_class),
+				        static_cast<uint32_t>(image_class.dimension),
+				        static_cast<uint32_t>(image.dimension), image_class.mip_count, image.mip_count,
+				        static_cast<uint32_t>(image_class.conversion_format),
+				        static_cast<uint32_t>(image.conversion_format), image_class.shader_swizzle,
+				        image.shader_swizzle, image_class.cube, image.cube,
+				        image_class.needs_manual_depth_compare, image.needs_manual_depth_compare,
+				        next_snapshot.images[candidate].dwords[0],
+				        next_snapshot.images[candidate].dwords[1],
+				        next_snapshot.images[candidate].dwords[2],
+				        next_snapshot.images[candidate].dwords[3],
+				        next_snapshot.images[candidate].dwords[4],
+				        next_snapshot.images[candidate].dwords[5],
+				        next_snapshot.images[candidate].dwords[6],
+				        next_snapshot.images[candidate].dwords[7]));
 			}
 		}
 	}
-	SamplerPlan sampler_plan;
-	if (!BuildSamplerPlan(program.info, specialization.images, sampler_plan)) {
-		return SpecializationFail("specialized sampler layout exceeds its resource limit");
+	// Manual comparison is part of the shader permutation. Extract the final dense sampler
+	// table after indirect candidates have been appended so every cloned sampler keeps its
+	// own comparison function.
+	next_specialization.sampler_depth_compare_funcs.clear();
+	next_specialization.sampler_depth_compare_funcs.reserve(next_snapshot.samplers.size());
+	for (const auto& sampler_descriptor: next_snapshot.samplers) {
+		next_specialization.sampler_depth_compare_funcs.push_back(
+		    sampler_descriptor.dword_count >= 1
+		        ? static_cast<uint8_t>((sampler_descriptor.dwords[0] >> 12u) & 0x7u)
+		        : 0u);
 	}
-	for (uint32_t index = 0; index < program.info.samplers.size(); index++) {
-		const auto target = sampler_plan.point_sampler[index];
-		if (target != UINT32_MAX && target >= program.info.samplers.size()) {
-			snapshot.samplers.push_back(snapshot.samplers[index]);
+	ShaderInfo sampler_info = program.info;
+	sampler_info.samplers.clear();
+	for (const auto origin: next_specialization.sampler_origins) {
+		if (origin >= program.info.samplers.size()) {
+			return SpecializationFail("specialized sampler has an invalid origin");
+		}
+		sampler_info.samplers.push_back(program.info.samplers[origin]);
+	}
+	sampler_info.sampled_pairs.clear();
+	for (const auto& pair: program.info.sampled_pairs) {
+		if (pair.image >= next_specialization.images.size()) {
+			return SpecializationFail("sampled pair has an invalid image resource");
+		}
+		const bool indirect = next_specialization.images[pair.image].indirect_root == pair.image;
+		for (uint32_t index = 0; index < next_specialization.images.size(); index++) {
+			const auto& image = next_specialization.images[index];
+			if (indirect ? image.indirect_root != pair.image : index != pair.image) {
+				continue;
+			}
+			const bool dynamic_pair = image.indirect_sampler != UINT32_MAX &&
+			                          image.indirect_sampler < next_specialization.sampler_origins.size() &&
+			                          next_specialization.sampler_origins[image.indirect_sampler] == pair.sampler;
+			const auto sampler = dynamic_pair ? image.indirect_sampler : pair.sampler;
+			if (sampler >= sampler_info.samplers.size()) {
+				return SpecializationFail("sampled pair has an invalid sampler resource");
+			}
+			if (std::ranges::any_of(sampler_info.sampled_pairs, [&](const SampledResourcePair& p) {
+				    return p.image == index && p.sampler == sampler;
+				})) {
+				continue;
+			}
+			if (sampler_info.sampled_pairs.size() >= ShaderInfo::MaxSampledPairs) {
+				return SpecializationFail("specialized sampled pairs exceed the resource limit");
+			}
+			sampler_info.sampled_pairs.push_back({index, sampler, pair.first_use_pc});
 		}
 	}
-	ImageRemap(specialization).Apply(snapshot.images);
+	next_specialization.sampled_pairs = sampler_info.sampled_pairs;
+	SamplerPlan sampler_plan;
+	if (!BuildSamplerPlan(sampler_info, next_specialization.images, sampler_plan)) {
+		return SpecializationFail("specialized sampler layout exceeds its resource limit");
+	}
+	for (uint32_t index = 0; index < sampler_info.samplers.size(); index++) {
+		const auto target = sampler_plan.point_sampler[index];
+		if (target != UINT32_MAX && target >= sampler_info.samplers.size()) {
+			next_snapshot.samplers.push_back(next_snapshot.samplers[index]);
+		}
+	}
+	if (!ValidateSnapshotBufferWrites(program, runtime, next_snapshot, next_specialization)) {
+		return false;
+	}
+	ImageRemap(next_specialization).Apply(next_snapshot.images);
+	// Commit only after validation; copy assignment reuses same-shape output capacity.
+	specialization       = next_specialization;
+	specialized_snapshot = next_snapshot;
 	return true;
 }
 
@@ -854,6 +2431,8 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	plan.user_data_count            = program.user_data_count;
 	plan.info                       = program.info;
 	plan.memory_info                = program.memory_info;
+	plan.bounded_srt_reads           = program.bounded_srt_reads;
+	plan.bounded_srt_reads_precede_writes = program.bounded_srt_reads_precede_writes;
 	plan.srt_plan_complete          = program.srt_plan_complete;
 	plan.resource_tracking_complete = program.resource_tracking_complete;
 	plan.has_address_writes         = program.has_address_writes;
@@ -898,6 +2477,10 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 			target.indirect_image->key_count = Clone(target.indirect_image->key_count);
 			target.indirect_image->selector_mask = Clone(target.indirect_image->selector_mask);
 		}
+		target.inline_descriptor = source.inline_descriptor;
+		target.bounded_buffer = source.bounded_buffer;
+		target.bounded_image = source.bounded_image;
+		target.bounded_sampler = source.bounded_sampler;
 		for (uint32_t dword = 0; dword < source.dword_count; dword++) {
 			target.dwords[dword] = Clone(source.dwords[dword]);
 		}
@@ -907,14 +2490,48 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		plan.srt_reads.push_back({Clone(read.value), read.flat_offset});
 	}
 	plan.control_flow = ResourceControlFlow(program);
-	for (auto& block: plan.control_flow) {
-		block.condition = Clone(block.condition);
-	}
+	for (auto& block : plan.control_flow) block.condition = Clone(block.condition);
 	plan.uniform_fill = AnalyzeUniformFill(program);
-	for (uint32_t i = 0; i < plan.uniform_fill.fill.words; ++i) {
+	for (uint32_t i = 0; i < plan.uniform_fill.fill.words; ++i)
 		plan.uniform_fill.values[i] = Clone(plan.uniform_fill.values[i]);
+	plan.materialization_sources.reserve(plan.info.buffers.size() + plan.info.images.size() +
+	                                     plan.info.samplers.size());
+	for (const auto& buffer: plan.info.buffers) {
+		const auto* source = Source(plan, buffer.source);
+		if (source != nullptr && (source->bounded_buffer.has_value() ||
+		                          source->inline_descriptor.has_value())) {
+			plan.requires_specialization_memory = true;
+		} else {
+			plan.materialization_sources.push_back(buffer.source);
+		}
+	}
+	for (const auto& image: plan.info.images) {
+		const auto* source = Source(plan, image.source);
+		if (source != nullptr && (source->indirect_image.has_value() ||
+		                          source->inline_descriptor.has_value() ||
+		                          source->bounded_image.has_value())) {
+			plan.requires_specialization_memory = true;
+		} else {
+			plan.materialization_sources.push_back(image.source);
+		}
+	}
+	for (const auto& sampler: plan.info.samplers) {
+		const auto* source = Source(plan, sampler.source);
+		if (source != nullptr && (source->inline_descriptor.has_value() ||
+		                          source->bounded_sampler.has_value())) {
+			plan.requires_specialization_memory = true;
+		} else {
+			plan.materialization_sources.push_back(sampler.source);
+		}
 	}
 	plan.clean_flat_slots.resize(plan.srt_reads.size());
+	for (const auto& read: plan.bounded_srt_reads) {
+		plan.requires_specialization_memory = true;
+		if (read.workgroup_axis == UINT32_MAX) {
+			MarkCleanFlatSlots(plan, Source(plan, read.count_source), plan.clean_flat_slots);
+		}
+		MarkCleanFlatSlots(plan, Source(plan, read.address_source), plan.clean_flat_slots);
+	}
 	for (const auto& image: plan.info.images) {
 		const auto* source = Source(plan, image.source);
 		if (source == nullptr || !source->indirect_image.has_value()) {
@@ -926,142 +2543,78 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		MarkCleanFlatSlots(plan, Source(plan, source->indirect_image->table_source),
 		                   plan.clean_flat_slots);
 	}
+	for (const auto& source: plan.descriptor_sources) {
+		if (source.inline_descriptor.has_value()) {
+			MarkCleanFlatSlots(plan, Source(plan, source.inline_descriptor->buffer_source),
+			                   plan.clean_flat_slots);
+			if (source.inline_descriptor->image_table.has_value()) {
+				MarkCleanFlatSlots(plan, Source(plan, source.inline_descriptor->image_table->address_source),
+				                   plan.clean_flat_slots);
+			}
+		}
+	}
+	const auto mark_wave_candidate = [&](const auto& candidate) {
+		if (candidate.immediate || candidate.value >= plan.srt_reads.size()) return;
+		plan.clean_flat_slots[candidate.value] = ResourcePlan::FlatSlotClean;
+		DescriptorSource dependency;
+		dependency.dword_count = 1u;
+		dependency.dwords[0] = plan.srt_reads[candidate.value].value;
+		MarkCleanFlatSlots(plan, &dependency, plan.clean_flat_slots);
+	};
+	for (const auto& source: plan.descriptor_sources) {
+		if (source.bounded_buffer.has_value() && source.bounded_buffer->wave_uniform) {
+			for (const auto& descriptor: source.bounded_buffer->wave_candidates)
+				for (const auto& candidate: descriptor) mark_wave_candidate(candidate);
+		}
+		if (source.bounded_image.has_value() && source.bounded_image->wave_uniform) {
+			for (const auto& descriptor: source.bounded_image->wave_candidates)
+				for (const auto& candidate: descriptor) mark_wave_candidate(candidate);
+		}
+	}
+	for (const auto& source: plan.descriptor_sources) {
+		if ((source.bounded_buffer.has_value() && source.bounded_buffer->expression) ||
+		    (source.bounded_image.has_value() && source.bounded_image->expression) ||
+		    source.bounded_sampler.has_value()) {
+			MarkDeferredFlatSlots(plan, &source, plan.clean_flat_slots);
+		}
+	}
 	return plan;
 }
 
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
-	if (!program.resource_tracking_complete ||
-	    (program.requires_specialization_memory && runtime.read_specialization_memory == nullptr)) {
+	g_last_specialization_error.clear();
+	MaterializedSnapshot materialized;
+	if (!MaterializeSnapshot(program, runtime, materialized)) {
 		return false;
 	}
-	const bool masked_image = std::ranges::any_of(program.info.images, [&](const auto& image) {
-		const auto* source = Source(program, image.source);
-		return source != nullptr && source->indirect_image.has_value() &&
-		       !source->indirect_image->selector_mask.IsEmpty();
-	});
-	if (masked_image &&
-	    (program.has_address_writes ||
-	     std::ranges::any_of(program.info.images, &ImageResource::written))) {
-		return false;
-	}
-	const bool capture_reads = masked_image &&
-	    std::ranges::any_of(program.info.buffers, &BufferResource::written);
-	auto& reads = program.specialization_reads;
-	ReadCapture capture {runtime, reads};
-	SrtRuntime observed = runtime;
-	if (capture_reads) {
-		reads.clear();
-		observed.userdata = &capture;
-		observed.read_specialization_memory = CaptureStrictRead;
-		if (observed.read_memory != nullptr) observed.read_memory = CaptureOrdinaryRead;
-	}
-	SrtWalker clean(program, CleanRuntime(observed));
-	SrtWalker walker(program, observed, program.clean_flat_slots, &clean);
-	const auto active = clean.FindActiveSources();
-	if (!walker.RefreshFlatBuffer(snapshot.flattened_srt)) {
-		return false;
-	}
-	snapshot.uniform_fill = {};
-	const auto& fill = program.uniform_fill;
-	const auto words = fill.fill.words;
-	std::array<uint32_t, 4> stored {};
-	bool uniform_fill = words != 0;
-	for (uint32_t i = 0; i < words && uniform_fill; ++i) {
-		uniform_fill = clean.Evaluate(fill.values[i], stored[i]) && stored[i] == stored[0];
-	}
-	if (uniform_fill) {
-		snapshot.uniform_fill = fill.fill;
-		snapshot.uniform_fill.value = stored[0];
-	}
-	const auto evaluate = [&](uint32_t source, DescriptorValue& value) {
-		if (source >= program.descriptor_sources.size()) {
-			return false;
-		}
-		if (active.empty() || active[source]) {
-			return walker.EvaluateDescriptor(source, value);
-		}
-		value = {};
-		value.dword_count = program.descriptor_sources[source].dword_count;
-		return true;
-	};
-	snapshot.buffers.resize(program.info.buffers.size());
-	for (uint32_t i = 0; i < program.info.buffers.size(); ++i) {
-		if (!evaluate(program.info.buffers[i].source, snapshot.buffers[i])) {
-			return false;
-		}
-	}
-	if (capture_reads) {
-		for (uint32_t i = 0; i < program.info.buffers.size(); ++i) {
-			const auto& buffer = program.info.buffers[i];
-			if (!buffer.written || (!active.empty() && !active[buffer.source])) continue;
-			DescriptorValue strict;
-			if (!clean.EvaluateDescriptor(buffer.source, strict) ||
-			    strict != snapshot.buffers[i]) return false;
-		}
-	}
-	snapshot.images.resize(program.info.images.size());
-	specialization.images.resize(program.info.images.size());
-	for (uint32_t i = 0; i < program.info.images.size(); ++i) {
-		const auto& image = program.info.images[i];
-		specialization.images[i] = {
-		    .numeric_class = image.numeric_class,
-		    .dimension = image.dimension,
-		    .mip_count = image.mip_count,
-		    .conversion_format = image.conversion_format,
-		    .shader_swizzle = image.shader_swizzle,
-		    .indirect_root = image.indirect_root,
-		    .indirect_mapping_offset = image.indirect_mapping_offset,
-		    .indirect_search_iterations = image.indirect_search_iterations,
-		    .cube = image.cube,
-		};
-		const auto* source = Source(program, image.source);
-		if (source == nullptr) {
-			return false;
-		}
-		if (source->indirect_image.has_value()) {
-			snapshot.images[i] = {.dword_count = 8u};
-			if (!active.empty() && !active[image.source]) {
-				continue;
-			}
-			const auto& indirect = *source->indirect_image;
-			DescriptorValue material;
-			DescriptorValue table;
-			if ((indirect.material_source != UINT32_MAX &&
-			     !clean.EvaluateDescriptor(indirect.material_source, material)) ||
-			    !clean.EvaluateDescriptor(indirect.table_source, table) ||
-			    !MaterializeIndirectImage(program, indirect, material, table, i, observed, clean, snapshot,
-			                              specialization)) {
-				return false;
-			}
-		} else {
-			if (!evaluate(image.source, snapshot.images[i])) {
-				return false;
-			}
-			if (!ValidImageDescriptor(snapshot.images[i], image.r128)) {
-				snapshot.images[i].dwords.fill(0);
-			}
-		}
-	}
-	snapshot.samplers.resize(program.info.samplers.size());
-	for (uint32_t i = 0; i < program.info.samplers.size(); ++i) {
-		if (!evaluate(program.info.samplers[i].source, snapshot.samplers[i])) {
-			return false;
-		}
-	}
-	if (capture_reads && !WrittenBuffersDisjoint(program, snapshot, reads)) return false;
-	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
-	return BuildResourceSpecialization(program, snapshot, specialization);
+	return BuildResourceSpecialization(program, std::move(materialized), runtime, snapshot,
+	                                   specialization);
+}
+
+std::string_view LastResourceSpecializationError() noexcept {
+	return g_last_specialization_error;
 }
 
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization) {
 	EXIT_IF(!program.resource_tracking_complete || program.shader_info_complete ||
 	        program.binding_layout_complete);
-	EXIT_IF(program.info.buffers.size() != specialization.buffers.size() ||
-	        program.info.images.size() > specialization.images.size());
+	EXIT_IF(specialization.buffer_origins.size() != specialization.buffers.size() ||
+	        program.info.images.size() > specialization.images.size() ||
+	        program.info.samplers.size() > specialization.sampler_origins.size());
 
-	auto buffers = program.info.buffers;
-	for (size_t index = 0; index < buffers.size(); index++) {
+	std::vector<BufferResource> buffers;
+	std::vector<uint32_t> buffer_remap(program.info.buffers.size(), UINT32_MAX);
+	for (size_t index = 0; index < specialization.buffers.size(); index++) {
+		const auto origin = specialization.buffer_origins[index];
+		EXIT_IF(origin >= program.info.buffers.size());
+		buffers.push_back(program.info.buffers[origin]);
+		const auto* source = Source(program, buffers.back().source);
+		if (source == nullptr || (!source->bounded_buffer.has_value() &&
+		                          !source->inline_descriptor.has_value())) {
+			EXIT_IF(buffer_remap[origin] != UINT32_MAX);
+			buffer_remap[origin] = static_cast<uint32_t>(index);
+		}
 		buffers[index].packed_stride      = specialization.buffers[index].packed_stride;
 		buffers[index].descriptor_format  = specialization.buffers[index].descriptor_format;
 		buffers[index].descriptor_swizzle = specialization.buffers[index].descriptor_swizzle;
@@ -1083,6 +2636,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		image.indirect_root              = source.indirect_root;
 		image.indirect_mapping_offset    = source.indirect_mapping_offset;
 		image.indirect_search_iterations = source.indirect_search_iterations;
+		image.indirect_sampler           = source.indirect_sampler;
 		image.cube                       = source.cube;
 		image.indirect_resources.clear();
 	}
@@ -1094,12 +2648,24 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		}
 	}
 
+	ShaderInfo sampler_info = program.info;
+	sampler_info.samplers.clear();
+	for (const auto origin: specialization.sampler_origins) {
+		EXIT_IF(origin >= program.info.samplers.size());
+		sampler_info.samplers.push_back(program.info.samplers[origin]);
+	}
+	sampler_info.sampled_pairs = specialization.sampled_pairs;
+	EXIT_IF(specialization.sampler_depth_compare_funcs.size() != sampler_info.samplers.size());
+	for (uint32_t index = 0; index < sampler_info.samplers.size(); index++) {
+		sampler_info.samplers[index].depth_compare_func =
+		    specialization.sampler_depth_compare_funcs[index];
+	}
 	SamplerPlan sampler_plan;
-	EXIT_IF(!BuildSamplerPlan(program.info, images, sampler_plan));
-	auto samplers      = program.info.samplers;
-	auto sampled_pairs = program.info.sampled_pairs;
+	EXIT_IF(!BuildSamplerPlan(sampler_info, images, sampler_plan));
+	auto samplers      = sampler_info.samplers;
+	auto sampled_pairs = sampler_info.sampled_pairs;
 	samplers.reserve(sampler_plan.sampler_count);
-	for (uint32_t index = 0; index < program.info.samplers.size(); index++) {
+	for (uint32_t index = 0; index < sampler_info.samplers.size(); index++) {
 		const auto target = sampler_plan.point_sampler[index];
 		if (target == UINT32_MAX) {
 			continue;
@@ -1120,9 +2686,46 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		}
 		samplers[pair.sampler].depth_compare |= images[pair.image].depth_compare;
 	}
+	for (auto& image: images) {
+		if (image.indirect_sampler != UINT32_MAX) {
+			EXIT_IF(image.indirect_sampler >= sampler_info.samplers.size());
+			if (RequiresPointSampler(image)) {
+				EXIT_IF(sampler_plan.point_sampler[image.indirect_sampler] == UINT32_MAX);
+				image.indirect_sampler = sampler_plan.point_sampler[image.indirect_sampler];
+			}
+		}
+	}
 
 	auto memory_info = program.memory_info;
-	const ImageRemap image_remap(specialization);
+	std::vector<uint8_t> remapped_memory(memory_info.size());
+	for (auto* block: program.blocks) {
+		for (auto& inst: *block) {
+			if (BufferAccessOf(inst.GetOpcode()) == BufferAccess::None) {
+				continue;
+			}
+			const auto index = inst.Flags<MemoryFlags>().index;
+			EXIT_IF(index >= memory_info.size());
+			auto& memory = memory_info[index];
+			if (memory.planning_only) {
+				continue;
+			}
+			if (!remapped_memory[index]) {
+				remapped_memory[index] = 1u;
+				if (memory.buffer_table != UINT32_MAX) {
+					EXIT_IF(memory.buffer_table >= specialization.buffer_tables.size());
+					memory.resource = UINT32_MAX;
+				} else {
+					EXIT_IF(memory.resource >= buffer_remap.size() || buffer_remap[memory.resource] == UINT32_MAX);
+					memory.resource = buffer_remap[memory.resource];
+				}
+			}
+			if (memory.buffer_table == UINT32_MAX) {
+				auto* handle = inst.Arg(0).Resolve().TryInstruction();
+				EXIT_IF(handle == nullptr || handle->GetOpcode() != ValueOpcode::GetBufferResource);
+				handle->SetFlags<uint32_t>(memory.resource);
+			}
+		}
+	}
 	for (auto* block: program.blocks) {
 		for (auto it = block->begin(); it != block->end(); ++it) {
 			auto& inst = *it;
@@ -1158,9 +2761,12 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 				memory.sampler = sampler_plan.point_sampler[memory.sampler];
 			}
 			EXIT_IF(image.indirect_root == memory.resource &&
-			        inst.GetOpcode() != ValueOpcode::ImageSampleRaw);
+			        inst.GetOpcode() != ValueOpcode::ImageSampleRaw &&
+			        inst.GetOpcode() != ValueOpcode::ImageRead &&
+			        inst.GetOpcode() != ValueOpcode::ImageWrite);
 		}
 	}
+	const ImageRemap image_remap(specialization);
 	for (auto* block: program.blocks) {
 		for (auto& inst: *block) {
 			if (inst.GetOpcode() == ValueOpcode::GetImageResource) {
@@ -1190,6 +2796,8 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		}
 	}
 	image_remap.Apply(images);
+	program.info.bounded_srt_reads = specialization.bounded_srt_reads;
+	program.info.buffer_tables = specialization.buffer_tables;
 	program.info.buffers       = std::move(buffers);
 	program.info.images        = std::move(images);
 	program.info.samplers      = std::move(samplers);

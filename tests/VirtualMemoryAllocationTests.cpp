@@ -784,6 +784,65 @@ void TestFlexibleMemoryReuseIsZeroFilled() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestDirectMemoryReuseIsZeroFilled() {
+	const char*       test    = "DirectMemoryReuseIsZeroFilled";
+	constexpr uint64_t MapSize = SceKernelPageSize * 2;
+	constexpr uint8_t Poison   = 0xa5;
+	const auto        direct   = Libs::LibKernel::Memory::KernelGetDirectMemorySize();
+
+	int64_t source_phys = 0;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+	            SceKernelDirectMemoryStart, direct, MapSize, SceKernelPageSize, SceKernelMtypeC,
+	            &source_phys),
+	        "KernelAllocateDirectMemory(source)");
+
+	// Direct memory is physical: unmapping keeps the contents, so the bytes stay in the
+	// backing store while the range sits in the physical free list.
+	void* source = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
+	            &source, MapSize, SceKernelProtCpuRw, 0, source_phys, SceKernelPageSize,
+	            "direct_zero_source"),
+	        "KernelMapNamedDirectMemory(source)");
+	std::memset(source, Poison, MapSize);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMunmap(reinterpret_cast<uint64_t>(source), MapSize),
+	        "KernelMunmap(source)");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelCheckedReleaseDirectMemory(source_phys, MapSize),
+	        "KernelCheckedReleaseDirectMemory(source)");
+
+	// Searching from the released address makes the reuse deterministic: the freed range is
+	// the first one the allocator can hand back.
+	int64_t reused_phys = 0;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+	            source_phys, direct, MapSize, SceKernelPageSize, SceKernelMtypeC, &reused_phys),
+	        "KernelAllocateDirectMemory(reuse)");
+	Check(test, reused_phys == source_phys,
+	      "released direct range was not reused, so the zero-fill went untested");
+
+	void* reused = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
+	            &reused, MapSize, SceKernelProtCpuRw, 0, reused_phys, SceKernelPageSize,
+	            "direct_zero_reuse"),
+	        "KernelMapNamedDirectMemory(reuse)");
+	const auto* bytes = reinterpret_cast<const uint8_t*>(reused);
+	Check(test,
+	      std::all_of(bytes, bytes + MapSize, [](uint8_t value) { return value == 0; }),
+	      "reused direct backing exposed stale bytes");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMunmap(reinterpret_cast<uint64_t>(reused), MapSize),
+	        "KernelMunmap(reuse)");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelCheckedReleaseDirectMemory(reused_phys, MapSize),
+	        "KernelCheckedReleaseDirectMemory(reuse)");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestSmallerFlexibleMapReusesReleasedHole() {
 	const char*        test       = "SmallerFlexibleMapReusesReleasedHole";
 	const auto         baseline   = AvailableFlexibleMemory(test);
@@ -3122,6 +3181,7 @@ int main(int argc, char** argv) {
 	RunTest(TestFlexibleDmemCompatAndAlignmentFlags);
 	RunTest(TestFlexibleNoCoalescePreservesBoundaries);
 	RunTest(TestFlexibleMemoryReuseIsZeroFilled);
+	RunTest(TestDirectMemoryReuseIsZeroFilled);
 	RunTest(TestSmallerFlexibleMapReusesReleasedHole);
 	RunTest(TestGuestStackUsesPrivateOwnerMemoryAndCache);
 	RunTest(TestMainEntryUsesGuestStackAndDisablesHostChecks);

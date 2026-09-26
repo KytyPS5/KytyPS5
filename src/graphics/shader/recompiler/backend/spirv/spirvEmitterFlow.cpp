@@ -724,4 +724,17 @@ void EmitUnreachable(ValueEmitContext& ctx, const IR::Inst& inst) {
 	ctx.Fail(inst, "must be lowered before SPIR-V emission");
 }
 
+void EmitDpp8MoveU32(ValueEmitContext& ctx, const IR::Inst& inst) {
+ auto& state = ctx.state;
+ const auto flags = inst.Flags<IR::Dpp8MoveFlags>();
+ const auto target = EmitDpp8TargetLane(state, flags.lane_selectors);
+ const auto shuffled = EmitWaveReadLane(state, ctx.Arg(inst, 0), target.lane);
+ if (flags.fetch_inactive) { ctx.Define(inst, shuffled); return; }
+ const auto active = EmitBallotLaneActiveBool(state, EmitWaveBallot(state, ctx.Arg(inst, 1)), target.lane);
+ ctx.Define(inst, Select(state, TypeU32(state), active, shuffled, ConstantU32(state, 0)));
+}
+uint32_t EmitDpp8UpdateU32(EmitterState& state, uint32_t value, uint32_t previous, uint32_t active) {
+ return Select(state, TypeU32(state), active, value, previous);
+}
+
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter

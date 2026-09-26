@@ -11,6 +11,7 @@
 #include "common/threads.h"
 #include "common/timer.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/shaderCapabilities.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -55,6 +56,7 @@ vk::PhysicalDeviceVulkan12Features WindowContext::RequiredVulkan12Features() noe
 	features.shaderOutputViewportIndex = VK_TRUE;
 	features.bufferDeviceAddress       = VK_TRUE;
 	features.shaderBufferInt64Atomics  = VK_TRUE;
+	features.shaderSharedInt64Atomics  = VK_TRUE;
 	return features;
 }
 
@@ -276,6 +278,11 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		if (required_features12.shaderBufferInt64Atomics == VK_TRUE &&
 		    features12.shaderBufferInt64Atomics != VK_TRUE) {
 			LOGF("shaderBufferInt64Atomics is not supported\n");
+			skip_device = true;
+		}
+		if (required_features12.shaderSharedInt64Atomics == VK_TRUE &&
+		    features12.shaderSharedInt64Atomics != VK_TRUE) {
+			LOGF("shaderSharedInt64Atomics is not supported\n");
 			skip_device = true;
 		}
 		if (features13.robustImageAccess != VK_TRUE) {
@@ -557,6 +564,14 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		supported_features2.pNext = &provoking_vertex;
 	}
 	physical_device.getFeatures2(&supported_features2);
+	const bool shader_fma_ext_enabled =
+	    HasExtension(device_extensions, VK_KHR_SHADER_FMA_EXTENSION_NAME);
+	vk::PhysicalDeviceShaderFmaFeaturesKHR supported_fma {};
+	if (shader_fma_ext_enabled) {
+		vk::PhysicalDeviceFeatures2 fma_query {};
+		fma_query.pNext = &supported_fma;
+		physical_device.getFeatures2(&fma_query);
+	}
 	graphics.mesh_shader_enabled = mesh_extension && supported_mesh.meshShader;
 
 	vk::PhysicalDeviceSubgroupSizeControlProperties subgroup_size_control {};
@@ -628,6 +643,9 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	device_features.vertexPipelineStoresAndAtomics       = VK_TRUE;
 	graphics.sample_rate_shading_enabled                 = true;
 	device_features.shaderInt64 = VK_TRUE;
+	// Optional: existing shaders and exact integer-to-F64 conversions do not
+	// require native Float64. Used operations are checked by the compiler.
+	device_features.shaderFloat64 = supported_features2.features.shaderFloat64;
 
 	vk::PhysicalDeviceRobustness2FeaturesEXT robustness2 {};
 #if defined(__APPLE__)
@@ -679,6 +697,13 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	create_info.enabledExtensionCount   = static_cast<uint32_t>(device_extensions.size());
 	create_info.ppEnabledExtensionNames = device_extensions.data();
 	create_info.pEnabledFeatures        = &device_features;
+	vk::PhysicalDeviceShaderFmaFeaturesKHR fma_features {};
+	if (shader_fma_ext_enabled) {
+		fma_features.shaderFmaFloat64 = device_features.shaderFloat64 == VK_TRUE
+		                                   ? supported_fma.shaderFmaFloat64 : VK_FALSE;
+		fma_features.pNext = const_cast<void*>(create_info.pNext);
+		create_info.pNext = &fma_features;
+	}
 
 	vk::Device device = nullptr;
 
@@ -688,6 +713,13 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		return nullptr;
 	}
 
+	graphics.shader_host_profile = QueryShaderHostProfile(
+	    physical_device, device_features.shaderFloat64 == VK_TRUE,
+	    fma_features.shaderFmaFloat64 == VK_TRUE);
+	LOGF("Vulkan shader FP64: enabled=%d fused_fma=%d rte64=%d rte32=%d signed_zero_inf_nan=%d\n",
+	     graphics.shader_host_profile.float64, graphics.shader_host_profile.fma_float64,
+	     graphics.shader_host_profile.rte_float64, graphics.shader_host_profile.rte_float32,
+	     graphics.shader_host_profile.signed_zero_inf_nan_preserve_float64);
 	return device;
 }
 
@@ -1047,6 +1079,13 @@ void WindowContext::CreateVulkan() {
 		    HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
 			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
+		}
+		if (HasExtension(available_extensions, VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME);
+			graphic_ctx.depth_range_unrestricted_enabled = true;
+		}
+		if (HasExtension(available_extensions, VK_KHR_SHADER_FMA_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_KHR_SHADER_FMA_EXTENSION_NAME);
 		}
 	}
 

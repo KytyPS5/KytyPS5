@@ -124,7 +124,35 @@ DppTargetLane EmitDppTargetLane(EmitterState& state, const IR::DppMoveFlags& fla
 	return {subid, ConstantBool(state, true)};
 }
 
+DppTargetLane EmitDpp8TargetLane(EmitterState& state, uint32_t lane_selectors) {
+	// Each group of eight is independent, including both halves of a guest wave64.
+	const auto subid    = EmitSubgroupLocalInvocationId(state);
+	const auto group    = state.builder.AllocateId();
+	const auto in_group = state.builder.AllocateId();
+	const auto shift    = state.builder.AllocateId();
+	const auto shifted  = state.builder.AllocateId();
+	const auto sel      = state.builder.AllocateId();
+	const auto lane     = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    {OpBitwiseAnd, TypeU32(state), group, subid, ConstantU32(state, 0xfffffff8u)});
+	state.builder.AddFunction(
+	    {OpBitwiseAnd, TypeU32(state), in_group, subid, ConstantU32(state, 7u)});
+	state.builder.AddFunction(
+	    {OpIMul, TypeU32(state), shift, in_group, ConstantU32(state, 3u)});
+	state.builder.AddFunction({OpShiftRightLogical, TypeU32(state), shifted,
+	                           ConstantU32(state, lane_selectors), shift});
+	state.builder.AddFunction(
+	    {OpBitwiseAnd, TypeU32(state), sel, shifted, ConstantU32(state, 7u)});
+	state.builder.AddFunction({OpIAdd, TypeU32(state), lane, group, sel});
+	return {lane, EmitTrueBool(state)};
+}
+
 uint32_t EmitSubgroupLocalInvocationId(EmitterState& state) {
+	if (state.compute_execution.IsCooperativeWave64()) {
+		return EmitBinaryU32(state, OpBitwiseAnd, EmitHostLocalInvocationIndex(state),
+		                     ConstantU32(state, 63));
+	}
+	if (state.compute_execution.IsSplitWave64()) return EmitHostLocalInvocationIndex(state);
 	if (state.subgroup_local_invocation_id_variable == 0) {
 		EXIT("SubgroupLocalInvocationId was not declared before SPIR-V function emission\n");
 	}
@@ -153,6 +181,41 @@ const InputBinding* InputBindingForParameter(const EmitterState& state, uint32_t
 }
 
 uint32_t EmitInputComponentU32(EmitterState& state, IR::StageInputKind kind, uint32_t component) {
+	if ((state.compute_workgroup.IsReshaped() || state.compute_execution.IsSplitWave64()) && (kind == IR::StageInputKind::LocalInvocationId ||
+	                                             kind == IR::StageInputKind::GlobalInvocationId)) {
+		EXIT_IF(component >= 3u);
+		const auto& guest = state.compute_workgroup.guest_size;
+		uint32_t    local = ConstantU32(state, 0);
+		if (guest[component] != 1u) {
+			// Recover guest coordinates from the unchanged X-major local invocation index.
+			local             = EmitLocalInvocationIndex(state);
+			const auto stride = component == 0u   ? 1u
+			                    : component == 1u ? guest[0]
+			                                      : guest[0] * guest[1];
+			if (stride != 1u) {
+				const auto divided = state.builder.AllocateId();
+				state.builder.AddFunction(
+				    {OpUDiv, TypeU32(state), divided, local, ConstantU32(state, stride)});
+				local = divided;
+			}
+			if (component != 2u) {
+				const auto remainder = state.builder.AllocateId();
+				state.builder.AddFunction({OpUMod, TypeU32(state), remainder, local,
+				                           ConstantU32(state, guest[component])});
+				local = remainder;
+			}
+		}
+		if (kind == IR::StageInputKind::LocalInvocationId) {
+			return local;
+		}
+		const auto group = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, component);
+		const auto offset = state.builder.AllocateId();
+		const auto global = state.builder.AllocateId();
+		state.builder.AddFunction(
+		    {OpIMul, TypeU32(state), offset, group, ConstantU32(state, guest[component])});
+		state.builder.AddFunction({OpIAdd, TypeU32(state), global, offset, local});
+		return global;
+	}
 	const auto variable = InputVariableForKind(state, kind);
 	if (variable == 0) {
 		return ConstantU32(state, 0);
@@ -166,13 +229,17 @@ uint32_t EmitInputComponentU32(EmitterState& state, IR::StageInputKind kind, uin
 	return value;
 }
 
-uint32_t EmitLocalInvocationIndex(EmitterState& state) {
+uint32_t EmitHostLocalInvocationIndex(EmitterState& state) {
 	const auto variable = InputVariableForKind(state, IR::StageInputKind::LocalInvocationIndex);
 	if (variable == 0) {
 		return ConstantU32(state, 0);
 	}
-	const auto value = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, variable);
+	uint32_t value = state.host_local_invocation_index;
+	if (value == 0) {
+		value = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, variable);
+		if (state.compute_execution.IsSplitWave64()) state.host_local_invocation_index = value;
+	}
 	if (state.lane_count == 2) {
 		const auto wave_base =
 		    EmitBinaryU32(state, spv::OpBitwiseAnd, value, ConstantU32(state, ~31u));
@@ -208,10 +275,10 @@ uint32_t EmitVertexParameterComponentU32(EmitterState& state, const InputBinding
 }
 
 uint32_t EmitSubgroupLaneActiveBool(EmitterState& state, uint32_t lane) {
-	const auto active_ballot = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4), active_ballot,
-	                          ConstantU32(state, spv::ScopeSubgroup), ConstantBool(state, true));
-	return EmitBallotLaneActiveBool(state, active_ballot, lane);
+	// Route through the wave ballot helper so split/cooperative wave64 uses the
+	// admitted workgroup aggregate instead of a bare 32-lane subgroup ballot.
+	return EmitBallotLaneActiveBool(state, EmitWaveBallot(state, ConstantBool(state, true)),
+	                                lane);
 }
 uint32_t EmitBallotLaneActiveBool(EmitterState& state, uint32_t active_ballot, uint32_t lane) {
 	const auto low = state.builder.AllocateId();
@@ -248,4 +315,23 @@ uint32_t EmitBallotLaneActiveBool(EmitterState& state, uint32_t active_ballot, u
 	return ret;
 }
 
+uint32_t EmitLocalInvocationIndex(EmitterState& state) {
+	const auto local = EmitHostLocalInvocationIndex(state);
+	if (!state.compute_execution.IsSplitWave64() || state.compute_execution.wave_partition_factor == 1)
+		return local;
+	const auto variable = InputVariableForKind(state, IR::StageInputKind::WorkgroupId);
+	EXIT_IF(variable == 0);
+	const auto pointer = state.builder.AllocateId();
+	const auto host_group_x = state.builder.AllocateId();
+	state.builder.AddFunction({OpAccessChain, TypePointer(state, StorageClassInput, TypeU32(state)),
+	                           pointer, variable, ConstantU32(state, 0)});
+	state.builder.AddFunction({OpLoad, TypeU32(state), host_group_x, pointer});
+	const auto wave = EmitBinaryU32(state, OpUMod, host_group_x,
+	                                ConstantU32(state, state.compute_execution.wave_partition_factor));
+	const auto offset = EmitBinaryU32(state, OpIMul, wave, ConstantU32(state, 64));
+	return EmitBinaryU32(state, OpIAdd, offset, local);
+}
+
+
+uint32_t EmitTrueBool(EmitterState& state) { return ConstantBool(state, true); }
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter

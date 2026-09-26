@@ -558,6 +558,8 @@ static void ShaderGetStaticInputInfoPS(
 	KYTY_PROFILER_FUNCTION();
 
 	ps_info = {};
+	ps_info.initial_fp_state = {true, regs.ps_regs.rsrc1.float_mode, regs.ps_regs.rsrc1.ieee_mode,
+	                         regs.ps_regs.rsrc1.dx10_clamp};
 	ps_info.scratch_size_dwords = data.scratch_size_dwords;
 
 	// SPI_PS_IN_CONTROL: NUM_INTERP occupies bits 5:0 and PS_W32_EN is bit 15.
@@ -617,6 +619,8 @@ static void ShaderGetStaticInputInfoCS(const HW::ComputeShaderInfo& regs,
 	info                                  = {};
 	info.dispatch_thread_dimensions       = dispatch_thread_dimensions;
 	info.host_subgroup_size               = host_subgroup_size;
+	info.initial_fp_state = {true, regs.cs_regs.float_mode, regs.cs_regs.ieee_mode,
+	                         regs.cs_regs.dx10_clamp};
 	info.threads_num[0]                   = regs.cs_regs.num_thread_x;
 	info.threads_num[1]                   = regs.cs_regs.num_thread_y;
 	info.threads_num[2]                   = regs.cs_regs.num_thread_z;
@@ -635,6 +639,7 @@ static void ShaderGetStaticInputInfoCS(const HW::ComputeShaderInfo& regs,
 void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t>& key) {
 	EXIT_IF(info.resources_num < 0 || info.resources_num > ShaderVertexInputInfo::RES_MAX);
 	key.clear();
+	key.push_back(info.initial_fp_state.StaticKey());
 	key.push_back(static_cast<uint32_t>(info.fetch_embedded));
 	key.push_back(static_cast<uint32_t>(info.fetch_attrib_reg));
 	key.push_back(static_cast<uint32_t>(info.fetch_buffer_reg));
@@ -642,6 +647,12 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 	key.push_back(info.wave_size);
 	key.push_back(info.scratch_size_dwords);
 	key.push_back(info.pa_cl_vs_out_cntl);
+	EXIT_IF(info.linked_param_count > ShaderVertexInputInfo::PARAM_LINK_MAX);
+	key.push_back(info.linked_param_count);
+	for (uint32_t i = 0; i < info.linked_param_count; ++i) {
+		key.push_back(info.linked_param_sources[i]);
+		key.push_back(info.linked_param_locations[i]);
+	}
 	key.push_back(static_cast<uint32_t>(info.clip_space.enabled));
 	if (info.clip_space.enabled) {
 		for (const float value: info.clip_space.scale) {
@@ -692,6 +703,7 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>& key) {
 	EXIT_IF(info.input_num > std::size(info.interpolator_settings));
 	key.clear();
+	key.push_back(info.initial_fp_state.StaticKey());
 	key.push_back(info.scratch_size_dwords);
 	key.push_back(info.input_num);
 	key.push_back(info.wave_size);
@@ -726,6 +738,7 @@ void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>
 
 void BuildStageStaticKey(const ShaderComputeInputInfo& info, std::vector<uint32_t>& key) {
 	key.clear();
+	key.push_back(info.initial_fp_state.StaticKey());
 	key.push_back(info.workgroup_register);
 	key.push_back(info.wave_size);
 	key.push_back(info.host_subgroup_size);
@@ -755,6 +768,8 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 		                                    regs.gs_regs.rsrc2.user_sgpr, sh, data, info)) {
 			EXIT("failed to prepare vertex shader program\n");
 		}
+	info.initial_fp_state = {true, regs.gs_regs.rsrc1.float_mode, regs.gs_regs.rsrc1.ieee_mode,
+	                         regs.gs_regs.rsrc1.dx10_clamp};
 		info.wave_size = (context.GetShaderStages() & 0x00400000u) != 0 ? 32u : 64u;
 		return params;
 	}

@@ -181,6 +181,10 @@ sudo apt-get install --no-install-recommends \
 Qt 6 (Concurrent, Network, Widgets) is required for the launcher — either the distribution packages
 (`qt6-base-dev`) or an official Qt installation.
 
+Qt is only needed for the launcher. To build without it, configure with
+`-DKYTY_BUILD_LAUNCHER=OFF` and build `kyty_emulator` (plus `kyty_tests` for the regression
+tests) instead of `launcher`.
+
 ```bash
 git submodule update --init --recursive
 

@@ -37,6 +37,8 @@ private:
 	void                   WriteF16(const Decoder::Operand& operand, IR::F32 value);
 	IR::U32                ReadU32(const Decoder::Operand& operand);
 	std::array<IR::U32, 2> ReadU32Pair(const Decoder::Operand& operand);
+	IR::F64                ReadF64(const Decoder::Operand& operand);
+	IR::U1 MaskIsZero(IR::U32 low, IR::U32 high);
 	IR::U64                ReadU64(const Decoder::Operand& operand);
 	IR::F32 ReadF16LaneAsF32(const Decoder::Operand& operand, bool high_lane, bool packed = false);
 	IR::F32 ReadF16AsF32(const Decoder::Operand& operand);
@@ -127,6 +129,7 @@ private:
 	void EmitFloatOrderedCompare(const Decoder::Instruction& inst, bool ordered, bool cmpx);
 	void EmitFloatClassCompare(const Decoder::Instruction& inst, bool cmpx);
 	void V_CVT_F32_UBYTE(const Decoder::Instruction& inst, uint32_t byte_index);
+	void V_CVT_F64_32(const Decoder::Instruction& inst, bool signed_value);
 	void V_CVT_F32_U32(const Decoder::Instruction& inst);
 	void V_CVT_F32_I32(const Decoder::Instruction& inst);
 	void V_CVT_U32_F32(const Decoder::Instruction& inst);

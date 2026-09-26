@@ -80,6 +80,8 @@ void ValidateNativeProgram(const IR::Program& program) {
 	}
 	const bool uses_flattened_runtime =
 	    !program.srt_reads.empty() ||
+	    std::ranges::any_of(program.info.bounded_srt_reads, [](const auto& read) { return read.count != 0; }) ||
+	    std::ranges::any_of(program.info.buffer_tables, [](const auto& table) { return table.count != 0; }) ||
 	     std::ranges::any_of(program.info.images, [](const IR::ImageResource& image) {
 		     return image.indirect_search_iterations != 0u;
 	     });
@@ -110,6 +112,9 @@ void ValidateNativeProgram(const IR::Program& program) {
 	     !IR::PushData::CanFit(program.bindings.push_data_start_dword, shader_data_dwords)) ||
 	    program.bindings.memory_offset_dword != program.bindings.user_data_registers.size() ||
 	    program.bindings.memory_offset_count != program.info.buffers.size() ||
+	    program.bindings.memory_limit_dword !=
+	        program.bindings.memory_offset_dword +
+	            (program.bindings.memory_offset_count + 3u) / 4u ||
 	    has_shader_data_storage != (shader_data_dwords != 0 && !program.bindings.UsesPushData()) ||
 	    !std::is_sorted(program.bindings.user_data_registers.begin(),
 	                    program.bindings.user_data_registers.end()) ||
@@ -151,7 +156,26 @@ void ValidateNativeProgram(const IR::Program& program) {
 					if (planning_only_handle(inst) || indirect_buffer_handle(inst)) {
 						break;
 					}
-					if (dense >= program.info.buffers.size()) {
+					if (!inst.Uses().empty() && std::ranges::any_of(inst.Uses(), [&](const IR::Use& use) {
+						if (IR::BufferAccessOf(use.user->GetOpcode()) == IR::BufferAccess::None) { return false; }
+						const auto index = use.user->Flags<IR::MemoryFlags>().index;
+						return index < program.memory_info.size() &&
+						       program.memory_info[index].buffer_table != UINT32_MAX;
+					})) {
+						if (dense >= program.info.buffer_tables.size()) {
+							Fail(program, "typed buffer handle has an invalid bounded table");
+						}
+						for (const auto& use: inst.Uses()) {
+							if (IR::BufferAccessOf(use.user->GetOpcode()) == IR::BufferAccess::None) {
+								Fail(program, "bounded buffer handle has an unsupported use");
+							}
+							const auto index = use.user->Flags<IR::MemoryFlags>().index;
+							if (index >= program.memory_info.size() ||
+							    program.memory_info[index].buffer_table != dense) {
+								Fail(program, "bounded buffer handle and memory table disagree");
+							}
+						}
+					} else if (dense >= program.info.buffers.size()) {
 						Fail(program, "typed buffer handle has an invalid dense resource");
 					}
 					break;
@@ -198,10 +222,6 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 	SpirvRequirements requirements {};
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
-			if (IR::BufferAccessOf(inst.GetOpcode()) == IR::BufferAccess::Atomic &&
-			    inst.GetType() == IR::Type::U64) {
-				requirements.buffer_int64_atomics = true;
-			}
 			const auto address_access = IR::AddressOpcodeInfoOf(inst.GetOpcode()).access;
 			if (address_access != IR::AddressAccess::None) {
 				const auto memory_index = inst.Flags<IR::MemoryFlags>().index;
@@ -226,17 +246,34 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 				if (memory.kind == IR::ResourceKind::IndirectBuffer) {
 					requirements.subgroup_local_invocation_id = true;
 				}
-				if (memory.kind == IR::ResourceKind::Buffer) {
+				const auto inspect_candidate = [&](uint32_t resource) {
 					requirements.coherent_buffers |= memory.coherent;
-					if (memory.resource >= program.info.buffers.size()) {
+					if (resource >= program.info.buffers.size()) {
 						Fail(program, "buffer operation has invalid resource metadata");
 					}
-					if ((program.info.buffers[memory.resource].packed_stride & (1u << 20u)) != 0u) {
+					if (IR::BufferAccessOf(inst.GetOpcode()) == IR::BufferAccess::Atomic &&
+					    inst.GetType() == IR::Type::U64) {
+						requirements.buffer_int64_atomics = true;
+					}
+					if (memory.kind == IR::ResourceKind::Buffer &&
+					    (program.info.buffers[resource].packed_stride & (1u << 20u)) != 0u) {
 						if (program.stage != ShaderType::Compute) {
 							Fail(program, "buffer ADD_TID is only valid for compute shaders");
 						}
 						requirements.subgroup_local_invocation_id = true;
 					}
+				};
+				if (memory.buffer_table != UINT32_MAX) {
+					if (memory.buffer_table >= program.info.buffer_tables.size()) {
+						Fail(program, "buffer operation has invalid bounded table metadata");
+					}
+					const auto& table = program.info.buffer_tables[memory.buffer_table];
+					if ((table.count == 0) != table.resources.empty()) {
+						Fail(program, "bounded buffer count and candidates disagree");
+					}
+					for (const auto resource: table.resources) { inspect_candidate(resource); }
+				} else if (memory.kind == IR::ResourceKind::Buffer) {
+					inspect_candidate(memory.resource);
 				}
 			}
 			const auto shared_access = IR::SharedAccessOf(inst.GetOpcode());
@@ -253,6 +290,13 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 				    kind == IR::ResourceKind::Lds) {
 					requirements.function_lds = true;
 				}
+				if (inst.GetOpcode() == IR::ValueOpcode::SharedAtomicIAdd64 ||
+				    inst.GetOpcode() == IR::ValueOpcode::SharedAtomicOr64) {
+					if (program.stage != ShaderType::Compute || kind != IR::ResourceKind::Lds) {
+						Fail(program, "64-bit shared atomics require compute LDS storage");
+					}
+					requirements.shared_int64_atomics = true;
+				}
 				if (shared_access == IR::SharedAccess::Append ||
 				    shared_access == IR::SharedAccess::Consume) {
 					requirements.subgroup_ballot              = true;
@@ -263,11 +307,13 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 			switch (inst.GetOpcode()) {
 				case IR::ValueOpcode::Ballot: requirements.subgroup_ballot = true; break;
 				case IR::ValueOpcode::DppMoveU32:
+				case IR::ValueOpcode::Dpp8MoveU32:
 				case IR::ValueOpcode::ReadFirstLane:
 				case IR::ValueOpcode::ReadLane: {
 					requirements.subgroup_ballot  = true;
 					requirements.subgroup_shuffle = true;
-					if (inst.GetOpcode() == IR::ValueOpcode::DppMoveU32) {
+					if (inst.GetOpcode() == IR::ValueOpcode::DppMoveU32 ||
+					    inst.GetOpcode() == IR::ValueOpcode::Dpp8MoveU32) {
 						requirements.subgroup_local_invocation_id = true;
 					}
 					break;
@@ -317,8 +363,12 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 	return requirements;
 }
 
-std::vector<uint32_t> EmitProgram(const IR::Program& program,
-                                  ShaderStageInputInfo input_info) {
+void CollectSpirvRequirements(IR::Program& program) { program.spirv_requirements = Emitter::AnalyzeProgramRequirements(program); }
+
+std::vector<uint32_t> EmitProgram(const IR::Program& program, ShaderStageInputInfo input_info,
+                                  const ComputeWorkgroupLimits& compute_workgroup_limits,
+                                  const ShaderHostProfile& host_profile,
+                                  const IR::ResourceSpecialization& specialization) {
 	using namespace Emitter;
 
 	if (program.stage != ShaderType::Compute && program.stage != ShaderType::Vertex &&
@@ -333,10 +383,32 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 	}
 	ValidateNativeProgram(program);
 	IR::ValidateProgram(program, true);
-	EmitterState state(program, input_info);
+	ShaderFloatingPointState initial_fp_state{};
+	if (program.stage == ShaderType::Compute && input_info.compute != nullptr) {
+		initial_fp_state = input_info.compute->initial_fp_state;
+	} else if (program.stage == ShaderType::Vertex && input_info.vertex != nullptr) {
+		initial_fp_state = input_info.vertex->initial_fp_state;
+	} else if (program.stage == ShaderType::Pixel && input_info.pixel != nullptr) {
+		initial_fp_state = input_info.pixel->initial_fp_state;
+	}
+	const auto f64 = IR::AnalyzeF64Program(program, initial_fp_state, host_profile);
+	if (!f64.error.empty()) {
+		Fail(program, f64.error.c_str());
+	}
+	EmitterState state(program, input_info, specialization);
+	state.f64_certificate = f64;
+	state.stage = program.stage;
+	state.wave_size = program.wave_size;
+	state.native_subgroup_size = compute_workgroup_limits.native_subgroup_size;
+	if (program.stage == ShaderType::Compute) {
+		state.compute_execution = PlanComputeExecution(program, input_info, compute_workgroup_limits);
+		if (!state.compute_execution.error.empty()) Fail(program, state.compute_execution.error.c_str());
+		state.compute_workgroup = state.compute_execution.layout;
+	}
 	const auto* workgroup = ShaderWorkgroupInput(program.stage, input_info);
 	state.lane_count =
-	    workgroup != nullptr && program.wave_size == 64u && workgroup->host_subgroup_size == 32u
+	    !state.compute_execution.IsSplitWave64() && workgroup != nullptr &&
+	    program.wave_size == 64u && workgroup->host_subgroup_size == 32u
 	        ? 2u
 	        : 1u;
 	DefineModule(state);

@@ -167,8 +167,26 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	                                    copies = std::move(copies)] {
 		m_download_buffer.Invalidate(offset, total_size);
 		for (const auto& copy: copies) {
-			Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
-			                                      mapped + (copy.dstOffset - offset), copy.size);
+			const auto guest = buffer_address + copy.srcOffset;
+			const auto host  = mapped + (copy.dstOffset - offset);
+			const auto writable =
+			    Libs::LibKernel::Memory::TryClampRangeSize(guest, copy.size);
+			if (writable == 0) {
+				LOGF("BufferCache: skipped GPU download into unmapped guest "
+				     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+				     guest, copy.size);
+				continue;
+			}
+			if (writable != copy.size) {
+				LOGF("BufferCache: clamped GPU download addr=0x%016" PRIx64
+				     " size=0x%016" PRIx64 " to 0x%016" PRIx64 "\n",
+				     guest, copy.size, writable);
+			}
+			if (!Libs::LibKernel::Memory::TryWriteBacking(guest, host, writable)) {
+				LOGF("BufferCache: skipped GPU download write without host backing "
+				     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+				     guest, writable);
+			}
 		}
 	});
 	return true;
@@ -484,9 +502,28 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	}
 
 	auto [staging, stage_offset] = m_staging_buffer.Map(size, 16);
-	if (staging == nullptr || (!Libs::LibKernel::Memory::TryReadBacking(vaddr, staging, size) &&
-	                           !Libs::LibKernel::Memory::TryReadPrtBacking(vaddr, staging, size))) {
-		EXIT("BufferCache: failed to read mapped guest image backing\n");
+	// Image descriptors may span past the contiguous mapped VMA prefix (PRT holes,
+	// sparse commits). Read the mapped head and zero the unmapped tail — same
+	// guest-visible zero fill used for OOB scalar buffer loads.
+	const auto mapped =
+	    staging != nullptr ? Libs::LibKernel::Memory::TryClampRangeSize(vaddr, size) : uint64_t {0};
+	bool filled = false;
+	if (staging != nullptr && mapped != 0) {
+		filled = Libs::LibKernel::Memory::TryReadBacking(vaddr, staging, mapped) ||
+		         Libs::LibKernel::Memory::TryReadPrtBacking(vaddr, staging, mapped);
+		if (filled && mapped < size) {
+			std::memset(staging + mapped, 0, static_cast<size_t>(size - mapped));
+		}
+	}
+	if (!filled) {
+		EXIT("BufferCache: failed to read mapped guest image backing "
+		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 " clamped=0x%016" PRIx64
+		     " staging=%d registered=%d cpu_dirty=%d gpu_dirty=%d buffer_dirty=%d\n",
+		     vaddr, size, Libs::LibKernel::Memory::TryClampRangeSize(vaddr, size),
+		     staging != nullptr, IsRegionRegistered(vaddr, size),
+		     m_memory_tracker.IsRegionCpuModified(vaddr, size),
+		     m_memory_tracker.IsRegionGpuModified(vaddr, size),
+		     m_gpu_modified_ranges.Intersects(vaddr, size));
 	}
 	m_staging_buffer.Commit();
 	return {&m_staging_buffer, stage_offset};

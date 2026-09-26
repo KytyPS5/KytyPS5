@@ -14,12 +14,16 @@
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
 #include "kernel/memory.h"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -715,6 +719,11 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	switch (binding) {
 		case BindingType::Texture:
 			recreate |= requested.IsDepth() && !cached.info.IsDepth();
+			// Vulkan image views cannot cross the depth/stencil and color format
+			// classes. Guest software may reinterpret the same allocation through a
+			// color texture descriptor, so replace the native depth image and preserve
+			// its depth-aspect bits through the existing buffer copy path.
+			recreate |= cached.info.IsDepth() && !requested.IsDepth();
 			recreate |= raw_d16_texture;
 			break;
 		case BindingType::Storage: recreate |= cached.info.IsDepth(); break;
@@ -1088,8 +1097,50 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 	upload(copies, linear);
 }
 
-void TextureCache::InitializeImage(ImageId id) {
+GuestRange TextureCache::SelectUploadRange(const ImageInfo& info,
+                                           const ImageViewInfo& view) noexcept {
+	if (!info.data.Valid() || info.IsVolume() || info.resources.levels == 0 ||
+	    info.resources.levels > info.mip_layout.size() || info.resources.layers != 1 ||
+	    view.level_count == 0 || view.base_level >= info.resources.levels ||
+	    view.level_count > info.resources.levels - view.base_level || view.layer_count == 0 ||
+	    view.base_layer >= info.resources.layers ||
+	    view.layer_count > info.resources.layers - view.base_layer) {
+		return info.data;
+	}
+	uint64_t begin = UINT64_MAX;
+	uint64_t end   = 0;
+	for (uint32_t level = view.base_level; level < view.base_level + view.level_count; ++level) {
+		const auto& mip = info.mip_layout[level];
+		if (mip.size == 0 || mip.size % info.resources.layers != 0) {
+			return info.data;
+		}
+		const auto layer_size = mip.size;
+		if (view.base_layer > (UINT64_MAX - mip.offset) / layer_size) {
+			return info.data;
+		}
+		const auto mip_begin = mip.offset + layer_size * view.base_layer;
+		if (view.layer_count > (UINT64_MAX - mip_begin) / layer_size) {
+			return info.data;
+		}
+		const auto mip_end = mip_begin + layer_size * view.layer_count;
+		if (mip_begin > info.data.size || mip_end > info.data.size) {
+			return info.data;
+		}
+		begin = std::min(begin, mip_begin);
+		end   = std::max(end, mip_end);
+	}
+	if (begin == UINT64_MAX || begin >= end || begin > UINT64_MAX - info.data.address) {
+		return info.data;
+	}
+	return {info.data.address + begin, end - begin};
+}
+
+void TextureCache::InitializeImage(ImageId id, const ImageDesc* description) {
+	const ImageDesc desc = description != nullptr ? *description : ImageDesc {};
 	auto& image = m_slot_images[id];
+	if (image.sampled_htile_clear_import) {
+		EXIT("sampled HTile import cannot upload raw depth backing\n");
+	}
 	if (image.info.data.Empty()) {
 		return;
 	}
@@ -1105,8 +1156,39 @@ void TextureCache::InitializeImage(ImageId id) {
 	}
 	const bool upload = image.IsBufferModified() || image.IsCpuDirty();
 	if (upload) {
+		const auto upload_range = description != nullptr && (desc.type == BindingType::Texture || desc.type == BindingType::Storage)
+		                              ? SelectUploadRange(image.info, desc.view_info)
+		                              : image.info.data;
+		const auto mapped_size =
+		    LibKernel::Memory::TryClampRangeSize(upload_range.address, upload_range.size);
+		if (mapped_size < upload_range.size) {
+			LOGF("TextureUploadLayout binding=%u addr=0x%016" PRIx64
+			     " size=0x%016" PRIx64 " upload=0x%016" PRIx64 "+0x%016" PRIx64
+			     " mapped=0x%016" PRIx64
+			     " extent=%ux%ux%u pitch=%u levels=%u layers=%u samples=%u"
+			     " type=%u tile=%u format=%u guest=%u bpb=%u view=%u+%u/%u+%u\n",
+			     static_cast<uint32_t>(desc.type), image.info.data.address, image.info.data.size,
+			     upload_range.address, upload_range.size, mapped_size, image.info.extent.width,
+			     image.info.extent.height,
+			     image.info.extent.depth, image.info.pitch, image.info.resources.levels,
+			     image.info.resources.layers, image.info.samples,
+			     static_cast<uint32_t>(image.info.type),
+			     static_cast<uint32_t>(image.info.tile_mode),
+			     static_cast<uint32_t>(image.info.pixel_format),
+			     static_cast<uint32_t>(image.info.guest_format), image.info.bytes_per_block,
+			     desc.view_info.base_level, desc.view_info.level_count, desc.view_info.base_layer,
+			     desc.view_info.layer_count);
+			for (uint32_t level = 0;
+			     level < image.info.resources.levels && level < image.info.mip_layout.size();
+			     ++level) {
+				const auto& mip = image.info.mip_layout[level];
+				LOGF("TextureUploadMip level=%u offset=0x%016" PRIx64
+				     " size=0x%016" PRIx64 " pitch=%u height=%u\n",
+				     level, mip.offset, mip.size, mip.pitch, mip.height);
+			}
+		}
 		const auto [source, source_offset] =
-		    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
+		    m_buffer_cache.ObtainBufferForImage(upload_range.address, upload_range.size);
 		if (source == nullptr) {
 			EXIT("TextureCache: failed to obtain image upload source\n");
 		}
@@ -1244,6 +1326,204 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 	return association;
 }
 
+
+ImageId TextureCache::FindSampledHtileImage(ImageDesc& desc) {
+	ValidateImageDesc(desc);
+	const auto requested = desc.info;
+	if (desc.type != BindingType::Texture || !requested.data.Valid() ||
+	    requested.metadata.kind != ImageMetadataKind::Htile ||
+	    !requested.metadata.range.Valid()) {
+		EXIT("invalid sampled HTile image description\n");
+	}
+	const auto metadata = requested.metadata.range;
+	if (requested.data.address < metadata.End() && metadata.address < requested.data.End()) {
+		EXIT("sampled HTile metadata overlaps its depth allocation\n");
+	}
+	// Inspect every overlapping owner before any cache mutation. Native depth
+	// targets keep their GPU pixels; their guest HTile may deliberately be stale.
+	const auto lookup = [&]() {
+		ImageId result {};
+		for (const auto id: FindImagesInRegion(requested.data.address, requested.data.size, false)) {
+			const auto& image = m_slot_images[id];
+			const auto& info = image.info;
+			const bool exact_ranges = info.data == requested.data &&
+			    info.resources == requested.resources && info.metadata.range == metadata;
+			// Preserve existing native depth-array views of a prefix allocation.
+			// Imported clears themselves still require the exact single-layer owner.
+			const bool native_prefix = !image.sampled_htile_clear_import &&
+			    info.data.Valid() && info.metadata.range.Valid() &&
+			    info.resources.levels == 1 && requested.resources.levels == 1 &&
+			    info.resources.layers >= requested.resources.layers && requested.resources.layers != 0 &&
+			    info.data.address == requested.data.address && info.data.size >= requested.data.size &&
+			    info.data.size % info.resources.layers == 0 &&
+			    requested.data.size % requested.resources.layers == 0 &&
+			    info.data.size / info.resources.layers ==
+			        requested.data.size / requested.resources.layers &&
+			    info.metadata.range.address == metadata.address && info.metadata.range.size >= metadata.size &&
+			    info.metadata.range.size % info.resources.layers == 0 &&
+			    metadata.size % requested.resources.layers == 0 &&
+			    info.metadata.range.size / info.resources.layers ==
+			        metadata.size / requested.resources.layers;
+			const bool matches = !image.depth_id && info.IsDepth() &&
+			    (exact_ranges || native_prefix) && info.extent == requested.extent &&
+			    info.type == requested.type && info.pitch == requested.pitch &&
+			    info.samples == requested.samples && info.bytes_per_block == requested.bytes_per_block &&
+			    info.guest_format == requested.guest_format && info.tile_mode == requested.tile_mode &&
+			    info.metadata.kind == ImageMetadataKind::Htile;
+			if (!matches || (result && result != id)) {
+				EXIT("sampled HTile import requires an exact nonoverlapping depth owner\n");
+			}
+			result = id;
+		}
+		return result;
+	};
+	ImageId existing_native {};
+	{
+		std::scoped_lock lock {m_lock};
+		const auto existing = lookup();
+		if (existing && !m_slot_images[existing].sampled_htile_clear_import) {
+			existing_native = existing;
+		}
+	}
+	TileSizeAlign stencil_size {}, htile_size {}, depth_size {};
+	const bool per_layer_layout =
+	    TileGetDepthSize(requested.extent.width, requested.extent.height, 0,
+	                     Prospero::DepthFormat::kZ32F, Prospero::StencilFormat::kInvalid,
+	                     true, stencil_size, htile_size, depth_size, 0);
+	const uint64_t layers = requested.resources.layers;
+	const bool shape = requested.pixel_format == vk::Format::eD32Sfloat &&
+	    requested.guest_format == Prospero::BufferFormat::k32Float &&
+	    requested.type == Prospero::ImageType::kColor2D && requested.extent.depth == 1 &&
+	    requested.resources.levels == 1 && layers != 0 && requested.samples == 1 &&
+	    requested.bytes_per_block == 4 && requested.tile_mode == Prospero::TileMode::kDepth &&
+	    !requested.HasStencil() && !requested.metadata.stencil_compressed &&
+	    requested.metadata.compression == VideoOutCompression::Uncompressed &&
+	    per_layer_layout && requested.data.size == static_cast<uint64_t>(depth_size.size) * layers &&
+	    metadata.size == static_cast<uint64_t>(htile_size.size) * layers &&
+	    (metadata.address & (htile_size.align - 1u)) == 0 &&
+	    requested.pitch == TileGetTexturePitch(requested.guest_format, requested.extent.width,
+	                                           requested.tile_mode);
+	const bool data_mapped =
+	    m_scheduler.Context().IsMapped(requested.data.address, requested.data.size);
+	const bool metadata_mapped =
+	    m_scheduler.Context().IsMapped(metadata.address, metadata.size);
+	if (!shape || !data_mapped || !metadata_mapped) {
+		EXIT("unsupported sampled HTile clear import geometry or mapping: shape=%d "
+		     "data_mapped=%d metadata_mapped=%d data=0x%016" PRIx64 "+0x%016" PRIx64
+		     " metadata=0x%016" PRIx64 "+0x%016" PRIx64
+		     " extent=%ux%ux%u pitch=%u levels=%u layers=%u samples=%u bpe=%u "
+		     "pixel_format=%u guest_format=%u type=%u tile=%u stencil=%d "
+		     "stencil_compressed=%d compression=%u expected_depth=0x%08x "
+		     "expected_htile=0x%08x htile_align=0x%08x\n",
+		     shape, data_mapped, metadata_mapped, requested.data.address,
+		     requested.data.size, metadata.address, metadata.size, requested.extent.width,
+		     requested.extent.height, requested.extent.depth, requested.pitch,
+		     requested.resources.levels, requested.resources.layers, requested.samples,
+		     requested.bytes_per_block, static_cast<uint32_t>(requested.pixel_format),
+		     static_cast<uint32_t>(requested.guest_format), static_cast<uint32_t>(requested.type),
+		     static_cast<uint32_t>(requested.tile_mode), requested.HasStencil(),
+		     requested.metadata.stencil_compressed,
+		     static_cast<uint32_t>(requested.metadata.compression), depth_size.size,
+		     htile_size.size, htile_size.align);
+	}
+	uint32_t clear                = 0;
+	bool     tracked_clear_known = layers <= 32;
+	for (uint32_t layer = 0; tracked_clear_known && layer < layers; layer++) {
+		uint32_t layer_fill       = 0;
+		bool     layer_fill_known = false;
+		if (!IsMetaCleared(metadata.address, layer, &layer_fill, &layer_fill_known) ||
+		    !layer_fill_known || (layer != 0 && layer_fill != clear)) {
+			tracked_clear_known = false;
+			break;
+		}
+		clear = layer_fill;
+	}
+	if (tracked_clear_known && clear != 0 && clear != 0xfffffff0u) {
+		EXIT("sampled HTile metadata fill does not encode a supported depth clear\n");
+	}
+	if (existing_native) {
+		// Native depth attachments keep GPU pixels; guest HTile may be stale or
+		// GPU-dirty. Prefer the attachment over a CPU clear-import that would
+		// EXIT on ownership or fight the rendered depth.
+		std::scoped_lock lock {m_lock};
+		auto& image = m_slot_images[existing_native];
+		TouchImage(image);
+		return existing_native;
+	}
+	if (IsRegionGpuModified(metadata.address, metadata.size)) {
+		EXIT("sampled HTile import has unsupported GPU image or raw-buffer ownership\n");
+	}
+	if (m_buffer_cache.HasGpuDirtyBytes(requested.data.address, requested.data.size)) {
+		// Depth bytes are buffer-dirty without a matching image owner. Drain to
+		// host so the clear-import path can treat HTile as authoritative.
+		m_buffer_cache.ReadMemory(requested.data.address, requested.data.size);
+	}
+	if (m_buffer_cache.HasGpuDirtyBytes(requested.data.address, requested.data.size)) {
+		EXIT("sampled HTile import has unsupported GPU image or raw-buffer ownership\n");
+	}
+	// ReadMemory may submit/wait and reenter cache maintenance. No cache lock,
+	// image reference, or command-buffer reference may survive this call.
+	// ReadMemory widens its download window. A clean metadata range must not
+	// drain a disjoint writable binding whose GPU work is still to be recorded.
+	if (!tracked_clear_known) {
+		if (m_buffer_cache.HasGpuDirtyBytes(metadata.address, metadata.size)) {
+			m_buffer_cache.ReadMemory(metadata.address, metadata.size);
+		}
+		std::vector<uint32_t> words(metadata.size / sizeof(uint32_t));
+		if (m_buffer_cache.HasGpuDirtyBytes(metadata.address, metadata.size) ||
+		    IsRegionGpuModified(metadata.address, metadata.size) ||
+		    !LibKernel::Memory::TryReadBacking(metadata.address, words.data(), metadata.size)) {
+			EXIT("sampled HTile metadata is not coherent and readable\n");
+		}
+		// AMD PAL Gfx9Htile::GetClearValue: Z-only clear has ZMask=0 and min=max.
+		// TC depth clears support exact 0/1; mixed/other encodings need decompression.
+		clear = words.front();
+		if ((clear != 0 && clear != 0xfffffff0u) ||
+		    !std::all_of(words.begin(), words.end(),
+		                 [clear](uint32_t word) { return word == clear; })) {
+			EXIT("sampled HTile metadata is not a uniform supported clear\n");
+		}
+	}
+	std::scoped_lock lock {m_lock};
+	auto id = lookup();
+	if (id && !m_slot_images[id].sampled_htile_clear_import && !tracked_clear_known) {
+		TouchImage(m_slot_images[id]);
+		return id;
+	}
+	if (!id) {
+		auto info = requested;
+		info.htile_clear_mask = 0;
+		id = InsertImage(info);
+		m_slot_images[id].sampled_htile_clear_import = true;
+	}
+	auto& image = m_slot_images[id];
+	m_scheduler.EndRendering();
+	const auto command = m_scheduler.Current().Handle();
+	const ImageSubresourceRange subresource {0, 1, 0, requested.resources.layers};
+	image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
+	              subresource, command);
+	const vk::ImageSubresourceRange range {vk::ImageAspectFlagBits::eDepth, 0, 1, 0,
+	                                       requested.resources.layers};
+	const vk::ClearDepthStencilValue value {clear == 0 ? 0.0f : 1.0f, 0};
+	command.clearDepthStencilImage(image.backing.image, vk::ImageLayout::eTransferDstOptimal,
+	                               &value, 1, &range);
+	if (tracked_clear_known) {
+		const auto tracked = m_surface_metas.find(metadata.address);
+		if (tracked == m_surface_metas.end() ||
+		    tracked->second.type != MetaDataInfo::Type::HTile) {
+			EXIT("sampled HTile clear state disappeared during materialization\n");
+		}
+		for (uint32_t layer = 0; layer < layers; layer++) {
+			tracked->second.clear_mask &= ~(1u << layer);
+		}
+	}
+	TrackImage(id);
+	CommitGpuWrite(image);
+	image.tick_accessed_last = m_scheduler.CurrentTick();
+	TouchImage(image);
+	return id;
+}
+
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	auto& command = m_scheduler.Current();
 	if (command.IsInvalid()) {
@@ -1257,11 +1537,17 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	const auto metadata_base_layer = desc.view_info.base_layer;
 
 	ImageId result {};
+	bool    inserted_new = false;
 	{
 		std::scoped_lock lock {m_lock};
 		const auto       candidates =
 		    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
 
+		for (const auto id: candidates) {
+			if (m_slot_images[id].sampled_htile_clear_import) {
+				EXIT("sampled HTile import requires its metadata-aware lookup path\n");
+			}
+		}
 		for (const auto id: candidates) {
 			const auto& image = m_slot_images[id];
 			if (SameBacking(image.info, desc.info, exact_format)) {
@@ -1296,6 +1582,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		}
 		if (!result) {
 			result         = InsertImage(desc.info);
+			inserted_new   = true;
 			auto& inserted = m_slot_images[result];
 			if (m_buffer_cache.HasGpuDirtyBytes(inserted.info.data.address,
 			                                    inserted.info.data.size)) {
@@ -1376,6 +1663,20 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 }
 
 vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
+	bool imported = false;
+	{
+		std::scoped_lock lock {m_lock};
+		imported = m_slot_images[id].sampled_htile_clear_import;
+	}
+	if (imported) {
+		if (desc.type != BindingType::Texture) {
+			EXIT("sampled HTile import cannot change image ownership\n");
+		}
+		auto sampled = desc;
+		if (FindSampledHtileImage(sampled) != id) {
+			EXIT("sampled HTile texture changed before final acquisition\n");
+		}
+	}
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
 	TouchImage(image);
@@ -1425,6 +1726,9 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
 		EXIT("TextureCache: color target requires rediscovery before final acquisition\n");
 	}
+	if (image.sampled_htile_clear_import) {
+		EXIT("sampled HTile import cannot change image ownership\n");
+	}
 	TouchImage(image);
 	image.MarkGpuModified();
 	image.usage.render_target = true;
@@ -1442,6 +1746,9 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	auto&            image = m_slot_images[id];
 	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
 		EXIT("TextureCache: depth target requires rediscovery before final acquisition\n");
+	}
+	if (image.sampled_htile_clear_import) {
+		EXIT("sampled HTile import cannot change image ownership\n");
 	}
 	TouchImage(image);
 	image.MarkGpuModified();
@@ -1464,7 +1771,7 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 void TextureCache::MarkGpuWritten(ImageId id) {
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
-	if (!image.registered || image.depth_id) {
+	if (!image.registered || image.depth_id || image.sampled_htile_clear_import) {
 		EXIT("TextureCache: cannot mark an unavailable image GPU-written\n");
 	}
 	TrackImage(id);
@@ -1835,7 +2142,37 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	                                               1, &barrier, 0, nullptr);
 	m_scheduler.DeferPriorityOperation([&download, range, mapped, offset] {
 		download.Invalidate(offset, range.size);
-		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
+		const char* path = std::getenv("KYTY_RENDER_TARGET_INPUT_READBACK_PATH");
+		if (path == nullptr || *path == '\0') {
+			path = std::getenv("KYTY_VIDEO_OUT_DRAW_READBACK_PATH");
+		}
+		if (path != nullptr && *path != '\0') {
+			uint64_t nonzero = 0;
+			uint32_t minimum = UINT32_MAX;
+			uint32_t maximum = 0;
+			uint32_t first    = 0;
+			for (uint64_t index = 0; index < range.size; index++) {
+				const auto value = mapped[index];
+				nonzero += value != 0 ? 1 : 0;
+				minimum = std::min<uint32_t>(minimum, value);
+				maximum = std::max<uint32_t>(maximum, value);
+				if (index < sizeof(first)) {
+					first |= static_cast<uint32_t>(value) << (index * 8u);
+				}
+			}
+			if (auto* output = std::fopen(path, "ab"); output != nullptr) {
+				std::fprintf(output,
+				             "addr=0x%016" PRIx64 " size=0x%016" PRIx64
+				             " nonzero_bytes=%" PRIu64 " min=%u max=%u first=0x%08x\n",
+				             range.address, range.size, nonzero, minimum, maximum, first);
+				std::fclose(output);
+			}
+		}
+		if (!LibKernel::Memory::TryWriteBacking(range.address, mapped, range.size)) {
+			LOGF("TextureCache: skipped GPU download write without host backing "
+			     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+			     range.address, range.size);
+		}
 	});
 	return true;
 }
@@ -1849,6 +2186,24 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 		auto& image = m_slot_images[id];
 		if (!image.Overlaps(address, size)) {
 			continue;
+		}
+		if (std::getenv("KYTY_IMAGE_INVALIDATE_TRACE") != nullptr &&
+		    image.info.data.size >= 1024 * 1024) {
+			static std::atomic<uint32_t> trace_count {0};
+			const auto count = trace_count.fetch_add(1, std::memory_order_relaxed);
+			if (count < 256) {
+				std::fprintf(stderr,
+				             "ImageInvalidate index=%u write=0x%016" PRIx64 "+0x%" PRIx64
+				             " image=0x%016" PRIx64 "+0x%" PRIx64
+				             " extent=%ux%ux%u usage=t%d/s%d/r%d/v%d dirty=g%d/b%d/c%d\n",
+				             count, address, size, image.info.data.address, image.info.data.size,
+				             image.info.extent.width, image.info.extent.height, image.info.extent.depth,
+				             image.usage.texture ? 1 : 0, image.usage.storage ? 1 : 0,
+				             image.usage.render_target ? 1 : 0, image.usage.video_out ? 1 : 0,
+				             image.IsGpuModified() ? 1 : 0, image.IsBufferModified() ? 1 : 0,
+				             image.IsCpuDirty() ? 1 : 0);
+				std::fflush(stderr);
+			}
 		}
 		if (image.IsGpuModified()) {
 			image.ClearGpuModified();
@@ -1902,12 +2257,14 @@ bool TextureCache::IsMeta(uint64_t address) {
 	return found != m_surface_metas.end();
 }
 
-bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice) {
+bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice, uint32_t* fill_value, bool* fill_known) {
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
 	if (found == m_surface_metas.end() || slice >= 32) {
 		return false;
 	}
+	if (fill_value != nullptr) *fill_value = found->second.fill_value;
+	if (fill_known != nullptr) *fill_known = found->second.fill_known;
 	return (found->second.clear_mask & (1u << slice)) != 0;
 }
 
@@ -1918,6 +2275,19 @@ bool TextureCache::ClearMeta(uint64_t address) {
 		return false;
 	}
 	found->second.clear_mask = UINT32_MAX;
+	found->second.fill_known = false;
+	return true;
+}
+
+bool TextureCache::ClearMeta(uint64_t address, uint32_t fill_value) {
+	std::scoped_lock lock {m_lock};
+	const auto       found = m_surface_metas.find(address);
+	if (found == m_surface_metas.end()) {
+		return false;
+	}
+	found->second.clear_mask = UINT32_MAX;
+	found->second.fill_value = fill_value;
+	found->second.fill_known = true;
 	return true;
 }
 

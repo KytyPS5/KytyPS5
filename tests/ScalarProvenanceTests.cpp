@@ -102,6 +102,41 @@ Value RawRead(Fixture &fixture, Value address, Value offset, uint32_t memory,
                             0x80, block);
 }
 
+void TestDeferredFlatSlotSkipsEagerEvaluation() {
+  // Yōtei CS 8457901d: expression slots marked FlatSlotDeferred depend on
+  // ReadBoundedSrtU32 and must not be eagerly walked (GPU-selected addresses).
+  Fixture fixture;
+  const auto memory = fixture.AddMemory(ResourceKind::ScalarAddress, 0x20);
+  fixture.program.memory_info[memory].planning_only = true;
+  const auto read = RawRead(
+      fixture, Address(fixture, Value(0x1000u), Value(0u)), Value(0u), memory);
+  fixture.Emit(ValueOpcode::GetBufferResource,
+               {read, Value(0u), Value(16u), Value(0u)});
+  fixture.Plan();
+  Check(!fixture.program.srt_reads.empty(),
+        "deferred flat slot fixture lost its planning SRT read");
+
+  fixture.program.clean_flat_slots.assign(fixture.program.srt_reads.size(), 0u);
+  fixture.program.clean_flat_slots[0] =
+      Libs::Graphics::ShaderRecompiler::IR::ResourcePlan::FlatSlotDeferred;
+
+  uint32_t rejected = 0;
+  const auto reject = [](void *userdata, uint64_t, std::span<uint32_t>) {
+    ++*static_cast<uint32_t *>(userdata);
+    return false;
+  };
+  SrtRuntime runtime{.read_memory = reject,
+                     .userdata = &rejected,
+                     .read_specialization_memory = reject};
+  std::vector<uint32_t> flat;
+  Check(SrtWalker(fixture.program, runtime, fixture.program.clean_flat_slots)
+            .RefreshFlatBuffer(flat),
+        "deferred flat slot was eagerly evaluated during RefreshFlatBuffer");
+  Check(rejected == 0u, "deferred flat slot still attempted a guest memory read");
+  Check(flat.size() == fixture.program.srt_reads.size() && flat[0] == 0u,
+        "deferred flat slot was not left as a zero placeholder");
+}
+
 void TestImmediateFlatteningAndGvn() {
   Fixture fixture;
   const auto memory = fixture.AddMemory(ResourceKind::ScalarAddress, 0x20);
@@ -580,6 +615,7 @@ void DbgExit(int) { std::abort(); }
 
 int main() {
   try {
+    TestDeferredFlatSlotSkipsEagerEvaluation();
     TestImmediateFlatteningAndGvn();
     TestRawScalarComponentAlignment();
     TestScalarMemoryDomainMismatchFails();

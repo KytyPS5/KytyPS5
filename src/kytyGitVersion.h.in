@@ -5,6 +5,8 @@
 #define KYTY_GIT_HASH "@KYTY_GIT_HASH@"
 // Full commit identity used for compatibility checks.
 #define KYTY_GIT_REVISION "@KYTY_GIT_REVISION@"
+// Exact tracked and untracked source state used for local cache compatibility.
+#define KYTY_GIT_WORKTREE_FINGERPRINT "@KYTY_GIT_WORKTREE_FINGERPRINT@"
 
 /* Build provenance, shown in the window title and in crash reports. */
 #if defined(KYTY_OFFICIAL_BUILD)

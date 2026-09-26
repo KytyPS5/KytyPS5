@@ -3,9 +3,11 @@
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/timer.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/debug.h"
+#include "graphics/host_gpu/renderer/pipeline/DescriptorBudget.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
@@ -24,6 +26,15 @@
 #include <vector>
 
 namespace Libs::Graphics {
+
+vk::PipelineCreateFlags ComputePipelineCreationFlags(bool cooperative_wave64) {
+	return cooperative_wave64 ? vk::PipelineCreateFlagBits::eDisableOptimization
+	                          : vk::PipelineCreateFlags {};
+}
+
+bool ComputePipelineDisablesOptimizationForTest(bool cooperative_wave64) {
+	return static_cast<VkPipelineCreateFlags>(ComputePipelineCreationFlags(cooperative_wave64)) != 0;
+}
 
 // IDK: maybe we can remove it?
 constexpr uint8_t kTemporaryVertexAttribFormat113 =
@@ -188,10 +199,31 @@ static void AddLayoutBindings(std::vector<vk::DescriptorSetLayoutBinding>& descr
 }
 
 static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
-                                   std::span<const vk::DescriptorSetLayoutBinding> bindings) {
-	uint32_t descriptor_count = 0;
+                                   std::span<const vk::DescriptorSetLayoutBinding> bindings,
+                                   uint32_t fragment_color_attachments = 0) {
+	uint64_t descriptor_count = 0;
+	std::vector<DescriptorBudgetBinding> budget_bindings;
+	budget_bindings.reserve(bindings.size());
 	for (const auto& binding: bindings) {
 		descriptor_count += binding.descriptorCount;
+		budget_bindings.push_back({static_cast<VkDescriptorType>(binding.descriptorType),
+		                           binding.descriptorCount,
+		                           static_cast<VkShaderStageFlags>(binding.stageFlags)});
+	}
+	// These are the final specialized native bindings: arrays include every storage mip,
+	// sampler clone, and auxiliary buffer, and graphics contains both VS and PS bindings.
+	const auto& limits = static_cast<const VkPhysicalDeviceLimits&>(
+	    graphics.GetPhysicalDeviceProperties().limits);
+	if (const auto failure = ValidateDescriptorBudget(budget_bindings, limits,
+	                                                  fragment_color_attachments)) {
+		const char* stage = failure->stage == VK_SHADER_STAGE_VERTEX_BIT ? "vertex"
+		                    : failure->stage == VK_SHADER_STAGE_FRAGMENT_BIT ? "fragment"
+		                    : failure->stage == VK_SHADER_STAGE_COMPUTE_BIT ? "compute"
+		                    : failure->stage == 0u ? "pipeline" : "other";
+		EXIT("Vulkan descriptor budget exceeded: limit=%s required=%" PRIu64
+		     " available=%" PRIu64 " stage=%s (0x%08x) type=%s\n",
+		     failure->limit_name, failure->required, failure->limit, stage,
+		     failure->stage, failure->resource_type);
 	}
 	pipeline.uses_push_descriptors = descriptor_count <= graphics.max_push_descriptors;
 
@@ -617,10 +649,18 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	LOGF("PipelineTrace: vkCreateComputePipelines begin layout=%p\n",
 	     static_cast<void*>(pipeline.pipeline_layout));
+	Log::Flush();
+	const auto pipeline_begin = Common::Timer::QueryPerformanceCounter();
 	result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr,
 	                                                &pipeline.pipeline);
-	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p\n",
-	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
+	const auto pipeline_end = Common::Timer::QueryPerformanceCounter();
+	const auto frequency    = Common::Timer::QueryPerformanceFrequency();
+	const auto elapsed_ms =
+	    frequency == 0 ? 0 : (pipeline_end - pipeline_begin) * 1000u / frequency;
+	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p elapsed_ms=%" PRIu64
+	     "\n",
+	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline), elapsed_ms);
+	Log::Flush();
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);

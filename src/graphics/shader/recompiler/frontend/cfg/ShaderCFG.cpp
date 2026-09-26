@@ -9,6 +9,7 @@
 #include <set>
 #include <span>
 #include <stack>
+#include <tuple>
 
 namespace Libs::Graphics::ShaderRecompiler::CFG {
 namespace {
@@ -1464,6 +1465,167 @@ std::vector<uint32_t> SelectionRegion(const Graph& graph, const BasicBlock& head
 	return region;
 }
 
+bool CloneExternallyEnteredLinearTail(Graph& graph, uint32_t header, uint32_t merge,
+	                                  const std::vector<uint32_t>& region) {
+	// Bound the construct being rewritten rather than unrelated blocks in the module.
+	// SplitSharedMergeBlocks separately caps the number of clones.
+	constexpr size_t MaxSemanticCloneRegionBlocks = 32;
+	if (region.size() > MaxSemanticCloneRegionBlocks) {
+		return false;
+	}
+	if (std::ranges::any_of(graph.blocks, [](const BasicBlock& block) {
+		    return block.terminator.condition == BranchCondition::GotoVariable ||
+		           block.terminator.goto_variable != UINT32_MAX;
+	    })) {
+		return false;
+	}
+	std::vector<uint32_t> shared_blocks;
+	for (auto member: region) {
+		if (!graph.Dominates(header, member)) {
+			shared_blocks.push_back(member);
+		}
+	}
+	if (shared_blocks.empty()) {
+		return false;
+	}
+	if (shared_blocks.size() != 1u) {
+		return false;
+	}
+	const auto* shared_tail = graph.FindBlock(shared_blocks.front());
+	if (shared_tail == nullptr || shared_tail->inst_end - shared_tail->inst_begin > 16u) {
+		return false;
+	}
+
+	// Node splitting is safe here because every copied block is a straight-line suffix leading
+	// to the common merge. More general side-entered regions need full semantic region cloning.
+	for (auto member: shared_blocks) {
+		const auto* block = graph.FindBlock(member);
+		if (block == nullptr || block->terminator.kind != TerminatorKind::Branch ||
+		    block->successors.size() != 1u ||
+		    (block->successors.front() != merge &&
+		     !Contains(shared_blocks, block->successors.front()))) {
+			return false;
+		}
+		std::vector<uint32_t> visited;
+		auto                  cursor = member;
+		while (cursor != merge) {
+			if (Contains(visited, cursor)) {
+				return false;
+			}
+			visited.push_back(cursor);
+			const auto* cursor_block = graph.FindBlock(cursor);
+			if (cursor_block == nullptr || cursor_block->successors.size() != 1u) {
+				return false;
+			}
+			cursor = cursor_block->successors.front();
+		}
+	}
+
+	std::map<uint32_t, uint32_t> clones;
+	for (auto member: shared_blocks) {
+		const auto* source = graph.FindBlock(member);
+		if (source == nullptr) {
+			return false;
+		}
+		BasicBlock clone       = *source;
+		clone.id               = static_cast<uint32_t>(graph.blocks.size());
+		clone.predecessors.clear();
+		clone.dominators.clear();
+		clone.post_dominators.clear();
+		clones.emplace(member, clone.id);
+		graph.blocks.push_back(std::move(clone));
+	}
+
+	for (const auto& [source_id, clone_id]: clones) {
+		auto* clone = graph.FindBlock(clone_id);
+		if (clone == nullptr) {
+			return false;
+		}
+		for (const auto& [old_target, new_target]: clones) {
+			ReplaceValue(clone->successors, old_target, new_target);
+			ReplaceTerminatorTarget(clone->terminator, old_target, new_target);
+		}
+	}
+
+	bool redirected = false;
+	for (const auto& [source_id, clone_id]: clones) {
+		const auto* source = graph.FindBlock(source_id);
+		if (source == nullptr) {
+			return false;
+		}
+		const auto predecessors = source->predecessors;
+		for (auto predecessor: predecessors) {
+			if (!graph.Dominates(header, predecessor)) {
+				continue;
+			}
+			auto* block = graph.FindBlock(predecessor);
+			if (block != nullptr) {
+				redirected |= ReplaceValue(block->successors, source_id, clone_id);
+				ReplaceTerminatorTarget(block->terminator, source_id, clone_id);
+			}
+		}
+	}
+	return redirected;
+}
+
+bool CloneOneNestedSelectionTail(Graph& graph) {
+	std::vector<uint32_t> loop_headers;
+	for (const auto& loop: graph.natural_loops) {
+		AddUnique(loop_headers, loop.header);
+	}
+	struct Candidate {
+		uint32_t              header = UINT32_MAX;
+		uint32_t              merge  = UINT32_MAX;
+		uint32_t              cost   = UINT32_MAX;
+		uint32_t              depth  = UINT32_MAX;
+		std::vector<uint32_t> region;
+	};
+	std::vector<Candidate> candidates;
+	for (const auto& block: graph.blocks) {
+		if (block.terminator.kind != TerminatorKind::ConditionalBranch ||
+		    Contains(loop_headers, block.id) || IsInnermostLoopControlConditional(graph, block)) {
+			continue;
+		}
+		const auto merge  = FindSelectionMerge(graph, block);
+		const auto region = SelectionRegion(graph, block, merge);
+		const auto external = std::find_if(region.begin(), region.end(), [&](uint32_t member) {
+			const auto* member_block = graph.FindBlock(member);
+			return member_block != nullptr &&
+			       std::ranges::any_of(member_block->predecessors, [&](uint32_t predecessor) {
+				       return predecessor != block.id && !Contains(region, predecessor);
+			       });
+		});
+		if (external == region.end()) {
+			continue;
+		}
+		const bool shared_with_enclosing_header =
+		    std::ranges::any_of(graph.blocks, [&](const BasicBlock& candidate) {
+			    return candidate.id != block.id &&
+			           candidate.terminator.kind == TerminatorKind::ConditionalBranch &&
+			           !Contains(loop_headers, candidate.id) &&
+			           graph.Dominates(candidate.id, block.id) &&
+			           !IsInnermostLoopControlConditional(graph, candidate) &&
+			           FindSelectionMerge(graph, candidate) == merge;
+		    });
+		const auto* external_block = graph.FindBlock(*external);
+		if (shared_with_enclosing_header && external_block != nullptr) {
+			candidates.push_back({block.id, merge,
+			                      external_block->inst_end - external_block->inst_begin,
+			                      static_cast<uint32_t>(block.dominators.size()), region});
+		}
+	}
+	std::ranges::sort(candidates, {}, [](const Candidate& candidate) {
+		return std::tuple {candidate.cost, candidate.depth, candidate.header};
+	});
+	for (const auto& candidate: candidates) {
+		if (CloneExternallyEnteredLinearTail(graph, candidate.header, candidate.merge,
+		                                     candidate.region)) {
+			return true;
+		}
+	}
+	return false;
+}
+
 bool SplitOneSelectionMerge(Graph& graph) {
 	std::vector<uint32_t> loop_headers;
 	loop_headers.reserve(graph.natural_loops.size());
@@ -1508,12 +1670,7 @@ bool SplitOneSelectionMerge(Graph& graph) {
 			       });
 		});
 		if (external != region.end()) {
-			SetFailure(
-			    graph, FailureKind::StructuredControlFlow, block_id,
-			    fmt::format("selection header block {} has externally entered region block {}; "
-			                "semantic block cloning is disabled",
-			                block_id, *external));
-			return false;
+			continue;
 		}
 		const auto construct_blocks = DominatedBlocks(graph, block_id, merge);
 		const auto force_split      = MergeLeavesContainingLoop(graph, block_id, merge);
@@ -1527,6 +1684,12 @@ bool SplitOneSelectionMerge(Graph& graph) {
 bool SplitSharedMergeBlocks(Graph& graph) {
 	const auto original_block_count = static_cast<uint32_t>(graph.blocks.size());
 	const auto split_budget         = std::max<uint32_t>(16u, original_block_count * 4u);
+	constexpr uint32_t kSemanticCloneBudget = 4;
+	for (uint32_t clone = 0; clone < kSemanticCloneBudget && CloneOneNestedSelectionTail(graph);
+	     clone++) {
+		RebuildPredecessors(graph);
+		RecomputeAnalyses(graph);
+	}
 	for (uint32_t splits = 0; splits < split_budget; splits++) {
 		if (!SplitOneLoopMerge(graph) && !SplitOneSelectionMerge(graph)) {
 			return !graph.unsupported;
@@ -1886,11 +2049,14 @@ bool RouteSharedSelectionArm(Graph& graph, uint32_t route_variable) {
 
 } // namespace
 
-Graph BuildGraph(const Decoder::Program& program) {
+Graph BuildGraph(const Decoder::Program& program, std::string_view context) {
 	Graph graph;
+	const std::string prefix = context.empty() ? "" : fmt::format("{}: ", context);
+	auto fail = [&graph, &prefix](FailureKind kind, uint32_t block_id, std::string message) {
+		ExitBuildFailure(graph, kind, block_id, prefix + message);
+	};
 	if (program.instructions.empty()) {
-		ExitBuildFailure(graph, FailureKind::InvalidLabel, UINT32_MAX,
-		                 "cannot build CFG for empty shader");
+		fail(FailureKind::InvalidLabel, UINT32_MAX, "cannot build CFG for empty shader");
 	}
 
 	const auto first_pc = program.instructions.front().pc;
@@ -1900,10 +2066,9 @@ Graph BuildGraph(const Decoder::Program& program) {
 	for (const auto& inst: program.instructions) {
 		instruction_pcs.insert(inst.pc);
 		if (inst.opcode == Opcode::UNSUPPORTED) {
-			ExitBuildFailure(
-			    graph, FailureKind::UnsupportedInstruction, UINT32_MAX,
-			    fmt::format("unsupported decoded instruction in CFG at pc 0x{:08x}: {}", inst.pc,
-			                Decoder::InstructionToString(inst).c_str()));
+			fail(FailureKind::UnsupportedInstruction, UINT32_MAX,
+			     fmt::format("unsupported decoded instruction in CFG at pc 0x{:08x}: {}", inst.pc,
+			                 Decoder::InstructionToString(inst).c_str()));
 		}
 	}
 
@@ -1917,9 +2082,9 @@ Graph BuildGraph(const Decoder::Program& program) {
 		const auto  next_pc = InstructionEndPc(inst);
 		if (Decoder::IsDirectBranch(inst.opcode)) {
 			if (!IsValidTarget(inst.branch_target, instruction_pcs, first_pc, end_pc)) {
-				ExitBuildFailure(graph, FailureKind::InvalidBranchTarget, UINT32_MAX,
-				                 fmt::format("branch at pc 0x{:08x} targets invalid pc 0x{:08x}",
-				                             inst.pc, inst.branch_target));
+				fail(FailureKind::InvalidBranchTarget, UINT32_MAX,
+				     fmt::format("branch at pc 0x{:08x} targets invalid pc 0x{:08x}", inst.pc,
+				                 inst.branch_target));
 			}
 			labels.insert(inst.branch_target);
 			if (next_pc <= end_pc) {
@@ -1928,19 +2093,17 @@ Graph BuildGraph(const Decoder::Program& program) {
 		} else if (inst.opcode == Opcode::S_SETPC_B64) {
 			SetpcTargetInfo target_info;
 			if (!ResolveSetpcTargets(program, i, target_info)) {
-				ExitBuildFailure(
-				    graph, FailureKind::InvalidBranchTarget, UINT32_MAX,
-				    fmt::format("unsupported dynamic S_SETPC_B64 at pc 0x{:08x}", inst.pc));
+				fail(FailureKind::InvalidBranchTarget, UINT32_MAX,
+				     fmt::format("unsupported dynamic S_SETPC_B64 at pc 0x{:08x}", inst.pc));
 			}
 			const auto target_pcs = target_info.indirect
 			                            ? std::span<const uint32_t>(target_info.target_pcs)
 			                            : std::span<const uint32_t>(&target_info.target, 1);
 			for (const auto target: target_pcs) {
 				if (!IsValidTarget(target, instruction_pcs, first_pc, end_pc)) {
-					ExitBuildFailure(
-					    graph, FailureKind::InvalidBranchTarget, UINT32_MAX,
-					    fmt::format("S_SETPC_B64 at pc 0x{:08x} targets invalid pc 0x{:08x}",
-					                inst.pc, target));
+					fail(FailureKind::InvalidBranchTarget, UINT32_MAX,
+					     fmt::format("S_SETPC_B64 at pc 0x{:08x} targets invalid pc 0x{:08x}",
+					                 inst.pc, target));
 				}
 				labels.insert(target);
 			}
@@ -1960,9 +2123,8 @@ Graph BuildGraph(const Decoder::Program& program) {
 			continue;
 		}
 		if (start != end_pc && !instruction_pcs.contains(start)) {
-			ExitBuildFailure(
-			    graph, FailureKind::InvalidLabel, UINT32_MAX,
-			    fmt::format("CFG label does not start on an instruction: 0x{:08x}", start));
+			fail(FailureKind::InvalidLabel, UINT32_MAX,
+			     fmt::format("CFG label does not start on an instruction: 0x{:08x}", start));
 		}
 
 		BasicBlock block;
@@ -2032,10 +2194,9 @@ Graph BuildGraph(const Decoder::Program& program) {
 			block.terminator.true_block = pc_to_block.at(last.branch_target);
 			const auto fallthrough      = pc_to_block.find(next_pc);
 			if (fallthrough == pc_to_block.end()) {
-				ExitBuildFailure(
-				    graph, FailureKind::MissingFallthrough, block.id,
-				    fmt::format("conditional branch at pc 0x{:08x} has no fallthrough block",
-				                last.pc));
+				fail(FailureKind::MissingFallthrough, block.id,
+				     fmt::format("conditional branch at pc 0x{:08x} has no fallthrough block",
+				                 last.pc));
 			}
 			block.terminator.false_block = fallthrough->second;
 		} else {

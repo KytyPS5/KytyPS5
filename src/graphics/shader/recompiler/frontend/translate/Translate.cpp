@@ -20,6 +20,11 @@ static IR::DppMoveFlags DppFlags(const Decoder::Operand& operand) {
 	};
 }
 
+IR::U1 Translator::MaskIsZero(IR::U32 low, IR::U32 high) {
+ const auto mask = program.wave_size == 64u ? ir.BitwiseOr(low, high) : low;
+ return ir.IEqual(mask, IR::U32(IR::Value(0u)));
+}
+
 const Decoder::Operand& Translator::SourceAt(const Decoder::Instruction& inst, uint32_t index) {
 	switch (index) {
 		case 0: return inst.src0;
@@ -169,11 +174,8 @@ IR::U32 Translator::ReadScalarCode(uint32_t code) {
 		case 106u: return ir.GetVccLo();
 		case 107u: return ir.GetVccHi();
 		case 124u: return ir.GetM0();
-		case 126u:
-		case 127u: {
-			const auto mask = BallotMask(ir.GetExec());
-			return mask[code - 126u];
-		}
+		case 126u: return ir.GetExecLo();
+		case 127u: return ir.GetExecHi();
 		default: return IR::U32(IR::Value(0u));
 	}
 }
@@ -182,6 +184,13 @@ IR::U32 Translator::ApplyBitSourceModifiers(const Decoder::Operand& operand, IR:
 	if (operand.dpp) {
 		value =
 		    IR::U32(ir.Emit(IR::ValueOpcode::DppMoveU32, {value, ir.GetExec()}, DppFlags(operand)));
+	}
+	if (operand.dpp8) {
+		const IR::Dpp8MoveFlags flags {
+		    .lane_selectors = operand.dpp8_lane_selectors,
+		    .fetch_inactive = operand.dpp8_fetch_inactive,
+		};
+		value = IR::U32(ir.Emit(IR::ValueOpcode::Dpp8MoveU32, {value, ir.GetExec()}, flags));
 	}
 	if (operand.sdwa_sel != 6u) {
 		uint32_t offset = 0;
@@ -202,7 +211,34 @@ IR::U32 Translator::ApplyBitSourceModifiers(const Decoder::Operand& operand, IR:
 	return value;
 }
 
+IR::F64 Translator::ReadF64(const Decoder::Operand& operand) {
+	if (operand.dpp || operand.dpp8 || operand.sdwa_sel != 6u || operand.sdwa_sext ||
+	    operand.op_sel || operand.op_sel_hi || operand.negate_hi) {
+		EXIT("FP64 source selectors are not implemented");
+	}
+	if (operand.kind != Decoder::OperandKind::Sgpr &&
+	    operand.kind != Decoder::OperandKind::Vgpr) {
+		// FP64 literals have different expansion rules from integer U64 operands.
+		// Keep untested literal/inline forms explicit instead of misreading bits.
+		EXIT("FP64 arithmetic currently requires a scalar or vector register pair");
+	}
+	const auto raw = PlainOperand(operand);
+	const auto low = ReadRawU32(raw);
+	const auto high = ReadRawU32(OffsetOperand(raw, 1));
+	auto value = IR::F64(ir.Emit(IR::ValueOpcode::CompositeConstructF64, {low, high}));
+	if (operand.absolute) {
+		value = IR::F64(ir.Emit(IR::ValueOpcode::FPAbs64, {value}));
+	}
+	if (operand.negate) {
+		value = IR::F64(ir.Emit(IR::ValueOpcode::FPNeg64, {value}));
+	}
+	return value;
+}
+
 IR::Value Translator::ReadOperand(const Decoder::Operand& operand, IR::Type type) {
+	if (type == IR::Type::F64) {
+		return ReadF64(operand);
+	}
 	if (type == IR::Type::U16) {
 		return ir.Emit(IR::ValueOpcode::ConvertU16U32,
 		               {ApplyBitSourceModifiers(operand, ReadRawU32(operand))});
@@ -219,8 +255,8 @@ IR::Value Translator::ReadOperand(const Decoder::Operand& operand, IR::Type type
 			case Decoder::OperandKind::ExecHi: return ir.GetExec();
 			case Decoder::OperandKind::VccLo:
 			case Decoder::OperandKind::VccHi: return ir.GetVcc();
-			case Decoder::OperandKind::VccZ: return ir.LogicalNot(ir.GetVcc());
-			case Decoder::OperandKind::ExecZ: return ir.LogicalNot(ir.GetExec());
+			case Decoder::OperandKind::VccZ: return MaskIsZero(ir.GetVccLo(), ir.GetVccHi());
+			case Decoder::OperandKind::ExecZ: return MaskIsZero(ir.GetExecLo(), ir.GetExecHi());
 			default: break;
 		}
 		return ir.INotEqual(ReadRawU32(operand), IR::U32(IR::Value(0u)));
@@ -403,7 +439,12 @@ void Translator::WriteOperand(const Decoder::Operand& operand, IR::Value value) 
 		Write16Bits(operand, IR::U32(ir.Emit(IR::ValueOpcode::ConvertU32U16, {bits})));
 		return;
 	}
-	if (type == IR::Type::U64) {
+	if (type == IR::Type::U64 || type == IR::Type::F64) {
+		if (type == IR::Type::F64 &&
+		    (operand.clamp || operand.omod != 0u || operand.sdwa_sel != 6u ||
+		     operand.explicit_sdwa_dst || operand.dpp || operand.dpp8)) {
+			EXIT("FP64 destination modifiers are not implemented");
+		}
 		WriteU32Pair(operand, {ir.CompositeExtract(value, 0), ir.CompositeExtract(value, 1)});
 		return;
 	}
@@ -630,8 +671,8 @@ IR::U1 Translator::ReadMask(const Decoder::Operand& operand) {
 			           ? ThreadBit({ReadRawU32(operand), IR::U32(IR::Value(0u))})
 			           : ir.GetVcc();
 		case Decoder::OperandKind::Scc: return ir.GetScc();
-		case Decoder::OperandKind::VccZ: return ir.LogicalNot(ir.GetVcc());
-		case Decoder::OperandKind::ExecZ: return ir.LogicalNot(ir.GetExec());
+		case Decoder::OperandKind::VccZ: return MaskIsZero(ir.GetVccLo(), ir.GetVccHi());
+		case Decoder::OperandKind::ExecZ: return MaskIsZero(ir.GetExecLo(), ir.GetExecHi());
 		default: return ir.INotEqual(ReadRawU32(operand), IR::U32(IR::Value(0u)));
 	}
 }
@@ -654,10 +695,9 @@ IR::U1 Translator::ReadMaskValid(const Decoder::Operand& operand) {
 		case Decoder::OperandKind::ExecLo:
 		case Decoder::OperandKind::ExecHi:
 		case Decoder::OperandKind::VccLo:
-		case Decoder::OperandKind::VccHi:
-		case Decoder::OperandKind::VccZ:
-		case Decoder::OperandKind::ExecZ:
-		case Decoder::OperandKind::Scc: return IR::U1(IR::Value(true));
+		case Decoder::OperandKind::VccHi: return IR::U1(IR::Value(true));
+		// SCC/EXECZ/VCCZ are numeric scalar operands {flag, 0}, not replicated
+		// lane masks. Their Boolean form remains useful for carry/branch inputs.
 		default: return IR::U1(IR::Value(false));
 	}
 }
@@ -745,17 +785,25 @@ void Translator::AddBranchCondition(const CFG::BasicBlock& source, IR::BlockInfo
 	if (source.terminator.kind != CFG::TerminatorKind::ConditionalBranch) {
 		return;
 	}
-	// EXEC and VCC are invocation-local Boolean masks. Branching on that Boolean lets inactive
-	// invocations leave the region without reconstructing a host-subgroup mask.
+	// Scalar mask branches are wave-uniform. A later SAVEEXEC can reactivate lanes
+	// inside the region, so inactive guest lanes must not leave the host branch.
 	IR::U1 condition;
 	switch (source.terminator.condition) {
 		case CFG::BranchCondition::Always: condition = IR::U1(IR::Value(true)); break;
 		case CFG::BranchCondition::SccZero: condition = ir.LogicalNot(ir.GetScc()); break;
 		case CFG::BranchCondition::SccNonZero: condition = ir.GetScc(); break;
-		case CFG::BranchCondition::VccZero: condition = ir.LogicalNot(ir.GetVcc()); break;
-		case CFG::BranchCondition::VccNonZero: condition = ir.GetVcc(); break;
-		case CFG::BranchCondition::ExecZero: condition = ir.LogicalNot(ir.GetExec()); break;
-		case CFG::BranchCondition::ExecNonZero: condition = ir.GetExec(); break;
+		case CFG::BranchCondition::VccZero:
+			condition = MaskIsZero(ir.GetVccLo(), ir.GetVccHi());
+			break;
+		case CFG::BranchCondition::VccNonZero:
+			condition = ir.LogicalNot(MaskIsZero(ir.GetVccLo(), ir.GetVccHi()));
+			break;
+		case CFG::BranchCondition::ExecZero:
+			condition = MaskIsZero(ir.GetExecLo(), ir.GetExecHi());
+			break;
+		case CFG::BranchCondition::ExecNonZero:
+			condition = ir.LogicalNot(MaskIsZero(ir.GetExecLo(), ir.GetExecHi()));
+			break;
 		case CFG::BranchCondition::ScalarInstruction:
 			EXIT_IF(instruction_branch_condition.IsEmpty());
 			condition = instruction_branch_condition;
@@ -845,6 +893,8 @@ void IncludeInstructionVectorRegisters(const Decoder::Instruction& inst, uint32_
 	if (inst.family == Decoder::Family::DS) {
 		switch (inst.opcode) {
 			case Decoder::Opcode::DS_WRITE_B64:
+			case Decoder::Opcode::DS_ADD_U64:
+			case Decoder::Opcode::DS_OR_B64:
 			case Decoder::Opcode::DS_WRITE_B96:
 			case Decoder::Opcode::DS_WRITE_B128: include_vector(inst.src1, inst.data_dwords); break;
 			case Decoder::Opcode::DS_WRITE2_B32:

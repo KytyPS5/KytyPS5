@@ -73,6 +73,20 @@ struct ShaderClipSpaceTransform {
 	bool  enabled        = false;
 };
 
+// Unknown is distinct from a known zero register value, particularly for old
+// offline manifests which did not capture the initial guest FP controls.
+struct ShaderFloatingPointState {
+	bool    known      = false;
+	uint8_t float_mode = 0;
+	bool    ieee_mode  = false;
+	bool    dx10_clamp = false;
+
+	[[nodiscard]] uint32_t StaticKey() const {
+		return known ? 0x10000u | float_mode | (uint32_t(ieee_mode) << 8u) |
+		                   (uint32_t(dx10_clamp) << 9u) : 0u;
+	}
+};
+
 struct ShaderWorkgroupInputInfo {
 	uint32_t threads_num[3]      = {0, 0, 0};
 	uint32_t lds_size_dwords     = 0;
@@ -124,12 +138,14 @@ struct ShaderTessellationInputInfo {
 
 struct ShaderVertexInputInfo {
 	static constexpr int RES_MAX = 32;
+	static constexpr uint32_t PARAM_LINK_MAX = 32;
 
 	ShaderBufferResource    resources[RES_MAX];
 	ShaderVertexDestination resources_dst[RES_MAX];
 	ShaderVertexInputBuffer buffers[RES_MAX];
 	ShaderStageRuntime      stage;
-	ShaderType                  logical_stage        = ShaderType::Vertex;
+	ShaderFloatingPointState initial_fp_state;
+	ShaderType              logical_stage        = ShaderType::Vertex;
 	int                     resources_num       = 0;
 	int                     fetch_attrib_reg    = 0;
 	int                     fetch_buffer_reg    = 0;
@@ -137,6 +153,9 @@ struct ShaderVertexInputInfo {
 	uint32_t                wave_size           = 64;
 	uint32_t                scratch_size_dwords = 0;
 	uint32_t                pa_cl_vs_out_cntl    = 0;
+	uint32_t                linked_param_sources[PARAM_LINK_MAX]   = {};
+	uint32_t                linked_param_locations[PARAM_LINK_MAX] = {};
+	uint32_t                linked_param_count                     = 0;
 	ShaderClipSpaceTransform clip_space;
 	ShaderMeshInputInfo      mesh;
 	ShaderTessellationInputInfo tess;
@@ -145,6 +164,8 @@ struct ShaderVertexInputInfo {
 };
 
 struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
+	bool needs_lds_barriers = false;
+	ShaderFloatingPointState initial_fp_state;
 	uint32_t           dispatch_threads_num[3]    = {0, 0, 0};
 	bool               group_id[3]                = {false, false, false};
 	bool               dispatch_thread_dimensions = false;
@@ -155,6 +176,7 @@ struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
 };
 
 struct ShaderPixelInputInfo {
+	ShaderFloatingPointState initial_fp_state;
 	uint32_t                                       interpolator_settings[32]    = {0};
 	uint32_t                                       input_num                    = 0;
 	uint32_t                                       wave_size                    = 64;

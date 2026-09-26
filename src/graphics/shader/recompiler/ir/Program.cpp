@@ -141,6 +141,7 @@ CompiledShaderInfo Program::TakeCompiledInfo() && {
 	    .user_data_base  = user_data_base,
 	    .user_data_count = user_data_count,
 	    .scratch_dwords  = scratch_dwords,
+	    .bounded_srt_reads_precede_writes = bounded_srt_reads_precede_writes,
 	    .info            = std::move(info),
 	    .bindings        = std::move(bindings),
 	};
@@ -457,8 +458,12 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 				    !memory.SupportsIndirectBufferLoad(inst.GetOpcode())) {
 					return Fail("indirect buffer requires a raw DWORD x2/x3/x4 load");
 				}
+				const bool packed_d16 = memory.kind == ResourceKind::Buffer &&
+				                        memory.formatted && memory.data_bits == 16u &&
+				                        memory.component_count > memory.data_dwords &&
+				                        memory.component_count <= memory.data_dwords * 2u;
 				if (buffer_components > 1u &&
-				    (!vector_buffer || memory.data_bits != 32u ||
+				    (!vector_buffer || (memory.data_bits != 32u && !packed_d16) ||
 				     memory.data_dwords != buffer_components || memory.component_index != 0u)) {
 					return Fail(fmt::format("{} has inconsistent native-wide metadata",
 					                        ValueOpcodeName(inst.GetOpcode())));
@@ -680,6 +685,7 @@ std::string ProgramToString(const Program& program) {
 			case Type::U64: return fmt::format("0x{:016x}", value.U64());
 			case Type::F16: return fmt::format("f16(0x{:04x})", value.F16Bits());
 			case Type::F32: return fmt::format("{}f", value.F32Value());
+			case Type::F64: return fmt::format("f64(0x{:016x})", value.F64Bits());
 			default: return fmt::format("<{}>", TypeName(value.GetType()));
 		}
 	};

@@ -187,6 +187,8 @@ Decoder::Operand MemorySourceAt(const Decoder::Instruction& decoded, uint32_t in
 		const bool store_or_atomic =
 		    (decoded.opcode >= Decoder::Opcode::BUFFER_STORE_FORMAT_X &&
 		     decoded.opcode <= Decoder::Opcode::BUFFER_STORE_FORMAT_XYZW) ||
+		    (decoded.opcode >= Decoder::Opcode::BUFFER_STORE_FORMAT_D16_X &&
+		     decoded.opcode <= Decoder::Opcode::BUFFER_STORE_FORMAT_D16_XYZW) ||
 		    (decoded.opcode >= Decoder::Opcode::BUFFER_STORE_BYTE &&
 		     decoded.opcode <= Decoder::Opcode::BUFFER_STORE_DWORDX4) ||
 		    (decoded.opcode >= Decoder::Opcode::TBUFFER_STORE_FORMAT_X &&
@@ -223,7 +225,7 @@ Decoder::Operand MemorySourceAt(const Decoder::Instruction& decoded, uint32_t in
 		const bool store_or_atomic = decoded.opcode == Decoder::Opcode::IMAGE_STORE ||
 		                             decoded.opcode == Decoder::Opcode::IMAGE_STORE_MIP ||
 		                             (decoded.opcode >= Decoder::Opcode::IMAGE_ATOMIC_SWAP &&
-		                              decoded.opcode <= Decoder::Opcode::IMAGE_ATOMIC_XOR);
+		                              decoded.opcode <= Decoder::Opcode::IMAGE_ATOMIC_FMAX);
 		if (store_or_atomic) {
 			return index == 0u ? decoded.dst : decoded.src0;
 		}
@@ -435,7 +437,15 @@ void Translator::BUFFER_LOAD(const Decoder::Instruction& inst) {
 	IR::ValueOpcode opcode;
 	const auto      bits = memory.data_bits;
 	const auto      sign = memory.data_signed;
-	switch (bits) {
+	if (memory.formatted && bits == 16u) {
+		switch (memory.data_dwords) {
+			case 1u: opcode = IR::ValueOpcode::LoadBufferU32; break;
+			case 2u: opcode = IR::ValueOpcode::LoadBufferU32x2; break;
+			default:
+				EXIT("opcode %s at pc 0x%08x has unsupported formatted buffer load dword count %u",
+				     Decoder::InstructionToString(inst).c_str(), inst.pc, memory.data_dwords);
+		}
+	} else switch (bits) {
 		case 8u: opcode = IR::ValueOpcode::LoadBufferU8; break;
 		case 16u: opcode = IR::ValueOpcode::LoadBufferU16; break;
 		case 32u:
@@ -459,7 +469,18 @@ void Translator::BUFFER_LOAD(const Decoder::Instruction& inst) {
 	const auto loaded =
 	    ir.Emit(opcode, {resource, address.index, address.offset, address.soffset, ir.GetExec()},
 	            AddMemoryInfo(memory, inst.pc));
-	if (bits != 32u) {
+	if (memory.formatted && bits == 16u) {
+		for (uint32_t word = 0; word < memory.data_dwords; word++) {
+			auto packed = memory.data_dwords == 1u ? loaded : ir.CompositeExtract(loaded, word);
+			if (word * 2u + 1u >= memory.component_count) {
+				const auto old_high = ir.BitwiseAnd(
+				    ReadU32(OffsetOperand(inst.dst, word)), IR::U32(IR::Value(0xffff0000u)));
+				packed = ir.BitwiseOr(
+				    ir.BitwiseAnd(IR::U32(packed), IR::U32(IR::Value(0x0000ffffu))), old_high);
+			}
+			WriteOperand(OffsetOperand(inst.dst, word), packed);
+		}
+	} else if (bits != 32u) {
 		WriteOperand(inst.dst, WidenSubdword(loaded, bits, sign));
 	} else if (memory.data_dwords == 1u) {
 		WriteOperand(inst.dst, loaded);
@@ -479,7 +500,22 @@ void Translator::BUFFER_STORE(const Decoder::Instruction& inst) {
 	const auto      data     = ReadU32(data_src);
 	IR::ValueOpcode opcode;
 	IR::Value       value;
-	switch (memory.data_bits) {
+	if (memory.formatted && memory.data_bits == 16u) {
+		switch (memory.data_dwords) {
+			case 1u:
+				opcode = IR::ValueOpcode::StoreBufferU32;
+				value  = data;
+				break;
+			case 2u:
+				opcode = IR::ValueOpcode::StoreBufferU32x2;
+				value  = ir.Emit(IR::ValueOpcode::CompositeConstructU32x2,
+				                 {data, ReadU32(OffsetOperand(data_src, 1u))});
+				break;
+			default:
+				EXIT("opcode %s at pc 0x%08x has unsupported formatted buffer store dword count %u",
+				     Decoder::InstructionToString(inst).c_str(), inst.pc, memory.data_dwords);
+		}
+	} else switch (memory.data_bits) {
 		case 8u:
 			opcode = IR::ValueOpcode::StoreBufferU8;
 			value  = NarrowSubdword(data, 8u);
@@ -569,8 +605,11 @@ void Translator::DS_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode opc
                            bool returns_value) {
 	const auto memory  = MemoryInfoFromDecoded(inst);
 	const auto address = ReadU32(MemorySourceAt(inst, 1));
-	const auto result  = ir.Emit(opcode, {address, ReadU32(MemorySourceAt(inst, 0)), ir.GetExec()},
-	                             AddMemoryInfo(memory, inst.pc));
+	const auto data    = MemorySourceAt(inst, 0);
+	const auto value   = memory.data_dwords == 2u ? IR::Value(ReadU64(data))
+	                                               : IR::Value(ReadU32(data));
+	const auto result  =
+	    ir.Emit(opcode, {address, value, ir.GetExec()}, AddMemoryInfo(memory, inst.pc));
 	if (returns_value) {
 		WriteOperand(inst.dst, result);
 	}
@@ -906,6 +945,12 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::BUFFER_LOAD_SBYTE:
 		case Decoder::Opcode::BUFFER_LOAD_USHORT:
 		case Decoder::Opcode::BUFFER_LOAD_SSHORT:
+		case Decoder::Opcode::BUFFER_LOAD_UBYTE_D16:
+		case Decoder::Opcode::BUFFER_LOAD_UBYTE_D16_HI:
+		case Decoder::Opcode::BUFFER_LOAD_SBYTE_D16:
+		case Decoder::Opcode::BUFFER_LOAD_SBYTE_D16_HI:
+		case Decoder::Opcode::BUFFER_LOAD_SHORT_D16:
+		case Decoder::Opcode::BUFFER_LOAD_SHORT_D16_HI:
 		case Decoder::Opcode::BUFFER_LOAD_DWORD:
 		case Decoder::Opcode::BUFFER_LOAD_DWORDX2:
 		case Decoder::Opcode::BUFFER_LOAD_DWORDX3:
@@ -914,6 +959,10 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::BUFFER_LOAD_FORMAT_XY:
 		case Decoder::Opcode::BUFFER_LOAD_FORMAT_XYZ:
 		case Decoder::Opcode::BUFFER_LOAD_FORMAT_XYZW:
+		case Decoder::Opcode::BUFFER_LOAD_FORMAT_D16_X:
+		case Decoder::Opcode::BUFFER_LOAD_FORMAT_D16_XY:
+		case Decoder::Opcode::BUFFER_LOAD_FORMAT_D16_XYZ:
+		case Decoder::Opcode::BUFFER_LOAD_FORMAT_D16_XYZW:
 		case Decoder::Opcode::TBUFFER_LOAD_FORMAT_X:
 		case Decoder::Opcode::TBUFFER_LOAD_FORMAT_XY:
 		case Decoder::Opcode::TBUFFER_LOAD_FORMAT_XYZ:
@@ -924,11 +973,17 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::BUFFER_STORE_DWORDX3:
 		case Decoder::Opcode::BUFFER_STORE_DWORDX4:
 		case Decoder::Opcode::BUFFER_STORE_BYTE:
+		case Decoder::Opcode::BUFFER_STORE_BYTE_D16_HI:
 		case Decoder::Opcode::BUFFER_STORE_SHORT:
+		case Decoder::Opcode::BUFFER_STORE_SHORT_D16_HI:
 		case Decoder::Opcode::BUFFER_STORE_FORMAT_X:
 		case Decoder::Opcode::BUFFER_STORE_FORMAT_XY:
 		case Decoder::Opcode::BUFFER_STORE_FORMAT_XYZ:
 		case Decoder::Opcode::BUFFER_STORE_FORMAT_XYZW:
+		case Decoder::Opcode::BUFFER_STORE_FORMAT_D16_X:
+		case Decoder::Opcode::BUFFER_STORE_FORMAT_D16_XY:
+		case Decoder::Opcode::BUFFER_STORE_FORMAT_D16_XYZ:
+		case Decoder::Opcode::BUFFER_STORE_FORMAT_D16_XYZW:
 		case Decoder::Opcode::TBUFFER_STORE_FORMAT_X:
 		case Decoder::Opcode::TBUFFER_STORE_FORMAT_XY:
 		case Decoder::Opcode::TBUFFER_STORE_FORMAT_XYZ:
@@ -1005,6 +1060,10 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicOr32, false);
 		case Decoder::Opcode::DS_OR_RTN_B32:
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicOr32, true);
+		case Decoder::Opcode::DS_ADD_U64:
+			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicIAdd64, false);
+		case Decoder::Opcode::DS_OR_B64:
+			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicOr64, false);
 		case Decoder::Opcode::DS_XOR_B32:
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicXor32, false);
 		case Decoder::Opcode::DS_XOR_RTN_B32:
@@ -1026,6 +1085,10 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicOr32);
 		case Decoder::Opcode::IMAGE_ATOMIC_XOR:
 			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicXor32);
+		case Decoder::Opcode::IMAGE_ATOMIC_FMIN:
+			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicFMin32);
+		case Decoder::Opcode::IMAGE_ATOMIC_FMAX:
+			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicFMax32);
 
 		case Decoder::Opcode::FLAT_LOAD_UBYTE:
 		case Decoder::Opcode::FLAT_LOAD_SBYTE:

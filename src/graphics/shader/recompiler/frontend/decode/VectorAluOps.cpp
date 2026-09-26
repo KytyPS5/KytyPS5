@@ -87,6 +87,10 @@ constexpr OpcodeMap VOP1_OPCODE_LIST[] = {
     {0x00u, Opcode::V_NOP},
     {0x01u, Opcode::V_MOV_B32},
     {0x02u, Opcode::V_READFIRSTLANE_B32},
+    {0x04u, Opcode::V_CVT_F64_I32},
+    {0x16u, Opcode::V_CVT_F64_U32},
+    {0x0fu, Opcode::V_CVT_F32_F64},
+    {0x2fu, Opcode::V_RCP_F64},
     {0x05u, Opcode::V_CVT_F32_I32},
     {0x06u, Opcode::V_CVT_F32_U32},
     {0x07u, Opcode::V_CVT_U32_F32},
@@ -146,6 +150,8 @@ constexpr OpcodeMap VOP3_ENCODED_VOP1_OPCODE_LIST[] = {
     {0x00u, Opcode::V_NOP},
     {0x01u, Opcode::V_MOV_B32},
     {0x02u, Opcode::V_READFIRSTLANE_B32},
+    {0x04u, Opcode::V_CVT_F64_I32},
+    {0x16u, Opcode::V_CVT_F64_U32},
     {0x05u, Opcode::V_CVT_F32_I32},
     {0x06u, Opcode::V_CVT_F32_U32},
     {0x07u, Opcode::V_CVT_U32_F32},
@@ -229,11 +235,15 @@ constexpr VopcOpcodeInfo VOPC_OPCODE_LIST[] = {
     {0x92u, Opcode::V_CMPX_EQ_I32},        {0x93u, Opcode::V_CMPX_LE_I32},
     {0x94u, Opcode::V_CMPX_GT_I32},        {0x95u, Opcode::V_CMPX_NE_I32},
     {0x96u, Opcode::V_CMPX_GE_I32},        {0x98u, Opcode::V_CMPX_CLASS_F32},
+    {0x99u, Opcode::V_CMPX_LT_I16},        {0x9au, Opcode::V_CMPX_EQ_I16},
+    {0x9bu, Opcode::V_CMPX_LE_I16},        {0x9cu, Opcode::V_CMPX_GT_I16},
+    {0x9du, Opcode::V_CMPX_NE_I16},        {0x9eu, Opcode::V_CMPX_GE_I16},
     {0xa9u, Opcode::V_CMP_LT_U16},         {0xaau, Opcode::V_CMP_EQ_U16},
     {0xabu, Opcode::V_CMP_LE_U16},         {0xacu, Opcode::V_CMP_GT_U16},
     {0xadu, Opcode::V_CMP_NE_U16},         {0xaeu, Opcode::V_CMP_GE_U16},
     {0xb9u, Opcode::V_CMPX_LT_U16, false}, {0xbau, Opcode::V_CMPX_EQ_U16, false},
-    {0xbcu, Opcode::V_CMPX_GT_U16},        {0xc0u, Opcode::V_CMP_F_U32},
+    {0xbcu, Opcode::V_CMPX_GT_U16},        {0xbdu, Opcode::V_CMPX_NE_U16},
+    {0xc0u, Opcode::V_CMP_F_U32},
     {0xc1u, Opcode::V_CMP_LT_U32},         {0xc2u, Opcode::V_CMP_EQ_U32},
     {0xc3u, Opcode::V_CMP_LE_U32},         {0xc4u, Opcode::V_CMP_GT_U32},
     {0xc5u, Opcode::V_CMP_NE_U32},         {0xc6u, Opcode::V_CMP_GE_U32},
@@ -251,8 +261,9 @@ constexpr VopcOpcodeInfo VOPC_OPCODE_LIST[] = {
     {0xedu, Opcode::V_CMP_NEQ_F16},        {0xeeu, Opcode::V_CMP_NLT_F16},
     {0xd9u, Opcode::V_CMPX_LT_F16},        {0xdau, Opcode::V_CMPX_EQ_F16},
     {0xdbu, Opcode::V_CMPX_LE_F16},        {0xdcu, Opcode::V_CMPX_GT_F16},
-    {0xdeu, Opcode::V_CMPX_GE_F16},        {0xfbu, Opcode::V_CMPX_NGT_F16},
-    {0xfdu, Opcode::V_CMPX_NEQ_F16},       {0xfeu, Opcode::V_CMPX_NLT_F16},
+	{0xdeu, Opcode::V_CMPX_GE_F16},        {0xfbu, Opcode::V_CMPX_NGT_F16},
+	{0xfcu, Opcode::V_CMPX_NLE_F16},       {0xfdu, Opcode::V_CMPX_NEQ_F16},
+	{0xfeu, Opcode::V_CMPX_NLT_F16},
 };
 
 constexpr auto VOPC_OPS = Detail::MakeOpcodeTable<0x100>(VOPC_OPCODE_LIST);
@@ -267,6 +278,8 @@ constexpr OpcodeMap VOP3_OPCODE_LIST[] = {
     {0x146u, Opcode::V_CUBETC_F32},
     {0x147u, Opcode::V_CUBEMA_F32},
     {0x14bu, Opcode::V_FMA_F32},
+    {0x14cu, Opcode::V_FMA_F64},
+    {0x165u, Opcode::V_MUL_F64},
     {0x148u, Opcode::V_BFE_U32},
     {0x149u, Opcode::V_BFE_I32},
     {0x14au, Opcode::V_BFI_B32},
@@ -845,6 +858,7 @@ bool IsVopcFloatCompareOpcode(Opcode opcode) {
 		case Opcode::V_CMPX_GT_F16:
 		case Opcode::V_CMPX_GE_F16:
 		case Opcode::V_CMPX_NGT_F16:
+		case Opcode::V_CMPX_NLE_F16:
 		case Opcode::V_CMPX_NEQ_F16:
 		case Opcode::V_CMPX_NLT_F16:
 		case Opcode::V_CMP_CLASS_F32:
@@ -1176,8 +1190,75 @@ void DecodeVopcDpp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_in
 	ReadLiteralOperands(code, word_index, inst);
 }
 
+void ApplyDpp8Modifier(Operand& operand, uint32_t modifier, bool fetch_inactive) {
+ operand.dpp8 = true;
+ operand.dpp8_lane_selectors = (modifier >> 8u) & 0xffffffu;
+ operand.dpp8_fetch_inactive = fetch_inactive;
+}
+
+void DecodeVopcDpp8Impl(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
+                        uint32_t opcode, uint32_t vsrc1, Instruction& inst, bool fetch_inactive) {
+	const auto modifier = code[word_index + 1u];
+	const auto src0     = modifier & 0xffu;
+	SetRawWords(inst, code, word_index, 2);
+	if (inst.opcode == Opcode::UNSUPPORTED) {
+		SetUnsupported(inst, Family::VOPC, opcode, "VOPC opcode is not implemented");
+		return;
+	}
+	const auto* info = Detail::FindOpcode(VOPC_OPS, opcode);
+	if (info == nullptr || !info->supports_dpp) {
+		SetUnsupported(inst, Family::VOPC, opcode, "VOPC DPP8 modifier is not supported for opcode");
+		return;
+	}
+	DecodeVectorGpr(vsrc1, inst.src1);
+	DecodeVectorGpr(src0, inst.src0);
+	inst.dst.kind = IsVopcCompareExec(inst.opcode) ? OperandKind::ExecLo : OperandKind::VccLo;
+	ApplyDpp8Modifier(inst.src0, modifier, fetch_inactive);
+	inst.src_count = 2;
+	ReadLiteralOperands(code, word_index, inst);
+}
+
+void DecodeVopcDpp8(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, uint32_t opcode,
+                    uint32_t vsrc1, Instruction& inst) {
+	DecodeVopcDpp8Impl(pc, code, word_index, opcode, vsrc1, inst, false);
+}
+
+void DecodeVopcDpp8Fi(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
+                      uint32_t opcode, uint32_t vsrc1, Instruction& inst) {
+	DecodeVopcDpp8Impl(pc, code, word_index, opcode, vsrc1, inst, true);
+}
+
+void DecodeVop2Dpp8Impl(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
+                        uint32_t opcode, uint32_t vdst, uint32_t vsrc1, Instruction& inst,
+                        bool fetch_inactive) {
+	const auto modifier = code[word_index + 1u];
+	const auto src0     = modifier & 0xffu;
+	SetRawWords(inst, code, word_index, 2);
+	if (inst.opcode == Opcode::UNSUPPORTED) {
+		SetUnsupported(inst, Family::VOP2, opcode, "VOP2 opcode is not implemented");
+		return;
+	}
+
+	DecodeVectorGpr(vdst, inst.dst);
+	DecodeVectorGpr(vsrc1, inst.src1);
+	DecodeVectorGpr(src0, inst.src0);
+	ApplyDpp8Modifier(inst.src0, modifier, fetch_inactive);
+	FinalizeVop2Instruction(code, word_index, inst);
+}
+
+void DecodeVop2Dpp8(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
+                    uint32_t opcode, uint32_t vdst, uint32_t vsrc1, Instruction& inst) {
+	DecodeVop2Dpp8Impl(pc, code, word_index, opcode, vdst, vsrc1, inst, false);
+}
+
+void DecodeVop2Dpp8Fi(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
+                      uint32_t opcode, uint32_t vdst, uint32_t vsrc1, Instruction& inst) {
+	DecodeVop2Dpp8Impl(pc, code, word_index, opcode, vdst, vsrc1, inst, true);
+}
+
 uint32_t NativeVop3SourceCount(Opcode opcode) {
 	switch (opcode) {
+		case Opcode::V_MUL_F64:
 		case Opcode::V_MUL_LO_U32:
 		case Opcode::V_MUL_HI_U32:
 		case Opcode::V_MUL_LO_I32:
@@ -1329,6 +1410,8 @@ bool SupportsNativeVop3SourceModifiers(Opcode opcode) {
 		case Opcode::V_MAC_F32:
 		case Opcode::V_MAD_F32:
 		case Opcode::V_FMA_F32:
+		case Opcode::V_MUL_F64:
+		case Opcode::V_FMA_F64:
 		case Opcode::V_PACK_B32_F16:
 		case Opcode::V_CUBEID_F32:
 		case Opcode::V_CUBESC_F32:
@@ -1401,6 +1484,11 @@ bool HasUnsupportedNativeVop3Modifiers(Opcode opcode, bool permlane, bool mad_mi
 		return clamp != 0u || omod != 0u || neg != 0u;
 	}
 	switch (opcode) {
+		case Opcode::V_MUL_F64:
+			return (abs & ~0x3u) != 0u || (neg & ~0x3u) != 0u ||
+			       op_sel != 0u || clamp != 0u || omod != 0u;
+		case Opcode::V_FMA_F64:
+			return op_sel != 0u || clamp != 0u || omod != 0u;
 		case Opcode::V_LDEXP_F32: return (abs & ~1u) != 0u || op_sel != 0u || (neg & ~1u) != 0u;
 		case Opcode::V_CNDMASK_B32:
 			return (abs & ~0x3u) != 0u || op_sel != 0u || clamp != 0u || omod != 0u ||
@@ -1450,6 +1538,12 @@ bool IsVopcCompareExec(Opcode opcode) {
 		case Opcode::V_CMPX_NE_I32:
 		case Opcode::V_CMPX_GE_I32:
 		case Opcode::V_CMPX_CLASS_F32:
+		case Opcode::V_CMPX_LT_I16:
+		case Opcode::V_CMPX_EQ_I16:
+		case Opcode::V_CMPX_LE_I16:
+		case Opcode::V_CMPX_GT_I16:
+		case Opcode::V_CMPX_NE_I16:
+		case Opcode::V_CMPX_GE_I16:
 		case Opcode::V_CMPX_LT_U32:
 		case Opcode::V_CMPX_EQ_U32:
 		case Opcode::V_CMPX_LE_U32:
@@ -1461,12 +1555,14 @@ bool IsVopcCompareExec(Opcode opcode) {
 		case Opcode::V_CMPX_LT_U16:
 		case Opcode::V_CMPX_EQ_U16:
 		case Opcode::V_CMPX_GT_U16:
+		case Opcode::V_CMPX_NE_U16:
 		case Opcode::V_CMPX_LT_F16:
 		case Opcode::V_CMPX_EQ_F16:
 		case Opcode::V_CMPX_LE_F16:
 		case Opcode::V_CMPX_GT_F16:
 		case Opcode::V_CMPX_GE_F16:
 		case Opcode::V_CMPX_NGT_F16:
+		case Opcode::V_CMPX_NLE_F16:
 		case Opcode::V_CMPX_NEQ_F16:
 		case Opcode::V_CMPX_NLT_F16: return true;
 		default: return false;
@@ -1494,6 +1590,8 @@ void DecodeVop2(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 		return;
 	}
 	switch (src0) {
+		case 233u: DecodeVop2Dpp8(pc, code, word_index, opcode, vdst, vsrc1, inst); return;
+		case 234u: DecodeVop2Dpp8Fi(pc, code, word_index, opcode, vdst, vsrc1, inst); return;
 		case 249u: DecodeVop2Sdwa(pc, code, word_index, opcode, vdst, vsrc1, inst); return;
 		case 250u: DecodeVop2Dpp(pc, code, word_index, opcode, vdst, vsrc1, inst); return;
 		default: break;
@@ -1525,6 +1623,13 @@ void DecodeVop1(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	if (inst.opcode == Opcode::V_NOP) {
 		inst.dst.kind  = OperandKind::Null;
 		inst.src_count = 0;
+		return;
+	}
+	if ((inst.opcode == Opcode::V_CVT_F64_I32 || inst.opcode == Opcode::V_CVT_F64_U32) &&
+	    (src0 == 233u || src0 == 234u || src0 == 249u || src0 == 250u)) {
+		SetRawWords(inst, code, word_index, 2);
+		SetUnsupported(inst, Family::VOP1, opcode,
+		               "FP64 integer conversion DPP/DPP8/SDWA is not supported");
 		return;
 	}
 	switch (src0) {
@@ -1559,6 +1664,8 @@ void DecodeVopc(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	SetRawWords(inst, code, word_index, 1);
 
 	switch (src0) {
+		case 233u: DecodeVopcDpp8(pc, code, word_index, opcode, vsrc1, inst); return;
+		case 234u: DecodeVopcDpp8Fi(pc, code, word_index, opcode, vsrc1, inst); return;
 		case 249u: DecodeVopcSdwa(pc, code, word_index, opcode, vsrc1, inst); return;
 		case 250u: DecodeVopcDpp(pc, code, word_index, opcode, vsrc1, inst); return;
 		default: break;

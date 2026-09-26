@@ -481,6 +481,10 @@ std::string OperandToString(const Operand& operand) {
 		                    operand.dpp_ctrl, operand.dpp_fetch_inactive ? 1u : 0u,
 		                    operand.dpp_bound_ctrl ? 1u : 0u);
 	}
+	if (operand.dpp8) {
+		text += fmt::format(".dpp8(sel=0x{:06x},fi={})", operand.dpp8_lane_selectors,
+		                    operand.dpp8_fetch_inactive ? 1u : 0u);
+	}
 	return text;
 }
 
@@ -579,6 +583,8 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::IMAGE_ATOMIC_AND:
 		case Opcode::IMAGE_ATOMIC_OR:
 		case Opcode::IMAGE_ATOMIC_XOR:
+		case Opcode::IMAGE_ATOMIC_FMIN:
+		case Opcode::IMAGE_ATOMIC_FMAX:
 		case Opcode::IMAGE_LOAD:
 		case Opcode::IMAGE_LOAD_MIP:
 		case Opcode::IMAGE_GET_RESINFO:
@@ -605,18 +611,34 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::BUFFER_LOAD_FORMAT_XY:
 		case Opcode::BUFFER_LOAD_FORMAT_XYZ:
 		case Opcode::BUFFER_LOAD_FORMAT_XYZW:
+		case Opcode::BUFFER_LOAD_FORMAT_D16_X:
+		case Opcode::BUFFER_LOAD_FORMAT_D16_XY:
+		case Opcode::BUFFER_LOAD_FORMAT_D16_XYZ:
+		case Opcode::BUFFER_LOAD_FORMAT_D16_XYZW:
+		case Opcode::BUFFER_STORE_FORMAT_D16_X:
+		case Opcode::BUFFER_STORE_FORMAT_D16_XY:
+		case Opcode::BUFFER_STORE_FORMAT_D16_XYZ:
+		case Opcode::BUFFER_STORE_FORMAT_D16_XYZW:
 		case Opcode::BUFFER_STORE_FORMAT_X:
 		case Opcode::BUFFER_STORE_FORMAT_XY:
 		case Opcode::BUFFER_STORE_FORMAT_XYZ:
 		case Opcode::BUFFER_STORE_FORMAT_XYZW:
 		case Opcode::BUFFER_LOAD_UBYTE:
 		case Opcode::BUFFER_LOAD_USHORT:
+		case Opcode::BUFFER_LOAD_UBYTE_D16:
+		case Opcode::BUFFER_LOAD_UBYTE_D16_HI:
+		case Opcode::BUFFER_LOAD_SBYTE_D16:
+		case Opcode::BUFFER_LOAD_SBYTE_D16_HI:
+		case Opcode::BUFFER_LOAD_SHORT_D16:
+		case Opcode::BUFFER_LOAD_SHORT_D16_HI:
 		case Opcode::BUFFER_LOAD_DWORD:
 		case Opcode::BUFFER_LOAD_DWORDX2:
 		case Opcode::BUFFER_LOAD_DWORDX3:
 		case Opcode::BUFFER_LOAD_DWORDX4:
 		case Opcode::BUFFER_STORE_BYTE:
+		case Opcode::BUFFER_STORE_BYTE_D16_HI:
 		case Opcode::BUFFER_STORE_SHORT:
+		case Opcode::BUFFER_STORE_SHORT_D16_HI:
 		case Opcode::BUFFER_STORE_DWORD:
 		case Opcode::BUFFER_STORE_DWORDX2:
 		case Opcode::BUFFER_STORE_DWORDX3:
@@ -680,6 +702,8 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::DS_AND_RTN_B32:
 		case Opcode::DS_OR_B32:
 		case Opcode::DS_OR_RTN_B32:
+		case Opcode::DS_ADD_U64:
+		case Opcode::DS_OR_B64:
 		case Opcode::DS_XOR_B32:
 		case Opcode::DS_XOR_RTN_B32:
 		case Opcode::DS_WRXCHG_RTN_B32:

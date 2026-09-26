@@ -382,19 +382,22 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	(void)poll;
 	if (!TestWaitRegMemValue(*addr, ref, mask, func)) {
 		static std::atomic<uint32_t> wait_reg_logs {0};
-		if (wait_reg_logs.fetch_add(1, std::memory_order_relaxed) < 64) {
+		const auto log_id = wait_reg_logs.fetch_add(1, std::memory_order_relaxed);
+		// Soft-stall after Flip often lands here after the first 64 logs; keep
+		// emitting under graphics-debug-dump and periodically otherwise.
+		if (GraphicsRunDebugDumpEnabled() || log_id < 64 || (log_id % 256u) == 0u) {
 			if constexpr (sizeof(T) == sizeof(uint32_t)) {
 				LOGF("CommandProcessor::WaitRegMem32 suspend addr=0x%016" PRIx64
 				     " value=0x%08" PRIx32 " ref=0x%08" PRIx32 " mask=0x%08" PRIx32
-				     " func=0x%08" PRIx32 "\n",
+				     " func=0x%08" PRIx32 " n=%u\n",
 				     reinterpret_cast<uint64_t>(addr), static_cast<uint32_t>(*addr),
-				     static_cast<uint32_t>(ref), static_cast<uint32_t>(mask), func);
+				     static_cast<uint32_t>(ref), static_cast<uint32_t>(mask), func, log_id);
 			} else {
 				LOGF("CommandProcessor::WaitRegMem64 suspend addr=0x%016" PRIx64
 				     " value=0x%016" PRIx64 " ref=0x%016" PRIx64 " mask=0x%016" PRIx64
-				     " func=0x%08" PRIx32 "\n",
+				     " func=0x%08" PRIx32 " n=%u\n",
 				     reinterpret_cast<uint64_t>(addr), static_cast<uint64_t>(*addr),
-				     static_cast<uint64_t>(ref), static_cast<uint64_t>(mask), func);
+				     static_cast<uint64_t>(ref), static_cast<uint64_t>(mask), func, log_id);
 			}
 			Log::Flush();
 		}

@@ -1173,10 +1173,10 @@ bool FlipQueue::Flip(uint32_t micros) {
 		m_done_cond_var.SignalAll();
 		return false;
 	}
-	// Do not hold the config mutex across Present: title updates and swapchain
-	// recovery must not block guest VideoOut waits for the duration of vsync.
+	// Keep cfg.mutex through Present so guest VideoOut waits cannot interleave a
+	// vblank wait between Present completion and flip-status publish. Title updates
+	// are non-blocking and must not wait on this thread.
 	const uint64_t present_vblank = r.cfg->vblank_status.count;
-	r.cfg->mutex.Unlock();
 
 	m_mutex.Lock();
 	if (m_requests.empty() || m_requests.front().id != r.id ||
@@ -1188,7 +1188,6 @@ bool FlipQueue::Flip(uint32_t micros) {
 
 	m_presenter.Present(*r.frame);
 
-	r.cfg->mutex.Lock();
 	m_mutex.Lock();
 	if (m_requests.empty() || m_requests.front().id != r.id ||
 	    m_requests.front().state != RequestState::Presenting) {

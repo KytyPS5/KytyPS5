@@ -861,12 +861,7 @@ Swapchain::Status Swapchain::Present() {
 	vk::Result result;
 	{
 		Common::LockGuard lock(m_window.graphic_ctx.queue_mutex);
-		LOGF("Present: vkQueuePresentKHR begin image=%u frame_slot=%u\n", m_image_index,
-		     m_frame_index);
-		Log::Flush();
 		result = m_window.graphic_ctx.queue.presentKHR(&present);
-		LOGF("Present: vkQueuePresentKHR end result=%s\n", vk::to_string(result).c_str());
-		Log::Flush();
 	}
 	switch (result) {
 		case vk::Result::eSuccess: break;

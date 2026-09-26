@@ -706,26 +706,98 @@ uint32_t FormattedOutOfBoundsValue(ValueEmitContext& ctx, const IR::MemoryInfo& 
 	return ConstructU32Composite(ctx.state, components, values);
 }
 
+uint32_t ClampFormatComponentF32(EmitterState& state, uint32_t data, float low, float high) {
+	return EmitGlsl<GLSLstd450FClamp, IR::Type::F32>(state, EmitBitcastU32ToF32(state, data),
+	                                                 ConstantF32Value(state, low),
+	                                                 ConstantF32Value(state, high));
+}
+
+uint32_t RoundScaledFormatComponent(EmitterState& state, uint32_t clamped, float scale) {
+	return EmitFPRoundEven32(
+	    state, Binary(state, spv::OpFMul, TypeF32(state), clamped, ConstantF32Value(state, scale)));
+}
+
+// Mirrors NormalizeFormatComponent for stores: converts one 32-bit source component into the
+// raw bits the buffer format keeps. Sub-dword integers saturate, normalized and scaled values
+// clamp before rounding, and 10/11-bit floats reuse the F16 exponent range.
+uint32_t DenormalizeFormatComponent(EmitterState& state, const Format::BufferFormatInfo& info,
+                                    uint32_t component, uint32_t data) {
+	const auto bits = info.component_bits[component];
+	if (bits >= 32u) return data;
+	const auto max_unsigned  = static_cast<float>((1u << bits) - 1u);
+	const auto max_signed    = static_cast<float>((1u << (bits - 1u)) - 1u);
+	const auto pack_low_half = [&](auto&& pack) {
+		return pack(state, EmitCompositeConstructF32x2(state, EmitBitcastU32ToF32(state, data),
+		                                               ConstantF32Value(state, 0.0f)));
+	};
+	switch (info.type) {
+		case Format::ComponentType::Uint:
+			return EmitMinMaxU32Value(state, data, ConstantU32(state, (1u << bits) - 1u), false);
+		case Format::ComponentType::Sint: {
+			const auto limit = (1u << (bits - 1u)) - 1u;
+			const auto high  = EmitMinMaxI32Value(state, data, ConstantU32(state, limit), false);
+			return EmitMinMaxI32Value(state, high, ConstantU32(state, ~limit), true);
+		}
+		case Format::ComponentType::Uscaled:
+			return EmitConvertU32F32(state,
+			                         ClampFormatComponentF32(state, data, 0.0f, max_unsigned));
+		case Format::ComponentType::Sscaled:
+			return EmitConvertS32F32(
+			    state, ClampFormatComponentF32(state, data, -max_signed - 1.0f, max_signed));
+		case Format::ComponentType::Unorm:
+			return EmitConvertU32F32(
+			    state, RoundScaledFormatComponent(
+			               state, ClampFormatComponentF32(state, data, 0.0f, 1.0f), max_unsigned));
+		case Format::ComponentType::Snorm:
+			if (bits == 16u) return pack_low_half(EmitPackSnorm2x16);
+			return EmitConvertS32F32(
+			    state, RoundScaledFormatComponent(
+			               state, ClampFormatComponentF32(state, data, -1.0f, 1.0f), max_signed));
+		case Format::ComponentType::Float: {
+			if (bits == 16u) return pack_low_half(EmitPackHalf2x16);
+			// 10- and 11-bit unsigned floats share the F16 exponent width and bias: clamp away
+			// the sign, convert to F16 (RTZ) and drop the surplus mantissa bits. F16 keeps the
+			// exponent at bits 14:10, so shifting by 15 - bits lands it at the packed format's
+			// exponent position (10:6 for 11-bit, 9:5 for 10-bit) with the sign bit gone.
+			const auto positive = EmitGlsl<GLSLstd450FMax, IR::Type::F32>(
+			    state, EmitBitcastU32ToF32(state, data), ConstantF32Value(state, 0.0f));
+			return EmitShiftRightConstant(state, EmitF32ToF16RtzBits(state, positive), 15u - bits);
+		}
+		default: return data;
+	}
+}
+
 void StoreFormattedInBounds(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
                             const PreparedFormattedMemory& plan, uint32_t component,
                             uint32_t data) {
 	if (component >= plan.info.component_count) return;
 	const auto bits = plan.info.component_bits[component];
-	if (bits == 16u && (plan.info.type == Format::ComponentType::Snorm ||
-	                    plan.info.type == Format::ComponentType::Float)) {
-		const auto value = EmitBitCastF32U32(ctx.state, data);
-		const auto pair = EmitCompositeConstructF32x2(ctx.state, value,
-		                                               ConstantF32Value(ctx.state, 0.0f));
-		data = plan.info.type == Format::ComponentType::Float
-		           ? EmitPackHalf2x16(ctx.state, pair)
-		           : EmitPackSnorm2x16(ctx.state, pair);
-	}
+	data            = DenormalizeFormatComponent(ctx.state, plan.info, component, data);
 	if (bits == 8u || bits == 16u) {
 		StoreSubwordInBounds(ctx, mem, plan.resource, plan.addresses[component],
 		                     plan.indices[component], bits, data);
 	} else {
 		StoreWordInBounds(ctx, plan.resource, plan.indices[component], data);
 	}
+}
+
+// Packed formats keep every component in one dword: convert each transferred component,
+// insert it at its bit offset and issue a single store. Partial transfers preserve the rest.
+void StorePackedFormattedInBounds(ValueEmitContext& ctx, const PreparedFormattedMemory& plan,
+                                  uint32_t components, const std::array<uint32_t, 4>& data) {
+	auto&      state = ctx.state;
+	const auto count = std::min(components, plan.info.component_count);
+	if (count == 0u) return;
+	uint32_t word = count < plan.info.component_count
+	                    ? LoadWordInBounds(ctx, plan.resource, plan.indices[0])
+	                    : ConstantU32(state, 0);
+	for (uint32_t component = 0; component < count; component++) {
+		const auto raw = DenormalizeFormatComponent(state, plan.info, component, data[component]);
+		word           = EmitBitFieldInsert(state, word, raw,
+		                                    ConstantU32(state, plan.info.component_bit_offset[component]),
+		                                    ConstantU32(state, plan.info.component_bits[component]));
+	}
+	StoreWordInBounds(ctx, plan.resource, plan.indices[0], word);
 }
 
 void FormattedStore(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
@@ -740,7 +812,11 @@ void FormattedStore(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Memor
 		const auto plan = PrepareFormattedMemory(ctx, inst, mem, resource, info, 1u,
 		                                         FormattedAccess::Store);
 		EmitIfCondition(ctx.state, plan.in_bounds, [&]() {
-			StoreFormattedInBounds(ctx, mem, plan, 0u, data);
+			if (plan.info.packed_bitfield) {
+				StorePackedFormattedInBounds(ctx, plan, 1u, std::array<uint32_t, 4> {data});
+			} else {
+				StoreFormattedInBounds(ctx, mem, plan, 0u, data);
+			}
 		});
 	});
 }
@@ -862,11 +938,18 @@ void StoreWideBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t compo
 			const auto plan = PrepareFormattedMemory(ctx, inst, mem, resource, info, components,
 			                                         FormattedAccess::Store);
 			EmitIfCondition(state, plan.in_bounds, [&]() {
+				std::array<uint32_t, 4> values {};
 				for (uint32_t component = 0; component < components; component++) {
-					const auto data = state.builder.AllocateId();
-					state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), data,
-					                          composite, component);
-					StoreFormattedInBounds(ctx, mem, plan, component, data);
+					values[component] = state.builder.AllocateId();
+					state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state),
+					                          values[component], composite, component);
+				}
+				if (plan.info.packed_bitfield) {
+					StorePackedFormattedInBounds(ctx, plan, components, values);
+					return;
+				}
+				for (uint32_t component = 0; component < components; component++) {
+					StoreFormattedInBounds(ctx, mem, plan, component, values[component]);
 				}
 			});
 			return;

@@ -318,8 +318,27 @@ void Translator::EmitVector(const Decoder::Instruction& inst) {
 			return;
 		case O::V_CVT_PK_U8_F32: V_CVT_PK_U8_F32(inst); return;
 		case O::V_PACK_B32_F16: V_PACK_B32_F16(inst); return;
-		case O::V_CVT_PK_U16_U32:
-		case O::V_CVT_PK_I16_I32: return PackB16(inst, false, false);
+		case O::V_CVT_PK_U16_U32: {
+			// RDNA2 saturates each source to the 16-bit range instead of truncating it.
+			const auto saturate = [&](const Decoder::Operand& source) {
+				return IR::U32(
+				    ir.Emit(IR::ValueOpcode::UMin32, {ReadU32(source), IR::Value(0xffffu)}));
+			};
+			WriteOperand(DestinationOperand(inst),
+			             PackU16Lanes(saturate(inst.src0), saturate(inst.src1)));
+			return;
+		}
+		case O::V_CVT_PK_I16_I32: {
+			const auto saturate = [&](const Decoder::Operand& source) {
+				const auto clamped_high = IR::U32(
+				    ir.Emit(IR::ValueOpcode::SMin32, {ReadU32(source), IR::Value(0x7fffu)}));
+				return IR::U32(
+				    ir.Emit(IR::ValueOpcode::SMax32, {clamped_high, IR::Value(0xffff8000u)}));
+			};
+			WriteOperand(DestinationOperand(inst),
+			             PackU16Lanes(saturate(inst.src0), saturate(inst.src1)));
+			return;
+		}
 
 		case O::V_LSHLREV_B16:
 			return Integer16Shift(inst, IR::ValueOpcode::ShiftLeftLogical32, false);

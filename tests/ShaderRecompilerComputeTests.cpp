@@ -19187,14 +19187,51 @@ TestCase Vop3CvtPkI16I32Captured() {
   test.name = "Vop3CvtPkI16I32Captured";
   test.code = std::move(code);
   test.initial = {0x00018001u, 0xfffe7ffeu, 0};
-  test.expected = {0x00018001u, 0xfffe7ffeu, 0x7ffe8001u};
+  // RDNA2 saturates: 0x00018001 clamps to 0x7fff and the negative
+  // 0xfffe7ffe clamps to 0x8000 instead of being truncated.
+  test.expected = {0x00018001u, 0xfffe7ffeu, 0x80007fffu};
   test.opcodes = {O::BUFFER_LOAD_DWORD, O::V_MOV_B32, O::V_CVT_PK_I16_I32,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.decoded_counts = {{"0x00000014: V_CVT_PK_I16_I32 v5, v7, v16\n", 1}};
-  test.ir_counts = {{" = BitwiseAnd32 ", 2},
+  test.ir_counts = {{" = SMin32 ", 2},
+                    {" = SMax32 ", 2},
+                    {" = BitwiseAnd32 ", 2},
                     {" = ShiftLeftLogical32 ", 1},
                     {" = BitwiseOr32 ", 1}};
   test.required_spirv = {"OpBitwiseAnd", "OpShiftLeftLogical", "OpBitwiseOr"};
+  return test;
+}
+
+TestCase Vop3CvtPkU16U32Saturates() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 30, 0);
+  AppendBufferLoadDword(&code, 7, 30);
+  AppendVMovU32(&code, 30, 4);
+  AppendBufferLoadDword(&code, 16, 30);
+  AppendVMovU32(&code, 30, 8);
+  AppendBufferLoadDword(&code, 8, 30);
+  AppendVMovU32(&code, 30, 12);
+  AppendBufferLoadDword(&code, 17, 30);
+  AppendVop3(&code, 0x36a, 5, Vgpr(7), Vgpr(16)); // v_cvt_pk_u16_u32 v5, v7, v16
+  AppendVop3(&code, 0x36a, 6, Vgpr(8), Vgpr(17)); // v_cvt_pk_u16_u32 v6, v8, v17
+  AppendStoreVgpr(&code, 5, 4);
+  AppendStoreVgpr(&code, 6, 5);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "Vop3CvtPkU16U32Saturates";
+  test.code = std::move(code);
+  // 0x10000 and 0xffffffff clamp to 0xffff; in-range values pass through.
+  test.initial = {0x00010000u, 0x00001234u, 0xffffffffu, 0x00008000u, 0, 0};
+  test.expected = {0x00010000u, 0x00001234u, 0xffffffffu,
+                   0x00008000u, 0x1234ffffu, 0x8000ffffu};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_CVT_PK_U16_U32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"V_CVT_PK_U16_U32 v5, v7, v16", 1},
+                         {"V_CVT_PK_U16_U32 v6, v8, v17", 1}};
+  test.ir_counts = {{" = UMin32 ", 4}};
   return test;
 }
 
@@ -19599,13 +19636,13 @@ TestCase VectorBfeI32SignExtendsField() {
   return test;
 }
 
-TestCase VectorAlignByteUsesFiveBitByteOffset() {
+TestCase VectorAlignByteUsesTwoBitByteOffset() {
   using O = ShaderOpcode;
 
   std::vector<u32> code;
   AppendVMovLiteral(&code, 0, 0x11223344u);
   AppendVMovLiteral(&code, 1, 0x55667788u);
-  constexpr u32 offsets[] = {0, 1, 3, 4, 5, 7, 8, 31};
+  constexpr u32 offsets[] = {0, 1, 2, 3, 4, 5, 7, 8, 31};
   for (u32 i = 0; i < static_cast<u32>(std::size(offsets)); i++) {
     AppendVMovU32(&code, 2, offsets[i]);
     AppendVop3(&code, 0x14f, 10u + i, Vgpr(0), Vgpr(1), Vgpr(2));
@@ -19613,12 +19650,14 @@ TestCase VectorAlignByteUsesFiveBitByteOffset() {
   }
   AppendEnd(&code);
 
+  // RDNA2 only honours S2[1:0]: offsets 4 and 8 read S1 unshifted, 5 and 31
+  // wrap to one- and three-byte shifts, and no offset produces zero.
   return {
-      "VectorAlignByteUsesFiveBitByteOffset",
+      "VectorAlignByteUsesTwoBitByteOffset",
       code,
       {},
-      {0x55667788u, 0x44556677u, 0x22334455u, 0x11223344u, 0x00112233u,
-       0x00000011u, 0u, 0u},
+      {0x55667788u, 0x44556677u, 0x33445566u, 0x22334455u, 0x55667788u,
+       0x44556677u, 0x22334455u, 0x55667788u, 0x22334455u},
       {O::V_MOV_B32, O::V_ALIGNBYTE_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
@@ -20982,6 +21021,60 @@ TestCase VectorDpp8Captured(bool masked_exec) {
   return test;
 }
 
+TestCase VectorDpp8Vop2FetchInactive() {
+  using O = ShaderOpcode;
+  constexpr u32 sentinel = 0xaaaaaaaau;
+  constexpr u32 masks[] = {0x0f0f0f0fu, 0xf0f0f0f0u};
+  std::vector<u32> code;
+  AppendVMovU32(&code, 5, 100);
+  code.push_back(EncodeVop2(0x25, 5, Vgpr(0), 5));
+  AppendVMovLiteral(&code, 6, 1000);
+  AppendVMovLiteral(&code, 2, sentinel);
+  AppendVMovLiteral(&code, 3, sentinel);
+  AppendSMovLiteral(&code, 126, masks[0]);
+  AppendSMovLiteral(&code, 127, masks[1]);
+  // v_add_nc_u32 v2, v5, v6 dpp8:[4,5,6,7,4,5,6,7] (src0 encoding 233).
+  code.push_back(EncodeVop2(0x25, 2, 233, 6));
+  code.push_back(0xfacfac05u);
+  // Same selectors with fi:1 (src0 encoding 234) reads EXEC-inactive lanes.
+  code.push_back(EncodeVop2(0x25, 3, 234, 6));
+  code.push_back(0xfacfac05u);
+  AppendSMovLiteral(&code, 126, 0xffffffffu);
+  AppendSMovLiteral(&code, 127, 0xffffffffu);
+  code.push_back(EncodeVop2(0x1a, 7, InlineU32(2), 0));
+  AppendBufferStoreDword(&code, 2, 7);
+  AppendVMovU32(&code, 8, 64u * sizeof(u32));
+  code.push_back(EncodeVop2(0x25, 7, Vgpr(8), 7));
+  AppendBufferStoreDword(&code, 3, 7);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "VectorDpp8Vop2FetchInactive";
+  test.code = std::move(code);
+  test.expected.resize(128, sentinel);
+  for (u32 lane = 0; lane < 64; ++lane) {
+    const auto mask = masks[lane / 32u];
+    if ((mask & (1u << (lane % 32u))) == 0) {
+      continue;
+    }
+    const u32 source = (lane & ~7u) | 4u | (lane & 3u);
+    const bool source_active = (mask & (1u << (source % 32u))) != 0;
+    test.expected[lane] = (source_active ? 100u + source : 0u) + 1000u;
+    test.expected[64u + lane] = 100u + source + 1000u;
+  }
+  test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::S_MOV_B32,
+                  O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{".dpp8(ctrl=0xfacfac,fi=0,bc=0)", 1},
+                         {".dpp8(ctrl=0xfacfac,fi=1,bc=0)", 1}};
+  test.compute_info.wave_size = 64;
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase VectorDppQuadPermuteReverse() {
   using O = ShaderOpcode;
 
@@ -21077,6 +21170,43 @@ TestCase VectorDppBoundsControlZeroPreservesDestination() {
   test.expected = {0xaaaaaaaau, 100, 101, 102, 103, 104, 105, 106};
   test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::V_LSHLREV_B32,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 8;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase VectorDppInactiveSourceLaneHonorsBoundControl() {
+  using O = ShaderOpcode;
+  constexpr u32 sentinel = 0xaaaaaaaau;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 2, sentinel);
+  AppendVMovLiteral(&code, 3, sentinel);
+  AppendVMovU32(&code, 1, 100);
+  // Disable lane 2 so lane 3's row_shr:1 source is EXEC-inactive.
+  AppendSMovLiteral(&code, 126, 0xfbu);
+  code.push_back(EncodeVop2(0x25, 2, 250, 1));
+  code.push_back(EncodeVop2Dpp(0, 0x111)); // fi:0 bound_ctrl:0
+  code.push_back(EncodeVop2(0x25, 3, 250, 1));
+  code.push_back(EncodeVop2Dpp(0, 0x111) | (1u << 19u)); // fi:0 bound_ctrl:1
+  AppendSMovLiteral(&code, 126, 0xffffffffu);
+  code.push_back(EncodeVop2(0x1a, 4, InlineU32(2), 0));
+  AppendBufferStoreDword(&code, 2, 4);
+  AppendStoreVgprAtLaneDwordOffset(&code, 3, 0, 8);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "VectorDppInactiveSourceLaneHonorsBoundControl";
+  test.code = code;
+  // BOUND_CTRL=0 leaves lanes 0 (out of range) and 3 (inactive source)
+  // unwritten; BOUND_CTRL=1 feeds them zero instead.
+  test.expected = {sentinel, 100, sentinel, sentinel, 103, 104, 105, 106,
+                   100,      100, sentinel, 100,      103, 104, 105, 106};
+  test.opcodes = {O::V_MOV_B32,     O::S_MOV_B32,          O::V_ADD_NC_U32,
+                  O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.compute_info.threads_num[0] = 8;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -24077,6 +24207,68 @@ TestCase BufferStoreFormatXSnorm16ClampsRoundsAndPreservesHalfwords() {
   return test;
 }
 
+TestCase BufferStoreFormatXyzwResource8888UnormConvertsComponents() {
+  using O = ShaderOpcode;
+
+  // 2.0 and -1.0 clamp to the ends of the range; 0.5 * 255 = 127.5 rounds to 128.
+  constexpr std::array<u32, 8> values = {
+      0x00000000u, 0x3f800000u, 0x3f000000u, 0x40000000u,
+      0xbf800000u, 0x3e800000u, 0x3f400000u, 0x3e4ccccdu};
+  std::vector<u32> code;
+  for (u32 record = 0; record < 2; record++) {
+    for (u32 component = 0; component < 4; component++) {
+      AppendVMovLiteral(&code, component, values[record * 4 + component]);
+    }
+    AppendVMovU32(&code, 20, record);
+    code.push_back(EncodeMubuf0(0x07u, 0, true, false));
+    code.push_back(EncodeMubuf1(0, 0, 20));
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "BufferStoreFormatXyzwResource8_8_8_8UnormConvertsComponents";
+  test.code = std::move(code);
+  test.initial = std::vector<u32>(2, 0xdeadbeefu);
+  test.expected = {0xff80ff00u, 0x33bf4000u};
+  test.user_data = MakeStructuredStorageBufferData(
+      4, 2, false, BufferFormat(Prospero::BufferFormat::k8_8_8_8UNorm));
+  test.has_user_data = true;
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_XYZW, O::S_ENDPGM};
+  test.required_spirv = {"FClamp", "RoundEven"};
+  return test;
+}
+
+TestCase BufferStoreFormatXyzwResource2101010UnormPacksOneDword() {
+  using O = ShaderOpcode;
+
+  // x uses the 2-bit field: 1.0 -> 3; 0.5 -> 512 and 0.25 -> 256 of 1023.
+  constexpr std::array<u32, 8> values = {
+      0x3f800000u, 0x3f000000u, 0x3e800000u, 0x3f800000u,
+      0x00000000u, 0x3f800000u, 0xbf800000u, 0x3f000000u};
+  std::vector<u32> code;
+  for (u32 record = 0; record < 2; record++) {
+    for (u32 component = 0; component < 4; component++) {
+      AppendVMovLiteral(&code, component, values[record * 4 + component]);
+    }
+    AppendVMovU32(&code, 20, record);
+    code.push_back(EncodeMubuf0(0x07u, 0, true, false));
+    code.push_back(EncodeMubuf1(0, 0, 20));
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "BufferStoreFormatXyzwResource2_10_10_10UnormPacksOneDword";
+  test.code = std::move(code);
+  test.initial = std::vector<u32>(2, 0xdeadbeefu);
+  test.expected = {0xffd00803u, 0x80000ffcu};
+  test.user_data = MakeStructuredStorageBufferData(
+      4, 2, false, BufferFormat(Prospero::BufferFormat::k2_10_10_10UNorm));
+  test.has_user_data = true;
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_XYZW, O::S_ENDPGM};
+  test.required_spirv = {"OpBitFieldInsert", "FClamp", "RoundEven"};
+  return test;
+}
+
 TestCase BufferLoadFormatXyResource88UintExtractsBytes() {
   using O = ShaderOpcode;
 
@@ -25018,6 +25210,49 @@ TestCase GlobalSignedImmediateRebasesBeforeSaddr() {
   test.bda_mappings = {{GuestBase, 8}};
   test.opcodes = {O::S_MOV_B32, O::V_MOV_B32, O::FLAT_LOAD_DWORD,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
+TestCase FlatCachePolicyBitsDecodeAsHints() {
+  using O = ShaderOpcode;
+
+  constexpr uint64_t GuestBase = 0x0000000110000000ull;
+  constexpr u32 glc = 1u << 16u;
+  constexpr u32 slc = 1u << 17u;
+  constexpr u32 dlc = 1u << 12u;
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 20, static_cast<u32>(GuestBase));
+  AppendVMovLiteral(&code, 21, static_cast<u32>(GuestBase >> 32u));
+  // flat_load_dword v0, v[20:21] glc dlc
+  code.push_back(EncodeFlat0(0x0c, 0, 0) | glc | dlc);
+  code.push_back(EncodeFlat1(0, 0x7d, 0, 20));
+  // global_load_dword v1, v[20:21], off offset:4 slc
+  code.push_back(EncodeFlat0(0x0c, 2, 4) | slc);
+  code.push_back(EncodeFlat1(1, 0x7d, 0, 20));
+  // global_load_dword v2, v[20:21], off offset:8 glc slc dlc
+  code.push_back(EncodeFlat0(0x0c, 2, 8) | glc | slc | dlc);
+  code.push_back(EncodeFlat1(2, 0x7d, 0, 20));
+  // global_store_dword v[20:21], v1, off offset:12 glc
+  code.push_back(EncodeFlat0(0x1c, 2, 12) | glc);
+  code.push_back(EncodeFlat1(0, 0x7d, 1, 20));
+  AppendStoreVgpr(&code, 0, 0);
+  AppendStoreVgpr(&code, 1, 1);
+  AppendStoreVgpr(&code, 2, 2);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "FlatCachePolicyBitsDecodeAsHints";
+  test.code = std::move(code);
+  test.initial = {0, 0, 0, 0x11111111u, 0x22222222u, 0x33333333u, 0};
+  test.expected = {0x11111111u, 0x22222222u, 0x33333333u, 0x11111111u,
+                   0x22222222u, 0x33333333u, 0x22222222u};
+  test.bda_mappings = {{GuestBase, 12}};
+  test.opcodes = {O::V_MOV_B32, O::FLAT_LOAD_DWORD, O::FLAT_STORE_DWORD,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"segment=0 glc=1 dlc=1 slc=0", 1},
+                         {"segment=2 glc=0 dlc=0 slc=1", 1},
+                         {"segment=2 glc=1 dlc=1 slc=1", 1},
+                         {"segment=2 glc=1 dlc=0 slc=0", 1}};
   return test;
 }
 
@@ -28683,6 +28918,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(Vop2SdwaLshrrevCapturedByte1Source);
   AddCase(Vop2SdwaSubNcPreservesByteAndWordDestinations);
   AddCase(Vop3CvtPkI16I32Captured);
+  AddCase(Vop3CvtPkU16U32Saturates);
   AddCase(Vop3MulLoU16CapturedAndSelectors);
   AddCase(Vop3MadI16CapturedSelectorsAndSaturation);
   AddCase(Vop3Med3I16Captured);
@@ -28692,7 +28928,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorVop3LshlrevB64Captured);
   AddCase(VectorVop3IntegerOps);
   AddCase(VectorBfeI32SignExtendsField);
-  AddCase(VectorAlignByteUsesFiveBitByteOffset);
+  AddCase(VectorAlignByteUsesTwoBitByteOffset);
   AddCase(VectorCarryAndBitCountOps);
   AddCase(VectorMbcntUsesThreadMask);
   AddCase(VectorAddcWritesPerLaneCarryOut);
@@ -28732,10 +28968,12 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorPermlane16FetchInactiveFi);
   cases.push_back(VectorDpp8Captured(false));
   cases.push_back(VectorDpp8Captured(true));
+  AddCase(VectorDpp8Vop2FetchInactive);
   AddCase(VectorDppQuadPermuteReverse);
   AddCase(VectorDppRowXmask);
   AddCase(VectorDppBankMaskPreservesDestination);
   AddCase(VectorDppBoundsControlZeroPreservesDestination);
+  AddCase(VectorDppInactiveSourceLaneHonorsBoundControl);
   AddCase(Vop3FmacF32NegatedSourceAccumulates);
   AddCase(Vop3LdexpSourceModifier);
   AddCase(Vop1MoveRelSource);
@@ -28827,6 +29065,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferStoreFormatXyzwFloat16ConvertsComponents);
   AddCase(BufferStoreFormatXyzwSnorm16CapturedSkinningVectors);
   AddCase(BufferStoreFormatXSnorm16ClampsRoundsAndPreservesHalfwords);
+  AddCase(BufferStoreFormatXyzwResource8888UnormConvertsComponents);
+  AddCase(BufferStoreFormatXyzwResource2101010UnormPacksOneDword);
   AddCase(BufferLoadFormatXResource8UintZeroExtendsByte);
   AddCase(BufferLoadFormatXyResource88UintExtractsBytes);
   AddCase(BufferLoadFormatXyResource8888UnormConvertsFirstTwoComponents);
@@ -28865,6 +29105,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(FlatLoadVariants);
   AddCase(FlatSubdwordLoadsApplyByteOffset);
   AddCase(FlatVirtualAddressRebasesGuestAllocation);
+  AddCase(FlatCachePolicyBitsDecodeAsHints);
   AddCase(GlobalSignedImmediateRebasesBeforeSaddr);
   AddCase(FlatSegmentIgnoresSaddrAndMasksOffsetMsb);
   AddCase(ScratchIsPrivatePerInvocation);
@@ -33570,10 +33811,12 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorDpp8Captured(false));
     RunCase(&vulkan, VectorDpp8Captured(true));
+    RunCase(&vulkan, VectorDpp8Vop2FetchInactive());
     RunCase(&vulkan, VectorDppQuadPermuteReverse());
     RunCase(&vulkan, VectorDppRowXmask());
     RunCase(&vulkan, VectorDppBankMaskPreservesDestination());
     RunCase(&vulkan, VectorDppBoundsControlZeroPreservesDestination());
+    RunCase(&vulkan, VectorDppInactiveSourceLaneHonorsBoundControl());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--cmpx-o-f32-only") == 0) {
@@ -33585,6 +33828,8 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     RunCase(&vulkan, BufferStoreFormatXyzwSnorm16CapturedSkinningVectors());
     RunCase(&vulkan, BufferStoreFormatXSnorm16ClampsRoundsAndPreservesHalfwords());
+    RunCase(&vulkan, BufferStoreFormatXyzwResource8888UnormConvertsComponents());
+    RunCase(&vulkan, BufferStoreFormatXyzwResource2101010UnormPacksOneDword());
     RunCase(&vulkan, BufferStoreFormatXResource16UintWritesHalfword());
     RunCase(&vulkan, BufferStoreFormatXResource16UintPreservesAdjacentLanes());
     RunCase(&vulkan, BufferStoreFormatXyResource88UintWritesBytes());
@@ -33681,6 +33926,7 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, BufferLoadDwordIdxenUsesDescriptorStride());
     RunCase(&vulkan, BufferStoreFormatXAddTidUsesLaneIndex());
     RunCase(&vulkan, FlatVirtualAddressRebasesGuestAllocation());
+    RunCase(&vulkan, FlatCachePolicyBitsDecodeAsHints());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--wave64-only") == 0) {
@@ -33832,7 +34078,7 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--alignbyte-only") == 0) {
     VulkanHarness vulkan;
-    RunCase(&vulkan, VectorAlignByteUsesFiveBitByteOffset());
+    RunCase(&vulkan, VectorAlignByteUsesTwoBitByteOffset());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--zero-shift-only") == 0) {
@@ -33865,6 +34111,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--cvt-pk-i16-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, Vop3CvtPkI16I32Captured());
+    RunCase(&vulkan, Vop3CvtPkU16U32Saturates());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--med3-i16-only") == 0) {

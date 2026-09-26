@@ -101,7 +101,7 @@ uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t c
 }
 
 uint32_t EmitDppWriteCondition(ValueEmitContext& ctx, const IR::DppMoveFlags& flags,
-                               uint32_t exec) {
+                               IR::Value exec) {
 	auto&      state      = ctx.state;
 	const auto lane       = EmitSubgroupLocalInvocationId(state);
 	const auto bank_shift = state.builder.AllocateId();
@@ -143,9 +143,19 @@ uint32_t EmitDppWriteCondition(ValueEmitContext& ctx, const IR::DppMoveFlags& fl
 		state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), bounded, writable,
 		                          target.valid);
 		writable = bounded;
+		if (!flags.fetch_inactive && !flags.dpp8) {
+			// DPP16 with FI=0 treats an EXEC-inactive source lane as out of range, so
+			// BOUND_CTRL=0 leaves the destination unwritten instead of storing zero.
+			const auto ballot        = ctx.Ballot(exec);
+			const auto source_active = EmitBallotLaneActiveBool(state, ballot, target.lane);
+			const auto fetchable     = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), fetchable, writable,
+			                          source_active);
+			writable = fetchable;
+		}
 	}
 	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), result, exec, writable);
+	state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), result, ctx.Def(exec), writable);
 	return result;
 }
 
@@ -631,7 +641,7 @@ uint32_t EmitDppMoveU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 
 uint32_t EmitDppUpdateU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto flags = inst.Flags<IR::DppMoveFlags>();
-	const auto write = EmitDppWriteCondition(ctx, flags, ctx.Arg(inst, 2));
+	const auto write = EmitDppWriteCondition(ctx, flags, inst.Arg(2));
 	return EmitNative<spv::OpSelect, IR::Type::U32>(ctx.state, write, ctx.Arg(inst, 0),
 	                                                ctx.Arg(inst, 1));
 }

@@ -123,6 +123,11 @@ private:
 	PortIn* GetAudioInPort(Id handle); // Caller holds m_mutex.
 
 	Common::Mutex m_mutex;
+	// The handle is validated under m_mutex, but the write happens after that lock is
+	// released, so two guest threads can reach the same output port at once and race on
+	// its output clock and on the SDL stream. One mutex per port serializes them. It is
+	// kept outside PortOut because AudioOutClose resets the port.
+	Common::Mutex m_out_port_mutex[OUT_PORTS_MAX];
 	PortOut       m_out_ports[OUT_PORTS_MAX];
 	PortIn        m_in_ports[IN_PORTS_MAX];
 
@@ -450,7 +455,9 @@ bool Audio::AudioOutClose(Id handle) {
 	Common::LockGuard lock(m_mutex);
 
 	if (AudioOutValid(handle)) {
-		auto& port = m_out_ports[handle.GetId()];
+		const auto       port_id = handle.GetId();
+		Common::LockGuard port_lock(m_out_port_mutex[port_id]);
+		auto&             port = m_out_ports[port_id];
 
 		CloseSdlDevice(&port);
 		port = {};
@@ -516,24 +523,31 @@ uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking
 	EXIT_NOT_IMPLEMENTED(num == 0);
 	EXIT_NOT_IMPLEMENTED(!AudioOutValid(params[0].handle));
 
-	const auto& first_port = m_out_ports[params[0].handle.GetId()];
+	const auto first_id      = params[0].handle.GetId();
+	const auto first_samples = m_out_ports[first_id].samples_num;
 
-	uint64_t block_time   = (1000000 * first_port.samples_num) / first_port.freq;
-	uint64_t current_time = LibKernel::KernelGetProcessTime();
-
-	uint64_t max_wait_time = 0;
-
-	for (uint32_t i = 0; i < num; i++) {
-		uint64_t next_time = m_out_ports[params[i].handle.GetId()].last_output_time + block_time;
-		uint64_t wait_time = (next_time > current_time ? next_time - current_time : 0);
-		max_wait_time      = (wait_time > max_wait_time ? wait_time : max_wait_time);
+	uint64_t block_time = 0;
+	{
+		Common::LockGuard port_lock(m_out_port_mutex[first_id]);
+		block_time = (1000000 * m_out_ports[first_id].samples_num) / m_out_ports[first_id].freq;
 	}
 
-	bool any_port_has_device = false;
+	uint64_t current_time = LibKernel::KernelGetProcessTime();
+
+	uint64_t max_wait_time      = 0;
+	bool     any_port_has_device = false;
 	for (uint32_t i = 0; i < num; i++) {
-		if (m_out_ports[params[i].handle.GetId()].stream != nullptr) {
+		const auto port_id = params[i].handle.GetId();
+		if (port_id < 0 || port_id >= OUT_PORTS_MAX) {
+			continue;
+		}
+		Common::LockGuard port_lock(m_out_port_mutex[port_id]);
+		const auto&       port      = m_out_ports[port_id];
+		const uint64_t    next_time = port.last_output_time + block_time;
+		const uint64_t wait_time = (next_time > current_time ? next_time - current_time : 0);
+		max_wait_time             = (wait_time > max_wait_time ? wait_time : max_wait_time);
+		if (port.stream != nullptr) {
 			any_port_has_device = true;
-			break;
 		}
 	}
 
@@ -545,16 +559,20 @@ uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking
 	}
 
 	for (uint32_t i = 0; i < num; i++) {
-		auto& port = m_out_ports[params[i].handle.GetId()];
+		const auto port_id = params[i].handle.GetId();
+		if (port_id < 0 || port_id >= OUT_PORTS_MAX) {
+			continue;
+		}
+		Common::LockGuard port_lock(m_out_port_mutex[port_id]);
+		auto&             port = m_out_ports[port_id];
 
 		QueueSdlAudio(&port, params[i].data, blocking);
+		// Update the clock under the same lock, otherwise a concurrent batch for this port
+		// can read a stale value and the two writes end up paced off the same deadline.
+		port.last_output_time = LibKernel::KernelGetProcessTime();
 	}
 
-	for (uint32_t i = 0; i < num; i++) {
-		m_out_ports[params[i].handle.GetId()].last_output_time = LibKernel::KernelGetProcessTime();
-	}
-
-	return first_port.samples_num;
+	return first_samples;
 }
 
 static bool RecordingDevicePresent(SDL_AudioDeviceID device) {

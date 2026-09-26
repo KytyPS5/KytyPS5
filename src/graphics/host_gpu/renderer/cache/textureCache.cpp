@@ -1864,7 +1864,9 @@ bool TextureCache::IsRegionGpuModified(uint64_t address, uint64_t size) {
 	std::scoped_lock lock {m_lock};
 	for (const auto id: FindImagesInRegion(address, size, false)) {
 		const auto& image = m_slot_images[id];
-		if (!image.depth_id && image.IsGpuModified()) {
+		// A CPU write inside the image supersedes what the GPU rendered: the image is refreshed
+		// from guest memory before its next use, so guest memory holds the live bytes.
+		if (!image.depth_id && image.IsGpuModified() && !image.IsDefinitelyCpuDirty()) {
 			return true;
 		}
 	}

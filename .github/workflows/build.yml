@@ -2,6 +2,12 @@ name: Build and Release KytyPS5
 
 on:
   workflow_dispatch:
+    inputs:
+      create_release:
+        description: Create a GitHub release after a successful build
+        required: true
+        default: false
+        type: boolean
   push:
     branches: [ main, master ]
   pull_request:
@@ -432,8 +438,11 @@ jobs:
     name: Release KytyPS5
     if: >-
       always() &&
-      github.event_name == 'push' &&
-      github.repository == 'maok625/KytyPS5-PullsTry' &&
+      (
+        (github.event_name == 'push' &&
+         github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) ||
+        (github.event_name == 'workflow_dispatch' && inputs.create_release == true)
+      ) &&
       (needs.windows.result == 'success' ||
        needs.macos.result == 'success' ||
        needs.linux.result == 'success')

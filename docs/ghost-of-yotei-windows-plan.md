@@ -3,17 +3,16 @@
 Обновлено **26 сентября 2026 года**. Игра: **Ghost of Yōtei, PPSA26344**.
 Рабочая ветка — `yotei-windows-bringup` в локальном fork `fxpw/KytyPS5`.
 
-Checkpoint dense image/pair budget + Materialize path **26 сентября 2026 года**,
-источник `ba183b7c` + MaxImages/MaxSampledPairs=512 (рабочее дерево):
+Checkpoint planning_only SRT zeros + dense budgets **26 сентября 2026 года**,
+источник `1cdc1998` + SRT eval fixes (рабочее дерево):
 
-1. `8457901d` закрыт: deferred flat skip (`eb8cc3a5`) + null unevaluable
-   expression candidates (`ba183b7c`).
-2. PS `f8927c09` упирался в `MaxImages=64` / `MaxSampledPairs=64` при
-   probes=255 → pairs≈52 / images≈115. Лимиты подняты до 512 (контракт
-   bring-up). Game `_Build/runs/yotei-integrated-20260925-232709-4df601`
-   (SHA `4b35d0ce…`, frame 306, `shown=114`): **`f8927c09` Emit SPIR-V
-   words≈297386**. Следующий fatal — VS `4c26e33f93a0ef40`:
-   `runtime descriptor evaluation failed` на Materialize.
+1. `MaxImages`/`MaxSampledPairs`=512: PS `f8927c09` Emit SPIR-V ≈297k.
+2. VS `4c26e33f`: `ReadConst`→`LoadAddressU32`/`ReadConstBuffer` на
+   `planning_only` roots с unmapped/OOB payload → zero word (как optional null
+   SRT). Game `_Build/runs/yotei-integrated-20260925-235234-814b80`
+   (SHA dirty/`1cdc1998`+, frame 214, **shown=127**, flips gpu 128):
+   прошёл прежние Materialize fatals. Следующий — `bounded SRT read 0 index 0
+   cannot read coherent source at 0x5000f37f80`.
 3. Меню/gameplay **PENDING**.
 
 Checkpoint materialization + VOPC `0xbd` + LDS atomic return + workgroup

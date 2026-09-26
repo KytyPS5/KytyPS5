@@ -1637,6 +1637,11 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 		                      ? static_cast<uint64_t>(static_cast<uint32_t>(records))
 		                      : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
 		if (aligned > size || size - aligned < sizeof(uint32_t)) {
+			// Empty/null buffer descriptors used as optional SRT roots yield zero.
+			if (mem.planning_only) {
+				result = 0;
+				return true;
+			}
 			return false;
 		}
 		address = ((base & ~uint64_t {3}) + byte_offset) & ~uint64_t {3};
@@ -1650,6 +1655,16 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 	uint32_t word = 0;
 	if (m_runtime.read_memory != nullptr) {
 		if (!m_runtime.read_memory(m_runtime.userdata, address, {&word, 1})) {
+			// planning_only scalar roots may point at optional/unmapped SRT payloads
+			// (Yōtei VS 4c26e33f). Keep specialization alive with a zero word, matching
+			// the exact-null LoadAddress contract used for optional SRT bases.
+			if (mem.planning_only) {
+				result = 0;
+				return true;
+			}
+			m_last_flat_error = fmt::format(
+			    "LoadAddress read failed at 0x{:x} (planning={} opcode={})", address,
+			    mem.planning_only, static_cast<uint32_t>(inst.GetOpcode()));
 			return false;
 		}
 	} else {
@@ -1701,15 +1716,41 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 			const auto slot = inst.Arg(1).Resolve();
 			if (!slot.IsImmediate() || slot.GetType() != Type::U32 ||
 			    slot.U32() >= m_program.srt_reads.size()) {
+				m_last_flat_error = fmt::format(
+				    "ReadConst slot invalid (imm={} type={} value={} srt_reads={})",
+				    slot.IsImmediate(),
+				    slot.IsImmediate() ? static_cast<uint32_t>(slot.GetType()) : UINT32_MAX,
+				    slot.IsImmediate() && slot.GetType() == Type::U32 ? slot.U32() : UINT32_MAX,
+				    m_program.srt_reads.size());
 				return false;
 			}
-			if (slot.U32() < m_clean_flat_slots.size() &&
-			    m_clean_flat_slots[slot.U32()] == ResourcePlan::FlatSlotClean &&
-			    m_clean_evaluator != nullptr) {
+			const auto slot_kind = slot.U32() < m_clean_flat_slots.size()
+			                           ? m_clean_flat_slots[slot.U32()]
+			                           : 0u;
+			if (slot_kind == ResourcePlan::FlatSlotClean && m_clean_evaluator != nullptr) {
 				return m_clean_evaluator->EvaluateWide(m_program.srt_reads[slot.U32()].value,
 				                                       result);
 			}
-			return EvaluateWide(m_program.srt_reads[slot.U32()].value, result);
+			// Deferred slots are filled by bounded expression evaluation. A shared
+			// ReadConst leaf used outside that path must not fail Materialize when the
+			// GPU-selected LoadAddress is not yet readable (Yōtei VS 4c26e33f).
+			if (slot_kind == ResourcePlan::FlatSlotDeferred && !m_bounded_candidate.has_value()) {
+				if (EvaluateWide(m_program.srt_reads[slot.U32()].value, result)) {
+					return true;
+				}
+				result = 0;
+				return true;
+			}
+			if (!EvaluateWide(m_program.srt_reads[slot.U32()].value, result)) {
+				const auto* nested = m_program.srt_reads[slot.U32()].value.Resolve().TryInstruction();
+				m_last_flat_error = fmt::format(
+				    "ReadConst slot {} failed (slot_kind={} nested_opcode={} bounded={})",
+				    slot.U32(), slot_kind,
+				    nested != nullptr ? static_cast<uint32_t>(nested->GetOpcode()) : UINT32_MAX,
+				    m_bounded_candidate.has_value());
+				return false;
+			}
+			return true;
 		}
 		case ValueOpcode::ReadBoundedSrtU32: {
 			if (!m_bounded_candidate.has_value()) {
@@ -2018,7 +2059,10 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 	return false;
 }
 bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
+	m_last_flat_error.clear();
 	if (source >= m_program.descriptor_sources.size()) {
+		m_last_flat_error = fmt::format("descriptor source {} is out of range ({})", source,
+		                                m_program.descriptor_sources.size());
 		return false;
 	}
 	const auto& descriptor = m_program.descriptor_sources[source];
@@ -2026,6 +2070,15 @@ bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
 	result.dword_count = descriptor.dword_count;
 	for (uint32_t index = 0; index < descriptor.dword_count; ++index) {
 		if (!Evaluate(descriptor.dwords[index], result.dwords[index])) {
+			const auto* inst = descriptor.dwords[index].Resolve().TryInstruction();
+			const auto nested = m_last_flat_error;
+			m_last_flat_error = fmt::format(
+			    "descriptor source {} dword {} failed (opcode={} args={} user_data={}+{}{})",
+			    source, index,
+			    inst != nullptr ? static_cast<uint32_t>(inst->GetOpcode()) : UINT32_MAX,
+			    inst != nullptr ? inst->NumArgs() : 0u, m_program.user_data_base,
+			    m_runtime.user_data.size(),
+			    nested.empty() ? "" : fmt::format(" nested={}", nested));
 			return false;
 		}
 	}

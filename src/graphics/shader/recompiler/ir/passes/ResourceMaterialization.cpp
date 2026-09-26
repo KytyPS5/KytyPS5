@@ -1486,8 +1486,19 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& i
 	values.reserve(program.materialization_sources.size());
 	for (const auto source : program.materialization_sources) {
 		DescriptorValue value;
-		if (!walker.EvaluateDescriptor(source, value))
-			return SpecializationFail("runtime descriptor evaluation failed");
+		if (!walker.EvaluateDescriptor(source, value)) {
+			const auto* desc = Source(program, source);
+			const auto& detail = walker.LastFlatError();
+			return SpecializationFail(fmt::format(
+			    "runtime descriptor evaluation failed (source={} dwords={} "
+			    "inline={} bounded_buffer={} bounded_image={} indirect={}{})",
+			    source, desc != nullptr ? desc->dword_count : 0u,
+			    desc != nullptr && desc->inline_descriptor.has_value(),
+			    desc != nullptr && desc->bounded_buffer.has_value(),
+			    desc != nullptr && desc->bounded_image.has_value(),
+			    desc != nullptr && desc->indirect_image.has_value(),
+			    detail.empty() ? "" : fmt::format(" detail={}", detail)));
+		}
 		values.push_back(value);
 	}
 	std::vector<uint32_t> flattened_srt;

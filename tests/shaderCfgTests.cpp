@@ -10082,26 +10082,24 @@ void TestMeshDispatchSplit() {
       {65535, 1, {65535, 65535, 4194304}, 1},
       // Astro's Playroom on AMD: 68734 groups exceed the 65535 per-dimension limit (#624).
       {68734, 1, {65535, 65535, 4194304}, 2},
-      {68734, 3, {65535, 65535, 4194304}, 6},
+      // Three instances fit one slice each of the two group ranges.
+      {68734, 3, {65535, 65535, 4194304}, 2},
+      {68734, 3, {65535, 2, 4194304}, 4},
       {100, 200, {65535, 65535, 4194304}, 1},
       {100, 200, {65535, 65535, 4096}, 5},
       {100, 200, {65535, 64, 4194304}, 4},
       {4194305, 1, {UINT32_MAX, UINT32_MAX, 4194304}, 2},
+      // Absurd dispatches are rejected instead of expanded into millions of draws.
       {UINT32_MAX, UINT32_MAX, {65535, 65535, 4194304}, 0},
+      {MaxMeshDispatchSlices * 65535 + 1, 1, {65535, 65535, 4194304}, 0},
+      {MaxMeshDispatchSlices * 65535, 1, {65535, 65535, 4194304}, MaxMeshDispatchSlices},
       {0, 5, {65535, 65535, 4194304}, 0},
       {5, 0, {65535, 65535, 4194304}, 0},
       {5, 5, {0, 65535, 4194304}, 0},
   };
   for (const auto &test : cases) {
     const auto slices = SplitMeshDispatch(test.groups, test.instances, test.limits);
-    if (test.slice_count == 0) {
-      // Either nothing to draw or every slice still fits the limits.
-      Check(slices.empty() == (test.groups == 0 || test.instances == 0 ||
-                               test.limits.max_groups == 0),
-            "mesh dispatch split returned slices for an empty dispatch");
-    } else {
-      Check(slices.size() == test.slice_count, "mesh dispatch split produced the wrong slice count");
-    }
+    Check(slices.size() == test.slice_count, "mesh dispatch split produced the wrong slice count");
     std::vector<uint64_t> covered;
     for (const auto &slice : slices) {
       Check(slice.group_count != 0 && slice.instance_count != 0 &&

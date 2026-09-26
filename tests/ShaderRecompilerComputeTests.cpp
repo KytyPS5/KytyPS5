@@ -9578,7 +9578,7 @@ public:
       scheduler.Finish();
 
       auto output = CreateStorageBuffer(name, {}, test.expected.size());
-      const auto sampler = context.GetSamplerCache().GetSampler(sampler_descriptor);
+      const auto sampler = context.GetSamplerCache().GetSampler(sampler_descriptor, {});
       Image sampled;
       sampled.view = view;
       sampled.layout = image.backing.state.layout;
@@ -10533,7 +10533,7 @@ public:
               texture_cache, scheduler.Current(), lod_binding.image_id,
               {vk::ImageAspectFlagBits::eColor, mip, 1, 0, 1}, clear);
         }
-        const auto sampler = context.GetSamplerCache().GetSampler(lod_sampler);
+        const auto sampler = context.GetSamplerCache().GetSampler(lod_sampler, {});
         auto output = CreateStorageBuffer(lod_test.name, {}, 1);
         struct LodCase {
           uint32_t base_level;

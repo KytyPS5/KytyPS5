@@ -22,10 +22,15 @@ struct MeshDispatchSlice {
 	uint32_t instance_count = 0;
 };
 
+// Upper bound on the host draws one guest dispatch may be replayed as; beyond it the
+// dispatch is treated as invalid rather than expanded into an unbounded draw list.
+constexpr uint64_t MaxMeshDispatchSlices = 4096;
+
 // Splits a groups x instances mesh dispatch into host draws that each respect the
 // per-dimension and total workgroup limits. Slices cover whole instance ranges first so
 // primitive numbering stays contiguous within an instance. Returns no slices when the
-// dispatch is empty or the limits cannot host a single workgroup.
+// dispatch is empty, the limits cannot host a single workgroup, or the dispatch would
+// need more than MaxMeshDispatchSlices draws.
 inline std::vector<MeshDispatchSlice> SplitMeshDispatch(uint32_t groups, uint32_t instances,
                                                         const MeshDispatchLimits& limits) {
 	std::vector<MeshDispatchSlice> slices;
@@ -36,6 +41,12 @@ inline std::vector<MeshDispatchSlice> SplitMeshDispatch(uint32_t groups, uint32_
 	const uint32_t group_stride = std::min({groups, limits.max_groups, limits.max_total});
 	const uint32_t instance_stride =
 	    std::min({instances, limits.max_instances, limits.max_total / group_stride});
+	const uint64_t group_slices    = (uint64_t {groups} - 1u) / group_stride + 1u;
+	const uint64_t instance_slices = (uint64_t {instances} - 1u) / instance_stride + 1u;
+	if (group_slices * instance_slices > MaxMeshDispatchSlices) {
+		return slices;
+	}
+	slices.reserve(static_cast<size_t>(group_slices * instance_slices));
 	for (uint32_t instance = 0; instance < instances;) {
 		const uint32_t instance_count = std::min(instance_stride, instances - instance);
 		for (uint32_t group = 0; group < groups;) {

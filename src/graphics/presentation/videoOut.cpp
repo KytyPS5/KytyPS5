@@ -380,6 +380,15 @@ static void TriggerVideoOutEvents(VideoOutConfig& video_out, VideoOutEventKind k
 		EXIT_NOT_IMPLEMENTED(result != OK && result != LibKernel::KERNEL_ERROR_EBADF &&
 		                     result != LibKernel::KERNEL_ERROR_ENOENT);
 	}
+	if (kind == VideoOutEventKind::Flip) {
+		static std::atomic<uint32_t> flip_event_logs {0};
+		const auto                   n = flip_event_logs.fetch_add(1, std::memory_order_relaxed);
+		if (n < 32 || (n % 64u) == 0u) {
+			LOGF("TriggerVideoOutEvents Flip listeners=%zu arg=%" PRId64 " n=%u\n", queues.size(),
+			     reinterpret_cast<int64_t>(trigger_data), n);
+			Log::Flush();
+		}
+	}
 }
 
 static void DeleteVideoOutEvents(const VideoOutEventQueues& queues, VideoOutEventKind kind) {

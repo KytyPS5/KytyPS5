@@ -18,8 +18,12 @@ Checkpoint Flip queue lock-order (Reserve cfg→m_mutex ABBA) **26 сентяб�
    soft-stall снят** — ready=shown=137, pstg=10 (VblankEnd), PresentThread
    ~60fps (frame→44k). Новый стопор: guest/GPU перестал вызывать
    `CommandProcessor::Flip` (ровно 137); Sync after-complete balanced; нет
-   Fatal/Materialize. Следующее: почему CP/guest останавливает flip submit
-   (~submit=790). Меню/gameplay PENDING.
+   Fatal/Materialize.
+5. Retries `…-052812` / `…-053958` + WaitFlipDone/WaitRegMem logs: после
+   последнего `Flip()`+`WriteAtEndOfPipe64(refclock)` нет ни WaitFlipDone,
+   ни WaitRegMem — DCB просто кончается, guest больше не сабмитит GPU.
+   Present здоров. Следующее: почему CPU/equeue не продолжает кадр после
+   Flip event (listeners? kevent?). Меню/gameplay PENDING.
 
 Checkpoint present soft-stall (shown≈130 / ready=shown+1) **26 сентября 2026 года**:
 

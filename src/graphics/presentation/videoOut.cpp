@@ -1189,10 +1189,12 @@ bool FlipQueue::Flip(uint32_t micros) {
 		m_done_cond_var.SignalAll();
 		return false;
 	}
-	// Keep cfg.mutex through Present so guest VideoOut waits cannot interleave a
-	// vblank wait between Present completion and flip-status publish. Title updates
-	// are non-blocking and must not wait on this thread.
 	const uint64_t present_vblank = r.cfg->vblank_status.count;
+	// Never hold cfg.mutex while acquiring the flip-queue mutex: Prepare locks
+	// m_mutex then cfg.mutex, and Soft-stall samples show PresentDone (pstg=11)
+	// with shown not yet incremented — Flip blocked on m_mutex while still
+	// holding cfg across Present.
+	r.cfg->mutex.Unlock();
 
 	m_mutex.Lock();
 	if (m_requests.empty() || m_requests.front().id != r.id ||
@@ -1204,13 +1206,23 @@ bool FlipQueue::Flip(uint32_t micros) {
 
 	m_presenter.Present(*r.frame);
 
+	SetPresentStage(kPresentStageFlipPublish);
 	m_mutex.Lock();
 	if (m_requests.empty() || m_requests.front().id != r.id ||
 	    m_requests.front().state != RequestState::Presenting) {
 		EXIT("video-out flip queue changed while processing its front request\n");
 	}
 	m_requests.pop_front();
+	m_diagnostics.presented++;
+	m_diagnostics.last_presented_index = r.index;
+	const int flip_pending =
+	    static_cast<int>(m_requests.size() + m_cpu_requests.size());
+	m_processing = false;
+	m_done_cond_var.SignalAll();
+	m_submit_slot_cond_var.Signal();
+	m_mutex.Unlock();
 
+	r.cfg->mutex.Lock();
 	r.cfg->last_presented_vblank                = present_vblank;
 	r.cfg->flip_status.count++;
 	r.cfg->flip_status.processTime              = LibKernel::KernelGetProcessTime();
@@ -1218,18 +1230,11 @@ bool FlipQueue::Flip(uint32_t micros) {
 	r.cfg->flip_status.submitProcessTimeCounter = r.submit_ptc;
 	r.cfg->flip_status.flipArg                  = r.flip_arg;
 	r.cfg->flip_status.currentBuffer            = r.index;
-	m_diagnostics.presented++;
-	m_diagnostics.last_presented_index = r.index;
-	r.cfg->flip_status.flipPendingNum = static_cast<int>(m_requests.size() + m_cpu_requests.size());
+	r.cfg->flip_status.flipPendingNum           = flip_pending;
 	if (r.source == FlipRequestSource::GpuEop && r.cfg->flip_status.gcQueueNum > 0) {
 		r.cfg->flip_status.gcQueueNum--;
 	}
 	TriggerVideoOutEvents(*r.cfg, VideoOutEventKind::Flip, reinterpret_cast<void*>(r.flip_arg));
-
-	m_processing = false;
-	m_done_cond_var.SignalAll();
-	m_submit_slot_cond_var.Signal();
-	m_mutex.Unlock();
 	r.cfg->mutex.Unlock();
 
 	Graphics::RenderDocOnGuestFlip(m_presenter.Renderer());

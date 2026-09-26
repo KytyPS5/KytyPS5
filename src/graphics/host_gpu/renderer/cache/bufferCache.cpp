@@ -182,7 +182,11 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 				     " size=0x%016" PRIx64 " to 0x%016" PRIx64 "\n",
 				     guest, copy.size, writable);
 			}
-			Libs::LibKernel::Memory::WriteBacking(guest, host, writable);
+			if (!Libs::LibKernel::Memory::TryWriteBacking(guest, host, writable)) {
+				LOGF("BufferCache: skipped GPU download write without host backing "
+				     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+				     guest, writable);
+			}
 		}
 	});
 	return true;

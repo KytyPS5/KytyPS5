@@ -2158,7 +2158,11 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 				std::fclose(output);
 			}
 		}
-		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
+		if (!LibKernel::Memory::TryWriteBacking(range.address, mapped, range.size)) {
+			LOGF("TextureCache: skipped GPU download write without host backing "
+			     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+			     range.address, range.size);
+		}
 	});
 	return true;
 }

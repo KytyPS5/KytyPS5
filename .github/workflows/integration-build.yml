@@ -1,0 +1,189 @@
+name: KytyPS5 Integration Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_source:
+        description: Upstream source to integrate before building
+        required: true
+        default: none
+        type: choice
+        options:
+          - none
+          - main
+          - commit
+          - pull_request
+      upstream_value:
+        description: Upstream commit SHA or PR number, depending on upstream_source
+        required: false
+        default: ''
+        type: string
+      patch_text:
+        description: Optional unified diff patch; gh workflow run can pass this with -F patch_text=@file.patch
+        required: false
+        default: ''
+        type: string
+      file_source_ref:
+        description: Optional local/origin/upstream ref from which to restore selected files
+        required: false
+        default: ''
+        type: string
+      file_paths:
+        description: Optional newline-separated repository-relative paths to restore from file_source_ref
+        required: false
+        default: ''
+        type: string
+      create_release:
+        description: Create a GitHub release after the integration build succeeds
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: kyty-integration-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Prepare integration branch
+    runs-on: ubuntu-latest
+    outputs:
+      branch: ${{ steps.meta.outputs.branch }}
+    env:
+      UPSTREAM_SOURCE: ${{ inputs.upstream_source }}
+      UPSTREAM_VALUE: ${{ inputs.upstream_value }}
+      PATCH_TEXT: ${{ inputs.patch_text }}
+      FILE_SOURCE_REF: ${{ inputs.file_source_ref }}
+      FILE_PATHS: ${{ inputs.file_paths }}
+    steps:
+      - name: Checkout fork main
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Configure git
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        shell: bash
+        run: |
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream https://github.com/KytyPS5/KytyPS5.git
+          git fetch --prune --tags upstream main
+
+      - name: Create integration branch
+        id: meta
+        shell: bash
+        run: |
+          branch="integration/$(date -u +'%Y%m%d-%H%M%S')-${GITHUB_RUN_NUMBER}"
+          git switch -c "$branch" "origin/${{ github.event.repository.default_branch }}"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+
+      - name: Integrate upstream main
+        if: inputs.upstream_source == 'main'
+        shell: bash
+        run: |
+          git merge --no-edit --no-ff upstream/main
+
+      - name: Integrate upstream commit
+        if: inputs.upstream_source == 'commit'
+        shell: bash
+        run: |
+          test -n "$UPSTREAM_VALUE"
+          git fetch upstream "$UPSTREAM_VALUE"
+          git cherry-pick --no-edit "$UPSTREAM_VALUE"
+
+      - name: Integrate upstream pull request
+        if: inputs.upstream_source == 'pull_request'
+        shell: bash
+        run: |
+          test -n "$UPSTREAM_VALUE"
+          git fetch upstream "pull/$UPSTREAM_VALUE/head:refs/remotes/upstream/pr-$UPSTREAM_VALUE"
+          git merge --no-edit --no-ff "refs/remotes/upstream/pr-$UPSTREAM_VALUE"
+
+      - name: Apply supplied patch
+        if: inputs.patch_text != ''
+        shell: bash
+        run: |
+          printf '%s\n' "$PATCH_TEXT" > "$RUNNER_TEMP/request.patch"
+          git apply --3way --index "$RUNNER_TEMP/request.patch"
+          git diff --cached --check
+          git commit -m "Apply requested patch"
+
+      - name: Restore supplied files
+        if: inputs.file_source_ref != '' && inputs.file_paths != ''
+        shell: bash
+        run: |
+          git fetch origin "$FILE_SOURCE_REF" || true
+          git fetch upstream "$FILE_SOURCE_REF" || true
+          while IFS= read -r path; do
+            [ -z "$path" ] && continue
+            case "$path" in
+              /*|../*|*/../*)
+                echo "Refusing unsafe repository path: $path" >&2
+                exit 1
+                ;;
+            esac
+            git restore --source "$FILE_SOURCE_REF" -- "$path"
+          done <<< "$FILE_PATHS"
+          git add --all
+          git diff --cached --check
+          if ! git diff --cached --quiet; then
+            git commit -m "Restore requested files from $FILE_SOURCE_REF"
+          fi
+
+      - name: Validate final tree
+        shell: bash
+        run: |
+          git diff --check
+          git status --short
+          git log -5 --oneline --decorate
+          ./scripts/prepare-build.sh "$RUNNER_TEMP/source-manifest.json"
+
+      - name: Push integration branch
+        shell: bash
+        run: |
+          git push --set-upstream origin "${{ steps.meta.outputs.branch }}"
+
+  dispatch-build:
+    name: Dispatch standard build
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger build workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_BRANCH: ${{ needs.prepare.outputs.branch }}
+          CREATE_RELEASE: ${{ inputs.create_release }}
+        shell: bash
+        run: |
+          gh workflow run build.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref "$TARGET_BRANCH" \
+            -f create_release="$CREATE_RELEASE"
+
+      - name: Wait for build run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_BRANCH: ${{ needs.prepare.outputs.branch }}
+        shell: bash
+        run: |
+          for _ in $(seq 1 30); do
+            run_id="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow build.yml --branch "$TARGET_BRANCH" --limit 1 --json databaseId --jq '.[0].databaseId // empty')"
+            if [ -n "$run_id" ]; then
+              echo "Watching build run $run_id"
+              gh run watch "$run_id" --repo "$GITHUB_REPOSITORY" --exit-status
+              exit $?
+            fi
+            sleep 2
+          done
+          echo "Timed out waiting for the dispatched build run to appear." >&2
+          exit 1

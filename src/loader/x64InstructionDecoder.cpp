@@ -183,13 +183,20 @@ GuestFaultingInstruction DecodeGuestFaultingInstruction(const uint8_t* code, siz
 
 			case ZYDIS_OPERAND_TYPE_MEMORY: {
 				const uint64_t address = ResolveMemoryOperand(instruction, operand, registers);
-				const bool     resolved =
-				    IsGeneralPurposeRegister(operand.mem.base) &&
-				    (operand.mem.index == ZYDIS_REGISTER_NONE ||
-				     IsGeneralPurposeRegister(operand.mem.index));
+				// A missing base or index leaves a constant the resolver already computes, so
+				// only a segment base outside the reported register file leaves the operand
+				// unresolved. fs:/gs: bases are invisible here, and printing their offset as a
+				// linear fault address would be wrong.
+				const bool segment_unresolved = operand.mem.segment == ZYDIS_REGISTER_FS ||
+				                                operand.mem.segment == ZYDIS_REGISTER_GS;
+				const bool     resolved       = !segment_unresolved &&
+				                    (operand.mem.base == ZYDIS_REGISTER_NONE ||
+				                     IsGeneralPurposeRegister(operand.mem.base)) &&
+				                    (operand.mem.index == ZYDIS_REGISTER_NONE ||
+				                     IsGeneralPurposeRegister(operand.mem.index));
 				used = Append(result.text, sizeof(result.text), used, "%s[0x%016" PRIx64 "]%s",
 				              OperandWidthName(operand.size), address, resolved ? "" : " unresolved");
-				if (!computes_address_only && (operand.actions & memory_access) != 0) {
+				if (!computes_address_only && resolved && (operand.actions & memory_access) != 0) {
 					result.reads_memory |= (operand.actions & ZYDIS_OPERAND_ACTION_MASK_READ) != 0;
 					result.writes_memory |=
 					    (operand.actions & ZYDIS_OPERAND_ACTION_MASK_WRITE) != 0;

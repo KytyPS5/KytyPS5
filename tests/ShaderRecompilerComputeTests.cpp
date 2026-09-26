@@ -21217,6 +21217,37 @@ TestCase Vop1MoveRelDestination() {
   return test;
 }
 
+TestCase CubeIdCapturedNegationAndOutputScale() {
+  using O = ShaderOpcode;
+
+  constexpr std::array directions = {
+      std::array{4.0f, 2.0f, 1.0f}, std::array{-4.0f, 2.0f, 1.0f},
+      std::array{1.0f, -4.0f, 2.0f}, std::array{1.0f, 4.0f, 2.0f},
+      std::array{1.0f, 2.0f, -4.0f}, std::array{1.0f, 2.0f, 4.0f}};
+  constexpr std::array registers = {47u, 49u, 48u};
+  TestCase test;
+  test.name = "CubeIdCapturedNegationAndOutputScale";
+  for (u32 i = 0; i < directions.size(); i++) {
+    for (u32 component = 0; component < registers.size(); component++) {
+      test.initial.push_back(std::bit_cast<u32>(directions[i][component]));
+      AppendVMovU32(&test.code, 30, (i * 3u + component) * 4u);
+      AppendBufferLoadDword(&test.code, registers[component], 30);
+    }
+    // The captured instruction negates Y/Z and divides the floating face ID by two.
+    test.code.insert(test.code.end(), {0xd544000bu, 0xdcc2632fu});
+    AppendStoreVgpr(&test.code, 11, i);
+  }
+  AppendEnd(&test.code);
+  test.expected = {0x00000000u, 0x3f000000u, 0x3f800000u,
+                   0x3fc00000u, 0x40000000u, 0x40200000u};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_CUBEID_F32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {
+      {"V_CUBEID_F32 v11.omod(3), v47, v49.neg, v48.neg", directions.size()}};
+  test.required_spirv = {"OpFNegate", "OpFMul"};
+  return test;
+}
+
 TestCase VectorFloatSpecialOps() {
   using O = ShaderOpcode;
 
@@ -29098,6 +29129,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(Vop1MoveRelSource);
   AddCase(Vop1MoveRelDestination);
   AddCase(VectorFloatSpecialOps);
+  AddCase(CubeIdCapturedNegationAndOutputScale);
   AddCase(MadMixF16LiteralHalfSourceUsesOpsel);
   AddCase(MadMixF16NegHiIsAbsAndNegIsIndependent);
   AddCase(VectorVop3FmaF16UsesRdna2Opcode34b);
@@ -34191,6 +34223,12 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, Vop1SdwaFfbhCapturedScalarLowWordSource());
     RunCase(&vulkan, VectorFfbhI32NativeAndVop3OnGpu());
     RunCase(&vulkan, Vop1SdwaFfblCapturedHighWordSource());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--cubeid-omod-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, CubeIdCapturedNegationAndOutputScale());
+    RunCase(&vulkan, VectorFloatSpecialOps());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--sdwa-ashr-only") == 0) {

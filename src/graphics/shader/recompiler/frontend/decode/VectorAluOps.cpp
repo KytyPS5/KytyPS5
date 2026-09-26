@@ -1380,6 +1380,7 @@ bool SupportsNativeVop3ResultModifiers(Opcode opcode) {
 		case Opcode::V_MAD_F32:
 		case Opcode::V_FMA_F32:
 		case Opcode::V_FMA_F16:
+		case Opcode::V_CUBEID_F32:
 		case Opcode::V_CVT_PKRTZ_F16_F32:
 		case Opcode::V_LDEXP_F32:
 		case Opcode::V_MIN3_F32:

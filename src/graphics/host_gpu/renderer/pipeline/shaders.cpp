@@ -3,6 +3,7 @@
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/timer.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/debug.h"
@@ -648,10 +649,18 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	LOGF("PipelineTrace: vkCreateComputePipelines begin layout=%p\n",
 	     static_cast<void*>(pipeline.pipeline_layout));
+	Log::Flush();
+	const auto pipeline_begin = Common::Timer::QueryPerformanceCounter();
 	result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr,
 	                                                &pipeline.pipeline);
-	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p\n",
-	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
+	const auto pipeline_end = Common::Timer::QueryPerformanceCounter();
+	const auto frequency    = Common::Timer::QueryPerformanceFrequency();
+	const auto elapsed_ms =
+	    frequency == 0 ? 0 : (pipeline_end - pipeline_begin) * 1000u / frequency;
+	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p elapsed_ms=%" PRIu64
+	     "\n",
+	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline), elapsed_ms);
+	Log::Flush();
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);

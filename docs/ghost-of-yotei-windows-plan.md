@@ -28,9 +28,19 @@ Checkpoint Flip queue lock-order (Reserve cfg→m_mutex ABBA) **26 сентяб�
    тесте, но не в `LIB_FUNC`. Фикс `…` / commit: зарегистрировать GetVrrStatus.
    RED/GREEN: `shader_cfg_tests --videoout-vrr-status-only`.
 7. Game `_Build/runs/yotei-integrated-20260926-060211-presentfix`: **shown=151**
-   (прошлый soft-stall ~137 снят), gWT7 stubs=0, Present 60fps. Новый Fatal:
+   (прошлый soft-stall ~137 снят), gWT7 stubs=0, Present 60fps. Fatal был:
    `sampled HTile import has unsupported GPU image or raw-buffer ownership`
-   (`textureCache.cpp:1452`), exit 321. Меню/gameplay PENDING.
+   (`textureCache.cpp:1452`), exit 321.
+8. Фикс `73c99f03`: при наличии native depth owner всегда возвращать его;
+   buffer-dirty depth без image — ReadMemory перед clear-import.
+9. Game `_Build/runs/yotei-integrated-20260926-061925-presentfix`: **shown=164**,
+   HTile ownership fatal снят (0). Present 60fps до стопора. Exit `-805306369`
+   (`0xcfffffff`) без `--- Error ---`: first-use CS `0x8000198700` /
+   hash `54904fb419d79e49` (SPIR-V ~739k words, LDS 3200 dwords, wg 512)
+   застрял в `vkCreateComputePipelines` под GPUAV lite; AJM продолжал,
+   shown не рос → frame watchdog Kill. `PipelineTrace: begin` есть, `done` нет.
+10. Следующее: Sync present-fix **без GPUAV** + elapsed на CreatePipeline;
+    если pipeline создаётся — гнать следующий fatal. Меню/gameplay PENDING.
 
 Checkpoint present soft-stall (shown≈130 / ready=shown+1) **26 сентября 2026 года**:
 

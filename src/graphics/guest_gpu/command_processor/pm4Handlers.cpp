@@ -1741,6 +1741,7 @@ KYTY_CP_OP_PARSER(CpOpDumpConstRam) {
 	EXIT_NOT_IMPLEMENTED(dw_num >= 0x3000);
 	EXIT_NOT_IMPLEMENTED(offset > 0xbffc);
 	EXIT_NOT_IMPLEMENTED((offset & 0x3u) != 0);
+	EXIT_NOT_IMPLEMENTED(offset / 4 + dw_num > 0x3000);
 
 	cp.DumpConstRam(dst, offset, dw_num);
 
@@ -1782,6 +1783,12 @@ KYTY_CP_OP_PARSER(CpOpEventWriteEop) {
 	auto*    dst_gpu_addr =
 	    reinterpret_cast<void*>(buffer[1] | (static_cast<uint64_t>(buffer[2] & 0xffffu) << 32u));
 	uint64_t value = (buffer[3] | (static_cast<uint64_t>(buffer[4]) << 32u));
+
+	// EVENT_WRITE_EOP's DATA_SEL 3 is the GPU clock; WriteAtEndOfPipe follows the RELEASE_MEM
+	// convention (see CpOpReleaseMem) where the clock is source 4.
+	if (event_write_source == 3) {
+		event_write_source = 4;
+	}
 
 	cp.WriteAtEndOfPipe64(cache_policy, event_write_dest, eop_event_type, cache_action, event_index,
 	                      event_write_source, dst_gpu_addr, value, interrupt_selector);
@@ -2370,7 +2377,7 @@ KYTY_CP_OP_PARSER(CpOpSetContextReg) {
 	auto cmd_offset = NormalizeRegisterOffset(buffer[0]);
 
 	if (HwCtxTrySetFakeRegister(cmd_offset, buffer[1])) {
-		return 2;
+		return KYTY_PM4_LEN(cmd_id) - 1u;
 	}
 
 	if (cmd_offset >= Pm4::CX_NUM) {
@@ -2415,7 +2422,7 @@ KYTY_CP_OP_PARSER(CpOpSetShaderReg) {
 
 	auto cmd_offset = buffer[0];
 	if (cmd_offset == Pm4::SH_NOP) {
-		return 2;
+		return KYTY_PM4_LEN(cmd_id) - 1u;
 	}
 
 	EXIT_NOT_IMPLEMENTED(cmd_offset >= Pm4::SH_NUM);
@@ -2610,6 +2617,7 @@ KYTY_CP_OP_PARSER(CpOpWriteConstRam) {
 	EXIT_NOT_IMPLEMENTED(dw_num >= 0x3000);
 	EXIT_NOT_IMPLEMENTED(offset > 0xbffc);
 	EXIT_NOT_IMPLEMENTED((offset & 0x3u) != 0);
+	EXIT_NOT_IMPLEMENTED(offset / 4 + dw_num > 0x3000);
 
 	cp.WriteConstRam(offset, buffer + 1, dw_num);
 

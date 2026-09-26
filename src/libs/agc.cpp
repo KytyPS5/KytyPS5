@@ -1728,7 +1728,7 @@ int KYTY_SYSV_ABI AgcDriverRegisterWorkloadStream(uint32_t stream_id, const void
 }
 
 uint32_t* KYTY_SYSV_ABI AgcCbNop(CommandBuffer* buf, uint32_t size_in_dwords) {
-	if (buf == nullptr || size_in_dwords < 2) {
+	if (buf == nullptr || size_in_dwords == 0) {
 		return nullptr;
 	}
 
@@ -1738,10 +1738,14 @@ uint32_t* KYTY_SYSV_ABI AgcCbNop(CommandBuffer* buf, uint32_t size_in_dwords) {
 		return nullptr;
 	}
 
-	cmd[0] = KYTY_PM4(size_in_dwords, Pm4::IT_NOP, Pm4::R_ZERO);
-	if (size_in_dwords > 1) {
-		memset(cmd + 1, 0, static_cast<size_t>(size_in_dwords - 1) * 4);
+	if (size_in_dwords == 1) {
+		// AMD's header-only NOP: COUNT == 0x3fff and no body.
+		cmd[0] = 0xffff1000u;
+		return cmd;
 	}
+
+	cmd[0] = KYTY_PM4(size_in_dwords, Pm4::IT_NOP, Pm4::R_ZERO);
+	memset(cmd + 1, 0, static_cast<size_t>(size_in_dwords - 1) * 4);
 
 	return cmd;
 }
@@ -3622,7 +3626,8 @@ int KYTY_SYSV_ABI AgcDmaDataPatchSetSrcAddressOrOffsetOrImmediate(
 
 uint32_t KYTY_SYSV_ABI AgcGetPacketSize(uint32_t* packet) {
 	const auto cmd_id = packet[0];
-	if ((cmd_id & 0x3fffff00u) == 0x3fff1000u) {
+	// Type-2 padding and the header-only NOP (COUNT == 0x3fff) have no body.
+	if ((cmd_id >> 30u) == 2u || (cmd_id & 0x3fffff00u) == 0x3fff1000u) {
 		return 1;
 	}
 
@@ -3666,11 +3671,10 @@ int KYTY_SYSV_ABI AgcSetRangePredication(uint32_t* start, const volatile uint32_
 	const uint32_t predication_bit = (static_cast<uint8_t>(predication) == 1 ? 1u : 0u);
 	while (packet_va < end_va) {
 		const auto cmd_id = packet[0];
-		packet[0]         = (cmd_id & ~1u) | predication_bit;
-
-		auto size = KYTY_PM4_LEN(cmd_id);
-		if ((cmd_id & 0x3fffff00u) == 0x3fff1000u) {
-			size = 1;
+		const auto size   = AgcGetPacketSize(packet);
+		// Type-2 padding carries no predicate bit and is left untouched.
+		if ((cmd_id >> 30u) != 2u) {
+			packet[0] = (cmd_id & ~1u) | predication_bit;
 		}
 
 		packet_va += size * sizeof(uint32_t);

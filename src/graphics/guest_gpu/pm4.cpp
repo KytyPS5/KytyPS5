@@ -120,15 +120,19 @@ void DumpPm4PacketStream(Common::File* file, const uint32_t* cmd_buffer, uint32_
 		uint32_t len = 0;
 
 		const auto packet_type = static_cast<PacketType>(cmd_id >> 30u);
-		// Type-2 packets are header-only padding; every other packet type requires a body.
-		EXIT_NOT_IMPLEMENTED(dw < 2 && packet_type != PacketType::Type2);
+		// Type-2 packets are header-only padding whatever their low bits hold, and AMD's
+		// header-only NOP (COUNT == 0x3fff) carries no body either; everything else needs one.
+		const bool header_only =
+		    packet_type == PacketType::Type2 ||
+		    (packet_type == PacketType::Type3 && (cmd_id & 0x3fffff00u) == 0x3fff1000u);
+		EXIT_NOT_IMPLEMENTED(dw < 2 && !header_only);
 
 		switch (packet_type) {
 			case PacketType::Type3: {
 				const bool    sh_gx = (cmd_id & 0x2u) == 0;
 				const uint8_t op    = ((cmd_id >> 8u) & 0xffu);
 				const auto    r     = KYTY_PM4_R(cmd_id);
-				len                 = ((cmd_id >> 16u) & 0x3fffu) + 1;
+				len                 = (header_only ? 0u : ((cmd_id >> 16u) & 0x3fffu) + 1u);
 
 				EXIT_NOT_IMPLEMENTED(len >= dw);
 

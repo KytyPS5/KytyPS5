@@ -50,7 +50,11 @@ constexpr int      VIDEO_OUT_BUS_TYPE_MAIN                              = 0;
 constexpr int      VIDEO_OUT_BUS_TYPE_OVERLAY                           = 1;
 constexpr int      VIDEO_OUT_BUS_TYPE_SUB                               = 2;
 constexpr int      VIDEO_OUT_FLIP_MODE_VSYNC                            = 1;
+constexpr int      VIDEO_OUT_FLIP_MODE_HSYNC                            = 2;
+constexpr int      VIDEO_OUT_FLIP_MODE_WINDOW                           = 3;
 constexpr int      VIDEO_OUT_FLIP_MODE_VSYNC_MULTI                      = 4;
+constexpr int      VIDEO_OUT_FLIP_MODE_VSYNC_MULTI_2                    = 5;
+constexpr int      VIDEO_OUT_FLIP_MODE_WINDOW_2                         = 6;
 constexpr int      VIDEO_OUT_BUFFER_INDEX_BLACK                         = -2;
 constexpr int      VIDEO_OUT_BUFFER_INDEX_BLANK                         = -1;
 constexpr int      VIDEO_OUT_BUFFER_NUM_MAX                             = 16;
@@ -498,7 +502,16 @@ static bool IsSpecialBufferIndex(int index) {
 }
 
 static bool IsValidFlipMode(int mode) {
-	return mode >= VIDEO_OUT_FLIP_MODE_VSYNC && mode <= VIDEO_OUT_FLIP_MODE_VSYNC_MULTI;
+	// Every accepted mode is paced by the vblank here; the multi/window variants alias VSYNC.
+	switch (mode) {
+		case VIDEO_OUT_FLIP_MODE_VSYNC:
+		case VIDEO_OUT_FLIP_MODE_HSYNC:
+		case VIDEO_OUT_FLIP_MODE_WINDOW:
+		case VIDEO_OUT_FLIP_MODE_VSYNC_MULTI:
+		case VIDEO_OUT_FLIP_MODE_VSYNC_MULTI_2:
+		case VIDEO_OUT_FLIP_MODE_WINDOW_2: return true;
+		default: return false;
+	}
 }
 
 static int ReserveFlipRequest(VideoOutDriver::Impl& driver, int handle, int index, int flip_mode,
@@ -508,7 +521,7 @@ static int ReserveFlipRequest(VideoOutDriver::Impl& driver, int handle, int inde
 		return VIDEO_OUT_ERROR_INVALID_HANDLE;
 	}
 	if (!IsValidFlipMode(flip_mode)) {
-		return VIDEO_OUT_ERROR_INVALID_VALUE;
+		return VIDEO_OUT_ERROR_INVALID_FLIP_MODE;
 	}
 	if (!IsValidBufferIndex(index)) {
 		return VIDEO_OUT_ERROR_INVALID_INDEX;
@@ -1467,7 +1480,7 @@ KYTY_SYSV_ABI int VideoOutSubmitFlip(int handle, int index, int flip_mode, int64
 	uint64_t  request_id = 0;
 	const int result     = ReserveFlipRequest(DriverState(), handle, index, flip_mode, flip_arg,
 	                                          FlipRequestSource::Cpu, request_id);
-	if (result == VIDEO_OUT_ERROR_INVALID_VALUE) {
+	if (result == VIDEO_OUT_ERROR_INVALID_FLIP_MODE) {
 		LOGF("\t unsupported flip_mode = %d\n", flip_mode);
 	}
 	if (result != OK) {

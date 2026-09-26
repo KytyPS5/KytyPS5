@@ -32221,6 +32221,36 @@ void CheckPm4AcquireMemNoOp(RenderContext &renderer) {
   std::printf("[host]    %-32s ok\n", "Pm4AcquireMemNoOp");
 }
 
+void CheckPm4HeaderOnlyNop(RenderContext &renderer) {
+  constexpr const char *name = "Pm4HeaderOnlyNop";
+  GraphicsInitJmpTables();
+  CommandProcessor processor(renderer, 0);
+  processor.BufferInit();
+  uint32_t first = 0;
+  uint32_t second = 0;
+  const auto first_address = reinterpret_cast<uint64_t>(&first);
+  const auto second_address = reinterpret_cast<uint64_t>(&second);
+  // AMD's header-only NOP (0xffff1000, COUNT == 0x3fff) and Type-2 padding carry
+  // no body whatever their low bits hold; each must advance exactly one dword,
+  // including as the final dword of the stream.
+  const std::array<uint32_t, 14> commands{
+      0xffff1000u,
+      KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0), 0,
+      static_cast<uint32_t>(first_address),
+      static_cast<uint32_t>(first_address >> 32u), 11,
+      0xffff1001u, 0x80000001u,
+      KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0), 0,
+      static_cast<uint32_t>(second_address),
+      static_cast<uint32_t>(second_address >> 32u), 22,
+      0xffff1000u};
+  Pm4Execution execution;
+  Require(name, "header-only packets",
+          processor.Process(execution, commands) == Pm4ProcessResult::Complete &&
+              execution.MadeProgress() && first == 11 && second == 22,
+          "a header-only NOP or Type-2 packet consumed the wrong number of dwords");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 void CheckPm4SyntheticOcclusionCounterDump(RenderContext &renderer) {
   GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
@@ -33865,6 +33895,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--context-state-only") == 0) {
     VulkanHarness vulkan;
     CheckAgcShaderFusion();
+    CheckPm4HeaderOnlyNop(vulkan.RuntimeRenderer());
     CheckPm4NativeTargetGeometryRegisters(vulkan.RuntimeRenderer());
     CheckPm4PrivateAgcShaderRegisters(vulkan.RuntimeRenderer());
     CheckPm4PrivateAgcUconfigRegisters(vulkan.RuntimeRenderer());

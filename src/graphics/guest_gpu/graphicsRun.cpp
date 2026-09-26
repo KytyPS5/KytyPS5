@@ -712,7 +712,9 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 		const auto        opcode        = (packet_header >> 8u) & 0xffu;
 		EXIT_NOT_IMPLEMENTED(remaining_dw > total_dw);
 
-		if (packet_header == 0x80000000u) {
+		// Type-2 packets are header-only padding whatever their low bits hold, and AMD's
+		// header-only NOP (COUNT == 0x3fff) carries no body either: both span one dword.
+		if ((packet_header >> 30u) == 2u || (packet_header & 0x3fffff00u) == 0x3fff1000u) {
 			cursor.offset_dw++;
 			execution.m_made_progress = true;
 			continue;
@@ -910,6 +912,11 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 	if (!indexed) {
 		DrawIndirectArgs args {};
 		std::memcpy(&args, args_addr, sizeof(args));
+		if (args.instance_count == 0) {
+			// A zero instance count culls the draw; NUM_INSTANCES == 0 means one instance.
+			m_num_instances = 1;
+			return;
+		}
 		m_num_instances = args.instance_count;
 		DrawIndexAuto({.vertex_count   = args.vertex_count_per_instance,
 		               .instance_count = args.instance_count,
@@ -921,6 +928,10 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 
 	DrawIndexedIndirectArgs args {};
 	std::memcpy(&args, args_addr, sizeof(args));
+	if (args.instance_count == 0) {
+		m_num_instances = 1;
+		return;
+	}
 
 	uint64_t index_size = 0;
 	switch (m_index_type_and_size) {
@@ -992,6 +1003,10 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 
 		if (!indexed) {
 			auto* args = reinterpret_cast<const DrawIndirectArgs*>(args_addr);
+			if (args->instance_count == 0) {
+				m_num_instances = 1;
+				continue;
+			}
 			m_num_instances = args->instance_count;
 			DrawIndexAuto({.vertex_count   = args->vertex_count_per_instance,
 			               .instance_count = args->instance_count,
@@ -1002,6 +1017,10 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 		}
 
 		auto* args = reinterpret_cast<const DrawIndexedIndirectArgs*>(args_addr);
+		if (args->instance_count == 0) {
+			m_num_instances = 1;
+			continue;
+		}
 
 		auto* index_addr = reinterpret_cast<const void*>(
 		    m_index_base_addr + static_cast<uint64_t>(args->start_index_location) * index_size);
@@ -1260,7 +1279,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 							case 0x2b:
 							case 0x2d:
 							case 0x30:
-								if (event_index == 0x00 && !with_interrupt) {
+								if (event_index == 0x00) {
 									write64(false);
 									return;
 								}
@@ -1282,13 +1301,13 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 								break;
 							case 0x2b:
 							case 0x2d:
-								if (event_index == 0x00 && !with_interrupt) {
+								if (event_index == 0x00) {
 									write64(true);
 									return;
 								}
 								break;
 							case 0x2f:
-								if (event_index == 0x06 && !with_interrupt) {
+								if (event_index == 0x06) {
 									write64(true);
 									return;
 								}

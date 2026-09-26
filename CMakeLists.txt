@@ -457,10 +457,14 @@ string(REGEX MATCHALL "void[ \t]+Test[A-Za-z0-9_]+" kyty_shader_cfg_defined_raw 
 string(REGEX REPLACE "void[ \t]+" "" kyty_shader_cfg_defined "${kyty_shader_cfg_defined_raw}")
 list(REMOVE_DUPLICATES kyty_shader_cfg_defined)
 # The calls live after main(). Each name is looked up directly instead of matching a call pattern,
-# so the check does not depend on how a call happens to be spelled.
+# so the check does not depend on how a call happens to be spelled. Line comments are dropped
+# first, because a name mentioned only in a comment is not a call and would otherwise hide a
+# test that is still dormant. Kept on one line, because a wrapped string(REGEX ...) silently
+# matches nothing here.
 string(FIND "${kyty_shader_cfg_source}" "int main(" kyty_shader_cfg_main_pos)
 math(EXPR kyty_shader_cfg_main_pos "${kyty_shader_cfg_main_pos} - 1")
 string(SUBSTRING "${kyty_shader_cfg_source}" ${kyty_shader_cfg_main_pos} -1 kyty_shader_cfg_main)
+string(REGEX REPLACE "//[^\n]*" "" kyty_shader_cfg_main "${kyty_shader_cfg_main}")
 set(kyty_shader_cfg_dormant "")
 foreach(kyty_shader_cfg_name ${kyty_shader_cfg_defined})
 	string(FIND "${kyty_shader_cfg_main}" "${kyty_shader_cfg_name}();" kyty_shader_cfg_at)

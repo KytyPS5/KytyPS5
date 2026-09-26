@@ -863,6 +863,8 @@ struct SocketTransport {
 #endif
 	}
 	NativeSocket socket;
+	// Guest-visible blocking mode of a native (non-P2P) socket.
+	std::atomic<bool> nonblocking {false};
 };
 
 struct P2pEndpoint {
@@ -1171,6 +1173,25 @@ static bool GetSocketBackend(int guest_fd, NativeSocket* out, SocketSlot* state 
 		*state = slot;
 	}
 	return true;
+}
+
+[[maybe_unused]] static void SetNativeSocketNonblocking(int guest_fd, bool nonblocking) {
+	Common::LockGuard lock(g_socket_mutex);
+	if (guest_fd >= 0 && guest_fd < SOCKET_FD_MAX) {
+		const auto& slot = g_sockets[static_cast<size_t>(guest_fd)];
+		if (slot.transport && !slot.p2p) {
+			slot.transport->nonblocking.store(nonblocking, std::memory_order_relaxed);
+		}
+	}
+}
+
+[[maybe_unused]] static bool IsNativeSocketNonblocking(int guest_fd) {
+	Common::LockGuard lock(g_socket_mutex);
+	if (guest_fd < 0 || guest_fd >= SOCKET_FD_MAX) {
+		return false;
+	}
+	const auto& slot = g_sockets[static_cast<size_t>(guest_fd)];
+	return slot.transport && slot.transport->nonblocking.load(std::memory_order_relaxed);
 }
 
 bool KYTY_SYSV_ABI IsSocket(int s) {
@@ -2105,6 +2126,7 @@ int KYTY_SYSV_ABI Setsockopt(int s, int level, int optname, const void* optval, 
 		if (ioctlsocket(socket, FIONBIO, &enabled) == SOCKET_ERROR) {
 			return SetHostSocketError();
 		}
+		SetNativeSocketNonblocking(s, enabled != 0);
 		return 0;
 	}
 #else
@@ -2214,7 +2236,56 @@ int64_t KYTY_SYSV_ABI Recvfrom(int s, void* buf, uint64_t len, int flags, void* 
 	SocketLength     host_addrlen = sizeof(host_addr);
 	int64_t          result       = 0;
 	if (addr == nullptr) {
-		result = ::recv(socket, static_cast<char*>(buf), host_len, host_flags);
+#if defined(_WIN32)
+		// Winsock rejects MSG_PEEK combined with MSG_WAITALL (WSAEOPNOTSUPP), while the
+		// guest expects to peek at a full-length message without consuming it. Keep
+		// peeking until the requested length has arrived, the peer closes, or a
+		// nonblocking socket would block.
+		if ((host_flags & (MSG_PEEK | MSG_WAITALL)) == (MSG_PEEK | MSG_WAITALL)) {
+			const int  peek_flags  = host_flags & ~MSG_WAITALL;
+			const bool nonblocking = IsNativeSocketNonblocking(s);
+			for (;;) {
+				result = ::recv(socket, static_cast<char*>(buf), host_len, peek_flags);
+				if (result <= 0 || result >= host_len || nonblocking) {
+					// Error, peer closed, complete, or a nonblocking socket that returns
+					// whatever has arrived so far (FreeBSD semantics of MSG_WAITALL).
+					break;
+				}
+				int type     = 0;
+				int type_len = sizeof(type);
+				if (::getsockopt(socket, SOL_SOCKET, SO_TYPE, reinterpret_cast<char*>(&type),
+				                 &type_len) != 0 ||
+				    type != SOCK_STREAM) {
+					break; // datagrams are delivered whole; nothing more will arrive
+				}
+				// Wait for more bytes without consuming the ones already queued. A peer that
+				// closed after a partial message cannot be told apart from a slow one while
+				// data is buffered, so give up waiting once nothing arrives for a while and
+				// return the partial message, as a disconnect does on FreeBSD.
+				const auto stalled_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+				u_long     pending          = 0;
+				do {
+					fd_set  readable;
+					timeval poll_interval {0, 1000};
+					FD_ZERO(&readable);
+					FD_SET(socket, &readable);
+					if (::select(0, &readable, nullptr, nullptr, &poll_interval) == SOCKET_ERROR ||
+					    ioctlsocket(socket, FIONREAD, &pending) == SOCKET_ERROR) {
+						pending = 0;
+						result  = SOCKET_ERROR;
+						break;
+					}
+				} while (pending <= static_cast<u_long>(result) &&
+				         std::chrono::steady_clock::now() < stalled_deadline);
+				if (result == SOCKET_ERROR || pending <= static_cast<u_long>(result)) {
+					break;
+				}
+			}
+		} else
+#endif
+		{
+			result = ::recv(socket, static_cast<char*>(buf), host_len, host_flags);
+		}
 	} else {
 		result = ::recvfrom(socket, static_cast<char*>(buf), host_len, host_flags,
 		                    reinterpret_cast<sockaddr*>(&host_addr), &host_addrlen);

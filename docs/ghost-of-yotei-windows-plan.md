@@ -25,9 +25,12 @@ Checkpoint Flip queue lock-order (Reserve cfg→m_mutex ABBA) **26 сентяб�
    Present здоров. `TriggerVideoOutEvents Flip listeners=0` (игра не зовёт
    AddFlipEvent).
 6. **277× unresolved stub** `gWT7X8H0bYs` (VideoOutGetVrrStatus) — NID был в
-   тесте, но не в `LIB_FUNC`. Фикс: зарегистрировать GetVrrStatus + Initialize.
-   RED/GREEN: `shader_cfg_tests --videoout-vrr-status-only`. Game retry PENDING.
-   Меню/gameplay PENDING.
+   тесте, но не в `LIB_FUNC`. Фикс `…` / commit: зарегистрировать GetVrrStatus.
+   RED/GREEN: `shader_cfg_tests --videoout-vrr-status-only`.
+7. Game `_Build/runs/yotei-integrated-20260926-060211-presentfix`: **shown=151**
+   (прошлый soft-stall ~137 снят), gWT7 stubs=0, Present 60fps. Новый Fatal:
+   `sampled HTile import has unsupported GPU image or raw-buffer ownership`
+   (`textureCache.cpp:1452`), exit 321. Меню/gameplay PENDING.
 
 Checkpoint present soft-stall (shown≈130 / ready=shown+1) **26 сентября 2026 года**:
 

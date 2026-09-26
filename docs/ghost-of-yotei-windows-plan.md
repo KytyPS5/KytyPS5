@@ -16,8 +16,13 @@ Checkpoint present soft-stall (shown≈130 / ready=shown+1) **26 сентябр�
 5. `flip_rate` pacing: relative к `last_presented_vblank` (не absolute
    `count % (rate+1)`), чтобы Ready не голодал на odd-phase.
    RED/GREEN: `video_out_flip_due_tests` (`VideoOutFlipDueTests.cpp`).
-6. Game retry Sync+GPUAV lite — PENDING после install этого checkpoint.
-7. Меню/gameplay **PENDING**.
+6. Game `_Build/runs/yotei-integrated-20260926-031246-presentfix`
+   (rev `79e5736d` binary label dirty/`2836fb8`): title unblock сработал
+   (shown рос с обновлением title до **121**), затем снова soft-stall
+   `ready=122/shown=121` на 300s — Present ждёт `renderer.GetMutex`,
+   удерживаемый GPU compile/materialize. Следующий фикс: TryLock timeout 5s.
+7. Game retry после mutex-bound Present — PENDING.
+8. Меню/gameplay **PENDING**.
 
 Checkpoint bounded SRT unmapped/coherent reads **26 сентября 2026 года**,
 источник `84cbbb85` (локально; `git push` на origin таймаутится к github.com:443):

@@ -935,25 +935,42 @@ void Presenter::Present(Frame& frame, bool reuse) {
 	m_impl->frames.ValidateForPresent(&frame, reuse);
 
 	const auto overlay_visual = GetSystemOverlayVisualState();
-	auto&      swapchain  = m_impl->swapchain;
+	auto&      swapchain      = m_impl->swapchain;
 	// Some window systems keep presenting an old swapchain after a resize.
 	if (swapchain.NeedsResize()) {
 		m_impl->RecoverSwapchain(Swapchain::Status::Recreate);
 	}
 	for (uint32_t attempt = 0; attempt < 4; attempt++) {
+		// GPU dispatches hold this mutex across shader compile/materialize. An unbounded
+		// wait here freezes VideoOut Flip (ready=shown+1) while Sync keeps running.
+		bool locked = false;
+		for (uint32_t spin = 0; spin < 5000; spin++) {
+			if (m_impl->renderer.GetMutex().TryLock()) {
+				locked = true;
+				break;
+			}
+			Common::Thread::SleepMicro(1000);
+		}
+		if (!locked) {
+			LOGF("Present: timed out waiting for renderer mutex; dropping frame\n");
+			Log::Flush();
+			m_impl->frames.Release(&frame, reuse);
+			return;
+		}
+
 		auto status = swapchain.AcquireNextImage();
 		if (status != Swapchain::Status::Success) {
+			m_impl->renderer.GetMutex().Unlock();
 			m_impl->RecoverSwapchain(status);
 			continue;
 		}
-		{
-			Common::LockGuard render_lock(m_impl->renderer.GetMutex());
-			auto&             command          = m_impl->present_scheduler.BeginCommand();
-			const bool        draw_system_overlay =
-			    overlay_visual.active && swapchain.PrepareSystemOverlay();
-			swapchain.RecordPresentCommands(command, frame.image, draw_system_overlay);
-			frame.present_tick = swapchain.Submit(m_impl->present_scheduler);
-		}
+		auto&      command = m_impl->present_scheduler.BeginCommand();
+		const bool draw_system_overlay =
+		    overlay_visual.active && swapchain.PrepareSystemOverlay();
+		swapchain.RecordPresentCommands(command, frame.image, draw_system_overlay);
+		frame.present_tick = swapchain.Submit(m_impl->present_scheduler);
+		m_impl->renderer.GetMutex().Unlock();
+
 		status = swapchain.Present();
 		if (status != Swapchain::Status::Success) {
 			m_impl->RecoverSwapchain(status);

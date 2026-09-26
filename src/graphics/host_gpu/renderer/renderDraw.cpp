@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
+#include "graphics/host_gpu/renderer/meshDispatch.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -1025,7 +1026,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	const auto vertex_stages =
 	    std::span {state.vertex_info.data(), state.programs.VertexStageCount()};
 	const bool mesh_active = state.vertex_info[0].stage.program->stage == ShaderType::Mesh;
-	uint32_t   mesh_groups = 0;
+	std::vector<MeshDispatchSlice> mesh_slices;
 	if (mesh_active) {
 		const auto& mesh = state.vertex_info[0].mesh;
 		static std::atomic_bool restart_warned = false;
@@ -1042,14 +1043,26 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		if (primitives == 0 || draw.instance_count == 0) {
 			return;
 		}
-		mesh_groups        = (primitives - 1u) / mesh.primitives_per_group + 1u;
-		const auto& limits = m_context.GetGraphics().mesh_shader_properties;
-		if (mesh_groups > limits.maxMeshWorkGroupCount[0] ||
-		    draw.instance_count > limits.maxMeshWorkGroupCount[1] ||
-		    static_cast<uint64_t>(mesh_groups) * draw.instance_count >
-		        limits.maxMeshWorkGroupTotalCount) {
-			EXIT("mesh draw exceeds host workgroup limits: %ux%u\n", mesh_groups,
-			     draw.instance_count);
+		const auto  mesh_groups = (primitives - 1u) / mesh.primitives_per_group + 1u;
+		const auto& limits      = m_context.GetGraphics().mesh_shader_properties;
+		mesh_slices             = SplitMeshDispatch(
+            mesh_groups, draw.instance_count,
+            {.max_groups    = limits.maxMeshWorkGroupCount[0],
+             .max_instances = limits.maxMeshWorkGroupCount[1],
+             .max_total     = limits.maxMeshWorkGroupTotalCount});
+		if (mesh_slices.empty()) {
+			EXIT("mesh draw cannot be dispatched within host workgroup limits: %ux%u\n",
+			     mesh_groups, draw.instance_count);
+		}
+		if (mesh_slices.size() > 1) {
+			static std::atomic_bool split_logged = false;
+			if (!split_logged.exchange(true, std::memory_order_relaxed)) {
+				LOGF("mesh draw %ux%u exceeds host workgroup limits %ux%u (total %u); "
+				     "replaying it as %u host draws\n",
+				     mesh_groups, draw.instance_count, limits.maxMeshWorkGroupCount[0],
+				     limits.maxMeshWorkGroupCount[1], limits.maxMeshWorkGroupTotalCount,
+				     static_cast<uint32_t>(mesh_slices.size()));
+			}
 		}
 	}
 
@@ -1106,13 +1119,15 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x300u);
 	}
 	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
-	if (mesh_active) {
+	const auto push_mesh_draw_data = [&](const MeshDispatchSlice& slice) {
 		const uint32_t draw_data[] {
 		    draw.index_count,
 		    draw.IsIndexed() ? static_cast<uint32_t>(emit.vertex_offset) : emit.first_vertex,
-		    emit.first_instance, index_source.guest_element_size,
+		    emit.first_instance + slice.first_instance,
+		    index_source.guest_element_size,
 		    static_cast<uint32_t>(index_source.address),
-		    static_cast<uint32_t>(index_source.address >> 32u)};
+		    static_cast<uint32_t>(index_source.address >> 32u),
+		    slice.base_group};
 		static_assert(std::size(draw_data) == ShaderRecompiler::IR::PushData::MeshDrawDwordCount);
 		vk_buffer.pushConstants(pipeline.pipeline_layout,
 		                        vk::ShaderStageFlagBits::eMeshEXT |
@@ -1124,6 +1139,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 
 	SetGraphicsDynamicParams(buffer, vk_buffer, vertex_stages.back(), state.depth_info, rendering);
 	if (m_context.GetGraphics().attachment_feedback_loop_enabled) {
+	};
+	if (mesh_active) {
+		push_mesh_draw_data(mesh_slices.front());
 		vk_buffer.setAttachmentFeedbackLoopEnableEXT(feedback_aspects);
 	}
 
@@ -1137,7 +1155,13 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	}
 	if (mesh_active) {
-		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
+		for (size_t index = 0; index < mesh_slices.size(); index++) {
+			const auto& slice = mesh_slices[index];
+			if (index != 0) {
+				push_mesh_draw_data(slice);
+			}
+			vk_buffer.drawMeshTasksEXT(slice.group_count, slice.instance_count, 1);
+		}
 	} else {
 		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
 	}

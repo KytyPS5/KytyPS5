@@ -7,6 +7,7 @@
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
+#include "graphics/host_gpu/renderer/meshDispatch.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
@@ -10018,18 +10019,23 @@ void TestMeshInputAssembly() {
     options.wave_size = test.wave_size;
     options.user_data_count = 0;
     options.input_info.vertex = &input;
+    // The guest workgroup is either the host workgroup itself or reached through the
+    // slice base pushed for a split dispatch; both must assemble the same input.
+    for (const bool via_slice_base : {false, true}) {
     auto program = Frontend::TranslateProgram(decoded, graph, options);
-    const uint32_t draw[] = {test.count, test.base_vertex, 7, test.width,
-                             test.address_low, 0x12};
+    const uint32_t draw[] = {test.count,       test.base_vertex, 7, test.width,
+                             test.address_low, 0x12,             via_slice_base ? test.group : 0u};
+    static_assert(std::size(draw) == PushData::MeshDrawDwordCount);
     Inst *load = nullptr;
     for (auto &inst : *program.blocks.front()) {
       if (inst.GetOpcode() == ValueOpcode::MeshDrawParameter) {
         inst.ReplaceUsesWith(Value(draw[inst.Arg(0).U32()]));
       } else if (inst.GetOpcode() == ValueOpcode::GetBuiltin) {
         const auto kind = static_cast<StageInputKind>(inst.Arg(0).U32());
+        const uint32_t group = via_slice_base ? 0u : test.group;
         const uint32_t value = kind == StageInputKind::LocalInvocationIndex
                                    ? test.lane
-                                   : inst.Arg(1).U32() == 0 ? test.group : 2;
+                                   : inst.Arg(1).U32() == 0 ? group : 2;
         inst.ReplaceUsesWith(Value(value));
       } else if (inst.GetOpcode() == ValueOpcode::LoadAddressU32) {
         Check(load == nullptr, "mesh index fetch emitted duplicate loads");
@@ -10058,7 +10064,67 @@ void TestMeshInputAssembly() {
     }
     Check(sgpr3 == test.wave_info && vgprs[0] == ((test.first << 2) | (test.second << 18)) &&
               vgprs[1] == test.third * 4 && vgprs[5] == test.vertex_id && vgprs[8] == 9,
-          "mesh prolog changed input assembly, wave counts, vertex ID, or instance ID");
+          via_slice_base
+              ? "mesh prolog ignored the slice base workgroup of a split dispatch"
+              : "mesh prolog changed input assembly, wave counts, vertex ID, or instance ID");
+    }
+  }
+}
+
+void TestMeshDispatchSplit() {
+  struct Case {
+    uint32_t groups, instances;
+    MeshDispatchLimits limits;
+    size_t slice_count;
+  };
+  const Case cases[] = {
+      {1, 1, {65535, 65535, 4194304}, 1},
+      {65535, 1, {65535, 65535, 4194304}, 1},
+      // Astro's Playroom on AMD: 68734 groups exceed the 65535 per-dimension limit (#624).
+      {68734, 1, {65535, 65535, 4194304}, 2},
+      {68734, 3, {65535, 65535, 4194304}, 6},
+      {100, 200, {65535, 65535, 4194304}, 1},
+      {100, 200, {65535, 65535, 4096}, 5},
+      {100, 200, {65535, 64, 4194304}, 4},
+      {4194305, 1, {UINT32_MAX, UINT32_MAX, 4194304}, 2},
+      {UINT32_MAX, UINT32_MAX, {65535, 65535, 4194304}, 0},
+      {0, 5, {65535, 65535, 4194304}, 0},
+      {5, 0, {65535, 65535, 4194304}, 0},
+      {5, 5, {0, 65535, 4194304}, 0},
+  };
+  for (const auto &test : cases) {
+    const auto slices = SplitMeshDispatch(test.groups, test.instances, test.limits);
+    if (test.slice_count == 0) {
+      // Either nothing to draw or every slice still fits the limits.
+      Check(slices.empty() == (test.groups == 0 || test.instances == 0 ||
+                               test.limits.max_groups == 0),
+            "mesh dispatch split returned slices for an empty dispatch");
+    } else {
+      Check(slices.size() == test.slice_count, "mesh dispatch split produced the wrong slice count");
+    }
+    std::vector<uint64_t> covered;
+    for (const auto &slice : slices) {
+      Check(slice.group_count != 0 && slice.instance_count != 0 &&
+                slice.group_count <= test.limits.max_groups &&
+                slice.instance_count <= test.limits.max_instances &&
+                static_cast<uint64_t>(slice.group_count) * slice.instance_count <=
+                    test.limits.max_total &&
+                slice.base_group + slice.group_count <= test.groups &&
+                slice.first_instance + slice.instance_count <= test.instances,
+            "mesh dispatch slice violates the host limits or the dispatch bounds");
+      covered.push_back((uint64_t{slice.first_instance} << 32u) | slice.base_group);
+    }
+    if (!slices.empty()) {
+      // Every (group, instance) pair is drawn exactly once.
+      uint64_t total = 0;
+      for (const auto &slice : slices) {
+        total += static_cast<uint64_t>(slice.group_count) * slice.instance_count;
+      }
+      std::ranges::sort(covered);
+      Check(total == static_cast<uint64_t>(test.groups) * test.instances &&
+                std::ranges::adjacent_find(covered) == covered.end(),
+            "mesh dispatch slices overlap or leave workgroups undrawn");
+    }
   }
 }
 
@@ -13665,6 +13731,7 @@ int main() {
   TestMeshExportStorage();
   TestMergedShaderUserDataSnapshot();
   TestMeshInputAssembly();
+  TestMeshDispatchSplit();
   TestEmbeddedFetchPreservesSharedScalarLoad();
   TestEmbeddedVertexFormatSwizzle();
   TestNewShaderRecompilerSetpcJumpTable();

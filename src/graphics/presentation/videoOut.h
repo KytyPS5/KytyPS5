@@ -38,6 +38,8 @@ struct VideoOutDiagnostics {
 	uint32_t last_output_resolution = 0;
 	int      last_submitted_index   = -3;
 	int      last_presented_index = -3;
+	// PresentThread/Presenter stage for soft-stall diagnosis (see PresentStage*).
+	uint32_t present_stage          = 0;
 };
 
 class VideoOutDriver final {

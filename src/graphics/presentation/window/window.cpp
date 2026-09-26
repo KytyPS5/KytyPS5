@@ -944,13 +944,13 @@ void WindowContext::UpdateTitle() {
 	const auto  video_out   = VideoOut::VideoOutGetDiagnostics();
 	auto text = fmt::format(
 	    "[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:f}, flips cpu/gpu: {}/{}, "
-	    "prepared: {}, ready: {}, shown: {}, last: {}, output status: {} (res {}), "
+	    "prepared: {}, ready: {}, shown: {}, last: {}, pstg: {}, output status: {} (res {}), "
 	    "support: {} (mode 0x{:x} -> {})", KYTY_BUILD_LABEL, build_type,
 	    (has_title ? title : ""), (has_title ? ", " : ""), (has_title_id ? title_id : ""),
 	    (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""),
 	    device_name, processor_name, frame_num, current_fps, video_out.cpu_submitted,
 	    video_out.gpu_submitted, video_out.prepared, video_out.ready, video_out.presented,
-	    video_out.last_presented_index, video_out.output_status_calls,
+	    video_out.last_presented_index, video_out.present_stage, video_out.output_status_calls,
 	    video_out.last_output_resolution, video_out.output_support_calls,
 	    video_out.last_output_mode, video_out.last_output_support);
 

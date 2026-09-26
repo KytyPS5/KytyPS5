@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <limits>
+#include <atomic>
 
 namespace Libs::VideoOut {
 
@@ -36,6 +37,31 @@ inline constexpr uint64_t kNoPresentedVblank = std::numeric_limits<uint64_t>::ma
 	}
 	const auto period = static_cast<int64_t>(period_ticks);
 	return total_wait > period ? period : total_wait;
+}
+
+// Soft-stall diagnosis: which PresentThread/Presenter step is running.
+inline constexpr uint32_t kPresentStageSleep          = 1;
+inline constexpr uint32_t kPresentStageVblankBegin    = 2;
+inline constexpr uint32_t kPresentStageFlipEnter      = 3;
+inline constexpr uint32_t kPresentStageFlipNotReady   = 4;
+inline constexpr uint32_t kPresentStageFlipNotDue     = 5;
+inline constexpr uint32_t kPresentStagePresentMutex   = 6;
+inline constexpr uint32_t kPresentStagePresentAcquire = 7;
+inline constexpr uint32_t kPresentStagePresentSubmit  = 8;
+inline constexpr uint32_t kPresentStagePresentQueue   = 9;
+inline constexpr uint32_t kPresentStageVblankEnd      = 10;
+
+inline std::atomic<uint32_t>& PresentStageFlag() noexcept {
+	static std::atomic<uint32_t> stage {0};
+	return stage;
+}
+
+inline void SetPresentStage(uint32_t stage) noexcept {
+	PresentStageFlag().store(stage, std::memory_order_relaxed);
+}
+
+[[nodiscard]] inline uint32_t GetPresentStage() noexcept {
+	return PresentStageFlag().load(std::memory_order_relaxed);
 }
 
 } // namespace Libs::VideoOut

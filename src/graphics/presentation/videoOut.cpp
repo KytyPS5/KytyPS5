@@ -619,7 +619,9 @@ VideoOutDiagnostics VideoOutGetDiagnostics() {
 	if (g_video_out_driver == nullptr) {
 		return {};
 	}
-	return g_video_out_driver->State().GetFlipQueue().GetDiagnostics();
+	auto diagnostics              = g_video_out_driver->State().GetFlipQueue().GetDiagnostics();
+	diagnostics.present_stage = GetPresentStage();
+	return diagnostics;
 }
 
 VideoOutDriver::Impl::~Impl() {
@@ -826,6 +828,7 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 		// the GPU keeps running — the shown≈ready-1 soft-stall shape.
 		total_wait = ClampPresentPacingWait(total_wait, period);
 
+		SetPresentStage(kPresentStageSleep);
 		const auto sleep_begin = Common::Timer::QueryPerformanceCounter();
 		if (total_wait > 0) {
 			const auto remaining_us =
@@ -851,7 +854,9 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 			continue;
 		}
 
+		SetPresentStage(kPresentStageVblankBegin);
 		VblankBegin();
+		SetPresentStage(kPresentStageFlipEnter);
 		bool presented = m_flip_queue.Flip(0);
 		if (!presented && m_presenter.NeedsSystemOverlayRefresh()) {
 			if (auto* frame = m_presenter.PrepareLastFrame(); frame != nullptr) {
@@ -887,6 +892,7 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 				m_presenter.Present(blank);
 			}
 		}
+		SetPresentStage(kPresentStageVblankEnd);
 		VblankEnd();
 
 		const auto frame_end = Common::Timer::QueryPerformanceCounter();
@@ -1150,6 +1156,7 @@ bool FlipQueue::Flip(uint32_t micros) {
 		EXIT("video-out flip queue processing is already active\n");
 	}
 	if (m_requests.front().state != RequestState::Ready) {
+		SetPresentStage(kPresentStageFlipNotReady);
 		static std::atomic<uint32_t> not_ready_logs {0};
 		if (not_ready_logs.fetch_add(1, std::memory_order_relaxed) < 64) {
 			LOGF("FlipQueue::Flip front not Ready id=%" PRIu64 " state=%u queue=%zu\n",
@@ -1166,6 +1173,7 @@ bool FlipQueue::Flip(uint32_t micros) {
 
 	r.cfg->mutex.Lock();
 	if (!IsFlipDueLocked(*r.cfg, r.generation)) {
+		SetPresentStage(kPresentStageFlipNotDue);
 		static std::atomic<uint32_t> not_due_logs {0};
 		if (not_due_logs.fetch_add(1, std::memory_order_relaxed) < 64) {
 			LOGF("FlipQueue::Flip not due id=%" PRIu64 " flip_rate=%d vblank=%" PRIu64

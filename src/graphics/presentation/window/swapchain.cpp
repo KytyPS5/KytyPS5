@@ -12,6 +12,7 @@
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
+#include "graphics/presentation/videoOutFlipDue.h"
 #include "graphics/presentation/window/windowInternal.h"
 
 #include <algorithm>
@@ -959,6 +960,7 @@ void Presenter::Present(Frame& frame, bool reuse) {
 	for (uint32_t attempt = 0; attempt < 4; attempt++) {
 		// GPU dispatches hold this mutex across shader compile/materialize. An unbounded
 		// wait here freezes VideoOut Flip (ready=shown+1) while Sync keeps running.
+		VideoOut::SetPresentStage(VideoOut::kPresentStagePresentMutex);
 		bool locked = false;
 		for (uint32_t spin = 0; spin < 5000; spin++) {
 			if (m_impl->renderer.GetMutex().TryLock()) {
@@ -977,12 +979,14 @@ void Presenter::Present(Frame& frame, bool reuse) {
 		// wait while GPU work that frees images also needs this mutex.
 		m_impl->renderer.GetMutex().Unlock();
 
+		VideoOut::SetPresentStage(VideoOut::kPresentStagePresentAcquire);
 		auto status = swapchain.AcquireNextImage();
 		if (status != Swapchain::Status::Success) {
 			m_impl->RecoverSwapchain(status);
 			continue;
 		}
 
+		VideoOut::SetPresentStage(VideoOut::kPresentStagePresentMutex);
 		locked = false;
 		for (uint32_t spin = 0; spin < 5000; spin++) {
 			if (m_impl->renderer.GetMutex().TryLock()) {
@@ -999,6 +1003,7 @@ void Presenter::Present(Frame& frame, bool reuse) {
 			m_impl->frames.Release(&frame, reuse);
 			return;
 		}
+		VideoOut::SetPresentStage(VideoOut::kPresentStagePresentSubmit);
 		auto&      command = m_impl->present_scheduler.BeginCommand();
 		const bool draw_system_overlay =
 		    overlay_visual.active && swapchain.PrepareSystemOverlay();
@@ -1006,6 +1011,7 @@ void Presenter::Present(Frame& frame, bool reuse) {
 		frame.present_tick = swapchain.Submit(m_impl->present_scheduler);
 		m_impl->renderer.GetMutex().Unlock();
 
+		VideoOut::SetPresentStage(VideoOut::kPresentStagePresentQueue);
 		status = swapchain.Present();
 		if (status != Swapchain::Status::Success) {
 			m_impl->RecoverSwapchain(status);

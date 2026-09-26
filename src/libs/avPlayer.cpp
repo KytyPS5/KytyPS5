@@ -1418,9 +1418,7 @@ private:
 		           ? to_ms(s->duration, s->time_base)
 		           : (fmt->duration > 0 ? static_cast<uint64_t>(fmt->duration / 1000) : 0);
 	}
-	// Titles use the frame as linear R8 luma and R8G8 chroma textures, so both planes' rows must
-	// be 64-texel aligned.
-	uint32_t VideoPitch(AVStream* s) const { return align_up(Width(s), 128u); }
+	uint32_t VideoPitch(AVStream* s) const { return align_up(Width(s), 256u); }
 	uint32_t VideoBufferSize(AVStream* s) const { return VideoPitch(s) * Height(s) * 3 / 2; }
 	void     FillVideo(AVStream* s, AvPlayerVideo* v) const {
 		std::memset(v, 0, sizeof(*v));
@@ -1488,7 +1486,6 @@ private:
 	bool PrepareVideo(AVFrame* src, std::unique_ptr<GuestBuffer>& buffer,
 	                  AvPlayerFrameInfoEx* info) {
 		auto*    s     = fmt->streams[video_id.value()];
-		uint32_t w     = Width(s);
 		uint32_t h     = Height(s);
 		uint32_t pitch = VideoPitch(s);
 		uint64_t size  = static_cast<uint64_t>(pitch) * h * 3 / 2;
@@ -1541,32 +1538,17 @@ private:
 			}
 			return false;
 		}
-		// Titles sample the whole pitch-wide frame, so pad it the way decoders do by extending the
-		// picture's edges; zero-filled NV12 shows up as a green band.
-		auto*          dst          = buffer->Get();
-		const auto     luma_width   = static_cast<uint32_t>(src->width);
-		const auto     luma_rows    = static_cast<uint32_t>(src->height);
-		const uint32_t chroma_width = std::min(align_up(luma_width, 2u), pitch);
-		const uint32_t chroma_rows  = (luma_rows + 1) / 2;
-		for (uint32_t y = 0; y < h; y++) {
-			auto* row = dst + static_cast<size_t>(y) * pitch;
-			std::memcpy(row,
-			            nv12->data[0] +
-			                static_cast<size_t>(std::min(y, luma_rows - 1)) * nv12->linesize[0],
-			            luma_width);
-			std::memset(row + luma_width, row[luma_width - 1], pitch - luma_width);
+		auto* dst = buffer->Get();
+		auto* c   = dst + pitch * h;
+		// PPSA02433 samples the padded columns; zero chroma would turn them green.
+		std::memset(dst, s->codecpar->color_range == AVCOL_RANGE_JPEG ? 0 : 16,
+		            static_cast<size_t>(pitch) * h);
+		std::memset(c, 128, static_cast<size_t>(pitch) * h / 2);
+		for (int y = 0; y < src->height; y++) {
+			std::memcpy(dst + y * pitch, nv12->data[0] + y * nv12->linesize[0], src->width);
 		}
-		auto* c = dst + static_cast<size_t>(pitch) * h;
-		for (uint32_t y = 0; y < h / 2; y++) {
-			auto* row = c + static_cast<size_t>(y) * pitch;
-			std::memcpy(row,
-			            nv12->data[1] +
-			                static_cast<size_t>(std::min(y, chroma_rows - 1)) * nv12->linesize[1],
-			            chroma_width);
-			for (uint32_t x = chroma_width; x + 1 < pitch; x += 2) {
-				row[x]     = row[chroma_width - 2];
-				row[x + 1] = row[chroma_width - 1];
-			}
+		for (int y = 0; y < src->height / 2; y++) {
+			std::memcpy(c + y * pitch, nv12->data[1] + y * nv12->linesize[1], src->width);
 		}
 		std::memset(info, 0, sizeof(*info));
 		info->data       = dst;
@@ -1576,7 +1558,7 @@ private:
 		FillVideoEx(s, &info->details.video, src->sample_aspect_ratio);
 		info->details.video.crop_left_offset = static_cast<uint32_t>(src->crop_left);
 		info->details.video.crop_right_offset =
-		    static_cast<uint32_t>(src->crop_right) + (w > luma_width ? w - luma_width : 0u);
+		    static_cast<uint32_t>(src->crop_right + (pitch - src->width));
 		info->details.video.crop_top_offset = static_cast<uint32_t>(src->crop_top);
 		info->details.video.crop_bottom_offset =
 		    static_cast<uint32_t>(src->crop_bottom + (h - src->height));

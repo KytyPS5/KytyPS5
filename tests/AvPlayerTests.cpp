@@ -35,12 +35,12 @@ namespace {
 
 namespace AvPlayer = Libs::Audio::AvPlayer;
 
-// The clip is narrower than its 128-aligned pitch and shorter than its 16-aligned height, so every
+// The clip is narrower than its 256-aligned pitch and shorter than its 16-aligned height, so every
 // frame carries padding. Its audio ends 50 ms before the last video frame.
 constexpr uint32_t ClipWidth         = 336;
 constexpr uint32_t ClipHeight        = 120;
 constexpr uint32_t ClipAlignedHeight = 128;
-constexpr uint32_t ClipPitch         = 384;
+constexpr uint32_t ClipPitch         = 512;
 constexpr int      ClipFrames        = 10;
 constexpr int      ClipFps           = 10;
 constexpr int      AudioRate         = 48000;
@@ -337,38 +337,30 @@ bool BuildClip(std::vector<uint8_t>* clip) {
 	return true;
 }
 
-// Every padding byte right of the picture repeats the row's last pixel (or UV pair), and the
-// rows below it repeat the last picture row.
-void CheckFramePadding(const GuestFrameInfoEx& frame) {
+// Right and bottom padding contains limited-range black luma and neutral chroma.
+void CheckBlackFramePadding(const GuestFrameInfoEx& frame) {
 	const auto& video = frame.video;
 	Check(video.width == ClipWidth && video.height == ClipAlignedHeight, "reported frame size");
-	Check(video.pitch == ClipPitch, "pitch is the width aligned to 128");
-	Check(video.crop_right_offset == 0, "right crop is measured from the reported width");
+	Check(video.pitch == ClipPitch, "pitch is the width aligned to 256");
+	Check(video.crop_right_offset == ClipPitch - ClipWidth, "right crop includes pitch padding");
 	Check(video.crop_bottom_offset == ClipAlignedHeight - ClipHeight, "bottom crop");
+	Check(video.video_full_range_flag == 0, "the fixture uses limited range");
 
 	const auto* luma = static_cast<const uint8_t*>(frame.data);
-	Check(luma[ClipWidth - 1] != 0, "the picture's right edge differs from zero padding");
+	Check(luma[ClipWidth - 1] != 16, "decoded picture luma differs from black padding");
 	for (uint32_t y = 0; y < ClipAlignedHeight; y++) {
 		const auto* row = luma + static_cast<size_t>(y) * ClipPitch;
-		for (uint32_t x = ClipWidth; x < ClipPitch; x++) {
-			Check(row[x] == row[ClipWidth - 1], "luma padding repeats the edge pixel");
-		}
-		if (y >= ClipHeight) {
-			const auto* last = luma + static_cast<size_t>(ClipHeight - 1) * ClipPitch;
-			Check(std::memcmp(row, last, ClipPitch) == 0, "padding rows repeat the last row");
+		for (uint32_t x = y < ClipHeight ? ClipWidth : 0; x < ClipPitch; x++) {
+			Check(row[x] == 16, "luma padding is limited-range black");
 		}
 	}
 	const auto* chroma = luma + static_cast<size_t>(ClipPitch) * ClipAlignedHeight;
+	Check(chroma[ClipWidth - 2] != 128 || chroma[ClipWidth - 1] != 128,
+	      "decoded picture chroma differs from neutral padding");
 	for (uint32_t y = 0; y < ClipAlignedHeight / 2; y++) {
 		const auto* row = chroma + static_cast<size_t>(y) * ClipPitch;
-		for (uint32_t x = ClipWidth; x < ClipPitch; x += 2) {
-			Check(row[x] == row[ClipWidth - 2] && row[x + 1] == row[ClipWidth - 1],
-			      "chroma padding repeats the edge UV pair");
-		}
-		if (y >= ClipHeight / 2) {
-			const auto* last = chroma + static_cast<size_t>(ClipHeight / 2 - 1) * ClipPitch;
-			Check(std::memcmp(row, last, ClipPitch) == 0,
-			      "chroma padding rows repeat the last row");
+		for (uint32_t x = y < ClipHeight / 2 ? ClipWidth : 0; x < ClipPitch; x++) {
+			Check(row[x] == 128, "chroma padding is neutral");
 		}
 	}
 }
@@ -411,7 +403,7 @@ PlaybackResult Play(std::vector<uint8_t>& clip, bool check_padding) {
 		if (AvPlayer::AvPlayerGetVideoDataEx(
 		        player, reinterpret_cast<AvPlayer::AvPlayerFrameInfoEx*>(&video)) != 0) {
 			if (check_padding && result.video_frames == 0) {
-				CheckFramePadding(video);
+				CheckBlackFramePadding(video);
 			}
 			result.video_frames++;
 		}
@@ -432,7 +424,7 @@ void TestPlaysVideoPastTheEndOfAudio(std::vector<uint8_t>& clip) {
 	Check(result.video_frames == ClipFrames, "every video frame is presented");
 }
 
-void TestPadsFramesWithTheirEdges(std::vector<uint8_t>& clip) {
+void TestPadsFramesWithBlack(std::vector<uint8_t>& clip) {
 	const auto result = Play(clip, true);
 	Check(result.video_frames > 0, "a video frame was delivered");
 }
@@ -476,7 +468,7 @@ int main() {
 	(void)Common::Singleton<Loader::RuntimeLinker>::Instance();
 
 	TestPlaysVideoPastTheEndOfAudio(clip);
-	TestPadsFramesWithTheirEdges(clip);
+	TestPadsFramesWithBlack(clip);
 	TestPlanesMatchLinearTexturePitch();
 
 	subsystems.Destroy();

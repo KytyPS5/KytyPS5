@@ -484,11 +484,21 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	}
 
 	auto [staging, stage_offset] = m_staging_buffer.Map(size, 16);
-	const bool dense_backing =
-	    staging != nullptr && Libs::LibKernel::Memory::TryReadBacking(vaddr, staging, size);
-	const bool prt_backing = staging != nullptr && !dense_backing &&
-	                         Libs::LibKernel::Memory::TryReadPrtBacking(vaddr, staging, size);
-	if (!dense_backing && !prt_backing) {
+	// Image descriptors may span past the contiguous mapped VMA prefix (PRT holes,
+	// sparse commits). Read the mapped head and zero the unmapped tail — same
+	// guest-visible zero fill used for OOB scalar buffer loads.
+	const auto mapped =
+	    staging != nullptr ? Libs::LibKernel::Memory::TryClampRangeSize(vaddr, size) : uint64_t {0};
+	bool filled = false;
+	if (staging != nullptr && mapped != 0) {
+		filled = Libs::LibKernel::Memory::TryReadBacking(vaddr, staging, mapped) ||
+		         Libs::LibKernel::Memory::TryReadPrtBacking(vaddr, staging, mapped);
+		if (filled && mapped < size) {
+			std::memset(static_cast<std::byte*>(staging) + mapped, 0,
+			            static_cast<size_t>(size - mapped));
+		}
+	}
+	if (!filled) {
 		EXIT("BufferCache: failed to read mapped guest image backing "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 " clamped=0x%016" PRIx64
 		     " staging=%d registered=%d cpu_dirty=%d gpu_dirty=%d buffer_dirty=%d\n",

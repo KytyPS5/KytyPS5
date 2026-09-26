@@ -18,9 +18,13 @@ Checkpoint bounded SRT unmapped/coherent reads **26 сентября 2026 год
    `Presenter::Present` доходит до `end` — hang не в acquire/present.
    `FlipQueue::Flip front not Ready id=… state=1 (Recording) queue=1`: EOP-flip
    застрял после `Prepare`, до `CompleteFlip` (priority op после GPU tick).
-   Без Sync+GPUAV — breakpoint `exit -2147483645` на shown=0.
-4. Меню/gameplay **PENDING**. Следующий фокус: почему GPU EOP не доводит
-   Recording→Ready (графический CB / DeferPriorityOperation CompleteFlip).
+4. Коммит `59d8f991`: `FlushAndWait` + Flip ждут priority ops → Recording→Ready.
+   Game `_Build/runs/yotei-integrated-20260926-020045-97830d`: **shown=132**,
+   `front not Ready=0`. Новый fatal:
+   `BufferCache: failed to read mapped guest image backing`
+   `addr=0x000000a80d7c0000 size=0x2ab000 clamped=0xc0000`
+   (staging=1 registered=0 cpu_dirty=1 gpu_dirty=0).
+5. Меню/gameplay **PENDING**. Push на origin пока таймаутится (github:443).
 
 Checkpoint planning_only SRT zeros + dense budgets **26 сентября 2026 года**,
 источник `1cdc1998` / `37584633`:

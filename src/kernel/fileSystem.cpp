@@ -28,8 +28,12 @@ namespace Libs::LibKernel::FileSystem {
 
 LIB_NAME("libkernel", "libkernel");
 
-constexpr int      DESCRIPTOR_MIN = 3;
-constexpr uint64_t DIR_BLOCK_SIZE = 512;
+constexpr int DESCRIPTOR_MIN = 3;
+// network.cpp numbers sockets inside [SOCKET_DESCRIPTOR_MIN, SOCKET_DESCRIPTOR_MAX), so files are
+// numbered 3..127 and then continue from 1024.
+constexpr int      SOCKET_DESCRIPTOR_MIN = 128;
+constexpr int      SOCKET_DESCRIPTOR_MAX = 1024;
+constexpr uint64_t DIR_BLOCK_SIZE        = 512;
 
 enum class SpecialFile {
 	None,
@@ -170,6 +174,23 @@ static int PosixToKernel(int posix_errno) {
 	return KERNEL_ERROR_UNKNOWN + posix_errno;
 }
 
+// Files keep a dense index; their descriptor numbers skip the socket range.
+static int IndexToDescriptor(size_t index) {
+	const auto d = static_cast<int>(index) + DESCRIPTOR_MIN;
+	return (d < SOCKET_DESCRIPTOR_MIN ? d : d + (SOCKET_DESCRIPTOR_MAX - SOCKET_DESCRIPTOR_MIN));
+}
+
+static bool DescriptorToIndex(int d, size_t* index) {
+	if (d < DESCRIPTOR_MIN || (d >= SOCKET_DESCRIPTOR_MIN && d < SOCKET_DESCRIPTOR_MAX)) {
+		return false;
+	}
+	*index = static_cast<size_t>(d < SOCKET_DESCRIPTOR_MIN
+	                                 ? d - DESCRIPTOR_MIN
+	                                 : d - DESCRIPTOR_MIN -
+	                                       (SOCKET_DESCRIPTOR_MAX - SOCKET_DESCRIPTOR_MIN));
+	return true;
+}
+
 int FileDescriptors::CreateDescriptor() {
 	Common::LockGuard lock(m_mutex);
 
@@ -182,25 +203,26 @@ int FileDescriptors::CreateDescriptor() {
 	file->sync_writes = false;
 	file->special     = SpecialFile::None;
 
-	int files_num = static_cast<int>(m_files.size());
-	for (int index = 0; index < files_num; index++) {
+	const auto files_num = m_files.size();
+	for (size_t index = 0; index < files_num; index++) {
 		if (m_files[index] == nullptr) {
 			m_files[index] = file;
-			return index + DESCRIPTOR_MIN;
+			return IndexToDescriptor(index);
 		}
 	}
 
 	m_files.push_back(file);
-	return static_cast<int>(m_files.size()) + DESCRIPTOR_MIN - 1;
+	return IndexToDescriptor(m_files.size() - 1);
 }
 
 void FileDescriptors::DeleteDescriptor(int d) {
 	Common::LockGuard lock(m_mutex);
 
-	auto index = static_cast<size_t>(d - DESCRIPTOR_MIN);
+	size_t index = 0;
+	if (!DescriptorToIndex(d, &index) || index >= m_files.size() || m_files[index] == nullptr) {
+		return;
+	}
 
-	EXIT_IF(index >= m_files.size());
-	EXIT_IF(m_files[index] == nullptr);
 	EXIT_IF(m_files[index]->opened);
 
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
@@ -215,9 +237,8 @@ void FileDescriptors::DeleteDescriptor(int d) {
 File* FileDescriptors::GetFile(int d) {
 	Common::LockGuard lock(m_mutex);
 
-	auto index = static_cast<size_t>(d - DESCRIPTOR_MIN);
-
-	if (index >= m_files.size()) {
+	size_t index = 0;
+	if (!DescriptorToIndex(d, &index) || index >= m_files.size()) {
 		return nullptr;
 	}
 
@@ -558,13 +579,21 @@ int KYTY_SYSV_ABI KernelClose(int d) {
 		return KERNEL_ERROR_EBADF;
 	}
 
-	EXIT_IF(!file->opened);
+	{
+		// Serialize with I/O in flight on this descriptor. A descriptor that is not open (a second
+		// close, or an open that is still being set up) is not ours to release.
+		Common::LockGuard lock(file->mutex);
 
-	if (!file->directory && file->special == SpecialFile::None) {
-		file->f.Close();
+		if (!file->opened) {
+			return KERNEL_ERROR_EBADF;
+		}
+
+		if (!file->directory && file->special == SpecialFile::None) {
+			file->f.Close();
+		}
+
+		file->opened = false;
 	}
-
-	file->opened = false;
 
 	LOGF("\tClose: %s\n", Common::PathToString(file->real_name).c_str());
 
@@ -718,6 +747,10 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 
 	if (offset < 0) {
 		return KERNEL_ERROR_EINVAL;
+	}
+
+	if (::Libs::Network::Net::IsSocket(d)) {
+		return KERNEL_ERROR_ESPIPE;
 	}
 
 	auto* file = g_files->GetFile(d);
@@ -883,6 +916,10 @@ int64_t KYTY_SYSV_ABI KernelPwrite(int d, const void* buf, size_t nbytes, int64_
 		return KERNEL_ERROR_EINVAL;
 	}
 
+	if (::Libs::Network::Net::IsSocket(d)) {
+		return KERNEL_ERROR_ESPIPE;
+	}
+
 	auto* file = g_files->GetFile(d);
 
 	if (file == nullptr) {
@@ -992,6 +1029,10 @@ int64_t KYTY_SYSV_ABI KernelLseek(int d, int64_t offset, int whence) {
 
 	if (d < DESCRIPTOR_MIN) {
 		return KERNEL_ERROR_EBADF;
+	}
+
+	if (::Libs::Network::Net::IsSocket(d)) {
+		return KERNEL_ERROR_ESPIPE;
 	}
 
 	auto* file = g_files->GetFile(d);
@@ -1109,6 +1150,10 @@ int KYTY_SYSV_ABI KernelFstat(int d, FileStat* sb) {
 
 	if (sb == nullptr) {
 		return KERNEL_ERROR_EFAULT;
+	}
+
+	if (::Libs::Network::Net::IsSocket(d)) {
+		return KERNEL_ERROR_EBADF;
 	}
 
 	auto* file = g_files->GetFile(d);
@@ -1317,6 +1362,11 @@ int KYTY_SYSV_ABI KernelGetdirentries(int fd, char* buf, int nbytes, int64_t* ba
 
 	if (buf == nullptr) {
 		return KERNEL_ERROR_EFAULT;
+	}
+
+	// A socket is not a directory.
+	if (::Libs::Network::Net::IsSocket(fd)) {
+		return KERNEL_ERROR_EINVAL;
 	}
 
 	auto* file = g_files->GetFile(fd);

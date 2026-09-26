@@ -552,6 +552,73 @@ void CheckDirectoryOpenErrors() {
   Check(FileSystem::KernelClose(again) == OK, "close directory open fixture");
 }
 
+void CheckDescriptorNumbering() {
+  namespace Net = Libs::Network::Net;
+  // Sockets own descriptors [128, 1024); files are numbered 3..127 and then from 1024 upward, so
+  // a title with many open files never reaches a socket through a file descriptor.
+  constexpr int FileCount = 130;
+  std::vector<int> descriptors;
+  for (int i = 0; i < FileCount; ++i) {
+    const auto path = "/savedata0/many-" + std::to_string(i) + ".dat";
+    const int fd = FileSystem::KernelOpen(path.c_str(), 0x602, 0777);
+    Check(fd >= 3, "open one of many files");
+    Check(fd < 128 || fd >= 1024, "file descriptor stays outside the socket range");
+    Check(!Net::IsSocket(fd), "file descriptor is not mistaken for a socket");
+    Check(std::find(descriptors.begin(), descriptors.end(), fd) == descriptors.end(),
+          "file descriptors are unique");
+    const auto payload = "payload-" + std::to_string(i);
+    Check(FileSystem::KernelWrite(fd, payload.data(), payload.size()) == payload.size(),
+          "write through a numbered descriptor");
+    descriptors.push_back(fd);
+  }
+  Check(descriptors.back() >= 1024, "file descriptors continue past the socket range");
+
+  const int sock = Net::Socket(2, 1, 0);
+  Check(sock >= 128 && sock < 1024, "socket descriptor lives inside the socket range");
+  Check(std::find(descriptors.begin(), descriptors.end(), sock) == descriptors.end(),
+        "socket descriptor does not alias an open file");
+
+  for (int i = 0; i < FileCount; ++i) {
+    const int fd = descriptors[i];
+    const auto expected = "payload-" + std::to_string(i);
+    std::array<char, 32> buffer{};
+    Check(FileSystem::KernelPread(fd, buffer.data(), buffer.size(), 0) == expected.size() &&
+              std::memcmp(buffer.data(), expected.data(), expected.size()) == 0,
+          "pread reads back through a numbered descriptor");
+    buffer.fill(0);
+    Check(FileSystem::KernelLseek(fd, 0, 0) == 0 &&
+              FileSystem::KernelRead(fd, buffer.data(), buffer.size()) == expected.size() &&
+              std::memcmp(buffer.data(), expected.data(), expected.size()) == 0,
+          "read reads back through a numbered descriptor");
+    FileSystem::FileStat stat{};
+    Check(FileSystem::KernelFstat(fd, &stat) == OK && stat.st_size == expected.size(),
+          "fstat sees a numbered descriptor");
+    Check(FileSystem::KernelClose(fd) == OK, "close a numbered descriptor");
+    Check(FileSystem::KernelClose(fd) == Libs::LibKernel::KERNEL_ERROR_EBADF,
+          "second close of a descriptor reports EBADF");
+  }
+  Check(FileSystem::KernelClose(sock) == OK, "close the socket through the kernel close");
+
+  std::array<char, 8> scratch{};
+  for (const int fd : {128, 1023, 4096}) {
+    Check(FileSystem::KernelClose(fd) == Libs::LibKernel::KERNEL_ERROR_EBADF &&
+              FileSystem::KernelRead(fd, scratch.data(), scratch.size()) ==
+                  Libs::LibKernel::KERNEL_ERROR_EBADF &&
+              FileSystem::KernelPread(fd, scratch.data(), scratch.size(), 0) ==
+                  Libs::LibKernel::KERNEL_ERROR_EBADF &&
+              FileSystem::KernelLseek(fd, 0, 0) == Libs::LibKernel::KERNEL_ERROR_EBADF,
+          "descriptors that name no file or socket report EBADF");
+  }
+
+  const int reused = FileSystem::KernelOpen("/savedata0/many-0.dat", 0, 0);
+  Check(reused == descriptors.front(), "closed descriptors are reused from the lowest number");
+  Check(FileSystem::KernelClose(reused) == OK, "close the reused descriptor");
+  for (int i = 0; i < FileCount; ++i) {
+    const auto path = "/savedata0/many-" + std::to_string(i) + ".dat";
+    Check(FileSystem::KernelUnlink(path.c_str()) == OK, "remove one of many files");
+  }
+}
+
 } // namespace
 
 int main() {
@@ -585,6 +652,7 @@ int main() {
   CheckSaveRename(temporary.Path(), "replacement-save");
   CheckDirectoryRename(temporary.Path());
   CheckDirectoryOpenErrors();
+  CheckDescriptorNumbering();
   FileSystem::Shutdown();
   CheckSocketWakeup();
   graphics.reset();

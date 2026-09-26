@@ -2553,12 +2553,27 @@ int KYTY_SYSV_ABI KernelMunmap(uint64_t vaddr, size_t len) {
 	if (len == 0 || UINT64_MAX - vaddr < len) {
 		return KERNEL_ERROR_EINVAL;
 	}
-	std::vector<VirtualRanges::Range> ranges;
-	if (!g_virtual_ranges->QuerySpan(vaddr, len, &ranges)) {
-		return KERNEL_ERROR_EACCES;
+
+	// Like FreeBSD, unmap whatever is mapped inside the span and ignore the holes in it.
+	const auto end     = vaddr + len;
+	auto       current = vaddr;
+	while (current < end) {
+		VirtualRanges::Range range {};
+		if (!g_virtual_ranges->Query(current, 1, &range) || range.start >= end) {
+			break;
+		}
+		const auto range_end =
+		    (UINT64_MAX - range.start < range.size ? UINT64_MAX : range.start + range.size);
+		const auto chunk_start = std::max(current, range.start);
+		const auto chunk_end   = std::min(end, range_end);
+		UnmapGpuRange(chunk_start, chunk_end - chunk_start);
+		const int result = UnmapMemoryRange(chunk_start, chunk_end - chunk_start);
+		if (result != OK) {
+			return result;
+		}
+		current = chunk_end;
 	}
-	UnmapGpuRange(vaddr, len);
-	return UnmapMemoryRange(vaddr, len);
+	return OK;
 }
 
 size_t KYTY_SYSV_ABI KernelGetDirectMemorySize() {
@@ -2883,8 +2898,24 @@ int KYTY_SYSV_ABI KernelReleaseDirectMemory(int64_t start, size_t len) {
 	if (validation != OK) {
 		return validation;
 	}
-	if (len != 0) {
-		(void)ReleaseDirectMemoryInternal(start, len);
+
+	std::lock_guard<std::recursive_mutex> memory_operation_lock(g_memory_operation_mutex);
+
+	// Like FreeBSD, release every allocation inside the span and ignore the holes in it. Only the
+	// checked variant requires a gap-free allocated span.
+	const auto begin   = static_cast<uint64_t>(start);
+	const auto end     = (UINT64_MAX - begin < len ? UINT64_MAX : begin + len);
+	auto       current = begin;
+	while (current < end) {
+		PhysicalMemory::AllocatedBlock block {};
+		if (!g_physical_memory->Find(current, true, &block) || block.start_addr >= end) {
+			break;
+		}
+		const auto block_start = std::max(current, block.start_addr);
+		const auto block_end   = std::min(end, block.start_addr + block.size);
+		(void)ReleaseDirectMemoryInternal(static_cast<int64_t>(block_start),
+		                                  block_end - block_start);
+		current = block_end;
 	}
 	return OK;
 }

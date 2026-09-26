@@ -285,6 +285,35 @@ void TestWakeZeroIsNoOp() {
   }
 }
 
+void TestWakeReleasesMixedWidthWaiters() {
+  // 32-bit waiters may park on a futex while 64-bit waiters use the portable registry (a futex
+  // only watches 32 bits); one wake with a count has to be shared between both kinds.
+  uint64_t word = 0;
+  uint32_t timeout = 1000000;
+  std::atomic<int> ready{0};
+  int result32 = Libs::LibKernel::KERNEL_ERROR_ETIMEDOUT;
+  int result64 = Libs::LibKernel::KERNEL_ERROR_ETIMEDOUT;
+  std::thread waiter32([&] {
+    ready.fetch_add(1, std::memory_order_release);
+    result32 = Wait32(reinterpret_cast<uint32_t *>(&word), 0, &timeout);
+  });
+  std::thread waiter64([&] {
+    ready.fetch_add(1, std::memory_order_release);
+    result64 = Wait64(&word, 0, &timeout);
+  });
+  while (ready.load(std::memory_order_acquire) != 2) {
+    std::this_thread::yield();
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  // Only the upper half changes, so the 32-bit waiter is released by the wake count alone.
+  Store(&word, UINT64_C(0x100000000));
+  Check(Wake(&word, 2) == OK, "wake-two succeeds with mixed-width waiters");
+  waiter32.join();
+  waiter64.join();
+  Check(result32 == OK && result64 == OK,
+        "wake-two releases one 32-bit and one 64-bit waiter");
+}
+
 } // namespace
 
 int main() {
@@ -297,6 +326,7 @@ int main() {
   TestAddressesAreIsolated();
   TestCompareRegisterWakeRace();
   TestWakeZeroIsNoOp();
+  TestWakeReleasesMixedWidthWaiters();
   std::printf("SyncOnAddressTests: all passed\n");
   return 0;
 }

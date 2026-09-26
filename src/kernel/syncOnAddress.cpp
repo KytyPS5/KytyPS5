@@ -225,32 +225,34 @@ int WaitPortable(volatile T* address, T expected, const WaitDeadline& deadline,
 	return result;
 }
 
-int WakePortable(volatile void* address, int32_t count) {
+// Returns the number of waiters released.
+int32_t WakePortable(volatile void* address, int32_t count) {
 	if (count == 0) {
-		return OK;
+		return 0;
 	}
 	auto&            registry = GetPortableRegistry();
 	std::unique_lock registry_lock(registry.mutex);
 	const auto       it = registry.entries.find(reinterpret_cast<uintptr_t>(address));
 	if (it == registry.entries.end()) {
-		return OK;
+		return 0;
 	}
 	auto entry = it->second;
 	entry->mutex.Lock();
 	registry_lock.unlock();
 
-	int32_t remaining = count;
+	int32_t woken = 0;
 	for (auto* waiter: entry->waiters) {
 		if (!waiter->wake_requested) {
 			waiter->wake_requested = true;
 			waiter->condition.Signal();
-			if (remaining != INT_MAX && --remaining == 0) {
+			woken++;
+			if (count != INT_MAX && woken == count) {
 				break;
 			}
 		}
 	}
 	entry->mutex.Unlock();
-	return OK;
+	return woken;
 }
 
 template <typename T>
@@ -262,7 +264,14 @@ int WaitImpl(volatile T* address, T expected, const WaitDeadline& deadline,
 
 	int result = OK;
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
-	result = WaitLinux(address, expected, deadline, signal_poll);
+	// A futex only watches 32 bits: a 64-bit waiter that parks on the low half after comparing the
+	// whole word misses a wake that follows a change confined to the upper half and sleeps until
+	// the next signal poll. 64-bit waits therefore use the portable registry.
+	if constexpr (sizeof(T) == sizeof(uint32_t)) {
+		result = WaitLinux(address, expected, deadline, signal_poll);
+	} else {
+		result = WaitPortable(address, expected, deadline, signal_poll);
+	}
 #else
 	result = WaitPortable(address, expected, deadline, signal_poll);
 #endif
@@ -292,10 +301,14 @@ int Wake(volatile void* address, int32_t count) {
 		return KERNEL_ERROR_EINVAL;
 	}
 
+	const auto woken = WakePortable(address, count);
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
-	return WakeLinux(address, count);
+	// 32-bit waiters park on the futex; the portable registry only holds 64-bit waiters here.
+	return WakeLinux(address, count == INT_MAX ? count : count - woken);
+#else
+	(void)woken;
+	return OK;
 #endif
-	return WakePortable(address, count);
 }
 
 } // namespace Libs::LibKernel::SyncOnAddress

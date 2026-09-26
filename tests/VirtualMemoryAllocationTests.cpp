@@ -1551,6 +1551,74 @@ void TestDirectReleaseContracts() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestReleaseDirectMemoryIgnoresHoles() {
+	const char* test      = "ReleaseDirectMemoryIgnoresHoles";
+	const auto  end       = Libs::LibKernel::Memory::KernelGetDirectMemorySize();
+	int64_t     phys_addr = 0;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+	            0, end, SceKernelPageSize * 3, SceKernelPageSize, SceKernelMtypeC, &phys_addr),
+	        "KernelAllocateDirectMemory");
+	void* address = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
+	            &address, SceKernelPageSize * 3, SceKernelProtCpuRw, 0, phys_addr,
+	            SceKernelPageSize, "release_holes"),
+	        "KernelMapNamedDirectMemory");
+	const auto base   = reinterpret_cast<uint64_t>(address);
+	const auto middle = phys_addr + static_cast<int64_t>(SceKernelPageSize);
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(middle, SceKernelPageSize),
+	        "KernelReleaseDirectMemory(middle page)");
+	ExpectUnmapped(test, base + SceKernelPageSize);
+	ExpectRange(test, Query(test, base), base, base + SceKernelPageSize, SceKernelProtCpuRw, 0, 1,
+	            0, 1, "release_holes", static_cast<uint64_t>(phys_addr));
+
+	struct QueryInfo {
+		int64_t start;
+		int64_t end;
+		int     memory_type;
+	} info {};
+	// The checked release still requires a gap-free allocated span...
+	Check(test,
+	      Libs::LibKernel::Memory::KernelCheckedReleaseDirectMemory(
+	          phys_addr, SceKernelPageSize * 3) == Libs::LibKernel::KERNEL_ERROR_ENOENT,
+	      "checked release did not reject a span with a hole");
+	Check(test,
+	      Libs::LibKernel::Memory::KernelDirectMemoryQuery(phys_addr, 0, &info, sizeof(info)) ==
+	              OK &&
+	          info.start == phys_addr && info.end == middle,
+	      "rejected checked release changed the allocations");
+	// ...while, like FreeBSD, the plain release frees the allocations around the hole.
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelReleaseDirectMemory(phys_addr, SceKernelPageSize * 3),
+	        "KernelReleaseDirectMemory(span with a hole)");
+	ExpectUnmapped(test, base);
+	ExpectUnmapped(test, base + SceKernelPageSize * 2);
+	Check(test,
+	      Libs::LibKernel::Memory::KernelDirectMemoryQuery(phys_addr, 0, &info, sizeof(info)) ==
+	              ErrorAccess &&
+	          Libs::LibKernel::Memory::KernelDirectMemoryQuery(
+	              phys_addr + static_cast<int64_t>(SceKernelPageSize * 2), 0, &info,
+	              sizeof(info)) == ErrorAccess,
+	      "release across a hole left pages allocated");
+
+	int64_t coalesced = -1;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+	            0, end, SceKernelPageSize * 3, SceKernelPageSize, SceKernelMtypeC, &coalesced),
+	        "KernelAllocateDirectMemory(coalesced)");
+	Check(test, coalesced == phys_addr, "pages released around a hole did not coalesce with it");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelReleaseDirectMemory(coalesced, SceKernelPageSize * 3),
+	        "KernelReleaseDirectMemory(cleanup)");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelReleaseDirectMemory(phys_addr, SceKernelPageSize * 3),
+	        "KernelReleaseDirectMemory(fully released span)");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestReleasedReserveCanBeReused() {
 	const char* test = "ReleasedReserveCanBeReused";
 	void*       addr = nullptr;
@@ -1616,6 +1684,48 @@ void TestMunmapAcrossAdjacentFlexibleMappings() {
 	      "multi-range unmap leaked flexible-memory budget");
 	ExpectUnmapped(test, base);
 	ExpectUnmapped(test, base + SceKernelPageSize);
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+void TestMunmapIgnoresHoles() {
+	const char* test     = "MunmapIgnoresHoles";
+	const auto  baseline = AvailableFlexibleMemory(test);
+	void*       reserve  = nullptr;
+
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelReserveVirtualRange(&reserve, SceKernelPageSize * 4, 0,
+	                                                           SceKernelPageSize),
+	        "KernelReserveVirtualRange");
+	const auto base   = reinterpret_cast<uint64_t>(reserve);
+	void*      second = reinterpret_cast<void*>(base + SceKernelPageSize);
+	void*      fourth = reinterpret_cast<void*>(base + SceKernelPageSize * 3);
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedFlexibleMemory(
+	            &second, SceKernelPageSize, SceKernelProtCpuRw, SceKernelMapFixed, "hole_second"),
+	        "KernelMapNamedFlexibleMemory(second page)");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedFlexibleMemory(
+	            &fourth, SceKernelPageSize, SceKernelProtCpuRw, SceKernelMapFixed, "hole_fourth"),
+	        "KernelMapNamedFlexibleMemory(fourth page)");
+	// Punch holes before and between the mappings by releasing the reserved pages.
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize),
+	        "KernelMunmap(first page)");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMunmap(base + SceKernelPageSize * 2, SceKernelPageSize),
+	        "KernelMunmap(third page)");
+	ExpectUnmapped(test, base);
+	ExpectUnmapped(test, base + SceKernelPageSize * 2);
+
+	// FreeBSD munmap releases whatever is mapped inside the span and ignores the holes.
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize * 4),
+	        "KernelMunmap(span with holes)");
+	ExpectUnmapped(test, base + SceKernelPageSize);
+	ExpectUnmapped(test, base + SceKernelPageSize * 3);
+	Check(test, AvailableFlexibleMemory(test) == baseline,
+	      "munmap across holes did not return the flexible pages");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize * 4),
+	        "KernelMunmap(fully unmapped span)");
 
 	std::printf("[host]    %-48s ok\n", test);
 }
@@ -3276,6 +3386,7 @@ int main(int argc, char** argv) {
 	RunTest(TestFixedNoOverwriteRejectsReservedRange);
 	RunTest(TestReleasedReserveCanBeReused);
 	RunTest(TestMunmapAcrossAdjacentFlexibleMappings);
+	RunTest(TestMunmapIgnoresHoles);
 	RunTest(TestDirectMapQueryOffsetAndPartialMunmap);
 	RunTest(TestDirectPartialProtectUnmapPreservesNeighbors);
 #if defined(__linux__)
@@ -3284,6 +3395,7 @@ int main(int argc, char** argv) {
 	RunTest(TestDirectMapValidationBeforeOwnerMutation);
 	RunTest(TestDirectReleaseRollbackRestoresOwnerMapping);
 	RunTest(TestDirectReleaseContracts);
+	RunTest(TestReleaseDirectMemoryIgnoresHoles);
 	RunTest(TestNonzeroDirectOffsetAliasesSharedBacking);
 	RunTest(TestDirectMapAcrossContiguousAllocations);
 	RunTest(TestDirectPhysicalFreeRangeReuseAndCoalescing);

@@ -1441,14 +1441,24 @@ ImageId TextureCache::FindSampledHtileImage(ImageDesc& desc) {
 	if (tracked_clear_known && clear != 0 && clear != 0xfffffff0u) {
 		EXIT("sampled HTile metadata fill does not encode a supported depth clear\n");
 	}
-	if (existing_native && !tracked_clear_known) {
+	if (existing_native) {
+		// Native depth attachments keep GPU pixels; guest HTile may be stale or
+		// GPU-dirty. Prefer the attachment over a CPU clear-import that would
+		// EXIT on ownership or fight the rendered depth.
 		std::scoped_lock lock {m_lock};
-		auto&            image = m_slot_images[existing_native];
+		auto& image = m_slot_images[existing_native];
 		TouchImage(image);
 		return existing_native;
 	}
-	if (IsRegionGpuModified(metadata.address, metadata.size) ||
-	    m_buffer_cache.HasGpuDirtyBytes(requested.data.address, requested.data.size)) {
+	if (IsRegionGpuModified(metadata.address, metadata.size)) {
+		EXIT("sampled HTile import has unsupported GPU image or raw-buffer ownership\n");
+	}
+	if (m_buffer_cache.HasGpuDirtyBytes(requested.data.address, requested.data.size)) {
+		// Depth bytes are buffer-dirty without a matching image owner. Drain to
+		// host so the clear-import path can treat HTile as authoritative.
+		m_buffer_cache.ReadMemory(requested.data.address, requested.data.size);
+	}
+	if (m_buffer_cache.HasGpuDirtyBytes(requested.data.address, requested.data.size)) {
 		EXIT("sampled HTile import has unsupported GPU image or raw-buffer ownership\n");
 	}
 	// ReadMemory may submit/wait and reenter cache maintenance. No cache lock,

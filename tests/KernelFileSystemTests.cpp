@@ -449,6 +449,13 @@ void CheckSocketWakeup() {
         "send wake bytes with guest MSG_NOSIGNAL");
   readable[reader / 64] = bit;
   const std::array<int64_t, 2> deadline {1, 0};
+  const auto wait_readable = [&readable, &deadline](int fd, const char* message) {
+    const auto fd_bit = uint64_t {1} << (fd % 64);
+    readable[fd / 64] = fd_bit;
+    Check(Net::Select(fd + 1, readable.data(), nullptr, nullptr, deadline.data()) == 1 &&
+              readable[fd / 64] == fd_bit,
+          message);
+  };
   Check(Net::Select(reader + 1, readable.data(), nullptr, nullptr,
                     deadline.data()) == 1 && readable[reader / 64] == bit,
         "select reports the guest descriptor after wake");
@@ -468,15 +475,17 @@ void CheckSocketWakeup() {
         "send the first fragment");
   const char* const second_fragment = text + text_length / 2;
   const std::size_t second_length   = text_length - text_length / 2;
-  std::thread peer([&writer, second_fragment, second_length] {
+  int64_t second_send_result = -1;
+  std::thread peer([&writer, second_fragment, second_length, &second_send_result] {
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    Net::Send(writer, second_fragment, second_length, 0);
+    second_send_result = Net::Send(writer, second_fragment, second_length, 0);
   });
   std::array<char, text_length> message {};
   Check(Net::Recv(reader, message.data(), message.size(), 0x42) == message.size() &&
             std::memcmp(message.data(), text, text_length) == 0,
         "guest PEEK and WAITALL waits for a fragmented message");
   peer.join();
+  Check(second_send_result == second_length, "send second fragment");
   Check(Net::Recv(reader, message.data(), message.size(), 0) == message.size() &&
             std::memcmp(message.data(), text, text_length) == 0,
         "peeked bytes stay available for the following receive");
@@ -486,6 +495,7 @@ void CheckSocketWakeup() {
   // MSG_DONTWAIT must never wait for the rest of the message.
   Check(Net::Send(writer, text, prefix_length, 0) == prefix_length,
         "send bytes for the non-waiting peek");
+  wait_readable(reader, "non-waiting peek bytes arrived");
   Check(Net::Recv(reader, message.data(), message.size(), 0xc2) == prefix_length,
         "guest MSG_DONTWAIT PEEK and WAITALL returns the buffered prefix");
   Check(Net::Recv(reader, message.data(), prefix_length, 0) == prefix_length,
@@ -499,6 +509,7 @@ void CheckSocketWakeup() {
         "enable the guest non-blocking socket");
   Check(Net::Send(writer, text, prefix_length, 0) == prefix_length,
         "send bytes for the non-blocking socket peek");
+  wait_readable(reader, "non-blocking socket peek bytes arrived");
   Check(Net::Recv(reader, message.data(), message.size(), 0x42) == prefix_length,
         "non-blocking socket PEEK and WAITALL returns the buffered prefix");
   Check(Net::Recv(reader, message.data(), prefix_length, 0) == prefix_length,
@@ -555,10 +566,12 @@ void CheckSocketWakeup() {
             Net::Connect(inherited_writer, inherited_address.data(),
                          inherited_address_size) == 0,
         "connect to nonblocking listener");
+  wait_readable(inherited_listener, "accepted-mode connection is queued");
   const int inherited_reader = Net::Accept(inherited_listener, nullptr, nullptr);
   Check(inherited_reader >= 0, "accept nonblocking listener socket");
   Check(Net::Send(inherited_writer, text, prefix_length, 0) == prefix_length,
         "send accepted-mode prefix");
+  wait_readable(inherited_reader, "accepted-mode prefix arrived");
   std::array<char, text_length> inherited_message {};
   auto inherited_receive = std::async(std::launch::async, [&] {
     return Net::Recv(inherited_reader, inherited_message.data(), inherited_message.size(),
@@ -620,6 +633,25 @@ void CheckSocketWakeup() {
   Check(Net::Recvfrom(datagram_receiver, datagram_buffer.data(), datagram_buffer.size(), 0,
                       datagram_source.data(), &datagram_source_size) == 0,
         "consume zero-length datagram");
+
+  // Winsock needs a one-byte scratch buffer to obtain the source of a zero-length peek.
+  // A queued one-byte datagram must still be reported as a zero-length receive.
+  constexpr char one_byte_datagram = 'x';
+  Check(Net::Sendto(datagram_sender, &one_byte_datagram, sizeof(one_byte_datagram), 0,
+                    datagram_address.data(), datagram_address.size()) == 1,
+        "send one-byte datagram");
+  datagram_source_size = datagram_source.size();
+  Check(Net::Recvfrom(datagram_receiver, datagram_buffer.data(), 0, 0x42,
+                      datagram_source.data(), &datagram_source_size) == 0 &&
+            datagram_source_size == datagram_sender_address.size() &&
+            std::memcmp(datagram_source.data(), datagram_sender_address.data(),
+                        datagram_sender_address.size()) == 0,
+        "zero-length peek does not report scratch data");
+  datagram_source_size = datagram_source.size();
+  Check(Net::Recvfrom(datagram_receiver, datagram_buffer.data(), datagram_buffer.size(), 0,
+                      datagram_source.data(), &datagram_source_size) == 1 &&
+            datagram_buffer[0] == one_byte_datagram,
+        "consume one-byte datagram after zero-length peek");
   Check(Net::SocketClose(datagram_sender) == 0 &&
             Net::SocketClose(datagram_receiver) == 0,
         "close datagram sockets");

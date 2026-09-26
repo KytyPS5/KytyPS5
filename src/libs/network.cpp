@@ -1121,7 +1121,7 @@ static short PollSocket(NativeSocket socket) {
 
 static bool WaitForPeekedBytes(NativeSocket socket) {
 	std::this_thread::sleep_for(std::chrono::milliseconds(1));
-	constexpr short terminal_events = POLLHUP | POLLERR | POLLNVAL;
+	constexpr short terminal_events = POLLHUP | POLLERR;
 	return (PollSocket(socket) & terminal_events) != 0;
 }
 
@@ -1166,9 +1166,14 @@ static int64_t RecvPeekWaitAll(NativeSocket socket, bool nonblocking, bool no_wa
 		}
 		if (peeked >= host_len || peeked == 0 || peer_closed || nonblocking || no_wait ||
 		    !SocketIsStream(socket)) {
-			return peeked;
+			return std::min<int64_t>(peeked, static_cast<int64_t>(host_len));
 		}
 		peer_closed = WaitForPeekedBytes(socket);
+		if (peer_closed) {
+			// Winsock can report the terminal event before recv(MSG_PEEK) exposes EOF.
+			// Preserve the already-buffered prefix instead of turning it into WSAECONNRESET.
+			return peeked;
+		}
 	}
 }
 #endif

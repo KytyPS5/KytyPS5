@@ -55,6 +55,13 @@ Checkpoint Flip queue lock-order (Reserve cfg→m_mutex ABBA) **26 сентяб�
     на холодном старте). GPUAV+instrumentation обязателен (без него
     `b90e2024` → nvgpucomp `0x80000003`). Цель readback: colored>0 около
     prepared frame ~236.
+14. Cold GPUAV+instr+None `…-071734-presentfix-gpuav`: **timeout 900s на
+    shown=136** (colored=0, readback START=200 не достигнуто). Bottleneck —
+    `vkCreateComputePipelines` 5–35 с на GPUAV-SPIR-V (`6cc64dee` ~16 с,
+    пики ~35 с). Cache load 331 MB → save **369 MB**. Следующее: тёплый
+    повтор (тот же blob), без core validation (`-NoVulkanValidation`),
+    Timeout 1800 / ReadbackStart 130; параллельно снять зависимость от
+    GPUAV для `b90e` (корневой ускоритель до spinner).
 
 Checkpoint present soft-stall (shown≈130 / ready=shown+1) **26 сентября 2026 года**:
 

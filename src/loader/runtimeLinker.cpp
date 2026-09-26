@@ -984,21 +984,28 @@ static void PatchProgram(Program* program, uint64_t address, uint64_t size) {
 	}
 
 	if (!program->elf->IsShared() && program->tls.handler_vaddr != 0 &&
-	    size >= Jit::Call9::GetSize()) {
+	    size >= Jit::Jmp9::GetSize()) {
 		// Replace:
 		//   66 66 66
 		//   mov <reg>, qword ptr fs:[0x00]
-		// with:
-		//   call <handler>
-		//   mov <reg>,rax
-		//   nop ...
+		// with a jump to a per-site trampoline (Jit::TlsSiteTrampoline) that moves rsp below
+		// the guest red zone, calls the TLS handler and jumps back. The replaced mov writes
+		// nothing to the stack, so a call placed directly at the site would clobber the
+		// red-zone slot at [rsp-8] that leaf functions use for spills. Call9 remains the
+		// fallback when no trampoline memory is reachable.
 		const uint8_t tls_pattern[5]       = {0x64, 0x48, 0x8B, 0x00, 0x25};
 		const uint8_t zero_displacement[4] = {};
 
-		EXIT_IF(Jit::Call9::GetSize() != 9);
+		EXIT_IF(Jit::Call9::GetSize() != 9 || Jit::Jmp9::GetSize() != 9);
+
+		struct Site {
+			uint8_t* inst = nullptr;
+			uint8_t  reg  = 0;
+		};
+		std::vector<Site> sites;
 
 		auto* start_ptr = reinterpret_cast<uint8_t*>(address);
-		auto* end_ptr   = start_ptr + size - Jit::Call9::GetSize();
+		auto* end_ptr   = start_ptr + size - Jit::Jmp9::GetSize();
 
 		for (auto* ptr = start_ptr; ptr <= end_ptr; ptr++) {
 			auto*  inst_ptr     = ptr;
@@ -1008,7 +1015,7 @@ static void PatchProgram(Program* program, uint64_t address, uint64_t size) {
 				prefix_count++;
 			}
 
-			if (inst_ptr + Jit::Call9::GetSize() > start_ptr + size) {
+			if (inst_ptr + Jit::Jmp9::GetSize() > start_ptr + size) {
 				break;
 			}
 
@@ -1018,18 +1025,73 @@ static void PatchProgram(Program* program, uint64_t address, uint64_t size) {
 			    memcmp(inst_ptr + 5, zero_displacement, sizeof(zero_displacement)) == 0) {
 				LOGF("Patch tls at addr: [%016" PRIx64 "]\n", reinterpret_cast<uint64_t>(inst_ptr));
 
-				const auto reg = (modrm >> 3u) & 7u;
+				const auto reg = static_cast<uint8_t>((modrm >> 3u) & 7u);
 				EXIT_NOT_IMPLEMENTED(reg == 4u);
-
-				// A raw scan can encounter a 0x66 in the preceding instruction, so do not
-				// overwrite it. Call9 starts with REX.W to neutralize genuine 0x66
-				// prefixes on AMD processors (before it could turn E8 into callw 16bit).
-				auto* code = new (inst_ptr) Jit::Call9;
-				code->SetFunc(reg == 0
-				                  ? program->tls.handler_vaddr
-				                  : program->tls.handler_vaddr + Jit::TlsRegStub::GetOffset(reg));
-				ptr += prefix_count + Jit::Call9::GetSize() - 1;
+				sites.push_back({inst_ptr, reg});
+				ptr += prefix_count + Jit::Jmp9::GetSize() - 1;
 			}
+		}
+		if (sites.empty()) {
+			return;
+		}
+
+		constexpr uint64_t GUEST_PAGE_SIZE = 0x4000;
+		const uint64_t     region_size =
+		    AlignUp(sites.size() * Jit::TlsSiteTrampoline::GetSize(), GUEST_PAGE_SIZE);
+		// Right behind the image keeps every rel32 within reach; the loader spaces programs
+		// far enough apart for that space to be free.
+		uint64_t region = Libs::LibKernel::Memory::AllocateRuntimeMemory(
+		    program->base_vaddr + program->mapped_size, region_size,
+		    Common::VirtualMemory::Mode::ExecuteReadWrite, "tls_trampolines", false);
+		const auto reachable = [](uint64_t from, uint64_t to) {
+			const auto distance = static_cast<int64_t>(to - from);
+			return distance >= INT32_MIN && distance <= INT32_MAX;
+		};
+		bool use_trampolines = region != 0;
+		if (use_trampolines) {
+			const auto first = reinterpret_cast<uint64_t>(sites.front().inst);
+			const auto last  = reinterpret_cast<uint64_t>(sites.back().inst);
+			const auto end   = region + region_size;
+			use_trampolines  = reachable(first, region) && reachable(first, end) &&
+			                  reachable(last, region) && reachable(last, end) &&
+			                  reachable(region, program->tls.handler_vaddr) &&
+			                  reachable(end, program->tls.handler_vaddr);
+			if (!use_trampolines) {
+				EXIT_IF(!Libs::LibKernel::Memory::FreeGuestMemory(region, region_size));
+				region = 0;
+			}
+		}
+		if (!use_trampolines) {
+			LOGF("TLS trampolines are out of reach for segment 0x%016" PRIx64
+			     "; patching %zu sites with direct calls\n",
+			     address, sites.size());
+		}
+
+		for (size_t index = 0; index < sites.size(); index++) {
+			const auto& site = sites[index];
+			const auto  handler =
+                site.reg == 0 ? program->tls.handler_vaddr
+			                   : program->tls.handler_vaddr + Jit::TlsRegStub::GetOffset(site.reg);
+			// A raw scan can encounter a 0x66 in the preceding instruction, so do not
+			// overwrite it. Jmp9/Call9 start with REX.W to neutralize genuine 0x66 prefixes
+			// on AMD processors (which would otherwise turn E9/E8 into a 16-bit branch).
+			if (use_trampolines) {
+				auto* trampoline = new (reinterpret_cast<void*>(
+				    region + index * Jit::TlsSiteTrampoline::GetSize())) Jit::TlsSiteTrampoline;
+				trampoline->SetHandler(handler);
+				trampoline->SetReturn(reinterpret_cast<uint64_t>(site.inst) + Jit::Jmp9::GetSize());
+				auto* code = new (site.inst) Jit::Jmp9;
+				code->SetTarget(reinterpret_cast<uint64_t>(trampoline));
+			} else {
+				auto* code = new (site.inst) Jit::Call9;
+				code->SetFunc(handler);
+			}
+		}
+		if (use_trampolines) {
+			program->tls.trampoline_regions.emplace_back(region, region_size);
+			EXIT_IF(!Libs::LibKernel::Memory::ProtectGuestMemory(
+			    region, region_size, Common::VirtualMemory::Mode::Execute));
+			Common::VirtualMemory::FlushInstructionCache(region, region_size);
 		}
 	}
 }
@@ -2009,12 +2071,19 @@ void RuntimeLinker::DeleteProgram(Program* p) {
 		g_tls_cached_main_program = nullptr;
 		g_tls_cached_main_tcb     = nullptr;
 	}
-	for (auto& record: g_stubbed_imports) {
-		if (record.patch_vaddr >= program->base_vaddr &&
-		    record.patch_vaddr < program->base_vaddr + program->mapped_size) {
-			record.patch_vaddr = 0;
+	{
+		Common::LockGuard stub_lock(g_stubbed_imports_mutex);
+		for (auto& record: g_stubbed_imports) {
+			if (record.patch_vaddr >= program->base_vaddr &&
+			    record.patch_vaddr < program->base_vaddr + program->mapped_size) {
+				record.patch_vaddr = 0;
+			}
 		}
 	}
+	for (const auto& [region, region_size]: program->tls.trampoline_regions) {
+		EXIT_IF(!Libs::LibKernel::Memory::FreeGuestMemory(region, region_size));
+	}
+	program->tls.trampoline_regions.clear();
 
 	if (program->base_vaddr != 0 || program->mapped_size != 0) {
 		EXIT_IF(program->base_vaddr == 0 || program->mapped_size == 0);

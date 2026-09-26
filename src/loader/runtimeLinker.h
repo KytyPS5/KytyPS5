@@ -61,6 +61,8 @@ struct ThreadLocalStorage {
 	uint64_t image_size    = 0;
 	uint64_t tcb_offset    = 0;
 	uint64_t handler_vaddr = 0;
+	// Per-site trampolines of the patched `mov r64, fs:[0]` instructions (address, size).
+	std::vector<std::pair<uint64_t, uint64_t>> trampoline_regions;
 
 	std::vector<uint8_t>           init_image;
 	std::unordered_map<int, Block> tlss;

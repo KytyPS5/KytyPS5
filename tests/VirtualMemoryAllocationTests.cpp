@@ -7,6 +7,7 @@
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
+#include "loader/jit.h"
 #include "loader/redZonePatcher.h"
 #include "loader/runtimeLinker.h"
 #include "loader/systemContent.h"
@@ -163,6 +164,117 @@ void InitSubsystems() {
 
 	initialized = true;
 }
+
+#if defined(__x86_64__) || defined(_M_X64)
+// Stands in for the TLS handler's slow path: an MS-ABI callee that clobbers flags and a
+// volatile vector register before returning the thread's TLS base.
+static KYTY_MS_ABI uint8_t* TestTlsHandler() {
+	__asm__ volatile("pxor %%xmm0, %%xmm0\n\txor %%eax, %%eax\n\tadd $1, %%eax" ::: "eax", "xmm0",
+	                 "cc");
+	return reinterpret_cast<uint8_t*>(0x0000004242424240ull);
+}
+
+// A patched `mov r64, fs:[0]` must behave exactly like the original instruction: it may not
+// disturb the flags, the red zone below rsp, or any other register. The trampoline patch
+// (Jmp9 + TlsSiteTrampoline) satisfies that; the direct Call9 fallback still pushes its return
+// address into the red zone, which this test documents.
+void TestTlsPatchTrampolines() {
+	const char*        test            = "TlsPatchTrampolines";
+	constexpr uint64_t CODE_SIZE       = 0x1000;
+	constexpr uint64_t HANDLER_SIZE    = 0x1000;
+	constexpr uint64_t TRAMPOLINE_SIZE = 0x1000;
+	constexpr uint64_t SENTINEL        = 0x1122334455667788ull;
+	constexpr uint64_t TLS_BASE        = 0x0000004242424240ull;
+	constexpr uint8_t  REG             = 3; // rbx
+	const auto         mapping         = Libs::LibKernel::Memory::AllocateProgramMemory(
+        0x0000000903000000ull, CODE_SIZE + HANDLER_SIZE + TRAMPOLINE_SIZE,
+        Common::VirtualMemory::Mode::ExecuteReadWrite, "tls_trampoline_test");
+	Check(test, mapping != 0, "failed to allocate TLS patch test code");
+	const auto handler_page = mapping + CODE_SIZE;
+	const auto trampoline   = handler_page + HANDLER_SIZE;
+	const auto reg_stub     = handler_page + Loader::Jit::TlsRegStub::GetOffset(REG);
+
+	for (const bool use_trampoline: {false, true}) {
+		Xbyak::CodeGenerator code(CODE_SIZE, reinterpret_cast<void*>(mapping));
+		code.push(code.rbx);
+		code.mov(code.rax, SENTINEL);
+		code.mov(code.qword[code.rsp - 8], code.rax); // red-zone slot a leaf may spill to
+		code.movq(code.xmm0, code.rax);
+		code.cmp(code.rax, code.rax); // ZF = 1 must survive the patched instruction
+		const auto site = mapping + code.getSize();
+		// mov rbx, qword ptr fs:[0]
+		code.db(0x64);
+		code.db(0x48);
+		code.db(0x8b);
+		code.db(0x1c);
+		code.db(0x25);
+		code.dd(0);
+		// Result bits: 0 = ZF intact, 1 = rbx holds the TLS base, 2 = red zone intact,
+		// 3 = xmm0 intact.
+		code.setz(code.cl);
+		code.movzx(code.ecx, code.cl);
+		code.mov(code.rax, TLS_BASE);
+		code.cmp(code.rbx, code.rax);
+		code.sete(code.al);
+		code.movzx(code.eax, code.al);
+		code.shl(code.eax, 1);
+		code.or_(code.ecx, code.eax);
+		code.mov(code.rax, SENTINEL);
+		code.cmp(code.qword[code.rsp - 8], code.rax);
+		code.sete(code.al);
+		code.movzx(code.eax, code.al);
+		code.shl(code.eax, 2);
+		code.or_(code.ecx, code.eax);
+		code.mov(code.rax, SENTINEL); // the sete/movzx above reused rax
+		code.movq(code.rdx, code.xmm0);
+		code.cmp(code.rdx, code.rax);
+		code.sete(code.al);
+		code.movzx(code.eax, code.al);
+		code.shl(code.eax, 3);
+		code.or_(code.ecx, code.eax);
+		code.mov(code.eax, code.ecx);
+		code.pop(code.rbx);
+		code.ret();
+
+		auto* safe_call = new (reinterpret_cast<void*>(handler_page)) Loader::Jit::SafeCall;
+		safe_call->SetFunc(TestTlsHandler);
+		auto* stub = new (reinterpret_cast<void*>(reg_stub)) Loader::Jit::TlsRegStub;
+		stub->SetFunc(handler_page);
+		stub->SetOutputReg(REG);
+		if (use_trampoline) {
+			auto* entry = new (reinterpret_cast<void*>(trampoline)) Loader::Jit::TlsSiteTrampoline;
+			entry->SetHandler(reg_stub);
+			entry->SetReturn(site + Loader::Jit::Jmp9::GetSize());
+			auto* patch = new (reinterpret_cast<void*>(site)) Loader::Jit::Jmp9;
+			patch->SetTarget(trampoline);
+		} else {
+			auto* patch = new (reinterpret_cast<void*>(site)) Loader::Jit::Call9;
+			patch->SetFunc(reg_stub);
+		}
+		Check(test,
+		      Common::VirtualMemory::FlushInstructionCache(
+		          mapping, CODE_SIZE + HANDLER_SIZE + TRAMPOLINE_SIZE),
+		      "failed to flush generated TLS patch test code");
+
+		using GuestFunction = uint64_t(KYTY_SYSV_ABI*)();
+		const auto result   = reinterpret_cast<GuestFunction>(mapping)();
+		if (use_trampoline) {
+			Check(test, result == 0xf,
+			      "trampoline TLS patch changed the flags, destination, red zone or xmm0");
+		} else {
+			Check(test, (result & 0xb) == 0xb,
+			      "direct-call TLS patch changed the flags, destination or xmm0");
+			Check(test, (result & 0x4) == 0,
+			      "test harness did not reproduce the red-zone clobber of a direct call");
+		}
+	}
+	Check(test,
+	      Libs::LibKernel::Memory::FreeGuestMemory(mapping,
+	                                               CODE_SIZE + HANDLER_SIZE + TRAMPOLINE_SIZE),
+	      "failed to free TLS patch test code");
+	std::printf("[host]    %-48s ok\n", test);
+}
+#endif
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 void* g_red_zone_fault_page = nullptr;
@@ -3136,6 +3248,7 @@ int main(int argc, char** argv) {
 
 #if defined(__x86_64__) || defined(_M_X64)
 	RunTest(TestSmallFiberStacksAndMigration);
+	RunTest(TestTlsPatchTrampolines);
 #endif
 #if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	RunTest(TestPackedReciprocalSquareRoot);

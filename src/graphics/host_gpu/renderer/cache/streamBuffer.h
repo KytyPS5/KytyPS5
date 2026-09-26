@@ -104,6 +104,13 @@ public:
 	void                                        Commit();
 	[[nodiscard]] uint64_t Copy(const void* source, uint64_t size, uint64_t alignment = 0);
 
+	// The largest single reservation Map can accept. A reservation bigger than the whole
+	// buffer is refused outright rather than waited on, and a non-coherent one is rounded
+	// up to the device atom before that comparison, so a caller covering one logical
+	// transfer with several reservations has to size each against this rather than
+	// against Size().
+	[[nodiscard]] uint64_t MaxReservation() const;
+
 private:
 	friend struct StreamBufferTestAccess;
 

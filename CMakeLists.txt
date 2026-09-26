@@ -426,6 +426,13 @@ add_executable(memory_tracker_tests EXCLUDE_FROM_ALL
 target_link_libraries(memory_tracker_tests fmt::fmt common)
 target_include_directories(memory_tracker_tests PRIVATE ${inc_headers})
 
+add_executable(buffer_download_batch_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/BufferDownloadBatchTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/cache/bufferDownloadBatch.cpp"
+)
+target_link_libraries(buffer_download_batch_tests fmt::fmt common)
+target_include_directories(buffer_download_batch_tests PRIVATE ${inc_headers})
+
 add_executable(shader_vertex_metadata_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ShaderVertexMetadataTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"
@@ -553,6 +560,7 @@ if(BUILD_TESTING)
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
+	add_test(NAME buffer_download_batch COMMAND $<TARGET_FILE:buffer_download_batch_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
@@ -617,6 +625,7 @@ if(BUILD_TESTING)
 		scalar_provenance_tests
 		image_page_table_tests
 		memory_tracker_tests
+		buffer_download_batch_tests
 		page_manager_tests
 		bit_array_tests
 		shader_vertex_metadata_tests

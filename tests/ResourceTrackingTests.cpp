@@ -422,6 +422,17 @@ void TestInvariantIndirectImageMaterialization() {
         "address-backed indirect image descriptors were not materialized");
   auto fixture = MakeIndirectImageFixture(false);
   fixture->PlanAndTrack();
+  Check(fixture->program.info.images[0].simple_2d_sampling,
+        "simple 2D sample was not marked for mixed 2D/3D candidates");
+  auto derivative_fixture = MakeIndirectImageFixture(false);
+  for (auto &image_memory : derivative_fixture->program.memory_info) {
+    if (image_memory.kind == ResourceKind::Image) {
+      image_memory.image_sample_flags |= Decoder::ImageSampleFlagDerivative;
+    }
+  }
+  derivative_fixture->PlanAndTrack();
+  Check(!derivative_fixture->program.info.images[0].simple_2d_sampling,
+        "derivative sample was marked for mixed 2D/3D candidates");
   auto resource_plan = ExtractResourcePlan(fixture->program);
   EliminateDeadCode(fixture->program.blocks);
   ValidateProgram(fixture->program, true);
@@ -556,6 +567,24 @@ void TestInvariantIndirectImageMaterialization() {
                        mixed_snapshot.images[1].dwords.end(),
                        memory.words.begin() + second_image),
         "mixed 2D and cube candidates were rejected or discarded");
+  memory.words[second_image + 1u] = image_descriptor[1];
+  memory.words[second_image + 3u] =
+      Libs::Graphics::DstSel(4, 5, 6, 7) |
+      (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor3D) << 28u);
+  memory.words[second_image + 4u] = 0u;
+  Check(MaterializeResources(resource_plan, runtime, mixed_snapshot,
+                             mixed_specialization) &&
+            mixed_specialization.images.size() == 2 &&
+            mixed_specialization.images[0].dimension ==
+                Decoder::ImageDimension::Dim2D &&
+            mixed_specialization.images[1].dimension ==
+                Decoder::ImageDimension::Dim3D,
+        "simple 2D sampling rejected a 3D descriptor candidate");
+  resource_plan.info.images[0].simple_2d_sampling = false;
+  Check(!MaterializeResources(resource_plan, runtime, mixed_snapshot,
+                              mixed_specialization),
+        "non-simple 2D sampling accepted a 3D descriptor candidate");
+  resource_plan.info.images[0].simple_2d_sampling = true;
   memory.words[second_image + 1u] =
       static_cast<uint32_t>(
           Libs::Graphics::Prospero::BufferFormat::k32_32_32_32UInt)

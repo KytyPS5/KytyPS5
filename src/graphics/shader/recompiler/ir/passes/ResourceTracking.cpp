@@ -1253,7 +1253,7 @@ private:
 			if (image.source == source && image.resource_class == resource_class &&
 			    image.dimension == memory.image_dimension && image.mip_mode == mip &&
 			    image.depth_compare == depth && image.r128 == memory.image_r128) {
-				Merge(image, op, pc);
+				Merge(image, memory, op, pc);
 				return i;
 			}
 		}
@@ -1261,22 +1261,29 @@ private:
 			return UINT32_MAX;
 		}
 		ImageResource image;
-		image.source         = source;
-		image.first_use_pc   = pc;
-		image.resource_class = resource_class;
-		image.dimension      = memory.image_dimension;
-		image.mip_mode       = mip;
-		image.depth_compare  = depth;
-		image.r128           = memory.image_r128;
-		Merge(image, op, pc);
+		image.source             = source;
+		image.first_use_pc       = pc;
+		image.resource_class     = resource_class;
+		image.dimension          = memory.image_dimension;
+		image.mip_mode           = mip;
+		image.depth_compare      = depth;
+		image.r128               = memory.image_r128;
+		image.simple_2d_sampling = true;
+		Merge(image, memory, op, pc);
 		m_info.images.push_back(image);
 		return static_cast<uint32_t>(m_info.images.size() - 1);
 	}
 
-	static void Merge(ImageResource& image, ValueOpcode op, uint32_t pc) {
-		const auto access  = ImageOpcodeInfoOf(op).access;
-		const bool atomic  = access == ImageAccess::Atomic;
-		const bool write   = access == ImageAccess::Write || atomic;
+	static void Merge(ImageResource& image, const MemoryInfo& memory, ValueOpcode op, uint32_t pc) {
+		const auto access = ImageOpcodeInfoOf(op).access;
+		const bool atomic = access == ImageAccess::Atomic;
+		const bool write  = access == ImageAccess::Write || atomic;
+		image.simple_2d_sampling &=
+		    op == ValueOpcode::ImageSampleRaw &&
+		    memory.image_dimension == Decoder::ImageDimension::Dim2D &&
+		    (memory.image_sample_flags &
+		     (Decoder::ImageSampleFlagDerivative | Decoder::ImageSampleFlagOffset |
+		      Decoder::ImageSampleFlagCompare)) == 0u;
 		image.first_use_pc = std::min(image.first_use_pc, pc);
 		image.read         = image.read || !write || atomic;
 		image.written      = image.written || write;

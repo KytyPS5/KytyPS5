@@ -583,9 +583,14 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			return SpecializationFail("indirect image specialization has no typed candidate");
 		}
 		const auto& image_class = specialization.images[exemplar];
+		const bool  allow_2d_3d = program.info.images[root_index].simple_2d_sampling;
 		const auto  is_2d       = [](Decoder::ImageDimension dimension) {
 			return dimension == Decoder::ImageDimension::Dim2D ||
 			       dimension == Decoder::ImageDimension::Dim2DArray;
+		};
+		const auto is_2d_or_3d = [](Decoder::ImageDimension dimension) {
+			return dimension == Decoder::ImageDimension::Dim2D ||
+			       dimension == Decoder::ImageDimension::Dim3D;
 		};
 		for (uint32_t candidate = 0; candidate < specialization.images.size(); candidate++) {
 			auto& image = specialization.images[candidate];
@@ -603,7 +608,9 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			const bool same_coordinates =
 			    image.dimension == image_class.dimension && image.cube == image_class.cube;
 			if (image.numeric_class != image_class.numeric_class ||
-			    (!same_coordinates && !(is_2d(image.dimension) && is_2d(image_class.dimension))) ||
+			    (!same_coordinates && !(is_2d(image.dimension) && is_2d(image_class.dimension)) &&
+			     !(allow_2d_3d && is_2d_or_3d(image.dimension) &&
+			       is_2d_or_3d(image_class.dimension))) ||
 			    image.mip_count != image_class.mip_count ||
 			    image.conversion_format != image_class.conversion_format ||
 			    image.shader_swizzle != image_class.shader_swizzle) {

@@ -22,6 +22,7 @@
 #include <cinttypes>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <span>
 #include <tuple>
@@ -1810,29 +1811,48 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	auto&      download = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
 	auto [mapped, offset] =
 	    download.Map(range.size, std::max<uint64_t>(image.info.bytes_per_block, 4));
+	// Map refuses a reservation larger than the download buffer instead of waiting for space,
+	// so a whole-image readback can exceed it. Stage that readback in a private buffer of
+	// exactly the needed size instead of exiting: the deferred write-back retires it once the
+	// copy has been read, exactly as the shared-buffer path releases its reservation.
+	std::unique_ptr<Buffer> oversized;
 	if (mapped == nullptr) {
-		EXIT("TextureCache: failed to map reusable download buffer\n");
+		oversized = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+		                                     AllFlags, range.size);
+		mapped    = oversized->Mapped().data();
+		offset    = 0;
+	} else {
+		download.Commit();
 	}
-	download.Commit();
+	auto& destination = oversized != nullptr ? *oversized : download;
 	if (!LibKernel::Memory::TryReadBacking(range.address, mapped, range.size)) {
 		return false;
 	}
-	download.Flush(offset, range.size);
+	destination.Flush(offset, range.size);
 
-	DownloadImage(image, download, offset, range.size, std::move(transfer));
+	DownloadImage(image, destination, offset, range.size, std::move(transfer));
 	vk::BufferMemoryBarrier barrier {};
 	barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eTransferWrite |
 	                        vk::AccessFlagBits::eShaderWrite;
 	barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
 	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-	barrier.buffer              = download.Handle();
+	barrier.buffer              = destination.Handle();
 	barrier.offset              = offset;
 	barrier.size                = range.size;
 	m_scheduler.EndRendering();
 	m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                                               vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
 	                                               1, &barrier, 0, nullptr);
+	if (oversized != nullptr) {
+		m_scheduler.DeferPriorityOperation(
+		    [owner = std::move(oversized), range, mapped]() mutable {
+			    owner->Invalidate(0, range.size);
+			    LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
+			    owner.reset();
+		    });
+		return true;
+	}
 	m_scheduler.DeferPriorityOperation([&download, range, mapped, offset] {
 		download.Invalidate(offset, range.size);
 		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);

@@ -26,8 +26,11 @@ Checkpoint present soft-stall (shown≈130 / ready=shown+1) **26 сентябр�
    (отпускание давало interleave со guest vblank wait).
 8. Retries `…-032603` / `…-034036` / `…-035330`: максимум **shown=137** /
    ready=138, watchdog 180s; presentKHR begin/end сходятся (не hang в
-   presentKHR). Soft-stall Present/Flip **ещё не закрыт**.
-9. Меню/gameplay **PENDING**. Branch ahead локально; push к github:443
+   presentKHR). Корневая причина: `PresentThread` SleepMicro на весь
+   накопленный pacing credit (до ~UINT32_MAX us).
+9. Коммит clamp pacing ≤ 1 vblank period + тест `ClampPresentPacingWait`.
+   Game retry — PENDING.
+10. Меню/gameplay **PENDING**. Branch ahead локально; push к github:443
    таймаутится.
 
 Checkpoint bounded SRT unmapped/coherent reads **26 сентября 2026 года**,

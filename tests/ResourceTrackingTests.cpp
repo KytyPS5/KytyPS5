@@ -5406,6 +5406,39 @@ void TestBoundedMaterializationAddressesAndSnapshot() {
         "same coherent source word was read twice or observed inconsistent values");
 }
 
+void TestBoundedMaterializationZerosUnmappedScalarRows() {
+  Fixture fixture;
+  InitializeBoundedSnapshot(fixture, 1u, false);
+  fixture.program.bounded_srt_reads[0].offset_scale = 4u;
+  fixture.program.bounded_srt_reads[0].offset_bias = 0u;
+  fixture.program.bounded_srt_reads[0].memory_offset = 0u;
+  auto plan = ExtractResourcePlan(fixture.program);
+  BoundedSnapshotReader reader;
+  // Row 0 is mapped; row 1 lands on an unmapped foreign address. Dense snapshots
+  // must keep width with a zero word instead of aborting materialization.
+  reader.words = {{0x1000ull, 0x11u}};
+  reader.unmapped_address = 0x1004ull;
+  const std::array<uint32_t, 3> data{2u, 0x1000u, 0u};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, BoundedSnapshotRuntime(reader, data), snapshot, specialization),
+        "unmapped bounded scalar row aborted the coherent snapshot");
+  Check(snapshot.flattened_srt == std::vector<uint32_t>{0x11u, 0u} &&
+            reader.reads == std::vector<uint64_t>{0x1000ull},
+        "unmapped bounded scalar row was not zeroed or still reached Clean");
+  Check(snapshot.immutable_srt_ranges == std::vector<ResourceReadRange>{{0x1000ull, 4u}},
+        "unmapped bounded row was recorded as an immutable footprint");
+  Check(reader.ordinary_reads == 0u, "unmapped bounded row used the ordinary reader");
+  // Mapped-but-unreadably-dirty sources must still reject the transaction.
+  reader.fail_address = 0x1000ull;
+  reader.unmapped_address = UINT64_MAX;
+  const auto saved_snapshot = snapshot;
+  const auto saved_specialization = specialization;
+  Check(!MaterializeResources(plan, BoundedSnapshotRuntime(reader, data), snapshot, specialization),
+        "dirty coherent source was accepted as a zeroed foreign row");
+  CheckBoundedTransaction(snapshot, saved_snapshot, specialization, saved_specialization);
+}
+
 void TestBoundedMaterializationCandidatesAndRemap() {
   for (const uint32_t count : {3u,0u}) {
     Fixture fixture;
@@ -6654,6 +6687,11 @@ int main(int argc, char** argv) {
       std::cout << "KYTY_BOUNDED_WRITE_ALIAS_PASS\n";
       return 0;
     }
+    if (argc == 2 && std::strcmp(argv[1], "--bounded-unmapped-scalar-only") == 0) {
+      TestBoundedMaterializationZerosUnmappedScalarRows();
+      std::cout << "KYTY_BOUNDED_UNMAPPED_SCALAR_PASS\n";
+      return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--wave-uniform-buffer-phi-only") == 0) {
       TestWaveUniformBufferPhiTable();
       std::cout << "KYTY_WAVE_UNIFORM_BUFFER_PHI_PASS\n";
@@ -6713,6 +6751,8 @@ int main(int argc, char** argv) {
     Run("bounded SRT split header", TestBoundedSrtSplitHeaderUniformCount);
     Run("bounded SRT shared memory count", TestBoundedSrtSplitHeaderSharedMemoryCount);
     Run("TestBoundedMaterializationAddressesAndSnapshot", TestBoundedMaterializationAddressesAndSnapshot);
+    Run("TestBoundedMaterializationZerosUnmappedScalarRows",
+        TestBoundedMaterializationZerosUnmappedScalarRows);
     Run("TestBoundedMaterializationCandidatesAndRemap", TestBoundedMaterializationCandidatesAndRemap);
     Run("TestBoundedMaterializationLimitsAreTransactional", TestBoundedMaterializationLimitsAreTransactional);
     Run("TestBoundedMaterializationRejectsWritableAliases", TestBoundedMaterializationRejectsWritableAliases);

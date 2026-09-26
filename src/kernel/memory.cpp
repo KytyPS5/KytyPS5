@@ -884,6 +884,26 @@ bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return TryReadBacking(vaddr, data, size);
 }
 
+bool TryReadGpuCoherentBacking(uint64_t vaddr, void* data, uint64_t size) {
+	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
+		if (!Graphics::GuestGpu::IsGpuThread()) {
+			return false;
+		}
+		auto& buffers = GetGpuResources().GetBufferCache();
+		if (GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size)) {
+			return false;
+		}
+		if (buffers.HasGpuDirtyBytes(vaddr, size) || buffers.IsRegionGpuModified(vaddr, size)) {
+			buffers.ReadMemory(vaddr, size, false);
+		}
+		if (buffers.HasGpuDirtyBytes(vaddr, size) ||
+		    GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size)) {
+			return false;
+		}
+	}
+	return TryReadBacking(vaddr, data, size);
+}
+
 uint64_t TryClampRangeSize(uint64_t vaddr, uint64_t size) {
 	return g_virtual_ranges != nullptr ? g_virtual_ranges->ClampRangeSize(vaddr, size) : 0;
 }

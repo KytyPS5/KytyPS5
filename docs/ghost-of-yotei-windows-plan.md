@@ -3,16 +3,32 @@
 Обновлено **26 сентября 2026 года**. Игра: **Ghost of Yōtei, PPSA26344**.
 Рабочая ветка — `yotei-windows-bringup` в локальном fork `fxpw/KytyPS5`.
 
+Checkpoint bounded SRT unmapped/coherent reads **26 сентября 2026 года**,
+источник working tree поверх `37584633`:
+
+1. Dense bounded scalar snapshots: unmapped rows (`clamp==0`) → zero word;
+   mapped-but-dirty still reject. `SnapshotReader` forwards clamp to caller's
+   userdata. RED/GREEN:
+   `resource_tracking_tests --bounded-unmapped-scalar-only`
+   (`_Build/logs/bounded-unmapped-{red,green}.*`).
+2. Specialization reads use `TryReadGpuCoherentBacking` (drain GPU-dirty
+   buffer bytes on GPU thread; texture-modified still rejected).
+3. Game `_Build/runs/yotei-integrated-20260926-002157-8def42`
+   (SHA dirty/`37584633`+, frame 299, **shown=122**, flips gpu 123): прежний
+   Materialize fatal `0x5000f37f80` снят. Watchdog: shown 122 не двигался
+   420s; в хвосте лога повторный Emit CS `34e090c623ad611c` /
+   `6cc64dee32dc7094`. Меню/gameplay **PENDING**.
+
 Checkpoint planning_only SRT zeros + dense budgets **26 сентября 2026 года**,
-источник `1cdc1998` + SRT eval fixes (рабочее дерево):
+источник `1cdc1998` / `37584633`:
 
 1. `MaxImages`/`MaxSampledPairs`=512: PS `f8927c09` Emit SPIR-V ≈297k.
 2. VS `4c26e33f`: `ReadConst`→`LoadAddressU32`/`ReadConstBuffer` на
    `planning_only` roots с unmapped/OOB payload → zero word (как optional null
    SRT). Game `_Build/runs/yotei-integrated-20260925-235234-814b80`
    (SHA dirty/`1cdc1998`+, frame 214, **shown=127**, flips gpu 128):
-   прошёл прежние Materialize fatals. Следующий — `bounded SRT read 0 index 0
-   cannot read coherent source at 0x5000f37f80`.
+   прошёл прежние Materialize fatals. Следующий был — `bounded SRT read 0
+   index 0 cannot read coherent source at 0x5000f37f80` (закрыт выше).
 3. Меню/gameplay **PENDING**.
 
 Checkpoint materialization + VOPC `0xbd` + LDS atomic return + workgroup

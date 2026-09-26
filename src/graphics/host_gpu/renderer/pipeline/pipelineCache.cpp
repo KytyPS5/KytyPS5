@@ -169,8 +169,11 @@ bool ReadShaderBacking(void*, uint64_t address, std::span<uint32_t> values) {
 }
 
 bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
+	// Specialization snapshots must observe GPU-published table bytes. Drain
+	// dirty buffer ranges on the GPU thread; refuse texture-modified sources.
 	return !values.empty() &&
-	       Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, values.data(), values.size_bytes());
+	       Libs::LibKernel::Memory::TryReadGpuCoherentBacking(address, values.data(),
+	                                                         values.size_bytes());
 }
 
 uint64_t ClampShaderGuestMemory(void*, uint64_t address, uint64_t size) {

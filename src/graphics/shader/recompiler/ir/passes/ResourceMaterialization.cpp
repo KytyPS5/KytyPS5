@@ -778,6 +778,16 @@ struct SnapshotReader {
 		return true;
 	}
 
+	// Keep clamp queries on the caller's userdata; SnapshotReader only owns the
+	// specialization/ordinary read callbacks while the bounded snapshot runs.
+	static uint64_t Clamp(void* userdata, uint64_t address, uint64_t size) {
+		auto& self = *static_cast<SnapshotReader*>(userdata);
+		if (self.runtime.clamp_memory_range == nullptr) {
+			return size;
+		}
+		return self.runtime.clamp_memory_range(self.runtime.userdata, address, size);
+	}
+
 	void Finish(ResourceSnapshot& snapshot) const {
 		std::vector<uint64_t> addresses;
 		addresses.reserve(words.size());
@@ -896,10 +906,24 @@ bool MaterializeBoundedReads(const ResourcePlan& program, const SrtRuntime& runt
 			}
 			const uint64_t address = offset < 0 ? base - static_cast<uint64_t>(-offset)
 			                                    : base + static_cast<uint64_t>(offset);
-			uint32_t word = 0;
-			if (address > AddressMask - 3u || !ReadSpecializationWord(runtime, address, word)) {
+			if (address > AddressMask - 3u) {
 				return SpecializationFail(fmt::format(
-				    "bounded SRT read {} index {} cannot read coherent source at 0x{:x}", id, index, address));
+				    "bounded SRT read {} index {} cannot address 0x{:x} for a 32-bit word", id, index,
+				    address));
+			}
+			// Dense workgroup / selector snapshots enumerate every proved index.
+			// Unmapped foreign rows keep table width with a zero word — same guest
+			// result as a scalar buffer load past its mapped extent.
+			if (runtime.clamp_memory_range != nullptr &&
+			    runtime.clamp_memory_range(runtime.userdata, address, sizeof(uint32_t)) == 0u) {
+				flat.push_back(0u);
+				continue;
+			}
+			uint32_t word = 0;
+			if (!ReadSpecializationWord(runtime, address, word)) {
+				return SpecializationFail(fmt::format(
+				    "bounded SRT read {} index {} cannot read coherent source at 0x{:x}", id, index,
+				    address));
 			}
 			flat.push_back(word);
 		}
@@ -1473,6 +1497,9 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& i
 		runtime.userdata = &reader;
 		runtime.read_memory = SnapshotReader::Ordinary;
 		runtime.read_specialization_memory = SnapshotReader::Clean;
+		if (input_runtime.clamp_memory_range != nullptr) {
+			runtime.clamp_memory_range = SnapshotReader::Clamp;
+		}
 	}
 	if ((program.requires_specialization_memory || !program.bounded_srt_reads.empty() ||
 	     capture_reads) &&

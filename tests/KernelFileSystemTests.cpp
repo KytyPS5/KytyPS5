@@ -483,8 +483,11 @@ void CheckSocketWakeup() {
       // A short or failed send would strand the blocking receive below. The writer is
       // still open, so no end of stream ever arrives and the peek loop would spin
       // forever instead of failing. Half-close this end so the reader sees EOF and
-      // the receive returns the short prefix, which fails the check below.
+      // the receive returns the short prefix, which fails the check below. Close too:
+      // Shutdown is a Windows-only no-op elsewhere, and a closed writer makes the
+      // receive fail on every platform.
       Net::Shutdown(writer, 1);
+      Net::SocketClose(writer);
     }
   });
   std::array<char, text_length> message {};

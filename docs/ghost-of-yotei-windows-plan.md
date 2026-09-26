@@ -108,7 +108,12 @@ Checkpoint Flip queue lock-order (Reserve cfg→m_mutex ABBA) **26 сентяб�
     `bounded buffer 3 exceeds the dense buffer limit (... buffers=65 limit=64)`
     for CS `0x8457901d80b91921`. Raise shared `ShaderInfo::MaxBuffers` 64→128
     (device DescriptorBudget remains the hard host gate). Menu still **PENDING**.
-
+24. `…-104613` still Fatal at limit=128 (`buffers=129`, candidates=69, count=65536).
+    Raise `MaxBuffers` 128→512. `…-112601` (512): densify **passed** (8457901d with
+    buffers=232; SpirvReuse hits on 6cc64dee). New Fatal at shown≈196:
+    `storage buffer offset adjustment is unsupported` (adj=2, backing=0x6d22,
+    align=16, stage=CS slot=193) — dword-indexed SSBO cannot carry a non-multiple-of-4
+    host rebase. Menu **PENDING**.
 
 Checkpoint present soft-stall (shown≈130 / ready=shown+1) **26 сентября 2026 года**:
 

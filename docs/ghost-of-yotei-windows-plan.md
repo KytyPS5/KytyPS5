@@ -20,12 +20,14 @@ Checkpoint bounded SRT unmapped/coherent reads **26 сентября 2026 год
    застрял после `Prepare`, до `CompleteFlip` (priority op после GPU tick).
 4. Коммит `59d8f991`: `FlushAndWait` + Flip ждут priority ops → Recording→Ready.
 5. Коммиты `4cd0c88a`/`ae6eb916`: `ObtainBufferForImage` читает clamped mapped
-   prefix и zero-fill хвост. Game
-   `_Build/runs/yotei-integrated-20260926-021939-ac206d` (**shown=134**): image
-   backing fatal снят. Новый:
-   `Memory: required direct-backing write failed addr=0x200000208 size=0x10`.
-6. Меню/gameplay **PENDING**. `git push` на origin таймаутится (github:443);
-   ветка локально ahead.
+   prefix и zero-fill хвост.
+6. Коммиты `0dd4f0df`/`16a8daa8`: GPU download priority больше не EXIT на
+   unmapped/non-writable guest (в т.ч. `0x200000208` у default map base).
+7. Game `_Build/runs/yotei-integrated-20260926-023701-fb471f` (**shown=130**,
+   ready=131, exit watchdog 300s): fatals сняты; снова soft-stall present.
+   `front not Ready`/`Flip not due` в хвосте нет (лимит логов / другой путь).
+8. Меню/gameplay **PENDING**. Локально `yotei-windows-bringup` ahead 9;
+   `git push` к github.com:443 таймаутится.
 
 Checkpoint planning_only SRT zeros + dense budgets **26 сентября 2026 года**,
 источник `1cdc1998` / `37584633`:

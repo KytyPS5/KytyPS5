@@ -163,6 +163,29 @@ int KYTY_SYSV_ABI NetSetsockopt(int s, int level, int optname, const void* optva
 	return FinishSocketCall(Net::Setsockopt(s, level, optname, optval, optlen));
 }
 
+int KYTY_SYSV_ABI NetConnect(int s, const void* addr, uint32_t addrlen) {
+	if (addr != nullptr) {
+		LOGF("\t connect: socket=%d addrlen=%u\n", s, addrlen);
+	}
+	return FinishSocketCall(Net::Connect(s, addr, addrlen));
+}
+
+int64_t KYTY_SYSV_ABI NetSend(int s, const void* buf, uint64_t len, int flags) {
+	const auto result = Net::Send(s, buf, len, flags);
+	if (result < 0) {
+		*GetNetErrorAddr() = PosixToNetError(*Posix::GetErrorAddr());
+	}
+	return result;
+}
+
+int64_t KYTY_SYSV_ABI NetRecv(int s, void* buf, uint64_t len, int flags) {
+	const auto result = Net::Recv(s, buf, len, flags);
+	if (result < 0) {
+		*GetNetErrorAddr() = PosixToNetError(*Posix::GetErrorAddr());
+	}
+	return result;
+}
+
 uint32_t KYTY_SYSV_ABI NetHtonl(uint32_t host32) {
 	return ((host32 & 0x000000ffu) << 24u) | ((host32 & 0x0000ff00u) << 8u) |
 	       ((host32 & 0x00ff0000u) >> 8u) | ((host32 & 0xff000000u) >> 24u);
@@ -207,6 +230,9 @@ LIB_DEFINE(InitNet_1_Net) {
 	LIB_FUNC("Q4qBuN-c0ZM", LibNet::NetSocket);
 	LIB_FUNC("45ggEzakPJQ", LibNet::NetSocketClose);
 	LIB_FUNC("2mKX2Spso7I", LibNet::NetSetsockopt);
+	LIB_FUNC("OXXX4mUk3uk", LibNet::NetConnect);
+	LIB_FUNC("beRjXBn-z+o", LibNet::NetSend);
+	LIB_FUNC("9wO9XrMsNhc", LibNet::NetRecv);
 	LIB_FUNC("9T2pDF2Ryqg", LibNet::NetHtonl);
 	LIB_FUNC("iWQWrwiSt8A", LibNet::NetHtons);
 	LIB_FUNC("pQGpHYopAIY", LibNet::NetNtohl);
@@ -226,6 +252,8 @@ LIB_DEFINE(InitNet_1_Ssl) {
 	LIB_FUNC("0K1yQ6Lv-Yc", Ssl::SslTerm);
 	LIB_FUNC("TDfQqO-gMbY", Ssl::SslGetCaCerts);
 	LIB_FUNC("qIvLs0gYxi0", Ssl::SslFreeCaCerts);
+	LIB_FUNC("qOn+wm28wmA", Ssl::SslGetCaCerts);
+	LIB_FUNC("+DzXseDVkeI", Ssl::SslFreeCaCerts);
 }
 
 } // namespace LibSsl

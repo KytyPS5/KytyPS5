@@ -287,7 +287,10 @@ static void GameEventFinger([[maybe_unused]] const EventFinger& f) {
 }
 
 static void GameEventController([[maybe_unused]] const EventController& f) {
-	EXIT_NOT_IMPLEMENTED(f.remapped);
+	if (f.remapped) {
+		LOGF("Controller remapped: id = %d\n", f.id);
+		return;
+	}
 
 #ifdef KYTY_DBG_INPUT
 	if (f.added || f.removed) {
@@ -306,14 +309,26 @@ static void GameEventController([[maybe_unused]] const EventController& f) {
 
 	if (f.added) {
 		auto* pad = SDL_OpenGamepad(f.id);
-		EXIT_NOT_IMPLEMENTED(pad == nullptr);
-		int id = SDL_GetJoystickID(SDL_GetGamepadJoystick(pad));
-		Controller::Connect(id);
+		if (pad == nullptr) {
+			Log::WriteToConsoleAndLog(
+			    fmt::format("Warning: cannot open controller {}: {}\n", f.id, SDL_GetError()));
+			return;
+		}
+		auto* joystick = SDL_GetGamepadJoystick(pad);
+		if (joystick == nullptr) {
+			Log::WriteToConsoleAndLog(
+			    fmt::format("Warning: controller {} has no joystick handle\n", f.id));
+			SDL_CloseGamepad(pad);
+			return;
+		}
+		Controller::Connect(SDL_GetJoystickID(joystick));
 	}
 
 	if (f.removed) {
 		Controller::Disconnect(f.id);
-		SDL_CloseGamepad(SDL_GetGamepadFromID(f.id));
+		if (auto* pad = SDL_GetGamepadFromID(f.id); pad != nullptr) {
+			SDL_CloseGamepad(pad);
+		}
 	}
 
 	if (f.down || f.up) {

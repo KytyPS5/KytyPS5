@@ -4,6 +4,8 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/threads.h"
+#include "gpu_blit_shaders/gpu_blit_fs_triangle_spv.h"
+#include "gpu_blit_shaders/gpu_blit_texture_overlay_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -26,6 +28,7 @@ namespace Libs::Graphics {
 
 struct Presenter::Frame {
 	VulkanImage image;
+	vk::ImageView sample_view  = nullptr;
 	uint64_t    present_tick = 0;
 	bool        busy         = false;
 	bool        reusing_last = false;
@@ -43,6 +46,10 @@ public:
 	~FramePool() {
 		m_scheduler.Wait(m_scheduler.CurrentTick() - 1);
 		for (auto& frame: m_frames) {
+			if (frame->sample_view != nullptr) {
+				m_window.graphic_ctx.device.destroyImageView(frame->sample_view, nullptr);
+				frame->sample_view = nullptr;
+			}
 			if (frame->image.image != nullptr) {
 				m_window.graphic_ctx.DeleteImage(frame->image);
 			}
@@ -188,6 +195,10 @@ void Presenter::Frame::Configure(GraphicContext& graphics, vk::Extent2D extent, 
 	}
 
 	if (dst.image != nullptr) {
+		if (sample_view != nullptr) {
+			graphics.device.destroyImageView(sample_view, nullptr);
+			sample_view = nullptr;
+		}
 		graphics.DeleteImage(dst);
 	}
 
@@ -200,13 +211,27 @@ void Presenter::Frame::Configure(GraphicContext& graphics, vk::Extent2D extent, 
 	create.format        = format;
 	create.tiling        = vk::ImageTiling::eOptimal;
 	create.initialLayout = vk::ImageLayout::eUndefined;
-	create.usage = vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst;
+	create.usage = vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst |
+	               vk::ImageUsageFlagBits::eSampled;
 	create.sharingMode = vk::SharingMode::eExclusive;
 	create.samples     = vk::SampleCountFlagBits::e1;
 	if (!graphics.CreateImage(create, dst)) {
 		EXIT("failed to allocate prepared presentation image, extent=%ux%u format=%d\n",
 		     extent.width, extent.height, static_cast<int>(format));
 	}
+
+	vk::ImageViewCreateInfo view_create {};
+	view_create.sType                           = vk::StructureType::eImageViewCreateInfo;
+	view_create.image                           = dst.image;
+	view_create.viewType                        = vk::ImageViewType::e2D;
+	view_create.format                          = format;
+	view_create.subresourceRange.aspectMask     = vk::ImageAspectFlagBits::eColor;
+	view_create.subresourceRange.baseMipLevel   = 0;
+	view_create.subresourceRange.levelCount     = 1;
+	view_create.subresourceRange.baseArrayLayer = 0;
+	view_create.subresourceRange.layerCount     = 1;
+	RequireVulkanSuccess(graphics.device.createImageView(&view_create, nullptr, &sample_view),
+	                     "create prepared presentation view");
 }
 
 void Presenter::Frame::Transit(vk::CommandBuffer command, vk::ImageLayout layout,
@@ -283,7 +308,8 @@ public:
 	[[nodiscard]] bool   NeedsResize() const;
 	[[nodiscard]] Status AcquireNextImage();
 	[[nodiscard]] bool   PrepareSystemOverlay();
-	void                 RecordPresentCommands(CommandBuffer& command, VulkanImage& source,
+	void                 RecordPresentCommands(CommandBuffer& command, Presenter::Frame& source,
+	                                           Presenter::Frame* overlay,
 	                                           bool draw_system_overlay);
 	uint64_t             Submit(CommandScheduler& scheduler);
 	[[nodiscard]] Status Present();
@@ -295,6 +321,8 @@ public:
 
 private:
 	void Destroy();
+	void EnsureOverlayPipeline();
+	void DestroyOverlayPipeline();
 
 	WindowContext&              m_window;
 	vk::SwapchainKHR            m_handle = nullptr;
@@ -307,6 +335,13 @@ private:
 	std::vector<vk::Semaphore>  m_image_acquired;
 	std::vector<vk::Semaphore>  m_render_complete;
 	std::unique_ptr<SystemOverlay> m_system_overlay;
+	vk::DescriptorSetLayout     m_overlay_descriptor_layout = nullptr;
+	vk::PipelineLayout          m_overlay_pipeline_layout   = nullptr;
+	vk::ShaderModule            m_overlay_vertex_shader     = nullptr;
+	vk::ShaderModule            m_overlay_fragment_shader   = nullptr;
+	vk::Pipeline                m_overlay_pipeline          = nullptr;
+	vk::Sampler                 m_overlay_sampler           = nullptr;
+	vk::Format                  m_overlay_pipeline_format   = vk::Format::eUndefined;
 	uint32_t                    m_image_index = static_cast<uint32_t>(-1);
 	uint32_t                    m_frame_index = 0;
 };
@@ -492,6 +527,7 @@ Swapchain::~Swapchain() {
 }
 
 void Swapchain::Destroy() {
+	DestroyOverlayPipeline();
 	if (m_handle == nullptr && m_image_acquired.empty() && m_render_complete.empty() &&
 	    m_image_views.empty()) {
 		return;
@@ -592,11 +628,152 @@ bool Swapchain::PrepareSystemOverlay() {
 	return m_system_overlay->PrepareFrame(m_extent, m_format, ImageCount());
 }
 
-void Swapchain::RecordPresentCommands(CommandBuffer& command, VulkanImage& source,
-                                      bool draw_system_overlay) {
-	if (source.state.layout != vk::ImageLayout::eTransferSrcOptimal) {
+void Swapchain::DestroyOverlayPipeline() {
+	auto& graphics = m_window.graphic_ctx;
+	if (m_overlay_pipeline != nullptr) {
+		graphics.device.destroyPipeline(m_overlay_pipeline, nullptr);
+		m_overlay_pipeline = nullptr;
+	}
+	if (m_overlay_fragment_shader != nullptr) {
+		graphics.device.destroyShaderModule(m_overlay_fragment_shader, nullptr);
+		m_overlay_fragment_shader = nullptr;
+	}
+	if (m_overlay_vertex_shader != nullptr) {
+		graphics.device.destroyShaderModule(m_overlay_vertex_shader, nullptr);
+		m_overlay_vertex_shader = nullptr;
+	}
+	if (m_overlay_pipeline_layout != nullptr) {
+		graphics.device.destroyPipelineLayout(m_overlay_pipeline_layout, nullptr);
+		m_overlay_pipeline_layout = nullptr;
+	}
+	if (m_overlay_descriptor_layout != nullptr) {
+		graphics.device.destroyDescriptorSetLayout(m_overlay_descriptor_layout, nullptr);
+		m_overlay_descriptor_layout = nullptr;
+	}
+	if (m_overlay_sampler != nullptr) {
+		graphics.device.destroySampler(m_overlay_sampler, nullptr);
+		m_overlay_sampler = nullptr;
+	}
+	m_overlay_pipeline_format = vk::Format::eUndefined;
+}
+
+void Swapchain::EnsureOverlayPipeline() {
+	auto& graphics = m_window.graphic_ctx;
+	if (m_overlay_pipeline != nullptr && m_overlay_pipeline_format == m_format) {
+		return;
+	}
+	DestroyOverlayPipeline();
+	EXIT_IF(m_format == vk::Format::eUndefined);
+
+	vk::DescriptorSetLayoutBinding texture_binding {};
+	texture_binding.binding         = 0;
+	texture_binding.descriptorType  = vk::DescriptorType::eCombinedImageSampler;
+	texture_binding.descriptorCount = 1;
+	texture_binding.stageFlags      = vk::ShaderStageFlagBits::eFragment;
+
+	vk::DescriptorSetLayoutCreateInfo descriptor_info {};
+	descriptor_info.flags        = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
+	descriptor_info.bindingCount = 1;
+	descriptor_info.pBindings    = &texture_binding;
+	RequireVulkanSuccess(
+	    graphics.device.createDescriptorSetLayout(&descriptor_info, nullptr,
+	                                              &m_overlay_descriptor_layout),
+	    "create video-out overlay descriptor layout");
+
+	vk::PipelineLayoutCreateInfo layout_info {};
+	layout_info.setLayoutCount = 1;
+	layout_info.pSetLayouts    = &m_overlay_descriptor_layout;
+	RequireVulkanSuccess(
+	    graphics.device.createPipelineLayout(&layout_info, nullptr, &m_overlay_pipeline_layout),
+	    "create video-out overlay pipeline layout");
+
+	vk::SamplerCreateInfo sampler_info {};
+	sampler_info.magFilter    = vk::Filter::eLinear;
+	sampler_info.minFilter    = vk::Filter::eLinear;
+	sampler_info.addressModeU = vk::SamplerAddressMode::eClampToEdge;
+	sampler_info.addressModeV = vk::SamplerAddressMode::eClampToEdge;
+	sampler_info.addressModeW = vk::SamplerAddressMode::eClampToEdge;
+	RequireVulkanSuccess(graphics.device.createSampler(&sampler_info, nullptr, &m_overlay_sampler),
+	                     "create video-out overlay sampler");
+
+	m_overlay_vertex_shader   = CompileSPV(GPU_BLIT_FS_TRIANGLE_SPV, graphics.device);
+	m_overlay_fragment_shader = CompileSPV(GPU_BLIT_TEXTURE_OVERLAY_SPV, graphics.device);
+
+	std::array<vk::PipelineShaderStageCreateInfo, 2> stages {};
+	stages[0].stage  = vk::ShaderStageFlagBits::eVertex;
+	stages[0].module = m_overlay_vertex_shader;
+	stages[0].pName  = "main";
+	stages[1].stage  = vk::ShaderStageFlagBits::eFragment;
+	stages[1].module = m_overlay_fragment_shader;
+	stages[1].pName  = "main";
+
+	vk::PipelineVertexInputStateCreateInfo   vertex_input {};
+	vk::PipelineInputAssemblyStateCreateInfo input_assembly {};
+	input_assembly.topology = vk::PrimitiveTopology::eTriangleList;
+	vk::PipelineViewportStateCreateInfo viewport {};
+	viewport.viewportCount = 1;
+	viewport.scissorCount  = 1;
+	vk::PipelineRasterizationStateCreateInfo rasterization {};
+	rasterization.lineWidth = 1.0f;
+	vk::PipelineMultisampleStateCreateInfo multisample {};
+	multisample.rasterizationSamples = vk::SampleCountFlagBits::e1;
+	vk::PipelineColorBlendAttachmentState blend_attachment {};
+	blend_attachment.blendEnable         = VK_TRUE;
+	blend_attachment.srcColorBlendFactor = vk::BlendFactor::eSrcAlpha;
+	blend_attachment.dstColorBlendFactor = vk::BlendFactor::eOneMinusSrcAlpha;
+	blend_attachment.colorBlendOp        = vk::BlendOp::eAdd;
+	blend_attachment.srcAlphaBlendFactor = vk::BlendFactor::eOne;
+	blend_attachment.dstAlphaBlendFactor = vk::BlendFactor::eOneMinusSrcAlpha;
+	blend_attachment.alphaBlendOp        = vk::BlendOp::eAdd;
+	blend_attachment.colorWriteMask      = vk::ColorComponentFlagBits::eR |
+	                                       vk::ColorComponentFlagBits::eG |
+	                                       vk::ColorComponentFlagBits::eB |
+	                                       vk::ColorComponentFlagBits::eA;
+	vk::PipelineColorBlendStateCreateInfo color_blend {};
+	color_blend.attachmentCount = 1;
+	color_blend.pAttachments    = &blend_attachment;
+	const std::array                   dynamic_states {vk::DynamicState::eViewport,
+	                                                   vk::DynamicState::eScissor};
+	vk::PipelineDynamicStateCreateInfo dynamic {};
+	dynamic.dynamicStateCount = static_cast<uint32_t>(dynamic_states.size());
+	dynamic.pDynamicStates    = dynamic_states.data();
+
+	vk::PipelineRenderingCreateInfo rendering {};
+	rendering.colorAttachmentCount    = 1;
+	rendering.pColorAttachmentFormats = &m_format;
+
+	vk::GraphicsPipelineCreateInfo create {};
+	create.pNext               = &rendering;
+	create.stageCount          = static_cast<uint32_t>(stages.size());
+	create.pStages             = stages.data();
+	create.pVertexInputState   = &vertex_input;
+	create.pInputAssemblyState = &input_assembly;
+	create.pViewportState      = &viewport;
+	create.pRasterizationState = &rasterization;
+	create.pMultisampleState   = &multisample;
+	create.pColorBlendState    = &color_blend;
+	create.pDynamicState       = &dynamic;
+	create.layout              = m_overlay_pipeline_layout;
+	RequireVulkanSuccess(
+	    graphics.device.createGraphicsPipelines(nullptr, 1, &create, nullptr, &m_overlay_pipeline),
+	    "create video-out overlay pipeline");
+	SetVulkanObjectNameF(graphics.device, m_overlay_pipeline, "Kyty.VideoOutOverlayPipeline");
+	m_overlay_pipeline_format = m_format;
+}
+
+void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame& source,
+                                      Presenter::Frame* overlay, bool draw_system_overlay) {
+	if (source.image.state.layout != vk::ImageLayout::eTransferSrcOptimal) {
 		EXIT("invalid prepared presentation image, vk_image=%p layout=%d\n",
-		     static_cast<void*>(source.image), static_cast<int>(source.state.layout));
+		     static_cast<void*>(source.image.image), static_cast<int>(source.image.state.layout));
+	}
+	if (overlay != nullptr) {
+		const auto overlay_layout = overlay->image.state.layout;
+		if (overlay->sample_view == nullptr ||
+		    (overlay_layout != vk::ImageLayout::eTransferSrcOptimal &&
+		     overlay_layout != vk::ImageLayout::eShaderReadOnlyOptimal)) {
+			overlay = nullptr;
+		}
 	}
 	EXIT_IF(m_image_index >= m_images.size());
 	auto vk_command = command.Handle();
@@ -624,8 +801,8 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, VulkanImage& sourc
 	region.srcSubresource.mipLevel       = 0;
 	region.srcSubresource.baseArrayLayer = 0;
 	region.srcSubresource.layerCount     = 1;
-	region.srcOffsets[1].x               = static_cast<int>(source.extent.width);
-	region.srcOffsets[1].y               = static_cast<int>(source.extent.height);
+	region.srcOffsets[1].x               = static_cast<int>(source.image.extent.width);
+	region.srcOffsets[1].y               = static_cast<int>(source.image.extent.height);
 	region.srcOffsets[1].z               = 1;
 	region.dstSubresource.aspectMask     = vk::ImageAspectFlagBits::eColor;
 	region.dstSubresource.mipLevel       = 0;
@@ -634,17 +811,106 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, VulkanImage& sourc
 	region.dstOffsets[1].x               = static_cast<int>(m_extent.width);
 	region.dstOffsets[1].y               = static_cast<int>(m_extent.height);
 	region.dstOffsets[1].z               = 1;
-	vk_command.blitImage(source.image, vk::ImageLayout::eTransferSrcOptimal,
+	vk_command.blitImage(source.image.image, vk::ImageLayout::eTransferSrcOptimal,
 	                     m_images[m_image_index], vk::ImageLayout::eTransferDstOptimal, 1, &region,
 	                     vk::Filter::eLinear);
 
+	vk::ImageLayout   target_layout     = vk::ImageLayout::eTransferDstOptimal;
+	vk::AccessFlags   target_access     = vk::AccessFlagBits::eTransferWrite;
+	vk::PipelineStageFlags target_stage = vk::PipelineStageFlagBits::eTransfer;
+
+	if (overlay != nullptr) {
+		EnsureOverlayPipeline();
+
+		vk::ImageMemoryBarrier to_color {};
+		to_color.sType                           = vk::StructureType::eImageMemoryBarrier;
+		to_color.srcAccessMask                   = vk::AccessFlagBits::eTransferWrite;
+		to_color.dstAccessMask                   = vk::AccessFlagBits::eColorAttachmentWrite;
+		to_color.oldLayout                       = target_layout;
+		to_color.newLayout                       = vk::ImageLayout::eColorAttachmentOptimal;
+		to_color.srcQueueFamilyIndex             = VK_QUEUE_FAMILY_IGNORED;
+		to_color.dstQueueFamilyIndex             = VK_QUEUE_FAMILY_IGNORED;
+		to_color.image                           = m_images[m_image_index];
+		to_color.subresourceRange.aspectMask     = vk::ImageAspectFlagBits::eColor;
+		to_color.subresourceRange.baseMipLevel   = 0;
+		to_color.subresourceRange.levelCount     = 1;
+		to_color.subresourceRange.baseArrayLayer = 0;
+		to_color.subresourceRange.layerCount     = 1;
+
+		vk::ImageMemoryBarrier to_read {};
+		to_read.sType                           = vk::StructureType::eImageMemoryBarrier;
+		to_read.srcAccessMask                   = vk::AccessFlagBits::eTransferRead;
+		to_read.dstAccessMask                   = vk::AccessFlagBits::eShaderRead;
+		to_read.oldLayout                       = overlay->image.state.layout;
+		to_read.newLayout                       = vk::ImageLayout::eShaderReadOnlyOptimal;
+		to_read.srcQueueFamilyIndex             = VK_QUEUE_FAMILY_IGNORED;
+		to_read.dstQueueFamilyIndex             = VK_QUEUE_FAMILY_IGNORED;
+		to_read.image                           = overlay->image.image;
+		to_read.subresourceRange.aspectMask     = vk::ImageAspectFlagBits::eColor;
+		to_read.subresourceRange.baseMipLevel   = 0;
+		to_read.subresourceRange.levelCount     = 1;
+		to_read.subresourceRange.baseArrayLayer = 0;
+		to_read.subresourceRange.layerCount     = 1;
+
+		const std::array barriers {to_color, to_read};
+		vk_command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+		                           vk::PipelineStageFlagBits::eColorAttachmentOutput |
+		                               vk::PipelineStageFlagBits::eFragmentShader,
+		                           vk::DependencyFlagBits::eByRegion, 0, nullptr, 0, nullptr,
+		                           static_cast<uint32_t>(barriers.size()), barriers.data());
+		overlay->image.state = {vk::PipelineStageFlagBits2::eFragmentShader,
+		                        vk::AccessFlagBits2::eShaderRead,
+		                        vk::ImageLayout::eShaderReadOnlyOptimal};
+		overlay->image.subresource_states.clear();
+
+		vk::RenderingAttachmentInfo color_attachment {};
+		color_attachment.imageView   = m_image_views[m_image_index];
+		color_attachment.imageLayout = vk::ImageLayout::eColorAttachmentOptimal;
+		color_attachment.loadOp      = vk::AttachmentLoadOp::eLoad;
+		color_attachment.storeOp     = vk::AttachmentStoreOp::eStore;
+		vk::RenderingInfo rendering {};
+		rendering.renderArea.extent = m_extent;
+		rendering.layerCount        = 1;
+		rendering.colorAttachmentCount = 1;
+		rendering.pColorAttachments    = &color_attachment;
+		vk_command.beginRendering(&rendering);
+
+		vk::DescriptorImageInfo descriptor_image {};
+		descriptor_image.sampler     = m_overlay_sampler;
+		descriptor_image.imageView   = overlay->sample_view;
+		descriptor_image.imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal;
+		vk::WriteDescriptorSet descriptor_write {};
+		descriptor_write.dstBinding      = 0;
+		descriptor_write.descriptorCount = 1;
+		descriptor_write.descriptorType  = vk::DescriptorType::eCombinedImageSampler;
+		descriptor_write.pImageInfo      = &descriptor_image;
+		vk_command.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, m_overlay_pipeline_layout,
+		                                0, 1, &descriptor_write);
+		vk_command.bindPipeline(vk::PipelineBindPoint::eGraphics, m_overlay_pipeline);
+		const vk::Viewport overlay_viewport {0.0f,
+		                                     0.0f,
+		                                     static_cast<float>(m_extent.width),
+		                                     static_cast<float>(m_extent.height),
+		                                     0.0f,
+		                                     1.0f};
+		const vk::Rect2D overlay_scissor {{0, 0}, m_extent};
+		vk_command.setViewport(0, 1, &overlay_viewport);
+		vk_command.setScissor(0, 1, &overlay_scissor);
+		vk_command.draw(3, 1, 0, 0);
+		vk_command.endRendering();
+
+		target_layout = vk::ImageLayout::eColorAttachmentOptimal;
+		target_access = vk::AccessFlagBits::eColorAttachmentWrite;
+		target_stage  = vk::PipelineStageFlagBits::eColorAttachmentOutput;
+	}
+
 	vk::ImageMemoryBarrier to_present {};
 	to_present.sType         = vk::StructureType::eImageMemoryBarrier;
-	to_present.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	to_present.srcAccessMask = target_access;
 	to_present.dstAccessMask = draw_system_overlay ? vk::AccessFlagBits::eColorAttachmentRead |
 	                                                     vk::AccessFlagBits::eColorAttachmentWrite
 	                                               : vk::AccessFlagBits::eMemoryRead;
-	to_present.oldLayout     = vk::ImageLayout::eTransferDstOptimal;
+	to_present.oldLayout     = target_layout;
 	to_present.newLayout     = draw_system_overlay ? vk::ImageLayout::eColorAttachmentOptimal
 	                                               : vk::ImageLayout::ePresentSrcKHR;
 	to_present.srcQueueFamilyIndex             = VK_QUEUE_FAMILY_IGNORED;
@@ -656,7 +922,7 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, VulkanImage& sourc
 	to_present.subresourceRange.baseArrayLayer = 0;
 	to_present.subresourceRange.layerCount     = 1;
 	vk_command.pipelineBarrier(
-	    vk::PipelineStageFlagBits::eTransfer,
+	    target_stage,
 	    draw_system_overlay ? vk::PipelineStageFlagBits::eColorAttachmentOutput
 	                        : vk::PipelineStageFlagBits::eAllCommands,
 	    vk::DependencyFlagBits::eByRegion, 0, nullptr, 0, nullptr, 1, &to_present);
@@ -778,9 +1044,12 @@ RenderContext& Presenter::Renderer() const noexcept {
 	return m_impl->renderer;
 }
 
-void Presenter::Present(Frame& frame, bool reuse) {
+void Presenter::Present(Frame& frame, bool reuse, Frame* overlay) {
 	KYTY_PROFILER_FUNCTION();
 	m_impl->frames.ValidateForPresent(&frame, reuse);
+	if (overlay != nullptr) {
+		m_impl->frames.ValidateForPresent(overlay, false);
+	}
 
 	const auto overlay_visual = GetSystemOverlayVisualState();
 	auto&      swapchain  = m_impl->swapchain;
@@ -799,7 +1068,7 @@ void Presenter::Present(Frame& frame, bool reuse) {
 			auto&             command          = m_impl->present_scheduler.BeginCommand();
 			const bool        draw_system_overlay =
 			    overlay_visual.active && swapchain.PrepareSystemOverlay();
-			swapchain.RecordPresentCommands(command, frame.image, draw_system_overlay);
+			swapchain.RecordPresentCommands(command, frame, overlay, draw_system_overlay);
 			frame.present_tick = swapchain.Submit(m_impl->present_scheduler);
 		}
 		status = swapchain.Present();
@@ -812,10 +1081,16 @@ void Presenter::Present(Frame& frame, bool reuse) {
 		                                         std::memory_order_release);
 		m_impl->window.UpdateTitle();
 		m_impl->frames.Release(&frame, true);
+		if (overlay != nullptr) {
+			m_impl->frames.Release(overlay, false);
+		}
 		return;
 	}
 	LOGF("Vulkan presentation retry exhausted; dropping frame\n");
 	m_impl->frames.Release(&frame, reuse);
+	if (overlay != nullptr) {
+		m_impl->frames.Release(overlay, false);
+	}
 }
 
 void Presenter::Discard(Frame& frame) {

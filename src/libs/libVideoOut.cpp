@@ -10,9 +10,25 @@ namespace LibGen5 {
 
 LIB_VERSION("VideoOut", 1, "VideoOut", 1, 1);
 
+static KYTY_SYSV_ABI int VideoOutSetFlipMaster(int handle, uint32_t master) {
+	LOGF("\t handle = %d\n"
+	     "\t master = %" PRIu32 "\n",
+	     handle, master);
+	return OK;
+}
+
+static KYTY_SYSV_ABI int VideoOutAddBufferAttributeOption(int handle, uint64_t option) {
+	LOGF("\t handle = %d\n"
+	     "\t option = 0x%016" PRIx64 "\n",
+	     handle, option);
+	return OK;
+}
+
 LIB_DEFINE(InitVideoOut_1) {
 	PRINT_NAME_ENABLE(true);
 
+	LIB_FUNC("WkYtyOg30do", VideoOutSetFlipMaster);
+	LIB_FUNC("MBlv8YWoyOk", VideoOutAddBufferAttributeOption);
 	LIB_FUNC("Up36PTk687E", VideoOut::VideoOutOpen);
 	LIB_FUNC("uquVH4-Du78", VideoOut::VideoOutClose);
 	LIB_FUNC("PjS5uASwcV8", VideoOut::VideoOutSetBufferAttribute2);

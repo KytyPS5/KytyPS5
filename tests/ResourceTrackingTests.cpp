@@ -270,7 +270,9 @@ MakeIndirectImageFixture(bool malformed, uint32_t material_immediate = 0,
 
 std::unique_ptr<Fixture> MakeAddressBackedImageFixture(uint32_t selector_depth = 0u,
                                                       bool shared_selector = true,
-                                                      bool invalid_selector_leaf = false) {
+                                                      bool invalid_selector_leaf = false,
+                                                      bool bounded_loop = false,
+                                                      bool written_output = false) {
   auto fixture = std::make_unique<Fixture>();
   const auto root = fixture->Address(fixture->UserData(7), fixture->UserData(8), 0x11f0);
   const auto load_root_word = [&](uint32_t offset, uint32_t pc) {
@@ -293,14 +295,33 @@ std::unique_ptr<Fixture> MakeAddressBackedImageFixture(uint32_t selector_depth =
   const auto material = fixture->Buffer(material_words, 0x1200);
   auto *entry = fixture->block;
   auto *loop = fixture->AddBlock();
+  auto *body = bounded_loop ? fixture->AddBlock() : loop;
+  auto *done = bounded_loop ? fixture->AddBlock() : nullptr;
   entry->AddBranch(loop);
-  loop->AddBranch(loop);
+  if (bounded_loop) {
+    loop->AddBranch(body);
+    loop->AddBranch(done);
+    body->AddBranch(loop);
+  } else {
+    loop->AddBranch(loop);
+  }
   auto &selector_phi = loop->AppendNewInst(ValueOpcode::Phi, {},
                                             static_cast<uint64_t>(Type::U32));
   const auto carried = fixture->Emit(
-      ValueOpcode::IAdd32, {Value(&selector_phi), Value(1u)}, 0, loop);
+      ValueOpcode::IAdd32, {Value(&selector_phi), Value(1u)}, 0, body);
   selector_phi.AddPhiOperand(entry, Value(0u));
-  selector_phi.AddPhiOperand(loop, carried);
+  selector_phi.AddPhiOperand(body, carried);
+  if (bounded_loop) {
+    const auto bound = fixture->Emit(ValueOpcode::SMin32,
+                                     {fixture->UserData(11), Value(2u)}, 0, entry);
+    const auto less = fixture->Emit(ValueOpcode::SLessThan32,
+                                    {Value(&selector_phi), bound}, 0, loop);
+    fixture->program.block_info[1].condition = fixture->Emit(
+        ValueOpcode::LogicalNot, {less}, 0, loop);
+    fixture->program.block_info[1].terminator = {
+        .kind = Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch,
+        .true_block = 3u, .false_block = 2u};
+  }
   Value selector(&selector_phi);
   if (invalid_selector_leaf) {
     const auto invocation = fixture->Emit(
@@ -308,25 +329,25 @@ std::unique_ptr<Fixture> MakeAddressBackedImageFixture(uint32_t selector_depth =
         {Value(static_cast<uint32_t>(StageInputKind::GlobalInvocationId)), Value(0u)}, 0,
         loop);
     selector = fixture->Emit(ValueOpcode::ReadFirstLane,
-                             {invocation, Value(true)}, 0, loop);
+                             {invocation, Value(true)}, 0, body);
   }
   for (uint32_t depth = 0; depth < selector_depth; depth++) {
     selector = fixture->Emit(ValueOpcode::IAdd32,
-                             {selector, shared_selector ? selector : Value(1u)}, 0, loop);
+                             {selector, shared_selector ? selector : Value(1u)}, 0, body);
   }
   const auto record = fixture->Emit(
-      ValueOpcode::IMul32, {selector, Value(384u)}, 0, loop);
+      ValueOpcode::IMul32, {selector, Value(384u)}, 0, body);
   MemoryInfo material_read;
   material_read.kind = ResourceKind::ScalarBuffer;
   material_read.offset = 368u;
   const auto key = fixture->Emit(
       ValueOpcode::ReadConstBuffer, {material, record},
-      fixture->AddMemory(material_read, 0x1204), loop);
-  fixture->Emit(ValueOpcode::ULessThan32, {key, Value(8u)}, 0, loop);
+      fixture->AddMemory(material_read, 0x1204), body);
+  fixture->Emit(ValueOpcode::ULessThan32, {key, Value(8u)}, 0, body);
   const auto key_shift = fixture->Emit(
-      ValueOpcode::ShiftLeftLogical32, {key, Value(5u)}, 0, loop);
+      ValueOpcode::ShiftLeftLogical32, {key, Value(5u)}, 0, body);
   const auto key_offset = fixture->Emit(
-      ValueOpcode::IAdd32, {key_shift, Value(152u)}, 0, loop);
+      ValueOpcode::IAdd32, {key_shift, Value(152u)}, 0, body);
   std::array<Value, 8> image_words;
   for (uint32_t dword = 0; dword < image_words.size(); dword++) {
     MemoryInfo heap_read;
@@ -335,13 +356,13 @@ std::unique_ptr<Fixture> MakeAddressBackedImageFixture(uint32_t selector_depth =
     image_words[dword] = fixture->Emit(
       ValueOpcode::LoadAddressU32,
       {heap_base, key_offset, Value(0u), Value(true)},
-      fixture->AddMemory(heap_read, 0x1214), loop);
+      fixture->AddMemory(heap_read, 0x1214), body);
   }
   const auto image = fixture->Emit(
       ValueOpcode::GetImageResource,
       {image_words[0], image_words[1], image_words[2], image_words[3], image_words[4],
        image_words[5], image_words[6], image_words[7]},
-      MemoryFlags{0, 0x1220}, loop);
+      MemoryFlags{0, 0x1220}, body);
   const auto sampler =
       fixture->Sampler({Value(0u), Value(0u), Value(0u), Value(0u)}, 0x1220);
   MemoryInfo sample;
@@ -349,10 +370,20 @@ std::unique_ptr<Fixture> MakeAddressBackedImageFixture(uint32_t selector_depth =
   sample.image_dimension = Decoder::ImageDimension::Dim2D;
   const auto sampled = fixture->Emit(
       ValueOpcode::ImageSampleRaw,
-      {image, sampler, fixture->ImageAddress()}, fixture->AddMemory(sample, 0x1220), loop);
+      {image, sampler, fixture->ImageAddress()}, fixture->AddMemory(sample, 0x1220), body);
   fixture->Emit(ValueOpcode::ReferenceU32,
                 {fixture->Emit(ValueOpcode::CompositeExtractU32x4,
                                {sampled, Value(0u)})});
+  if (written_output) {
+    const auto output = fixture->Buffer(
+        {fixture->UserData(12), fixture->UserData(13),
+         fixture->UserData(14), fixture->UserData(15)});
+    MemoryInfo output_write;
+    output_write.kind = ResourceKind::Buffer;
+    fixture->Emit(ValueOpcode::StoreBufferU32,
+                  {output, Value(0u), Value(0u), Value(0u), Value(1u), Value(true)},
+                  fixture->AddMemory(output_write, 0x1224), body);
+  }
   return fixture;
 }
 
@@ -420,6 +451,26 @@ void TestInvariantIndirectImageMaterialization() {
             address_snapshot.flattened_srt[
                 address_specialization.images[0].indirect_mapping_offset + 5u] == 6u,
         "address-backed indirect image descriptors were not materialized");
+  auto bounded = MakeAddressBackedImageFixture(0u, true, false, true);
+  bounded->PlanAndTrack();
+  const auto &bounded_indirect = bounded->program.descriptor_sources[
+      bounded->program.info.images[0].source].indirect_image;
+  Check(bounded_indirect && bounded_indirect->selector_limit == 2u,
+        "signed-clamped loop did not bound its image key selector");
+  auto bounded_written = MakeAddressBackedImageFixture(0u, true, false, true, true);
+  bounded_written->PlanAndTrack();
+  const auto &written_indirect = bounded_written->program.descriptor_sources[
+      bounded_written->program.info.images[0].source].indirect_image;
+  Check(written_indirect && written_indirect->selector_limit == 2u,
+        "unrelated shader write disabled the loop index bound");
+  const auto bounded_plan = ExtractResourcePlan(bounded->program);
+  ResourceSnapshot bounded_snapshot;
+  ResourceSpecialization bounded_specialization;
+  Check(MaterializeResources(bounded_plan, address_runtime, bounded_snapshot,
+                             bounded_specialization) &&
+            bounded_snapshot.flattened_srt[
+                bounded_specialization.images[0].indirect_mapping_offset] == 2u,
+        "bounded loop enumerated wrapped image keys outside its range");
   auto fixture = MakeIndirectImageFixture(false);
   fixture->PlanAndTrack();
   Check(fixture->program.info.images[0].simple_2d_3d_sampling,
@@ -748,7 +799,8 @@ void TestSharedUniformLoopIndex() {
              "invalid shared selector was not rejected promptly");
 }
 
-void TestBoundedAddressImageKeys() {
+void CheckBoundedAddressImageKeys(bool branch_guard, bool guarded_result,
+                                  ResourceKind material_kind = ResourceKind::ScalarAddress) {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   Fixture fixture;
   auto *entry = fixture.block;
@@ -759,13 +811,18 @@ void TestBoundedAddressImageKeys() {
   header->AddBranch(body);
   header->AddBranch(exit);
   body->AddBranch(header);
+  if (!branch_guard) body->AddBranch(exit);
   fixture.program.block_info[0].terminator = {
       .kind = CFG::TerminatorKind::Branch, .true_block = 1u};
-  fixture.program.block_info[1].terminator = {
-      .kind = CFG::TerminatorKind::ConditionalBranch,
-      .true_block = 2u, .false_block = 3u};
+  fixture.program.block_info[1].terminator = branch_guard
+      ? CFG::Terminator{.kind = CFG::TerminatorKind::ConditionalBranch,
+                        .true_block = 2u, .false_block = 3u}
+      : CFG::Terminator{.kind = CFG::TerminatorKind::Branch,
+                        .true_block = 2u};
   fixture.program.block_info[2].terminator = {
-      .kind = CFG::TerminatorKind::Branch, .true_block = 1u};
+      .kind = branch_guard ? CFG::TerminatorKind::Branch
+                           : CFG::TerminatorKind::ConditionalBranch,
+      .true_block = 1u, .false_block = branch_guard ? 0u : 3u};
   fixture.program.block_info[3].terminator.kind = CFG::TerminatorKind::Return;
 
   const auto active = fixture.Emit(
@@ -777,6 +834,7 @@ void TestBoundedAddressImageKeys() {
   loop.AddPhiOperand(entry, active);
   loop.AddPhiOperand(body, next);
   fixture.program.block_info[1].condition = Value(&loop);
+  if (!branch_guard) fixture.program.block_info[2].condition = Value(&loop);
 
   const auto pointer = fixture.Address(fixture.UserData(0),
                                         fixture.UserData(1), 0x20);
@@ -792,7 +850,7 @@ void TestBoundedAddressImageKeys() {
   std::array<Value, 4> reads;
   for (uint32_t index = 0; index < reads.size(); ++index) {
     MemoryInfo memory;
-    memory.kind = ResourceKind::ScalarAddress;
+    memory.kind = material_kind;
     memory.offset = index * 4u;
     reads[index] = fixture.Emit(ValueOpcode::LoadAddressU32,
                                 {pointer, offset, Value(0u), active},
@@ -840,17 +898,32 @@ void TestBoundedAddressImageKeys() {
   MemoryInfo sample;
   sample.kind = ResourceKind::Image;
   sample.image_dimension = Decoder::ImageDimension::Dim2D;
-  fixture.Emit(ValueOpcode::ImageSampleRaw,
+  const auto sampled = fixture.Emit(ValueOpcode::ImageSampleRaw,
                {image, sampler, fixture.ImageAddress()},
                fixture.AddMemory(sample, 0x50), body);
+  const auto component = fixture.Emit(ValueOpcode::CompositeExtractU32x4,
+                                      {sampled, Value(0u)}, 0, body);
+  const auto result = guarded_result
+      ? fixture.Emit(ValueOpcode::SelectU32,
+                     {Value(&loop), component, Value(0u)}, 0, body)
+      : component;
   const auto output = fixture.Buffer(
       {fixture.UserData(7), fixture.UserData(8), fixture.UserData(9),
        fixture.UserData(10)});
   MemoryInfo store;
   store.kind = ResourceKind::Buffer;
   fixture.Emit(ValueOpcode::StoreBufferU32,
-               {output, Value(0u), Value(0u), Value(0u), Value(1u),
+               {output, Value(0u), Value(0u), Value(0u), result,
                 Value(true)}, fixture.AddMemory(store, 0x60), body);
+  if (!branch_guard && !guarded_result) {
+    BuildSrtPlan(fixture.program);
+    TrackResources(fixture.program);
+    const auto &source = fixture.program.descriptor_sources[
+        fixture.program.info.images.at(0).source];
+    Check(!source.indirect_image || !source.indirect_image->address_key,
+          "unguarded image result accepted an inactive-lane key");
+    return;
+  }
   fixture.PlanAndTrack();
   Check(fixture.program.info.buffers.size() == 1u &&
             fixture.program.info.buffers[0].written,
@@ -896,6 +969,13 @@ void TestBoundedAddressImageKeys() {
   user_data[7] = 0x1010u;
   Check(!MaterializeResources(plan, runtime, snapshot, specialization),
         "write overlapping the address-key source was accepted");
+}
+
+void TestBoundedAddressImageKeys() {
+  CheckBoundedAddressImageKeys(true, true);
+  CheckBoundedAddressImageKeys(false, true);
+  CheckBoundedAddressImageKeys(false, true, ResourceKind::Global);
+  CheckBoundedAddressImageKeys(false, false);
 }
 
 std::unique_ptr<Fixture> MakeBufferRecordImageFixture(bool formatted) {

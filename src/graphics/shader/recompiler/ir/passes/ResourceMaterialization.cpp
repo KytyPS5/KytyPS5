@@ -350,6 +350,28 @@ bool MaterializeIndirectImage(const ResourcePlan&                    program,
 			}
 			std::ranges::sort(keys);
 			keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+		} else if (indirect.selector_limit != 0u) {
+			// The loop exits before this positive signed cap, so its U32 index cannot wrap.
+			const auto count = indirect.selector_limit;
+			if (count > MaxIndirectImageProbes ||
+			    static_cast<uint64_t>(indirect.selector_offset) +
+			            static_cast<uint64_t>(count - 1u) * indirect.selector_stride >
+			        UINT32_MAX) {
+				return false;
+			}
+			keys.reserve(count + 1u);
+			keys.push_back(0u); // Out-of-bounds buffer reads can select the zero key.
+			for (uint32_t index = 0; index < count; ++index) {
+				const auto offset = indirect.selector_offset + index * indirect.selector_stride;
+				uint32_t   key    = 0;
+				if (!ReadScalarTable(material.Base48(), material.GetSize(), offset, runtime,
+				                     {&key, 1})) {
+					return false;
+				}
+				keys.push_back(key);
+			}
+			std::ranges::sort(keys);
+			keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
 		} else {
 			// Enumerate every wrapped scalar-buffer offset that can pass the descriptor bounds.
 			const auto step    = std::gcd<uint64_t>(indirect.selector_stride, uint64_t {1} << 32u);
@@ -387,7 +409,9 @@ bool MaterializeIndirectImage(const ResourcePlan&                    program,
 		candidate.dword_count   = 8u;
 		const auto table_offset = (key << 5u) + indirect.table_offset;
 		if (!ReadScalarTable(table_base, table_size, table_offset, runtime, candidate.dwords)) {
-			return false;
+			return SpecializationFail(fmt::format(
+			    "shader=0x{:016x} indirect image {} candidate key {} read failed at offset {}",
+			    program.shader_hash, image_index, key, table_offset));
 		}
 		if (NullImageDescriptor(candidate) ||
 		    !ValidImageDescriptor(candidate, program.info.images[image_index].r128)) {
@@ -1115,7 +1139,9 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			    !clean.EvaluateDescriptor(indirect.table_source, table) ||
 			    !MaterializeIndirectImage(program, indirect, material, table, i, observed, clean,
 			                              snapshot, specialization)) {
-				return false;
+				return SpecializationFail(fmt::format(
+				    "shader=0x{:016x} indirect image {} materialization failed at pc 0x{:08x}",
+				    program.shader_hash, i, image.first_use_pc));
 			}
 		} else {
 			if (!evaluate(image.source, snapshot.images[i])) {

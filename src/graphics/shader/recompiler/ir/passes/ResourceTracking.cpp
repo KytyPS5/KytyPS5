@@ -767,6 +767,29 @@ private:
 		return ImpliesLoopGuard(guard, required, active);
 	}
 
+	bool ImageSampleResultGuarded(const Inst& image, Value required) const {
+		if (image.Uses().empty()) return false;
+		return std::ranges::all_of(image.Uses(), [&](const Use& image_use) {
+			const auto* sample = image_use.user;
+			if (image_use.operand != 0u || sample->GetOpcode() != ValueOpcode::ImageSampleRaw ||
+			    sample->Uses().empty())
+				return false;
+			return std::ranges::all_of(sample->Uses(), [&](const Use& sample_use) {
+				const auto* extract = sample_use.user;
+				if (sample_use.operand != 0u ||
+				    extract->GetOpcode() != ValueOpcode::CompositeExtractU32x4 ||
+				    extract->Uses().empty())
+					return false;
+				return std::ranges::all_of(extract->Uses(), [&](const Use& extract_use) {
+					const auto* select = extract_use.user;
+					return extract_use.operand == 1u &&
+					       select->GetOpcode() == ValueOpcode::SelectU32 &&
+					       ImpliesLoopGuard(select->Arg(0), required);
+				});
+			});
+		});
+	}
+
 	struct U32Bounds {
 		uint32_t low       = 0;
 		uint32_t high      = 0;
@@ -883,8 +906,8 @@ private:
 		const auto index = inst->Flags<MemoryFlags>().index;
 		if (index >= m_program.memory_info.size()) return false;
 		const auto& memory = m_program.memory_info[index];
-		if (memory.kind != ResourceKind::ScalarAddress || memory.data_bits != 32u ||
-		    memory.data_dwords != 1u)
+		if ((memory.kind != ResourceKind::ScalarAddress && memory.kind != ResourceKind::Global) ||
+		    memory.data_bits != 32u || memory.data_dwords != 1u)
 			return false;
 		if (result.reads.empty()) {
 			result.scale = scale;
@@ -899,7 +922,14 @@ private:
 	bool MatchAddressMaterialKey(Value key, const Inst& image, uint32_t pc,
 	                             DescriptorSource&                material_source,
 	                             DescriptorSource::IndirectImage& indirect) {
-		const auto guard = PositiveUseGuard(image.Parent());
+		Value guard = PositiveUseGuard(image.Parent());
+		if (guard.IsEmpty()) {
+			const auto* lane = key.Resolve().TryInstruction();
+			if (lane != nullptr && lane->GetOpcode() == ValueOpcode::ReadFirstLane &&
+			    lane->NumArgs() >= 2u && ImageSampleResultGuarded(image, lane->Arg(1))) {
+				guard = lane->Arg(1);
+			}
+		}
 		if (guard.IsEmpty()) return false;
 		AddressKeyReads reads;
 		if (!CollectAddressKeyReads(key, guard, 1u, 0u, reads) || reads.reads.empty()) return false;
@@ -1168,11 +1198,11 @@ private:
 		return true;
 	}
 
-	Value BoundedLoopCount(Value key, const Block* use) const {
+	Value BoundedLoopCount(Value key, const Block* use, bool allow_nonruntime_bound = false) const {
 		const auto* phi = key.Resolve().TryInstruction();
-		if (m_shader_writes || phi == nullptr || phi->GetOpcode() != ValueOpcode::Phi ||
-		    phi->GetType() != Type::U32 || phi->NumArgs() != 2u ||
-		    m_program.blocks.size() != m_program.block_info.size()) {
+		if ((!allow_nonruntime_bound && m_shader_writes) || phi == nullptr ||
+		    phi->GetOpcode() != ValueOpcode::Phi || phi->GetType() != Type::U32 ||
+		    phi->NumArgs() != 2u || m_program.blocks.size() != m_program.block_info.size()) {
 			return {};
 		}
 		bool induction = false;
@@ -1203,7 +1233,7 @@ private:
 		for (const auto& use_of_key: phi->Uses()) {
 			const auto* compare = use_of_key.user;
 			if (compare->GetOpcode() != ValueOpcode::SLessThan32 || use_of_key.operand != 0u ||
-			    !ValidateRuntimeValue(m_program, compare->Arg(1)))
+			    (!allow_nonruntime_bound && !ValidateRuntimeValue(m_program, compare->Arg(1))))
 				continue;
 			for (uint32_t i = 0; i < m_program.block_info.size(); ++i) {
 				const auto& info    = m_program.block_info[i];
@@ -1326,6 +1356,16 @@ private:
 				return false;
 			}
 			indirect.selector_offset += memory->offset;
+			const auto  loop_bound = BoundedLoopCount(selector, handle.Parent(), true);
+			const auto* bound_inst = loop_bound.Resolve().TryInstruction();
+			uint32_t    bound_cap  = 0;
+			if (bound_inst != nullptr && bound_inst->GetOpcode() == ValueOpcode::SMin32 &&
+			    bound_inst->NumArgs() == 2u &&
+			    (ImmediateU32(bound_inst->Arg(0), bound_cap) ||
+			     ImmediateU32(bound_inst->Arg(1), bound_cap)) &&
+			    bound_cap > 0u && bound_cap <= INT32_MAX) {
+				indirect.selector_limit = bound_cap;
+			}
 			const auto* material_handle = material_read->Arg(0).Resolve().TryInstruction();
 			if (material_handle == nullptr ||
 			    material_handle->GetOpcode() != ValueOpcode::GetBufferResource ||

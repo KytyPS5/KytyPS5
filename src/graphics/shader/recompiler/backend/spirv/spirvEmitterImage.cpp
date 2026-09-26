@@ -131,16 +131,18 @@ uint32_t CoordF32(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::In
 }
 
 uint32_t CoordU32(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::Inst& address,
-                  ImageDimension dimension) {
+                  ImageDimension dimension, uint32_t supplied_components = UINT32_MAX) {
 	const auto components = ImageDimensionInfoFor(dimension).coordinate_components;
 	const auto x          = AddressU32(ctx, mem, address, 0);
 	if (components == 1u) return x;
-	const auto y      = mem.image_address_components > 1u ? AddressU32(ctx, mem, address, 1)
-	                                                      : ConstantU32(ctx.state, 0);
+	const auto y      = supplied_components > 1u && mem.image_address_components > 1u
+	                        ? AddressU32(ctx, mem, address, 1)
+	                        : ConstantU32(ctx.state, 0);
 	const auto result = ctx.state.builder.AllocateId();
 	if (components == 3u) {
-		const auto z = mem.image_address_components > 2u ? AddressU32(ctx, mem, address, 2)
-		                                                 : ConstantU32(ctx.state, 0);
+		const auto z = supplied_components > 2u && mem.image_address_components > 2u
+		                   ? AddressU32(ctx, mem, address, 2)
+		                   : ConstantU32(ctx.state, 0);
 		ctx.state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(ctx.state, 3),
 		                              result, x, y, z);
 	} else {
@@ -699,29 +701,39 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		return;
 	}
 	if (op == IR::ValueOpcode::ImageRead) {
-		const auto  dimension      = image.dimension;
-		const auto& dimension_info = ImageDimensionInfoFor(dimension);
-		const auto  numeric_class  = image.numeric_class;
-		const auto  condition      = ctx.Arg(inst, 2);
+		const auto numeric_class = image.numeric_class;
+		const auto condition     = ctx.Arg(inst, 2);
 		ctx.Define(
 		    inst,
 		    EmitValueOrDefaultIfCondition(
 		        state, condition, TypeU32Vector(state, 4), ConstantU32CompositeZero(state, 4),
 		        [&]() {
-			        const auto descriptor = LoadSampledImageDescriptor(state, mem.resource);
-			        const auto color      = state.builder.AllocateId();
-			        const auto coord      = CoordU32(ctx, mem, *address, dimension);
-			        if (dimension_info.multisampled != 0u) {
-				        state.builder.AddFunction(
-				            spv::OpImageFetch, ImageVectorType(state, numeric_class, 4), color,
-				            descriptor, coord, spv::ImageOperandsSampleMask,
-				            AddressU32(ctx, mem, *address, dimension_info.coordinate_components));
-			        } else {
-				        state.builder.AddFunction(spv::OpImageFetch,
-				                                  ImageVectorType(state, numeric_class, 4), color,
-				                                  descriptor, coord, spv::ImageOperandsLodMask,
-				                                  LodU32(ctx, mem, *address, dimension));
-			        }
+			        const auto color = EmitImageCandidateSwitch(
+			            ctx, inst, mem, ImageVectorType(state, numeric_class, 4),
+			            [&](uint32_t resource) {
+				            const auto& candidate      = state.program.info.images[resource];
+				            const auto& dimension_info = ImageDimensionInfoFor(candidate.dimension);
+				            const auto  descriptor = LoadSampledImageDescriptor(state, resource);
+				            const auto  coord      = CoordU32(
+				                ctx, mem, *address, candidate.dimension,
+				                ImageDimensionInfoFor(mem.image_dimension).coordinate_components);
+				            const auto texel = state.builder.AllocateId();
+				            if (dimension_info.multisampled != 0u) {
+					            state.builder.AddFunction(
+					                spv::OpImageFetch, ImageVectorType(state, numeric_class, 4),
+					                texel, descriptor, coord, spv::ImageOperandsSampleMask,
+					                AddressU32(ctx, mem, *address,
+					                           ImageDimensionInfoFor(mem.image_dimension)
+					                               .coordinate_components));
+				            } else {
+					            state.builder.AddFunction(
+					                spv::OpImageFetch, ImageVectorType(state, numeric_class, 4),
+					                texel, descriptor, coord, spv::ImageOperandsLodMask,
+					                LodU32(ctx, mem, *address, mem.image_dimension));
+				            }
+				            return texel;
+			            });
+			        if (color == 0u) return ConstantU32CompositeZero(state, 4);
 			        return ResultVector(ctx, UnpackImageTexel(ctx, mem, color), numeric_class,
 			                            false, mem);
 		        }));

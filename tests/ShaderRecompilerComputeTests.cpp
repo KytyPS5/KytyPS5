@@ -27774,6 +27774,58 @@ void CheckIndirectImageKeySwitch() {
   Require(name, "dimension query count", queries == 2u,
           "dimension query dropped a candidate");
 
+  // A 2D read followed by a mip operand must not use that mip as a 3D coordinate.
+  program.info.images[1].dimension = ShaderRecompiler::Decoder::ImageDimension::Dim3D;
+  MemoryInfo read_memory{};
+  read_memory.kind = ResourceKind::Image;
+  read_memory.image_dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+  read_memory.image_address_components = 3u;
+  read_memory.image_has_mip = true;
+  program.memory_info.push_back(read_memory);
+  auto &read_address = block->AppendNewInst(
+      ValueOpcode::MakeImageAddress,
+      {Value(5u), Value(6u), Value(2u), Value(0u), Value(0u), Value(0u),
+       Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u), Value(0u)});
+  auto &read_enabled = block->AppendNewInst(ValueOpcode::IEqual32,
+                                             {Value(&key), Value(0u)});
+  auto &read = block->AppendNewInst(ValueOpcode::ImageRead,
+                                   {Value(&image), Value(&read_address), Value(&read_enabled)});
+  read.SetFlags(MemoryFlags{2u, 0xa4u});
+  auto &texel = block->AppendNewInst(ValueOpcode::CompositeExtractU32x4,
+                                    {Value(&read), Value(0u)});
+  block->AppendNewInst(ValueOpcode::ReferenceU32, {Value(&texel)});
+  program.binding_layout_complete = false;
+  AllocateBindings(program);
+  spirv = ShaderRecompiler::Spirv::EmitProgram(program, {.compute = &compute});
+  ValidateSpirv(name, spirv);
+  Require(name, "indirect image read disassembly", tools.Disassemble(spirv, &text),
+          "failed to disassemble indirect image reads");
+  Require(name, "indirect image read switch",
+          CountText(text, "OpImageFetch") == 2 && CountText(text, "OpSwitch") == 3,
+          "image read did not select both descriptor candidates");
+  std::vector<std::span<const u32>> read_definitions(spirv[3]);
+  u32 fetches = 0;
+  for (size_t offset = 5; offset < spirv.size();) {
+    const auto words = std::span<const u32>(spirv).subspan(offset, spirv[offset] >> 16u);
+    const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
+    if (opcode == spv::OpCompositeConstruct || opcode == spv::OpConstant) {
+      read_definitions[words[2]] = words;
+    } else if (opcode == spv::OpImageFetch) {
+      const auto coord = read_definitions[words[4]];
+      const auto lod = read_definitions[words[6]];
+      const bool correct_coord = fetches == 0u ? coord.size() == 5u
+                                     : coord.size() == 6u &&
+                                           !read_definitions[coord[5]].empty() &&
+                                           read_definitions[coord[5]][3] == 0u;
+      Require(name, "indirect read coordinates and mip",
+              correct_coord && lod.size() == 4u && lod[3] == 2u,
+              "image read used the mip as a coordinate or queried the wrong level");
+      fetches++;
+    }
+    offset += words.size();
+  }
+  Require(name, "indirect read count", fetches == 2u,
+          "image read did not fetch from both candidates");
 }
 
 TestCase ImageStoreMipSelectsPpsa01340Descriptor() {

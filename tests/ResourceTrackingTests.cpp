@@ -786,6 +786,9 @@ std::unique_ptr<Fixture> MakeBufferRecordImageFixture(bool formatted) {
   query.image_dimension = Decoder::ImageDimension::Dim2D;
   fixture->Emit(ValueOpcode::ImageQueryDimensions,
                 {image, fixture->ImageAddress()}, fixture->AddMemory(query, 0x70));
+  fixture->Emit(ValueOpcode::ImageRead,
+                {image, fixture->ImageAddress(), Value(true)},
+                fixture->AddMemory(query, 0xa4));
   const auto reused_image = fixture->Image(words, 0x74);
   fixture->Emit(ValueOpcode::ImageQueryDimensions,
                 {reused_image, fixture->ImageAddress()}, fixture->AddMemory(query, 0x74));

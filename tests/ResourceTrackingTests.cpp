@@ -3736,7 +3736,7 @@ void TestGraphicsPushConstantLayout() {
 }
 
 void TestResourceLimitIsTransactional() {
-  // Upstream MaxBuffers=64 contract: exact capacity must survive CollectShaderInfo
+  // MaxBuffers capacity contract: exact capacity must survive CollectShaderInfo
   // and AllocateBindings without truncating the dense buffer table.
   {
     Fixture accepted;

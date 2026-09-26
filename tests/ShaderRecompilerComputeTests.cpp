@@ -18876,6 +18876,31 @@ TestCase VectorFfbhI32NativeAndVop3OnGpu() {
   return test;
 }
 
+TestCase Vop1SdwaFfbhCapturedScalarLowWordSource() {
+  using O = ShaderOpcode;
+
+  constexpr std::array inputs = {0xdead0000u, 0xffff0001u, 0x00008000u,
+                                 0x00010008u, 0xffff4000u, 0x0000ffffu};
+  std::vector<u32> code;
+  for (u32 i = 0; i < inputs.size(); i++) {
+    AppendSmemLoadOpcode(&code, 0x08, 39, i * 4u);
+    code.insert(code.end(), {0x7e0072f9u, 0x00840627u}); // v_ffbh_u32 v0, s39.word0
+    AppendStoreVgpr(&code, 0, i);
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "Vop1SdwaFfbhCapturedScalarLowWordSource";
+  test.code = std::move(code);
+  test.initial.assign(inputs.begin(), inputs.end());
+  test.expected = {0xffffffffu, 31u, 16u, 28u, 17u, 16u};
+  test.opcodes = {O::S_BUFFER_LOAD_DWORD, O::V_FFBH_U32, O::V_MOV_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"V_FFBH_U32 v0, s39.sdwa(sel=4,sext=0)", inputs.size()}};
+  test.required_spirv = {"OpBitFieldUExtract", "FindUMsb"};
+  return test;
+}
+
 TestCase Vop1SdwaFfblCapturedHighWordSource() {
   using O = ShaderOpcode;
 
@@ -29001,6 +29026,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorVop3MoveAppliesFloatSourceModifiers);
   AddCase(VectorIntegerOps);
   AddCase(VectorFfbhI32NativeAndVop3OnGpu);
+  AddCase(Vop1SdwaFfbhCapturedScalarLowWordSource);
   AddCase(Vop1SdwaFfblCapturedHighWordSource);
   AddCase(Vop1SdwaNotCapturedByte0Source);
   AddCase(Vop1SdwaNotPreservesHighWordDestination);
@@ -34158,6 +34184,13 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--sdwa-mov-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, Vop1SdwaMovByteDestinations());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--sdwa-ffbh-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, Vop1SdwaFfbhCapturedScalarLowWordSource());
+    RunCase(&vulkan, VectorFfbhI32NativeAndVop3OnGpu());
+    RunCase(&vulkan, Vop1SdwaFfblCapturedHighWordSource());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--sdwa-ashr-only") == 0) {

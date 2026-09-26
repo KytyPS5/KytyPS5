@@ -138,6 +138,7 @@ private:
 	static const void*     PrepareOutputBuffer(const PortOut& port, const void* data,
 	                                           std::vector<uint8_t>* buffer);
 	static bool            QueueSdlAudio(PortOut* port, const void* data, bool blocking);
+	static void            DrainSdlAudio(PortOut* port);
 };
 
 static Audio* g_audio = nullptr;
@@ -404,6 +405,24 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking) {
 	return true;
 }
 
+void Audio::DrainSdlAudio(PortOut* port) {
+	EXIT_IF(port == nullptr);
+
+	// sceAudioOutOutput(handle, NULL) returns once everything queued on the port has been played.
+	// The wait is bounded so a stalled device cannot hang the game.
+	if (port->stream == nullptr) {
+		return;
+	}
+
+	const auto buffer_us = port->freq != 0 ? (1000000ULL * port->samples_num) / port->freq : 0;
+	const auto deadline  = LibKernel::KernelGetProcessTime() + buffer_us * 4 + 200000;
+	while (SDL_GetAudioStreamQueued(port->stream) > 0 &&
+	       LibKernel::KernelGetProcessTime() < deadline) {
+		Common::Thread::SleepMicro(1000);
+	}
+	port->queue_primed = false;
+}
+
 Audio::Id Audio::AudioOutOpen(int type, uint32_t samples_num, uint32_t freq, Format format) {
 	Common::LockGuard lock(m_mutex);
 
@@ -545,16 +564,30 @@ uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking
 	}
 
 	for (uint32_t i = 0; i < num; i++) {
-		auto& port = m_out_ports[params[i].handle.GetId()];
+		auto&      port          = m_out_ports[params[i].handle.GetId()];
+		const bool primed_before = port.queue_primed;
 
-		QueueSdlAudio(&port, params[i].data, blocking);
+		if (params[i].data == nullptr) {
+			// A NULL buffer asks to wait until the port's queued output has been played.
+			DrainSdlAudio(&port);
+		} else {
+			QueueSdlAudio(&port, params[i].data, blocking);
+		}
+
+		// Keep an absolute schedule while the queue is primed, so sleep overshoot does not stretch
+		// every period past block_time and slowly drain the queue. Re-anchor to the clock when the
+		// port is not being paced or fell more than one block behind.
+		const auto now       = LibKernel::KernelGetProcessTime();
+		const auto scheduled = port.last_output_time + block_time;
+		if (primed_before && port.queue_primed && scheduled <= now &&
+		    now - scheduled <= block_time) {
+			port.last_output_time = scheduled;
+		} else {
+			port.last_output_time = now;
+		}
 	}
 
-	for (uint32_t i = 0; i < num; i++) {
-		m_out_ports[params[i].handle.GetId()].last_output_time = LibKernel::KernelGetProcessTime();
-	}
-
-	return first_port.samples_num;
+	return (params[0].data != nullptr ? first_port.samples_num : 0);
 }
 
 static bool RecordingDevicePresent(SDL_AudioDeviceID device) {

@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bitset>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
@@ -95,6 +96,7 @@ enum class AjmCodec : uint32_t {
 
 constexpr int32_t AJM_ERROR_INVALID_CONTEXT     = static_cast<int32_t>(0x80930002u);
 constexpr int32_t AJM_ERROR_INVALID_PARAMETER   = static_cast<int32_t>(0x80930005u);
+constexpr int32_t AJM_ERROR_OUT_OF_RESOURCES    = static_cast<int32_t>(0x80930007u);
 constexpr int32_t AJM_ERROR_CODEC_NOT_SUPPORTED = static_cast<int32_t>(0x80930008u);
 constexpr int32_t AJM_ERROR_JOB_CREATION        = static_cast<int32_t>(0x80930012u);
 constexpr size_t  AJM_JOB_CONTROL_SIZE          = 48;
@@ -120,10 +122,10 @@ constexpr uint64_t AJM_FLAG_SIDEBAND_STREAM           = 1ull << 47u;
 constexpr uint64_t AJM_INSTANCE_FLAG_FORMAT_OFFSET    = 7u;
 constexpr uint64_t AJM_INSTANCE_FLAG_FORMAT_MASK      = 0x7u;
 constexpr uint64_t AJM_INSTANCE_FLAG_MAX_CHANNEL_MASK = 0x7fu;
+constexpr uint32_t AJM_INSTANCE_SLOT_MASK             = 0x3fffu;
 constexpr uint32_t AJM_DEC_OPUS_MAX_CHANNELS_FOR_10CH = 10;
 constexpr uint32_t AJM_DEC_OPUS_FRAME_SAMPLES         = 960;
 
-static std::atomic_uint32_t g_ajm_next_instance {1};
 static std::atomic_uint32_t g_ajm_next_batch {1};
 
 static uint32_t AjmGetFlagChannelCount(uint64_t flags) {
@@ -334,6 +336,19 @@ struct AjmInstanceState {
 
 static std::mutex                                     g_ajm_instances_mutex;
 static std::unordered_map<uint32_t, AjmInstanceState> g_ajm_instances;
+static std::bitset<AJM_INSTANCE_SLOT_MASK + 1>        g_ajm_used_slots;
+
+// Returns the lowest free instance slot in [1, AJM_INSTANCE_SLOT_MASK], or 0 when all slots are in
+// use. Slots freed by AjmInstanceDestroy are reused. Caller holds g_ajm_instances_mutex.
+static uint32_t AjmAllocateInstanceSlotLocked() {
+	for (uint32_t slot = 1; slot <= AJM_INSTANCE_SLOT_MASK; slot++) {
+		if (!g_ajm_used_slots.test(slot)) {
+			g_ajm_used_slots.set(slot);
+			return slot;
+		}
+	}
+	return 0;
+}
 
 static bool AjmCodecIsSupported(uint32_t codec) {
 	return codec == static_cast<uint32_t>(AjmCodec::DecMp3) ||
@@ -496,23 +511,26 @@ static void AjmWriteSideband(uint64_t flags, void* sideband_output, size_t sideb
 
 	AjmWriteResult(sideband_output, sideband_output_size, decode_result);
 
+	// SDK sideband layout, which games read at fixed offsets: Result, then Stream, Format,
+	// GaplessDecode, MFrame and the codec info, each present only when its flag is set.
 	size_t offset = AJM_SIDEBAND_RESULT_SIZE;
 
-	if ((flags & AJM_FLAG_RUN_GET_CODEC_INFO) != 0 && decoder != nullptr) {
-		const auto codec_info_size = decoder->CodecInfoSize();
-		if (offset + codec_info_size <= sideband_output_size) {
-			decoder->WriteCodecInfo(static_cast<uint8_t*>(sideband_output) + offset,
-			                        sideband_output_size - offset, decode_result);
-			offset += codec_info_size;
-		}
+	if ((flags & AJM_FLAG_SIDEBAND_STREAM) != 0 &&
+	    offset + AJM_SIDEBAND_STREAM_SIZE <= sideband_output_size) {
+		auto* stream =
+		    reinterpret_cast<AjmSidebandStream*>(static_cast<uint8_t*>(sideband_output) + offset);
+		stream->size_consumed         = AjmClampInt32(decode_result.input_consumed);
+		stream->size_produced         = AjmClampInt32(decode_result.output_written);
+		stream->total_decoded_samples = decode_result.total_decoded_samples;
+		offset += AJM_SIDEBAND_STREAM_SIZE;
 	}
 
-	if ((flags & AJM_FLAG_SIDEBAND_RESAMPLE_INFO) != 0 &&
-	    offset + AJM_SIDEBAND_RESAMPLE_INFO_SIZE <= sideband_output_size) {
-		auto* info = reinterpret_cast<AjmSidebandResampleInfo*>(
-		    static_cast<uint8_t*>(sideband_output) + offset);
-		info->ratio = 1.0f;
-		offset += AJM_SIDEBAND_RESAMPLE_INFO_SIZE;
+	if ((flags & AJM_FLAG_SIDEBAND_FORMAT) != 0 &&
+	    offset + AJM_SIDEBAND_FORMAT_SIZE <= sideband_output_size) {
+		auto* format =
+		    reinterpret_cast<AjmSidebandFormat*>(static_cast<uint8_t*>(sideband_output) + offset);
+		*format = decode_result.format;
+		offset += AJM_SIDEBAND_FORMAT_SIZE;
 	}
 
 	if ((flags & AJM_FLAG_SIDEBAND_GAPLESS) != 0 &&
@@ -525,29 +543,29 @@ static void AjmWriteSideband(uint64_t flags, void* sideband_output, size_t sideb
 		offset += AJM_SIDEBAND_GAPLESS_SIZE;
 	}
 
-	if ((flags & AJM_FLAG_SIDEBAND_FORMAT) != 0 &&
-	    offset + AJM_SIDEBAND_FORMAT_SIZE <= sideband_output_size) {
-		auto* format =
-		    reinterpret_cast<AjmSidebandFormat*>(static_cast<uint8_t*>(sideband_output) + offset);
-		*format = decode_result.format;
-		offset += AJM_SIDEBAND_FORMAT_SIZE;
-	}
-
-	if ((flags & AJM_FLAG_SIDEBAND_STREAM) != 0 &&
-	    offset + AJM_SIDEBAND_STREAM_SIZE <= sideband_output_size) {
-		auto* stream =
-		    reinterpret_cast<AjmSidebandStream*>(static_cast<uint8_t*>(sideband_output) + offset);
-		stream->size_consumed         = AjmClampInt32(decode_result.input_consumed);
-		stream->size_produced         = AjmClampInt32(decode_result.output_written);
-		stream->total_decoded_samples = decode_result.total_decoded_samples;
-		offset += AJM_SIDEBAND_STREAM_SIZE;
-	}
-
 	if ((flags & AJM_FLAG_RUN_MULTIPLE_FRAMES) != 0 &&
 	    offset + AJM_SIDEBAND_MFRAME_SIZE <= sideband_output_size) {
 		auto* mframe =
 		    reinterpret_cast<AjmSidebandMFrame*>(static_cast<uint8_t*>(sideband_output) + offset);
 		mframe->num_frames = decode_result.frames;
+		offset += AJM_SIDEBAND_MFRAME_SIZE;
+	}
+
+	// Not part of the documented layout; kept after the documented blocks so it cannot shift them.
+	if ((flags & AJM_FLAG_SIDEBAND_RESAMPLE_INFO) != 0 &&
+	    offset + AJM_SIDEBAND_RESAMPLE_INFO_SIZE <= sideband_output_size) {
+		auto* info = reinterpret_cast<AjmSidebandResampleInfo*>(
+		    static_cast<uint8_t*>(sideband_output) + offset);
+		info->ratio = 1.0f;
+		offset += AJM_SIDEBAND_RESAMPLE_INFO_SIZE;
+	}
+
+	if ((flags & AJM_FLAG_RUN_GET_CODEC_INFO) != 0 && decoder != nullptr) {
+		const auto codec_info_size = decoder->CodecInfoSize();
+		if (offset + codec_info_size <= sideband_output_size) {
+			decoder->WriteCodecInfo(static_cast<uint8_t*>(sideband_output) + offset,
+			                        sideband_output_size - offset, decode_result);
+		}
 	}
 }
 
@@ -789,9 +807,6 @@ int KYTY_SYSV_ABI AjmInstanceCreate(uint32_t context, uint32_t codec, uint64_t f
 	EXIT_NOT_IMPLEMENTED(instance == nullptr);
 	const auto supported = AjmLogCodecSupport(codec);
 
-	const auto slot = (g_ajm_next_instance.fetch_add(1, std::memory_order_relaxed) & 0x3fffu);
-	*instance       = (codec << 14u) | slot;
-
 	auto state    = AjmInstanceState {};
 	state.context = context;
 	state.codec   = codec;
@@ -800,6 +815,12 @@ int KYTY_SYSV_ABI AjmInstanceCreate(uint32_t context, uint32_t codec, uint64_t f
 
 	{
 		std::scoped_lock lock(g_ajm_instances_mutex);
+		const auto       slot = AjmAllocateInstanceSlotLocked();
+		if (slot == 0) {
+			LOGF("\t no free instance slot for codec %" PRIu32 "\n", codec);
+			return AJM_ERROR_OUT_OF_RESOURCES;
+		}
+		*instance                  = (codec << 14u) | slot;
 		g_ajm_instances[*instance] = std::move(state);
 	}
 
@@ -820,7 +841,9 @@ int KYTY_SYSV_ABI AjmInstanceDestroy(uint32_t context, uint32_t instance) {
 	LOGF("\t context = %" PRIu32 ", instance = 0x%08" PRIx32 "\n", context, instance);
 
 	std::scoped_lock lock(g_ajm_instances_mutex);
-	g_ajm_instances.erase(instance);
+	if (g_ajm_instances.erase(instance) != 0) {
+		g_ajm_used_slots.reset(instance & AJM_INSTANCE_SLOT_MASK);
+	}
 
 	return OK;
 }

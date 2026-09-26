@@ -173,9 +173,26 @@ public:
 
 		while (input_offset < input_size) {
 			AjmMp3FrameHeader header {};
-			if (AjmParseMp3Header(input_bytes + input_offset, input_size - input_offset, &header)) {
+			const bool        have_header =
+			    AjmParseMp3Header(input_bytes + input_offset, input_size - input_offset, &header);
+			if (have_header) {
 				m_last_header = header;
 				m_have_header = true;
+			}
+
+			// The parser takes the frame's bytes as soon as it sees them, so make sure the frame's
+			// PCM will fit before handing them over: a frame decoded without room for its output
+			// would be lost together with the input already consumed.
+			const auto frame_output_bytes =
+			    PredictFrameOutputBytes(have_header ? &header : nullptr, gapless);
+			const auto output_room =
+			    (output != nullptr && output_offset < output_size ? output_size - output_offset
+			                                                      : 0);
+			if (frame_output_bytes > output_room) {
+				if (!decoded) {
+					result.result = AJM_RESULT_NOT_ENOUGH_ROOM;
+				}
+				break;
 			}
 
 			uint8_t*  packet_data = nullptr;
@@ -255,6 +272,26 @@ private:
 		}
 	}
 
+	// PCM bytes the next frame will produce after the gapless window is applied. Without a header
+	// at the current position (a frame resumed mid-way or leading junk) the frame is sized after
+	// the last header seen, or after a full MPEG-1 frame when there is none.
+	[[nodiscard]] size_t PredictFrameOutputBytes(const AjmMp3FrameHeader* header,
+	                                             const AjmGaplessState*   gapless) const {
+		if (header == nullptr && m_have_header) {
+			header = &m_last_header;
+		}
+		auto       samples  = (header != nullptr ? header->samples_per_channel : 1152u);
+		const auto channels = (header != nullptr ? header->num_channels : std::max(m_channels, 1u));
+		if (gapless != nullptr) {
+			samples -= std::min<uint32_t>(samples, gapless->current.skip_samples);
+			if (gapless->HasSampleLimit()) {
+				samples = std::min<uint32_t>(samples, gapless->current.total_samples);
+			}
+		}
+		return static_cast<size_t>(samples) * static_cast<size_t>(channels) *
+		       AjmBytesPerSample(m_sample_encoding);
+	}
+
 	bool WriteFrame(const AVFrame* frame, void* output, size_t output_size, size_t* output_offset,
 	                AjmGaplessState* gapless, AjmDecodeResult* result) {
 		if (frame == nullptr || output_offset == nullptr || result == nullptr) {
@@ -310,10 +347,13 @@ private:
 			    std::min(gapless->current.total_samples, samples_written);
 		}
 		if (gapless != nullptr) {
-			const auto skipped_total =
-			    std::min<uint32_t>(std::numeric_limits<uint16_t>::max(),
-			                       static_cast<uint32_t>(gapless->current.skipped_samples) +
-			                           skip_samples + (samples_to_write - samples_written));
+			// Samples dropped by the gapless window count as skipped; samples the output had no
+			// room for are still owed to the caller and do not.
+			const auto skipped_samples =
+			    static_cast<uint32_t>(frame->nb_samples) - samples_to_write;
+			const auto skipped_total = std::min<uint32_t>(
+			    std::numeric_limits<uint16_t>::max(),
+			    static_cast<uint32_t>(gapless->current.skipped_samples) + skipped_samples);
 			gapless->current.skipped_samples = static_cast<uint16_t>(skipped_total);
 		}
 

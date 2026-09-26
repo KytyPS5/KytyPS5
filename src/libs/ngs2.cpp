@@ -768,6 +768,7 @@ struct Ngs2CustomSamplerVoiceState {
 static Ngs2Internal*        g_ngs_list     = nullptr;
 static Ngs2RackInternal*    g_racks_list   = nullptr;
 static std::atomic_uint32_t g_next_ngs_uid = 1;
+static Common::Mutex        g_ngs_mutex;
 static Common::Mutex        g_racks_mutex;
 
 static_assert(sizeof(Ngs2UserFxContext) == 72);
@@ -816,10 +817,21 @@ static Ngs2Internal* Ngs2CreateSystemInternal(const Ngs2SystemOption*      optio
 	ngs->option      = *option;
 	ngs->buffer_info = *buffer_info;
 	ngs->uid         = g_next_ngs_uid.fetch_add(1, std::memory_order_relaxed);
-	ngs->next        = g_ngs_list;
-	g_ngs_list       = ngs;
+
+	Common::LockGuard ngs_lock(g_ngs_mutex);
+	ngs->next  = g_ngs_list;
+	g_ngs_list = ngs;
 
 	return ngs;
+}
+
+// Caller holds g_ngs_mutex.
+static bool Ngs2SystemIsRegisteredLocked(const Ngs2Internal* ngs) {
+	auto* current = g_ngs_list;
+	while (current != nullptr && current != ngs) {
+		current = current->next;
+	}
+	return current != nullptr;
 }
 
 static bool Ngs2RackIsCustom(Ngs2RackType type) {
@@ -1052,13 +1064,12 @@ int KYTY_SYSV_ABI Ngs2SystemGetInfo(uintptr_t system_handle, Ngs2SystemInfo* inf
 		return ERROR_INVALID_OUT_SIZE;
 	}
 
-	auto* ngs     = reinterpret_cast<Ngs2Internal*>(system_handle);
-	auto* current = g_ngs_list;
-	while (current != nullptr && current != ngs) {
-		current = current->next;
-	}
-	if (current == nullptr) {
-		return ERROR_INVALID_SYSTEM_HANDLE;
+	auto* ngs = reinterpret_cast<Ngs2Internal*>(system_handle);
+	{
+		Common::LockGuard ngs_lock(g_ngs_mutex);
+		if (!Ngs2SystemIsRegisteredLocked(ngs)) {
+			return ERROR_INVALID_SYSTEM_HANDLE;
+		}
 	}
 
 	Common::LockGuard lock(ngs->mutex);
@@ -1100,11 +1111,75 @@ int KYTY_SYSV_ABI Ngs2SystemSetGrainSamples(uintptr_t system_handle, uint32_t nu
 }
 
 int KYTY_SYSV_ABI Ngs2SystemDestroy(uintptr_t system_handle, Ngs2ContextBufferInfo* buffer_info) {
+	constexpr int32_t ERROR_INVALID_SYSTEM_HANDLE = static_cast<int32_t>(0x804a8201u);
+
 	PRINT_NAME();
 	LOGF("\t system_handle = 0x%016" PRIx64 "\n", static_cast<uint64_t>(system_handle));
 
 	if (buffer_info != nullptr) {
-		std::memset(buffer_info, 0, sizeof(Ngs2ContextBufferInfo));
+		*buffer_info = {};
+	}
+	if (system_handle == 0) {
+		return ERROR_INVALID_SYSTEM_HANDLE;
+	}
+
+	auto* ngs = reinterpret_cast<Ngs2Internal*>(system_handle);
+	{
+		Common::LockGuard ngs_lock(g_ngs_mutex);
+		if (!Ngs2SystemIsRegisteredLocked(ngs)) {
+			return ERROR_INVALID_SYSTEM_HANDLE;
+		}
+	}
+
+	// Racks still attached to the system would be left pointing at freed memory; destroy them
+	// first, the same way their own destroy call would.
+	for (;;) {
+		Ngs2RackInternal* rack = nullptr;
+		{
+			Common::LockGuard racks_lock(g_racks_mutex);
+			for (auto* current = g_racks_list; current != nullptr; current = current->next) {
+				if (current->ngs == ngs) {
+					rack = current;
+					break;
+				}
+			}
+		}
+		if (rack == nullptr) {
+			break;
+		}
+		LOGF("\t destroying rack 0x%016" PRIx64 " still attached to the system\n",
+		     reinterpret_cast<uint64_t>(rack));
+		const int result = Ngs2RackDestroy(reinterpret_cast<uintptr_t>(rack), nullptr);
+		if (result != OK) {
+			return result;
+		}
+	}
+
+	Ngs2ContextBufferInfo context_buffer;
+	Ngs2BufferAllocator   allocator;
+	{
+		Common::LockGuard lock(ngs->mutex);
+		{
+			Common::LockGuard ngs_lock(g_ngs_mutex);
+			auto**            link = &g_ngs_list;
+			while (*link != nullptr && *link != ngs) {
+				link = &(*link)->next;
+			}
+			if (*link == nullptr) {
+				return ERROR_INVALID_SYSTEM_HANDLE;
+			}
+			*link = ngs->next;
+		}
+		context_buffer = ngs->buffer_info;
+		allocator      = ngs->allocator;
+	}
+	std::destroy_at(ngs);
+
+	if (allocator.free_handler != nullptr) {
+		return allocator.free_handler(&context_buffer);
+	}
+	if (buffer_info != nullptr) {
+		*buffer_info = context_buffer;
 	}
 
 	return OK;

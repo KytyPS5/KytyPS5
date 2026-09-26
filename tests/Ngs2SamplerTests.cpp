@@ -276,6 +276,67 @@ void TestPcm16RenderOutput() {
 	      "PCM16 render rack cleanup failed");
 }
 
+alignas(Ngs2Internal) std::byte g_allocated_system_storage[sizeof(Ngs2Internal)];
+std::vector<void*>              g_freed_system_buffers;
+
+int32_t KYTY_SYSV_ABI AllocateSystemBuffer(Ngs2ContextBufferInfo* info) {
+	Check(info->host_buffer_size <= sizeof(g_allocated_system_storage),
+	      "system allocator asked for more than the system's own size");
+	info->host_buffer = g_allocated_system_storage;
+	return OK;
+}
+
+int32_t KYTY_SYSV_ABI FreeSystemBuffer(Ngs2ContextBufferInfo* info) {
+	g_freed_system_buffers.push_back(info->host_buffer);
+	return OK;
+}
+
+void TestSystemDestroy() {
+	constexpr int32_t ERROR_INVALID_SYSTEM_HANDLE = static_cast<int32_t>(0x804a8201u);
+	constexpr int32_t ERROR_INVALID_RACK_HANDLE   = static_cast<int32_t>(0x804a8202u);
+
+	alignas(Ngs2Internal) std::byte system_storage[sizeof(Ngs2Internal)];
+	Ngs2ContextBufferInfo           system_buffer {system_storage, sizeof(system_storage)};
+	system_buffer.user_data = 77;
+	uintptr_t system_handle = 0;
+	Check(Ngs2SystemCreate(nullptr, &system_buffer, &system_handle) == OK,
+	      "system creation failed");
+
+	Ngs2RackOptionUnion option {};
+	Ngs2FillDefaultRackOption(0x1000, &option);
+	option.common.max_voices = 1;
+	alignas(Ngs2RackInternal) alignas(Ngs2VoiceInternal)
+	    std::byte         rack_storage[sizeof(Ngs2RackInternal) + sizeof(Ngs2VoiceInternal)];
+	Ngs2ContextBufferInfo rack_buffer {rack_storage, sizeof(rack_storage)};
+	uintptr_t             rack_handle = 0;
+	Check(Ngs2RackCreate(system_handle, 0x1000, &option.common, &rack_buffer, &rack_handle) == OK,
+	      "system destroy test rack creation failed");
+
+	Ngs2ContextBufferInfo returned {};
+	Check(Ngs2SystemDestroy(system_handle, &returned) == OK, "system destroy failed");
+	Check(returned.host_buffer == system_storage &&
+	          returned.host_buffer_size == sizeof(system_storage) && returned.user_data == 77,
+	      "system destroy did not hand the game's buffer back");
+	Check(Ngs2RackDestroy(rack_handle, nullptr) == ERROR_INVALID_RACK_HANDLE,
+	      "rack outlived its destroyed system");
+	Ngs2SystemInfo info {};
+	Check(Ngs2SystemGetInfo(system_handle, &info, sizeof(info)) == ERROR_INVALID_SYSTEM_HANDLE &&
+	          Ngs2SystemDestroy(system_handle, nullptr) == ERROR_INVALID_SYSTEM_HANDLE &&
+	          Ngs2SystemDestroy(0, nullptr) == ERROR_INVALID_SYSTEM_HANDLE,
+	      "destroyed system handle stayed valid");
+
+	const Ngs2BufferAllocator allocator {AllocateSystemBuffer, FreeSystemBuffer, 5};
+	uintptr_t                 allocated_handle = 0;
+	Check(Ngs2SystemCreateWithAllocator(nullptr, &allocator, &allocated_handle) == OK &&
+	          allocated_handle == reinterpret_cast<uintptr_t>(g_allocated_system_storage),
+	      "system creation with allocator failed");
+	Check(Ngs2SystemDestroy(allocated_handle, &returned) == OK &&
+	          g_freed_system_buffers.size() == 1 &&
+	          g_freed_system_buffers[0] == g_allocated_system_storage &&
+	          returned.host_buffer == nullptr,
+	      "system destroy did not release the allocator's buffer");
+}
+
 void TestPitchLoopAndSkip() {
 	Fixture       f(24000);
 	const int16_t pcm[] = {-30000, 8192, 16384};
@@ -941,5 +1002,6 @@ int main() {
 	TestPlayStateBeforeRender();
 	TestStatePublication();
 	TestStopThenPlayBeforeRender();
+	TestSystemDestroy();
 	std::puts("Ngs2SamplerTests: all cases passed");
 }

@@ -1,25 +1,27 @@
-Дата обзора: **8 сентября 2026 года** · обновление статуса: **25 сентября 2026**
+Дата обзора: **8 сентября 2026 года** · обновление статуса: **26 сентября 2026**
 
 # Открытые PR KytyPS5: что полезно для текущего bring-up
 
-## Обновление 25 сентября 2026
+## Обновление 26 сентября 2026
 
 Снимок не пересобирает весь каталог из 68 PR: ниже — дельта относительно
-текущей ветки `yotei-windows-bringup` @ `e1c6502d` (draft
-[#497](https://github.com/KytyPS5/KytyPS5/pull/497), base `main` tip `5ce4f083`).
-#497 снова **mergeable** после merge `upstream/main`; `mergeable_state=unstable`
-означает CI, не конфликты. Игровой blocker **25.09 вечер**: `MaterializeResources` на CS
-`40395313615abcc8` (после закрытия 86da ballot / SAVEEXEC / 7291 continue /
-e94e LDS u64). Меню/gameplay **PENDING**.
+текущей ветки `yotei-windows-bringup` @ `23e4fd74` (draft
+[#497](https://github.com/KytyPS5/KytyPS5/pull/497), base `main` tip `fd2e15ee`).
+#497 снова **MERGEABLE** после merge `upstream/main` (`fd2e15ee`); конфликты
+`CMakeLists.txt` / `ShaderIR.h` / `ResourceTrackingTests.cpp` разрешены.
+**Первый ненулевой кадр на текущем tip доказан** (`…-081515-presentfix-gpuav`,
+prepared frame 250, spinner). Меню/gameplay **PENDING**. Крупный CS `54904fb4`
+под GPUAV всё ещё дорог (CreatePipeline / specialization churn).
 
 ### Уже в текущей ветке (не тащить повторно)
 
 | Источник | Статус |
 | --- | --- |
-| [#497](https://github.com/KytyPS5/KytyPS5/pull/497) | **current integration:** head `e1c6502d`, synced to main `5ce4f083`. |
+| [#497](https://github.com/KytyPS5/KytyPS5/pull/497) | **current integration:** head `23e4fd74`, synced to main `fd2e15ee`. |
 | [#811](https://github.com/KytyPS5/KytyPS5/pull/811) address-backed images | **covered selectively** в `c1a4f853` (`record_key` / `protected_image` / `--address-backed-indirect-only` GREEN). Upstream PR ещё open и dirty vs main — целый re-merge не нужен; buffer-key класс остаётся нашим RED. |
-| Main tip `5ce4f083` и предшественники в merge | NGS2/ATRAC9 (#825 и соседние audio), void translator + `V_CMPX_O_F32`, sync/EOP, CFG/tests — уже в #497. |
+| Main tip `fd2e15ee` и предшественники в merge | NGS2/ATRAC9, void translator + `V_CMPX_O_F32`, sync/EOP, CFG/tests, `MaxBuffers=64`, `lru_cache` tests, CI recompiler unit tests — уже в #497. |
 | Selective ports #798/#799/#812/#820 | Уже в ветке (см. plan); повтор не нужен. |
+| Present soft-stall / VrrStatus / HTile native / post-EOP readback | Уже в ветке 26.09; не тащить повторно. |
 
 ### Смержены в upstream main после 20 сентября (полезные пересечения)
 
@@ -42,9 +44,9 @@ e94e LDS u64). Меню/gameplay **PENDING**.
 
 ### Ещё открытые кандидаты (без полного re-triage)
 
-Очередь correctness для текущего blocker не меняется: address-backed **buffer**
-descriptor / tracking, затем соседние resource frontiers. Из старого списка по
-GitHub на 25.09 ещё open как минимум [#506](https://github.com/KytyPS5/KytyPS5/pull/506)
+Очередь correctness для текущего blocker: long run past spinner → menu frame;
+тяжёлый CS `54904fb4` CreatePipeline под GPUAV и specialization churn. Из старого
+списка по GitHub на 26.09 ещё open как минимум [#506](https://github.com/KytyPS5/KytyPS5/pull/506)
 (FPS/scheduling, dirty, split-first) и [#811](https://github.com/KytyPS5/KytyPS5/pull/811)
 (image side уже покрыт). Полный каталог ниже — исторический снимок 8.09; строки
 **covered**/**merged into main** выше имеют приоритет над таблицей.
@@ -73,11 +75,13 @@ milestone первого rendered pixel; меню и gameplay остаются *
 
 ## Короткий вывод
 
-Готового PR, который можно целиком влить и тем самым получить первый ненулевой
-кадр Ghost of Yōtei, **нет**. Run на `b247c0f`, дошедший до frame 179, не
-компилировал проблемный вариант `6cc64dee…`, поэтому прежний вывод о закрытом PC
-`0x656c` был преждевременным. Следующий run воспроизвёл отказ: точный шейдер
-использует signed runtime loop, stride 196 и четыре correlated descriptor words,
+Готового чужого PR, который можно целиком влить и получить меню Ghost of Yōtei,
+**нет**. Первый ненулевой кадр (spinner) на текущем tip `23e4fd74` уже доказан
+своим bring-up (`…-081515`). Следующий milestone — **первый кадр меню**; текущий
+runtime cost — GPUAV CreatePipeline на больших cooperative CS (`54904fb4`).
+Исторический вывод про PC `0x656c` / signed loop `6cc64dee` ниже сохранён как
+контекст 8–9 сентября, не как актуальный blocker.
+
 а не constant guarded selector из регрессии `b247c0f`.
 
 Нужный общий bounded-read proof уже существовал, но был безусловно отключён для
@@ -258,7 +262,7 @@ decoder gap `VOPC 0xbd` (`V_CMPX_NE_U16`) в frame 222. Checkpoint `5aaf3b4`
 | [#488 minimized window crash](https://github.com/KytyPS5/KytyPS5/pull/488) | **P2/separate:** полезный WSI fix, но не влияет на обычный не-minimized запуск. |
 | [#490 float image atomics](https://github.com/KytyPS5/KytyPS5/pull/490) | **covered:** production semantics уже в ветке; текущий PR head лишь другая актуализация того же класса. |
 | [#493 opt-in BVH stub](https://github.com/KytyPS5/KytyPS5/pull/493) | **diagnostic only:** decode/message полезны; always-miss не является реализацией ray tracing и не нужен Yōtei сейчас. |
-| [#497 current Yōtei draft](https://github.com/KytyPS5/KytyPS5/pull/497) | **current integration (25.09):** head `e1c6502d`, mergeable vs main `5ce4f083`; #811 image side + main audio/translator in tree; runtime blocker address-backed buffer `86da5eb7…`; nonzero menu/gameplay still PENDING (spinner proven on older `96611fe`). |
+| [#497 current Yōtei draft](https://github.com/KytyPS5/KytyPS5/pull/497) | **current integration (26.09):** head `23e4fd74`, MERGEABLE vs main `fd2e15ee`; spinner/nonzero prepared frame 250 proven on current tip (`…-081515`); menu/gameplay PENDING; GPUAV CreatePipeline cost on CS `54904fb4` remains. |
 | [#500 Demon's Souls shader work](https://github.com/KytyPS5/KytyPS5/pull/500) | **closed unmerged (25.09) / partly covered:** часть уже перенесена; остаток только по отдельному RED, не revive whole. |
 | [#503 negative printf precision](https://github.com/KytyPS5/KytyPS5/pull/503) | **P2/separate:** корректный libc fix с хорошим focused coverage; не связан с renderer/shader failure. |
 | [#504 rejected-open descriptor leak](https://github.com/KytyPS5/KytyPS5/pull/504) | **P2/separate:** однострочный kernel cleanup с тестами; полезен глобально, не текущему run. |
@@ -268,17 +272,15 @@ decoder gap `VOPC 0xbd` (`V_CMPX_NE_U16`) в frame 222. Checkpoint `5aaf3b4`
 
 ## Рекомендуемая очередь без конфликтов со вторым агентом
 
-1. Добавить exact RED и общий decoder/lowering для runtime MUBUF `0x87`, затем
-   повторить прогретый GPUAV-lite/source-readback run `f1776f0`.
-2. Сохранять оставшиеся 82 corpus failures как независимый backlog; поднимать
+1. Long run past spinner (`ContinueAfterColored`) до первого menu frame; фиксировать
+   post-spinner Fatal / CreatePipeline hang / resource admission без title branching.
+2. Для CS `54904fb4`: уменьшить SPIR-V / specialization churn (shared wave64
+   collectives, bounded CreatePipeline) — см. `emulator-test-debt.md`.
+3. Сохранять оставшиеся corpus failures как независимый backlog; поднимать
    конкретную группу раньше runtime frontier только при доказанной общей
    correctness-зависимости.
-3. После первого корректного изображения измерить #461, #420, #484, #483 и
-   четыре части #506 по отдельности. Главный compile stall уже закрыт локальным
-   CFG-механизмом; scheduling-порты не смешивать с opcode correctness.
-4. Для black-frame расследования сначала доказать потерю ownership/clear state.
-   Если исчезает GPU-authored storage owner — #373; если capture показывает CMask
-   fast clear — #429; если ни то ни другое, эти PR не применять «на удачу».
+4. После первого menu frame измерить #461, #420, #484, #483 и части #506 по
+   отдельности. Scheduling-порты не смешивать с opcode correctness.
 5. #509 разрезать на независимые primitive-restart, watcher-lifetime,
    storage-view validation и selector-semantics задачи. Последнюю оставить
    unsupported до появления спецификации/RED, не заменять произвольным нулём.

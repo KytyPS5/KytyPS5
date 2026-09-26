@@ -64,7 +64,9 @@ Remaining debt:
 - Factor repeated split-wave64 ballot/readlane lowering into reusable SPIR-V functions
   without changing workgroup scratch, dynamic-uniformity or barrier semantics.
 - Ratchet exact synthetic module size and validate that bounded pipeline creation no
-  longer exceeds 60 seconds before claiming menu or gameplay progress.
+  longer exceeds several minutes under GPUAV instrumentation before claiming menu
+  progress. Game evidence 26.09: CS `54904fb419d79e49` still costs ~20–278 s per
+  `vkCreateComputePipelines` and can recompile multiple specialization variants.
 
 ## Compressed video-out metadata on a native render-target alias
 
@@ -1397,19 +1399,29 @@ Required tests:
 
 ## First nonzero Yotei source frame
 
-Status: **rendered-pixel milestone reached; menu and gameplay remain pending.**
+Status: **rendered-pixel milestone reached on current tip; menu and gameplay remain pending.**
 
-Native GPUAV-lite run `_Build/runs/yotei-integrated-20260909-101008-669804` at
-checkpoint `96611fe` reached `shown=280`. The unchanged source readback is black
-through frame 235, then frame 236 contains 10 nonzero RGB pixels and frame 242
-contains 214. `_Build/analysis/yotei-first-nonzero-96611fe.png` independently
-shows the white animated loading spinner in the upper-right corner.
+Historical proof on `96611fe`: GPUAV-lite run
+`_Build/runs/yotei-integrated-20260909-101008-669804` reached `shown=280`.
+Source readback stayed black through frame 235; frame 236 had 10 nonzero RGB
+pixels and frame 242 had 214. Screenshot
+`_Build/analysis/yotei-first-nonzero-96611fe.png` shows the white loading
+spinner.
+
+**Re-proven 26 September 2026** on bring-up tip `fb1cc8b` / plan note `23e4fd74`:
+warm GPUAV+instrumentation fullscreen run
+`_Build/runs/yotei-integrated-20260926-081515-presentfix-gpuav` —
+prepared **frame 250** `colored=10` (max RGB 45/45/45), then frames 251–276
+grow to `colored=108` / max ~546/525/546; `shown=277`, auto-stop
+`colored-proven` (~147 s). Present blit after Flip EOP is the readback site.
 
 Remaining validation:
 
-- Preserve the readback and screenshot as the evidence boundary: do not promote
-  the result to menu or gameplay until a recognizable full scene is captured.
-- Continue bounded runs with the 60-second shown-frame watchdog and record the
-  first post-spinner compile, resource, GPU execution, or presentation blocker.
+- Preserve the readback as the evidence boundary: do not promote the result to
+  menu or gameplay until a recognizable full scene / menu frame is captured.
+- Continue bounded runs past spinner (`ContinueAfterColored`); record the first
+  post-spinner compile, resource, GPU execution, or presentation blocker.
+  Large CS `54904fb419d79e49` still dominates CreatePipeline time under GPUAV
+  (multi-minute compiles / specialization churn).
 - Re-run the accumulated shader/GPU test debt before upstream submission; the
   rendered-pixel milestone does not waive neighboring regressions.

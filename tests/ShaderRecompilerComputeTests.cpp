@@ -29467,6 +29467,61 @@ TestCase BufferStoreFormatXyzwFloat16ConvertsComponents() {
   return test;
 }
 
+constexpr u32 NarrowFloatFormatVariants = 5;
+
+// Formatted stores convert VGPR floats to SNORM/SSCALED bytes and to unsigned 11/10-bit floats
+// instead of truncating the float bits.
+TestCase BufferStoreFormatConvertsNarrowFloatFormats(u32 variant) {
+  using O = ShaderOpcode;
+
+  struct Variant {
+    const char *name;
+    Prospero::BufferFormat format;
+    u32 opcode;
+    std::array<float, 4> values;
+    u32 expected;
+  };
+  const float nan = std::bit_cast<float>(0x7fc00000u);
+  const float infinity = std::bit_cast<float>(0x7f800000u);
+  const std::array<Variant, NarrowFloatFormatVariants> variants = {{
+      {"BufferStoreFormatXyzwSnorm8Converts", Prospero::BufferFormat::k8_8_8_8SNorm, 0x07u,
+       {1.0f, -1.0f, 0.5f, -2.0f}, 0x8140817fu},
+      {"BufferStoreFormatXyzwSscaled8Converts", Prospero::BufferFormat::k8_8_8_8SScaled, 0x07u,
+       {3.0f, -5.0f, 200.0f, -200.0f}, 0x807ffb03u},
+      {"BufferStoreFormatXyzFloat11_11_10Converts", Prospero::BufferFormat::k11_11_10Float, 0x06u,
+       {1.0f, 2.0f, 0.5f, 0.0f}, 0x702003c0u},
+      // Negatives clamp to zero, NaN and infinity are kept and the mantissa bits the narrow
+      // formats cannot hold are dropped.
+      {"BufferStoreFormatXyzFloat11_11_10ClampsNegativeKeepsNaN",
+       Prospero::BufferFormat::k11_11_10Float, 0x06u, {-1.0f, nan, 1.015625f, 0.0f}, 0x783ff800u},
+      {"BufferStoreFormatXyzFloat11_11_10TruncatesKeepsInfinity",
+       Prospero::BufferFormat::k11_11_10Float, 0x06u, {1.0078125f, -2.0f, infinity, 0.0f},
+       0xf80003c0u},
+  }};
+  const auto &selected = variants[variant];
+  std::vector<u32> code;
+  for (u32 component = 0; component < 4; component++) {
+    AppendVMovLiteral(&code, component, std::bit_cast<u32>(selected.values[component]));
+  }
+  AppendVMovU32(&code, 20, 0);
+  code.push_back(EncodeMubuf0(selected.opcode, 0, true, false));
+  code.push_back(EncodeMubuf1(0, 0, 20));
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = selected.name;
+  test.code = std::move(code);
+  test.initial = std::vector<u32>(1, 0xdeadbeefu);
+  test.expected = {selected.expected};
+  test.user_data = MakeStructuredStorageBufferData(4, 1, false, BufferFormat(selected.format));
+  test.has_user_data = true;
+  test.opcodes = {O::V_MOV_B32,
+                  selected.opcode == 0x07u ? O::BUFFER_STORE_FORMAT_XYZW
+                                           : O::BUFFER_STORE_FORMAT_XYZ,
+                  O::S_ENDPGM};
+  return test;
+}
+
 TestCase BufferStoreFormatXyzwSnorm16CapturedSkinningVectors() {
   using O = ShaderOpcode;
 
@@ -36612,6 +36667,9 @@ std::vector<TestCase> MakeCases() {
   AddCase(DsFloatMinMaxIgnoresData1);
   AddCase([] { return DsFloatMinMaxClasses(false); });
   AddCase([] { return DsFloatMinMaxClasses(true); });
+  for (u32 variant = 0; variant < NarrowFloatFormatVariants; variant++) {
+    cases.push_back(BufferStoreFormatConvertsNarrowFloatFormats(variant));
+  }
   AddCase(DsSwizzleInvalidSourceLaneZero);
   AddCase(DsPermuteCapturedExecOffsetAndWrap);
   AddCase(DsPermuteWave64UsesIndependentHalves);
@@ -41921,6 +41979,9 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, BufferStoreFormatXRejectsPartialRecord());
     RunCase(&vulkan, BufferStoreFormatXyRejectsPartialRecord());
     RunCase(&vulkan, BufferFormatStoreVariants());
+    for (u32 variant = 0; variant < NarrowFloatFormatVariants; variant++) {
+      RunCase(&vulkan, BufferStoreFormatConvertsNarrowFloatFormats(variant));
+    }
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-float16-store-only") == 0) {

@@ -382,7 +382,23 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 	EXIT_NOT_IMPLEMENTED(wait_for_previous > 1);
 	EXIT_NOT_IMPLEMENTED(write_confirm > 1);
 	EXIT_NOT_IMPLEMENTED(block_engine > 1);
-	if (static_cast<uint32_t>(dst_address_or_offset) == 0x3022cu) {
+	// GL2 prefetch. The guest streams a block through L2 by aiming a DMA_DATA at register
+	// offset 0x0003022c, the same 0x30xxx register space GraphicsDcbDmaData selects its
+	// source addresses from; nothing guest-visible is written and the emulator has no L2
+	// to warm, so the packet is a no-op. CpOpDmaData already returns early on the full
+	// control/control2 encoding of that packet, but this repeats the test on the decoded
+	// fields so COPY_DATA, or any encoding that differs in the bits that test pins, cannot
+	// fall through to the destination-selector EXIT below.
+	//
+	// Only selectors 0..3 address plain memory or GDS. The high selector bit that the
+	// packet carries (control2 bit 27, assembled back into dst_sel bit 2) puts the
+	// destination outside them, which is what makes 0x0003022c a register offset rather
+	// than an address, so requiring it keeps a guest VA whose low half happens to equal
+	// 0x0003022c from being silently dropped.
+	constexpr uint64_t GL2PrefetchRegisterOffset = 0x0003022c;
+	constexpr uint8_t  NonMemoryDestinationSelector = 0x4;
+	if (dst_address_or_offset == GL2PrefetchRegisterOffset &&
+	    (dst_sel & NonMemoryDestinationSelector) != 0) {
 		return;
 	}
 	auto decode_gds = [](uint8_t selector, bool& is_gds) {

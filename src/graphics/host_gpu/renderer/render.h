@@ -168,9 +168,9 @@ public:
 	void                           FindBuffers(std::span<PreparedBindings* const> stages);
 	void                           RebindBuffers(PreparedBindings& bindings);
 	void                           RebindImages(PreparedBindings& bindings);
-	void CommitBindings(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
-	                    const PipelineCache::Pipeline&     pipeline,
-	                    std::span<PreparedBindings* const> bindings);
+	bool                           ResolveStageImages(PreparedBindings& bindings);
+	void                           AcquireStageImageViews(PreparedBindings& bindings);
+	bool                           ResolveColorTargets(std::span<RenderColorInfo> colors);
 	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
 	                                            const ShaderRecompiler::IR::DescriptorValue& value);
 

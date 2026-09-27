@@ -8414,7 +8414,7 @@ public:
       if (width == 1 && height == 1) {
         Require(name, "single-texel tiled layout",
                 color.desc.info.mip_layout[0] == ImageMipInfo{0, 0x10000, 128, 64},
-                "the render target lost the SDK's padded block height");
+                "the render target lost the expected padded block height");
       }
 
       if (target.levels == 7) {
@@ -8426,7 +8426,7 @@ public:
           Require(name, "linear mip chain", layout.offset == offsets[mip] &&
                       layout.pitch == pitches[mip] &&
                       layout.size == pitches[mip] * (height >> mip) * 8,
-                  "linear target mip offsets or padded pitches differ from the SDK");
+                  "linear target mip offsets or padded pitches differ from the expected layout");
         }
       }
 

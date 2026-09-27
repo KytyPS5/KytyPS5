@@ -1830,6 +1830,14 @@ public:
     m_physical_device.getProperties2(&properties);
     return subgroup.subgroupSize;
   }
+  // A consumer GPU may lack the production rasterization features the fragment
+  // cases need. The compute cases still run on such a device, so the harness reports
+  // the capability instead of failing the whole binary before the first case.
+  [[nodiscard]] bool RasterizationSupported() const {
+    return m_rasterization_supported;
+  }
+  void SkipRasterizationCases(u32 count) { m_skipped_cases += count; }
+  [[nodiscard]] u32 SkippedCaseCount() const { return m_skipped_cases; }
   [[nodiscard]] GraphicContext &RuntimeContext() {
     EnsureRuntimeContext();
     return m_runtime_context;
@@ -15929,6 +15937,9 @@ public:
   }
 
 private:
+  bool m_rasterization_supported = true;
+  u32   m_skipped_cases          = 0;
+
   RenderContext &Renderer() {
     EXIT_IF(m_renderer == nullptr);
     return *m_renderer;
@@ -15960,8 +15971,8 @@ private:
     m_runtime_context.physical_device_memory_properties = m_memory_properties;
     m_runtime_context.queue_family = m_queue_family;
     m_runtime_context.queue = m_queue;
-    m_runtime_context.attachment_feedback_loop_enabled = true;
-    m_runtime_context.provoking_vertex_last_enabled = true;
+    m_runtime_context.attachment_feedback_loop_enabled = m_rasterization_supported;
+    m_runtime_context.provoking_vertex_last_enabled = m_rasterization_supported;
     const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info{
         .format = vk::Format::eBc1RgbaUnormBlock,
         .type = vk::ImageType::e2D,
@@ -16121,14 +16132,19 @@ private:
             "image view minimum LOD is not supported");
     Require("VulkanHarness", "graphics", available_features12.shaderOutputLayer == true,
             "vertex layer output is not supported");
-    Require("VulkanHarness", "graphics", available_features.fillModeNonSolid &&
-                available_features.tessellationShader &&
-                available_depth_clip.depthClipEnable && available_clip_control.depthClipControl &&
-                available_color_write.colorWriteEnable &&
-                available_feedback_layout.attachmentFeedbackLoopLayout &&
-                available_feedback_dynamic.attachmentFeedbackLoopDynamicState &&
-                available_provoking_vertex.provokingVertexLast,
-            "production rasterization features are not supported");
+    m_rasterization_supported = available_features.fillModeNonSolid &&
+                                available_features.tessellationShader &&
+                                available_depth_clip.depthClipEnable &&
+                                available_clip_control.depthClipControl &&
+                                available_color_write.colorWriteEnable &&
+                                available_feedback_layout.attachmentFeedbackLoopLayout &&
+                                available_feedback_dynamic.attachmentFeedbackLoopDynamicState &&
+                                available_provoking_vertex.provokingVertexLast;
+    if (!m_rasterization_supported) {
+      std::printf(
+          "[host]    ProductionRasterization   unavailable, rasterization cases "
+          "will be skipped\n");
+    }
 
     float priority = 1.0f;
     vk::DeviceQueueCreateInfo queue_info{};
@@ -16160,27 +16176,33 @@ private:
     vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR derivatives{};
     derivatives.pNext = &device_features13;
     derivatives.computeDerivativeGroupQuads = true;
+    // Requesting a feature the device does not support fails device creation, so the
+    // rasterization feature chain is only chained in when every part is available.
     vk::PhysicalDeviceDepthClipEnableFeaturesEXT depth_clip{};
-    depth_clip.pNext = &derivatives;
-    depth_clip.depthClipEnable = true;
     vk::PhysicalDeviceDepthClipControlFeaturesEXT clip_control{};
-    clip_control.pNext = &depth_clip;
-    clip_control.depthClipControl = true;
     vk::PhysicalDeviceColorWriteEnableFeaturesEXT color_write{};
-    color_write.pNext = &clip_control;
-    color_write.colorWriteEnable = true;
     vk::PhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT feedback_layout{};
-    feedback_layout.pNext = &color_write;
-    feedback_layout.attachmentFeedbackLoopLayout = true;
     vk::PhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT feedback_dynamic{};
-    feedback_dynamic.pNext = &feedback_layout;
-    feedback_dynamic.attachmentFeedbackLoopDynamicState = true;
     vk::PhysicalDeviceProvokingVertexFeaturesEXT provoking_vertex{};
-    provoking_vertex.pNext = &feedback_dynamic;
-    provoking_vertex.provokingVertexLast = available_provoking_vertex.provokingVertexLast;
+    if (m_rasterization_supported) {
+      depth_clip.pNext = &derivatives;
+      depth_clip.depthClipEnable = true;
+      clip_control.pNext = &depth_clip;
+      clip_control.depthClipControl = true;
+      color_write.pNext = &clip_control;
+      color_write.colorWriteEnable = true;
+      feedback_layout.pNext = &color_write;
+      feedback_layout.attachmentFeedbackLoopLayout = true;
+      feedback_dynamic.pNext = &feedback_layout;
+      feedback_dynamic.attachmentFeedbackLoopDynamicState = true;
+      provoking_vertex.pNext = &feedback_dynamic;
+      provoking_vertex.provokingVertexLast = available_provoking_vertex.provokingVertexLast;
+    }
     vk::PhysicalDeviceImageViewMinLodFeaturesEXT min_lod{};
-    min_lod.pNext = &provoking_vertex;
     min_lod.minLod = true;
+    min_lod.pNext = m_rasterization_supported
+                        ? static_cast<void *>(&provoking_vertex)
+                        : static_cast<void *>(&derivatives);
     device_info.pNext = &min_lod;
     vk::PhysicalDeviceFeatures device_features{};
     device_features.shaderStorageImageWriteWithoutFormat = true;
@@ -16188,22 +16210,26 @@ private:
     device_features.sampleRateShading = true;
     device_features.shaderInt64 = true;
     device_features.shaderFloat64 = available_features.shaderFloat64;
-    device_features.fillModeNonSolid = true;
-    device_features.tessellationShader = true;
+    device_features.fillModeNonSolid = m_rasterization_supported;
+    device_features.tessellationShader = m_rasterization_supported;
     device_info.pEnabledFeatures = &device_features;
-    constexpr const char *device_extensions[] = {
+    std::vector<const char *> device_extensions{
         VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
         VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME,
         VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME,
-        VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME,
-        VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME,
-        VK_EXT_COLOR_WRITE_ENABLE_EXTENSION_NAME,
-        VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME,
-        VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME,
-        VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,
         VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME};
-    device_info.enabledExtensionCount = std::size(device_extensions);
-    device_info.ppEnabledExtensionNames = device_extensions;
+    if (m_rasterization_supported) {
+      device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
+      device_extensions.push_back(VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME);
+      device_extensions.push_back(VK_EXT_COLOR_WRITE_ENABLE_EXTENSION_NAME);
+      device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
+      device_extensions.push_back(
+          VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
+      device_extensions.push_back(VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME);
+    }
+    device_info.enabledExtensionCount =
+        static_cast<uint32_t>(device_extensions.size());
+    device_info.ppEnabledExtensionNames = device_extensions.data();
     RequireVk("VulkanHarness", "dispatch",
               m_physical_device.createDevice(&device_info, nullptr, &m_device),
               "vkCreateDevice");
@@ -16691,6 +16717,10 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
 }
 
 void RunGraphicsCase(VulkanHarness *vulkan, const GraphicsCase &test) {
+  if (vulkan != nullptr && !vulkan->RasterizationSupported()) {
+    vulkan->SkipRasterizationCases(1);
+    return;
+  }
   auto compiled = CompileFragmentCase(test);
   auto actual = vulkan->RenderFragment(test, compiled);
   CompareGraphicsWords(test, actual);
@@ -35446,14 +35476,21 @@ int main(int argc, char **argv) {
     return 2;
   }
   VulkanHarness vulkan;
+  // Keep compute and host checks running when rasterization features are missing.
+  const bool rasterization = vulkan.RasterizationSupported();
+  bool skipped_device_checks = false;
   CheckRenderTargetFormatContract();
   CheckSampledColorViews();
   CheckImageTransitionState(vulkan.RuntimeRenderer());
   CheckSampledDepthResource();
   CheckDepthTextureEncoding();
   vulkan.CheckSamplerBorderColors();
-  vulkan.CheckComparisonDepthTexture();
-  vulkan.CheckRasterization(true);
+  if (rasterization) {
+    vulkan.CheckComparisonDepthTexture();
+    vulkan.CheckRasterization(true);
+  } else {
+    skipped_device_checks = true;
+  }
   CheckBasicStorageTextureDescriptor();
   CheckStorageTextureLinearUploadLayout();
   CheckStorageTextureDepthTileUploadLayout();
@@ -35477,6 +35514,8 @@ int main(int argc, char **argv) {
   CheckShaderRecompilerFatalContracts();
   CheckDepthFeedbackAspects();
   VulkanHarness vulkan;
+  const bool rasterization = vulkan.RasterizationSupported();
+  bool skipped_device_checks = false;
 #endif
   CheckImageSamplerSpecialization();
   CheckResourcePlanHandoff();
@@ -35516,30 +35555,32 @@ int main(int argc, char **argv) {
   vulkan.CheckSchedulerTimeline();
   vulkan.CheckHostImageAllocation();
   vulkan.CheckDescriptorHeapLargeSet();
-  vulkan.CheckGraphicsPushConstantBank();
   vulkan.CheckGpuMappedRangeLifecycle();
   vulkan.CheckStreamBufferRing();
   vulkan.CheckGpuTilerCpuParity();
   vulkan.CheckNativeIndirectDispatch();
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-  vulkan.CheckRenderExecutorColorDiscovery();
-  vulkan.CheckRenderExecutorColorVolumeDiscovery();
-  vulkan.CheckRenderExecutorColorMetadataClear();
-  vulkan.CheckSampledDccClear();
-  vulkan.CheckRenderExecutorColorStandardTileDiscovery();
-  vulkan.CheckRenderExecutorColorDepthTileDiscovery();
-  vulkan.CheckRenderExecutorStencilBindingDiscovery();
-#endif
   vulkan.CheckUnifiedTextureCacheFlow();
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-  vulkan.CheckBgra16Readback();
-  vulkan.CheckRasterization(false);
-  vulkan.CheckRasterization(false, true);
-  vulkan.CheckBufferCacheDirtyGarbageCollection();
-#endif
   vulkan.CheckUnifiedImageViewCache();
   vulkan.CheckPackedTextureComponents();
   vulkan.CheckCubeFaceStorageExpansion();
+  if (rasterization) {
+    vulkan.CheckGraphicsPushConstantBank();
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+    vulkan.CheckRenderExecutorColorDiscovery();
+    vulkan.CheckRenderExecutorColorVolumeDiscovery();
+    vulkan.CheckRenderExecutorColorMetadataClear();
+    vulkan.CheckSampledDccClear();
+    vulkan.CheckRenderExecutorColorStandardTileDiscovery();
+    vulkan.CheckRenderExecutorColorDepthTileDiscovery();
+    vulkan.CheckRenderExecutorStencilBindingDiscovery();
+    vulkan.CheckBgra16Readback();
+    vulkan.CheckRasterization(false);
+    vulkan.CheckRasterization(false, true);
+    vulkan.CheckBufferCacheDirtyGarbageCollection();
+#endif
+  } else {
+    skipped_device_checks = true;
+  }
   const auto tests = MakeCases();
   const auto graphics_tests = MakeGraphicsCases();
   CheckOpcodeCoverage(tests, graphics_tests);
@@ -35550,6 +35591,15 @@ int main(int argc, char **argv) {
     RunGraphicsCase(&vulkan, test);
   }
   vulkan.CheckGpuCommandLane();
+  if (skipped_device_checks) {
+    std::printf(
+        "ShaderRecompilerComputeTests: device rasterization checks skipped, this "
+        "device does not support the production rasterization features\n");
+  }
+  if (vulkan.SkippedCaseCount() > 0) {
+    std::printf("ShaderRecompilerComputeTests: %u graphics cases skipped\n",
+                vulkan.SkippedCaseCount());
+  }
   std::printf("ShaderRecompilerComputeTests: all cases passed\n");
   return 0;
 }

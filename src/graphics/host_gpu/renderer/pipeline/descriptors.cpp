@@ -1062,7 +1062,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	}
 }
 
-void RenderExecutor::RebindImages(PreparedBindings& prepared) {
+bool RenderExecutor::ResolveStageImages(PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
 	const auto& program  = *prepared.runtime->program;
@@ -1070,13 +1070,38 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	auto&       images   = prepared.images;
 	EXIT_IF(images.size() != program.info.images.size());
 	auto& texture_cache = m_context.GetTextureCache();
-	// Acquire each view before a later overlapping descriptor can replace its image.
+	bool  resolved      = false;
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		const auto old_image = texture_cache.m_slot_images.try_get(images[i].image_id);
 		if (old_image == nullptr || (!old_image->registered && !old_image->info.data.Empty()) ||
 		    old_image->binding.needs_rebind) {
 			if (old_image != nullptr) {
 				old_image->binding = {};
+			}
+			images[i] = ResolveTexture(program.info.images[i], snapshot.images[i]);
+			BindImage(images[i].image_id,
+			          images[i].desc.type == TextureCache::BindingType::Storage);
+			resolved = true;
+		}
+	}
+	return resolved;
+}
+
+void RenderExecutor::AcquireStageImageViews(PreparedBindings& prepared) {
+	KYTY_PROFILER_FUNCTION();
+	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
+	const auto& program  = *prepared.runtime->program;
+	const auto& snapshot = *prepared.runtime->resources;
+	auto&       images   = prepared.images;
+	EXIT_IF(images.size() != program.info.images.size());
+	auto& texture_cache = m_context.GetTextureCache();
+	for (uint32_t i = 0; i < program.info.images.size(); i++) {
+		// Aliases that never settle are resolved right before their own view is acquired.
+		const auto current = texture_cache.m_slot_images.try_get(images[i].image_id);
+		if (current == nullptr || (!current->registered && !current->info.data.Empty()) ||
+		    current->binding.needs_rebind) {
+			if (current != nullptr) {
+				current->binding = {};
 			}
 			images[i] = ResolveTexture(program.info.images[i], snapshot.images[i]);
 			BindImage(images[i].image_id,
@@ -1108,6 +1133,43 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	}
 }
 
+// Resolving one binding can displace an image another binding already resolved, so identities are
+// settled before any view is acquired. Two passes is the steady state; the bound stops a cycle.
+static constexpr uint32_t IMAGE_RESOLVE_PASSES = 4;
+
+void RenderExecutor::RebindImages(PreparedBindings& prepared) {
+	for (uint32_t pass = 0; pass < IMAGE_RESOLVE_PASSES; pass++) {
+		if (!ResolveStageImages(prepared)) {
+			break;
+		}
+		if (pass + 1 == IMAGE_RESOLVE_PASSES) {
+			LOGF("compute image identities did not settle in %u passes\n", IMAGE_RESOLVE_PASSES);
+		}
+	}
+	AcquireStageImageViews(prepared);
+}
+
+bool RenderExecutor::ResolveColorTargets(std::span<RenderColorInfo> colors) {
+	auto& cache    = m_context.GetTextureCache();
+	bool  resolved = false;
+	for (auto& target: colors) {
+		EXIT_IF(!target.image_id);
+		const auto old_image = cache.m_slot_images.try_get(target.image_id);
+		if (old_image == nullptr || (!old_image->registered && !old_image->info.data.Empty()) ||
+		    old_image->binding.needs_rebind) {
+			if (old_image != nullptr) {
+				old_image->binding = {};
+			}
+			target.desc.view_info.base_level = target.guest_mip_level;
+			target.desc.view_info.base_layer = target.guest_array_layer;
+			target.image_id                  = cache.FindImage(target.desc);
+			BindRenderTarget(target.image_id);
+			resolved = true;
+		}
+	}
+	return resolved;
+}
+
 void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
                                              std::span<RenderColorInfo> colors) {
 	bool uses_dma   = false;
@@ -1121,23 +1183,22 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 		m_context.PrepareBda(writes_dma);
 
 	}
-	for (auto* stage: stages) {
-		RebindImages(*stage);
-	}
-	auto& cache = m_context.GetTextureCache();
-	for (auto& target: colors) {
-		EXIT_IF(!target.image_id);
-		const auto old_image = cache.m_slot_images.try_get(target.image_id);
-		if (old_image == nullptr || (!old_image->registered && !old_image->info.data.Empty()) ||
-		    old_image->binding.needs_rebind) {
-			if (old_image != nullptr) {
-				old_image->binding = {};
-			}
-			target.desc.view_info.base_level = target.guest_mip_level;
-			target.desc.view_info.base_layer = target.guest_array_layer;
-			target.image_id = cache.FindImage(target.desc);
-			BindRenderTarget(target.image_id);
+	for (uint32_t pass = 0; pass < IMAGE_RESOLVE_PASSES; pass++) {
+		bool resolved = false;
+		for (auto* stage: stages) {
+			resolved |= ResolveStageImages(*stage);
 		}
+		resolved |= ResolveColorTargets(colors);
+		if (!resolved) {
+			break;
+		}
+		if (pass + 1 == IMAGE_RESOLVE_PASSES) {
+			LOGF("image identities did not settle in %u passes: stages=%zu colors=%zu\n",
+			     IMAGE_RESOLVE_PASSES, stages.size(), colors.size());
+		}
+	}
+	for (auto* stage: stages) {
+		AcquireStageImageViews(*stage);
 	}
 	// Discovery can read back PS5 metadata and submit the scheduler. Reserve draw buffers only
 	// after image identities are final; attachment layout transitions follow buffer alias copies.

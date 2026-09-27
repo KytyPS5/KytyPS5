@@ -22182,6 +22182,87 @@ TestCase VectorSinCosMaxFiniteSpecialCases() {
            O::S_ENDPGM}};
 }
 
+TestCase VectorCompareF32ExposureGuard() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "VectorCompareF32ExposureGuard";
+  test.initial = {0x00000001u, 0x80000001u, 0x007fffffu, 0x807fffffu,
+                  0x00000000u, 0x80000000u, 0x3f800000u, 0x40000000u};
+  test.expected = test.initial;
+  AppendVMovLiteral(&test.code, 1, 0x3f800000u);
+  for (u32 i = 0; i < test.initial.size(); i++) {
+    AppendVMovU32(&test.code, 31, i * sizeof(u32));
+    AppendBufferLoadDword(&test.code, 0, 31);
+    // Captured exposure guard: replace zero with 1.0 before taking its reciprocal.
+    test.code.push_back(EncodeVopc(0x02, InlineU32(0), 0));
+    test.code.push_back(EncodeVop2(0x01, 2, Vgpr(0), 1));
+    test.code.push_back(EncodeVop1(0x2a, 3, Vgpr(2)));
+    AppendStoreVgpr(&test.code, 2, static_cast<u32>(test.expected.size()));
+    AppendStoreVgpr(&test.code, 3, static_cast<u32>(test.expected.size() + 1));
+    test.expected.push_back(i == 7 ? 0x40000000u : 0x3f800000u);
+    test.expected.push_back(i == 7 ? 0x3f000000u : 0x3f800000u);
+  }
+  test.initial.resize(test.expected.size());
+  AppendEnd(&test.code);
+  test.opcodes = {O::BUFFER_LOAD_DWORD, O::V_CMP_EQ_F32, O::V_CNDMASK_B32,
+                  O::V_RCP_F32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
+TestCase VectorCompareF32DenormalModes(u32 mode) {
+  using O = ShaderOpcode;
+  enum Relation : u32 { Less, Equal, Greater, Unordered };
+  struct Pair {
+    u32 lhs;
+    u32 rhs;
+    Relation relation;
+  };
+  constexpr Pair pairs[] = {
+      {0x00000001u, 0x00000000u, Equal},
+      {0x80000001u, 0x80000000u, Equal},
+      {0x00000000u, 0x00000001u, Equal},
+      {0x80000000u, 0x80000001u, Equal},
+      {0x007fffffu, 0x80000001u, Equal},
+      {0x00800000u, 0x007fffffu, Greater},
+      {0xbf800000u, 0x80000001u, Less},
+      {0xff800000u, 0xbf800000u, Less},
+      {0x7f800000u, 0x7f800000u, Equal},
+      {0x7fc12345u, 0x00000000u, Unordered},
+      {0x00000000u, 0x7fa12345u, Unordered},
+      {0x00000000u, 0x80000000u, Equal},
+  };
+  TestCase test;
+  constexpr const char* names[] = {"VectorCompareF32DenormalModeC0",
+                                   "VectorCompareF32DenormalModeE0"};
+  test.name = names[(mode >> 5u) & 1u];
+  test.compute_info.float_mode = static_cast<uint8_t>(mode);
+  test.has_compute_info = true;
+  for (const auto& pair : pairs) {
+    test.initial.insert(test.initial.end(), {pair.lhs, pair.rhs});
+  }
+  test.expected = test.initial;
+  AppendVMovU32(&test.code, 1, 1);
+  for (u32 i = 0; i < std::size(pairs); i++) {
+    AppendVMovU32(&test.code, 31, i * 2u * sizeof(u32));
+    AppendBufferLoadDword(&test.code, 2, 31);
+    AppendVMovU32(&test.code, 31, (i * 2u + 1u) * sizeof(u32));
+    AppendBufferLoadDword(&test.code, 3, 31);
+    // The sixteen architectural predicates select subsets of LT/EQ/GT/unordered.
+    for (u32 predicate = 0; predicate < 16; predicate++) {
+      test.code.push_back(EncodeVopc(predicate, Vgpr(2), 3));
+      test.code.push_back(EncodeVop2(0x01, 4, InlineU32(0), 1));
+      AppendStoreVgpr(&test.code, 4, static_cast<u32>(test.expected.size()));
+      test.expected.push_back((predicate >> pairs[i].relation) & 1u);
+    }
+  }
+  test.initial.resize(test.expected.size());
+  AppendEnd(&test.code);
+  test.opcodes = {O::BUFFER_LOAD_DWORD, O::V_CMP_EQ_F32, O::V_CMP_LE_F32,
+                  O::V_CMP_GE_F32, O::V_CNDMASK_B32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  return test;
+}
+
 TestCase VectorCompareOps() {
   using O = ShaderOpcode;
 
@@ -22532,6 +22613,8 @@ TestCase VectorCompareClassF32() {
   append_class(0x40000000u, 1u << 8u, true);
   append_class(0x7f800000u, 1u << 9u, true);
   append_class(0x40000000u, 1u << 3u, false);
+  append_class(0x00000001u, 1u << 7u, true);
+  append_class(0x80000001u, 1u << 4u, true);
 
   AppendVMovLiteral(&code, 0, 0x3f800000u);
   AppendVMovU32(&code, 2, 1u << 3u);
@@ -29686,6 +29769,10 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorF64CapturedScreenSpaceShadows);
   AddCase(VectorF64ModesModifiersAndExec);
   AddCase(VectorSinCosMaxFiniteSpecialCases);
+  AddCase(VectorCompareF32ExposureGuard);
+  for (const auto mode : {0xc0u, 0xe0u}) {
+    cases.push_back(VectorCompareF32DenormalModes(mode));
+  }
   AddCase(VectorCompareOps);
   AddCase(VectorVop3CompareEqI64OnGpu);
   AddCase(VectorVop3CompareEqU64OnGpu);
@@ -34552,6 +34639,16 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--cmpx-o-f32-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorVopcCmpxOrderedCapturedExecMask());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--fp32-compare-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, VectorCompareF32ExposureGuard());
+    for (const auto mode : {0xc0u, 0xe0u}) {
+      RunCase(&vulkan, VectorCompareF32DenormalModes(mode));
+    }
+    RunCase(&vulkan, VectorCompareClassF32());
+    RunCase(&vulkan, VectorCompareF16Ops());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-format-store-only") == 0) {

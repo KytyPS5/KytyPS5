@@ -781,14 +781,18 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 			}
 			return false;
 		case ValueOpcode::FPOrdLessThanEqual32:
-			if (binary()) {
-				result = Float32(a) <= Float32(b);
-				return true;
-			}
-			return false;
 		case ValueOpcode::FPOrdGreaterThanEqual32:
 			if (binary()) {
-				result = Float32(a) >= Float32(b);
+				const auto operand = [&](uint64_t bits) {
+					if (inst.Flags<FPCompareFlags>().flush_input_denorms &&
+					    (bits & 0x7fffffffu) < 0x00800000u) {
+						bits &= 0x80000000u;
+					}
+					return Float32(bits);
+				};
+				result = inst.GetOpcode() == ValueOpcode::FPOrdLessThanEqual32
+				             ? operand(a) <= operand(b)
+				             : operand(a) >= operand(b);
 				return true;
 			}
 			return false;

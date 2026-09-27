@@ -396,6 +396,49 @@ void TestUniformFirstLaneSamplerLod() {
         "uniform sampler LOD clamp evaluated incorrectly");
 }
 
+void TestFloatComparisonDescriptorInputs() {
+  struct Input {
+    uint32_t bits;
+    uint32_t less_equal;
+    uint32_t greater_equal;
+  };
+  constexpr std::array inputs = {
+      Input{0x00000001u, 0, 1}, Input{0x80000001u, 1, 0},
+      Input{0x007fffffu, 0, 1}, Input{0x807fffffu, 1, 0},
+      Input{0x00800000u, 0, 1}, Input{0x80800000u, 1, 0},
+      Input{0x00000000u, 1, 1}, Input{0x80000000u, 1, 1},
+      Input{0x7fc00000u, 0, 0}};
+  for (const bool flush : {false, true}) {
+    Fixture fixture;
+    const auto user = fixture.Emit(
+        ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(2))});
+    const auto value = fixture.Emit(ValueOpcode::BitCastF32U32, {user});
+    const auto less_equal = fixture.Emit(ValueOpcode::FPOrdLessThanEqual32,
+                                         {value, Value::F32(0.0f)});
+    const auto greater_equal = fixture.Emit(ValueOpcode::FPOrdGreaterThanEqual32,
+                                            {value, Value::F32(0.0f)});
+    less_equal.Instruction()->SetFlags(FPCompareFlags{flush});
+    greater_equal.Instruction()->SetFlags(FPCompareFlags{flush});
+    const auto low = fixture.Emit(ValueOpcode::SelectU32,
+                                  {less_equal, Value(1u), Value(0u)});
+    const auto high = fixture.Emit(ValueOpcode::SelectU32,
+                                   {greater_equal, Value(1u), Value(0u)});
+    fixture.program.descriptor_sources.push_back(
+        {.dwords = {low, high}, .dword_count = 2});
+    fixture.Plan();
+    for (size_t index = 0; index < inputs.size(); index++) {
+      const auto &input = inputs[index];
+      const std::array user_data{input.bits};
+      DescriptorValue result;
+      Check(SrtWalker(fixture.program, {.user_data = user_data})
+                    .EvaluateDescriptor(0, result) &&
+                result.dwords[0] == (flush && index < 4 ? 1 : input.less_equal) &&
+                result.dwords[1] == (flush && index < 4 ? 1 : input.greater_equal),
+            "descriptor comparison disagrees with native FP32 input mode");
+    }
+  }
+}
+
 void TestSharedIntegerRuntimeDependencies() {
   Fixture fixture;
   const auto lane = fixture.Emit(ValueOpcode::LaneId);
@@ -591,6 +634,7 @@ int main() {
     TestControlDependentStandaloneLoadStaysTyped();
     TestRuntime64BitDescriptorOps();
     TestUniformFirstLaneSamplerLod();
+    TestFloatComparisonDescriptorInputs();
     TestSharedIntegerRuntimeDependencies();
     TestConstantBufferBounds();
     TestReadLaneElimination();

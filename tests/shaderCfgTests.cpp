@@ -3923,6 +3923,35 @@ void TestNewShaderRecompilerScalarB64LaneTranslation() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestFloatComparisonInputModes() {
+  using namespace ShaderRecompiler;
+  const uint32_t shader[] = {
+      EncodeVopc(0x02, 256, 1), // v_cmp_eq_f32 v0, v1
+      EncodeVopc(0xca, 256, 1), // v_cmp_eq_f16 v0, v1
+      EncodeSopp(0x01),
+  };
+  Decoder::Program decoded;
+  Decoder::DecodeProgram(shader, decoded);
+  for (const uint8_t mode : {0xc0, 0xd0, 0xe0, 0xf0}) {
+    ShaderComputeInputInfo compute{};
+    compute.float_mode = mode;
+    Frontend::TranslateOptions options{.stage = ShaderType::Compute};
+    options.input_info.compute = &compute;
+    const auto program = Frontend::TranslateProgram(decoded, CFG::BuildGraph(decoded), options);
+    uint32_t comparisons = 0;
+    for (const auto* block : program.blocks) {
+      for (const auto& inst : *block) {
+        if (inst.GetOpcode() != IR::ValueOpcode::FPOrdEqual32) continue;
+        Check(inst.Flags<IR::FPCompareFlags>().flush_input_denorms ==
+                  (comparisons == 0 && (mode & 0x10u) == 0),
+              "compute input mode leaked into preserved or promoted F16 comparison");
+        comparisons++;
+      }
+    }
+    Check(comparisons == 2, "comparison input-mode fixture did not translate both precisions");
+  }
+}
+
 void TestNewShaderRecompilerSignedCompareAlu() {
   const uint32_t shader[] = {
       EncodeSMovB32(0, 193),   // s0 = -1
@@ -13582,6 +13611,7 @@ int main() {
   TestNewShaderRecompilerCapturedVopcSdwaCmpxLtU16();
   TestNewShaderRecompilerIrLookupMissFailsExplicitly();
   TestNewShaderRecompilerRejectsDppOn64BitCompares();
+  TestFloatComparisonInputModes();
   TestPsInputCountRegisterDecode();
   TestPixelAncillaryLayerInput();
   TestNewShaderRecompilerUnbasedFlatUsesBda();

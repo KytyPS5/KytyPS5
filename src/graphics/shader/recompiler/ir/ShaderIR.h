@@ -147,6 +147,7 @@ struct SamplerResource {
 	uint32_t first_use_pc          = 0;
 	bool     force_point_filtering = false;
 	bool     depth_compare         = false;
+	bool     integer_border        = false;
 
 	bool operator==(const SamplerResource& other) const = default;
 };

@@ -9584,6 +9584,83 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  void CheckSamplerBorderColors() {
+    constexpr const char *name = "SamplerBorderColors";
+    auto &context = RuntimeRenderer();
+    constexpr std::array<std::array<float, 2>, 5> coordinates{{
+        {{0.5f, -1.f}}, {{-1.f, 0.5f}}, {{2.f, 0.5f}},
+        {{0.5f, 2.f}}, {{0.5f, 0.5f}}}};
+    std::array<vk::Sampler, 3> float_samplers{};
+    for (const bool integer : {false, true}) {
+      auto image = CreateImage2D(name, 2, 2,
+          integer ? vk::Format::eR8G8B8A8Uint : vk::Format::eR8G8B8A8Unorm,
+          vk::ImageUsageFlagBits::eSampled, std::vector<u32>(4, 0xffffffffu), 1,
+          vk::ImageLayout::eShaderReadOnlyOptimal);
+      for (const auto border : {Prospero::SamplerBorderColor::kOpaqueWhite,
+                                Prospero::SamplerBorderColor::kOpaqueBlack,
+                                Prospero::SamplerBorderColor::kTransBlack}) {
+        ShaderSamplerResource sampler_descriptor{};
+        const auto clamp = static_cast<u32>(Prospero::SamplerClampMode::kClampBorder);
+        sampler_descriptor.fields[0] = clamp | (clamp << 3u);
+        sampler_descriptor.fields[2] = 1u << 24u;
+        sampler_descriptor.fields[3] = static_cast<u32>(border) << 30u;
+        TestCase test;
+        test.name = name;
+        test.has_user_data = true;
+        test.user_data = MakeSampledTextureData(integer ? Prospero::BufferFormat::k8_8_8_8UInt
+                                                        : Prospero::BufferFormat::k8_8_8_8UNorm);
+        test.user_data[2] = 1u | (1u << 14u);
+        std::copy_n(sampler_descriptor.fields, 4, test.user_data.begin() + 8);
+        test.user_data[50] = coordinates.size() * 4u * sizeof(u32);
+        test.user_data[51] = 3u << 28u;
+        test.opcodes = {ShaderOpcode::V_MOV_B32, ShaderOpcode::IMAGE_SAMPLE,
+                        ShaderOpcode::BUFFER_STORE_DWORD, ShaderOpcode::S_ENDPGM};
+        for (u32 sample = 0; sample < coordinates.size(); ++sample) {
+          AppendVMovLiteral(&test.code, 20, std::bit_cast<u32>(coordinates[sample][0]));
+          AppendVMovLiteral(&test.code, 21, std::bit_cast<u32>(coordinates[sample][1]));
+          test.code.push_back(EncodeMimg0(0x20, 0xf));
+          test.code.push_back(EncodeMimg1(0, 20, 0, 2));
+          for (u32 channel = 0; channel < 4; ++channel) {
+            AppendStoreVgpr(&test.code, channel, sample * 4u + channel);
+            const bool inside = sample == coordinates.size() - 1u;
+            const bool one = inside || border == Prospero::SamplerBorderColor::kOpaqueWhite ||
+                (border == Prospero::SamplerBorderColor::kOpaqueBlack && channel == 3u);
+            test.expected.push_back(one ? (integer ? (inside ? 255u : 1u) : 0x3f800000u) : 0u);
+          }
+        }
+        AppendEnd(&test.code);
+        const auto compiled = CompileCase(test, SubgroupSize());
+        const auto &sampler_info = compiled.program.info.samplers[0];
+        Require(name, "sampler specialization", sampler_info.integer_border == integer,
+                "sampled image numeric type did not select its sampler border class");
+        auto output = CreateStorageBuffer(name, {}, test.expected.size());
+        const auto sampler = context.GetSamplerCache().GetSampler(
+            sampler_descriptor, sampler_info.integer_border);
+        Require(name, "sampler reuse",
+                sampler == context.GetSamplerCache().GetSampler(sampler_descriptor, integer),
+                "identical typed sampler descriptors did not reuse the cached sampler");
+        if (integer) {
+          Require(name, "typed border cache key", sampler != float_samplers[static_cast<u32>(border)],
+                  "integer image reused the floating-point border sampler");
+        } else {
+          float_samplers[static_cast<u32>(border)] = sampler;
+        }
+        Dispatch(test, compiled, output, nullptr, &image, nullptr, nullptr, sampler);
+        const auto actual = ReadBuffer(name, output, test.expected.size());
+        for (u32 i = 0; i < actual.size(); ++i) {
+          if (actual[i] != test.expected[i]) {
+            Fail(name, "native border sample", "integer=" + std::to_string(integer) +
+                " border=" + std::to_string(static_cast<u32>(border)) + " word=" + std::to_string(i) +
+                " expected=" + std::to_string(test.expected[i]) + " actual=" + std::to_string(actual[i]));
+          }
+        }
+        DestroyBuffer(&output);
+      }
+      DestroyImage(&image);
+    }
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckComparisonDepthTexture() {
     constexpr const char *name = "ComparisonDepthTexture";
     constexpr uintptr_t base = 0x0000000204200000ull;
@@ -9702,7 +9779,8 @@ public:
       scheduler.Finish();
 
       auto output = CreateStorageBuffer(name, {}, test.expected.size());
-      const auto sampler = context.GetSamplerCache().GetSampler(sampler_descriptor);
+      const auto sampler = context.GetSamplerCache().GetSampler(
+          sampler_descriptor, compiled.program.info.samplers[0].integer_border);
       Image sampled;
       sampled.view = view;
       sampled.layout = image.backing.state.layout;
@@ -10713,7 +10791,8 @@ public:
               texture_cache, scheduler.Current(), lod_binding.image_id,
               {vk::ImageAspectFlagBits::eColor, mip, 1, 0, 1}, clear);
         }
-        const auto sampler = context.GetSamplerCache().GetSampler(lod_sampler);
+        const auto sampler = context.GetSamplerCache().GetSampler(
+            lod_sampler, lod_program.program.info.samplers[0].integer_border);
         auto output = CreateStorageBuffer(lod_test.name, {}, 1);
         struct LodCase {
           uint32_t base_level;
@@ -32244,10 +32323,10 @@ void CheckImageSamplerSpecialization() {
   sampled_image.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
   sampled_image.read = true;
   mixed_sampler_program.info.images = {sampled_image, sampled_image,
-                                       sampled_image};
+                                       sampled_image, sampled_image};
   mixed_sampler_program.info.samplers.push_back({0u, 4u});
   mixed_sampler_program.info.sampled_pairs = {
-      {0u, 0u, 8u}, {1u, 0u, 12u}, {2u, 0u, 16u}};
+      {0u, 0u, 8u}, {1u, 0u, 12u}, {2u, 0u, 16u}, {3u, 0u, 20u}};
   ShaderRecompiler::IR::MemoryInfo signed_memory;
   signed_memory.kind = ShaderRecompiler::IR::ResourceKind::Image;
   signed_memory.resource = 2u;
@@ -32297,11 +32376,16 @@ void CheckImageSamplerSpecialization() {
   signed_image_descriptor.dwords[0] = 0x3000u;
   signed_image_descriptor.dwords[1] =
       static_cast<uint32_t>(Prospero::BufferFormat::k32SInt) << 20u;
+  auto unsigned_image_descriptor = native_image_descriptor;
+  unsigned_image_descriptor.dwords[0] = 0x4000u;
+  unsigned_image_descriptor.dwords[1] =
+      static_cast<uint32_t>(Prospero::BufferFormat::k32UInt) << 20u;
 
   ShaderRecompiler::IR::DescriptorValue sampler_descriptor{};
   sampler_descriptor.dword_count = 4;
   const std::array descriptors{native_image_descriptor, packed_image_descriptor,
-                               signed_image_descriptor, sampler_descriptor};
+                               signed_image_descriptor, unsigned_image_descriptor,
+                               sampler_descriptor};
   mixed_sampler_program.descriptor_sources.resize(descriptors.size());
   for (u32 source = 0; source < descriptors.size(); source++) {
     auto &destination = mixed_sampler_program.descriptor_sources[source];
@@ -32313,7 +32397,7 @@ void CheckImageSamplerSpecialization() {
   for (u32 image = 0; image < mixed_sampler_program.info.images.size(); image++) {
     mixed_sampler_program.info.images[image].source = image;
   }
-  mixed_sampler_program.info.samplers[0].source = 3;
+  mixed_sampler_program.info.samplers[0].source = 4;
   mixed_sampler_program.srt_plan_complete = true;
   auto mixed_sampler_plan =
       ShaderRecompiler::IR::ExtractResourcePlan(mixed_sampler_program);
@@ -32327,16 +32411,21 @@ void CheckImageSamplerSpecialization() {
   ShaderRecompiler::IR::ApplyResourceSpecialization(
       mixed_sampler_program, mixed_sampler_specialization);
   Require("ImageSamplerSpecialization", "mixed sampler variant",
-          mixed_sampler_program.info.samplers.size() == 2u &&
+          mixed_sampler_program.info.samplers.size() == 3u &&
               !mixed_sampler_program.info.samplers[0].force_point_filtering &&
-              mixed_sampler_program.info.samplers[1].force_point_filtering &&
+              !mixed_sampler_program.info.samplers[0].integer_border &&
+              !mixed_sampler_program.info.samplers[1].force_point_filtering &&
+              mixed_sampler_program.info.samplers[1].integer_border &&
+              mixed_sampler_program.info.samplers[2].force_point_filtering &&
+              mixed_sampler_program.info.samplers[2].integer_border &&
               mixed_sampler_program.info.sampled_pairs[0].sampler == 0u &&
-              mixed_sampler_program.info.sampled_pairs[1].sampler == 1u &&
-              mixed_sampler_program.info.sampled_pairs[2].sampler == 1u &&
-              mixed_sampler_program.memory_info[0].sampler == 1u &&
-              mixed_sampler_snapshot.samplers.size() == 2u,
-          "a shared float/integer sampler was not split into point and native "
-          "variants or the signed instruction retained the native sampler");
+              mixed_sampler_program.info.sampled_pairs[1].sampler == 2u &&
+              mixed_sampler_program.info.sampled_pairs[2].sampler == 2u &&
+              mixed_sampler_program.info.sampled_pairs[3].sampler == 1u &&
+              mixed_sampler_program.memory_info[0].sampler == 2u &&
+              mixed_sampler_snapshot.samplers.size() == 3u,
+          "a shared float/unsigned/signed sampler lost its border or filtering "
+          "class in the compiled bindings, instruction or descriptor snapshot");
 
   std::printf("[host]    %-32s ok\n", "ImageSpecializationPipelineId");
 }
@@ -33368,7 +33457,7 @@ void CheckPm4Predication(RenderContext &renderer) {
     const auto predicated_address = reinterpret_cast<uint64_t>(&predicated);
     const auto unconditional_address = reinterpret_cast<uint64_t>(&unconditional);
     return std::array<uint32_t, 14>{
-        // Captured AGC form: c0022000 00010100 <query low> <query high>.
+        // Captured packet form: c0022000 00010100 <query low> <query high>.
         0xc0022000u, (op << 16u) | (wait << 12u) | (condition << 8u),
         static_cast<uint32_t>(address), static_cast<uint32_t>(address >> 32u),
         KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0) | 1u, 0,
@@ -34310,7 +34399,7 @@ void CheckPm4ContextStateOperations(RenderContext &renderer) {
               processor.GetCtx().GetRenderTargetMask() == 0x0badc0de,
           "CLEAR_STATE discarded the pushed Cx state");
 
-  // AGC CLEAR_STATE restores the viewport, scissor, and guard-band register defaults.
+  // CLEAR_STATE restores the viewport, scissor, and guard-band register defaults.
   processor.GetCtx().SetScreenScissor(1, 2, 3, 4);
   processor.GetCtx().SetGuardBands(2.0f, 3.0f, 4.0f, 5.0f);
   Pm4Execution scissor_reset;
@@ -34369,7 +34458,7 @@ void CheckPm4ContextStateOperations(RenderContext &renderer) {
               Gen5::AgcDcbContextStateOpGetSize(2) == 108 &&
               Gen5::AgcDcbContextStateOpGetSize(3) == 128 &&
               Gen5::AgcDcbContextStateOpGetSize(4) == 0,
-          "context-state HLE sizes do not match libSceAgc");
+          "context-state HLE sizes do not match the expected packet layout");
   std::printf("[host]    %-32s ok\n", "Pm4ContextState");
 }
 
@@ -35102,6 +35191,12 @@ int main(int argc, char **argv) {
     vulkan.CheckBufferCacheDirtyGarbageCollection();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--sampler-border-only") == 0) {
+    CheckImageSamplerSpecialization();
+    VulkanHarness vulkan;
+    vulkan.CheckSamplerBorderColors();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--sampled-depth-resource-only") == 0) {
     VulkanHarness vulkan;
     CheckSampledDepthResource();
@@ -35192,6 +35287,7 @@ int main(int argc, char **argv) {
   CheckImageTransitionState(vulkan.RuntimeRenderer());
   CheckSampledDepthResource();
   CheckDepthTextureEncoding();
+  vulkan.CheckSamplerBorderColors();
   vulkan.CheckComparisonDepthTexture();
   vulkan.CheckRasterization(true);
   CheckBasicStorageTextureDescriptor();

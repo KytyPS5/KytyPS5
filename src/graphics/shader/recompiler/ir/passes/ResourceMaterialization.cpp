@@ -107,14 +107,16 @@ Prospero::BufferFormat ImageConversionFormat(Prospero::BufferFormat format) {
 	                                                      : Prospero::BufferFormat::kInvalid;
 }
 
-bool RequiresPointSampler(const ImageResource& image) {
-	return image.numeric_class == Prospero::TextureNumericClass::Sint ||
-	       image.conversion_format != Prospero::BufferFormat::kInvalid;
-}
+enum class SamplerClass : uint8_t { Float, Integer, PointInteger };
 
-bool RequiresPointSampler(const ResourceSpecialization::Image& image) {
-	return image.numeric_class == Prospero::TextureNumericClass::Sint ||
-	       image.conversion_format != Prospero::BufferFormat::kInvalid;
+template <typename Image>
+SamplerClass ClassifySampler(const Image& image) {
+	if (image.numeric_class == Prospero::TextureNumericClass::Sint ||
+	    image.conversion_format != Prospero::BufferFormat::kInvalid) {
+		return SamplerClass::PointInteger;
+	}
+	return image.numeric_class == Prospero::TextureNumericClass::Uint ? SamplerClass::Integer
+	                                                               : SamplerClass::Float;
 }
 
 bool DescriptorIsCube(const DescriptorValue& descriptor) {
@@ -380,8 +382,13 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 } // namespace
 
 struct SamplerPlan {
-	std::array<uint32_t, ShaderInfo::MaxSamplers> point_sampler {};
-	uint32_t                                      sampler_count = 0;
+	struct Binding {
+		uint32_t     source;
+		SamplerClass type;
+	};
+	std::array<std::array<uint32_t, 3>, ShaderInfo::MaxSamplers> mapping;
+	std::array<Binding, ShaderInfo::MaxSamplers>                bindings;
+	uint32_t                                                  sampler_count = 0;
 };
 
 struct ImageRemap {
@@ -595,11 +602,9 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 	if (!BuildSamplerPlan(program.info, specialization.images, sampler_plan)) {
 		return SpecializationFail("specialized sampler layout exceeds its resource limit");
 	}
-	for (uint32_t index = 0; index < program.info.samplers.size(); index++) {
-		const auto target = sampler_plan.point_sampler[index];
-		if (target != UINT32_MAX && target >= program.info.samplers.size()) {
-			snapshot.samplers.push_back(snapshot.samplers[index]);
-		}
+	for (uint32_t index = static_cast<uint32_t>(program.info.samplers.size());
+	     index < sampler_plan.sampler_count; index++) {
+		snapshot.samplers.push_back(snapshot.samplers[sampler_plan.bindings[index].source]);
 	}
 	ImageRemap(specialization).Apply(snapshot.images);
 	return true;
@@ -607,29 +612,29 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 
 template <typename Images>
 bool BuildSamplerPlan(const ShaderInfo& base, const Images& images, SamplerPlan& plan) {
-	if (base.samplers.size() > plan.point_sampler.size()) {
+	if (base.samplers.size() > plan.mapping.size()) {
 		return false;
 	}
 	std::array<uint8_t, ShaderInfo::MaxSamplers> usage {};
-	plan.point_sampler.fill(UINT32_MAX);
 	plan.sampler_count = static_cast<uint32_t>(base.samplers.size());
 	for (const auto& pair: base.sampled_pairs) {
 		if (pair.image >= images.size() || pair.sampler >= base.samplers.size()) {
 			return false;
 		}
-		usage[pair.sampler] |= RequiresPointSampler(images[pair.image]) ? 2u : 1u;
+		usage[pair.sampler] |= 1u << static_cast<uint32_t>(ClassifySampler(images[pair.image]));
 	}
 	for (uint32_t index = 0; index < base.samplers.size(); index++) {
-		if ((usage[index] & 2u) == 0u) {
-			continue;
-		}
-		if ((usage[index] & 1u) == 0u) {
-			plan.point_sampler[index] = index;
-		} else {
-			if (plan.sampler_count >= ShaderInfo::MaxSamplers) {
-				return false;
-			}
-			plan.point_sampler[index] = plan.sampler_count++;
+		auto& mapping = plan.mapping[index];
+		mapping.fill(UINT32_MAX);
+		const auto classes = usage[index] == 0u ? 1u : usage[index];
+		bool       first   = true;
+		for (uint32_t type = 0; type < mapping.size(); type++) {
+			if ((classes & (1u << type)) == 0u) continue;
+			const auto target = first ? index : plan.sampler_count++;
+			if (target >= ShaderInfo::MaxSamplers) return false;
+			mapping[type]         = target;
+			plan.bindings[target] = {index, static_cast<SamplerClass>(type)};
+			first                = false;
 		}
 	}
 	return true;
@@ -1105,25 +1110,18 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 	auto samplers      = program.info.samplers;
 	auto sampled_pairs = program.info.sampled_pairs;
 	samplers.reserve(sampler_plan.sampler_count);
-	for (uint32_t index = 0; index < program.info.samplers.size(); index++) {
-		const auto target = sampler_plan.point_sampler[index];
-		if (target == UINT32_MAX) {
-			continue;
+	for (uint32_t index = 0; index < sampler_plan.sampler_count; index++) {
+		const auto& binding = sampler_plan.bindings[index];
+		if (index >= program.info.samplers.size()) {
+			samplers.push_back(program.info.samplers[binding.source]);
 		}
-		if (target == index) {
-			samplers[index].force_point_filtering = true;
-		} else {
-			EXIT_IF(target != samplers.size());
-			auto sampler                  = samplers[index];
-			sampler.force_point_filtering = true;
-			samplers.push_back(std::move(sampler));
-		}
+		samplers[index].force_point_filtering = binding.type == SamplerClass::PointInteger;
+		samplers[index].integer_border        = binding.type != SamplerClass::Float;
 	}
 	for (auto& pair: sampled_pairs) {
-		if (RequiresPointSampler(images[pair.image])) {
-			EXIT_IF(sampler_plan.point_sampler[pair.sampler] == UINT32_MAX);
-			pair.sampler = sampler_plan.point_sampler[pair.sampler];
-		}
+		const auto type = static_cast<uint32_t>(ClassifySampler(images[pair.image]));
+		pair.sampler = sampler_plan.mapping[pair.sampler][type];
+		EXIT_IF(pair.sampler == UINT32_MAX);
 		samplers[pair.sampler].depth_compare |= images[pair.image].depth_compare;
 	}
 
@@ -1201,10 +1199,11 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 				inst.ReplaceUsesWith(Value(&*result));
 				continue;
 			}
-			if (image_opcode.needs_sampler && RequiresPointSampler(image) &&
+			if (image_opcode.needs_sampler &&
 			    memory.sampler < program.info.samplers.size()) {
-				EXIT_IF(sampler_plan.point_sampler[memory.sampler] == UINT32_MAX);
-				memory.sampler = sampler_plan.point_sampler[memory.sampler];
+				const auto type = static_cast<uint32_t>(ClassifySampler(image));
+				memory.sampler = sampler_plan.mapping[memory.sampler][type];
+				EXIT_IF(memory.sampler == UINT32_MAX);
 			}
 			EXIT_IF(image.indirect_root == memory.resource &&
 			        inst.GetOpcode() != ValueOpcode::ImageSampleRaw);

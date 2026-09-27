@@ -2799,6 +2799,16 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 			auto& inst = *it;
 			if (BufferAccessOf(inst.GetOpcode()) == BufferAccess::Read) {
 				const auto& memory = memory_info[inst.Flags<MemoryFlags>().index];
+				if (memory.kind == ResourceKind::Buffer && memory.buffer_table != UINT32_MAX) {
+					EXIT_IF(memory.buffer_table >= specialization.buffer_tables.size());
+					for (const auto resource : specialization.buffer_tables[memory.buffer_table].resources) {
+						EXIT_IF(resource >= specialization.buffers.size());
+						if (specialization.buffers[resource].zero_stride_oob) {
+							EXIT("bounded zero-stride mode-0 vector reads require candidate-specific lowering");
+						}
+					}
+					continue;
+				}
 				if (memory.kind == ResourceKind::Buffer &&
 				    specialization.buffers[memory.resource].zero_stride_oob) {
 					// Bounds mode 0 checks offset >= stride, so zero stride

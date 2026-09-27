@@ -3777,6 +3777,44 @@ void TestBoundedBufferBindingCollection() {
              "invalid buffer table candidate", "out-of-range bounded candidate was accepted");
 }
 
+void TestBoundedVectorTableSpecialization() {
+  for (const uint32_t count : {0u, 1u}) {
+    for (const bool zero_stride : {false, true}) {
+      if (count == 0u && zero_stride) continue;
+      Fixture fixture;
+      fixture.program.resource_tracking_complete = true;
+      fixture.program.descriptor_sources.resize(1u);
+      fixture.program.descriptor_sources[0].dword_count = 4u;
+      fixture.program.descriptor_sources[0].bounded_buffer.emplace();
+      fixture.program.info.buffers.push_back({.source = 0u});
+      MemoryInfo memory;
+      memory.kind = ResourceKind::Buffer;
+      memory.buffer_table = 0u;
+      const auto flags = fixture.AddMemory(memory, 4u);
+      const auto handle = fixture.Buffer({Value(0u), Value(0u), Value(0u), Value(0u)});
+      const auto load = fixture.Emit(ValueOpcode::LoadBufferU32,
+          {handle, Value(0u), Value(0u), Value(0u), Value(true)}, flags);
+      fixture.Emit(ValueOpcode::ReferenceU32, {load});
+      ResourceSpecialization specialization;
+      specialization.buffer_tables.push_back({.count = count});
+      if (count != 0u) {
+        specialization.buffer_origins.push_back(0u);
+        specialization.buffers.push_back({.zero_stride_oob = zero_stride});
+        specialization.buffer_tables[0].resources.push_back(0u);
+      }
+      if (zero_stride) {
+        CheckFatal([&] { ApplyResourceSpecialization(fixture.program, specialization); },
+            "bounded zero-stride", "mode-0 bounded candidate was silently admitted");
+      } else {
+        ApplyResourceSpecialization(fixture.program, specialization);
+        Check(fixture.program.memory_info[flags.index].resource == UINT32_MAX &&
+                  load.ResolveInstruction()->GetOpcode() == ValueOpcode::LoadBufferU32,
+              "table read was treated as one direct dense buffer");
+      }
+    }
+  }
+}
+
 void TestResourceLimitIsTransactional() {
   // MaxBuffers capacity contract: exact capacity must survive CollectShaderInfo
   // and AllocateBindings without truncating the dense buffer table.
@@ -6875,6 +6913,7 @@ int main(int argc, char** argv) {
     Run("image binding ABI", TestImageBindingAbi);
     Run("graphics push constants", TestGraphicsPushConstantLayout);
     Run("bounded buffer binding collection", TestBoundedBufferBindingCollection);
+    Run("bounded vector table specialization", TestBoundedVectorTableSpecialization);
     Run("resource limit", TestResourceLimitIsTransactional);
     Run("malformed memory kinds", TestMalformedMemoryKindsRejected);
   } catch (const std::exception &exception) {

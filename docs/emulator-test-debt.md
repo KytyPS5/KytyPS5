@@ -143,6 +143,22 @@ pre-fix collector (`merge-bounded-bindings-valid-red-20260927.txt`) and passes
 with candidate collection (`merge-bounded-bindings-valid-green-20260927.txt`).
 Full native rebuild, shader validation and original game retry remain required.
 
+Second game retry (`yotei-integrated-20260927-201838-menucheck-gpuav-sync`,
+`e47a15c7`, exit 321) passes the collector and exposes a CPU AV in
+`ApplyResourceSpecialization` (RVA 0x268ce7): upstream zero-stride read rewriting
+indexes a logical-table access as a direct dense resource. Before fixing it,
+add empty/nonempty vector-table application tests with preserved live reads.
+A vector table containing a mode-0 zero-stride candidate needs candidate-specific
+zero/default-format lowering; reject that unsupported combination explicitly
+until its independent numerical GPU regression exists. Do not disable the
+existing direct zero-stride rewrite or treat every table candidate as zero.
+
+Vector-table application CPU RED reproduces the native AV without Vulkan:
+`merge-table-vector-red-20260927.txt`, exit 0xc0000005. Unchanged GREEN:
+`merge-table-vector-green-20260927.txt`, exit 0, empty and nonempty table reads
+remain explicit and mode-0 zero-stride candidates fail with the supported-case
+boundary. Candidate-specific zero/default-format GPU lowering is pending.
+
 ## Restored RO aligned-upload regression source (2026-09-27)
 
 The historical RED/GREEN logs existed but the selector implementation had been

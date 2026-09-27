@@ -85,6 +85,16 @@ bool CollectMemoryResources(const Program& program, std::vector<uint32_t>& buffe
 	return uses_gds;
 }
 
+bool UsesFlattenedSrt(const Program& program) {
+	return std::ranges::any_of(program.blocks, [](const Block* block) {
+		return std::ranges::any_of(*block, [](const Inst& inst) {
+			return inst.GetOpcode() == ValueOpcode::ReadConst;
+		});
+	}) || std::ranges::any_of(program.info.images, [](const ImageResource& image) {
+		return image.indirect_search_iterations != 0u;
+	});
+}
+
 void AllocateBindings(Program& program, uint32_t push_data_start_dword) {
 	if (!program.shader_info_complete || program.binding_layout_complete) {
 		EXIT("shader binding layout failed: %s", !program.shader_info_complete
@@ -145,12 +155,7 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword) {
 		AddBinding(next, DescriptorBindingKind::BdaPagetable);
 		AddBinding(next, DescriptorBindingKind::FaultBuffer);
 	}
-	const bool uses_flattened_runtime =
-	    !program.srt_reads.empty() ||
-	    std::ranges::any_of(program.info.images, [](const ImageResource& image) {
-		    return image.indirect_search_iterations != 0u;
-	    });
-	if (uses_flattened_runtime) {
+	if (UsesFlattenedSrt(program)) {
 		AddBinding(next, DescriptorBindingKind::FlattenedSrt);
 	}
 

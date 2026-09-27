@@ -634,6 +634,45 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	const auto emit_begin = std::chrono::steady_clock::now();
 	auto& ir = translated.program;
 	IR::ApplyResourceSpecialization(ir, specialization);
+	// The resource plan owns host descriptor evaluation now. Keep only dependencies consumed
+	// by GPU memory operations; bound descriptor dwords must not retain shader instructions.
+	for (auto& inst: ir.value_storage) {
+		inst.Invalidate();
+	}
+	for (auto* block: ir.blocks) {
+		for (auto& inst: *block) {
+			const auto op = inst.GetOpcode();
+			if (op == IR::ValueOpcode::ReferenceU32) {
+				const auto* read = inst.Arg(0).Resolve().TryInstruction();
+				if (read != nullptr &&
+				    (read->GetOpcode() == IR::ValueOpcode::LoadAddressU32 ||
+				     read->GetOpcode() == IR::ValueOpcode::ReadConstBuffer) &&
+				    ir.memory_info[read->Flags<IR::MemoryFlags>().index].planning_only) {
+					inst.Invalidate();
+				}
+				continue;
+			}
+			uint32_t first = 0;
+			if (op == IR::ValueOpcode::GetBufferResource) {
+				if (std::ranges::any_of(inst.Uses(), [&](const IR::Use& use) {
+					return ir.memory_info[use.user->Flags<IR::MemoryFlags>().index].kind ==
+					       IR::ResourceKind::IndirectBuffer;
+				})) {
+					continue;
+				}
+			} else if (op == IR::ValueOpcode::GetImageResource) {
+				const auto resource = inst.Flags<uint32_t>();
+				first = resource < ir.info.images.size() &&
+				                ir.info.images[resource].indirect_root == resource ? 1u : 0u;
+			} else if (op != IR::ValueOpcode::GetSamplerResource) {
+				continue;
+			}
+			for (size_t index = first; index < inst.NumArgs(); index++) {
+				inst.SetArg(index, IR::Value(0u));
+			}
+		}
+	}
+	ir.value_storage.clear();
 	IR::RemoveIdentities(ir.blocks);
 	IR::EliminateDeadCode(ir.blocks);
 

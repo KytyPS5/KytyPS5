@@ -35383,13 +35383,20 @@ void CheckIndirectImageKeySwitch(
         definitions[words[2]] = words;
       } else if (opcode == spv::OpImageSampleExplicitLod) {
         const auto coord = definitions[words[4]];
-        const auto lod = definitions[words[6]];
+        auto lod = definitions.at(words[6]);
+        if (lod.size() == 4u &&
+            static_cast<spv::Op>(lod[0] & 0xffffu) == spv::OpBitcast) {
+          lod = lod[3] < definitions.size() ? definitions[lod[3]]
+                                           : std::span<const u32>{};
+        }
         const auto components = samples == (cube_first ? 1u : 0u) ? 2u : 3u;
         Require(name, "mixed coordinate and LOD layout",
-                !coord.empty() && definitions[coord[1]][3] == components &&
+                coord.size() >= 2u && coord[1] < definitions.size() &&
+                    definitions[coord[1]].size() == 4u &&
+                    definitions[coord[1]][3] == components &&
                     words[5] == spv::ImageOperandsLodMask && lod.size() == 4u &&
-                    definitions[lod[3]].size() == 4u &&
-                    definitions[lod[3]][3] == std::bit_cast<u32>(2.0f),
+                    static_cast<spv::Op>(lod[0] & 0xffffu) == spv::OpConstant &&
+                    lod[3] == std::bit_cast<u32>(2.0f),
                 "candidate coordinates changed the instruction's LOD operand");
         samples++;
       }
@@ -36948,9 +36955,9 @@ TestCase MakeCvt32ToF64Case(const char* name, bool unsigned_input,
   // Both descriptors address the one native test buffer. Input is the first
   // 32 DWORDs; all writes are in four separate output planes after it.
   test.user_data[2] = total_dwords * sizeof(u32);
-  test.user_data[3] = DstSel(4, 5, 6, 7);
+  test.user_data[3] = DstSel(4, 5, 6, 7) | (3u << 28u);
   test.user_data[50] = total_dwords * sizeof(u32);
-  test.user_data[51] = DstSel(4, 5, 6, 7);
+  test.user_data[51] = DstSel(4, 5, 6, 7) | (3u << 28u);
   test.initial.assign(total_dwords, 0xfeedfaceu);
   for (u32 lane = 0; lane < lanes; ++lane) {
     test.initial[lane] = values[lane % values.size()].input;
@@ -37065,9 +37072,9 @@ TestCase MakeF64ArithmeticBase(const char* name, u32 input_planes,
   test.compute_info.wave_size = 32;
   test.has_user_data = true;
   test.user_data[2] = words * sizeof(u32);
-  test.user_data[3] = DstSel(4, 5, 6, 7);
+  test.user_data[3] = DstSel(4, 5, 6, 7) | (3u << 28u);
   test.user_data[50] = words * sizeof(u32);
-  test.user_data[51] = DstSel(4, 5, 6, 7);
+  test.user_data[51] = DstSel(4, 5, 6, 7) | (3u << 28u);
   test.initial.assign(words, 0xfeedfaceu);
   test.expected = test.initial;
   AppendSMovLiteral(&test.code, 126, 0xffffffffu);

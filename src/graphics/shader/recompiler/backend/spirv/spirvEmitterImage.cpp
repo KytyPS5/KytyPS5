@@ -859,7 +859,9 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto  layout         = Layout(mem, dimension);
 		const auto  numeric_class  = image.numeric_class;
 		const bool  dref           = HasFlag(mem, Decoder::ImageSampleFlagCompare);
-		const bool  manual_compare = state.specialization.images[mem.resource].needs_manual_depth_compare;
+		const bool  manual_compare =
+		    dref && !state.specialization.images.empty() &&
+		    state.specialization.images.at(mem.resource).needs_manual_depth_compare;
 		if (dref && state.program.info.images[mem.resource].conversion_format !=
 		                Prospero::BufferFormat::kInvalid) {
 			ctx.Fail(inst, "uses depth comparison with a packed integer image");
@@ -1024,10 +1026,10 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			const auto& selected_image = state.program.info.images[resource];
 			const auto candidate_dimension = selected_image.dimension;
 			const auto& candidate_dimension_info = ImageDimensionInfoFor(candidate_dimension);
-			const auto candidate_layout = Layout(mem, candidate_dimension);
+			const auto candidate_layout = Layout(mem, mem.image_dimension);
 			const auto candidate_coord =
 			    CoordF32(ctx, mem, *address, candidate_layout.coord,
-			             candidate_dimension_info.coordinate_components);
+			             candidate_dimension_info.coordinate_components, selected_image.cube);
 			uint32_t candidate_dref_value = 0;
 			if (dref) {
 				candidate_dref_value = candidate_layout.dref != NoImageComponent

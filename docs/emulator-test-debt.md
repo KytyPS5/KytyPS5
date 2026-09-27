@@ -85,10 +85,15 @@ explicitly, and retain the separate zero-stride mode-0 rejection GPU fixtures.
 Evidence: `merge-gpu-f64-arithmetic-20260927.txt.stderr` and conversion log.
 
 Indirect-image selector RED is a host test AV (`merge-gpu-indirect-image-20260927.txt`,
-Application Error fault module is the test EXE). Its SPIR-V assertion treats
-an `OpConstant` literal as an SSA ID while inspecting LOD. Accept both direct
-float constants and the equivalent bitcast of integer constants with bounds
-checks, preserving the exact 2.0 LOD and coordinate-dimension oracles.
+Application Error fault module is the test EXE). A diagnostic native link map localizes the AV to `EmitImage`: ordinary
+non-comparison sampling unconditionally reads an empty optional specialization
+array for `needs_manual_depth_compare`. Preserve the unchanged indirect-image
+fixtures; only comparison instructions with supplied specialization need that
+lookup. Evidence: `merge-indirect-map-crash-20260927.txt` and
+`_Build/analysis/indirect-diagnostic.map` (fault RVA 0x3a633e).
+Separately, the fixture's SPIR-V assertion treats an `OpConstant` literal as an
+SSA ID while inspecting LOD. Accept direct float constants and equivalent
+bitcasts with bounds checks, preserving exact 2.0 LOD and coordinate dimensions.
 
 GPU checkpoint: SDWA MOV GREEN (`merge-sdwa-green-20260927.txt`), all ten
 FP64 conversion cases GREEN (`merge-f64-conversion-green-20260927.txt`).
@@ -98,6 +103,25 @@ rounding, then `RcpF64OddConvertedIntegersWithinIsaError` terminates with
 Evidence: `merge-f64-arithmetic-green-20260927.txt` and its `.run.json`;
 Windows Application Error event confirms the driver module. Do not claim the
 arithmetic selector GREEN; an isolated saved-SPIR-V probe remains required.
+
+After removing that AV, the unchanged mixed-candidate key-switch test is RED:
+`merge-indirect-emitter-green-20260927.txt.stderr` reports missing shared cube
+coordinate conversion. The candidate sample path calls `CoordF32` without
+the selected image cube metadata. Preserve both cube-first permutations,
+the two coordinate-subtraction oracle, exact LOD and three sample cases;
+apply guest cube conversion for each candidate from decoded resource metadata.
+
+The same unchanged LOD oracle then exposes RED at mixed coordinate/LOD layout
+(`merge-cube-candidate-green-20260927.txt.stderr`): a 2D candidate relocates
+the LOD slot of an instruction decoded as 2D-array. Guest address operands
+follow decoded instruction metadata; candidate dimensions change host coordinate
+width, not the instruction LOD/bias/gradient slots. Preserve LOD=2.0 for
+both candidate orders before correcting the shared sample operand layout.
+
+Indirect-image selector GREEN after the shared emitter corrections:
+`merge-sample-layout-green-20260927.txt`, exit 0. Both mixed cube orders,
+exact LOD assertions and the numerical cube-gradient GPU case pass. Temporary
+disassembly instrumentation was removed; its RED artifact remains in `_Build/logs`.
 
 ## Restored RO aligned-upload regression source (2026-09-27)
 

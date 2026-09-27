@@ -9,7 +9,7 @@
 
 **[Weekly updates](https://github.com/KytyPS5/KytyPS5/discussions/862)** — game progress, recent fixes and upcoming work.
 
-**[Development on Discord](https://discord.com/channels/1525448264135213167/1530523021931057223)** — KytyPS5 development.
+**[Development on Discord](https://discord.gg/UNrkMqGaBg)** — KytyPS5 development.
 
 KytyPS5 is a free and open-source PlayStation 5 emulator written in C++ for Windows and Linux,
 with experimental macOS support. It is based on a heavily modified version of

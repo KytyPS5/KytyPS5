@@ -619,7 +619,10 @@ IR::U1 Translator::ReadMask(const Decoder::Operand& operand) {
 	if (operand.kind == Decoder::OperandKind::LiteralConstant ||
 	    operand.kind == Decoder::OperandKind::IntegerInlineConstant ||
 	    operand.kind == Decoder::OperandKind::FloatInlineConstant) {
-		return ThreadBit(ReadU32Pair(operand));
+		// Wave32 lane masks are 32-bit operands, which keep the single-precision encoding.
+		return ThreadBit(program.wave_size == 64u
+		                     ? ReadU32Pair(operand)
+		                     : std::array {ReadRawU32(operand), IR::U32(IR::Value(0u))});
 	}
 	switch (operand.kind) {
 		case Decoder::OperandKind::Sgpr: {

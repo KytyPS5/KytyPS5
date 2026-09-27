@@ -55,11 +55,9 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r) {
 			case Prospero::SamplerAnisoRatio::kTwo: aniso_ratio = 2.0f; break;
 			case Prospero::SamplerAnisoRatio::kFour: aniso_ratio = 4.0f; break;
 			case Prospero::SamplerAnisoRatio::kEight: aniso_ratio = 8.0f; break;
-			case Prospero::SamplerAnisoRatio::kSixteen: aniso_ratio = 16.0f; break;
-			default:
-				EXIT("unknown ratio: %d dwords=%08x,%08x,%08x,%08x\n",
-				     static_cast<int>(r.MaxAnisoRatio()), r.fields[0], r.fields[1], r.fields[2],
-				     r.fields[3]);
+			case Prospero::SamplerAnisoRatio::kSixteen:
+			// Reserved encodings 5-7 fall back to the maximum ratio.
+			default: aniso_ratio = 16.0f; break;
 		}
 	}
 

@@ -115,10 +115,16 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 	return m_mapped_ranges.Contains(vaddr, size);
 }
 
+uint64_t RenderContext::MappedRangesVersion() const noexcept {
+	std::shared_lock lock(m_mapped_ranges_mutex);
+	return m_mapped_ranges_version;
+}
+
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	std::lock_guard lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.Add(vaddr, size);
 	m_buffer_cache.QueueBdaSync(vaddr, size);
+	m_mapped_ranges_version++;
 }
 
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
@@ -143,6 +149,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		m_image_heap.UnmapMemory(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
+		m_mapped_ranges_version++;
 	};
 	// Shutdown still owns the GPU while queued rendering drains, but its command lane no
 	// longer accepts external work. Use the guest GPU's state for the teardown route.
@@ -158,6 +165,7 @@ void RenderContext::PrepareBda() {
 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
 		return true;
 	}();
+	m_buffer_cache.PrepareFaultBuffer();
 	std::shared_lock lock(m_mapped_ranges_mutex);
 	m_buffer_cache.SynchronizeBda(m_mapped_ranges);
 	m_fault_process_pending = true;
@@ -169,6 +177,11 @@ void RenderContext::RunGarbageCollector() {
 		m_buffer_cache.ProcessFaultBuffer();
 	}
 	m_image_heap.RunGarbageCollector();
+	if (m_indirect_write_tables.TakePendingWrites()) {
+		m_buffer_cache.ProcessWriteBuffer([this](std::span<const uint64_t> pages) {
+			m_indirect_write_tables.NoteWrites(pages);
+		});
+	}
 	m_texture_cache.ProcessDownloadImages();
 	m_texture_cache.RunGarbageCollector();
 	m_buffer_cache.RunGarbageCollector();

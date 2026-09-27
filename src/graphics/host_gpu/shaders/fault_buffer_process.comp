@@ -24,12 +24,14 @@ void main() {
     if (all(equal(words, uvec4(0u)))) {
         return;
     }
+    // Entry 0 holds the count; the bound area sets the capacity.
+    const uint capacity = uint(download_buffer.length());
     for (uint component = 0u; component < 4u; ++component) {
         uint word = words[component];
         const uint base_bit = (id * 4u + component) * 32u;
         while (word != 0u) {
             const uint store_index = atomicAdd(download_buffer32[0], 1u) + 1u;
-            if (store_index >= MAX_PAGE_FAULTS) {
+            if (store_index >= capacity) {
                 // Pages not reported stay set for the next scan.
                 fault_buffer[id][component] = word;
                 return;

@@ -190,6 +190,13 @@ public:
 	[[nodiscard]] const_iterator begin() const { return Iterator(*this, 0); }
 	[[nodiscard]] const_iterator end() const { return Iterator(*this, N); }
 
+	BitArray& operator|=(const BitArray& other) {
+		for (size_t word = 0; word < WORD_COUNT; word++) {
+			Store(word, Load(word) | other.Load(word));
+		}
+		return *this;
+	}
+
 	[[nodiscard]] BitArray operator~() const {
 		BitArray result;
 		for (size_t word = 0; word < WORD_COUNT; word++) {

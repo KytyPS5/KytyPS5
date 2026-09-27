@@ -50,6 +50,33 @@ static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::Descriptor
 	return true;
 }
 
+// Stores through V#s selected from a descriptor table write guest memory by device address.
+// Cache every target of the tables so the BDA page table covers them. Returns whether any table
+// names a target.
+static bool PrepareIndirectWriteTargets(RenderContext& context, const PreparedBindings& bindings) {
+	const auto& program = *bindings.runtime->program;
+	const auto& layout  = program.bindings;
+	if (layout.memory_offset_count == 0) {
+		return false;
+	}
+	// Buffer sources follow the bound resources, which leave out buffers the shader never
+	// accesses, not the shader's buffer list.
+	const auto& resources = layout.descriptors.front().resources;
+	bool        prepared  = false;
+	for (uint32_t i = 0; i < bindings.buffer_sources.size() && i < resources.size(); ++i) {
+		const auto& resource = program.info.buffers[resources[i]];
+		const auto& table    = bindings.buffer_sources[i];
+		if (!resource.indirect_write_table || table.address == 0 ||
+		    table.size <= resource.indirect_table_offset) {
+			continue;
+		}
+		prepared |=
+		    context.GetIndirectWriteTables().Prepare(table.address + resource.indirect_table_offset,
+		                                             table.size - resource.indirect_table_offset);
+	}
+	return prepared;
+}
+
 bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
                                                 const CommandBuffer&          buffer) {
 	const auto& program   = *input.stage.program;
@@ -343,6 +370,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		          bindings.shader_data.begin() + program.bindings.dispatch_thread_dword);
 	}
 	FindBuffers(bindings);
+	// New target buffers must exist before PrepareBda uploads the CPU writes of cached buffers.
+	const bool indirect_writes = PrepareIndirectWriteTargets(m_context, bindings);
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
 	}
@@ -355,7 +384,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
 	bool has_storage_writes = bindings.shared_memory.buffer != nullptr ||
-	    HasShaderBufferWrites(input_info.stage);
+	                          HasShaderBufferWrites(input_info.stage) || indirect_writes;
 	has_storage_writes =
 	    std::any_of(program.info.images.begin(), program.info.images.end(),
 	                [](const auto& image) {
@@ -459,6 +488,8 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	PrepareBindings(input_info.stage, bindings);
 	FindBuffers(bindings);
 	const auto& program = *input_info.stage.program;
+	// New target buffers must exist before PrepareBda uploads the CPU writes of cached buffers.
+	const bool indirect_writes = PrepareIndirectWriteTargets(m_context, bindings);
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
 	}
@@ -473,8 +504,9 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
 	const auto vk_buffer = buffer.Handle();
-	const bool has_storage_writes = bindings.shared_memory.buffer != nullptr ||
-	    HasShaderBufferWrites(input_info.stage) ||
+	const bool has_storage_writes =
+	    bindings.shared_memory.buffer != nullptr || HasShaderBufferWrites(input_info.stage) ||
+	    indirect_writes ||
 	    std::any_of(program.info.images.begin(), program.info.images.end(), [](const auto& image) {
 		    return image.written && image.resource_class ==
 		                                ShaderRecompiler::IR::ImageResourceClass::Storage;

@@ -4842,11 +4842,12 @@ void TestNewShaderRecompilerScalarMemoryBindingDomains() {
       };
 
   const uint32_t raw_shader[] = {
-      EncodeSmem0(0x00, 12, 4),
-      2u, // s_load_dword s12, s[8:9], s0 offset:2
+      EncodeSmem0(0x01, 12, 4),
+      2u, // s_load_dwordx2 s[12:13], s[8:9], s0 offset:2
       EncodeVop1(0x01, 0, 12),
-      EncodeExp0(0x00, 0x1),
-      EncodeExp1(0, 0, 0, 0),
+      EncodeVop1(0x01, 1, 13),
+      EncodeExp0(0x00, 0x3),
+      EncodeExp1(0, 1, 0, 0),
       EncodeSopp(0x01),
   };
   std::array<uint32_t, 12> raw_user_data{};
@@ -4879,8 +4880,10 @@ void TestNewShaderRecompilerScalarMemoryBindingDomains() {
         "raw scalar load did not use only the DMA domain");
   Check(count_live_memory_ops(
             raw.program, ShaderRecompiler::IR::ValueOpcode::LoadAddressU32,
-            ShaderRecompiler::IR::ResourceKind::ScalarAddress) == 1u,
+            ShaderRecompiler::IR::ResourceKind::ScalarAddress) == 2u,
         "raw scalar load did not remain a live typed address operation");
+  Check(SpirvInstructionOpcodeCount(raw.spirv, 57) == 2u,
+        "aligned scalar DWORDs must each use one BDA lookup");
   Check(SpirvContainsOpcode(raw.spirv, 199),
         "raw scalar SOFFSET alignment was not emitted");
   CheckSpirvBinaryValidates(raw.spirv);

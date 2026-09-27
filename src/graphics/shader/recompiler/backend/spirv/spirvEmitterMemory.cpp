@@ -146,7 +146,12 @@ uint32_t GuestAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Mem
 			ctx.Fail(inst, "has no address base pair");
 			return ConstantDeviceAddress(state, 0);
 		}
-		const auto base = DeviceAddressFromWords(state, ctx.Arg(*handle, 0), ctx.Arg(*handle, 1));
+		auto base_low = ctx.Arg(*handle, 0);
+		if (mem.kind == IR::ResourceKind::ScalarAddress) {
+			base_low = Binary(state, spv::OpBitwiseAnd, TypeU32(state), base_low,
+			                  ConstantU32(state, ~3u));
+		}
+		const auto base = DeviceAddressFromWords(state, base_low, ctx.Arg(*handle, 1));
 		address         = Binary(state, spv::OpIAdd, TypeScalarU64(state), base,
 		                         Unary(state, spv::OpUConvert, TypeScalarU64(state), low));
 	}
@@ -1198,6 +1203,8 @@ void EmitLoadMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 		value = LoadWideBuffer(ctx, inst, buffer_components);
 	else if (shared_components > 1u)
 		value = LoadWideShared(ctx, inst, shared_components);
+	else if (mem.kind == IR::ResourceKind::ScalarAddress)
+		value = LoadBdaDword(ctx, GuestAddress(ctx, inst, mem));
 	else if (address_info.access == IR::AddressAccess::Read &&
 	         mem.kind != IR::ResourceKind::Scratch)
 		value = LoadBda(ctx, GuestAddress(ctx, inst, mem), ctx.Arg(inst, inst.NumArgs() - 1),

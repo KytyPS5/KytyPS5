@@ -25603,6 +25603,52 @@ TestCase ScalarLoadAlignsComponentsAndMasksAddress() {
           {O::S_MOV_B32, O::S_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase ScalarLoadAlignsDynamicBase() {
+  using O = ShaderOpcode;
+  constexpr uint64_t GuestBase = 0x10000;
+  std::vector<u32> code;
+  AppendSMovLiteral(&code, 8, GuestBase);
+  AppendSMovLiteral(&code, 9, 0);
+  code.push_back(EncodeSop2(0x00, 8, 8, 4)); // group ID supplies each base low-bit pattern
+  AppendSMovLiteral(&code, 10, 7);
+  code.push_back(EncodeSmem0(0x01, 12, 4));
+  code.push_back(EncodeSmem1(7, 10)); // all three address components align independently
+  code.push_back(EncodeVop1(0x01, 0, 12));
+  code.push_back(EncodeVop1(0x01, 1, 13));
+  code.push_back(EncodeVop1(0x01, 2, 4));
+  code.push_back(EncodeVop2(0x1a, 3, InlineU32(3), 2));
+  AppendBufferStoreDword(&code, 0, 3);
+  code.push_back(EncodeVop2(0x25, 3, InlineU32(4), 3));
+  AppendBufferStoreDword(&code, 1, 3);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "ScalarLoadAlignsDynamicBase";
+  test.code = std::move(code);
+  test.initial.resize(20);
+  test.initial[18] = 0x12345678;
+  test.initial[19] = 0x9abcdef0;
+  test.expected = test.initial;
+  for (u32 group = 0; group < 4; ++group) {
+    test.expected[group * 2] = test.initial[18];
+    test.expected[group * 2 + 1] = test.initial[19];
+  }
+  test.bda_mappings = {{GuestBase, 64}};
+  test.required_spirv = {"get_bda_pointer"};
+  test.forbidden_spirv = {"flattened_srt"};
+  test.opcodes = {O::S_MOV_B32, O::S_ADD_U32, O::S_LOAD_DWORDX2, O::V_MOV_B32,
+                  O::V_LSHLREV_B32, O::V_ADD_NC_U32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.wave_size = 32;
+  test.compute_info.threads_num[0] = 1;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.group_id[0] = true;
+  test.compute_info.workgroup_register = 4;
+  test.has_compute_info = true;
+  test.dispatch_x = 4;
+  return test;
+}
+
 TestCase FlatVirtualAddressRebasesGuestAllocation() {
   using O = ShaderOpcode;
 
@@ -29551,6 +29597,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ScalarMemoryLoadVariants);
   AddCase(ScalarLoadSignedImmediateOffsetAddsSoffset);
   AddCase(ScalarLoadAlignsComponentsAndMasksAddress);
+  AddCase(ScalarLoadAlignsDynamicBase);
   AddCase(BufferLoadStore);
   AddCase(BufferLoadDwordOffenIdxenUsesVaddrPlusOneOffset);
   AddCase(BufferStoreDwordOffenIdxenUsesVaddrPlusOneOffset);

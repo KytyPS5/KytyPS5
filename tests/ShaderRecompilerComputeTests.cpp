@@ -14373,6 +14373,40 @@ public:
                 "a stale color target clipped stencil coverage or the NULL-export shader was skipped");
       }
 
+      // A depth-only draw retains the previous PS address and write masks, but
+      // SPI_SHADER_COL_FORMAT disables its exports. Compiling this stale PS
+      // with the new zero-input metadata would fail before the depth draw.
+      static const auto stale_pixel = [] {
+        std::vector<u32> code{EncodeVintrp(0, 0, 0, 0, 0),
+                              EncodeVintrp(1, 0, 0, 0, 1),
+                              EncodeExp0(0, 0xf), EncodeExp1(0, 0, 0, 0)};
+        AppendEnd(&code);
+        return code;
+      }();
+      const auto stale_address = reinterpret_cast<uint64_t>(stale_pixel.data());
+      ShaderMapUserData(stale_address,
+          {.type = Prospero::ShaderBinaryType::kPs,
+           .code_size_bytes = static_cast<u32>(stale_pixel.size() * sizeof(u32))});
+      shaders.SetPsShaderBase(stale_address);
+      registers.SetPsInControl(0);
+      registers.SetDepthShaderControl({});
+      registers.SetDepthControl({.z_enable = true, .z_write_enable = true,
+                                .zfunc = static_cast<uint8_t>(vk::CompareOp::eAlways)});
+      for (const auto slot : {0u, 3u}) {
+        registers.SetTargetOutputMode(slot, 0);
+      }
+      RenderExecutorTestAccess::DrawAuto(
+          executor, scheduler.Current(), {.vertex_count = 3, .instance_count = 1});
+      const auto depth_only_pixels = ReadCachedTexel(
+          name, context, depth.image_id, {}, {extent, extent, 1});
+      Require(name, "disabled stale PS preserves fixed-function depth",
+              std::ranges::all_of(depth_only_pixels, [](u32 v) { return v == 0; }),
+              "disabled color exports invoked the stale PS or clipped fixed-function depth");
+      registers.SetPsInControl(0x8000);
+      for (const auto slot : {0u, 3u}) {
+        registers.SetTargetOutputMode(slot, 4);
+      }
+
       // With MRT0 still bound, an MRT3-only export must retain location3 in
       // rendering attachments, pipeline formats, blend masks and dynamic write enables.
       static const auto sparse_pixel = [] {

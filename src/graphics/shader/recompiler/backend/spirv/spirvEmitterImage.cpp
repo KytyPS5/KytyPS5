@@ -290,6 +290,43 @@ uint32_t ResultVector(ValueEmitContext& ctx, uint32_t value,
 	return result;
 }
 
+// The descriptor of a bindless table image the instruction selects: entry = key & mask;
+// flattened_srt[mapping] holds the entry count, then each entry's slot among the table
+// descriptors of the root's binding.
+uint32_t ImageTableElement(ValueEmitContext& ctx, const IR::Inst& inst,
+                           const IR::ImageResource& image) {
+	auto&       state  = ctx.state;
+	const auto* handle = inst.Arg(0).ResolveInstruction();
+	if (handle == nullptr || handle->NumArgs() == 0u || state.flattened_srt_variable == 0 ||
+	    image.table_descriptor_base == UINT32_MAX) {
+		ctx.Fail(inst, "has no image table runtime mapping");
+	}
+	const auto LoadTableMapping = [&](uint32_t index) {
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
+		                          pointer, state.flattened_srt_variable, ConstantU32(state, 0),
+		                          index);
+		const auto value = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+		return value;
+	};
+	const auto entry    = Binary(state, spv::OpBitwiseAnd, TypeU32(state), ctx.Def(handle->Arg(0)),
+	                             ConstantU32(state, image.table_entry_mask));
+	const auto count    = LoadTableMapping(ConstantU32(state, image.table_mapping_offset));
+	const auto in_range = Binary(state, spv::OpULessThan, TypeBool(state), entry, count);
+	const auto clamped  = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpSelect, TypeU32(state), clamped, in_range, entry,
+	                          ConstantU32(state, 0));
+	const auto mapped =
+	    LoadTableMapping(Binary(state, spv::OpIAdd, TypeU32(state), clamped,
+	                            ConstantU32(state, image.table_mapping_offset + 1u)));
+	const auto slot = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpSelect, TypeU32(state), slot, in_range, mapped,
+	                          ConstantU32(state, 0));
+	return Binary(state, spv::OpIAdd, TypeU32(state), slot,
+	              ConstantU32(state, image.table_descriptor_base));
+}
+
 uint32_t QueryDimensions(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
                          const IR::Inst& address, uint32_t resource, uint32_t array_index) {
 	const auto  dimension = ctx.state.program.info.images.at(resource).dimension;
@@ -667,6 +704,7 @@ auto EmitImageAccess(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t resul
 	auto& state = ctx.state;
 	const auto& mem = ctx.Memory(inst);
 	const auto& image = state.program.info.images.at(mem.resource);
+	if (image.table_capacity != 0u) return emit(mem.resource, ImageTableElement(ctx, inst, image));
 	if (image.indirect_root != mem.resource) return emit(mem.resource, 0u);
 	const auto* handle = inst.Arg(0).ResolveInstruction();
 	const auto* source = image.source < state.program.descriptor_sources.size()

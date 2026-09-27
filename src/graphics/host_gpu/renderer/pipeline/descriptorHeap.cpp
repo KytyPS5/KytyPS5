@@ -11,7 +11,7 @@ namespace {
 constexpr uint32_t   DescriptorHeapCount = 1024;
 constexpr std::array DescriptorPoolSizes = {
     vk::DescriptorPoolSize {vk::DescriptorType::eStorageBuffer, 8192},
-    vk::DescriptorPoolSize {vk::DescriptorType::eSampledImage, 8192},
+    vk::DescriptorPoolSize {vk::DescriptorType::eSampledImage, DescriptorHeap::MaxSampledImages},
     vk::DescriptorPoolSize {vk::DescriptorType::eStorageImage, 1024},
     vk::DescriptorPoolSize {vk::DescriptorType::eSampler, 1024},
 };
@@ -25,6 +25,9 @@ DescriptorHeap::DescriptorHeap(GraphicContext& graphics, MasterSemaphore& master
 
 DescriptorHeap::~DescriptorHeap() {
 	m_graphics.device.destroyDescriptorPool(m_current_pool, nullptr);
+	for (const auto pool: m_persistent_pools) {
+		m_graphics.device.destroyDescriptorPool(pool, nullptr);
+	}
 	for (const auto& [pool, tick]: m_pending_pools) {
 		m_master_semaphore.Wait(tick);
 		m_graphics.device.destroyDescriptorPool(pool, nullptr);
@@ -81,6 +84,25 @@ vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout layout) {
 	allocate.descriptorPool = m_current_pool;
 	EXIT_IF(!fill(fresh_batch));
 	return fresh_batch.sets[--fresh_batch.size];
+}
+
+vk::DescriptorSet DescriptorHeap::CommitPersistent(vk::DescriptorSetLayout layout) {
+	const auto&                  sizes = LayoutSizes(layout);
+	vk::DescriptorPoolCreateInfo create {};
+	create.maxSets       = 1;
+	create.poolSizeCount = static_cast<uint32_t>(sizes.size());
+	create.pPoolSizes    = sizes.data();
+	vk::DescriptorPool pool;
+	EXIT_IF(m_graphics.device.createDescriptorPool(&create, nullptr, &pool) !=
+	        vk::Result::eSuccess);
+	m_persistent_pools.push_back(pool);
+	vk::DescriptorSetAllocateInfo allocate {};
+	allocate.descriptorPool     = pool;
+	allocate.descriptorSetCount = 1;
+	allocate.pSetLayouts        = &layout;
+	vk::DescriptorSet set;
+	EXIT_IF(m_graphics.device.allocateDescriptorSets(&allocate, &set) != vk::Result::eSuccess);
+	return set;
 }
 
 void DescriptorHeap::CreateDescriptorPool() {

@@ -30,6 +30,10 @@ struct ResourceSpecialization {
 		uint32_t                      indirect_root              = ImageResource::NoIndirectImage;
 		uint32_t                      indirect_mapping_offset    = 0;
 		uint32_t                      indirect_search_iterations = 0;
+		uint32_t                      table                      = ImageResource::NoImageTable;
+		uint32_t                      table_capacity             = 0;
+		uint32_t                      table_mapping_offset       = 0;
+		uint32_t                      table_entry_mask           = 0;
 		bool                          cube                       = false;
 		bool                          skip_degamma               = false;
 		bool                          fmask                      = false;
@@ -63,6 +67,9 @@ bool                 LoadResourcePlan(std::span<const uint8_t> bytes, ResourcePl
 // Refreshes cached resources and specialization in place. A failed refresh must not be used.
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
+
+// Whether the host can bind a bindless table T# in the descriptor array of a specialized root.
+bool ImageTableSlotCompatible(const ImageResource& root, const DescriptorValue& descriptor);
 
 // Applies an already-derived specialization to native IR before layout and emission.
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization);

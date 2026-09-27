@@ -576,6 +576,13 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	device_features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
 	device_features.shaderStorageImageMultisample =
 	    supported2.features.shaderStorageImageMultisample;
+	// Bindless image tables index sampled image arrays per lane.
+	device_features.shaderSampledImageArrayDynamicIndexing =
+	    supported2.features.shaderSampledImageArrayDynamicIndexing;
+	if (supported2.features.shaderSampledImageArrayDynamicIndexing != VK_TRUE) {
+		LOGF("WARNING: dynamic sampled image indexing is not supported; bindless image "
+		     "tables will not work\n");
+	}
 	device_features.shaderImageGatherExtended            = VK_TRUE;
 	device_features.shaderResourceMinLod                 = VK_TRUE;
 	device_features.independentBlend                     = VK_TRUE;

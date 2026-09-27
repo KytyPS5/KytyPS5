@@ -690,6 +690,16 @@ add_executable(gpu_blit_shader_tests EXCLUDE_FROM_ALL
 target_link_libraries(gpu_blit_shader_tests kyty_test_gtest Vulkan::Headers)
 target_include_directories(gpu_blit_shader_tests PRIVATE ${inc_headers})
 
+# Common::SoftExitScope turns a fatal error of the current thread into a C++ exception: its
+# thrower and the renderer code that catches it need exceptions where they are off by default.
+if(NOT KYTY_CLANG_CL)
+	target_compile_options(common PRIVATE -fexceptions)
+	set_source_files_properties(
+		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/descriptors.cpp"
+		"${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp"
+		PROPERTIES COMPILE_OPTIONS -fexceptions)
+endif()
+
 # These tests use exceptions.
 if(NOT KYTY_CLANG_CL)
 	foreach(kyty_exception_test scalar_provenance_tests resource_tracking_tests

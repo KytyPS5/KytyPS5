@@ -55,6 +55,26 @@ public:
 	KYTY_CLASS_NO_COPY(TextureCache);
 
 	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false);
+	// Lookup for bindings the shader may never read (bindless table candidates). It resolves
+	// like FindImage but returns an empty id instead of converting a depth image to color or
+	// back: those conversions replace the image other passes use, which then convert it again.
+	// When the description reads a color image of the same layout as depth, depth_source
+	// receives that image (see FindDepthCopy()).
+	[[nodiscard]] ImageId FindImageSpeculative(ImageDesc& desc, bool exact_format = false,
+	                                           ImageId* depth_source = nullptr);
+	// PS5 samples any memory as depth with a depth T#: a T# that compares against a color
+	// image's memory reads its bytes as depth values. Vulkan compares only depth formats, so the
+	// binding samples a depth image with the color image's layout, in `requested`'s depth
+	// format, that is not registered over the guest memory and is copied from the color image
+	// when it is acquired (FindTexture()) after the color image was written. The copy lives as
+	// long as the color image.
+	[[nodiscard]] ImageId FindDepthCopy(ImageId color_id, const ImageInfo& requested);
+	// Whether the depth copy `image` no longer holds its color image's contents (false for
+	// other images).
+	[[nodiscard]] bool DepthCopyStale(const Image& image) const;
+	// Whether acquiring the depth copy `image` (FindTexture()) would change nothing: it holds its
+	// color image's contents, and the color image is clean and tracked (false for other images).
+	[[nodiscard]] bool DepthCopyCurrent(const Image& image) const;
 	void                        UpdateImage(ImageId id);
 	[[nodiscard]] ImageId       FindImageFromRange(uint64_t address, uint64_t size,
 	                                               bool ensure_valid = true);
@@ -89,6 +109,39 @@ public:
 	[[nodiscard]] bool WriteBackImages();
 	// The tick of the latest write-back pending over the range's pages, or 0 when none is.
 	[[nodiscard]] uint64_t WriteBackTick(uint64_t address, uint64_t size);
+	// Advances whenever an image is registered or unregistered.
+	[[nodiscard]] uint64_t ImageSetEpoch() const { return m_image_set_epoch; }
+	// The ImageSetEpoch of the last registration or unregistration of an image overlapping the
+	// range's pages: while it is unchanged, a lookup in the range finds the same images.
+	[[nodiscard]] uint64_t ImageEpochInRegion(uint64_t address, uint64_t size);
+	// The granularity of ImageEpochInRegion(): log2 of its page size.
+	static constexpr uint32_t ImagePageBits = 20;
+	// Calls `function(address, size)` for the image range of every registration and
+	// unregistration after ImageSetEpoch() was `epoch`, oldest first. False when the history no
+	// longer reaches back that far.
+	template <typename Function>
+	[[nodiscard]] bool ForEachImageSetChangeSince(uint64_t epoch, Function&& function) {
+		std::scoped_lock lock {m_lock};
+		if (m_image_set_epoch - epoch > ImageSetChangeHistory) {
+			return false;
+		}
+		for (auto change = epoch + 1; change <= m_image_set_epoch; ++change) {
+			const auto& range = m_image_set_changes[change % ImageSetChangeHistory];
+			function(range.first, range.second);
+		}
+		return true;
+	}
+	// A counter per image slot that advances whenever the image in the slot changes what a
+	// binding of one of its views, as it was bound, depends on (see Image::StateChanged()), and
+	// when the slot holds another image. While it is unchanged, such a binding still holds
+	// without reading the image.
+	[[nodiscard]] uint32_t ImageVersion(ImageId id) const noexcept {
+		return m_image_versions.Load(id.index);
+	}
+	// A pinned image is used without its bindings looking it up or touching it: the garbage
+	// collector keeps it and overlapping lookups do not delete it as unused. Pins nest.
+	void PinImage(ImageId id);
+	void UnpinImage(ImageId id);
 	void RunGarbageCollector();
 
 private:
@@ -103,6 +156,11 @@ private:
 		ImageId image;
 		int32_t mip   = -1;
 		int32_t layer = -1;
+		// Speculative lookups only: resolving the overlap would replace an owned image.
+		bool rejected = false;
+		// Rejected lookups only: the color image the description reads as depth, when a depth
+		// copy of it can stand for the description (see FindDepthCopy()).
+		ImageId depth_source;
 	};
 
 	// A recorded image download whose guest pages stay inaccessible until it lands.
@@ -128,6 +186,36 @@ private:
 	static_assert(sizeof(Bucket) == 64);
 
 	using ImagePageTable = MultiLevelPageTable<Bucket, 20, 44, 14>;
+	static_assert(ImagePageTable::kPageBits == ImagePageBits);
+
+	// The ImageVersion() counters, in chunks that never move: images keep a pointer to theirs.
+	class ImageVersions final {
+	public:
+		ImageVersions() = default;
+		~ImageVersions();
+		KYTY_CLASS_NO_COPY(ImageVersions);
+
+		[[nodiscard]] std::atomic<uint32_t>& Counter(uint32_t index);
+		[[nodiscard]] uint32_t               Load(uint32_t index) const noexcept {
+			if ((index >> kChunkBits) >= kMaxChunks) {
+				return 0;
+			}
+			const auto* chunk = m_chunks[index >> kChunkBits].load(std::memory_order_acquire);
+			return chunk == nullptr
+			           ? 0
+			           : (*chunk)[index & (kChunkSize - 1)].load(std::memory_order_acquire);
+		}
+
+	private:
+		static constexpr size_t kChunkBits = 10;
+		static constexpr size_t kChunkSize = size_t {1} << kChunkBits;
+		static constexpr size_t kMaxChunks = 4096;
+		using Chunk                        = std::array<std::atomic<uint32_t>, kChunkSize>;
+
+		std::array<std::atomic<Chunk*>, kMaxChunks> m_chunks {};
+	};
+	// Gives a new image its slot's version counter and advances it.
+	void AttachImageVersion(ImageId id);
 
 	// Callers pass a nonempty, valid guest range.
 	template <typename Func>
@@ -225,7 +313,12 @@ private:
 	[[nodiscard]] static BindingType UploadBinding(const Image& image);
 
 	[[nodiscard]] OverlapResult ResolveOverlap(const ImageInfo& requested, BindingType binding,
-	                                           ImageId cached, ImageId merged);
+	                                           ImageId cached, ImageId merged,
+	                                           bool speculative = false);
+	[[nodiscard]] ImageId       FindImageImpl(ImageDesc& desc, bool exact_format, bool speculative,
+	                                          ImageId* depth_source = nullptr);
+	[[nodiscard]] static bool   DepthOverlapNeedsRecreate(const ImageInfo& requested,
+	                                                      BindingType binding, const Image& cached);
 	[[nodiscard]] ImageId       ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
 	                                                ImageId cached);
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
@@ -249,6 +342,9 @@ private:
 	                               uint32_t layer, uint32_t layers, const vk::ClearValue* clear,
 	                               vk::CommandBuffer command);
 	void RefreshCopySource(ImageId id);
+	// Caller holds m_lock.
+	void RefreshDepthCopy(ImageId copy_id);
+	void ReleaseDepthCopies(ImageId color_id);
 	[[nodiscard]] bool CopyD16(Image& destination, Image& source);
 	void               CopyImage(ImageId destination, ImageId source);
 	// The depth image's stencil plane record covering exactly range, or none.
@@ -267,21 +363,47 @@ private:
 	BlitHelper                                        m_blit_helper;
 	TileManager                                       m_tiler;
 	BufferCache&                                      m_buffer_cache;
+	// Before the images, which point into it.
+	ImageVersions                                     m_image_versions;
 	Common::SlotVector<Image>                         m_slot_images;
 	ImagePageTable                                    m_image_page_table;
+	MultiLevelPageTable<uint64_t, ImagePageTable::kPageBits, ImagePageTable::kAddressSpaceBits,
+	                    ImagePageTable::kFirstLevelBits>
+	    m_image_page_epochs;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	std::mutex                                        m_write_back_mutex;
 	std::vector<WriteBack>                            m_write_backs;
+	// Color image -> its depth copies, one per depth format (see FindDepthCopy).
+	std::unordered_map<ImageId, std::vector<ImageId>> m_depth_copies;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;
-	uint64_t m_critical_gc_memory      = 3ull * 1024 * 1024 * 1024;
-	uint64_t m_gc_tick                 = 0;
-	bool     m_readback_linear_images  = false;
-	bool     m_readback_tiled_images   = false;
-	bool     m_readback_storage_images = false;
+	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
+	uint64_t         m_gc_tick                = 0;
+	uint64_t         m_image_set_epoch        = 0;
+	// The image range of the last registrations and unregistrations, by ImageSetEpoch.
+	static constexpr uint64_t ImageSetChangeHistory = 1024;
+	std::array<std::pair<uint64_t, uint64_t>, ImageSetChangeHistory> m_image_set_changes {};
+	bool             m_readback_linear_images = false;
+	bool             m_readback_tiled_images  = false;
+	bool             m_readback_storage_images = false;
+	// Lookups that found an existing image with the same backing, by description: while no image
+	// on the pages of the range was registered or unregistered since, the same lookup finds the
+	// same image.
+	struct ExactLookup {
+		ImageInfo info;
+		ImageId   id;
+		uint64_t  epoch        = 0;
+		bool      exact_format = false;
+		bool      valid        = false;
+	};
+	static constexpr size_t                                   ExactLookupWays = 1024;
+	std::unique_ptr<std::array<ExactLookup, ExactLookupWays>> m_exact_lookups =
+	    std::make_unique<std::array<ExactLookup, ExactLookupWays>>();
+	[[nodiscard]] static size_t ExactLookupSlot(const ImageInfo& info) noexcept;
+	[[nodiscard]] uint64_t      ImageEpochInRegionUnlocked(uint64_t address, uint64_t size) const;
 
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;

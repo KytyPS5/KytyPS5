@@ -251,6 +251,15 @@ void DefineDescriptors(EmitterState& state) {
 		if (count == 0) image_types[IR::ImageBindingIndex(*kind)] = &image;
 		count += image.mip_count;
 	}
+	std::array<bool, IR::ImageBindingCount> image_tables {};
+	const auto table_bases = IR::AllocateImageTableDescriptors(info.images, counts);
+	for (size_t index = 0; index < info.images.size(); ++index) {
+		auto& image                 = info.images[index];
+		image.table_descriptor_base = table_bases[index];
+		if (image.table_capacity != 0u) {
+			image_tables[IR::ImageBindingIndex(*IR::DescriptorBindingForImage(image))] = true;
+		}
+	}
 	counts[static_cast<size_t>(Kind::Samplers)] = static_cast<uint32_t>(info.samplers.size());
 	counts[static_cast<size_t>(Kind::Gds)] = info.uses_gds;
 	counts[static_cast<size_t>(Kind::SharedMemory)] =
@@ -364,6 +373,14 @@ void DefineDescriptors(EmitterState& state) {
 				                 counts[index], 0u, IR::NativeBinding(state.program.stage, kind));
 				state.builder.AddName(definition.variable,
 				                      ("image_" + std::to_string(static_cast<uint32_t>(kind))).c_str());
+				if (image_tables[IR::ImageBindingIndex(kind)]) {
+					// Bindless table descriptors are indexed per lane.
+					state.builder.RequireVersion(0x00010500u);
+					state.builder.RequireCapability(spv::CapabilityShaderNonUniform);
+					state.builder.RequireCapability(spv::CapabilitySampledImageArrayDynamicIndexing);
+					state.builder.RequireCapability(
+					    spv::CapabilitySampledImageArrayNonUniformIndexing);
+				}
 				break;
 			}
 		}

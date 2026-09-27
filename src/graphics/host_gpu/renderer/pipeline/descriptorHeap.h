@@ -20,6 +20,13 @@ public:
 	KYTY_CLASS_NO_COPY(DescriptorHeap);
 
 	[[nodiscard]] vk::DescriptorSet Commit(vk::DescriptorSetLayout layout);
+	// A set of a pool of its own that lives as long as the heap. It is never bound: it holds
+	// descriptors that bindings copy into the sets Commit() gives them.
+	[[nodiscard]] vk::DescriptorSet CommitPersistent(vk::DescriptorSetLayout layout);
+
+	// Sampled images of one pool; bindless image tables take tens of thousands of them per set
+	// (GTA V's ray tracing table: ~82000).
+	static constexpr uint32_t MaxSampledImages = 262144;
 
 private:
 	static constexpr uint32_t DescriptorSetBatch = 32;

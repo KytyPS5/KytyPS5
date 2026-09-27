@@ -190,11 +190,13 @@ public:
 		}
 #endif
 		StorePages(vaddr, size, backing_offset);
+		BumpBackingEpoch(vaddr, size);
 		return true;
 	}
 
 	// The caller validated the span; failing here is an emulator fault.
 	void Unmap(uint64_t vaddr, uint64_t size) {
+		BumpBackingEpoch(vaddr, size);
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		const auto end   = vaddr + size;
 		uint64_t   views = 0;

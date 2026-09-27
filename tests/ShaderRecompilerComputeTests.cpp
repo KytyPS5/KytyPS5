@@ -27279,17 +27279,17 @@ TestCase DsAppendConsumeUsesEncodedLdsSelector() {
   using O = ShaderOpcode;
 
   std::vector<u32> code;
-  AppendSMovLiteral(&code, 124, 0x0000ffffu);
+  AppendSMovLiteral(&code, 124, 0xffff0000u);
   AppendVMovU32(&code, 1, 0);
   AppendVMovU32(&code, 2, 10);
   code.push_back(EncodeDs0(0x0d, 0));
   code.push_back(EncodeDs1(0, 2, 1));
-  code.push_back(EncodeDs0(0x3e, 0));
+  code.push_back(EncodeDs0(0x3e, 1));
   code.push_back(EncodeDs1(3, 0, 0));
-  code.push_back(EncodeDs0(0x3d, 0));
+  code.push_back(EncodeDs0(0x3d, 2));
   code.push_back(EncodeDs1(4, 0, 0));
   AppendSMovLiteral(&code, 124, 0);
-  code.push_back(EncodeDs0(0x3e, 0));
+  code.push_back(EncodeDs0(0x3e, 3));
   code.push_back(EncodeDs1(5, 0, 0));
   code.push_back(EncodeDs0(0x36, 0));
   code.push_back(EncodeDs1(6, 0, 1));
@@ -27302,9 +27302,62 @@ TestCase DsAppendConsumeUsesEncodedLdsSelector() {
   return {"DsAppendConsumeLdsSelector",
           code,
           {},
-          {10, 11, 0, 10},
+          {10, 11, 10, 11},
           {O::S_MOV_B32, O::V_MOV_B32, O::DS_WRITE_B32, O::DS_READ_B32,
            O::DS_APPEND, O::DS_CONSUME, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+}
+
+TestCase DsAppendAllocatesAcrossWaves(u32 wave_size) {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = wave_size == 64 ? "DsAppendAllocatesAcrossWaves64"
+                             : "DsAppendAllocatesAcrossWaves32";
+  auto &code = test.code;
+  AppendVMovU32(&code, 2, 0);
+  AppendVMovU32(&code, 5, 1);
+  // Only workgroup lane zero initializes the shared allocation counter.
+  code.push_back(EncodeSop1(0x04, 10, 126));
+  code.push_back(EncodeVopc(0xc2, InlineU32(0), 0));
+  code.push_back(EncodeSop1(0x04, 126, 106));
+  code.push_back(EncodeDs0(0x0d, 0));
+  code.push_back(EncodeDs1(0, 2, 2));
+  code.push_back(EncodeSop1(0x04, 126, 10));
+  code.push_back(EncodeSopp(0x0a, 0));
+  for (u32 batch = 0; batch < 2; ++batch) {
+    // Captured CS ea0aceac sets M0=0 and uses OFFSET=1. LDS ignores M0
+    // and aligns OFFSET before allocating once for every active wave.
+    AppendSMovLiteral(&code, 124, batch == 0 ? 0 : 0xffff0000u);
+    code.push_back(EncodeDs0(0x3e, batch == 0 ? 1 : 3));
+    code.push_back(EncodeDs1(3, 0, 0));
+    code.push_back(EncodeVop2(0x24, 6, 127, 3));
+    code.push_back(EncodeVop2(0x23, 6, 126, 6));
+    code.push_back(EncodeVop2(0x1a, 7, InlineU32(2), 6));
+    // A histogram detects duplicate allocations without assuming wave order.
+    AppendBufferStoreOpcode(&code, 0x32, 5, 7);
+  }
+  code.push_back(EncodeSopp(0x0a, 0));
+  code.push_back(EncodeDs0(0x36, 0));
+  code.push_back(EncodeDs1(8, 0, 2));
+  AppendStoreVgprAtLaneDwordOffset(&code, 8, 0, 512);
+  AppendEnd(&code);
+  test.expected.assign(512, 1);
+  test.expected.resize(768, 512);
+  test.initial.resize(test.expected.size());
+  test.compute_info.threads_num[0] = 256;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = wave_size;
+  test.compute_info.lds_size_dwords = 1;
+  test.has_compute_info = true;
+  test.forbidden_spirv = {"\"gds\""};
+  test.opcodes = {O::S_MOV_B32, O::S_MOV_B64, O::S_BARRIER,
+                  O::V_MOV_B32, O::V_CMP_EQ_U32, O::DS_WRITE_B32,
+                  O::DS_APPEND, O::V_MBCNT_HI_U32_B32,
+                  O::V_MBCNT_LO_U32_B32, O::V_LSHLREV_B32,
+                  O::BUFFER_ATOMIC_ADD, O::DS_READ_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
 }
 
 TestCase DsAppendUsesEncodedGdsSelector() {
@@ -27341,6 +27394,46 @@ TestCase DsAppendUsesEncodedGdsSelector() {
                  O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
   test.gds_initial = {10, 20, 30, 40};
   test.expected_gds = {10, 20, 30, 40};
+  return test;
+}
+
+TestCase DsAppendConsumeGdsRegionBounds() {
+  using O = ShaderOpcode;
+  struct Access {
+    u32 m0, offset;
+    bool valid;
+  };
+  constexpr Access accesses[] = {
+      {0x00000004u, 3, true},
+      {0x00000004u, 4, false},
+      {0x00000003u, 0, false},
+      {0xbffc0004u, 3, true},
+      {0xbffc0008u, 0, false},
+      {0xc0000004u, 0, false},
+      {0x0000c000u, 0xbfff, true},
+      {0x0000c000u, 0xc000, false},
+  };
+  TestCase test;
+  test.name = "DsAppendConsumeGdsRegionBounds";
+  auto &code = test.code;
+  for (const auto &access : accesses) {
+    AppendSMovLiteral(&code, 124, access.m0);
+    code.push_back(EncodeDs0(0x3e, access.offset, true));
+    code.push_back(EncodeDs1(0, 0, 0));
+    code.push_back(EncodeDs0(0x3d, access.offset, true));
+    code.push_back(EncodeDs1(1, 0, 0));
+    AppendStoreVgpr(&code, 0, static_cast<u32>(test.expected.size()));
+    test.expected.push_back(access.valid ? 10 : 0);
+    AppendStoreVgpr(&code, 1, static_cast<u32>(test.expected.size()));
+    test.expected.push_back(access.valid ? 11 : 0);
+  }
+  AppendEnd(&code);
+  test.initial.resize(test.expected.size());
+  // Backing beyond the guest partition must not make an invalid region valid.
+  test.gds_initial.assign(0x10000u / sizeof(u32), 10);
+  test.expected_gds = test.gds_initial;
+  test.opcodes = {O::S_MOV_B32, O::DS_APPEND, O::DS_CONSUME,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   return test;
 }
 
@@ -29686,7 +29779,10 @@ std::vector<TestCase> MakeCases() {
   AddCase(DsReadU16D16CapturedPreservesHighHalf);
   AddCase(DsReadU16D16HiCapturedPreservesLowHalf);
   AddCase(DsAppendConsumeUsesEncodedLdsSelector);
+  cases.push_back(DsAppendAllocatesAcrossWaves(32));
+  cases.push_back(DsAppendAllocatesAcrossWaves(64));
   AddCase(DsAppendUsesEncodedGdsSelector);
+  AddCase(DsAppendConsumeGdsRegionBounds);
   AddCase(DsGdsSubdwordAndAtomicWrites);
   AddCase(DsReadWrite2Variants);
   AddCase(DsWideReadSnapshotsOverlappingAddress);

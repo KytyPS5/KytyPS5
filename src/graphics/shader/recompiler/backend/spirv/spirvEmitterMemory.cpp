@@ -1104,16 +1104,27 @@ uint32_t EmitAppendConsume(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (ctx.half == 1) {
 		return ctx.other_half->Def(IR::Value(const_cast<IR::Inst*>(&inst)));
 	}
-	const auto m0 = ctx.Arg(inst, 0);
-	const auto base =
-	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), m0, ConstantU32(state, 16));
-	const auto size =
-	    Binary(state, spv::OpBitwiseAnd, TypeU32(state), m0, ConstantU32(state, 0xffffu));
-	const auto address = Binary(state, spv::OpIAdd, TypeU32(state), base,
-	                            ConstantU32(state, ctx.Memory(inst).offset));
+	const auto mem           = ctx.Memory(inst);
+	const auto offset        = mem.offset & 0xfffcu;
+	auto       address       = ConstantU32(state, offset);
+	uint32_t   region_bounds = 0;
+	if (mem.kind == IR::ResourceKind::Gds) {
+		const auto m0 = ctx.Arg(inst, 0);
+		const auto base =
+		    Binary(state, spv::OpShiftRightLogical, TypeU32(state), m0, ConstantU32(state, 16));
+		const auto size =
+		    Binary(state, spv::OpBitwiseAnd, TypeU32(state), m0, ConstantU32(state, 0xffffu));
+		address = Binary(state, spv::OpIAdd, TypeU32(state), base, address);
+		// The entire M0 region must fit the PS5's 48 KiB GDS partition.
+		region_bounds = AndCondition(
+		    state, Binary(state, spv::OpULessThan, TypeBool(state),
+		                  ConstantU32(state, offset + 3u), size),
+		    Binary(state, spv::OpULessThanEqual, TypeBool(state),
+		           Binary(state, spv::OpIAdd, TypeU32(state), base, size),
+		           ConstantU32(state, 0xc000u)));
+	}
 	const auto raw_index =
 	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), address, ConstantU32(state, 2));
-	const auto mem    = ctx.Memory(inst);
 	const auto access = PrepareMemoryResourceAccess(state, mem);
 	const auto index  = EmitMemoryElementIndex(state, access, raw_index);
 	const auto exec   = ctx.Arg(inst, 1);
@@ -1132,19 +1143,17 @@ uint32_t EmitAppendConsume(ValueEmitContext& ctx, const IR::Inst& inst) {
 	        : first;
 	const auto is_first       = Binary(state, spv::OpIEqual, TypeBool(state),
 	                                   EmitSubgroupLocalInvocationId(state), source_lane);
-	const auto storage_bounds = EmitMemoryElementInBounds(state, access, index);
-	const auto m0_bounds =
-	    mem.kind == IR::ResourceKind::Gds
-	        ? Binary(state, spv::OpINotEqual, TypeBool(state), size, ConstantU32(state, 0))
-	        : Binary(state, spv::OpULessThan, TypeBool(state),
-	                 ConstantU32(state, ctx.Memory(inst).offset + 3u), size);
+	auto bounds = EmitMemoryElementInBounds(state, access, index);
+	if (mem.kind == IR::ResourceKind::Gds) {
+		bounds = AndCondition(state, bounds, region_bounds);
+	}
 	const auto condition = AndCondition(
 	    state, is_first,
 	    AndCondition(state,
 	                 state.lane_count == 2 ? Binary(state, spv::OpINotEqual, TypeBool(state), count,
 	                                                ConstantU32(state, 0))
 	                                       : exec,
-	                 AndCondition(state, storage_bounds, m0_bounds)));
+	                 bounds));
 	const auto atomic = EmitValueOrZeroIfCondition(state, condition, [&]() {
 		const auto value = state.builder.AllocateId();
 		state.builder.AddFunction(append ? spv::OpAtomicIAdd : spv::OpAtomicISub, TypeU32(state),

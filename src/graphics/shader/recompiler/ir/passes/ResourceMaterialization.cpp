@@ -401,6 +401,9 @@ struct ImageRemap {
 	template <typename T>
 	void Apply(std::vector<T>& images) const {
 		EXIT_IF(images.size() != source_count);
+		if (count == source_count) {
+			return;
+		}
 		for (uint32_t index = 0; index < source_count; index++) {
 			if (indices[index] != UINT32_MAX && indices[index] != index) {
 				images[indices[index]] = std::move(images[index]);

@@ -951,7 +951,7 @@ public:
 				return true;
 			}
 			auto now = CurrentTimeNoLock();
-			return now == 0 || candidate.info.time_stamp <= now;
+			return now == 0 || candidate.info.time_stamp + candidate.timestamp_offset <= now;
 		});
 		if (!frame) {
 			return false;
@@ -996,7 +996,7 @@ public:
 		out->details.audio.size          = current_audio->info.details.audio.size;
 		std::memcpy(out->details.audio.language_code,
 		            current_audio->info.details.audio.language_code, 4);
-		start_time_ms = out->time_stamp;
+		start_time_ms = current_audio->info.time_stamp + current_audio->timestamp_offset;
 		clock_start   = std::chrono::steady_clock::now();
 		paused_extra  = {};
 		RecordLoopBoundary(*current_audio);
@@ -1395,7 +1395,6 @@ private:
 				av_frame_free(&frame);
 				return false;
 			}
-			ready.info.time_stamp += timestamp_offset;
 			ready.timestamp_offset = timestamp_offset;
 			frames.Push(std::move(ready));
 			av_frame_free(&frame);

@@ -291,7 +291,7 @@ static char* CopyUriPart(char*& dst, const UriPart& part) {
 }
 
 static int ParseEmptyUri(SceHttpUriElement* out, void* pool, size_t* require, size_t prepare) {
-	constexpr size_t needed = 3;
+	constexpr size_t needed = 4;
 
 	if (require != nullptr) {
 		*require = needed;
@@ -310,10 +310,12 @@ static int ParseEmptyUri(SceHttpUriElement* out, void* pool, size_t* require, si
 		auto* dst        = static_cast<char*>(pool);
 		out->scheme      = dst++;
 		out->hostname    = dst++;
-		out->path        = dst;
+		out->path        = dst++;
+		out->query       = dst;
 		out->scheme[0]   = '\0';
 		out->hostname[0] = '\0';
 		out->path[0]     = '\0';
+		out->query[0]    = '\0';
 	}
 
 	return 0;
@@ -474,6 +476,9 @@ static int KYTY_SYSV_ABI HttpUriParse(SceHttpUriElement* out, const char* src_ur
 			needed += part.len + 1;
 		}
 	}
+	if (query.begin == nullptr) {
+		needed += 1;
+	}
 
 	if (require != nullptr) {
 		*require = needed;
@@ -496,7 +501,12 @@ static int KYTY_SYSV_ABI HttpUriParse(SceHttpUriElement* out, const char* src_ur
 		out->password = CopyUriPart(dst, password);
 		out->hostname = CopyUriPart(dst, hostname);
 		out->path     = CopyUriPart(dst, path);
-		out->query    = CopyUriPart(dst, query);
+		if (query.begin == nullptr) {
+			out->query    = dst++;
+			out->query[0] = '\0';
+		} else {
+			out->query = CopyUriPart(dst, query);
+		}
 		out->fragment = CopyUriPart(dst, fragment);
 	}
 

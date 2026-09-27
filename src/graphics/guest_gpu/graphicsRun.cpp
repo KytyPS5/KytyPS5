@@ -337,7 +337,11 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 	EXIT_NOT_IMPLEMENTED(wait_for_previous > 1);
 	EXIT_NOT_IMPLEMENTED(write_confirm > 1);
 	EXIT_NOT_IMPLEMENTED(block_engine > 1);
-	if (static_cast<uint32_t>(dst_address_or_offset) == 0x3022cu) {
+	// GL2 prefetch: dst_sel bit 2 makes 0x0003022c a register offset, not a guest address.
+	constexpr uint64_t GL2PrefetchRegisterOffset    = 0x0003022c;
+	constexpr uint8_t  NonMemoryDestinationSelector = 0x4;
+	if (dst_address_or_offset == GL2PrefetchRegisterOffset &&
+	    (dst_sel & NonMemoryDestinationSelector) != 0) {
 		return;
 	}
 	auto decode_gds = [](uint8_t selector, bool& is_gds) {

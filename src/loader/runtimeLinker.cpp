@@ -725,6 +725,41 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 	} else {
 	    std::printf("Global value:  <unreadable>\n");
 	}
+	std::printf("Exception RIP : 0x%016" PRIx64 "\n", info->exception_address);
+	std::printf("Fault VA      : 0x%016" PRIx64 "\n", info->access_violation_vaddr);
+	std::printf("RAX           : 0x%016" PRIx64 "\n", info->rax);
+
+// Address referenced by:
+// 48 8b 05 39 ee 13 04
+// mov rax,[rip+0x413ee39]
+	constexpr uint64_t global_addr = 0x0000000905AAA75Aull;
+
+	std::printf("Global addr   : 0x%016" PRIx64 "\n", global_addr);
+
+	if (IsReadableRange(global_addr, sizeof(uint64_t))) {
+	    uint64_t global_value = 0;
+	    std::memcpy(&global_value,
+                reinterpret_cast<const void*>(global_addr),
+                sizeof(global_value));
+
+    	std::printf("Global value  : 0x%016" PRIx64 "\n", global_value);
+
+    	if (IsReadableRange(global_addr - 0x40, 0x80)) {
+        	std::printf("Global region:\n");
+
+        	for (uint64_t offset = 0; offset < 0x80; offset += 8) {
+            	uint64_t value = 0;
+            	std::memcpy(&value,
+                        reinterpret_cast<const void*>(global_addr - 0x40 + offset),
+                        sizeof(value));
+
+            	std::printf("  [%+04" PRIx64 "] = %016" PRIx64 "\n",
+                        offset - 0x40, value);
+        	}
+    	}
+	} else {
+    	std::printf("Global value  : <unreadable>\n");
+	}
 	EXIT("Unhandled host exception: type=%u code=%u pc=0x%016" PRIx64
 	     " access=%u address=0x%016" PRIx64 "\n",
 	     static_cast<unsigned>(info->type), info->native_code, info->exception_address,

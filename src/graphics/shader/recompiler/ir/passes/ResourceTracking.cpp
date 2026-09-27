@@ -1170,6 +1170,7 @@ private:
 		for (auto& pair: m_info.sampled_pairs) {
 			if (pair.image == image && pair.sampler == sampler) {
 				pair.first_use_pc = std::min(pair.first_use_pc, pc);
+				return;
 			}
 		}
 		if (m_info.sampled_pairs.size() >= ShaderInfo::MaxSampledPairs) {

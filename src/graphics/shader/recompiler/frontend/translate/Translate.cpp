@@ -233,13 +233,6 @@ IR::Value Translator::ReadOperand(const Decoder::Operand& operand, IR::Type type
 		if (type == IR::Type::F64) {
 			if (operand.kind == Decoder::OperandKind::LiteralConstant) {
 				pair = {IR::U32(IR::Value(0u)), IR::U32(IR::Value(operand.value))};
-			} else if (operand.kind == Decoder::OperandKind::FloatInlineConstant) {
-				const auto bits = operand.value == 0x3e22f983u
-				                      ? 0x3fc45f306dc9c882ull
-				                      : std::bit_cast<uint64_t>(static_cast<double>(
-				                            std::bit_cast<float>(operand.value)));
-				pair            = {IR::U32(IR::Value(static_cast<uint32_t>(bits))),
-				                   IR::U32(IR::Value(static_cast<uint32_t>(bits >> 32u)))};
 			}
 			if (operand.absolute) {
 				pair[1] = ir.BitwiseAnd(pair[1], IR::U32(IR::Value(0x7fffffffu)));
@@ -488,6 +481,16 @@ std::array<IR::U32, 2> Translator::ReadU32Pair(const Decoder::Operand& operand) 
 	if (operand.kind == Decoder::OperandKind::VccLo) {
 		return {ir.GetVccLo(), ir.GetVccHi()};
 	}
+	if (operand.kind == Decoder::OperandKind::FloatInlineConstant) {
+		// A 64-bit operand (integer or float) receives the double-precision encoding of a
+		// float inline constant: s_mov_b64 s[0:1], 1.0 yields 0x3ff0000000000000.
+		const auto bits = operand.value == 0x3e22f983u
+		                      ? 0x3fc45f306dc9c882ull
+		                      : std::bit_cast<uint64_t>(
+		                            static_cast<double>(std::bit_cast<float>(operand.value)));
+		return {IR::U32(IR::Value(static_cast<uint32_t>(bits))),
+		        IR::U32(IR::Value(static_cast<uint32_t>(bits >> 32u)))};
+	}
 	const auto low = ApplyBitSourceModifiers(operand, ReadRawU32(operand));
 	IR::U32    high(IR::Value(0u));
 	if (operand.kind == Decoder::OperandKind::Sgpr || operand.kind == Decoder::OperandKind::Vgpr) {
@@ -620,7 +623,10 @@ IR::U1 Translator::ReadMask(const Decoder::Operand& operand) {
 	if (operand.kind == Decoder::OperandKind::LiteralConstant ||
 	    operand.kind == Decoder::OperandKind::IntegerInlineConstant ||
 	    operand.kind == Decoder::OperandKind::FloatInlineConstant) {
-		return ThreadBit(ReadU32Pair(operand));
+		// Wave32 lane masks are 32-bit operands, which keep the single-precision encoding.
+		return ThreadBit(program.wave_size == 64u
+		                     ? ReadU32Pair(operand)
+		                     : std::array {ReadRawU32(operand), IR::U32(IR::Value(0u))});
 	}
 	switch (operand.kind) {
 		case Decoder::OperandKind::Sgpr: {

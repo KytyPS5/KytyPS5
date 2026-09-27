@@ -23034,6 +23034,30 @@ TestCase VectorAlignByteUsesTwoBitByteOffset() {
   return test;
 }
 
+TestCase ScalarVector64BitFloatInlineConstants() {
+  using O = ShaderOpcode;
+
+  // 64-bit operands receive the double-precision encoding of float inline constants,
+  // for integer B64 opcodes as well (s_mov_b64 s[0:1], 1.0 = 0x3ff0000000000000).
+  std::vector<u32> code;
+  code.push_back(0xbea804f2u); // s_mov_b64 s[40:41], 1.0
+  code.push_back(0x88aa80f0u); // s_or_b64 s[42:43], 0.5, 0
+  AppendVop3(&code, 0x300, 2, InlineU32(32), 244u); // v_lshrrev_b64 v[2:3], 32, 2.0
+  AppendStoreSgprPair(&code, 40, 0);
+  AppendStoreSgprPair(&code, 42, 2);
+  AppendStoreVgpr(&code, 2, 4);
+  AppendStoreVgpr(&code, 3, 5);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "ScalarVector64BitFloatInlineConstants";
+  test.code = std::move(code);
+  test.expected = {0u, 0x3ff00000u, 0u, 0x3fe00000u, 0x40000000u, 0u};
+  test.opcodes = {O::S_MOV_B64, O::S_OR_B64, O::V_LSHRREV_B64, O::V_MOV_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
 TestCase VectorCarryAndBitCountOps() {
   using O = ShaderOpcode;
 
@@ -36304,6 +36328,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorVop3IntegerOps);
   AddCase(VectorBfeI32SignExtendsField);
   AddCase(VectorAlignByteUsesTwoBitByteOffset);
+  AddCase(ScalarVector64BitFloatInlineConstants);
   AddCase(VectorCarryAndBitCountOps);
   AddCase(VectorMbcntUsesThreadMask);
   AddCase(VectorAddcWritesPerLaneCarryOut);
@@ -42411,6 +42436,11 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, Vop2SdwaMulI24Destinations(32));
     RunCase(&vulkan, Vop2SdwaMulI24Destinations(64));
     RunCase(&vulkan, VectorIntegerOps());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--inline-f64-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, ScalarVector64BitFloatInlineConstants());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--cvt-pk-i16-only") == 0) {

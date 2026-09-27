@@ -3737,6 +3737,46 @@ void TestGraphicsPushConstantLayout() {
         "storage fallback retained an irrelevant attempted push-data position");
 }
 
+void TestBoundedBufferBindingCollection() {
+  Fixture fixture;
+  fixture.program.shader_info_complete = true;
+  fixture.program.info.buffers.resize(5);
+  fixture.program.info.buffer_tables.push_back(
+      {.count = 3u, .resources = {4u, 1u}});
+  MemoryInfo table_memory;
+  table_memory.kind = ResourceKind::Buffer;
+  table_memory.resource = UINT32_MAX;
+  table_memory.buffer_table = 0u;
+  const auto table_index = fixture.AddMemory(table_memory, 4u);
+  const auto handle = fixture.Buffer({Value(0u), Value(0u), Value(0u), Value(0u)}, 4u);
+  fixture.Emit(ValueOpcode::LoadBufferU32,
+               {handle, Value(0u), Value(0u), Value(0u), Value(true)}, table_index);
+  std::vector<uint32_t> live;
+  Check(!CollectMemoryResources(fixture.program, live) &&
+            live == std::vector<uint32_t>{1u, 4u},
+        "bounded table candidates were not compacted into live buffer bindings");
+
+  MemoryInfo direct_memory;
+  direct_memory.kind = ResourceKind::Buffer;
+  direct_memory.resource = 2u;
+  fixture.Emit(ValueOpcode::StoreBufferU32,
+               {handle, Value(0u), Value(0u), Value(0u), Value(7u), Value(true)},
+               fixture.AddMemory(direct_memory, 8u));
+  AllocateBindings(fixture.program);
+  const auto *binding = FindBinding(fixture.program.bindings, DescriptorBindingKind::Buffers);
+  Check(binding != nullptr && binding->resources == std::vector<uint32_t>{1u, 2u, 4u} &&
+            fixture.program.bindings.memory_offset_count == 3u,
+        "mixed direct/table bindings lost candidates or included dead buffers");
+
+  fixture.program.memory_info[table_index.index].buffer_table = 1u;
+  CheckFatal([&] { std::vector<uint32_t> output; CollectMemoryResources(fixture.program, output); },
+             "invalid buffer table", "missing bounded table was accepted");
+  fixture.program.memory_info[table_index.index].buffer_table = 0u;
+  fixture.program.info.buffer_tables[0].resources.push_back(5u);
+  CheckFatal([&] { std::vector<uint32_t> output; CollectMemoryResources(fixture.program, output); },
+             "invalid buffer table candidate", "out-of-range bounded candidate was accepted");
+}
+
 void TestResourceLimitIsTransactional() {
   // MaxBuffers capacity contract: exact capacity must survive CollectShaderInfo
   // and AllocateBindings without truncating the dense buffer table.
@@ -6834,6 +6874,7 @@ int main(int argc, char** argv) {
     Run("comparison binding isolation", TestComparisonBindingsAreIsolated);
     Run("image binding ABI", TestImageBindingAbi);
     Run("graphics push constants", TestGraphicsPushConstantLayout);
+    Run("bounded buffer binding collection", TestBoundedBufferBindingCollection);
     Run("resource limit", TestResourceLimitIsTransactional);
     Run("malformed memory kinds", TestMalformedMemoryKindsRejected);
   } catch (const std::exception &exception) {

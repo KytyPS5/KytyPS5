@@ -72,8 +72,20 @@ bool CollectMemoryResources(const Program& program, std::vector<uint32_t>& buffe
 				}
 				uses_gds |= memory.kind == ResourceKind::Gds;
 			} else if (memory.kind == ResourceKind::Buffer || memory.kind == ResourceKind::ScalarBuffer) {
-				EXIT_IF(memory.resource >= program.info.buffers.size());
-				live_buffers.at(memory.resource) = true;
+				if (memory.buffer_table != UINT32_MAX) {
+					if (memory.buffer_table >= program.info.buffer_tables.size()) {
+						BindingFail("typed shader contains an invalid buffer table");
+					}
+					for (const auto resource : program.info.buffer_tables[memory.buffer_table].resources) {
+						if (resource >= program.info.buffers.size()) {
+							BindingFail("typed shader contains an invalid buffer table candidate");
+						}
+						live_buffers.at(resource) = true;
+					}
+				} else {
+					EXIT_IF(memory.resource >= program.info.buffers.size());
+					live_buffers.at(memory.resource) = true;
+				}
 			}
 		}
 	}

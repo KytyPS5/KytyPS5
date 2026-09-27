@@ -123,6 +123,26 @@ Indirect-image selector GREEN after the shared emitter corrections:
 exact LOD assertions and the numerical cube-gradient GPU case pass. Temporary
 disassembly instrumentation was removed; its RED artifact remains in `_Build/logs`.
 
+Neighbor check `--sampled-depth-resource-only` remains RED at the existing
+`ComparisonDepthTexture` assertion requiring `OpImageSampleDrefExplicitLod`:
+`merge-sample-depth-neighbor-20260927.txt.stderr`. Manual depth-compare lowering
+is already present in pre-merge `e0c73250`; distinguish host format capability
+admission and the fixture opcode requirement from numerical comparison results
+before changing either. Its GPU numerical stage has not been reached.
+
+Game retry on `1f1f7665` reaches a binding-collector bounds error before present:
+`_Build/runs/yotei-integrated-20260927-201152-menucheck-gpuav-sync`, exit 321.
+A specialized bounded buffer access has a logical table and multiple dense
+candidates, not one `memory.resource`. Before changing collection, add a CPU
+fixture with reordered/duplicate candidates, a separate direct buffer, and
+invalid table/candidate boundaries. Require only live dense resources in
+bindings, preserving their ascending compact order and packed shader-data ABI.
+
+Bounded-binding regression RED/GREEN: unchanged valid fixture fails on the
+pre-fix collector (`merge-bounded-bindings-valid-red-20260927.txt`) and passes
+with candidate collection (`merge-bounded-bindings-valid-green-20260927.txt`).
+Full native rebuild, shader validation and original game retry remain required.
+
 ## Restored RO aligned-upload regression source (2026-09-27)
 
 The historical RED/GREEN logs existed but the selector implementation had been

@@ -548,30 +548,40 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph\n", GetDumpLabel(options),
 	     StageName(options.stage), options.shader_hash);
-	auto cfg = CFG::BuildGraph(decoded);
+	auto native_cfg = CFG::BuildGraph(decoded);
+	CFG::Graph structured_cfg;
+	auto* selected_cfg = &native_cfg;
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph blocks=%" PRIu64
 	     " loops=%" PRIu64 " back_edges=%" PRIu64 " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
-	     static_cast<uint64_t>(cfg.blocks.size()), static_cast<uint64_t>(cfg.natural_loops.size()),
-	     static_cast<uint64_t>(cfg.back_edges.size()), phase_ms());
-	if (cfg.irreducible) {
-		LogDispatcherFallback(options, cfg, "build");
+	     static_cast<uint64_t>(native_cfg.blocks.size()),
+	     static_cast<uint64_t>(native_cfg.natural_loops.size()),
+	     static_cast<uint64_t>(native_cfg.back_edges.size()), phase_ms());
+	if (native_cfg.irreducible) {
+		LogDispatcherFallback(options, native_cfg, "build");
 	} else {
 		LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " CFG Structurize\n",
 		     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
-		if (!CFG::Structurize(cfg)) {
-			LogDispatcherFallback(options, cfg, "structurize");
+		structured_cfg = CFG::Structurize(native_cfg);
+		if (structured_cfg.unsupported) {
+			native_cfg.unsupported = true;
+			native_cfg.failure_kind = structured_cfg.failure_kind;
+			native_cfg.failure_block = structured_cfg.failure_block;
+			native_cfg.unsupported_reason = structured_cfg.unsupported_reason;
+			LogDispatcherFallback(options, native_cfg, "structurize");
 		} else {
+			selected_cfg = &structured_cfg;
 			LOGF("%s structured CFG success: blocks=%" PRIu64 "\n", GetDumpLabel(options),
-			     static_cast<uint64_t>(cfg.blocks.size()));
+			     static_cast<uint64_t>(selected_cfg->blocks.size()));
 		}
 		LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " CFG Structurize blocks=%" PRIu64
 		     " loops=%" PRIu64 " elapsed_ms=%" PRIu64 "\n",
 		     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
-		     static_cast<uint64_t>(cfg.blocks.size()),
-		     static_cast<uint64_t>(cfg.natural_loops.size()), phase_ms());
+		     static_cast<uint64_t>(selected_cfg->blocks.size()),
+		     static_cast<uint64_t>(selected_cfg->natural_loops.size()), phase_ms());
 	}
 
+	const auto& cfg = *selected_cfg;
 	Frontend::EmbeddedFetchPlan embedded_fetch;
 	if ((options.stage == ShaderType::Vertex || options.stage == ShaderType::Local) &&
 	    options.input_info.vertex != nullptr && options.input_info.vertex->fetch_embedded) {
@@ -616,7 +626,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	LowerTessellationMemory(ir, options);
 	IR::BuildSrtPlan(ir);
 	IR::EliminateDeadCode(ir.blocks);
-	IR::TrackResources(ir);
+	IR::TrackResources(ir, decoded, native_cfg);
 	IR::EliminateDeadCode(ir.blocks);
 	TranslateResult result;
 	result.program = std::move(ir);

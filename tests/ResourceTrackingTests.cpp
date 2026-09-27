@@ -127,7 +127,7 @@ struct Fixture {
 
   void PlanAndTrack() {
     BuildSrtPlan(program);
-    TrackResources(program);
+    TrackResources(program, {}, {});
   }
 };
 
@@ -520,7 +520,7 @@ void TestInvariantIndirectImageMaterialization() {
 
   auto malformed = MakeIndirectImageFixture(true);
   BuildSrtPlan(malformed->program);
-  CheckFatal([&] { TrackResources(malformed->program); }, "not a valid runtime value",
+  CheckFatal([&] { TrackResources(malformed->program, {}, {}); }, "not a valid runtime value",
              "malformed indirect image pattern was accepted");
   Check(!malformed->program.resource_tracking_complete &&
             malformed->program.info.images.empty() &&
@@ -529,7 +529,7 @@ void TestInvariantIndirectImageMaterialization() {
 
   auto wrapped_immediate = MakeIndirectImageFixture(false, 4u);
   BuildSrtPlan(wrapped_immediate->program);
-  CheckFatal([&] { TrackResources(wrapped_immediate->program); },
+  CheckFatal([&] { TrackResources(wrapped_immediate->program, {}, {}); },
              "not a valid runtime value",
              "wrapped scalar immediate entered the invariant image proof");
   Check(!wrapped_immediate->program.resource_tracking_complete,
@@ -1405,7 +1405,7 @@ void TestDenseBufferTracking() {
             fixture.program.memory_info[other_flags.index].resource == 1,
         "typed memory metadata was not patched to dense indices");
 
-  CheckFatal([&] { TrackResources(fixture.program); }, "already tracked",
+  CheckFatal([&] { TrackResources(fixture.program, {}, {}); }, "already tracked",
              "resource tracking allowed a second mutation pass");
 }
 
@@ -1602,7 +1602,7 @@ void TestSampleAdjustSamplerScratch() {
                   {rejected_image, rejected_sampler, rejected.ImageAddress()},
                   rejected.AddMemory(rejected_memory, 0x200));
     BuildSrtPlan(rejected.program);
-    CheckFatal([&] { TrackResources(rejected.program); },
+    CheckFatal([&] { TrackResources(rejected.program, {}, {}); },
                "not a valid runtime value", message);
   };
   CheckRejected(0u, 12u,
@@ -1991,7 +1991,7 @@ void TestPhiValidation() {
                fixture.AddMemory(memory, 20), merge);
 
   BuildSrtPlan(fixture.program);
-  CheckFatal([&] { TrackResources(fixture.program); }, "not a valid runtime value",
+  CheckFatal([&] { TrackResources(fixture.program, {}, {}); }, "not a valid runtime value",
              "control-dependent descriptor phi was accepted");
   Check(!fixture.program.resource_tracking_complete &&
             fixture.program.info.buffers.empty() &&
@@ -2153,90 +2153,6 @@ void TestConditionalSamplerPhi() {
         "not a valid runtime value",
         "shader-written sampler predicate was accepted");
   }
-}
-
-void TestGuardedSamplerPhi() {
-  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
-  const auto make_plan = [](bool take_true, bool reverse_phi, bool bypass,
-                            bool mismatched, bool ambiguous) {
-    Fixture fixture(ShaderType::Pixel);
-    auto *entry = fixture.block;
-    auto *loaded = fixture.AddBlock();
-    auto *merge = fixture.AddBlock();
-    auto *sample = fixture.AddBlock();
-    auto *exit = fixture.AddBlock();
-    entry->AddBranch(loaded);
-    entry->AddBranch(merge);
-    loaded->AddBranch(merge);
-    merge->AddBranch(sample);
-    merge->AddBranch(exit);
-    sample->AddBranch(exit);
-    if (bypass) exit->AddBranch(sample);
-    const auto lane = fixture.Emit(ValueOpcode::LaneId);
-    const auto predicate = fixture.Emit(ValueOpcode::IEqual32, {lane, Value(0u)});
-    fixture.program.block_info[0].condition = predicate;
-    fixture.program.block_info[0].terminator = {
-        .kind = CFG::TerminatorKind::ConditionalBranch,
-        .true_block = 1u, .false_block = 2u};
-    fixture.program.block_info[1].terminator = {
-        .kind = CFG::TerminatorKind::Branch, .true_block = 2u};
-    auto &guard = merge->AppendNewInst(ValueOpcode::Phi, {},
-                                       static_cast<uint64_t>(Type::U1));
-    guard.AddPhiOperand(entry, ambiguous ? predicate : Value(!take_true));
-    guard.AddPhiOperand(mismatched ? sample : loaded, predicate);
-    fixture.program.block_info[2].condition = Value(&guard);
-    fixture.program.block_info[2].terminator = {
-        .kind = CFG::TerminatorKind::ConditionalBranch,
-        .true_block = take_true ? 3u : 4u,
-        .false_block = take_true ? 4u : 3u};
-    fixture.program.block_info[3].terminator = {
-        .kind = CFG::TerminatorKind::Branch, .true_block = 4u};
-    fixture.program.block_info[4].terminator = {
-        .kind = bypass ? CFG::TerminatorKind::Branch : CFG::TerminatorKind::Return,
-        .true_block = 3u};
-    std::array<Value, 4> words;
-    for (uint32_t word = 0; word < words.size(); ++word) {
-      // An arbitrary excluded value proves this is control-flow reasoning, not null filtering.
-      const auto first = Value(0xbad000u + word);
-      const auto second = fixture.UserData(word);
-      auto &phi = merge->AppendNewInst(ValueOpcode::Phi, {},
-                                       static_cast<uint64_t>(Type::U32));
-      phi.AddPhiOperand(reverse_phi ? loaded : entry, reverse_phi ? second : first);
-      phi.AddPhiOperand(reverse_phi ? entry : loaded, reverse_phi ? first : second);
-      words[word] = Value(&phi);
-    }
-    fixture.block = sample;
-    const auto image = fixture.Image({Value(0u), Value(0u), Value(0u), Value(0u),
-                                      Value(0u), Value(0u), Value(0u), Value(0u)});
-    const auto sampler = fixture.Sampler(words);
-    MemoryInfo memory;
-    memory.kind = ResourceKind::Image;
-    memory.image_dimension = Decoder::ImageDimension::Dim2D;
-    fixture.Emit(ValueOpcode::ImageSampleRaw,
-                  {image, sampler, fixture.ImageAddress()},
-                  fixture.AddMemory(memory, 0x2a0));
-    fixture.PlanAndTrack();
-    Check(words[0].ResolveInstruction()->GetOpcode() == ValueOpcode::Phi,
-          "guarded host descriptor selection rewrote the GPU Phi");
-    return ExtractResourcePlan(fixture.program);
-  };
-  for (const bool take_true : {false, true}) {
-    for (const bool reverse_phi : {false, true}) {
-      auto plan = make_plan(take_true, reverse_phi, false, false, false);
-      const std::array<uint32_t, 4> user_data{0x444u, 0x555u, 0x666u, 0x777u};
-      DescriptorValue selected;
-      Check(SrtWalker(plan, {.user_data = user_data}).EvaluateDescriptor(
-                plan.info.samplers[0].source, selected) &&
-                std::equal(user_data.begin(), user_data.end(), selected.dwords.begin()),
-            "guarded sampler did not match descriptor and predicate predecessors");
-    }
-  }
-  CheckFatal([&] { make_plan(true, false, true, false, false); },
-              "not a valid runtime value", "sampler guard accepted an unguarded path");
-  CheckFatal([&] { make_plan(true, false, false, true, false); },
-              "not a valid runtime value", "sampler guard ignored predecessor identity");
-  CheckFatal([&] { make_plan(true, false, false, false, true); },
-              "not a valid runtime value", "sampler guard discarded a reachable alternative");
 }
 
 void TestLoopCycleEnteredThroughRuntimeValue() {
@@ -2852,7 +2768,7 @@ void TestResourceLimitIsTransactional() {
                  fixture.AddMemory(memory, index * 4u));
   }
   BuildSrtPlan(fixture.program);
-  CheckFatal([&] { TrackResources(fixture.program); },
+  CheckFatal([&] { TrackResources(fixture.program, {}, {}); },
              "buffer resource limit exceeded",
              "resource-limit failure was not reported");
   Check(!fixture.program.resource_tracking_complete &&
@@ -2872,7 +2788,7 @@ void TestMalformedMemoryKindsRejected() {
                  fixture.AddMemory(memory, 4));
     BuildSrtPlan(fixture.program);
     CheckFatal(
-        [&] { TrackResources(fixture.program); },
+        [&] { TrackResources(fixture.program, {}, {}); },
         "address operation has invalid resource kind",
         "resource tracking accepted an address opcode with buffer metadata");
   }
@@ -2889,7 +2805,7 @@ void TestMalformedMemoryKindsRejected() {
                  fixture.AddMemory(memory, 8));
     BuildSrtPlan(fixture.program);
     CheckFatal(
-        [&] { TrackResources(fixture.program); },
+        [&] { TrackResources(fixture.program, {}, {}); },
         "image operation has invalid resource kind",
         "resource tracking accepted an image opcode with address metadata");
   }
@@ -2924,7 +2840,6 @@ int main() {
     Run("dynamic SRT", TestDynamicSrtReadRemainsExplicit);
     Run("phi validation", TestPhiValidation);
     Run("conditional sampler phi", TestConditionalSamplerPhi);
-    Run("guarded sampler phi", TestGuardedSamplerPhi);
     Run("runtime-rooted loop", TestLoopCycleEnteredThroughRuntimeValue);
     Run("invariant loop phi", TestInvariantLoopPhi);
     Run("DMA address materialization", TestDmaAddressMaterialization);

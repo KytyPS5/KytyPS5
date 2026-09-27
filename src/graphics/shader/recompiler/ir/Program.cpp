@@ -81,7 +81,8 @@ bool EquivalentValue(const ResourcePlan& program, Value left, Value right,
 		    program.memory_info[li] != program.memory_info[ri]) {
 			return false;
 		}
-	} else if (lhs->Flags<uint64_t>() != rhs->Flags<uint64_t>()) {
+	} else if (lhs->GetOpcode() != ValueOpcode::ReadConst &&
+	           lhs->Flags<uint64_t>() != rhs->Flags<uint64_t>()) {
 		return false;
 	}
 	for (size_t index = 0; index < lhs->NumArgs(); index++) {

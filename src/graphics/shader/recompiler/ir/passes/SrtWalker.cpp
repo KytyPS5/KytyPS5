@@ -430,7 +430,8 @@ private:
 			const auto resource =
 			    Value(&*block->PrependNewInst(where, ValueOpcode::GetSrtResource));
 			const auto flat = Value(&*block->PrependNewInst(where, ValueOpcode::ReadConst,
-			                                                {resource, Value(patch.slot)}));
+			                                                {resource, Value(patch.slot)},
+			                                                patch.inst->Flags<uint64_t>()));
 			const auto uses = patch.inst->Uses();
 			for (const auto& use: uses) {
 				use.user->SetArg(use.operand, flat);

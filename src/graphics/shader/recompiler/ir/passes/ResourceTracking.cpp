@@ -82,7 +82,10 @@ uint32_t ByteExtent(const MemoryInfo& memory) {
 
 class Tracker {
 public:
-	explicit Tracker(Program& program): m_program(program), m_info(program.info) {
+	Tracker(Program& program, const Decoder::Program& decoded, const CFG::Graph& native_cfg)
+	    : m_program(program), m_decoded(decoded), m_native_cfg(native_cfg),
+	      m_scalar_writes(std::move(program.scalar_writes)), m_info(program.info) {
+		std::ranges::sort(m_scalar_writes, {}, &Program::ScalarWrite::pc);
 		m_info.buffers.clear();
 		m_info.images.clear();
 		m_info.samplers.clear();
@@ -169,7 +172,98 @@ private:
 		std::abort();
 	}
 
-	Value LowerDescriptorPhi(Value value, const Block* use) {
+	Value NativeDescriptorSource(Value value, uint32_t reg, uint32_t use_pc) const {
+		value = value.Resolve();
+		const auto* phi = value.TryInstruction();
+		if (phi == nullptr || phi->GetOpcode() != ValueOpcode::Phi || m_native_cfg.blocks.empty())
+			return value;
+		std::vector<const Inst*> candidates;
+		std::vector<const Inst*> visited;
+		std::vector<const Inst*> pending {phi};
+		while (!pending.empty()) {
+			const auto* inst = pending.back();
+			pending.pop_back();
+			if (std::ranges::find(visited, inst) != visited.end()) continue;
+			visited.push_back(inst);
+			if (inst->GetOpcode() == ValueOpcode::Phi) {
+				for (size_t i = 0; i < inst->NumArgs(); ++i) {
+					const auto* arg = inst->Arg(i).Resolve().TryInstruction();
+					if (arg != nullptr) pending.push_back(arg);
+				}
+			} else if (inst->GetOpcode() == ValueOpcode::ReadConst ||
+			           inst->GetOpcode() == ValueOpcode::GetUserData) {
+				candidates.push_back(inst);
+			}
+		}
+		if (candidates.empty()) return value;
+		const auto source_at = [&](uint32_t pc) {
+			Value source;
+			const auto native = std::ranges::lower_bound(m_decoded.instructions, pc, {},
+			                                            &Decoder::Instruction::pc);
+			for (const auto* candidate: candidates) {
+				if (pc == UINT32_MAX) {
+					if (candidate->GetOpcode() != ValueOpcode::GetUserData ||
+					    RegIndex(candidate->Arg(0).ScalarRegister()) != reg)
+						continue;
+				} else {
+					if (candidate->GetOpcode() != ValueOpcode::ReadConst) continue;
+					const auto flags = candidate->Flags<MemoryFlags>();
+					if (flags.pc != pc || flags.index >= m_program.memory_info.size()) continue;
+					if (native == m_decoded.instructions.end() || native->pc != pc ||
+					    native->dst.kind != Decoder::OperandKind::Sgpr ||
+					    native->dst.reg + m_program.memory_info[flags.index].component_index != reg)
+						continue;
+				}
+				const Value current(const_cast<Inst*>(candidate));
+				if (!source.IsEmpty() && !EquivalentValue(m_program, source, current)) return Value {};
+				source = current;
+			}
+			return source;
+		};
+		const auto use = std::ranges::find_if(m_native_cfg.blocks, [&](const auto& block) {
+			return block.start_pc <= use_pc && use_pc < block.end_pc;
+		});
+		if (use == m_native_cfg.blocks.end()) return value;
+		struct Position { uint32_t block; uint32_t before; };
+		std::vector<Position> positions {{use->id, use_pc}};
+		std::vector<bool> reached(m_native_cfg.blocks.size());
+		Value selected;
+		const auto select = [&](uint32_t pc) {
+			const auto source = source_at(pc);
+			if (source.IsEmpty() || (!selected.IsEmpty() && !EquivalentValue(m_program, selected, source)))
+				return false;
+			selected = source;
+			return true;
+		};
+		while (!positions.empty()) {
+			const auto position = positions.back();
+			positions.pop_back();
+			const auto& block = m_native_cfg.blocks[position.block];
+			// A backedge may revisit the use block after a write later than the original use.
+			if (position.before == block.end_pc) {
+				if (reached[block.id]) continue;
+				reached[block.id] = true;
+			}
+			auto write = std::ranges::lower_bound(m_scalar_writes, position.before, {},
+			                                    &Program::ScalarWrite::pc);
+			bool found = false;
+			while (write != m_scalar_writes.begin()) {
+				--write;
+				if (write->pc < block.start_pc) break;
+				if (RegIndex(write->reg) != reg) continue;
+				if (!select(write->pc)) return value;
+				found = true;
+				break;
+			}
+			if (found) continue;
+			if (block.id == m_native_cfg.entry_block && !select(UINT32_MAX)) return value;
+			for (const auto pred: block.predecessors)
+				positions.push_back({pred, m_native_cfg.blocks[pred].end_pc});
+		}
+		return selected.IsEmpty() ? value : selected;
+	}
+
+	Value LowerDescriptorPhi(Value value) {
 		value           = value.Resolve();
 		const auto* phi = value.TryInstruction();
 		if (m_shader_writes || phi == nullptr || phi->GetOpcode() != ValueOpcode::Phi ||
@@ -182,42 +276,6 @@ private:
 		if (merge == nullptr || branch == nullptr || phi->PhiBlock(1) == nullptr ||
 		    branch == phi->PhiBlock(1)) {
 			return value;
-		}
-		// Structurization can merge the descriptor and its use predicate in parallel Phis.
-		// Match their incoming blocks to exclude only edges that cannot reach this use.
-		if (use != nullptr && use->ImmPredecessors().size() == 1u &&
-		    use->ImmPredecessors()[0] == merge) {
-			const auto merge_it = std::ranges::find(m_program.blocks, merge);
-			const auto use_it   = std::ranges::find(m_program.blocks, use);
-			if (merge_it != m_program.blocks.end() && use_it != m_program.blocks.end()) {
-				const auto& info = m_program.block_info[merge_it - m_program.blocks.begin()];
-				const auto& term = info.terminator;
-				const auto id    = m_program.block_info[use_it - m_program.blocks.begin()].id;
-				const auto* condition = info.condition.Resolve().TryInstruction();
-				if (term.kind == CFG::TerminatorKind::ConditionalBranch &&
-				    term.true_block != term.false_block &&
-				    (id == term.true_block || id == term.false_block) && condition != nullptr &&
-				    condition->GetOpcode() == ValueOpcode::Phi && condition->GetType() == Type::U1 &&
-				    condition->Parent() == merge && condition->NumArgs() == 2u &&
-				    condition->NumPhiBlocks() == 2u) {
-					const bool taken = id == term.true_block;
-					for (uint32_t skipped = 0; skipped < 2u; skipped++) {
-						const auto excluded = condition->Arg(skipped).Resolve();
-						const auto included = condition->Arg(skipped ^ 1u).Resolve();
-						if (!excluded.IsImmediate() || excluded.GetType() != Type::U1 ||
-						    excluded.U1() == taken ||
-						    (included.IsImmediate() && included.U1() != taken)) {
-							continue;
-						}
-						for (uint32_t selected = 0; selected < 2u; selected++) {
-							if (phi->PhiBlock(selected) == condition->PhiBlock(skipped ^ 1u) &&
-							    phi->PhiBlock(selected ^ 1u) == condition->PhiBlock(skipped)) {
-								return phi->Arg(selected);
-							}
-						}
-					}
-				}
-			}
 		}
 		for (const auto& [original, selected]: m_descriptor_selections) {
 			if (original == phi) {
@@ -276,14 +334,16 @@ private:
 	}
 
 	void MakeSource(const Inst& handle, uint32_t width, bool sampler, bool sample_adjust,
-	                DescriptorSource& descriptor, uint32_t pc) {
+	                uint32_t base_reg, DescriptorSource& descriptor, uint32_t pc) {
 		if (handle.NumArgs() != width) {
 			Fail(pc, fmt::format("{} has {} descriptor dwords, expected {}",
 			                     ValueOpcodeName(handle.GetOpcode()), handle.NumArgs(), width));
 		}
 		descriptor.dword_count = width;
 		for (uint32_t i = 0; i < width; i++) {
-			descriptor.dwords[i] = LowerDescriptorPhi(handle.Arg(i), handle.Parent());
+			const auto value = base_reg != UINT32_MAX
+			    ? NativeDescriptorSource(handle.Arg(i), base_reg + i, pc) : handle.Arg(i);
+			descriptor.dwords[i] = LowerDescriptorPhi(value);
 		}
 		if (sample_adjust) {
 			descriptor.dwords[3] = CanonicalizeSampleAdjustDword3(descriptor.dwords[3]);
@@ -404,7 +464,7 @@ private:
 		if (width == 0u) {
 			return false;
 		}
-		MakeSource(handle, width, false, false, descriptor, pc);
+		MakeSource(handle, width, false, false, UINT32_MAX, descriptor, pc);
 		uint32_t bad_dword = 0;
 		return ValidateSource(descriptor, bad_dword);
 	}
@@ -1014,14 +1074,15 @@ private:
 		}
 	}
 
-	bool GetHandle(Value value, ValueOpcode expected, uint32_t width, uint32_t pc, Inst*& handle,
-	               uint32_t& source, bool sampler = false, bool sample_adjust = false) {
+	bool GetHandle(Value value, ValueOpcode expected, uint32_t width, uint32_t pc,
+	               uint32_t base_reg, Inst*& handle, uint32_t& source, bool sampler = false,
+	               bool sample_adjust = false) {
 		handle = value.Resolve().TryInstruction();
 		if (handle == nullptr || handle->GetOpcode() != expected) {
 			Fail(pc, fmt::format("memory operation requires {}", ValueOpcodeName(expected)));
 		}
 		DescriptorSource descriptor;
-		MakeSource(*handle, width, sampler, sample_adjust, descriptor, pc);
+		MakeSource(*handle, width, sampler, sample_adjust, base_reg, descriptor, pc);
 		uint32_t bad_dword = 0;
 		if (!ValidateSource(descriptor, bad_dword)) {
 			if (expected == ValueOpcode::GetBufferResource &&
@@ -1204,8 +1265,8 @@ private:
 		uint32_t resource = 0;
 
 		if (buffer != BufferAccess::None) {
-			if (!GetHandle(inst.Arg(0), ValueOpcode::GetBufferResource, 4, flags.pc, handle,
-			               source)) {
+			if (!GetHandle(inst.Arg(0), ValueOpcode::GetBufferResource, 4, flags.pc,
+			               memory.resource * 4u, handle, source)) {
 				if (memory.kind != ResourceKind::Buffer || !memory.SupportsIndirectBufferLoad(op)) {
 					Fail(flags.pc,
 					     "buffer descriptor is not a valid runtime value; GPU-selected access "
@@ -1255,7 +1316,8 @@ private:
 		if (indirect != nullptr) {
 			source = indirect->source;
 		} else {
-			GetHandle(inst.Arg(0), ValueOpcode::GetImageResource, 8, flags.pc, handle, source);
+			GetHandle(inst.Arg(0), ValueOpcode::GetImageResource, 8, flags.pc,
+			          memory.resource * 4u, handle, source);
 		}
 		resource = AddImage(source, memory, op, flags.pc);
 		if (resource == UINT32_MAX) {
@@ -1271,8 +1333,8 @@ private:
 			uint32_t   sampler_source = 0;
 			const bool sample_adjust =
 			    (memory.image_sample_flags & Decoder::ImageSampleFlagAdjust) != 0;
-			GetHandle(inst.Arg(1), ValueOpcode::GetSamplerResource, 4, flags.pc, sampler_handle,
-			          sampler_source, true, sample_adjust);
+			GetHandle(inst.Arg(1), ValueOpcode::GetSamplerResource, 4, flags.pc,
+			          memory.sampler * 4u, sampler_handle, sampler_source, true, sample_adjust);
 			sampler = AddSampler(sampler_source, flags.pc);
 			if (sampler == UINT32_MAX) {
 				Fail(flags.pc, "sampler resource limit exceeded");
@@ -1313,6 +1375,9 @@ private:
 	}
 
 	Program&                                   m_program;
+	const Decoder::Program&                    m_decoded;
+	const CFG::Graph&                          m_native_cfg;
+	std::vector<Program::ScalarWrite>          m_scalar_writes;
 	ShaderInfo                                 m_info;
 	std::vector<DescriptorSource>              m_sources;
 	std::vector<HandlePatch>                   m_handle_patches;
@@ -1324,8 +1389,8 @@ private:
 
 } // namespace
 
-void TrackResources(Program& program) {
-	Tracker(program).Run();
+void TrackResources(Program& program, const Decoder::Program& decoded, const CFG::Graph& native_cfg) {
+	Tracker(program, decoded, native_cfg).Run();
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

@@ -1758,16 +1758,13 @@ Graph BuildGraph(const Decoder::Program& program) {
 	return graph;
 }
 
-bool Structurize(Graph& graph) {
-	if (graph.unsupported || graph.irreducible) return false;
-	auto structured = GotoStructurizer(graph).Run();
-	if (structured.unsupported) {
-		SetFailure(graph, structured.failure_kind, structured.failure_block,
-		           structured.unsupported_reason);
-		return false;
+Graph Structurize(const Graph& graph) {
+	if (graph.unsupported || graph.irreducible) {
+		Graph failed;
+		SetFailure(failed, graph.failure_kind, graph.failure_block, graph.unsupported_reason);
+		return failed;
 	}
-	graph = std::move(structured);
-	return true;
+	return GotoStructurizer(graph).Run();
 }
 
 std::string BranchConditionToString(BranchCondition condition) {

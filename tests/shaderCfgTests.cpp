@@ -7778,8 +7778,8 @@ void TestNewShaderRecompilerCfgLoopHeaderDsAppendConsumeStructured() {
   const auto original_block_count = graph.blocks.size();
   const auto original_coverage =
       CfgInstructionCoverage(graph, decoded.instructions.size());
-  Check(ShaderRecompiler::CFG::Structurize(graph),
-        graph.unsupported_reason.c_str());
+  graph = ShaderRecompiler::CFG::Structurize(graph);
+  Check(!graph.unsupported, graph.unsupported_reason.c_str());
   Check(graph.natural_loops.size() == 1u, "DS loop was not preserved");
   Check(graph.blocks.size() == original_block_count + 1u,
         "DS loop structurization did not add exactly one empty header");
@@ -7914,7 +7914,8 @@ void TestNewShaderRecompilerCfgLoopExitSharedWithSelection() {
   const auto coverage = CfgInstructionCoverage(graph, decoded.instructions.size());
   Check(block_count == 8u && graph.natural_loops.size() == 1u,
         "shared loop-exit fixture has the wrong native CFG");
-  Check(ShaderRecompiler::CFG::Structurize(graph), graph.unsupported_reason.c_str());
+  graph = ShaderRecompiler::CFG::Structurize(graph);
+  Check(!graph.unsupported, graph.unsupported_reason.c_str());
   Check(CfgInstructionCoverage(graph, decoded.instructions.size()) == coverage,
         "shared loop-exit routing changed semantic instruction coverage");
 
@@ -8029,8 +8030,8 @@ void TestNewShaderRecompilerCfgNestedLoopExitTailMergeSplit() {
   ShaderRecompiler::CFG::Graph graph;
   graph = ShaderRecompiler::CFG::BuildGraph(program);
   const auto original_block_count = graph.blocks.size();
-  Check(ShaderRecompiler::CFG::Structurize(graph),
-        graph.unsupported_reason.c_str());
+  graph = ShaderRecompiler::CFG::Structurize(graph);
+  Check(!graph.unsupported, graph.unsupported_reason.c_str());
   Check(graph.blocks.size() > original_block_count,
         "nested loop exit tails did not create a private inner merge");
 
@@ -8177,8 +8178,8 @@ void TestNewShaderRecompilerCfgLoopGatewaySelection() {
   graph = ShaderRecompiler::CFG::BuildGraph(decoded);
   const auto original_coverage =
       CfgInstructionCoverage(graph, decoded.instructions.size());
-  Check(ShaderRecompiler::CFG::Structurize(graph),
-        graph.unsupported_reason.c_str());
+  graph = ShaderRecompiler::CFG::Structurize(graph);
+  Check(!graph.unsupported, graph.unsupported_reason.c_str());
   Check(CfgInstructionCoverage(graph, decoded.instructions.size()) ==
             original_coverage,
         "loop gateway structurization duplicated semantic instructions");
@@ -8216,8 +8217,8 @@ void TestNewShaderRecompilerCfgConditionalLoopHeaderSelection() {
   ShaderRecompiler::CFG::Graph graph;
   graph = ShaderRecompiler::CFG::BuildGraph(decoded);
   const auto original_block_count = graph.blocks.size();
-  Check(ShaderRecompiler::CFG::Structurize(graph),
-        graph.unsupported_reason.c_str());
+  graph = ShaderRecompiler::CFG::Structurize(graph);
+  Check(!graph.unsupported, graph.unsupported_reason.c_str());
   Check(graph.blocks.size() > original_block_count,
         "conditional guest loop header did not create a synthetic header");
 
@@ -8269,8 +8270,8 @@ void TestNewShaderRecompilerCfgMultipleLoopLatches() {
   const auto coverage = CfgInstructionCoverage(graph, decoded.instructions.size());
   Check(graph.back_edges.size() == 2u,
         "multiple-latch fixture lacks two native backedges");
-  Check(ShaderRecompiler::CFG::Structurize(graph),
-        graph.unsupported_reason.c_str());
+  graph = ShaderRecompiler::CFG::Structurize(graph);
+  Check(!graph.unsupported, graph.unsupported_reason.c_str());
   Check(CfgInstructionCoverage(graph, decoded.instructions.size()) == coverage,
         "shared backedge construction duplicated guest instructions");
   Check(graph.back_edges.size() == 1u && graph.natural_loops.size() == 1u,
@@ -8344,8 +8345,8 @@ void TestNewShaderRecompilerCfgNestedEarlyExitLoopForwarders() {
       CfgInstructionCoverage(graph, decoded.instructions.size());
   Check(original_block_count == 7u && graph.natural_loops.size() == 1u,
         "nested early-exit fixture has the wrong native CFG");
-  const bool structured = ShaderRecompiler::CFG::Structurize(graph);
-  Check(structured, graph.unsupported_reason.c_str());
+  graph = ShaderRecompiler::CFG::Structurize(graph);
+  Check(!graph.unsupported, graph.unsupported_reason.c_str());
   Check(CfgInstructionCoverage(graph, decoded.instructions.size()) == original_coverage,
         "nested early-exit structurization changed semantic coverage");
   std::unordered_set<uint32_t> merges;
@@ -8391,8 +8392,8 @@ void TestNewShaderRecompilerCfgExecSccSharedArm() {
   Check(std::ranges::all_of(original_coverage,
                             [](uint32_t uses) { return uses == 1u; }),
         "shared-arm fixture already duplicated a semantic instruction");
-  Check(ShaderRecompiler::CFG::Structurize(graph),
-        graph.unsupported_reason.c_str());
+  graph = ShaderRecompiler::CFG::Structurize(graph);
+  Check(!graph.unsupported, graph.unsupported_reason.c_str());
   Check(CfgInstructionCoverage(graph, decoded.instructions.size()) ==
             original_coverage,
         "EXEC/SCC shared-arm structurization changed semantic coverage");
@@ -8431,8 +8432,8 @@ void TestSharedReturnPreservesDescriptorDominance() {
   auto graph = ShaderRecompiler::CFG::BuildGraph(decoded);
   const auto original_coverage =
       CfgInstructionCoverage(graph, decoded.instructions.size());
-  Check(ShaderRecompiler::CFG::Structurize(graph),
-        graph.unsupported_reason.c_str());
+  graph = ShaderRecompiler::CFG::Structurize(graph);
+  Check(!graph.unsupported, graph.unsupported_reason.c_str());
   const auto *overwrite = graph.FindBlockByPc(0x10u);
   const auto *body = graph.FindBlockByPc(0x20u);
   Check(overwrite != nullptr && body != nullptr &&
@@ -8464,6 +8465,224 @@ void TestSharedReturnPreservesDescriptorDominance() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestNestedSelectionPreservesDescriptorSources() {
+  constexpr uint32_t nested_arm = 12, direct_arm = 18, join = 21, end = 23;
+  const uint32_t shader[] = {
+      EncodeSopc(0x07, 9, 128),
+      EncodeSopp(0x04, end - 1 - 1),
+      EncodeSopc(0x07, 8, 130),
+      EncodeSopp(0x04, direct_arm - 3 - 1),
+      EncodeSmem0(0x02, 16, 10), 125u << 25u,
+      EncodeSopc(0x07, 8, 129),
+      EncodeSopp(0x04, nested_arm - 7 - 1),
+      EncodeSmem0(0x08, 24, 8), 125u << 25u,
+      EncodeVop1(0x01, 0, 24),
+      EncodeSopp(0x02, join - 11 - 1),
+      EncodeSmem0(0x02, 16, 10), (125u << 25u) | 16u,
+      EncodeSmem0(0x08, 24, 8), 125u << 25u,
+      EncodeVop1(0x01, 0, 24),
+      EncodeSopp(0x02, join - 17 - 1),
+      EncodeSmem0(0x08, 24, 8), 125u << 25u,
+      EncodeVop1(0x01, 0, 24),
+      EncodeMubuf0(0x1c, 0, false), EncodeMubuf1(0, 3, 0),
+      EncodeSopp(0x01),
+  };
+  ShaderRecompiler::Decoder::Program decoded;
+  ShaderRecompiler::Decoder::DecodeProgram(std::span{shader}, decoded);
+  auto graph = ShaderRecompiler::CFG::BuildGraph(decoded);
+  const auto coverage = CfgInstructionCoverage(graph, decoded.instructions.size());
+  Check(graph.blocks.size() == 8u &&
+            std::ranges::all_of(coverage, [](uint32_t uses) { return uses == 1u; }),
+        "nested descriptor fixture has the wrong native topology");
+  graph = ShaderRecompiler::CFG::Structurize(graph);
+  Check(!graph.unsupported, graph.unsupported_reason.c_str());
+  Check(CfgInstructionCoverage(graph, decoded.instructions.size()) == coverage,
+        "nested descriptor selection changed semantic instruction coverage");
+
+  const std::array<uint32_t, 8> table{
+      0x3000u, 0u, 4u, 3u << 28u, 0x5000u, 0u, 4u, 3u << 28u};
+  std::array<uint32_t, 14> user_data{};
+  user_data[1] = 1u;
+  user_data[4] = 0x4000u;
+  user_data[6] = 4u;
+  user_data[7] = 3u << 28u;
+  user_data[10] = 4u;
+  user_data[11] = 3u << 28u;
+  const auto address = reinterpret_cast<uint64_t>(table.data());
+  user_data[12] = static_cast<uint32_t>(address);
+  user_data[13] = static_cast<uint32_t>(address >> 32u);
+  for (uint32_t mode = 0; mode != 3; ++mode) {
+    user_data[0] = mode;
+    user_data[8] = 0x2000u + mode * 0x10000u;
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    options.user_data_base = 8;
+    options.user_data = user_data;
+    const auto result = RecompileForTest(shader, options, ReadHostTestMemory);
+    Check(!result.program.dispatcher_fallback && result.resources.buffers.size() == 4u,
+          "nested descriptor selection lost its structured resource bindings");
+    for (size_t i = 0; i < result.program.info.buffers.size(); ++i) {
+      const auto pc = result.program.info.buffers[i].first_use_pc;
+      const uint32_t expected = pc == 8u * 4u ? table[0]
+                                : pc == 14u * 4u ? table[4]
+                                : pc == direct_arm * 4u ? user_data[8]
+                                : pc == join * 4u ? user_data[4] : 0u;
+      Check(expected != 0u && result.resources.buffers[i].dwords[0] == expected,
+            "nested descriptor selection chose another arm's descriptor");
+    }
+    CheckSpirvBinaryValidates(result.spirv);
+  }
+}
+
+void TestSharedExitPreservesNativeDescriptorSources() {
+  constexpr uint32_t selected = 8, later = 18, normal = 26, killed = 29;
+  const uint32_t shader[] = {
+      EncodeSopc(0x07, 0, 128),
+      EncodeSopp(0x04, normal - 1 - 1),
+      EncodeSmem0(0x02, 8, 6), (125u << 25u) | 32u,
+      EncodeSopc(0x07, 1, 128),
+      EncodeSopp(0x04, selected - 5 - 1),
+      EncodeSmem0(0x02, 8, 6), (125u << 25u) | 16u,
+      EncodeSopc(0x07, 2, 128),
+      EncodeSopp(0x04, later - 9 - 1),
+      EncodeSmem0(0x02, 8, 6), (125u << 25u) | 32u,
+      EncodeSopc(0x07, 3, 128),
+      EncodeSopp(0x04, killed - 13 - 1),
+      EncodeSmem0(0x08, 16, 4), 125u << 25u,
+      EncodeVop1(0x01, 0, 16),
+      EncodeSopp(0x02, normal - 17 - 1),
+      EncodeSmem0(0x02, 8, 6), (125u << 25u) | 48u,
+      EncodeSopc(0x07, 4, 128),
+      EncodeSopp(0x04, killed - 21 - 1),
+      EncodeSmem0(0x08, 16, 4), 125u << 25u,
+      EncodeVop1(0x01, 0, 16),
+      EncodeSopp(0x02, normal - 25 - 1),
+      EncodeExp0(0x00, 0x1), EncodeExp1(0, 0, 0, 0),
+      EncodeSopp(0x01),
+      EncodeSopp(0x01),
+  };
+  ShaderRecompiler::Decoder::Program decoded;
+  ShaderRecompiler::Decoder::DecodeProgram(std::span{shader}, decoded);
+  auto graph = ShaderRecompiler::CFG::BuildGraph(decoded);
+  const auto coverage = CfgInstructionCoverage(graph, decoded.instructions.size());
+  Check(graph.blocks.size() == 10u &&
+            std::ranges::all_of(coverage, [](uint32_t uses) { return uses == 1u; }),
+        "shared-exit descriptor fixture has the wrong native topology");
+  graph = ShaderRecompiler::CFG::Structurize(graph);
+  Check(!graph.unsupported, graph.unsupported_reason.c_str());
+  Check(CfgInstructionCoverage(graph, decoded.instructions.size()) == coverage,
+        "shared-exit descriptor selection changed semantic instruction coverage");
+
+  const std::array<uint32_t, 16> table{
+      0x2000u, 0u, 4u, 3u << 28u, 0x3000u, 0u, 4u, 3u << 28u,
+      0x4000u, 0u, 4u, 3u << 28u, 0x5000u, 0u, 4u, 3u << 28u};
+  std::array<uint32_t, 14> user_data{};
+  std::fill_n(user_data.begin(), 5, 1u);
+  user_data[8] = 0x1000u;
+  user_data[10] = 4u;
+  user_data[11] = 3u << 28u;
+  const auto address = reinterpret_cast<uint64_t>(table.data());
+  user_data[12] = static_cast<uint32_t>(address);
+  user_data[13] = static_cast<uint32_t>(address >> 32u);
+  for (uint32_t arm = 0; arm != 2; ++arm) {
+    user_data[2] = arm;
+    auto options = MakeCompileOptions(ShaderType::Pixel);
+    options.user_data = user_data;
+    const auto result = RecompileForTest(shader, options, ReadHostTestMemory);
+    Check(!result.program.dispatcher_fallback && result.resources.buffers.size() == 2u,
+          "shared-exit descriptor selection lost its structured resource bindings");
+    for (size_t i = 0; i < result.program.info.buffers.size(); ++i) {
+      const auto pc = result.program.info.buffers[i].first_use_pc;
+      const uint32_t expected = pc == 14u * 4u ? table[8]
+                                : pc == 22u * 4u ? table[12] : 0u;
+      Check(expected != 0u && result.resources.buffers[i].dwords[0] == expected,
+            "shared-exit descriptor selection retained an overwritten native source");
+    }
+    CheckSpirvBinaryValidates(result.spirv);
+  }
+}
+
+void TestNativeGuardedSamplerSource() {
+  constexpr uint32_t nested = 12, sample = 18, join = 20, end = 22;
+  const uint32_t shader[] = {
+      EncodeSopc(0x07, 21, 128),
+      EncodeSopp(0x04, end - 1 - 1),
+      EncodeSopc(0x07, 20, 130),
+      EncodeSopp(0x04, sample - 3 - 1),
+      EncodeSMovB32(16, 133), EncodeSMovB32(17, 134),
+      EncodeSMovB32(18, 135), EncodeSMovB32(19, 136),
+      EncodeSopc(0x07, 20, 129),
+      EncodeSopp(0x04, nested - 9 - 1),
+      EncodeVop1(0x01, 0, 128),
+      EncodeSopp(0x02, join - 11 - 1),
+      EncodeSMovB32(16, 137), EncodeSMovB32(17, 138),
+      EncodeSMovB32(18, 139), EncodeSMovB32(19, 140),
+      EncodeVop1(0x01, 0, 129),
+      EncodeSopp(0x02, join - 17 - 1),
+      EncodeMimg0(0x20, 0x1), EncodeMimg1(0, 2, 4, 2),
+      EncodeExp0(0x00, 0x1), EncodeExp1(0, 0, 0, 0),
+      EncodeSopp(0x01),
+  };
+  auto user_data = ImageTestUserData();
+  const std::array<uint32_t, 4> sampler{0u, 0u, 0x09500000u, 0u};
+  std::ranges::copy(sampler, user_data.begin() + 8);
+  user_data[13] = 1u;
+  for (uint32_t mode = 0; mode != 3; ++mode) {
+    user_data[12] = mode;
+    auto options = MakeCompileOptions(ShaderType::Pixel);
+    options.user_data_base = 8;
+    options.user_data = user_data;
+    const auto result = RecompileForTest(shader, options);
+    const auto expected = mode == 2u ? sampler : std::array<uint32_t, 4>{};
+    Check(!result.program.dispatcher_fallback && result.resources.samplers.size() == 1u &&
+              result.resources.samplers[0].dword_count == expected.size() &&
+              std::equal(expected.begin(), expected.end(), result.resources.samplers[0].dwords.begin()),
+          "guarded native sample selected an unrelated arm's sampler constants");
+    CheckSpirvBinaryValidates(result.spirv);
+  }
+}
+
+void TestNativeDescriptorProvenanceRejectsGpuSelection() {
+#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+  const std::array<uint32_t, 13> selected{
+      EncodeSmem0(0x02, 8, 6), 125u << 25u,
+      EncodeVop1(0x01, 1, 128),
+      EncodeVopc(0xc4, 256, 1),
+      EncodeSopp(0x06, 2),
+      EncodeSmem0(0x02, 8, 6), (125u << 25u) | 16u,
+      EncodeSmem0(0x08, 16, 4), 125u << 25u,
+      EncodeVop1(0x01, 2, 16),
+      EncodeMubuf0(0x1c, 0, false), EncodeMubuf1(2, 0, 0),
+      EncodeSopp(0x01),
+  };
+  auto partial = selected;
+  partial[5] = EncodeVop1(0x02, 11, 256);
+  partial[6] = EncodeSopp(0x00);
+  const std::array<uint32_t, 13> loop{
+      EncodeSmem0(0x02, 8, 6), 125u << 25u,
+      EncodeSmem0(0x08, 16, 4), 125u << 25u,
+      EncodeVop1(0x01, 2, 16),
+      EncodeMubuf0(0x1c, 0, false), EncodeMubuf1(2, 0, 0),
+      EncodeSmem0(0x02, 8, 6), (125u << 25u) | 16u,
+      EncodeVop1(0x01, 1, 128),
+      EncodeVopc(0xc4, 256, 1),
+      EncodeSopp(0x07, 0xfff6u),
+      EncodeSopp(0x01),
+  };
+  std::array<uint32_t, 14> user_data{};
+  ShaderComputeInputInfo input_info{};
+  input_info.thread_ids_num = 1;
+  input_info.threads_num[0] = 64;
+  input_info.threads_num[1] = input_info.threads_num[2] = 1;
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.input_info.compute = &input_info;
+  options.user_data = user_data;
+  for (const auto &shader : {selected, partial, loop}) {
+    ExpectFatal([&] { ShaderRecompiler::TranslateProgram(shader, options); },
+                "native descriptor provenance accepted a GPU-selected or loop-carried value");
+  }
+#endif
+}
+
 void TestCfgSiblingSharedExit() {
   // f7030726b9470dd8: a nested exit on one side and two exits on the
   // other side share an epilogue, separate from the normal return.
@@ -8481,8 +8700,8 @@ void TestCfgSiblingSharedExit() {
   Decoder::Program decoded;
   Decoder::DecodeProgram(std::span{shader}, decoded);
   const auto original = CFG::BuildGraph(decoded);
-  auto structured = original;
-  Check(CFG::Structurize(structured), structured.unsupported_reason.c_str());
+  auto structured = CFG::Structurize(original);
+  Check(!structured.unsupported, structured.unsupported_reason.c_str());
   Check(CfgInstructionCoverage(structured, decoded.instructions.size()) ==
             CfgInstructionCoverage(original, decoded.instructions.size()),
         "shared sibling exit duplicated or dropped guest instructions");
@@ -8564,8 +8783,8 @@ void TestNewShaderRecompilerCfgNestedTailEarlyExit() {
   graph = ShaderRecompiler::CFG::BuildGraph(decoded);
   const auto original_coverage =
       CfgInstructionCoverage(graph, decoded.instructions.size());
-  Check(ShaderRecompiler::CFG::Structurize(graph),
-        graph.unsupported_reason.c_str());
+  graph = ShaderRecompiler::CFG::Structurize(graph);
+  Check(!graph.unsupported, graph.unsupported_reason.c_str());
   Check(CfgInstructionCoverage(graph, decoded.instructions.size()) ==
             original_coverage,
         "nested-tail routing changed semantic instruction coverage");
@@ -8603,8 +8822,8 @@ void TestNewShaderRecompilerCfgSharedReturnAfterNestedSelections() {
   graph = ShaderRecompiler::CFG::BuildGraph(decoded);
   const auto original_coverage =
       CfgInstructionCoverage(graph, decoded.instructions.size());
-  Check(ShaderRecompiler::CFG::Structurize(graph),
-        graph.unsupported_reason.c_str());
+  graph = ShaderRecompiler::CFG::Structurize(graph);
+  Check(!graph.unsupported, graph.unsupported_reason.c_str());
   Check(CfgInstructionCoverage(graph, decoded.instructions.size()) ==
             original_coverage,
         "shared-exit route ordering changed semantic instruction coverage");
@@ -8641,7 +8860,8 @@ void TestNewShaderRecompilerCfgAlternatingSharedReturns() {
   auto graph = ShaderRecompiler::CFG::BuildGraph(decoded);
   const auto coverage = CfgInstructionCoverage(graph, decoded.instructions.size());
   Check(graph.blocks.size() == 5u, "alternating returns fixture has the wrong CFG");
-  Check(ShaderRecompiler::CFG::Structurize(graph), graph.unsupported_reason.c_str());
+  graph = ShaderRecompiler::CFG::Structurize(graph);
+  Check(!graph.unsupported, graph.unsupported_reason.c_str());
   Check(CfgInstructionCoverage(graph, decoded.instructions.size()) == coverage,
         "alternating returns duplicated a terminal epilogue");
 
@@ -8680,8 +8900,8 @@ void TestNewShaderRecompilerCfgLoopSharedRegion() {
       CfgInstructionCoverage(graph, decoded.instructions.size());
   Check(graph.natural_loops.size() == 1u,
         "loop shared-region fixture has the wrong native CFG");
-  const bool structured = ShaderRecompiler::CFG::Structurize(graph);
-  Check(structured, graph.unsupported_reason.c_str());
+  graph = ShaderRecompiler::CFG::Structurize(graph);
+  Check(!graph.unsupported, graph.unsupported_reason.c_str());
   const auto *loop_header = graph.FindBlockByPc(0x00u);
   Check(graph.natural_loops.size() == 1u && graph.back_edges.size() == 1u &&
             loop_header != nullptr && loop_header->terminator.loop_header &&
@@ -8734,8 +8954,8 @@ void TestNewShaderRecompilerCfgSharedRegionBeforeEarlyBreakLoop() {
       CfgInstructionCoverage(graph, decoded.instructions.size());
   Check(graph.blocks.size() == 9u && graph.natural_loops.size() == 1u,
         "shared-region/early-break fixture has the wrong native CFG");
-  Check(ShaderRecompiler::CFG::Structurize(graph),
-        graph.unsupported_reason.c_str());
+  graph = ShaderRecompiler::CFG::Structurize(graph);
+  Check(!graph.unsupported, graph.unsupported_reason.c_str());
   Check(graph.natural_loops.size() == 1u && graph.back_edges.size() == 1u,
         "selection routing introduced a cycle around a structured loop exit");
   Check(CfgInstructionCoverage(graph, decoded.instructions.size()) ==
@@ -8795,8 +9015,8 @@ void TestNewShaderRecompilerCfgOverlappingEarlyExitLadder() {
   const auto original_block_count = graph.blocks.size();
   const auto original_coverage =
       CfgInstructionCoverage(graph, decoded.instructions.size());
-  const bool structured = ShaderRecompiler::CFG::Structurize(graph);
-  Check(structured, graph.unsupported_reason.c_str());
+  graph = ShaderRecompiler::CFG::Structurize(graph);
+  Check(!graph.unsupported, graph.unsupported_reason.c_str());
   Check(CfgInstructionCoverage(graph, decoded.instructions.size()) ==
             original_coverage,
         "early-exit ladder routing changed semantic instruction coverage");
@@ -8834,8 +9054,8 @@ void TestNewShaderRecompilerCfgNestedEarlyExitSharedTerminal() {
   graph = ShaderRecompiler::CFG::BuildGraph(decoded);
   const auto original_coverage =
       CfgInstructionCoverage(graph, decoded.instructions.size());
-  const bool structured = ShaderRecompiler::CFG::Structurize(graph);
-  Check(structured, graph.unsupported_reason.c_str());
+  graph = ShaderRecompiler::CFG::Structurize(graph);
+  Check(!graph.unsupported, graph.unsupported_reason.c_str());
   Check(CfgInstructionCoverage(graph, decoded.instructions.size()) ==
             original_coverage,
         "nested early-exit structurization changed semantic coverage");
@@ -8877,8 +9097,8 @@ void TestNewShaderRecompilerCfgEarlyReturnSharedLoopContinuation() {
   auto graph = ShaderRecompiler::CFG::BuildGraph(decoded);
   const auto original_coverage =
       CfgInstructionCoverage(graph, decoded.instructions.size());
-  Check(ShaderRecompiler::CFG::Structurize(graph),
-        graph.unsupported_reason.c_str());
+  graph = ShaderRecompiler::CFG::Structurize(graph);
+  Check(!graph.unsupported, graph.unsupported_reason.c_str());
   Check(CfgInstructionCoverage(graph, decoded.instructions.size()) ==
                 original_coverage &&
             graph.natural_loops.size() == 2u,
@@ -8914,8 +9134,8 @@ void TestNewShaderRecompilerCfgSharedTerminalEarlyExit() {
   graph = ShaderRecompiler::CFG::BuildGraph(decoded);
   const auto original_coverage =
       CfgInstructionCoverage(graph, decoded.instructions.size());
-  Check(ShaderRecompiler::CFG::Structurize(graph),
-        graph.unsupported_reason.c_str());
+  graph = ShaderRecompiler::CFG::Structurize(graph);
+  Check(!graph.unsupported, graph.unsupported_reason.c_str());
   Check(
       CfgInstructionCoverage(graph, decoded.instructions.size()) ==
           original_coverage,
@@ -8950,8 +9170,8 @@ void TestNewShaderRecompilerCfgPrunesUnreachableSelectionEntry() {
       CfgInstructionCoverage(graph, decoded.instructions.size());
   Check(original_coverage[1] == 0u,
         "CFG retained an unreachable external selection entry");
-  Check(ShaderRecompiler::CFG::Structurize(graph),
-        graph.unsupported_reason.c_str());
+  graph = ShaderRecompiler::CFG::Structurize(graph);
+  Check(!graph.unsupported, graph.unsupported_reason.c_str());
   Check(CfgInstructionCoverage(graph, decoded.instructions.size()) ==
             original_coverage,
         "selection structurization changed reachable semantic code");
@@ -8979,28 +9199,24 @@ void TestNewShaderRecompilerCfgFailedStructurizationPreservesGraph() {
   const auto original = graph;
   Check(graph.natural_loops.size() == 1u && !graph.irreducible,
         "failed structurization fixture must have one reducible loop");
-  Check(!CFG::Structurize(graph) && graph.unsupported &&
-            graph.failure_kind == CFG::FailureKind::StructuredControlFlow &&
-            !graph.unsupported_reason.empty(),
+  const auto failed = CFG::Structurize(graph);
+  Check(failed.unsupported &&
+            failed.failure_kind == CFG::FailureKind::StructuredControlFlow &&
+            !failed.unsupported_reason.empty(),
         "loop without a merge did not retain its structurization failure");
-  Check(graph.failure_block == UINT32_MAX,
+  Check(failed.failure_block == UINT32_MAX,
         "failed structurization exposed a discarded synthetic block ID");
   Check(CfgInstructionCoverage(graph, decoded.instructions.size()) ==
             CfgInstructionCoverage(original, decoded.instructions.size()),
         "failed structurization changed instruction coverage");
-  auto topology = graph;
-  topology.unsupported = original.unsupported;
-  topology.failure_kind = original.failure_kind;
-  topology.failure_block = original.failure_block;
-  topology.unsupported_reason = original.unsupported_reason;
-  Check(CFG::GraphToString(topology) == CFG::GraphToString(original),
+  Check(CFG::GraphToString(graph) == CFG::GraphToString(original),
         "failed structurization changed CFG topology or analyses");
 
   auto options = MakeCompileOptions(ShaderType::Compute);
   auto result = RecompileForTest(shader, options);
   Check(result.program.dispatcher_fallback &&
-            result.program.cfg_failure_kind == graph.failure_kind &&
-            result.program.fallback_reason == graph.unsupported_reason,
+            result.program.cfg_failure_kind == failed.failure_kind &&
+            result.program.fallback_reason == failed.unsupported_reason,
         "compiler did not consume CFG failure diagnostics directly");
   CheckSpirvBinaryValidates(result.spirv);
 }
@@ -12231,7 +12447,13 @@ void TestTypedDescriptorRealWideMoveTranslation() {
   };
   ShaderRecompiler::IR::Program ir;
   BuildTypedPlan(shader, static_cast<uint32_t>(std::size(shader)), ir);
-  ShaderRecompiler::IR::TrackResources(ir);
+  for (uint32_t reg = 0; reg < 4; ++reg) {
+    Check(std::ranges::any_of(ir.scalar_writes, [&](const auto &write) {
+            return write.pc == (reg / 2u) * 4u &&
+                   ShaderRecompiler::IR::RegIndex(write.reg) == reg;
+          }), "wide scalar move lost a native descriptor component write");
+  }
+  ShaderRecompiler::IR::TrackResources(ir, {}, {});
   Check(ir.info.buffers.size() == 1,
         "real wide-move shader did not track one buffer use");
   const auto *source = TypedDescriptorSource(ir, ir.info.buffers[0].source);
@@ -12421,7 +12643,7 @@ void TestTypedDescriptorRealCarryAndScalarLoads() {
   }
   Check(address_reads == 4 && buffer_reads == 4,
         "real scalar loads used the wrong raw typed operations");
-  ShaderRecompiler::IR::TrackResources(load_ir);
+  ShaderRecompiler::IR::TrackResources(load_ir, {}, {});
   Check(load_ir.info.buffers.size() == 2,
         "real scalar-load descriptor sources were not attached");
   for (const auto &buffer : load_ir.info.buffers) {
@@ -12452,7 +12674,7 @@ void TestTypedDescriptorRealCarryAndScalarLoads() {
   BuildTypedPlan(inline_sampler_shader,
                  static_cast<uint32_t>(std::size(inline_sampler_shader)),
                  inline_sampler_ir);
-  ShaderRecompiler::IR::TrackResources(inline_sampler_ir);
+  ShaderRecompiler::IR::TrackResources(inline_sampler_ir, {}, {});
   ShaderRecompiler::IR::DescriptorValue sampler;
   ShaderRecompiler::IR::SrtRuntime runtime;
   Check(inline_sampler_ir.info.samplers.size() == 1 &&
@@ -12643,7 +12865,7 @@ void TestScalarMemoryLoadCrossesIntoVcc() {
         "wide SMEM destination crossing into VCC lost scalar provenance");
   CheckFlattenedReadSlots(
       ir, 4, "wide SMEM destination crossing into VCC used wrong flat offsets");
-  ShaderRecompiler::IR::TrackResources(ir);
+  ShaderRecompiler::IR::TrackResources(ir, {}, {});
   Check(ir.info.buffers.size() == 1,
         "wide SMEM destination crossing into VCC lost its buffer use");
   const auto *source =
@@ -12705,7 +12927,7 @@ void TestResourceTrackingRealDensePatching() {
   };
   ShaderRecompiler::IR::Program ir;
   BuildTypedPlan(shader, static_cast<uint32_t>(std::size(shader)), ir);
-  ShaderRecompiler::IR::TrackResources(ir);
+  ShaderRecompiler::IR::TrackResources(ir, {}, {});
   Check(ir.info.buffers.size() == 2 && ir.info.images.size() == 2 &&
             ir.info.samplers.size() == 1,
         "real resource tracking produced the wrong dense list sizes");
@@ -12772,7 +12994,7 @@ void TestDirectTranslationResetsAnalysisState() {
   ShaderRecompiler::IR::Program ir;
   BuildTypedPlan(first_shader, static_cast<uint32_t>(std::size(first_shader)),
                  ir);
-  ShaderRecompiler::IR::TrackResources(ir);
+  ShaderRecompiler::IR::TrackResources(ir, {}, {});
   ShaderComputeInputInfo compute;
   ShaderRecompiler::IR::CollectShaderInfo(ir, {.compute = &compute});
   Check(ir.resource_tracking_complete && ir.shader_info_complete &&
@@ -13648,6 +13870,10 @@ int main() {
   TestNewShaderRecompilerCfgNestedEarlyExitLoopForwarders();
   TestNewShaderRecompilerCfgExecSccSharedArm();
   TestSharedReturnPreservesDescriptorDominance();
+  TestSharedExitPreservesNativeDescriptorSources();
+  TestNestedSelectionPreservesDescriptorSources();
+  TestNativeGuardedSamplerSource();
+  TestNativeDescriptorProvenanceRejectsGpuSelection();
   TestCfgSiblingSharedExit();
   TestNewShaderRecompilerCfgNestedTailEarlyExit();
   TestNewShaderRecompilerCfgSharedReturnAfterNestedSelections();

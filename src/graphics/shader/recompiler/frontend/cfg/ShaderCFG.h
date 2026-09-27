@@ -119,9 +119,9 @@ struct Graph {
 };
 
 Graph       BuildGraph(const Decoder::Program& program);
-// Commits structured control flow on success; preserves the original graph with
-// failure diagnostics on failure. failure_block is an original block ID or UINT32_MAX.
-bool        Structurize(Graph& graph);
+// Returns structured control flow or failure diagnostics without changing the native graph.
+// On failure, failure_block is an original block ID or UINT32_MAX.
+Graph       Structurize(const Graph& graph);
 std::string BranchConditionToString(BranchCondition condition);
 std::string FailureKindToString(FailureKind kind);
 std::string GraphToString(const Graph& graph);

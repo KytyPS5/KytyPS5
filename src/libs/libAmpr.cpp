@@ -1800,16 +1800,38 @@ SubmissionEngine& Engine(bool amm_engine, uint32_t priority) {
 
 }
 
-static int EnqueueCommandBuffer(uint64_t command_buffer, bool amm_engine, uint32_t priority,
+static int EnqueueCommandBuffer(uint64_t command_buffer, bool /*amm_engine*/, uint32_t /*priority*/,
                                 uint32_t submission_id, uint64_t result_address) {
-	PendingSubmission submission;
-	if (!TryGetCommandBufferState(command_buffer, &submission.state)) {
-		return LibKernel::KERNEL_ERROR_EFAULT;
-	}
-	submission.id     = submission_id;
-	submission.result = result_address;
-	Engine(amm_engine, priority).Enqueue(std::move(submission));
-	return OK;
+    CommandBufferState state {};
+    if (!TryGetCommandBufferState(command_buffer, &state)) {
+        return LibKernel::KERNEL_ERROR_EFAULT;
+    }
+
+    int32_t  execution_result = OK;
+    uint32_t error_offset     = 0;
+
+    const auto submit_result =
+        ExecuteCommandBufferState(state, &execution_result, &error_offset);
+
+    if (submit_result != OK && execution_result == OK) {
+        execution_result = submit_result;
+    }
+
+    if (result_address != 0) {
+        const auto result =
+            AprShared::WriteResult(reinterpret_cast<void*>(result_address),
+                                    execution_result, error_offset);
+        if (result != OK) {
+            return result;
+        }
+    }
+
+    if (submission_id != 0) {
+        AprShared::SetSubmissionResult(
+            submission_id, execution_result, error_offset);
+    }
+
+    return submit_result;
 }
 
 static int ExecuteCommandBufferState(const CommandBufferState& state, int32_t* execution_result,

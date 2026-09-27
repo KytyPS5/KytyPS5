@@ -811,13 +811,14 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			operands.push_back(AddressF32(ctx, mem, *address, layout.bias));
 		}
 		const auto sampler_id = LoadSamplerDescriptor(state, mem.sampler);
-		const auto EmitSample = [&](uint32_t resource, uint32_t array_index = 0u) {
+		const auto EmitSample = [&](uint32_t resource, uint32_t array_index = 0u,
+		                             uint32_t element = 0u) {
 			const auto& candidate = state.program.info.images[resource];
 			const auto coord =
 			    CoordF32(ctx, mem, *address, layout.coord,
 			             ImageDimensionInfoFor(candidate.dimension).coordinate_components,
 			             candidate.cube);
-			const auto sampled = MakeSampledImage(state, resource, sampler_id, 0u, array_index);
+			const auto sampled = MakeSampledImage(state, resource, sampler_id, 0u, array_index, element);
 			const auto            sample  = state.builder.AllocateId();
 			std::vector<uint32_t> sample_operands {result_type, sample, sampled, coord};
 			if (dref) {
@@ -830,6 +831,52 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			state.builder.AddFunction(opcode, sample_operands);
 			return sample;
 		};
+		if (image.table_capacity != 0u) {
+			// Bindless table: entry = key & mask; flattened_srt[mapping] holds the entry count,
+			// then each entry's slot among the table descriptors of the root's binding.
+			const auto* handle = image_arg.ResolveInstruction();
+			const auto  kind   = IR::DescriptorBindingForImage(image);
+			const auto* binding =
+			    kind.has_value() ? IR::FindBinding(state.program.bindings, *kind) : nullptr;
+			const auto table_base = binding != nullptr ? binding->TableBase(image.table) : UINT32_MAX;
+			if (handle == nullptr || handle->NumArgs() == 0u || state.flattened_srt_variable == 0 ||
+			    table_base == UINT32_MAX) {
+				ctx.Fail(inst, "has no image table runtime mapping");
+				return;
+			}
+			const auto LoadTableMapping = [&](uint32_t index) {
+				const auto pointer = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
+				                          pointer, state.flattened_srt_variable,
+				                          ConstantU32(state, 0), index);
+				const auto value = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+				return value;
+			};
+			const auto entry    = Binary(state, spv::OpBitwiseAnd, TypeU32(state),
+			                             ctx.Def(handle->Arg(0)),
+			                             ConstantU32(state, image.table_entry_mask));
+			const auto count    = LoadTableMapping(ConstantU32(state, image.table_mapping_offset));
+			const auto in_range = Binary(state, spv::OpULessThan, TypeBool(state), entry, count);
+			const auto clamped  = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpSelect, TypeU32(state), clamped, in_range, entry,
+			                          ConstantU32(state, 0));
+			const auto mapped = LoadTableMapping(
+			    Binary(state, spv::OpIAdd, TypeU32(state), clamped,
+			           ConstantU32(state, image.table_mapping_offset + 1u)));
+			const auto slot = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpSelect, TypeU32(state), slot, in_range, mapped,
+			                          ConstantU32(state, 0));
+			const auto element = Binary(state, spv::OpIAdd, TypeU32(state), slot,
+			                            ConstantU32(state, table_base));
+			const auto sample  = EmitSample(mem.resource, 0u, element);
+			auto       result  = sample;
+			if (!dref) {
+				result = UnpackImageTexel(ctx, mem, sample);
+			}
+			ctx.Define(inst, ResultVector(ctx, result, numeric_class, dref, mem));
+			return;
+		}
 		if (image.indirect_root != mem.resource) {
 			const auto sample = EmitSample(mem.resource);
 			auto       result = sample;

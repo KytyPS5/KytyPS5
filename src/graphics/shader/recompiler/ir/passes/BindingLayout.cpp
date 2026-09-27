@@ -108,7 +108,10 @@ bool UsesFlattenedSrt(const Program& program) {
 			return inst.GetOpcode() == ValueOpcode::ReadConst;
 		});
 	}) || std::ranges::any_of(program.info.buffers, uses_mapping) ||
-	       std::ranges::any_of(program.info.images, uses_mapping);
+	       std::ranges::any_of(program.info.images, uses_mapping) ||
+	       std::ranges::any_of(program.info.images, [](const ImageResource& image) {
+		       return image.table_capacity != 0u;
+	       });
 }
 
 void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool lds_storage) {
@@ -153,6 +156,25 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool lds
 		if (!image_groups[i].empty()) {
 			AddBinding(next, static_cast<DescriptorBindingKind>(FirstImageBinding + i),
 			           std::move(image_groups[i]));
+		}
+	}
+	// Bindless table descriptors follow the resources of their roots' binding; roots of one
+	// table and binding share the same descriptors.
+	for (uint32_t i = 0; i < program.info.images.size(); i++) {
+		const auto& image = program.info.images[i];
+		if (image.table_capacity == 0u) {
+			continue;
+		}
+		const auto kind = *DescriptorBindingForImage(image);
+		auto       binding = std::ranges::find(next.descriptors, kind, &DescriptorBinding::kind);
+		EXIT_IF(binding == next.descriptors.end());
+		auto range = std::ranges::find(binding->tables, image.table,
+		                               &DescriptorBinding::TableRange::table);
+		if (range == binding->tables.end()) {
+			binding->tables.push_back({.table = image.table, .capacity = image.table_capacity,
+			                           .root = i});
+		} else if (range->capacity != image.table_capacity) {
+			EXIT("shader binding layout failed: image table %u has two capacities", image.table);
 		}
 	}
 

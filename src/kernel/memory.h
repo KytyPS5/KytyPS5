@@ -116,8 +116,14 @@ bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
+// Whether TryReadBacking or TryReadSparseBacking can read the whole range.
+bool                   IsBackingReadable(uint64_t vaddr, uint64_t size);
+// Changes whenever backing is mapped or unmapped, or a PRT aperture changes: an unchanged value
+// means IsBackingReadable still answers as before.
+[[nodiscard]] uint64_t BackingEpoch() noexcept;
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
-void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
+// Not noexcept: under a Common::SoftExitScope its failure throws to the scope's owner.
+void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;
 [[nodiscard]] bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept;

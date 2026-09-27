@@ -21,7 +21,7 @@
 #include "loader/redZonePatcher.h"
 #include "loader/symbolDatabase.h"
 #include "loader/x64InstructionEmulator.h"
-
+#include <Zydis/Zydis.h>
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
@@ -717,37 +717,73 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 	std::printf("Fault VA      : 0x%016" PRIx64 "\n", info->access_violation_vaddr);
 	std::printf("RAX           : 0x%016" PRIx64 "\n", info->rax);
 
-// Address referenced by:
-// 48 8b 05 39 ee 13 04
-// mov rax,[rip+0x413ee39]
-	constexpr uint64_t global_addr = 0x0000000905AAA75Aull;
+	// Live disassembly of whatever is actually mapped at the fault right now -- correct even
+	// if something rewrote the guest bytes, unlike guessing from the static hex dump above.
+	{
+		ZydisDecoder decoder;
+		ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
+		ZydisFormatter formatter;
+		ZydisFormatterInit(&formatter, ZYDIS_FORMATTER_STYLE_INTEL);
 
-	std::printf("Global addr   : 0x%016" PRIx64 "\n", global_addr);
+		constexpr uint64_t DISASM_BEFORE = 64;
+		constexpr uint64_t DISASM_AFTER  = 32;
+		const uint64_t      start        = info->exception_address - DISASM_BEFORE;
 
-	if (IsReadableRange(global_addr, sizeof(uint64_t))) {
-	    uint64_t global_value = 0;
-	    std::memcpy(&global_value,
-                reinterpret_cast<const void*>(global_addr),
-                sizeof(global_value));
+		if (IsReadableRange(start, DISASM_BEFORE + DISASM_AFTER)) {
+			std::printf("--- Disassembly ('->' marks the faulting instruction) ---\n");
 
-    	std::printf("Global value  : 0x%016" PRIx64 "\n", global_value);
+			const auto* base = reinterpret_cast<const uint8_t*>(start);
+			uint64_t    addr = start;
+			ZyanUSize   left = DISASM_BEFORE + DISASM_AFTER;
 
-    	if (IsReadableRange(global_addr - 0x40, 0x80)) {
-        	std::printf("Global region:\n");
+			while (left > 0 && addr <= info->exception_address + 16) {
+				ZydisDecodedInstruction insn;
+				ZydisDecodedOperand     operands[ZYDIS_MAX_OPERAND_COUNT];
+				const auto*             p = base + (addr - start);
 
-        	for (uint64_t offset = 0; offset < 0x80; offset += 8) {
-            	uint64_t value = 0;
-            	std::memcpy(&value,
-                        reinterpret_cast<const void*>(global_addr - 0x40 + offset),
-                        sizeof(value));
+				if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(&decoder, p, left, &insn, operands))) {
+					std::printf("   %016" PRIx64 ": <decode failed>\n", addr);
+					addr++;
+					left--;
+					continue;
+				}
 
-            	std::printf("  [%+04" PRIx64 "] = %016" PRIx64 "\n",
-                        offset - 0x40, value);
-        	}
-    	}
-	} else {
-    	std::printf("Global value  : <unreadable>\n");
+				char text[256];
+				ZydisFormatterFormatInstruction(&formatter, &insn, operands,
+				                                insn.operand_count_visible, text, sizeof(text),
+				                                addr, ZYAN_NULL);
+				std::printf("%s %016" PRIx64 ": %s\n",
+				            (addr == info->exception_address ? "->" : "  "), addr, text);
+
+				addr += insn.length;
+				left -= std::min<ZyanUSize>(insn.length, left);
+			}
+		}
 	}
+
+	// Which loaded module (if any) owns the faulting address. "no module" means the fault is
+	// inside something KytyPS5 generated itself (TLS handler stub, unresolved-import thunk,
+	// red-zone/rsqrt trampoline) rather than guest ELF code.
+	// NOTE: FindProgramByAddr/StackTrace lock RuntimeLinker::m_mutex -- if a crash ever hits
+	// on a thread already holding it (e.g. mid-relocation) this deadlocks instead of printing.
+	// Not a concern for a crash this deep in guest code, worth remembering if you reuse this
+	// earlier in boot.
+	{
+		auto* rt    = Common::Singleton<RuntimeLinker>::Instance();
+		auto* owner = rt->FindProgramByAddr(info->exception_address);
+		if (owner != nullptr) {
+			std::printf("Faulting module: %s (base=0x%016" PRIx64 ", offset=0x%016" PRIx64 ")\n",
+			            Common::PathToString(owner->file_name).c_str(), owner->base_vaddr,
+			            info->exception_address - owner->base_vaddr);
+		} else {
+			std::printf("Faulting address belongs to no loaded module (likely a KytyPS5-generated "
+			            "stub: TLS handler / unresolved-import thunk / red-zone trampoline)\n");
+		}
+
+		std::printf("--- Guest stack trace (also written to the log file) ---\n");
+		rt->StackTrace(info->rbp, info->rsp);
+	}
+
 	EXIT("Unhandled host exception: type=%u code=%u pc=0x%016" PRIx64
 	     " access=%u address=0x%016" PRIx64 "\n",
 	     static_cast<unsigned>(info->type), info->native_code, info->exception_address,

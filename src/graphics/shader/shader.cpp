@@ -626,6 +626,7 @@ static void ShaderGetStaticInputInfoCS(const HW::ComputeShaderInfo& regs,
 	info.threads_num[2]                   = regs.cs_regs.num_thread_z;
 	info.lds_size_dwords                  = static_cast<uint32_t>(regs.cs_regs.lds_size) * 128u;
 	info.scratch_size_dwords              = data.scratch_size_dwords;
+	info.float_mode                       = regs.cs_regs.float_mode;
 	info.group_id[0]                      = regs.cs_regs.tgid_x_en != 0;
 	info.group_id[1]                      = regs.cs_regs.tgid_y_en != 0;
 	info.group_id[2]                      = regs.cs_regs.tgid_z_en != 0;
@@ -740,7 +741,7 @@ void BuildStageStaticKey(const ShaderComputeInputInfo& info, std::vector<uint32_
 	key.clear();
 	key.push_back(info.initial_fp_state.StaticKey());
 	key.push_back(info.workgroup_register);
-	key.push_back(info.wave_size);
+	key.push_back(info.wave_size | (static_cast<uint32_t>(info.float_mode) << 8u));
 	key.push_back(info.host_subgroup_size);
 	key.push_back(info.thread_ids_num);
 	key.push_back(info.lds_size_dwords);

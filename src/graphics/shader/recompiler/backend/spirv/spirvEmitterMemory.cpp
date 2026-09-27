@@ -960,26 +960,80 @@ uint32_t LoadFormattedD16(ValueEmitContext& ctx, const IR::Inst& inst,
 	    });
 }
 
+uint32_t EncodeFormattedStoreComponent(ValueEmitContext& ctx,
+                                       const Format::BufferFormatInfo& info,
+                                       uint32_t component, uint32_t data) {
+	const auto bits = info.component_bits[component];
+	if (info.type == Format::ComponentType::Unorm) {
+		const auto value = EmitBitCastF32U32(ctx.state, data);
+		const auto clamped = EmitFPMin32(
+		    ctx.state, EmitFPMax32(ctx.state, value, ConstantF32Value(ctx.state, 0.0f)),
+		    ConstantF32Value(ctx.state, 1.0f));
+		const auto scaled = EmitFPMul32(
+		    ctx.state, clamped, ConstantF32Value(ctx.state, float((1u << bits) - 1u)));
+		return Unary(ctx.state, spv::OpConvertFToU, TypeU32(ctx.state),
+		             EmitFPRoundEven32(ctx.state, scaled));
+	}
+	if (bits == 16u && (info.type == Format::ComponentType::Snorm ||
+	                    info.type == Format::ComponentType::Float)) {
+		const auto value = EmitBitCastF32U32(ctx.state, data);
+		const auto pair = EmitCompositeConstructF32x2(ctx.state, value,
+		                                               ConstantF32Value(ctx.state, 0.0f));
+		return info.type == Format::ComponentType::Float ? EmitPackHalf2x16(ctx.state, pair)
+		                                               : EmitPackSnorm2x16(ctx.state, pair);
+	}
+	return data;
+}
+
 void StoreFormattedInBounds(ValueEmitContext& ctx, const IR::Inst& inst,
                             const IR::MemoryInfo& mem, const PreparedFormattedMemory& plan,
                             uint32_t component, uint32_t data) {
 	if (component >= plan.info.component_count) return;
 	const auto bits = plan.info.component_bits[component];
-	if (bits == 16u && (plan.info.type == Format::ComponentType::Snorm ||
-	                    plan.info.type == Format::ComponentType::Float)) {
-		const auto value = EmitBitCastF32U32(ctx.state, data);
-		const auto pair = EmitCompositeConstructF32x2(ctx.state, value,
-		                                               ConstantF32Value(ctx.state, 0.0f));
-		data = plan.info.type == Format::ComponentType::Float
-		           ? EmitPackHalf2x16(ctx.state, pair)
-		           : EmitPackSnorm2x16(ctx.state, pair);
-	}
+	data = EncodeFormattedStoreComponent(ctx, plan.info, component, data);
 	if (bits == 8u || bits == 16u) {
 		StoreSubwordInBounds(ctx, mem, plan.resource, plan.addresses[component],
 		                     plan.indices[component], bits, data);
 	} else {
 		StoreWordInBounds(ctx, plan.resource, plan.indices[component], data);
 	}
+}
+
+void StoreFormattedPrepared(ValueEmitContext& ctx, const IR::Inst& inst,
+                             const IR::MemoryInfo& mem, const MemoryResourceAccess& resource,
+                             const Format::BufferFormatInfo& info, uint32_t data,
+                             uint32_t components) {
+	// RDNA2 formatted stores transfer the entire format, zero-filling missing VGPRs.
+	const auto plan = PrepareFormattedMemory(ctx, inst, mem, resource, info, info.component_count,
+	                                         FormattedAccess::Store);
+	EmitIfCondition(ctx.state, plan.in_bounds, [&]() {
+		auto packed = ConstantU32(ctx.state, 0);
+		for (uint32_t component = 0; component < info.component_count; component++) {
+			auto value = ConstantU32(ctx.state, 0);
+			if (component < components) {
+				value = data;
+				if (components != 1u) {
+					value = ctx.state.builder.AllocateId();
+					ctx.state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(ctx.state),
+					                              value, data, component);
+				}
+			}
+			value = EncodeFormattedStoreComponent(ctx, info, component, value);
+			const auto bits = info.component_bits[component];
+			if (info.packed_bitfield) {
+				packed = EmitBitFieldInsert(
+				    ctx.state, packed, value,
+				    ConstantU32(ctx.state, info.component_bit_offset[component]),
+				    ConstantU32(ctx.state, bits));
+			} else if (bits == 8u || bits == 16u) {
+				StoreSubwordInBounds(ctx, mem, resource, plan.addresses[component],
+				                     plan.indices[component], bits, value);
+			} else {
+				StoreWordInBounds(ctx, resource, plan.indices[component], value);
+			}
+		}
+		if (info.packed_bitfield) StoreWordInBounds(ctx, resource, plan.indices[0], packed);
+	});
 }
 
 void FormattedStore(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
@@ -991,11 +1045,7 @@ void FormattedStore(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Memor
 			StoreWordPrepared(ctx, inst, RebaseRawComponent(mem, 0u), resource, data);
 			return;
 		}
-		const auto plan = PrepareFormattedMemory(ctx, inst, mem, resource, info, 1u,
-		                                         FormattedAccess::Store);
-		EmitIfCondition(ctx.state, plan.in_bounds, [&]() {
-			StoreFormattedInBounds(ctx, inst, mem, plan, 0u, data);
-		});
+		StoreFormattedPrepared(ctx, inst, mem, resource, info, data, 1u);
 	});
 }
 
@@ -1172,16 +1222,7 @@ void StoreWideBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t compo
 		const auto info = Format::GetFormatInfo(
 		    mem.formatted ? BufferFormat(ctx, mem) : Prospero::BufferFormat::kInvalid);
 		if (info.type != Format::ComponentType::Unknown) {
-			const auto plan = PrepareFormattedMemory(ctx, inst, mem, resource, info, components,
-			                                         FormattedAccess::Store);
-			EmitIfCondition(state, plan.in_bounds, [&]() {
-				for (uint32_t component = 0; component < components; component++) {
-					const auto data = state.builder.AllocateId();
-					state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), data,
-					                          composite, component);
-					StoreFormattedInBounds(ctx, inst, mem, plan, component, data);
-				}
-			});
+			StoreFormattedPrepared(ctx, inst, mem, resource, info, composite, components);
 			return;
 		}
 		for (uint32_t component = 0; component < components; component++) {

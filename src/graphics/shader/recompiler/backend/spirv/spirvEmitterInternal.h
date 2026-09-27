@@ -481,6 +481,10 @@ template <spv::Op opcode, IR::Type type, typename... Args>
 uint32_t EmitNative(EmitterState& state, Args... args) {
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction(opcode, TypeId(state, type), result, args...);
+	if constexpr (type == IR::Type::F64 &&
+	              (opcode == spv::OpFMul || opcode == spv::OpFDiv || opcode == spv::OpExtInst)) {
+		state.builder.AddAnnotation(spv::OpDecorate, result, spv::DecorationNoContraction);
+	}
 	return result;
 }
 

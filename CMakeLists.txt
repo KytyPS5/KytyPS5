@@ -301,6 +301,7 @@ set(gpu_blit_generated_dir "${PROJECT_BINARY_DIR}/gpu_blit_shaders")
 set(gpu_blit_shader_sources
 	"${gpu_tiler_shader_dir}/gpu_blit_fs_triangle.vert"
 	"${gpu_tiler_shader_dir}/gpu_blit_color_to_ms_depth.frag"
+	"${gpu_tiler_shader_dir}/gpu_video_out_overlay.frag"
 )
 foreach(shader_source IN LISTS gpu_blit_shader_sources)
 	get_filename_component(shader_name "${shader_source}" NAME_WE)
@@ -494,11 +495,20 @@ add_executable(ngs2_sampler_tests EXCLUDE_FROM_ALL
 target_link_libraries(ngs2_sampler_tests common fmt::fmt LibAtrac9)
 target_include_directories(ngs2_sampler_tests PRIVATE ${inc_headers})
 
+add_executable(pad_haptics_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/PadHapticsTests.cpp"
+)
+target_link_libraries(pad_haptics_tests common fmt::fmt SDL3::SDL3-static)
+target_include_directories(pad_haptics_tests PRIVATE ${inc_headers})
+
 add_executable(save_data_memory_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SaveDataMemoryTests.cpp"
 )
 target_link_libraries(save_data_memory_tests common fmt::fmt)
 target_include_directories(save_data_memory_tests PRIVATE ${inc_headers})
+
+add_kyty_full_emulator_test(http_uri_parse_tests
+	"${KYTY_TESTS_DIR}/HttpUriParseTests.cpp")
 
 add_executable(event_queue_lifetime_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/EventQueueLifetimeTests.cpp"
@@ -635,7 +645,9 @@ if(BUILD_TESTING)
 	add_test(NAME sync_on_address COMMAND $<TARGET_FILE:sync_on_address_tests>)
 	add_test(NAME audio_out2_port COMMAND $<TARGET_FILE:audio_out2_port_tests>)
 	add_test(NAME ngs2_sampler COMMAND $<TARGET_FILE:ngs2_sampler_tests>)
+	add_test(NAME pad_haptics COMMAND $<TARGET_FILE:pad_haptics_tests>)
 	add_test(NAME save_data_memory COMMAND $<TARGET_FILE:save_data_memory_tests>)
+	add_test(NAME http_uri_parse COMMAND $<TARGET_FILE:http_uri_parse_tests>)
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
 	add_test(NAME shader_recompiler_alignbyte
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --alignbyte-only)
@@ -725,7 +737,8 @@ if(BUILD_TESTING)
 		audio_out2_port_tests
 		save_data_memory_tests
 		ngs2_sampler_tests
-		save_data_memory_tests
+		pad_haptics_tests
+		http_uri_parse_tests
 	)
 endif()
 

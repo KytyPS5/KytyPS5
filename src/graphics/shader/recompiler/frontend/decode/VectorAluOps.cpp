@@ -465,6 +465,8 @@ bool IsVopcCompareExec(Opcode opcode);
 
 bool IsVop1FloatSourceOpcode(Opcode opcode) {
 	switch (opcode) {
+		case Opcode::V_CVT_F32_F64:
+		case Opcode::V_RCP_F64:
 		case Opcode::V_MOV_B32:
 		case Opcode::V_CVT_F32_F16:
 		case Opcode::V_CVT_U32_F32:
@@ -540,6 +542,7 @@ constexpr Vop1SdwaRule VOP1_SDWA_RULES[] = {
     {Opcode::V_NOT_B32, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), SdwaSelBytes() | SdwaSelWords(),
      SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), false},
     {Opcode::V_FFBL_B32, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), 0, 0, false},
+    {Opcode::V_FFBH_U32, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), 0, 0, false},
     {Opcode::V_CVT_F32_F16, SdwaSelWords() | SdwaSelFull(), 0, 0, true},
     {Opcode::V_CVT_F16_F32, SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), SdwaSelWords(),
      SdwaSelBytes() | SdwaSelWords() | SdwaSelFull(), true},
@@ -722,6 +725,11 @@ void ApplyDppModifier(Operand& operand, uint32_t modifier, uint32_t encoding) {
 
 void DecodeVop1Dpp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
                    uint32_t opcode, uint32_t vdst, Instruction& inst) {
+	if (inst.opcode == Opcode::V_CVT_F64_I32 || inst.opcode == Opcode::V_CVT_F32_F64 ||
+	    inst.opcode == Opcode::V_RCP_F64) {
+		SetUnsupported(inst, Family::VOP1, opcode, "FP64 instructions do not support DPP");
+		return;
+	}
 	const auto modifier = code[word_index + 1u];
 	const auto src0     = modifier & 0xffu;
 	SetRawWords(inst, code, word_index, 2);
@@ -771,6 +779,7 @@ bool IsVop2FloatOpcode(Opcode opcode) {
 
 bool IsVop1FloatResultOpcode(Opcode opcode) {
 	switch (opcode) {
+		case Opcode::V_CVT_F32_F64:
 		case Opcode::V_CVT_F32_I32:
 		case Opcode::V_CVT_F32_U32:
 		case Opcode::V_CVT_F32_F16:
@@ -1443,6 +1452,7 @@ bool SupportsNativeVop3ResultModifiers(Opcode opcode) {
 		case Opcode::V_MAD_F32:
 		case Opcode::V_FMA_F32:
 		case Opcode::V_FMA_F16:
+		case Opcode::V_CUBEID_F32:
 		case Opcode::V_CVT_PKRTZ_F16_F32:
 		case Opcode::V_LDEXP_F32:
 		case Opcode::V_MIN3_F32:

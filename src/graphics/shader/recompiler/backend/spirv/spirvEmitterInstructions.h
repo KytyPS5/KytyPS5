@@ -19,7 +19,12 @@ uint32_t              EmitConvertF16F32(EmitterState& state, uint32_t arg0);
 inline constexpr auto EmitConvertF32F16 = EmitF16BitsToF32;
 uint32_t              EmitConvertS32F32(EmitterState& state, uint32_t arg0);
 uint32_t              EmitConvertU32F32(EmitterState& state, uint32_t arg0);
-uint32_t              EmitConvertF32S32(EmitterState& state, uint32_t arg0);
+template <IR::Type type>
+uint32_t EmitConvertSigned32ToFloat(EmitterState& state, uint32_t arg0) {
+	const auto signed_value = Unary(state, spv::OpBitcast, TypeI32(state), arg0);
+	return EmitNative<spv::OpConvertSToF, type>(state, signed_value);
+}
+inline constexpr auto EmitConvertF32S32 = EmitConvertSigned32ToFloat<IR::Type::F32>;
 EMIT_NATIVE(ConvertF32U32, OpConvertUToF, F32, uint32_t)
 EMIT_NATIVE(CompositeConstructU64, OpCompositeConstruct, U64, uint32_t, uint32_t)
 EMIT_NATIVE(CompositeConstructU32x2, OpCompositeConstruct, U32x2, uint32_t, uint32_t)
@@ -271,6 +276,8 @@ inline constexpr auto EmitImageAtomicUMax32    = EmitImage;
 inline constexpr auto EmitImageAtomicAnd32     = EmitImage;
 inline constexpr auto EmitImageAtomicOr32      = EmitImage;
 inline constexpr auto EmitImageAtomicXor32     = EmitImage;
+inline constexpr auto EmitImageAtomicFMin32    = EmitImage;
+inline constexpr auto EmitImageAtomicFMax32    = EmitImage;
 void                  EmitUnreachable(ValueEmitContext& ctx, const IR::Inst& inst);
 inline constexpr auto EmitPhi                        = EmitUnreachable;
 inline constexpr auto EmitTessellationBase           = EmitUnreachable;
@@ -316,6 +323,4 @@ uint32_t EmitDpp8UpdateU32(EmitterState& state, uint32_t value, uint32_t previou
 uint32_t EmitReadBoundedSrtU32(ValueEmitContext& ctx, const IR::Inst& inst);
 void EmitSharedAtomicIAdd64(ValueEmitContext& ctx, const IR::Inst& inst);
 void EmitSharedAtomicOr64(ValueEmitContext& ctx, const IR::Inst& inst);
-inline constexpr auto EmitImageAtomicFMin32 = EmitImage;
-inline constexpr auto EmitImageAtomicFMax32 = EmitImage;
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter

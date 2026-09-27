@@ -166,6 +166,7 @@ struct ShaderVertexInputInfo {
 struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
 	bool needs_lds_barriers = false;
 	ShaderFloatingPointState initial_fp_state;
+	uint8_t            float_mode                 = 0xc0;
 	uint32_t           dispatch_threads_num[3]    = {0, 0, 0};
 	bool               group_id[3]                = {false, false, false};
 	bool               dispatch_thread_dimensions = false;

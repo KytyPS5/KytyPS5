@@ -1003,6 +1003,7 @@ static int ConvertHostSocketError(int error) {
 		case ENOBUFS: posix_error = Posix::POSIX_ENOBUFS; break;
 		case ENOMEM: posix_error = Posix::POSIX_ENOMEM; break;
 		case ENOTSOCK: posix_error = Posix::POSIX_ENOTSOCK; break;
+		case EPIPE: posix_error = Posix::POSIX_EPIPE; break;
 		case EPROTONOSUPPORT: posix_error = Posix::POSIX_EPROTONOSUPPORT; break;
 		default: break;
 	}

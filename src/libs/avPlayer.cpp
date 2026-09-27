@@ -950,11 +950,8 @@ public:
 			if (deliver_seek_frame || sync_mode != 0) {
 				return true;
 			}
-			if (audio_id) {
-				return candidate.info.time_stamp <= last_audio_ts;
-			}
 			auto now = CurrentTimeNoLock();
-			return now == 0 || candidate.info.time_stamp <= now;
+			return now == 0 || candidate.info.time_stamp + candidate.timestamp_offset <= now;
 		});
 		if (!frame) {
 			return false;
@@ -999,7 +996,9 @@ public:
 		out->details.audio.size          = current_audio->info.details.audio.size;
 		std::memcpy(out->details.audio.language_code,
 		            current_audio->info.details.audio.language_code, 4);
-		last_audio_ts = out->time_stamp;
+		start_time_ms = current_audio->info.time_stamp + current_audio->timestamp_offset;
+		clock_start   = std::chrono::steady_clock::now();
+		paused_extra  = {};
 		RecordLoopBoundary(*current_audio);
 		return true;
 	}
@@ -1064,7 +1063,6 @@ private:
 		video_done               = true;
 		audio_done               = true;
 		seek_video_frame_pending = false;
-		last_audio_ts            = 0;
 		last_output_loop_offset  = 0;
 		pending_loop_warnings    = 0;
 	}
@@ -1397,7 +1395,6 @@ private:
 				av_frame_free(&frame);
 				return false;
 			}
-			ready.info.time_stamp += timestamp_offset;
 			ready.timestamp_offset = timestamp_offset;
 			frames.Push(std::move(ready));
 			av_frame_free(&frame);
@@ -1541,11 +1538,14 @@ private:
 			return false;
 		}
 		auto* dst = buffer->Get();
-		std::memset(dst, 0, static_cast<size_t>(size));
+		auto* c   = dst + pitch * h;
+		// PPSA02433 samples the padded columns; zero chroma would turn them green.
+		std::memset(dst, s->codecpar->color_range == AVCOL_RANGE_JPEG ? 0 : 16,
+		            static_cast<size_t>(pitch) * h);
+		std::memset(c, 128, static_cast<size_t>(pitch) * h / 2);
 		for (int y = 0; y < src->height; y++) {
 			std::memcpy(dst + y * pitch, nv12->data[0] + y * nv12->linesize[0], src->width);
 		}
-		auto* c = dst + pitch * h;
 		for (int y = 0; y < src->height / 2; y++) {
 			std::memcpy(c + y * pitch, nv12->data[1] + y * nv12->linesize[1], src->width);
 		}
@@ -1674,7 +1674,6 @@ private:
 	int32_t                                  trick_speed   = AVPLAYER_TRICK_SPEED_NORMAL;
 	uint32_t                                 sync_mode     = 0;
 	uint64_t                                 start_time_ms = 0;
-	uint64_t                                 last_audio_ts = 0;
 	uint64_t                                 last_output_loop_offset = 0;
 	uint32_t                                 pending_loop_warnings   = 0;
 	std::chrono::steady_clock::time_point    clock_start {};

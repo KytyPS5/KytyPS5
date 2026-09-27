@@ -440,6 +440,14 @@ void ConfigurationEditDialog::add_game_directory() {
 		start_dir = m_game_dirs_list->item(m_game_dirs_list->count() - 1)->text();
 	}
 
+#if defined(__APPLE__)
+	// Use the native macOS picker to browse mounted volumes.
+	const auto dir = QFileDialog::getExistingDirectory(this, tr("Select game folder"), start_dir);
+	if (dir.isEmpty()) {
+		return;
+	}
+	AddGameDirectoryItem(dir);
+#else
 	QFileDialog dialog(this, tr("Select game folders"), start_dir);
 	dialog.setFileMode(QFileDialog::Directory);
 	dialog.setOption(QFileDialog::ShowDirsOnly, true);
@@ -462,6 +470,7 @@ void ConfigurationEditDialog::add_game_directory() {
 	for (const auto& dir: dialog.selectedFiles()) {
 		AddGameDirectoryItem(dir);
 	}
+#endif
 
 	update_game_directory_buttons();
 }

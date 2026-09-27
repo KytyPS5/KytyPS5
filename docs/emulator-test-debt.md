@@ -159,6 +159,16 @@ Vector-table application CPU RED reproduces the native AV without Vulkan:
 remain explicit and mode-0 zero-stride candidates fail with the supported-case
 boundary. Candidate-specific zero/default-format GPU lowering is pending.
 
+Final checkpoint on `e55e5053`: native full target build/install passed,
+focused CTest 22/22 and eight GPU selectors 8/8 passed. Evidence:
+`merge-table-final-build-20260927.log`, `merge-table-final-ctest-20260927.log`,
+`merge-gpu-*-table-final-20260927.txt`. Original game retry
+`yotei-integrated-20260927-202436-menucheck-gpuav-sync` passes the two native
+integration crashes but stops at the explicit bounded mode-0 zero-stride vector
+candidate boundary (exit 321, shown=0). Next required regression is numerical
+selection between normal and zero-stride candidates, formatted defaults/D16
+and sparse EXEC, before shared candidate-specific lowering. Menu remains pending.
+
 ## Restored RO aligned-upload regression source (2026-09-27)
 
 The historical RED/GREEN logs existed but the selector implementation had been

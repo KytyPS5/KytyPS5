@@ -3,6 +3,48 @@
 Обновлено **27 сентября 2026 года**. Игра: **Ghost of Yōtei, PPSA26344**.
 Рабочая ветка — `yotei-windows-bringup` в локальном fork `fxpw/KytyPS5`.
 
+Checkpoint интеграции upstream и повторного game retry **27 сентября 2026 года**:
+
+- Текущие изменения сохранены коммитом `e0c73250`; upstream `421684e7`
+  интегрирован merge-коммитом `6238c2ed`. Все 17 конфликтных файлов разрешены,
+  незавершённого merge и unmerged index entries нет. History не переписана.
+- Общие исправления после регрессионных RED: `0c71c8cc` (SRT admission,
+  fallible host copy, alias/limit checks и conditional materialization),
+  `1f1f7665` (cube metadata и decoded guest operand layout), `e47a15c7`
+  (live bounded-table candidates), `e55e5053` (vector table/direct rewrite
+  distinction). Проверки названия игры, shader hash и guest address не добавлены.
+- Native Windows source `e55e5053`: MSVC Developer Environment явно
+  инициализирован через `vcvars64.bat`; emulator, launcher и `kyty_tests`
+  собраны, install выполнен. Логи `_Build/logs/merge-table-final-build-20260927.log`
+  и `merge-table-final-install-20260927.log`. Binary SHA-256:
+  `86D7F0D0C57186F99AB80CE442A5D4A9EB6320F9FC0AFF78C669276A1FD4499B`.
+- Выбранный CTest GREEN **22/22**, включая восемь обязательных Windows CI
+  проверок: `_Build/logs/merge-table-final-ctest-20260927.log`.
+  Synthetic GPU selectors GREEN **8/8**: float-image-atomic, buffer-format-store,
+  buffer-d16, sdwa-mov, sdwa-ffbh, zero-stride-oob, f64-conversion, indirect-image.
+  Логи `merge-gpu-*-table-final-20260927.txt` и `.run.json`. Это focused checks,
+  не утверждение о полном shader corpus или другой игре.
+- Отдельные RED остаются: NVIDIA `nvgpucomp64.dll` при FP64 reciprocal
+  (arithmetic selector проходит четыре предыдущих случая, затем `0x80000003`),
+  и `ComparisonDepthTexture` до numerical stage на opcode assertion.
+  Детали/регрессионный долг: `docs/emulator-test-debt.md`.
+- Game retry `_Build/runs/yotei-integrated-20260927-202436-menucheck-gpuav-sync`:
+  UTC `20:24:36.7888297` → `20:24:58.8427248`, окно **1280×720**,
+  GPUAV instrumentation + SyncDiag, exit **321**, `shown=0`.
+  Предыдущие collector bounds error и host AV в direct zero-stride rewrite
+  пройдены. Текущий явный blocker:
+  `bounded zero-stride mode-0 vector reads require candidate-specific lowering`.
+  Readback выключен (limit 0): его image transition требует проверки;
+  ненулевой кадр, меню и gameplay **не подтверждены**. После retry процессы
+  kyty_emulator, shader_cfg_tests, ninja и MSBuild отсутствуют.
+- Следующий шаг: сначала synthetic table с обычным и mode-0 zero-stride
+  кандидатом, численная проверка результата выбранного кандидата, formatted
+  defaults/D16 и sparse EXEC; затем общий candidate-specific lowering.
+  Не подменять отсутствующее lowering нулём для всей таблицы и не повышать
+  snapshot/resource limits без независимого RED/GREEN.
+- Лишние корневые temp logs и неиспользуемая копия SDL2 архивированы внутри
+  `_Build`; пользовательские файлы, captures и game data сохранены.
+
 Checkpoint проверки текущего WIP **27 сентября 2026 года**:
 
 - Основа `1c421608`; чужие незакоммиченные изменения сохранены. Windows

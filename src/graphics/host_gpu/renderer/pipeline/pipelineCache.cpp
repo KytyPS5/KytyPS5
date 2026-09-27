@@ -97,6 +97,10 @@ bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) 
 	       Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, values.data(), values.size_bytes());
 }
 
+bool ValidateShaderGuestMemoryRange(void*, uint64_t address, uint64_t size) {
+	return Libs::LibKernel::Memory::TryClampRangeSize(address, size) != 0;
+}
+
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
                      const std::vector<uint32_t>& spirv) {
 	if (!Config::GraphicsDebugDumpEnabled()) {
@@ -291,6 +295,7 @@ struct PipelineCache::ProgramCache {
 		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),
 		    .read_specialization_memory = ReadShaderGuestMemory,
+			.validate_memory_range      = ValidateShaderGuestMemoryRange,
 		};
 		if (entry != programs.end()) {
 			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(

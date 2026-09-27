@@ -1315,6 +1315,9 @@ struct TestCase {
   size_t storage_buffer_range_bytes = 0;
   std::vector<u32> storage_buffer_offsets;
   std::vector<BdaMapping> bda_mappings;
+  // Guest addresses whose caching page V#-table stores must (true) or must not
+  // (false) have marked in the fault buffer's write bitmap.
+  std::vector<std::pair<uint64_t, bool>> expected_bda_writes;
   bool expand_shader_data_storage = false;
   bool expected_force_point_sampler = false;
   float expected_float_tolerance = 0.0f;
@@ -4954,6 +4957,195 @@ public:
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(
                 direct_offset, allocation_size) == 0,
             "dirty-GC direct-memory allocation release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  void CheckIndirectWriteTables() {
+    constexpr const char *name = "IndirectWriteTables";
+    constexpr uintptr_t base = 0x0000000206000000ull;
+    constexpr uint64_t allocation_size = 0x800000;
+    constexpr uint64_t mapped_size = 0x400000;
+    constexpr uint64_t page = BufferCache::CACHING_PAGESIZE;
+    // Larger than a caching page, so a read-only acquisition caches (and
+    // cleans) it instead of streaming it.
+    constexpr uint64_t table_offset = 0x10000;
+    constexpr uint32_t table_entries = 2048;
+    constexpr uint64_t table_bytes = table_entries * 16;
+    using Tables = Libs::Graphics::IndirectWriteTables;
+
+    const auto vsharp = [](uint64_t address, uint32_t bytes, bool format = true,
+                           uint32_t type = 0) {
+      ShaderBufferResource resource;
+      resource.fields[0] = static_cast<uint32_t>(address);
+      resource.fields[1] = static_cast<uint32_t>(address >> 32u) & 0xffffu;
+      resource.fields[2] = bytes;
+      resource.fields[3] =
+          (format ? 0x5204u : 0x204u) | (3u << 28u) | (type << 30u);
+      return resource;
+    };
+
+    Require(name, "target ranges",
+            Tables::TargetRange(vsharp(base, 64)).address == base &&
+                Tables::TargetRange(vsharp(base, 64)).size == 64 &&
+                Tables::TargetRange(vsharp(base, 64, false)).size == 0 &&
+                Tables::TargetRange(vsharp(base, 64, true, 2)).size == 0 &&
+                Tables::TargetRange(vsharp(base, 0)).size == 0 &&
+                Tables::TargetRange(vsharp(0, 64)).size == 0,
+            "stores through T#s, S#s or formatless V#s were not dropped");
+    // DWORD stores ignore the two low address bits: an unaligned target covers whole DWORDs.
+    Require(name, "unaligned target range",
+            Tables::TargetRange(vsharp(base + 2, 5)).address == base &&
+                Tables::TargetRange(vsharp(base + 2, 5)).size == 8,
+            "an unaligned target did not cover the DWORDs its stores write");
+    const auto groups = Tables::CoalesceTargets(
+        {{base + 3 * page + 8, 8}, {base + 16, 32}, {base + page - 4, 8},
+         {base + 5 * page, page}, {base + 16, 32}});
+    Require(name, "target coalescing",
+            groups.size() == 3 && groups[0].address == base &&
+                groups[0].size == 2 * page &&
+                groups[1].address == base + 3 * page &&
+                groups[1].size == page &&
+                groups[2].address == base + 5 * page &&
+                groups[2].size == page,
+            "targets sharing or touching a caching page were not coalesced");
+
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, 0x10000, 0, &direct_offset) == 0,
+            "direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset, 0x10000) ==
+                    0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fixed direct-memory mapping failed");
+    auto *memory = static_cast<uint8_t *>(mapped);
+    std::memset(memory, 0, allocation_size);
+    {
+      auto &cache = context.GetBufferCache();
+      auto &tables = context.GetIndirectWriteTables();
+      context.MapMemory(base, mapped_size);
+      const uint64_t table = base + table_offset;
+      const auto entry = [&](uint32_t index) { return table + index * 16u; };
+      const auto set_entry = [&](uint32_t index,
+                                 const ShaderBufferResource &resource) {
+        // What the CPU write fault on a cached, clean page does first.
+        (void)context.InvalidateMemory(entry(index), sizeof(resource));
+        std::memcpy(reinterpret_cast<void *>(entry(index)), &resource,
+                    sizeof(resource));
+      };
+
+      const uint64_t written = base + 0x100000;
+      const uint64_t neighbour = base + 0x100000 + page + 0x10;
+      const uint64_t texture = base + 0x200000;
+      const uint64_t formatless = base + 0x280000;
+      const uint64_t unmapped = base + mapped_size + 0x10000;
+      const uint64_t late = base + 0x300000;
+      Require(name, "empty table", !tables.Prepare(table, table_bytes),
+              "a table without V#s reported targets");
+      set_entry(0, vsharp(written, 0x100));
+      set_entry(1, vsharp(neighbour, 0x40));
+      set_entry(2, vsharp(texture, 0x100, true, 2));
+      set_entry(3, vsharp(formatless, 0x100, false));
+      // The last entry: the whole table is scanned, not a prefix.
+      set_entry(table_entries - 1, vsharp(unmapped, 0x100));
+      Require(name, "first preparation", tables.Prepare(table, table_bytes),
+              "a table with V#s reported no targets");
+      const auto owner = BufferCacheTestAccess::PageOwner(cache, written);
+      Require(name, "cached targets",
+              cache.IsRegionRegistered(written, 0x100) &&
+                  cache.IsRegionRegistered(neighbour, 0x40) &&
+                  owner && BufferCacheTestAccess::PageOwner(cache, neighbour) ==
+                               owner &&
+                  cache.GetBuffer(owner).IsInBounds(written, page + 0x50),
+              "neighbouring targets were not cached by one buffer");
+      Require(name, "dropped targets",
+              !cache.IsRegionRegistered(texture, 0x100) &&
+                  !cache.IsRegionRegistered(formatless, 0x100) &&
+                  !cache.IsRegionRegistered(unmapped, 0x100),
+              "a target stores cannot reach was cached");
+
+      // The shader binds the table, which caches and cleans its pages.
+      (void)cache.ObtainBuffer(table, table_bytes, false);
+      Require(name, "unchanged table",
+              tables.Prepare(table, table_bytes) &&
+                  BufferCacheTestAccess::PageOwner(cache, written) == owner,
+              "an unchanged table cached its targets again");
+      set_entry(1000, vsharp(late, 0x80));
+      Require(name, "changed entry",
+              tables.Prepare(table, table_bytes) &&
+                  cache.IsRegionRegistered(late, 0x80),
+              "a V# the CPU wrote after the first scan was not cached");
+
+      context.MapMemory(base + mapped_size, allocation_size - mapped_size);
+      Require(name, "mapped target",
+              tables.Prepare(table, table_bytes) &&
+                  cache.IsRegionRegistered(unmapped, 0x100),
+              "a target mapped after the scan was not cached");
+
+      // A dispatch uploads the CPU writes of the new buffers before it runs.
+      context.PrepareBda();
+      // Stores wrote the pages of `written` and `neighbour`; the CPU wrote
+      // `neighbour` after the dispatch was recorded, so its upload wins.
+      (void)context.InvalidateMemory(neighbour, 4);
+      const std::array<uint64_t, 2> pages{written, neighbour & ~(page - 1)};
+      tables.NoteWrites(pages);
+      Require(name, "written targets",
+              cache.IsRegionGpuModified(written, 0x100) &&
+                  cache.HasGpuDirtyBytes(written, 0x100) &&
+                  !cache.IsRegionGpuModified(written + 0x2000, 0x10) &&
+                  !cache.HasGpuDirtyBytes(written + 0x100, 0x10),
+              "only the targets of a written page must become GPU modified");
+      Require(name, "CPU-written target",
+              !cache.IsRegionGpuModified(neighbour, 0x40) &&
+                  cache.IsRegionCpuModified(neighbour, 0x40),
+              "a page the CPU wrote after the dispatch became GPU modified");
+      cache.ReadMemory(written, 0x100);
+
+      // Releasing the targets' buffers makes the next preparation cache them
+      // again even though the table did not change.
+      BufferCacheTestAccess::SetGarbageCollectionThresholds(cache, 0, 0);
+      for (uint32_t tick = 0; tick < 200; tick++) {
+        cache.RunGarbageCollector();
+      }
+      BufferCacheTestAccess::SetGarbageCollectionThresholds(
+          cache, std::numeric_limits<uint64_t>::max(),
+          std::numeric_limits<uint64_t>::max());
+      Require(name, "released targets",
+              !cache.IsRegionRegistered(written, 0x100) &&
+                  !cache.IsRegionRegistered(late, 0x80),
+              "garbage collection kept the target buffers");
+      Require(name, "recached targets",
+              tables.Prepare(table, table_bytes) &&
+                  cache.IsRegionRegistered(written, 0x100) &&
+                  cache.IsRegionRegistered(neighbour, 0x40) &&
+                  cache.IsRegionRegistered(late, 0x80) &&
+                  cache.IsRegionRegistered(unmapped, 0x100),
+              "targets released by garbage collection were not cached again");
+
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "direct-memory allocation release failed");
     std::printf("[host]    %-32s ok\n", name);
   }
 
@@ -14796,6 +14988,52 @@ public:
     return sampler;
   }
 
+  // The write-bitmap bits of the caching pages of `addresses` after the last
+  // dispatch.
+  std::vector<bool> ReadBdaWriteBits(const char *shader_name,
+                                     const std::vector<uint64_t> &addresses) {
+    auto words = CreateHostBuffer(shader_name, addresses.size() * sizeof(u32),
+                                  vk::BufferUsageFlagBits::eTransferDst, {});
+    std::vector<vk::BufferCopy> copies;
+    for (size_t i = 0; i < addresses.size(); i++) {
+      const auto page = BufferCache::PageIndex(addresses[i]);
+      copies.push_back({BufferCache::WRITE_BITMAP_OFFSET + page / 32 * 4,
+                        i * sizeof(u32), sizeof(u32)});
+    }
+    vk::CommandBuffer cmd = BeginCommands(shader_name, "write bitmap");
+    vk::BufferMemoryBarrier before{};
+    before.sType = vk::StructureType::eBufferMemoryBarrier;
+    before.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+    before.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+    before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    before.buffer = m_fault_buffer.buffer;
+    before.offset = 0;
+    before.size = m_fault_buffer.size;
+    cmd.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+                        vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1,
+                        &before, 0, nullptr);
+    cmd.copyBuffer(m_fault_buffer.buffer, words.buffer,
+                   static_cast<u32>(copies.size()), copies.data());
+    vk::BufferMemoryBarrier after = before;
+    after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+    after.dstAccessMask = vk::AccessFlagBits::eHostRead;
+    after.buffer = words.buffer;
+    after.size = words.size;
+    cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                        vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1,
+                        &after, 0, nullptr);
+    EndSubmitAndFree(shader_name, "write bitmap", cmd);
+    const auto values = ReadBuffer(shader_name, words, addresses.size());
+    DestroyBuffer(&words);
+    std::vector<bool> bits;
+    for (size_t i = 0; i < addresses.size(); i++) {
+      const auto page = BufferCache::PageIndex(addresses[i]);
+      bits.push_back(((values[i] >> (page % 32)) & 1u) != 0);
+    }
+    return bits;
+  }
+
   std::vector<u32> ReadBuffer(const char *shader_name, const Buffer &buffer,
                               size_t dword_count) {
     if (!buffer.coherent) {
@@ -18168,7 +18406,8 @@ private:
     m_bda_pagetable_buffer =
         CreateDeviceBuffer(shader_name, BufferCache::BDA_PAGETABLE_SIZE, usage);
     m_fault_buffer = CreateDeviceBuffer(
-        shader_name, BufferCache::CACHING_NUMPAGES / 8, usage);
+        shader_name, BufferCache::FAULT_BUFFER_SIZE,
+        usage | vk::BufferUsageFlagBits::eTransferSrc);
   }
 
   Buffer CreateHostBuffer(const char *shader_name, vk::DeviceSize size,
@@ -18403,6 +18642,20 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
                    needs_storage_image ? &storage_image_uint : nullptr,
                    sampler);
   auto actual = vulkan->ReadBuffer(test.name, buffer, test.expected.size());
+  if (!test.expected_bda_writes.empty()) {
+    std::vector<uint64_t> addresses;
+    for (const auto &[address, written] : test.expected_bda_writes) {
+      addresses.push_back(address);
+    }
+    const auto bits = vulkan->ReadBdaWriteBits(test.name, addresses);
+    for (size_t i = 0; i < bits.size(); i++) {
+      Require(test.name, "write bitmap",
+              bits[i] == test.expected_bda_writes[i].second,
+              test.expected_bda_writes[i].second
+                  ? "a V# table store did not mark its page written"
+                  : "a page without V# table stores was marked written");
+    }
+  }
   if (!test.expected_gds.empty()) {
     const auto gds_actual =
         vulkan->ReadBuffer(test.name, gds_buffer, test.expected_gds.size());
@@ -27670,6 +27923,84 @@ TestCase BufferLoadFormatXGpuSelectedDescriptors() {
   return test;
 }
 
+TestCase BufferStoresGpuSelectedDescriptors() {
+  using O = ShaderOpcode;
+  constexpr uint64_t GuestBase = 0x0000000110000000ull;
+  // Further guest pages aliasing the same backing, so the write bitmap shows
+  // which pages the stores reached.
+  constexpr uint64_t DroppedBase = GuestBase + 0x100000;
+  constexpr uint64_t WrittenBase = GuestBase + 0x200000;
+  constexpr u32 TableByte = 1024;
+  struct DescriptorCase {
+    u32 records, mode;
+    bool bound, written;
+    uint64_t base = GuestBase;
+  };
+  const DescriptorCase cases[] = {
+      {16, 3, true, true},
+      // Raw bounds: the DWORD at offset 4 needs eight bytes.
+      {4, 3, true, false},
+      {8, 3, true, true},
+      // A V# without a data format drops the store.
+      {16, 3, false, false},
+      {1, 2, true, true},
+      {0, 2, true, false},
+      {16, 3, false, false, DroppedBase},
+      {16, 3, true, true, WrittenBase},
+  };
+  TestCase test;
+  test.name = "BufferStoresGpuSelectedDescriptors";
+  test.initial.resize(1024);
+  for (u32 i = 0; i < test.initial.size(); ++i) {
+    test.initial[i] = 0x5a000000u + i;
+  }
+  for (u32 i = 0; i < std::size(cases); ++i) {
+    const auto &input = cases[i];
+    const u32 data_offset = 2048 + i * 64;
+    // 16-byte table entries, as in PPSA04263's skinning shaders.
+    const std::array<u32, 4> descriptor{
+        static_cast<u32>(input.base + data_offset),
+        static_cast<u32>(input.base >> 32u), input.records,
+        (input.bound ? 0x5204u : 0x204u) | (input.mode << 28u)};
+    std::copy(descriptor.begin(), descriptor.end(),
+              test.initial.begin() + TableByte / 4 + i * 4);
+  }
+  test.expected = test.initial;
+  for (u32 i = 0; i < std::size(cases); ++i) {
+    // Reverse the table order through a GPU load and readfirstlane, not host
+    // constants.
+    const u32 selected = static_cast<u32>(std::size(cases)) - 1 - i;
+    test.initial[64 + i] = selected;
+    test.expected[64 + i] = selected;
+    AppendVMovU32(&test.code, 30, (64 + i) * 4);
+    AppendBufferLoadDword(&test.code, 0, 30);
+    test.code.push_back(EncodeVop1(0x02, 20, Vgpr(0)));
+    test.code.push_back(EncodeSop2(0x1e, 20, 20, InlineU32(4))); // s_lshl_b32 s20, s20, 4
+    test.code.push_back(EncodeSmem0(0x0a, 8, 0));
+    test.code.push_back(EncodeSmem1(TableByte, 20));
+    AppendVMovLiteral(&test.code, 1, 0xc0de0000u + i);
+    AppendVMovU32(&test.code, 21, 4);
+    test.code.push_back(EncodeMubuf0(0x1c, 0, false, true));
+    test.code.push_back(EncodeMubuf1(1, 2, 21));
+    if (cases[selected].written) {
+      test.expected[(2048 + selected * 64 + 4) / 4] = 0xc0de0000u + i;
+    }
+  }
+  AppendEnd(&test.code);
+  test.bda_mappings = {{GuestBase, 0}, {DroppedBase, 0}, {WrittenBase, 0}};
+  test.expected_bda_writes = {{GuestBase, true},
+                              {DroppedBase, false},
+                              {WrittenBase, true},
+                              // Mapped by no V#: nothing reaches it.
+                              {GuestBase + 0x300000, false}};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_READFIRSTLANE_B32,
+                  O::S_LSHL_B32, O::S_BUFFER_LOAD_DWORDX4, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.required_spirv = {"OpConvertUToPtr", "PhysicalStorageBuffer",
+                         "OpAtomicOr"};
+  return test;
+}
+
 TestCase BufferStoreDwordx4DropsOnlyOutOfBoundsTail() {
   using O = ShaderOpcode;
 
@@ -34898,6 +35229,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferLoadDwordx4ZeroesOnlyOutOfBoundsTail);
   AddCase(BufferLoadsGpuSelectedDescriptors);
   AddCase(BufferLoadDwordGpuSelectedDescriptors);
+  AddCase(BufferStoresGpuSelectedDescriptors);
   AddCase(BufferLoadDwordx3GpuSelectedDescriptors);
   AddCase(BufferLoadFormatXGpuSelectedDescriptors);
   AddCase(BufferStoreDwordx4DropsOnlyOutOfBoundsTail);
@@ -40290,6 +40622,7 @@ int main(int argc, char **argv) {
     CheckRuntimeBufferRecords(vulkan);
     RunCase(&vulkan, BufferLoadsGpuSelectedDescriptors());
     RunCase(&vulkan, BufferLoadDwordGpuSelectedDescriptors());
+    RunCase(&vulkan, BufferStoresGpuSelectedDescriptors());
     RunCase(&vulkan, BufferLoadDwordx3GpuSelectedDescriptors());
     RunCase(&vulkan, BufferLoadFormatXGpuSelectedDescriptors());
     RunCase(&vulkan, BufferLoadFormatXRejectsPartialRecord());
@@ -40714,6 +41047,11 @@ int main(int argc, char **argv) {
     vulkan.CheckBufferCacheDirtyGarbageCollection();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--indirect-write-tables-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckIndirectWriteTables();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--sampler-border-only") == 0) {
     CheckImageSamplerSpecialization();
     VulkanHarness vulkan;
@@ -40925,6 +41263,7 @@ int main(int argc, char **argv) {
     vulkan.CheckRasterization(false, Prospero::BufferFormat::k11_11_10Float);
     vulkan.CheckRasterization(false, Prospero::BufferFormat::k10_10_10_2UScaled);
     vulkan.CheckBufferCacheDirtyGarbageCollection();
+    vulkan.CheckIndirectWriteTables();
 #endif
   } else {
     skipped_device_checks = true;

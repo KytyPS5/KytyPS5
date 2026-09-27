@@ -237,7 +237,7 @@ static std::unique_ptr<AjmDecoder> AjmCreateDecoder(uint32_t codec, uint64_t fla
 		case static_cast<uint32_t>(AjmCodec::DecM4aac):
 			return std::make_unique<AjmAacDecoder>(channels, 48000, encoding, flags);
 		case static_cast<uint32_t>(AjmCodec::DecOpus):
-			return std::make_unique<AjmOpusDecoder>(channels, 48000, encoding, flags);
+			return std::make_unique<AjmOpusDecoder>(channels, encoding);
 		default: break;
 	}
 

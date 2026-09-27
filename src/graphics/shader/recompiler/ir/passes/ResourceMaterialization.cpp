@@ -27,10 +27,8 @@ namespace {
 constexpr uint64_t AddressMask            = 0x0000ffffffffffffull;
 constexpr uint64_t RegisteredBufferAddressLimit = uint64_t{1} << 40u;
 constexpr uint64_t MaxIndirectImageProbes = 65536u;
-// A 16-bit selector can feed multiple descriptors and their address expressions.
-// Bound each selector domain independently, then apply an explicit memory budget
-// to the whole coherent transaction instead of treating the first 65,536 words
-// as a semantic limit. This includes 256 full-width selector columns.
+// Storage reservations and logical probe counts have separate budgets.
+constexpr uint64_t MaxBoundedSnapshotProbes = 65536u;
 constexpr uint64_t MaxBoundedSnapshotBytes = 64u * 1024u * 1024u;
 constexpr uint64_t MaxBoundedSnapshotWords = MaxBoundedSnapshotBytes / sizeof(uint32_t);
 
@@ -893,14 +891,14 @@ bool MaterializeBoundedReads(const ResourcePlan& program, const SrtRuntime& runt
 			size = read.count_signed && static_cast<int32_t>(raw_count) <= 0 ? 0u : raw_count;
 		}
 		if (size > MaxIndirectImageProbes ||
-		    snapshot_words > MaxBoundedSnapshotWords - uint64_t{size} ||
+		    snapshot_words > MaxBoundedSnapshotProbes - uint64_t{size} ||
 		    (!workgroup_column &&
 		     flat.size() > UINT32_MAX - uint64_t{size})) {
 			return SpecializationFail(fmt::format(
 			    "bounded SRT read {} exceeds the candidate/snapshot limit "
 			    "(count={} stride={} bias={} words={} candidate_limit={} word_limit={})",
 			    id, size, read.offset_scale, read.offset_bias, snapshot_words + uint64_t{size},
-			    MaxIndirectImageProbes, MaxBoundedSnapshotWords));
+			    MaxIndirectImageProbes, MaxBoundedSnapshotProbes));
 		}
 		snapshot_words += size;
 
@@ -1564,10 +1562,17 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& i
 	const auto clean_runtime = CleanRuntime(runtime);
 	SrtWalker clean(program, clean_runtime);
 	SrtWalker walker(program, runtime, program.clean_flat_slots, &clean);
+	const auto active = clean.FindActiveSources();
 	std::vector<DescriptorValue> values;
 	values.reserve(program.materialization_sources.size());
 	for (const auto source : program.materialization_sources) {
 		DescriptorValue value;
+		if (!active.empty() && source < active.size() && !active[source]) {
+			value = {};
+			value.dword_count = program.descriptor_sources[source].dword_count;
+			values.push_back(value);
+			continue;
+		}
 		if (!walker.EvaluateDescriptor(source, value)) {
 			const auto* desc = Source(program, source);
 			const auto& detail = walker.LastFlatError();
@@ -1627,7 +1632,7 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& i
 	if (capture_reads) {
 		for (uint32_t i = 0; i < program.info.buffers.size(); ++i) {
 			const auto& buffer = program.info.buffers[i];
-			if (!buffer.written) {
+			if (!buffer.written || (!active.empty() && !active[buffer.source])) {
 				continue;
 			}
 			DescriptorValue strict;
@@ -1705,6 +1710,10 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& i
 				snapshot.indirect_images.push_back(std::move(table));
 			}
 		} else if (source != nullptr && source->indirect_image.has_value()) {
+			next.images[image_index].dword_count = source->dword_count;
+			if (!active.empty() && !active[image.source]) {
+				continue;
+			}
 			const auto& indirect = *source->indirect_image;
 			DescriptorValue material, heap;
 			if ((indirect.material_source != UINT32_MAX &&

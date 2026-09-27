@@ -253,8 +253,9 @@ public:
 		});
 		m_program.descriptor_sources         = std::move(m_sources);
 		m_program.info                       = std::move(m_info);
-		m_program.bounded_srt_reads_precede_writes =
-		    ProveBoundedSrtReadsPrecedeWrites(m_program);
+		// Local CFG order does not establish read-before-write order between
+		// invocations. Alias admission needs a dispatch-wide proof, unavailable here.
+		m_program.bounded_srt_reads_precede_writes = false;
 		m_program.resource_tracking_complete = true;
 	}
 
@@ -1322,6 +1323,9 @@ private:
 			return nullptr;
 		}
 		const auto& memory = m_program.memory_info[index];
+		if (!address && static_cast<int32_t>(memory.offset) < 0) {
+			return nullptr;
+		}
 		return memory.kind ==
 		                   (address ? ResourceKind::ScalarAddress : ResourceKind::ScalarBuffer) &&
 		               memory.data_bits == 32u && memory.data_dwords == 1u
@@ -2400,6 +2404,13 @@ private:
 					continue;
 				}
 				auto* image = inst.Arg(0).Resolve().TryInstruction();
+				if (image != nullptr && image->GetOpcode() == ValueOpcode::GetImageResource) {
+					bool runtime_uniform = true;
+					for (size_t word = 0; word < image->NumArgs(); ++word) {
+						runtime_uniform &= ValidateRuntimeValue(m_program, image->Arg(word));
+					}
+					if (runtime_uniform) continue;
+				}
 				auto* sampler = image_info.needs_sampler && inst.NumArgs() >= 2u
 				                    ? inst.Arg(1).Resolve().TryInstruction()
 				                    : nullptr;
@@ -2642,8 +2653,14 @@ private:
 		    MakeBoundedBufferSource(*handle, source, bounded_rejection)) return;
 		bool has_bounded_column = false;
 		if (expected == ValueOpcode::GetBufferResource) {
+			bool all_bounded_columns = handle->NumArgs() == 4u;
 			for (uint32_t word = 0; word < handle->NumArgs(); ++word) {
-				has_bounded_column |= BoundedReadValue(handle->Arg(word)) != nullptr;
+				const bool bounded = BoundedReadValue(handle->Arg(word)) != nullptr;
+				has_bounded_column |= bounded;
+				all_bounded_columns &= bounded;
+			}
+			if (all_bounded_columns) {
+				Fail(pc, "GetBufferResource is not a valid runtime value: " + bounded_rejection);
 			}
 		}
 		if (expected == ValueOpcode::GetImageResource && m_program.dispatcher_fallback) {
@@ -2810,16 +2827,7 @@ private:
 			const char* value = std::getenv("KYTY_SHADER_PHASE_TRACE");
 			return value != nullptr && *value != '\0' && std::string_view(value) != "0";
 		}();
-		if (expected == ValueOpcode::GetImageResource) {
-			for (; bad_dword < descriptor.dword_count; bad_dword++) {
-				const auto* value = descriptor.dwords[bad_dword].Resolve().TryInstruction();
-				if (value != nullptr && value->GetOpcode() == ValueOpcode::ReadConstBuffer) {
-					Fail(pc, fmt::format("{} dword {} is not a valid runtime value",
-					                     ValueOpcodeName(expected), bad_dword));
-				}
-			}
-			bad_dword = 0;
-		}
+
 		if (!ValidateSource(descriptor, bad_dword)) {
 			if (trace_buffer_failure && expected == ValueOpcode::GetBufferResource) {
 				std::fprintf(stderr,
@@ -3082,6 +3090,10 @@ private:
 			Fail(flags.pc, "memory operation has no resource handle");
 		}
 		const auto& memory = m_program.memory_info[flags.index];
+		if (op == ValueOpcode::ReadConstBuffer &&
+		    static_cast<int32_t>(memory.offset) < 0) {
+			Fail(flags.pc, "ReadConstBuffer offset is not a valid runtime value");
+		}
 		if (memory.planning_only || IsIndirectPlanningMemory(flags.index)) {
 			return;
 		}

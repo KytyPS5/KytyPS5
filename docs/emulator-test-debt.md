@@ -1,5 +1,104 @@
 # Emulator regression test debt
 
+## Upstream integration and SRT rejection regressions (2026-09-27)
+
+Native required checks on the merge of `e0c73250` and `421684e7` expose
+unchanged CPU RED cases: `TestConstantBufferBounds` accepts an out-of-bounds
+planning read, and the wrapped scalar-buffer immediate in
+`TestInvariantIndirectImages` passes runtime admission. Evidence:
+`_Build/logs/merge-focused-ctest-20260927.log`. Before correcting production,
+preserve these rejection oracles, retain in-range reads, and reject unreadable
+non-null planning roots rather than fabricating zero descriptors. Scalar-buffer
+admission must agree with the evaluator's unsigned offset constraint. The
+RO-upload fixture must contain a live memory access under upstream binding
+pruning; its byte/padding oracle remains unchanged. GREEN and game retry pending.
+
+After restoring those rejections, the existing `TestUniformScalarBufferImage`
+also exposes RED: draw-uniform nested descriptors are captured by inline GPU
+descriptor lowering instead of normal runtime materialization. Preserve its
+three numerical descriptor-address oracles and the unreadable-memory rejection;
+uniform descriptors must keep the ordinary specialization path.
+
+The next existing RED is `TestSrtRawFallbackReadability`: the no-callback
+SRT fallback directly dereferences null/reserved/no-access host memory, causing
+native CPU AV. Evidence: `merge-resource-crash-localize-20260927.txt` and the
+existing `--srt-raw-fallback-case` fixtures. Require an exact, fallible DWORD
+copy through the host OS, preserve successful readable bytes and transactional
+failure, and retain callback-based guest-memory reads. This is CPU memory
+admission, not a GPU-driver workaround. GREEN pending.
+
+Existing finite-selector rejection RED (`merge-resource-finite-red-20260927.txt`)
+shows that a four-column descriptor with a displaced fourth column bypasses
+the failed correlated-table proof via generic bounded-expression admission.
+Preserve mixed-column/mixed-index, unknown/undef/cyclic/conditional-root and
+stage rejection fixtures; retain positive contiguous columns and genuine
+derived bounded descriptor expressions. No broader descriptor assembly is
+claimed without an independent regression.
+
+Existing finite-selector materialization RED then exposes an immutable-source
+writer alias accepted by the `bounded_srt_reads_precede_writes` bypass. A local
+CFG ordering observation is not a dispatch-wide ordering proof across waves
+or workgroups. Preserve exact-end nonoverlap, readable candidate snapshots,
+transactional failure and the last-DWORD overlap rejection before changing
+alias admission. Evidence: `merge-resource-correlated-green-20260927.txt.stderr`.
+
+Next RED: `TestWorkgroupSrtTrackingProof` rejects an otherwise proved acyclic
+WorkgroupId read solely because its CFG has no cycle. Preserve the same affine
+proof and coherent snapshot/alias checks for acyclic and cyclic inputs;
+host-read failures must remain errors. Evidence: `merge-resource-alias-green-20260927.txt.stderr`.
+
+Existing transactional-limit RED: `TestBoundedMaterializationLimitsAreTransactional`
+accepts 65,538 logical probes across two columns after the WIP raised the
+combined budget. Preserve the unchanged 65,536 success and 65,538 rejection
+oracles, including repeated-address memoization and unchanged snapshots on
+failure. Keep allocation capacity separate from the logical probe budget.
+Evidence: `merge-resource-workgroup-green-20260927.txt.stderr`.
+
+Conditional-buffer RED (`merge-resource-budget-green-20260927.txt.stderr`)
+shows that the WIP lost upstream reachability-aware descriptor materialization.
+Preserve existing untaken/taken, absent descriptor, failed predicate read, shared
+use, loop and writable-alias cases. Only proved unreachable sources may skip
+evaluation; unknown predicates keep every potentially executed source.
+
+Existing image-binding ABI RED (`merge-resource-indirect-green-20260927.txt.stderr`)
+accepts a depth-comparison storage image. Preserve the existing comparison,
+integer, atomic and dimension rejection matrix; comparison sampling applies
+only to sampled resources.
+
+Native `resource_tracking_tests` GREEN: all unchanged rejection and positive
+fixtures pass after the shared corrections, including eight raw host-memory
+readability cases. Evidence: `_Build/logs/merge-resource-image-abi-green-20260927.txt`
+and its `.run.json` (exit 0). The added unreadable planning-root regression
+was recorded RED before its fix. Full rebuilt focused checks and GPU cases
+remain pending at this checkpoint; game progress is not inferred from CPU GREEN.
+
+SDWA MOV numerical fixture RED: the decoder rejects byte source extraction
+combined with partial destination insertion, although shared translation
+already treats both fields independently. Preserve the unchanged overlapping
+source/destination, sign extension and inactive EXEC oracles before admitting
+those combinations. Evidence: `merge-gpu-sdwa-mov-20260927.txt`.
+
+FP64 fixtures need descriptor setup aligned with upstream zero-stride mode-0
+semantics: their explicit user data overwrites default mode-3 bounds bits.
+Retain every IEEE literal oracle and sentinel, set raw-buffer bounds mode 3
+explicitly, and retain the separate zero-stride mode-0 rejection GPU fixtures.
+Evidence: `merge-gpu-f64-arithmetic-20260927.txt.stderr` and conversion log.
+
+Indirect-image selector RED is a host test AV (`merge-gpu-indirect-image-20260927.txt`,
+Application Error fault module is the test EXE). Its SPIR-V assertion treats
+an `OpConstant` literal as an SSA ID while inspecting LOD. Accept both direct
+float constants and the equivalent bitcast of integer constants with bounds
+checks, preserving the exact 2.0 LOD and coordinate-dimension oracles.
+
+GPU checkpoint: SDWA MOV GREEN (`merge-sdwa-green-20260927.txt`), all ten
+FP64 conversion cases GREEN (`merge-f64-conversion-green-20260927.txt`).
+FP64 arithmetic passes multiply, fused FMA, signed-zero FMA and F64-to-F32
+rounding, then `RcpF64OddConvertedIntegersWithinIsaError` terminates with
+`0x80000003` inside NVIDIA `nvgpucomp64.dll` 32.0.16.1714 at offset 0x589eb2.
+Evidence: `merge-f64-arithmetic-green-20260927.txt` and its `.run.json`;
+Windows Application Error event confirms the driver module. Do not claim the
+arithmetic selector GREEN; an isolated saved-SPIR-V probe remains required.
+
 ## Restored RO aligned-upload regression source (2026-09-27)
 
 The historical RED/GREEN logs existed but the selector implementation had been

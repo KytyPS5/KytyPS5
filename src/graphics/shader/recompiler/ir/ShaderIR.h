@@ -380,6 +380,9 @@ DescriptorBindingForImage(const ImageResource& image) {
 			return std::nullopt;
 		}
 	} else if (image.resource_class == ImageResourceClass::Storage) {
+		if (image.depth_compare) {
+			return std::nullopt;
+		}
 		if (image.atomic) {
 			if (image.numeric_class != Prospero::TextureNumericClass::Uint) {
 				return std::nullopt;

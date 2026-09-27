@@ -492,6 +492,12 @@ void TestConstantBufferBounds() {
             flat == std::vector<uint32_t>{0xa5a5a5a5u},
         "constant-buffer SRT walk failed");
 
+  TestMemory unreadable_memory{};
+  SrtRuntime unreadable_runtime{.read_memory = ReadMemory,
+                               .userdata = &unreadable_memory};
+  Check(!SrtWalker(fixture.program, unreadable_runtime).RefreshFlatBuffer(flat),
+        "unreadable non-null planning root was replaced with zero");
+
   Fixture overflow;
   const auto overflow_memory = overflow.AddMemory(ResourceKind::ScalarBuffer);
   const auto overflow_buffer =

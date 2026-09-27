@@ -2393,6 +2393,8 @@ void TestDynamicSrtReadRemainsExplicit() {
                 fixture.program.bindings.user_data_registers.size() &&
             fixture.program.bindings.memory_offset_count == 1u &&
             fixture.program.bindings.ShaderDataDwords() ==
+                fixture.program.bindings.memory_offset_dword + 2u &&
+            fixture.program.bindings.memory_limit_dword ==
                 fixture.program.bindings.memory_offset_dword + 1u,
         "unified memory-offset layout is inconsistent");
 }

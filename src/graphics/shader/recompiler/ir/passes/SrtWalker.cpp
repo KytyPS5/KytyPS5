@@ -86,6 +86,10 @@ bool IsRawRead(const ResourcePlan& values, const Inst& inst) {
 		return false;
 	}
 	const auto kind = values.memory_info[index].kind;
+	if (kind == ResourceKind::ScalarBuffer &&
+	    static_cast<int32_t>(values.memory_info[index].offset) < 0) {
+		return false;
+	}
 	return (op == ValueOpcode::LoadAddressU32 && kind == ResourceKind::ScalarAddress) ||
 	       (op == ValueOpcode::ReadConstBuffer && kind == ResourceKind::ScalarBuffer);
 }
@@ -622,6 +626,7 @@ public:
 		const auto& memory = m_program.memory_info[flags.index];
 		const auto expected_kind = address_read ? ResourceKind::ScalarAddress : ResourceKind::ScalarBuffer;
 		if (memory.kind != expected_kind || memory.planning_only ||
+		    (buffer_read && static_cast<int32_t>(memory.offset) < 0) ||
 		    memory.data_dwords != 1u || memory.data_bits != 32u ||
 			(address_read && (!Immediate(read.Arg(2), 0u) || read.Arg(3).Resolve() != Value(true)))) {
 			trace_reject("memory shape");
@@ -652,15 +657,6 @@ public:
 		if (!BuildGraph()) return {};
 		const bool workgroup = offset.index->GetOpcode() == ValueOpcode::GetBuiltin;
 		if (m_program.dispatcher_fallback && workgroup) return {};
-		if (workgroup) {
-			// Acyclic shaders can execute this uniform-per-workgroup scalar read
-			// directly through the existing BDA emitter. Keep CPU snapshots for
-			// cyclic programs whose cooperative wave scheduling needs immutable
-			// coefficients; eagerly reading GPU-produced acyclic inputs would fail.
-			std::unordered_set<const Block*> active;
-			std::unordered_set<const Block*> complete;
-			if (!GraphHasCycle(m_program.blocks.front(), active, complete)) return {};
-		}
 		const auto maximum = workgroup ? std::optional<uint32_t>{} :
 		                                FiniteMaximum(Value(const_cast<Inst*>(offset.index)));
 		if (m_program.dispatcher_fallback && buffer_read &&
@@ -1637,11 +1633,6 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 		                      ? static_cast<uint64_t>(static_cast<uint32_t>(records))
 		                      : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
 		if (aligned > size || size - aligned < sizeof(uint32_t)) {
-			// Empty/null buffer descriptors used as optional SRT roots yield zero.
-			if (mem.planning_only) {
-				result = 0;
-				return true;
-			}
 			return false;
 		}
 		address = ((base & ~uint64_t {3}) + byte_offset) & ~uint64_t {3};
@@ -1655,20 +1646,13 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 	uint32_t word = 0;
 	if (m_runtime.read_memory != nullptr) {
 		if (!m_runtime.read_memory(m_runtime.userdata, address, {&word, 1})) {
-			// planning_only scalar roots may point at optional/unmapped SRT payloads
-			// (Yōtei VS 4c26e33f). Keep specialization alive with a zero word, matching
-			// the exact-null LoadAddress contract used for optional SRT bases.
-			if (mem.planning_only) {
-				result = 0;
-				return true;
-			}
 			m_last_flat_error = fmt::format(
 			    "LoadAddress read failed at 0x{:x} (planning={} opcode={})", address,
 			    mem.planning_only, static_cast<uint32_t>(inst.GetOpcode()));
 			return false;
 		}
 	} else {
-		std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
+		if (!HostMemoryReadU32(address, word)) return false;
 	}
 	result = word;
 	return true;

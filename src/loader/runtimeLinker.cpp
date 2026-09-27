@@ -713,18 +713,6 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		}
 		std::fflush(stdout);
 	}
-	std::printf("Exception RIP: 0x%016" PRIx64 "\n", info->exception_address);
-	std::printf("Fault VA:      0x%016" PRIx64 "\n", info->access_violation_vaddr);
-	std::printf("RAX:           0x%016" PRIx64 "\n", info->rax);
-	std::printf("RIP global:    0x%016" PRIx64 "\n", 0x0000000905AAA75Aull);
-	
-	uint64_t global_value = 0;
-	if (Libs::LibKernel::Memory::ReadGuest(
-	        0x0000000905AAA75Aull, &global_value)) {
-    	std::printf("Global value:  0x%016" PRIx64 "\n", global_value);
-	} else {
-	    std::printf("Global value:  <unreadable>\n");
-	}
 	std::printf("Exception RIP : 0x%016" PRIx64 "\n", info->exception_address);
 	std::printf("Fault VA      : 0x%016" PRIx64 "\n", info->access_violation_vaddr);
 	std::printf("RAX           : 0x%016" PRIx64 "\n", info->rax);

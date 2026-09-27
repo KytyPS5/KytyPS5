@@ -84,6 +84,8 @@ bool IsRuntimeSelect(ValueOpcode op) {
 	       op == ValueOpcode::SelectF32;
 }
 
+} // namespace
+
 bool IsRuntimeUniformOp(ValueOpcode op) {
 	switch (op) {
 		case ValueOpcode::ConditionRef:
@@ -140,6 +142,8 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 		default: return false;
 	}
 }
+
+namespace {
 
 class RuntimeValidator {
 public:

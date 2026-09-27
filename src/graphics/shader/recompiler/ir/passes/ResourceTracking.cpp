@@ -11,6 +11,7 @@
 #include <optional>
 #include <span>
 #include <tuple>
+#include <unordered_set>
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -612,8 +613,8 @@ private:
 	Value LowerDescriptorPhi(Value value) {
 		value           = value.Resolve();
 		const auto* phi = value.TryInstruction();
-		if (m_shader_writes || phi == nullptr || phi->GetOpcode() != ValueOpcode::Phi ||
-		    phi->NumArgs() != 2u || phi->NumPhiBlocks() != 2u || phi->GetType() != Type::U32 ||
+		if (phi == nullptr || phi->GetOpcode() != ValueOpcode::Phi || phi->NumArgs() != 2u ||
+		    phi->NumPhiBlocks() != 2u || phi->GetType() != Type::U32 ||
 		    m_program.blocks.size() != m_program.block_info.size()) {
 			return value;
 		}
@@ -665,6 +666,7 @@ private:
 		    !((term.true_block == target_ids[0] && term.false_block == target_ids[1]) ||
 		      (term.false_block == target_ids[0] && term.true_block == target_ids[1])) ||
 		    !ValidateRuntimeValue(m_program, info.condition, RuntimeValueType::Integer) ||
+		    (m_shader_writes && ReadsMemory(info.condition)) ||
 		    !ValidateRuntimeValue(m_program, phi->Arg(0)) ||
 		    !ValidateRuntimeValue(m_program, phi->Arg(1))) {
 			return value;
@@ -677,6 +679,67 @@ private:
 		selected.SetArg(2, phi->Arg(true_arg ^ 1u));
 		m_descriptor_selections.emplace_back(phi, Value(&selected));
 		return Value(&selected);
+	}
+
+	// Shader writes may alias scalar memory, including on a later loop visit, but not user data.
+	static bool ReadsMemory(Value value) {
+		std::vector<Value>              pending {value};
+		std::unordered_set<const Inst*> visited;
+		while (!pending.empty()) {
+			const auto* inst = pending.back().Resolve().TryInstruction();
+			pending.pop_back();
+			if (inst == nullptr || !visited.insert(inst).second) {
+				continue;
+			}
+			const auto op = inst->GetOpcode();
+			if (op == ValueOpcode::ReadConst || op == ValueOpcode::ReadConstBuffer ||
+			    AddressOpcodeInfoOf(op).access != AddressAccess::None ||
+			    BufferAccessOf(op) != BufferAccess::None) {
+				return true;
+			}
+			for (size_t index = 0; index < inst->NumArgs(); index++) {
+				pending.push_back(inst->Arg(index));
+			}
+		}
+		return false;
+	}
+
+	// Lowers descriptor Phis nested in a uniform expression, such as S_BITSET1 on a V# base
+	// selected by a scalar branch, by rebuilding the expression over the host selections.
+	Value LowerDescriptorWord(Value value, std::vector<std::pair<const Inst*, Value>>& lowered) {
+		value            = value.Resolve();
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr) {
+			return value;
+		}
+		if (inst->GetOpcode() == ValueOpcode::Phi) {
+			return LowerDescriptorPhi(value);
+		}
+		if (!IsRuntimeUniformOp(inst->GetOpcode())) {
+			return value;
+		}
+		for (const auto& [original, result]: lowered) {
+			if (original == inst) {
+				return result;
+			}
+		}
+		std::vector<Value> args(inst->NumArgs());
+		bool               changed = false;
+		for (size_t index = 0; index < args.size(); index++) {
+			args[index] = LowerDescriptorWord(inst->Arg(index), lowered);
+			changed     = changed || args[index] != inst->Arg(index).Resolve();
+		}
+		auto result = value;
+		if (changed) {
+			auto& rebuilt = m_program.value_storage.emplace_back(inst->GetOpcode(),
+			                                                     inst->Flags<uint64_t>());
+			for (size_t index = 0; index < args.size(); index++) {
+				rebuilt.SetArg(index, args[index]);
+			}
+			result = Value(&rebuilt);
+		}
+		lowered.emplace_back(inst, result);
+		return result;
 	}
 
 	void MakeSource(const Inst& handle, uint32_t width, bool sampler, bool sample_adjust,
@@ -693,10 +756,11 @@ private:
 			                     ValueOpcodeName(handle.GetOpcode()), handle.NumArgs(), width));
 		}
 		descriptor.dword_count = width;
+		std::vector<std::pair<const Inst*, Value>> lowered;
 		for (uint32_t i = 0; i < width; i++) {
 			const auto value = base_reg != UINT32_MAX
 			    ? NativeDescriptorSource(handle.Arg(i), base_reg + i, pc) : handle.Arg(i);
-			descriptor.dwords[i] = LowerDescriptorPhi(value);
+			descriptor.dwords[i] = LowerDescriptorWord(value, lowered);
 		}
 		if (sample_adjust) {
 			descriptor.dwords[3] = CanonicalizeSampleAdjustDword3(descriptor.dwords[3]);

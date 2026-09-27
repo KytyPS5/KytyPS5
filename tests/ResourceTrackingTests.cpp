@@ -3175,6 +3175,129 @@ void TestGuardedScalarDescriptorReads() {
   }
 }
 
+// GTA V CS d03361dd03166145 selects the base of an atomic V# with S_CBRANCH_SCC0 on s2,
+// adds it with S_ADD_U32/S_ADDC_U32 in each arm, sets a flag on the merged high word with
+// S_BITSET1_B32, and also stores through another buffer.
+ResourcePlan WrittenScalarBranchBufferPlan(bool memory_predicate) {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  Fixture fixture;
+  auto *entry = fixture.block;
+  auto *first = fixture.AddBlock();
+  auto *second = fixture.AddBlock();
+  auto *merge = fixture.AddBlock();
+  entry->AddBranch(first);
+  entry->AddBranch(second);
+  first->AddBranch(merge);
+  second->AddBranch(merge);
+  fixture.program.block_info[0].terminator = {
+      .kind = CFG::TerminatorKind::ConditionalBranch,
+      .true_block = 1, .false_block = 2};
+  fixture.program.block_info[1].terminator = {
+      .kind = CFG::TerminatorKind::Branch, .true_block = 3};
+  fixture.program.block_info[2].terminator = {
+      .kind = CFG::TerminatorKind::Branch, .true_block = 3};
+  fixture.program.block_info[3].terminator.kind = CFG::TerminatorKind::Return;
+
+  std::array<Value, 12> user_data;
+  for (uint32_t index = 0; index < user_data.size(); index++) {
+    user_data[index] = fixture.UserData(index);
+  }
+  const auto control =
+      fixture.Buffer({Value(0x1000u), Value(0u), Value(16u), Value(0u)});
+  MemoryInfo scalar;
+  scalar.kind = ResourceKind::ScalarBuffer;
+  const auto read = [&](uint32_t offset, Block *block) {
+    return fixture.Emit(ValueOpcode::ReadConstBuffer, {control, Value(offset)},
+                        fixture.AddMemory(scalar, 0x7c), block);
+  };
+  const auto selector = memory_predicate ? read(4u, entry) : user_data[2];
+  fixture.program.block_info[0].condition =
+      fixture.Emit(ValueOpcode::IEqual32, {Value(0u), selector});
+
+  const auto add_carry = [&](Value low, Value low_addend, Value high,
+                             Block *block) {
+    const auto sum =
+        fixture.Emit(ValueOpcode::IAddCarry32, {low, low_addend}, 0, block);
+    const auto carry = fixture.Emit(
+        ValueOpcode::SelectU32,
+        {fixture.Emit(ValueOpcode::INotEqual32,
+                      {fixture.Emit(ValueOpcode::CompositeExtractU32x2,
+                                    {sum, Value(1u)}, 0, block),
+                       Value(0u)},
+                      0, block),
+         Value(1u), Value(0u)},
+        0, block);
+    return std::pair{
+        fixture.Emit(ValueOpcode::CompositeExtractU32x2, {sum, Value(0u)}, 0,
+                     block),
+        fixture.Emit(ValueOpcode::IAdd32, {high, carry}, 0, block)};
+  };
+  const auto [first_low, first_high] =
+      add_carry(user_data[4], user_data[5], user_data[1], first);
+  const auto [second_low, second_high] =
+      add_carry(user_data[3], read(0u, second), user_data[0], second);
+  std::array<Value, 2> base;
+  for (uint32_t word = 0; word < base.size(); word++) {
+    auto &phi = merge->AppendNewInst(ValueOpcode::Phi, {},
+                                     static_cast<uint64_t>(Type::U32));
+    phi.AddPhiOperand(first, word == 0 ? first_low : first_high);
+    phi.AddPhiOperand(second, word == 0 ? second_low : second_high);
+    base[word] = Value(&phi);
+  }
+  fixture.block = merge;
+  const auto high =
+      fixture.Emit(ValueOpcode::BitwiseOr32, {base[1], Value(0x40000u)});
+  const auto flags =
+      fixture.Buffer({base[0], high, user_data[6], Value(0x16204u)}, 0x1a8);
+  MemoryInfo memory;
+  memory.kind = ResourceKind::Buffer;
+  memory.idxen = true;
+  fixture.Emit(ValueOpcode::BufferAtomicOr32,
+               {flags, Value(1u), Value(0u), Value(0u), Value(0u), Value(true)},
+               fixture.AddMemory(memory, 0x1a8));
+  const auto output = fixture.Buffer(
+      {user_data[8], user_data[9], user_data[10], user_data[11]}, 0x190);
+  fixture.Emit(ValueOpcode::StoreBufferU32,
+               {output, Value(0u), Value(0u), Value(0u), Value(1u), Value(true)},
+               fixture.AddMemory(memory, 0x190));
+  fixture.PlanAndTrack();
+  Check(flags.ResolveInstruction()->Arg(0).ResolveInstruction()->GetOpcode() ==
+            ValueOpcode::Phi,
+        "host descriptor selection changed the GPU Phi");
+  EliminateDeadCode(fixture.program.blocks);
+  ValidateProgram(fixture.program, true);
+  return ExtractResourcePlan(fixture.program);
+}
+
+void TestWrittenScalarBranchBuffer() {
+  auto plan = WrittenScalarBranchBufferPlan(false);
+  Check(!plan.info.uses_dma, "scalar-branch V# fell back to DMA");
+  const auto buffer = std::ranges::find_if(
+      plan.info.buffers, [](const BufferResource &resource) { return resource.atomic; });
+  Check(buffer != plan.info.buffers.end(), "scalar-branch V# was not bound");
+  std::array<uint32_t, 12> user_data{7u,          0x12u,  0u, 0x5000u,
+                                     0xfffff000u, 0x2000u, 0x100u};
+  TestMemory memory;
+  memory.words[0] = 0xfffffd00u;
+  const SrtRuntime runtime{.user_data = user_data,
+                           .read_memory = ReadTestMemory,
+                           .userdata = &memory};
+  for (const bool taken : {true, false}) {
+    user_data[2] = taken ? 0u : 1u;
+    DescriptorValue value;
+    Check(SrtWalker(plan, runtime).EvaluateDescriptor(buffer->source, value),
+          "scalar-branch V# was not evaluated");
+    // Both arms carry into the high word.
+    Check(value.dwords[0] == (taken ? 0x1000u : 0x4d00u) &&
+              value.dwords[1] == (taken ? 0x40013u : 0x40008u) &&
+              value.dwords[2] == 0x100u && value.dwords[3] == 0x16204u,
+          "scalar-branch V# chose the wrong incoming base");
+  }
+  CheckFatal([] { WrittenScalarBranchBufferPlan(true); },
+             "not a valid runtime value",
+             "shader-written scalar predicate selected a V#");
+}
+
 void TestConservativeBufferReachability() {
   std::array<uint32_t, 8> user_data{
       0x1000, 16u << 16u, 1, 0x4dfac,
@@ -3196,6 +3319,93 @@ void TestConservativeBufferReachability() {
                          snapshot.buffers[1].dwords.begin()),
           "shared or loop-dependent resource was pruned, or inactive scalar branch retained");
   }
+}
+
+ResourcePlan WritableBufferPhiPlan(bool memory_predicate) {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  Fixture fixture;
+  auto *entry = fixture.block;
+  auto *taken = fixture.AddBlock();
+  auto *skipped = fixture.AddBlock();
+  auto *merge = fixture.AddBlock();
+  entry->AddBranch(taken);
+  entry->AddBranch(skipped);
+  taken->AddBranch(merge);
+  skipped->AddBranch(merge);
+  fixture.program.block_info[0].terminator = {
+      .kind = CFG::TerminatorKind::ConditionalBranch,
+      .true_block = 1, .false_block = 2};
+  fixture.program.block_info[1].terminator = {
+      .kind = CFG::TerminatorKind::Branch, .true_block = 3};
+  fixture.program.block_info[2].terminator = {
+      .kind = CFG::TerminatorKind::Branch, .true_block = 3};
+  fixture.program.block_info[3].terminator.kind = CFG::TerminatorKind::Return;
+  auto flag = fixture.UserData(2);
+  if (memory_predicate) {
+    const auto control = fixture.Buffer(
+        {fixture.UserData(8), fixture.UserData(9), Value(16u), Value(0u)});
+    MemoryInfo scalar;
+    scalar.kind = ResourceKind::ScalarBuffer;
+    flag = fixture.Emit(ValueOpcode::ReadConstBuffer, {control, Value(0u)},
+                        fixture.AddMemory(scalar, 0x10));
+  }
+  fixture.program.block_info[0].condition =
+      fixture.Emit(ValueOpcode::INotEqual32, {flag, Value(0u)});
+
+  // CS 42cd6fdf7ea2c764 stores through s[0:1] or s[6:7] plus a 64-bit offset.
+  const auto base = [&](Block *block, uint32_t low, uint32_t high) {
+    fixture.block = block;
+    const auto sum = fixture.Emit(ValueOpcode::IAddCarry32,
+                                  {fixture.UserData(low), Value(0x40u)});
+    const auto carry =
+        fixture.Emit(ValueOpcode::CompositeExtractU32x2, {sum, Value(1u)});
+    return std::array<Value, 2>{
+        fixture.Emit(ValueOpcode::CompositeExtractU32x2, {sum, Value(0u)}),
+        fixture.Emit(ValueOpcode::IAdd32, {fixture.UserData(high), carry})};
+  };
+  const auto first = base(taken, 0, 1);
+  const auto second = base(skipped, 6, 7);
+  std::array<Value, 2> words;
+  for (uint32_t word = 0; word < words.size(); ++word) {
+    auto &phi = merge->AppendNewInst(ValueOpcode::Phi, {},
+                                     static_cast<uint64_t>(Type::U32));
+    phi.AddPhiOperand(taken, first[word]);
+    phi.AddPhiOperand(skipped, second[word]);
+    words[word] = Value(&phi);
+  }
+  fixture.block = merge;
+  const auto high = fixture.Emit(ValueOpcode::BitwiseOr32, {words[1], Value(0x40000u)});
+  const auto output =
+      fixture.Buffer({words[0], high, Value(64u), Value(0x16204u)}, 0x84);
+  MemoryInfo store;
+  store.kind = ResourceKind::Buffer;
+  fixture.Emit(ValueOpcode::StoreBufferU32,
+               {output, Value(0u), Value(0u), Value(0u), Value(1u), Value(true)},
+               fixture.AddMemory(store, 0x84));
+  fixture.PlanAndTrack();
+  Check(words[0].ResolveInstruction()->GetOpcode() == ValueOpcode::Phi,
+        "host descriptor selection changed the GPU Phi");
+  return ExtractResourcePlan(fixture.program);
+}
+
+void TestWritableBufferPhi() {
+  const auto plan = WritableBufferPhiPlan(false);
+  std::array<uint32_t, 8> user_data{0x1000, 0x10, 0, 0, 0, 0, 0xfffffff0u, 0x20};
+  const SrtRuntime runtime{.user_data = user_data};
+  for (const auto flag : {0u, 1u, 0x80000000u}) {
+    user_data[2] = flag;
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    const auto expected = flag != 0u ? std::array<uint32_t, 2>{0x1040, 0x40010}
+                                     : std::array<uint32_t, 2>{0x30, 0x40021};
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              snapshot.buffers.size() == 1 &&
+              snapshot.buffers[0].dwords[0] == expected[0] &&
+              snapshot.buffers[0].dwords[1] == expected[1],
+          "writable shader chose the wrong user-data selected buffer");
+  }
+  CheckFatal([] { WritableBufferPhiPlan(true); }, "not a valid runtime value",
+             "writable shader accepted a memory-backed descriptor predicate");
 }
 
 void TestConditionalIndirectImageMaterialization() {
@@ -3594,7 +3804,9 @@ int main() {
     Run("buffer swizzle specialization", TestBufferSwizzleSpecialization);
     Run("conditional buffer materialization", TestConditionalBufferMaterialization);
     Run("guarded scalar descriptor reads", TestGuardedScalarDescriptorReads);
+    Run("written scalar-branch buffer", TestWrittenScalarBranchBuffer);
     Run("conservative buffer reachability", TestConservativeBufferReachability);
+    Run("writable buffer phi", TestWritableBufferPhi);
     Run("conditional indirect image", TestConditionalIndirectImageMaterialization);
     Run("shader info and bindings", TestShaderInfoAndBindingLayout);
     Run("image binding ABI", TestImageBindingAbi);

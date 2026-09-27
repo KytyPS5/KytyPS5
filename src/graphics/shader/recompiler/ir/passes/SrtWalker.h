@@ -24,6 +24,8 @@ enum class RuntimeValueType { Any, Integer };
 
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
                           RuntimeValueType type = RuntimeValueType::Any);
+// Side-effect-free operations that runtime values may combine.
+bool IsRuntimeUniformOp(ValueOpcode op);
 // Uses the strict reader for values that affect shader specialization.
 SrtRuntime CleanRuntime(SrtRuntime runtime);
 

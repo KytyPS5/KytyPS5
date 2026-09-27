@@ -4,6 +4,7 @@ VALUE_OPCODE(Identity, Opaque, Opaque)
 VALUE_OPCODE(Void, Void)
 VALUE_OPCODE(Reference, Void, U1)
 VALUE_OPCODE(ReferenceU32, Void, U32)
+VALUE_OPCODE(ConditionRef, U1, U1)
 
 // Translation and register-state pseudo operations.
 VALUE_OPCODE(GetUserData, U32, ScalarReg)

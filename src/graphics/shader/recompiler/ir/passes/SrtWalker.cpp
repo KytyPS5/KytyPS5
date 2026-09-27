@@ -89,6 +89,7 @@ bool IsRuntimeSelect(ValueOpcode op) {
 
 bool IsRuntimeUniformOp(ValueOpcode op) {
 	switch (op) {
+		case ValueOpcode::ConditionRef:
 		case ValueOpcode::BitCastU32F32:
 		case ValueOpcode::BitCastF32U32:
 		case ValueOpcode::ConvertU32F32:
@@ -970,6 +971,7 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 				return true;
 			}
 			return false;
+		case ValueOpcode::ConditionRef: return Arg(inst, 0, result);
 		case ValueOpcode::LogicalNot:
 			if (Arg(inst, 0, a)) {
 				result = a == 0u;

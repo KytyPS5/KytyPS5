@@ -23390,6 +23390,73 @@ TestCase SharedReturnKeepsSelectedValues() {
   return test;
 }
 
+TestCase SiblingSharedExitKeepsCapturedConditions() {
+  using O = ShaderOpcode;
+  std::vector<u32> code = {
+      EncodeVop1(0x01, 5, 4),
+      EncodeVop2(0x1a, 5, InlineU32(6), 5),
+      EncodeVop2(0x25, 5, Vgpr(0), 5), // group * 64 + lane
+      EncodeSop2(0x0e, 6, 4, InlineU32(1)),
+      0, // choose left or right
+      EncodeSMovB32(8, InlineU32(20)),
+      EncodeSop2(0x0e, 6, 4, InlineU32(2)),
+      0, // left: skip nested exit
+      EncodeSop2(0x0e, 6, 4, InlineU32(4)),
+      0, // nested left: shared exit
+      0, // left -> normal return
+      EncodeSMovB32(8, InlineU32(30)),
+      EncodeSop2(0x0e, 6, 4, InlineU32(8)),
+      0, // first right shared exit
+      EncodeSMovB32(8, InlineU32(40)),
+      EncodeSop2(0x0e, 6, 4, InlineU32(16)),
+      0, // second right shared exit
+      EncodeSMovB32(8, InlineU32(50)),
+      EncodeSopc(0x06, InlineU32(0), InlineU32(1)), // overwrite SCC
+  };
+  AppendStoreSgprAtLaneDwordOffset(&code, 8, 5, 0);
+  AppendEnd(&code);
+  const auto shared_exit = static_cast<u32>(code.size());
+  code.push_back(EncodeSop2(0x00, 8, 8, InlineU32(1))); // overwrite SCC again
+  AppendStoreSgprAtLaneDwordOffset(&code, 8, 5, 0);
+  AppendEnd(&code);
+  code[4] = EncodeSopp(0x04, 11u - 5u);
+  code[7] = EncodeSopp(0x04, 10u - 8u);
+  code[9] = EncodeSopp(0x04, shared_exit - 10u);
+  code[10] = EncodeSopp(0x02, 17u - 11u);
+  code[13] = EncodeSopp(0x04, shared_exit - 14u);
+  code[16] = EncodeSopp(0x04, shared_exit - 17u);
+
+  TestCase test;
+  test.name = "SiblingSharedExitKeepsCapturedConditions";
+  test.code = std::move(code);
+  for (u32 group = 0; group < 32; ++group) {
+    u32 result = 50;
+    if (group & 1u) {
+      if ((group & 2u) && !(group & 4u)) result = 21;
+    } else if (!(group & 8u)) {
+      result = 31;
+    } else if (!(group & 16u)) {
+      result = 41;
+    }
+    test.expected.insert(test.expected.end(), 64, result);
+  }
+  test.opcodes = {O::V_MOV_B32, O::V_LSHLREV_B32, O::V_ADD_NC_U32,
+                  O::S_AND_B32, O::S_MOV_B32, O::S_CMP_EQ_U32, O::S_ADD_U32,
+                  O::S_CBRANCH_SCC0, O::S_BRANCH, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpSelectionMerge"};
+  test.forbidden_spirv = {"OpSwitch"};
+  test.compute_info.wave_size = 64;
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.group_id[0] = true;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.workgroup_register = 4;
+  test.has_compute_info = true;
+  test.dispatch_x = 32;
+  return test;
+}
+
 TestCase BranchVccnzUsesWaveMask() {
   using O = ShaderOpcode;
 
@@ -29477,6 +29544,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(BranchSelect);
   AddCase(SimpleLoop);
   AddCase(SharedReturnKeepsSelectedValues);
+  AddCase(SiblingSharedExitKeepsCapturedConditions);
   AddCase(BranchVccnzUsesWaveMask);
   AddCase(BranchVccnzUsesCarryProducedWaveMask);
   AddCase(ScalarMemRealtimeCapturedPlaceholder);
@@ -34450,6 +34518,7 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, ImageSampleAndGather());
     RunCase(&vulkan, ImageGatherLodApproximatesLevelZero());
     RunCase(&vulkan, SharedReturnKeepsSelectedValues());
+    RunCase(&vulkan, SiblingSharedExitKeepsCapturedConditions());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--position-w-only") == 0) {

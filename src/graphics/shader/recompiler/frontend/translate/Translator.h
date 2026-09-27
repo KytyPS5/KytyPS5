@@ -15,7 +15,7 @@ public:
 	void TranslateInstruction(const Decoder::Instruction& inst);
 	void TranslateEmbeddedFetch(const Decoder::Instruction& inst, uint32_t attribute,
 	                            uint32_t component_count, const ShaderBufferResource& resource);
-	void AddBranchCondition(const CFG::BasicBlock& source, IR::BlockInfo& info);
+	void AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlock& source, IR::BlockInfo& info);
 
 private:
 	const Decoder::Operand& SourceAt(const Decoder::Instruction& inst, uint32_t index);

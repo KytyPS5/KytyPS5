@@ -1818,12 +1818,12 @@ void TestSopkCompareImmediateExtension() {
         TranslateProgram(shader, MakeCompileOptions(ShaderType::Vertex));
     const auto branch = std::ranges::find_if(
         translated.program.block_info, [](const auto &block) {
-          return block.terminator.condition == CFG::BranchCondition::SccZero;
+          return block.terminator.kind == CFG::TerminatorKind::ConditionalBranch;
         });
     Check(branch != translated.program.block_info.end(),
           "captured LUT parameter export branch was lost");
     const auto condition = branch->condition.Resolve();
-    Check(condition.IsImmediate() && condition.U1() == (counts == 6u),
+    Check(condition.IsImmediate() && condition.U1() == (counts != 6u),
           "captured LUT unsigned compare suppressed a live parameter export");
   }
 }
@@ -7882,17 +7882,13 @@ void TestNewShaderRecompilerCfgLoopExitSharedWithSelection() {
   const auto coverage = CfgInstructionCoverage(graph, decoded.instructions.size());
   Check(block_count == 8u && graph.natural_loops.size() == 1u,
         "shared loop-exit fixture has the wrong native CFG");
-  Check(!ShaderRecompiler::CFG::Structurize(graph) &&
-            graph.unsupported_reason.find("duplicate structured merge block") !=
-                std::string::npos,
-        "shared loop exit did not terminate at its structured merge conflict");
-  Check(graph.blocks.size() == block_count &&
-            CfgInstructionCoverage(graph, decoded.instructions.size()) == coverage,
-        "shared loop-exit fallback changed semantic instruction coverage");
+  Check(ShaderRecompiler::CFG::Structurize(graph), graph.unsupported_reason.c_str());
+  Check(CfgInstructionCoverage(graph, decoded.instructions.size()) == coverage,
+        "shared loop-exit routing changed semantic instruction coverage");
 
   auto result = RecompileForTest(shader, MakeCompileOptions(ShaderType::Compute));
-  Check(result.program.dispatcher_fallback && SpirvContainsOpcode(result.spirv, 251),
-        "shared loop exit did not emit its dispatcher fallback");
+  Check(!result.program.dispatcher_fallback && !SpirvContainsOpcode(result.spirv, 251),
+        "shared loop exit did not retain structured control flow");
   CheckSpirvBinaryValidates(result.spirv);
 }
 
@@ -7922,7 +7918,7 @@ void TestNewShaderRecompilerCfgLoopEarlyBreakNoSelection() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
-void TestNewShaderRecompilerCfgNestedLoopNonlocalExitDispatcher() {
+void TestNewShaderRecompilerCfgNestedLoopNonlocalExitStructured() {
   const uint32_t shader[] = {
       EncodeSopc(0x0a, 0, 129),    // outer loop: s_cmp_lt_u32 s0, 1
       EncodeSopp(0x04, 9),         // outer exit -> end
@@ -7942,10 +7938,10 @@ void TestNewShaderRecompilerCfgNestedLoopNonlocalExitDispatcher() {
   options.dump_ir = true;
 
   auto result = RecompileForTest(shader, options);
-  Check((result.ir_dump.find("mode=dispatcher") != std::string::npos),
-        "nested-loop nonlocal exit did not select dispatcher fallback");
-  Check(SpirvInstructionOpcodeCount(result.spirv, 251) != 0,
-        "nested-loop nonlocal exit dispatcher SPIR-V lacks OpSwitch");
+  Check((result.ir_dump.find("mode=structured") != std::string::npos),
+        "nested-loop nonlocal exit did not retain structured control flow");
+  Check(SpirvInstructionOpcodeCount(result.spirv, 251) == 0,
+        "nested-loop nonlocal exit unexpectedly selected dispatcher OpSwitch");
   CheckSpirvBinaryValidates(result.spirv);
 }
 
@@ -8006,27 +8002,23 @@ void TestNewShaderRecompilerCfgNestedLoopExitTailMergeSplit() {
   Check(graph.blocks.size() > original_block_count,
         "nested loop exit tails did not create a private inner merge");
 
-  const auto *outer_header = graph.FindBlockByPc(0);
-  const auto *inner_header = graph.FindBlockByPc(8);
-  Check(outer_header != nullptr && inner_header != nullptr &&
-            outer_header->terminator.loop_header &&
-            inner_header->terminator.loop_header,
-        "nested loop exit-tail fixture did not retain both loop headers");
-  Check(inner_header->terminator.merge_block !=
-            outer_header->terminator.continue_block,
-        "inner loop merge still aliases the outer continue target");
-  const auto *inner_merge =
-      graph.FindBlock(inner_header->terminator.merge_block);
-  Check(inner_merge != nullptr &&
-            inner_merge->inst_begin == inner_merge->inst_end &&
-            inner_merge->terminator.kind ==
-                ShaderRecompiler::CFG::TerminatorKind::Branch &&
-            inner_merge->terminator.true_block ==
-                outer_header->terminator.continue_block,
-        "private inner merge does not forward to the outer continue target");
+  std::vector<const ShaderRecompiler::CFG::BasicBlock *> headers;
+  for (const auto &block : graph.blocks)
+    if (block.terminator.loop_header) headers.push_back(&block);
+  Check(headers.size() == 2u, "nested loop exit-tail fixture lost a loop header");
+  if (!graph.Dominates(headers[0]->id, headers[1]->id)) std::swap(headers[0], headers[1]);
+  const auto *outer_header = headers[0];
+  const auto *inner_header = headers[1];
+  Check(inner_header->terminator.merge_block != outer_header->terminator.continue_block &&
+            graph.Dominates(outer_header->id, inner_header->terminator.merge_block),
+        "inner loop merge escaped the enclosing loop body");
+  auto result = RecompileForTest(shader, MakeCompileOptions(ShaderType::Compute));
+  Check(!result.program.dispatcher_fallback,
+        "nested loop exit tails selected the dispatcher");
+  CheckSpirvBinaryValidates(result.spirv);
 }
 
-void TestNewShaderRecompilerCfgMixedContinueNonmergeExitDispatcher() {
+void TestNewShaderRecompilerCfgMixedContinueNonmergeExitStructured() {
   const uint32_t shader[] = {
       EncodeSopc(0x06, 7, 7),    // entry branch bypasses loop -> exit X
       EncodeSopp(0x05, 5),       // entry -> X
@@ -8046,10 +8038,10 @@ void TestNewShaderRecompilerCfgMixedContinueNonmergeExitDispatcher() {
   options.dump_ir = true;
 
   auto result = RecompileForTest(shader, options);
-  Check((result.ir_dump.find("mode=dispatcher") != std::string::npos),
-        "mixed continue/nonmerge exit did not select dispatcher fallback");
-  Check(SpirvInstructionOpcodeCount(result.spirv, 251) != 0,
-        "mixed continue/nonmerge exit dispatcher SPIR-V lacks OpSwitch");
+  Check((result.ir_dump.find("mode=structured") != std::string::npos),
+        "mixed continue/nonmerge exit did not retain structured control flow");
+  Check(SpirvInstructionOpcodeCount(result.spirv, 251) == 0,
+        "mixed continue/nonmerge exit unexpectedly selected dispatcher OpSwitch");
   CheckSpirvBinaryValidates(result.spirv);
 }
 
@@ -8100,7 +8092,7 @@ void TestNewShaderRecompilerCfgDirectConditionalLatchNoSelection() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
-void TestNewShaderRecompilerCfgLoopEarlyContinuesNoSelection() {
+void TestNewShaderRecompilerCfgLoopEarlyContinuesStructured() {
   const uint32_t shader[] = {
       EncodeSMovB32(0, 128),       // s0 = 0
       EncodeSopc(0x0a, 0, 130),    // loop: s_cmp_lt_u32 s0, 2
@@ -8125,8 +8117,8 @@ void TestNewShaderRecompilerCfgLoopEarlyContinuesNoSelection() {
         "loop early continues should stay on structured path");
   Check(SpirvInstructionOpcodeCount(result.spirv, 246) != 0,
         "loop early continues SPIR-V lacks OpLoopMerge");
-  Check(SpirvInstructionOpcodeCount(result.spirv, 247) == 0,
-        "loop early continues SPIR-V unexpectedly used OpSelectionMerge");
+  Check(SpirvInstructionOpcodeCount(result.spirv, 250) <= 4u,
+        "loop early continues introduced duplicate conditional branches");
   Check(SpirvInstructionOpcodeCount(result.spirv, 251) == 0,
         "loop early continues unexpectedly used dispatcher OpSwitch");
   CheckSpirvBinaryValidates(result.spirv);
@@ -8242,29 +8234,28 @@ void TestNewShaderRecompilerCfgMultipleLoopLatches() {
   ShaderRecompiler::Decoder::DecodeProgram(std::span{shader}, decoded);
   ShaderRecompiler::CFG::Graph graph;
   graph = ShaderRecompiler::CFG::BuildGraph(decoded);
-  const auto original_block_count = graph.blocks.size();
+  const auto coverage = CfgInstructionCoverage(graph, decoded.instructions.size());
   Check(graph.back_edges.size() == 2u,
         "multiple-latch fixture lacks two native backedges");
   Check(ShaderRecompiler::CFG::Structurize(graph),
         graph.unsupported_reason.c_str());
-  Check(graph.blocks.size() == original_block_count + 2u,
-        "multiple native latches did not create one synthetic continue and one "
-        "empty header");
+  Check(CfgInstructionCoverage(graph, decoded.instructions.size()) == coverage,
+        "shared backedge construction duplicated guest instructions");
   Check(graph.back_edges.size() == 1u && graph.natural_loops.size() == 1u,
         "multiple native latches were not coalesced to one SPIR-V backedge");
   const auto &loop = graph.natural_loops.front();
   const auto *continue_block = graph.FindBlock(loop.continue_block);
   Check(continue_block != nullptr &&
-            continue_block->inst_begin == continue_block->inst_end &&
-            continue_block->predecessors.size() == 2u,
-        "canonical continue does not join both native latches");
+            continue_block->terminator.true_block == loop.header &&
+            graph.Dominates(loop.header, continue_block->id),
+        "canonical continue does not return to its natural loop header");
 
   auto options = MakeCompileOptions(ShaderType::Compute);
   auto result = RecompileForTest(shader, options);
   Check(SpirvInstructionOpcodeCount(result.spirv, 246) == 1u,
         "multiple-latch SPIR-V has the wrong loop-merge count");
-  Check(SpirvInstructionOpcodeCount(result.spirv, 247) == 0u,
-        "multiple-latch SPIR-V unexpectedly used a selection merge");
+  Check(SpirvInstructionOpcodeCount(result.spirv, 250) <= 2u,
+        "multiple-latch routing duplicated a native conditional branch");
   Check(SpirvInstructionOpcodeCount(result.spirv, 251) == 0u,
         "multiple-latch SPIR-V unexpectedly used dispatcher OpSwitch");
   CheckSpirvBinaryValidates(result.spirv);
@@ -8319,36 +8310,20 @@ void TestNewShaderRecompilerCfgNestedEarlyExitLoopForwarders() {
   const auto original_block_count = graph.blocks.size();
   const auto original_coverage =
       CfgInstructionCoverage(graph, decoded.instructions.size());
-  const auto original_empty_blocks =
-      std::ranges::count_if(graph.blocks, [](const auto &block) {
-        return block.inst_begin == block.inst_end;
-      });
   Check(original_block_count == 7u && graph.natural_loops.size() == 1u,
         "nested early-exit fixture has the wrong native CFG");
   const bool structured = ShaderRecompiler::CFG::Structurize(graph);
   Check(structured, graph.unsupported_reason.c_str());
-  Check(graph.blocks.size() == original_block_count + 4u &&
-            CfgInstructionCoverage(graph, decoded.instructions.size()) ==
-                original_coverage &&
-            std::ranges::count_if(graph.blocks,
-                                  [](const auto &block) {
-                                    return block.inst_begin == block.inst_end;
-                                  }) == original_empty_blocks + 4,
+  Check(CfgInstructionCoverage(graph, decoded.instructions.size()) == original_coverage,
         "nested early-exit structurization changed semantic coverage");
-  const auto *preheader = graph.FindBlockByPc(0x00u);
-  const auto *outer = graph.FindBlockByPc(0x08u);
-  const auto *inner = graph.FindBlockByPc(0x10u);
-  const auto *loop = graph.FindBlockByPc(0x20u);
-  Check(
-      preheader != nullptr && outer != nullptr && inner != nullptr &&
-          loop != nullptr && loop->terminator.loop_header &&
-          preheader->terminator.merge_block != UINT32_MAX &&
-          outer->terminator.merge_block != UINT32_MAX &&
-          inner->terminator.merge_block != UINT32_MAX &&
-          preheader->terminator.merge_block != outer->terminator.merge_block &&
-          preheader->terminator.merge_block != inner->terminator.merge_block &&
-          outer->terminator.merge_block != inner->terminator.merge_block,
-      "nested early-exit constructs do not have distinct structured merges");
+  std::unordered_set<uint32_t> merges;
+  for (const auto &block : graph.blocks) {
+    if (block.terminator.merge_block != UINT32_MAX)
+      Check(merges.insert(block.terminator.merge_block).second,
+            "nested early-exit constructs share a structured merge");
+  }
+  Check(graph.natural_loops.size() == 1u,
+        "nested early-exit routing changed the natural loop count");
 
   auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
@@ -8365,7 +8340,7 @@ void TestNewShaderRecompilerCfgNestedEarlyExitLoopForwarders() {
 
 void TestNewShaderRecompilerCfgExecSccSharedArm() {
   const uint32_t shader[] = {
-      EncodeSop2(0x15, 126, 4, 126), // s_andn2_b64 exec, s4, exec
+      EncodeSop2(0x0f, 126, 4, 126), // s_and_b64 exec, s4, exec (runtime mask)
       EncodeSopp(0x08, 2),           // execz -> shared arm
       EncodeSop2(0x15, 30, 30, 126), // s_andn2_b64 s30, s30, exec
       EncodeSopp(0x04, 2),           // scc0 -> other arm, else shared arm
@@ -8386,15 +8361,6 @@ void TestNewShaderRecompilerCfgExecSccSharedArm() {
         "shared-arm fixture already duplicated a semantic instruction");
   Check(ShaderRecompiler::CFG::Structurize(graph),
         graph.unsupported_reason.c_str());
-  uint32_t route_selects = 0;
-  uint32_t route_sets = 0;
-  for (const auto &block : graph.blocks) {
-    route_selects += block.terminator.condition ==
-                     ShaderRecompiler::CFG::BranchCondition::GotoVariable;
-    route_sets += block.terminator.goto_value >= 0;
-  }
-  Check(graph.blocks.size() == 5u && route_selects == 0u && route_sets == 0u,
-        "shared return arm introduced synthetic routing state");
   Check(CfgInstructionCoverage(graph, decoded.instructions.size()) ==
             original_coverage,
         "EXEC/SCC shared-arm structurization changed semantic coverage");
@@ -8437,7 +8403,7 @@ void TestSharedReturnPreservesDescriptorDominance() {
         graph.unsupported_reason.c_str());
   const auto *overwrite = graph.FindBlockByPc(0x10u);
   const auto *body = graph.FindBlockByPc(0x20u);
-  Check(graph.blocks.size() == 5u && overwrite != nullptr && body != nullptr &&
+  Check(overwrite != nullptr && body != nullptr &&
             graph.Dominates(overwrite->id, body->id) &&
             std::ranges::count_if(graph.blocks, [](const auto &block) {
               return block.terminator.kind ==
@@ -8463,6 +8429,78 @@ void TestSharedReturnPreservesDescriptorDominance() {
             result.resources.buffers.size() == 1u &&
             result.resources.buffers[0].dwords[0] == 0x2000u,
         "return-only descriptor reached the surviving buffer operation");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestCfgSiblingSharedExit() {
+  // f7030726b9470dd8: a nested exit on one side and two exits on the
+  // other side share an epilogue, separate from the normal return.
+  const uint32_t shader[] = {
+      EncodeSopc(0x06, 0, 128), EncodeSopp(0x04, 5), // right or left
+      EncodeSopc(0x06, 1, 128), EncodeSopp(0x04, 2), // join or nested exit
+      EncodeSopc(0x06, 2, 128), EncodeSopp(0x04, 7), // shared exit
+      EncodeSopp(0x02, 4),                         // left -> main
+      EncodeSopc(0x06, 3, 128), EncodeSopp(0x04, 4), // right -> shared exit
+      EncodeSopc(0x06, 4, 128), EncodeSopp(0x04, 2), // second shared exit
+      EncodeSMovB32(5, 129), EncodeSopp(0x01),       // main and normal return
+      EncodeSMovB32(5, 130), EncodeSopp(0x01),       // shared exit epilogue
+  };
+  using namespace ShaderRecompiler;
+  Decoder::Program decoded;
+  Decoder::DecodeProgram(std::span{shader}, decoded);
+  const auto original = CFG::BuildGraph(decoded);
+  auto structured = original;
+  Check(CFG::Structurize(structured), structured.unsupported_reason.c_str());
+  Check(CfgInstructionCoverage(structured, decoded.instructions.size()) ==
+            CfgInstructionCoverage(original, decoded.instructions.size()),
+        "shared sibling exit duplicated or dropped guest instructions");
+  const auto trace = [&](const CFG::Graph &graph, uint32_t decisions) {
+    std::vector<uint32_t> executed;
+    std::vector<bool> variables(original.blocks.size() * 2);
+    const auto expression = [&](auto &&self, uint32_t index) -> bool {
+      const auto &value = graph.expressions.at(index);
+      switch (value.op) {
+      case CFG::ConditionExpression::Op::Constant: return value.lhs != 0;
+      case CFG::ConditionExpression::Op::Variable: return variables.at(value.lhs);
+      case CFG::ConditionExpression::Op::Native: std::abort();
+      case CFG::ConditionExpression::Op::Not: return !self(self, value.lhs);
+      case CFG::ConditionExpression::Op::Or:
+        return self(self, value.lhs) || self(self, value.rhs);
+      }
+      std::abort();
+    };
+    auto current = graph.entry_block;
+    for (unsigned steps = 0; steps < 100; ++steps) {
+      const auto &block = graph.blocks.at(current);
+      for (auto inst = block.inst_begin; inst < block.inst_end; ++inst)
+        executed.push_back(inst);
+      for (const auto &assignment : block.assignments) {
+        variables.at(assignment.variable) =
+            graph.expressions[assignment.expression].op == CFG::ConditionExpression::Op::Native
+                ? (decisions & (1u << (assignment.variable - original.blocks.size()))) != 0
+                : expression(expression, assignment.expression);
+      }
+      const auto &term = block.terminator;
+      if (term.kind == CFG::TerminatorKind::Return) return executed;
+      Check(term.kind == CFG::TerminatorKind::Branch ||
+                term.kind == CFG::TerminatorKind::ConditionalBranch,
+            "shared exit trace has an unsupported terminator");
+      const bool condition = term.expression != UINT32_MAX
+                                 ? expression(expression, term.expression)
+                                 : (decisions & (1u << block.id)) != 0;
+      current = term.kind == CFG::TerminatorKind::Branch || condition
+                    ? term.true_block : term.false_block;
+    }
+    Check(false, "shared exit trace did not terminate");
+    return executed;
+  };
+  for (uint32_t decisions = 0; decisions < (1u << original.blocks.size()); ++decisions)
+    Check(trace(original, decisions) == trace(structured, decisions),
+          "goto elimination changed the executed shared-exit path");
+  auto result = RecompileForTest(shader, MakeCompileOptions(ShaderType::Compute));
+  Check(!result.program.dispatcher_fallback &&
+            SpirvInstructionOpcodeCount(result.spirv, 251) == 0,
+        "shared sibling exit selected dispatcher lowering");
   CheckSpirvBinaryValidates(result.spirv);
 }
 
@@ -8499,17 +8537,6 @@ void TestNewShaderRecompilerCfgNestedTailEarlyExit() {
   Check(CfgInstructionCoverage(graph, decoded.instructions.size()) ==
             original_coverage,
         "nested-tail routing changed semantic instruction coverage");
-  Check(std::ranges::count_if(
-            graph.blocks,
-            [](const auto &block) {
-              return block.terminator.condition ==
-                     ShaderRecompiler::CFG::BranchCondition::GotoVariable;
-            }) == 1u &&
-            std::ranges::count_if(graph.blocks,
-                                  [](const auto &block) {
-                                    return block.terminator.goto_value >= 0;
-                                  }) == 3u,
-        "nested-tail early exit did not use typed route state");
 
   auto options = MakeCompileOptions(ShaderType::Pixel);
   options.dump_ir = true;
@@ -8549,17 +8576,6 @@ void TestNewShaderRecompilerCfgSharedReturnAfterNestedSelections() {
   Check(CfgInstructionCoverage(graph, decoded.instructions.size()) ==
             original_coverage,
         "shared-exit route ordering changed semantic instruction coverage");
-  const auto route_selects =
-      std::ranges::count_if(graph.blocks, [](const auto &block) {
-        return block.terminator.condition ==
-               ShaderRecompiler::CFG::BranchCondition::GotoVariable;
-      });
-  const auto route_sets =
-      std::ranges::count_if(graph.blocks, [](const auto &block) {
-        return block.terminator.goto_value >= 0;
-      });
-  Check(route_selects == 0u && route_sets == 0u,
-        "nested selections introduced routing state for a shared return");
 
   auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
@@ -8628,7 +8644,6 @@ void TestNewShaderRecompilerCfgLoopSharedRegion() {
   ShaderRecompiler::Decoder::DecodeProgram(std::span{shader}, decoded);
   ShaderRecompiler::CFG::Graph graph;
   graph = ShaderRecompiler::CFG::BuildGraph(decoded);
-  const auto original_block_count = graph.blocks.size();
   const auto original_coverage =
       CfgInstructionCoverage(graph, decoded.instructions.size());
   Check(graph.natural_loops.size() == 1u,
@@ -8641,18 +8656,8 @@ void TestNewShaderRecompilerCfgLoopSharedRegion() {
             loop_header->terminator.continue_block != UINT32_MAX,
         "loop shared-region routing did not preserve the natural loop");
 
-  uint32_t route_selects = 0;
-  uint32_t route_sets = 0;
-  for (const auto &block : graph.blocks) {
-    route_selects += block.terminator.condition ==
-                     ShaderRecompiler::CFG::BranchCondition::GotoVariable;
-    route_sets += block.terminator.goto_value >= 0;
-  }
-  Check(route_selects == 1u && route_sets == 3u &&
-            graph.blocks.size() >= original_block_count + 5u &&
-            CfgInstructionCoverage(graph, decoded.instructions.size()) ==
-                original_coverage,
-        "loop shared region was not routed without semantic duplication");
+  Check(CfgInstructionCoverage(graph, decoded.instructions.size()) == original_coverage,
+        "loop shared region changed guest instruction coverage");
 
   auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
@@ -8701,11 +8706,6 @@ void TestNewShaderRecompilerCfgSharedRegionBeforeEarlyBreakLoop() {
         graph.unsupported_reason.c_str());
   Check(graph.natural_loops.size() == 1u && graph.back_edges.size() == 1u,
         "selection routing introduced a cycle around a structured loop exit");
-  Check(std::ranges::count_if(graph.blocks, [](const auto &block) {
-          return block.terminator.condition ==
-                 ShaderRecompiler::CFG::BranchCondition::GotoVariable;
-        }) == 1u,
-        "shared-region routing rewrote unrelated loop-control branches");
   Check(CfgInstructionCoverage(graph, decoded.instructions.size()) ==
             original_coverage,
         "shared-region/early-break routing changed semantic coverage");
@@ -8770,17 +8770,6 @@ void TestNewShaderRecompilerCfgOverlappingEarlyExitLadder() {
         "early-exit ladder routing changed semantic instruction coverage");
   Check(graph.blocks.size() > original_block_count,
         "early-exit ladder routing did not add forwarding blocks");
-  const auto route_selects =
-      std::ranges::count_if(graph.blocks, [](const auto &block) {
-        return block.terminator.condition ==
-               ShaderRecompiler::CFG::BranchCondition::GotoVariable;
-      });
-  const auto route_sets =
-      std::ranges::count_if(graph.blocks, [](const auto &block) {
-        return block.terminator.goto_value >= 0;
-      });
-  Check(route_selects != 0u && route_sets >= 3u,
-        "early-exit ladder lacks explicit typed route state");
 
   auto options = MakeCompileOptions(ShaderType::Pixel);
   options.dump_ir = true;
@@ -8818,17 +8807,6 @@ void TestNewShaderRecompilerCfgNestedEarlyExitSharedTerminal() {
   Check(CfgInstructionCoverage(graph, decoded.instructions.size()) ==
             original_coverage,
         "nested early-exit structurization changed semantic coverage");
-  const auto route_selects =
-      std::ranges::count_if(graph.blocks, [](const auto &block) {
-        return block.terminator.condition ==
-               ShaderRecompiler::CFG::BranchCondition::GotoVariable;
-      });
-  const auto route_sets =
-      std::ranges::count_if(graph.blocks, [](const auto &block) {
-        return block.terminator.goto_value >= 0;
-      });
-  Check(route_selects == 1u && route_sets == 3u,
-        "nested early exit lacks complete typed route state");
 
   auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
@@ -8873,12 +8851,6 @@ void TestNewShaderRecompilerCfgEarlyReturnSharedLoopContinuation() {
                 original_coverage &&
             graph.natural_loops.size() == 2u,
         "shared-continuation gateway changed semantic blocks or the loops");
-  Check(std::ranges::none_of(graph.blocks,
-                             [](const auto &block) {
-                               return block.terminator.goto_variable !=
-                                      UINT32_MAX;
-                             }),
-        "private early return introduced unnecessary routing state");
 
   auto options = MakeCompileOptions(ShaderType::Compute);
   auto result = RecompileForTest(shader, options);
@@ -13629,13 +13601,13 @@ int main() {
   TestNewShaderRecompilerCfgSharedOuterAndLoopMerge();
   TestNewShaderRecompilerCfgLoopExitSharedWithSelection();
   TestNewShaderRecompilerCfgLoopEarlyBreakNoSelection();
-  TestNewShaderRecompilerCfgNestedLoopNonlocalExitDispatcher();
+  TestNewShaderRecompilerCfgNestedLoopNonlocalExitStructured();
   TestNewShaderRecompilerCfgNestedLoopLocalExitNoSelection();
   TestNewShaderRecompilerCfgNestedLoopExitTailMergeSplit();
-  TestNewShaderRecompilerCfgMixedContinueNonmergeExitDispatcher();
+  TestNewShaderRecompilerCfgMixedContinueNonmergeExitStructured();
   TestNewShaderRecompilerCfgConditionalLatchNoSelection();
   TestNewShaderRecompilerCfgDirectConditionalLatchNoSelection();
-  TestNewShaderRecompilerCfgLoopEarlyContinuesNoSelection();
+  TestNewShaderRecompilerCfgLoopEarlyContinuesStructured();
   TestNewShaderRecompilerCfgLoopGatewaySelection();
   TestNewShaderRecompilerCfgConditionalLoopHeaderSelection();
   TestNewShaderRecompilerCfgMultipleLoopLatches();
@@ -13643,6 +13615,7 @@ int main() {
   TestNewShaderRecompilerCfgNestedEarlyExitLoopForwarders();
   TestNewShaderRecompilerCfgExecSccSharedArm();
   TestSharedReturnPreservesDescriptorDominance();
+  TestCfgSiblingSharedExit();
   TestNewShaderRecompilerCfgNestedTailEarlyExit();
   TestNewShaderRecompilerCfgSharedReturnAfterNestedSelections();
   TestNewShaderRecompilerCfgAlternatingSharedReturns();

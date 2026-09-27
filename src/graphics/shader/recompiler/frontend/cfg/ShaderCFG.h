@@ -18,8 +18,15 @@ enum class BranchCondition {
 	ExecZero,
 	ExecNonZero,
 	ScalarInstruction,
-	GotoVariable,
+	Expression,
 	Unknown
+};
+
+struct ConditionExpression {
+	enum class Op { Constant, Variable, Native, Not, Or };
+	Op       op;
+	uint32_t lhs;
+	uint32_t rhs = UINT32_MAX;
 };
 
 enum class TerminatorKind { Branch, ConditionalBranch, IndirectBranch, Return, Unsupported };
@@ -48,8 +55,7 @@ struct Terminator {
 	std::vector<uint32_t> indirect_targets;
 	std::vector<uint32_t> indirect_selector_values;
 	std::vector<uint32_t> indirect_selector_targets;
-	uint32_t              goto_variable = UINT32_MAX;
-	int32_t               goto_value    = -1;
+	uint32_t              expression    = UINT32_MAX;
 	bool                  loop_header   = false;
 };
 
@@ -59,6 +65,8 @@ struct BasicBlock {
 	uint32_t              end_pc     = 0;
 	uint32_t              inst_begin = 0;
 	uint32_t              inst_end   = 0;
+	struct Assignment { uint32_t variable; uint32_t expression; };
+	std::vector<Assignment> assignments;
 	std::vector<uint32_t> predecessors;
 	std::vector<uint32_t> successors;
 	std::vector<uint32_t> dominators;
@@ -89,6 +97,7 @@ struct StronglyConnectedComponent {
 
 struct Graph {
 	std::vector<BasicBlock>                 blocks;
+	std::vector<ConditionExpression>        expressions;
 	std::vector<BackEdge>                   back_edges;
 	std::vector<NaturalLoop>                natural_loops;
 	std::vector<StronglyConnectedComponent> components;

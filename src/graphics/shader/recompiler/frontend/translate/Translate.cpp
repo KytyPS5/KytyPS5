@@ -746,55 +746,61 @@ void Translator::WriteCompareResult(const Decoder::Operand& operand, IR::U1 valu
 	WriteMask(operand, ir.LogicalAnd(ir.GetExec(), value));
 }
 
-void Translator::AddBranchCondition(const CFG::BasicBlock& source, IR::BlockInfo& info) {
-	if (source.terminator.goto_value >= 0) {
-		if (source.terminator.goto_variable == UINT32_MAX) {
-			EXIT("block %u sets an invalid goto variable", source.id);
+void Translator::AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlock& source,
+                                    IR::BlockInfo& info) {
+	const auto native_condition = [&](CFG::BranchCondition kind) -> IR::U1 {
+		IR::U1 condition;
+		switch (kind) {
+			case CFG::BranchCondition::Always: condition = IR::U1(IR::Value(true)); break;
+			case CFG::BranchCondition::SccZero: condition = ir.LogicalNot(ir.GetScc()); break;
+			case CFG::BranchCondition::SccNonZero: condition = ir.GetScc(); break;
+			case CFG::BranchCondition::VccZero: condition = ir.LogicalNot(ir.GetVcc()); break;
+			case CFG::BranchCondition::VccNonZero: condition = ir.GetVcc(); break;
+			case CFG::BranchCondition::ExecZero: condition = ir.LogicalNot(ir.GetExec()); break;
+			case CFG::BranchCondition::ExecNonZero: condition = ir.GetExec(); break;
+			case CFG::BranchCondition::ScalarInstruction:
+				EXIT_IF(instruction_branch_condition.IsEmpty());
+				condition = instruction_branch_condition;
+				break;
+			default: EXIT("block %u has an invalid native branch condition", source.id);
 		}
-		ir.SetGotoVariable(source.terminator.goto_variable,
-		                   IR::U1(IR::Value(source.terminator.goto_value != 0)));
+		return IR::U1(ir.Emit(IR::ValueOpcode::ConditionRef, {condition}, kind));
+	};
+	const auto expression = [&](auto&& self, uint32_t index) -> IR::U1 {
+		const auto& value = graph.expressions.at(index);
+		switch (value.op) {
+			case CFG::ConditionExpression::Op::Constant: return IR::U1(IR::Value(value.lhs != 0));
+			case CFG::ConditionExpression::Op::Variable: return ir.GetGotoVariable(value.lhs);
+			case CFG::ConditionExpression::Op::Native:
+				return native_condition(static_cast<CFG::BranchCondition>(value.lhs));
+			case CFG::ConditionExpression::Op::Not: return ir.LogicalNot(self(self, value.lhs));
+			case CFG::ConditionExpression::Op::Or:
+				return ir.LogicalOr(self(self, value.lhs), self(self, value.rhs));
+		}
+		EXIT("invalid CFG condition expression");
+	};
+	for (const auto& assignment: source.assignments) {
+		ir.SetGotoVariable(assignment.variable, expression(expression, assignment.expression));
 	}
-	if (source.terminator.kind == CFG::TerminatorKind::IndirectBranch) {
-		if (source.terminator.indirect_selector_code != UINT32_MAX) {
-			info.indirect_target = ReadScalarCode(source.terminator.indirect_selector_code);
-		} else if (source.terminator.indirect_pc_sgpr != UINT32_MAX) {
-			info.indirect_target =
-			    ir.GetScalarReg(static_cast<IR::ScalarReg>(source.terminator.indirect_pc_sgpr));
+	const auto& term = source.terminator;
+	if (term.kind == CFG::TerminatorKind::IndirectBranch) {
+		if (term.indirect_selector_code != UINT32_MAX) {
+			info.indirect_target = ReadScalarCode(term.indirect_selector_code);
+		} else if (term.indirect_pc_sgpr != UINT32_MAX) {
+			info.indirect_target = ir.GetScalarReg(static_cast<IR::ScalarReg>(term.indirect_pc_sgpr));
 		} else {
 			EXIT("block %u has no indirect branch selector", source.id);
 		}
 		ir.Emit(IR::ValueOpcode::ReferenceU32, {info.indirect_target});
 		return;
 	}
-	if (source.terminator.kind != CFG::TerminatorKind::ConditionalBranch) {
-		return;
+	if (term.kind == CFG::TerminatorKind::ConditionalBranch) {
+		const auto condition = term.expression != UINT32_MAX
+		                           ? expression(expression, term.expression)
+		                           : native_condition(term.condition);
+		info.condition = condition;
+		ir.Emit(IR::ValueOpcode::Reference, {condition});
 	}
-	// EXEC and VCC are invocation-local Boolean masks. Branching on that Boolean lets inactive
-	// invocations leave the region without reconstructing a host-subgroup mask.
-	IR::U1 condition;
-	switch (source.terminator.condition) {
-		case CFG::BranchCondition::Always: condition = IR::U1(IR::Value(true)); break;
-		case CFG::BranchCondition::SccZero: condition = ir.LogicalNot(ir.GetScc()); break;
-		case CFG::BranchCondition::SccNonZero: condition = ir.GetScc(); break;
-		case CFG::BranchCondition::VccZero: condition = ir.LogicalNot(ir.GetVcc()); break;
-		case CFG::BranchCondition::VccNonZero: condition = ir.GetVcc(); break;
-		case CFG::BranchCondition::ExecZero: condition = ir.LogicalNot(ir.GetExec()); break;
-		case CFG::BranchCondition::ExecNonZero: condition = ir.GetExec(); break;
-		case CFG::BranchCondition::ScalarInstruction:
-			EXIT_IF(instruction_branch_condition.IsEmpty());
-			condition = instruction_branch_condition;
-			break;
-		case CFG::BranchCondition::GotoVariable:
-			if (source.terminator.goto_variable == UINT32_MAX) {
-				EXIT("block %u reads an invalid goto variable", source.id);
-			}
-			condition = ir.GetGotoVariable(source.terminator.goto_variable);
-			break;
-		case CFG::BranchCondition::Unknown:
-			EXIT("block %u has an unknown branch condition", source.id);
-	}
-	info.condition = condition;
-	ir.Emit(IR::ValueOpcode::Reference, {condition});
 }
 
 namespace {
@@ -1297,7 +1303,7 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			}
 			translator.TranslateInstruction(instruction);
 		}
-		translator.AddBranchCondition(cfg_block, result.block_info[typed_index]);
+		translator.AddBranchCondition(cfg, cfg_block, result.block_info[typed_index]);
 	}
 	IR::ValidateProgram(result, false);
 	return result;

@@ -17721,15 +17721,22 @@ TestCase ScalarSaveExecOps() {
   AppendStoreSgpr(&code, 253, 12);
   AppendEnd(&code);
 
-  return {"ScalarSaveExecOps",
-          code,
-          {},
-          {1, 0, 1, 0, 0xffffffffu, 0xffffffffu, 0xffffffffu,
-           3, 0xffffffffu, 3, 2, 0xffffffffu, 1},
-          {O::S_MOV_B32, O::S_AND_SAVEEXEC_B64, O::S_ORN2_SAVEEXEC_B64,
-           O::S_ANDN1_SAVEEXEC_B64, O::S_AND_SAVEEXEC_B32,
-           O::S_ANDN1_SAVEEXEC_B32, O::S_MOV_B64, O::V_MOV_B32,
-           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  TestCase test;
+  test.name = "ScalarSaveExecOps";
+  test.code = code;
+  // A full wave enters with EXEC set for all 64 lanes, so the two saved EXEC
+  // pairs are 0xffffffff/0xffffffff rather than the 1/0 a single-invocation
+  // dispatch would report.
+  test.expected = {0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu,
+                   0xffffffffu, 0xffffffffu, 0xffffffffu, 3, 0xffffffffu,
+                   3, 2, 0xffffffffu, 1};
+  test.opcodes = {O::S_MOV_B32, O::S_AND_SAVEEXEC_B64, O::S_ORN2_SAVEEXEC_B64,
+                  O::S_ANDN1_SAVEEXEC_B64, O::S_AND_SAVEEXEC_B32,
+                  O::S_ANDN1_SAVEEXEC_B32, O::S_MOV_B64, O::V_MOV_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 64;
+  test.has_compute_info = true;
+  return test;
 }
 
 TestCase ScalarOrn2SaveexecUsesSourceOrNotExec() {
@@ -17749,12 +17756,18 @@ TestCase ScalarOrn2SaveexecUsesSourceOrNotExec() {
   AppendStoreSgpr(&code, 253, 4);
   AppendEnd(&code);
 
-  return {"ScalarOrn2SaveexecUsesSourceOrNotExec",
-          code,
-          {},
-          {0x0000000cu, 0x80000000u, 0xfffffff3u, 0x7fffffffu, 1},
-          {O::S_MOV_B32, O::S_ORN2_SAVEEXEC_B64, O::S_MOV_B64, O::V_MOV_B32,
-           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  TestCase test;
+  test.name = "ScalarOrn2SaveexecUsesSourceOrNotExec";
+  test.code = code;
+  test.expected = {0x0000000cu, 0x80000000u, 0xfffffff3u, 0x7fffffffu, 1};
+  test.opcodes = {O::S_MOV_B32, O::S_ORN2_SAVEEXEC_B64, O::S_MOV_B64, O::V_MOV_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  // The case reads a whole 64-bit EXEC mask, so it needs a populated subgroup.
+  // A 1x1x1 dispatch leaves OpGroupNonUniformBallot with a single invocation
+  // and every lane above zero reads back as zero.
+  test.compute_info.threads_num[0] = 64;
+  test.has_compute_info = true;
+  return test;
 }
 
 TestCase ScalarOrn2SaveexecB32(u32 wave_size, u32 threads) {

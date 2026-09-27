@@ -1,8 +1,105 @@
 # Emulator regression test debt
 
+## Restored RO aligned-upload regression source (2026-09-27)
+
+The historical RED/GREEN logs existed but the selector implementation had been
+lost from the worktree. Restored `--storage-buffer-ro-aligned-upload-only` now
+checks the real renderer binding and copies its upload bytes back from Vulkan.
+The unchanged fixture fails with `HEAD` descriptors at guest offset 2
+(`_Build/logs/ro-align-restored-red-20260927.txt`, exit 321, unsupported rebase)
+and passes with the preserved WIP implementation
+(`ro-align-restored-green-20260927.txt`, exit 0). Offsets 1/2/3 and zero padding
+are covered; neighboring byte-offset binding and rejection tests pass. Pending:
+independent GPU-dirty read-only negative fixture. A hash-only cross-ProgramKey
+SPIR-V reuse experiment was removed before commit because it omitted binary
+equality; the existing collision-checked sibling permutation reuse remains.
+
+## Runtime sampler binding in synthetic GPU cases (2026-09-27)
+
+Existing `ImageSampleR128DynamicMaterialPairs` numerical RED:
+`_Build/runs/synthetic-image-20260927-routing/00000/stderr.txt` expects
+`[80,8,20,2]` but receives `[80,8,80,8]`. The harness ignores its
+`use_runtime_samplers` flag and binds a single ClampToEdge sampler. Before
+using these fixtures as emulator evidence, bind each materialized sampler
+through the runtime sampler cache and rerun the unchanged numerical oracle.
+Static sampler coverage must remain green; no production sampler change is
+justified by this harness failure.
+
+GREEN: `_Build/runs/synthetic-image-20260927-runtime-samplers-green/report.json`
+passes both unchanged numerical fixtures (2/2) with runtime samplers bound.
+
+## Graphics wave64 emitter routing on subgroup32 (2026-09-27)
+
+Before changing collective emission, prove a CPU SPIR-V regression for the
+existing graphics partition contract: a Vertex wave64 module on native32 must
+route ballot through the shared partition helper and normalize shuffle targets
+to native lanes. Cover Pixel too and leave compute/dual-context wave64 paths
+unchanged. This restores existing partition behavior; it does not establish
+true cross-subgroup graphics wave64 equivalence. The captured vertex mask
+clearing loop suggests this missing routing can prevent termination; that
+runtime attribution requires a bounded game retry and source/menu evidence.
+
+Confirmed CPU RED: `_Build/logs/graphics-wave64-red-20260927.txt.stderr`
+reports `graphics wave64 shuffle target bypassed native32 normalization`.
+The unchanged selector passes after restoring shared helper routing:
+`graphics-wave64-green-20260927.txt` (native Windows, exit 0).
+Neighboring partitioned graphics loop, cooperative collective functions and
+split-wave64 swizzle/ballot selectors pass. Game attribution remains pending.
+
+## Homogeneous indirect image sampling: opaque SSA validation (2026-09-27)
+
+Required regression before correcting the uncommitted sampling optimization:
+`shader_recompiler_compute_tests --homogeneous-indirect-image-validation-only`.
+Two independent same-dimension float image candidates must emit valid Vulkan
+SPIR-V and preserve candidate selection. `OpSampledImage` results cannot be
+merged through `OpPhi`; sample in each branch and merge numerical results.
+The CPU selector validates SPIR-V without initializing the GPU. Keep existing
+heterogeneous dimension/numeric coverage and require GPU candidate readback
+before claiming the 250-candidate game draw is fixed. Menu remains pending.
+
 This file records regression coverage deferred during fast launch bring-up. Each item
 describes a guest contract rather than a title-specific workaround. Deferred tests must
 be added before the corresponding fixes are proposed upstream.
+
+## Workgroup-axis bounded SRT pipeline identity
+
+Status: GREEN materialization contract (26 September 2026); game still sees
+remaining `SpecializationMiss` from **non-workgroup** columns.
+
+Game evidence `…-212219-presentprobe-gpuav` (LOGF tip): CS `54904fb419d79e49`
+`SpecializationMiss` ×3 with `bounded_srt[2..4]` counts `16→14→19→11` (and
+matching flat-offset shifts). Columns `[0],[1]` stay `count=1`; `[5],[6]` stay
+`0`. `ProgramKeySplit=0` for this hash. Workgroup-axis reserve is therefore
+insufficient alone — selector/count-source layout counts still splinter
+CreatePipeline identity (cold GPUAV ≈270s/variant; warm cache hides cost).
+
+Contract (extended): count-source / selector-sourced bounded columns need a
+stable layout upper bound (or non-module-affecting count) so dispatch-varying
+live sizes do not create new SPIR-V, matching the workgroup-axis reserve
+rule. Live words still fill only the used prefix.
+
+GREEN (workgroup only): `resource_tracking_tests --workgroup-srt-materialization-only`
+→ `KYTY_WORKGROUP_SRT_MATERIALIZATION_PASS`. Selector-stable reserve: RED pending.
+
+## VS indirect-image expansion DeviceLost (~shown=191)
+
+Status: failing draw identified; cause not established. The attempted opaque
+SSA optimization failed CPU validation on 27 September and was removed.
+
+SyncDiag + GPUAV8: DeviceLost on first draw using VS `0xe3125617f3efc38f`
+(guest ES `0x803f946a00`) with PS `0x803fe78e00`, indexed count=119856.
+SpecializationCompile: `images=251 sampled_pairs=250`,
+`indirect_search_iterations=9`. Neighboring VS specialize with `images=0`.
+Prior same-PS draws with ES `0x803fba0000` complete. Menu blocked here.
+
+Contract: preserve candidate selection and valid Vulkan SPIR-V. Opaque
+`OpSampledImage` values cannot be merged by `OpPhi` or consumed across blocks.
+The existing per-candidate sampling switch remains until a legal alternative
+has independent validation and numerical GPU coverage. The CPU-only
+`--homogeneous-indirect-image-validation-only` proves the attempted variant
+invalid and passes with numerical result merging restored. Logs:
+`_Build/logs/homogeneous-image-red2-20260927.txt.stderr` and
+`homogeneous-image-green2-20260927.txt`. This does not prove the draw fixed.
 
 ## Current Windows regression status after branch reconciliation
 
@@ -839,8 +936,12 @@ Required tests:
   multiple atomics in one straight-line shader, and atomic results consumed by wave
   collectives without changing their lane ownership.
 - Rejection cases for a live atomic result controlling a divergent branch, cyclic atomic
-  feedback, LDS atomics, cooperative scheduling, and partitioned multiwave workgroups until
+  feedback, cooperative scheduling, and partitioned multiwave workgroups until
   their separate ordering and publication contracts have executable coverage.
+  Acyclic single-wave LDS and GDS integer atomic returns are covered by
+  `--single-wave64-lds-atomic-return-only`,
+  `--single-wave64-gds-atomic-admission-only`, and
+  `--gds-atomic-add-return-wave64-only`.
 - Native Windows audit and SPIR-V validation of the captured shader class, followed by a
   bounded game run beyond the original shader-admission failure.
 
@@ -1358,8 +1459,9 @@ Remaining validation:
 
 ## GPUAV-sensitive NVIDIA pipeline cache identity
 
-Status: runtime workaround documented; shared cache identity regression and fix
-remain pending.
+Status: **shared identity fixed** (KytyPC3 + separate `{TITLE}-core.bin` /
+`{TITLE}-gpuav.bin`). No-GPUAV game retry after cool-down still required to
+confirm early graphics pipeline with a clean core cache.
 
 Two bounded runs using a cache warmed under GPUAV-lite but launching without
 GPUAV fail at frame 12/13 inside NVIDIA `nvgpucomp64.dll` 32.0.16.1664 with
@@ -1368,15 +1470,20 @@ same module offset. The instrumented GPUAV-lite path continues to the later
 emulator frontiers. Driver cache blobs from GPUAV-lite and non-GPUAV attempts are
 therefore preserved under separate filenames and must not be mixed.
 
-Required tests:
+Tests:
 
-- Add a CPU cache-signature regression proving shader instrumentation/validation
-  mode participates in compatibility whenever the layer can change modules seen
-  by the driver.
+- GREEN: `shader_cfg_tests --pipeline-cache-validation-mode-only` →
+  `KYTY_PIPELINE_CACHE_VALIDATION_MODE_PASS` (distinct filenames; core vs GPUAV
+  signatures incompatible; self-compatible). Neighbors
+  `--pipeline-cache-revision-only` / `--pipeline-cache-identity-only`.
 - Keep the native driver reproduction bounded and do not repeatedly crash the
   compiler merely to test cache loading.
-- Re-enable a no-GPUAV fast profile only after the cache identity is separated
-  and a clean-cache run passes the early graphics pipeline.
+- Next: after a long DeviceLost cool-down (GPUAV+instr recovers; core/noval and
+  GPUAV-lite still abort in `vkCreateComputePipelines` for CS `0xb90e…` with
+  `exit=-2147483645` for ≥12m), run no-GPUAV `ContinueAfterColored` with empty
+  `_PipelineCache/PPSA26344-core.bin`. Do not load the legacy mixed
+  `PPSA26344.bin`. Separately, consider tagging shader-instrumentation in the
+  cache identity (lite vs instr currently share `-gpuav.bin`).
 
 ## GFX10 MUBUF opcode 0x87 runtime frontier
 
@@ -1428,6 +1535,14 @@ Remaining validation:
   `done` at Kill. ReadbackStart=240 never reached (`sawColored=false`).
 - After `/STACK:16777216` + SPIR-V permutation reuse (`…-093517`): reached
   **shown=197**, then Fatal `MaterializeResources` (exit 321). Menu still pending.
+- Dense buffer limit: raise shared `ShaderInfo::MaxBuffers` 64→128→512 (device
+  DescriptorBudget remains the hard gate). `…-112601` cleared densify then hit
+  RO SSBO host `adjustment=2` (`storage buffer offset adjustment is unsupported`).
+- Shared RO realign: `NativeStorageBuffer` stages Upload when dword-indexed SSBO
+  has byte host adj and `read && !written && !atomic` (non-GPU-dirty). RED/GREEN:
+  `shader_recompiler_compute_tests --storage-buffer-ro-aligned-upload-only`
+  (`_Build/logs/ro-align-{red,green}.out.txt`). Writable/atomic/GPU-dirty stay
+  fail-closed. Long run after this tip: `…-120514-presentfix-gpuav` in progress.
 - Debt for shared fix: print/use `LastResourceSpecializationError` on that Fatal;
   continue specialization-stable pipeline identity / smaller SPIR-V under GPUAV —
   not a title branch and not “merge #718 first”.

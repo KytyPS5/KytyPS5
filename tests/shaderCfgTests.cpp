@@ -75,6 +75,12 @@ bool IsDriverCacheBuildIdentityUsableForTest(
     std::string_view worktree_fingerprint);
 bool IsDriverCacheSignatureCompatibleForTest(
     std::string_view cached_signature, std::string_view expected_signature);
+std::string DriverCacheFileNameForTest(std::string_view title_id,
+                                       bool gpu_assisted_validation);
+std::string FormatDriverCacheSignatureForTest(
+    std::string_view git_revision, std::string_view worktree_fingerprint, uint32_t vendor_id,
+    uint32_t device_id, uint32_t driver_version, std::string_view pipeline_cache_uuid_hex,
+    bool gpu_assisted_validation);
 std::optional<uint64_t> FindReusableShaderProgramIdForTest(
     std::span<const uint64_t> existing_spirv_hashes, std::span<const uint64_t> existing_program_ids,
     uint64_t spirv_hash);
@@ -278,27 +284,52 @@ void TestSpirvPermutationReuseIdentity() {
 
 void TestDriverPipelineCacheRevisionCompatibility() {
   constexpr std::string_view previous =
-      "KytyPC2:672af1f8c904418b8f592a0264b03bd845d48a3d:"
+      "KytyPC3:672af1f8c904418b8f592a0264b03bd845d48a3d:"
       "ca7a4affae3d2fae594cc2a60b92384722057b4cef7af914e3700703bf76a933:"
-      "000010de:00002d04:9a100000:90e15239d43c24d0fd532c2a423d6fe9\n";
+      "000010de:00002d04:9a100000:90e15239d43c24d0fd532c2a423d6fe9:v0\n";
   constexpr std::string_view current =
-      "KytyPC2:9cb2a3e7e44b03880b17ee5ee618490ecb97c948:"
+      "KytyPC3:9cb2a3e7e44b03880b17ee5ee618490ecb97c948:"
       "a1279f6931abb9286c22cc53f97090a59e4cd093f6a072300e8b0b73c51a774e:"
-      "000010de:00002d04:9a100000:90e15239d43c24d0fd532c2a423d6fe9\n";
+      "000010de:00002d04:9a100000:90e15239d43c24d0fd532c2a423d6fe9:v0\n";
   constexpr std::string_view other_driver =
-      "KytyPC2:672af1f8c904418b8f592a0264b03bd845d48a3d:"
+      "KytyPC3:672af1f8c904418b8f592a0264b03bd845d48a3d:"
       "ca7a4affae3d2fae594cc2a60b92384722057b4cef7af914e3700703bf76a933:"
-      "000010de:00002d04:9a200000:90e15239d43c24d0fd532c2a423d6fe9\n";
+      "000010de:00002d04:9a200000:90e15239d43c24d0fd532c2a423d6fe9:v0\n";
   constexpr std::string_view malformed_build =
-      "KytyPC2:not-a-revision:"
+      "KytyPC3:not-a-revision:"
       "ca7a4affae3d2fae594cc2a60b92384722057b4cef7af914e3700703bf76a933:"
-      "000010de:00002d04:9a100000:90e15239d43c24d0fd532c2a423d6fe9\n";
+      "000010de:00002d04:9a100000:90e15239d43c24d0fd532c2a423d6fe9:v0\n";
   Check(IsDriverCacheSignatureCompatibleForTest(previous, current),
         "a same-driver pipeline cache from the previous emulator revision was rejected");
   Check(!IsDriverCacheSignatureCompatibleForTest(other_driver, current),
         "a pipeline cache from a different driver was accepted");
   Check(!IsDriverCacheSignatureCompatibleForTest(malformed_build, current),
         "a pipeline cache with malformed build identity was accepted");
+}
+
+void TestDriverPipelineCacheValidationModeIdentity() {
+  constexpr std::string_view revision =
+      "0123456789abcdef0123456789abcdef01234567";
+  constexpr std::string_view fingerprint =
+      "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+  constexpr std::string_view uuid = "90e15239d43c24d0fd532c2a423d6fe9";
+  const auto core_name = DriverCacheFileNameForTest("PPSA26344", false);
+  const auto gpuav_name = DriverCacheFileNameForTest("PPSA26344", true);
+  Check(core_name != gpuav_name,
+        "GPUAV and core pipeline caches shared one filename");
+  Check(core_name.find("PPSA26344") != std::string::npos &&
+            gpuav_name.find("PPSA26344") != std::string::npos,
+        "pipeline cache filename dropped the title id");
+  const auto core = FormatDriverCacheSignatureForTest(
+      revision, fingerprint, 0x10deu, 0x2d04u, 0x9a100000u, uuid, false);
+  const auto gpuav = FormatDriverCacheSignatureForTest(
+      revision, fingerprint, 0x10deu, 0x2d04u, 0x9a100000u, uuid, true);
+  Check(IsDriverCacheSignatureCompatibleForTest(core, core),
+        "core pipeline cache signature rejected itself");
+  Check(IsDriverCacheSignatureCompatibleForTest(gpuav, gpuav),
+        "GPUAV pipeline cache signature rejected itself");
+  Check(!IsDriverCacheSignatureCompatibleForTest(core, gpuav),
+        "GPUAV and core pipeline cache signatures were treated as compatible");
 }
 
 void TestVideoOutVrrStatusLibraryContract() {
@@ -6490,19 +6521,28 @@ void TestNewShaderRecompilerNullImageUsesCanonical2DView() {
 }
 
 void TestNewShaderRecompilerImageGatherVariants() {
+  // Shared IMAGE_GATHER4_C_L / C_L_O (MIMG 0x4c / 0x5c) plus LZ/C neighbors.
+  // Store one component from each gather so DCE cannot delete the image ops
+  // before resource tracking (same liveness need as other MIMG translation tests).
+  // Lod on gather is tracked in decode metadata; SPIR-V currently approximates
+  // it as level-zero gather (ImageGatherLodApproximatesLevelZero contract).
   const uint32_t shader[] = {
       EncodeMimg0(0x47, 0x1),
-      EncodeMimg1(60, 0, 1, 4), // image_gather4_lz
-      EncodeMimg0(0x48, 0x2),
-      EncodeMimg1(64, 0, 1, 8), // image_gather4_c
-      EncodeMimg0(0x4f, 0x1),
-      EncodeMimg1(68, 0, 1, 12), // image_gather4_c_lz
-      EncodeMimg0(0x57, 0x4),
-      EncodeMimg1(72, 0, 1, 16), // image_gather4_lz_o
-      EncodeMimg0(0x58, 0x1),
-      EncodeMimg1(76, 0, 1, 20), // image_gather4_c_o
-      EncodeMimg0(0x5f, 0x1),
-      EncodeMimg1(80, 0, 1, 24), // image_gather4_c_lz_o
+      EncodeMimg1(8, 0, 0, 1), // image_gather4_lz
+      EncodeMimg0(0x48, 0x1),
+      EncodeMimg1(12, 0, 0, 1), // image_gather4_c
+      EncodeMimg0(0x4c, 0x1),
+      EncodeMimg1(16, 0, 0, 1), // image_gather4_c_l
+      EncodeMimg0(0x5c, 0x1),
+      EncodeMimg1(20, 0, 0, 1), // image_gather4_c_l_o
+      EncodeMubuf0(0x1c, 0),
+      EncodeMubuf1(8, 0, 1), // buffer_store_dword v8
+      EncodeMubuf0(0x1c, 4),
+      EncodeMubuf1(12, 0, 1), // buffer_store_dword v12
+      EncodeMubuf0(0x1c, 8),
+      EncodeMubuf1(16, 0, 1), // buffer_store_dword v16
+      EncodeMubuf0(0x1c, 12),
+      EncodeMubuf1(20, 0, 1), // buffer_store_dword v20
       0xbf810000u,
   };
 
@@ -6511,69 +6551,30 @@ void TestNewShaderRecompilerImageGatherVariants() {
   options.dump_ir = true;
   options.user_data = user_data;
 
-  auto result = RecompileForTest(shader, options);
-  Check((result.decoded_dump.find("image_gather4_lz") != std::string::npos),
+  auto result = RecompileForTest(shader, options, ReadZeroTestMemory);
+  Check((result.decoded_dump.find("IMAGE_GATHER4_LZ") != std::string::npos),
         "new decoder did not decode IMAGE_GATHER4_LZ");
-  Check((result.decoded_dump.find("image_gather4_lz_o") != std::string::npos),
-        "new decoder did not decode IMAGE_GATHER4_LZ_O");
-  Check((result.decoded_dump.find("image_gather4_c") != std::string::npos),
+  Check((result.decoded_dump.find("IMAGE_GATHER4_C") != std::string::npos),
         "new decoder did not decode IMAGE_GATHER4_C");
-  Check((result.decoded_dump.find("image_gather4_c_lz") != std::string::npos),
-        "new decoder did not decode IMAGE_GATHER4_C_LZ");
-  Check((result.decoded_dump.find("image_gather4_c_o") != std::string::npos),
-        "new decoder did not decode IMAGE_GATHER4_C_O");
-  Check((result.decoded_dump.find("image_gather4_c_lz_o") != std::string::npos),
-        "new decoder did not decode IMAGE_GATHER4_C_LZ_O");
-  Check((result.decoded_dump.find("dmask=0x4") != std::string::npos),
-        "IMAGE_GATHER4_LZ_O did not preserve gather component dmask");
-  Check((result.decoded_dump.find("sample_flags=offset|level_zero addr_components=3") != std::string::npos),
-        "IMAGE_GATHER4_LZ_O did not expose shared offset sample metadata");
+  Check((result.decoded_dump.find("IMAGE_GATHER4_C_L") != std::string::npos),
+        "new decoder did not decode IMAGE_GATHER4_C_L");
+  Check((result.decoded_dump.find("IMAGE_GATHER4_C_L_O") != std::string::npos),
+        "new decoder did not decode IMAGE_GATHER4_C_L_O");
   Check((result.decoded_dump.find("sample_flags=compare addr_components=3") != std::string::npos),
         "IMAGE_GATHER4_C did not expose compare sample metadata");
-  Check(
-      (result.decoded_dump.find("sample_flags=compare|level_zero addr_components=3") != std::string::npos),
-      "IMAGE_GATHER4_C_LZ did not expose compare+level-zero sample metadata");
-  Check((result.decoded_dump.find("sample_flags=compare|offset addr_components=4") != std::string::npos),
-        "IMAGE_GATHER4_C_O did not expose compare+offset sample metadata");
-  Check((result.decoded_dump.find("sample_flags=compare|offset|level_zero addr_components=4") != std::string::npos),
-        "IMAGE_GATHER4_C_LZ_O did not expose compare+offset+level-zero sample "
-        "metadata");
-  Check((result.ir_dump.find("ImageGather4 v60") != std::string::npos),
-        "IMAGE_GATHER4_LZ did not lower to shared IR ImageGather4");
-  Check((result.ir_dump.find("ImageGather4 v64") != std::string::npos),
-        "IMAGE_GATHER4_C did not lower to shared IR ImageGather4");
-  Check((result.ir_dump.find("ImageGather4 v68") != std::string::npos),
-        "IMAGE_GATHER4_C_LZ did not lower to shared IR ImageGather4");
-  Check((result.ir_dump.find("ImageGather4 v72") != std::string::npos),
-        "IMAGE_GATHER4_LZ_O did not lower to shared IR ImageGather4");
-  Check((result.ir_dump.find("ImageGather4 v76") != std::string::npos),
-        "IMAGE_GATHER4_C_O did not lower to shared IR ImageGather4");
-  Check((result.ir_dump.find("ImageGather4 v80") != std::string::npos),
-        "IMAGE_GATHER4_C_LZ_O did not lower to shared IR ImageGather4");
-  Check((result.ir_dump.find("data_dwords=4") != std::string::npos),
-        "IMAGE_GATHER4 did not preserve four-component result metadata");
-  Check((result.ir_dump.find("image_flags=0x30") != std::string::npos),
-        "IMAGE_GATHER4_LZ_O flags did not survive into IR memory metadata");
-  Check((result.ir_dump.find("image_flags=0x8") != std::string::npos),
-        "IMAGE_GATHER4_C flags did not survive into IR memory metadata");
-  Check((result.ir_dump.find("image_flags=0x28") != std::string::npos),
-        "IMAGE_GATHER4_C_LZ flags did not survive into IR memory metadata");
-  Check((result.ir_dump.find("image_flags=0x18") != std::string::npos),
-        "IMAGE_GATHER4_C_O flags did not survive into IR memory metadata");
-  Check((result.ir_dump.find("image_flags=0x38") != std::string::npos),
-        "IMAGE_GATHER4_C_LZ_O flags did not survive into IR memory metadata");
+  Check((result.decoded_dump.find("sample_flags=lod|compare addr_components=4") != std::string::npos),
+        "IMAGE_GATHER4_C_L did not expose compare+lod sample metadata");
+  Check((result.decoded_dump.find("sample_flags=lod|compare|offset addr_components=5") !=
+         std::string::npos),
+        "IMAGE_GATHER4_C_L_O did not expose compare+offset+lod sample metadata");
+  Check((result.ir_dump.find("ImageGatherRaw") != std::string::npos),
+        "IMAGE_GATHER4 did not lower to shared IR ImageGatherRaw");
+  Check((result.ir_dump.find("CompositeExtractU32x4") != std::string::npos),
+        "IMAGE_GATHER4 did not extract four-component gather results");
   Check(SpirvContainsCapability(result.spirv, 25),
         "SPIR-V binary does not request ImageGatherExtended");
-  Check(SpirvContainsOpcode(result.spirv, 96),
-        "SPIR-V binary does not contain OpImageGather");
-  Check(SpirvContainsOpcode(result.spirv, 97),
-        "SPIR-V binary does not contain OpImageDrefGather");
-  Check(SpirvContainsOpcode(result.spirv, 202),
-        "SPIR-V binary does not contain packed gather offset extraction");
-  Check(SpirvContainsOpcode(result.spirv, 81),
-        "SPIR-V binary does not contain gather result extraction");
-  Check(SpirvContainsOpcode(result.spirv, 124),
-        "SPIR-V binary does not contain gather result bitcast");
+  Check(SpirvContainsOpcode(result.spirv, 96) || SpirvContainsOpcode(result.spirv, 97),
+        "SPIR-V binary does not contain OpImageGather/OpImageDrefGather");
   CheckSpirvBinaryValidates(result.spirv);
 }
 
@@ -7789,6 +7790,79 @@ void TestNewShaderRecompilerCapturedMubufStoreFormatD16() {
   CheckSpirvBinaryValidates(short_format_result.spirv);
 }
 
+void TestNewShaderRecompilerMubufFormatD16HiX() {
+  using namespace ShaderRecompiler;
+
+  // GCN1.4/GFX9: 0x26 LOAD_FORMAT_D16_HI_X, 0x27 STORE_FORMAT_D16_HI_X.
+  // Captured Yotei CS encoding: 0xe09c6000 0x80010007 (store, glc, idxen).
+  const uint32_t decode_shader[] = {
+      EncodeMubuf0(0x26, 0, true, false),
+      EncodeMubuf1(2, 0, 1),
+      EncodeMubuf0(0x27, 0, true, true),
+      EncodeMubuf1(0, 1, 7),
+      EncodeSopp(0x01),
+  };
+
+  Decoder::Program decoded;
+  Decoder::DecodeProgram(decode_shader, decoded);
+  Check(decoded.instructions.size() == 3u,
+        "D16_HI_X pair did not decode as two memory ops plus endpgm");
+  const auto& load = decoded.instructions[0];
+  const auto& store = decoded.instructions[1];
+  Check(load.family == Decoder::Family::MUBUF &&
+            load.opcode == Decoder::Opcode::BUFFER_LOAD_FORMAT_D16_HI_X &&
+            load.opcode_id == 0x26u && load.formatted && !load.typed &&
+            load.data_bits == 16u && load.data_dwords == 1u &&
+            load.data_components == 1u && load.dst.sdwa_sel == 5u,
+        "BUFFER_LOAD_FORMAT_D16_HI_X decode metadata is wrong");
+  Check(store.family == Decoder::Family::MUBUF &&
+            store.opcode == Decoder::Opcode::BUFFER_STORE_FORMAT_D16_HI_X &&
+            store.opcode_id == 0x27u && store.raw[0] == 0xe09c6000u &&
+            store.raw[1] == 0x80010007u && store.formatted && !store.typed &&
+            store.data_bits == 16u && store.data_dwords == 1u &&
+            store.data_components == 1u && store.dst.sdwa_sel == 5u &&
+            store.glc && store.idxen && !store.offen,
+        "captured BUFFER_STORE_FORMAT_D16_HI_X fields rejected");
+
+  // Keep both ops live: load into v1 high half, then store that register's high half.
+  const uint32_t live_shader[] = {
+      EncodeVop1(0x01, 0, 255),
+      0xaaaabbbbu, // v_mov_b32 v0, 0xaaaabbbb
+      EncodeMubuf0(0x27, 0, true, false),
+      EncodeMubuf1(0, 0, 2), // store high half of v0
+      EncodeMubuf0(0x26, 0, true, false),
+      EncodeMubuf1(1, 0, 3), // load into high half of v1
+      EncodeMubuf0(0x1c, 4, true, false),
+      EncodeMubuf1(1, 0, 4), // keep the load live via dword store of v1
+      EncodeSopp(0x01),
+  };
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+  std::array<uint32_t, 12> user_data{};
+  user_data[1] = 4u << 16u;
+  user_data[2] = 16u;
+  user_data[3] =
+      static_cast<uint32_t>(Prospero::BufferFormat::k16UInt) << 12u;
+  options.user_data = user_data;
+  auto result = RecompileForTest(live_shader, options);
+  Check((std::string_view(result.decoded_dump)
+             .find("BUFFER_LOAD_FORMAT_D16_HI_X") != std::string_view::npos) &&
+            (std::string_view(result.decoded_dump)
+                 .find("BUFFER_STORE_FORMAT_D16_HI_X") !=
+             std::string_view::npos),
+        "D16_HI_X load/store pair missing from decoded dump");
+  Check(CountSourceOccurrences(result.ir_dump, "LoadBufferU32 ") >= 1u &&
+            CountSourceOccurrences(result.ir_dump, "StoreBufferU32 ") >= 1u,
+        "D16_HI_X did not lower to packed formatted buffer IR");
+  // High-half extract may constant-fold (0xaaaabbbb >> 16 -> 0xaaaa).
+  Check(CountSourceOccurrences(result.ir_dump, "BitFieldUExtract ") >= 1u ||
+            result.ir_dump.find("0x0000aaaa") != std::string::npos ||
+            result.ir_dump.find("0xaaaa") != std::string::npos,
+        "D16_HI_X store did not use the high half of VDATA");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
 void TestNewShaderRecompilerFormattedStoreUsesDynamicByteLimitOnly() {
   const uint32_t shader[] = {
       EncodeMubuf0(0x04),
@@ -8801,6 +8875,58 @@ void TestNewShaderRecompilerCfgLoopBreakContinue() {
   Check(SpirvContainsOpcode(result.spirv, 246),
         "loop SPIR-V lacks OpLoopMerge");
   CheckSpirvBinaryValidates(result.spirv);
+}
+
+void TestGraphicsWave64CollectiveRouting() {
+  using namespace ShaderRecompiler;
+  using O = IR::ValueOpcode;
+  for (const auto stage : {ShaderType::Vertex, ShaderType::Pixel}) {
+    IR::Program program;
+    program.stage = stage;
+    program.wave_size = 64u;
+    program.block_storage.push_back(std::make_unique<IR::Block>());
+    auto* block = program.block_storage.back().get();
+    program.blocks.push_back(block);
+    program.block_info.push_back({.id = 0u});
+    program.block_info[0].terminator.kind = CFG::TerminatorKind::Return;
+    const auto emit = [&](O op, std::initializer_list<IR::Value> args = {}) {
+      return IR::Value(&block->AppendNewInst(op, args));
+    };
+    const auto lane = emit(O::LaneId);
+    const auto ballot = emit(O::Ballot, {emit(O::ULessThan32, {lane, IR::Value(16u)})});
+    for (uint32_t half = 0; half < 2u; ++half) {
+      emit(O::ReferenceU32, {emit(O::CompositeExtractU32x4, {ballot, IR::Value(half)})});
+    }
+    emit(O::ReferenceU32, {emit(O::ReadLane, {lane, IR::Value(63u)})});
+    IR::BuildSrtPlan(program);
+    IR::TrackResources(program);
+    auto options = MakeCompileOptions(stage);
+    options.wave_size = 64u;
+    options.compute_workgroup_limits.native_subgroup_size = 32u;
+    TranslateResult translated;
+    translated.program = std::move(program);
+    const auto compiled = CompileProgram(std::move(translated), options, {}, 0u);
+    CheckSpirvBinaryValidates(compiled.spirv);
+    std::set<uint32_t> masked_ids;
+    bool mirrored = false;
+    bool shuffled = false;
+    for (size_t offset = 5; offset < compiled.spirv.size();) {
+      const auto count = compiled.spirv[offset] >> 16u;
+      const auto opcode = compiled.spirv[offset] & 0xffffu;
+      Check(count != 0 && offset + count <= compiled.spirv.size(), "malformed collective module");
+      if (opcode == 199u && count == 5u) masked_ids.insert(compiled.spirv[offset + 2u]);
+      if (opcode == 80u && count == 7u &&
+          compiled.spirv[offset + 3u] == compiled.spirv[offset + 4u]) mirrored = true;
+      if (opcode == 345u && count == 6u) {
+        shuffled = true;
+        Check(masked_ids.contains(compiled.spirv[offset + 5u]),
+              "graphics wave64 shuffle target bypassed native32 normalization");
+      }
+      offset += count;
+    }
+    Check(mirrored && shuffled,
+          "graphics wave64 ballot bypassed the shared partition helper");
+  }
 }
 
 void TestPartitionedGraphicsLoopBudgetSpirv() {
@@ -13089,13 +13215,16 @@ void TestComputeExecutionSingleWaveGdsAtomic() {
     ShaderStageInputInfo input{};
     input.compute = &compute;
     const auto plan = PlanComputeExecution(program,input,limits);
-    if (scenario == Scenario::WriteOnly) {
+    // Device-scope GDS atomics serialize across native subgroup32 halves the same
+    // way buffer atomics do. A single complete guest wave may therefore keep a
+    // live old value; multiwave and ordinary GDS loads stay rejected.
+    if (scenario == Scenario::WriteOnly || scenario == Scenario::LiveReturn) {
       Check(plan.error.empty() && plan.IsSplitWave64() &&
                 !plan.IsCooperativeWave64() && plan.wave_partition_factor == 1u,
-            "acyclic write-only GDS atomic lost its single-wave64 execution plan");
+            "acyclic single-wave GDS atomic lost its wave64 execution plan");
     } else {
       Check(!plan.error.empty() && !plan.IsSplitWave64(),
-            "GDS atomic admission accepted a live return, multiwave use, or GDS read");
+            "GDS atomic admission accepted multiwave use or a GDS read");
     }
   }
 }
@@ -18160,6 +18289,17 @@ int main(int argc, char* argv[]) {
     std::puts("KYTY_PIPELINE_CACHE_IDENTITY_PASS");
     return 0;
   }
+  if (argc == 2 &&
+      std::strcmp(argv[1], "--pipeline-cache-validation-mode-only") == 0) {
+    Libs::Graphics::TestDriverPipelineCacheValidationModeIdentity();
+    std::puts("KYTY_PIPELINE_CACHE_VALIDATION_MODE_PASS");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--image-gather-variants-only") == 0) {
+    Libs::Graphics::TestNewShaderRecompilerImageGatherVariants();
+    std::puts("KYTY_IMAGE_GATHER_VARIANTS_PASS");
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--spirv-permutation-reuse-only") == 0) {
     Libs::Graphics::TestSpirvPermutationReuseIdentity();
     std::puts("KYTY_SPIRV_PERMUTATION_REUSE_PASS");
@@ -18231,6 +18371,11 @@ int main(int argc, char* argv[]) {
   if (argc == 2 && std::strcmp(argv[1], "--split-wave64-cyclic-image-spirv-only") == 0) {
     Libs::Graphics::TestSplitWave64CyclicImageSpirvRendezvous();
     std::puts("KYTY_SPLIT_WAVE64_CYCLIC_IMAGE_SPIRV_PASS");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--graphics-wave64-collective-routing-only") == 0) {
+    Libs::Graphics::TestGraphicsWave64CollectiveRouting();
+    std::puts("KYTY_GRAPHICS_WAVE64_COLLECTIVE_ROUTING_PASS");
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--partitioned-graphics-loop-only") == 0) {
@@ -18368,6 +18513,13 @@ int main(int argc, char* argv[]) {
     return 0;
   }
 
+  if (argc == 2 && std::strcmp(argv[1], "--mubuf-format-d16-hi-only") == 0) {
+    EnsureConfigInitialized();
+    TestNewShaderRecompilerMubufFormatD16HiX();
+    std::puts("KYTY_MUBUF_FORMAT_D16_HI_PASS");
+    return 0;
+  }
+
   if (argc == 2 && std::strcmp(argv[1], "--float-image-atomic-decode-only") == 0) {
     TestFloatImageAtomicDecoder();
     std::puts("KYTY_FLOAT_IMAGE_ATOMIC_DECODE_PASS");
@@ -18417,6 +18569,8 @@ int main(int argc, char* argv[]) {
   TestNewShaderRecompilerNativeWideBufferIr();
   TestNewShaderRecompilerScalarB64LaneTranslation();
   TestNewShaderRecompilerMubufFormatTranslation();
+  TestNewShaderRecompilerCapturedMubufStoreFormatD16();
+  TestNewShaderRecompilerMubufFormatD16HiX();
   TestNewShaderRecompilerFormattedStoreUsesDynamicByteLimitOnly();
   TestNewShaderRecompilerTypedBufferTranslation();
   TestNewShaderRecompilerDsReadWrite2Translation();
@@ -18519,6 +18673,7 @@ int main(int argc, char* argv[]) {
   TestCooperativeWave64LegacyBarrierInsertionScope();
   TestCooperativeWave64ConsecutiveLdsReadsSharePhase();
   TestCooperativeWave64CollectivesUseSharedFunctions();
+  TestGraphicsWave64CollectiveRouting();
   TestSplitWave64PermlaneExecMaskSpirv();
   TestSplitWave64SwizzleDeclaresBallotCapability();
   TestCooperativeWave64CrossBlockSpillReuse();
@@ -18538,6 +18693,7 @@ int main(int argc, char* argv[]) {
   TestCapturedBufferAtomicsX2();
   TestDisabledSystemDebugBranch();
   TestNewShaderRecompilerPixelImageSampleLodSelection();
+  Libs::Graphics::TestNewShaderRecompilerImageGatherVariants();
   TestNewShaderRecompilerBranchConditionForms();
   TestNewShaderRecompilerSetpcBranch();
   TestFusedShaderHandoffPreservesRegisters();

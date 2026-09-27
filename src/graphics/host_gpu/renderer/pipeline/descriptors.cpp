@@ -35,6 +35,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cstring>
 #include <fmt/format.h>
 #include <limits>
 #include <span>
@@ -160,9 +161,65 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	const auto adjustment     = offset - aligned_offset;
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
 	const bool byte_adjustment = adjustment % sizeof(uint32_t) != 0;
-	if ((byte_adjustment && !SupportsFormattedStorageOffset(resource) &&
-	     !SupportsScalarStorageOffset(resource)) ||
-	    adjustment >= 256 || adjustment > max_range || size > max_range - adjustment) {
+	if (byte_adjustment && !SupportsFormattedStorageOffset(resource) &&
+	    !SupportsScalarStorageOffset(resource)) {
+		// Dword-indexed SSBOs shift the published byte rebase >>2, so a 1/2/3-byte host
+		// misalignment would be lost. For read-only non-atomic bindings whose guest CPU
+		// backing is current, stage an aligned upload and bind that (adjustment=0).
+		// Writable/atomic/GPU-dirty cases stay fail-closed until a byte-address path exists.
+		if (resource.written || resource.atomic || !resource.read ||
+		    context.GetBufferCache().IsRegionGpuModified(address, size) ||
+		    context.GetBufferCache().HasGpuDirtyBytes(address, size)) {
+			EXIT("storage buffer offset adjustment is unsupported: stage=%u slot=%u guest=0x%016" PRIx64
+			     " requested=0x%016" PRIx64 " size=0x%016" PRIx64 " backing_offset=0x%016" PRIx64
+			     " alignment=0x%016" PRIx64 " aligned_offset=0x%016" PRIx64
+			     " adjustment=0x%016" PRIx64 " max_range=0x%016" PRIx64
+			     " formatted=%d descriptor_formatted_only=%d scalar=%d atomic=%d written=%d\n",
+			     static_cast<uint32_t>(stage), slot, address, size, size,
+			     static_cast<uint64_t>(offset), static_cast<uint64_t>(alignment),
+			     static_cast<uint64_t>(aligned_offset), static_cast<uint64_t>(adjustment),
+			     static_cast<uint64_t>(max_range), resource.formatted,
+			     resource.descriptor_formatted_only, resource.scalar, resource.atomic,
+			     resource.written);
+		}
+		const auto padded = Common::AlignUp(size, sizeof(uint32_t));
+		if (padded > max_range) {
+			EXIT("storage buffer aligned upload exceeds maxStorageBufferRange\n");
+		}
+		auto& upload = context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Upload);
+		auto [mapped, map_offset] = upload.Map(padded, alignment);
+		if (mapped == nullptr) {
+			EXIT("storage buffer aligned upload failed to map staging\n");
+		}
+		const auto mapped_bytes =
+		    Libs::LibKernel::Memory::TryClampRangeSize(address, size);
+		bool filled = false;
+		if (mapped_bytes != 0) {
+			filled = Libs::LibKernel::Memory::TryReadBacking(address, mapped, mapped_bytes) ||
+			         Libs::LibKernel::Memory::TryReadPrtBacking(address, mapped, mapped_bytes);
+			if (filled && mapped_bytes < size) {
+				std::memset(mapped + mapped_bytes, 0, static_cast<size_t>(size - mapped_bytes));
+			}
+		}
+		if (!filled) {
+			EXIT("storage buffer aligned upload failed to read guest backing: stage=%u slot=%u "
+			     "guest=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+			     static_cast<uint32_t>(stage), slot, address, size);
+		}
+		if (padded > size) {
+			std::memset(mapped + size, 0, static_cast<size_t>(padded - size));
+		}
+		upload.Commit();
+		buffer_offset = 0;
+		buffer_limit  = static_cast<uint32_t>(size);
+		const vk::DescriptorBufferInfo aligned {upload.Handle(), map_offset, padded};
+		SetVulkanObjectNameF(
+		    graphics.device, aligned.buffer,
+		    "Kyty.{}.StorageBufferAlignedUpload[slot={} guest=0x{:016x} size=0x{:x} adj={}]",
+		    ShaderStageResourceName(stage), slot, address, size, adjustment);
+		return aligned;
+	}
+	if (adjustment >= 256 || adjustment > max_range || size > max_range - adjustment) {
 		EXIT("storage buffer offset adjustment is unsupported: stage=%u slot=%u guest=0x%016" PRIx64
 		     " requested=0x%016" PRIx64 " size=0x%016" PRIx64 " backing_offset=0x%016" PRIx64
 		     " alignment=0x%016" PRIx64 " aligned_offset=0x%016" PRIx64

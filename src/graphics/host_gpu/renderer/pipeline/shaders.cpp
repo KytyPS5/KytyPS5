@@ -584,9 +584,12 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		LOGF("PipelineTrace: vkCreateGraphicsPipelines done result=%s pipeline=%p\n",
 		     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
 	}
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
-
-	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);
+	if (result != vk::Result::eSuccess) {
+		EXIT("vkCreateGraphicsPipelines failed: %s (device may be lost after TDR; cool down "
+		     "and retry)\n",
+		     vk::to_string(result).c_str());
+	}
+	EXIT_IF(pipeline.pipeline == nullptr);
 
 	if (tess_control_shader_module != nullptr) {
 		graphics.device.destroyShaderModule(tess_control_shader_module, nullptr);
@@ -661,9 +664,12 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	     "\n",
 	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline), elapsed_ms);
 	Log::Flush();
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
-
-	EXIT_NOT_IMPLEMENTED(pipeline.pipeline == nullptr);
+	if (result != vk::Result::eSuccess) {
+		EXIT("vkCreateComputePipelines failed: %s (device may be lost after TDR; cool down "
+		     "and retry)\n",
+		     vk::to_string(result).c_str());
+	}
+	EXIT_IF(pipeline.pipeline == nullptr);
 }
 
 } // namespace Libs::Graphics

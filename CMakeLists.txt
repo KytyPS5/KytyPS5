@@ -575,6 +575,12 @@ if(BUILD_TESTING)
 	set_tests_properties(emulator_present_mode_invalid PROPERTIES WILL_FAIL TRUE)
 	add_test(NAME ime_dialog COMMAND $<TARGET_FILE:ime_dialog_tests>)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
+	add_test(NAME graphics_wave64_collective_routing
+	         COMMAND $<TARGET_FILE:shader_cfg_tests> --graphics-wave64-collective-routing-only)
+	add_test(NAME homogeneous_indirect_image_validation
+	         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --homogeneous-indirect-image-validation-only)
+	set_tests_properties(graphics_wave64_collective_routing homogeneous_indirect_image_validation
+	                     PROPERTIES TIMEOUT 30)
 	add_test(NAME shader_audit_metadata
 	         COMMAND ${Python3_EXECUTABLE} "${KYTY_TESTS_DIR}/ShaderAuditMetadataTests.py"
 	                 $<TARGET_FILE:shader_cfg_tests>
@@ -595,6 +601,16 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_cfg_tests> --pipeline-cache-identity-only)
 	add_test(NAME spirv_permutation_reuse
 		COMMAND $<TARGET_FILE:shader_cfg_tests> --spirv-permutation-reuse-only)
+	add_test(NAME pipeline_cache_validation_mode
+		COMMAND $<TARGET_FILE:shader_cfg_tests> --pipeline-cache-validation-mode-only)
+	add_test(NAME single_wave64_gds_atomic_admission
+		COMMAND $<TARGET_FILE:shader_cfg_tests> --single-wave64-gds-atomic-admission-only)
+	add_test(NAME mubuf_format_d16_hi
+		COMMAND $<TARGET_FILE:shader_cfg_tests> --mubuf-format-d16-hi-only)
+	set_tests_properties(pipeline_cache_validation_mode single_wave64_gds_atomic_admission
+	                    mubuf_format_d16_hi PROPERTIES TIMEOUT 30)
+	add_test(NAME image_gather_variants
+		COMMAND $<TARGET_FILE:shader_cfg_tests> --image-gather-variants-only)
 	if(WIN32)
 		add_test(NAME shader_f64_admission
 		         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --f64-admission-only)
@@ -667,6 +683,9 @@ if(BUILD_TESTING)
 		add_test(NAME shader_immutable_srt_binding_admission
 			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --immutable-srt-binding-admission-only)
 		set_tests_properties(shader_immutable_srt_binding_admission PROPERTIES TIMEOUT 360 RUN_SERIAL TRUE)
+		add_test(NAME storage_buffer_ro_aligned_upload
+			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --storage-buffer-ro-aligned-upload-only)
+		set_tests_properties(storage_buffer_ro_aligned_upload PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE)
 		add_test(NAME sampled_htile_write_admission
 			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --sampled-htile-write-admission-only)
 		add_test(NAME sampled_htile_admission

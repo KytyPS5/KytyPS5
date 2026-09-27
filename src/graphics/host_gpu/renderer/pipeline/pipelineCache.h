@@ -245,6 +245,14 @@ bool IsDriverCacheBuildIdentityUsableForTest(std::string_view git_hash,
                                              std::string_view worktree_fingerprint);
 bool IsDriverCacheSignatureCompatibleForTest(std::string_view cached_signature,
                                              std::string_view expected_signature);
+// GPUAV instrumentation changes modules the driver caches. Core vs GPUAV must
+// not share a filename or signature identity (NVIDIA APPCRASH when mixed).
+[[nodiscard]] std::string DriverCacheFileNameForTest(std::string_view title_id,
+                                                     bool gpu_assisted_validation);
+[[nodiscard]] std::string FormatDriverCacheSignatureForTest(
+    std::string_view git_revision, std::string_view worktree_fingerprint, uint32_t vendor_id,
+    uint32_t device_id, uint32_t driver_version, std::string_view pipeline_cache_uuid_hex,
+    bool gpu_assisted_validation);
 
 // Returns the existing ShaderProgram.id when a specialization miss emits SPIR-V
 // that is already resident. Empty when the binary is new and Create*Pipelines

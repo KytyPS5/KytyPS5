@@ -1,7 +1,59 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
-Обновлено **26 сентября 2026 года**. Игра: **Ghost of Yōtei, PPSA26344**.
+Обновлено **27 сентября 2026 года**. Игра: **Ghost of Yōtei, PPSA26344**.
 Рабочая ветка — `yotei-windows-bringup` в локальном fork `fxpw/KytyPS5`.
+
+Checkpoint проверки текущего WIP **27 сентября 2026 года**:
+
+- Основа `1c421608`; чужие незакоммиченные изменения сохранены. Windows
+  перезагружена в 15:27 UTC. Изолированный probe на сохранённом CS
+  `b90e2024732c6111` всё ещё падает при `vkCreateComputePipelines`
+  (exit `-1073741819`): `_Build/logs/b90e-probe-post-reboot-20260927.txt`.
+  Одна перезагрузка не устраняет ошибку; GPUAV instrumentation остаётся
+  необходимым диагностическим режимом для дальнейшего game retry.
+- Незакоммиченный `EmitHomogeneousIndirectSample` нарушал SPIR-V:
+  `OpSampledImage` нельзя передавать через `OpPhi`/между блоками.
+  CPU RED `homogeneous-image-red2-20260927.txt.stderr`, unchanged GREEN
+  `homogeneous-image-green2-20260927.txt` после удаления этого варианта.
+  Сохранён диагностический patch в `_Build/analysis/`; обычная выборка
+  numerical results остаётся. Причина прежнего DeviceLost не доказана.
+- `ValueEmitContext` обходил общий graphics wave64 partition helper:
+  lane 63 попадал в subgroup32 shuffle напрямую, верхняя половина ballot
+  не получала partition mask. Synthetic Vertex/Pixel CPU RED
+  `graphics-wave64-red-20260927.txt.stderr` → unchanged GREEN
+  `graphics-wave64-green-20260927.txt` после восстановления общего routing.
+  Partitioned graphics loop, cooperative collectives, split-wave64 ballot
+  также GREEN. Это восстановление существующего partition lowering,
+  а не доказательство полной cross-subgroup wave64 эквивалентности.
+- Native MSVC Developer Environment: сборка/установка emulator успешны.
+  Новая сборка SHA-256
+  `D2D853FD3CFBB702CAD8D56B2807F7D9B3991527BD6E49BE54CB1EB9963E6756`.
+- Завершён baseline `_Build/runs/yotei-integrated-20260927-182113-menucheck-gpuav-sync`:
+  прежняя сборка `DC2E8DC8…`, окно 1280×720, GPUAV instrumentation,
+  SyncDiag; shown=123. Процесс закрыт вручную для проверки новой сборки,
+  exit -1 не является самостоятельным emulator crash. PrintWindow чёрный,
+  меню и новый полезный кадр не подтверждены.
+- Retry новой сборки `…-183108-menucheck-gpuav-sync` завершён вручную для
+  актуализации ветки по команде пользователя: shown=154, exit -1.
+  Все 34 readback кадров 120–153 имеют RGB=0, alpha=3. Прежний draw
+  `e312…` ещё не достигнут; runtime эффект wave routing не доказан.
+  Меню и новый ненулевой кадр не подтверждены. Старые checkpoint ниже —
+  история; не переносить их spinner/DeviceLost результат на новый WIP.
+- Synthetic material images: исправлена потерянная привязка
+  `use_runtime_samplers` в стенде; unchanged GPU oracle GREEN 2/2,
+  `_Build/runs/synthetic-image-20260927-runtime-samplers-green/report.json`.
+- Восстановлен отсутствовавший RO aligned-upload regression: на HEAD
+  descriptor path RED при adj=2, на сохранённом WIP GREEN с GPU-readback
+  смещений 1/2/3 и padding. Логи `ro-align-restored-{red,green}-20260927.txt`.
+  Временный raw-frame diagnostic сохранён отдельным patch в `_Build/analysis`,
+  в production checkpoint не включён. Misplaced root logs и untracked SDL2
+  source перенесены в `_Build`; игровые данные и артефакты сохранены.
+- Перед checkpoint-коммитом native focused CTest GREEN **9/9**:
+  wave routing, opaque image validation, cache identity/reuse/mode, GDS
+  admission, D16_HI, gather variants и RO aligned-upload.
+  `_Build/logs/precommit-focused-20260927.log`. Полная suite и меню pending;
+  после upstream merge требуется повторная native сборка и проверки.
+
 
 Checkpoint Flip queue lock-order (Reserve cfg→m_mutex ABBA) **26 сентября 2026 года**:
 
@@ -114,6 +166,213 @@ Checkpoint Flip queue lock-order (Reserve cfg→m_mutex ABBA) **26 сентяб�
     `storage buffer offset adjustment is unsupported` (adj=2, backing=0x6d22,
     align=16, stage=CS slot=193) — dword-indexed SSBO cannot carry a non-multiple-of-4
     host rebase. Menu **PENDING**.
+25. RO dword SSBO host adj∈{1,2,3}: `NativeStorageBuffer` stages an aligned Upload
+    copy when `read && !written && !atomic` and guest backing is not GPU-dirty;
+    publishes `buffer_offset=0`. Writable/atomic/GPU-dirty stay fail-closed.
+    RED: `_Build/logs/ro-align-red.out.txt` (EXIT adj=2 written=0).
+    GREEN: `--storage-buffer-ro-aligned-upload-only` → `KYTY_RO_ALIGN_UPLOAD_PASS`;
+    neighbors `--storage-buffer-byte-offset-{binding,boundary}-only` still pass.
+    Long run `…-120514-presentprobe-gpuav`: **cleared adj=2 Fatal** (shown past
+    196 → **198**). New Fatal exit 321: CFG
+    `MIMG opcode=0x4c` (`IMAGE_GATHER4_C_L`) on CS `0x0041b6a03db7472d`; log also
+    lists unimplemented MUBUF `0x27`. Menu **PENDING**.
+26. Shared MIMG gather `0x4c` / `0x5c` (`IMAGE_GATHER4_C_L` / `C_L_O`) decode +
+    translate to `ImageGatherRaw`; specialization allows gather on indirect roots.
+    Lod on gather remains level-zero approximation (existing gather-L contract).
+    RED was DCE of unused gathers before tracking; GREEN fixture stores results.
+    `shader_cfg_tests --image-gather-variants-only` → `KYTY_IMAGE_GATHER_VARIANTS_PASS`
+    (`_Build/logs/gather-pass.out.txt`).
+    Long run `…-130714-presentprobe-gpuav` (GPUAV+instr, ContinueAfterColored,
+    Timeout 7200 / Watchdog 3600): **cleared MIMG 0x4c** — decode shows
+    `IMAGE_GATHER4_C_L` on CS `0x0041b6a03db7472d`. Flip events to **arg=193**.
+    New Fatal exit **321**: CFG `MUBUF opcode=0x27` at pc `0x000014e4` (same CS;
+    eight `0x27` sites). Menu **PENDING**.
+27. Shared MUBUF `0x26` / `0x27` (`BUFFER_LOAD_FORMAT_D16_HI_X` /
+    `BUFFER_STORE_FORMAT_D16_HI_X`): GCN1.4 format D16 X with VDATA high half.
+    Decode sets `sdwa_sel=5`; translate reuses packed formatted D16 buffer IR.
+    RED: `shader_cfg_tests --mubuf-format-d16-hi-only` failed decode metadata
+    (`_Build/logs/mubuf-format-d16-hi-red.txt`).
+    GREEN: same selector → `KYTY_MUBUF_FORMAT_D16_HI_PASS`; GPU neighbors
+    `shader_recompiler_compute_tests --mubuf-format-d16-hi-only` →
+    `KYTY_MUBUF_FORMAT_D16_HI_GPU_PASS` (HI store / D16_X low neighbor / HI load).
+    Long run `…-133640-presentprobe-gpuav` (GPUAV+instr, ContinueAfterColored,
+    Timeout 7200 / Watchdog 3600, ~34m): **cleared MUBUF 0x27 CFG** — Flip through
+    **arg=193**; shaders to VS47/PS70/CS286. New Fatal exit **321**: SPIR-V
+    validation `hash=0x0041b6a03db7472d` —
+    `wave64 splitting does not support guest shared or scratch memory`
+    (`SpirvEmitter.cpp`). `maxShown=0`, colored not proven. Menu **PENDING**.
+28. CS `0x0041b6a03db7472d` uses acyclic single-wave `DS_ADD_RTN_U32` **GDS**
+    (`gds=1`, live old value → `ReadFirstLane`), not Scratch (`scratch_dwords=0`).
+    Split-wave planning already admitted dead GDS atomics and live LDS/buffer
+    atomics; live GDS returns were an overly narrow gate. Shared fix: admit
+    acyclic single-wave 32-bit GDS atomics with live returns under the same
+    device-scope contract. Multiwave / GDS loads stay rejected.
+    RED: `shader_cfg_tests --single-wave64-gds-atomic-admission-only` →
+    `acyclic single-wave GDS atomic lost its wave64 execution plan`
+    (`_Build/logs/gds-live-atomic-red.*`).
+    GREEN: same selector → `KYTY_SINGLE_WAVE64_GDS_ATOMIC_ADMISSION_PASS`;
+    neighbor `--single-wave64-lds-atomic-return-only` PASS; GPU
+    `--gds-atomic-add-return-wave64-only` →
+    `KYTY_GDS_ATOMIC_ADD_RETURN_WAVE64_PASS`
+    (`_Build/logs/gds-rtn-gpu-green.*`).
+    Long run `…-142251-presentprobe-gpuav` (GPUAV+instr, ContinueAfterColored,
+    Timeout 7200 / Watchdog 3600, ~9m): **cleared GDS live-atomic Fatal** —
+    CS `0x0041b6a03db7472d` SPIR-V EmitProgram **words=94120**. Present
+    **maxShown=196** (past prior adj=2 / gather / MUBUF frontiers; Flip ready
+    matched shown). New exit **321**: `vkWaitSemaphores` **ErrorDeviceLost**
+    (`masterSemaphore.cpp`, wait_tick≈41054 / known≈41052) while compiling
+    graphics VS `0xd75722a398fb037a` / PS `0xe678d49d7cc1e490` after heavy CS
+    work — TDR-class hang, not SPIR-V validation. Menu still **PENDING**;
+    next retry without GPUAV instr to separate hang from instrumentation.
+    Follow-up `…-143254-presentfix-noval` / `…-143531-presentfix-val` exited
+    immediately `exit=-2147483645` during `vkCreateComputePipelines` for CS
+    `0xb90e2024732c6111` — residual TDR after DeviceLost; not a new semantic
+    frontier.
+29. Retry `…-143703-presentfix-gpuav` (GPUAV+instr, ContinueAfterColored,
+    Timeout 7200 / Watchdog 3600) after cool-down: **cleared GDS Fatal again**;
+    **first COLORED present proven** —
+    `COLORED frame=247 width=480 height=270 ... colored=10` (readback).
+    Present advanced to **shown≈318** / ready=318 while compiling large CS
+    `0xfc6f8c56eb7e168f` (SPIR-V words≈760605). Exit again **DeviceLost** on
+    `vkWaitSemaphores` while emitting VS `0xd75722a398fb037a` (same graphics
+    frontier as `…-142251`). Menu/gameplay still **PENDING**; isolate hang
+    without GPUAV instr once the driver is healthy after TDR.
+    Note: immediate post-TDR retries without GPUAV abort in
+    `vkCreateComputePipelines` (`exit=-2147483645`); GPUAV path recovers after
+    a few minutes of cool-down.
+30. Shared **pipeline-cache validation-mode identity** (enables safe no-GPUAV
+    isolation of the DeviceLost hang without mixing NVIDIA compiler blobs):
+    KytyPC3 signature + `_PipelineCache/{TITLE}-{core|gpuav}.bin`. Mode tag
+    `v0`/`v1` is part of the driver implementation identity (cross-mode load
+    rejected). GREEN: `shader_cfg_tests --pipeline-cache-validation-mode-only`
+    → `KYTY_PIPELINE_CACHE_VALIDATION_MODE_PASS`; neighbors
+    `--pipeline-cache-revision-only` / `--pipeline-cache-identity-only`.
+    Historical RED: GPUAV-lite-warmed `PPSA26344.bin` + no-GPUAV launch APPCRASH
+    in `nvgpucomp64.dll` at frame 12/13 (debt § GPUAV-sensitive cache).
+    Long run `…-152514-presentprobe-gpuav` (pre-rebuild binary, GPUAV+instr,
+    ContinueAfterColored): soft-stall **shown=304** ~17m during heavy CS
+    CreatePipeline (ws≈31GB), then advanced past prior DeviceLost frontier
+    (**shown=345**, colored proven). Exit **321** again (`FINISHED exit=321`
+    in `yotei-gds-rtn-gpuav4.stdout`). Title/progress:
+    `C:\Users\fxpw\AppData\Local\Temp\kyty-progress.log`. Run `_kyty.txt` on G:
+    was orphaned mid-flight. Menu/gameplay still **PENDING**. Post-rebuild
+    no-GPUAV (`…-160929` / `…-161556-presentprobe-noval`) still immediate
+    `exit=-2147483645` on `vkCreateComputePipelines` CS `0xb90e2024732c6111`
+    after TDR (separate `PPSA26344-core.bin` written ~3.5MB before crash —
+    identity split works; driver still unhealthy for core). Retry
+    `…-161820-presentprobe-gpuav` (cache-identity tip, fresh
+    `PPSA26344-gpuav.bin`, ContinueAfterColored): recovered after cool-down;
+    colored proven; stalled ~15m on CS `0x54904fb419d79e49` CreatePipeline
+    (SPIR-V **words=755335**); advanced to **shown=305**; exit **321**
+    DeviceLost (`wait_tick≈49622`). Post-TDR: no-GPUAV and GPUAV-lite (no
+    instr) still immediate `exit=-2147483645` even after 12m cool-down; only
+    GPUAV+instr recovers. Menu still **PENDING**. Next offline: bound/analyze
+    CS `54904`/`fc6f8c56`-class hangs without reset loops; longer cool-down
+    before core-cache noval isolation.
+31. Warm GPUAV+instr `…-173836` (restored `PPSA26344-gpuav-instr-warm`):
+    **shown=195**, colored not proven (readbackStart=200); exit **321**
+    DeviceLost `wait_tick≈41099` while emitting VS `0xd75722a` — same early
+    frontier as `…-142251`. Scan showed **no** `54904` CreatePipeline in that
+    short warm run; hang is from earlier GPU work overlapping compile.
+32. SyncDiag `…-181001-presentprobe-gpuav-sync` (`KYTY_GPU_SYNC_DIAGNOSTICS=1`,
+    `MIN_WORKGROUPS=1`): **identified** guest CS `0x8000198700` (= hash
+    `54904fb419d79e49`). `GpuDispatchSync` after-complete elapsed
+    **≈285–295 s** on first-use / new specialization (CreatePipeline under
+    GPUAV of ~755k SPIR-V words), then **≈23 ms** when the pipeline is warm.
+    Soft-stall **shown=151** is serialized CreatePipeline of `54904`, not an
+    infinite GPU loop. **DeviceLost root (SyncDiag):** not an incomplete
+    dispatch — last `GpuDispatchSync` phases all `after-complete`; hang is
+    `GpuDrawSync` **after-wait** on indexed draw `count=119856 instances=1`
+    `ps=0x803fe78e00` `es=0x803f946a00` (prior draws with same PS +
+    `es=0x803fba0000` completed). `GpuDrawSync` is printf-only (stdout), so
+    `_kyty.txt` scans miss it. Exit `vkWaitSemaphores` DeviceLost
+    `wait_tick≈128120` while CPU also emitted VS `0xe3125617f3efc38f`.
+33. Warm GPUAV+instr `…-185358-presentprobe-gpuav` (cool-down ~42m, warm
+    `PPSA26344-gpuav.bin`): soft-stall **shown=154** during CS `54904`
+    **4×** `SpecializationMiss` (`buffers=31 bounded_srt=7`, `prior_perms`
+    1→3) — EmitProgram words `755123 / 755359 / 755335 / 755335`,
+    **SpirvReuse=0**, four distinct `vkCreatePipelineLayout` +
+    `vkCreateComputePipelines` (~265–271 s each under GPUAV+instr). Advanced
+    to **shown≈190** then exit **321** DeviceLost `wait_tick≈41237`
+    (same early tick band as `…-142251` / `…-173836`). Colored not proven
+    (readbackStart=200). Menu still **PENDING**.
+34. Shared fix (tip after `…-185358`): workgroup-axis bounded SRT layouts
+    reserve a stable equal share of the 65536-probe budget so guest grid
+    size no longer splinters `ResourceSpecialization` / SPIR-V identity
+    (`ResourceMaterialization.cpp`). GREEN:
+    `resource_tracking_tests --workgroup-srt-materialization-only` →
+    `KYTY_WORKGROUP_SRT_MATERIALIZATION_PASS`. Also `GpuDrawSync` now
+    `LOGF`s into `_kyty.txt` (was stdout-only). Game retry
+    `…-193928-presentprobe-gpuav`: still **4×** EmitProgram + ~270s
+    CreatePipeline for `54904` with **miss549=0 during those four** —
+    not SpecializationMiss (stable SRT helped that path); likely
+    **ProgramKeySplit** (static_state / user_data). After the four,
+    shown advanced **151→189**, miss549=3, then exit **321** DeviceLost
+    `wait_tick≈40968` (early frontier again; colored not proven,
+    readbackStart=200). Menu still **PENDING**; hanging draw
+    `ps=0x803fe78e00`+`es=0x803f946a00` remains the DeviceLost root
+    after 54904.
+
+34. Warm GPUAV+instr `…-202653-presentprobe-gpuav` (ProgramKeySplit tip,
+    workgroup-SRT reserve in binary): soft-stall **shown=151** while
+    **4×** `54904` EmitProgram words `755123/755359/755335/755335` and
+    **3×** `vkCreateComputePipelines` ≈267–279 s. `std::printf`
+    diagnostics (`ProgramKeySplit`/`SpecializationMiss`/`SpirvReuse`)
+    went only to truncated `stdout.txt` (~98 KB), so `_kyty` had
+    **split549=0 miss549=0** despite recompiles — switched those paths
+    to `LOGF` + `SpecializationMissDiff` / `SpecializationCompile`
+    fingerprints. Forced stop mid-54904; immediate noval/val retries
+    (`…-000028-nogpuav`, `…-210153-val`) died at early
+    `vkCreateComputePipelines` for CS `b90e2024732c6111` (driver cool-down).
+    Short abort logs already show `ProgramKeySplitDiff` on
+    `dispatch_thread_dimensions` for CS `2bd3cd129405f9a9` (1162→811
+    words). Shared cross-`ProgramKey` `SpirvReuse` by `spirv_hash`
+    staged to avoid a 4th duplicate module when words match. Next:
+    cool-down + GPUAV8 with LOGF tip; classify 54904 as ProgramKey vs
+    remaining specialization topology churn; then past shown=190/345
+    toward menu.
+
+35. GPUAV8 `…-212219-presentprobe-gpuav` (LOGF tip, warm `gpuav.bin`):
+    **shown≈191** then exit **321** DeviceLost `wait_tick≈40765`.
+    `54904` root cause classified: **SpecializationMiss** on
+    **selector/count-source** `bounded_srt[2..4]` counts
+    `16→14→19→11` (layouts not workgroup-reserved; flat offsets shift).
+    `split549=0`. Warm cache made CreatePipeline ~seconds not ~270s.
+    **DeviceLost root:** first-use VS `0xe3125617f3efc38f` (guest ES
+    `0x803f946a00`, with PS `0x803fe78e00`, indexed draw count=119856).
+    SyncDiag: prior draws with same PS + ES `0x803fba0000` complete;
+    hang on `GpuDrawSync` after-wait after compiling VS 51.
+    SpecializationCompile for `e3125617`: **buffers=13 images=251
+    sampled_pairs=250**, `image[1] indirect_search_iterations=9`
+    (≈256-key indirect table → 250-way OpSwitch samples). Post-TDR
+    retries (`noval9`, `gpuav10`) crash inside
+    `vkCreateComputePipelines` for CS `b90e…` (driver wedged;
+    `nvlddmkm`). Tip: clearer CreatePipeline failure EXIT; next Fast
+    (no Vulkan validation / no GPUAV) after ≥45m cool-down + SPIR-V
+    dump of `e312` toward menu / colored (shown≥345).
+
+36. Fast12 `…-230512-presentprobe-noval` after cool to 02:05: **immediate
+    exit -2147483645** (`STATUS_BREAKPOINT`) at
+    `vkCreateComputePipelines` for CS `b90e2024732c6111`, **maxShown=0**.
+    Driver still wedged post-TDR; loading `PPSA26344-core.bin` does not help.
+    Tip now has shared **homogeneous indirect-sample** emit (Phi SampledImage
+    + one `OpImageSample*`; hetero path unchanged). Next: quarantine
+    `core.bin`, **90m** cool-down, then warm **GPUAV without instrumentation**
+    (`gpuav.bin`) + e312 dump + ContinueAfterColored toward menu.
+
+37. After quarantining `PPSA26344-core.bin` and **90m** cool-down, GPUAV12
+    `…-004128-presentprobe-gpuav` (warm `gpuav.bin`, no instr, homog tip):
+    again **immediate** `exit=-2147483645` at `vkCreateComputePipelines`
+    for CS `b90e…`, **maxShown=0**. Non-elevated PnP disable/enable of
+    RTX 5060 Ti failed («Общий сбой»). Cool-down alone is insufficient.
+
+38. Elevated display disable/enable + `pnputil /restart-device` + NVIDIA
+    container service bounce: GPUAV13/14 still immediate `b90e`
+    CreatePipeline `STATUS_BREAKPOINT`. Cold GPUAV15 (gpuav.bin quarantined)
+    same death. **nvlddmkm shader compiler remains wedged** — needs a full
+    **Windows reboot** (adapter restart is not enough). Homogeneous e312
+    emit stays on tip; warm `gpuav.bin` restored for post-reboot retry.
+    After reboot: warm GPUAV no-instr + ContinueAfterColored + e312 dump.
 
 Checkpoint present soft-stall (shown≈130 / ready=shown+1) **26 сентября 2026 года**:
 
@@ -885,36 +1144,21 @@ cooperative SSBO, #459 и #476 — 46/46 за 39,24 с и 9 последоват
 
 | Поле | Значение |
 | --- | --- |
-| Версия игры | `APP_VER = 01.512.000` |
-| Каталог игры на стенде | `G:\games\Kyty\PPSA26344\PPSA26344` |
-| Каталог последнего запуска | `_Build/runs/yotei-integrated-20260908-150356-e59dec` |
-| SHA-256 запущенного emulator | `1c4a3d2dc6a80c5896f2849774cdb6dc9e1d49e1b14275ed5d550488392bed50` |
-| Время UTC | `2026-09-08T15:03:56.8024802Z` → `15:14:01.9625954Z` |
-| Режим | RTX 5060 Ti, окно 320×180, Diagnostic, FIFO, GPUAV с отключёнными shared-memory-race/sanitizer и лимитом 128 instrumentations/pass, quiet guest/shader logs, phase trace и source readback |
-| Завершение | Достигнут resource-specialization fatal во время timeout closure: Windows exit `321`; task-owned процесс завершён, зависших процессов нет. Wrapper также отметил timeout draining redirected output. |
-| Наблюдаемое исполнение | Последний window title: frame 132, flips CPU/GPU 0/120, prepared/ready/shown 120/120/119; скомпилировано 174 shaders. Run прошёл прежний PC `0x7c4`. |
-| Текущая граница | `indirect image table at pc 0x000078b8 has incompatible candidates`: exemplar/candidate dimensions `3/1`, shader swizzles `0x24c/0`; следующий шаг — exact RED и candidate-specific swizzle lowering. |
-| Диагностика | Dimension-only RED/GREEN `_Build/logs/heterogeneous-indirect-images-red-20260908.txt` и `_Build/logs/heterogeneous-indirect-images-green-20260908.txt`; SPIR-V GREEN `_Build/logs/heterogeneous-indirect-images-spirv-green-20260908.txt`; runtime phase trace в последнем run. |
-| Изображение | `_Build/analysis/yotei-present-gpuav-lite-long-20260908.txt`: 10 source frames 110–119, 480×270, RGB min=max=0, alpha min=max=3; ненулевой полезный кадр пока не доказан. |
-| Пройденный scalar-buffer блокер | `6cc64dee32dc7094`, PC `0x656c`: signed runtime Phi loop со stride 196 и дополнительным mask guard доказан по полному dispatcher CFG; четыре correlated descriptor words материализуются общим buffer-table path. |
-| Пройденный блокер | `da7e70d9fcafe48c`: GFX10 opcode `0x83`, signed runtime loop bounds и correlated scalar-buffer descriptor tables проходят resource tracking; SPIR-V 238 336 слов создан, `vkCreateComputePipelines` вернул Success |
-| Пройденный image-блокер | Storage `k16_16_16_16Float`, 16x16, `kStandard4KB`, address `0x502a4c4800`, size/alignment 4096/4096. Ранняя allocation-alignment проверка удалена; `053b…` и четыре следующих compute pipelines созданы без VUID |
-| Пройденная граница | `c6b0a54eb5738565`: 4384 decoded instructions, CFG 266 blocks/7 loops, dispatcher fallback; Normalize 23 811, TrackResources 23 795, SPIR-V 358 533 слова с текущим ABI, shader завершён |
-| Пройденная renderer-ошибка | Устаревший depth attachment повторно найден и привязан по исходному descriptor перед final view acquisition; прежнего `depth target changed after render-state discovery` нет |
-| Пройденный descriptor-блокер | `8457901d80b91921`: decode 1109, CFG 126 blocks/8 loops, Normalize 5115, TrackResources 5074, SPIR-V 102 791 слово; bounded expressions и uniform scalar-address branch пройдены, shader №136 завершён |
-| Пройденные следующие shaders | `3570528edd66651a` стал №137 (SPIR-V 7 872 слов), `e80c528999326b0e` — №138 (74 070), `f8927c09f4b928c7` — №139 (203 924), `16fc5de632960733` — №140 (2 588), `975c2837903937d1` — №141 (15 413) |
-| Пройденный sampled-table блокер | Доминирующий guard доказывает `selector < 255` при stride 368; вместо 1 445 GCD probes материализуются 255 selector values. Null image пары канонизируются; compiler budget ограничен 512 images/pairs с отдельной проверкой Vulkan device limits. |
-| Пройденный null-SRT блокер | `ee4f153aa500d327`, vertex: exact null `LoadAddressU32` root создаёт нулевые descriptor words; TrackResources завершён, с graphics-interface ABI выпущено 16 509 SPIR-V слов |
-| Пройденный buffer-offset блокер | Vertex slot 6: guest `0x80760a1a16`, size `0x240`, alignment 16, residual 6, descriptor-formatted R16 read-only. Vulkan view округлён до DWORD, точная guest byte-limit проверяется в SPIR-V; прежнего fatal нет |
-| Пройденный graphics-interface блокер | Pixel stage компилируется первым; связи guest source → host location входят в vertex static key. Matching outputs сохраняются, collision aliases получают то же значение, конфликтующий неиспользуемый output удаляется, отсутствующий guest producer объявляется без ложного `param_export_mask`. Прежний VUID `RuntimeSpirv-OpEntryPoint-08743` отсутствует. |
-| Пройденная descriptor-граница | `7ceb0f3417f926f9`: decode 732, CFG 53 blocks/2 loops, Normalize 3207; memoized TrackResources завершается, пять correlated image candidates материализуются, SPIR-V 103 404 слова, shader №159. |
-| Пройденная graphics-wave64 граница | PS `964747887d898821`: decode 234, CFG 22 blocks/1 loop, structured 26 blocks, Normalize/TrackResources 1 174, SPIR-V 9 820 слов. Все shuffle targets ограничены native subgroup32, ballot отражён в обе guest mask halves, а общий pixel-loop counter завершает fragment после 256 входов в тело. Модуль проходит `spirv-val`; прежний auto draw и следующие команды получают `after-complete` без нового NVIDIA reset. |
-| Пройденная byte-to-D16 граница | GFX10 MUBUF `0x20...0x23` декодируются как unsigned/signed byte-to-D16 low/high loads с сохранением соседней половины VDATA. `d7a83911714a58ee`: decode 55, structured CFG 4 blocks, Normalize/TrackResources 198, SPIR-V 6 537 слов, shader №172; dispatch 76×1×1 завершён за 63 618 мкс. |
-| Пройденная dispatcher SRT-граница | `6cc64dee32dc7094`: selector из unsigned 5-bit extraction даёт ровно 32 значения; buffer table `0x1030 + selector * 16` находится в однозначном entry prefix из безусловных блоков. Exact audit и игра проходят PC `0x530`; scalar-buffer image table с ключом `ReadFirstLane(Phi) << 5` также планируется через inline image path и проходит PC `0x4d64`. |
-| Предыдущая pipeline-граница | Screen Space Shadows `b90e2024732c6111` на RTX 5060 Ti: NVIDIA `nvgpucomp64.dll` падал с `0x80000003` во время компиляции. Collision-free LDS DWORD lowering сохранил atomics для конфликтующих адресов и в реальном run довёл `b90e` до успешного pipeline/dispatch. |
-| Текущая execution-граница | CS `6cc64dee32dc7094` проходит прежний PC `0x656c` и dimension-only PC `0x7c4`; следующий indirect image table на PC `0x78b8` требует candidate-specific dimension и shader swizzle. Correctness-цель ненулевого source RGB остаётся незакрытой. |
-| Диагностика | Latest GPUAV log `_Build/runs/yotei-integrated-20260908-150356-e59dec`; source readback `_Build/analysis/yotei-present-gpuav-lite-long-20260908.txt`. |
-| Главный performance blocker | `916ea8893e5b276a` ≈6,05 с при 960×540; после снижения внутренних targets до 480×270 наблюдаемый FPS после прогрева вырос до ≈2,31 |
+| Source | `1c421608` + сохранённый WIP, включая graphics wave64 routing; banner dirty |
+| Версия / каталог игры | `01.512.000`, `G:\games\Kyty\PPSA26344\PPSA26344` |
+| Завершённый run | `_Build/runs/yotei-integrated-20260927-183108-menucheck-gpuav-sync` |
+| SHA-256 emulator | `D2D853FD3CFBB702CAD8D56B2807F7D9B3991527BD6E49BE54CB1EB9963E6756` |
+| Время UTC | `2026-09-27T18:31:08.9441677Z` → `18:45:17.0610260Z` |
+| Режим | Native Windows / RTX 5060 Ti, окно 1280×720, FIFO, GPUAV shader instrumentation + SyncDiag; prepared surface 480×270 |
+| Завершение | Вручную закрыт task-owned процесс для актуализации ветки по новой команде пользователя; exit -1, не самостоятельный emulator crash |
+| Прогресс | maxShown=154; прежний аварийный indexed draw с VS `e312…` ещё не достигнут |
+| Пиксели | 34 readback кадров 120–153: RGB=0, alpha=3; меню / новый ненулевой кадр не подтверждены |
+| Подтверждённый отдельный blocker | Probe на старом сохранённом `b90e…` после reboot всё ещё падает внутри pipeline compilation. GPUAV instrumentation позволяет продвигать игру дальше |
+| Следующая проверка | После интеграции upstream и native rebuild повторить bounded run с пиксельным capture; проверить прежний draw, затем узнаваемое меню |
+
+
+### Исторические performance наблюдения (сентябрь 2026)
+
 
 Текущий game executable получен из сохранённого исходного файла обратимым
 диагностическим преобразованием. Все три начальных значения 3840×2160 и полная

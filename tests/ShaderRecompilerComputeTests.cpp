@@ -11893,6 +11893,101 @@ void CheckSampledHtileArrayClearDiscovery() {
 
   // Place inside VulkanHarness. Reaches actual renderer admission before any
   // binding mutation, without dispatching potentially conflicting resources.
+  void CheckReadOnlyStorageAlignedUpload() {
+    using namespace ShaderRecompiler::IR;
+    constexpr const char* name = "ReadOnlyStorageAlignedUpload";
+    constexpr uintptr_t base = 0x0000000205d00000ull;
+    constexpr uint64_t allocation_size = 0x10000u;
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "allocation", Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+        0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size,
+        allocation_size, 0, &direct_offset) == 0, "direct allocation failed");
+    void* mapped = reinterpret_cast<void*>(base);
+    Require(name, "mapping", Libs::LibKernel::Memory::KernelMapDirectMemory(
+        &mapped, allocation_size, 0x3, 0x10, direct_offset, allocation_size) == 0 &&
+        mapped == reinterpret_cast<void*>(base), "direct mapping failed");
+    auto* input = static_cast<uint8_t*>(mapped);
+    for (uint32_t i = 0; i < allocation_size; ++i) input[i] = static_cast<uint8_t>(i * 13u + 7u);
+    {
+      RenderContext context(m_runtime_context);
+      auto& scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      context.InitializeGpu(nullptr);
+      context.MapMemory(base, allocation_size);
+      auto& executor = context.GetRenderExecutor();
+      const auto [backing, origin] = context.GetBufferCache().ObtainBuffer(
+          base, allocation_size, false, false);
+      Require(name, "backing", backing != nullptr && origin == 0u,
+              "fixture requires a common backing origin");
+      std::puts("KYTY_RO_ALIGN_UPLOAD_READY");
+      std::fflush(stdout);
+      for (const uint32_t offset : {2u, 1u, 3u}) {
+        const uint32_t size = offset == 3u ? 17u : 16u;
+        Program program{};
+        program.stage = ShaderType::Compute;
+        program.resource_tracking_complete = true;
+        program.shader_info_complete = true;
+        BufferResource resource{};
+        resource.read = true;
+        resource.max_byte_extent = 4u;
+        program.info.buffers.push_back(resource);
+        AllocateBindings(program);
+        CompiledShaderInfo info{};
+        info.stage = program.stage;
+        info.info = std::move(program.info);
+        info.bindings = std::move(program.bindings);
+        ShaderBufferResource descriptor{};
+        descriptor.UpdateAddress48(base + offset);
+        descriptor.fields[2] = size;
+        descriptor.fields[3] = DstSel(4, 5, 6, 7) | (1u << 24u);
+        DescriptorValue value{};
+        value.dword_count = 4u;
+        std::copy_n(descriptor.fields, 4, value.dwords.begin());
+        ShaderRecompiler::IR::ResourceSnapshot snapshot;
+        snapshot.buffers.push_back(value);
+        ShaderStageRuntime runtime{.program = &info, .resources = &snapshot};
+        PreparedBindings prepared;
+        executor.PrepareBindings(runtime, prepared);
+        executor.FindBuffers(prepared);
+        executor.RebindBuffers(prepared);
+        Require(name, "binding", prepared.buffers.size() == 1u, "missing SSBO view");
+        const auto view = prepared.buffers[0];
+        const auto padded = (size + 3u) & ~3u;
+        Require(name, "aligned view", view.buffer != backing->Handle() &&
+            view.offset % context.GetGraphics().StorageMinAlignment() == 0u &&
+            view.range == padded &&
+            (prepared.shader_data.at(info.bindings.memory_offset_dword) & 0xffu) == 0u,
+            "read-only upload retained an unrepresentable byte rebase");
+        scheduler.Finish();
+        auto output = CreateHostBuffer(name, padded, vk::BufferUsageFlagBits::eTransferDst, {});
+        const auto command = BeginCommands(name, "upload readback");
+        const vk::BufferCopy copy{view.offset, 0u, padded};
+        command.copyBuffer(view.buffer, output.buffer, 1, &copy);
+        EndSubmitAndFree(name, "upload readback", command);
+        const auto actual = ReadBuffer(name, output, padded / 4u);
+        const auto* bytes = reinterpret_cast<const uint8_t*>(actual.data());
+        Require(name, "guest bytes", std::memcmp(bytes, input + offset, size) == 0,
+                "aligned upload changed the guest bytes");
+        for (uint32_t i = size; i < padded; ++i)
+          Require(name, "padding", bytes[i] == 0u, "upload padding was not cleared");
+        DestroyBuffer(&output);
+        RenderExecutorTestAccess::ResetBindings(executor);
+      }
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+      context.ShutdownGpu();
+    }
+    Require(name, "unmap", Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "fixture unmap failed");
+    Require(name, "release", Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+        direct_offset, allocation_size) == 0, "fixture release failed");
+    std::puts("KYTY_RO_ALIGN_UPLOAD_PASS");
+  }
+
   void CheckStorageBufferByteOffsetBinding(bool unsupported_halfword = false,
                                            const char* mixed_mode = nullptr,
                                            bool formatted_dword = false,
@@ -19549,7 +19644,15 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
         vk::ImageUsageFlagBits::eStorage, test.storage_image_r32ui, 1,
         vk::ImageLayout::eGeneral);
   }
-  if (needs_sampler) {
+  if (needs_sampler && test.use_runtime_samplers) {
+    auto& cache = vulkan->RuntimeRenderer().GetSamplerCache();
+    samplers_by_resource.reserve(compiled.resources.samplers.size());
+    for (const auto& value : compiled.resources.samplers) {
+      ShaderSamplerResource descriptor{};
+      std::copy_n(value.dwords.begin(), 4, descriptor.fields);
+      samplers_by_resource.push_back(cache.GetSampler(descriptor));
+    }
+  } else if (needs_sampler) {
     sampler = vulkan->CreateNearestSampler(test.name, sampled_image.mip_levels);
   }
 
@@ -42446,6 +42549,11 @@ int main(int argc, char **argv) {
     return 0;
   }
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  if (argc == 2 && std::strcmp(argv[1], "--storage-buffer-ro-aligned-upload-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckReadOnlyStorageAlignedUpload();
+    return 0;
+  }
   if (argc == 3 && std::strcmp(argv[1], "--storage-buffer-byte-offset-reject") == 0) {
     const bool halfword = std::strcmp(argv[2], "unaligned-halfword") == 0;
     if (!halfword && std::strcmp(argv[2], "mixed-raw-word") != 0 &&
@@ -43188,6 +43296,15 @@ if (argc == 1) {
     CheckIndirectImageKeySwitch();
     VulkanHarness vulkan;
     RunCase(&vulkan, ImageCubeGradientsPreserveDerivatives());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--homogeneous-indirect-image-validation-only") == 0) {
+    for (auto test : {ImageSampleLzR128DynamicMaterialStaticSampler(),
+                      ImageSampleR128DynamicMaterialPairs()}) {
+      test.compile_only = true;
+      RunCase(nullptr, test);
+    }
+    std::puts("KYTY_HOMOGENEOUS_INDIRECT_IMAGE_VALIDATION_PASS");
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--readlane-key-guard-only") == 0) {

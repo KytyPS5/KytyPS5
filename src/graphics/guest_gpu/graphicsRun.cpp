@@ -946,6 +946,12 @@ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 	const auto& ps = m_sh_ctx.GetPs().ps_regs;
 	const auto& vs = m_sh_ctx.GetVs();
 	if (trace_draw) {
+		LOGF("GpuDrawSync: phase=before-wait type=indexed submit=%" PRIu64
+		     " count=%u instances=%u ps=0x%016" PRIx64 " es=0x%016" PRIx64
+		     " gs=0x%016" PRIx64 "\n",
+		     m_submit_id, args.index_count, args.instance_count, ps.data_addr,
+		     vs.es_regs.data_addr, vs.gs_regs.data_addr);
+		Log::Flush();
 		std::printf("GpuDrawSync: phase=before-wait type=indexed submit=%" PRIu64
 		            " count=%u instances=%u ps=0x%016" PRIx64 " es=0x%016" PRIx64
 		            " gs=0x%016" PRIx64 "\n",
@@ -953,15 +959,21 @@ void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 		            vs.es_regs.data_addr, vs.gs_regs.data_addr);
 		std::fflush(stdout);
 		BufferFlushAndWait();
+		LOGF("GpuDrawSync: phase=before-complete type=indexed submit=%" PRIu64 "\n", m_submit_id);
+		Log::Flush();
 		std::printf("GpuDrawSync: phase=before-complete type=indexed submit=%" PRIu64 "\n",
 		            m_submit_id);
 		std::fflush(stdout);
 	}
 	m_renderer.GetRenderExecutor().DrawIndex(m_submit_id, CurrentBuffer(), args);
 	if (trace_draw) {
+		LOGF("GpuDrawSync: phase=after-wait type=indexed submit=%" PRIu64 "\n", m_submit_id);
+		Log::Flush();
 		std::printf("GpuDrawSync: phase=after-wait type=indexed submit=%" PRIu64 "\n", m_submit_id);
 		std::fflush(stdout);
 		BufferFlushAndWait();
+		LOGF("GpuDrawSync: phase=after-complete type=indexed submit=%" PRIu64 "\n", m_submit_id);
+		Log::Flush();
 		std::printf("GpuDrawSync: phase=after-complete type=indexed submit=%" PRIu64 "\n",
 		            m_submit_id);
 		std::fflush(stdout);

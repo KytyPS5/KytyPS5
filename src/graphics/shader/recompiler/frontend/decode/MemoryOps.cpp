@@ -56,6 +56,8 @@ constexpr MemoryOpcodeInfo MUBUF_OPCODE_LIST[] = {
     {0x23u, Opcode::BUFFER_LOAD_SBYTE_D16_HI, 1, 8, true},
     {0x24u, Opcode::BUFFER_LOAD_SHORT_D16, 1, 16},
     {0x25u, Opcode::BUFFER_LOAD_SHORT_D16_HI, 1, 16},
+    {0x26u, Opcode::BUFFER_LOAD_FORMAT_D16_HI_X, 1, 16, false, false, true, 1},
+    {0x27u, Opcode::BUFFER_STORE_FORMAT_D16_HI_X, 1, 16, false, false, true, 1},
 	{0x80u, Opcode::BUFFER_LOAD_FORMAT_D16_X, 1, 16, false, false, true, 1},
 	{0x81u, Opcode::BUFFER_LOAD_FORMAT_D16_XY, 1, 16, false, false, true, 2},
 	{0x82u, Opcode::BUFFER_LOAD_FORMAT_D16_XYZ, 2, 16, false, false, true, 3},
@@ -311,14 +313,18 @@ void DecodeMubuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_inde
 	    inst.opcode == Opcode::BUFFER_LOAD_SHORT_D16 ||
 	    inst.opcode == Opcode::BUFFER_LOAD_UBYTE_D16_HI ||
 	    inst.opcode == Opcode::BUFFER_LOAD_SBYTE_D16_HI ||
-	    inst.opcode == Opcode::BUFFER_LOAD_SHORT_D16_HI) {
+	    inst.opcode == Opcode::BUFFER_LOAD_SHORT_D16_HI ||
+	    inst.opcode == Opcode::BUFFER_LOAD_FORMAT_D16_HI_X) {
 		// RDNA2 D16 loads replace one half of VDATA and preserve the other.
+		// FORMAT_D16_HI_X stores the converted component into the high half.
 		const bool high = inst.opcode == Opcode::BUFFER_LOAD_UBYTE_D16_HI ||
 		                  inst.opcode == Opcode::BUFFER_LOAD_SBYTE_D16_HI ||
-		                  inst.opcode == Opcode::BUFFER_LOAD_SHORT_D16_HI;
+		                  inst.opcode == Opcode::BUFFER_LOAD_SHORT_D16_HI ||
+		                  inst.opcode == Opcode::BUFFER_LOAD_FORMAT_D16_HI_X;
 		inst.dst.sdwa_sel = high ? 5u : 4u;
 	} else if (inst.opcode == Opcode::BUFFER_STORE_BYTE_D16_HI ||
-	           inst.opcode == Opcode::BUFFER_STORE_SHORT_D16_HI) {
+	           inst.opcode == Opcode::BUFFER_STORE_SHORT_D16_HI ||
+	           inst.opcode == Opcode::BUFFER_STORE_FORMAT_D16_HI_X) {
 		// VDATA is the store source: narrow its high half to eight or sixteen bits.
 		inst.dst.sdwa_sel = 5u;
 	}

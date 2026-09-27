@@ -840,16 +840,15 @@ uint32_t ValueEmitContext::HalfArg(const IR::Inst& inst, size_t index, uint32_t 
 }
 
 uint32_t ValueEmitContext::Ballot(IR::Value predicate) {
-	if (state.compute_execution.IsSplitWave64()) return EmitWaveBallot(state, Def(predicate));
+	if (state.compute_execution.IsSplitWave64() || other_half == nullptr) {
+		return EmitWaveBallot(state, Def(predicate));
+	}
 	const auto ballot_type = TypeU32Vector(state, 4);
 	const auto scope       = ConstantU32(state, spv::ScopeSubgroup);
 	const auto low         = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpGroupNonUniformBallot, ballot_type, low, scope,
 	                          other_half == nullptr || half == 0 ? Def(predicate)
 	                                                             : other_half->Def(predicate));
-	if (other_half == nullptr) {
-		return low;
-	}
 	const auto high      = state.builder.AllocateId();
 	const auto low_word  = state.builder.AllocateId();
 	const auto high_word = state.builder.AllocateId();
@@ -912,7 +911,7 @@ uint32_t ValueEmitContext::Shuffle(const IR::Inst& inst, size_t index, uint32_t 
 	const auto low   = state.builder.AllocateId();
 	if (other_half == nullptr) {
 		state.builder.AddFunction(spv::OpGroupNonUniformShuffle, type, low, scope, Arg(inst, index),
-		                          lane);
+		                          NormalizeWaveLaneTarget(state, lane));
 		return low;
 	}
 	const auto physical_lane =

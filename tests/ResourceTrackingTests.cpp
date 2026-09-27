@@ -6282,7 +6282,9 @@ void TestWorkgroupSrtTrackingProof() {
     ResourceSnapshot snapshot;
     ResourceSpecialization specialization;
     Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-              snapshot.flattened_srt == std::vector<uint32_t>{0x11u, 0x22u} &&
+              snapshot.flattened_srt.size() == 65536u &&
+              snapshot.flattened_srt[0] == 0x11u && snapshot.flattened_srt[1] == 0x22u &&
+              specialization.bounded_srt_reads == std::vector<BoundedSrtLayout>{{65536u, 0u}} &&
               reader.ordinary_reads == 0u,
           "DCE or extraction lost the pure coefficient address roots");
   }
@@ -6376,17 +6378,29 @@ void TestWorkgroupSrtMaterializationAndSpecialization() {
   const std::array<uint32_t,2> data{0x1003u,0u};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
+  // Three workgroup-axis columns share the 65536-word probe budget equally so
+  // layout.count / flat_offset stay stable across dispatch sizes (CreatePipeline
+  // identity). Live coefficient words still follow the current guest grid.
+  constexpr uint32_t kReserve = 65536u / 3u;
+  const std::vector<BoundedSrtLayout> stable_layout {
+      {kReserve, 0u}, {kReserve, kReserve}, {kReserve, 2u * kReserve}};
   Check(MaterializeResources(plan, WorkgroupSnapshotRuntime(reader,data,{3u,2u,1u}), snapshot,specialization),
         "known guest dispatch bounds did not materialize workgroup coefficients");
-  Check(snapshot.flattened_srt == std::vector<uint32_t>{0x11u,0x22u,0x33u,0x11u,0x22u,0x11u} &&
-            specialization.bounded_srt_reads == std::vector<BoundedSrtLayout>{{3u,0u},{2u,3u},{1u,5u}} &&
+  Check(snapshot.flattened_srt.size() == size_t{3u} * kReserve &&
+            snapshot.flattened_srt[0] == 0x11u && snapshot.flattened_srt[1] == 0x22u &&
+            snapshot.flattened_srt[2] == 0x33u &&
+            snapshot.flattened_srt[kReserve] == 0x11u &&
+            snapshot.flattened_srt[kReserve + 1u] == 0x22u &&
+            snapshot.flattened_srt[2u * kReserve] == 0x11u &&
+            specialization.bounded_srt_reads == stable_layout &&
             reader.reads == std::vector<uint64_t>{0x1000u,0x1004u,0x1008u} && reader.ordinary_reads == 0u &&
             snapshot.immutable_srt_ranges == std::vector<ResourceReadRange>{{0x1000u,12u}},
         "axis cardinality, source alignment, cross-column memoization or footprints changed");
   plan.info.uses_dma = true;
   reader.reads.clear();
   Check(MaterializeResources(plan, WorkgroupSnapshotRuntime(reader,data,{3u,2u,1u}), snapshot,specialization) &&
-            snapshot.flattened_srt == std::vector<uint32_t>{0x11u,0x22u,0x33u,0x11u,0x22u,0x11u} &&
+            snapshot.flattened_srt[0] == 0x11u && snapshot.flattened_srt[1] == 0x22u &&
+            snapshot.flattened_srt[2] == 0x33u &&
             snapshot.immutable_srt_ranges == std::vector<ResourceReadRange>{{0x1000u,12u}},
         "read-only DMA access rejected an otherwise coherent bounded SRT snapshot");
   const auto read_only_snapshot = snapshot;
@@ -6416,13 +6430,18 @@ void TestWorkgroupSrtMaterializationAndSpecialization() {
   CheckBoundedTransaction(snapshot,saved_snapshot,specialization,saved_specialization);
   reader.reads.clear();
   Check(MaterializeResources(plan, WorkgroupSnapshotRuntime(reader,data,{1u,1u,1u}), snapshot,specialization) &&
-            specialization != saved_specialization &&
-            specialization.bounded_srt_reads == std::vector<BoundedSrtLayout>{{1u,0u},{1u,1u},{1u,2u}},
-        "dispatch count change reused a stale permutation layout");
+            specialization == saved_specialization &&
+            specialization.bounded_srt_reads == stable_layout &&
+            snapshot.flattened_srt[0] == 0x11u &&
+            snapshot.flattened_srt[kReserve] == 0x11u &&
+            snapshot.flattened_srt[2u * kReserve] == 0x11u,
+        "dispatch count change splintered the stable workgroup SRT pipeline layout");
   const auto same_layout = specialization;
   reader.reads.clear(); reader.words[0].second = 0x99u;
   Check(MaterializeResources(plan, WorkgroupSnapshotRuntime(reader,data,{1u,1u,1u}), snapshot,specialization) &&
-            specialization == same_layout && snapshot.flattened_srt == std::vector<uint32_t>(3u,0x99u),
+            specialization == same_layout && snapshot.flattened_srt[0] == 0x99u &&
+            snapshot.flattened_srt[kReserve] == 0x99u &&
+            snapshot.flattened_srt[2u * kReserve] == 0x99u,
         "coefficient payload was cached across dispatches or unnecessarily changed the shader key");
   ApplyResourceSpecialization(fixture.program,specialization);
   Check(fixture.program.info.bounded_srt_reads == specialization.bounded_srt_reads,
@@ -6439,17 +6458,25 @@ void TestWorkgroupSrtZeroDispatchAndProbeLimit() {
   const std::array<uint32_t,2> data{0x1000u,0u};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
+  constexpr uint32_t kReserve = 65536u / 2u;
+  const std::vector<BoundedSrtLayout> stable_layout {{kReserve, 0u}, {kReserve, kReserve}};
   // Any empty axis means no invocation can execute any column, even X reads.
+  // Layout stays at the stable reserve so zero-sized dispatches do not splinter
+  // pipeline identity from nonzero grids of the same shader.
   for (uint32_t axis = 0u; axis < 3u; ++axis) {
     std::array<uint32_t,3> groups{3u,2u,5u}; groups[axis] = 0u;
     Check(MaterializeResources(plan, WorkgroupSnapshotRuntime(reader,{},groups),snapshot,specialization) &&
-              snapshot.flattened_srt.empty() && snapshot.immutable_srt_ranges.empty() &&
-              specialization.bounded_srt_reads == std::vector<BoundedSrtLayout>{{0u,0u},{0u,0u}} &&
+              snapshot.flattened_srt.size() == size_t{2u} * kReserve &&
+              snapshot.immutable_srt_ranges.empty() &&
+              specialization.bounded_srt_reads == stable_layout &&
               reader.reads.empty(),
           "zero dispatch attempted to evaluate a table address or used another nonzero axis count");
   }
   Check(MaterializeResources(plan,WorkgroupSnapshotRuntime(reader,data,{32768u,32768u,1u}),snapshot,specialization) &&
-            snapshot.flattened_srt.size() == 65536u && reader.reads.size() == 1u,
+            snapshot.flattened_srt.size() == size_t{2u} * kReserve &&
+            snapshot.flattened_srt[0] == 0x77u &&
+            snapshot.flattened_srt[kReserve] == 0x77u && reader.reads.size() == 1u &&
+            specialization.bounded_srt_reads == stable_layout,
         "exact combined workgroup snapshot probe budget was rejected");
   const auto old_snapshot = snapshot;
   const auto old_specialization = specialization;
@@ -6471,7 +6498,10 @@ void TestWorkgroupSrtWrappedOffsetsAndWriteAliases() {
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
   Check(MaterializeResources(plan,WorkgroupSnapshotRuntime(reader,data,{3u,1u,1u}),snapshot,specialization) &&
-            snapshot.flattened_srt == std::vector<uint32_t>{0xa1u,0xb2u,0xc3u} &&
+            snapshot.flattened_srt.size() == 65536u &&
+            snapshot.flattened_srt[0] == 0xa1u && snapshot.flattened_srt[1] == 0xb2u &&
+            snapshot.flattened_srt[2] == 0xc3u &&
+            specialization.bounded_srt_reads == std::vector<BoundedSrtLayout>{{65536u, 0u}} &&
             reader.reads == std::vector<uint64_t>{0x100000ff8ull,0xffcull,0x1000ull} &&
             snapshot.immutable_srt_ranges == std::vector<ResourceReadRange>{{0xffcu,8u},{0x100000ff8ull,4u}},
         "workgroup affine U32 wrap was combined with signed SMEM immediate or lost exact ranges");

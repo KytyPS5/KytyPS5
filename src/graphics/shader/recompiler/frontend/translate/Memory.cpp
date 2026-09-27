@@ -189,6 +189,7 @@ Decoder::Operand MemorySourceAt(const Decoder::Instruction& decoded, uint32_t in
 		     decoded.opcode <= Decoder::Opcode::BUFFER_STORE_FORMAT_XYZW) ||
 		    (decoded.opcode >= Decoder::Opcode::BUFFER_STORE_FORMAT_D16_X &&
 		     decoded.opcode <= Decoder::Opcode::BUFFER_STORE_FORMAT_D16_XYZW) ||
+		    decoded.opcode == Decoder::Opcode::BUFFER_STORE_FORMAT_D16_HI_X ||
 		    (decoded.opcode >= Decoder::Opcode::BUFFER_STORE_BYTE &&
 		     decoded.opcode <= Decoder::Opcode::BUFFER_STORE_DWORDX4) ||
 		    (decoded.opcode >= Decoder::Opcode::TBUFFER_STORE_FORMAT_X &&
@@ -963,6 +964,7 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::BUFFER_LOAD_FORMAT_D16_XY:
 		case Decoder::Opcode::BUFFER_LOAD_FORMAT_D16_XYZ:
 		case Decoder::Opcode::BUFFER_LOAD_FORMAT_D16_XYZW:
+		case Decoder::Opcode::BUFFER_LOAD_FORMAT_D16_HI_X:
 		case Decoder::Opcode::TBUFFER_LOAD_FORMAT_X:
 		case Decoder::Opcode::TBUFFER_LOAD_FORMAT_XY:
 		case Decoder::Opcode::TBUFFER_LOAD_FORMAT_XYZ:
@@ -984,6 +986,7 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::BUFFER_STORE_FORMAT_D16_XY:
 		case Decoder::Opcode::BUFFER_STORE_FORMAT_D16_XYZ:
 		case Decoder::Opcode::BUFFER_STORE_FORMAT_D16_XYZW:
+		case Decoder::Opcode::BUFFER_STORE_FORMAT_D16_HI_X:
 		case Decoder::Opcode::TBUFFER_STORE_FORMAT_X:
 		case Decoder::Opcode::TBUFFER_STORE_FORMAT_XY:
 		case Decoder::Opcode::TBUFFER_STORE_FORMAT_XYZ:
@@ -1117,9 +1120,11 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::IMAGE_GATHER4_LZ:
 		case Decoder::Opcode::IMAGE_GATHER4_C:
 		case Decoder::Opcode::IMAGE_GATHER4_C_LZ:
+		case Decoder::Opcode::IMAGE_GATHER4_C_L:
 		case Decoder::Opcode::IMAGE_GATHER4_LZ_O:
 		case Decoder::Opcode::IMAGE_GATHER4_C_O:
 		case Decoder::Opcode::IMAGE_GATHER4_C_LZ_O:
+		case Decoder::Opcode::IMAGE_GATHER4_C_L_O:
 		case Decoder::Opcode::IMAGE_GATHER4H: return IMAGE_GATHER(inst);
 
 		case Decoder::Opcode::DS_MIN_F32:

@@ -92,9 +92,11 @@ bool IsDriverCacheSignatureCompatible(std::string_view cached_signature,
 
 	// Vulkan keys cached entries by the full pipeline state. Keep the build fields for
 	// provenance, but do not discard valid driver data merely because Kyty changed.
+	// Validation mode (core vs GPUAV) is part of the driver-visible module identity:
+	// mixing GPUAV-instrumented blobs into a core launch crashes NVIDIA's compiler.
 	const auto implementation_identity = [](std::string_view signature)
 	    -> std::optional<std::string_view> {
-		constexpr std::string_view prefix = "KytyPC2:";
+		constexpr std::string_view prefix = "KytyPC3:";
 		if (!signature.starts_with(prefix) || !signature.ends_with('\n')) {
 			return std::nullopt;
 		}
@@ -113,13 +115,16 @@ bool IsDriverCacheSignatureCompatible(std::string_view cached_signature,
 		}
 
 		const auto identity = signature.substr(fingerprint_end + 1);
-		constexpr size_t identity_size = 8 + 1 + 8 + 1 + 8 + 1 + 32 + 1;
+		// vendor:device:driver:uuid:vN\n  — fixed-width mode tag v0/v1
+		constexpr size_t identity_size = 8 + 1 + 8 + 1 + 8 + 1 + 32 + 1 + 2 + 1;
 		if (identity.size() != identity_size || identity[8] != ':' ||
-		    identity[17] != ':' || identity[26] != ':' || identity.back() != '\n' ||
+		    identity[17] != ':' || identity[26] != ':' || identity[59] != ':' ||
+		    identity.back() != '\n' ||
 		    !IsLowerHex(identity.substr(0, 8), 8) ||
 		    !IsLowerHex(identity.substr(9, 8), 8) ||
 		    !IsLowerHex(identity.substr(18, 8), 8) ||
-		    !IsLowerHex(identity.substr(27, 32), 32)) {
+		    !IsLowerHex(identity.substr(27, 32), 32) ||
+		    (identity.substr(60, 2) != "v0" && identity.substr(60, 2) != "v1")) {
 			return std::nullopt;
 		}
 		return identity;
@@ -131,6 +136,27 @@ bool IsDriverCacheSignatureCompatible(std::string_view cached_signature,
 	       *cached_identity == *expected_identity;
 }
 
+std::string_view DriverCacheValidationModeTag(bool gpu_assisted_validation) {
+	return gpu_assisted_validation ? "v1" : "v0";
+}
+
+std::string DriverCacheFileName(std::string_view title_id, bool gpu_assisted_validation) {
+	return fmt::format("{}-{}.bin", title_id,
+	                   gpu_assisted_validation ? "gpuav" : "core");
+}
+
+std::string FormatDriverCacheSignature(std::string_view git_revision,
+                                       std::string_view worktree_fingerprint,
+                                       uint32_t vendor_id, uint32_t device_id,
+                                       uint32_t driver_version,
+                                       std::string_view pipeline_cache_uuid_hex,
+                                       bool gpu_assisted_validation) {
+	return fmt::format("KytyPC3:{}:{}:{:08x}:{:08x}:{:08x}:{}:{}\n", git_revision,
+	                   worktree_fingerprint, vendor_id, device_id, driver_version,
+	                   pipeline_cache_uuid_hex,
+	                   DriverCacheValidationModeTag(gpu_assisted_validation));
+}
+
 std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties) {
 	constexpr char hex[] = "0123456789abcdef";
 	std::string    uuid(VK_UUID_SIZE * 2, '0');
@@ -138,9 +164,10 @@ std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties)
 		uuid[i * 2]     = hex[properties.pipelineCacheUUID[i] >> 4u];
 		uuid[i * 2 + 1] = hex[properties.pipelineCacheUUID[i] & 0xfu];
 	}
-	return fmt::format("KytyPC2:{}:{}:{:08x}:{:08x}:{:08x}:{}\n", KYTY_GIT_REVISION,
-	                   KYTY_GIT_WORKTREE_FINGERPRINT, properties.vendorID,
-	                   properties.deviceID, properties.driverVersion, uuid);
+	return FormatDriverCacheSignature(
+	    KYTY_GIT_REVISION, KYTY_GIT_WORKTREE_FINGERPRINT, properties.vendorID,
+	    properties.deviceID, properties.driverVersion, uuid,
+	    Config::GpuAssistedValidationEnabled());
 }
 
 std::string PipelineCacheTitleId() {
@@ -646,12 +673,11 @@ struct PipelineCache::ProgramCache {
 			EXIT_IF(sibling == siblings.end());
 			handle      = sibling->handle;
 			owns_module = false;
-			std::printf(
+			LOGF(
 			    "SpirvReuse: stage=%s hash=0x%016" PRIx64
 			    " words=%zu spirv_hash=0x%016" PRIx64 " program_id=%" PRIu64 " prior_perms=%zu\n",
 			    stage_name, options.shader_hash, result.spirv.size(), spirv_hash, handle.id,
 			    siblings.size());
-			std::fflush(stdout);
 		} else {
 			handle.module = CompileSPV(result.spirv, device);
 			EXIT_IF(handle.module == nullptr);
@@ -696,6 +722,49 @@ struct PipelineCache::ProgramCache {
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, lookup_key.static_state);
 		auto                                         entry = programs.find(lookup_key);
+		if (entry == programs.end()) {
+			for (const auto& [existing_key, existing_source]: programs) {
+				if (existing_key.hash != params.hash || existing_key.stage != stage) {
+					continue;
+				}
+				LOGF("ProgramKeySplit: stage=%u hash=0x%016" PRIx64
+				     " user_data=%u/%u code_size=%u/%u static_words=%zu/%zu prior_perms=%zu\n",
+				     static_cast<unsigned>(stage), params.hash, existing_key.user_data_count,
+				     lookup_key.user_data_count, existing_key.code_size, lookup_key.code_size,
+				     existing_key.static_state.size(), lookup_key.static_state.size(),
+				     existing_source.permutations.size());
+				static constexpr const char* kComputeStaticNames[] = {
+				    "fp_state",           "workgroup_register", "wave_size",
+				    "host_subgroup_size", "thread_ids_num",     "lds_size_dwords",
+				    "scratch_size_dwords","dispatch_thread_dimensions",
+				    "threads_num_x",      "group_id_x",         "threads_num_y",
+				    "group_id_y",         "threads_num_z",      "group_id_z",
+				    "tg_size_en",
+				};
+				const auto words =
+				    std::min(existing_key.static_state.size(), lookup_key.static_state.size());
+				for (size_t i = 0; i < words; ++i) {
+					if (existing_key.static_state[i] == lookup_key.static_state[i]) {
+						continue;
+					}
+					const char* name = (stage == ShaderType::Compute &&
+					                    i < std::size(kComputeStaticNames))
+					                       ? kComputeStaticNames[i]
+					                       : "word";
+					LOGF("ProgramKeySplitDiff: hash=0x%016" PRIx64
+					     " %s[%zu]=0x%08" PRIx32 "->0x%08" PRIx32 "\n",
+					     params.hash, name, i, existing_key.static_state[i],
+					     lookup_key.static_state[i]);
+				}
+				if (existing_key.static_state.size() != lookup_key.static_state.size()) {
+					LOGF("ProgramKeySplitDiff: hash=0x%016" PRIx64
+					     " static_state size %zu->%zu\n",
+					     params.hash, existing_key.static_state.size(),
+					     lookup_key.static_state.size());
+				}
+				break;
+			}
+		}
 		if (entry != programs.end() && entry->second.skip_dispatch) {
 			return {};
 		}
@@ -731,13 +800,78 @@ struct PipelineCache::ProgramCache {
 				return permutation->handle;
 			}
 			const auto& specialization = entry->second.specialization;
-			std::printf(
-			    "SpecializationMiss: stage=%u hash=0x%016" PRIx64
-			    " buffers=%zu images=%zu sampled_pairs=%zu bounded_srt=%zu prior_perms=%zu\n",
-			    static_cast<unsigned>(stage), params.hash, specialization.buffers.size(),
-			    specialization.images.size(), specialization.sampled_pairs.size(),
-			    specialization.bounded_srt_reads.size(), entry->second.permutations.size());
-			std::fflush(stdout);
+			LOGF("SpecializationMiss: stage=%u hash=0x%016" PRIx64
+			     " buffers=%zu images=%zu sampled_pairs=%zu bounded_srt=%zu buffer_tables=%zu "
+			     "prior_perms=%zu\n",
+			     static_cast<unsigned>(stage), params.hash, specialization.buffers.size(),
+			     specialization.images.size(), specialization.sampled_pairs.size(),
+			     specialization.bounded_srt_reads.size(), specialization.buffer_tables.size(),
+			     entry->second.permutations.size());
+			if (!entry->second.permutations.empty()) {
+				const auto& prior = entry->second.permutations.back().specialization;
+				if (prior.buffers.size() != specialization.buffers.size()) {
+					LOGF("SpecializationMissDiff: hash=0x%016" PRIx64 " buffers %zu->%zu\n",
+					     params.hash, prior.buffers.size(), specialization.buffers.size());
+				}
+				if (prior.images.size() != specialization.images.size()) {
+					LOGF("SpecializationMissDiff: hash=0x%016" PRIx64 " images %zu->%zu\n",
+					     params.hash, prior.images.size(), specialization.images.size());
+				}
+				if (prior.sampled_pairs.size() != specialization.sampled_pairs.size()) {
+					LOGF("SpecializationMissDiff: hash=0x%016" PRIx64 " sampled_pairs %zu->%zu\n",
+					     params.hash, prior.sampled_pairs.size(),
+					     specialization.sampled_pairs.size());
+				}
+				if (prior.bounded_srt_reads != specialization.bounded_srt_reads) {
+					LOGF("SpecializationMissDiff: hash=0x%016" PRIx64
+					     " bounded_srt layouts changed (prior=%zu now=%zu)\n",
+					     params.hash, prior.bounded_srt_reads.size(),
+					     specialization.bounded_srt_reads.size());
+					const auto n = std::min(prior.bounded_srt_reads.size(),
+					                        specialization.bounded_srt_reads.size());
+					for (size_t i = 0; i < n; ++i) {
+						if (prior.bounded_srt_reads[i] == specialization.bounded_srt_reads[i]) {
+							continue;
+						}
+						LOGF("SpecializationMissDiff: hash=0x%016" PRIx64
+						     " bounded_srt[%zu] count=%u->%u flat=%u->%u\n",
+						     params.hash, i, prior.bounded_srt_reads[i].count,
+						     specialization.bounded_srt_reads[i].count,
+						     prior.bounded_srt_reads[i].flat_offset,
+						     specialization.bounded_srt_reads[i].flat_offset);
+					}
+				}
+				if (prior.buffer_tables != specialization.buffer_tables) {
+					LOGF("SpecializationMissDiff: hash=0x%016" PRIx64
+					     " buffer_tables changed (prior=%zu now=%zu)\n",
+					     params.hash, prior.buffer_tables.size(),
+					     specialization.buffer_tables.size());
+					const auto n =
+					    std::min(prior.buffer_tables.size(), specialization.buffer_tables.size());
+					for (size_t i = 0; i < n; ++i) {
+						const auto& a = prior.buffer_tables[i];
+						const auto& b = specialization.buffer_tables[i];
+						if (a == b) {
+							continue;
+						}
+						LOGF("SpecializationMissDiff: hash=0x%016" PRIx64
+						     " buffer_table[%zu] count=%u->%u resources=%zu->%zu\n",
+						     params.hash, i, a.count, b.count, a.resources.size(),
+						     b.resources.size());
+					}
+				}
+				for (size_t i = 0; i < std::min(prior.images.size(), specialization.images.size());
+				     ++i) {
+					if (prior.images[i].indirect_search_iterations ==
+					    specialization.images[i].indirect_search_iterations) {
+						continue;
+					}
+					LOGF("SpecializationMissDiff: hash=0x%016" PRIx64
+					     " image[%zu] indirect_search_iterations=%u->%u\n",
+					     params.hash, i, prior.images[i].indirect_search_iterations,
+					     specialization.images[i].indirect_search_iterations);
+				}
+			}
 		}
 
 		ShaderStageInputInfo stage_input {};
@@ -799,6 +933,26 @@ struct PipelineCache::ProgramCache {
 				     static_cast<unsigned>(stage), params.hash, static_cast<int>(reason.size()),
 				     reason.data());
 			}
+			const auto& specialization = entry->second.specialization;
+			LOGF("SpecializationCompile: stage=%u hash=0x%016" PRIx64
+			     " buffers=%zu images=%zu sampled_pairs=%zu bounded_srt=%zu buffer_tables=%zu\n",
+			     static_cast<unsigned>(stage), params.hash, specialization.buffers.size(),
+			     specialization.images.size(), specialization.sampled_pairs.size(),
+			     specialization.bounded_srt_reads.size(), specialization.buffer_tables.size());
+			for (size_t i = 0; i < specialization.bounded_srt_reads.size(); ++i) {
+				LOGF("SpecializationCompile: hash=0x%016" PRIx64
+				     " bounded_srt[%zu] count=%u flat=%u\n",
+				     params.hash, i, specialization.bounded_srt_reads[i].count,
+				     specialization.bounded_srt_reads[i].flat_offset);
+			}
+			for (size_t i = 0; i < specialization.images.size(); ++i) {
+				if (specialization.images[i].indirect_search_iterations == 0u) {
+					continue;
+				}
+				LOGF("SpecializationCompile: hash=0x%016" PRIx64
+				     " image[%zu] indirect_search_iterations=%u\n",
+				     params.hash, i, specialization.images[i].indirect_search_iterations);
+			}
 		}
 		entry->second.permutations.push_back(CompilePermutation(
 		    params, options, std::move(translated), entry->second.specialization, push_data_cursor,
@@ -812,14 +966,14 @@ struct PipelineCache::ProgramCache {
 			counts[static_cast<size_t>(key.stage)] += source.permutations.size();
 		}
 		// Guest geometry shaders are compiled through the host mesh stage.
-		std::printf("Shaders: VS %zu | PS %zu | CS %zu | GS %zu | LS %zu | HS %zu | TES %zu\n",
-		            counts[static_cast<size_t>(ShaderType::Vertex)],
-		            counts[static_cast<size_t>(ShaderType::Pixel)],
-		            counts[static_cast<size_t>(ShaderType::Compute)],
-		            counts[static_cast<size_t>(ShaderType::Mesh)],
-		            counts[static_cast<size_t>(ShaderType::Local)],
-		            counts[static_cast<size_t>(ShaderType::TessellationControl)],
-		            counts[static_cast<size_t>(ShaderType::TessellationEvaluation)]);
+		LOGF("Shaders: VS %zu | PS %zu | CS %zu | GS %zu | LS %zu | HS %zu | TES %zu\n",
+		     counts[static_cast<size_t>(ShaderType::Vertex)],
+		     counts[static_cast<size_t>(ShaderType::Pixel)],
+		     counts[static_cast<size_t>(ShaderType::Compute)],
+		     counts[static_cast<size_t>(ShaderType::Mesh)],
+		     counts[static_cast<size_t>(ShaderType::Local)],
+		     counts[static_cast<size_t>(ShaderType::TessellationControl)],
+		     counts[static_cast<size_t>(ShaderType::TessellationEvaluation)]);
 		return permutation.handle;
 	}
 
@@ -890,6 +1044,20 @@ bool IsDriverCacheSignatureCompatibleForTest(std::string_view cached_signature,
 	return IsDriverCacheSignatureCompatible(cached_signature, expected_signature);
 }
 
+std::string DriverCacheFileNameForTest(std::string_view title_id,
+                                       bool gpu_assisted_validation) {
+	return DriverCacheFileName(title_id, gpu_assisted_validation);
+}
+
+std::string FormatDriverCacheSignatureForTest(
+    std::string_view git_revision, std::string_view worktree_fingerprint, uint32_t vendor_id,
+    uint32_t device_id, uint32_t driver_version, std::string_view pipeline_cache_uuid_hex,
+    bool gpu_assisted_validation) {
+	return FormatDriverCacheSignature(git_revision, worktree_fingerprint, vendor_id, device_id,
+	                                  driver_version, pipeline_cache_uuid_hex,
+	                                  gpu_assisted_validation);
+}
+
 void PipelineCache::InitializeDriverCache() {
 	const auto title_id = PipelineCacheTitleId();
 	if (title_id.empty()) {
@@ -907,7 +1075,9 @@ void PipelineCache::InitializeDriverCache() {
 		return;
 	}
 
-	m_driver_cache_path     = std::filesystem::path("_PipelineCache") / (title_id + ".bin");
+	m_driver_cache_path =
+	    std::filesystem::path("_PipelineCache") /
+	    DriverCacheFileName(title_id, Config::GpuAssistedValidationEnabled());
 	const auto path         = Common::PathToString(m_driver_cache_path);
 	const bool cache_exists = Common::File::IsFileExisting(m_driver_cache_path);
 	if (cache_exists) {

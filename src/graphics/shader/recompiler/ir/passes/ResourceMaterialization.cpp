@@ -819,7 +819,40 @@ bool MaterializeBoundedReads(const ResourcePlan& program, const SrtRuntime& runt
 	}
 	SrtRuntime clean_runtime = runtime;
 	clean_runtime.read_memory = runtime.read_specialization_memory;
+
+	// Workgroup-axis coefficient tables are indexed by WorkgroupId, so the live
+	// index domain is whatever the current dispatch launches. Baking that count into
+	// ResourceSpecialization forced a new SPIR-V / CreatePipeline per grid size
+	// (Yōtei CS 54904: 4× ~270s GPUAV compiles). Reserve a stable equal share of the
+	// combined probe budget per workgroup-axis column so layout.count / flat_offset
+	// stay pipeline-identity stable while the snapshot still stores only the live
+	// words for this dispatch.
+	uint32_t workgroup_columns = 0;
+	for (const auto& read: program.bounded_srt_reads) {
+		if (read.workgroup_axis != UINT32_MAX) {
+			++workgroup_columns;
+		}
+	}
+	const uint32_t workgroup_reserve =
+	    workgroup_columns == 0
+	        ? 0u
+	        : static_cast<uint32_t>(MaxIndirectImageProbes / workgroup_columns);
+	if (workgroup_columns != 0 && workgroup_reserve == 0u) {
+		return SpecializationFail("workgroup bounded SRT columns exceed the combined probe budget");
+	}
+
+	auto& flat = snapshot.resources.flattened_srt;
+	if (workgroup_columns != 0) {
+		const uint64_t reserved_words =
+		    uint64_t{workgroup_reserve} * workgroup_columns;
+		if (reserved_words > MaxBoundedSnapshotWords || reserved_words > UINT32_MAX) {
+			return SpecializationFail("workgroup bounded SRT reserved layout exceeds snapshot budget");
+		}
+		flat.assign(static_cast<size_t>(reserved_words), 0u);
+	}
+
 	uint64_t snapshot_words = 0;
+	uint32_t workgroup_slot = 0;
 	for (uint32_t id = 0; id < program.bounded_srt_reads.size(); id++) {
 		const auto& read = program.bounded_srt_reads[id];
 		const auto* address_source = Source(program, read.address_source);
@@ -828,7 +861,8 @@ bool MaterializeBoundedReads(const ResourcePlan& program, const SrtRuntime& runt
 			return SpecializationFail("bounded SRT read has invalid address source width");
 		}
 		uint32_t size = 0;
-		if (read.workgroup_axis != UINT32_MAX) {
+		const bool workgroup_column = read.workgroup_axis != UINT32_MAX;
+		if (workgroup_column) {
 			if (read.workgroup_axis >= 3u || read.count_source != UINT32_MAX ||
 			    !runtime.compute_workgroups.has_value()) {
 				return SpecializationFail(fmt::format(
@@ -839,6 +873,11 @@ bool MaterializeBoundedReads(const ResourcePlan& program, const SrtRuntime& runt
 			// These are guest counts, before host wave partitioning, not local sizes.
 			if (std::ranges::all_of(groups, [](uint32_t count) { return count != 0u; })) {
 				size = groups[read.workgroup_axis];
+			}
+			if (size > workgroup_reserve) {
+				return SpecializationFail(fmt::format(
+				    "bounded SRT read {} workgroup count {} exceeds stable per-column reserve {}",
+				    id, size, workgroup_reserve));
 			}
 		} else {
 			const auto* count_source = Source(program, read.count_source);
@@ -854,7 +893,8 @@ bool MaterializeBoundedReads(const ResourcePlan& program, const SrtRuntime& runt
 		}
 		if (size > MaxIndirectImageProbes ||
 		    snapshot_words > MaxBoundedSnapshotWords - uint64_t{size} ||
-		    snapshot.resources.flattened_srt.size() > UINT32_MAX - uint64_t{size}) {
+		    (!workgroup_column &&
+		     flat.size() > UINT32_MAX - uint64_t{size})) {
 			return SpecializationFail(fmt::format(
 			    "bounded SRT read {} exceeds the candidate/snapshot limit "
 			    "(count={} stride={} bias={} words={} candidate_limit={} word_limit={})",
@@ -862,9 +902,17 @@ bool MaterializeBoundedReads(const ResourcePlan& program, const SrtRuntime& runt
 			    MaxIndirectImageProbes, MaxBoundedSnapshotWords));
 		}
 		snapshot_words += size;
-		auto& flat = snapshot.resources.flattened_srt;
-		const auto start = static_cast<uint32_t>(flat.size());
-		snapshot.bounded_srt_reads.push_back({size, start});
+
+		uint32_t start = 0;
+		uint32_t layout_count = size;
+		if (workgroup_column) {
+			start = workgroup_slot * workgroup_reserve;
+			layout_count = workgroup_reserve;
+			++workgroup_slot;
+		} else {
+			start = static_cast<uint32_t>(flat.size());
+		}
+		snapshot.bounded_srt_reads.push_back({layout_count, start});
 		if (size == 0u) {
 			continue; // The proved guard makes the read unreachable; do not dereference its table.
 		}
@@ -892,7 +940,11 @@ bool MaterializeBoundedReads(const ResourcePlan& program, const SrtRuntime& runt
 				if (aligned > bytes || bytes - aligned < sizeof(uint32_t)) {
 					// Scalar buffer loads return zero outside the descriptor extent. Preserve that
 					// guest result in the candidate snapshot without touching host memory.
-					flat.push_back(0u);
+					if (workgroup_column) {
+						flat[start + index] = 0u;
+					} else {
+						flat.push_back(0u);
+					}
 					continue;
 				}
 				offset = static_cast<int64_t>(aligned);
@@ -914,18 +966,20 @@ bool MaterializeBoundedReads(const ResourcePlan& program, const SrtRuntime& runt
 			// Dense workgroup / selector snapshots enumerate every proved index.
 			// Unmapped foreign rows keep table width with a zero word — same guest
 			// result as a scalar buffer load past its mapped extent.
+			uint32_t word = 0;
 			if (runtime.clamp_memory_range != nullptr &&
 			    runtime.clamp_memory_range(runtime.userdata, address, sizeof(uint32_t)) == 0u) {
-				flat.push_back(0u);
-				continue;
-			}
-			uint32_t word = 0;
-			if (!ReadSpecializationWord(runtime, address, word)) {
+				word = 0u;
+			} else if (!ReadSpecializationWord(runtime, address, word)) {
 				return SpecializationFail(fmt::format(
 				    "bounded SRT read {} index {} cannot read coherent source at 0x{:x}", id, index,
 				    address));
 			}
-			flat.push_back(word);
+			if (workgroup_column) {
+				flat[start + index] = word;
+			} else {
+				flat.push_back(word);
+			}
 		}
 	}
 	return true;
@@ -2762,6 +2816,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 			}
 			EXIT_IF(image.indirect_root == memory.resource &&
 			        inst.GetOpcode() != ValueOpcode::ImageSampleRaw &&
+			        inst.GetOpcode() != ValueOpcode::ImageGatherRaw &&
 			        inst.GetOpcode() != ValueOpcode::ImageRead &&
 			        inst.GetOpcode() != ValueOpcode::ImageWrite);
 		}

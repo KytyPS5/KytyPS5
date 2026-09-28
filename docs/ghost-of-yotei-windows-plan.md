@@ -1,7 +1,42 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
-Обновлено **27 сентября 2026 года**. Игра: **Ghost of Yōtei, PPSA26344**.
+Обновлено **28 сентября 2026 года**. Игра: **Ghost of Yōtei, PPSA26344**.
 Рабочая ветка — `yotei-windows-bringup` в локальном fork `fxpw/KytyPS5`.
+
+Checkpoint bounded zero-stride lowering **28 сентября 2026 года**:
+
+- `56429ffd` — переносимая aggregate initialization двух CPU fixtures вместо
+  zero-argument optional emplace (точный CI d690678c: Windows/macOS GREEN,
+  Linux compile RED). `ea76c166` — общий candidate-specific vector OOB lowering
+  для bounded buffer tables; normal candidates читают данные, mode-0 zero-stride
+  возвращают ISA-defined zero/SEL_1 defaults, включая D16 packing. Scalar-buffer
+  reads сохраняют отдельный bounds path. Workgroup bounds не подменяются count.
+- RED до production fix записан в `docs/emulator-test-debt.md`, включая повтор
+  исправленного D16 encoding на исходном production. GPU numerical GREEN 4/4:
+  Raw, Formatted, D16, Scalar; четыре соседних selectors GREEN. Логи
+  `_Build/logs/bounded-zero-*-final-20260928.txt` и `bounded-zero-neighbor-*.txt`.
+- Native Windows MSVC Developer Environment: emulator, launcher, kyty_tests
+  build/install GREEN; focused CTest **22/22**. Логи
+  `bounded-zero-native-{build,ctest,install}-20260928.log`. Исходники:
+  d690678c + проверенные изменения, сохранённые в 56429ffd/ea76c166;
+  binary SHA-256 `E2CA13121A9D57058FDB9BAF7CE402A4531A1F97DF909672FC93947A5EE68232`.
+- Первый 1280×720 GPUAV+SyncDiag retry `yotei-integrated-20260928-162700-menucheck-gpuav-sync`:
+  timeout 180s, exit -1, shown=53. Это остановка watchdog, не emulator crash.
+- Повтор `yotei-integrated-20260928-163025-menucheck-gpuav-sync`:
+  UTC 16:30:25.8741454 → 16:33:48.6334300, естественный exit **321**, shown=**161**.
+  Старый zero-stride blocker пройден; достигнуты 128 CS / 25 PS / 12 VS.
+  Новая граница: `MaterializeResources failed ... bounded SRT materialization failed`
+  в CS `8457901d80b91921`, dispatch 2×1×1, до SPIR-V emit этого shader.
+- DesktopCopy активного собственного окна `window-desktop-initial.png` при shown=7
+  показывает чёрную игровую область. `window-printwindow-later.png` при shown=160
+  — дополнительный capture; PrintWindow сам по себе не доказывает GPU pixels.
+  Readback отключён: transition перед image-to-buffer copy ещё не проверен.
+  Ненулевой кадр, меню и gameplay **не подтверждены**. После обоих retries
+  emulator/shader tests/ninja/MSBuild процессов нет.
+- Normal push до ea76c166 выполнен. Свежий upstream main — 22ff4693,
+  PR #497 снова CONFLICTING; новая интеграция и её повторная проверка pending.
+  Следующее: интегрировать новые общие resource/memory/CFG corrections,
+  локализовать bounded snapshot отказ без ослабления alias/readability/probe limits.
 
 Checkpoint интеграции upstream и повторного game retry **27 сентября 2026 года**:
 

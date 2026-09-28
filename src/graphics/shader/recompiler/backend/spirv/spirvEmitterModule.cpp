@@ -684,8 +684,8 @@ void DefineModule(EmitterState& state) {
 	state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeSignedZeroInfNanPreserve,
 	                               32u);
 	if (state.requirements.float64) {
-		EXIT_NOT_IMPLEMENTED(state.program.stage != ShaderType::Compute);
-		EXIT_NOT_IMPLEMENTED(state.input_info.compute->float_mode != 0xc0);
+		EXIT_NOT_IMPLEMENTED(state.program.stage == ShaderType::Compute &&
+		                     state.input_info.compute->float_mode != 0xc0);
 		// MODE=0xc0 uses round-to-nearest-even and preserves FP64 input/output denormals.
 		state.builder.RequireCapability(spv::CapabilityFloat64);
 		state.builder.RequireCapability(spv::CapabilityRoundingModeRTE);

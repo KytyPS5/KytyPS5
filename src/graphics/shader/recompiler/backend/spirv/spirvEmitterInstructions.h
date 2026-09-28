@@ -31,7 +31,9 @@ uint32_t EmitConvertSigned32ToFloat(EmitterState& state, uint32_t arg0) {
 inline constexpr auto EmitConvertF32S32 = EmitConvertSigned32ToFloat<IR::Type::F32>;
 inline constexpr auto EmitConvertF64S32 = EmitConvertSigned32ToFloat<IR::Type::F64>;
 uint32_t              EmitConvertF32F64(EmitterState& state, uint32_t arg0);
+uint32_t              EmitConvertF64F32(EmitterState& state, uint32_t arg0);
 EMIT_NATIVE(ConvertF32U32, OpConvertUToF, F32, uint32_t)
+EMIT_NATIVE(ConvertF64U32, OpConvertUToF, F64, uint32_t)
 EMIT_NATIVE(CompositeConstructU64, OpCompositeConstruct, U64, uint32_t, uint32_t)
 EMIT_NATIVE(CompositeConstructU32x2, OpCompositeConstruct, U32x2, uint32_t, uint32_t)
 EMIT_NATIVE(CompositeConstructU32x3, OpCompositeConstruct, U32x3, uint32_t, uint32_t, uint32_t)

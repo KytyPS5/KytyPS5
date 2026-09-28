@@ -89,6 +89,8 @@ constexpr OpcodeMap VOP1_OPCODE_LIST[] = {
     {0x02u, Opcode::V_READFIRSTLANE_B32},
     {0x04u, Opcode::V_CVT_F64_I32},
     {0x0fu, Opcode::V_CVT_F32_F64},
+    {0x10u, Opcode::V_CVT_F64_F32},
+    {0x16u, Opcode::V_CVT_F64_U32},
     {0x2fu, Opcode::V_RCP_F64},
     {0x05u, Opcode::V_CVT_F32_I32},
     {0x06u, Opcode::V_CVT_F32_U32},
@@ -151,6 +153,8 @@ constexpr OpcodeMap VOP3_ENCODED_VOP1_OPCODE_LIST[] = {
     {0x02u, Opcode::V_READFIRSTLANE_B32},
     {0x04u, Opcode::V_CVT_F64_I32},
     {0x0fu, Opcode::V_CVT_F32_F64},
+    {0x10u, Opcode::V_CVT_F64_F32},
+    {0x16u, Opcode::V_CVT_F64_U32},
     {0x2fu, Opcode::V_RCP_F64},
     {0x05u, Opcode::V_CVT_F32_I32},
     {0x06u, Opcode::V_CVT_F32_U32},
@@ -461,6 +465,7 @@ bool IsVopcCompareExec(Opcode opcode);
 bool IsVop1FloatSourceOpcode(Opcode opcode) {
 	switch (opcode) {
 		case Opcode::V_CVT_F32_F64:
+		case Opcode::V_CVT_F64_F32:
 		case Opcode::V_RCP_F64:
 		case Opcode::V_MOV_B32:
 		case Opcode::V_CVT_F32_F16:
@@ -721,6 +726,7 @@ void ApplyDppModifier(Operand& operand, uint32_t modifier, uint32_t encoding) {
 void DecodeVop1Dpp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
                    uint32_t opcode, uint32_t vdst, Instruction& inst) {
 	if (inst.opcode == Opcode::V_CVT_F64_I32 || inst.opcode == Opcode::V_CVT_F32_F64 ||
+	    inst.opcode == Opcode::V_CVT_F64_F32 || inst.opcode == Opcode::V_CVT_F64_U32 ||
 	    inst.opcode == Opcode::V_RCP_F64) {
 		SetUnsupported(inst, Family::VOP1, opcode, "FP64 instructions do not support DPP");
 		return;

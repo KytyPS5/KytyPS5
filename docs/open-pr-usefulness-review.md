@@ -2,7 +2,32 @@
 
 # Открытые PR KytyPS5: что полезно для текущего bring-up
 
-## Полный переснимок 26 сентября 2026 (113 open)
+## Выборочная актуализация 28 сентября 2026
+
+Ветка `yotei-windows-bringup`: merge `10961866` содержит upstream main
+`8e61798b`. PR #497 после normal push MERGEABLE; exact-head CI
+[36467910181](https://github.com/KytyPS5/KytyPS5/actions/runs/36467910181)
+ещё выполняется. Это выборочный обзор свежих candidates, не новый полный census.
+
+Текущая подтверждённая runtime граница: retry `2e3a2a13`, 1280×720,
+`maxShown=101`, CS `5f3fdf61a7ca4a20` PC 0x26c image descriptor origin.
+Два DesktopCopy показывают чёрную client area. Ненулевой кадр / меню / gameplay
+не подтверждены. Историческое утверждение о spinner ниже не является текущим
+доказательством и не переносится на эту revision.
+
+- #852 (`ae39466e`), mixed indirect image candidates/bounded keys: CONFLICTING,
+  reviewed metadata/files/diff, зависит от #811 и пересекается с уже selectively
+  integrated image/table механизмами. Требует независимой nested image-loop RED
+  против текущей ветки; whole PR не интегрирован и не признан решением 5f3f.
+- #877 (`9cd1eb7d`), fault manager performance: metadata + diff inspected.
+  В faultManager.cpp diff содержит дублированные closing blocks и обращения к
+  count/index/fault_ranges вне scope. Не интегрирован; build не заявляется.
+- #869 (`43345a76`), fault counter capacity: metadata inspected, полезный
+  отдельный bounds candidate; локального RED/GREEN и integration нет.
+- #857, #876, #875: видны в свежем open list; deep review/build не выполнены.
+  Ни один из этих PR не объявляется подтверждённым menu fix.
+
+## Исторический полный переснимок 26 сентября 2026 (113 open)
 
 GitHub REST `state=open&per_page=100` (paginate) → **113** открытых PR
 (range #148–#845, drafts=5).
@@ -18,7 +43,7 @@ Long run `…-081840`: watchdog **shown=159** — CS `54904fb4` 4× CreatePipeli
 shader/GPU/Windows candidates. Не утверждение, что все 113 собраны и
 прогнаны на GPU.
 
-### Короткий вывод (актуально)
+### Короткий вывод (исторический snapshot 26.09)
 
 - Готового чужого PR «целиком → меню Yōtei» **нет**.
 - **Merge 26.09 после `…-081840`:** ничего не влито в #497 — ни один open PR

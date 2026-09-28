@@ -58,6 +58,16 @@ finite/bounded table proof and guarded memory snapshots in a synthetic native-CF
 image regression; retain unknown/unbounded/conditional-root and writable-alias
 rejections. Desktop captures remain black; no rendered image/menu claim.
 
+Additional 2026-09-28 evidence: merge 10961866 real retry
+`yotei-integrated-20260928-185252-menucheck-gpuav-sync`, maxShown=92,
+black DesktopCopy shown=6/65, same image-origin exit 321. CPU-only captured-shader
+audit also fails at PC 0x26c in both explicit legacy needs_lds_barriers profiles;
+logs `srt-5f3f-cpu-audit-input-fixed-{false,true}-20260928`. Initial input_error
+from a missing compute.needs_lds_barriers is excluded from reproduction evidence.
+Next synthetic fixture must cover nested constant post-test loops with scalar image
+address induction, canonical/native CFG origin, writes and invalid bounds. Keep
+shader-write and runtime-value rejection until a supported proof is established.
+
 ## Pending neighboring unaligned scalar-buffer read (2026-09-28)
 
 Additional numerical test `--unaligned-scalar-buffer-load-only` fails 1024/1032

@@ -3,6 +3,28 @@
 Обновлено **28 сентября 2026 года**. Игра: **Ghost of Yōtei, PPSA26344**.
 Рабочая ветка — `yotei-windows-bringup` в локальном fork `fxpw/KytyPS5`.
 
+Checkpoint upstream merge `10961866` **28 сентября 2026 года**:
+
+- Committed native Windows build/install GREEN; required CTest 22/22,
+  NGS2/ATRAC9 GREEN. Partial-mip CPU + native EXEC full/upper + bounded store
+  + zero-stride OOB numerical GPU fixtures GREEN (`merge-10961866-*`).
+- Retry `yotei-integrated-20260928-185252-menucheck-gpuav-sync`, 1280×720,
+  GPUAV+SyncDiag, readback disabled, UTC 18:52:52.8928254 → 18:53:59.4207626,
+  exit 321, maxShown=92. Emulator SHA-256
+  `E2410310C5C3CB5B8F1C4D7AC63BA5E38B163FF40A20109DC25B3FF94730CEB1`.
+  Та же граница: CS `5f3fdf61a7ca4a20`, PC 0x26c, GetImageResource dword 0
+  rejects root LoadAddressU32. DesktopCopy shown=6/65 — чёрная client area.
+  Ненулевой кадр / меню / gameplay не подтверждены. Все task-owned процессы закрыты.
+- CPU-only audit старого dispatched capture воспроизводит тот же image tracking
+  error в двух явно заданных legacy barrier profiles. Logs
+  `srt-5f3f-cpu-audit-input-fixed-{false,true}-20260928.*`; profile inputs kept
+  under `_Build/analysis/srt-5f3f-cpu-profiles-20260928`. Первый audit имел
+  input_error (не reproduction); corrected profiles дали intended exit 321.
+- Normal push выполнен; PR #497 MERGEABLE. Exact-source CI `36467910181`
+  выполняется, GREEN ещё не объявляется. Fresh PR selective review:
+  `docs/open-pr-usefulness-review.md`. Полный compute/cache suite не GREEN:
+  DCC/video-out alias и unaligned scalar-buffer read остаются отдельным debt.
+
 Checkpoint реального запуска `2e3a2a13` **28 сентября 2026 года**:
 
 - Native Windows committed build/install GREEN. Retry
@@ -1381,17 +1403,17 @@ cooperative SSBO, #459 и #476 — 46/46 за 39,24 с и 9 последоват
 
 | Поле | Значение |
 | --- | --- |
-| Source | `2e3a2a13` (committed) |
+| Source | `10961866` (committed) |
 | Версия / каталог игры | `01.512.000`, `G:\games\Kyty\PPSA26344\PPSA26344` |
-| Завершённый run | `_Build/runs/yotei-integrated-20260928-183223-menucheck-gpuav-sync` |
-| SHA-256 emulator | `2B57A93F6350BB1F95CB083BA2CCD197CA2C8AC1AD0EBEF5B5DD7CAACB264D9D` |
-| Время UTC | `2026-09-28T18:32:23.4871409Z` → `18:35:19.0282480Z` |
+| Завершённый run | `_Build/runs/yotei-integrated-20260928-185252-menucheck-gpuav-sync` |
+| SHA-256 emulator | `E2410310C5C3CB5B8F1C4D7AC63BA5E38B163FF40A20109DC25B3FF94730CEB1` |
+| Время UTC | `2026-09-28T18:52:52.8928254Z` → `18:53:59.4207626Z` |
 | Режим | Native Windows / RTX 5060 Ti, окно 1280×720, GPUAV shader instrumentation + SyncDiag; readback disabled |
 | Завершение | Естественный exit 321; task-owned processes закрыты |
-| Прогресс | maxShown=101; новая граница CS `5f3fdf61a7ca4a20` PC 0x26c GetImageResource / LoadAddressU32 |
-| Пиксели | DesktopCopy shown=0/66: чёрная client area; ненулевой кадр / меню / gameplay не подтверждены |
+| Прогресс | maxShown=92; та же граница CS `5f3fdf61a7ca4a20` PC 0x26c GetImageResource / LoadAddressU32 |
+| Пиксели | DesktopCopy shown=6/65: чёрная client area; ненулевой кадр / меню / gameplay не подтверждены |
 | Подтверждённый отдельный blocker | Старый saved `b90e…` standalone probe compiler crash; GPUAV позволяет пройти эту точку в игре |
-| Следующая проверка | Свежий upstream 8e61798b merge/build/affected tests; image-origin regression и pixel proof |
+| Следующая проверка | Synthetic nested image-origin regression (CPU reproduction available), shared fix и pixel proof |
 
 
 ### Исторические performance наблюдения (сентябрь 2026)

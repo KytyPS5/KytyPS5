@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <fmt/format.h>
+#include <numeric>
 #include <optional>
 #include <span>
 #include <utility>
@@ -1204,7 +1205,7 @@ private:
 			const auto* memory = material_read != nullptr
 			                         ? ScalarReadMemory(*material_read, material_memory_index) : nullptr;
 			if (table_offset != 0u || memory == nullptr || memory->kind != ResourceKind::ScalarBuffer ||
-			    memory->offset != 0u || !MemoryIndexBelongsTo(material_memory_index, *material_read)) {
+			    memory->offset > INT32_MAX || !MemoryIndexBelongsTo(material_memory_index, *material_read)) {
 				return false;
 			}
 			Value selector;
@@ -1212,6 +1213,9 @@ private:
 			                         indirect.selector_offset)) {
 				return false;
 			}
+			const auto step = std::gcd<uint64_t>(indirect.selector_stride, uint64_t {1} << 32u);
+			indirect.selector_offset =
+			    (static_cast<uint32_t>(indirect.selector_offset % step) & ~3u) + (memory->offset & ~3u);
 			const auto* shift = plan.reads[0]->Arg(1).Resolve().TryInstruction();
 			const std::array<const Inst*, 1> material_users {shift};
 			if (!UsesOnly(*material_read, material_users) || !UsesOnly(*shift, plan.reads)) {

@@ -206,8 +206,9 @@ bool ReadLinearTestMemory(void *userdata, uint64_t address, std::span<uint32_t> 
 }
 
 std::unique_ptr<Fixture>
-MakeIndirectImageFixture(bool malformed, uint32_t material_immediate = 0,
-                         bool memory_backed_material = false) {
+MakeIndirectImageFixture(bool malformed, uint32_t material_immediate = 4,
+                         bool memory_backed_material = false, uint32_t member_offset = 0,
+                         uint32_t material_stride = 224) {
   auto fixture = std::make_unique<Fixture>();
   std::array<Value, 4> material_words;
   std::array<Value, 4> heap_words;
@@ -249,9 +250,9 @@ MakeIndirectImageFixture(bool malformed, uint32_t material_immediate = 0,
   const auto selector = fixture->Emit(ValueOpcode::ReadFirstLane,
                                       {invocation, Value(true)});
   const auto record =
-      fixture->Emit(ValueOpcode::IMul32, {selector, Value(224u)});
-  const auto member = fixture->Emit(ValueOpcode::IAdd32, {record, Value(4u)});
-  fixture->Emit(ValueOpcode::ReferenceU32, {record});
+      fixture->Emit(ValueOpcode::IMul32, {selector, Value(material_stride)});
+  const auto member = member_offset == 0 ? record :
+      fixture->Emit(ValueOpcode::IAdd32, {record, Value(member_offset)});
   fixture->Emit(ValueOpcode::ReferenceU32, {member});
   MemoryInfo material_scalar;
   material_scalar.kind = ResourceKind::ScalarBuffer;
@@ -497,7 +498,7 @@ void TestInvariantIndirectImageMaterialization() {
             rebound_specialization != collapsed_specialization,
         "larger indirect candidate topology reused the old specialization");
 
-  auto memory_backed = MakeIndirectImageFixture(false, 0u, true);
+  auto memory_backed = MakeIndirectImageFixture(false, 4u, true);
   memory_backed->PlanAndTrack();
   auto memory_backed_plan = ExtractResourcePlan(memory_backed->program);
   EliminateDeadCode(memory_backed->program.blocks);
@@ -550,13 +551,34 @@ void TestInvariantIndirectImageMaterialization() {
             malformed->program.descriptor_sources.empty(),
         "malformed indirect image pattern was partially accepted");
 
-  auto wrapped_immediate = MakeIndirectImageFixture(false, 4u);
-
-  CheckFatal([&] { wrapped_immediate->PlanAndTrack(); },
+  auto negative_immediate = MakeIndirectImageFixture(false, 0xfffffffcu);
+  CheckFatal([&] { negative_immediate->PlanAndTrack(); },
              "not a valid runtime value",
-             "wrapped scalar immediate entered the invariant image proof");
-  Check(!wrapped_immediate->program.resource_tracking_complete,
-        "wrapped scalar immediate entered the invariant image proof");
+             "negative scalar immediate entered the indirect image proof");
+
+  for (const auto [immediate, member, first, stride] :
+       {std::array{0u, 4u, 4u, 224u}, std::array{4u, 4u, 8u, 224u},
+        std::array{36u, 0u, 36u, 224u}, std::array{1u, 3u, 0u, 224u},
+        std::array{1u, 3u, 0u, 1u}, std::array{1u, 3u, 0u, 2u}}) {
+    auto split_offset = MakeIndirectImageFixture(false, immediate, false, member, stride);
+    split_offset->PlanAndTrack();
+    const auto split_plan = ExtractResourcePlan(split_offset->program);
+    LinearTestMemory split_memory;
+    std::copy(image_descriptor.begin(), image_descriptor.end(),
+              split_memory.words.begin() + 0x1000u / 4u);
+    split_memory.fail_address = first == 36u ? 0x1004u : UINT64_MAX;
+    split_memory.watched_address = split_memory.base + first;
+    user_data[1] = stride << 16u;
+    user_data[2] = stride < 4u ? 8u / stride : 1u;
+    SrtRuntime split_runtime{.user_data = user_data,
+                             .userdata = &split_memory,
+                             .read_specialization_memory = ReadLinearTestMemory};
+    Check(MaterializeResources(split_plan, split_runtime, snapshot, specialization) &&
+              snapshot.images.size() == 1 &&
+              snapshot.images[0].dwords == image_descriptor &&
+              split_memory.watched_reads == 1u,
+          "indirect scalar offsets did not align and bound their components independently");
+  }
 }
 
 void TestGuardedDirectImageTable() {

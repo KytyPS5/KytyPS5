@@ -488,35 +488,34 @@ void TestSharedIntegerRuntimeDependencies() {
 }
 
 void TestConstantBufferBounds() {
-  Fixture fixture;
-  const auto memory = fixture.AddMemory(ResourceKind::ScalarBuffer);
-  const auto buffer =
-      fixture.Emit(ValueOpcode::GetBufferResource,
-                   {Value(0x3000u), Value(0u), Value(16u), Value(0u)});
-  const auto read = fixture.EmitMemory(ValueOpcode::ReadConstBuffer,
-                                       {buffer, Value(12u)}, memory);
-  LoadBuffer(fixture, {read, Value(0u), Value(16u), Value(0u)});
-  fixture.Plan();
+  struct Case {
+    uint32_t offset;
+    uint32_t immediate;
+    bool valid;
+    uint32_t expected;
+  };
+  for (const auto &test : {Case{12u, 0u, true, 0xa5a5a5a5u},
+                           Case{3u, 1u, true, 0x12345678u},
+                           Case{0xfffffffcu, 4u, false, 0u},
+                           Case{16u, 0u, false, 0u}}) {
+    Fixture fixture;
+    const auto memory = fixture.AddMemory(ResourceKind::ScalarBuffer, test.immediate);
+    const auto buffer =
+        fixture.Emit(ValueOpcode::GetBufferResource,
+                     {Value(0x3000u), Value(0u), Value(16u), Value(0u)});
+    const auto read = fixture.EmitMemory(ValueOpcode::ReadConstBuffer,
+                                         {buffer, Value(test.offset)}, memory);
+    LoadBuffer(fixture, {read, Value(0u), Value(16u), Value(0u)});
+    fixture.Plan();
 
-  TestMemory memory_image{{{0x300cu, 0xa5a5a5a5u}}};
-  SrtRuntime runtime{.read_memory = ReadMemory, .userdata = &memory_image};
-  std::vector<uint32_t> flat;
-  Check(SrtWalker(fixture.program, runtime).RefreshFlatBuffer(flat) &&
-            flat == std::vector<uint32_t>{0xa5a5a5a5u},
-        "constant-buffer SRT walk failed");
-
-  Fixture overflow;
-  const auto overflow_memory = overflow.AddMemory(ResourceKind::ScalarBuffer);
-  const auto overflow_buffer =
-      overflow.Emit(ValueOpcode::GetBufferResource,
-                    {Value(0x3000u), Value(0u), Value(16u), Value(0u)});
-  const auto overflow_read =
-      overflow.EmitMemory(ValueOpcode::ReadConstBuffer,
-                          {overflow_buffer, Value(16u)}, overflow_memory);
-  LoadBuffer(overflow, {overflow_read, Value(0u), Value(16u), Value(0u)});
-  overflow.Plan();
-  Check(!SrtWalker(overflow.program, runtime).RefreshFlatBuffer(flat),
-        "out-of-bounds constant-buffer walk was accepted");
+    TestMemory memory_image{{{0x3000u, 0x12345678u}, {0x300cu, 0xa5a5a5a5u}}};
+    SrtRuntime runtime{.read_memory = ReadMemory, .userdata = &memory_image};
+    std::vector<uint32_t> flat;
+    Check(SrtWalker(fixture.program, runtime).RefreshFlatBuffer(flat) == test.valid,
+          "constant-buffer walk misaligned or wrapped its offset components");
+    Check(test.valid ? flat == std::vector<uint32_t>{test.expected} : memory_image.reads == 0,
+          "constant-buffer walk read the wrong word or accessed an out-of-bounds address");
+  }
 }
 
 void TestReadLaneElimination() {

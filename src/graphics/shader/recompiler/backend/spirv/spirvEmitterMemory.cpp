@@ -1187,10 +1187,11 @@ void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (mem.planning_only) return;
 	auto& state        = ctx.state;
 	mem.kind           = IR::ResourceKind::ScalarBuffer;
-	const auto address = Binary(state, spv::OpIAdd, TypeU32(state), ctx.Arg(inst, 1),
-	                            ConstantU32(state, mem.offset));
-	const auto index =
-	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), address, ConstantU32(state, 2));
+	auto index = Binary(state, spv::OpShiftRightLogical, TypeU32(state), ctx.Arg(inst, 1),
+	                    ConstantU32(state, 2));
+	if (mem.offset >= 4u) {
+		index = Binary(state, spv::OpIAdd, TypeU32(state), index, ConstantU32(state, mem.offset >> 2u));
+	}
 	const auto access    = PrepareMemoryResourceAccess(state, mem);
 	const auto element   = EmitMemoryElementIndex(state, access, index);
 	const auto condition = EmitMemoryElementInBounds(state, access, element);

@@ -456,16 +456,15 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 			return false;
 		}
 		const auto byte_offset =
-		    static_cast<uint64_t>(immediate) + static_cast<uint32_t>(offset);
-		const auto aligned = byte_offset & ~uint64_t {3};
+		    (static_cast<uint64_t>(immediate) & ~uint64_t {3}) + (static_cast<uint32_t>(offset) & ~3u);
 		const auto stride  = (static_cast<uint32_t>(high) >> 16u) & 0x3fffu;
 		const auto size = stride == 0u
 		                      ? static_cast<uint64_t>(static_cast<uint32_t>(records))
 		                      : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
-		if (aligned > size || size - aligned < sizeof(uint32_t)) {
+		if (byte_offset > size || size - byte_offset < sizeof(uint32_t)) {
 			return false;
 		}
-		address = ((base & ~uint64_t {3}) + byte_offset) & ~uint64_t {3};
+		address = (base & ~uint64_t {3}) + byte_offset;
 	} else {
 		const auto relative = (immediate & ~int64_t {3}) +
 		                      static_cast<int64_t>(static_cast<uint32_t>(offset) & ~3u);

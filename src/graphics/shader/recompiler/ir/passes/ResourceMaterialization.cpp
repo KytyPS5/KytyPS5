@@ -225,9 +225,9 @@ void MarkCleanFlatSlots(const ResourcePlan& program, const DescriptorSource* sou
 	}
 }
 
-bool ReadScalarTable(uint64_t base, uint64_t size, uint32_t dynamic_offset,
+bool ReadScalarTable(uint64_t base, uint64_t size, uint64_t dynamic_offset,
                      const SrtRuntime& runtime, std::span<uint32_t> words) {
-	const auto offset = static_cast<uint64_t>(dynamic_offset) & ~uint64_t {3};
+	const auto offset = dynamic_offset & ~uint64_t {3};
 	const auto count = std::min<uint64_t>(words.size(), offset < size ? (size - offset) / 4u : 0u);
 	std::ranges::fill(words.subspan(count), 0u);
 	if (count == 0u) {
@@ -306,26 +306,24 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 		    material.Stride() != indirect.selector_stride) {
 			return false;
 		}
-		// Enumerate every wrapped scalar-buffer offset that can pass the descriptor bounds.
-		const auto step = std::gcd<uint64_t>(indirect.selector_stride, uint64_t {1} << 32u);
-		const auto residue = static_cast<uint64_t>(indirect.selector_offset) % step;
-		const auto limit = std::min<uint64_t>(UINT32_MAX, material.GetSize() + 3u);
-		const auto probe_count = residue <= limit ? (limit - residue) / step + 1u : 0u;
+		// The first aligned offset includes the immediate added after shader U32 arithmetic.
+		const auto step = std::max<uint64_t>(4u,
+		    std::gcd<uint64_t>(indirect.selector_stride, uint64_t {1} << 32u));
+		const uint64_t first = indirect.selector_offset;
+		const auto size = material.GetSize();
+		const auto limit = std::min(first + (uint64_t {1} << 32u) - step, size >= 4u ? size - 4u : 0u);
+		const auto probe_count = size >= 4u && first <= limit ? (limit - first) / step + 1u : 0u;
 		if (probe_count > MaxIndirectImageProbes) {
 			return false;
 		}
 		keys.reserve(static_cast<size_t>(probe_count) + 1u);
 		keys.push_back(0u);
-		for (uint64_t offset = residue; offset <= limit && probe_count != 0u; offset += step) {
+		for (uint64_t probe = 0, offset = first; probe < probe_count; ++probe, offset += step) {
 			uint32_t key = 0;
-			if (!ReadScalarTable(material.Base48(), material.GetSize(),
-			                     static_cast<uint32_t>(offset), runtime, {&key, 1})) {
+			if (!ReadScalarTable(material.Base48(), size, offset, runtime, {&key, 1})) {
 				return false;
 			}
 			keys.push_back(key);
-			if (limit - offset < step) {
-				break;
-			}
 		}
 		std::ranges::sort(keys);
 		keys.erase(std::unique(keys.begin(), keys.end()), keys.end());

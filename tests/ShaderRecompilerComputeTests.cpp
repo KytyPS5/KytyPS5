@@ -23772,6 +23772,35 @@ TestCase ScalarMemoryLoadVariants() {
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase ScalarBufferOffsetAlignmentAndCarry() {
+  using O = ShaderOpcode;
+  std::vector<u32> code;
+  AppendSMovLiteral(&code, 12, 0xfffffffcu);
+  code.push_back(EncodeSop2(0x00, 12, 12, 4));
+  code.push_back(EncodeSmem0(0x08, 20));
+  code.push_back(EncodeSmem1(4, 12));
+  AppendSMovLiteral(&code, 12, 3u);
+  code.push_back(EncodeSop2(0x00, 12, 12, 4));
+  code.push_back(EncodeSmem0(0x08, 21));
+  code.push_back(EncodeSmem1(1, 12));
+  AppendStoreSgpr(&code, 20, 0);
+  AppendStoreSgpr(&code, 21, 1);
+  AppendEnd(&code);
+
+  TestCase test{"ScalarBufferOffsetAlignmentAndCarry", code,
+                {0x11111111u, 0x22222222u}, {0u, 0x11111111u},
+                {O::S_MOV_B32, O::S_ADD_U32, O::S_BUFFER_LOAD_DWORD,
+                 O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  test.forbidden_spirv = {"flattened_srt"};
+  test.compute_info.threads_num[0] = 1;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.group_id[0] = true;
+  test.compute_info.workgroup_register = 4;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase ScalarLoadSignedImmediateOffsetAddsSoffset() {
   using O = ShaderOpcode;
 
@@ -29888,6 +29917,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(BranchVccnzUsesCarryProducedWaveMask);
   AddCase(ScalarMemRealtimeCapturedPlaceholder);
   AddCase(ScalarMemoryLoadVariants);
+  AddCase(ScalarBufferOffsetAlignmentAndCarry);
   AddCase(ScalarLoadSignedImmediateOffsetAddsSoffset);
   AddCase(ScalarLoadAlignsComponentsAndMasksAddress);
   AddCase(ScalarLoadAlignsDynamicBase);

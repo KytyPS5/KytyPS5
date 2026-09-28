@@ -12822,10 +12822,10 @@ void TestSrtWalkerRealSBufferTranslation() {
   const auto walked = ShaderRecompiler::IR::SrtWalker(ir, runtime).RefreshFlatBuffer(flat);
   Check(walked, "SRT walk failed");
   Check(flat.size() == 4 &&
-            std::equal(flat.begin(), flat.end(), table.begin() + 1),
-        "real S_BUFFER_LOAD walk used the wrong final alignment");
+            std::equal(flat.begin(), flat.end(), table.begin()),
+        "real S_BUFFER_LOAD walk did not align offset components independently");
 
-  user_data[10] = 4 * sizeof(uint32_t);
+  user_data[10] = 3 * sizeof(uint32_t);
   const auto bounds_walked = ShaderRecompiler::IR::SrtWalker(ir, runtime).RefreshFlatBuffer(flat);
   Check(!bounds_walked, "real S_BUFFER_LOAD walk ignored descriptor bounds");
   CheckFlattenedReadSlots(

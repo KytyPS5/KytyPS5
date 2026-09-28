@@ -6997,6 +6997,49 @@ void TestSrtRawFallbackReadability() {
 
 } // namespace
 
+void TestGpuSelectedRawBufferAdmission() {
+  struct Case { ValueOpcode opcode; uint32_t words; bool formatted; bool typed; bool admitted; };
+  for (const auto input : {Case{ValueOpcode::LoadBufferU32x2, 2u, false, false, true},
+                          Case{ValueOpcode::LoadBufferU32x3, 3u, false, false, true},
+                          Case{ValueOpcode::LoadBufferU32x4, 4u, false, false, true},
+                          Case{ValueOpcode::LoadBufferU32, 1u, false, false, false},
+                          Case{ValueOpcode::LoadBufferU32x4, 4u, true, false, false},
+                          Case{ValueOpcode::LoadBufferU32x4, 4u, false, true, false},
+                          Case{ValueOpcode::StoreBufferU32, 1u, false, false, false}}) {
+    Fixture fixture;
+    fixture.program.srt_plan_complete = true;
+    const auto handle = fixture.Buffer({fixture.Emit(ValueOpcode::LaneId), Value(0u), Value(16u), Value(0x30005000u)});
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Buffer;
+    memory.data_dwords = input.words;
+    memory.formatted = input.formatted;
+    memory.typed = input.typed;
+    const auto flags = fixture.AddMemory(memory, 0x40u);
+    if (input.opcode == ValueOpcode::StoreBufferU32)
+      fixture.Emit(input.opcode, {handle, Value(0u), Value(0u), Value(0u), Value(1u), Value(true)}, flags);
+    else
+      fixture.Emit(input.opcode, {handle, Value(0u), Value(0u), Value(0u), Value(true)}, flags);
+    if (!input.admitted) {
+      CheckFatal([&] { TrackResources(fixture.program); }, "not a valid runtime value",
+                 "GPU-selected descriptor bypassed raw vector-load restriction");
+    } else {
+      TrackResources(fixture.program);
+      Check(fixture.program.memory_info[flags.index].kind == ResourceKind::IndirectBuffer &&
+                fixture.program.info.uses_dma && fixture.program.info.buffers.empty(),
+            "GPU-selected raw vector descriptor was assigned a fake host binding");
+      ResourceSnapshot snapshot;
+      ResourceSpecialization specialization;
+      auto plan = ExtractResourcePlan(fixture.program);
+      Check(MaterializeResources(plan, {}, snapshot, specialization),
+            "GPU-selected buffer unexpectedly required host descriptor materialization");
+      ApplyResourceSpecialization(fixture.program, specialization);
+      Check(fixture.program.memory_info[flags.index].kind == ResourceKind::IndirectBuffer,
+            "GPU-selected buffer was rewritten as a direct host descriptor");
+      ValidateProgram(fixture.program, true);
+    }
+  }
+}
+
 int main(int argc, char** argv) {
   try {
     if (argc == 2 && std::strcmp(argv[1], "--conditional-scalar-address-only") == 0) {
@@ -7118,6 +7161,7 @@ int main(int argc, char** argv) {
         throw std::runtime_error(std::string(name) + ": " + exception.what());
       }
     };
+    Run("GPU-selected raw buffers", TestGpuSelectedRawBufferAdmission);
     Run("dense buffers", TestDenseBufferTracking);
     Run("compute buffer fill", TestComputeBufferFill);
     Run("scalar/vector alias", TestScalarAndVectorBufferAlias);

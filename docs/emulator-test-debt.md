@@ -1,5 +1,45 @@
 # Emulator regression test debt
 
+## GPU-selected raw buffer fallback integration (2026-09-28)
+
+Game retry on a233dfe1 `yotei-integrated-20260928-173637-menucheck-gpuav-sync`
+passes the ordinary-payload SRT failure and reaches CS d8959888aafd2552,
+pc 0x1b4: dynamic LoadAddressU32 buffer dword fails host validation.
+Upstream already provides a GPU descriptor path limited by
+SupportsIndirectBufferLoad to raw DWORD x2/x3/x4, but local GetHandle always
+throws instead of returning its new false result to that guarded caller.
+Before changing production run existing numerical BufferLoadsGpuSelectedDescriptors
+and BufferLoadDwordx3GpuSelectedDescriptors; preserve x1/formatted/typed/store
+rejections and bounded-table proof failures. Do not return a null host resource.
+
+Existing numerical fixture RED: `indirect-buffer-red-20260928.txt`, exit 321
+at PC 0x30, dynamic ReadConstBuffer descriptor rejected before pipeline creation.
+Add CPU admission matrix for raw x2/x3/x4 versus x1/formatted/typed/store,
+asserting supported loads use IndirectBuffer without a fake host binding.
+
+CPU matrix RED confirmed: `indirect-buffer-cpu-red-20260928.txt`,
+raw x2 fails GetBufferResource runtime validation. Return false only for a
+buffer source validation failure after existing bounded proofs; the caller
+still enforces the raw vector contract before activating the GPU path.
+
+After admission, the unchanged GPU fixture reaches a second integration RED:
+`indirect-buffer-gpu-green-20260928.txt` asserts in host buffer remapping at
+ResourceMaterialization.cpp:2788. GPU-selected handles have no host dense index.
+Extend the CPU matrix through materialization/specialization before correcting
+that remap; raw GPU handles must retain their descriptor operands and kind.
+
+CPU plan extraction RED: `indirect-buffer-specialization-red-20260928.txt`
+throws invalid vector subscript in ResourceControlFlow: it also assumes an
+IndirectBuffer has a host source index. Exclude only IndirectBuffer from host
+source liveness and host remapping; preserve dense/table validation for other
+kinds. The unchanged GPU fixture independently reproduces the later remap.
+
+GPU-selected buffer GREEN: unchanged CPU admission/materialization matrix
+and full resource suite (`indirect-buffer-specialization-green-20260928.txt`);
+numerical x2/x4 and x3 fixtures pass (`indirect-buffer-final-*.txt`), including
+11 descriptor variations, bounds modes, swizzle, OOB tails and unmapped rows.
+Mandatory CTest 22/22 (`indirect-buffer-ctest-20260928.log`).
+
 ## Ordinary scalar payload prefetch (2026-09-28)
 
 Retry on 76d56359 reaches CS 8968b4b53e5a246a, shown=0, flat slot 209.

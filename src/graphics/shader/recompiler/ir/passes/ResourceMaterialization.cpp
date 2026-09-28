@@ -2321,7 +2321,7 @@ static std::vector<ResourceBlock> ResourceControlFlow(const Program& program) {
 				continue;
 			}
 			const auto& memory = program.memory_info.at(inst.Flags<MemoryFlags>().index);
-			if (memory.planning_only) {
+			if (memory.planning_only || memory.kind == ResourceKind::IndirectBuffer) {
 				continue;
 			}
 			if (buffer != BufferAccess::None) {
@@ -2776,7 +2776,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 			const auto index = inst.Flags<MemoryFlags>().index;
 			EXIT_IF(index >= memory_info.size());
 			auto& memory = memory_info[index];
-			if (memory.planning_only) {
+			if (memory.planning_only || memory.kind == ResourceKind::IndirectBuffer) {
 				continue;
 			}
 			if (!remapped_memory[index]) {

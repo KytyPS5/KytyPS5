@@ -3,6 +3,27 @@
 Обновлено **28 сентября 2026 года**. Игра: **Ghost of Yōtei, PPSA26344**.
 Рабочая ветка — `yotei-windows-bringup` в локальном fork `fxpw/KytyPS5`.
 
+Checkpoint GPU-selected raw buffers **28 сентября 2026 года**:
+
+- `a233dfe1` собран/установлен и normal-pushed; exact-head GitHub CI
+  `36459385052` GREEN Windows/Linux/macOS (release skipped).
+- Retry `yotei-integrated-20260928-173637-menucheck-gpuav-sync`:
+  1280×720 GPUAV+SyncDiag, UTC 17:36:37.9351123 → 17:36:59.5233657,
+  естественный exit 321, shown=0; ordinary-payload SRT blocker пройден.
+  Installed SHA-256 `9578B4DD2506E0B8DADCAE84EA623295E3B30FE7E15917965FC9979A74375FF2`.
+  Следующий отказ: CS `d8959888aafd2552`, PC 0x1b4, dynamic buffer descriptor
+  root LoadAddressU32 не принимается host validator.
+- Существующий upstream raw x2/x3/x4 GPU path был недостижим через local
+  GetHandle; после его подключения обнаружены два host dense-index assumptions
+  в liveness/specialization. CPU/GPU RED записаны до соответствующих fixes.
+- GREEN: CPU matrix raw x2/x3/x4 против x1/formatted/typed/store через
+  materialization/specialization; полный resource suite; CTest 22/22.
+  Два numerical GPU-descriptor fixtures проходят прежние oracles для 11
+  variations bounds/swizzle/OOB/unmapped, без fake host binding.
+  Логи `indirect-buffer-{specialization-green,ctest,final-*}-20260928.*`.
+- Committed build/install/game retry с этим исправлением pending;
+  первый ненулевой кадр/меню/gameplay пока не подтверждены.
+
 Checkpoint ordinary scalar payload **28 сентября 2026 года**:
 
 - Retry `yotei-integrated-20260928-172154-menucheck-gpuav-sync` на `76d56359`:

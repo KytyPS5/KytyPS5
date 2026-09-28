@@ -94,19 +94,6 @@ vk::DescriptorImageInfo MakeImageInfo(const TextureBinding& texture, uint32_t el
 	return {nullptr, view, texture.layout};
 }
 
-static const char* ShaderStageResourceName(ShaderType stage) {
-	switch (stage) {
-		case ShaderType::Vertex: return "Vertex";
-		case ShaderType::Mesh: return "Mesh";
-		case ShaderType::Local: return "Local";
-		case ShaderType::TessellationControl: return "Hull";
-		case ShaderType::TessellationEvaluation: return "Domain";
-		case ShaderType::Pixel: return "Pixel";
-		case ShaderType::Compute: return "Compute";
-		default: return "Unknown";
-	}
-}
-
 static Prospero::ImageType TextureType(const ShaderTextureResource& descriptor) {
 	const auto type = descriptor.Type();
 	return type == Prospero::ImageType::kCube ? Prospero::ImageType::kColor2DArray : type;
@@ -141,8 +128,9 @@ static bool SupportsScalarStorageOffset(const ShaderRecompiler::IR::BufferResour
 
 static vk::DescriptorBufferInfo
 NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource& source,
-                    const ShaderRecompiler::IR::BufferResource& resource, ShaderType stage,
-                    uint32_t slot, uint32_t& buffer_offset, uint32_t& buffer_limit) {
+                    const ShaderRecompiler::IR::BufferResource& resource,
+                    uint32_t& buffer_offset, uint32_t& buffer_limit,
+                    ShaderType stage, uint32_t slot) {
 	buffer_offset = 0;
 	buffer_limit  = 0;
 
@@ -213,10 +201,6 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 		buffer_offset = 0;
 		buffer_limit  = static_cast<uint32_t>(size);
 		const vk::DescriptorBufferInfo aligned {upload.Handle(), map_offset, padded};
-		SetVulkanObjectNameF(
-		    graphics.device, aligned.buffer,
-		    "Kyty.{}.StorageBufferAlignedUpload[slot={} guest=0x{:016x} size=0x{:x} adj={}]",
-		    ShaderStageResourceName(stage), slot, address, size, adjustment);
 		return aligned;
 	}
 	if (adjustment >= 256 || adjustment > max_range || size > max_range - adjustment) {
@@ -247,16 +231,6 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	if (resource.written) {
 		context.GetTextureCache().InvalidateMemoryFromGPU(address, size);
 	}
-	const char* access = "Read";
-	if (resource.written && resource.read) {
-		access = "ReadWrite";
-	} else if (resource.written) {
-		access = "Write";
-	}
-	SetVulkanObjectNameF(
-	    graphics.device, result.buffer,
-	    "Kyty.{}.StorageBuffer[slot={} guest=0x{:016x} size=0x{:x} access={} formatted={}]",
-	    ShaderStageResourceName(stage), slot, address, size, access, resource.formatted);
 	return result;
 }
 
@@ -1323,7 +1297,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		uint32_t buffer_limit = 0;
 		prepared.buffers.push_back(NativeStorageBuffer(m_context, prepared.buffer_sources[i],
 		                                               program.info.buffers[resource],
-		                                               program.stage, resource, buffer_offset, buffer_limit));
+		                                               buffer_offset, buffer_limit, program.stage, i));
 		pack_memory_offset(i, buffer_offset);
 		prepared.shader_data[layout.memory_limit_dword + i] = buffer_limit;
 	}

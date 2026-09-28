@@ -1865,13 +1865,10 @@ static bool Ngs2FourCcEquals(const uint8_t* data, const char* four_cc) {
 	return std::memcmp(data, four_cc, 4) == 0;
 }
 
-static bool Ngs2GetAtrac9CodecInfo(std::array<uint8_t, ATRAC9_CONFIG_DATA_SIZE> config,
+static bool Ngs2GetAtrac9CodecInfo(const std::array<uint8_t, ATRAC9_CONFIG_DATA_SIZE>& config,
                                    Atrac9CodecInfo& codec) {
-	if (config[0] != 0xfe || (config[1] & 1u) != 0 || ((config[1] >> 1u) & 7u) >= 6u) {
-		return false;
-	}
 	void* decoder = Atrac9GetHandle();
-	const bool valid = decoder != nullptr && Atrac9InitDecoder(decoder, config.data()) == 0 &&
+	const bool valid = decoder != nullptr && Ajm::AjmAt9InitDecoder(decoder, config.data()) == 0 &&
 	                   Atrac9GetCodecInfo(decoder, &codec) == 0 && codec.channels > 0 &&
 	                   codec.samplingRate > 0 && codec.superframeSize > 0 &&
 	                   codec.framesInSuperframe > 0 && codec.frameSamples > 0 &&

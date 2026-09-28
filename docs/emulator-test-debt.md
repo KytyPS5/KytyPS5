@@ -671,8 +671,12 @@ Remaining debt:
 
 ## Compressed video-out metadata on a native render-target alias
 
-Status: regression test added; run against the unfixed implementation before the
-shared cache correction.
+Status: regression RED confirmed on Windows 2026-09-28.
+`--buffer-cache-range-only` fails at "video-out metadata on render-target alias"
+with merge 8e61798b and identically with only the two upstream textureCache files
+replaced by HEAD 45e09731 versions. Logs `merge-8e-image-ownership-20260928` and
+`merge-8e-image-ownership-baseline-20260928` (bounded, no timeout). New upstream
+ownership cases later in the fixture are not reached. Shared metadata fix pending.
 
 Observed trigger: a guest color target is first discovered as a native render target
 with DCC metadata, then the same allocation is acquired through VideoOut with an

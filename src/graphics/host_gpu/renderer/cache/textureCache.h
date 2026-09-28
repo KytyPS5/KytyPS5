@@ -135,7 +135,6 @@ private:
 	[[nodiscard]] static BindingType UploadBinding(const Image& image);
 	[[nodiscard]] static GuestRange  SelectUploadRange(const ImageInfo& info,
 	                                                   const ImageViewInfo& view) noexcept;
-	[[nodiscard]] bool               SafeToDownload(const Image& image);
 
 	// Caller holds m_lock; it also serializes the per-image query epoch.
 	[[nodiscard]] ImageIds      FindImagesInRegion(uint64_t address, uint64_t size,

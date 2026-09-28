@@ -18,9 +18,16 @@ Checkpoint реального запуска `2e3a2a13` **28 сентября 20
   и `owned-window-shown43-desktop.png` фактически при shown=66. Оба показывают
   чёрную client area. Ненулевой кадр / меню / gameplay не подтверждены;
   maxShown=101 не является доказательством изображения.
-- Все task-owned процессы закрыты. Новый upstream `8e61798b` содержит 5 commits
-  после `22ff4693`; read-only merge preview показывает 2 conflicts
-  (textureCache.h / descriptors.cpp). Интеграция и её runtime proof pending.
+- Upstream `8e61798b` (5 commits после `22ff4693`) интегрирован с разрешением
+  2 conflicts (textureCache.h / descriptors.cpp). Native Windows emulator/launcher/
+  kyty_tests build GREEN, required CTest 22/22, NGS2/ATRAC9 synthetic GREEN.
+  Bounded buffer limits, aligned uploads и SelectUploadRange сохранены; upstream
+  image-local ownership и buffer naming приняты. Runtime нового merge pending.
+- Расширенный `--buffer-cache-range-only` RED на существующей DCC/video-out alias
+  metadata проверке до новых ownership cases. Scoped baseline без двух upstream
+  textureCache changes даёт тот же RED. Логи `merge-8e-image-ownership*`:
+  это не доказательство GREEN ownership suite; отдельный debt остаётся.
+  Все task-owned процессы закрыты.
 
 Checkpoint native EXEC / finite selectors **28 сентября 2026 года**:
 

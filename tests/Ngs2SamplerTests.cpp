@@ -88,6 +88,84 @@ void TestStreamingResample() {
 	      "streaming progress does not match consumed source data");
 }
 
+// One encoded mono block with one nonzero spectral coefficient.
+constexpr std::array<uint8_t, 36> ATRAC9_MONO_BLOCK {0, 0, 0x04, 0x20, 0x04, 0xc0, 0, 0, 0x1f, 0xc0};
+
+void TestAtrac9Vibration() {
+	using namespace Libs::Audio::Ajm;
+	for (uint8_t index: {7, 6}) {
+		const int channels = index - 5;
+		std::array<uint8_t, 4> config {0xfe, static_cast<uint8_t>(0x70 | (index << 1)), 0x03, 0xf0};
+		const auto original = config;
+		AjmAt9Decoder decoder(channels, 48000, AjmSampleEncoding::Float, 0);
+		const auto initialized = decoder.Initialize(config.data(), config.size());
+		AjmSidebandDecAt9CodecInfo info {};
+		decoder.WriteCodecInfo(&info, sizeof(info), initialized);
+		Check(initialized.result == OK && initialized.format.channel_num == channels &&
+		          initialized.format.sampling_frequency == 48000 && info.frame_samples == 256 &&
+		          info.frames_in_super_frame == 4 && info.super_frame_size == 128 &&
+		          config == original,
+		      "ATRAC9 vibration config returned incorrect geometry or changed input");
+		Atrac9CodecInfo parsed {};
+		Check(Ngs2GetAtrac9CodecInfo(config, parsed) && parsed.channels == channels &&
+		          parsed.samplingRate == 48000 && parsed.frameSamples == 256 &&
+		          parsed.framesInSuperframe == 4 && parsed.superframeSize == 128,
+		      "NGS2 vibration metadata differs from decoder metadata");
+
+		// Enlarge the superframe for the synthetic blocks and compare ordinary mono/dual mono.
+		config[2] = 0x0b;
+		Check(decoder.Initialize(config.data(), config.size()).result == OK,
+		      "ATRAC9 fixture initialization failed");
+		config[1] -= 12;
+		auto reference = std::unique_ptr<void, decltype(&Atrac9ReleaseHandle)>(
+		    Atrac9GetHandle(), Atrac9ReleaseHandle);
+		Check(reference != nullptr && Atrac9InitDecoder(reference.get(), config.data()) == 0,
+		      "ATRAC9 reference initialization failed");
+		std::array<uint8_t, 384> encoded {};
+		for (int frame = 0; frame < 4; ++frame) {
+			for (int channel = 0; channel < channels; ++channel) {
+				auto block = encoded.begin() + (frame * channels + channel) * ATRAC9_MONO_BLOCK.size();
+				std::copy(ATRAC9_MONO_BLOCK.begin(), ATRAC9_MONO_BLOCK.end(), block);
+				if (frame != 0) *block |= 0x80;
+			}
+		}
+		std::vector<float> actual(4 * 256 * channels), expected(actual.size());
+		size_t offset = 0;
+		for (int frame = 0; frame < 4; ++frame) {
+			int used = 0;
+			Check(Atrac9DecodeF32(reference.get(), encoded.data() + offset,
+			                       expected.data() + frame * 256 * channels, &used, 0) == 0 &&
+			          used == channels * ATRAC9_MONO_BLOCK.size(),
+			      "ATRAC9 reference decoding failed");
+			offset += used;
+		}
+		for (int pass = 0; pass < 2; ++pass) {
+			if (pass != 0) decoder.Reset();
+			const auto decoded = decoder.Decode(encoded.data(), encoded.size(), actual.data(),
+			                                      actual.size() * sizeof(float), true, nullptr);
+			Check(decoded.result == OK && decoded.frames == 4 &&
+			          decoded.input_consumed == encoded.size() &&
+			          decoded.output_written == actual.size() * sizeof(float) &&
+			          actual == expected && std::ranges::any_of(actual, [](float sample) {
+				          return std::abs(sample) > 0.00001f;
+			          }),
+			      "ATRAC9 vibration decoding or reset differs from mono/dual mono");
+		}
+		{
+			auto invalid = original;
+			invalid[0] = 0;
+			Check(decoder.Initialize(invalid.data(), invalid.size()).result != OK &&
+			          !Ngs2GetAtrac9CodecInfo(invalid, parsed),
+			      "ATRAC9 vibration accepted an invalid header");
+			invalid = original;
+			invalid[1] |= 1;
+			Check(decoder.Initialize(invalid.data(), invalid.size()).result != OK &&
+			          !Ngs2GetAtrac9CodecInfo(invalid, parsed),
+			      "ATRAC9 vibration accepted an unsupported extension");
+		}
+	}
+}
+
 void TestAtrac9ResampleAcrossFrames() {
 	const auto make_voice = [] {
 		auto f = std::make_unique<Fixture>(24000);
@@ -715,11 +793,11 @@ void TestLoopCallbacksAndExit() {
 void TestAtrac9Looping() {
 	// Four encoded mono frames with one nonzero spectral coefficient, then superframe padding.
 	// The block skips one frame plus one sample and ends inside the third frame.
-	constexpr std::array<uint8_t, 36> frame {0, 0, 0x04, 0x20, 0x04, 0xc0, 0, 0, 0x1f, 0xc0};
 	std::array<uint8_t, 192> encoded {};
 	for (size_t i = 0; i < 4; ++i) {
-		std::copy(std::begin(frame), std::end(frame), encoded.begin() + i * sizeof(frame));
-		if (i != 0) encoded[i * sizeof(frame)] |= 0x80;
+		std::copy(ATRAC9_MONO_BLOCK.begin(), ATRAC9_MONO_BLOCK.end(),
+		          encoded.begin() + i * ATRAC9_MONO_BLOCK.size());
+		if (i != 0) encoded[i * ATRAC9_MONO_BLOCK.size()] |= 0x80;
 	}
 	const auto make_voice = [&](uint32_t repeats, LoopCallbacks& log) {
 		auto f = std::make_unique<Fixture>(24000);
@@ -980,6 +1058,7 @@ void TestFiniteFilterTail() {
 } // namespace
 
 int main() {
+	TestAtrac9Vibration();
 	TestPcm16RenderOutput();
 	TestSubmixerSetupAndRouting();
 	TestWaveformBlockGeometry();

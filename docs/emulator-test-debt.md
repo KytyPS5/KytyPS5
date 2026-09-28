@@ -1,5 +1,41 @@
 # Emulator regression test debt
 
+## Ordinary scalar payload prefetch (2026-09-28)
+
+Retry on 76d56359 reaches CS 8968b4b53e5a246a, shown=0, flat slot 209.
+Temporary bounded diagnostics (`yotei-integrated-20260928-172639-menucheck-gpuav-sync`)
+show a host read of address zero at guest PC 0x39dc. The native instruction
+is scalar payload under an EXECZ branch, not a descriptor dependency. The
+new planner blanket-hoists constant-offset scalar loads before guest control
+flow, even when only arithmetic consumes them. Add an unchanged CPU matrix
+proving ordinary payload loads stay in guest IR while descriptor dependencies
+still receive valid flat slots; numerical scalar-read/cooperative neighbors and
+game retry must confirm the shared correction. Do not fabricate zero memory.
+
+CPU RED confirmed: `scalar-payload-red-20260928.txt` rejects eager hoisting
+of an ordinary scalar payload. Descriptor dependency is the positive neighbor
+in the same unchanged fixture. Restrict host prefetch to resource recipes,
+retaining ordinary scalar memory and its guest control-flow position.
+
+Neighbor input correction: numerical BDA coefficient test RED
+`scalar-payload-gpu-cooperative-bda-coefficients-20260928.txt` (2304/16516
+words differ; coefficient planes pass, mailbox reads return mode-0 defaults).
+The fixture replaces the default user-data array but omits word 51: its
+zero-stride vector descriptor therefore explicitly requests bounds mode 0,
+which correctly always returns OOB zeros. Set its raw byte-address descriptor
+to bounds mode 3, matching MakeNativeUserData/MakeStructuredStorageBufferData;
+retain all 16516 numerical expectations, alias separation, dispatch geometry
+and real mailbox feedback. This repairs the fixture input, not production OOB
+semantics. Mode-0 bounded Raw/Formatted/D16/Scalar remain GREEN unchanged.
+
+Scalar payload GREEN: unchanged CPU matrix (`scalar-payload-green-20260928.txt`),
+required CTest 22/22 (`scalar-payload-ctest-20260928.log`), bounded numerical
+mode-0 Raw/Formatted/D16/Scalar 4/4 (`scalar-payload-bounded-*-final-20260928.txt`),
+cyclic scalar address GPU and cooperative LDS 9/9
+(`scalar-payload-multiwave-green-20260928.txt`). Corrected mode-3 BDA neighbor
+passes all 16516 unchanged values (`scalar-payload-bda-fixture-green-20260928.txt`).
+Temporary SRT diagnostics removed before the fix; original logs preserved.
+
 ## Wave64 ConditionRef admission (2026-09-28)
 
 Game retry on 4fcc3575 reaches a controlled ConditionRef rejection, shown=0:

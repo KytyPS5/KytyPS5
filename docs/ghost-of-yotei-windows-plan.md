@@ -3,6 +3,26 @@
 Обновлено **28 сентября 2026 года**. Игра: **Ghost of Yōtei, PPSA26344**.
 Рабочая ветка — `yotei-windows-bringup` в локальном fork `fxpw/KytyPS5`.
 
+Checkpoint ordinary scalar payload **28 сентября 2026 года**:
+
+- Retry `yotei-integrated-20260928-172154-menucheck-gpuav-sync` на `76d56359`:
+  1280×720, GPUAV+SyncDiag, UTC 17:21:54.8448430 → 17:22:11.1730053,
+  естественный exit 321, shown=0. ConditionRef blocker пройден; новая граница:
+  CS `8968b4b53e5a246a`, runtime SRT evaluation failed, flat slot 209.
+  Installed SHA-256 `D7105638CB043F797F57D1441208AE65579D3952F47884567FB6247C11BFDDB8`.
+- Diagnostic retry `...-172639-menucheck-gpuav-sync` доказал eager host read
+  адреса 0 в S_LOAD_DWORDX8 PC 0x39dc: ordinary payload находится под EXECZ,
+  новый planner выносил его из guest control flow. Это не повод zero-fill.
+- CPU RED до production fix записан в debt. Общая коррекция сохраняет payload
+  memory operations в guest IR; descriptor/address dependencies остаются host
+  recipes. Тот же CPU matrix GREEN; CTest 22/22; bounded numerical 4/4;
+  cyclic scalar-address GPU GREEN и cooperative LDS 9/9.
+- BDA-coefficients fixture исправляет пропущенный bounds mode 3 в своём
+  user-data descriptor; все 16516 ожидаемых DWORD сохранены и GREEN.
+  Ранее он запрашивал mode-0 zero-stride OOB, поэтому возвращал верные zeros.
+- Temporary diagnostics удалены. Native build `scalar-payload-fix-build-20260928.log`
+  GREEN; committed install/game retry pending. Ненулевой кадр/меню не подтверждены.
+
 Checkpoint wave64 `ConditionRef` **28 сентября 2026 года**:
 
 - Свежий merge `4fcc3575` собран/установлен и normal-pushed; PR #497

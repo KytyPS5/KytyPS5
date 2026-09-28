@@ -33333,6 +33333,7 @@ TestCase Wave64CooperativeBdaCoefficientsByWorkgroup() {
   // The writable descriptor ends before the read-only coefficient allocation.
   // Do not manufacture an overlapping immutable snapshot dependency.
   test.user_data[50] = (mailbox + total) * sizeof(u32);
+  test.user_data[51] = 3u << 28u; // Raw byte-address bounds; mode 0 + zero stride is always OOB.
   test.bda_mappings = {{guest_base, 0}};
   test.required_spirv = {"OpControlBarrier", " Coherent"};
 

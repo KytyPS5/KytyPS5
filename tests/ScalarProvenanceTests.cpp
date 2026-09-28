@@ -224,6 +224,29 @@ void TestDynamicReadRemainsTyped() {
         "dynamic scalar read received a fake flattened slot");
 }
 
+void TestOrdinaryScalarPayloadRemainsGuestRead() {
+  for (const bool descriptor : {false, true}) {
+    Fixture fixture;
+    const auto memory = fixture.AddMemory(ResourceKind::ScalarAddress);
+    const auto read = RawRead(fixture, Address(fixture, Value(0u), Value(0u)),
+                             Value(0u), memory);
+    if (descriptor) LoadBuffer(fixture, {read, Value(0u), Value(16u), Value(0u)});
+    else fixture.Emit(ValueOpcode::ReferenceU32, {read});
+    Libs::Graphics::ShaderRecompiler::Decoder::Program decoded;
+    decoded.instructions.emplace_back();
+    decoded.instructions.back().opcode = Libs::Graphics::ShaderRecompiler::Decoder::Opcode::S_ENDPGM;
+    TrackResources(fixture.program, decoded, {});
+    if (descriptor) {
+      Check(fixture.program.srt_reads.size() == 1u && fixture.program.memory_info[memory].planning_only,
+            "descriptor scalar dependency lost its host resource slot");
+    } else {
+      Check(fixture.program.srt_reads.empty() && !fixture.program.memory_info[memory].planning_only &&
+                read.ResolveInstruction()->GetOpcode() == ValueOpcode::LoadAddressU32,
+            "ordinary scalar payload was hoisted into an eager host resource read");
+    }
+  }
+}
+
 void TestNestedSrtWalk() {
   Fixture fixture;
   const auto memory = fixture.AddMemory(ResourceKind::ScalarAddress);
@@ -661,6 +684,7 @@ void DbgExit(int) { std::abort(); }
 
 int main() {
   try {
+    TestOrdinaryScalarPayloadRemainsGuestRead();
     TestDeferredFlatSlotSkipsEagerEvaluation();
     TestImmediateFlatteningAndGvn();
     TestRawScalarComponentAlignment();

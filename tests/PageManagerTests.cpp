@@ -597,15 +597,20 @@ void CheckDeathCase(const char *name) {
   CloseHandle(process.hThread);
   CloseHandle(process.hProcess);
 #else
+#if defined(__APPLE__)
+  std::vector<char> path(PATH_MAX);
+  uint32_t path_size = static_cast<uint32_t>(path.size());
+  if (_NSGetExecutablePath(path.data(), &path_size) != 0) {
+    path.resize(path_size);
+    Check(_NSGetExecutablePath(path.data(), &path_size) == 0,
+          "_NSGetExecutablePath failed");
+  }
+#endif
   const pid_t pid = ::fork();
   Check(pid >= 0, "fork failed");
   if (pid == 0) {
 #if defined(__APPLE__)
-    char path[PATH_MAX]{};
-    uint32_t path_size = sizeof(path);
-    Check(_NSGetExecutablePath(path, &path_size) == 0,
-          "_NSGetExecutablePath failed");
-    ::execl(path, "PageManagerTests", "--death", name, nullptr);
+    ::execl(path.data(), "PageManagerTests", "--death", name, nullptr);
 #else
     ::execl("/proc/self/exe", "PageManagerTests", "--death", name, nullptr);
 #endif

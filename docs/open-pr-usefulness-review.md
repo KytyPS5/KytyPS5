@@ -2,6 +2,13 @@
 
 # Открытые PR KytyPS5: что полезно для текущего bring-up
 
+Checkpoint 28.09 `c8aaaa5b`: shared post-test proof fixed after CPU/native shader
+RED→GREEN, real retry passes 5f3f image origin/pipeline. Latest run
+`…-202341-menucheck-gpuav-sync`, maxShown113, black client area shown37/106,
+next CS8457901d80b91921 snapshot capacity (65536 candidates / 131072 accumulated
+words). No nonzero frame/menu/gameplay confirmation. Older runtime summaries below
+are historical checkpoints; no additional open PR integrated in this fix.
+
 ## Выборочная актуализация 28 сентября 2026
 
 Ветка `yotei-windows-bringup`: merge `10961866` содержит upstream main

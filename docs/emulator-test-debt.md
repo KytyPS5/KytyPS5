@@ -48,7 +48,7 @@ Native build `native-exec-wave-fix-build-20260928.log` GREEN. Committed 2e3a2a13
 retry passes both descriptor-store failures and reaches the pending image boundary
 at shown=101; captures of shown=0/66 remain black.
 
-## Pending native image descriptor origin after resumed presentation (2026-09-28)
+## Native image descriptor origin / split-latch post-test proof (2026-09-28)
 
 Committed 2e3a2a13 native Windows retry reaches shown=101 and fails CS
 5f3fdf61a7ca4a20, PC 0x26c: GetImageResource dword 0 rejects LoadAddressU32 root.
@@ -99,6 +99,24 @@ Shared correction replaces exact update-parent equality by proven latch dominanc
 constant positive bound, unit-step phi, repeat edge, read dominance and runtime root
 checks remain. Neighbor image table, wave64 image loop, bounded store3Sparse and
 native EXEC upper GREEN; required CTest22/22 GREEN. Game retry pending.
+
+Real committed c8aaaa5b retry passes 5f3f image-origin boundary, emits 150116 SPIR-V
+words and creates pipeline successfully (2912ms); subsequent dispatches continue.
+Run `yotei-integrated-20260928-202341-menucheck-gpuav-sync`, maxShown113,
+black DesktopCopy shown37/106. No frame/menu/gameplay claim.
+
+## Pending finite selector snapshot capacity (2026-09-28)
+
+Same committed retry fails MaterializeResources CS8457901d80b91921. stderr:
+bounded SRT read1 exceeds snapshot limit, count65536 stride592 bias0,
+accumulated words131072 vs word_limit65536. Guest code uses a finite 16-bit
+lane-selected record key and multiple scalar-buffer descriptor/payload columns.
+Hypotheses, not fixes: eager snapshot planning may cover a larger finite domain
+than the descriptor extent, or ordinary payload dependencies may require a runtime
+path instead. Before production change add synthetic finite selectors, descriptor
+extents, OOB rows, required vs ordinary dependencies and cap endpoints. Preserve
+read/store admission, zero-work semantics and snapshot/descriptor limits. Do not
+claim a root cause or increase the limit without an independent regression.
 
 ## Pending neighboring unaligned scalar-buffer read (2026-09-28)
 

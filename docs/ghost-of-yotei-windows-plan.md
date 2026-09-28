@@ -3,6 +3,26 @@
 Обновлено **28 сентября 2026 года**. Игра: **Ghost of Yōtei, PPSA26344**.
 Рабочая ветка — `yotei-windows-bringup` в локальном fork `fxpw/KytyPS5`.
 
+Checkpoint реального запуска `c8aaaa5b` **28 сентября 2026 года**:
+
+- Committed native Windows build/install GREEN. Retry
+  `yotei-integrated-20260928-202341-menucheck-gpuav-sync`, 1280×720 GPUAV+SyncDiag,
+  readback disabled; UTC 20:23:41.2849348 → 20:25:49.1894739, exit321,
+  maxShown=113. Emulator SHA-256
+  `D110EC723793DA809EE0A236A4826AB2B30D70B7C4FDB04A8822DD458F450A10`.
+- `5f3fdf61a7ca4a20` boundary PASSED: bounded columns count=6, SPIR-V 150116
+  words, vkCreateComputePipelines Success elapsed_ms=2912; subsequent dispatches
+  continue. Native nested-image regression and neighboring cases stay GREEN.
+- Следующая граница: CS `8457901d80b91921`, MaterializeResources bounded SRT.
+  stderr confirms read1 candidate/snapshot limit: count=65536, stride=592,
+  bias=0, accumulated words=131072, candidate_limit=65536, word_limit=65536.
+  Не повышать лимит и не подставлять нули: следующий test должен отличать finite
+  selector range, actual descriptor extent и required snapshot dependencies.
+- DesktopCopy shown=37/106 показывает чёрную client area. Ненулевой кадр / меню /
+  gameplay не подтверждены. Все task-owned процессы закрыты.
+- Normal push c8aaaa5b выполнен, PR497 MERGEABLE; exact-source CI36478770112
+  выполняется, его GREEN pending. Предыдущий 4a556c73 CI GREEN подтверждён.
+
 Checkpoint nested post-test image proof **28 сентября 2026 года**:
 
 - Tested source: `4a556c73` + shared SrtWalker dominance correction. SSA split latch
@@ -1419,17 +1439,17 @@ cooperative SSBO, #459 и #476 — 46/46 за 39,24 с и 9 последоват
 
 | Поле | Значение |
 | --- | --- |
-| Source | `10961866` (committed) |
+| Source | `c8aaaa5b` (committed) |
 | Версия / каталог игры | `01.512.000`, `G:\games\Kyty\PPSA26344\PPSA26344` |
-| Завершённый run | `_Build/runs/yotei-integrated-20260928-185252-menucheck-gpuav-sync` |
-| SHA-256 emulator | `E2410310C5C3CB5B8F1C4D7AC63BA5E38B163FF40A20109DC25B3FF94730CEB1` |
-| Время UTC | `2026-09-28T18:52:52.8928254Z` → `18:53:59.4207626Z` |
+| Завершённый run | `_Build/runs/yotei-integrated-20260928-202341-menucheck-gpuav-sync` |
+| SHA-256 emulator | `D110EC723793DA809EE0A236A4826AB2B30D70B7C4FDB04A8822DD458F450A10` |
+| Время UTC | `2026-09-28T20:23:41.2849348Z` → `20:25:49.1894739Z` |
 | Режим | Native Windows / RTX 5060 Ti, окно 1280×720, GPUAV shader instrumentation + SyncDiag; readback disabled |
 | Завершение | Естественный exit 321; task-owned processes закрыты |
-| Прогресс | maxShown=92; та же граница CS `5f3fdf61a7ca4a20` PC 0x26c GetImageResource / LoadAddressU32 |
-| Пиксели | DesktopCopy shown=6/65: чёрная client area; ненулевой кадр / меню / gameplay не подтверждены |
+| Прогресс | maxShown=113; 5f3f passed; CS `8457901d80b91921` bounded SRT snapshot limit (count65536 / words131072) |
+| Пиксели | DesktopCopy shown=37/106: чёрная client area; ненулевой кадр / меню / gameplay не подтверждены |
 | Подтверждённый отдельный blocker | Старый saved `b90e…` standalone probe compiler crash; GPUAV позволяет пройти эту точку в игре |
-| Следующая проверка | Synthetic nested image-origin regression (CPU reproduction available), shared fix и pixel proof |
+| Следующая проверка | Synthetic finite selector snapshot/budget regression, shared correction и pixel proof |
 
 
 ### Исторические performance наблюдения (сентябрь 2026)

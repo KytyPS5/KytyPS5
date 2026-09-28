@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <fmt/format.h>
+#include <optional>
 #include <span>
 #include <utility>
 
@@ -694,6 +695,13 @@ private:
 		       selector_inst->GetOpcode() == ValueOpcode::ReadFirstLane;
 	}
 
+	enum class LaneQuantifier { Any, All };
+	struct EdgePredicate {
+		Value condition;
+		bool positive;
+		LaneQuantifier lanes = LaneQuantifier::All;
+	};
+
 	bool NonzeroOnEntry(Value value, const Block* block) const {
 		if (m_program.blocks.size() != m_program.block_info.size()) {
 			return false;
@@ -705,13 +713,12 @@ private:
 				return false;
 			}
 			const auto* previous = block->ImmPredecessors()[0];
-			Value condition;
-			bool positive = false;
-			if (ConditionalEdge(previous, block, condition, positive)) {
-				const auto* test = condition.TryInstruction();
+			const auto edge = ConditionalEdge(previous, block);
+			if (edge && edge->lanes == LaneQuantifier::All) {
+				const auto* test = edge->condition.TryInstruction();
 				if (test != nullptr && test->NumArgs() == 2u &&
-				    ((test->GetOpcode() == ValueOpcode::INotEqual32 && positive) ||
-				     (test->GetOpcode() == ValueOpcode::IEqual32 && !positive))) {
+				    ((test->GetOpcode() == ValueOpcode::INotEqual32 && edge->positive) ||
+				     (test->GetOpcode() == ValueOpcode::IEqual32 && !edge->positive))) {
 					for (uint32_t arg = 0; arg < 2u; ++arg) {
 						uint32_t immediate;
 						if (ImmediateU32(test->Arg(arg), immediate) && immediate == 0u &&
@@ -776,41 +783,44 @@ private:
 		return false;
 	}
 
-	bool ConditionalEdge(const Block* from, const Block* to, Value& condition,
-	                     bool& positive) const {
+	std::optional<EdgePredicate> ConditionalEdge(const Block* from, const Block* to) const {
 		const auto position = std::ranges::find(m_program.blocks, from);
 		const auto target = std::ranges::find(m_program.blocks, to);
-		if (position == m_program.blocks.end() || target == m_program.blocks.end()) return false;
+		if (position == m_program.blocks.end() || target == m_program.blocks.end()) return {};
 		const auto& info = m_program.block_info[position - m_program.blocks.begin()];
 		const auto& term = info.terminator;
 		const auto id = m_program.block_info[target - m_program.blocks.begin()].id;
 		if (term.kind != CFG::TerminatorKind::ConditionalBranch ||
-		    (term.true_block == id) == (term.false_block == id)) return false;
-		condition = info.condition;
-		positive = term.true_block == id;
-		while (const auto* inst = condition.Resolve().TryInstruction()) {
+		    (term.true_block == id) == (term.false_block == id)) return {};
+		EdgePredicate edge {info.condition, term.true_block == id};
+		while (const auto* inst = edge.condition.Resolve().TryInstruction()) {
 			if (inst->GetOpcode() == ValueOpcode::LogicalNot) {
-				positive = !positive;
+				edge.positive = !edge.positive;
 			} else if (inst->GetOpcode() == ValueOpcode::ConditionRef) {
-				// SCC is uniform across the guest wave; EXEC and VCC are lane predicates.
 				const auto kind = inst->Flags<CFG::BranchCondition>();
-				if (kind != CFG::BranchCondition::SccZero &&
-				    kind != CFG::BranchCondition::SccNonZero) break;
+				const bool scalar = kind == CFG::BranchCondition::SccZero ||
+				                    kind == CFG::BranchCondition::SccNonZero;
+				const bool zero = kind == CFG::BranchCondition::ExecZero ||
+				                  kind == CFG::BranchCondition::VccZero;
+				const bool nonzero = kind == CFG::BranchCondition::ExecNonZero ||
+				                     kind == CFG::BranchCondition::VccNonZero;
+				if (!scalar && !zero && !nonzero) break;
+				// SCC is uniform. Negating a lane reduction exchanges all and any.
+				edge.lanes = scalar || (zero == edge.positive) ? LaneQuantifier::All
+				                                              : LaneQuantifier::Any;
 			} else {
 				break;
 			}
-			condition = inst->Arg(0);
+			edge.condition = inst->Arg(0);
 		}
-		condition = condition.Resolve();
-		return true;
+		edge.condition = edge.condition.Resolve();
+		return edge;
 	}
 
-	Value PositiveUseGuard(const Block* use) const {
+	Value PositiveLaneWitness(const Block* use) const {
 		if (use == nullptr || use->ImmPredecessors().size() != 1u) return {};
-		Value condition;
-		bool positive = false;
-		return ConditionalEdge(use->ImmPredecessors()[0], use, condition, positive) && positive
-		           ? condition : Value {};
+		const auto edge = ConditionalEdge(use->ImmPredecessors()[0], use);
+		return edge && edge->positive ? edge->condition : Value {};
 	}
 
 	Value SimplifyGuard(Value guard) const {
@@ -962,11 +972,12 @@ private:
 		return {};
 	}
 
-	bool EdgeOn(const Block* from, const Block* to, Value predicate, bool positive) const {
-		Value condition;
-		bool taken = false;
-		return ConditionalEdge(from, to, condition, taken) && taken == positive &&
-		       EquivalentValue(m_program, condition, predicate);
+	bool MaskEdge(const Block* from, const Block* to, Value predicate, bool positive) const {
+		const auto edge = ConditionalEdge(from, to);
+		// Continuation needs an active lane; an inactive exit must include every lane.
+		return edge && edge->positive == positive &&
+		       (positive || edge->lanes == LaneQuantifier::All) &&
+		       EquivalentValue(m_program, edge->condition, predicate);
 	}
 
 	Value BoundedSetBitMask(Value index, Value guard) const {
@@ -975,7 +986,7 @@ private:
 		    phi->NumArgs() != 3u || phi->GetType() != Type::U32 ||
 		    !ImpliesIndexBelow32(guard, index)) return {};
 		for (uint32_t bit_arm = 0; bit_arm < 3u; ++bit_arm) {
-			const auto bit_guard = PositiveUseGuard(phi->PhiBlock(bit_arm));
+			const auto bit_guard = PositiveLaneWitness(phi->PhiBlock(bit_arm));
 			const auto* selected = phi->Arg(bit_arm).Resolve().TryInstruction();
 			if (selected == nullptr || selected->GetOpcode() != ValueOpcode::SelectU32 ||
 			    selected->NumArgs() != 3u ||
@@ -988,7 +999,7 @@ private:
 			if (initial_mask.IsEmpty()) continue;
 			for (uint32_t sentinel_arm = 0; sentinel_arm < 3u; ++sentinel_arm) {
 				if (sentinel_arm == bit_arm) continue;
-				const auto sentinel_guard = PositiveUseGuard(phi->PhiBlock(sentinel_arm));
+				const auto sentinel_guard = PositiveLaneWitness(phi->PhiBlock(sentinel_arm));
 				const auto* sentinel = phi->Arg(sentinel_arm).Resolve().TryInstruction();
 				uint32_t bound = 0;
 				if (sentinel == nullptr || sentinel->GetOpcode() != ValueOpcode::SelectU32 ||
@@ -999,16 +1010,27 @@ private:
 				const auto* active_phi = loop_active.TryInstruction();
 				if (active_phi == nullptr || active_phi->GetOpcode() != ValueOpcode::Phi ||
 				    active_phi->NumArgs() != 2u) continue;
+				const auto other_arm = 3u - bit_arm - sentinel_arm;
+				const auto* carried = phi->Arg(other_arm).Resolve().TryInstruction();
+				const auto* bit_block = phi->PhiBlock(bit_arm);
+				if (carried == nullptr || carried->GetOpcode() != ValueOpcode::Phi ||
+				    carried->NumArgs() != 2u || carried->Parent() != active_phi->Parent() ||
+				    selected->Arg(2).Resolve() != phi->Arg(sentinel_arm).Resolve() ||
+				    sentinel->Arg(2).Resolve() != phi->Arg(other_arm).Resolve()) continue;
+				const uint32_t back = carried->PhiBlock(0) == bit_block ? 0u : 1u;
+				if (carried->PhiBlock(back) != bit_block ||
+				    carried->Arg(back).Resolve() != phi->Arg(bit_arm).Resolve()) continue;
 				bool invariant = false;
 				for (uint32_t initial = 0; initial < 2u; ++initial) {
-					invariant = Implies(guard, active_phi->Arg(initial)) &&
-					            EdgeOn(active_phi->PhiBlock(initial ^ 1u), active_phi->Parent(),
-					                   active_phi->Arg(initial ^ 1u), true);
+					invariant = active_phi->PhiBlock(initial) == carried->PhiBlock(back ^ 1u) &&
+					            active_phi->PhiBlock(initial ^ 1u) == bit_block &&
+					            Implies(guard, active_phi->Arg(initial)) &&
+					            MaskEdge(bit_block, active_phi->Parent(),
+					                     active_phi->Arg(initial ^ 1u), true);
 					if (invariant) break;
 				}
 				if (!invariant) continue;
-				const auto other_arm = 3u - bit_arm - sentinel_arm;
-				if (EdgeOn(phi->PhiBlock(other_arm), phi->Parent(), loop_active, false))
+				if (MaskEdge(phi->PhiBlock(other_arm), phi->Parent(), loop_active, false))
 					return initial_mask;
 			}
 		}
@@ -1018,7 +1040,7 @@ private:
 	bool MatchUniformizedMaterialKey(Value key, const Inst& image,
 	                                DescriptorSource::IndirectImage& indirect,
 	                                DescriptorSource& material_source, uint32_t pc) {
-		const auto guard = PositiveUseGuard(image.Parent());
+		const auto guard = PositiveLaneWitness(image.Parent());
 		if (guard.IsEmpty()) return false;
 		const auto local = EqualLocalKey(guard, key);
 		const auto* selected = local.Resolve().TryInstruction();
@@ -1080,22 +1102,6 @@ private:
 		}
 		if (!induction) return {};
 
-		// Native branches advance the whole guest wave, so the induction and runtime
-		// bound are uniform. A reduced condition witnesses a lane with its edge
-		// polarity; implication of the comparison therefore bounds the whole wave.
-		const auto implies = [](auto&& self, Value value, bool positive,
-		                        const Inst* comparison) -> bool {
-			const auto* inst = value.Resolve().TryInstruction();
-			if (inst == comparison) return positive;
-			if (inst == nullptr) return false;
-			if (inst->GetOpcode() == ValueOpcode::ConditionRef)
-				return self(self, inst->Arg(0), positive, comparison);
-			if (inst->GetOpcode() == ValueOpcode::LogicalNot)
-				return self(self, inst->Arg(0), !positive, comparison);
-			return positive && inst->GetOpcode() == ValueOpcode::LogicalAnd &&
-			       (self(self, inst->Arg(0), true, comparison) ||
-			        self(self, inst->Arg(1), true, comparison));
-		};
 		for (const auto& use_of_key: phi->Uses()) {
 			const auto* compare = use_of_key.user;
 			if (compare->GetOpcode() != ValueOpcode::SLessThan32 || use_of_key.operand != 0u ||
@@ -1112,10 +1118,10 @@ private:
 			const bool yes_reaches = CanReach(yes, use, phi->Parent());
 			const bool no_reaches = CanReach(no, use, phi->Parent());
 			if (yes_reaches == no_reaches) continue;
-			Value condition;
-			bool positive = false;
-			if (ConditionalEdge(block, yes_reaches ? yes : no, condition, positive) &&
-			    implies(implies, condition, positive, compare)) return compare->Arg(1);
+			const auto edge = ConditionalEdge(block, yes_reaches ? yes : no);
+			// Native wave control makes the induction and bound uniform; one lane suffices.
+			if (edge && edge->positive && Implies(edge->condition, Value(use_of_key.user)))
+				return compare->Arg(1);
 		}
 		return {};
 	}

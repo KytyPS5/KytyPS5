@@ -913,8 +913,16 @@ void TestBoundedComputeImageLoop() {
 
 void TestUniformizedMaterialImageKeys() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
-  const auto make_plan = [](bool wrong_update, bool wrong_equality) {
+  enum class Variant {
+    Valid, Plain, WrongUpdate, WrongEquality, WrongExit, WrongCarry, WrongBackedge
+  };
+  const auto make_plan = [](Variant variant) {
     Fixture fixture;
+    fixture.program.wave_size = 64u;
+    const auto branch = [&](Value predicate, CFG::BranchCondition kind, Block *block) {
+      return variant == Variant::Plain ? predicate : fixture.Emit(
+          ValueOpcode::ConditionRef, {predicate}, kind, block);
+    };
     auto *entry = fixture.block;
     auto *header = fixture.AddBlock();
     auto *inactive = fixture.AddBlock();
@@ -940,16 +948,25 @@ void TestUniformizedMaterialImageKeys() {
         .kind = CFG::TerminatorKind::Branch, .true_block = 1u};
     fixture.program.block_info[1].terminator = {
         .kind = CFG::TerminatorKind::Branch, .true_block = 2u};
-    const auto active_on_entry = fixture.Emit(
+    const auto enabled = fixture.Emit(
         ValueOpcode::INotEqual32, {fixture.UserData(5u), Value(0u)}, 0, entry);
+    const auto local = fixture.Emit(ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)}, 0, entry);
+    const auto active_on_entry = fixture.Emit(ValueOpcode::LogicalAnd,
+        {enabled, fixture.Emit(ValueOpcode::INotEqual32, {local, Value(0u)}, 0, entry)},
+        0, entry);
     auto &active_phi = header->AppendNewInst(
         ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U1));
     auto &mask_phi = header->AppendNewInst(
         ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+    auto &carry_phi = header->AppendNewInst(
+        ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
     const auto mask = Value(&mask_phi);
     const auto active = Value(&active_phi);
-    fixture.program.block_info[2].condition = fixture.Emit(
-        ValueOpcode::LogicalNot, {active}, 0, inactive);
+    fixture.program.block_info[2].condition = branch(
+        fixture.Emit(ValueOpcode::LogicalNot, {active}, 0, inactive),
+        variant == Variant::WrongExit ? CFG::BranchCondition::ExecNonZero
+                                      : CFG::BranchCondition::ExecZero, inactive);
     fixture.program.block_info[2].terminator = {
         .kind = CFG::TerminatorKind::ConditionalBranch,
         .true_block = 5u, .false_block = 3u};
@@ -957,8 +974,9 @@ void TestUniformizedMaterialImageKeys() {
         ValueOpcode::INotEqual32, {Value(0u), mask}, 0, sentinel);
     const auto bit_guard = fixture.Emit(
         ValueOpcode::LogicalAnd, {active, nonzero}, 0, sentinel);
-    fixture.program.block_info[3].condition = fixture.Emit(
-        ValueOpcode::LogicalNot, {bit_guard}, 0, sentinel);
+    fixture.program.block_info[3].condition = branch(
+        fixture.Emit(ValueOpcode::LogicalNot, {bit_guard}, 0, sentinel),
+        CFG::BranchCondition::ExecZero, sentinel);
     fixture.program.block_info[3].terminator = {
         .kind = CFG::TerminatorKind::ConditionalBranch,
         .true_block = 5u, .false_block = 4u};
@@ -968,11 +986,12 @@ void TestUniformizedMaterialImageKeys() {
     const auto one_bit = fixture.Emit(
         ValueOpcode::ShiftLeftLogical32, {Value(1u), position}, 0, bit);
     const auto cleared = fixture.Emit(
-        wrong_update ? ValueOpcode::BitwiseOr32 : ValueOpcode::BitwiseXor32,
+        variant == Variant::WrongUpdate ? ValueOpcode::BitwiseOr32 : ValueOpcode::BitwiseXor32,
         {mask, one_bit}, 0, bit);
     const auto continuation = fixture.Emit(
         ValueOpcode::LogicalAnd, {bit_guard, active_on_entry}, 0, bit);
-    fixture.program.block_info[4].condition = continuation;
+    fixture.program.block_info[4].condition = branch(
+        continuation, CFG::BranchCondition::ExecNonZero, bit);
     fixture.program.block_info[4].terminator = {
         .kind = CFG::TerminatorKind::ConditionalBranch,
         .true_block = 1u, .false_block = 5u};
@@ -981,13 +1000,18 @@ void TestUniformizedMaterialImageKeys() {
     mask_phi.AddPhiOperand(entry, fixture.UserData(4u));
     mask_phi.AddPhiOperand(bit, cleared);
     const auto arbitrary = fixture.UserData(6u);
+    const auto carry = Value(&carry_phi);
     const auto sentinel_index = fixture.Emit(
-        ValueOpcode::SelectU32, {active, Value(32u), arbitrary}, 0, sentinel);
+        ValueOpcode::SelectU32,
+        {active, Value(32u), variant == Variant::WrongCarry ? arbitrary : carry},
+        0, sentinel);
     const auto bit_index = fixture.Emit(
         ValueOpcode::SelectU32, {bit_guard, first, sentinel_index}, 0, bit);
+    carry_phi.AddPhiOperand(entry, arbitrary);
+    carry_phi.AddPhiOperand(bit, variant == Variant::WrongBackedge ? arbitrary : bit_index);
     auto &index_phi = merge->AppendNewInst(
         ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
-    index_phi.AddPhiOperand(inactive, arbitrary);
+    index_phi.AddPhiOperand(inactive, carry);
     index_phi.AddPhiOperand(sentinel, sentinel_index);
     index_phi.AddPhiOperand(bit, bit_index);
     const auto index = Value(&index_phi);
@@ -1018,17 +1042,18 @@ void TestUniformizedMaterialImageKeys() {
         ValueOpcode::LoadAddressU32,
         {base, material_offset, Value(0u), material_guard},
         fixture.AddMemory(material_memory, 0x1a88u), choose);
-    const auto local = fixture.Emit(
+    const auto local_key = fixture.Emit(
         ValueOpcode::SelectU32, {material_guard, loaded, arbitrary}, 0, choose);
     const auto key = fixture.Emit(
-        ValueOpcode::ReadLane, {local, Value(0u)}, 0, choose);
+        ValueOpcode::ReadLane, {local_key, Value(0u)}, 0, choose);
     const auto compared = fixture.Emit(
         ValueOpcode::IEqual32,
-        {key, wrong_equality ? arbitrary : local}, 0, choose);
+        {key, variant == Variant::WrongEquality ? arbitrary : local_key}, 0, choose);
     const auto sample_guard = fixture.Emit(
         ValueOpcode::LogicalAnd, {material_guard, compared}, 0, choose);
-    fixture.program.block_info[6].condition = fixture.Emit(
-        ValueOpcode::LogicalNot, {sample_guard}, 0, choose);
+    fixture.program.block_info[6].condition = branch(
+        fixture.Emit(ValueOpcode::LogicalNot, {sample_guard}, 0, choose),
+        CFG::BranchCondition::ExecZero, choose);
     fixture.program.block_info[6].terminator = {
         .kind = CFG::TerminatorKind::ConditionalBranch,
         .true_block = 8u, .false_block = 7u};
@@ -1088,7 +1113,8 @@ void TestUniformizedMaterialImageKeys() {
           "uniformized image key lost its finite material range");
     return ExtractResourcePlan(fixture.program);
   };
-  auto plan = make_plan(false, false);
+  auto plan = make_plan(Variant::Valid);
+  make_plan(Variant::Plain);
   Check(plan.requires_specialization_memory &&
             plan.descriptor_sources[plan.info.images[0].source]
                 .indirect_image->selector_mask.Resolve().TryInstruction() != nullptr,
@@ -1142,10 +1168,16 @@ void TestUniformizedMaterialImageKeys() {
   user_data[8] = first_table;
   Check(!MaterializeResources(plan, runtime, snapshot, specialization),
         "written buffer alias with an image record was accepted");
-  CheckFatal([&] { make_plan(true, false); }, "not a valid runtime value",
+  CheckFatal([&] { make_plan(Variant::WrongUpdate); }, "not a valid runtime value",
              "non-clearing material mask was accepted");
-  CheckFatal([&] { make_plan(false, true); }, "not a valid runtime value",
+  CheckFatal([&] { make_plan(Variant::WrongEquality); }, "not a valid runtime value",
              "unrelated ReadLane key was accepted");
+  CheckFatal([&] { make_plan(Variant::WrongExit); }, "not a valid runtime value",
+             "one inactive lane bypassed material index initialization for active lanes");
+  for (const auto variant : {Variant::WrongCarry, Variant::WrongBackedge}) {
+    CheckFatal([&] { make_plan(variant); }, "not a valid runtime value",
+               "inactive material lane did not preserve its selected index across iterations");
+  }
 }
 
 void TestImageDescriptorFields() {

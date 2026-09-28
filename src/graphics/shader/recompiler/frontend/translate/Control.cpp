@@ -1,17 +1,14 @@
 #include "common/assert.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 
+
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 namespace {
 
 bool IsExecOrVcc(const Decoder::Operand& operand) {
-	switch (operand.kind) {
-		case Decoder::OperandKind::ExecLo:
-		case Decoder::OperandKind::ExecHi:
-		case Decoder::OperandKind::VccLo:
-		case Decoder::OperandKind::VccHi: return true;
-		default: return false;
-	}
+ using K = Decoder::OperandKind;
+ return operand.kind == K::ExecLo || operand.kind == K::ExecHi ||
+        operand.kind == K::VccLo || operand.kind == K::VccHi;
 }
 
 Decoder::Operand ConditionOperand(Decoder::OperandKind kind) {

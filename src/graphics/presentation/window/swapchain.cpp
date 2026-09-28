@@ -4,6 +4,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/threads.h"
+#include "common/timer.h"
 #include "gpu_blit_shaders/gpu_blit_fs_triangle_spv.h"
 #include "gpu_blit_shaders/gpu_video_out_overlay_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -13,9 +14,13 @@
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
+#include "graphics/presentation/videoOutFlipDue.h"
 #include "graphics/presentation/window/windowInternal.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <deque>
 #include <array>
 #include <limits>
 #include <memory>
@@ -26,11 +31,27 @@
 
 namespace Libs::Graphics {
 
+uint64_t PresentReadbackEnvU64(const char* name, uint64_t fallback) {
+	const char* value = std::getenv(name);
+	if (value == nullptr || *value == '\0') {
+		return fallback;
+	}
+	char*                  end    = nullptr;
+	const unsigned long long parsed = std::strtoull(value, &end, 10);
+	if (end == value || *end != '\0') {
+		return fallback;
+	}
+	return static_cast<uint64_t>(parsed);
+}
+
 struct Presenter::Frame {
 	VulkanImage   image;
 	vk::ImageView view         = nullptr;
 	uint64_t      present_tick = 0;
 	bool          busy         = false;
+	bool          guest_surface = false;
+	bool          capture_pending = false;
+	Image*        guest_source = nullptr;
 
 	void Configure(GraphicContext& graphics, vk::Extent2D extent, vk::Format format);
 	void Transit(vk::CommandBuffer command, vk::ImageLayout layout, vk::AccessFlags2 access);
@@ -112,6 +133,9 @@ public:
 			EXIT("prepared-frame pool returned an invalid frame\n");
 		}
 		frame->busy = true;
+		frame->guest_surface = false;
+		frame->capture_pending = false;
+		frame->guest_source = nullptr;
 		m_mutex.Unlock();
 
 		m_scheduler.Wait(frame->present_tick);
@@ -299,6 +323,9 @@ private:
 };
 
 struct Presenter::Impl {
+	uint64_t present_readback_count = 0;
+	uint64_t present_readback_frame = 0;
+	uint64_t present_source_trace_count = 0;
 	explicit Impl(WindowContext& owner)
 	    : renderer(*owner.render_context), window(owner), swapchain(owner),
 	      present_scheduler(renderer, owner.graphic_ctx), frames(owner, present_scheduler) {
@@ -312,6 +339,119 @@ struct Presenter::Impl {
 		     status == Swapchain::Status::SurfaceLost ? " and surface" : "");
 		swapchain.Recreate(status == Swapchain::Status::SurfaceLost);
 		frames.SetFormat(swapchain.Format());
+	}
+
+	void CapturePreparedFrame(Presenter::Frame& frame) {
+		const char* path = std::getenv("KYTY_PRESENT_READBACK_PATH");
+		const bool capture_source = std::getenv("KYTY_PRESENT_READBACK_SOURCE") != nullptr;
+		const auto* source_image =
+		    capture_source && frame.guest_source != nullptr ? frame.guest_source : nullptr;
+		const auto capture_format =
+		    source_image != nullptr ? source_image->backing.format : frame.image.format;
+		const auto capture_extent = source_image != nullptr
+		                                ? source_image->backing.extent
+		                                : vk::Extent3D {frame.image.extent.width,
+		                                                frame.image.extent.height, 1};
+		const auto capture_handle =
+		    source_image != nullptr ? source_image->backing.image : frame.image.image;
+		static uint32_t trace_count = 0;
+		if (path != nullptr && *path != '\0' && trace_count < 16) {
+			std::printf("PresentReadback: guest=%d format=%d extent=%ux%u count=%" PRIu64 "\n",
+			            frame.guest_surface ? 1 : 0, static_cast<int>(capture_format),
+			            capture_extent.width, capture_extent.height, present_readback_count);
+			std::fflush(stdout);
+			trace_count++;
+		}
+		if (!frame.guest_surface || path == nullptr || *path == '\0') {
+			return;
+		}
+		const auto frame_index = present_readback_frame++;
+		const auto frame_start = PresentReadbackEnvU64("KYTY_PRESENT_READBACK_START", 0);
+		const auto frame_limit = PresentReadbackEnvU64("KYTY_PRESENT_READBACK_LIMIT", 8);
+		if (frame_index < frame_start || present_readback_count >= frame_limit) {
+			return;
+		}
+		if (capture_format != vk::Format::eA2B10G10R10UnormPack32 &&
+		    capture_format != vk::Format::eA2R10G10B10UnormPack32 &&
+		    capture_format != vk::Format::eR8G8B8A8Unorm &&
+		    capture_format != vk::Format::eB8G8R8A8Unorm &&
+		    capture_format != vk::Format::eR8G8B8A8Srgb &&
+		    capture_format != vk::Format::eB8G8R8A8Srgb) {
+			return;
+		}
+		const uint64_t size = uint64_t {capture_extent.width} * capture_extent.height * 4u;
+		Buffer download(window.graphic_ctx, present_scheduler, MemoryUsage::Download, 0,
+		                vk::BufferUsageFlagBits::eTransferDst, size);
+		auto& command = present_scheduler.BeginCommand();
+		vk::BufferImageCopy copy {};
+		copy.bufferRowLength = capture_extent.width;
+		copy.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+		copy.imageExtent = capture_extent;
+		command.Handle().copyImageToBuffer(capture_handle, vk::ImageLayout::eTransferSrcOptimal,
+		                                   download.Handle(), 1, &copy);
+		vk::BufferMemoryBarrier2 barrier {};
+		barrier.srcStageMask        = vk::PipelineStageFlagBits2::eTransfer;
+		barrier.srcAccessMask       = vk::AccessFlagBits2::eTransferWrite;
+		barrier.dstStageMask        = vk::PipelineStageFlagBits2::eHost;
+		barrier.dstAccessMask       = vk::AccessFlagBits2::eHostRead;
+		barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.buffer              = download.Handle();
+		barrier.offset              = 0;
+		barrier.size                = size;
+		vk::DependencyInfo dependency {};
+		dependency.bufferMemoryBarrierCount = 1;
+		dependency.pBufferMemoryBarriers    = &barrier;
+		command.Handle().pipelineBarrier2(dependency);
+		const auto tick = present_scheduler.Submit();
+		present_scheduler.Wait(tick);
+		download.Invalidate(0, size);
+
+		std::array<uint32_t, 4> minimum {UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX};
+		std::array<uint32_t, 4> maximum {0, 0, 0, 0};
+		std::array<uint64_t, 4> nonzero {};
+		uint64_t colored_pixels = 0;
+		const auto bytes = download.Mapped();
+		for (uint64_t offset = 0; offset < size; offset += 4) {
+			std::array<uint32_t, 4> values {};
+			if (capture_format == vk::Format::eA2B10G10R10UnormPack32) {
+				uint32_t packed = 0;
+				std::memcpy(&packed, bytes.data() + static_cast<size_t>(offset), sizeof(packed));
+				values = {packed & 0x3ffu, (packed >> 10u) & 0x3ffu,
+				          (packed >> 20u) & 0x3ffu, packed >> 30u};
+			} else if (capture_format == vk::Format::eA2R10G10B10UnormPack32) {
+				uint32_t packed = 0;
+				std::memcpy(&packed, bytes.data() + static_cast<size_t>(offset), sizeof(packed));
+				// A2R10G10B10_PACK32: B in bits 0-9, G 10-19, R 20-29, A 30-31.
+				values = {(packed >> 20u) & 0x3ffu, (packed >> 10u) & 0x3ffu,
+				          packed & 0x3ffu, packed >> 30u};
+			} else {
+				for (uint32_t channel = 0; channel < 4; channel++) {
+					values[channel] = bytes[static_cast<size_t>(offset + channel)];
+				}
+			}
+			bool colored = false;
+			for (uint32_t channel = 0; channel < 4; channel++) {
+				const auto value = values[channel];
+				minimum[channel] = std::min(minimum[channel], value);
+				maximum[channel] = std::max(maximum[channel], value);
+				nonzero[channel] += value != 0 ? 1u : 0u;
+				if (channel < 3 && value != 0) colored = true;
+			}
+			colored_pixels += colored ? 1u : 0u;
+		}
+		if (auto* output = std::fopen(path, "ab"); output != nullptr) {
+			std::fprintf(output,
+			             "frame=%" PRIu64 " width=%u height=%u format=%d colored=%" PRIu64
+			             " nonzero=%" PRIu64 ",%" PRIu64 ",%" PRIu64 ",%" PRIu64
+			             " min=%u,%u,%u,%u max=%u,%u,%u,%u\n",
+			             frame_index, capture_extent.width, capture_extent.height,
+			             static_cast<int>(capture_format), colored_pixels, nonzero[0], nonzero[1],
+			             nonzero[2], nonzero[3], minimum[0], minimum[1], minimum[2], minimum[3],
+			             maximum[0], maximum[1], maximum[2], maximum[3]);
+			std::fclose(output);
+		}
+		present_readback_count++;
 	}
 
 	Image& ResolveSurface(const ImageInfo& info) {
@@ -332,6 +472,22 @@ struct Presenter::Impl {
 		auto&      image      = cache.GetImage(image_id);
 		image.usage.video_out = true;
 		cache.UpdateImage(image_id);
+		const char* readback_path = std::getenv("KYTY_PRESENT_READBACK_PATH");
+		if (readback_path != nullptr && *readback_path != '\0' && present_source_trace_count < 8) {
+			std::printf(
+			    "PresentSource: addr=0x%016" PRIx64 " size=0x%016" PRIx64
+			    " metadata=0x%016" PRIx64 " compression=%u usage=t%d/s%d/r%d/v%d "
+			    "dirty=g%d/b%d/c%d backing=%d %ux%u\n",
+			    image.info.data.address, image.info.data.size, image.info.metadata.range.address,
+			    static_cast<uint32_t>(image.info.metadata.compression), image.usage.texture ? 1 : 0,
+			    image.usage.storage ? 1 : 0, image.usage.render_target ? 1 : 0,
+			    image.usage.video_out ? 1 : 0, image.IsGpuModified() ? 1 : 0,
+			    image.IsBufferModified() ? 1 : 0, image.IsCpuDirty() ? 1 : 0,
+			    static_cast<int>(image.backing.format), image.backing.extent.width,
+			    image.backing.extent.height);
+			std::fflush(stdout);
+			present_source_trace_count++;
+		}
 		return image;
 	}
 	void Present();
@@ -559,28 +715,49 @@ bool Swapchain::NeedsResize() const {
 
 Swapchain::Status Swapchain::AcquireNextImage() {
 	EXIT_IF(m_handle == nullptr || m_frame_index >= m_image_acquired.size());
-	m_image_index     = static_cast<uint32_t>(-1);
-	const auto result = m_window.graphic_ctx.device.acquireNextImageKHR(
-	    m_handle, std::numeric_limits<uint64_t>::max(), m_image_acquired[m_frame_index], nullptr,
-	    &m_image_index);
-	switch (result) {
-		case vk::Result::eSuccess: break;
-		case vk::Result::eSuboptimalKHR:
-			LOGF("vkAcquireNextImageKHR returned vk::Result::eSuboptimalKHR\n");
-			return Status::Recreate;
-		case vk::Result::eErrorOutOfDateKHR:
-			LOGF("vkAcquireNextImageKHR returned vk::Result::eErrorOutOfDateKHR\n");
-			return Status::Recreate;
-		case vk::Result::eErrorUnknown:
-			LOGF("vkAcquireNextImageKHR returned vk::Result::eErrorUnknown\n");
-			return Status::Recreate;
-		case vk::Result::eErrorSurfaceLostKHR:
-			LOGF("vkAcquireNextImageKHR returned vk::Result::eErrorSurfaceLostKHR\n");
-			return Status::SurfaceLost;
-		default: EXIT("vkAcquireNextImageKHR failed: %s\n", vk::to_string(result).c_str());
+	m_image_index = static_cast<uint32_t>(-1);
+	// Poll with timeout=0: some drivers do not reliably wake an unbounded or
+	// long acquireNextImage wait while the GPU keeps submitting, which freezes
+	// VideoOut Flip (ready=shown+1) without Fatal.
+	constexpr uint32_t kAcquirePollLimitMs = 1000;
+	const auto         begin               = Common::Timer::QueryPerformanceCounter();
+	const auto         frequency           = Common::Timer::QueryPerformanceFrequency();
+	for (;;) {
+		const auto result = m_window.graphic_ctx.device.acquireNextImageKHR(
+		    m_handle, 0, m_image_acquired[m_frame_index], nullptr, &m_image_index);
+		switch (result) {
+			case vk::Result::eSuccess:
+				EXIT_IF(m_image_index >= m_images.size());
+				return Status::Success;
+			case vk::Result::eTimeout: {
+				const auto now = Common::Timer::QueryPerformanceCounter();
+				const auto elapsed_ms =
+				    frequency == 0 ? kAcquirePollLimitMs
+				                   : static_cast<uint32_t>((now - begin) * 1000u / frequency);
+				if (elapsed_ms >= kAcquirePollLimitMs) {
+					LOGF("vkAcquireNextImageKHR timed out after %ums; recreating swapchain\n",
+					     elapsed_ms);
+					Log::Flush();
+					return Status::Recreate;
+				}
+				Common::Thread::SleepMicro(1000);
+				continue;
+			}
+			case vk::Result::eSuboptimalKHR:
+				LOGF("vkAcquireNextImageKHR returned vk::Result::eSuboptimalKHR\n");
+				return Status::Recreate;
+			case vk::Result::eErrorOutOfDateKHR:
+				LOGF("vkAcquireNextImageKHR returned vk::Result::eErrorOutOfDateKHR\n");
+				return Status::Recreate;
+			case vk::Result::eErrorUnknown:
+				LOGF("vkAcquireNextImageKHR returned vk::Result::eErrorUnknown\n");
+				return Status::Recreate;
+			case vk::Result::eErrorSurfaceLostKHR:
+				LOGF("vkAcquireNextImageKHR returned vk::Result::eErrorSurfaceLostKHR\n");
+				return Status::SurfaceLost;
+			default: EXIT("vkAcquireNextImageKHR failed: %s\n", vk::to_string(result).c_str());
+		}
 	}
-	EXIT_IF(m_image_index >= m_images.size());
-	return Status::Success;
 }
 
 bool Swapchain::PrepareSystemOverlay() {
@@ -885,6 +1062,9 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	}
 	frame->Configure(m_impl->window.graphic_ctx,
 	                 {image.backing.extent.width, image.backing.extent.height}, frame_format);
+	frame->guest_surface = true;
+	frame->capture_pending = true;
+	frame->guest_source = &image;
 	frame->CopyFrom(buffer, image);
 	return *frame;
 }
@@ -932,6 +1112,10 @@ RenderContext& Presenter::Renderer() const noexcept {
 	return m_impl->renderer;
 }
 
+void Presenter::UpdateWindowTitle() {
+	m_impl->window.UpdateTitle();
+}
+
 void Presenter::Present(Frame& frame) {
 	const Layer layer {&frame, 0, false};
 	Present(std::span(&layer, 1));
@@ -972,13 +1156,22 @@ void Presenter::Impl::Present() {
 		RecoverSwapchain(Swapchain::Status::Recreate);
 	}
 	for (uint32_t attempt = 0; attempt < 2; attempt++) {
+		VideoOut::SetPresentStage(VideoOut::kPresentStagePresentAcquire);
 		auto status = swapchain.AcquireNextImage();
 		if (status != Swapchain::Status::Success) {
 			RecoverSwapchain(status);
 			continue;
 		}
+		VideoOut::SetPresentStage(VideoOut::kPresentStagePresentMutex);
 		{
 			Common::LockGuard render_lock(renderer.GetMutex());
+			VideoOut::SetPresentStage(VideoOut::kPresentStagePresentSubmit);
+			for (const auto& layer : layers) {
+				if (layer.frame != nullptr && layer.frame->capture_pending) {
+					CapturePreparedFrame(*layer.frame);
+					layer.frame->capture_pending = false;
+				}
+			}
 			auto&             command = present_scheduler.BeginCommand();
 			const bool        draw_system_overlay =
 			    overlay_visual.active && swapchain.PrepareSystemOverlay();
@@ -991,6 +1184,7 @@ void Presenter::Impl::Present() {
 				}
 			}
 		}
+		VideoOut::SetPresentStage(VideoOut::kPresentStagePresentQueue);
 		status = swapchain.Present();
 		if (status != Swapchain::Status::Success) {
 			RecoverSwapchain(status);
@@ -998,7 +1192,7 @@ void Presenter::Impl::Present() {
 		}
 
 		presented_overlay_revision.store(overlay_visual.revision, std::memory_order_release);
-		window.UpdateTitle();
+		VideoOut::SetPresentStage(VideoOut::kPresentStagePresentDone);
 		return;
 	}
 	LOGF("Vulkan presentation retry exhausted; dropping frame\n");

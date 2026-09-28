@@ -637,11 +637,14 @@ uint32_t EmitDppUpdateU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 }
 
 uint32_t EmitConditionRef(ValueEmitContext& ctx, const IR::Inst& inst) {
-	if (ctx.other_half == nullptr) return ctx.Arg(inst, 0);
-	// A native scalar branch makes one decision for both emulated wave halves.
-	if (ctx.half != 0) return ctx.other_half->Def(IR::Value(&inst));
+	const bool split_compute = ctx.state.compute_execution.IsSplitWave64();
+	if (ctx.other_half == nullptr && !split_compute) return ctx.Arg(inst, 0);
+	// Packed graphics and physical compute halves share one scalar branch decision.
+	if (ctx.other_half != nullptr && ctx.half != 0) return ctx.other_half->Def(IR::Value(&inst));
 	const auto kind = inst.Flags<CFG::BranchCondition>();
-	if (kind == CFG::BranchCondition::ScalarInstruction) return ctx.Arg(inst, 0);
+	if (kind == CFG::BranchCondition::ScalarInstruction ||
+	    (split_compute && (kind == CFG::BranchCondition::SccZero ||
+	                       kind == CFG::BranchCondition::SccNonZero))) return ctx.Arg(inst, 0);
 	const auto ballot = ctx.Ballot(inst.Arg(0));
 	const auto low = ctx.state.builder.AllocateId();
 	const auto high = ctx.state.builder.AllocateId();
@@ -745,6 +748,19 @@ uint32_t EmitGetShaderBase(ValueEmitContext& ctx) {
 
 void EmitUnreachable(ValueEmitContext& ctx, const IR::Inst& inst) {
 	ctx.Fail(inst, "must be lowered before SPIR-V emission");
+}
+
+void EmitDpp8MoveU32(ValueEmitContext& ctx, const IR::Inst& inst) {
+ auto& state = ctx.state;
+ const auto flags = inst.Flags<IR::Dpp8MoveFlags>();
+ const auto target = EmitDpp8TargetLane(state, flags.lane_selectors);
+ const auto shuffled = EmitWaveReadLane(state, ctx.Arg(inst, 0), target.lane);
+ if (flags.fetch_inactive) { ctx.Define(inst, shuffled); return; }
+ const auto active = EmitBallotLaneActiveBool(state, EmitWaveBallot(state, ctx.Arg(inst, 1)), target.lane);
+ ctx.Define(inst, Select(state, TypeU32(state), active, shuffled, ConstantU32(state, 0)));
+}
+uint32_t EmitDpp8UpdateU32(EmitterState& state, uint32_t value, uint32_t previous, uint32_t active) {
+ return Select(state, TypeU32(state), active, value, previous);
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter

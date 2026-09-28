@@ -10,6 +10,13 @@
 #include <windows.h>
 #undef min
 #undef max
+#elif defined(__APPLE__)
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#else
+#include <sys/syscall.h>
+#include <sys/uio.h>
+#include <unistd.h>
 #endif
 
 namespace Libs::Graphics {
@@ -28,6 +35,33 @@ bool IsAccessible(DWORD protect, HostMemoryAccess access) {
 #endif
 
 } // namespace
+
+bool HostMemoryReadU32(uint64_t address, uint32_t& value) {
+	uint32_t word = 0;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	SIZE_T copied = 0;
+	if (!ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(address),
+	                       &word, sizeof(word), &copied) || copied != sizeof(word)) {
+		return false;
+	}
+#elif defined(__APPLE__)
+	mach_vm_size_t copied = 0;
+	if (mach_vm_read_overwrite(mach_task_self(), address, sizeof(word),
+	                           reinterpret_cast<mach_vm_address_t>(&word), &copied) !=
+	        KERN_SUCCESS || copied != sizeof(word)) {
+		return false;
+	}
+#else
+	const iovec local {&word, sizeof(word)};
+	const iovec remote {reinterpret_cast<void*>(address), sizeof(word)};
+	if (syscall(SYS_process_vm_readv, getpid(), &local, 1ul, &remote, 1ul, 0ul) !=
+	    static_cast<long>(sizeof(word))) {
+		return false;
+	}
+#endif
+	value = word;
+	return true;
+}
 
 bool HostMemoryQueryRange(uint64_t addr, uint64_t requested_size, HostMemoryAccess access,
                           uint64_t& accessible_size) {

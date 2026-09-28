@@ -215,6 +215,10 @@ uint32_t RenderTargetBytesPerElement(BufferFormat format) {
 	return info != nullptr ? info->render_target_bytes_per_element : 0;
 }
 
+bool IsKnownFormat(BufferFormat format) {
+	return FindFormatInfo(format) != nullptr;
+}
+
 bool IsFmaskTextureFormat(BufferFormat format) {
 	return format >= BufferFormat::kFmask8_S2_F1 && format <= BufferFormat::kFmask64_S16_F8;
 }

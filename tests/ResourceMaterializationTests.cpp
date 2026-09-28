@@ -95,7 +95,7 @@ Libs::Graphics::ShaderRecompiler::IR::ResourcePlan UserDataBufferPlan() {
   return ExtractResourcePlan(program);
 }
 
-Libs::Graphics::ShaderRecompiler::IR::ResourcePlan MixedSamplerPlan() {
+Libs::Graphics::ShaderRecompiler::IR::ResourcePlan MixedSamplerPlan(uint32_t sampler_count = 2u) {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   Program program;
   program.stage = Libs::Graphics::ShaderType::Compute;
@@ -134,6 +134,9 @@ Libs::Graphics::ShaderRecompiler::IR::ResourcePlan MixedSamplerPlan() {
            Libs::Graphics::Prospero::BufferFormat::k8_8_8_8UNorm});
   program.info.samplers.push_back({.source = sampler0});
   program.info.samplers.push_back({.source = sampler1});
+  for (uint32_t index = 2u; index < sampler_count; index++) {
+    program.info.samplers.push_back({.source = AddSource(4, 0x30000000u + index)});
+  }
   program.info.sampled_pairs.push_back({.image = 0, .sampler = 0});
   program.info.sampled_pairs.push_back({.image = 0, .sampler = 1});
   program.info.sampled_pairs.push_back({.image = 1, .sampler = 1});
@@ -242,21 +245,83 @@ void TestMixedSamplerDuplicatesTheCorrectSnapshot() {
         "point sampler variant duplicated the wrong runtime descriptor");
 }
 
-} // namespace
-
-namespace Common {
-
-int DbgExitHandler(const char *, int, std::string_view) { std::abort(); }
-
-int DbgExitHandler(const char *, int, fmt::text_style, std::string_view) {
-  std::abort();
+void TestPointSamplerCapacityIsTransactional() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  auto plan = MixedSamplerPlan(ShaderInfo::MaxSamplers - 1u);
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, {}, snapshot, specialization),
+        "ordinary samplers plus one point variant rejected the exact sampler capacity");
+  Check(snapshot.samplers.size() == ShaderInfo::MaxSamplers &&
+            specialization.sampler_origins.size() == ShaderInfo::MaxSamplers - 1u &&
+            snapshot.samplers.back() == snapshot.samplers[1] &&
+            snapshot.samplers.back() != snapshot.samplers[0],
+        "point sampler capacity dropped or cloned the wrong descriptor");
+  const auto prior_snapshot = snapshot;
+  const auto prior_specialization = specialization;
+  for (const uint32_t count : {ShaderInfo::MaxSamplers, ShaderInfo::MaxSamplers + 1u}) {
+    auto overflow = MixedSamplerPlan(count);
+    Check(!MaterializeResources(overflow, {}, snapshot, specialization),
+          "ordinary samplers plus point expansion exceeded the sampler capacity");
+    Check(snapshot.buffers == prior_snapshot.buffers && snapshot.images == prior_snapshot.images &&
+              snapshot.samplers == prior_snapshot.samplers &&
+              snapshot.flattened_srt == prior_snapshot.flattened_srt &&
+              snapshot.user_data == prior_snapshot.user_data &&
+              specialization == prior_specialization,
+          "sampler capacity failure partially replaced a successful materialization");
+  }
 }
 
-int DbgExitIfHandler(const char *, const char *, int) { return 1; }
+void TestAtomicFloatImageUsesRawUintSpecialization() {
+  using namespace Libs::Graphics;
+  using namespace ShaderRecompiler::IR;
+  for (const auto format : {Prospero::BufferFormat::k32UInt,
+                           Prospero::BufferFormat::k32Float}) {
+    for (const bool atomic : {false, true}) {
+      Program program;
+      program.stage = ShaderType::Compute;
+      program.srt_plan_complete = true;
+      program.resource_tracking_complete = true;
+      AddValueBlock(program);
 
-void DbgExit(int) { std::abort(); }
+      // A non-null R32 descriptor must take the format-specialization path.
+      const uint32_t words[] = {
+          0x304bb700u, 0xc0000000u | (static_cast<uint32_t>(format) << 20u),
+          0x0000001fu, 0x91b00204u, 0, 0x00700000u, 0, 0};
+      DescriptorSource source;
+      source.dword_count = 8;
+      for (uint32_t i = 0; i < 8; ++i) {
+        source.dwords[i] = Value(words[i]);
+      }
+      program.descriptor_sources.push_back(source);
+      ImageResource image;
+      image.source = 0;
+      image.resource_class = ImageResourceClass::Storage;
+      image.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      image.read = true;
+      image.written = true;
+      image.atomic = atomic;
+      program.info.images.push_back(image);
 
-} // namespace Common
+      auto plan = ExtractResourcePlan(program);
+      ResourceSnapshot snapshot;
+      ResourceSpecialization specialization;
+      Check(MaterializeResources(plan, {}, snapshot, specialization),
+            "R32 image materialization failed");
+      Check(snapshot.images.size() == 1 &&
+                snapshot.images[0].dwords[1] == words[1],
+            "specialization changed the guest image descriptor");
+      const auto expected = atomic || format == Prospero::BufferFormat::k32UInt
+                                ? Prospero::TextureNumericClass::Uint
+                                : Prospero::TextureNumericClass::Float;
+      Check(specialization.images.size() == 1 &&
+                specialization.images[0].numeric_class == expected,
+            "R32F atomic image must use Uint while ordinary R32F stays Float");
+    }
+  }
+}
+
+} // namespace
 
 int main() {
   TestMappedSrtUsesDirectReaderByDefault();
@@ -264,6 +329,8 @@ int main() {
   TestUnbasedFlatCacheHitMaterializes();
   TestFailedMaterializationRejectsStage();
   TestMixedSamplerDuplicatesTheCorrectSnapshot();
+  TestPointSamplerCapacityIsTransactional();
+  TestAtomicFloatImageUsesRawUintSpecialization();
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;
 }

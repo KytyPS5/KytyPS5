@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/renderDoc.h"
+#include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/window/hostInput.h"
 #include "graphics/presentation/window/windowInternal.h"
@@ -715,6 +716,7 @@ void WindowContext::Run() {
 	loop.paused.store(false, std::memory_order_release);
 
 	while (!loop.need_exit) {
+		ApplyPendingTitle();
 		if (loop.paused.load(std::memory_order_acquire)) {
 			if (!timer.IsPaused()) {
 				timer.Pause();
@@ -939,22 +941,45 @@ void WindowContext::UpdateTitle() {
 	}
 
 	const auto* device_name = graphic_ctx.GetPhysicalDeviceProperties().deviceName.data();
+	const auto  video_out   = VideoOut::VideoOutGetDiagnostics();
 	auto text = fmt::format(
-	    "[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:.0f}", KYTY_BUILD_LABEL, build_type,
+	    "[{} | {}] {}{}{}{}{}{}[{}] [{}], frame: {}, fps: {:f}, flips cpu/gpu: {}/{}, "
+	    "prepared: {}, ready: {}, shown: {}, last: {}, pstg: {}, output status: {} (res {}), "
+	    "support: {} (mode 0x{:x} -> {})", KYTY_BUILD_LABEL, build_type,
 	    (has_title ? title : ""), (has_title ? ", " : ""), (has_title_id ? title_id : ""),
 	    (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""),
-	    device_name, processor_name, frame_num, current_fps);
+	    device_name, processor_name, frame_num, current_fps, video_out.cpu_submitted,
+	    video_out.gpu_submitted, video_out.prepared, video_out.ready, video_out.presented,
+	    video_out.last_presented_index, video_out.present_stage, video_out.output_status_calls,
+	    video_out.last_output_resolution, video_out.output_support_calls,
+	    video_out.last_output_mode, video_out.last_output_support);
 
-	struct TitleUpdate {
-		SDL_Window*  window;
-		std::string* text;
-	} update {window, &text};
-	EXIT_IF(!SDL_RunOnMainThread(
-	    [](void* data) {
-		    auto& title = *static_cast<TitleUpdate*>(data);
-		    SDL_SetWindowTitle(title.window, title.text->c_str());
-	    },
-	    &update, true));
+	// Never block the present thread on the window thread. A blocking
+	// SDL_RunOnMainThread here soft-stalls VideoOut while the GPU keeps running
+	// (ready=shown+1, shown frozen) whenever the main loop is not pumping.
+	{
+		Common::LockGuard lock(title_mutex);
+		pending_title = std::move(text);
+		title_dirty   = true;
+	}
+	SDL_Event wake {};
+	wake.type = SDL_EVENT_USER;
+	SDL_PushEvent(&wake);
+}
+
+void WindowContext::ApplyPendingTitle() {
+	std::string text;
+	{
+		Common::LockGuard lock(title_mutex);
+		if (!title_dirty) {
+			return;
+		}
+		text        = std::move(pending_title);
+		title_dirty = false;
+	}
+	if (window != nullptr) {
+		SDL_SetWindowTitle(window, text.c_str());
+	}
 }
 
 } // namespace Libs::Graphics

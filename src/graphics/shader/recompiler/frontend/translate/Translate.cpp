@@ -4,7 +4,6 @@
 
 #include <algorithm>
 #include <array>
-#include <bit>
 #include <unordered_map>
 #include <utility>
 
@@ -19,6 +18,11 @@ static IR::DppMoveFlags DppFlags(const Decoder::Operand& operand) {
 	    .bound_control  = operand.dpp_bound_ctrl,
 	    .dpp8           = operand.dpp8,
 	};
+}
+
+IR::U1 Translator::MaskIsZero(IR::U32 low, IR::U32 high) {
+ const auto mask = program.wave_size == 64u ? ir.BitwiseOr(low, high) : low;
+ return ir.IEqual(mask, IR::U32(IR::Value(0u)));
 }
 
 const Decoder::Operand& Translator::SourceAt(const Decoder::Instruction& inst, uint32_t index) {
@@ -170,11 +174,8 @@ IR::U32 Translator::ReadScalarCode(uint32_t code) {
 		case 106u: return ir.GetVccLo();
 		case 107u: return ir.GetVccHi();
 		case 124u: return ir.GetM0();
-		case 126u:
-		case 127u: {
-			const auto mask = BallotMask(ir.GetExec());
-			return mask[code - 126u];
-		}
+		case 126u: return ir.GetExecLo();
+		case 127u: return ir.GetExecHi();
 		default: return IR::U32(IR::Value(0u));
 	}
 }
@@ -183,6 +184,13 @@ IR::U32 Translator::ApplyBitSourceModifiers(const Decoder::Operand& operand, IR:
 	if (operand.dpp) {
 		value =
 		    IR::U32(ir.Emit(IR::ValueOpcode::DppMoveU32, {value, ir.GetExec()}, DppFlags(operand)));
+	}
+	if (operand.dpp8) {
+		const IR::Dpp8MoveFlags flags {
+		    .lane_selectors = operand.dpp8_lane_selectors,
+		    .fetch_inactive = operand.dpp8_fetch_inactive,
+		};
+		value = IR::U32(ir.Emit(IR::ValueOpcode::Dpp8MoveU32, {value, ir.GetExec()}, flags));
 	}
 	if (operand.sdwa_sel != 6u) {
 		uint32_t offset = 0;
@@ -203,7 +211,34 @@ IR::U32 Translator::ApplyBitSourceModifiers(const Decoder::Operand& operand, IR:
 	return value;
 }
 
+IR::F64 Translator::ReadF64(const Decoder::Operand& operand) {
+	if (operand.dpp || operand.dpp8 || operand.sdwa_sel != 6u || operand.sdwa_sext ||
+	    operand.op_sel || operand.op_sel_hi || operand.negate_hi) {
+		EXIT("FP64 source selectors are not implemented");
+	}
+	if (operand.kind != Decoder::OperandKind::Sgpr &&
+	    operand.kind != Decoder::OperandKind::Vgpr) {
+		// FP64 literals have different expansion rules from integer U64 operands.
+		// Keep untested literal/inline forms explicit instead of misreading bits.
+		EXIT("FP64 arithmetic currently requires a scalar or vector register pair");
+	}
+	const auto raw = PlainOperand(operand);
+	const auto low = ReadRawU32(raw);
+	const auto high = ReadRawU32(OffsetOperand(raw, 1));
+	auto value = IR::F64(ir.Emit(IR::ValueOpcode::CompositeConstructF64, {low, high}));
+	if (operand.absolute) {
+		value = IR::F64(ir.Emit(IR::ValueOpcode::FPAbs64, {value}));
+	}
+	if (operand.negate) {
+		value = IR::F64(ir.Emit(IR::ValueOpcode::FPNeg64, {value}));
+	}
+	return value;
+}
+
 IR::Value Translator::ReadOperand(const Decoder::Operand& operand, IR::Type type) {
+	if (type == IR::Type::F64) {
+		return ReadF64(operand);
+	}
 	if (type == IR::Type::U16) {
 		return ir.Emit(IR::ValueOpcode::ConvertU16U32,
 		               {ApplyBitSourceModifiers(operand, ReadRawU32(operand))});
@@ -220,34 +255,15 @@ IR::Value Translator::ReadOperand(const Decoder::Operand& operand, IR::Type type
 			case Decoder::OperandKind::ExecHi: return ir.GetExec();
 			case Decoder::OperandKind::VccLo:
 			case Decoder::OperandKind::VccHi: return ir.GetVcc();
-			case Decoder::OperandKind::VccZ: return ir.LogicalNot(ir.GetVcc());
-			case Decoder::OperandKind::ExecZ: return ir.LogicalNot(ir.GetExec());
+			case Decoder::OperandKind::VccZ: return MaskIsZero(ir.GetVccLo(), ir.GetVccHi());
+			case Decoder::OperandKind::ExecZ: return MaskIsZero(ir.GetExecLo(), ir.GetExecHi());
 			default: break;
 		}
 		return ir.INotEqual(ReadRawU32(operand), IR::U32(IR::Value(0u)));
 	}
-	if (type == IR::Type::U64 || type == IR::Type::F64) {
-		auto pair = ReadU32Pair(operand);
-		if (type == IR::Type::F64) {
-			if (operand.kind == Decoder::OperandKind::LiteralConstant) {
-				pair = {IR::U32(IR::Value(0u)), IR::U32(IR::Value(operand.value))};
-			} else if (operand.kind == Decoder::OperandKind::FloatInlineConstant) {
-				const auto bits = operand.value == 0x3e22f983u
-				                      ? 0x3fc45f306dc9c882ull
-				                      : std::bit_cast<uint64_t>(static_cast<double>(
-				                            std::bit_cast<float>(operand.value)));
-				pair            = {IR::U32(IR::Value(static_cast<uint32_t>(bits))),
-				                   IR::U32(IR::Value(static_cast<uint32_t>(bits >> 32u)))};
-			}
-			if (operand.absolute) {
-				pair[1] = ir.BitwiseAnd(pair[1], IR::U32(IR::Value(0x7fffffffu)));
-			}
-			if (operand.negate) {
-				pair[1] = ir.BitwiseXor(pair[1], IR::U32(IR::Value(0x80000000u)));
-			}
-		}
-		const auto bits = ir.ConstructU64(pair[0], pair[1]);
-		return type == IR::Type::F64 ? ir.Emit(IR::ValueOpcode::BitCastF64U64, {bits}) : IR::Value(bits);
+	if (type == IR::Type::U64) {
+		const auto pair = ReadU32Pair(operand);
+		return ir.ConstructU64(pair[0], pair[1]);
 	}
 	auto bits = ApplyBitSourceModifiers(operand, ReadRawU32(operand));
 	if (TypesOverlap(type, IR::Type::F32) && !TypesOverlap(type, IR::Type::U32)) {
@@ -424,11 +440,12 @@ void Translator::WriteOperand(const Decoder::Operand& operand, IR::Value value) 
 		Write16Bits(operand, IR::U32(ir.Emit(IR::ValueOpcode::ConvertU32U16, {bits})));
 		return;
 	}
-	if (type == IR::Type::F64) {
-		value = ir.Emit(IR::ValueOpcode::BitCastU64F64, {value});
-		type  = IR::Type::U64;
-	}
-	if (type == IR::Type::U64) {
+	if (type == IR::Type::U64 || type == IR::Type::F64) {
+		if (type == IR::Type::F64 &&
+		    (operand.clamp || operand.omod != 0u || operand.sdwa_sel != 6u ||
+		     operand.explicit_sdwa_dst || operand.dpp || operand.dpp8)) {
+			EXIT("FP64 destination modifiers are not implemented");
+		}
 		WriteU32Pair(operand, {ir.CompositeExtract(value, 0), ir.CompositeExtract(value, 1)});
 		return;
 	}
@@ -655,8 +672,8 @@ IR::U1 Translator::ReadMask(const Decoder::Operand& operand) {
 			           ? ThreadBit({ReadRawU32(operand), IR::U32(IR::Value(0u))})
 			           : ir.GetVcc();
 		case Decoder::OperandKind::Scc: return ir.GetScc();
-		case Decoder::OperandKind::VccZ: return ir.LogicalNot(ir.GetVcc());
-		case Decoder::OperandKind::ExecZ: return ir.LogicalNot(ir.GetExec());
+		case Decoder::OperandKind::VccZ: return MaskIsZero(ir.GetVccLo(), ir.GetVccHi());
+		case Decoder::OperandKind::ExecZ: return MaskIsZero(ir.GetExecLo(), ir.GetExecHi());
 		default: return ir.INotEqual(ReadRawU32(operand), IR::U32(IR::Value(0u)));
 	}
 }
@@ -679,10 +696,9 @@ IR::U1 Translator::ReadMaskValid(const Decoder::Operand& operand) {
 		case Decoder::OperandKind::ExecLo:
 		case Decoder::OperandKind::ExecHi:
 		case Decoder::OperandKind::VccLo:
-		case Decoder::OperandKind::VccHi:
-		case Decoder::OperandKind::VccZ:
-		case Decoder::OperandKind::ExecZ:
-		case Decoder::OperandKind::Scc: return IR::U1(IR::Value(true));
+		case Decoder::OperandKind::VccHi: return IR::U1(IR::Value(true));
+		// SCC/EXECZ/VCCZ are numeric scalar operands {flag, 0}, not replicated
+		// lane masks. Their Boolean form remains useful for carry/branch inputs.
 		default: return IR::U1(IR::Value(false));
 	}
 }
@@ -888,6 +904,8 @@ void IncludeInstructionVectorRegisters(const Decoder::Instruction& inst, uint32_
 	if (inst.family == Decoder::Family::DS) {
 		switch (inst.opcode) {
 			case Decoder::Opcode::DS_WRITE_B64:
+			case Decoder::Opcode::DS_ADD_U64:
+			case Decoder::Opcode::DS_OR_B64:
 			case Decoder::Opcode::DS_WRITE_B96:
 			case Decoder::Opcode::DS_WRITE_B128: include_vector(inst.src1, inst.data_dwords); break;
 			case Decoder::Opcode::DS_WRITE2_B32:

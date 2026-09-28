@@ -31,7 +31,8 @@ vk::ShaderModule CompileSPV(std::span<const uint32_t> code, vk::Device device);
 template <typename Handle, typename... Args>
 void SetVulkanObjectNameF(vk::Device device, Handle handle, fmt::format_string<Args...> format,
                           Args&&... args) {
-	if (!Config::GraphicsDebugDumpEnabled() || device == nullptr || handle == nullptr ||
+	if ((!Config::GraphicsDebugDumpEnabled() && !Config::GpuAssistedValidationEnabled()) ||
+	    device == nullptr || handle == nullptr ||
 	    VULKAN_HPP_DEFAULT_DISPATCHER.vkSetDebugUtilsObjectNameEXT == nullptr) {
 		return;
 	}

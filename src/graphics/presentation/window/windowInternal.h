@@ -10,6 +10,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -42,6 +43,7 @@ struct WindowContext {
 	void                                                    RefreshSurfaceCapabilities();
 	void                                                    UpdateIcon();
 	void                                                    UpdateTitle();
+	void                                                    ApplyPendingTitle();
 	void                                                    Resize(uint32_t width, uint32_t height);
 	void ProcessWindowEvent(const SDL_WindowEvent& event);
 	void ProcessDisplayEvent(const SDL_DisplayEvent& event);
@@ -57,6 +59,9 @@ struct WindowContext {
 	WindowLoopState                loop;
 
 	Common::Mutex mutex;
+	Common::Mutex title_mutex;
+	std::string   pending_title;
+	bool          title_dirty = false;
 };
 
 } // namespace Libs::Graphics

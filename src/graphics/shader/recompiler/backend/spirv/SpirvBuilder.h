@@ -25,6 +25,10 @@ struct DeferredPhi {
 	size_t word_offset    = 0;
 };
 
+struct DeferredLoopMerge {
+	size_t word_offset = 0;
+};
+
 class Builder {
 public:
 	explicit Builder(uint32_t version = 0x00010300u);
@@ -80,8 +84,20 @@ public:
 	void        AddFunction(std::span<const uint32_t> words);
 	DeferredPhi AddDeferredPhi(uint32_t type, uint32_t result, size_t incoming_count);
 	void        PatchDeferredPhi(DeferredPhi phi, size_t incoming, uint32_t value, uint32_t parent);
+	DeferredLoopMerge AddDeferredLoopMerge(uint32_t merge, uint32_t loop_control);
+	void PatchDeferredLoopContinue(DeferredLoopMerge loop, uint32_t continue_target);
 
 	[[nodiscard]] std::vector<uint32_t> Build() const;
+
+	void AddFunction(std::initializer_list<uint32_t> words) { AddFunction(std::span<const uint32_t>(words.begin(), words.size())); }
+	uint32_t Type(uint32_t opcode, std::initializer_list<uint32_t> operands) { return Type(static_cast<spv::Op>(opcode), std::span<const uint32_t>(operands.begin(), operands.size())); }
+	uint32_t Constant(uint32_t opcode, uint32_t type, std::initializer_list<uint32_t> operands) { return Constant(static_cast<spv::Op>(opcode), type, std::span<const uint32_t>(operands.begin(), operands.size())); }
+	void AddFunction(uint32_t opcode, std::initializer_list<uint32_t> operands) { AddFunction(static_cast<spv::Op>(opcode), std::span<const uint32_t>(operands.begin(), operands.size())); }
+	void AddAnnotation(uint32_t opcode, std::initializer_list<uint32_t> operands) { AddAnnotation(static_cast<spv::Op>(opcode), std::span<const uint32_t>(operands.begin(), operands.size())); }
+	void AddAnnotation(std::initializer_list<uint32_t> words) { AddAnnotation(static_cast<spv::Op>(*words.begin()), std::span<const uint32_t>(words.begin()+1, words.size()-1)); }
+	void RequireCapability(uint32_t capability) { RequireCapability(static_cast<spv::Capability>(capability)); }
+	uint32_t DefineGlobalVariable(uint32_t pointer_type, uint32_t storage_class) { return DefineGlobalVariable(pointer_type, static_cast<spv::StorageClass>(storage_class)); }
+	void DefineGlobalVariable(uint32_t id, uint32_t pointer_type, uint32_t storage_class) { DefineGlobalVariable(id, pointer_type, static_cast<spv::StorageClass>(storage_class)); }
 
 private:
 	static void AppendOperand(std::vector<uint32_t>& words, uint32_t value) {
@@ -158,6 +174,7 @@ private:
 	std::map<std::string, uint32_t>           m_import_ids;
 	std::map<std::vector<uint32_t>, uint32_t> m_declaration_ids;
 	size_t                                    m_unpatched_phi_incomings = 0;
+	size_t                                    m_unpatched_loop_merges   = 0;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv

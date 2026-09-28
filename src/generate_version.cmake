@@ -1,6 +1,7 @@
 set(KYTY_GIT_VERSION "unknown")
 set(KYTY_GIT_HASH "unknown")
 set(KYTY_GIT_REVISION "unknown")
+set(KYTY_GIT_WORKTREE_FINGERPRINT "unknown")
 if(GIT_EXECUTABLE)
 	execute_process(
 		COMMAND "${GIT_EXECUTABLE}" describe --tags --always --dirty
@@ -27,6 +28,45 @@ if(GIT_EXECUTABLE)
 		set(KYTY_GIT_REVISION "unknown")
 	else()
 		string(SUBSTRING "${KYTY_GIT_REVISION}" 0 7 KYTY_GIT_HASH)
+
+		# A Vulkan pipeline cache contains driver-compiled code and must never be
+		# shared by two different emulator binaries.  The commit identifies clean
+		# builds; the diff and hashes of untracked files make local builds equally
+		# reproducible without putting generated/ignored build output in the key.
+		execute_process(
+			COMMAND "${GIT_EXECUTABLE}" diff --binary HEAD --
+			WORKING_DIRECTORY "${GIT_WORKING_DIRECTORY}"
+			OUTPUT_VARIABLE GIT_TRACKED_DIFF
+			RESULT_VARIABLE GIT_DIFF_RESULT
+			ERROR_QUIET
+		)
+		execute_process(
+			COMMAND "${GIT_EXECUTABLE}" ls-files --others --exclude-standard
+			WORKING_DIRECTORY "${GIT_WORKING_DIRECTORY}"
+			OUTPUT_VARIABLE GIT_UNTRACKED_FILES
+			OUTPUT_STRIP_TRAILING_WHITESPACE
+			RESULT_VARIABLE GIT_UNTRACKED_RESULT
+			ERROR_QUIET
+		)
+		if(GIT_DIFF_RESULT EQUAL 0 AND GIT_UNTRACKED_RESULT EQUAL 0)
+			set(GIT_WORKTREE_MATERIAL "revision:${KYTY_GIT_REVISION}\ntracked:\n${GIT_TRACKED_DIFF}\nuntracked:\n")
+			if(NOT GIT_UNTRACKED_FILES STREQUAL "")
+				string(REPLACE "\r\n" "\n" GIT_UNTRACKED_FILES "${GIT_UNTRACKED_FILES}")
+				string(REPLACE "\n" ";" GIT_UNTRACKED_LIST "${GIT_UNTRACKED_FILES}")
+				list(SORT GIT_UNTRACKED_LIST)
+				foreach(GIT_UNTRACKED_FILE IN LISTS GIT_UNTRACKED_LIST)
+					if(NOT GIT_UNTRACKED_FILE STREQUAL "" AND
+					   EXISTS "${GIT_WORKING_DIRECTORY}/${GIT_UNTRACKED_FILE}" AND
+					   NOT IS_DIRECTORY "${GIT_WORKING_DIRECTORY}/${GIT_UNTRACKED_FILE}")
+						file(SHA256 "${GIT_WORKING_DIRECTORY}/${GIT_UNTRACKED_FILE}" GIT_UNTRACKED_HASH)
+						string(APPEND GIT_WORKTREE_MATERIAL
+						       "${GIT_UNTRACKED_FILE}:${GIT_UNTRACKED_HASH}\n")
+					endif()
+				endforeach()
+			endif()
+			string(SHA256 KYTY_GIT_WORKTREE_FINGERPRINT "${GIT_WORKTREE_MATERIAL}")
+		endif()
+
 		execute_process(
 			COMMAND "${GIT_EXECUTABLE}" diff-index --quiet HEAD --
 			WORKING_DIRECTORY "${GIT_WORKING_DIRECTORY}"

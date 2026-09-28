@@ -1,0 +1,6 @@
+interface:
+  display_name: "Emulator regression first"
+  short_description: "Reproduce defects before shared emulator fixes"
+  default_prompt: "Use $emulator-regression-first to reproduce this emulator defect before fixing the shared behavior and checking other supported cases."
+policy:
+  allow_implicit_invocation: true

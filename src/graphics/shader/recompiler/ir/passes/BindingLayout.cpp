@@ -72,8 +72,20 @@ bool CollectMemoryResources(const Program& program, std::vector<uint32_t>& buffe
 				}
 				uses_gds |= memory.kind == ResourceKind::Gds;
 			} else if (memory.kind == ResourceKind::Buffer || memory.kind == ResourceKind::ScalarBuffer) {
-				EXIT_IF(memory.resource >= program.info.buffers.size());
-				live_buffers.at(memory.resource) = true;
+				if (memory.buffer_table != UINT32_MAX) {
+					if (memory.buffer_table >= program.info.buffer_tables.size()) {
+						BindingFail("typed shader contains an invalid buffer table");
+					}
+					for (const auto resource : program.info.buffer_tables[memory.buffer_table].resources) {
+						if (resource >= program.info.buffers.size()) {
+							BindingFail("typed shader contains an invalid buffer table candidate");
+						}
+						live_buffers.at(resource) = true;
+					}
+				} else {
+					EXIT_IF(memory.resource >= program.info.buffers.size());
+					live_buffers.at(memory.resource) = true;
+				}
 			}
 		}
 	}
@@ -106,7 +118,8 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword) {
 	const bool            uses_gds = CollectMemoryResources(program, buffers);
 	next.user_data_registers = CollectUserData(program);
 	next.memory_offset_dword = static_cast<uint32_t>(next.user_data_registers.size());
-	next.memory_offset_count       = static_cast<uint32_t>(buffers.size());
+	next.memory_offset_count = static_cast<uint32_t>(buffers.size());
+	next.memory_limit_dword  = next.memory_offset_dword + (next.memory_offset_count + 3u) / 4u;
 	next.push_data_start_dword =
 	    PushData::StartFor(push_data_start_dword, next.ShaderDataDwords());
 
@@ -155,7 +168,14 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword) {
 		AddBinding(next, DescriptorBindingKind::BdaPagetable);
 		AddBinding(next, DescriptorBindingKind::FaultBuffer);
 	}
-	if (UsesFlattenedSrt(program)) {
+	const bool uses_flattened_runtime =
+	    !program.srt_reads.empty() ||
+	    std::ranges::any_of(program.info.bounded_srt_reads, [](const auto& read) { return read.count != 0; }) ||
+	    std::ranges::any_of(program.info.buffer_tables, [](const auto& table) { return table.count != 0; }) ||
+	    std::ranges::any_of(program.info.images, [](const ImageResource& image) {
+		    return image.indirect_search_iterations != 0u;
+	    });
+	if (uses_flattened_runtime) {
 		AddBinding(next, DescriptorBindingKind::FlattenedSrt);
 	}
 

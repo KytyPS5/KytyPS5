@@ -30,6 +30,8 @@ public:
 
 	static Value F16(uint16_t bits);
 	static Value F32(float value);
+	// Store the exact IEEE binary64 encoding, including NaN payloads.
+	static Value F64(uint64_t bits);
 
 	[[nodiscard]] bool IsEmpty() const;
 	[[nodiscard]] bool IsImmediate() const;
@@ -50,6 +52,7 @@ public:
 	[[nodiscard]] uint64_t  U64() const;
 	[[nodiscard]] uint16_t  F16Bits() const;
 	[[nodiscard]] float     F32Value() const;
+	[[nodiscard]] uint64_t  F64Bits() const;
 
 	bool operator==(const Value& other) const;
 
@@ -91,6 +94,7 @@ using U32    = TypedValue<Type::U32>;
 using U64    = TypedValue<Type::U64>;
 using F16    = TypedValue<Type::F16>;
 using F32    = TypedValue<Type::F32>;
+using F64    = TypedValue<Type::F64>;
 using U32F32 = TypedValue<Type::U32 | Type::F32>;
 
 struct Use {

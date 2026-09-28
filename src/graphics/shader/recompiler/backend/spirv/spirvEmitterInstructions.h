@@ -15,8 +15,6 @@ inline constexpr auto EmitConvertU32U16 = EmitBitCastU16F16;
 inline constexpr auto EmitConvertU32U8  = EmitBitCastU16F16;
 inline constexpr auto EmitBitCastU32F32 = EmitBitCastU16F16;
 EMIT_NATIVE(BitCastF32U32, OpBitcast, F32, uint32_t)
-EMIT_NATIVE(BitCastU64F64, OpBitcast, U64, uint32_t)
-EMIT_NATIVE(BitCastF64U64, OpBitcast, F64, uint32_t)
 uint32_t              EmitConvertU16U32(EmitterState& state, uint32_t arg0);
 uint32_t              EmitConvertU8U32(EmitterState& state, uint32_t arg0);
 uint32_t              EmitConvertF16F32(EmitterState& state, uint32_t arg0);
@@ -29,11 +27,8 @@ uint32_t EmitConvertSigned32ToFloat(EmitterState& state, uint32_t arg0) {
 	return EmitNative<spv::OpConvertSToF, type>(state, signed_value);
 }
 inline constexpr auto EmitConvertF32S32 = EmitConvertSigned32ToFloat<IR::Type::F32>;
-inline constexpr auto EmitConvertF64S32 = EmitConvertSigned32ToFloat<IR::Type::F64>;
-uint32_t              EmitConvertF32F64(EmitterState& state, uint32_t arg0);
-uint32_t              EmitConvertF64F32(EmitterState& state, uint32_t arg0);
+uint32_t EmitConvertF64F32(EmitterState& state, uint32_t arg0);
 EMIT_NATIVE(ConvertF32U32, OpConvertUToF, F32, uint32_t)
-EMIT_NATIVE(ConvertF64U32, OpConvertUToF, F64, uint32_t)
 EMIT_NATIVE(CompositeConstructU64, OpCompositeConstruct, U64, uint32_t, uint32_t)
 EMIT_NATIVE(CompositeConstructU32x2, OpCompositeConstruct, U32x2, uint32_t, uint32_t)
 EMIT_NATIVE(CompositeConstructU32x3, OpCompositeConstruct, U32x3, uint32_t, uint32_t, uint32_t)
@@ -149,10 +144,6 @@ inline constexpr auto EmitFPCmpClass32 = EmitClassMaskF32;
 EMIT_NATIVE(FPAdd32, OpFAdd, F32, uint32_t, uint32_t)
 EMIT_NATIVE(FPSub32, OpFSub, F32, uint32_t, uint32_t)
 EMIT_NATIVE(FPMul32, OpFMul, F32, uint32_t, uint32_t)
-EMIT_NATIVE(FPMul64, OpFMul, F64, uint32_t, uint32_t)
-inline constexpr auto EmitFPFma64 =
-    EmitGlsl<GLSLstd450Fma, IR::Type::F64, uint32_t, uint32_t, uint32_t>;
-uint32_t              EmitFPRecip64(EmitterState& state, uint32_t arg0);
 inline constexpr auto EmitFPFma32 =
     EmitGlsl<GLSLstd450Fma, IR::Type::F32, uint32_t, uint32_t, uint32_t>;
 uint32_t EmitFPMin32(EmitterState& state, uint32_t arg0, uint32_t arg1);
@@ -219,6 +210,7 @@ inline constexpr auto EmitGetImageResource   = EmitGetSrtResource;
 inline constexpr auto EmitGetSamplerResource = EmitGetSrtResource;
 inline constexpr auto EmitMakeImageAddress   = EmitGetSrtResource;
 void                  EmitLoadMemory(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitBufferOutOfBoundsRead(ValueEmitContext& ctx, const IR::Inst& inst);
 void                  EmitStoreMemory(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitAtomic32(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitBufferAtomic64(ValueEmitContext& ctx, const IR::Inst& inst);
@@ -337,4 +329,19 @@ inline constexpr auto EmitSetVccHi                   = EmitUnreachable;
 inline constexpr auto EmitGetM0                      = EmitUnreachable;
 inline constexpr auto EmitSetM0                      = EmitUnreachable;
 
+void EmitFPAbs64(ValueEmitContext& ctx, const IR::Inst& inst);
+void EmitFPNeg64(ValueEmitContext& ctx, const IR::Inst& inst);
+void EmitFPMul64(ValueEmitContext& ctx, const IR::Inst& inst);
+void EmitFPFma64(ValueEmitContext& ctx, const IR::Inst& inst);
+void EmitFPRecip64(ValueEmitContext& ctx, const IR::Inst& inst);
+void EmitConvertF32F64(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t EmitConvertF64S32(EmitterState& state, uint32_t source);
+uint32_t EmitConvertF64U32(EmitterState& state, uint32_t source);
+inline constexpr auto EmitCompositeConstructF64 = EmitCompositeConstructU64;
+inline constexpr auto EmitCompositeExtractF64 = EmitCompositeExtractU64;
+void EmitDpp8MoveU32(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t EmitDpp8UpdateU32(EmitterState& state, uint32_t value, uint32_t previous, uint32_t active);
+uint32_t EmitReadBoundedSrtU32(ValueEmitContext& ctx, const IR::Inst& inst);
+void EmitSharedAtomicIAdd64(ValueEmitContext& ctx, const IR::Inst& inst);
+void EmitSharedAtomicOr64(ValueEmitContext& ctx, const IR::Inst& inst);
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter

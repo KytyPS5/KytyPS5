@@ -668,7 +668,6 @@ void PruneUnreachableBlocks(Graph& graph) {
 		RemapIds(block.successors, id_map);
 		block.predecessors.clear();
 		block.dominators.clear();
-		block.post_dominators.clear();
 		auto& terminator          = block.terminator;
 		terminator.true_block     = RemapId(terminator.true_block, id_map);
 		terminator.false_block    = RemapId(terminator.false_block, id_map);
@@ -716,37 +715,6 @@ void ComputeDominators(Graph& graph) {
 			if (next != block.dominators) {
 				block.dominators = std::move(next);
 				changed          = true;
-			}
-		}
-	}
-}
-
-void ComputePostDominators(Graph& graph) {
-	const auto count = static_cast<uint32_t>(graph.blocks.size());
-	const auto all   = AllBlockIds(count);
-
-	for (auto& block: graph.blocks) {
-		block.post_dominators = block.successors.empty() ? std::vector<uint32_t> {block.id} : all;
-	}
-
-	bool changed = true;
-	while (changed) {
-		changed = false;
-		for (auto& block: graph.blocks) {
-			std::vector<uint32_t> next;
-			if (block.successors.empty()) {
-				next = {block.id};
-			} else {
-				next = graph.blocks[block.successors.front()].post_dominators;
-				for (uint32_t i = 1; i < block.successors.size(); i++) {
-					next = IntersectSorted(next, graph.blocks[block.successors[i]].post_dominators);
-				}
-				AddUnique(next, block.id);
-				SortUnique(next);
-			}
-			if (next != block.post_dominators) {
-				block.post_dominators = std::move(next);
-				changed               = true;
 			}
 		}
 	}
@@ -809,31 +777,9 @@ void ComputeNaturalLoops(Graph& graph) {
 		edge.natural = natural;
 
 		NaturalLoop loop;
-		loop.header         = edge.to;
-		loop.latch          = edge.from;
-		loop.continue_block = edge.from;
-		loop.body_blocks    = std::move(body);
-
-		for (auto block_id: loop.body_blocks) {
-			const auto* block = graph.FindBlock(block_id);
-			if (block == nullptr) {
-				continue;
-			}
-			for (auto succ: block->successors) {
-				if (!Contains(loop.body_blocks, succ)) {
-					AddUnique(loop.exit_blocks, succ);
-				}
-			}
-		}
-		SortUnique(loop.exit_blocks);
-
-		if (!loop.exit_blocks.empty()) {
-			uint32_t merge = loop.exit_blocks.front();
-			for (uint32_t i = 1; i < loop.exit_blocks.size(); i++) {
-				merge = graph.FindNearestCommonPostDominator(merge, loop.exit_blocks[i]);
-			}
-			loop.merge = merge;
-		}
+		loop.header      = edge.to;
+		loop.latch       = edge.from;
+		loop.body_blocks = std::move(body);
 		graph.natural_loops.push_back(std::move(loop));
 	}
 }
@@ -933,7 +879,6 @@ void ComputeComponents(Graph& graph) {
 
 void RecomputeAnalyses(Graph& graph) {
 	ComputeDominators(graph);
-	ComputePostDominators(graph);
 	ComputeBackEdges(graph);
 	ComputeNaturalLoops(graph);
 	ComputeComponents(graph);
@@ -952,7 +897,6 @@ std::vector<uint32_t> ApplyBlockOrder(Graph& graph, std::vector<BasicBlock> bloc
 		RemapIds(block.predecessors, id_map);
 		RemapIds(block.successors, id_map);
 		RemapIds(block.dominators, id_map);
-		RemapIds(block.post_dominators, id_map);
 		block.terminator.true_block     = RemapId(block.terminator.true_block, id_map);
 		block.terminator.false_block    = RemapId(block.terminator.false_block, id_map);
 		block.terminator.merge_block    = RemapId(block.terminator.merge_block, id_map);
@@ -1007,34 +951,6 @@ BasicBlock* Graph::FindBlockByPc(uint32_t pc) {
 bool Graph::Dominates(uint32_t dominator, uint32_t block) const {
 	const auto* target = FindBlock(block);
 	return target != nullptr && Contains(target->dominators, dominator);
-}
-
-bool Graph::PostDominates(uint32_t post_dominator, uint32_t block) const {
-	const auto* target = FindBlock(block);
-	return target != nullptr && Contains(target->post_dominators, post_dominator);
-}
-
-uint32_t Graph::FindNearestCommonPostDominator(uint32_t block_a, uint32_t block_b) const {
-	const auto* a = FindBlock(block_a);
-	const auto* b = FindBlock(block_b);
-	if (a == nullptr || b == nullptr) {
-		return UINT32_MAX;
-	}
-
-	const auto common = IntersectSorted(a->post_dominators, b->post_dominators);
-	for (auto candidate: common) {
-		bool nearest = true;
-		for (auto other: common) {
-			if (other != candidate && !PostDominates(other, candidate)) {
-				nearest = false;
-				break;
-			}
-		}
-		if (nearest) {
-			return candidate;
-		}
-	}
-	return common.empty() ? UINT32_MAX : common.front();
 }
 
 namespace {
@@ -1814,9 +1730,7 @@ std::string GraphToString(const Graph& graph) {
 		text += fmt::format("  predecessors=[{}] successors=[{}]\n",
 		                    VectorToString(block.predecessors).c_str(),
 		                    VectorToString(block.successors).c_str());
-		text += fmt::format("  dominators=[{}] post_dominators=[{}]\n",
-		                    VectorToString(block.dominators).c_str(),
-		                    VectorToString(block.post_dominators).c_str());
+		text += fmt::format("  dominators=[{}]\n", VectorToString(block.dominators).c_str());
 		text += fmt::format(
 		    "  terminator={} condition={} true={} false={} merge={} continue={} loop_header={} "
 		    "indirect_sgpr={} indirect_selector={} indirect_targets=[{}] selector_values=[{}] "
@@ -1843,10 +1757,8 @@ std::string GraphToString(const Graph& graph) {
 		                    edge.natural ? 1u : 0u);
 	}
 	for (const auto& loop: graph.natural_loops) {
-		text += fmt::format("loop header={} latch={} merge={} continue={} body=[{}] exits=[{}]\n",
-		                    loop.header, loop.latch, loop.merge, loop.continue_block,
-		                    VectorToString(loop.body_blocks).c_str(),
-		                    VectorToString(loop.exit_blocks).c_str());
+		text += fmt::format("loop header={} latch={} body=[{}]\n", loop.header, loop.latch,
+		                    VectorToString(loop.body_blocks).c_str());
 	}
 	for (const auto& component: graph.components) {
 		text += fmt::format("scc blocks=[{}] entries=[{}] irreducible={}\n",

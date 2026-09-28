@@ -8277,7 +8277,9 @@ void TestNewShaderRecompilerCfgMultipleLoopLatches() {
   Check(graph.back_edges.size() == 1u && graph.natural_loops.size() == 1u,
         "multiple native latches were not coalesced to one SPIR-V backedge");
   const auto &loop = graph.natural_loops.front();
-  const auto *continue_block = graph.FindBlock(loop.continue_block);
+  const auto *header = graph.FindBlock(loop.header);
+  Check(header != nullptr, "natural loop header is missing");
+  const auto *continue_block = graph.FindBlock(header->terminator.continue_block);
   Check(continue_block != nullptr &&
             continue_block->terminator.true_block == loop.header &&
             graph.Dominates(loop.header, continue_block->id),

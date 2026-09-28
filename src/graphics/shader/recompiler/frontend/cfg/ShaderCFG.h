@@ -70,7 +70,6 @@ struct BasicBlock {
 	std::vector<uint32_t> predecessors;
 	std::vector<uint32_t> successors;
 	std::vector<uint32_t> dominators;
-	std::vector<uint32_t> post_dominators;
 	Terminator            terminator;
 };
 
@@ -81,12 +80,9 @@ struct BackEdge {
 };
 
 struct NaturalLoop {
-	uint32_t              header         = UINT32_MAX;
-	uint32_t              latch          = UINT32_MAX;
-	uint32_t              merge          = UINT32_MAX;
-	uint32_t              continue_block = UINT32_MAX;
+	uint32_t              header = UINT32_MAX;
+	uint32_t              latch  = UINT32_MAX;
 	std::vector<uint32_t> body_blocks;
-	std::vector<uint32_t> exit_blocks;
 };
 
 struct StronglyConnectedComponent {
@@ -114,8 +110,6 @@ struct Graph {
 	const BasicBlock* FindBlockByPc(uint32_t pc) const;
 	BasicBlock*       FindBlockByPc(uint32_t pc);
 	bool              Dominates(uint32_t dominator, uint32_t block) const;
-	bool              PostDominates(uint32_t post_dominator, uint32_t block) const;
-	uint32_t          FindNearestCommonPostDominator(uint32_t block_a, uint32_t block_b) const;
 };
 
 Graph       BuildGraph(const Decoder::Program& program);

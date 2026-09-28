@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/image/image.h"
 
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
@@ -10,7 +11,9 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdint>
+#include <fmt/format.h>
 #include <xxhash.h>
 
 namespace Libs::Graphics {
@@ -48,12 +51,29 @@ namespace {
 }
 
 [[nodiscard]] vk::ImageUsageFlags ImageUsageFlags(GraphicContext& graphics, const ImageInfo& info) {
+	auto usage = vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst;
 	if (info.IsBlock()) {
-		return vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst |
-		       vk::ImageUsageFlagBits::eSampled;
+		usage |= vk::ImageUsageFlagBits::eSampled;
+		if (graphics.supports_block_texel_view) {
+			const auto storage = usage | vk::ImageUsageFlagBits::eStorage;
+			if (graphics.GetImageFormatProperties(info.pixel_format, HostImageType(info.type),
+			                                      vk::ImageTiling::eOptimal, storage,
+			                                      ImageCreateFlags(graphics, info),
+			                                      nullptr) == vk::Result::eSuccess) {
+				usage = storage;
+			} else {
+				static std::atomic_flag warned = ATOMIC_FLAG_INIT;
+				if (!warned.test_and_set(std::memory_order_relaxed)) {
+					Log::WriteToConsoleAndLog(fmt::format(
+					    "Warning: format {} does not support storage access; block-compressed "
+					    "textures written by the guest will not render.\n",
+					    vk::to_string(info.pixel_format)));
+				}
+			}
+		}
+		return usage;
 	}
 	const auto properties = graphics.GetFormatProperties(info.pixel_format);
-	auto       usage = vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst;
 	if (HasFormatFeature(properties, vk::FormatFeatureFlagBits::eSampledImage)) {
 		usage |= vk::ImageUsageFlagBits::eSampled;
 	}

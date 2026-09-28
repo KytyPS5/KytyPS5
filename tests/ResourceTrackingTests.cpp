@@ -741,10 +741,12 @@ void TestGuardedDirectImageTable() {
 void TestBoundedComputeImageLoop() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   enum class Variant {
-    Bounded, WrongGuard, EntryBypass, ExitBypass, GuardBlock, WrongStep
+    Bounded, Plain, Nonzero, TrueEdge, WrongGuard, EntryBypass, ExitBypass, GuardBlock,
+    WrongStep, DivergentBound, DivergentKey, Disjunction, WrongPolarity
   };
   const auto make_plan = [](Variant variant) {
     Fixture fixture;
+    fixture.program.wave_size = 64u;
     auto *entry = fixture.block;
     auto *header = fixture.AddBlock();
     auto *body = fixture.AddBlock();
@@ -763,7 +765,8 @@ void TestBoundedComputeImageLoop() {
         .true_block = 1u, .false_block = 2u};
     fixture.program.block_info[1].terminator = {
         .kind = CFG::TerminatorKind::ConditionalBranch,
-        .true_block = 4u, .false_block = 2u};
+        .true_block = variant == Variant::TrueEdge ? 2u : 4u,
+        .false_block = variant == Variant::TrueEdge ? 4u : 2u};
     fixture.program.block_info[2].terminator = {
         .kind = CFG::TerminatorKind::Branch, .true_block = 3u};
     fixture.program.block_info[3].terminator = {
@@ -776,19 +779,34 @@ void TestBoundedComputeImageLoop() {
     auto &phi = header->AppendNewInst(ValueOpcode::Phi, {},
                                       static_cast<uint64_t>(Type::U32));
     const auto key = Value(&phi);
-    const auto count = fixture.UserData(2);
+    const auto local = fixture.Emit(
+        ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)});
+    const auto count = variant == Variant::DivergentBound ? local : fixture.UserData(2);
     const auto in_range = fixture.Emit(ValueOpcode::SLessThan32,
                                        {variant == Variant::WrongGuard
                                             ? Value(0u) : key,
                                         count}, 0, header);
-    const auto allowed = fixture.Emit(ValueOpcode::LogicalAnd,
-                                      {in_range, Value(true)}, 0, header);
-    fixture.program.block_info[1].condition =
-        fixture.Emit(ValueOpcode::LogicalNot, {allowed}, 0, header);
+    const auto active = fixture.Emit(ValueOpcode::INotEqual32,
+                                     {local, Value(0u)}, 0, header);
+    const auto allowed = fixture.Emit(variant == Variant::Disjunction
+                                         ? ValueOpcode::LogicalOr : ValueOpcode::LogicalAnd,
+                                      {in_range, active}, 0, header);
+    const bool nonzero = variant == Variant::Nonzero || variant == Variant::TrueEdge;
+    auto condition = allowed;
+    if (!nonzero)
+      condition = fixture.Emit(ValueOpcode::LogicalNot, {condition}, 0, header);
+    if (variant != Variant::Plain)
+      condition = fixture.Emit(ValueOpcode::ConditionRef, {condition},
+          nonzero ? CFG::BranchCondition::ExecNonZero
+                  : CFG::BranchCondition::ExecZero, header);
+    if (variant == Variant::Nonzero || variant == Variant::WrongPolarity)
+      condition = fixture.Emit(ValueOpcode::LogicalNot, {condition}, 0, header);
+    fixture.program.block_info[1].condition = condition;
     const auto step = fixture.Emit(ValueOpcode::IAdd32,
                                    {key, Value(variant == Variant::WrongStep ? 2u : 1u)},
                                    0, latch);
-    phi.AddPhiOperand(entry, Value(0u));
+    phi.AddPhiOperand(entry, variant == Variant::DivergentKey ? local : Value(0u));
     phi.AddPhiOperand(latch, step);
 
     fixture.block = variant == Variant::GuardBlock ? header : body;
@@ -825,6 +843,9 @@ void TestBoundedComputeImageLoop() {
   };
 
   auto plan = make_plan(Variant::Bounded);
+  make_plan(Variant::Plain);
+  make_plan(Variant::Nonzero);
+  make_plan(Variant::TrueEdge);
   CheckFatal([&] { make_plan(Variant::WrongGuard); },
              "not a valid runtime value",
              "compute image loop accepted an unrelated guard");
@@ -840,6 +861,11 @@ void TestBoundedComputeImageLoop() {
   CheckFatal([&] { make_plan(Variant::WrongStep); },
              "not a valid runtime value",
              "compute image loop accepted a two-step induction");
+  for (const auto variant : {Variant::DivergentBound, Variant::DivergentKey,
+                             Variant::Disjunction, Variant::WrongPolarity}) {
+    CheckFatal([&] { make_plan(variant); }, "not a valid runtime value",
+               "compute image loop accepted a guard without a uniform bound");
+  }
 
   LinearTestMemory memory;
   const auto table = 0x1800u + 0x6b0u;

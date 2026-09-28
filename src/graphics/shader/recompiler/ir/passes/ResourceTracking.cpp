@@ -1080,33 +1080,42 @@ private:
 		}
 		if (!induction) return {};
 
-		const auto contains = [&](auto&& self, Value value, const Inst* comparison) -> bool {
-			value = value.Resolve();
-			if (value.TryInstruction() == comparison) return true;
-			const auto* inst = value.TryInstruction();
-			return inst != nullptr && inst->GetOpcode() == ValueOpcode::LogicalAnd &&
-			       (self(self, inst->Arg(0), comparison) || self(self, inst->Arg(1), comparison));
+		// Native branches advance the whole guest wave, so the induction and runtime
+		// bound are uniform. A reduced condition witnesses a lane with its edge
+		// polarity; implication of the comparison therefore bounds the whole wave.
+		const auto implies = [](auto&& self, Value value, bool positive,
+		                        const Inst* comparison) -> bool {
+			const auto* inst = value.Resolve().TryInstruction();
+			if (inst == comparison) return positive;
+			if (inst == nullptr) return false;
+			if (inst->GetOpcode() == ValueOpcode::ConditionRef)
+				return self(self, inst->Arg(0), positive, comparison);
+			if (inst->GetOpcode() == ValueOpcode::LogicalNot)
+				return self(self, inst->Arg(0), !positive, comparison);
+			return positive && inst->GetOpcode() == ValueOpcode::LogicalAnd &&
+			       (self(self, inst->Arg(0), true, comparison) ||
+			        self(self, inst->Arg(1), true, comparison));
 		};
 		for (const auto& use_of_key: phi->Uses()) {
 			const auto* compare = use_of_key.user;
 			if (compare->GetOpcode() != ValueOpcode::SLessThan32 || use_of_key.operand != 0u ||
 			    !ValidateRuntimeValue(m_program, compare->Arg(1))) continue;
-			for (uint32_t i = 0; i < m_program.block_info.size(); ++i) {
-				const auto& info = m_program.block_info[i];
-				const auto* negated = info.condition.Resolve().TryInstruction();
-				if (info.terminator.kind != CFG::TerminatorKind::ConditionalBranch ||
-				    compare->Parent() != m_program.blocks[i] || negated == nullptr ||
-				    negated->GetOpcode() != ValueOpcode::LogicalNot ||
-				    !contains(contains, negated->Arg(0), compare) ||
-				    use == m_program.blocks[i] ||
-				    CanReach(m_program.blocks.front(), use, m_program.blocks[i]) ||
-				    CanReach(phi->Parent(), use, m_program.blocks[i]) ||
-				    CanReach(FindBlock(info.terminator.true_block), use, phi->Parent()) ||
-				    !CanReach(FindBlock(info.terminator.false_block), use, phi->Parent())) {
-					continue;
-				}
-				return compare->Arg(1);
-			}
+			const auto position = std::ranges::find(m_program.blocks, compare->Parent());
+			if (position == m_program.blocks.end()) continue;
+			const auto* block = *position;
+			const auto& info = m_program.block_info[position - m_program.blocks.begin()];
+			if (info.terminator.kind != CFG::TerminatorKind::ConditionalBranch || use == block ||
+			    CanReach(m_program.blocks.front(), use, block) ||
+			    CanReach(phi->Parent(), use, block)) continue;
+			const auto* yes = FindBlock(info.terminator.true_block);
+			const auto* no = FindBlock(info.terminator.false_block);
+			const bool yes_reaches = CanReach(yes, use, phi->Parent());
+			const bool no_reaches = CanReach(no, use, phi->Parent());
+			if (yes_reaches == no_reaches) continue;
+			Value condition;
+			bool positive = false;
+			if (ConditionalEdge(block, yes_reaches ? yes : no, condition, positive) &&
+			    implies(implies, condition, positive, compare)) return compare->Arg(1);
 		}
 		return {};
 	}

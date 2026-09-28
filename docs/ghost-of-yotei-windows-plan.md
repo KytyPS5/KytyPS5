@@ -3,6 +3,25 @@
 Обновлено **28 сентября 2026 года**. Игра: **Ghost of Yōtei, PPSA26344**.
 Рабочая ветка — `yotei-windows-bringup` в локальном fork `fxpw/KytyPS5`.
 
+Checkpoint реального запуска `2e3a2a13` **28 сентября 2026 года**:
+
+- Native Windows committed build/install GREEN. Retry
+  `yotei-integrated-20260928-183223-menucheck-gpuav-sync`, 1280×720 GPUAV+SyncDiag,
+  readback disabled, UTC 18:32:23.4871409 → 18:35:19.0282480, exit 321,
+  **maxShown=101**. SHA-256 emulator
+  `2B57A93F6350BB1F95CB083BA2CCD197CA2C8AC1AD0EBEF5B5DD7CAACB264D9D`.
+- d895 / 86da descriptor-store boundaries пройдены; presentation возобновился.
+  Новая граница: CS `5f3fdf61a7ca4a20`, PC 0x26c, GetImageResource dword 0
+  runtime validation rejects root LoadAddressU32. Требуется отдельная image
+  descriptor origin/table/guard регрессия; не подменять image пустым resource.
+- DesktopCopy активного task-owned окна: `owned-window-desktop.png` при shown=0
+  и `owned-window-shown43-desktop.png` фактически при shown=66. Оба показывают
+  чёрную client area. Ненулевой кадр / меню / gameplay не подтверждены;
+  maxShown=101 не является доказательством изображения.
+- Все task-owned процессы закрыты. Новый upstream `8e61798b` содержит 5 commits
+  после `22ff4693`; read-only merge preview показывает 2 conflicts
+  (textureCache.h / descriptors.cpp). Интеграция и её runtime proof pending.
+
 Checkpoint native EXEC / finite selectors **28 сентября 2026 года**:
 
 - `05d10203` собран/установлен и normal-pushed; exact-head CI `36463341547`
@@ -1355,17 +1374,17 @@ cooperative SSBO, #459 и #476 — 46/46 за 39,24 с и 9 последоват
 
 | Поле | Значение |
 | --- | --- |
-| Source | `05d10203` (committed) |
+| Source | `2e3a2a13` (committed) |
 | Версия / каталог игры | `01.512.000`, `G:\games\Kyty\PPSA26344\PPSA26344` |
-| Завершённый run | `_Build/runs/yotei-integrated-20260928-181147-menucheck-gpuav-sync` |
-| SHA-256 emulator | `11B8D7A9B94F36894EE597DE6A8761C890EC89BDD03991BBED7D27AE261B6255` |
-| Время UTC | `2026-09-28T18:11:47.3992189Z` → `18:12:03.6160404Z` |
+| Завершённый run | `_Build/runs/yotei-integrated-20260928-183223-menucheck-gpuav-sync` |
+| SHA-256 emulator | `2B57A93F6350BB1F95CB083BA2CCD197CA2C8AC1AD0EBEF5B5DD7CAACB264D9D` |
+| Время UTC | `2026-09-28T18:32:23.4871409Z` → `18:35:19.0282480Z` |
 | Режим | Native Windows / RTX 5060 Ti, окно 1280×720, GPUAV shader instrumentation + SyncDiag; readback disabled |
 | Завершение | Естественный exit 321; task-owned processes закрыты |
-| Прогресс | shown=0; d895 materialized count=3 / emitted SPIR-V; новая граница CS `86da5eb7b8257bb0` PC 0x530 BUFFER_STORE_DWORD |
-| Пиксели | Ненулевой кадр / меню / gameplay не подтверждены |
+| Прогресс | maxShown=101; новая граница CS `5f3fdf61a7ca4a20` PC 0x26c GetImageResource / LoadAddressU32 |
+| Пиксели | DesktopCopy shown=0/66: чёрная client area; ненулевой кадр / меню / gameplay не подтверждены |
 | Подтверждённый отдельный blocker | Старый saved `b90e…` standalone probe compiler crash; GPUAV позволяет пройти эту точку в игре |
-| Следующая проверка | Committed native EXEC finite-selector / wave64 reduction fix, затем pixel evidence |
+| Следующая проверка | Свежий upstream 8e61798b merge/build/affected tests; image-origin regression и pixel proof |
 
 
 ### Исторические performance наблюдения (сентябрь 2026)

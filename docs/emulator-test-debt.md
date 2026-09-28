@@ -44,7 +44,19 @@ CPU translation of captured 86da passes both explicit diagnostic barrier profile
 Fix shared native EXEC nonempty-path proof, split-compute whole-wave ConditionRef
 reduction, collective rendezvous placement, requirements and scratch budgeting.
 GPU-selected writes remain rejected unless the existing table/root/guard proof holds.
-Native build `native-exec-wave-fix-build-20260928.log` GREEN. Committed game retry pending.
+Native build `native-exec-wave-fix-build-20260928.log` GREEN. Committed 2e3a2a13
+retry passes both descriptor-store failures and reaches the pending image boundary
+at shown=101; captures of shown=0/66 remain black.
+
+## Pending native image descriptor origin after resumed presentation (2026-09-28)
+
+Committed 2e3a2a13 native Windows retry reaches shown=101 and fails CS
+5f3fdf61a7ca4a20, PC 0x26c: GetImageResource dword 0 rejects LoadAddressU32 root.
+Run `yotei-integrated-20260928-183223-menucheck-gpuav-sync`, exit 321.
+Before a production correction distinguish descriptor origin reconstruction,
+finite/bounded table proof and guarded memory snapshots in a synthetic native-CFG
+image regression; retain unknown/unbounded/conditional-root and writable-alias
+rejections. Desktop captures remain black; no rendered image/menu claim.
 
 ## Pending neighboring unaligned scalar-buffer read (2026-09-28)
 

@@ -6037,6 +6037,65 @@ void TestBoundedMaterializationCandidatesAndRemap() {
   }
 }
 
+void TestBoundedScalarProbeBudget() {
+  const auto check = [](uint32_t count, uint32_t scale, uint32_t bytes,
+                        uint32_t columns, bool expected) {
+    Fixture fixture;
+    InitializeBoundedSnapshot(fixture, columns, false);
+    const auto address = AddBoundedSnapshotSource(fixture,
+        {Value(0x1000u), Value(0u), Value(bytes), Value(0u)});
+    for (auto& read : fixture.program.bounded_srt_reads) {
+      read.address_source = address;
+      read.offset_scale = scale;
+    }
+    const auto plan = ExtractResourcePlan(fixture.program);
+    BoundedSnapshotReader reader;
+    reader.words = {{0x1000u, 0x13579bdfu}, {0x1004u, 0x2468ace0u}};
+    ResourceSnapshot snapshot;
+    snapshot.user_data = {0xfeedu};
+    ResourceSpecialization specialization;
+    const auto saved = snapshot;
+    const auto saved_specialization = specialization;
+    const std::array<uint32_t, 1> data{count};
+    const bool accepted = MaterializeResources(plan, BoundedSnapshotRuntime(reader, data),
+                                               snapshot, specialization);
+    Check(accepted == expected, "scalar-buffer zero rows incorrectly consume probe/storage budget");
+    Check(reader.ordinary_reads == 0u, "snapshot used mutable ordinary memory");
+    if (!accepted) {
+      CheckBoundedTransaction(snapshot, saved, specialization, saved_specialization);
+      return;
+    }
+    Check(snapshot.flattened_srt.size() == uint64_t{count} * columns,
+          "scalar snapshot truncated its logical selector domain");
+    Check(specialization.bounded_srt_reads.size() == columns,
+          "scalar snapshot lost a correlated column");
+    for (uint32_t column = 0; column < columns; ++column) {
+      Check(specialization.bounded_srt_reads[column].count == count &&
+                specialization.bounded_srt_reads[column].flat_offset == column * count,
+            "scalar snapshot changed its logical selector layout");
+      for (uint32_t index = 0; index < count; ++index) {
+        const uint32_t dynamic = index * scale + column * 4u;
+        const uint64_t aligned = uint64_t{dynamic} & ~uint64_t{3};
+        const uint32_t expected_word = aligned + 4u > bytes ? 0u :
+            aligned == 0u ? 0x13579bdfu : 0x2468ace0u;
+        Check(snapshot.flattened_srt[uint64_t{column} * count + index] == expected_word,
+              "scalar snapshot lost an OOB zero or wrapped in-bounds row");
+      }
+    }
+    Check(reader.reads.size() == (count == 0u || bytes == 0u ? 0u : 2u),
+          "scalar snapshot read outside its descriptor extent or failed to cache words");
+  };
+  check(65536u, 16u, 8u, 2u, true);
+  check(65536u, 592u, 8u, 2u, true);
+  check(6u, 0x80000000u, 8u, 2u, true); // Wrapped offsets re-enter the descriptor.
+  check(0u, 16u, 8u, 2u, true);
+  check(65536u, 16u, 0u, 2u, true);
+  check(32768u, 0u, 8u, 2u, true); // Exactly 65536 probes despite cache reuse.
+  check(32769u, 0u, 8u, 2u, false);
+  check(65536u, 16u, 0u, 256u, true); // Existing 64 MiB storage cap.
+  check(65536u, 16u, 0u, 257u, false);
+}
+
 void TestBoundedMaterializationLimitsAreTransactional() {
   Fixture fixture;
   InitializeBoundedSnapshot(fixture,2u,false);
@@ -7325,6 +7384,13 @@ int main(int argc, char** argv) {
       std::cout << "KYTY_BOUNDED_WRITE_ALIAS_PASS\n";
       return 0;
     }
+    if (argc == 2 && std::strcmp(argv[1], "--bounded-scalar-probe-budget-only") == 0) {
+      TestBoundedScalarProbeBudget();
+      TestBoundedMaterializationLimitsAreTransactional();
+      TestWorkgroupSrtZeroDispatchAndProbeLimit();
+      std::cout << "KYTY_BOUNDED_SCALAR_PROBE_BUDGET_PASS\n";
+      return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--bounded-unmapped-scalar-only") == 0) {
       TestBoundedMaterializationZerosUnmappedScalarRows();
       std::cout << "KYTY_BOUNDED_UNMAPPED_SCALAR_PASS\n";
@@ -7396,6 +7462,7 @@ int main(int argc, char** argv) {
     Run("TestBoundedMaterializationZerosUnmappedScalarRows",
         TestBoundedMaterializationZerosUnmappedScalarRows);
     Run("TestBoundedMaterializationCandidatesAndRemap", TestBoundedMaterializationCandidatesAndRemap);
+    Run("TestBoundedScalarProbeBudget", TestBoundedScalarProbeBudget);
     Run("TestBoundedMaterializationLimitsAreTransactional", TestBoundedMaterializationLimitsAreTransactional);
     Run("TestBoundedMaterializationRejectsWritableAliases", TestBoundedMaterializationRejectsWritableAliases);
     Run("TestBoundedMaterializationNullsForeignBufferSlots",

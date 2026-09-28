@@ -118,6 +118,35 @@ extents, OOB rows, required vs ordinary dependencies and cap endpoints. Preserve
 read/store admission, zero-work semantics and snapshot/descriptor limits. Do not
 claim a root cause or increase the limit without an independent regression.
 
+### Regression required before capacity correction
+
+`TestBoundedScalarProbeBudget` / `--bounded-scalar-probe-budget-only`:
+retain 65536 logical keys in each of two scalar-buffer columns while an 8-byte
+SRD permits only two coherent words; all other rows must remain zero. Repeat with
+strides16/592, U32 offset wrap re-entering the extent, zero count and zero extent.
+Keep exactly65536/plus-one in-bounds probe admission (including repeated addresses),
+and exactly64MiB/plus-one dense storage admission. Failed materialization must
+leave snapshot/specialization unchanged and never use ordinary mutable reads.
+Run existing raw-address and workgroup probe limits unchanged.
+Native GPU `FiniteScalarBufferDescriptorExtent` uses a GPU-loaded 16-bit key
+0/1/65535, one-row scalar-buffer SRD and four descriptor columns; expected
+output is the valid row then zero loads, with backing sentinels unchanged. Expected pre-fix
+failure: second column rejected despite descriptor-proven zero rows. RED on unchanged production4db9964a: native CPU
+`bounded-scalar-budget-red-20260928.txt.stderr` rejects read1 count65536,
+stride16 bias4; native GPU `bounded-scalar-budget-gpu-corrected-red-20260928.txt.stderr`
+rejects read1 at materialization before GPU execution. Both intended failures. An intervening GREEN attempt exposed a fixture-only
+input address >=256, outside the harness packed offset field. Input relocated
+without changing the key/data oracle; corrected fixture reran RED with only the
+production patch absent. That harness failure is not GREEN evidence.
+The proposed shared change charges descriptor-in-bounds probes independently of
+dense storage, preserving logical rows and both existing constants. GREEN: unchanged CPU/domain oracle and corrected native GPU fixture
+`bounded-scalar-budget-{final-green,gpu-final-green}-20260928.txt`; SPIR-V
+validation and all backing words checked by the GPU harness. Native Windows
+full build `bounded-scalar-budget-final-build-20260928.log` and required CTest22/22
+`bounded-scalar-budget-ctest-20260928.log`. Scalar sparse store, upper EXEC guard,
+and nested post-test image numerical neighbors GREEN. Existing raw/workgroup
+exact probe boundaries pass unchanged. Original game retry remains pending.
+
 ## Pending neighboring unaligned scalar-buffer read (2026-09-28)
 
 Additional numerical test `--unaligned-scalar-buffer-load-only` fails 1024/1032

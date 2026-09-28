@@ -849,7 +849,7 @@ bool MaterializeBoundedReads(const ResourcePlan& program, const SrtRuntime& runt
 		flat.assign(static_cast<size_t>(reserved_words), 0u);
 	}
 
-	uint64_t snapshot_words = 0;
+	uint64_t snapshot_probes = 0;
 	uint32_t workgroup_slot = 0;
 	for (uint32_t id = 0; id < program.bounded_srt_reads.size(); id++) {
 		const auto& read = program.bounded_srt_reads[id];
@@ -890,16 +890,11 @@ bool MaterializeBoundedReads(const ResourcePlan& program, const SrtRuntime& runt
 			size = read.count_signed && static_cast<int32_t>(raw_count) <= 0 ? 0u : raw_count;
 		}
 		if (size > MaxIndirectImageProbes ||
-		    snapshot_words > MaxBoundedSnapshotProbes - uint64_t{size} ||
-		    (!workgroup_column &&
-		     flat.size() > UINT32_MAX - uint64_t{size})) {
+		    (!workgroup_column && flat.size() > MaxBoundedSnapshotWords - uint64_t{size})) {
 			return SpecializationFail(fmt::format(
-			    "bounded SRT read {} exceeds the candidate/snapshot limit "
-			    "(count={} stride={} bias={} words={} candidate_limit={} word_limit={})",
-			    id, size, read.offset_scale, read.offset_bias, snapshot_words + uint64_t{size},
-			    MaxIndirectImageProbes, MaxBoundedSnapshotProbes));
+			    "bounded SRT read {} exceeds candidate/storage limits (count={} stored_words={} word_limit={})",
+			    id, size, flat.size() + uint64_t{size}, MaxBoundedSnapshotWords));
 		}
-		snapshot_words += size;
 
 		uint32_t start = 0;
 		uint32_t layout_count = size;
@@ -921,21 +916,43 @@ bool MaterializeBoundedReads(const ResourcePlan& program, const SrtRuntime& runt
 		const uint64_t base = (((uint64_t{address_words.dwords[1]} << 32u) |
 		                        address_words.dwords[0]) & AddressMask) & ~uint64_t{3};
 		const int64_t immediate = static_cast<int64_t>(static_cast<int32_t>(read.memory_offset));
+		const bool scalar_buffer = address_source->dword_count == 4u;
+		if (scalar_buffer && immediate < 0) {
+			return SpecializationFail(fmt::format(
+			    "bounded buffer read {} has a negative immediate offset", id));
+		}
+		const uint32_t stride = (address_words.dwords[1] >> 16u) & 0x3fffu;
+		const uint64_t bytes = stride == 0u ? uint64_t{address_words.dwords[2]}
+		                                    : uint64_t{stride} * address_words.dwords[2];
+		const auto buffer_offset = [&](uint32_t index) {
+			// The dynamic offset wraps as a guest U32 before the widened immediate addition.
+			const uint32_t dynamic = index * read.offset_scale + read.offset_bias;
+			return (static_cast<uint64_t>(immediate) + dynamic) & ~uint64_t{3};
+		};
+		const auto buffer_in_bounds = [&](uint64_t offset) {
+			return offset <= bytes && bytes - offset >= sizeof(uint32_t);
+		};
+		uint64_t probes = size;
+		if (scalar_buffer) {
+			// Descriptor-proven OOB words consume dense storage, but never read memory.
+			// Keep every logical selector row: wrapped offsets can re-enter the extent.
+			probes = 0;
+			for (uint32_t index = 0; index < size; ++index) {
+				probes += buffer_in_bounds(buffer_offset(index));
+			}
+		}
+		if (snapshot_probes > MaxBoundedSnapshotProbes - probes) {
+			return SpecializationFail(fmt::format(
+			    "bounded SRT read {} exceeds snapshot probe limit (probes={} probe_limit={})",
+			    id, snapshot_probes + probes, MaxBoundedSnapshotProbes));
+		}
+		snapshot_probes += probes;
 		for (uint32_t index = 0; index < size; index++) {
 			const uint32_t dynamic = index * read.offset_scale + read.offset_bias;
 			int64_t offset = 0;
-			if (address_source->dword_count == 4u) {
-				if (immediate < 0) {
-					return SpecializationFail(fmt::format(
-					    "bounded buffer read {} has a negative immediate offset", id));
-				}
-				const uint64_t byte_offset = static_cast<uint64_t>(immediate) + dynamic;
-				const uint64_t aligned = byte_offset & ~uint64_t{3};
-				const uint32_t stride = (address_words.dwords[1] >> 16u) & 0x3fffu;
-				const uint64_t bytes = stride == 0u
-				                           ? uint64_t{address_words.dwords[2]}
-				                           : uint64_t{stride} * address_words.dwords[2];
-				if (aligned > bytes || bytes - aligned < sizeof(uint32_t)) {
+			if (scalar_buffer) {
+				const uint64_t aligned = buffer_offset(index);
+				if (!buffer_in_bounds(aligned)) {
 					// Scalar buffer loads return zero outside the descriptor extent. Preserve that
 					// guest result in the candidate snapshot without touching host memory.
 					if (workgroup_column) {

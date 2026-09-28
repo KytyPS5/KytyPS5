@@ -3,6 +3,23 @@
 Обновлено **28 сентября 2026 года**. Игра: **Ghost of Yōtei, PPSA26344**.
 Рабочая ветка — `yotei-windows-bringup` в локальном fork `fxpw/KytyPS5`.
 
+Checkpoint finite scalar-buffer snapshot budgets **28 сентября 2026 года**:
+
+- Source `4db9964a` + generic materialization correction: descriptor-proven OOB
+  rows keep their logical positions and zero values, without consuming coherent
+  memory probes. Existing 65536-probe and 64MiB bounded-column storage caps retained.
+  No game/hash/address conditions; guest bounds/address arithmetic unchanged.
+- Native CPU RED → GREEN and native finite 16-bit selector GPU RED → GREEN;
+  keys0/1/65535, in-bounds output then OOB zeros, backing sentinels unchanged.
+  Wrap re-entry, zero work/extent, exact/plus-one probe/storage limits covered.
+  Native MSVC Developer Environment build GREEN, CTest22/22 and scalar/EXEC/image
+  GPU neighbors GREEN (`bounded-scalar-budget-*` logs). Full compute suite is not
+  claimed GREEN; unrelated unaligned scalar and DCC/cache debt remain.
+- Committed build/install and game retry pending. Latest completed runtime still
+  c8aaaa5b / maxShown113 / black client / CS845790 snapshot capacity boundary.
+  No nonzero frame, menu or gameplay claim. Previous4db9964a CI36479506102 confirmed
+  GREEN Windows/Linux/macOS; new exact-head CI pending.
+
 Checkpoint реального запуска `c8aaaa5b` **28 сентября 2026 года**:
 
 - Committed native Windows build/install GREEN. Retry

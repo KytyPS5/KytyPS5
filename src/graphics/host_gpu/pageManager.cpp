@@ -294,6 +294,16 @@ uint64_t PageManager::GetPageSize() const {
 	return PAGE_SIZE;
 }
 
+bool PageManager::IsWatched(uint64_t vaddr) const {
+	auto* region = m_impl->FindRegion(vaddr);
+	if (region == nullptr) {
+		return false;
+	}
+	const auto page = static_cast<size_t>((vaddr % REGION_SIZE) / PAGE_SIZE);
+	SpinGuard  lock(region->lock);
+	return region->pages[page].write_watchers != 0 || region->pages[page].access_watchers != 0;
+}
+
 template <bool track>
 void PageManager::UpdatePageWatchers(uint64_t vaddr, uint64_t size) {
 	m_impl->UpdatePageWatchers<track, false>(vaddr, size);

@@ -238,13 +238,17 @@ void TestWatchAndUnwatch(uint64_t base = 0x0000000200010000ull) {
   auto *memory = Allocate(page_size * 2, PAGE_READWRITE, base);
   const auto address = reinterpret_cast<uint64_t>(memory);
 
+  Check(!manager.IsWatched(address), "unwatched page reported as watched");
   manager.UpdatePageWatchers<true>(address, page_size);
   Check(Protection(memory) == PAGE_READONLY && IsWritable(memory + page_size),
         "write watch installed incorrect protections");
   Check(g_protection_calls != 0,
         "watch protection bypassed the address-space owner callback");
+  Check(manager.IsWatched(address + 8) && !manager.IsWatched(address + page_size),
+        "IsWatched does not report the watched page only");
   manager.UpdatePageWatchers<false>(address, page_size);
   Check(IsWritable(memory), "write unwatch did not restore access");
+  Check(!manager.IsWatched(address), "unwatched page still reported as watched");
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
 

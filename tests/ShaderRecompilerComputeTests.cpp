@@ -39865,14 +39865,20 @@ TestCase RayTracingIntersectStillWritesOtherOutputs() {
 std::vector<TestCase> MakeCases() {
   std::vector<TestCase> cases;
   cases.reserve(128);
-  auto AddCase = [&cases](TestCase (*factory)()) {
-    cases.push_back(factory());
+  // KYTY_TEST_FILTER narrows the run to cases whose name contains it. The suite stops at the first
+  // failure, so without this a known-failing case hides every later one from a diagnosis run.
+  const char *const filter = std::getenv("KYTY_TEST_FILTER");
+  auto AddMade = [&cases, filter](TestCase test) {
+    if (filter == nullptr || std::strstr(test.name, filter) != nullptr) {
+      cases.push_back(std::move(test));
+    }
   };
-  cases.push_back(BufferWorkgroupPublication(32));
-  cases.push_back(BufferWorkgroupPublication(64));
-  cases.push_back(BufferWorkgroupPublication(32, true));
-  cases.push_back(BufferWorkgroupPublication(32, false, true));
-  cases.push_back(BufferWorkgroupPublication(64, false, true));
+  auto AddCase = [&AddMade](TestCase (*factory)()) { AddMade(factory()); };
+  AddMade(BufferWorkgroupPublication(32));
+  AddMade(BufferWorkgroupPublication(64));
+  AddMade(BufferWorkgroupPublication(32, true));
+  AddMade(BufferWorkgroupPublication(32, false, true));
+  AddMade(BufferWorkgroupPublication(64, false, true));
 
   AddCase(IntegerAddSubMul);
   AddCase(BitwiseOps);

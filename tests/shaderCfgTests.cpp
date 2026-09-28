@@ -8601,6 +8601,49 @@ void TestSharedExitPreservesNativeDescriptorSources() {
   }
 }
 
+void TestNativeScalarReadDescriptorPlanning() {
+  constexpr uint32_t nested = 10, read = 14, join = 18, end = 20;
+  const uint32_t shader[] = {
+      EncodeSopc(0x07, 9, 128),
+      EncodeSopp(0x04, end - 1 - 1),
+      EncodeSopc(0x07, 8, 130),
+      EncodeSopp(0x04, read - 3 - 1),
+      EncodeSop1(0x24, 0, 126), EncodeSop1(0x04, 2, 126),
+      EncodeSopc(0x07, 8, 129),
+      EncodeSopp(0x04, nested - 7 - 1),
+      EncodeVop1(0x01, 0, 128),
+      EncodeSopp(0x02, join - 9 - 1),
+      EncodeSop1(0x04, 0, 126), EncodeSop1(0x04, 2, 126),
+      EncodeVop1(0x01, 0, 129),
+      EncodeSopp(0x02, join - 13 - 1),
+      EncodeSmem0(0x0a, 16, 0), 125u << 25u,
+      EncodeMubuf0(0x0c, 0, false), EncodeMubuf1(0, 4, 1),
+      EncodeExp0(0x00, 0x1), EncodeExp1(0, 0, 0, 0),
+      EncodeSopp(0x01),
+  };
+  const std::array<uint32_t, 4> table{0x5000u, 0u, 4u, 3u << 28u};
+  const auto address = reinterpret_cast<uint64_t>(table.data());
+  std::array<uint32_t, 10> user_data{};
+  user_data[0] = static_cast<uint32_t>(address);
+  user_data[1] = static_cast<uint32_t>(address >> 32u);
+  user_data[2] = sizeof(table);
+  user_data[3] = 3u << 28u;
+  user_data[9] = 1u;
+  for (const uint32_t mode : {2u, 0u, 1u}) {
+    user_data[8] = mode;
+    auto options = MakeCompileOptions(ShaderType::Pixel);
+    options.user_data = user_data;
+    const auto result = RecompileForTest(shader, options, ReadHostTestMemory);
+    Check(!result.program.dispatcher_fallback && result.resources.buffers.size() == 1u &&
+              std::ranges::equal(result.resources.flattened_srt, table),
+          "scalar descriptor planning retained an unrelated native execution mask");
+    const auto expected = mode == 2u ? table : std::array<uint32_t, 4>{};
+    Check(std::equal(expected.begin(), expected.end(), result.resources.buffers[0].dwords.begin()),
+          "scalar descriptor planning selected the wrong native resource");
+    CheckSpirvBinaryValidates(result.spirv);
+  }
+}
+
 void TestNativeGuardedSamplerSource() {
   constexpr uint32_t nested = 12, sample = 18, join = 20, end = 22;
   const uint32_t shader[] = {
@@ -12348,7 +12391,7 @@ void BuildTypedPlan(const uint32_t *code, uint32_t words,
     ShaderRecompiler::IR::RemoveIdentities(ir.blocks);
     ShaderRecompiler::IR::EliminateDeadCode(ir.blocks);
   }
-  ShaderRecompiler::IR::BuildSrtPlan(ir);
+  ShaderRecompiler::IR::TrackResources(ir, decoded, cfg);
   ShaderRecompiler::IR::EliminateDeadCode(ir.blocks);
 }
 
@@ -12445,15 +12488,20 @@ void TestTypedDescriptorRealWideMoveTranslation() {
       EncodeMubuf1(0, 0, 1), // buffer_store_dword via copied s[0:3]
       EncodeSopp(0x01),
   };
-  ShaderRecompiler::IR::Program ir;
-  BuildTypedPlan(shader, static_cast<uint32_t>(std::size(shader)), ir);
+  ShaderRecompiler::Decoder::Program decoded;
+  ShaderRecompiler::Decoder::DecodeProgram(std::span{shader}, decoded);
+  const auto native = ShaderRecompiler::CFG::BuildGraph(decoded);
+  ShaderComputeInputInfo compute;
+  auto ir = ShaderRecompiler::Frontend::TranslateProgram(
+      decoded, native, {.stage = ShaderType::Compute, .wave_size = 64u,
+                        .input_info = {.compute = &compute}});
   for (uint32_t reg = 0; reg < 4; ++reg) {
     Check(std::ranges::any_of(ir.scalar_writes, [&](const auto &write) {
             return write.pc == (reg / 2u) * 4u &&
                    ShaderRecompiler::IR::RegIndex(write.reg) == reg;
           }), "wide scalar move lost a native descriptor component write");
   }
-  ShaderRecompiler::IR::TrackResources(ir, {}, {});
+  BuildTypedPlan(shader, static_cast<uint32_t>(std::size(shader)), ir);
   Check(ir.info.buffers.size() == 1,
         "real wide-move shader did not track one buffer use");
   const auto *source = TypedDescriptorSource(ir, ir.info.buffers[0].source);
@@ -12627,8 +12675,7 @@ void TestTypedDescriptorRealCarryAndScalarLoads() {
   ShaderRecompiler::IR::Program load_ir;
   BuildTypedPlan(load_shader, static_cast<uint32_t>(std::size(load_shader)),
                  load_ir);
-  Check(load_ir.srt_reads.size() == 8 &&
-            load_ir.dynamic_reads.empty(),
+  Check(load_ir.srt_reads.size() == 8,
         "real scalar loads did not build eight flattened reads");
   uint32_t address_reads = 0;
   uint32_t buffer_reads = 0;
@@ -12643,7 +12690,6 @@ void TestTypedDescriptorRealCarryAndScalarLoads() {
   }
   Check(address_reads == 4 && buffer_reads == 4,
         "real scalar loads used the wrong raw typed operations");
-  ShaderRecompiler::IR::TrackResources(load_ir, {}, {});
   Check(load_ir.info.buffers.size() == 2,
         "real scalar-load descriptor sources were not attached");
   for (const auto &buffer : load_ir.info.buffers) {
@@ -12674,7 +12720,6 @@ void TestTypedDescriptorRealCarryAndScalarLoads() {
   BuildTypedPlan(inline_sampler_shader,
                  static_cast<uint32_t>(std::size(inline_sampler_shader)),
                  inline_sampler_ir);
-  ShaderRecompiler::IR::TrackResources(inline_sampler_ir, {}, {});
   ShaderRecompiler::IR::DescriptorValue sampler;
   ShaderRecompiler::IR::SrtRuntime runtime;
   Check(inline_sampler_ir.info.samplers.size() == 1 &&
@@ -12705,7 +12750,7 @@ void TestSrtWalkerRealSmemTranslation() {
   };
   ShaderRecompiler::IR::Program ir;
   BuildTypedPlan(shader, static_cast<uint32_t>(std::size(shader)), ir);
-  Check(ir.srt_reads.size() == 4 && ir.dynamic_reads.empty(),
+  Check(ir.srt_reads.size() == 4,
         "real SMEM translation did not build four compact SRT reads");
 
   const std::array<uint32_t, 4> table = {0x11111111u, 0x22222222u, 0x33333333u,
@@ -12761,7 +12806,7 @@ void TestSrtWalkerRealSBufferTranslation() {
   };
   ShaderRecompiler::IR::Program ir;
   BuildTypedPlan(shader, static_cast<uint32_t>(std::size(shader)), ir);
-  Check(ir.srt_reads.size() == 4 && ir.dynamic_reads.empty(),
+  Check(ir.srt_reads.size() == 4,
         "real S_BUFFER_LOAD translation did not build four compact reads");
 
   const std::array<uint32_t, 5> table = {0x11111111u, 0x22222222u, 0x33333333u,
@@ -12816,7 +12861,7 @@ void TestScalarMemorySourcesCapturedBeforeWrites() {
                    EncodeSopp(0x01)});
     ShaderRecompiler::IR::Program ir;
     BuildTypedPlan(shader.data(), static_cast<uint32_t>(shader.size()), ir);
-    Check(ir.srt_reads.size() == 4 && ir.dynamic_reads.empty(),
+    Check(ir.srt_reads.size() == 4,
           opcode == 0x02 ? "overlapping S_LOAD operands were evaluated after a "
                            "component write"
                          : "overlapping S_BUFFER_LOAD operands were evaluated "
@@ -12861,11 +12906,10 @@ void TestScalarMemoryLoadCrossesIntoVcc() {
   };
   ShaderRecompiler::IR::Program ir;
   BuildTypedPlan(shader, static_cast<uint32_t>(std::size(shader)), ir);
-  Check(ir.srt_reads.size() == 4 && ir.dynamic_reads.empty(),
+  Check(ir.srt_reads.size() == 4,
         "wide SMEM destination crossing into VCC lost scalar provenance");
   CheckFlattenedReadSlots(
       ir, 4, "wide SMEM destination crossing into VCC used wrong flat offsets");
-  ShaderRecompiler::IR::TrackResources(ir, {}, {});
   Check(ir.info.buffers.size() == 1,
         "wide SMEM destination crossing into VCC lost its buffer use");
   const auto *source =
@@ -12927,7 +12971,6 @@ void TestResourceTrackingRealDensePatching() {
   };
   ShaderRecompiler::IR::Program ir;
   BuildTypedPlan(shader, static_cast<uint32_t>(std::size(shader)), ir);
-  ShaderRecompiler::IR::TrackResources(ir, {}, {});
   Check(ir.info.buffers.size() == 2 && ir.info.images.size() == 2 &&
             ir.info.samplers.size() == 1,
         "real resource tracking produced the wrong dense list sizes");
@@ -12994,7 +13037,6 @@ void TestDirectTranslationResetsAnalysisState() {
   ShaderRecompiler::IR::Program ir;
   BuildTypedPlan(first_shader, static_cast<uint32_t>(std::size(first_shader)),
                  ir);
-  ShaderRecompiler::IR::TrackResources(ir, {}, {});
   ShaderComputeInputInfo compute;
   ShaderRecompiler::IR::CollectShaderInfo(ir, {.compute = &compute});
   Check(ir.resource_tracking_complete && ir.shader_info_complete &&
@@ -13003,10 +13045,13 @@ void TestDirectTranslationResetsAnalysisState() {
   ir.shader_hash = 0xdeadbeef;
 
   const uint32_t second_shader[] = {EncodeSopp(0x01)};
-  BuildTypedPlan(second_shader, static_cast<uint32_t>(std::size(second_shader)),
-                 ir);
+  ShaderRecompiler::Decoder::Program decoded;
+  ShaderRecompiler::Decoder::DecodeProgram(std::span{second_shader}, decoded);
+  ir = ShaderRecompiler::Frontend::TranslateProgram(
+      decoded, ShaderRecompiler::CFG::BuildGraph(decoded),
+      {.stage = ShaderType::Compute, .input_info = {.compute = &compute}});
   Check(!ir.resource_tracking_complete && !ir.shader_info_complete &&
-            ir.srt_plan_complete &&
+            !ir.srt_plan_complete &&
             ir.srt_reads.empty() && ir.shader_hash == 0 &&
             ir.info.buffers.empty() && ir.info.images.empty() &&
             ir.info.samplers.empty() && ir.info.sampled_pairs.empty() &&
@@ -13872,6 +13917,7 @@ int main() {
   TestSharedReturnPreservesDescriptorDominance();
   TestSharedExitPreservesNativeDescriptorSources();
   TestNestedSelectionPreservesDescriptorSources();
+  TestNativeScalarReadDescriptorPlanning();
   TestNativeGuardedSamplerSource();
   TestNativeDescriptorProvenanceRejectsGpuSelection();
   TestCfgSiblingSharedExit();

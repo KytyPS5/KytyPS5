@@ -1,6 +1,7 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
+#include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
@@ -126,7 +127,27 @@ struct Fixture {
   }
 
   void PlanAndTrack() {
-    BuildSrtPlan(program);
+    for (size_t index = 0; index < program.block_info.size(); ++index) {
+      const auto condition = program.block_info[index].condition;
+      if (!condition.IsEmpty())
+        Emit(ValueOpcode::Reference, {condition}, 0, program.blocks[index]);
+    }
+    for (auto *target : program.blocks) {
+      for (auto &inst : *target) {
+        if (inst.HasUses() || inst.MayHaveSideEffects() ||
+            (BufferAccessOf(inst.GetOpcode()) == BufferAccess::None &&
+             AddressOpcodeInfoOf(inst.GetOpcode()).access == AddressAccess::None &&
+             ImageOpcodeInfoOf(inst.GetOpcode()).access == ImageAccess::None))
+          continue;
+        auto value = Value(&inst);
+        if (value.GetType() == Type::U32x4)
+          value = Emit(ValueOpcode::CompositeExtractU32x4, {value, Value(0u)}, 0, target);
+        if (value.GetType() == Type::U8)
+          value = Emit(ValueOpcode::ConvertU32U8, {value}, 0, target);
+        Check(value.GetType() == Type::U32, "unhandled memory result type in fixture");
+        Emit(ValueOpcode::ReferenceU32, {value}, 0, target);
+      }
+    }
     TrackResources(program, {}, {});
   }
 };
@@ -277,7 +298,9 @@ void TestInvariantIndirectImageMaterialization() {
 
   Check(fixture->program.info.buffers.size() == 1 &&
             fixture->program.info.images.size() == 1 &&
-            fixture->program.dynamic_reads.size() == 1,
+            std::ranges::any_of(*fixture->block, [](const Inst &inst) {
+              return inst.GetOpcode() == ValueOpcode::ReadConstBuffer;
+            }),
         "indirect image key was not retained as a scalar-buffer read");
   const auto source = fixture->program.info.images[0].source;
   Check(source < fixture->program.descriptor_sources.size() &&
@@ -519,8 +542,8 @@ void TestInvariantIndirectImageMaterialization() {
         "a same-shape refresh discarded the runtime output storage");
 
   auto malformed = MakeIndirectImageFixture(true);
-  BuildSrtPlan(malformed->program);
-  CheckFatal([&] { TrackResources(malformed->program, {}, {}); }, "not a valid runtime value",
+
+  CheckFatal([&] { malformed->PlanAndTrack(); }, "not a valid runtime value",
              "malformed indirect image pattern was accepted");
   Check(!malformed->program.resource_tracking_complete &&
             malformed->program.info.images.empty() &&
@@ -528,8 +551,8 @@ void TestInvariantIndirectImageMaterialization() {
         "malformed indirect image pattern was partially accepted");
 
   auto wrapped_immediate = MakeIndirectImageFixture(false, 4u);
-  BuildSrtPlan(wrapped_immediate->program);
-  CheckFatal([&] { TrackResources(wrapped_immediate->program, {}, {}); },
+
+  CheckFatal([&] { wrapped_immediate->PlanAndTrack(); },
              "not a valid runtime value",
              "wrapped scalar immediate entered the invariant image proof");
   Check(!wrapped_immediate->program.resource_tracking_complete,
@@ -1405,7 +1428,7 @@ void TestDenseBufferTracking() {
             fixture.program.memory_info[other_flags.index].resource == 1,
         "typed memory metadata was not patched to dense indices");
 
-  CheckFatal([&] { TrackResources(fixture.program, {}, {}); }, "already tracked",
+  CheckFatal([&] { fixture.PlanAndTrack(); }, "already tracked",
              "resource tracking allowed a second mutation pass");
 }
 
@@ -1601,8 +1624,8 @@ void TestSampleAdjustSamplerScratch() {
     rejected.Emit(ValueOpcode::ImageSampleRaw,
                   {rejected_image, rejected_sampler, rejected.ImageAddress()},
                   rejected.AddMemory(rejected_memory, 0x200));
-    BuildSrtPlan(rejected.program);
-    CheckFatal([&] { TrackResources(rejected.program, {}, {}); },
+
+    CheckFatal([&] { rejected.PlanAndTrack(); },
                "not a valid runtime value", message);
   };
   CheckRejected(0u, 12u,
@@ -1936,7 +1959,8 @@ void TestDynamicSrtReadRemainsExplicit() {
   fixture.PlanAndTrack();
 
   Check(fixture.program.srt_reads.empty() &&
-            fixture.program.dynamic_reads.size() == 1 &&
+            read.ResolveInstruction()->GetOpcode() == ValueOpcode::LoadAddressU32 &&
+            !fixture.program.memory_info[0].planning_only &&
             fixture.program.info.uses_dma,
         "dynamic scalar read was incorrectly flattened or lost");
   std::array<uint32_t, 3> user_data{0x1000u, 0u, 4u};
@@ -1990,8 +2014,7 @@ void TestPhiValidation() {
                {handle, Value(0u), Value(0u), Value(0u), Value(true)},
                fixture.AddMemory(memory, 20), merge);
 
-  BuildSrtPlan(fixture.program);
-  CheckFatal([&] { TrackResources(fixture.program, {}, {}); }, "not a valid runtime value",
+  CheckFatal([&] { fixture.PlanAndTrack(); }, "not a valid runtime value",
              "control-dependent descriptor phi was accepted");
   Check(!fixture.program.resource_tracking_complete &&
             fixture.program.info.buffers.empty() &&
@@ -2092,7 +2115,9 @@ ResourcePlan ConditionalSamplerPlan(bool diamond, bool reverse, bool reverse_phi
                                {result, Value(0u)})});
   }
   fixture.PlanAndTrack();
-  Check(fixture.program.value_storage.size() == 4,
+  Check(std::ranges::count_if(fixture.program.value_storage, [](const Inst &inst) {
+          return inst.GetOpcode() == ValueOpcode::SelectU32;
+        }) == 4,
         "repeated sampler uses retained duplicate planning selections");
   Check(sampler_words[0].ResolveInstruction()->GetOpcode() == ValueOpcode::Phi,
         "host descriptor selection changed the GPU Phi");
@@ -2168,11 +2193,24 @@ void TestLoopCycleEnteredThroughRuntimeValue() {
                                     {Value(&phi), Value(0xffffffffu)}, 0, loop);
   phi.AddPhiOperand(entry, initial);
   phi.AddPhiOperand(loop, carried);
-  fixture.Emit(ValueOpcode::GetBufferResource,
+  const auto handle = fixture.Emit(ValueOpcode::GetBufferResource,
                {carried, Value(0u), Value(0u), Value(0u)}, MemoryFlags{0, 12},
                loop);
-
-  BuildSrtPlan(fixture.program);
+  MemoryInfo memory;
+  memory.kind = ResourceKind::Buffer;
+  fixture.Emit(ValueOpcode::LoadBufferU32,
+               {handle, Value(0u), Value(0u), Value(0u), Value(true)},
+               fixture.AddMemory(memory, 16), loop);
+  ConstantPropagationPass(fixture.program.blocks);
+  RemoveIdentities(fixture.program.blocks);
+  fixture.PlanAndTrack();
+  const std::array<uint32_t, 1> user_data{0x4000u};
+  DescriptorValue descriptor;
+  Check(fixture.program.info.buffers.size() == 1u &&
+            SrtWalker(fixture.program, {.user_data = user_data}).EvaluateDescriptor(
+                fixture.program.info.buffers[0].source, descriptor) &&
+            descriptor.dwords[0] == user_data[0],
+        "runtime-rooted invariant loop lost its buffer source");
 }
 
 void TestInvariantLoopPhi() {
@@ -2516,14 +2554,15 @@ void TestShaderInfoAndBindingLayout() {
   fixture.Emit(ValueOpcode::LoadBufferU32,
                {handle, Value(0u), Value(0u), Value(0u), Value(true)},
                fixture.AddMemory(buffer, 4));
-  fixture.Emit(
+  const auto invocation = fixture.Emit(
       ValueOpcode::GetBuiltin,
       {Value(static_cast<uint32_t>(StageInputKind::GlobalInvocationId)),
        Value(2u)});
-  fixture.Emit(ValueOpcode::BitwiseXor32, {Value(1u), Value(2u)});
+  const auto value = fixture.Emit(ValueOpcode::BitwiseXor32,
+                                   {invocation, Value(2u)});
   MemoryInfo gds;
   gds.kind = ResourceKind::Gds;
-  fixture.Emit(ValueOpcode::WriteSharedU32, {Value(0u), Value(1u), Value(true)},
+  fixture.Emit(ValueOpcode::WriteSharedU32, {Value(0u), value, Value(true)},
                fixture.AddMemory(gds, 8));
   fixture.PlanAndTrack();
 
@@ -2767,8 +2806,8 @@ void TestResourceLimitIsTransactional() {
                  {handle, Value(0u), Value(0u), Value(0u), Value(true)},
                  fixture.AddMemory(memory, index * 4u));
   }
-  BuildSrtPlan(fixture.program);
-  CheckFatal([&] { TrackResources(fixture.program, {}, {}); },
+
+  CheckFatal([&] { fixture.PlanAndTrack(); },
              "buffer resource limit exceeded",
              "resource-limit failure was not reported");
   Check(!fixture.program.resource_tracking_complete &&
@@ -2786,9 +2825,9 @@ void TestMalformedMemoryKindsRejected() {
     fixture.Emit(ValueOpcode::StoreAddressU32,
                  {address, Value(0u), Value(0u), Value(1u), Value(true)},
                  fixture.AddMemory(memory, 4));
-    BuildSrtPlan(fixture.program);
+
     CheckFatal(
-        [&] { TrackResources(fixture.program, {}, {}); },
+        [&] { fixture.PlanAndTrack(); },
         "address operation has invalid resource kind",
         "resource tracking accepted an address opcode with buffer metadata");
   }
@@ -2803,9 +2842,9 @@ void TestMalformedMemoryKindsRejected() {
     fixture.Emit(ValueOpcode::ImageRead,
                  {image, fixture.ImageAddress(), Value(true)},
                  fixture.AddMemory(memory, 8));
-    BuildSrtPlan(fixture.program);
+
     CheckFatal(
-        [&] { TrackResources(fixture.program, {}, {}); },
+        [&] { fixture.PlanAndTrack(); },
         "image operation has invalid resource kind",
         "resource tracking accepted an image opcode with address metadata");
   }
@@ -2896,3 +2935,4 @@ void DbgExit(int) { throw std::runtime_error("typed IR assertion failed"); }
 #include "graphics/shader/recompiler/ir/Value.cpp"
 #include "graphics/shader/recompiler/ir/opcodes/ValueOpcodes.cpp"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.cpp"
+#include "graphics/shader/recompiler/ir/passes/ConstantPropagation.cpp"

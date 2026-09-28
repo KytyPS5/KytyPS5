@@ -15,7 +15,6 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
-#include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "graphics/shader/recompiler/ir/passes/SsaRewrite.h"
 
 #include <algorithm>
@@ -624,8 +623,6 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		IR::EliminateDeadCode(ir.blocks);
 	}
 	LowerTessellationMemory(ir, options);
-	IR::BuildSrtPlan(ir);
-	IR::EliminateDeadCode(ir.blocks);
 	IR::TrackResources(ir, decoded, native_cfg);
 	IR::EliminateDeadCode(ir.blocks);
 	TranslateResult result;
@@ -652,16 +649,6 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	for (auto* block: ir.blocks) {
 		for (auto& inst: *block) {
 			const auto op = inst.GetOpcode();
-			if (op == IR::ValueOpcode::ReferenceU32) {
-				const auto* read = inst.Arg(0).Resolve().TryInstruction();
-				if (read != nullptr &&
-				    (read->GetOpcode() == IR::ValueOpcode::LoadAddressU32 ||
-				     read->GetOpcode() == IR::ValueOpcode::ReadConstBuffer) &&
-				    ir.memory_info[read->Flags<IR::MemoryFlags>().index].planning_only) {
-					inst.Invalidate();
-				}
-				continue;
-			}
 			uint32_t first = 0;
 			if (op == IR::ValueOpcode::GetBufferResource) {
 				if (std::ranges::any_of(inst.Uses(), [&](const IR::Use& use) {

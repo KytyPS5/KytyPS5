@@ -7,7 +7,6 @@
 #include <bit>
 #include <cmath>
 #include <cstring>
-#include <fmt/format.h>
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -22,21 +21,6 @@ SrtRuntime CleanRuntime(SrtRuntime runtime) {
 namespace {
 
 constexpr uint64_t AddressMask = 0x0000ffffffffffffull;
-
-const char* StageName(ShaderType stage) {
-	switch (stage) {
-		case ShaderType::Vertex: return "vertex";
-		case ShaderType::Pixel: return "pixel";
-		case ShaderType::Fetch: return "fetch";
-		case ShaderType::Compute: return "compute";
-		default: return "unknown";
-	}
-}
-
-std::string Diagnostic(const ResourcePlan& program, uint32_t pc, const std::string& message) {
-	return fmt::format("shader SRT: hash=0x{:016x} stage={} pc=0x{:08x} {}", program.shader_hash,
-	                   StageName(program.stage), pc, message);
-}
 
 bool AddSignedAddress(uint64_t base, int64_t offset, uint64_t& result) {
 	if (base > AddressMask) {
@@ -313,152 +297,6 @@ private:
 	std::unordered_set<const Inst*> m_validated_dependencies;
 };
 
-class PlanBuilder {
-public:
-	explicit PlanBuilder(Program& program): m_program(program) {}
-
-	void Run() {
-		m_program.srt_reads.clear();
-		m_program.dynamic_reads.clear();
-		for (auto* block: m_program.blocks) {
-			for (auto& inst: *block) {
-				const auto op = inst.GetOpcode();
-				if (op == ValueOpcode::LoadAddressU32 || op == ValueOpcode::ReadConstBuffer) {
-					const auto flags = inst.Flags<MemoryFlags>();
-					if (flags.index < m_program.memory_info.size()) {
-						const auto kind       = m_program.memory_info[flags.index].kind;
-						const bool crosswired = (op == ValueOpcode::LoadAddressU32 &&
-						                         kind == ResourceKind::ScalarBuffer) ||
-						                        (op == ValueOpcode::ReadConstBuffer &&
-						                         kind == ResourceKind::ScalarAddress);
-						if (crosswired) {
-							Fail(flags.pc,
-							     fmt::format("{} has incompatible scalar memory metadata",
-							                 ValueOpcodeName(op)));
-						}
-					}
-				}
-				if (IsDescriptorHandle(inst.GetOpcode())) {
-					for (size_t index = 0; index < inst.NumArgs(); index++) {
-						Collect(inst.Arg(index), 0);
-					}
-				}
-			}
-		}
-		for (auto* block: m_program.blocks) {
-			for (auto& inst: *block) {
-				if (inst.GetOpcode() == ValueOpcode::LoadAddressU32 && IsRawRead(m_program, inst) &&
-				    inst.Arg(1).Resolve().IsImmediate() &&
-				    ValidateRuntimeValue(m_program, Value(&inst))) {
-					Collect(Value(&inst), inst.Flags<MemoryFlags>().pc);
-				}
-			}
-		}
-		PatchReads();
-	}
-
-private:
-	struct Patch {
-		Inst*    inst = nullptr;
-		uint32_t slot = 0;
-		bool     keep = false;
-	};
-
-	[[noreturn]] void Fail(uint32_t pc, const std::string& message) const {
-		const auto diagnostic = Diagnostic(m_program, pc, message);
-		EXIT("shader SRT planning failed: %s", diagnostic.c_str());
-		std::abort();
-	}
-
-	void Collect(Value value, uint32_t use_pc) {
-		value = value.Resolve();
-		if (value.IsImmediate()) {
-			return;
-		}
-		auto* inst = value.TryInstruction();
-		if (inst == nullptr) {
-			Fail(use_pc, "invalid typed planning value");
-		}
-		const auto cycle = std::ranges::find(m_visiting, inst);
-		if (cycle != m_visiting.end()) {
-			const auto contains_phi = std::any_of(cycle, m_visiting.end(), [](const Inst* value) {
-				return value->GetOpcode() == ValueOpcode::Phi;
-			});
-			if (contains_phi) {
-				return;
-			}
-			Fail(use_pc, fmt::format("cyclic typed planning value {} without a phi",
-			                         ValueOpcodeName(inst->GetOpcode())));
-		}
-		if (std::ranges::find(m_visited, inst) != m_visited.end()) {
-			return;
-		}
-		m_visiting.push_back(inst);
-		for (size_t index = 0; index < inst->NumArgs(); index++) {
-			Collect(inst->Arg(index), use_pc);
-		}
-		m_visiting.pop_back();
-		m_visited.push_back(inst);
-		if (!IsRawRead(m_program, *inst)) {
-			return;
-		}
-		const auto offset = inst->Arg(1).Resolve();
-		if (!offset.IsImmediate() || offset.GetType() != Type::U32) {
-			if (std::ranges::find(m_program.dynamic_reads, value) ==
-			    m_program.dynamic_reads.end()) {
-				m_program.dynamic_reads.push_back(value);
-			}
-			return;
-		}
-		for (uint32_t slot = 0; slot < m_program.srt_reads.size(); slot++) {
-			if (EquivalentValue(m_program, value, m_program.srt_reads[slot].value)) {
-				m_patches.push_back({inst, slot, false});
-				return;
-			}
-		}
-		const auto slot = static_cast<uint32_t>(m_program.srt_reads.size());
-		m_program.srt_reads.push_back({value, slot});
-		m_patches.push_back({inst, slot, true});
-	}
-
-	void PatchReads() {
-		for (const auto& patch: m_patches) {
-			auto* block = patch.inst->Parent();
-			auto& list  = block->Instructions();
-			auto  where =
-			    std::ranges::find_if(list, [&](const Inst& inst) { return &inst == patch.inst; });
-			const auto resource =
-			    Value(&*block->PrependNewInst(where, ValueOpcode::GetSrtResource));
-			const auto flat = Value(&*block->PrependNewInst(where, ValueOpcode::ReadConst,
-			                                                {resource, Value(patch.slot)},
-			                                                patch.inst->Flags<uint64_t>()));
-			const auto uses = patch.inst->Uses();
-			for (const auto& use: uses) {
-				use.user->SetArg(use.operand, flat);
-			}
-			for (auto& info: m_program.block_info) {
-				if (info.condition.Resolve() == Value(patch.inst)) {
-					info.condition = flat;
-				}
-				if (info.indirect_target.Resolve() == Value(patch.inst)) {
-					info.indirect_target = flat;
-				}
-			}
-			if (patch.keep) {
-				const auto memory = patch.inst->Flags<MemoryFlags>().index;
-				if (memory < m_program.memory_info.size()) {
-					m_program.memory_info[memory].planning_only = true;
-				}
-				block->AppendNewInst(ValueOpcode::ReferenceU32, {Value(patch.inst)});
-			}
-		}
-	}
-
-	Program&           m_program;
-	std::vector<Inst*> m_visiting;
-	std::vector<Inst*> m_visited;
-	std::vector<Patch> m_patches;
-};
 
 } // namespace
 
@@ -1068,13 +906,5 @@ bool ValidateRuntimeValue(const ResourcePlan& program, Value value, RuntimeValue
 	return RuntimeValidator(program, type).Run(value);
 }
 
-void BuildSrtPlan(Program& program) {
-	if (program.resource_tracking_complete) {
-		EXIT("shader SRT planning failed: cannot rebuild SRT after resource tracking");
-	}
-	program.srt_plan_complete = false;
-	PlanBuilder(program).Run();
-	program.srt_plan_complete = true;
-}
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

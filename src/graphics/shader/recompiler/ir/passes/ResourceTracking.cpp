@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <algorithm>
@@ -98,9 +99,8 @@ public:
 		if (m_program.resource_tracking_complete) {
 			Fail(0, "resources already tracked");
 		}
-		if (!m_program.srt_plan_complete) {
-			Fail(0, "SRT plan is not ready");
-		}
+		PlanScalarReads();
+		EliminateDeadCode(m_program.blocks);
 		PlanIndirectImages();
 		for (auto* block: m_program.blocks) {
 			for (auto& inst: *block) {
@@ -130,13 +130,6 @@ public:
 				m_program.memory_info[index].planning_only = true;
 			}
 		}
-		std::erase_if(m_program.dynamic_reads, [&](Value value) {
-			const auto* inst = value.Resolve().TryInstruction();
-			return std::any_of(m_indirect_images.begin(), m_indirect_images.end(),
-			                   [&](const IndirectImagePlan& plan) {
-				return std::ranges::find(plan.reads, inst) != plan.reads.end();
-			});
-		});
 		m_program.descriptor_sources         = std::move(m_sources);
 		m_program.info                       = std::move(m_info);
 		m_program.resource_tracking_complete = true;
@@ -153,6 +146,13 @@ private:
 		uint32_t resource    = 0;
 		uint32_t sampler     = 0;
 		bool     has_sampler = false;
+	};
+
+	struct ResolvedHandle {
+		const Inst* handle;
+		uint32_t pc;
+		DescriptorSource source;
+		Value planning_handle;
 	};
 
 	struct IndirectImagePlan {
@@ -191,6 +191,8 @@ private:
 					if (arg != nullptr) pending.push_back(arg);
 				}
 			} else if (inst->GetOpcode() == ValueOpcode::ReadConst ||
+			           inst->GetOpcode() == ValueOpcode::LoadAddressU32 ||
+			           inst->GetOpcode() == ValueOpcode::ReadConstBuffer ||
 			           inst->GetOpcode() == ValueOpcode::GetUserData) {
 				candidates.push_back(inst);
 			}
@@ -206,7 +208,9 @@ private:
 					    RegIndex(candidate->Arg(0).ScalarRegister()) != reg)
 						continue;
 				} else {
-					if (candidate->GetOpcode() != ValueOpcode::ReadConst) continue;
+					if (candidate->GetOpcode() != ValueOpcode::ReadConst &&
+					    candidate->GetOpcode() != ValueOpcode::LoadAddressU32 &&
+					    candidate->GetOpcode() != ValueOpcode::ReadConstBuffer) continue;
 					const auto flags = candidate->Flags<MemoryFlags>();
 					if (flags.pc != pc || flags.index >= m_program.memory_info.size()) continue;
 					if (native == m_decoded.instructions.end() || native->pc != pc ||
@@ -228,11 +232,18 @@ private:
 		std::vector<Position> positions {{use->id, use_pc}};
 		std::vector<bool> reached(m_native_cfg.blocks.size());
 		Value selected;
+		uint32_t selected_pc = UINT32_MAX;
 		const auto select = [&](uint32_t pc) {
 			const auto source = source_at(pc);
-			if (source.IsEmpty() || (!selected.IsEmpty() && !EquivalentValue(m_program, selected, source)))
-				return false;
+			if (source.IsEmpty()) return false;
+			if (!selected.IsEmpty()) {
+				const auto op = source.TryInstruction()->GetOpcode();
+				if ((op == ValueOpcode::LoadAddressU32 || op == ValueOpcode::ReadConstBuffer) &&
+				    selected_pc != pc) return false;
+				if (!EquivalentValue(m_program, selected, source)) return false;
+			}
 			selected = source;
+			selected_pc = pc;
 			return true;
 		};
 		while (!positions.empty()) {
@@ -335,6 +346,13 @@ private:
 
 	void MakeSource(const Inst& handle, uint32_t width, bool sampler, bool sample_adjust,
 	                uint32_t base_reg, DescriptorSource& descriptor, uint32_t pc) {
+		const auto resolved = std::ranges::find_if(m_resolved_handles, [&](const auto& entry) {
+			return entry.handle == &handle && entry.pc == pc;
+		});
+		if (resolved != m_resolved_handles.end()) {
+			descriptor = resolved->source;
+			return;
+		}
 		if (handle.NumArgs() != width) {
 			Fail(pc, fmt::format("{} has {} descriptor dwords, expected {}",
 			                     ValueOpcodeName(handle.GetOpcode()), handle.NumArgs(), width));
@@ -354,6 +372,174 @@ private:
 			// Border color and its table index are unused unless a clamp axis selects border mode.
 			descriptor.dwords[3] = Value(0u);
 		}
+		m_resolved_handles.push_back({&handle, pc, descriptor, {}});
+	}
+
+	uint32_t ScalarReadBase(const Inst& read) const {
+		const auto flags = read.Flags<MemoryFlags>();
+		if (m_program.memory_info[flags.index].kind == ResourceKind::ScalarBuffer)
+			return m_program.memory_info[flags.index].resource * 4u;
+		const auto native = std::ranges::lower_bound(m_decoded.instructions, flags.pc, {},
+		                                            &Decoder::Instruction::pc);
+		return native != m_decoded.instructions.end() && native->pc == flags.pc &&
+		               native->src0.kind == Decoder::OperandKind::Sgpr
+		           ? native->src0.reg : UINT32_MAX;
+	}
+
+	void CollectScalarRead(Value value, uint32_t use_pc) {
+		value = value.Resolve();
+		if (value.IsImmediate()) return;
+		auto* inst = value.TryInstruction();
+		if (inst == nullptr) Fail(use_pc, "invalid typed planning value");
+		const auto cycle = std::ranges::find(m_srt_visiting, inst);
+		if (cycle != m_srt_visiting.end()) {
+			if (std::any_of(cycle, m_srt_visiting.end(), [](const Inst* value) {
+				return value->GetOpcode() == ValueOpcode::Phi;
+			})) return;
+			Fail(use_pc, "cyclic typed planning value without a phi");
+		}
+		if (std::ranges::find(m_srt_visited, inst) != m_srt_visited.end()) return;
+		m_srt_visiting.push_back(inst);
+		uint32_t memory_index = 0;
+		const auto* memory = ScalarReadMemory(*inst, memory_index);
+		DescriptorSource source;
+		if (memory != nullptr) {
+			const auto* handle = inst->Arg(0).Resolve().TryInstruction();
+			const auto width = memory->kind == ResourceKind::ScalarBuffer ? 4u : 2u;
+			if (handle == nullptr || handle->GetOpcode() !=
+			        (width == 4u ? ValueOpcode::GetBufferResource : ValueOpcode::GetAddressResource))
+				Fail(use_pc, "scalar read has an invalid resource handle");
+			MakeSource(*handle, width, false, false, ScalarReadBase(*inst), source,
+			           inst->Flags<MemoryFlags>().pc);
+			for (uint32_t word = 0; word < width; ++word)
+				CollectScalarRead(source.dwords[word], inst->Flags<MemoryFlags>().pc);
+			for (size_t arg = 1; arg < inst->NumArgs(); ++arg)
+				CollectScalarRead(inst->Arg(arg), use_pc);
+		} else {
+			for (size_t arg = 0; arg < inst->NumArgs(); ++arg)
+				CollectScalarRead(inst->Arg(arg), use_pc);
+		}
+		m_srt_visiting.pop_back();
+		m_srt_visited.push_back(inst);
+		if (memory == nullptr) return;
+		const auto offset = inst->Arg(1).Resolve();
+		if (!offset.IsImmediate() || offset.GetType() != Type::U32) return;
+		m_scalar_reads.push_back(inst);
+	}
+
+	void PlanScalarReads() {
+		m_program.srt_plan_complete = false;
+		m_program.srt_reads.clear();
+		for (auto* block: m_program.blocks) {
+			for (auto& inst: *block) {
+				const auto op = inst.GetOpcode();
+				const auto image = ImageOpcodeInfoOf(op);
+				if (BufferAccessOf(op) == BufferAccess::None &&
+				    AddressOpcodeInfoOf(op).access == AddressAccess::None &&
+				    image.access == ImageAccess::None) continue;
+				const auto flags = inst.Flags<MemoryFlags>();
+				if (flags.index >= m_program.memory_info.size())
+					Fail(flags.pc, "memory metadata index is out of range");
+				if (inst.NumArgs() < (image.needs_sampler ? 2u : 1u))
+					Fail(flags.pc, "memory operation has no resource handle");
+				const auto& memory = m_program.memory_info[flags.index];
+				if ((op == ValueOpcode::LoadAddressU32 && memory.kind == ResourceKind::ScalarBuffer) ||
+				    (op == ValueOpcode::ReadConstBuffer && memory.kind == ResourceKind::ScalarAddress))
+					Fail(flags.pc, "scalar read has incompatible scalar memory metadata");
+				for (uint32_t arg = 0; arg < (image.needs_sampler ? 2u : 1u); ++arg) {
+					const auto* handle = inst.Arg(arg).Resolve().TryInstruction();
+					if (handle == nullptr) continue;
+					const auto kind = handle->GetOpcode();
+					const bool sampler = kind == ValueOpcode::GetSamplerResource;
+					const uint32_t width = kind == ValueOpcode::GetImageResource ? 8u
+					                     : kind == ValueOpcode::GetAddressResource ? 2u
+					                     : kind == ValueOpcode::GetBufferResource || sampler ? 4u : 0u;
+					if (width == 0u) continue;
+					const auto base = width == 2u
+					    ? (memory.kind == ResourceKind::ScalarAddress ? ScalarReadBase(inst) : UINT32_MAX)
+					    : (sampler ? memory.sampler : memory.resource) * 4u;
+					DescriptorSource source;
+					MakeSource(*handle, width, sampler,
+					           sampler && (memory.image_sample_flags & Decoder::ImageSampleFlagAdjust) != 0,
+					           base, source, flags.pc);
+					for (uint32_t word = 0; word < width; ++word)
+						CollectScalarRead(source.dwords[word], flags.pc);
+				}
+			}
+		}
+		for (auto* block: m_program.blocks) {
+			for (auto& inst: *block) {
+				uint32_t index = 0;
+				if (inst.GetOpcode() == ValueOpcode::LoadAddressU32 &&
+				    ScalarReadMemory(inst, index) != nullptr && inst.Arg(1).Resolve().IsImmediate() &&
+				    ValidateRuntimeValue(m_program, Value(&inst)))
+					CollectScalarRead(Value(&inst), inst.Flags<MemoryFlags>().pc);
+			}
+		}
+		for (auto* read: m_scalar_reads) {
+			const auto flags = read->Flags<MemoryFlags>();
+			auto& memory = m_program.memory_info[flags.index];
+			memory.planning_only = true;
+			const auto* handle = read->Arg(0).Resolve().TryInstruction();
+			auto resolved = std::ranges::find_if(m_resolved_handles, [&](const auto& entry) {
+				return entry.handle == handle && entry.pc == flags.pc;
+			});
+			EXIT_IF(resolved == m_resolved_handles.end());
+			uint32_t slot = 0;
+			for (; slot < m_program.srt_reads.size(); ++slot) {
+				const auto* other = m_program.srt_reads[slot].value.Resolve().TryInstruction();
+				if (other->GetOpcode() != read->GetOpcode() ||
+				    m_program.memory_info[other->Flags<MemoryFlags>().index] != memory) continue;
+				const auto* other_handle = other->Arg(0).Resolve().TryInstruction();
+				bool same = true;
+				for (uint32_t word = 0; word < resolved->source.dword_count; ++word)
+					same &= EquivalentValue(m_program, resolved->source.dwords[word], other_handle->Arg(word));
+				for (size_t arg = 1; arg < read->NumArgs(); ++arg)
+					same &= EquivalentValue(m_program, read->Arg(arg), other->Arg(arg));
+				if (same) break;
+			}
+			const bool keep = slot == m_program.srt_reads.size();
+			if (keep) m_program.srt_reads.push_back({Value(read), slot});
+			auto* block = read->Parent();
+			auto& list = block->Instructions();
+			const auto where = std::ranges::find_if(list, [&](const Inst& inst) {
+				return &inst == read;
+			});
+			const auto resource = Value(&*block->PrependNewInst(where, ValueOpcode::GetSrtResource));
+			const auto flat = Value(&*block->PrependNewInst(where, ValueOpcode::ReadConst,
+			    {resource, Value(slot)}, read->Flags<uint64_t>()));
+			const auto uses = read->Uses();
+			for (const auto& use: uses) use.user->SetArg(use.operand, flat);
+			for (auto& entry: m_resolved_handles) {
+				for (uint32_t word = 0; word < entry.source.dword_count; ++word)
+					if (entry.source.dwords[word].Resolve() == Value(read))
+						entry.source.dwords[word] = flat;
+			}
+			for (auto& info: m_program.block_info) {
+				if (info.condition.Resolve() == Value(read)) info.condition = flat;
+				if (info.indirect_target.Resolve() == Value(read)) info.indirect_target = flat;
+			}
+			if (keep) {
+				if (resolved->planning_handle.IsEmpty()) {
+					bool unchanged = true;
+					for (uint32_t word = 0; word < resolved->source.dword_count; ++word)
+						unchanged &= handle->Arg(word).Resolve() == resolved->source.dwords[word].Resolve();
+					resolved->planning_handle = read->Arg(0);
+					if (!unchanged) {
+						auto& retained = m_program.value_storage.emplace_back(handle->GetOpcode());
+						for (uint32_t word = 0; word < resolved->source.dword_count; ++word)
+							retained.SetArg(word, resolved->source.dwords[word]);
+						resolved->planning_handle = Value(&retained);
+					}
+				}
+				read->SetArg(0, resolved->planning_handle);
+				read->SetParent(nullptr);
+				m_program.value_storage.splice(m_program.value_storage.end(), list, where);
+			} else {
+				list.erase(where);
+			}
+		}
+		m_program.srt_plan_complete = true;
 	}
 
 	bool ValidateSource(const DescriptorSource& descriptor, uint32_t& bad_dword) const {
@@ -457,14 +643,19 @@ private:
 		return true;
 	}
 
-	bool MakeRuntimeTableSource(const Inst& handle, uint32_t pc,
-	                            DescriptorSource& descriptor) {
-		const auto width = handle.GetOpcode() == ValueOpcode::GetBufferResource ? 4u
-		                 : handle.GetOpcode() == ValueOpcode::GetAddressResource ? 2u : 0u;
+	bool MakeRuntimeTableSource(const Inst& read, DescriptorSource& descriptor) {
+		const auto* handle = read.Arg(0).Resolve().TryInstruction();
+		if (handle == nullptr) return false;
+		const auto width = handle->GetOpcode() == ValueOpcode::GetBufferResource ? 4u
+		                 : handle->GetOpcode() == ValueOpcode::GetAddressResource ? 2u : 0u;
 		if (width == 0u) {
 			return false;
 		}
-		MakeSource(handle, width, false, false, UINT32_MAX, descriptor, pc);
+		const auto flags = read.Flags<MemoryFlags>();
+		const auto kind = m_program.memory_info[flags.index].kind;
+		const auto base = kind == ResourceKind::ScalarAddress || kind == ResourceKind::ScalarBuffer
+		    ? ScalarReadBase(read) : UINT32_MAX;
+		MakeSource(*handle, width, false, false, base, descriptor, flags.pc);
 		uint32_t bad_dword = 0;
 		return ValidateSource(descriptor, bad_dword);
 	}
@@ -852,7 +1043,7 @@ private:
 		const auto* material_handle = read->Arg(0).Resolve().TryInstruction();
 		if (material_handle == nullptr ||
 		    material_handle->GetOpcode() != ValueOpcode::GetAddressResource ||
-		    !MakeRuntimeTableSource(*material_handle, pc, material_source)) return false;
+		    !MakeRuntimeTableSource(*read, material_source)) return false;
 		AffineOffset offset;
 		if (!MatchAffineOffset(read->Arg(1), active, offset) || offset.index.IsEmpty() ||
 		    offset.stride == 0u || offset.offset + memory.offset > UINT32_MAX ||
@@ -974,7 +1165,7 @@ private:
 		}
 
 		DescriptorSource table_source;
-		if (!MakeRuntimeTableSource(*table_handle, pc, table_source)) {
+		if (!MakeRuntimeTableSource(*plan.reads[0], table_source)) {
 			return false;
 		}
 		DescriptorSource material_source;
@@ -1018,7 +1209,7 @@ private:
 			const auto* material_handle = material_read->Arg(0).Resolve().TryInstruction();
 			if (material_handle == nullptr ||
 			    material_handle->GetOpcode() != ValueOpcode::GetBufferResource ||
-			    !MakeRuntimeTableSource(*material_handle, pc, material_source)) {
+			    !MakeRuntimeTableSource(*material_read, material_source)) {
 				return false;
 			}
 			indirect.material_source = InternSource(material_source);
@@ -1378,6 +1569,10 @@ private:
 	const Decoder::Program&                    m_decoded;
 	const CFG::Graph&                          m_native_cfg;
 	std::vector<Program::ScalarWrite>          m_scalar_writes;
+	std::vector<ResolvedHandle>                m_resolved_handles;
+	std::vector<const Inst*>                   m_srt_visiting;
+	std::vector<const Inst*>                   m_srt_visited;
+	std::vector<Inst*>                         m_scalar_reads;
 	ShaderInfo                                 m_info;
 	std::vector<DescriptorSource>              m_sources;
 	std::vector<HandlePatch>                   m_handle_patches;

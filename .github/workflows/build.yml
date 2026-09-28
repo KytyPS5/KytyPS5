@@ -114,6 +114,7 @@ jobs:
         run: |
           cmake --build _Build/windows --target launcher ^
             audio_out2_port_tests pad_haptics_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests ^
+            shader_recompiler_compute_tests ^
             resource_tracking_tests scalar_provenance_tests ^
             resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests --parallel
 

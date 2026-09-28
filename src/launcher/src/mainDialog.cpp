@@ -19,6 +19,7 @@
 #include <QObject>
 #include <QPointer>
 #include <QProcess>
+#include <QProcessEnvironment>
 #include <QRadioButton>
 #include <QRegularExpression>
 #include <QSettings>
@@ -380,6 +381,11 @@ static QString BuildWinCmdKCommand(const QString& interpreter, const QStringList
 #endif
 
 void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
+	auto environment = QProcessEnvironment::systemEnvironment();
+	environment.insert("KYTY_DEFER_RELEASE_MEM_INTERRUPTS",
+	                   info.defer_release_mem_interrupts_enabled ? "1" : "0");
+	process->setProcessEnvironment(environment);
+
 	const auto& interpreter = m_p->GetInterpreter();
 
 	QFileInfo f(interpreter);

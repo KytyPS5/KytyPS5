@@ -98,7 +98,8 @@ static void PrintUsage() {
 	::printf("  --skip-notice-screen                 Skip startup logos and notices in supported games.\n");
 	::printf("  --launch-activity <id>               Launch into this activity (1-32 printable ASCII chars).\n");
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	::printf("  --redzone                            Protect the guest SysV red zone.\n");
+	::printf("  --redzone                            Protect the guest SysV red zone (default).\n");
+	::printf("  --no-redzone                         Do not protect the guest SysV red zone.\n");
 #endif
 	::printf("  --keymap <Control=Input>             DualSense mapping; may be repeated.\n");
 	::printf("  --rd                                 Enable RenderDoc capture.\n");
@@ -225,6 +226,7 @@ static constexpr Flag FLAGS[] = {
     {"--skip-notice-screen", &ConfigOptions::skip_notice_screen},
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
     {"--redzone", &ConfigOptions::red_zone_protection_enabled},
+    {"--no-redzone", &ConfigOptions::red_zone_protection_enabled, false},
 #endif
 };
 

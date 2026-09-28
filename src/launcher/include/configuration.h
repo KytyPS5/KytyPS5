@@ -138,7 +138,7 @@ public:
 	bool                   renderdoc_enabled           = false;
 	bool                   amd_cpu_enabled             = false;
 #if defined(_WIN32)
-	bool red_zone_protection_enabled = false;
+	bool red_zone_protection_enabled = true;
 #endif
 	QStringList host_input_mapping;
 

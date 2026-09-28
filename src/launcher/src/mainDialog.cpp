@@ -274,9 +274,7 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 		args << "--amd-cpu";
 	}
 #if defined(_WIN32)
-	if (info.red_zone_protection_enabled) {
-		args << "--redzone";
-	}
+	args << (info.red_zone_protection_enabled ? "--redzone" : "--no-redzone");
 #endif
 	for (const auto& binding: info.host_input_mapping) {
 		args << "--keymap" << binding;

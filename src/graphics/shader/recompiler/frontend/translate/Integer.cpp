@@ -541,6 +541,19 @@ void Translator::V_CNDMASK_B32(const Decoder::Instruction& inst) {
 	WriteOperand(DestinationOperand(inst), result);
 }
 
+void Translator::V_CVT_PK_16_32(const Decoder::Instruction& inst, bool sign) {
+	// u32_to_u16/i32_to_i16 saturate to the 16-bit range; they are not plain truncations.
+	const auto convert = [&](const Decoder::Operand& operand) {
+		const auto value = ReadU32(operand);
+		if (!sign) {
+			return IR::U32(ir.Emit(IR::ValueOpcode::UMin32, {value, IR::Value(0xffffu)}));
+		}
+		const auto low = IR::U32(ir.Emit(IR::ValueOpcode::SMax32, {value, IR::Value(0xffff8000u)}));
+		return IR::U32(ir.Emit(IR::ValueOpcode::SMin32, {low, IR::Value(0x7fffu)}));
+	};
+	WriteOperand(DestinationOperand(inst), PackU16Lanes(convert(inst.src0), convert(inst.src1)));
+}
+
 void Translator::PackB16(const Decoder::Instruction& inst, bool high0, bool high1) {
 	const auto lo        = high0 ? ir.ShiftRightLogical(ReadU32(inst.src0), IR::U32(IR::Value(16u)))
 	                             : ReadU32(inst.src0);

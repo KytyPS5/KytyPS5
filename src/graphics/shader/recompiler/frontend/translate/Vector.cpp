@@ -408,8 +408,8 @@ void Translator::EmitVector(const Decoder::Instruction& inst) {
 			return;
 		case O::V_CVT_PK_U8_F32: V_CVT_PK_U8_F32(inst); return;
 		case O::V_PACK_B32_F16: V_PACK_B32_F16(inst); return;
-		case O::V_CVT_PK_U16_U32:
-		case O::V_CVT_PK_I16_I32: return PackB16(inst, false, false);
+		case O::V_CVT_PK_U16_U32: return V_CVT_PK_16_32(inst, false);
+		case O::V_CVT_PK_I16_I32: return V_CVT_PK_16_32(inst, true);
 
 		case O::V_LSHLREV_B16:
 			return Integer16Shift(inst, IR::ValueOpcode::ShiftLeftLogical32, false);

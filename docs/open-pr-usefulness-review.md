@@ -2,6 +2,32 @@
 
 # Открытые PR KytyPS5: что полезно для текущего bring-up
 
+Checkpoint 28.09 `8cb79392`: finite scalar-buffer snapshot budget fix proven
+native CPU/GPU RED→GREEN. Real retry `…-205136-menucheck-gpuav-sync` passes
+CS845790 (81 columns, SPIR-V54523 words, pipeline2041ms), maxShown119, black
+DesktopCopy shown29/114. New boundary PSf8927 inline sampled pair image admission
+(size23184 stride368 probes1439 pairs297 accumulated images607 / MaxImages512).
+No frame/menu/gameplay proof. Source CI36482065792: Build/Test/Install GREEN Windows/Linux/macOS;
+overall failure is macOS artifact-upload DNS (`getaddrinfo ENOTFOUND`), not a
+compile/test failure. Documentation push retries CI. No new open PR integrated or merged.
+
+Fresh selective metadata+full diff review of newly opened candidates:
+
+- #894 `4b3c1df0`, block image storage usage: MERGEABLE against upstream base;
+  changes image.cpp device format/usage query and adds storage only on supported
+  BC formats. Relevant to later texture/pixel failures, but does not change the
+  current BuildResourceSpecialization resource-count boundary. Not integrated;
+  require independent supported/unsupported block-view storage regression and
+  numerical write/sample validation before adoption. Author's Stray result is
+  not branch-specific proof.
+- #893 `bfe3e0dd`, native VRSQRTPS trampoline under --amd-cpu: MERGEABLE against
+  upstream base; loader/redZonePatcher.cpp only. It does not address PS sampled
+  resource admission on this Ryzen host. Not integrated, no local CPU semantics
+  regression/build claimed. PR's standalone bit-exact harness is not included.
+- Fresh open-list check also includes #852/#811 image candidates previously
+  reviewed below; no evidence currently proves that a whole PR resolves this
+  new pair/domain/resource admission boundary.
+
 Checkpoint 28.09 `c8aaaa5b`: shared post-test proof fixed after CPU/native shader
 RED→GREEN, real retry passes 5f3f image origin/pipeline. Latest run
 `…-202341-menucheck-gpuav-sync`, maxShown113, black client area shown37/106,

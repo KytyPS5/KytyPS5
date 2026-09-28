@@ -105,9 +105,9 @@ words and creates pipeline successfully (2912ms); subsequent dispatches continue
 Run `yotei-integrated-20260928-202341-menucheck-gpuav-sync`, maxShown113,
 black DesktopCopy shown37/106. No frame/menu/gameplay claim.
 
-## Pending finite selector snapshot capacity (2026-09-28)
+## Finite selector snapshot capacity corrected (2026-09-28)
 
-Same committed retry fails MaterializeResources CS8457901d80b91921. stderr:
+Baseline c8aaaa5b committed retry failed MaterializeResources CS8457901d80b91921. stderr:
 bounded SRT read1 exceeds snapshot limit, count65536 stride592 bias0,
 accumulated words131072 vs word_limit65536. Guest code uses a finite 16-bit
 lane-selected record key and multiple scalar-buffer descriptor/payload columns.
@@ -146,6 +146,39 @@ full build `bounded-scalar-budget-final-build-20260928.log` and required CTest22
 `bounded-scalar-budget-ctest-20260928.log`. Scalar sparse store, upper EXEC guard,
 and nested post-test image numerical neighbors GREEN. Existing raw/workgroup
 exact probe boundaries pass unchanged. Original game retry remains pending.
+
+Committed8cb79392 retry `yotei-integrated-20260928-205136-menucheck-gpuav-sync` confirms that
+CS845790 passes81 bounded columns, SPIR-V54523 words and pipeline creation2041ms.
+The domain/count remains65536; no quota constant changed. Source8cb79392
+CI36482065792 Build/Test/Install GREEN Windows/Linux/macOS; macOS artifact upload
+DNS failure prevents an overall GREEN claim. Documentation push retries CI.
+New runtime boundary is below.
+
+## Pending sampled pair image admission (2026-09-28)
+
+Completed8cb79392 native Windows retry reaches PSf8927c09f4b928c7 at maxShown119,
+then exit321: `inline sampled pairs exceed the dense image resource limit
+(size=23184 stride=368 probes=1439 pairs=297 images=607)`. Evidence: completed
+run above / stderr.txt and stdout tail. This failure is after the corrected CS
+materialization and successful compute pipeline; no new frame/menu proof.
+
+Read-only code diagnosis: BuildResourceSpecialization sums each indirect table's
+candidate count minus its root before creating dense resources. Candidates carry
+root-specific mapping/type metadata and an indirect sampler. It is not yet proven
+whether607 represents necessary distinct typed pairs, duplicates across roots,
+or an overestimated selector domain. Do not collapse images with different
+samplers/types/roots blindly and do not increase MaxImages.
+
+Before any fix: capture candidate identities/domain evidence with bounded
+CPU-only diagnostics; add independent multi-root synthetic tables with overlapping
+and disjoint image/sampler pairs, differing type/dimension/swizzle semantics,
+invalid holes, descriptor extents and exact/plus-one admission. Prove intended
+RED then unchanged GREEN. Native numerical image/sampler selection must preserve
+per-root mappings and sampler differences, dirty-memory/alias rejection and
+transactionality. Retry this PS in the game only after that proof.
+Older diagnostic ISA capture:
+`yotei-integrated-20260926-070451-presentfix-gpuav/shaders/original/0168_new_shader_ps_f8927c09f4b928c7.rdna2`;
+current runtime memory values are not reconstructed from that ISA capture.
 
 ## Pending neighboring unaligned scalar-buffer read (2026-09-28)
 

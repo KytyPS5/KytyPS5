@@ -3,6 +3,31 @@
 Обновлено **28 сентября 2026 года**. Игра: **Ghost of Yōtei, PPSA26344**.
 Рабочая ветка — `yotei-windows-bringup` в локальном fork `fxpw/KytyPS5`.
 
+Checkpoint реального запуска `8cb79392` **28 сентября 2026 года**:
+
+- Committed native Windows MSVC Developer Environment build/install GREEN.
+  Retry `yotei-integrated-20260928-205136-menucheck-gpuav-sync`, 1280×720 GPUAV shader
+  instrumentation + SyncDiag, readback disabled. UTC 2026-09-28T20:51:37.4832364Z →
+  2026-09-28T20:53:17.8675287Z; natural exit321, maxShown119. Emulator SHA-256
+  `7A47287F763756571347A747D497C327686540C2A577786893B0644A0A9AFAE7`.
+- CS `8457901d80b91921` PASSED: 81 bounded columns preserve count65536,
+  materialization succeeds, SPIR-V54523 words, vkCreateComputePipelines Success
+  elapsed_ms2041, subsequent compute/draw work continues. Log references:
+  `_kyty.txt:5619740` / `:5619824`, stdout tail and stderr in the completed run.
+- New confirmed boundary: PS `f8927c09f4b928c7`, MaterializeResources /
+  BuildResourceSpecialization: inline sampled pairs exceed dense image limit;
+  size23184, stride368, probes1439, pairs297, accumulated images607.
+  No limit increase, error suppression or game-specific workaround.
+- DesktopCopy shown29/114 is black. No nonzero frame/menu/gameplay proof.
+  Emulator and other task-owned build/test processes closed. Committed-source
+  `Wave64ImageReadLoopAccumulatesWithoutFeedback` numerical neighbor also GREEN
+  (`bounded-scalar-budget-8cb79392-wave64-neighbor-20260928.txt`). Regression debt
+  records the new admission boundary and hypotheses for independent reproduction.
+- Normal push8cb79392 complete. Exact-source CI36482065792: Build/Test/Install GREEN on Windows/Linux/macOS;
+  overall run failed only at macOS artifact upload (`getaddrinfo ENOTFOUND` for
+  GitHub Actions blob storage). Documentation checkpoint push will retry CI;
+  do not call that overall run GREEN. Previous4db9964a CI36479506102 GREEN.
+
 Checkpoint finite scalar-buffer snapshot budgets **28 сентября 2026 года**:
 
 - Source `4db9964a` + generic materialization correction: descriptor-proven OOB
@@ -1407,12 +1432,12 @@ PC `0x530`; следующий blocker — runtime-происхождение DW
 
 | Уровень | Последний подтверждённый результат | Что этим ещё не доказано |
 | --- | --- | --- |
-| Установленный эмулятор | Windows `kyty_emulator` собран, install tree обновлён; SHA-256 `f6d4415238bcf971ea730067ed2a824a01c757d5113477fcdf579e548e683b37`. | Новый `--partitioned-graphics-loop-only`, sampled-depth и PS5 PlayGo regressions PASS; полный CTest отложен как test debt. |
-| Полная native Windows-сборка и CTest | Последняя завершённая стабильная серия: **48/48 PASS**. | После добавления persistent cache и последнего точечного отката полный suite ещё не повторён. |
-| Дополнительные CPU-проверки | Новый `pipeline_cache_identity` — **PASS**; прежний `--cooperative-wave64-admission-only` также PASS. | Нужен повтор после окончательной пересборки текущего дерева. |
-| Дополнительные проверки GPU/Vulkan | Persistent cache checkpointed семь раз до принудительной остановки, затем 7 069 215 байт успешно загружены; создание pipelines после checkpoints продолжилось. Прежний полный `--wave64-multiwave-lds-only`: **9/9 readback PASS**. | Cache не доказывает корректность пикселей и не сохраняет переведённый SPIR-V автоматически. |
-| CPU-аудит корпуса | `yotei-cfg-tail-20260907-02`: **825 manifests, 714 passed / 111 failed**; большой соседний `ps_00051f2c` сохранил прежний bounded fallback и завершился за 6,9 с. | `passed` означает достигнутую стадию статического аудита, а не готовность к GPU. |
-| Реальная игра | Максимум остаётся frame 158 / 145 shown в `_Build/runs/yotei-integrated-20260907-211101-9da340`. Текущий tree в `_Build/runs/yotei-integrated-20260908-121310-464eda` загрузил PlayGo 35 chunks и выпустил валидный `f8927c09f4b928c7`; 180-секундный GPUAV timeout остановил его на frame 131 / 117 shown. | Первый ненулевой видимый кадр не достигнут: новый readback `_Build/analysis/yotei-present-after-backedge-loopfix-gpuav-20260908.txt` для frames 110–117 показывает RGB=0, alpha=3. |
+| Установленный эмулятор | Committed `8cb79392`, native Windows build/install GREEN; SHA-256 `7A47287F763756571347A747D497C327686540C2A577786893B0644A0A9AFAE7`. | Build не доказывает пиксели. |
+| Native Windows CTest | Required checks22/22 GREEN (`bounded-scalar-budget-ctest-20260928.log`). | Полный compute/cache suite не GREEN: отдельные unaligned scalar и DCC/video-out debt. |
+| CPU regression | Finite scalar-buffer snapshot RED → GREEN; zero rows, wrap, zero work, exact/plus-one probe/storage caps и транзакционность. | Новый PS image-resource admission ещё требует независимой регрессии. |
+| GPU/Vulkan | FiniteScalarBufferDescriptorExtent numerical GREEN; scalar sparse store / upper EXEC / nested image neighbors GREEN. | Это synthetic coverage, не cross-game compatibility. |
+| CPU-аудит корпуса | Последний точечный5f3f audit GREEN в двух explicit legacy barrier profiles; исторический общий audit ниже. | Полный корпус после8cb79392 не повторён; audit не равен GPU результату. |
+| Реальная игра | Run `yotei-integrated-20260928-205136-menucheck-gpuav-sync`, maxShown119; CS845790 materialization/pipeline passed, PSf8927 image limit fails. | DesktopCopy shown29/114 чёрный; ненулевой кадр, меню и gameplay не подтверждены. |
 
 Доказательства предыдущего GDS-этапа:
 `_Build/gds-append-offset-regression/native-validation.json` и
@@ -1456,17 +1481,18 @@ cooperative SSBO, #459 и #476 — 46/46 за 39,24 с и 9 последоват
 
 | Поле | Значение |
 | --- | --- |
-| Source | `c8aaaa5b` (committed) |
+| Source | `8cb79392` (committed) |
 | Версия / каталог игры | `01.512.000`, `G:\games\Kyty\PPSA26344\PPSA26344` |
-| Завершённый run | `_Build/runs/yotei-integrated-20260928-202341-menucheck-gpuav-sync` |
-| SHA-256 emulator | `D110EC723793DA809EE0A236A4826AB2B30D70B7C4FDB04A8822DD458F450A10` |
-| Время UTC | `2026-09-28T20:23:41.2849348Z` → `20:25:49.1894739Z` |
-| Режим | Native Windows / RTX 5060 Ti, окно 1280×720, GPUAV shader instrumentation + SyncDiag; readback disabled |
-| Завершение | Естественный exit 321; task-owned processes закрыты |
-| Прогресс | maxShown=113; 5f3f passed; CS `8457901d80b91921` bounded SRT snapshot limit (count65536 / words131072) |
-| Пиксели | DesktopCopy shown=37/106: чёрная client area; ненулевой кадр / меню / gameplay не подтверждены |
-| Подтверждённый отдельный blocker | Старый saved `b90e…` standalone probe compiler crash; GPUAV позволяет пройти эту точку в игре |
-| Следующая проверка | Synthetic finite selector snapshot/budget regression, shared correction и pixel proof |
+| Завершённый run | `_Build/runs/yotei-integrated-20260928-205136-menucheck-gpuav-sync` |
+| SHA-256 emulator | `7A47287F763756571347A747D497C327686540C2A577786893B0644A0A9AFAE7` |
+| Время UTC | `2026-09-28T20:51:37.4832364Z` → `2026-09-28T20:53:17.8675287Z` |
+| Режим | Native Windows / RTX 5060 Ti, окно1280×720, GPUAV shader instrumentation + SyncDiag; readback disabled |
+| Завершение | Natural exit321; task-owned processes закрыты |
+| Прогресс | maxShown119; CS845790 passed (81 columns, SPIR-V54523 words, pipeline2041ms); PSf8927 inline sampled image admission fails |
+| Текущий blocker | PS `f8927c09f4b928c7`: size23184 stride368 probes1439 pairs297 accumulated images607 exceed dense image limit |
+| Пиксели | DesktopCopy shown29/114 чёрный; ненулевой кадр/меню/gameplay не подтверждены |
+| Подтверждённый отдельный blocker | Saved `b90e…` standalone NVIDIA compiler crash; GPUAV проходит эту точку в игре |
+| Следующая проверка | Independent multi-root sampled pair/domain/resource admission regression, candidate identity diagnostics и pixel proof |
 
 
 ### Исторические performance наблюдения (сентябрь 2026)

@@ -764,43 +764,61 @@ void TestBoundedComputeImageLoop() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   enum class Variant {
     Bounded, Plain, Nonzero, TrueEdge, WrongGuard, EntryBypass, ExitBypass, GuardBlock,
-    WrongStep, DivergentBound, DivergentKey, Disjunction, WrongPolarity
+    WrongStep, DivergentBound, DivergentKey, Disjunction, WrongPolarity,
+    IncrementBypass, PreviousBound, Masked, MaskedWrongGuard, MaskResurrection, StatusOverwrite
   };
   const auto make_plan = [](Variant variant) {
     Fixture fixture;
     fixture.program.wave_size = 64u;
+    const bool masked = variant >= Variant::Masked;
     auto *entry = fixture.block;
     auto *header = fixture.AddBlock();
     auto *body = fixture.AddBlock();
     auto *latch = fixture.AddBlock();
     auto *exit = fixture.AddBlock();
+    auto *compare = masked ? fixture.AddBlock() : header;
+    auto *guard = masked ? fixture.AddBlock() : header;
+    auto *increment = masked ? fixture.AddBlock() : latch;
+    auto *final_exit = variant == Variant::PreviousBound ? fixture.AddBlock() : exit;
     entry->AddBranch(header);
-    header->AddBranch(exit);
-    header->AddBranch(body);
-    body->AddBranch(latch);
-    latch->AddBranch(header);
-    if (variant == Variant::EntryBypass) entry->AddBranch(body);
-    if (variant == Variant::ExitBypass) exit->AddBranch(body);
-    fixture.program.block_info[0].terminator = {
-        .kind = variant == Variant::EntryBypass ? CFG::TerminatorKind::ConditionalBranch
-                                               : CFG::TerminatorKind::Branch,
-        .true_block = 1u, .false_block = 2u};
-    fixture.program.block_info[1].terminator = {
-        .kind = CFG::TerminatorKind::ConditionalBranch,
-        .true_block = variant == Variant::TrueEdge ? 2u : 4u,
-        .false_block = variant == Variant::TrueEdge ? 4u : 2u};
-    fixture.program.block_info[2].terminator = {
-        .kind = CFG::TerminatorKind::Branch, .true_block = 3u};
-    fixture.program.block_info[3].terminator = {
-        .kind = CFG::TerminatorKind::Branch, .true_block = 1u};
-    fixture.program.block_info[4].terminator = {
-        .kind = variant == Variant::ExitBypass ? CFG::TerminatorKind::Branch
-                                              : CFG::TerminatorKind::Return,
-        .true_block = 2u};
+    if (!masked) {
+      header->AddBranch(exit);
+      header->AddBranch(body);
+      body->AddBranch(latch);
+      latch->AddBranch(header);
+      if (variant == Variant::PreviousBound) latch->AddBranch(final_exit);
+      if (variant == Variant::EntryBypass) entry->AddBranch(body);
+      if (variant == Variant::ExitBypass) exit->AddBranch(body);
+      if (variant == Variant::IncrementBypass || variant == Variant::PreviousBound)
+        exit->AddBranch(latch);
+      fixture.program.block_info[0].terminator = {
+          .kind = variant == Variant::EntryBypass ? CFG::TerminatorKind::ConditionalBranch
+                                                 : CFG::TerminatorKind::Branch,
+          .true_block = 1u, .false_block = 2u};
+      fixture.program.block_info[1].terminator = {
+          .kind = CFG::TerminatorKind::ConditionalBranch,
+          .true_block = variant == Variant::TrueEdge ? 2u : 4u,
+          .false_block = variant == Variant::TrueEdge ? 4u : 2u};
+      fixture.program.block_info[2].terminator = {
+          .kind = CFG::TerminatorKind::Branch, .true_block = 3u};
+      fixture.program.block_info[3].terminator = {
+          .kind = variant == Variant::PreviousBound ? CFG::TerminatorKind::ConditionalBranch
+                                                   : CFG::TerminatorKind::Branch,
+          .true_block = 1u, .false_block = 5u};
+      fixture.program.block_info[4].terminator = {
+          .kind = final_exit != exit || variant == Variant::ExitBypass ||
+                          variant == Variant::IncrementBypass
+                      ? CFG::TerminatorKind::Branch : CFG::TerminatorKind::Return,
+          .true_block = final_exit != exit || variant == Variant::IncrementBypass ? 3u : 2u};
+      if (final_exit != exit)
+        fixture.program.block_info[5].terminator.kind = CFG::TerminatorKind::Return;
+    }
 
     auto &phi = header->AppendNewInst(ValueOpcode::Phi, {},
                                       static_cast<uint64_t>(Type::U32));
     const auto key = Value(&phi);
+    auto *previous = variant == Variant::PreviousBound ?
+        &header->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U1)) : nullptr;
     const auto local = fixture.Emit(
         ValueOpcode::GetBuiltin,
         {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)});
@@ -808,28 +826,98 @@ void TestBoundedComputeImageLoop() {
     const auto in_range = fixture.Emit(ValueOpcode::SLessThan32,
                                        {variant == Variant::WrongGuard
                                             ? Value(0u) : key,
-                                        count}, 0, header);
-    const auto active = fixture.Emit(ValueOpcode::INotEqual32,
-                                     {local, Value(0u)}, 0, header);
-    const auto allowed = fixture.Emit(variant == Variant::Disjunction
-                                         ? ValueOpcode::LogicalOr : ValueOpcode::LogicalAnd,
-                                      {in_range, active}, 0, header);
-    const bool nonzero = variant == Variant::Nonzero || variant == Variant::TrueEdge;
-    auto condition = allowed;
-    if (!nonzero)
-      condition = fixture.Emit(ValueOpcode::LogicalNot, {condition}, 0, header);
-    if (variant != Variant::Plain)
-      condition = fixture.Emit(ValueOpcode::ConditionRef, {condition},
-          nonzero ? CFG::BranchCondition::ExecNonZero
-                  : CFG::BranchCondition::ExecZero, header);
-    if (variant == Variant::Nonzero || variant == Variant::WrongPolarity)
-      condition = fixture.Emit(ValueOpcode::LogicalNot, {condition}, 0, header);
-    fixture.program.block_info[1].condition = condition;
+                                        count}, 0, compare);
+    const auto initial_active = fixture.Emit(ValueOpcode::INotEqual32,
+                                             {local, Value(0u)}, 0, entry);
+    if (masked) {
+      auto &active_phi = header->AppendNewInst(ValueOpcode::Phi, {},
+                                               static_cast<uint64_t>(Type::U1));
+      auto &saved_phi = header->AppendNewInst(ValueOpcode::Phi, {},
+                                              static_cast<uint64_t>(Type::U1));
+      auto &status_phi = header->AppendNewInst(ValueOpcode::Phi, {},
+                                               static_cast<uint64_t>(Type::U32));
+      const auto active = Value(&active_phi);
+      const auto saved = Value(&saved_phi);
+      const auto status = Value(&status_phi);
+      const auto mask = fixture.Emit(ValueOpcode::LogicalOr,
+          {fixture.Emit(ValueOpcode::LogicalAnd, {in_range, active}, 0, compare),
+           fixture.Emit(ValueOpcode::LogicalNot, {active}, 0, compare)}, 0, compare);
+      const auto next_saved = fixture.Emit(ValueOpcode::LogicalAnd,
+          {variant == Variant::MaskResurrection ? Value(true) : saved, mask}, 0, compare);
+      const auto execute = fixture.Emit(ValueOpcode::LogicalAnd, {active, mask}, 0, compare);
+      const auto body_status = fixture.Emit(ValueOpcode::SelectU32,
+          {execute, local, status}, 0, guard);
+      const auto next_active = fixture.Emit(ValueOpcode::LogicalAnd,
+          {next_saved, fixture.Emit(ValueOpcode::UGreaterThanEqual32,
+                                   {Value(3u), body_status}, 0, latch)}, 0, latch);
+      const auto next_status = fixture.Emit(ValueOpcode::SelectU32,
+          {variant == Variant::StatusOverwrite ? Value(true) : next_active,
+           Value(0u), body_status}, 0, increment);
+      active_phi.AddPhiOperand(entry, initial_active);
+      active_phi.AddPhiOperand(increment, next_active);
+      saved_phi.AddPhiOperand(entry, initial_active);
+      saved_phi.AddPhiOperand(increment, next_saved);
+      status_phi.AddPhiOperand(entry, local);
+      status_phi.AddPhiOperand(increment, next_status);
+      const auto branch = [&](uint32_t index, uint32_t yes, uint32_t no,
+                              Value predicate, CFG::BranchCondition kind) {
+        auto *block = fixture.program.blocks[index];
+        block->AddBranch(fixture.program.blocks[yes]);
+        block->AddBranch(fixture.program.blocks[no]);
+        const auto inverse = fixture.Emit(ValueOpcode::LogicalNot, {predicate}, 0, block);
+        fixture.program.block_info[index].condition =
+            fixture.Emit(ValueOpcode::ConditionRef, {inverse}, kind, block);
+        fixture.program.block_info[index].terminator = {
+            .kind = CFG::TerminatorKind::ConditionalBranch,
+            .true_block = yes, .false_block = no};
+      };
+      fixture.program.block_info[0].terminator = {
+          .kind = CFG::TerminatorKind::Branch, .true_block = 1u};
+      branch(1u, 4u, 5u, active, CFG::BranchCondition::ExecZero);
+      branch(5u, 4u, 6u, mask, CFG::BranchCondition::VccZero);
+      const auto image_guard = variant == Variant::MaskedWrongGuard ? active :
+          fixture.Emit(ValueOpcode::LogicalAnd,
+              {fixture.Emit(ValueOpcode::LogicalAnd, {execute, in_range}, 0, guard),
+               fixture.Emit(ValueOpcode::IEqual32, {local, Value(1u)}, 0, guard)}, 0, guard);
+      branch(6u, 3u, 2u, image_guard, CFG::BranchCondition::ExecZero);
+      body->AddBranch(latch);
+      fixture.program.block_info[2].terminator = {
+          .kind = CFG::TerminatorKind::Branch, .true_block = 3u};
+      branch(3u, 4u, 7u, next_active, CFG::BranchCondition::ExecZero);
+      increment->AddBranch(header);
+      fixture.program.block_info[7].terminator = {
+          .kind = CFG::TerminatorKind::Branch, .true_block = 1u};
+      fixture.program.block_info[4].terminator.kind = CFG::TerminatorKind::Return;
+    } else {
+      const auto active = initial_active;
+      const auto allowed = fixture.Emit(variant == Variant::Disjunction
+                                           ? ValueOpcode::LogicalOr : ValueOpcode::LogicalAnd,
+                                        {in_range, active}, 0, header);
+      const bool nonzero = variant == Variant::Nonzero || variant == Variant::TrueEdge;
+      auto condition = allowed;
+      if (!nonzero)
+        condition = fixture.Emit(ValueOpcode::LogicalNot, {condition}, 0, header);
+      if (variant != Variant::Plain)
+        condition = fixture.Emit(ValueOpcode::ConditionRef, {condition},
+            nonzero ? CFG::BranchCondition::ExecNonZero
+                    : CFG::BranchCondition::ExecZero, header);
+      if (variant == Variant::Nonzero || variant == Variant::WrongPolarity)
+        condition = fixture.Emit(ValueOpcode::LogicalNot, {condition}, 0, header);
+      fixture.program.block_info[1].condition = condition;
+      if (variant == Variant::PreviousBound) {
+        previous->AddPhiOperand(entry, Value(false));
+        previous->AddPhiOperand(latch, in_range);
+        const auto continuing = fixture.Emit(ValueOpcode::LogicalOr,
+            {in_range, Value(previous)}, 0, latch);
+        fixture.program.block_info[3].condition = fixture.Emit(ValueOpcode::ConditionRef,
+            {continuing}, CFG::BranchCondition::SccNonZero, latch);
+      }
+    }
     const auto step = fixture.Emit(ValueOpcode::IAdd32,
                                    {key, Value(variant == Variant::WrongStep ? 2u : 1u)},
-                                   0, latch);
+                                   0, increment);
     phi.AddPhiOperand(entry, variant == Variant::DivergentKey ? local : Value(0u));
-    phi.AddPhiOperand(latch, step);
+    phi.AddPhiOperand(increment, step);
 
     fixture.block = variant == Variant::GuardBlock ? header : body;
     const auto table = fixture.Address(fixture.UserData(0), fixture.UserData(1));
@@ -868,6 +956,13 @@ void TestBoundedComputeImageLoop() {
   make_plan(Variant::Plain);
   make_plan(Variant::Nonzero);
   make_plan(Variant::TrueEdge);
+  make_plan(Variant::Masked);
+  for (const auto variant : {Variant::IncrementBypass, Variant::PreviousBound,
+                             Variant::MaskedWrongGuard,
+                             Variant::MaskResurrection, Variant::StatusOverwrite}) {
+    CheckFatal([&] { make_plan(variant); }, "not a valid runtime value",
+               "compute image loop allowed an unbounded induction or mask resurrection");
+  }
   CheckFatal([&] { make_plan(Variant::WrongGuard); },
              "not a valid runtime value",
              "compute image loop accepted an unrelated guard");

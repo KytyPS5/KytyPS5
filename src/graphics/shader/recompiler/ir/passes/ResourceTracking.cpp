@@ -7,9 +7,11 @@
 
 #include <algorithm>
 #include <fmt/format.h>
+#include <map>
 #include <numeric>
 #include <optional>
 #include <span>
+#include <tuple>
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -82,6 +84,169 @@ uint32_t ByteExtent(const MemoryInfo& memory) {
 	const auto end   = static_cast<uint64_t>(memory.offset) + static_cast<uint64_t>(bytes) * count;
 	return end > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(end);
 }
+
+// Prove a loop cannot continue after its bound fails, both on entry and after an
+// arbitrary previous iteration. Header Phis are substituted simultaneously; all
+// unsupported expressions remain unconstrained. This state exists only while tracking.
+class LoopBoundProof {
+public:
+	LoopBoundProof(const Program& program, const Inst& induction, const Inst& bound)
+	    : m_program(program), m_induction(induction), m_bound(bound) {}
+
+	bool Excludes(Value condition, bool positive) {
+		for (uint32_t incoming = 0; incoming < m_induction.NumArgs(); ++incoming) {
+			m_incoming = m_induction.PhiBlock(incoming);
+			m_values[1].clear();
+			if (Evaluate(condition, true) != (positive ? 0u : 1u)) return false;
+		}
+		return true;
+	}
+
+private:
+	struct Node {
+		uint32_t variable = UINT32_MAX;
+		uint32_t low = 0;
+		uint32_t high = 0;
+	};
+
+	uint32_t NodeFor(uint32_t variable, uint32_t low, uint32_t high) {
+		if (low == high) return low;
+		const auto [it, inserted] = m_nodes_by_key.try_emplace(
+		    std::array {variable, low, high}, static_cast<uint32_t>(m_nodes.size()));
+		if (inserted) m_nodes.push_back({variable, low, high});
+		return it->second;
+	}
+
+	uint32_t Unknown(Type type) {
+		if (type == Type::U1) return NodeFor(m_variables++, 0u, 1u);
+		m_nodes.emplace_back();
+		return static_cast<uint32_t>(m_nodes.size() - 1u);
+	}
+
+	uint32_t Select(uint32_t condition, uint32_t yes, uint32_t no) {
+		if (condition == 0u) return no;
+		if (condition == 1u || yes == no) return yes;
+		if (yes == 1u && no == 0u) return condition;
+		const std::array key {condition, yes, no};
+		if (const auto found = m_choices.find(key); found != m_choices.end()) return found->second;
+		const auto variable = std::min({m_nodes[condition].variable, m_nodes[yes].variable,
+		                                m_nodes[no].variable});
+		const auto arm = [&](uint32_t value, bool high) {
+			const auto node = m_nodes[value];
+			return node.variable == variable ? (high ? node.high : node.low) : value;
+		};
+		const auto low = Select(arm(condition, false), arm(yes, false), arm(no, false));
+		const auto high = Select(arm(condition, true), arm(yes, true), arm(no, true));
+		const auto result = NodeFor(variable, low, high);
+		m_choices.emplace(key, result);
+		return result;
+	}
+
+	uint32_t Compare(const Inst& inst, uint32_t left, uint32_t right) {
+		const auto key = std::tuple {inst.GetOpcode(), inst.Flags<uint64_t>(), left, right};
+		if (const auto found = m_predicates.find(key); found != m_predicates.end()) return found->second;
+		const auto variable = std::min(m_nodes[left].variable, m_nodes[right].variable);
+		uint32_t result;
+		if (variable == UINT32_MAX) {
+			result = Unknown(Type::U1);
+		} else {
+			const auto lhs = m_nodes[left];
+			const auto rhs = m_nodes[right];
+			const auto low = Compare(inst, lhs.variable == variable ? lhs.low : left,
+			                         rhs.variable == variable ? rhs.low : right);
+			const auto high = Compare(inst, lhs.variable == variable ? lhs.high : left,
+			                          rhs.variable == variable ? rhs.high : right);
+			result = Select(NodeFor(variable, 0u, 1u), high, low);
+		}
+		m_predicates.emplace(key, result);
+		return result;
+	}
+
+	uint32_t Evaluate(Value value, bool current) {
+		value = value.Resolve();
+		if (value.IsImmediate()) {
+			if (value.GetType() == Type::U1) return value.U1() ? 1u : 0u;
+			for (const auto& [literal, node]: m_literals) {
+				if (literal == value) return node;
+			}
+			const auto node = Unknown(value.GetType());
+			m_literals.emplace_back(value, node);
+			return node;
+		}
+		const auto* inst = value.TryInstruction();
+		if (current && inst == &m_bound) return 0u;
+		auto& values = m_values[current];
+		if (const auto found = values.find(inst); found != values.end()) {
+			if (found->second == UINT32_MAX) found->second = Unknown(value.GetType());
+			return found->second;
+		}
+		const auto cached = values.emplace(inst, UINT32_MAX).first;
+		auto result = UINT32_MAX;
+		const auto arg = [&](uint32_t index) { return Evaluate(inst->Arg(index), current); };
+		switch (inst->GetOpcode()) {
+			case ValueOpcode::Phi: {
+				const auto invariant = ResolveInvariantPhi(m_program, value);
+				if (!invariant.IsEmpty()) {
+					result = Evaluate(invariant, current);
+				} else if (inst->Parent() == m_induction.Parent()) {
+					if (current) {
+						for (uint32_t i = 0; i < inst->NumArgs(); ++i) {
+							if (inst->PhiBlock(i) == m_incoming) result = Evaluate(inst->Arg(i), false);
+						}
+					}
+				} else if (inst->NumArgs() != 0u) {
+					result = arg(0);
+					for (uint32_t i = 1; i < inst->NumArgs(); ++i) {
+						if (arg(i) != result) { result = UINT32_MAX; break; }
+					}
+				}
+				break;
+			}
+			case ValueOpcode::LogicalNot: result = Select(arg(0), 0u, 1u); break;
+			case ValueOpcode::LogicalAnd: {
+				const auto left = arg(0);
+				result = left == 0u ? 0u : Select(left, arg(1), 0u);
+				break;
+			}
+			case ValueOpcode::LogicalOr: {
+				const auto left = arg(0);
+				result = left == 1u ? 1u : Select(left, 1u, arg(1));
+				break;
+			}
+			case ValueOpcode::SelectU1:
+			case ValueOpcode::SelectU32: {
+				const auto condition = arg(0);
+				result = condition == 0u ? arg(2) : condition == 1u ? arg(1)
+				                                                   : Select(condition, arg(1), arg(2));
+				break;
+			}
+			default:
+				if (inst->GetType() == Type::U1 && inst->NumArgs() == 2u &&
+				    inst->Arg(0).GetType() == Type::U32 && inst->Arg(1).GetType() == Type::U32)
+					result = Compare(*inst, arg(0), arg(1));
+				break;
+		}
+		// Only unsupported values and cycles need free variables.
+		if (result == UINT32_MAX) {
+			if (cached->second == UINT32_MAX) cached->second = Unknown(value.GetType());
+			return cached->second;
+		}
+		cached->second = result;
+		return result;
+	}
+
+	const Program& m_program;
+	const Inst& m_induction;
+	const Inst& m_bound;
+	const Block* m_incoming = nullptr;
+	uint32_t m_variables = 0;
+	std::vector<Node> m_nodes {{}, {}};
+	std::vector<std::pair<Value, uint32_t>> m_literals;
+	std::array<std::map<const Inst*, uint32_t>, 2> m_values;
+	std::map<std::array<uint32_t, 3>, uint32_t> m_nodes_by_key;
+	std::map<std::array<uint32_t, 3>, uint32_t> m_choices;
+	std::map<std::tuple<ValueOpcode, uint64_t, uint32_t, uint32_t>, uint32_t> m_predicates;
+};
 
 class Tracker {
 public:
@@ -762,28 +927,6 @@ private:
 		}
 	}
 
-	const Block* FindBlock(uint32_t id) const {
-		const auto info = std::ranges::find(m_program.block_info, id, &BlockInfo::id);
-		return info == m_program.block_info.end()
-		           ? nullptr
-		           : m_program.blocks[info - m_program.block_info.begin()];
-	}
-
-	bool CanReach(const Block* start, const Block* target, const Block* avoid) const {
-		std::vector<const Block*> pending {start};
-		std::vector<const Block*> visited;
-		while (!pending.empty()) {
-			const auto* block = pending.back();
-			pending.pop_back();
-			if (block == nullptr || block == avoid ||
-			    std::ranges::find(visited, block) != visited.end()) continue;
-			if (block == target) return true;
-			visited.push_back(block);
-			for (const auto* next: block->ImmSuccessors()) pending.push_back(next);
-		}
-		return false;
-	}
-
 	std::optional<EdgePredicate> ConditionalEdge(const Block* from, const Block* to) const {
 		const auto position = std::ranges::find(m_program.blocks, from);
 		const auto target = std::ranges::find(m_program.blocks, to);
@@ -1082,47 +1225,49 @@ private:
 		const auto* phi = key.Resolve().TryInstruction();
 		if (m_shader_writes || phi == nullptr || phi->GetOpcode() != ValueOpcode::Phi ||
 		    phi->GetType() != Type::U32 || phi->NumArgs() != 2u ||
-		    m_program.blocks.size() != m_program.block_info.size()) {
-			return {};
-		}
-		bool induction = false;
+		    m_program.blocks.size() != m_program.block_info.size()) return {};
+		const Block* increment_block = nullptr;
 		for (uint32_t initial = 0; initial < 2u; ++initial) {
 			const auto zero = phi->Arg(initial).Resolve();
 			const auto* step = phi->Arg(initial ^ 1u).Resolve().TryInstruction();
 			if (!zero.IsImmediate() || zero.GetType() != Type::U32 || zero.U32() != 0u ||
 			    step == nullptr || step->GetOpcode() != ValueOpcode::IAdd32 ||
-			    step->Parent() != phi->PhiBlock(initial ^ 1u)) {
-				continue;
-			}
+			    step->Parent() != phi->PhiBlock(initial ^ 1u)) continue;
 			uint32_t increment = 0;
-			induction = (step->Arg(0).Resolve() == key &&
-			             ImmediateU32(step->Arg(1), increment) && increment == 1u) ||
-			            (step->Arg(1).Resolve() == key &&
-			             ImmediateU32(step->Arg(0), increment) && increment == 1u);
-			if (induction) break;
+			if ((step->Arg(0).Resolve() == key &&
+			     ImmediateU32(step->Arg(1), increment) && increment == 1u) ||
+			    (step->Arg(1).Resolve() == key &&
+			     ImmediateU32(step->Arg(0), increment) && increment == 1u)) {
+				increment_block = step->Parent();
+				break;
+			}
 		}
-		if (!induction) return {};
+		if (increment_block == nullptr) return {};
 
+		const auto guarded_on_entry = [&](const Block* block, const auto& accepts) {
+			for (size_t depth = 0; block != phi->Parent() &&
+			     depth < m_program.blocks.size(); ++depth) {
+				if (block->ImmPredecessors().size() != 1u) return false;
+				const auto* previous = block->ImmPredecessors()[0];
+				const auto edge = ConditionalEdge(previous, block);
+				if (edge && accepts(*edge)) return true;
+				block = previous;
+			}
+			return false;
+		};
 		for (const auto& use_of_key: phi->Uses()) {
 			const auto* compare = use_of_key.user;
 			if (compare->GetOpcode() != ValueOpcode::SLessThan32 || use_of_key.operand != 0u ||
 			    !ValidateRuntimeValue(m_program, compare->Arg(1))) continue;
-			const auto position = std::ranges::find(m_program.blocks, compare->Parent());
-			if (position == m_program.blocks.end()) continue;
-			const auto* block = *position;
-			const auto& info = m_program.block_info[position - m_program.blocks.begin()];
-			if (info.terminator.kind != CFG::TerminatorKind::ConditionalBranch || use == block ||
-			    CanReach(m_program.blocks.front(), use, block) ||
-			    CanReach(phi->Parent(), use, block)) continue;
-			const auto* yes = FindBlock(info.terminator.true_block);
-			const auto* no = FindBlock(info.terminator.false_block);
-			const bool yes_reaches = CanReach(yes, use, phi->Parent());
-			const bool no_reaches = CanReach(no, use, phi->Parent());
-			if (yes_reaches == no_reaches) continue;
-			const auto edge = ConditionalEdge(block, yes_reaches ? yes : no);
-			// Native wave control makes the induction and bound uniform; one lane suffices.
-			if (edge && edge->positive && Implies(edge->condition, Value(use_of_key.user)))
-				return compare->Arg(1);
+			if (!guarded_on_entry(use, [&](const EdgePredicate& edge) {
+				return edge.positive && Implies(edge.condition, Value(use_of_key.user));
+			})) continue;
+			LoopBoundProof proof(m_program, *phi, *compare);
+			// The image bound and the increment guard are separate obligations: a
+			// skipped image alone does not prevent signed induction wraparound.
+			if (guarded_on_entry(increment_block, [&](const EdgePredicate& edge) {
+				return proof.Excludes(edge.condition, edge.positive);
+			})) return compare->Arg(1);
 		}
 		return {};
 	}

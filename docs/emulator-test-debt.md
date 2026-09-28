@@ -1,5 +1,33 @@
 # Emulator regression test debt
 
+## Bounded descriptor stores through scalar ConditionRef (2026-09-28)
+
+Retry on 5b63741c (`yotei-integrated-20260928-174752-menucheck-gpuav-sync`)
+rejects CS d8959888aafd2552 at PC 0x1b4, BUFFER_STORE_DWORD. This is a store,
+not the single-DWORD read assumed during initial diagnosis. Preserve the GPU-selected
+write rejection. CPU-only legacy-profile diagnostic reproduces the same boundary;
+its needs_lds_barriers=false is an explicit diagnostic assumption, not a new capture.
+The bounded loop proof unwraps LogicalNot but not scalar ConditionRef introduced
+by upstream CFG. Before production edits, add six positive descriptor-store loop
+cases (SCC zero/nonzero, unsigned/reversed/signed comparison) and eight rejection
+neighbors (wrong success edge, pre-guard read, nonunit step, guarded pointer).
+Keep live induction keys, host snapshot limits and runtime store semantics.
+CPU RED confirmed: `bounded-condition-cpu-red-20260928.txt.stderr`, exit 1;
+first SCC-wrapped descriptor store loses its bounded table and fails host validation.
+The unrelated x1-read experiment is preserved outside source in
+`_Build/analysis/indirect-dword-experiment-20260928.patch` and reverted from source.
+
+GREEN: unchanged six positives/eight rejection neighbors; four additional EXEC/VCC
+reduction cases remain rejected (`bounded-condition-cpu-boundaries-green-20260928.txt`).
+Unwrap only SCC ConditionRef and preserve polarity from its already-decoded operand.
+Numerical native-CFG BoundedBufferScalarLoopStore{1,3}{Full,Sparse} pass complete
+output/SRT/sentinel comparison and SPIR-V validation. Four existing zero-stride
+Raw/Formatted/D16/Scalar neighbors GREEN. Captured d895 CPU resource tracking
+passes both explicit barrier diagnostic variants; materialization/GPU/game proof
+is not inferred from that CPU audit. Native build3 and CTest 22/22 GREEN
+(`bounded-condition-fix-build3-20260928.log`, `bounded-condition-ctest-20260928.log`).
+
+
 ## GPU-selected raw buffer fallback integration (2026-09-28)
 
 Game retry on a233dfe1 `yotei-integrated-20260928-173637-menucheck-gpuav-sync`

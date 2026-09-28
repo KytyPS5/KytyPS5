@@ -799,13 +799,7 @@ public:
 		    latch_update.TryInstruction()->Parent() == latch && Dominates(read.Parent(), latch)) {
 			auto latch_condition = latch_info.condition.Resolve();
 			bool latch_invert = false;
-			std::unordered_set<const Inst*> latch_condition_visited;
-			while (const auto* inst = latch_condition.TryInstruction()) {
-				if (!latch_condition_visited.insert(inst).second) return {};
-				if (inst->GetOpcode() != ValueOpcode::LogicalNot || inst->NumArgs() != 1u) break;
-				latch_invert = !latch_invert;
-				latch_condition = inst->Arg(0).Resolve();
-			}
+			if (!UnwrapScalarCondition(latch_condition, latch_invert)) return {};
 			const auto* compare = latch_condition.TryInstruction();
 			const auto repeat_id = latch_invert ? latch_info.terminator.false_block
 			                                    : latch_info.terminator.true_block;
@@ -843,13 +837,7 @@ public:
 		if (info.terminator.kind != CFG::TerminatorKind::ConditionalBranch) return {};
 		auto condition = info.condition.Resolve();
 		bool invert = false;
-		std::unordered_set<const Inst*> condition_visited;
-		while (const auto* inst = condition.TryInstruction()) {
-			if (!condition_visited.insert(inst).second) return {};
-			if (inst->GetOpcode() != ValueOpcode::LogicalNot || inst->NumArgs() != 1u) break;
-			invert = !invert;
-			condition = inst->Arg(0).Resolve();
-		}
+		if (!UnwrapScalarCondition(condition, invert)) return {};
 		const auto* compare = condition.TryInstruction();
 		if (compare == nullptr || compare->NumArgs() != 2u) return {};
 		Value count;
@@ -881,6 +869,26 @@ public:
 	}
 
 private:
+	static bool UnwrapScalarCondition(Value& condition, bool& invert) {
+		std::unordered_set<const Inst*> visited;
+		while (const auto* inst = condition.TryInstruction()) {
+			if (!visited.insert(inst).second) return false;
+			if (inst->GetOpcode() == ValueOpcode::LogicalNot && inst->NumArgs() == 1u) {
+				invert = !invert;
+			} else if (inst->GetOpcode() == ValueOpcode::ConditionRef && inst->NumArgs() == 1u) {
+				const auto kind = inst->Flags<CFG::BranchCondition>();
+				// SCC's operand is already the complete branch predicate. EXEC/VCC
+				// need lane reductions and cannot establish this scalar loop proof.
+				if (kind != CFG::BranchCondition::SccZero &&
+				    kind != CFG::BranchCondition::SccNonZero) break;
+			} else {
+				break;
+			}
+			condition = inst->Arg(0).Resolve();
+		}
+		return true;
+	}
+
 	std::optional<uint32_t> FiniteMaximum(Value value) {
 		value = value.Resolve();
 		if (value.GetType() != Type::U32) return {};

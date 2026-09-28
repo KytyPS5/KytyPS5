@@ -2960,6 +2960,54 @@ void TestBoundedSrtTrackingProofBoundaries() {
 
 }
 
+void TestBoundedSrtScalarConditionRefs() {
+  for (const auto kind : {CFG::BranchCondition::SccZero, CFG::BranchCondition::SccNonZero}) {
+    for (const auto scenario : {BoundedSrtScenario::Valid, BoundedSrtScenario::ReversedGuard,
+                                BoundedSrtScenario::SignedGuard}) {
+      auto test = MakeBoundedSrtTrackingFixture(scenario);
+      auto& fixture = *test.fixture;
+      auto& info = fixture.program.block_info[1];
+      info.condition = fixture.Emit(ValueOpcode::ConditionRef, {info.condition}, kind,
+                                    fixture.program.blocks[1]);
+      fixture.PlanAndTrack();
+      Check(fixture.program.resource_tracking_complete && fixture.program.info.buffers.size() == 1u &&
+                !fixture.program.info.uses_dma,
+            "scalar ConditionRef lost bounded descriptor store table");
+      for (const auto word : test.descriptor_words) {
+        const auto* read = word.Resolve().TryInstruction();
+        Check(read != nullptr && read->GetOpcode() == ValueOpcode::ReadBoundedSrtU32 &&
+                  read->Arg(0).Resolve() == test.index,
+              "scalar ConditionRef discarded descriptor induction index");
+      }
+    }
+    for (const auto scenario : {BoundedSrtScenario::WrongSuccessEdge,
+                                BoundedSrtScenario::ReadBeforeGuard,
+                                BoundedSrtScenario::NonunitStep,
+                                BoundedSrtScenario::GuardedPointerLoad}) {
+      auto test = MakeBoundedSrtTrackingFixture(scenario);
+      auto& fixture = *test.fixture;
+      auto& info = fixture.program.block_info[1];
+      info.condition = fixture.Emit(ValueOpcode::ConditionRef, {info.condition}, kind,
+                                    fixture.program.blocks[1]);
+      BuildSrtPlan(fixture.program);
+      CheckFatal([&] { TrackResources(fixture.program); }, "not a valid runtime value",
+                 "scalar ConditionRef admitted an unproved descriptor store table");
+    }
+  }
+  for (const auto kind : {CFG::BranchCondition::ExecZero, CFG::BranchCondition::ExecNonZero,
+                          CFG::BranchCondition::VccZero, CFG::BranchCondition::VccNonZero}) {
+    auto test = MakeBoundedSrtTrackingFixture(BoundedSrtScenario::Valid);
+    auto& fixture = *test.fixture;
+    auto& info = fixture.program.block_info[1];
+    info.condition = fixture.Emit(ValueOpcode::ConditionRef, {info.condition}, kind,
+                                  fixture.program.blocks[1]);
+    BuildSrtPlan(fixture.program);
+    CheckFatal([&] { TrackResources(fixture.program); }, "not a valid runtime value",
+               "wave reduction was silently treated as scalar bounded-loop guard");
+  }
+  std::cout << "KYTY_BOUNDED_SRT_SCALAR_CONDITION_REF_PASS positives=6 negatives=12\n";
+}
+
 struct DispatcherSignedBufferLoopFixture {
   std::unique_ptr<Fixture> fixture;
   std::array<Value, 4> descriptor_words;
@@ -7071,6 +7119,10 @@ int main(int argc, char** argv) {
       std::cout << "KYTY_HETEROGENEOUS_INDIRECT_IMAGES_PASS\n";
       return 0;
     }
+    if (argc == 2 && std::strcmp(argv[1], "--bounded-srt-scalar-condition-ref-only") == 0) {
+      TestBoundedSrtScalarConditionRefs();
+      return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--dispatcher-signed-buffer-loop-only") == 0) {
       TestDispatcherSignedBufferLoop();
       std::cout << "KYTY_DISPATCHER_SIGNED_BUFFER_LOOP_PASS\n";
@@ -7193,6 +7245,7 @@ int main(int argc, char** argv) {
     Run("workgroup SRT zero dispatch and limits", TestWorkgroupSrtZeroDispatchAndProbeLimit);
     Run("workgroup SRT offsets and aliases", TestWorkgroupSrtWrappedOffsetsAndWriteAliases);
     Run("bounded SRT tracking proof", TestBoundedSrtTrackingProofBoundaries);
+    Run("bounded SRT scalar ConditionRef", TestBoundedSrtScalarConditionRefs);
     Run("bounded SRT split header", TestBoundedSrtSplitHeaderUniformCount);
     Run("bounded SRT shared memory count", TestBoundedSrtSplitHeaderSharedMemoryCount);
     Run("TestBoundedMaterializationAddressesAndSnapshot", TestBoundedMaterializationAddressesAndSnapshot);

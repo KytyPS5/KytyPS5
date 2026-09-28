@@ -3,6 +3,28 @@
 Обновлено **28 сентября 2026 года**. Игра: **Ghost of Yōtei, PPSA26344**.
 Рабочая ветка — `yotei-windows-bringup` в локальном fork `fxpw/KytyPS5`.
 
+Checkpoint bounded scalar ConditionRef **28 сентября 2026 года**:
+
+- `5b63741c` собран/установлен и normal-pushed; exact-head CI `36460716685`
+  GREEN Windows/Linux/macOS. Retry `yotei-integrated-20260928-174752-menucheck-gpuav-sync`:
+  UTC 17:47:52.4257579 → 17:48:02.6048640, 1280×720 GPUAV+SyncDiag,
+  естественный exit 321, shown=0. SHA-256 emulator
+  `953452159F914977933A2144DE78FDF78E8EDF4EF46EF2FE2D74856FC5884E01`.
+- CS `d8959888aafd2552`, PC 0x1b4 — **BUFFER_STORE_DWORD**, а не single-DWORD
+  load. Raw vector fallback исправлен независимо, но этой записи недостаточно.
+  Эксперимент x1 сохранён в ignored analysis patch и убран из исходников.
+- CPU RED доказал, что bounded loop proof теряет SCC `ConditionRef` нового CFG.
+  Общая коррекция снимает только scalar SCC wrapper, сохраняя polarity,
+  induction/guard/root proofs и snapshot budgets; GPU-selected writes запрещены.
+- GREEN: 6 положительных / 12 отрицательных CPU cases, numerical native-CFG
+  descriptor-store loops 1/3 × Full/Sparse **4/4**, bounded zero-stride neighbors
+  **4/4**, native emulator/launcher/kyty_tests build и required CTest **22/22**.
+  Логи `bounded-condition-{cpu-boundaries-green,gpu-*,neighbor-*,ctest}-20260928.*`.
+  Legacy captured shader CPU audit GREEN в двух явно заданных barrier variants;
+  это не подтверждение materialization/GPU/frame.
+- Committed install/game retry с этим исправлением pending. Первый ненулевой
+  кадр, меню и gameplay не подтверждены.
+
 Checkpoint GPU-selected raw buffers **28 сентября 2026 года**:
 
 - `a233dfe1` собран/установлен и normal-pushed; exact-head GitHub CI
@@ -21,8 +43,8 @@ Checkpoint GPU-selected raw buffers **28 сентября 2026 года**:
   Два numerical GPU-descriptor fixtures проходят прежние oracles для 11
   variations bounds/swizzle/OOB/unmapped, без fake host binding.
   Логи `indirect-buffer-{specialization-green,ctest,final-*}-20260928.*`.
-- Committed build/install/game retry с этим исправлением pending;
-  первый ненулевой кадр/меню/gameplay пока не подтверждены.
+- Committed build/install/retry `5b63741c` завершены; его результат приведён
+  в следующем checkpoint выше. Первый ненулевой кадр/меню/gameplay не подтверждены.
 
 Checkpoint ordinary scalar payload **28 сентября 2026 года**:
 
@@ -1306,17 +1328,17 @@ cooperative SSBO, #459 и #476 — 46/46 за 39,24 с и 9 последоват
 
 | Поле | Значение |
 | --- | --- |
-| Source | `1c421608` + сохранённый WIP, включая graphics wave64 routing; banner dirty |
+| Source | `5b63741c` (committed) |
 | Версия / каталог игры | `01.512.000`, `G:\games\Kyty\PPSA26344\PPSA26344` |
-| Завершённый run | `_Build/runs/yotei-integrated-20260927-183108-menucheck-gpuav-sync` |
-| SHA-256 emulator | `D2D853FD3CFBB702CAD8D56B2807F7D9B3991527BD6E49BE54CB1EB9963E6756` |
-| Время UTC | `2026-09-27T18:31:08.9441677Z` → `18:45:17.0610260Z` |
-| Режим | Native Windows / RTX 5060 Ti, окно 1280×720, FIFO, GPUAV shader instrumentation + SyncDiag; prepared surface 480×270 |
-| Завершение | Вручную закрыт task-owned процесс для актуализации ветки по новой команде пользователя; exit -1, не самостоятельный emulator crash |
-| Прогресс | maxShown=154; прежний аварийный indexed draw с VS `e312…` ещё не достигнут |
-| Пиксели | 34 readback кадров 120–153: RGB=0, alpha=3; меню / новый ненулевой кадр не подтверждены |
-| Подтверждённый отдельный blocker | Probe на старом сохранённом `b90e…` после reboot всё ещё падает внутри pipeline compilation. GPUAV instrumentation позволяет продвигать игру дальше |
-| Следующая проверка | После интеграции upstream и native rebuild повторить bounded run с пиксельным capture; проверить прежний draw, затем узнаваемое меню |
+| Завершённый run | `_Build/runs/yotei-integrated-20260928-174752-menucheck-gpuav-sync` |
+| SHA-256 emulator | `953452159F914977933A2144DE78FDF78E8EDF4EF46EF2FE2D74856FC5884E01` |
+| Время UTC | `2026-09-28T17:47:52.4257579Z` → `17:48:02.6048640Z` |
+| Режим | Native Windows / RTX 5060 Ti, окно 1280×720, GPUAV shader instrumentation + SyncDiag; readback disabled |
+| Завершение | Естественный exit 321; task-owned processes закрыты |
+| Прогресс | shown=0; CS `d8959888aafd2552` PC 0x1b4 BUFFER_STORE_DWORD, dynamic buffer descriptor rejected |
+| Пиксели | Ненулевой кадр / меню / gameplay не подтверждены |
+| Подтверждённый отдельный blocker | Старый saved `b90e…` standalone probe compiler crash; GPUAV позволяет пройти эту точку в игре |
+| Следующая проверка | Committed scalar ConditionRef fix: materialization, game retry, затем пиксельное подтверждение |
 
 
 ### Исторические performance наблюдения (сентябрь 2026)

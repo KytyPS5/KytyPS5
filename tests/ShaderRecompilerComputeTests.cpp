@@ -30487,7 +30487,64 @@ TestCase BufferStoreFormatXDropsOutOfRangeRecord() {
 }
 
 // Dispatch-uniform descriptors from an immutable two-entry SRT. Only the
-// selected zero-stride mode-0 entry is OOB; sparse EXEC preserves inactive VGPRs.
+// A bounded scalar loop selects writable descriptors from an immutable SRT.
+TestCase BoundedBufferScalarLoopStore(u32 count, bool sparse) {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = count == 1 ? (sparse ? "BoundedBufferScalarLoopStore1Sparse"
+                                 : "BoundedBufferScalarLoopStore1Full")
+                         : (sparse ? "BoundedBufferScalarLoopStore3Sparse"
+                                   : "BoundedBufferScalarLoopStore3Full");
+  test.has_compute_info = test.has_user_data = true;
+  test.compute_info = {};
+  test.compute_info.threads_num[0] = 4;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = 32;
+  test.initial.assign(76, 0xdeadbeefu);
+  for (u32 row = 0; row < 3; ++row) {
+    const std::array<u32, 4> descriptor{row * 16u, 4u << 16u, 4u, 0u};
+    std::copy(descriptor.begin(), descriptor.end(), test.initial.begin() + 64 + row * 4);
+  }
+  test.expected = test.initial;
+  test.user_data = MakeStructuredStorageBufferData(4, 12);
+  test.user_data[8] = 256; // Immutable descriptor table, beyond every store.
+  test.user_data[10] = count;
+  test.buffer_addresses_are_backing_offsets = true;
+  test.required_spirv = {"OpSwitch"};
+  auto& code = test.code;
+  AppendSMovLiteral(&code, 20, 0);
+  if (sparse) code.push_back(EncodeSop1(0x04, 126, InlineU32(5)));
+  const size_t guard = code.size();
+  code.push_back(EncodeSopc(0x0a, 20, 10)); // i < runtime count.
+  const size_t exit_branch = code.size();
+  code.push_back(0u);
+  code.push_back(EncodeSop2(0x1e, 21, 20, InlineU32(4)));
+  code.push_back(EncodeSmem0(0x02, 24, 4)); // s[24:27] = SRT[i].
+  code.push_back(EncodeSmem1(0, 21));
+  code.push_back(EncodeSopp(0x0c, 0));
+  code.push_back(EncodeVop1(0x01, 4, 20));
+  AppendVMovLiteral(&code, 5, 100u);
+  code.push_back(EncodeVop2(0x25, 4, Vgpr(5), 4));
+  code.push_back(EncodeMubuf0(0x1c, 0, true, false)); // idxen store to selected row.
+  code.push_back(EncodeMubuf1(4, 6, 0));
+  code.push_back(EncodeSop2(0x00, 20, 20, InlineU32(1)));
+  const auto back = static_cast<int32_t>(guard) - static_cast<int32_t>(code.size() + 1u);
+  code.push_back(EncodeSopp(0x02, static_cast<u32>(back)));
+  code[exit_branch] = EncodeSopp(0x04, code.size() - exit_branch - 1u);
+  AppendEnd(&code);
+  for (u32 row = 0; row < count; ++row)
+    for (u32 lane = 0; lane < 4; ++lane)
+      if (!sparse || lane == 0 || lane == 2) test.expected[row * 4 + lane] = 100u + row;
+  test.opcodes = {O::S_MOV_B32, O::S_CMP_LT_U32, O::S_CBRANCH_SCC0,
+                  O::S_LSHL_B32, O::S_LOAD_DWORDX4, O::S_WAITCNT, O::V_MOV_B32,
+                  O::V_ADD_NC_U32, O::BUFFER_STORE_DWORD, O::S_ADD_U32,
+                  O::S_BRANCH, O::S_ENDPGM};
+  if (sparse) test.opcodes.push_back(O::S_MOV_B64);
+  test.decoded_counts = {{"S_CBRANCH_SCC0", 1u}, {"BUFFER_STORE_DWORD ", 1u}};
+  return test;
+}
+
 TestCase BoundedBufferZeroStrideCandidates(u32 variant) {
   using O = ShaderOpcode;
   TestCase test;
@@ -38288,6 +38345,10 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferZeroStrideOobFormatsAndWidths);
   for (u32 variant = 0; variant < 4; ++variant)
     cases.push_back(BoundedBufferZeroStrideCandidates(variant));
+  for (const auto count : {1u, 3u}) {
+    cases.push_back(BoundedBufferScalarLoopStore(count, false));
+    cases.push_back(BoundedBufferScalarLoopStore(count, true));
+  }
   AddCase(TBufferLoadFormatXyzwSnapshotsOverlappingAddress);
   AddCase(TBufferLoadFormatXyzwPackedSnapshotsOverlappingAddress);
   AddCase(TBufferLoadFormatX8UintZeroExtendsByte);

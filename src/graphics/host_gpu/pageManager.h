@@ -18,6 +18,9 @@ public:
 
 	KYTY_CLASS_NO_COPY(PageManager);
 
+	// Whether cache tracking currently restricts access to the page holding vaddr.
+	[[nodiscard]] bool IsWatched(uint64_t vaddr) const;
+
 	template <bool track, bool is_read = false>
 	void UpdatePageWatchers(uint64_t vaddr, uint64_t size);
 	template <bool track, bool is_read = false>

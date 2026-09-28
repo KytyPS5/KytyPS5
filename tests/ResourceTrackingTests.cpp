@@ -1031,11 +1031,16 @@ void TestBoundedComputeImageLoop() {
 void TestUniformizedMaterialImageKeys() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   enum class Variant {
-    Valid, Plain, WrongUpdate, WrongEquality, WrongExit, WrongCarry, WrongBackedge
+    Valid, Plain, WrongUpdate, WrongEquality, WrongExit, WrongCarry, WrongBackedge,
+    AndNot, Subset, FirstLane, FirstLaneDirect, FirstLaneAndNot, EmptyFirstEntry, WrongFirstBackedge,
+    WideningFirstEntry, WideningFirstBackedge, WrongFirstLoadMask
   };
   const auto make_plan = [](Variant variant) {
     Fixture fixture;
     fixture.program.wave_size = 64u;
+    const bool first_lane = variant >= Variant::FirstLane;
+    const bool first_lane_loop = first_lane && variant != Variant::FirstLaneDirect;
+    const uint32_t sample_entry_id = first_lane_loop ? 10u : 9u;
     const auto branch = [&](Value predicate, CFG::BranchCondition kind, Block *block) {
       return variant == Variant::Plain ? predicate : fixture.Emit(
           ValueOpcode::ConditionRef, {predicate}, kind, block);
@@ -1049,6 +1054,8 @@ void TestUniformizedMaterialImageKeys() {
     auto *choose = fixture.AddBlock();
     auto *sample = fixture.AddBlock();
     auto *done = fixture.AddBlock();
+    auto *sample_header = first_lane_loop ? fixture.AddBlock() : nullptr;
+    auto *sample_entry = first_lane ? fixture.AddBlock() : nullptr;
     entry->AddBranch(header);
     header->AddBranch(inactive);
     inactive->AddBranch(merge);
@@ -1058,8 +1065,20 @@ void TestUniformizedMaterialImageKeys() {
     bit->AddBranch(header);
     bit->AddBranch(merge);
     merge->AddBranch(choose);
-    choose->AddBranch(sample);
+    choose->AddBranch(first_lane ? sample_entry : sample);
     choose->AddBranch(done);
+    if (first_lane) {
+      sample_entry->AddBranch(first_lane_loop ? sample_header : sample);
+      fixture.program.block_info[sample_entry_id].terminator = {
+          .kind = CFG::TerminatorKind::Branch, .true_block = first_lane_loop ? 9u : 7u};
+    }
+    if (first_lane_loop) {
+      sample_header->AddBranch(sample);
+      sample->AddBranch(sample_header);
+      fixture.program.block_info[9].terminator = {
+          .kind = CFG::TerminatorKind::Branch, .true_block = 7u,
+          .merge_block = 8u, .continue_block = 7u, .loop_header = true};
+    }
     sample->AddBranch(done);
     fixture.program.block_info[0].terminator = {
         .kind = CFG::TerminatorKind::Branch, .true_block = 1u};
@@ -1102,9 +1121,15 @@ void TestUniformizedMaterialImageKeys() {
         ValueOpcode::BitwiseAnd32, {first, Value(31u)}, 0, bit);
     const auto one_bit = fixture.Emit(
         ValueOpcode::ShiftLeftLogical32, {Value(1u), position}, 0, bit);
+    const bool and_not = variant == Variant::AndNot || variant == Variant::FirstLaneAndNot;
+    const auto removed = and_not
+        ? fixture.Emit(ValueOpcode::BitwiseNot32, {one_bit}, 0, bit)
+        : variant == Variant::Subset ? fixture.UserData(7u) : one_bit;
     const auto cleared = fixture.Emit(
-        variant == Variant::WrongUpdate ? ValueOpcode::BitwiseOr32 : ValueOpcode::BitwiseXor32,
-        {mask, one_bit}, 0, bit);
+        variant == Variant::WrongUpdate ? ValueOpcode::BitwiseOr32
+        : and_not || variant == Variant::Subset ? ValueOpcode::BitwiseAnd32
+                                              : ValueOpcode::BitwiseXor32,
+        {mask, removed}, 0, bit);
     const auto continuation = fixture.Emit(
         ValueOpcode::LogicalAnd, {bit_guard, active_on_entry}, 0, bit);
     fixture.program.block_info[4].condition = branch(
@@ -1155,25 +1180,54 @@ void TestUniformizedMaterialImageKeys() {
     const auto base = fixture.Address(fixture.UserData(0u), fixture.UserData(1u));
     MemoryInfo material_memory;
     material_memory.kind = ResourceKind::Global;
+    const auto load_mask = variant == Variant::WrongFirstLoadMask
+        ? fixture.Emit(ValueOpcode::LogicalNot, {material_guard}, 0, choose)
+        : material_guard;
     const auto loaded = fixture.Emit(
         ValueOpcode::LoadAddressU32,
-        {base, material_offset, Value(0u), material_guard},
+        {base, material_offset, Value(0u), load_mask},
         fixture.AddMemory(material_memory, 0x1a88u), choose);
     const auto local_key = fixture.Emit(
         ValueOpcode::SelectU32, {material_guard, loaded, arbitrary}, 0, choose);
-    const auto key = fixture.Emit(
-        ValueOpcode::ReadLane, {local_key, Value(0u)}, 0, choose);
+    Inst *sample_active_phi = nullptr;
+    auto sample_active = material_guard;
+    if (first_lane) {
+      const auto initial = variant == Variant::EmptyFirstEntry ? Value(false)
+          : variant == Variant::WideningFirstEntry ? enabled
+          : fixture.Emit(ValueOpcode::LogicalAnd,
+              {material_guard, fixture.Emit(ValueOpcode::SLessThanEqual32,
+                  {Value(0u), local_key}, 0, choose)}, 0, choose);
+      sample_active = initial;
+      if (first_lane_loop) {
+        sample_active_phi = &sample_header->AppendNewInst(
+            ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U1));
+        sample_active_phi->AddPhiOperand(sample_entry, initial);
+        sample_active = Value(sample_active_phi);
+      }
+      fixture.program.block_info[6].condition = branch(
+          variant == Variant::EmptyFirstEntry ? enabled : initial,
+          CFG::BranchCondition::ExecNonZero, choose);
+      fixture.program.block_info[6].terminator = {
+          .kind = CFG::TerminatorKind::ConditionalBranch,
+          .true_block = sample_entry_id, .false_block = 8u};
+    }
+    auto *key_block = first_lane ? sample : choose;
+    const auto key = first_lane
+        ? fixture.Emit(ValueOpcode::ReadFirstLane, {local_key, sample_active}, 0, key_block)
+        : fixture.Emit(ValueOpcode::ReadLane, {local_key, Value(0u)}, 0, key_block);
     const auto compared = fixture.Emit(
         ValueOpcode::IEqual32,
-        {key, variant == Variant::WrongEquality ? arbitrary : local_key}, 0, choose);
+        {key, variant == Variant::WrongEquality ? arbitrary : local_key}, 0, key_block);
     const auto sample_guard = fixture.Emit(
-        ValueOpcode::LogicalAnd, {material_guard, compared}, 0, choose);
-    fixture.program.block_info[6].condition = branch(
-        fixture.Emit(ValueOpcode::LogicalNot, {sample_guard}, 0, choose),
-        CFG::BranchCondition::ExecZero, choose);
-    fixture.program.block_info[6].terminator = {
-        .kind = CFG::TerminatorKind::ConditionalBranch,
-        .true_block = 8u, .false_block = 7u};
+        ValueOpcode::LogicalAnd, {sample_active, compared}, 0, key_block);
+    if (!first_lane) {
+      fixture.program.block_info[6].condition = branch(
+          fixture.Emit(ValueOpcode::LogicalNot, {sample_guard}, 0, choose),
+          CFG::BranchCondition::ExecZero, choose);
+      fixture.program.block_info[6].terminator = {
+          .kind = CFG::TerminatorKind::ConditionalBranch,
+          .true_block = 8u, .false_block = 7u};
+    }
     const auto table_offset = fixture.Emit(
         ValueOpcode::IAdd32,
         {fixture.Emit(ValueOpcode::ShiftLeftLogical32,
@@ -1203,10 +1257,33 @@ void TestUniformizedMaterialImageKeys() {
     MemoryInfo image_memory;
     image_memory.kind = ResourceKind::Image;
     image_memory.image_dimension = Decoder::ImageDimension::Dim2D;
-    fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, address},
-                 fixture.AddMemory(image_memory, 0x1aecu), sample);
-    fixture.program.block_info[7].terminator = {
-        .kind = CFG::TerminatorKind::Branch, .true_block = 8u};
+    const auto sampled = fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, address},
+        fixture.AddMemory(image_memory, 0x1aecu), sample);
+    if (first_lane) {
+      const auto component = fixture.Emit(
+          ValueOpcode::CompositeExtractU32x4, {sampled, Value(0u)}, 0, sample);
+      fixture.Emit(ValueOpcode::ReferenceU32,
+          {fixture.Emit(ValueOpcode::SelectU32,
+              {variant == Variant::EmptyFirstEntry ? material_guard : sample_guard,
+               component, Value(0u)}, 0, sample)}, 0, sample);
+    }
+    if (first_lane_loop) {
+      auto remaining = fixture.Emit(ValueOpcode::LogicalAnd,
+          {sample_active, fixture.Emit(ValueOpcode::LogicalNot,
+              {sample_guard}, 0, sample)}, 0, sample);
+      if (variant == Variant::WideningFirstBackedge)
+        remaining = fixture.Emit(ValueOpcode::LogicalOr, {remaining, enabled}, 0, sample);
+      sample_active_phi->AddPhiOperand(sample, remaining);
+      fixture.program.block_info[7].condition = branch(
+          variant == Variant::WrongFirstBackedge ? sample_guard : remaining,
+          CFG::BranchCondition::ExecNonZero, sample);
+      fixture.program.block_info[7].terminator = {
+          .kind = CFG::TerminatorKind::ConditionalBranch,
+          .true_block = 9u, .false_block = 8u};
+    } else {
+      fixture.program.block_info[7].terminator = {
+          .kind = CFG::TerminatorKind::Branch, .true_block = 8u};
+    }
     fixture.program.block_info[8].terminator.kind = CFG::TerminatorKind::Return;
     const auto output = fixture.Emit(
         ValueOpcode::GetBufferResource,
@@ -1232,6 +1309,11 @@ void TestUniformizedMaterialImageKeys() {
   };
   auto plan = make_plan(Variant::Valid);
   make_plan(Variant::Plain);
+  make_plan(Variant::AndNot);
+  make_plan(Variant::Subset);
+  make_plan(Variant::FirstLane);
+  make_plan(Variant::FirstLaneDirect);
+  plan = make_plan(Variant::FirstLaneAndNot);
   Check(plan.requires_specialization_memory &&
             plan.descriptor_sources[plan.info.images[0].source]
                 .indirect_image->selector_mask.Resolve().TryInstruction() != nullptr,
@@ -1294,6 +1376,12 @@ void TestUniformizedMaterialImageKeys() {
   for (const auto variant : {Variant::WrongCarry, Variant::WrongBackedge}) {
     CheckFatal([&] { make_plan(variant); }, "not a valid runtime value",
                "inactive material lane did not preserve its selected index across iterations");
+  }
+  for (const auto variant : {Variant::EmptyFirstEntry, Variant::WrongFirstBackedge,
+                            Variant::WideningFirstEntry, Variant::WideningFirstBackedge,
+                            Variant::WrongFirstLoadMask}) {
+    CheckFatal([&] { make_plan(variant); }, "not a valid runtime value",
+               "first-lane material key escaped its active load mask");
   }
 }
 

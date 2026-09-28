@@ -967,6 +967,33 @@ private:
 		return edge && edge->positive ? edge->condition : Value {};
 	}
 
+	bool HasActiveLane(Value mask, const Block* use) const {
+		mask = mask.Resolve();
+		const auto incoming_is_nonempty = [&](const Block* from, const Block* to,
+		                                     Value incoming, const Block* header) {
+			for (size_t depth = 0; depth < m_program.blocks.size(); ++depth) {
+				const auto edge = ConditionalEdge(from, to);
+				if (edge && edge->positive && Implies(edge->condition, incoming)) return true;
+				if (from == header || from->ImmSuccessors().size() != 1u ||
+				    from->ImmPredecessors().size() != 1u) return false;
+				to = from;
+				from = from->ImmPredecessors()[0];
+			}
+			return false;
+		};
+		const auto* phi = mask.TryInstruction();
+		if (phi != nullptr && phi->GetOpcode() == ValueOpcode::Phi &&
+		    phi->GetType() == Type::U1 && phi->NumArgs() != 0u) {
+			for (size_t arm = 0; arm < phi->NumArgs(); ++arm) {
+				if (!incoming_is_nonempty(phi->PhiBlock(arm), phi->Parent(),
+				                          phi->Arg(arm), phi->Parent())) return false;
+			}
+			return true;
+		}
+		return use != nullptr && use->ImmPredecessors().size() == 1u &&
+		       incoming_is_nonempty(use->ImmPredecessors()[0], use, mask, nullptr);
+	}
+
 	Value SimplifyGuard(Value guard) const {
 		const auto invariant = ResolveInvariantPhi(m_program, guard);
 		return (invariant.IsEmpty() ? guard : invariant).Resolve();
@@ -1074,10 +1101,14 @@ private:
 		        EquivalentValue(m_program, inst->Arg(1), index));
 	}
 
-	bool ClearsFirstSetBit(Value value, Value mask) const {
+	bool MaskOnlyLosesBits(Value value, Value mask) const {
 		const auto* update = value.Resolve().TryInstruction();
-		if (update == nullptr || update->GetOpcode() != ValueOpcode::BitwiseXor32 ||
-		    update->NumArgs() != 2u) return false;
+		if (update == nullptr || update->NumArgs() != 2u) return false;
+		if (update->GetOpcode() == ValueOpcode::BitwiseAnd32) {
+			return EquivalentValue(m_program, update->Arg(0), mask) ||
+			       EquivalentValue(m_program, update->Arg(1), mask);
+		}
+		if (update->GetOpcode() != ValueOpcode::BitwiseXor32) return false;
 		Value bit;
 		if (EquivalentValue(m_program, update->Arg(0), mask)) bit = update->Arg(1);
 		else if (EquivalentValue(m_program, update->Arg(1), mask)) bit = update->Arg(0);
@@ -1102,13 +1133,13 @@ private:
 		       first->NumArgs() == 1u && EquivalentValue(m_program, first->Arg(0), mask);
 	}
 
-	Value InitialClearingMask(Value value, const Block* update_block) const {
+	Value InitialCandidateMask(Value value, const Block* update_block) const {
 		const auto* phi = value.Resolve().TryInstruction();
 		if (phi == nullptr || phi->GetOpcode() != ValueOpcode::Phi ||
 		    phi->NumArgs() != 2u || phi->GetType() != Type::U32) return {};
 		for (uint32_t back = 0; back < 2u; ++back) {
 			if (phi->PhiBlock(back) != update_block ||
-			    !ClearsFirstSetBit(phi->Arg(back), value)) continue;
+			    !MaskOnlyLosesBits(phi->Arg(back), value)) continue;
 			const auto initial = phi->Arg(back ^ 1u).Resolve();
 			return ValidateRuntimeValue(m_program, initial, RuntimeValueType::Integer)
 			           ? initial : Value {};
@@ -1139,7 +1170,7 @@ private:
 			if (first == nullptr || first->GetOpcode() != ValueOpcode::FindILsb32 ||
 			    first->NumArgs() != 1u || !ImpliesNonzero(bit_guard, first->Arg(0)))
 				continue;
-			const auto initial_mask = InitialClearingMask(first->Arg(0), phi->PhiBlock(bit_arm));
+			const auto initial_mask = InitialCandidateMask(first->Arg(0), phi->PhiBlock(bit_arm));
 			if (initial_mask.IsEmpty()) continue;
 			for (uint32_t sentinel_arm = 0; sentinel_arm < 3u; ++sentinel_arm) {
 				if (sentinel_arm == bit_arm) continue;
@@ -1183,10 +1214,32 @@ private:
 
 	bool MatchUniformizedMaterialKey(Value key, const Inst& image,
 	                                DescriptorSource::IndirectImage& indirect,
-	                                DescriptorSource& material_source, uint32_t pc) {
-		const auto guard = PositiveLaneWitness(image.Parent());
-		if (guard.IsEmpty()) return false;
-		const auto local = EqualLocalKey(guard, key);
+	                                DescriptorSource& material_source) {
+		Value guard;
+		Value local;
+		const auto* first = key.Resolve().TryInstruction();
+		if (first != nullptr && first->GetOpcode() == ValueOpcode::ReadFirstLane &&
+		    first->NumArgs() == 2u) {
+			guard = first->Arg(1).Resolve();
+			// Empty EXEC selects lane zero, which may not have loaded a material key.
+			if (!HasActiveLane(guard, first->Parent())) return false;
+			local = first->Arg(0).Resolve();
+			const auto* phi = guard.TryInstruction();
+			if (phi != nullptr && phi->GetOpcode() == ValueOpcode::Phi &&
+			    phi->GetType() == Type::U1 && phi->NumArgs() == 2u) {
+				for (uint32_t initial = 0; initial < 2u; ++initial) {
+					if (Implies(phi->Arg(initial ^ 1u), guard)) {
+						// The backedge only removes lanes from the initial mask.
+						guard = phi->Arg(initial).Resolve();
+						break;
+					}
+				}
+			}
+		} else {
+			guard = PositiveLaneWitness(image.Parent());
+			if (guard.IsEmpty()) return false;
+			local = EqualLocalKey(guard, key);
+		}
 		const auto* selected = local.Resolve().TryInstruction();
 		if (selected == nullptr || selected->GetOpcode() != ValueOpcode::SelectU32 ||
 		    selected->NumArgs() != 3u || !Implies(guard, selected->Arg(0))) return false;
@@ -1272,7 +1325,7 @@ private:
 		return {};
 	}
 
-	bool TryMakeIndirectImage(Inst& handle, uint32_t pc, IndirectImagePlan& plan) {
+	bool TryMakeIndirectImage(Inst& handle, IndirectImagePlan& plan) {
 		if (handle.GetOpcode() != ValueOpcode::GetImageResource || handle.NumArgs() != 8u) {
 			return false;
 		}
@@ -1339,7 +1392,7 @@ private:
 				indirect.key_count = BoundedLoopCount(key, handle.Parent());
 			}
 			if (indirect.key_count.IsEmpty() &&
-			    !MatchUniformizedMaterialKey(key, handle, indirect, material_source, pc)) {
+			    !MatchUniformizedMaterialKey(key, handle, indirect, material_source)) {
 				return false;
 			}
 			if ((table_offset & 3u) != 0u ||
@@ -1418,7 +1471,7 @@ private:
 					continue;
 				}
 				IndirectImagePlan plan;
-				if (TryMakeIndirectImage(*handle, inst.Flags<MemoryFlags>().pc, plan)) {
+				if (TryMakeIndirectImage(*handle, plan)) {
 					m_indirect_images.push_back(std::move(plan));
 				}
 			}

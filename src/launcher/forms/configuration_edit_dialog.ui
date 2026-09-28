@@ -279,6 +279,12 @@
        </property>
        <layout class="QVBoxLayout" name="compatibilityLayout">
         <item>
+         <widget class="QCheckBox" name="checkBox_defer_release_mem_interrupts">
+          <property name="toolTip"><string>Experimentally defer interrupt-only RELEASE_MEM flushes to existing submission boundaries. May improve performance or cause synchronization problems. Restart the game after changing this setting.</string></property>
+          <property name="text"><string>Batch interrupt-only GPU flushes (experimental)</string></property>
+         </widget>
+        </item>
+        <item>
          <widget class="QCheckBox" name="checkBox_amd_cpu">
           <property name="toolTip"><string>Patch CPU instructions that differ between AMD and the host CPU.</string></property>
           <property name="text"><string>AMD CPU patch (experimental)</string></property>

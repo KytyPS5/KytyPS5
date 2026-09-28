@@ -20,6 +20,7 @@
 #include <atomic>
 #include <bit>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -53,6 +54,16 @@
 namespace Libs::Graphics {
 
 namespace {
+
+// Opt-in experiment: keep interrupt callbacks queued until an existing flush boundary.
+// Memory-writing RELEASE_MEM paths retain their original flush behavior.
+bool DeferInterruptOnlyReleaseMemFlushes() {
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_DEFER_RELEASE_MEM_INTERRUPTS");
+		return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+	}();
+	return enabled;
+}
 
 constexpr uint32_t GcrGl2MetadataInvalidate = 1u << 1u;
 constexpr uint32_t GcrGl0VectorInvalidate   = 1u << 2u;
@@ -2278,7 +2289,7 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 				break;
 			default: EXIT("unknown release_mem interrupt selector\n");
 		}
-		if (queued) {
+		if (queued && !DeferInterruptOnlyReleaseMemFlushes()) {
 			cp.BufferFlush();
 		}
 	};

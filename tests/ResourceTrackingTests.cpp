@@ -765,10 +765,12 @@ void TestBoundedComputeImageLoop() {
   enum class Variant {
     Bounded, Plain, Nonzero, TrueEdge, WrongGuard, EntryBypass, ExitBypass, GuardBlock,
     WrongStep, DivergentBound, DivergentKey, Disjunction, WrongPolarity,
-    IncrementBypass, PreviousBound, Masked, MaskedWrongGuard, MaskResurrection, StatusOverwrite
+    IncrementBypass, PreviousBound, Masked, MaskedWrongGuard, MaskResurrection, StatusOverwrite,
+    GuardedDiamond, GuardedDiamondBypass
   };
   const auto make_plan = [](Variant variant) {
-    Fixture fixture;
+    const bool diamond = variant >= Variant::GuardedDiamond;
+    Fixture fixture(diamond ? ShaderType::Vertex : ShaderType::Compute);
     fixture.program.wave_size = 64u;
     const bool masked = variant >= Variant::Masked;
     auto *entry = fixture.block;
@@ -821,7 +823,8 @@ void TestBoundedComputeImageLoop() {
         &header->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U1)) : nullptr;
     const auto local = fixture.Emit(
         ValueOpcode::GetBuiltin,
-        {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)});
+        {Value(static_cast<uint32_t>(diamond ? StageInputKind::VertexIndex
+                                            : StageInputKind::LocalInvocationId)), Value(0u)});
     const auto count = variant == Variant::DivergentBound ? local : fixture.UserData(2);
     const auto in_range = fixture.Emit(ValueOpcode::SLessThan32,
                                        {variant == Variant::WrongGuard
@@ -830,19 +833,21 @@ void TestBoundedComputeImageLoop() {
     const auto initial_active = fixture.Emit(ValueOpcode::INotEqual32,
                                              {local, Value(0u)}, 0, entry);
     if (masked) {
-      auto &active_phi = header->AppendNewInst(ValueOpcode::Phi, {},
-                                               static_cast<uint64_t>(Type::U1));
+      auto *active_phi = diamond ? nullptr : &header->AppendNewInst(
+          ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U1));
       auto &saved_phi = header->AppendNewInst(ValueOpcode::Phi, {},
                                               static_cast<uint64_t>(Type::U1));
       auto &status_phi = header->AppendNewInst(ValueOpcode::Phi, {},
                                                static_cast<uint64_t>(Type::U32));
-      const auto active = Value(&active_phi);
       const auto saved = Value(&saved_phi);
       const auto status = Value(&status_phi);
+      const auto active = diamond ? fixture.Emit(ValueOpcode::LogicalAnd,
+          {saved, fixture.Emit(ValueOpcode::UGreaterThanEqual32,
+                               {Value(0u), status}, 0, header)}, 0, header) : Value(active_phi);
       const auto mask = fixture.Emit(ValueOpcode::LogicalOr,
           {fixture.Emit(ValueOpcode::LogicalAnd, {in_range, active}, 0, compare),
            fixture.Emit(ValueOpcode::LogicalNot, {active}, 0, compare)}, 0, compare);
-      const auto next_saved = fixture.Emit(ValueOpcode::LogicalAnd,
+      auto next_saved = fixture.Emit(ValueOpcode::LogicalAnd,
           {variant == Variant::MaskResurrection ? Value(true) : saved, mask}, 0, compare);
       const auto execute = fixture.Emit(ValueOpcode::LogicalAnd, {active, mask}, 0, compare);
       const auto body_status = fixture.Emit(ValueOpcode::SelectU32,
@@ -850,14 +855,29 @@ void TestBoundedComputeImageLoop() {
       const auto next_active = fixture.Emit(ValueOpcode::LogicalAnd,
           {next_saved, fixture.Emit(ValueOpcode::UGreaterThanEqual32,
                                    {Value(3u), body_status}, 0, latch)}, 0, latch);
-      const auto next_status = fixture.Emit(ValueOpcode::SelectU32,
+      auto next_status = fixture.Emit(ValueOpcode::SelectU32,
           {variant == Variant::StatusOverwrite ? Value(true) : next_active,
-           Value(0u), body_status}, 0, increment);
-      active_phi.AddPhiOperand(entry, initial_active);
-      active_phi.AddPhiOperand(increment, next_active);
+           Value(0u), body_status}, 0,
+          variant == Variant::GuardedDiamondBypass ? latch : increment);
+      if (variant == Variant::GuardedDiamondBypass) {
+        auto &merged_saved = increment->AppendNewInst(ValueOpcode::Phi, {},
+                                                      static_cast<uint64_t>(Type::U1));
+        merged_saved.AddPhiOperand(compare, saved);
+        merged_saved.AddPhiOperand(latch, next_saved);
+        next_saved = Value(&merged_saved);
+        auto &merged_status = increment->AppendNewInst(ValueOpcode::Phi, {},
+                                                       static_cast<uint64_t>(Type::U32));
+        merged_status.AddPhiOperand(compare, status);
+        merged_status.AddPhiOperand(latch, next_status);
+        next_status = Value(&merged_status);
+      }
+      if (active_phi != nullptr) {
+        active_phi->AddPhiOperand(entry, initial_active);
+        active_phi->AddPhiOperand(increment, next_active);
+      }
       saved_phi.AddPhiOperand(entry, initial_active);
       saved_phi.AddPhiOperand(increment, next_saved);
-      status_phi.AddPhiOperand(entry, local);
+      status_phi.AddPhiOperand(entry, diamond ? Value(0u) : local);
       status_phi.AddPhiOperand(increment, next_status);
       const auto branch = [&](uint32_t index, uint32_t yes, uint32_t no,
                               Value predicate, CFG::BranchCondition kind) {
@@ -874,7 +894,9 @@ void TestBoundedComputeImageLoop() {
       fixture.program.block_info[0].terminator = {
           .kind = CFG::TerminatorKind::Branch, .true_block = 1u};
       branch(1u, 4u, 5u, active, CFG::BranchCondition::ExecZero);
-      branch(5u, 4u, 6u, mask, CFG::BranchCondition::VccZero);
+      branch(5u, variant == Variant::GuardedDiamondBypass ? 7u : 4u, 6u,
+             diamond ? execute : mask,
+             diamond ? CFG::BranchCondition::ExecZero : CFG::BranchCondition::VccZero);
       const auto image_guard = variant == Variant::MaskedWrongGuard ? active :
           fixture.Emit(ValueOpcode::LogicalAnd,
               {fixture.Emit(ValueOpcode::LogicalAnd, {execute, in_range}, 0, guard),
@@ -957,9 +979,11 @@ void TestBoundedComputeImageLoop() {
   make_plan(Variant::Nonzero);
   make_plan(Variant::TrueEdge);
   make_plan(Variant::Masked);
+  make_plan(Variant::GuardedDiamond);
   for (const auto variant : {Variant::IncrementBypass, Variant::PreviousBound,
                              Variant::MaskedWrongGuard,
-                             Variant::MaskResurrection, Variant::StatusOverwrite}) {
+                             Variant::MaskResurrection, Variant::StatusOverwrite,
+                             Variant::GuardedDiamondBypass}) {
     CheckFatal([&] { make_plan(variant); }, "not a valid runtime value",
                "compute image loop allowed an unbounded induction or mask resurrection");
   }

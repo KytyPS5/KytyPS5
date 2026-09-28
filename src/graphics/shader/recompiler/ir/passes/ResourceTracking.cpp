@@ -1298,15 +1298,18 @@ private:
 		if (increment_block == nullptr) return {};
 
 		const auto guarded_on_entry = [&](const Block* block, const auto& accepts) {
-			for (size_t depth = 0; block != phi->Parent() &&
-			     depth < m_program.blocks.size(); ++depth) {
-				if (block->ImmPredecessors().size() != 1u) return false;
-				const auto* previous = block->ImmPredecessors()[0];
-				const auto edge = ConditionalEdge(previous, block);
-				if (edge && accepts(*edge)) return true;
-				block = previous;
+			std::vector<const Block*> pending {block};
+			for (size_t i = 0; i < pending.size(); ++i) {
+				const auto* current = pending[i];
+				if (current == phi->Parent() || current->ImmPredecessors().empty()) return false;
+				for (const auto* previous: current->ImmPredecessors()) {
+					const auto edge = ConditionalEdge(previous, current);
+					if (edge && accepts(*edge)) continue;
+					if (std::ranges::find(pending, previous) == pending.end())
+						pending.push_back(previous);
+				}
 			}
-			return false;
+			return true;
 		};
 		for (const auto& use_of_key: phi->Uses()) {
 			const auto* compare = use_of_key.user;

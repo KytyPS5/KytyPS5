@@ -705,22 +705,10 @@ private:
 				return false;
 			}
 			const auto* previous = block->ImmPredecessors()[0];
-			const auto current_it = std::ranges::find(m_program.blocks, block);
-			const auto previous_it = std::ranges::find(m_program.blocks, previous);
-			if (current_it == m_program.blocks.end() || previous_it == m_program.blocks.end()) {
-				return false;
-			}
-			const auto& info = m_program.block_info[previous_it - m_program.blocks.begin()];
-			const auto id = m_program.block_info[current_it - m_program.blocks.begin()].id;
-			const auto& term = info.terminator;
-			if (term.kind == CFG::TerminatorKind::ConditionalBranch &&
-			    (term.true_block == id) != (term.false_block == id)) {
-				bool positive = term.true_block == id;
-				const auto* test = info.condition.Resolve().TryInstruction();
-				while (test != nullptr && test->GetOpcode() == ValueOpcode::LogicalNot) {
-					positive = !positive;
-					test = test->Arg(0).Resolve().TryInstruction();
-				}
+			Value condition;
+			bool positive = false;
+			if (ConditionalEdge(previous, block, condition, positive)) {
+				const auto* test = condition.TryInstruction();
 				if (test != nullptr && test->NumArgs() == 2u &&
 				    ((test->GetOpcode() == ValueOpcode::INotEqual32 && positive) ||
 				     (test->GetOpcode() == ValueOpcode::IEqual32 && !positive))) {
@@ -801,9 +789,17 @@ private:
 		condition = info.condition;
 		positive = term.true_block == id;
 		while (const auto* inst = condition.Resolve().TryInstruction()) {
-			if (inst->GetOpcode() != ValueOpcode::LogicalNot) break;
+			if (inst->GetOpcode() == ValueOpcode::LogicalNot) {
+				positive = !positive;
+			} else if (inst->GetOpcode() == ValueOpcode::ConditionRef) {
+				// SCC is uniform across the guest wave; EXEC and VCC are lane predicates.
+				const auto kind = inst->Flags<CFG::BranchCondition>();
+				if (kind != CFG::BranchCondition::SccZero &&
+				    kind != CFG::BranchCondition::SccNonZero) break;
+			} else {
+				break;
+			}
 			condition = inst->Arg(0);
-			positive = !positive;
 		}
 		condition = condition.Resolve();
 		return true;

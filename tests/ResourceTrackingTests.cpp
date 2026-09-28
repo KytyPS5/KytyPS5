@@ -561,9 +561,10 @@ void TestInvariantIndirectImageMaterialization() {
 
 void TestGuardedDirectImageTable() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
-  enum class Guard { Nonzero, Zero, Unrelated, Bypass };
+  enum class Guard { Nonzero, SccNonZero, Plain, Zero, Unrelated, Bypass, ExecZero, VccZero };
   const auto make_plan = [](Guard guard) {
     Fixture fixture(ShaderType::Pixel);
+    fixture.program.wave_size = 64u;
     auto *entry = fixture.block;
     auto *middle = fixture.AddBlock();
     auto *before_sample = fixture.AddBlock();
@@ -580,8 +581,19 @@ void TestGuardedDirectImageTable() {
     const auto nonzero = fixture.Emit(
         ValueOpcode::INotEqual32,
         {Value(0u), guard == Guard::Unrelated ? fixture.UserData(2) : mask});
-    fixture.program.block_info[0].condition =
-        fixture.Emit(ValueOpcode::LogicalNot, {nonzero});
+    const auto kind = guard == Guard::ExecZero ? CFG::BranchCondition::ExecZero
+                    : guard == Guard::VccZero ? CFG::BranchCondition::VccZero
+                                             : CFG::BranchCondition::SccZero;
+    auto condition = nonzero;
+    if (guard == Guard::SccNonZero) {
+      condition = fixture.Emit(ValueOpcode::ConditionRef, {condition},
+                               CFG::BranchCondition::SccNonZero);
+    }
+    condition = fixture.Emit(ValueOpcode::LogicalNot, {condition});
+    if (guard != Guard::Plain && guard != Guard::SccNonZero) {
+      condition = fixture.Emit(ValueOpcode::ConditionRef, {condition}, kind);
+    }
+    fixture.program.block_info[0].condition = condition;
     fixture.program.block_info[0].terminator = {
         .kind = CFG::TerminatorKind::ConditionalBranch,
         .true_block = guard == Guard::Zero ? 1u : 4u,
@@ -645,7 +657,10 @@ void TestGuardedDirectImageTable() {
   };
 
   auto plan = make_plan(Guard::Nonzero);
-  for (const auto guard : {Guard::Zero, Guard::Unrelated, Guard::Bypass}) {
+  make_plan(Guard::SccNonZero);
+  make_plan(Guard::Plain);
+  for (const auto guard : {Guard::Zero, Guard::Unrelated, Guard::Bypass,
+                           Guard::ExecZero, Guard::VccZero}) {
     CheckFatal([&] { make_plan(guard); }, "not a valid runtime value",
                "direct table accepted a selector without a dominating nonzero guard");
   }

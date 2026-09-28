@@ -9,6 +9,8 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 // descriptor_sources, then writes dense indices to handle flags and MemoryInfo.
 void TrackResources(Program& program);
 bool ProveBoundedSrtReadsPrecedeWrites(const Program& program);
+// Resolves native descriptor sources, plans their scalar reads, and assigns dense resource bindings.
+void TrackResources(Program& program, const Decoder::Program& decoded, const CFG::Graph& native_cfg);
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
 

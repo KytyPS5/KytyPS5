@@ -219,17 +219,24 @@ void TestRangeSet() {
 void TestGuestRange() {
   constexpr GuestRange empty{};
   constexpr GuestRange first_byte{1, 1};
-  constexpr GuestRange last_byte{TRACKER_ADDRESS_SIZE - 1, 1};
+  constexpr uint64_t extended_end = Libs::LibKernel::Memory::kExtendedMemoryBase +
+                                    Libs::LibKernel::Memory::kExtendedMemorySize;
+  constexpr GuestRange last_byte{extended_end - 1, 1};
 
   static_assert(empty.Empty() && !empty.Valid() && empty.ValidOrEmpty());
   static_assert(!first_byte.Empty() && first_byte.Valid() &&
                 first_byte.ValidOrEmpty() && first_byte.End() == 2);
-  static_assert(last_byte.Valid() && last_byte.End() == TRACKER_ADDRESS_SIZE);
+  static_assert(last_byte.Valid() && last_byte.End() == extended_end);
 
   Check(!GuestRange{0, 1}.Empty() && !GuestRange{0, 1}.ValidOrEmpty(),
         "zero-address nonempty guest range is rejected");
   Check(!GuestRange{1, 0}.Empty() && !GuestRange{1, 0}.ValidOrEmpty(),
         "nonzero-address empty guest range is rejected");
+  Check(GuestRange{Libs::LibKernel::Memory::kExtendedMemoryBase, 1}.Valid() &&
+            !GuestRange{Libs::Graphics::LOWER_ADDRESS_SIZE, 1}.Valid() &&
+            !GuestRange{Libs::LibKernel::Memory::kExtendedMemoryBase - 1, 2}.Valid() &&
+            !GuestRange{extended_end - 1, 2}.Valid(),
+        "extended range and gap boundaries are enforced");
   Check(!GuestRange{TRACKER_ADDRESS_SIZE, 1}.Valid(),
         "first address beyond the guest range is rejected");
   Check(!GuestRange{TRACKER_ADDRESS_SIZE - 1, 2}.Valid(),

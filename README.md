@@ -72,8 +72,8 @@ or graphical glitches, so please include the version you tested when reporting a
       <img src="docs/screenshots/ps5-02.png" width="300" alt="Demon's Souls running in KytyPS5">
     </td>
     <td align="center">
-      <strong>Hellboy</strong><br>
-      <img src="docs/screenshots/ps5-06.png" width="300" alt="Hellboy running in KytyPS5">
+      <strong>UFC 5</strong><br>
+      <img src="docs/screenshots/ps5-06.png" width="300" alt="UFC 5 running in KytyPS5">
     </td>
   </tr>
 </table>

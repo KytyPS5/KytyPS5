@@ -175,8 +175,7 @@ uint32_t LoadSamplerDescriptor(EmitterState& state, uint32_t sampler) {
 }
 
 static bool RequiresPointSampler(const IR::ImageResource& image) {
-	return image.numeric_class == Prospero::TextureNumericClass::Uint ||
-	       image.numeric_class == Prospero::TextureNumericClass::Sint ||
+	return image.numeric_class == Prospero::TextureNumericClass::Sint ||
 	       image.conversion_format != Prospero::BufferFormat::kInvalid;
 }
 

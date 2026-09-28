@@ -37,7 +37,6 @@
 #include <spirv-tools/libspirv.hpp>
 #include <spirv-tools/optimizer.hpp>
 #include <string_view>
-#include <tuple>
 #include <utility>
 #include <vector>
 #include <xxhash.h>
@@ -562,7 +561,7 @@ struct PipelineCache::ProgramCache {
 	static constexpr std::size_t MaxStaticKeyWords =
 	    15 + ShaderVertexInputInfo::PARAM_LINK_MAX * 2 + ShaderVertexInputInfo::RES_MAX * 13;
 
-	Permutation CompilePermutation(const ShaderParams&                          params,
+	Permutation CompilePermutation(const ShaderParams&                  params,
 	                               const ShaderRecompiler::CompileOptions&      options,
 	                               ShaderRecompiler::TranslateResult            translated,
 	                               ShaderRecompiler::IR::ResourceSpecialization specialization,
@@ -883,14 +882,15 @@ struct PipelineCache::ProgramCache {
 			stage_input.compute = &input_info;
 		}
 		const char* label = nullptr;
+		const char* stage_name = nullptr;
 		switch (stage) {
-			case ShaderType::Vertex: label = "ShaderRecompiler VS"; break;
-			case ShaderType::Mesh: label = "ShaderRecompiler MS"; break;
-			case ShaderType::Local: label = "ShaderRecompiler LS"; break;
-			case ShaderType::TessellationControl: label = "ShaderRecompiler HS"; break;
-			case ShaderType::TessellationEvaluation: label = "ShaderRecompiler DS"; break;
-			case ShaderType::Pixel: label = "ShaderRecompiler PS"; break;
-			case ShaderType::Compute: label = "ShaderRecompiler CS"; break;
+			case ShaderType::Vertex: label = "ShaderRecompiler VS"; stage_name = "vs"; break;
+			case ShaderType::Mesh: label = "ShaderRecompiler MS"; stage_name = "ms"; break;
+			case ShaderType::Local: label = "ShaderRecompiler LS"; stage_name = "ls"; break;
+			case ShaderType::TessellationControl: label = "ShaderRecompiler HS"; stage_name = "hs"; break;
+			case ShaderType::TessellationEvaluation: label = "ShaderRecompiler DS"; stage_name = "ds"; break;
+			case ShaderType::Pixel: label = "ShaderRecompiler PS"; stage_name = "ps"; break;
+			case ShaderType::Compute: label = "ShaderRecompiler CS"; stage_name = "cs"; break;
 			default: EXIT("invalid pipeline shader stage\n");
 		}
 		ShaderRecompiler::CompileOptions options;

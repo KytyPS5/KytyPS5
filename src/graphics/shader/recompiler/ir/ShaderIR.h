@@ -168,6 +168,7 @@ struct SamplerResource {
 	bool     force_point_filtering = false;
 	bool     depth_compare         = false;
 	uint8_t  depth_compare_func    = 0; // vk::CompareOp value from sampler descriptor
+	bool     integer_border        = false;
 
 	bool operator==(const SamplerResource& other) const = default;
 };
@@ -701,6 +702,7 @@ struct ResourcePlan {
 	bool                                requires_specialization_memory = false;
 	bool                                has_address_writes = false;
 	bool                                bounded_srt_reads_precede_writes = false;
+	bool                                capture_specialization_reads = false;
 	bool                                srt_plan_complete          = false;
 	bool                                resource_tracking_complete = false;
 	ShaderInfo                          info;
@@ -753,6 +755,8 @@ struct Program: ResourcePlan {
 	CFG::FailureKind              cfg_failure_kind    = CFG::FailureKind::None;
 	std::string                   fallback_reason;
 	std::vector<BlockInfo>        block_info;
+	struct ScalarWrite { uint32_t pc; ScalarReg reg; };
+	std::vector<ScalarWrite>      scalar_writes;
 	// Typed memory and export instructions reference shader-local metadata by dense index.
 	// Decoder-only details (such as NSA register numbers) have already become IR operands.
 	std::vector<ExportInfo> export_info;

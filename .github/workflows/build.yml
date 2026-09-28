@@ -113,14 +113,14 @@ jobs:
         shell: cmd
         run: |
           cmake --build _Build/windows --target launcher ^
-            audio_out2_port_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests ^
+            audio_out2_port_tests pad_haptics_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests ^
             resource_tracking_tests scalar_provenance_tests ^
             resource_materialization_tests shader_vertex_metadata_tests --parallel
 
       - name: Test
         shell: cmd
         run: |
-          ctest --test-dir _Build/windows --output-on-failure -R "^(audio_out2_port|ime_dialog|lru_cache|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|virtual_memory_allocation)$"
+          ctest --test-dir _Build/windows --output-on-failure -R "^(audio_out2_port|pad_haptics|ime_dialog|lru_cache|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|virtual_memory_allocation)$"
 
       - name: Install
         shell: cmd
@@ -201,7 +201,7 @@ jobs:
         shell: bash
         run: |
           cmake --build _Build/macos \
-            --target launcher audio_out2_port_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests \
+            --target launcher audio_out2_port_tests pad_haptics_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests \
               resource_tracking_tests scalar_provenance_tests \
               resource_materialization_tests shader_vertex_metadata_tests \
             --parallel
@@ -210,7 +210,7 @@ jobs:
         shell: bash
         run: |
           ctest --test-dir _Build/macos --output-on-failure \
-            -R '^(audio_out2_port|ime_dialog|lru_cache|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|virtual_memory_allocation)$'
+            -R '^(audio_out2_port|pad_haptics|ime_dialog|lru_cache|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|virtual_memory_allocation)$'
 
       - name: Install
         shell: bash
@@ -384,7 +384,7 @@ jobs:
         run: |
           cmake --build _Build/linux \
             --target launcher page_manager_tests memory_tracker_tests \
-              audio_out2_port_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests \
+              audio_out2_port_tests pad_haptics_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests \
               resource_tracking_tests scalar_provenance_tests \
               resource_materialization_tests shader_vertex_metadata_tests \
             --parallel
@@ -393,7 +393,7 @@ jobs:
         shell: bash
         run: |
           ctest --test-dir _Build/linux --output-on-failure \
-            -R '^(audio_out2_port|ime_dialog|lru_cache|memory_tracker|page_manager|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|virtual_memory_allocation)$'
+            -R '^(audio_out2_port|pad_haptics|ime_dialog|lru_cache|memory_tracker|page_manager|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|virtual_memory_allocation)$'
 
       - name: Install
         shell: bash

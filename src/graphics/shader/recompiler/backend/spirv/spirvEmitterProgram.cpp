@@ -192,30 +192,6 @@ void EmitReturn(ValueEmitContext& ctx) {
 	ctx.state.builder.AddFunction(spv::OpReturn);
 }
 
-uint32_t BranchCondition(ValueEmitContext& ctx, const IR::BlockInfo& info) {
-	// Scalar-instruction conditions already test the full wave's raw register values.
-	if (ctx.other_half == nullptr ||
-	    info.terminator.condition == CFG::BranchCondition::ScalarInstruction ||
-	    info.terminator.condition == CFG::BranchCondition::GotoVariable) {
-		return ctx.Def(info.condition);
-	}
-	const auto ballot = ctx.Ballot(info.condition);
-	const auto low    = ctx.state.builder.AllocateId();
-	const auto high   = ctx.state.builder.AllocateId();
-	const auto result = ctx.state.builder.AllocateId();
-	ctx.state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(ctx.state), low, ballot, 0);
-	ctx.state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(ctx.state), high, ballot, 1);
-	const auto kind     = info.terminator.condition;
-	const bool zero     = kind == CFG::BranchCondition::ExecZero ||
-	                      kind == CFG::BranchCondition::VccZero ||
-	                      kind == CFG::BranchCondition::SccZero;
-	const auto combined =
-	    EmitBinaryU32(ctx.state, zero ? spv::OpBitwiseAnd : spv::OpBitwiseOr, low, high);
-	ctx.state.builder.AddFunction(zero ? spv::OpIEqual : spv::OpINotEqual, TypeBool(ctx.state),
-	                              result, combined, ConstantU32(ctx.state, zero ? ~0u : 0u));
-	return result;
-}
-
 uint32_t EmitGraphicsLoopWithinBudget(ValueEmitContext& ctx) {
 	auto& state = ctx.state;
 	EXIT_IF(state.graphics_loop_counter_variable == 0);
@@ -286,7 +262,7 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, StructuredFunctionState& st
 				EmitReturn(ctx);
 				return;
 			}
-			auto condition = BranchCondition(ctx, info);
+			auto condition = ctx.Def(info.condition);
 			if (const auto loop = structured.budgeted_loop_continues.find(block);
 			    loop != structured.budgeted_loop_continues.end()) {
 				const auto* header = loop->second.first;
@@ -339,7 +315,7 @@ uint32_t EmitDispatcherNextPc(ValueEmitContext& ctx, const DispatcherFunctionSta
 			EmitDispatcherTarget(ctx, dispatcher, block, term.false_block);
 			const auto selected = ctx.state.builder.AllocateId();
 			ctx.state.builder.AddFunction(
-			    spv::OpSelect, TypeU32(ctx.state), selected, BranchCondition(ctx, info),
+			    spv::OpSelect, TypeU32(ctx.state), selected, ctx.Def(info.condition),
 			    ConstantU32(ctx.state, term.true_block), ConstantU32(ctx.state, term.false_block));
 			return selected;
 		}

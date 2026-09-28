@@ -628,10 +628,8 @@ void Validate(const ImageInfo& info) {
 			break;
 		case ImageMetadataKind::Dcc:
 		case ImageMetadataKind::Cmask:
-			if (info.metadata.range.address == 0 ||
-			    info.metadata.range.address >= TRACKER_ADDRESS_SIZE ||
-			    (info.metadata.range.size != 0 &&
-			     info.metadata.range.size > TRACKER_ADDRESS_SIZE - info.metadata.range.address) ||
+			if (!GuestRange {info.metadata.range.address,
+			                 std::max<uint64_t>(info.metadata.range.size, 1)}.Valid() ||
 			    info.metadata.compression == VideoOutCompression::Unsupported) {
 				EXIT("invalid color metadata\n");
 			}

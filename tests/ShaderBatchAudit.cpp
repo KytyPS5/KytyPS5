@@ -381,7 +381,8 @@ int RunShaderBatchAudit(int argc, char* argv[]) {
                       ShaderRecompiler::CFG::GraphToString(graph).c_str());
           std::fflush(stdout);
         }
-        const bool structured = !graph.unsupported && ShaderRecompiler::CFG::Structurize(graph);
+        graph = ShaderRecompiler::CFG::Structurize(graph);
+        const bool structured = !graph.unsupported;
         if (dump_cfg) {
           std::printf("KYTY_SHADER_AUDIT_CFG_AFTER_BEGIN\n%sKYTY_SHADER_AUDIT_CFG_AFTER_END\n",
                       ShaderRecompiler::CFG::GraphToString(graph).c_str());

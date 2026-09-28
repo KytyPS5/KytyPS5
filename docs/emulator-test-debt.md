@@ -1,5 +1,74 @@
 # Emulator regression test debt
 
+## Fresh upstream 22ff integration regressions (2026-09-28)
+
+Native merge build succeeds (`merge-22ff-build3-20260928.log`). Existing unchanged
+resource suite is RED: `invariant indirect images`, address-backed image words at
+pc 0x1220 fail runtime-source admission (`merge-22ff-ctest1-20260928.log`, 21/22).
+Retain the finite scalar-buffer key enumeration when the image table has a
+scalar-address root and positive table offset; the new lane/loop proof remains
+required for domains without that independent finite material-buffer bound.
+Do not weaken negative immediate, alignment, readability, probe or alias checks.
+The preserved address-table fixture includes a shifted key followed by a constant
+image-table bias; exclusive-use proofs must cover that complete offset chain
+(`merge-22ff-resource2-20260928.txt`, same intended admission RED).
+
+The bounded Raw selector fails before its own fixture is compiled: construction
+of an unrelated upstream FP64 case eagerly compiles a vertex reciprocal chain
+with unknown initial guest FP state. Log `merge-22ff-zero-raw1-20260928.txt`,
+exit 321. Preserve this strict FP64 rejection; move the companion compile check
+into the selected case execution so fixture enumeration has no compiler side
+effects. Numerical bounded Raw/Formatted/D16/Scalar oracles remain unchanged.
+
+The old shared-exit test's route-field counters describe the retired CFG
+representation. Adapt it to the new expression/assignment API by comparing
+executed native instruction paths for every branch-decision combination,
+retaining instruction coverage and validated structured SPIR-V checks.
+
+Numerical GPU RED after companion isolation: `merge-22ff-zero-raw2-20260928.txt`
+returns the first candidate's payload for both workgroups. The dump
+`_Build/analysis/merge-22ff-zero-raw-red.spv{,.ir.txt}` shows the bounded
+GetBufferResource selector scrubbed to zero by upstream's descriptor cleanup.
+Preserve runtime keys for bounded buffer/image/sampler and inline tables;
+ordinary host-only descriptor words can still be discarded. Repeat the same
+four numerical oracles unchanged and neighboring descriptor-selection cases.
+
+Address-table oracle correction: RDNA2 ISA section 7.2.1 describes the memory
+address as base + immediate + scalar offset, without truncating the resulting
+sum to U32. The shader's index multiplication wraps before SMEM; adding its
+positive immediate must not invent a second wrap. The old address fixture's
+112-byte key is unreachable (minimum offset 368). Keep that word as a rejected
+read trap and assert only OOB key zero and the real 368-byte key five are mapped.
+This follows the same widened addition already covered by TestConstantBufferBounds
+and upstream's split-offset matrix. Source:
+https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf.
+
+Legacy preplanned-IR regression RED: `merge-22ff-resource4-20260928.txt`
+accepts a formatted vector record key because unconditional tracking DCE removes
+the unused image query before its strict resource validation. Preserve the
+planning-only API contract: run this new DCE only when tracking itself builds
+the SRT plan, and rerun the unchanged resource rejection/alias fixtures.
+
+Record-key alias regression RED: `merge-22ff-resource5-20260928.txt`
+accepts a written buffer alias of an indirect record key. Include record-key
+indirect images in the specialization capture policy, alongside selector masks;
+retain the unchanged rejection fixture and non-alias positive cases.
+
+Integer sampler integration RED: `merge-22ff-verified-neighbor-sampler-border-20260928.txt`
+exits 321: UInt border-color image has no point variant. The new materializer
+classifies UInt as Integer (integer border, original filtering), Sint/converted
+as PointInteger. Match backend point routing to that existing classification;
+rerun unchanged border-color numerical cases and indirect-image neighbors.
+
+Integration GREEN: unchanged resource suite passes (`merge-22ff-resource6-20260928.txt`),
+required CTest 22/22 (`merge-22ff-ctest2-20260928.log`), neighboring upstream
+CPU suites 12/12 (`merge-22ff-extra-ctest-20260928.log`), shared CFG execution
+and SPIR-V checks pass (`merge-22ff-shared-cfg-20260928.txt`). Four numerical
+bounded-buffer cases and five neighbors pass (`merge-22ff-verified-*.txt`);
+integer border fix passes `merge-22ff-sampler-border-green-20260928.txt`.
+Full compute suite remains unverified: known strict FP64 and comparison-depth
+boundaries are preserved, not bypassed by this integration.
+
 ## Candidate-specific zero-stride vector reads (2026-09-28)
 
 Before changing production, add numerical native GPU cases

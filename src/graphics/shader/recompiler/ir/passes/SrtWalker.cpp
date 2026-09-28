@@ -111,6 +111,7 @@ bool IsRuntimeSelect(ValueOpcode op) {
 
 bool IsRuntimeUniformOp(ValueOpcode op) {
 	switch (op) {
+		case ValueOpcode::ConditionRef:
 		case ValueOpcode::BitCastU32F32:
 		case ValueOpcode::BitCastF32U32:
 		case ValueOpcode::ConvertU32F32:
@@ -1626,16 +1627,15 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 			return false;
 		}
 		const auto byte_offset =
-		    static_cast<uint64_t>(immediate) + static_cast<uint32_t>(offset);
-		const auto aligned = byte_offset & ~uint64_t {3};
+		    (static_cast<uint64_t>(immediate) & ~uint64_t {3}) + (static_cast<uint32_t>(offset) & ~3u);
 		const auto stride  = (static_cast<uint32_t>(high) >> 16u) & 0x3fffu;
 		const auto size = stride == 0u
 		                      ? static_cast<uint64_t>(static_cast<uint32_t>(records))
 		                      : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
-		if (aligned > size || size - aligned < sizeof(uint32_t)) {
+		if (byte_offset > size || size - byte_offset < sizeof(uint32_t)) {
 			return false;
 		}
-		address = ((base & ~uint64_t {3}) + byte_offset) & ~uint64_t {3};
+		address = (base & ~uint64_t {3}) + byte_offset;
 	} else {
 		const auto relative = (immediate & ~int64_t {3}) +
 		                      static_cast<int64_t>(static_cast<uint32_t>(offset) & ~3u);
@@ -1837,14 +1837,18 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 			}
 			return false;
 		case ValueOpcode::FPOrdLessThanEqual32:
-			if (binary()) {
-				result = Float32(a) <= Float32(b);
-				return true;
-			}
-			return false;
 		case ValueOpcode::FPOrdGreaterThanEqual32:
 			if (binary()) {
-				result = Float32(a) >= Float32(b);
+				const auto operand = [&](uint64_t bits) {
+					if (inst.Flags<FPCompareFlags>().flush_input_denorms &&
+					    (bits & 0x7fffffffu) < 0x00800000u) {
+						bits &= 0x80000000u;
+					}
+					return Float32(bits);
+				};
+				result = inst.GetOpcode() == ValueOpcode::FPOrdLessThanEqual32
+				             ? operand(a) <= operand(b)
+				             : operand(a) >= operand(b);
 				return true;
 			}
 			return false;
@@ -2027,6 +2031,7 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 				return true;
 			}
 			return false;
+		case ValueOpcode::ConditionRef: return Arg(inst, 0, result);
 		case ValueOpcode::LogicalNot:
 			if (Arg(inst, 0, a)) {
 				result = a == 0u;

@@ -685,8 +685,6 @@ constexpr int      PROT_AMPR_READ                = 0x40;
 constexpr int      PROT_AMPR_WRITE               = 0x80;
 constexpr int      PROT_ACP_READ                 = 0x100;
 constexpr int      PROT_ACP_WRITE                = 0x200;
-constexpr uint64_t AMM_VA_START                  = 0x0000001000000000ull;
-constexpr uint64_t AMM_VA_SIZE                   = 0x0000001000000000ull;
 constexpr uint64_t APR_MAX_READ_LENGTH           = 0x0000000100000000ull;
 constexpr uint64_t APR_MAX_FILE_OFFSET           = 0x0000010000000000ull;
 constexpr uint64_t APR_MAX_APP_ADDRESS           = 0x0000f00000000000ull;
@@ -744,19 +742,6 @@ struct CommandBufferState {
 	uint64_t                         gather_scatter_file_offset = 0;
 };
 
-struct AmmAutoPoolRange {
-	uint64_t start = 0;
-	uint64_t size  = 0;
-	uint64_t used  = 0;
-};
-
-struct AmmVirtualAddressRanges {
-	uint64_t va_start          = 0;
-	uint64_t va_end            = 0;
-	uint64_t multimap_va_start = 0;
-	uint64_t multimap_va_end   = 0;
-};
-
 struct AmmUsageStatsData {
 	uint64_t size_in_bytes                                    = 0;
 	uint16_t num_page_table_pool_entries                      = 0;
@@ -770,8 +755,6 @@ static_assert(sizeof(AmmUsageStatsData) == 0x18);
 static std::mutex                                       g_command_buffer_mutex;
 static std::unordered_map<uint64_t, CommandBufferState> g_command_buffers;
 static std::unordered_map<uint64_t, uint64_t>           g_command_buffer_aliases;
-static std::mutex                                       g_amm_auto_pool_mutex;
-static std::vector<AmmAutoPoolRange>                    g_amm_auto_pool;
 using CommandBufferIterator = std::unordered_map<uint64_t, CommandBufferState>::iterator;
 
 static bool HasQueuedCommands(const CommandBufferState& state) {
@@ -1227,48 +1210,20 @@ static int NormalizeAmmProtection(int prot) {
 	return normalized;
 }
 
-static bool AllocateAmmAutoDirectMemory(uint64_t size, int memory_type, uint64_t* dmem_offset) {
-	if (dmem_offset == nullptr || size == 0) {
-		return false;
-	}
-
-	std::scoped_lock lock(g_amm_auto_pool_mutex);
-
-	for (auto& range: g_amm_auto_pool) {
-		const auto aligned_used = (range.used + (AMM_PAGE_SIZE - 1u)) & ~(AMM_PAGE_SIZE - 1u);
-		if (aligned_used <= range.size && size <= range.size - aligned_used) {
-			*dmem_offset = range.start + aligned_used;
-			range.used   = aligned_used + size;
-			return true;
-		}
-	}
-
-	int64_t allocated = 0;
-	if (LibKernel::Memory::KernelAllocateDirectMemory(
-	        0, LibKernel::Memory::KernelGetDirectMemorySize(), size, AMM_PAGE_SIZE, memory_type,
-	        &allocated) != OK) {
-		return false;
-	}
-
-	*dmem_offset = static_cast<uint64_t>(allocated);
-	return true;
-}
-
 static int ExecuteAmmMapCommand(const CommandBufferState::AmmMapCommand& command) {
 	if (!ValidateAmmMapArgs(command.va, command.size)) {
 		return LibKernel::KERNEL_ERROR_EINVAL;
 	}
 
-	uint64_t dmem_offset = command.dmem_offset;
-	if (command.kind == AmmCommandKind::MapAuto &&
-	    !AllocateAmmAutoDirectMemory(command.size, command.type, &dmem_offset)) {
-		return LibKernel::KERNEL_ERROR_EAGAIN;
+	if (command.kind == AmmCommandKind::MapAuto) {
+		return LibKernel::Memory::MapAutomaticMemory(command.va, command.size, command.type,
+		                                             NormalizeAmmProtection(command.prot));
 	}
 
 	void* addr = reinterpret_cast<void*>(command.va);
 	return LibKernel::Memory::KernelMapDirectMemory2(
 	    &addr, command.size, command.type, NormalizeAmmProtection(command.prot), AMM_MAP_FIXED,
-	    static_cast<int64_t>(dmem_offset), AMM_PAGE_SIZE);
+	    static_cast<int64_t>(command.dmem_offset), AMM_PAGE_SIZE);
 }
 
 static bool AppendAmmMapRecord(uint64_t                                 command_buffer,
@@ -2360,25 +2315,15 @@ static int KYTY_SYSV_ABI AmmGiveDirectMemory(int64_t search_start, int64_t searc
                                              int64_t* dmem_offset) {
 	PRINT_NAME();
 
-	if (dmem_offset == nullptr || size == 0 ||
-	    (usage != AMM_USAGE_DIRECT && usage != AMM_USAGE_AUTO)) {
+	constexpr uint64_t block_size = 0x200000;
+	if (dmem_offset == nullptr || size == 0 || (size & (block_size - 1)) != 0 ||
+	    (align & (block_size - 1)) != 0 || (usage != AMM_USAGE_DIRECT && usage != AMM_USAGE_AUTO)) {
 		return LibKernel::KERNEL_ERROR_EINVAL;
 	}
 
-	int64_t allocated = 0;
-	int     result = LibKernel::Memory::KernelAllocateDirectMemory(search_start, search_end, size,
-	                                                               align, 0, &allocated);
-	if (result != OK) {
-		return result;
-	}
-
-	*dmem_offset = allocated;
-	if (usage == AMM_USAGE_AUTO) {
-		std::scoped_lock lock(g_amm_auto_pool_mutex);
-		g_amm_auto_pool.push_back(AmmAutoPoolRange {static_cast<uint64_t>(allocated), size, 0});
-	}
-
-	return OK;
+	return LibKernel::Memory::AllocateDirectMemory(search_start, search_end, size,
+	                                               align != 0 ? align : block_size, 0, dmem_offset,
+	                                               usage == AMM_USAGE_AUTO);
 }
 
 static void KYTY_SYSV_ABI AmmGetVirtualAddressRanges(uint64_t* va_start, uint64_t* va_end,
@@ -2386,19 +2331,18 @@ static void KYTY_SYSV_ABI AmmGetVirtualAddressRanges(uint64_t* va_start, uint64_
                                                      uint64_t* multimap_va_end) {
 	PRINT_NAME();
 
+	constexpr auto end = LibKernel::Memory::kExtendedMemoryBase + LibKernel::Memory::kExtendedMemorySize;
 	if (va_start != nullptr) {
-		AprShared::WriteGuest(reinterpret_cast<uint64_t>(va_start), AMM_VA_START);
+		AprShared::WriteGuest(reinterpret_cast<uint64_t>(va_start), LibKernel::Memory::kExtendedMemoryBase);
 	}
 	if (va_end != nullptr) {
-		AprShared::WriteGuest(reinterpret_cast<uint64_t>(va_end), AMM_VA_START + AMM_VA_SIZE);
+		AprShared::WriteGuest(reinterpret_cast<uint64_t>(va_end), end);
 	}
 	if (multimap_va_start != nullptr) {
-		AprShared::WriteGuest(reinterpret_cast<uint64_t>(multimap_va_start),
-		                      AMM_VA_START + AMM_VA_SIZE / 2u);
+		AprShared::WriteGuest(reinterpret_cast<uint64_t>(multimap_va_start), end);
 	}
 	if (multimap_va_end != nullptr) {
-		AprShared::WriteGuest(reinterpret_cast<uint64_t>(multimap_va_end),
-		                      AMM_VA_START + AMM_VA_SIZE);
+		AprShared::WriteGuest(reinterpret_cast<uint64_t>(multimap_va_end), end);
 	}
 }
 

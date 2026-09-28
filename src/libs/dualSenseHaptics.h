@@ -7,12 +7,18 @@ namespace Libs::Controller::DualSenseHaptics {
 
 struct Stream;
 
-Stream* Open(uint32_t freq);
+// A speaker stream plays a pad speaker port and routes the speaker to it; the others play vibration
+// ports on the actuators.
+Stream* Open(uint32_t freq, bool speaker);
 void    Close(Stream* stream);
-void    Queue(Stream* stream, int controller, const void* data, uint32_t frames, uint32_t channels,
-              bool is_float, const int* volume);
+// Returns how long the queued audio still plays, in microseconds, or 0 when no DualSense took it
+// (the active pad has no usable USB audio device or its speaker cannot be routed).
+// Multiple DualSenses or matching audio endpoints are ambiguous and are not selected.
+uint64_t Queue(Stream* stream, int controller, const void* data, uint32_t frames, uint32_t channels,
+               bool is_float, const int* volume);
 // Returns false for other gamepad types, which retain the normal rumble path.
 bool SetVibration(int controller, uint8_t large_motor, uint8_t small_motor);
+// Also restores the headphone routing.
 void Shutdown();
 
 } // namespace Libs::Controller::DualSenseHaptics

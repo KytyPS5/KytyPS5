@@ -3,6 +3,26 @@
 Обновлено **28 сентября 2026 года**. Игра: **Ghost of Yōtei, PPSA26344**.
 Рабочая ветка — `yotei-windows-bringup` в локальном fork `fxpw/KytyPS5`.
 
+Checkpoint свежей интеграции upstream `22ff4693` **28 сентября 2026 года**:
+
+- 26 конфликтных файлов разрешены с сохранением bounded/inline resource tables,
+  wave64/D16 и strict FP64 admission. Старые неиспользуемые CFG helper paths
+  удалены при переходе на новый transactional structurizer.
+- Перед production corrections зафиксированы RED: descriptor cleanup терял
+  runtime table selector, tracking DCE пропускал validation preplanned IR,
+  record-key capture терял writable alias rejection, UInt sampler routing
+  расходился с новым integer-border policy. Подробности в emulator-test-debt.
+- Native Windows emulator/launcher/kyty_tests build GREEN:
+  `merge-22ff-build9-20260928.log`. Required CTest **22/22**, дополнительные
+  upstream CPU tests **12/12**; shared-merge CFG execution/SPIR-V GREEN.
+- Numerical GPU: bounded Raw/Formatted/D16/Scalar **4/4**, соседние
+  zero-stride/format-store/D16/indirect-image/F64-conversion **5/5**,
+  sampler-border GREEN после его отдельного RED. Логи `merge-22ff-verified-*.txt`,
+  `merge-22ff-sampler-border-green-20260928.txt`.
+- Install и game retry на завершённой интеграции pending. Последняя реальная
+  граница пока CS `8457901d80b91921`, bounded SRT materialization failed,
+  shown=161; ненулевой кадр, меню и gameplay не подтверждены.
+
 Checkpoint bounded zero-stride lowering **28 сентября 2026 года**:
 
 - `56429ffd` — переносимая aggregate initialization двух CPU fixtures вместо

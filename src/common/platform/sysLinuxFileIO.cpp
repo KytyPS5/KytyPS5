@@ -54,7 +54,7 @@ struct sys_file_t {
 #endif
 
 static std::filesystem::path get_internal_name(const std::filesystem::path& name) {
-	return name.is_absolute() ? name : (std::filesystem::path(".") / name);
+	return name.empty() || name.is_absolute() ? name : (std::filesystem::path(".") / name);
 }
 
 // Pass access-pattern hints to the host.

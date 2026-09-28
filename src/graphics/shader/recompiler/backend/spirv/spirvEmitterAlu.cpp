@@ -420,6 +420,11 @@ uint32_t EmitConvertU32F32(EmitterState& state, uint32_t arg0) {
 	return EmitF32ToU32(state, arg0, false);
 }
 
+uint32_t EmitConvertF64F32(EmitterState& state, uint32_t arg0) {
+	return EmitNative<spv::OpFConvert, IR::Type::F64>(state,
+	                                                  EmitFlushF32DenormToSignedZero(state, arg0));
+}
+
 uint32_t EmitCompositeExtractU64(EmitterState& state, uint32_t arg0, IR::Value arg1) {
 	return EmitNative<spv::OpCompositeExtract, IR::Type::U32>(state, arg0, arg1.U32());
 }

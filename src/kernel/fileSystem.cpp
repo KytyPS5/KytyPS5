@@ -358,7 +358,8 @@ std::filesystem::path MountPoints::ResolvePath(const std::string& mounted_name) 
 #endif
 	}
 
-	return mounted_name;
+	// Unmounted guest paths must not fall through to the host filesystem.
+	return {};
 }
 
 void Initialize() {
@@ -461,6 +462,10 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 	}
 
 	file->real_name = g_mount_points->ResolvePath(file->name);
+	if (file->real_name.empty()) {
+		g_files->DeleteDescriptor(descriptor);
+		return KERNEL_ERROR_ENOENT;
+	}
 
 	if (trunc && rw_mode == Common::File::Mode::Read) {
 		g_files->DeleteDescriptor(descriptor);
@@ -1255,7 +1260,7 @@ int KYTY_SYSV_ABI KernelRename(const char* from, const char* to) {
 	auto real_from = g_mount_points->ResolvePath(from_path);
 	auto real_to   = g_mount_points->ResolvePath(to_path);
 
-	if (!Common::File::IsFileExisting(real_from)) {
+	if (real_to.empty() || !Common::File::IsFileExisting(real_from)) {
 		return KERNEL_ERROR_ENOENT;
 	}
 
@@ -1335,6 +1340,9 @@ int KYTY_SYSV_ABI KernelMkdir(const char* path, uint16_t mode) {
 	     path, mode);
 
 	auto real_name = g_mount_points->ResolvePath(std::string(path));
+	if (real_name.empty()) {
+		return KERNEL_ERROR_ENOENT;
+	}
 
 	if (Common::File::IsDirectoryExisting(real_name)) {
 		return KERNEL_ERROR_EEXIST;

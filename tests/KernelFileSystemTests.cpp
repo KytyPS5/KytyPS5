@@ -132,7 +132,7 @@ void CheckMountRoot(const std::filesystem::path &root) {
   FileSystem::Mount(root, "/app0");
   Check(FileSystem::GetRealFilename("/app0/rpf.cache") == root / "rpf.cache",
         "resolve mount descendant");
-  Check(FileSystem::GetRealFilename("/app01/rpf.cache") == "/app01/rpf.cache",
+  Check(FileSystem::GetRealFilename("/app01/rpf.cache").empty(),
         "mount prefix must end at a path component");
 
   for (const char *path : {"/app0", "/app0/"}) {
@@ -162,16 +162,56 @@ void CheckMountRoot(const std::filesystem::path &root) {
     }
   }
   FileSystem::Umount("/app0");
-  Check(FileSystem::GetRealFilename("/app0/rpf.cache") == "/app0/rpf.cache",
+  Check(FileSystem::GetRealFilename("/app0/rpf.cache").empty(),
         "unmount by guest path");
   for (const auto &folder : {root, root / ""}) {
     for (const auto &host : {root, root / ""}) {
       FileSystem::Mount(folder, "/app0");
       FileSystem::Umount(Common::PathToGenericString(host));
-      Check(FileSystem::GetRealFilename("/app0/rpf.cache") == "/app0/rpf.cache",
+      Check(FileSystem::GetRealFilename("/app0/rpf.cache").empty(),
             "unmount by host path with or without trailing separator");
     }
   }
+}
+
+void CheckUnmappedPaths(const std::filesystem::path &root) {
+  const auto host_file = root / "host-only.dat";
+  const auto host_path = Common::PathToGenericString(host_file);
+  Common::File fixture;
+  Check(fixture.Create(host_file), "create unmapped host file");
+  fixture.Close();
+
+  FileSystem::FileStat stat {};
+  Check(FileSystem::GetRealFilename(host_path).empty() &&
+            FileSystem::KernelOpen(host_path.c_str(), 0, 0) ==
+                Libs::LibKernel::KERNEL_ERROR_ENOENT &&
+            FileSystem::KernelStat(host_path.c_str(), &stat) ==
+                Libs::LibKernel::KERNEL_ERROR_ENOENT &&
+            FileSystem::KernelCheckReachability(host_path.c_str()) ==
+                Libs::LibKernel::KERNEL_ERROR_ENOENT,
+        "existing host files are absent from the guest namespace");
+  Check(FileSystem::KernelUnlink(host_path.c_str()) ==
+            Libs::LibKernel::KERNEL_ERROR_ENOENT &&
+            FileSystem::KernelRmdir(Common::PathToGenericString(root).c_str()) ==
+                Libs::LibKernel::KERNEL_ERROR_ENOENT &&
+            std::filesystem::exists(host_file),
+        "unmapped host files and directories cannot be removed");
+
+  const auto missing = Common::PathToGenericString(root / "unmapped-create");
+  Check(FileSystem::KernelOpen(missing.c_str(), 0x601, 0777) ==
+            Libs::LibKernel::KERNEL_ERROR_ENOENT &&
+            FileSystem::KernelMkdir(missing.c_str(), 0777) ==
+                Libs::LibKernel::KERNEL_ERROR_ENOENT &&
+            !std::filesystem::exists(root / "unmapped-create"),
+        "creation requires a mounted guest destination");
+
+  FileSystem::Mount(root, "/app0");
+  Check(FileSystem::KernelRename("/app0/host-only.dat", missing.c_str()) ==
+            Libs::LibKernel::KERNEL_ERROR_ENOENT &&
+            std::filesystem::exists(host_file) &&
+            !std::filesystem::exists(root / "unmapped-create"),
+        "rename to an unmapped destination preserves the source");
+  FileSystem::Umount("/app0");
 }
 
 void CheckUnicodePaths(const std::filesystem::path &root) {
@@ -548,6 +588,7 @@ int main(int, char**) {
   TempDirectory temporary;
   FileSystem::Initialize();
   CheckMountRoot(temporary.Path());
+  CheckUnmappedPaths(temporary.Path());
   CheckUnicodePaths(temporary.Path());
   CheckUnicodeLogPath(temporary.Path());
   CheckDirectoryStream(temporary.Path());

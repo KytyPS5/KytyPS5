@@ -159,7 +159,12 @@ uint32_t GuestAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Mem
 			ctx.Fail(inst, "has no address base pair");
 			return ConstantDeviceAddress(state, 0);
 		}
-		const auto base = DeviceAddressFromWords(state, ctx.Arg(*handle, 0), ctx.Arg(*handle, 1));
+		auto base_low = ctx.Arg(*handle, 0);
+		if (mem.kind == IR::ResourceKind::ScalarAddress) {
+			base_low = Binary(state, spv::OpBitwiseAnd, TypeU32(state), base_low,
+			                  ConstantU32(state, ~3u));
+		}
+		const auto base = DeviceAddressFromWords(state, base_low, ctx.Arg(*handle, 1));
 		address         = Binary(state, spv::OpIAdd, TypeScalarU64(state), base,
 		                         Unary(state, spv::OpUConvert, TypeScalarU64(state), low));
 	}
@@ -1363,7 +1368,14 @@ void DefineGetBdaPointer(EmitterState& state) {
 	state.builder.AddFunction(spv::OpFunctionParameter, type, address);
 	EmitLabel(state, entry_label);
 
-	const auto page64        = Binary(state, spv::OpShiftRightLogical, type, address,
+	const auto extended = Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), address,
+	                             ConstantDeviceAddress(state, LibKernel::Memory::kExtendedMemoryBase));
+	const auto packed = Select(state, type, extended,
+	                           Binary(state, spv::OpISub, type, address,
+	                                  ConstantDeviceAddress(state,
+	                                      LibKernel::Memory::kExtendedMemoryBase - LOWER_ADDRESS_SIZE)),
+	                           address);
+	const auto page64        = Binary(state, spv::OpShiftRightLogical, type, packed,
 	                                  ConstantDeviceAddress(state, BufferCache::CACHING_PAGEBITS));
 	const auto page          = Unary(state, spv::OpUConvert, TypeU32(state), page64);
 	const auto entry_pointer = state.builder.AllocateId();
@@ -1526,16 +1538,27 @@ uint32_t EmitAppendConsume(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (ctx.half == 1) {
 		return ctx.other_half->Def(IR::Value(const_cast<IR::Inst*>(&inst)));
 	}
-	const auto m0 = ctx.Arg(inst, 0);
-	const auto base =
-	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), m0, ConstantU32(state, 16));
-	const auto size =
-	    Binary(state, spv::OpBitwiseAnd, TypeU32(state), m0, ConstantU32(state, 0xffffu));
-	const auto address = Binary(state, spv::OpIAdd, TypeU32(state), base,
-	                            ConstantU32(state, ctx.Memory(inst).offset));
+	const auto mem           = ctx.Memory(inst);
+	const auto offset        = mem.offset & 0xfffcu;
+	auto       address       = ConstantU32(state, offset);
+	uint32_t   region_bounds = 0;
+	if (mem.kind == IR::ResourceKind::Gds) {
+		const auto m0 = ctx.Arg(inst, 0);
+		const auto base =
+		    Binary(state, spv::OpShiftRightLogical, TypeU32(state), m0, ConstantU32(state, 16));
+		const auto size =
+		    Binary(state, spv::OpBitwiseAnd, TypeU32(state), m0, ConstantU32(state, 0xffffu));
+		address = Binary(state, spv::OpIAdd, TypeU32(state), base, address);
+		// The entire M0 region must fit the PS5's 48 KiB GDS partition.
+		region_bounds = AndCondition(
+		    state, Binary(state, spv::OpULessThan, TypeBool(state),
+		                  ConstantU32(state, offset + 3u), size),
+		    Binary(state, spv::OpULessThanEqual, TypeBool(state),
+		           Binary(state, spv::OpIAdd, TypeU32(state), base, size),
+		           ConstantU32(state, 0xc000u)));
+	}
 	const auto raw_index =
 	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), address, ConstantU32(state, 2));
-	const auto mem    = ctx.Memory(inst);
 	const auto access = PrepareMemoryResourceAccess(state, mem);
 	const auto index  = EmitMemoryElementIndex(state, access, raw_index);
 	const auto exec   = ctx.Arg(inst, 1);
@@ -1554,19 +1577,17 @@ uint32_t EmitAppendConsume(ValueEmitContext& ctx, const IR::Inst& inst) {
 	        : first;
 	const auto is_first       = Binary(state, spv::OpIEqual, TypeBool(state),
 	                                   EmitSubgroupLocalInvocationId(state), source_lane);
-	const auto storage_bounds = EmitMemoryElementInBounds(state, access, index);
-	const auto m0_bounds =
-	    mem.kind == IR::ResourceKind::Gds
-	        ? Binary(state, spv::OpINotEqual, TypeBool(state), size, ConstantU32(state, 0))
-	        : Binary(state, spv::OpULessThan, TypeBool(state),
-	                 ConstantU32(state, ctx.Memory(inst).offset + 3u), size);
+	auto bounds = EmitMemoryElementInBounds(state, access, index);
+	if (mem.kind == IR::ResourceKind::Gds) {
+		bounds = AndCondition(state, bounds, region_bounds);
+	}
 	const auto condition = AndCondition(
 	    state, is_first,
 	    AndCondition(state,
 	                 state.lane_count == 2 ? Binary(state, spv::OpINotEqual, TypeBool(state), count,
 	                                                ConstantU32(state, 0))
 	                                       : exec,
-	                 AndCondition(state, storage_bounds, m0_bounds)));
+	                 bounds));
 	const auto atomic = EmitValueOrZeroIfCondition(state, condition, [&]() {
 		const auto value = state.builder.AllocateId();
 		state.builder.AddFunction(append ? spv::OpAtomicIAdd : spv::OpAtomicISub, TypeU32(state),
@@ -1600,10 +1621,11 @@ void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (mem.planning_only) return;
 	auto& state        = ctx.state;
 	mem.kind           = IR::ResourceKind::ScalarBuffer;
-	const auto address = Binary(state, spv::OpIAdd, TypeU32(state), ctx.Arg(inst, 1),
-	                            ConstantU32(state, mem.offset));
-	const auto index =
-	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), address, ConstantU32(state, 2));
+	auto index = Binary(state, spv::OpShiftRightLogical, TypeU32(state), ctx.Arg(inst, 1),
+	                    ConstantU32(state, 2));
+	if (mem.offset >= 4u) {
+		index = Binary(state, spv::OpIAdd, TypeU32(state), index, ConstantU32(state, mem.offset >> 2u));
+	}
 	const auto access    = PrepareMemoryResourceAccess(state, mem);
 	const auto element   = EmitMemoryElementIndex(state, access, index);
 	const auto condition = EmitMemoryElementInBounds(state, access, element);
@@ -1650,6 +1672,8 @@ void EmitLoadMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 		value = LoadWideBuffer(ctx, inst, buffer_components);
 	else if (shared_components > 1u)
 		value = LoadWideShared(ctx, inst, shared_components);
+	else if (mem.kind == IR::ResourceKind::ScalarAddress)
+		value = LoadBdaDword(ctx, GuestAddress(ctx, inst, mem));
 	else if (address_info.access == IR::AddressAccess::Read &&
 	         mem.kind != IR::ResourceKind::Scratch)
 		value = LoadBda(ctx, GuestAddress(ctx, inst, mem), ctx.Arg(inst, inst.NumArgs() - 1),

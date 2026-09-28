@@ -29,6 +29,10 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(xbyak zydis)
 
 set(SDL_SHARED OFF CACHE BOOL "" FORCE)
+if(APPLE)
+	# SDL's built-in iconv fallback does not support CP932.
+	set(SDL_SYSTEM_ICONV ON CACHE BOOL "Use system iconv for CP932 conversion" FORCE)
+endif()
 add_subdirectory(SDL3)
 
 add_library(Vulkan-Headers INTERFACE)

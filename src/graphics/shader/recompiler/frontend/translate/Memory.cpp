@@ -238,6 +238,7 @@ Decoder::Operand MemorySourceAt(const Decoder::Instruction& decoded, uint32_t in
 				return index == 0u ? decoded.src0 : MakeImmediate(decoded.offset & 0xffffu);
 			case Decoder::Opcode::DS_CONSUME:
 			case Decoder::Opcode::DS_APPEND:
+				return decoded.gds ? MakeM0Operand() : MakeImmediate(0);
 			case Decoder::Opcode::DS_READ_ADDTID_B32: return MakeM0Operand();
 			case Decoder::Opcode::DS_WRITE_ADDTID_B32:
 				return index == 0u ? decoded.src1 : MakeM0Operand();
@@ -885,8 +886,7 @@ void Translator::DS_MINMAX_F32(const Decoder::Instruction& inst, IR::ValueOpcode
 void Translator::DS_APPEND_CONSUME(const Decoder::Instruction& inst, IR::ValueOpcode opcode) {
 	const auto memory = MemoryInfoFromDecoded(inst);
 	WriteOperand(inst.dst, ir.Emit(opcode,
-	                               {ReadU32(MemorySourceAt(inst, 0)), ir.GetExec(), ir.GetExecLo(),
-	                                ir.GetExecHi()},
+	                               {ReadU32(MemorySourceAt(inst, 0)), ir.GetExec()},
 	                               AddMemoryInfo(memory, inst.pc)));
 }
 

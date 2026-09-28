@@ -160,6 +160,7 @@ enum class Opcode {
 	V_RCP_F64,
 	V_MUL_F64,
 	V_FMA_F64,
+	V_CVT_F64_F32,
 	V_CVT_F32_I32,
 	V_CVT_F32_U32,
 	V_CVT_U32_F32,

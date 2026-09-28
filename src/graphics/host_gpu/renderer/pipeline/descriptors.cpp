@@ -291,8 +291,8 @@ bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor, bo
 	constexpr uint32_t htile_control = 0x00280000u;
 	const uint32_t expected_control  = htile_control | (descriptor.MsaaDepth() ? (1u << 10u) : 0u);
 	const auto     metadata_addr     = descriptor.MetaAddr() << 8u;
-	return metadata_control == expected_control && metadata_addr != 0 &&
-	       metadata_addr < TRACKER_ADDRESS_SIZE && (metadata_addr & 0x7fffu) == 0 &&
+	return metadata_control == expected_control && GuestRange {metadata_addr, 1}.Valid() &&
+	       (metadata_addr & 0x7fffu) == 0 &&
 	       descriptor.TileMode() == Prospero::TileMode::kDepth;
 }
 
@@ -1180,16 +1180,17 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 
 static vk::Sampler NativeSampler(RenderContext&                                  context,
                                  const ShaderRecompiler::IR::CompiledShaderInfo& program,
-                                 uint32_t                                        index,
-                                 const ShaderRecompiler::IR::DescriptorValue&    value) {
-	auto descriptor = DecodeNativeDescriptor<ShaderSamplerResource>(value);
-	if (!program.info.samplers[index].depth_compare) {
+                                 uint32_t index,
+                                 const ShaderRecompiler::IR::DescriptorValue& value) {
+	auto        descriptor = DecodeNativeDescriptor<ShaderSamplerResource>(value);
+	const auto& sampler = program.info.samplers[index];
+	if (!sampler.depth_compare) {
 		descriptor.fields[0] &= ~(0x7u << 12u);
 	}
-	if (program.info.samplers[index].force_point_filtering) {
+	if (sampler.force_point_filtering) {
 		descriptor.SetPointFiltering();
 	}
-	return context.GetSamplerCache().GetSampler(descriptor);
+	return context.GetSamplerCache().GetSampler(descriptor, sampler.integer_border);
 }
 
 static vk::DescriptorBufferInfo NativeUpload(RenderContext&            context,

@@ -1435,6 +1435,11 @@ static void Ngs2FinishBlock(Ngs2VoiceInternal& voice) {
 		}
 		++block.repeated_count;
 		block.cursor = 0;
+		if (voice.decoder != nullptr) {
+			block.data_cursor = 0;
+			voice.compressed_input.clear();
+			voice.decoder->Reset();
+		}
 	}
 	const Ngs2VoiceCallbackInfo info {voice.callback_data,
 	                                  reinterpret_cast<uintptr_t>(&voice),
@@ -2396,8 +2401,7 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 								block.num_samples      = 0;
 							}
 							EXIT_NOT_IMPLEMENTED(block.num_repeats != 0 &&
-							                     (voice->rack->type != Ngs2RackType::Sampler ||
-							                      voice->decoder != nullptr));
+							                     voice->rack->type != Ngs2RackType::Sampler);
 							EXIT_NOT_IMPLEMENTED(
 							    voice->decoder == nullptr &&
 							    (uint64_t(block.num_skip_samples) + block.num_samples) *

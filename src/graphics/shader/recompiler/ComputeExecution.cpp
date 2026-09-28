@@ -83,7 +83,7 @@ bool IsSupportedSplitOperation(O op) {
 	    IR::SharedAccessOf(op) == IR::SharedAccess::Read ||
 	    IR::SharedAccessOf(op) == IR::SharedAccess::Write) return true;
 	switch (op) {
-		case O::Void: case O::Reference: case O::ReferenceU32:
+		case O::Void: case O::Reference: case O::ReferenceU32: case O::ConditionRef:
 		case O::GetUserData: case O::GetShaderBase: case O::GetBuiltin:
 		case O::UndefU1: case O::UndefU8: case O::UndefU16: case O::UndefU32: case O::UndefU64:
 		case O::LaneId: case O::Ballot: case O::ReadLane: case O::ReadFirstLane: case O::WriteLane:
@@ -100,6 +100,9 @@ bool HasWaveOperations(const IR::Program& program) {
 	    program.spirv_requirements->subgroup_shuffle || program.spirv_requirements->subgroup_local_invocation_id)) return true;
 	for (const auto* block : program.blocks) for (const auto& inst : *block) {
 		switch (inst.GetOpcode()) {
+			case O::ConditionRef:
+				if (inst.Flags<CFG::BranchCondition>() != CFG::BranchCondition::ScalarInstruction) return true;
+				break;
 			case O::Ballot: case O::LaneId: case O::ReadLane: case O::ReadFirstLane:
 			case O::WriteLane: case O::WqmU64: case O::DppMoveU32: case O::DppUpdateU32:
 			case O::Dpp8MoveU32: case O::Dpp8UpdateU32: case O::Permlane16U32:
@@ -580,6 +583,11 @@ std::string ProveSplitWaveConvergence(const IR::Program& program, bool partition
 			} else if (op == O::GetBuiltin) {
 				is_uniform = inst->Arg(0).IsImmediate() &&
 				             static_cast<IR::StageInputKind>(inst->Arg(0).U32()) == IR::StageInputKind::WorkgroupId;
+			} else if (op == O::ConditionRef) {
+				// Native mask branches reduce the predicate across both guest wave halves.
+				// Scalar instruction branches instead preserve operand uniformity.
+				is_uniform = inst->Flags<CFG::BranchCondition>() != CFG::BranchCondition::ScalarInstruction ||
+				             uniform(inst->Arg(0));
 			} else if (op == O::ReadLane) {
 				is_uniform = uniform(inst->Arg(1));
 			} else if (op == O::Ballot || op == O::ReadFirstLane || op == O::GetUserData || op == O::GetShaderBase) {

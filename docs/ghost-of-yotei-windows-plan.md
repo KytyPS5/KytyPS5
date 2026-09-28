@@ -3,6 +3,21 @@
 Обновлено **28 сентября 2026 года**. Игра: **Ghost of Yōtei, PPSA26344**.
 Рабочая ветка — `yotei-windows-bringup` в локальном fork `fxpw/KytyPS5`.
 
+Checkpoint wave64 `ConditionRef` **28 сентября 2026 года**:
+
+- Свежий merge `4fcc3575` собран/установлен и normal-pushed; PR #497
+  `MERGEABLE`, exact-head CI `36456692100` ещё выполняется.
+- 1280×720 GPUAV+SyncDiag retry `yotei-integrated-20260928-171407-menucheck-gpuav-sync`
+  на этом commit завершился exit 321 при shown=0: CS `a7661ff4ea282325`,
+  wave64 splitting does not support operation ConditionRef. Installed SHA-256
+  `CE6876FDBAA7237A8684D32EC7E1009C21300500C92DD1C4B434AF27D98E37DC`.
+- Синтетическая CPU-регрессия воспроизвела этот отказ до production fix.
+  Общий planner теперь учитывает whole-wave mask reduction и сохраняет
+  varying ScalarInstruction rejection. GREEN 14-input matrix + 6 соседних
+  CPU/CFG selectors; CTest 22/22; numerical subvector/VCC и cooperative LDS 9/9.
+  Логи `condition-ref-{red,green,ctest,multiwave-gpu}-20260928.*`.
+- Повтор игры с исправлением pending; ненулевой кадр/меню/gameplay не подтверждены.
+
 Checkpoint свежей интеграции upstream `22ff4693` **28 сентября 2026 года**:
 
 - 26 конфликтных файлов разрешены с сохранением bounded/inline resource tables,

@@ -10995,6 +10995,36 @@ struct CooperativeExecutionFixture {
   }
 };
 
+void TestWave64ConditionRefAdmission() {
+  using F = CooperativeExecutionFixture;
+  using O = F::O;
+  using V = F::V;
+  using C = ShaderRecompiler::CFG::BranchCondition;
+  for (const auto kind : {C::ScalarInstruction, C::ExecZero, C::ExecNonZero,
+                          C::VccZero, C::VccNonZero, C::SccZero, C::SccNonZero}) {
+    for (const bool varying : {false, true}) {
+      F f;
+      const auto body = f.AddBlock();
+      const auto finish = f.AddBlock();
+      f.Emit(0, O::Barrier);
+      const auto predicate = varying ? f.Emit(0, O::INotEqual32, {f.lane, V(0u)}) : V(true);
+      const auto condition = f.Emit(0, O::ConditionRef, {predicate});
+      condition.TryInstruction()->SetFlags(kind);
+      f.Conditional(0, body, finish, condition);
+      f.KeepWave(body);
+      f.Branch(body, finish);
+      f.KeepWave(finish);
+      const auto plan = f.Plan();
+      if (varying && kind == C::ScalarInstruction) {
+        Check(!plan.error.empty(), "varying scalar ConditionRef bypassed wave64 convergence proof");
+      } else {
+        Check(plan.error.empty() && plan.IsSplitWave64() && plan.IsCooperativeWave64(),
+              "native ConditionRef lost whole-wave branch reduction in cooperative planning");
+      }
+    }
+  }
+}
+
 void TestCooperativeWave64GeometryAndBudget() {
   using F=CooperativeExecutionFixture;
   using O=F::O;
@@ -11150,7 +11180,7 @@ void TestCooperativeWave64OperationBoundaries() {
       if (scenario==Scenario::Gds) {
         // factor==1 must not accidentally enable the earlier one-wave GDS path.
         const auto append=f.Shared(0,O::DataAppend,
-            {V(0x00040004u),V(true),V(0xffffffffu),V(0xffffffffu)},1u);
+            {V(0x00040004u),V(true)},1u);
         f.Emit(0,O::ReferenceU32,{append});
       } else {
         const auto handle=f.Emit(0,O::GetScratchResource);
@@ -11293,35 +11323,21 @@ void TestScalarMaskBranchUsesWholeWave() {
       Check(!condition.IsEmpty() && !condition.Resolve().IsImmediate(),
             "scalar mask branch lost its condition");
       auto *root = condition.ResolveInstruction();
-      Check(root != nullptr, "scalar mask branch lost its condition");
-      if (nonzero) {
-        Check(root->GetOpcode() == IR::ValueOpcode::LogicalNot,
-              "nonzero scalar mask branch did not invert the zero test");
-        root = root->Arg(0).ResolveInstruction();
-      }
-      Check(root != nullptr && root->GetOpcode() == IR::ValueOpcode::IEqual32,
-            "scalar mask branch is lane-varying instead of testing the whole mask");
+      const auto kind = vcc ? (nonzero ? CFG::BranchCondition::VccNonZero : CFG::BranchCondition::VccZero)
+                            : (nonzero ? CFG::BranchCondition::ExecNonZero : CFG::BranchCondition::ExecZero);
+      Check(root != nullptr && root->GetOpcode() == IR::ValueOpcode::ConditionRef &&
+                root->Flags<CFG::BranchCondition>() == kind,
+            "scalar mask branch lost its native whole-wave reduction metadata");
       auto *mask = root->Arg(0).ResolveInstruction();
-      Check(mask != nullptr, "scalar mask branch lost its mask source");
-      if (wave_size == 64u) {
-        Check(mask->GetOpcode() == IR::ValueOpcode::BitwiseOr32,
-              "wave64 scalar mask branch ignored the upper mask half");
-        const auto *low = mask->Arg(0).ResolveInstruction();
-        const auto *high = mask->Arg(1).ResolveInstruction();
-        Check(low != nullptr && high != nullptr &&
-                  low->GetOpcode() == (vcc ? IR::ValueOpcode::GetVccLo
-                                          : IR::ValueOpcode::GetExecLo) &&
-                  high->GetOpcode() == (vcc ? IR::ValueOpcode::GetVccHi
-                                           : IR::ValueOpcode::GetExecHi),
-              "wave64 scalar mask branch read the wrong mask halves");
-      } else {
-        Check(mask->GetOpcode() == (vcc ? IR::ValueOpcode::GetVccLo
-                                         : IR::ValueOpcode::GetExecLo),
-              "wave32 scalar mask branch read the wrong low mask");
+      if (!nonzero) {
+        Check(mask != nullptr && mask->GetOpcode() == IR::ValueOpcode::LogicalNot,
+              "zero scalar mask branch did not negate its lane predicate");
+        mask = mask->Arg(0).ResolveInstruction();
       }
-      Check(root->Arg(1).Resolve().IsImmediate() &&
-                root->Arg(1).Resolve().U32() == 0u,
-            "scalar mask branch did not compare its mask against zero");
+      Check(mask != nullptr && mask->GetOpcode() ==
+                (vcc ? IR::ValueOpcode::GetVcc : IR::ValueOpcode::GetExec),
+            "scalar mask branch selected the wrong native mask predicate");
+      Check(program.wave_size == wave_size, "scalar mask branch lost its guest wave size");
     }
   }
 }
@@ -18635,6 +18651,11 @@ int main(int argc, char* argv[]) {
     std::puts("KYTY_COOPERATIVE_AUTOPROMOTION_PASS");
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--wave64-condition-ref-only") == 0) {
+    Libs::Graphics::TestWave64ConditionRefAdmission();
+    std::puts("KYTY_WAVE64_CONDITION_REF_PASS");
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--cooperative-wave64-admission-only") == 0) {
     Libs::Graphics::TestCooperativeWave64GeometryAndBudget();
     Libs::Graphics::TestCooperativeWave64BarrierOrderAndControl();
@@ -18976,6 +18997,7 @@ int main(int argc, char* argv[]) {
   TestSingletonLdsStoresDoNotNeedAtomics();
   TestMixedComparisonImagesUseSeparateSpirvVariables();
   TestComputeExecutionWaveScratchBudget();
+  TestWave64ConditionRefAdmission();
   TestCooperativeWave64GeometryAndBudget();
   TestCooperativeWave64BarrierOrderAndControl();
   TestCooperativeWave64OperationBoundaries();

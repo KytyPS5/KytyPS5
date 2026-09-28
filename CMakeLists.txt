@@ -640,6 +640,8 @@ if(BUILD_TESTING)
 		add_test(NAME shader_f64_admission
 		         COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --f64-admission-positive-only)
 	endif()
+	add_test(NAME wave64_condition_ref
+	         COMMAND $<TARGET_FILE:shader_cfg_tests> --wave64-condition-ref-only)
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)

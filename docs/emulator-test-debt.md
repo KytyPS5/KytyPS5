@@ -1,5 +1,31 @@
 # Emulator regression test debt
 
+## Wave64 ConditionRef admission (2026-09-28)
+
+Game retry on 4fcc3575 reaches a controlled ConditionRef rejection, shown=0:
+`yotei-integrated-20260928-171407-menucheck-gpuav-sync` (CS a7661ff4ea282325).
+Before changing production add a synthetic CPU matrix of native mask conditions
+with varying lane predicates and ScalarInstruction with uniform/varying inputs.
+Mask conditions already reduce both halves in the backend; scalar instruction
+conditions must retain their operand uniformity and divergent rejection.
+CPU RED confirmed: `condition-ref-red-20260928.txt`, intended assertion
+"native ConditionRef lost whole-wave branch reduction in cooperative planning".
+Run the fixture RED/GREEN unchanged, existing scalar-mask numerical/Spir-V
+cases, cooperative admission, and repeat the original game.
+
+Neighbor fixture API updates: `condition-ref-cooperative-20260928.txt`
+asserts while constructing retired four-argument DataAppend (now two args);
+`condition-ref-mask-oracle-old-20260928.txt` asserts on retired integer mask
+IR. Adapt fixtures to current signatures and ConditionRef kind/predicate,
+retaining input matrix and rejection oracles. These are fixture compatibility
+failures, not additional production RED evidence.
+
+ConditionRef GREEN: unchanged 14-input admission matrix and six neighboring
+CPU/CFG selectors (`condition-ref-neighbor-*.txt`), mandatory CTest 22/22
+(`condition-ref-ctest-20260928.log`). Numerical GPU: wave64 subvector loops
+and VCC branch pass; multi-wave LDS/cooperative selector 9/9 passes
+(`condition-ref-multiwave-gpu-20260928.txt`). No unsupported-case guards removed.
+
 ## Fresh upstream 22ff integration regressions (2026-09-28)
 
 Native merge build succeeds (`merge-22ff-build3-20260928.log`). Existing unchanged

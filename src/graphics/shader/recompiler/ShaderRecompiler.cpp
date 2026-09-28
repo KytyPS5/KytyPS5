@@ -623,13 +623,21 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		IR::EliminateDeadCode(ir.blocks);
 	}
 	LowerTessellationMemory(ir, options);
+	std::string cfg_dump;
+	if (options.dump_ir) {
+		cfg_dump = CFG::GraphToString(cfg);
+		if (options.early_dump) {
+			LOGF("%s native IR before resource tracking:\n%s", GetDumpLabel(options),
+			     MakeIrDump(cfg_dump, ir).c_str());
+		}
+	}
 	IR::TrackResources(ir, decoded, native_cfg);
 	IR::EliminateDeadCode(ir.blocks);
 	TranslateResult result;
 	result.program = std::move(ir);
 	if (options.dump_ir) {
 		result.decoded_dump = std::move(decoded_dump);
-		result.cfg_dump     = CFG::GraphToString(cfg);
+		result.cfg_dump     = std::move(cfg_dump);
 	}
 	return result;
 }

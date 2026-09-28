@@ -1191,6 +1191,35 @@ private:
 		return left_ballot != nullptr && left_ballot == right_ballot;
 	}
 
+	bool IsNativeExecMaskGuard(Value condition, Value active, bool& nonempty_true) const {
+		condition = condition.Resolve();
+		active = active.Resolve();
+		bool invert = false;
+		std::unordered_set<const Inst*> visited;
+		while (const auto* inst = condition.TryInstruction()) {
+			if (!visited.insert(inst).second) return false;
+			if (inst->GetOpcode() != ValueOpcode::LogicalNot || inst->NumArgs() != 1u) break;
+			invert = !invert;
+			condition = inst->Arg(0).Resolve();
+		}
+		const auto* reference = condition.TryInstruction();
+		if (reference == nullptr || reference->GetOpcode() != ValueOpcode::ConditionRef ||
+		    reference->NumArgs() != 1u) return false;
+		const auto kind = reference->Flags<CFG::BranchCondition>();
+		const auto predicate = reference->Arg(0).Resolve();
+		if (kind == CFG::BranchCondition::ExecNonZero) {
+			if (predicate != active) return false;
+			nonempty_true = !invert; // Any(active).
+			return true;
+		}
+		if (kind != CFG::BranchCondition::ExecZero) return false;
+		const auto* inactive = predicate.TryInstruction();
+		if (inactive == nullptr || inactive->GetOpcode() != ValueOpcode::LogicalNot ||
+		    inactive->NumArgs() != 1u || inactive->Arg(0).Resolve() != active) return false;
+		nonempty_true = invert; // All(!active); only its opposite proves nonempty.
+		return true;
+	}
+
 	bool ProveActiveMaskNonempty(const Inst& read_first_lane, Value active) const {
 		if (read_first_lane.Parent() == nullptr || !m_ids.contains(read_first_lane.Parent()))
 			return false;
@@ -1219,8 +1248,11 @@ private:
 			const bool classic =
 			    classic_words && IsZeroMaskGuard(info.condition, low, high);
 			const bool ballot = IsBallotZeroGuard(info.condition, active);
-			if (!classic && !ballot) continue;
-			const auto* nonempty = m_by_id.at(info.terminator.false_block);
+			bool nonempty_true = false;
+			const bool native_exec = IsNativeExecMaskGuard(info.condition, active, nonempty_true);
+			if (!classic && !ballot && !native_exec) continue;
+			const auto* nonempty = m_by_id.at(nonempty_true ? info.terminator.true_block
+			                                                : info.terminator.false_block);
 			if (!Dominates(guard, read_first_lane.Parent()) ||
 			    !Dominates(nonempty, read_first_lane.Parent()) ||
 			    !PostDominates(read_first_lane.Parent(), nonempty)) continue;

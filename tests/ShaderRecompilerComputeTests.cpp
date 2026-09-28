@@ -28922,7 +28922,7 @@ TestCase DsAppendWave64OffsetLoopCompactsSparseReservations() {
 
 // GPU-derived selectors remain runtime values even though their possible
 // values form the finite set {0,1,2,3,4}. No captured shader bytes are used.
-TestCase MakeFiniteSelectorDescriptorStores(bool sparse_upper) {
+TestCase MakeFiniteSelectorDescriptorStores(bool sparse_upper, bool native_exec_guard = false) {
   using O = ShaderOpcode;
   constexpr u32 lanes = 64u, scenarios = 5u, guard = 4u;
   constexpr u32 record_stride = 64u;
@@ -28934,8 +28934,11 @@ TestCase MakeFiniteSelectorDescriptorStores(bool sparse_upper) {
   const uint64_t mask = sparse_upper ? upper_mask : 0xffffffffffffffffull;
   const u32 first_lane = sparse_upper ? 37u : 0u;
   TestCase test;
-  test.name = sparse_upper ? "FiniteSelectorDescriptorStoresUseFirstActiveUpperLane"
-                           : "FiniteSelectorDescriptorStoresUseGpuChoices";
+  test.name = native_exec_guard
+                  ? (sparse_upper ? "FiniteSelectorNativeExecGuardUpper"
+                                  : "FiniteSelectorNativeExecGuardFull")
+                  : (sparse_upper ? "FiniteSelectorDescriptorStoresUseFirstActiveUpperLane"
+                                  : "FiniteSelectorDescriptorStoresUseGpuChoices");
   test.has_user_data = true;
   test.has_compute_info = true;
   test.compute_info.threads_num[0] = lanes;
@@ -28976,10 +28979,20 @@ TestCase MakeFiniteSelectorDescriptorStores(bool sparse_upper) {
     AppendVMovU32(&code, 4, 0u); // inactive selector lanes must retain zero
     AppendVMovU32(&code, 7, step * lanes);
     code.push_back(EncodeVop2(0x25, 7, Vgpr(6), 7));
+    if (native_exec_guard) {
+      code.push_back(EncodeMubuf0(0x0c, 0, true, false));
+      code.push_back(EncodeMubuf1(4, 0, 7)); // Unknown old values in inactive lanes.
+      code.push_back(EncodeSopp(0x0c, 0));
+    }
     AppendVMovLiteral(&code, 12, 0x60000000u + step * 256u);
     code.push_back(EncodeVop2(0x25, 12, Vgpr(6), 12));
     AppendSMovLiteral(&code, 126, static_cast<u32>(mask));
     AppendSMovLiteral(&code, 127, static_cast<u32>(mask >> 32u));
+    const size_t exec_guard = code.size();
+    if (native_exec_guard) {
+      code.push_back(0u); // EXECZ skips every descriptor-dependent operation.
+      AppendVMovU32(&code, 4, 0u);
+    }
     code.push_back(EncodeMubuf0(0x0c, 0, true, false));
     code.push_back(EncodeMubuf1(10, 0, 7)); // input v10, indexv7, s[0:3]
     code.push_back(EncodeSopp(0x0c, 0));
@@ -28994,6 +29007,7 @@ TestCase MakeFiniteSelectorDescriptorStores(bool sparse_upper) {
     code.push_back(EncodeSopp(0x0c, 0));
     code.push_back(EncodeMubuf0(0x1c, 0, true, false, true));
     code.push_back(EncodeMubuf1(12, 4, 7)); // selected s[16:19], unique recordv7
+    if (native_exec_guard) code[exec_guard] = EncodeSopp(0x08, code.size() - exec_guard - 1u);
     code.push_back(EncodeSop1(0x04, 126, 193u)); // full EXEC before observations
     AppendStoreVgprAtLaneDwordOffset(&code, 4, 6,
         marker_dword_offset + guard + step * 2u * lanes);
@@ -29003,7 +29017,8 @@ TestCase MakeFiniteSelectorDescriptorStores(bool sparse_upper) {
       const bool active = (mask & (uint64_t{1} << lane)) != 0;
       const u32 input =
           test.initial[(input_base + record_stride * (step * lanes + lane)) / 4u];
-      const u32 selector = active && input < scenarios ? input : 0u;
+      const u32 selector = active ? (input < scenarios ? input : 0u)
+                                  : (native_exec_guard ? input : 0u);
       test.expected[marker_base / 4u + marker_dword_offset + guard +
                     step * 2u * lanes + lane] = selector;
       test.expected[marker_base / 4u + marker_dword_offset + guard +
@@ -29020,6 +29035,7 @@ TestCase MakeFiniteSelectorDescriptorStores(bool sparse_upper) {
                   O::V_READFIRSTLANE_B32, O::S_LSHL4_ADD_U32,
                   O::S_LOAD_DWORDX4, O::BUFFER_STORE_DWORD,
                   O::S_MOV_B32, O::S_MOV_B64, O::S_ENDPGM};
+  if (native_exec_guard) test.opcodes.push_back(O::S_CBRANCH_EXECZ);
   test.decoded_counts = {{"V_READFIRSTLANE_B32", scenarios},
                          {"S_LOAD_DWORDX4", scenarios}};
   return test;
@@ -30486,7 +30502,6 @@ TestCase BufferStoreFormatXDropsOutOfRangeRecord() {
   return test;
 }
 
-// Dispatch-uniform descriptors from an immutable two-entry SRT. Only the
 // A bounded scalar loop selects writable descriptors from an immutable SRT.
 TestCase BoundedBufferScalarLoopStore(u32 count, bool sparse) {
   using O = ShaderOpcode;
@@ -30545,6 +30560,8 @@ TestCase BoundedBufferScalarLoopStore(u32 count, bool sparse) {
   return test;
 }
 
+// Dispatch-uniform descriptors from an immutable two-entry SRT. Only the
+// selected zero-stride mode-0 entry is OOB; sparse EXEC preserves inactive VGPRs.
 TestCase BoundedBufferZeroStrideCandidates(u32 variant) {
   using O = ShaderOpcode;
   TestCase test;
@@ -38295,6 +38312,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferDescriptorTableScalarLoopLoadsFeedLaterResults);
   AddCase(BufferDescriptorTableZeroTripSkipsUnreadableTable);
   AddCase(FiniteSelectorDescriptorStoresUseGpuChoices);
+  AddCase([] { return MakeFiniteSelectorDescriptorStores(false, true); });
+  AddCase([] { return MakeFiniteSelectorDescriptorStores(true, true); });
   AddCase(FiniteSelectorDescriptorStoresUseFirstActiveUpperLane);
   AddCase(Buffers65FromSrtUsePackedOffsetsAndStorageFallback);
   AddCase(BufferD16LoadsPreserveHalvesAndSnapshotAddress);

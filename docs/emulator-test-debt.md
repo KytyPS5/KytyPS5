@@ -1,5 +1,67 @@
 # Emulator regression test debt
 
+## Finite first-active-lane selectors through native EXEC guards (2026-09-28)
+
+Committed 05d10203 retry `yotei-integrated-20260928-181147-menucheck-gpuav-sync`
+passes d895 and reaches CS 86da5eb7b8257bb0, PC 0x530 BUFFER_STORE_DWORD.
+Decoded selector uses V_READFIRSTLANE after finite per-lane choices and an EXECZ
+early return. Existing finite-selector GPU fixture passes independently.
+Hypothesis: nonempty-mask proof recognizes legacy low|high and Ballot equality,
+but not the native ConditionRef EXEC reduction. Before production changes add
+a CPU matrix for EXEC zero/nonzero, lower/upper masks and unrelated early exit;
+keep missing/wrong/bypassed guards, mismatched masks, conditional read and cycles
+rejected. Every snapshot root, bound and materialization limit remains required.
+Do not admit arbitrary GPU-selected writes.
+
+CPU RED confirmed on 05d10203 production: `native-exec-cpu-red-20260928.txt.stderr`,
+exit 1, exact expected lost finite first-active-lane proof. Add native-CFG numerical
+GPU full/upper-only fixtures with runtime unknown inactive VGPR values, matching
+EXECZ guard and unchanged descriptor/output/sentinel oracles before production fix.
+Both numerical native-CFG GPU fixtures RED before pipeline creation, PC 0x90
+(`native-exec-gpu-red-FiniteSelectorNativeExecGuard{Full,Upper}-20260928.txt`),
+exit 321. CPU legacy-profile audit of 86da independently reproduces the actual
+PC 0x530 rejection (`srt-86da-cpu-audit-false-20260928.txt`); barrier=false remains
+an explicit diagnostic assumption.
+
+After guard admission, unchanged upper-only numerical fixture gives a second RED:
+`native-exec-gpu-green-FiniteSelectorNativeExecGuardUpper-20260928.txt.stderr`,
+272/7032 DWORD mismatches, assertion exit -1073740791. The full-mask variant passes;
+the existing upper-only fixture without native guard remains GREEN. Split-wave
+ConditionRef emission returns a per-lane predicate when other_half is null, even
+though the admitted compute execution uses two physical native32 subgroups. Add
+exact/one-byte-short mask-reduction scratch budgets to the existing planner matrix
+before correcting emission and collective scheduling. Keep the numerical oracle.
+Scratch-budget RED confirmed: `native-exec-ballot-budget-red-20260928.txt.stderr`,
+assertion "mask ConditionRef omitted whole-wave ballot scratch" before production changes.
+
+GREEN: unchanged CPU native-EXEC matrix (6 positives/12 negatives); full and upper-only
+GPU fixtures pass all 7032 DWORDs with the original oracle. Existing finite selector
+full/upper neighbors and bounded scalar store neighbor GREEN; cooperative LDS suite
+9/9 and CTest 22/22 GREEN. Logs `native-exec-{cpu-green,gpu-wave-green-upper,final-*,
+multiwave-green,ballot-budget-green,ctest}-20260928.*`. The 14-case planner matrix
+now also enforces exact/one-byte-short mask ballot scratch budgets.
+CPU translation of captured 86da passes both explicit diagnostic barrier profiles.
+Fix shared native EXEC nonempty-path proof, split-compute whole-wave ConditionRef
+reduction, collective rendezvous placement, requirements and scratch budgeting.
+GPU-selected writes remain rejected unless the existing table/root/guard proof holds.
+Native build `native-exec-wave-fix-build-20260928.log` GREEN. Committed game retry pending.
+
+## Pending neighboring unaligned scalar-buffer read (2026-09-28)
+
+Additional numerical test `--unaligned-scalar-buffer-load-only` fails 1024/1032
+DWORDs: expected 0x13579bdf at host byte adjustment 3, actual 0xdf579bdf from offset 0.
+`native-exec-unaligned-scalar-neighbor-20260928.txt.stderr` reproduces it; the
+same unchanged test still fails identically with only the own wave-emitter,
+cooperative scheduling, requirements and budget patch absent
+(`native-exec-unaligned-baseline-red-20260928.txt.stderr`). Source read-only
+comparison to 2fc423a9 shows that EmitReadConstBuffer already omitted host-view
+byte adjustment before the fresh merge. This neighboring path is not GREEN.
+Before a separate fix retain that RED and add host adjustments 1/2/3 plus
+aligned and end-of-view cases; use shared bounds-checked byte reconstruction,
+preserve guest SMEM offset semantics and avoid shifting the output resource.
+The wave patch was preserved and restored via
+`_Build/analysis/native-exec-wave-production-20260928.patch`; no reset/user edits.
+
 ## Bounded descriptor stores through scalar ConditionRef (2026-09-28)
 
 Retry on 5b63741c (`yotei-integrated-20260928-174752-menucheck-gpuav-sync`)

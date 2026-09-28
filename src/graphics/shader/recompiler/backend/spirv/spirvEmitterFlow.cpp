@@ -637,11 +637,14 @@ uint32_t EmitDppUpdateU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 }
 
 uint32_t EmitConditionRef(ValueEmitContext& ctx, const IR::Inst& inst) {
-	if (ctx.other_half == nullptr) return ctx.Arg(inst, 0);
-	// A native scalar branch makes one decision for both emulated wave halves.
-	if (ctx.half != 0) return ctx.other_half->Def(IR::Value(&inst));
+	const bool split_compute = ctx.state.compute_execution.IsSplitWave64();
+	if (ctx.other_half == nullptr && !split_compute) return ctx.Arg(inst, 0);
+	// Packed graphics and physical compute halves share one scalar branch decision.
+	if (ctx.other_half != nullptr && ctx.half != 0) return ctx.other_half->Def(IR::Value(&inst));
 	const auto kind = inst.Flags<CFG::BranchCondition>();
-	if (kind == CFG::BranchCondition::ScalarInstruction) return ctx.Arg(inst, 0);
+	if (kind == CFG::BranchCondition::ScalarInstruction ||
+	    (split_compute && (kind == CFG::BranchCondition::SccZero ||
+	                       kind == CFG::BranchCondition::SccNonZero))) return ctx.Arg(inst, 0);
 	const auto ballot = ctx.Ballot(inst.Arg(0));
 	const auto low = ctx.state.builder.AllocateId();
 	const auto high = ctx.state.builder.AllocateId();

@@ -56,7 +56,7 @@ void Guard(EmitterState& state, uint32_t active, Body&& body) {
 
 bool IsCollective(O op) {
 	switch (op) {
-		case O::Ballot: case O::ReadLane: case O::ReadFirstLane: case O::WqmU64:
+		case O::ConditionRef: case O::Ballot: case O::ReadLane: case O::ReadFirstLane: case O::WqmU64:
 		case O::DppMoveU32: case O::Dpp8MoveU32: case O::Permlane16U32:
 		case O::SwizzleU32: case O::BpermuteU32: return true;
 		default: return false;

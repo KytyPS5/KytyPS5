@@ -117,6 +117,11 @@ bool HasWaveBallot(const IR::Program& program) {
 	if (program.spirv_requirements && program.spirv_requirements->subgroup_ballot) return true;
 	for (const auto* block : program.blocks) for (const auto& inst : *block) {
 		if (inst.GetOpcode() == O::Ballot) return true;
+		if (inst.GetOpcode() == O::ConditionRef) {
+			const auto kind = inst.Flags<CFG::BranchCondition>();
+			if (kind == CFG::BranchCondition::ExecZero || kind == CFG::BranchCondition::ExecNonZero ||
+			    kind == CFG::BranchCondition::VccZero || kind == CFG::BranchCondition::VccNonZero) return true;
+		}
 	}
 	return false;
 }

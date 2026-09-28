@@ -289,6 +289,13 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 				}
 			}
 			switch (inst.GetOpcode()) {
+				case IR::ValueOpcode::ConditionRef: {
+					const auto kind = inst.Flags<CFG::BranchCondition>();
+					requirements.subgroup_ballot |= kind == CFG::BranchCondition::ExecZero ||
+					    kind == CFG::BranchCondition::ExecNonZero || kind == CFG::BranchCondition::VccZero ||
+					    kind == CFG::BranchCondition::VccNonZero;
+					break;
+				}
 				case IR::ValueOpcode::Ballot: requirements.subgroup_ballot = true; break;
 				case IR::ValueOpcode::DppMoveU32:
 				case IR::ValueOpcode::Dpp8MoveU32:

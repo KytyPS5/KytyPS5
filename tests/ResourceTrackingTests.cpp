@@ -6413,7 +6413,8 @@ enum class ActiveFiniteScenario {
   EarlyExit, CyclicControl, UnrelatedEarlyExit,
 };
 
-FiniteSelectorFixture MakeActiveFiniteSelectorFixture(ActiveFiniteScenario scenario) {
+FiniteSelectorFixture MakeActiveFiniteSelectorFixture(
+    ActiveFiniteScenario scenario, CFG::BranchCondition native_guard = CFG::BranchCondition::Unknown) {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   FiniteSelectorFixture result;
   result.fixture = std::make_unique<Fixture>(ShaderType::Compute);
@@ -6436,6 +6437,7 @@ FiniteSelectorFixture MakeActiveFiniteSelectorFixture(ActiveFiniteScenario scena
     info.terminator.true_block = to;
   };
   const auto conditional = [&](uint32_t from, uint32_t yes, uint32_t no, Value condition) {
+    if (from == 1u && native_guard == CFG::BranchCondition::ExecNonZero) std::swap(yes, no);
     f.program.blocks[from]->AddBranch(f.program.blocks[yes]);
     f.program.blocks[from]->AddBranch(f.program.blocks[no]);
     auto& info = f.program.block_info[from];
@@ -6488,7 +6490,13 @@ FiniteSelectorFixture MakeActiveFiniteSelectorFixture(ActiveFiniteScenario scena
       f.Emit(ValueOpcode::BitwiseAnd32, {shifted, Value(1u)}, 0, entry);
   const auto active = f.Emit(ValueOpcode::INotEqual32, {selected, Value(0u)}, 0, entry);
   const auto combined = f.Emit(ValueOpcode::BitwiseOr32, {low, high}, 0, entry);
-  const auto empty = f.Emit(ValueOpcode::IEqual32, {combined, Value(0u)}, 0, guard);
+  auto empty = f.Emit(ValueOpcode::IEqual32, {combined, Value(0u)}, 0, guard);
+  if (native_guard == CFG::BranchCondition::ExecZero) {
+    const auto inactive = f.Emit(ValueOpcode::LogicalNot, {active}, 0, guard);
+    empty = f.Emit(ValueOpcode::ConditionRef, {inactive}, native_guard, guard);
+  } else if (native_guard == CFG::BranchCondition::ExecNonZero) {
+    empty = f.Emit(ValueOpcode::ConditionRef, {active}, native_guard, guard);
+  }
   const auto branch_choice =
       f.Emit(ValueOpcode::INotEqual32, {f.UserData(3u), Value(0u)}, 0, entry);
 
@@ -6592,6 +6600,33 @@ void TestFiniteSelectorActiveMaskProof() {
   std::cout << "finite selector active-mask positives passed: 4\n";
 }
 
+
+void TestFiniteSelectorNativeExecGuard() {
+  for (const auto kind : {CFG::BranchCondition::ExecZero, CFG::BranchCondition::ExecNonZero}) {
+    for (const auto scenario : {ActiveFiniteScenario::ValidLow, ActiveFiniteScenario::ValidHigh,
+                                ActiveFiniteScenario::UnrelatedEarlyExit}) {
+      auto test = MakeActiveFiniteSelectorFixture(scenario, kind);
+      const auto proof = ProveBoundedSrtRead(test.fixture->program,
+                                            *test.words[0].ResolveInstruction());
+      Check(proof && proof->count.Resolve() == Value(5u) &&
+                proof->index.Resolve() == test.index.Resolve(),
+            "native EXEC guard lost finite first-active-lane descriptor table proof");
+      test.fixture->PlanAndTrack();
+      Check(test.fixture->program.info.buffers.size() == 1u &&
+                test.fixture->program.bounded_srt_reads.size() == 4u &&
+                !test.fixture->program.info.uses_dma,
+            "native EXEC guard discarded its correlated descriptor store table");
+    }
+    for (const auto scenario : {ActiveFiniteScenario::MissingGuard, ActiveFiniteScenario::WrongEdge,
+                                ActiveFiniteScenario::BypassGuard, ActiveFiniteScenario::DifferentMask,
+                                ActiveFiniteScenario::EarlyExit, ActiveFiniteScenario::CyclicControl}) {
+      auto test = MakeActiveFiniteSelectorFixture(scenario, kind);
+      Check(!ProveBoundedSrtRead(test.fixture->program, *test.words[0].ResolveInstruction()),
+            "native EXEC guard accepted an unsafe first-active-lane projection");
+    }
+  }
+  std::cout << "KYTY_FINITE_SELECTOR_NATIVE_EXEC_PASS positives=6 negatives=12\n";
+}
 
 // Synthetic CPU regressions: append after the existing bounded snapshot helpers.
 Value WorkgroupSrtIndex(Fixture& fixture, uint32_t axis) {
@@ -7150,6 +7185,10 @@ int main(int argc, char** argv) {
       std::cout << "KYTY_BOUNDED_WRITER_ALIAS_PASS\n";
       return 0;
     }
+    if (argc == 2 && std::strcmp(argv[1], "--finite-selector-native-exec-only") == 0) {
+      TestFiniteSelectorNativeExecGuard();
+      return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--finite-selector-active-proof-only") == 0) {
       TestFiniteSelectorActiveMaskProof();
       std::cout << "KYTY_FINITE_SELECTOR_ACTIVE_PROOF_PASS\n";
@@ -7239,6 +7278,7 @@ int main(int argc, char** argv) {
     Run("finite selector SRT proof", TestFiniteSelectorSrtProof);
     Run("finite selector SRT materialization", TestFiniteSelectorSrtMaterialization);
     Run("finite selector active-mask proof", TestFiniteSelectorActiveMaskProof);
+    Run("finite selector native EXEC guard", TestFiniteSelectorNativeExecGuard);
     Run("workgroup SRT proof", TestWorkgroupSrtTrackingProof);
     Run("workgroup SRT root execution", TestWorkgroupSrtRootExecutionProof);
     Run("workgroup SRT materialization", TestWorkgroupSrtMaterializationAndSpecialization);

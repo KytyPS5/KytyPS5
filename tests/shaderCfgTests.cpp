@@ -11020,6 +11020,14 @@ void TestWave64ConditionRefAdmission() {
       } else {
         Check(plan.error.empty() && plan.IsSplitWave64() && plan.IsCooperativeWave64(),
               "native ConditionRef lost whole-wave branch reduction in cooperative planning");
+        if (kind == C::ExecZero || kind == C::ExecNonZero ||
+            kind == C::VccZero || kind == C::VccNonZero) {
+          // Two ballot words per complete guest wave, even without a Ballot IR opcode.
+          f.limits.max_shared_memory_bytes = (128u + 4u) * sizeof(uint32_t);
+          Check(f.Plan().error.empty(), "mask ConditionRef rejected its exact scratch budget");
+          --f.limits.max_shared_memory_bytes;
+          Check(!f.Plan().error.empty(), "mask ConditionRef omitted whole-wave ballot scratch");
+        }
       }
     }
   }

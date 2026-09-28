@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -133,6 +134,10 @@ private:
 	int              m_connected_count = 0;
 	bool             m_motion_enabled  = true;
 	uint64_t         m_gyro_time       = 0;
+	// Gravity direction ("up") in the reset frame, captured from the accelerometer after
+	// connection / orientation reset. Used to correct gyro drift in the orientation's tilt.
+	std::array<float, 3> m_up_reference {0.0f, 1.0f, 0.0f};
+	bool                 m_up_reference_valid = false;
 	ControllerState  m_state;
 	ControllerState  m_states[STATES_MAX];
 	bool             m_obtained[STATES_MAX] {};
@@ -436,6 +441,42 @@ void GameController::TouchPad(int id, int finger, bool down, float x, float y) {
 	}
 }
 
+namespace {
+
+using Vec3 = std::array<float, 3>;
+using Quat = std::array<float, 4>; // x, y, z, w
+
+// Rotates v by q (q * v * conj(q)).
+Vec3 QuatRotate(const Quat& q, const Vec3& v) {
+	const Vec3  u {q[0], q[1], q[2]};
+	const float w = q[3];
+	const Vec3  t {2.0f * (u[1] * v[2] - u[2] * v[1]), 2.0f * (u[2] * v[0] - u[0] * v[2]),
+                  2.0f * (u[0] * v[1] - u[1] * v[0])};
+	return {v[0] + w * t[0] + (u[1] * t[2] - u[2] * t[1]),
+	        v[1] + w * t[1] + (u[2] * t[0] - u[0] * t[2]),
+	        v[2] + w * t[2] + (u[0] * t[1] - u[1] * t[0])};
+}
+
+Quat QuatConjugate(const Quat& q) {
+	return {-q[0], -q[1], -q[2], q[3]};
+}
+
+float Length(const Vec3& v) {
+	return std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+}
+
+// Gain (rad/s per unit of tilt error) of the accelerometer correction applied to the integrated
+// orientation. KYTY_GYRO_CORRECTION=0 disables it (pure gyro integration, previous behavior).
+float GyroCorrectionGain() {
+	static const float gain = [] {
+		const char* value = std::getenv("KYTY_GYRO_CORRECTION");
+		return value != nullptr ? static_cast<float>(std::atof(value)) : 1.0f;
+	}();
+	return gain;
+}
+
+} // namespace
+
 void GameController::Motion(int id, Sensor sensor, const float* data, uint64_t time_us) {
 	Common::LockGuard lock(m_mutex);
 	if (id != m_active_id || !m_motion_enabled) {
@@ -447,20 +488,42 @@ void GameController::Motion(int id, Sensor sensor, const float* data, uint64_t t
 		for (int i = 0; i < 3; i++) {
 			m_state.accel[i] = data[i] / SDL_STANDARD_GRAVITY;
 		}
+		// Remember which way is up in the reset frame, once the pad is roughly at rest.
+		const float magnitude = Length(m_state.accel);
+		if (!m_up_reference_valid && magnitude > 0.9f && magnitude < 1.1f) {
+			const Vec3 up {m_state.accel[0] / magnitude, m_state.accel[1] / magnitude,
+			               m_state.accel[2] / magnitude};
+			m_up_reference       = QuatRotate(m_state.orientation, up);
+			m_up_reference_valid = true;
+		}
 	} else {
 		std::copy_n(data, 3, m_state.gyro.begin());
+		// Pure gyro integration accumulates the sensor bias, so the orientation drifts. Like the
+		// PS5 system software, correct the tilt (not the heading) with the accelerometer: nudge
+		// the angular velocity so the predicted "up" converges on the measured gravity
+		// (Mahony-style complementary filter). The reported gyro values stay raw.
+		Vec3        rate {data[0], data[1], data[2]};
+		const float gain      = GyroCorrectionGain();
+		const float magnitude = Length(m_state.accel);
+		if (gain > 0.0f && m_up_reference_valid && magnitude > 0.8f && magnitude < 1.2f) {
+			const Vec3 measured {m_state.accel[0] / magnitude, m_state.accel[1] / magnitude,
+			                     m_state.accel[2] / magnitude};
+			const Vec3 predicted = QuatRotate(QuatConjugate(m_state.orientation), m_up_reference);
+			rate[0] += gain * (measured[1] * predicted[2] - measured[2] * predicted[1]);
+			rate[1] += gain * (measured[2] * predicted[0] - measured[0] * predicted[2]);
+			rate[2] += gain * (measured[0] * predicted[1] - measured[1] * predicted[0]);
+		}
 		// Do not extrapolate a single sample across lost reports (e.g. loss of window focus).
 		constexpr uint64_t max_gyro_interval_us = 100000;
 		if (m_gyro_time != 0 && time_us > m_gyro_time &&
 		    time_us - m_gyro_time <= max_gyro_interval_us) {
 			const float dt = static_cast<float>(time_us - m_gyro_time) * 0.000001f;
-			const float speed =
-			    std::sqrt(data[0] * data[0] + data[1] * data[1] + data[2] * data[2]);
+			const float speed      = Length(rate);
 			const float half_angle = speed * dt * 0.5f;
 			const float scale      = speed > 0.0f ? std::sin(half_angle) / speed : 0.0f;
-			const float x          = data[0] * scale;
-			const float y          = data[1] * scale;
-			const float z          = data[2] * scale;
+			const float x          = rate[0] * scale;
+			const float y          = rate[1] * scale;
+			const float z          = rate[2] * scale;
 			const float w          = std::cos(half_angle);
 			const auto  q          = m_state.orientation;
 			// Accumulate body-local rotation relative to connection / orientation reset.
@@ -490,6 +553,7 @@ void GameController::SetMotionSensorState(bool enable) {
 		m_gyro_time      = 0;
 		m_state.accel    = {0.0f, 1.0f, 0.0f};
 		m_state.gyro     = {};
+		m_up_reference_valid = false;
 		m_state.time     = LibKernel::KernelGetProcessTime();
 		AddState();
 	}
@@ -497,8 +561,9 @@ void GameController::SetMotionSensorState(bool enable) {
 
 void GameController::ResetOrientation() {
 	Common::LockGuard lock(m_mutex);
-	m_state.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
-	m_gyro_time         = 0;
+	m_state.orientation  = {0.0f, 0.0f, 0.0f, 1.0f};
+	m_gyro_time          = 0;
+	m_up_reference_valid = false;
 	m_state.time        = LibKernel::KernelGetProcessTime();
 	AddState();
 }

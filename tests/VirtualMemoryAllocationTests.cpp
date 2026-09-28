@@ -2162,10 +2162,25 @@ void TestDirectMapQueryOffsetAndPartialMunmap() {
 	            "prospero_direct", phys);
 	Check(test, info.memory_type == SceKernelMtypeC, "unexpected direct memory type");
 
+	// Resolve the middle page before unmapping it: lookups a thread repeats must not outlive the
+	// mapping they resolved.
+	uint64_t middle_read = 0;
+	Check(test,
+	      Libs::LibKernel::Memory::TryReadBacking(base + SceKernelPageSize, &middle_read,
+	                                              sizeof(middle_read)),
+	      "TryReadBacking should resolve the middle page before munmap");
+	Check(test,
+	      Libs::LibKernel::Memory::ClampRangeSize(base + SceKernelPageSize - 0xf30, 0x1560) ==
+	          0x1560,
+	      "ClampRangeSize should accept a range inside one mapping");
 	CheckOk(test,
 	        Libs::LibKernel::Memory::KernelMunmap(base + SceKernelPageSize, SceKernelPageSize),
 	        "KernelMunmap(direct middle page)");
 	ExpectUnmapped(test, base + SceKernelPageSize);
+	Check(test,
+	      !Libs::LibKernel::Memory::TryReadBacking(base + SceKernelPageSize, &middle_read,
+	                                               sizeof(middle_read)),
+	      "TryReadBacking should reject an unmapped page it resolved before");
 
 	constexpr uint64_t transaction_sentinel = 0x5452414e53414354ull; // "TRANSACT"
 	constexpr uint64_t sparse_write         = 0x4e4f504152544941ull; // "NOPARTIA"

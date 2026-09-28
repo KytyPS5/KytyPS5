@@ -2165,7 +2165,8 @@ void TestFixedReserveRangeAddRollbackKeepsPlaceholder() {
 
 void TestExtendedAndUserMappingsDoNotAlias() {
 	const char* test = "ExtendedAndUserMappingsDoNotAlias";
-	constexpr uint64_t user_address = 0x1000000000ull;
+	// macOS starts its ordinary guest range at 448 GiB.
+	constexpr uint64_t user_address = 0x7000000000ull;
 	const uint64_t addresses[] {
 	    user_address,
 	    Libs::LibKernel::Memory::kExtendedMemoryBase + user_address,

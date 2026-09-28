@@ -3785,7 +3785,7 @@ void TestBoundedVectorTableSpecialization() {
       fixture.program.resource_tracking_complete = true;
       fixture.program.descriptor_sources.resize(1u);
       fixture.program.descriptor_sources[0].dword_count = 4u;
-      fixture.program.descriptor_sources[0].bounded_buffer.emplace();
+      fixture.program.descriptor_sources[0].bounded_buffer = DescriptorSource::BoundedBuffer{};
       fixture.program.info.buffers.push_back({.source = 0u});
       MemoryInfo memory;
       memory.kind = ResourceKind::Buffer;
@@ -5303,7 +5303,7 @@ void InitializeBoundedSnapshot(Fixture& fixture, uint32_t columns, bool buffer_t
   if (buffer_table) {
     Check(columns == 4u, "test descriptor table must have four columns");
     const auto source = AddBoundedSnapshotSource(fixture, {Value(0u),Value(0u),Value(0u),Value(0u)});
-    program.descriptor_sources[source].bounded_buffer.emplace();
+    program.descriptor_sources[source].bounded_buffer = DescriptorSource::BoundedBuffer{};
     program.descriptor_sources[source].bounded_buffer->reads = {0u, 1u, 2u, 3u};
     program.info.buffers.push_back({.source=source});
   }

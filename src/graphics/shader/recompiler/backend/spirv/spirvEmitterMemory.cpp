@@ -1613,6 +1613,31 @@ void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	           }));
 }
 
+// A statically OOB candidate must never access its native backing. Reuse the
+// formatted source/default and D16 packing rules of ordinary bounded loads.
+uint32_t EmitBufferOutOfBoundsRead(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto& state = ctx.state;
+	const auto mem = ctx.Memory(inst);
+	const auto type = TypeId(state, inst.GetType());
+	const auto zero = state.builder.Constant(OpConstantNull, type, {});
+	if (!mem.formatted) return zero;
+	const auto info = Format::GetFormatInfo(BufferFormat(ctx, mem));
+	if (info.type == Format::ComponentType::Unknown) return zero;
+	const auto count = mem.data_bits == 16u ? mem.component_count
+	                                       : IR::BufferComponentCount(inst.GetOpcode());
+	std::array<uint32_t, 4> values {};
+	for (uint32_t component = 0; component < count; ++component) {
+		const auto source = ResolveFormattedSource(ctx, mem, info, component);
+		values[component] = FormattedConstant(ctx, info, source.kind);
+	}
+	const auto result = mem.data_bits == 16u
+	    ? ConstructFormattedD16Result(ctx, info, values,
+	                                 IR::BufferComponentCount(inst.GetOpcode()), count)
+	    : count == 1u ? values[0] : ConstructU32Composite(state, count, values);
+	return EmitValueOrDefaultIfCondition(
+	    state, ctx.Arg(inst, inst.NumArgs() - 1), type, zero, [&]() { return result; });
+}
+
 void EmitLoadMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto  op  = inst.GetOpcode();
 	const auto& mem = ctx.Memory(inst);

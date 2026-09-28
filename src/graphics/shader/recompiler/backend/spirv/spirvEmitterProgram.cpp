@@ -476,7 +476,13 @@ bool EmitBoundedBufferMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 		ctx.memory_override_inst = &inst;
 		ctx.memory_override = &specialized;
 		ctx.definitions.erase(&inst);
-		EmitRawDirectInstruction(ctx, inst);
+		if (IR::BufferAccessOf(inst.GetOpcode()) == IR::BufferAccess::Read &&
+		    specialized.kind == IR::ResourceKind::Buffer &&
+		    state.program.info.buffers[specialized.resource].zero_stride_oob) {
+			ctx.Define(inst, EmitBufferOutOfBoundsRead(ctx, inst));
+		} else {
+			EmitRawDirectInstruction(ctx, inst);
+		}
 		if (has_result) {
 			phi.push_back(ctx.definitions.at(&inst));
 			phi.push_back(state.current_label);

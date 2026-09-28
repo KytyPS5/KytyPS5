@@ -1033,9 +1033,13 @@ private:
 		descriptor.dword_count = 4u;
 		descriptor.dwords[0] = words[0]->proof.address_low;
 		descriptor.dwords[1] = words[0]->proof.address_high;
+		// Workgroup bounds come from the dispatch axis, not a scalar count.
+		// The unused count-retention operand still needs a valid typed value;
+		// retain the selector while the real bound remains in bounded_srt_reads.
 		descriptor.dwords[2] = words[0]->proof.source_dwords == 4u
 		                           ? words[0]->proof.descriptor_word2
-		                           : words[0]->proof.count;
+		                           : words[0]->proof.workgroup_axis != UINT32_MAX
+		                                 ? words[0]->proof.index : words[0]->proof.count;
 		descriptor.dwords[3] = words[0]->proof.source_dwords == 4u
 		                           ? words[0]->proof.descriptor_word3
 		                           : Value(0u);

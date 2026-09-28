@@ -1,5 +1,66 @@
 # Emulator regression test debt
 
+## Candidate-specific zero-stride vector reads (2026-09-28)
+
+Before changing production, add numerical native GPU cases
+`BoundedBufferZeroStride{Raw,Formatted,D16}`: two dispatch workgroups
+load distinct descriptors from a separate immutable SRT, one normal and one
+mode-0 zero-stride. Preserve ordinary data, per-candidate float SEL_1 defaults,
+D16 packed defaults, inactive EXEC sentinels and all untouched SRT/backing words.
+Require table selection in validated SPIR-V. RDNA2 ISA section 8.1.5, Table 35
+and range-check notes specify offset >= stride for mode 0 and SEL_1 exceptions:
+https://docs.amd.com/api/khub/documents/Et~wpu9g~Ffl7d9q0QZ~Og/content.
+Run unchanged oracles RED before lowering and GREEN afterwards; retain direct
+zero-stride/scalar and ordinary table boundary checks. GPU work must be bounded.
+
+RED on unfixed production d690678c: all three selectors exit 321 at the
+explicit bounded zero-stride rejection, without dispatch or driver failure.
+Logs: `_Build/logs/bounded-zero-{raw,format,d16}-red-20260928.txt` and
+`.run.json`. The temporary CPU unsupported-case oracle can now be replaced
+by retention of per-candidate OOB metadata, covered by these independent
+GPU numerical fixtures. GREEN pending.
+
+After admitting candidate-specific OOB, the unchanged Raw fixture exposes
+a second compiler RED: `GetBufferResource has an empty argument`
+(`bounded-zero-raw-green-20260928.txt`, exit 321). Workgroup-bounded
+columns have a dispatch-axis bound and no scalar count root; the typed handle
+must retain valid planning operands without inventing a descriptor count.
+Preserve the numerical fixture and distinguish its dispatch bound from loop
+count roots before correcting handle construction.
+
+The first formatted emit attempt fails SPIR-V validation: vector OpSelect
+requires a matching condition shape. Use the existing conditional value
+merge, retaining the same sparse-EXEC oracle. Also correct the synthetic D16
+encoding to set opcode bit 25 (the helper masks high bits), add a decoded
+opcode assertion, and reproduce the corrected D16 case with the candidate
+production patch absent. Add an independent bounded scalar read: mode-0
+vector OOB must not erase scalar-buffer data.
+
+Corrected D16 RED with all candidate production changes absent:
+`bounded-zero-corrected-d16-red-20260928.txt`, exit 321 at the original
+mode-0 rejection. Preserved patch: `_Build/analysis/bounded-zero-production-in-progress-20260928.patch`.
+Bounded scalar numerical RED: `bounded-zero-scalar-red-20260928.txt.stderr`
+returns zero for all four lanes of the second workgroup instead of 0x40000000.
+Keep ScalarBuffer accesses on their existing scalar bounds path.
+
+Native numerical GPU GREEN: all four cases, unchanged final oracles,
+`bounded-zero-{raw,formatted,d16,scalar}-final-20260928.txt`, exit 0.
+The corrected D16 fixture retains its decoded-opcode assertion. All emitted
+modules pass Vulkan 1.2 SPIR-V validation. Neighbor selectors GREEN:
+zero-stride-oob, buffer-format-store, buffer-d16, indirect-image; logs
+`bounded-zero-neighbor-*-20260928.txt`. Executable SHA-256:
+`536463B7358654AD1CC7E5088C352FE17D248A56AA4804BEF7789D8A31BE5619`.
+Native emulator/launcher/kyty_tests build and install GREEN:
+`bounded-zero-native-{build,install}-20260928.log`. Focused CTest GREEN
+22/22: `bounded-zero-native-ctest-20260928.log`, including required Windows
+checks and existing resource tracking/materialization boundaries. Original
+game retry remains pending at this checkpoint.
+
+Separately, exact-head CI d690678c failed Linux compilation at two test-only
+zero-argument optional emplace calls (Windows/macOS succeeded). Use explicit
+aggregate initialization without changing semantic expectations. Evidence:
+`_Build/logs/ci-d690-linux-failure.txt`.
+
 ## Upstream integration and SRT rejection regressions (2026-09-27)
 
 Native required checks on the merge of `e0c73250` and `421684e7` expose

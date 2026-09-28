@@ -30107,6 +30107,88 @@ TestCase BufferStoreFormatXDropsOutOfRangeRecord() {
   return test;
 }
 
+// Dispatch-uniform descriptors from an immutable two-entry SRT. Only the
+// selected zero-stride mode-0 entry is OOB; sparse EXEC preserves inactive VGPRs.
+TestCase BoundedBufferZeroStrideCandidates(u32 variant) {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = variant == 0 ? "BoundedBufferZeroStrideRaw"
+            : variant == 1 ? "BoundedBufferZeroStrideFormatted"
+                           : variant == 2 ? "BoundedBufferZeroStrideD16"
+                           : "BoundedBufferZeroStrideScalar";
+  test.has_compute_info = test.has_user_data = true;
+  test.compute_info = {};
+  test.compute_info.threads_num[0] = 4;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = 32;
+  test.compute_info.workgroup_register = 16;
+  test.compute_info.group_id[0] = true;
+  test.dispatch_x = 2;
+  test.initial.resize(136, 0xdeadbeefu);
+  const std::array<u32, 4> payload{0x40000000u, 0x40400000u, 0x40800000u, 0x40a00000u};
+  std::copy(payload.begin(), payload.end(), test.initial.begin() + 32);
+  std::copy(payload.begin(), payload.end(), test.initial.begin() + 40);
+  const u32 format = BufferFormat(Prospero::BufferFormat::k32_32_32_32Float);
+  const std::array<u32, 8> descriptors{
+      128u, 16u << 16u, 1u, (format << 12u) | DstSel(1, 4, 1, 0) | (1u << 24u),
+      160u, 0u, 16u, (format << 12u) | DstSel(1, 4, 1, 0) | (1u << 24u)};
+  std::copy(descriptors.begin(), descriptors.end(), test.initial.begin() + 128);
+  test.expected = test.initial;
+  test.user_data = MakeStructuredStorageBufferData(4, 32);
+  test.user_data[8] = 512; // Separate read-only SRT, past every writable byte.
+  test.buffer_addresses_are_backing_offsets = true;
+  test.required_spirv = {"OpSwitch"};
+  auto& code = test.code;
+  code.push_back(EncodeSop2(0x1e, 20, 16, InlineU32(4)));
+  code.push_back(EncodeSmem0(0x02, 24, 4)); // s_load_dwordx4 s[24:27], s[8:9].
+  code.push_back(EncodeSmem1(0, 20));
+  code.push_back(EncodeSopp(0x0c, 0));
+  code.push_back(EncodeVop1(0x01, 4, 16));
+  code.push_back(EncodeVop2(0x1a, 4, InlineU32(2), 4));
+  code.push_back(EncodeVop2(0x25, 4, Vgpr(0), 4)); // Global lane output index.
+  for (u32 reg = 8; reg < 12; ++reg) AppendVMovLiteral(&code, reg, 0xabcdef01u);
+  AppendVMovU32(&code, 20, 0);
+  code.push_back(EncodeSop1(0x04, 60, 126));
+  code.push_back(EncodeSop1(0x04, 126, InlineU32(5))); // lanes 0 and 2 only.
+  if (variant == 3) {
+    code.push_back(EncodeSmem0(0x08, 28, 12));
+    code.push_back(EncodeSmem1(0));
+  } else {
+    code.push_back(EncodeMubuf0(variant == 0 ? 0x0e : 0x03) |
+                   (variant == 2 ? 1u << 25u : 0u));
+    code.push_back(EncodeMubuf1(8, 6, 20));
+  }
+  code.push_back(EncodeSop1(0x04, 126, 60));
+  if (variant == 3) code.push_back(EncodeVop1(0x01, 8, 28));
+  const u32 words = variant == 3 ? 1 : variant == 2 ? 2 : 4;
+  for (u32 word = 0; word < words; ++word)
+    AppendStoreVgprAtLaneDwordOffset(&code, 8 + word, 4, word * 8);
+  AppendEnd(&code);
+  test.opcodes = {O::S_LSHL_B32, O::S_LOAD_DWORDX4, O::S_WAITCNT,
+                  O::V_MOV_B32, O::V_LSHLREV_B32, O::V_ADD_NC_U32,
+                  O::S_MOV_B64, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts.push_back({variant == 3 ? "S_BUFFER_LOAD_DWORD "
+      : variant == 2 ? "BUFFER_LOAD_FORMAT_D16_XYZW "
+      : variant == 1 ? "BUFFER_LOAD_FORMAT_XYZW " : "BUFFER_LOAD_DWORDX4 ", 1});
+  test.opcodes.push_back(variant == 0 ? O::BUFFER_LOAD_DWORDX4
+                       : variant == 1 ? O::BUFFER_LOAD_FORMAT_XYZW
+                       : variant == 2 ? O::BUFFER_LOAD_FORMAT_D16_XYZW
+                                      : O::S_BUFFER_LOAD_DWORD);
+  for (u32 group = 0; group < 2; ++group) {
+    std::array<u32, 4> values{};
+    if (variant == 0) { if (group == 0) values = payload; }
+    else if (variant == 1) values = {0x3f800000u, group == 0 ? payload[0] : 0u, 0x3f800000u, 0u};
+    else if (variant == 2) values = {group == 0 ? 0x40003c00u : 0x00003c00u, 0x00003c00u, 0u, 0u};
+    else values[0] = payload[0];
+    for (u32 lane = 0; lane < 4; ++lane)
+      for (u32 word = 0; word < words; ++word)
+        test.expected[word * 8 + group * 4 + lane] =
+            variant == 3 || (lane & 1u) == 0 ? values[word] : 0xabcdef01u;
+  }
+  return test;
+}
+
 TestCase TBufferCapturedZeroStrideOob(bool raw_bounds = false, bool scalar = false) {
   using O = ShaderOpcode;
   TestCase test;
@@ -37667,6 +37749,8 @@ std::vector<TestCase> MakeCases() {
   AddCase([] { return TBufferCapturedZeroStrideOob(true); });
   AddCase([] { return TBufferCapturedZeroStrideOob(false, true); });
   AddCase(BufferZeroStrideOobFormatsAndWidths);
+  for (u32 variant = 0; variant < 4; ++variant)
+    cases.push_back(BoundedBufferZeroStrideCandidates(variant));
   AddCase(TBufferLoadFormatXyzwSnapshotsOverlappingAddress);
   AddCase(TBufferLoadFormatXyzwPackedSnapshotsOverlappingAddress);
   AddCase(TBufferLoadFormatX8UintZeroExtendsByte);

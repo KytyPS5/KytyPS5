@@ -115,6 +115,9 @@ struct BufferResource {
 	// Positive proof: every access uses the descriptor format, without typed overrides.
 	bool                   descriptor_formatted_only = false;
 	bool                   scalar             = false;
+	// OOB_SELECT=0 with zero stride rejects every vector read, independently
+	// of host backing size. Scalar-buffer reads have a separate bounds contract.
+	bool                   zero_stride_oob    = false;
 
 	[[nodiscard]] uint64_t LimitDescriptorSize(uint32_t stride, uint64_t size) const {
 		return stride == 0u && stride_zero_access_size != 0u && stride_zero_access_size < size

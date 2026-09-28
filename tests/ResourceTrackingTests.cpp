@@ -3802,15 +3802,13 @@ void TestBoundedVectorTableSpecialization() {
         specialization.buffers.push_back({.zero_stride_oob = zero_stride});
         specialization.buffer_tables[0].resources.push_back(0u);
       }
-      if (zero_stride) {
-        CheckFatal([&] { ApplyResourceSpecialization(fixture.program, specialization); },
-            "bounded zero-stride", "mode-0 bounded candidate was silently admitted");
-      } else {
-        ApplyResourceSpecialization(fixture.program, specialization);
-        Check(fixture.program.memory_info[flags.index].resource == UINT32_MAX &&
-                  load.ResolveInstruction()->GetOpcode() == ValueOpcode::LoadBufferU32,
-              "table read was treated as one direct dense buffer");
-      }
+      ApplyResourceSpecialization(fixture.program, specialization);
+      Check(fixture.program.memory_info[flags.index].resource == UINT32_MAX &&
+                load.ResolveInstruction()->GetOpcode() == ValueOpcode::LoadBufferU32,
+            "table read was treated as one direct dense buffer");
+      if (count != 0u)
+        Check(fixture.program.info.buffers[0].zero_stride_oob == zero_stride,
+              "table candidate lost its vector OOB metadata");
     }
   }
 }

@@ -190,6 +190,7 @@ inline constexpr auto EmitGetImageResource   = EmitGetSrtResource;
 inline constexpr auto EmitGetSamplerResource = EmitGetSrtResource;
 inline constexpr auto EmitMakeImageAddress   = EmitGetSrtResource;
 void                  EmitLoadMemory(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitBufferOutOfBoundsRead(ValueEmitContext& ctx, const IR::Inst& inst);
 void                  EmitStoreMemory(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitAtomic32(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitBufferAtomic64(ValueEmitContext& ctx, const IR::Inst& inst);

@@ -2683,6 +2683,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 			EXIT_IF(buffer_remap[origin] != UINT32_MAX);
 			buffer_remap[origin] = static_cast<uint32_t>(index);
 		}
+		buffers[index].zero_stride_oob    = specialization.buffers[index].zero_stride_oob;
 		buffers[index].packed_stride      = specialization.buffers[index].packed_stride;
 		buffers[index].descriptor_format  = specialization.buffers[index].descriptor_format;
 		buffers[index].descriptor_swizzle = specialization.buffers[index].descriptor_swizzle;
@@ -2803,9 +2804,6 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 					EXIT_IF(memory.buffer_table >= specialization.buffer_tables.size());
 					for (const auto resource : specialization.buffer_tables[memory.buffer_table].resources) {
 						EXIT_IF(resource >= specialization.buffers.size());
-						if (specialization.buffers[resource].zero_stride_oob) {
-							EXIT("bounded zero-stride mode-0 vector reads require candidate-specific lowering");
-						}
 					}
 					continue;
 				}

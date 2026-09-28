@@ -3,6 +3,22 @@
 Обновлено **28 сентября 2026 года**. Игра: **Ghost of Yōtei, PPSA26344**.
 Рабочая ветка — `yotei-windows-bringup` в локальном fork `fxpw/KytyPS5`.
 
+Checkpoint nested post-test image proof **28 сентября 2026 года**:
+
+- Tested source: `4a556c73` + shared SrtWalker dominance correction. SSA split latch
+  placed i+1/compare before an empty backedge block. Old equality check rejected
+  a bounded dense image selector. No guest-specific branches or relaxed bounds.
+- Regression debt recorded before fix. CPU RED → unchanged oracle GREEN
+  (4 positives / 6 negatives); native shader RED PC 0x38 image root → SPIR-V and
+  six numerical values GREEN. Wave32 regression isolates descriptor proof.
+- Captured 5f3f CPU audit GREEN in both explicit diagnostic barrier profiles;
+  native build GREEN, CTest22/22; image table / wave64 image loop / bounded scalar
+  store / native EXEC upper GPU neighbors GREEN (`nested-posttest-*` logs).
+- Committed build/install/game retry pending; latest real runtime remains
+  `10961866` shown92 / image-origin boundary. Nonzero frame/menu/gameplay pending.
+- Exact-head CI `4a556c73`: run36468596026 confirmed GREEN Windows/Linux/macOS,
+  release skipped. This does not validate the new working source patch.
+
 Checkpoint upstream merge `10961866` **28 сентября 2026 года**:
 
 - Committed native Windows build/install GREEN; required CTest 22/22,

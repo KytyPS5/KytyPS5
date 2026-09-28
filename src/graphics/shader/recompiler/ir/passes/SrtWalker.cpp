@@ -788,15 +788,17 @@ public:
 			    .memory_offset = memory.offset,
 			    .count_signed = count_signed};
 		};
-		// A canonical post-test loop consumes index i, increments it once in the
-		// latch, and repeats while next < a positive constant. Requiring the read
-		// to dominate that latch proves the accessed dense range is [0, bound).
+		// A canonical post-test loop consumes index i and carries i+1 on its
+		// backedge while next < a positive constant. SSA can put the update and
+		// comparison before an empty latch. Update dominance (already established
+		// above) and read dominance of the latch prove the dense range [0, bound).
 		// Runtime and non-positive signed bounds need max(1, N) materialization
 		// semantics and remain unsupported here.
 		const auto& latch_info = m_program.block_info[m_ids.at(latch)];
 		if (latch_info.terminator.kind == CFG::TerminatorKind::ConditionalBranch &&
 		    latch_update.TryInstruction() != nullptr &&
-		    latch_update.TryInstruction()->Parent() == latch && Dominates(read.Parent(), latch)) {
+		    Dominates(latch_update.TryInstruction()->Parent(), latch) &&
+		    Dominates(read.Parent(), latch)) {
 			auto latch_condition = latch_info.condition.Resolve();
 			bool latch_invert = false;
 			if (!UnwrapScalarCondition(latch_condition, latch_invert)) return {};

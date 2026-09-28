@@ -68,6 +68,38 @@ Next synthetic fixture must cover nested constant post-test loops with scalar im
 address induction, canonical/native CFG origin, writes and invalid bounds. Keep
 shader-write and runtime-value rejection until a supported proof is established.
 
+Synthetic regression prepared before production correction: `resource_tracking_tests
+--nested-posttest-image-only`. Four signed/unsigned/plain/non-nested positive cases
+require dense [0,5) image table retention across an SSA split latch; six negative
+cases retain nonunit step, wrong repeat edge, zero/runtime bound, entry bypass and
+non-dominating update rejection. Code inspection shows the guest post-test update
+and compare dominate an empty backedge block; current proof requires update.Parent
+== latch even after proving update dominance. RED confirmed on unchanged 4a556c73 production: `nested-posttest-image-cpu-red-20260928.txt.stderr`,
+exit 1, "split-latch nested post-test image loop lost its dense bound".
+
+Native-CFG numerical regression prepared: `NestedPostTestImageDescriptorLoop`,
+three full scalar-address image descriptors, signed outer/inner post-test loops,
+two repeats per descriptor and independent six-output float oracle (2,20,80).
+Wave32 fixture isolates descriptor proof; it does not claim new wave64 coverage.
+All stores and table backing retained; loops have constant bounds. Before GREEN
+run with only the new SrtWalker dominance correction absent to prove intended RED.
+
+Corrected synthetic CFG still RED unchanged oracle on old proof:
+`nested-posttest-image-cpu-corrected-red-20260928.txt.stderr`. Native numerical
+fixture RED before pipeline creation at PC 0x38 GetImageResource root LoadAddressU32,
+exit321 (`nested-posttest-image-gpu-red-20260928.txt`). Only the own SrtWalker
+correction was absent; unrelated source preserved. The prior first GREEN attempt
+stopped on a duplicate test edge assertion and is excluded from GREEN evidence.
+
+GREEN on the same corrected fixtures and unchanged oracles: CPU 4/6 matrix;
+native shader SPIR-V validation and numerical six outputs; captured 5f3f CPU audit
+both legacy barrier profiles. Logs `nested-posttest-image-cpu-final-green`,
+`nested-posttest-image-gpu-green`, `nested-posttest-capture-cpu-{false,true}`.
+Shared correction replaces exact update-parent equality by proven latch dominance;
+constant positive bound, unit-step phi, repeat edge, read dominance and runtime root
+checks remain. Neighbor image table, wave64 image loop, bounded store3Sparse and
+native EXEC upper GREEN; required CTest22/22 GREEN. Game retry pending.
+
 ## Pending neighboring unaligned scalar-buffer read (2026-09-28)
 
 Additional numerical test `--unaligned-scalar-buffer-load-only` fails 1024/1032

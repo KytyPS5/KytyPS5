@@ -35856,6 +35856,77 @@ TestCase MakeImageSampleDynamicMaterials(MaterialImageSampleMode mode) {
   return test;
 }
 
+TestCase NestedPostTestImageDescriptorLoop() {
+  TestCase test;
+  test.name = "NestedPostTestImageDescriptorLoop";
+  test.has_user_data = true;
+  test.has_compute_info = true;
+  test.compute_info.threads_num[0] = 1;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.wave_size = 32;
+  test.use_runtime_samplers = true;
+  test.buffer_addresses_are_backing_offsets = true;
+  constexpr u32 table_base = 4096u;
+  test.initial.resize((table_base + 3u * 32u) / 4u);
+  test.user_data[24] = table_base;
+  test.user_data[50] = 6u * sizeof(u32);
+  test.sampled_image_fixtures.push_back({0u, MakeRgbaImage(4, 4)});
+  constexpr std::array values {2.0f, 20.0f, 80.0f};
+  for (u32 key = 0; key < values.size(); ++key) {
+    const uint64_t address = (key + 1u) * 0x100000ull;
+    const std::array<u32, 8> descriptor {
+        static_cast<u32>(address >> 8u),
+        (static_cast<u32>(Prospero::BufferFormat::k32_32_32_32Float) << 20u) | (3u << 30u),
+        3u << 14u,
+        DstSel(4, 5, 6, 7) | (static_cast<u32>(Prospero::ImageType::kColor2D) << 28u),
+        0u, 0x00700000u, 0u, 0u};
+    std::copy(descriptor.begin(), descriptor.end(),
+               test.initial.begin() + table_base / 4u + key * 8u);
+    auto image = MakeRgbaImage(4, 4);
+    SetRgbaPixel(&image, 4, 1, 1, std::bit_cast<u32>(values[key]), 0, 0, 0);
+    test.sampled_image_fixtures.push_back({address, std::move(image)});
+    for (u32 repeat = 0; repeat < 2u; ++repeat)
+      test.expected.push_back(std::bit_cast<u32>(values[key]));
+  }
+  auto& code = test.code;
+  const auto clamp = static_cast<u32>(Prospero::SamplerClampMode::kClampLastTexel);
+  AppendSMovLiteral(&code, 76, clamp | (clamp << 3u) | (clamp << 6u));
+  for (u32 reg = 77; reg < 80; ++reg) code.push_back(EncodeSMovB32(reg, InlineU32(0)));
+  AppendVMovLiteral(&code, 24, std::bit_cast<u32>(0.375f));
+  AppendVMovLiteral(&code, 25, std::bit_cast<u32>(0.375f));
+  code.push_back(EncodeSMovB32(32, InlineU32(0)));
+  const auto outer = code.size();
+  code.push_back(EncodeSMovB32(35, InlineU32(0)));
+  const auto inner = code.size();
+  code.push_back(EncodeSop2(0x1e, 33, 32, InlineU32(5)));
+  code.push_back(EncodeSmem0(0x03, 16, 12));
+  code.push_back(EncodeSmem1(0, 33));
+  code.push_back(EncodeMimg0(0x27, 0x1, 0, false, 1, false));
+  code.push_back(EncodeMimg1(0, 24, 4, 19));
+  code.push_back(EncodeSop2(0x1e, 36, 32, InlineU32(1)));
+  code.push_back(EncodeSop2(0x02, 36, 36, 35));
+  code.push_back(EncodeSop2(0x1e, 36, 36, InlineU32(2)));
+  code.push_back(EncodeVop1(0x01, 30, 36));
+  AppendBufferStoreDword(&code, 0, 30);
+  code.push_back(EncodeSop2(0x02, 35, 35, InlineU32(1)));
+  code.push_back(EncodeSopc(0x04, 35, InlineU32(2)));
+  auto branch = code.size();
+  code.push_back(EncodeSopp(0x05, static_cast<u32>(
+      static_cast<int64_t>(inner) - static_cast<int64_t>(branch + 1u))));
+  code.push_back(EncodeSop2(0x02, 32, 32, InlineU32(1)));
+  code.push_back(EncodeSopc(0x04, 32, InlineU32(3)));
+  branch = code.size();
+  code.push_back(EncodeSopp(0x05, static_cast<u32>(
+      static_cast<int64_t>(outer) - static_cast<int64_t>(branch + 1u))));
+  AppendEnd(&code);
+  test.opcodes = {ShaderOpcode::S_LOAD_DWORDX8, ShaderOpcode::IMAGE_SAMPLE,
+                   ShaderOpcode::S_ADD_I32, ShaderOpcode::S_CMP_LT_I32,
+                   ShaderOpcode::S_CBRANCH_SCC1, ShaderOpcode::BUFFER_STORE_DWORD};
+  test.required_spirv = {"OpLoopMerge", "OpSwitch", "OpImageSampleExplicitLod"};
+  return test;
+}
+
 TestCase ImageSampleR128DynamicMaterialPairs() {
   return MakeImageSampleDynamicMaterials(MaterialImageSampleMode::CompactDynamicSampler);
 }
@@ -38497,6 +38568,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageLoadR128IgnoresAdjacentMaskSgprs);
   AddCase(ImageSampleR128DynamicMaterialPairs);
   AddCase(ImageSampleLzR128DynamicMaterialStaticSampler);
+  AddCase(NestedPostTestImageDescriptorLoop);
   AddCase(ImageSampleDynamicMaterialImageTablePairs);
   AddCase(ImageSampleLzFullDynamicMaterialStaticSampler);
   AddCase(ImageLoad1DUsesScalarCoordinate);

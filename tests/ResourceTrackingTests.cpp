@@ -1072,6 +1072,105 @@ void TestGuardedDirectImageTable() {
         "batched descriptor read crossed the 48-bit endpoint");
 }
 
+// SSA may split the guest branch into an update block and an empty backedge block.
+// The outer image index is invariant during the inner post-test loop.
+void TestNestedPostTestImageLoop() {
+  enum class Variant { ValidSigned, ValidUnsigned, Plain, NoInnerLoop, WrongStep,
+                       WrongEdge, ZeroBound, RuntimeBound, EntryBypass, UpdateBypass };
+  const auto run = [](Variant variant, bool accepted) {
+    Fixture fixture;
+    for (uint32_t i = 1; i < 9u; ++i) fixture.AddBlock();
+    const auto branch = [&](uint32_t from, uint32_t to) {
+      fixture.program.blocks[from]->AddBranch(fixture.program.blocks[to]);
+      fixture.program.block_info[from].terminator = {
+          .kind = CFG::TerminatorKind::Branch, .true_block = to};
+    };
+    const auto conditional = [&](uint32_t from, uint32_t yes, uint32_t no, Value condition) {
+      fixture.program.blocks[from]->AddBranch(fixture.program.blocks[yes]);
+      fixture.program.blocks[from]->AddBranch(fixture.program.blocks[no]);
+      fixture.program.block_info[from].terminator = {
+          .kind = CFG::TerminatorKind::ConditionalBranch, .true_block = yes, .false_block = no};
+      fixture.program.block_info[from].condition = condition;
+    };
+    if (variant != Variant::EntryBypass) branch(0, 1);
+    branch(1, 2); branch(2, 3); branch(3, 4); branch(4, 5); branch(6, 7);
+    auto& outer = fixture.program.blocks[1]->AppendNewInst(
+        ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+    const Value key(&outer);
+    auto& inner = fixture.program.blocks[3]->AppendNewInst(
+        ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+    const auto inner_next = fixture.Emit(ValueOpcode::IAdd32, {Value(&inner), Value(1u)},
+                                         0, fixture.program.blocks[4]);
+    inner.AddPhiOperand(fixture.program.blocks[2], Value(0u));
+    const auto inner_test = fixture.Emit(ValueOpcode::ULessThan32,
+                                         {inner_next, Value(3u)}, 0, fixture.program.blocks[4]);
+    if (variant == Variant::UpdateBypass) {
+      conditional(5, 6, 7, fixture.Emit(ValueOpcode::INotEqual32,
+                    {fixture.UserData(3u), Value(0u)}, 0, fixture.program.blocks[5]));
+    } else if (variant == Variant::NoInnerLoop) {
+      branch(5, 6);
+    } else {
+      inner.AddPhiOperand(fixture.program.blocks[5], inner_next);
+      conditional(5, 3, 6, fixture.Emit(ValueOpcode::ConditionRef, {inner_test},
+                   CFG::BranchCondition::SccNonZero, fixture.program.blocks[5]));
+    }
+    const auto next = fixture.Emit(ValueOpcode::IAdd32,
+        {key, Value(variant == Variant::WrongStep ? 2u : 1u)}, 0, fixture.program.blocks[6]);
+    outer.AddPhiOperand(fixture.program.blocks[0], Value(0u));
+    outer.AddPhiOperand(fixture.program.blocks[7], next);
+    const auto bound = variant == Variant::RuntimeBound ? fixture.UserData(2u)
+                         : Value(variant == Variant::ZeroBound ? 0u : 5u);
+    auto condition = fixture.Emit(variant == Variant::ValidUnsigned
+                                     ? ValueOpcode::ULessThan32 : ValueOpcode::SLessThan32,
+                                   {next, bound}, 0, fixture.program.blocks[6]);
+    if (variant != Variant::Plain)
+      condition = fixture.Emit(ValueOpcode::ConditionRef, {condition},
+                                CFG::BranchCondition::SccNonZero, fixture.program.blocks[7]);
+    conditional(7, variant == Variant::WrongEdge ? 8u : 1u,
+                   variant == Variant::WrongEdge ? 1u : 8u, condition);
+    fixture.program.block_info[8].terminator.kind = CFG::TerminatorKind::Return;
+    if (variant == Variant::EntryBypass) {
+      conditional(0, 1, 3, fixture.Emit(ValueOpcode::INotEqual32,
+                    {fixture.UserData(3u), Value(0u)}));
+    }
+    fixture.block = fixture.program.blocks[3];
+    const auto table = fixture.Address(fixture.UserData(0u), fixture.UserData(1u));
+    const auto offset = fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)});
+    std::array<Value, 8> words;
+    for (uint32_t word = 0; word < words.size(); ++word) {
+      words[word] = fixture.Emit(ValueOpcode::LoadAddressU32,
+          {table, offset, Value(0u), Value(true)},
+          fixture.AddMemory({.kind = ResourceKind::ScalarAddress,
+                             .offset = word * 4u}, 0x80u));
+    }
+    const auto image = fixture.Image(words, 0x90u);
+    const auto sampler = fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)});
+    MemoryInfo sample;
+    sample.kind = ResourceKind::Image;
+    sample.image_dimension = Decoder::ImageDimension::Dim2D;
+    fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, fixture.ImageAddress()},
+                 fixture.AddMemory(sample, 0x90u));
+    const auto proof = ProveBoundedSrtRead(fixture.program, *words[0].TryInstruction());
+    Check(proof.has_value() == accepted,
+          accepted ? "split-latch nested post-test image loop lost its dense bound"
+                   : "split-latch post-test loop admitted an invalid induction/edge");
+    if (!accepted) return;
+    Check(proof->count.Resolve() == Value(5u) && proof->index == key && proof->offset_scale == 32u,
+          "split-latch image proof changed its count or live selector");
+    fixture.PlanAndTrack();
+    Check(fixture.program.info.images.size() == 1u &&
+              fixture.program.descriptor_sources[fixture.program.info.images[0].source].bounded_image &&
+              fixture.program.bounded_srt_reads.size() == 8u,
+          "split-latch image loop lost its logical descriptor table");
+  };
+  for (const auto variant : {Variant::ValidSigned, Variant::ValidUnsigned,
+                             Variant::Plain, Variant::NoInnerLoop}) run(variant, true);
+  for (const auto variant : {Variant::WrongStep, Variant::WrongEdge, Variant::ZeroBound,
+                             Variant::RuntimeBound, Variant::EntryBypass,
+                             Variant::UpdateBypass}) run(variant, false);
+  std::cout << "KYTY_NESTED_POSTTEST_IMAGE_PASS positives=4 negatives=6\n";
+}
+
 void TestBoundedComputeImageLoop() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   enum class Variant {
@@ -7185,6 +7284,10 @@ int main(int argc, char** argv) {
       std::cout << "KYTY_BOUNDED_WRITER_ALIAS_PASS\n";
       return 0;
     }
+    if (argc == 2 && std::strcmp(argv[1], "--nested-posttest-image-only") == 0) {
+      TestNestedPostTestImageLoop();
+      return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--finite-selector-native-exec-only") == 0) {
       TestFiniteSelectorNativeExecGuard();
       return 0;
@@ -7267,6 +7370,7 @@ int main(int argc, char** argv) {
     Run("shared uniform loop index", TestSharedUniformLoopIndex);
     Run("buffer record image key", TestBufferRecordImageKey);
     Run("guarded direct image table", TestGuardedDirectImageTable);
+    Run("nested post-test image loop", TestNestedPostTestImageLoop);
     Run("bounded compute image loop", TestBoundedComputeImageLoop);
     Run("uniformized material image keys", TestUniformizedMaterialImageKeys);
     Run("image descriptor fields", TestImageDescriptorFields);

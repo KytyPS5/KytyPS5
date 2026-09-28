@@ -483,25 +483,17 @@ KYTY_CP_OP_PARSER(CpOpGetLodStats) {
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0038e00);
 
 	const auto buffer_size = buffer[0];
-	auto* dst = reinterpret_cast<volatile uint32_t*>((buffer[1] & 0xffffffc0u) |
+	auto*      dst         = reinterpret_cast<void*>((buffer[1] & 0xffffffc0u) |
 	                                                 (static_cast<uint64_t>(buffer[2]) << 32u));
 
 	if (Config::LodStatsEnabled()) {
 		// Bit 18 or 19 resets the counters after the report.
-		cp.GetLodStats(dst, buffer_size, (buffer[3] & 0xc0000u) != 0);
+		cp.GetLodStats(static_cast<volatile uint32_t*>(dst), buffer_size, (buffer[3] & 0xc0000u) != 0);
 		return 4;
 	}
 
-	// Mip statistics are not collected: each of up to 256 2-dword slots after the 16-dword header
-	// reports its id (dword 0 bits 24-31) and finest sampled mip 15 (dword 1 bits 24-27), i.e. no
-	// samples. A non-zero dword 0 then marks the report complete.
-	if (dst != nullptr && buffer_size >= 64) {
-		const auto slots = std::min((buffer_size - 64) / 8, 256u);
-		for (uint32_t slot = 0; slot < slots; slot++) {
-			dst[16 + slot * 2]     = slot << 24u;
-			dst[16 + slot * 2 + 1] = 15u << 24u;
-		}
-		dst[0] = 1;
+	if (dst != nullptr && buffer_size != 0) {
+		cp.WriteLodStats(dst, buffer_size);
 	}
 
 	return 4;
@@ -581,7 +573,7 @@ KYTY_CP_OP_PARSER(CpOpCondExec) {
 	EXIT_NOT_IMPLEMENTED(addr == 0);
 	EXIT_NOT_IMPLEMENTED(payload_dw + exec_count >= dw);
 
-	if (*reinterpret_cast<const volatile uint32_t*>(addr) == 0) {
+	if (cp.ReadDecisionValue<uint32_t>(reinterpret_cast<const volatile void*>(addr)) == 0) {
 		return payload_dw + exec_count;
 	}
 
@@ -611,7 +603,8 @@ KYTY_CP_OP_PARSER(CpOpBranch) {
 	EXIT_NOT_IMPLEMENTED(function > 6);
 	EXIT_NOT_IMPLEMENTED(then_buffer == nullptr || then_num_dw == 0);
 
-	if (TestWaitRegMemValue(*compare_addr, reference, mask, function)) {
+	if (TestWaitRegMemValue(cp.ReadDecisionValue<uint64_t>(compare_addr), reference, mask,
+	                        function)) {
 		cp.ProcessIndirectBuffer({then_buffer, then_num_dw}, true);
 	} else if (mode == 2 && else_num_dw != 0) {
 		EXIT_NOT_IMPLEMENTED(else_buffer == nullptr);
@@ -1210,6 +1203,10 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 	    reinterpret_cast<void*>((buffer[2] & ~0x3u) | (static_cast<uint64_t>(buffer[3]) << 32u)),
 	    buffer[4] | (static_cast<uint64_t>(buffer[5]) << 32u), buffer[6] & 0x07ffffffu,
 	    (buffer[0] & (1u << 21u)) != 0);
+	if (((buffer[1] >> 24u) & 0x7u) == 0 || ((buffer[1] >> 24u) & 0x7u) == 3) {
+		// A label-only release keeps batching; long batches still start the GPU early.
+		cp.BufferFlushIfBatchReady();
+	}
 
 	return 7;
 }

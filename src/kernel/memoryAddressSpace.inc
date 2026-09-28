@@ -158,6 +158,28 @@ public:
 		return true;
 	}
 
+	// The backing alias of a range that one run of contiguous backing holds, or null. Needs no
+	// lock, like TryReadBacking. The alias stays mapped for the store's lifetime, so the pointer
+	// can be read later, even after the guest range changed.
+	[[nodiscard]] const uint8_t* FindBackingPointer(uint64_t vaddr, uint64_t size) const {
+		if (size == 0 || UINT64_MAX - vaddr < size) {
+			return nullptr;
+		}
+		const uint8_t* result = nullptr;
+		bool           split  = false;
+		ForEachRun(
+		    vaddr, size,
+		    [&](uint64_t offset, uint64_t start, uint64_t) {
+			    if (start == vaddr) {
+				    result = m_backing_base + offset;
+			    } else {
+				    split = true;
+			    }
+		    },
+		    [&](uint64_t, uint64_t) { split = true; });
+		return split ? nullptr : result;
+	}
+
 	template <typename Gap>
 	void ReadSparseBacking(uint64_t vaddr, void* data, uint64_t size, Gap&& gap) const {
 		auto* destination = static_cast<uint8_t*>(data);
@@ -543,6 +565,10 @@ public:
 
 	[[nodiscard]] bool IsBacked(uint64_t vaddr, uint64_t size) const {
 		return m_backing->IsBacked(vaddr, size);
+	}
+
+	[[nodiscard]] const uint8_t* FindBackingPointer(uint64_t vaddr, uint64_t size) const {
+		return m_backing->FindBackingPointer(vaddr, size);
 	}
 
 	template <bool copy_private>

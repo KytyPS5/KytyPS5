@@ -238,7 +238,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 }
 
 void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
-                    std::optional<ImageSubresourceRange> range, vk::CommandBuffer command_buffer) {
+                    std::optional<ImageSubresourceRange> range, CommandRecorder command_buffer) {
 	const auto transfer_access =
 	    vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite;
 	vk::PipelineStageFlags2 destination_stage {};

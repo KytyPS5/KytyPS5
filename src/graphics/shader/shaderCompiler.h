@@ -43,6 +43,24 @@ ShaderParams PrepareProgram(
     ShaderPixelInputInfo&                               input_info);
 ShaderParams PrepareProgram(const HW::ComputeShaderInfo& regs, ShaderComputeInputInfo& input_info);
 
+// Reads the guest memory PrepareProgram needs besides registers and shader code (vertex fetch
+// tables); false when the range cannot be read.
+using ShaderGuestReader = bool (*)(void* userdata, uint64_t address, void* data, uint64_t size);
+
+// Makes PrepareProgram on the calling thread read guest memory through `reader` instead of plain
+// loads while the scope lives (a null reader keeps plain loads).
+class ShaderGuestReaderScope {
+public:
+	ShaderGuestReaderScope(ShaderGuestReader reader, void* userdata);
+	~ShaderGuestReaderScope();
+	ShaderGuestReaderScope(const ShaderGuestReaderScope&)            = delete;
+	ShaderGuestReaderScope& operator=(const ShaderGuestReaderScope&) = delete;
+
+private:
+	ShaderGuestReader m_previous_reader;
+	void*             m_previous_userdata;
+};
+
 } // namespace Libs::Graphics
 
 #endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_SHADERCOMPILER_H_ */

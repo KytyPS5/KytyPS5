@@ -22,6 +22,11 @@ bool IsMainThread();
 // Unique per thread; never reused by another thread.
 int GetThreadIdUnique();
 
+// Current thread: raises its priority to "highest", and restricts it to one logical
+// processor (when `logical_cpu` is not negative). No-ops where unsupported.
+void RaiseCurrentPriority();
+void PinCurrent(int logical_cpu);
+
 } // namespace Thread
 
 // Recursive.

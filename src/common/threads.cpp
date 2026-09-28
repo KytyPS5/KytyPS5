@@ -59,6 +59,24 @@ void InitializeThreads() {
 	g_main_thread = std::this_thread::get_id();
 }
 
+void Thread::RaiseCurrentPriority() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+#endif
+}
+
+void Thread::PinCurrent(int logical_cpu) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (logical_cpu >= 0 && logical_cpu < 64) {
+		const auto mask = DWORD_PTR {1} << static_cast<uint32_t>(logical_cpu);
+		::SetThreadAffinityMask(::GetCurrentThread(), mask);
+		::SetThreadIdealProcessor(::GetCurrentThread(), static_cast<DWORD>(logical_cpu));
+	}
+#else
+	(void)logical_cpu;
+#endif
+}
+
 void Thread::SleepMicro(uint32_t micros) {
 	SleepNano(uint64_t {micros} * 1000);
 }

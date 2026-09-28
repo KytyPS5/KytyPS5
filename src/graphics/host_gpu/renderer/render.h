@@ -4,6 +4,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
@@ -34,6 +35,28 @@ struct DrawIndexBufferSource;
 class RenderContext;
 class CommandScheduler;
 struct RenderExecutorTestAccess;
+
+// An image description derived from a T# and a shader's view of it (see ResolveTexture).
+struct TextureDescDerivation {
+	TextureCache::ImageDesc desc;
+	bool                    shader_conversion = false;
+	vk::Format              pixel_format      = vk::Format::eUndefined;
+	vk::Format              view_format       = vk::Format::eUndefined;
+	uint64_t                size              = 0;
+	// The image the last lookup of a sampled texture with this description found, the
+	// description it was found with and the view acquired for it. Reused while no image on the
+	// pages of the range was registered or unregistered since and the image keeps the state the
+	// acquisition left it in.
+	struct Found {
+		ImageId                 id;
+		TextureCache::ImageDesc desc;
+		vk::ImageView           view            = nullptr;
+		uint64_t                image_set_epoch = 0;
+		ImageLookupState        state;
+		bool                    valid = false;
+	};
+	Found found;
+};
 
 enum class DrawOffsetSource : uint8_t {
 	DrawState,
@@ -101,21 +124,28 @@ public:
 
 	KYTY_CLASS_NO_COPY(CommandBuffer);
 
-	[[nodiscard]] bool IsInvalid() const noexcept { return m_buffer == nullptr; }
+	[[nodiscard]] bool IsInvalid() const noexcept {
+		return m_stream != nullptr ? !m_open : m_buffer == nullptr;
+	}
 
 	void BeginRendering(const RenderState& state) const;
 	void EndRendering() const;
 
-	[[nodiscard]] vk::CommandBuffer Handle() const noexcept { return m_buffer; }
+	[[nodiscard]] CommandRecorder Handle() const;
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
 	[[nodiscard]] RenderContext&    GetContext() const noexcept { return m_context; }
-	[[nodiscard]] HW::Context&      GetRegisters() const noexcept { return *m_registers; }
-	[[nodiscard]] HW::UserConfig&   GetUserConfig() const noexcept { return *m_user_config; }
-	[[nodiscard]] HW::Shader&       GetShaders() const noexcept { return *m_shaders; }
+	[[nodiscard]] const HW::Context&    GetRegisters() const noexcept { return *m_registers; }
+	[[nodiscard]] const HW::UserConfig& GetUserConfig() const noexcept { return *m_user_config; }
+	[[nodiscard]] const HW::Shader&     GetShaders() const noexcept { return *m_shaders; }
+
+	// Pipelines recorded outside the draws (the presentation overlay) replace the dynamic state
+	// the draws set.
+	void InvalidateDynamicState() const;
 
 private:
-	explicit CommandBuffer(CommandScheduler& scheduler);
-	void Bind(HW::Context& registers, HW::UserConfig& user_config, HW::Shader& shaders) noexcept {
+	CommandBuffer(CommandScheduler& scheduler, CommandStream* stream);
+	void Bind(const HW::Context& registers, const HW::UserConfig& user_config,
+	          const HW::Shader& shaders) noexcept {
 		m_registers   = &registers;
 		m_user_config = &user_config;
 		m_shaders     = &shaders;
@@ -124,14 +154,18 @@ private:
 	void Begin();
 	void End() const;
 
+	CommandScheduler&   m_scheduler;
 	RenderContext&      m_context;
 	GraphicContext&     m_graphics;
+	// Direct recording writes m_buffer; deferred recording appends to m_stream while m_open.
 	vk::CommandBuffer   m_buffer = nullptr;
+	CommandStream*      m_stream = nullptr;
+	bool                m_open   = false;
 	mutable RenderState m_render_state;
 	mutable bool        m_rendering   = false;
-	HW::Context*        m_registers   = nullptr;
-	HW::UserConfig*     m_user_config = nullptr;
-	HW::Shader*         m_shaders     = nullptr;
+	const HW::Context*    m_registers   = nullptr;
+	const HW::UserConfig* m_user_config = nullptr;
+	const HW::Shader*     m_shaders     = nullptr;
 
 	friend class CommandScheduler;
 };
@@ -151,6 +185,31 @@ public:
 	void DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr, uint32_t mode,
 	                      bool async_compute);
 	void ProcessPssr(CommandBuffer& buffer, const Pssr::Request& request);
+
+	// Shader programs and resources of a draw resolved ahead of its execution.
+	struct ResolvedDraw;
+	// Resolve thread: resolves the shader programs of a draw with the given registers ahead of
+	// its execution; null when the draw resolves them itself (tessellation, programs that are not
+	// compiled yet, guest memory that cannot be read ahead). Waits while every resolution is in
+	// use: the execution thread releases them in order.
+	[[nodiscard]] ResolvedDraw* ResolveDrawAhead(const HW::Context&    context,
+	                                             const HW::UserConfig& user_config,
+	                                             const HW::Shader&     shaders);
+	// Execution thread: the next draw uses `resolved` when the guest memory it read still holds
+	// the same bytes.
+	void UseResolvedDraw(ResolvedDraw* resolved) noexcept { m_resolved_draw = resolved; }
+	// Execution thread: the operation that carried `resolved` executed.
+	static void ReleaseResolvedDraw(ResolvedDraw* resolved) noexcept;
+	// Execution thread: the context register snapshot of the operation about to execute (0 for
+	// live registers); operations with the same id see the same context registers.
+	void UseContextId(uint64_t context_id) noexcept { m_context_id = context_id; }
+	// Execution thread: an operation other than a draw is about to execute (see
+	// RenderTargetMemo).
+	void InvalidateRenderTargetMemo() noexcept;
+	// Advances whenever an operation other than a draw executes (see
+	// InvalidateRenderTargetMemo()): within one value only draws executed, so no guest-visible
+	// effect let the guest write the memory they read.
+	[[nodiscard]] uint64_t DrawWindow() const noexcept { return m_draw_window; }
 
 	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
 	void                           FindBuffers(std::span<PreparedBindings* const> stages);
@@ -411,8 +470,26 @@ private:
 	[[nodiscard]] bool DepthStencilCopy(CommandBuffer& buffer);
 	[[nodiscard]] bool CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo& draw,
 	                                    const DrawEmitInfo& emit, const DrawRenderState& state);
-	[[nodiscard]] bool PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
-	                                          DrawRenderState& state);
+	struct DrawRenderStorage;
+	struct ColorTargetMemo;
+	struct DepthTargetMemo;
+	struct RenderTargetMemo;
+	struct ResolvedDrawRing;
+	// See RenderTargetMemo.
+	void               CaptureRenderTargetKey(const HW::Context& registers, uint32_t mrt_mask);
+	[[nodiscard]] bool RenderTargetMemoCurrent();
+	[[nodiscard]] bool TryReuseRenderTargets(const HW::Context& registers, uint32_t mrt_mask);
+	void StoreRenderTargetMemo(const RenderColorInfo* colors, uint32_t color_count,
+	                           const RenderDepthInfo& depth, const vk::ImageView* views,
+	                           vk::ImageView depth_view, ImageId stencil);
+	// The draw state of the executing draw: the one its resolution prepared when that is still
+	// valid (shaders_resolved), otherwise the reused state.
+	[[nodiscard]] DrawRenderState& AcquireDrawRenderState(bool  tessellation,
+	                                                      bool& shaders_resolved,
+	                                                      const ShaderIndirectOffsets& indirect_offsets,
+	                                                      bool indirect_draw);
+	[[nodiscard]] bool PrepareDrawRenderState(CommandBuffer& buffer, bool shaders_resolved,
+	                                          const DrawCallInfo& draw, DrawRenderState& state);
 	void               ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallInfo& draw,
 	                                       const DrawRenderState& state, const DrawEmitInfo& emit,
 	                                       const DrawIndexBufferSource& index_source);
@@ -430,14 +507,24 @@ private:
 	[[nodiscard]] bool TryConsumeComputeFill(const ShaderComputeInputInfo& input,
 	                                        CommandBuffer& command, uint32_t group_x,
 	                                        uint32_t group_y, uint32_t group_z, uint32_t mode);
-	[[nodiscard]] bool        Upscale(vk::CommandBuffer command, const Pssr::Request& request,
-	                                  Dlss::Inputs& inputs);
+	void CreatePssrPipeline();
+	struct UpscalerFeature;
+	// The feature the upscaler evaluates the request with: the context's, or a new one (and `reset`
+	// set) when that one does not take the request; null when the upscaler can't take it.
+	[[nodiscard]] UpscalerFeature* UpscalerFeatureFor(const Pssr::Request& request,
+	                                                  const Dlss::Inputs& inputs, bool& reset);
+	// Where the command buffer is recorded: creates the feature the first time and evaluates it.
+	// False when the upscaler refused the feature or the evaluation failed.
+	[[nodiscard]] static bool EvaluateUpscaler(vk::CommandBuffer command, UpscalerFeature& feature,
+	                                           const Pssr::Request& request, Dlss::Inputs& inputs,
+	                                           bool reset);
+	static void ReleaseUpscalerFeature(UpscalerFeature* feature);
 
-	// A null feature is one the upscaler refused or failed.
+	// Upscaler history of a PSSR context.
 	struct UpscalerContext {
-		uint64_t                           context;
-		Dlss::Creation                     creation;
-		std::unique_ptr<Upscaler::Feature> feature;
+		uint64_t         context;
+		Dlss::Creation   creation;
+		UpscalerFeature* feature;
 	};
 
 	// GET_LOD_STATS counters since their last reset. With --lod-stats a bound T# with counting
@@ -453,6 +540,9 @@ private:
 	GraphicsBindings                     m_graphics_bindings;
 	// The current draw's targets; PrepareDrawRenderState resolves them again for each draw.
 	DrawTargets                           m_targets;
+	// The targets of the executing draw: m_targets, or the remembered ones of the render target
+	// memo, used in place, when the draw reuses the targets of the draw before.
+	DrawTargets*                          m_draw_targets = &m_targets;
 	PreparedBindings                     m_compute_bindings;
 	std::vector<ImageId>                  m_bound_images;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;

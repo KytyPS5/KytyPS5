@@ -1751,6 +1751,8 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	auto& reads = snapshot.specialization_reads;
 	reads = program.source_reads;
 	if (!WalkSrt(program, runtime, snapshot.flattened_srt, capture_reads ? &reads : nullptr)) {
+		// Ahead of execution a walk fails on any fault; the execution thread walks again.
+		if (runtime.record_load != nullptr) return false;
 		return SpecializationFail(fmt::format("SRT refresh complete={} reads={} user_data={}",
 		    program.srt_plan_complete, program.srt_reads.size(), runtime.user_data.size()));
 	}

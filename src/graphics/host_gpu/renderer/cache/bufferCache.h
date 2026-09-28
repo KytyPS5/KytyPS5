@@ -78,6 +78,9 @@ public:
 	[[nodiscard]] Buffer* GetBdaPageTableBuffer() noexcept { return &m_bda_pagetable_buffer; }
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
+	// Copies guest memory into the mapped stream buffer, possibly on the host copy thread (see
+	// CommandScheduler::HostCopies()).
+	void StreamGuestData(uint8_t* destination, uint64_t vaddr, uint64_t size);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
 	                bool src_gds);
@@ -134,6 +137,19 @@ public:
 	// Advances whenever a buffer is registered: a new buffer may cover CPU-dirty pages that no
 	// earlier synchronization uploaded.
 	[[nodiscard]] uint64_t RegisterEpoch() const { return m_register_epoch; }
+	// Advances whenever recorded work may write cached buffers (written bindings, fills, copies,
+	// device-address stores).
+	[[nodiscard]] uint64_t GpuWriteGeneration() const noexcept { return m_gpu_write_generation; }
+	// Advances whenever a page of the range becomes CPU dirty (see
+	// MemoryTracker::RegionCpuDirtyEpoch); pages that stay CPU dirty do not advance it.
+	[[nodiscard]] uint64_t CpuDirtyEpoch(uint64_t vaddr, uint64_t size) const {
+		uint64_t epoch = 0;
+		for (auto index = vaddr / TRACKER_REGION_SIZE; index * TRACKER_REGION_SIZE < vaddr + size;
+		     index++) {
+			epoch += m_memory_tracker.RegionCpuDirtyEpoch(index);
+		}
+		return epoch;
+	}
 	void               RunGarbageCollector();
 
 private:
@@ -187,6 +203,7 @@ private:
 	RangeSet                                          m_released_ranges;
 	bool                                              m_record_released = false;
 	MemoryTracker                                     m_memory_tracker;
+	uint64_t                                           m_gpu_write_generation = 0;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;
@@ -194,6 +211,33 @@ private:
 	TextureCache&                                     m_texture_cache;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_register_epoch     = 0;
+	// Advances whenever a buffer is registered or unregistered.
+	uint64_t m_buffer_set_epoch = 0;
+	// The buffer a read-only binding of a range found, while no buffer was registered or
+	// unregistered and no page of the range became CPU dirty since (see ObtainBuffer()).
+	struct ObtainMemo {
+		uint64_t vaddr        = 0;
+		uint64_t size         = 0;
+		uint64_t buffer_epoch = 0;
+		uint64_t cpu_epoch    = 0;
+		uint64_t offset       = 0;
+		BufferId id;
+	};
+	// The stream copy a range got within the current draw window (see ObtainBuffer()).
+	struct StreamMemo {
+		uint64_t vaddr            = 0;
+		uint64_t size             = 0;
+		uint64_t window           = UINT64_MAX;
+		uint64_t lap              = 0;
+		uint64_t write_generation = 0;
+		uint64_t offset           = 0;
+	};
+	static constexpr size_t                                  StreamMemoSlots = 1024;
+	std::unique_ptr<std::array<StreamMemo, StreamMemoSlots>> m_stream_memo =
+	    std::make_unique<std::array<StreamMemo, StreamMemoSlots>>();
+	static constexpr size_t                                  ObtainMemoSlots = 4096;
+	std::unique_ptr<std::array<ObtainMemo, ObtainMemoSlots>> m_obtain_memo =
+	    std::make_unique<std::array<ObtainMemo, ObtainMemoSlots>>();
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;

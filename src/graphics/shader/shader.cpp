@@ -161,6 +161,29 @@ static void ShaderDetectBuffers(ShaderVertexInputInfo& info) {
 	}
 }
 
+thread_local ShaderGuestReader t_guest_reader          = nullptr;
+thread_local void*             t_guest_reader_userdata = nullptr;
+
+ShaderGuestReaderScope::ShaderGuestReaderScope(ShaderGuestReader reader, void* userdata)
+    : m_previous_reader(t_guest_reader), m_previous_userdata(t_guest_reader_userdata) {
+	t_guest_reader          = reader;
+	t_guest_reader_userdata = userdata;
+}
+
+ShaderGuestReaderScope::~ShaderGuestReaderScope() {
+	t_guest_reader          = m_previous_reader;
+	t_guest_reader_userdata = m_previous_userdata;
+}
+
+static void ReadShaderGuest(const void* address, void* data, size_t size) {
+	if (t_guest_reader == nullptr) {
+		std::memcpy(data, address, size);
+	} else if (!t_guest_reader(t_guest_reader_userdata, reinterpret_cast<uint64_t>(address), data,
+	                           size)) {
+		std::memset(data, 0, size);
+	}
+}
+
 static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
                                        std::span<const ShaderSemantic> input_semantics,
                                        const uint32_t* attrib, const uint32_t* buffer) {
@@ -178,20 +201,21 @@ static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
 		uint32_t reg  = in.hardware_mapping;
 		uint32_t size = in.size_in_elements;
 
+		uint32_t attribute = 0;
+		ReadShaderGuest(&attrib[in.semantic], &attribute, sizeof(attribute));
 		if (debug_dump) {
-			LOGF("reg = %u, size = %u, va[%u] = 0x%08" PRIx32 "\n", reg, size, i,
-			     attrib[in.semantic]);
+			LOGF("reg = %u, size = %u, va[%u] = 0x%08" PRIx32 "\n", reg, size, i, attribute);
 		}
 
-		size_t index = attrib[in.semantic] & 0x1fu;
-		auto   format =
-		    static_cast<Prospero::VertexAttribFormat>((attrib[in.semantic] >> 5u) & 0x1ffu);
-		uint32_t offset      = (attrib[in.semantic] >> 14u) & 0xfffu;
-		uint32_t fetch_index = (attrib[in.semantic] >> 26u) & 0x1u;
+		size_t   index  = attribute & 0x1fu;
+		auto     format = static_cast<Prospero::VertexAttribFormat>((attribute >> 5u) & 0x1ffu);
+		uint32_t offset = (attribute >> 14u) & 0xfffu;
+		uint32_t fetch_index = (attribute >> 26u) & 0x1u;
 
 		EXIT_NOT_IMPLEMENTED(index >= ShaderVertexInputInfo::RES_MAX);
 
-		const auto* sharp = &buffer[index * 4];
+		uint32_t sharp[4] {};
+		ReadShaderGuest(&buffer[index * 4], sharp, sizeof(sharp));
 
 		EXIT_NOT_IMPLEMENTED(info.resources_num >= ShaderVertexInputInfo::RES_MAX);
 

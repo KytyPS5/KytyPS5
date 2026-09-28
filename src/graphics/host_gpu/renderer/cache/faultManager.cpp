@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <algorithm>
@@ -89,7 +90,11 @@ void FaultManager::ProcessFaultBuffer() {
 		}
 		fault_ranges.ForEach([this](uint64_t start, uint64_t end) {
 			EXIT_IF(end - start > std::numeric_limits<uint32_t>::max());
-			(void)m_buffer_cache.FindBuffer(start, end - start);
+			// The guest may have unmapped the range since the GPU accessed it: an unmap does not
+			// wait for this completion.
+			if (m_scheduler.Context().IsMapped(start, end - start)) {
+				(void)m_buffer_cache.FindBuffer(start, end - start);
+			}
 		});
 	});
 }
@@ -155,8 +160,10 @@ void FaultManager::Process(Reader& reader, uint64_t bitmap_offset, PagesHandler&
 	command.pipelineBarrier2(dependency);
 
 	const auto area = reader.current;
-	m_scheduler.DeferOperation([&reader, mapped, offset, area, area_size,
-	                            handler = std::move(handler)] {
+	// The write scan marks the pages the GPU wrote as GPU-owned: an unmap waits for it, or a remap
+	// of the range would inherit the marks. The fault scan only caches pages still mapped.
+	Common::UniqueFunction<void> scan = [&reader, mapped, offset, area, area_size,
+	                                     handler = std::move(handler)] {
 		reader.download.Invalidate(offset, area_size);
 		const auto* entries = std::bit_cast<const uint64_t*>(mapped);
 		// The parser counts every set bit but stores only the entries the area holds; it leaves
@@ -172,7 +179,12 @@ void FaultManager::Process(Reader& reader, uint64_t bitmap_offset, PagesHandler&
 			handler(pages);
 		}
 		reader.ticks[area] = 0;
-	});
+	};
+	if (&reader == &m_writes) {
+		m_scheduler.DeferOperation(std::move(scan));
+	} else {
+		m_scheduler.DeferHostOperation(std::move(scan));
+	}
 
 	reader.ticks[reader.current++] = m_scheduler.CurrentTick();
 	reader.current %= MaxPendingFaults;

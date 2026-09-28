@@ -2,9 +2,13 @@
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/threads.h"
 
 #include <algorithm>
+#include <array>
+#include <cstdlib>
 #include <memory>
+#include <string_view>
 
 namespace Config {
 
@@ -271,6 +275,59 @@ bool SkipNoticeScreen() {
 
 const std::string& GetLaunchActivity() {
 	return g_config->launch_activity;
+}
+
+uint32_t ParseGpuPipelineStages(const char* value) {
+	char*      end    = nullptr;
+	const auto parsed = std::strtoul(value, &end, 0);
+	if (end == value || *end != '\0') {
+		EXIT("invalid GPU pipeline stages: %s\n", value);
+	}
+	return parsed == 1 ? GPU_PIPELINE_ALL : static_cast<uint32_t>(parsed) & GPU_PIPELINE_ALL;
+}
+
+void ConfigureGpuStageThread(GpuStageThread stage) {
+	// Five physical cores of the first CCD of a Ryzen 9 5900X (SMT siblings are adjacent), away
+	// from core 0: the stages share its L3.
+	static const std::array<int, 5> cpus = [] {
+		std::array<int, 5> result {4, 6, 8, 10, 2};
+		const char*        value = std::getenv("KYTY_GPU_THREAD_CPUS");
+		if (value == nullptr) {
+			return result;
+		}
+		if (std::string_view(value) == "off") {
+			return std::array<int, 5> {-1, -1, -1, -1, -1};
+		}
+		// Stages without a listed CPU keep their default.
+		for (auto& cpu: result) {
+			if (*value == '\0') {
+				break;
+			}
+			char* end = nullptr;
+			cpu       = static_cast<int>(std::strtol(value, &end, 10));
+			if (end == value) {
+				EXIT("invalid KYTY_GPU_THREAD_CPUS: %s\n", std::getenv("KYTY_GPU_THREAD_CPUS"));
+			}
+			value = *end == ',' ? end + 1 : end;
+		}
+		return result;
+	}();
+	static const bool high_priority = [] {
+		const char* value = std::getenv("KYTY_GPU_THREAD_PRIORITY");
+		return value == nullptr || std::string_view(value) != "0";
+	}();
+	if (high_priority) {
+		Common::Thread::RaiseCurrentPriority();
+	}
+	Common::Thread::PinCurrent(cpus[static_cast<uint32_t>(stage)]);
+}
+
+uint32_t GpuPipelineStages() {
+	if (const char* value = std::getenv("KYTY_GPU_PIPELINE"); value != nullptr) {
+		return ParseGpuPipelineStages(value);
+	}
+	// Tools and tests that do not load a configuration run the GPU inline.
+	return g_config != nullptr ? g_config->gpu_pipeline_stages : 0;
 }
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS

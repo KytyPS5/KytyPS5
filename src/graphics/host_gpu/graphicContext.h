@@ -157,6 +157,8 @@ struct VulkanImage {
 	VulkanImageState              state;
 	std::vector<VulkanImageState> subresource_states;
 	VmaAllocation                allocation = nullptr;
+	// Created with parameters DeleteImage can describe again: kept for reuse when deleted.
+	bool recyclable = false;
 };
 
 

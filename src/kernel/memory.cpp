@@ -837,6 +837,25 @@ bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return g_guest_address_space->TryReadBacking(vaddr, data, size);
 }
 
+const void* FindBackingPointer(uint64_t vaddr, uint64_t size) {
+	return g_guest_address_space != nullptr ? g_guest_address_space->FindBackingPointer(vaddr, size)
+	                                        : nullptr;
+}
+
+bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
+	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
+		// Byte ranges the GPU wrote lie on GPU-dirty pages: the lock-free page check answers
+		// for most reads.
+		auto& buffers = GetGpuResources().GetBufferCache();
+		if (!Graphics::GuestGpu::IsGpuThread() ||
+		    (buffers.MayBeGpuModified(vaddr, size) && buffers.HasGpuDirtyBytes(vaddr, size)) ||
+		    GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size)) {
+			return false;
+		}
+	}
+	return TryReadBacking(vaddr, data, size);
+}
+
 bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
 		if (!Graphics::GuestGpu::IsGpuThread()) {

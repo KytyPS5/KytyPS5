@@ -128,7 +128,7 @@ StateLayout Layout(size_t blases, size_t pairs, size_t walks, uint32_t instance_
 }
 
 // Each step consumes what the one before wrote, the last one on the host.
-void Barrier(vk::CommandBuffer command) {
+void Barrier(const CommandRecorder& command) {
 	const vk::MemoryBarrier2 barrier {.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands,
 	                                  .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
 	                                  .dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands |
@@ -139,6 +139,16 @@ void Barrier(vk::CommandBuffer command) {
 	command.pipelineBarrier2(
 	    vk::DependencyInfo {.memoryBarrierCount = 1, .pMemoryBarriers = &barrier});
 }
+
+// A BLAS build or update of Prepare(), recorded where the command buffer is (see Custom()).
+struct BlasBuild {
+	vk::DeviceAddress          vertices;
+	VkAccelerationStructureKHR source;
+	VkAccelerationStructureKHR destination;
+	vk::DeviceAddress          scratch;
+	uint32_t                   count;
+	uint32_t                   update;
+};
 
 vk::AccelerationStructureGeometryKHR TriangleGeometry(vk::DeviceAddress vertices, uint32_t count) {
 	vk::AccelerationStructureGeometryKHR geometry {};
@@ -592,7 +602,11 @@ vk::DeviceAddress RayTracing::Prepare(uint64_t tlas) {
 	const auto command = m_scheduler.Current().Handle();
 	Barrier(command);
 	const Context header {.valid = 1, .structure = top.structure.address};
-	command.updateBuffer(m_state->Handle(), 0, sizeof(header), &header);
+	const auto*   header_copy =
+	    command.CopyArray(reinterpret_cast<const uint8_t*>(&header), sizeof(header));
+	command.Custom([state_buffer = m_state->Handle(), header_copy](vk::CommandBuffer c) {
+		c.updateBuffer(state_buffer, 0, sizeof(Context), header_copy);
+	});
 	command.fillBuffer(m_state->Handle(), sizeof(header), layout.size - sizeof(header), 0);
 	Barrier(command);
 
@@ -631,26 +645,64 @@ vk::DeviceAddress RayTracing::Prepare(uint64_t tlas) {
 	Reserve(m_scratch, vk::BufferUsageFlagBits::eStorageBuffer,
 	        std::max(scratch_size, top.structure.build_scratch) + m_scratch_alignment);
 	const auto scratch = Common::AlignUp(m_scratch->BufferDeviceAddress(), m_scratch_alignment);
-	for (auto& info: builds) {
-		info.scratchData.deviceAddress += scratch;
-	}
 	if (!builds.empty()) {
-		command.buildAccelerationStructuresKHR(static_cast<uint32_t>(builds.size()), builds.data(),
-		                                       range_pointers.data());
+		// The recorder may run the builds later: they travel as plain records.
+		std::vector<BlasBuild> records;
+		records.reserve(builds.size());
+		for (size_t i = 0; i < builds.size(); ++i) {
+			const auto& info = builds[i];
+			records.push_back({
+			    .vertices    = info.pGeometries->geometry.triangles.vertexData.deviceAddress,
+			    .source      = info.srcAccelerationStructure,
+			    .destination = info.dstAccelerationStructure,
+			    .scratch     = info.scratchData.deviceAddress + scratch,
+			    .count       = ranges[i].primitiveCount,
+			    .update      = info.mode == vk::BuildAccelerationStructureModeKHR::eUpdate ? 1u : 0u,
+			});
+		}
+		const auto* copy  = command.CopyArray(records.data(), records.size());
+		const auto  count = static_cast<uint32_t>(records.size());
+		command.Custom([copy, count](vk::CommandBuffer c) {
+			std::vector<vk::AccelerationStructureGeometryKHR>              geometries(count);
+			std::vector<vk::AccelerationStructureBuildGeometryInfoKHR>     infos(count);
+			std::vector<vk::AccelerationStructureBuildRangeInfoKHR>        ranges(count);
+			std::vector<const vk::AccelerationStructureBuildRangeInfoKHR*> range_pointers(count);
+			for (uint32_t i = 0; i < count; ++i) {
+				geometries[i]              = TriangleGeometry(copy[i].vertices, copy[i].count);
+				auto& info                 = infos[i];
+				info.type                  = vk::AccelerationStructureTypeKHR::eBottomLevel;
+				info.flags                 = BlasFlags;
+				info.mode                  = copy[i].update != 0
+				                                 ? vk::BuildAccelerationStructureModeKHR::eUpdate
+				                                 : vk::BuildAccelerationStructureModeKHR::eBuild;
+				info.srcAccelerationStructure  = copy[i].source;
+				info.dstAccelerationStructure  = copy[i].destination;
+				info.geometryCount             = 1;
+				info.pGeometries               = &geometries[i];
+				info.scratchData.deviceAddress = copy[i].scratch;
+				ranges[i].primitiveCount       = copy[i].count;
+				range_pointers[i]              = &ranges[i];
+			}
+			c.buildAccelerationStructuresKHR(count, infos.data(), range_pointers.data());
+		});
 	}
 	Barrier(command);
 
-	const auto instances = InstanceGeometry(parameters.instances);
-	vk::AccelerationStructureBuildGeometryInfoKHR info {};
-	info.type                      = vk::AccelerationStructureTypeKHR::eTopLevel;
-	info.flags                     = vk::BuildAccelerationStructureFlagBitsKHR::ePreferFastTrace;
-	info.dstAccelerationStructure  = top.structure.handle;
-	info.geometryCount             = 1;
-	info.pGeometries               = &instances;
-	info.scratchData.deviceAddress = scratch;
-	const vk::AccelerationStructureBuildRangeInfoKHR  range {top.instance_slots, 0, 0, 0};
-	const vk::AccelerationStructureBuildRangeInfoKHR* range_pointer = &range;
-	command.buildAccelerationStructuresKHR(1, &info, &range_pointer);
+	command.Custom([instances_address = parameters.instances,
+	                tlas_handle       = static_cast<VkAccelerationStructureKHR>(top.structure.handle),
+	                scratch, slots = top.instance_slots](vk::CommandBuffer c) {
+		const auto instances = InstanceGeometry(instances_address);
+		vk::AccelerationStructureBuildGeometryInfoKHR info {};
+		info.type                      = vk::AccelerationStructureTypeKHR::eTopLevel;
+		info.flags                     = vk::BuildAccelerationStructureFlagBitsKHR::ePreferFastTrace;
+		info.dstAccelerationStructure  = tlas_handle;
+		info.geometryCount             = 1;
+		info.pGeometries               = &instances;
+		info.scratchData.deviceAddress = scratch;
+		const vk::AccelerationStructureBuildRangeInfoKHR  range {slots, 0, 0, 0};
+		const vk::AccelerationStructureBuildRangeInfoKHR* range_pointer = &range;
+		c.buildAccelerationStructuresKHR(1, &info, &range_pointer);
+	});
 	Barrier(command);
 
 	if (readback) {

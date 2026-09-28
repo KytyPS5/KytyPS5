@@ -408,6 +408,7 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	// New target buffers must exist before PrepareBda uploads the CPU writes of cached buffers.
 	const bool indirect_writes = PrepareIndirectWriteTargets(m_context, bindings);
 	if (program.info.uses_dma) {
+		m_context.CacheDmaBases(input_info.stage);
 		m_context.PrepareBda();
 	}
 	PrepareRayQuery(m_context, input_info.stage, bindings);
@@ -549,6 +550,7 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	// New target buffers must exist before PrepareBda uploads the CPU writes of cached buffers.
 	const bool indirect_writes = PrepareIndirectWriteTargets(m_context, bindings);
 	if (program.info.uses_dma) {
+		m_context.CacheDmaBases(input_info.stage);
 		m_context.PrepareBda();
 	}
 	PrepareRayQuery(m_context, input_info.stage, bindings);

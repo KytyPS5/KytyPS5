@@ -31,6 +31,18 @@ enum class PssrUpscaler { Linear, DLSS, FSR };
 using Keymap = std::vector<std::string>;
 using ControllerColor = std::array<uint8_t, 3>;
 
+// Stages of the emulated GPU that run on threads of their own; see GpuPipelineStages().
+enum GpuPipelineStage : uint32_t {
+	GPU_PIPELINE_RECORDING = 1u << 0u, // Vulkan command recording and submission.
+	// The command processor runs ahead of the execution of the operations it produces.
+	GPU_PIPELINE_COMMAND_PROCESSOR = 1u << 1u,
+	// Shader programs and resource tables of draws are resolved ahead of their execution
+	// (requires the command processor stage).
+	GPU_PIPELINE_RESOLVE = 1u << 2u,
+	GPU_PIPELINE_ALL =
+	    GPU_PIPELINE_RECORDING | GPU_PIPELINE_COMMAND_PROCESSOR | GPU_PIPELINE_RESOLVE,
+};
+
 constexpr uint32_t DEFAULT_CONSOLE_LANGUAGE = 1;
 constexpr uint32_t MAX_CONSOLE_LANGUAGE     = 29;
 constexpr std::size_t MAX_USER_NAME_LENGTH = 16;
@@ -108,6 +120,7 @@ struct ConfigOptions {
 	bool                   playgo_hack_enabled         = false;
 	bool                   skip_notice_screen          = false;
 	std::string            launch_activity;
+	uint32_t               gpu_pipeline_stages         = GPU_PIPELINE_ALL;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	bool red_zone_protection_enabled = true;
 #endif
@@ -189,6 +202,23 @@ bool PlayGoHackEnabled();
 bool SkipNoticeScreen();
 // Activity ID of the one-shot launchActivity game intent; empty sends none.
 const std::string& GetLaunchActivity();
+// GpuPipelineStage bits. The KYTY_GPU_PIPELINE environment variable overrides the option: 0 runs
+// the whole emulated GPU inline on one thread, 1 enables every stage, other values are masks.
+uint32_t GpuPipelineStages();
+uint32_t ParseGpuPipelineStages(const char* value);
+
+// Threads of a pipelined GPU. KYTY_GPU_THREAD_CPUS lists the logical processors the command
+// processor, execution, recording, resolve and host copy threads are pinned to ("off" leaves
+// them unpinned); KYTY_GPU_THREAD_PRIORITY=0 keeps their normal priority.
+enum class GpuStageThread : uint32_t {
+	CommandProcessor = 0,
+	Execution        = 1,
+	Recording        = 2,
+	Resolve          = 3,
+	HostCopy         = 4
+};
+// Applies the priority and affinity of `stage` to the calling thread.
+void ConfigureGpuStageThread(GpuStageThread stage);
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled();
 #endif

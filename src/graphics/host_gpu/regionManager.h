@@ -55,7 +55,9 @@ public:
 private:
 	static uint32_t CurrentThread() noexcept {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		return GetCurrentThreadId();
+		// Cached: the lock is taken for most dirty-page queries of the GPU threads.
+		static thread_local const uint32_t tid = GetCurrentThreadId();
+		return tid;
 #elif defined(__APPLE__)
 		// mach thread port is a nonzero per-thread id (0 is the "no owner" sentinel).
 		static thread_local const uint32_t tid =
@@ -125,7 +127,7 @@ public:
 				m_cpu_dirty_epoch.fetch_add(1, std::memory_order_acq_rel);
 				s_cpu_dirty_epoch.fetch_add(1, std::memory_order_acq_rel);
 			}
-			m_has_cpu_dirty.store(m_cpu_dirty.Any(), std::memory_order_release);
+			m_has_cpu_dirty.store(!m_cpu_dirty.None(), std::memory_order_release);
 			UpdateProtection<!enable, false>(changed);
 		} else {
 			UpdateProtection<enable, true>(changed);
@@ -143,7 +145,7 @@ public:
 		if constexpr (clear) {
 			bits.UnsetRange(start, end);
 			if constexpr (source == DirtySource::Cpu) {
-				m_has_cpu_dirty.store(m_cpu_dirty.Any(), std::memory_order_release);
+				m_has_cpu_dirty.store(!m_cpu_dirty.None(), std::memory_order_release);
 				UpdateProtection<true, false>(mask);
 			} else {
 				UpdateProtection<false, true>(mask);
@@ -196,15 +198,25 @@ public:
 		return m_has_cpu_dirty.load(std::memory_order_acquire);
 	}
 
+	// Whether any page is GPU dirty, i.e. read protected. Read without the lock: a stale answer
+	// only chooses between a plain read and a checked one.
+	[[nodiscard]] bool HasGpuDirty() const {
+		return m_has_gpu_dirty.load(std::memory_order_acquire);
+	}
+
 	TrackingSpinLock lock;
 
 private:
 	// CPU-dirty pages are not write-watched; GPU-dirty pages are read-watched.
 	template <bool track, bool is_read>
 	void UpdateProtection(RegionBits& changed) {
-		if (!changed.None()) {
-			m_page_manager.UpdatePageWatchersForRegion<track, is_read>(m_cpu_addr, changed);
+		if (changed.None()) {
+			return;
 		}
+		if constexpr (is_read) {
+			m_has_gpu_dirty.store(!m_gpu_dirty.None(), std::memory_order_release);
+		}
+		m_page_manager.UpdatePageWatchersForRegion<track, is_read>(m_cpu_addr, changed);
 	}
 
 	template <DirtySource source>
@@ -238,6 +250,7 @@ private:
 	RegionBits   m_gpu_dirty;
 	// A new region starts with every page CPU dirty.
 	std::atomic_bool      m_has_cpu_dirty {true};
+	std::atomic_bool      m_has_gpu_dirty {false};
 	std::atomic<uint64_t> m_cpu_dirty_epoch {1};
 
 	inline static std::atomic<uint64_t> s_cpu_dirty_epoch {0};

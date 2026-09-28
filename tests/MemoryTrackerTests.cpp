@@ -303,6 +303,42 @@ void TestRangeSet() {
             intersections[0].second == 0x1040 &&
             intersections[1].first == 0x1220 && intersections[1].second == 0x1240,
         "range set subtraction did not preserve both exact tails");
+
+  // Random adds and subtractions against a byte model: merged ranges stay maximal and exact.
+  constexpr uint64_t base = 0x10000;
+  constexpr uint64_t span = 512;
+  RangeSet random;
+  std::vector<bool> model(span, false);
+  uint32_t seed = 12345;
+  const auto next = [&seed](uint32_t bound) {
+    seed = seed * 1664525u + 1013904223u;
+    return (seed >> 8u) % bound;
+  };
+  for (int step = 0; step < 20000; step++) {
+    const uint64_t begin = next(span - 1);
+    const uint64_t size = 1 + next(static_cast<uint32_t>(std::min<uint64_t>(span - begin, 48)));
+    if (next(3) != 0) {
+      random.Add(base + begin, size);
+      for (uint64_t i = begin; i < begin + size; i++) model[i] = true;
+    } else {
+      random.Subtract(base + begin, size);
+      for (uint64_t i = begin; i < begin + size; i++) model[i] = false;
+    }
+    std::vector<std::pair<uint64_t, uint64_t>> actual;
+    random.ForEach([&](uint64_t start, uint64_t end) { actual.emplace_back(start, end); });
+    std::vector<std::pair<uint64_t, uint64_t>> expected;
+    for (uint64_t i = 0; i < span;) {
+      if (!model[i]) {
+        i++;
+        continue;
+      }
+      uint64_t j = i;
+      while (j < span && model[j]) j++;
+      expected.emplace_back(base + i, base + j);
+      i = j;
+    }
+    Check(actual == expected, "range set diverged from the byte model");
+  }
 }
 
 void TestGuestRange() {

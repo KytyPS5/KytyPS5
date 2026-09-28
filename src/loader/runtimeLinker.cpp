@@ -667,6 +667,13 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			case CoreAccess::Execute: access = GpuAccess::Execute; break;
 			case CoreAccess::Unknown: return false;
 		}
+		// A walk ahead of execution does not resolve faults: the load reads zero and the walk
+		// fails.
+		if (const auto length = Libs::Graphics::ShaderRecompiler::IR::SrtWalkerAheadLoadLength(
+		        info->exception_address, info->access_violation_vaddr)) {
+			Loader::X64InstructionEmulator::SkipLoad(info->native_context, length);
+			return true;
+		}
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
 			return true;

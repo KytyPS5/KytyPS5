@@ -14,8 +14,10 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
 #include <algorithm>
+#include <array>
 #include <bitset>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <type_traits>
 #include <unordered_set>
@@ -80,7 +82,9 @@ public:
 	                                               bool ensure_valid = true);
 	[[nodiscard]] vk::ImageView FindTexture(ImageId id, const ImageDesc& desc);
 	[[nodiscard]] vk::ImageView FindRenderTarget(ImageId id, const ImageDesc& desc);
-	[[nodiscard]] vk::ImageView FindDepthTarget(ImageId id, const ImageDesc& desc);
+	// stencil (optional) receives the stencil association the target refreshed, if any.
+	[[nodiscard]] vk::ImageView FindDepthTarget(ImageId id, const ImageDesc& desc,
+	                                            ImageId* stencil = nullptr);
 	[[nodiscard]] Image&        GetImage(ImageId id) {
 		auto& image = m_slot_images[id];
 		TouchImage(image);
@@ -105,6 +109,8 @@ public:
 
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
+	// Whether storage readback is on (constant while the GPU runs; the command processor reads it).
+	[[nodiscard]] bool StorageReadbackEnabled() const { return m_readback_storage_images; }
 	// With storage readback, a GL2 writeback makes GPU-written images visible to the CPU; returns
 	// whether a download was recorded.
 	[[nodiscard]] bool WriteBackImages();
@@ -168,6 +174,7 @@ private:
 	struct WriteBack {
 		GuestRange range;
 		uint64_t   tick;
+		bool       operator==(const WriteBack&) const = default;
 	};
 
 	// PS5: guest addresses span 44 bits, so an entry keeps the whole image address.
@@ -341,7 +348,7 @@ private:
 	// render area.
 	vk::Rect2D BeginColorRendering(Image& image, vk::Format format, uint32_t level,
 	                               uint32_t layer, uint32_t layers, const vk::ClearValue* clear,
-	                               vk::CommandBuffer command);
+	                               const CommandRecorder& command);
 	void RefreshCopySource(ImageId id);
 	// Caller holds m_lock.
 	void RefreshDepthCopy(ImageId copy_id);
@@ -352,7 +359,9 @@ private:
 	[[nodiscard]] ImageId FindStencilPlane(const Image& depth, GuestRange range) const;
 	[[nodiscard]] ImageId AssociateStencil(ImageId depth, GuestRange stencil);
 	void CopyImageMip(ImageId destination, ImageId source, uint32_t mip, uint32_t layer);
-	void ValidateImageDesc(const ImageDesc& desc) const;
+	// Validates the view and binding of a description; ImageOps::Validate() checks its image
+	// information.
+	void ValidateImageViewDesc(const ImageDesc& desc) const;
 
 	[[nodiscard]] bool DownloadImageMemory(ImageId id);
 	[[nodiscard]] bool DownloadQueuedImages();

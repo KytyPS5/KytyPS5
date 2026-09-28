@@ -7,6 +7,7 @@
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/spscQueue.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/gpu_defs.h"
@@ -41,9 +42,13 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <span>
+#include <thread>
+#include <type_traits>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -431,6 +436,304 @@ static bool DrawHasValidVertexShader(const HW::Shader& sh_ctx) {
 	return vs.es_regs.data_addr != 0;
 }
 
+struct RenderExecutor::DrawRenderStorage {
+	DrawRenderState state {};
+	// Only tessellation draws write the input infos of the second and third vertex stages.
+	bool tessellation_stages_written = false;
+};
+static_assert(std::is_trivially_destructible_v<DrawRenderState>);
+
+template <typename T>
+static void ValueInitialize(T& object) {
+	::new (static_cast<void*>(std::addressof(object))) T {};
+}
+
+// A draw state is 36 KB, 30 KB of it the input infos of the three vertex stages, and
+// value-initializing one on the stack took ~0.6 us per draw. Reuse one state and restore its
+// value-initialized contents, skipping the tessellation stages when no draw wrote them.
+// A resolution ahead of execution (see ResolveDrawAhead): the draw state with its shader
+// programs, the storage their stages point to, and whether the execution thread still uses it.
+struct RenderExecutor::ResolvedDraw {
+	DrawRenderStorage storage;
+	ProgramResolution programs;
+	std::atomic_bool  busy {false};
+};
+
+// More resolutions than operations can wait between the resolve and execution threads, so the
+// resolve thread only ever waits for room in that queue.
+struct RenderExecutor::ResolvedDrawRing {
+	static constexpr size_t Size = 320;
+
+	std::array<ResolvedDraw, Size> draws;
+	size_t                         next = 0;
+};
+
+void RenderExecutor::ReleaseResolvedDraw(ResolvedDraw* resolved) noexcept {
+	resolved->busy.store(false, std::memory_order_release);
+}
+
+// The render targets the last draw acquired. Nearly every draw renders to the targets of the
+// draw before it, with the same target registers, and acquiring them again repeats the same
+// lookups (image discovery, color metadata, attachment views, HTile state) with the same results.
+// A draw reuses them while nothing those lookups depend on can have changed:
+//  - only draws executed since the targets were acquired: any other operation and any
+//    submission invalidate them, so no guest-visible effect let the guest write in between;
+//  - the target registers and the slice offset are the same;
+//  - no image was registered or unregistered, and each target image (and stencil association)
+//    still has the tracking, dirty and ownership state the acquisition left it in;
+//  - no work wrote cached buffers since, and no page of the color/HTile metadata became CPU
+//    dirty. The guest writes metadata through the GPU; a CPU write between two draws would need
+//    the GPU to wait for it (WAIT_REG_MEM), and the first operation after a wait invalidates the
+//    targets too.
+// Draws with depth or stencil clears are not reused. Image layout transitions, attachment
+// layouts and binding state are still set by every draw.
+struct RenderExecutor::RenderTargetMemo {
+	struct MetadataEpoch {
+		GuestRange range;
+		uint64_t   epoch = 0;
+	};
+
+	// Registers ResolveRenderColorTarget() and ResolveRenderDepthTarget() read.
+	uint64_t                                                   context_id   = 0;
+	uint32_t                                                   mrt_mask     = 0;
+	uint32_t                                                   target_mask  = 0;
+	std::array<HW::RenderTarget, RENDER_COLOR_ATTACHMENTS_MAX> targets {};
+	HW::DepthRenderTarget                                      depth {};
+	HW::RenderControl                                          render_control {};
+	std::array<float, 3>                                       depth_values {};
+	uint8_t                                                    stencil_clear = 0;
+	bool                                                       depth_wanted  = false;
+
+	// A draw captured its registers and is acquiring its targets.
+	bool pending = false;
+	// The outputs below are the targets of the last draw.
+	bool                                                           valid                = false;
+	uint64_t                                                       tick                 = 0;
+	uint64_t                                                       image_set_epoch      = 0;
+	uint64_t                                                       gpu_write_generation = 0;
+	std::array<MetadataEpoch, RENDER_COLOR_ATTACHMENTS_MAX + 1>    metadata {};
+	uint32_t                                                       metadata_count = 0;
+	std::array<ImageLookupState, RENDER_COLOR_ATTACHMENTS_MAX + 2> images {};
+	uint32_t                                                       image_count = 0;
+	DrawTargets                                                    draw_targets;
+	std::array<vk::ImageView, RENDER_COLOR_ATTACHMENTS_MAX>        color_views {};
+	vk::ImageView                                                  depth_view = nullptr;
+};
+
+template <typename T>
+static bool SameBytes(const T& a, const T& b) {
+	static_assert(std::is_trivially_copyable_v<T>);
+	return std::memcmp(&a, &b, sizeof(T)) == 0;
+}
+
+template <typename T>
+static void CopyBytes(T& destination, const T& source) {
+	static_assert(std::is_trivially_copyable_v<T>);
+	std::memcpy(&destination, &source, sizeof(T));
+}
+
+void RenderExecutor::InvalidateRenderTargetMemo() noexcept {
+	m_draw_window++;
+	if (m_render_target_memo != nullptr) {
+		m_render_target_memo->valid   = false;
+		m_render_target_memo->pending = false;
+	}
+	m_render_targets_reused = false;
+}
+
+void RenderExecutor::CaptureRenderTargetKey(const HW::Context& hw, uint32_t mrt_mask) {
+	if (m_render_target_memo == nullptr) {
+		m_render_target_memo = {new RenderTargetMemo {},
+		                        [](RenderTargetMemo* memo) { delete memo; }};
+	}
+	auto& memo   = *m_render_target_memo;
+	memo.valid   = false;
+	memo.pending = !graphics_debug_dump_enabled();
+	if (!memo.pending) {
+		return;
+	}
+	memo.context_id   = m_context_id;
+	memo.mrt_mask     = mrt_mask;
+	memo.target_mask  = hw.GetRenderTargetMask();
+	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
+		if ((mrt_mask & (1u << slot)) != 0) {
+			CopyBytes(memo.targets[slot], hw.GetRenderTarget(slot));
+		}
+	}
+	CopyBytes(memo.depth, hw.GetDepthRenderTarget());
+	CopyBytes(memo.render_control, hw.GetRenderControl());
+	memo.depth_wanted  = DepthStencilTargetWanted(hw);
+	memo.depth_values  = {hw.GetDepthClearValue(), hw.GetDepthBoundsMin(), hw.GetDepthBoundsMax()};
+	memo.stencil_clear = hw.GetStencilClearValue();
+}
+
+bool RenderExecutor::RenderTargetMemoCurrent() {
+	const auto& memo  = *m_render_target_memo;
+	auto&       cache = m_context.GetTextureCache();
+	if (memo.tick != m_context.GetCommandScheduler().CurrentTick() ||
+	    memo.image_set_epoch != cache.ImageSetEpoch() ||
+	    memo.gpu_write_generation != m_context.GetBufferCache().GpuWriteGeneration()) {
+		return false;
+	}
+	for (uint32_t i = 0; i < memo.image_count; i++) {
+		const auto& state = memo.images[i];
+		const auto* image = cache.m_slot_images.try_get(state.id);
+		if (image == nullptr || !image->registered || image->binding.needs_rebind ||
+		    ImageLookupState::Of(state.id, *image) != state) {
+			return false;
+		}
+	}
+	auto& buffers = m_context.GetBufferCache();
+	for (uint32_t i = 0; i < memo.metadata_count; i++) {
+		const auto& metadata = memo.metadata[i];
+		if (buffers.CpuDirtyEpoch(metadata.range.address, metadata.range.size) != metadata.epoch) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool RenderExecutor::TryReuseRenderTargets(const HW::Context& hw, uint32_t mrt_mask) {
+	if (m_render_target_memo == nullptr || !m_render_target_memo->valid) {
+		return false;
+	}
+	auto& memo = *m_render_target_memo;
+	if (memo.mrt_mask != mrt_mask) {
+		return false;
+	}
+	// Operations with the same context snapshot have the same registers.
+	if (m_context_id == 0 || memo.context_id != m_context_id) {
+		// The depth bounds only set dynamic state: draws that differ in them (a deferred light
+		// each) reuse the targets and take the bounds below.
+		// Neither do the depth and stencil test controls, as long as the draw still wants a
+		// depth/stencil target: they are refreshed below (layouts follow per draw).
+		const float depth_clear = hw.GetDepthClearValue();
+		if (memo.target_mask != hw.GetRenderTargetMask() ||
+		    !SameBytes(memo.depth, hw.GetDepthRenderTarget()) ||
+		    !SameBytes(memo.render_control, hw.GetRenderControl()) ||
+		    memo.depth_wanted != DepthStencilTargetWanted(hw) ||
+		    !SameBytes(memo.depth_values[0], depth_clear) ||
+		    memo.stencil_clear != hw.GetStencilClearValue()) {
+			return false;
+		}
+		for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
+			if ((mrt_mask & (1u << slot)) != 0 &&
+			    !SameBytes(memo.targets[slot], hw.GetRenderTarget(slot))) {
+				return false;
+			}
+		}
+		memo.context_id = m_context_id;
+	}
+	if (!RenderTargetMemoCurrent()) {
+		return false;
+	}
+	// The draw uses the memo's targets in place: only a draw that acquires its targets itself
+	// stores new ones.
+	auto& targets = memo.draw_targets;
+	if (targets.depth.image_id) {
+		ApplyDepthStencilTestState(hw, targets.depth);
+	}
+	m_draw_targets = &targets;
+	for (uint32_t i = 0; i < targets.color_count; i++) {
+		BindRenderTarget(targets.colors[i].image_id);
+	}
+	if (targets.depth.image_id) {
+		BindRenderTarget(targets.depth.image_id);
+	}
+	return true;
+}
+
+void RenderExecutor::StoreRenderTargetMemo(const RenderColorInfo* colors, uint32_t color_count,
+                                           const RenderDepthInfo& depth, const vk::ImageView* views,
+                                           vk::ImageView depth_view, ImageId stencil) {
+	auto& memo   = *m_render_target_memo;
+	memo.pending = false;
+	// Clears consume their state; the next draw acquires its targets itself.
+	if (depth.depth_clear_enable || depth.load_clear_aspects || depth.stencil_clear_enable) {
+		return;
+	}
+	auto& cache             = m_context.GetTextureCache();
+	auto& buffers           = m_context.GetBufferCache();
+	memo.metadata_count     = 0;
+	memo.image_count        = 0;
+	const auto add_metadata = [&](const ImageInfo& info) {
+		if (info.metadata.kind == ImageMetadataKind::None || info.metadata.range.Empty()) {
+			return true;
+		}
+		const auto range                     = info.metadata.range;
+		memo.metadata[memo.metadata_count++] = {range,
+		                                        buffers.CpuDirtyEpoch(range.address, range.size)};
+		return true;
+	};
+	const auto add_image = [&](ImageId id) {
+		memo.images[memo.image_count++] = ImageLookupState::Of(id, cache.m_slot_images[id]);
+	};
+	for (uint32_t i = 0; i < color_count; i++) {
+		if (!add_metadata(colors[i].desc.info)) {
+			return;
+		}
+		add_image(colors[i].image_id);
+		memo.draw_targets.colors[i] = colors[i];
+		memo.color_views[i]         = views[i];
+	}
+	if (depth.image_id) {
+		if (!add_metadata(depth.desc.info)) {
+			return;
+		}
+		add_image(depth.image_id);
+		if (stencil) {
+			add_image(stencil);
+		}
+	}
+	memo.draw_targets.color_count = color_count;
+	memo.draw_targets.depth       = depth;
+	memo.depth_view               = depth_view;
+	memo.tick                 = m_context.GetCommandScheduler().CurrentTick();
+	memo.image_set_epoch      = cache.ImageSetEpoch();
+	memo.gpu_write_generation = buffers.GpuWriteGeneration();
+	memo.valid                = true;
+}
+
+// Keep it in sync with the members of DrawRenderState.
+static void ResetDrawRenderState(DrawRenderState& state, bool tessellation_stages) {
+	state.mrt_mask                 = 0;
+	state.topology                 = vk::PrimitiveTopology::ePointList;
+	state.primitive_restart_enable = false;
+	state.ps_active                = false;
+	ValueInitialize(state.vertex_info[0]);
+	if (tessellation_stages) {
+		ValueInitialize(state.vertex_info[1]);
+		ValueInitialize(state.vertex_info[2]);
+	}
+	ValueInitialize(state.ps_input_info);
+	state.indirect_offsets = {};
+	state.indirect_draw    = false;
+}
+
+DrawRenderState& RenderExecutor::AcquireDrawRenderState(bool tessellation, bool& shaders_resolved,
+                                                        const ShaderIndirectOffsets& indirect_offsets,
+                                                        bool indirect_draw) {
+	// The operations before this draw executed: the resolution holds when the guest memory it
+	// read still has the same bytes.
+	auto* resolved = std::exchange(m_resolved_draw, nullptr);
+	// Resolutions ahead of execution read the shaders of direct draws: without GPU-read indirect
+	// records or offsets.
+	shaders_resolved = resolved != nullptr && !tessellation && !indirect_draw &&
+	                   indirect_offsets == ShaderIndirectOffsets {} &&
+	                   resolved->programs.reads.StillValid();
+	if (shaders_resolved) {
+		return resolved->storage.state;
+	}
+	if (m_draw_state == nullptr) {
+		m_draw_state = {new DrawRenderStorage {},
+		                [](DrawRenderStorage* storage) { delete storage; }};
+	} else {
+		ResetDrawRenderState(m_draw_state->state, m_draw_state->tessellation_stages_written);
+	}
+	m_draw_state->tessellation_stages_written = tessellation;
+	return m_draw_state->state;
+}
+
 struct DrawCallInfo {
 	bool     indexed        = true;
 	uint32_t index_count    = 0;
@@ -446,6 +749,30 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 	EXIT_IF(colors == nullptr || color_count > RENDER_COLOR_ATTACHMENTS_MAX);
 	feedback_aspects = {};
 	auto&       cache = m_context.GetTextureCache();
+	// The targets of the draw before, when this draw reused them and they are still current (the
+	// texture bindings of this draw may have rediscovered them).
+	const RenderTargetMemo* memo = nullptr;
+	if (m_render_targets_reused && m_render_target_memo->valid &&
+	    m_render_target_memo->draw_targets.color_count == color_count &&
+	    m_render_target_memo->draw_targets.depth.image_id == depth.image_id &&
+	    RenderTargetMemoCurrent()) {
+		memo = m_render_target_memo.get();
+		for (uint32_t i = 0; i < color_count && memo != nullptr; i++) {
+			if (memo->draw_targets.colors[i].image_id != colors[i].image_id) {
+				memo = nullptr;
+			}
+		}
+	}
+	if (m_render_targets_reused && memo == nullptr) {
+		// The draw acquires the memo's targets in place (see TryReuseRenderTargets()) and may
+		// update them: the memo no longer describes the draw before.
+		m_render_target_memo->valid = false;
+	}
+	const bool store =
+	    memo == nullptr && m_render_target_memo != nullptr && m_render_target_memo->pending;
+	std::array<vk::ImageView, RENDER_COLOR_ATTACHMENTS_MAX> color_views {};
+	vk::ImageView                                           depth_view = nullptr;
+	ImageId                                                 stencil_id {};
 	RenderState state {};
 	state.width                 = std::numeric_limits<uint32_t>::max();
 	state.height                = std::numeric_limits<uint32_t>::max();
@@ -454,7 +781,10 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 	for (uint32_t i = 0; i < color_count; i++) {
 		auto& target = colors[i];
 		EXIT_IF(!target.image_id);
-		const auto image_view = cache.FindRenderTarget(target.image_id, target.desc);
+		const auto image_view = memo != nullptr
+		                            ? memo->color_views[i]
+		                            : cache.FindRenderTarget(target.image_id, target.desc);
+		color_views[i]        = image_view;
 		auto&      image      = cache.GetImage(target.image_id);
 		EXIT_IF(image.backing.samples != target.desc.info.samples || image_view == nullptr);
 		const auto& view   = target.desc.view_info;
@@ -477,20 +807,26 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		attachment.image_layout = layout;
 	}
 	if (depth.image_id) {
-		const auto  image_view = cache.FindDepthTarget(depth.image_id, depth.desc);
-		const auto& metadata   = depth.desc.info.metadata;
-		const bool meta_clear =
-		    metadata.kind == ImageMetadataKind::Htile &&
-		    cache.IsMetaCleared(metadata.range.address, depth.desc.view_info.base_layer);
-		depth.load_clear_aspects = {};
-		if (depth.depth_clear_enable || meta_clear)
-			depth.load_clear_aspects |= vk::ImageAspectFlagBits::eDepth;
-		// Apply pending clears to compressed stencil as well as depth.
-		if (depth.stencil_clear_enable || (meta_clear && metadata.stencil_compressed))
-			depth.load_clear_aspects |= vk::ImageAspectFlagBits::eStencil;
-		if (meta_clear &&
-		    !cache.TouchMeta(metadata.range.address, depth.desc.view_info.base_layer, false)) {
-			EXIT("failed to consume HTile clear state\n");
+		// A reused acquisition had no depth clear and no HTile clear to consume.
+		const auto image_view =
+		    memo != nullptr ? memo->depth_view
+		                    : cache.FindDepthTarget(depth.image_id, depth.desc, &stencil_id);
+		depth_view = image_view;
+		if (memo == nullptr) {
+			const auto& metadata = depth.desc.info.metadata;
+			const bool meta_clear =
+			    metadata.kind == ImageMetadataKind::Htile &&
+			    cache.IsMetaCleared(metadata.range.address, depth.desc.view_info.base_layer);
+			depth.load_clear_aspects = {};
+			if (depth.depth_clear_enable || meta_clear)
+				depth.load_clear_aspects |= vk::ImageAspectFlagBits::eDepth;
+			// Apply pending clears to compressed stencil as well as depth.
+			if (depth.stencil_clear_enable || (meta_clear && metadata.stencil_compressed))
+				depth.load_clear_aspects |= vk::ImageAspectFlagBits::eStencil;
+			if (meta_clear &&
+			    !cache.TouchMeta(metadata.range.address, depth.desc.view_info.base_layer, false)) {
+				EXIT("failed to consume HTile clear state\n");
+			}
 		}
 		auto& image = cache.GetImage(depth.image_id);
 		EXIT_IF(image_view == nullptr || image.backing.samples != depth.desc.info.samples);
@@ -557,6 +893,10 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 	EXIT_IF(state.width == 0 || state.height == 0 || state.num_layers == 0 ||
 	        state.width == std::numeric_limits<uint32_t>::max() ||
 	        state.height == std::numeric_limits<uint32_t>::max());
+	if (store) {
+		StoreRenderTargetMemo(colors, color_count, depth, color_views.data(), depth_view,
+		                      stencil_id);
+	}
 	return state;
 }
 
@@ -641,6 +981,7 @@ static uint64_t VertexBufferDescriptorSize(int binding, const ShaderVertexInputI
 	return size;
 }
 
+// Trivial: draws fill only the entries they use (no 3.5 KiB of zeroing per draw).
 struct VertexBufferRange {
 	uint64_t base_address;
 	uint64_t requested_end;
@@ -826,10 +1167,45 @@ static bool ResolvePrimitiveRestart(const CommandBuffer& buffer,
 	return false;
 }
 
-bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
-                                            DrawRenderState& state) {
-	m_context.GetImageHeap().BeginDraw();
-	m_context.GetPipelineCache().GetGraphicsPrograms(buffer, state);
+RenderExecutor::ResolvedDraw* RenderExecutor::ResolveDrawAhead(const HW::Context&    context,
+                                                               const HW::UserConfig& user_config,
+                                                               const HW::Shader&     shaders) {
+	if (user_config.GetPrimType() == Prospero::PrimitiveType::kPatch ||
+	    !DrawHasValidVertexShader(shaders)) {
+		return nullptr;
+	}
+	if (m_resolved_ring == nullptr) {
+		m_resolved_ring = {new ResolvedDrawRing {}, [](ResolvedDrawRing* ring) { delete ring; }};
+	}
+	auto& ring = *m_resolved_ring;
+	auto& draw = ring.draws[ring.next];
+	// The execution thread releases resolutions in order.
+	for (Common::SpinWait wait; draw.busy.load(std::memory_order_acquire);) {
+		if (!wait.Spin()) {
+			std::this_thread::yield();
+		}
+	}
+	ring.next   = (ring.next + 1) % ResolvedDrawRing::Size;
+	auto& state = draw.storage.state;
+	ResetDrawRenderState(state, false);
+	draw.programs.Reset();
+	if (!m_context.GetPipelineCache().GetGraphicsProgramsAhead(context, user_config, shaders, state,
+	                                                          draw.programs) ||
+	    draw.programs.reads.Failed() || state.vertex_info[0].stage.module == nullptr) {
+		return nullptr;
+	}
+	// Published to the execution thread with the operation that carries it.
+	draw.busy.store(true, std::memory_order_relaxed);
+	return &draw;
+}
+
+bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, bool shaders_resolved,
+                                            const DrawCallInfo& draw,
+                                            DrawRenderState&    state) {
+	if (!shaders_resolved) {
+		m_context.GetImageHeap().BeginDraw();
+		m_context.GetPipelineCache().GetGraphicsPrograms(buffer, state);
+	}
 	// Vertex programs the host cannot run are not compiled.
 	if (state.vertex_info[0].stage.module == nullptr) {
 		return false;
@@ -843,43 +1219,49 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	                         &ShaderVertexInputInfo::stage)) {
 		return false;
 	}
-	auto& targets       = m_targets;
-	targets.color_count = 0;
-	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
-		if ((state.mrt_mask & (1u << slot)) != 0) {
-			ResolveRenderColorTarget(buffer, targets.colors[targets.color_count], slot);
-			if (targets.colors[targets.color_count].image_id) {
-				targets.color_count++;
+	const auto mrt_mask = state.mrt_mask;
+	m_render_targets_reused = TryReuseRenderTargets(buffer.GetRegisters(), mrt_mask);
+	if (!m_render_targets_reused) {
+		m_draw_targets      = &m_targets;
+		auto& targets       = m_targets;
+		targets.color_count = 0;
+		CaptureRenderTargetKey(buffer.GetRegisters(), mrt_mask);
+		for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
+			if ((mrt_mask & (1u << slot)) != 0) {
+				ResolveRenderColorTarget(buffer, targets.colors[targets.color_count], slot);
+				if (targets.colors[targets.color_count].image_id) {
+					targets.color_count++;
+				}
+			}
+		}
+		ResolveRenderDepthTarget(buffer, targets.depth);
+		// TODO(PPSA09243): Vulkan passes take one sample count. Where PS5 attachments mix counts,
+		// keep those matching the raster count instead of resolving multisampled shadows.
+		const auto colors       = std::span {targets.colors, targets.color_count};
+		const auto pass_samples = targets.depth.image_id ? targets.depth.desc.info.samples
+		                                                 : targets.colors[0].desc.info.samples;
+		if (std::ranges::any_of(colors, [&](const RenderColorInfo& color) {
+			    return color.desc.info.samples != pass_samples;
+		    })) {
+			const auto raster =
+			    render_sample_count(buffer.GetRegisters().GetAaConfig().msaa_num_samples);
+			const auto dropped = std::ranges::remove_if(colors, [&](const RenderColorInfo& color) {
+				return color.desc.info.samples != raster;
+			});
+			targets.color_count -= static_cast<uint32_t>(dropped.size());
+			if (targets.depth.image_id && targets.depth.desc.info.samples != raster) {
+				targets.depth = {};
+			}
+			static std::atomic_bool logged = false;
+			if (!logged.exchange(true, std::memory_order_relaxed)) {
+				Log::WriteToConsoleAndLog(
+				    "Warning: dropping attachments whose sample count differs from the raster.\n");
 			}
 		}
 	}
-	ResolveRenderDepthTarget(buffer, targets.depth);
-	// TODO(PPSA09243): Vulkan passes take one sample count. Where PS5 attachments mix counts,
-	// keep those matching the raster count instead of resolving multisampled shadows.
-	const auto colors       = std::span {targets.colors, targets.color_count};
-	const auto pass_samples = targets.depth.image_id ? targets.depth.desc.info.samples
-	                                                 : targets.colors[0].desc.info.samples;
-	if (std::ranges::any_of(colors, [&](const RenderColorInfo& color) {
-		    return color.desc.info.samples != pass_samples;
-	    })) {
-		const auto raster =
-		    render_sample_count(buffer.GetRegisters().GetAaConfig().msaa_num_samples);
-		const auto dropped = std::ranges::remove_if(colors, [&](const RenderColorInfo& color) {
-			return color.desc.info.samples != raster;
-		});
-		targets.color_count -= static_cast<uint32_t>(dropped.size());
-		if (targets.depth.image_id && targets.depth.desc.info.samples != raster) {
-			targets.depth = {};
-		}
-		static std::atomic_bool logged = false;
-		if (!logged.exchange(true, std::memory_order_relaxed)) {
-			Log::WriteToConsoleAndLog(
-			    "Warning: dropping attachments whose sample count differs from the raster.\n");
-		}
-	}
 
-	if (targets.color_count == 0 && !targets.depth.image_id && !state.ps_active) {
-		LogFramebufferSkip(draw.Name(), targets.depth, buffer, draw.index_count, 0);
+	if (m_draw_targets->color_count == 0 && !m_draw_targets->depth.image_id && !state.ps_active) {
+		LogFramebufferSkip(draw.Name(), m_draw_targets->depth, buffer, draw.index_count, 0);
 		return false;
 	}
 
@@ -907,7 +1289,7 @@ static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffe
 	return prepared;
 }
 
-static void CommitVertexBuffers(vk::CommandBuffer            vk_buffer,
+static void CommitVertexBuffers(CommandRecorder              vk_buffer,
                                 const PreparedVertexBuffers& prepared) {
 	if (prepared.count != 0) {
 		// Guest descriptor bounds must survive allocation merging in the cache.
@@ -916,7 +1298,7 @@ static void CommitVertexBuffers(vk::CommandBuffer            vk_buffer,
 	}
 }
 
-static void CommitIndexBuffer(vk::CommandBuffer vk_buffer, const PreparedIndexBuffer& prepared) {
+static void CommitIndexBuffer(CommandRecorder vk_buffer, const PreparedIndexBuffer& prepared) {
 	if (prepared.buffer == nullptr) {
 		return;
 	}
@@ -945,7 +1327,7 @@ static void LogDrawStateIfNeeded(const CommandBuffer& buffer, const DrawCallInfo
 	                  index_addr);
 }
 
-static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_buffer,
+static void EmitDrawPrimitives(const HW::UserConfig& ucfg, CommandRecorder vk_buffer,
                                const DrawCallInfo& draw, const DrawEmitInfo& emit) {
 	switch (ucfg.GetPrimType()) {
 		case Prospero::PrimitiveType::kPointList:
@@ -990,13 +1372,13 @@ bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo&
 	}
 	auto& ucfg = buffer.GetUserConfig();
 	const auto& hw = buffer.GetRegisters();
-	auto&       depth = m_targets.depth;
-	auto&       color = m_targets.colors[0];
+	auto&       depth = m_draw_targets->depth;
+	auto&       color = m_draw_targets->colors[0];
 	EXIT_NOT_IMPLEMENTED(
 	    !m_context.GetGraphics().maintenance8_enabled ||
 	    !Prospero::IsRectList(ucfg.GetPrimType()) || draw.indexed || draw.index_count != 3 ||
 	    draw.instance_count != 1 || emit.vertex_offset != 0 || emit.first_instance != 0 ||
-	    m_targets.color_count != 1 || color.target_slot != 0 || !depth.image_id ||
+	    m_draw_targets->color_count != 1 || color.target_slot != 0 || !depth.image_id ||
 	    color.desc.info.samples != 1 || depth.desc.info.extent.width != color.Extent().width ||
 	    depth.desc.info.extent.height != color.Extent().height ||
 	    depth.desc.view_info.layer_count != 1 || color.desc.view_info.layer_count != 1 ||
@@ -1104,7 +1486,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		descriptor_stages[stage_count++] = &bindings.pixel;
 	}
 	const auto stages = std::span {descriptor_stages.data(), stage_count};
-	PrepareGraphicsBindings(stages, std::span {m_targets.colors, m_targets.color_count});
+	PrepareGraphicsBindings(stages, std::span {m_draw_targets->colors, m_draw_targets->color_count});
 	PreparedVertexBuffers vertex_bindings;
 	PreparedIndexBuffer   index_binding;
 	vk::DeviceAddress     mesh_indices = 0;
@@ -1124,10 +1506,10 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		args_buffer = m_context.GetBufferCache().ObtainBuffer(emit.indirect.address, size, false);
 		EXIT_IF((args_buffer.second & 3u) != 0);
 	}
-	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(buffer, state, m_targets);
+	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(buffer, state, *m_draw_targets);
 	vk::ImageAspectFlags feedback_aspects;
-	const auto rendering = AcquireRenderTargets(buffer, m_targets.colors, m_targets.color_count,
-	                                            m_targets.depth, feedback_aspects, stages);
+	const auto rendering = AcquireRenderTargets(buffer, m_draw_targets->colors, m_draw_targets->color_count,
+	                                            m_draw_targets->depth, feedback_aspects, stages);
 	vk::DeviceAddress task_params = 0;
 	if (mesh_task) {
 		const MeshTaskParams params {
@@ -1185,7 +1567,7 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	}
 
 	auto& dynamic_state = m_context.GetCommandScheduler().GetDynamicState();
-	UpdateGraphicsDynamicState(buffer, dynamic_state, vertex_stages.back(), m_targets.depth,
+	UpdateGraphicsDynamicState(buffer, dynamic_state, vertex_stages.back(), m_draw_targets->depth,
 	                           rendering);
 	dynamic_state.SetAttachmentFeedbackLoopAspects(feedback_aspects);
 	dynamic_state.Commit(m_context.GetGraphics(), vk_buffer);
@@ -1280,6 +1662,7 @@ bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args)
 
 	if (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer) ||
 	    ResolveColorTargets(buffer)) {
+		InvalidateRenderTargetMemo();
 		ResetBindings();
 		return true;
 	}
@@ -1307,10 +1690,19 @@ bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args)
 
 	uc_check(ucfg);
 
-	hw_check(buffer);
+	// A pure check of the context registers: once per register snapshot.
+	if (m_context_id == 0 || m_context_id != m_checked_context_id ||
+	    graphics_debug_dump_enabled()) {
+		hw_check(buffer);
+		m_checked_context_id = m_context_id;
+	}
 
-	DrawRenderState state {.indirect_offsets = args.indirect.offsets,
-	                       .indirect_draw    = args.indirect.address != 0};
+	bool  shaders_resolved = false;
+	auto& state = AcquireDrawRenderState(ucfg.GetPrimType() == Prospero::PrimitiveType::kPatch,
+	                                     shaders_resolved, args.indirect.offsets,
+	                                     args.indirect.address != 0);
+	state.indirect_offsets = args.indirect.offsets;
+	state.indirect_draw    = args.indirect.address != 0;
 	if (!GetDrawTopology(ucfg, state.topology)) {
 		return true;
 	}
@@ -1340,12 +1732,12 @@ bool RenderExecutor::DrawIndex(CommandBuffer& buffer, const DrawIndexArgs& args)
 	}
 
 	const DrawCallInfo draw {true, args.index_count, args.instance_count};
-	if (!PrepareDrawRenderState(buffer, draw, state)) {
+	if (!PrepareDrawRenderState(buffer, shaders_resolved, draw, state)) {
 		ResetBindings();
 		return true;
 	}
 
-	LogDrawStateIfNeeded(buffer, draw, state, m_targets, args.index_type_and_size, args.index_addr);
+	LogDrawStateIfNeeded(buffer, draw, state, *m_draw_targets, args.index_type_and_size, args.index_addr);
 	const auto emit = ResolveDrawEmit(ucfg, state.vertex_info[0], args.offset_source,
 	                                  args.base_vertex, args.first_instance, args.indirect);
 	if (emit) {
@@ -1371,6 +1763,7 @@ bool RenderExecutor::DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args) {
 
 	if (ConsumeMetadataColorOperation(buffer) || DepthStencilCopy(buffer) ||
 	    ResolveColorTargets(buffer)) {
+		InvalidateRenderTargetMemo();
 		ResetBindings();
 		return true;
 	}
@@ -1394,17 +1787,26 @@ bool RenderExecutor::DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args) {
 
 	uc_check(ucfg);
 
-	hw_check(buffer);
+	// A pure check of the context registers: once per register snapshot.
+	if (m_context_id == 0 || m_context_id != m_checked_context_id ||
+	    graphics_debug_dump_enabled()) {
+		hw_check(buffer);
+		m_checked_context_id = m_context_id;
+	}
 
 	const DrawCallInfo draw {false, args.vertex_count, args.instance_count};
 
-	DrawRenderState state {.indirect_offsets = args.indirect.offsets,
-	                       .indirect_draw    = args.indirect.address != 0};
+	bool  shaders_resolved = false;
+	auto& state = AcquireDrawRenderState(ucfg.GetPrimType() == Prospero::PrimitiveType::kPatch,
+	                                     shaders_resolved, args.indirect.offsets,
+	                                     args.indirect.address != 0);
+	state.indirect_offsets = args.indirect.offsets;
+	state.indirect_draw    = args.indirect.address != 0;
 	if (!GetDrawTopology(ucfg, state.topology)) {
 		ResetBindings();
 		return true;
 	}
-	if (!PrepareDrawRenderState(buffer, draw, state)) {
+	if (!PrepareDrawRenderState(buffer, shaders_resolved, draw, state)) {
 		ResetBindings();
 		return true;
 	}
@@ -1423,7 +1825,7 @@ bool RenderExecutor::DrawAuto(CommandBuffer& buffer, const DrawAutoArgs& args) {
 		return true;
 	}
 
-	LogDrawStateIfNeeded(buffer, draw, state, m_targets, 0, nullptr);
+	LogDrawStateIfNeeded(buffer, draw, state, *m_draw_targets, 0, nullptr);
 	const auto emit = ResolveDrawEmit(ucfg, state.vertex_info[0], args.offset_source,
 	                                  static_cast<int32_t>(args.first_vertex), args.first_instance,
 	                                  args.indirect);

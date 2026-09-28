@@ -9,6 +9,7 @@
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
 using SrtMemoryReader = bool (*)(void* userdata, uint64_t address, std::span<uint32_t> values);
+using SrtLoadRecorder = void (*)(void* userdata, uint64_t address, uint32_t value);
 
 // Image descriptors at base + first + k * step, k < count, within size bytes that a sampled
 // root selects by GPU-computed byte offset. The host keeps them resident instead of
@@ -45,6 +46,10 @@ struct SrtRuntime {
 	std::span<const uint32_t> workgroup_counts;
 	uint64_t                  indirect_args_address = 0;
 	ImageHeapSource*          image_heap            = nullptr;
+	// A walk ahead of execution: a guest load that faults fails the walk instead of resolving
+	// the fault (GPU-written bytes cannot be downloaded there), and the walk reports every load
+	// above the null page with the value it read.
+	SrtLoadRecorder           record_load           = nullptr;
 };
 
 class SrtReadCapture {
@@ -82,6 +87,9 @@ bool WalkedImageActive(const ResourcePlan& plan, uint32_t image);
 // Length of the guest load at rip if it belongs to the walker running on this thread, else 0.
 // The exception handler completes such a load as a zero read.
 uint32_t SrtWalkerLoadLength(uint64_t rip);
+// As SrtWalkerLoadLength, for a fault the walker on this thread must not resolve: a walk ahead
+// of execution, which then fails. Loads below guest memory read zero in any walk.
+uint32_t SrtWalkerAheadLoadLength(uint64_t rip, uint64_t address);
 
 // Nonnegative affine coefficients: element zero is constant, remaining elements are
 // caller-selected leaves. Runtime range proofs must additionally exclude U32 wrap.

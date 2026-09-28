@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <array>
+#include <mutex>
 #include <optional>
 
 namespace Libs::Graphics {
@@ -34,31 +35,85 @@ void MemoryBarrier(vk::CommandBuffer command) {
 	    vk::DependencyInfo {.memoryBarrierCount = 1, .pMemoryBarriers = &barrier});
 }
 
+// The execution thread chooses quality modes and releases features, and the thread that records
+// the Vulkan command buffer creates and evaluates them: the upscaler is called by one of them at a
+// time.
+std::mutex g_upscaler_mutex;
+
+// The linear upscale, recorded on its own or where the upscaler cannot take the request.
+struct LinearPssr {
+	vk::PipelineLayout layout;
+	vk::Pipeline       pipeline;
+	vk::ImageView      input;
+	vk::ImageView      output;
+	PssrParameters     parameters;
+
+	void Record(vk::CommandBuffer command) const {
+		const std::array images {
+		    vk::DescriptorImageInfo {nullptr, input, vk::ImageLayout::eGeneral},
+		    vk::DescriptorImageInfo {nullptr, output, vk::ImageLayout::eGeneral}};
+		std::array<vk::WriteDescriptorSet, 2> writes {};
+		for (uint32_t i = 0; i < writes.size(); ++i) {
+			writes[i].dstBinding = i;
+			writes[i].descriptorCount = 1;
+			writes[i].descriptorType = i == 0 ? vk::DescriptorType::eSampledImage
+			                                 : vk::DescriptorType::eStorageImage;
+			writes[i].pImageInfo = &images[i];
+		}
+		command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, layout, 0, writes.size(),
+		                             writes.data());
+		command.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
+		command.pushConstants(layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(parameters),
+		                      &parameters);
+		command.dispatch((parameters.output_size[0] + 7) / 8, (parameters.output_size[1] + 7) / 8,
+		                 1);
+		ShaderAccessBarrier(CommandRecorder {command}, vk::PipelineStageFlagBits::eComputeShader);
+	}
+};
+
 } // namespace
 
+// The upscaler feature of a PSSR context. The execution thread makes one when a request needs a
+// new feature; the upscaler (DLSS or FSR) creates and evaluates it where the PSSR command is
+// recorded into a Vulkan command buffer: at once with a direct recorder, on the recording thread
+// with a deferred one. Its fields are accessed under g_upscaler_mutex.
+struct RenderExecutor::UpscalerFeature {
+	Dlss::Creation                     creation;
+	std::unique_ptr<Upscaler::Feature> feature; // null until created, and when it was refused
+	bool                               created = false;
+	bool                               failed  = false; // an evaluation failed
+};
+
 RenderExecutor::~RenderExecutor() {
+	for (const auto& context: m_upscaler_contexts) {
+		ReleaseUpscalerFeature(context.feature);
+	}
 	const auto device = m_context.GetGraphics().device;
 	device.destroyPipeline(m_pssr_pipeline, nullptr);
 	device.destroyPipelineLayout(m_pssr_pipeline_layout, nullptr);
 	device.destroyDescriptorSetLayout(m_pssr_descriptor_layout, nullptr);
 }
 
-bool RenderExecutor::Upscale(vk::CommandBuffer command, const Pssr::Request& request,
-                             Dlss::Inputs& inputs) {
-	const auto release = [&](std::unique_ptr<Upscaler::Feature>& feature) {
-		if (feature != nullptr) {
-			m_context.GetCommandScheduler().DeferOperation(
-			    [feature = std::move(feature)]() mutable { feature.reset(); });
-		}
+RenderExecutor::UpscalerFeature* RenderExecutor::UpscalerFeatureFor(const Pssr::Request& request,
+                                                                    const Dlss::Inputs&  inputs,
+                                                                    bool&                reset) {
+	// After the GPU is done with the commands recorded until now.
+	const auto release = [&](UpscalerFeature* feature) {
+		m_context.GetCommandScheduler().DeferOperation(
+		    [feature] { ReleaseUpscalerFeature(feature); });
 	};
 	auto context =
 	    std::ranges::find(m_upscaler_contexts, request.context, &UpscalerContext::context);
-	bool reset = (request.flags & Pssr::kReset) != 0;
+	reset = (request.flags & Pssr::kReset) != 0;
 	if (context == m_upscaler_contexts.end() || !Dlss::Takes(context->creation, request, inputs)) {
 		// A render size the upscaler can't take scales linearly.
-		const auto creation = Upscaler::Choose(request, inputs);
+		std::optional<Dlss::Creation> creation;
+		{
+			std::lock_guard lock(g_upscaler_mutex);
+			creation = Upscaler::Choose(request, inputs);
+		}
 		if (!creation) {
-			return false;
+			return nullptr;
 		}
 		if (context != m_upscaler_contexts.end()) {
 			release(context->feature);
@@ -72,19 +127,70 @@ bool RenderExecutor::Upscale(vk::CommandBuffer command, const Pssr::Request& req
 			                                     {request.context, {}, nullptr});
 		}
 		context->creation = *creation;
-		context->feature  = Upscaler::Create(command, *creation);
+		context->feature  = new UpscalerFeature {.creation = *creation};
 		reset             = true;
 	}
-	if (context->feature == nullptr) {
+	return context->feature;
+}
+
+bool RenderExecutor::EvaluateUpscaler(vk::CommandBuffer command, UpscalerFeature& feature,
+                                      const Pssr::Request& request, Dlss::Inputs& inputs,
+                                      bool reset) {
+	std::lock_guard lock(g_upscaler_mutex);
+	if (!feature.created) {
+		feature.created = true;
+		feature.feature = Upscaler::Create(command, feature.creation);
+	}
+	if (feature.feature == nullptr || feature.failed) {
 		return false;
 	}
 	MemoryBarrier(command);
-	if (!context->feature->Evaluate(command, request, inputs, reset)) {
-		release(context->feature);
+	if (!feature.feature->Evaluate(command, request, inputs, reset)) {
+		feature.failed = true;
 		return false;
 	}
 	MemoryBarrier(command);
 	return true;
+}
+
+void RenderExecutor::ReleaseUpscalerFeature(UpscalerFeature* feature) {
+	if (feature == nullptr) {
+		return;
+	}
+	{
+		std::lock_guard lock(g_upscaler_mutex);
+		feature->feature.reset();
+	}
+	delete feature;
+}
+
+void RenderExecutor::CreatePssrPipeline() {
+	auto& graphics = m_context.GetGraphics();
+	const std::array bindings {
+	    vk::DescriptorSetLayoutBinding {0, vk::DescriptorType::eSampledImage, 1,
+	                                    vk::ShaderStageFlagBits::eCompute},
+	    vk::DescriptorSetLayoutBinding {1, vk::DescriptorType::eStorageImage, 1,
+	                                    vk::ShaderStageFlagBits::eCompute}};
+	vk::DescriptorSetLayoutCreateInfo descriptor_info {};
+	descriptor_info.flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
+	descriptor_info.bindingCount = bindings.size();
+	descriptor_info.pBindings = bindings.data();
+	RequireVulkanSuccess(graphics.device.createDescriptorSetLayout(
+	                         &descriptor_info, nullptr, &m_pssr_descriptor_layout),
+	                     "create upscaling descriptor layout");
+	const vk::PushConstantRange push {vk::ShaderStageFlagBits::eCompute, 0,
+	                                  sizeof(PssrParameters)};
+	vk::PipelineLayoutCreateInfo layout_info {};
+	layout_info.setLayoutCount = 1;
+	layout_info.pSetLayouts = &m_pssr_descriptor_layout;
+	layout_info.pushConstantRangeCount = 1;
+	layout_info.pPushConstantRanges = &push;
+	RequireVulkanSuccess(graphics.device.createPipelineLayout(
+	                         &layout_info, nullptr, &m_pssr_pipeline_layout),
+	                     "create upscaling pipeline layout");
+	m_pssr_pipeline =
+	    CreateComputePipeline(graphics.device, GPU_PSSR_LINEAR_SPV, m_pssr_pipeline_layout,
+		                      "create upscaling pipeline");
 }
 
 void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& request) {
@@ -195,6 +301,11 @@ void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& req
 	               command);
 	destination.Transit(vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderWrite,
 	                    range(destination_view), command);
+	if (m_pssr_pipeline == nullptr) {
+		CreatePssrPipeline();
+	}
+	const LinearPssr linear {m_pssr_pipeline_layout, m_pssr_pipeline, input.image_view,
+	                         output.image_view, parameters};
 	if (dlss_bindings[0]) {
 		// Whether a binding is a whole one-level, one-layer image, unswizzled in its channels.
 		const auto raw = [&](const TextureBinding& binding, uint32_t channels) {
@@ -245,58 +356,27 @@ void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& req
 		    !Fsr::Enabled() || (Fsr::Reads(request, inputs) && raw(input, 3) &&
 		                        raw(*dlss_bindings[0], 1) && raw(*dlss_bindings[1], 2) &&
 		                        (!dlss_bindings[2] || raw(*dlss_bindings[2], 1)) && raw(output, 3));
-		if (readable && Upscale(command, request, inputs)) {
+		bool reset = false;
+		if (auto* feature = readable ? UpscalerFeatureFor(request, inputs, reset) : nullptr;
+		    feature != nullptr) {
+			// DLSS and FSR record into the Vulkan command buffer, so the upscaler runs where the
+			// command buffer is recorded; there it falls back to the linear upscale when the
+			// upscaler refuses the feature or the evaluation fails.
+			command.Custom([feature, request = request, inputs, exposure,
+			                has_exposure = dlss_bindings[2].has_value(), reset,
+			                linear](vk::CommandBuffer vk_command) {
+				auto replayed      = inputs;
+				auto exposure_copy = exposure;
+				replayed.exposure  = has_exposure ? &exposure_copy : nullptr;
+				if (!EvaluateUpscaler(vk_command, *feature, request, replayed, reset)) {
+					linear.Record(vk_command);
+				}
+			});
 			ResetBindings();
 			return;
 		}
 	}
-	auto& graphics = m_context.GetGraphics();
-	if (m_pssr_pipeline == nullptr) {
-		const std::array bindings {
-		    vk::DescriptorSetLayoutBinding {0, vk::DescriptorType::eSampledImage, 1,
-		                                    vk::ShaderStageFlagBits::eCompute},
-		    vk::DescriptorSetLayoutBinding {1, vk::DescriptorType::eStorageImage, 1,
-		                                    vk::ShaderStageFlagBits::eCompute}};
-		vk::DescriptorSetLayoutCreateInfo descriptor_info {};
-		descriptor_info.flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
-		descriptor_info.bindingCount = bindings.size();
-		descriptor_info.pBindings = bindings.data();
-		RequireVulkanSuccess(graphics.device.createDescriptorSetLayout(
-		                         &descriptor_info, nullptr, &m_pssr_descriptor_layout),
-		                     "create upscaling descriptor layout");
-		const vk::PushConstantRange push {vk::ShaderStageFlagBits::eCompute, 0,
-		                                  sizeof(PssrParameters)};
-		vk::PipelineLayoutCreateInfo layout_info {};
-		layout_info.setLayoutCount = 1;
-		layout_info.pSetLayouts = &m_pssr_descriptor_layout;
-		layout_info.pushConstantRangeCount = 1;
-		layout_info.pPushConstantRanges = &push;
-		RequireVulkanSuccess(graphics.device.createPipelineLayout(
-		                         &layout_info, nullptr, &m_pssr_pipeline_layout),
-		                     "create upscaling pipeline layout");
-		m_pssr_pipeline =
-		    CreateComputePipeline(graphics.device, GPU_PSSR_LINEAR_SPV, m_pssr_pipeline_layout,
-			                      "create upscaling pipeline");
-	}
-	const std::array images {
-	    vk::DescriptorImageInfo {nullptr, input.image_view, vk::ImageLayout::eGeneral},
-	    vk::DescriptorImageInfo {nullptr, output.image_view, vk::ImageLayout::eGeneral}};
-	std::array<vk::WriteDescriptorSet, 2> writes {};
-	for (uint32_t i = 0; i < writes.size(); ++i) {
-		writes[i].dstBinding = i;
-		writes[i].descriptorCount = 1;
-		writes[i].descriptorType = i == 0 ? vk::DescriptorType::eSampledImage
-		                                 : vk::DescriptorType::eStorageImage;
-		writes[i].pImageInfo = &images[i];
-	}
-	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_pssr_pipeline_layout,
-	                             0, writes.size(), writes.data());
-	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_pssr_pipeline);
-	command.pushConstants(m_pssr_pipeline_layout, vk::ShaderStageFlagBits::eCompute,
-	                      0, sizeof(parameters), &parameters);
-	command.dispatch((parameters.output_size[0] + 7) / 8,
-	                 (parameters.output_size[1] + 7) / 8, 1);
-	ShaderAccessBarrier(command, vk::PipelineStageFlagBits::eComputeShader);
+	command.Custom([linear](vk::CommandBuffer vk_command) { linear.Record(vk_command); });
 	ResetBindings();
 }
 

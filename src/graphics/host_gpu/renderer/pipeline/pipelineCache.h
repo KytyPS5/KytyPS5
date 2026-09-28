@@ -17,9 +17,11 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <deque>
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <queue>
 #include <span>
 #include <thread>
@@ -29,9 +31,64 @@
 
 namespace Libs::Graphics {
 
+// Guest memory that a resolution ahead of execution read. The execution thread repeats the reads
+// before it uses the resolution: guest memory may have changed in between (operations that
+// execute before the draw write it), and ahead of execution GPU-owned bytes cannot be read.
+class GuestReadLog {
+public:
+	void Clear() {
+		m_entries.clear();
+		m_bytes.clear();
+		m_failed = false;
+	}
+	// Reads the backing store without faulting. Strict reads are checked the way specialization
+	// memory is read (GPU-owned bytes fail), the others as plain loads.
+	bool               Read(uint64_t address, void* data, uint64_t size, bool strict);
+	// A plain load the SRT walker made.
+	void               RecordLoad(uint64_t address, uint32_t value);
+	void               Fail() { m_failed = true; }
+	[[nodiscard]] bool Failed() const { return m_failed; }
+	// Execution thread: whether every read still gives the recorded bytes.
+	[[nodiscard]] bool StillValid() const;
+
+private:
+	static constexpr uint64_t StrictCheckBytes = 64;
+	struct Entry {
+		uint64_t address = 0;
+		uint32_t size    = 0;
+		uint32_t offset  = 0;
+		bool     strict  = false;
+	};
+	void                 Append(uint64_t address, const void* data, uint32_t size, bool strict);
+	std::vector<Entry>   m_entries;
+	std::vector<uint8_t> m_bytes;
+	bool                 m_failed = false;
+};
+
+// Storage of the shader programs a draw resolved ahead of its execution: the resource snapshots
+// and specializations its stages point to, and the guest memory they read.
+struct ProgramResolution {
+	static constexpr uint32_t MaxStages = 4;
+
+	std::array<ShaderRecompiler::IR::ResourceSnapshot, MaxStages>       resources;
+	std::array<ShaderRecompiler::IR::ResourceSpecialization, MaxStages> specializations;
+	GuestReadLog                                                        reads;
+	uint32_t                                                            stages = 0;
+
+	void Reset() {
+		reads.Clear();
+		stages = 0;
+	}
+};
+
 struct GraphicContext;
 struct ShaderParams;
 class CommandBuffer;
+
+namespace HW {
+class UserConfig;
+class Shader;
+} // namespace HW
 
 namespace ShaderRecompiler {
 struct CompileOptions;
@@ -201,6 +258,12 @@ public:
 
 	// Reads the shaders and registers bound in `command` into the state's shader stages.
 	void GetGraphicsPrograms(const CommandBuffer& command, DrawRenderState& state);
+	// The resolve thread: resolves the programs of a draw ahead of its execution, with programs
+	// and modules that exist, into `ahead`, reading guest memory through its log. False when the
+	// execution thread resolves the draw itself; programs it misses are queued to the workers.
+	bool GetGraphicsProgramsAhead(const HW::Context& context, const HW::UserConfig& user_config,
+	                              const HW::Shader& shaders, DrawRenderState& state,
+	                              ProgramResolution& ahead);
 	// Null skips the dispatch.
 	const ShaderModule* GetComputeProgram(const HW::ComputeShaderInfo& regs,
 	                                      ShaderComputeInputInfo&      input_info);
@@ -217,7 +280,9 @@ private:
 		ShaderRecompiler::IR::ResourcePlan           resource_plan;
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
-		std::vector<ShaderModule>                    modules;
+		// A deque: resolutions ahead of execution keep pointers to modules while new ones are
+		// added.
+		std::deque<ShaderModule>                     modules;
 		bool                                         skip_dispatch = false;
 
 		[[nodiscard]] std::span<const uint32_t> FunctionCode() const;
@@ -264,18 +329,70 @@ private:
 	std::unordered_map<GraphicsPipelineKey, Pipeline, GraphicsPipelineKeyHash> m_graphics_pipelines;
 	std::unordered_map<uint64_t, Pipeline>                                     m_compute_pipelines;
 	std::unordered_map<uint64_t, ShaderTessellationInputInfo>                  m_tess_layouts;
+	// The pipeline the last lookup found; pipelines are never removed while the cache lives.
+	GraphicsPipelineKey m_last_graphics_key {};
+	Pipeline*           m_last_graphics_pipeline = nullptr;
+	// Draws resolve their programs on the resolve thread and, when a resolution is not usable,
+	// on the execution thread, which also resolves dispatches. Compile workers add programs.
+	std::atomic_flag m_program_lock;
+	ProgramKey       m_ahead_key;
+
+	// Graphics programs compiled on worker threads: the resolve thread queues the programs and
+	// modules its draws miss, so the shaders of a new area compile in parallel instead of one
+	// after another on the execution thread. Workers only add programs; the execution thread
+	// still resolves every draw itself and compiles what they did not add.
+	struct CompileJob;
+	static constexpr uint32_t CompileWorkers = 6;
+	// Under the program lock: programs a worker is compiling, with their number of jobs.
+	std::unordered_map<ProgramKey, uint32_t, ProgramKeyHash> m_in_flight;
+	std::mutex                                               m_job_mutex;
+	std::condition_variable                                  m_job_available;
+	std::deque<std::unique_ptr<CompileJob>>                  m_jobs;
+	bool                                                     m_stopping = false;
+	std::vector<std::jthread>                                m_workers;
+
 	// Records everything first created if a shader store is open, and writes the driver cache.
 	ShaderStoreWriter m_store;
 	// Checks every quarter second whether the driver cache is due; stopped by Save().
 	std::jthread      m_driver_cache_timer;
 
+	bool ResolveGraphicsPrograms(const HW::Context& context, const HW::UserConfig& user_config,
+	                             const HW::Shader& shaders, DrawRenderState& state,
+	                             ProgramResolution* ahead);
 	template <typename InputInfo>
 	const ShaderModule* GetProgram(const ShaderParams& params, InputInfo& input_info,
 	                               uint32_t& push_data_cursor);
+	template <typename InputInfo>
+	const ShaderModule* GetAhead(const ShaderParams& params, InputInfo& input_info,
+	                             uint32_t& push_data_cursor, ProgramResolution& ahead);
 	ShaderModule& CompileModule(Program& program, const ProgramKey& key,
 	                            ShaderRecompiler::CompileOptions  options,
 	                            ShaderRecompiler::TranslateResult translated,
 	                            uint32_t                          push_data_cursor);
+	// Compiles a module without touching the cache; `spirv` receives its code.
+	ShaderModule BuildModule(const ProgramKey& key, const ShaderRecompiler::CompileOptions& options,
+	                         ShaderRecompiler::TranslateResult                   translated,
+	                         const ShaderRecompiler::IR::ResourceSpecialization& specialization,
+	                         std::span<const uint32_t> function_code, uint32_t push_data_cursor,
+	                         std::vector<uint32_t>& spirv) const;
+	// Under the program lock: counts a module added to `program` and records it in the store.
+	void AddedModule(const ProgramKey& key, const Program& program, const ShaderModule& module,
+	                 const std::vector<uint32_t>& spirv);
+	void LockPrograms();
+	void UnlockPrograms();
+	// Under the program lock (resolve thread): queues the program of m_ahead_key, or one of its
+	// modules, to the compile workers.
+	template <typename InputInfo>
+	void QueueCompile(const ShaderParams& params, const InputInfo& input_info,
+	                  uint32_t                                            push_data_cursor,
+	                  const ShaderRecompiler::IR::ResourceSpecialization* specialization);
+	// Execution thread, under the program lock: waits without the lock until no worker compiles
+	// the program of `key`. False when none did.
+	bool WaitForCompile(const ProgramKey& key);
+	template <typename InputInfo>
+	void RunCompileJob(CompileJob& job, InputInfo& input_info);
+	void CompileWorker();
+	void StopWorkers();
 	void InitializeDriverCache();
 	// Marks the driver cache changed and, once per interval, has the store thread write it; sooner
 	// after a slow creation.

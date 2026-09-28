@@ -287,18 +287,30 @@ void TextureCache::UnregisterImage(ImageId id) {
 }
 
 uint64_t TextureCache::ImageEpochInRegion(uint64_t address, uint64_t size) {
+	std::scoped_lock lock {m_lock};
+	return ImageEpochInRegionUnlocked(address, size);
+}
+
+uint64_t TextureCache::ImageEpochInRegionUnlocked(uint64_t address, uint64_t size) const {
 	ImagePageTable::PageRange pages {};
 	if (!ImagePageTable::TryGetPageRange(address, size, pages)) {
 		return UINT64_MAX;
 	}
-	std::scoped_lock lock {m_lock};
-	uint64_t         epoch = 0;
+	uint64_t epoch = 0;
 	ForEachPage(address, size, [&](uint64_t page) {
 		if (const auto* page_epoch = m_image_page_epochs.Find(page)) {
 			epoch = std::max(epoch, *page_epoch);
 		}
 	});
 	return epoch;
+}
+
+size_t TextureCache::ExactLookupSlot(const ImageInfo& info) noexcept {
+	uint64_t hash = info.data.address * 0x9e3779b97f4a7c15ull;
+	hash ^= (info.data.size + static_cast<uint64_t>(info.pixel_format)) * 0xc2b2ae3d27d4eb4full;
+	hash ^= (static_cast<uint64_t>(info.extent.width) << 32u | info.extent.height) *
+	        0x165667b19e3779f9ull;
+	return static_cast<size_t>(hash >> 32u) % ExactLookupWays;
 }
 
 void TextureCache::DeleteImage(ImageId id) {
@@ -325,7 +337,7 @@ void TextureCache::DeleteImage(ImageId id) {
 	}
 	UnregisterImage(id);
 	if (m_scheduler.Active()) {
-		m_scheduler.DeferOperation([this, id] { m_slot_images.erase(id); });
+		m_scheduler.DeferHostOperation([this, id] { m_slot_images.erase(id); });
 	} else {
 		m_slot_images.erase(id);
 	}
@@ -485,8 +497,7 @@ void TextureCache::TrackImageDownload(ImageId id, Image& image) {
 	}
 }
 
-void TextureCache::ValidateImageDesc(const ImageDesc& desc) const {
-	ImageOps::Validate(desc.info);
+void TextureCache::ValidateImageViewDesc(const ImageDesc& desc) const {
 	if (desc.view_info.format == vk::Format::eUndefined || desc.view_info.level_count == 0 ||
 	    desc.view_info.layer_count == 0 ||
 	    desc.view_info.base_level >= desc.info.resources.levels ||
@@ -1415,7 +1426,7 @@ void TextureCache::ReleaseDepthCopies(ImageId color_id) {
 		copy.StateChanged();
 		// The copy is never registered: queued work may still sample it.
 		if (m_scheduler.Active()) {
-			m_scheduler.DeferOperation([this, copy_id] { m_slot_images.erase(copy_id); });
+			m_scheduler.DeferHostOperation([this, copy_id] { m_slot_images.erase(copy_id); });
 		} else {
 			m_slot_images.erase(copy_id);
 		}
@@ -1425,11 +1436,38 @@ void TextureCache::ReleaseDepthCopies(ImageId color_id) {
 
 ImageId TextureCache::FindImageImpl(ImageDesc& desc, bool exact_format, bool speculative,
                                     ImageId* depth_source) {
-	ValidateImageDesc(desc);
+	// The image description of a remembered lookup was validated when it was remembered.
+	ValidateImageViewDesc(desc);
 	EXIT_IF(desc.info.data.Empty());
 	const auto metadata_base_layer = desc.view_info.base_layer;
 
 	ImageId result {};
+	{
+		std::scoped_lock lock {m_lock};
+		// Draws look up the same targets and textures over and over: remember lookups that found
+		// an image with the same backing (no overlap resolution, no insertion) until the image set
+		// changes.
+		auto& exact = (*m_exact_lookups)[ExactLookupSlot(desc.info)];
+		if (exact.valid && exact.exact_format == exact_format &&
+		    desc.type != BindingType::VideoOut &&
+		    std::memcmp(&exact.info, &desc.info, sizeof(ImageInfo)) == 0 &&
+		    (exact.epoch == m_image_set_epoch ||
+		     ImageEpochInRegionUnlocked(desc.info.data.address, desc.info.data.size) <=
+		         exact.epoch)) {
+			// No image of the range changed until now: the next lookup compares with now instead of
+			// scanning the pages of the range again.
+			exact.epoch              = m_image_set_epoch;
+			auto& image              = m_slot_images[exact.id];
+			image.tick_accessed_last = m_gc_tick;
+			TouchImage(image);
+			result = exact.id;
+		}
+	}
+	if (result) {
+		MaterializeColorClear(result, desc, metadata_base_layer);
+		return result;
+	}
+	ImageOps::Validate(desc.info);
 	{
 		std::scoped_lock lock {m_lock};
 		Common::SmallVector<ImageId, 8> candidates;
@@ -1459,6 +1497,7 @@ ImageId TextureCache::FindImageImpl(ImageDesc& desc, bool exact_format, bool spe
 				block_alias = true;
 			}
 		}
+		const bool same_backing = static_cast<bool>(result);
 
 		int32_t view_mip   = -1;
 		int32_t view_layer = -1;
@@ -1512,6 +1551,14 @@ ImageId TextureCache::FindImageImpl(ImageDesc& desc, bool exact_format, bool spe
 				FreeImage(result);
 				result = {};
 			}
+		}
+		if (result && same_backing && desc.type != BindingType::VideoOut) {
+			auto& exact = (*m_exact_lookups)[ExactLookupSlot(desc.info)];
+			std::memcpy(&exact.info, &desc.info, sizeof(ImageInfo));
+			exact.id           = result;
+			exact.epoch        = m_image_set_epoch;
+			exact.exact_format = exact_format;
+			exact.valid        = true;
 		}
 		if (!result) {
 			result         = InsertImage(desc.info);
@@ -1642,7 +1689,7 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 	return image.FindView(desc.view_info);
 }
 
-vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
+vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc, ImageId* stencil) {
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
 	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
@@ -1673,7 +1720,11 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	RefreshImage(id);
 	CommitGpuWrite(image);
 	if (desc.info.HasStencil()) {
-		RefreshImage(AssociateStencil(id, desc.info.stencil));
+		const auto association = AssociateStencil(id, desc.info.stencil);
+		RefreshImage(association);
+		if (stencil != nullptr) {
+			*stencil = association;
+		}
 	}
 	return image.FindView(desc.view_info);
 }
@@ -1840,7 +1891,7 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
 vk::Rect2D TextureCache::BeginColorRendering(Image& image, vk::Format format, uint32_t level,
                                              uint32_t layer, uint32_t layers,
                                              const vk::ClearValue* clear,
-                                             vk::CommandBuffer     command) {
+                                             const CommandRecorder& command) {
 	ImageViewInfo view {};
 	view.format      = format;
 	view.type        = layers == 1 ? vk::ImageViewType::e2D : vk::ImageViewType::e2DArray;
@@ -2031,24 +2082,31 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	                                               vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
 	                                               1, &barrier, 0, nullptr);
 	// With storage readback, guest accesses to its pages wait until the stored data lands.
+	const WriteBack write_back {range, m_scheduler.CurrentTick()};
 	if (m_readback_storage_images) {
 		{
 			std::scoped_lock write_back_lock {m_write_back_mutex};
-			m_write_backs.push_back({range, m_scheduler.CurrentTick()});
+			m_write_backs.push_back(write_back);
 		}
 		m_page_manager.UpdatePageWatchers<true, true>(range.address, range.size);
 	}
-	m_scheduler.DeferPriorityOperation([this, download = std::move(download), range,
-	                                    trapped = m_readback_storage_images] {
-		download.buffer->Invalidate(download.offset, range.size);
-		LibKernel::Memory::WriteBacking(range.address, download.mapped, range.size);
-		if (trapped) {
-			m_page_manager.UpdatePageWatchers<false, true>(range.address, range.size);
-			// Priority operations run in queue order, so this write-back is the oldest.
-			std::scoped_lock write_back_lock {m_write_back_mutex};
-			m_write_backs.erase(m_write_backs.begin());
-		}
-	});
+	m_scheduler.DeferPriorityOperation(
+	    [this, download = std::move(download), write_back, trapped = m_readback_storage_images] {
+		    download.buffer->Invalidate(download.offset, write_back.range.size);
+		    LibKernel::Memory::WriteBacking(write_back.range.address, download.mapped,
+		                                    write_back.range.size);
+		    if (trapped) {
+			    m_page_manager.UpdatePageWatchers<false, true>(write_back.range.address,
+			                                                   write_back.range.size);
+			    // Not the oldest one: a priority operation queued while the scheduler is not open
+			    // runs at once, ahead of the queued ones. A predicate, because the vectorized
+			    // std::find of MSVC STL 14.51 rejects 24-byte elements.
+			    std::scoped_lock write_back_lock {m_write_back_mutex};
+			    m_write_backs.erase(std::ranges::find_if(
+			        m_write_backs, [&](const WriteBack& pending) { return pending == write_back; }));
+		    }
+	    },
+	    range.address, range.size);
 	return true;
 }
 

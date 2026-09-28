@@ -150,8 +150,8 @@ bool ImmediateBits(Value value, uint64_t& bits) {
 
 // Scratch layout in bytes: per descriptor source its eight DWORDs and a known DWORD, one
 // activity byte per source, then per image, then one qword per walked value (all ones when
-// unknown). The walker's value slots, reachability, states, read bases and captured addresses
-// follow.
+// unknown). The walker's value slots, reachability, states, read bases and captured loads
+// (address qword, value dword, pad) follow.
 constexpr uint32_t DescriptorStride = 9u * sizeof(uint32_t);
 
 uint32_t ActiveOffset(const ResourcePlan& plan) {
@@ -168,6 +168,10 @@ const uint8_t* Scratch(const ResourcePlan& plan) {
 }
 
 thread_local const Xbyak::CodeGenerator* t_running_walker = nullptr;
+thread_local bool                         t_walker_ahead   = false;
+thread_local bool                         t_walker_faulted = false;
+// Guest memory starts here: a table pointer below it is null.
+constexpr uint64_t GuestMemoryStart = 0x40000;
 
 class RuntimeValidator {
 public:
@@ -1018,7 +1022,8 @@ void WalkerCompiler::EmitRead(const Node& node) {
 		c.mov(c.eax, c.dword[c.r10]);
 		++m_captures;
 		c.mov(c.qword[c.r8], c.r10);
-		c.add(c.r8, 8);
+		c.mov(c.dword[c.r8 + 8], c.eax);
+		c.add(c.r8, 16);
 		Store(node);
 	}
 	// Only buffer reads have a zero path.
@@ -1431,7 +1436,7 @@ void WalkerCompiler::Compile(std::span<const Value> values) {
 		Branch(stub.operand, *stub.unknown);
 		c.jmp(stub.back, Near);
 	}
-	m_plan.srt_scratch.assign(m_plan.srt_captures / 8u + m_captures, 0u);
+	m_plan.srt_scratch.assign(m_plan.srt_captures / 8u + m_captures * 2u, 0u);
 	m_plan.srt_user_data = m_user_data;
 	c.readyRE();
 	EXIT_IF(Xbyak::GetError() != 0);
@@ -1450,18 +1455,27 @@ bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<ui
 	flat.assign(plan.srt_reads.size(), 0u);
 	using Walker = const uint64_t* KYTY_SYSV_ABI (*)(const uint32_t*, uint32_t*, uint64_t*, uint64_t);
 	t_running_walker = plan.srt_code.get();
+	t_walker_ahead   = runtime.record_load != nullptr;
+	t_walker_faulted = false;
 	const auto* end = plan.srt_code->getCode<Walker>()(runtime.user_data.data(), flat.data(),
 	                                                     plan.srt_scratch.data(), runtime.shader_base);
 	t_running_walker = nullptr;
-	if (end == nullptr) return false;
+	t_walker_ahead   = false;
+	if (end == nullptr || t_walker_faulted) return false;
+	const auto* first = plan.srt_scratch.data() + plan.srt_captures / 8u;
 	if (reads != nullptr) {
-		// Resizing first lets the copy vectorize; emplace_back reloads the vector's end per read.
-		const std::span captured {plan.srt_scratch.data() + plan.srt_captures / 8u, end};
-		const auto      first = reads->size();
-		reads->resize(first + captured.size());
-		std::ranges::transform(captured, reads->data() + first, [](uint64_t address) {
-			return std::pair {address, uint64_t {sizeof(uint32_t)}};
-		});
+		// Resizing first spares emplace_back's reload of the vector's end per read.
+		const auto base = reads->size();
+		reads->resize(base + static_cast<size_t>(end - first) / 2u);
+		auto* out = reads->data() + base;
+		for (auto* read = first; read != end; read += 2) *out++ = {read[0], uint64_t {sizeof(uint32_t)}};
+	}
+	if (runtime.record_load != nullptr) {
+		for (auto* read = first; read != end; read += 2) {
+			// Nothing is mapped below guest memory: those bytes read zero on every thread.
+			if (read[0] >= GuestMemoryStart)
+				runtime.record_load(runtime.userdata, read[0], static_cast<uint32_t>(read[1]));
+		}
 	}
 	return true;
 }
@@ -1507,6 +1521,13 @@ bool ValidateRuntimeValue(const ResourcePlan& program, Value value, RuntimeValue
 
 bool ValidateWaveUniformValue(const ResourcePlan& program, Value value) {
 	return RuntimeValidator(program, RuntimeValueType::Any, true).Run(value);
+}
+
+uint32_t SrtWalkerAheadLoadLength(uint64_t rip, uint64_t address) {
+	if (!t_walker_ahead || address < GuestMemoryStart) return 0;
+	const auto length = SrtWalkerLoadLength(rip);
+	if (length != 0) t_walker_faulted = true;
+	return length;
 }
 
 uint32_t SrtWalkerLoadLength(uint64_t rip) {

@@ -1170,6 +1170,8 @@ void EnsureConfigInitialized() {
     subsystems.Initialize<Config::Lifecycle>();
     Config::ConfigOptions options;
     options.printf_direction = Config::LogDirection::Silent;
+    // The checks drive the renderer and inspect its Vulkan command buffers synchronously.
+    options.gpu_pipeline_stages = 0;
     Config::Load(options);
     subsystems.Initialize<Log::Lifecycle>();
     subsystems.Initialize<Libs::LibKernel::Memory::Lifecycle>();
@@ -2695,14 +2697,14 @@ public:
     scheduler.Begin(registers, user_config, shaders);
 
     auto *command = &scheduler.Current();
-    const auto original_handle = command->Handle();
+    const auto original_handle = command->Handle().Direct();
     HW::Context next_registers{};
     HW::UserConfig next_user_config{};
     HW::Shader next_shaders{};
     scheduler.Begin(next_registers, next_user_config, next_shaders);
     Require("SchedulerTimeline", "guest context rebind",
             &scheduler.Current() == command &&
-                command->Handle() == original_handle &&
+                command->Handle().Direct() == original_handle &&
                 &command->GetRegisters() == &next_registers &&
                 &command->GetUserConfig() == &next_user_config &&
                 &command->GetShaders() == &next_shaders,
@@ -2779,7 +2781,7 @@ public:
     constexpr size_t blocked_submission_count = 6;
     std::array<vk::CommandBuffer, blocked_submission_count> blocked_handles{};
     for (size_t i = 0; i < blocked_submission_count; ++i) {
-      blocked_handles[i] = scheduler.Current().Handle();
+      blocked_handles[i] = scheduler.Current().Handle().Direct();
       if (i == 0) {
         scheduler.Flush(external_wait);
       } else {
@@ -2813,7 +2815,7 @@ public:
     scheduler.Flush();
     Require(
         "SchedulerTimeline", "timeline pool reuse",
-        std::ranges::find(blocked_handles, scheduler.Current().Handle()) !=
+        std::ranges::find(blocked_handles, scheduler.Current().Handle().Direct()) !=
             blocked_handles.end(),
         "completed command buffers were not reused after timeline progress");
     scheduler.Shutdown();
@@ -3387,7 +3389,7 @@ public:
         gpu.SendCommandSync([&] {
           processor->BufferInit();
           const auto tick_before = gpu_scheduler.CurrentTick();
-          gpu_scheduler.DeferOperation([&] { host_resource_retired = true; });
+          gpu_scheduler.DeferHostOperation([&] { host_resource_retired = true; });
           constexpr uint64_t cpu_only_address = 0x0000000200400000ull;
           context.MapMemory(cpu_only_address, 0x4000);
           context.UnmapMemory(cpu_only_address, 0x4000);
@@ -5053,10 +5055,11 @@ public:
           "overlap");
       const auto clean_unmap_tick = scheduler.CurrentTick();
       resources.UnmapMemory(index_begin, index_page);
-      Require(name, "clean cached buffer unmap drain",
-              scheduler.CurrentTick() == clean_unmap_tick + 1 &&
+      // Queued GPU work only reads the cached copy of a clean buffer: its unmap needs no drain.
+      Require(name, "clean cached buffer unmap without drain",
+              scheduler.CurrentTick() == clean_unmap_tick &&
                   !resources.IsMapped(index_begin, index_page),
-              "unmapping a clean cached buffer did not drain native work");
+              "unmapping a clean cached buffer drained native work");
       resources.MapMemory(index_begin, index_page);
       const auto index_bridge =
           cache.FindBuffer(index_begin + index_page - 1, index_page + 2);
@@ -11603,7 +11606,7 @@ public:
       clear.float32[3] = 4.0f;
       const vk::ImageSubresourceRange range{vk::ImageAspectFlagBits::eColor, 0,
                                             1, 0, 1};
-      scheduler.Current().Handle().clearColorImage(
+      scheduler.Current().Handle().Direct().clearColorImage(
           image.backing.image, vk::ImageLayout::eTransferDstOptimal, clear,
           range);
       cache.MarkGpuWritten(id);
@@ -12172,6 +12175,11 @@ public:
       TextureCacheTestAccess::ClearImage(context.GetTextureCache(), scheduler.Current(),
                                          source.image_id,
                                          {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, red);
+      // Deleted Vulkan images are pooled and reused with their old contents: the subresource
+      // the resolve must leave alone starts out zero.
+      TextureCacheTestAccess::ClearImage(context.GetTextureCache(), scheduler.Current(),
+                                         whole.image_id,
+                                         {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
       registers.SetColorControl({.mode = 3});
       Require(name, "resolve",
               RenderExecutorTestAccess::ResolveColorTargets(executor, scheduler.Current()),
@@ -19010,7 +19018,8 @@ public:
               "raw image synchronization should be disabled by default");
       for (const auto [sync_raw, formatted] :
            {std::pair{false, false}, {true, false}, {false, true}, {true, true}}) {
-        Config::Load({.sync_raw_image_buffers = sync_raw});
+        // The checks drive the renderer synchronously (see EnsureConfigInitialized).
+        Config::Load({.sync_raw_image_buffers = sync_raw, .gpu_pipeline_stages = 0});
         const bool sync_image = sync_raw || formatted;
         const uint32_t before = 0x13579bd0u | (uint32_t(sync_raw) << 1u) | uint32_t(formatted);
         constexpr uint32_t guard = 0x2468ace0u;
@@ -19090,7 +19099,7 @@ public:
         clear_attachment.clearValue.color.uint32[0] = after;
         const vk::ClearRect clear_rect{{{0, 0}, {128, 128}}, 0, 1};
         scheduler.Current().BeginRendering(rendering);
-        scheduler.Current().Handle().clearAttachments(1, &clear_attachment, 1, &clear_rect);
+        scheduler.Current().Handle().Direct().clearAttachments(1, &clear_attachment, 1, &clear_rect);
         scheduler.EndRendering();
         scheduler.Finish();
         Require(name, "buffer alias observes prior GPU contents",
@@ -19105,7 +19114,7 @@ public:
                 "attachment rendering lost its new color or changed the untouched array layer");
         RenderExecutorTestAccess::ResetBindings(executor);
       }
-      Config::Load({});
+      Config::Load({.gpu_pipeline_stages = 0});
 
       auto colliding_msaa_texture = array_texture;
       colliding_msaa_texture.fields[3] =
@@ -20916,7 +20925,7 @@ public:
       RenderExecutorTestAccess::CommitBindings(
           executor, command, selected, bindings.vertex[0], bindings.pixel);
       command.BeginRendering(rendering);
-      auto cmd = command.Handle();
+      auto cmd = command.Handle().Direct();
       cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, selected.pipeline);
       const vk::Viewport viewport{0, 0, static_cast<float>(extent),
                                   static_cast<float>(extent), 0, 1};
@@ -21893,6 +21902,11 @@ public:
                  static_cast<uint32_t>(second_instance_vertex.size() * sizeof(u32))});
         shaders.SetEsShaderBase(second_instance_vs);
         CommandProcessor processor(context, 0);
+        // The fork's command processor draws with its own registers (it binds them for each
+        // operation): give it the ones set up above, and bind them again afterwards.
+        processor.GetCtx() = registers;
+        processor.GetUcfg() = user_config;
+        processor.GetShCtx() = shaders;
         processor.SetIndexType(1);
         // Zeroed guest memory: read as indices, the table draws no triangle.
         constexpr uint64_t object_ids_address = index_address + 0x100;
@@ -21916,6 +21930,7 @@ public:
                   complete && drawn == (instances != 0),
                   "the packet's instance count, index buffer or index count was misread");
         }
+        scheduler.Begin(registers, user_config, shaders);
       }
 
       // Indirect records come from the GPU copy; the CPU backing holds zeros. Embedded

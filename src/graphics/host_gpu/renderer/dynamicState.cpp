@@ -4,7 +4,7 @@
 
 namespace Libs::Graphics {
 
-void DynamicState::Commit(const GraphicContext& graphics, vk::CommandBuffer cmdbuf) {
+void DynamicState::Commit(const GraphicContext& graphics, CommandRecorder cmdbuf) {
 	if (dirty_state.viewports) {
 		dirty_state.viewports = false;
 		cmdbuf.setViewportWithCount(num_viewports, viewports.data());

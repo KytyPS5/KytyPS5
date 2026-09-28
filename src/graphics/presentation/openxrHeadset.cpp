@@ -142,7 +142,8 @@ constexpr Access COLOR_ATTACHMENT {vk::PipelineStageFlagBits2::eColorAttachmentO
                                    vk::AccessFlagBits2::eColorAttachmentRead |
                                        vk::AccessFlagBits2::eColorAttachmentWrite};
 
-void Barrier(vk::CommandBuffer command, vk::Image image, vk::ImageLayout from, vk::ImageLayout to,
+template <typename Command>
+void Barrier(const Command& command, vk::Image image, vk::ImageLayout from, vk::ImageLayout to,
              uint32_t layers, Access src, Access dst) {
 	vk::ImageMemoryBarrier2 barrier {};
 	barrier.srcStageMask        = src.stage;

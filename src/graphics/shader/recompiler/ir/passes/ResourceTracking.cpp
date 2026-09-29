@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 
 #include "common/assert.h"
+#include "common/hackNotice.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
@@ -4230,6 +4231,30 @@ private:
 		}
 	}
 
+	// The runtime-valid operand of an OR whose other operand is not, recursively; zero if none.
+	Value RuntimeOrOperand(Value value) const {
+		value = value.Resolve();
+		if (ValidateRuntimeValue(m_program, value)) {
+			return value;
+		}
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr || inst->GetOpcode() != ValueOpcode::BitwiseOr32) {
+			return Value(0u);
+		}
+		const auto a      = RuntimeOrOperand(inst->Arg(0));
+		const auto b      = RuntimeOrOperand(inst->Arg(1));
+		const bool a_zero = a.IsImmediate() && a.U32() == 0u;
+		const bool b_zero = b.IsImmediate() && b.U32() == 0u;
+		if (a_zero) {
+			return b;
+		}
+		if (b_zero) {
+			return a;
+		}
+		// Both sides keep runtime bits but the OR itself is not trackable: keep neither.
+		return Value(0u);
+	}
+
 	bool GetHandle(Value value, ValueOpcode expected, uint32_t width, uint32_t pc,
 	               uint32_t base_reg, Inst*& handle, uint32_t& source, bool sampler = false,
 	               bool sample_adjust = false) {
@@ -4240,6 +4265,19 @@ private:
 		DescriptorSource descriptor;
 		MakeSource(*handle, width, sampler, sample_adjust, base_reg, descriptor, pc);
 		uint32_t bad_dword = 0;
+		if (expected == ValueOpcode::GetSamplerResource && !ValidateSource(descriptor, bad_dword) &&
+		    bad_dword == 3u) {
+			// S# word 3 only holds the border color pointer and type. A shader that ORs lane data
+			// into it (reserved or border bits) still samples correctly inside the texture: keep
+			// the runtime part of the OR, or use a transparent black border.
+			descriptor.dwords[3] = RuntimeOrOperand(descriptor.dwords[3]);
+			Common::HackNotice::Report(
+			    "sampler border color word changed", "ResourceTracking::GetHandle",
+			    m_program.shader_hash, pc,
+			    fmt::format("pc=0x{:08x}: the S# border color word is not a runtime value; its "
+			                "lane-dependent bits were dropped",
+			                pc));
+		}
 		if (!ValidateSource(descriptor, bad_dword)) {
 			if (expected == ValueOpcode::GetBufferResource &&
 			    std::all_of(descriptor.dwords.begin(), descriptor.dwords.begin() + width,

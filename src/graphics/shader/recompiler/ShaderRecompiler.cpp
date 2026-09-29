@@ -943,6 +943,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		     options.shader_hash);
 		TranslateResult unsupported_result;
 		unsupported_result.unsupported = true;
+		unsupported_result.decoded_dump = std::move(decoded_dump);
 		return unsupported_result;
 	}
 	IR::EliminateDeadCode(ir.blocks);

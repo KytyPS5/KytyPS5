@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -442,6 +443,17 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	EXIT_IF(m_scheduler.Current().IsInvalid());
 	const auto end = Common::AlignUp(vaddr + size, CACHING_PAGESIZE);
+	if (vaddr < CACHING_PAGESIZE) {
+		// Guest page 0 is never mapped; a request here is a garbage or null descriptor that
+		// slipped past the null checks. The memory tracker cannot hold address 0, so name the
+		// caller now rather than in the garbage collector later.
+		static std::atomic<uint32_t> reported = 0;
+		if (reported.fetch_add(1) < 8) {
+			LOGF("BufferCache: buffer requested in guest page 0: vaddr=0x%016" PRIx64
+			     " size=0x%016" PRIx64 "\n%s",
+			     vaddr, size, Common::HostBacktrace().c_str());
+		}
+	}
 	vaddr = Common::AlignDown(vaddr, CACHING_PAGESIZE);
 	size               = end - vaddr;
 	const auto overlap = ResolveOverlaps(vaddr, size);
@@ -712,11 +724,21 @@ uint64_t BufferCache::LruClock() const noexcept {
 void BufferCache::RunGarbageCollector() {
 	m_gc_tick++;
 	const auto clock = LruClock();
+	// Pressure is judged by this cache's own bytes. Device-wide usage also counts the images
+	// spilled to host memory, which on a 6 GB card keeps it above the critical mark forever
+	// and has the collector destroy and recreate every buffer twice a second (a third of
+	// the GPU thread's time in the world). KYTY_GC_DEVICE_BYTES=1 restores that policy.
+	static const bool device_bytes = std::getenv("KYTY_GC_DEVICE_BYTES") != nullptr;
+	if (device_bytes && m_graphics.CanReportMemoryUsage()) {
+		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
+	}
 	if (m_total_used_memory < m_trigger_gc_memory) {
 		return;
 	}
 
 	const bool     aggressive = m_total_used_memory >= m_critical_gc_memory;
+	// Ages in frames, as in the texture cache: a buffer used this frame or the last is
+	// never a candidate, whatever the submission count.
 	const uint64_t age        = std::min<uint64_t>(aggressive ? 2 : 4, clock);
 	const size_t   limit      = aggressive ? 64 : 32;
 
@@ -726,10 +748,15 @@ void BufferCache::RunGarbageCollector() {
 		auto& buffer = m_slot_buffers[id];
 		EXIT_IF(buffer.is_deleted);
 		if (buffer.CpuAddress() == 0) {
+			// See CreateBuffer: the tracker rejects address 0, so this one is never collected.
 			return false;
 		}
 		m_memory_tracker.ValidateGpuDirtyOwnership(m_gpu_modified_ranges, buffer.CpuAddress(),
 		                                           buffer.Size(), "garbage collection");
+		// An aged GPU-dirty buffer is downloaded and dropped under either policy. Retaining it
+		// (the non-aggressive rule before) leaves its GPU-written bytes owning the pages
+		// forever, and the images that share those pages are then re-sourced from the
+		// buffer's stale contents: the world renders black. Measured 2026-09-21.
 		const bool dirty = m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size());
 		if (dirty) {
 			EXIT_IF(!DownloadBufferMemory(buffer, buffer.CpuAddress(), buffer.Size()));

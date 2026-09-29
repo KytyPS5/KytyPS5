@@ -72,8 +72,8 @@ or graphical glitches, so please include the version you tested when reporting a
       <img src="docs/screenshots/ps5-02.png" width="300" alt="Demon's Souls running in KytyPS5">
     </td>
     <td align="center">
-      <strong>Hellboy</strong><br>
-      <img src="docs/screenshots/ps5-06.png" width="300" alt="Hellboy running in KytyPS5">
+      <strong>UFC 5</strong><br>
+      <img src="docs/screenshots/ps5-06.png" width="300" alt="UFC 5 running in KytyPS5">
     </td>
   </tr>
 </table>
@@ -236,9 +236,10 @@ cmake --build _Build/linux --target launcher --parallel
 cmake --install _Build/linux --prefix _Build/linux/install
 ```
 
-The configure step downloads the FFmpeg prebuilts and the `xbyak`/`zydis` sources, so it needs
-network access; a fully sandboxed `nix build` would require vendoring those inputs. A Vulkan 1.3
-driver must be available at runtime (on NixOS, `hardware.graphics.enable = true`).
+The configure step downloads the FFmpeg prebuilts and the `xbyak`, `zydis`, `zstd`, and ZArchive
+sources, so it needs network access; a fully sandboxed `nix build` would require vendoring those
+inputs. A Vulkan 1.3 driver must be available at runtime (on NixOS,
+`hardware.graphics.enable = true`).
 
 ### Building on macOS
 
@@ -332,17 +333,21 @@ open _Build/macos/install/KytyPS5.app  # or double-click in Finder
 ```
 
 On first launch, add one or more game folders in the global settings. The launcher searches those
-folders recursively for game directories containing `eboot.bin`. Select a detected game and run it
-from the game list.
+folders recursively for game directories containing `eboot.bin` and ZArchive (`.zar`) game dumps
+whose archive root contains `eboot.bin`. Select a detected game and run it from the game list.
+ZArchive dumps are mounted read-only and streamed directly; they do not need to be extracted first.
 
-The emulator can also be started directly with a legally obtained game directory or ELF file:
+The emulator can also be started directly with a legally obtained game directory, ELF file, or
+ZArchive dump:
 
 ```powershell
 .\_Build\windows\install\kyty_emulator.exe --game "D:\Games\ExampleGame"
+.\_Build\windows\install\kyty_emulator.exe --game "D:\Games\ExampleGame.zar"
 ```
 
 ```bash
 ./_Build/linux/install/kyty_emulator --game "/games/ExampleGame"
+./_Build/linux/install/kyty_emulator --game "/games/ExampleGame.zar"
 ```
 
 On macOS, the adjacent flat or app-bundled `libMoltenVK.dylib` is found automatically; no

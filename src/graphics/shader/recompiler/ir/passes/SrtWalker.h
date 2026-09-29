@@ -21,9 +21,6 @@ struct SrtRuntime {
 
 enum class RuntimeValueType { Any, Integer };
 
-// Collects reachable ReadConst values. Immediate offsets receive compact flat-buffer slots;
-// dynamic offsets remain explicit and are never assigned a fake slot.
-void BuildSrtPlan(Program& program);
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
                           RuntimeValueType type = RuntimeValueType::Any);
 // Uses the strict reader for values that affect shader specialization.

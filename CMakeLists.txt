@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.16...4.3)
+cmake_minimum_required(VERSION 3.18...4.3)
 
 if(CMAKE_VERSION VERSION_GREATER_EQUAL 4.0)
 	set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "Minimum policy version for bundled dependencies")
@@ -407,6 +407,16 @@ add_executable(page_manager_tests EXCLUDE_FROM_ALL
 target_link_libraries(page_manager_tests common)
 target_include_directories(page_manager_tests PRIVATE ${inc_headers})
 
+add_executable(archive_file_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ArchiveFileTests.cpp"
+)
+target_link_libraries(archive_file_tests common ZArchive::zarchive)
+target_include_directories(archive_file_tests PRIVATE ${inc_headers})
+
+add_executable(avplayer_file_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/AvPlayerFileTests.cpp")
+target_link_libraries(avplayer_file_tests common FFmpeg::ffmpeg ZArchive::zarchive)
+target_include_directories(avplayer_file_tests PRIVATE ${inc_headers})
+
 add_executable(bit_array_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/BitArrayTests.cpp"
 )
@@ -490,6 +500,17 @@ add_executable(save_data_memory_tests EXCLUDE_FROM_ALL
 target_link_libraries(save_data_memory_tests common fmt::fmt)
 target_include_directories(save_data_memory_tests PRIVATE ${inc_headers})
 
+add_executable(ces_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/CesTests.cpp")
+target_link_libraries(ces_tests common fmt::fmt SDL3::SDL3-static)
+target_include_directories(ces_tests PRIVATE ${inc_headers})
+
+add_executable(save_data_dialog_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/SaveDataDialogTests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/dialog.cpp"
+)
+target_link_libraries(save_data_dialog_tests common fmt::fmt)
+target_include_directories(save_data_dialog_tests PRIVATE ${inc_headers})
+
 add_kyty_full_emulator_test(http_uri_parse_tests
 	"${KYTY_TESTS_DIR}/HttpUriParseTests.cpp")
 
@@ -503,6 +524,7 @@ target_include_directories(event_queue_lifetime_tests PRIVATE ${inc_headers})
 
 add_kyty_full_emulator_test(kernel_file_system_tests
 	"${KYTY_TESTS_DIR}/KernelFileSystemTests.cpp")
+target_link_libraries(kernel_file_system_tests ZArchive::zarchive)
 
 add_executable(sync_on_address_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SyncOnAddressTests.cpp"
@@ -569,6 +591,8 @@ if(BUILD_TESTING)
 	add_test(NAME image_page_table COMMAND $<TARGET_FILE:image_page_table_tests>)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
+	add_test(NAME archive_file COMMAND $<TARGET_FILE:archive_file_tests>)
+	add_test(NAME avplayer_file COMMAND $<TARGET_FILE:avplayer_file_tests>)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
 	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
@@ -581,6 +605,8 @@ if(BUILD_TESTING)
 	add_test(NAME ngs2_sampler COMMAND $<TARGET_FILE:ngs2_sampler_tests>)
 	add_test(NAME pad_haptics COMMAND $<TARGET_FILE:pad_haptics_tests>)
 	add_test(NAME save_data_memory COMMAND $<TARGET_FILE:save_data_memory_tests>)
+	add_test(NAME ces COMMAND $<TARGET_FILE:ces_tests>)
+	add_test(NAME save_data_dialog COMMAND $<TARGET_FILE:save_data_dialog_tests>)
 	add_test(NAME http_uri_parse COMMAND $<TARGET_FILE:http_uri_parse_tests>)
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
 	add_test(NAME shader_recompiler_alignbyte
@@ -618,6 +644,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --compute-meta-clear-only)
 	add_test(NAME buffer_cache_dirty_gc
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-gc-only)
+	add_test(NAME color_render_target_1d
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --rt1d-only)
 
 	if(WIN32)
 		# These tests still depend on the Windows multisample-depth path.
@@ -636,6 +664,8 @@ if(BUILD_TESTING)
 		image_page_table_tests
 		memory_tracker_tests
 		page_manager_tests
+		archive_file_tests
+		avplayer_file_tests
 		bit_array_tests
 		lru_cache_tests
 		shader_vertex_metadata_tests
@@ -650,6 +680,8 @@ if(BUILD_TESTING)
 		ngs2_sampler_tests
 		pad_haptics_tests
 		save_data_memory_tests
+		ces_tests
+		save_data_dialog_tests
 		http_uri_parse_tests
 	)
 endif()

@@ -32,6 +32,7 @@ constexpr int AUDIO_OUT_PORT_TYPE_AUDIO3D   = 126;
 constexpr int AUDIO_OUT_PORT_TYPE_AUX       = 127;
 
 constexpr uint32_t AUDIO_OUT_PARAM_FORMAT_MASK = 0x000000ffu;
+constexpr uint64_t AUDIO_OUT_TARGET_LATENCY_US = 40000;
 
 constexpr int      AUDIO_IN_SILENT_STATE_DEVICE_NONE = 0x1;
 constexpr uint32_t AUDIO_IN_GRAIN_MAX_ASYNC          = 384;
@@ -368,11 +369,11 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking) {
 
 	uint32_t min_queued_size = 0;
 	if (blocking) {
-		constexpr uint64_t target_latency_us = 40000;
 		const auto buffer_us = port->freq != 0 ? (1000000ULL * port->samples_num) / port->freq : 0;
 		const auto buffers =
-		    buffer_us != 0 ? static_cast<uint32_t>((target_latency_us + buffer_us - 1) / buffer_us)
-		                   : 2u;
+		    buffer_us != 0
+		        ? static_cast<uint32_t>((AUDIO_OUT_TARGET_LATENCY_US + buffer_us - 1) / buffer_us)
+		        : 2u;
 		min_queued_size           = prepared_size * std::clamp(buffers, 2u, 16u);
 		const auto wait_start      = LibKernel::KernelGetProcessTime();
 		auto queued                = SDL_GetAudioStreamQueued(port->stream);
@@ -440,10 +441,13 @@ Audio::Id Audio::AudioOutOpen(int type, uint32_t samples_num, uint32_t freq, For
 				port.volume[i] = 32768;
 			}
 
-			if (type == AUDIO_OUT_PORT_TYPE_VIBRATION) {
-				port.haptics = Controller::DualSenseHaptics::Open(freq);
-			} else {
+			// Pad speaker ports keep the main output too; it plays them whenever no DualSense does.
+			if (type != AUDIO_OUT_PORT_TYPE_VIBRATION) {
 				OpenSdlDevice(&port);
+			}
+			if (type == AUDIO_OUT_PORT_TYPE_VIBRATION || type == AUDIO_OUT_PORT_TYPE_PADSPK) {
+				port.haptics =
+				    Controller::DualSenseHaptics::Open(freq, type == AUDIO_OUT_PORT_TYPE_PADSPK);
 			}
 
 			return Id::Create(id);
@@ -554,14 +558,22 @@ uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking
 	for (uint32_t i = 0; i < num; i++) {
 		auto& port = m_out_ports[params[i].handle.GetId()];
 
-		if (port.type == AUDIO_OUT_PORT_TYPE_VIBRATION) {
-			// Haptics never pace output; keep the stream alive against close and volume changes.
+		uint64_t controller_queued_us = 0;
+		if (port.haptics != nullptr) {
+			// Keep the stream alive against close and volume changes.
 			Common::LockGuard lock(m_mutex);
-			Controller::DualSenseHaptics::Queue(
+			controller_queued_us = Controller::DualSenseHaptics::Queue(
 			    port.haptics, Controller::GetActiveControllerId(), params[i].data, port.samples_num,
 			    static_cast<uint32_t>(port.channels_num), FormatIsFloat(port.format), port.volume);
-		} else {
+		}
+		if (controller_queued_us == 0) {
+			// No DualSense took it (e.g. it was unplugged); a pad speaker port plays on the main
+			// output instead, and a vibration port has none.
 			QueueSdlAudio(&port, params[i].data, blocking);
+		} else if (blocking && port.type == AUDIO_OUT_PORT_TYPE_PADSPK &&
+		           controller_queued_us > AUDIO_OUT_TARGET_LATENCY_US) {
+			// Vibration never paces output; the speaker is audible, so pace it like other ports.
+			Common::Thread::SleepMicro(controller_queued_us - AUDIO_OUT_TARGET_LATENCY_US);
 		}
 	}
 

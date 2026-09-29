@@ -161,10 +161,8 @@ int KYTY_SYSV_ABI AjmDecAt9ParseConfigData(const void*              config_data,
 		return AJM_ERROR_INVALID_PARAMETER;
 	}
 
-	uint8_t config[ATRAC9_CONFIG_DATA_SIZE] {};
-	std::memcpy(config, config_data, sizeof(config));
 	Atrac9CodecInfo codec_info {};
-	const int       init_result = Atrac9InitDecoder(handle, config);
+	const int       init_result = AjmAt9InitDecoder(handle, static_cast<const uint8_t*>(config_data));
 	const int       info_result =
 	    init_result == 0 ? Atrac9GetCodecInfo(handle, &codec_info) : init_result;
 	Atrac9ReleaseHandle(handle);

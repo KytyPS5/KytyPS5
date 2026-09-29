@@ -27,6 +27,7 @@
 #include <atomic>
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
@@ -167,6 +168,37 @@ bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) 
 	}
 	std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
 	return true;
+}
+
+// --skip-shaders and KYTY_SKIP_SHADER_HASHES="hash,hash,...": skip the draws and dispatches of
+// these guest shaders, the same way a shader that fails to compile is skipped. To see what one
+// shader contributes, to step past one that loses the device, or to leave out work nothing can
+// use (the ray-tracing BVH updates whose only consumer gives up).
+bool SkipShaderRequested(uint64_t shader_hash) {
+	static const std::vector<uint64_t> hashes = [] {
+		std::vector<uint64_t> result;
+		const auto parse = [&result](std::string_view list) {
+			size_t start = 0;
+			while (start < list.size()) {
+				const auto end = std::min(list.find(',', start), list.size());
+				if (end > start) {
+					result.push_back(
+					    std::strtoull(std::string(list.substr(start, end - start)).c_str(), nullptr, 16));
+				}
+				start = end + 1;
+			}
+		};
+		parse(Config::GetSkipShaderHashes());
+		if (const char* value = std::getenv("KYTY_SKIP_SHADER_HASHES"); value != nullptr) {
+			parse(value);
+		}
+		for (const auto hash: result) {
+			LOGF("ProgramCache: skipping the draws and dispatches of shader 0x%016" PRIx64 "\n",
+			     hash);
+		}
+		return result;
+	}();
+	return std::ranges::find(hashes, shader_hash) != hashes.end();
 }
 
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
@@ -356,6 +388,9 @@ struct PipelineCache::ProgramCache {
 			stage = ShaderType::Compute;
 		}
 
+		if (SkipShaderRequested(params.hash)) {
+			return ShaderProgram {};
+		}
 		const auto user_data = std::span(params.user_data).first(params.user_data_count);
 		lookup_key.stage           = stage;
 		lookup_key.hash            = params.hash;

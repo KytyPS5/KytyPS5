@@ -578,6 +578,7 @@ LIB_DEFINE(InitAudio_1_Acm) {
 	LIB_FUNC("8fe55ktlNVo", Acm::AcmBatchStartBuffers);
 	LIB_FUNC("RLN3gRlXJLE", Acm::AcmBatchWait);
 	LIB_FUNC("r7z5YQFZo+U", Acm::AcmBatchJobNotification);
+	LIB_FUNC("GTfJ64qFCPw", Acm::AcmBatchJobPriority);
 	LIB_FUNC("u70oWo92SYQ", Acm::AcmConvReverbSharedInput);
 	LIB_FUNC("9nLbWmRDpa8", Acm::AcmConvReverbSharedIr);
 	LIB_FUNC("KovqaFbmtsM", Acm::AcmFft);

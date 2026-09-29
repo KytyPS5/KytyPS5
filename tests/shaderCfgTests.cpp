@@ -1036,6 +1036,42 @@ void EnsureConfigInitialized() {
   }
 }
 
+void TestDeclaredShaderHashMarker() {
+  // A shader may start with a real s_mov_b32 vcc_hi, <constant>: the same word as the binary
+  // info marker. Engine PS 0xce92bce6ef67760d does, and its "block" lay about 8 GB past the code.
+  // The hash must then be the content hash, without reading there.
+  alignas(256) static uint32_t plain[60] = {0xBEEB03FFu, 0x3D00EAF7u};
+  ShaderMappedData data;
+  data.code_size_bytes = sizeof(plain);
+  const auto plain_addr = reinterpret_cast<uint64_t>(plain);
+  ShaderMapUserData(plain_addr, data);
+  Check(ShaderDeclaredHash(plain_addr) == XXH3_64bits(plain, sizeof(plain)),
+        "a leading s_mov_b32 vcc_hi whose offset leaves the code must give the "
+        "content hash");
+
+  // A marker whose block lies inside the code and carries a signature declares the hash: the
+  // block starts at dword (3 + 1) * 2 = 8, hash0 and hash1 at bytes 16 and 20 of it.
+  alignas(256) static uint32_t marked[16] = {0xBEEB03FFu, 3u};
+  std::memcpy(&marked[8], "OrbShdr", 7);
+  marked[12] = 0x11223344u;
+  marked[13] = 0x55667788u;
+  data.code_size_bytes = sizeof(marked);
+  const auto marked_addr = reinterpret_cast<uint64_t>(marked);
+  ShaderMapUserData(marked_addr, data);
+  Check(ShaderDeclaredHash(marked_addr) == 0x5566778811223344ull,
+        "a binary info block inside the code must declare the hash");
+
+  // The same offset without a signature is not a block.
+  alignas(256) static uint32_t unsigned_block[16] = {0xBEEB03FFu, 3u};
+  unsigned_block[12] = 0x11223344u;
+  data.code_size_bytes = sizeof(unsigned_block);
+  const auto unsigned_addr = reinterpret_cast<uint64_t>(unsigned_block);
+  ShaderMapUserData(unsigned_addr, data);
+  Check(ShaderDeclaredHash(unsigned_addr) ==
+            XXH3_64bits(unsigned_block, sizeof(unsigned_block)),
+        "a binary info block without a signature must give the content hash");
+}
+
 void TestResourceDescriptorClassification() {
   uint32_t raw_texture[8] = {};
   raw_texture[3] = 9u << 28u;
@@ -14036,6 +14072,7 @@ int main() {
 
   EnsureConfigInitialized();
   TestRayTracingDispatchDetection();
+  TestDeclaredShaderHashMarker();
   TestResourceDescriptorClassification();
   TestShaderBufferResourceSize();
   TestNativeShaderResourceDependencies();

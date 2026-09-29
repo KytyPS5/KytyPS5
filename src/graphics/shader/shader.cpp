@@ -21,6 +21,7 @@
 #include <atomic>
 #include <bit>
 #include <cstdio>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -93,19 +94,32 @@ static ShaderMappedData ShaderGetMappedData(uint64_t addr, const char* label) {
 	EXIT("%s shader=0x%016" PRIx64 " is missing from ShaderMap\n", label, addr);
 }
 
-static const ShaderBinaryInfo* GetBinaryInfo(const uint32_t* code) {
+// The binary info a shader declares with a leading s_mov_b32 vcc_hi, <offset>. That word is
+// also a real instruction a shader can start with (s_mov_b32 vcc_hi, <constant>), whose
+// "offset" can point gigabytes past the code, so the block counts only when it lies inside the
+// code and carries a known signature: "OrbShdr", or the start of the "barefoot" trailer.
+static const ShaderBinaryInfo* GetBinaryInfo(const uint32_t* code, uint32_t code_size_bytes) {
 	EXIT_IF(code == nullptr);
 
-	if (code[0] == 0xBEEB03FF) {
-		return reinterpret_cast<const ShaderBinaryInfo*>(code +
-		                                                 static_cast<size_t>(code[1] + 1) * 2);
+	if (code_size_bytes < 2 * sizeof(uint32_t) || code[0] != 0xBEEB03FF) {
+		return nullptr;
 	}
-
-	return nullptr;
+	const auto offset = (static_cast<uint64_t>(code[1]) + 1u) * 2u * sizeof(uint32_t);
+	if (offset + sizeof(ShaderBinaryInfo) > code_size_bytes) {
+		return nullptr;
+	}
+	const auto* info = reinterpret_cast<const ShaderBinaryInfo*>(
+	    reinterpret_cast<const uint8_t*>(code) + offset);
+	if (std::memcmp(info->signature, "OrbShdr", sizeof(info->signature)) != 0 &&
+	    std::memcmp(info->signature, "barefoo", sizeof(info->signature)) != 0) {
+		return nullptr;
+	}
+	return info;
 }
 
-static uint64_t ReadDeclaredShaderHash(uint64_t shader_addr) {
-	const auto* header = GetBinaryInfo(reinterpret_cast<const uint32_t*>(shader_addr));
+static uint64_t ReadDeclaredShaderHash(uint64_t shader_addr, uint32_t code_size_bytes) {
+	const auto* header =
+	    GetBinaryInfo(reinterpret_cast<const uint32_t*>(shader_addr), code_size_bytes);
 	return header != nullptr ? (static_cast<uint64_t>(header->hash1) << 32u) | header->hash0 : 0;
 }
 
@@ -114,19 +128,24 @@ static uint64_t GetDeclaredShaderHash(uint64_t shader_addr) {
 	if (auto cached = g_shader_hash_cache.find(shader_addr); cached != g_shader_hash_cache.end()) {
 		return cached->second;
 	}
-	auto hash = ReadDeclaredShaderHash(shader_addr);
-	if (hash == 0 && g_shader_map != nullptr) {
+	uint32_t code_size_bytes = 0;
+	if (g_shader_map != nullptr) {
 		if (auto iter = g_shader_map->find(shader_addr); iter != g_shader_map->end()) {
-			const auto& data = iter->second;
-			if (data.code_size_bytes != 0 && data.code_size_bytes % sizeof(uint32_t) == 0) {
-				hash = XXH3_64bits(reinterpret_cast<const void*>(shader_addr), data.code_size_bytes);
-			}
+			code_size_bytes = iter->second.code_size_bytes;
 		}
+	}
+	auto hash = ReadDeclaredShaderHash(shader_addr, code_size_bytes);
+	if (hash == 0 && code_size_bytes != 0 && code_size_bytes % sizeof(uint32_t) == 0) {
+		hash = XXH3_64bits(reinterpret_cast<const void*>(shader_addr), code_size_bytes);
 	}
 	if (hash != 0) {
 		g_shader_hash_cache.emplace(shader_addr, hash);
 	}
 	return hash;
+}
+
+uint64_t ShaderDeclaredHash(uint64_t shader_addr) {
+	return GetDeclaredShaderHash(shader_addr);
 }
 
 static ShaderParams GetShaderParams(uint64_t shader_addr, const char* label, uint64_t declared_hash,

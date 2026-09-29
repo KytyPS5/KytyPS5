@@ -307,6 +307,8 @@ struct ShaderMappedData {
 
 void ShaderInit();
 void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data);
+// The guest hash the shader binary declares (a content hash when it declares none).
+uint64_t ShaderDeclaredHash(uint64_t shader_addr);
 
 void     ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info);
 void     ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info);

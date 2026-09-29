@@ -676,7 +676,10 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 		                      ? static_cast<uint64_t>(static_cast<uint32_t>(records))
 		                      : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
 		if (byte_offset > size || size - byte_offset < sizeof(uint32_t)) {
-			return false;
+			// A scalar buffer read past the end returns zero (PS5 ISA, scalar buffer addressing),
+			// as the shader's own load does (EmitReadConstBuffer). Failing skipped the draw.
+			result = 0;
+			return true;
 		}
 		address = (base & ~uint64_t {3}) + byte_offset;
 	} else {
@@ -690,10 +693,10 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 	const auto reader = vector ? m_runtime.read_specialization_memory : m_runtime.read_memory;
 	if (reader != nullptr) {
 		if (!reader(m_runtime.userdata, address, {&word, 1})) {
-			// A failed load through a null base pointer sits on a path the shader guards with a
-			// null-pointer test and never executes. Its value cannot matter; failing would skip the
-			// dispatch.
-			if (base == 0) {
+			// A plan without control flow cannot tell a guarded read from an active one: a failed
+			// read through a null base there reads zero. With control flow, the reachability walk
+			// skips guarded reads and a null read in a reachable block fails.
+			if (base == 0 && m_program.control_flow.empty()) {
 				result = 0;
 				return true;
 			}

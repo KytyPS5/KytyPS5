@@ -461,6 +461,8 @@ struct ShaderInfo {
 	int32_t                          instance_offset_sgpr = -1;
 	bool                             has_bitwise_xor    = false;
 	bool                             uses_dma           = false;
+	// Research: loop watchdogs report their trips into the bindless feedback buffer (set 1).
+	bool                             watchdog_reports   = false;
 
 	bool operator==(const ShaderInfo& other) const = default;
 };
@@ -565,6 +567,13 @@ struct ResourcePlan {
 	std::vector<uint8_t>                clean_flat_slots;
 	bool                                requires_specialization_memory = false;
 	bool                                capture_specialization_reads = false;
+	// A descriptor phi was lowered to a host selection in a shader that writes memory: the
+	// reads that evaluate it are captured and must not overlap a buffer the shader writes.
+	bool                                descriptor_phi_under_writes = false;
+	bool                                has_uniform_buffer_reads = false;
+	// The device supports bindless images: an indirect image the enumeration cannot cover
+	// becomes a bindless one instead of failing tracking.
+	bool                                bindless_images = false;
 	bool                                srt_plan_complete          = false;
 	bool                                resource_tracking_complete = false;
 	ShaderInfo                          info;

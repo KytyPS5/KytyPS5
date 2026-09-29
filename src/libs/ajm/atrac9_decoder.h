@@ -60,6 +60,19 @@ static bool AjmFourCcEquals(const uint8_t* data, char a, char b, char c, char d)
 	       data[2] == static_cast<uint8_t>(c) && data[3] == static_cast<uint8_t>(d);
 }
 
+// LibAtrac9 checks the header byte and the validation bit, then indexes its six-entry
+// channel-configuration table with the 3-bit field unchecked: 6 and 7 read past the table,
+// and InitFrame writes that many blocks past the handle (a host access violation).
+// Channel configs 0-5 are LibAtrac9's; 6 and 7 are the SDK's vibration mono and vibration dual
+// mono (ajm/at9_decoder.h), ATRAC9 streams the console routes to the controller's haptics.
+static bool AjmAt9ConfigDataValid(const uint8_t* config_data) {
+	return config_data[0] == 0xfeu && (config_data[1] & 1u) == 0;
+}
+
+[[nodiscard]] static bool AjmAt9IsVibrationConfig(const uint8_t* config_data) {
+	return ((config_data[1] >> 1u) & 7u) >= 6u;
+}
+
 class AjmAt9Decoder final: public AjmDecoder {
 public:
 	AjmAt9Decoder(uint32_t channels, uint32_t sample_rate, AjmSampleEncoding encoding,
@@ -314,9 +327,21 @@ private:
 			result->result = AJM_RESULT_CODEC_ERROR | AJM_RESULT_FATAL;
 			return false;
 		}
+		if (!AjmAt9ConfigDataValid(config_data)) {
+			LOGF("AJM ATRAC9: invalid config data %02x %02x %02x %02x\n", config_data[0],
+			     config_data[1], config_data[2], config_data[3]);
+			m_is_initialized = false;
+			result->result   = AJM_RESULT_CODEC_ERROR | AJM_RESULT_INVALID_DATA;
+			return false;
+		}
 
 		std::memcpy(m_config_data, config_data, ATRAC9_CONFIG_DATA_SIZE);
 		m_has_config = true;
+		if (AjmAt9IsVibrationConfig(config_data)) {
+			LOGF("AJM ATRAC9: vibration config %02x %02x %02x %02x decoded as %s\n", config_data[0],
+			     config_data[1], config_data[2], config_data[3],
+			     (config_data[1] & 0x02u) != 0 ? "dual mono" : "mono");
+		}
 
 		const int init_ret = AjmAt9InitDecoder(m_handle, m_config_data);
 		if (init_ret != 0) {

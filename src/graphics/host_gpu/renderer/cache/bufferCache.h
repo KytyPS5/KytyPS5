@@ -68,6 +68,7 @@ public:
 		EXIT("BufferCache: invalid utility-buffer usage\n");
 	}
 	[[nodiscard]] const Buffer* GetGdsBuffer() const noexcept { return &m_gds_buffer; }
+	[[nodiscard]] Buffer*       GetGdsBuffer() noexcept { return &m_gds_buffer; }
 	[[nodiscard]] Buffer* GetBdaPageTableBuffer() noexcept { return &m_bda_pagetable_buffer; }
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return m_fault_manager.GetFaultBuffer(); }
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
@@ -75,13 +76,29 @@ public:
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
 	                bool src_gds);
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.
-	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
-	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
-	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
-	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
-	void               ProcessFaultBuffer();
-	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
-	void               RunGarbageCollector();
+	[[nodiscard]] bool              IsRegionRegistered(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool              HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
+	// Any thread: none of the bytes is GPU-written, or on its way back from the GPU, so guest
+	// memory holds their current value even when their page is protected.
+	[[nodiscard]] bool              IsCleanForConcurrentRead(uint64_t vaddr, uint64_t size) const;
+	[[nodiscard]] bool              IsRegionCpuModified(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool              IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+	void                            ProcessFaultBuffer();
+	// GPU thread: writes bytes on a page protected because the GPU wrote to it, without
+	// downloading the page: the host copy through the backing store, the GPU copy in the command
+	// stream, after the GPU's earlier writes. Bytes the GPU had written are then current on both
+	// sides and no longer need a download. False when there is nothing to save (the page is not
+	// protected as GPU-written) or it would be wrong (a download of these bytes is in flight, or
+	// no cached buffer covers them); the caller then writes normally.
+	[[nodiscard]] bool              WriteClean(uint64_t vaddr, const void* data, uint64_t size);
+	[[nodiscard]] ShaderFaultReport CollectFaults() { return m_fault_manager.CollectFaults(); }
+	[[nodiscard]] uint64_t          UnattributedFaults() const noexcept {
+		return m_fault_manager.UnattributedFaults();
+	}
+	void                            SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
+	// Same, but visits only the tracker regions that may hold CPU-dirty pages.
+	void                            SynchronizeCpuDirtyBuffersInRange(uint64_t vaddr, uint64_t size);
+	void                            RunGarbageCollector();
 
 private:
 	friend struct BufferCacheTestAccess;
@@ -108,27 +125,27 @@ private:
 	void JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumulate_stream_score);
 	[[nodiscard]] BufferId CreateBuffer(uint64_t vaddr, uint64_t size);
 	void                   Register(BufferId id);
-	void Unregister(BufferId id);
+	void                   Unregister(BufferId id);
 	template <bool insert>
-	void ChangeRegister(BufferId id);
-	void DeleteBuffer(BufferId id);
-	[[nodiscard]] bool SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
-	                                     bool is_written, bool is_texel_buffer);
+	void                     ChangeRegister(BufferId id);
+	void                     DeleteBuffer(BufferId id);
+	[[nodiscard]] bool       SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size,
+	                                           bool is_written, bool is_texel_buffer);
 	[[nodiscard]] vk::Buffer UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
 	                                      uint64_t total_size);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	// Queues backing publication; callers wait before clearing dirty pages or reusing their data.
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool DownloadBufferWindow(Buffer& buffer, uint64_t vaddr, uint64_t size);
-	void DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCopy> copies,
-	                          uint64_t total_size);
+	void               DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCopy> copies,
+	                                        uint64_t total_size);
 
-	GraphicContext&                                   m_graphics;
-	CommandScheduler&                                 m_scheduler;
-	FaultManager                                      m_fault_manager;
-	Buffer                                            m_gds_buffer;
-	Buffer                                            m_bda_pagetable_buffer;
-	Common::SlotVector<Buffer>                        m_slot_buffers;
+	GraphicContext&                                    m_graphics;
+	CommandScheduler&                                  m_scheduler;
+	FaultManager                                       m_fault_manager;
+	Buffer                                             m_gds_buffer;
+	Buffer                                             m_bda_pagetable_buffer;
+	Common::SlotVector<Buffer>                         m_slot_buffers;
 	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_lru_cache;
 	BufferMap                                         m_buffers;
 	PageTable                                         m_page_table;

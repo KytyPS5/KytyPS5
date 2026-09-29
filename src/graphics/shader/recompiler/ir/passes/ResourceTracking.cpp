@@ -1,19 +1,22 @@
-#include "graphics/shader/recompiler/frontend/translate/Translator.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "graphics/shader/recompiler/frontend/translate/Translator.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <algorithm>
+#include <bit>
 #include <fmt/format.h>
 #include <map>
 #include <numeric>
 #include <optional>
 #include <span>
 #include <tuple>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -590,45 +593,85 @@ private:
 		           ? native->src0.reg : UINT32_MAX;
 	}
 
-	void CollectScalarRead(Value value, uint32_t use_pc) {
-		value = value.Resolve();
-		if (value.IsImmediate()) return;
-		auto* inst = value.TryInstruction();
-		if (inst == nullptr) Fail(use_pc, "invalid typed planning value");
-		const auto cycle = std::ranges::find(m_srt_visiting, inst);
-		if (cycle != m_srt_visiting.end()) {
-			if (std::any_of(cycle, m_srt_visiting.end(), [](const Inst* value) {
-				return value->GetOpcode() == ValueOpcode::Phi;
-			})) return;
-			Fail(use_pc, "cyclic typed planning value without a phi");
+	// Large inlined shaders have descriptor dependencies thousands of instructions deep: walk
+	// them with an explicit stack (post-order, same cycle rule) instead of one native frame each.
+	void CollectScalarRead(Value root, uint32_t root_pc) {
+		struct Frame {
+			Inst*                                   inst   = nullptr;
+			bool                                    memory = false;
+			std::vector<std::pair<Value, uint32_t>> dependencies;
+			size_t                                  next = 0;
+		};
+		std::vector<Frame>                        stack;
+		std::unordered_map<const Inst*, size_t>   visiting;
+		const auto enter = [&](Value value, uint32_t use_pc) {
+			value = value.Resolve();
+			if (value.IsImmediate()) return;
+			auto* inst = value.TryInstruction();
+			if (inst == nullptr) {
+				Fail(use_pc, "invalid typed planning value");
+				return;
+			}
+			if (const auto cycle = visiting.find(inst); cycle != visiting.end()) {
+				if (std::any_of(stack.begin() + static_cast<std::ptrdiff_t>(cycle->second), stack.end(),
+				                [](const Frame& frame) {
+					                return frame.inst->GetOpcode() == ValueOpcode::Phi;
+				                })) {
+					return;
+				}
+				Fail(use_pc, "cyclic typed planning value without a phi");
+				return;
+			}
+			if (m_srt_visited.contains(inst)) return;
+			Frame frame;
+			frame.inst = inst;
+			uint32_t    memory_index = 0;
+			const auto* memory       = ScalarReadMemory(*inst, memory_index);
+			if (memory != nullptr) {
+				frame.memory       = true;
+				const auto* handle = inst->Arg(0).Resolve().TryInstruction();
+				const auto  width  = memory->kind == ResourceKind::ScalarBuffer ? 4u : 2u;
+				if (handle == nullptr ||
+				    handle->GetOpcode() != (width == 4u ? ValueOpcode::GetBufferResource
+				                                        : ValueOpcode::GetAddressResource)) {
+					Fail(use_pc, "scalar read has an invalid resource handle");
+					return;
+				}
+				const auto      pc = inst->Flags<MemoryFlags>().pc;
+				DescriptorSource source;
+				MakeSource(*handle, width, false, false, ScalarReadBase(*inst), source, pc);
+				for (uint32_t word = 0; word < width; ++word) {
+					frame.dependencies.emplace_back(source.dwords[word], pc);
+				}
+				for (size_t arg = 1; arg < inst->NumArgs(); ++arg) {
+					frame.dependencies.emplace_back(inst->Arg(arg), use_pc);
+				}
+			} else {
+				for (size_t arg = 0; arg < inst->NumArgs(); ++arg) {
+					frame.dependencies.emplace_back(inst->Arg(arg), use_pc);
+				}
+			}
+			visiting.emplace(inst, stack.size());
+			stack.push_back(std::move(frame));
+		};
+		enter(root, root_pc);
+		while (!stack.empty() && !m_failed) {
+			auto& frame = stack.back();
+			if (frame.next < frame.dependencies.size()) {
+				const auto dependency = frame.dependencies[frame.next++];
+				enter(dependency.first, dependency.second);
+				continue;
+			}
+			auto* inst         = frame.inst;
+			const bool memory  = frame.memory;
+			stack.pop_back();
+			visiting.erase(inst);
+			m_srt_visited.insert(inst);
+			if (!memory) continue;
+			const auto offset = inst->Arg(1).Resolve();
+			if (!offset.IsImmediate() || offset.GetType() != Type::U32) continue;
+			m_scalar_reads.push_back(inst);
 		}
-		if (std::ranges::find(m_srt_visited, inst) != m_srt_visited.end()) return;
-		m_srt_visiting.push_back(inst);
-		uint32_t memory_index = 0;
-		const auto* memory = ScalarReadMemory(*inst, memory_index);
-		DescriptorSource source;
-		if (memory != nullptr) {
-			const auto* handle = inst->Arg(0).Resolve().TryInstruction();
-			const auto width = memory->kind == ResourceKind::ScalarBuffer ? 4u : 2u;
-			if (handle == nullptr || handle->GetOpcode() !=
-			        (width == 4u ? ValueOpcode::GetBufferResource : ValueOpcode::GetAddressResource))
-				Fail(use_pc, "scalar read has an invalid resource handle");
-			MakeSource(*handle, width, false, false, ScalarReadBase(*inst), source,
-			           inst->Flags<MemoryFlags>().pc);
-			for (uint32_t word = 0; word < width; ++word)
-				CollectScalarRead(source.dwords[word], inst->Flags<MemoryFlags>().pc);
-			for (size_t arg = 1; arg < inst->NumArgs(); ++arg)
-				CollectScalarRead(inst->Arg(arg), use_pc);
-		} else {
-			for (size_t arg = 0; arg < inst->NumArgs(); ++arg)
-				CollectScalarRead(inst->Arg(arg), use_pc);
-		}
-		m_srt_visiting.pop_back();
-		m_srt_visited.push_back(inst);
-		if (memory == nullptr) return;
-		const auto offset = inst->Arg(1).Resolve();
-		if (!offset.IsImmediate() || offset.GetType() != Type::U32) return;
-		m_scalar_reads.push_back(inst);
 	}
 
 	void PlanScalarReads() {
@@ -1709,7 +1752,11 @@ private:
 	}
 
 	void Collect(Inst& inst) {
-		const auto op           = inst.GetOpcode();
+		const auto op = inst.GetOpcode();
+		if (op == ValueOpcode::ShaderTrap) {
+			m_info.uses_dma = true;
+			return;
+		}
 		const auto buffer       = BufferAccessOf(op);
 		const auto address_info = AddressOpcodeInfoOf(op);
 		const auto image_info   = ImageOpcodeInfoOf(op);
@@ -1878,8 +1925,7 @@ private:
 	const CFG::Graph&                          m_native_cfg;
 	std::vector<Program::ScalarWrite>          m_scalar_writes;
 	std::vector<ResolvedHandle>                m_resolved_handles;
-	std::vector<const Inst*>                   m_srt_visiting;
-	std::vector<const Inst*>                   m_srt_visited;
+	std::unordered_set<const Inst*>            m_srt_visited;
 	std::vector<Inst*>                         m_scalar_reads;
 	ShaderInfo                                 m_info;
 	std::vector<DescriptorSource>              m_sources;

@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/frontend/decode/ShaderFunctions.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
 #include "kytyGitVersion.h"
@@ -30,6 +31,7 @@
 #include <fmt/format.h>
 #include <limits>
 #include <span>
+#include <string>
 #include <spirv-tools/libspirv.hpp>
 #include <string_view>
 #include <tuple>
@@ -268,6 +270,9 @@ struct PipelineCache::ProgramCache {
 		uint32_t              user_data_count = 0;
 		uint32_t              code_size       = 0;
 		std::vector<uint32_t> static_state;
+		// Exact expanded code includes callees and their original return-PC constants.
+		// A different target/body must not reuse a program compiled for an earlier call.
+		std::vector<uint32_t> function_code;
 
 		bool operator==(const ProgramKey&) const = default;
 	};
@@ -301,6 +306,7 @@ struct PipelineCache::ProgramCache {
 			PipelineKeyHash::Mix(hash, key.user_data_count);
 			PipelineKeyHash::Mix(hash, key.code_size);
 			PipelineKeyHash::Mix(hash, key.static_state.size());
+			PipelineKeyHash::Mix(hash, key.function_code.size());
 			// Bucket same-shape static variants by source. ProgramKey equality performs the one
 			// exact state comparison needed on a stable hit without hashing the full state first.
 			return hash;
@@ -355,6 +361,19 @@ struct PipelineCache::ProgramCache {
 		lookup_key.user_data_count = params.user_data_count;
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, lookup_key.static_state);
+		// Research: a program with inlined calls is valid only for the same call targets.
+		if (const auto found = call_targets.find(params.hash); found != call_targets.end()) {
+			for (const auto index: found->second) {
+				lookup_key.static_state.push_back(index < user_data.size() ? user_data[index] : 0u);
+			}
+		}
+		// Research: ShaderFunctions expands calls first; the calls it refuses reach the
+		// recompiler's own inliner.
+		lookup_key.function_code.clear();
+		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+			ExpandShaderFunctions(params, user_data, input_info.wave_size,
+			                      lookup_key.function_code);
+		}
 		if (unsupported.contains(lookup_key)) {
 			return ShaderProgram {};
 		}
@@ -526,8 +545,28 @@ struct PipelineCache::ProgramCache {
 		}
 	}
 
+	// Shader function expansion decodes the shader and every callee, and a shader with table
+	// calls can be dispatched hundreds of times a frame; the expander keeps what it can reuse.
+	void ExpandShaderFunctions(const ShaderParams& params, std::span<const uint32_t> user_data,
+	                           uint32_t wave_size, std::vector<uint32_t>& expanded) {
+		std::string reason;
+		if (!function_expander.Expand(
+		        params.code, params.Base(), user_data,
+		        [](uint64_t address, std::span<uint32_t> words) {
+			        return ReadShaderGuestMemoryRaw(nullptr, address, words);
+		        },
+		        expanded, reason, wave_size)) {
+			static std::atomic<uint32_t> reports {0};
+			if (reports.fetch_add(1) < 16) {
+				::printf("Shader function expansion hash=%016" PRIx64 ": %s\n", params.hash,
+				         reason.c_str());
+			}
+		}
+	}
+
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
 	std::unordered_set<ProgramKey, ProgramKeyHash>              unsupported;
+	ShaderRecompiler::Decoder::ShaderFunctionExpander          function_expander;
 	ProgramKey                                                  lookup_key;
 	// Research: per shader hash, the user-data dwords holding its inlined call targets.
 	std::unordered_map<uint64_t, std::vector<uint32_t>>         call_targets;

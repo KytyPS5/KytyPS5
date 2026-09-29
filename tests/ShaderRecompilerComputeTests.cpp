@@ -36,6 +36,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/frontend/decode/ShaderFunctions.h"
 #include "graphics/shader/recompiler/Tessellation.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
@@ -1159,6 +1160,64 @@ void CheckLeastRecentlyUsedCacheOrdering() {
           visited == std::vector<uint32_t>{1, 3, 2},
           "touching a non-tail item left a cycle or changed LRU order");
   std::printf("[host]    %-32s ok\n", "LeastRecentlyUsedCache");
+}
+
+// The cached expander must return exactly what InlineShaderFunctions returns, while user data
+// the call does not depend on changes, the target changes, and the callee code changes.
+void CheckShaderFunctionExpansionCache() {
+  constexpr const char *name = "ShaderFunctionExpansionCache";
+  constexpr uint64_t callee_a = 0x10000000ull;
+  constexpr uint64_t callee_b = 0x10000100ull;
+  std::vector<u32> memory(0x200 / 4, 0xbf810000u);
+  const auto store = [&](uint64_t address, std::initializer_list<u32> words) {
+    std::copy(words.begin(), words.end(), memory.begin() + (address - callee_a) / 4);
+  };
+  // v_mov_b32 v0, 1; s_setpc_b64 s[4:5]
+  store(callee_a, {EncodeVop1(0x01u, 0, InlineU32(1)), EncodeSop1(0x20u, 0, 4)});
+  // v_mov_b32 v0, 2; v_mov_b32 v1, 3; s_setpc_b64 s[4:5]
+  store(callee_b, {EncodeVop1(0x01u, 0, InlineU32(2)), EncodeVop1(0x01u, 1, InlineU32(3)),
+                   EncodeSop1(0x20u, 0, 4)});
+  const ShaderRecompiler::Decoder::ShaderCodeReader read = [&](uint64_t address, std::span<uint32_t> words) {
+    if (address < callee_a || address + words.size() * 4 > callee_a + memory.size() * 4) {
+      return false;
+    }
+    std::copy_n(memory.begin() + (address - callee_a) / 4, words.size(), words.begin());
+    return true;
+  };
+  // s_swappc_b64 s[4:5], s[0:1]: the target comes from user data s0/s1.
+  std::vector<u32> code{EncodeSop1(0x21u, 4, 0)};
+  AppendEnd(&code);
+  const uint64_t base = reinterpret_cast<uint64_t>(code.data());
+
+  ShaderRecompiler::Decoder::ShaderFunctionExpander expander;
+  const auto check = [&](const char *step, std::array<u32, 3> user_data,
+                         bool expect_calls) {
+    std::vector<u32> reference;
+    std::vector<u32> cached;
+    std::string reference_reason;
+    std::string cached_reason;
+    const bool reference_ok = ShaderRecompiler::Decoder::InlineShaderFunctions(
+        code, base, user_data, read, reference, reference_reason, 64);
+    const bool cached_ok =
+        expander.Expand(code, base, user_data, read, cached, cached_reason, 64);
+    Require(name, step,
+            reference_ok && cached_ok && reference == cached &&
+                reference_reason == cached_reason && (reference.size() > 2) == expect_calls,
+            "the cached expansion differs from InlineShaderFunctions");
+    return cached;
+  };
+  const auto first = check("first expansion", {u32(callee_a), 0, 7}, true);
+  const auto unrelated = check("unrelated user data", {u32(callee_a), 0, 9}, true);
+  Require(name, "unrelated user data", first == unrelated,
+          "a register the call does not use changed the expansion");
+  const auto other = check("other target", {u32(callee_b), 0, 9}, true);
+  Require(name, "other target", other != first, "a new call target reused the old expansion");
+  store(callee_a, {EncodeVop1(0x01u, 0, InlineU32(4))});
+  const auto patched = check("patched callee", {u32(callee_a), 0, 7}, true);
+  Require(name, "patched callee", patched != first,
+          "changed callee code reused the old expansion");
+  check("target again", {u32(callee_b), 0, 7}, true);
+  std::printf("[host]    %-32s ok\n", name);
 }
 
 struct BdaMapping {
@@ -35763,6 +35822,7 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, ScalarMemRealtimeReadsDeviceClock());
     return 0;
   }
+  CheckShaderFunctionExpansionCache();
   if (argc == 2 && std::strcmp(argv[1], "--packed-integer-neg-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, Vop3pIntegerNegationCapturedAndSelectedHalves());

@@ -25376,7 +25376,13 @@ TestCase BufferStoreFormatXAddTidUsesLaneIndex() {
   test.expected = std::vector<u32>(64, 0);
   std::fill_n(test.expected.begin(), 32, 0x12345678u);
   test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_FORMAT_X, O::S_ENDPGM};
-  test.compute_info.threads_num[0] = 64;
+  // One 32-lane wave. A 64-thread workgroup is equally legal, but a driver may
+  // run it as a single 64-wide subgroup, which makes SubgroupLocalInvocationId
+  // the flat thread id; both waves would then write lanes 0..31 and the
+  // readback could not tell that apart from lane indexing. The
+  // required/forbidden SPIR-V assertions below are what actually pin the
+  // addressing to the subgroup lane rather than the workgroup thread id.
+  test.compute_info.threads_num[0] = 32;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
   test.compute_info.thread_ids_num = 0;

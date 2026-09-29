@@ -272,6 +272,23 @@ void CommandProcessor::BufferFlushAndWait() {
 	GetScheduler().FlushAndWait();
 }
 
+void CommandProcessor::SynchronizePredicate(uint64_t address, uint64_t size) {
+	auto&      buffers  = m_renderer.GetBufferCache();
+	auto&      textures = m_renderer.GetTextureCache();
+	const auto sync     = ClassifyPredicateSync(textures.IsRegionGpuModified(address, size),
+                                            textures.HasPendingDownload(address, size),
+                                            buffers.IsRegionGpuModified(address, size));
+	if (sync == PredicateSync::Drain) {
+		auto& scheduler = GetScheduler();
+		BufferFlushAndWait();
+		// The drain submits and completes every recorded tick; image write-backs are applied by
+		// the priority runner afterwards, so wait for the ones queued up to that tick.
+		scheduler.WaitPriorityOperations(scheduler.CurrentTick() - 1);
+	} else if (sync == PredicateSync::Download) {
+		buffers.ReadMemory(address, size, false);
+	}
+}
+
 void CommandProcessor::BufferWait() {
 	BufferInit();
 	GetScheduler().Finish();
@@ -849,10 +866,10 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 			}
 		} break;
 		case 0x03:
-			if (wait_op != 0) {
-				BufferFlushAndWait();
-			}
 			EXIT_NOT_IMPLEMENTED(address == nullptr);
+			if (wait_op != 0) {
+				SynchronizePredicate(reinterpret_cast<uint64_t>(address), sizeof(uint64_t));
+			}
 			value = *reinterpret_cast<const volatile uint64_t*>(address);
 			break;
 		default: EXIT("unknown predication op: 0x%08" PRIx32 "\n", op);

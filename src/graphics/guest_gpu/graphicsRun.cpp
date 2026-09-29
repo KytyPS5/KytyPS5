@@ -394,6 +394,45 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 	}
 }
 
+static bool DecodeDmaGds(uint8_t selector, bool& is_gds) {
+	switch (selector) {
+		case 0:
+		case 3: is_gds = false; return true;
+		case 1: is_gds = true; return true;
+		default: return false;
+	}
+}
+
+/// Writes a full-width 64-bit immediate with DMA_DATA destination semantics.
+///
+/// DMA_DATA's immediate source is a repeated 32-bit fill value, so the two halves have to be
+/// written one dword at a time. The complete eight-byte destination is validated once up front:
+/// validating each half separately would accept the low dword and only then reject the high one,
+/// leaving a half-written 64-bit value behind.
+void CommandProcessor::DmaDataImmediate64(uint8_t dst_sel, uint8_t dst_cache_policy,
+                                          uint64_t dst_address_or_offset, uint64_t immediate,
+                                          uint8_t write_confirm) {
+	EXIT_NOT_IMPLEMENTED(dst_cache_policy > 3);
+	EXIT_NOT_IMPLEMENTED(write_confirm > 1);
+	if (static_cast<uint32_t>(dst_address_or_offset) == 0x3022cu) {
+		return;
+	}
+	if (dst_sel == 2) {
+		// kNowhere discards the destination without a guest-visible write.
+		return;
+	}
+	bool dst_gds = false;
+	if (!DecodeDmaGds(dst_sel, dst_gds)) {
+		EXIT("unsupported dmaData destination selector 0x%02" PRIx8 "\n", dst_sel);
+	}
+	auto& buffer_cache = m_renderer.GetBufferCache();
+	buffer_cache.ValidateFillRange(dst_address_or_offset, sizeof(uint64_t), dst_gds);
+	buffer_cache.FillBuffer(dst_address_or_offset, sizeof(uint32_t),
+	                        static_cast<uint32_t>(immediate), dst_gds);
+	buffer_cache.FillBuffer(dst_address_or_offset + sizeof(uint32_t), sizeof(uint32_t),
+	                        static_cast<uint32_t>(immediate >> 32u), dst_gds);
+}
+
 void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cache_policy,
                                uint64_t dst_address_or_offset, uint8_t src_sel,
                                uint8_t  src_cache_policy,
@@ -412,14 +451,6 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 	if (static_cast<uint32_t>(dst_address_or_offset) == 0x3022cu) {
 		return;
 	}
-	auto decode_gds = [](uint8_t selector, bool& is_gds) {
-		switch (selector) {
-			case 0:
-			case 3: is_gds = false; return true;
-			case 1: is_gds = true; return true;
-			default: return false;
-		}
-	};
 	if (dst_sel == 2) {
 		// kNowhere discards the GL2 prefetch destination without a guest-visible write.
 		if (src_sel != 3) {
@@ -428,7 +459,7 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 		return;
 	}
 	bool dst_gds = false;
-	if (!decode_gds(dst_sel, dst_gds)) {
+	if (!DecodeDmaGds(dst_sel, dst_gds)) {
 		EXIT("unsupported dmaData destination selector 0x%02" PRIx8 "\n", dst_sel);
 	}
 	auto& buffer_cache = m_renderer.GetBufferCache();
@@ -439,7 +470,7 @@ void CommandProcessor::DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cach
 		return;
 	}
 	bool src_gds = false;
-	if (!decode_gds(src_sel, src_gds)) {
+	if (!DecodeDmaGds(src_sel, src_gds)) {
 		EXIT("unsupported dmaData source selector 0x%02" PRIx8 "\n", src_sel);
 	}
 	if (src_gds && dst_gds) {

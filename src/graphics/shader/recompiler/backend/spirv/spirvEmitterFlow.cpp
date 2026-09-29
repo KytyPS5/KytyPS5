@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
 #include "common/logging/log.h"
+#include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 
 #include <algorithm>
 #include <atomic>
@@ -686,8 +687,98 @@ uint32_t EmitReadFirstLane(ValueEmitContext& ctx, const IR::Inst& inst) {
 	return ctx.Shuffle(inst, 0, lane);
 }
 
+// The lanes' reduction, natively over the lanes the host subgroup has (IR::MatchLaneReduction).
+static uint32_t EmitLaneReduction(ValueEmitContext& ctx, const IR::LaneReduction& reduction) {
+	auto& state = ctx.state;
+	// A wave64 on a 32-wide subgroup keeps lanes 32-63 in the second half.
+	const auto host_lanes = state.lane_count == 2 ? 32u : state.program.wave_size;
+	auto&      lane = reduction.first_lane / host_lanes == ctx.half ? ctx : *ctx.other_half;
+	const auto subid = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), subid,
+	                          state.subgroup_local_invocation_id_variable);
+	const auto in_range =
+	    Binary(state, spv::OpULessThan, TypeBool(state),
+	           Binary(state, spv::OpISub, TypeU32(state), subid,
+	                  ConstantU32(state, reduction.first_lane % host_lanes)),
+	           ConstantU32(state, reduction.lanes));
+	const auto contribution =
+	    Select(state, TypeU32(state), in_range, lane.Def(reduction.source),
+	           ConstantU32(state, IR::ReductionIdentity(reduction.operation)));
+	spv::Op operation = spv::OpGroupNonUniformIAdd;
+	switch (reduction.operation) {
+		case IR::ValueOpcode::UMax32: operation = spv::OpGroupNonUniformUMax; break;
+		case IR::ValueOpcode::UMin32: operation = spv::OpGroupNonUniformUMin; break;
+		case IR::ValueOpcode::SMax32: operation = spv::OpGroupNonUniformSMax; break;
+		case IR::ValueOpcode::SMin32: operation = spv::OpGroupNonUniformSMin; break;
+		case IR::ValueOpcode::BitwiseOr32: operation = spv::OpGroupNonUniformBitwiseOr; break;
+		case IR::ValueOpcode::BitwiseAnd32: operation = spv::OpGroupNonUniformBitwiseAnd; break;
+		case IR::ValueOpcode::BitwiseXor32: operation = spv::OpGroupNonUniformBitwiseXor; break;
+		default: break;
+	}
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(operation, TypeU32(state), result,
+	                          ConstantU32(state, spv::ScopeSubgroup), spv::GroupOperationReduce,
+	                          contribution);
+	return result;
+}
+
+// Research: V_READLANE may name a lane the host has no invocation for (a pixel-shader warp with
+// uncovered quads), and OpGroupNonUniformShuffle then returns an undefined value. A wave
+// reduction (DPP row shifts, then V_READLANE of lanes 15 and 31) read garbage there, and the loop
+// it bounds never ended: a GPU hang in two pixel shaders. Such a lane reads the highest active
+// lane at or below it in its 16-lane row, which holds the row prefix those reductions compute, or
+// 0 when the row has no active lane.
 uint32_t EmitReadLane(ValueEmitContext& ctx, const IR::Inst& inst) {
-	return ctx.Shuffle(inst, 0, ctx.Arg(inst, 1));
+	if (const auto reduction = IR::MatchLaneReduction(inst, ctx.state.program.wave_size)) {
+		return EmitLaneReduction(ctx, *reduction);
+	}
+	auto&      state    = ctx.state;
+	const auto lane     = ctx.Arg(inst, 1);
+	const auto physical = ctx.other_half != nullptr
+	                          ? EmitBinaryU32(state, spv::OpBitwiseAnd, lane, ConstantU32(state, 31))
+	                          : lane;
+	const auto active   = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4), active,
+	                          ConstantU32(state, spv::ScopeSubgroup), ConstantBool(state, true));
+	auto word = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), word, active, 0);
+	if (ctx.other_half == nullptr && state.program.wave_size == 64u) {
+		const auto high    = state.builder.AllocateId();
+		const auto in_high = state.builder.AllocateId();
+		const auto chosen  = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), high, active, 1);
+		state.builder.AddFunction(spv::OpUGreaterThanEqual, TypeBool(state), in_high, physical,
+		                          ConstantU32(state, 32));
+		state.builder.AddFunction(spv::OpSelect, TypeU32(state), chosen, in_high, high, word);
+		word = chosen;
+	}
+	const auto bit      = EmitBinaryU32(state, spv::OpBitwiseAnd, physical, ConstantU32(state, 31));
+	const auto row_base = EmitBinaryU32(state, spv::OpBitwiseAnd, bit, ConstantU32(state, 16));
+	// Bits row_base..bit: (2 << bit) - 1 wraps to all ones for bit 31.
+	const auto up_to = EmitBinaryU32(
+	    state, spv::OpISub,
+	    EmitBinaryU32(state, spv::OpShiftLeftLogical, ConstantU32(state, 2), bit),
+	    ConstantU32(state, 1));
+	const auto below = EmitBinaryU32(
+	    state, spv::OpISub,
+	    EmitBinaryU32(state, spv::OpShiftLeftLogical, ConstantU32(state, 1), row_base),
+	    ConstantU32(state, 1));
+	const auto candidates = EmitBinaryU32(
+	    state, spv::OpBitwiseAnd, word,
+	    EmitBinaryU32(state, spv::OpBitwiseAnd, up_to,
+	                  EmitNative<spv::OpNot, IR::Type::U32>(state, below)));
+	const auto highest = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, TypeU32(state), highest, GlslStd450(state),
+	                          GLSLstd450FindUMsb, candidates);
+	const auto any = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpINotEqual, TypeBool(state), any, candidates,
+	                          ConstantU32(state, 0));
+	const auto source = EmitBinaryU32(
+	    state, spv::OpBitwiseOr,
+	    EmitBinaryU32(state, spv::OpBitwiseAnd, lane, ConstantU32(state, ~31u)),
+	    EmitNative<spv::OpSelect, IR::Type::U32>(state, any, highest, ConstantU32(state, 0)));
+	const auto value = ctx.Shuffle(inst, 0, source);
+	return EmitNative<spv::OpSelect, IR::Type::U32>(state, any, value, ConstantU32(state, 0));
 }
 
 uint32_t EmitWriteLane(ValueEmitContext& ctx, const IR::Inst& inst) {

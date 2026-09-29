@@ -4,6 +4,7 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
+#include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 
 #include <algorithm>
 #include <array>
@@ -353,6 +354,11 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 					requirements.subgroup_ballot  = true;
 					requirements.subgroup_shuffle = true;
 					if (inst.GetOpcode() == IR::ValueOpcode::DppMoveU32) {
+						requirements.subgroup_local_invocation_id = true;
+					}
+					if (inst.GetOpcode() == IR::ValueOpcode::ReadLane &&
+					    IR::MatchLaneReduction(inst, program.wave_size)) {
+						requirements.subgroup_arithmetic          = true;
 						requirements.subgroup_local_invocation_id = true;
 					}
 					break;

@@ -338,6 +338,19 @@ private:
 		std::array<Value, 8>       roots {};
 		std::array<uint32_t, 8>    memory {};
 		std::array<const Inst*, 8> reads {};
+		// A descriptor merged by phis: the heap reads behind them.
+		std::vector<uint32_t>      extra_memory;
+		std::vector<const Inst*>   extra_reads;
+	};
+
+	struct BindlessSamplerPlan {
+		Inst*                      handle = nullptr;
+		uint32_t                   source = 0;
+		Value                      key;
+		std::array<Value, 3>       table_roots {};
+		std::array<uint32_t, 4>    memory {};
+		std::array<const Inst*, 4> reads {};
+		std::array<bool, 4>        exclusive {};
 	};
 
 	void Fail(uint32_t pc, const std::string& reason) const {
@@ -1519,7 +1532,24 @@ private:
 			return false;
 		}
 		uint32_t bad_dword = 0;
+		m_gpu_records_handle = false;
 		if (!ValidateSource(descriptor, bad_dword)) {
+			m_last_bad_dword = bad_dword;
+			// Research: a buffer whose record count only the shader computes (from data it
+			// loads itself) binds from its host-known base to the end of its mapping; every
+			// access also applies the hardware range check with the shader's own V# words
+			// (MemoryInfo::gpu_records), so out-of-range accesses drop as they do there.
+			if (expected == ValueOpcode::GetBufferResource && width == 4u && bad_dword == 2u &&
+			    m_program.bindless_images) {
+				auto relaxed         = descriptor;
+				relaxed.dwords[2]    = Value(0xffffffffu);
+				uint32_t relaxed_bad = 0;
+				if (ValidateSource(relaxed, relaxed_bad)) {
+					m_gpu_records_handle = true;
+					source               = InternSource(relaxed);
+					return true;
+				}
+			}
 			if (expected == ValueOpcode::GetBufferResource &&
 			    std::all_of(descriptor.dwords.begin(), descriptor.dwords.begin() + width,
 			                [](Value word) { return word.Resolve().GetType() == Type::U32; })) {
@@ -1710,10 +1740,18 @@ private:
 				if (m_failed) {
 					return;
 				}
-				if (memory.kind != ResourceKind::Buffer || !memory.SupportsIndirectBufferLoad(op)) {
+				const bool scalar_read =
+				    memory.kind == ResourceKind::ScalarBuffer && op == ValueOpcode::ReadConstBuffer;
+				const bool vector_read =
+				    memory.kind == ResourceKind::Buffer &&
+				    (op == ValueOpcode::LoadBufferU32 || op == ValueOpcode::LoadBufferU32x2 ||
+				     op == ValueOpcode::LoadBufferU32x3 || op == ValueOpcode::LoadBufferU32x4);
+				if ((!scalar_read && !vector_read) ||
+				    (scalar_read && (memory.formatted || memory.typed))) {
 					Fail(flags.pc,
-					     "buffer descriptor is not a valid runtime value; GPU-selected access "
-					     "requires a raw DWORD x2/x3/x4 load");
+					     fmt::format("buffer descriptor dword {} is not a valid runtime value; "
+					                 "GPU-selected access requires a scalar or vector DWORD load",
+					                 m_last_bad_dword));
 					return;
 				}
 				m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
@@ -1724,6 +1762,10 @@ private:
 			if (resource == UINT32_MAX) {
 				Fail(flags.pc, "buffer resource limit exceeded");
 				return;
+			}
+			if (m_gpu_records_handle) {
+				m_program.memory_info[flags.index].gpu_records = true;
+				m_info.buffers[resource].gpu_records            = true;
 			}
 			AddHandlePatch(handle, resource, flags.pc);
 			AddMemoryPatch(flags.index, resource, 0, false, flags.pc);
@@ -1844,6 +1886,16 @@ private:
 	std::vector<HandlePatch>                   m_handle_patches;
 	std::vector<MemoryPatch>                   m_memory_patches;
 	std::vector<IndirectImagePlan>             m_indirect_images;
+	// Bindless table reads the shader also uses as values: they stay real buffer reads.
+	std::vector<uint32_t>                      m_live_table_memory;
+	std::vector<BindlessSamplerPlan>           m_bindless_samplers;
+	std::map<const Inst*, int>                 m_indirect_rejects;
+	// Key phis built by PlanPhiTableRead, and their free (key 0) operands.
+	std::vector<const Inst*>                   m_key_phis;
+	std::vector<std::pair<const Inst*, size_t>> m_free_phi_keys;
+	uint32_t                                   m_last_bad_dword = 0;
+	bool                                       m_gpu_records_handle = false;
+	std::vector<const Inst*>                   m_default_sampler_reads;
 	std::vector<std::pair<const Inst*, Value>> m_descriptor_selections;
 	bool                                       m_shader_writes = false;
 };

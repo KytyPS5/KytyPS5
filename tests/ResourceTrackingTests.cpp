@@ -2318,12 +2318,13 @@ void TestPhiValidation() {
                {handle, Value(0u), Value(0u), Value(0u), Value(true)},
                fixture.AddMemory(memory, 20), merge);
 
-  CheckFatal([&] { fixture.PlanAndTrack(); }, "not a valid runtime value",
-             "control-dependent descriptor phi was accepted");
-  Check(!fixture.program.resource_tracking_complete &&
+  // The descriptor is not a runtime value on the CPU, so the DWORD read selects its buffer
+  // on the GPU instead of binding one on the host.
+  fixture.PlanAndTrack();
+  Check(fixture.program.resource_tracking_complete && fixture.program.info.uses_dma &&
             fixture.program.info.buffers.empty() &&
-            fixture.program.descriptor_sources.empty(),
-        "control-dependent descriptor phi was not rejected transactionally");
+            fixture.program.memory_info.back().kind == ResourceKind::IndirectBuffer,
+        "control-dependent descriptor phi did not become a GPU-selected buffer read");
 }
 
 ResourcePlan ConditionalSamplerPlan(bool diamond, bool reverse, bool reverse_phi,

@@ -837,7 +837,12 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 	for (const auto resource: resources) {
 		auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[resource]);
 		const auto address = descriptor.Base48();
-		const auto requested_size = descriptor.GetSize();
+		// Research: a record count only the shader knows binds a capped range; the shader
+		// applies the real bound itself.
+		constexpr uint64_t GpuRecordsBinding = 64ull << 20u;
+		const auto requested_size = program.info.buffers[resource].gpu_records
+		                                ? std::min(descriptor.GetSize(), GpuRecordsBinding)
+		                                : descriptor.GetSize();
 		if (address < BufferCache::CACHING_PAGESIZE || requested_size == 0) {
 			prepared.buffer_sources.push_back({});
 			continue;

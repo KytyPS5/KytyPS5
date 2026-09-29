@@ -267,7 +267,10 @@ void DecodeScalarSource(uint32_t code, uint32_t pc, Operand& operand) {
 		case 252u: operand.kind = OperandKind::ExecZ; return;
 		case 253u: operand.kind = OperandKind::Scc; return;
 		case 255u: operand.kind = OperandKind::LiteralConstant; return;
-		default: EXIT("unsupported scalar source operand 0x%08x at pc 0x%08x", code, pc);
+		default:
+			operand.kind  = OperandKind::Unsupported;
+			operand.value = code;
+			return;
 	}
 }
 
@@ -287,7 +290,10 @@ void DecodeScalarDestination(uint32_t code, uint32_t pc, Operand& operand) {
 		case 125u: operand.kind = OperandKind::Null; return;
 		case 126u: operand.kind = OperandKind::ExecLo; return;
 		case 127u: operand.kind = OperandKind::ExecHi; return;
-		default: EXIT("unsupported scalar destination operand 0x%08x at pc 0x%08x", code, pc);
+		default:
+			operand.kind  = OperandKind::Unsupported;
+			operand.value = code;
+			return;
 	}
 }
 
@@ -362,26 +368,36 @@ Family GetInstructionFamily(uint32_t word) {
 void DecodeInstruction(std::span<const uint32_t> code, uint32_t word_index, Instruction& inst) {
 	const uint32_t pc = word_index * sizeof(uint32_t);
 	switch (GetInstructionFamily(code[word_index])) {
-		case Family::SOP1: DecodeSop1(pc, code, word_index, inst); return;
-		case Family::SOP2: DecodeSop2(pc, code, word_index, inst); return;
-		case Family::SOPK: DecodeSopk(pc, code, word_index, inst); return;
-		case Family::SOPC: DecodeSopc(pc, code, word_index, inst); return;
-		case Family::SOPP: DecodeSopp(pc, code, word_index, inst); return;
-		case Family::VOP1: DecodeVop1(pc, code, word_index, inst); return;
-		case Family::VOP2: DecodeVop2(pc, code, word_index, inst); return;
-		case Family::VOP3: DecodeVop3(pc, code, word_index, inst); return;
-		case Family::VOP3P: DecodeVop3p(pc, code, word_index, inst); return;
-		case Family::VOPC: DecodeVopc(pc, code, word_index, inst); return;
-		case Family::VINTRP: DecodeVintrp(pc, code, word_index, inst); return;
-		case Family::SMEM: DecodeSmem(pc, code, word_index, inst); return;
-		case Family::MUBUF: DecodeMubuf(pc, code, word_index, inst); return;
-		case Family::MTBUF: DecodeMtbuf(pc, code, word_index, inst); return;
-		case Family::FLAT: DecodeFlat(pc, code, word_index, inst); return;
-		case Family::DS: DecodeDs(pc, code, word_index, inst); return;
-		case Family::MIMG: DecodeMimg(pc, code, word_index, inst); return;
-		case Family::EXP: DecodeExp(pc, code, word_index, inst); return;
+		case Family::SOP1: DecodeSop1(pc, code, word_index, inst); break;
+		case Family::SOP2: DecodeSop2(pc, code, word_index, inst); break;
+		case Family::SOPK: DecodeSopk(pc, code, word_index, inst); break;
+		case Family::SOPC: DecodeSopc(pc, code, word_index, inst); break;
+		case Family::SOPP: DecodeSopp(pc, code, word_index, inst); break;
+		case Family::VOP1: DecodeVop1(pc, code, word_index, inst); break;
+		case Family::VOP2: DecodeVop2(pc, code, word_index, inst); break;
+		case Family::VOP3: DecodeVop3(pc, code, word_index, inst); break;
+		case Family::VOP3P: DecodeVop3p(pc, code, word_index, inst); break;
+		case Family::VOPC: DecodeVopc(pc, code, word_index, inst); break;
+		case Family::VINTRP: DecodeVintrp(pc, code, word_index, inst); break;
+		case Family::SMEM: DecodeSmem(pc, code, word_index, inst); break;
+		case Family::MUBUF: DecodeMubuf(pc, code, word_index, inst); break;
+		case Family::MTBUF: DecodeMtbuf(pc, code, word_index, inst); break;
+		case Family::FLAT: DecodeFlat(pc, code, word_index, inst); break;
+		case Family::DS: DecodeDs(pc, code, word_index, inst); break;
+		case Family::MIMG: DecodeMimg(pc, code, word_index, inst); break;
+		case Family::EXP: DecodeExp(pc, code, word_index, inst); break;
 		default:
 			EXIT("unknown RDNA2 instruction family at pc 0x%08x, raw=0x%08x", pc, code[word_index]);
+	}
+	if (inst.opcode == Opcode::UNSUPPORTED) {
+		return;
+	}
+	for (const Operand* operand:
+	     {&inst.dst, &inst.dst2, &inst.src0, &inst.src1, &inst.src2, &inst.src3}) {
+		if (operand->kind == OperandKind::Unsupported) {
+			SetUnsupported(inst, inst.family, inst.opcode_id, "scalar operand is not implemented");
+			return;
+		}
 	}
 }
 

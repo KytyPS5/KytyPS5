@@ -62,12 +62,7 @@ void ValidateNativeProgram(const IR::Program& program) {
 		Expect(Kind::BdaPagetable);
 		Expect(Kind::FaultBuffer);
 	}
-	const bool uses_flattened_runtime =
-	    !program.srt_reads.empty() ||
-	     std::ranges::any_of(program.info.images, [](const IR::ImageResource& image) {
-		     return image.indirect_search_iterations != 0u;
-	     });
-	if (uses_flattened_runtime) {
+	if (IR::UsesFlattenedSrt(program)) {
 		Expect(Kind::FlattenedSrt);
 	}
 	if (program.bindings.ShaderDataDwords() != 0 && !program.bindings.UsesPushData()) {
@@ -233,6 +228,12 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 				const auto kind = program.memory_info[index].kind;
 				if (kind != IR::ResourceKind::Lds && kind != IR::ResourceKind::Gds) {
 					Fail(program, "shared operation has invalid resource kind");
+				}
+				if (inst.GetOpcode() == IR::ValueOpcode::SharedAtomicOr64) {
+					if (kind != IR::ResourceKind::Lds || program.stage != ShaderType::Compute) {
+						Fail(program, "64-bit shared atomics require compute LDS");
+					}
+					requirements.shared_int64_atomics = true;
 				}
 				if (program.stage != ShaderType::Compute && program.stage != ShaderType::Mesh &&
 				    kind == IR::ResourceKind::Lds) {

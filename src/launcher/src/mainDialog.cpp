@@ -3,6 +3,7 @@
 #include "configuration.h"
 #include "configurationItem.h"
 #include "configurationListWidget.h"
+#include "gameContent.h"
 #include "patchesDialog.h"
 #include "updateChecker.h"
 
@@ -260,7 +261,7 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	}
 
 	QString game = info.basedir;
-	if (!info.elf.isEmpty()) {
+	if (!info.elf.isEmpty() && !GameContent::IsArchive(info.basedir)) {
 		game = QDir(info.basedir).filePath(info.elf);
 	}
 	args << "--game" << game;
@@ -507,7 +508,7 @@ void MainDialogPrivate::Update() {
 	if (run_enabled) {
 		const auto& info = item->GetInfo();
 		auto        dir  = info.basedir;
-		run_enabled      = !dir.isEmpty() && QDir(dir).exists();
+		run_enabled      = !dir.isEmpty() && (QDir(dir).exists() || GameContent::IsArchive(dir));
 	}
 
 	m_ui->widget->SetRunEnabled(run_enabled);

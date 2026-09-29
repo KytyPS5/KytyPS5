@@ -235,6 +235,7 @@ Decoder::Operand MemorySourceAt(const Decoder::Instruction& decoded, uint32_t in
 				return index == 0u ? decoded.src0 : MakeImmediate(decoded.offset & 0xffffu);
 			case Decoder::Opcode::DS_CONSUME:
 			case Decoder::Opcode::DS_APPEND:
+				return decoded.gds ? MakeM0Operand() : MakeImmediate(0);
 			case Decoder::Opcode::DS_READ_ADDTID_B32: return MakeM0Operand();
 			case Decoder::Opcode::DS_WRITE_ADDTID_B32:
 				return index == 0u ? decoded.src1 : MakeM0Operand();
@@ -569,7 +570,10 @@ void Translator::DS_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode opc
                            bool returns_value) {
 	const auto memory  = MemoryInfoFromDecoded(inst);
 	const auto address = ReadU32(MemorySourceAt(inst, 1));
-	const auto result  = ir.Emit(opcode, {address, ReadU32(MemorySourceAt(inst, 0)), ir.GetExec()},
+	const auto data_src = MemorySourceAt(inst, 0);
+	const IR::Value value =
+	    memory.data_dwords == 2u ? IR::Value(ReadU64(data_src)) : IR::Value(ReadU32(data_src));
+	const auto result  = ir.Emit(opcode, {address, value, ir.GetExec()},
 	                             AddMemoryInfo(memory, inst.pc));
 	if (returns_value) {
 		WriteOperand(inst.dst, result);
@@ -845,8 +849,7 @@ void Translator::DS_MINMAX_F32(const Decoder::Instruction& inst, IR::ValueOpcode
 void Translator::DS_APPEND_CONSUME(const Decoder::Instruction& inst, IR::ValueOpcode opcode) {
 	const auto memory = MemoryInfoFromDecoded(inst);
 	WriteOperand(inst.dst, ir.Emit(opcode,
-	                               {ReadU32(MemorySourceAt(inst, 0)), ir.GetExec(), ir.GetExecLo(),
-	                                ir.GetExecHi()},
+	                               {ReadU32(MemorySourceAt(inst, 0)), ir.GetExec()},
 	                               AddMemoryInfo(memory, inst.pc)));
 }
 
@@ -1003,6 +1006,8 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicAnd32, true);
 		case Decoder::Opcode::DS_OR_B32:
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicOr32, false);
+		case Decoder::Opcode::DS_OR_B64:
+			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicOr64, false);
 		case Decoder::Opcode::DS_OR_RTN_B32:
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicOr32, true);
 		case Decoder::Opcode::DS_XOR_B32:

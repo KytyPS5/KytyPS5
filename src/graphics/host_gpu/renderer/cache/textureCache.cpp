@@ -222,14 +222,6 @@ TextureCache::BindingType TextureCache::UploadBinding(const Image& image) {
 	return image.usage.storage ? BindingType::Storage : BindingType::Texture;
 }
 
-bool TextureCache::SafeToDownload(const Image& image) {
-	if (!image.SafeToDownload()) {
-		return false;
-	}
-	const auto range = image.info.data;
-	return !m_buffer_cache.HasGpuDirtyBytes(range.address, range.size);
-}
-
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
 	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
 	if (!info.data.Empty()) {
@@ -1370,7 +1362,7 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 		if (ensure_valid && owner->depth_id) {
 			owner = m_slot_images.try_get(owner->depth_id);
 		}
-		if (owner == nullptr || (ensure_valid && !SafeToDownload(*owner))) {
+		if (owner == nullptr || (ensure_valid && !owner->SafeToDownload())) {
 			continue;
 		}
 		matches.push_back(id);
@@ -1770,7 +1762,7 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	std::scoped_lock lock {m_texture_cache.m_lock};
 	auto& image = m_texture_cache.m_slot_images[selected];
 	// The GPU thread owns image retirement; CPU invalidation can dirty this image after lookup.
-	if (!m_texture_cache.SafeToDownload(image)) {
+	if (!image.SafeToDownload()) {
 		return false;
 	}
 	if (!buffer.IsInBounds(image.info.data.address, 1)) {
@@ -1836,7 +1828,7 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 		return false;
 	}
 	auto transfer = BuildDownload(image);
-	if (!transfer.valid || !SafeToDownload(image)) {
+	if (!transfer.valid || !image.SafeToDownload()) {
 		return false;
 	}
 	const auto range    = image.info.data;
@@ -1897,7 +1889,10 @@ bool TextureCache::IsRegionGpuModified(uint64_t address, uint64_t size) {
 	std::scoped_lock lock {m_lock};
 	for (const auto id: FindImagesInRegion(address, size, false)) {
 		const auto& image = m_slot_images[id];
-		if (!image.depth_id && image.IsGpuModified()) {
+		// PPSA17168: S_LOAD_DWORD reads shader data at an address overlapping an old
+		// render target whose memory the CPU has reused. The cached image still retains
+		// its earlier GPU-modified flag.
+		if (!image.depth_id && image.IsGpuModified() && !image.IsDefinitelyCpuDirty()) {
 			return true;
 		}
 	}
@@ -2023,7 +2018,7 @@ void TextureCache::RunGarbageCollector() {
 				continue;
 			}
 			if (owner->IsGpuModified()) {
-				const bool safe = SafeToDownload(*owner);
+				const bool safe = owner->SafeToDownload();
 				if (safe && owner->info.IsTiled()) {
 					continue;
 				}

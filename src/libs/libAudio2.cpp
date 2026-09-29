@@ -167,7 +167,7 @@ struct AudioOut2MasteringStatesV2 {
 
 static std::atomic_uint64_t g_audioout2_next_context {1};
 static std::atomic_uint64_t g_audioout2_next_port {1};
-static std::atomic_uint64_t g_audioout2_next_user {1};
+static AudioOut2UserHandle g_audioout2_next_user = 1;
 
 struct AudioOut2ContextState {
 	bool                   used        = false;
@@ -182,6 +182,7 @@ struct AudioOut2PortStateEntry {
 	bool                   used          = false;
 	AudioOut2PortHandle    handle        = 0;
 	AudioOut2ContextHandle context       = 0;
+	AudioOut2UserHandle    user          = 0;
 	uint16_t               port_type     = 0;
 	uint32_t               data_format   = 0;
 	uint32_t               sampling_freq = 48000;
@@ -210,6 +211,7 @@ static Common::Mutex                              g_audioout2_context_mutex;
 static std::array<AudioOut2ContextState, 16>      g_audioout2_contexts;
 static Common::Mutex                              g_audioout2_port_mutex;
 static std::array<AudioOut2PortStateEntry, 256>   g_audioout2_ports;
+static std::vector<AudioOut2UserHandle>          g_audioout2_users;
 static Common::Mutex                              g_audioout2_speaker_array_mutex;
 static std::array<AudioOut2SpeakerArrayState, 32> g_audioout2_speaker_arrays;
 static Common::Mutex                              g_audioout2_latency_mutex;
@@ -218,6 +220,7 @@ static std::array<AudioOut2LatencyState, 16>      g_audioout2_latencies;
 static constexpr int AUDIO_OUT2_ERROR_NOT_READY                   = -2144960504; /* 0x80268008 */
 static constexpr int AUDIO_OUT2_ERROR_PORT_FULL                   = -2144960494; /* 0x80268012 */
 static constexpr int AUDIO_OUT2_ERROR_INVALID_PARAM               = -2144960511; /* 0x80268001 */
+static constexpr int AUDIO_OUT2_ERROR_BUSY                        = -2144960505; /* 0x80268007 */
 static constexpr int AUDIO_OUT2_ERROR_MASTERING_INVALID_API_PARAM = -2144959999; /* 0x80268201 */
 static constexpr int AUDIO_OUT2_ERROR_MASTERING_INVALID_STATES_ID = -2144959996; /* 0x80268204 */
 static constexpr uint32_t AUDIO_OUT2_PORT_ATTRIBUTE_ID_PCM        = 0;
@@ -589,6 +592,12 @@ int KYTY_SYSV_ABI AudioOut2PortCreate(AudioOut2ContextHandle ctx, const AudioOut
 	const auto samples_num = context_state->num_grains == 0 ? 512u : context_state->num_grains;
 
 	g_audioout2_port_mutex.Lock();
+	if (std::find(g_audioout2_users.begin(), g_audioout2_users.end(), params->user_handle) ==
+	    g_audioout2_users.end()) {
+		g_audioout2_port_mutex.Unlock();
+		g_audioout2_context_mutex.Unlock();
+		return AUDIO_OUT2_ERROR_INVALID_PARAM;
+	}
 	AudioOut2PortStateEntry* port_state = nullptr;
 	for (auto& candidate: g_audioout2_ports) {
 		if (!candidate.used) {
@@ -601,6 +610,7 @@ int KYTY_SYSV_ABI AudioOut2PortCreate(AudioOut2ContextHandle ctx, const AudioOut
 		port_state->used          = true;
 		port_state->handle        = next_port;
 		port_state->context       = ctx;
+		port_state->user          = params->user_handle;
 		port_state->port_type     = params->port_type;
 		port_state->data_format   = params->data_format;
 		port_state->sampling_freq = params->sampling_freq;
@@ -730,9 +740,12 @@ int KYTY_SYSV_ABI AudioOut2GetSystemState(AudioOut2SystemState* state) {
 
 int KYTY_SYSV_ABI AudioOut2UserCreate(uint32_t user_id, AudioOut2UserHandle* handle) {
 	PRINT_NAME();
-	EXIT_NOT_IMPLEMENTED(handle == nullptr);
-	*handle = static_cast<AudioOut2UserHandle>(
-	    g_audioout2_next_user.fetch_add(1, std::memory_order_relaxed));
+	if (handle == nullptr) {
+		return AUDIO_OUT2_ERROR_INVALID_PARAM;
+	}
+	Common::LockGuard lock(g_audioout2_port_mutex);
+	*handle = g_audioout2_next_user++;
+	g_audioout2_users.push_back(*handle);
 	LOGF("\t user_id = %" PRIu32 ", handle = 0x%016" PRIx64 "\n", user_id,
 	     static_cast<uint64_t>(*handle));
 	return OK;
@@ -741,6 +754,32 @@ int KYTY_SYSV_ABI AudioOut2UserCreate(uint32_t user_id, AudioOut2UserHandle* han
 int KYTY_SYSV_ABI AudioOut2UserDestroy(AudioOut2UserHandle handle) {
 	PRINT_NAME();
 	LOGF("\t handle = 0x%016" PRIx64 "\n", static_cast<uint64_t>(handle));
+	Common::LockGuard lock(g_audioout2_port_mutex);
+	const auto it = std::find(g_audioout2_users.begin(), g_audioout2_users.end(), handle);
+	if (it == g_audioout2_users.end()) {
+		return AUDIO_OUT2_ERROR_INVALID_PARAM;
+	}
+	if (std::any_of(g_audioout2_ports.begin(), g_audioout2_ports.end(),
+	                [handle](const auto& port) { return port.used && port.user == handle; })) {
+		return AUDIO_OUT2_ERROR_BUSY;
+	}
+	g_audioout2_users.erase(it);
+	return OK;
+}
+
+int KYTY_SYSV_ABI AudioOut2UserGetSupportedAttributes(AudioOut2UserHandle handle,
+                                                       uint32_t* context_attributes,
+                                                       uint32_t* port_attributes) {
+	if (context_attributes == nullptr || port_attributes == nullptr) {
+		return AUDIO_OUT2_ERROR_INVALID_PARAM;
+	}
+	Common::LockGuard lock(g_audioout2_port_mutex);
+	if (std::find(g_audioout2_users.begin(), g_audioout2_users.end(), handle) ==
+	    g_audioout2_users.end()) {
+		return AUDIO_OUT2_ERROR_INVALID_PARAM;
+	}
+	*context_attributes = 0;
+	*port_attributes    = 1u << AUDIO_OUT2_PORT_ATTRIBUTE_ID_PCM;
 	return OK;
 }
 

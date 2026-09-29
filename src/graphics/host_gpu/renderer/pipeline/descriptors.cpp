@@ -91,19 +91,6 @@ vk::DescriptorImageInfo MakeImageInfo(const TextureBinding& texture, uint32_t el
 	return {nullptr, view, texture.layout};
 }
 
-static const char* ShaderStageResourceName(ShaderType stage) {
-	switch (stage) {
-		case ShaderType::Vertex: return "Vertex";
-		case ShaderType::Mesh: return "Mesh";
-		case ShaderType::Local: return "Local";
-		case ShaderType::TessellationControl: return "Hull";
-		case ShaderType::TessellationEvaluation: return "Domain";
-		case ShaderType::Pixel: return "Pixel";
-		case ShaderType::Compute: return "Compute";
-		default: return "Unknown";
-	}
-}
-
 static Prospero::ImageType TextureType(const ShaderTextureResource& descriptor) {
 	const auto type = descriptor.Type();
 	return type == Prospero::ImageType::kCube ? Prospero::ImageType::kColor2DArray : type;
@@ -126,8 +113,7 @@ static bool IsMultisampledTexture(Prospero::ImageType type) {
 
 static vk::DescriptorBufferInfo
 NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource& source,
-                    const ShaderRecompiler::IR::BufferResource& resource, ShaderType stage,
-                    uint32_t slot, uint32_t& buffer_offset) {
+                    const ShaderRecompiler::IR::BufferResource& resource, uint32_t& buffer_offset) {
 	buffer_offset = 0;
 
 	const auto& [address, size, id] = source;
@@ -152,16 +138,6 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	if (resource.written) {
 		context.GetTextureCache().InvalidateMemoryFromGPU(address, size);
 	}
-	const char* access = "Read";
-	if (resource.written && resource.read) {
-		access = "ReadWrite";
-	} else if (resource.written) {
-		access = "Write";
-	}
-	SetVulkanObjectNameF(
-	    graphics.device, result.buffer,
-	    "Kyty.{}.StorageBuffer[slot={} guest=0x{:016x} size=0x{:x} access={} formatted={}]",
-	    ShaderStageResourceName(stage), slot, address, size, access, resource.formatted);
 	return result;
 }
 
@@ -196,8 +172,8 @@ bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor, bo
 	constexpr uint32_t htile_control = 0x00280000u;
 	const uint32_t expected_control  = htile_control | (descriptor.MsaaDepth() ? (1u << 10u) : 0u);
 	const auto     metadata_addr     = descriptor.MetaAddr() << 8u;
-	return metadata_control == expected_control && metadata_addr != 0 &&
-	       metadata_addr < TRACKER_ADDRESS_SIZE && (metadata_addr & 0x7fffu) == 0 &&
+	return metadata_control == expected_control && GuestRange {metadata_addr, 1}.Valid() &&
+	       (metadata_addr & 0x7fffu) == 0 &&
 	       descriptor.TileMode() == Prospero::TileMode::kDepth;
 }
 
@@ -738,14 +714,15 @@ static vk::Sampler NativeSampler(RenderContext&                       context,
                                  const ShaderRecompiler::IR::CompiledShaderInfo& program,
                                  uint32_t index,
                                  const ShaderRecompiler::IR::DescriptorValue& value) {
-	auto descriptor = DecodeNativeDescriptor<ShaderSamplerResource>(value);
-	if (!program.info.samplers[index].depth_compare) {
+	auto        descriptor = DecodeNativeDescriptor<ShaderSamplerResource>(value);
+	const auto& sampler = program.info.samplers[index];
+	if (!sampler.depth_compare) {
 		descriptor.fields[0] &= ~(0x7u << 12u);
 	}
-	if (program.info.samplers[index].force_point_filtering) {
+	if (sampler.force_point_filtering) {
 		descriptor.SetPointFiltering();
 	}
-	return context.GetSamplerCache().GetSampler(descriptor);
+	return context.GetSamplerCache().GetSampler(descriptor, sampler.integer_border);
 }
 
 static vk::DescriptorBufferInfo NativeUpload(RenderContext&            context,
@@ -873,7 +850,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		uint32_t buffer_offset = 0;
 		prepared.buffers.push_back(NativeStorageBuffer(m_context, prepared.buffer_sources[i],
 		                                               program.info.buffers[resource],
-		                                               program.stage, resource, buffer_offset));
+		                                               buffer_offset));
 		pack_memory_offset(i, buffer_offset);
 	}
 	if (ShaderRecompiler::IR::FindBinding(

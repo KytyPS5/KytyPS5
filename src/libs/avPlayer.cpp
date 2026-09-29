@@ -1,6 +1,6 @@
 #include "common/common.h"
+#include "common/file.h"
 #include "common/logging/log.h"
-#include "common/stringUtils.h"
 #include "kernel/fileSystem.h"
 #include "kernel/pthread.h"
 #include "libs/audio.h"
@@ -9,12 +9,14 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cerrno>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <limits>
 #include <magic_enum.hpp>
 #include <memory>
 #include <mutex>
@@ -577,30 +579,40 @@ public:
 	explicit FileStreamer(AvPlayerFileReplacement f): file(f) {}
 	~FileStreamer() {
 		if (ctx != nullptr) {
+			av_freep(&ctx->buffer);
 			avio_context_free(&ctx);
 		}
-		if (opened && file.close != nullptr) {
+		if (opened) {
 			file.close(file.object_pointer);
 		}
 	}
 	bool Init(const std::string& path) {
-		if (file.open == nullptr || file.close == nullptr || file.read_offset == nullptr ||
-		    file.size == nullptr) {
+		if (file.open != nullptr) {
+			if (file.close == nullptr || file.read_offset == nullptr || file.size == nullptr ||
+			    file.open(file.object_pointer, path.c_str()) < 0) {
+				return false;
+			}
+			opened = true;
+			size   = file.size(file.object_pointer);
+		} else {
+			if (!local_file.Open(LibKernel::FileSystem::GetRealFilename(path),
+			                     Common::File::Mode::Read)) {
+				return false;
+			}
+			size = local_file.Size();
+		}
+		if (size == 0 || size > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
 			return false;
 		}
-		if (file.open(file.object_pointer, path.c_str()) < 0) {
-			return false;
-		}
-		opened = true;
-		size   = file.size(file.object_pointer);
-		if (size == 0) {
-			return false;
-		}
-		auto* buf = static_cast<uint8_t*>(av_malloc(4096));
+		constexpr int buffer_size = 64 * 1024;
+		auto*         buf         = static_cast<uint8_t*>(av_malloc(buffer_size));
 		if (buf == nullptr) {
 			return false;
 		}
-		ctx = avio_alloc_context(buf, 4096, 0, this, Read, nullptr, Seek);
+		ctx = avio_alloc_context(buf, buffer_size, 0, this, Read, nullptr, Seek);
+		if (ctx == nullptr) {
+			av_free(buf);
+		}
 		return ctx != nullptr;
 	}
 	AVIOContext* Context() const { return ctx; }
@@ -611,33 +623,50 @@ private:
 		if (s->pos >= s->size) {
 			return AVERROR_EOF;
 		}
-		len = static_cast<int>(std::min<uint64_t>(len, s->size - s->pos));
-		auto r =
-		    s->file.read_offset(s->file.object_pointer, buf, s->pos, static_cast<uint32_t>(len));
-		if (r <= 0) {
-			return r == 0 ? AVERROR_EOF : r;
+		len      = static_cast<int>(std::min<uint64_t>(len, s->size - s->pos));
+		int read = 0;
+		if (s->opened) {
+			read = s->file.read_offset(s->file.object_pointer, buf, s->pos,
+			                           static_cast<uint32_t>(len));
+		} else {
+			uint32_t bytes = 0;
+			s->local_file.Read(buf, static_cast<uint32_t>(len), &bytes);
+			read = static_cast<int>(bytes);
 		}
-		s->pos += static_cast<uint64_t>(r);
-		return r;
+		if (read <= 0 || read > len) {
+			return read < 0 ? read : AVERROR(EIO);
+		}
+		s->pos += static_cast<uint64_t>(read);
+		return read;
 	}
-	static int64_t Seek(void* opaque, int64_t off, int whence) {
+	static int64_t Seek(void* opaque, int64_t offset, int whence) {
 		auto* s = static_cast<FileStreamer*>(opaque);
 		if ((whence & AVSEEK_SIZE) != 0) {
 			return static_cast<int64_t>(s->size);
 		}
-		int64_t p = whence == SEEK_SET
-		                ? off
-		                : (whence == SEEK_CUR
-		                       ? static_cast<int64_t>(s->pos) + off
-		                       : (whence == SEEK_END ? static_cast<int64_t>(s->size) + off : -1));
-		if (p < 0) {
-			return -1;
+		whence &= ~AVSEEK_FORCE;
+		uint64_t base = 0;
+		switch (whence) {
+			case SEEK_SET: break;
+			case SEEK_CUR: base = s->pos; break;
+			case SEEK_END: base = s->size; break;
+			default: return AVERROR(EINVAL);
 		}
-		p      = std::min<int64_t>(p, static_cast<int64_t>(s->size));
-		s->pos = static_cast<uint64_t>(p);
-		return p;
+		const auto distance = offset < 0 ? uint64_t {0} - static_cast<uint64_t>(offset)
+		                                 : static_cast<uint64_t>(offset);
+		if ((offset < 0 && distance > base) ||
+		    (offset >= 0 && distance > std::numeric_limits<int64_t>::max() - base)) {
+			return AVERROR(EINVAL);
+		}
+		const auto position = offset < 0 ? base - distance : base + distance;
+		if (!s->opened && !s->local_file.Seek(position)) {
+			return AVERROR(EIO);
+		}
+		s->pos = position;
+		return static_cast<int64_t>(position);
 	}
 	AvPlayerFileReplacement file;
+	Common::File            local_file;
 	bool                    opened = false;
 	uint64_t                pos    = 0;
 	uint64_t                size   = 0;
@@ -675,25 +704,17 @@ public:
 			return static_cast<Source*>(opaque)->interrupt_io.load() ? 1 : 0;
 		};
 		raw->interrupt_callback.opaque = this;
-		if (file.open != nullptr) {
-			streamer = std::make_unique<FileStreamer>(file);
-			if (!streamer->Init(path)) {
-				avformat_free_context(raw);
-				return AVPLAYER_ERROR_OPERATION_FAILED;
-			}
-			raw->pb = streamer->Context();
-			if (auto rc = avformat_open_input(&raw, nullptr, nullptr, nullptr); rc < 0) {
-				LOGF("\t avformat_open_input callback failed: %s\n", fferr(rc).c_str());
-				return AVPLAYER_ERROR_OPERATION_FAILED;
-			}
-		} else {
-			auto real     = LibKernel::FileSystem::GetRealFilename(std::string(path.c_str()));
-			auto real_str = Common::PathToString(real);
-			if (auto rc = avformat_open_input(&raw, real_str.c_str(), nullptr, nullptr); rc < 0) {
-				LOGF("\t avformat_open_input failed: %s path=%s\n", fferr(rc).c_str(),
-				     real_str.c_str());
-				return AVPLAYER_ERROR_OPERATION_FAILED;
-			}
+		streamer                       = std::make_unique<FileStreamer>(file);
+		if (!streamer->Init(path)) {
+			avformat_free_context(raw);
+			return AVPLAYER_ERROR_OPERATION_FAILED;
+		}
+		raw->pb = streamer->Context();
+		if (const auto rc = avformat_open_input(&raw, file.open == nullptr ? path.c_str() : nullptr,
+		                                        nullptr, nullptr);
+		    rc < 0) {
+			LOGF("\t avformat_open_input failed: %s path=%s\n", fferr(rc).c_str(), path.c_str());
+			return AVPLAYER_ERROR_OPERATION_FAILED;
 		}
 		fmt = raw;
 		if (auto rc = avformat_find_stream_info(fmt, nullptr); rc < 0) {

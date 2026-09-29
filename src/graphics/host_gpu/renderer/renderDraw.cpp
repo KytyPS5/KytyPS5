@@ -249,8 +249,8 @@ static void LogDrawInputState(const CommandBuffer& buffer, const RenderColorInfo
 	for (int bi = 0; bi < vs_input_info.buffers_num; bi++) {
 		const auto& b = vs_input_info.buffers[bi];
 		LOGF("DrawInputState[%u]: vb[%d] addr=0x%010" PRIx64
-		     " stride=%u records=%u fetch_index=%u attr_num=%d\n",
-		     log_id, bi, b.addr, b.stride, b.num_records, b.fetch_index, b.attr_num);
+		     " stride=%u records=%u fetch_index=%u\n",
+		     log_id, bi, b.addr, b.stride, b.num_records, b.fetch_index);
 
 		const auto* bytes = reinterpret_cast<const uint8_t*>(b.addr);
 		if (bytes != nullptr && b.stride != 0) {
@@ -272,11 +272,13 @@ static void LogDrawInputState(const CommandBuffer& buffer, const RenderColorInfo
 				     raw[5], raw[6], raw[7], raw[8], flt[0], flt[1], flt[2], flt[3], flt[4], flt[5],
 				     flt[6], flt[7], flt[8]);
 
-				for (int ai = 0; ai < b.attr_num; ai++) {
-					const auto  res_index = b.attr_indices[ai];
-					const auto& r         = vs_input_info.resources[res_index];
-					const auto& rd        = vs_input_info.resources_dst[res_index];
-					const auto  offset    = b.attr_offsets[ai];
+				for (int ai = 0; ai < vs_input_info.resources_num; ai++) {
+					const auto& r  = vs_input_info.resources[ai];
+					const auto& rd = vs_input_info.resources_dst[ai];
+					if (rd.buffer_index != bi) {
+						continue;
+					}
+					const auto offset = static_cast<uint32_t>(r.Base48() - b.addr);
 					if (offset + 4u <= b.stride &&
 					    r.Format() == Prospero::BufferFormat::k8_8_8_8UNorm) {
 						uint32_t packed = 0;
@@ -296,14 +298,16 @@ static void LogDrawInputState(const CommandBuffer& buffer, const RenderColorInfo
 			}
 		}
 
-		for (int ai = 0; ai < b.attr_num; ai++) {
-			const auto  res_index = b.attr_indices[ai];
-			const auto& r         = vs_input_info.resources[res_index];
-			const auto& rd        = vs_input_info.resources_dst[res_index];
-			LOGF("DrawInputState[%u]: attr[%d] res=%d offset=%u dst=v%d regs=%d fetch_index=%u "
+		for (int ai = 0; ai < vs_input_info.resources_num; ai++) {
+			const auto& r  = vs_input_info.resources[ai];
+			const auto& rd = vs_input_info.resources_dst[ai];
+			if (rd.buffer_index != bi) {
+				continue;
+			}
+			LOGF("DrawInputState[%u]: attr[%d] offset=%u dst=v%d regs=%d fetch_index=%u "
 			     "sharp=%08" PRIx32 " %08" PRIx32 " %08" PRIx32 " %08" PRIx32 "\n",
-			     log_id, ai, res_index, b.attr_offsets[ai], rd.register_start, rd.registers_num,
-			     rd.fetch_index, r.fields[0], r.fields[1], r.fields[2], r.fields[3]);
+			     log_id, ai, static_cast<uint32_t>(r.Base48() - b.addr), rd.register_start,
+			     rd.registers_num, rd.fetch_index, r.fields[0], r.fields[1], r.fields[2], r.fields[3]);
 		}
 	}
 }
@@ -575,12 +579,17 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 	return state;
 }
 
-static bool DrawHasActivePixelShader(const CommandBuffer& buffer) {
-	const auto& ctx              = buffer.GetRegisters();
-	const auto& sh_regs          = ctx.GetShaderRegisters();
-	const bool  has_color_output = (ctx.GetRenderTargetMask() & sh_regs.m_cbShaderMask) != 0;
-	return buffer.GetShaders().GetPs().ps_regs.data_addr != 0 &&
-	       (has_color_output || PixelShaderHasDepthOrCoverageSideEffects(sh_regs));
+static uint32_t DrawColorOutputMask(const HW::Context& ctx) {
+	const auto& sh_regs     = ctx.GetShaderRegisters();
+	const auto  write_mask  = ctx.GetRenderTargetMask() & sh_regs.m_cbShaderMask;
+	uint32_t    output_mask = 0;
+	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
+		if (sh_regs.target_output_mode[slot] != 0 &&
+		    render_target_mask_slot(write_mask, slot) != 0) {
+			output_mask |= 1u << slot;
+		}
+	}
+	return output_mask;
 }
 
 enum class CbColorMode : uint8_t {
@@ -625,19 +634,22 @@ struct PreparedIndexBuffer {
 	vk::IndexType  type   = vk::IndexType::eUint16;
 };
 
-static uint64_t VertexBufferDescriptorSize(const ShaderVertexInputBuffer& buffer,
-                                           const ShaderVertexInputInfo& info) {
+static uint64_t VertexBufferDescriptorSize(int binding, const ShaderVertexInputInfo& info) {
+	const auto& buffer = info.buffers[binding];
 	if (buffer.stride != 0 || buffer.num_records == 0) {
 		return static_cast<uint64_t>(buffer.stride) * buffer.num_records;
 	}
 
 	uint64_t size = 0;
-	for (int i = 0; i < buffer.attr_num; i++) {
-		const auto& resource = info.resources[buffer.attr_indices[i]];
+	for (int i = 0; i < info.resources_num; i++) {
+		if (info.resources_dst[i].buffer_index != binding) {
+			continue;
+		}
+		const auto& resource = info.resources[i];
 		// RDNA2 OOB_SELECT=2 only checks NumRecords != 0. A constant attribute still
 		// fetches its entire format; NumRecords is not a byte count in this mode.
 		const uint64_t extent = resource.OutOfBounds() == 2
-		                            ? static_cast<uint64_t>(buffer.attr_offsets[i]) +
+		                            ? resource.Base48() - buffer.addr +
 		                                  ShaderRecompiler::Format::GetFormatInfo(resource.Format()).byte_size
 		                            : buffer.num_records;
 		size = std::max(size, extent);
@@ -674,7 +686,7 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 	uint32_t                                                      range_count = 0;
 	for (int i = 0; i < vs_input_info.buffers_num; i++) {
 		const auto& vertex = vs_input_info.buffers[i];
-		const auto  size   = VertexBufferDescriptorSize(vertex, vs_input_info);
+		const auto  size   = VertexBufferDescriptorSize(i, vs_input_info);
 		sizes[i]           = size;
 		if (size == 0) {
 			continue;
@@ -713,9 +725,6 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 		    Libs::LibKernel::Memory::ClampRangeSize(range.base_address, range.RequestedSize());
 		range.acquired_end = range.base_address + size;
 		range.binding      = cache.ObtainBuffer(range.base_address, size, false);
-		SetVulkanObjectNameF(
-		    buffer.GetContext().GetGraphics().device, range.binding.first->Handle(),
-		    "Kyty.VertexBufferRange[guest=0x{:016x} size=0x{:x}]", range.base_address, size);
 	}
 
 	// Rebuild slot bindings, offsetting non-empty slots into their acquired merged range.
@@ -747,10 +756,6 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 		prepared.buffers[i] = range->binding.first->Handle();
 		prepared.offsets[i] = range->binding.second + vertex.addr - range->base_address;
 		prepared.sizes[i]   = std::min(size, range->acquired_end - vertex.addr);
-		SetVulkanObjectNameF(
-		    buffer.GetContext().GetGraphics().device, prepared.buffers[i],
-		    "Kyty.VertexBuffer[slot={} guest=0x{:016x} size=0x{:x} stride={} records={}]", i,
-		    vertex.addr, size, vertex.stride, vertex.num_records);
 	}
 
 	return prepared;
@@ -847,7 +852,7 @@ static bool ResolvePrimitiveRestart(const CommandBuffer& buffer,
 }
 
 static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
-                           DrawRenderState& state) {
+                           uint32_t color_output_mask, DrawRenderState& state) {
 	auto& ctx    = buffer.GetRegisters();
 	auto& sh_ctx = buffer.GetShaders();
 
@@ -861,7 +866,7 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 	    target_export_mapping {};
 	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
 		const auto& rt = ctx.GetRenderTarget(slot);
-		if (rt.base.addr != 0 && render_target_mask_slot(ctx.GetRenderTargetMask(), slot) != 0) {
+		if ((color_output_mask & (1u << slot)) != 0 && rt.base.addr != 0) {
 			target_export_mapping[slot] =
 			    TextureGetRenderTargetFormat(rt.info.format, rt.info.channel_type,
 			                                 rt.info.channel_order)
@@ -880,8 +885,12 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
                                             uint32_t            render_target_slice_offset,
 	                                        DrawRenderState& state) {
-	state.ps_active = DrawHasActivePixelShader(buffer);
-	RefreshShaders(buffer, draw, state);
+	const auto& shader_regs       = buffer.GetRegisters().GetShaderRegisters();
+	const auto  color_output_mask = DrawColorOutputMask(buffer.GetRegisters());
+	state.ps_active = buffer.GetShaders().GetPs().ps_regs.data_addr != 0 &&
+	                  (color_output_mask != 0 ||
+	                   PixelShaderHasDepthOrCoverageSideEffects(shader_regs));
+	RefreshShaders(buffer, draw, color_output_mask, state);
 	uint32_t mrt_mask = 0;
 	if (state.ps_active) {
 		for (const auto& output: state.ps_input_info.stage.program->info.outputs) {
@@ -890,6 +899,7 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 			}
 		}
 	}
+	mrt_mask &= color_output_mask;
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "ResolveRenderColorTarget");
 	}
@@ -927,17 +937,11 @@ static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffe
 		auto& stream = buffer.GetContext().GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
 		prepared.offset = stream.Copy(source.host_data, source.size, 16);
 		prepared.buffer = stream.Handle();
-		SetVulkanObjectNameF(buffer.GetContext().GetGraphics().device, prepared.buffer,
-		                     "Kyty.IndexBuffer[guest=transient size=0x{:x} type={}]", source.size,
-		                     static_cast<uint32_t>(source.type));
 	} else {
 		auto [buffer_ptr, offset] =
 		    buffer.GetContext().GetBufferCache().ObtainBuffer(source.address, source.size, false);
 		prepared.buffer = buffer_ptr->Handle();
 		prepared.offset = offset;
-		SetVulkanObjectNameF(buffer.GetContext().GetGraphics().device, prepared.buffer,
-		                     "Kyty.IndexBuffer[guest=0x{:016x} size=0x{:x} type={}]",
-		                     source.address, source.size, static_cast<uint32_t>(source.type));
 	}
 	return prepared;
 }

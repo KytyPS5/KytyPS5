@@ -9,13 +9,15 @@ namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
 class Translator {
 public:
-	Translator(IR::Program& program, IR::Block* block, uint32_t vector_limit)
-	    : program(program), ir(block), current_vector_limit(vector_limit) {}
+	Translator(IR::Program& program, IR::Block* block, uint32_t vector_limit,
+	           bool flush_f32_inputs)
+	    : program(program), ir(block), current_vector_limit(vector_limit),
+	      flush_f32_inputs(flush_f32_inputs) {}
 
 	void TranslateInstruction(const Decoder::Instruction& inst);
 	void TranslateEmbeddedFetch(const Decoder::Instruction& inst, uint32_t attribute,
 	                            uint32_t component_count, const ShaderBufferResource& resource);
-	void AddBranchCondition(const CFG::BasicBlock& source, IR::BlockInfo& info);
+	void AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlock& source, IR::BlockInfo& info);
 
 private:
 	const Decoder::Operand& SourceAt(const Decoder::Instruction& inst, uint32_t index);
@@ -261,6 +263,7 @@ private:
 	Decoder::Opcode current_opcode       = Decoder::Opcode::UNKNOWN;
 	uint32_t        current_pc           = 0;
 	uint32_t        current_vector_limit = 1;
+	bool            flush_f32_inputs;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::Frontend

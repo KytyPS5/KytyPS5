@@ -808,14 +808,8 @@ static void GetDynLibs(Elf64* elf, T* out, const char* names, Elf64_Sxword tag) 
 static RelocationInfo GetRelocationInfo(Elf64_Rela* r, Program* program) {
 	KYTY_PROFILER_FUNCTION();
 
-	// KYTY_PROFILER_BLOCK("1");
-
 	RelocationInfo ret;
 	// SymbolRecord   sr {};
-
-	// KYTY_PROFILER_END_BLOCK;
-
-	// KYTY_PROFILER_BLOCK("2");
 
 	auto         type    = r->GetType();
 	auto         symbol  = r->GetSymbol();
@@ -825,10 +819,6 @@ static RelocationInfo GetRelocationInfo(Elf64_Rela* r, Program* program) {
 	ret.base_vaddr       = program->base_vaddr;
 	ret.vaddr            = ret.base_vaddr + r->r_offset;
 	ret.bind_self        = false;
-
-	// KYTY_PROFILER_END_BLOCK;
-
-	// KYTY_PROFILER_BLOCK("3");
 
 	switch (type) {
 		case R_X86_64_GLOB_DAT:
@@ -877,8 +867,6 @@ static RelocationInfo GetRelocationInfo(Elf64_Rela* r, Program* program) {
 			break;
 		default: EXIT("unknown type: %d\n", (int)type);
 	}
-
-	// KYTY_PROFILER_END_BLOCK;
 
 	return ret;
 }

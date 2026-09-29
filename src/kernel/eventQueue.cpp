@@ -121,6 +121,8 @@ int KernelEqueuePrivate::GetTriggeredEvents(KernelEvent* ev, int num) {
 				event.event = event.pending_events.front();
 				event.pending_events.pop_front();
 				event.triggered = true;
+			} else if (event.triggered) {
+				break;
 			}
 
 			if (ret >= num) {

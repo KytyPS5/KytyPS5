@@ -1836,6 +1836,29 @@ public:
   [[nodiscard]] bool RasterizationSupported() const {
     return m_rasterization_supported;
   }
+  // Returns the first format the device can attach as depth-stencil at `samples`,
+  // preferring `preferred`. Some drivers reject VK_FORMAT_D24_UNORM_S8_UINT
+  // outright, and Image::Image exits the process rather than create such an
+  // image, so a caller that hardcodes one can never run on those devices.
+  // eUndefined means no depth-stencil attachment is available at all.
+  [[nodiscard]] vk::Format SupportedDepthStencilFormat(
+      vk::Format preferred, vk::SampleCountFlagBits samples) const {
+    const auto usage = vk::ImageUsageFlagBits::eDepthStencilAttachment |
+                       vk::ImageUsageFlagBits::eSampled |
+                       vk::ImageUsageFlagBits::eTransferSrc |
+                       vk::ImageUsageFlagBits::eTransferDst;
+    for (const auto candidate:
+         {preferred, vk::Format::eD32SfloatS8Uint, vk::Format::eD16UnormS8Uint}) {
+      vk::ImageFormatProperties properties {};
+      if (m_runtime_context.GetImageFormatProperties(
+              candidate, vk::ImageType::e2D, vk::ImageTiling::eOptimal, usage,
+              {}, &properties) == vk::Result::eSuccess &&
+          static_cast<bool>(properties.sampleCounts & samples)) {
+        return candidate;
+      }
+    }
+    return vk::Format::eUndefined;
+  }
   void SkipRasterizationCases(u32 count) { m_skipped_cases += count; }
   [[nodiscard]] u32 SkippedCaseCount() const { return m_skipped_cases; }
   [[nodiscard]] GraphicContext &RuntimeContext() {
@@ -3511,31 +3534,38 @@ public:
                 depth.views.size() == 3,
             "unified depth view cache lost sampled/attachment identity");
 
-    auto depth_stencil_info = depth_info;
-    depth_stencil_info.pixel_format = vk::Format::eD24UnormS8Uint;
-    depth_stencil_info.guest_format = Prospero::BufferFormat::k16UNorm;
-    depth_stencil_info.bytes_per_block = 2;
-    Libs::Graphics::Image depth_stencil(m_runtime_context, scheduler,
-                                        depth_stencil_info);
-    auto depth_only_info = depth_sampled;
-    depth_only_info.format = depth_stencil_info.pixel_format;
-    const auto depth_only = depth_stencil.FindView(depth_only_info);
-    auto combined_info = depth_only_info;
-    combined_info.aspect =
-        vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
-    combined_info.mapping = {};
-    combined_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
-    const auto combined = depth_stencil.FindView(combined_info);
-    Require(name, "depth/stencil aspects",
-            depth_only != nullptr && combined != nullptr &&
-                depth_only != combined &&
-                depth_stencil.views.size() == 2 &&
-                depth_stencil.views[0].info.aspect ==
-                    vk::ImageAspectFlagBits::eDepth &&
-                depth_stencil.views[1].info.aspect ==
-                    (vk::ImageAspectFlagBits::eDepth |
-                     vk::ImageAspectFlagBits::eStencil),
-            "explicit depth-only and combined aspects shared one image view");
+      // D24S8 is not universally attachable; ask the device before using it.
+      const auto depth_stencil_format = SupportedDepthStencilFormat(
+          vk::Format::eD24UnormS8Uint, vk::SampleCountFlagBits::e1);
+      if (depth_stencil_format == vk::Format::eUndefined) {
+        SkipRasterizationCases(1);
+      } else {
+        auto depth_stencil_info = depth_info;
+        depth_stencil_info.pixel_format = depth_stencil_format;
+        depth_stencil_info.guest_format = Prospero::BufferFormat::k16UNorm;
+        depth_stencil_info.bytes_per_block = 2;
+        Libs::Graphics::Image depth_stencil(m_runtime_context, scheduler,
+                                            depth_stencil_info);
+        auto depth_only_info = depth_sampled;
+        depth_only_info.format = depth_stencil_info.pixel_format;
+        const auto depth_only = depth_stencil.FindView(depth_only_info);
+        auto combined_info = depth_only_info;
+        combined_info.aspect =
+            vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
+        combined_info.mapping = {};
+        combined_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+        const auto combined = depth_stencil.FindView(combined_info);
+        Require(name, "depth/stencil aspects",
+                depth_only != nullptr && combined != nullptr &&
+                    depth_only != combined &&
+                    depth_stencil.views.size() == 2 &&
+                    depth_stencil.views[0].info.aspect ==
+                        vk::ImageAspectFlagBits::eDepth &&
+                    depth_stencil.views[1].info.aspect ==
+                        (vk::ImageAspectFlagBits::eDepth |
+                         vk::ImageAspectFlagBits::eStencil),
+                "explicit depth-only and combined aspects shared one image view");
+      }
     Require(name, "role-free backing",
             color.backing.image_type == vk::ImageType::e2D &&
                 color.backing.layers == 2 &&
@@ -4689,6 +4719,15 @@ public:
     constexpr uint64_t allocation_size = 0x2800000;
     constexpr uint64_t allocation_alignment = 0x200000;
     EnsureRuntimeContext();
+    // Some drivers cannot attach D24S8 in any configuration, and Image::Image
+    // exits the process instead of creating such an image. Resolve one host
+    // depth-stencil format up front; everything below needs one.
+    const auto host_depth_stencil = SupportedDepthStencilFormat(
+        vk::Format::eD24UnormS8Uint, vk::SampleCountFlagBits::e1);
+    if (host_depth_stencil == vk::Format::eUndefined) {
+      SkipRasterizationCases(1);
+      return;
+    }
     RenderContext context(m_runtime_context);
     auto &scheduler = context.GetCommandScheduler();
     HW::Context registers{};
@@ -5652,12 +5691,22 @@ public:
       auto ms_depth_desc = color_desc;
       ms_depth_desc.type = BindingType::DepthTarget;
       ms_depth_desc.info.stencil = {base + ms_stencil_offset, ms_stencil_size};
-      ms_depth_desc.info.pixel_format = vk::Format::eD24UnormS8Uint;
+      // D24S8 is not universally attachable, so ask the device first. Everything
+      // below this point drives a depth-stencil target, so a device with no such
+      // format cannot run any of it.
+      const auto ms_depth_format =
+          SupportedDepthStencilFormat(host_depth_stencil,
+                                      vk::SampleCountFlagBits::e2);
+      if (ms_depth_format == vk::Format::eUndefined) {
+        SkipRasterizationCases(1);
+        return;
+      }
+      ms_depth_desc.info.pixel_format = ms_depth_format;
       ms_depth_desc.info.guest_format = Prospero::BufferFormat::k16UNorm;
       ms_depth_desc.info.bytes_per_block = 2;
       ms_depth_desc.info.samples = 2;
       ms_depth_desc.info.type = Prospero::ImageType::kColor2D;
-      ms_depth_desc.view_info.format = vk::Format::eD24UnormS8Uint;
+      ms_depth_desc.view_info.format = ms_depth_format;
       ms_depth_desc.view_info.aspect =
           vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
       ms_depth_desc.view_info.usage =
@@ -7934,7 +7983,7 @@ public:
       std::memset(memory + d16_fallback_stencil_offset, 0x6d, 4);
       auto d16_depth_desc = MakeLinearDesc(
           base + d16_fallback_offset, sizeof(d16_fallback_values),
-          vk::Format::eD24UnormS8Uint, Prospero::BufferFormat::k16UNorm,
+          host_depth_stencil, Prospero::BufferFormat::k16UNorm,
           Prospero::ImageType::kColor2D, {4, 1, 1}, 1, 2, 1);
       d16_depth_desc.type = BindingType::DepthTarget;
       d16_depth_desc.info.stencil = {base + d16_fallback_stencil_offset, 4};

@@ -806,6 +806,59 @@ static std::optional<std::array<uint64_t, 3>> FillIndex(Value value, uint32_t ax
 	return left;
 }
 
+// A thread-dimension dispatch starts its padding lanes with EXEC cleared, through
+// GlobalInvocationId < DispatchThreadCount on each axis (TranslateProgram). The fill
+// fast path only runs for whole-workgroup dispatches (ResolveComputeBufferFill), where
+// that bound holds for every lane, so it enables a store just like `true`.
+static bool IsDispatchBoundsEnable(Value value, uint32_t depth = 0) {
+	value = value.Resolve();
+	if (value == Value(true)) {
+		return true;
+	}
+	const auto* inst = value.TryInstruction();
+	if (inst == nullptr || depth == 8u) {
+		return false;
+	}
+	if (inst->GetOpcode() == ValueOpcode::LogicalAnd) {
+		return IsDispatchBoundsEnable(inst->Arg(0), depth + 1u) &&
+		       IsDispatchBoundsEnable(inst->Arg(1), depth + 1u);
+	}
+	if (inst->GetOpcode() != ValueOpcode::ULessThan32) {
+		return false;
+	}
+	const auto builtin_axis = [](Value operand, StageInputKind kind, Value& axis) {
+		const auto* builtin = operand.Resolve().TryInstruction();
+		if (builtin == nullptr || builtin->GetOpcode() != ValueOpcode::GetBuiltin ||
+		    builtin->NumArgs() != 2u ||
+		    builtin->Arg(0).Resolve() != Value(static_cast<uint32_t>(kind))) {
+			return false;
+		}
+		axis = builtin->Arg(1).Resolve();
+		return axis.IsImmediate();
+	};
+	Value id_axis;
+	Value count_axis;
+	return builtin_axis(inst->Arg(0), StageInputKind::GlobalInvocationId, id_axis) &&
+	       builtin_axis(inst->Arg(1), StageInputKind::DispatchThreadCount, count_axis) &&
+	       id_axis == count_axis;
+}
+
+// A VGPR written under EXEC keeps its old value in disabled lanes, so a dispatch bound in
+// EXEC leaves select(enable, value, old). Enabled lanes, the only ones a store writes,
+// see the value.
+static Value EnabledValue(Value value, Value enable) {
+	value  = value.Resolve();
+	enable = enable.Resolve();
+	for (;;) {
+		const auto* select = value.TryInstruction();
+		if (select == nullptr || select->GetOpcode() != ValueOpcode::SelectU32 ||
+		    select->Arg(0).Resolve() != enable) {
+			return value;
+		}
+		value = select->Arg(1).Resolve();
+	}
+}
+
 static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 	if (program.stage != ShaderType::Compute || program.blocks.empty() ||
 	    program.blocks.size() != program.block_info.size() || program.info.uses_dma ||
@@ -837,6 +890,9 @@ static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 		if (buffer.read && (!buffer.scalar || buffer.written)) return {};
 	}
 	const auto& memory = program.memory_info.at(store->Flags<MemoryFlags>().index);
+	// Stores write only enabled lanes; buffer fills are enabled by EXEC.
+	const auto enable =
+	    store->GetOpcode() == ValueOpcode::ImageWrite ? Value(true) : store->Arg(5).Resolve();
 	UniformFillPlan result;
 	result.fill.resource = memory.resource;
 	Value data;
@@ -844,7 +900,7 @@ static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 		if (program.info.images.size() != 1 || memory.dmask != 1 || memory.data_bits != 32 ||
 		    memory.image_has_mip || memory.image_sample_flags != 0 || memory.image_r128 ||
 		    memory.image_dimension != Decoder::ImageDimension::Dim2DArray ||
-		    store->Arg(3).Resolve() != Value(true)) return {};
+		    !IsDispatchBoundsEnable(store->Arg(3))) return {};
 		const auto& image = program.info.images[memory.resource];
 		if (image.read || image.atomic || image.mip_mode != ImageMipMode::None) return {};
 		const auto* address = store->Arg(1).ResolveInstruction();
@@ -872,18 +928,18 @@ static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 		                             ValueOpcode::StoreBufferU32x3, ValueOpcode::StoreBufferU32x4};
 		const auto           store_op = std::ranges::find(stores, op);
 		if (store_op == stores.end() || store->Arg(2).Resolve() != Value(0u) ||
-		    store->Arg(3).Resolve() != Value(0u) || store->Arg(5).Resolve() != Value(true))
+		    store->Arg(3).Resolve() != Value(0u) || !IsDispatchBoundsEnable(store->Arg(5)))
 			return {};
 		if (!memory.formatted || memory.typed || !memory.idxen || memory.offen || memory.offset != 0 ||
 		    memory.data_bits != 32 ||
 		    memory.data_dwords != static_cast<uint32_t>(store_op - stores.begin() + 1))
 			return {};
-		const auto address = FillIndex(store->Arg(1), 0);
+		const auto address = FillIndex(EnabledValue(store->Arg(1), store->Arg(5)), 0);
 		if (!address || (*address)[0] != 0 || (*address)[1] != 1 || (*address)[2] == 0) return {};
 		result.fill.kind = UniformFillKind::Buffer;
 		result.fill.group_stride[0] = static_cast<uint32_t>((*address)[2]);
 		result.fill.words = memory.data_dwords;
-		data = store->Arg(4);
+		data = EnabledValue(store->Arg(4), store->Arg(5));
 	}
 	data = data.Resolve();
 	const auto*          vector = data.TryInstruction();
@@ -894,7 +950,7 @@ static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 	    (vector == nullptr || vector->GetOpcode() != composites[result.fill.words - 2]))
 		return {};
 	for (uint32_t i = 0; i < result.fill.words; ++i) {
-		const auto word = result.fill.words == 1 ? data : vector->Arg(i);
+		const auto word = result.fill.words == 1 ? data : EnabledValue(vector->Arg(i), enable);
 		if (word.GetType() != Type::U32 ||
 		    !ValidateRuntimeValue(program, word, RuntimeValueType::Integer))
 			return {};
@@ -962,6 +1018,9 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	for (const auto& read: program.srt_reads) {
 		plan.srt_reads.push_back({Clone(read.value), read.flat_offset});
 	}
+	plan.has_uniform_buffer_reads = std::ranges::any_of(plan.value_storage, [](const Inst& inst) {
+		return inst.GetOpcode() == ValueOpcode::LoadBufferU32;
+	});
 	plan.control_flow = ResourceControlFlow(program);
 	for (auto& block: plan.control_flow) {
 		block.condition = Clone(block.condition);
@@ -984,7 +1043,17 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		MarkCleanFlatSlots(plan, Source(plan, source->indirect_image->table_source),
 		                   plan.clean_flat_slots);
 	}
-	if (masked_image) {
+	for (const auto& sampler: plan.info.samplers) {
+		const auto* source = Source(plan, sampler.source);
+		if (source == nullptr || !source->bindless_sampler.has_value()) {
+			continue;
+		}
+		plan.requires_specialization_memory = true;
+		MarkCleanFlatSlots(plan, source, plan.clean_flat_slots);
+	}
+	// Research: a descriptor phi evaluated on the host in a shader that writes memory needs the
+	// same proof as a masked image: nothing the evaluation read can be written by the shader.
+	if (masked_image || program.descriptor_phi_under_writes || plan.has_uniform_buffer_reads) {
 		plan.resource_tracking_complete &= !program.has_address_writes &&
 		    !std::ranges::any_of(plan.info.images, &ImageResource::written);
 		plan.capture_specialization_reads =

@@ -510,9 +510,18 @@ struct DescriptorSource {
 		bool operator==(const IndirectImage& other) const = default;
 	};
 
-	std::array<Value, 8>         dwords {};
-	uint32_t                     dword_count = 0;
-	std::optional<IndirectImage> indirect_image;
+	// A sampler read from a sampler heap at a GPU-computed key: dwords 0-2 are the heap's V#
+	// (dword 3 is left 0), the S# records start table_offset bytes into it.
+	struct BindlessSampler {
+		uint32_t table_offset = 0;
+
+		bool operator==(const BindlessSampler& other) const = default;
+	};
+
+	std::array<Value, 8>           dwords {};
+	uint32_t                       dword_count = 0;
+	std::optional<IndirectImage>   indirect_image;
+	std::optional<BindlessSampler> bindless_sampler;
 
 	bool operator==(const DescriptorSource& other) const = default;
 };

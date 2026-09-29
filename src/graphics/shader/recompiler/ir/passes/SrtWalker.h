@@ -54,6 +54,7 @@ private:
 	bool EvaluatePhi(const Inst& inst, uint64_t& result);
 	bool EvaluateExtract(const Inst& inst, uint64_t& result);
 	bool EvaluateRawRead(const Inst& inst, uint64_t& result);
+	bool EvaluateBufferRead(const Inst& inst, uint64_t& result);
 	bool EvaluateInst(const Inst& inst, uint64_t& result);
 
 	const ResourcePlan&              m_program;
@@ -61,6 +62,7 @@ private:
 	std::span<const uint8_t>         m_clean_flat_slots;
 	SrtWalker*                      m_clean_evaluator = nullptr;
 	Value                           m_active_mask;
+	const Inst*                     m_failed_value = nullptr;
 	ResourcePlan::EvaluationContext& m_context;
 	// The last raw read that failed, for RefreshFlatBuffer's report.
 	const char* m_read_failure         = nullptr;

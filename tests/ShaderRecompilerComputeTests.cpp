@@ -25118,6 +25118,10 @@ TestCase BufferLoadsGpuSelectedDescriptors(bool xyz) {
   test.name = xyz ? "BufferLoadDwordx3GpuSelectedDescriptors"
                   : "BufferLoadsGpuSelectedDescriptors";
   test.initial.resize(2048);
+  // v40 = lane index (0 in lane 0), from v_mbcnt_lo_u32_b32 over v41 = ~0u, v42 = 0.
+  AppendVMovLiteral(&test.code, 41, 0xffffffffu);
+  test.code.push_back(EncodeVop1(0x01, 42, InlineU32(0)));
+  test.code.push_back(EncodeVop2(0x23, 40, Vgpr(41), 42));
   for (u32 i = 0; i < std::size(cases); ++i) {
     const auto &input = cases[i];
     const u32 data_offset = 4096 + i * 128;
@@ -25134,6 +25138,11 @@ TestCase BufferLoadsGpuSelectedDescriptors(bool xyz) {
     const u32 selected = static_cast<u32>(std::size(cases)) - 1 - i;
     test.initial[64 + i] = selected;
     AppendVMovU32(&test.code, 30, (64 + i) * 4);
+    // Offset the selector address by the lane index: lane 0 reads the same entry, but the
+    // load is no longer a uniform read the host could evaluate (IsUniformBufferRead), so
+    // the descriptor stays GPU-selected.
+    test.code.push_back(EncodeVop2(0x1a, 43, InlineU32(2), 40));
+    test.code.push_back(EncodeVop2(0x25, 30, Vgpr(43), 30));
     AppendBufferLoadDword(&test.code, 0, 30);
     test.code.push_back(EncodeVop1(0x02, 20, Vgpr(0)));
     test.code.push_back(EncodeSop2(0x26, 20, 20, 255)); // s_mul_i32 s20, s20, 120

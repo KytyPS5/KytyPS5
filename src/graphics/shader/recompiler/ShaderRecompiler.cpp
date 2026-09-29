@@ -847,6 +847,7 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 		     options.shader_hash);
 		TranslateResult unsupported_result;
 		unsupported_result.unsupported = true;
+		unsupported_result.decoded_dump = std::move(decoded_dump);
 		return unsupported_result;
 	}
 	TranslateResult result;

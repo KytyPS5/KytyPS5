@@ -1372,8 +1372,14 @@ void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), access.byte_offset, ConstantU32(state, 2)));
 	const auto condition = EmitMemoryElementInBounds(state, access, element);
 	ctx.Define(inst, EmitValueOrZeroIfCondition(state, condition, [&]() {
-		           return EmitNative<spv::OpLoad, IR::Type::U32>(
-		               state, EmitMemoryElementPointer(state, access, element));
+		           const auto pointer = EmitMemoryElementPointer(state, access, element);
+		           if (!mem.coherent) {
+			           return EmitNative<spv::OpLoad, IR::Type::U32>(state, pointer);
+		           }
+		           const auto value = state.builder.AllocateId();
+		           state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer,
+		                                     spv::MemoryAccessVolatileMask);
+		           return value;
 	           }));
 }
 

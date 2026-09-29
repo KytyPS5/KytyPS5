@@ -77,6 +77,15 @@ struct MemoryInfo {
 		       (opcode == ValueOpcode::LoadBufferU32x2 || opcode == ValueOpcode::LoadBufferU32x3 ||
 		        opcode == ValueOpcode::LoadBufferU32x4);
 	}
+	// Raw DWORD stores through a V# selected at runtime from a descriptor table.
+	[[nodiscard]] bool SupportsIndirectBufferStore(ValueOpcode opcode) const {
+		return !formatted && !typed && data_bits == 32u &&
+		       (opcode == ValueOpcode::StoreBufferU32 || opcode == ValueOpcode::StoreBufferU32x2 ||
+		        opcode == ValueOpcode::StoreBufferU32x3 || opcode == ValueOpcode::StoreBufferU32x4);
+	}
+	[[nodiscard]] bool SupportsIndirectBufferAccess(ValueOpcode opcode) const {
+		return SupportsIndirectBufferLoad(opcode) || SupportsIndirectBufferStore(opcode);
+	}
 
 	bool operator==(const MemoryInfo& other) const = default;
 };
@@ -110,6 +119,10 @@ struct BufferResource {
 	bool                   atomic             = false;
 	bool                   formatted          = false;
 	bool                   scalar             = false;
+	// This buffer is a table of V#s (16-byte entries starting at indirect_table_offset) that
+	// selects the targets of IndirectBuffer stores; the host caches every entry it names.
+	bool     indirect_write_table  = false;
+	uint32_t indirect_table_offset = 0;
 
 	bool operator==(const BufferResource& other) const = default;
 };

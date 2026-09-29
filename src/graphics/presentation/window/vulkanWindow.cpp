@@ -355,14 +355,14 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 
 		if (!skip_device &&
 		    !CheckFormat(device, vk::Format::eR8G8B8A8Srgb, true, storage_features)) {
-			LOGF("Format vk::Format::eR8G8B8A8Srgb cannot be used as texture\n");
-			check_format(vk::Format::eR8G8B8A8Unorm, storage_features, "texture");
+			LOGF("Format vk::Format::eR8G8B8A8Srgb cannot be used as storage image\n");
+			check_format(vk::Format::eR8G8B8A8Unorm, storage_features, "storage image");
 		}
 
 		if (!skip_device &&
 		    !CheckFormat(device, vk::Format::eB8G8R8A8Srgb, true, storage_features)) {
-			LOGF("Format vk::Format::eB8G8R8A8Srgb cannot be used as texture\n");
-			check_format(vk::Format::eB8G8R8A8Unorm, storage_features, "texture");
+			LOGF("Format vk::Format::eB8G8R8A8Srgb cannot be used as storage image\n");
+			check_format(vk::Format::eB8G8R8A8Unorm, storage_features, "storage image");
 		}
 
 		if (!skip_device && device_properties.limits.maxSamplerAnisotropy < 16.0f) {

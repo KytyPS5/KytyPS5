@@ -908,7 +908,8 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, IndirectDrawRegisters 
 void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_count_or_count,
                                          const volatile uint32_t* count_addr,
                                          uint32_t stride_in_bytes, IndirectDrawRegisters registers,
-                                         uint32_t draw_initiator, bool indexed) {
+                                         uint32_t draw_initiator, bool indexed,
+                                         uint32_t draw_index_register) {
 	EXIT_NOT_IMPLEMENTED((draw_initiator & ~0x20u) != (indexed ? 0u : 2u));
 	EXIT_NOT_IMPLEMENTED(m_draw_indirect_args_base_addr == 0);
 
@@ -938,6 +939,14 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	}
 
 	for (uint32_t i = 0; i < draw_count; i++) {
+		// DRAW_INDIRECT_MULTI writes DrawIndex before each draw, including draws
+		// with zero vertices/instances. It starts at zero for each packet.
+		if (draw_index_register != Pm4::SH_NOP) {
+			EXIT_NOT_IMPLEMENTED(draw_index_register >= Pm4::SH_NUM ||
+			                     g_hw_sh_indirect_func[draw_index_register] == nullptr);
+			SetUserDataMarker(HW::UserSgprType::Unknown);
+			g_hw_sh_indirect_func[draw_index_register](*this, draw_index_register, i);
+		}
 		const auto args_addr = m_draw_indirect_args_base_addr + data_offset +
 		                       static_cast<uint64_t>(i) * stride_in_bytes;
 

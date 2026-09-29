@@ -1668,13 +1668,16 @@ KYTY_CP_OP_PARSER(CpOpDrawIndirectMulti) {
 	const IndirectDrawRegisters registers {
 	    buffer[1] & 0xffffu, buffer[2] & 0xffffu,
 	    indexed && (buffer[3] & (1u << 28u)) != 0 ? buffer[1] >> 16u : Pm4::SH_NOP};
+	const auto draw_index_register =
+	    (buffer[3] & 0x80000000u) != 0 ? buffer[3] & 0xffffu : Pm4::SH_NOP;
+	EXIT_NOT_IMPLEMENTED((buffer[3] & (1u << 27u)) != 0); // User-VGPR destinations.
 
 	if (count_indirect == 0) {
 		count_addr = nullptr;
 	}
 
 	cp.DrawIndirectMulti(data_offset, max_count_or_count, count_addr, stride_in_bytes,
-	                     registers, draw_initiator, indexed);
+	                     registers, draw_initiator, indexed, draw_index_register);
 
 	return 9;
 }

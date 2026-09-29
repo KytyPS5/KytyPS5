@@ -89,7 +89,8 @@ public:
 	                  uint32_t draw_initiator, bool indexed);
 	void DrawIndirectMulti(uint32_t data_offset, uint32_t max_count_or_count,
 	                       const volatile uint32_t* count_addr, uint32_t stride_in_bytes,
-	                       IndirectDrawRegisters registers, uint32_t draw_initiator, bool indexed);
+	                       IndirectDrawRegisters registers, uint32_t draw_initiator, bool indexed,
+	                       uint32_t draw_index_register);
 	void WriteAtEndOfPipe32(uint32_t cache_policy, uint32_t event_write_dest,
 	                        uint32_t eop_event_type, uint32_t cache_action, uint32_t event_index,
 	                        uint32_t event_write_source, void* dst_gpu_addr, uint32_t value,

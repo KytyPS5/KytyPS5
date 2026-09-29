@@ -939,7 +939,8 @@ constexpr Vop2SdwaRule VOP2_SDWA_RULES[] = {
     {SdwaSelAll(), SdwaSelAll(), SdwaSelAll(), true, false},
     {SdwaSelFull(), SdwaSelAll(), SdwaSelAll(), false, false},
     {SdwaSelFull(), SdwaSelAll(), SdwaSelAll(), false, false},
-    {SdwaSelWords() | SdwaSelFull(), SdwaSelAll(), SdwaSelAll(), true, false},
+    // Bitwise: WriteRawU32 inserts a byte or word destination like any other partial write.
+    {SdwaSelAll(), SdwaSelAll(), SdwaSelAll(), true, false},
 };
 static_assert(sizeof(VOP2_SDWA_RULES) / sizeof(VOP2_SDWA_RULES[0]) ==
               static_cast<size_t>(Vop2SdwaProfile::Count));

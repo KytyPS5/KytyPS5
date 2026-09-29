@@ -231,6 +231,9 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 		case O::S_CBRANCH_EXECZ:
 		case O::S_CBRANCH_EXECNZ:
 		case O::S_CBRANCH_CDBGSYS:
+		case O::S_CBRANCH_CDBGUSER:
+		case O::S_CBRANCH_CDBGSYS_OR_USER:
+		case O::S_CBRANCH_CDBGSYS_AND_USER:
 		case O::S_ENDPGM: return;
 		default: return FailMissingTranslation(inst);
 	}

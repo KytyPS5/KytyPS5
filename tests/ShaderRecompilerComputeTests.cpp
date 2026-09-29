@@ -20020,6 +20020,34 @@ TestCase Vop2SdwaSubNcPreservesByteAndWordDestinations() {
           {O::V_MOV_B32, O::V_SUB_NC_U32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+TestCase Vop2SdwaOrByteDestinations() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 0, 0x11223344u);
+  AppendVMovLiteral(&code, 1, 0xaabbccddu);
+  // Captured: v_or_b32_sdwa v0, v0, v1 dst_sel:BYTE_3 dst_unused:UNUSED_PRESERVE
+  // src0_sel:BYTE_0 src1_sel:BYTE_2 (0x380002f9 0x02001300).
+  code.push_back(EncodeVop2(0x1c, 0, 249, 1));
+  code.push_back(EncodeVop2Sdwa(0, 3, 2, 0, 2));
+  AppendStoreVgpr(&code, 0, 0);
+  // Every byte destination: (byte 0 of v2) | (byte 1 of v1), the other bytes preserved.
+  AppendVMovLiteral(&code, 2, 0x000000f0u);
+  for (u32 sel = 0; sel < 4; sel++) {
+    AppendVMovLiteral(&code, 10 + sel, 0xa1b2c3d4u);
+    code.push_back(EncodeVop2(0x1c, 10 + sel, 249, 1));
+    code.push_back(EncodeVop2Sdwa(2, sel, 2, 0, 1));
+    AppendStoreVgpr(&code, 10 + sel, 1 + sel);
+  }
+  AppendEnd(&code);
+
+  return {"Vop2SdwaOrByteDestinations",
+          code,
+          {},
+          {0xff223344u, 0xa1b2c3fcu, 0xa1b2fcd4u, 0xa1fcc3d4u, 0xfcb2c3d4u},
+          {O::V_MOV_B32, O::V_OR_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+}
+
 TestCase Vop3CvtPkI16I32Captured() {
   using O = ShaderOpcode;
 
@@ -30703,6 +30731,7 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(Vop2SdwaMaxI32CapturedHighWord(64));
   AddCase(Vop2SdwaLshrrevCapturedByte1Source);
   AddCase(Vop2SdwaSubNcPreservesByteAndWordDestinations);
+  AddCase(Vop2SdwaOrByteDestinations);
   AddCase(Vop3CvtPkI16I32Captured);
   AddCase(Vop3MulLoU16CapturedAndSelectors);
   AddCase(Vop3MadI16CapturedSelectorsAndSaturation);

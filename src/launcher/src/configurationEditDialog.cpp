@@ -7,6 +7,7 @@
 
 #include <QAbstractItemView>
 #include <QCheckBox>
+#include <QColorDialog>
 #include <QComboBox>
 #include <QCoreApplication>
 #include <QDir>
@@ -39,6 +40,22 @@
 constexpr char SETTINGS_CFG_DIALOG[]               = "ConfigurationEditDialog";
 constexpr char SETTINGS_CFG_LAST_GEOMETRY[]        = "geometry";
 constexpr int  GLOBAL_SETTINGS_GAME_DIRS_MIN_WIDTH = 560;
+
+static void UpdateControllerColorButton(QPushButton* button, const QString& hex) {
+	const QColor color(hex);
+	if (!color.isValid()) {
+		button->setProperty("controllerColor", QString {});
+		button->setText(QObject::tr("Custom"));
+		button->setStyleSheet({});
+		return;
+	}
+	const auto normalized = color.name(QColor::HexRgb);
+	button->setProperty("controllerColor", normalized);
+	button->setText(normalized.toUpper());
+	button->setStyleSheet(QStringLiteral("background-color: %1; color: %2;")
+	                          .arg(normalized, color.lightness() < 128 ? QStringLiteral("white")
+	                                                                   : QStringLiteral("black")));
+}
 
 const QStringList CONSOLE_LANGUAGE_NAMES = {
     "Japanese",
@@ -110,6 +127,21 @@ ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* p
 	connect(m_ui->ok_button, &QPushButton::clicked, this, &ConfigurationEditDialog::save);
 	connect(m_ui->cancel_button, &QPushButton::clicked, this, &QDialog::reject);
 	connect(m_ui->clear_button, &QPushButton::clicked, this, &ConfigurationEditDialog::clear);
+	connect(m_ui->button_controller_color, &QPushButton::clicked, this, [this]() {
+		const auto current = m_ui->button_controller_color->property("controllerColor").toString();
+		const auto initial =
+		    current.isEmpty() ? QColor(QStringLiteral("#0070d1")) : QColor(current);
+		const auto color = QColorDialog::getColor(initial, this, tr("DualSense lightbar color"));
+		if (color.isValid()) {
+			const auto hex = color.name(QColor::HexRgb);
+			UpdateControllerColorButton(m_ui->button_controller_color, hex);
+			emit PreviewControllerColor(hex);
+		}
+	});
+	connect(m_ui->button_controller_color_reset, &QPushButton::clicked, this, [this]() {
+		UpdateControllerColorButton(m_ui->button_controller_color, {});
+		emit PreviewControllerColor({});
+	});
 	connect(m_ui->comboBox_shader_log_direction, &QComboBox::currentTextChanged, this,
 	        [this](const QString& text) {
 		        auto log = TextToEnum<Configuration::LogDirection>(text);
@@ -169,6 +201,7 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->lineEdit_user_name->setMaxLength(static_cast<int>(Config::MAX_USER_NAME_LENGTH));
 	m_ui->lineEdit_user_name->setText(info.user_name);
 	m_ui->spinBox_user_id->setValue(info.user_id);
+	UpdateControllerColorButton(m_ui->button_controller_color, info.controller_color);
 	auto* microphone = m_ui->comboBox_audio_input_device;
 	microphone->clear();
 	microphone->addItem(tr("None"), QString {});
@@ -370,6 +403,7 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui) {
 	info.user_name = ui.lineEdit_user_name->text().trimmed();
 	info.user_id   = ui.spinBox_user_id->value();
 	info.audio_input_device = ui.comboBox_audio_input_device->currentData().toString();
+	info.controller_color   = ui.button_controller_color->property("controllerColor").toString();
 	info.screen_resolution =
 	    TextToEnum<Configuration::Resolution>(ui.comboBox_screen_resolution->currentText());
 	info.present_mode =
@@ -427,6 +461,7 @@ void ConfigurationEditDialog::save() {
 void ConfigurationEditDialog::clear() {
 	Configuration default_info;
 	Init(default_info);
+	emit PreviewControllerColor({});
 
 	if (m_show_game_dirs) {
 		m_game_dirs_list->clear();

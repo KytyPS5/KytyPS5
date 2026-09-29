@@ -53,6 +53,7 @@ static void PrintUsage() {
 	::printf("  --user-id <num>                      Local user ID. Default: %d.\n",
 	         Config::DEFAULT_USER_ID);
 	::printf("  --mic <name>                        Capture from this microphone; omit for silence.\n");
+	::printf("  --controller-color <#RRGGBB>        Override the controller lightbar color.\n");
 	::printf(
 	    "  --present-mode <value>               Fifo, Mailbox, or Immediate. Default: Mailbox.\n");
 	::printf(
@@ -142,6 +143,20 @@ static bool ParseUint32(const std::string& value, uint32_t& out) {
 		return false;
 	}
 	out = number;
+	return true;
+}
+
+static bool ParseControllerColor(const std::string& value, Config::ControllerColor& out) {
+	if (value.size() != 7 || value[0] != '#') {
+		return false;
+	}
+	uint32_t rgb = 0;
+	auto [end, error] = std::from_chars(value.data() + 1, value.data() + value.size(), rgb, 16);
+	if (error != std::errc {} || end != value.data() + value.size()) {
+		return false;
+	}
+	out = {static_cast<uint8_t>(rgb >> 16), static_cast<uint8_t>(rgb >> 8),
+	       static_cast<uint8_t>(rgb)};
 	return true;
 }
 
@@ -302,6 +317,13 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			}
 		} else if (arg == "--mic") {
 			options.config.audio_input_device = value;
+		} else if (arg == "--controller-color") {
+			Config::ControllerColor color {};
+			if (!ParseControllerColor(value, color)) {
+				::printf("invalid controller color (expected #RRGGBB): %s\n", value.c_str());
+				return false;
+			}
+			options.config.controller_color = color;
 		} else if (arg == "--present-mode") {
 			if (!ParseEnum(value, options.config.present_mode)) {
 				::printf("invalid present mode: %s\n", value.c_str());

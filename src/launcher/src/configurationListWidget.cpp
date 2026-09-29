@@ -751,6 +751,8 @@ void ConfigurationListWidget::edit_configuration() {
 	auto                    info = CreateConfiguration(*item);
 	ConfigurationEditDialog dlg(*info, this);
 	dlg.setWindowTitle(tr("Edit game settings"));
+	connect(&dlg, &ConfigurationEditDialog::PreviewControllerColor, this,
+	        &ConfigurationListWidget::PreviewControllerColor);
 
 	if (dlg.exec() == QDialog::Accepted) {
 		info->custom_settings           = true;
@@ -761,6 +763,8 @@ void ConfigurationListWidget::edit_configuration() {
 		WriteSettings();
 		item->Update();
 		SelectItem(item);
+	} else {
+		emit Select();
 	}
 }
 
@@ -788,6 +792,8 @@ void ConfigurationListWidget::edit_global_settings() {
 	ConfigurationEditDialog dlg(info, this);
 	dlg.setWindowTitle(tr("Global settings"));
 	dlg.SetGameDirectories(m_game_dirs);
+	connect(&dlg, &ConfigurationEditDialog::PreviewControllerColor, this,
+	        &ConfigurationListWidget::PreviewControllerColor);
 
 	if (dlg.exec() == QDialog::Accepted) {
 		m_global_info.CopyEmulatorSettingsFrom(info);
@@ -799,6 +805,7 @@ void ConfigurationListWidget::edit_global_settings() {
 			ScanGameDirectory();
 		}
 	}
+	emit Select();
 }
 
 void ConfigurationListWidget::edit_input_mapping() {

@@ -297,6 +297,9 @@ void GameController::Connect(int id) {
 	if (id != HOST_INPUT_CONTROLLER_ID) {
 		if (auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(id));
 		    pad != nullptr) {
+			if (const auto& color = Config::GetControllerColor()) {
+				(void)SDL_SetGamepadLED(pad, (*color)[0], (*color)[1], (*color)[2]);
+			}
 			for (auto sensor: {SDL_SENSOR_ACCEL, SDL_SENSOR_GYRO}) {
 				if (SDL_GamepadHasSensor(pad, sensor) &&
 				    !SDL_SetGamepadSensorEnabled(pad, sensor, true)) {
@@ -581,6 +584,11 @@ int GameController::GetActiveControllerId() {
 
 void GameController::SetLightBar(uint8_t r, uint8_t g, uint8_t b) {
 	Common::LockGuard lock(m_mutex);
+	if (const auto& color = Config::GetControllerColor()) {
+		r = (*color)[0];
+		g = (*color)[1];
+		b = (*color)[2];
+	}
 	if (auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(m_active_id));
 	    pad != nullptr) {
 		(void)SDL_SetGamepadLED(pad, r, g, b);

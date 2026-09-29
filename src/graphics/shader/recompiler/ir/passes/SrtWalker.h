@@ -17,6 +17,10 @@ struct SrtRuntime {
 	SrtMemoryReader           read_memory                = nullptr;
 	void*                     userdata                   = nullptr;
 	SrtMemoryReader           read_specialization_memory = nullptr;
+	// Accept image atomics on k32Float descriptors: upstream's float atomics, and integer atomics
+	// run as uint atomics on the raw bits. On by default, as in the emulator; the emulator passes
+	// --no-float-image-atomics through here.
+	bool                      float_image_atomics        = true;
 };
 
 enum class RuntimeValueType { Any, Integer };

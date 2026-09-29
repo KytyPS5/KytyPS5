@@ -481,6 +481,12 @@ struct DescriptorSource {
 		uint32_t selector_stride = 0;
 		uint32_t selector_offset = 0;
 		uint32_t table_offset    = 0;
+		// The key is (material word >> key_shift) & key_mask; identity unless the shader packs
+		// two keys into one word.
+		uint32_t key_shift = 0;
+		uint32_t key_mask  = UINT32_MAX;
+		// No enumeration: the shader looks the key up in the bindless translation table.
+		bool     bindless  = false;
 		Value    key_count;
 		Value    selector_mask;
 

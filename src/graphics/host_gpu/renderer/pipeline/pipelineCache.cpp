@@ -325,6 +325,7 @@ struct PipelineCache::ProgramCache {
 		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),
 		    .read_specialization_memory = ReadShaderGuestMemory,
+		    .float_image_atomics        = Config::FloatImageAtomicsEnabled(),
 		};
 		if (entry != programs.end()) {
 			if (!ShaderRecompiler::IR::MaterializeResources(

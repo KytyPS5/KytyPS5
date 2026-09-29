@@ -21962,6 +21962,37 @@ TestCase VectorDppBoundsControlZeroPreservesDestination() {
   return test;
 }
 
+// DPP16 with FI=0 and BC=0: a lane whose source lane is inactive is not written, as with an
+// out-of-range source. Lane 3 is off, so lane 4 (row_shr:1 reads lane 3) keeps its value.
+TestCase VectorDppInactiveSourcePreservesDestination() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 2, 0xaaaaaaaau);
+  AppendVMovU32(&code, 1, 100);
+  AppendSMovLiteral(&code, 126, 0x000000f7u);
+  code.push_back(EncodeVop2(0x25, 2, 250, 1));
+  code.push_back(EncodeVop2Dpp(0, 0x111));
+  AppendSMovLiteral(&code, 126, 0x000000ffu);
+  code.push_back(EncodeVop2(0x1a, 3, InlineU32(2), 0));
+  AppendBufferStoreDword(&code, 2, 3);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "VectorDppInactiveSourcePreservesDestination";
+  test.code = code;
+  test.expected = {0xaaaaaaaau, 100, 101, 0xaaaaaaaau, 0xaaaaaaaau, 104, 105, 106};
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::V_ADD_NC_U32, O::V_LSHLREV_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.wave_size = 32;
+  test.compute_info.threads_num[0] = 8;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase Vop3FmacF32NegatedSourceAccumulates() {
   using O = ShaderOpcode;
 
@@ -30825,6 +30856,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorDppRowXmask);
   AddCase(VectorDppBankMaskPreservesDestination);
   AddCase(VectorDppBoundsControlZeroPreservesDestination);
+  AddCase(VectorDppInactiveSourcePreservesDestination);
   AddCase(Vop3FmacF32NegatedSourceAccumulates);
   AddCase(Vop3LdexpSourceModifier);
   AddCase(Vop1MoveRelSource);
@@ -35744,6 +35776,7 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, VectorDppRowXmask());
     RunCase(&vulkan, VectorDppBankMaskPreservesDestination());
     RunCase(&vulkan, VectorDppBoundsControlZeroPreservesDestination());
+    RunCase(&vulkan, VectorDppInactiveSourcePreservesDestination());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--cmpx-o-f32-only") == 0) {

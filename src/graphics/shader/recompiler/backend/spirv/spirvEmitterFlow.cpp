@@ -647,10 +647,30 @@ uint32_t EmitDppMoveU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	                                                ConstantU32(state, 0));
 }
 
+// Research: DPP16 with FI=0 treats an inactive source lane like an out-of-range one, so with BC=0
+// the destination lane is not written. A source lane the host has no invocation for (a pixel warp
+// with uncovered quads) exists on the hardware and holds the identity a reduction seeded it with;
+// leaving the destination unwritten has the same effect. A min-reduction combined those lanes as 0
+// instead, its loop picked an item no lane held, and the GPU hung (PS 0x7dce3261e625949c).
 uint32_t EmitDppUpdateU32(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto&      state = ctx.state;
 	const auto flags = inst.Flags<IR::DppMoveFlags>();
-	const auto write = EmitDppWriteCondition(ctx, flags, ctx.Arg(inst, 2));
-	return EmitNative<spv::OpSelect, IR::Type::U32>(ctx.state, write, ctx.Arg(inst, 0),
+	auto       write = EmitDppWriteCondition(ctx, flags, ctx.Arg(inst, 2));
+	if (!flags.dpp8) {
+		const auto target = EmitDppTargetLane(state, flags);
+		const auto host_lane =
+		    ctx.other_half != nullptr
+		        ? EmitBinaryU32(state, spv::OpBitwiseAnd, target.lane, ConstantU32(state, 31))
+		        : target.lane;
+		auto source_ok = EmitSubgroupLaneActiveBool(state, host_lane);
+		if (!flags.bound_control && !flags.fetch_inactive) {
+			source_ok = EmitNative<spv::OpLogicalAnd, IR::Type::U1>(
+			    state, source_ok,
+			    EmitBallotLaneActiveBool(state, ctx.Ballot(inst.Arg(2)), target.lane));
+		}
+		write = EmitNative<spv::OpLogicalAnd, IR::Type::U1>(state, write, source_ok);
+	}
+	return EmitNative<spv::OpSelect, IR::Type::U32>(state, write, ctx.Arg(inst, 0),
 	                                                ctx.Arg(inst, 1));
 }
 

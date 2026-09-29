@@ -37109,6 +37109,35 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, DsAtomic64Bounds(true));
     return 0;
   }
+  // Run only the cases whose name contains argv[2]. The --*-only flags below
+  // need a hand-written entry per group of cases; this needs none.
+  if (argc == 3 && std::strcmp(argv[1], "--case") == 0) {
+    const std::string wanted = argv[2];
+    VulkanHarness     vulkan;
+    u32               matched = 0;
+    for (const auto &test : MakeCases()) {
+      if (std::string_view(test.name).find(wanted) == std::string_view::npos) {
+        continue;
+      }
+      RunCase(&vulkan, test);
+      matched++;
+    }
+    for (const auto &test : MakeGraphicsCases()) {
+      if (std::string_view(test.name).find(wanted) == std::string_view::npos) {
+        continue;
+      }
+      RunGraphicsCase(&vulkan, test);
+      matched++;
+    }
+    if (matched == 0) {
+      std::printf("ShaderRecompilerComputeTests: no case matched \"%s\"\n",
+                  wanted.c_str());
+      return 1;
+    }
+    std::printf("ShaderRecompilerComputeTests: %u case(s) matched \"%s\"\n",
+                matched, wanted.c_str());
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--new-opcodes-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorCompareInteger64Edges());

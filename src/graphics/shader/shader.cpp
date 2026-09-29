@@ -764,9 +764,6 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 		                     group.primitive_group_size != 1u || group.vertex_group_size != 1u ||
 		                     user_vgpr.vgpr1 || user_vgpr.vgpr2 || user_vgpr.vgpr3 ||
 		                     mesh.max_vertices != sh.m_vgtGsMaxVertOut);
-	} else if (merged) {
-		EXIT_NOT_IMPLEMENTED(regs.gs_regs.rsrc1.gs_vgpr_component_count != 3u ||
-		                     regs.gs_regs.rsrc2.es_vgpr_component_count != 3u);
 	}
 	if ((user_config.GetPrimType() != Prospero::PrimitiveType::kPointList &&
 	     user_config.GetPrimType() != Prospero::PrimitiveType::kLineList &&

@@ -24041,7 +24041,9 @@ TestCase BranchVccnzUsesWaveMask() {
   TestCase test;
   test.name = "BranchVccnzUsesWaveMask";
   test.code = code;
-  test.expected = std::vector<u32>(8, 42);
+  // S_CBRANCH_VCCNZ diverges: only the lanes whose VCC bit is set take the
+  // branch. V_CMP_EQ_U32 sets VCC for v0 == 0, which is lane 0 of each group.
+  test.expected = {42u, 11u, 11u, 11u, 42u, 11u, 11u, 11u};
   test.opcodes = {O::V_MOV_B32,          O::V_LSHLREV_B32,   O::V_ADD_NC_U32,
                   O::V_CMP_EQ_U32,       O::S_CBRANCH_VCCNZ, O::S_BRANCH,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
@@ -26148,7 +26150,9 @@ TestCase BranchVccnzUsesCarryProducedWaveMask() {
   std::vector<u32> code = {
       EncodeVop1(0x01, 1, 0),          EncodeVop2(0x1a, 1, InlineU32(2), 1),
       EncodeVop2(0x25, 1, Vgpr(0), 1), EncodeVop2(0x1a, 3, InlineU32(2), 1),
-      EncodeVopc(0xc0, Vgpr(0), 0),
+      // V_CMP_F_U32 takes its predicate from an implicit src2 of 0, which is
+      // "always false". V_CMP_EQ_U32 actually sets the carry-in for lane 0.
+      EncodeVopc(0xc2, Vgpr(0), 0),
   };
   AppendVMovLiteral(&code, 2, 0xffffffffu);
   code.push_back(EncodeVop2(0x28, 5, Vgpr(2), 1));

@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
+#include "graphics/shader/recompiler/frontend/decode/ShaderFunctions.h"
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
@@ -264,8 +265,11 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 
 		case O::S_NOP:
 		case O::S_SLEEP:
-		case O::S_SETPRIO:
-		case O::S_TRAP: EmitControlNop(); return;
+		case O::S_SETPRIO: EmitControlNop(); return;
+		case O::S_TRAP:
+			// Retail GPUs run with traps disabled, so a guest assert falls through.
+			EmitControlNop();
+			return;
 		case O::S_WAITCNT_DEPCTR: return;
 		case O::S_BARRIER: S_BARRIER(); return;
 		case O::S_SENDMSG: S_SENDMSG(inst); return;

@@ -710,6 +710,12 @@ void DefineModule(EmitterState& state) {
 		                               state.input_info.vertex->mesh.max_vertices);
 		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeOutputPrimitivesEXT,
 		                               state.input_info.vertex->mesh.max_primitives);
+		if (state.mesh_passes > 1u) {
+			state.mesh_pass_variable = state.builder.DefineGlobalVariable(
+			    TypePointer(state, spv::StorageClassPrivate, TypeU32(state)),
+			    spv::StorageClassPrivate);
+			state.builder.AddName(state.mesh_pass_variable, "mesh_pass");
+		}
 	}
 	if (state.program.stage == ShaderType::TessellationControl ||
 	    state.program.stage == ShaderType::TessellationEvaluation) {
@@ -821,6 +827,8 @@ void DefineModule(EmitterState& state) {
 				local_x = 2u;
 			}
 		}
+		// A pass runs 1/mesh_passes of the waves (mesh threads are one-dimensional).
+		local_x /= state.mesh_passes;
 		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeLocalSize, local_x,
 		                               local_y, local_z);
 	}

@@ -30,6 +30,7 @@
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
+#include <mutex>
 #include <span>
 #include <string>
 #include <spirv-tools/libspirv.hpp>
@@ -779,17 +780,24 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		auto& mesh              = vertex_info[0].mesh;
 		mesh.host_subgroup_size = m_graphics.subgroup_size;
 		const auto& limits      = m_graphics.mesh_shader_properties;
-		const auto  logical_threads =
-		    mesh.threads_num[0] * mesh.threads_num[1] * mesh.threads_num[2];
-		const auto host_threads = ((logical_threads + mesh.wave_size - 1u) / mesh.wave_size) *
-		                          std::min(mesh.host_subgroup_size, mesh.wave_size);
-		if (host_threads > limits.maxMeshWorkGroupInvocations ||
-		    host_threads > limits.maxMeshWorkGroupSize[0] ||
-		    mesh.max_vertices > limits.maxMeshOutputVertices ||
+		// A subgroup with more threads than a mesh workgroup may have (NVIDIA: 128) runs its
+		// waves in passes; see EmitMeshEntryPoint.
+		mesh.passes = mesh.PassesFor(
+		    std::min(limits.maxMeshWorkGroupInvocations, limits.maxMeshWorkGroupSize[0]));
+		if (mesh.passes == 0 || mesh.max_vertices > limits.maxMeshOutputVertices ||
 		    mesh.max_primitives > limits.maxMeshOutputPrimitives ||
 		    mesh.lds_size_dwords * sizeof(uint32_t) > limits.maxMeshSharedMemorySize) {
-			EXIT("mesh shader exceeds host limits: threads=%u vertices=%u primitives=%u LDS=%u\n",
-			     host_threads, mesh.max_vertices, mesh.max_primitives, mesh.lds_size_dwords);
+			// Skipped like the draws of a shader that gives up, and reported once per shader.
+			static std::mutex                   logged_mutex;
+			static std::unordered_set<uint64_t> logged;
+			std::lock_guard                     lock(logged_mutex);
+			if (logged.insert(vertex_params[0].hash).second) {
+				LOGF("mesh shader 0x%016" PRIx64 " exceeds host limits, draws skipped: wave%u "
+				     "threads=%u vertices=%u primitives=%u LDS=%u\n",
+				     vertex_params[0].hash, mesh.wave_size, mesh.HostThreads(), mesh.max_vertices,
+				     mesh.max_primitives, mesh.lds_size_dwords);
+			}
+			return {};
 		}
 	}
 	ShaderParams pixel_params;

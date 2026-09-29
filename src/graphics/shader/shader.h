@@ -88,7 +88,27 @@ struct ShaderMeshInputInfo: ShaderWorkgroupInputInfo {
 	uint32_t max_vertices         = 0;
 	uint32_t max_primitives       = 0;
 	uint32_t provoking_vertex     = 0;
+	// A subgroup larger than a host mesh workgroup may be (VK_EXT_mesh_shader limits) runs its
+	// waves in this many sequential passes of equal size, each on the whole workgroup.
+	uint32_t passes               = 1;
 
+	[[nodiscard]] constexpr uint32_t Waves() const {
+		return (threads_num[0] * threads_num[1] * threads_num[2] + wave_size - 1u) / wave_size;
+	}
+	// Host invocations for all waves at once: a wave64 on a 32-wide subgroup takes 32.
+	[[nodiscard]] constexpr uint32_t HostThreads() const {
+		return Waves() * (host_subgroup_size < wave_size ? host_subgroup_size : wave_size);
+	}
+	// The fewest passes of whole waves whose invocations fit max_invocations; 0 when none do.
+	[[nodiscard]] constexpr uint32_t PassesFor(uint32_t max_invocations) const {
+		const auto waves = Waves();
+		for (uint32_t count = 1; count <= waves; count++) {
+			if (waves % count == 0 && HostThreads() / count <= max_invocations) {
+				return count;
+			}
+		}
+		return waves == 0 ? 1u : 0u;
+	}
 	[[nodiscard]] constexpr uint32_t InputPrimitiveSize() const {
 		switch (static_cast<Prospero::PrimitiveType>(input_primitive)) {
 			case Prospero::PrimitiveType::kPointList: return 1u;

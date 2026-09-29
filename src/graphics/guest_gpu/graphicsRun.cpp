@@ -425,12 +425,22 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 		return;
 	}
 
+	// Labels often share a page with bytes the GPU wrote. A plain write then faults and downloads
+	// the page, draining the GPU; WriteClean writes both copies instead.
+	auto& cache = m_renderer.GetBufferCache();
 	if (write_one_address) {
+		if (cache.WriteClean(reinterpret_cast<uint64_t>(dst), &src[dw_num - 1], sizeof(uint32_t))) {
+			return;
+		}
 		for (uint32_t i = 0; i < dw_num; i++) {
 			dst[0] = src[i];
 		}
 	} else {
-		memcpy(dst, src, static_cast<size_t>(dw_num) * sizeof(uint32_t));
+		const auto bytes = static_cast<size_t>(dw_num) * sizeof(uint32_t);
+		if (cache.WriteClean(reinterpret_cast<uint64_t>(dst), src, bytes)) {
+			return;
+		}
+		memcpy(dst, src, bytes);
 	}
 }
 

@@ -29,6 +29,16 @@ public:
 	void               MarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size);
 	void               UntrackMemory(uint64_t vaddr, uint64_t size);
+	// Calls func(address, bytes) for each part of the range, one per tracker region, that may
+	// hold CPU-dirty pages (lock-free summaries: false is exact, true is conservative).
+	template <typename Func>
+	void ForEachMaybeCpuDirtyRegion(uint64_t vaddr, uint64_t size, Func&& func) {
+		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			if (manager->MaybeModified<DirtySource::Cpu>()) {
+				func(manager->GetCpuAddr() + offset, bytes);
+			}
+		});
+	}
 	// Removes protection from a range and flushes GPU-owned data when required.
 	template <typename Flush>
 	void InvalidateRegion(uint64_t vaddr, uint64_t size, Flush&& on_flush) noexcept {

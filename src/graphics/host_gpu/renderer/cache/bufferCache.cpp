@@ -17,6 +17,7 @@
 #include <cinttypes>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <utility>
 #include <vector>
 
@@ -112,6 +113,8 @@ void BufferCache::DeleteBuffer(BufferId id) {
 }
 
 bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	// One reservation cannot exceed the download ring, so a larger range goes in ring-sized
+	// windows; a window that does not fit drains the ring before it is mapped.
 	const auto capacity = m_download_buffer.Size();
 	bool       any      = false;
 	for (uint64_t offset = 0; offset < size; offset += capacity) {
@@ -128,10 +131,12 @@ bool BufferCache::DownloadBufferWindow(Buffer& buffer, uint64_t vaddr, uint64_t 
 	    vaddr, size, [&](uint64_t address, uint64_t bytes) noexcept {
 		    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, address, bytes,
 		                                           "buffer download");
+		    std::unique_lock lock(m_dirty_ranges_mutex);
 		    m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t end) {
 			    copies.emplace_back(start - buffer_address, total_size, end - start);
 			    // Keep packed ranges on separate cache lines, as in shadPS4.
 			    total_size += Common::AlignUp(end - start, 64);
+			    m_downloading_ranges.Add(start, end - start);
 		    });
 		    m_gpu_modified_ranges.Subtract(address, bytes);
 	    });
@@ -214,6 +219,10 @@ void BufferCache::DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCop
 			Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
 			                                      mapped + (copy.dstOffset - offset), copy.size);
 		}
+		std::unique_lock lock(m_dirty_ranges_mutex);
+		for (const auto& copy: copies) {
+			m_downloading_ranges.Subtract(buffer_address + copy.srcOffset, copy.size);
+		}
 	});
 }
 
@@ -273,6 +282,34 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
 }
 
+bool BufferCache::WriteClean(uint64_t vaddr, const void* data, uint64_t size) {
+	if (!GuestGpu::IsGpuThread() || size == 0 || !GuestRange {vaddr, size}.Valid() ||
+	    !m_memory_tracker.IsRegionGpuModified(vaddr, size)) {
+		return false;
+	}
+	{
+		// A download publishes the GPU's older value of these bytes when it lands.
+		std::shared_lock lock(m_dirty_ranges_mutex);
+		if (m_downloading_ranges.Intersects(vaddr, size)) {
+			return false;
+		}
+	}
+
+	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
+	if (owner == nullptr || !*owner || !m_slot_buffers[*owner].IsInBounds(vaddr, size) ||
+	    !Libs::LibKernel::Memory::TryWriteBacking(vaddr, data, size)) {
+		return false;
+	}
+	WriteDataBuffer(m_slot_buffers[*owner], vaddr, data, size);
+	if (HasGpuDirtyBytes(vaddr, size)) {
+		// Overwritten in full: guest memory holds the value the GPU copy will have.
+		std::unique_lock lock(m_dirty_ranges_mutex);
+		m_gpu_modified_ranges.Subtract(vaddr, size);
+	}
+	m_texture_cache.InvalidateMemory(vaddr, size);
+	return true;
+}
+
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
@@ -284,6 +321,22 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			return;
 		}
 		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
+
+		// The page is protected as GPU-written, but none of its bytes are waiting for a download:
+		// the bytes the GPU wrote are elsewhere in the window, or were downloaded with another
+		// page. The page is current, so lift its protection. Downloading the window instead drained
+		// the GPU (~30 ms a fault) for guest reads of structs next to the command processor's
+		// labels.
+		const auto page_begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+		const auto page_end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
+		if (m_memory_tracker.IsRegionGpuModified(page_begin, page_end - page_begin) &&
+		    !HasGpuDirtyBytes(page_begin, page_end - page_begin)) {
+			m_memory_tracker.UnmarkRegionAsGpuModified(page_begin, page_end - page_begin);
+			if (is_write) {
+				m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+			}
+			return;
+		}
 
 		// Widen nearby CPU reads so they share one GPU drain.
 		constexpr uint64_t WindowSize   = 512 * 1024;
@@ -510,6 +563,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	TouchBuffer(buffer);
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
+		std::unique_lock lock(m_dirty_ranges_mutex);
 		m_gpu_modified_ranges.Add(vaddr, size);
 	}
 	return {&buffer, buffer.Offset(vaddr)};
@@ -687,6 +741,13 @@ void BufferCache::RunGarbageCollector() {
 
 void BufferCache::ProcessFaultBuffer() {
 	m_fault_manager.ProcessFaultBuffer();
+}
+
+void BufferCache::SynchronizeCpuDirtyBuffersInRange(uint64_t vaddr, uint64_t size) {
+	m_memory_tracker.ForEachMaybeCpuDirtyRegion(
+	    vaddr, size, [this](uint64_t address, uint64_t bytes) {
+		    SynchronizeBuffersInRange(address, bytes);
+	    });
 }
 
 void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {

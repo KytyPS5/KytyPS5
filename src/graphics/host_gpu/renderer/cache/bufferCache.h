@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include <map>
+#include <shared_mutex>
 #include <span>
 #include <utility>
 #include <vector>
@@ -150,16 +151,21 @@ private:
 	Buffer                                             m_bda_pagetable_buffer;
 	Common::SlotVector<Buffer>                         m_slot_buffers;
 	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_lru_cache;
-	BufferMap                                         m_buffers;
-	PageTable                                         m_page_table;
-	RangeSet                                          m_gpu_modified_ranges;
-	MemoryTracker                                     m_memory_tracker;
-	StreamBuffer                                      m_staging_buffer;
-	StreamBuffer                                      m_stream_buffer;
-	StreamBuffer                                      m_download_buffer;
-	StreamBuffer                                      m_device_buffer;
-	TextureCache&                                     m_texture_cache;
-	uint64_t                                          m_total_used_memory  = 0;
+	BufferMap                                          m_buffers;
+	PageTable                                          m_page_table;
+	RangeSet                                           m_gpu_modified_ranges;
+	// Bytes whose download is recorded but not yet in guest memory.
+	RangeSet                                           m_downloading_ranges;
+	// Guards changes to both range sets (GPU thread and download completions) against
+	// IsCleanForConcurrentRead; the GPU thread reads them without it.
+	mutable std::shared_mutex                          m_dirty_ranges_mutex;
+	MemoryTracker                                      m_memory_tracker;
+	StreamBuffer                                       m_staging_buffer;
+	StreamBuffer                                       m_stream_buffer;
+	StreamBuffer                                       m_download_buffer;
+	StreamBuffer                                       m_device_buffer;
+	TextureCache&                                      m_texture_cache;
+	uint64_t                                           m_total_used_memory = 0;
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;

@@ -655,7 +655,7 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 	destination.ClearBufferModified();
 }
 
-void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint32_t mip,
+bool TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint32_t mip,
                                 uint32_t layer) {
 	RefreshCopySource(source_id);
 	auto& destination = m_slot_images[destination_id];
@@ -665,11 +665,31 @@ void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint3
 		EXIT("TextureCache: invalid mip-copy ownership or sample count\n");
 	}
 	if (!destination.CopyMip(source, mip, layer)) {
-		return;
+		return false;
 	}
 	if (source.IsGpuModified()) {
 		destination.MarkGpuModified();
 	}
+	return true;
+}
+
+// A mip copy is skipped when the destination has no host level for that mip, which happens once the
+// guest mip tail is clamped to the host chain. Freeing the source then would discard GPU-written
+// contents that the destination cannot hold and the guest address space no longer has, so the
+// source is only dropped when the transfer happened or its contents are still in guest memory.
+// A retained source keeps its GPU-modified mark, so the garbage collector reclaims it by
+// downloading it first.
+void TextureCache::FreeCopySource(ImageId source_id, bool copied) {
+	auto& source = m_slot_images[source_id];
+	if (copied || !source.IsGpuModified()) {
+		FreeImage(source_id);
+		return;
+	}
+	LOGF_COLOR(Log::Color::BrightYellow,
+	           "TextureCache: retained a GPU-modified mip-copy source with no host destination "
+	           "level: addr=0x%016" PRIx64 " levels=%u host_levels=%u layers=%u\n",
+	           source.info.data.address, source.info.resources.levels,
+	           std::max(source.backing.mip_levels, 1u), source.info.resources.layers);
 }
 
 ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
@@ -866,9 +886,9 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		}
 		cached.binding.needs_rebind |= cached.binding.is_bound || cached.binding.is_target;
 		m_slot_images[merged_id].binding.is_target |= cached.binding.is_target;
-		CopyImageMip(merged_id, cached_id, static_cast<uint32_t>(mip),
-		             static_cast<uint32_t>(layer));
-		FreeImage(cached_id);
+		const bool copied = CopyImageMip(merged_id, cached_id, static_cast<uint32_t>(mip),
+		                                 static_cast<uint32_t>(layer));
+		FreeCopySource(cached_id, copied);
 		return {merged_id};
 	}
 	if (requested.data.address >= cached.info.data.address && safe_to_delete) {
@@ -889,13 +909,14 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 	InitializeImage(expanded_id);
 	const int32_t mip = source.info.MipOf(info);
 	const int32_t layer = source.info.SliceOf(info, mip);
+	bool          copied = true;
 	if (layer >= 0) {
-		CopyImageMip(expanded_id, source_id, static_cast<uint32_t>(mip),
-		             static_cast<uint32_t>(layer));
+		copied = CopyImageMip(expanded_id, source_id, static_cast<uint32_t>(mip),
+		                      static_cast<uint32_t>(layer));
 	} else {
 		CopyImage(expanded_id, source_id);
 	}
-	FreeImage(source_id);
+	FreeCopySource(source_id, copied);
 	return expanded_id;
 }
 

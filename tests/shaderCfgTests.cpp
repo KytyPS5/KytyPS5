@@ -10216,6 +10216,11 @@ void TestMeshExportStorage() {
     const auto reg = std::ranges::find(layout.user_data_registers, 13u);
     Check(reg != layout.user_data_registers.end(), "mesh shader lost user s13");
     const auto source = DisassembleSpirvBinary(result.spirv);
+    // A vertex exported at (0,0,0,0) marks its bit, and primitives using it are culled.
+    Check(source.find("OpAtomicOr") != std::string::npos &&
+              source.find("OpAll") != std::string::npos &&
+              source.find("OpLogicalOr") != std::string::npos,
+          "mesh shader lost the zero-position primitive cull");
     for (const auto dword :
          {static_cast<uint32_t>(reg - layout.user_data_registers.begin()),
           layout.memory_offset_dword}) {
@@ -10262,8 +10267,9 @@ void TestMeshExportStorage() {
     }
     // The Pathless shader 35869c17ce783c88 exceeds the host's 28 KiB budget
     // when its four vertex exports and primitive exports are shared arrays.
-    Check(shared_bytes == 3840u * 4u + 192u * 4u + 8u && shared_bytes <= 28672u,
-          "mesh staging must retain guest LDS, shared Layer and allocation within the host budget");
+    Check(shared_bytes == 3840u * 4u + 192u * 4u + 8u + 6u * 4u && shared_bytes <= 28672u,
+          "mesh staging must retain guest LDS, shared Layer, allocation and the zero-position "
+          "mask within the host budget");
     Check(private_bytes == (4u * 16u + 4u) * (64u / subgroup_size),
           "mesh vertex and primitive exports lost their separate logical-lane storage");
   }

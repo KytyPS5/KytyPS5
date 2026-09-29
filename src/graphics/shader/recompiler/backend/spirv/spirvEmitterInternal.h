@@ -126,6 +126,14 @@ struct EmitterState {
 	uint32_t                   mesh_primitive_data                   = 0;
 	uint32_t                   mesh_primitives                       = 0;
 	uint32_t                   mesh_cull                             = 0;
+	uint32_t                   mesh_zero_position_mask               = 0;
+	uint32_t                   mesh_zero_position_words              = 0;
+	// A subgroup larger than the host workgroup runs in mesh_passes passes (ShaderMeshInputInfo):
+	// mesh_pass_variable holds the current pass, and the guest program is cut at its barriers
+	// into mesh_segment_funcs, each called once per pass.
+	uint32_t                   mesh_passes                           = 1;
+	uint32_t                   mesh_pass_variable                    = 0;
+	std::vector<uint32_t>      mesh_segment_funcs;
 	uint32_t                   entry_label                           = 0;
 	uint32_t                   current_label                         = 0;
 	const IR::Block*           current_block                         = nullptr;

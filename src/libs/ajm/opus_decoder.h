@@ -1,9 +1,11 @@
 #pragma once
 
+#include "common/logging/log.h"
 #include "libs/ajm/decoder.h"
 #include "libs/ajm/ffmpeg_decoder_common.h"
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 
 namespace Libs::Audio::Ajm {
@@ -21,6 +23,24 @@ struct AjmSidebandDecOpusCodecInfo {
 static_assert(sizeof(AjmDecOpusInitializeParameters) == 12);
 static_assert(sizeof(AjmSidebandDecOpusCodecInfo) == 4);
 
+// Channel mapping family 1 (RFC 7845, 5.1.1.2): Vorbis channel order with a stream layout fixed by
+// the channel count. AJM passes only the count, so the standard layout is assumed.
+struct AjmOpusVorbisLayout {
+	uint8_t streams;
+	uint8_t coupled;
+	uint8_t mapping[8];
+};
+inline constexpr std::array<AjmOpusVorbisLayout, 8> AjmOpusVorbisLayouts {{
+    {1, 0, {0}},
+    {1, 1, {0, 1}},
+    {2, 1, {0, 2, 1}},
+    {2, 2, {0, 1, 2, 3}},
+    {3, 2, {0, 4, 1, 2, 3}},
+    {4, 2, {0, 4, 1, 2, 3, 5}},
+    {4, 3, {0, 4, 1, 2, 3, 5, 6}},
+    {5, 3, {0, 6, 1, 2, 3, 4, 5, 7}},
+}};
+
 class AjmOpusDecoder final: public AjmDecoder {
 public:
 	AjmOpusDecoder(uint32_t max_channels, AjmSampleEncoding encoding)
@@ -37,8 +57,11 @@ public:
 			return result;
 		}
 		const auto& params = *static_cast<const AjmDecOpusInitializeParameters*>(parameters);
-		if (params.channel_num == 0 || params.channel_num > 2 || params.sample_rate != 48000 ||
-		    params.mapping_family != 0) {
+		const bool family0 = params.mapping_family == 0 && params.channel_num >= 1 &&
+		                     params.channel_num <= 2;
+		const bool family1 = params.mapping_family == 1 && params.channel_num >= 1 &&
+		                     params.channel_num <= AjmOpusVorbisLayouts.size();
+		if ((!family0 && !family1) || params.sample_rate != 48000) {
 			result.result = AJM_RESULT_INVALID_PARAMETER | AJM_RESULT_FATAL;
 			return result;
 		}
@@ -52,6 +75,11 @@ public:
 		if (m_context != nullptr) {
 			av_channel_layout_default(&m_context->ch_layout, static_cast<int>(params.channel_num));
 			m_context->sample_rate = static_cast<int>(params.sample_rate);
+			if (family1 && !SetMultistreamHeader(params.channel_num)) {
+				avcodec_free_context(&m_context);
+			}
+		}
+		if (m_context != nullptr) {
 			if (avcodec_open2(m_context, codec, nullptr) < 0) {
 				avcodec_free_context(&m_context);
 			}
@@ -62,6 +90,32 @@ public:
 		}
 		SetFormat(params.channel_num, params.sample_rate, m_sample_encoding);
 		return MakeResult();
+	}
+
+	// FFmpeg reads a multistream layout from an OpusHead: magic, version 1, channel count,
+	// pre-skip 0 (AJM applies its own gapless skip), 48 kHz, gain 0, family 1, then the stream
+	// count, the coupled count and the channel mapping.
+	bool SetMultistreamHeader(uint32_t channels) {
+		const auto& layout = AjmOpusVorbisLayouts[channels - 1];
+		const auto  size   = 21 + static_cast<int>(channels);
+		LOGF("AJM Opus: multistream %u ch (%u streams, %u coupled)\n", channels,
+		     static_cast<unsigned>(layout.streams), static_cast<unsigned>(layout.coupled));
+		auto*       head   = static_cast<uint8_t*>(av_mallocz(size + AV_INPUT_BUFFER_PADDING_SIZE));
+		if (head == nullptr) {
+			return false;
+		}
+		std::memcpy(head, "OpusHead", 8);
+		head[8]  = 1;
+		head[9]  = static_cast<uint8_t>(channels);
+		head[12] = 48000u & 0xffu;
+		head[13] = (48000u >> 8u) & 0xffu;
+		head[18] = 1;
+		head[19] = layout.streams;
+		head[20] = layout.coupled;
+		std::memcpy(head + 21, layout.mapping, channels);
+		m_context->extradata      = head;
+		m_context->extradata_size = size;
+		return true;
 	}
 
 	void Reset() override {

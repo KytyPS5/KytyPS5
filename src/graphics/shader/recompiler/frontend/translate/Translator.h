@@ -88,7 +88,9 @@ private:
 	void          BUFFER_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode opcode);
 	void          IMAGE_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode opcode);
 	void DS_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool returns_value);
+	void DS_ADD_U64(const Decoder::Instruction& inst);
 	void FLAT_LOAD(const Decoder::Instruction& inst);
+	void FLAT_APERTURE(const Decoder::Instruction& inst, bool store);
 	void FLAT_STORE(const Decoder::Instruction& inst);
 	void IMAGE_GET_RESINFO(const Decoder::Instruction& inst);
 	void IMAGE_GET_LOD(const Decoder::Instruction& inst);

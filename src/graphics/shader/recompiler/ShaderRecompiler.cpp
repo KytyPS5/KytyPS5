@@ -899,6 +899,11 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		IR::RemoveIdentities(ir.blocks);
 		IR::EliminateDeadCode(ir.blocks);
 	}
+	if (const auto removed = IR::SimplifyLocalAddressStores(ir); removed != 0) {
+		LOGF("%s local-address proof: hash=0x%016" PRIx64 " removed_global_stores=%u\n",
+		     GetDumpLabel(options), options.shader_hash, removed);
+		IR::EliminateDeadCode(ir.blocks);
+	}
 	if (!LowerTessellationMemory(ir, options)) {
 		if (!options.non_fatal) {
 			EXIT("%s failed hash=0x%016" PRIx64 ": unsupported tessellation memory shape\n",

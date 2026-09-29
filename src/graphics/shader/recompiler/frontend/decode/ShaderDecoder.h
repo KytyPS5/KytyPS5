@@ -658,6 +658,10 @@ enum class OperandKind {
 	Scc,
 	M0,
 	PopsExitingWaveId,
+	SharedBase,
+	SharedLimit,
+	PrivateBase,
+	PrivateLimit,
 	Null,
 	Vgpr,
 	// A special register the recompiler does not model;

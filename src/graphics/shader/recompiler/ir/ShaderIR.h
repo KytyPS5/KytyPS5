@@ -23,6 +23,16 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
+// Research: flags of a SelectU32 that models a V_MOVRELD write to one register of the file.
+// Compilers never place descriptor registers inside a relatively indexed array, so a host-side
+// descriptor evaluation may take the unwritten (false) operand.
+inline constexpr uint64_t MovRelSelectFlags = 0x4d4f5652u; // "MOVR"
+
+// Emulated 64-bit FLAT apertures. Each contains 4 GiB of byte offsets and is
+// outside guest global VA space. Keep queries and FLAT routing consistent.
+inline constexpr uint32_t SharedApertureHigh = 0x70000000u;
+inline constexpr uint32_t PrivateApertureHigh = 0x80000000u;
+
 enum class ResourceKind {
 	None,
 	ScalarBuffer,

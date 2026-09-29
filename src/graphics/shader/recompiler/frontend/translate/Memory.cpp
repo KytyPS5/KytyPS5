@@ -2,6 +2,7 @@
 #include "common/logging/log.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 #include "graphics/shader/recompiler/frontend/decode/ImageOps.h"
+#include "graphics/shader/recompiler/frontend/translate/Translator.h"
 
 #include <algorithm>
 #include <array>
@@ -90,7 +91,7 @@ ResourceKind MemoryKind(const Decoder::Instruction& decoded) {
 	switch (decoded.family) {
 		case Decoder::Family::SMEM:
 			return IsScalarAddressLoad(decoded.opcode) ? ResourceKind::ScalarAddress
-			                                          : ResourceKind::ScalarBuffer;
+			                                           : ResourceKind::ScalarBuffer;
 		case Decoder::Family::MUBUF:
 		case Decoder::Family::MTBUF: return ResourceKind::Buffer;
 		case Decoder::Family::FLAT: return FlatSegmentResourceKind(decoded.memory_segment);
@@ -153,7 +154,6 @@ IR::MemoryInfo MemoryInfoFromDecoded(const Decoder::Instruction& decoded) {
 	}
 	return memory;
 }
-
 
 bool IsScalarBufferLoad(Decoder::Opcode opcode) {
 	switch (opcode) {
@@ -298,8 +298,7 @@ Translator::AddressOperands Translator::ReadAddressOperands(const Decoder::Instr
 		    high_or_base.kind != Decoder::OperandKind::Vgpr ? ReadU32(high_or_base) : low;
 		return {ir.Emit(IR::ValueOpcode::GetScratchResource), offset, IR::Value(0u)};
 	}
-	if (kind == IR::ResourceKind::Global &&
-	    high_or_base.kind != Decoder::OperandKind::Vgpr) {
+	if (kind == IR::ResourceKind::Global && high_or_base.kind != Decoder::OperandKind::Vgpr) {
 		const auto base_low  = ReadU32(high_or_base);
 		const auto base_high = ReadU32(OffsetOperand(high_or_base, 1u));
 		return {GetAddressResource(base_low, base_high), low, IR::Value(0u)};
@@ -544,10 +543,9 @@ void Translator::BUFFER_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode
 	} else {
 		const IR::Value value =
 		    memory.data_dwords == 2u ? IR::Value(ReadU64(data_src)) : IR::Value(ReadU32(data_src));
-		result = ir.Emit(opcode,
-		                 {resource, address.index, address.offset, address.soffset, value,
-		                  ir.GetExec()},
-		                 flags);
+		result = ir.Emit(
+		    opcode, {resource, address.index, address.offset, address.soffset, value, ir.GetExec()},
+		    flags);
 	}
 	if (inst.glc) {
 		WriteOperand(inst.dst, result);
@@ -580,7 +578,121 @@ void Translator::DS_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode opc
 	}
 }
 
+// DS_ADD_U64 (no return) as two 32-bit atomics: the low dword's add, then the high dword's add
+// with the low one's carry. The sum is exact; only a read between the two could see one half
+// updated.
+void Translator::DS_ADD_U64(const Decoder::Instruction& inst) {
+	auto memory            = MemoryInfoFromDecoded(inst);
+	memory.data_dwords     = 1u;
+	memory.component_count = 1u;
+	const auto address     = ReadU32(MemorySourceAt(inst, 1));
+	const auto data        = MemorySourceAt(inst, 0);
+	const auto low         = IR::U32(ReadU32(OffsetOperand(data, 0)));
+	const auto high        = IR::U32(ReadU32(OffsetOperand(data, 1)));
+	const auto old_low     = IR::U32(ir.Emit(IR::ValueOpcode::SharedAtomicIAdd32,
+	                                         {address, low, ir.GetExec()},
+	                                         AddMemoryInfo(memory, inst.pc)));
+	const auto carry = ir.Select(ir.ULessThan(ir.IAdd(old_low, low), old_low),
+	                             IR::U32(IR::Value(1u)), IR::U32(IR::Value(0u)));
+	auto high_memory = memory;
+	high_memory.offset += 4u;
+	ir.Emit(IR::ValueOpcode::SharedAtomicIAdd32, {address, ir.IAdd(high, carry), ir.GetExec()},
+	        AddMemoryInfo(high_memory, inst.pc));
+}
+
+void Translator::FLAT_APERTURE(const Decoder::Instruction& inst, bool store) {
+	const auto      memory = MemoryInfoFromDecoded(inst);
+	const auto      bits   = memory.data_bits;
+	IR::ValueOpcode address_op;
+	IR::ValueOpcode shared_op;
+	switch (bits) {
+		case 8u:
+			address_op = store ? IR::ValueOpcode::StoreAddressU8 : IR::ValueOpcode::LoadAddressU8;
+			shared_op  = store ? IR::ValueOpcode::WriteSharedU8 : IR::ValueOpcode::LoadSharedU8;
+			break;
+		case 16u:
+			address_op = store ? IR::ValueOpcode::StoreAddressU16 : IR::ValueOpcode::LoadAddressU16;
+			shared_op  = store ? IR::ValueOpcode::WriteSharedU16 : IR::ValueOpcode::LoadSharedU16;
+			break;
+		case 32u:
+			address_op = store ? IR::ValueOpcode::StoreAddressU32 : IR::ValueOpcode::LoadAddressU32;
+			shared_op  = store ? IR::ValueOpcode::WriteSharedU32 : IR::ValueOpcode::LoadSharedU32;
+			break;
+		default:
+			EXIT("opcode %s at pc 0x%08x has unsupported flat aperture width %u",
+			     Decoder::InstructionToString(inst).c_str(), inst.pc, bits);
+			return;
+	}
+	const auto address = ReadAddressOperands(inst, store ? 1u : 0u);
+	const auto zero    = IR::U32(IR::Value(0u));
+	const auto active  = ir.GetExec();
+	const auto count   = bits == 32u ? std::min(memory.data_dwords, 4u) : 1u;
+	for (uint32_t index = 0; index < count; ++index) {
+		// Classify the effective 64-bit address, including carry from the instruction
+		// offset and each component. A local offset must not wrap into its aperture.
+		const auto low =
+		    ir.IAdd(IR::U32(address.low), IR::U32(IR::Value(memory.offset + index * 4u)));
+		const auto carry =
+		    ir.Select(ir.ULessThan(low, IR::U32(address.low)), IR::U32(IR::Value(1u)), zero);
+		const auto high           = ir.IAdd(IR::U32(address.high), carry);
+		const auto shared         = ir.IEqual(high, IR::U32(IR::Value(IR::SharedApertureHigh)));
+		const auto private_memory = ir.IEqual(high, IR::U32(IR::Value(IR::PrivateApertureHigh)));
+		const auto global_active =
+		    ir.LogicalAnd(active, ir.LogicalNot(ir.LogicalOr(shared, private_memory)));
+		const auto shared_active    = ir.LogicalAnd(active, shared);
+		const auto private_active   = ir.LogicalAnd(active, private_memory);
+		auto       global_info      = memory;
+		global_info.offset          = 0;
+		global_info.data_dwords     = 1;
+		global_info.component_index = index;
+		global_info.kind            = IR::ResourceKind::Global;
+		auto shared_info            = global_info;
+		shared_info.kind            = IR::ResourceKind::Lds;
+		auto private_info           = global_info;
+		private_info.kind           = IR::ResourceKind::Scratch;
+		const auto resource         = GetAddressResource(low, high);
+		if (store) {
+			auto value = IR::Value(ReadU32(OffsetOperand(MemorySourceAt(inst, 0), index)));
+			if (bits != 32u) value = NarrowSubdword(IR::U32(value), bits);
+			ir.Emit(shared_op, {low, value, shared_active}, AddMemoryInfo(shared_info, inst.pc));
+			if (program.scratch_dwords != 0) {
+				ir.Emit(address_op,
+				        {ir.Emit(IR::ValueOpcode::GetScratchResource), low, zero, value,
+				         private_active},
+				        AddMemoryInfo(private_info, inst.pc));
+			}
+			// Retain the global store and its existing ownership-validation requirement.
+			ir.Emit(address_op, {resource, low, high, value, global_active},
+			        AddMemoryInfo(global_info, inst.pc));
+		} else {
+			const auto widen = [&](IR::Value value) {
+				return bits == 32u ? IR::U32(value)
+				                   : WidenSubdword(value, bits, memory.data_signed);
+			};
+			const auto global_value =
+			    widen(ir.Emit(address_op, {resource, low, high, global_active},
+			                  AddMemoryInfo(global_info, inst.pc)));
+			const auto shared_value = widen(
+			    ir.Emit(shared_op, {low, shared_active}, AddMemoryInfo(shared_info, inst.pc)));
+			auto private_value = zero;
+			if (program.scratch_dwords != 0) {
+				private_value = widen(ir.Emit(
+				    address_op,
+				    {ir.Emit(IR::ValueOpcode::GetScratchResource), low, zero, private_active},
+				    AddMemoryInfo(private_info, inst.pc)));
+			}
+			WriteOperand(OffsetOperand(inst.dst, index),
+			             ir.Select(shared, shared_value,
+			                       ir.Select(private_memory, private_value, global_value)));
+		}
+	}
+}
+
 void Translator::FLAT_LOAD(const Decoder::Instruction& inst) {
+	if (inst.memory_segment == 0u) {
+		FLAT_APERTURE(inst, false);
+		return;
+	}
 	const auto      memory = MemoryInfoFromDecoded(inst);
 	IR::ValueOpcode opcode;
 	const auto      bits = memory.data_bits;
@@ -609,6 +721,10 @@ void Translator::FLAT_LOAD(const Decoder::Instruction& inst) {
 }
 
 void Translator::FLAT_STORE(const Decoder::Instruction& inst) {
+	if (inst.memory_segment == 0u) {
+		FLAT_APERTURE(inst, true);
+		return;
+	}
 	const auto      memory  = MemoryInfoFromDecoded(inst);
 	const auto      data_op = MemorySourceAt(inst, 0);
 	const auto      address = ReadAddressOperands(inst, 1);
@@ -1010,6 +1126,7 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicXor32, true);
 		case Decoder::Opcode::DS_WRXCHG_RTN_B32:
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicSwap32, true);
+		case Decoder::Opcode::DS_ADD_U64: return DS_ADD_U64(inst);
 
 		case Decoder::Opcode::IMAGE_ATOMIC_SWAP:
 			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicSwap32);

@@ -257,6 +257,10 @@ void DecodeScalarSource(uint32_t code, uint32_t pc, Operand& operand) {
 		case 126u: operand.kind = OperandKind::ExecLo; return;
 		case 127u: operand.kind = OperandKind::ExecHi; return;
 		case 239u: operand.kind = OperandKind::PopsExitingWaveId; return;
+		case 235u: operand.kind = OperandKind::SharedBase; return;
+		case 236u: operand.kind = OperandKind::SharedLimit; return;
+		case 237u: operand.kind = OperandKind::PrivateBase; return;
+		case 238u: operand.kind = OperandKind::PrivateLimit; return;
 		case 248u:
 			operand.kind      = OperandKind::FloatInlineConstant;
 			operand.value = std::bit_cast<uint32_t>(0.15915494309189535f);
@@ -473,6 +477,10 @@ std::string OperandToString(const Operand& operand) {
 		case OperandKind::Scc: text = "scc"; break;
 		case OperandKind::M0: text = "m0"; break;
 		case OperandKind::PopsExitingWaveId: text = "pops_exiting_wave_id"; break;
+		case OperandKind::SharedBase: text = "shared_base"; break;
+		case OperandKind::SharedLimit: text = "shared_limit"; break;
+		case OperandKind::PrivateBase: text = "private_base"; break;
+		case OperandKind::PrivateLimit: text = "private_limit"; break;
 		case OperandKind::Null: text = "null"; break;
 		default: text = "unknown"; break;
 	}

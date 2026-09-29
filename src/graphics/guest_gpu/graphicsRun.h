@@ -16,6 +16,7 @@
 #include <semaphore>
 #include <span>
 #include <thread>
+#include <unordered_map>
 
 namespace Libs::Graphics {
 
@@ -30,7 +31,22 @@ public:
 	void               Shutdown();
 	[[nodiscard]] bool IsStopping();
 	void               SendCommand(Common::UniqueFunction<void>&& command);
+	// Like SendCommand, but false instead of exiting once the GPU no longer accepts commands.
+	bool               TrySendCommand(Common::UniqueFunction<void>&& command);
 	void               SendCommandSync(Common::UniqueFunction<void>&& command);
+
+	// End-of-pipe labels (RELEASE_MEM without an interrupt) become visible to the CPU once the
+	// host GPU has executed the work recorded before them, as on hardware, instead of when the
+	// packet is recorded. Until then the GPU thread's own label checks (WAIT_REG_MEM,
+	// COND_INDIRECT_BUFFER) see the recorded value through ReadLabel.
+	// KYTY_LABELS_AT_COMPLETION=1 enables it.
+	[[nodiscard]] static bool LabelsAtCompletion();
+	// Whether any label write has been deferred (so ReadLabel must consult the pending ones).
+	[[nodiscard]] static bool LabelsDeferred() noexcept;
+	// GPU thread.
+	void DeferLabelWrite(uint64_t address, uint64_t value, uint32_t size);
+	template <typename T>
+	[[nodiscard]] T ReadLabel(const volatile T* address) const;
 
 	// Submitted command memory is borrowed and must remain valid until GPU execution completes.
 	void Submit(std::span<const uint32_t> draw_commands,
@@ -69,6 +85,8 @@ private:
 	};
 
 	void              Enqueue(Submission submission);
+	// Re-checks queues blocked in WAIT_REG_MEM (a label was published off the GPU thread).
+	void              Wake();
 	void              ProcessCommands();
 	bool              Process(Submission& submission);
 	static void       ThreadRun(void* data);
@@ -91,6 +109,15 @@ private:
 	// Completion callbacks can outlive GuestGpu during renderer shutdown.
 	std::shared_ptr<std::binary_semaphore> m_suspend_point_ready =
 	    std::make_shared<std::binary_semaphore>(1);
+
+	struct PendingLabel {
+		uint64_t value    = 0;
+		uint32_t size     = 0;
+		uint64_t sequence = 0;
+	};
+	// Label writes recorded but not yet visible to the CPU. GPU thread only.
+	std::unordered_map<uint64_t, PendingLabel> m_pending_labels;
+	uint64_t                                   m_label_sequence = 0;
 
 	std::unique_ptr<CommandProcessor>                                m_gfx_cp;
 	std::array<std::unique_ptr<CommandProcessor>, ComputeQueueCount> m_compute_cp;

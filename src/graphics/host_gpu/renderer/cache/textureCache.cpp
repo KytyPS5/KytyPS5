@@ -253,6 +253,12 @@ void TextureCache::UnregisterImage(ImageId id) {
 	if (!image.registered) {
 		return;
 	}
+	if (image.bindless_pinned) {
+		image.bindless_pinned = false;
+		if (on_bindless_unregister) {
+			on_bindless_unregister(id);
+		}
+	}
 	UntrackImage(id);
 	ImagePageTable::PageRange pages {};
 	if (!ImagePageTable::TryGetPageRange(image.info.data.address, image.info.data.size, pages)) {
@@ -2033,6 +2039,9 @@ void TextureCache::RunGarbageCollector() {
 			}
 			auto owner = m_slot_images.try_get(id);
 			if (owner == nullptr || !owner->registered || owner->depth_id) {
+				continue;
+			}
+			if (owner->bindless_pinned) {
 				continue;
 			}
 			if (owner->IsGpuModified()) {

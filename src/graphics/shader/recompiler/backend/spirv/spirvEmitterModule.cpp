@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
+#include "graphics/shader/recompiler/ir/BindlessBindings.h"
 
 #include <algorithm>
 #include <bit>
@@ -179,7 +180,94 @@ uint32_t F32ArrayType(EmitterState& state, uint32_t count) {
 	return state.builder.Type(spv::OpTypeArray, TypeF32(state), ConstantU32(state, count));
 }
 
+// Set 1 (BindlessBindings.h): one runtime array per image type, aliasing the binding of its
+// dimension, and the translation buffer. Declared before the entry point collects globals.
+void DefineBindlessImages(EmitterState& state) {
+	for (const auto& image: state.program.info.images) {
+		if (!image.bindless) {
+			continue;
+		}
+		const auto type = ImageType(state, image);
+		if (state.bindless_image_variables.contains(type)) {
+			continue;
+		}
+		uint32_t binding = IR::BindlessImages2D;
+		if (image.cube) {
+			binding = IR::BindlessImagesCube;
+		} else if (image.dimension == ImageDimension::Dim3D) {
+			binding = IR::BindlessImages3D;
+		} else if (image.dimension == ImageDimension::Dim2DArray ||
+		           image.dimension == ImageDimension::Dim2DMsaaArray) {
+			binding = IR::BindlessImages2DArray;
+		}
+		const auto array    = state.builder.Type(spv::OpTypeRuntimeArray, type);
+		const auto variable = state.builder.DefineGlobalVariable(
+		    TypePointer(state, spv::StorageClassUniformConstant, array),
+		    spv::StorageClassUniformConstant);
+		state.builder.AddName(variable, "bindless_images");
+		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationDescriptorSet,
+		                            IR::BindlessDescriptorSet);
+		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBinding, binding);
+		state.bindless_image_variables[type] = variable;
+		state.builder.RequireCapability(spv::CapabilityRuntimeDescriptorArray);
+		state.builder.RequireCapability(spv::CapabilitySampledImageArrayNonUniformIndexing);
+		state.builder.RequireCapability(spv::CapabilityShaderNonUniform);
+		state.builder.RequireVersion(0x00010500u);
+	}
+	if (state.bindless_sampler_variable == 0 &&
+	    std::ranges::any_of(state.program.info.samplers, &IR::SamplerResource::bindless)) {
+		const auto array    = state.builder.Type(spv::OpTypeRuntimeArray,
+		                                         state.builder.Type(spv::OpTypeSampler));
+		const auto variable = state.builder.DefineGlobalVariable(
+		    TypePointer(state, spv::StorageClassUniformConstant, array),
+		    spv::StorageClassUniformConstant);
+		state.builder.AddName(variable, "bindless_samplers");
+		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationDescriptorSet,
+		                            IR::BindlessDescriptorSet);
+		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBinding,
+		                            IR::BindlessSamplers);
+		state.bindless_sampler_variable = variable;
+		state.builder.RequireCapability(spv::CapabilityRuntimeDescriptorArray);
+		state.builder.RequireCapability(spv::CapabilitySampledImageArrayNonUniformIndexing);
+		state.builder.RequireCapability(spv::CapabilityShaderNonUniform);
+		state.builder.RequireVersion(0x00010500u);
+	}
+	if (!state.bindless_image_variables.empty() && state.bindless_translation_variable == 0) {
+		const auto variable = state.builder.DefineGlobalVariable(
+		    TypePointer(state, spv::StorageClassStorageBuffer, StorageBufferType(state)),
+		    spv::StorageClassStorageBuffer);
+		state.builder.AddName(variable, "bindless_translation");
+		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationDescriptorSet,
+		                            IR::BindlessDescriptorSet);
+		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBinding,
+		                            IR::BindlessTranslation);
+		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationNonWritable);
+		state.bindless_translation_variable = variable;
+		const auto feedback = state.builder.DefineGlobalVariable(
+		    TypePointer(state, spv::StorageClassStorageBuffer, StorageBufferType(state)),
+		    spv::StorageClassStorageBuffer);
+		state.builder.AddName(feedback, "bindless_feedback");
+		state.builder.AddAnnotation(spv::OpDecorate, feedback, spv::DecorationDescriptorSet,
+		                            IR::BindlessDescriptorSet);
+		state.builder.AddAnnotation(spv::OpDecorate, feedback, spv::DecorationBinding,
+		                            IR::BindlessFeedback);
+		state.bindless_feedback_variable = feedback;
+	}
+	if (state.program.info.watchdog_reports && state.bindless_feedback_variable == 0) {
+		const auto feedback = state.builder.DefineGlobalVariable(
+		    TypePointer(state, spv::StorageClassStorageBuffer, StorageBufferType(state)),
+		    spv::StorageClassStorageBuffer);
+		state.builder.AddName(feedback, "bindless_feedback");
+		state.builder.AddAnnotation(spv::OpDecorate, feedback, spv::DecorationDescriptorSet,
+		                            IR::BindlessDescriptorSet);
+		state.builder.AddAnnotation(spv::OpDecorate, feedback, spv::DecorationBinding,
+		                            IR::BindlessFeedback);
+		state.bindless_feedback_variable = feedback;
+	}
+}
+
 void DefineDescriptors(EmitterState& state) {
+	DefineBindlessImages(state);
 	if (state.program.bindings.UsesPushData() || state.program.stage == ShaderType::Mesh) {
 		const auto type              = PushConstantBlockType(state);
 		state.push_constant_variable = state.builder.DefineGlobalVariable(

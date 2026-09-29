@@ -937,6 +937,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 			     MakeIrDump(cfg_dump, ir).c_str());
 		}
 	}
+	ir.bindless_images = options.bindless_images;
 	if (!IR::TrackResources(ir, decoded, native_cfg) && options.non_fatal) {
 		LOGF("%s gave up hash=0x%016" PRIx64 ": resource tracking failed\n", GetDumpLabel(options),
 		     options.shader_hash);
@@ -995,6 +996,7 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	IR::EliminateDeadCode(ir.blocks);
 
 	IR::CollectShaderInfo(ir, options.input_info);
+	ir.info.watchdog_reports = ir.bindless_images && ir.info.uses_dma;
 	IR::AllocateBindings(ir, push_data_start_dword);
 	std::string ir_dump;
 	if (options.dump_ir) {

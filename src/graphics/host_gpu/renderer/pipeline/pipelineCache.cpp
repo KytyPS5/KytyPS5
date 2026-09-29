@@ -392,14 +392,18 @@ struct PipelineCache::ProgramCache {
 			if (!ShaderRecompiler::IR::MaterializeResources(
 			        entry->second.resource_plan, runtime, entry->second.resources,
 			        entry->second.specialization)) {
+				// A descriptor source that cannot be read right now (memory the guest has not
+				// mapped or filled yet) skips this draw rather than the session; the next one
+				// re-evaluates from scratch.
 				if (!ShaderFailureNonFatal()) {
 					EXIT("shader resource materialization failed\n");
 				}
 				static std::atomic<uint32_t> reported = 0;
 				if (reported.fetch_add(1) < 16) {
 					LOGF("ProgramCache: skipping stage %u hash=0x%016" PRIx64
-					     ": resource materialization failed\n",
-					     static_cast<uint32_t>(stage), params.hash);
+					     ": resource materialization failed (materialization line %d)\n",
+					     static_cast<uint32_t>(stage), params.hash,
+					     ShaderRecompiler::IR::LastIndirectImageFailureLine());
 				}
 				return ShaderProgram {};
 			}
@@ -461,7 +465,12 @@ struct PipelineCache::ProgramCache {
 		}
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code);
 		options.non_fatal = ShaderFailureNonFatal();
-		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
+		options.bindless_images = bindless_images;
+		options.read_code       = ReadShaderCode;
+		const auto compile_code = lookup_key.function_code.empty()
+		                              ? params.code
+		                              : std::span<const uint32_t>(lookup_key.function_code);
+		auto translated = ShaderRecompiler::TranslateProgram(compile_code, options);
 		if (translated.skip_dispatch) {
 			entry = programs.try_emplace(lookup_key, ShaderRecompiler::IR::ResourcePlan {}).first;
 			entry->second.skip_dispatch = true;
@@ -504,8 +513,9 @@ struct PipelineCache::ProgramCache {
 				static std::atomic<uint32_t> reported = 0;
 				if (reported.fetch_add(1) < 16) {
 					LOGF("ProgramCache: skipping stage %u hash=0x%016" PRIx64
-					     ": resource materialization failed on first use\n",
-					     static_cast<uint32_t>(stage), params.hash);
+					     ": resource materialization failed on first use (materialization line %d)\n",
+					     static_cast<uint32_t>(stage), params.hash,
+					     ShaderRecompiler::IR::LastIndirectImageFailureLine());
 				}
 				return ShaderProgram {};
 			}
@@ -532,8 +542,8 @@ struct PipelineCache::ProgramCache {
 		return permutation.handle;
 	}
 
-	ProgramCache(vk::Device device, bool shader_clock)
-	    : device(device), shader_clock(shader_clock) {
+	ProgramCache(vk::Device device, bool shader_clock, bool bindless_images)
+	    : device(device), shader_clock(shader_clock), bindless_images(bindless_images) {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 	}
 	~ProgramCache() {
@@ -572,12 +582,15 @@ struct PipelineCache::ProgramCache {
 	std::unordered_map<uint64_t, std::vector<uint32_t>>         call_targets;
 	vk::Device                                                  device;
 	bool                                                        shader_clock = false;
+	bool                                                        bindless_images = false;
 	uint64_t                                                    next_shader_id = 0;
 };
 
 PipelineCache::PipelineCache(GraphicContext& graphics)
-    : m_graphics(graphics), m_program_cache(std::make_unique<ProgramCache>(graphics.device,
-                                                                   graphics.shader_device_clock_enabled)) {
+    : m_graphics(graphics),
+      m_program_cache(std::make_unique<ProgramCache>(
+          graphics.device, graphics.shader_device_clock_enabled,
+          graphics.bindless_enabled && Config::BindlessImagesEnabled())) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
 }

@@ -5872,6 +5872,22 @@ void TestNewShaderRecompilerImageLoadVariants() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+// An image load whose result is never used is removed before resource tracking, but its
+// memory_info entry stays behind, still holding its T# register from translation (s[8:15], 2).
+// With no image left, materialization must not take that for an image index (two blood-pool
+// decal shaders ended the emulator this way).
+void TestDeadImageAccessKeepsNoImageIndex() {
+  const uint32_t shader[] = {
+      EncodeMimg0(0x00, 0x1), EncodeMimg1(4, 2, 0, 0), // image_load v4, v[0:1], s[8:15]
+      EncodeVop1(0x01, 4, 242),                        // v_mov_b32 v4, 1.0: the load is dead
+      EncodeExp0(0x00, 0xf), EncodeExp1(4, 4, 4, 4),   // exp mrt0
+      0xbf810000u,
+  };
+  const auto result = RecompileForTest(shader, MakeCompileOptions(ShaderType::Pixel));
+  CheckSpirvBinaryValidates(result.spirv);
+  Check(!SpirvContainsOpcode(result.spirv, 95), "the dead image load was not removed");
+}
+
 void TestNewShaderRecompilerImageLoad2DMsaa() {
   const uint32_t shader[] = {
       0xf0000130u, // image_load v3, v[5:7], s[0:7] dmask:x dim:2d_msaa
@@ -14335,6 +14351,7 @@ int main() {
   TestScalarAshrI64Decoder();
   TestNewShaderDecoderArchitecture();
   TestImageAddressOperands();
+  TestDeadImageAccessKeepsNoImageIndex();
   TestSopkCompareImmediateExtension();
   TestNewShaderRecompilerCapturedVopcSdwaCmpxClass();
   TestNewShaderRecompilerCapturedVopcSdwaCmpxLtU16();

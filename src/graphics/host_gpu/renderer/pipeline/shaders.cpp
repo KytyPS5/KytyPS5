@@ -190,6 +190,26 @@ static void AddLayoutBindings(std::vector<vk::DescriptorSetLayoutBinding>& descr
 	}
 }
 
+static bool UsesBindless(const ShaderRecompiler::IR::CompiledShaderInfo& program) {
+	return program.info.watchdog_reports ||
+	       std::ranges::any_of(program.info.images, &ShaderRecompiler::IR::ImageResource::bindless) ||
+	       std::ranges::any_of(program.info.samplers,
+	                           &ShaderRecompiler::IR::SamplerResource::bindless);
+}
+
+// Set 0 is the pipeline's own descriptors; set 1, when a stage samples bindless images, is the
+// shared bindless table.
+static void FillSetLayouts(GraphicContext& graphics, const PipelineCache::Pipeline& pipeline,
+                           std::array<vk::DescriptorSetLayout, 2>& layouts, uint32_t& count) {
+	layouts[0] = pipeline.descriptor_set_layout;
+	count      = 1;
+	if (pipeline.uses_bindless) {
+		EXIT_IF(graphics.bindless_layout == nullptr);
+		layouts[1] = graphics.bindless_layout;
+		count      = 2;
+	}
+}
+
 static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                                    std::span<const vk::DescriptorSetLayoutBinding> bindings) {
 	uint32_t descriptor_count = 0;
@@ -445,19 +465,24 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		const auto native_stage = NativeShaderStage(stage.logical_stage);
 		AddLayoutBindings(descriptor_bindings, *stage.stage.program, native_stage);
 		graphics_stages |= native_stage;
+		pipeline.uses_bindless |= UsesBindless(*stage.stage.program);
 	}
 	if (ps_active) {
 		EXIT_IF(!ps_input_info->stage);
 		AddLayoutBindings(descriptor_bindings, *ps_input_info->stage.program,
 		                  vk::ShaderStageFlagBits::eFragment);
+		pipeline.uses_bindless |= UsesBindless(*ps_input_info->stage.program);
 	}
 	CreateDescriptorLayout(graphics, pipeline, descriptor_bindings);
 	const vk::PushConstantRange push_constants {graphics_stages, 0,
 	                                            ShaderRecompiler::IR::NativePushConstantSize};
 
+	std::array<vk::DescriptorSetLayout, 2> set_layouts {};
+	uint32_t                               set_layout_count = 0;
+	FillSetLayouts(graphics, pipeline, set_layouts, set_layout_count);
 	vk::PipelineLayoutCreateInfo pipeline_layout_info {};
-	pipeline_layout_info.setLayoutCount         = 1;
-	pipeline_layout_info.pSetLayouts            = &pipeline.descriptor_set_layout;
+	pipeline_layout_info.setLayoutCount         = set_layout_count;
+	pipeline_layout_info.pSetLayouts            = set_layouts.data();
 	pipeline_layout_info.pushConstantRangeCount = 1;
 	pipeline_layout_info.pPushConstantRanges    = &push_constants;
 
@@ -592,13 +617,17 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	std::vector<vk::DescriptorSetLayoutBinding> descriptor_bindings;
 	AddLayoutBindings(descriptor_bindings, *input_info.stage.program,
 	                  vk::ShaderStageFlagBits::eCompute);
+	pipeline.uses_bindless = UsesBindless(*input_info.stage.program);
 	CreateDescriptorLayout(graphics, pipeline, descriptor_bindings);
 	const vk::PushConstantRange push_constants {vk::ShaderStageFlagBits::eCompute, 0,
 	                                            ShaderRecompiler::IR::NativePushConstantSize};
 
+	std::array<vk::DescriptorSetLayout, 2> set_layouts {};
+	uint32_t                               set_layout_count = 0;
+	FillSetLayouts(graphics, pipeline, set_layouts, set_layout_count);
 	vk::PipelineLayoutCreateInfo pipeline_layout_info {};
-	pipeline_layout_info.setLayoutCount         = 1;
-	pipeline_layout_info.pSetLayouts            = &pipeline.descriptor_set_layout;
+	pipeline_layout_info.setLayoutCount         = set_layout_count;
+	pipeline_layout_info.pSetLayouts            = set_layouts.data();
 	pipeline_layout_info.pushConstantRangeCount = 1;
 	pipeline_layout_info.pPushConstantRanges    = &push_constants;
 

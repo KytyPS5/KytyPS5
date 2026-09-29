@@ -116,6 +116,8 @@ public:
 		vk::Pipeline            pipeline              = nullptr;
 		vk::DescriptorSetLayout descriptor_set_layout = nullptr;
 		bool                    uses_push_descriptors = false;
+		// Samples bindless images: descriptor set 1 is the bindless table.
+		bool                    uses_bindless         = false;
 	};
 
 	struct GraphicsPrograms {

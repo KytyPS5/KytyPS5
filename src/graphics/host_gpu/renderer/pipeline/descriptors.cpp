@@ -783,6 +783,207 @@ void RenderExecutor::ResetBindings() {
 	m_bound_images.clear();
 }
 
+static uint32_t BindlessBindingFor(const ShaderRecompiler::IR::ImageResource& resource) {
+	using ShaderRecompiler::Decoder::ImageDimension;
+	if (resource.cube) {
+		return ShaderRecompiler::IR::BindlessImagesCube;
+	}
+	if (resource.dimension == ImageDimension::Dim3D) {
+		return ShaderRecompiler::IR::BindlessImages3D;
+	}
+	if (resource.dimension == ImageDimension::Dim2DArray ||
+	    resource.dimension == ImageDimension::Dim2DMsaaArray) {
+		return ShaderRecompiler::IR::BindlessImages2DArray;
+	}
+	return ShaderRecompiler::IR::BindlessImages2D;
+}
+
+// A heap entry the bindless array of this binding can hold: a float-sampled, single-sample
+// texture of a matching shape. Anything else stays the placeholder rather than reaching
+// ResolveTexture, which exits on descriptors a draw would never bind that way.
+static bool BindlessCompatible(const ShaderTextureResource& descriptor, uint32_t binding) {
+	if (descriptor.IsNull() ||
+	    Prospero::SampledTextureNumericClass(descriptor.Format()) !=
+	        Prospero::TextureNumericClass::Float) {
+		return false;
+	}
+	switch (descriptor.Type()) {
+		case Prospero::ImageType::kColor2D:
+			return binding == ShaderRecompiler::IR::BindlessImages2D ||
+			       binding == ShaderRecompiler::IR::BindlessImages2DArray;
+		case Prospero::ImageType::kColor2DArray:
+			return binding == ShaderRecompiler::IR::BindlessImages2D ||
+			       binding == ShaderRecompiler::IR::BindlessImages2DArray;
+		case Prospero::ImageType::kCube: return binding == ShaderRecompiler::IR::BindlessImagesCube;
+		case Prospero::ImageType::kColor3D: return binding == ShaderRecompiler::IR::BindlessImages3D;
+		default: return false;
+	}
+}
+
+bool RenderExecutor::ResolveBindlessKey(BindlessTable::Heap& heap, uint32_t key) {
+	auto&                                 table = m_context.GetBindlessTable();
+	ShaderRecompiler::IR::DescriptorValue value {};
+	value.dword_count  = 8u;
+	const auto address = heap.base + heap.table_offset + static_cast<uint64_t>(key) * 32u;
+	heap.settled[key]  = 1;
+	if (!Libs::LibKernel::Memory::TryReadBacking(address, value.dwords.data(), 32u)) {
+		table.SetTranslation(heap, key, 0u);
+		return false;
+	}
+	const auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
+	if (!BindlessCompatible(descriptor, heap.binding)) {
+		table.SetTranslation(heap, key, 0u);
+		return false;
+	}
+	auto binding = ResolveTexture(heap.resource, value);
+	auto& texture_cache = m_context.GetTextureCache();
+	auto* image = texture_cache.m_slot_images.try_get(binding.image_id);
+	if (image == nullptr || image->info.data.Empty()) {
+		table.SetTranslation(heap, key, 0u);
+		return false;
+	}
+	BindImage(binding.image_id, false);
+	const auto view = texture_cache.FindTexture(binding.image_id, binding.desc);
+	image           = texture_cache.m_slot_images.try_get(binding.image_id);
+	const auto slot = table.AllocateSlot(heap.binding);
+	if (image == nullptr || view == nullptr || slot == 0) {
+		table.SetTranslation(heap, key, 0u);
+		return false;
+	}
+	const auto layout = image->info.IsDepth() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
+	                                          : vk::ImageLayout::eShaderReadOnlyOptimal;
+	table.WriteSlot(heap.binding, slot, view, layout);
+	heap.slots[key]         = slot;
+	image->bindless_pinned  = true;
+	image->usage.texture    = true;
+	heap.resolved.push_back(binding.image_id);
+	table.AddImageReference(binding.image_id, heap, key);
+	table.SetTranslation(heap, key, slot);
+	return true;
+}
+
+void RenderExecutor::ResolveBindlessRequests() {
+	const auto frame = m_context.GetGraphics().presented_frames.load(std::memory_order_relaxed);
+	if (frame == m_bindless_frame) {
+		return;
+	}
+	auto& table     = m_context.GetBindlessTable();
+	auto& scheduler = m_context.GetCommandScheduler();
+	// The flags come from a snapshot recorded in an earlier frame. Until the GPU has executed
+	// it, check again at the next bindless draw instead of waiting.
+	if (table.SnapshotRecorded() && !table.SnapshotReady(scheduler)) {
+		return;
+	}
+	m_bindless_frame = frame;
+	m_context.GetBindlessTable().DrainWatchdogReports(frame);
+	if (!table.SnapshotRecorded()) {
+		table.RecordFeedbackSnapshot(scheduler);
+		return;
+	}
+	table.ConsumeSnapshot();
+	// Each texture may upload and detile; spread first sight of a scene over a few frames.
+	constexpr uint32_t Budget   = 128;
+	uint32_t           resolved = 0;
+	for (auto& heap: m_context.GetBindlessTable().Heaps()) {
+		m_bindless_requests.clear();
+		m_context.GetBindlessTable().TakeRequests(heap, m_bindless_requests);
+		for (const auto key: m_bindless_requests) {
+			if (heap.settled[key] != 0) {
+				continue;
+			}
+			if (resolved >= Budget) {
+				break; // still pending: the next frame flags it again
+			}
+			resolved += ResolveBindlessKey(heap, key) ? 1u : 0u;
+		}
+	}
+	table.RecordFeedbackSnapshot(scheduler);
+}
+
+// Bindless samplers: the S# records of each sampler heap a draw indexes are mirrored into the
+// sampler array of set 1, once per frame per heap, and the shader gets the region base and record
+// count. Keys outside it, and heaps that cannot be read, use the default sampler in slot 0.
+void RenderExecutor::PrepareBindlessSamplers(const ShaderStageRuntime& runtime,
+                                             PreparedBindings&         prepared) {
+	const auto& program  = *runtime.program;
+	const auto& snapshot = *runtime.resources;
+	if (snapshot.bindless_sampler_heaps.empty()) {
+		return;
+	}
+	auto& table = m_context.GetBindlessTable();
+	auto& cache = m_context.GetSamplerCache();
+	{
+		ShaderSamplerResource default_sampler;
+		std::ranges::copy(ShaderRecompiler::IR::BindlessDefaultSampler, default_sampler.fields);
+		table.WriteDefaultSampler(cache.GetSampler(default_sampler, false));
+	}
+	const auto frame = m_context.GetGraphics().presented_frames.load(std::memory_order_relaxed);
+	constexpr uint64_t MaxRecords = 1024;
+	for (const auto& use: snapshot.bindless_sampler_heaps) {
+		uint32_t region  = 0;
+		uint32_t entries = 0;
+		if (table.SamplersEnabled() && use.sampler < program.info.samplers.size()) {
+			const auto&    sampler = program.info.samplers[use.sampler];
+			const uint32_t flags =
+			    (sampler.depth_compare ? BindlessTable::SamplerDepthCompare : 0u) |
+			    (sampler.force_point_filtering ? BindlessTable::SamplerPointFiltering : 0u) |
+			    (sampler.integer_border ? BindlessTable::SamplerIntegerBorder : 0u);
+			auto* heap = table.FindOrCreateSamplerHeap(use.base, use.table_offset, flags);
+			if (heap->checked_frame != frame) {
+				heap->checked_frame = frame;
+				const uint64_t available =
+				    use.size > use.table_offset ? (use.size - use.table_offset) / 16u : 0u;
+				std::vector<std::array<uint32_t, 4>> records(std::min(available, MaxRecords));
+				const uint64_t address = use.base + use.table_offset;
+				const uint64_t bytes   = records.size() * sizeof(records[0]);
+				if (!records.empty() &&
+				    !m_context.GetBufferCache().HasGpuDirtyBytes(address, bytes) &&
+				    Libs::LibKernel::Memory::TryReadBacking(address, records.data(), bytes)) {
+					(void)table.MirrorSamplerHeap(*heap, records, cache);
+				}
+			}
+			region  = heap->region;
+			entries = region != 0 ? static_cast<uint32_t>(heap->records.size()) : 0u;
+		}
+		prepared.bindless_patches.push_back({use.mapping_offset, region, entries});
+	}
+}
+
+void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
+                                          PreparedBindings& prepared) {
+	prepared.bindless_patches.clear();
+	prepared.bindless_images.clear();
+	const auto& program  = *runtime.program;
+	const auto& snapshot = *runtime.resources;
+	auto&       table    = m_context.GetBindlessTable();
+	if ((snapshot.bindless_heaps.empty() && snapshot.bindless_sampler_heaps.empty()) ||
+	    !table.Enabled()) {
+		return;
+	}
+	PrepareBindlessSamplers(runtime, prepared);
+	if (snapshot.bindless_heaps.empty()) {
+		return;
+	}
+	ResolveBindlessRequests();
+	for (const auto& use: snapshot.bindless_heaps) {
+		if (use.image >= program.info.images.size()) {
+			continue;
+		}
+		const auto& resource = program.info.images[use.image];
+		const uint64_t span  = use.size > use.table_offset ? use.size - use.table_offset : 0;
+		const auto entries   = static_cast<uint32_t>(std::min<uint64_t>(span / 32u, 1u << 18u));
+		auto* heap = table.FindOrCreateHeap(use.base, use.table_offset, BindlessBindingFor(resource),
+		                                    entries, resource);
+		if (heap == nullptr) {
+			continue; // region 0, count 0: every key samples the placeholder
+		}
+		prepared.bindless_patches.push_back(
+		    {use.mapping_offset, heap->region, std::min(entries, heap->entries)});
+		prepared.bindless_images.insert(prepared.bindless_images.end(), heap->resolved.begin(),
+		                                heap->resolved.end());
+	}
+}
+
 void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
                                      PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
@@ -809,6 +1010,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
 		prepared.samplers.push_back(NativeSampler(m_context, program, i, snapshot.samplers[i]));
 	}
+	PrepareBindlessHeaps(runtime, prepared);
 	prepared.shader_data.reserve(program.bindings.ShaderDataDwords());
 	for (const auto reg: program.bindings.user_data_registers) {
 		prepared.shader_data.push_back(snapshot.user_data[reg - program.user_data_base]);
@@ -891,7 +1093,18 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	}
 	if (ShaderRecompiler::IR::FindBinding(
 	        layout, ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt) != nullptr) {
-		prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);
+		if (prepared.bindless_patches.empty()) {
+			prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);
+		} else {
+			m_bindless_srt.assign(snapshot.flattened_srt.begin(), snapshot.flattened_srt.end());
+			for (const auto& [offset, region, entries]: prepared.bindless_patches) {
+				if (static_cast<size_t>(offset) + 1u < m_bindless_srt.size()) {
+					m_bindless_srt[offset]      = region;
+					m_bindless_srt[offset + 1u] = entries;
+				}
+			}
+			prepared.flattened_srt = NativeUpload(m_context, m_bindless_srt);
+		}
 	}
 	if (ShaderRecompiler::IR::FindBinding(
 	        program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::ShaderData) != nullptr) {
@@ -1032,6 +1245,19 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			    shader_stages, vk::DependencyFlags {}, 0, nullptr, 1, &barrier, 0, nullptr);
 		}
 
+		// Bindless textures are sampled through set 1 with a read-only layout.
+		for (const auto id: descriptors.bindless_images) {
+			auto* image = m_context.GetTextureCache().m_slot_images.try_get(id);
+			if (image == nullptr || !image->registered || image->binding.is_target ||
+			    image->info.data.Empty()) {
+				continue;
+			}
+			const auto layout = image->info.IsDepth() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
+			                                          : vk::ImageLayout::eShaderReadOnlyOptimal;
+			if (image->backing.state.layout != layout) {
+				image->Transit(layout, vk::AccessFlagBits2::eShaderRead, {}, vk_buffer);
+			}
+		}
 		for (uint32_t i = 0; i < program.info.images.size(); i++) {
 			auto& image   = m_context.GetTextureCache().GetImage(descriptors.images[i].image_id);
 			auto& binding = descriptors.images[i];
@@ -1184,6 +1410,12 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout, 0, 1, &set,
 			                             0, nullptr);
 		}
+	}
+	if (pipeline.uses_bindless) {
+		const auto set = m_context.GetGraphics().bindless_set;
+		EXIT_IF(set == nullptr);
+		vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout, 1, 1, &set, 0,
+		                             nullptr);
 	}
 }
 

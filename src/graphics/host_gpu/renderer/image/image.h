@@ -144,6 +144,9 @@ public:
 	ImageUsage       usage;
 	ImageBinding     binding;
 	bool             registered     = false;
+	// Referenced by a bindless table slot: the collector keeps it, and unregistering it tells the
+	// table (TextureCache::on_bindless_unregister) to repoint the slot.
+	bool             bindless_pinned = false;
 	mutable uint32_t query_epoch    = 0;
 	uint64_t         track_addr     = 0;
 	uint64_t         track_addr_end = 0;

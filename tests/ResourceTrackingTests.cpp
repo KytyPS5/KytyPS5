@@ -1,4 +1,5 @@
 #include "graphics/guest_gpu/gpu_defs.h"
+#include "graphics/shader/recompiler/frontend/translate/Translator.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
@@ -2485,6 +2486,60 @@ void TestConditionalSamplerPhi() {
   }
 }
 
+// A sampler read from a heap at a GPU-selected key gets a fixed sampler, and the heap reads it
+// strands become planning-only (no load). Six effect shaders also use one of those reads as data
+// (the register is reused after a branch); planning-only, it left that data without a value.
+void TestDefaultSamplerKeepsDataReads() {
+  Libs::Graphics::ShaderRecompiler::Frontend::TranslationNonFatalScope non_fatal(true);
+  Fixture fixture;
+  std::array<Value, 4> heap_words;
+  std::array<Value, 8> image_words;
+  for (uint32_t dword = 0; dword < 4; dword++) {
+    heap_words[dword] = fixture.UserData(dword + 4u);
+  }
+  for (uint32_t dword = 0; dword < 8; dword++) {
+    image_words[dword] = fixture.UserData(dword + 8u);
+  }
+  const auto heap = fixture.Buffer(heap_words, 0x100);
+  const auto invocation = fixture.Emit(
+      ValueOpcode::GetBuiltin,
+      {Value(static_cast<uint32_t>(StageInputKind::GlobalInvocationId)), Value(0u)});
+  const auto key = fixture.Emit(ValueOpcode::ReadFirstLane, {invocation, Value(true)});
+  const auto offset = fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(4u)});
+  std::array<Value, 4> reads;
+  for (uint32_t dword = 0; dword < 4; dword++) {
+    MemoryInfo word;
+    word.kind = ResourceKind::ScalarBuffer;
+    word.offset = dword * sizeof(uint32_t);
+    reads[dword] = fixture.Emit(ValueOpcode::ReadConstBuffer, {heap, offset},
+                                fixture.AddMemory(word, 0x100));
+  }
+  const auto sampler = fixture.Sampler(reads, 0x110);
+  const auto image = fixture.Image(image_words, 0x110);
+  MemoryInfo sample;
+  sample.kind = ResourceKind::Image;
+  sample.image_dimension = Decoder::ImageDimension::Dim2D;
+  const auto sampled = fixture.Emit(ValueOpcode::ImageSampleRaw,
+                                    {image, sampler, fixture.ImageAddress()},
+                                    fixture.AddMemory(sample, 0x110));
+  fixture.Emit(ValueOpcode::ReferenceU32,
+               {fixture.Emit(ValueOpcode::CompositeExtractU32x4, {sampled, Value(0u)})});
+  const auto data = fixture.Emit(ValueOpcode::SelectU32, {invocation, reads[1], Value(0u)});
+  fixture.Emit(ValueOpcode::ReferenceU32, {data});
+  fixture.PlanAndTrack();
+
+  for (uint32_t dword = 0; dword < 4; dword++) {
+    const auto &memory =
+        fixture.program.memory_info[reads[dword].TryInstruction()->Flags<MemoryFlags>().index];
+    Check(memory.planning_only == (dword != 1u),
+          dword == 1u ? "a heap read also used as data became planning-only"
+                      : "a heap read only the sampler used stayed a load");
+  }
+  const auto *handle = sampler.TryInstruction();
+  Check(handle->Arg(0).IsImmediate() && handle->Arg(3).IsImmediate(),
+        "the sampler did not take the fixed sampler");
+}
+
 void TestLoopCycleEnteredThroughRuntimeValue() {
   Fixture fixture;
   auto *entry = fixture.block;
@@ -2850,6 +2905,110 @@ void TestConditionalIndirectImageMaterialization() {
         "taken indirect image branch did not require its descriptor table");
 }
 
+// Research: a goto-structured region merges a bindless descriptor in stages, and one path
+// (which never samples) carries an unrelated value into the merge: PS 5e3edde52562876c.
+// entry -> {with_a, middle}; middle -> {with_b, other}; with_b, other -> inner; with_a, inner
+// -> outer, which samples. The free branch gets key 0; a read of the heap at another record
+// offset on that branch is a real choice between fields and still turns the image down.
+void TestNestedBindlessDescriptorPhi(bool other_reads_heap) {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  Fixture fixture;
+  fixture.program.bindless_images = true;
+  auto *entry = fixture.block;
+  auto *with_a = fixture.AddBlock();
+  auto *middle = fixture.AddBlock();
+  auto *with_b = fixture.AddBlock();
+  auto *other = fixture.AddBlock();
+  auto *inner = fixture.AddBlock();
+  auto *outer = fixture.AddBlock();
+  entry->AddBranch(with_a);
+  entry->AddBranch(middle);
+  middle->AddBranch(with_b);
+  middle->AddBranch(other);
+  with_b->AddBranch(inner);
+  other->AddBranch(inner);
+  with_a->AddBranch(outer);
+  inner->AddBranch(outer);
+  auto &info = fixture.program.block_info;
+  info[0].condition = fixture.Emit(ValueOpcode::INotEqual32, {fixture.UserData(11), Value(0u)});
+  info[0].terminator = {.kind = CFG::TerminatorKind::ConditionalBranch, .true_block = 1, .false_block = 2};
+  info[2].condition =
+      fixture.Emit(ValueOpcode::INotEqual32, {fixture.UserData(12), Value(0u)}, 0, middle);
+  info[2].terminator = {.kind = CFG::TerminatorKind::ConditionalBranch, .true_block = 3, .false_block = 4};
+  info[1].terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = 6};
+  info[3].terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = 5};
+  info[4].terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = 5};
+  info[5].terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = 6};
+  info[6].terminator.kind = CFG::TerminatorKind::Return;
+
+  const auto heap = fixture.Buffer(
+      {fixture.UserData(4), fixture.UserData(5), fixture.UserData(6), fixture.UserData(7)}, 0x10d8);
+  const auto key_a = fixture.UserData(8);
+  const auto key_b = fixture.UserData(9);
+  const auto offset_a = fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key_a, Value(5u)}, 0, with_a);
+  const auto offset_b = fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key_b, Value(5u)}, 0, with_b);
+  const auto counter =
+      fixture.Emit(ValueOpcode::IAdd32, {fixture.UserData(10), Value(1u)}, 0, other);
+  const auto offset_other =
+      fixture.Emit(ValueOpcode::ShiftLeftLogical32, {counter, Value(5u)}, 0, other);
+  std::array<Value, 8> image_words;
+  for (uint32_t dword = 0; dword < image_words.size(); dword++) {
+    const auto read = [&](Block *block, Value offset, uint32_t extra) {
+      MemoryInfo word;
+      word.kind = ResourceKind::ScalarBuffer;
+      word.offset = dword * sizeof(uint32_t) + extra;
+      return fixture.Emit(ValueOpcode::ReadConstBuffer, {heap, offset},
+                          fixture.AddMemory(word, 0x10d8), block);
+    };
+    const auto from_a = read(with_a, offset_a, 0);
+    const auto from_b = read(with_b, offset_b, 0);
+    const auto from_other = other_reads_heap ? read(other, offset_other, 32) : counter;
+    auto &inner_phi = inner->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+    inner_phi.AddPhiOperand(with_b, from_b);
+    inner_phi.AddPhiOperand(other, from_other);
+    auto &outer_phi = outer->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+    outer_phi.AddPhiOperand(with_a, from_a);
+    outer_phi.AddPhiOperand(inner, Value(&inner_phi));
+    image_words[dword] = Value(&outer_phi);
+  }
+  fixture.block = outer;
+  const auto image = fixture.Image(image_words, 0x10f0);
+  const auto sampler = fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)}, 0x10f0);
+  MemoryInfo sample;
+  sample.kind = ResourceKind::Image;
+  sample.image_dimension = Decoder::ImageDimension::Dim2D;
+  const auto sampled = fixture.Emit(ValueOpcode::ImageSampleRaw,
+                                    {image, sampler, fixture.ImageAddress()},
+                                    fixture.AddMemory(sample, 0x10f0));
+  fixture.Emit(ValueOpcode::ReferenceU32,
+               {fixture.Emit(ValueOpcode::CompositeExtractU32x4, {sampled, Value(0u)})});
+  if (other_reads_heap) {
+    CheckFatal([&] { fixture.PlanAndTrack(); }, "not a valid runtime value",
+               "a heap read at another record offset was taken as a free branch");
+    return;
+  }
+  fixture.PlanAndTrack();
+  Check(fixture.program.resource_tracking_complete && fixture.program.info.images.size() == 1,
+        "nested descriptor phi with a free branch was not tracked");
+  const auto source = fixture.program.info.images[0].source;
+  Check(source < fixture.program.descriptor_sources.size() &&
+            fixture.program.descriptor_sources[source].indirect_image.has_value() &&
+            fixture.program.descriptor_sources[source].indirect_image->bindless,
+        "nested descriptor phi did not become a bindless heap lookup");
+  const auto *key = image.ResolveInstruction()->Arg(0).ResolveInstruction();
+  Check(key != nullptr && key->GetOpcode() == ValueOpcode::Phi && key->Parent() == outer &&
+            key->NumArgs() == 2u,
+        "outer key phi missing");
+  const auto *inner_key = key->Arg(1).ResolveInstruction();
+  Check(key->Arg(0).Resolve() == key_a && inner_key != nullptr &&
+            inner_key->GetOpcode() == ValueOpcode::Phi && inner_key->Parent() == inner &&
+            inner_key->Arg(0).Resolve() == key_b && inner_key->Arg(1).IsImmediate() &&
+            inner_key->Arg(1).U32() == 0u,
+        "key phis do not mirror the descriptor phis, with key 0 on the free branch");
+  EliminateDeadCode(fixture.program.blocks);
+  ValidateProgram(fixture.program, true);
+}
+
 void TestShaderInfoAndBindingLayout() {
   Fixture fixture;
   const auto handle = fixture.Buffer(
@@ -3184,6 +3343,7 @@ int main() {
     Run("dynamic SRT", TestDynamicSrtReadRemainsExplicit);
     Run("phi validation", TestPhiValidation);
     Run("conditional sampler phi", TestConditionalSamplerPhi);
+    Run("default sampler keeps data reads", TestDefaultSamplerKeepsDataReads);
     Run("runtime-rooted loop", TestLoopCycleEnteredThroughRuntimeValue);
     Run("invariant loop phi", TestInvariantLoopPhi);
     Run("DMA address materialization", TestDmaAddressMaterialization);
@@ -3192,6 +3352,9 @@ int main() {
     Run("conditional buffer materialization", TestConditionalBufferMaterialization);
     Run("conservative buffer reachability", TestConservativeBufferReachability);
     Run("conditional indirect image", TestConditionalIndirectImageMaterialization);
+    Run("nested bindless descriptor phi", [] { TestNestedBindlessDescriptorPhi(false); });
+    Run("nested bindless descriptor phi, other offset",
+        [] { TestNestedBindlessDescriptorPhi(true); });
     Run("shader info and bindings", TestShaderInfoAndBindingLayout);
     Run("image binding ABI", TestImageBindingAbi);
     Run("graphics push constants", TestGraphicsPushConstantLayout);

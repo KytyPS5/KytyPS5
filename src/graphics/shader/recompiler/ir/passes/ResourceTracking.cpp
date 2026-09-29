@@ -479,16 +479,37 @@ public:
 	[[nodiscard]] bool Failed() const { return m_failed; }
 
 private:
+	bool UsesOnlyDescriptorSnapshots(Value value) const {
+		std::vector<Value>       pending {value};
+		std::unordered_set<const Inst*> visited;
+		while (!pending.empty()) {
+			const auto current = pending.back().Resolve();
+			pending.pop_back();
+			const auto* inst = current.TryInstruction();
+			if (inst == nullptr || !visited.insert(inst).second) continue;
+			if (inst->GetOpcode() == ValueOpcode::ReadConst) continue;
+			if (BufferAccessOf(inst->GetOpcode()) != BufferAccess::None ||
+			    AddressOpcodeInfoOf(inst->GetOpcode()).access != AddressAccess::None ||
+			    ImageOpcodeInfoOf(inst->GetOpcode()).access != ImageAccess::None)
+				return false;
+			for (size_t i = 0; i < inst->NumArgs(); ++i)
+				pending.push_back(inst->Arg(i));
+		}
+		return true;
+	}
 
-	Value LowerDescriptorPhi(Value value) {
+	Value LowerDescriptorPhi(Value value, bool buffer = false) {
 		value           = value.Resolve();
 		const auto* phi = value.TryInstruction();
-		if (m_shader_writes || phi == nullptr || phi->GetOpcode() != ValueOpcode::Phi ||
+		// Research: a buffer descriptor may lower in a shader that writes memory too;
+		// materialization then proves the evaluating reads disjoint from every written buffer
+		// (descriptor_phi_under_writes). Images and samplers keep upstream's refusal.
+		if ((m_shader_writes && !buffer) || phi == nullptr || phi->GetOpcode() != ValueOpcode::Phi ||
 		    phi->NumArgs() != 2u || phi->NumPhiBlocks() != 2u || phi->GetType() != Type::U32 ||
 		    m_program.blocks.size() != m_program.block_info.size()) {
 			return value;
 		}
-		const auto* merge = phi->Parent();
+		const auto* merge  = phi->Parent();
 		const auto* branch = phi->PhiBlock(0);
 		if (merge == nullptr || branch == nullptr || phi->PhiBlock(1) == nullptr ||
 		    branch == phi->PhiBlock(1)) {
@@ -512,11 +533,10 @@ private:
 		for (uint32_t arm = 0; arm < 2; arm++) {
 			const auto* incoming = phi->PhiBlock(arm);
 			if (incoming == merge ||
-			    (incoming != branch &&
-			     (incoming->ImmPredecessors().size() != 1u ||
-			      incoming->ImmPredecessors()[0] != branch ||
-			      incoming->ImmSuccessors().size() != 1u ||
-			      incoming->ImmSuccessors()[0] != merge))) {
+			    (incoming != branch && (incoming->ImmPredecessors().size() != 1u ||
+			                            incoming->ImmPredecessors()[0] != branch ||
+			                            incoming->ImmSuccessors().size() != 1u ||
+			                            incoming->ImmSuccessors()[0] != merge))) {
 				return value;
 			}
 			const auto* target = incoming == branch ? merge : incoming;
@@ -532,6 +552,15 @@ private:
 		}
 		const auto& info = m_program.block_info[branch_it - m_program.blocks.begin()];
 		const auto& term = info.terminator;
+		// Writes do not invalidate user data or the descriptor values already captured
+		// in SRT slots. Never introduce a host selection over a live GPU memory read.
+		if (m_shader_writes &&
+		    (!UsesOnlyDescriptorSnapshots(info.condition) ||
+		     !UsesOnlyDescriptorSnapshots(phi->Arg(0)) ||
+		     !UsesOnlyDescriptorSnapshots(phi->Arg(1)) ||
+		     !ValidateRuntimeValue(m_program, phi->Arg(0), RuntimeValueType::Integer) ||
+		     !ValidateRuntimeValue(m_program, phi->Arg(1), RuntimeValueType::Integer)))
+			return value;
 		if (term.kind != CFG::TerminatorKind::ConditionalBranch ||
 		    !((term.true_block == target_ids[0] && term.false_block == target_ids[1]) ||
 		      (term.false_block == target_ids[0] && term.true_block == target_ids[1])) ||
@@ -547,7 +576,129 @@ private:
 		selected.SetArg(1, phi->Arg(true_arg));
 		selected.SetArg(2, phi->Arg(true_arg ^ 1u));
 		m_descriptor_selections.emplace_back(phi, Value(&selected));
+		if (m_shader_writes) {
+			m_program.descriptor_phi_under_writes = true;
+		}
 		return Value(&selected);
+	}
+
+	// Research: a descriptor dword computed from a phi (a V# base address picked on a uniform
+	// branch, then a flag bit set in it) lowers the phi inside a host copy of the pure integer
+	// expression around it. Reads are never copied, so their memory metadata stays their own.
+	// The one value outside a web of phis whose other operands are the web itself or relative
+	// register writes over it (empty when there is more than one).
+	Value ResolveMovRelPhiWeb(Value start) const {
+		std::vector<const Inst*> pending {start.Resolve().TryInstruction()};
+		std::vector<const Inst*> seen;
+		Value                    external;
+		while (!pending.empty()) {
+			const auto* inst = pending.back();
+			pending.pop_back();
+			if (inst == nullptr || std::ranges::find(seen, inst) != seen.end()) {
+				continue;
+			}
+			if (seen.size() > 1024u) {
+				return {};
+			}
+			seen.push_back(inst);
+			if (inst->GetOpcode() == ValueOpcode::SelectU32 &&
+			    inst->Flags<uint64_t>() == MovRelSelectFlags) {
+				const auto next = inst->Arg(2).Resolve();
+				if (const auto* def = next.TryInstruction(); def != nullptr &&
+				    (def->GetOpcode() == ValueOpcode::Phi ||
+				     (def->GetOpcode() == ValueOpcode::SelectU32 &&
+				      def->Flags<uint64_t>() == MovRelSelectFlags))) {
+					pending.push_back(def);
+				} else if (external.IsEmpty()) {
+					external = next;
+				} else if (!(external == next)) {
+					return {};
+				}
+				continue;
+			}
+			if (inst->GetOpcode() != ValueOpcode::Phi) {
+				return {};
+			}
+			for (size_t i = 0; i < inst->NumArgs(); i++) {
+				const auto arg = inst->Arg(i).Resolve();
+				if (const auto* def = arg.TryInstruction(); def != nullptr &&
+				    (def->GetOpcode() == ValueOpcode::Phi ||
+				     (def->GetOpcode() == ValueOpcode::SelectU32 &&
+				      def->Flags<uint64_t>() == MovRelSelectFlags))) {
+					pending.push_back(def);
+				} else if (external.IsEmpty()) {
+					external = arg;
+				} else if (!(external == arg)) {
+					return {};
+				}
+			}
+		}
+		return external;
+	}
+
+	Value LowerDescriptorValue(Value value, const Block* use, bool buffer, uint32_t depth = 0) {
+		value      = value.Resolve();
+		auto* inst = value.TryInstruction();
+		if (inst == nullptr) {
+			return value;
+		}
+		if (inst->GetOpcode() == ValueOpcode::Phi) {
+			// A register carried around a loop that only a relative write could change holds
+			// the one value it entered with.
+			if (const auto single = ResolveMovRelPhiWeb(value); !single.IsEmpty() && depth < 64u) {
+				return LowerDescriptorValue(single, use, buffer, depth + 1u);
+			}
+			return LowerDescriptorPhi(value, buffer);
+		}
+		// A relative register write (V_MOVRELD) is modelled as a select on every register it
+		// could reach; a descriptor register is never part of such an array.
+		if (inst->GetOpcode() == ValueOpcode::SelectU32 &&
+		    inst->Flags<uint64_t>() == MovRelSelectFlags && depth < 64u) {
+			return LowerDescriptorValue(inst->Arg(2), use, buffer, depth + 1u);
+		}
+		// A value the host can evaluate is wave-uniform, so reading its first lane is itself.
+		if (inst->GetOpcode() == ValueOpcode::ReadFirstLane && inst->NumArgs() >= 1u &&
+		    depth < 64u) {
+			const auto lowered = LowerDescriptorValue(inst->Arg(0), use, buffer, depth + 1u);
+			if (ValidateRuntimeValue(m_program, lowered)) {
+				return lowered;
+			}
+			return value;
+		}
+		switch (inst->GetOpcode()) {
+			case ValueOpcode::BitFieldInsert:
+			case ValueOpcode::BitFieldSExtract:
+			case ValueOpcode::BitFieldUExtract:
+			case ValueOpcode::BitwiseAnd32:
+			case ValueOpcode::BitwiseNot32:
+			case ValueOpcode::BitwiseOr32:
+			case ValueOpcode::BitwiseXor32:
+			case ValueOpcode::IAdd32:
+			case ValueOpcode::IMul32:
+			case ValueOpcode::ISub32:
+			case ValueOpcode::SelectU32:
+			case ValueOpcode::ShiftLeftLogical32:
+			case ValueOpcode::ShiftRightArithmetic32:
+			case ValueOpcode::ShiftRightLogical32: break;
+			default: return value;
+		}
+		if (depth >= 6u) {
+			return value;
+		}
+		std::vector<Value> args(inst->NumArgs());
+		bool               changed = false;
+		for (size_t i = 0; i < args.size(); i++) {
+			args[i] = LowerDescriptorValue(inst->Arg(i), use, buffer, depth + 1u);
+			changed = changed || !(args[i] == inst->Arg(i).Resolve());
+		}
+		if (!changed) {
+			return value;
+		}
+		auto& copy = m_program.value_storage.emplace_back(inst->GetOpcode(), inst->Flags<uint64_t>());
+		for (size_t i = 0; i < args.size(); i++) {
+			copy.SetArg(i, args[i]);
+		}
+		return Value(&copy);
 	}
 
 	void MakeSource(const Inst& handle, uint32_t width, bool sampler, bool sample_adjust,
@@ -568,7 +719,8 @@ private:
 		for (uint32_t i = 0; i < width; i++) {
 			const auto value = base_reg != UINT32_MAX
 			    ? NativeDescriptorSource(handle.Arg(i), base_reg + i, pc) : handle.Arg(i);
-			descriptor.dwords[i] = LowerDescriptorPhi(value);
+			descriptor.dwords[i] = LowerDescriptorValue(
+			    value, handle.Parent(), handle.GetOpcode() == ValueOpcode::GetBufferResource);
 		}
 		if (sample_adjust) {
 			descriptor.dwords[3] = CanonicalizeSampleAdjustDword3(descriptor.dwords[3]);

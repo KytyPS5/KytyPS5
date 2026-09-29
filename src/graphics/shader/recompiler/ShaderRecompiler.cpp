@@ -925,6 +925,10 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		unsupported_result.unsupported = true;
 		return unsupported_result;
 	}
+	if (IR::RemoveRedundantPhiWebs(ir.blocks)) {
+		IR::RemoveIdentities(ir.blocks);
+		IR::EliminateDeadCode(ir.blocks);
+	}
 	std::string cfg_dump;
 	if (options.dump_ir) {
 		cfg_dump = CFG::GraphToString(cfg);

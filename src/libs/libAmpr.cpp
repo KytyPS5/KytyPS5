@@ -438,7 +438,6 @@ static int ResolvePathsCommon(const void* path_list, uint64_t count, uint32_t* i
 		return LibKernel::KERNEL_ERROR_EFAULT;
 	}
 
-		// Concatenate the prefix literally, including an empty prefix.
 	const auto path_list_addr = reinterpret_cast<uint64_t>(path_list);
 	bool       any_error      = false;
 	int        first_error    = OK;
@@ -506,6 +505,7 @@ static void SetSubmissionResult(uint32_t submission_id, int32_t execution_result
 	}
 }
 
+// Blocks until the engine has run the submission, then retires it.
 static void DiscardSubmission(uint32_t submission_id) {
 	std::scoped_lock lock(g_mutex);
 	g_submissions.erase(submission_id);
@@ -548,6 +548,8 @@ static int WriteResult(void* result, int32_t execution_result = 0, uint32_t erro
 } // namespace AprShared
 
 namespace LibAmpr::Ampr {
+// Queues the command buffer on the APR or AMM engine and returns at once; the engine runs
+// it in order and retires submission_id (0 for an anonymous submit) when done.
 static int EnqueueCommandBuffer(uint64_t command_buffer, bool amm_engine, uint32_t priority,
                                 uint32_t submission_id, uint64_t result_address);
 }
@@ -874,6 +876,7 @@ constexpr uint32_t AMPR_WAIT_COMPARE_GREATER_THAN_OR_EQUAL_WRAPPED = 4;
 constexpr uint32_t AMPR_WAIT_COMPARE_GREATER_THAN_SIGNED           = 5;
 constexpr uint32_t AMPR_WAIT_COMPARE_LESS_THAN_SIGNED              = 6;
 
+// CounterAccessSizeAndOffset: 8-byte pair, whole counter, or a 2/1-byte slice at an offset.
 constexpr uint8_t AMPR_COUNTER_ACCESS_SIZE_8          = 0;
 constexpr uint8_t AMPR_COUNTER_ACCESS_SIZE_4          = 1;
 constexpr uint8_t AMPR_COUNTER_ACCESS_SIZE_2_OFFSET_0 = 2;
@@ -889,6 +892,9 @@ constexpr uint8_t AMPR_WRITE_COUNTER_ATOMIC_ADD            = 4;
 constexpr uint8_t AMPR_WAIT_ON_COUNTER_MASK_DISABLED = 0;
 constexpr uint8_t AMPR_WAIT_ON_COUNTER_MASK_AND      = 1;
 
+// The AMPR unit has a bank of 4-byte counters, addressed by an 8-bit index, that APR and AMM
+// submissions share: one engine's writeCounterOnCompletion is what the other engine's
+// waitOnCounter observes.
 constexpr size_t AMPR_NUM_COUNTERS = 256;
 
 enum class AmmCommandKind : uint32_t {
@@ -948,9 +954,9 @@ struct CommandBufferState {
 		CounterCommandKind kind          = CounterCommandKind::Write;
 		uint8_t            index         = 0;
 		uint8_t            access        = AMPR_COUNTER_ACCESS_SIZE_4;
-		uint8_t            op            = 0;
+		uint8_t            op            = 0; // WriteCounterOperation or WaitCompare
 		uint8_t            mask_op       = AMPR_WAIT_ON_COUNTER_MASK_DISABLED;
-		uint64_t           value         = 0;
+		uint64_t           value         = 0; // write value or wait reference
 		uint64_t           mask          = 0;
 		uint64_t           address       = 0;
 	};
@@ -1463,6 +1469,8 @@ static void WriteCounterLocked(const CounterAccess& access, uint64_t value) {
 	std::memcpy(g_counters + access.byte_offset, &value, access.bytes);
 }
 
+// WaitCompare semantics at the width of the value read; the wrapped and signed forms sign-extend
+// from that width.
 static bool AmprWaitSatisfied(uint64_t observed, uint64_t ref, uint32_t compare, uint32_t bytes) {
 	const auto mask = CounterValueMask(bytes);
 	const auto bits = bytes * 8u;
@@ -1588,8 +1596,8 @@ static bool AppendAmmMapRecord(uint64_t                                 command_
 static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offset,
                                uint64_t destination, uint64_t size, uint64_t* bytes_read);
 
-static int ExecuteCommandBufferState(const CommandBufferState& state, int32_t* execution_result,
-                                     uint32_t* error_offset);
+static int ExecuteCommandBufferState(const CommandBufferState& state, bool amm_engine,
+                                     int32_t* execution_result, uint32_t* error_offset);
 
 namespace {
 
@@ -1599,9 +1607,11 @@ struct PendingSubmission {
 	uint64_t           result = 0;
 };
 
+// One in-order engine each for the asset reader and the memory mapper, as on the hardware:
+// a wait in one engine only holds that engine, and the guest keeps submitting to the other.
 class SubmissionEngine {
 public:
-	explicit SubmissionEngine(const char* name): m_name(name) {
+	SubmissionEngine(const char* name, bool amm_engine): m_name(name), m_amm_engine(amm_engine) {
 		std::thread([this] { Run(); }).detach();
 	}
 
@@ -1613,45 +1623,78 @@ public:
 		m_wake.notify_one();
 	}
 
+	// Runs the submission on the calling thread if nothing is queued or running on this ring,
+	// so the ring's order holds; returns false (and runs nothing) otherwise.
+	bool TryRunInline(const PendingSubmission& submission) {
+		{
+			std::scoped_lock lock(m_mutex);
+			if (m_running || !m_queue.empty()) {
+				return false;
+			}
+			m_running = true;
+		}
+		Execute(submission);
+		{
+			std::scoped_lock lock(m_mutex);
+			m_running = false;
+		}
+		m_wake.notify_one();
+		return true;
+	}
+
 private:
 	void Run() {
 		for (;;) {
 			PendingSubmission submission;
 			{
 				std::unique_lock lock(m_mutex);
-				m_wake.wait(lock, [this] { return !m_queue.empty(); });
+				m_wake.wait(lock, [this] { return !m_running && !m_queue.empty(); });
 				submission = std::move(m_queue.front());
 				m_queue.pop_front();
+				m_running = true;
 			}
-			int32_t  execution_result = OK;
-			uint32_t error_offset     = 0;
-			const auto submit_result =
-			    ExecuteCommandBufferState(submission.state, &execution_result, &error_offset);
-			if (submit_result != OK && execution_result == OK) {
-				execution_result = submit_result;
-			}
-			if (execution_result != OK) {
-				LOGF("\t%s submission failed: id=%u result=0x%08" PRIx32 " offset=0x%08" PRIx32
-				     "\n",
-				     m_name, submission.id, static_cast<uint32_t>(execution_result),
-				     error_offset);
-			}
-			if (submission.result != 0) {
-				(void)AprShared::WriteResult(reinterpret_cast<void*>(submission.result),
-				                             execution_result, error_offset);
-			}
-			if (submission.id != 0) {
-				AprShared::SetSubmissionResult(submission.id, execution_result, error_offset);
+			Execute(submission);
+			{
+				std::scoped_lock lock(m_mutex);
+				m_running = false;
 			}
 		}
 	}
 
+	void Execute(const PendingSubmission& submission) {
+		int32_t  execution_result = OK;
+		uint32_t error_offset     = 0;
+		const auto submit_result = ExecuteCommandBufferState(submission.state, m_amm_engine,
+		                                                     &execution_result, &error_offset);
+		if (submit_result != OK && execution_result == OK) {
+			execution_result = submit_result;
+		}
+		if (execution_result != OK) {
+			LOGF("\t%s submission failed: id=%u result=0x%08" PRIx32 " offset=0x%08" PRIx32 "\n",
+			     m_name, submission.id, static_cast<uint32_t>(execution_result), error_offset);
+		}
+		if (submission.result != 0) {
+			(void)AprShared::WriteResult(reinterpret_cast<void*>(submission.result),
+			                             execution_result, error_offset);
+		}
+		if (submission.id != 0) {
+			AprShared::SetSubmissionResult(submission.id, execution_result, error_offset);
+		}
+	}
+
 	const char*                   m_name;
+	bool                          m_amm_engine = false;
+	bool                          m_running    = false;
 	std::mutex                    m_mutex;
 	std::condition_variable       m_wake;
 	std::deque<PendingSubmission> m_queue;
 };
 
+// Each priority level is its own in-order ring on the hardware (APR has six, AMM three): a
+// wait suspends only the commands behind it at the same priority, and a buffer submitted
+// later at another priority runs past it. One thread per ring keeps that property; folding
+// them into one queue deadlocked a wait-on-address against the higher-priority writer of
+// the value it waited for.
 SubmissionEngine& Engine(bool amm_engine, uint32_t priority) {
 	static std::mutex                                            engines_mutex;
 	static std::map<std::pair<bool, uint32_t>, SubmissionEngine*> engines;
@@ -1660,12 +1703,12 @@ SubmissionEngine& Engine(bool amm_engine, uint32_t priority) {
 	if (engine == nullptr) {
 		static std::deque<std::string> names;
 		names.push_back((amm_engine ? "amm" : "apr") + std::string(" p") + std::to_string(priority));
-		engine = new SubmissionEngine(names.back().c_str());
+		engine = new SubmissionEngine(names.back().c_str(), amm_engine);
 	}
 	return *engine;
 }
 
-}
+} // namespace
 
 static int EnqueueCommandBuffer(uint64_t command_buffer, bool amm_engine, uint32_t priority,
                                 uint32_t submission_id, uint64_t result_address) {
@@ -1675,12 +1718,22 @@ static int EnqueueCommandBuffer(uint64_t command_buffer, bool amm_engine, uint32
 	}
 	submission.id     = submission_id;
 	submission.result = result_address;
-	Engine(amm_engine, priority).Enqueue(std::move(submission));
+	// The memory mapper finishes a few maps in microseconds on the hardware. A streaming title
+	// wrote into a freshly mapped texture 2-6 ms after submitting the map, while the batch still
+	// sat in its ring, so a batch that cannot block (no waits, counters or file reads) runs on
+	// the submitting thread when its ring is idle. Anything else keeps the ring's order.
+	auto&      engine = Engine(amm_engine, priority);
+	const auto& state = submission.state;
+	if (amm_engine && state.wait_address_commands.empty() && state.counter_commands.empty() &&
+	    state.read_file_commands.empty() && engine.TryRunInline(submission)) {
+		return OK;
+	}
+	engine.Enqueue(std::move(submission));
 	return OK;
 }
 
-static int ExecuteCommandBufferState(const CommandBufferState& state, int32_t* execution_result,
-                                     uint32_t* error_offset) {
+static int ExecuteCommandBufferState(const CommandBufferState& state, bool amm_engine,
+                                     int32_t* execution_result, uint32_t* error_offset) {
 	*execution_result = OK;
 	*error_offset     = 0;
 
@@ -1742,8 +1795,13 @@ static int ExecuteCommandBufferState(const CommandBufferState& state, int32_t* e
 		return a.record_offset < b.record_offset;
 	});
 
+	// One lock per unit: a unit's buffers interleave only at a wait, but the memory mapper
+	// never queues behind the asset reader's file reads. Sharing one lock held an AMM batch
+	// (one map) for milliseconds behind an APR read from slow storage, and the title wrote
+	// into the range before the map ran.
 	static std::mutex g_apr_execution_mutex;
-	std::unique_lock  execution_lock(g_apr_execution_mutex);
+	static std::mutex g_amm_execution_mutex;
+	std::unique_lock  execution_lock(amm_engine ? g_amm_execution_mutex : g_apr_execution_mutex);
 
 	for (const auto& entry: ordered) {
 		switch (entry.kind) {
@@ -1792,17 +1850,26 @@ static int ExecuteCommandBufferState(const CommandBufferState& state, int32_t* e
 					return AmprWaitSatisfied(observed, command.ref_value, command.compare, 8);
 				};
 
+				// Another queue's submission satisfies this wait; it may be a while away. Like the
+				// hardware it has no timeout: giving up ran the next command early (a read into
+				// memory a slow AMM map had not mapped yet). A long wait is logged instead.
 				constexpr uint32_t WaitPollMicros    = 50;
 				constexpr double   WaitSpinSeconds   = 0.0002;
-				constexpr double   WaitTimeoutSecond = 10.0;
+				constexpr double   WaitReportSeconds = 10.0;
 				Common::Timer      wait_timer;
 				wait_timer.Start();
 				execution_lock.unlock();
-				uint64_t observed = 0;
+				uint64_t observed    = 0;
+				double   next_report = WaitReportSeconds;
 				for (;;) {
-					if (!AprShared::ReadGuest(command.address, &observed) || satisfied(observed) ||
-					    wait_timer.GetTimeS() >= WaitTimeoutSecond) {
+					if (!AprShared::ReadGuest(command.address, &observed) || satisfied(observed)) {
 						break;
+					}
+					if (wait_timer.GetTimeS() >= next_report) {
+						LOGF("\tAMPR wait-on-address still waiting after %.0f s: address=0x%016" PRIx64
+						     " compare=%u ref=0x%016" PRIx64 " observed=0x%016" PRIx64 "\n",
+						     next_report, command.address, command.compare, command.ref_value, observed);
+						next_report += WaitReportSeconds;
 					}
 					if (wait_timer.GetTimeS() < WaitSpinSeconds) {
 						Common::Thread::SleepNano(0);
@@ -1812,7 +1879,7 @@ static int ExecuteCommandBufferState(const CommandBufferState& state, int32_t* e
 				}
 				execution_lock.lock();
 				if (!satisfied(observed)) {
-					LOGF("\tAMPR wait-on-address timed out: address=0x%016" PRIx64
+					LOGF("\tAMPR wait-on-address cannot read its address: address=0x%016" PRIx64
 					     " compare=%u ref=0x%016" PRIx64 " observed=0x%016" PRIx64 "\n",
 					     command.address, command.compare, command.ref_value, observed);
 				}
@@ -1878,7 +1945,9 @@ static int ExecuteCommandBufferState(const CommandBufferState& state, int32_t* e
 						g_counter_cv.notify_all();
 					} break;
 					case CounterCommandKind::Wait: {
-						constexpr auto WaitTimeout = std::chrono::seconds(10);
+						// The writer is usually the other engine, so give up the execution lock. No
+						// timeout, as on the hardware; a long wait is logged every 10 s.
+						constexpr auto WaitReport = std::chrono::seconds(10);
 						const auto     satisfied   = [&]() {
 							auto observed = ReadCounterLocked(access);
 							if (command.mask_op == AMPR_WAIT_ON_COUNTER_MASK_AND) {
@@ -1890,7 +1959,17 @@ static int ExecuteCommandBufferState(const CommandBufferState& state, int32_t* e
 						execution_lock.unlock();
 						{
 							std::unique_lock lock(g_counter_mutex);
-							if (!g_counter_cv.wait_for(lock, WaitTimeout, satisfied)) {
+							bool             met = false;
+							for (uint32_t periods = 1; !(met = g_counter_cv.wait_for(lock, WaitReport,
+							                                                        satisfied));
+							     periods++) {
+								LOGF("\tAMPR wait-on-counter still waiting after %u s: index=%u "
+								     "compare=%u ref=0x%016" PRIx64 " observed=0x%016" PRIx64 "\n",
+								     periods * 10u, static_cast<uint32_t>(command.index),
+								     static_cast<uint32_t>(command.op), command.value,
+								     ReadCounterLocked(access));
+							}
+							if (!met) {
 								LOGF("\tAMPR wait-on-counter timed out: index=%u access=%u "
 								     "compare=%u ref=0x%016" PRIx64 " observed=0x%016" PRIx64 "\n",
 								     static_cast<uint32_t>(command.index),
@@ -2000,6 +2079,11 @@ static int ReadHostFileToGuest(const std::string& host_path, uint64_t file_offse
 		return OK;
 	}
 
+	// The destination may be cached as a GPU buffer and write-protected by the memory tracker.
+	// ReadFile into such a page raises no user-mode fault; it fails silently and the asset
+	// lands as zeros (seen as PAGE_READONLY + ERROR_NOACCESS). Reading into a host chunk and
+	// copying takes the tracked-page fault like any CPU write, so the tracker unprotects the
+	// page and marks it dirty, and the bytes land.
 	LibKernel::Memory::InvalidateMemory(destination, readable);
 	thread_local std::vector<uint8_t> chunk;
 	if (chunk.size() < APR_HOST_READ_CHUNK_SIZE) {
@@ -2616,6 +2700,7 @@ static int KYTY_SYSV_ABI CommandBufferWriteAddressOnCompletion(void*            
 	return AppendWriteAddressCommand(command_buffer, address, value);
 }
 
+// Commands run in order and to completion here, so "immediately" and "on completion" coincide.
 static int KYTY_SYSV_ABI CommandBufferWriteCounter(void* command_buffer, uint8_t counter_index,
                                                    uint8_t access, uint64_t value, uint8_t op,
                                                    uint32_t) {
@@ -2783,6 +2868,9 @@ static int KYTY_SYSV_ABI AprCommandBufferResetGatherScatterState(void* command_b
 	return OK;
 }
 
+// mapBegin/mapDirectBegin are AMM map commands riding in an APR buffer: the reads that follow
+// land in the pages they map. Recording them as no-ops leaves those reads faulting on reserved
+// but uncommitted memory.
 static int KYTY_SYSV_ABI AprCommandBufferMapBegin(void* command_buffer, uint64_t va, uint64_t size,
                                                   int32_t type, int32_t prot) {
 	PRINT_NAME();

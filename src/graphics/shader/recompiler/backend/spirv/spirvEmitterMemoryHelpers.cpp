@@ -1,5 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 
+#include <algorithm>
+
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
 uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index) {
@@ -62,7 +64,11 @@ void EmitMemoryOffsets(EmitterState& state) {
 
 uint32_t LdsDwordCount(const EmitterState& state) {
 	const auto* workgroup = ShaderWorkgroupInput(state.program.stage, state.input_info);
-	return workgroup != nullptr ? workgroup->lds_size_dwords : 8192u;
+	if (workgroup != nullptr) {
+		return workgroup->lds_size_dwords;
+	}
+	return state.requirements.function_lds_dwords != 0 ? state.requirements.function_lds_dwords
+	                                                   : 8192u;
 }
 
 void EnsureLdsStorage(EmitterState& state) {
@@ -72,10 +78,11 @@ void EnsureLdsStorage(EmitterState& state) {
 	if (ShaderWorkgroupInput(state.program.stage, state.input_info) == nullptr) {
 		EXIT("function LDS was not prepared before SPIR-V function emission\n");
 	}
+	const auto dwords = std::max({1u, LdsDwordCount(state)});
 	const auto define = [&](uint32_t type, uint32_t bytes) {
 		const auto array = state.builder.DecoratedType(
 		    spv::OpTypeArray, {{spv::OpDecorate, {spv::DecorationArrayStride, bytes}}}, type,
-		    ConstantU32(state, std::max(LdsDwordCount(state) * 4u / bytes, 1u)));
+		    ConstantU32(state, std::max(dwords * 4u / bytes, 1u)));
 		const auto block = state.builder.DecoratedType(
 		    spv::OpTypeStruct, {{spv::OpMemberDecorate, {0, spv::DecorationOffset, 0}},
 		                        {spv::OpDecorate, {spv::DecorationBlock}}}, array);
@@ -90,7 +97,7 @@ void EnsureLdsStorage(EmitterState& state) {
 		state.builder.AddName(state.lds_u64_variable, "lds_qwords");
 	} else {
 		state.lds_variable = state.builder.DefineGlobalVariable(
-		    TypeU32ArrayPointer(state, spv::StorageClassWorkgroup, LdsDwordCount(state)),
+		    TypeU32ArrayPointer(state, spv::StorageClassWorkgroup, dwords),
 		    spv::StorageClassWorkgroup);
 	}
 	state.builder.AddName(state.lds_variable, "lds_dwords");

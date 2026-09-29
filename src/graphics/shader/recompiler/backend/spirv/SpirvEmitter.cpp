@@ -7,6 +7,9 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
+#include <optional>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
@@ -171,10 +174,95 @@ void ValidateNativeProgram(const IR::Program& program) {
 	}
 }
 
+// An upper bound of a U32 value built from constants, the lane id and simple integer arithmetic,
+// or nothing. Phi cycles (a loop-carried address) are unbounded.
+std::optional<uint64_t> UpperBoundU32(IR::Value value, uint32_t wave_size,
+                                      std::vector<const IR::Inst*>& visiting) {
+	value = value.Resolve();
+	if (value.IsImmediate()) {
+		return value.GetType() == IR::Type::U32 ? std::optional<uint64_t>(value.U32())
+		                                        : std::nullopt;
+	}
+	const auto* inst = value.TryInstruction();
+	if (inst == nullptr || visiting.size() > 64u || std::ranges::find(visiting, inst) != visiting.end()) {
+		return std::nullopt;
+	}
+	visiting.push_back(inst);
+	const auto arg = [&](size_t index) { return UpperBoundU32(inst->Arg(index), wave_size, visiting); };
+	const auto immediate = [&](size_t index) -> std::optional<uint32_t> {
+		const auto operand = inst->Arg(index).Resolve();
+		return operand.IsImmediate() && operand.GetType() == IR::Type::U32
+		           ? std::optional<uint32_t>(operand.U32())
+		           : std::nullopt;
+	};
+	std::optional<uint64_t> result;
+	switch (inst->GetOpcode()) {
+		case IR::ValueOpcode::LaneId: result = wave_size - 1u; break;
+		case IR::ValueOpcode::IAdd32:
+			if (const auto a = arg(0), b = arg(1); a && b) {
+				result = *a + *b;
+			}
+			break;
+		case IR::ValueOpcode::IMul32:
+			if (const auto a = arg(0), b = arg(1); a && b) {
+				result = *a * *b;
+			}
+			break;
+		case IR::ValueOpcode::ShiftLeftLogical32:
+		case IR::ValueOpcode::ShiftRightLogical32: {
+			const auto a = arg(0);
+			const auto b = immediate(1);
+			if (a && b && *b < 32u) {
+				result = inst->GetOpcode() == IR::ValueOpcode::ShiftLeftLogical32 ? *a << *b : *a >> *b;
+			}
+			break;
+		}
+		case IR::ValueOpcode::BitwiseAnd32: {
+			const auto a = arg(0), b = arg(1);
+			if (a || b) {
+				result = std::min(a.value_or(UINT32_MAX), b.value_or(UINT32_MAX));
+			}
+			break;
+		}
+		case IR::ValueOpcode::BitwiseOr32:
+		case IR::ValueOpcode::BitwiseXor32:
+			if (const auto a = arg(0), b = arg(1); a && b) {
+				result = std::bit_ceil(std::max(*a, *b) + 1u) - 1u;
+			}
+			break;
+		case IR::ValueOpcode::SelectU32:
+			if (const auto a = arg(1), b = arg(2); a && b) {
+				result = std::max(*a, *b);
+			}
+			break;
+		case IR::ValueOpcode::Phi: {
+			uint64_t bound = 0;
+			bool     known = inst->NumArgs() != 0;
+			for (size_t index = 0; known && index < inst->NumArgs(); index++) {
+				const auto incoming = arg(index);
+				known               = incoming.has_value();
+				bound               = known ? std::max(bound, *incoming) : bound;
+			}
+			if (known) {
+				result = bound;
+			}
+			break;
+		}
+		default: break;
+	}
+	visiting.pop_back();
+	return result && *result <= UINT32_MAX ? result : std::nullopt;
+}
+
 } // namespace
 
 Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program& program) {
 	SpirvRequirements requirements {};
+	// A non-compute stage keeps LDS in a function-scope array of its own, which NVIDIA places in
+	// local memory: at the 8192-dword default that is 32 KB per invocation, several GB across the
+	// GPU. Size it from the addresses the shader can form instead.
+	uint64_t function_lds_bytes     = 0;
+	bool     function_lds_unbounded = false;
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			requirements.float64 |= inst.GetType() == IR::Type::F64;
@@ -238,6 +326,16 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 				if (program.stage != ShaderType::Compute && program.stage != ShaderType::Mesh &&
 				    kind == IR::ResourceKind::Lds) {
 					requirements.function_lds = true;
+					std::vector<const IR::Inst*> visiting;
+					const auto address = UpperBoundU32(inst.Arg(0), program.wave_size, visiting);
+					if (address.has_value()) {
+						const auto& memory = program.memory_info[index];
+						function_lds_bytes = std::max(
+						    function_lds_bytes, *address + std::max(memory.offset, memory.secondary_offset) +
+						                            4u * IR::SharedComponentCount(inst.GetOpcode()));
+					} else {
+						function_lds_unbounded = true;
+					}
 				}
 				if (shared_access == IR::SharedAccess::Append ||
 				    shared_access == IR::SharedAccess::Consume) {
@@ -300,6 +398,11 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 				default: break;
 			}
 		}
+	}
+	if (requirements.function_lds && !function_lds_unbounded &&
+	    function_lds_bytes < 8192u * sizeof(uint32_t)) {
+		requirements.function_lds_dwords =
+		    static_cast<uint32_t>((function_lds_bytes + sizeof(uint32_t) - 1u) / sizeof(uint32_t));
 	}
 	return requirements;
 }

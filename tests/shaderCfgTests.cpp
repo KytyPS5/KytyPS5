@@ -1362,6 +1362,42 @@ void TestSpirvRequirementsAnalysis() {
             requirements.pixel_valid_mask,
         "consolidated SPIR-V requirements missed an IR dependency");
 
+  Check(requirements.function_lds_dwords == 1u,
+        "a constant LDS address did not size the function LDS array");
+
+  {
+    // LDS in a non-compute stage is a function-scope array per invocation, which NVIDIA keeps
+    // in local memory. A lane-private slot at lane * 4 + 1792 (PS 0x4fa6faa57bc9a97a) needs 512
+    // dwords, not the 8192-dword default that cost 32 KB per pixel.
+    Program lane_private;
+    lane_private.stage = ShaderType::Pixel;
+    lane_private.block_storage.push_back(std::make_unique<Block>());
+    auto *lane_block = lane_private.block_storage.back().get();
+    lane_private.blocks.push_back(lane_block);
+    lane_private.memory_info.push_back({.kind = ResourceKind::Lds, .offset = 1792});
+    lane_private.memory_info.push_back({.kind = ResourceKind::Lds});
+    auto &lane = lane_block->AppendNewInst(ValueOpcode::LaneId);
+    auto &address = lane_block->AppendNewInst(ValueOpcode::ShiftLeftLogical32,
+                                              {Value(&lane), Value(2u)});
+    auto &store = lane_block->AppendNewInst(
+        ValueOpcode::WriteSharedU32, {Value(&address), Value(0u), Value(true)});
+    store.SetFlags(MemoryFlags{.index = 0});
+    Check(ShaderRecompiler::Spirv::Emitter::AnalyzeProgramRequirements(lane_private)
+                  .function_lds_dwords == 512u,
+          "a lane-private LDS address was not bounded by the wave size");
+
+    // An address loaded from memory cannot be bounded: keep the default size.
+    auto &loaded = lane_block->AppendNewInst(ValueOpcode::LoadSharedU32,
+                                             {Value(&address), Value(true)});
+    loaded.SetFlags(MemoryFlags{.index = 0});
+    auto &dependent = lane_block->AppendNewInst(ValueOpcode::LoadSharedU32,
+                                                {Value(&loaded), Value(true)});
+    dependent.SetFlags(MemoryFlags{.index = 1});
+    Check(ShaderRecompiler::Spirv::Emitter::AnalyzeProgramRequirements(lane_private)
+                  .function_lds_dwords == 0u,
+          "an unbounded LDS address shrank the function LDS array");
+  }
+
   program.stage = ShaderType::Compute;
   const auto compute_requirements =
       ShaderRecompiler::Spirv::Emitter::AnalyzeProgramRequirements(program);

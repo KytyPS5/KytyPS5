@@ -678,6 +678,8 @@ void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>
 	key.insert(key.end(), std::begin(info.target_output_mode), std::end(info.target_output_mode));
 	const auto mask = info.target_shader_mask;
 	key.push_back((mask | (mask >> 1u) | (mask >> 2u) | (mask >> 3u)) & 0x11111111u);
+	key.push_back(info.target_uint_mask);
+	key.push_back(info.target_sint_mask);
 	for (uint32_t base = 0; base < info.target_export_mapping.size(); base += 4u) {
 		uint32_t packed = 0;
 		for (uint32_t i = 0; i < 4u; i++) {
@@ -795,11 +797,9 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 static std::mutex                   g_rejected_tessellation_mutex;
 static std::unordered_set<uint64_t> g_rejected_tessellation;
 
-static uint64_t TessellationProgramKey(const HW::VertexShaderInfo& regs,
-                                       const HW::ShaderRegisters&  sh) {
-	const uint64_t words[4] = {GetDeclaredShaderHash(regs.ls_regs.data_addr),
-	                           GetDeclaredShaderHash(regs.hs_regs.data_addr), sh.m_vgtLsHsConfig,
-	                           sh.m_vgtTfParam};
+static uint64_t TessellationProgramKey(uint64_t local_hash, uint64_t control_hash,
+                                       const HW::ShaderRegisters& sh) {
+	const uint64_t words[4] = {local_hash, control_hash, sh.m_vgtLsHsConfig, sh.m_vgtTfParam};
 	return XXH3_64bits(words, sizeof(words));
 }
 
@@ -807,15 +807,15 @@ bool PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Con
                                  std::array<ShaderVertexInputInfo, 3>& input_info,
                                  std::array<ShaderParams, 3>&          params) {
 	const auto& sh        = context.GetShaderRegisters();
-	const auto  tess_key  = TessellationProgramKey(regs, sh);
+	const auto [local, local_hash] = ShaderGetMappedData(regs.ls_regs.data_addr, "ShaderGetInputInfoLS():");
+	const auto [control, control_hash] = ShaderGetMappedData(regs.hs_regs.data_addr, "ShaderGetInputInfoHS():");
+	const auto  tess_key  = TessellationProgramKey(local_hash, control_hash, sh);
 	{
 		std::scoped_lock lock(g_rejected_tessellation_mutex);
 		if (g_rejected_tessellation.contains(tess_key)) {
 			return false;
 		}
 	}
-	const auto [local, local_hash] = ShaderGetMappedData(regs.ls_regs.data_addr, "ShaderGetInputInfoLS():");
-	const auto [control, control_hash] = ShaderGetMappedData(regs.hs_regs.data_addr, "ShaderGetInputInfoHS():");
 	const auto [evaluation, evaluation_hash] = ShaderGetMappedData(regs.es_regs.data_addr, "ShaderGetInputInfoTES():");
 	EXIT_NOT_IMPLEMENTED(local.type != Prospero::ShaderBinaryType::kHsFront ||
 	                     control.type != Prospero::ShaderBinaryType::kHsBack ||

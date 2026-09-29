@@ -418,7 +418,7 @@ Program DecodeFrontProgram(std::span<const uint32_t> front) {
 	return result;
 }
 
-void DecodeProgram(std::span<const uint32_t> code, Program& program) {
+void DecodeProgram(std::span<const uint32_t> code, Program& program, bool translate_bvh) {
 	program.instructions.clear();
 	program.instructions.reserve(code.size());
 	program.code = code;

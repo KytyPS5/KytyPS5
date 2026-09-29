@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <array>
+#include <unordered_map>
 #include <atomic>
 #include <cctype>
 #include <cstdio>
@@ -447,7 +448,15 @@ struct PipelineCache::ProgramCache {
 			entry->second.skip_dispatch = true;
 			return {};
 		}
+		if (!translated.unsupported && !translated.call_target_user_data.empty() &&
+		    call_targets.try_emplace(params.hash, translated.call_target_user_data).second) {
+			for (const auto index: translated.call_target_user_data) {
+				lookup_key.static_state.push_back(index < user_data.size() ? user_data[index] : 0u);
+			}
+		}
 		if (translated.unsupported) {
+			// Remember the refusal: a skipped shader is dispatched again every frame, and
+			// re-deriving the same answer costs as much as a compile each time.
 			unsupported.insert(lookup_key);
 			return ShaderProgram {};
 		}
@@ -520,6 +529,8 @@ struct PipelineCache::ProgramCache {
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
 	std::unordered_set<ProgramKey, ProgramKeyHash>              unsupported;
 	ProgramKey                                                  lookup_key;
+	// Research: per shader hash, the user-data dwords holding its inlined call targets.
+	std::unordered_map<uint64_t, std::vector<uint32_t>>         call_targets;
 	vk::Device                                                  device;
 	bool                                                        shader_clock = false;
 	uint64_t                                                    next_shader_id = 0;

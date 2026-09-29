@@ -62,6 +62,11 @@ private:
 	SrtWalker*                      m_clean_evaluator = nullptr;
 	Value                           m_active_mask;
 	ResourcePlan::EvaluationContext& m_context;
+	// The last raw read that failed, for RefreshFlatBuffer's report.
+	const char* m_read_failure         = nullptr;
+	uint64_t    m_read_failure_address = 0;
+	uint64_t    m_read_failure_offset  = 0;
+	uint64_t    m_read_failure_size    = 0;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

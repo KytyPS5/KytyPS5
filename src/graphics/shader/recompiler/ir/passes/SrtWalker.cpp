@@ -4,9 +4,14 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <fmt/format.h>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -466,8 +471,8 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 		}
 		address = (base & ~uint64_t {3}) + byte_offset;
 	} else {
-		const auto relative = (immediate & ~int64_t {3}) +
-		                      static_cast<int64_t>(static_cast<uint32_t>(offset) & ~3u);
+		const auto relative =
+		    (immediate & ~int64_t {3}) + static_cast<int64_t>(static_cast<uint32_t>(offset) & ~3u);
 		if (!AddSignedAddress(base & ~uint64_t {3}, relative, address)) {
 			return false;
 		}
@@ -475,6 +480,17 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 	uint32_t word = 0;
 	if (m_runtime.read_memory != nullptr) {
 		if (!m_runtime.read_memory(m_runtime.userdata, address, {&word, 1})) {
+			// A failed load through a null base pointer sits on a path the shader guards with a
+			// null-pointer test and never executes (CS 0x0b4b91abfed42248 checks s[4:5] against
+			// zero before its s_load). Its value cannot matter; failing would skip the dispatch.
+			if (base == 0) {
+				result = 0;
+				return true;
+			}
+			m_read_failure         = "guest memory unreadable";
+			m_read_failure_address = address;
+			m_read_failure_offset  = 0;
+			m_read_failure_size    = 0;
 			return false;
 		}
 	} else {
@@ -883,19 +899,41 @@ std::span<const uint8_t> SrtWalker::FindActiveSources() {
 }
 
 bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
-	if (!m_program.srt_plan_complete) {
+	// A failure skips the draw or dispatch; say which SRT read failed (capped).
+	static std::atomic<uint32_t> reported {0};
+	const auto report = [&](const char* reason, size_t index, uint32_t flat_offset, bool clean) {
+		if (reported.fetch_add(1, std::memory_order_relaxed) < 32) {
+			const auto* detail = clean && m_clean_evaluator != nullptr ? m_clean_evaluator : this;
+			std::fprintf(stderr,
+			             "SRT flat buffer refresh failed: %s (read %zu of %zu, flat slot %u, %s)"
+			             " last raw read: %s address=0x%llx offset=0x%llx size=0x%llx\n",
+			             reason, index, m_program.srt_reads.size(), flat_offset,
+			             clean ? "clean" : "ordinary",
+			             detail->m_read_failure != nullptr ? detail->m_read_failure : "none",
+			             static_cast<unsigned long long>(detail->m_read_failure_address),
+			             static_cast<unsigned long long>(detail->m_read_failure_offset),
+			             static_cast<unsigned long long>(detail->m_read_failure_size));
+		}
 		return false;
+	};
+	m_read_failure = nullptr;
+	if (m_clean_evaluator != nullptr) {
+		m_clean_evaluator->m_read_failure = nullptr;
+	}
+	if (!m_program.srt_plan_complete) {
+		return report("SRT plan incomplete", 0, 0, false);
 	}
 	flat.resize(m_program.srt_reads.size());
-	for (const auto& read: m_program.srt_reads) {
-		const bool clean = read.flat_offset < m_clean_flat_slots.size() &&
+	for (size_t index = 0; index < m_program.srt_reads.size(); index++) {
+		const auto& read  = m_program.srt_reads[index];
+		const bool  clean = read.flat_offset < m_clean_flat_slots.size() &&
 		                   m_clean_flat_slots[read.flat_offset] != 0u;
 		if (clean && (m_clean_evaluator == nullptr || m_runtime.read_specialization_memory == nullptr)) {
-			return false;
+			return report("no clean reader", index, read.flat_offset, clean);
 		}
 		auto& evaluator = clean ? *m_clean_evaluator : *this;
 		if (read.flat_offset >= flat.size() || !evaluator.Evaluate(read.value, flat[read.flat_offset])) {
-			return false;
+			return report("value unreadable", index, read.flat_offset, clean);
 		}
 	}
 	return true;

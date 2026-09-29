@@ -110,6 +110,42 @@ bool UsesShaderClock(const ShaderRecompiler::IR::Program& program) {
 	return false;
 }
 
+// Ordinary (raw) SRT reads: only memory the guest has committed, read through the guest
+// mapping so a GPU-owned page is refreshed first. Without a reader the walker dereferenced
+// whatever address a descriptor chain produced, including 0 on a path the shader never takes.
+bool ReadShaderGuestMemoryRaw(void*, uint64_t address, std::span<uint32_t> values) {
+	if (values.empty()) {
+		return false;
+	}
+	// Bytes the GPU has not written are current in the backing store. Reading them there skips
+	// the tracked-page fault, which drains the GPU to refresh whatever else on the page the GPU
+	// wrote: constants that share a page with GPU-written arguments cost a drain per dispatch.
+	if (Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, values.data(),
+	                                                    values.size_bytes())) {
+		return true;
+	}
+	if (!Libs::LibKernel::Memory::TryReadBacking(address, values.data(), values.size_bytes())) {
+		return false;
+	}
+	std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
+	return true;
+}
+
+// Research: a subroutine's code for inlining, in 1 KiB steps while the guest has it committed.
+std::vector<uint32_t> ReadShaderCode(uint64_t address) {
+	constexpr size_t      Chunk = 256;
+	constexpr size_t      Limit = 16384;
+	std::vector<uint32_t> words;
+	while (words.size() < Limit) {
+		std::array<uint32_t, Chunk> chunk {};
+		if (!ReadShaderGuestMemoryRaw(nullptr, address + words.size() * sizeof(uint32_t), chunk)) {
+			break;
+		}
+		words.insert(words.end(), chunk.begin(), chunk.end());
+	}
+	return words;
+}
+
 bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
 	if (values.empty()) {
 		return false;
@@ -118,6 +154,10 @@ bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) 
 	                                                    values.size_bytes())) {
 		return true;
 	}
+	// The bytes are mapped but GPU-owned. Reading them through the guest mapping takes the
+	// tracked-page fault, which drains the GPU and refreshes the page, so the value read is
+	// the one the shader would see. Before, this only ever succeeded because the aggressive
+	// garbage collector happened to have downloaded the range first.
 	if (!Libs::LibKernel::Memory::TryReadBacking(address, values.data(), values.size_bytes())) {
 		return false;
 	}
@@ -324,6 +364,7 @@ struct PipelineCache::ProgramCache {
 		const ShaderRecompiler::IR::SrtRuntime       runtime {
 		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),
+		    .read_memory                = ReadShaderGuestMemoryRaw,
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		    .float_image_atomics        = Config::FloatImageAtomicsEnabled(),
 		};

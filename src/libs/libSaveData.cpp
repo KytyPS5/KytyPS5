@@ -12,6 +12,7 @@
 #include "loader/symbolDatabase.h"
 #include "loader/systemContent.h"
 
+#include <atomic>
 #include <algorithm>
 #include <cstring>
 #include <ctime>
@@ -256,6 +257,16 @@ static constexpr uint32_t SAVE_DATA_EVENT_TYPE_UMOUNT_BACKUP_END = 1u;
 static constexpr uint32_t SAVE_DATA_EVENT_TYPE_BACKUP_END        = 2u;
 static constexpr uint32_t SAVE_DATA_EVENT_TYPE_MEMORY_SYNC_END   = 3u;
 static constexpr uint32_t SAVE_DATA_EVENT_TYPE_COMMIT_BACKUP_END = 4u;
+static constexpr uint32_t SAVE_DATA_EVENT_TYPE_CONVERT_END       = 5u;
+
+struct SaveDataConvertParam {
+	int32_t                   user_id;
+	int32_t                   pad;
+	const SceSaveDataDirName* src_dir_name;
+	const SceSaveDataDirName* dst_dir_name;
+	uint64_t                  dst_blocks;
+	uint8_t                   reserved[24];
+};
 
 static constexpr size_t   SAVE_DATA_MEMORY_MAX_SIZE      = 32 * 1024 * 1024;
 static constexpr uint32_t SAVE_DATA_MEMORY_SET_PARAM     = 1u;
@@ -1142,20 +1153,24 @@ int KYTY_SYSV_ABI SaveDataSyncSaveDataMemory(const SaveDataMemorySync* sync_para
 }
 
 int KYTY_SYSV_ABI SaveDataGetEventResult(const void* event_param, SaveDataEvent* event) {
-	PRINT_NAME();
-
-	LOGF("\t event_param = 0x%016" PRIx64 "\n"
-	     "\t event       = 0x%016" PRIx64 "\n",
-	     reinterpret_cast<uint64_t>(event_param), reinterpret_cast<uint64_t>(event));
-
 	if (event == nullptr) {
 		return SAVE_DATA_ERROR_PARAMETER;
 	}
 
 	Common::LockGuard lock(g_mount_mutex);
 	if (g_save_data_events.empty()) {
+		// Titles poll this in a tight loop from a worker thread; logging every empty poll wrote
+		// tens of gigabytes and slowed the whole emulator.
+		static std::atomic<uint32_t> empty_polls = 0;
+		if (empty_polls.fetch_add(1) < 4) {
+			PRINT_NAME();
+			LOGF("\t event_param = 0x%016" PRIx64 " (no event queued; later empty polls are not "
+			     "logged)\n",
+			     reinterpret_cast<uint64_t>(event_param));
+		}
 		return SAVE_DATA_ERROR_NOT_FOUND;
 	}
+	PRINT_NAME();
 
 	*event = g_save_data_events.front();
 	g_save_data_events.pop_front();
@@ -1190,6 +1205,51 @@ int KYTY_SYSV_ABI SaveDataBackup(const SaveDataBackup* backup) {
 	queue_save_data_event(SAVE_DATA_EVENT_TYPE_BACKUP_END, backup->user_id, backup->title_id,
 	                      backup->dir_name);
 
+	return OK;
+}
+
+// Converts a save made in an older format to the current one and reports the end as a
+// CONVERT_END event. Kyty keeps a single format, so there is nothing to rewrite: the conversion
+// ends at once, copying the save when the title names a different destination.
+int KYTY_SYSV_ABI SaveDataConvert(const SaveDataConvertParam* convert) {
+	PRINT_NAME();
+
+	if (convert == nullptr || convert->src_dir_name == nullptr) {
+		return SAVE_DATA_ERROR_PARAMETER;
+	}
+	const auto* dst = convert->dst_dir_name != nullptr ? convert->dst_dir_name : convert->src_dir_name;
+	const std::string src_name(convert->src_dir_name->data,
+	                           strnlen(convert->src_dir_name->data, sizeof(convert->src_dir_name->data)));
+	const std::string dst_name(dst->data, strnlen(dst->data, sizeof(dst->data)));
+	LOGF("\t user_id = %" PRId32 ", src = %s, dst = %s, dst_blocks = %" PRIu64 "\n",
+	     convert->user_id, src_name.c_str(), dst_name.c_str(), convert->dst_blocks);
+
+	Common::LockGuard lock(g_mount_mutex);
+	int32_t    error = OK;
+	const auto from  = save_directory(get_title_id(), src_name, convert->user_id);
+	std::error_code ec;
+	if (!std::filesystem::exists(from, ec)) {
+		error = SAVE_DATA_ERROR_NOT_FOUND;
+	} else if (dst_name != src_name) {
+		std::filesystem::copy(from, save_directory(get_title_id(), dst_name, convert->user_id),
+		                      std::filesystem::copy_options::recursive |
+		                          std::filesystem::copy_options::overwrite_existing,
+		                      ec);
+		if (ec) {
+			error = SAVE_DATA_ERROR_INTERNAL;
+		}
+	}
+	LOGF("\t result = 0x%08" PRIx32 "\n", static_cast<uint32_t>(error));
+	queue_save_data_event(SAVE_DATA_EVENT_TYPE_CONVERT_END, convert->user_id, nullptr, dst, error);
+	return OK;
+}
+
+int KYTY_SYSV_ABI SaveDataGetConvertProgress(float* progress) {
+	PRINT_NAME();
+	if (progress == nullptr) {
+		return SAVE_DATA_ERROR_PARAMETER;
+	}
+	*progress = 1.0f; // conversion ends inside SaveDataConvert
 	return OK;
 }
 
@@ -1292,6 +1352,8 @@ LIB_VERSION("SaveData_native", 1, "SaveData_native", 1, 1);
 
 LIB_DEFINE(InitSaveDataNative_1) {
 	LIB_FUNC("TywrFKCoLGY", ::Libs::SaveData::SaveDataInitialize3);
+	LIB_FUNC("2mfSRGdshtk", ::Libs::SaveData::SaveDataConvert);
+	LIB_FUNC("8EA5OMIL1lQ", ::Libs::SaveData::SaveDataGetConvertProgress);
 	LIB_FUNC("dyIhnXq-0SM", ::Libs::SaveData::SaveDataDirNameSearch);
 	LIB_FUNC("PHnuI4LhuRk", ::Libs::SaveData::SaveDataDirNameSearch);
 	LIB_FUNC("ZP4e7rlzOUk", ::Libs::SaveData::SaveDataMount3);

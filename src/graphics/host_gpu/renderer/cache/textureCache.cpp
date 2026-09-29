@@ -1050,7 +1050,17 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 	if (info.samples != 1 || destination.backing.samples != 1 ||
 	    info.resources.layers == 0 || info.data.size % info.resources.layers != 0 ||
 	    Prospero::NumBytesPerElement(info.guest_format) != info.bytes_per_block) {
-		EXIT("TextureCache: invalid depth upload\n");
+		EXIT("TextureCache: invalid depth upload: stencil=%u addr=0x%016" PRIx64
+		     " size=0x%016" PRIx64
+		     " format=%u elem_bytes=%u bytes_per_block=%u tile=%u extent=%ux%ux%u pitch=%u "
+		     "levels=%u layers=%u samples=%u backing_samples=%u\n",
+		     image.depth_id ? 1u : 0u, info.data.address, info.data.size,
+		     static_cast<uint32_t>(info.guest_format),
+		     static_cast<uint32_t>(Prospero::NumBytesPerElement(info.guest_format)),
+		     static_cast<uint32_t>(info.bytes_per_block), static_cast<uint32_t>(info.tile_mode),
+		     info.extent.width, info.extent.height, info.extent.depth, info.pitch,
+		     info.resources.levels, info.resources.layers, info.samples,
+		     destination.backing.samples);
 	}
 	const auto          layers          = info.resources.layers;
 	const auto          full_slice_size = info.data.size / layers;
@@ -1449,8 +1459,21 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	TouchImage(image);
 	image.MarkGpuModified();
 	image.usage.depth_target = true;
-	image.info.stencil = desc.info.stencil;
-	image.info.metadata = desc.info.metadata;
+	// A target view covering fewer slices than the cached image (e.g. slice 0 of a cube shadow
+	// map) describes per-slice stencil/HTile planes only up to its last slice. Scale them to the
+	// image's layer count so the planes keep matching the native image.
+	const auto scale_range = [&](GuestRange range) {
+		const auto desc_layers  = desc.info.resources.layers;
+		const auto image_layers = image.info.resources.layers;
+		if (range.Empty() || desc_layers == 0 || image_layers <= desc_layers ||
+		    desc.info.data.address != image.info.data.address || range.size % desc_layers != 0) {
+			return range;
+		}
+		return GuestRange {range.address, range.size / desc_layers * image_layers};
+	};
+	image.info.stencil        = scale_range(desc.info.stencil);
+	image.info.metadata       = desc.info.metadata;
+	image.info.metadata.range = scale_range(desc.info.metadata.range);
 	if (desc.info.HasMetadata()) {
 		m_surface_metas.emplace(desc.info.metadata.range.address,
 		                        MetaDataInfo {.type       = MetaDataInfo::Type::HTile,
@@ -1459,7 +1482,7 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	RefreshImage(id);
 	CommitGpuWrite(image);
 	if (desc.info.HasStencil()) {
-		RefreshImage(AssociateStencil(id, desc.info.stencil));
+		RefreshImage(AssociateStencil(id, image.info.stencil));
 	}
 	return image.FindView(desc.view_info);
 }

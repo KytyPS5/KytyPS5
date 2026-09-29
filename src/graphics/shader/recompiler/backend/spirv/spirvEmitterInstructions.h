@@ -149,7 +149,10 @@ inline constexpr auto EmitFPCmpClass32 = EmitClassMaskF32;
 EMIT_NATIVE(FPAdd32, OpFAdd, F32, uint32_t, uint32_t)
 EMIT_NATIVE(FPSub32, OpFSub, F32, uint32_t, uint32_t)
 EMIT_NATIVE(FPMul32, OpFMul, F32, uint32_t, uint32_t)
+EMIT_NATIVE(FPAdd64, OpFAdd, F64, uint32_t, uint32_t)
 EMIT_NATIVE(FPMul64, OpFMul, F64, uint32_t, uint32_t)
+EMIT_NATIVE(FPOrdLessThanEqual64, OpFOrdLessThanEqual, U1, uint32_t, uint32_t)
+EMIT_NATIVE(FPOrdGreaterThanEqual64, OpFOrdGreaterThanEqual, U1, uint32_t, uint32_t)
 inline constexpr auto EmitFPFma64 =
     EmitGlsl<GLSLstd450Fma, IR::Type::F64, uint32_t, uint32_t, uint32_t>;
 uint32_t              EmitFPRecip64(EmitterState& state, uint32_t arg0);
@@ -259,6 +262,7 @@ inline constexpr auto EmitBufferAtomicUMin32    = EmitAtomic32;
 inline constexpr auto EmitBufferAtomicSMax32    = EmitAtomic32;
 inline constexpr auto EmitBufferAtomicUMax32    = EmitAtomic32;
 inline constexpr auto EmitBufferAtomicAnd32     = EmitAtomic32;
+inline constexpr auto EmitBufferAtomicAnd64     = EmitBufferAtomic64;
 inline constexpr auto EmitBufferAtomicOr32      = EmitAtomic32;
 inline constexpr auto EmitBufferAtomicOr64      = EmitBufferAtomic64;
 inline constexpr auto EmitBufferAtomicXor32     = EmitAtomic32;
@@ -302,7 +306,9 @@ inline constexpr auto EmitImageSampleRaw       = EmitImage;
 inline constexpr auto EmitImageGatherRaw       = EmitImage;
 inline constexpr auto EmitImageAtomicSwap32    = EmitImage;
 inline constexpr auto EmitImageAtomicIAdd32    = EmitImage;
+inline constexpr auto EmitImageAtomicSMin32    = EmitImage;
 inline constexpr auto EmitImageAtomicUMin32    = EmitImage;
+inline constexpr auto EmitImageAtomicSMax32    = EmitImage;
 inline constexpr auto EmitImageAtomicUMax32    = EmitImage;
 inline constexpr auto EmitImageAtomicAnd32     = EmitImage;
 inline constexpr auto EmitImageAtomicOr32      = EmitImage;

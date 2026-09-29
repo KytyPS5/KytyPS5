@@ -23087,6 +23087,45 @@ TestCase VectorVop3CompareEqU64OnGpu() {
   return test;
 }
 
+TestCase VectorVop3CompareEqF64OnGpu() {
+  using O = ShaderOpcode;
+
+  struct Case {
+    u32 lo0, hi0, lo1, hi1;
+    u32 src0, src1; // 100: s[100:101], 102: s[102:103], 128: inline 0, 242: inline 1.0
+  };
+  constexpr Case cases[] = {
+      {0, 0x00000000u, 0, 0, 128, 100},           // captured: 0 == +0.0
+      {0, 0x80000000u, 0, 0, 128, 100},           // 0 == -0.0
+      {0, 0x3ff00000u, 0, 0, 128, 100},           // 0 == 1.0
+      {0, 0x7ff80000u, 0, 0x7ff80000u, 100, 102}, // NaN == NaN
+      {0, 0x3ff00000u, 0, 0x3ff00000u, 100, 102}, // 1.0 == 1.0
+      {0, 0x3ff00000u, 0, 0, 242, 100},           // inline 1.0 is the f64 1.0
+      {1, 0x3ff00000u, 0, 0x3ff00000u, 100, 102}, // low dwords differ
+  };
+  std::vector<u32> code;
+  code.push_back(EncodeVop1(0x01, 1, InlineU32(1)));
+  u32 index = 0;
+  for (const auto &c : cases) {
+    AppendSMovLiteral(&code, 100, c.lo0);
+    AppendSMovLiteral(&code, 101, c.hi0);
+    AppendSMovLiteral(&code, 102, c.lo1);
+    AppendSMovLiteral(&code, 103, c.hi1);
+    code.push_back(0xd422006au); // v_cmp_eq_f64 vcc_lo, src0, src1
+    code.push_back(c.src0 | (c.src1 << 9u));
+    code.push_back(EncodeVop2(0x01, 2, InlineU32(0), 1));
+    AppendStoreVgpr(&code, 2, index++);
+  }
+  AppendEnd(&code);
+
+  return {"VectorVop3CompareEqF64OnGpu",
+          code,
+          {},
+          {1, 1, 0, 0, 1, 1, 0},
+          {O::V_MOV_B32, O::S_MOV_B32, O::V_CMP_EQ_F64, O::V_CNDMASK_B32,
+           O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+}
+
 TestCase VectorVop3CompareNeU64OnGpu() {
   using O = ShaderOpcode;
 
@@ -30816,6 +30855,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorCompareOps);
   AddCase(VectorVop3CompareEqI64OnGpu);
   AddCase(VectorVop3CompareEqU64OnGpu);
+  AddCase(VectorVop3CompareEqF64OnGpu);
   AddCase(VectorVop3CompareGtU64OnGpu);
   AddCase(VectorVopcCompareLtU64OnGpu);
   AddCase(VectorVop3CompareNeU64OnGpu);

@@ -180,6 +180,13 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 			return SimpleInteger(inst, IR::ValueOpcode::ShiftRightLogical64, IR::Type::U64, false,
 			                     false, true);
 		case O::S_ASHR_I64: return S_ASHR_I64(inst);
+		case O::S_BREV_B64: {
+			// Each half reversed, and the halves swapped. SCC is unchanged, as for S_BREV_B32.
+			const auto value = ReadU32Pair(inst.src0);
+			WriteU32Pair(inst.dst, {IR::U32(ir.Emit(IR::ValueOpcode::BitReverse32, {value[1]})),
+			                        IR::U32(ir.Emit(IR::ValueOpcode::BitReverse32, {value[0]}))});
+			return;
+		}
 
 		case O::S_ANDN2_B32:
 			return ComposedIntegerBinary(inst, IR::ValueOpcode::BitwiseAnd32, true, false, true);

@@ -9717,6 +9717,8 @@ void TestCapturedBufferAtomicsX2() {
   const Case cases[] = {
       {{0xe1680018u, 0x80000000u}, 0u, 241u, "BUFFER_ATOMIC_OR_X2",
        "BufferAtomicOr64", "OpAtomicOr", ValueOpcode::BufferAtomicOr64},
+      {{0xe1640018u, 0x80000000u}, 0u, 240u, "BUFFER_ATOMIC_AND_X2",
+       "BufferAtomicAnd64", "OpAtomicAnd", ValueOpcode::BufferAtomicAnd64},
       {{0xe1402000u, 0x80000913u}, 9u, 229u, "BUFFER_ATOMIC_SWAP_X2",
        "BufferAtomicSwap64", "OpAtomicExchange", ValueOpcode::BufferAtomicSwap64},
   };

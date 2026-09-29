@@ -392,8 +392,13 @@ void EmitAuxPositionExport(ValueEmitContext& ctx, uint32_t data, const IR::Expor
 			state.builder.AddFunction(spv::OpStore, state.point_size_variable, f32);
 			continue;
 		}
-		auto StoreDistance = [&](uint32_t variable, uint32_t index) {
+		auto StoreDistance = [&](IR::StageOutputKind kind, uint32_t variable, uint32_t index) {
 			if (index == UINT32_MAX) {
+				return;
+			}
+			if (state.program.stage == ShaderType::Mesh) {
+				// Kept per lane; the mesh entry point copies it to the vertex's array.
+				state.builder.AddFunction(spv::OpStore, MeshOutputPointer(state, kind, index), f32);
 				return;
 			}
 			const auto pointer = state.builder.AllocateId();
@@ -402,8 +407,10 @@ void EmitAuxPositionExport(ValueEmitContext& ctx, uint32_t data, const IR::Expor
 			                          pointer, variable, ConstantU32(state, index));
 			state.builder.AddFunction(spv::OpStore, pointer, f32);
 		};
-		StoreDistance(state.clip_distance_variable, output.clip_distance);
-		StoreDistance(state.cull_distance_variable, output.cull_distance);
+		StoreDistance(IR::StageOutputKind::ClipDistance, state.clip_distance_variable,
+		              output.clip_distance);
+		StoreDistance(IR::StageOutputKind::CullDistance, state.cull_distance_variable,
+		              output.cull_distance);
 	}
 }
 

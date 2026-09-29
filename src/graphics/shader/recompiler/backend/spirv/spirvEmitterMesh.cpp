@@ -140,13 +140,50 @@ uint32_t UnusableVertex(EmitterState& state, uint32_t vertex, uint32_t vertices)
 
 void DefineMeshOutputs(EmitterState& state) {
 	const auto& mesh = state.input_info.vertex->mesh;
+	// Clip and cull distances (the position exports' CCDIST vectors): one per-vertex float[N]
+	// built-in each, like gl_MeshVerticesEXT[].gl_ClipDistance; every distance has its own
+	// per-lane value until the copy-out.
+	uint32_t clip_distances = 0;
+	uint32_t cull_distances = 0;
+	for (const auto& output: state.outputs) {
+		if (output.kind == IR::StageOutputKind::ClipDistance) {
+			clip_distances = std::max(clip_distances, output.index + 1);
+		} else if (output.kind == IR::StageOutputKind::CullDistance) {
+			cull_distances = std::max(cull_distances, output.index + 1);
+		}
+	}
+	const auto DefineDistances = [&](uint32_t& variable, uint32_t count, const char* name,
+	                                 spv::BuiltIn builtin) {
+		if (count == 0) {
+			return;
+		}
+		variable = MeshArray(
+		    state, spv::StorageClassOutput,
+		    state.builder.Type(spv::OpTypeArray, TypeF32(state), ConstantU32(state, count)),
+		    mesh.max_vertices);
+		state.interface_variables.push_back(variable);
+		state.builder.AddName(variable, name);
+		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBuiltIn, builtin);
+	};
+	DefineDistances(state.clip_distance_variable, clip_distances, "gl_ClipDistance",
+	                spv::BuiltInClipDistance);
+	DefineDistances(state.cull_distance_variable, cull_distances, "gl_CullDistance",
+	                spv::BuiltInCullDistance);
 	for (auto& output: state.outputs) {
 		if (output.kind != IR::StageOutputKind::Position &&
 		    output.kind != IR::StageOutputKind::Parameter &&
-		    output.kind != IR::StageOutputKind::Layer) {
+		    output.kind != IR::StageOutputKind::Layer && !IsDistance(output.kind)) {
 			EXIT("unsupported mesh output kind=%u\n", static_cast<uint32_t>(output.kind));
 		}
-		const auto type    = MeshOutputType(state, output.kind);
+		const auto type = MeshOutputType(state, output.kind);
+		if (IsDistance(output.kind)) {
+			output.variable_id = output.kind == IR::StageOutputKind::ClipDistance
+			                         ? state.clip_distance_variable
+			                         : state.cull_distance_variable;
+			output.mesh_data_variable = MeshArray(state, spv::StorageClassPrivate, type,
+			                                      state.lane_count * state.mesh_passes);
+			continue;
+		}
 		output.variable_id = MeshArray(
 		    state, spv::StorageClassOutput, type,
 		    output.kind == IR::StageOutputKind::Layer ? mesh.max_primitives : mesh.max_vertices);

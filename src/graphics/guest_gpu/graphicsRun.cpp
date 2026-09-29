@@ -1502,8 +1502,9 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 	ProcessorScope processor_scope(*this);
 
 	m_renderer.GetVideoOut().PrepareFlip(request_id, command);
+	GetScheduler().DeferPriorityOperation(
+	    [this, request_id] { m_renderer.GetVideoOut().CompleteFlip(request_id); });
 	GetScheduler().Flush();
-	m_renderer.GetVideoOut().CompleteFlip(request_id);
 }
 
 void CommandProcessor::SynchronizeGpu() {

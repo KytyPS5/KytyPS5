@@ -336,14 +336,15 @@ static void ShaderDetectBuffers(ShaderVertexInputInfo& info) {
 	for (int ri = 0; ri < info.resources_num; ri++) {
 		const auto& r = info.resources[ri];
 
-		bool merged = false;
-		for (int bi = 0; bi < info.buffers_num; bi++) {
+		auto& destination = info.resources_dst[ri];
+		int bi = 0;
+		for (; bi < info.buffers_num; bi++) {
 			auto& b = info.buffers[bi];
 
 			uint64_t stride = b.stride;
 
 			if (stride == r.Stride() &&
-			    b.fetch_index == static_cast<uint32_t>(info.resources_dst[ri].fetch_index)) {
+			    b.fetch_index == destination.fetch_index) {
 				uint64_t rbase   = r.Base48();
 				uint64_t base    = std::min(rbase, b.addr);
 				uint64_t offset1 = rbase - base;
@@ -352,45 +353,33 @@ static void ShaderDetectBuffers(ShaderVertexInputInfo& info) {
 				if (offset1 < stride && offset2 < stride) {
 					EXIT_NOT_IMPLEMENTED(b.num_records != r.NumRecords());
 					b.addr = base;
-					EXIT_NOT_IMPLEMENTED(b.attr_num >= ShaderVertexInputBuffer::ATTR_MAX);
-					b.attr_indices[b.attr_num++] = ri;
-					merged                       = true;
 					break;
 				}
 			}
 		}
 
-		if (!merged) {
+		if (bi == info.buffers_num) {
 			EXIT_NOT_IMPLEMENTED(info.buffers_num >= ShaderVertexInputInfo::RES_MAX);
-			int bi                           = info.buffers_num++;
-			info.buffers[bi].addr            = r.Base48();
-			info.buffers[bi].stride          = r.Stride();
-			info.buffers[bi].num_records     = r.NumRecords();
-			info.buffers[bi].fetch_index     = info.resources_dst[ri].fetch_index;
-			info.buffers[bi].attr_num        = 1;
-			info.buffers[bi].attr_indices[0] = ri;
+			info.buffers[bi] = {.addr = r.Base48(),
+			                    .stride = r.Stride(),
+			                    .num_records = r.NumRecords(),
+			                    .fetch_index = destination.fetch_index};
+			info.buffers_num++;
 		}
-	}
-
-	for (int bi = 0; bi < info.buffers_num; bi++) {
-		auto& b = info.buffers[bi];
-		for (int ri = 0; ri < b.attr_num; ri++) {
-			b.attr_offsets[ri] = info.resources[b.attr_indices[ri]].Base48() - b.addr;
-		}
+		destination.buffer_index = bi;
 	}
 }
 
 static void ShaderApplyAttribSemantics(ShaderVertexInputInfo& info,
-                                       const ShaderSemantic*  input_semantics,
-                                       uint32_t num_input_semantics, const uint32_t* attrib,
-                                       const uint32_t* buffer) {
+                                       std::span<const ShaderSemantic> input_semantics,
+                                       const uint32_t* attrib, const uint32_t* buffer) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_IF(attrib == nullptr || buffer == nullptr);
 
 	const bool debug_dump = Config::GraphicsDebugDumpEnabled();
 
-	for (uint32_t i = 0; i < num_input_semantics; i++) {
+	for (uint32_t i = 0; i < input_semantics.size(); i++) {
 		const auto& in = input_semantics[i];
 
 		EXIT_NOT_IMPLEMENTED(in.static_vb_index == 1 || in.static_attribute == 1);
@@ -544,8 +533,7 @@ static bool ShaderGetStaticVertexInputInfo(uint64_t shader_addr, const HW::UserS
 			     shader_addr);
 			return false;
 		}
-		ShaderApplyAttribSemantics(info, metadata.input_semantics.data(),
-		                           metadata.input_semantics_count, attrib, buffer);
+		ShaderApplyAttribSemantics(info, metadata.input_semantics, attrib, buffer);
 		ShaderDetectBuffers(info);
 	}
 	return true;
@@ -622,6 +610,7 @@ static void ShaderGetStaticInputInfoCS(const HW::ComputeShaderInfo& regs,
 	info.threads_num[2]                   = regs.cs_regs.num_thread_z;
 	info.lds_size_dwords                  = static_cast<uint32_t>(regs.cs_regs.lds_size) * 128u;
 	info.scratch_size_dwords              = data.scratch_size_dwords;
+	info.float_mode                       = regs.cs_regs.float_mode;
 	info.group_id[0]                      = regs.cs_regs.tgid_x_en != 0;
 	info.group_id[1]                      = regs.cs_regs.tgid_y_en != 0;
 	info.group_id[2]                      = regs.cs_regs.tgid_z_en != 0;
@@ -677,15 +666,8 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 		key.push_back(destination.registers_num);
 		key.push_back(destination.fetch_index);
 		key.push_back(static_cast<uint32_t>(destination.attr_id));
-		key.push_back(resource.Stride());
-		key.push_back(static_cast<uint32_t>(resource.SwizzleEnabled()));
-		key.push_back(resource.DstSelX());
-		key.push_back(resource.DstSelY());
-		key.push_back(resource.DstSelZ());
-		key.push_back(resource.DstSelW());
-		key.push_back(resource.RawFormat());
-		key.push_back(resource.OutOfBounds());
-		key.push_back(static_cast<uint32_t>(resource.AddTid()));
+		key.push_back(resource.fields[1] & 0xbfff0000u); // Stride and swizzle enable.
+		key.push_back(resource.fields[3] & 0x3087ffffu); // Channels, format, OOB, and add TID.
 	}
 }
 
@@ -711,6 +693,7 @@ void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>
 	key.push_back(static_cast<uint32_t>(info.ps_sample_mask_export_enable));
 	key.push_back(static_cast<uint32_t>(info.ps_early_z));
 	key.push_back(static_cast<uint32_t>(info.dual_source_blending));
+	key.push_back(static_cast<uint32_t>(info.alpha_blend_source_remap));
 	key.insert(key.end(), std::begin(info.target_output_mode), std::end(info.target_output_mode));
 	for (uint32_t base = 0; base < info.target_export_mapping.size(); base += 4u) {
 		uint32_t packed = 0;
@@ -727,7 +710,7 @@ void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>
 void BuildStageStaticKey(const ShaderComputeInputInfo& info, std::vector<uint32_t>& key) {
 	key.clear();
 	key.push_back(info.workgroup_register);
-	key.push_back(info.wave_size);
+	key.push_back(info.wave_size | (static_cast<uint32_t>(info.float_mode) << 8u));
 	key.push_back(info.host_subgroup_size);
 	key.push_back(info.thread_ids_num);
 	key.push_back(info.lds_size_dwords);
@@ -906,8 +889,9 @@ void ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info) {
 
 		LOGF("\t\t register_start   = %d\n"
 		     "\t\t registers_num    = %d\n"
-		     "\t\t fetch_index      = %" PRIu32 "\n",
-		     rd.register_start, rd.registers_num, rd.fetch_index);
+		     "\t\t fetch_index      = %" PRIu32 "\n"
+		     "\t\t buffer_index     = %d\n",
+		     rd.register_start, rd.registers_num, rd.fetch_index, rd.buffer_index);
 		LOGF("\t\t fields           = %08" PRIx32 "%08" PRIx32 "%08" PRIx32 "%08" PRIx32 "\n",
 		     r.fields[3], r.fields[2], r.fields[1], r.fields[0]);
 		LOGF("\t\t Base()           = %" PRIx64 "\n"
@@ -933,14 +917,8 @@ void ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info) {
 		LOGF("\t\t addr        = %" PRIx64 "\n"
 		     "\t\t stride      = %" PRIu32 "\n"
 		     "\t\t num_records = %" PRIu32 "\n"
-		     "\t\t fetch_index = %" PRIu32 "\n"
-		     "\t\t attr_num    = %" PRId32 "\n",
-		     r.addr, r.stride, r.num_records, r.fetch_index, r.attr_num);
-		for (int j = 0; j < r.attr_num; j++) {
-			LOGF("\t\t attr_indices[%d]  = %d\n"
-			     "\t\t attr_offsets[%d]  = %u\n",
-			     j, r.attr_indices[j], j, r.attr_offsets[j]);
-		}
+		     "\t\t fetch_index = %" PRIu32 "\n",
+		     r.addr, r.stride, r.num_records, r.fetch_index);
 	}
 }
 

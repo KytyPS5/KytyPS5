@@ -273,6 +273,9 @@ void Translator::EmitVector(const Decoder::Instruction& inst) {
 		case O::V_CMPX_NGT_F16:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPUnordLessThanEqual32, true, true);
 			return;
+		case O::V_CMPX_NLE_F16:
+			EmitFloatCompare(inst, IR::ValueOpcode::FPUnordGreaterThan32, true, true);
+			return;
 		case O::V_CMP_NEQ_F16:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPUnordNotEqual32, true, false);
 			return;
@@ -297,6 +300,10 @@ void Translator::EmitVector(const Decoder::Instruction& inst) {
 		case O::V_CVT_F32_UBYTE3: V_CVT_F32_UBYTE(inst, 3); return;
 		case O::V_CVT_F32_U32: V_CVT_F32_U32(inst); return;
 		case O::V_CVT_F32_I32: V_CVT_F32_I32(inst); return;
+		case O::V_CVT_F64_I32: return FloatUnary(inst, IR::ValueOpcode::ConvertF64S32);
+		case O::V_CVT_F32_F64: return FloatUnary(inst, IR::ValueOpcode::ConvertF32F64);
+		case O::V_CVT_F64_F32: return FloatUnary(inst, IR::ValueOpcode::ConvertF64F32);
+		case O::V_CVT_F64_U32: return FloatUnary(inst, IR::ValueOpcode::ConvertF64U32);
 		case O::V_CVT_U32_F32: V_CVT_U32_F32(inst); return;
 		case O::V_CVT_I32_F32: V_CVT_I32_F32(inst); return;
 		case O::V_CVT_F16_F32: V_CVT_F16_F32(inst); return;
@@ -394,6 +401,7 @@ void Translator::EmitVector(const Decoder::Instruction& inst) {
 
 		case O::V_FREXP_MANT_F32: return V_FREXP_MANT_F32(inst);
 		case O::V_RCP_F32: return FloatUnary(inst, IR::ValueOpcode::FPRecip32);
+		case O::V_RCP_F64: return FloatUnary(inst, IR::ValueOpcode::FPRecip64);
 		case O::V_RCP_IFLAG_F32: return FloatUnary(inst, IR::ValueOpcode::FPRecipIFlag32);
 		case O::V_FRACT_F32: return FloatUnary(inst, IR::ValueOpcode::FPFract32);
 		case O::V_TRUNC_F32: return FloatUnary(inst, IR::ValueOpcode::FPTrunc32);
@@ -410,6 +418,7 @@ void Translator::EmitVector(const Decoder::Instruction& inst) {
 		case O::V_SUB_F32: return FloatBinary(inst, IR::ValueOpcode::FPSub32, false);
 		case O::V_SUBREV_F32: return FloatBinary(inst, IR::ValueOpcode::FPSub32, true);
 		case O::V_MUL_F32: return FloatBinary(inst, IR::ValueOpcode::FPMul32, false);
+		case O::V_MUL_F64: return FloatBinary(inst, IR::ValueOpcode::FPMul64, false);
 		case O::V_MIN_F32: return FloatBinary(inst, IR::ValueOpcode::FPMin32, false);
 		case O::V_MAX_F32: return FloatBinary(inst, IR::ValueOpcode::FPMax32, false);
 		case O::V_LDEXP_F32: return FloatBinary(inst, IR::ValueOpcode::FPLdexp, false);
@@ -418,6 +427,7 @@ void Translator::EmitVector(const Decoder::Instruction& inst) {
 		case O::V_MADAK_F32:
 		case O::V_MAD_F32:
 		case O::V_FMA_F32: return FloatTernary(inst, IR::ValueOpcode::FPFma32, false, true);
+		case O::V_FMA_F64: return FloatTernary(inst, IR::ValueOpcode::FPFma64, false, false);
 		case O::V_MIN3_F32: return FloatTernary(inst, IR::ValueOpcode::FPMinTri32, false, false);
 		case O::V_MAX3_F32: return FloatTernary(inst, IR::ValueOpcode::FPMaxTri32, false, false);
 		case O::V_MED3_F32: return FloatTernary(inst, IR::ValueOpcode::FPMedTri32, false, false);

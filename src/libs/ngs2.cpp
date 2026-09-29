@@ -1435,6 +1435,11 @@ static void Ngs2FinishBlock(Ngs2VoiceInternal& voice) {
 		}
 		++block.repeated_count;
 		block.cursor = 0;
+		if (voice.decoder != nullptr) {
+			block.data_cursor = 0;
+			voice.compressed_input.clear();
+			voice.decoder->Reset();
+		}
 	}
 	const Ngs2VoiceCallbackInfo info {voice.callback_data,
 	                                  reinterpret_cast<uintptr_t>(&voice),
@@ -1860,13 +1865,10 @@ static bool Ngs2FourCcEquals(const uint8_t* data, const char* four_cc) {
 	return std::memcmp(data, four_cc, 4) == 0;
 }
 
-static bool Ngs2GetAtrac9CodecInfo(std::array<uint8_t, ATRAC9_CONFIG_DATA_SIZE> config,
+static bool Ngs2GetAtrac9CodecInfo(const std::array<uint8_t, ATRAC9_CONFIG_DATA_SIZE>& config,
                                    Atrac9CodecInfo& codec) {
-	if (config[0] != 0xfe || (config[1] & 1u) != 0 || ((config[1] >> 1u) & 7u) >= 6u) {
-		return false;
-	}
 	void* decoder = Atrac9GetHandle();
-	const bool valid = decoder != nullptr && Atrac9InitDecoder(decoder, config.data()) == 0 &&
+	const bool valid = decoder != nullptr && Ajm::AjmAt9InitDecoder(decoder, config.data()) == 0 &&
 	                   Atrac9GetCodecInfo(decoder, &codec) == 0 && codec.channels > 0 &&
 	                   codec.samplingRate > 0 && codec.superframeSize > 0 &&
 	                   codec.framesInSuperframe > 0 && codec.frameSamples > 0 &&
@@ -2396,8 +2398,7 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 								block.num_samples      = 0;
 							}
 							EXIT_NOT_IMPLEMENTED(block.num_repeats != 0 &&
-							                     (voice->rack->type != Ngs2RackType::Sampler ||
-							                      voice->decoder != nullptr));
+							                     voice->rack->type != Ngs2RackType::Sampler);
 							EXIT_NOT_IMPLEMENTED(
 							    voice->decoder == nullptr &&
 							    (uint64_t(block.num_skip_samples) + block.num_samples) *

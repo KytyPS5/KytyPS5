@@ -172,7 +172,7 @@ uint64_t PrepareVideoOutFlip(CommandBuffer& buffer, int handle, int index, int f
 			     "\n",
 			     result, handle, index, flip_mode, flip_arg);
 		}
-		video_out.WaitForSubmitSlot();
+		video_out.WaitForSubmitSlot(handle);
 	}
 }
 

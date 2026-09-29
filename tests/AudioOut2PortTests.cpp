@@ -17,6 +17,7 @@ namespace {
 
 namespace AudioOut2 = Libs::Audio::AudioOut2;
 
+AudioOut2::AudioOut2UserHandle     g_user_handle = 0;
 std::mutex                        g_device_mutex;
 std::condition_variable           g_device_cv;
 std::vector<int>                  g_live_devices;
@@ -97,6 +98,7 @@ PortParam MakeParam(uint32_t data_format = 0x200) {
 	PortParam param {};
 	param.data_format   = data_format;
 	param.sampling_freq = 48000;
+	param.user_handle   = g_user_handle;
 	return param;
 }
 
@@ -108,6 +110,56 @@ AudioOut2::AudioOut2ContextHandle CreateContext(uint32_t queue_depth = 4) {
 	Check(AudioOut2::AudioOut2ContextCreate(AsParam(&param), nullptr, 0, &context) == OK,
 	      "context create failed");
 	return context;
+}
+
+void TestUserSupportedAttributes() {
+	constexpr int invalid_param = static_cast<int32_t>(0x80268001u);
+	constexpr int busy          = static_cast<int32_t>(0x80268007u);
+	AudioOut2::AudioOut2UserHandle user = 0;
+	Check(AudioOut2::AudioOut2UserCreate(1000, nullptr) == invalid_param,
+	      "null user handle output was accepted");
+	Check(AudioOut2::AudioOut2UserCreate(1000, &user) == OK, "user create failed");
+	uint32_t context_attributes = UINT32_MAX;
+	uint32_t port_attributes    = UINT32_MAX;
+	Check(AudioOut2::AudioOut2UserGetSupportedAttributes(user, &context_attributes,
+	                                                    &port_attributes) == OK &&
+	          context_attributes == 0 && port_attributes == 1,
+	      "user capabilities do not match implemented PCM support");
+
+	context_attributes = port_attributes = UINT32_MAX;
+	Check(AudioOut2::AudioOut2UserGetSupportedAttributes(user, nullptr, &port_attributes) ==
+	          invalid_param &&
+	          AudioOut2::AudioOut2UserGetSupportedAttributes(user, &context_attributes, nullptr) ==
+	              invalid_param &&
+	          context_attributes == UINT32_MAX && port_attributes == UINT32_MAX,
+	      "null capability outputs were accepted or modified");
+	for (const auto invalid: {AudioOut2::AudioOut2UserHandle {0}, UINTPTR_MAX}) {
+		Check(AudioOut2::AudioOut2UserGetSupportedAttributes(invalid, &context_attributes,
+		                                                    &port_attributes) == invalid_param &&
+		          context_attributes == UINT32_MAX && port_attributes == UINT32_MAX,
+		      "invalid user capabilities succeeded or modified outputs");
+	}
+
+	const auto context = CreateContext();
+	auto param = MakeParam();
+	param.user_handle = user;
+	AudioOut2::AudioOut2PortHandle port = 0;
+	Check(AudioOut2::AudioOut2PortCreate(context, AsParam(&param), &port) == OK,
+	      "user port create failed");
+	Check(AudioOut2::AudioOut2UserDestroy(user) == busy,
+	      "user was destroyed while owning a port");
+	AudioOut2::AudioOut2ContextDestroy(context);
+	Check(AudioOut2::AudioOut2UserDestroy(user) == OK, "unused user destroy failed");
+	Check(AudioOut2::AudioOut2UserGetSupportedAttributes(user, &context_attributes,
+	                                                    &port_attributes) == invalid_param &&
+	          context_attributes == UINT32_MAX && port_attributes == UINT32_MAX &&
+	          AudioOut2::AudioOut2UserDestroy(user) == invalid_param,
+	      "destroyed user remained valid");
+
+	const auto new_context = CreateContext();
+	Check(AudioOut2::AudioOut2PortCreate(new_context, AsParam(&param), &port) == invalid_param,
+	      "destroyed user acquired a port");
+	AudioOut2::AudioOut2ContextDestroy(new_context);
 }
 
 void BlockDeviceOpens() {
@@ -436,6 +488,8 @@ uint64_t KYTY_SYSV_ABI KernelGetProcessTime() {
 } // namespace Libs::LibKernel
 
 int main() {
+	Check(AudioOut2::AudioOut2UserCreate(1000, &g_user_handle) == OK, "test user create failed");
+	TestUserSupportedAttributes();
 	TestSlotReuse();
 	TestFullTableRecovers();
 	TestConcurrentCreates();
@@ -445,6 +499,7 @@ int main() {
 	TestAsynchronousDevicePushKeepsQueueBounded();
 	TestHandleWithoutPcmDoesNotBypassQueue();
 	TestPcmCopiedBeforeScratchBufferReuse();
+	Check(AudioOut2::AudioOut2UserDestroy(g_user_handle) == OK, "test user destroy failed");
 	std::printf("AudioOut2PortTests: all cases passed\n");
 	return 0;
 }

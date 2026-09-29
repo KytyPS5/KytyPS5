@@ -7,9 +7,11 @@
 #include "libs/network.h"
 #include "loader/symbolDatabase.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cstddef>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <string>
@@ -163,6 +165,16 @@ int KYTY_SYSV_ABI NetSetsockopt(int s, int level, int optname, const void* optva
 	return FinishSocketCall(Net::Setsockopt(s, level, optname, optval, optlen));
 }
 
+int KYTY_SYSV_ABI NetSend(int s, const void* buf, size_t len, int flags) {
+	const auto size = std::min<size_t>(len, std::numeric_limits<int>::max());
+	return FinishSocketCall(static_cast<int>(Net::Send(s, buf, size, flags | 0x20000)));
+}
+
+int KYTY_SYSV_ABI NetRecv(int s, void* buf, size_t len, int flags) {
+	const auto size = std::min<size_t>(len, std::numeric_limits<int>::max());
+	return FinishSocketCall(static_cast<int>(Net::Recv(s, buf, size, flags)));
+}
+
 uint32_t KYTY_SYSV_ABI NetHtonl(uint32_t host32) {
 	return ((host32 & 0x000000ffu) << 24u) | ((host32 & 0x0000ff00u) << 8u) |
 	       ((host32 & 0x00ff0000u) >> 8u) | ((host32 & 0xff000000u) >> 24u);
@@ -207,6 +219,8 @@ LIB_DEFINE(InitNet_1_Net) {
 	LIB_FUNC("Q4qBuN-c0ZM", LibNet::NetSocket);
 	LIB_FUNC("45ggEzakPJQ", LibNet::NetSocketClose);
 	LIB_FUNC("2mKX2Spso7I", LibNet::NetSetsockopt);
+	LIB_FUNC("beRjXBn-z+o", LibNet::NetSend);
+	LIB_FUNC("9wO9XrMsNhc", LibNet::NetRecv);
 	LIB_FUNC("9T2pDF2Ryqg", LibNet::NetHtonl);
 	LIB_FUNC("iWQWrwiSt8A", LibNet::NetHtons);
 	LIB_FUNC("pQGpHYopAIY", LibNet::NetNtohl);
@@ -277,7 +291,7 @@ static char* CopyUriPart(char*& dst, const UriPart& part) {
 }
 
 static int ParseEmptyUri(SceHttpUriElement* out, void* pool, size_t* require, size_t prepare) {
-	constexpr size_t needed = 3;
+	constexpr size_t needed = 4;
 
 	if (require != nullptr) {
 		*require = needed;
@@ -296,10 +310,12 @@ static int ParseEmptyUri(SceHttpUriElement* out, void* pool, size_t* require, si
 		auto* dst        = static_cast<char*>(pool);
 		out->scheme      = dst++;
 		out->hostname    = dst++;
-		out->path        = dst;
+		out->path        = dst++;
+		out->query       = dst;
 		out->scheme[0]   = '\0';
 		out->hostname[0] = '\0';
 		out->path[0]     = '\0';
+		out->query[0]    = '\0';
 	}
 
 	return 0;
@@ -460,6 +476,9 @@ static int KYTY_SYSV_ABI HttpUriParse(SceHttpUriElement* out, const char* src_ur
 			needed += part.len + 1;
 		}
 	}
+	if (query.begin == nullptr) {
+		needed += 1;
+	}
 
 	if (require != nullptr) {
 		*require = needed;
@@ -482,7 +501,12 @@ static int KYTY_SYSV_ABI HttpUriParse(SceHttpUriElement* out, const char* src_ur
 		out->password = CopyUriPart(dst, password);
 		out->hostname = CopyUriPart(dst, hostname);
 		out->path     = CopyUriPart(dst, path);
-		out->query    = CopyUriPart(dst, query);
+		if (query.begin == nullptr) {
+			out->query    = dst++;
+			out->query[0] = '\0';
+		} else {
+			out->query = CopyUriPart(dst, query);
+		}
 		out->fragment = CopyUriPart(dst, fragment);
 	}
 

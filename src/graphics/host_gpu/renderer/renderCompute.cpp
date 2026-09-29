@@ -365,6 +365,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	PrepareBindings(input_info.stage, bindings);
 	FindBuffers(bindings);
 	if (program.info.uses_dma) {
+		m_context.CacheDmaBases(input_info.stage);
 		m_context.PrepareBda();
 	}
 	RebindImages(bindings);
@@ -419,6 +420,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	FindBuffers(bindings);
 	const auto& program = *input_info.stage.program;
 	if (program.info.uses_dma) {
+		m_context.CacheDmaBases(input_info.stage);
 		m_context.PrepareBda();
 	}
 	RebindImages(bindings);

@@ -74,6 +74,12 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	return true;
 }
 
+bool RenderContext::CanServeCleanRead(uint64_t fault_vaddr, uint64_t vaddr,
+                                      uint64_t size) const noexcept {
+	return IsMapped(vaddr, size) && m_page_manager.IsReadWatched(fault_vaddr) &&
+	       m_buffer_cache.IsCleanForConcurrentRead(vaddr, size);
+}
+
 bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (!IsMapped(vaddr, size)) {
 		return false;

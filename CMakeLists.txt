@@ -434,6 +434,16 @@ add_executable(avplayer_file_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/AvPlayerF
 target_link_libraries(avplayer_file_tests common FFmpeg::ffmpeg ZArchive::zarchive)
 target_include_directories(avplayer_file_tests PRIVATE ${inc_headers})
 
+if (WIN32)
+	# Guest loads from protected pages, completed by the instruction emulator (Windows contexts).
+	add_executable(x64_load_emulation_tests EXCLUDE_FROM_ALL
+		"${KYTY_TESTS_DIR}/X64LoadEmulationTests.cpp"
+		"${KYTY_SOURCE_DIR}/loader/x64InstructionEmulator.cpp"
+	)
+	target_link_libraries(x64_load_emulation_tests common Zydis::Zydis)
+	target_include_directories(x64_load_emulation_tests PRIVATE ${inc_headers})
+endif()
+
 add_executable(bit_array_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/BitArrayTests.cpp"
 )
@@ -614,6 +624,9 @@ if(BUILD_TESTING)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
 	add_test(NAME archive_file COMMAND $<TARGET_FILE:archive_file_tests>)
 	add_test(NAME avplayer_file COMMAND $<TARGET_FILE:avplayer_file_tests>)
+	if (WIN32)
+		add_test(NAME x64_load_emulation COMMAND $<TARGET_FILE:x64_load_emulation_tests>)
+	endif()
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
 	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
@@ -707,6 +720,9 @@ if(BUILD_TESTING)
 		save_data_dialog_tests
 		http_uri_parse_tests
 	)
+	if (WIN32)
+		add_dependencies(kyty_tests x64_load_emulation_tests)
+	endif()
 endif()
 
 # Test Darwin signal-context restoration for SSE4a instructions.

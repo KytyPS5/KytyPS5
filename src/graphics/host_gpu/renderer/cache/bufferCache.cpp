@@ -679,6 +679,12 @@ bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
 	return m_gpu_modified_ranges.Intersects(vaddr, size);
 }
 
+bool BufferCache::IsCleanForConcurrentRead(uint64_t vaddr, uint64_t size) const {
+	std::shared_lock lock(m_dirty_ranges_mutex);
+	return !m_gpu_modified_ranges.Intersects(vaddr, size) &&
+	       !m_downloading_ranges.Intersects(vaddr, size);
+}
+
 bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionCpuModified(vaddr, size);
 }

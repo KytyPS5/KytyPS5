@@ -290,6 +290,15 @@ void PageManager::UpdatePageWatchers(uint64_t vaddr, uint64_t size) {
 template void PageManager::UpdatePageWatchers<true>(uint64_t, uint64_t);
 template void PageManager::UpdatePageWatchers<false>(uint64_t, uint64_t);
 
+bool PageManager::IsReadWatched(uint64_t vaddr) const noexcept {
+	const auto* region = m_impl->FindRegion(vaddr);
+	if (region == nullptr) {
+		return false;
+	}
+	const auto index = static_cast<size_t>((vaddr % REGION_SIZE) / PAGE_SIZE);
+	return region->pages[index].access_watchers != 0;
+}
+
 template <bool track, bool is_read>
 void PageManager::UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& mask) {
 	if (base_addr % REGION_SIZE != 0 || base_addr >= ADDRESS_SIZE ||

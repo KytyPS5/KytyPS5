@@ -184,6 +184,8 @@ struct ShaderPixelInputInfo {
 	uint32_t                                       ps_perspective_center_vgpr   = UINT32_MAX;
 	uint32_t                                       ps_perspective_centroid_vgpr = UINT32_MAX;
 	uint8_t                                        target_output_mode[8]        = {};
+	uint32_t                                       target_uint_mask             = 0;
+	uint32_t                                       target_sint_mask             = 0;
 	std::array<Prospero::ColorComponentMapping, 8> target_export_mapping        = {};
 	uint32_t                                       scratch_size_dwords          = 0;
 	bool                                           ps_pos_x                     = false;

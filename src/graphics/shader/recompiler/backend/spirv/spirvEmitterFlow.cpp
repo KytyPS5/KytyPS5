@@ -527,9 +527,34 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 		if (state.program.stage != ShaderType::Mesh && variable == 0) {
 			return;
 		}
-		const bool uint_output = MrtOutputMode(state, exp) == 7u;
-		const auto vector_type = uint_output ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4);
-		auto       value       = ExportVector(ctx, data, exp, uint_output);
+		const bool mrt =
+		    state.program.stage == ShaderType::Pixel && exp.kind == IR::ExportTargetKind::Mrt;
+		// An integer render target, or a UINT16_ABGR export (format 7) whatever the target.
+		const bool uint_output =
+		    MrtOutputMode(state, exp) == 7u ||
+		    (mrt && (state.input_info.pixel->target_uint_mask & (1u << exp.index)) != 0);
+		const bool sint_output =
+		    mrt && (state.input_info.pixel->target_sint_mask & (1u << exp.index)) != 0;
+		const auto vector_type = uint_output   ? TypeU32Vector(state, 4)
+		                         : sint_output ? TypeI32Vector(state, 4)
+		                                       : TypeF32Vector(state, 4);
+		auto       value       = ExportVector(ctx, data, exp, uint_output || sint_output);
+		if (sint_output) {
+			const auto signed_value = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpBitcast, vector_type, signed_value, value);
+			value = signed_value;
+			if (exp.compr) {
+				const auto shift = state.builder.AllocateId();
+				const auto bits  = ConstantU32(state, 16);
+				state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 4), shift,
+				                          bits, bits, bits, bits);
+				const auto high = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpShiftLeftLogical, vector_type, high, value, shift);
+				value = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpShiftRightArithmetic, vector_type, value, high,
+				                          shift);
+			}
+		}
 		if (state.program.stage == ShaderType::Pixel && exp.kind == IR::ExportTargetKind::Mrt &&
 		    exp.index == 0 && !uint_output && state.input_info.pixel->alpha_blend_source_remap) {
 			// Broadcast logical alpha before swizzling the primary output.

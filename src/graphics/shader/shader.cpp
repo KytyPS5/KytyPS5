@@ -740,6 +740,8 @@ void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>
 	key.push_back(static_cast<uint32_t>(info.dual_source_blending));
 	key.push_back(static_cast<uint32_t>(info.alpha_blend_source_remap));
 	key.insert(key.end(), std::begin(info.target_output_mode), std::end(info.target_output_mode));
+	key.push_back(info.target_uint_mask);
+	key.push_back(info.target_sint_mask);
 	for (uint32_t base = 0; base < info.target_export_mapping.size(); base += 4u) {
 		uint32_t packed = 0;
 		for (uint32_t i = 0; i < 4u; i++) {

@@ -803,6 +803,20 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	ShaderParams pixel_params;
 	if (pixel_active) {
 		pixel_params      = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
+		// SPI_SHADER_COL_FORMAT describes export packing, not the attachment numeric type.
+		// In particular, 32-bit exports can carry raw integer material data.
+		for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
+			const auto& rt = context.GetRenderTarget(slot);
+			if (rt.base.addr == 0 ||
+			    render_target_mask_slot(context.GetRenderTargetMask(), slot) == 0) {
+				continue;
+			}
+			if (rt.info.channel_type == Prospero::ChannelType::kUInt) {
+				pixel_info.target_uint_mask |= 1u << slot;
+			} else if (rt.info.channel_type == Prospero::ChannelType::kSInt) {
+				pixel_info.target_sint_mask |= 1u << slot;
+			}
+		}
 		const auto& blend = context.GetBlendControl(0);
 		pixel_info.dual_source_blending =
 		    blend.enable && !context.GetRenderTarget(0).info.blend_bypass &&
@@ -814,6 +828,10 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 			// MRT1 supplies the second blend source for target 0.
 			pixel_info.target_output_mode[1]    = pixel_info.target_output_mode[0];
 			pixel_info.target_export_mapping[1] = pixel_info.target_export_mapping[0];
+			pixel_info.target_uint_mask =
+			    (pixel_info.target_uint_mask & ~2u) | ((pixel_info.target_uint_mask & 1u) << 1u);
+			pixel_info.target_sint_mask =
+			    (pixel_info.target_sint_mask & ~2u) | ((pixel_info.target_sint_mask & 1u) << 1u);
 		} else if (blend.enable && !context.GetRenderTarget(0).info.blend_bypass &&
 		           pixel_info.target_output_mode[0] != 0 && pixel_info.target_output_mode[0] != 7 &&
 		           std::all_of(std::begin(pixel_info.target_output_mode) + 1,

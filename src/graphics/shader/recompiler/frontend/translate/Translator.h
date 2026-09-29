@@ -93,6 +93,7 @@ private:
 	void FLAT_APERTURE(const Decoder::Instruction& inst, bool store);
 	void FLAT_STORE(const Decoder::Instruction& inst);
 	void IMAGE_GET_RESINFO(const Decoder::Instruction& inst);
+	void IMAGE_BVH_INTERSECT_RAY(const Decoder::Instruction& inst);
 	void IMAGE_GET_LOD(const Decoder::Instruction& inst);
 	void IMAGE_LOAD(const Decoder::Instruction& inst);
 	void IMAGE_STORE(const Decoder::Instruction& inst);

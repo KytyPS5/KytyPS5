@@ -786,9 +786,13 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(decoded.instructions.size()), phase_ms());
 
+	if (decoded.has_bvh && !decoded.bvh_truncated) {
+		LOGF("%s BVH intersection translated in software: hash=0x%016" PRIx64 "\n",
+		     GetDumpLabel(options), options.shader_hash);
+	}
 	// Temporary workaround for games that compile ray-tracing shaders before
 	// the player can select a mode without ray tracing.
-	if (options.stage == ShaderType::Compute && decoded.has_bvh) {
+	if (options.stage == ShaderType::Compute && decoded.bvh_truncated) {
 		static std::atomic_flag warned = ATOMIC_FLAG_INIT;
 		if (!warned.test_and_set(std::memory_order_relaxed)) {
 			const auto& bvh = decoded.instructions.back();

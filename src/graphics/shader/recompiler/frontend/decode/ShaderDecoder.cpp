@@ -427,6 +427,7 @@ void DecodeProgram(std::span<const uint32_t> code, Program& program, bool transl
 	program.instructions.reserve(code.size());
 	program.code = code;
 	program.has_bvh = false;
+	program.bvh_truncated = false;
 
 	std::vector<bool> branch_targets;
 	for (uint32_t word_index = 0; word_index < code.size();) {
@@ -437,7 +438,10 @@ void DecodeProgram(std::span<const uint32_t> code, Program& program, bool transl
 		word_index += inst.word_count;
 		if (inst.family == Family::MIMG && (inst.opcode_id == 0xe6u || inst.opcode_id == 0xe7u)) {
 			program.has_bvh = true;
-			return;
+			if (!translate_bvh || inst.opcode != Opcode::IMAGE_BVH_INTERSECT_RAY) {
+				program.bvh_truncated = true;
+				return;
+			}
 		}
 
 		if (IsDirectBranch(inst.opcode)) {
@@ -617,6 +621,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::IMAGE_LOAD:
 		case Opcode::IMAGE_LOAD_MIP:
 		case Opcode::IMAGE_GET_RESINFO:
+		case Opcode::IMAGE_BVH_INTERSECT_RAY:
 		case Opcode::IMAGE_GET_LOD:
 		case Opcode::IMAGE_GATHER4_L:
 		case Opcode::IMAGE_GATHER4_LZ:

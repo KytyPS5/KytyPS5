@@ -588,6 +588,7 @@ enum class Opcode {
 	DS_WRITE_ADDTID_B32,
 	DS_READ_ADDTID_B32,
 	IMAGE_GET_RESINFO,
+	IMAGE_BVH_INTERSECT_RAY,
 	IMAGE_GET_LOD,
 	IMAGE_LOAD,
 	IMAGE_LOAD_MIP,
@@ -777,6 +778,9 @@ struct Program {
 	std::span<const uint32_t> code;
 	std::vector<Instruction>  instructions;
 	bool                     has_bvh = false;
+	// Decoding stopped at a BVH instruction that is not translated (every one unless
+	// translate_bvh; the 64-bit form and malformed encodings always).
+	bool                     bvh_truncated = false;
 };
 
 // Code spans are trusted to contain complete instructions, valid branch targets, and 32-bit PCs.

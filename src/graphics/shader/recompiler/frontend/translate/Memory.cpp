@@ -1168,6 +1168,7 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::FLAT_STORE_DWORDX4: return FLAT_STORE(inst);
 
 		case Decoder::Opcode::IMAGE_GET_RESINFO: return IMAGE_GET_RESINFO(inst);
+		case Decoder::Opcode::IMAGE_BVH_INTERSECT_RAY: return IMAGE_BVH_INTERSECT_RAY(inst);
 		case Decoder::Opcode::IMAGE_GET_LOD: return IMAGE_GET_LOD(inst);
 		case Decoder::Opcode::IMAGE_LOAD:
 		case Decoder::Opcode::IMAGE_LOAD_MIP: return IMAGE_LOAD(inst);

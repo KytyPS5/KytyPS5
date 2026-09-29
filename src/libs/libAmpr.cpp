@@ -82,29 +82,11 @@ static bool IsValidGuestRange(uint64_t addr, uint64_t size, bool write = false) 
 	return addr != 0 && addr <= std::numeric_limits<uint64_t>::max() - size;
 }
 
+// The kernel's table of guest mappings answers with one lookup. Asking the host (VirtualQuery) took
+// one call per host region, and the memory tracker's per-page protections split the game's buffers
+// into thousands of regions: the check was ~90 % of the file reader's time while the title loaded.
 static bool IsGuestRangeCommitted(uint64_t addr, uint64_t size) {
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	uint64_t checked = 0;
-	while (checked < size) {
-		MEMORY_BASIC_INFORMATION mbi {};
-		if (VirtualQuery(reinterpret_cast<const void*>(addr + checked), &mbi, sizeof(mbi)) == 0) {
-			return false;
-		}
-		if (mbi.State != MEM_COMMIT) {
-			return false;
-		}
-		const auto region_end =
-		    reinterpret_cast<uint64_t>(mbi.BaseAddress) + static_cast<uint64_t>(mbi.RegionSize);
-		if (region_end <= addr + checked) {
-			return false;
-		}
-		checked = region_end - addr;
-	}
-#else
-	(void)addr;
-	(void)size;
-#endif
-	return true;
+	return LibKernel::Memory::IsCommittedRange(addr, size);
 }
 
 static bool ReadGuestBytes(uint64_t addr, void* out, uint64_t size) {

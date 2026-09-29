@@ -1093,28 +1093,40 @@ private:
 			return nullptr;
 		}
 		const auto& memory = m_program.memory_info[index];
-		return memory.kind == (address ? ResourceKind::ScalarAddress : ResourceKind::ScalarBuffer) &&
+		return memory.kind ==
+		                   (address ? ResourceKind::ScalarAddress : ResourceKind::ScalarBuffer) &&
 		               memory.data_bits == 32u && memory.data_dwords == 1u
 		           ? &memory
 		           : nullptr;
 	}
 
+	static bool IsMemoryAccess(const Inst& inst) {
+		const auto op = inst.GetOpcode();
+		return BufferAccessOf(op) != BufferAccess::None ||
+		       AddressOpcodeInfoOf(op).access != AddressAccess::None ||
+		       ImageOpcodeInfoOf(op).access != ImageAccess::None;
+	}
+
+	// Whether no memory access other than owner uses memory_info[index]. Only the indirect-image
+	// and bindless-sampler planning asks, after PlanScalarReads and dead-code elimination, and
+	// it adds, removes and re-indexes no memory accesses, so each index's users are counted once
+	// per shader; scanning the whole program per call made tracking quadratic (seconds per title
+	// load).
 	bool MemoryIndexBelongsTo(uint32_t index, const Inst& owner) const {
-		for (const auto* block: m_program.blocks) {
-			for (const auto& inst: *block) {
-				const auto op = inst.GetOpcode();
-				if ((BufferAccessOf(op) == BufferAccess::None &&
-				     AddressOpcodeInfoOf(op).access == AddressAccess::None &&
-				     ImageOpcodeInfoOf(op).access == ImageAccess::None) ||
-				    &inst == &owner) {
-					continue;
-				}
-				if (inst.Flags<MemoryFlags>().index == index) {
-					return false;
+		if (!m_memory_users_counted) {
+			for (const auto* block: m_program.blocks) {
+				for (const auto& inst: *block) {
+					if (IsMemoryAccess(inst)) {
+						m_memory_users[inst.Flags<MemoryFlags>().index]++;
+					}
 				}
 			}
+			m_memory_users_counted = true;
 		}
-		return true;
+		const auto     users = m_memory_users.find(index);
+		const uint32_t count = users == m_memory_users.end() ? 0u : users->second;
+		const bool     owned = IsMemoryAccess(owner) && owner.Flags<MemoryFlags>().index == index;
+		return count == (owned ? 1u : 0u);
 	}
 
 	bool MakeRuntimeTableSource(const Inst& read, DescriptorSource& descriptor) {
@@ -2942,6 +2954,10 @@ private:
 	std::vector<const Inst*>                   m_default_sampler_reads;
 	std::vector<std::pair<const Inst*, Value>> m_descriptor_selections;
 	bool                                       m_shader_writes = false;
+
+	// MemoryIndexBelongsTo's count of memory accesses per memory_info index, built on first use.
+	mutable std::unordered_map<uint32_t, uint32_t> m_memory_users;
+	mutable bool                                   m_memory_users_counted = false;
 };
 
 } // namespace

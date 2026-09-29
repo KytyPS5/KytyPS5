@@ -465,6 +465,9 @@ struct ShaderInfo {
 	std::vector<SampledResourcePair> sampled_pairs;
 	std::vector<StageInput>          inputs;
 	std::vector<StageOutput>         outputs;
+	// User-data registers holding the low dword of a 64-bit base address that DMA (FLAT/global)
+	// accesses offset from; the next register holds the high dword.
+	std::vector<uint32_t>            dma_base_registers;
 	std::array<uint8_t, 32>          vertex_fetch_components {};
 	int32_t                          vertex_offset_sgpr = -1;
 	int32_t                          instance_offset_sgpr = -1;

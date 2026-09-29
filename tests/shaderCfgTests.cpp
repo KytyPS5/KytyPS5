@@ -6809,7 +6809,9 @@ void TestNewShaderRecompilerFormattedStoreUsesRuntimeArrayLengthOnly() {
   CheckSpirvBinaryValidates(result.spirv);
 
   const auto source = DisassembleSpirvBinary(result.spirv);
-  Check((source.find("OpArrayLength") != std::string::npos),
+  // The bound buffer length comes from shader data (NVIDIA can report OpArrayLength as zero
+  // for ranges over 2 GiB), and the store compares against it.
+  Check((source.find("OpULessThan") != std::string::npos),
         "formatted store SPIR-V lacks runtime storage-buffer bounds check");
   Check(
       !SpirvSourceHasInstructionUsing(source, "OpULessThan", "%uint_5"),
@@ -9637,8 +9639,10 @@ void TestNewShaderRecompilerBufferLoadsGuardedByExec() {
   const auto source = DisassembleSpirvBinary(result.spirv);
   const auto exec_branch =
       source.find("OpBranchConditional", 0);
+  // The bound length comes from shader data rather than OpArrayLength; the
+  // bounds check is the unsigned compare against it.
   const auto array_length =
-      source.find("OpArrayLength", 0);
+      source.find("OpULessThan", 0);
   const auto bounds_branch = source.find("OpBranchConditional", array_length);
   const auto element_access = source.find("OpAccessChain %_ptr_StorageBuffer_uint", 0);
   Check(exec_branch != std::string::npos,
@@ -9682,8 +9686,9 @@ void TestNewShaderRecompilerBufferAtomicsGuardedByBounds() {
     CheckSpirvBinaryValidates(result.spirv);
 
     const auto source = DisassembleSpirvBinary(result.spirv);
+    // Bound lengths come from shader data, not OpArrayLength.
     const auto array_length =
-        source.find("OpArrayLength", 0);
+        source.find("OpULessThan", 0);
     const auto bounds_branch = source.find("OpBranchConditional", array_length);
     const auto atomic = source.find(test.spirv, 0);
     const auto memory_barrier =
@@ -9735,8 +9740,9 @@ void TestCapturedBufferAtomicsX2() {
           "64-bit buffer atomic storage view does not use eight-byte elements");
     Check(CountSourceOccurrences(source, "Aliased") == 2u,
           "both storage-buffer views must declare that they alias");
+    // Bound lengths come from shader data, not OpArrayLength.
     const auto array_length =
-        source.find("OpArrayLength", 0);
+        source.find("OpULessThan", 0);
     const auto bounds_branch = source.find("OpBranchConditional", array_length);
     const auto atomic =
         source.find(test.spirv_name, 0);
@@ -13844,7 +13850,9 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
                                     .instructions = 211,
                                     .runtime_arrays = 1,
                                     .variables = 2,
-                                    .loads = 9,
+                                    // The buffer length is a shader-data load, not
+                                    // OpArrayLength.
+                                    .loads = 10,
                                     .stores = 4,
                                     .array_lengths = 2,
                                     .phis = 5,

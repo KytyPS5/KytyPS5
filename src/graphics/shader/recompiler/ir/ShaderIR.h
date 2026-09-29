@@ -188,6 +188,7 @@ enum class StageInputKind {
 	LocalInvocationIndex,
 	GlobalInvocationId,
 	Parameter,
+	DispatchThreadCount,
 };
 
 enum class StageOutputKind {
@@ -417,11 +418,19 @@ struct BindingLayout {
 	uint32_t                       push_data_start_dword = PushData::NoStart;
 	uint32_t                       memory_offset_dword = 0;
 	uint32_t                       memory_offset_count = 0;
+	bool                           has_dispatch_dimensions = false;
 	std::vector<uint32_t>          user_data_registers;
 	std::vector<DescriptorBinding> descriptors;
 
-	[[nodiscard]] uint32_t ShaderDataDwords() const {
+	// Each bound buffer's length in dwords follows the packed memory offsets.
+	[[nodiscard]] uint32_t BufferLengthDword() const {
 		return memory_offset_dword + (memory_offset_count + 3u) / 4u;
+	}
+	[[nodiscard]] uint32_t DispatchDimensionsDword() const {
+		return BufferLengthDword() + memory_offset_count;
+	}
+	[[nodiscard]] uint32_t ShaderDataDwords() const {
+		return DispatchDimensionsDword() + (has_dispatch_dimensions ? 3u : 0u);
 	}
 	[[nodiscard]] bool UsesPushData() const {
 		return push_data_start_dword != PushData::NoStart;

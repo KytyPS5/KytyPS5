@@ -13960,6 +13960,7 @@ public:
       }
     }
 
+    std::vector<u32> shader_data = compiled.packed_user_data;
     const auto *buffers = Binding(Kind::Buffers);
     if (buffers != nullptr) {
       buffer_infos.resize(buffers->resources.size());
@@ -13978,6 +13979,10 @@ public:
           Require(test.name, "dispatch", info.range <= buffer.size,
                   "storage buffer descriptor range exceeds backing buffer");
         }
+      }
+      for (u32 i = 0; i < buffer_infos.size(); i++) {
+        shader_data.at(layout.BufferLengthDword() + i) =
+            static_cast<u32>(buffer_infos[i].range / sizeof(u32));
       }
       vk::WriteDescriptorSet write{};
       write.sType = vk::StructureType::eWriteDescriptorSet;
@@ -14005,8 +14010,7 @@ public:
     }
     if (const auto *user = Binding(Kind::ShaderData); user != nullptr) {
       user_data_buffer =
-          CreateStorageBuffer(test.name, compiled.packed_user_data,
-                              compiled.packed_user_data.size());
+          CreateStorageBuffer(test.name, shader_data, shader_data.size());
       user_data_info = {user_data_buffer.buffer, 0, user_data_buffer.size};
       vk::WriteDescriptorSet write{};
       write.sType = vk::StructureType::eWriteDescriptorSet;
@@ -14178,8 +14182,7 @@ public:
                            1, &descriptor_set, 0, nullptr);
     if (layout.UsesPushData()) {
       ShaderRecompiler::IR::PushData push_data;
-      std::copy(compiled.packed_user_data.begin(),
-                compiled.packed_user_data.end(),
+      std::copy(shader_data.begin(), shader_data.end(),
                 push_data.dwords.begin() + layout.push_data_start_dword);
       cmd.pushConstants(pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
                         sizeof(push_data), push_data.dwords.data());

@@ -55,6 +55,8 @@ void EmitMemoryOffsets(EmitterState& state) {
 		state.memory_byte_offsets[i] = EmitBinaryU32(
 		    state, spv::OpBitwiseAnd, EmitBinaryU32(state, spv::OpShiftRightLogical, word, shift),
 		    ConstantU32(state, 0xffu));
+		state.memory_dword_lengths[i] =
+		    EmitShaderDataDwordLoad(state, state.program.bindings.BufferLengthDword() + i);
 	}
 }
 
@@ -111,9 +113,9 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 	state.builder.AddFunction(spv::OpAccessChain, pointer_type, access.object_pointer, variable,
 	                          ConstantU32(state, array_index));
 	access.byte_offset = state.memory_byte_offsets[array_index];
-	access.length      = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpArrayLength, TypeU32(state), access.length,
-	                          access.object_pointer, 0);
+	// Some NVIDIA drivers return zero from OpArrayLength for ranges over 2 GiB.
+	// Use the actual bound range, including alignment, without truncating guest memory.
+	access.length = state.memory_dword_lengths[array_index];
 	return access;
 }
 

@@ -74,8 +74,13 @@ BufferAddress CalculateBufferAddress(EmitterState& state, uint32_t index, uint32
 }
 
 uint32_t BufferLane(EmitterState& state) {
+	// MUBUF add_tid and the packed per-lane stride address by the guest wave
+	// lane. Nothing declares VK_SUBGROUP_SIZE_CONTROL, so the host subgroup may
+	// be wider than the guest wave and SubgroupLocalInvocationId may already be a
+	// flat thread id. Mask by the wave size instead of assuming 64 lanes.
+	const auto mask = state.program.wave_size >= 64u ? 63u : 31u;
 	return Binary(state, spv::OpBitwiseAnd, TypeU32(state), EmitSubgroupLocalInvocationId(state),
-	              ConstantU32(state, 63));
+	              ConstantU32(state, mask));
 }
 
 uint32_t BufferByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {

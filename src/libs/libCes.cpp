@@ -3,7 +3,7 @@
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
 
-#include <SDL_stdinc.h>
+#include <SDL3/SDL_stdinc.h>
 #include <array>
 #include <cstring>
 

@@ -3,7 +3,6 @@
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
-#include "common/stringUtils.h"
 
 #include <cstdio>
 #include <filesystem>
@@ -47,7 +46,7 @@ std::shared_ptr<spdlog::logger> MakeFileLogger(std::string                  name
 	}
 
 	auto sink =
-	    std::make_shared<spdlog::sinks::basic_file_sink_mt>(Common::PathToString(path), true);
+	    std::make_shared<spdlog::sinks::basic_file_sink_mt>(path.native(), true);
 	return MakeLogger(std::move(name), std::move(sink));
 }
 

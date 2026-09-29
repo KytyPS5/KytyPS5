@@ -21,6 +21,7 @@ constexpr MemoryOpcodeInfo SMEM_OPCODE_LIST[] = {
     {0x04u, Opcode::S_LOAD_DWORDX16, 16, 32},      {0x08u, Opcode::S_BUFFER_LOAD_DWORD, 1, 32},
     {0x09u, Opcode::S_BUFFER_LOAD_DWORDX2, 2, 32}, {0x0au, Opcode::S_BUFFER_LOAD_DWORDX4, 4, 32},
     {0x0bu, Opcode::S_BUFFER_LOAD_DWORDX8, 8, 32}, {0x0cu, Opcode::S_BUFFER_LOAD_DWORDX16, 16, 32},
+    {0x25u, Opcode::S_MEMREALTIME, 2, 32},
 };
 
 constexpr MemoryOpcodeInfo MUBUF_OPCODE_LIST[] = {
@@ -86,6 +87,7 @@ constexpr MemoryOpcodeInfo FLAT_OPCODE_LIST[] = {
 
 constexpr MemoryOpcodeInfo DS_OPCODE_LIST[] = {
     {0x00u, Opcode::DS_ADD_U32, 1, 32},          {0x01u, Opcode::DS_SUB_U32, 1, 32},
+    {0x03u, Opcode::DS_INC_U32, 1, 32},          {0x04u, Opcode::DS_DEC_U32, 1, 32},
     {0x05u, Opcode::DS_MIN_I32, 1, 32},          {0x06u, Opcode::DS_MAX_I32, 1, 32},
     {0x07u, Opcode::DS_MIN_U32, 1, 32},          {0x08u, Opcode::DS_MAX_U32, 1, 32},
     {0x09u, Opcode::DS_AND_B32, 1, 32},          {0x0au, Opcode::DS_OR_B32, 1, 32},
@@ -107,6 +109,7 @@ constexpr MemoryOpcodeInfo DS_OPCODE_LIST[] = {
     {0x4du, Opcode::DS_WRITE_B64, 2, 32},        {0x4eu, Opcode::DS_WRITE2_B64, 4, 32},
     {0x4fu, Opcode::DS_WRITE2ST64_B64, 4, 32},   {0x76u, Opcode::DS_READ_B64, 2, 32},
     {0x77u, Opcode::DS_READ2_B64, 4, 32},        {0x78u, Opcode::DS_READ2ST64_B64, 4, 32},
+    {0xa0u, Opcode::DS_WRITE_B8_D16_HI, 1, 8},
     {0xa1u, Opcode::DS_WRITE_B16_D16_HI, 1, 16},
     {0xa6u, Opcode::DS_READ_U16_D16, 1, 16},
     {0xa7u, Opcode::DS_READ_U16_D16_HI, 1, 16},
@@ -147,6 +150,7 @@ bool IsDsWriteOpcode(Opcode opcode) {
 	switch (opcode) {
 		case Opcode::DS_WRITE_B8:
 		case Opcode::DS_WRITE_B16:
+		case Opcode::DS_WRITE_B8_D16_HI:
 		case Opcode::DS_WRITE_B16_D16_HI:
 		case Opcode::DS_WRITE2_B32:
 		case Opcode::DS_WRITE2ST64_B32:
@@ -166,7 +170,9 @@ bool IsDsAtomicOpcode(Opcode opcode) {
 		case Opcode::DS_ADD_RTN_U32:
 		case Opcode::DS_SUB_U32:
 		case Opcode::DS_SUB_RTN_U32:
+		case Opcode::DS_INC_U32:
 		case Opcode::DS_INC_RTN_U32:
+		case Opcode::DS_DEC_U32:
 		case Opcode::DS_DEC_RTN_U32:
 		case Opcode::DS_MIN_I32:
 		case Opcode::DS_MIN_RTN_I32:
@@ -240,6 +246,10 @@ void DecodeSmem(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	}
 
 	DecodeScalarDestination(sdst, pc, inst.dst);
+	if (inst.opcode == Opcode::S_MEMREALTIME) {
+		inst.src_count = 0;
+		return;
+	}
 	// SMEM encodes SBASE in SGPR pairs. Scalar-buffer loads still use the same
 	// pair index; their descriptor operand consumes four SGPRs from that base.
 	DecodeScalarSource(sbase * 2u, pc, inst.src0);
@@ -263,6 +273,7 @@ void DecodeMubuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_inde
 	inst.idxen       = ((word0 >> 13u) & 1u) != 0;
 	inst.offen       = ((word0 >> 12u) & 1u) != 0;
 	inst.glc         = ((word0 >> 14u) & 1u) != 0;
+	inst.dlc         = ((word0 >> 15u) & 1u) != 0;
 	inst.slc         = ((word1 >> 22u) & 1u) != 0;
 	inst.family      = Family::MUBUF;
 	inst.opcode_id   = opcode;
@@ -298,6 +309,7 @@ void DecodeMtbuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_inde
 	inst.idxen         = ((word0 >> 13u) & 1u) != 0;
 	inst.offen         = ((word0 >> 12u) & 1u) != 0;
 	inst.glc           = ((word0 >> 14u) & 1u) != 0;
+	inst.dlc           = ((word0 >> 15u) & 1u) != 0;
 	inst.slc           = ((word1 >> 22u) & 1u) != 0;
 	inst.family        = Family::MTBUF;
 	inst.opcode_id     = opcode;
@@ -429,7 +441,9 @@ void DecodeDs(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, 
 	}
 	DecodeVectorGpr(addr, inst.src0);
 	DecodeVectorGpr(data0, inst.src1);
-	if (inst.opcode == Opcode::DS_WRITE_B16_D16_HI) {
+	if (inst.opcode == Opcode::DS_WRITE_B8_D16_HI) {
+		inst.src1.sdwa_sel = 2u;
+	} else if (inst.opcode == Opcode::DS_WRITE_B16_D16_HI) {
 		inst.src1.sdwa_sel = 5u;
 	}
 	DecodeVectorGpr(data1, inst.src2);

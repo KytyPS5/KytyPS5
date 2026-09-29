@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 
 #include <algorithm>
 #include <array>
@@ -34,9 +35,6 @@ void ValidateNativeProgram(const IR::Program& program) {
 		present[index]   = true;
 		expected[index]  = std::move(resources);
 	};
-	if (!program.info.buffers.empty()) {
-		Expect(Kind::Buffers, Dense(program.info.buffers.size()));
-	}
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		const auto kind = IR::DescriptorBindingForImage(program.info.images[i]);
 		if (!kind.has_value()) {
@@ -54,23 +52,9 @@ void ValidateNativeProgram(const IR::Program& program) {
 	if (!program.info.samplers.empty()) {
 		Expect(Kind::Samplers, Dense(program.info.samplers.size()));
 	}
-	bool uses_gds = false;
-	for (const auto* block: program.blocks) {
-		for (const auto& inst: *block) {
-			if (IR::SharedAccessOf(inst.GetOpcode()) == IR::SharedAccess::None) {
-				continue;
-			}
-			const auto index = inst.Flags<IR::MemoryFlags>().index;
-			if (index >= program.memory_info.size()) {
-				Fail(program, "shared operation has invalid memory metadata");
-			}
-			const auto kind = program.memory_info[index].kind;
-			if (kind != IR::ResourceKind::Lds && kind != IR::ResourceKind::Gds) {
-				Fail(program, "shared operation has invalid resource kind");
-			}
-			uses_gds |= kind == IR::ResourceKind::Gds;
-		}
-	}
+	auto& buffers = expected[static_cast<size_t>(Kind::Buffers)];
+	const bool uses_gds = IR::CollectMemoryResources(program, buffers);
+	present[static_cast<size_t>(Kind::Buffers)] = !buffers.empty();
 	if (uses_gds) {
 		Expect(Kind::Gds);
 	}
@@ -109,7 +93,7 @@ void ValidateNativeProgram(const IR::Program& program) {
 	if ((program.bindings.UsesPushData() &&
 	     !IR::PushData::CanFit(program.bindings.push_data_start_dword, shader_data_dwords)) ||
 	    program.bindings.memory_offset_dword != program.bindings.user_data_registers.size() ||
-	    program.bindings.memory_offset_count != program.info.buffers.size() ||
+	    program.bindings.memory_offset_count != buffers.size() ||
 	    has_shader_data_storage != (shader_data_dwords != 0 && !program.bindings.UsesPushData()) ||
 	    !std::is_sorted(program.bindings.user_data_registers.begin(),
 	                    program.bindings.user_data_registers.end()) ||
@@ -132,12 +116,23 @@ void ValidateNativeProgram(const IR::Program& program) {
 			              program.memory_info[index].planning_only;
 		       });
 	};
+	const auto indirect_buffer_handle = [&](const IR::Inst& handle) {
+		return program.info.uses_dma && handle.NumArgs() == 4u && !handle.Uses().empty() &&
+		       std::ranges::all_of(handle.Uses(), [&](const IR::Use& use) {
+			       if (IR::BufferAccessOf(use.user->GetOpcode()) != IR::BufferAccess::Read) {
+				       return false;
+			       }
+			       const auto index = use.user->Flags<IR::MemoryFlags>().index;
+			       return index < program.memory_info.size() &&
+			              program.memory_info[index].kind == IR::ResourceKind::IndirectBuffer;
+		       });
+	};
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			const auto dense = inst.Flags<uint32_t>();
 			switch (inst.GetOpcode()) {
 				case IR::ValueOpcode::GetBufferResource:
-					if (planning_only_handle(inst)) {
+					if (planning_only_handle(inst) || indirect_buffer_handle(inst)) {
 						break;
 					}
 					if (dense >= program.info.buffers.size()) {
@@ -187,6 +182,7 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 	SpirvRequirements requirements {};
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
+			requirements.float64 |= inst.GetType() == IR::Type::F64;
 			if (IR::BufferAccessOf(inst.GetOpcode()) == IR::BufferAccess::Atomic &&
 			    inst.GetType() == IR::Type::U64) {
 				requirements.buffer_int64_atomics = true;
@@ -212,7 +208,11 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 					Fail(program, "buffer operation has invalid memory metadata");
 				}
 				const auto& memory = program.memory_info[memory_index];
+				if (memory.kind == IR::ResourceKind::IndirectBuffer) {
+					requirements.subgroup_local_invocation_id = true;
+				}
 				if (memory.kind == IR::ResourceKind::Buffer) {
+					requirements.coherent_buffers |= memory.coherent;
 					if (memory.resource >= program.info.buffers.size()) {
 						Fail(program, "buffer operation has invalid resource metadata");
 					}

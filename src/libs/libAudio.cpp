@@ -1,6 +1,9 @@
 #include "common/abi.h"
 #include "libs/ajm/aac_decoder.h"
+#include "libs/acm.h"
+#include "libs/audio3d.h"
 #include "libs/audio.h"
+#include "libs/ngs2.h"
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
 

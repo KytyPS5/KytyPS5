@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 
 namespace Libs::Graphics {
 
@@ -138,8 +139,7 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	// Color-control state selects the color-buffer operation and logical blend operation.
 	// The normal copy operation is a regular color write, not an attachment clear.
 	// Nonlinear clear values are still stored as normalized components.
-	// Fast color clears are metadata driven and must be handled explicitly when
-	// that metadata path is implemented; render-pass load must preserve contents.
+	// Metadata clears are materialized during image discovery; render-pass loads preserve contents.
 	uint32_t   width  = 0;
 	uint32_t   height = 0;
 	uint32_t   pitch  = 0;
@@ -159,9 +159,6 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 			tile = !RenderIsColorTileModeLinear(rt.attrib3.tile_mode);
 			break;
 		default: EXIT("unknown tile mode: %u\n", static_cast<uint32_t>(rt.attrib3.tile_mode));
-	}
-	if (!tile && levels > 1) {
-		EXIT("linear mipmapped render targets are unsupported\n");
 	}
 	if (samples > 1 && (!tile || levels != 1)) {
 		EXIT("multisampled render targets require a single-mip tiled surface\n");
@@ -203,8 +200,7 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		     " layer=%u/%u\n",
 		     rt.attrib3.dimension, rt.attrib3.depth, view.base_layer, view.image_layers);
 	}
-	// PPSA28068: the linear EULA target and its sampled view must share the padded pitch.
-	if (!tile || volume || texture_tile) {
+	if (samples == 1) {
 		pitch = TileGetTexturePitch(transfer_format, width, rt.attrib3.tile_mode);
 	} else {
 		pitch = TileGetRenderTargetPitch(width, bytes_per_element, rt.attrib.num_fragments);
@@ -232,37 +228,26 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		}
 		size         = volume_layout.block_slice_size;
 		backing_size = volume_layout.total_size;
-	} else if (tile) {
+	} else {
 		TileSizeAlign layout {};
 		bool          valid_layout = false;
-		if (texture_tile) {
+		if (samples == 1) {
 			TileGetTextureSize(transfer_format, width, height, levels, rt.attrib3.tile_mode,
 			                   &layout, mip_sizes, mip_padded);
-			valid_layout = layout.size != 0 && layout.align == texture_tile_layout.block.block_size;
+			valid_layout = layout.size != 0 && layout.align != 0 &&
+			               (rt.attrib3.tile_mode != Prospero::TileMode::kRenderTarget ||
+			                levels <= std::bit_width(std::max(width, height)));
 		} else {
-			valid_layout =
-			    levels == 1 ? TileGetRenderTargetSize(width, height, pitch, bytes_per_element,
-			                                          layout, rt.attrib.num_fragments)
-			                : TileGetRenderTargetMipLayout(width, height, pitch, bytes_per_element,
-			                                               levels, layout, mip_sizes, mip_padded);
+			valid_layout = TileGetRenderTargetSize(width, height, pitch, bytes_per_element,
+			                                       layout, rt.attrib.num_fragments);
+			mip_sizes[0]  = {layout.size, 0, 0, 0, 0, 0};
+			mip_padded[0] = {pitch, height};
 		}
 		if (!valid_layout) {
 			EXIT("unsupported render-target layout: %ux%u pitch=%u bytes=%u levels=%u\n", width,
 			     height, pitch, bytes_per_element, levels);
 		}
 		size = layout.size;
-		EXIT_IF(size > UINT32_MAX);
-		if (levels == 1) {
-			mip_sizes[0]  = {static_cast<uint32_t>(size), 0, 0, 0, 0, 0};
-			mip_padded[0] = {pitch, height};
-		}
-	} else {
-		size = static_cast<uint64_t>(pitch) * height * bytes_per_element * samples;
-		if (size > UINT32_MAX) {
-			EXIT("linear render-target slice exceeds the supported layout size\n");
-		}
-		mip_sizes[0]  = {static_cast<uint32_t>(size), 0, 0, 0, 0, 0};
-		mip_padded[0] = {pitch, height};
 	}
 	if (size == 0 || (!volume && size > UINT64_MAX / view.image_layers)) {
 		EXIT("render-target memory footprint is invalid\n");
@@ -304,15 +289,25 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	desc.info.samples         = samples;
 	desc.info.tile_mode       = rt.attrib3.tile_mode;
 	const bool has_dcc        = rt.info.dcc_compression_enable && rt.dcc_addr.addr != 0;
-	if (has_dcc) {
+	const bool has_cmask      = !rt.info.dcc_compression_enable && rt.info.cmask_fast_clear_enable &&
+	                            rt.cmask.addr != 0 && samples == 1 &&
+	                            !rt.info.fmask_compression_enable &&
+	                            !rt.attrib3.write_vrs_rate_hint_to_cmask;
+	if (has_dcc || has_cmask) {
 		TileSizeAlign metadata_size {};
-		(void)TileGetDccSize(width, height, volume ? depth : view.image_layers, bytes_per_element,
-		                     levels, rt.attrib3.tile_mode, metadata_size, rt.attrib.num_fragments);
-		desc.info.metadata.kind                     = ImageMetadataKind::Dcc;
-		desc.info.metadata.range                    = {rt.dcc_addr.addr, metadata_size.size};
-		desc.info.metadata.dcc_clear_word           = rt.clear_word0.word0;
-		desc.info.metadata.dcc_clear_register_valid = true;
-		desc.info.metadata.dcc_alpha_msb            = DccAlphaOnMsb(rt.info);
+		const auto layers = volume ? depth : view.image_layers;
+		if (has_dcc) {
+			(void)TileGetDccSize(width, height, layers, bytes_per_element, levels,
+			                     rt.attrib3.tile_mode, metadata_size, rt.attrib.num_fragments);
+			desc.info.metadata.dcc_alpha_msb = DccAlphaOnMsb(rt.info);
+		} else {
+			(void)TileGetCmaskSize(width, height, layers, levels, metadata_size);
+		}
+		// DCC owns the clear when both planes are enabled; single-sample CMASK stays expanded.
+		desc.info.metadata.kind = has_dcc ? ImageMetadataKind::Dcc : ImageMetadataKind::Cmask;
+		desc.info.metadata.range = {has_dcc ? rt.dcc_addr.addr : rt.cmask.addr, metadata_size.size};
+		desc.info.metadata.clear_word           = rt.clear_word0.word0;
+		desc.info.metadata.clear_register_valid = true;
 	}
 	for (uint32_t level = 0; level < levels; level++) {
 		if (volume) {

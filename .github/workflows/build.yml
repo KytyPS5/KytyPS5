@@ -43,9 +43,6 @@ jobs:
       - name: Setup Visual Studio environment
         uses: ilammy/msvc-dev-cmd@v1
 
-      - name: Setup Ninja
-        uses: seanmiddleditch/gha-setup-ninja@v5
-
       - name: Locate vcpkg
         id: vcpkg
         shell: pwsh
@@ -115,12 +112,15 @@ jobs:
       - name: Build
         shell: cmd
         run: |
-          cmake --build _Build/windows --target launcher audio_out2_port_tests ime_dialog_tests virtual_memory_allocation_tests --parallel
+          cmake --build _Build/windows --target launcher ^
+            audio_out2_port_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests ^
+            resource_tracking_tests scalar_provenance_tests ^
+            resource_materialization_tests shader_vertex_metadata_tests --parallel
 
       - name: Test
         shell: cmd
         run: |
-          ctest --test-dir _Build/windows --output-on-failure -R "^(audio_out2_port|ime_dialog|virtual_memory_allocation)$"
+          ctest --test-dir _Build/windows --output-on-failure -R "^(audio_out2_port|ime_dialog|lru_cache|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|virtual_memory_allocation)$"
 
       - name: Install
         shell: cmd
@@ -155,7 +155,7 @@ jobs:
 
       - name: Install build dependencies
         shell: bash
-        run: brew install glslang ninja
+        run: brew install glslang
 
       - name: Install Qt 6.10.3
         uses: jurplel/install-qt-action@v4
@@ -201,14 +201,16 @@ jobs:
         shell: bash
         run: |
           cmake --build _Build/macos \
-            --target launcher audio_out2_port_tests ime_dialog_tests virtual_memory_allocation_tests \
+            --target launcher audio_out2_port_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests \
+              resource_tracking_tests scalar_provenance_tests \
+              resource_materialization_tests shader_vertex_metadata_tests \
             --parallel
 
       - name: Test
         shell: bash
         run: |
           ctest --test-dir _Build/macos --output-on-failure \
-            -R '^(audio_out2_port|ime_dialog|virtual_memory_allocation)$'
+            -R '^(audio_out2_port|ime_dialog|lru_cache|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|virtual_memory_allocation)$'
 
       - name: Install
         shell: bash
@@ -317,8 +319,8 @@ jobs:
             libxkbcommon-dev \
             libxrandr-dev \
             libxss-dev \
+            libxtst-dev \
             lld \
-            ninja-build \
             pkg-config \
             wayland-protocols
 
@@ -363,7 +365,7 @@ jobs:
             -DCMAKE_PREFIX_PATH="$Qt6_DIR" 2>&1 | tee _Build/configure.log
           exit "${PIPESTATUS[0]}"
 
-      - name: Verify SDL2 backends
+      - name: Verify SDL3 backends
         shell: bash
         run: |
           status=0
@@ -382,14 +384,16 @@ jobs:
         run: |
           cmake --build _Build/linux \
             --target launcher page_manager_tests memory_tracker_tests \
-              audio_out2_port_tests ime_dialog_tests virtual_memory_allocation_tests \
+              audio_out2_port_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests \
+              resource_tracking_tests scalar_provenance_tests \
+              resource_materialization_tests shader_vertex_metadata_tests \
             --parallel
 
       - name: Test
         shell: bash
         run: |
           ctest --test-dir _Build/linux --output-on-failure \
-            -R '^(audio_out2_port|ime_dialog|page_manager|memory_tracker|virtual_memory_allocation)$'
+            -R '^(audio_out2_port|ime_dialog|lru_cache|memory_tracker|page_manager|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|virtual_memory_allocation)$'
 
       - name: Install
         shell: bash

@@ -3,6 +3,8 @@
 
 #include <QNetworkAccessManager>
 #include <QObject>
+#include <QString>
+#include <QUrl>
 
 class QByteArray;
 class QWidget;
@@ -29,6 +31,11 @@ private:
 	QWidget*              m_parent           = nullptr;
 	QNetworkAccessManager m_network;
 	bool                  m_checking_updates = false;
+
+	// Answer from the primary update feed, kept while the GitHub fallback feed is
+	// being consulted, so it can still be shown if the fallback request fails.
+	QString m_primary_tag;
+	QUrl    m_primary_page_url;
 };
 
 #endif // UPDATE_CHECKER_H

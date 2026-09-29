@@ -291,9 +291,20 @@ uint32_t EmitConvertU32F32(EmitterState& state, uint32_t arg0) {
 	return EmitF32ToU32(state, arg0, false);
 }
 
-uint32_t EmitConvertF32S32(EmitterState& state, uint32_t arg0) {
-	const auto signed_value = Unary(state, spv::OpBitcast, TypeI32(state), arg0);
-	return EmitNative<spv::OpConvertSToF, IR::Type::F32>(state, signed_value);
+uint32_t EmitConvertF32F64(EmitterState& state, uint32_t arg0) {
+	const auto converted = Unary(state, spv::OpFConvert, TypeF32(state), arg0);
+	const auto source    = EmitNative<spv::OpCompositeExtract, IR::Type::U32>(
+	    state, Unary(state, spv::OpBitcast, TypeU64(state), arg0), 1u);
+	const auto exponent = EmitAndConstant(state, source, 0x7ff00000u);
+	const auto overflow =
+	    Binary(state, spv::OpLogicalAnd, TypeBool(state),
+	           EmitCompareU32Constant(state, spv::OpUGreaterThan, exponent, 0x47e00000u),
+	           EmitCompareU32Constant(state, spv::OpULessThan, exponent, 0x7ff00000u));
+	const auto clamped = EmitOrU32(state, EmitAndConstant(state, source, 0x80000000u),
+	                               ConstantU32(state, 0x7f7fffffu));
+	return EmitFlushF32DenormToSignedZero(
+	    state, Select(state, TypeF32(state), overflow,
+	                  Unary(state, spv::OpBitcast, TypeF32(state), clamped), converted));
 }
 
 uint32_t EmitCompositeExtractU64(EmitterState& state, uint32_t arg0, IR::Value arg1) {
@@ -451,6 +462,11 @@ uint32_t EmitFPMaxTri32(EmitterState& state, uint32_t arg0, uint32_t arg1, uint3
 uint32_t EmitFPRecip32(EmitterState& state, uint32_t arg0) {
 	const auto source = EmitFlushF32DenormToSignedZero(state, arg0);
 	return Binary(state, spv::OpFDiv, TypeF32(state), ConstantF32(state, 0x3f800000u), source);
+}
+
+uint32_t EmitFPRecip64(EmitterState& state, uint32_t arg0) {
+	const auto one = state.builder.Constant(spv::OpConstant, TypeF64(state), 0u, 0x3ff00000u);
+	return EmitNative<spv::OpFDiv, IR::Type::F64>(state, one, arg0);
 }
 
 uint32_t EmitFPRecipIFlag32(EmitterState& state, uint32_t arg0) {

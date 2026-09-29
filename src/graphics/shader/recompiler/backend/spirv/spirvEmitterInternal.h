@@ -385,6 +385,11 @@ uint32_t EmitBinaryU32(EmitterState& state, spv::Op opcode, uint32_t lhs, uint32
 
 uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index);
 
+// A thread-dimension compute dispatch whose counts the shader reads from GPU memory.
+[[nodiscard]] bool DispatchDimensionsIndirect(const EmitterState& state);
+// Guest DMA, or DispatchDimensionsIndirect: the module uses physical storage buffer pointers.
+[[nodiscard]] bool UsesPhysicalAddresses(const EmitterState& state);
+
 uint32_t StorageBufferPackedStride(const EmitterState& state, const IR::MemoryInfo& mem);
 
 Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::MemoryInfo& mem);

@@ -9,6 +9,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shaderBindings.h"
 
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <type_traits>
@@ -45,6 +46,11 @@ struct PreparedBindings {
 	vk::DescriptorBufferInfo              flattened_srt;
 	vk::DescriptorBufferInfo              shader_data_buffer;
 	std::vector<uint32_t>                 shader_data;
+	std::array<uint32_t, 3>               dispatch_dimensions {};
+	// Bindless: flattened-SRT words to patch (offset, region, entries) and resolved images to
+	// keep readable for this draw.
+	std::vector<std::array<uint32_t, 3>>  bindless_patches;
+	std::vector<ImageId>                  bindless_images;
 };
 
 [[nodiscard]] vk::DescriptorType

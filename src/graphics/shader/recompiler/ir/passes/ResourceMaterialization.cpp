@@ -755,6 +755,48 @@ static std::vector<ResourceBlock> ResourceControlFlow(const Program& program) {
 	return blocks;
 }
 
+// True for the enable of a store every launched lane performs: `true`, or the launch mask of a
+// dispatch sized in threads (global id < thread count on each axis), which the host consumer's
+// own coverage check already bounds.
+static bool IsLaunchMask(Value value, uint32_t depth = 0) {
+	value = value.Resolve();
+	if (value.IsImmediate()) {
+		return value == Value(true);
+	}
+	const auto* inst = value.TryInstruction();
+	if (inst == nullptr || depth > 8) {
+		return false;
+	}
+	if (inst->GetOpcode() == ValueOpcode::LogicalAnd) {
+		return IsLaunchMask(inst->Arg(0), depth + 1) && IsLaunchMask(inst->Arg(1), depth + 1);
+	}
+	if (inst->GetOpcode() != ValueOpcode::ULessThan32) {
+		return false;
+	}
+	const auto* id    = inst->Arg(0).Resolve().TryInstruction();
+	const auto* count = inst->Arg(1).Resolve().TryInstruction();
+	return id != nullptr && count != nullptr && id->GetOpcode() == ValueOpcode::GetBuiltin &&
+	       id->Arg(0) == Value(static_cast<uint32_t>(StageInputKind::GlobalInvocationId)) &&
+	       count->GetOpcode() == ValueOpcode::GetBuiltin &&
+	       count->Arg(0) == Value(static_cast<uint32_t>(StageInputKind::DispatchThreadCount)) &&
+	       id->Arg(1) == count->Arg(1);
+}
+
+// The value a launched lane computed: selects on the launch mask only keep the old value in lanes
+// that never store.
+static Value StripLaunchSelect(Value value) {
+	for (uint32_t depth = 0; depth < 8; depth++) {
+		value            = value.Resolve();
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr || inst->GetOpcode() != ValueOpcode::SelectU32 ||
+		    !IsLaunchMask(inst->Arg(0))) {
+			break;
+		}
+		value = inst->Arg(1);
+	}
+	return value;
+}
+
 // Nonnegative affine coefficients for constant, local and workgroup coordinates. Reject modular
 // arithmetic that could wrap; runtime coverage also bounds the largest invocation index.
 static std::optional<std::array<uint64_t, 3>> FillIndex(Value value, uint32_t axis,
@@ -771,6 +813,10 @@ static std::optional<std::array<uint64_t, 3>> FillIndex(Value value, uint32_t ax
 		return {};
 	}
 	const auto op = inst->GetOpcode();
+	// A lane outside the launch mask keeps its old value, but never stores either.
+	if (op == ValueOpcode::SelectU32 && IsLaunchMask(inst->Arg(0))) {
+		return FillIndex(inst->Arg(1), axis, depth + 1);
+	}
 	if (op == ValueOpcode::GetBuiltin && inst->Arg(1) == Value(axis)) {
 		if (inst->Arg(0) == Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId))) {
 			return std::array<uint64_t, 3> {0, 1, 0};
@@ -941,7 +987,7 @@ static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 		result.fill.words = memory.data_dwords;
 		data = EnabledValue(store->Arg(4), store->Arg(5));
 	}
-	data = data.Resolve();
+	data = StripLaunchSelect(data);
 	const auto*          vector = data.TryInstruction();
 	constexpr std::array composites {ValueOpcode::CompositeConstructU32x2,
 	                                 ValueOpcode::CompositeConstructU32x3,

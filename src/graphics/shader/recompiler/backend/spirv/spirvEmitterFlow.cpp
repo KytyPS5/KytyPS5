@@ -21,6 +21,31 @@ bool UserDataDwordIndex(const EmitterState& state, IR::ScalarReg reg, uint32_t& 
 }
 
 uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t component) {
+	if (kind == IR::StageInputKind::DispatchThreadCount) {
+		const auto dword = state.program.bindings.DispatchDimensionsDword();
+		if (!DispatchDimensionsIndirect(state)) {
+			return EmitShaderDataDwordLoad(state, dword + component);
+		}
+		// The counts stay where the guest's indirect arguments are; the shader data holds
+		// their device address.
+		const auto u64     = TypeScalarU64(state);
+		const auto low     = Unary(state, spv::OpUConvert, u64, EmitShaderDataDwordLoad(state, dword));
+		const auto high    = Unary(state, spv::OpUConvert, u64,
+		                           EmitShaderDataDwordLoad(state, dword + 1u));
+		const auto base    = Binary(state, spv::OpBitwiseOr, u64, low,
+		                            Binary(state, spv::OpShiftLeftLogical, u64, high,
+		                                   state.builder.Constant(spv::OpConstant, u64, 32u, 0u)));
+		const auto address = Binary(state, spv::OpIAdd, u64, base,
+		                            state.builder.Constant(spv::OpConstant, u64,
+		                                                   component * 4u, 0u));
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer,
+		                          address);
+		const auto value = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer,
+		                          spv::MemoryAccessAlignedMask, 4u);
+		return value;
+	}
 	if (kind == IR::StageInputKind::LocalInvocationIndex) {
 		return EmitLocalInvocationIndex(state);
 	}

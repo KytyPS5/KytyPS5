@@ -9515,9 +9515,10 @@ public:
                   CpOpDispatchIndirect(processor, 0xc0011600u, packet.data(), 0, 0) == 2,
                   "the offset indirect packet was not consumed");
         }
+        // Thread-count arguments are converted on the GPU too, never read back.
+        Require(name, "asynchronous indirect dispatch", scheduler.CurrentTick() == tick,
+                "indirect arguments caused a host submission or readback");
         if (test.mode == 0x41u) {
-          Require(name, "asynchronous indirect dispatch", scheduler.CurrentTick() == tick,
-                  "workgroup-count arguments caused a host submission or readback");
           if (!test.transfer) {
             const auto merged = BufferCacheTestAccess::PageOwner(cache, args);
             Require(name, "argument/output owner merge",

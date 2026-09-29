@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
+#include <memory>
 #include <optional>
 #include <span>
 #include <vector>
@@ -238,6 +239,8 @@ private:
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
 	std::vector<uint32_t>                 m_image_occurrences;
+	// Created at the first thread-dimension indirect dispatch.
+	std::unique_ptr<IndirectDispatchGroups> m_indirect_groups;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

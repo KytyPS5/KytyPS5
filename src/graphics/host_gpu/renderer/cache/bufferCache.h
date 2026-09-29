@@ -54,10 +54,13 @@ public:
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
+	// needs_device_address: the caller reads the data through a buffer device address, which
+	// the stream buffer used for small CPU-written reads does not have.
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBuffer(uint64_t vaddr, uint64_t size,
 	                                                        bool     is_written,
-	                                                        bool     is_texel_buffer = false,
-	                                                        BufferId id              = {});
+	                                                        bool     is_texel_buffer      = false,
+	                                                        BufferId id                   = {},
+	                                                        bool     needs_device_address = false);
 	[[nodiscard]] StreamBuffer&                GetUtilityBuffer(MemoryUsage usage) noexcept {
 		switch (usage) {
 			case MemoryUsage::Upload: return m_staging_buffer;

@@ -29302,7 +29302,7 @@ TestCase ImageCubeGradientsPreserveDerivatives() {
   return test;
 }
 
-TestCase ImageGatherLodApproximatesLevelZero() {
+TestCase ImageGatherLodReadsSelectedLevel() {
   using O = ShaderOpcode;
   std::vector<u32> code;
   AppendVMovLiteral(&code, 20, 0x3f000000u);
@@ -29317,16 +29317,24 @@ TestCase ImageGatherLodApproximatesLevelZero() {
   }
   AppendEnd(&code);
 
+  // Mip 0 is all 1.0; mip 1 holds a distinct red value per texel.
+  auto mip1 = MakeRgbaImage(2, 2);
+  SetRgbaPixel(&mip1, 2, 0, 0, 0x40000000u, 0, 0, 0);
+  SetRgbaPixel(&mip1, 2, 1, 0, 0x40400000u, 0, 0, 0);
+  SetRgbaPixel(&mip1, 2, 0, 1, 0x40800000u, 0, 0, 0);
+  SetRgbaPixel(&mip1, 2, 1, 1, 0x40a00000u, 0, 0, 0);
+
   TestCase test;
-  test.name = "ImageGatherLodApproximatesLevelZero";
+  test.name = "ImageGatherLodReadsSelectedLevel";
   test.code = std::move(code);
   test.opcodes = {O::V_MOV_B32, O::IMAGE_GATHER4_L, O::IMAGE_SAMPLE,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  // Explicit sampling proves mip 1 is accessible; the gather must still read mip 0.
-  test.expected = {0x3f800000u, 0x3f800000u, 0x3f800000u, 0x3f800000u, 0x41000000u};
-  test.sampled_image_rgba_mips = {std::vector<u32>(4 * 4 * 4, 0x3f800000u),
-                                 std::vector<u32>(2 * 2 * 4, 0x41000000u)};
-  test.required_spirv = {"OpImageGather", "OpImageSampleExplicitLod"};
+  // LOD 1 gathers mip 1's 2x2 footprint in gather order (i0,j1), (i1,j1), (i1,j0), (i0,j0);
+  // the nearest-filtered sample at the same LOD reads texel (1,1).
+  test.expected = {0x40800000u, 0x40a00000u, 0x40400000u, 0x40000000u, 0x40a00000u};
+  test.sampled_image_rgba_mips = {std::vector<u32>(4 * 4 * 4, 0x3f800000u), mip1};
+  test.required_spirv = {"OpImageFetch", "OpImageQueryLevels", "OpImageSampleExplicitLod"};
+  test.forbidden_spirv = {"OpImageGather"};
   return test;
 }
 
@@ -31144,7 +31152,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageGetResinfoDmaskMipLevels);
   AddCase(ImageSampleAndGather);
   AddCase(ImageCubeGradientsPreserveDerivatives);
-  AddCase(ImageGatherLodApproximatesLevelZero);
+  AddCase(ImageGatherLodReadsSelectedLevel);
   AddCase(ImageD16GatherPacksHalfPairs);
   AddCase(ImageSampleA16SamplerCoordsOnGpu);
   AddCase(ImageSampleOpcodeAliasUsesNormalCoords);
@@ -36010,7 +36018,7 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, BranchVccnzUsesWaveMask());
     RunCase(&vulkan, BranchVccnzUsesCarryProducedWaveMask());
     RunCase(&vulkan, ImageSampleAndGather());
-    RunCase(&vulkan, ImageGatherLodApproximatesLevelZero());
+    RunCase(&vulkan, ImageGatherLodReadsSelectedLevel());
     RunCase(&vulkan, SharedReturnKeepsSelectedValues());
     RunCase(&vulkan, SiblingSharedExitKeepsCapturedConditions());
     return 0;

@@ -828,6 +828,20 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		if (op == IR::ValueOpcode::ImageGatherRaw) {
 			const auto coord = CoordF32(ctx, mem, *address, layout.coord,
 			                            dimension_info.coordinate_components, image.cube);
+			if (HasFlag(mem, Decoder::ImageSampleFlagLod) && !dref &&
+			    layout.lod != NoImageComponent && !image.cube &&
+			    (dimension == ImageDimension::Dim2D || dimension == ImageDimension::Dim2DArray) &&
+			    layout.offset == NoImageComponent &&
+			    !HasFlag(mem, Decoder::ImageSampleFlagGatherHorizontal) &&
+			    ImageConversionFormat(state, mem).format == Prospero::BufferFormat::kInvalid) {
+				const auto gathered =
+				    EmitGatherAtLod(ctx, mem, coord, AddressF32(ctx, mem, *address, layout.lod),
+				                    dimension == ImageDimension::Dim2DArray, numeric_class,
+				                    ImageGatherComponent(mem.dmask));
+				ctx.Define(inst, ResultVector(ctx, UnpackImageGather(ctx, mem, gathered),
+				                              numeric_class, false, mem, true));
+				return;
+			}
 			if (HasFlag(mem, Decoder::ImageSampleFlagLod)) {
 				static std::atomic_flag warned = ATOMIC_FLAG_INIT;
 				if (!warned.test_and_set(std::memory_order_relaxed)) {

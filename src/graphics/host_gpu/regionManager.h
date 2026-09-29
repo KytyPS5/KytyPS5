@@ -70,6 +70,8 @@ private:
 
 static_assert(std::atomic_uint32_t::is_always_lock_free);
 
+inline std::atomic<uint64_t> g_cpu_dirty_epoch {1};
+
 class RegionManager final {
 public:
 	RegionManager(PageManager& page_manager, uint64_t cpu_addr)
@@ -85,6 +87,11 @@ public:
 	KYTY_CLASS_NO_COPY(RegionManager);
 
 	[[nodiscard]] uint64_t GetCpuAddr() const { return m_cpu_addr; }
+
+	template <DirtySource source>
+	[[nodiscard]] bool MaybeModified() const noexcept {
+		return GetSummary<source>().load(std::memory_order_acquire);
+	}
 	template <DirtySource source>
 	[[nodiscard]] bool IsModified(uint64_t offset, uint64_t size) const {
 		const auto [start, end] = GetPageRange(m_cpu_addr + offset, size);
@@ -108,8 +115,15 @@ public:
 		auto& bits = GetBits<source>();
 		if constexpr (enable) {
 			bits.SetRange(start, end);
+			GetSummary<source>().store(true, std::memory_order_release);
+			if constexpr (source == DirtySource::Cpu) {
+				g_cpu_dirty_epoch.fetch_add(1, std::memory_order_release);
+			}
 		} else {
 			bits.UnsetRange(start, end);
+			if (bits.None()) {
+				GetSummary<source>().store(false, std::memory_order_release);
+			}
 		}
 		if constexpr (source == DirtySource::Cpu) {
 			UpdateProtection<!enable, false>();
@@ -125,6 +139,9 @@ public:
 		RegionBits mask(bits, start, end);
 		if constexpr (clear) {
 			bits.UnsetRange(start, end);
+			if (bits.None()) {
+				GetSummary<source>().store(false, std::memory_order_release);
+			}
 			if constexpr (source == DirtySource::Cpu) {
 				UpdateProtection<true, false>();
 			} else {
@@ -169,6 +186,24 @@ private:
 		}
 	}
 
+	template <DirtySource source>
+	std::atomic<bool>& GetSummary() {
+		if constexpr (source == DirtySource::Cpu) {
+			return m_cpu_maybe_dirty;
+		} else {
+			return m_gpu_maybe_dirty;
+		}
+	}
+
+	template <DirtySource source>
+	const std::atomic<bool>& GetSummary() const {
+		if constexpr (source == DirtySource::Cpu) {
+			return m_cpu_maybe_dirty;
+		} else {
+			return m_gpu_maybe_dirty;
+		}
+	}
+
 	[[nodiscard]] std::pair<size_t, size_t> GetPageRange(uint64_t vaddr, uint64_t size) const {
 		if (size == 0 || vaddr < m_cpu_addr || vaddr >= m_cpu_addr + TRACKER_REGION_SIZE ||
 		    size > m_cpu_addr + TRACKER_REGION_SIZE - vaddr) {
@@ -183,6 +218,8 @@ private:
 	uint64_t     m_cpu_addr = 0;
 	RegionBits   m_cpu_dirty;
 	RegionBits   m_gpu_dirty;
+	std::atomic<bool> m_cpu_maybe_dirty {true};
+	std::atomic<bool> m_gpu_maybe_dirty {false};
 	RegionBits   m_writable;
 	RegionBits   m_readable;
 };

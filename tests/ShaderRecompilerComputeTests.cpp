@@ -160,6 +160,10 @@ struct BufferCacheTestAccess {
     cache.m_critical_gc_memory = critical;
   }
 
+  static void PresentFrames(BufferCache &cache, uint64_t frames) {
+    cache.m_graphics.presented_frames.fetch_add(frames);
+  }
+
   static StreamBuffer &DownloadBuffer(BufferCache &cache) {
     return cache.m_download_buffer;
   }
@@ -229,6 +233,8 @@ struct TextureCacheTestAccess {
     cache.m_pressure_gc_memory = pressure;
     cache.m_critical_gc_memory = UINT64_MAX;
     cache.m_gc_tick = tick;
+    cache.m_gc_freed_bytes_frame = 0;
+    cache.m_gc_freed_images_frame = 0;
     std::vector<ImageId> live;
     cache.m_lru_cache = {};
     cache.m_slot_images.ForEach([&](ImageId id, Image &image) {
@@ -4019,6 +4025,7 @@ public:
       cache.FillBuffer(base + second_offset, sizeof(second_value), second_value,
                        false);
 
+      BufferCacheTestAccess::PresentFrames(cache, 8);
       for (uint32_t tick = 0; tick < 160; tick++) {
         cache.RunGarbageCollector();
       }
@@ -4037,20 +4044,43 @@ public:
       Libs::LibKernel::Memory::TryReadBacking(base + second_offset,
                                               &second_before_completion,
                                               sizeof(second_before_completion));
-      Require(name, "normal dirty retention",
-              first_before_completion == first_stale &&
-                  second_before_completion == second_stale &&
-                  cache.IsRegionRegistered(base, allocation_size) &&
-                  cache.IsRegionGpuModified(base + first_offset,
-                                            sizeof(first_value)) &&
-                  cache.IsRegionGpuModified(base + second_offset,
-                                            sizeof(second_value)) &&
+      Require(name, "normal dirty publication",
+              first_before_completion == first_value &&
+                  second_before_completion == second_value &&
+                  !cache.IsRegionRegistered(base, allocation_size) &&
+                  !cache.IsRegionGpuModified(base + first_offset,
+                                             sizeof(first_value)) &&
+                  !cache.IsRegionGpuModified(base + second_offset,
+                                             sizeof(second_value)) &&
+                  !cache.HasGpuDirtyBytes(base + first_offset,
+                                          sizeof(first_value)) &&
+                  !cache.HasGpuDirtyBytes(base + second_offset,
+                                          sizeof(second_value)) &&
+                  scheduler.CurrentTick() > gc_submission_tick,
+              "normal GC retained or failed to publish an aged dirty Buffer");
+
+      Libs::LibKernel::Memory::WriteBacking(base + first_offset, &first_stale,
+                                            sizeof(first_stale));
+      Libs::LibKernel::Memory::WriteBacking(base + second_offset, &second_stale,
+                                            sizeof(second_stale));
+      MarkGpuWrite(base + first_offset, sizeof(first_value));
+      MarkGpuWrite(base + second_offset, sizeof(second_value));
+      cache.FillBuffer(base + first_offset, sizeof(first_value), first_value,
+                       false);
+      cache.FillBuffer(base + second_offset, sizeof(second_value), second_value,
+                       false);
+      BufferCacheTestAccess::SetGarbageCollectionThresholds(
+          cache, std::numeric_limits<uint64_t>::max(),
+          std::numeric_limits<uint64_t>::max());
+      BufferCacheTestAccess::PresentFrames(cache, 8);
+      for (uint32_t tick = 0; tick < 160; tick++) {
+        cache.RunGarbageCollector();
+      }
+      Require(name, "re-armed dirty Buffer",
+              cache.IsRegionRegistered(base, allocation_size) &&
                   cache.HasGpuDirtyBytes(base + first_offset,
-                                         sizeof(first_value)) &&
-                  cache.HasGpuDirtyBytes(base + second_offset,
-                                         sizeof(second_value)) &&
-                  scheduler.CurrentTick() == gc_submission_tick,
-              "normal GC retired or synchronized a dirty Buffer");
+                                         sizeof(first_value)),
+              "the re-armed dirty Buffer was reclaimed without pressure");
       BufferCacheTestAccess::SetGarbageCollectionThresholds(cache, 0, 0);
       const auto older_publication_tick = scheduler.CurrentTick();
       std::binary_semaphore older_publication_entered{0};
@@ -4113,6 +4143,7 @@ public:
         cache.FillBuffer(address, sizeof(starvation_value), starvation_value,
                          false);
       }
+      BufferCacheTestAccess::PresentFrames(cache, 8);
       for (uint32_t tick = 0; tick < 160; tick++) {
         cache.RunGarbageCollector();
       }
@@ -4123,37 +4154,39 @@ public:
       Require(name, "normal-GC clean candidate",
               static_cast<bool>(starvation_clean),
               "failed to create the clean starvation candidate");
+      BufferCacheTestAccess::PresentFrames(cache, 8);
       for (uint32_t tick = 0; tick <= 160; tick++) {
         cache.RunGarbageCollector();
       }
       BufferCacheTestAccess::SetGarbageCollectionThresholds(
           cache, 0, std::numeric_limits<uint64_t>::max());
+      const auto starvation_retired =
+          BufferCacheTestAccess::PageOwner(cache, base + starvation_offset);
       cache.RunGarbageCollector();
+      cache.RunGarbageCollector();
+      uint32_t starvation_first_backing = 0;
+      uint32_t starvation_last_backing = 0;
+      std::memcpy(&starvation_first_backing, memory + starvation_offset,
+                  sizeof(starvation_first_backing));
+      std::memcpy(&starvation_last_backing,
+                  memory + starvation_offset +
+                      (starvation_count - 1) * starvation_stride,
+                  sizeof(starvation_last_backing));
       Require(
-          name, "normal-GC dirty bypass",
-          cache.IsRegionRegistered(base + starvation_offset,
-                                   sizeof(starvation_value)) &&
-              cache.IsRegionRegistered(
+          name, "normal-GC dirty publication",
+          starvation_first_backing == starvation_value &&
+              starvation_last_backing == starvation_value &&
+              !cache.IsRegionRegistered(base + starvation_offset,
+                                        sizeof(starvation_value)) &&
+              !cache.IsRegionRegistered(
                   base + starvation_offset +
                       (starvation_count - 1) * starvation_stride,
                   sizeof(starvation_value)) &&
               !cache.IsRegionRegistered(base + starvation_clean_offset,
-                                        sizeof(starvation_value)),
-          "old dirty owners hid an eligible clean Buffer from normal GC");
-      BufferCacheTestAccess::SetGarbageCollectionThresholds(cache, 0, 0);
-      const auto starvation_retired =
-          BufferCacheTestAccess::PageOwner(cache, base + starvation_offset);
-      cache.RunGarbageCollector();
-      Require(name, "critical-GC starvation cleanup",
-              !cache.IsRegionRegistered(base + starvation_offset,
                                         sizeof(starvation_value)) &&
-                  !cache.IsRegionRegistered(
-                      base + starvation_offset +
-                          (starvation_count - 1) * starvation_stride,
-                      sizeof(starvation_value)) &&
-                  !BufferCacheTestAccess::IsBufferAllocated(
-                      cache, starvation_retired),
-              "critical GC did not immediately free the skipped dirty owners");
+              !BufferCacheTestAccess::IsBufferAllocated(cache,
+                                                        starvation_retired),
+          "normal GC retained aged dirty owners or hid the clean Buffer");
 
       constexpr uint64_t lookup_only_offset = 0x218000;
       constexpr uint64_t obtained_offset = 0x220000;
@@ -4166,6 +4199,7 @@ public:
           base + lookup_only_offset, residency_size);
       const auto obtained =
           cache.FindBuffer(base + obtained_offset, residency_size);
+      BufferCacheTestAccess::PresentFrames(cache, 8);
       for (uint32_t tick = 0; tick <= 160; tick++) {
         cache.RunGarbageCollector();
       }
@@ -4275,6 +4309,7 @@ public:
               "failed to allocate the near-capacity dirty native buffer");
       cache.FillBuffer(base + large_offset, large_size, large_value, false);
       const auto large_submission_tick = scheduler.CurrentTick();
+      BufferCacheTestAccess::PresentFrames(cache, 8);
       for (uint32_t tick = 0; tick <= 160; tick++) {
         cache.RunGarbageCollector();
       }
@@ -4335,6 +4370,7 @@ public:
                        grouped_first_value, false);
       cache.FillBuffer(base + grouped_second_offset, grouped_owner_size,
                        grouped_second_value, false);
+      BufferCacheTestAccess::PresentFrames(cache, 8);
       for (uint32_t tick = 0; tick <= 160; tick++) {
         cache.RunGarbageCollector();
       }
@@ -4437,6 +4473,7 @@ public:
                       cache, base + sparse_offset + sparse_owner_stride),
               "sparse GC fixtures merged into one source owner");
       const auto sparse_gc_tick = scheduler.CurrentTick();
+      BufferCacheTestAccess::PresentFrames(cache, 8);
       for (uint32_t tick = 0; tick <= 160; ++tick) {
         cache.RunGarbageCollector();
       }
@@ -4465,6 +4502,7 @@ public:
                                sizeof(disjoint_value), true, false);
       cache.FillBuffer(base + disjoint_dirty_offset, sizeof(disjoint_value),
                        disjoint_value, false);
+      BufferCacheTestAccess::PresentFrames(cache, 8);
       for (uint32_t tick = 0; tick <= 160; tick++) {
         cache.RunGarbageCollector();
       }
@@ -4527,6 +4565,7 @@ public:
                                sizeof(reacquire_value), true, false);
       cache.FillBuffer(base + reacquire_dirty_offset, sizeof(reacquire_value),
                        reacquire_value, false);
+      BufferCacheTestAccess::PresentFrames(cache, 8);
       for (uint32_t tick = 0; tick <= 160; tick++) {
         cache.RunGarbageCollector();
       }
@@ -24002,14 +24041,14 @@ TestCase BranchVccnzUsesWaveMask() {
   return test;
 }
 
-TestCase ScalarMemRealtimeCapturedPlaceholder() {
+TestCase ScalarMemRealtimeReadsDeviceClock() {
   using O = ShaderOpcode;
   namespace D = ShaderRecompiler::Decoder;
 
   std::vector<u32> code = {0xf4940300u, 0xfa000000u};
   D::Instruction decoded;
   D::DecodeInstruction(code, 0, decoded);
-  Require("ScalarMemRealtimeCapturedPlaceholder", "decode",
+  Require("ScalarMemRealtimeReadsDeviceClock", "decode",
           decoded.opcode == O::S_MEMREALTIME && decoded.word_count == 2 &&
               decoded.dst.kind == D::OperandKind::Sgpr && decoded.dst.reg == 12 &&
               decoded.data_dwords == 2 && decoded.src_count == 0 &&
@@ -24020,11 +24059,14 @@ TestCase ScalarMemRealtimeCapturedPlaceholder() {
   code.insert(code.end(), {0xf4940300u, 0xfa000000u});
   AppendStoreSgprPair(&code, 12, 2);
   AppendEnd(&code);
-  return {"ScalarMemRealtimeCapturedPlaceholder",
-          code,
-          {},
-          {UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX},
-          {O::S_MEMREALTIME, O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  TestCase test{"ScalarMemRealtimeReadsDeviceClock",
+                code,
+                {},
+                {},
+                {O::S_MEMREALTIME, O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
+  test.required_spirv = {"OpReadClockKHR"};
+  test.compile_only = true;
+  return test;
 }
 
 TestCase ScalarMemoryLoadVariants() {
@@ -30240,7 +30282,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(SiblingSharedExitKeepsCapturedConditions);
   AddCase(BranchVccnzUsesWaveMask);
   AddCase(BranchVccnzUsesCarryProducedWaveMask);
-  AddCase(ScalarMemRealtimeCapturedPlaceholder);
+  AddCase(ScalarMemRealtimeReadsDeviceClock);
   AddCase(ScalarMemoryLoadVariants);
   AddCase(ScalarBufferOffsetAlignmentAndCarry);
   AddCase(ScalarLoadSignedImmediateOffsetAddsSoffset);
@@ -30729,9 +30771,9 @@ void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride) {
                                   .domain = 1,
                                   .partitioning = 2,
                                   .output_topology = 2};
-  AnalyzeTessellationPrograms(local, control, tess);
   Require(name, "decoded interface",
-          tess.ls_stride == ls_stride && tess.hs_stride == hs_stride,
+          AnalyzeTessellationPrograms(local, control, tess) &&
+              tess.ls_stride == ls_stride && tess.hs_stride == hs_stride,
           "captured LS and HS address arithmetic must produce distinct strides");
 
   constexpr std::array stages{ShaderType::Local, ShaderType::TessellationControl,
@@ -35062,7 +35104,7 @@ int main(int argc, char **argv) {
   CheckLeastRecentlyUsedCacheOrdering();
   if (argc == 2 && std::strcmp(argv[1], "--s-memrealtime-only") == 0) {
     VulkanHarness vulkan;
-    RunCase(&vulkan, ScalarMemRealtimeCapturedPlaceholder());
+    RunCase(&vulkan, ScalarMemRealtimeReadsDeviceClock());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--packed-integer-neg-only") == 0) {

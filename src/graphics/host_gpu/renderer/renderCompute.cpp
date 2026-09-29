@@ -258,6 +258,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
 	if (!compute_program) {
 		// Temporary until RT is implemented.
+		ResetBindings();
 		return;
 	}
 	if (use_thread_dimensions) {
@@ -419,6 +420,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
 	if (!compute_program) {
 		// Temporary until RT is implemented.
+		ResetBindings();
 		return;
 	}
 	buffer.EndRendering();

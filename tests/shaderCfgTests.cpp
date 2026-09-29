@@ -3948,6 +3948,7 @@ void TestNewShaderRecompilerScalarB64Alu() {
       EncodeSop1(0x10, 30, 26),       // s_bcnt1_i32_b64 s30, s[26:27]
       EncodeSop1(0x14, 31, 26),       // s_ff1_i32_b64 s31, s[26:27]
       EncodeSop1(0x16, 106, 26),      // s_flbit_i32_b64 vcc_lo, s[26:27]
+      0xbeea1a0bu,                   // s_sext_i32_i16 vcc_lo, s11
       EncodeSop1(0x3b, 32, 30),       // s_bitreplicate_b64_b32 s[32:33], s30
       EncodeSop2(0x29, 34, 32, 255), // s_bfe_u64 s[34:35], s[32:33], 0x00040002
       0x00040002u,
@@ -4005,6 +4006,8 @@ void TestNewShaderRecompilerScalarB64Alu() {
         "new decoder did not decode RDNA2 S_FF1_I32_B64");
   Check((result.decoded_dump.find("s_flbit_i32_b64 vcc_lo, s26") != std::string::npos),
         "new decoder did not decode RDNA2 S_FLBIT_I32_B64");
+  Check((result.decoded_dump.find("s_sext_i32_i16 vcc_lo, s11") != std::string::npos),
+        "new decoder did not decode S_SEXT_I32_I16");
   Check((result.decoded_dump.find("s_bitreplicate_b64_b32 s32, s30") != std::string::npos),
         "new decoder did not decode old-backed S_BITREPLICATE_B64_B32");
   Check((result.decoded_dump.find("s_bfe_u64 s34, s32, 0x00040002") != std::string::npos),

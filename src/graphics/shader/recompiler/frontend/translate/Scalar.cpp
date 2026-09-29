@@ -208,6 +208,11 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 		case O::S_FF1_I32_B64: return S_FF1_I32_B64(inst);
 		case O::S_FLBIT_I32_B32: return V_FFBH_32(inst, false);
 		case O::S_FLBIT_I32_B64: return S_FLBIT_I32_B64(inst);
+		case O::S_SEXT_I32_I16:
+			WriteOperand(DestinationOperand(inst),
+			             ir.Emit(IR::ValueOpcode::BitFieldSExtract,
+			                     {ReadU32(inst.src0), IR::Value(0u), IR::Value(16u)}));
+			return;
 
 		case O::S_BITSET0_B32: return S_BITSET_B32(inst, false);
 		case O::S_BITSET1_B32: return S_BITSET_B32(inst, true);

@@ -13015,9 +13015,12 @@ void TestSrtWalkerRealSBufferTranslation() {
             std::equal(flat.begin(), flat.end(), table.begin()),
         "real S_BUFFER_LOAD walk did not align offset components independently");
 
+  // Past num_records a dword reads as zero (PS5 ISA, scalar buffer addressing).
   user_data[10] = 3 * sizeof(uint32_t);
   const auto bounds_walked = ShaderRecompiler::IR::SrtWalker(ir, runtime).RefreshFlatBuffer(flat);
-  Check(!bounds_walked, "real S_BUFFER_LOAD walk ignored descriptor bounds");
+  Check(bounds_walked && flat.size() == 4 &&
+            std::equal(flat.begin(), flat.begin() + 3, table.begin()) && flat[3] == 0u,
+        "real S_BUFFER_LOAD walk did not read zero past the descriptor bounds");
   CheckFlattenedReadSlots(
       ir, 4, "real S_BUFFER_LOAD patch used the wrong flat offsets");
 

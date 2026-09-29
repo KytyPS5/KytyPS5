@@ -9,8 +9,10 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <functional>
@@ -167,6 +169,23 @@ bool CaptureOrdinaryRead(void* userdata, uint64_t address, std::span<uint32_t> v
 
 bool WrittenBuffersDisjoint(const ResourcePlan& program, const ResourceSnapshot& snapshot,
                             std::span<const std::pair<uint64_t, uint64_t>> reads) {
+	// Research: say which written buffer overlapped which read (capped), and
+	// KYTY_IGNORE_WRITTEN_OVERLAP=1 skips the check, to test what a skipped dispatch costs.
+	static const bool ignore = std::getenv("KYTY_IGNORE_WRITTEN_OVERLAP") != nullptr;
+	static std::atomic<uint32_t> reported {0};
+	const auto report = [&](uint32_t index, uint64_t base, uint64_t size, uint64_t address,
+	                        uint64_t bytes) {
+		if (reported.fetch_add(1, std::memory_order_relaxed) < 32) {
+			std::fprintf(stderr,
+			             "written buffer overlap: hash=0x%016llx buffer %u base=0x%llx size=0x%llx"
+			             " read=0x%llx bytes=0x%llx%s\n",
+			             static_cast<unsigned long long>(program.shader_hash), index,
+			             static_cast<unsigned long long>(base), static_cast<unsigned long long>(size),
+			             static_cast<unsigned long long>(address),
+			             static_cast<unsigned long long>(bytes), ignore ? " (ignored)" : "");
+		}
+		return ignore;
+	};
 	for (uint32_t i = 0; i < program.info.buffers.size(); ++i) {
 		if (!program.info.buffers[i].written) continue;
 		ShaderBufferResource buffer;
@@ -179,7 +198,9 @@ bool WrittenBuffersDisjoint(const ResourcePlan& program, const ResourceSnapshot&
 			if (bytes == 0u) continue;
 			if (address > AddressMask || bytes - 1u > AddressMask - address ||
 			    (address <= base ? base - address < bytes : address - base < size)) {
-				return false;
+				if (!report(i, base, size, address, bytes)) {
+					return false;
+				}
 			}
 		}
 	}

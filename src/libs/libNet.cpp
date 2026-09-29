@@ -7,8 +7,11 @@
 #include "libs/network.h"
 #include "loader/symbolDatabase.h"
 
+#include <algorithm>
 #include <cctype>
+#include <cstddef>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <string>
@@ -162,6 +165,16 @@ int KYTY_SYSV_ABI NetSetsockopt(int s, int level, int optname, const void* optva
 	return FinishSocketCall(Net::Setsockopt(s, level, optname, optval, optlen));
 }
 
+int KYTY_SYSV_ABI NetSend(int s, const void* buf, size_t len, int flags) {
+	const auto size = std::min<size_t>(len, std::numeric_limits<int>::max());
+	return FinishSocketCall(static_cast<int>(Net::Send(s, buf, size, flags | 0x20000)));
+}
+
+int KYTY_SYSV_ABI NetRecv(int s, void* buf, size_t len, int flags) {
+	const auto size = std::min<size_t>(len, std::numeric_limits<int>::max());
+	return FinishSocketCall(static_cast<int>(Net::Recv(s, buf, size, flags)));
+}
+
 uint32_t KYTY_SYSV_ABI NetHtonl(uint32_t host32) {
 	return ((host32 & 0x000000ffu) << 24u) | ((host32 & 0x0000ff00u) << 8u) |
 	       ((host32 & 0x00ff0000u) >> 8u) | ((host32 & 0xff000000u) >> 24u);
@@ -206,6 +219,8 @@ LIB_DEFINE(InitNet_1_Net) {
 	LIB_FUNC("Q4qBuN-c0ZM", LibNet::NetSocket);
 	LIB_FUNC("45ggEzakPJQ", LibNet::NetSocketClose);
 	LIB_FUNC("2mKX2Spso7I", LibNet::NetSetsockopt);
+	LIB_FUNC("beRjXBn-z+o", LibNet::NetSend);
+	LIB_FUNC("9wO9XrMsNhc", LibNet::NetRecv);
 	LIB_FUNC("9T2pDF2Ryqg", LibNet::NetHtonl);
 	LIB_FUNC("iWQWrwiSt8A", LibNet::NetHtons);
 	LIB_FUNC("pQGpHYopAIY", LibNet::NetNtohl);
@@ -276,7 +291,7 @@ static char* CopyUriPart(char*& dst, const UriPart& part) {
 }
 
 static int ParseEmptyUri(SceHttpUriElement* out, void* pool, size_t* require, size_t prepare) {
-	constexpr size_t needed = 3;
+	constexpr size_t needed = 4;
 
 	if (require != nullptr) {
 		*require = needed;
@@ -295,10 +310,12 @@ static int ParseEmptyUri(SceHttpUriElement* out, void* pool, size_t* require, si
 		auto* dst        = static_cast<char*>(pool);
 		out->scheme      = dst++;
 		out->hostname    = dst++;
-		out->path        = dst;
+		out->path        = dst++;
+		out->query       = dst;
 		out->scheme[0]   = '\0';
 		out->hostname[0] = '\0';
 		out->path[0]     = '\0';
+		out->query[0]    = '\0';
 	}
 
 	return 0;
@@ -459,6 +476,9 @@ static int KYTY_SYSV_ABI HttpUriParse(SceHttpUriElement* out, const char* src_ur
 			needed += part.len + 1;
 		}
 	}
+	if (query.begin == nullptr) {
+		needed += 1;
+	}
 
 	if (require != nullptr) {
 		*require = needed;
@@ -481,7 +501,12 @@ static int KYTY_SYSV_ABI HttpUriParse(SceHttpUriElement* out, const char* src_ur
 		out->password = CopyUriPart(dst, password);
 		out->hostname = CopyUriPart(dst, hostname);
 		out->path     = CopyUriPart(dst, path);
-		out->query    = CopyUriPart(dst, query);
+		if (query.begin == nullptr) {
+			out->query    = dst++;
+			out->query[0] = '\0';
+		} else {
+			out->query = CopyUriPart(dst, query);
+		}
 		out->fragment = CopyUriPart(dst, fragment);
 	}
 
@@ -1527,6 +1552,10 @@ struct NpEntitlementAccessAddcontEntitlementInfo {
 	uint32_t                  download_status;
 };
 
+struct NpEntitlementAccessEntitlementKey {
+	uint8_t data[16];
+};
+
 static constexpr NpEntitlementAccessAddcontEntitlementInfo NP_ENTITLEMENT_ACCESS_ADDON_LIST[] = {
     {{{"85y-je"}, {}}, 3, 4}, // GTA V hash 0xf4315381
     {{{"5d5c48"}, {}}, 3, 4}, // GTA V hash 0x961c34b0
@@ -1613,12 +1642,31 @@ static int KYTY_SYSV_ABI NpEntitlementAccessGetAddcontEntitlementInfo(
 	return NP_ENTITLEMENT_ACCESS_ERROR_NO_ENTITLEMENT;
 }
 
+static int KYTY_SYSV_ABI NpEntitlementAccessGetEntitlementKey(
+    uint32_t service_label, const NpUnifiedEntitlementLabel* entitlement_label,
+    NpEntitlementAccessEntitlementKey* key) {
+	PRINT_NAME();
+
+	LOGF("\t service_label     = %" PRIu32 "\n"
+	     "\t entitlement_label = 0x%016" PRIx64 "\n"
+	     "\t key               = 0x%016" PRIx64 "\n",
+	     service_label, reinterpret_cast<uint64_t>(entitlement_label),
+	     reinterpret_cast<uint64_t>(key));
+
+	if (entitlement_label == nullptr || key == nullptr) {
+		return NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER;
+	}
+
+	return NP_ENTITLEMENT_ACCESS_ERROR_NO_ENTITLEMENT;
+}
+
 LIB_DEFINE(InitNet_1_NpEntitlementAccess) {
 	LIB_FUNC("jO8DM8oyego", LibNpEntitlementAccess::NpEntitlementAccessInitialize);
 	LIB_FUNC("lPDO62PpJIA", LibNpEntitlementAccess::NpEntitlementAccessGetSkuFlag);
 	LIB_FUNC("TFyU+KFBv54",
 	         LibNpEntitlementAccess::NpEntitlementAccessGetAddcontEntitlementInfoList);
 	LIB_FUNC("xddD23+8TfQ", LibNpEntitlementAccess::NpEntitlementAccessGetAddcontEntitlementInfo);
+	LIB_FUNC("5LiMEPuW0DQ", LibNpEntitlementAccess::NpEntitlementAccessGetEntitlementKey);
 }
 
 } // namespace LibNpEntitlementAccess
@@ -3721,6 +3769,21 @@ namespace LibGameLiveStreaming {
 
 LIB_VERSION("GameLiveStreaming", 1, "GameLiveStreaming", 1, 1);
 
+constexpr int GAME_LIVE_STREAMING_ERROR_INVALID_PARAM = -2136997886;
+
+struct GameLiveStreamingStatus2 {
+	int32_t  user_id;
+	bool     is_on_air;
+	uint32_t spectator_count;
+	uint32_t text_message_count;
+	uint32_t command_message_count;
+	uint8_t  reserved[52];
+};
+
+static_assert(sizeof(GameLiveStreamingStatus2) == 72);
+static_assert(offsetof(GameLiveStreamingStatus2, is_on_air) == 4);
+static_assert(offsetof(GameLiveStreamingStatus2, spectator_count) == 8);
+
 static int KYTY_SYSV_ABI GameLiveStreamingInitialize(size_t heap_size) {
 	PRINT_NAME();
 
@@ -3735,9 +3798,34 @@ static int KYTY_SYSV_ABI GameLiveStreamingTerminate() {
 	return 0;
 }
 
+static int KYTY_SYSV_ABI GameLiveStreamingGetCurrentStatus2(GameLiveStreamingStatus2* status) {
+	PRINT_NAME();
+
+	if (status == nullptr) {
+		return GAME_LIVE_STREAMING_ERROR_INVALID_PARAM;
+	}
+
+	std::memset(status, 0, sizeof(*status));
+	status->user_id = -1;
+	return OK;
+}
+
+static int KYTY_SYSV_ABI GameLiveStreamingGetSocialFeedbackMessagesCount(int type, uint32_t* count) {
+	PRINT_NAME();
+
+	if (type < 1 || type > 3 || count == nullptr) {
+		return GAME_LIVE_STREAMING_ERROR_INVALID_PARAM;
+	}
+
+	*count = 0;
+	return OK;
+}
+
 LIB_DEFINE(InitPlatform_1_GameLiveStreaming) {
 	LIB_FUNC("kvYEw2lBndk", LibGameLiveStreaming::GameLiveStreamingInitialize);
 	LIB_FUNC("9yK6Fk8mKOQ", LibGameLiveStreaming::GameLiveStreamingTerminate);
+	LIB_FUNC("lK8dLBNp9OE", LibGameLiveStreaming::GameLiveStreamingGetCurrentStatus2);
+	LIB_FUNC("yeQKjHETi40", LibGameLiveStreaming::GameLiveStreamingGetSocialFeedbackMessagesCount);
 }
 
 } // namespace LibGameLiveStreaming

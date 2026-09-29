@@ -256,7 +256,7 @@ void Shutdown() {
 int Network::PoolCreate(const char* name, int size) {
 	Common::LockGuard lock(m_mutex);
 
-	for (int id = 0; id < POOLS_MAX; id++) {
+	for (int id = 1; id < POOLS_MAX; id++) {
 		if (!m_pools[id].used) {
 			m_pools[id].used = true;
 			m_pools[id].size = size;
@@ -1003,6 +1003,7 @@ static int ConvertHostSocketError(int error) {
 		case ENOBUFS: posix_error = Posix::POSIX_ENOBUFS; break;
 		case ENOMEM: posix_error = Posix::POSIX_ENOMEM; break;
 		case ENOTSOCK: posix_error = Posix::POSIX_ENOTSOCK; break;
+		case EPIPE: posix_error = Posix::POSIX_EPIPE; break;
 		case EPROTONOSUPPORT: posix_error = Posix::POSIX_EPROTONOSUPPORT; break;
 		default: break;
 	}

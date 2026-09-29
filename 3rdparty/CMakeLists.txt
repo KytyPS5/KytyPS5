@@ -29,7 +29,7 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(xbyak zydis)
 
 set(SDL_SHARED OFF CACHE BOOL "" FORCE)
-add_subdirectory(SDL2)
+add_subdirectory(SDL3)
 
 add_library(Vulkan-Headers INTERFACE)
 add_library(Vulkan::Headers ALIAS Vulkan-Headers)
@@ -86,6 +86,9 @@ set(SPDLOG_BUILD_WARNINGS OFF CACHE BOOL "" FORCE)
 set(SPDLOG_INSTALL OFF CACHE BOOL "" FORCE)
 set(SPDLOG_FMT_EXTERNAL ON CACHE BOOL "" FORCE)
 set(SPDLOG_NO_EXCEPTIONS ON CACHE BOOL "" FORCE)
+if(WIN32)
+	set(SPDLOG_WCHAR_FILENAMES ON CACHE BOOL "" FORCE)
+endif()
 add_subdirectory(spdlog EXCLUDE_FROM_ALL)
 
 if (NOT TARGET FFmpeg::ffmpeg)

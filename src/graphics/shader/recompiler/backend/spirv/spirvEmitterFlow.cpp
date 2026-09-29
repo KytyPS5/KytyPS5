@@ -559,6 +559,10 @@ void EmitVoid(ValueEmitContext&) {}
 
 void EmitBarrier(EmitterState& state) {
 	const auto tessellation = state.program.stage == ShaderType::TessellationControl;
+	if (!tessellation && ShaderWorkgroupInput(state.program.stage, state.input_info) == nullptr) {
+		// Independent graphics invocations have no native workgroup left to synchronize.
+		return;
+	}
 	const auto memory_scope = tessellation ? spv::ScopeInvocation : spv::ScopeWorkgroup;
 	const auto semantics    = tessellation ? spv::MemorySemanticsMaskNone
 	                                       : spv::MemorySemanticsAcquireReleaseMask |

@@ -90,6 +90,7 @@ QString KeyName(const QKeyEvent& event) {
 	}
 
 	switch (key) {
+		case Qt::Key_Space: return QStringLiteral("Space");
 		case Qt::Key_Return:
 		case Qt::Key_Enter: return QStringLiteral("Return");
 		case Qt::Key_Backspace: return QStringLiteral("Backspace");
@@ -132,8 +133,7 @@ public:
 
 		auto* layout = new QVBoxLayout(this);
 		m_label      = new QLabel(
-		    tr("Press a key or mouse button.\nSpace, F1, F7, and F11 are reserved; Esc cancels."),
-		    this);
+		    tr("Press a key or mouse button.\nF1, F7, and F11 are reserved; Esc cancels."), this);
 		m_label->setAlignment(Qt::AlignCenter);
 		layout->addWidget(m_label);
 	}
@@ -149,8 +149,8 @@ protected:
 			reject();
 			return;
 		}
-		if (event->key() == Qt::Key_Space || event->key() == Qt::Key_F1 ||
-		    event->key() == Qt::Key_F7 || event->key() == Qt::Key_F11) {
+		if (event->key() == Qt::Key_F1 || event->key() == Qt::Key_F7 ||
+		    event->key() == Qt::Key_F11) {
 			m_label->setText(tr("That key is reserved by the emulator."));
 			return;
 		}

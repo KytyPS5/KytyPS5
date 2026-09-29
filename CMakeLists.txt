@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.12...4.3)
+cmake_minimum_required(VERSION 3.16...4.3)
 
 if(CMAKE_VERSION VERSION_GREATER_EQUAL 4.0)
 	set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "Minimum policy version for bundled dependencies")
@@ -11,6 +11,22 @@ if(NOT KYTY_GENERATOR_IS_MULTI_CONFIG AND NOT CMAKE_BUILD_TYPE)
 endif()
 
 project(Kyty)
+
+find_program(SCCACHE_PROGRAM sccache)
+find_program(CCACHE_PROGRAM ccache)
+
+foreach(lang IN ITEMS C CXX)
+    # An explicitly empty launcher disables caching for this language.
+    if(NOT DEFINED CMAKE_${lang}_COMPILER_LAUNCHER)
+        if(SCCACHE_PROGRAM)
+            set(CMAKE_${lang}_COMPILER_LAUNCHER "${SCCACHE_PROGRAM}")
+            message(STATUS "sccache enabled for ${lang}: ${SCCACHE_PROGRAM}")
+        elseif(CCACHE_PROGRAM)
+            set(CMAKE_${lang}_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+            message(STATUS "ccache enabled for ${lang}: ${CCACHE_PROGRAM}")
+        endif()
+    endif()
+endforeach()
 
 set(KYTY_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src")
 set(KYTY_TESTS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/tests")
@@ -285,6 +301,7 @@ set(gpu_blit_generated_dir "${PROJECT_BINARY_DIR}/gpu_blit_shaders")
 set(gpu_blit_shader_sources
 	"${gpu_tiler_shader_dir}/gpu_blit_fs_triangle.vert"
 	"${gpu_tiler_shader_dir}/gpu_blit_color_to_ms_depth.frag"
+	"${gpu_tiler_shader_dir}/gpu_video_out_overlay.frag"
 )
 foreach(shader_source IN LISTS gpu_blit_shader_sources)
 	get_filename_component(shader_name "${shader_source}" NAME_WE)
@@ -315,7 +332,7 @@ if (KYTY_CLANG_CL)
 	set_source_files_properties(${kyty_emulator_src} PROPERTIES COMPILE_FLAGS "-Wno-pragma-pack -Wno-deprecated-declarations -D_TIMESPEC_DEFINED")
 endif()
 
-set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL2-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak)
+set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL3::SDL3-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak)
 
 # Linux system libraries.
 if(LINUX)
@@ -325,7 +342,6 @@ endif()
 
 set(inc_headers
 	${KYTY_SOURCE_DIR}
-	${KYTY_THIRD_PARTY_DIR}/SDL2/include
 	${KYTY_THIRD_PARTY_DIR}/VulkanMemoryAllocator/include
 	${KYTY_THIRD_PARTY_DIR}/SPIRV-Tools/include
 	${KYTY_THIRD_PARTY_DIR}/SPIRV-Headers/include
@@ -396,6 +412,11 @@ add_executable(bit_array_tests EXCLUDE_FROM_ALL
 )
 target_include_directories(bit_array_tests PRIVATE ${inc_headers})
 
+add_executable(lru_cache_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/LruCacheTests.cpp"
+)
+target_include_directories(lru_cache_tests PRIVATE ${inc_headers})
+
 add_executable(ime_dialog_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ImeDialogTests.cpp"
 	"${KYTY_SOURCE_DIR}/libs/imeCommon.cpp"
@@ -449,6 +470,28 @@ add_executable(audio_out2_port_tests EXCLUDE_FROM_ALL
 )
 target_link_libraries(audio_out2_port_tests common fmt::fmt)
 target_include_directories(audio_out2_port_tests PRIVATE ${inc_headers})
+
+add_executable(ngs2_sampler_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/Ngs2SamplerTests.cpp"
+	"${KYTY_SOURCE_DIR}/loader/timer.cpp"
+)
+target_link_libraries(ngs2_sampler_tests common fmt::fmt LibAtrac9)
+target_include_directories(ngs2_sampler_tests PRIVATE ${inc_headers})
+
+add_executable(pad_haptics_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/PadHapticsTests.cpp"
+)
+target_link_libraries(pad_haptics_tests common fmt::fmt SDL3::SDL3-static)
+target_include_directories(pad_haptics_tests PRIVATE ${inc_headers})
+
+add_executable(save_data_memory_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/SaveDataMemoryTests.cpp"
+)
+target_link_libraries(save_data_memory_tests common fmt::fmt)
+target_include_directories(save_data_memory_tests PRIVATE ${inc_headers})
+
+add_kyty_full_emulator_test(http_uri_parse_tests
+	"${KYTY_TESTS_DIR}/HttpUriParseTests.cpp")
 
 add_executable(event_queue_lifetime_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/EventQueueLifetimeTests.cpp"
@@ -527,6 +570,7 @@ if(BUILD_TESTING)
 	add_test(NAME memory_tracker COMMAND $<TARGET_FILE:memory_tracker_tests>)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
+	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
 	add_test(NAME resource_materialization COMMAND $<TARGET_FILE:resource_materialization_tests>)
 	add_test(NAME resource_tracking COMMAND $<TARGET_FILE:resource_tracking_tests>)
@@ -534,6 +578,10 @@ if(BUILD_TESTING)
 	add_test(NAME kernel_file_system COMMAND $<TARGET_FILE:kernel_file_system_tests>)
 	add_test(NAME sync_on_address COMMAND $<TARGET_FILE:sync_on_address_tests>)
 	add_test(NAME audio_out2_port COMMAND $<TARGET_FILE:audio_out2_port_tests>)
+	add_test(NAME ngs2_sampler COMMAND $<TARGET_FILE:ngs2_sampler_tests>)
+	add_test(NAME pad_haptics COMMAND $<TARGET_FILE:pad_haptics_tests>)
+	add_test(NAME save_data_memory COMMAND $<TARGET_FILE:save_data_memory_tests>)
+	add_test(NAME http_uri_parse COMMAND $<TARGET_FILE:http_uri_parse_tests>)
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
 	add_test(NAME shader_recompiler_alignbyte
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --alignbyte-only)
@@ -589,6 +637,7 @@ if(BUILD_TESTING)
 		memory_tracker_tests
 		page_manager_tests
 		bit_array_tests
+		lru_cache_tests
 		shader_vertex_metadata_tests
 		resource_materialization_tests
 		resource_tracking_tests
@@ -598,6 +647,10 @@ if(BUILD_TESTING)
 		shader_recompiler_compute_tests
 		virtual_memory_allocation_tests
 		audio_out2_port_tests
+		ngs2_sampler_tests
+		pad_haptics_tests
+		save_data_memory_tests
+		http_uri_parse_tests
 	)
 endif()
 
@@ -655,7 +708,16 @@ if(KYTY_CLANG_CL)
 	)
 	add_custom_command(TARGET kyty_emulator POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different "${KYTY_THIRD_PARTY_DIR}/winpthread/bin/libwinpthread-1.dll" $<TARGET_FILE_DIR:kyty_emulator>/libwinpthread-1.dll)
 elseif(WIN32 OR LINUX)
-	set_target_properties(kyty_emulator PROPERTIES LINK_FLAGS "${KYTY_LD_OPTIONS} -Wl,-Map=${KYTY_EMULATOR_MAP_LINK_PATH}")
+	set_target_properties(kyty_emulator PROPERTIES LINK_FLAGS "${KYTY_LD_OPTIONS}")
+	# LINK_FLAGS is a space-delimited string: a -Map path containing spaces would
+	# be split into bogus arguments, so pass it as a discrete link option instead.
+	target_link_options(kyty_emulator PRIVATE "-Wl,-Map=${KYTY_EMULATOR_MAP_LINK_PATH}")
+endif()
+
+if(LINUX)
+    target_link_options(kyty_emulator PRIVATE
+        $<$<CONFIG:Release>:-Wl,--strip-all>
+    )
 endif()
 
 if(APPLE)

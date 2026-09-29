@@ -9,7 +9,7 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 
 class Value;
 
-using SrtMemoryReader = bool (*)(void* userdata, uint64_t address, uint32_t* value);
+using SrtMemoryReader = bool (*)(void* userdata, uint64_t address, std::span<uint32_t> values);
 
 struct SrtRuntime {
 	std::span<const uint32_t> user_data;
@@ -26,26 +26,42 @@ enum class RuntimeValueType { Any, Integer };
 void BuildSrtPlan(Program& program);
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
                           RuntimeValueType type = RuntimeValueType::Any);
-bool EvaluateUniformValues(const ResourcePlan& program, std::span<const Value> values,
-                            const SrtRuntime& runtime, std::span<uint32_t> results);
+// Uses the strict reader for values that affect shader specialization.
+SrtRuntime CleanRuntime(SrtRuntime runtime);
 
-bool EvaluateDescriptorSource(const ResourcePlan& program, uint32_t source,
-                              const SrtRuntime& runtime, DescriptorValue& result);
+// One memoized evaluation session shared by the entire shader resource refresh.
+class SrtWalker {
+public:
+	SrtWalker(const ResourcePlan& program, const SrtRuntime& runtime,
+	          std::span<const uint8_t> clean_flat_slots = {}, SrtWalker* clean_evaluator = nullptr,
+	          Value active_mask = {});
+	~SrtWalker();
+	SrtWalker(const SrtWalker&)            = delete;
+	SrtWalker& operator=(const SrtWalker&) = delete;
 
-// Evaluates one runtime snapshot transactionally. Scalar values and ReadConst results shared by
-// several descriptors are memoized once across the batch.
-bool EvaluateDescriptorSources(const ResourcePlan& program, std::span<const uint32_t> sources,
-                               const SrtRuntime& runtime, std::vector<DescriptorValue>& results);
+	bool Evaluate(Value value, uint32_t& result);
+	bool EvaluateDescriptor(uint32_t source, DescriptorValue& result);
+	// An empty span means that all sources are active.
+	std::span<const uint8_t> FindActiveSources();
+	bool RefreshFlatBuffer(std::vector<uint32_t>& flat);
 
-// Evaluates potentially reachable descriptor sources and the flattened immediate SRT with one
-// memoized scalar walk. Inactive descriptors are zero; on failure no destination is changed.
-bool EvaluateRuntimeSources(const ResourcePlan& program, std::span<const uint32_t> sources,
-                            const SrtRuntime& runtime, std::vector<DescriptorValue>& results,
-                            std::vector<uint32_t>& flat, std::span<const uint8_t> clean_flat_slots,
-                            std::vector<uint8_t>& active_sources);
+private:
+	static ResourcePlan::EvaluationContext& AcquireContext(const ResourcePlan& program);
+	static float Float32(uint64_t bits);
+	bool EvaluateWide(Value value, uint64_t& result);
+	bool Arg(const Inst& inst, size_t index, uint64_t& result);
+	bool EvaluatePhi(const Inst& inst, uint64_t& result);
+	bool EvaluateExtract(const Inst& inst, uint64_t& result);
+	bool EvaluateRawRead(const Inst& inst, uint64_t& result);
+	bool EvaluateInst(const Inst& inst, uint64_t& result);
 
-bool WalkSrt(const ResourcePlan& program, const SrtRuntime& runtime,
-             std::vector<uint32_t>& flat);
+	const ResourcePlan&              m_program;
+	SrtRuntime                      m_runtime;
+	std::span<const uint8_t>         m_clean_flat_slots;
+	SrtWalker*                      m_clean_evaluator = nullptr;
+	Value                           m_active_mask;
+	ResourcePlan::EvaluationContext& m_context;
+};
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
 

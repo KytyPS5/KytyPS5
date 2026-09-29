@@ -7,8 +7,11 @@
 #include <xbyak/xbyak.h>
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <unordered_map>
@@ -677,8 +680,8 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 		}
 		address = (base & ~uint64_t {3}) + byte_offset;
 	} else {
-		const auto relative = (immediate & ~int64_t {3}) +
-		                      static_cast<int64_t>(static_cast<uint32_t>(offset) & ~3u);
+		const auto relative =
+		    (immediate & ~int64_t {3}) + static_cast<int64_t>(static_cast<uint32_t>(offset) & ~3u);
 		if (!AddSignedAddress(base & ~uint64_t {3}, relative, address)) {
 			return false;
 		}
@@ -687,6 +690,13 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 	const auto reader = vector ? m_runtime.read_specialization_memory : m_runtime.read_memory;
 	if (reader != nullptr) {
 		if (!reader(m_runtime.userdata, address, {&word, 1})) {
+			// A failed load through a null base pointer sits on a path the shader guards with a
+			// null-pointer test and never executes. Its value cannot matter; failing would skip the
+			// dispatch.
+			if (base == 0) {
+				result = 0;
+				return true;
+			}
 			return false;
 		}
 	} else {

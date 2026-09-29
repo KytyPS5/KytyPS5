@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
+#include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 
 #include "common/assert.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
@@ -514,6 +515,11 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 			info.subgroup_ballot  = true;
 			info.subgroup_shuffle = true;
 			if (inst.GetOpcode() == ValueOpcode::DppMoveU32) {
+				info.subgroup_local_invocation_id = true;
+			}
+			if (inst.GetOpcode() == ValueOpcode::ReadLane &&
+			    MatchLaneReduction(inst, program.wave_size)) {
+				info.subgroup_arithmetic          = true;
 				info.subgroup_local_invocation_id = true;
 			}
 			break;

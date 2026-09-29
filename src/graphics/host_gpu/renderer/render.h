@@ -65,6 +65,9 @@ struct DrawIndexArgs {
 	uint32_t         first_instance             = 0;
 	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
 	uint32_t         render_target_slice_offset = 0;
+	// Research: the guest address of GPU-read indirect arguments (0: the counts above apply).
+	// index_addr is then the index buffer base and index_count its size in indices.
+	uint64_t         gpu_args                   = 0;
 };
 
 struct DrawAutoArgs {
@@ -74,6 +77,7 @@ struct DrawAutoArgs {
 	uint32_t         first_instance             = 0;
 	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
 	uint32_t         render_target_slice_offset = 0;
+	uint64_t         gpu_args                   = 0; // as DrawIndexArgs::gpu_args
 };
 
 struct SubmitInfo {
@@ -201,6 +205,11 @@ private:
 	                         DrawRenderState& state, vk::PrimitiveTopology topology,
 	                         const DrawEmitInfo& emit, const DrawIndexBufferSource& index_source,
 	                         bool primitive_restart_enable);
+	void ExecutePreparedDrawResolved(uint64_t submit_id, CommandBuffer& buffer,
+	                                 const DrawCallInfo& draw, DrawRenderState& state,
+	                                 vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
+	                                 const DrawIndexBufferSource& index_source,
+	                                 bool primitive_restart_enable);
 	[[nodiscard]] RenderState AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
 	                                               uint32_t color_count, RenderDepthInfo& depth,
 	                                               vk::ImageAspectFlags& feedback_aspects,

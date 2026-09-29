@@ -890,6 +890,25 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 	const auto* args_addr =
 	    reinterpret_cast<const void*>(m_draw_indirect_args_base_addr + data_offset);
 
+	// Research: the GPU reads its own arguments. A CPU read of arguments an earlier GPU pass
+	// wrote faults on the tracked page and drains the whole queue, once per draw. 8-bit indices
+	// (expanded on the host) and an unknown index buffer size keep the CPU read.
+	if (!indexed) {
+		DrawIndexAuto({.vertex_count   = 1,
+		               .instance_count = 1,
+		               .offset_source  = DrawOffsetSource::IndirectArgs,
+		               .gpu_args       = reinterpret_cast<uint64_t>(args_addr)});
+		return;
+	}
+	if (m_index_buffer_size != 0 && (m_index_type_and_size == 0 || m_index_type_and_size == 1)) {
+		DrawIndex({.index_count    = m_index_buffer_size,
+		           .index_addr     = reinterpret_cast<const void*>(m_index_base_addr),
+		           .instance_count = 1,
+		           .offset_source  = DrawOffsetSource::IndirectArgs,
+		           .gpu_args       = reinterpret_cast<uint64_t>(args_addr)});
+		return;
+	}
+
 	if (!indexed) {
 		DrawIndirectArgs args {};
 		std::memcpy(&args, args_addr, sizeof(args));

@@ -14,6 +14,7 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
 #include <cstring>
 #include <memory>
@@ -504,6 +505,22 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	return false;
 }
 
+// Reads guest memory for an upload. The guest can unmap memory a cached buffer still covers: AMM
+// maps streaming textures in blocks, and a texture upload once read one byte past the end of the
+// block it had mapped. Such bytes read as zero, like ObtainBufferForImage's direct path.
+static void ReadGuestForUpload(uint8_t* destination, uint64_t address, uint64_t size) {
+	if (!Libs::LibKernel::Memory::TryReadBacking(address, destination, size) &&
+	    !Libs::LibKernel::Memory::TryReadSparseBacking(address, destination, size)) {
+		static std::atomic<uint32_t> reported {0};
+		if (reported.fetch_add(1) < 16) {
+			LOGF("BufferCache: upload of unmapped guest memory 0x%016" PRIx64 " size=0x%" PRIx64
+			     " reads as zero\n",
+			     address, size);
+		}
+		std::memset(destination, 0, static_cast<size_t>(size));
+	}
+}
+
 vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
                                      uint64_t total_size) {
 	if (copies.empty()) {
@@ -514,7 +531,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	if (mapped != nullptr) {
 		for (auto& copy: copies) {
 			const auto address = buffer.CpuAddress() + copy.dstOffset;
-			std::memcpy(mapped + copy.srcOffset, reinterpret_cast<const void*>(address), copy.size);
+			ReadGuestForUpload(mapped + copy.srcOffset, address, copy.size);
 			copy.srcOffset += base_offset;
 		}
 		m_staging_buffer.Commit();
@@ -525,8 +542,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	                                         vk::BufferUsageFlagBits::eTransferSrc, total_size);
 	for (const auto& copy: copies) {
 		const auto address = buffer.CpuAddress() + copy.dstOffset;
-		std::memcpy(temporary->Mapped().data() + copy.srcOffset,
-		            reinterpret_cast<const void*>(address), copy.size);
+		ReadGuestForUpload(temporary->Mapped().data() + copy.srcOffset, address, copy.size);
 	}
 	temporary->Flush(0, total_size);
 	const auto handle = temporary->Handle();

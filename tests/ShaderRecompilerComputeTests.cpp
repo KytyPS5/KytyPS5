@@ -9389,6 +9389,9 @@ public:
       uint32_t mode;
       uint32_t expected_threads;
       bool transfer = false;
+      // The CPU writes the counts: a small CPU-written read, which the buffer cache would
+      // serve from its stream buffer, but the conversion reads them by device address.
+      bool cpu = false;
     };
     constexpr std::array cases{
         DispatchCase{{2, 1, 1}, 0x41u, 8},
@@ -9397,6 +9400,7 @@ public:
         DispatchCase{{1, 1, 0}, 0x41u, 0},
         DispatchCase{{3, 1, 1}, 0x41u, 12, true},
         DispatchCase{{8, 1, 1}, 0x61u, 8},
+        DispatchCase{{8, 1, 1}, 0x61u, 8, true, true},
     };
 
     // Separate DWORD descriptors preserve two owners until the indirect argument
@@ -9468,7 +9472,15 @@ public:
         const auto &test = cases[index];
         const auto args = argument_address(index);
         const auto output = base + index * case_size + BufferCache::CACHING_PAGESIZE + 0x100u;
-        if (test.transfer) {
+        if (test.cpu) {
+          std::memcpy(reinterpret_cast<void *>(args), test.dimensions.data(),
+                      sizeof(test.dimensions));
+          // What the write fault on a tracked page does.
+          Require(name, "CPU argument write",
+                  context.InvalidateMemory(args, sizeof(test.dimensions)) &&
+                      cache.IsRegionCpuModified(args, sizeof(test.dimensions)),
+                  "the CPU-written arguments are not CPU-modified");
+        } else if (test.transfer) {
           for (u32 i = 0; i < 3; i++) {
             auto [buffer, offset] = cache.ObtainBuffer(args + i * 4u, 4, true);
             buffer->Fill(offset, 4, test.dimensions[i]);
@@ -9485,8 +9497,9 @@ public:
         }
         std::array<u32, 3> stale{};
         Require(name, "GPU-only argument write",
-                LibKernel::Memory::TryReadBacking(args, stale.data(), sizeof(stale)) &&
-                    stale == std::array<u32, 3>{},
+                test.cpu ||
+                    (LibKernel::Memory::TryReadBacking(args, stale.data(), sizeof(stale)) &&
+                     stale == std::array<u32, 3>{}),
                 "argument publication changed the CPU backing before indirect dispatch");
         const auto first_owner = BufferCacheTestAccess::PageOwner(cache, args);
         const auto second_owner = BufferCacheTestAccess::PageOwner(cache, args + 8u);

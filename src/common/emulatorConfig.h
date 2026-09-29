@@ -80,6 +80,7 @@ struct ConfigOptions {
 	bool                   trophy_enabled              = true;
 	bool                   playgo_hack_enabled         = false;
 	bool                   skip_notice_screen          = false;
+	bool                   float_image_atomics_enabled = true;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	bool red_zone_protection_enabled = false;
 #endif
@@ -133,6 +134,7 @@ bool ReadbackLinearImagesEnabled();
 bool SyncRawImageBuffersEnabled();
 bool TessellationEnabled();
 bool TrophyEnabled();
+bool FloatImageAtomicsEnabled();
 bool PlayGoHackEnabled();
 bool SkipNoticeScreen();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS

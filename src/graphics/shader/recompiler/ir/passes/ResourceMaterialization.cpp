@@ -195,68 +195,13 @@ bool ReadScalarTable(uint64_t base, uint64_t size, uint64_t dynamic_offset,
 	       runtime.read_specialization_memory(runtime.userdata, address, prefix);
 }
 
-bool NormalizeIndirectStoreBuffer(DescriptorValue& value) {
-	ShaderBufferResource descriptor;
-	if (!DecodeBufferDescriptor(value, descriptor)) return false;
-	if (descriptor.Type() != 0u || descriptor.Format() == Prospero::BufferFormat::kInvalid ||
-	    descriptor.Base48() == 0u || descriptor.GetSize() == 0u) {
-		value.dwords.fill(0u);
-	} else if (descriptor.Stride() != 1u || descriptor.SwizzleEnabled() || descriptor.AddTid() ||
-	           descriptor.OutOfBounds() != 3u) {
-		return SpecializationFail("indirect buffer stores require linear byte bounds");
-	}
-	return true;
-}
-
-bool IsBoundedDescriptorTable(const ResourcePlan& program,
-                              const DescriptorSource::IndirectDescriptor& indirect) {
-	const auto* table = Source(program, indirect.table_source);
-	return indirect.sources.empty() && !indirect.selector &&
-	       indirect.workgroup_axis == UINT32_MAX && table != nullptr && table->dword_count == 4u;
-}
-
-template <typename Specialization, typename Normalize>
-bool MaterializeIndirectDescriptor(const ResourcePlan&                         program,
-                                   const DescriptorSource::IndirectDescriptor& indirect,
-                                   uint32_t resource_index, uint32_t dword_count,
-                                   const SrtRuntime& runtime, SrtWalker& clean,
-                                   ResourceSnapshot&             snapshot,
-                                   std::vector<DescriptorValue>& descriptors,
-                                   std::vector<Specialization>&  specializations,
-                                   uint32_t maximum_resources, Normalize&& normalize) {
-	const auto  descriptor_bytes = dword_count * sizeof(uint32_t);
-	const auto& sources = indirect.sources;
-	const auto* selector = indirect.selector ? &*indirect.selector : nullptr;
-	auto& keys = program.material_keys;
-	const auto children_begin = descriptors.size();
-	const auto root_resource = specializations[resource_index];
-	const auto intern_candidate = [&](const DescriptorValue& candidate, uint32_t& ordinal) {
-		ordinal = 0u;
-		if (candidate == descriptors[resource_index]) return true;
-		const auto found = std::find(descriptors.begin() + children_begin, descriptors.end(), candidate);
-		ordinal = static_cast<uint32_t>(found - descriptors.begin() - children_begin + 1u);
-		if (found == descriptors.end()) {
-			if (descriptors.size() >= maximum_resources) return false;
-			descriptors.push_back(candidate);
-			auto child = root_resource;
-			child.indirect_root = resource_index;
-			specializations.push_back(child);
-		}
-		return true;
-	};
-	const auto read_keys = [&](const ShaderBufferResource& material, uint64_t first,
-	                           uint64_t step, uint64_t count) {
-		keys.resize(count);
-		if (step == 4u) {
-			return ReadScalarTable(material.Base48(), material.GetSize(), first, runtime, keys);
-		}
-		for (auto& key: keys) {
-			if (!ReadScalarTable(material.Base48(), material.GetSize(), first, runtime, {&key, 1}))
-				return false;
-			first += step;
-		}
-		return true;
-	};
+		// --no-float-image-atomics turns the R32 float case off.
+		const bool float_atomic = float_image_atomics && base.atomic && !base.atomic64 &&
+		                          format == Prospero::BufferFormat::k32Float;
+		if (base.atomic &&
+		    (base.atomic64 ? format != Prospero::BufferFormat::k32_32UInt
+		                   : format != Prospero::BufferFormat::k32UInt &&
+		                         format != Prospero::BufferFormat::k32SInt && !float_atomic)) {
 	uint64_t table_base = 0;
 	uint64_t table_size = UINT64_MAX; // Scalar addresses have no buffer descriptor bounds.
 	if (sources.empty()) {
@@ -479,7 +424,8 @@ private:
 };
 
 static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSnapshot& snapshot,
-                                        ResourceSpecialization& specialization) {
+                                        ResourceSpecialization& specialization,
+                                        bool                    float_image_atomics) {
 	for (uint32_t i = 0; i < specialization.images.size(); i++) {
 		const auto& descriptor = snapshot.images[i];
 		auto&       image      = specialization.images[i];
@@ -543,12 +489,16 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		                              base.written && !base.read && !base.atomic;
 		image.numeric_class         = Prospero::SampledTextureNumericClass(format);
 		if (storage) {
-			if ((!raw_sint_storage && image.numeric_class == Prospero::TextureNumericClass::Sint) ||
+			if ((!raw_sint_storage && !base.atomic &&
+			     image.numeric_class == Prospero::TextureNumericClass::Sint) ||
 			    image.numeric_class == Prospero::TextureNumericClass::Unsupported) {
 				return SpecializationFail(
 				    fmt::format("storage image descriptor {} uses unsupported format {}", i,
 				                static_cast<uint32_t>(format)));
 			}
+			// Image atomics are integer operations on the raw 32-bit texel whatever the
+			// descriptor's numeric format; R32 float/sint texels keep their bits through the
+			// uint view.
 			if (raw_sint_storage || base.atomic) {
 				image.numeric_class = Prospero::TextureNumericClass::Uint;
 			}
@@ -1074,6 +1024,10 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	return plan;
 }
 
+int LastIndirectImageFailureLine() {
+	return g_indirect_failure_line;
+}
+
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
 	if (!program.resource_tracking_complete ||
@@ -1233,7 +1187,11 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		}
 	}
 	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
-	return BuildResourceSpecialization(program, snapshot, specialization);
+	if (!BuildResourceSpecialization(program, snapshot, specialization,
+	                                 runtime.float_image_atomics)) {
+		return FailIndirect(__LINE__);
+	}
+	return true;
 }
 
 void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization) {

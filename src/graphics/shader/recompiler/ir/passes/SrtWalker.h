@@ -18,6 +18,10 @@ struct SrtRuntime {
 	void*                     userdata                   = nullptr;
 	SrtMemoryReader           read_specialization_memory = nullptr;
 	std::span<const uint32_t> workgroup_counts;
+	// Accept image atomics on k32Float descriptors: upstream's float atomics, and integer atomics
+	// run as uint atomics on the raw bits. On by default, as in the emulator; the emulator passes
+	// --no-float-image-atomics through here.
+	bool                      float_image_atomics        = true;
 };
 
 class SrtReadCapture {

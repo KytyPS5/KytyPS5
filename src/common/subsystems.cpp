@@ -1,5 +1,7 @@
 #include "common/subsystems.h"
 
+#include <atomic>
+
 namespace Common {
 
 static Subsystems* g_active_subsystems = nullptr;
@@ -35,6 +37,11 @@ void Subsystems::EmergencyShutdown() {
 }
 
 void Subsystems::EmergencyShutdownActive() {
+	// Once only: a second fatal error must not re-enter hooks that are already running.
+	static std::atomic_flag started;
+	if (started.test_and_set()) {
+		return;
+	}
 	if (g_active_subsystems != nullptr) {
 		g_active_subsystems->EmergencyShutdown();
 	}

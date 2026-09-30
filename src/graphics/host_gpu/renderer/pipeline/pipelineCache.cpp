@@ -277,6 +277,12 @@ bool ReadShaderGuestMemoryPermissive(void*, uint64_t address, std::span<uint32_t
 	return true;
 }
 
+// Asked only after a read has already refused, so it re-probes and may well answer that the range
+// reads back now - that answer is itself the finding, not a contradiction.
+const char* DescribeShaderReadRefusal(void*, uint64_t address) {
+	return Libs::LibKernel::Memory::DescribeGpuBackingRefusal(address, sizeof(uint32_t));
+}
+
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
                      const std::vector<uint32_t>& spirv) {
 	if (!Config::GraphicsDebugDumpEnabled()) {
@@ -694,9 +700,11 @@ struct PipelineCache::ProgramCache {
 		if (!reported_shaders.insert(hash).second) {
 			return;
 		}
+		const auto reason = ShaderRecompiler::IR::LastMaterializeFailure();
 		PipelineCacheLog("shader resources unavailable, skipping this dispatch: "
-		                 "hash=0x{:016x} stage={} descriptor materialization failed",
-		                 hash, StageShortName(stage));
+		                 "hash=0x{:016x} stage={} descriptor materialization failed: {}",
+		                 hash, StageShortName(stage),
+		                 reason.empty() ? std::string_view {"no recorded reason"} : reason);
 	}
 
 	// A hardware ray-tracing intersect lowered to a constant miss: the shader runs, but its
@@ -810,12 +818,16 @@ struct PipelineCache::ProgramCache {
 
 		KYTY_PROFILER_BLOCK("ProgramCache::Get");
 		const auto user_data = std::span(params.user_data).first(params.user_data_count);
-		uint64_t   code_key  = 0;
-		{
-			KYTY_PROFILER_BLOCK("ProgramCache::ShaderCodeKey");
-			code_key = ShaderCodeKey(params.code, params.back_code);
-		}
-		auto& proven                     = unfoldable[code_key];
+		const auto code_size = UnfoldableCodeSize(params.code, params.back_code);
+		std::optional<uint64_t> code_key;
+		const auto              key = [&] {
+			if (!code_key.has_value()) {
+				KYTY_PROFILER_BLOCK("ProgramCache::ShaderCodeKey");
+				code_key = ShaderCodeKey(params.code, params.back_code);
+			}
+			return *code_key;
+		};
+		const auto& proven               = unfoldable.Find(code_size, key);
 		lookup_key.stage                 = stage;
 		lookup_key.hash                  = params.hash;
 		lookup_key.user_data_count       = params.user_data_count;
@@ -838,6 +850,8 @@ struct PipelineCache::ProgramCache {
 		    .shader_base                = params.Base(),
 		    .read_memory                = ReadShaderGuestMemoryPermissive,
 		    .read_specialization_memory = ReadShaderGuestMemory,
+		    .readable_extent            = ReadableShaderExtent,
+		    .describe_read_refusal      = DescribeShaderReadRefusal,
 		};
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			runtime.workgroup_counts = input_info.workgroup_counts;

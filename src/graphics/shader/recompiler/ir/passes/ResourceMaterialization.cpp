@@ -1,3 +1,4 @@
+#include <string_view>
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
 #include "common/assert.h"
@@ -19,6 +20,9 @@
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
+
+std::string& MaterializeFailure();
+
 namespace {
 
 constexpr uint64_t AddressMask             = 0x0000ffffffffffffull;
@@ -35,9 +39,21 @@ struct IndirectBuffer {
 	std::vector<DescriptorValue> descriptors;
 };
 
+// Not memoed, so a failing table fails on every draw; print each reason at every doubling.
 bool SpecializationFail(std::string_view message) {
-	std::fprintf(stderr, "shader resource specialization failed: %.*s\n",
-	             static_cast<int>(message.size()), message.data());
+	static std::mutex                                mutex;
+	static std::unordered_map<std::string, uint64_t> counts;
+	uint64_t                                         count = 0;
+	{
+		const std::lock_guard<std::mutex> lock(mutex);
+		count = ++counts[std::string(message)];
+	}
+	MaterializeFailure() = message;
+	if ((count & (count - 1u)) == 0u) {
+		std::fprintf(stderr, "shader resource specialization failed: %.*s (occurrence %llu)\n",
+		             static_cast<int>(message.size()), message.data(),
+		             static_cast<unsigned long long>(count));
+	}
 	return false;
 }
 
@@ -1854,11 +1870,42 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	return plan;
 }
 
-bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
-                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+// Materialization has a dozen distinct ways to refuse and the report carried none of them, so a
+// dropped dispatch said only that it was dropped. The last reason stands until the next attempt.
+std::string& MaterializeFailure() {
+	static thread_local std::string reason;
+	return reason;
+}
+
+std::string_view LastMaterializeFailure() {
+	return MaterializeFailure();
+}
+
+// The renderer treats a captured read inside a buffer the shader writes as fatal.
+static bool CapturedReadsAvoidWrittenBuffers(const ResourcePlan&     program,
+                                             const ResourceSnapshot& snapshot) {
+	for (uint32_t i = 0; i < program.info.buffers.size() && i < snapshot.buffers.size(); ++i) {
+		if (!program.info.buffers[i].written) continue;
+		ShaderBufferResource buffer;
+		if (!DecodeBufferDescriptor(snapshot.buffers[i], buffer)) continue;
+		const auto base = buffer.Base48();
+		const auto size = buffer.GetSize();
+		if (size == 0u) continue;
+		for (const auto [address, bytes]: snapshot.specialization_reads) {
+			if (bytes != 0u && address < base + size && base < address + bytes) {
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
+bool MaterializeInto(const ResourcePlan& program, const SrtRuntime& runtime,
+                     ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
+                     bool prune = true) {
 	if (!program.resource_tracking_complete ||
-	    ((program.requires_specialization_memory || !program.source_reads.empty()) &&
-	     runtime.read_specialization_memory == nullptr)) {
+	    (program.requires_specialization_memory && runtime.read_specialization_memory == nullptr)) {
+		MaterializeFailure() = "plan incomplete";
 		return false;
 	}
 	const bool capture_reads = program.capture_specialization_reads || !program.source_reads.empty();
@@ -1868,7 +1915,10 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	const auto observed = capture_reads ? capture.ObservedRuntime() : runtime;
 	SrtWalker clean(program, CleanRuntime(observed));
 	SrtWalker walker(program, observed, program.clean_flat_slots, &clean);
-	if (!walker.RefreshFlatBuffer(snapshot.flattened_srt)) {
+	FlatRefreshFailure flat_failure;
+	if (!walker.RefreshFlatBuffer(snapshot.flattened_srt, &flat_failure, prune)) {
+		MaterializeFailure() =
+		    fmt::format("flat srt refresh: {}", DescribeFlatRefreshFailure(flat_failure));
 		return false;
 	}
 	const auto active = std::span<const uint8_t>(program.active_sources);
@@ -1890,6 +1940,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	}
 	const auto evaluate = [&](uint32_t source, DescriptorValue& value, bool written = false) {
 		if (source >= program.descriptor_sources.size()) {
+			MaterializeFailure() = "active source scan";
 			return false;
 		}
 		if (active.empty() || active[source]) {
@@ -1913,17 +1964,25 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 				if (!clean.EvaluateDescriptor(source->indirect_buffer->heap_source, table) ||
 				    !MaterializeIndirectBuffer(*source->indirect_buffer, table, runtime,
 				                               program.shader_hash, resolved)) {
+					MaterializeFailure() = "buffer heap descriptor";
 					return false;
 				}
 				// Stage one binds the one descriptor the table can select. A table with more than
 				// one needs a runtime selection this snapshot cannot express, so the draw is
 				// refused and the shader falls back to the in-shader V# decode.
 				if (resolved.descriptors.size() > 1u) {
+					MaterializeFailure() = "buffer table not single";
 					return false;
 				}
 				snapshot.buffers[i] = resolved.descriptors[resolved.candidates[0]];
 			}
 		} else if (!evaluate(buffer.source, snapshot.buffers[i], buffer.written)) {
+			// Which buffer, and whether it was the table's own root, is what separates a
+			// loop-carried heap record from an ordinary descriptor that simply would not read.
+			MaterializeFailure() =
+			    fmt::format("buffer descriptor: buffer {} source {}{}{}", i, buffer.source,
+			                buffer.indirect_root == i ? " (indirect root)" : "",
+			                buffer.written ? " (written)" : "");
 			return false;
 		}
 		auto&                descriptor_value = snapshot.buffers[i];
@@ -1970,6 +2029,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		};
 		const auto* source = Source(program, image.source);
 		if (source == nullptr) {
+			MaterializeFailure() = "image source missing";
 			return false;
 		}
 		if (source->indirect_descriptor.has_value()) {
@@ -1978,11 +2038,29 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 				continue;
 			}
 			const auto& indirect = *source->indirect_descriptor;
-			if (!MaterializeIndirectImage(program, indirect, i, observed, clean, snapshot, specialization)) {
+			DescriptorValue material;
+			DescriptorValue table;
+			if (indirect.sources.empty() &&
+			    ((indirect.material_source != UINT32_MAX &&
+			      !clean.EvaluateDescriptor(indirect.material_source, material)) ||
+			     !clean.EvaluateDescriptor(indirect.table_source, table))) {
+				MaterializeFailure() =
+				    fmt::format("indirect image table at pc 0x{:08x}: its own handles are not "
+				                "host-evaluable",
+				                image.first_use_pc);
+				return false;
+			}
+			IndirectImageFailure indirect_failure;
+			if (!MaterializeIndirectImage(program, indirect, material, table, i, observed, clean,
+			                              snapshot, specialization, indirect_failure)) {
+				MaterializeFailure() =
+				    fmt::format("indirect image table at pc 0x{:08x}: {}", image.first_use_pc,
+				                DescribeIndirectImageFailure(indirect_failure));
 				return false;
 			}
 		} else {
 			if (!evaluate(image.source, snapshot.images[i], image.written)) {
+				MaterializeFailure() = "image descriptor";
 				return false;
 			}
 			if (!ValidImageDescriptor(snapshot.images[i], image.r128)) {
@@ -1994,14 +2072,8 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	PadIndirectImageShapes(program, snapshot, specialization);
 	snapshot.samplers.resize(program.info.samplers.size());
 	for (uint32_t i = 0; i < program.info.samplers.size(); ++i) {
-		auto source = program.info.samplers[i].source;
-		if (source >= program.descriptor_sources.size()) return false;
-		const auto& descriptor = program.descriptor_sources[source];
-		if (descriptor.indirect_descriptor) {
-			if (descriptor.indirect_descriptor->sources.empty()) return false;
-			source = descriptor.indirect_descriptor->sources[0];
-		}
-		if (!evaluate(source, snapshot.samplers[i])) {
+		if (!evaluate(program.info.samplers[i].source, snapshot.samplers[i])) {
+			MaterializeFailure() = "sampler descriptor";
 			return false;
 		}
 		if (program.info.samplers[i].gather_lod) {
@@ -2018,6 +2090,50 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
 	return BuildResourceSpecialization(program, snapshot, specialization) &&
 	       WriteIndirectImageSlots(program, snapshot, specialization);
+}
+
+// The caller holds one snapshot and one specialization per cached shader, and both outlive a
+// refused draw: the permutation lookup compares the specialization, so a half-written one names
+// a shape nothing was built for. Materialize aside and commit only when the whole draw resolves.
+//
+// Aside is a reused scratch pair, cleared rather than reconstructed so a warm draw allocates
+// nothing, and the commit is a copy rather than a move so the caller keeps the storage its own
+// descriptor writes already point at. Clearing is what makes reuse sound: every container then
+// grows from empty exactly as a fresh snapshot would, so no flattened-SRT slot a shader leaves
+// unwritten can carry another shader value.
+bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
+                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+	static thread_local ResourceSnapshot       next;
+	static thread_local ResourceSpecialization next_specialization;
+	const auto                                 reset = [] {
+		next.buffers.clear();
+		next.images.clear();
+		next.samplers.clear();
+		next.flattened_srt.clear();
+		next.user_data.clear();
+		next.key_feedback.clear();
+		next.uniform_fill = {};
+		next_specialization.buffers.clear();
+		next_specialization.images.clear();
+	};
+	reset();
+	if (!MaterializeInto(program, runtime, next, next_specialization)) {
+		return false;
+	}
+	// A branch condition read from a buffer the shader writes cannot prune blocks: walk them all.
+	if (!CapturedReadsAvoidWrittenBuffers(program, next)) {
+		reset();
+		if (!MaterializeInto(program, runtime, next, next_specialization, false)) {
+			return false;
+		}
+		if (!CapturedReadsAvoidWrittenBuffers(program, next)) {
+			MaterializeFailure() = "scalar reads overlap a buffer the shader writes";
+			return false;
+		}
+	}
+	snapshot       = next;
+	specialization = next_specialization;
+	return true;
 }
 
 const char* FirstSpecializationDifference(const ResourceSpecialization& before,

@@ -99,6 +99,71 @@ struct RuntimeValueFailure {
 
 [[nodiscard]] std::string_view RuntimeValueRejectName(RuntimeValueReject reason);
 
+// Why a raw SRT read refused at evaluation time, which a structural validation cannot see. The
+// first refusal after a flat refresh starts is kept: a later one may belong to a trial the walk
+// went on to abandon.
+enum class RawReadReject : uint8_t {
+	None,
+	MemoryIndexOutOfRange,
+	NoHandle,
+	HandleOperandUnavailable,
+	DescriptorOperandUnavailable,
+	NegativeImmediate,
+	AddTidIndexing,
+	SwizzledElementOutOfStride,
+	OutsideDescriptorBounds,
+	AddressOverflow,
+	ReadRefused,
+};
+
+[[nodiscard]] std::string_view RawReadRejectName(RawReadReject reason);
+
+// Why a loop-carried phi could not be reduced to the one value it holds on every iteration.
+// Separates "the host could never stand in for this" from "the entry value was not reachable".
+enum class PhiReject : uint8_t {
+	None,
+	Barred,
+	NoEntry,
+	EntryUnevaluable,
+	WebAssumptionConflict,
+	OperandVariesPerIteration,
+};
+
+[[nodiscard]] std::string_view PhiRejectName(PhiReject reason);
+
+// Names the opcode that stopped the walk, not only which dword refused.
+[[nodiscard]] std::string DescribeRuntimeFailure(const RuntimeValueFailure& failure);
+
+// Why a flat SRT refresh refused. The value cases separate a chain the walk cannot express from
+// one it can but whose guest memory would not answer - different bugs with the same symptom.
+struct FlatRefreshFailure {
+	enum class Stage : uint8_t {
+		None,
+		PlanIncomplete,
+		CleanSlotUnreadable,
+		OffsetOutOfRange,
+		ValueUnevaluable,
+	};
+
+	Stage               stage       = Stage::None;
+	uint32_t            flat_offset = 0;
+	RuntimeValueFailure value;
+	bool                value_is_expressible = false;
+	// The guest address the walk could not read, and why - asked for after the fact, so it can
+	// legitimately answer that the range reads back now.
+	uint64_t            read_address     = 0;
+	bool                has_read_address = false;
+	const char*         read_refusal     = nullptr;
+	RawReadReject       raw_read         = RawReadReject::None;
+	ValueOpcode         first_refusal     = ValueOpcode::Void;
+	bool                has_first_refusal = false;
+	PhiReject           phi               = PhiReject::None;
+	const char*         raw_read_operand = nullptr;
+	RuntimeValueFailure raw_read_operand_failure;
+};
+
+[[nodiscard]] std::string DescribeFlatRefreshFailure(const FlatRefreshFailure& failure);
+
 // Optionally reports why the first rejected instruction could not be re-executed. Pass a sink
 // only where that reason is logged: it is written at most once, and only when validation fails.
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
@@ -129,7 +194,9 @@ public:
 	bool Evaluate(Value value, uint32_t& result);
 	bool EvaluateDescriptor(uint32_t source, DescriptorValue& result);
 	// Refreshes reachable scalar reads and active descriptor sources in one walk.
-	bool RefreshFlatBuffer(std::vector<uint32_t>& flat);
+	// With prune clear every block counts as reachable and no branch condition is read.
+	bool RefreshFlatBuffer(std::vector<uint32_t>& flat, FlatRefreshFailure* failure = nullptr,
+	                       bool prune = true);
 
 private:
 	static ResourcePlan::EvaluationContext& AcquireContext(const ResourcePlan& program);
@@ -141,6 +208,7 @@ private:
 	bool EvaluateExtractU32x4(const Inst& inst, uint32_t component, uint64_t& result);
 	bool EvaluateRawRead(const Inst& inst, uint64_t& result, uint32_t component_bytes = 0u);
 	bool EvaluateInst(const Inst& inst, uint64_t& result);
+	bool EvaluateInstRule(const Inst& inst, uint64_t& result);
 
 	const ResourcePlan&              m_program;
 	SrtRuntime                      m_runtime;
@@ -154,6 +222,18 @@ private:
 	// Non-null only inside the per-lane sweep a readfirstlane runs, which is the one place a
 	// lane index has a value. Owned by the sweep, shared with any walk it starts.
 	LaneScope*                                m_lane = nullptr;
+	// The last guest read this walk refused, kept so a flat refresh can name the address rather
+	// than only the slot.
+	uint64_t                                  m_refused_read     = 0;
+	bool                                      m_has_refused_read = false;
+	RawReadReject                             m_raw_read_reject  = RawReadReject::None;
+	const char*                               m_raw_read_operand = nullptr;
+	// The first instruction to refuse after a flat refresh starts. Recursion unwinds innermost
+	// first, so the first refusal is the deepest one - the root, not its callers.
+	ValueOpcode                               m_first_refusal     = ValueOpcode::Void;
+	bool                                      m_has_first_refusal = false;
+	PhiReject                                 m_phi_reject        = PhiReject::None;
+	RuntimeValueFailure                       m_raw_read_operand_failure {};
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

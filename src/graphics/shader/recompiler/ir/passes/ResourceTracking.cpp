@@ -108,26 +108,6 @@ const char* StageName(ShaderType stage) {
 	}
 }
 
-// Names the instruction the host could not re-execute, so a rejected descriptor dword says which
-// opcode stopped the walk instead of only which dword. ValueOpcodeName is a string_view, so this
-// must stay inside fmt::format and out of any printf-style call.
-std::string DescribeRuntimeFailure(const RuntimeValueFailure& failure) {
-	if (failure.has_entry_opcodes) {
-		const auto operand = [](ValueOpcode opcode) {
-			return opcode == ValueOpcode::Void ? std::string_view("immediate")
-			                                   : ValueOpcodeName(opcode);
-		};
-		return fmt::format("{} {}, entries {} and {}", RuntimeValueRejectName(failure.reason),
-		                   ValueOpcodeName(failure.opcode), operand(failure.entry_opcode),
-		                   operand(failure.other_opcode));
-	}
-	if (failure.has_opcode) {
-		return fmt::format("{} {}", RuntimeValueRejectName(failure.reason),
-		                   ValueOpcodeName(failure.opcode));
-	}
-	return std::string(RuntimeValueRejectName(failure.reason));
-}
-
 uint32_t ByteExtent(const MemoryInfo& memory) {
 	const auto bytes = std::max((memory.data_bits + 7u) / 8u, 1u);
 	const auto count = std::max(memory.data_dwords, 1u);

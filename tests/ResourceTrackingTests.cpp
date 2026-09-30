@@ -1721,18 +1721,19 @@ void TestUniformizedMaterialImageKeys() {
             snapshot.flattened_srt[MappingOf(
                 snapshot, specialization.images[0].indirect_mapping_offset) + 3u] == 4096u,
         "material mask did not limit sparse descriptor reads");
+  // A read the shader's own buffer write overlaps is refused here, not left to
+  // the renderer.
   user_data[8] = first_material;
-  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            std::ranges::find(snapshot.specialization_reads,
-                std::pair<uint64_t, uint64_t>{first_material, 4}) !=
-                snapshot.specialization_reads.end(),
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization) &&
+            LastMaterializeFailure() ==
+                "scalar reads overlap a buffer the shader writes",
         "material key read was omitted from the renderer write-overlap check");
   user_data[8] = first_table;
-  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            std::ranges::find(snapshot.specialization_reads,
-                std::pair<uint64_t, uint64_t>{first_table, 32}) !=
-                snapshot.specialization_reads.end(),
-        "image descriptor read was omitted from the renderer write-overlap check");
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization) &&
+            LastMaterializeFailure() ==
+                "scalar reads overlap a buffer the shader writes",
+        "image descriptor read was omitted from the renderer write-overlap "
+        "check");
   CheckFatal([&] { make_plan(Variant::WrongUpdate); }, "not a valid runtime value",
              "non-clearing material mask was accepted");
   CheckFatal([&] { make_plan(Variant::WrongEquality); }, "not a valid runtime value",
@@ -4053,9 +4054,10 @@ void TestConservativeBufferReachability() {
     auto plan = ConditionalBufferPlan(use);
     ResourceSnapshot snapshot;
     ResourceSpecialization specialization;
+    // A condition read from a buffer the shader writes cannot prune, so every
+    // case keeps it.
     std::array<uint32_t, 4> expected{};
-    if (use != ConditionalBufferUse::Writable)
-      std::copy_n(user_data.begin() + 4, expected.size(), expected.begin());
+    std::copy_n(user_data.begin() + 4, expected.size(), expected.begin());
     Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
               snapshot.buffers.size() == 2 &&
               std::equal(expected.begin(), expected.end(),

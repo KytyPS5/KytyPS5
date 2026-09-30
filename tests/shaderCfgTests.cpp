@@ -10651,19 +10651,32 @@ void TestMergedShaderUserDataSnapshot() {
   Check(fan_input.mesh.primitives_per_group == 30 && fan_input.mesh.vertices_per_group == 32 &&
             fan_input.mesh.max_vertices == 256 && fan_input.mesh.max_primitives == 192,
         "captured triangle-fan GS configuration lost its subgroup assembly limits");
-  context.SetShaderStages(0x00482030u);
-  context.SetMaxOutputPerSubgroup(32);
-  context.SetGsMaxVertOut(32);
   user_config.SetPrimitiveType(Prospero::PrimitiveType::kPointList);
   user_config.SetGeControl({1, 1});
   regs.gs_regs.rsrc1.gs_vgpr_component_count = 0;
   regs.gs_regs.rsrc2.es_vgpr_component_count = 1;
+  struct FastLaunchCase {
+    uint32_t vertices;
+    uint32_t wave;
+    uint32_t threads;
+  };
+  const FastLaunchCase fast_cases[] = {{64, 32, 64}, {65, 32, 96}, {65, 64, 128}, {32, 32, 32}};
   ShaderVertexInputInfo fast_input{};
-  PrepareProgram(regs, context, user_config, fast_input);
-  Check(fast_input.mesh.fast_launch && fast_input.mesh.threads_num[0] == 32 &&
-            fast_input.mesh.primitives_per_group == 1 && fast_input.mesh.vertices_per_group == 1 &&
-            fast_input.mesh.max_vertices == 32 && fast_input.mesh.max_primitives == 32,
-        "captured fast-launch shader lost its per-group launch and output limits");
+  for (const auto &test : fast_cases) {
+    context.SetMaxOutputPerSubgroup(test.vertices);
+    context.SetGsMaxVertOut(test.vertices);
+    for (const bool merged : {false, true}) {
+      context.SetShaderStages(0x00082010u | (test.wave == 32 ? 0x00400000u : 0u) |
+                              (merged ? 0x20u : 0u));
+      regs.gs_regs.rsrc2.lds_size = merged ? 0 : 64;
+      PrepareProgram(regs, context, user_config, fast_input);
+      Check(fast_input.mesh.fast_launch && fast_input.mesh.wave_size == test.wave &&
+                fast_input.mesh.threads_num[0] == test.threads &&
+                fast_input.mesh.primitives_per_group == 1 && fast_input.mesh.vertices_per_group == 1 &&
+                fast_input.mesh.max_vertices == test.vertices && fast_input.mesh.max_primitives == test.vertices,
+            "fast-launch shader lost its per-group launch and output limits");
+    }
+  }
   auto ordinary_input = fast_input;
   ordinary_input.mesh.fast_launch = false;
   Check(MakeStageStaticKey(fast_input) != MakeStageStaticKey(ordinary_input),
@@ -10689,6 +10702,39 @@ void TestMergedShaderUserDataSnapshot() {
             SpirvSourceHasInstructionUsing(fast_source, "OpExecutionMode", "OutputPrimitivesEXT 32"),
         "fast-launch SPIR-V truncated the mesh output capacity");
 
+  ShaderUserData native_data{};
+  mapped.user_data = &native_data;
+  ShaderMapUserData(regs.es_regs.data_addr, mapped);
+  context.SetShaderStages(0);
+  context.SetMaxOutputPerSubgroup(64);
+  context.SetGsMaxVertOut(0);
+  user_config.SetPrimitiveType(Prospero::PrimitiveType::kTriList);
+  user_config.SetGeControl({64, 64});
+  ShaderVertexInputInfo native_input{};
+  const auto passthrough = PrepareProgram(regs, context, user_config, native_input);
+  Check(native_input.logical_stage == ShaderType::Vertex &&
+            passthrough.user_data_count == HW::UserSgprInfo::SGPRS_MAX,
+        "NGG without shared LDS did not retain the vertex path");
+  regs.gs_regs.rsrc2.lds_size = 64;
+  for (const auto primitive : {Prospero::PrimitiveType::kTriList,
+                               Prospero::PrimitiveType::kTriStrip}) {
+    user_config.SetPrimitiveType(primitive);
+    const auto params = PrepareProgram(regs, context, user_config, native_input);
+    Check(((uint64_t{params.user_data[1]} << 32u) | params.user_data[0]) ==
+              regs.gs_regs.user_data_addr,
+          "native GS did not initialize its s0:s1 user-data pointer");
+    const uint32_t primitives = primitive == Prospero::PrimitiveType::kTriList ? 21 : 62;
+    Check(native_input.logical_stage == ShaderType::Mesh &&
+              native_input.mesh.lds_size_dwords == 8192 &&
+              native_input.mesh.primitives_per_group == primitives &&
+              native_input.mesh.vertices_per_group == (primitives == 21 ? 63 : 64) &&
+              native_input.mesh.max_primitives == primitives &&
+              native_input.mesh.threads_num[0] == 64 && params.back_code.empty() &&
+              params.user_data_count == 8u + HW::UserSgprInfo::SGPRS_MAX &&
+              std::equal(std::begin(regs.gs_user_sgpr.value), std::end(regs.gs_user_sgpr.value),
+                         params.user_data.begin() + 8),
+          "native NGG lost its shared LDS, input assembly limits, or s8 user data");
+  }
 }
 
 void TestEmbeddedFetchPreservesSharedScalarLoad() {

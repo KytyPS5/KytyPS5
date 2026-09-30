@@ -38,7 +38,7 @@ struct RenderDepthInfo {
 	vk::StencilOpState          stencil_back;
 	ImageId                     image_id;
 
-	[[nodiscard]] vk::ImageAspectFlags AttachmentWriteAspects() const;
+	[[nodiscard]] vk::ImageAspectFlags AttachmentWriteAspects(bool include_clears = true) const;
 };
 
 inline vk::ImageAspectFlags DepthFeedbackAspects(vk::ImageAspectFlags draw_writes,

@@ -26,12 +26,13 @@ void SetThreadName(const char* name);
 
 void Initialize();
 void Shutdown();
+void EmergencyShutdown();
 
 struct Lifecycle {
 	static constexpr const char* name               = "Profiler";
 	static constexpr auto        initialize         = Profiler::Initialize;
 	static constexpr auto        shutdown           = Profiler::Shutdown;
-	static constexpr auto        emergency_shutdown = Profiler::Shutdown;
+	static constexpr auto        emergency_shutdown = Profiler::EmergencyShutdown;
 };
 
 } // namespace Profiler

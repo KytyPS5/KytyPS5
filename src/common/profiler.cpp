@@ -2,9 +2,11 @@
 
 #include "common/emulatorConfig.h"
 
+#include <chrono>
 #include <common/TracyProtocol.hpp>
 #include <common/TracyVersion.hpp>
 #include <cstdio>
+#include <thread>
 #include <tracy/Tracy.hpp>
 
 namespace Profiler {
@@ -29,6 +31,19 @@ void Initialize() {
 void Shutdown() {
 	if (tracy::ProfilerAvailable()) {
 		tracy::ShutdownProfiler();
+	}
+}
+
+// A connected server waits for zones this failing thread never closes; bound the wait.
+void EmergencyShutdown() {
+	if (!tracy::ProfilerAvailable()) {
+		return;
+	}
+	auto& profiler = tracy::GetProfiler();
+	profiler.RequestShutdown();
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+	while (!profiler.HasShutdownFinished() && std::chrono::steady_clock::now() < deadline) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(10));
 	}
 }
 

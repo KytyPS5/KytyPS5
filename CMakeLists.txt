@@ -303,8 +303,17 @@ list(APPEND kyty_emulator_src "${fault_buffer_shader_header}")
 list(APPEND kyty_emulator_src ${gpu_tiler_shader_headers})
 
 set(gpu_blit_generated_dir "${PROJECT_BINARY_DIR}/gpu_blit_shaders")
-function(add_gpu_blit_shader shader_name shader_file)
-	set(shader_source "${gpu_tiler_shader_dir}/${shader_file}")
+set(gpu_blit_shader_sources
+	"${gpu_tiler_shader_dir}/gpu_blit_fs_triangle.vert"
+	"${gpu_tiler_shader_dir}/gpu_blit_color_to_ms_depth.frag"
+	"${gpu_tiler_shader_dir}/gpu_video_out_overlay.frag"
+	"${gpu_tiler_shader_dir}/gpu_color_clear.frag"
+	"${gpu_tiler_shader_dir}/gpu_color_clear_uint.frag"
+	"${gpu_tiler_shader_dir}/gpu_color_clear_sint.frag"
+	"${gpu_tiler_shader_dir}/gpu_color_clear_classify.comp"
+)
+foreach(shader_source IN LISTS gpu_blit_shader_sources)
+	get_filename_component(shader_name "${shader_source}" NAME_WE)
 	set(shader_spv "${gpu_blit_generated_dir}/${shader_name}.spv")
 	set(shader_header "${gpu_blit_generated_dir}/${shader_name}_spv.h")
 	string(TOUPPER "${shader_name}_SPV" shader_symbol)

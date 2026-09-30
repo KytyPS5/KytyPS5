@@ -21,11 +21,14 @@
 #include <array>
 #include <bit>
 #include <cinttypes>
+#include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
 #include <optional>
 #include <span>
+#include <string_view>
 #include <tuple>
 #include <vulkan/vulkan_format_traits.hpp>
 
@@ -78,6 +81,37 @@ constexpr size_t MaxEmergencyReclaimImages = 256;
 [[nodiscard]] bool OverlapVictimPixelsAreUnrecoverable(const Image& image) {
 	return image.IsGpuModified() && !image.IsBufferModified() && !image.IsDefinitelyCpuDirty() &&
 	       !ImageOwnsGuestBytes(image);
+}
+
+// Every key DecodeColorClear can accept, in candidate order.
+constexpr std::array<uint8_t, 5> ColorClearDccCodes {0x00, 0x40, 0x80, 0xc0, 0x20};
+constexpr std::array<uint8_t, 1> ColorClearCmaskCodes {0x00};
+
+[[nodiscard]] constexpr uint32_t ColorClearCodeBit(uint8_t code) {
+	return 1u << (code >> 5u);
+}
+
+[[nodiscard]] bool BackingIsUniform(uint64_t address, uint64_t size, uint8_t value) {
+	std::array<uint8_t, 0x1000> chunk;
+	for (uint64_t offset = 0; offset < size; offset += chunk.size()) {
+		const auto bytes = std::min<uint64_t>(chunk.size(), size - offset);
+		if (!LibKernel::Memory::TryReadBacking(address + offset, chunk.data(), bytes)) {
+			EXIT("TextureCache: failed to read color metadata slice\n");
+		}
+		if (!std::all_of(chunk.begin(), chunk.begin() + bytes,
+		                 [value](uint8_t byte) { return byte == value; })) {
+			return false;
+		}
+	}
+	return true;
+}
+
+// A draw may flush a subnormal or quiet a NaN payload that a transfer clear keeps.
+[[nodiscard]] bool ColorSurvivesDraw(const std::array<float, 4>& color) {
+	return std::ranges::all_of(color, [](float value) {
+		const auto kind = std::fpclassify(value);
+		return kind != FP_NAN && kind != FP_SUBNORMAL;
+	});
 }
 
 [[nodiscard]] bool DecodeColorClear(const TextureCache::ImageDesc& desc, uint8_t code,
@@ -222,7 +256,7 @@ void ReportUploadSourceRefused(const Image& image) {
 TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler,
                            PageManager& page_manager, BufferCache& buffer_cache)
     : m_graphics(graphics), m_scheduler(scheduler), m_page_manager(page_manager),
-      m_blit_helper(graphics, scheduler),
+      m_blit_helper(graphics, scheduler), m_color_clear_helper(graphics, scheduler),
       m_tiler(graphics, scheduler, buffer_cache.GetUtilityBuffer(MemoryUsage::Stream)),
       m_buffer_cache(buffer_cache),
       m_readback_linear_images(Config::ReadbackLinearImagesEnabled()) {
@@ -1371,12 +1405,50 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	if (first >= layers || count > layers - first) {
 		EXIT("TextureCache: color view exceeds its native metadata slices\n");
 	}
-	// Finish native metadata writes before reading backing bytes. This can submit the scheduler,
-	// so discovery runs before final draw uploads and never holds the texture lock across it.
-	if (m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
+	const auto slice_size = range.size / layers;
+	// Only these keys can materialize, so metadata holding none of them never needs reading.
+	std::array<ColorClearHelper::Candidate, ColorClearHelper::MaxCandidates> candidates {};
+	uint32_t candidate_count = 0;
+	uint32_t candidate_codes = 0;
+	const bool cmask = desc.info.metadata.kind == ImageMetadataKind::Cmask;
+	for (const uint8_t code: cmask ? std::span<const uint8_t> {ColorClearCmaskCodes}
+	                               : std::span<const uint8_t> {ColorClearDccCodes}) {
+		vk::ClearColorValue color {};
+		if (DecodeColorClear(desc, code, color)) {
+			candidates[candidate_count++] = {code, color.uint32};
+			candidate_codes |= ColorClearCodeBit(code);
+		}
+	}
+	if (candidate_count == 0) {
+		return;
+	}
+	const auto view_range = GuestRange {range.address + slice_size * first, slice_size * count};
+	if (m_buffer_cache.IsRegionGpuModified(view_range.address, view_range.size)) {
+		const bool consume  = desc.type != BindingType::VideoOut;
+		bool       resolved = consume;
+		for (uint32_t slice = 0; slice < count && resolved; slice++) {
+			resolved = m_buffer_cache.IsMetadataClassified(view_range.address + slice_size * slice,
+			                                               slice_size, candidate_codes);
+		}
+		if (resolved) {
+			return;
+		}
+		if (MaterializeColorClearOnGpu(id, desc, first, image_first, count, slice_size,
+		                               std::span {candidates.data(), candidate_count})) {
+			if (consume) {
+				for (uint32_t slice = 0; slice < count; slice++) {
+					m_buffer_cache.MarkMetadataClassified(view_range.address + slice_size * slice,
+					                                      slice_size, candidate_codes);
+				}
+			}
+			return;
+		}
+		// Finish native metadata writes before reading backing bytes. This can submit the
+		// scheduler, so discovery runs before final draw uploads and never holds the texture lock
+		// across it.
+		KYTY_PROFILER_BLOCK("MaterializeColorClear metadata readback");
 		m_buffer_cache.ReadMemory(range.address, range.size, false);
 	}
-	const auto slice_size = range.size / layers;
 	for (uint32_t slice = 0; slice < count; slice++) {
 		const auto address = range.address + slice_size * (first + slice);
 		uint8_t code = 0;
@@ -1384,14 +1456,8 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			EXIT("TextureCache: failed to read color metadata backing\n");
 		}
 		vk::ClearValue clear {};
-		if (!DecodeColorClear(desc, code, clear.color)) {
-			continue;
-		}
-		std::vector<uint8_t> bytes(slice_size);
-		if (!LibKernel::Memory::TryReadBacking(address, bytes.data(), bytes.size())) {
-			EXIT("TextureCache: failed to read color metadata slice\n");
-		}
-		if (!std::all_of(bytes.begin(), bytes.end(), [code](uint8_t byte) { return byte == code; })) {
+		if (!DecodeColorClear(desc, code, clear.color) ||
+		    !BackingIsUniform(address, slice_size, code)) {
 			continue;
 		}
 		{
@@ -1410,11 +1476,101 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		// Publish the conversion's expanded keys without treating them as guest writes
 		// to overlapping image data. Invalidate the buffer before updating its backing.
 		if (desc.type != BindingType::VideoOut) {
-			std::fill(bytes.begin(), bytes.end(), uint8_t {0xff});
+			const std::vector<uint8_t> keys(slice_size, uint8_t {0xff});
 			m_buffer_cache.InvalidateMemory(address, slice_size);
-			LibKernel::Memory::WriteBacking(address, bytes.data(), bytes.size());
+			LibKernel::Memory::WriteBacking(address, keys.data(), keys.size());
 		}
 	}
+}
+
+bool TextureCache::MaterializeColorClearOnGpu(
+    ImageId id, const ImageDesc& desc, uint32_t first, uint32_t image_first, uint32_t count,
+    uint64_t slice_size, std::span<const ColorClearHelper::Candidate> candidates) {
+	const auto& view = desc.view_info;
+	if (desc.info.IsVolume() || count > ColorClearHelper::MaxSlices ||
+	    !m_color_clear_helper.SupportsFormat(view.format)) {
+		return false;
+	}
+	// An integer attachment takes the bits as they are; only a float output can alter them.
+	const std::string_view numeric = vk::componentNumericFormat(view.format, 0);
+	if (numeric != "UINT" && numeric != "SINT" &&
+	    !std::ranges::all_of(candidates, [](const ColorClearHelper::Candidate& candidate) {
+		    return ColorSurvivesDraw(std::bit_cast<std::array<float, 4>>(candidate.color));
+	    })) {
+		return false;
+	}
+	const auto address = desc.info.metadata.range.address + slice_size * first;
+	const auto size    = slice_size * count;
+	{
+		std::scoped_lock lock {m_lock};
+		auto&            image = m_slot_images[id];
+		if (image.backing.image == nullptr || image.depth_id ||
+		    !(image.backing.usage & vk::ImageUsageFlagBits::eColorAttachment)) {
+			return false;
+		}
+		// Registry entries and aliasing images need the side effects of a CPU fill.
+		const auto registered = m_surface_metas.lower_bound(address);
+		if (registered != m_surface_metas.end() && registered->first < address + size) {
+			return false;
+		}
+		static const bool strict_aliases = [] {
+			const char* text = std::getenv("KYTY_NO_COLOR_CLEAR_ALIAS_GPU");
+			return text != nullptr && std::strcmp(text, "0") != 0;
+		}();
+		for (const auto other: FindImagesInRegion(address, size, false)) {
+			const auto& alias = m_slot_images[other];
+			if (!strict_aliases && (other == id || !alias.IsGpuModified())) {
+				continue;
+			}
+			if (alias.Overlaps(address, size)) {
+				return false;
+			}
+		}
+		// Only the GPU knows whether the draw runs, so the image must hold the guest contents.
+		const auto dirty = [&] { return image.IsCpuDirty() || image.IsBufferModified(); };
+		if (dirty() && image.info.metadata.compression == VideoOutCompression::Uncompressed) {
+			RefreshImage(id);
+		}
+		if (dirty()) {
+			return false;
+		}
+	}
+	const bool  consume           = desc.type != BindingType::VideoOut;
+	const auto [metadata, offset] = m_buffer_cache.ObtainBuffer(address, size, consume);
+	const auto& limits            = m_graphics.physical_device_properties.limits;
+	const auto  alignment         = std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 1);
+	if (metadata == nullptr || offset % alignment != 0) {
+		return false;
+	}
+	KYTY_PROFILER_BLOCK("MaterializeColorClear GPU classify");
+	std::scoped_lock lock {m_lock};
+	auto&            image   = m_slot_images[id];
+	auto&            command = m_scheduler.Current();
+	TrackImage(id);
+	command.EndRendering();
+	const auto native = command.Handle();
+	m_color_clear_helper.Classify(native, metadata->Handle(), offset, slice_size, count,
+	                              candidates, consume);
+	const vk::Extent2D extent {std::max(image.info.extent.width >> view.base_level, 1u),
+	                          std::max(image.info.extent.height >> view.base_level, 1u)};
+	for (uint32_t slice = 0; slice < count; slice++) {
+		const auto    layer = image_first + slice;
+		ImageViewInfo info {};
+		info.format      = view.format;
+		info.type        = vk::ImageViewType::e2D;
+		info.base_level  = view.base_level;
+		info.level_count = 1;
+		info.base_layer  = layer;
+		info.layer_count = 1;
+		info.usage       = vk::ImageUsageFlagBits::eColorAttachment;
+		image.Transit(vk::ImageLayout::eColorAttachmentOptimal,
+		              vk::AccessFlagBits2::eColorAttachmentWrite,
+		              ImageSubresourceRange {view.base_level, 1, layer, 1}, native);
+		m_color_clear_helper.Draw(native, image.FindView(info), view.format, image.backing.samples,
+		                          extent, slice);
+	}
+	CommitGpuWrite(image);
+	return true;
 }
 
 void TextureCache::RefreshImage(ImageId id) {

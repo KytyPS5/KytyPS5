@@ -10,12 +10,15 @@
 #include "graphics/host_gpu/regionManager.h"
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/image/blitHelper.h"
+#include "graphics/host_gpu/renderer/image/colorClearHelper.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
 #include <atomic>
 #include <map>
 #include <mutex>
+#include <optional>
+#include <span>
 #include <string>
 #include <type_traits>
 #include <unordered_map>
@@ -252,6 +255,10 @@ private:
 	void                        RefreshImage(ImageId id);
 	void                        MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	                                                uint32_t metadata_base_layer);
+	// False when the target cannot take the GPU draw and the metadata must be read back.
+	[[nodiscard]] bool MaterializeColorClearOnGpu(
+	    ImageId id, const ImageDesc& desc, uint32_t first, uint32_t image_first, uint32_t count,
+	    uint64_t slice_size, std::span<const ColorClearHelper::Candidate> candidates);
 	void                        InitializeImage(ImageId id);
 	[[nodiscard]] bool          CanDownload(const Image& image) const;
 	void UploadImage(Image& image, Buffer& source, uint64_t source_offset);
@@ -288,6 +295,7 @@ private:
 	TrackingSpinLock                                  m_lock;
 	PageManager&                                      m_page_manager;
 	BlitHelper                                        m_blit_helper;
+	ColorClearHelper                                  m_color_clear_helper;
 	TileManager                                       m_tiler;
 	BufferCache&                                      m_buffer_cache;
 	Common::SlotVector<Image>                         m_slot_images;

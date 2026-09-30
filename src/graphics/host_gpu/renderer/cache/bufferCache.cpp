@@ -572,6 +572,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
+		ForgetClassifiedMetadata(vaddr, size);
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }
@@ -853,6 +854,33 @@ void BufferCache::MarkBdaStores(uint64_t vaddr, uint64_t size) {
 		TouchBuffer(buffer);
 		(void)SynchronizeBuffer(buffer, start, finish - start, true, false);
 		m_gpu_modified_ranges.Add(start, finish - start);
+		ForgetClassifiedMetadata(start, finish - start);
+	}
+}
+
+void BufferCache::MarkMetadataClassified(uint64_t vaddr, uint64_t size, uint32_t codes) {
+	if (!GuestRange {vaddr, size}.Valid()) {
+		EXIT("BufferCache: invalid classified-metadata range\n");
+	}
+	ForgetClassifiedMetadata(vaddr, size);
+	m_classified_metadata[vaddr] = {size, codes};
+	m_classified_span            = std::max(m_classified_span, size);
+}
+
+bool BufferCache::IsMetadataClassified(uint64_t vaddr, uint64_t size, uint32_t codes) const {
+	const auto found = m_classified_metadata.find(vaddr);
+	return found != m_classified_metadata.end() && found->second.size == size &&
+	       (codes & ~found->second.codes) == 0;
+}
+
+void BufferCache::ForgetClassifiedMetadata(uint64_t vaddr, uint64_t size) {
+	if (m_classified_metadata.empty()) {
+		return;
+	}
+	const auto end = vaddr + size;
+	auto       it  = m_classified_metadata.lower_bound(vaddr - std::min(vaddr, m_classified_span));
+	while (it != m_classified_metadata.end() && it->first < end) {
+		it = it->first + it->second.size > vaddr ? m_classified_metadata.erase(it) : std::next(it);
 	}
 }
 

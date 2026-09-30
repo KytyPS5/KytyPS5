@@ -90,6 +90,9 @@ public:
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+	// Metadata a GPU classification consumed holds none of `codes` until the next GPU write.
+	void               MarkMetadataClassified(uint64_t vaddr, uint64_t size, uint32_t codes);
+	[[nodiscard]] bool IsMetadataClassified(uint64_t vaddr, uint64_t size, uint32_t codes) const;
 	void               ProcessFaultBuffer();
 	// A BDA fault on an owned page can only come from a store, which promotes the page to tracked.
 	void               ResolveBdaFault(uint64_t vaddr, uint64_t size);
@@ -158,6 +161,12 @@ private:
 	template <bool async>
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	void MarkBdaStores(uint64_t vaddr, uint64_t size);
+	void ForgetClassifiedMetadata(uint64_t vaddr, uint64_t size);
+
+	struct ClassifiedMetadata {
+		uint64_t size  = 0;
+		uint32_t codes = 0;
+	};
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
@@ -173,6 +182,8 @@ private:
 	RangeSet                                          m_bda_tracked_ranges;
 	// Tracked since the last mark, so stores that ran before tracking are owned without a rerun.
 	RangeSet                                          m_bda_unmarked_ranges;
+	std::map<uint64_t, ClassifiedMetadata>            m_classified_metadata;
+	uint64_t                                          m_classified_span = 0;
 	MemoryTracker                                     m_memory_tracker;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;

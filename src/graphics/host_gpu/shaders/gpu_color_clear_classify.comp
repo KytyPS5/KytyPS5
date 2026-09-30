@@ -1,0 +1,71 @@
+#version 450
+
+// One workgroup per colour metadata slice.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+struct Record {
+	uint vertex_count;
+	uint instance_count;
+	uint first_vertex;
+	uint first_instance;
+	uvec4 color;
+};
+
+layout(std430, binding = 0) buffer metadata_buf {
+	uint metadata[];
+};
+
+layout(std430, binding = 1) writeonly buffer record_buf {
+	Record records[];
+};
+
+layout(push_constant) uniform Params {
+	uvec4 colors[5];
+	uvec2 codes;
+	uint  slice_words;
+	uint  code_count;
+	uint  consume;
+} params;
+
+shared uint uniform_slice;
+
+void main() {
+	const uint slice   = gl_WorkGroupID.x;
+	const uint first   = slice * params.slice_words;
+	const uint code    = metadata[first] & 0xffu;
+	const uint pattern = code * 0x01010101u;
+	if (gl_LocalInvocationIndex == 0u) {
+		uniform_slice = 1u;
+	}
+	barrier();
+	bool same = true;
+	for (uint i = gl_LocalInvocationIndex; same && i < params.slice_words; i += gl_WorkGroupSize.x) {
+		same = metadata[first + i] == pattern;
+	}
+	if (!same) {
+		uniform_slice = 0u;
+	}
+	barrier();
+	uint selected = params.code_count;
+	if (uniform_slice != 0u) {
+		for (uint k = 0u; k < params.code_count; ++k) {
+			const uint packed = k < 4u ? params.codes.x : params.codes.y;
+			if (((packed >> (8u * (k & 3u))) & 0xffu) == code) {
+				selected = k;
+			}
+		}
+	}
+	const bool matched = selected < params.code_count;
+	if (matched && params.consume != 0u) {
+		for (uint i = gl_LocalInvocationIndex; i < params.slice_words; i += gl_WorkGroupSize.x) {
+			metadata[first + i] = 0xffffffffu;
+		}
+	}
+	if (gl_LocalInvocationIndex == 0u) {
+		records[slice].vertex_count   = 3u;
+		records[slice].instance_count = matched ? 1u : 0u;
+		records[slice].first_vertex   = 0u;
+		records[slice].first_instance = 0u;
+		records[slice].color          = matched ? params.colors[selected] : uvec4(0u);
+	}
+}

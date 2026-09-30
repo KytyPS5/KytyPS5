@@ -12054,6 +12054,10 @@ public:
         FillCase{.fill = 0x20202020u, .texel = {0x0000ffffu},
                  .layout = Prospero::ChannelLayout::k16_16,
                  .type = Prospero::ChannelType::kUNorm, .clear_word = 0x0000ffffu},
+        // R32_UINT, cleared through the DCC register key: the draw must write integer bits.
+        FillCase{.fill = 0x20202020u, .texel = {0xfedcba98u, 0},
+                 .layout = Prospero::ChannelLayout::k32,
+                 .type = Prospero::ChannelType::kUInt, .clear_word = 0xfedcba98u},
     };
     EnsureRuntimeContext();
     // Astro's generic metadata fill, through S_ENDPGM; trailing debug data is omitted.
@@ -12112,6 +12116,7 @@ public:
       const auto bytes_per_pixel = TextureGetRenderTargetFormat(
           layout, type, Prospero::ChannelOrder::kStandard).bytes_per_element;
       const uint32_t probe_width = bytes_per_pixel == 2 ? 2 : 1;
+      const bool integer = type == Prospero::ChannelType::kUInt;
       TileSizeAlign dcc_size{};
       (void)TileGetDccSize(512, 256, 1, bytes_per_pixel, 1,
                           Prospero::TileMode::kRenderTarget, dcc_size, 0);
@@ -12216,6 +12221,9 @@ public:
         RenderDepthInfo no_depth{};
         const auto rendering = RenderExecutorTestAccess::AcquireRenderTargets(
             executor, scheduler.Current(), &color, 1, no_depth);
+        Require(name, "GPU-written metadata decided on the GPU",
+                context.GetBufferCache().IsRegionGpuModified(dcc_address, metadata_size),
+                "materializing a GPU-written clear drained its metadata back to the CPU");
         if (fill_case.reuse_unorm) {
           Require(name, "FLOAT clear reuses UNORM image",
                   color.image_id == preexisting_id &&
@@ -12276,6 +12284,9 @@ public:
         const auto paint = [&] {
           vk::ClearValue clear{};
           clear.color.float32 = std::array{1.0f, 0.0f, 1.0f, 1.0f};
+          if (integer) {
+            clear.color.uint32 = std::array{0x00c0ffeeu, 0u, 0u, 0u};
+          }
           TextureCacheTestAccess::ClearImage(
               texture_cache, scheduler.Current(), color.image_id,
               {vk::ImageAspectFlagBits::eColor, 0, 1, selected_layer, 1}, clear);
@@ -12285,6 +12296,8 @@ public:
           painted = {0x0000ffffu, 0xffffffffu};
         } else if (fill_case.cmask) {
           painted = {0xffff00ffu};
+        } else if (integer) {
+          painted = {0x00c0ffeeu};
         } else if (bytes_per_pixel <= 4) {
           const uint32_t one = type == Prospero::ChannelType::kFloat ? 0x3c00u : 0xffffu;
           painted = {bytes_per_pixel == 2 ? one | (one << 16u) : one};
@@ -12326,6 +12339,11 @@ public:
                 read_texel() == expected,
                 "a repeated metadata fill did not clear an already drawn target");
         paint();
+        bind();
+        Require(name, "GPU-consumed metadata stays consumed",
+                read_texel() == painted &&
+                    context.GetBufferCache().IsRegionGpuModified(dcc_address, metadata_size),
+                "rebinding GPU-consumed metadata reapplied its clear or drained it");
         WriteMetadata(context, dcc_address, metadata_size, UINT32_MAX);
         fill_metadata(metadata_words - 1);
         bind();
@@ -12542,6 +12560,40 @@ public:
               ReadCachedTexel(name, context, binding.image_id) ==
                   std::vector<u32>{0x3c003c00u, 0x00003c00u},
               "an existing sampled image retained the previous DCC clear");
+      auto &buffers = context.GetBufferCache();
+      (void)buffers.ObtainBuffer(dcc_address, metadata_size, true);
+      buffers.FillBuffer(dcc_address, metadata_size, 0x40404040u, false);
+      binding.image_id = cache.FindImage(binding.desc);
+      (void)cache.FindTexture(binding.image_id, binding.desc);
+      Require(name, "GPU-written sampled clear",
+              buffers.IsRegionGpuModified(dcc_address, metadata_size) &&
+                  ReadCachedTexel(name, context, binding.image_id, {3839, 2159, 0}) ==
+                      std::vector<u32>{0, 0x3c000000u},
+              "a GPU-written sampled clear was drained or not materialized");
+      buffers.ReadMemory(dcc_address, metadata_size);
+      Require(name, "GPU-written sampled clear expands native metadata",
+              LibKernel::Memory::TryReadBacking(dcc_address, expanded_metadata.data(),
+                                               expanded_metadata.size()) &&
+                  std::all_of(expanded_metadata.begin(), expanded_metadata.end(),
+                              [](uint8_t byte) { return byte == 0xff; }),
+              "the GPU materialization retained native clear keys");
+      // RESIDENT EVIL 3 samples a target whose metadata another image also covers. An alias that
+      // holds nothing newer than guest memory does not take the decision off the GPU.
+      auto alias = MakeLinearDesc(dcc_address, metadata_size, vk::Format::eR8Unorm,
+                                  Prospero::BufferFormat::k8UNorm, Prospero::ImageType::kColor2D,
+                                  {4096, static_cast<uint32_t>(metadata_size / 4096), 1}, 1, 1, 1);
+      const auto alias_id = cache.FindImage(alias);
+      (void)cache.FindTexture(alias_id, alias);
+      (void)buffers.ObtainBuffer(dcc_address, metadata_size, true);
+      buffers.FillBuffer(dcc_address, metadata_size, 0x80808080u, false);
+      binding.image_id = cache.FindImage(binding.desc);
+      (void)cache.FindTexture(binding.image_id, binding.desc);
+      Require(name, "sampled clear beside a metadata alias",
+              binding.image_id != alias_id &&
+                  buffers.IsRegionGpuModified(dcc_address, metadata_size) &&
+                  ReadCachedTexel(name, context, binding.image_id) ==
+                      std::vector<u32>{0x3c003c00u, 0x00003c00u},
+              "an alias holding only guest bytes drained the GPU-written clear");
       resources.UnmapMemory(base, allocation_size);
       scheduler.Finish();
       context.ShutdownGpu();

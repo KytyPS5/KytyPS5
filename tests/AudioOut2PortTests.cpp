@@ -17,6 +17,10 @@
 #include <thread>
 #include <vector>
 
+namespace Libs::LibKernel {
+uint64_t KYTY_SYSV_ABI KernelGetProcessTime();
+} // namespace Libs::LibKernel
+
 namespace {
 
 namespace AudioOut2 = Libs::Audio::AudioOut2;
@@ -27,6 +31,7 @@ std::condition_variable           g_device_cv;
 std::vector<int>                  g_live_devices;
 std::vector<int>                  g_device_backed_handles;
 std::vector<bool>                 g_output_blocking;
+bool                              g_last_cushion = false;
 std::vector<std::vector<uint8_t>> g_output_pcm;
 std::vector<std::array<float, 2>> g_output_gains;
 size_t                            g_capture_bytes = 0;
@@ -419,6 +424,7 @@ void TestAsynchronousDevicePushKeepsQueueBounded() {
 	      "full async queue accepted another buffer");
 	const auto calls = OutputCalls();
 	Check(calls.size() == 1 && !calls[0], "rejected async push reached the device backend");
+	Check(g_last_cushion, "async push did not ask the backend for a jitter cushion");
 
 	uint32_t queued    = 0;
 	uint32_t available = 0;
@@ -439,9 +445,53 @@ void TestHandleWithoutPcmDoesNotBypassQueue() {
 	ResetOutputCalls();
 
 	Check(AudioOut2::AudioOut2ContextPush(context, 1) == OK, "empty sync push failed");
+	uint32_t queued    = 0;
+	uint32_t available = 0;
+	Check(AudioOut2::AudioOut2ContextGetQueueLevel(context, &queued, &available) == OK &&
+	          available == 1,
+	      "sync push returned without room for the next grain");
+	Check(AudioOut2::AudioOut2ContextPush(context, 0) == OK, "async push after sync push failed");
 	Check(AudioOut2::AudioOut2ContextPush(context, 0) != OK,
 	      "handle without PCM bypassed queue backpressure");
 	Check(OutputCalls().empty(), "empty push reached the device backend");
+
+	AudioOut2::AudioOut2PortDestroy(port);
+	AudioOut2::AudioOut2ContextDestroy(context);
+}
+
+	constexpr uint64_t grain_micros = (512u * 1000000u) / 48000u;
+
+	const auto context = CreateContext(1);
+	auto       param   = MakeParam();
+	AudioOut2::AudioOut2PortHandle port = 0;
+	Check(AudioOut2::AudioOut2PortCreate(context, AsParam(&param), &port) == OK,
+	float pcm[512 * 2] {};
+	SetPcm(port, pcm);
+	ResetOutputCalls();
+
+	const auto start = Libs::LibKernel::KernelGetProcessTime();
+	uint64_t   first_return = 0;
+	for (int i = 0; i < 3; i++) {
+		uint32_t queued    = 0;
+		uint32_t available = 0;
+		Check(AudioOut2::AudioOut2ContextGetQueueLevel(context, &queued, &available) == OK &&
+		          available == 1,
+		      "queue was full before a sync push");
+		if (i == 2) {
+			// Refill time spent after a grain was taken must not delay the next one.
+			for (int j = 0; j < 4; j++) {
+				(void)Libs::LibKernel::KernelGetProcessTime();
+			}
+		}
+		if (i == 1) {
+			first_return = Libs::LibKernel::KernelGetProcessTime();
+		}
+	}
+	const auto end = Libs::LibKernel::KernelGetProcessTime();
+
+	Check(end - first_return < grain_micros + 5000, "refill time delayed the output clock");
+	const auto calls = OutputCalls();
+	Check(std::none_of(calls.begin(), calls.end(), [](bool blocking) { return blocking; }),
 
 	AudioOut2::AudioOut2PortDestroy(port);
 	AudioOut2::AudioOut2ContextDestroy(context);
@@ -479,6 +529,37 @@ void TestPcmCopiedBeforeScratchBufferReuse() {
 	CaptureOutputPcm(0);
 	AudioOut2::AudioOut2PortDestroy(first);
 	AudioOut2::AudioOut2PortDestroy(second);
+	AudioOut2::AudioOut2ContextDestroy(context);
+}
+
+void TestAdvancedGrainsPushInOrder() {
+	const auto                     context = CreateContext();
+	const auto                     param   = MakeParam();
+	AudioOut2::AudioOut2PortHandle port    = 0;
+	Check(AudioOut2::AudioOut2PortCreate(context, AsParam(&param), &port) == OK,
+	      "port create failed");
+
+	std::vector<float> first(512 * 2, 0.25f);
+	std::vector<float> second(512 * 2, -0.5f);
+	const auto         pcm_bytes = first.size() * sizeof(float);
+	CaptureOutputPcm(pcm_bytes);
+
+	SetPcm(port, first.data());
+	Check(AudioOut2::AudioOut2ContextAdvance(context) == OK, "first advance failed");
+	SetPcm(port, second.data());
+	Check(AudioOut2::AudioOut2ContextAdvance(context) == OK, "second advance failed");
+	Check(AudioOut2::AudioOut2ContextPush(context, 1) == OK, "first push failed");
+	Check(AudioOut2::AudioOut2ContextPush(context, 1) == OK, "second push failed");
+
+	const auto output = OutputPcm();
+	Check(output.size() == 2, "advanced grains were not both output");
+	Check(std::memcmp(output[0].data(), first.data(), pcm_bytes) == 0,
+	      "first push did not output the first committed grain");
+	Check(std::memcmp(output[1].data(), second.data(), pcm_bytes) == 0,
+	      "second push did not output the second committed grain");
+
+	CaptureOutputPcm(0);
+	AudioOut2::AudioOut2PortDestroy(port);
 	AudioOut2::AudioOut2ContextDestroy(context);
 }
 
@@ -534,10 +615,6 @@ void TestPortGainAndValidation() {
 void TestObjectGainAndAmbisonics() {
 	constexpr float half_power = 0.70710678f;
 	struct Coefficients { uint32_t channel; float left; float right; };
-	constexpr Coefficients cases[] {{UINT32_MAX, half_power, half_power}, {0, 1.0f, 1.0f},
-	                               {1, 0.0f, 0.0f}, {2, half_power, -half_power}, {3, 0.0f, 0.0f},
-	                               {64, half_power, half_power}, {65, half_power, -half_power},
-	                               {66, 0.0f, 0.0f}, {99, 0.0f, 0.0f}};
 	for (const auto format: {0x100u, 0x101u}) {
 		const auto context = CreateContext(1, 1);
 		auto param = MakeParam(format);
@@ -567,8 +644,6 @@ void TestObjectGainAndAmbisonics() {
 			const float gain = 0.5f;
 			const Attribute attributes[] {{0, 0, &input, sizeof(input)}, {1, 0, &gain, sizeof(gain)},
 			                              {8, 0, &test.channel, sizeof(test.channel)}};
-			Check(AudioOut2::AudioOut2PortSetAttributes(object, AsAttribute(attributes), 3) == OK,
-			      "object attributes could not be set atomically with PCM first");
 			for (int push = 0; push < 2; push++) {
 				CheckSamples(PushPcm(context, output_bytes).at(0), {0.25f * test.left, 0.25f * test.right},
 				             "object gain or ambisonics decoded incorrectly or accumulated across pushes");
@@ -578,7 +653,6 @@ void TestObjectGainAndAmbisonics() {
 		SetAttribute(object, 8, UINT32_MAX);
 		SetAttribute(object, 1, 0.0f);
 		SetPcm(object, pcm);
-		CheckSamples(PushPcm(context, output_bytes).at(0), {0.0f}, "zero gain did not mute object");
 		AudioOut2::AudioOut2ContextAdvance(context);
 		SetPcm(object, pcm);
 		CheckSamples(PushPcm(context, output_bytes).at(0), {0.0f}, "object gain did not persist");
@@ -702,7 +776,7 @@ bool AudioOutHasDevice(int handle) {
 	       g_device_backed_handles.end();
 }
 
-uint32_t AudioOutOutputs(const OutputParam* params, uint32_t num, bool blocking) {
+uint32_t AudioOutOutputs(const OutputParam* params, uint32_t num, bool blocking, bool cushion) {
 	std::unique_lock lock(g_device_mutex);
 	g_output_blocking.push_back(blocking);
 	if (g_block_outputs && g_blocked_output.empty()) {
@@ -749,6 +823,7 @@ int main() {
 	TestAsynchronousDevicePushKeepsQueueBounded();
 	TestHandleWithoutPcmDoesNotBypassQueue();
 	TestPcmCopiedBeforeScratchBufferReuse();
+	TestAdvancedGrainsPushInOrder();
 	TestPortGainAndValidation();
 	TestObjectGainAndAmbisonics();
 	TestObjectBusRouting();

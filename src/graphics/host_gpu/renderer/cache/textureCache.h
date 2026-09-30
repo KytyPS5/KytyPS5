@@ -195,6 +195,9 @@ private:
 
 	void               InvalidateCpuAliases(uint64_t address, uint64_t size);
 	[[nodiscard]] bool DownloadImageMemory(ImageId id);
+	// Caller holds m_lock. Publishes the GPU contents of every other image covering `range` into
+	// the buffers backing those bytes, so a guest-memory read of `range` sees them.
+	uint32_t PublishGpuOwners(ImageId destination, GuestRange range);
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;

@@ -390,7 +390,23 @@ bool TextureCache::SafeToDownload(const Image& image) {
 		return false;
 	}
 	const auto range = image.info.data;
-	return !m_buffer_cache.HasGpuDirtyBytes(range.address, range.size);
+	if (!m_buffer_cache.HasGpuDirtyBytes(range.address, range.size)) {
+		return true;
+	}
+	// A buffer wrote these bytes at some point, which used to end the matter. The transient
+	// allocator reuses one guest range for several surfaces, so that claim frequently belongs to
+	// an older, unrelated write: half of the refusals measured on Beast of Reincarnation named a
+	// buffer write older than the image's own GPU write. Let the newer side own the bytes.
+	// Opt-in: this was measured on Beast of Reincarnation and restored nothing, so the default
+	// keeps the old behaviour. See .dev/background-missing.md.
+	static const bool arbitrate = [] {
+		const char* value = std::getenv("KYTY_IMAGE_TICK_ARBITRATION");
+		return value != nullptr && value[0] != '0';
+	}();
+	if (!arbitrate) {
+		return false;
+	}
+	return image.gpu_write_tick > m_buffer_cache.GpuWriteTick(range.address, range.size);
 }
 
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
@@ -1423,6 +1439,152 @@ void TextureCache::DebugReportStaleBind(ImageId id, uint64_t rt_address) {
 	}
 }
 
+// Debug: one line per distinct owner/outcome. `skip` is null when the publication happened, so a
+// frame that still shows stale pixels can be traced to either "no owner published" or the reason
+// the owner was refused.
+static void DebugReportOwnerPublish(ImageId destination, ImageId owner_id, const Image& owner,
+                                    const char* skip, uint64_t buffer_tick) {
+	if (owner.info.extent.width < 640) {
+		return;
+	}
+	static std::mutex                                                     dbg_mutex;
+	static std::set<std::tuple<uint64_t, uint32_t, uint32_t, std::string>> dbg_seen;
+	const std::tuple<uint64_t, uint32_t, uint32_t, std::string> key {
+	    owner.info.data.address, owner.info.extent.width,
+	    static_cast<uint32_t>(owner.backing.format), skip == nullptr ? "published" : skip};
+	bool first = false;
+	{
+		std::scoped_lock lock {dbg_mutex};
+		first = dbg_seen.insert(key).second;
+	}
+	if (!first) {
+		return;
+	}
+	LOGF("OWNER PUBLISH: dst=%u owner=%u addr=0x%016" PRIx64 " size=0x%" PRIx64 " %ux%u fmt=%u"
+	     " gpu_write=%" PRIu64 " guest_sync=%" PRIu64 " image_tick=%" PRIu64
+	     " buffer_tick=%" PRIu64 " image_newer=%d outcome=%s\n",
+	     static_cast<uint32_t>(destination.index), static_cast<uint32_t>(owner_id.index),
+	     owner.info.data.address, owner.info.data.size, owner.info.extent.width,
+	     owner.info.extent.height, static_cast<uint32_t>(owner.backing.format),
+	     owner.GpuWriteSerial(), owner.GuestSyncSerial(), owner.gpu_write_tick, buffer_tick,
+	     owner.gpu_write_tick > buffer_tick ? 1 : 0, skip == nullptr ? "published" : skip);
+}
+
+// The guest address of an image is not an identity: a transient allocator reuses and overlaps
+// offsets, so the live pixels for a range can sit inside a different image entirely. Before
+// anything reconstructs an image from guest memory, hand the bytes to their owner to fill in.
+uint32_t TextureCache::PublishGpuOwners(ImageId destination, GuestRange range) {
+	// Opt-in for the same reason as the tick arbitration above.
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_IMAGE_OWNER_PUBLISH");
+		return value != nullptr && value[0] != '0';
+	}();
+	if (!enabled || !range.Valid()) {
+		return 0;
+	}
+	// Debug: without these the probe below is silent both when nothing owns the bytes and when
+	// every owner is filtered out, which are different answers.
+	static std::atomic_uint64_t dbg_calls {0};
+	static std::atomic_uint64_t dbg_candidates {0};
+	static std::atomic_uint64_t dbg_self {0};
+	static std::atomic_uint64_t dbg_unusable {0};
+	static std::atomic_uint64_t dbg_not_gpu {0};
+	static std::atomic_uint64_t dbg_current {0};
+	static std::atomic_uint64_t dbg_no_overlap {0};
+	static std::atomic_uint64_t dbg_compressed {0};
+	static std::atomic_uint64_t dbg_published {0};
+	const auto dbg_call_index = dbg_calls.fetch_add(1, std::memory_order_relaxed);
+	if ((dbg_call_index % 4096) == 0) {
+		LOGF("OWNER PUBLISH STATS: calls=%" PRIu64 " candidates=%" PRIu64 " self=%" PRIu64
+		     " unusable=%" PRIu64 " not_gpu=%" PRIu64 " guest_current=%" PRIu64
+		     " no_overlap=%" PRIu64 " compressed=%" PRIu64 " published=%" PRIu64 "\n",
+		     dbg_call_index, dbg_candidates.load(std::memory_order_relaxed),
+		     dbg_self.load(std::memory_order_relaxed), dbg_unusable.load(std::memory_order_relaxed),
+		     dbg_not_gpu.load(std::memory_order_relaxed),
+		     dbg_current.load(std::memory_order_relaxed),
+		     dbg_no_overlap.load(std::memory_order_relaxed),
+		     dbg_compressed.load(std::memory_order_relaxed),
+		     dbg_published.load(std::memory_order_relaxed));
+	}
+	uint32_t published = 0;
+	for (const auto owner_id: FindImagesInRegion(range.address, range.size, false)) {
+		dbg_candidates.fetch_add(1, std::memory_order_relaxed);
+		if (owner_id == destination) {
+			dbg_self.fetch_add(1, std::memory_order_relaxed);
+			continue;
+		}
+		auto* owner = m_slot_images.try_get(owner_id);
+		if (owner == nullptr || owner->depth_id || owner->backing.image == nullptr) {
+			dbg_unusable.fetch_add(1, std::memory_order_relaxed);
+			continue;
+		}
+		if (!owner->IsGpuModified()) {
+			dbg_not_gpu.fetch_add(1, std::memory_order_relaxed);
+			continue;
+		}
+		if (owner->GuestMemoryIsCurrent()) {
+			dbg_current.fetch_add(1, std::memory_order_relaxed);
+			continue;
+		}
+		if (!owner->Overlaps(range.address, range.size)) {
+			dbg_no_overlap.fetch_add(1, std::memory_order_relaxed);
+			continue;
+		}
+		if (owner->info.metadata.compression != VideoOutCompression::Uncompressed) {
+			dbg_compressed.fetch_add(1, std::memory_order_relaxed);
+			continue;
+		}
+		const char* skip = nullptr;
+		if (!SafeToDownload(*owner)) {
+			skip = owner->IsBufferModified() ? "buffer-modified"
+			       : owner->IsCpuDirty()     ? "cpu-dirty"
+			                                 : "buffer-dirty-bytes";
+		}
+		auto transfer = skip == nullptr ? BuildDownload(*owner) : ImageDownload {};
+		if (skip == nullptr && !transfer.valid) {
+			skip = "no-transfer";
+		}
+		std::pair<Buffer*, uint64_t> target {nullptr, 0};
+		if (skip == nullptr) {
+			// The write flag is what legitimately hands these bytes to the GPU side: it flushes
+			// any outstanding CPU pages into the buffer first and then moves the tracker's dirty
+			// state from CPU to GPU, which a direct mark would corrupt.
+			target = m_buffer_cache.ObtainBuffer(owner->info.data.address, owner->info.data.size,
+			                                     true, false);
+			// A small read can be served from the upload stream, which is not a copy destination.
+			if (target.first == nullptr ||
+			    !target.first->IsInBounds(owner->info.data.address, owner->info.data.size)) {
+				skip = "no-buffer";
+			}
+		}
+		const auto buffer_tick =
+		    m_buffer_cache.GpuWriteTick(owner->info.data.address, owner->info.data.size);
+		DebugReportOwnerPublish(destination, owner_id, *owner, skip, buffer_tick);
+		// Debug: how often the refusing buffer claim is older than the image's own GPU write,
+		// i.e. how often the boolean gate is discarding the newer contents.
+		if (skip != nullptr && std::string_view {skip} == "buffer-dirty-bytes") {
+			static std::atomic_uint64_t dbg_stale_claim {0};
+			static std::atomic_uint64_t dbg_fresh_claim {0};
+			auto& counter = owner->gpu_write_tick > buffer_tick ? dbg_stale_claim : dbg_fresh_claim;
+			const auto n  = counter.fetch_add(1, std::memory_order_relaxed);
+			if ((n % 2048) == 0) {
+				LOGF("OWNER CLAIM STATS: image_newer=%" PRIu64 " buffer_newer=%" PRIu64 "\n",
+				     dbg_stale_claim.load(std::memory_order_relaxed),
+				     dbg_fresh_claim.load(std::memory_order_relaxed));
+			}
+		}
+		if (skip != nullptr) {
+			continue;
+		}
+		DownloadImage(*owner, *target.first, target.second, owner->info.data.size,
+		              std::move(transfer));
+		owner->MarkGuestSynchronized();
+		dbg_published.fetch_add(1, std::memory_order_relaxed);
+		published++;
+	}
+	return published;
+}
+
 void TextureCache::InitializeImage(ImageId id) {
 	auto& image = m_slot_images[id];
 	if (image.info.data.Empty()) {
@@ -1445,7 +1607,29 @@ void TextureCache::InitializeImage(ImageId id) {
 		return;
 	}
 	const bool upload = image.IsBufferModified() || image.IsCpuDirty();
+	// Debug: how often an image is rebuilt from guest memory at all, and how much of that is the
+	// large surfaces the scene passes through.
+	{
+		static std::atomic_uint64_t dbg_init {0};
+		static std::atomic_uint64_t dbg_upload {0};
+		static std::atomic_uint64_t dbg_upload_big {0};
+		const auto n = dbg_init.fetch_add(1, std::memory_order_relaxed);
+		if (upload) {
+			dbg_upload.fetch_add(1, std::memory_order_relaxed);
+			if (image.info.extent.width >= 640) {
+				dbg_upload_big.fetch_add(1, std::memory_order_relaxed);
+			}
+		}
+		if ((n % 8192) == 0) {
+			LOGF("INIT IMAGE STATS: calls=%" PRIu64 " uploads=%" PRIu64 " uploads_big=%" PRIu64
+			     "\n", n, dbg_upload.load(std::memory_order_relaxed),
+			     dbg_upload_big.load(std::memory_order_relaxed));
+		}
+	}
 	if (upload) {
+		// Whoever holds GPU output for these bytes publishes it first; otherwise the upload below
+		// reads whatever stale copy guest memory still carries.
+		(void)PublishGpuOwners(id, image.info.data);
 		const auto [source, source_offset] =
 		    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
 		if (source == nullptr) {
@@ -2073,6 +2257,7 @@ void TextureCache::CommitGpuWrite(Image& image) {
 	if (image.IsCpuDirty()) {
 		image.RefreshComplete();
 	}
+	image.gpu_write_tick = m_scheduler.CurrentTick();
 	image.MarkGpuModified();
 }
 

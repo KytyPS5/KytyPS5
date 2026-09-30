@@ -117,8 +117,20 @@ public:
 	}
 
 	[[nodiscard]] bool IsGpuModified() const noexcept { return m_gpu_modified; }
-	void               MarkGpuModified() noexcept { m_gpu_modified = true; }
-	void               ClearGpuModified() noexcept { m_gpu_modified = false; }
+	void               MarkGpuModified() noexcept {
+        m_gpu_modified = true;
+        m_gpu_write_serial++;
+	}
+	void ClearGpuModified() noexcept { m_gpu_modified = false; }
+
+	// Guest memory only holds what the last download published. The two serials say whether the
+	// bytes behind this image are the current contents or a stale copy of an older GPU write.
+	void MarkGuestSynchronized() noexcept { m_guest_sync_serial = m_gpu_write_serial; }
+	[[nodiscard]] uint64_t GpuWriteSerial() const noexcept { return m_gpu_write_serial; }
+	[[nodiscard]] uint64_t GuestSyncSerial() const noexcept { return m_guest_sync_serial; }
+	[[nodiscard]] bool     GuestMemoryIsCurrent() const noexcept {
+        return m_guest_sync_serial >= m_gpu_write_serial;
+	}
 
 	[[nodiscard]] bool IsBufferModified() const noexcept { return m_buffer_modified; }
 	void               MarkBufferModified() noexcept { m_buffer_modified = true; }
@@ -149,6 +161,9 @@ public:
 	uint64_t         track_addr_end = 0;
 	ImageId          depth_id {};
 	uint64_t         tick_accessed_last = 0;
+	// Scheduler tick of the last GPU write into this image. Compared against the tick of the last
+	// buffer write to the same guest bytes to decide which side holds the newer contents.
+	uint64_t         gpu_write_tick     = 0;
 	size_t           lru_id             = 0;
 
 private:
@@ -162,7 +177,9 @@ private:
 
 	GraphicContext&   m_graphics;
 	CommandScheduler& m_scheduler;
-	uint64_t          m_maybe_cpu_hash   = 0;
+	uint64_t          m_maybe_cpu_hash    = 0;
+	uint64_t          m_gpu_write_serial  = 0;
+	uint64_t          m_guest_sync_serial = 0;
 	bool              m_cpu_dirty        = false;
 	bool              m_maybe_cpu_dirty  = false;
 	bool              m_maybe_hash_valid = false;

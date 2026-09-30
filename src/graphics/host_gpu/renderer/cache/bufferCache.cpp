@@ -496,6 +496,12 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 			}
 		}
 		m_gpu_modified_ranges.Add(vaddr, size);
+		const auto tick = m_scheduler.CurrentTick();
+		for (auto page = vaddr >> PageTable::kPageBits;
+		     page <= (vaddr + size - 1) >> PageTable::kPageBits; ++page) {
+			auto& recorded = m_gpu_write_ticks[page];
+			recorded       = std::max(recorded, tick);
+		}
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }
@@ -606,6 +612,21 @@ bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 
 bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
 	return m_gpu_modified_ranges.Intersects(vaddr, size);
+}
+
+uint64_t BufferCache::GpuWriteTick(uint64_t vaddr, uint64_t size) const {
+	if (!GuestRange {vaddr, size}.Valid()) {
+		return 0;
+	}
+	uint64_t tick = 0;
+	for (auto page = vaddr >> PageTable::kPageBits;
+	     page <= (vaddr + size - 1) >> PageTable::kPageBits; ++page) {
+		const auto it = m_gpu_write_ticks.find(page);
+		if (it != m_gpu_write_ticks.end()) {
+			tick = std::max(tick, it->second);
+		}
+	}
+	return tick;
 }
 
 bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {

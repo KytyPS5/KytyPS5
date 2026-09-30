@@ -15,6 +15,7 @@
 #include <atomic>
 #include <bit>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <magic_enum.hpp>
@@ -103,6 +104,13 @@ static void UnmapGpuRange(uint64_t vaddr, uint64_t size) {
 		return;
 	}
 	GetGpuResources().UnmapMemory(vaddr, size);
+}
+
+static void ForgetGpuRange(uint64_t vaddr, uint64_t size) {
+	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
+		return;
+	}
+	GetGpuResources().ForgetMemory(vaddr, size);
 }
 
 // A guest protection change replaces the host protection, dropping the GPU caches' write watch.
@@ -2275,7 +2283,7 @@ static int MapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags
 		    std::all_of(reserved_ranges.begin(), reserved_ranges.end(), [](const auto& range) {
 			    return range.type == VirtualRangeType::Reserved;
 		    })) {
-			UnmapGpuRange(in_addr, len);
+			ForgetGpuRange(in_addr, len);
 			reserved_target = true;
 			out_addr        = in_addr;
 		}
@@ -2287,7 +2295,7 @@ static int MapFlexibleMemory(void** addr_in_out, size_t len, int prot, int flags
 		const auto search_addr = (in_addr != 0 ? in_addr : DEFAULT_PS5_BASE);
 		out_addr               = FindGuestFreeRange(search_addr, len, map_alignment);
 		if (out_addr != 0) {
-			UnmapGpuRange(out_addr, len);
+			ForgetGpuRange(out_addr, len);
 		}
 	}
 
@@ -3077,7 +3085,7 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 			    std::all_of(reserved_ranges.begin(), reserved_ranges.end(), [](const auto& range) {
 				    return range.type == VirtualRangeType::Reserved;
 			    })) {
-				UnmapGpuRange(in_addr, len);
+				ForgetGpuRange(in_addr, len);
 				reserved_target = true;
 			}
 			if (!reserved_target && ReplaceFixedRangeWithReserved(in_addr, len)) {
@@ -3099,7 +3107,7 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 		    std::all_of(reserved_ranges.begin(), reserved_ranges.end(), [](const auto& range) {
 			    return range.type == VirtualRangeType::Reserved;
 		    })) {
-			UnmapGpuRange(in_addr, len);
+			ForgetGpuRange(in_addr, len);
 			reserved_target = true;
 			if (map_shared_fixed(in_addr)) {
 				out_addr       = in_addr;
@@ -3109,7 +3117,7 @@ static int MapDirectMemory(void** addr, size_t len, int prot, int flags,
 		if (!reserved_target) {
 			out_addr = FindGuestFreeRange(in_addr, len, alignment);
 			if (out_addr != 0) {
-				UnmapGpuRange(out_addr, len);
+				ForgetGpuRange(out_addr, len);
 				shared_backing = map_shared_fixed(out_addr);
 				if (!shared_backing) {
 					out_addr = 0;
@@ -3385,7 +3393,12 @@ static bool ReplaceFixedRangeWithReserved(uint64_t start, uint64_t size) {
 		return ok;
 	};
 
-	UnmapGpuRange(start, size);
+	if (std::any_of(chunks.begin(), chunks.end(),
+	                [](const auto& chunk) { return IsCommittedRangeType(chunk.range.type); })) {
+		UnmapGpuRange(start, size);
+	} else {
+		ForgetGpuRange(start, size);
+	}
 	g_virtual_ranges->Remove(start, size);
 
 	for (auto& chunk: chunks) {
@@ -3526,7 +3539,7 @@ int KYTY_SYSV_ABI KernelReserveVirtualRange(void** addr, size_t len, int flags, 
 		alignment = (alignment != 0 ? alignment : PAGE_SIZE);
 		out_addr  = FindGuestFreeRange(in_addr, len, alignment);
 		if (out_addr != 0) {
-			UnmapGpuRange(out_addr, len);
+			ForgetGpuRange(out_addr, len);
 		}
 	}
 

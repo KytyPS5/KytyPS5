@@ -3752,19 +3752,56 @@ public:
     gpu.SendCommandSync(
         [&] { scheduler.DeferOperation([&] { normal_completed = true; }); });
     resources.MapMemory(empty_unmap_base, empty_unmap_size);
+    const auto idle_unmap_tick = scheduler.CurrentTick();
     resources.UnmapMemory(empty_unmap_base, empty_unmap_size);
-    Require("GpuCommandLane", "unmap native completion",
-            completion_published.load() &&
+    Require("GpuCommandLane", "unmap without a drain",
+            scheduler.CurrentTick() == idle_unmap_tick &&
                 !resources.IsMapped(empty_unmap_base, empty_unmap_size),
-            "unmap returned before an earlier native guest-memory callback");
+            "an unmap of idle memory drained the GPU");
+    gpu.SendCommandSync([&] { scheduler.Finish(); });
+    Require("GpuCommandLane", "unrelated native completion",
+            normal_completed.load(),
+            "a native callback did not run after its recording finished");
+
+    std::binary_semaphore lane_held{0};
+    std::binary_semaphore release_lane{0};
+    gpu.SendCommand([&] {
+      lane_held.release();
+      release_lane.acquire();
+    });
+    lane_held.acquire();
+    std::atomic<bool> forget_returned{false};
+    std::jthread forget_thread([&] {
+      resources.ForgetMemory(empty_unmap_base, empty_unmap_size);
+      resources.MapMemory(empty_unmap_base, empty_unmap_size);
+      forget_returned = true;
+    });
+    const auto forget_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!forget_returned.load() &&
+           std::chrono::steady_clock::now() < forget_deadline) {
+      std::this_thread::yield();
+    }
+    const bool forget_overtook_lane = forget_returned.load();
+    release_lane.release();
+    forget_thread.join();
+    gpu.SendCommandSync([] {});
+    Require("GpuCommandLane", "forget without a round trip",
+            forget_overtook_lane &&
+                resources.IsMapped(empty_unmap_base, empty_unmap_size),
+            "forgetting a free range waited for the GPU thread or dropped "
+            "the mapping that followed it");
+    resources.UnmapMemory(empty_unmap_base, empty_unmap_size);
 
     std::binary_semaphore priority_entered{0};
     std::binary_semaphore release_priority{0};
     gpu.SendCommandSync([&] {
-      scheduler.DeferPriorityOperation([&] {
-        priority_entered.release();
-        release_priority.acquire();
-      });
+      scheduler.DeferPriorityOperation(
+          [&] {
+            priority_entered.release();
+            release_priority.acquire();
+          },
+          empty_unmap_base, empty_unmap_size);
       scheduler.Flush();
     });
     priority_entered.acquire();
@@ -4353,6 +4390,109 @@ public:
                 static_cast<bool>(volume.backing.flags &
                                   vk::ImageCreateFlagBits::e2DArrayCompatible),
             "2D slice views of a compatible 3D backing were rejected");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  void CheckBufferCacheDetachedDownload() {
+    constexpr const char *name = "BufferCacheDetachedDownload";
+    constexpr uintptr_t base = 0x0000000206800000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t submitted_offset = 0x1000;
+    constexpr uint64_t recording_offset = 0x2000;
+    constexpr uint64_t joined_offset = 0x40100;
+    constexpr uint32_t stale = 0x0badf00du;
+    constexpr uint32_t submitted_value = 0x11223344u;
+    constexpr uint32_t recording_value = 0x55667788u;
+    constexpr uint32_t joined_value = 0x99aabbccu;
+
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "detached-download direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "detached-download fixed direct-memory mapping failed");
+      std::memcpy(static_cast<uint8_t *>(mapped) + offset, &stale, sizeof(stale));
+    }
+    {
+      auto &cache = context.GetBufferCache();
+      context.MapMemory(base, allocation_size);
+      const auto write_on_gpu = [&](uint64_t offset, uint32_t value) {
+        Require(name, "dirty allocation",
+                cache.ObtainBuffer(base + offset, sizeof(value), true, false).first !=
+                    nullptr,
+                "detached-download buffer allocation failed");
+        cache.FillBuffer(base + offset, sizeof(value), value, false);
+      };
+      const auto backing = [&](uint64_t offset) {
+        uint32_t value = 0;
+        Libs::LibKernel::Memory::TryReadBacking(base + offset, &value, sizeof(value));
+        return value;
+      };
+
+      // Written by a submitted batch: read without submitting the recording in progress.
+      write_on_gpu(submitted_offset, submitted_value);
+      scheduler.Flush();
+      const auto recording = scheduler.CurrentTick();
+      cache.ReadMemory(base + submitted_offset, sizeof(submitted_value));
+      Require(name, "submitted writer downloads detached",
+              backing(submitted_offset) == submitted_value &&
+                  scheduler.CurrentTick() == recording &&
+                  !cache.HasGpuDirtyBytes(base + submitted_offset,
+                                          sizeof(submitted_value)),
+              "a write from a submitted batch drained the recording in progress");
+
+      // A writer in the recording in progress, even beside a submitted one, still drains.
+      write_on_gpu(submitted_offset, submitted_value + 1u);
+      scheduler.Flush();
+      write_on_gpu(recording_offset, recording_value);
+      const auto drained = scheduler.CurrentTick();
+      // Readback covers only the requested pages, so the read spans both writers.
+      cache.ReadMemory(base + submitted_offset,
+                       recording_offset + sizeof(recording_value) - submitted_offset);
+      Require(name, "recording writer drains",
+              backing(submitted_offset) == submitted_value + 1u &&
+                  backing(recording_offset) == recording_value &&
+                  scheduler.CurrentTick() > drained,
+              "a window written by the recording in progress was read without it");
+
+      // A buffer rebuilt in the recording in progress holds the joined bytes only once it runs.
+      write_on_gpu(joined_offset, joined_value);
+      scheduler.Flush();
+      (void)cache.FindBuffer(base + joined_offset - 0x8100, 0x20000);
+      const auto joined = scheduler.CurrentTick();
+      cache.ReadMemory(base + joined_offset, sizeof(joined_value));
+      Require(name, "joined owner drains",
+              backing(joined_offset) == joined_value && scheduler.CurrentTick() > joined,
+              "a buffer joined in the recording in progress was downloaded before the join");
+
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "detached-download direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "detached-download direct-memory allocation release failed");
     std::printf("[host]    %-32s ok\n", name);
   }
 
@@ -5059,9 +5199,9 @@ public:
                                     base + partial_unmap_survivor_offset),
               "CPU read did not publish the retained GPU-dirty page");
       uint32_t partial_unmap_survivor_backing = 0;
-      std::memcpy(&partial_unmap_survivor_backing,
-                  memory + partial_unmap_survivor_offset,
-                  sizeof(partial_unmap_survivor_backing));
+      Libs::LibKernel::Memory::TryReadBacking(base + partial_unmap_survivor_offset,
+                                              &partial_unmap_survivor_backing,
+                                              sizeof(partial_unmap_survivor_backing));
       Require(
           name, "partial-invalidation ownership",
           !resources.IsMapped(base + 0x8000, 0x4000) &&
@@ -5414,6 +5554,72 @@ public:
               "owner's dirty prefix");
       cache.ReadMemory(base + reacquire_disjoint_offset,
                        sizeof(reacquire_value));
+
+      constexpr uint64_t arena_offset = 0x2400000;
+      constexpr uint64_t arena_size = 0x10000;
+      constexpr uint32_t arena_published = 0x5eed1e55u;
+      constexpr uint32_t elsewhere_published = 0x0e15e0e1u;
+      auto arena_owner =
+          cache.ObtainBuffer(base + arena_offset, arena_size, false);
+      Require(name, "streaming-arena owner", arena_owner.first != nullptr,
+              "streaming-arena buffer allocation failed");
+      const auto idle_unmap_tick = scheduler.CurrentTick();
+      const auto elsewhere_tick = scheduler.CurrentTick();
+      std::atomic<bool> elsewhere_ran{false};
+      std::binary_semaphore release_elsewhere{0};
+      scheduler.DeferPriorityOperation(
+          [&] {
+            release_elsewhere.acquire();
+            Libs::LibKernel::Memory::WriteBacking(base + clean_offset,
+                                                  &elsewhere_published,
+                                                  sizeof(elsewhere_published));
+            elsewhere_ran = true;
+          },
+          base + clean_offset, sizeof(elsewhere_published));
+      std::atomic<bool> idle_unmap_returned{false};
+      std::jthread release_elsewhere_thread([&] {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (!idle_unmap_returned.load() &&
+               std::chrono::steady_clock::now() < deadline) {
+          std::this_thread::yield();
+        }
+        release_elsewhere.release();
+      });
+      resources.UnmapMemory(base + arena_offset, arena_size);
+      const bool idle_unmap_waited = elsewhere_ran.load();
+      idle_unmap_returned = true;
+      release_elsewhere_thread.join();
+      Require(name, "idle unmap",
+              scheduler.CurrentTick() == idle_unmap_tick &&
+                  !idle_unmap_waited &&
+                  !resources.IsMapped(base + arena_offset, arena_size) &&
+                  cache.IsRegionRegistered(base + arena_offset, arena_size) &&
+                  cache.IsRegionCpuModified(base + arena_offset, arena_size),
+              "an unmap over clean memory submitted, waited for an unrelated "
+              "write-back, or dropped its owner");
+      resources.MapMemory(base + arena_offset, arena_size);
+      scheduler.Finish();
+      scheduler.WaitPriorityOperations(elsewhere_tick);
+
+      const auto publication_tick = scheduler.CurrentTick();
+      std::atomic<bool> arena_ran{false};
+      scheduler.DeferPriorityOperation(
+          [&] {
+            Libs::LibKernel::Memory::WriteBacking(
+                base + arena_offset, &arena_published, sizeof(arena_published));
+            arena_ran = true;
+          },
+          base + arena_offset, sizeof(arena_published));
+      resources.UnmapMemory(base + arena_offset, arena_size);
+      uint32_t arena_backing = 0;
+      std::memcpy(&arena_backing, memory + arena_offset, sizeof(arena_backing));
+      Require(name, "unmap publishes queued write-backs",
+              arena_ran && arena_backing == arena_published &&
+                  scheduler.CurrentTick() > publication_tick &&
+                  !resources.IsMapped(base + arena_offset, arena_size),
+              "an unmap returned before a write-back queued over its range");
+      resources.MapMemory(base + arena_offset, arena_size);
 
       resources.UnmapMemory(base, allocation_size);
       scheduler.Finish();
@@ -54130,6 +54336,8 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-gc-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckBufferCacheDirtyGarbageCollection();
+    vulkan.CheckBufferCacheDetachedDownload();
+    vulkan.CheckTextureCacheCollectorProgress();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--sampler-border-only") == 0) {
@@ -54398,6 +54606,7 @@ int main(int argc, char **argv) {
     vulkan.CheckRasterization(false, Prospero::BufferFormat::k11_11_10Float);
     vulkan.CheckRasterization(false, Prospero::BufferFormat::k10_10_10_2UScaled);
     vulkan.CheckBufferCacheDirtyGarbageCollection();
+    vulkan.CheckBufferCacheDetachedDownload();
     vulkan.CheckBufferCacheBdaStoreOwnership();
     vulkan.CheckBufferCacheBdaResidency();
   } else {

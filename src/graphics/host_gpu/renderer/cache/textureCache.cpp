@@ -2198,6 +2198,7 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	     copy_size != image.info.data.size)) {
 		return false;
 	}
+	MarkGpuWrite(image.info.data.address, copy_size);
 	ForgetColorMetadataChecks(image.info.data.address, copy_size);
 	m_texture_cache.DownloadImage(image, buffer, buf_offset, copy_size, levels);
 	return true;
@@ -2283,10 +2284,10 @@ bool TextureCache::DownloadImageBatch(Image& image, const TextureDownloadChunk& 
 	m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                                               vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
 	                                               1, &barrier, 0, nullptr);
-	m_scheduler.DeferPriorityOperation([&download, range, mapped, offset] {
-		download.Invalidate(offset, range.size);
-		LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
-	});
+	m_scheduler.DeferPriorityOperation(
+		    download.Invalidate(offset, range.size);
+	    },
+	    range.address, range.size);
 	return true;
 }
 
@@ -2466,12 +2467,7 @@ bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {
 	return true;
 }
 
-bool TextureCache::IsRegionRegistered(uint64_t address, uint64_t size) {
-	std::scoped_lock lock {m_lock};
-	return !FindImagesInRegion(address, size, false).empty();
-}
-
-void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
+bool TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) {
 		EXIT("TextureCache: invalid unmap range\n");
 	}
@@ -2485,13 +2481,16 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 		}
 	}
 	auto images = FindImagesInRegion(address, size, false);
+	bool freed  = false;
 	for (const auto id: images) {
 		auto owner = m_slot_images.try_get(id);
 		if (owner == nullptr) {
 			continue;
 		}
 		FreeImage(id);
+		freed = true;
 	}
+	return freed;
 }
 
 void TextureCache::RunGarbageCollector(bool per_frame) {

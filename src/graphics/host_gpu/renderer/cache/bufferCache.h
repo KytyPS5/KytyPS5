@@ -146,6 +146,18 @@ private:
 	Buffer                                            m_gds_buffer;
 	Buffer                                            m_bda_pagetable_buffer;
 	Common::SlotVector<Buffer>                        m_slot_buffers;
+	// The tick of the recording that last wrote a range, kept until that tick completes.
+	struct GpuWriteMark {
+		uint64_t end  = 0;
+		uint64_t tick = 0;
+	};
+	void MarkGpuWrite(uint64_t vaddr, uint64_t size);
+	// The newest tick of a mark overlapping the range, or 0.
+	[[nodiscard]] uint64_t NewestGpuWriteTick(uint64_t vaddr, uint64_t size) const;
+	void                   PruneGpuWriteMarks();
+	// Downloads without submitting the recording in progress; false leaves all state unchanged.
+	[[nodiscard]] bool TryDownloadDetached(Buffer& buffer, uint64_t vaddr, uint64_t size);
+
 	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_lru_cache;
 	BufferMap                                         m_buffers;
 	PageTable                                         m_page_table;
@@ -166,6 +178,10 @@ private:
 	// Tracked since the last mark, so stores that ran before tracking are owned without a rerun.
 	RangeSet m_bda_unmarked_ranges;
 	RangeSet m_bda_pinned_ranges;
+	// Disjoint; a mark whose tick has completed no longer constrains anything and is pruned.
+	std::map<uint64_t, GpuWriteMark>          m_gpu_write_marks;
+	// A BDA store can reach any page, including ones no mark names yet.
+	uint64_t      m_bda_store_tick = 0;
 };
 
 } // namespace Libs::Graphics

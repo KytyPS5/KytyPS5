@@ -268,6 +268,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	if constexpr (async) {
 		m_scheduler.DeferPriorityOperation(std::move(publish));
 	} else {
+		KYTY_PROFILER_BLOCK("BufferCache::ReadMemory drain");
 		const auto tick = m_scheduler.CurrentTick();
 		m_scheduler.Wait(tick);
 		m_scheduler.WaitPriorityOperations(tick);
@@ -338,7 +339,18 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
-	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write] {
+	// A guest thread's access runs here on the GPU thread, outside any zone of its own.
+	const bool guest_access = !GuestGpu::IsGpuThread();
+	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write, guest_access] {
+		static constexpr tracy::SourceLocationData guest_read {
+		    "BufferCache::ReadMemory for a guest CPU read", TracyFunction, TracyFile,
+		    static_cast<uint32_t>(__LINE__), 0};
+		static constexpr tracy::SourceLocationData guest_write {
+		    "BufferCache::ReadMemory for a guest CPU write", TracyFunction, TracyFile,
+		    static_cast<uint32_t>(__LINE__), 0};
+		tracy::ScopedZone zone(is_write ? &guest_write : &guest_read, TRACY_CALLSTACK,
+		                       guest_access && tracy::ProfilerAvailable());
+		zone.Value(vaddr);
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;
 		}
@@ -819,6 +831,7 @@ void BufferCache::ResolveBdaFault(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::MarkBdaStoresInMapped(const RangeSet& mapped, bool all_tracked) {
+	KYTY_PROFILER_FUNCTION();
 	const auto& ranges = all_tracked ? m_bda_tracked_ranges : m_bda_unmarked_ranges;
 	ForEachBdaMarkRange(ranges, mapped,
 	                    [this](uint64_t begin, uint64_t end) { MarkBdaStores(begin, end - begin); });

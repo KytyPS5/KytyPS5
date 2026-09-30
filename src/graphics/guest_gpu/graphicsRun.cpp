@@ -116,6 +116,7 @@ void GuestGpu::ProcessCommands() {
 			m_commands.pop_front();
 			EXIT_IF(m_pending_commands.fetch_sub(1, std::memory_order_acq_rel) == 0);
 		}
+		KYTY_PROFILER_BLOCK("GuestGpu command from another thread");
 		command();
 	}
 }
@@ -520,7 +521,10 @@ void GuestGpu::ThreadRun(void* data) {
 
 		if (command) {
 			EXIT_IF(g_current_processor != nullptr);
-			command();
+			{
+				KYTY_PROFILER_BLOCK("GuestGpu command from another thread");
+				command();
+			}
 
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			gpu->m_processing = false;
@@ -1019,6 +1023,7 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 	EXIT_NOT_IMPLEMENTED(args_addr == 0 || (args_addr & 3u) != 0);
 	if ((mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0) {
+		KYTY_PROFILER_BLOCK("DispatchIndirect CPU records: thread dimensions");
 		const auto* args = reinterpret_cast<const vk::DispatchIndirectCommand*>(args_addr);
 		// The address travels with the counts so the limit check can name where they came from.
 		DispatchDirect(args->x, args->y, args->z, mode, args_addr);

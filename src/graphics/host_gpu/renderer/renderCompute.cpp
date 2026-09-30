@@ -549,15 +549,22 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	ResetBindings();
 }
 
-void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
-                                      uint64_t args_addr, uint32_t mode, bool async_compute) {
+void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
+                                      uint32_t mode) {
+	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(buffer.IsInvalid() || args_addr == 0 || (args_addr & 3u) != 0 ||
 	        (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0);
-	m_context.GetCommandScheduler().PopPendingOperations();
+	{
+		KYTY_PROFILER_BLOCK("DispatchIndirect PopPendingOperations");
+		m_context.GetCommandScheduler().PopPendingOperations();
+	}
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DispatchIndirect), submit_id,
 	                    static_cast<uint32_t>(args_addr), static_cast<uint32_t>(args_addr >> 32u),
 	                    0, mode, buffer.GetShaders().GetCs().cs_regs.data_addr);
-	Common::LockGuard lock(m_context.GetMutex());
+	const Common::LockGuard lock = [&] {
+		KYTY_PROFILER_BLOCK("DispatchIndirect context lock");
+		return Common::LockGuard(m_context.GetMutex());
+	}();
 	const auto& cs_regs = buffer.GetShaders().GetCs();
 	if (cs_regs.cs_regs.data_addr == 0) {
 		return;
@@ -578,13 +585,17 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	FindBuffers(std::span {&descriptor_stage, 1u});
 	const auto& program = *input_info.stage.program;
 	if (program.info.uses_dma) {
+		KYTY_PROFILER_BLOCK("DispatchIndirect PrepareBda");
 		m_context.PrepareBda(program.info.writes_dma);
 	}
 	BindSharedMemory(m_context, input_info, bindings, args_addr);
 	RebindImages(bindings);
 	// Acquiring arguments can merge cache buffers; finalize shader bindings afterward.
-	const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
-	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
+	const auto [args_buffer, args_offset] = [&] {
+		KYTY_PROFILER_BLOCK("DispatchIndirect ObtainBuffer(args)");
+		return m_context.GetBufferCache().ObtainBuffer(args_addr,
+		                                               sizeof(vk::DispatchIndirectCommand), false);
+	}();
 	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
 	RebindBuffers(bindings);
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,

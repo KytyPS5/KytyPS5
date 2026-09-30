@@ -6,6 +6,7 @@
 #include "common/emulatorConfig.h"
 #include "common/hostException.h"
 #include "common/logging/log.h"
+#include "common/profiler.h"
 #include "common/singleton.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -22,6 +23,7 @@
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <memory>
@@ -3295,6 +3297,15 @@ static void* RunThread(void* arg) {
 	     reinterpret_cast<uint64_t>(thread->entry), reinterpret_cast<uint64_t>(thread->arg),
 	     reinterpret_cast<uint64_t>(thread->attr->stack_addr),
 	     static_cast<uint64_t>(thread->attr->stack_size));
+
+	KYTY_PROFILER_THREAD(thread->name.c_str());
+	if (Config::ProfilerEnabled()) {
+		// Tracy only resolves the name of a thread that has sent an event.
+		KYTY_PROFILER_BLOCK("Guest thread start");
+		std::printf("Guest thread: %s os_thread_id=%" PRIu64 "\n", thread->name.c_str(),
+		            os_thread_id);
+		std::fflush(stdout);
+	}
 
 	// NOLINTNEXTLINE(cppcoreguidelines-pro-type-cstyle-cast)
 	pthread_cleanup_push(CleanupThread, thread);

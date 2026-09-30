@@ -1340,6 +1340,7 @@ void TextureCache::InitializeImage(ImageId id) {
 
 void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
                                        uint32_t metadata_base_layer) {
+	KYTY_PROFILER_FUNCTION();
 	if (desc.info.metadata.kind != ImageMetadataKind::Dcc &&
 	    desc.info.metadata.kind != ImageMetadataKind::Cmask) {
 		return;
@@ -1538,6 +1539,7 @@ ImageId TextureCache::StencilPlaneOwner(const ImageDesc& desc) const {
 }
 
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
+	KYTY_PROFILER_FUNCTION();
 	auto& command = m_scheduler.Current();
 	if (command.IsInvalid()) {
 		EXIT("TextureCache: image lookup requires a valid command buffer\n");
@@ -2734,9 +2736,7 @@ void TextureCache::FreePublishedEvictions() {
 }
 
 void TextureCache::ProcessDownloadImages() {
-	if (!m_readback_linear_images) {
-		return;
-	}
+	KYTY_PROFILER_FUNCTION();
 	std::scoped_lock lock {m_lock};
 	for (const auto id: m_download_images) {
 		const auto owner = m_slot_images.try_get(id);

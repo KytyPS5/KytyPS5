@@ -1138,6 +1138,7 @@ void RenderExecutor::AcquireStageImageViews(PreparedBindings& prepared) {
 static constexpr uint32_t IMAGE_RESOLVE_PASSES = 4;
 
 void RenderExecutor::RebindImages(PreparedBindings& prepared) {
+	KYTY_PROFILER_FUNCTION();
 	for (uint32_t pass = 0; pass < IMAGE_RESOLVE_PASSES; pass++) {
 		if (!ResolveStageImages(prepared)) {
 			break;

@@ -13050,9 +13050,41 @@ void TestRenderTargetReverseExportMapping() {
         "inactive reverse MRT mapping was not normalized out of the shader "
       "cache key");
   sh.target_output_mode[0] = 4;
+  sh.m_cbShaderMask = 0x0000000fu;
   PrepareProgram(regs, sh, mappings, compiled_info);
   Check(compiled_info.target_export_mapping[0] == gr32.export_mapping,
       "active reverse MRT mapping was lost before shader specialization");
+
+  sh.m_cbShaderMask = 0x000000f0u;
+  sh.target_output_mode[1] = 5;
+  mappings[1] = format.export_mapping;
+  options.input_info.pixel = &compiled_info;
+  const uint32_t compressed_shader[] = {
+      EncodeExp0(0x00, 0xf, true, true), EncodeExp1(0, 1, 0, 0), 0xbf810000u,
+  };
+  for (const auto mode : {4u, 7u}) {
+    sh.target_output_mode[0] = mode;
+    PrepareProgram(regs, sh, mappings, compiled_info);
+    Check(compiled_info.target_output_mode[0] == mode &&
+              compiled_info.target_export_mapping[0] == mappings[1] &&
+              compiled_info.target_export_mapping[1].IsIdentity(),
+          "sparse MRT export did not retain its format and mapped component order");
+    const auto result = RecompileForTest(compressed_shader, options);
+    CheckSpirvBinaryValidates(result.spirv);
+    const auto source = DisassembleSpirvBinary(result.spirv);
+    Check(source.find("OpDecorate %out_mrt_0 Location 1") != std::string::npos &&
+              source.find(mode == 7u ? "OpVariable %_ptr_Output_v4uint Output"
+                                     : "OpVariable %_ptr_Output_v4float Output") !=
+                  std::string::npos,
+          "sparse MRT export selected the wrong location or output type");
+    Check(mode == 4u ? SpirvContainsExtInst(result.spirv, 62)
+                     : CountSourceOccurrences(source, "OpBitFieldUExtract") == 4u,
+          "sparse compressed export used the physical slot's decoding mode");
+  }
+  sh.target_output_mode[0] = 0;
+  PrepareProgram(regs, sh, mappings, compiled_info);
+  Check(compiled_info.target_export_mapping[0].IsIdentity(),
+        "disabled sparse export retained a component mapping");
 }
 
 void TestBlendMappingClassification() {

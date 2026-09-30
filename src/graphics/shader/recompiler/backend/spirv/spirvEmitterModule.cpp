@@ -634,6 +634,16 @@ void DefineOutputs(EmitterState& state) {
 				break;
 			case IR::StageOutputKind::Parameter:
 			case IR::StageOutputKind::Mrt: {
+				const bool pixel_mrt = binding.kind == IR::StageOutputKind::Mrt &&
+				                       state.program.stage == ShaderType::Pixel;
+				const bool dual_source = pixel_mrt && state.input_info.pixel->dual_source_blending;
+				const auto location = pixel_mrt && !dual_source
+				                          ? ShaderPixelExportTarget(state.input_info.pixel->target_shader_mask,
+				                                                    binding.index)
+				                          : binding.location;
+				if (location == UINT32_MAX) {
+					continue;
+				}
 				const bool uint_output =
 				    binding.kind == IR::StageOutputKind::Mrt &&
 				    state.program.stage == ShaderType::Pixel &&
@@ -642,13 +652,10 @@ void DefineOutputs(EmitterState& state) {
 				const auto type = uint_output ? TypeU32Vector(state, 4) : TypeF32Vector(state, 4);
 				binding.variable_id = DefineInterfaceVariable(state, type, spv::StorageClassOutput,
 				                                              binding.debug_name.c_str());
-				const bool dual_source = binding.kind == IR::StageOutputKind::Mrt &&
-				                         state.program.stage == ShaderType::Pixel &&
-				                         state.input_info.pixel->dual_source_blending;
 				EXIT_NOT_IMPLEMENTED(dual_source && binding.index > 1);
 				state.builder.AddAnnotation(spv::OpDecorate, binding.variable_id,
 				                            spv::DecorationLocation,
-				                            dual_source ? 0u : binding.location);
+				                            dual_source ? 0u : location);
 				if (dual_source) {
 					state.builder.AddAnnotation(spv::OpDecorate, binding.variable_id,
 					                            spv::DecorationIndex, binding.index);

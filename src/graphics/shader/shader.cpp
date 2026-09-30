@@ -561,10 +561,13 @@ static void ShaderGetStaticInputInfoPS(
 		ps_info.interpolator_settings[i] = sh.ps_interpolator_settings[i];
 	}
 
-	for (int i = 0; i < 8; i++) {
-		ps_info.target_output_mode[i]    = sh.target_output_mode[i];
-		ps_info.target_export_mapping[i] = sh.target_output_mode[i] != 0
-		                                       ? target_export_mapping[i]
+	ps_info.target_shader_mask = sh.m_cbShaderMask;
+	for (uint32_t i = 0; i < 8u; i++) {
+		const auto target = ShaderPixelExportTarget(ps_info.target_shader_mask, i);
+		const auto mode = sh.target_output_mode[i];
+		ps_info.target_output_mode[i]    = mode;
+		ps_info.target_export_mapping[i] = target < 8u && mode != 0u
+		                                       ? target_export_mapping[target]
 		                                       : Prospero::ColorComponentMapping {};
 	}
 }
@@ -667,6 +670,7 @@ void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>
 	key.push_back(static_cast<uint32_t>(info.ps_early_z));
 	key.push_back(static_cast<uint32_t>(info.dual_source_blending));
 	key.push_back(static_cast<uint32_t>(info.alpha_blend_source));
+	key.push_back(info.target_shader_mask);
 	key.insert(key.end(), std::begin(info.target_output_mode), std::end(info.target_output_mode));
 	for (uint32_t base = 0; base < info.target_export_mapping.size(); base += 4u) {
 		uint32_t packed = 0;

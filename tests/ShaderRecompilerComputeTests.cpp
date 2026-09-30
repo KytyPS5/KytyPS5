@@ -1348,6 +1348,9 @@ struct GraphicsCase {
   u32 pixel_perspective_center_vgpr = UINT32_MAX;
   u32 pixel_perspective_centroid_vgpr = UINT32_MAX;
   u32 pixel_custom_interpolation_mask = 0;
+  u32 pixel_target_shader_mask = UINT32_MAX;
+  uint8_t pixel_target_output_mode = 0;
+  std::vector<std::string> required_spirv;
 };
 
 struct CompiledShader {
@@ -1771,6 +1774,9 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
   }
   pixel_info.ps_perspective_centroid_vgpr = test.pixel_perspective_centroid_vgpr;
   pixel_info.custom_interpolation_mask = test.pixel_custom_interpolation_mask;
+  pixel_info.target_shader_mask = test.pixel_target_shader_mask;
+  std::fill(std::begin(pixel_info.target_output_mode),
+            std::end(pixel_info.target_output_mode), test.pixel_target_output_mode);
   for (u32 i = 0; i < std::size(pixel_info.interpolator_settings); i++) {
     pixel_info.interpolator_settings[i] = i;
   }
@@ -1805,6 +1811,8 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
   Require(test.name, "SPIR-V emit", !result.spirv.empty(),
           "recompiler returned empty SPIR-V");
   ValidateSpirv(test.name, result.spirv);
+  CheckSpirvText({.name = test.name, .required_spirv = test.required_spirv},
+                 result.spirv);
   std::vector<u32> packed_user_data;
   for (const auto reg : result.program.bindings.user_data_registers) {
     packed_user_data.push_back(
@@ -15550,6 +15558,7 @@ public:
     HW::UserConfig user_config{};
     HW::Shader shaders{};
     registers.SetRenderTargetMask(0xf);
+    registers.SetShaderMask(0xf);
     scheduler.Begin(registers, user_config, shaders);
     auto &resources = context;
     auto &cache = context.GetTextureCache();
@@ -16371,13 +16380,11 @@ public:
         registers.SetTargetOutputMode(slot, 4);
       }
 
-      // With MRT0 still bound, an MRT3-only export must retain location3 in
+      // With MRT0 still bound, the compacted MRT3 export must retain location3 in
       // rendering attachments, pipeline formats, blend masks and dynamic write enables.
-      static const auto sparse_pixel = [] {
-        auto code = native_pixel;
-        *std::ranges::find(code, EncodeExp0(0x00, 0xf)) = EncodeExp0(0x03, 0xf);
-        return code;
-      }();
+      registers.SetShaderMask(0xf000);
+      registers.SetTargetOutputMode(3, 0);
+      static const auto sparse_pixel = native_pixel;
       const auto sparse_address = reinterpret_cast<uint64_t>(sparse_pixel.data());
       ShaderMapUserData(sparse_address,
           {.type = Prospero::ShaderBinaryType::kPs,
@@ -16423,7 +16430,7 @@ public:
         }
         AppendVMovU32(&code, 22, 0);
         AppendVMovLiteral(&code, 23, 0x3f800000u);
-        code.insert(code.end(), {EncodeExp0(0x03, 0xf), EncodeExp1(20, 21, 22, 23)});
+        code.insert(code.end(), {EncodeExp0(0x00, 0xf), EncodeExp1(20, 21, 22, 23)});
         AppendEnd(&code);
         return code;
       }();
@@ -34582,6 +34589,61 @@ GraphicsCase GraphicsInterpolationExport() {
            O::V_MOV_B32, O::EXP, O::S_ENDPGM}};
 }
 
+void CheckPixelExportTargets() {
+  constexpr const char *name = "PixelExportTargets";
+  Require(name, "compacted MRTs",
+          ShaderPixelExportTarget(0x0000fff0u, 0) == 1u &&
+              ShaderPixelExportTarget(0x0000fff0u, 1) == 2u &&
+              ShaderPixelExportTarget(0x0000fff0u, 2) == 3u,
+          "exports must skip disabled physical targets");
+  Require(name, "sparse MRTs",
+          ShaderPixelExportTarget(0xf00000f0u, 1) == 7u &&
+              ShaderPixelExportTarget(0xf00000f0u, 2) == UINT32_MAX &&
+              ShaderPixelExportTarget(0u, 0) == UINT32_MAX,
+          "missing exports must not alias an enabled target");
+  GraphicsCase test;
+  test.name = name;
+  test.pixel_target_shader_mask = 0x0000fff0u;
+  test.pixel_target_output_mode = 4;
+  AppendVMovLiteral(&test.fragment_code, 0, 0x3c003c00u);
+  for (u32 target = 0; target < 3; target++) {
+    test.fragment_code.push_back(EncodeExp0(target, 0xf, target == 2, true, true));
+    test.fragment_code.push_back(EncodeExp1(0, 0, 0, 0));
+    test.required_spirv.push_back("%out_mrt_" + std::to_string(target) +
+                                  " Location " + std::to_string(target + 1));
+  }
+  AppendEnd(&test.fragment_code);
+  (void)CompileFragmentCase(test);
+  ShaderPixelInputInfo pixel{};
+  std::vector<u32> first_key;
+  std::vector<u32> second_key;
+  BuildStageStaticKey(pixel, first_key);
+  pixel.target_shader_mask = test.pixel_target_shader_mask;
+  BuildStageStaticKey(pixel, second_key);
+  Require(name, "shader cache key", first_key != second_key,
+          "MRT mapping must specialize the shader cache key");
+  const auto address = reinterpret_cast<uint64_t>(test.fragment_code.data());
+  ShaderMapUserData(address,
+      {.type = Prospero::ShaderBinaryType::kPs,
+       .code_size_bytes = static_cast<u32>(test.fragment_code.size() * sizeof(u32))});
+  HW::PixelShaderInfo regs{};
+  regs.ps_regs.data_addr = address;
+  HW::ShaderRegisters shader_regs{};
+  shader_regs.m_cbShaderMask = test.pixel_target_shader_mask;
+  std::fill(std::begin(shader_regs.target_output_mode),
+            std::end(shader_regs.target_output_mode), 4);
+  std::array<Prospero::ColorComponentMapping, 8> mapping{};
+  mapping[1].packed = 0x1bu;
+  mapping[2].packed = 0xb1u;
+  PrepareProgram(regs, shader_regs, mapping, pixel);
+  Require(name, "physical target components",
+          pixel.target_shader_mask == shader_regs.m_cbShaderMask &&
+              pixel.target_export_mapping[0].packed == mapping[1].packed &&
+              pixel.target_export_mapping[1].packed == mapping[2].packed,
+          "logical exports must use the mapped physical target's component order");
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 GraphicsCase GraphicsPositionWExport() {
   GraphicsCase test;
   test.name = "GraphicsPositionWExport";
@@ -40827,6 +40889,10 @@ int main(int argc, char **argv) {
     RunGraphicsCase(&vulkan, GraphicsPositionWExport());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--pixel-export-only") == 0) {
+    CheckPixelExportTargets();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--centroid-only") == 0) {
     VulkanHarness vulkan;
     RunGraphicsCase(&vulkan, GraphicsPackedHalfCentroid());
@@ -41369,6 +41435,7 @@ int main(int argc, char **argv) {
   CheckEmbeddedFetchVertexOffset();
   CheckEmbeddedFetchLaneSpill();
   CheckTessellationPrograms();
+  CheckPixelExportTargets();
   CheckPixelParameterAliases();
   CheckRectListShaders();
   CheckIndirectBufferStore(vulkan);

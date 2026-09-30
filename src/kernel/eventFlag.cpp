@@ -204,7 +204,7 @@ void KernelEventFlagPrivate::Clear(uint64_t bits) {
 		m_mutex.Lock();
 	}
 
-	m_bits &= bits;
+	m_bits &= ~bits;
 }
 
 void KernelEventFlagPrivate::Cancel(uint64_t bits, int* num_waiting_threads) {

@@ -512,8 +512,50 @@ static void SchedulerBackoffOnce() {
 #endif
 }
 
+static void CpuRelax() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	YieldProcessor();
+#else
+	__builtin_ia32_pause();
+#endif
+}
+
+// A blocked short sleep lasts ~0.5 ms on Windows; spin it instead, within a per-thread budget.
+constexpr uint64_t                  ShortSleepSpinMaxNanos    = 50'000;
+constexpr uint64_t                  ShortSleepSpinBudgetNanos = 1'000'000;
+constexpr std::chrono::milliseconds ShortSleepSpinWindow {10};
+
+static bool SpinShortSleep(uint64_t nanoseconds) {
+	if (nanoseconds > ShortSleepSpinMaxNanos) {
+		return false;
+	}
+	using Clock = std::chrono::steady_clock;
+	thread_local Clock::time_point window_start {};
+	thread_local uint64_t          spent_nanos = 0;
+	const auto                     now         = Clock::now();
+	if (now - window_start >= ShortSleepSpinWindow) {
+		window_start = now;
+		spent_nanos  = 0;
+	}
+	if (spent_nanos + nanoseconds > ShortSleepSpinBudgetNanos) {
+		return false;
+	}
+	spent_nanos += nanoseconds;
+	SchedulerBackoffOnce();
+	const auto deadline = now + std::chrono::nanoseconds(nanoseconds);
+	while (Clock::now() < deadline) {
+		CpuRelax();
+	}
+	return true;
+}
+
 static void SleepMicroWithSignalPoll(uint64_t microseconds) {
 	if (microseconds == 0) {
+		SchedulerBackoffOnce();
+		KernelDispatchPendingSignalForCurrentThread();
+		return;
+	}
+	if (microseconds <= ShortSleepSpinMaxNanos / 1000u && SpinShortSleep(microseconds * 1000u)) {
 		KernelDispatchPendingSignalForCurrentThread();
 		return;
 	}
@@ -528,6 +570,10 @@ static void SleepMicroWithSignalPoll(uint64_t microseconds) {
 
 static void SleepNanoWithSignalPoll(uint64_t nanoseconds) {
 	if (nanoseconds == 0) {
+		KernelDispatchPendingSignalForCurrentThread();
+		return;
+	}
+	if (SpinShortSleep(nanoseconds)) {
 		KernelDispatchPendingSignalForCurrentThread();
 		return;
 	}

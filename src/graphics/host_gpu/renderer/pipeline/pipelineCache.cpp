@@ -499,10 +499,6 @@ struct PipelineCache::ProgramCache {
 		}
 
 		const auto user_data = std::span(params.user_data).first(params.user_data_count);
-		lookup_key.stage           = stage;
-		lookup_key.hash            = params.hash;
-		lookup_key.user_data_count = params.user_data_count;
-		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		const auto              code_size = UnfoldableCodeSize(params.code, params.back_code);
 		std::optional<uint64_t> code_key;
 		const auto              key = [&] {
@@ -512,6 +508,10 @@ struct PipelineCache::ProgramCache {
 			return *code_key;
 		};
 		const auto& proven               = unfoldable.Find(code_size, key);
+		lookup_key.stage                 = stage;
+		lookup_key.hash                  = params.hash;
+		lookup_key.user_data_count       = params.user_data_count;
+		lookup_key.code_size             = static_cast<uint32_t>(params.code.size());
 		lookup_key.unfoldable_generation = proven.generation;
 		BuildStageStaticKey(input_info, lookup_key.static_state);
 		auto                                         entry = programs.find(lookup_key);

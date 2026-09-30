@@ -350,8 +350,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
-	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write] {
-		if (is_write && !IsRegionRegistered(vaddr, size)) {
+	const bool    guest_access = !GuestGpu::IsGpuThread();
 			return;
 		}
 		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];

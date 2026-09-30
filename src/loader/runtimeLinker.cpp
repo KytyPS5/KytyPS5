@@ -658,6 +658,10 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 	}
 
 	if (info->type == Common::HostException::ExceptionType::AccessViolation) {
+		// A guest range briefly unmapped while the emulator replaced its mapping: wait until it
+		// is mapped again, then retry the access unless the GPU tracking resolves the fault.
+		const auto transient =
+		    Libs::LibKernel::Memory::WaitForTransientUnmap(info->access_violation_vaddr);
 		using CoreAccess = Common::HostException::AccessViolationType;
 		using GpuAccess  = Libs::Graphics::PageFaultAccess;
 		GpuAccess access;
@@ -676,6 +680,10 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		}
 		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
+			return true;
+		}
+		if (transient != 0 && Libs::LibKernel::Memory::RetryTransientUnmapFault(
+		                          info->access_violation_vaddr, transient)) {
 			return true;
 		}
 		if (const auto length =

@@ -1482,6 +1482,136 @@ void TestPartialUnmapPreservesHostPermissions() {
 #endif
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+DWORD HostProtection(uint64_t vaddr) {
+	MEMORY_BASIC_INFORMATION info {};
+	if (VirtualQuery(reinterpret_cast<const void*>(vaddr), &info, sizeof(info)) == 0 ||
+	    info.State != MEM_COMMIT) {
+		return 0;
+	}
+	return info.Protect;
+}
+
+// Windows splits a file view by unmapping all of it: the survivors are mapped again and must get
+// their own protections back (guest mprotect, GPU write and read tracking).
+void TestPartialUnmapPreservesHostPermissionsWindows() {
+	const char* test = "PartialUnmapPreservesHostPermissions";
+	const auto  base = MapNamedFlexible(test, SceKernelPageSize * 3, SceKernelProtCpuRw,
+	                                    "unmap_host_permissions");
+	using Common::VirtualMemory::Mode;
+	Check(test, Libs::LibKernel::Memory::ProtectGuestHostMemory(base, SceKernelPageSize, Mode::Read),
+	      "could not protect the left survivor from writes");
+	Check(test,
+	      Libs::LibKernel::Memory::ProtectGuestHostMemory(base + SceKernelPageSize * 2,
+	                                                      SceKernelPageSize, Mode::NoAccess),
+	      "could not protect the right survivor from reads");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMunmap(base + SceKernelPageSize, SceKernelPageSize),
+	        "KernelMunmap(middle)");
+
+	Check(test, HostProtection(base) == PAGE_READONLY,
+	      "partial unmap removed the left survivor's write protection");
+	Check(test, HostProtection(base + SceKernelPageSize * 2) == PAGE_NOACCESS,
+	      "partial unmap removed the right survivor's read protection");
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, SceKernelPageSize),
+	        "KernelMunmap(left cleanup)");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMunmap(base + SceKernelPageSize * 2, SceKernelPageSize),
+	        "KernelMunmap(right cleanup)");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
+std::atomic<uint64_t> g_transient_unmap_retries {0};
+
+// The part of the runtime linker's fault handler that retries accesses to a replaced mapping.
+LONG CALLBACK TransientUnmapFaultHandler(EXCEPTION_POINTERS* info) {
+	const auto* record = info->ExceptionRecord;
+	if (record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record->NumberParameters < 2) {
+		return EXCEPTION_CONTINUE_SEARCH;
+	}
+	const auto address = static_cast<uint64_t>(record->ExceptionInformation[1]);
+	const auto window  = Libs::LibKernel::Memory::WaitForTransientUnmap(address);
+	if (window != 0 && Libs::LibKernel::Memory::RetryTransientUnmapFault(address, window)) {
+		g_transient_unmap_retries.fetch_add(1, std::memory_order_relaxed);
+		return EXCEPTION_CONTINUE_EXECUTION;
+	}
+	return EXCEPTION_CONTINUE_SEARCH;
+}
+
+// On the console, unmapping part of a mapping and MAP_FIXED over a mapping leave the rest of the
+// memory usable by other threads. The emulator briefly unmaps it (Windows view splits, unmap then
+// map for MAP_FIXED); a thread using it meanwhile must not fault for good.
+void TestAccessDuringMappingReplacement() {
+	const char*   test    = "AccessDuringMappingReplacement";
+	constexpr int Pages   = 64;
+	auto*         handler = AddVectoredExceptionHandler(1, TransientUnmapFaultHandler);
+	Check(test, handler != nullptr, "failed to install test exception handler");
+	g_transient_unmap_retries = 0;
+
+	const auto flexible = MapNamedFlexible(test, SceKernelPageSize * Pages, SceKernelProtCpuRw,
+	                                       "transient_split");
+
+	int64_t phys_addr = 0;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+	            0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), SceKernelPageSize,
+	            SceKernelPageSize, SceKernelMtypeC, &phys_addr),
+	        "KernelAllocateDirectMemory");
+	void* direct_addr = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(&direct_addr, SceKernelPageSize,
+	                                                            SceKernelProtCpuRw, 0, phys_addr,
+	                                                            SceKernelPageSize, "transient_fixed"),
+	        "KernelMapNamedDirectMemory");
+	const auto direct = reinterpret_cast<uint64_t>(direct_addr);
+
+	std::atomic<bool>     stop {false};
+	std::atomic<uint64_t> mismatches {0};
+	std::atomic<uint64_t> accesses {0};
+	std::thread           worker([&] {
+		auto*    kept     = reinterpret_cast<volatile uint64_t*>(flexible);
+		auto*    replaced = reinterpret_cast<volatile uint64_t*>(direct);
+		uint64_t i        = 0;
+		for (; !stop.load(std::memory_order_relaxed); i++) {
+			kept[i % 512]     = i;
+			replaced[i % 512] = i;
+			if (kept[i % 512] != i || replaced[i % 512] != i) {
+				mismatches.fetch_add(1, std::memory_order_relaxed);
+			}
+		}
+		accesses = i;
+	});
+
+	// Each unmap is a partial unmap of the view that holds the worker's page.
+	for (int page = Pages - 1; page >= 1; page--) {
+		CheckOk(test,
+		        Libs::LibKernel::Memory::KernelMunmap(flexible + SceKernelPageSize * page,
+		                                              SceKernelPageSize),
+		        "KernelMunmap(split)");
+	}
+	for (int i = 0; i < 256; i++) {
+		void* fixed = direct_addr;
+		CheckOk(test,
+		        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
+		            &fixed, SceKernelPageSize, SceKernelProtCpuRw, SceKernelMapFixed, phys_addr,
+		            SceKernelPageSize, "transient_fixed"),
+		        "KernelMapNamedDirectMemory(fixed)");
+		Check(test, fixed == direct_addr, "MAP_FIXED moved the mapping");
+	}
+	stop = true;
+	worker.join();
+	RemoveVectoredExceptionHandler(handler);
+
+	Check(test, mismatches == 0, "memory changed while its mapping was replaced");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(flexible, SceKernelPageSize),
+	        "KernelMunmap(flexible cleanup)");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(direct, SceKernelPageSize),
+	        "KernelMunmap(direct cleanup)");
+	CheckOk(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(phys_addr, SceKernelPageSize),
+	        "KernelReleaseDirectMemory");
+	std::printf("[host]    %-48s ok (%" PRIu64 " accesses, %" PRIu64 " retried)\n", test,
+	            accesses.load(), g_transient_unmap_retries.load());
+}
 void TestWindowsBackingViewPermissions() {
 	const char* test = "WindowsBackingViewPermissions";
 	Check(test, Libs::LibKernel::Memory::TestWindowsBackingViewModes(),
@@ -4500,6 +4630,8 @@ int main(int argc, char** argv) {
 	RunTest(TestPartialUnmapPreservesHostPermissions);
 #endif
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	RunTest(TestPartialUnmapPreservesHostPermissionsWindows);
+	RunTest(TestAccessDuringMappingReplacement);
 	RunTest(TestWindowsBackingViewPermissions);
 #endif
 	RunTest(TestDirectMappingNamesTypesAndValidation);

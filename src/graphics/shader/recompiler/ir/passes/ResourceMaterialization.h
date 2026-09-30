@@ -53,7 +53,10 @@ struct ResourceSpecialization {
 // its values and is independent of the translated shader CFG.
 ResourcePlan ExtractResourcePlan(const Program& program);
 
-// Refreshes cached resources and specialization in place. A failed refresh must not be used.
+// One line naming why the last MaterializeResources on this thread refused.
+std::string_view LastMaterializeFailure();
+
+// Refreshes cached resources and specialization. A refusal leaves the specialization untouched.
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
 

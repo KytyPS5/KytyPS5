@@ -178,6 +178,8 @@ bool ReadShaderGuestMemoryPermissive(void*, uint64_t address, std::span<uint32_t
 	return true;
 }
 
+}
+
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
                      const std::vector<uint32_t>& spirv) {
 	if (!Config::GraphicsDebugDumpEnabled()) {
@@ -378,7 +380,11 @@ struct PipelineCache::ProgramCache {
 		if (!reported_shaders.insert(hash).second) {
 			return;
 		}
+		const auto reason = ShaderRecompiler::IR::LastMaterializeFailure();
 		PipelineCacheLog("shader resources unavailable, skipping this dispatch: "
+		                 "hash=0x{:016x} stage={} descriptor materialization failed: {}",
+		                 hash, StageShortName(stage),
+		                 reason.empty() ? std::string_view {"no recorded reason"} : reason);
 	}
 
 	void ReportStubbed(ShaderType stage, uint64_t hash) {

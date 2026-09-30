@@ -146,7 +146,9 @@ public:
 	bool Evaluate(Value value, uint32_t& result);
 	bool EvaluateDescriptor(uint32_t source, DescriptorValue& result);
 	// Refreshes reachable scalar reads and active descriptor sources in one walk.
-	bool RefreshFlatBuffer(std::vector<uint32_t>& flat);
+	// A GPU-owned data slot reads 0, is listed in `gpu_owned_slots`, and the refresh refuses.
+	bool RefreshFlatBuffer(std::vector<uint32_t>& flat, bool prune = true,
+	                       SrtWalker*             conditions      = nullptr,
 
 private:
 	SrtWalker(SrtWalker& parent, Value active_mask, bool clean = false,
@@ -159,6 +161,7 @@ private:
 	bool EvaluatePhi(const Inst& inst, uint64_t& result);
 	bool EvaluateExtract(const Inst& inst, uint64_t& result);
 	bool EvaluateInst(const Inst& inst, uint64_t& result);
+	bool     EvaluateRule(const Inst& inst, uint64_t& result);
 
 	const ResourcePlan&              m_program;
 	SrtRuntime                      m_runtime;

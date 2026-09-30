@@ -4,8 +4,6 @@
 #include "common/assert.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
-#include <xbyak/xbyak.h>
-
 #include <algorithm>
 #include <bit>
 #include <cmath>
@@ -595,6 +593,7 @@ private:
 			if (!IsDescriptorLoad(m_program, *inst) ||
 			    inst->Arg(0).ResolveInstruction() == nullptr ||
 			    inst->Arg(0).ResolveInstruction()->GetOpcode() != ValueOpcode::GetBufferResource) {
+				return finish(false);
 			}
 			const auto guard = inst->Arg(4).Resolve();
 			return finish(
@@ -776,19 +775,87 @@ void CompileSrtWalker(ResourcePlan& program) {
 	EXIT_IF(Xbyak::GetError() != 0);
 }
 
+size_t RawReadOffsetArgument(ValueOpcode op) {
+	return DescriptorLoadDwords(op) != 0u ? 3u : 1u;
+}
+
+bool RawReadShapeOf(const ResourcePlan& program, const Inst& inst, uint32_t component_bytes,
+                    RawReadShape& shape) {
+	const auto index = inst.Flags<SrtReadFlags>().index;
+	if (index >= program.memory_info.size()) {
+		return false;
+	}
+	const auto op = inst.GetOpcode();
+	shape.immediate =
+	    static_cast<int64_t>(static_cast<int32_t>(program.memory_info[index].offset)) +
+	    component_bytes;
+	shape.kind = op == ValueOpcode::ReadConstBuffer ? RawReadShape::Kind::ConstBuffer
+	             : op == ValueOpcode::LoadBufferU32 ? RawReadShape::Kind::VectorBuffer
+	             : DescriptorLoadDwords(op) != 0u   ? RawReadShape::Kind::VectorDescriptor
+	                                                : RawReadShape::Kind::Address;
+	return true;
+}
+
+SrtRefusal RawReadAddressFrom(const RawReadShape& shape, const std::array<uint64_t, 5>& operands,
+                              uint64_t& address, bool& zero) {
+	zero              = false;
+	const auto high   = operands[1];
+	const auto offset = operands[2];
+	const auto base   = ((high << 32u) | static_cast<uint32_t>(operands[0])) & AddressMask;
+	if (shape.kind == RawReadShape::Kind::Address) {
+		const auto relative = (shape.immediate & ~int64_t {3}) +
+		                      static_cast<int64_t>(static_cast<uint32_t>(offset) & ~3u);
+		return AddSignedAddress(base & ~uint64_t {3}, relative, address)
+		           ? SrtRefusal::None
+		           : SrtRefusal::ReadOutOfBounds;
+	}
+	const auto records = operands[3];
+	const auto word3   = operands[4];
+	if (shape.immediate < 0) {
+		return SrtRefusal::UnsupportedOperand;
+	}
+	const auto byte_offset = (static_cast<uint64_t>(shape.immediate) & ~uint64_t {3}) +
+	                         (static_cast<uint32_t>(offset) & ~3u);
+	const auto stride      = (static_cast<uint32_t>(high) >> 16u) & 0x3fffu;
+	if (shape.kind != RawReadShape::Kind::ConstBuffer) {
+		// Only the uniform, unswizzled DWORD address is evaluated on the host.
+		if ((high & (1u << 31u)) != 0u || (word3 & ((1u << 23u) | 0xf0000000u)) != 0u) {
+			return SrtRefusal::UnsupportedOperand;
+		}
+		if ((shape.kind == RawReadShape::Kind::VectorBuffer && stride == 0u) || records == 0u ||
+		    ((word3 >> 12u) & 0x7fu) == 0u) {
+			zero = true;
+			return SrtRefusal::None;
+		}
+	}
+	const auto size = stride == 0u ? static_cast<uint64_t>(static_cast<uint32_t>(records))
+	                               : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
+	if (byte_offset > size || size - byte_offset < sizeof(uint32_t)) {
+		zero = true;
+		return SrtRefusal::None;
+	}
+	address = (base & ~uint64_t {3}) + byte_offset;
+	return SrtRefusal::None;
+}
+
 SrtWalker::SrtWalker(const ResourcePlan& program, const SrtRuntime& runtime,
                      SrtWalker* clean_evaluator)
-    : m_program(program), m_runtime(runtime), m_clean_evaluator(clean_evaluator),
-      m_session(this),
-      m_read_policy(clean_evaluator != nullptr ? 2u : 0u), m_context(AcquireContext()) {}
+    : m_program(program), m_runtime(runtime), m_clean_evaluator(clean_evaluator), m_session(this),
+      m_read_policy(clean_evaluator != nullptr ? 2u : 0u), m_state(&m_own_state),
+      m_context(AcquireContext()) {}
 
-SrtWalker::SrtWalker(SrtWalker& parent, Value active_mask, bool clean,
-                     SrtWalker* clean_evaluator)
-    : m_program(parent.m_program), m_runtime(clean ? CleanRuntime(parent.m_runtime) : parent.m_runtime),
+SrtWalker::SrtWalker(SrtWalker& parent, Value active_mask, bool clean, SrtWalker* clean_evaluator,
+                     bool isolated)
+    : m_program(parent.m_program),
+      m_runtime(clean ? CleanRuntime(parent.m_runtime) : parent.m_runtime),
       m_clean_evaluator(clean_evaluator), m_active_mask(active_mask.Resolve()),
       m_reachable_blocks(parent.m_reachable_blocks), m_session(parent.m_session),
       m_read_policy((parent.m_read_policy & 1u) | (clean ? 1u : 0u) |
-                    (clean_evaluator != nullptr ? 2u : 0u)), m_context(AcquireContext()) {}
+                    (clean_evaluator != nullptr ? 2u : 0u)),
+      m_isolated(isolated || parent.m_isolated), m_state(parent.m_state),
+      m_context(AcquireContext()) {
+	// A walker that takes phis on trust or binds a lane keeps its own memo, as do its children.
+	if (!isolated && parent.m_isolated) {
 
 SrtWalker::~SrtWalker() {
 	if (m_session != this) return;
@@ -951,9 +1018,13 @@ bool SrtWalker::EvaluatePhi(const Inst& inst, uint64_t& result) {
 	if (!value.IsEmpty()) {
 		return EvaluateWide(value, result);
 	}
+	if (m_barred.contains(&inst)) {
+		return Refuse(SrtRefusal::VaryingPhi);
 	}
 	// Loop-carried: assume the entry value and require every operand of the phi web to reproduce
 	// it.
+	if (!EvaluateWide(entry, candidate)) {
+		return false;
 	}
 	// A separate memo: this walk already holds the operands the phi was reached through.
 	SrtWalker trial(*this, m_active_mask, false, m_clean_evaluator, true);
@@ -962,12 +1033,14 @@ bool SrtWalker::EvaluatePhi(const Inst& inst, uint64_t& result) {
 	trial.m_lane           = m_lane;
 	trial.m_suspended_lane = m_suspended_lane;
 	for (const auto* member: web) {
+			return Refuse(SrtRefusal::VaryingPhi);
 		}
 	}
 	for (const auto* member: web) {
 		for (size_t index = 0; index < member->NumArgs(); index++) {
 			uint64_t carried = 0;
 			if (!trial.EvaluateWide(member->Arg(index), carried)) return false;
+			if (carried != candidate) return Refuse(SrtRefusal::VaryingPhi);
 		}
 	}
 	result = candidate;
@@ -1010,7 +1083,6 @@ bool SrtWalker::EvaluateExtract(const Inst& inst, uint64_t& result) {
 	}
 }
 
-		return false;
 	const auto* source = inst.Arg(0).ResolveInstruction();
 	if (source == nullptr || component >= 4u) {
 		return Refuse(SrtRefusal::UnsupportedOperand);
@@ -1033,6 +1105,12 @@ bool SrtWalker::EvaluateExtract(const Inst& inst, uint64_t& result) {
 		return EvaluateRawRead(*source, result, component * sizeof(uint32_t));
 	}
 	return Refuse(SrtRefusal::UnsupportedOperand);
+	RawReadShape shape;
+	if (!RawReadShapeOf(m_program, inst, component_bytes, shape)) {
+		return Refuse(SrtRefusal::UnsupportedOperand);
+	}
+	const bool vector = shape.kind == RawReadShape::Kind::VectorBuffer ||
+	                    shape.kind == RawReadShape::Kind::VectorDescriptor;
 	const auto guard = vector ? inst.Arg(4).Resolve() : Value {};
 	if (vector && (guard.IsImmediate() || guard != m_active_mask)) {
 		uint64_t enabled = 0;
@@ -1044,22 +1122,21 @@ bool SrtWalker::EvaluateExtract(const Inst& inst, uint64_t& result) {
 	}
 	const auto* handle = inst.Arg(0).ResolveInstruction();
 	if (handle == nullptr) {
+		return Refuse(SrtRefusal::UnsupportedOperand);
+	}
+	auto&        operands = event.operands;
+	if (!Arg(*handle, 0, operands[0]) || !Arg(*handle, 1, operands[1]) ||
+	    !Arg(inst, RawReadOffsetArgument(inst.GetOpcode()), operands[2])) {
 		return false;
 	}
-	uint64_t low    = 0;
-	uint64_t high   = 0;
-	uint64_t offset = 0;
-		return false;
+	if (shape.kind != RawReadShape::Kind::Address) {
 	}
 		uint64_t records = 0;
 		uint64_t word3   = 0;
 		if (handle->NumArgs() != 4u || !Arg(*handle, 2, records) || !Arg(*handle, 3, word3)) {
-			return false;
 		}
 		if (immediate < 0) {
-			return false;
 		}
-				return false;
 			}
 		}
 			result = 0u;
@@ -1068,16 +1145,16 @@ bool SrtWalker::EvaluateExtract(const Inst& inst, uint64_t& result) {
 		const auto relative = (immediate & ~int64_t {3}) +
 		                      static_cast<int64_t>(static_cast<uint32_t>(offset) & ~3u);
 		if (!AddSignedAddress(base & ~uint64_t {3}, relative, address)) {
-			return false;
 		}
 	}
 	uint32_t word = 0;
 	const auto reader = vector ? m_runtime.read_specialization_memory : m_runtime.read_memory;
 	if (reader != nullptr) {
 		if (!reader(m_runtime.userdata, address, {&word, 1})) {
-			return false;
+			return Refuse(SrtRefusal::ReadRefused);
 		}
 	} else {
+		if (vector) return Refuse(SrtRefusal::ReadRefused);
 		std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
 	}
 	result = word;
@@ -1091,7 +1168,16 @@ void SrtWalker::BarAssumptions(SrtWalker& walker) const {
 		walker.m_barred.insert(assumed.first);
 }
 
+
 bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
+	const auto refusals = m_state->refusals;
+	if (EvaluateRule(inst, result)) return true;
+	// The operands evaluated but this instruction cannot combine them.
+	if (m_state->refusals == refusals) Refuse(SrtRefusal::UnsupportedOperand);
+	return false;
+}
+
+bool SrtWalker::EvaluateRule(const Inst& inst, uint64_t& result) {
 	uint64_t   a       = 0;
 	uint64_t   b       = 0;
 	uint64_t   c       = 0;
@@ -1705,7 +1791,8 @@ bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
 	return true;
 }
 
-bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
+bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat, bool prune, SrtWalker* conditions,
+                                  std::vector<uint32_t>* gpu_owned_slots) {
 	if (!m_program.srt_plan_complete) return false;
 	if (m_program.srt_code && m_runtime.read_memory == nullptr) {
 		flat.resize(m_program.srt_reads.size());
@@ -1716,15 +1803,23 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		return m_program.srt_code->getCode<Walker>()(m_runtime.user_data.data(), flat.data(),
 		    m_context.values.data(), m_context.generation, m_runtime.user_data.size());
 	}
+	const auto fail = [&](SrtRefusal reason) {
+		m_refusal = reason;
+		return false;
+	};
+	bool       owned   = false;
 	const auto refresh = [&](uint32_t slot) {
-		if (slot >= m_program.srt_reads.size()) return false;
+		if (slot >= m_program.srt_reads.size()) return fail(SrtRefusal::UnsupportedOperand);
 		const auto& read = m_program.srt_reads[slot];
 		const auto* inst = read.value.ResolveInstruction();
 		const bool clean = inst != nullptr && inst->Flags<SrtReadFlags>().clean != 0u;
 		if (clean && (m_clean_evaluator == nullptr || m_runtime.read_specialization_memory == nullptr))
-			return false;
+			return fail(SrtRefusal::ReadRefused);
 		auto& evaluator = clean ? *m_clean_evaluator : *this;
-		return read.flat_offset < flat.size() && evaluator.Evaluate(read.value, flat[read.flat_offset]);
+		if (read.flat_offset >= flat.size()) return fail(SrtRefusal::UnsupportedOperand);
+		if (evaluator.Evaluate(read.value, flat[read.flat_offset])) return true;
+		if (gpu_owned_slots != nullptr && evaluator.m_refusal == SrtRefusal::GpuOwned) {
+		return fail(evaluator.m_refusal);
 	};
 	auto& active = m_program.active_sources;
 	if (m_program.control_flow.empty()) {

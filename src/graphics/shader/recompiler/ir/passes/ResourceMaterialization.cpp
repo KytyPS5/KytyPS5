@@ -26,11 +26,133 @@ constexpr uint64_t AddressMask            = 0x0000ffffffffffffull;
 std::string& MaterializeFailure() {
 	static thread_local std::string reason;
 	return reason;
+// A refusal skips the draw; its caller reports MaterializeFailure() as its one line.
 bool SpecializationFail(std::string_view message) {
-	std::fprintf(stderr, "shader resource specialization failed: %.*s\n",
-	             static_cast<int>(message.size()), message.data());
+	MaterializeFailure() = message;
 	return false;
 }
+
+std::string_view RefusalName(const SrtWalker& walker, const SrtWalker& clean) {
+	return SrtRefusalName(walker.Refusal() != SrtRefusal::None ? walker.Refusal()
+	                                                           : clean.Refusal());
+}
+
+bool PhiRefusal(SrtRefusal refusal) {
+	return refusal == SrtRefusal::VaryingPhi || refusal == SrtRefusal::PhiNoEntry ||
+	       refusal == SrtRefusal::PhiMerge;
+}
+
+bool RefuseRead(void*, uint64_t, std::span<uint32_t>) {
+	return false;
+}
+
+// Records each specialization read with the flat SRT slot whose walk issued it.
+class SpecializationReadCapture {
+public:
+	SpecializationReadCapture(const SrtRuntime& source, ResourceSnapshot& snapshot,
+	                          std::vector<uint8_t>& conditions)
+	    : m_source(source), m_ranges(snapshot.specialization_reads),
+	      m_slots(snapshot.specialization_read_slots), m_conditions(conditions) {}
+
+	SrtRuntime ObservedRuntime() {
+		auto runtime        = m_source;
+		runtime.userdata    = this;
+		runtime.read_memory = ReadOrdinary;
+		runtime.read_specialization_memory =
+		    m_source.read_specialization_memory != nullptr ? ReadStrict : nullptr;
+		runtime.read_condition_memory =
+		    m_source.read_condition_memory != nullptr ? ReadCondition : nullptr;
+		runtime.gpu_owned       = m_source.gpu_owned != nullptr ? GpuOwned : nullptr;
+		runtime.readable_extent = m_source.readable_extent != nullptr ? ReadableExtent : nullptr;
+		runtime.read_specialization_block =
+		    m_source.read_specialization_block != nullptr ? ReadBlock : nullptr;
+		runtime.hash_specialization_block =
+		    m_source.hash_specialization_block != nullptr ? HashBlock : nullptr;
+		runtime.walk_restarted = m_source.walk_restarted != nullptr ? WalkRestarted : nullptr;
+		runtime.zero_read      = m_source.zero_read != nullptr ? ZeroRead : nullptr;
+		return runtime;
+	}
+
+private:
+	static SpecializationReadCapture& Of(void* userdata) {
+		return *static_cast<SpecializationReadCapture*>(userdata);
+	}
+
+	void Record(uint64_t address, uint64_t bytes, bool condition = false) {
+		m_ranges.emplace_back(address, bytes);
+		m_slots.push_back(CurrentSrtReadSlot());
+		m_conditions.push_back(condition ? 1u : 0u);
+	}
+
+	static bool ReadStrict(void* userdata, uint64_t address, std::span<uint32_t> values) {
+		auto& capture = Of(userdata);
+		if (!capture.m_source.read_specialization_memory(capture.m_source.userdata, address,
+		                                                 values))
+			return false;
+		capture.Record(address, values.size_bytes());
+		return true;
+	}
+
+	static bool ReadCondition(void* userdata, uint64_t address, std::span<uint32_t> values) {
+		auto& capture = Of(userdata);
+		if (!capture.m_source.read_condition_memory(capture.m_source.userdata, address, values))
+			return false;
+		capture.Record(address, values.size_bytes(), true);
+		return true;
+	}
+
+	static bool ReadOrdinary(void* userdata, uint64_t address, std::span<uint32_t> values) {
+		auto& capture = Of(userdata);
+		if (capture.m_source.read_memory != nullptr) {
+			if (!capture.m_source.read_memory(capture.m_source.userdata, address, values))
+				return false;
+		} else {
+			std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
+		}
+		capture.Record(address, values.size_bytes());
+		return true;
+	}
+
+	static bool GpuOwned(void* userdata, uint64_t address, uint64_t size) {
+		auto& capture = Of(userdata);
+		return capture.m_source.gpu_owned(capture.m_source.userdata, address, size);
+	}
+
+	static uint64_t ReadableExtent(void* userdata, uint64_t address, uint64_t size) {
+		auto& capture = Of(userdata);
+		return capture.m_source.readable_extent(capture.m_source.userdata, address, size);
+	}
+
+	static bool ReadBlock(void* userdata, uint64_t address, void* data, uint64_t size) {
+		auto& capture = Of(userdata);
+		if (!capture.m_source.read_specialization_block(capture.m_source.userdata, address, data,
+		                                                size))
+			return false;
+		capture.Record(address, size);
+		return true;
+	}
+
+	static bool HashBlock(void* userdata, uint64_t address, uint64_t size, uint64_t* hash) {
+		auto& capture = Of(userdata);
+		return capture.m_source.hash_specialization_block(capture.m_source.userdata, address, size,
+		                                                  hash);
+	}
+
+	static void WalkRestarted(void* userdata) {
+		auto& capture = Of(userdata);
+		capture.m_source.walk_restarted(capture.m_source.userdata);
+	}
+
+	static void ZeroRead(void* userdata) {
+		auto& capture = Of(userdata);
+		capture.m_source.zero_read(capture.m_source.userdata);
+	}
+
+	SrtRuntime                                  m_source;
+	std::vector<std::pair<uint64_t, uint64_t>>& m_ranges;
+	std::vector<uint32_t>&                      m_slots;
+	std::vector<uint8_t>&                       m_conditions;
+};
 
 Decoder::ImageDimension DescriptorDimension(const DescriptorValue&  descriptor,
                                             Decoder::ImageDimension requested) {
@@ -1582,40 +1704,14 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	return plan;
 }
 
-bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
-                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
-	for (auto& keys: program.selector_keys) keys.resolved = false;
-	if (!program.resource_tracking_complete ||
-	    ((program.requires_specialization_memory || !program.source_reads.empty()) &&
-	     runtime.read_specialization_memory == nullptr)) {
-		return false;
-	}
-	const auto uses_workgroup_count = [](const DescriptorSource& source) {
-		return source.indirect_descriptor && source.indirect_descriptor->workgroup_axis != UINT32_MAX;
-	};
-	const bool capture_reads = program.capture_specialization_reads || !program.source_reads.empty() ||
-	    (runtime.indirect_args_address != 0u &&
-	     std::ranges::any_of(program.descriptor_sources, uses_workgroup_count));
 	auto& reads = snapshot.specialization_reads;
 	reads = program.source_reads;
 	SrtReadCapture capture {runtime, reads};
-	auto observed = capture_reads ? capture.ObservedRuntime() : runtime;
 	SrtWalker clean(program, CleanRuntime(observed));
-	if (!walker.RefreshFlatBuffer(snapshot.flattened_srt)) {
-		return SpecializationFail(fmt::format("SRT refresh complete={} reads={} user_data={}",
-		    program.srt_plan_complete, program.srt_reads.size(), runtime.user_data.size()));
-	}
-	const auto active = std::span<const uint8_t>(program.active_sources);
-	std::array<uint32_t, 3> workgroup_counts {};
-	if (runtime.indirect_args_address != 0u) {
-		for (uint32_t source = 0; source < program.descriptor_sources.size(); ++source) {
-			if ((!active.empty() && !active[source]) ||
-			    !uses_workgroup_count(program.descriptor_sources[source])) continue;
-			if ((runtime.indirect_args_address & 3u) != 0u ||
-			    !ReadTable(runtime.indirect_args_address, sizeof(workgroup_counts), 0u,
-			               observed, workgroup_counts)) return false;
-			observed.workgroup_counts = workgroup_counts;
-			break;
+std::string_view LastMaterializeFailure() {
+	return MaterializeFailure();
+}
+
 		}
 	}
 	snapshot.uniform_fill = {};
@@ -1645,29 +1741,15 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			    SpecializationFail(fmt::format("descriptor evaluation source={}", source));
 		}
 		value = {};
-		value.dword_count = program.descriptor_sources[source].dword_count;
-		return true;
-	};
-	const auto resource_failed = [&](std::string_view kind, uint32_t resource, uint32_t source,
-	                                 size_t candidates) {
-		return SpecializationFail(fmt::format("indirect {} resource={} source={} candidates={}",
-		    kind, resource, source, candidates));
-	};
-	snapshot.buffers.resize(program.info.buffers.size());
+
+static bool SpecializeBuffers(const ResourcePlan& program, ResourceSnapshot& snapshot,
+                              ResourceSpecialization& specialization) {
+	specialization.unbound_buffers.assign(snapshot.buffers.size(), false);
 	for (uint32_t i = 0; i < snapshot.buffers.size(); ++i) {
 		const auto base_index =
 		    i < program.info.buffers.size() ? i : specialization.buffers[i].indirect_root;
 		if (base_index >= program.info.buffers.size()) return false;
-					        program, base.source, i, 4u, 4u, observed, clean, snapshot,
-					        snapshot.buffers, specialization.buffers,
-					        [&](DescriptorValue& value) {
-						        return NormalizeIndirectBuffer(
-						            value, source->indirect_descriptor->indexed, base);
-					        }))
-						return resource_failed("buffer", i, base.source, snapshot.buffers.size());
-				}
-			}
-		}
+		const auto&          base             = program.info.buffers[base_index];
 		auto&                descriptor_value = snapshot.buffers[i];
 		ShaderBufferResource descriptor;
 		if (!DecodeBufferDescriptor(descriptor_value, descriptor)) {
@@ -1685,6 +1767,10 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		} else if (!swizzle) {
 			packed_stride &= ~(3u << 16u);
 		}
+		// No access indexes this buffer, so only a swizzle or ADD_TID makes its stride matter.
+		if (base.unindexed && (packed_stride & ((1u << 14u) | (1u << 20u))) == 0u) {
+			packed_stride = 0u;
+		}
 		auto& buffer         = specialization.buffers[i];
 		buffer.packed_stride = packed_stride;
 		buffer.descriptor_format =
@@ -1692,7 +1778,49 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		buffer.descriptor_swizzle = base.formatted ? descriptor.DstSelXYZW() : DstSel(4, 5, 6, 7);
 		buffer.zero_stride_oob    = descriptor.OutOfBounds() == 0u && stride == 0u;
 		buffer.scalar_empty       = base.scalar && descriptor.GetSize() == 0u;
+		const auto* source        = Source(program, base.source);
+		specialization.unbound_buffers[i] =
+		    i < program.info.buffers.size() &&
+		    buffer.indirect_root == BufferResource::NoIndirectBuffer && source != nullptr &&
+		    !source->indirect_descriptor &&
+		    (descriptor.Base48() == 0u || descriptor.GetSize() == 0u);
 	}
+	return true;
+}
+
+static uint32_t SrtReadPc(const ResourcePlan& program, uint32_t slot) {
+	if (program.frozen_values) {
+		return slot < program.srt_read_pcs.size() ? program.srt_read_pcs[slot] : UINT32_MAX;
+	}
+	const auto* read = slot < program.srt_reads.size()
+	                       ? program.srt_reads[slot].value.ResolveInstruction()
+	                       : nullptr;
+	return read != nullptr ? read->Flags<MemoryFlags>().pc : UINT32_MAX;
+}
+
+static bool MaterializeInto(const ResourcePlan& program, const SrtRuntime& runtime,
+                            ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
+                            std::vector<uint8_t>&  conditions,
+                            std::vector<uint32_t>* refused_tables) {
+	for (auto& keys: program.selector_keys) keys.resolved = false;
+	if (!program.resource_tracking_complete ||
+	    ((program.requires_specialization_memory || !program.source_reads.empty()) &&
+	     runtime.read_specialization_memory == nullptr)) {
+		return SpecializationFail("resource plan is incomplete");
+	}
+	const auto uses_workgroup_count = [](const DescriptorSource& source) {
+		return source.indirect_descriptor && source.indirect_descriptor->workgroup_axis != UINT32_MAX;
+	};
+	const bool capture_reads = program.capture_specialization_reads || !program.source_reads.empty() ||
+	    (runtime.indirect_args_address != 0u &&
+	     std::ranges::any_of(program.descriptor_sources, uses_workgroup_count));
+	snapshot.specialization_reads = program.source_reads;
+	snapshot.specialization_read_slots.assign(program.source_reads.size(), UINT32_MAX);
+	conditions.assign(program.source_reads.size(), 0u);
+	SpecializationReadCapture capture {runtime, snapshot, conditions};
+	auto observed = capture_reads ? capture.ObservedRuntime() : runtime;
+	SrtWalker clean(program, CleanRuntime(observed));
+	static thread_local std::vector<uint32_t> gpu_owned_slots;
 	std::array<uint32_t, 3> workgroup_counts {};
 	if (runtime.indirect_args_address != 0u) {
 		for (uint32_t source = 0; source < program.descriptor_sources.size(); ++source) {
@@ -1706,6 +1834,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			break;
 		}
 	}
+			return SpecializationFail(fmt::format("descriptor source {} is missing", source));
 			auto& evaluator = capture_reads && written ? clean : walker;
 			return evaluator.EvaluateDescriptor(source, value) ||
 			       SpecializationFail(fmt::format("descriptor evaluation source={}: {}", source,
@@ -1714,6 +1843,8 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		                                          "indirect {} resource={} source={} candidates={}",
 		                                          kind, resource, source, candidates))
 				}
+			if (refused_tables == nullptr || !PhiRefusal(evaluator.Refusal())) return false;
+			refuse(base.first_use_pc);
 	snapshot.images.resize(program.info.images.size());
 	specialization.images.resize(program.info.images.size());
 	for (uint32_t i = 0; i < program.info.images.size(); ++i) {
@@ -1731,7 +1862,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		};
 		const auto* source = Source(program, image.source);
 		if (source == nullptr) {
-			return false;
+			return SpecializationFail("image source is missing");
 		}
 		if (source->indirect_descriptor.has_value()) {
 			snapshot.images[i] = {.dword_count = 8u};
@@ -1740,6 +1871,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			}
 			const auto& indirect = *source->indirect_descriptor;
 			const bool bounded_table = IsBoundedDescriptorTable(program, indirect);
+			MaterializeFailure().clear();
 			if (!MaterializeIndirectDescriptor(
 			        program, image.source, i, 8u, image.r128 ? 4u : 8u, observed, clean, snapshot, snapshot.images,
 			        specialization.images, [&](DescriptorValue& value) {

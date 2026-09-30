@@ -1552,7 +1552,7 @@ int KYTY_SYSV_ABI AgcSuspendPoint() {
 	PRINT_NAME();
 
 	EXIT_IF(g_renderer == nullptr);
-	g_renderer->GetGpu().Done();
+	g_renderer->GetGpu().SuspendPoint();
 
 	return OK;
 }

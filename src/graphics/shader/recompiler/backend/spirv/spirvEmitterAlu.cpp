@@ -307,6 +307,11 @@ uint32_t EmitConvertF32F64(EmitterState& state, uint32_t arg0) {
 	                  Unary(state, spv::OpBitcast, TypeF32(state), clamped), converted));
 }
 
+uint32_t EmitConvertF64F32(EmitterState& state, uint32_t arg0) {
+	return EmitNative<spv::OpFConvert, IR::Type::F64>(state,
+	                                                  EmitFlushF32DenormToSignedZero(state, arg0));
+}
+
 uint32_t EmitCompositeExtractU64(EmitterState& state, uint32_t arg0, IR::Value arg1) {
 	return EmitNative<spv::OpCompositeExtract, IR::Type::U32>(state, arg0, arg1.U32());
 }

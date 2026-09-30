@@ -24,8 +24,6 @@
 
 namespace Libs::Graphics {
 
-static std::atomic<uint32_t> g_render_color_log_count = 0;
-
 static bool DccAlphaOnMsb(const HW::ColorInfo& info) {
 	switch (info.format) {
 		case Prospero::ChannelLayout::k10_10_10_2:
@@ -299,7 +297,7 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 		     target_format.bytes_per_element);
 	}
 
-	TextureCache::ImageDesc desc {};
+	auto& desc = r.desc;
 	desc.type              = TextureCache::BindingType::RenderTarget;
 	desc.info.data         = {rt.base.addr, backing_size};
 	desc.info.pixel_format = target_format.format;
@@ -372,7 +370,6 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	desc.view_info.layer_count = view.layer_count;
 	desc.view_info.usage       = vk::ImageUsageFlagBits::eColorAttachment;
 	auto& texture_cache        = m_context.GetTextureCache();
-	r.desc                     = std::move(desc);
 	r.guest_mip_level          = rt.view.current_mip_level;
 	r.guest_array_layer        = view.base_layer;
 	r.image_id                 = texture_cache.FindImage(r.desc, exact_format);

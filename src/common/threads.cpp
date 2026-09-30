@@ -2,7 +2,6 @@
 
 #include "common/assert.h"
 
-#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>             // IWYU pragma: keep
@@ -26,8 +25,7 @@
 #ifdef KYTY_WIN_CS
 #include <windows.h> // IWYU pragma: keep
 // IWYU pragma: no_include <winbase.h>
-constexpr DWORD    KYTY_CS_SPIN_COUNT          = 4000;
-constexpr uint64_t KYTY_SLEEP_SPIN_LIMIT_100NS = 500; // 50 us
+constexpr DWORD KYTY_CS_SPIN_COUNT = 4000;
 
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
@@ -36,30 +34,6 @@ constexpr uint64_t KYTY_SLEEP_SPIN_LIMIT_100NS = 500; // 50 us
 static void SleepHighResolution100ns(uint64_t units_100ns) {
 	if (units_100ns == 0) {
 		return;
-	}
-
-	// Keep spinning only where a kernel transition is
-	// likely to cost more than the requested delay; ordinary millisecond sleeps use the
-	// per-thread high-resolution waitable timer below.
-	if (units_100ns <= KYTY_SLEEP_SPIN_LIMIT_100NS) {
-		LARGE_INTEGER frequency {};
-		LARGE_INTEGER start {};
-		if (QueryPerformanceFrequency(&frequency) != 0 && QueryPerformanceCounter(&start) != 0 &&
-		    frequency.QuadPart > 0) {
-			const auto wait_ticks =
-			    static_cast<LONGLONG>((static_cast<long double>(units_100ns) *
-			                           static_cast<long double>(frequency.QuadPart)) /
-			                          10000000.0L);
-			const auto    deadline = start.QuadPart + std::max<LONGLONG>(wait_ticks, 1);
-			LARGE_INTEGER now {};
-			do {
-				if (QueryPerformanceCounter(&now) == 0) {
-					break;
-				}
-				YieldProcessor();
-			} while (now.QuadPart < deadline);
-			return;
-		}
 	}
 
 	thread_local HANDLE timer = CreateWaitableTimerExW(
@@ -131,14 +105,13 @@ static SleepConditionVariableCS_func_t ResolveSleepConditionVariableCS() {
 #endif
 
 #ifdef KYTY_POSIX_HIGH_RES_SLEEP
-// Spin for very short waits; use an absolute deadline for longer waits.
+// An absolute deadline preserves the requested sleep across signal interruptions.
 static void SleepHighResolutionNanos(uint64_t nanos) {
 	if (nanos == 0) {
 		return;
 	}
 
 	constexpr uint64_t NANOS_PER_SEC = 1000000000;
-	constexpr uint64_t SPIN_LIMIT_NS = 50000; // below this a context switch dominates
 
 	timespec deadline {};
 	if (clock_gettime(CLOCK_MONOTONIC, &deadline) != 0) {
@@ -149,17 +122,6 @@ static void SleepHighResolutionNanos(uint64_t nanos) {
 	auto target_nsec = static_cast<uint64_t>(deadline.tv_nsec) + nanos;
 	deadline.tv_sec += static_cast<time_t>(target_nsec / NANOS_PER_SEC);
 	deadline.tv_nsec = static_cast<long>(target_nsec % NANOS_PER_SEC);
-
-	if (nanos <= SPIN_LIMIT_NS) {
-		timespec now {};
-		do {
-			if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
-				return;
-			}
-		} while (now.tv_sec < deadline.tv_sec ||
-		         (now.tv_sec == deadline.tv_sec && now.tv_nsec < deadline.tv_nsec));
-		return;
-	}
 
 	while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &deadline, nullptr) == EINTR) {
 	}

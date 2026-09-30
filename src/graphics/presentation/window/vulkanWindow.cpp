@@ -561,6 +561,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 
 	auto features12 = WindowContext::RequiredVulkan12Features();
 	features12.shaderSharedInt64Atomics = supported_features12.shaderSharedInt64Atomics;
+	features12.drawIndirectCount        = supported_features12.drawIndirectCount;
 	vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR workgroup_layout {};
 	workgroup_layout.workgroupMemoryExplicitLayout =
 	    supported_workgroup_layout.workgroupMemoryExplicitLayout;
@@ -678,6 +679,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	device_features.multiViewport                        = VK_TRUE;
 	device_features.fillModeNonSolid                      = VK_TRUE;
 	device_features.vertexPipelineStoresAndAtomics       = VK_TRUE;
+	graphics.draw_indirect_count_enabled                  = features12.drawIndirectCount;
 	// Storage image sample counts beyond 1x require the feature.
 	if (!device_features.shaderStorageImageMultisample) {
 		graphics.physical_device_properties.limits.storageImageSampleCounts =

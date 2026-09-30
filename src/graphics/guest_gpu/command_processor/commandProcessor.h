@@ -118,6 +118,7 @@ private:
 	void ProcessPm4(Pm4Execution& execution);
 	void SuspendPm4();
 	uint32_t            NumInstances();
+	uint32_t            IndexSize() const;
 	const void*         IndexAddress(uint32_t first_index) const;
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
 	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }
@@ -135,8 +136,11 @@ private:
 	uint64_t       m_dispatch_indirect_args_base_addr = 0;
 	// Persistent draw state. Indirect draws leave the address of their last instance count,
 	// read only when a later draw inherits it.
-	uint32_t m_num_instances      = 1;
-	uint64_t m_num_instances_addr = 0;
+	uint32_t                 m_num_instances        = 1;
+	uint64_t                 m_num_instances_addr   = 0;
+	const volatile uint32_t* m_num_instances_count  = nullptr;
+	uint32_t                 m_num_instances_max    = 0;
+	uint32_t                 m_num_instances_stride = 0;
 
 	const int m_interrupt_event_id;
 	uint64_t  m_submit_id                   = 0;

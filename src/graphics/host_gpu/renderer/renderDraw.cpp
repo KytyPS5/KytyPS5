@@ -14,6 +14,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/bindingEpoch.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
@@ -840,30 +841,40 @@ static bool GetDrawTopology(const HW::UserConfig& ucfg, vk::PrimitiveTopology& t
 	return true;
 }
 
-static bool ResolvePrimitiveRestart(const CommandBuffer& buffer,
-                                    const DrawIndexBufferSource& source) {
+enum class PrimitiveRestart : uint8_t { Off, Native, Custom };
+
+static PrimitiveRestart ClassifyPrimitiveRestart(const CommandBuffer& buffer, uint32_t element_size,
+                                                 uint32_t& restart_index) {
 	const auto control = buffer.GetUserConfig().GetPrimitiveResetControl();
 	EXIT_NOT_IMPLEMENTED((control & ~0x3u) != 0);
 	if ((control & 0x1u) == 0) {
-		return false;
+		return PrimitiveRestart::Off;
 	}
 	switch (buffer.GetUserConfig().GetPrimType()) {
 		case Prospero::PrimitiveType::kLineStrip:
 		case Prospero::PrimitiveType::kTriFan:
 		case Prospero::PrimitiveType::kTriStrip: break;
-		default: return false;
+		default: return PrimitiveRestart::Off;
 	}
 
-	const auto element_size = source.guest_element_size;
-	const auto index_mask   = UINT32_MAX >> ((4 - element_size) * 8);
-	const auto reset_index  = buffer.GetRegisters().GetPrimitiveResetIndex();
+	const auto index_mask  = UINT32_MAX >> ((4 - element_size) * 8);
+	const auto reset_index = buffer.GetRegisters().GetPrimitiveResetIndex();
 	if ((control & 0x2u) != 0 && (reset_index & ~index_mask) != 0) {
-		return false;
+		return PrimitiveRestart::Off;
 	}
-	const auto restart_index = reset_index & index_mask;
-	if (restart_index == index_mask) {
-		// Use native restart; the 8-bit path widens its marker to 0xffff.
-		return true;
+	restart_index = reset_index & index_mask;
+	// Use native restart; the 8-bit path widens its marker to 0xffff.
+	return restart_index == index_mask ? PrimitiveRestart::Native : PrimitiveRestart::Custom;
+}
+
+static bool ResolvePrimitiveRestart(const CommandBuffer&         buffer,
+                                    const DrawIndexBufferSource& source) {
+	const auto element_size  = source.guest_element_size;
+	uint32_t   restart_index = 0;
+	switch (ClassifyPrimitiveRestart(buffer, element_size, restart_index)) {
+		case PrimitiveRestart::Off: return false;
+		case PrimitiveRestart::Native: return true;
+		case PrimitiveRestart::Custom: break;
 	}
 
 	// A game can set a custom reset value without using it in the index buffer.
@@ -920,15 +931,26 @@ static bool RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 	return vertex_ready && pixel_ready;
 }
 
-bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
-                                            uint32_t            render_target_slice_offset,
-	                                        DrawRenderState& state) {
+static bool PrepareDrawShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 	const auto& shader_regs       = buffer.GetRegisters().GetShaderRegisters();
 	const auto  color_output_mask = DrawColorOutputMask(buffer.GetRegisters());
 	state.ps_active = buffer.GetShaders().GetPs().ps_regs.data_addr != 0 &&
 	                  (color_output_mask != 0 ||
 	                   PixelShaderHasDepthOrCoverageSideEffects(shader_regs));
-	uint32_t mrt_mask = 0;
+}
+
+bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
+                                            uint32_t         render_target_slice_offset,
+                                            DrawRenderState& state) {
+	return PrepareDrawShaders(buffer, draw, state) &&
+	       PrepareDrawTargets(buffer, draw, render_target_slice_offset, state);
+}
+
+bool RenderExecutor::PrepareDrawTargets(CommandBuffer& buffer, const DrawCallInfo& draw,
+                                        uint32_t         render_target_slice_offset,
+                                        DrawRenderState& state) {
+	const auto color_output_mask = DrawColorOutputMask(buffer.GetRegisters());
+	uint32_t   mrt_mask          = 0;
 	if (state.ps_active) {
 		for (const auto& output: state.ps_input_info.stage.program->info.outputs) {
 			if (output.kind == ShaderRecompiler::IR::StageOutputKind::Mrt ||
@@ -1008,6 +1030,75 @@ static PreparedIndexBuffer PrepareIndexBuffer(CommandBuffer&               buffe
 	return prepared;
 }
 
+[[nodiscard]] static uint64_t IndirectRecordSize(bool indexed) {
+	return indexed ? sizeof(vk::DrawIndexedIndirectCommand) : sizeof(vk::DrawIndirectCommand);
+}
+
+[[nodiscard]] static uint64_t IndirectArgsSpan(const DrawIndirectArgs& records, bool indexed) {
+	return static_cast<uint64_t>(records.stride) * (records.count - 1u) +
+	       IndirectRecordSize(indexed);
+}
+
+// Drain-free reads only: a stale target of an empty draw can evict the surface at its address.
+[[nodiscard]] static bool IndirectDrawIsEmpty(RenderContext&          context,
+                                              const DrawIndirectArgs& records, bool indexed) {
+	constexpr uint64_t MaxPeekBytes = 64u * 1024u;
+	const auto         clean_read   = [&](uint64_t address, std::span<uint32_t> words) {
+		const auto size = words.size_bytes();
+		return !context.GetBufferCache().HasGpuDirtyBytes(address, size) &&
+		       !context.GetTextureCache().IsRegionGpuModified(address, size) &&
+		       Libs::LibKernel::Memory::TryReadBacking(address, words.data(), size);
+	};
+	auto count = records.count;
+	if (records.count_address != 0) {
+		uint32_t reported = 0;
+		if (!clean_read(records.count_address, {&reported, 1})) {
+			return false;
+		}
+		count = std::min(count, reported);
+	}
+	if (count == 0) {
+		return true;
+	}
+	const auto span =
+	    static_cast<uint64_t>(records.stride) * (count - 1u) + IndirectRecordSize(indexed);
+	if (span > MaxPeekBytes) {
+		return false;
+	}
+	static thread_local std::vector<uint32_t> words;
+	words.resize(static_cast<size_t>(span / sizeof(uint32_t)));
+	if (!clean_read(records.address, words)) {
+		return false;
+	}
+	for (uint32_t record = 0; record < count; record++) {
+		const auto first = static_cast<size_t>(record) * records.stride / sizeof(uint32_t);
+			return false;
+		}
+	}
+	return true;
+}
+
+static void EmitIndirectDraw(vk::CommandBuffer vk_buffer, const DrawCallInfo& draw,
+                             const DrawIndirectArgs&             records,
+                             const std::pair<Buffer*, uint64_t>& args_buffer,
+                             const std::pair<Buffer*, uint64_t>& count_buffer) {
+	const auto args = args_buffer.first->Handle();
+	if (count_buffer.first != nullptr) {
+		const auto count = count_buffer.first->Handle();
+		if (draw.IsIndexed()) {
+			vk_buffer.drawIndexedIndirectCount(args, args_buffer.second, count, count_buffer.second,
+			                                   records.count, records.stride);
+		} else {
+			vk_buffer.drawIndirectCount(args, args_buffer.second, count, count_buffer.second,
+			                            records.count, records.stride);
+		}
+	} else if (draw.IsIndexed()) {
+		vk_buffer.drawIndexedIndirect(args, args_buffer.second, records.count, records.stride);
+	} else {
+		vk_buffer.drawIndirect(args, args_buffer.second, records.count, records.stride);
+	}
+}
+
 static void CommitVertexBuffers(vk::CommandBuffer            vk_buffer,
                                 const PreparedVertexBuffers& prepared) {
 	for (uint32_t i = 0; i < prepared.count; i++) {
@@ -1018,6 +1109,16 @@ static void CommitVertexBuffers(vk::CommandBuffer            vk_buffer,
 		vk_buffer.bindVertexBuffers2(0, prepared.count, prepared.buffers.data(),
 		                             prepared.offsets.data(), prepared.sizes.data(), nullptr);
 	}
+}
+
+static bool StageMayWriteMemory(const ShaderStageRuntime& stage) {
+	const auto& program = *stage.program;
+	const auto& info    = program.info;
+	return program.has_address_writes ||
+	       std::ranges::any_of(info.buffers, [](const auto& buffer) { return buffer.written; }) ||
+	       std::ranges::any_of(info.images, [](const auto& image) { return image.written; }) ||
+	       program.bindings.descriptor_counts[static_cast<size_t>(
+	           ShaderRecompiler::IR::DescriptorBindingKind::Gds)] != 0;
 }
 
 static void CommitIndexBuffer(vk::CommandBuffer vk_buffer, const PreparedIndexBuffer& prepared) {
@@ -1223,6 +1324,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                                    : sizeof(vk::DrawIndirectCommand));
 		args_buffer = m_context.GetBufferCache().ObtainBuffer(emit.indirect.address, size, false);
 		EXIT_IF((args_buffer.second & 3u) != 0);
+		}
 	}
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "CreatePipeline");
@@ -1299,12 +1401,26 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                        std::bit_width(planes) * 4u * sizeof(uint32_t),
 		                        buffer.GetRegisters().GetUserClipPlanes().data());
 	}
+	if (mesh_active && !task_front) {
+		const uint32_t index_bound = draw.IsIndexed() ? index_source.readable : 0u;
+		vk_buffer.pushConstants(
+		    pipeline.pipeline_layout, draw_stages,
+		    PushData::MeshIndexBoundDword(vertex_stages.back().user_clip_planes) * sizeof(uint32_t),
+		    sizeof(index_bound), &index_bound);
+	}
 
 	auto& dynamic_state = m_context.GetCommandScheduler().GetDynamicState();
+	// Helper passes that bind their own pipelines and state bump the graphics binding epoch.
+	if (m_dynamic_state_command != static_cast<VkCommandBuffer>(vk_buffer) ||
+	    m_dynamic_state_epoch != GraphicsBindingEpoch()) {
+		dynamic_state.Invalidate();
+	}
 	UpdateGraphicsDynamicState(buffer, dynamic_state, vertex_stages.back(), state.depth_info,
 	                           rendering);
 	dynamic_state.SetAttachmentFeedbackLoopAspects(feedback_aspects);
 	dynamic_state.Commit(m_context.GetGraphics(), vk_buffer);
+	m_dynamic_state_command = static_cast<VkCommandBuffer>(vk_buffer);
+	m_dynamic_state_epoch   = GraphicsBindingEpoch();
 
 	vk::PipelineStageFlags shader_write_stages = {};
 	for (const auto& stage: vertex_stages) {
@@ -1323,6 +1439,16 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	LogDrawPhase(draw.Name(), "BeginRendering");
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x400u);
+	}
+		// The arguments may come from any earlier GPU write; the barrier cannot sit in a pass.
+		m_context.GetCommandScheduler().EndRendering();
+		vk::MemoryBarrier barrier {};
+		barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+		barrier.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
+		vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+		                          vk::PipelineStageFlagBits::eDrawIndirect, {}, 1, &barrier, 0,
+		                          nullptr, 0, nullptr);
+		buffer.MarkIndirectArgsBarrier();
 	}
 	m_context.GetCommandScheduler().BeginRendering(rendering);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
@@ -1346,6 +1472,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (stencil_export.bits != 0) {
 		RecordStencilExportReplay(
 		    vk_buffer, stencil_export, stencil_bit_pipelines, rendering.num_color_attachments, [&] {
+			    if (args_buffer.first == nullptr) {
+				    EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
+			    }
 		    });
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Draws);
@@ -1357,6 +1486,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (shader_write_stages) {
 		m_context.GetCommandScheduler().EndRendering();
 		ShaderWriteBarrier(vk_buffer, shader_write_stages);
+	}
+	if (std::ranges::any_of(vertex_stages,
+	                        [](const auto& stage) { return StageMayWriteMemory(stage.stage); }) ||
+	    (state.ps_active && StageMayWriteMemory(state.ps_input_info.stage))) {
+		buffer.InvalidateIndirectArgsBarrier();
 	}
 	LogDrawPhase(draw.Name(), "DrawComplete");
 	if (!draw.IsIndexed()) {
@@ -1382,8 +1516,110 @@ static bool DrawCountsAccepted(const char* name, uint32_t count, uint32_t instan
 	return false;
 }
 
+static bool Refuse(IndirectDrawResult* refusal, IndirectDrawResult reason) {
+	if (refusal != nullptr) {
+		*refusal = reason;
+	}
+	return false;
+}
+
+
+struct IndirectStagePlan {
+	bool                   merged              = false;
+	IndirectDrawResult     native_mesh_refusal = IndirectDrawResult::Drawn;
+	std::array<uint8_t, 3> payload_sgprs {};
+
+	[[nodiscard]] const std::array<uint8_t, 3>* Payload() const {
+		return merged || native_mesh_refusal == IndirectDrawResult::Drawn ? &payload_sgprs
+		                                                                  : nullptr;
+	}
+};
+
+// Refusals decided before any preparation; the records are trimmed to their mapped span.
+static IndirectDrawResult ClassifyIndirectDraw(const GraphicContext& graphics,
+                                               const CommandBuffer&  buffer,
+                                               DrawIndirectArgs& records, bool indexed,
+                                               bool mesh_indirect, IndirectStagePlan& plan) {
+	const auto& hw = buffer.GetRegisters();
+	if (records.count_address != 0 && !graphics.draw_indirect_count_enabled) {
+		return IndirectDrawResult::MissingFeature;
+	}
+	const auto record = IndirectRecordSize(indexed);
+	if ((records.address & 3u) != 0 || (records.count_address & 3u) != 0 ||
+	    (records.count > 1 && ((records.stride & 3u) != 0 || records.stride < record))) {
+		return IndirectDrawResult::Misaligned;
+	}
+	// Trimmed to the mapped records rather than refused; the CPU path reads no further either.
+	const auto mapped = Libs::LibKernel::Memory::ClampRangeSize(records.address,
+	                                                            IndirectArgsSpan(records, indexed));
+	if (mapped < record) {
+		return IndirectDrawResult::ArgsUnmapped;
+	}
+	if (records.count > 1) {
+		records.count = static_cast<uint32_t>(
+		    std::min<uint64_t>(records.count, (mapped - record) / records.stride + 1u));
+	}
+	if (records.count_address != 0 &&
+	    Libs::LibKernel::Memory::ClampRangeSize(records.count_address, sizeof(uint32_t)) !=
+	        sizeof(uint32_t)) {
+		return IndirectDrawResult::ArgsUnmapped;
+	}
+	if (buffer.GetUserConfig().GetPrimType() == Prospero::PrimitiveType::kQuadListLegacy) {
+		return IndirectDrawResult::QuadList;
+	}
+	return IndirectDrawResult::Drawn;
+}
+
+// With indirect records the bound range is the whole INDEX_BUFFER_SIZE.
+static IndirectDrawResult ClassifyIndirectIndices(const CommandBuffer& buffer,
+                                                  const DrawIndexArgs& args) {
+	uint32_t element_size = 0;
+	switch (static_cast<Prospero::IndexType>(args.index_type_and_size)) {
+		case Prospero::IndexType::kIndex16: element_size = 2; break;
+		case Prospero::IndexType::kIndex32: element_size = 4; break;
+		default: return IndirectDrawResult::IndexType;
+	}
+	const auto address = reinterpret_cast<uint64_t>(args.index_addr);
+	const auto size    = static_cast<uint64_t>(args.index_count) * element_size;
+	// A register left at a pool's full extent would bind the whole pool for every draw.
+	constexpr uint64_t MaxBoundIndexBytes = 64ull * 1024 * 1024;
+	if (address == 0 || size == 0) {
+		return IndirectDrawResult::IndexBufferUnset;
+	}
+	if (size > MaxBoundIndexBytes) {
+		return IndirectDrawResult::IndexBufferTooLarge;
+	}
+	if (Libs::LibKernel::Memory::ClampRangeSize(address, size) != size) {
+		return IndirectDrawResult::IndexBufferUnmapped;
+	}
+	uint32_t restart_index = 0;
+	if (ClassifyPrimitiveRestart(buffer, element_size, restart_index) == PrimitiveRestart::Custom) {
+		return IndirectDrawResult::CustomRestart;
+	}
+	return IndirectDrawResult::Drawn;
+}
+
+// Refusals that need the prepared shaders, decided before any target is resolved.
+static IndirectDrawResult IndirectStageRefusal(const GraphicContext&    graphics,
+                                               const DrawRenderState&   state,
+                                               const DrawIndirectArgs&  records,
+                                               const IndirectStagePlan& plan) {
+	const auto& vertex = state.vertex_info[0];
+	if (vertex.stage.program->stage != ShaderType::Mesh) {
+		if (plan.merged) {
+			return IndirectDrawResult::MergedGeometry;
+		}
+		// Vulkan applies the records' offsets, which matches while no SGPR is named for them.
+		const bool offset_registers = records.vertex_offset_register != Pm4::SH_NOP ||
+		                              records.instance_offset_register != Pm4::SH_NOP ||
+		                              records.index_offset_register != Pm4::SH_NOP;
+		return offset_registers ? IndirectDrawResult::OffsetRegister : IndirectDrawResult::Drawn;
+	}
+	return IndirectDrawResult::Drawn;
+}
+
 // Vulkan offsets for a prepared draw, or nullopt when its indirect records need CPU counts, as
-// mesh and quad-list draws do. Indirect records carry their own offsets.
+// quad-list draws do. Indirect records carry their own offsets.
 static std::optional<DrawEmitInfo> ResolveDrawEmit(const HW::UserConfig&        ucfg,
                                                    const ShaderVertexInputInfo& vs,
                                                    DrawOffsetSource             source,
@@ -1606,7 +1842,21 @@ bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 		return true;
 	}
 	DrawRenderState state {};
-	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
+	if (indirect.address != 0) {
+		if (!PrepareDrawShaders(buffer, draw, state, plan.Payload())) {
+			ResetBindings();
+			return true;
+		}
+		if (const auto result =
+		        IndirectStageRefusal(m_context.GetGraphics(), state, indirect, plan);
+		    result != IndirectDrawResult::Drawn) {
+			ResetBindings();
+			return Refuse(refusal, result);
+		}
+	}
+	if (indirect.address != 0
+	        ? !PrepareDrawTargets(buffer, draw, args.render_target_slice_offset, state)
+	        : !PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
 		ResetBindings();
 		return true;
 	}
@@ -1626,14 +1876,14 @@ bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	}
 
 	LogDrawStateIfNeeded(buffer, draw, state, 0, nullptr);
-	const auto emit = ResolveDrawEmit(ucfg, state.vertex_info[0], args.offset_source,
-	                                  static_cast<int32_t>(args.first_vertex), args.first_instance,
-	                                  args.indirect);
+	const auto emit =
+	    ResolveDrawEmit(ucfg, state.vertex_info[0], args.offset_source,
+	                    static_cast<int32_t>(args.first_vertex), args.first_instance, indirect);
 	if (emit) {
 		ExecutePreparedDraw(submit_id, buffer, draw, state, topology, *emit, {}, false);
 	}
 	ResetBindings();
-	return emit.has_value();
+	return emit.has_value() || Refuse(refusal, IndirectDrawResult::QuadList);
 }
 
 bool RenderExecutor::ResolveColorTargets(CommandBuffer& buffer, uint32_t render_target_slice_offset) {

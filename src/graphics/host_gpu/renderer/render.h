@@ -78,6 +78,23 @@ struct DrawAutoArgs {
 	DrawIndirectArgs indirect;
 };
 
+// Drawn, or why the draw needs its counts on the CPU.
+enum class IndirectDrawResult : uint8_t {
+	Drawn,
+	MissingFeature,
+	Misaligned,
+	ArgsUnmapped,
+	MergedGeometry,
+	QuadList,
+	IndexType,
+	IndexBufferUnset,
+	IndexBufferTooLarge,
+	IndexBufferUnmapped,
+	CustomRestart,
+	MeshStage,
+	OffsetRegister,
+};
+
 struct SubmitInfo {
 	static constexpr uint32_t MaxSemaphores = 3;
 
@@ -116,6 +133,11 @@ public:
 	                  uint32_t arg2 = 0, uint32_t arg3 = 0, uint64_t arg4 = 0);
 	void BeginRendering(const RenderState& state) const;
 	void EndRendering() const;
+	[[nodiscard]] bool IndirectArgsBarrierHolds() const noexcept {
+		return m_rendering && m_indirect_barrier_holds;
+	}
+	void MarkIndirectArgsBarrier() const noexcept { m_indirect_barrier_holds = true; }
+	void InvalidateIndirectArgsBarrier() const noexcept { m_indirect_barrier_holds = false; }
 
 	[[nodiscard]] vk::CommandBuffer Handle() const;
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
@@ -150,6 +172,7 @@ private:
 	HW::Context*        m_registers   = nullptr;
 	HW::UserConfig*     m_user_config = nullptr;
 	HW::Shader*         m_shaders     = nullptr;
+	mutable bool           m_indirect_barrier_holds = false;
 
 	friend class CommandScheduler;
 };
@@ -175,9 +198,12 @@ public:
 	                                            const ShaderRecompiler::IR::DescriptorValue& value);
 
 private:
-	// False, with nothing drawn, when the draw's indirect records need CPU counts.
-	bool DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
-	bool DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
+	// False, with nothing drawn, when the draw's indirect records need CPU counts; refusal says
+	// why.
+	bool DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args,
+	               IndirectDrawResult* refusal = nullptr);
+	bool DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args,
+	              IndirectDrawResult* refusal = nullptr);
 
 	struct GraphicsBindings {
 		std::array<PreparedBindings, 3> vertex;
@@ -198,6 +224,9 @@ private:
 	                                          const DrawCallInfo& draw,
 	                                          uint32_t            render_target_slice_offset,
 	                                          DrawRenderState& state);
+	[[nodiscard]] bool PrepareDrawTargets(CommandBuffer& buffer, const DrawCallInfo& draw,
+	                                      uint32_t         render_target_slice_offset,
+	                                      DrawRenderState& state);
 	void ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer, const DrawCallInfo& draw,
 	                         DrawRenderState& state, vk::PrimitiveTopology topology,
 	                         const DrawEmitInfo& emit, const DrawIndexBufferSource& index_source,
@@ -225,6 +254,7 @@ private:
 	std::vector<ImageId>                  m_bound_images;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
+	bool m_mesh_indirect        = true;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

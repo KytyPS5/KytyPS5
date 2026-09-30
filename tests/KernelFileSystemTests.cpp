@@ -1,3 +1,5 @@
+// The test provides its own entry point, so SDL must not rename main() to SDL_main().
+#define SDL_MAIN_HANDLED
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_main.h>
 

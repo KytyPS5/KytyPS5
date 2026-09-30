@@ -7,6 +7,9 @@
 #include "graphics/host_gpu/memoryHeadroom.h"
 #include "graphics/host_gpu/vulkanCommon.h" // IWYU pragma: export
 
+#include <atomic>
+#include <chrono>
+#include <deque>
 #include <map>
 #include <mutex>
 #include <tuple>
@@ -125,11 +128,47 @@ struct GraphicContext {
 	[[nodiscard]] bool CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image,
 	                               ImageAllocationReport* report = nullptr);
 	void               DeleteImage(VulkanImage& image);
+	// Destroys every idle pooled image and returns the bytes released.
+	uint64_t           TrimImagePool();
+	// Images that needed a new device allocation, as opposed to a pooled one.
+	[[nodiscard]] uint64_t ImageAllocationCount() const noexcept {
+		return m_image_allocations.load(std::memory_order_relaxed);
+	}
 
 	uint32_t screen_width  = 0;
 	uint32_t screen_height = 0;
 
 private:
+	struct ImagePoolKey {
+		vk::ImageCreateFlags    flags;
+		vk::ImageType           type = vk::ImageType::e2D;
+		vk::Format              format = vk::Format::eUndefined;
+		vk::Extent3D            extent;
+		uint32_t                mip_levels = 1;
+		uint32_t                layers     = 1;
+		vk::SampleCountFlagBits samples    = vk::SampleCountFlagBits::e1;
+		vk::ImageUsageFlags     usage;
+
+		bool operator==(const ImagePoolKey&) const = default;
+	};
+	struct PooledImage {
+		ImagePoolKey                          key;
+		vk::Image                             image      = nullptr;
+		VmaAllocation                         allocation = nullptr;
+		uint64_t                              size       = 0;
+		std::chrono::steady_clock::time_point released;
+	};
+
+	[[nodiscard]] bool TakePooledImage(const ImagePoolKey& key, VulkanImage& image);
+	[[nodiscard]] bool PoolImage(VulkanImage& image);
+	void               ExpirePooledImages(std::vector<PooledImage>& victims, uint64_t incoming);
+
+	std::mutex              m_image_pool_mutex;
+	std::deque<PooledImage> m_image_pool;
+	uint64_t                m_image_pool_bytes = 0;
+	uint64_t                m_image_pool_limit = 0;
+	std::atomic<uint64_t>   m_image_allocations {0};
+
 	mutable std::mutex                                 m_format_properties_mutex;
 	mutable std::map<vk::Format, vk::FormatProperties> m_format_properties;
 	mutable std::mutex                                 m_image_format_properties_mutex;
@@ -161,6 +200,8 @@ struct VulkanImage {
 	VulkanImageState              state;
 	std::vector<VulkanImageState> subresource_states;
 	VmaAllocation                allocation = nullptr;
+	// Created from a plain create info into device-local memory, so an identical request can reuse it.
+	bool                          poolable   = false;
 };
 
 

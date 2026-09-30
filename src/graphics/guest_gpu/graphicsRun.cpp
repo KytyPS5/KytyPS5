@@ -23,12 +23,17 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <memory>
 #include <mutex>
 #include <semaphore>
+#include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -52,6 +57,22 @@ struct DrawIndexedIndirectArgs {
 	uint32_t base_vertex_location;
 	uint32_t start_instance_location;
 };
+
+// Named for the refusal, so a drain under a CPU read of indirect records says why.
+static tracy::ScopedZone IndirectFallbackZone(IndirectDrawResult result) {
+	static const auto names = [] {
+		std::array<std::string, static_cast<size_t>(IndirectDrawResult::Count)> out;
+		for (size_t i = 0; i < out.size(); i++) {
+			out[i] = std::string("DrawIndirect CPU records: ") +
+			         IndirectDrawResultName(static_cast<IndirectDrawResult>(i));
+		}
+		return out;
+	}();
+	const auto& name = names.at(static_cast<size_t>(result));
+	return tracy::ScopedZone(__LINE__, TracyFile, std::strlen(TracyFile), TracyFunction,
+	                         std::strlen(TracyFunction), name.data(), name.size(), TRACY_CALLSTACK,
+	                         tracy::ProfilerAvailable());
+}
 
 static bool GraphicsRunDebugDumpEnabled() {
 	return Config::GraphicsDebugDumpEnabled() &&
@@ -805,7 +826,81 @@ void CommandProcessor::SetNumInstances(uint32_t num_instances) {
 		num_instances = 1;
 	}
 
-	m_num_instances = num_instances;
+	m_num_instances     = num_instances;
+	m_pending_instances = {};
+}
+
+uint32_t CommandProcessor::NumInstances() {
+	const auto pending = std::exchange(m_pending_instances, {});
+	if (pending.args_addr == 0) {
+		return m_num_instances;
+	}
+	KYTY_PROFILER_BLOCK("NumInstances from indirect records");
+	// Read as late as possible, so the records must still be mapped.
+	const auto readable = [](uint64_t address) {
+		return LibKernel::Memory::ClampRangeSize(address, sizeof(uint32_t)) == sizeof(uint32_t);
+	};
+	auto count = pending.max_count;
+	if (pending.count_addr != nullptr) {
+		if (!readable(reinterpret_cast<uint64_t>(pending.count_addr))) {
+			return m_num_instances;
+		}
+		const uint32_t reported = *pending.count_addr;
+		count                   = std::min(reported, count);
+	}
+	if (count != 0) {
+		const auto address = pending.args_addr +
+		                     static_cast<uint64_t>(count - 1u) * pending.stride +
+		                     offsetof(DrawIndirectArgs, instance_count);
+		if (readable(address)) {
+			m_num_instances = *reinterpret_cast<const volatile uint32_t*>(address);
+		}
+	}
+	return m_num_instances;
+}
+
+IndirectDrawResult CommandProcessor::DrawIndirectOnGpu(uint64_t args_addr, uint32_t max_count,
+                                                       uint32_t                 stride,
+                                                       const volatile uint32_t* count_addr,
+                                                       bool                     indexed) {
+	const auto result = m_renderer.GetRenderExecutor().DrawIndirect(
+	    m_submit_id, CurrentBuffer(),
+	    {.args_addr           = args_addr,
+	     .max_count           = max_count,
+	     .stride              = stride,
+	     .count_addr          = reinterpret_cast<uint64_t>(count_addr),
+	     .indexed             = indexed,
+	     .index_type_and_size = m_index_type_and_size,
+	     .index_base_addr     = m_index_base_addr,
+	     .index_buffer_size   = m_index_buffer_size});
+	if (result == IndirectDrawResult::Drawn) {
+		m_pending_instances = {args_addr, max_count, stride, count_addr};
+	} else {
+		ReportIndirectFallback(result, args_addr, indexed);
+		m_pending_instances = {};
+	}
+	return result;
+}
+
+// Reported at doublings per reason; gpu_written says whether the read drained.
+void CommandProcessor::ReportIndirectFallback(IndirectDrawResult result, uint64_t args_addr,
+                                              bool indexed) {
+	static std::array<std::atomic<uint64_t>, static_cast<size_t>(IndirectDrawResult::Count)>
+	           counts {};
+	const auto count =
+	    counts.at(static_cast<size_t>(result)).fetch_add(1, std::memory_order_relaxed) + 1;
+	if ((count & (count - 1u)) != 0) {
+		return;
+	}
+	const auto size = indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
+	const bool gpu_written = m_renderer.GetBufferCache().HasGpuDirtyBytes(args_addr, size);
+	std::printf("DrawIndirect: records read on the CPU (%s) x%" PRIu64 " args=0x%016" PRIx64
+	            " indexed=%u prim=%u stages=0x%08" PRIx32 " cb_mode=%u index_type=%" PRIu32
+	            " index_size=%" PRIu32 " gpu_written=%u\n",
+	            IndirectDrawResultName(result), count, args_addr, indexed ? 1u : 0u,
+	            static_cast<uint32_t>(m_ucfg.GetPrimType()), m_ctx.GetShaderStages(),
+	            static_cast<uint32_t>(m_ctx.GetColorControl().mode), m_index_type_and_size,
+	            m_index_buffer_size, gpu_written ? 1u : 0u);
 }
 
 void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t wait_op,
@@ -862,7 +957,7 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 void CommandProcessor::DrawIndex(DrawIndexArgs args) {
 	args.index_type_and_size = m_index_type_and_size;
 	if (args.instance_count == 0) {
-		args.instance_count = m_num_instances;
+		args.instance_count = NumInstances();
 	}
 	if (GraphicsRunDebugDumpEnabled() && (args.base_vertex != 0 || args.first_instance != 0)) {
 		LOGF("\t draw indexed offsets: base_vertex = %" PRId32 ", first_instance = %" PRIu32 "\n",
@@ -914,6 +1009,16 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
                                          uint32_t draw_initiator, bool indexed) {
 	EXIT_NOT_IMPLEMENTED((draw_initiator & ~0x20u) != (indexed ? 0u : 2u));
 	EXIT_NOT_IMPLEMENTED(m_draw_indirect_args_base_addr == 0);
+
+	if (max_count_or_count == 0) {
+		return;
+	}
+	const auto result = DrawIndirectOnGpu(m_draw_indirect_args_base_addr + data_offset,
+	                                      max_count_or_count, stride_in_bytes, count_addr, indexed);
+	if (result == IndirectDrawResult::Drawn) {
+		return;
+	}
+	const auto zone = IndirectFallbackZone(result);
 
 	uint32_t draw_count = max_count_or_count;
 	if (count_addr != nullptr) {
@@ -1036,7 +1141,7 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 
 void CommandProcessor::DrawIndexAuto(DrawAutoArgs args) {
 	if (args.instance_count == 0) {
-		args.instance_count = m_num_instances;
+		args.instance_count = NumInstances();
 	}
 	m_renderer.GetRenderExecutor().DrawAuto(m_submit_id, CurrentBuffer(), args);
 }

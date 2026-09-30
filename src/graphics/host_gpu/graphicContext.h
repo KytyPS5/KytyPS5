@@ -40,6 +40,10 @@ struct GraphicContext {
 	bool                               pipeline_library_enabled              = false;
 	bool                               pipeline_library_fast_linking         = false;
 	bool                               supports_block_texel_view              = false;
+	// Guest indirect draws stay on the GPU only when all three are enabled.
+	bool                               draw_indirect_first_instance_enabled  = false;
+	bool                               multi_draw_indirect_enabled           = false;
+	bool                               draw_indirect_count_enabled           = false;
 	bool                                      mesh_shader_enabled                   = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
 	uint32_t                           subgroup_size                         = 0;

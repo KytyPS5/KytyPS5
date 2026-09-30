@@ -156,6 +156,12 @@ private:
 	                      uint32_t interrupt_context_id);
 	void ProcessPm4(Pm4Execution& execution);
 	void SuspendPm4();
+	[[nodiscard]] uint32_t NumInstances();
+	[[nodiscard]] IndirectDrawResult DrawIndirectOnGpu(uint64_t args_addr, uint32_t max_count,
+	                                                   uint32_t                 stride,
+	                                                   const volatile uint32_t* count_addr,
+	                                                   bool                     indexed);
+	void ReportIndirectFallback(IndirectDrawResult result, uint64_t args_addr, bool indexed);
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
 	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }
 
@@ -173,6 +179,14 @@ private:
 	uint64_t         m_dispatch_indirect_args_base_addr = 0;
 	// Persistent draw state: indirect draws update it for subsequent draws.
 	uint32_t m_num_instances = 1;
+	// Left on the GPU, an indirect draw's instance count is read only if a later draw inherits it.
+	struct PendingInstances {
+		uint64_t                 args_addr  = 0;
+		uint32_t                 max_count  = 0;
+		uint32_t                 stride     = 0;
+		const volatile uint32_t* count_addr = nullptr;
+	};
+	PendingInstances m_pending_instances;
 
 	uint32_t m_de_count    = 0;
 	uint32_t m_ce_count    = 0;

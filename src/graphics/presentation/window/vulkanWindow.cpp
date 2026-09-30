@@ -639,6 +639,7 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 
 	auto features12 = WindowContext::RequiredVulkan12Features();
 	features12.shaderSharedInt64Atomics = supported_features12.shaderSharedInt64Atomics;
+	features12.drawIndirectCount        = supported_features12.drawIndirectCount;
 	vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR workgroup_layout {};
 	workgroup_layout.workgroupMemoryExplicitLayout =
 	    supported_workgroup_layout.workgroupMemoryExplicitLayout;
@@ -746,6 +747,12 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	device_features.multiViewport                        = VK_TRUE;
 	device_features.fillModeNonSolid                      = VK_TRUE;
 	device_features.vertexPipelineStoresAndAtomics       = VK_TRUE;
+	device_features.drawIndirectFirstInstance =
+	    supported_features2.features.drawIndirectFirstInstance;
+	device_features.multiDrawIndirect = supported_features2.features.multiDrawIndirect;
+	graphics.draw_indirect_first_instance_enabled = device_features.drawIndirectFirstInstance;
+	graphics.multi_draw_indirect_enabled          = device_features.multiDrawIndirect;
+	graphics.draw_indirect_count_enabled          = features12.drawIndirectCount;
 	graphics.sample_rate_shading_enabled                 = true;
 	device_features.shaderInt64 = VK_TRUE;
 	device_features.shaderFloat64 =

@@ -55,6 +55,7 @@ public:
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
+	void               ForgetMemory(uint64_t vaddr, uint64_t size);
 	void               ProtectMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode);
 	// Stores own every tracked page up front: the guest may read before the dispatch completes.
 	void               PrepareBda(bool stores);
@@ -66,6 +67,8 @@ public:
 	void TriggerInterrupt(int event_id, uint32_t context_id);
 
 private:
+	[[nodiscard]] bool IsAnyMapped(uint64_t vaddr, uint64_t size) const noexcept;
+
 	struct InterruptEqRegistration {
 		LibKernel::EventQueue::KernelEqueue eq       = LibKernel::EventQueue::KERNEL_EQUEUE_INVALID;
 		int                                 event_id = 0;

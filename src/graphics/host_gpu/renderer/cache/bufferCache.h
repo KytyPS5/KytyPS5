@@ -166,6 +166,18 @@ private:
 	void RecordBdaEviction(const Buffer& buffer);
 	void ForgetClassifiedMetadata(uint64_t vaddr, uint64_t size);
 
+	// The tick of the recording that last wrote a range, kept until that tick completes.
+	struct GpuWriteMark {
+		uint64_t end  = 0;
+		uint64_t tick = 0;
+	};
+	void MarkGpuWrite(uint64_t vaddr, uint64_t size);
+	// The newest tick of a mark overlapping the range, or 0.
+	[[nodiscard]] uint64_t NewestGpuWriteTick(uint64_t vaddr, uint64_t size) const;
+	void                   PruneGpuWriteMarks();
+	// Downloads without submitting the recording in progress; false leaves all state unchanged.
+	[[nodiscard]] bool TryDownloadDetached(Buffer& buffer, uint64_t vaddr, uint64_t size);
+
 	struct ClassifiedMetadata {
 		uint64_t size  = 0;
 		uint32_t codes = 0;
@@ -190,6 +202,10 @@ private:
 	RangeSet                                          m_bda_pinned_ranges;
 	std::map<uint64_t, ClassifiedMetadata>            m_classified_metadata;
 	uint64_t                                          m_classified_span = 0;
+	// Disjoint; a mark whose tick has completed no longer constrains anything and is pruned.
+	std::map<uint64_t, GpuWriteMark>                  m_gpu_write_marks;
+	// A BDA store can reach any page, including ones no mark names yet.
+	uint64_t                                          m_bda_store_tick = 0;
 	MemoryTracker                                     m_memory_tracker;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;

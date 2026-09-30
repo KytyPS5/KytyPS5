@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 
 #include <condition_variable>
+#include <deque>
 #include <mutex>
 #include <queue>
 #include <thread>
@@ -40,8 +41,15 @@ public:
 	void                      DrainPriorityOperations();
 	void                      WaitPriorityOperations(uint64_t tick);
 	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
-	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
-	[[nodiscard]] bool        HasPendingPriorityOperations();
+	// `write_address`/`write_size` name the guest memory the operation writes, if any.
+	void DeferPriorityOperation(Common::UniqueFunction<void>&& operation, uint64_t write_address = 0,
+	                            uint64_t write_size = 0);
+	// Newest tick a queued write of guest memory overlapping the range waits for, or 0.
+	[[nodiscard]] uint64_t PendingGuestWriteTick(uint64_t address, uint64_t size);
+	// Waits for every queued write of guest memory overlapping the range.
+	void WaitGuestWrites(uint64_t address, uint64_t size);
+	// Records into its own command buffer that waits only for `wait_tick`, already submitted.
+	void RunDetached(uint64_t wait_tick, Common::UniqueFunction<void, vk::CommandBuffer>&& record);
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
 
 	[[nodiscard]] bool Active() const noexcept { return m_command.m_registers != nullptr; }
@@ -84,7 +92,9 @@ private:
 
 	struct PendingOperation {
 		Common::UniqueFunction<void> callback;
-		uint64_t                     tick = 0;
+		uint64_t                     tick        = 0;
+		uint64_t                     write_begin = 0;
+		uint64_t                     write_end   = 0;
 	};
 
 	void BeginNext();
@@ -99,13 +109,18 @@ private:
 	CommandBuffer                m_command;
 	DynamicState                 m_dynamic_state;
 	std::queue<PendingOperation> m_pending_operations;
-	std::queue<PendingOperation> m_priority_operations;
+	std::deque<PendingOperation> m_priority_operations;
 	std::mutex                   m_operation_mutex;
 	std::condition_variable      m_operation_available;
 	std::jthread                 m_priority_thread;
-	bool                         m_priority_active      = false;
-	uint64_t                     m_priority_active_tick = 0;
-	OperationState               m_operation_state      = OperationState::Open;
+	bool                         m_priority_active        = false;
+	uint64_t                     m_priority_active_tick   = 0;
+	uint64_t                     m_priority_active_begin  = 0;
+	uint64_t                     m_priority_active_end    = 0;
+	vk::CommandPool              m_detached_pool          = nullptr;
+	vk::CommandBuffer            m_detached_buffer        = nullptr;
+	vk::Fence                    m_detached_fence         = nullptr;
+	OperationState               m_operation_state        = OperationState::Open;
 	std::mutex                   m_stream_buffer_mutex;
 	std::vector<StreamBuffer*>   m_stream_buffers;
 };

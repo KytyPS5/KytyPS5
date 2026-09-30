@@ -101,6 +101,12 @@ CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graph
 
 CommandScheduler::~CommandScheduler() {
 	Shutdown();
+	if (m_detached_fence != nullptr) {
+		m_graphics.device.destroyFence(m_detached_fence, nullptr);
+	}
+	if (m_detached_pool != nullptr) {
+		m_graphics.device.destroyCommandPool(m_detached_pool, nullptr);
+	}
 }
 
 void CommandScheduler::Shutdown() {
@@ -245,17 +251,14 @@ void CommandScheduler::DeferOperation(Common::UniqueFunction<void>&& operation) 
 	operation();
 }
 
-void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& operation) {
-	QueueOperation(std::move(operation), true);
-}
-
-void CommandScheduler::QueueOperation(Common::UniqueFunction<void>&& operation, bool priority) {
+void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& operation,
+                                              uint64_t write_address, uint64_t write_size) {
 	CheckActive();
 	EXIT_IF(!operation);
 	std::unique_lock lock(m_operation_mutex);
 	if (m_operation_state == OperationState::Open) {
-		auto& queue = priority ? m_priority_operations : m_pending_operations;
-		queue.push({std::move(operation), CurrentTick()});
+		m_priority_operations.push_back(
+		    {std::move(operation), CurrentTick(), write_address, write_address + write_size});
 		lock.unlock();
 		m_operation_available.notify_one();
 		return;
@@ -283,9 +286,11 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 				return;
 			}
 			operation = std::move(m_priority_operations.front());
-			m_priority_operations.pop();
-			m_priority_active      = true;
-			m_priority_active_tick = operation.tick;
+			m_priority_operations.pop_front();
+			m_priority_active        = true;
+			m_priority_active_tick   = operation.tick;
+			m_priority_active_begin  = operation.write_begin;
+			m_priority_active_end    = operation.write_end;
 		}
 		m_master.Wait(operation.tick);
 		if (!stop.stop_requested()) {
@@ -293,8 +298,10 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 		}
 		{
 			std::lock_guard lock(m_operation_mutex);
-			m_priority_active      = false;
-			m_priority_active_tick = 0;
+			m_priority_active        = false;
+			m_priority_active_tick   = 0;
+			m_priority_active_begin  = 0;
+			m_priority_active_end    = 0;
 		}
 		m_operation_available.notify_all();
 	}
@@ -316,6 +323,96 @@ void CommandScheduler::WaitPriorityOperations(uint64_t tick) {
 		    !m_priority_operations.empty() && m_priority_operations.front().tick <= tick;
 		return !active_before_or_at && !queued_before_or_at;
 	});
+}
+
+uint64_t CommandScheduler::PendingGuestWriteTick(uint64_t address, uint64_t size) {
+	const auto      end = address + size;
+	std::lock_guard lock(m_operation_mutex);
+	uint64_t        tick = 0;
+	if (m_priority_active && m_priority_active_begin < end && address < m_priority_active_end) {
+		tick = m_priority_active_tick;
+	}
+	for (const auto& operation: m_priority_operations) {
+		if (operation.write_begin < end && address < operation.write_end) {
+			tick = std::max(tick, operation.tick);
+		}
+	}
+	return tick;
+}
+
+void CommandScheduler::WaitGuestWrites(uint64_t address, uint64_t size) {
+	EXIT_IF(g_deferred_callback_scheduler == this);
+	const auto tick = PendingGuestWriteTick(address, size);
+	if (tick == 0) {
+		return;
+	}
+	if (tick >= CurrentTick()) {
+		CheckActive();
+		if (!m_command.IsInvalid()) {
+			Submit();
+		}
+		BeginNext();
+	}
+	WaitPriorityOperations(tick);
+}
+
+void CommandScheduler::RunDetached(uint64_t                                         wait_tick,
+                                   Common::UniqueFunction<void, vk::CommandBuffer>&& record) {
+	EXIT_IF(wait_tick >= CurrentTick() || !record);
+	auto& device = m_graphics.device;
+	if (m_detached_pool == nullptr) {
+		vk::CommandPoolCreateInfo pool_info {};
+		pool_info.queueFamilyIndex = m_graphics.queue_family;
+		pool_info.flags            = vk::CommandPoolCreateFlagBits::eTransient |
+		                  vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
+		EXIT_NOT_IMPLEMENTED(device.createCommandPool(&pool_info, nullptr, &m_detached_pool) !=
+		                     vk::Result::eSuccess);
+		vk::CommandBufferAllocateInfo allocate {};
+		allocate.commandPool        = m_detached_pool;
+		allocate.level              = vk::CommandBufferLevel::ePrimary;
+		allocate.commandBufferCount = 1;
+		EXIT_NOT_IMPLEMENTED(device.allocateCommandBuffers(&allocate, &m_detached_buffer) !=
+		                     vk::Result::eSuccess);
+		vk::FenceCreateInfo fence_info {};
+		EXIT_NOT_IMPLEMENTED(device.createFence(&fence_info, nullptr, &m_detached_fence) !=
+		                     vk::Result::eSuccess);
+	}
+	// The semaphore wait orders this batch after the writer's submission alone.
+	const auto queue = m_graphics.readback_queue != nullptr ? m_graphics.readback_queue
+	                                                        : m_graphics.queue;
+
+	vk::CommandBufferBeginInfo begin {};
+	begin.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
+	EXIT_NOT_IMPLEMENTED(m_detached_buffer.begin(&begin) != vk::Result::eSuccess);
+	record(m_detached_buffer);
+	EXIT_NOT_IMPLEMENTED(m_detached_buffer.end() != vk::Result::eSuccess);
+
+	const auto                      semaphore = m_master.Handle();
+	const vk::PipelineStageFlags    stage     = vk::PipelineStageFlagBits::eAllCommands;
+	vk::TimelineSemaphoreSubmitInfo timeline_info {};
+	timeline_info.waitSemaphoreValueCount = 1;
+	timeline_info.pWaitSemaphoreValues    = &wait_tick;
+	vk::SubmitInfo submit_info {};
+	submit_info.pNext              = &timeline_info;
+	submit_info.waitSemaphoreCount = 1;
+	submit_info.pWaitSemaphores    = &semaphore;
+	submit_info.pWaitDstStageMask  = &stage;
+	submit_info.commandBufferCount = 1;
+	submit_info.pCommandBuffers    = &m_detached_buffer;
+	vk::Result result;
+	{
+		Common::LockGuard lock(m_graphics.queue_mutex);
+		result = queue.submit(1, &submit_info, m_detached_fence);
+	}
+	if (result == vk::Result::eSuccess) {
+		result = device.waitForFences(1, &m_detached_fence, VK_TRUE, UINT64_MAX);
+	}
+	if (result != vk::Result::eSuccess) {
+		ReportVulkanFatal("detached submission", result, wait_tick, 0, 0, 0, 0, 0, 0, 0);
+	}
+	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	EXIT_NOT_IMPLEMENTED(device.resetFences(1, &m_detached_fence) != vk::Result::eSuccess);
+	m_master.Refresh();
 }
 
 void CommandScheduler::RunOperation(Common::UniqueFunction<void>&& operation) {

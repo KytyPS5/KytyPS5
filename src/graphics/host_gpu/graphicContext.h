@@ -56,7 +56,10 @@ struct GraphicContext {
 	vk::ShaderStageFlags               required_subgroup_size_stages         = {};
 	Common::Mutex                      queue_mutex;
 	uint32_t                           queue_family = static_cast<uint32_t>(-1);
+	uint32_t                           queue_count  = 1;
 	vk::Queue                          queue        = nullptr;
+	// A second queue of `queue_family`, or null; CommandScheduler::RunDetached submits to it.
+	vk::Queue                          readback_queue = nullptr;
 
 	[[nodiscard]] const vk::PhysicalDeviceProperties& GetPhysicalDeviceProperties() const {
 		return physical_device_properties;

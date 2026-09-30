@@ -538,11 +538,18 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	EXIT_IF(physical_device == nullptr);
 	EXIT_IF(queue_family == static_cast<uint32_t>(-1));
 
-	const float               queue_priority = 1.0f;
-	vk::DeviceQueueCreateInfo queue_create_info {};
+	// A second queue of the same family carries readbacks that must not wait behind the first.
+	uint32_t queue_family_count = 0;
+	physical_device.getQueueFamilyProperties(&queue_family_count, nullptr);
+	std::vector<vk::QueueFamilyProperties> queue_families(queue_family_count);
+	physical_device.getQueueFamilyProperties(&queue_family_count, queue_families.data());
+	EXIT_IF(queue_family >= queue_family_count);
+	const std::array<float, 2> queue_priorities {1.0f, 1.0f};
+	vk::DeviceQueueCreateInfo  queue_create_info {};
 	queue_create_info.queueFamilyIndex = queue_family;
-	queue_create_info.queueCount       = 1;
-	queue_create_info.pQueuePriorities = &queue_priority;
+	queue_create_info.queueCount       = std::min(2u, queue_families[queue_family].queueCount);
+	queue_create_info.pQueuePriorities = queue_priorities.data();
+	graphics.queue_count               = queue_create_info.queueCount;
 
 	vk::PhysicalDeviceColorWriteEnableFeaturesEXT color_write_ext {};
 	color_write_ext.colorWriteEnable = VK_TRUE;
@@ -1228,6 +1235,9 @@ void WindowContext::CreateVulkan() {
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
 	graphic_ctx.device.getQueue(graphic_ctx.queue_family, 0, &graphic_ctx.queue);
 	EXIT_IF(graphic_ctx.queue == nullptr);
+	if (graphic_ctx.queue_count > 1) {
+		graphic_ctx.device.getQueue(graphic_ctx.queue_family, 1, &graphic_ctx.readback_queue);
+	}
 
 	if (!graphic_ctx.CreateAllocator()) {
 		EXIT("Could not create Vulkan memory allocator");

@@ -266,6 +266,12 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	                       {}, 0, nullptr, 1, &after, 0, nullptr);
 	// The copy consuming the reservation is recorded; a synchronous wait must not carry it on.
 	hold.reset();
+	uint64_t write_begin = UINT64_MAX;
+	uint64_t write_end   = 0;
+	for (const auto& copy: copies) {
+		write_begin = std::min(write_begin, copy.srcOffset);
+		write_end   = std::max(write_end, copy.srcOffset + copy.size);
+	}
 	auto publish = [this, mapped, offset, total_size, buffer_address,
 	                copies = std::move(copies), owner = std::move(temporary)] {
 		(owner ? *owner : m_download_buffer).Invalidate(offset, total_size);
@@ -275,7 +281,8 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		}
 	};
 	if constexpr (async) {
-		m_scheduler.DeferPriorityOperation(std::move(publish));
+		m_scheduler.DeferPriorityOperation(std::move(publish), buffer_address + write_begin,
+		                                   write_end - write_begin);
 	} else {
 		KYTY_PROFILER_BLOCK("BufferCache::ReadMemory drain");
 		const auto tick = m_scheduler.CurrentTick();
@@ -283,6 +290,135 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		m_scheduler.WaitPriorityOperations(tick);
 		publish();
 	}
+	return true;
+}
+
+void BufferCache::MarkGpuWrite(uint64_t vaddr, uint64_t size) {
+	if (size == 0) {
+		return;
+	}
+	const auto end  = vaddr + size;
+	const auto tick = m_scheduler.CurrentTick();
+	auto       it   = m_gpu_write_marks.lower_bound(vaddr);
+	// A binding re-marked with its previous extent, the common case, only moves its tick.
+	if (it != m_gpu_write_marks.end() && it->first == vaddr && it->second.end == end) {
+		it->second = {end, tick};
+		return;
+	}
+	if (it != m_gpu_write_marks.begin()) {
+		auto& previous = std::prev(it)->second;
+		if (previous.end > vaddr) {
+			const auto tail = previous;
+			previous.end    = vaddr;
+			if (tail.end > end) {
+				m_gpu_write_marks.emplace_hint(it, end, tail);
+			}
+		}
+	}
+	while (it != m_gpu_write_marks.end() && it->first < end) {
+		if (it->second.end > end) {
+			auto node  = m_gpu_write_marks.extract(it);
+			node.key() = end;
+			m_gpu_write_marks.insert(std::move(node));
+			break;
+		}
+		it = m_gpu_write_marks.erase(it);
+	}
+	m_gpu_write_marks.emplace(vaddr, GpuWriteMark {end, tick});
+}
+
+uint64_t BufferCache::NewestGpuWriteTick(uint64_t vaddr, uint64_t size) const {
+	const auto end    = vaddr + size;
+	auto       it     = m_gpu_write_marks.upper_bound(vaddr);
+	uint64_t   newest = 0;
+	if (it != m_gpu_write_marks.begin()) {
+		--it;
+	}
+	for (; it != m_gpu_write_marks.end() && it->first < end; ++it) {
+		if (it->second.end > vaddr) {
+			newest = std::max(newest, it->second.tick);
+		}
+	}
+	return newest;
+}
+
+void BufferCache::PruneGpuWriteMarks() {
+	const auto completed = m_scheduler.GetMasterSemaphore().KnownGpuTick();
+	std::erase_if(m_gpu_write_marks,
+	              [completed](const auto& entry) { return entry.second.tick <= completed; });
+}
+
+bool BufferCache::TryDownloadDetached(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	const auto                  buffer_address = buffer.CpuAddress();
+	std::vector<vk::BufferCopy> copies;
+	RangeSet                    pages;
+	m_memory_tracker.ForEachDownloadRange<false>(
+	    vaddr, size, [&](uint64_t address, uint64_t bytes) noexcept {
+		    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, address, bytes,
+		                                           "buffer download");
+		    pages.Add(address, bytes);
+		    m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t end) {
+			    copies.emplace_back(start - buffer_address, 0, end - start);
+		    });
+	    });
+	if (copies.empty()) {
+		return false;
+	}
+	uint64_t total_size  = 0;
+	uint64_t newest_tick = 0;
+	for (auto& copy: copies) {
+		copy.dstOffset = total_size;
+		total_size += Common::AlignUp(copy.size, 64);
+		newest_tick =
+		    std::max(newest_tick, NewestGpuWriteTick(buffer_address + copy.srcOffset, copy.size));
+	}
+
+	const auto current = m_scheduler.CurrentTick();
+	// Only a semaphore wait makes a completed writer's stores visible to the copy.
+	const auto wait = std::max(newest_tick, m_scheduler.GetMasterSemaphore().KnownGpuTick());
+	// The recording in progress wrote it, or a BDA store shader in it may have.
+	if (newest_tick >= current || m_bda_store_tick >= current) {
+		return false;
+	}
+	// Queued write-backs publish in order; one still waiting for a later tick would land on top.
+	if (m_scheduler.PendingGuestWriteTick(vaddr, size) > wait) {
+		return false;
+	}
+	StreamHold hold(m_download_buffer);
+	const auto [mapped, offset] = m_download_buffer.Map(total_size, 64, false);
+	if (mapped == nullptr) {
+		return false;
+	}
+	m_download_buffer.Commit();
+	for (auto& copy: copies) {
+		copy.dstOffset += offset;
+	}
+	const auto source = buffer.Handle();
+	const auto target = m_download_buffer.Handle();
+	m_scheduler.RunDetached(wait, [&](vk::CommandBuffer command) {
+		command.copyBuffer(source, target, static_cast<uint32_t>(copies.size()), copies.data());
+		vk::BufferMemoryBarrier after {};
+		after.srcAccessMask       = vk::AccessFlagBits::eTransferWrite;
+		after.dstAccessMask       = vk::AccessFlagBits::eHostRead;
+		after.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		after.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		after.buffer              = target;
+		after.offset              = offset;
+		after.size                = total_size;
+		command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+		                        vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1, &after, 0,
+		                        nullptr);
+	});
+	// Write-backs queued up to the writer's tick come first, exactly as in the drain.
+	m_scheduler.WaitPriorityOperations(wait);
+	m_download_buffer.Invalidate(offset, total_size);
+	for (const auto& copy: copies) {
+		Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
+		                                      mapped + (copy.dstOffset - offset), copy.size);
+	}
+	pages.ForEach([this](uint64_t begin, uint64_t end) {
+		m_gpu_modified_ranges.Subtract(begin, end - begin);
+	});
 	return true;
 }
 
@@ -365,7 +501,9 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		}
 		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
 
-		if (DownloadBufferMemory<false>(buffer, vaddr, size)) {
+		if (TryDownloadDetached(buffer, vaddr, size)) {
+			m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
+		} else if (DownloadBufferMemory<false>(buffer, vaddr, size)) {
 			m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
 		}
 		if (is_write) {
@@ -470,7 +608,10 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	                     "Kyty.GameBuffer[guest=0x{:016x} size=0x{:x}]", overlap.begin,
 	                     overlap.end - overlap.begin);
 	for (auto it = overlap.first; it != overlap.last;) {
-		const auto old_id = (it++)->second;
+		const auto  old_id = (it++)->second;
+		const auto& joined = m_slot_buffers[old_id];
+		// The joined bytes only reach the new buffer when the recording in progress runs.
+		MarkGpuWrite(joined.CpuAddress(), joined.Size());
 		JoinOverlap(id, old_id, !overlap.has_stream_leap);
 	}
 	Register(id);
@@ -581,6 +722,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
+		MarkGpuWrite(vaddr, size);
 		ForgetClassifiedMetadata(vaddr, size);
 	}
 	return {&buffer, buffer.Offset(vaddr)};
@@ -711,6 +853,7 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::RunGarbageCollector() {
+	PruneGpuWriteMarks();
 	const auto tick = m_gc_tick++;
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
@@ -896,6 +1039,9 @@ void BufferCache::RecordBdaEviction(const Buffer& buffer) {
 
 void BufferCache::MarkBdaStoresInMapped(const RangeSet& mapped, bool all_tracked) {
 	KYTY_PROFILER_FUNCTION();
+	if (all_tracked) {
+		m_bda_store_tick = m_scheduler.CurrentTick();
+	}
 	const auto& ranges = all_tracked ? m_bda_tracked_ranges : m_bda_unmarked_ranges;
 	ForEachBdaMarkRange(ranges, mapped,
 	                    [this](uint64_t begin, uint64_t end) { MarkBdaStores(begin, end - begin); });
@@ -917,6 +1063,7 @@ void BufferCache::MarkBdaStores(uint64_t vaddr, uint64_t size) {
 		TouchBuffer(buffer);
 		(void)SynchronizeBuffer(buffer, start, finish - start, true, false);
 		m_gpu_modified_ranges.Add(start, finish - start);
+		MarkGpuWrite(start, finish - start);
 		ForgetClassifiedMetadata(start, finish - start);
 	}
 }

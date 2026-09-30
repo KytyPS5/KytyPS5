@@ -34589,6 +34589,32 @@ GraphicsCase GraphicsInterpolationExport() {
            O::V_MOV_B32, O::EXP, O::S_ENDPGM}};
 }
 
+GraphicsCase GraphicsCompressedExport(uint8_t mode) {
+  GraphicsCase test;
+  test.name = mode == 6 ? "GraphicsCompressedSnormExport"
+              : mode == 5 ? "GraphicsCompressedUnormExport"
+                          : "GraphicsCompressedHalfExport";
+  test.pixel_target_output_mode = mode;
+  test.required_spirv = {mode == 6 ? "UnpackSnorm2x16"
+                        : mode == 5 ? "UnpackUnorm2x16" : "UnpackHalf2x16"};
+  const u32 low = mode == 6 ? 0x80007fffu
+                  : mode == 5 ? 0xffff0000u : 0x3c003800u;
+  const u32 high = mode == 6 ? 0x7fff0000u
+                   : mode == 5 ? 0x0000ffffu : 0x00003400u;
+  AppendVMovLiteral(&test.fragment_code, 0, low);
+  AppendVMovLiteral(&test.fragment_code, 1, high);
+  test.fragment_code.push_back(EncodeExp0(0, 0xf, true, true, true));
+  test.fragment_code.push_back(EncodeExp1(0, 1, 0, 0));
+  AppendEnd(&test.fragment_code);
+  test.expected_pixel = mode == 6
+      ? std::vector<u32>{0x3f800000u, 0xbf800000u, 0u,
+                         0x3f800000u}
+      : mode == 5 ? std::vector<u32>{0u, 0x3f800000u, 0x3f800000u, 0u}
+                  : std::vector<u32>{0x3f000000u, 0x3f800000u, 0x3e800000u, 0u};
+  test.opcodes = {ShaderOpcode::V_MOV_B32, ShaderOpcode::EXP, ShaderOpcode::S_ENDPGM};
+  return test;
+}
+
 void CheckPixelExportTargets() {
   constexpr const char *name = "PixelExportTargets";
   Require(name, "compacted MRTs",
@@ -35584,6 +35610,9 @@ std::vector<TestCase> MakeCases() {
 std::vector<GraphicsCase> MakeGraphicsCases() {
   return {
       GraphicsInterpolationExport(),
+      GraphicsCompressedExport(4),
+      GraphicsCompressedExport(5),
+      GraphicsCompressedExport(6),
       GraphicsPositionWExport(),
       GraphicsPerspectiveSampleInputs(false),
       GraphicsPerspectiveSampleInputs(true),
@@ -40891,6 +40920,9 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--pixel-export-only") == 0) {
     CheckPixelExportTargets();
+    for (const auto mode : {4, 5, 6}) {
+      (void)CompileFragmentCase(GraphicsCompressedExport(mode));
+    }
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--centroid-only") == 0) {

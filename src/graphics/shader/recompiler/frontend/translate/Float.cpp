@@ -6,7 +6,7 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
-bool Translator::PackedFloat16(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
+void Translator::PackedFloat16(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
                                bool accumulator, bool quiet_snan) {
 	const auto translate_lane = [&](bool high) {
 		const auto lhs = ReadF16LaneAsF32(inst.src0, high, true);
@@ -44,16 +44,15 @@ bool Translator::PackedFloat16(const Decoder::Instruction& inst, IR::ValueOpcode
 		result = PackU16Lanes(override_lane(false), override_lane(true));
 	}
 	WriteOperand(raw, result);
-	return true;
 }
 
-bool Translator::Float16Unary(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
+void Translator::Float16Unary(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
                               bool invalid_negative) {
 	const auto argument = ReadF16AsF32(inst.src0);
 	auto       result   = IR::F32(ir.Emit(opcode, {argument}));
 	if (!invalid_negative) {
 		WriteF16(DestinationOperand(inst), result);
-		return true;
+		return;
 	}
 	const auto negative =
 	    IR::U1(ir.Emit(IR::ValueOpcode::FPOrdLessThan32, {argument, IR::Value::F32(0.0f)}));
@@ -61,10 +60,9 @@ bool Translator::Float16Unary(const Decoder::Instruction& inst, IR::ValueOpcode 
 	const auto bits    = PackHalf2x16(result, IR::F32(IR::Value::F32(0.0f)));
 	const auto invalid = IR::U32(IR::Value(inst.dst.clamp ? 0u : 0xfe00u));
 	Write16Bits(DestinationOperand(inst), ir.Select(negative, invalid, bits));
-	return true;
 }
 
-bool Translator::Float16Trig(const Decoder::Instruction& inst, IR::ValueOpcode opcode) {
+void Translator::Float16Trig(const Decoder::Instruction& inst, IR::ValueOpcode opcode) {
 	const auto argument = ReadF16AsF32(inst.src0);
 	const auto magnitude =
 	    ir.BitwiseAnd(ir.BitCastU32(argument), IR::U32(IR::Value(0x7fffffffu)));
@@ -97,18 +95,16 @@ bool Translator::Float16Trig(const Decoder::Instruction& inst, IR::ValueOpcode o
 	const auto bits    = PackHalf2x16(result, IR::F32(IR::Value::F32(0.0f)));
 	const auto invalid = IR::U32(IR::Value(inst.dst.clamp ? 0u : 0xfe00u));
 	Write16Bits(DestinationOperand(inst), ir.Select(infinite, invalid, bits));
-	return true;
 }
 
-bool Translator::Float16Binary(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
+void Translator::Float16Binary(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
                                bool reverse) {
 	const auto lhs = ReadF16AsF32(reverse ? inst.src1 : inst.src0);
 	const auto rhs = ReadF16AsF32(reverse ? inst.src0 : inst.src1);
 	WriteF16(DestinationOperand(inst), IR::F32(ir.Emit(opcode, {lhs, rhs})));
-	return true;
 }
 
-bool Translator::Float16Ternary(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
+void Translator::Float16Ternary(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
                                 bool accumulator, bool mix) {
 	std::array<IR::Value, 3> args;
 	for (uint32_t index = 0; index < args.size(); index++) {
@@ -116,16 +112,14 @@ bool Translator::Float16Ternary(const Decoder::Instruction& inst, IR::ValueOpcod
 		args[index] = mix ? IR::Value(ReadMixF32(operand)) : IR::Value(ReadF16AsF32(operand));
 	}
 	WriteF16(DestinationOperand(inst), IR::F32(ir.Emit(opcode, {args[0], args[1], args[2]})));
-	return true;
 }
 
-bool Translator::FloatUnary(const Decoder::Instruction& inst, IR::ValueOpcode opcode) {
+void Translator::FloatUnary(const Decoder::Instruction& inst, IR::ValueOpcode opcode) {
 	const auto type = IR::ArgTypeOf(opcode, 0);
 	WriteOperand(DestinationOperand(inst), ir.Emit(opcode, {ReadOperand(inst.src0, type)}));
-	return true;
 }
 
-bool Translator::FloatBinary(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
+void Translator::FloatBinary(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
                              bool reverse) {
 	std::array<IR::Value, 2> args;
 	for (uint32_t index = 0; index < args.size(); index++) {
@@ -133,10 +127,9 @@ bool Translator::FloatBinary(const Decoder::Instruction& inst, IR::ValueOpcode o
 		args[index]        = ReadOperand(operand, IR::ArgTypeOf(opcode, index));
 	}
 	WriteOperand(DestinationOperand(inst), ir.Emit(opcode, {args[0], args[1]}));
-	return true;
 }
 
-bool Translator::FloatTernary(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
+void Translator::FloatTernary(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
                               bool accumulator, bool mix) {
 	std::array<IR::Value, 3> args;
 	for (uint32_t index = 0; index < args.size(); index++) {
@@ -146,10 +139,9 @@ bool Translator::FloatTernary(const Decoder::Instruction& inst, IR::ValueOpcode 
 		                                                  : ReadOperand(operand, type);
 	}
 	WriteOperand(DestinationOperand(inst), ir.Emit(opcode, {args[0], args[1], args[2]}));
-	return true;
 }
 
-bool Translator::V_FREXP_MANT_F32(const Decoder::Instruction& inst) {
+void Translator::V_FREXP_MANT_F32(const Decoder::Instruction& inst) {
 	const auto bits = ReadU32(inst.src0);
 	const auto exponent =
 	    IR::U32(ir.Emit(IR::ValueOpcode::BitFieldUExtract, {bits, IR::Value(23u), IR::Value(8u)}));
@@ -167,10 +159,9 @@ bool Translator::V_FREXP_MANT_F32(const Decoder::Instruction& inst) {
 	                                 ir.Select(zero, bits, subnormal));
 	const auto result    = ir.Select(ir.IEqual(exponent, IR::U32(IR::Value(0xffu))), bits, finite);
 	WriteOperand(DestinationOperand(inst), ir.BitCastF32(result));
-	return true;
 }
 
-bool Translator::V_DOT2C_F32_F16(const Decoder::Instruction& inst) {
+void Translator::V_DOT2C_F32_F16(const Decoder::Instruction& inst) {
 	auto a          = inst.src0;
 	a.op_sel        = false;
 	a.op_sel_hi     = true;
@@ -184,26 +175,25 @@ bool Translator::V_DOT2C_F32_F16(const Decoder::Instruction& inst) {
 	const auto acc  = ReadMixF32(inst.dst);
 	const auto lo   = IR::F32(ir.Emit(IR::ValueOpcode::FPFma32, {a_lo, b_lo, acc}));
 	WriteOperand(DestinationOperand(inst), ir.Emit(IR::ValueOpcode::FPFma32, {a_hi, b_hi, lo}));
-	return true;
 }
 
-bool Translator::V_CUBEID_F32(const Decoder::Instruction& inst) {
+void Translator::V_CUBEID_F32(const Decoder::Instruction& inst) {
 	return FloatCube(inst, 0u);
 }
 
-bool Translator::V_CUBESC_F32(const Decoder::Instruction& inst) {
+void Translator::V_CUBESC_F32(const Decoder::Instruction& inst) {
 	return FloatCube(inst, 1u);
 }
 
-bool Translator::V_CUBETC_F32(const Decoder::Instruction& inst) {
+void Translator::V_CUBETC_F32(const Decoder::Instruction& inst) {
 	return FloatCube(inst, 2u);
 }
 
-bool Translator::V_CUBEMA_F32(const Decoder::Instruction& inst) {
+void Translator::V_CUBEMA_F32(const Decoder::Instruction& inst) {
 	return FloatCube(inst, 3u);
 }
 
-bool Translator::FloatCube(const Decoder::Instruction& inst, uint32_t result_kind) {
+void Translator::FloatCube(const Decoder::Instruction& inst, uint32_t result_kind) {
 	const auto x  = ReadMixF32(inst.src0);
 	const auto y  = ReadMixF32(inst.src1);
 	const auto z  = ReadMixF32(inst.src2);
@@ -243,13 +233,12 @@ bool Translator::FloatCube(const Decoder::Instruction& inst, uint32_t result_kin
 		default: EXIT("invalid cube result kind");
 	}
 	WriteOperand(DestinationOperand(inst), result);
-	return true;
 }
 
 // Half-precision frexp works on the raw 16-bit encoding: the mantissa keeps its bits and the
 // exponent is replaced by the one that puts the value in [0.5, 1).
-bool Translator::V_FREXP_MANT_F16(const Decoder::Instruction& inst) {
-	const auto bits = ReadF16LaneBits(inst.src0, false);
+void Translator::V_FREXP_MANT_F16(const Decoder::Instruction& inst) {
+	const auto bits = Read16LaneBits(inst.src0, false);
 	const auto exponent =
 	    IR::U32(ir.Emit(IR::ValueOpcode::BitFieldUExtract, {bits, IR::Value(10u), IR::Value(5u)}));
 	const auto mantissa = ir.BitwiseAnd(bits, IR::U32(IR::Value(0x03ffu)));
@@ -266,11 +255,10 @@ bool Translator::V_FREXP_MANT_F16(const Decoder::Instruction& inst) {
 	                                 ir.Select(zero, bits, subnormal));
 	const auto result    = ir.Select(ir.IEqual(exponent, IR::U32(IR::Value(0x1fu))), bits, finite);
 	Write16Bits(DestinationOperand(inst), result);
-	return true;
 }
 
-bool Translator::V_FREXP_EXP_I16_F16(const Decoder::Instruction& inst) {
-	const auto bits = ReadF16LaneBits(inst.src0, false);
+void Translator::V_FREXP_EXP_I16_F16(const Decoder::Instruction& inst) {
+	const auto bits = Read16LaneBits(inst.src0, false);
 	const auto exponent =
 	    IR::U32(ir.Emit(IR::ValueOpcode::BitFieldUExtract, {bits, IR::Value(10u), IR::Value(5u)}));
 	const auto mantissa  = ir.BitwiseAnd(bits, IR::U32(IR::Value(0x03ffu)));
@@ -284,7 +272,6 @@ bool Translator::V_FREXP_EXP_I16_F16(const Decoder::Instruction& inst) {
 	const auto result    = ir.Select(ir.IEqual(exponent, IR::U32(IR::Value(0x1fu))),
 	                                 IR::U32(IR::Value(0u)), finite);
 	Write16Bits(DestinationOperand(inst), ir.BitwiseAnd(result, IR::U32(IR::Value(0xffffu))));
-	return true;
 }
 
 // The legacy multiply returns +0.0 whenever either operand is zero, even against NaN or infinity.
@@ -297,7 +284,7 @@ IR::F32 Translator::FloatMulLegacy(IR::F32 lhs, IR::F32 rhs) {
 	return SelectF32(either_zero, zero, product);
 }
 
-bool Translator::FloatLegacy(const Decoder::Instruction& inst, bool add, bool accumulator) {
+void Translator::FloatLegacy(const Decoder::Instruction& inst, bool add, bool accumulator) {
 	const auto lhs = IR::F32(ReadOperand(inst.src0, IR::Type::F32));
 	const auto rhs = IR::F32(ReadOperand(inst.src1, IR::Type::F32));
 	auto       result = FloatMulLegacy(lhs, rhs);
@@ -307,19 +294,17 @@ bool Translator::FloatLegacy(const Decoder::Instruction& inst, bool add, bool ac
 		result = IR::F32(ir.Emit(IR::ValueOpcode::FPAdd32, {result, addend}));
 	}
 	WriteOperand(DestinationOperand(inst), result);
-	return true;
 }
 
-bool Translator::V_LDEXP_F16(const Decoder::Instruction& inst) {
+void Translator::V_LDEXP_F16(const Decoder::Instruction& inst) {
 	const auto value = ReadF16AsF32(inst.src0);
 	WriteF16(DestinationOperand(inst),
 	         IR::F32(ir.Emit(IR::ValueOpcode::FPLdexp, {value, ReadU32(inst.src1)})));
-	return true;
 }
 
 // Division fix-up applies the special-case numerics of a divide to the quotient the reciprocal
 // sequence produced. S0 is that quotient, S1 the denominator and S2 the numerator.
-bool Translator::V_DIV_FIXUP(const Decoder::Instruction& inst, bool half) {
+void Translator::V_DIV_FIXUP(const Decoder::Instruction& inst, bool half) {
 	const auto read = [&](const Decoder::Operand& operand) {
 		return half ? ReadF16AsF32(operand) : IR::F32(ReadOperand(operand, IR::Type::F32));
 	};
@@ -370,22 +355,20 @@ bool Translator::V_DIV_FIXUP(const Decoder::Instruction& inst, bool half) {
 	} else {
 		WriteOperand(DestinationOperand(inst), result);
 	}
-	return true;
 }
 
 // The architectural scaling only protects the Newton-Raphson iteration from exponents that would
 // make the intermediate reciprocal overflow or flush to zero. Passing the operand through unscaled
 // keeps every other quotient exact and leaves the post-scale flag clear for V_DIV_FMAS_F32.
-bool Translator::V_DIV_SCALE_F32(const Decoder::Instruction& inst) {
+void Translator::V_DIV_SCALE_F32(const Decoder::Instruction& inst) {
 	WriteOperand(DestinationOperand(inst), ReadOperand(inst.src0, IR::Type::F32));
 	if (inst.dst2.kind != Decoder::OperandKind::Null &&
 	    inst.dst2.kind != Decoder::OperandKind::Unknown) {
 		WriteMask(inst.dst2, IR::U1(IR::Value(false)));
 	}
-	return true;
 }
 
-bool Translator::V_DIV_FMAS_F32(const Decoder::Instruction& inst) {
+void Translator::V_DIV_FMAS_F32(const Decoder::Instruction& inst) {
 	const auto value = IR::F32(ir.Emit(IR::ValueOpcode::FPFma32,
 	                                   {ReadOperand(inst.src0, IR::Type::F32),
 	                                    ReadOperand(inst.src1, IR::Type::F32),
@@ -394,10 +377,9 @@ bool Translator::V_DIV_FMAS_F32(const Decoder::Instruction& inst) {
 	const auto scaled = IR::F32(
 	    ir.Emit(IR::ValueOpcode::FPMul32, {value, IR::Value::F32(4294967296.0f)}));
 	WriteOperand(DestinationOperand(inst), SelectF32(ir.GetVcc(), scaled, value));
-	return true;
 }
 
-bool Translator::V_DOT2_F32_F16(const Decoder::Instruction& inst) {
+void Translator::V_DOT2_F32_F16(const Decoder::Instruction& inst) {
 	auto a      = inst.src0;
 	a.op_sel    = false;
 	a.op_sel_hi = true;
@@ -410,7 +392,6 @@ bool Translator::V_DOT2_F32_F16(const Decoder::Instruction& inst) {
 	WriteOperand(DestinationOperand(inst),
 	             ir.Emit(IR::ValueOpcode::FPFma32,
 	                     {ReadF16LaneAsF32(a, true), ReadF16LaneAsF32(b, true), low}));
-	return true;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Frontend

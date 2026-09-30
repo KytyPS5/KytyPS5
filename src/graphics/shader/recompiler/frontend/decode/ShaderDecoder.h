@@ -198,6 +198,8 @@ enum class Opcode {
 	V_DOT4_U32_U8,
 	V_DOT8_I32_I4,
 	V_DOT8_U32_U4,
+	V_CVT_F64_I32,
+	V_CVT_F32_F64,
 	V_CVT_F32_I32,
 	V_CVT_F32_U32,
 	V_CVT_U32_F32,
@@ -222,6 +224,7 @@ enum class Opcode {
 	V_CVT_F32_UBYTE1,
 	V_CVT_F32_UBYTE2,
 	V_CVT_F32_UBYTE3,
+	V_RCP_F64,
 	V_RCP_F32,
 	V_RCP_IFLAG_F32,
 	V_FRACT_F32,
@@ -284,15 +287,17 @@ enum class Opcode {
 	V_CVT_PKRTZ_F16_F32,
 	V_CVT_PK_U8_F32,
 	V_MAD_F32,
+	V_MAD_I16,
 	V_MAD_I32_I24,
 	V_MAD_U32_U24,
 	V_MAD_U64_U32,
 	V_MAD_I64_I32,
 	V_MAD_U16,
-	V_MAD_I16,
 	V_MAD_U32_U16,
 	V_MAD_I32_I16,
 	V_MUL_LO_U16,
+	V_FMA_F64,
+	V_MUL_F64,
 	V_FMA_F32,
 	V_FMA_F16,
 	V_PACK_B32_F16,
@@ -512,8 +517,8 @@ enum class Opcode {
 	V_CMP_LE_U16,
 	V_CMP_GT_U16,
 	V_CMPX_LT_U16,
-	V_CMPX_GT_U16,
 	V_CMPX_EQ_U16,
+	V_CMPX_GT_U16,
 	V_CMPX_LE_U16,
 	V_CMPX_NE_U16,
 	V_CMPX_GE_U16,
@@ -731,6 +736,8 @@ enum class Opcode {
 	IMAGE_ATOMIC_AND,
 	IMAGE_ATOMIC_OR,
 	IMAGE_ATOMIC_XOR,
+	IMAGE_ATOMIC_FMIN,
+	IMAGE_ATOMIC_FMAX,
 	IMAGE_SAMPLE,
 	IMAGE_GATHER4,
 	IMAGE_GATHER4_CL,
@@ -875,6 +882,7 @@ struct Operand {
 	bool     absolute           = false;
 	bool     clamp              = false;
 	bool     dpp                = false;
+	bool     dpp8               = false;
 };
 
 struct Instruction {
@@ -910,6 +918,7 @@ struct Instruction {
 	bool           formatted                                    = false;
 	bool           gds                                          = false;
 	bool           glc                                          = false;
+	bool           dlc                                          = false;
 	bool           slc                                          = false;
 	bool           idxen                                        = false;
 	bool           offen                                        = false;
@@ -928,6 +937,7 @@ struct Instruction {
 struct Program {
 	std::span<const uint32_t> code;
 	std::vector<Instruction>  instructions;
+	bool                     has_bvh = false;
 };
 
 // Code spans are trusted to contain complete instructions, valid branch targets, and 32-bit PCs.

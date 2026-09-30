@@ -166,9 +166,9 @@ void Translator::V_CVT_PK_U8_F32(const Decoder::Instruction& inst) {
 }
 
 void Translator::V_PACK_B32_F16(const Decoder::Instruction& inst) {
-	const auto low = ReadF16LaneBits(inst.src0, false);
+	const auto low = Read16LaneBits(inst.src0, false);
 	const auto high =
-	    ir.ShiftLeftLogical(ReadF16LaneBits(inst.src1, false), IR::U32(IR::Value(16u)));
+	    ir.ShiftLeftLogical(Read16LaneBits(inst.src1, false), IR::U32(IR::Value(16u)));
 	WriteOperand(DestinationOperand(inst), ir.BitwiseOr(low, high));
 }
 

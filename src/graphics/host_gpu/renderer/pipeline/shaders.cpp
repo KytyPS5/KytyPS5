@@ -368,6 +368,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	// MoltenVK lacks VK_EXT_depth_clip_enable; omit the depth-clip struct on macOS and accept
 	// Vulkan's default depth clipping (enabled) instead of the PS5's clamp behavior.
 #if !defined(__APPLE__)
+	// The DB clamps depth to the viewport range after polygon offset is applied.
+	rasterizer.depthClampEnable = VK_TRUE;
 	rasterizer.pNext = &clip_ext;
 #endif
 	vk::PipelineRasterizationProvokingVertexStateCreateInfoEXT provoking_vertex {};

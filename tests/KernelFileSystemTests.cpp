@@ -1,18 +1,23 @@
-#include "SDL.h"
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_main.h>
+
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/subsystems.h"
 #include "common/threads.h"
+#include "common/stringUtils.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "kernel/fileSystem.h"
 #include "libs/errno.h"
 #include "libs/network.h"
 #include "loader/symbolDatabase.h"
 
+#include <algorithm>
 #include <array>
 
 #include <chrono>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -25,6 +30,10 @@
 
 namespace Libs::LibKernelApr {
 void InitLibKernel_1_Apr(Loader::SymbolDatabase *symbols);
+}
+
+namespace Libs::LibNet {
+void InitNet_1_Net(Loader::SymbolDatabase *symbols);
 }
 
 namespace {
@@ -89,6 +98,33 @@ void CheckSaveRename(const std::filesystem::path &root,
         "renamed save contents");
 }
 
+void TestSaveOpenVisibility() {
+  constexpr char Path[] = "/savedata0/visible-save.dat";
+  constexpr char Payload[] = "saved progress";
+
+  const int fd = FileSystem::KernelOpen(Path, 0xa01, 0777);
+  Check(fd >= 3, "create save file exclusively");
+  FileSystem::FileStat stat {};
+  Check(FileSystem::KernelStat(Path, &stat) == OK && stat.st_size == 0,
+        "created save file is visible before close");
+  Check(FileSystem::KernelOpen(Path, 0xa01, 0777) ==
+            Libs::LibKernel::KERNEL_ERROR_EEXIST,
+        "exclusive creation detects an open save file");
+  Check(FileSystem::KernelWrite(fd, Payload, sizeof(Payload) - 1) ==
+            sizeof(Payload) - 1,
+        "populate save file before truncation");
+  Check(FileSystem::KernelClose(fd) == OK, "close populated save file");
+  Check(FileSystem::KernelStat(Path, &stat) == OK &&
+            stat.st_size == sizeof(Payload) - 1,
+        "save file contains the truncation fixture");
+
+  const int truncated = FileSystem::KernelOpen(Path, 0x401, 0777);
+  Check(truncated >= 3, "truncate existing save file");
+  Check(FileSystem::KernelStat(Path, &stat) == OK && stat.st_size == 0,
+        "save truncation is visible before close");
+  Check(FileSystem::KernelClose(truncated) == OK, "close truncated save file");
+}
+
 void CheckMountRoot(const std::filesystem::path &root) {
   Common::File cache;
   Check(cache.Create(root / "rpf.cache"), "create directory listing fixture");
@@ -126,6 +162,80 @@ void CheckMountRoot(const std::filesystem::path &root) {
     }
   }
   FileSystem::Umount("/app0");
+  Check(FileSystem::GetRealFilename("/app0/rpf.cache") == "/app0/rpf.cache",
+        "unmount by guest path");
+  for (const auto &folder : {root, root / ""}) {
+    for (const auto &host : {root, root / ""}) {
+      FileSystem::Mount(folder, "/app0");
+      FileSystem::Umount(Common::PathToGenericString(host));
+      Check(FileSystem::GetRealFilename("/app0/rpf.cache") == "/app0/rpf.cache",
+            "unmount by host path with or without trailing separator");
+    }
+  }
+}
+
+void CheckUnicodePaths(const std::filesystem::path &root) {
+  constexpr std::string_view HostDirectory =
+      "Test\xc3\xa9-\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e";
+  constexpr std::string_view GuestFilename =
+      "asset-\xc3\xa9-\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e.bin";
+
+  const auto unicode_root =
+      root / Common::PathFromUtf8(HostDirectory);
+  const auto nested_root = unicode_root / "nested";
+
+  Check(Common::File::CreateDirectories(nested_root),
+        "create nested Unicode host directory");
+
+  CheckMountRoot(nested_root);
+
+  const auto native_file =
+      nested_root / Common::PathFromUtf8(GuestFilename);
+
+  Common::File fixture;
+  Check(fixture.Create(native_file), "create Unicode filename");
+  fixture.Close();
+
+  const auto entries = Common::File::GetDirEntries(nested_root);
+  Check(std::any_of(entries.begin(), entries.end(), [&](const auto &entry) {
+          return entry.is_file && entry.name == GuestFilename;
+        }), "directory enumeration returns UTF-8 filenames");
+
+  FileSystem::Mount(nested_root, "/app0");
+
+  const auto guest_file =
+      std::string("/app0/") + std::string(GuestFilename);
+
+  Check(FileSystem::GetRealFilename(guest_file) == native_file,
+        "resolve Unicode guest path");
+
+  const int fd = FileSystem::KernelOpen(guest_file.c_str(), 0, 0);
+  Check(fd >= 3, "open Unicode guest path");
+  Check(FileSystem::KernelClose(fd) == OK,
+        "close Unicode guest path");
+
+  FileSystem::Umount("/app0");
+}
+
+void CheckUnicodeLogPath(const std::filesystem::path &root) {
+  Config::ConfigOptions options;
+  options.printf_direction = Config::LogDirection::File;
+  options.printf_output_file = root / u8"logs-\u65e5\u672c\u8a9e-\U0001f600" / u8"log-\u00e9.txt";
+  Config::Load(options);
+  Log::Initialize();
+  constexpr std::string_view Payload = "Unicode log path\n";
+  Log::Write(Payload);
+  Log::Shutdown();
+
+  Common::File result(options.printf_output_file, Common::File::Mode::Read);
+  Check(!result.IsInvalid(), "open Unicode log file");
+  const auto data = result.ReadWholeBuffer();
+  Check(data.size() == Payload.size() &&
+            std::memcmp(data.data(), Payload.data(), data.size()) == 0,
+        "Unicode log file contains output");
+  options.printf_direction = Config::LogDirection::Silent;
+  Config::Load(options);
+  Log::Initialize();
 }
 
 void CheckDirectoryStream(const std::filesystem::path &root) {
@@ -302,6 +412,22 @@ void CheckAprPaths(const std::filesystem::path &root) {
 
 void CheckSocketWakeup() {
   namespace Net = Libs::Network::Net;
+  Loader::SymbolDatabase symbols;
+  Libs::LibNet::InitNet_1_Net(&symbols);
+  const auto *send_symbol = symbols.Find(
+      {"beRjXBn-z+o", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
+  const auto *recv_symbol = symbols.Find(
+      {"9wO9XrMsNhc", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
+  const auto *errno_symbol = symbols.Find(
+      {"HQOwnfMGipQ", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
+  Check(send_symbol && recv_symbol && errno_symbol,
+        "Net send, receive and errno exports resolve with the guest ABI versions");
+  using Send = int (KYTY_SYSV_ABI *)(int, const void *, size_t, int);
+  using Recv = int (KYTY_SYSV_ABI *)(int, void *, size_t, int);
+  using Errno = int *(KYTY_SYSV_ABI *)();
+  const auto net_send = reinterpret_cast<Send>(send_symbol->vaddr);
+  const auto net_recv = reinterpret_cast<Recv>(recv_symbol->vaddr);
+  auto *net_errno = reinterpret_cast<Errno>(errno_symbol->vaddr)();
   // Guest sockaddr_in: length, family, network-order port/address, padding.
   std::array<uint8_t, 16> address {16, 2, 0, 0, 127, 0, 0, 1};
   const int listener = Net::Socket(2, 1, 0);
@@ -336,26 +462,61 @@ void CheckSocketWakeup() {
                     immediate.data()) == 0 && readable[reader / 64] == 0,
         "empty socket is not readable");
   const char payload[] = "wake";
-  Check(Net::Send(writer, payload, sizeof(payload), 0x20000) == sizeof(payload),
-        "send wake bytes with guest MSG_NOSIGNAL");
+  *net_errno = Libs::Posix::POSIX_EINVAL;
+  Check(net_send(writer, payload, sizeof(payload), 0) == sizeof(payload) &&
+            *net_errno == Libs::Posix::POSIX_EINVAL,
+        "Net send forwards bytes and preserves errno on success");
   readable[reader / 64] = bit;
   const std::array<int64_t, 2> deadline {1, 0};
   Check(Net::Select(reader + 1, readable.data(), nullptr, nullptr,
                     deadline.data()) == 1 && readable[reader / 64] == bit,
         "select reports the guest descriptor after wake");
   std::array<char, sizeof(payload)> received {};
-  Check(Net::Recv(reader, received.data(), received.size(), 0x42) == sizeof(payload) &&
+  Check(net_recv(reader, received.data(), received.size(), 0x42) == sizeof(payload) &&
+            std::memcmp(received.data(), payload, sizeof(payload)) == 0 &&
+            *net_errno == Libs::Posix::POSIX_EINVAL,
+        "Net receive forwards PEEK and WAITALL without consuming bytes");
+  received.fill(0);
+  Check(net_recv(reader, received.data(), received.size(), 0x40) == sizeof(payload) &&
             std::memcmp(received.data(), payload, sizeof(payload)) == 0,
-        "guest PEEK and WAITALL preserve the wake bytes");
-  Check(Net::Recv(reader, received.data(), received.size(), 0x40) == sizeof(payload),
-        "consume wake bytes with guest WAITALL");
+        "Net receive consumes the same bytes after peeking");
 #if !defined(_WIN32)
   Check(Net::Recv(reader, received.data(), received.size(), 0x80) == -1 &&
             *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EWOULDBLOCK,
         "empty nonblocking receive translates guest errno");
+  Check(net_recv(reader, received.data(), received.size(), 0x80) ==
+            Libs::Network::NET_ERROR_EWOULDBLOCK &&
+            *net_errno == Libs::Posix::POSIX_EWOULDBLOCK,
+        "Net nonblocking receive translates POSIX failure and Net errno");
 #endif
-  Check(Net::SocketClose(reader) == 0 && Net::SocketClose(writer) == 0,
-        "close wake sockets");
+  Check(net_send(-1, payload, sizeof(payload), 0) == Libs::Network::NET_ERROR_EBADF &&
+            *net_errno == Libs::Posix::POSIX_EBADF,
+        "Net send translates an invalid socket instead of returning POSIX minus one");
+  Check(net_recv(reader, nullptr, received.size(), 0) == Libs::Network::NET_ERROR_EFAULT &&
+            *net_errno == Libs::Posix::POSIX_EFAULT,
+        "Net receive translates an invalid output buffer");
+  Check(net_send(writer, payload, sizeof(payload), 0x100000) ==
+            Libs::Network::NET_ERROR_EOPNOTSUPP &&
+            *net_errno == Libs::Posix::POSIX_EOPNOTSUPP,
+        "Net send preserves the backend's unsupported crypto flag error");
+#if defined(__linux__)
+  const int disconnected = Net::Socket(2, 1, 0);
+  Check(disconnected >= 0, "create unconnected socket for broken pipe check");
+  const auto previous_sigpipe = std::signal(SIGPIPE, SIG_DFL);
+  Check(previous_sigpipe != SIG_ERR, "set default SIGPIPE disposition for Net send");
+  const auto broken_send = net_send(disconnected, payload, sizeof(payload), 0);
+  std::signal(SIGPIPE, previous_sigpipe);
+  Check(broken_send == Libs::Network::NET_ERROR_EPIPE &&
+            *net_errno == Libs::Posix::POSIX_EPIPE,
+        "Net send reports a broken pipe without raising host SIGPIPE");
+  Check(Net::SocketClose(disconnected) == 0, "close unconnected socket");
+#endif
+  Check(Net::SocketClose(writer) == 0, "close wake writer");
+  *net_errno = Libs::Posix::POSIX_EINVAL;
+  Check(net_recv(reader, received.data(), received.size(), 0) == 0 &&
+            *net_errno == Libs::Posix::POSIX_EINVAL,
+        "Net receive returns EOF without replacing errno");
+  Check(Net::SocketClose(reader) == 0, "close wake reader");
   readable[reader / 64] = bit;
   Check(Net::Select(reader + 1, readable.data(), nullptr, nullptr,
                     immediate.data()) == -1 &&
@@ -375,11 +536,11 @@ int main() {
   Config::Load(options);
   subsystems.Initialize<Log::Lifecycle>();
 
-  Check(SDL_InitSubSystem(SDL_INIT_VIDEO) == 0, "initialize Vulkan test video");
+  Check(SDL_InitSubSystem(SDL_INIT_VIDEO), "initialize Vulkan test video");
   auto graphics = std::make_unique<Libs::Graphics::WindowContext>();
   graphics->graphic_ctx.screen_width = 64;
   graphics->graphic_ctx.screen_height = 64;
-  graphics->window = SDL_CreateWindow("KernelFileSystemTests", 0, 0, 64, 64,
+  graphics->window = SDL_CreateWindow("KernelFileSystemTests", 64, 64,
                                       SDL_WINDOW_VULKAN | SDL_WINDOW_HIDDEN);
   Check(graphics->window != nullptr, "create hidden Vulkan test window");
   graphics->CreateVulkan();
@@ -387,9 +548,12 @@ int main() {
   TempDirectory temporary;
   FileSystem::Initialize();
   CheckMountRoot(temporary.Path());
+  CheckUnicodePaths(temporary.Path());
+  CheckUnicodeLogPath(temporary.Path());
   CheckDirectoryStream(temporary.Path());
   CheckAprPaths(temporary.Path());
   FileSystem::Mount(temporary.Path(), "/savedata0");
+  TestSaveOpenVisibility();
   CheckSaveRename(temporary.Path(), "first-save");
   CheckSaveRename(temporary.Path(), "replacement-save");
   FileSystem::Shutdown();

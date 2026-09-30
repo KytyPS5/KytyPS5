@@ -188,8 +188,8 @@ bool IsDsAtomicOpcode(Opcode opcode) {
 		case Opcode::DS_SUB_U32:
 		case Opcode::DS_SUB_RTN_U32:
 		case Opcode::DS_INC_U32:
-		case Opcode::DS_DEC_U32:
 		case Opcode::DS_INC_RTN_U32:
+		case Opcode::DS_DEC_U32:
 		case Opcode::DS_DEC_RTN_U32:
 		case Opcode::DS_MIN_I32:
 		case Opcode::DS_MIN_RTN_I32:
@@ -263,6 +263,10 @@ void DecodeSmem(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	}
 
 	DecodeScalarDestination(sdst, pc, inst.dst);
+	if (inst.opcode == Opcode::S_MEMREALTIME) {
+		inst.src_count = 0;
+		return;
+	}
 	// SMEM encodes SBASE in SGPR pairs. Scalar-buffer loads still use the same
 	// pair index; their descriptor operand consumes four SGPRs from that base.
 	DecodeScalarSource(sbase * 2u, pc, inst.src0);
@@ -286,6 +290,7 @@ void DecodeMubuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_inde
 	inst.idxen       = ((word0 >> 13u) & 1u) != 0;
 	inst.offen       = ((word0 >> 12u) & 1u) != 0;
 	inst.glc         = ((word0 >> 14u) & 1u) != 0;
+	inst.dlc         = ((word0 >> 15u) & 1u) != 0;
 	inst.slc         = ((word1 >> 22u) & 1u) != 0;
 	inst.family      = Family::MUBUF;
 	inst.opcode_id   = opcode;
@@ -321,6 +326,7 @@ void DecodeMtbuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_inde
 	inst.idxen         = ((word0 >> 13u) & 1u) != 0;
 	inst.offen         = ((word0 >> 12u) & 1u) != 0;
 	inst.glc           = ((word0 >> 14u) & 1u) != 0;
+	inst.dlc           = ((word0 >> 15u) & 1u) != 0;
 	inst.slc           = ((word1 >> 22u) & 1u) != 0;
 	inst.family        = Family::MTBUF;
 	inst.opcode_id     = opcode;
@@ -456,7 +462,9 @@ void DecodeDs(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, 
 	}
 	DecodeVectorGpr(addr, inst.src0);
 	DecodeVectorGpr(data0, inst.src1);
-	if (inst.opcode == Opcode::DS_WRITE_B16_D16_HI || inst.opcode == Opcode::DS_WRITE_B8_D16_HI) {
+	if (inst.opcode == Opcode::DS_WRITE_B8_D16_HI) {
+		inst.src1.sdwa_sel = 2u;
+	} else if (inst.opcode == Opcode::DS_WRITE_B16_D16_HI) {
 		inst.src1.sdwa_sel = 5u;
 	}
 	DecodeVectorGpr(data1, inst.src2);

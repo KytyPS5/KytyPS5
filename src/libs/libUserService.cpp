@@ -92,7 +92,9 @@ static KYTY_SYSV_ABI int UserServiceGetLoginUserIdList(UserServiceLoginUserIdLis
 }
 
 static KYTY_SYSV_ABI int UserServiceGetUserName(int user_id, char* name, size_t size) {
-	EXIT_NOT_IMPLEMENTED(user_id != Config::GetUserId());
+	if (user_id != Config::GetUserId()) {
+		return USER_SERVICE_ERROR_NOT_LOGGED_IN;
+	}
 	EXIT_NOT_IMPLEMENTED(size < 5);
 
 	const auto& user_name = Config::GetUserName();

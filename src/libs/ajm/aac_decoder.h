@@ -39,9 +39,9 @@ static constexpr uint32_t AJM_DEC_M4AAC_MAX_SAMPLING_FREQ_INDEX = 11;
 
 class AjmAacDecoder final: public AjmDecoder {
 public:
-	AjmAacDecoder(uint32_t channels, uint32_t sample_rate, AjmSampleEncoding encoding,
+	AjmAacDecoder(uint32_t max_channels, uint32_t sample_rate, AjmSampleEncoding encoding,
 	              uint64_t flags)
-	    : AjmDecoder(channels, sample_rate, encoding), m_flags(flags) {
+	    : AjmDecoder(0, sample_rate, encoding), m_max_channels(max_channels), m_flags(flags) {
 		m_codec = avcodec_find_decoder(AV_CODEC_ID_AAC);
 		if (m_codec == nullptr) {
 			LOGF("AJM AAC: avcodec_find_decoder failed\n");
@@ -100,6 +100,11 @@ public:
 		    ((m_flags & AJM_INSTANCE_FLAG_DEC_M4AAC_ENABLE_NONDELAY_OUTPUT) != 0 ? 0u : 2u);
 		m_total_decoded_samples = 0;
 		m_bitrate               = 0;
+		m_channels              = 0;
+		m_raw_configured        = false;
+		if (m_config_number == AJM_DEC_M4AAC_CONFIG_NUMBER_RAW) {
+			m_sample_rate = SamplingRateFromIndex(m_sampling_freq_index);
+		}
 		if (m_is_initialized) {
 			OpenDecoder();
 		}
@@ -220,13 +225,15 @@ private:
 	// Steps to the next layout that the instance is wide enough to emit, reopening the decoder on
 	// it. Returns false once the candidates are exhausted.
 	bool AdvanceChannelConfig() {
-		const auto cap = std::clamp<uint32_t>(m_channels, 1u, AJM_DEC_M4AAC_MAX_CHANNELS);
+		const auto cap = std::clamp<uint32_t>(m_max_channels, 1u, AJM_DEC_M4AAC_MAX_CHANNELS);
 		while (++m_channel_config_index < std::size(CHANNEL_CONFIG_CANDIDATES)) {
 			if (ChannelConfigChannels(CHANNEL_CONFIG_CANDIDATES[m_channel_config_index]) > cap) {
 				continue;
 			}
 			Release();
 			OpenDecoder();
+			// The retried layout reaches the decoder through the next packet's side data.
+			m_raw_configured = false;
 			if (m_codec_context != nullptr) {
 				LOGF("AJM AAC: retrying with channelConfiguration=%" PRIu32 "\n",
 				     CurrentChannelConfig());
@@ -246,27 +253,6 @@ private:
 			return;
 		}
 
-		if (m_config_number == AJM_DEC_M4AAC_CONFIG_NUMBER_RAW) {
-			const auto sample_index =
-			    std::min(m_sampling_freq_index, AJM_DEC_M4AAC_MAX_SAMPLING_FREQ_INDEX);
-			constexpr uint32_t audio_object_type = 2;
-			const auto         channel_configuration = CurrentChannelConfig();
-
-			auto* extradata = static_cast<uint8_t*>(av_mallocz(2 + AV_INPUT_BUFFER_PADDING_SIZE));
-			if (extradata == nullptr) {
-				Release();
-				return;
-			}
-
-			extradata[0] = static_cast<uint8_t>((audio_object_type << 3u) | (sample_index >> 1u));
-			extradata[1] = static_cast<uint8_t>(((sample_index & 0x1u) << 7u) |
-			                                    (channel_configuration << 3u));
-			m_codec_context->extradata      = extradata;
-			m_codec_context->extradata_size = 2;
-			SetFormat(ChannelConfigChannels(channel_configuration),
-			          SamplingRateFromIndex(sample_index), m_sample_encoding);
-		}
-
 		if (avcodec_open2(m_codec_context, m_codec, nullptr) < 0) {
 			LOGF("AJM AAC: decoder initialization failed\n");
 			Release();
@@ -280,6 +266,10 @@ private:
 		}
 
 		const auto channels = static_cast<uint32_t>(std::max(frame->ch_layout.nb_channels, 1));
+		if (channels > m_max_channels) {
+			result->result = AJM_RESULT_TOO_MANY_CHANNELS;
+			return false;
+		}
 		const auto bpf      = channels * AjmBytesPerSample(m_sample_encoding);
 		if (bpf == 0) {
 			result->result = AJM_RESULT_INVALID_PARAMETER;
@@ -364,6 +354,28 @@ private:
 			return false;
 		}
 		std::memcpy(packet->data, packet_data, static_cast<size_t>(packet_size));
+		if (m_config_number == AJM_DEC_M4AAC_CONFIG_NUMBER_RAW && !m_raw_configured) {
+			// Only indexed stereo starts with a channel pair; the instance limit is not
+			// the stream's channel count. A leading SCE remains ambiguous.
+			const auto channels = (packet_data[0] >> 5u) == 1u
+			                          ? 2u
+			                          : std::clamp(m_max_channels, 1u, AJM_DEC_M4AAC_MAX_CHANNELS);
+			// Once a first guess fails to decode, the retry walks the candidate layouts instead.
+			const auto channel_configuration =
+			    m_channel_config_index == 0 ? std::min(channels, 7u) : CurrentChannelConfig();
+			auto* extradata = av_packet_new_side_data(packet, AV_PKT_DATA_NEW_EXTRADATA, 2);
+			if (extradata == nullptr) {
+				av_packet_free(&packet);
+				result->result = AJM_RESULT_CODEC_ERROR | AJM_RESULT_FATAL;
+				return false;
+			}
+			constexpr uint32_t audio_object_type = 2;
+			extradata[0] = static_cast<uint8_t>((audio_object_type << 3u) |
+			                                    (m_sampling_freq_index >> 1u));
+			extradata[1] = static_cast<uint8_t>(((m_sampling_freq_index & 1u) << 7u) |
+			                                    (channel_configuration << 3u));
+			m_raw_configured = true;
+		}
 
 		int rc = avcodec_send_packet(m_codec_context, packet);
 		av_packet_free(&packet);
@@ -411,12 +423,14 @@ private:
 
 	const AVCodec*  m_codec               = nullptr;
 	AVCodecContext* m_codec_context       = nullptr;
+	const uint32_t  m_max_channels;
 	uint64_t        m_flags               = 0;
 	uint32_t        m_config_number       = AJM_DEC_M4AAC_CONFIG_NUMBER_ADTS;
 	uint32_t        m_sampling_freq_index = 3;
 	uint32_t        m_skip_frames         = 2;
 	uint32_t        m_bitrate             = 0;
 	bool            m_is_initialized      = false;
+	bool            m_raw_configured      = false;
 };
 
 } // namespace Libs::Audio::Ajm

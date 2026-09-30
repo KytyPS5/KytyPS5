@@ -6,6 +6,7 @@
 #include "common/stringUtils.h"
 #include "kernel/pthread.h"
 
+#include <cstddef>
 #include <filesystem>
 
 namespace Libs::LibKernel::FileSystem {
@@ -32,6 +33,14 @@ struct FileStat {
 	unsigned int: (8 / 2) * (16 - static_cast<int>(sizeof(KernelTimespec)));
 };
 
+struct KernelIovec {
+	void*  iov_base;
+	size_t iov_len;
+};
+
+static_assert(sizeof(KernelIovec) == 16);
+static_assert(offsetof(KernelIovec, iov_len) == 8);
+
 void Initialize();
 void Shutdown();
 void EmergencyShutdown();
@@ -51,8 +60,10 @@ int KYTY_SYSV_ABI     KernelOpen(const char* path, int flags, uint16_t mode);
 int KYTY_SYSV_ABI     KernelClose(int d);
 int64_t KYTY_SYSV_ABI KernelRead(int d, void* buf, size_t nbytes);
 int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offset);
+int64_t KYTY_SYSV_ABI KernelPreadv(int d, const KernelIovec* iov, int iovcnt, int64_t offset);
 int64_t KYTY_SYSV_ABI KernelWrite(int d, const void* buf, size_t nbytes);
 int64_t KYTY_SYSV_ABI KernelPwrite(int d, const void* buf, size_t nbytes, int64_t offset);
+int64_t KYTY_SYSV_ABI KernelPwritev(int d, const KernelIovec* iov, int iovcnt, int64_t offset);
 int64_t KYTY_SYSV_ABI KernelLseek(int d, int64_t offset, int whence);
 int KYTY_SYSV_ABI     KernelStat(const char* path, FileStat* sb);
 int KYTY_SYSV_ABI     KernelFstat(int d, FileStat* sb);

@@ -19,7 +19,7 @@
 PatchesDialog::PatchesDialog(const Configuration& game, QWidget* parent)
     : QDialog(parent), m_title_id(game.title_id.trimmed().toUpper()) {
 	setAttribute(Qt::WA_DeleteOnClose);
-	setWindowTitle(tr("Cheats (Experimental) - %1").arg(game.name));
+	setWindowTitle(tr("Cheats (experimental) - %1").arg(game.name));
 	resize(640, 480);
 
 	auto* layout = new QVBoxLayout(this);

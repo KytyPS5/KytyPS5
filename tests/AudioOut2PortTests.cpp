@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <map>
+#include <cstring>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -17,17 +18,19 @@ namespace {
 
 namespace AudioOut2 = Libs::Audio::AudioOut2;
 
-std::mutex              g_device_mutex;
-std::condition_variable g_device_cv;
-std::vector<int>        g_live_devices;
-std::vector<int>        g_device_backed_handles;
-std::vector<bool>       g_output_blocking;
+std::mutex                        g_device_mutex;
+std::condition_variable           g_device_cv;
+std::vector<int>                  g_live_devices;
+std::vector<int>                  g_device_backed_handles;
+std::vector<bool>                 g_output_blocking;
+std::vector<std::vector<uint8_t>> g_output_pcm;
+size_t                            g_capture_bytes = 0;
 // Grains the fake device still holds, so queue-level queries see a device queue rather than the
 // synthetic grain counter.
-std::map<int, uint32_t>  g_queued_grains;
-int                     g_next_device  = 1;
-int                     g_open_waiters = 0;
-bool                    g_block_opens  = false;
+std::map<int, uint32_t>           g_queued_grains;
+int                              g_next_device  = 1;
+int                               g_open_waiters = 0;
+bool                              g_block_opens  = false;
 
 void Check(bool value, const char* text) {
 	if (!value) {
@@ -148,6 +151,17 @@ void ResetOutputCalls() {
 std::vector<bool> OutputCalls() {
 	std::lock_guard lock(g_device_mutex);
 	return g_output_blocking;
+}
+
+void CaptureOutputPcm(size_t bytes) {
+	std::lock_guard lock(g_device_mutex);
+	g_capture_bytes = bytes;
+	g_output_pcm.clear();
+}
+
+std::vector<std::vector<uint8_t>> OutputPcm() {
+	std::lock_guard lock(g_device_mutex);
+	return g_output_pcm;
 }
 
 void TestSlotReuse() {
@@ -331,6 +345,41 @@ void TestHandleWithoutPcmDoesNotBypassQueue() {
 	AudioOut2::AudioOut2ContextDestroy(context);
 }
 
+void TestPcmCopiedBeforeScratchBufferReuse() {
+	const auto context = CreateContext();
+	const auto param   = MakeParam();
+	AudioOut2::AudioOut2PortHandle first = 0;
+	AudioOut2::AudioOut2PortHandle second = 0;
+	Check(AudioOut2::AudioOut2PortCreate(context, AsParam(&param), &first) == OK,
+	      "first port create failed");
+	Check(AudioOut2::AudioOut2PortCreate(context, AsParam(&param), &second) == OK,
+	      "second port create failed");
+
+	std::vector<float> scratch(512 * 2);
+	std::vector<float> first_pcm(scratch.size(), 0.25f);
+	std::vector<float> second_pcm(scratch.size(), -0.5f);
+	std::copy(first_pcm.begin(), first_pcm.end(), scratch.begin());
+	SetPcm(first, scratch.data());
+	std::copy(second_pcm.begin(), second_pcm.end(), scratch.begin());
+	SetPcm(second, scratch.data());
+	std::fill(scratch.begin(), scratch.end(), 0.0f);
+
+	const auto pcm_bytes = scratch.size() * sizeof(float);
+	CaptureOutputPcm(pcm_bytes);
+	Check(AudioOut2::AudioOut2ContextPush(context, 1) == OK, "shared-buffer push failed");
+	const auto output = OutputPcm();
+	Check(output.size() == 2, "shared-buffer push did not output both ports");
+	Check(std::memcmp(output[0].data(), first_pcm.data(), pcm_bytes) == 0,
+	      "first port lost PCM when scratch buffer was reused");
+	Check(std::memcmp(output[1].data(), second_pcm.data(), pcm_bytes) == 0,
+	      "second port lost PCM when scratch buffer was reused");
+
+	CaptureOutputPcm(0);
+	AudioOut2::AudioOut2PortDestroy(first);
+	AudioOut2::AudioOut2PortDestroy(second);
+	AudioOut2::AudioOut2ContextDestroy(context);
+}
+
 } // namespace
 
 namespace Libs::Audio::AudioInternal {
@@ -374,6 +423,12 @@ uint32_t AudioOutOutputs(const OutputParam* params, uint32_t num, bool blocking)
 	for (uint32_t i = 0; i < num; i++) {
 		if (params != nullptr && params[i].data != nullptr) {
 			g_queued_grains[params[i].handle]++;
+		}
+	}
+	if (g_capture_bytes != 0) {
+		for (uint32_t i = 0; i < num; i++) {
+			const auto* bytes = static_cast<const uint8_t*>(params[i].data);
+			g_output_pcm.emplace_back(bytes, bytes + g_capture_bytes);
 		}
 	}
 	return 0;
@@ -423,6 +478,7 @@ int main() {
 	TestFloat12ChannelPortOutputsPcm();
 	TestAsynchronousDevicePushKeepsQueueBounded();
 	TestHandleWithoutPcmDoesNotBypassQueue();
+	TestPcmCopiedBeforeScratchBufferReuse();
 	std::printf("AudioOut2PortTests: all cases passed\n");
 	return 0;
 }

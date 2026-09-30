@@ -34,11 +34,12 @@ struct ImageOpcodeInfo {
 };
 
 struct DppMoveFlags {
-	uint16_t control        = 0;
-	uint8_t  row_mask       = 0xf;
-	uint8_t  bank_mask      = 0xf;
+	uint32_t control   : 24 = 0;
+	uint32_t row_mask  : 4  = 0xf;
+	uint32_t bank_mask : 4  = 0xf;
 	bool     fetch_inactive = false;
 	bool     bound_control  = false;
+	bool     dpp8           = false;
 };
 static_assert(sizeof(DppMoveFlags) <= sizeof(uint64_t));
 static_assert(std::is_trivially_copyable_v<DppMoveFlags>);

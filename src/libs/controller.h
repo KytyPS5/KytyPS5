@@ -73,6 +73,7 @@ void SetRightStick(int id, int x, int y);
 void SetTouchPad(int id, int finger, bool down, float x, float y);
 void SetSensor(int id, Sensor sensor, const float* data, uint64_t time_us);
 void ResetInputState();
+int  GetActiveControllerId();
 
 int KYTY_SYSV_ABI PadInit();
 int KYTY_SYSV_ABI PadOpen(int user_id, int type, int index, const void* param);
@@ -81,6 +82,7 @@ int KYTY_SYSV_ABI PadSetMotionSensorState(int handle, bool enable);
 int KYTY_SYSV_ABI PadSetAngularVelocityDeadbandState(int handle, bool enable);
 int KYTY_SYSV_ABI PadResetOrientation(int handle);
 int KYTY_SYSV_ABI PadGetControllerInformation(int handle, PadControllerInformation* info);
+int KYTY_SYSV_ABI PadIsRemoteController(int handle, bool* is_remote);
 int KYTY_SYSV_ABI PadReadState(int handle, PadData* data);
 int KYTY_SYSV_ABI PadRead(int handle, PadData* data, int num);
 int KYTY_SYSV_ABI PadSetVibration(int handle, const PadVibrationParam* param);

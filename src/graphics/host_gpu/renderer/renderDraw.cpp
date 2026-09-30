@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -67,7 +68,7 @@ std::pair<int32_t, uint32_t> ResolveDrawOffsets(uint32_t index_offset,
 
 	EXIT_IF(!vs_input_info.stage);
 	const auto& program   = *vs_input_info.stage.program;
-	const auto& resources = vs_input_info.stage.resources;
+	const auto& resources = *vs_input_info.stage.resources;
 	if (index_offset == 0 &&
 	    program.info.vertex_offset_sgpr >= static_cast<int32_t>(program.user_data_base)) {
 		const auto index =
@@ -481,15 +482,16 @@ struct DrawCallInfo {
 
 RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
                                                  uint32_t color_count, RenderDepthInfo& depth,
-                                                 const std::optional<PreparedBindings>& pixel) {
+                                                 vk::ImageAspectFlags& feedback_aspects,
+                                                 std::span<PreparedBindings* const> stages) {
 	EXIT_IF(colors == nullptr || color_count > RENDER_COLOR_ATTACHMENTS_MAX);
+	feedback_aspects = {};
 	auto&       cache = m_context.GetTextureCache();
 	RenderState state {};
 	state.width                 = std::numeric_limits<uint32_t>::max();
 	state.height                = std::numeric_limits<uint32_t>::max();
 	state.num_layers            = std::numeric_limits<uint32_t>::max();
 	state.num_color_attachments = 0;
-	uint32_t attachment_samples = 0;
 	for (uint32_t i = 0; i < color_count; i++) {
 		auto& target = colors[i];
 		EXIT_IF(!target.image_id);
@@ -506,22 +508,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			g_dbg_rt_width  = image.info.extent.width;
 			g_dbg_rt_height = image.info.extent.height;
 		}
-		SetVulkanObjectNameF(m_context.GetGraphics().device, image.backing.image,
-		                     "Kyty.MRT{}.Image[guest=0x{:016x} size=0x{:x} format={}]",
-		                     target.target_slot, image.info.data.address, image.info.data.size,
-		                     static_cast<uint32_t>(image.info.pixel_format));
-		SetVulkanObjectNameF(m_context.GetGraphics().device, image_view,
-		                     "Kyty.MRT{}.View[guest=0x{:016x} mip={} layer={}+{}]",
-		                     target.target_slot, image.info.data.address,
-		                     target.desc.view_info.base_level, target.desc.view_info.base_layer,
-		                     target.desc.view_info.layer_count);
 		EXIT_IF(image.backing.samples != target.desc.info.samples || image_view == nullptr);
-		if (attachment_samples == 0) {
-			attachment_samples = target.desc.info.samples;
-		} else if (attachment_samples != target.desc.info.samples) {
-			EXIT("mixed color attachment sample counts are unsupported: %u and %u\n",
-			     attachment_samples, target.desc.info.samples);
-		}
 		const auto& view   = target.desc.view_info;
 		const auto  layout = image.binding.is_bound ? vk::ImageLayout::eGeneral
 		                                            : vk::ImageLayout::eColorAttachmentOptimal;
@@ -561,43 +548,30 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			EXIT("failed to consume HTile clear state\n");
 		}
 		auto& image = cache.GetImage(depth.image_id);
-		SetVulkanObjectNameF(m_context.GetGraphics().device, image.backing.image,
-		                     "Kyty.DepthTarget.Image[guest=0x{:016x} size=0x{:x} format={}]",
-		                     image.info.data.address, image.info.data.size,
-		                     static_cast<uint32_t>(image.info.pixel_format));
-		SetVulkanObjectNameF(m_context.GetGraphics().device, image_view,
-		                     "Kyty.DepthTarget.View[guest=0x{:016x} layer={}+{}]",
-		                     image.info.data.address, depth.desc.view_info.base_layer,
-		                     depth.desc.view_info.layer_count);
 		EXIT_IF(image_view == nullptr || image.backing.samples != depth.desc.info.samples);
-		if (attachment_samples == 0) {
-			attachment_samples = depth.desc.info.samples;
-		} else if (attachment_samples != depth.desc.info.samples) {
-			EXIT("mixed color/depth sample counts are unsupported: %u and %u\n", attachment_samples,
-			     depth.desc.info.samples);
+		const auto draw_writes = depth.AttachmentWriteAspects();
+		vk::ImageAspectFlags sampled_aspects;
+		for (const auto* stage: stages) {
+			for (const auto& binding: stage->images) {
+				if (binding.image_id != depth.image_id ||
+				    binding.desc.type != TextureCache::BindingType::Texture) continue;
+				const auto native =
+				    std::ranges::find(image.views, binding.image_view, &CachedImageView::view);
+				EXIT_IF(native == image.views.end());
+				sampled_aspects |= native->info.aspect;
+				feedback_aspects |= DepthFeedbackAspects(draw_writes, depth.desc.view_info,
+				                                         native->info);
+			}
 		}
-		const bool feedback = depth.depth_write_enable && pixel &&
-		    std::ranges::any_of(pixel->images, [&](const TextureBinding& binding) {
-			    if (binding.image_id != depth.image_id ||
-			        binding.desc.type != TextureCache::BindingType::Texture) {
-				    return false;
-			    }
-			    const auto native =
-			        std::ranges::find(image.views, binding.image_view, &CachedImageView::view);
-			    EXIT_IF(native == image.views.end());
-			    const auto& sampled = native->info;
-			    const auto& target = depth.desc.view_info;
-			    return (sampled.aspect & vk::ImageAspectFlagBits::eDepth) &&
-			           ImageRangeOverlaps(sampled.base_level, sampled.level_count,
-			                              target.base_level, target.level_count) &&
-			           ImageRangeOverlaps(sampled.base_layer, sampled.layer_count,
-			                              target.base_layer, target.layer_count);
-		    });
-		if (feedback && !m_context.GetGraphics().attachment_feedback_loop_enabled) {
+		if (feedback_aspects && !m_context.GetGraphics().attachment_feedback_loop_enabled) {
 			EXIT("depth attachment feedback loop is not supported by the host\n");
 		}
-		const auto layout = feedback ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
-		                             : depth_attachment_layout(depth);
+		auto layout = depth_attachment_layout(depth);
+		if (sampled_aspects & ~DepthReadableAspects(layout)) {
+			layout = m_context.GetGraphics().attachment_feedback_loop_enabled
+			             ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
+			             : vk::ImageLayout::eGeneral;
+		}
 		// The attachment store writes even when guest depth/stencil tests do not.
 		const auto access = vk::AccessFlagBits2::eDepthStencilAttachmentRead |
 		                    vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
@@ -626,9 +600,6 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		const auto& limits = buffer.GetGraphics().GetPhysicalDeviceProperties().limits;
 		state.width        = limits.maxFramebufferWidth;
 		state.height       = limits.maxFramebufferHeight;
-	} else if (attachment_samples == 0 ||
-	           vulkan_sample_count(attachment_samples) == vk::SampleCountFlagBits {}) {
-		EXIT("render state has no valid attachments\n");
 	}
 	if (state.num_layers == std::numeric_limits<uint32_t>::max()) {
 		state.num_layers = 1;
@@ -733,11 +704,13 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 	        vs_input_info.buffers_num > ShaderVertexInputInfo::RES_MAX);
 
 	// Collect the non-empty guest vertex ranges.
+	std::array<uint64_t, ShaderVertexInputInfo::RES_MAX>          sizes {};
 	std::array<VertexBufferRange, ShaderVertexInputInfo::RES_MAX> ranges {};
 	uint32_t                                                      range_count = 0;
 	for (int i = 0; i < vs_input_info.buffers_num; i++) {
 		const auto& vertex = vs_input_info.buffers[i];
 		const auto  size   = VertexBufferDescriptorSize(vertex, vs_input_info);
+		sizes[i]           = size;
 		if (size == 0) {
 			continue;
 		}
@@ -786,7 +759,7 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 	vk::Buffer null_buffer = nullptr;
 	for (int i = 0; i < vs_input_info.buffers_num; i++) {
 		const auto& vertex = vs_input_info.buffers[i];
-		const auto  size   = VertexBufferDescriptorSize(vertex, vs_input_info);
+		const auto  size   = sizes[i];
 		if (size == 0) {
 			if (null_buffer == nullptr) {
 				null_buffer = cache.GetBuffer(NULL_BUFFER_ID).Handle();
@@ -824,8 +797,7 @@ static void SetDrawDebugPhase(CommandBuffer& buffer, uint64_t submit_id, const D
 	                    draw.instance_count, draw.first_instance);
 }
 
-static bool GetDrawTopology(const HW::UserConfig& ucfg, bool auto_draw,
-                            vk::PrimitiveTopology& topology) {
+static bool GetDrawTopology(const HW::UserConfig& ucfg, vk::PrimitiveTopology& topology) {
 
 	topology = vk::PrimitiveTopology::ePointList;
 
@@ -848,14 +820,11 @@ static bool GetDrawTopology(const HW::UserConfig& ucfg, bool auto_draw,
 			topology = vk::PrimitiveTopology::eTriangleStrip;
 			break;
 		case Prospero::PrimitiveType::kPatch:
+			if (!Config::TessellationEnabled()) return false;
+			[[fallthrough]];
 		case Prospero::PrimitiveType::kRectList:
-			topology = vk::PrimitiveTopology::ePatchList;
-			break;
 		case Prospero::PrimitiveType::kRectListLegacy:
-			if (!auto_draw) {
-				EXIT("unknown primitive type: %u\n", static_cast<uint32_t>(ucfg.GetPrimType()));
-			}
-			topology = vk::PrimitiveTopology::eTriangleStrip;
+			topology = vk::PrimitiveTopology::ePatchList;
 			break;
 		case Prospero::PrimitiveType::kQuadListLegacy:
 			topology = vk::PrimitiveTopology::eTriangleFan;
@@ -1034,8 +1003,7 @@ static void LogDrawStateIfNeeded(const CommandBuffer& buffer, const DrawCallInfo
 		return;
 	}
 
-	if (!draw.IsIndexed() &&
-	    buffer.GetUserConfig().GetPrimType() != Prospero::PrimitiveType::kRectListLegacy) {
+	if (!draw.IsIndexed() && !Prospero::IsRectList(buffer.GetUserConfig().GetPrimType())) {
 		return;
 	}
 
@@ -1048,8 +1016,7 @@ static void LogDrawStateIfNeeded(const CommandBuffer& buffer, const DrawCallInfo
 }
 
 static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_buffer,
-                               const ShaderVertexInputInfo& vs_input_info, const DrawCallInfo& draw,
-                               const DrawEmitInfo& emit) {
+                               const DrawCallInfo& draw, const DrawEmitInfo& emit) {
 	switch (ucfg.GetPrimType()) {
 		case Prospero::PrimitiveType::kPointList:
 		case Prospero::PrimitiveType::kLineList:
@@ -1058,6 +1025,7 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 		case Prospero::PrimitiveType::kTriFan:
 		case Prospero::PrimitiveType::kTriStrip:
 		case Prospero::PrimitiveType::kRectList:
+		case Prospero::PrimitiveType::kRectListLegacy:
 		case Prospero::PrimitiveType::kPatch:
 			if (draw.IsIndexed()) {
 				vk_buffer.drawIndexed(draw.index_count, draw.instance_count, 0, emit.vertex_offset,
@@ -1066,14 +1034,6 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 				vk_buffer.draw(draw.index_count, draw.instance_count, emit.first_vertex,
 				               emit.first_instance);
 			}
-			break;
-		case Prospero::PrimitiveType::kRectListLegacy:
-			if (draw.IsIndexed()) {
-				EXIT("unknown primitive type: %u\n", static_cast<uint32_t>(ucfg.GetPrimType()));
-			}
-			// Sarah
-			EXIT_NOT_IMPLEMENTED(!(draw.index_count == 3 && vs_input_info.buffers_num == 0));
-			vk_buffer.draw(4, draw.instance_count, emit.first_vertex, emit.first_instance);
 			break;
 		case Prospero::PrimitiveType::kQuadListLegacy:
 			EXIT_NOT_IMPLEMENTED((draw.index_count & 0x3u) != 0);
@@ -1136,15 +1096,16 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                              index_source.guest_element_size);
 	}
 	LogDrawPhase(draw.Name(), "PrepareBindings");
-	GraphicsBindings                 bindings;
+	auto&                            bindings = m_graphics_bindings;
 	std::array<PreparedBindings*, 4> descriptor_stages {};
 	uint32_t                         stage_count = 0;
 	for (uint32_t i = 0; i < vertex_stages.size(); i++) {
-		bindings.vertex[i]               = PrepareBindings(state.vertex_info[i].stage);
+		PrepareBindings(state.vertex_info[i].stage, bindings.vertex[i]);
 		descriptor_stages[stage_count++] = &bindings.vertex[i];
 	}
 	if (state.ps_active) {
-		bindings.pixel.emplace(PrepareBindings(state.ps_input_info.stage));
+		if (!bindings.pixel) bindings.pixel.emplace();
+		PrepareBindings(state.ps_input_info.stage, *bindings.pixel);
 		descriptor_stages[stage_count++] = &*bindings.pixel;
 	}
 	const auto stages = std::span {descriptor_stages.data(), stage_count};
@@ -1156,10 +1117,6 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
 		index_binding   = PrepareIndexBuffer(buffer, index_source);
 	}
-	const auto rendering =
-	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
-	                         bindings.pixel);
-
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "CreatePipeline");
 	}
@@ -1167,6 +1124,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
 	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
 	    state.programs);
+	vk::ImageAspectFlags feedback_aspects;
+	const auto rendering =
+	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
+	                         feedback_aspects, stages);
 
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest
@@ -1176,7 +1137,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (!mesh_active) {
 		CommitVertexBuffers(vk_buffer, vertex_bindings);
 	}
-	if (bindings.pixel && !draw.IsIndexed()) {
+	if (state.ps_active && !draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x300u);
 	}
 	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
@@ -1198,11 +1159,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 
 	SetGraphicsDynamicParams(buffer, vk_buffer, vertex_stages.back(), state.depth_info, rendering);
 	if (m_context.GetGraphics().attachment_feedback_loop_enabled) {
-		vk_buffer.setAttachmentFeedbackLoopEnableEXT(
-		    rendering.depth_stencil_attachment.image_layout ==
-		            vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
-		        ? vk::ImageAspectFlags {vk::ImageAspectFlagBits::eDepth}
-		        : vk::ImageAspectFlags {});
+		vk_buffer.setAttachmentFeedbackLoopEnableEXT(feedback_aspects);
 	}
 
 	LogDrawPhase(draw.Name(), "BeginRendering");
@@ -1217,7 +1174,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (mesh_active) {
 		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
 	} else {
-		EmitDrawPrimitives(ucfg, vk_buffer, state.vertex_info[0], draw, emit);
+		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
 	}
 
 	if (!draw.IsIndexed()) {
@@ -1297,7 +1254,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	hw_check(buffer);
 
 	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
-	if (!GetDrawTopology(ucfg, false, topology)) {
+	if (!GetDrawTopology(ucfg, topology)) {
 		DebugReportDroppedDraw("unsupported-topology", sh_ctx, args.index_count,
 		                       args.instance_count);
 		return;
@@ -1409,7 +1366,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	                         args.vertex_count, args.instance_count, args.first_instance};
 
 	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
-	if (!GetDrawTopology(ucfg, true, topology)) {
+	if (!GetDrawTopology(ucfg, topology)) {
 		ResetBindings();
 		return;
 	}
@@ -1419,7 +1376,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 		return;
 	}
 
-	const bool rect_list = ucfg.GetPrimType() == Prospero::PrimitiveType::kRectList;
+	const bool rect_list = Prospero::IsRectList(ucfg.GetPrimType());
 	if (rect_list && state.vertex_info[0].buffers_num == 0 &&
 	    state.vertex_info[0].stage.program->param_export_mask == 0 &&
 	    state.ps_input_info.input_num != 0) {

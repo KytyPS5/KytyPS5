@@ -167,6 +167,12 @@
           <property name="text"><string>Enable readback</string></property>
          </widget>
         </item>
+        <item row="7" column="1">
+         <widget class="QCheckBox" name="checkBox_tessellation">
+          <property name="toolTip"><string>Draw tessellated geometry. Disabled by default; unsupported tessellation may cause crashes.</string></property>
+          <property name="text"><string>Enable tessellation support (experimental)</string></property>
+         </widget>
+        </item>
        </layout>
       </widget>
      </item>
@@ -275,13 +281,13 @@
         <item>
          <widget class="QCheckBox" name="checkBox_amd_cpu">
           <property name="toolTip"><string>Patch CPU instructions that differ between AMD and the host CPU.</string></property>
-          <property name="text"><string>AMD CPU patch (EXPERIMENTAL)</string></property>
+          <property name="text"><string>AMD CPU patch (experimental)</string></property>
          </widget>
         </item>
         <item>
          <widget class="QCheckBox" name="checkBox_red_zone_protection">
           <property name="toolTip"><string>Helps prevent crashes in some games on Windows</string></property>
-          <property name="text"><string>Windows SysV red zone crash protection (Experimental)</string></property>
+          <property name="text"><string>Windows SysV red zone crash protection (experimental)</string></property>
          </widget>
         </item>
        </layout>

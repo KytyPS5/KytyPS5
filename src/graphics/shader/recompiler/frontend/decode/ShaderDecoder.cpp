@@ -74,11 +74,11 @@ std::string FormatMemory(const Instruction& inst) {
 		text += OperandToString(*sources[i]);
 	}
 	text += fmt::format(" ; offset={} offset2={} dwords={} bits={} dfmt={} nfmt={} signed={} "
-	                    "typed={} formatted={} segment={} glc={} slc={} idxen={} offen={}",
+	                    "typed={} formatted={} segment={} glc={} dlc={} slc={} idxen={} offen={}",
 	                    inst.offset, inst.secondary_offset, inst.data_dwords, inst.data_bits,
 	                    inst.data_format, inst.number_format, inst.data_signed ? 1u : 0u,
 	                    inst.typed ? 1u : 0u, inst.formatted ? 1u : 0u, inst.memory_segment,
-	                    inst.glc ? 1u : 0u, inst.slc ? 1u : 0u, inst.idxen ? 1u : 0u,
+	                    inst.glc ? 1u : 0u, inst.dlc ? 1u : 0u, inst.slc ? 1u : 0u, inst.idxen ? 1u : 0u,
 	                    inst.offen ? 1u : 0u);
 	return text;
 }
@@ -464,6 +464,7 @@ void DecodeProgram(std::span<const uint32_t> code, Program& program) {
 	program.instructions.clear();
 	program.instructions.reserve(code.size());
 	program.code = code;
+	program.has_bvh = false;
 
 	std::vector<bool> branch_targets;
 	for (uint32_t word_index = 0; word_index < code.size();) {
@@ -490,6 +491,10 @@ void DecodeProgram(std::span<const uint32_t> code, Program& program) {
 
 		const auto& inst = program.instructions.back();
 		word_index += inst.word_count;
+		if (inst.family == Family::MIMG && (inst.opcode_id == 0xe6u || inst.opcode_id == 0xe7u)) {
+			program.has_bvh = true;
+			return;
+		}
 
 		if (IsDirectBranch(inst.opcode)) {
 			const auto target_index = inst.branch_target / sizeof(uint32_t);
@@ -552,8 +557,9 @@ std::string OperandToString(const Operand& operand) {
 		text += ".clamp";
 	}
 	if (operand.dpp) {
-		text += fmt::format(".dpp(ctrl=0x{:x},fi={},bc={})", operand.dpp_ctrl,
-		                    operand.dpp_fetch_inactive ? 1u : 0u, operand.dpp_bound_ctrl ? 1u : 0u);
+		text += fmt::format(".{}(ctrl=0x{:x},fi={},bc={})", operand.dpp8 ? "dpp8" : "dpp",
+		                    operand.dpp_ctrl, operand.dpp_fetch_inactive ? 1u : 0u,
+		                    operand.dpp_bound_ctrl ? 1u : 0u);
 	}
 	return text;
 }
@@ -713,6 +719,8 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::IMAGE_ATOMIC_AND:
 		case Opcode::IMAGE_ATOMIC_OR:
 		case Opcode::IMAGE_ATOMIC_XOR:
+		case Opcode::IMAGE_ATOMIC_FMIN:
+		case Opcode::IMAGE_ATOMIC_FMAX:
 		case Opcode::IMAGE_LOAD:
 		case Opcode::IMAGE_LOAD_MIP:
 		case Opcode::IMAGE_GET_RESINFO:
@@ -815,7 +823,9 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::DS_ADD_RTN_U32:
 		case Opcode::DS_SUB_U32:
 		case Opcode::DS_SUB_RTN_U32:
+		case Opcode::DS_INC_U32:
 		case Opcode::DS_INC_RTN_U32:
+		case Opcode::DS_DEC_U32:
 		case Opcode::DS_DEC_RTN_U32:
 		case Opcode::DS_MIN_I32:
 		case Opcode::DS_MIN_RTN_I32:
@@ -850,6 +860,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::DS_READ_B128:
 		case Opcode::DS_WRITE_B8:
 		case Opcode::DS_WRITE_B16:
+		case Opcode::DS_WRITE_B8_D16_HI:
 		case Opcode::DS_WRITE_B16_D16_HI:
 		case Opcode::DS_WRITE2_B32:
 		case Opcode::DS_WRITE2ST64_B32:

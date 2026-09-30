@@ -165,24 +165,26 @@ namespace {
 
 constexpr uint64_t NumFramesBeforeRemoval = 32;
 
-[[nodiscard]] bool DecodeDccClear(const TextureCache::ImageDesc& desc, uint8_t code,
+[[nodiscard]] bool DecodeColorClear(const TextureCache::ImageDesc& desc, uint8_t code,
                                   vk::ClearColorValue& clear) {
+	const auto& metadata = desc.info.metadata;
+	const auto  format   = desc.view_info.format;
+	const bool  cmask    = metadata.kind == ImageMetadataKind::Cmask;
+	if (cmask ? code == 0 : code == 0x20) {
+		// Register clears belong to the color buffer; the texture pipe cannot decode them.
+		return desc.type == TextureCache::BindingType::RenderTarget &&
+		       metadata.clear_register_valid && !PackedColorClearNeedsHighWord(format) &&
+		       DecodePackedColorClear(format, metadata.clear_word, 0, clear);
+	}
+	if (cmask) {
+		return false;
+	}
 	switch (code) {
 		case 0x00:
-		case 0x20:
 		case 0x40:
 		case 0x80:
 		case 0xc0: break;
 		default: return false;
-	}
-	const auto& metadata = desc.info.metadata;
-	const auto  format   = desc.view_info.format;
-	if (code == 0x20) {
-		// Clear-to-register is a color-buffer operation; the texture pipe cannot decode it.
-		return desc.type == TextureCache::BindingType::RenderTarget &&
-		       metadata.dcc_clear_register_valid &&
-		       !PackedColorClearNeedsHighWord(format) &&
-		       DecodePackedColorClear(format, metadata.dcc_clear_word, 0, clear);
 	}
 	clear = {};
 	if (code == 0x00) {
@@ -240,50 +242,21 @@ constexpr uint64_t NumFramesBeforeRemoval = 32;
 	return true;
 }
 
-[[nodiscard]] const char* BindingTypeName(TextureCache::BindingType type) {
-	switch (type) {
-		case TextureCache::BindingType::Texture: return "Texture";
-		case TextureCache::BindingType::Storage: return "StorageTexture";
-		case TextureCache::BindingType::RenderTarget: return "ColorTarget";
-		case TextureCache::BindingType::DepthTarget: return "DepthTarget";
-		case TextureCache::BindingType::VideoOut: return "VideoOut";
-	}
-	return "Image";
-}
-
-void NameImageBinding(GraphicContext& graphics, Image& image, vk::ImageView view,
-                      TextureCache::BindingType type, const ImageViewInfo& view_info) {
-	const auto* role = BindingTypeName(type);
-	SetVulkanObjectNameF(
-	    graphics.device, image.backing.image,
-	    "Kyty.{}.Image[guest=0x{:016x} size=0x{:x} extent={}x{}x{} format={} mips={} layers={} "
-	    "samples={}]",
-	    role, image.info.data.address, image.info.data.size, image.info.extent.width,
-	    image.info.extent.height, image.info.extent.depth,
-	    static_cast<uint32_t>(image.info.pixel_format), image.info.resources.levels,
-	    image.info.resources.layers, image.info.samples);
-	SetVulkanObjectNameF(
-	    graphics.device, view,
-	    "Kyty.{}.View[guest=0x{:016x} format={} aspect=0x{:x} mip={}+{} layer={}+{}]", role,
-	    image.info.data.address, static_cast<uint32_t>(view_info.format),
-	    static_cast<vk::ImageAspectFlags::MaskType>(view_info.aspect), view_info.base_level,
-	    view_info.level_count, view_info.base_layer, view_info.layer_count);
-}
-
 [[nodiscard]] bool CanTransferStencil(const ImageInfo& info) {
 	// Raw buffer copies cannot decode Hi-Stencil or initialize multisampled images.
 	return info.samples == 1 && !info.metadata.stencil_compressed;
 }
 
 [[nodiscard]] std::vector<vk::BufferImageCopy> BuildDepthCopies(const ImageInfo& info,
-                                                                uint64_t         slice_stride) {
+                                                              uint64_t slice_stride,
+                                                              vk::ImageAspectFlags aspect) {
 	std::vector<vk::BufferImageCopy> copies(info.resources.layers);
 	for (uint32_t layer = 0; layer < info.resources.layers; ++layer) {
 		auto& copy             = copies[layer];
 		copy.bufferOffset      = slice_stride * layer;
 		copy.bufferRowLength   = info.pitch;
 		copy.bufferImageHeight = info.extent.height;
-		copy.imageSubresource  = {vk::ImageAspectFlagBits::eDepth, 0, layer, 1};
+		copy.imageSubresource  = {aspect, 0, layer, 1};
 		copy.imageExtent       = {info.extent.width, info.extent.height, 1};
 	}
 	return copies;
@@ -386,7 +359,7 @@ bool TextureCache::SameBacking(const ImageInfo& cached, const ImageInfo& request
 		return false;
 	}
 	if (!ImageViewOps::FormatsCompatible(cached.pixel_format, requested.pixel_format) ||
-	    (cached.type != requested.type && requested.extent != vk::Extent3D {1, 1, 1})) {
+	    cached.type != requested.type) {
 		return false;
 	}
 	if (exact_format && cached.pixel_format != requested.pixel_format) {
@@ -865,9 +838,12 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 	const bool source_depth = source.info.IsDepth();
 	const bool dest_depth   = destination.info.IsDepth();
 	const bool direct_copy =
-	    source.backing.format == destination.backing.format ||
-	    (!source_depth && !dest_depth &&
-	     vk::blockSize(source.backing.format) == vk::blockSize(destination.backing.format));
+	    (source.backing.image_type == destination.backing.image_type ||
+	     (source.backing.image_type != vk::ImageType::e1D &&
+	      destination.backing.image_type != vk::ImageType::e1D)) &&
+	    (source.backing.format == destination.backing.format ||
+	     (!source_depth && !dest_depth &&
+	      vk::blockSize(source.backing.format) == vk::blockSize(destination.backing.format)));
 	if (direct_copy) {
 		destination.CopyImage(source);
 	} else if (!CopyD16(destination, source)) {
@@ -901,7 +877,8 @@ void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint3
 ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
                                           ImageId cached_id) {
 	auto& cached = m_slot_images[cached_id];
-	if (!cached.info.IsDepth() && !requested.IsDepth()) {
+	if ((!cached.info.IsDepth() && !requested.IsDepth()) ||
+	    cached.info.tile_mode != requested.tile_mode) {
 		return {};
 	}
 	const bool stencil_match = requested.HasStencil() == cached.info.HasStencil();
@@ -915,8 +892,8 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	    requested.samples == 1 && requested.data == cached.info.data &&
 	    requested.extent == cached.info.extent && requested.resources == cached.info.resources &&
 	    requested.type == cached.info.type && requested.pitch == cached.info.pitch &&
-	    requested.tile_mode == cached.info.tile_mode && !requested.HasStencil() &&
-	    !cached.info.HasStencil() && !requested.HasMetadata() && !cached.info.HasMetadata();
+	    !requested.HasStencil() && !cached.info.HasStencil() && !requested.HasMetadata() &&
+	    !cached.info.HasMetadata();
 	// PPSA04264
 	const bool retain_cached_layout =
 	    requested.samples == 1 && cached.info.samples == 1 && cached.backing.samples == 1 &&
@@ -927,7 +904,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	    requested.resources.layers != 0 && cached.info.resources.layers != 0 &&
 	    requested.resources.layers < cached.info.resources.layers &&
 	    requested.type == cached.info.type && requested.pitch == cached.info.pitch &&
-	    requested.tile_mode == cached.info.tile_mode && requested.mip_layout[0].offset == 0 &&
+	    requested.mip_layout[0].offset == 0 &&
 	    cached.info.mip_layout[0].offset == 0 &&
 	    requested.mip_layout[0].size == requested.data.size &&
 	    cached.info.mip_layout[0].size == cached.info.data.size &&
@@ -1036,12 +1013,15 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 			return {merged_id};
 		}
 		// PPSA08394
+		// A view cannot change the native image type or grow its extent.
 		if (requested.data.size == cached.info.data.size &&
-		    requested.resources == cached.info.resources && requested.type == cached.info.type &&
-		    requested.extent.width > cached.info.extent.width &&
-		    requested.extent.height >= cached.info.extent.height &&
-		    requested.extent.depth >= cached.info.extent.depth &&
-		    ImageViewOps::FormatsCompatible(cached.info.pixel_format, requested.pixel_format)) {
+		    requested.resources == cached.info.resources &&
+		    ImageViewOps::FormatsCompatible(cached.info.pixel_format, requested.pixel_format) &&
+		    (requested.type != cached.info.type
+		         ? requested.extent == cached.info.extent
+		         : requested.extent.width > cached.info.extent.width &&
+		               requested.extent.height >= cached.info.extent.height &&
+		               requested.extent.depth >= cached.info.extent.depth)) {
 			return {ExpandImage(requested, cached_id)};
 		}
 		// PS5 mip tails can expose more levels without increasing the guest allocation.
@@ -1228,8 +1208,8 @@ TextureCache::ImageDownload TextureCache::BuildDownload(const Image& image) cons
 }
 
 void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_offset) {
-	const auto& info    = image.info;
-	const auto  binding = UploadBinding(image);
+	auto& destination = image.depth_id ? m_slot_images[image.depth_id] : image;
+	const auto binding = image.depth_id ? BindingType::DepthTarget : UploadBinding(image);
 	// Debug: this is the guest-memory -> image path. An instance with no GPU producer and no
 	// upload has no source at all; one with an upload is externally supplied data. Keyed by
 	// (address, extent, format) so it lines up with the shape-keyed graph.
@@ -1238,7 +1218,8 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 	// volume stays usable.
 	// 1620 rows is a 1920x1080 NV12 frame seen as one R8 plane, which is how the decoded
 	// movie is bound; include it so the movie texture's upload cadence is visible.
-	if (DebugGfxTraceEnabled() && info.extent.width == 1920 &&
+	if (const auto& info = image.info;
+	    DebugGfxTraceEnabled() && info.extent.width == 1920 &&
 	    (info.extent.height == 1080 || info.extent.height == 1620)) {
 		LOGF("CONSUME: frame=%" PRIu64 " seq=%" PRIu64 " addr=0x%016" PRIx64 " size=0x%" PRIx64
 		     " %ux%u fmt=%u guest_fmt=%u mips=%u layers=%u binding=%u\n",
@@ -1248,14 +1229,15 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 		     static_cast<uint32_t>(info.guest_format), info.resources.levels,
 		     info.resources.layers, static_cast<uint32_t>(binding));
 	}
-	const auto  upload  = [&](std::vector<vk::BufferImageCopy>& copies, TileManager::Result linear) {
+	const auto  upload  =[&](std::vector<vk::BufferImageCopy>& copies, TileManager::Result linear) {
 		for (auto& copy: copies) {
 			copy.bufferOffset += linear.offset;
 		}
-		image.Upload(copies, linear.buffer, linear.offset, linear.size);
+		destination.Upload(copies, linear.buffer, linear.offset, linear.size);
 	};
 
 	if (binding != BindingType::DepthTarget) {
+		const auto& info = image.info;
 		auto transfer = BuildTextureTransfer(image, binding, TransferDirection::Upload);
 		if (!transfer.valid) {
 			EXIT("TextureCache: invalid texture upload: binding=%u addr=0x%016" PRIx64
@@ -1279,21 +1261,32 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 		return;
 	}
 
-	if (info.samples != 1 || image.backing.samples != 1 ||
+	// The stencil plane has its own row pitch and shares the native image
+	// with the depth plane.
+	auto info = destination.info;
+	if (image.depth_id) {
+		info.data            = image.info.data;
+		info.guest_format    = Prospero::BufferFormat::k8UInt;
+		info.bytes_per_block = 1;
+		if (info.IsTiled()) info.pitch = TileGetDepthPitch(info.extent.width, 1, 0);
+	}
+	if (info.samples != 1 || destination.backing.samples != 1 ||
 	    info.resources.layers == 0 || info.data.size % info.resources.layers != 0 ||
 	    Prospero::NumBytesPerElement(info.guest_format) != info.bytes_per_block) {
 		EXIT("TextureCache: invalid depth upload\n");
 	}
 	const auto          layers          = info.resources.layers;
 	const auto          full_slice_size = info.data.size / layers;
-	auto                copies          = BuildDepthCopies(info, full_slice_size);
+	auto copies = BuildDepthCopies(info, full_slice_size, image.depth_id
+	                                                        ? vk::ImageAspectFlagBits::eStencil
+	                                                        : vk::ImageAspectFlagBits::eDepth);
 	TileManager::Result linear {source.Handle(), source_offset, source.Size() - source_offset};
 	if (info.IsTiled()) {
 		const auto tiles = BuildDepthTiles(info);
 		linear =
 		    m_tiler.Detile(source.Handle(), source_offset, info.data.size, info.data.size, tiles);
 	}
-	const auto transfer_bytes = DepthAspectTransferBytes(info.pixel_format);
+	const auto transfer_bytes = image.depth_id ? 1u : DepthAspectTransferBytes(info.pixel_format);
 	if (transfer_bytes != info.bytes_per_block) {
 		const uint64_t texels_per_slice = static_cast<uint64_t>(info.pitch) * info.extent.height;
 		EXIT_NOT_IMPLEMENTED(info.bytes_per_block != sizeof(uint16_t) ||
@@ -1333,10 +1326,7 @@ void TextureCache::TransferStencil(Image& image, GuestRange stencil, Buffer& buf
 	        stencil.size % info.resources.layers != 0);
 	const auto slice_size = stencil.size / info.resources.layers;
 	EXIT_IF(static_cast<uint64_t>(info.pitch) * info.extent.height > slice_size);
-	auto copies = BuildDepthCopies(info, slice_size);
-	for (auto& copy: copies) {
-		copy.imageSubresource.aspectMask = vk::ImageAspectFlagBits::eStencil;
-	}
+	auto copies = BuildDepthCopies(info, slice_size, vk::ImageAspectFlagBits::eStencil);
 	const bool          upload = direction == TransferDirection::Upload;
 	TileManager::Result linear {buffer.Handle(), offset, stencil.size};
 	if (info.IsTiled()) {
@@ -1474,9 +1464,10 @@ void TextureCache::InitializeImage(ImageId id) {
 	}
 }
 
-void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
+void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
                                        uint32_t metadata_base_layer) {
-	if (desc.info.metadata.kind != ImageMetadataKind::Dcc) {
+	if (desc.info.metadata.kind != ImageMetadataKind::Dcc &&
+	    desc.info.metadata.kind != ImageMetadataKind::Cmask) {
 		return;
 	}
 	// Painting the fast clear is disabled by default, because the metadata association feeding it
@@ -1535,18 +1526,18 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 		std::scoped_lock lock {m_lock};
 		auto& image         = m_slot_images[id];
 		image.info.metadata = desc.info.metadata;
-		// A native DCC allocation must not retain a reused HTile/CMask/FMask interpretation.
+		// Native color metadata must not retain a reused HTile/CMask/FMask clear flag.
 		m_surface_metas.erase(range.address);
 		if (range.size == 0 || desc.info.resources.levels != 1 || image.info.resources.levels != 1) {
 			return;
 		}
 	}
 	const auto layers = desc.info.TransferLayers();
-	// These one-mip surfaces use complete 4 KiB DCC metadata blocks.
+	// These one-mip surfaces use complete 4 KiB color metadata blocks.
 	constexpr uint64_t MetadataBlockSize = 0x1000;
 	if (!range.Valid() || range.address % MetadataBlockSize != 0 || layers == 0 ||
 	    range.size % layers != 0 || (range.size / layers) % MetadataBlockSize != 0) {
-		EXIT("TextureCache: DCC slices must contain aligned 4 KiB blocks\n");
+		EXIT("TextureCache: color metadata slices must contain aligned 4 KiB blocks\n");
 	}
 	const auto& view           = desc.view_info;
 	const bool  volume_texture = desc.info.IsVolume() && view.type == vk::ImageViewType::e3D;
@@ -1554,7 +1545,7 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 	const auto  image_first    = volume_texture ? 0u : view.base_layer;
 	const auto  count          = volume_texture ? desc.info.extent.depth : view.layer_count;
 	if (first >= layers || count > layers - first) {
-		EXIT("TextureCache: DCC view exceeds its native metadata slices\n");
+		EXIT("TextureCache: color view exceeds its native metadata slices\n");
 	}
 	// Finish native metadata writes before reading backing bytes. This can submit the scheduler,
 	// so discovery runs before final draw uploads and never holds the texture lock across it.
@@ -1566,15 +1557,15 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 		const auto address = range.address + slice_size * (first + slice);
 		uint8_t code = 0;
 		if (!LibKernel::Memory::TryReadBacking(address, &code, sizeof(code))) {
-			EXIT("TextureCache: failed to read DCC metadata backing\n");
+			EXIT("TextureCache: failed to read color metadata backing\n");
 		}
 		vk::ClearValue clear {};
-		if (!DecodeDccClear(desc, code, clear.color)) {
+		if (!DecodeColorClear(desc, code, clear.color)) {
 			continue;
 		}
 		std::vector<uint8_t> bytes(slice_size);
 		if (!LibKernel::Memory::TryReadBacking(address, bytes.data(), bytes.size())) {
-			EXIT("TextureCache: failed to read DCC metadata slice\n");
+			EXIT("TextureCache: failed to read color metadata slice\n");
 		}
 		if (!std::all_of(bytes.begin(), bytes.end(), [code](uint8_t byte) { return byte == code; })) {
 			continue;
@@ -1630,46 +1621,55 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 		}
 		// Native expanded keys own consumption. Existing buffer tracking publishes this CPU
 		// write to future GPU readers; FillBuffer can fault and must run outside the texture lock.
-		m_buffer_cache.FillBuffer(address, slice_size, UINT32_MAX, false);
-		// Debug: the publish is what stops this surface being re-read as "still fast
-		// cleared" on the next acquisition. If it does not land in guest memory the same clear
-		// repaints every frame forever, which is exactly what one image did 1392 times. Read the
-		// byte back through the same path the next frame will use and report a mismatch.
-		{
-			uint8_t after = 0;
-			const bool read_ok = LibKernel::Memory::TryReadBacking(address, &after, sizeof(after));
-			if (!read_ok || after != 0xffu) {
-				static std::mutex           dbg_mutex;
-				static std::set<uint64_t>   dbg_seen;
-				bool                        first = false;
-				{
-					std::scoped_lock dbg_lock {dbg_mutex};
-					first = dbg_seen.emplace(address).second;
-				}
-				if (first) {
-					LOGF("DCC PUBLISH FAILED: metadata=0x%016" PRIx64 " size=0x%" PRIx64
-					     " wrote=0xff read_back=0x%02x read_ok=%d (this surface will re-clear"
-					     " every frame)\n",
-					     address, slice_size, after, read_ok ? 1 : 0);
+		if (desc.type != BindingType::VideoOut) {
+			m_buffer_cache.FillBuffer(address, slice_size, UINT32_MAX, false);
+			// Debug: the publish is what stops this surface being re-read as "still fast
+			// cleared" on the next acquisition. If it does not land in guest memory the same
+			// clear repaints every frame forever, which is exactly what one image did 1392 times.
+			// Read the byte back through the same path the next frame will use and report a
+			// mismatch.
+			{
+				uint8_t    after = 0;
+				const bool read_ok =
+				    LibKernel::Memory::TryReadBacking(address, &after, sizeof(after));
+				if (!read_ok || after != 0xffu) {
+					static std::mutex         dbg_mutex;
+					static std::set<uint64_t> dbg_seen;
+					bool                      first = false;
+					{
+						std::scoped_lock dbg_lock {dbg_mutex};
+						first = dbg_seen.emplace(address).second;
+					}
+					if (first) {
+						LOGF("DCC PUBLISH FAILED: metadata=0x%016" PRIx64 " size=0x%" PRIx64
+						     " wrote=0xff read_back=0x%02x read_ok=%d (this surface will re-clear"
+						     " every frame)\n",
+						     address, slice_size, after, read_ok ? 1 : 0);
+					}
 				}
 			}
+			// That publish writes the guest mapping directly so page faults invalidate stale
+			// readers. The metadata lives inside this surface's own padded guest range, so the
+			// faults also condemn the image the clear just wrote: InvalidateCpuAliases sets
+			// cpu_dirty on it, and the next bind uploads guest memory over the clear and
+			// everything drawn after it. Measured on Beast of Reincarnation: 40636 such
+			// invalidations in 542 frames, every one a single byte discarding an 8.44 MiB
+			// GPU-owned image, all of them inside 80 sequence numbers of a clear. The clear is
+			// the authoritative content at this point, so re-assert the image's ownership of it.
+			// Aliases of the metadata range keep their invalidation, which is what they want.
+			MarkGpuWritten(id);
 		}
-		// That publish writes the guest mapping directly so page faults invalidate stale readers.
-		// The metadata lives inside this surface's own padded guest range, so the faults also
-		// condemn the image the clear just wrote: InvalidateCpuAliases sets cpu_dirty on it, and
-		// the next bind uploads guest memory over the clear and everything drawn after it.
-		// Measured on Beast of Reincarnation: 40636 such invalidations in 542 frames, every one a
-		// single byte discarding an 8.44 MiB GPU-owned image, all of them inside 80 sequence
-		// numbers of a clear. The clear is the authoritative content at this point, so re-assert
-		// the image's ownership of it. Aliases of the metadata range keep their invalidation,
-		// which is what they want.
-		MarkGpuWritten(id);
 	}
 }
 
 void TextureCache::RefreshImage(ImageId id) {
-	TrackImage(id);
 	auto& image = m_slot_images[id];
+	if (image.depth_id &&
+	    (m_slot_images[image.depth_id].info.metadata.stencil_compressed ||
+	     m_slot_images[image.depth_id].info.samples != 1)) {
+		return;
+	}
+	TrackImage(id);
 	if (image.IsMaybeCpuDirty()) {
 		const auto hash = image.HashGuestEdges();
 		if (image.NeedsMaybeCpuHash()) {
@@ -1706,7 +1706,7 @@ void TextureCache::RefreshImage(ImageId id) {
 	InitializeImage(id);
 }
 
-void TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
+ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 	if (!stencil.Valid()) {
 		EXIT("TextureCache: invalid stencil association range\n");
 	}
@@ -1731,40 +1731,8 @@ void TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 	}
 	auto& record = m_slot_images[association];
 	TouchImage(record);
-	const bool range_mismatch  = depth.info.stencil != stencil;
-	const bool record_mismatch = record.info.data != stencil;
-	const bool other_depth     = record.depth_id && record.depth_id != depth_id;
-	const bool has_backing     = record.backing.image != nullptr;
-	// has_backing is not disqualifying: a stencil-plane view is redirected onto the depth
-	// image and read through its stencil aspect, so whatever backing the association record
-	// carries is never the thing sampled. Refusing on it blocked 121 of 125 pairings and
-	// left the stencil plane empty, which is what a Custom Stencil mask reads as zero.
-	const bool unsupported_pair = range_mismatch || record_mismatch || other_depth;
 	record.depth_id = depth_id;
-	if (unsupported_pair) {
-		// TODO(stencil): preserve GPU-written contents across pairing changes. Name the reason,
-		// because each of the four needs different handling to lift.
-		static std::atomic<uint64_t> refusals {0};
-		const auto n = refusals.fetch_add(1, std::memory_order_relaxed);
-		if (n < 16 || (n % 512) == 0) {
-			LOGF("STENCIL REFUSED #%" PRIu64 ": depth=0x%016" PRIx64 " stencil=0x%016" PRIx64
-			     " range_mismatch=%d record_mismatch=%d other_depth=%d has_backing=%d\n",
-			     n, depth.info.data.address, stencil.address, range_mismatch ? 1 : 0,
-			     record_mismatch ? 1 : 0, other_depth ? 1 : 0, has_backing ? 1 : 0);
-		}
-		return;
-	}
-	{
-		static std::atomic<uint64_t> accepted {0};
-		const auto n = accepted.fetch_add(1, std::memory_order_relaxed);
-		if (n < 16 || (n % 512) == 0) {
-			LOGF("STENCIL UPLOAD #%" PRIu64 ": depth=0x%016" PRIx64 " stencil=0x%016" PRIx64
-			     " size=0x%" PRIx64 " buffer_modified=%d cpu_dirty=%d\n",
-			     n, depth.info.data.address, stencil.address, stencil.size,
-			     record.IsBufferModified() ? 1 : 0, record.IsCpuDirty() ? 1 : 0);
-		}
-	}
-	RefreshImage(association);
+	return association;
 }
 
 // Binding this memory as something other than a stencil plane proves the guest has repurposed it,
@@ -1888,16 +1856,6 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			}
 		}
 		auto& image = m_slot_images[result];
-		if (desc.type == BindingType::VideoOut &&
-		    desc.info.metadata.compression != VideoOutCompression::Uncompressed) {
-			const bool guest_dirty = image.IsBufferModified() || image.IsCpuDirty();
-			const bool native_current =
-			    (image.usage.render_target || image.IsGpuModified()) && !guest_dirty;
-			if (!native_current) {
-				EXIT("TextureCache: compressed video-out read requires clean native GPU "
-				     "contents\n");
-			}
-		}
 		if (view_mip >= 0) {
 			desc.view_info.base_level = static_cast<uint32_t>(view_mip);
 		}
@@ -1907,7 +1865,19 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		image.tick_accessed_last = m_scheduler.CurrentTick();
 		TouchImage(image);
 	}
-	MaterializeDccClear(result, desc, metadata_base_layer);
+	MaterializeColorClear(result, desc, metadata_base_layer);
+	if (desc.type == BindingType::VideoOut &&
+	    desc.info.metadata.compression != VideoOutCompression::Uncompressed) {
+		std::scoped_lock lock {m_lock};
+		const auto& image = m_slot_images[result];
+		const bool guest_dirty = image.IsBufferModified() || image.IsCpuDirty();
+		const bool native_current =
+		    (image.usage.render_target || image.IsGpuModified()) && !guest_dirty;
+		if (!native_current) {
+			EXIT("TextureCache: compressed video-out read requires clean native GPU "
+			     "contents\n");
+		}
+	}
 	return result;
 }
 
@@ -1972,6 +1942,19 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	}
 	if (!image.info.data.Empty()) {
 		RefreshImage(id);
+		if (image.info.HasStencil() &&
+		    desc.info.data.address >= image.info.stencil.address &&
+		    desc.info.data.End() <= image.info.stencil.End()) {
+			for (const auto stencil_id:
+			     FindImagesInRegion(image.info.stencil.address, image.info.stencil.size, false)) {
+				const auto* stencil = m_slot_images.try_get(stencil_id);
+				if (stencil != nullptr && stencil->depth_id == id &&
+				    stencil->info.data == image.info.stencil) {
+					RefreshImage(stencil_id);
+					break;
+				}
+			}
+		}
 	}
 	switch (desc.type) {
 		case BindingType::Texture: break;
@@ -1983,9 +1966,7 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 			break;
 		default: EXIT("TextureCache: invalid texture binding\n");
 	}
-	const auto view = image.FindView(desc.view_info);
-	NameImageBinding(m_graphics, image, view, desc.type, desc.view_info);
-	return view;
+	return image.FindView(desc.view_info);
 }
 
 vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) {
@@ -2039,9 +2020,7 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 	RefreshImage(id);
 	CommitGpuWrite(image);
 	TrackImageDownload(id, image);
-	const auto view = image.FindView(desc.view_info);
-	NameImageBinding(m_graphics, image, view, desc.type, desc.view_info);
-	return view;
+	return image.FindView(desc.view_info);
 }
 
 vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
@@ -2056,20 +2035,19 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	TouchImage(image);
 	image.MarkGpuModified();
 	image.usage.depth_target = true;
-	RefreshImage(id);
+	image.info.stencil = desc.info.stencil;
+	image.info.metadata = desc.info.metadata;
 	if (desc.info.HasMetadata()) {
-		image.info.metadata = desc.info.metadata;
 		m_surface_metas.emplace(desc.info.metadata.range.address,
 		                        MetaDataInfo {.type       = MetaDataInfo::Type::HTile,
 		                                      .clear_mask = image.info.htile_clear_mask});
 	}
+	RefreshImage(id);
 	CommitGpuWrite(image);
 	if (desc.info.HasStencil()) {
-		AssociateStencil(id, desc.info.stencil);
+		RefreshImage(AssociateStencil(id, desc.info.stencil));
 	}
-	const auto view = image.FindView(desc.view_info);
-	NameImageBinding(m_graphics, image, view, desc.type, desc.view_info);
-	return view;
+	return image.FindView(desc.view_info);
 }
 
 void TextureCache::MarkGpuWritten(ImageId id) {
@@ -2080,11 +2058,16 @@ void TextureCache::MarkGpuWritten(ImageId id) {
 	}
 	TrackImage(id);
 	CommitGpuWrite(image);
+	if (image.info.HasStencil()) {
+		const auto stencil_id = AssociateStencil(id, image.info.stencil);
+		TrackImage(stencil_id);
+		CommitGpuWrite(m_slot_images[stencil_id]);
+	}
 }
 
 void TextureCache::CommitGpuWrite(Image& image) {
-	if (image.depth_id || image.backing.image == nullptr) {
-		EXIT("TextureCache: stencil association cannot own image contents\n");
+	if (!image.depth_id && image.backing.image == nullptr) {
+		EXIT("TextureCache: GPU writes require a native image or stencil association\n");
 	}
 	image.ClearBufferModified();
 	if (image.IsCpuDirty()) {
@@ -2169,9 +2152,10 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
 	        range.layerCount == 0 || range.baseArrayLayer >= layers ||
 	        range.layerCount > layers - range.baseArrayLayer ||
 	        (range.aspectMask & aspects) != range.aspectMask);
-	const bool full_image = range.aspectMask == aspects && range.baseMipLevel == 0 &&
-	                        range.levelCount == image.info.resources.levels &&
-	                        range.baseArrayLayer == 0 && range.layerCount == layers;
+	const bool full_subresources = range.baseMipLevel == 0 &&
+	                               range.levelCount == image.info.resources.levels &&
+	                               range.baseArrayLayer == 0 && range.layerCount == layers;
+	const bool full_image = range.aspectMask == aspects && full_subresources;
 	TrackImage(id);
 	if (!full_image && (image.IsBufferModified() || image.IsCpuDirty())) {
 		InitializeImage(id);
@@ -2179,26 +2163,13 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
 			EXIT("TextureCache: image clear retained guest ownership\n");
 		}
 	}
-	// A stencil clear writes the depth image, but the plane's guest bytes live on a separate
-	// association. Settle that association against this clear, or its pending upload lands
-	// afterwards and overwrites what the clear just wrote.
-	std::vector<ImageId> stencil_associations;
-	if ((range.aspectMask & vk::ImageAspectFlagBits::eStencil) && image.info.stencil.Valid()) {
-		const bool full_stencil = range.baseMipLevel == 0 &&
-		                          range.levelCount == image.info.resources.levels &&
-		                          range.baseArrayLayer == 0 && range.layerCount == layers;
-		for (const auto association:
-		     FindImagesInRegion(image.info.stencil.address, image.info.stencil.size, false)) {
-			auto& stencil = m_slot_images[association];
-			if (stencil.depth_id != id || stencil.info.data != image.info.stencil) {
-				continue;
-			}
-			TrackImage(association);
-			// Partial clears must retain guest writes outside the cleared subresources.
-			if (!full_stencil) {
-				RefreshImage(association);
-			}
-			stencil_associations.push_back(association);
+	if (image.info.HasStencil() && (range.aspectMask & vk::ImageAspectFlagBits::eStencil)) {
+		const auto stencil_id = AssociateStencil(id, image.info.stencil);
+		if (!full_subresources) {
+			RefreshImage(stencil_id);
+		} else {
+			TrackImage(stencil_id);
+			CommitGpuWrite(m_slot_images[stencil_id]);
 		}
 	}
 	command.EndRendering();
@@ -2249,14 +2220,6 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
 		                                        &clear.depthStencil, 1, &native_range);
 	}
 	CommitGpuWrite(image);
-	for (const auto association: stencil_associations) {
-		auto& stencil = m_slot_images[association];
-		// The native clear supersedes the pending stencil upload on the next binding.
-		stencil.ClearBufferModified();
-		if (stencil.IsCpuDirty()) {
-			stencil.RefreshComplete();
-		}
-	}
 }
 
 void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
@@ -2281,7 +2244,7 @@ void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t des
 	EXIT_NOT_IMPLEMENTED(transfer_slice > UINT64_MAX / layers);
 	const uint64_t transfer_size = transfer_slice * layers;
 	EXIT_NOT_IMPLEMENTED(guest_slice > full_slice_size);
-	auto copies = BuildDepthCopies(info, full_slice_size);
+	auto copies = BuildDepthCopies(info, full_slice_size, vk::ImageAspectFlagBits::eDepth);
 	if (transfer_bytes == info.bytes_per_block) {
 		if (!info.IsTiled()) {
 			for (auto& copy: copies) {

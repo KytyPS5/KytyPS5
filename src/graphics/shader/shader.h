@@ -51,10 +51,10 @@ struct CompiledShaderInfo;
 
 struct ShaderStageRuntime {
 	const ShaderRecompiler::IR::CompiledShaderInfo* program = nullptr;
-	ShaderRecompiler::IR::ResourceSnapshot          resources;
+	const ShaderRecompiler::IR::ResourceSnapshot*   resources = nullptr;
 
 	[[nodiscard]] explicit operator bool() const {
-		return program != nullptr;
+		return program != nullptr && resources != nullptr;
 	}
 };
 
@@ -134,6 +134,7 @@ struct ShaderVertexInputInfo {
 	int                     fetch_attrib_reg    = 0;
 	int                     fetch_buffer_reg    = 0;
 	int                     buffers_num         = 0;
+	uint32_t                wave_size           = 64;
 	uint32_t                scratch_size_dwords = 0;
 	uint32_t                pa_cl_vs_out_cntl    = 0;
 	ShaderClipSpaceTransform clip_space;
@@ -144,6 +145,7 @@ struct ShaderVertexInputInfo {
 };
 
 struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
+	uint8_t            float_mode                 = 0xc0;
 	uint32_t           dispatch_threads_num[3]    = {0, 0, 0};
 	bool               group_id[3]                = {false, false, false};
 	bool               dispatch_thread_dimensions = false;
@@ -175,6 +177,7 @@ struct ShaderPixelInputInfo {
 	bool                                           ps_depth_export_enable       = false;
 	bool                                           ps_sample_mask_export_enable = false;
 	bool                                           ps_sample_shading            = false;
+	bool                                           dual_source_blending         = false;
 	bool                                           ps_early_z                   = false;
 	bool                                           ps_execute_on_noop           = false;
 	ShaderStageRuntime                             stage;

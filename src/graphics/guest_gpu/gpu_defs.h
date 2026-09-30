@@ -26,6 +26,10 @@ enum class PrimitiveType : uint32_t {
 	kPolygon            = 21,
 };
 
+constexpr bool IsRectList(PrimitiveType type) {
+	return type == PrimitiveType::kRectList || type == PrimitiveType::kRectListLegacy;
+}
+
 enum class IndexType : uint32_t {
 	kIndex16 = 0,
 	kIndex32 = 1,

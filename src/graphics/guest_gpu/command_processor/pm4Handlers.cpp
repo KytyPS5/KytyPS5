@@ -1331,56 +1331,13 @@ KYTY_CP_OP_PARSER(CpOpDispatchIndirect) {
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0011600 && cmd_id != 0xc0021600);
 
 	if (cmd_id == 0xc0021600) {
-		struct DispatchIndirectArgs {
-			uint32_t thread_group_x;
-			uint32_t thread_group_y;
-			uint32_t thread_group_z;
-		};
-
-		auto* args = reinterpret_cast<const DispatchIndirectArgs*>(
-		    buffer[0] | (static_cast<uint64_t>(buffer[1]) << 32u));
-		uint32_t mode = buffer[2];
-
-		EXIT_NOT_IMPLEMENTED(args == nullptr);
-		// Debug: these counts come from a prior GPU pass. Reading them on the CPU here races
-		// with the GPU actually producing them.
-		{
-			static std::atomic_uint64_t dbg_ind {0};
-			static std::atomic_uint64_t dbg_zero {0};
-			const auto n = dbg_ind.fetch_add(1, std::memory_order_relaxed);
-			const bool is_zero = args->thread_group_x == 0 || args->thread_group_y == 0 ||
-			                     args->thread_group_z == 0;
-			if (is_zero) {
-				dbg_zero.fetch_add(1, std::memory_order_relaxed);
-				// Race test: let the GPU finish producing the counts, then look again.
-				static std::atomic_uint64_t dbg_recovered {0};
-				cp.BufferFlushAndWait();
-				if (args->thread_group_x != 0 && args->thread_group_y != 0 &&
-				    args->thread_group_z != 0) {
-					const auto rec = dbg_recovered.fetch_add(1, std::memory_order_relaxed);
-					if (rec < 30 || (rec % 200) == 0) {
-						LOGF("INDIRECT RACE #%" PRIu64 ": was 0, after sync groups=%ux%ux%u\n", rec,
-						     args->thread_group_x, args->thread_group_y, args->thread_group_z);
-					}
-				}
-			}
-			if (n < 40 || (n % 200) == 0) {
-				LOGF("DISPATCH INDIRECT #%" PRIu64 ": args=0x%016" PRIx64 " groups=%ux%ux%u zero=%d"
-				     " zero_total=%" PRIu64 "\n",
-				     n, reinterpret_cast<uint64_t>(args), args->thread_group_x,
-				     args->thread_group_y, args->thread_group_z, is_zero ? 1 : 0,
-				     dbg_zero.load(std::memory_order_relaxed));
-			}
-		}
-		cp.DispatchDirect(args->thread_group_x, args->thread_group_y, args->thread_group_z, mode);
-
+		cp.DispatchIndirect(buffer[0] | (static_cast<uint64_t>(buffer[1]) << 32u), buffer[2]);
 		return 3;
 	}
 
-	uint32_t data_offset = buffer[0];
-	uint32_t mode        = buffer[1];
-
-	cp.DispatchIndirect(data_offset, mode);
+	const auto base_addr = cp.GetDispatchIndirectArgsBaseAddress();
+	EXIT_NOT_IMPLEMENTED(base_addr == 0);
+	cp.DispatchIndirect(base_addr + buffer[0], buffer[1]);
 
 	return 2;
 }
@@ -2047,6 +2004,14 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 		auto pfunc = g_hw_ctx_indirect_func[cmd_offset & (Pm4::CX_NUM - 1)];
 
 		if (pfunc == nullptr) {
+			if (raw_cmd_offset == 0x24au && value == 0u) {
+				static std::atomic_flag logged = ATOMIC_FLAG_INIT;
+				if (!logged.test_and_set(std::memory_order_relaxed)) {
+					Log::WriteToConsoleAndLog(
+					    "\t diagnostic: ignoring indirect CX {0x24a, 0}; hardware effect unresolved\n");
+				}
+				continue;
+			}
 			EXIT("unknown cx reg at %05" PRIx32 ": 0x%" PRIx32 "\n", num_dw - dw, cmd_offset);
 		}
 

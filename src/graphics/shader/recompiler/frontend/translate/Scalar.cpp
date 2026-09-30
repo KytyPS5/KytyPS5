@@ -2,166 +2,166 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
-bool Translator::EmitScalar(const Decoder::Instruction& inst) {
+void Translator::EmitScalar(const Decoder::Instruction& inst) {
 	using O = Decoder::Opcode;
 	switch (inst.opcode) {
 		case O::S_MOV_B32:
-		case O::S_MOVK_I32: MOV_B32(inst, false); return true;
-		case O::S_MOV_B64: S_MOV_B64(inst); return true;
-		case O::S_WQM_B32: S_WQM(inst, false); return true;
-		case O::S_WQM_B64: S_WQM(inst, true); return true;
-		case O::S_GETPC_B64: S_GETPC_B64(inst); return true;
-		case O::S_SETPC_B64: return true;
-		case O::S_SWAPPC_B64: return true;
-		case O::S_SUBVECTOR_LOOP_BEGIN: S_SUBVECTOR_LOOP(inst, true); return true;
-		case O::S_SUBVECTOR_LOOP_END: S_SUBVECTOR_LOOP(inst, false); return true;
-		case O::S_CSELECT_B32: ScalarSelect32(inst, inst.src1); return true;
-		case O::S_CSELECT_B64: ScalarSelect64(inst, inst.src1); return true;
+		case O::S_MOVK_I32: MOV_B32(inst, false); return;
+		case O::S_MOV_B64: S_MOV_B64(inst); return;
+		case O::S_WQM_B32: S_WQM(inst, false); return;
+		case O::S_WQM_B64: S_WQM(inst, true); return;
+		case O::S_GETPC_B64: S_GETPC_B64(inst); return;
+		case O::S_SETPC_B64: return;
+		case O::S_SWAPPC_B64: return;
+		case O::S_SUBVECTOR_LOOP_BEGIN: S_SUBVECTOR_LOOP(inst, true); return;
+		case O::S_SUBVECTOR_LOOP_END: S_SUBVECTOR_LOOP(inst, false); return;
+		case O::S_CSELECT_B32: ScalarSelect32(inst, inst.src1); return;
+		case O::S_CSELECT_B64: ScalarSelect64(inst, inst.src1); return;
 		case O::S_CMOV_B32:
-		case O::S_CMOVK_I32: ScalarSelect32(inst, inst.dst); return true;
-		case O::S_CMOV_B64: ScalarSelect64(inst, inst.dst); return true;
+		case O::S_CMOVK_I32: ScalarSelect32(inst, inst.dst); return;
+		case O::S_CMOV_B64: ScalarSelect64(inst, inst.dst); return;
 		case O::S_SETREG_B32:
 		case O::S_SETREG_IMM32_B32:
-		case O::S_VERSION: EmitControlNop(); return true;
-		case O::S_GETREG_B32: S_GETREG_B32(inst); return true;
-		case O::S_WAITCNT: EmitWaitcnt(); return true;
+		case O::S_VERSION: EmitControlNop(); return;
+		case O::S_GETREG_B32: S_GETREG_B32(inst); return;
+		case O::S_WAITCNT: EmitWaitcnt(); return;
 
 		case O::S_AND_SAVEEXEC_B32:
 			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, false, false, false);
-			return true;
+			return;
 		case O::S_OR_SAVEEXEC_B32:
 			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalOr, false, false, false);
-			return true;
+			return;
 		case O::S_XOR_SAVEEXEC_B32:
 			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalXor, false, false, false);
-			return true;
+			return;
 		case O::S_ANDN2_SAVEEXEC_B32:
 			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, true, false, false);
-			return true;
+			return;
 		case O::S_NAND_SAVEEXEC_B32:
 			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, false, false, false, true);
-			return true;
+			return;
 		case O::S_NOR_SAVEEXEC_B32:
 			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalOr, false, false, false, true);
-			return true;
+			return;
 		case O::S_XNOR_SAVEEXEC_B32:
 			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalXor, false, false, false, true);
-			return true;
+			return;
 		case O::S_ORN1_SAVEEXEC_B32:
 			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalOr, false, true, false);
-			return true;
+			return;
 		case O::S_ANDN1_WREXEC_B32:
 			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, false, true, false, false, true);
-			return true;
+			return;
 		case O::S_ANDN2_WREXEC_B32:
 			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, true, false, false, false, true);
-			return true;
+			return;
 		case O::S_OR_SAVEEXEC_B64:
 			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalOr, false, false, true);
-			return true;
+			return;
 		case O::S_XOR_SAVEEXEC_B64:
 			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalXor, false, false, true);
-			return true;
+			return;
 		case O::S_ANDN2_SAVEEXEC_B64:
 			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, true, false, true);
-			return true;
+			return;
 		case O::S_NAND_SAVEEXEC_B64:
 			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, false, false, true, true);
-			return true;
+			return;
 		case O::S_NOR_SAVEEXEC_B64:
 			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalOr, false, false, true, true);
-			return true;
+			return;
 		case O::S_XNOR_SAVEEXEC_B64:
 			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalXor, false, false, true, true);
-			return true;
+			return;
 		case O::S_ORN1_SAVEEXEC_B64:
 			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalOr, false, true, true);
-			return true;
+			return;
 		case O::S_ANDN1_WREXEC_B64:
 			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, false, true, true, false, true);
-			return true;
+			return;
 		case O::S_ANDN2_WREXEC_B64:
 			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, true, false, true, false, true);
-			return true;
+			return;
 		case O::S_ANDN1_SAVEEXEC_B32:
 			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, false, true, false);
-			return true;
+			return;
 		case O::S_ORN2_SAVEEXEC_B32:
 			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalOr, true, false, false);
-			return true;
+			return;
 		case O::S_AND_SAVEEXEC_B64:
 			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, false, false, true);
-			return true;
+			return;
 		case O::S_ANDN1_SAVEEXEC_B64:
 			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, false, true, true);
-			return true;
+			return;
 		case O::S_ORN2_SAVEEXEC_B64:
 			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalOr, true, false, true);
-			return true;
-		case O::S_ADD_U32: ADD_U32(inst, false, false); return true;
-		case O::S_ADDC_U32: ADD_U32(inst, false, true); return true;
-		case O::S_SUB_U32: SUB_U32(inst, false, false); return true;
-		case O::S_SUBB_U32: SUBB_U32(inst, false, false); return true;
-		case O::S_ABSDIFF_I32: S_ABSDIFF_I32(inst); return true;
-		case O::S_ADD_I32: S_ADD_SUB_I32(inst, false); return true;
-		case O::S_SUB_I32: S_ADD_SUB_I32(inst, true); return true;
-		case O::S_LSHL1_ADD_U32: S_LSHL_ADD_U32(inst, 1u); return true;
-		case O::S_LSHL2_ADD_U32: S_LSHL_ADD_U32(inst, 2u); return true;
-		case O::S_LSHL3_ADD_U32: S_LSHL_ADD_U32(inst, 3u); return true;
-		case O::S_LSHL4_ADD_U32: S_LSHL_ADD_U32(inst, 4u); return true;
+			return;
+		case O::S_ADD_U32: ADD_U32(inst, false, false); return;
+		case O::S_ADDC_U32: ADD_U32(inst, false, true); return;
+		case O::S_SUB_U32: SUB_U32(inst, false, false); return;
+		case O::S_SUBB_U32: SUBB_U32(inst, false, false); return;
+		case O::S_ABSDIFF_I32: S_ABSDIFF_I32(inst); return;
+		case O::S_ADD_I32: S_ADD_SUB_I32(inst, false); return;
+		case O::S_SUB_I32: S_ADD_SUB_I32(inst, true); return;
+		case O::S_LSHL1_ADD_U32: S_LSHL_ADD_U32(inst, 1u); return;
+		case O::S_LSHL2_ADD_U32: S_LSHL_ADD_U32(inst, 2u); return;
+		case O::S_LSHL3_ADD_U32: S_LSHL_ADD_U32(inst, 3u); return;
+		case O::S_LSHL4_ADD_U32: S_LSHL_ADD_U32(inst, 4u); return;
 		case O::S_MIN_I32:
 			ScalarMinMax32(inst, IR::ValueOpcode::SMin32, IR::ValueOpcode::SLessThan32);
-			return true;
+			return;
 		case O::S_MAX_I32:
 			ScalarMinMax32(inst, IR::ValueOpcode::SMax32, IR::ValueOpcode::SGreaterThan32);
-			return true;
+			return;
 		case O::S_MIN_U32:
 			ScalarMinMax32(inst, IR::ValueOpcode::UMin32, IR::ValueOpcode::ULessThan32);
-			return true;
+			return;
 		case O::S_MAX_U32:
 			ScalarMinMax32(inst, IR::ValueOpcode::UMax32, IR::ValueOpcode::UGreaterThan32);
-			return true;
+			return;
 
 		case O::S_CMP_EQ_U32:
 		case O::S_CMP_EQ_I32:
 			EmitIntegerCompare(inst, IR::ValueOpcode::IEqual32, IR::Type::U32, true, false);
-			return true;
+			return;
 		case O::S_CMP_LG_U32:
 		case O::S_CMP_LG_I32:
 			EmitIntegerCompare(inst, IR::ValueOpcode::INotEqual32, IR::Type::U32, true, false);
-			return true;
+			return;
 		case O::S_CMP_GT_U32:
 			EmitIntegerCompare(inst, IR::ValueOpcode::UGreaterThan32, IR::Type::U32, true, false);
-			return true;
+			return;
 		case O::S_CMP_GE_U32:
 			EmitIntegerCompare(inst, IR::ValueOpcode::UGreaterThanEqual32, IR::Type::U32, true,
 			                   false);
-			return true;
+			return;
 		case O::S_CMP_LT_U32:
 			EmitIntegerCompare(inst, IR::ValueOpcode::ULessThan32, IR::Type::U32, true, false);
-			return true;
+			return;
 		case O::S_CMP_LE_U32:
 			EmitIntegerCompare(inst, IR::ValueOpcode::ULessThanEqual32, IR::Type::U32, true, false);
-			return true;
+			return;
 		case O::S_CMP_GT_I32:
 			EmitIntegerCompare(inst, IR::ValueOpcode::SGreaterThan32, IR::Type::U32, true, false);
-			return true;
+			return;
 		case O::S_CMP_GE_I32:
 			EmitIntegerCompare(inst, IR::ValueOpcode::SGreaterThanEqual32, IR::Type::U32, true,
 			                   false);
-			return true;
+			return;
 		case O::S_CMP_LT_I32:
 			EmitIntegerCompare(inst, IR::ValueOpcode::SLessThan32, IR::Type::U32, true, false);
-			return true;
+			return;
 		case O::S_CMP_LE_I32:
 			EmitIntegerCompare(inst, IR::ValueOpcode::SLessThanEqual32, IR::Type::U32, true, false);
-			return true;
+			return;
 		case O::S_CMP_EQ_U64:
 			EmitIntegerCompare(inst, IR::ValueOpcode::IEqual64, IR::Type::U64, true, false);
-			return true;
+			return;
 		case O::S_CMP_LG_U64:
 			EmitIntegerCompare(inst, IR::ValueOpcode::INotEqual64, IR::Type::U64, true, false);
-			return true;
+			return;
 
 		case O::S_AND_B64:
 			return S_U64_MASK(inst, IR::ValueOpcode::LogicalAnd, IR::ValueOpcode::BitwiseAnd32,
@@ -301,15 +301,15 @@ bool Translator::EmitScalar(const Decoder::Instruction& inst) {
 		case O::S_CLAUSE:
 		case O::S_ROUND_MODE:
 		case O::S_DENORM_MODE:
-		case O::S_TRAP: EmitControlNop(); return true;
+		case O::S_TRAP: EmitControlNop(); return;
 		case O::S_WAITCNT_DEPCTR:
-		case O::S_WAIT_IDLE: EmitWaitcnt(); return true;
-		case O::S_BARRIER: S_BARRIER(); return true;
+		case O::S_WAIT_IDLE: EmitWaitcnt(); return;
+		case O::S_BARRIER: S_BARRIER(); return;
 		case O::S_SENDMSG:
-		case O::S_SENDMSGHALT: S_SENDMSG(inst); return true;
+		case O::S_SENDMSGHALT: S_SENDMSG(inst); return;
 		case O::S_TTRACEDATA:
-		case O::S_TTRACEDATA_IMM: S_TTRACEDATA(); return true;
-		case O::S_INST_PREFETCH: S_INST_PREFETCH(); return true;
+		case O::S_TTRACEDATA_IMM: S_TTRACEDATA(); return;
+		case O::S_INST_PREFETCH: S_INST_PREFETCH(); return;
 		case O::S_BRANCH:
 		case O::S_CBRANCH_SCC0:
 		case O::S_CBRANCH_SCC1:
@@ -317,8 +317,8 @@ bool Translator::EmitScalar(const Decoder::Instruction& inst) {
 		case O::S_CBRANCH_VCCNZ:
 		case O::S_CBRANCH_EXECZ:
 		case O::S_CBRANCH_EXECNZ:
-		case O::S_ENDPGM: return true;
-		default: return false;
+		case O::S_ENDPGM: return;
+		default: return FailMissingTranslation(inst);
 	}
 }
 

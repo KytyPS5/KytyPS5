@@ -72,6 +72,7 @@ constexpr int32_t AJM_RESULT_INVALID_DATA       = 0x00000002;
 constexpr int32_t AJM_RESULT_INVALID_PARAMETER  = 0x00000004;
 constexpr int32_t AJM_RESULT_PARTIAL_INPUT      = 0x00000008;
 constexpr int32_t AJM_RESULT_NOT_ENOUGH_ROOM    = 0x00000010;
+constexpr int32_t AJM_RESULT_TOO_MANY_CHANNELS  = 0x00000040;
 constexpr int32_t AJM_RESULT_CODEC_ERROR        = 0x40000000;
 constexpr int32_t AJM_RESULT_FATAL              = static_cast<int32_t>(0x80000000u);
 

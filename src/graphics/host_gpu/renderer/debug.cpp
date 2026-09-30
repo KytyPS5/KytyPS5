@@ -209,28 +209,16 @@ static void RtCheck(const HW::RenderTarget& rt) {
 		}
 		if (rt.info.fmask_compression_enable) {
 			EXIT_NOT_IMPLEMENTED(rt.attrib.num_samples == 0 && rt.attrib.num_fragments == 0);
+			// Native MSAA stores expanded samples, independent of FMASK metadata compression.
 			static bool logged = false;
 			if (!logged) {
-				LOGF("RenderTarget: using native Vulkan MSAA without guest FMASK metadata, "
+				LOGF("RenderTarget: using expanded native Vulkan MSAA samples, "
 				     "fmask=0x%016" PRIx64 "\n",
 				     rt.fmask.addr);
 				logged = true;
 			}
 		}
 
-		EXIT_NOT_IMPLEMENTED(rt.info.fmask_data_compression_disable != false);
-
-		if (rt.info.cmask_fast_clear_enable || rt.info.dcc_compression_enable) {
-			static bool logged = false;
-			if (!logged) {
-				LOGF("RenderTarget: temporary: ignoring PS5 color metadata fast_clear=%s dcc=%s "
-				     "cmask=0x%016" PRIx64 " dcc_addr=0x%016" PRIx64 "\n",
-				     rt.info.cmask_fast_clear_enable ? "true" : "false",
-				     rt.info.dcc_compression_enable ? "true" : "false", rt.cmask.addr,
-				     rt.dcc_addr.addr);
-				logged = true;
-			}
-		}
 		if (rt.info.blend_bypass) {
 			static bool logged = false;
 			if (!logged) {

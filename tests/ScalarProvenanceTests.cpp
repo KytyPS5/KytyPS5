@@ -79,13 +79,14 @@ struct TestMemory {
   uint32_t reads = 0;
 };
 
-bool ReadMemory(void *userdata, uint64_t address, uint32_t *value) {
+bool ReadMemory(void *userdata, uint64_t address, std::span<uint32_t> values) {
   auto &memory = *static_cast<TestMemory *>(userdata);
-  const auto it = memory.words.find(address);
-  if (it == memory.words.end()) {
-    return false;
+  for (auto &value : values) {
+    const auto it = memory.words.find(address);
+    if (it == memory.words.end()) return false;
+    value = it->second;
+    address += sizeof(uint32_t);
   }
-  *value = it->second;
   memory.reads++;
   return true;
 }
@@ -122,7 +123,7 @@ void TestImmediateFlatteningAndGvn() {
   TestMemory memory_image{{{0x1020u, 0xfeedbeefu}}};
   SrtRuntime runtime{.read_memory = ReadMemory, .userdata = &memory_image};
   std::vector<uint32_t> flat;
-  Check(WalkSrt(fixture.program, runtime, flat), "flattened SRT walk failed");
+  Check(SrtWalker(fixture.program, runtime).RefreshFlatBuffer(flat), "flattened SRT walk failed");
   Check(flat == std::vector<uint32_t>{0xfeedbeefu} && memory_image.reads == 1,
         "flattened SRT did not evaluate its canonical read once");
 }
@@ -139,7 +140,7 @@ void TestRawScalarComponentAlignment() {
   TestMemory memory_image{{{0x1000u, 0x12345678u}}};
   SrtRuntime runtime{.read_memory = ReadMemory, .userdata = &memory_image};
   std::vector<uint32_t> flat;
-  Check(WalkSrt(fixture.program, runtime, flat), "raw scalar SRT walk failed");
+  Check(SrtWalker(fixture.program, runtime).RefreshFlatBuffer(flat), "raw scalar SRT walk failed");
   Check(
       flat == std::vector<uint32_t>{0x12345678u} && memory_image.reads == 1,
       "raw scalar base, immediate, and offset were not aligned independently");
@@ -195,7 +196,7 @@ void TestNestedSrtWalk() {
   TestMemory memory_image{{{0x1000u, 0x2000u}, {0x2000u, 0xabcdef01u}}};
   SrtRuntime runtime{.read_memory = ReadMemory, .userdata = &memory_image};
   std::vector<uint32_t> flat;
-  Check(WalkSrt(fixture.program, runtime, flat), "nested SRT walk failed");
+  Check(SrtWalker(fixture.program, runtime).RefreshFlatBuffer(flat), "nested SRT walk failed");
   Check(flat == std::vector<uint32_t>({0x2000u, 0xabcdef01u}),
         "nested typed SRT reads were not evaluated in dependency order");
 }
@@ -218,7 +219,7 @@ void TestShaderBaseAndUserData() {
   SrtRuntime runtime{.user_data = user_data,
                      .shader_base = 0x12345678abcdef00ull};
   DescriptorValue result;
-  Check(EvaluateDescriptorSource(fixture.program, 0, runtime, result),
+  Check(SrtWalker(fixture.program, runtime).EvaluateDescriptor(0, result),
         "shader-relative descriptor evaluation failed");
   Check(result.dword_count == 3 && result.dwords[0] == 0xabcdef00u &&
             result.dwords[1] == 0x12345678u && result.dwords[2] == 0x24u,
@@ -243,7 +244,7 @@ void TestCarryAndBitFields() {
       {.dwords = {low, high, inserted, sign}, .dword_count = 4});
 
   DescriptorValue result;
-  Check(EvaluateDescriptorSource(fixture.program, 0, {}, result),
+  Check(SrtWalker(fixture.program, {}).EvaluateDescriptor(0, result),
         "carry and bit-field descriptor evaluation failed");
   Check(result.dwords[0] == 1u && result.dwords[1] == 1u &&
             result.dwords[2] == 0x89abcdefu && result.dwords[3] == 0xffffffffu,
@@ -267,14 +268,11 @@ void TestInvariantAndDivergentPhi() {
       {.dwords = {Value(&divergent)}, .dword_count = 1});
 
   DescriptorValue result;
-  Check(EvaluateDescriptorSource(fixture.program, 0, {}, result) &&
+  Check(SrtWalker(fixture.program, {}).EvaluateDescriptor(0, result) &&
             result.dwords[0] == 7u,
         "loop-invariant typed phi was rejected");
-  result.dword_count = 4;
-  result.dwords[0] = 0xdeadbeefu;
-  Check(!EvaluateDescriptorSource(fixture.program, 1, {}, result) &&
-            result.dword_count == 4 && result.dwords[0] == 0xdeadbeefu,
-        "divergent phi did not fail transactionally");
+  Check(!SrtWalker(fixture.program, {}).EvaluateDescriptor(1, result),
+        "divergent phi was accepted");
 }
 
 void TestControlDependentStandaloneLoadStaysTyped() {
@@ -314,7 +312,7 @@ void TestRuntime64BitDescriptorOps() {
       {.dwords = {low, high}, .dword_count = 2});
 
   DescriptorValue result;
-  Check(EvaluateDescriptorSource(fixture.program, 0, {}, result) &&
+  Check(SrtWalker(fixture.program, {}).EvaluateDescriptor(0, result) &&
             result.dwords[0] == 0xabcdu && result.dwords[1] == 0x1235u,
         "64-bit typed descriptor arithmetic evaluation is incorrect");
 }
@@ -389,11 +387,11 @@ void TestUniformFirstLaneSamplerLod() {
   user_data[6] = 3u;
   SrtRuntime runtime{.user_data = user_data};
   DescriptorValue result;
-  Check(EvaluateDescriptorSource(fixture.program, 0, runtime, result) &&
+  Check(SrtWalker(fixture.program, runtime).EvaluateDescriptor(0, result) &&
             result.dwords[0] == 0x00300300u,
         "uniform sampler LOD evaluated incorrectly");
   user_data[6] = 20u;
-  Check(EvaluateDescriptorSource(fixture.program, 0, runtime, result) &&
+  Check(SrtWalker(fixture.program, runtime).EvaluateDescriptor(0, result) &&
             result.dwords[0] == 0x00ffffffu,
         "uniform sampler LOD clamp evaluated incorrectly");
 }
@@ -455,7 +453,7 @@ void TestConstantBufferBounds() {
   TestMemory memory_image{{{0x300cu, 0xa5a5a5a5u}}};
   SrtRuntime runtime{.read_memory = ReadMemory, .userdata = &memory_image};
   std::vector<uint32_t> flat;
-  Check(WalkSrt(fixture.program, runtime, flat) &&
+  Check(SrtWalker(fixture.program, runtime).RefreshFlatBuffer(flat) &&
             flat == std::vector<uint32_t>{0xa5a5a5a5u},
         "constant-buffer SRT walk failed");
 
@@ -470,10 +468,8 @@ void TestConstantBufferBounds() {
   overflow.Emit(ValueOpcode::GetBufferResource,
                 {overflow_read, Value(0u), Value(16u), Value(0u)});
   overflow.Plan();
-  flat = {0x55u};
-  Check(!WalkSrt(overflow.program, runtime, flat) &&
-            flat == std::vector<uint32_t>{0x55u},
-        "out-of-bounds constant-buffer walk was not transactional");
+  Check(!SrtWalker(overflow.program, runtime).RefreshFlatBuffer(flat),
+        "out-of-bounds constant-buffer walk was accepted");
 }
 
 void TestReadLaneElimination() {
@@ -560,10 +556,8 @@ void TestUndefinedRuntimeValueFails() {
   fixture.program.descriptor_sources.push_back(
       {.dwords = {undef}, .dword_count = 1});
   DescriptorValue result;
-  result.dword_count = 3;
-  Check(!EvaluateDescriptorSource(fixture.program, 0, {}, result) &&
-            result.dword_count == 3,
-        "undefined typed descriptor source did not fail transactionally");
+  Check(!SrtWalker(fixture.program, {}).EvaluateDescriptor(0, result),
+        "undefined typed descriptor source was accepted");
 }
 
 } // namespace

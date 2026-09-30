@@ -19,14 +19,6 @@ enum sys_file_cache_type_t {
 };
 
 // NOLINTNEXTLINE(readability-identifier-naming)
-struct sys_file_find_t {
-	std::filesystem::path path_with_name;
-	SysFileTimeStruct     last_access_time;
-	SysFileTimeStruct     last_write_time;
-	uint64_t              size;
-};
-
-// NOLINTNEXTLINE(readability-identifier-naming)
 struct sys_dir_entry_t {
 	std::string name;
 	bool        is_file;
@@ -74,8 +66,6 @@ bool SysFileSetLastWriteTimeUtc(const std::filesystem::path& name, SysFileTimeSt
 // NOLINTNEXTLINE(google-runtime-references)
 bool SysFileSetLastAccessAndWriteTimeUtc(const std::filesystem::path& name,
                                          SysFileTimeStruct& access, SysFileTimeStruct& write);
-// NOLINTNEXTLINE(google-runtime-references)
-void SysFileFindFiles(const std::filesystem::path& path, std::vector<sys_file_find_t>& out);
 // NOLINTNEXTLINE(google-runtime-references)
 void SysFileGetDents(const std::filesystem::path& path, std::vector<sys_dir_entry_t>& out);
 bool SysFileCopyFile(const std::filesystem::path& src, const std::filesystem::path& dst);

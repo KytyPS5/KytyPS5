@@ -245,88 +245,78 @@ void File::Printf(const char* format, ...) {
 	Write(s.data(), static_cast<uint32_t>(s.size()));
 }
 
+static std::filesystem::path WithoutTrailingSeparator(
+	const std::filesystem::path& path) {
+		if (!path.empty() && !path.has_filename() &&
+			path != path.root_path()) {
+			return path.parent_path();
+		}
+
+		return path;
+}
+
+
 bool File::IsDirectoryExisting(const std::filesystem::path& path) {
-	auto path_str = PathToGenericString(path);
-	return SysFileIsDirectoryExisting(path_str.ends_with("/") ? Common::RemoveLast(path_str, 1)
-	                                                          : path_str);
+	return SysFileIsDirectoryExisting(WithoutTrailingSeparator(path));
 }
 
 bool File::IsFileExisting(const std::filesystem::path& name) {
 	return SysFileIsFileExisting(name);
 }
 
-bool File::CreateDirectory(
-    const std::filesystem::path& path) // @suppress("Member declaration not found")
-{
-	auto path_str = PathToGenericString(path);
-	return SysFileCreateDirectory(path_str.ends_with("/") ? Common::RemoveLast(path_str, 1)
-	                                                      : path_str);
+bool File::CreateDirectory(const std::filesystem::path& path) {
+    return SysFileCreateDirectory(
+        WithoutTrailingSeparator(path));
 }
 
 bool File::DeleteDirectory(const std::filesystem::path& path) {
-	auto path_str = PathToGenericString(path);
-	return SysFileDeleteDirectory(path_str.ends_with("/") ? Common::RemoveLast(path_str, 1)
-	                                                      : path_str);
+    return SysFileDeleteDirectory(
+        WithoutTrailingSeparator(path));
 }
 
 bool File::CreateDirectories(const std::filesystem::path& path) {
-	std::string real_path = Common::ReplaceChar(PathToGenericString(path), '\\', '/');
+    const auto normalized_path =
+        WithoutTrailingSeparator(path);
 
-	std::vector<std::string> list = Common::Split(real_path, "/");
+    auto current_path = normalized_path.root_path();
 
-	std::string p;
+    for (const auto& component:
+         normalized_path.relative_path()) {
+        current_path /= component;
 
-	for (uint32_t si = 0; si < list.size(); si++) {
-		const std::string& s = list[si];
+        if (IsDirectoryExisting(current_path)) {
+            continue;
+        }
 
-		if (si != 0 || real_path.starts_with("/")) {
-			p += "/";
-		}
+        if (!CreateDirectory(current_path)) {
+            return false;
+        }
+    }
 
-		p += s;
-
-		if (IsDirectoryExisting(p)) {
-			continue;
-		}
-
-		if (!CreateDirectory(p)) // @suppress("Invalid arguments")
-		{
-			return false;
-		}
-	}
-
-	return true;
+    return true;
 }
 
 bool File::DeleteDirectories(const std::filesystem::path& path) {
-	std::string real_path = Common::ReplaceChar(PathToGenericString(path), '\\', '/');
+    const auto normalized_path =
+        WithoutTrailingSeparator(path);
 
-	std::vector<std::string> list = Common::Split(real_path, "/");
+    std::vector<std::filesystem::path> directories;
+    auto current_path = normalized_path.root_path();
 
-	std::string              p;
-	std::vector<std::string> list2;
+    for (const auto& component:
+         normalized_path.relative_path()) {
+        current_path /= component;
+        directories.push_back(current_path);
+    }
 
-	for (uint32_t si = 0; si < list.size(); si++) {
-		const std::string& s = list[si];
+    for (auto it = directories.rbegin();
+         it != directories.rend(); ++it) {
+        if (!DeleteDirectory(*it)) {
+            return false;
+        }
+    }
 
-		if (si != 0 || real_path.starts_with("/")) {
-			p += "/";
-		}
-
-		p += s;
-
-		list2.push_back(p);
-	}
-
-	uint32_t num = list2.size();
-
-	for (uint32_t si = num - 1; si < num; si--) {
-		if (!DeleteDirectory(list2[si])) {
-			return false;
-		}
-	}
-
-	return true;
+    return true;
 }
 
 bool File::DeleteFile(
@@ -455,51 +445,6 @@ bool File::SetLastAccessAndWriteTimeUTC(const std::filesystem::path& name, const
 	return SysFileSetLastAccessAndWriteTimeUtc(name, af, wf);
 }
 
-std::vector<File::FindInfo> File::FindFiles(const std::filesystem::path& path) {
-	std::vector<sys_file_find_t> files;
-
-	SysFileFindFiles(path, files);
-
-	auto     path_str = PathToGenericString(path);
-	uint32_t len      = static_cast<uint32_t>(path_str.size());
-
-	if (!path_str.ends_with("/") && !path_str.ends_with("\\")) {
-		len++;
-	}
-
-	std::vector<File::FindInfo> ret;
-	ret.reserve(files.size());
-
-	for (const auto& f: files) {
-		File::FindInfo r {};
-
-		r.path_with_name     = f.path_with_name;
-		r.rel_path_with_name = Common::Mid(PathToGenericString(f.path_with_name), len);
-		r.size               = f.size;
-
-		SysTimeStruct at {};
-		SysTimeStruct wt {};
-
-		SysFileToSystemTimeUtc(f.last_access_time, at);
-		SysFileToSystemTimeUtc(f.last_write_time, wt);
-
-		if (!at.is_invalid && !wt.is_invalid) {
-			r.last_access_time = DateTime(Date(at.Year, at.Month, at.Day),
-			                              Time(at.Hour, at.Minute, at.Second, at.Milliseconds));
-			r.last_write_time  = DateTime(Date(wt.Year, wt.Month, wt.Day),
-			                              Time(wt.Hour, wt.Minute, wt.Second, wt.Milliseconds));
-		}
-
-		// printf("%s, %s, %" PRIu64", %s, %s\n", r.path_with_name.c_str(),
-		// r.rel_path_with_name.c_str(), r.size, r.last_access_time.ToString().c_str(),
-		// r.last_write_time.ToString().c_str());
-
-		ret.push_back(std::move(r));
-	}
-
-	return ret;
-}
-
 std::vector<File::DirEntry> File::GetDirEntries(const std::filesystem::path& path) {
 	std::vector<sys_dir_entry_t> files;
 
@@ -508,13 +453,8 @@ std::vector<File::DirEntry> File::GetDirEntries(const std::filesystem::path& pat
 	std::vector<File::DirEntry> ret;
 	ret.reserve(files.size());
 
-	for (const auto& f: files) {
-		File::DirEntry r {};
-
-		r.name    = f.name;
-		r.is_file = f.is_file;
-
-		ret.push_back(std::move(r));
+	for (auto& f: files) {
+		ret.emplace_back(std::move(f.name), f.is_file);
 	}
 
 	return ret;

@@ -33,23 +33,26 @@ namespace {
 
 constexpr uint64_t NumFramesBeforeRemoval = 32;
 
-[[nodiscard]] bool DecodeDccClear(const TextureCache::ImageDesc& desc, uint8_t code,
+[[nodiscard]] bool DecodeColorClear(const TextureCache::ImageDesc& desc, uint8_t code,
                                   vk::ClearColorValue& clear) {
+	const auto& metadata = desc.info.metadata;
+	const auto  format   = desc.view_info.format;
+	const bool  cmask    = metadata.kind == ImageMetadataKind::Cmask;
+	if (cmask ? code == 0 : code == 0x20) {
+		// Register clears belong to the color buffer; the texture pipe cannot decode them.
+		return desc.type == TextureCache::BindingType::RenderTarget &&
+		       metadata.clear_register_valid &&
+		       DecodePackedColorClear(format, metadata.clear_word, clear);
+	}
+	if (cmask) {
+		return false;
+	}
 	switch (code) {
 		case 0x00:
-		case 0x20:
 		case 0x40:
 		case 0x80:
 		case 0xc0: break;
 		default: return false;
-	}
-	const auto& metadata = desc.info.metadata;
-	const auto  format   = desc.view_info.format;
-	if (code == 0x20) {
-		// Clear-to-register is a color-buffer operation; the texture pipe cannot decode it.
-		return desc.type == TextureCache::BindingType::RenderTarget &&
-		       metadata.dcc_clear_register_valid &&
-		       DecodePackedColorClear(format, metadata.dcc_clear_word, clear);
 	}
 	clear = {};
 	if (code == 0x00) {
@@ -193,7 +196,7 @@ bool TextureCache::SameBacking(const ImageInfo& cached, const ImageInfo& request
 		return false;
 	}
 	if (!ImageViewOps::FormatsCompatible(cached.pixel_format, requested.pixel_format) ||
-	    (cached.type != requested.type && requested.extent != vk::Extent3D {1, 1, 1})) {
+	    cached.type != requested.type) {
 		return false;
 	}
 	if (exact_format && cached.pixel_format != requested.pixel_format) {
@@ -217,14 +220,6 @@ TextureCache::BindingType TextureCache::UploadBinding(const Image& image) {
 		return BindingType::VideoOut;
 	}
 	return image.usage.storage ? BindingType::Storage : BindingType::Texture;
-}
-
-bool TextureCache::SafeToDownload(const Image& image) {
-	if (!image.SafeToDownload()) {
-		return false;
-	}
-	const auto range = image.info.data;
-	return !m_buffer_cache.HasGpuDirtyBytes(range.address, range.size);
 }
 
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
@@ -639,9 +634,12 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 	const bool source_depth = source.info.IsDepth();
 	const bool dest_depth   = destination.info.IsDepth();
 	const bool direct_copy =
-	    source.backing.format == destination.backing.format ||
-	    (!source_depth && !dest_depth &&
-	     vk::blockSize(source.backing.format) == vk::blockSize(destination.backing.format));
+	    (source.backing.image_type == destination.backing.image_type ||
+	     (source.backing.image_type != vk::ImageType::e1D &&
+	      destination.backing.image_type != vk::ImageType::e1D)) &&
+	    (source.backing.format == destination.backing.format ||
+	     (!source_depth && !dest_depth &&
+	      vk::blockSize(source.backing.format) == vk::blockSize(destination.backing.format)));
 	if (direct_copy) {
 		destination.CopyImage(source);
 	} else if (!CopyD16(destination, source)) {
@@ -675,7 +673,8 @@ void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint3
 ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
                                           ImageId cached_id) {
 	auto& cached = m_slot_images[cached_id];
-	if (!cached.info.IsDepth() && !requested.IsDepth()) {
+	if ((!cached.info.IsDepth() && !requested.IsDepth()) ||
+	    cached.info.tile_mode != requested.tile_mode) {
 		return {};
 	}
 	const bool stencil_match = requested.HasStencil() == cached.info.HasStencil();
@@ -689,8 +688,8 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	    requested.samples == 1 && requested.data == cached.info.data &&
 	    requested.extent == cached.info.extent && requested.resources == cached.info.resources &&
 	    requested.type == cached.info.type && requested.pitch == cached.info.pitch &&
-	    requested.tile_mode == cached.info.tile_mode && !requested.HasStencil() &&
-	    !cached.info.HasStencil() && !requested.HasMetadata() && !cached.info.HasMetadata();
+	    !requested.HasStencil() && !cached.info.HasStencil() && !requested.HasMetadata() &&
+	    !cached.info.HasMetadata();
 	// PPSA04264
 	const bool retain_cached_layout =
 	    requested.samples == 1 && cached.info.samples == 1 && cached.backing.samples == 1 &&
@@ -701,7 +700,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	    requested.resources.layers != 0 && cached.info.resources.layers != 0 &&
 	    requested.resources.layers < cached.info.resources.layers &&
 	    requested.type == cached.info.type && requested.pitch == cached.info.pitch &&
-	    requested.tile_mode == cached.info.tile_mode && requested.mip_layout[0].offset == 0 &&
+	    requested.mip_layout[0].offset == 0 &&
 	    cached.info.mip_layout[0].offset == 0 &&
 	    requested.mip_layout[0].size == requested.data.size &&
 	    cached.info.mip_layout[0].size == cached.info.data.size &&
@@ -810,12 +809,15 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 			return {merged_id};
 		}
 		// PPSA08394
+		// A view cannot change the native image type or grow its extent.
 		if (requested.data.size == cached.info.data.size &&
-		    requested.resources == cached.info.resources && requested.type == cached.info.type &&
-		    requested.extent.width > cached.info.extent.width &&
-		    requested.extent.height >= cached.info.extent.height &&
-		    requested.extent.depth >= cached.info.extent.depth &&
-		    ImageViewOps::FormatsCompatible(cached.info.pixel_format, requested.pixel_format)) {
+		    requested.resources == cached.info.resources &&
+		    ImageViewOps::FormatsCompatible(cached.info.pixel_format, requested.pixel_format) &&
+		    (requested.type != cached.info.type
+		         ? requested.extent == cached.info.extent
+		         : requested.extent.width > cached.info.extent.width &&
+		               requested.extent.height >= cached.info.extent.height &&
+		               requested.extent.depth >= cached.info.extent.depth)) {
 			return {ExpandImage(requested, cached_id)};
 		}
 		// PS5 mip tails can expose more levels without increasing the guest allocation.
@@ -1118,9 +1120,10 @@ void TextureCache::InitializeImage(ImageId id) {
 	}
 }
 
-void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
+void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
                                        uint32_t metadata_base_layer) {
-	if (desc.info.metadata.kind != ImageMetadataKind::Dcc) {
+	if (desc.info.metadata.kind != ImageMetadataKind::Dcc &&
+	    desc.info.metadata.kind != ImageMetadataKind::Cmask) {
 		return;
 	}
 	const auto range = desc.info.metadata.range;
@@ -1128,18 +1131,18 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 		std::scoped_lock lock {m_lock};
 		auto& image         = m_slot_images[id];
 		image.info.metadata = desc.info.metadata;
-		// A native DCC allocation must not retain a reused HTile/CMask/FMask interpretation.
+		// Native color metadata must not retain a reused HTile/CMask/FMask clear flag.
 		m_surface_metas.erase(range.address);
 		if (range.size == 0 || desc.info.resources.levels != 1 || image.info.resources.levels != 1) {
 			return;
 		}
 	}
 	const auto layers = desc.info.TransferLayers();
-	// These one-mip surfaces use complete 4 KiB DCC metadata blocks.
+	// These one-mip surfaces use complete 4 KiB color metadata blocks.
 	constexpr uint64_t MetadataBlockSize = 0x1000;
 	if (!range.Valid() || range.address % MetadataBlockSize != 0 || layers == 0 ||
 	    range.size % layers != 0 || (range.size / layers) % MetadataBlockSize != 0) {
-		EXIT("TextureCache: DCC slices must contain aligned 4 KiB blocks\n");
+		EXIT("TextureCache: color metadata slices must contain aligned 4 KiB blocks\n");
 	}
 	const auto& view           = desc.view_info;
 	const bool  volume_texture = desc.info.IsVolume() && view.type == vk::ImageViewType::e3D;
@@ -1147,7 +1150,7 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 	const auto  image_first    = volume_texture ? 0u : view.base_layer;
 	const auto  count          = volume_texture ? desc.info.extent.depth : view.layer_count;
 	if (first >= layers || count > layers - first) {
-		EXIT("TextureCache: DCC view exceeds its native metadata slices\n");
+		EXIT("TextureCache: color view exceeds its native metadata slices\n");
 	}
 	// Finish native metadata writes before reading backing bytes. This can submit the scheduler,
 	// so discovery runs before final draw uploads and never holds the texture lock across it.
@@ -1159,15 +1162,15 @@ void TextureCache::MaterializeDccClear(ImageId id, const ImageDesc& desc,
 		const auto address = range.address + slice_size * (first + slice);
 		uint8_t code = 0;
 		if (!LibKernel::Memory::TryReadBacking(address, &code, sizeof(code))) {
-			EXIT("TextureCache: failed to read DCC metadata backing\n");
+			EXIT("TextureCache: failed to read color metadata backing\n");
 		}
 		vk::ClearValue clear {};
-		if (!DecodeDccClear(desc, code, clear.color)) {
+		if (!DecodeColorClear(desc, code, clear.color)) {
 			continue;
 		}
 		std::vector<uint8_t> bytes(slice_size);
 		if (!LibKernel::Memory::TryReadBacking(address, bytes.data(), bytes.size())) {
-			EXIT("TextureCache: failed to read DCC metadata slice\n");
+			EXIT("TextureCache: failed to read color metadata slice\n");
 		}
 		if (!std::all_of(bytes.begin(), bytes.end(), [code](uint8_t byte) { return byte == code; })) {
 			continue;
@@ -1312,7 +1315,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		image.tick_accessed_last = m_scheduler.CurrentTick();
 		TouchImage(image);
 	}
-	MaterializeDccClear(result, desc, metadata_base_layer);
+	MaterializeColorClear(result, desc, metadata_base_layer);
 	if (desc.type == BindingType::VideoOut &&
 	    desc.info.metadata.compression != VideoOutCompression::Uncompressed) {
 		std::scoped_lock lock {m_lock};
@@ -1349,7 +1352,7 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 		if (ensure_valid && owner->depth_id) {
 			owner = m_slot_images.try_get(owner->depth_id);
 		}
-		if (owner == nullptr || (ensure_valid && !SafeToDownload(*owner))) {
+		if (owner == nullptr || (ensure_valid && !owner->SafeToDownload())) {
 			continue;
 		}
 		matches.push_back(id);
@@ -1740,7 +1743,7 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	std::scoped_lock lock {m_texture_cache.m_lock};
 	auto& image = m_texture_cache.m_slot_images[selected];
 	// The GPU thread owns image retirement; CPU invalidation can dirty this image after lookup.
-	if (!m_texture_cache.SafeToDownload(image)) {
+	if (!image.SafeToDownload()) {
 		return false;
 	}
 	if (!buffer.IsInBounds(image.info.data.address, 1)) {
@@ -1803,7 +1806,7 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 		return false;
 	}
 	auto transfer = BuildDownload(image);
-	if (!transfer.valid || !SafeToDownload(image)) {
+	if (!transfer.valid || !image.SafeToDownload()) {
 		return false;
 	}
 	const auto range    = image.info.data;
@@ -1864,7 +1867,10 @@ bool TextureCache::IsRegionGpuModified(uint64_t address, uint64_t size) {
 	std::scoped_lock lock {m_lock};
 	for (const auto id: FindImagesInRegion(address, size, false)) {
 		const auto& image = m_slot_images[id];
-		if (!image.depth_id && image.IsGpuModified()) {
+		// PPSA17168: S_LOAD_DWORD reads shader data at an address overlapping an old
+		// render target whose memory the CPU has reused. The cached image still retains
+		// its earlier GPU-modified flag.
+		if (!image.depth_id && image.IsGpuModified() && !image.IsDefinitelyCpuDirty()) {
 			return true;
 		}
 	}
@@ -1990,7 +1996,7 @@ void TextureCache::RunGarbageCollector() {
 				continue;
 			}
 			if (owner->IsGpuModified()) {
-				const bool safe = SafeToDownload(*owner);
+				const bool safe = owner->SafeToDownload();
 				if (safe && owner->info.IsTiled()) {
 					continue;
 				}

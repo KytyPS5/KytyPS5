@@ -8,6 +8,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "kernel/pthread.h"
+#include "libs/dualSenseHaptics.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "libs/padData.h"
@@ -113,6 +114,7 @@ public:
 	void ReleaseHostPads();
 	void GetConnectionInfo(bool* flag, int* count);
 	void SetVibration(uint8_t large_motor, uint8_t small_motor);
+	int  GetActiveControllerId();
 	void SetLightBar(uint8_t r, uint8_t g, uint8_t b);
 	bool SetTriggerEffect(const PadTriggerEffectParam& param);
 	void ReadState(ControllerState* state, bool* flag, int* count);
@@ -295,6 +297,9 @@ void GameController::Connect(int id) {
 	if (id != HOST_INPUT_CONTROLLER_ID) {
 		if (auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(id));
 		    pad != nullptr) {
+			if (const auto& color = Config::GetControllerColor()) {
+				(void)SDL_SetGamepadLED(pad, (*color)[0], (*color)[1], (*color)[2]);
+			}
 			for (auto sensor: {SDL_SENSOR_ACCEL, SDL_SENSOR_GYRO}) {
 				if (SDL_GamepadHasSensor(pad, sensor) &&
 				    !SDL_SetGamepadSensorEnabled(pad, sensor, true)) {
@@ -518,6 +523,7 @@ void GameController::ResetInputState() {
 
 void GameController::ReleaseHostPads() {
 	Common::LockGuard lock(m_mutex);
+	DualSenseHaptics::Shutdown();
 
 	std::vector<SDL_Gamepad*> pads;
 	for (const auto id: m_connected_ids) {
@@ -551,6 +557,9 @@ void GameController::ReleaseHostPads() {
 
 void GameController::SetVibration(uint8_t large_motor, uint8_t small_motor) {
 	Common::LockGuard lock(m_mutex);
+	if (DualSenseHaptics::SetVibration(m_active_id, large_motor, small_motor)) {
+		return;
+	}
 
 	if (m_active_id == HOST_INPUT_CONTROLLER_ID) {
 		return;
@@ -568,8 +577,18 @@ void GameController::SetVibration(uint8_t large_motor, uint8_t small_motor) {
 	}
 }
 
+int GameController::GetActiveControllerId() {
+	Common::LockGuard lock(m_mutex);
+	return m_active_id;
+}
+
 void GameController::SetLightBar(uint8_t r, uint8_t g, uint8_t b) {
 	Common::LockGuard lock(m_mutex);
+	if (const auto& color = Config::GetControllerColor()) {
+		r = (*color)[0];
+		g = (*color)[1];
+		b = (*color)[2];
+	}
 	if (auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(m_active_id));
 	    pad != nullptr) {
 		(void)SDL_SetGamepadLED(pad, r, g, b);
@@ -690,6 +709,10 @@ void SetSensor(int id, Sensor sensor, const float* data, uint64_t time_us) {
 
 void ResetInputState() {
 	g_controller->ResetInputState();
+}
+
+int GetActiveControllerId() {
+	return g_controller != nullptr ? g_controller->GetActiveControllerId() : -1;
 }
 
 int KYTY_SYSV_ABI PadInit() {

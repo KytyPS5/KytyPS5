@@ -626,9 +626,14 @@ void DefineModule(EmitterState& state) {
 		state.builder.RequireCapability(spv::CapabilityPhysicalStorageBufferAddresses);
 		state.builder.RequireExtension("SPV_KHR_physical_storage_buffer");
 	}
-	if (state.requirements.buffer_int64_atomics) {
+	if (state.requirements.buffer_int64_atomics || state.requirements.shared_int64_atomics) {
 		state.builder.RequireCapability(spv::CapabilityInt64);
 		state.builder.RequireCapability(spv::CapabilityInt64Atomics);
+	}
+	if (state.requirements.shared_int64_atomics) {
+		state.builder.RequireVersion(0x00010400u);
+		state.builder.RequireExtension("SPV_KHR_workgroup_memory_explicit_layout");
+		state.builder.RequireCapability(spv::CapabilityWorkgroupMemoryExplicitLayoutKHR);
 	}
 	if (state.clip_distance_variable != 0) {
 		state.builder.RequireCapability(spv::CapabilityClipDistance);
@@ -684,8 +689,8 @@ void DefineModule(EmitterState& state) {
 	state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeSignedZeroInfNanPreserve,
 	                               32u);
 	if (state.requirements.float64) {
-		EXIT_NOT_IMPLEMENTED(state.program.stage != ShaderType::Compute);
-		EXIT_NOT_IMPLEMENTED(state.input_info.compute->float_mode != 0xc0);
+		EXIT_NOT_IMPLEMENTED(state.program.stage == ShaderType::Compute &&
+		                     state.input_info.compute->float_mode != 0xc0);
 		// MODE=0xc0 uses round-to-nearest-even and preserves FP64 input/output denormals.
 		state.builder.RequireCapability(spv::CapabilityFloat64);
 		state.builder.RequireCapability(spv::CapabilityRoundingModeRTE);

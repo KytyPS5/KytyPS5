@@ -1213,20 +1213,12 @@ bool TileGetRenderTargetSize(uint32_t width, uint32_t height, uint32_t pitch,
 	return true;
 }
 
-bool TileGetDccSize(uint32_t width, uint32_t height, uint32_t slices,
-                    uint32_t bytes_per_element, uint32_t levels, Prospero::TileMode tile,
-                    TileSizeAlign& total_size, uint32_t num_fragments_log2) {
-	total_size = {};
-	if (width == 0 || height == 0 || slices == 0 || levels != 1 || num_fragments_log2 != 0 ||
-	    !std::has_single_bit(bytes_per_element) || bytes_per_element > 16 ||
-	    (tile != Prospero::TileMode::kRenderTarget && tile != Prospero::TileMode::kDepth)) {
+static bool TileGetColorMetadataSize(uint32_t width, uint32_t height, uint32_t slices,
+                                      uint32_t block_width, uint32_t block_height,
+                                      TileSizeAlign& total_size) {
+	if (width == 0 || height == 0 || slices == 0) {
 		return false;
 	}
-	// Gen5 color metadata uses 4 KiB blocks, with one byte per 256 bytes of color data.
-	// Metadata stays thin for volume surfaces, so every depth slice has its own block raster.
-	const uint32_t coverage_bits = 20u - std::countr_zero(bytes_per_element);
-	const uint32_t block_width   = 1u << ((coverage_bits + 1u) / 2u);
-	const uint32_t block_height  = 1u << (coverage_bits / 2u);
 	const uint64_t blocks_x = (static_cast<uint64_t>(width) + block_width - 1u) / block_width;
 	const uint64_t blocks_y = (static_cast<uint64_t>(height) + block_height - 1u) / block_height;
 	const uint64_t blocks   = blocks_x * blocks_y;
@@ -1238,36 +1230,27 @@ bool TileGetDccSize(uint32_t width, uint32_t height, uint32_t slices,
 	return true;
 }
 
-bool TileGetRenderTargetMipLayout(uint32_t width, uint32_t height, uint32_t pitch,
-                                  uint32_t bytes_per_element, uint32_t levels,
-                                  TileSizeAlign& total_size, TileSizeOffset* level_sizes,
-                                  TilePaddedSize* padded_size) {
+bool TileGetDccSize(uint32_t width, uint32_t height, uint32_t slices,
+                    uint32_t bytes_per_element, uint32_t levels, Prospero::TileMode tile,
+                    TileSizeAlign& total_size, uint32_t num_fragments_log2) {
 	total_size = {};
-	if (width == 0 || height == 0 || levels == 0 || levels > 16 ||
-	    pitch != TileGetRenderTargetPitch(width, bytes_per_element)) {
+	if (levels != 1 || num_fragments_log2 != 0 ||
+	    !std::has_single_bit(bytes_per_element) || bytes_per_element > 16 ||
+	    (tile != Prospero::TileMode::kRenderTarget && tile != Prospero::TileMode::kDepth)) {
 		return false;
 	}
-	uint32_t max_levels    = 1;
-	uint32_t max_dimension = std::max(width, height);
-	while (max_dimension > 1) {
-		max_dimension >>= 1u;
-		max_levels++;
-	}
-	if (levels > max_levels) {
-		return false;
-	}
-	auto format = Prospero::BufferFormat::kInvalid;
-	switch (bytes_per_element) {
-		case 1: format = Prospero::BufferFormat::k8UNorm; break;
-		case 2: format = Prospero::BufferFormat::k16UNorm; break;
-		case 4: format = Prospero::BufferFormat::k32Float; break;
-		case 8: format = Prospero::BufferFormat::k16_16_16_16Float; break;
-		case 16: format = Prospero::BufferFormat::k32_32_32_32Float; break;
-		default: return false;
-	}
-	TileGetTextureSize(format, width, height, levels, Prospero::TileMode::kRenderTarget,
-	                   &total_size, level_sizes, padded_size);
-	return total_size.size != 0 && total_size.align == 65536;
+	// Gen5 DCC uses 4 KiB blocks, with one byte per 256 bytes of color data.
+	// Metadata stays thin for volume surfaces, so every depth slice has its own block raster.
+	const uint32_t coverage_bits = 20u - std::countr_zero(bytes_per_element);
+	return TileGetColorMetadataSize(width, height, slices, 1u << ((coverage_bits + 1u) / 2u),
+	                                1u << (coverage_bits / 2u), total_size);
+}
+
+bool TileGetCmaskSize(uint32_t width, uint32_t height, uint32_t slices, uint32_t levels,
+                      TileSizeAlign& total_size) {
+	total_size = {};
+	// Gen5 CMASK stores four bits per 8x8 tile in 4 KiB blocks covering 1024x512 pixels.
+	return levels == 1 && TileGetColorMetadataSize(width, height, slices, 1024, 512, total_size);
 }
 
 void TileGetTextureSize(Prospero::BufferFormat format, uint32_t width, uint32_t height,

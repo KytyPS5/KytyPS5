@@ -1,3 +1,4 @@
+#include "common/archive.h"
 #include "common/common.h"
 #include "common/dateTime.h"
 #include "common/debug.h"
@@ -10,6 +11,7 @@
 
 #include <charconv>
 #include <cstdio>
+#include <filesystem>
 #include <string_view>
 #include <vector>
 #include <fmt/format.h>
@@ -40,9 +42,9 @@ static std::string GetBuildString() {
 
 static void PrintUsage() {
 	::printf("%s\n", GetBuildString().c_str());
-	::printf("kyty_emulator --game <dir|elf> [options]\n\n");
+	::printf("kyty_emulator --game <dir|elf|zar> [options]\n\n");
 	::printf("Options:\n");
-	::printf("  --game <dir|elf>                     Game directory or ELF to load.\n");
+	::printf("  --game <dir|elf|zar>                 Game directory, ELF, or ZArchive to load.\n");
 	::printf("  --game-patch <json>                  ETAHen cheat file.\n");
 	::printf("  --screen-width <num>                 Window width. Default: 1280.\n");
 	::printf("  --screen-height <num>                Window height. Default: 720.\n");
@@ -51,6 +53,7 @@ static void PrintUsage() {
 	::printf("  --user-id <num>                      Local user ID. Default: %d.\n",
 	         Config::DEFAULT_USER_ID);
 	::printf("  --mic <name>                        Capture from this microphone; omit for silence.\n");
+	::printf("  --controller-color <#RRGGBB>        Override the controller lightbar color.\n");
 	::printf(
 	    "  --present-mode <value>               Fifo, Mailbox, or Immediate. Default: Mailbox.\n");
 	::printf(
@@ -140,6 +143,20 @@ static bool ParseUint32(const std::string& value, uint32_t& out) {
 		return false;
 	}
 	out = number;
+	return true;
+}
+
+static bool ParseControllerColor(const std::string& value, Config::ControllerColor& out) {
+	if (value.size() != 7 || value[0] != '#') {
+		return false;
+	}
+	uint32_t rgb = 0;
+	auto [end, error] = std::from_chars(value.data() + 1, value.data() + value.size(), rgb, 16);
+	if (error != std::errc {} || end != value.data() + value.size()) {
+		return false;
+	}
+	out = {static_cast<uint8_t>(rgb >> 16), static_cast<uint8_t>(rgb >> 8),
+	       static_cast<uint8_t>(rgb)};
 	return true;
 }
 
@@ -234,11 +251,19 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				return false;
 			}
 
-			value = Common::FixFilenameSlash(value);
+			value           = Common::FixFilenameSlash(value);
 			const auto path = Common::PathFromUtf8(value);
 
 			if (Common::File::IsDirectoryExisting(path)) {
 				options.app0_dir = path;
+				options.elf      = "/app0/eboot.bin";
+			} else if (Common::IsSupportedArchive(path) && Common::File::IsFileExisting(path)) {
+				const auto root = Common::MakeArchivePath(path);
+				if (!Common::File::IsFileExisting(root / "eboot.bin")) {
+					::printf("Archive does not contain eboot.bin: %s\n", value.c_str());
+					return false;
+				}
+				options.app0_dir = root;
 				options.elf      = "/app0/eboot.bin";
 			} else if (Common::File::IsFileExisting(path)) {
 				options.app0_dir = path.parent_path();
@@ -249,7 +274,8 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 
 				options.elf = std::filesystem::path("/app0") / path.filename();
 			} else {
-				::printf("--game must point to an existing directory or ELF: %s\n", value.c_str());
+				::printf("--game must point to an existing directory, ELF, or archive: %s\n",
+				         value.c_str());
 				return false;
 			}
 		} else if (arg == "--game-patch") {
@@ -291,6 +317,13 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 			}
 		} else if (arg == "--mic") {
 			options.config.audio_input_device = value;
+		} else if (arg == "--controller-color") {
+			Config::ControllerColor color {};
+			if (!ParseControllerColor(value, color)) {
+				::printf("invalid controller color (expected #RRGGBB): %s\n", value.c_str());
+				return false;
+			}
+			options.config.controller_color = color;
 		} else if (arg == "--present-mode") {
 			if (!ParseEnum(value, options.config.present_mode)) {
 				::printf("invalid present mode: %s\n", value.c_str());

@@ -15,6 +15,8 @@ LIB_DEFINE(InitVideoOut_1) {
 
 	LIB_FUNC("Up36PTk687E", VideoOut::VideoOutOpen);
 	LIB_FUNC("uquVH4-Du78", VideoOut::VideoOutClose);
+	LIB_FUNC("WkYtyOg30do", VideoOut::VideoOutSetFlipMaster);
+	LIB_FUNC("MBlv8YWoyOk", VideoOut::VideoOutAddBufferAttributeOption);
 	LIB_FUNC("PjS5uASwcV8", VideoOut::VideoOutSetBufferAttribute2);
 	LIB_FUNC("rKBUtgRrtbk", VideoOut::VideoOutRegisterBuffers2);
 	LIB_FUNC("HuViW4HnrOw", VideoOut::VideoOutSubmitChangeBufferAttribute2);

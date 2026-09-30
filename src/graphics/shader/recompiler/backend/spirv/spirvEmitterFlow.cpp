@@ -19,6 +19,15 @@ bool UserDataDwordIndex(const EmitterState& state, IR::ScalarReg reg, uint32_t& 
 	return true;
 }
 
+uint32_t EmitCenterBarycentrics(EmitterState& state, uint32_t variable) {
+	const auto coordinates = state.builder.AllocateId();
+	const auto offset      = state.builder.Constant(spv::OpConstantNull, TypeF32Vector(state, 2));
+	state.builder.RequireCapability(spv::CapabilityInterpolationFunction);
+	state.builder.AddFunction(spv::OpExtInst, TypeF32Vector(state, 3), coordinates,
+	                          GlslStd450(state), GLSLstd450InterpolateAtOffset, variable, offset);
+	return coordinates;
+}
+
 uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t component) {
 	if (kind == IR::StageInputKind::LocalInvocationIndex) {
 		return EmitLocalInvocationIndex(state);
@@ -77,6 +86,7 @@ uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t c
 		return bits;
 	}
 	if (centroid || kind == IR::StageInputKind::BaryCoordSmooth ||
+	    kind == IR::StageInputKind::BaryCoordSmoothSample ||
 	    kind == IR::StageInputKind::BaryCoordNoPerspective) {
 		const auto value   = state.builder.AllocateId();
 		const auto bits    = state.builder.AllocateId();
@@ -85,6 +95,12 @@ uint32_t EmitBuiltinU32(EmitterState& state, IR::StageInputKind kind, uint32_t c
 			state.builder.RequireCapability(spv::CapabilityInterpolationFunction);
 			state.builder.AddFunction(spv::OpExtInst, TypeF32Vector(state, 3), coordinates,
 			                          GlslStd450(state), GLSLstd450InterpolateAtCentroid, variable);
+			state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), value,
+			                          coordinates, component + 1u);
+		} else if (kind == IR::StageInputKind::BaryCoordSmooth &&
+		           (state.input_info.pixel->ps_sample_shading ||
+		            InputVariableForKind(state, IR::StageInputKind::BaryCoordSmoothSample) != 0)) {
+			const auto coordinates = EmitCenterBarycentrics(state, variable);
 			state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), value,
 			                          coordinates, component + 1u);
 		} else {
@@ -170,16 +186,26 @@ uint32_t EmitAttribute(EmitterState& state, uint32_t attr, uint32_t chan) {
 		const auto barycentric_kind = state.input_info.pixel->ps_no_perspective
 		                                  ? IR::StageInputKind::BaryCoordNoPerspective
 		                                  : IR::StageInputKind::BaryCoordSmooth;
-		const auto barycentric      = InputVariableForKind(state, barycentric_kind);
-		uint32_t   sum              = 0;
+		const auto barycentric        = InputVariableForKind(state, barycentric_kind);
+		uint32_t   center_coordinates = 0;
+		if (barycentric_kind == IR::StageInputKind::BaryCoordSmooth &&
+		    InputVariableForKind(state, IR::StageInputKind::BaryCoordSmoothSample) != 0) {
+			center_coordinates = EmitCenterBarycentrics(state, barycentric);
+		}
+		uint32_t sum = 0;
 		for (uint32_t vertex = 0; vertex < 3u; vertex++) {
-			const auto pointer = state.builder.AllocateId();
 			const auto weight  = state.builder.AllocateId();
 			const auto product = state.builder.AllocateId();
-			state.builder.AddFunction(spv::OpAccessChain,
-			                          TypePointer(state, spv::StorageClassInput, TypeF32(state)),
-			                          pointer, barycentric, ConstantU32(state, vertex));
-			state.builder.AddFunction(spv::OpLoad, TypeF32(state), weight, pointer);
+			if (center_coordinates != 0) {
+				state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), weight,
+				                          center_coordinates, vertex);
+			} else {
+				const auto pointer = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpAccessChain,
+				                          TypePointer(state, spv::StorageClassInput, TypeF32(state)),
+				                          pointer, barycentric, ConstantU32(state, vertex));
+				state.builder.AddFunction(spv::OpLoad, TypeF32(state), weight, pointer);
+			}
 			state.builder.AddFunction(spv::OpFMul, TypeF32(state), product, load_per_vertex(vertex),
 			                          weight);
 			if (vertex == 0u) {

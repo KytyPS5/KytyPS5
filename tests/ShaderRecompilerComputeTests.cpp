@@ -1344,6 +1344,8 @@ struct GraphicsCase {
   bool pixel_position_w = false;
   float vertex_clip_w = 1.0f;
   bool pixel_depth_export = false;
+  u32 pixel_perspective_sample_vgpr = UINT32_MAX;
+  u32 pixel_perspective_center_vgpr = UINT32_MAX;
   u32 pixel_perspective_centroid_vgpr = UINT32_MAX;
   u32 pixel_custom_interpolation_mask = 0;
 };
@@ -1761,6 +1763,12 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
   pixel_info.ps_pos_w = test.pixel_position_w;
   pixel_info.ps_depth_export_enable = test.pixel_depth_export;
   pixel_info.ps_system_input_base = 2;
+  pixel_info.ps_perspective_sample_vgpr = test.pixel_perspective_sample_vgpr;
+  pixel_info.ps_sample_shading = test.pixel_perspective_sample_vgpr != UINT32_MAX;
+  pixel_info.ps_perspective_center_vgpr = test.pixel_perspective_center_vgpr;
+  if (pixel_info.ps_perspective_center_vgpr != UINT32_MAX) {
+    pixel_info.ps_system_input_base = pixel_info.ps_perspective_center_vgpr + 2;
+  }
   pixel_info.ps_perspective_centroid_vgpr = test.pixel_perspective_centroid_vgpr;
   pixel_info.custom_interpolation_mask = test.pixel_custom_interpolation_mask;
   for (u32 i = 0; i < std::size(pixel_info.interpolator_settings); i++) {
@@ -16485,6 +16493,11 @@ public:
 
   std::vector<u32> RenderFragment(const GraphicsCase &test,
                                   const CompiledShader &fragment) {
+    if (test.pixel_perspective_sample_vgpr != UINT32_MAX) {
+      Require(test.name, "sample positions",
+              m_physical_device.getProperties().limits.standardSampleLocations,
+              "sample barycentric fixture requires standard sample locations");
+    }
     const auto vertex_spirv =
         TestSpv::MakePassthroughVertexSpirv(test.layers > 1, test.vertex_clip_w);
     ValidateSpirv(test.name, vertex_spirv);
@@ -16606,6 +16619,8 @@ public:
     vk::PipelineMultisampleStateCreateInfo multisample{};
     multisample.sType = vk::StructureType::ePipelineMultisampleStateCreateInfo;
     multisample.rasterizationSamples = test.samples;
+    multisample.sampleShadingEnable = test.pixel_perspective_sample_vgpr != UINT32_MAX;
+    multisample.minSampleShading = 1.0f;
 
     vk::PipelineColorBlendAttachmentState color_attachment{};
     color_attachment.colorWriteMask =
@@ -34580,6 +34595,43 @@ GraphicsCase GraphicsPositionWExport() {
   return test;
 }
 
+GraphicsCase GraphicsPerspectiveSampleInputs(bool center, bool sample = true) {
+  GraphicsCase test;
+  test.name = center ? "GraphicsPerspectiveSampleCenter" : "GraphicsPerspectiveSample";
+  if (!sample) {
+    test.name = "GraphicsPerspectiveUnusedSample";
+  }
+  test.samples = vk::SampleCountFlagBits::e4;
+  test.pixel_perspective_sample_vgpr = 0;
+  test.pixel_perspective_center_vgpr = center ? 2u : UINT32_MAX;
+  for (u32 component = 0; component < 4; component++) {
+    u32 source = component % 2u;
+    if (center && (component >= 2u || !sample)) {
+      source += 2u;
+    }
+    test.fragment_code.push_back(EncodeVop2(0x08, 12 + component, Vgpr(source), source));
+  }
+  test.fragment_code.push_back(EncodeExp0(0x00, 0xf));
+  test.fragment_code.push_back(EncodeExp1(12, 13, 14, 15));
+  AppendEnd(&test.fragment_code);
+  test.vertices = {
+      0xbf800000u, 0xbf800000u, 0, 0, 0, 0,
+      0x40e00000u, 0xbf800000u, 0, 0, 0, 0,
+      0xbf800000u, 0x40400000u, 0, 0, 0, 0};
+  // Center I/J are (1/8, 1/4). Standard 4x samples have mean x^2=y^2=21/64.
+  test.expected_pixel = {sample ? 0x3ca80000u : 0x3c800000u,
+                         sample ? 0x3da80000u : 0x3d800000u,
+                         center ? 0x3c800000u : 0x3ca80000u,
+                         center ? 0x3d800000u : 0x3da80000u};
+  test.opcodes = {ShaderOpcode::V_MUL_F32, ShaderOpcode::EXP, ShaderOpcode::S_ENDPGM};
+  if (sample) {
+    test.required_spirv = {"SampleRateShading", "OpDecorate %gl_BaryCoordSampleKHR Sample"};
+  } else {
+    test.required_spirv = {"InterpolateAtOffset"};
+  }
+  return test;
+}
+
 GraphicsCase GraphicsPackedHalfCentroid() {
   GraphicsCase test;
   test.name = "GraphicsPackedHalfCentroid";
@@ -35471,6 +35523,9 @@ std::vector<GraphicsCase> MakeGraphicsCases() {
   return {
       GraphicsInterpolationExport(),
       GraphicsPositionWExport(),
+      GraphicsPerspectiveSampleInputs(false),
+      GraphicsPerspectiveSampleInputs(true),
+      GraphicsPerspectiveSampleInputs(true, false),
       GraphicsPackedHalfCentroid(),
       GraphicsPackedHalfInputAlias(false),
       GraphicsPackedHalfInputAlias(true),
@@ -40775,6 +40830,13 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--centroid-only") == 0) {
     VulkanHarness vulkan;
     RunGraphicsCase(&vulkan, GraphicsPackedHalfCentroid());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--perspective-sample-only") == 0) {
+    VulkanHarness vulkan;
+    RunGraphicsCase(&vulkan, GraphicsPerspectiveSampleInputs(false));
+    RunGraphicsCase(&vulkan, GraphicsPerspectiveSampleInputs(true));
+    RunGraphicsCase(&vulkan, GraphicsPerspectiveSampleInputs(true, false));
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--pixel-alias-only") == 0) {

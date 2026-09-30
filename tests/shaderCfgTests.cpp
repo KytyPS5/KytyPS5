@@ -6524,17 +6524,49 @@ void TestCustomVintrpMovTranslation() {
   Check(SpirvHasDecorationValue(mixed_linear_result.spirv, 11u, 5287u),
         "mixed linear input did not use BaryCoordNoPerspKHR");
   CheckSpirvBinaryValidates(mixed_linear_result.spirv);
+
+  std::vector<uint32_t> mixed_sample_shader(std::begin(mixed_shader), std::end(mixed_shader));
+  mixed_sample_shader[mixed_sample_shader.size() - 3] = EncodeExp0(0x00, 0x7);
+  mixed_sample_shader[mixed_sample_shader.size() - 2] = EncodeExp1(14, 0, 1, 0);
+  mixed_ps_info.ps_no_perspective = false;
+  mixed_ps_info.ps_system_input_base = 2;
+  mixed_ps_info.ps_perspective_sample_vgpr = 0;
+  mixed_ps_info.ps_sample_shading = true;
+  const auto mixed_sample_result = RecompileForTest(mixed_sample_shader, options);
+  const auto mixed_sample_source = DisassembleSpirvBinary(mixed_sample_result.spirv);
+  Check(SpirvHasDecorationValueWithDecoration(mixed_sample_result.spirv, 30u, 0u, 5285u) &&
+            SpirvDecorationValueCount(mixed_sample_result.spirv, 11u, 5286u) == 1u &&
+            SpirvHasDecorationValueWithDecoration(mixed_sample_result.spirv, 11u, 5286u, 17u) &&
+            SpirvSourceHasInstructionUsing(mixed_sample_source, "InterpolateAtOffset",
+                                         "%gl_BaryCoordSampleKHR") &&
+            SpirvInstructionOpcodeCount(mixed_sample_result.spirv, 133u) == 3u,
+        "per-vertex interpolation lost center weights alongside sample VGPRs");
+  CheckSpirvBinaryValidates(mixed_sample_result.spirv);
 }
 
-void TestPerspectiveCentroidInputs() {
-  constexpr std::array cases{std::array{4u, UINT32_MAX, 0u},
-                             std::array{5u, UINT32_MAX, 2u},
-                             std::array{6u, 0u, 2u}, std::array{7u, 2u, 4u}};
-  for (const auto &[inputs, center, centroid] : cases) {
-    const uint32_t other = center == UINT32_MAX ? centroid : center;
-    const std::vector<uint32_t> shader = {
-        EncodeExp0(0x00, 0xf), EncodeExp1(centroid, centroid + 1, other, other + 1),
-        EncodeSopp(0x01)};
+void TestPerspectiveInputs() {
+  using ShaderRecompiler::IR::StageInputKind;
+  constexpr std::array cases{std::array{1u, 0u, UINT32_MAX, UINT32_MAX},
+                             std::array{2u, UINT32_MAX, 0u, UINT32_MAX},
+                             std::array{3u, 0u, 2u, UINT32_MAX},
+                             std::array{4u, UINT32_MAX, UINT32_MAX, 0u},
+                             std::array{5u, 0u, UINT32_MAX, 2u},
+                             std::array{6u, UINT32_MAX, 0u, 2u},
+                             std::array{7u, 0u, 2u, 4u}};
+  for (const auto &[inputs, sample, center, centroid] : cases) {
+    const bool has_sample = sample != UINT32_MAX;
+    const bool has_center = center != UINT32_MAX;
+    const bool has_centroid = centroid != UINT32_MAX;
+    const std::array pairs{sample, center, centroid};
+    std::vector<uint32_t> shader;
+    uint32_t target = 0;
+    for (const auto pair : pairs) {
+      if (pair != UINT32_MAX) {
+        shader.push_back(EncodeExp0(target++, 0xf));
+        shader.push_back(EncodeExp1(pair, pair + 1, pair, pair + 1));
+      }
+    }
+    shader.push_back(EncodeSopp(0x01));
     HW::PixelShaderInfo regs{};
     regs.ps_regs.data_addr = reinterpret_cast<uint64_t>(shader.data());
     ShaderMappedData mapped{};
@@ -6545,31 +6577,64 @@ void TestPerspectiveCentroidInputs() {
     const std::array<Prospero::ColorComponentMapping, 8> mappings{};
     ShaderPixelInputInfo pixel{};
     (void)PrepareProgram(regs, sh, mappings, pixel);
-    Check(pixel.ps_perspective_centroid_vgpr == centroid &&
+    Check(pixel.ps_perspective_sample_vgpr == sample &&
+              pixel.ps_perspective_centroid_vgpr == centroid &&
               pixel.ps_perspective_center_vgpr == center &&
-              pixel.ps_system_input_base == centroid + 2,
-          "perspective-centroid pair did not follow enabled sample/center inputs");
+              pixel.ps_system_input_base == 2u * std::popcount(inputs),
+          "perspective pairs did not follow enabled sample/center/centroid inputs");
     const auto key = MakeStageStaticKey(pixel);
-    pixel.ps_perspective_centroid_vgpr = UINT32_MAX;
-    Check(key != MakeStageStaticKey(pixel), "centroid input is missing from shader key");
-    pixel.ps_perspective_centroid_vgpr = centroid;
+    for (auto *input : {&pixel.ps_perspective_sample_vgpr,
+                        &pixel.ps_perspective_center_vgpr,
+                        &pixel.ps_perspective_centroid_vgpr}) {
+      if (*input != UINT32_MAX) {
+        const auto saved = *input;
+        *input = UINT32_MAX;
+        Check(key != MakeStageStaticKey(pixel),
+              "perspective input is missing from shader key");
+        *input = saved;
+      }
+    }
     auto options = MakeCompileOptions(ShaderType::Pixel);
     options.input_info.pixel = &pixel;
     const auto result = RecompileForTest(shader, options);
     const auto source = DisassembleSpirvBinary(result.spirv);
-    Check(SpirvContainsCapability(result.spirv, 52u) &&
-              SpirvHasDecorationValue(result.spirv, 11u, 5286u) &&
-              (source.find("InterpolateAtCentroid %gl_BaryCoordKHR") != std::string::npos) &&
-              SpirvSourceHasInstructionUsing(source, "OpCompositeExtract", " 1") &&
-              SpirvSourceHasInstructionUsing(source, "OpCompositeExtract", " 2"),
-          "centroid I/J did not evaluate BaryCoordKHR Y/Z at the centroid");
+    Check(ProgramHasInput(result.program, StageInputKind::BaryCoordSmoothSample) == has_sample &&
+              ProgramHasInput(result.program, StageInputKind::BaryCoordSmooth) ==
+                  (has_center || has_centroid),
+          "sample and center/centroid inputs did not retain distinct IR kinds");
+    Check(SpirvContainsCapability(result.spirv, 5284u) &&
+              SpirvDecorationValueCount(result.spirv, 11u, 5286u) == 1u,
+          "perspective inputs must share exactly one barycentric builtin");
+    Check(SpirvHasDecorationValueWithDecoration(result.spirv, 11u, 5286u, 17u) ==
+              has_sample && SpirvContainsCapability(result.spirv, 35u) == has_sample,
+          "sample I/J did not request Sample interpolation and SampleRateShading");
+    if (has_centroid) {
+      Check(SpirvContainsCapability(result.spirv, 52u) &&
+                SpirvContainsExtInst(result.spirv, 76u) &&
+                SpirvSourceHasInstructionUsing(source, "OpCompositeExtract", " 1") &&
+                SpirvSourceHasInstructionUsing(source, "OpCompositeExtract", " 2"),
+            "centroid I/J did not evaluate BaryCoordKHR Y/Z at the centroid");
+    }
     Check(!SpirvHasDecorationValueWithDecoration(result.spirv, 11u, 5286u, 16u),
           "centroid input changed the shared center builtin's interpolation location");
-    if (center != UINT32_MAX) {
-      Check(SpirvSourceHasInstructionUsing(source, "OpLoad", "%float "),
-            "center pair lost its ordinary barycentric loads when centroid was enabled");
-    }
     CheckSpirvBinaryValidates(result.spirv);
+    if (has_sample && has_center) {
+      Check(SpirvContainsCapability(result.spirv, 52u) &&
+                SpirvSourceHasInstructionUsing(source, "InterpolateAtOffset",
+                                             "%gl_BaryCoordSampleKHR") &&
+                SpirvSourceHasInstructionUsing(source, "OpConstantNull", "%v2float"),
+            "center I/J did not interpolate at offset zero alongside sample I/J");
+      const uint32_t center_shader[] = {
+          EncodeExp0(0x00, 0xf), EncodeExp1(center, center + 1, center, center + 1),
+          EncodeSopp(0x01)};
+      const auto center_result = RecompileForTest(center_shader, options);
+      Check(!ProgramHasInput(center_result.program, StageInputKind::BaryCoordSmoothSample) &&
+                !SpirvContainsCapability(center_result.spirv, 35u) &&
+                !SpirvHasDecorationValueWithDecoration(center_result.spirv, 11u, 5286u, 17u) &&
+                SpirvContainsExtInst(center_result.spirv, 78u),
+            "unused sample VGPRs changed center input interpolation");
+      CheckSpirvBinaryValidates(center_result.spirv);
+    }
   }
 }
 
@@ -14892,10 +14957,16 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
 } // namespace
 } // namespace Libs::Graphics
 
-int main() {
+int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
   EnsureConfigInitialized();
+  if (argc == 2 && std::strcmp(argv[1], "--perspective-inputs-only") == 0) {
+    TestCustomVintrpMovTranslation();
+    TestPerspectiveInputs();
+    return 0;
+  }
+  Check(argc == 1, "unknown test selector");
   TestRayTracingInstructions();
   TestResourceDescriptorClassification();
   TestShaderBufferResourceSize();
@@ -15057,7 +15128,7 @@ int main() {
   TestNewShaderRecompilerNativeBindingPlan();
   TestNewShaderRecompilerStageInputInfo();
   TestCustomVintrpMovTranslation();
-  TestPerspectiveCentroidInputs();
+  TestPerspectiveInputs();
   TestGraphicsCreateInterpolantMapping();
   TestNewShaderRecompilerPixelPipelineEntry();
   TestComputeLdsAllocationIdentity();

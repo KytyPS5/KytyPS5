@@ -19721,7 +19721,7 @@ public:
     const bool packed_vertex_color = color_format != Prospero::BufferFormat::k32_32_32_32Float;
     const uint32_t extent = depth_feedback ? 8 : 32;
     constexpr uintptr_t depth_address = 0x0000000204400000ull;
-    constexpr uint64_t allocation_size = 0x40000;
+    constexpr uint64_t allocation_size = 0x80000;
     constexpr uint64_t rect_address = depth_address + 0x8000;
     constexpr uint64_t index_address = rect_address + 0x1000;
     EnsureRuntimeContext();
@@ -21087,6 +21087,54 @@ public:
         check_rect(rect_name, true);
       }
 
+      // RE9's GPU-driven draws, empty but unknowably so, keep a depth register over a colour surface.
+      constexpr uint64_t alias_address = depth_address + 0x40000;
+      const auto alias_surface = [&] {
+        HW::DepthRenderTarget alias{};
+        alias.z_info.format = Prospero::DepthFormat::kZ32F;
+        alias.z_read_base_addr = alias.z_write_base_addr = alias_address;
+        alias.size = {static_cast<uint16_t>(extent - 1), static_cast<uint16_t>(extent - 1),
+                      true};
+        registers.SetDepthRenderTarget(alias);
+        registers.SetDepthControl({.z_enable = true, .z_write_enable = true,
+                                   .zfunc = static_cast<uint8_t>(vk::CompareOp::eAlways)});
+        RenderDepthInfo resolved{};
+        RenderExecutorTestAccess::ResolveRenderDepthTarget(executor, scheduler.Current(),
+                                                           resolved);
+        // A compute binding of the same bytes as a single-channel colour surface.
+        auto surface = resolved.desc;
+        surface.type = BindingType::Storage;
+        surface.info.pixel_format = vk::Format::eR32Sfloat;
+        surface.view_info.format = surface.info.pixel_format;
+        surface.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+        surface.view_info.usage = vk::ImageUsageFlagBits::eStorage;
+        return surface;
+      };
+      const auto alias_owner_is_depth = [&] {
+        for (const auto id : TextureCacheTestAccess::FindImages(cache, alias_address, 0x10000,
+                                                                false)) {
+          const auto *owner = TextureCacheTestAccess::Owner(cache, id);
+          if (owner != nullptr && owner->registered && !owner->dormant) {
+            return owner->info.IsDepth();
+          }
+        }
+        return false;
+      };
+      const auto alias_round_trips = [&](const char *case_name, const auto &draw_empty) {
+        auto surface = alias_surface();
+        for (u32 frame = 0; frame < 6; frame++) {
+          draw_empty();
+          Require(case_name, "empty draw binds its stale depth target", alias_owner_is_depth(),
+                  "the fixture no longer recreates the depth image, so it proves nothing");
+          Require(case_name, "colour binding takes the surface back",
+                  !cache.GetImage(cache.FindImage(surface)).info.IsDepth(),
+                  "the colour binding did not displace the depth image");
+          scheduler.Finish();
+        }
+        registers.SetDepthControl({});
+        registers.SetDepthRenderTarget({});
+      };
+
       // GPU-written arguments are read on the GPU, never drained; a zero count draws nothing.
       if (m_draw_indirect_supported) {
         constexpr const char *indirect_name = "GpuIndirectRectList";
@@ -21189,6 +21237,46 @@ public:
                 "an empty indirect draw bound its stale depth target and created an image");
         registers.SetDepthControl({});
         registers.SetDepthRenderTarget({});
+
+        // A drawing record over the aliased address renders there, and the colour binding sees it.
+        {
+          auto surface = alias_surface();
+          vk::ClearValue one{};
+          one.color = vk::ClearColorValue(std::array<float, 4>{1.0f, 1.0f, 1.0f, 1.0f});
+          TextureCacheTestAccess::ClearImage(cache, scheduler.Current(),
+                                             cache.FindImage(surface),
+                                             {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, one);
+          Require(indirect_name, "aliased depth draw",
+                  RenderExecutorTestAccess::DrawIndirect(executor, scheduler.Current(),
+                                                         {.args_addr = args_address}) ==
+                      IndirectDrawResult::Drawn,
+                  "a drawing record over an aliased depth target fell back to the CPU");
+          const auto aliased = ReadCachedTexel(indirect_name, context, cache.FindImage(surface),
+                                               {}, {extent, extent, 1});
+          for (u32 y = 0; y < extent; y++) {
+            for (u32 x = 0; x < extent; x++) {
+              const bool inside = x >= 4 && x < 28 && y >= 4 && y < 28;
+              Require(indirect_name, "aliased depth written by the draw",
+                      aliased[y * extent + x] == (inside ? 0u : 0x3f800000u),
+                      "the colour binding lost the depth the draw wrote, or the depth image "
+                      "did not start from the colour surface");
+            }
+          }
+          registers.SetDepthControl({});
+          registers.SetDepthRenderTarget({});
+        }
+        // Empty GPU-written records over the same address, frame after frame.
+        constexpr uint64_t gpu_empty_address = args_address + 0x40;
+        (void)buffers.ObtainBuffer(gpu_empty_address, sizeof(empty_record), true);
+        buffers.CopyBuffer(gpu_empty_address, empty_address, sizeof(empty_record), false, false);
+        alias_round_trips("GpuIndirectAliasedDepth", [&] {
+          Require(indirect_name, "empty GPU-written record",
+                  RenderExecutorTestAccess::DrawIndirect(executor, scheduler.Current(),
+                                                         {.args_addr = gpu_empty_address}) ==
+                          IndirectDrawResult::Drawn &&
+                      buffers.IsRegionGpuModified(gpu_empty_address, sizeof(empty_record)),
+                  "an empty GPU-written indirect draw fell back to the CPU or drained");
+        });
         // A count bound past the mapping is trimmed rather than sent to the CPU.
         clear_rect();
         Require(indirect_name, "count bound past the mapping",
@@ -21231,8 +21319,10 @@ public:
         }
         scheduler.Begin(registers, user_config, shaders);
         BufferCacheTestAccess::DrainBuffer(buffers, args_address, sizeof(records));
+        BufferCacheTestAccess::DrainBuffer(buffers, gpu_empty_address, sizeof(empty_record));
         std::printf("[gpu]     %-32s ok\n", indirect_name);
       }
+
       // Captured format30 uses uncompressed mode9 at MRT2. Keep a blended
       // floating-point MRT live beside it, including sparse export routing.
       constexpr uint64_t packed_address = depth_address + 0x28000;
@@ -23349,8 +23439,7 @@ private:
       DestroyBuffer(&m_bda_pagetable_buffer);
       if (m_runtime_context.allocator != nullptr) {
         m_renderer.reset();
-        vmaDestroyAllocator(m_runtime_context.allocator);
-        m_runtime_context.allocator = nullptr;
+        m_runtime_context.DestroyAllocator();
       }
       if (m_command_pool != nullptr) {
         m_device.destroyCommandPool(m_command_pool, nullptr);

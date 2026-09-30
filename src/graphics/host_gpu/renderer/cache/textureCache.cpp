@@ -2476,6 +2476,10 @@ void TextureCache::RunGarbageCollector(bool per_frame) {
 	m_gc_frame = gc_frame;
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
+		// Idle pooled images go before any live one does.
+		if (m_total_used_memory >= m_pressure_gc_memory && m_graphics.TrimImagePool() != 0) {
+			m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
+		}
 	}
 	FreePublishedEvictions();
 	if (m_total_used_memory < m_trigger_gc_memory) {

@@ -4438,6 +4438,9 @@ public:
                       sizeof(guest));
           return guest == expected;
         };
+        // This fork reads back GPU-written linear images by default; these cases
+        // are about storage readback alone until they turn linear readback on.
+        TextureCacheTestAccess::SetLinearReadback(texture_cache, false);
         const auto off_image = shader_write(storage_off_address);
         Require("GpuCommandLane", "storage readback off",
                 !TextureCacheTestAccess::PendingDownload(texture_cache,

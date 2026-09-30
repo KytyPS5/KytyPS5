@@ -220,6 +220,7 @@ static constexpr Flag FLAGS[] = {
     {"--profile", &ConfigOptions::profiler_enabled},
     {"--spirv-debug-printf", &ConfigOptions::spirv_debug_printf_enabled},
     {"--readback-linear-images", &ConfigOptions::readback_linear_images},
+    {"--no-readback-linear-images", &ConfigOptions::readback_linear_images, false},
     {"--readback-tiled-images", &ConfigOptions::readback_tiled_images},
     {"--readback-storage-images", &ConfigOptions::readback_storage_images},
     {"--sync-raw-image-buffers", &ConfigOptions::sync_raw_image_buffers},

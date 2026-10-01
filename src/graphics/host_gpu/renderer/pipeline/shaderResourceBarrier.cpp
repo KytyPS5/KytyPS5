@@ -90,7 +90,7 @@ vk::BufferMemoryBarrier MakeGdsDependency(vk::Buffer buffer) {
 bool HasShaderBufferWrites(const ShaderStageRuntime& runtime) {
 	EXIT_IF(!runtime);
 	const auto& program   = *runtime.program;
-	const auto& resources = runtime.resources;
+	const auto& resources = *runtime.resources;
 	EXIT_IF(resources.buffers.size() != program.info.buffers.size());
 	bool has_writes = false;
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {

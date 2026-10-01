@@ -3,9 +3,19 @@
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
 
-#include <SDL_stdinc.h>
+#include <SDL3/SDL_stdinc.h>
 #include <array>
 #include <cstring>
+
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace Libs {
 
@@ -213,6 +223,54 @@ static int KYTY_SYSV_ABI CesMbcsUcsContextInit(CesContext* context, const CesPro
 	return 0;
 }
 
+#if defined(_WIN32)
+
+static size_t ConvertCp932ToUtf8(const char** inbuf, size_t* inbytesleft, char** outbuf,
+                                 size_t* outbytesleft) {
+	const auto* in = reinterpret_cast<const uint8_t*>(*inbuf);
+	while (*inbytesleft != 0) {
+		const uint8_t lead = in[0];
+		// Win32 accepts 0x80 as U+0080; the SJis1997 profile rejects this byte.
+		if (lead == 0x80) {
+			*inbuf = reinterpret_cast<const char*>(in);
+			return SDL_ICONV_EILSEQ;
+		}
+		const bool is_lead_byte = (lead >= 0x81 && lead <= 0x9f) || (lead >= 0xe0 && lead <= 0xfc);
+		const size_t char_len   = is_lead_byte ? 2 : 1;
+		if (*inbytesleft < char_len) {
+			*inbuf = reinterpret_cast<const char*>(in);
+			return SDL_ICONV_EINVAL;
+		}
+
+		wchar_t   wide[2];
+		const int wide_len =
+		    MultiByteToWideChar(932, MB_ERR_INVALID_CHARS, reinterpret_cast<const char*>(in),
+		                        static_cast<int>(char_len), wide, 2);
+		if (wide_len <= 0) {
+			*inbuf = reinterpret_cast<const char*>(in);
+			return SDL_ICONV_EILSEQ;
+		}
+
+		char      utf8[8];
+		const int utf8_len =
+		    WideCharToMultiByte(CP_UTF8, 0, wide, wide_len, utf8, sizeof(utf8), nullptr, nullptr);
+		if (utf8_len <= 0 || static_cast<size_t>(utf8_len) > *outbytesleft) {
+			*inbuf = reinterpret_cast<const char*>(in);
+			return SDL_ICONV_E2BIG;
+		}
+
+		std::memcpy(*outbuf, utf8, static_cast<size_t>(utf8_len));
+		*outbuf += utf8_len;
+		*outbytesleft -= static_cast<size_t>(utf8_len);
+		in += char_len;
+		*inbytesleft -= char_len;
+	}
+	*inbuf = reinterpret_cast<const char*>(in);
+	return 0;
+}
+
+#endif
+
 static int ConvertMbcsToUtf8(CesContext* context, const uint8_t* source, uint32_t source_max,
                              uint32_t* source_len, uint8_t* destination, uint32_t destination_max,
                              uint32_t* destination_len, bool measure) {
@@ -246,8 +304,10 @@ static int ConvertMbcsToUtf8(CesContext* context, const uint8_t* source, uint32_
 		++source_size;
 	}
 	const bool bounded_end = source_max != 0 && source_size == source_max;
-	const auto converter   = SDL_iconv_open("UTF-8", context->profile->encoding);
+#if !defined(_WIN32)
+	const auto converter = SDL_iconv_open("UTF-8", context->profile->encoding);
 	EXIT_IF(converter == reinterpret_cast<SDL_iconv_t>(-1));
+#endif
 
 	const char*           input      = reinterpret_cast<const char*>(source);
 	size_t                input_left = source_size;
@@ -258,7 +318,11 @@ static int ConvertMbcsToUtf8(CesContext* context, const uint8_t* source, uint32_
 		char* output = measure ? scratch.data() : reinterpret_cast<char*>(destination) + produced;
 		const size_t capacity    = measure ? scratch.size() : destination_max - 1 - produced;
 		size_t       output_left = capacity;
-		const auto   status      = SDL_iconv(converter, &input, &input_left, &output, &output_left);
+#if defined(_WIN32)
+		const auto status = ConvertCp932ToUtf8(&input, &input_left, &output, &output_left);
+#else
+		const auto status = SDL_iconv(converter, &input, &input_left, &output, &output_left);
+#endif
 		produced += capacity - output_left;
 		if (status == SDL_ICONV_E2BIG) {
 			if (measure) {
@@ -277,7 +341,9 @@ static int ConvertMbcsToUtf8(CesContext* context, const uint8_t* source, uint32_
 		}
 		break;
 	} while (input_left != 0);
+#if !defined(_WIN32)
 	SDL_iconv_close(converter);
+#endif
 
 	if (!measure) {
 		destination[produced] = 0;

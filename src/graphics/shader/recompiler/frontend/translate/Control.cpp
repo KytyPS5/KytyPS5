@@ -302,23 +302,95 @@ void Translator::S_MOV_B64(const Decoder::Instruction& inst) {
 }
 
 void Translator::S_WQM(const Decoder::Instruction& inst, bool wide) {
-	const auto source = wide ? ReadU64(inst.src0)
-	                         : ir.ConstructU64(ReadU32(inst.src0), IR::U32(IR::Value(0u)));
+	const bool source_is_mask = inst.src0.kind == Decoder::OperandKind::Sgpr ||
+	                            inst.src0.kind == Decoder::OperandKind::ExecLo ||
+	                            inst.src0.kind == Decoder::OperandKind::VccLo ||
+	                            (!wide && IsExecOrVcc(inst.src0));
+	const auto source_valid = ReadMaskValid(inst.src0);
+	auto source_live = IR::U1(IR::Value(false));
+	if (source_is_mask) {
+		if (inst.src0.kind == Decoder::OperandKind::VccLo ||
+		    inst.src0.kind == Decoder::OperandKind::VccHi) {
+			source_live = ir.GetVcc();
+		} else {
+			source_live = ReadMask(inst.src0);
+		}
+	}
+	const auto retained_live = ir.LogicalAnd(source_valid, source_live);
+
+	IR::U64 source;
+	if (wide) {
+		source = ReadU64(inst.src0);
+	} else {
+		source = ir.ConstructU64(ReadU32(inst.src0), IR::U32(IR::Value(0u)));
+	}
 	const auto result = IR::U64(ir.Emit(IR::ValueOpcode::WqmU64, {source}));
 	if (!wide) {
 		const auto low = ir.CompositeExtract(result, 0);
+		const bool destination_is_mask = IsExecOrVcc(inst.dst);
+		const bool destination_is_exec = inst.dst.kind == Decoder::OperandKind::ExecLo ||
+		                                 inst.dst.kind == Decoder::OperandKind::ExecHi;
+		auto old_live = IR::U1(IR::Value(false));
+		if (destination_is_mask) {
+			if (destination_is_exec) {
+				old_live = ir.GetExec();
+			} else {
+				old_live = ir.GetVcc();
+			}
+		}
+
 		// A 32-bit write preserves the other EXEC/VCC half and invalidates any
 		// overlapping SGPR-pair mask provenance through the ordinary scalar path.
 		WriteRawU32(inst.dst, low);
+		if (destination_is_mask) {
+			const auto is_high_half = [](const Decoder::Operand& operand) {
+				return operand.kind == Decoder::OperandKind::ExecHi ||
+				       operand.kind == Decoder::OperandKind::VccHi;
+			};
+			const bool destination_is_high = is_high_half(inst.dst);
+			auto affected_lanes = IR::U1(IR::Value(!destination_is_high));
+			if (program.wave_size == 64u) {
+				const auto lane = IR::U32(ir.Emit(IR::ValueOpcode::LaneId));
+				affected_lanes = ir.ULessThan(lane, IR::U32(IR::Value(32u)));
+				if (destination_is_high) {
+					affected_lanes = ir.LogicalNot(affected_lanes);
+				}
+			}
+
+			IR::U1 live;
+			if (destination_is_exec) {
+				live = ir.GetExec();
+			} else {
+				live = ir.GetVcc();
+			}
+			// A cross-half copy refers to different lanes, so only scalar bits apply.
+			if (is_high_half(inst.src0) == destination_is_high) {
+				live = ir.LogicalOr(retained_live, live);
+			}
+			live = IR::U1(ir.Emit(IR::ValueOpcode::SelectU1, {affected_lanes, live, old_live}));
+			if (destination_is_exec) {
+				ir.SetExec(live);
+			} else {
+				ir.SetVcc(live);
+			}
+		}
 		ir.SetScc(ir.INotEqual(low, IR::U32(IR::Value(0u))));
 		return;
 	}
-	const auto mask_valid = ReadMaskValid(inst.src0);
+
+	// WQM adds live lanes but never removes a source lane. Keep that fact separate
+	// from the scalar mask: reconstructing an entry-true predicate from a ballot
+	// otherwise introduces a spurious dependency into every vector write.
+	const auto live = ir.LogicalOr(retained_live, ThreadBit(ExtractU64(result)));
 	WriteOperand(DestinationOperand(inst), result);
-	if (inst.dst.kind == Decoder::OperandKind::Sgpr) {
+	if (inst.dst.kind == Decoder::OperandKind::ExecLo) {
+		ir.SetExec(live);
+	} else if (inst.dst.kind == Decoder::OperandKind::VccLo) {
+		ir.SetVcc(live);
+	} else if (inst.dst.kind == Decoder::OperandKind::Sgpr) {
 		const auto dst = static_cast<IR::ScalarReg>(inst.dst.reg);
-		ir.SetThreadBitScalarReg(dst, ThreadBit(ExtractU64(result)));
-		ir.SetScalarMaskTag(dst, mask_valid);
+		ir.SetThreadBitScalarReg(dst, live);
+		ir.SetScalarMaskTag(dst, source_valid);
 	}
 	ir.SetScc(IR::U1(ir.Emit(IR::ValueOpcode::INotEqual64, {result, IR::Value(uint64_t {0})})));
 }

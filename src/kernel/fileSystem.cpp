@@ -1,5 +1,6 @@
 #include "kernel/fileSystem.h"
 
+#include "common/archive.h"
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/dateTime.h"
@@ -41,6 +42,7 @@ public:
 	struct MountPair {
 		std::filesystem::path dir;
 		std::string           point;
+		std::shared_ptr<Common::ArchiveReader> archive;
 	};
 
 	MountPoints() { EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread()); }
@@ -64,6 +66,7 @@ struct File {
 	std::filesystem::path               real_name;
 	std::atomic_bool                    opened;
 	std::atomic_bool                    directory;
+	std::atomic_bool                    readable;
 	std::atomic_bool                    writable;
 	std::atomic_bool                    append;
 	std::atomic_bool                    sync_writes;
@@ -175,6 +178,7 @@ int FileDescriptors::CreateDescriptor() {
 	auto* file        = new File {};
 	file->opened      = false;
 	file->directory   = false;
+	file->readable    = false;
 	file->writable    = false;
 	file->append      = false;
 	file->sync_writes = false;
@@ -258,6 +262,7 @@ void MountPoints::Mount(const std::filesystem::path& folder, const std::string& 
 	MountPair p;
 	p.dir   = folder;
 	p.point = point_str;
+	p.archive = Common::OpenArchive(folder);
 
 	m_mount_pairs.push_back(std::move(p));
 }
@@ -344,11 +349,13 @@ std::filesystem::path MountPoints::ResolvePath(const std::string& mounted_name) 
 		}
 
 		const auto native_rel_path = Common::PathFromUtf8(rel_path);
+		if (Common::IsArchivePath(p.dir)) {
+			return p.dir / native_rel_path;
+		}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		if (HasWindowsForbiddenFilenameCharacter(rel_path)) {
-			::printf("FileSystem: Windows-incompatible guest filename: %s\n",
-			         mounted_name.c_str());
+			::printf("FileSystem: Windows-incompatible guest filename: %s\n", mounted_name.c_str());
 		}
 		return p.dir / native_rel_path;
 #else
@@ -356,7 +363,8 @@ std::filesystem::path MountPoints::ResolvePath(const std::string& mounted_name) 
 #endif
 	}
 
-	return mounted_name;
+	// Unmounted guest paths must not fall through to the host filesystem.
+	return {};
 }
 
 void Initialize() {
@@ -442,6 +450,7 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 	EXIT_IF(file == nullptr || file->opened || file->directory);
 
 	file->name        = path;
+	file->readable    = rw_mode != Common::File::Mode::Write;
 	file->writable    = rw_mode != Common::File::Mode::Read;
 	file->append      = append;
 	file->sync_writes = fsync || sync || dsync;
@@ -458,14 +467,24 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 	}
 
 	file->real_name = g_mount_points->ResolvePath(file->name);
+	if (file->real_name.empty()) {
+		g_files->DeleteDescriptor(descriptor);
+		return KERNEL_ERROR_ENOENT;
+	}
+	if (Common::IsArchivePath(file->real_name) &&
+	    (rw_mode != Common::File::Mode::Read || trunc || creat)) {
+		g_files->DeleteDescriptor(descriptor);
+		return KERNEL_ERROR_EROFS;
+	}
 
 	if (trunc && rw_mode == Common::File::Mode::Read) {
 		g_files->DeleteDescriptor(descriptor);
 		return KERNEL_ERROR_EACCES;
 	}
 
-	bool dir_exist  = Common::File::IsDirectoryExisting(file->real_name);
-	bool file_exist = Common::File::IsFileExisting(file->real_name);
+	const auto info = Common::File::GetInfo(file->real_name);
+	const bool dir_exist = info && !info->is_file;
+	const bool file_exist = info && info->is_file;
 
 	// A missing path opened without O_CREAT is ENOENT
 	if (!creat && !dir_exist && !file_exist) {
@@ -663,7 +682,7 @@ int64_t KYTY_SYSV_ABI KernelWrite(int d, const void* buf, size_t nbytes) {
 
 	auto* file = g_files->GetFile(d);
 
-	if (file == nullptr) {
+	if (file == nullptr || !file->opened || !file->writable) {
 		return KERNEL_ERROR_EBADF;
 	}
 
@@ -761,6 +780,106 @@ int64_t KYTY_SYSV_ABI KernelPread(int d, void* buf, size_t nbytes, int64_t offse
 	return bytes_read;
 }
 
+static int ValidateIovecs(const KernelIovec* iov, int iovcnt, int64_t offset,
+                          std::vector<KernelIovec>* buffers, size_t* total) {
+	constexpr int MaxIov = 1024;
+	if (iovcnt < 0 || iovcnt > MaxIov || offset < 0) {
+		return KERNEL_ERROR_EINVAL;
+	}
+	if (iov == nullptr && iovcnt != 0) {
+		return KERNEL_ERROR_EFAULT;
+	}
+
+	if (iovcnt != 0) {
+		buffers->assign(iov, iov + iovcnt);
+	}
+	*total = 0;
+	for (const auto& buffer: *buffers) {
+		if (buffer.iov_len > INT_MAX - *total) {
+			return KERNEL_ERROR_EINVAL;
+		}
+		if (buffer.iov_base == nullptr && buffer.iov_len != 0) {
+			return KERNEL_ERROR_EFAULT;
+		}
+		*total += buffer.iov_len;
+	}
+	return OK;
+}
+
+int64_t KYTY_SYSV_ABI KernelPreadv(int d, const KernelIovec* iov, int iovcnt, int64_t offset) {
+	PRINT_NAME();
+
+	std::vector<KernelIovec> buffers;
+	size_t                   total = 0;
+	const int                error = ValidateIovecs(iov, iovcnt, offset, &buffers, &total);
+	if (error != OK) {
+		return error;
+	}
+
+	if (d < DESCRIPTOR_MIN) {
+		return KERNEL_ERROR_EBADF;
+	}
+	if (::Libs::Network::Net::IsSocket(d)) {
+		return KERNEL_ERROR_ESPIPE;
+	}
+	auto* file = g_files->GetFile(d);
+	if (file == nullptr || !file->opened || !file->readable) {
+		return KERNEL_ERROR_EBADF;
+	}
+
+	Common::LockGuard lock(file->mutex);
+	if (file->directory) {
+		return KERNEL_ERROR_EISDIR;
+	}
+	if (total == 0) {
+		return 0;
+	}
+	if (file->special == SpecialFile::Random) {
+		for (const auto& buffer: buffers) {
+			if (buffer.iov_len != 0) {
+				Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buffer.iov_base),
+				                         buffer.iov_len);
+				FillRandomBuffer(buffer.iov_base, buffer.iov_len);
+			}
+		}
+		return static_cast<int64_t>(total);
+	}
+	if (file->f.IsInvalid()) {
+		return KERNEL_ERROR_EIO;
+	}
+
+	const auto position  = file->f.Tell();
+	const auto file_size = file->f.Size();
+	if (!file->f.Seek(static_cast<uint64_t>(offset))) {
+		return KERNEL_ERROR_EIO;
+	}
+	auto    remaining  = static_cast<uint64_t>(offset) < file_size ? file_size - offset : 0;
+	int64_t bytes_read = 0;
+	for (const auto& buffer: buffers) {
+		if (remaining == 0) {
+			break;
+		}
+		if (buffer.iov_len == 0) {
+			continue;
+		}
+		const auto count = static_cast<uint32_t>(std::min<uint64_t>(buffer.iov_len, remaining));
+		Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buffer.iov_base), count);
+		uint32_t bytes = 0;
+		file->f.Read(buffer.iov_base, count, &bytes);
+		bytes_read += bytes;
+		remaining -= bytes;
+		if (bytes < count) {
+			break;
+		}
+	}
+	if (!file->f.Seek(position)) {
+		return KERNEL_ERROR_EIO;
+	}
+	LOGF("\tReadv %" PRId64 " bytes (pos = %" PRId64 ", iovcnt = %d) from: %s\n", bytes_read,
+	     offset, iovcnt, Common::PathToString(file->real_name).c_str());
+	return bytes_read;
+}
+
 int64_t KYTY_SYSV_ABI KernelPwrite(int d, const void* buf, size_t nbytes, int64_t offset) {
 	PRINT_NAME();
 
@@ -778,7 +897,7 @@ int64_t KYTY_SYSV_ABI KernelPwrite(int d, const void* buf, size_t nbytes, int64_
 
 	auto* file = g_files->GetFile(d);
 
-	if (file == nullptr) {
+	if (file == nullptr || !file->opened || !file->writable) {
 		return KERNEL_ERROR_EBADF;
 	}
 
@@ -811,6 +930,72 @@ int64_t KYTY_SYSV_ABI KernelPwrite(int d, const void* buf, size_t nbytes, int64_
 	LOGF("\tWrite %u bytes (pos = %" PRId64 ") to: %s\n", bytes_written, offset,
 	     Common::PathToString(file->real_name).c_str());
 
+	return bytes_written;
+}
+
+int64_t KYTY_SYSV_ABI KernelPwritev(int d, const KernelIovec* iov, int iovcnt, int64_t offset) {
+	PRINT_NAME();
+
+	std::vector<KernelIovec> buffers;
+	size_t                   total = 0;
+	const int                error = ValidateIovecs(iov, iovcnt, offset, &buffers, &total);
+	if (error != OK) {
+		return error;
+	}
+
+	if (d < DESCRIPTOR_MIN) {
+		return KERNEL_ERROR_EBADF;
+	}
+	if (::Libs::Network::Net::IsSocket(d)) {
+		return KERNEL_ERROR_ESPIPE;
+	}
+	auto* file = g_files->GetFile(d);
+	if (file == nullptr || !file->opened || !file->writable) {
+		return KERNEL_ERROR_EBADF;
+	}
+	Common::LockGuard lock(file->mutex);
+	if (file->directory) {
+		return KERNEL_ERROR_EISDIR;
+	}
+	if (file->special != SpecialFile::None) {
+		return KERNEL_ERROR_EINVAL;
+	}
+	if (total == 0) {
+		return 0;
+	}
+	if (file->f.IsInvalid()) {
+		return KERNEL_ERROR_EIO;
+	}
+
+	const auto position = file->f.Tell();
+	const auto target   = (file->append ? file->f.Size() : static_cast<uint64_t>(offset));
+	if (target > static_cast<uint64_t>(INT64_MAX) - total) {
+		return KERNEL_ERROR_EFBIG;
+	}
+	if (!file->f.Seek(target)) {
+		return KERNEL_ERROR_EIO;
+	}
+
+	int64_t bytes_written = 0;
+	for (const auto& buffer: buffers) {
+		if (buffer.iov_len == 0) {
+			continue;
+		}
+		uint32_t bytes = 0;
+		file->f.Write(buffer.iov_base, static_cast<uint32_t>(buffer.iov_len), &bytes);
+		bytes_written += bytes;
+		if (bytes < buffer.iov_len) {
+			break;
+		}
+	}
+	const bool flushed  = !file->sync_writes || file->f.Flush();
+	const bool restored = file->f.Seek(position);
+	if (!flushed || !restored) {
+		return KERNEL_ERROR_EIO;
+	}
+
+	LOGF("\tWritev %" PRId64 " bytes (pos = %" PRId64 ", iovcnt = %d) to: %s\n", bytes_written,
+	     offset, iovcnt, Common::PathToString(file->real_name).c_str());
 	return bytes_written;
 }
 
@@ -889,15 +1074,13 @@ int KYTY_SYSV_ABI KernelStat(const char* path, FileStat* sb) {
 
 	auto real_file_name = g_mount_points->ResolvePath(path);
 
-	bool is_dir  = Common::File::IsDirectoryExisting(real_file_name);
-	bool is_file = Common::File::IsFileExisting(real_file_name);
-
-	if (!is_dir && !is_file) {
+	const auto info = Common::File::GetInfo(real_file_name);
+	if (!info) {
 		LOGF("\t file not found\n");
 		return KERNEL_ERROR_ENOENT;
 	}
 
-	EXIT_NOT_IMPLEMENTED(is_dir && is_file);
+	const bool is_dir = !info->is_file;
 
 	FileStat stat {};
 	stat.st_mode = 0000777u | (is_dir ? 0040000u : 0100000u);
@@ -911,7 +1094,7 @@ int KYTY_SYSV_ABI KernelStat(const char* path, FileStat* sb) {
 		stat.st_blksize = 512;
 		stat.st_blocks  = stat.st_size / 512;
 	} else {
-		stat.st_size    = static_cast<int64_t>(Common::File::Size(real_file_name));
+		stat.st_size    = static_cast<int64_t>(info->size);
 		stat.st_blksize = 512;
 		stat.st_blocks  = (stat.st_size + 511) / 512;
 
@@ -1048,6 +1231,9 @@ int KYTY_SYSV_ABI KernelUnlink(const char* path) {
 	}
 
 	auto real_file_name = g_mount_points->ResolvePath(path);
+	if (Common::IsArchivePath(real_file_name)) {
+		return KERNEL_ERROR_EROFS;
+	}
 
 	bool is_dir  = Common::File::IsDirectoryExisting(real_file_name);
 	bool is_file = Common::File::IsFileExisting(real_file_name);
@@ -1085,8 +1271,11 @@ int KYTY_SYSV_ABI KernelRename(const char* from, const char* to) {
 	auto to_path   = std::string(to);
 	auto real_from = g_mount_points->ResolvePath(from_path);
 	auto real_to   = g_mount_points->ResolvePath(to_path);
+	if (Common::IsArchivePath(real_from) || Common::IsArchivePath(real_to)) {
+		return KERNEL_ERROR_EROFS;
+	}
 
-	if (!Common::File::IsFileExisting(real_from)) {
+	if (real_to.empty() || !Common::File::IsFileExisting(real_from)) {
 		return KERNEL_ERROR_ENOENT;
 	}
 
@@ -1166,6 +1355,12 @@ int KYTY_SYSV_ABI KernelMkdir(const char* path, uint16_t mode) {
 	     path, mode);
 
 	auto real_name = g_mount_points->ResolvePath(std::string(path));
+	if (real_name.empty()) {
+		return KERNEL_ERROR_ENOENT;
+	}
+	if (Common::IsArchivePath(real_name)) {
+		return KERNEL_ERROR_EROFS;
+	}
 
 	if (Common::File::IsDirectoryExisting(real_name)) {
 		return KERNEL_ERROR_EEXIST;
@@ -1192,6 +1387,9 @@ int KYTY_SYSV_ABI KernelRmdir(const char* path) {
 	LOGF("\t path = %s\n", path);
 
 	auto real_name = g_mount_points->ResolvePath(std::string(path));
+	if (Common::IsArchivePath(real_name)) {
+		return KERNEL_ERROR_EROFS;
+	}
 
 	if (!Common::File::IsDirectoryExisting(real_name)) {
 		return KERNEL_ERROR_ENOENT;

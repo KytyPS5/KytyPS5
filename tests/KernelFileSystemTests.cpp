@@ -2,7 +2,9 @@
 #include <SDL3/SDL_main.h>
 
 #include "common/emulatorConfig.h"
+#include "common/archive.h"
 #include "common/file.h"
+#include "ArchiveTestFixture.h"
 #include "common/logging/log.h"
 #include "common/subsystems.h"
 #include "common/threads.h"
@@ -15,8 +17,10 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 
 #include <chrono>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -29,6 +33,14 @@
 
 namespace Libs::LibKernelApr {
 void InitLibKernel_1_Apr(Loader::SymbolDatabase *symbols);
+}
+
+namespace Libs::LibAmpr {
+void InitAmpr_1(Loader::SymbolDatabase *symbols);
+}
+
+namespace Libs::LibNet {
+void InitNet_1_Net(Loader::SymbolDatabase *symbols);
 }
 
 namespace {
@@ -127,7 +139,7 @@ void CheckMountRoot(const std::filesystem::path &root) {
   FileSystem::Mount(root, "/app0");
   Check(FileSystem::GetRealFilename("/app0/rpf.cache") == root / "rpf.cache",
         "resolve mount descendant");
-  Check(FileSystem::GetRealFilename("/app01/rpf.cache") == "/app01/rpf.cache",
+  Check(FileSystem::GetRealFilename("/app01/rpf.cache").empty(),
         "mount prefix must end at a path component");
 
   for (const char *path : {"/app0", "/app0/"}) {
@@ -157,16 +169,169 @@ void CheckMountRoot(const std::filesystem::path &root) {
     }
   }
   FileSystem::Umount("/app0");
-  Check(FileSystem::GetRealFilename("/app0/rpf.cache") == "/app0/rpf.cache",
+  Check(FileSystem::GetRealFilename("/app0/rpf.cache").empty(),
         "unmount by guest path");
   for (const auto &folder : {root, root / ""}) {
     for (const auto &host : {root, root / ""}) {
       FileSystem::Mount(folder, "/app0");
       FileSystem::Umount(Common::PathToGenericString(host));
-      Check(FileSystem::GetRealFilename("/app0/rpf.cache") == "/app0/rpf.cache",
+      Check(FileSystem::GetRealFilename("/app0/rpf.cache").empty(),
             "unmount by host path with or without trailing separator");
     }
   }
+}
+
+void CheckUnmappedPaths(const std::filesystem::path &root) {
+  const auto host_file = root / "host-only.dat";
+  const auto host_path = Common::PathToGenericString(host_file);
+  Common::File fixture;
+  Check(fixture.Create(host_file), "create unmapped host file");
+  fixture.Close();
+
+  FileSystem::FileStat stat {};
+  Check(FileSystem::GetRealFilename(host_path).empty() &&
+            FileSystem::KernelOpen(host_path.c_str(), 0, 0) ==
+                Libs::LibKernel::KERNEL_ERROR_ENOENT &&
+            FileSystem::KernelStat(host_path.c_str(), &stat) ==
+                Libs::LibKernel::KERNEL_ERROR_ENOENT &&
+            FileSystem::KernelCheckReachability(host_path.c_str()) ==
+                Libs::LibKernel::KERNEL_ERROR_ENOENT,
+        "existing host files are absent from the guest namespace");
+  Check(FileSystem::KernelUnlink(host_path.c_str()) ==
+            Libs::LibKernel::KERNEL_ERROR_ENOENT &&
+            FileSystem::KernelRmdir(Common::PathToGenericString(root).c_str()) ==
+                Libs::LibKernel::KERNEL_ERROR_ENOENT &&
+            std::filesystem::exists(host_file),
+        "unmapped host files and directories cannot be removed");
+
+  const auto missing = Common::PathToGenericString(root / "unmapped-create");
+  Check(FileSystem::KernelOpen(missing.c_str(), 0x601, 0777) ==
+            Libs::LibKernel::KERNEL_ERROR_ENOENT &&
+            FileSystem::KernelMkdir(missing.c_str(), 0777) ==
+                Libs::LibKernel::KERNEL_ERROR_ENOENT &&
+            !std::filesystem::exists(root / "unmapped-create"),
+        "creation requires a mounted guest destination");
+
+  FileSystem::Mount(root, "/app0");
+  Check(FileSystem::KernelRename("/app0/host-only.dat", missing.c_str()) ==
+            Libs::LibKernel::KERNEL_ERROR_ENOENT &&
+            std::filesystem::exists(host_file) &&
+            !std::filesystem::exists(root / "unmapped-create"),
+        "rename to an unmapped destination preserves the source");
+  FileSystem::Umount("/app0");
+}
+
+void CheckArchiveMount(const std::filesystem::path &root) {
+  const auto archive = root / u8"game-日本語.zar";
+  std::vector<uint8_t> payload(2 * 64 * 1024 + 33);
+  for (size_t i = 0; i < payload.size(); ++i) {
+    payload[i] = static_cast<uint8_t>(i * 37 + 11);
+  }
+  Check(ArchiveTests::CreateArchive(archive, payload), "create mounted archive fixture");
+  const auto archive_root = Common::MakeArchivePath(archive);
+  const auto host_member = archive_root / "assets/subdir/data.bin";
+  constexpr char GuestMember[] = "/app0/assets/subdir/data.bin";
+  FileSystem::Mount(archive_root, "/app0");
+  Check(FileSystem::GetRealFilename(GuestMember) == host_member &&
+            FileSystem::GetRealFilename("/app01/eboot.bin").empty(),
+        "resolve archive mounts at path-component boundaries");
+  Check(FileSystem::KernelOpen("/app0/../outside.bin", 0, 0) ==
+            Libs::LibKernel::KERNEL_ERROR_ENOENT &&
+            FileSystem::KernelOpen("/app0/missing.bin", 0, 0) ==
+            Libs::LibKernel::KERNEL_ERROR_ENOENT,
+        "reject traversal outside an archive and missing members");
+
+  FileSystem::FileStat path_stat{}, descriptor_stat{};
+  Check(FileSystem::KernelStat(GuestMember, &path_stat) == OK &&
+            path_stat.st_size == payload.size() &&
+            path_stat.st_size == Common::File::Size(host_member) &&
+            FileSystem::KernelCheckReachability(GuestMember) == OK,
+        "archive path stat and reachability agree with Common::File");
+  const int fd = FileSystem::KernelOpen("/app0/ASSETS/subdir/DATA.BIN", 0, 0);
+  Check(fd >= 3 && FileSystem::KernelFstat(fd, &descriptor_stat) == OK &&
+            descriptor_stat.st_size == path_stat.st_size &&
+            descriptor_stat.st_mode == path_stat.st_mode,
+        "case-insensitive archive open and descriptor stat agree");
+  std::array<uint8_t, 97> bytes{};
+  constexpr int64_t Offset = 64 * 1024 - 19;
+  Check(FileSystem::KernelPread(fd, bytes.data(), bytes.size(), Offset) == bytes.size() &&
+            std::equal(bytes.begin(), bytes.end(), payload.begin() + Offset) &&
+            FileSystem::KernelLseek(fd, 0, 1) == 0,
+        "archive pread crosses a compression block without moving position");
+  Check(FileSystem::KernelLseek(fd, Offset, 0) == Offset &&
+            FileSystem::KernelRead(fd, bytes.data(), bytes.size()) == bytes.size() &&
+            std::equal(bytes.begin(), bytes.end(), payload.begin() + Offset) &&
+            FileSystem::KernelLseek(fd, 0, 1) == Offset + bytes.size(),
+        "archive seek and sequential read share descriptor position");
+  Check(FileSystem::KernelLseek(fd, -9, 2) == payload.size() - 9 &&
+            FileSystem::KernelRead(fd, bytes.data(), bytes.size()) == 9 &&
+            std::equal(bytes.begin(), bytes.begin() + 9, payload.end() - 9) &&
+            FileSystem::KernelRead(fd, bytes.data(), bytes.size()) == 0,
+        "archive reads stop at the member boundary");
+  Check(FileSystem::KernelWrite(fd, bytes.data(), 1) ==
+            Libs::LibKernel::KERNEL_ERROR_EBADF &&
+            FileSystem::KernelPwrite(fd, bytes.data(), 1, 0) ==
+            Libs::LibKernel::KERNEL_ERROR_EBADF &&
+            FileSystem::KernelFtruncate(fd, 0) ==
+            Libs::LibKernel::KERNEL_ERROR_EBADF,
+        "archive read-only descriptors reject write and truncate");
+
+  const auto unicode_guest = std::string("/app0/") + std::string(ArchiveTests::UnicodeFilename);
+  const int unicode = FileSystem::KernelOpen(unicode_guest.c_str(), 0, 0);
+  Check(unicode >= 3 && FileSystem::KernelRead(unicode, bytes.data(), bytes.size()) ==
+            ArchiveTests::Eboot.size() &&
+            std::memcmp(bytes.data(), ArchiveTests::Eboot.data(), ArchiveTests::Eboot.size()) == 0,
+        "open and read a Unicode archive member");
+  Check(FileSystem::KernelClose(unicode) == OK, "close Unicode archive member");
+
+  const int directory = FileSystem::KernelOpen("/app0/", 0x00020000, 0);
+  Check(directory >= 3, "open mounted archive directory");
+  std::array<char, 512> block{};
+  const auto expected_entries = Common::File::GetDirEntries(archive_root);
+  size_t entries_seen = 0;
+  for (;;) {
+    const int length = FileSystem::KernelGetdents(directory, block.data(), block.size());
+    Check(length >= 0 && length <= block.size(), "read archive directory records");
+    if (length == 0) {
+      break;
+    }
+    for (size_t offset = 0; offset < static_cast<size_t>(length);) {
+      uint16_t record_length = 0;
+      Check(length - offset >= 8, "archive directory record header fits");
+      std::memcpy(&record_length, block.data() + offset + 4, sizeof(record_length));
+      const auto name_length = static_cast<uint8_t>(block[offset + 7]);
+      Check(record_length >= 9 + name_length && record_length <= length - offset,
+            "archive directory record fits");
+      const std::string_view name(block.data() + offset + 8, name_length);
+      Check(std::any_of(expected_entries.begin(), expected_entries.end(), [&](const auto &entry) {
+        return entry.name == name && block[offset + 6] == (entry.is_file ? 8 : 4);
+      }), "guest directory entry matches Common::File name and type");
+      ++entries_seen;
+      offset += record_length;
+    }
+  }
+  Check(entries_seen == expected_entries.size(), "guest enumerates every archive directory entry");
+  Check(FileSystem::KernelClose(directory) == OK, "close archive directory");
+
+  for (const int flags : {1, 2, 0x0200, 0x0400}) {
+    Check(FileSystem::KernelOpen(GuestMember, flags, 0777) ==
+              Libs::LibKernel::KERNEL_ERROR_EROFS,
+          "archive rejects write, create and truncate open flags");
+  }
+  Check(FileSystem::KernelUnlink(GuestMember) == Libs::LibKernel::KERNEL_ERROR_EROFS &&
+            FileSystem::KernelMkdir("/app0/new-dir", 0777) == Libs::LibKernel::KERNEL_ERROR_EROFS &&
+            FileSystem::KernelRmdir("/app0/assets") == Libs::LibKernel::KERNEL_ERROR_EROFS &&
+            FileSystem::KernelRename(GuestMember, "/app0/renamed.bin") ==
+                Libs::LibKernel::KERNEL_ERROR_EROFS,
+        "archive mount rejects path mutations");
+  FileSystem::Umount("/app0");
+  Check(FileSystem::GetRealFilename(GuestMember).empty() &&
+            FileSystem::KernelOpen(GuestMember, 0, 0) == Libs::LibKernel::KERNEL_ERROR_ENOENT &&
+            FileSystem::KernelLseek(fd, 0, 0) == 0 &&
+            FileSystem::KernelRead(fd, bytes.data(), bytes.size()) == bytes.size() &&
+            std::equal(bytes.begin(), bytes.end(), payload.begin()),
+        "unmount hides archive paths while open descriptors retain the reader");
+  Check(FileSystem::KernelClose(fd) == OK, "close last archive descriptor");
 }
 
 void CheckUnicodePaths(const std::filesystem::path &root) {
@@ -336,6 +501,125 @@ void CheckDirectoryStream(const std::filesystem::path &root) {
   FileSystem::Umount("/app0");
 }
 
+void CheckAmprOrdering(Loader::SymbolDatabase &symbols, uint32_t file_id) {
+  Libs::LibAmpr::InitAmpr_1(&symbols);
+  const auto find = [&](const char *nid) {
+    const auto *symbol = symbols.FindByNid(nid, Loader::SymbolType::Func);
+    Check(symbol != nullptr, "AMPR command and submission exports resolve");
+    return symbol->vaddr;
+  };
+  using Unary = void (KYTY_SYSV_ABI *)(void *);
+  using AprConstructor = void (KYTY_SYSV_ABI *)(void *, void *, void *);
+  using SetBuffer = int (KYTY_SYSV_ABI *)(void *, void *, uint32_t);
+  using Offset = uint64_t (KYTY_SYSV_ABI *)(void *);
+  using WaitAddress = int (KYTY_SYSV_ABI *)(void *, volatile uint64_t *, uint64_t,
+                                          uint8_t, uint8_t);
+  using WriteAddress = int (KYTY_SYSV_ABI *)(void *, volatile uint64_t *, uint64_t);
+  using ReadFile = int (KYTY_SYSV_ABI *)(void *, uint64_t, uint64_t, uint32_t,
+                                       void *, uint64_t, uint64_t);
+  struct Result { int32_t result; uint32_t error_offset; };
+  using SubmitApr = int (KYTY_SYSV_ABI *)(void *, uint32_t, Result *, uint32_t *);
+  using SubmitAmm = int (KYTY_SYSV_ABI *)(void *, uint32_t, uint32_t, uint32_t *);
+  using WaitSubmission = int (KYTY_SYSV_ABI *)(uint32_t);
+  const auto construct = reinterpret_cast<Unary>(find("8aI7R7WaOlc"));
+  const auto construct_apr = reinterpret_cast<AprConstructor>(find("a8uLzYY--tM"));
+  const auto construct_amm = reinterpret_cast<Unary>(find("EDq5bqCqYpA"));
+  const auto destroy = reinterpret_cast<Unary>(find("GuchCTefuZw"));
+  const auto set_buffer = reinterpret_cast<SetBuffer>(find("N-FSPA4S3nI"));
+  const auto offset = reinterpret_cast<Offset>(find("GnxKOHEawhk"));
+  const auto wait_address = reinterpret_cast<WaitAddress>(find("DLfoNxTFNVk"));
+  const auto write_address = reinterpret_cast<WriteAddress>(find("sJXyWHjP-F8"));
+  const auto read_file = reinterpret_cast<ReadFile>(find("mQ16-QdKv7k"));
+  const auto submit_apr = reinterpret_cast<SubmitApr>(find("ASoW5WE-UPo"));
+  const auto submit_amm = reinterpret_cast<SubmitAmm>(find("NnKhlMJtIsI"));
+  const auto wait_apr = reinterpret_cast<WaitSubmission>(find("rqwFKI4PAiM"));
+  const auto wait_amm = reinterpret_cast<WaitSubmission>(find("HXymib4T8gc"));
+  struct Buffer {
+    std::array<uint64_t, 5> header {};
+    std::array<uint32_t, 256> data {};
+  };
+  std::array<Buffer, 4> buffers;
+  const auto reset = [&](size_t apr_count) {
+    for (size_t i = 0; i < buffers.size(); ++i) {
+      auto &buffer = buffers[i];
+      construct(buffer.header.data());
+      if (i < apr_count) {
+        construct_apr(buffer.header.data(), &buffer.header[3], &buffer.header[4]);
+      } else {
+        construct_amm(buffer.header.data());
+      }
+      Check(set_buffer(buffer.header.data(), buffer.data.data(), sizeof(buffer.data)) == OK,
+            "initialize AMPR command buffer");
+    }
+  };
+  // SDK WaitCompare order: ==, unsigned >/<, !=, wrapped >=, signed >/<.
+  struct Comparison { uint8_t compare; uint64_t blocked, reference, released; };
+  constexpr std::array comparisons {
+      Comparison{0, 1, 2, 2}, Comparison{1, 0x40000000000019c3, 0x40000000000019c3,
+                                   0x40000000000019c4},
+      Comparison{1, 0, INT64_MAX, uint64_t{1} << 63},
+      Comparison{2, UINT64_MAX, uint64_t{1} << 63, INT64_MAX}, Comparison{3, 2, 2, 3},
+      Comparison{4, UINT64_MAX - 1, UINT64_MAX, 0},
+      Comparison{5, UINT64_MAX, 0, 1}, Comparison{6, 0, 0, UINT64_MAX}};
+  for (const auto &comparison : comparisons) {
+    reset(3);
+    uint64_t fence = comparison.blocked;
+    uint64_t blocked_done = 0, read_done = 0, lower_done = 0;
+    std::array<char, 3> output {};
+    std::array<Result, 3> results {{{1234, 5678}, {1234, 5678}, {1234, 5678}}};
+    std::array<uint32_t, 4> ids {};
+    auto *blocked = buffers[0].header.data();
+    auto *reader = buffers[1].header.data();
+    auto *lower = buffers[2].header.data();
+    auto *producer = buffers[3].header.data();
+    Check(wait_address(blocked, &fence, comparison.reference, comparison.compare, 0) == OK &&
+              write_address(blocked, &blocked_done, 1) == OK &&
+              read_file(reader, reinterpret_cast<uint64_t>(&buffers[1].header[3]),
+                        reinterpret_cast<uint64_t>(&buffers[1].header[4]), file_id,
+                        output.data(), output.size(), 0) == OK &&
+              write_address(reader, &read_done, 2) == OK &&
+              write_address(lower, &lower_done, 3) == OK &&
+              write_address(producer, &fence, comparison.released) == OK,
+          "build dependent APR read and later AMM fence producer");
+    Check(submit_apr(blocked, 3, &results[0], &ids[0]) == OK &&
+              submit_apr(reader, 3, &results[1], &ids[1]) == OK &&
+              submit_apr(lower, 4, &results[2], &ids[2]) == OK && wait_apr(ids[2]) == OK,
+          "APR submit returns while blocked and a lower priority completes");
+    Check(lower_done == 3 && blocked_done == 0 && read_done == 0 &&
+              output == std::array<char, 3>{} && results[0].result == 1234 &&
+              results[1].result == 1234,
+          "unsatisfied wait blocks later buffers at its priority without publishing completion");
+    Check(submit_amm(buffers[3].data.data(), static_cast<uint32_t>(offset(producer)), 1,
+                     &ids[3]) == OK && wait_amm(ids[3]) == OK &&
+              wait_apr(ids[0]) == OK && wait_apr(ids[1]) == OK,
+          "later AMM submission releases the APR dependency");
+    Check(blocked_done == 1 && read_done == 2 && std::memcmp(output.data(), "APR", 3) == 0,
+          "APR reads real file bytes only after its dependency completes");
+    for (const auto &result : results) {
+      Check(result.result == OK,
+            "submission wait observes the completed result");
+    }
+  }
+  reset(0);
+  uint64_t cpu_fence = 0, amm_done = 0, lower_done = 0;
+  std::array<uint32_t, 2> ids {};
+  Check(wait_address(buffers[0].header.data(), &cpu_fence, 0, 1, 0) == OK &&
+            write_address(buffers[0].header.data(), &amm_done, 1) == OK &&
+            write_address(buffers[1].header.data(), &lower_done, 1) == OK &&
+            submit_amm(buffers[0].data.data(), static_cast<uint32_t>(offset(buffers[0].header.data())),
+                       0, &ids[0]) == OK &&
+            submit_amm(buffers[1].data.data(), static_cast<uint32_t>(offset(buffers[1].header.data())),
+                       1, &ids[1]) == OK && wait_amm(ids[1]) == OK,
+        "AMM lower priority progresses while its high priority waits");
+  Check(lower_done == 1 && amm_done == 0, "AMM wait preserves its dependency");
+  std::atomic_ref(cpu_fence).store(1, std::memory_order_release);
+  Check(wait_amm(ids[0]) == OK && amm_done == 1,
+        "AMM observes an external CPU fence store without a submission notification");
+  for (auto &buffer : buffers) {
+    destroy(buffer.header.data());
+  }
+}
+
 void CheckAprPaths(const std::filesystem::path &root) {
   Loader::SymbolDatabase symbols;
   Libs::LibKernelApr::InitLibKernel_1_Apr(&symbols);
@@ -402,11 +686,28 @@ void CheckAprPaths(const std::filesystem::path &root) {
   Check(resolve(unterminated.data(), paths, 1, ids, sizes, &error_index) == -1 &&
             *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_ENAMETOOLONG,
         "APR rejects an unterminated prefix");
+  CheckAmprOrdering(symbols, expected_id);
   FileSystem::Umount("/app0");
 }
 
 void CheckSocketWakeup() {
   namespace Net = Libs::Network::Net;
+  Loader::SymbolDatabase symbols;
+  Libs::LibNet::InitNet_1_Net(&symbols);
+  const auto *send_symbol = symbols.Find(
+      {"beRjXBn-z+o", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
+  const auto *recv_symbol = symbols.Find(
+      {"9wO9XrMsNhc", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
+  const auto *errno_symbol = symbols.Find(
+      {"HQOwnfMGipQ", "Net", 1, "Net", 1, 1, Loader::SymbolType::Func});
+  Check(send_symbol && recv_symbol && errno_symbol,
+        "Net send, receive and errno exports resolve with the guest ABI versions");
+  using Send = int (KYTY_SYSV_ABI *)(int, const void *, size_t, int);
+  using Recv = int (KYTY_SYSV_ABI *)(int, void *, size_t, int);
+  using Errno = int *(KYTY_SYSV_ABI *)();
+  const auto net_send = reinterpret_cast<Send>(send_symbol->vaddr);
+  const auto net_recv = reinterpret_cast<Recv>(recv_symbol->vaddr);
+  auto *net_errno = reinterpret_cast<Errno>(errno_symbol->vaddr)();
   // Guest sockaddr_in: length, family, network-order port/address, padding.
   std::array<uint8_t, 16> address {16, 2, 0, 0, 127, 0, 0, 1};
   const int listener = Net::Socket(2, 1, 0);
@@ -441,26 +742,61 @@ void CheckSocketWakeup() {
                     immediate.data()) == 0 && readable[reader / 64] == 0,
         "empty socket is not readable");
   const char payload[] = "wake";
-  Check(Net::Send(writer, payload, sizeof(payload), 0x20000) == sizeof(payload),
-        "send wake bytes with guest MSG_NOSIGNAL");
+  *net_errno = Libs::Posix::POSIX_EINVAL;
+  Check(net_send(writer, payload, sizeof(payload), 0) == sizeof(payload) &&
+            *net_errno == Libs::Posix::POSIX_EINVAL,
+        "Net send forwards bytes and preserves errno on success");
   readable[reader / 64] = bit;
   const std::array<int64_t, 2> deadline {1, 0};
   Check(Net::Select(reader + 1, readable.data(), nullptr, nullptr,
                     deadline.data()) == 1 && readable[reader / 64] == bit,
         "select reports the guest descriptor after wake");
   std::array<char, sizeof(payload)> received {};
-  Check(Net::Recv(reader, received.data(), received.size(), 0x42) == sizeof(payload) &&
+  Check(net_recv(reader, received.data(), received.size(), 0x42) == sizeof(payload) &&
+            std::memcmp(received.data(), payload, sizeof(payload)) == 0 &&
+            *net_errno == Libs::Posix::POSIX_EINVAL,
+        "Net receive forwards PEEK and WAITALL without consuming bytes");
+  received.fill(0);
+  Check(net_recv(reader, received.data(), received.size(), 0x40) == sizeof(payload) &&
             std::memcmp(received.data(), payload, sizeof(payload)) == 0,
-        "guest PEEK and WAITALL preserve the wake bytes");
-  Check(Net::Recv(reader, received.data(), received.size(), 0x40) == sizeof(payload),
-        "consume wake bytes with guest WAITALL");
+        "Net receive consumes the same bytes after peeking");
 #if !defined(_WIN32)
   Check(Net::Recv(reader, received.data(), received.size(), 0x80) == -1 &&
             *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EWOULDBLOCK,
         "empty nonblocking receive translates guest errno");
+  Check(net_recv(reader, received.data(), received.size(), 0x80) ==
+            Libs::Network::NET_ERROR_EWOULDBLOCK &&
+            *net_errno == Libs::Posix::POSIX_EWOULDBLOCK,
+        "Net nonblocking receive translates POSIX failure and Net errno");
 #endif
-  Check(Net::SocketClose(reader) == 0 && Net::SocketClose(writer) == 0,
-        "close wake sockets");
+  Check(net_send(-1, payload, sizeof(payload), 0) == Libs::Network::NET_ERROR_EBADF &&
+            *net_errno == Libs::Posix::POSIX_EBADF,
+        "Net send translates an invalid socket instead of returning POSIX minus one");
+  Check(net_recv(reader, nullptr, received.size(), 0) == Libs::Network::NET_ERROR_EFAULT &&
+            *net_errno == Libs::Posix::POSIX_EFAULT,
+        "Net receive translates an invalid output buffer");
+  Check(net_send(writer, payload, sizeof(payload), 0x100000) ==
+            Libs::Network::NET_ERROR_EOPNOTSUPP &&
+            *net_errno == Libs::Posix::POSIX_EOPNOTSUPP,
+        "Net send preserves the backend's unsupported crypto flag error");
+#if defined(__linux__)
+  const int disconnected = Net::Socket(2, 1, 0);
+  Check(disconnected >= 0, "create unconnected socket for broken pipe check");
+  const auto previous_sigpipe = std::signal(SIGPIPE, SIG_DFL);
+  Check(previous_sigpipe != SIG_ERR, "set default SIGPIPE disposition for Net send");
+  const auto broken_send = net_send(disconnected, payload, sizeof(payload), 0);
+  std::signal(SIGPIPE, previous_sigpipe);
+  Check(broken_send == Libs::Network::NET_ERROR_EPIPE &&
+            *net_errno == Libs::Posix::POSIX_EPIPE,
+        "Net send reports a broken pipe without raising host SIGPIPE");
+  Check(Net::SocketClose(disconnected) == 0, "close unconnected socket");
+#endif
+  Check(Net::SocketClose(writer) == 0, "close wake writer");
+  *net_errno = Libs::Posix::POSIX_EINVAL;
+  Check(net_recv(reader, received.data(), received.size(), 0) == 0 &&
+            *net_errno == Libs::Posix::POSIX_EINVAL,
+        "Net receive returns EOF without replacing errno");
+  Check(Net::SocketClose(reader) == 0, "close wake reader");
   readable[reader / 64] = bit;
   Check(Net::Select(reader + 1, readable.data(), nullptr, nullptr,
                     immediate.data()) == -1 &&
@@ -471,7 +807,7 @@ void CheckSocketWakeup() {
 
 } // namespace
 
-int main() {
+int main(int, char**) {
   Common::InitializeThreads();
   Common::Subsystems subsystems;
   subsystems.Initialize<Config::Lifecycle>();
@@ -492,6 +828,8 @@ int main() {
   TempDirectory temporary;
   FileSystem::Initialize();
   CheckMountRoot(temporary.Path());
+  CheckUnmappedPaths(temporary.Path());
+  CheckArchiveMount(temporary.Path());
   CheckUnicodePaths(temporary.Path());
   CheckUnicodeLogPath(temporary.Path());
   CheckDirectoryStream(temporary.Path());

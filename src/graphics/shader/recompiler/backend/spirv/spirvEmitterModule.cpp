@@ -47,6 +47,10 @@ uint32_t TypeF32(EmitterState& state) {
 	return state.builder.Type(spv::OpTypeFloat, 32);
 }
 
+uint32_t TypeF64(EmitterState& state) {
+	return state.builder.Type(spv::OpTypeFloat, 64);
+}
+
 uint32_t TypeU32Vector(EmitterState& state, uint32_t components) {
 	return state.builder.Type(spv::OpTypeVector, TypeU32(state), components);
 }
@@ -200,6 +204,16 @@ void DefineDescriptors(EmitterState& state) {
 					                            spv::DecorationAliased);
 					state.builder.AddAnnotation(spv::OpDecorate, state.storage_buffer_u64_variable,
 					                            spv::DecorationAliased);
+				}
+				if (state.requirements.coherent_buffers) {
+					// RDNA2 stores publish to L2 even without GLC; every alias of the buffer
+					// must participate in visibility for cache-bypassing polling loads.
+					state.builder.AddAnnotation(spv::OpDecorate, state.storage_buffer_variable,
+					                            spv::DecorationCoherent);
+					if (state.storage_buffer_u64_variable != 0) {
+						state.builder.AddAnnotation(spv::OpDecorate, state.storage_buffer_u64_variable,
+						                            spv::DecorationCoherent);
+					}
 				}
 				break;
 			case IR::DescriptorBindingKind::BdaPagetable:
@@ -484,13 +498,10 @@ void DefineOutputs(EmitterState& state) {
 		DefineMeshOutputs(state);
 		return;
 	}
-	if (state.program.stage == ShaderType::Vertex &&
-	    clip_distance_count + cull_distance_count < 8u &&
-	    std::ranges::any_of(
-	        state.outputs,
-	        [](const OutputBinding& output) {
-		        return output.kind == IR::StageOutputKind::Position;
-	        })) {
+	if (state.program.stage == ShaderType::Vertex && clip_distance_count + cull_distance_count < 8u &&
+	    std::ranges::any_of(state.outputs, [](const OutputBinding& output) {
+		    return output.kind == IR::StageOutputKind::Position;
+	    })) {
 		// Reserve one plane for the enabled PA_CL_CLIP_CNTL clipping-error cull.
 		state.invalid_position_clip_distance = clip_distance_count++;
 		state.outputs.push_back({{IR::StageOutputKind::ClipDistance,
@@ -615,9 +626,14 @@ void DefineModule(EmitterState& state) {
 		state.builder.RequireCapability(spv::CapabilityPhysicalStorageBufferAddresses);
 		state.builder.RequireExtension("SPV_KHR_physical_storage_buffer");
 	}
-	if (state.requirements.buffer_int64_atomics) {
+	if (state.requirements.buffer_int64_atomics || state.requirements.shared_int64_atomics) {
 		state.builder.RequireCapability(spv::CapabilityInt64);
 		state.builder.RequireCapability(spv::CapabilityInt64Atomics);
+	}
+	if (state.requirements.shared_int64_atomics) {
+		state.builder.RequireVersion(0x00010400u);
+		state.builder.RequireExtension("SPV_KHR_workgroup_memory_explicit_layout");
+		state.builder.RequireCapability(spv::CapabilityWorkgroupMemoryExplicitLayoutKHR);
 	}
 	if (state.clip_distance_variable != 0) {
 		state.builder.RequireCapability(spv::CapabilityClipDistance);
@@ -672,13 +688,26 @@ void DefineModule(EmitterState& state) {
 	// contract prevents host compilers from treating synthesized IEEE values as finite.
 	state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeSignedZeroInfNanPreserve,
 	                               32u);
+	if (state.requirements.float64) {
+		EXIT_NOT_IMPLEMENTED(state.program.stage == ShaderType::Compute &&
+		                     state.input_info.compute->float_mode != 0xc0);
+		// MODE=0xc0 uses round-to-nearest-even and preserves FP64 input/output denormals.
+		state.builder.RequireCapability(spv::CapabilityFloat64);
+		state.builder.RequireCapability(spv::CapabilityRoundingModeRTE);
+		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeSignedZeroInfNanPreserve,
+		                               64u);
+		// FP64 denormal preservation is temporarily disabled.
+		// state.builder.RequireCapability(spv::CapabilityDenormPreserve);
+		// state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeDenormPreserve, 64u);
+		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeRoundingModeRTE, 32u);
+	}
 	if (const auto* cs = ShaderWorkgroupInput(state.program.stage, state.input_info)) {
-		uint32_t local_x = state.requirements.compute_derivatives ? 2u : 1u;
-		uint32_t local_y = state.requirements.compute_derivatives ? 2u : 1u;
-		uint32_t local_z = 1u;
-		local_x          = cs->threads_num[0] != 0u ? cs->threads_num[0] : local_x;
-		local_y          = cs->threads_num[1] != 0u ? cs->threads_num[1] : local_y;
-		local_z          = cs->threads_num[2] != 0u ? cs->threads_num[2] : local_z;
+		uint32_t    local_x = state.requirements.compute_derivatives ? 2u : 1u;
+		uint32_t    local_y = state.requirements.compute_derivatives ? 2u : 1u;
+		uint32_t    local_z = 1u;
+		local_x             = cs->threads_num[0] != 0u ? cs->threads_num[0] : local_x;
+		local_y             = cs->threads_num[1] != 0u ? cs->threads_num[1] : local_y;
+		local_z             = cs->threads_num[2] != 0u ? cs->threads_num[2] : local_z;
 		if (state.lane_count == 2) {
 			local_x = ((local_x * local_y * local_z + 63u) / 64u) * 32u;
 			local_y = local_z = 1u;

@@ -1,5 +1,6 @@
 #include "libs/controller.h"
 
+#include <SDL3/SDL.h>
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
@@ -7,11 +8,11 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "kernel/pthread.h"
+#include "libs/dualSenseHaptics.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "libs/padData.h"
 
-#include <SDL3/SDL.h>
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -85,10 +86,10 @@ struct ControllerState {
 		uint16_t y    = 0;
 	};
 
-	uint64_t             time                                  = 0;
-	uint32_t             buttons                               = 0;
-	int                  axes[static_cast<int>(Axis::AxisMax)] = {128, 128, 128, 128, 0, 0};
-	Touch                touch[2];
+	uint64_t time                                  = 0;
+	uint32_t buttons                               = 0;
+	int      axes[static_cast<int>(Axis::AxisMax)] = {128, 128, 128, 128, 0, 0};
+	Touch    touch[2];
 	std::array<float, 3> accel {0.0f, 1.0f, 0.0f};
 	std::array<float, 3> gyro {};
 	std::array<float, 4> orientation {0.0f, 0.0f, 0.0f, 1.0f};
@@ -113,6 +114,7 @@ public:
 	void ReleaseHostPads();
 	void GetConnectionInfo(bool* flag, int* count);
 	void SetVibration(uint8_t large_motor, uint8_t small_motor);
+	int  GetActiveControllerId();
 	void SetLightBar(uint8_t r, uint8_t g, uint8_t b);
 	bool SetTriggerEffect(const PadTriggerEffectParam& param);
 	void ReadState(ControllerState* state, bool* flag, int* count);
@@ -131,6 +133,9 @@ private:
 	int              m_connected_count = 0;
 	bool             m_motion_enabled  = true;
 	uint64_t         m_gyro_time       = 0;
+	// Accelerometer gravity direction in the reset frame.
+	std::array<float, 3> m_up_reference {0.0f, 1.0f, 0.0f};
+	bool                 m_up_reference_valid = false;
 	ControllerState  m_state;
 	ControllerState  m_states[STATES_MAX];
 	bool             m_obtained[STATES_MAX] {};
@@ -147,13 +152,13 @@ static void pad_fill_data(PadData* data, const ControllerState& state, bool conn
 
 	std::memset(data, 0, sizeof(*data));
 
-	data->buttons            = state.buttons;
-	data->left_stick_x       = state.axes[static_cast<int>(Axis::LeftX)];
-	data->left_stick_y       = state.axes[static_cast<int>(Axis::LeftY)];
-	data->right_stick_x      = state.axes[static_cast<int>(Axis::RightX)];
-	data->right_stick_y      = state.axes[static_cast<int>(Axis::RightY)];
-	data->analog_buttons_l2  = state.axes[static_cast<int>(Axis::TriggerLeft)];
-	data->analog_buttons_r2  = state.axes[static_cast<int>(Axis::TriggerRight)];
+	data->buttons           = state.buttons;
+	data->left_stick_x      = state.axes[static_cast<int>(Axis::LeftX)];
+	data->left_stick_y      = state.axes[static_cast<int>(Axis::LeftY)];
+	data->right_stick_x     = state.axes[static_cast<int>(Axis::RightX)];
+	data->right_stick_y     = state.axes[static_cast<int>(Axis::RightY)];
+	data->analog_buttons_l2 = state.axes[static_cast<int>(Axis::TriggerLeft)];
+	data->analog_buttons_r2 = state.axes[static_cast<int>(Axis::TriggerRight)];
 	data->acceleration_x     = state.accel[0];
 	data->acceleration_y     = state.accel[1];
 	data->acceleration_z     = state.accel[2];
@@ -293,7 +298,11 @@ void GameController::Connect(int id) {
 	m_connected_ids.push_back(id);
 
 	if (id != HOST_INPUT_CONTROLLER_ID) {
-		if (auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(id)); pad != nullptr) {
+		if (auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(id));
+		    pad != nullptr) {
+			if (const auto& color = Config::GetControllerColor()) {
+				(void)SDL_SetGamepadLED(pad, (*color)[0], (*color)[1], (*color)[2]);
+			}
 			for (auto sensor: {SDL_SENSOR_ACCEL, SDL_SENSOR_GYRO}) {
 				if (SDL_GamepadHasSensor(pad, sensor) &&
 				    !SDL_SetGamepadSensorEnabled(pad, sensor, true)) {
@@ -342,6 +351,7 @@ void GameController::CheckActive() {
 	m_connected     = new_connected;
 	m_state         = {};
 	m_gyro_time     = 0;
+	m_up_reference_valid = false;
 	m_states_num    = 0;
 	m_first_state   = 0;
 	m_next_touch_id = 1;
@@ -433,6 +443,29 @@ void GameController::TouchPad(int id, int finger, bool down, float x, float y) {
 	}
 }
 
+namespace {
+
+using Vec3 = std::array<float, 3>;
+using Quat = std::array<float, 4>; // x, y, z, w
+
+Vec3 QuatRotate(const Quat& q, const Vec3& v) {
+	const Vec3 t {2.0f * (q[1] * v[2] - q[2] * v[1]), 2.0f * (q[2] * v[0] - q[0] * v[2]),
+	              2.0f * (q[0] * v[1] - q[1] * v[0])};
+	return {v[0] + q[3] * t[0] + (q[1] * t[2] - q[2] * t[1]),
+	        v[1] + q[3] * t[1] + (q[2] * t[0] - q[0] * t[2]),
+	        v[2] + q[3] * t[2] + (q[0] * t[1] - q[1] * t[0])};
+}
+
+Quat QuatConjugate(const Quat& q) {
+	return {-q[0], -q[1], -q[2], q[3]};
+}
+
+float Length(const Vec3& v) {
+	return std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+}
+
+} // namespace
+
 void GameController::Motion(int id, Sensor sensor, const float* data, uint64_t time_us) {
 	Common::LockGuard lock(m_mutex);
 	if (id != m_active_id || !m_motion_enabled) {
@@ -444,20 +477,38 @@ void GameController::Motion(int id, Sensor sensor, const float* data, uint64_t t
 		for (int i = 0; i < 3; i++) {
 			m_state.accel[i] = data[i] / SDL_STANDARD_GRAVITY;
 		}
+		// Capture gravity near 1 G to limit interference from linear acceleration.
+		const float magnitude = Length(m_state.accel);
+		if (!m_up_reference_valid && magnitude > 0.9f && magnitude < 1.1f) {
+			const Vec3 up {m_state.accel[0] / magnitude, m_state.accel[1] / magnitude,
+			               m_state.accel[2] / magnitude};
+			m_up_reference       = QuatRotate(m_state.orientation, up);
+			m_up_reference_valid = true;
+		}
 	} else {
 		std::copy_n(data, 3, m_state.gyro.begin());
+		// Mahony tilt correction; heading is unobservable and reported gyro values stay raw.
+		auto        rate      = m_state.gyro;
+		const float magnitude = Length(m_state.accel);
+		if (m_up_reference_valid && magnitude > 0.8f && magnitude < 1.2f) {
+			const Vec3 measured {m_state.accel[0] / magnitude, m_state.accel[1] / magnitude,
+			                     m_state.accel[2] / magnitude};
+			const Vec3 predicted = QuatRotate(QuatConjugate(m_state.orientation), m_up_reference);
+			rate[0] += measured[1] * predicted[2] - measured[2] * predicted[1];
+			rate[1] += measured[2] * predicted[0] - measured[0] * predicted[2];
+			rate[2] += measured[0] * predicted[1] - measured[1] * predicted[0];
+		}
 		// Do not extrapolate a single sample across lost reports (e.g. loss of window focus).
 		constexpr uint64_t max_gyro_interval_us = 100000;
 		if (m_gyro_time != 0 && time_us > m_gyro_time &&
 		    time_us - m_gyro_time <= max_gyro_interval_us) {
-			const float dt = static_cast<float>(time_us - m_gyro_time) * 0.000001f;
-			const float speed =
-			    std::sqrt(data[0] * data[0] + data[1] * data[1] + data[2] * data[2]);
+			const float dt         = static_cast<float>(time_us - m_gyro_time) * 0.000001f;
+			const float speed      = Length(rate);
 			const float half_angle = speed * dt * 0.5f;
 			const float scale      = speed > 0.0f ? std::sin(half_angle) / speed : 0.0f;
-			const float x          = data[0] * scale;
-			const float y          = data[1] * scale;
-			const float z          = data[2] * scale;
+			const float x          = rate[0] * scale;
+			const float y          = rate[1] * scale;
+			const float z          = rate[2] * scale;
 			const float w          = std::cos(half_angle);
 			const auto  q          = m_state.orientation;
 			// Accumulate body-local rotation relative to connection / orientation reset.
@@ -483,19 +534,21 @@ void GameController::Motion(int id, Sensor sensor, const float* data, uint64_t t
 void GameController::SetMotionSensorState(bool enable) {
 	Common::LockGuard lock(m_mutex);
 	if (m_motion_enabled != enable) {
-		m_motion_enabled = enable;
-		m_gyro_time      = 0;
-		m_state.accel    = {0.0f, 1.0f, 0.0f};
-		m_state.gyro     = {};
-		m_state.time     = LibKernel::KernelGetProcessTime();
+		m_motion_enabled     = enable;
+		m_gyro_time          = 0;
+		m_state.accel        = {0.0f, 1.0f, 0.0f};
+		m_state.gyro         = {};
+		m_up_reference_valid = false;
+		m_state.time         = LibKernel::KernelGetProcessTime();
 		AddState();
 	}
 }
 
 void GameController::ResetOrientation() {
 	Common::LockGuard lock(m_mutex);
-	m_state.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
-	m_gyro_time         = 0;
+	m_state.orientation  = {0.0f, 0.0f, 0.0f, 1.0f};
+	m_gyro_time          = 0;
+	m_up_reference_valid = false;
 	m_state.time        = LibKernel::KernelGetProcessTime();
 	AddState();
 }
@@ -517,16 +570,18 @@ void GameController::ResetInputState() {
 
 void GameController::ReleaseHostPads() {
 	Common::LockGuard lock(m_mutex);
+	DualSenseHaptics::Shutdown();
 
 	std::vector<SDL_Gamepad*> pads;
 	for (const auto id: m_connected_ids) {
 		if (id == HOST_INPUT_CONTROLLER_ID) {
 			continue;
 		}
-		if (auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(id)); pad != nullptr) {
+		if (auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(id));
+		    pad != nullptr) {
 			if (SDL_GetGamepadType(pad) == SDL_GAMEPAD_TYPE_PS5) {
 				DualSenseEffects effect {};
-				effect.enable_bits      = 0x0c;
+				effect.enable_bits     = 0x0c;
 				effect.right_trigger[0] = 0x05;
 				effect.left_trigger[0]  = 0x05;
 				(void)SDL_SendGamepadEffect(pad, &effect, sizeof(effect));
@@ -549,6 +604,9 @@ void GameController::ReleaseHostPads() {
 
 void GameController::SetVibration(uint8_t large_motor, uint8_t small_motor) {
 	Common::LockGuard lock(m_mutex);
+	if (DualSenseHaptics::SetVibration(m_active_id, large_motor, small_motor)) {
+		return;
+	}
 
 	if (m_active_id == HOST_INPUT_CONTROLLER_ID) {
 		return;
@@ -566,8 +624,18 @@ void GameController::SetVibration(uint8_t large_motor, uint8_t small_motor) {
 	}
 }
 
+int GameController::GetActiveControllerId() {
+	Common::LockGuard lock(m_mutex);
+	return m_active_id;
+}
+
 void GameController::SetLightBar(uint8_t r, uint8_t g, uint8_t b) {
 	Common::LockGuard lock(m_mutex);
+	if (const auto& color = Config::GetControllerColor()) {
+		r = (*color)[0];
+		g = (*color)[1];
+		b = (*color)[2];
+	}
 	if (auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(m_active_id));
 	    pad != nullptr) {
 		(void)SDL_SetGamepadLED(pad, r, g, b);
@@ -597,7 +665,7 @@ bool GameController::SetTriggerEffect(const PadTriggerEffectParam& param) {
 	}
 
 	Common::LockGuard lock(m_mutex);
-	auto*             pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(m_active_id));
+	auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(m_active_id));
 	if (pad != nullptr && SDL_GetGamepadType(pad) == SDL_GAMEPAD_TYPE_PS5) {
 		(void)SDL_SendGamepadEffect(pad, &effect, sizeof(effect));
 	}
@@ -688,6 +756,10 @@ void SetSensor(int id, Sensor sensor, const float* data, uint64_t time_us) {
 
 void ResetInputState() {
 	g_controller->ResetInputState();
+}
+
+int GetActiveControllerId() {
+	return g_controller != nullptr ? g_controller->GetActiveControllerId() : -1;
 }
 
 int KYTY_SYSV_ABI PadInit() {

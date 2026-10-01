@@ -30,6 +30,7 @@ std::string TypeName(Type type) {
 	    "ImageResource",
 	    "SamplerResource",
 	    "ImageAddress",
+	    "F64",
 	};
 	const auto bits = static_cast<uint32_t>(type);
 	if (bits == 0) {

@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -16,14 +17,17 @@ namespace {
 
 namespace AudioOut2 = Libs::Audio::AudioOut2;
 
-std::mutex              g_device_mutex;
-std::condition_variable g_device_cv;
-std::vector<int>        g_live_devices;
-std::vector<int>        g_device_backed_handles;
-std::vector<bool>       g_output_blocking;
-int                     g_next_device  = 1;
-int                     g_open_waiters = 0;
-bool                    g_block_opens  = false;
+AudioOut2::AudioOut2UserHandle     g_user_handle = 0;
+std::mutex                        g_device_mutex;
+std::condition_variable           g_device_cv;
+std::vector<int>                  g_live_devices;
+std::vector<int>                  g_device_backed_handles;
+std::vector<bool>                 g_output_blocking;
+std::vector<std::vector<uint8_t>> g_output_pcm;
+size_t                            g_capture_bytes = 0;
+int                               g_next_device  = 1;
+int                               g_open_waiters = 0;
+bool                              g_block_opens  = false;
 
 void Check(bool value, const char* text) {
 	if (!value) {
@@ -94,6 +98,7 @@ PortParam MakeParam(uint32_t data_format = 0x200) {
 	PortParam param {};
 	param.data_format   = data_format;
 	param.sampling_freq = 48000;
+	param.user_handle   = g_user_handle;
 	return param;
 }
 
@@ -105,6 +110,56 @@ AudioOut2::AudioOut2ContextHandle CreateContext(uint32_t queue_depth = 4) {
 	Check(AudioOut2::AudioOut2ContextCreate(AsParam(&param), nullptr, 0, &context) == OK,
 	      "context create failed");
 	return context;
+}
+
+void TestUserSupportedAttributes() {
+	constexpr int invalid_param = static_cast<int32_t>(0x80268001u);
+	constexpr int busy          = static_cast<int32_t>(0x80268007u);
+	AudioOut2::AudioOut2UserHandle user = 0;
+	Check(AudioOut2::AudioOut2UserCreate(1000, nullptr) == invalid_param,
+	      "null user handle output was accepted");
+	Check(AudioOut2::AudioOut2UserCreate(1000, &user) == OK, "user create failed");
+	uint32_t context_attributes = UINT32_MAX;
+	uint32_t port_attributes    = UINT32_MAX;
+	Check(AudioOut2::AudioOut2UserGetSupportedAttributes(user, &context_attributes,
+	                                                    &port_attributes) == OK &&
+	          context_attributes == 0 && port_attributes == 1,
+	      "user capabilities do not match implemented PCM support");
+
+	context_attributes = port_attributes = UINT32_MAX;
+	Check(AudioOut2::AudioOut2UserGetSupportedAttributes(user, nullptr, &port_attributes) ==
+	          invalid_param &&
+	          AudioOut2::AudioOut2UserGetSupportedAttributes(user, &context_attributes, nullptr) ==
+	              invalid_param &&
+	          context_attributes == UINT32_MAX && port_attributes == UINT32_MAX,
+	      "null capability outputs were accepted or modified");
+	for (const auto invalid: {AudioOut2::AudioOut2UserHandle {0}, UINTPTR_MAX}) {
+		Check(AudioOut2::AudioOut2UserGetSupportedAttributes(invalid, &context_attributes,
+		                                                    &port_attributes) == invalid_param &&
+		          context_attributes == UINT32_MAX && port_attributes == UINT32_MAX,
+		      "invalid user capabilities succeeded or modified outputs");
+	}
+
+	const auto context = CreateContext();
+	auto param = MakeParam();
+	param.user_handle = user;
+	AudioOut2::AudioOut2PortHandle port = 0;
+	Check(AudioOut2::AudioOut2PortCreate(context, AsParam(&param), &port) == OK,
+	      "user port create failed");
+	Check(AudioOut2::AudioOut2UserDestroy(user) == busy,
+	      "user was destroyed while owning a port");
+	AudioOut2::AudioOut2ContextDestroy(context);
+	Check(AudioOut2::AudioOut2UserDestroy(user) == OK, "unused user destroy failed");
+	Check(AudioOut2::AudioOut2UserGetSupportedAttributes(user, &context_attributes,
+	                                                    &port_attributes) == invalid_param &&
+	          context_attributes == UINT32_MAX && port_attributes == UINT32_MAX &&
+	          AudioOut2::AudioOut2UserDestroy(user) == invalid_param,
+	      "destroyed user remained valid");
+
+	const auto new_context = CreateContext();
+	Check(AudioOut2::AudioOut2PortCreate(new_context, AsParam(&param), &port) == invalid_param,
+	      "destroyed user acquired a port");
+	AudioOut2::AudioOut2ContextDestroy(new_context);
 }
 
 void BlockDeviceOpens() {
@@ -144,6 +199,17 @@ void ResetOutputCalls() {
 std::vector<bool> OutputCalls() {
 	std::lock_guard lock(g_device_mutex);
 	return g_output_blocking;
+}
+
+void CaptureOutputPcm(size_t bytes) {
+	std::lock_guard lock(g_device_mutex);
+	g_capture_bytes = bytes;
+	g_output_pcm.clear();
+}
+
+std::vector<std::vector<uint8_t>> OutputPcm() {
+	std::lock_guard lock(g_device_mutex);
+	return g_output_pcm;
 }
 
 void TestSlotReuse() {
@@ -327,6 +393,41 @@ void TestHandleWithoutPcmDoesNotBypassQueue() {
 	AudioOut2::AudioOut2ContextDestroy(context);
 }
 
+void TestPcmCopiedBeforeScratchBufferReuse() {
+	const auto context = CreateContext();
+	const auto param   = MakeParam();
+	AudioOut2::AudioOut2PortHandle first = 0;
+	AudioOut2::AudioOut2PortHandle second = 0;
+	Check(AudioOut2::AudioOut2PortCreate(context, AsParam(&param), &first) == OK,
+	      "first port create failed");
+	Check(AudioOut2::AudioOut2PortCreate(context, AsParam(&param), &second) == OK,
+	      "second port create failed");
+
+	std::vector<float> scratch(512 * 2);
+	std::vector<float> first_pcm(scratch.size(), 0.25f);
+	std::vector<float> second_pcm(scratch.size(), -0.5f);
+	std::copy(first_pcm.begin(), first_pcm.end(), scratch.begin());
+	SetPcm(first, scratch.data());
+	std::copy(second_pcm.begin(), second_pcm.end(), scratch.begin());
+	SetPcm(second, scratch.data());
+	std::fill(scratch.begin(), scratch.end(), 0.0f);
+
+	const auto pcm_bytes = scratch.size() * sizeof(float);
+	CaptureOutputPcm(pcm_bytes);
+	Check(AudioOut2::AudioOut2ContextPush(context, 1) == OK, "shared-buffer push failed");
+	const auto output = OutputPcm();
+	Check(output.size() == 2, "shared-buffer push did not output both ports");
+	Check(std::memcmp(output[0].data(), first_pcm.data(), pcm_bytes) == 0,
+	      "first port lost PCM when scratch buffer was reused");
+	Check(std::memcmp(output[1].data(), second_pcm.data(), pcm_bytes) == 0,
+	      "second port lost PCM when scratch buffer was reused");
+
+	CaptureOutputPcm(0);
+	AudioOut2::AudioOut2PortDestroy(first);
+	AudioOut2::AudioOut2PortDestroy(second);
+	AudioOut2::AudioOut2ContextDestroy(context);
+}
+
 } // namespace
 
 namespace Libs::Audio::AudioInternal {
@@ -363,9 +464,15 @@ bool AudioOutHasDevice(int handle) {
 	       g_device_backed_handles.end();
 }
 
-uint32_t AudioOutOutputs(const OutputParam* /*params*/, uint32_t /*num*/, bool blocking) {
+uint32_t AudioOutOutputs(const OutputParam* params, uint32_t num, bool blocking) {
 	std::lock_guard lock(g_device_mutex);
 	g_output_blocking.push_back(blocking);
+	if (g_capture_bytes != 0) {
+		for (uint32_t i = 0; i < num; i++) {
+			const auto* bytes = static_cast<const uint8_t*>(params[i].data);
+			g_output_pcm.emplace_back(bytes, bytes + g_capture_bytes);
+		}
+	}
 	return 0;
 }
 
@@ -381,6 +488,8 @@ uint64_t KYTY_SYSV_ABI KernelGetProcessTime() {
 } // namespace Libs::LibKernel
 
 int main() {
+	Check(AudioOut2::AudioOut2UserCreate(1000, &g_user_handle) == OK, "test user create failed");
+	TestUserSupportedAttributes();
 	TestSlotReuse();
 	TestFullTableRecovers();
 	TestConcurrentCreates();
@@ -389,6 +498,8 @@ int main() {
 	TestFloat12ChannelPortOutputsPcm();
 	TestAsynchronousDevicePushKeepsQueueBounded();
 	TestHandleWithoutPcmDoesNotBypassQueue();
+	TestPcmCopiedBeforeScratchBufferReuse();
+	Check(AudioOut2::AudioOut2UserDestroy(g_user_handle) == OK, "test user destroy failed");
 	std::printf("AudioOut2PortTests: all cases passed\n");
 	return 0;
 }

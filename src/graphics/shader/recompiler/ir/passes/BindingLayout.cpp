@@ -46,28 +46,54 @@ void AddBinding(BindingLayout& layout, DescriptorBindingKind kind,
 	layout.descriptors.push_back({kind, std::move(resources)});
 }
 
-bool UsesGds(const Program& program) {
+} // namespace
+
+bool CollectMemoryResources(const Program& program, std::vector<uint32_t>& buffers) {
+	std::array<bool, ShaderInfo::MaxBuffers> live_buffers {};
 	bool uses_gds = false;
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
-			if (SharedAccessOf(inst.GetOpcode()) == SharedAccess::None) {
+			const auto op = inst.GetOpcode();
+			if (BufferAccessOf(op) == BufferAccess::None &&
+			    SharedAccessOf(op) == SharedAccess::None) {
 				continue;
 			}
 			const auto index = inst.Flags<MemoryFlags>().index;
 			if (index >= program.memory_info.size()) {
-				BindingFail("typed shader contains invalid shared-memory metadata");
+				BindingFail("typed shader contains invalid memory metadata");
 			}
-			const auto kind = program.memory_info[index].kind;
-			if (kind != ResourceKind::Lds && kind != ResourceKind::Gds) {
-				BindingFail("typed shader contains invalid shared-memory metadata");
+			const auto& memory = program.memory_info[index];
+			if (memory.planning_only) {
+				continue;
 			}
-			uses_gds |= kind == ResourceKind::Gds;
+			if (SharedAccessOf(op) != SharedAccess::None) {
+				if (memory.kind != ResourceKind::Lds && memory.kind != ResourceKind::Gds) {
+					BindingFail("typed shader contains invalid shared-memory metadata");
+				}
+				uses_gds |= memory.kind == ResourceKind::Gds;
+			} else if (memory.kind == ResourceKind::Buffer || memory.kind == ResourceKind::ScalarBuffer) {
+				EXIT_IF(memory.resource >= program.info.buffers.size());
+				live_buffers.at(memory.resource) = true;
+			}
+		}
+	}
+	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+		if (live_buffers.at(i)) {
+			buffers.push_back(i);
 		}
 	}
 	return uses_gds;
 }
 
-} // namespace
+bool UsesFlattenedSrt(const Program& program) {
+	return std::ranges::any_of(program.blocks, [](const Block* block) {
+		return std::ranges::any_of(*block, [](const Inst& inst) {
+			return inst.GetOpcode() == ValueOpcode::ReadConst;
+		});
+	}) || std::ranges::any_of(program.info.images, [](const ImageResource& image) {
+		return image.indirect_search_iterations != 0u;
+	});
+}
 
 void AllocateBindings(Program& program, uint32_t push_data_start_dword) {
 	if (!program.shader_info_complete || program.binding_layout_complete) {
@@ -76,18 +102,17 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword) {
 		                                             : "binding layout already allocated");
 	}
 	BindingLayout next;
+	std::vector<uint32_t> buffers;
+	const bool            uses_gds = CollectMemoryResources(program, buffers);
 	next.user_data_registers = CollectUserData(program);
 	next.memory_offset_dword = static_cast<uint32_t>(next.user_data_registers.size());
-	next.memory_offset_count = static_cast<uint32_t>(program.info.buffers.size());
+	next.memory_offset_count       = static_cast<uint32_t>(buffers.size());
 	next.push_data_start_dword =
 	    PushData::StartFor(push_data_start_dword, next.ShaderDataDwords());
 
-	if (!program.info.buffers.empty()) {
-		std::vector<uint32_t> resources(program.info.buffers.size());
-		for (uint32_t i = 0; i < resources.size(); i++) {
-			resources[i] = i;
-		}
-		AddBinding(next, DescriptorBindingKind::Buffers, std::move(resources));
+	if (!buffers.empty()) {
+		// Draw binding accesses this first group directly when memory_offset_count is nonzero.
+		AddBinding(next, DescriptorBindingKind::Buffers, std::move(buffers));
 	}
 
 	std::array<std::vector<uint32_t>, ImageBindingCount> image_groups;
@@ -123,19 +148,14 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword) {
 		}
 		AddBinding(next, DescriptorBindingKind::Samplers, std::move(resources));
 	}
-	if (UsesGds(program)) {
+	if (uses_gds) {
 		AddBinding(next, DescriptorBindingKind::Gds);
 	}
 	if (program.info.uses_dma) {
 		AddBinding(next, DescriptorBindingKind::BdaPagetable);
 		AddBinding(next, DescriptorBindingKind::FaultBuffer);
 	}
-	const bool uses_flattened_runtime =
-	    !program.srt_reads.empty() ||
-	    std::ranges::any_of(program.info.images, [](const ImageResource& image) {
-		    return image.indirect_search_iterations != 0u;
-	    });
-	if (uses_flattened_runtime) {
+	if (UsesFlattenedSrt(program)) {
 		AddBinding(next, DescriptorBindingKind::FlattenedSrt);
 	}
 

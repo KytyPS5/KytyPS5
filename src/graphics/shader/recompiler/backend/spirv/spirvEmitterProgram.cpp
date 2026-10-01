@@ -1,5 +1,6 @@
-#include "common/assert.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
+
+#include "common/assert.h"
 
 #include <algorithm>
 #include <bit>
@@ -56,11 +57,11 @@ struct StructuredFunctionState {
 
 struct DispatcherFunctionState {
 	std::array<std::unordered_map<const IR::Inst*, uint32_t>, 2> spills;
-	uint32_t                                                     header_label       = 0;
-	uint32_t                                                     select_label       = 0;
-	uint32_t                                                     after_switch_label = 0;
-	uint32_t                                                     continue_label     = 0;
-	uint32_t                                                     merge_label        = 0;
+	uint32_t                                      header_label       = 0;
+	uint32_t                                      select_label       = 0;
+	uint32_t                                      after_switch_label = 0;
+	uint32_t                                      continue_label     = 0;
+	uint32_t                                      merge_label        = 0;
 };
 
 void StoreDispatcherPhiEdge(ValueEmitContext& ctx, const DispatcherFunctionState& dispatcher,
@@ -96,33 +97,9 @@ void EmitReturn(ValueEmitContext& ctx) {
 	ctx.state.builder.AddFunction(spv::OpReturn);
 }
 
-uint32_t BranchCondition(ValueEmitContext& ctx, const IR::BlockInfo& info) {
-	// Scalar-instruction conditions already test the full wave's raw register values.
-	if (ctx.other_half == nullptr ||
-	    info.terminator.condition == CFG::BranchCondition::ScalarInstruction ||
-	    info.terminator.condition == CFG::BranchCondition::GotoVariable) {
-		return ctx.Def(info.condition);
-	}
-	const auto ballot = ctx.Ballot(info.condition);
-	const auto low    = ctx.state.builder.AllocateId();
-	const auto high   = ctx.state.builder.AllocateId();
-	const auto result = ctx.state.builder.AllocateId();
-	ctx.state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(ctx.state), low, ballot, 0);
-	ctx.state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(ctx.state), high, ballot, 1);
-	const auto kind = info.terminator.condition;
-	const bool zero = kind == CFG::BranchCondition::ExecZero ||
-	                  kind == CFG::BranchCondition::VccZero ||
-	                  kind == CFG::BranchCondition::SccZero;
-	const auto combined =
-	    EmitBinaryU32(ctx.state, zero ? spv::OpBitwiseAnd : spv::OpBitwiseOr, low, high);
-	ctx.state.builder.AddFunction(zero ? spv::OpIEqual : spv::OpINotEqual, TypeBool(ctx.state),
-	                              result, combined, ConstantU32(ctx.state, zero ? ~0u : 0u));
-	return result;
-}
-
 void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
                               const IR::BlockInfo& info) {
-	const auto& program    = ctx.state.program;
+	const auto& program = ctx.state.program;
 	const auto& term       = info.terminator;
 	const auto  emit_merge = [&]() {
 		if (term.loop_header) {
@@ -159,7 +136,7 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
 				EmitReturn(ctx);
 				return;
 			}
-			const auto condition = BranchCondition(ctx, info);
+			const auto condition = ctx.Def(info.condition);
 			emit_merge();
 			ctx.state.builder.AddFunction(spv::OpBranchConditional, condition,
 			                              ctx.Label(true_block), ctx.Label(false_block));
@@ -192,7 +169,7 @@ uint32_t EmitDispatcherNextPc(ValueEmitContext& ctx, const DispatcherFunctionSta
 			EmitDispatcherTarget(ctx, dispatcher, block, term.false_block);
 			const auto selected = ctx.state.builder.AllocateId();
 			ctx.state.builder.AddFunction(
-			    spv::OpSelect, TypeU32(ctx.state), selected, BranchCondition(ctx, info),
+			    spv::OpSelect, TypeU32(ctx.state), selected, ctx.Def(info.condition),
 			    ConstantU32(ctx.state, term.true_block), ConstantU32(ctx.state, term.false_block));
 			return selected;
 		}
@@ -356,7 +333,7 @@ void PatchStructuredPhis(ValueEmitContext& ctx, StructuredFunctionState& structu
 }
 
 void EmitStructuredFunction(ValueEmitContext& ctx) {
-	const auto&             program = ctx.state.program;
+	const auto& program = ctx.state.program;
 	StructuredFunctionState structured;
 	ctx.state.builder.AddFunction(spv::OpBranch, ctx.Label(program.blocks.front()));
 	for (size_t index = 0; index < program.blocks.size(); index++) {
@@ -439,6 +416,7 @@ uint32_t TypeId(EmitterState& state, IR::Type type) {
 		case IR::Type::U64: return TypeU64(state);
 		case IR::Type::U32x2: return TypeU32Pair(state);
 		case IR::Type::F32: return TypeF32(state);
+		case IR::Type::F64: return TypeF64(state);
 		case IR::Type::U32x3: return TypeU32Vector(state, 3);
 		case IR::Type::U32x4: return TypeU32Vector(state, 4);
 		case IR::Type::F32x2: return TypeF32Vector(state, 2);
@@ -551,9 +529,9 @@ uint32_t ValueEmitContext::Shuffle(const IR::Inst& inst, size_t index, uint32_t 
 	}
 	const auto physical_lane =
 	    EmitBinaryU32(state, spv::OpBitwiseAnd, lane, ConstantU32(state, 31));
-	const auto high    = state.builder.AllocateId();
-	const auto in_high = state.builder.AllocateId();
-	const auto value   = state.builder.AllocateId();
+	const auto high          = state.builder.AllocateId();
+	const auto in_high       = state.builder.AllocateId();
+	const auto value         = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpGroupNonUniformShuffle, type, low, scope,
 	                          HalfArg(inst, index, 0), physical_lane);
 	state.builder.AddFunction(spv::OpGroupNonUniformShuffle, type, high, scope,

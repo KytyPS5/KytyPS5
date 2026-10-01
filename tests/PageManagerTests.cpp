@@ -192,13 +192,25 @@ uint8_t *Allocate(uint64_t size, uint32_t protection = PAGE_READWRITE,
   Check(memory == reinterpret_cast<void *>(test_address),
         "fixed low VirtualAlloc failed");
 #elif defined(__APPLE__)
-  mach_vm_address_t raw = test_address;
-  Check(mach_vm_allocate(mach_task_self(), &raw, size, VM_FLAGS_FIXED) ==
-            KERN_SUCCESS &&
-            mach_vm_protect(mach_task_self(), raw, size, false,
-                            static_cast<vm_prot_t>(ToHostProt(protection))) ==
-                KERN_SUCCESS,
-        "fixed low mach_vm_allocate failed");
+  mach_vm_address_t raw = 0;
+  bool allocated = false;
+  constexpr uintptr_t stride = 0x0000000100000000ull;
+  for (uintptr_t candidate = test_address;
+       Libs::Graphics::GuestRange{candidate, size}.Valid(); candidate += stride) {
+    raw = candidate;
+    if (mach_vm_allocate(mach_task_self(), &raw, size, VM_FLAGS_FIXED) !=
+        KERN_SUCCESS) {
+      continue;
+    }
+    if (mach_vm_protect(mach_task_self(), raw, size, false,
+                        static_cast<vm_prot_t>(ToHostProt(protection))) ==
+        KERN_SUCCESS) {
+      allocated = true;
+      break;
+    }
+    mach_vm_deallocate(mach_task_self(), raw, size);
+  }
+  Check(allocated, "no free fixed guest address found");
   auto *memory = reinterpret_cast<uint8_t *>(raw);
   AllocationSizes()[memory] = static_cast<size_t>(size);
 #else

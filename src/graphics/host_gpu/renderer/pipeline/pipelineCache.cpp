@@ -581,7 +581,8 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     const HW::VertexShaderInfo& vertex_regs, const HW::PixelShaderInfo& pixel_regs,
     const HW::ShaderRegisters& sh, const HW::Context& context, const HW::UserConfig& user_config,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping, bool pixel_active,
-    std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info) {
+    std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info,
+    bool single_sample) {
 	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
 	std::array<ShaderParams, 3> vertex_params;
 	if (tess_active) {
@@ -635,6 +636,10 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 			pixel_info.target_output_mode[1]    = pixel_info.target_output_mode[0];
 			pixel_info.target_export_mapping[1] = {};
 		}
+		pixel_info.ps_single_sample = single_sample;
+	}
+	if (!tess_active) {
+		vertex_info[0].pixel_input = pixel_active ? &pixel_info : nullptr;
 	}
 	if (context.GetClipControl().clip_disable) {
 		const auto& viewport = context.GetScreenViewport().viewports[0];
@@ -653,11 +658,21 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	uint32_t          push_data_cursor =
 	    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount : 0;
 	GraphicsPrograms  result;
-	if (pixel_active) {
+	const bool       coupled_vertex_plan = pixel_active && !tess_active && !mesh_active;
+	if (pixel_active && !coupled_vertex_plan) {
 		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
 	}
 	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
 		result.vertex[i] = m_program_cache->Get(vertex_params[i], vertex_info[i], push_data_cursor);
+	}
+	if (coupled_vertex_plan) {
+		if (vertex_info[0].stage && vertex_info[0].stage.program != nullptr) {
+			const auto& vertex_info_compiled    = vertex_info[0].stage.program->info;
+			pixel_info.parameter_plan.locations = vertex_info_compiled.parameter_locations;
+			pixel_info.parameter_plan.aliases   = vertex_info_compiled.parameter_aliases;
+			pixel_info.parameter_plan.valid     = vertex_info_compiled.parameter_plan_valid;
+		}
+		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
 	}
 	return result;
 }

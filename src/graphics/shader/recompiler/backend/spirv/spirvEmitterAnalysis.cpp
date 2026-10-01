@@ -7,6 +7,11 @@
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
 uint32_t PixelParameterLocation(const EmitterState& state, uint32_t attr) {
+	const auto* pixel = state.input_info.pixel;
+	if (state.program.stage == ShaderType::Pixel && pixel != nullptr &&
+	    pixel->parameter_plan.valid && attr < pixel->parameter_plan.locations.size()) {
+		return pixel->parameter_plan.locations[attr];
+	}
 	std::array<uint32_t, 32> active_inputs {};
 	uint32_t                 active_count = 0;
 	for (const auto& input: state.inputs) {

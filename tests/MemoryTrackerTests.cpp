@@ -1,3 +1,4 @@
+#include "MachTestMemory.h"
 #include "common/hostException.h"
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/memoryTracker.h"
@@ -127,19 +128,8 @@ std::map<void *, size_t> &AllocationSizes() {
 
 void *VirtualAlloc(void *address, size_t size, DWORD, uint32_t protection) {
 #if defined(__APPLE__)
-  mach_vm_address_t raw_address = reinterpret_cast<mach_vm_address_t>(address);
-  const auto flags = address != nullptr ? VM_FLAGS_FIXED : VM_FLAGS_ANYWHERE;
-  if (mach_vm_allocate(mach_task_self(), &raw_address, size, flags) !=
-      KERN_SUCCESS) {
-    return nullptr;
-  }
-  if (mach_vm_protect(mach_task_self(), raw_address, size, false,
-                      static_cast<vm_prot_t>(ToHostProt(protection))) !=
-      KERN_SUCCESS) {
-    mach_vm_deallocate(mach_task_self(), raw_address, size);
-    return nullptr;
-  }
-  void *raw = reinterpret_cast<void *>(raw_address);
+  auto* raw = TestMemory::Allocate(reinterpret_cast<uint64_t>(address), size, static_cast<vm_prot_t>(ToHostProt(protection)));
+  if (raw == nullptr) return nullptr;
   AllocationSizes()[raw] = size;
   return raw;
 #else
@@ -244,7 +234,7 @@ uint8_t *Allocate(PageManager &manager, uint64_t pages) {
   auto *memory = static_cast<uint8_t *>(
       VirtualAlloc(reinterpret_cast<void *>(base), size,
                    MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-  Check(memory == reinterpret_cast<void *>(base), "fixed VirtualAlloc failed");
+  Check(memory != nullptr && reinterpret_cast<uint64_t>(memory) % Libs::Graphics::TRACKER_REGION_SIZE == base % Libs::Graphics::TRACKER_REGION_SIZE, "test VirtualAlloc failed or changed region offset");
   return memory;
 }
 
@@ -394,8 +384,7 @@ void TestRangeInvalidation() {
   auto *memory = static_cast<uint8_t *>(
       VirtualAlloc(reinterpret_cast<void *>(base), size,
                    MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-  Check(memory == reinterpret_cast<void *>(base),
-        "range invalidation allocation failed");
+  Check(memory != nullptr && reinterpret_cast<uint64_t>(memory) % Libs::Graphics::TRACKER_REGION_SIZE == 0, "range invalidation allocation failed or changed alignment");
   const auto address = reinterpret_cast<uint64_t>(memory);
 
   tracker.ForEachUploadRange(
@@ -623,7 +612,7 @@ void TestCrossRegionUpload() {
   auto *memory = static_cast<uint8_t *>(
       VirtualAlloc(reinterpret_cast<void *>(base), region_size * 2,
                    MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-  Check(memory == reinterpret_cast<void *>(base), "fixed VirtualAlloc failed");
+  Check(memory != nullptr && reinterpret_cast<uint64_t>(memory) % Libs::Graphics::TRACKER_REGION_SIZE == base % Libs::Graphics::TRACKER_REGION_SIZE, "test VirtualAlloc failed or changed region offset");
   const auto address = reinterpret_cast<uint64_t>(memory);
   const auto boundary = (address + region_size - 1) & ~(region_size - 1);
   uint32_t ranges = 0;
@@ -1010,6 +999,9 @@ int main(int argc, char **argv) {
   if (argc == 3 && std::strcmp(argv[1], "--death") == 0) {
     RunDeathCase(argv[2]);
   }
+#if defined(__APPLE__)
+  Check(TestMemory::CheckOccupiedPreferredAddress(), "occupied preferred address was not safely relocated");
+#endif
   TestGuestRange();
   TestRangeSet();
   TestQueriesDoNotRequireMappedOwnership();

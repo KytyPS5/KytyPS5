@@ -624,6 +624,16 @@ static void ShaderGetStaticInputInfoCS(const HW::ComputeShaderInfo& regs,
 void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t>& key) {
 	EXIT_IF(info.resources_num < 0 || info.resources_num > ShaderVertexInputInfo::RES_MAX);
 	key.clear();
+	if (info.pixel_input != nullptr) {
+		key.push_back(1u);
+		key.push_back(info.pixel_input->input_num);
+		for (uint32_t i = 0; i < info.pixel_input->input_num && i < 32u; i++) {
+			key.push_back(info.pixel_input->interpolator_settings[i]);
+		}
+		key.push_back(info.pixel_input->custom_interpolation_mask);
+	} else {
+		key.push_back(0u);
+	}
 	key.push_back(static_cast<uint32_t>(info.fetch_embedded));
 	key.push_back(static_cast<uint32_t>(info.fetch_attrib_reg));
 	key.push_back(static_cast<uint32_t>(info.fetch_buffer_reg));
@@ -674,6 +684,15 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>& key) {
 	EXIT_IF(info.input_num > std::size(info.interpolator_settings));
 	key.clear();
+	key.push_back(static_cast<uint32_t>(info.parameter_plan.valid));
+	for (const auto location: info.parameter_plan.locations) {
+		key.push_back(location);
+	}
+	key.push_back(static_cast<uint32_t>(info.parameter_plan.aliases.size()));
+	for (const auto& alias: info.parameter_plan.aliases) {
+		key.push_back(alias.first);
+		key.push_back(alias.second);
+	}
 	key.push_back(info.scratch_size_dwords);
 	key.push_back(info.input_num);
 	key.push_back(info.wave_size);
@@ -681,6 +700,7 @@ void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>
 	key.push_back(info.custom_interpolation_mask);
 	key.push_back(info.ps_perspective_center_vgpr);
 	key.push_back(info.ps_perspective_centroid_vgpr);
+	key.push_back(static_cast<uint32_t>(info.ps_single_sample));
 	key.push_back(static_cast<uint32_t>(info.ps_pos_x));
 	key.push_back(static_cast<uint32_t>(info.ps_pos_y));
 	key.push_back(static_cast<uint32_t>(info.ps_pos_z));

@@ -444,6 +444,9 @@ struct ShaderInfo {
 	std::vector<BufferResource>      buffers;
 	std::vector<ImageResource>       images;
 	std::vector<SamplerResource>     samplers;
+	std::array<uint32_t, 32>                   parameter_locations {};
+	std::vector<std::pair<uint32_t, uint32_t>> parameter_aliases;
+	bool                                       parameter_plan_valid = false;
 	std::vector<SampledResourcePair> sampled_pairs;
 	std::vector<StageInput>          inputs;
 	std::vector<StageOutput>         outputs;

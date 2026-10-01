@@ -1,12 +1,7 @@
 #include "graphics/presentation/window/hostInput.h"
 
-#include "SDL_error.h"
-#include "SDL_events.h"
-#include "SDL_keyboard.h"
-#include "SDL_keycode.h"
-#include "SDL_mouse.h"
-#include "SDL_timer.h"
-#include "SDL_video.h"
+#include <SDL3/SDL.h>
+
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
@@ -80,6 +75,7 @@ struct MouseJoystickState {
 };
 
 MouseJoystickState g_mouse;
+SDL_Window*        g_mouse_window = nullptr;
 
 std::size_t ControlFromName(std::string_view name) {
 	const auto info = std::find_if(CONTROL_INFO.begin(), CONTROL_INFO.end(),
@@ -213,14 +209,14 @@ uint32_t DefaultKeyboardButton(int key_code) {
 		case SDLK_LEFT: return Controller::PAD_BUTTON_LEFT;
 		case SDLK_DOWN: return Controller::PAD_BUTTON_DOWN;
 		case SDLK_RIGHT: return Controller::PAD_BUTTON_RIGHT;
-		case SDLK_j: return Controller::PAD_BUTTON_CROSS;
-		case SDLK_i: return Controller::PAD_BUTTON_TRIANGLE;
-		case SDLK_k: return Controller::PAD_BUTTON_SQUARE;
-		case SDLK_l: return Controller::PAD_BUTTON_CIRCLE;
-		case SDLK_q: return Controller::PAD_BUTTON_L1;
-		case SDLK_e: return Controller::PAD_BUTTON_R1;
-		case SDLK_z: return Controller::PAD_BUTTON_L2;
-		case SDLK_c: return Controller::PAD_BUTTON_R2;
+		case SDLK_J: return Controller::PAD_BUTTON_CROSS;
+		case SDLK_I: return Controller::PAD_BUTTON_TRIANGLE;
+		case SDLK_K: return Controller::PAD_BUTTON_SQUARE;
+		case SDLK_L: return Controller::PAD_BUTTON_CIRCLE;
+		case SDLK_Q: return Controller::PAD_BUTTON_L1;
+		case SDLK_E: return Controller::PAD_BUTTON_R1;
+		case SDLK_Z: return Controller::PAD_BUTTON_L2;
+		case SDLK_C: return Controller::PAD_BUTTON_R2;
 		case SDLK_LSHIFT: return Controller::PAD_BUTTON_L3;
 		case SDLK_LCTRL: return Controller::PAD_BUTTON_R3;
 		case SDLK_RETURN:
@@ -284,35 +280,35 @@ void DefaultKeyboardInput(int key_code, bool down) {
 	switch (NormalizeKey(static_cast<SDL_Keycode>(key_code))) {
 		case SDLK_BACKSPACE: SetTouchPad(0.25f, down); return;
 		case SDLK_TAB: SetTouchPad(0.75f, down); return;
-		case SDLK_a:
+		case SDLK_A:
 			left.left = down;
 			SetStickAxis(Controller::Axis::LeftX, left.left, left.right);
 			return;
-		case SDLK_d:
+		case SDLK_D:
 			left.right = down;
 			SetStickAxis(Controller::Axis::LeftX, left.left, left.right);
 			return;
-		case SDLK_w:
+		case SDLK_W:
 			left.up = down;
 			SetStickAxis(Controller::Axis::LeftY, left.up, left.down);
 			return;
-		case SDLK_s:
+		case SDLK_S:
 			left.down = down;
 			SetStickAxis(Controller::Axis::LeftY, left.up, left.down);
 			return;
-		case SDLK_f:
+		case SDLK_F:
 			right.left = down;
 			SetStickAxis(Controller::Axis::RightX, right.left, right.right);
 			return;
-		case SDLK_h:
+		case SDLK_H:
 			right.right = down;
 			SetStickAxis(Controller::Axis::RightX, right.left, right.right);
 			return;
-		case SDLK_t:
+		case SDLK_T:
 			right.up = down;
 			SetStickAxis(Controller::Axis::RightY, right.up, right.down);
 			return;
-		case SDLK_g:
+		case SDLK_G:
 			right.down = down;
 			SetStickAxis(Controller::Axis::RightY, right.up, right.down);
 			return;
@@ -320,11 +316,11 @@ void DefaultKeyboardInput(int key_code, bool down) {
 	}
 }
 
-void MouseToJoystick(int delta_x, int delta_y) {
+void MouseToJoystick(float delta_x, float delta_y) {
 	const double distance = std::hypot(delta_x, delta_y);
 	const double scale =
 	    std::clamp(distance * GetInputMap().MouseSensitivity() + 16.0, 64.0, 128.0) / distance;
-	const auto map_axis = [scale](int delta) {
+	const auto map_axis = [scale](float delta) {
 		return std::clamp(128 + static_cast<int>(std::lround(delta * scale)), 0, 255);
 	};
 	Controller::SetRightStick(Controller::HOST_INPUT_CONTROLLER_ID, map_axis(delta_x),
@@ -340,16 +336,45 @@ void CenterMouseStick() {
 }
 
 bool SetRelativeMouseMode(bool enabled) {
-	if (SDL_SetRelativeMouseMode(enabled ? SDL_TRUE : SDL_FALSE) == 0) {
+	if (SDL_SetWindowRelativeMouseMode(g_mouse_window, enabled)) {
 		return true;
 	}
 	LOGF("Mouse-to-joystick relative mode failed: %s\n", SDL_GetError());
 	return false;
 }
+
+int PollMouse(uint64_t now_ms) {
+	if (now_ms < g_mouse.next_poll) {
+		return static_cast<int>(g_mouse.next_poll - now_ms);
+	}
+	g_mouse.next_poll = now_ms + MOUSE_POLL_INTERVAL_MS;
+
+	float delta_x = 0;
+	float delta_y = 0;
+	SDL_GetRelativeMouseState(&delta_x, &delta_y);
+	if (delta_x == 0 && delta_y == 0) {
+		CenterMouseStick();
+	} else {
+		MouseToJoystick(delta_x, delta_y);
+		g_mouse.output = true;
+	}
+	return MOUSE_POLL_INTERVAL_MS;
+}
+
 } // namespace
 
-void HostInputInit() {
+void HostInputInit(SDL_Window* window) {
 	GetInputMap();
+	g_mouse_window = window;
+}
+
+void HostInputShutdown() {
+	if (g_mouse.enabled) {
+		SetRelativeMouseMode(false);
+		CenterMouseStick();
+		g_mouse = {};
+	}
+	g_mouse_window = nullptr;
 }
 
 void HostInputKey(int key_code, bool down) {
@@ -380,51 +405,33 @@ void HostInputToggleMouseToJoystick() {
 	if (!SetRelativeMouseMode(true)) {
 		return;
 	}
-	int ignored_x = 0;
-	int ignored_y = 0;
-	SDL_GetRelativeMouseState(&ignored_x, &ignored_y);
-	g_mouse.enabled   = true;
-	g_mouse.next_poll = SDL_GetTicks64() + MOUSE_POLL_INTERVAL_MS;
+	g_mouse.enabled = true;
 	LOGF("Mouse to right stick: enabled (F7 to release)\n");
 }
 
-int PollMouse(uint64_t now_ms) {
-	if (now_ms < g_mouse.next_poll) {
-		return static_cast<int>(g_mouse.next_poll - now_ms);
-	}
-	g_mouse.next_poll = now_ms + MOUSE_POLL_INTERVAL_MS;
-
-	int delta_x = 0;
-	int delta_y = 0;
-	SDL_GetRelativeMouseState(&delta_x, &delta_y);
-	if (delta_x == 0 && delta_y == 0) {
-		CenterMouseStick();
-		return MOUSE_POLL_INTERVAL_MS;
-	}
-
-	MouseToJoystick(delta_x, delta_y);
-	g_mouse.output = true;
-	return MOUSE_POLL_INTERVAL_MS;
-}
-
 bool HostInputWaitEvent(SDL_Event* event) {
-	if (!g_mouse.enabled || SDL_GetKeyboardFocus() == nullptr) {
+	bool has_event;
+	if (!g_mouse.enabled || SDL_GetKeyboardFocus() != g_mouse_window) {
+		g_mouse.next_poll = 0;
 		CenterMouseStick();
-		if (SDL_WaitEvent(event) == 0) {
+		has_event = SDL_WaitEvent(event);
+		if (!has_event) {
 			EXIT("%s\n", SDL_GetError());
 		}
-		return true;
+	} else {
+		if (g_mouse.next_poll == 0) {
+			SDL_GetRelativeMouseState(nullptr, nullptr);
+			g_mouse.next_poll = SDL_GetTicks() + MOUSE_POLL_INTERVAL_MS;
+		}
+		has_event = SDL_WaitEventTimeout(event, PollMouse(SDL_GetTicks()));
 	}
 
-	const int timeout_ms = PollMouse(SDL_GetTicks64());
-	SDL_ClearError();
-	if (SDL_WaitEventTimeout(event, timeout_ms) != 0) {
-		return true;
+	if (has_event && event->type == SDL_EVENT_WINDOW_FOCUS_LOST &&
+	    event->window.windowID == SDL_GetWindowID(g_mouse_window)) {
+		g_mouse.next_poll = 0;
+		CenterMouseStick();
 	}
-	if (SDL_GetError()[0] != '\0') {
-		EXIT("%s\n", SDL_GetError());
-	}
-	return false;
+	return has_event;
 }
 
 } // namespace Libs::Graphics

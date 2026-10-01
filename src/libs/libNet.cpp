@@ -7,9 +7,11 @@
 #include "libs/network.h"
 #include "loader/symbolDatabase.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cstddef>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <string>
@@ -163,6 +165,16 @@ int KYTY_SYSV_ABI NetSetsockopt(int s, int level, int optname, const void* optva
 	return FinishSocketCall(Net::Setsockopt(s, level, optname, optval, optlen));
 }
 
+int KYTY_SYSV_ABI NetSend(int s, const void* buf, size_t len, int flags) {
+	const auto size = std::min<size_t>(len, std::numeric_limits<int>::max());
+	return FinishSocketCall(static_cast<int>(Net::Send(s, buf, size, flags | 0x20000)));
+}
+
+int KYTY_SYSV_ABI NetRecv(int s, void* buf, size_t len, int flags) {
+	const auto size = std::min<size_t>(len, std::numeric_limits<int>::max());
+	return FinishSocketCall(static_cast<int>(Net::Recv(s, buf, size, flags)));
+}
+
 uint32_t KYTY_SYSV_ABI NetHtonl(uint32_t host32) {
 	return ((host32 & 0x000000ffu) << 24u) | ((host32 & 0x0000ff00u) << 8u) |
 	       ((host32 & 0x00ff0000u) >> 8u) | ((host32 & 0xff000000u) >> 24u);
@@ -207,6 +219,8 @@ LIB_DEFINE(InitNet_1_Net) {
 	LIB_FUNC("Q4qBuN-c0ZM", LibNet::NetSocket);
 	LIB_FUNC("45ggEzakPJQ", LibNet::NetSocketClose);
 	LIB_FUNC("2mKX2Spso7I", LibNet::NetSetsockopt);
+	LIB_FUNC("beRjXBn-z+o", LibNet::NetSend);
+	LIB_FUNC("9wO9XrMsNhc", LibNet::NetRecv);
 	LIB_FUNC("9T2pDF2Ryqg", LibNet::NetHtonl);
 	LIB_FUNC("iWQWrwiSt8A", LibNet::NetHtons);
 	LIB_FUNC("pQGpHYopAIY", LibNet::NetNtohl);
@@ -277,7 +291,7 @@ static char* CopyUriPart(char*& dst, const UriPart& part) {
 }
 
 static int ParseEmptyUri(SceHttpUriElement* out, void* pool, size_t* require, size_t prepare) {
-	constexpr size_t needed = 3;
+	constexpr size_t needed = 4;
 
 	if (require != nullptr) {
 		*require = needed;
@@ -296,10 +310,12 @@ static int ParseEmptyUri(SceHttpUriElement* out, void* pool, size_t* require, si
 		auto* dst        = static_cast<char*>(pool);
 		out->scheme      = dst++;
 		out->hostname    = dst++;
-		out->path        = dst;
+		out->path        = dst++;
+		out->query       = dst;
 		out->scheme[0]   = '\0';
 		out->hostname[0] = '\0';
 		out->path[0]     = '\0';
+		out->query[0]    = '\0';
 	}
 
 	return 0;
@@ -460,6 +476,9 @@ static int KYTY_SYSV_ABI HttpUriParse(SceHttpUriElement* out, const char* src_ur
 			needed += part.len + 1;
 		}
 	}
+	if (query.begin == nullptr) {
+		needed += 1;
+	}
 
 	if (require != nullptr) {
 		*require = needed;
@@ -482,7 +501,12 @@ static int KYTY_SYSV_ABI HttpUriParse(SceHttpUriElement* out, const char* src_ur
 		out->password = CopyUriPart(dst, password);
 		out->hostname = CopyUriPart(dst, hostname);
 		out->path     = CopyUriPart(dst, path);
-		out->query    = CopyUriPart(dst, query);
+		if (query.begin == nullptr) {
+			out->query    = dst++;
+			out->query[0] = '\0';
+		} else {
+			out->query = CopyUriPart(dst, query);
+		}
 		out->fragment = CopyUriPart(dst, fragment);
 	}
 
@@ -1528,6 +1552,10 @@ struct NpEntitlementAccessAddcontEntitlementInfo {
 	uint32_t                  download_status;
 };
 
+struct NpEntitlementAccessEntitlementKey {
+	uint8_t data[16];
+};
+
 static constexpr NpEntitlementAccessAddcontEntitlementInfo NP_ENTITLEMENT_ACCESS_ADDON_LIST[] = {
     {{{"85y-je"}, {}}, 3, 4}, // GTA V hash 0xf4315381
     {{{"5d5c48"}, {}}, 3, 4}, // GTA V hash 0x961c34b0
@@ -1614,12 +1642,31 @@ static int KYTY_SYSV_ABI NpEntitlementAccessGetAddcontEntitlementInfo(
 	return NP_ENTITLEMENT_ACCESS_ERROR_NO_ENTITLEMENT;
 }
 
+static int KYTY_SYSV_ABI NpEntitlementAccessGetEntitlementKey(
+    uint32_t service_label, const NpUnifiedEntitlementLabel* entitlement_label,
+    NpEntitlementAccessEntitlementKey* key) {
+	PRINT_NAME();
+
+	LOGF("\t service_label     = %" PRIu32 "\n"
+	     "\t entitlement_label = 0x%016" PRIx64 "\n"
+	     "\t key               = 0x%016" PRIx64 "\n",
+	     service_label, reinterpret_cast<uint64_t>(entitlement_label),
+	     reinterpret_cast<uint64_t>(key));
+
+	if (entitlement_label == nullptr || key == nullptr) {
+		return NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER;
+	}
+
+	return NP_ENTITLEMENT_ACCESS_ERROR_NO_ENTITLEMENT;
+}
+
 LIB_DEFINE(InitNet_1_NpEntitlementAccess) {
 	LIB_FUNC("jO8DM8oyego", LibNpEntitlementAccess::NpEntitlementAccessInitialize);
 	LIB_FUNC("lPDO62PpJIA", LibNpEntitlementAccess::NpEntitlementAccessGetSkuFlag);
 	LIB_FUNC("TFyU+KFBv54",
 	         LibNpEntitlementAccess::NpEntitlementAccessGetAddcontEntitlementInfoList);
 	LIB_FUNC("xddD23+8TfQ", LibNpEntitlementAccess::NpEntitlementAccessGetAddcontEntitlementInfo);
+	LIB_FUNC("5LiMEPuW0DQ", LibNpEntitlementAccess::NpEntitlementAccessGetEntitlementKey);
 }
 
 } // namespace LibNpEntitlementAccess
@@ -3787,6 +3834,27 @@ namespace LibSharePlay {
 
 LIB_VERSION("SharePlay", 1, "SharePlay", 1, 1);
 
+constexpr int SHARE_PLAY_ERROR_INVALID_ARGS        = -2129788927;
+constexpr int SHARE_PLAY_ERROR_ALREADY_INITIALIZED = -2129788925;
+constexpr int SHARE_PLAY_ERROR_NOT_INITIALIZED     = -2129788924;
+
+struct SharePlayConnectionInfoA {
+	int32_t  status;
+	int32_t  mode;
+	char     host_online_id[20];
+	char     visitor_online_id[20];
+	uint64_t host_account_id;
+	uint64_t visitor_account_id;
+	int32_t  host_user_id;
+	int32_t  visitor_user_id;
+};
+
+static_assert(sizeof(SharePlayConnectionInfoA) == 72);
+static_assert(offsetof(SharePlayConnectionInfoA, host_account_id) == 48);
+static_assert(offsetof(SharePlayConnectionInfoA, host_user_id) == 64);
+
+static bool g_share_play_initialized = false;
+
 static int KYTY_SYSV_ABI SharePlayInitialize(void* heap, size_t heap_size) {
 	PRINT_NAME();
 
@@ -3794,18 +3862,41 @@ static int KYTY_SYSV_ABI SharePlayInitialize(void* heap, size_t heap_size) {
 	     "\t heap_size = %" PRIu64 "\n",
 	     reinterpret_cast<uint64_t>(heap), static_cast<uint64_t>(heap_size));
 
+	if (g_share_play_initialized) {
+		return SHARE_PLAY_ERROR_ALREADY_INITIALIZED;
+	}
+	if (heap != nullptr && heap_size < 6u * 1024u) {
+		return SHARE_PLAY_ERROR_INVALID_ARGS;
+	}
+	g_share_play_initialized = true;
 	return 0;
 }
 
 static int KYTY_SYSV_ABI SharePlayTerminate() {
 	PRINT_NAME();
 
+	if (!g_share_play_initialized) {
+		return SHARE_PLAY_ERROR_NOT_INITIALIZED;
+	}
+	g_share_play_initialized = false;
+	return 0;
+}
+
+static int KYTY_SYSV_ABI SharePlayGetCurrentConnectionInfoA(SharePlayConnectionInfoA* info) {
+	if (!g_share_play_initialized) {
+		return SHARE_PLAY_ERROR_NOT_INITIALIZED;
+	}
+	if (info == nullptr) {
+		return SHARE_PLAY_ERROR_INVALID_ARGS;
+	}
+	*info = {.status = 0, .host_user_id = -1, .visitor_user_id = -1};
 	return 0;
 }
 
 LIB_DEFINE(InitPlatform_1_SharePlay) {
 	LIB_FUNC("isruqthpYcw", LibSharePlay::SharePlayInitialize);
 	LIB_FUNC("UaLjloJinow", LibSharePlay::SharePlayTerminate);
+	LIB_FUNC("+MCXJlWdi+s", LibSharePlay::SharePlayGetCurrentConnectionInfoA);
 }
 
 } // namespace LibSharePlay

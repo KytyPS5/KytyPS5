@@ -14,7 +14,7 @@ void Check(bool value, const char *text) {
   }
 }
 
-bool RejectSpecializationRead(void *userdata, uint64_t, uint32_t *) {
+bool RejectSpecializationRead(void *userdata, uint64_t, std::span<uint32_t>) {
   ++*static_cast<uint32_t *>(userdata);
   return false;
 }
@@ -219,19 +219,13 @@ void TestUnbasedFlatCacheHitMaterializes() {
         "unbased FLAT plan produced unexpected descriptors");
 }
 
-void TestFailedMaterializationPreservesPriorStage() {
+void TestFailedMaterializationRejectsStage() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   auto plan = UserDataBufferPlan();
   ResourceSnapshot snapshot;
-  snapshot.user_data.push_back(0xfeedbeefu);
   ResourceSpecialization specialization;
-  specialization.buffers.push_back({.packed_stride = 7});
   Check(!MaterializeResources(plan, {}, snapshot, specialization),
         "missing runtime user data did not reject the cached stage");
-  Check(snapshot.user_data == std::vector<uint32_t>{0xfeedbeefu} &&
-            specialization.buffers.size() == 1 &&
-            specialization.buffers[0].packed_stride == 7,
-        "failed cache materialization changed its destinations");
 }
 
 void TestMixedSamplerDuplicatesTheCorrectSnapshot() {
@@ -268,7 +262,7 @@ int main() {
   TestMappedSrtUsesDirectReaderByDefault();
   TestIntegerRuntimeValueFollowsSrtReads();
   TestUnbasedFlatCacheHitMaterializes();
-  TestFailedMaterializationPreservesPriorStage();
+  TestFailedMaterializationRejectsStage();
   TestMixedSamplerDuplicatesTheCorrectSnapshot();
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;

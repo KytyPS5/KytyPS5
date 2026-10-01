@@ -18,8 +18,15 @@ enum class BranchCondition {
 	ExecZero,
 	ExecNonZero,
 	ScalarInstruction,
-	GotoVariable,
+	Expression,
 	Unknown
+};
+
+struct ConditionExpression {
+	enum class Op { Constant, Variable, Native, Not, Or };
+	Op       op;
+	uint32_t lhs;
+	uint32_t rhs = UINT32_MAX;
 };
 
 enum class TerminatorKind { Branch, ConditionalBranch, IndirectBranch, Return, Unsupported };
@@ -48,8 +55,7 @@ struct Terminator {
 	std::vector<uint32_t> indirect_targets;
 	std::vector<uint32_t> indirect_selector_values;
 	std::vector<uint32_t> indirect_selector_targets;
-	uint32_t              goto_variable = UINT32_MAX;
-	int32_t               goto_value    = -1;
+	uint32_t              expression    = UINT32_MAX;
 	bool                  loop_header   = false;
 };
 
@@ -59,10 +65,11 @@ struct BasicBlock {
 	uint32_t              end_pc     = 0;
 	uint32_t              inst_begin = 0;
 	uint32_t              inst_end   = 0;
+	struct Assignment { uint32_t variable; uint32_t expression; };
+	std::vector<Assignment> assignments;
 	std::vector<uint32_t> predecessors;
 	std::vector<uint32_t> successors;
 	std::vector<uint32_t> dominators;
-	std::vector<uint32_t> post_dominators;
 	Terminator            terminator;
 };
 
@@ -73,12 +80,9 @@ struct BackEdge {
 };
 
 struct NaturalLoop {
-	uint32_t              header         = UINT32_MAX;
-	uint32_t              latch          = UINT32_MAX;
-	uint32_t              merge          = UINT32_MAX;
-	uint32_t              continue_block = UINT32_MAX;
+	uint32_t              header = UINT32_MAX;
+	uint32_t              latch  = UINT32_MAX;
 	std::vector<uint32_t> body_blocks;
-	std::vector<uint32_t> exit_blocks;
 };
 
 struct StronglyConnectedComponent {
@@ -89,6 +93,7 @@ struct StronglyConnectedComponent {
 
 struct Graph {
 	std::vector<BasicBlock>                 blocks;
+	std::vector<ConditionExpression>        expressions;
 	std::vector<BackEdge>                   back_edges;
 	std::vector<NaturalLoop>                natural_loops;
 	std::vector<StronglyConnectedComponent> components;
@@ -105,14 +110,12 @@ struct Graph {
 	const BasicBlock* FindBlockByPc(uint32_t pc) const;
 	BasicBlock*       FindBlockByPc(uint32_t pc);
 	bool              Dominates(uint32_t dominator, uint32_t block) const;
-	bool              PostDominates(uint32_t post_dominator, uint32_t block) const;
-	uint32_t          FindNearestCommonPostDominator(uint32_t block_a, uint32_t block_b) const;
 };
 
 Graph       BuildGraph(const Decoder::Program& program);
-// Commits structured control flow on success; preserves the original graph with
-// failure diagnostics on failure. failure_block is an original block ID or UINT32_MAX.
-bool        Structurize(Graph& graph);
+// Returns structured control flow or failure diagnostics without changing the native graph.
+// On failure, failure_block is an original block ID or UINT32_MAX.
+Graph       Structurize(const Graph& graph);
 std::string BranchConditionToString(BranchCondition condition);
 std::string FailureKindToString(FailureKind kind);
 std::string GraphToString(const Graph& graph);

@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/regionManager.h"
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
 
@@ -119,9 +120,20 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 }
 
 void RenderContext::PrepareBda() {
+	// Synchronizing walks every buffer in every mapped range. Do it once per guest submission, and
+	// again only if the GPU thread dirtied guest memory or a buffer was created since.
+	const auto cpu_epoch    = g_submission_serial.load(std::memory_order_acquire) * 0x100000000ull +
+	                          g_gpu_thread_dirty_epoch.load(std::memory_order_relaxed);
+	const auto buffer_epoch = m_buffer_cache.BufferEpoch();
+	if (cpu_epoch == m_bda_cpu_epoch && buffer_epoch == m_bda_buffer_epoch) {
+		m_fault_process_pending = true;
+		return;
+	}
+	m_bda_cpu_epoch    = cpu_epoch;
+	m_bda_buffer_epoch = buffer_epoch;
 	std::shared_lock lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
-		m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
+		m_buffer_cache.SynchronizeDirtyBuffersInRange(start, end - start);
 	});
 	m_fault_process_pending = true;
 }

@@ -36,6 +36,10 @@ struct GraphicContext {
 	bool                               image_atomic_int64_enabled             = false;
 	bool                               block_texel_view_multiple_layers       = false;
 	bool                               maintenance6_enabled                   = false;
+	// VK_EXT_device_fault: lets a lost device report the faulting address and kind.
+	bool                               device_fault_enabled                   = false;
+	// VK_EXT_conditional_rendering: lets fast clears be applied without a CPU readback.
+	bool                               conditional_rendering_enabled          = false;
 	bool                                      mesh_shader_enabled                   = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
 	uint32_t                           subgroup_size                         = 0;

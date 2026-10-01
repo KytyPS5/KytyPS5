@@ -1,0 +1,62 @@
+#version 450
+
+// Decides on the GPU whether a DCC metadata slice holds one uniform fast-clear key, so the clear can
+// be applied with conditional rendering instead of reading the metadata back on the CPU.
+//
+// For every candidate key k, predicate[k] becomes 1 when every byte of the slice equals k. When any
+// candidate matches, the slice is overwritten with 0xff so later acquisitions see it as consumed.
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) buffer metadata_buf {
+    uint metadata[];
+};
+
+layout(std430, binding = 1) writeonly buffer predicate_buf {
+    uint predicate[];
+};
+
+layout(push_constant) uniform Push {
+    uint first_dword;     // slice start in metadata[], in dwords
+    uint dword_count;     // slice length in dwords
+    uint predicate_base;  // first predicate slot to write
+    uint candidate_count; // number of valid entries in candidates[]
+    uint candidates[8];   // candidate keys
+} pc;
+
+shared uint s_uniform;
+
+void main() {
+    const uint lane = gl_LocalInvocationID.x;
+    if (lane == 0u) {
+        s_uniform = 1u;
+    }
+    barrier();
+
+    const uint first = metadata[pc.first_dword];
+    const uint key   = first & 0xffu;
+    bool uniform_slice = first == key * 0x01010101u;
+    for (uint i = lane; i < pc.dword_count && uniform_slice; i += 64u) {
+        uniform_slice = metadata[pc.first_dword + i] == first;
+    }
+    if (!uniform_slice) {
+        atomicAnd(s_uniform, 0u);
+    }
+    barrier();
+
+    bool matched = false;
+    if (lane < 8u) {
+        const bool hit = lane < pc.candidate_count && s_uniform != 0u &&
+                         key == pc.candidates[lane];
+        predicate[pc.predicate_base + lane] = hit ? 1u : 0u;
+    }
+    for (uint c = 0u; c < pc.candidate_count && c < 8u; c++) {
+        matched = matched || (s_uniform != 0u && key == pc.candidates[c]);
+    }
+    barrier();
+    if (matched) {
+        for (uint i = lane; i < pc.dword_count; i += 64u) {
+            metadata[pc.first_dword + i] = 0xffffffffu;
+        }
+    }
+}

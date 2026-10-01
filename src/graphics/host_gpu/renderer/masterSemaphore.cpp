@@ -1,7 +1,13 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/vulkanCommon.h"
+
+#include <cinttypes>
+#include <fmt/format.h>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -35,6 +41,47 @@ void MasterSemaphore::Refresh() {
 	}
 }
 
+void MasterSemaphore::ReportDeviceFault() {
+	if (!m_graphics.device_fault_enabled) {
+		Log::WriteToConsoleAndLog("device fault: VK_EXT_device_fault unavailable\n");
+		return;
+	}
+	const auto device         = static_cast<VkDevice>(m_graphics.device);
+	const auto get_fault_info = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceFaultInfoEXT;
+	if (get_fault_info == nullptr) {
+		Log::WriteToConsoleAndLog("device fault: vkGetDeviceFaultInfoEXT missing\n");
+		return;
+	}
+	VkDeviceFaultCountsEXT counts {VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
+	if (get_fault_info(device, &counts, nullptr) != VK_SUCCESS) {
+		Log::WriteToConsoleAndLog("device fault: count query failed\n");
+		return;
+	}
+	std::vector<VkDeviceFaultAddressInfoEXT> addresses(counts.addressInfoCount);
+	std::vector<VkDeviceFaultVendorInfoEXT>  vendors(counts.vendorInfoCount);
+	VkDeviceFaultInfoEXT                     info {VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT};
+	info.pAddressInfos      = addresses.data();
+	info.pVendorInfos       = vendors.data();
+	counts.vendorBinarySize = 0;
+	const auto result       = get_fault_info(device, &counts, &info);
+	if (result != VK_SUCCESS && result != VK_INCOMPLETE) {
+		Log::WriteToConsoleAndLog("device fault: info query failed\n");
+		return;
+	}
+	Log::WriteToConsoleAndLog(fmt::format("device fault: {}\n", info.description));
+	for (const auto& address: addresses) {
+		Log::WriteToConsoleAndLog(
+		    fmt::format("device fault address: type={} address=0x{:016x} precision=0x{:x}\n",
+		                static_cast<int>(address.addressType), address.reportedAddress,
+		                address.addressPrecision));
+	}
+	for (const auto& vendor: vendors) {
+		Log::WriteToConsoleAndLog(fmt::format("device fault vendor: {} code=0x{:x} data=0x{:x}\n",
+		                                      vendor.description, vendor.vendorFaultCode,
+		                                      vendor.vendorFaultData));
+	}
+}
+
 void MasterSemaphore::Wait(uint64_t tick) {
 	if (IsFree(tick)) {
 		return;
@@ -50,7 +97,14 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	wait_info.pValues        = &tick;
 
 	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	if (result != vk::Result::eSuccess) {
+		if (result == vk::Result::eErrorDeviceLost) {
+			ReportDeviceFault();
+		}
+		EXIT("timeline wait failed: result=%s tick=%" PRIu64 " gpu_tick=%" PRIu64
+		     " current_tick=%" PRIu64 "\n",
+		     vk::to_string(result).c_str(), tick, KnownGpuTick(), CurrentTick());
+	}
 	Refresh();
 }
 

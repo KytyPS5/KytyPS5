@@ -5,6 +5,7 @@
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "gpu_tiler_shaders/dcc_clear_predicate_spv.h"
 #include "graphics/guest_gpu/gpu_format.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -14,10 +15,14 @@
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/vulkanCommon.h"
 #include "kernel/memory.h"
+#include "libs/debugSnapshots.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
+#include <nlohmann/json.hpp>
 #include <set>
 #include <string>
 #include <array>
@@ -282,8 +287,51 @@ constexpr uint64_t NumFramesBeforeRemoval = 32;
 
 // Debug: correlation clock. A frame number alone cannot order an upload against the GPU writes
 // inside the same frame, so every correlated event also carries a monotonic sequence number.
+constexpr uint32_t PredicateSlots = 4096;
+
 std::atomic_uint64_t g_dbg_frame {0};
 std::atomic_uint64_t g_dbg_seq {0};
+
+nlohmann::json DebugGpuSnapshot() {
+	// Frame rate over the interval since the previous snapshot. Several panels may poll at once,
+	// so the sample only advances once at least half a second has passed.
+	static std::mutex fps_mutex;
+	static auto       fps_time  = std::chrono::steady_clock::now();
+	static uint64_t   fps_frame = g_dbg_frame.load(std::memory_order_relaxed);
+	static double     fps       = 0.0;
+	const uint64_t    frame     = g_dbg_frame.load(std::memory_order_relaxed);
+	{
+		std::scoped_lock lock {fps_mutex};
+		const auto       now     = std::chrono::steady_clock::now();
+		const double     elapsed = std::chrono::duration<double>(now - fps_time).count();
+		if (elapsed >= 0.5) {
+			fps       = static_cast<double>(frame - fps_frame) / elapsed;
+			fps_time  = now;
+			fps_frame = frame;
+		}
+	}
+	nlohmann::json result;
+	result["columns"] = {"Format", "Index", "Format name", "Address", "Image id", "Generation"};
+	auto& rows        = result["rows"];
+	rows              = nlohmann::json::array();
+	{
+		std::scoped_lock lock {g_dbg_rt_mutex};
+		std::map<uint32_t, uint32_t> per_format;
+		for (const auto& entry: g_dbg_rt_table) {
+			char address[24];
+			std::snprintf(address, sizeof(address), "0x%016" PRIx64, entry.address);
+			rows.push_back({entry.format, per_format[entry.format]++,
+			                vk::to_string(static_cast<vk::Format>(entry.format)), address,
+			                entry.id_index, entry.id_generation});
+		}
+	}
+	char fps_text[16];
+	std::snprintf(fps_text, sizeof(fps_text), "%.1f", fps);
+	result["summary"] = {{"Presented frames", frame},
+	                     {"FPS", fps_text},
+	                     {"Render targets seen", rows.size()}};
+	return result;
+}
 
 // EXPERIMENT (diagnostic): force readback enrolment on regardless of the launcher checkbox,
 // which did not take effect in testing. Set to false to restore normal config-driven behaviour.
@@ -327,6 +375,11 @@ void TextureCache::ConfigureGarbageCollectionBudget(uint64_t available_budget) {
 }
 
 TextureCache::~TextureCache() {
+	if (m_clear_pipeline != nullptr) {
+		m_graphics.device.destroyPipeline(m_clear_pipeline, nullptr);
+		m_graphics.device.destroyPipelineLayout(m_clear_pipeline_layout, nullptr);
+		m_graphics.device.destroyDescriptorSetLayout(m_clear_desc_layout, nullptr);
+	}
 	m_slot_images.ForEach([&](ImageId id, const Image& image) {
 		if (image.registered) {
 			UnregisterImage(id);
@@ -383,6 +436,29 @@ TextureCache::BindingType TextureCache::UploadBinding(const Image& image) {
 		return BindingType::VideoOut;
 	}
 	return image.usage.storage ? BindingType::Storage : BindingType::Texture;
+}
+
+bool TextureCache::SafeToDownload(const Image& image) {
+	if (!image.SafeToDownload()) {
+		return false;
+	}
+	const auto range = image.info.data;
+	if (!m_buffer_cache.HasGpuDirtyBytes(range.address, range.size)) {
+		return true;
+	}
+	// Image-local state alone is not enough here: a buffer write that landed on these bytes after
+	// the image was written makes the image stale, and reading it back hands the guest old data.
+	// On Beast of Reincarnation that stale readback left a shader spinning until the device was
+	// lost. The transient allocator does reuse one range for unrelated surfaces, though, so
+	// KYTY_IMAGE_TICK_ARBITRATION lets the newer of the two writes own the bytes instead.
+	static const bool arbitrate = [] {
+		const char* value = std::getenv("KYTY_IMAGE_TICK_ARBITRATION");
+		return value != nullptr && value[0] != '0';
+	}();
+	if (!arbitrate) {
+		return false;
+	}
+	return image.gpu_write_tick > m_buffer_cache.GpuWriteTick(range.address, range.size);
 }
 
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
@@ -1130,7 +1206,9 @@ TextureCache::BuildTextureTransfer(const Image& image, BindingType binding,
 
 	TextureTransfer transfer;
 	transfer.swap_bgra16 = info.bgra16 && (!upload || render_target || video_out);
-	if (render_target) {
+	// A render target can alias a block-compressed image through a block-texel view; that image's
+	// extent is in texels, not blocks, so it keeps its own format and layout.
+	if (render_target && !info.IsBlock()) {
 		format = ImageOps::RenderTargetTransferFormat(info.bytes_per_block);
 	}
 	if (video_out) {
@@ -1511,7 +1589,7 @@ uint32_t TextureCache::PublishGpuOwners(ImageId destination, GuestRange range) {
 			continue;
 		}
 		const char* skip = nullptr;
-		if (!owner->SafeToDownload()) {
+		if (!SafeToDownload(*owner)) {
 			skip = owner->IsBufferModified() ? "buffer-modified"
 			       : owner->IsCpuDirty()     ? "cpu-dirty"
 			                                 : "buffer-dirty-bytes";
@@ -1624,43 +1702,259 @@ void TextureCache::InitializeImage(ImageId id) {
 	}
 }
 
+bool TextureCache::PaintColorClearOnGpu(ImageId id, const ImageDesc& desc, uint32_t first,
+                                        uint32_t image_first, uint32_t count, uint32_t layers) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DCC_GPU_PAINT");
+		return value == nullptr || value[0] != '0';
+	}();
+	const auto& metadata = desc.info.metadata;
+	if (!enabled || !m_graphics.conditional_rendering_enabled ||
+	    (metadata.kind != ImageMetadataKind::Dcc && metadata.kind != ImageMetadataKind::Cmask) ||
+	    desc.view_info.level_count != 1) {
+		return false;
+	}
+	// Candidate keys: the four constant DCC clears and the register clear. A CMASK clear is the
+	// all-zero key, which DecodeColorClear resolves to the register clear.
+	constexpr uint8_t dcc_keys[]   = {0x00, 0x40, 0x80, 0xc0, 0x20};
+	constexpr uint8_t cmask_keys[] = {0x00};
+	const auto        keys         = metadata.kind == ImageMetadataKind::Cmask
+	                                     ? std::span<const uint8_t> {cmask_keys}
+	                                     : std::span<const uint8_t> {dcc_keys};
+	uint32_t          candidates[8] {};
+	vk::ClearValue    clears[8] {};
+	uint32_t          candidate_count = 0;
+	for (const auto key: keys) {
+		vk::ClearValue clear {};
+		if (DecodeColorClear(desc, key, clear.color)) {
+			candidates[candidate_count] = key;
+			clears[candidate_count]     = clear;
+			candidate_count++;
+		}
+	}
+	if (candidate_count == 0) {
+		return true;
+	}
+
+	if (m_clear_pipeline == nullptr) {
+		const vk::DescriptorSetLayoutBinding bindings[] {
+		    {0, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute, nullptr},
+		    {1, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute, nullptr},
+		};
+		vk::DescriptorSetLayoutCreateInfo layout_info {};
+		layout_info.flags        = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
+		layout_info.bindingCount = std::size(bindings);
+		layout_info.pBindings    = bindings;
+		RequireVulkanSuccess(
+		    m_graphics.device.createDescriptorSetLayout(&layout_info, nullptr, &m_clear_desc_layout),
+		    "create DCC clear descriptor layout");
+		const vk::PushConstantRange push {vk::ShaderStageFlagBits::eCompute, 0,
+		                                  12 * sizeof(uint32_t)};
+		vk::PipelineLayoutCreateInfo pipeline_layout_info {};
+		pipeline_layout_info.setLayoutCount         = 1;
+		pipeline_layout_info.pSetLayouts            = &m_clear_desc_layout;
+		pipeline_layout_info.pushConstantRangeCount = 1;
+		pipeline_layout_info.pPushConstantRanges    = &push;
+		RequireVulkanSuccess(m_graphics.device.createPipelineLayout(&pipeline_layout_info, nullptr,
+		                                                            &m_clear_pipeline_layout),
+		                     "create DCC clear pipeline layout");
+		const auto module = CompileSPV(DCC_CLEAR_PREDICATE_SPV, m_graphics.device);
+		vk::PipelineShaderStageCreateInfo stage {};
+		stage.stage  = vk::ShaderStageFlagBits::eCompute;
+		stage.module = module;
+		stage.pName  = "main";
+		vk::ComputePipelineCreateInfo pipeline_info {};
+		pipeline_info.stage  = stage;
+		pipeline_info.layout = m_clear_pipeline_layout;
+		const auto result    = m_graphics.device.createComputePipelines(nullptr, 1, &pipeline_info,
+		                                                                nullptr, &m_clear_pipeline);
+		m_graphics.device.destroyShaderModule(module, nullptr);
+		RequireVulkanSuccess(result, "create DCC clear pipeline");
+		m_clear_predicates = std::make_unique<Buffer>(
+		    m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0,
+		    vk::BufferUsageFlagBits::eStorageBuffer |
+		        vk::BufferUsageFlagBits::eConditionalRenderingEXT |
+		        vk::BufferUsageFlagBits::eTransferDst,
+		    PredicateSlots * 8 * sizeof(uint32_t));
+	}
+
+	const auto range      = metadata.range;
+	const auto slice_size = range.size / layers;
+	// The keys stay on the GPU: obtain them as written, since the pass consumes matched slices.
+	auto [meta_buffer, meta_offset] =
+	    m_buffer_cache.ObtainBuffer(range.address, range.size, true, false);
+	const auto alignment      = m_graphics.StorageMinAlignment();
+	const auto aligned_offset = Common::AlignDown(meta_offset, alignment);
+	const auto lead           = meta_offset - aligned_offset;
+	if (lead % sizeof(uint32_t) != 0 || slice_size % sizeof(uint32_t) != 0) {
+		return false;
+	}
+
+	auto& command = m_scheduler.Current();
+	command.EndRendering();
+	const auto cmd = command.Handle();
+
+	vk::MemoryBarrier2 before {};
+	before.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+	before.srcAccessMask = vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eTransferWrite;
+	before.dstStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
+	before.dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite;
+	vk::DependencyInfo dependency {};
+	dependency.memoryBarrierCount = 1;
+	dependency.pMemoryBarriers    = &before;
+	cmd.pipelineBarrier2(dependency);
+
+	const vk::DescriptorBufferInfo infos[] {
+	    {meta_buffer->Handle(), aligned_offset, lead + range.size},
+	    {m_clear_predicates->Handle(), 0, m_clear_predicates->Size()},
+	};
+	std::array<vk::WriteDescriptorSet, 2> writes {};
+	for (uint32_t index = 0; index < writes.size(); ++index) {
+		writes[index].dstBinding      = index;
+		writes[index].descriptorCount = 1;
+		writes[index].descriptorType  = vk::DescriptorType::eStorageBuffer;
+		writes[index].pBufferInfo     = &infos[index];
+	}
+	cmd.bindPipeline(vk::PipelineBindPoint::eCompute, m_clear_pipeline);
+	cmd.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_clear_pipeline_layout, 0, writes);
+	std::vector<uint32_t> slots(count);
+	for (uint32_t slice = 0; slice < count; slice++) {
+		slots[slice]           = m_clear_predicate_slot;
+		m_clear_predicate_slot = (m_clear_predicate_slot + 1) % PredicateSlots;
+		uint32_t push[12] {};
+		push[0] = static_cast<uint32_t>((lead + slice_size * (first + slice)) / sizeof(uint32_t));
+		push[1] = static_cast<uint32_t>(slice_size / sizeof(uint32_t));
+		push[2] = slots[slice] * 8;
+		push[3] = candidate_count;
+		for (uint32_t c = 0; c < 8; c++) {
+			push[4 + c] = candidates[c];
+		}
+		cmd.pushConstants(m_clear_pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
+		                  sizeof(push), push);
+		cmd.dispatch(1, 1, 1);
+	}
+
+	vk::MemoryBarrier2 after {};
+	after.srcStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
+	after.srcAccessMask = vk::AccessFlagBits2::eShaderWrite;
+	after.dstStageMask  = vk::PipelineStageFlagBits2::eConditionalRenderingEXT |
+	                     vk::PipelineStageFlagBits2::eAllCommands;
+	after.dstAccessMask = vk::AccessFlagBits2::eConditionalRenderingReadEXT |
+	                      vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite;
+	dependency.pMemoryBarriers = &after;
+	cmd.pipelineBarrier2(dependency);
+
+	{
+		std::scoped_lock lock {m_lock};
+		auto&            image = m_slot_images[id];
+		TrackImage(id);
+		const auto& view_desc = desc.view_info;
+		for (uint32_t slice = 0; slice < count; slice++) {
+			ImageViewInfo view {};
+			view.format      = view_desc.format;
+			view.type        = vk::ImageViewType::e2D;
+			view.base_level  = view_desc.base_level;
+			view.base_layer  = image_first + slice;
+			view.layer_count = 1;
+			view.usage       = vk::ImageUsageFlagBits::eColorAttachment;
+			image.Transit(vk::ImageLayout::eColorAttachmentOptimal,
+			              vk::AccessFlagBits2::eColorAttachmentWrite |
+			                  vk::AccessFlagBits2::eColorAttachmentRead,
+			              {}, cmd);
+			vk::RenderingAttachmentInfo attachment {};
+			attachment.imageView   = image.FindView(view);
+			attachment.imageLayout = vk::ImageLayout::eColorAttachmentOptimal;
+			attachment.loadOp      = vk::AttachmentLoadOp::eLoad;
+			attachment.storeOp     = vk::AttachmentStoreOp::eStore;
+			const vk::Extent2D extent {std::max(image.info.extent.width >> view.base_level, 1u),
+			                           std::max(image.info.extent.height >> view.base_level, 1u)};
+			vk::RenderingInfo rendering {};
+			rendering.renderArea.extent    = extent;
+			rendering.layerCount           = 1;
+			rendering.colorAttachmentCount = 1;
+			rendering.pColorAttachments    = &attachment;
+			cmd.beginRendering(&rendering);
+			for (uint32_t c = 0; c < candidate_count; c++) {
+				vk::ConditionalRenderingBeginInfoEXT condition {};
+				condition.buffer = m_clear_predicates->Handle();
+				condition.offset = (slots[slice] * 8 + c) * sizeof(uint32_t);
+				cmd.beginConditionalRenderingEXT(&condition);
+				vk::ClearAttachment clear {};
+				clear.aspectMask      = vk::ImageAspectFlagBits::eColor;
+				clear.colorAttachment = 0;
+				clear.clearValue      = clears[c];
+				vk::ClearRect rect {};
+				rect.rect.extent    = extent;
+				rect.baseArrayLayer = 0;
+				rect.layerCount     = 1;
+				cmd.clearAttachments(1, &clear, 1, &rect);
+				cmd.endConditionalRenderingEXT();
+			}
+			cmd.endRendering();
+		}
+		CommitGpuWrite(image);
+		image.clear_meta_tick  = m_buffer_cache.GpuWriteTick(range.address, range.size);
+		image.clear_check_tick = m_scheduler.CurrentTick();
+	}
+	return true;
+}
+
 void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
                                        uint32_t metadata_base_layer) {
 	if (desc.info.metadata.kind != ImageMetadataKind::Dcc &&
 	    desc.info.metadata.kind != ImageMetadataKind::Cmask) {
 		return;
 	}
-	// Painting the fast clear is disabled by default, because the metadata association feeding it
-	// is not trustworthy yet and every measurement says the paint costs picture and gains
-	// nothing. On Beast of Reincarnation the surfaces it paints include a 4096x4096 fmt=122
-	// texture, 1920x1088 fmt=74 compute working buffers and the 3840x2160 scan-out, which are not
-	// fast-clearable render targets - the metadata region for those allocations merely happens to
-	// read as uniform. Every colour it ever decoded was pure black. Skipping the paint entirely
-	// is the only configuration in which the game's title screen and character render.
-	//
-	// Two narrower gates were tried and both still lost the picture: restricting the paint to
-	// render-target acquisitions, and skipping it when the image is already GPU-modified. They
-	// are kept below, so that whoever fixes the association gets the least-bad behaviour when
-	// they turn this back on with KYTY_DCC_CLEAR or a dcc_clear.txt file beside the executable.
-	// The file form exists because the launcher spawns the emulator as a child, so an env var set
-	// in another shell never reaches it.
+	// Painting the fast clear is on by default. Beast of Reincarnation clears its separate-
+	// translucency target (0,0,0,1) with a DCC fast clear on memory the transient pool had just
+	// used for another surface; without the paint the composite multiplies the whole scene by a
+	// stale alpha of 0 and every 3D frame is black. The paint used to be gated off because it
+	// fired on images the GPU had already rewritten; the write-tick check below now skips those.
+	// KYTY_DCC_CLEAR=0, or a no_dcc_clear.txt file beside the executable (the launcher spawns the
+	// emulator as a child, so an env var set in another shell never reaches it), turns it off.
 	static const bool paint_dcc_clear = [] {
-		if (std::getenv("KYTY_DCC_CLEAR") != nullptr) {
+		if (const char* value = std::getenv("KYTY_DCC_CLEAR"); value != nullptr) {
+			return value[0] != '0';
+		}
+		FILE* f = std::fopen("no_dcc_clear.txt", "r");
+		if (f == nullptr) {
 			return true;
 		}
-		FILE* f = std::fopen("dcc_clear.txt", "r");
-		if (f == nullptr) {
-			return false;
-		}
 		(void)std::fclose(f);
-		LOGF("DCC CLEAR PAINT: re-enabled by dcc_clear.txt\n");
-		return true;
+		LOGF("DCC CLEAR PAINT: disabled by no_dcc_clear.txt\n");
+		return false;
 	}();
 	const auto register_only = [&] {
 		std::scoped_lock lock {m_lock};
 		m_slot_images[id].info.metadata = desc.info.metadata;
 		m_surface_metas.erase(desc.info.metadata.range.address);
 	};
+	// EXPERIMENT (diagnostic): say whether a 1080p RGBA16F target's metadata was rewritten after
+	// the image's last GPU write, i.e. whether a fast clear is pending on an aliased image.
+	if (desc.type == BindingType::RenderTarget && desc.info.extent.width == 1920 &&
+	    desc.info.extent.height == 1080 && desc.view_info.format == vk::Format::eR16G16B16A16Sfloat) {
+		const auto dbg_frame = g_dbg_frame.load(std::memory_order_relaxed);
+		if (dbg_frame >= 1995 && dbg_frame <= 2000) {
+			const auto range      = desc.info.metadata.range;
+			const bool meta_gpu   = m_buffer_cache.IsRegionGpuModified(range.address, range.size);
+			const auto meta_tick  = m_buffer_cache.GpuWriteTick(range.address, range.size);
+			uint64_t   image_tick = 0;
+			bool       image_gpu  = false;
+			{
+				std::scoped_lock lock {m_lock};
+				image_tick = m_slot_images[id].gpu_write_tick;
+				image_gpu  = m_slot_images[id].IsGpuModified();
+			}
+			LOGF("CLEAR PROBE: frame=%" PRIu64 " rt=0x%010" PRIx64 " id=%u/%u kind=%d meta=0x%010" PRIx64
+			     "+0x%" PRIx64 " meta_gpu=%d meta_tick=%" PRIu64 " image_gpu=%d image_tick=%" PRIu64
+			     " clear_reg=%d word=0x%016" PRIx64 "\n",
+			     g_dbg_frame.load(std::memory_order_relaxed), desc.info.data.address, id.index,
+			     id.generation, static_cast<int>(desc.info.metadata.kind), range.address,
+			     range.size, meta_gpu ? 1 : 0, meta_tick, image_gpu ? 1 : 0, image_tick,
+			     desc.info.metadata.clear_register_valid ? 1 : 0,
+			     static_cast<uint64_t>(desc.info.metadata.clear_word));
+		}
+	}
 	if (!paint_dcc_clear) {
 		register_only();
 		return;
@@ -1674,8 +1968,13 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	// surface. Kyty re-reads it on every acquisition, so an image the GPU already owns would be
 	// repainted from stale information.
 	{
+		// A transient pool hands one image to several surfaces, so "GPU-modified" alone does not
+		// mean the metadata is stale: the clear is current when the metadata was written after the
+		// image's last GPU write.
+		const auto meta_tick = m_buffer_cache.GpuWriteTick(desc.info.metadata.range.address,
+		                                                   desc.info.metadata.range.size);
 		std::scoped_lock lock {m_lock};
-		if (m_slot_images[id].IsGpuModified()) {
+		if (m_slot_images[id].IsGpuModified() && meta_tick <= m_slot_images[id].gpu_write_tick) {
 			m_slot_images[id].info.metadata = desc.info.metadata;
 			m_surface_metas.erase(desc.info.metadata.range.address);
 			return;
@@ -1709,8 +2008,28 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	}
 	// Finish native metadata writes before reading backing bytes. This can submit the scheduler,
 	// so discovery runs before final draw uploads and never holds the texture lock across it.
+	if (m_buffer_cache.IsRegionGpuModified(range.address, range.size) &&
+	    PaintColorClearOnGpu(id, desc, first, image_first, count, layers)) {
+		return;
+	}
 	if (m_buffer_cache.IsRegionGpuModified(range.address, range.size)) {
+		// Reading GPU-written metadata flushes and waits for the GPU. Skip it when this image has
+		// already evaluated this version of the metadata in an earlier submission: nothing has
+		// rewritten the keys since, so the answer cannot have changed.
+		const auto meta_tick = m_buffer_cache.GpuWriteTick(range.address, range.size);
+		{
+			std::scoped_lock lock {m_lock};
+			const auto&      image = m_slot_images[id];
+			if (meta_tick != 0 && meta_tick <= image.clear_meta_tick &&
+			    image.clear_check_tick < m_scheduler.CurrentTick()) {
+				return;
+			}
+		}
 		m_buffer_cache.ReadMemory(range.address, range.size, false);
+		std::scoped_lock lock {m_lock};
+		auto&            image = m_slot_images[id];
+		image.clear_meta_tick  = meta_tick;
+		image.clear_check_tick = m_scheduler.CurrentTick();
 	}
 	const auto slice_size = range.size / layers;
 	for (uint32_t slice = 0; slice < count; slice++) {
@@ -2062,7 +2381,7 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 		if (ensure_valid && owner->depth_id) {
 			owner = m_slot_images.try_get(owner->depth_id);
 		}
-		if (owner == nullptr || (ensure_valid && !owner->SafeToDownload())) {
+		if (owner == nullptr || (ensure_valid && !SafeToDownload(*owner))) {
 			continue;
 		}
 		matches.push_back(id);
@@ -2491,7 +2810,7 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	std::scoped_lock lock {m_texture_cache.m_lock};
 	auto& image = m_texture_cache.m_slot_images[selected];
 	// The GPU thread owns image retirement; CPU invalidation can dirty this image after lookup.
-	if (!image.SafeToDownload()) {
+	if (!m_texture_cache.SafeToDownload(image)) {
 		return false;
 	}
 	if (!buffer.IsInBounds(image.info.data.address, 1)) {
@@ -2581,7 +2900,7 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 		dbg_report("skipped:invalid-transfer");
 		return false;
 	}
-	if (!image.SafeToDownload()) {
+	if (!SafeToDownload(image)) {
 		dbg_report("skipped:image-unsafe");
 		return false;
 	}
@@ -2874,7 +3193,7 @@ void TextureCache::RunGarbageCollector() {
 				continue;
 			}
 			if (owner->IsGpuModified()) {
-				const bool safe = owner->SafeToDownload();
+				const bool safe = SafeToDownload(*owner);
 				if (safe && owner->info.IsTiled()) {
 					continue;
 				}

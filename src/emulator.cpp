@@ -19,6 +19,7 @@
 #include "libs/agc.h"
 #include "libs/audio.h"
 #include "libs/controller.h"
+#include "libs/debugSnapshots.h"
 #include "libs/libs.h"
 #include "libs/network.h"
 #include "loader/runtimeLinker.h"
@@ -194,6 +195,7 @@ void Run(const RunOptions& options) {
 	Init(options.config, param_json, subsystems);
 
 	ClearDebugTextureFolder();
+	Libs::DebugServer::Start(static_cast<uint16_t>(Config::GetDebugServerPort()));
 
 	PrintSystemInfo();
 	std::string title_id;

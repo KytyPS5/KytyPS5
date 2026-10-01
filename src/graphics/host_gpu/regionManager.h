@@ -5,7 +5,11 @@
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 
+#include <algorithm>
+#include <array>
 #include <atomic>
+#include <chrono>
+#include <cstdlib>
 #include <mutex>
 #include <utility>
 
@@ -25,6 +29,19 @@
 #endif
 
 namespace Libs::Graphics {
+
+// Guest data is only guaranteed visible to the GPU at submission boundaries, so a full buffer
+// synchronization is needed once per submission, plus whenever the GPU thread itself dirties guest
+// memory mid-stream (CP writes, fast-clear publishes).
+inline std::atomic_uint64_t g_submission_serial {1};
+// KYTY_VOLATILE_PAGES=1 enables volatile-page tracking (see RegionManager::ConsumeCpuDirty). Off by
+// default: on Beast of Reincarnation the per-submission re-uploads cost as much as the faults saved.
+inline const bool g_volatile_pages_enabled = [] {
+	const char* value = std::getenv("KYTY_VOLATILE_PAGES");
+	return value != nullptr && value[0] != '0';
+}();
+inline std::atomic_uint64_t g_gpu_thread_dirty_epoch {1};
+inline thread_local bool    g_region_on_gpu_thread = false;
 
 class TrackingSpinLock final {
 public:
@@ -101,6 +118,15 @@ public:
 			}
 		}
 		if constexpr (source == DirtySource::Gpu && enable) {
+			// A volatile page is CPU-dirty by design; a GPU write supersedes it, so it returns to
+			// ordinary tracking instead of tripping the conflict check below.
+			for (const auto [first, last]: RegionBits(m_volatile, start, end)) {
+				for (size_t page = first; page < last; page++) {
+					m_volatile.Unset(page);
+					m_cpu_dirty.Unset(page);
+					m_streak[page] = 0;
+				}
+			}
 			if (RegionBits(m_cpu_dirty, start, end).Any()) {
 				EXIT("GPU dirty state conflicts with CPU dirty state\n");
 			}
@@ -108,6 +134,11 @@ public:
 		auto& bits = GetBits<source>();
 		if constexpr (enable) {
 			bits.SetRange(start, end);
+			if constexpr (source == DirtySource::Cpu) {
+				if (g_region_on_gpu_thread) {
+					g_gpu_thread_dirty_epoch.fetch_add(1, std::memory_order_relaxed);
+				}
+			}
 		} else {
 			bits.UnsetRange(start, end);
 		}
@@ -119,10 +150,17 @@ public:
 	}
 
 	template <DirtySource source, bool clear, typename Func>
-	void ForEachModifiedRange(uint64_t vaddr, uint64_t size, Func&& func) {
+	void ForEachModifiedRange(uint64_t vaddr, uint64_t size, Func&& func,
+	                          bool keep_volatile = false) {
 		const auto [start, end] = GetPageRange(vaddr, size);
 		auto&      bits         = GetBits<source>();
 		RegionBits mask(bits, start, end);
+		if constexpr (source == DirtySource::Cpu && clear) {
+			if (g_volatile_pages_enabled) {
+				ConsumeCpuDirty(start, end, mask, keep_volatile, func);
+				return;
+			}
+		}
 		if constexpr (clear) {
 			bits.UnsetRange(start, end);
 			if constexpr (source == DirtySource::Cpu) {
@@ -139,6 +177,59 @@ public:
 	TrackingSpinLock lock;
 
 private:
+	// Ryujinx-style volatile pages: a page the CPU rewrites on several consecutive submissions
+	// stays CPU-dirty and writable instead of being re-protected after every upload, which costs
+	// a write fault and two protection changes per page per frame. Such a page is uploaded at most
+	// once per guest submission. Volatility ends when the page is consumed for a GPU write.
+	static constexpr uint8_t VolatileThreshold = 5;
+
+	template <typename Func>
+	void ConsumeCpuDirty(size_t start, size_t end, const RegionBits& mask, bool keep_volatile,
+	                     Func&& func) {
+		const auto serial = static_cast<uint32_t>(g_submission_serial.load(std::memory_order_relaxed));
+		// Consecutive means rewritten within ~100 ms: one guest frame spans many submissions.
+		const auto now_ms = static_cast<uint32_t>(
+		    std::chrono::duration_cast<std::chrono::milliseconds>(
+		        std::chrono::steady_clock::now().time_since_epoch())
+		        .count());
+		RegionBits upload = mask;
+		RegionBits keep;
+		for (const auto [first, last]: mask) {
+			for (size_t page = first; page < last; page++) {
+				if (!keep_volatile) {
+					m_volatile.Unset(page);
+					m_streak[page] = 0;
+					continue;
+				}
+				if (m_volatile.Get(page)) {
+					keep.Set(page);
+					if (m_dirty_serial[page] == serial) {
+						upload.Unset(page);
+					}
+				} else {
+					const bool consecutive = now_ms - m_dirty_time[page] <= 100u;
+					m_streak[page]         = consecutive ? static_cast<uint8_t>(std::min<int>(
+					                                           m_streak[page] + 1, 255))
+					                                     : uint8_t {1};
+					if (m_streak[page] >= VolatileThreshold) {
+						m_volatile.Set(page);
+						keep.Set(page);
+					}
+				}
+				m_dirty_serial[page] = serial;
+				m_dirty_time[page]   = now_ms;
+			}
+		}
+		m_cpu_dirty.UnsetRange(start, end);
+		for (const auto [first, last]: keep) {
+			m_cpu_dirty.SetRange(first, last);
+		}
+		UpdateProtection<true, false>();
+		for (const auto [first, last]: upload) {
+			func(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
+		}
+	}
+
 	template <bool track, bool is_read>
 	void UpdateProtection() {
 		const auto protection = is_read ? ~m_gpu_dirty : m_cpu_dirty;
@@ -185,6 +276,10 @@ private:
 	RegionBits   m_gpu_dirty;
 	RegionBits   m_writable;
 	RegionBits   m_readable;
+	RegionBits   m_volatile;
+	std::array<uint32_t, TRACKER_REGION_PAGES> m_dirty_serial {};
+	std::array<uint32_t, TRACKER_REGION_PAGES> m_dirty_time {};
+	std::array<uint8_t, TRACKER_REGION_PAGES>  m_streak {};
 };
 
 } // namespace Libs::Graphics

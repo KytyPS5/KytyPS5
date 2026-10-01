@@ -10,6 +10,7 @@
 #include "graphics/guest_gpu/command_processor/pm4Dispatch.h"
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
+#include "graphics/host_gpu/regionManager.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/sync.h"
@@ -444,8 +445,9 @@ void GuestGpu::ThreadRun(void* data) {
 	auto* gpu = static_cast<GuestGpu*>(data);
 	EXIT_IF(gpu == nullptr);
 	KYTY_PROFILER_THREAD("Thread_Gpu");
-	g_gpu_thread = true;
-	g_gpu_state  = gpu;
+	g_gpu_thread           = true;
+	g_gpu_state            = gpu;
+	g_region_on_gpu_thread = true;
 
 	for (;;) {
 		Submission                   submission;
@@ -505,6 +507,7 @@ void GuestGpu::ThreadRun(void* data) {
 
 		if (command) {
 			EXIT_IF(g_current_processor != nullptr);
+			g_submission_serial.fetch_add(1, std::memory_order_release);
 			command();
 
 			Common::LockGuard lock(gpu->m_queue_mutex);
@@ -516,6 +519,7 @@ void GuestGpu::ThreadRun(void* data) {
 		}
 
 		EXIT_IF(!has_submission);
+		g_submission_serial.fetch_add(1, std::memory_order_release);
 		const bool complete = gpu->Process(submission);
 
 		Common::LockGuard lock(gpu->m_queue_mutex);
@@ -948,6 +952,31 @@ void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiato
 
 	const auto* args_addr =
 	    reinterpret_cast<const void*>(m_draw_indirect_args_base_addr + data_offset);
+
+	// Let the host GPU read the arguments itself. Reading them here faults on memory a GPU
+	// culling pass just wrote and drains the whole GPU queue once per draw. The executor falls
+	// back to a CPU read for the paths that need the counts (mesh shaders, quad lists, 8-bit
+	// indices).
+	static const bool gpu_indirect = [] {
+		const char* value = std::getenv("KYTY_GPU_INDIRECT");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (gpu_indirect && (!indexed || m_index_buffer_size != 0)) {
+		const auto address = m_draw_indirect_args_base_addr + data_offset;
+		if (!indexed) {
+			DrawIndexAuto({.vertex_count      = 1,
+			               .instance_count    = 1,
+			               .offset_source     = DrawOffsetSource::IndirectArgs,
+			               .gpu_indirect_args = address});
+		} else {
+			DrawIndex({.index_count       = m_index_buffer_size,
+			           .index_addr        = reinterpret_cast<const void*>(m_index_base_addr),
+			           .instance_count    = 1,
+			           .offset_source     = DrawOffsetSource::IndirectArgs,
+			           .gpu_indirect_args = address});
+		}
+		return;
+	}
 
 	if (!indexed) {
 		DrawIndirectArgs args {};

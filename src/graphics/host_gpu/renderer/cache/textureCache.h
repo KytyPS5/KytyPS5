@@ -13,6 +13,7 @@
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
 #include <map>
+#include <memory>
 #include <type_traits>
 #include <atomic>
 #include <unordered_map>
@@ -151,6 +152,7 @@ private:
 	[[nodiscard]] static bool SameBacking(const ImageInfo& cached, const ImageInfo& requested,
 	                                      bool exact_format);
 	[[nodiscard]] static BindingType UploadBinding(const Image& image);
+	[[nodiscard]] bool               SafeToDownload(const Image& image);
 
 	// Caller holds m_lock; it also serializes the per-image query epoch.
 	[[nodiscard]] ImageIds      FindImagesInRegion(uint64_t address, uint64_t size,
@@ -197,6 +199,11 @@ private:
 	// Caller holds m_lock. Publishes the GPU contents of every other image covering `range` into
 	// the buffers backing those bytes, so a guest-memory read of `range` sees them.
 	uint32_t PublishGpuOwners(ImageId destination, GuestRange range);
+	// Applies a DCC fast clear whose metadata only the GPU holds, without a CPU readback: a
+	// compute pass tests the keys and each candidate clear runs under conditional rendering.
+	// Returns false when the GPU path cannot handle this surface. Caller does not hold m_lock.
+	[[nodiscard]] bool PaintColorClearOnGpu(ImageId id, const ImageDesc& desc, uint32_t first,
+	                                        uint32_t image_first, uint32_t count, uint32_t layers);
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
@@ -218,6 +225,11 @@ private:
 	uint64_t         m_gc_tick                = 0;
 	mutable uint32_t m_image_query_epoch      = 0;
 	bool             m_readback_linear_images = false;
+	vk::DescriptorSetLayout                           m_clear_desc_layout      = nullptr;
+	vk::PipelineLayout                                m_clear_pipeline_layout  = nullptr;
+	vk::Pipeline                                      m_clear_pipeline         = nullptr;
+	std::unique_ptr<Buffer>                           m_clear_predicates;
+	uint32_t                                          m_clear_predicate_slot   = 0;
 
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;

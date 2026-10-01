@@ -30,6 +30,8 @@ public:
 
 	void Refresh();
 	void Wait(uint64_t tick);
+	// Logs VK_EXT_device_fault details after VK_ERROR_DEVICE_LOST.
+	void ReportDeviceFault();
 
 private:
 	GraphicContext&       m_graphics;

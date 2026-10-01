@@ -7,12 +7,15 @@
 #include "common/virtualMemory.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "libs/debugSnapshots.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cinttypes>
+#include <cstdio>
 #include <bit>
 #include <cstddef>
 #include <cstdlib>
@@ -21,6 +24,8 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <nlohmann/json.hpp>
+#include <string>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -45,6 +50,7 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <sys/uio.h>
 #include <unistd.h>
 #endif
 
@@ -245,6 +251,11 @@ public:
 		m_ranges.insert(position, r);
 		MergeAroundUnlocked(index);
 		return true;
+	}
+
+	[[nodiscard]] std::vector<Range> Snapshot() {
+		Common::LockGuard lock(m_mutex);
+		return m_ranges;
 	}
 
 	bool Remove(uint64_t start, uint64_t size) {
@@ -4350,6 +4361,128 @@ int KYTY_SYSV_ABI KernelMemoryPoolGetBlockStats(KernelMemoryPoolBlockStats* outp
 	}
 
 	return OK;
+}
+
+static std::string DebugHex(uint64_t value) {
+	char text[24];
+	std::snprintf(text, sizeof(text), "0x%" PRIx64, value);
+	return text;
+}
+
+static std::string DebugProtection(int prot) {
+	std::string text;
+	text += (prot & 0x1) != 0 ? 'r' : '-';
+	text += (prot & 0x2) != 0 ? 'w' : '-';
+	text += (prot & 0x4) != 0 ? 'x' : '-';
+	text += (prot & 0x30) != 0 ? " gpu" : "";
+	return text;
+}
+
+nlohmann::json DebugMemorySnapshot() {
+	nlohmann::json result;
+	uint64_t       direct_allocated   = 0;
+	uint64_t       flexible_allocated = 0;
+	if (g_physical_memory != nullptr) {
+		Common::LockGuard lock(g_physical_memory->GetMutex());
+		for (const auto& [start, block]: g_physical_memory->GetPhysicalBlocks()) {
+			direct_allocated += block.size;
+		}
+	}
+	if (g_flexible_memory != nullptr) {
+		Common::LockGuard lock(g_flexible_memory->GetMutex());
+		for (const auto& block: g_flexible_memory->GetBlocks()) {
+			flexible_allocated += block.map_size;
+		}
+	}
+	const auto ranges =
+	    g_virtual_ranges != nullptr ? g_virtual_ranges->Snapshot() : std::vector<VirtualRanges::Range> {};
+	uint64_t mapped = 0;
+	for (const auto& range: ranges) {
+		if (!IsReservedRangeType(range.type)) {
+			mapped += range.size;
+		}
+	}
+	const auto mib = [](uint64_t bytes) {
+		char text[32];
+		std::snprintf(text, sizeof(text), "%.1f MiB", static_cast<double>(bytes) / 1048576.0);
+		return std::string(text);
+	};
+	result["summary"] = {
+	    {"Direct memory", mib(PhysicalMemory::TotalSize() - g_flexible_memory_size)},
+	    {"Direct allocated", mib(direct_allocated)},
+	    {"Flexible memory", mib(g_flexible_memory_size)},
+	    {"Flexible mapped", mib(flexible_allocated)},
+	    {"Pool committed", mib(g_memory_pool_committed.load(std::memory_order_relaxed))},
+	    {"Mapped (non-reserved)", mib(mapped)},
+	    {"Ranges", ranges.size()},
+	};
+	result["columns"] = {"Start", "End", "Size", "Type", "Prot", "Mem type", "Offset", "Name"};
+	auto& rows        = result["rows"];
+	rows              = nlohmann::json::array();
+	for (const auto& range: ranges) {
+		rows.push_back({DebugHex(range.start), DebugHex(range.start + range.size), DebugHex(range.size),
+		                std::string(magic_enum::enum_name(range.type)),
+		                DebugProtection(range.protection), range.memory_type, DebugHex(range.offset),
+		                std::string(range.name)});
+	}
+	return result;
+}
+
+// Guest addresses are host addresses, so memory the guest address space does not track (loaded
+// modules, runtime allocations) is still readable. Go through the OS so an unmapped page fails the
+// read instead of faulting the debug thread.
+static bool DebugReadHost(uint64_t vaddr, void* data, uint64_t size) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	SIZE_T read = 0;
+	return ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(vaddr), data, size,
+	                         &read) != 0 &&
+	       read == size;
+#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+	iovec local {data, size};
+	iovec remote {reinterpret_cast<void*>(vaddr), size};
+	return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == static_cast<ssize_t>(size);
+#else
+	(void)vaddr;
+	(void)data;
+	(void)size;
+	return false;
+#endif
+}
+
+static bool DebugRead(uint64_t vaddr, void* data, uint64_t size) {
+	return TryReadBacking(vaddr, data, size) || DebugReadHost(vaddr, data, size);
+}
+
+nlohmann::json DebugMemoryRead(uint64_t vaddr, uint32_t size) {
+	constexpr uint32_t MAX_READ = 64 * 1024;
+	size                        = std::min(size, MAX_READ);
+	std::vector<uint8_t> bytes(size);
+	std::string          hex;
+	hex.reserve(static_cast<size_t>(size) * 2);
+	constexpr char DIGITS[] = "0123456789abcdef";
+	// Read in 256-byte chunks so one unbacked page does not blank the whole view; a failed chunk
+	// retries byte by byte to find where the backing ends.
+	for (uint32_t offset = 0; offset < size;) {
+		const auto chunk = std::min<uint32_t>(256, size - offset);
+		if (DebugRead(vaddr + offset, bytes.data() + offset, chunk)) {
+			for (uint32_t i = 0; i < chunk; i++) {
+				hex += DIGITS[bytes[offset + i] >> 4u];
+				hex += DIGITS[bytes[offset + i] & 0xfu];
+			}
+		} else {
+			for (uint32_t i = 0; i < chunk; i++) {
+				uint8_t value = 0;
+				if (DebugRead(vaddr + offset + i, &value, 1)) {
+					hex += DIGITS[value >> 4u];
+					hex += DIGITS[value & 0xfu];
+				} else {
+					hex += "??";
+				}
+			}
+		}
+		offset += chunk;
+	}
+	return {{"address", vaddr}, {"size", size}, {"hex", hex}};
 }
 
 } // namespace Libs::LibKernel::Memory

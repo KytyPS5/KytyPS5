@@ -478,6 +478,20 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		supported_maintenance6.pNext = supported_features2.pNext;
 		supported_features2.pNext    = &supported_maintenance6;
 	}
+	const bool device_fault_extension =
+	    HasExtension(device_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+	vk::PhysicalDeviceFaultFeaturesEXT supported_device_fault {};
+	if (device_fault_extension) {
+		supported_device_fault.pNext = supported_features2.pNext;
+		supported_features2.pNext    = &supported_device_fault;
+	}
+	const bool conditional_rendering_extension =
+	    HasExtension(device_extensions, VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME);
+	vk::PhysicalDeviceConditionalRenderingFeaturesEXT supported_conditional_rendering {};
+	if (conditional_rendering_extension) {
+		supported_conditional_rendering.pNext = supported_features2.pNext;
+		supported_features2.pNext             = &supported_conditional_rendering;
+	}
 	physical_device.getFeatures2(&supported_features2);
 
 	auto features12 = WindowContext::RequiredVulkan12Features();
@@ -502,6 +516,11 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	     graphics.image_atomic_int64_enabled ? "Yes" : "No");
 
 	graphics.maintenance6_enabled = maintenance6_extension && supported_maintenance6.maintenance6;
+	graphics.conditional_rendering_enabled =
+	    conditional_rendering_extension &&
+	    supported_conditional_rendering.conditionalRendering == VK_TRUE;
+	graphics.device_fault_enabled =
+	    device_fault_extension && supported_device_fault.deviceFault == VK_TRUE;
 
 	vk::PhysicalDeviceSubgroupSizeControlProperties subgroup_size_control {};
 
@@ -650,6 +669,18 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		maintenance6.pNext        = const_cast<void*>(create_info.pNext);
 		maintenance6.maintenance6 = VK_TRUE;
 		create_info.pNext         = &maintenance6;
+	}
+	vk::PhysicalDeviceConditionalRenderingFeaturesEXT conditional_rendering {};
+	if (graphics.conditional_rendering_enabled) {
+		conditional_rendering.pNext                = const_cast<void*>(create_info.pNext);
+		conditional_rendering.conditionalRendering = VK_TRUE;
+		create_info.pNext                          = &conditional_rendering;
+	}
+	vk::PhysicalDeviceFaultFeaturesEXT device_fault {};
+	if (graphics.device_fault_enabled) {
+		device_fault.pNext       = const_cast<void*>(create_info.pNext);
+		device_fault.deviceFault = VK_TRUE;
+		create_info.pNext        = &device_fault;
 	}
 	create_info.pQueueCreateInfos       = &queue_create_info;
 	create_info.queueCreateInfoCount    = 1;
@@ -1020,7 +1051,9 @@ void WindowContext::CreateVulkan() {
 		                             VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME,
 		                             VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME,
 		                             VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
-		                             VK_KHR_MAINTENANCE_6_EXTENSION_NAME}) {
+		                             VK_KHR_MAINTENANCE_6_EXTENSION_NAME,
+		                             VK_EXT_DEVICE_FAULT_EXTENSION_NAME,
+		                             VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME}) {
 			if (HasExtension(available_extensions, extension)) {
 				device_extensions.push_back(extension);
 			}

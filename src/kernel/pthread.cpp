@@ -11,6 +11,7 @@
 #include "common/threads.h"
 #include "common/timer.h"
 #include "kernel/memory.h"
+#include "libs/debugSnapshots.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "loader/runtimeLinker.h"
@@ -27,6 +28,8 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <nlohmann/json.hpp>
+#include <string>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -589,6 +592,16 @@ public:
 	Pthread Create();
 
 	void FreeDetachedThreads();
+
+	template <typename F>
+	void ForEachLive(F&& visit) {
+		Common::LockGuard lock(m_mutex);
+		for (auto* p: m_threads) {
+			if (!p->free) {
+				visit(*p);
+			}
+		}
+	}
 
 private:
 	std::vector<Pthread> m_threads;
@@ -1525,6 +1538,60 @@ void PthreadPool::FreeDetachedThreads() {
 			PthreadJoin(p, nullptr);
 		}
 	}
+}
+
+nlohmann::json DebugThreadSnapshot() {
+	nlohmann::json result;
+	result["columns"] = {"Guest ID", "Name", "State", "CPU time (ms)", "cpu_ns", "Host TID",
+	                     "Detached"};
+	auto& rows        = result["rows"];
+	rows              = nlohmann::json::array();
+	uint32_t running  = 0;
+	uint64_t total_ns = 0;
+	auto*    pool     = g_pthread_context != nullptr ? g_pthread_context->GetPthreadPool() : nullptr;
+	if (pool != nullptr) {
+		pool->ForEachLive([&](PthreadPrivate& thread) {
+			const bool finished = thread.almost_done;
+			uint64_t   cpu_ns   = 0;
+			// A finished thread's handle may already be gone, so only live threads are asked.
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+			if (HANDLE handle = !finished ? OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE,
+			                                           static_cast<DWORD>(thread.host_thread_id))
+			                              : nullptr;
+			    handle != nullptr) {
+				FILETIME created {};
+				FILETIME exited {};
+				FILETIME kernel {};
+				FILETIME user {};
+				if (GetThreadTimes(handle, &created, &exited, &kernel, &user) != 0) {
+					const auto ticks = [](const FILETIME& t) {
+						return (static_cast<uint64_t>(t.dwHighDateTime) << 32u) | t.dwLowDateTime;
+					};
+					cpu_ns = (ticks(kernel) + ticks(user)) * 100u;
+				}
+				CloseHandle(handle);
+			}
+#else
+			clockid_t clock {};
+			timespec  ts {};
+			if (!finished && pthread_getcpuclockid(thread.p, &clock) == 0 &&
+			    clock_gettime(clock, &ts) == 0) {
+				cpu_ns = static_cast<uint64_t>(ts.tv_sec) * 1000000000ull +
+				         static_cast<uint64_t>(ts.tv_nsec);
+			}
+#endif
+			running += finished ? 0u : 1u;
+			total_ns += cpu_ns;
+			rows.push_back({thread.guest.thread_id, thread.name, finished ? "finishing" : "running",
+			                cpu_ns / 1000000u, cpu_ns, thread.host_thread_id,
+			                thread.detached ? "yes" : "no"});
+		});
+	}
+	result["summary"] = {{"Guest threads", rows.size()},
+	                     {"Running", running},
+	                     {"Host CPU cores", std::thread::hardware_concurrency()},
+	                     {"Total guest CPU time (s)", static_cast<double>(total_ns) / 1e9}};
+	return result;
 }
 
 static void DestructPthreadSpecific() {
@@ -4220,6 +4287,23 @@ int KYTY_SYSV_ABI pthread_attr_setschedpolicy(LibKernel::PthreadAttr* attr, int 
 	// PRINT_NAME();
 
 	return POSIX_PTHREAD_CALL(LibKernel::PthreadAttrSetschedpolicy(attr, policy));
+}
+
+// NID 2+pVfgiEd7A: a pthread_attr setter whose name is not known. Unreal Engine thread creation
+// (Afterimage, PPSA14053) calls it as f(attr, 16) straight after pthread_attr_setstacksize and
+// ignores the result. No attribute it could set changes how a host thread runs, so it is accepted
+// and dropped.
+int KYTY_SYSV_ABI pthread_attr_set_2pVfgiEd7A(LibKernel::PthreadAttr* attr, int value) {
+	// PRINT_NAME();
+
+	if (attr == nullptr) {
+		return POSIX_EINVAL;
+	}
+	static std::atomic_bool logged {false};
+	if (!logged.exchange(true)) {
+		LOGF("pthread_attr 2+pVfgiEd7A: value %d accepted and ignored\n", value);
+	}
+	return OK;
 }
 
 int KYTY_SYSV_ABI pthread_attr_setstacksize(LibKernel::PthreadAttr* attr, size_t stack_size) {

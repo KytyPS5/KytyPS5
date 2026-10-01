@@ -123,6 +123,10 @@ bool ProfilerEnabled() {
 	return g_config->profiler_enabled;
 }
 
+uint32_t GetDebugServerPort() {
+	return g_config->debug_server_port;
+}
+
 bool SpirvDebugPrintfEnabled() {
 	return g_config->spirv_debug_printf_enabled;
 }

@@ -479,6 +479,8 @@ struct DrawCallInfo {
 	uint32_t             index_count    = 0;
 	uint32_t             instance_count = 0;
 	uint32_t             first_instance = 0;
+	// Guest address of the argument block consumed by vkCmdDraw(Indexed)Indirect, or 0.
+	uint64_t             indirect_args  = 0;
 
 	[[nodiscard]] bool IsIndexed() const { return debug_op == CommandBufferDebugOp::DrawIndex; }
 	[[nodiscard]] const char* Name() const { return IsIndexed() ? "DrawIndex" : "DrawIndexAuto"; }
@@ -511,6 +513,20 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 			g_dbg_rt_format = static_cast<uint32_t>(image.backing.format);
 			g_dbg_rt_width  = image.info.extent.width;
 			g_dbg_rt_height = image.info.extent.height;
+		}
+		// EXPERIMENT (diagnostic): which guest format ends up on an R8_UINT colour backing.
+		if (image.backing.format == vk::Format::eR8Uint && image.info.extent.width >= 640) {
+			static std::atomic_uint32_t s_r8_probe {0};
+			if (s_r8_probe.fetch_add(1) < 16) {
+				LOGF("R8 RT: addr=0x%016" PRIx64 " %ux%u slot=%u guest_fmt=%u desc_pixel=%u "
+				     "img_pixel=%u view_fmt=%u backing=%u num_colors=%u\n",
+				     image.info.data.address, image.info.extent.width, image.info.extent.height,
+				     target.target_slot, static_cast<uint32_t>(target.desc.info.guest_format),
+				     static_cast<uint32_t>(target.desc.info.pixel_format),
+				     static_cast<uint32_t>(image.info.pixel_format),
+				     static_cast<uint32_t>(target.desc.view_info.format),
+				     static_cast<uint32_t>(image.backing.format), color_count);
+			}
 		}
 		EXIT_IF(image.backing.samples != target.desc.info.samples || image_view == nullptr);
 		const auto& view   = target.desc.view_info;
@@ -1019,6 +1035,45 @@ static void LogDrawStateIfNeeded(const CommandBuffer& buffer, const DrawCallInfo
 	                  draw.index_count, index_addr);
 }
 
+// Indirect arguments can go straight to the host GPU unless the draw path needs the counts on the
+// CPU: mesh-shader (NGG) draws size their workgroups from them, quad lists are split per quad and
+// 8-bit indices are widened on the CPU.
+static bool CanDrawIndirectOnGpu(const CommandBuffer& buffer, bool indexed, uint32_t index_type) {
+	if ((buffer.GetRegisters().GetShaderStages() & 0x20u) != 0) {
+		return false;
+	}
+	if (indexed && static_cast<Prospero::IndexType>(index_type) == Prospero::IndexType::kIndex8) {
+		return false;
+	}
+	switch (buffer.GetUserConfig().GetPrimType()) {
+		case Prospero::PrimitiveType::kPointList:
+		case Prospero::PrimitiveType::kLineList:
+		case Prospero::PrimitiveType::kLineStrip:
+		case Prospero::PrimitiveType::kTriList:
+		case Prospero::PrimitiveType::kTriFan:
+		case Prospero::PrimitiveType::kTriStrip: return true;
+		default: return false;
+	}
+}
+
+struct GuestDrawIndexedIndirectArgs {
+	uint32_t index_count;
+	uint32_t instance_count;
+	uint32_t first_index;
+	int32_t  base_vertex;
+	uint32_t first_instance;
+};
+
+struct GuestDrawIndirectArgs {
+	uint32_t vertex_count;
+	uint32_t instance_count;
+	uint32_t first_vertex;
+	uint32_t first_instance;
+};
+
+static_assert(sizeof(GuestDrawIndexedIndirectArgs) == sizeof(vk::DrawIndexedIndirectCommand));
+static_assert(sizeof(GuestDrawIndirectArgs) == sizeof(vk::DrawIndirectCommand));
+
 static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_buffer,
                                const DrawCallInfo& draw, const DrawEmitInfo& emit) {
 	switch (ucfg.GetPrimType()) {
@@ -1099,6 +1154,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		    index_source.address, static_cast<uint64_t>(draw.index_count) *
 		                              index_source.guest_element_size);
 	}
+	const uint64_t indirect_size = draw.IsIndexed() ? sizeof(vk::DrawIndexedIndirectCommand)
+	                                                : sizeof(vk::DrawIndirectCommand);
+	if (draw.indirect_args != 0) {
+		(void)m_context.GetBufferCache().ObtainBuffer(draw.indirect_args, indirect_size, false);
+	}
 	LogDrawPhase(draw.Name(), "PrepareBindings");
 	auto&                            bindings = m_graphics_bindings;
 	std::array<PreparedBindings*, 4> descriptor_stages {};
@@ -1123,6 +1183,12 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "CreatePipeline");
+	}
+	Buffer*  indirect_buffer = nullptr;
+	uint64_t indirect_offset = 0;
+	if (draw.indirect_args != 0) {
+		std::tie(indirect_buffer, indirect_offset) =
+		    m_context.GetBufferCache().ObtainBuffer(draw.indirect_args, indirect_size, false);
 	}
 	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(
 	    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
@@ -1175,7 +1241,47 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	}
-	if (mesh_active) {
+	// EXPERIMENT (diagnostic): KYTY_SKIP_DRAW_STAGE=<ShaderType> and KYTY_SKIP_DRAW_HASH=<hex,...>
+	// drop matching draws, to find which draws produce a given artefact by removing them.
+	static const auto skip_stage = [] {
+		const char* value = std::getenv("KYTY_SKIP_DRAW_STAGE");
+		return value != nullptr ? std::atoi(value) : -1;
+	}();
+	static const auto skip_hashes = [] {
+		std::vector<uint64_t> hashes;
+		if (const char* value = std::getenv("KYTY_SKIP_DRAW_HASH"); value != nullptr) {
+			for (const char* p = value; *p != 0;) {
+				char* end = nullptr;
+				const auto hash = std::strtoull(p, &end, 16);
+				if (end == p) {
+					break;
+				}
+				hashes.push_back(hash);
+				p = *end == ',' ? end + 1 : end;
+			}
+		}
+		return hashes;
+	}();
+	bool skip_draw = false;
+	for (const auto& info: vertex_stages) {
+		const auto* program = info.stage.program;
+		skip_draw |= static_cast<int>(program->stage) == skip_stage ||
+		             std::ranges::find(skip_hashes, program->shader_hash) != skip_hashes.end();
+	}
+	if (state.ps_active && std::ranges::find(skip_hashes, state.ps_input_info.stage.program->shader_hash) !=
+	                           skip_hashes.end()) {
+		skip_draw = true;
+	}
+	if (skip_draw) {
+	} else if (indirect_buffer != nullptr) {
+		if (draw.IsIndexed()) {
+			vk_buffer.drawIndexedIndirect(indirect_buffer->Handle(), indirect_offset, 1,
+			                              sizeof(vk::DrawIndexedIndirectCommand));
+		} else {
+			vk_buffer.drawIndirect(indirect_buffer->Handle(), indirect_offset, 1,
+			                       sizeof(vk::DrawIndirectCommand));
+		}
+	} else if (mesh_active) {
 		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
 	} else {
 		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
@@ -1206,6 +1312,29 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
                                const DrawIndexArgs& args) {
 	KYTY_PROFILER_FUNCTION();
+
+	if (args.gpu_indirect_args != 0 &&
+	    !CanDrawIndirectOnGpu(buffer, true, args.index_type_and_size)) {
+		GuestDrawIndexedIndirectArgs guest {};
+		std::memcpy(&guest, reinterpret_cast<const void*>(args.gpu_indirect_args), sizeof(guest));
+		uint32_t element_size = 2;
+		switch (static_cast<Prospero::IndexType>(args.index_type_and_size)) {
+			case Prospero::IndexType::kIndex16: element_size = 2; break;
+			case Prospero::IndexType::kIndex32: element_size = 4; break;
+			case Prospero::IndexType::kIndex8: element_size = 1; break;
+			default: EXIT("unknown index_type_and_size: %u\n", args.index_type_and_size);
+		}
+		DrawIndexArgs direct = args;
+		direct.gpu_indirect_args = 0;
+		direct.index_addr        = static_cast<const uint8_t*>(args.index_addr) +
+		                    static_cast<uint64_t>(guest.first_index) * element_size;
+		direct.index_count    = std::min(guest.index_count, args.index_count);
+		direct.instance_count = guest.instance_count;
+		direct.base_vertex    = guest.base_vertex;
+		direct.first_instance = guest.first_instance;
+		DrawIndex(submit_id, buffer, direct);
+		return;
+	}
 
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
@@ -1296,7 +1425,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndex, args.index_count,
-	                        args.instance_count, args.first_instance};
+	                        args.instance_count, args.first_instance, args.gpu_indirect_args};
 	DrawRenderState state {};
 	if (!PrepareDrawRenderState(buffer, draw, args.render_target_slice_offset, state)) {
 		ResetBindings();
@@ -1323,6 +1452,19 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args) {
 	KYTY_PROFILER_FUNCTION();
+
+	if (args.gpu_indirect_args != 0 && !CanDrawIndirectOnGpu(buffer, false, 0)) {
+		GuestDrawIndirectArgs guest {};
+		std::memcpy(&guest, reinterpret_cast<const void*>(args.gpu_indirect_args), sizeof(guest));
+		DrawAutoArgs direct      = args;
+		direct.gpu_indirect_args = 0;
+		direct.vertex_count      = guest.vertex_count;
+		direct.instance_count    = guest.instance_count;
+		direct.first_vertex      = guest.first_vertex;
+		direct.first_instance    = guest.first_instance;
+		DrawAuto(submit_id, buffer, direct);
+		return;
+	}
 
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
@@ -1366,8 +1508,8 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 
 	hw_check(buffer);
 
-	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndexAuto,
-	                         args.vertex_count, args.instance_count, args.first_instance};
+	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndexAuto, args.vertex_count,
+	                         args.instance_count, args.first_instance, args.gpu_indirect_args};
 
 	vk::PrimitiveTopology topology = vk::PrimitiveTopology::ePointList;
 	if (!GetDrawTopology(ucfg, topology)) {

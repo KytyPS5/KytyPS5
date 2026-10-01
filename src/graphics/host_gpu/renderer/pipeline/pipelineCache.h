@@ -8,8 +8,10 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/shader.h"
 
+#include <chrono>
 #include <cstddef>
 #include <filesystem>
+#include <future>
 #include <memory>
 #include <span>
 #include <type_traits>
@@ -110,6 +112,9 @@ public:
 	~PipelineCache();
 	KYTY_CLASS_NO_COPY(PipelineCache);
 	void Save();
+	// Saves at most once a minute after new pipelines appear, so a crash or a killed process
+	// does not throw away every pipeline compiled since launch.
+	void SaveIfDue();
 
 	struct Pipeline {
 		vk::PipelineLayout      pipeline_layout       = nullptr;
@@ -144,6 +149,11 @@ public:
 	                              const GraphicsPrograms& programs);
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	                             const ShaderProgram&          compute_program);
+	// Like GetComputePipeline, but a dispatcher-fallback program is compiled on a worker thread
+	// and nullptr is returned until it is ready. Such programs can take the driver minutes to
+	// optimize, and blocking the GPU thread that long trips guest watchdogs.
+	Pipeline* TryGetComputePipeline(const ShaderComputeInputInfo& input_info,
+	                                const ShaderProgram&          compute_program);
 
 private:
 	struct ProgramCache;
@@ -177,9 +187,11 @@ private:
 	std::unique_ptr<ProgramCache> m_program_cache;
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;
+	std::chrono::steady_clock::time_point m_last_save = std::chrono::steady_clock::now();
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
+	std::unordered_map<uint64_t, std::future<std::unique_ptr<Pipeline>>> m_pending_compute;
 
 	void InitializeDriverCache();
 };

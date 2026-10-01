@@ -514,6 +514,9 @@ struct CompiledShaderInfo {
 	uint32_t                      user_data_count     = 64;
 	uint32_t                      scratch_dwords      = 0;
 	uint32_t                      param_export_mask   = 0;
+	// The structurizer gave up and emitted a block dispatcher loop; drivers can take minutes to
+	// optimize the result, so pipelines built from it are created unoptimized.
+	bool                          dispatcher_fallback = false;
 	ShaderInfo                    info;
 	BindingLayout                 bindings;
 };

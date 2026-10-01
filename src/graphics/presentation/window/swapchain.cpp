@@ -7,6 +7,7 @@
 #include "gpu_blit_shaders/gpu_blit_fs_triangle_spv.h"
 #include "gpu_blit_shaders/gpu_video_out_overlay_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -19,6 +20,8 @@
 #include <cstdio>
 #include <atomic>
 #include <cinttypes>
+#include <cmath>
+#include <cstring>
 #include <cstdlib>
 #include <deque>
 #include <array>
@@ -881,6 +884,129 @@ Presenter::Presenter(WindowContext& window): m_impl(std::make_unique<Impl>(windo
 
 Presenter::~Presenter() = default;
 
+namespace {
+
+float DebugHalfToFloat(uint16_t h) {
+	const uint32_t sign = (h >> 15u) & 1u;
+	const uint32_t exp  = (h >> 10u) & 0x1fu;
+	const uint32_t mant = h & 0x3ffu;
+	float          value;
+	if (exp == 0) {
+		value = std::ldexp(static_cast<float>(mant), -24);
+	} else if (exp == 31) {
+		value = mant != 0 ? std::numeric_limits<float>::quiet_NaN()
+		                  : std::numeric_limits<float>::infinity();
+	} else {
+		value = std::ldexp(static_cast<float>(mant | 0x400u), static_cast<int>(exp) - 25);
+	}
+	return sign != 0 ? -value : value;
+}
+
+// EXPERIMENT (diagnostic): KYTY_DBG_STATS=1 reads back the viewer-selected RGBA16F target and
+// logs NaN/Inf/negative counts plus an 8x4 grid of channel means, since the viewer's raw
+// copy into the swapchain format cannot show HDR values faithfully.
+void DebugImageStats(Libs::Graphics::RenderContext& renderer, Libs::Graphics::CommandBuffer& buffer,
+                     Libs::Graphics::Image& source) {
+	static const bool enabled = std::getenv("KYTY_DBG_STATS") != nullptr;
+	if (!enabled || source.backing.format != vk::Format::eR16G16B16A16Sfloat) {
+		return;
+	}
+	static std::unique_ptr<Libs::Graphics::Buffer> readback;
+	static uint32_t                                width   = 0;
+	static uint32_t                                height  = 0;
+	static uint64_t                                address = 0;
+	static uint32_t                                counter = 0;
+	static bool                                    pending = false;
+	if ((counter++ % 20u) != 0u) {
+		return;
+	}
+	if (pending) {
+		readback->Invalidate(0, readback->Size());
+		const auto* texels = reinterpret_cast<const uint16_t*>(readback->Mapped().data());
+		uint64_t nan = 0, inf = 0, neg = 0, zero = 0, total = 0;
+		double   max_c[3] = {0, 0, 0};
+		double   grid[4][8][4] {};
+		uint64_t grid_nan[4][8] {};
+		uint64_t grid_n[4][8] {};
+		for (uint32_t y = 0; y < height; y++) {
+			for (uint32_t x = 0; x < width; x++) {
+				const auto* px = texels + (static_cast<uint64_t>(y) * width + x) * 4u;
+				float       c[4];
+				bool        bad = false;
+				for (int k = 0; k < 4; k++) {
+					c[k] = DebugHalfToFloat(px[k]);
+				}
+				for (int k = 0; k < 3; k++) {
+					if (std::isnan(c[k])) {
+						bad = true;
+						nan++;
+					} else if (std::isinf(c[k])) {
+						bad = true;
+						inf++;
+					} else if (c[k] < 0.0f) {
+						neg++;
+					}
+				}
+				const auto gy = y * 4u / height;
+				const auto gx = x * 8u / width;
+				if (bad) {
+					grid_nan[gy][gx]++;
+					continue;
+				}
+				if (c[0] == 0.0f && c[1] == 0.0f && c[2] == 0.0f) {
+					zero++;
+				}
+				for (int k = 0; k < 3; k++) {
+					max_c[k] = std::max(max_c[k], static_cast<double>(c[k]));
+				}
+				for (int k = 0; k < 4; k++) {
+					grid[gy][gx][k] += c[k];
+				}
+				grid_n[gy][gx]++;
+				total++;
+			}
+		}
+		LOGF("STATS: addr=0x%010" PRIx64 " %ux%u nan=%" PRIu64 " inf=%" PRIu64 " neg=%" PRIu64
+		     " black=%" PRIu64 " finite=%" PRIu64 " max=%.3g/%.3g/%.3g\n",
+		     address, width, height, nan, inf, neg, zero, total, max_c[0], max_c[1], max_c[2]);
+		for (int gy = 0; gy < 4; gy++) {
+			std::string row;
+			for (int gx = 0; gx < 8; gx++) {
+				char       cell[96];
+				const auto n = std::max<uint64_t>(grid_n[gy][gx], 1);
+				std::snprintf(cell, sizeof(cell), " [%.3g %.3g %.3g a%.2g bad%" PRIu64 "]",
+				              grid[gy][gx][0] / n, grid[gy][gx][1] / n, grid[gy][gx][2] / n,
+				              grid[gy][gx][3] / n, grid_nan[gy][gx]);
+				row += cell;
+			}
+			LOGF("STATS row%d:%s\n", gy, row.c_str());
+		}
+		pending = false;
+		return;
+	}
+	width   = source.backing.extent.width;
+	height  = source.backing.extent.height;
+	address = source.info.data.address;
+	const uint64_t size = static_cast<uint64_t>(width) * height * 8u;
+	if (!readback || readback->Size() < size) {
+		readback = std::make_unique<Libs::Graphics::Buffer>(
+		    renderer.GetGraphics(), renderer.GetCommandScheduler(),
+		    Libs::Graphics::MemoryUsage::Download, 0, vk::BufferUsageFlagBits::eTransferDst, size);
+	}
+	buffer.EndRendering();
+	auto command = buffer.Handle();
+	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
+	               command);
+	vk::BufferImageCopy region {};
+	region.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	region.imageExtent      = {width, height, 1};
+	command.copyImageToBuffer(source.backing.image, vk::ImageLayout::eTransferSrcOptimal,
+	                          readback->Handle(), 1, &region);
+	pending = true;
+}
+
+} // namespace
+
 Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo& info) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(buffer.IsInvalid());
@@ -908,15 +1034,21 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 		const char* sel_path = env_path != nullptr ? env_path : "rt_select.txt";
 		static std::atomic_uint64_t frame_counter {0};
 		static std::atomic_uint64_t selected {0};
+		// EXPERIMENT (diagnostic): an optional third field names the target's guest address, so
+		// a pass found in the log can be viewed without knowing its per-format index.
+		static std::atomic_uint64_t selected_address {0};
 		if ((frame_counter.fetch_add(1, std::memory_order_relaxed) % 15) == 0) {
 			if (FILE* f = std::fopen(sel_path, "r"); f != nullptr) {
 				// The file holds "<vk_format> <index>", e.g. "64 2" for the third 1080p
 				// A2B10G10R10 target. Addresses shift between runs, so they cannot be used.
-				unsigned int fmt = 0;
-				unsigned int idx = 0;
-				if (std::fscanf(f, "%u %u", &fmt, &idx) == 2) {
+				unsigned int       fmt  = 0;
+				unsigned int       idx  = 0;
+				unsigned long long addr = 0;
+				const int          read = std::fscanf(f, "%u %u %llx", &fmt, &idx, &addr);
+				if (read >= 2) {
 					selected.store((static_cast<uint64_t>(fmt) << 32u) | idx,
 					               std::memory_order_relaxed);
+					selected_address.store(read == 3 ? addr : 0, std::memory_order_relaxed);
 				}
 				(void)std::fclose(f);
 			}
@@ -927,7 +1059,29 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 			uint32_t id_index      = 0;
 			uint32_t id_generation = 0;
 			uint64_t picked_address = 0;
-			if (DebugFindRenderTarget(format, index, &id_index, &id_generation, &picked_address)) {
+			bool     found          = false;
+			if (const auto want = selected_address.load(std::memory_order_relaxed); want != 0) {
+				// The newest registration wins; older ones at the same address are usually freed.
+				for (uint32_t i = 0; i < 4096; i++) {
+					uint32_t entry_index      = 0;
+					uint32_t entry_generation = 0;
+					uint64_t entry_address    = 0;
+					if (!DebugFindRenderTarget(format, i, &entry_index, &entry_generation,
+					                           &entry_address)) {
+						break;
+					}
+					if (entry_address == want) {
+						id_index       = entry_index;
+						id_generation  = entry_generation;
+						picked_address = entry_address;
+						found          = true;
+					}
+				}
+			} else {
+				found = DebugFindRenderTarget(format, index, &id_index, &id_generation,
+				                              &picked_address);
+			}
+			if (found) {
 				auto& cache = m_impl->renderer.GetTextureCache();
 				auto* picked_image = cache.DebugTryGetImage(id_index, id_generation);
 				static std::atomic_uint64_t dbg_sub {0};
@@ -951,6 +1105,9 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 			     copy_source->info.extent.width, copy_source->info.extent.height,
 			     static_cast<uint32_t>(copy_source->backing.format));
 		}
+	}
+	if (copy_source != &image) {
+		DebugImageStats(m_impl->renderer, buffer, *copy_source);
 	}
 	frame->CopyFrom(buffer, *copy_source);
 

@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <thread>
 #include <cinttypes>
 #include <cmath>
 #include <condition_variable>
@@ -251,6 +252,15 @@ static void PrintAbortPointerArrayCandidate(const char* name, uint64_t addr) {
 		}
 	}
 
+	// EXPERIMENT (diagnostic): KYTY_ABORT_PARK=1 parks the aborting guest thread instead of
+	// exiting, so a watchdog abort (UE's render-thread timeout) does not kill an in-flight driver
+	// pipeline compile before it can reach the driver's shader cache.
+	if (std::getenv("KYTY_ABORT_PARK") != nullptr) {
+		LOGF("Guest abort() parked\n");
+		for (;;) {
+			std::this_thread::sleep_for(std::chrono::seconds(1));
+		}
+	}
 	EXIT("Guest abort()\n");
 	std::abort();
 }
@@ -551,6 +561,47 @@ void KYTY_SYSV_ABI cxa_finalize(void* d) {
 	}
 }
 
+// Itanium C++ ABI guards for function-local statics. Byte 0 of the 64-bit guard is set once the
+// object is constructed (compiled code tests it inline before calling in); byte 1 marks an
+// initializer in progress, so a second thread waits instead of constructing twice.
+static std::mutex              g_cxa_guard_mutex;
+static std::condition_variable g_cxa_guard_cv;
+
+static KYTY_SYSV_ABI int cxa_guard_acquire(uint64_t* guard) {
+	auto* bytes = reinterpret_cast<volatile uint8_t*>(guard);
+	std::unique_lock lock(g_cxa_guard_mutex);
+	for (;;) {
+		if (bytes[0] != 0) {
+			return 0;
+		}
+		if (bytes[1] == 0) {
+			bytes[1] = 1;
+			return 1;
+		}
+		g_cxa_guard_cv.wait(lock);
+	}
+}
+
+static KYTY_SYSV_ABI void cxa_guard_release(uint64_t* guard) {
+	auto* bytes = reinterpret_cast<volatile uint8_t*>(guard);
+	{
+		std::scoped_lock lock(g_cxa_guard_mutex);
+		bytes[0] = 1;
+		bytes[1] = 0;
+	}
+	g_cxa_guard_cv.notify_all();
+}
+
+// The initializer threw: leave the object unconstructed so the next caller retries.
+static KYTY_SYSV_ABI void cxa_guard_abort(uint64_t* guard) {
+	auto* bytes = reinterpret_cast<volatile uint8_t*>(guard);
+	{
+		std::scoped_lock lock(g_cxa_guard_mutex);
+		bytes[1] = 0;
+	}
+	g_cxa_guard_cv.notify_all();
+}
+
 } // namespace LibC
 
 namespace LibcInternalExt {
@@ -801,6 +852,9 @@ LIB_DEFINE(InitLibcInternal_1) {
 	LIB_FUNC("L1SBTkC+Cvw", LibC::abort);
 	LIB_FUNC("tsvEmnenz48", LibC::cxa_atexit);
 	LIB_FUNC("H2e8t5ScQGc", LibC::cxa_finalize);
+	LIB_FUNC("3GPpjQdAMTw", LibC::cxa_guard_acquire);
+	LIB_FUNC("9rAeANT2tyE", LibC::cxa_guard_release);
+	LIB_FUNC("2emaaluWzUw", LibC::cxa_guard_abort);
 	LIB_FUNC("DiGVep5yB5w", LibC::std_execute_once);
 
 	LIB_FUNC("al3JzFI9MQ0", LibcInternal::LibcHeapErrorReportForGame);
@@ -832,6 +886,9 @@ LIB_DEFINE(InitLibC_1) {
 	LIB_FUNC("XKRegsFpEpk", LibC::catchReturnFromMain);
 	LIB_FUNC("tsvEmnenz48", LibC::cxa_atexit);
 	LIB_FUNC("H2e8t5ScQGc", LibC::cxa_finalize);
+	LIB_FUNC("3GPpjQdAMTw", LibC::cxa_guard_acquire);
+	LIB_FUNC("9rAeANT2tyE", LibC::cxa_guard_release);
+	LIB_FUNC("2emaaluWzUw", LibC::cxa_guard_abort);
 	LIB_FUNC("DiGVep5yB5w", LibC::std_execute_once);
 }
 

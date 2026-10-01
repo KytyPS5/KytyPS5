@@ -366,6 +366,7 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 }
 
 BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
+	m_buffer_epoch.fetch_add(1, std::memory_order_relaxed);
 	EXIT_IF(m_scheduler.Current().IsInvalid());
 	const auto end = Common::AlignUp(vaddr + size, CACHING_PAGESIZE);
 	vaddr = Common::AlignDown(vaddr, CACHING_PAGESIZE);
@@ -700,6 +701,13 @@ void BufferCache::RunGarbageCollector() {
 
 void BufferCache::ProcessFaultBuffer() {
 	m_fault_manager.ProcessFaultBuffer();
+}
+
+void BufferCache::SynchronizeDirtyBuffersInRange(uint64_t vaddr, uint64_t size) {
+	// Only pages the CPU dirtied can need uploading, so walk those instead of every buffer.
+	m_memory_tracker.ForEachCpuDirtyRange(vaddr, size, [this](uint64_t address, uint64_t length) {
+		SynchronizeBuffersInRange(address, length);
+	});
 }
 
 void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {

@@ -77,6 +77,7 @@ static void PrintUsage() {
 	::printf("  --printf-direction <value>           Silent, Console, or File.\n");
 	::printf("  --printf-output-file <path>          Guest printf output file.\n");
 	::printf("  --profile                            Enable the Tracy profiler.\n");
+	::printf("  --debug-server-port <num>            Serve launcher debug tools on localhost.\n");
 	::printf("  --spirv-debug-printf <true|false>    Enable SPIR-V debug printf.\n");
 	::printf(
 	    "  --readback-linear-images <true|false> Read back writable linear images on submit.\n");
@@ -327,6 +328,12 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		} else if (arg == "--present-mode") {
 			if (!ParseEnum(value, options.config.present_mode)) {
 				::printf("invalid present mode: %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--debug-server-port") {
+			if (!ParseUint32(value, options.config.debug_server_port) ||
+			    options.config.debug_server_port > 65535) {
+				::printf("invalid debug server port: %s\n", value.c_str());
 				return false;
 			}
 		} else if (arg == "--gpu") {

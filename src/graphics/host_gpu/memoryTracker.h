@@ -76,6 +76,27 @@ public:
 		});
 	}
 
+	// Calls func(address, size) for every CPU-dirty range, outside the tracker locks.
+	template <typename Func>
+	void ForEachCpuDirtyRange(uint64_t vaddr, uint64_t size, Func&& func) {
+		CheckNotInUploadCallback();
+		std::vector<std::pair<uint64_t, uint64_t>> ranges;
+		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			std::scoped_lock lock(manager->lock);
+			manager->template ForEachModifiedRange<DirtySource::Cpu, false>(
+			    manager->GetCpuAddr() + offset, bytes, [&](uint64_t address, uint64_t length) {
+				    if (!ranges.empty() && ranges.back().first + ranges.back().second == address) {
+					    ranges.back().second += length;
+				    } else {
+					    ranges.emplace_back(address, length);
+				    }
+			    });
+		});
+		for (const auto& [address, length]: ranges) {
+			func(address, length);
+		}
+	}
+
 	template <typename RangeFunc, typename UploadFunc>
 	void ForEachUploadRange(uint64_t vaddr, uint64_t size, bool is_written, RangeFunc&& range_func,
 	                        UploadFunc&& upload_func) {
@@ -86,8 +107,9 @@ public:
 		const auto* previous_upload_owner = std::exchange(s_upload_owner, this);
 		Iterate<false>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
 			manager->lock.lock();
+			// A range about to be written by the GPU must not keep CPU-dirty pages behind.
 			manager->ForEachModifiedRange<DirtySource::Cpu, true>(manager->GetCpuAddr() + offset,
-			                                                      bytes, range_func);
+			                                                      bytes, range_func, !is_written);
 			if (!is_written) {
 				manager->lock.unlock();
 			}

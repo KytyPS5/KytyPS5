@@ -19,6 +19,7 @@
 #include "graphics/shader/shader.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <limits>
 #include <span>
 #include <vector>
@@ -618,6 +619,12 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	info.stage             = comp_shader_stage_info;
 	info.layout            = pipeline.pipeline_layout;
 	info.basePipelineIndex = -1;
+	// A dispatcher-fallback shader is one huge switch loop. NVIDIA's optimizer has been measured
+	// taking over two minutes on one of Beast of Reincarnation's (305k SPIR-V words), long enough
+	// for Unreal's render-thread watchdog to abort the game, so skip optimization for these.
+	if (input_info.stage.program->dispatcher_fallback && std::getenv("KYTY_OPTIMIZE_FALLBACK") == nullptr) {
+		info.flags |= vk::PipelineCreateFlagBits::eDisableOptimization;
+	}
 
 	EXIT_IF(pipeline.pipeline != nullptr);
 

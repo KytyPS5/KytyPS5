@@ -8,6 +8,7 @@
 #include "kernel/pthread.h"
 #include "libs/audio_internal.h"
 #include "libs/controller.h"
+#include "libs/debugSnapshots.h"
 #include "libs/dualSenseHaptics.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -20,6 +21,8 @@
 #include <cstring>
 #include <limits>
 #include <magic_enum.hpp>
+#include <nlohmann/json.hpp>
+#include <string>
 #include <vector>
 
 namespace Libs::Audio {
@@ -92,6 +95,7 @@ public:
 	bool     AudioOutSetVolume(Id handle, uint32_t bitflag, const int* volume);
 	uint32_t AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking = true);
 	bool     AudioOutGetStatus(Id handle, int* type, int* channels_num);
+	nlohmann::json DebugSnapshot();
 
 	Id       AudioInOpen(uint32_t samples_num, uint32_t freq, Format format, bool asynchronous);
 	int      AudioInClose(Id handle);
@@ -112,6 +116,9 @@ private:
 		bool     queue_primed     = false;
 		int      channels_num     = 0;
 		int      volume[12]       = {};
+		// Debug tools: peak of the last queued grain (0..1) and how many grains were queued.
+		float    debug_peak       = 0.0f;
+		uint64_t debug_outputs    = 0;
 
 		SDL_AudioStream*                     stream  = nullptr;
 		Controller::DualSenseHaptics::Stream* haptics = nullptr;
@@ -150,6 +157,66 @@ private:
 };
 
 static Audio* g_audio = nullptr;
+
+static const char* DebugPortTypeName(int type) {
+	switch (type) {
+		case AUDIO_OUT_PORT_TYPE_MAIN: return "Main";
+		case AUDIO_OUT_PORT_TYPE_BGM: return "BGM";
+		case AUDIO_OUT_PORT_TYPE_VOICE: return "Voice";
+		case AUDIO_OUT_PORT_TYPE_PERSONAL: return "Personal";
+		case AUDIO_OUT_PORT_TYPE_PADSPK: return "Pad speaker";
+		case AUDIO_OUT_PORT_TYPE_VIBRATION: return "Vibration";
+		case AUDIO_OUT_PORT_TYPE_AUDIO3D: return "Audio3D";
+		case AUDIO_OUT_PORT_TYPE_AUX: return "Aux";
+		default: return "Other";
+	}
+}
+
+nlohmann::json Audio::DebugSnapshot() {
+	Common::LockGuard lock(m_mutex);
+	nlohmann::json    result;
+	result["columns"] = {"Port", "Type", "Format", "Rate", "Grain", "Channels", "Queued grains",
+	                     "Outputs", "peak", "Device"};
+	auto& rows        = result["rows"];
+	rows              = nlohmann::json::array();
+	uint32_t open_ports = 0;
+	for (int i = 0; i < OUT_PORTS_MAX; i++) {
+		const auto& port = m_out_ports[i];
+		if (!port.used) {
+			continue;
+		}
+		open_ports++;
+		uint32_t   queued      = 0;
+		const auto grain_bytes = BytesPerSample(port.format) * OutputChannels(port) * port.samples_num;
+		if (port.stream != nullptr && grain_bytes != 0) {
+			const auto bytes = SDL_GetAudioStreamQueued(port.stream);
+			queued           = bytes > 0 ? static_cast<uint32_t>(bytes) / grain_bytes : 0;
+		}
+		rows.push_back({i + 1, DebugPortTypeName(port.type),
+		                std::string(magic_enum::enum_name(port.format)), port.freq, port.samples_num,
+		                port.channels_num, queued, port.debug_outputs, port.debug_peak,
+		                port.stream != nullptr ? "SDL" : (port.haptics != nullptr ? "Haptics" : "none")});
+	}
+	uint32_t open_inputs = 0;
+	for (const auto& port: m_in_ports) {
+		open_inputs += port.used ? 1u : 0u;
+	}
+	result["summary"] = {{"Output ports open", open_ports},
+	                     {"Input ports open", open_inputs},
+	                     {"SDL driver", SDL_GetCurrentAudioDriver() != nullptr
+	                                        ? SDL_GetCurrentAudioDriver()
+	                                        : "none"}};
+	return result;
+}
+
+nlohmann::json DebugAudioSnapshot() {
+	if (g_audio == nullptr) {
+		return {{"summary", {{"Audio", "not initialized"}}},
+		        {"columns", nlohmann::json::array()},
+		        {"rows", nlohmann::json::array()}};
+	}
+	return g_audio->DebugSnapshot();
+}
 
 namespace AudioInternal {
 
@@ -408,6 +475,24 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking) {
 				Common::Thread::SleepMicro(next_time - now);
 			}
 		}
+	}
+
+	{
+		const auto samples = output_channels * port->samples_num;
+		float      peak    = 0.0f;
+		if (FormatIsFloat(port->format)) {
+			const auto* values = static_cast<const float*>(prepared_data);
+			for (uint32_t i = 0; i < samples; i++) {
+				peak = std::max(peak, std::fabs(values[i]));
+			}
+		} else {
+			const auto* values = static_cast<const int16_t*>(prepared_data);
+			for (uint32_t i = 0; i < samples; i++) {
+				peak = std::max(peak, std::fabs(static_cast<float>(values[i]) / 32768.0f));
+			}
+		}
+		port->debug_peak = std::min(peak, 1.0f);
+		port->debug_outputs++;
 	}
 
 	if (!SDL_PutAudioStreamData(port->stream, prepared_data, static_cast<int>(prepared_size))) {

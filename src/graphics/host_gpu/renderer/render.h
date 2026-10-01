@@ -65,6 +65,9 @@ struct DrawIndexArgs {
 	uint32_t         first_instance             = 0;
 	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
 	uint32_t         render_target_slice_offset = 0;
+	// Guest address of a DrawIndexedIndirect argument block the GPU consumes directly. When set,
+	// index_addr/index_count describe the whole bound index buffer instead of one draw.
+	uint64_t         gpu_indirect_args          = 0;
 };
 
 struct DrawAutoArgs {
@@ -74,6 +77,8 @@ struct DrawAutoArgs {
 	uint32_t         first_instance             = 0;
 	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
 	uint32_t         render_target_slice_offset = 0;
+	// Guest address of a DrawIndirect argument block the GPU consumes directly.
+	uint64_t         gpu_indirect_args          = 0;
 };
 
 struct SubmitInfo {

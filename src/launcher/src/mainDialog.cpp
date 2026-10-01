@@ -4,6 +4,7 @@
 #include "configurationItem.h"
 #include "configurationListWidget.h"
 #include "controllerLightbar.h"
+#include "debugClient.h"
 #include "gameContent.h"
 #include "patchesDialog.h"
 #include "updateChecker.h"
@@ -243,6 +244,8 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 		args << "--tessellation";
 	}
 	args << "--vblank-frequency" << QString::number(info.vblank_frequency);
+	// Lets the launcher's debug tools attach to the running game.
+	args << "--debug-server-port" << QString::number(KYTY_DEBUG_SERVER_PORT);
 	args << "--console-language" << QString::number(info.console_language);
 	args << "--vulkan-validation" << BoolArg(info.vulkan_validation_enabled);
 	args << "--shader-validation" << BoolArg(info.shader_validation_enabled);

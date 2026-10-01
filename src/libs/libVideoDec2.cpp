@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fmt/format.h>
 #include <mutex>
 #include <unordered_set>
 
@@ -293,6 +294,39 @@ static void PublishDecodedFrame(const Decoder::Output& decoded,
 	const auto size  = picture_size != 0 ? std::min(picture_size, limit) : limit;
 	if (size == 0) {
 		return;
+	}
+	// EXPERIMENT (diagnostic): average luma of every 50th decoded picture, to tell a genuinely
+	// dark movie from one whose frames never reach the screen.
+	{
+		static std::atomic_uint64_t dbg_frames {0};
+		const auto                  n = dbg_frames.fetch_add(1, std::memory_order_relaxed);
+		if ((n % 50u) == 0u && decoded.pitch != 0 && decoded.height != 0) {
+			const auto* luma  = static_cast<const uint8_t*>(frame_buffer->frame_buffer);
+			uint64_t    sum   = 0;
+			uint32_t    max_y = 0;
+			for (uint32_t y = 0; y < decoded.height; y += 8) {
+				for (uint32_t x = 0; x < decoded.width; x += 8) {
+					const uint32_t v = luma[static_cast<uint64_t>(y) * decoded.pitch + x];
+					sum += v;
+					max_y = std::max(max_y, v);
+				}
+			}
+			const auto samples = static_cast<uint64_t>((decoded.height + 7) / 8) *
+			                     ((decoded.width + 7) / 8);
+			LOGF("VIDEODEC2 LUMA #%" PRIu64 ": avg=%" PRIu64 " max=%u fb=%p\n", n, sum / samples,
+			     max_y, frame_buffer->frame_buffer);
+			if (const char* dir = std::getenv("KYTY_VIDEO_DUMP"); dir != nullptr) {
+				const auto path = fmt::format("{}/luma_{:04}.pgm", dir, n);
+				if (FILE* f = std::fopen(path.c_str(), "wb"); f != nullptr) {
+					std::fprintf(f, "P5\n%u %u\n255\n", decoded.width, decoded.height);
+					for (uint32_t y = 0; y < decoded.height; y++) {
+						std::fwrite(luma + static_cast<uint64_t>(y) * decoded.pitch, 1,
+						            decoded.width, f);
+					}
+					std::fclose(f);
+				}
+			}
+		}
 	}
 	LibKernel::Memory::InvalidateMemory(reinterpret_cast<uint64_t>(frame_buffer->frame_buffer),
 	                                    size);

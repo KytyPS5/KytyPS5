@@ -272,7 +272,7 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	// is what says whether a target the compositor later samples as B10G11R11 was decoded as
 	// something else here.
 	bool decision_log_first = false;
-	{
+	if (DebugGfxTraceEnabled()) {
 		static std::mutex dbg_mutex;
 		static std::set<std::tuple<uint64_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t>>
 		    dbg_seen;

@@ -55,6 +55,12 @@ extern uint32_t g_dbg_rt_format;
 extern uint32_t g_dbg_rt_width;
 extern uint32_t g_dbg_rt_height;
 
+// EXPERIMENT (diagnostic): one sampled frame per 1000 gets a line per draw/dispatch and per
+// bound image, in submission order, so a single frame's pass chain can be read directly.
+bool DebugPassFrame() {
+	return (g_dbg_frame.load(std::memory_order_relaxed) % 1000u) == 999u;
+}
+
 namespace {
 
 using BindingKind = ShaderRecompiler::IR::DescriptorBindingKind;
@@ -143,6 +149,10 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	}
 	buffer_offset = static_cast<uint32_t>(adjustment);
 	const vk::DescriptorBufferInfo result {buffer->Handle(), aligned_offset, size + adjustment};
+	if (DebugPassFrame()) {
+		LOGF("PBUF: addr=0x%010" PRIx64 " size=0x%" PRIx64 " rw=%d%d fmt=%d\n", address, static_cast<uint64_t>(size), resource.read ? 1 : 0,
+		     resource.written ? 1 : 0, resource.formatted ? 1 : 0);
+	}
 	if (resource.written) {
 		context.GetTextureCache().InvalidateMemoryFromGPU(address, size);
 	}
@@ -984,7 +994,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		}
 
 		// Debug: record the texture->target edges so the composite chain can be walked.
-		{
+		if (DebugGfxTraceEnabled()) {
 			auto& dbg_img = texture_cache.GetImage(binding.image_id);
 			// No width filter: a complete graph is needed, and the edges are deduplicated by
 			// their full (address, extent, format) key anyway.
@@ -1016,11 +1026,25 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		}
 		auto&      image   = texture_cache.GetImage(binding.image_id);
 		const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
+		if (DebugPassFrame()) {
+			LOGF("PTEX: slot=%u id=%u/%u want=0x%010" PRIx64 ":%ux%u:%u got=0x%010" PRIx64
+			     ":%ux%ux%u:%u view=%u lv=%u+%u storage=%d written=%d gpu=%d bufmod=%d cpu=%d\n",
+			     i, binding.image_id.index, binding.image_id.generation,
+			     binding.desc.info.data.address, binding.desc.info.extent.width,
+			     binding.desc.info.extent.height,
+			     static_cast<uint32_t>(binding.desc.info.pixel_format), image.info.data.address,
+			     image.info.extent.width, image.info.extent.height, image.info.extent.depth,
+			     static_cast<uint32_t>(image.backing.format),
+			     static_cast<uint32_t>(binding.desc.view_info.format),
+			     binding.desc.view_info.base_level, binding.desc.view_info.level_count,
+			     storage ? 1 : 0, resource.written ? 1 : 0, image.IsGpuModified() ? 1 : 0,
+			     image.IsBufferModified() ? 1 : 0, image.IsCpuDirty() ? 1 : 0);
+		}
 		// Debug: COMPUTE IMG only covers dispatches and the edge graph only fires for colour
 		// targets, so a texture a pixel shader samples is invisible in both. Report every bound
 		// image once per (address, extent, format). This is what says whether an address the
 		// guest wrote - a decoded movie frame, for instance - is ever handed to a shader at all.
-		{
+		if (DebugGfxTraceEnabled()) {
 			static std::mutex                                                dbg_mutex;
 			static std::set<std::tuple<uint64_t, uint32_t, uint32_t, uint32_t>> dbg_seen;
 			bool first = false;
@@ -1052,6 +1076,31 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	}
 	if (uses_dma) {
 		m_context.PrepareBda();
+	}
+	if (DebugPassFrame()) {
+		std::string rts;
+		for (const auto& target: colors) {
+			char text[96];
+			std::snprintf(text, sizeof(text), " rt%u=0x%010" PRIx64 ":%ux%u:%u:id%u/%u",
+			              target.target_slot, target.desc.info.data.address,
+			              target.desc.info.extent.width,
+			              target.desc.info.extent.height,
+			              static_cast<uint32_t>(target.desc.info.pixel_format),
+			              target.image_id.index, target.image_id.generation);
+			rts += text;
+		}
+		std::string hashes;
+		for (const auto* stage: stages) {
+			char text[40];
+			std::snprintf(text, sizeof(text), " h%d=%016" PRIx64,
+			              static_cast<int>(stage->runtime->program->stage),
+			              stage->runtime->program->shader_hash);
+			hashes += text;
+		}
+		LOGF("PASS: frame=%" PRIu64 " kind=draw ps=%p colors=%zu%s%s\n",
+		     g_dbg_frame.load(std::memory_order_relaxed),
+		     stages.empty() ? nullptr : static_cast<const void*>(stages.back()->runtime->program),
+		     colors.size(), rts.c_str(), hashes.c_str());
 	}
 	for (auto* stage: stages) {
 		RebindImages(*stage);

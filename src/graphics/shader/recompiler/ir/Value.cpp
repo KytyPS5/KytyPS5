@@ -33,10 +33,6 @@ bool Value::IsImmediate() const {
 	return type != Type::Opaque;
 }
 
-bool Value::IsIdentity() const {
-	return type == Type::Opaque && inst->GetOpcode() == ValueOpcode::Identity;
-}
-
 bool Value::IsPhi() const {
 	return type == Type::Opaque && inst->GetOpcode() == ValueOpcode::Phi;
 }
@@ -63,10 +59,6 @@ Inst* Value::TryInstruction() const {
 Inst* Value::ResolveInstruction() const {
 	EXIT_IF(type != Type::Opaque);
 	return IsIdentity() ? inst->Arg(0).ResolveInstruction() : inst;
-}
-
-Value Value::Resolve() const {
-	return IsIdentity() ? inst->Arg(0).Resolve() : *this;
 }
 
 ScalarReg Value::ScalarRegister() const {
@@ -146,10 +138,6 @@ Inst::~Inst() {
 	ClearArgs();
 }
 
-ValueOpcode Inst::GetOpcode() const {
-	return opcode;
-}
-
 Type Inst::GetType() const {
 	if (opcode == ValueOpcode::Phi) {
 		return static_cast<Type>(flags);
@@ -172,17 +160,8 @@ size_t Inst::UseCount() const {
 	return uses.size();
 }
 
-size_t Inst::NumArgs() const {
-	return args.size();
-}
-
 size_t Inst::NumPhiBlocks() const {
 	return phi_blocks.size();
-}
-
-Value Inst::Arg(size_t index) const {
-	EXIT_IF(index >= args.size());
-	return args[index];
 }
 
 Block* Inst::PhiBlock(size_t index) const {

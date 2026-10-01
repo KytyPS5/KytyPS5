@@ -164,6 +164,9 @@ public:
 	// Scheduler tick of the last GPU write into this image. Compared against the tick of the last
 	// buffer write to the same guest bytes to decide which side holds the newer contents.
 	uint64_t         gpu_write_tick     = 0;
+	// Metadata write tick last evaluated for a pending fast clear, and the tick it was read in.
+	uint64_t         clear_meta_tick    = 0;
+	uint64_t         clear_check_tick   = 0;
 	size_t           lru_id             = 0;
 
 private:

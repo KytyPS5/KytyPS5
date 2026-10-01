@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/cache/multiLevelPageTable.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
+#include <atomic>
 #include <map>
 #include <span>
 #include <utility>
@@ -79,10 +80,15 @@ public:
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	// Scheduler tick of the newest buffer write covering these bytes, or 0 if none wrote them.
 	[[nodiscard]] uint64_t GpuWriteTick(uint64_t vaddr, uint64_t size) const;
+	// Bumped whenever a buffer is created.
+	[[nodiscard]] uint64_t BufferEpoch() const noexcept {
+		return m_buffer_epoch.load(std::memory_order_relaxed);
+	}
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               ProcessFaultBuffer();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
+	void               SynchronizeDirtyBuffersInRange(uint64_t vaddr, uint64_t size);
 	void               RunGarbageCollector();
 
 private:
@@ -133,6 +139,7 @@ private:
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
 	std::unordered_map<uint64_t, uint64_t>            m_gpu_write_ticks;
+	std::atomic_uint64_t                              m_buffer_epoch {0};
 	MemoryTracker                                     m_memory_tracker;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;

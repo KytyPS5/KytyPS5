@@ -433,6 +433,10 @@ PipelineCache::PipelineCache(GraphicContext& graphics)
 }
 
 PipelineCache::~PipelineCache() {
+	for (auto& [id, pending]: m_pending_compute) {
+		m_compute_pipelines.emplace(id, pending.get());
+	}
+	m_pending_compute.clear();
 	Save();
 	auto destroy = [this](const auto& pipelines) {
 		for (const auto& [key, pipeline]: pipelines) {
@@ -464,10 +468,10 @@ void PipelineCache::InitializeDriverCache() {
 		PipelineCacheLog("Vulkan pipeline cache: disabled (unknown git revision)");
 		return;
 	}
-	if (git_hash.ends_with("-dirty")) {
-		PipelineCacheLog("Vulkan pipeline cache: disabled (dirty build)");
-		return;
-	}
+	// A dirty build still gets the cache: the blob is the driver's own, keyed by the revision and
+	// the driver identity and validated by the driver on load, so pipelines a local change no
+	// longer produces are merely unused. Without it every launch recompiles every pipeline, which
+	// stalls frames (and audio) for minutes on titles with large shaders.
 
 	m_driver_cache_path     = std::filesystem::path("_PipelineCache") / (title_id + ".bin");
 	const auto path         = Common::PathToString(m_driver_cache_path);
@@ -533,6 +537,16 @@ void PipelineCache::InitializeDriverCache() {
 	} else {
 		PipelineCacheLog("Vulkan pipeline cache: initialized empty");
 	}
+}
+
+void PipelineCache::SaveIfDue() {
+	using Clock = std::chrono::steady_clock;
+	const auto now = Clock::now();
+	if (m_driver_cache == nullptr || now - m_last_save < std::chrono::seconds(60)) {
+		return;
+	}
+	m_last_save = now;
+	Save();
 }
 
 void PipelineCache::Save() {
@@ -867,9 +881,50 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
 
 	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
+	SaveIfDue();
 	EXIT_IF(!inserted);
 
 	return *iter->second;
+}
+
+PipelineCache::Pipeline*
+PipelineCache::TryGetComputePipeline(const ShaderComputeInputInfo& input_info,
+                                     const ShaderProgram&          compute_program) {
+	EXIT_IF(!compute_program);
+	if (auto iter = m_compute_pipelines.find(compute_program.id);
+	    iter != m_compute_pipelines.end()) {
+		return iter->second.get();
+	}
+	if (!input_info.stage.program->dispatcher_fallback) {
+		return &GetComputePipeline(input_info, compute_program);
+	}
+	if (auto pending = m_pending_compute.find(compute_program.id);
+	    pending != m_pending_compute.end()) {
+		if (pending->second.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+			return nullptr;
+		}
+		auto [iter, inserted] =
+		    m_compute_pipelines.emplace(compute_program.id, pending->second.get());
+		EXIT_IF(!inserted);
+		m_pending_compute.erase(pending);
+		LOGF("PipelineCache: background compute pipeline ready id=%" PRIu64 "\n",
+		     static_cast<uint64_t>(compute_program.id));
+		SaveIfDue();
+		return iter->second.get();
+	}
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "Compiling a large compute shader (hash 0x{:016x}) in the background; its dispatches "
+	    "are skipped until it is ready.\n",
+	    input_info.stage.program->shader_hash));
+	m_pending_compute.emplace(
+	    compute_program.id,
+	    std::async(std::launch::async, [this, input_info, module = compute_program.module]() {
+		    auto cached = std::make_unique<Pipeline>();
+		    CreatePipelineInternal(m_graphics, *cached, input_info, module, m_driver_cache);
+		    EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
+		    return cached;
+	    }));
+	return nullptr;
 }
 
 PipelineCache::Pipeline&
@@ -895,6 +950,7 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
 
 	auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(cached));
+	SaveIfDue();
 	EXIT_IF(!inserted);
 
 	return *iter->second;

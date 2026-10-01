@@ -38,6 +38,8 @@
 #include <vector>
 
 namespace Libs::Graphics {
+
+bool DebugPassFrame();
 static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::DescriptorValue> sources,
                                  GuestRange destination, uint32_t output_buffer = UINT32_MAX) {
 	for (uint32_t i = 0; i < sources.size(); ++i) {
@@ -365,13 +367,24 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 
 	buffer.EndRendering();
-	auto& pipeline =
-	    m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
+	auto* pipeline_ptr =
+	    m_context.GetPipelineCache().TryGetComputePipeline(input_info, compute_program);
+	if (pipeline_ptr == nullptr) {
+		// Still compiling in the background; skipping beats stalling the guest past its watchdog.
+		return;
+	}
+	auto& pipeline = *pipeline_ptr;
 	auto& bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
 	FindBuffers(bindings);
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
+	}
+	if (DebugPassFrame()) {
+		LOGF("PASS: frame=%" PRIu64 " kind=cs cs=0x%010" PRIx64 " groups=%ux%ux%u h=%016" PRIx64
+		     "\n",
+		     g_dbg_frame.load(std::memory_order_relaxed), sh_ctx.GetCs().cs_regs.data_addr,
+		     thread_group_x, thread_group_y, thread_group_z, program.shader_hash);
 	}
 	RebindImages(bindings);
 	// Debug: the edge graph only records colour-target bindings, so a composite produced by a
@@ -453,7 +466,13 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 	buffer.EndRendering();
-	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
+	auto* pipeline_ptr =
+	    m_context.GetPipelineCache().TryGetComputePipeline(input_info, compute_program);
+	if (pipeline_ptr == nullptr) {
+		// Still compiling in the background; skipping beats stalling the guest past its watchdog.
+		return;
+	}
+	auto& pipeline = *pipeline_ptr;
 	auto& bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
 	FindBuffers(bindings);
@@ -461,7 +480,38 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (program.info.uses_dma) {
 		m_context.PrepareBda();
 	}
+	if (DebugPassFrame()) {
+		auto& buffers = m_context.GetBufferCache();
+		LOGF("PASS: frame=%" PRIu64 " kind=csi cs=0x%010" PRIx64 " args=0x%010" PRIx64
+		     " gpu_mod=%d cpu_mod=%d dma=%d h=%016" PRIx64 "\n",
+		     g_dbg_frame.load(std::memory_order_relaxed), cs_regs.cs_regs.data_addr, args_addr,
+		     buffers.IsRegionGpuModified(args_addr, 12) ? 1 : 0,
+		     buffers.IsRegionCpuModified(args_addr, 12) ? 1 : 0, program.info.uses_dma ? 1 : 0,
+		     program.shader_hash);
+	}
 	RebindImages(bindings);
+	// EXPERIMENT (diagnostic): KYTY_EXP_SKIP_CAT=<n> drops the indirect dispatch whose arguments
+	// sit at slot n (32-byte stride) when it writes a 1080p B10G11R11 storage view, i.e. one
+	// motion-blur tile category, to see which category produces which part of the scene.
+	{
+		static const int skip_cat = [] {
+			const char* value = std::getenv("KYTY_EXP_SKIP_CAT");
+			return value != nullptr ? std::atoi(value) : -1;
+		}();
+		if (skip_cat >= 0 && static_cast<int>((args_addr & 0xffu) / 0x20u) == skip_cat) {
+			const bool writes_scene = std::any_of(
+			    bindings.images.begin(), bindings.images.end(), [](const auto& image) {
+				    return image.desc.type == TextureCache::BindingType::Storage &&
+				           image.desc.info.extent.width == 1920 &&
+				           image.desc.info.extent.height == 1080 &&
+				           image.desc.view_info.format == vk::Format::eB10G11R11UfloatPack32;
+			    });
+			if (writes_scene) {
+				ResetBindings();
+				return;
+			}
+		}
+	}
 	// Acquiring arguments can merge cache buffers; finalize shader bindings afterward.
 	const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
 	    args_addr, sizeof(vk::DispatchIndirectCommand), false);

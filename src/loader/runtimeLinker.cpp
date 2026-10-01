@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/pageManager.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
+#include "libs/debugSnapshots.h"
 #include "loader/elf.h"
 #include "loader/gamePatch.h"
 #include "loader/jit.h"
@@ -30,6 +31,8 @@
 #include <fmt/format.h>
 #include <magic_enum.hpp>
 #include <memory>
+#include <mutex>
+#include <nlohmann/json.hpp>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -124,8 +127,13 @@ struct StubbedImportRecord {
 	SymbolType  type = SymbolType::Unknown;
 	BindType    bind = BindType::Unknown;
 	std::string program;
+	uint64_t    calls    = 0;
+	bool        resolved = false;
 };
 
+// Guards g_stubbed_imports: the debug tools read it from their own thread while the guest calls
+// through the stubs and loads modules.
+static std::mutex                       g_stubbed_imports_mutex;
 static std::vector<StubbedImportRecord> g_stubbed_imports;
 static std::atomic_uint32_t             g_unresolved_stub_call_log_count {0};
 static std::vector<uint64_t>            g_unresolved_stub_thunk_pages;
@@ -177,8 +185,10 @@ static uint64_t AllocateUnresolvedImportThunk(uint64_t record_id) {
 
 static uint64_t RegisterStubbedImport(uint32_t index, const Program* program,
                                       const RelocationInfo& ri) {
-	for (const auto& record: g_stubbed_imports) {
+	std::scoped_lock lock {g_stubbed_imports_mutex};
+	for (auto& record: g_stubbed_imports) {
 		if (record.patch_vaddr == ri.vaddr) {
+			record.resolved = false;
 			return record.thunk_vaddr;
 		}
 	}
@@ -197,11 +207,31 @@ static uint64_t RegisterStubbedImport(uint32_t index, const Program* program,
 	return thunk;
 }
 
+// A module loaded later can supply a symbol that was stubbed at startup; the relocation pass then
+// patches the real address over the stub, and the record stops describing a live stub.
+static void MarkStubbedImportResolved(uint64_t patch_vaddr) {
+	std::scoped_lock lock {g_stubbed_imports_mutex};
+	for (auto& record: g_stubbed_imports) {
+		if (record.patch_vaddr == patch_vaddr) {
+			record.resolved = true;
+		}
+	}
+}
+
 static KYTY_SYSV_ABI uint64_t UnresolvedImportStub(uint64_t record_id) {
 	const auto log_index = g_unresolved_stub_call_log_count.fetch_add(1);
-	if (log_index < 1024) {
+	StubbedImportRecord record {};
+	bool                known = false;
+	{
+		std::scoped_lock lock {g_stubbed_imports_mutex};
 		if (record_id < g_stubbed_imports.size()) {
-			const auto& record = g_stubbed_imports[record_id];
+			g_stubbed_imports[record_id].calls++;
+			record = g_stubbed_imports[record_id];
+			known  = true;
+		}
+	}
+	if (log_index < 1024) {
+		if (known) {
 			printf("Unresolved import stub called: %s\n", record.name.c_str());
 			LOGF("Unresolved import stub called [%u]: patch_vaddr=0x%016" PRIx64
 			     " jmprela_index=%" PRIu32 " symbol=%s type=%s bind=%s program=%s\n",
@@ -894,6 +924,9 @@ static bool RelocateRecord(uint32_t index, Elf64_Rela* r, Program* program, bool
 	}
 
 	const bool patched = PatchGuestMemory64(ri.vaddr, value);
+	if (patched && ri.resolved && jmprela_table) {
+		MarkStubbedImportResolved(ri.vaddr);
+	}
 	if (patched && stubbed) {
 		LOGF("Relocate: unresolved %s import patched to stub [%u] [%016" PRIx64 "] <- %016" PRIx64
 		     ", %s, %s, %s, %s\n",
@@ -1306,7 +1339,10 @@ void RuntimeLinker::Clear() {
 	}
 	g_unresolved_stub_thunk_pages.clear();
 	g_unresolved_stub_thunk_offset = 0;
-	g_stubbed_imports.clear();
+	{
+		std::scoped_lock lock {g_stubbed_imports_mutex};
+		g_stubbed_imports.clear();
+	}
 	g_unresolved_stub_call_log_count.store(0);
 	if (g_invalid_memory != 0) {
 		EXIT_IF(!Libs::LibKernel::Memory::FreeGuestMemory(g_invalid_memory, 4096));
@@ -1677,6 +1713,34 @@ void RuntimeLinker::PreloadAdjacentPrograms() {
 	add_dir(root / "sce_module");
 	add_dir(root / "sce_modules");
 
+	// System modules a game expects the console firmware to provide (libc.prx for most Unity
+	// titles) can be supplied in sys_modules beside the emulator. The game's own copy of a module
+	// always wins, so only names the game does not ship are taken from there.
+	const auto sys_dir = std::filesystem::current_path() / "sys_modules";
+	if (Common::File::IsDirectoryExisting(sys_dir)) {
+		const auto shipped = [&module_paths, this](const std::string& name) {
+			for (const auto& p: module_paths) {
+				if (Common::EqualNoCase(Common::PathToGenericString(p.filename()), name)) {
+					return true;
+				}
+			}
+			for (auto* program: m_programs) {
+				if (Common::EqualNoCase(Common::PathToGenericString(program->file_name.filename()),
+				                        name)) {
+					return true;
+				}
+			}
+			return false;
+		};
+		for (const auto& entry: Common::File::GetDirEntries(sys_dir)) {
+			if (entry.is_file && IsAdjacentModuleFile(entry.name) &&
+			    !SkipAdjacentModuleFile(entry.name) && !shipped(entry.name)) {
+				LOGF("Loading system module fallback: %s\n", entry.name.c_str());
+				add_path(sys_dir / entry.name);
+			}
+		}
+	}
+
 	for (const auto& path: module_paths) {
 		auto* program                        = LoadProgram(path);
 		program->fail_if_global_not_resolved = false;
@@ -1990,10 +2054,13 @@ void RuntimeLinker::DeleteProgram(Program* p) {
 		g_tls_cached_main_program = nullptr;
 		g_tls_cached_main_tcb     = nullptr;
 	}
-	for (auto& record: g_stubbed_imports) {
-		if (record.patch_vaddr >= program->base_vaddr &&
-		    record.patch_vaddr < program->base_vaddr + program->mapped_size) {
-			record.patch_vaddr = 0;
+	{
+		std::scoped_lock lock {g_stubbed_imports_mutex};
+		for (auto& record: g_stubbed_imports) {
+			if (record.patch_vaddr >= program->base_vaddr &&
+			    record.patch_vaddr < program->base_vaddr + program->mapped_size) {
+				record.patch_vaddr = 0;
+			}
 		}
 	}
 
@@ -2326,6 +2393,33 @@ void* RuntimeLinker::ApplicationHeapMalloc(uint64_t size) {
 	Common::LockGuard lock(m_mutex);
 
 	return m_application_heap_malloc != nullptr ? m_application_heap_malloc(size) : nullptr;
+}
+
+nlohmann::json DebugImportSnapshot() {
+	nlohmann::json result;
+	result["columns"] = {"Symbol", "Calls", "Type", "Bind", "GOT slot", "Program"};
+	auto& rows        = result["rows"];
+	rows              = nlohmann::json::array();
+	uint64_t total    = 0;
+	uint32_t called   = 0;
+	{
+		std::scoped_lock lock {g_stubbed_imports_mutex};
+		for (const auto& record: g_stubbed_imports) {
+			if (record.resolved) {
+				continue;
+			}
+			char slot[24];
+			std::snprintf(slot, sizeof(slot), "0x%016" PRIx64, record.patch_vaddr);
+			rows.push_back({record.name, record.calls, std::string(magic_enum::enum_name(record.type)),
+			                std::string(magic_enum::enum_name(record.bind)), slot, record.program});
+			total += record.calls;
+			called += record.calls != 0 ? 1u : 0u;
+		}
+	}
+	result["summary"] = {{"Unresolved imports", rows.size()},
+	                     {"Called at least once", called},
+	                     {"Total stub calls", total}};
+	return result;
 }
 
 } // namespace Loader

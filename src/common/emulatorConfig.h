@@ -72,6 +72,7 @@ struct ConfigOptions {
 	bool                   readback_linear_images      = false;
 	bool                   tessellation_enabled        = false;
 	bool                   playgo_hack_enabled         = false;
+	uint32_t               debug_server_port           = 0;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	bool red_zone_protection_enabled = false;
 #endif
@@ -118,6 +119,8 @@ bool RenderDocEnabled();
 bool ReadbackLinearImagesEnabled();
 bool TessellationEnabled();
 bool PlayGoHackEnabled();
+// Localhost port of the launcher's debug-tools server; 0 when disabled.
+uint32_t GetDebugServerPort();
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled();
 #endif

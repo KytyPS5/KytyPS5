@@ -165,4 +165,30 @@ private:
 	mutable uint32_t    evaluation_index = UINT32_MAX;
 };
 
+// Hot in resource evaluation: inline so per-draw IR walks avoid out-of-line calls.
+inline ValueOpcode Inst::GetOpcode() const {
+	return opcode;
+}
+
+inline size_t Inst::NumArgs() const {
+	return args.size();
+}
+
+inline Value Inst::Arg(size_t index) const {
+	EXIT_IF(index >= args.size());
+	return args[index];
+}
+
+inline bool Value::IsIdentity() const {
+	return type == Type::Opaque && inst->GetOpcode() == ValueOpcode::Identity;
+}
+
+inline Value Value::Resolve() const {
+	Value value = *this;
+	while (value.IsIdentity()) {
+		value = value.inst->Arg(0);
+	}
+	return value;
+}
+
 } // namespace Libs::Graphics::ShaderRecompiler::IR

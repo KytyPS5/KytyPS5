@@ -37129,7 +37129,80 @@ void RunDsAppendHelperQuadCase(VulkanHarness *vulkan) {
   Fail(test.name, "graphics DS_APPEND helper", evidence.str() + "; expected delta 3");
 }
 
+GraphicsCase GraphicsSwizzleHelperQuad() {
+  using O = ShaderOpcode;
+  auto test = GraphicsDsAppendHelperQuad();
+  test.name = "GraphicsSwizzleHelperQuad";
+  test.gds_initial.clear();
+  test.expected_gds.clear();
+  std::vector<u32> code;
+  AppendVMovU32(&code, 2, 7);
+  AppendVop3(&code, 0x365, 4, 126u, InlineU32(0));
+  code.push_back(EncodeDs0(0x35, 0x00b1)); // quad selector [1,0,3,2]
+  code.push_back(EncodeDs1(3, 0, 2));
+  code.push_back(EncodeVop1(0x06, 8, Vgpr(3)));
+  code.push_back(EncodeVop1(0x06, 9, Vgpr(4)));
+  AppendVMovU32(&code, 10, 0);
+  AppendVMovLiteral(&code, 11, 0x3f800000u);
+  code.push_back(EncodeExp0(0x00, 0xf));
+  code.push_back(EncodeExp1(8, 9, 10, 11));
+  AppendEnd(&code);
+  test.fragment_code = std::move(code);
+  test.opcodes = {O::V_MOV_B32, O::V_MBCNT_LO_U32_B32, O::DS_SWIZZLE_B32,
+                  O::V_CVT_F32_U32, O::EXP, O::S_ENDPGM};
+  return test;
+}
 
+void CheckSwizzleHelperPredicate(const CompiledShader &fragment) {
+  ValidateSpirv("GraphicsSwizzleHelperQuad", fragment.spirv);
+  u32 helper = 0;
+  std::vector<u32> helper_loads, nonhelpers, filtered, shuffles;
+  const auto contains = [](const std::vector<u32> &values, u32 value) { return std::ranges::find(values, value) != values.end(); };
+  bool masked_shuffle = false;
+  for (size_t i = 5; i < fragment.spirv.size();) {
+    const u32 count = fragment.spirv[i] >> 16u;
+    Require("GraphicsSwizzleHelperQuad", "host", count != 0 && i + count <= fragment.spirv.size(), "invalid SPIR-V instruction");
+    const auto *p = fragment.spirv.data() + i;
+    const auto op = static_cast<spv::Op>(p[0] & 0xffffu);
+    if (op == spv::OpDecorate && count == 4 && p[2] == spv::DecorationBuiltIn && p[3] == spv::BuiltInHelperInvocation) helper = p[1];
+    if (op == spv::OpLoad && count >= 4 && p[3] == helper) helper_loads.push_back(p[2]);
+    if (op == spv::OpLogicalNot && count == 4 && contains(helper_loads, p[3])) nonhelpers.push_back(p[2]);
+    if (op == spv::OpGroupNonUniformBallot && count == 5 && contains(nonhelpers, p[4])) filtered.push_back(p[2]);
+    if (op == spv::OpCompositeExtract && count >= 4 && contains(filtered, p[3])) filtered.push_back(p[2]);
+    if ((op == spv::OpBitwiseAnd || op == spv::OpINotEqual || op == spv::OpLogicalAnd) && count == 5 && (contains(filtered, p[3]) || contains(filtered, p[4]))) filtered.push_back(p[2]);
+    if (op == spv::OpGroupNonUniformShuffle && count == 6) shuffles.push_back(p[2]);
+    if (op == spv::OpSelect && count == 6) {
+      masked_shuffle |= contains(filtered, p[3]) && contains(shuffles, p[4]);
+      if (contains(filtered, p[4]) || contains(filtered, p[5])) filtered.push_back(p[2]);
+    }
+    i += count;
+  }
+  Require("GraphicsSwizzleHelperQuad", "host", helper != 0 && masked_shuffle, "masked fragment swizzle must select its lane read through a !HelperInvocation ballot");
+  std::printf("[host]    GraphicsSwizzleHelperQuad predicate ok\n");
+}
+
+void RunSwizzleHelperQuadCase(VulkanHarness *vulkan) {
+  const auto test = GraphicsSwizzleHelperQuad();
+  const auto fragment = CompileFragmentCase(test);
+  CheckSwizzleHelperPredicate(fragment);
+  const auto actual = vulkan->RenderFragment(test, fragment);
+  std::vector<u32> lanes;
+  for (u32 i = 0; i < 4; ++i) {
+    if (actual.pixels[i * 4 + 3] == 0x3f800000u) lanes.push_back(static_cast<u32>(std::bit_cast<float>(actual.pixels[i * 4 + 1])));
+  }
+  Require(test.name, "graphics", lanes.size() == 3, "the triangle must cover three pixels");
+  u32 excluded = 0;
+  for (u32 i = 0; i < 4; ++i) {
+    if (actual.pixels[i * 4 + 3] != 0x3f800000u) continue;
+    const auto lane = static_cast<u32>(std::bit_cast<float>(actual.pixels[i * 4 + 1]));
+    const bool source_covered = std::ranges::find(lanes, lane ^ 1u) != lanes.end();
+    const float expected = source_covered ? 7.0f : 0.0f;
+    Require(test.name, "graphics", std::bit_cast<float>(actual.pixels[i * 4]) == expected, "swizzle read a helper lane or dropped a covered lane");
+    excluded += !source_covered;
+  }
+  Require(test.name, "graphics", excluded == 1, "the quad must exercise one helper source");
+  std::printf("[graphics] GraphicsSwizzleHelperQuad ok\n");
+}
 
 GraphicsCase GraphicsDirectSgprPushConstantExport() {
   using O = ShaderOpcode;
@@ -43516,8 +43589,15 @@ int main(int argc, char **argv) {
     RunDsAppendHelperQuadCase(&vulkan);
     return 0;
   }
-
-
+  if (argc == 2 && std::strcmp(argv[1], "--fragment-helper-host-only") == 0) {
+    CheckSwizzleHelperPredicate(CompileFragmentCase(GraphicsSwizzleHelperQuad()));
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--swizzle-helper-quad-only") == 0) {
+    VulkanHarness vulkan(VulkanHarness::Mode::PortableGraphics);
+    RunSwizzleHelperQuadCase(&vulkan);
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--position-w-only") == 0) {
     VulkanHarness vulkan;
     RunGraphicsCase(&vulkan, GraphicsPositionWExport());

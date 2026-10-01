@@ -337,15 +337,6 @@ folders recursively for game directories containing `eboot.bin` and ZArchive (`.
 whose archive root contains `eboot.bin`. Select a detected game and run it from the game list.
 ZArchive dumps are mounted read-only and streamed directly; they do not need to be extracted first.
 
-### DualSense audio over Bluetooth
-
-Pair an original DualSense or DualSense Edge with the host and select it as the active controller.
-Pad speaker and vibration audio are sent to that controller over Bluetooth HID; no four-channel
-USB audio device is needed. The emulator matches the controller to its HID endpoint by Bluetooth
-address, so it does not send audio to an arbitrary pad when several are connected. If the HID
-endpoint cannot be opened, pad speaker audio uses the normal host output. The host must grant
-access to the controller's HID device for wireless audio to work.
-
 The emulator can also be started directly with a legally obtained game directory, ELF file, or
 ZArchive dump:
 

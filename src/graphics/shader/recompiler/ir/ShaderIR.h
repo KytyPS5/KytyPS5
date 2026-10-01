@@ -23,6 +23,16 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
+// Research: flags of a SelectU32 that models a V_MOVRELD write to one register of the file.
+// Compilers never place descriptor registers inside a relatively indexed array, so a host-side
+// descriptor evaluation may take the unwritten (false) operand.
+inline constexpr uint64_t MovRelSelectFlags = 0x4d4f5652u; // "MOVR"
+
+// Emulated 64-bit FLAT apertures. Each contains 4 GiB of byte offsets and is
+// outside guest global VA space. Keep queries and FLAT routing consistent.
+inline constexpr uint32_t SharedApertureHigh = 0x70000000u;
+inline constexpr uint32_t PrivateApertureHigh = 0x80000000u;
+
 enum class ResourceKind {
 	None,
 	ScalarBuffer,
@@ -69,6 +79,9 @@ struct MemoryInfo {
 	bool                    offen                                                 = false;
 	bool                    coherent                                              = false;
 	bool                    planning_only                                         = false;
+	// Research: a buffer bound to the end of its mapping because only the shader knows its record
+	// count; accesses also apply the hardware range check with the shader's V# words.
+	bool                    gpu_records                                           = false;
 
 	[[nodiscard]] bool SupportsIndirectBufferLoad(ValueOpcode opcode) const {
 		return !formatted && !typed && data_bits == 32u &&
@@ -108,6 +121,8 @@ struct BufferResource {
 	bool                   atomic             = false;
 	bool                   formatted          = false;
 	bool                   scalar             = false;
+	// Research: the shader computes the record count; the host binds a capped range.
+	bool                   gpu_records        = false;
 
 	bool operator==(const BufferResource& other) const = default;
 };
@@ -137,6 +152,9 @@ struct ImageResource {
 	uint32_t                      indirect_root     = NoIndirectImage;
 	uint32_t                      indirect_mapping_offset   = 0;
 	uint32_t                      indirect_search_iterations = 0;
+	// Sampled through the bindless image arrays (descriptor set 1) at the slot the translation
+	// table gives for the handle's key; the mapping offset locates the heap's region and size.
+	bool                          bindless          = false;
 	std::vector<uint32_t>         indirect_resources;
 
 	bool operator==(const ImageResource& other) const = default;
@@ -148,6 +166,10 @@ struct SamplerResource {
 	bool     force_point_filtering = false;
 	bool     depth_compare         = false;
 	bool     integer_border        = false;
+	// Selected per draw by a GPU-computed key from a guest sampler heap: the shader indexes the
+	// bindless sampler array with the region base and entry count at bindless_mapping_offset.
+	bool     bindless                = false;
+	uint32_t bindless_mapping_offset = 0;
 
 	bool operator==(const SamplerResource& other) const = default;
 };
@@ -188,6 +210,7 @@ enum class StageInputKind {
 	LocalInvocationIndex,
 	GlobalInvocationId,
 	Parameter,
+	DispatchThreadCount,
 };
 
 enum class StageOutputKind {
@@ -417,11 +440,19 @@ struct BindingLayout {
 	uint32_t                       push_data_start_dword = PushData::NoStart;
 	uint32_t                       memory_offset_dword = 0;
 	uint32_t                       memory_offset_count = 0;
+	bool                           has_dispatch_dimensions = false;
 	std::vector<uint32_t>          user_data_registers;
 	std::vector<DescriptorBinding> descriptors;
 
-	[[nodiscard]] uint32_t ShaderDataDwords() const {
+	// Each bound buffer's length in dwords follows the packed memory offsets.
+	[[nodiscard]] uint32_t BufferLengthDword() const {
 		return memory_offset_dword + (memory_offset_count + 3u) / 4u;
+	}
+	[[nodiscard]] uint32_t DispatchDimensionsDword() const {
+		return BufferLengthDword() + memory_offset_count;
+	}
+	[[nodiscard]] uint32_t ShaderDataDwords() const {
+		return DispatchDimensionsDword() + (has_dispatch_dimensions ? 3u : 0u);
 	}
 	[[nodiscard]] bool UsesPushData() const {
 		return push_data_start_dword != PushData::NoStart;
@@ -452,6 +483,8 @@ struct ShaderInfo {
 	int32_t                          instance_offset_sgpr = -1;
 	bool                             has_bitwise_xor    = false;
 	bool                             uses_dma           = false;
+	// Research: loop watchdogs report their trips into the bindless feedback buffer (set 1).
+	bool                             watchdog_reports   = false;
 
 	bool operator==(const ShaderInfo& other) const = default;
 };
@@ -472,15 +505,30 @@ struct DescriptorSource {
 		uint32_t selector_stride = 0;
 		uint32_t selector_offset = 0;
 		uint32_t table_offset    = 0;
+		// The key is (material word >> key_shift) & key_mask; identity unless the shader packs
+		// two keys into one word.
+		uint32_t key_shift = 0;
+		uint32_t key_mask  = UINT32_MAX;
+		// No enumeration: the shader looks the key up in the bindless translation table.
+		bool     bindless  = false;
 		Value    key_count;
 		Value    selector_mask;
 
 		bool operator==(const IndirectImage& other) const = default;
 	};
 
-	std::array<Value, 8>         dwords {};
-	uint32_t                     dword_count = 0;
-	std::optional<IndirectImage> indirect_image;
+	// A sampler read from a sampler heap at a GPU-computed key: dwords 0-2 are the heap's V#
+	// (dword 3 is left 0), the S# records start table_offset bytes into it.
+	struct BindlessSampler {
+		uint32_t table_offset = 0;
+
+		bool operator==(const BindlessSampler& other) const = default;
+	};
+
+	std::array<Value, 8>           dwords {};
+	uint32_t                       dword_count = 0;
+	std::optional<IndirectImage>   indirect_image;
+	std::optional<BindlessSampler> bindless_sampler;
 
 	bool operator==(const DescriptorSource& other) const = default;
 };
@@ -490,6 +538,20 @@ struct SrtRead {
 	uint32_t flat_offset = 0;
 
 	bool operator==(const SrtRead& other) const = default;
+};
+
+// A store or atomic on a written buffer whose address operands the host can bound: immediates,
+// values it evaluates, compute invocation IDs, and a few integer operations on them.
+struct BufferWrite {
+	uint32_t buffer    = 0;
+	uint32_t immediate = 0;
+	Value    index;
+	Value    offset;
+	Value    soffset;
+	// The store's lane predicate: a select on it takes the stored lanes' operand.
+	Value    predicate;
+
+	bool operator==(const BufferWrite& other) const = default;
 };
 
 struct ResourceBlock {
@@ -547,9 +609,19 @@ struct ResourcePlan {
 	std::vector<DescriptorSource>       descriptor_sources;
 	std::vector<ResourceBlock>          control_flow;
 	std::vector<SrtRead>                srt_reads;
+	// Per buffer of info.buffers: every store to it is in buffer_writes (bounded write extent).
+	std::vector<uint8_t>                buffer_writes_bounded;
+	std::vector<BufferWrite>            buffer_writes;
 	std::vector<uint8_t>                clean_flat_slots;
 	bool                                requires_specialization_memory = false;
 	bool                                capture_specialization_reads = false;
+	// A descriptor phi was lowered to a host selection in a shader that writes memory: the
+	// reads that evaluate it are captured and must not overlap a buffer the shader writes.
+	bool                                descriptor_phi_under_writes = false;
+	bool                                has_uniform_buffer_reads = false;
+	// The device supports bindless images: an indirect image the enumeration cannot cover
+	// becomes a bindless one instead of failing tracking.
+	bool                                bindless_images = false;
 	bool                                srt_plan_complete          = false;
 	bool                                resource_tracking_complete = false;
 	ShaderInfo                          info;

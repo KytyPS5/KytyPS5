@@ -1223,6 +1223,55 @@ int KYTY_SYSV_ABI KernelFtruncate(int d, int64_t length) {
 	return OK;
 }
 
+int KYTY_SYSV_ABI KernelFsync(int d) {
+	PRINT_NAME();
+
+	if (d < 0) {
+		return KERNEL_ERROR_EBADF;
+	}
+
+	// stdin, stdout and stderr: KernelWrite flushes stdout and stderr on every write
+	if (d < DESCRIPTOR_MIN) {
+		return OK;
+	}
+
+	// FreeBSD fails fsync with EINVAL on a descriptor that has no vnode
+	if (::Libs::Network::Net::IsSocket(d)) {
+		return KERNEL_ERROR_EINVAL;
+	}
+
+	auto* file = g_files->GetFile(d);
+
+	if (file == nullptr || !file->opened) {
+		return KERNEL_ERROR_EBADF;
+	}
+
+	// Directories, devices and read-only descriptors succeed without a host flush, as on FreeBSD.
+	// Windows refuses FlushFileBuffers on a read-only handle.
+	if (file->directory || file->special != SpecialFile::None || !file->writable) {
+		LOGF("\tFsync (nothing to flush): %s\n", Common::PathToString(file->real_name).c_str());
+		return OK;
+	}
+
+	file->mutex.Lock();
+
+	bool is_invalid = file->f.IsInvalid();
+	bool flushed    = !is_invalid && file->f.Flush();
+
+	file->mutex.Unlock();
+
+	if (is_invalid) {
+		LOGF("\tfile is invalid\n");
+		return KERNEL_ERROR_EIO;
+	}
+
+	// The written data already reached the host, so a failed flush only loses durability
+	LOGF_COLOR(flushed ? Log::Color::Green : Log::Color::Red, "\tFsync: %s, %s\n",
+	           Common::PathToString(file->real_name).c_str(), flushed ? "[ok]" : "[flush failed]");
+
+	return OK;
+}
+
 int KYTY_SYSV_ABI KernelUnlink(const char* path) {
 	PRINT_NAME();
 

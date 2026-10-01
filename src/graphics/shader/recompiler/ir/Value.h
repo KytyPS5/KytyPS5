@@ -165,4 +165,52 @@ private:
 	mutable uint32_t    evaluation_index = UINT32_MAX;
 };
 
+// Operand accessors, inline.
+inline bool Value::IsEmpty() const {
+	return type == Type::Void;
+}
+
+inline bool Value::IsImmediate() const {
+	return type != Type::Opaque;
+}
+
+inline bool Value::IsIdentity() const {
+	return type == Type::Opaque && inst->GetOpcode() == ValueOpcode::Identity;
+}
+
+inline bool Value::IsPhi() const {
+	return type == Type::Opaque && inst->GetOpcode() == ValueOpcode::Phi;
+}
+
+inline Inst* Value::TryInstruction() const {
+	return type == Type::Opaque ? inst : nullptr;
+}
+
+inline Inst* Value::ResolveInstruction() const {
+	EXIT_IF(type != Type::Opaque);
+	return IsIdentity() ? inst->Arg(0).ResolveInstruction() : inst;
+}
+
+inline Value Value::Resolve() const {
+	return IsIdentity() ? inst->Arg(0).Resolve() : *this;
+}
+
+inline uint32_t Value::U32() const {
+	EXIT_IF(type != Type::U32);
+	return imm_u32;
+}
+
+inline size_t Inst::NumArgs() const {
+	return args.size();
+}
+
+inline Value Inst::Arg(size_t index) const {
+	EXIT_IF(index >= args.size());
+	return args[index];
+}
+
+inline ValueOpcode Inst::GetOpcode() const {
+	return opcode;
+}
+
 } // namespace Libs::Graphics::ShaderRecompiler::IR

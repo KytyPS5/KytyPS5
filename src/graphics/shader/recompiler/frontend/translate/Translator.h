@@ -88,9 +88,12 @@ private:
 	void          BUFFER_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode opcode);
 	void          IMAGE_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode opcode);
 	void DS_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool returns_value);
+	void DS_ADD_U64(const Decoder::Instruction& inst);
 	void FLAT_LOAD(const Decoder::Instruction& inst);
+	void FLAT_APERTURE(const Decoder::Instruction& inst, bool store);
 	void FLAT_STORE(const Decoder::Instruction& inst);
 	void IMAGE_GET_RESINFO(const Decoder::Instruction& inst);
+	void IMAGE_BVH_INTERSECT_RAY(const Decoder::Instruction& inst);
 	void IMAGE_GET_LOD(const Decoder::Instruction& inst);
 	void IMAGE_LOAD(const Decoder::Instruction& inst);
 	void IMAGE_STORE(const Decoder::Instruction& inst);
@@ -122,11 +125,17 @@ private:
 	void EmitCompareConstant(const Decoder::Instruction& inst, bool value, bool scalar, bool cmpx);
 	void EmitIntegerCompare(const Decoder::Instruction& inst, IR::ValueOpcode opcode, IR::Type type,
 	                        bool scalar, bool cmpx);
+	// A 64-bit compare the IR has no opcode for, as another one with swapped operands and/or a
+	// negated result (a >= b is !(a < b); a <= b is !(b < a) or !(a > b)).
+	void EmitInteger64CompareVia(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
+	                             bool swap, bool negate, bool cmpx);
 	void EmitInteger16Compare(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
 	                          bool signed_value, bool cmpx);
 	void EmitFloatCompare(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool half,
 	                      bool cmpx);
 	void EmitFloatOrderedCompare(const Decoder::Instruction& inst, bool ordered, bool cmpx);
+	void EmitFloat64Compare(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool cmpx);
+	void EmitFloat64Equal(const Decoder::Instruction& inst);
 	void EmitFloatClassCompare(const Decoder::Instruction& inst, bool cmpx);
 	void V_CVT_F32_UBYTE(const Decoder::Instruction& inst, uint32_t byte_index);
 	void V_CVT_F32_U32(const Decoder::Instruction& inst);
@@ -265,5 +274,45 @@ private:
 	uint32_t        current_vector_limit = 1;
 	bool            flush_f32_inputs;
 };
+
+inline bool& TranslationNonFatalFlag() {
+	static thread_local bool value = false;
+	return value;
+}
+
+inline bool& TranslationUnsupportedFlag() {
+	static thread_local bool value = false;
+	return value;
+}
+
+class TranslationNonFatalScope {
+public:
+	explicit TranslationNonFatalScope(bool enabled)
+	    : m_previous(TranslationNonFatalFlag()) {
+		TranslationNonFatalFlag()    = enabled;
+		TranslationUnsupportedFlag() = false;
+	}
+	~TranslationNonFatalScope() {
+		TranslationNonFatalFlag() = m_previous;
+	}
+	TranslationNonFatalScope(const TranslationNonFatalScope&)            = delete;
+	TranslationNonFatalScope& operator=(const TranslationNonFatalScope&) = delete;
+
+private:
+	bool m_previous;
+};
+
+inline void SetTranslationNonFatal(bool enabled) {
+	TranslationNonFatalFlag()    = enabled;
+	TranslationUnsupportedFlag() = false;
+}
+
+inline bool TranslationUnsupported() {
+	return TranslationUnsupportedFlag();
+}
+
+inline bool TranslationNonFatal() {
+	return TranslationNonFatalFlag();
+}
 
 } // namespace Libs::Graphics::ShaderRecompiler::Frontend

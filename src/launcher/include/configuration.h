@@ -95,6 +95,8 @@ public:
 	bool                   fullscreen_enabled          = false;
 	bool                   readback_linear_images      = false;
 	bool                   tessellation_enabled        = false;
+	bool                   bindless_images_enabled     = false;
+	QString                skip_shader_hashes;
 	int                    vblank_frequency            = 60;
 	int                    console_language            = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled   = false;
@@ -127,6 +129,8 @@ public:
 		fullscreen_enabled          = other.fullscreen_enabled;
 		readback_linear_images      = other.readback_linear_images;
 		tessellation_enabled        = other.tessellation_enabled;
+		bindless_images_enabled     = other.bindless_images_enabled;
+		skip_shader_hashes          = other.skip_shader_hashes;
 		vblank_frequency            = other.vblank_frequency;
 		console_language            = other.console_language;
 		vulkan_validation_enabled   = other.vulkan_validation_enabled;
@@ -174,6 +178,8 @@ public:
 		KYTY_CFG_SET(fullscreen_enabled);
 		KYTY_CFG_SET(readback_linear_images);
 		KYTY_CFG_SET(tessellation_enabled);
+		KYTY_CFG_SET(bindless_images_enabled);
+		KYTY_CFG_SET(skip_shader_hashes);
 		KYTY_CFG_SET(vblank_frequency);
 		KYTY_CFG_SET(console_language);
 		KYTY_CFG_SET(vulkan_validation_enabled);
@@ -218,6 +224,8 @@ public:
 		KYTY_CFG_GET(fullscreen_enabled);
 		KYTY_CFG_GET(readback_linear_images);
 		KYTY_CFG_GET(tessellation_enabled);
+		KYTY_CFG_GET(bindless_images_enabled);
+		KYTY_CFG_GET(skip_shader_hashes);
 		vblank_frequency = s->value("vblank_frequency", vblank_frequency).toInt();
 		console_language = s->value("console_language", console_language).toInt();
 		if (console_language < 0 || console_language > MAX_CONSOLE_LANGUAGE) {

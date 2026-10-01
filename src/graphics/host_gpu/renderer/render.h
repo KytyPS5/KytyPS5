@@ -4,12 +4,15 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "graphics/host_gpu/renderer/indirectDispatch.h"
+#include "graphics/host_gpu/renderer/pipeline/bindlessTable.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
+#include <memory>
 #include <optional>
 #include <span>
 #include <vector>
@@ -63,6 +66,9 @@ struct DrawIndexArgs {
 	uint32_t         first_instance             = 0;
 	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
 	uint32_t         render_target_slice_offset = 0;
+	// Research: the guest address of GPU-read indirect arguments (0: the counts above apply).
+	// index_addr is then the index buffer base and index_count its size in indices.
+	uint64_t         gpu_args                   = 0;
 };
 
 struct DrawAutoArgs {
@@ -72,6 +78,7 @@ struct DrawAutoArgs {
 	uint32_t         first_instance             = 0;
 	DrawOffsetSource offset_source              = DrawOffsetSource::DrawState;
 	uint32_t         render_target_slice_offset = 0;
+	uint64_t         gpu_args                   = 0; // as DrawIndexArgs::gpu_args
 };
 
 struct SubmitInfo {
@@ -161,6 +168,11 @@ public:
 	                      uint32_t mode);
 
 	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
+	// Bindless heaps: register the draw's heaps, patch their regions, and once per frame resolve
+	// the keys shaders flagged as pending.
+	void PrepareBindlessHeaps(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
+	void ResolveBindlessRequests();
+	bool ResolveBindlessKey(BindlessTable::Heap& heap, uint32_t key);
 	void                           FindBuffers(PreparedBindings& bindings);
 	void                           RebindBuffers(PreparedBindings& bindings);
 	void                           RebindImages(PreparedBindings& bindings);
@@ -194,6 +206,11 @@ private:
 	                         DrawRenderState& state, vk::PrimitiveTopology topology,
 	                         const DrawEmitInfo& emit, const DrawIndexBufferSource& index_source,
 	                         bool primitive_restart_enable);
+	void ExecutePreparedDrawResolved(uint64_t submit_id, CommandBuffer& buffer,
+	                                 const DrawCallInfo& draw, DrawRenderState& state,
+	                                 vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
+	                                 const DrawIndexBufferSource& index_source,
+	                                 bool primitive_restart_enable);
 	[[nodiscard]] RenderState AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
 	                                               uint32_t color_count, RenderDepthInfo& depth,
 	                                               vk::ImageAspectFlags& feedback_aspects,
@@ -213,10 +230,17 @@ private:
 	GraphicsBindings                     m_graphics_bindings;
 	PreparedBindings                     m_compute_bindings;
 	std::vector<ImageId>                  m_bound_images;
+
+	void PrepareBindlessSamplers(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
+	uint64_t                              m_bindless_frame = UINT64_MAX;
+	std::vector<uint32_t>                 m_bindless_requests;
+	std::vector<uint32_t>                 m_bindless_srt;
 	std::vector<vk::DescriptorBufferInfo> m_descriptor_buffers;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
 	std::vector<uint32_t>                 m_image_occurrences;
+	// Created at the first thread-dimension indirect dispatch.
+	std::unique_ptr<IndirectDispatchGroups> m_indirect_groups;
 
 	friend class CommandProcessor;
 	friend struct RenderExecutorTestAccess;

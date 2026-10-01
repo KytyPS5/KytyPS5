@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
+#include "graphics/shader/recompiler/frontend/decode/ShaderFunctions.h"
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
@@ -180,6 +181,13 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 			return SimpleInteger(inst, IR::ValueOpcode::ShiftRightLogical64, IR::Type::U64, false,
 			                     false, true);
 		case O::S_ASHR_I64: return S_ASHR_I64(inst);
+		case O::S_BREV_B64: {
+			// Each half reversed, and the halves swapped. SCC is unchanged, as for S_BREV_B32.
+			const auto value = ReadU32Pair(inst.src0);
+			WriteU32Pair(inst.dst, {IR::U32(ir.Emit(IR::ValueOpcode::BitReverse32, {value[1]})),
+			                        IR::U32(ir.Emit(IR::ValueOpcode::BitReverse32, {value[0]}))});
+			return;
+		}
 
 		case O::S_ANDN2_B32:
 			return ComposedIntegerBinary(inst, IR::ValueOpcode::BitwiseAnd32, true, false, true);
@@ -216,8 +224,16 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 
 		case O::S_NOP:
 		case O::S_SLEEP:
-		case O::S_SETPRIO:
-		case O::S_TRAP: EmitControlNop(); return;
+		case O::S_SETPRIO: EmitControlNop(); return;
+		case O::S_TRAP:
+			// Retail GPUs run with traps disabled, so a guest assert falls through. Only a
+			// shader-call target outside the expanded set reports a trap.
+			if (inst.src0.value == Decoder::ShaderCallMissTrapCode) {
+				ir.Emit(IR::ValueOpcode::ShaderTrap, {IR::Value(inst.pc), IR::Value(inst.src0.value)});
+			} else {
+				EmitControlNop();
+			}
+			return;
 		case O::S_WAITCNT_DEPCTR: EmitWaitcnt(); return;
 		case O::S_BARRIER: S_BARRIER(); return;
 		case O::S_SENDMSG: S_SENDMSG(inst); return;
@@ -231,6 +247,9 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 		case O::S_CBRANCH_EXECZ:
 		case O::S_CBRANCH_EXECNZ:
 		case O::S_CBRANCH_CDBGSYS:
+		case O::S_CBRANCH_CDBGUSER:
+		case O::S_CBRANCH_CDBGSYS_OR_USER:
+		case O::S_CBRANCH_CDBGSYS_AND_USER:
 		case O::S_ENDPGM: return;
 		default: return FailMissingTranslation(inst);
 	}

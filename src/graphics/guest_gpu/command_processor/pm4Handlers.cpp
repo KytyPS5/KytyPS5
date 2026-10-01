@@ -1476,7 +1476,7 @@ KYTY_CP_OP_PARSER(CpOpBranch) {
 	EXIT_NOT_IMPLEMENTED(function > 6);
 	EXIT_NOT_IMPLEMENTED(then_buffer == nullptr || then_num_dw == 0);
 
-	const bool take_then = TestWaitRegMemValue(*compare_addr, reference, mask, function);
+	const bool take_then = TestWaitRegMemValue(cp.ReadLabel(compare_addr), reference, mask, function);
 	LOGF("\t branch: take=%u then=0x%016" PRIx64 "/%" PRIu32 " else=0x%016" PRIx64 "/%" PRIu32 "\n",
 	     take_then ? 1u : 0u, reinterpret_cast<uint64_t>(then_buffer), then_num_dw,
 	     reinterpret_cast<uint64_t>(else_buffer), else_num_dw);
@@ -1661,13 +1661,16 @@ KYTY_CP_OP_PARSER(CpOpDrawIndirectMulti) {
 	const auto stride_in_bytes = buffer[7];
 	const auto draw_initiator  = buffer[8];
 	const bool indexed         = (cmd_id == 0xc0083800);
+	const auto draw_index_register =
+	    (buffer[3] & 0x80000000u) != 0 ? buffer[3] & 0xffffu : Pm4::SH_NOP;
+	EXIT_NOT_IMPLEMENTED((buffer[3] & (1u << 27u)) != 0); // User-VGPR destinations.
 
 	if (count_indirect == 0) {
 		count_addr = nullptr;
 	}
 
 	cp.DrawIndirectMulti(data_offset, max_count_or_count, count_addr, stride_in_bytes,
-	                     draw_initiator, indexed);
+	                     draw_initiator, indexed, draw_index_register);
 
 	return 9;
 }

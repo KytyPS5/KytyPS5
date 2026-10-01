@@ -3,6 +3,7 @@
 
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
+#include <array>
 #include <span>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -17,6 +18,14 @@ struct SrtRuntime {
 	SrtMemoryReader           read_memory                = nullptr;
 	void*                     userdata                   = nullptr;
 	SrtMemoryReader           read_specialization_memory = nullptr;
+	// Accept image atomics on k32Float descriptors: upstream's float atomics, and integer atomics
+	// run as uint atomics on the raw bits. On by default, as in the emulator; the emulator passes
+	// --no-float-image-atomics through here.
+	bool                      float_image_atomics        = true;
+	// Compute: the dispatch's workgroup count (zero when the host does not know it, as for an
+	// indirect dispatch) and workgroup size bound the invocation IDs in buffer write extents.
+	std::array<uint32_t, 3>   workgroup_count            = {};
+	std::array<uint32_t, 3>   workgroup_size             = {};
 };
 
 enum class RuntimeValueType { Any, Integer };
@@ -50,6 +59,7 @@ private:
 	bool EvaluatePhi(const Inst& inst, uint64_t& result);
 	bool EvaluateExtract(const Inst& inst, uint64_t& result);
 	bool EvaluateRawRead(const Inst& inst, uint64_t& result);
+	bool EvaluateBufferRead(const Inst& inst, uint64_t& result);
 	bool EvaluateInst(const Inst& inst, uint64_t& result);
 
 	const ResourcePlan&              m_program;
@@ -57,7 +67,13 @@ private:
 	std::span<const uint8_t>         m_clean_flat_slots;
 	SrtWalker*                      m_clean_evaluator = nullptr;
 	Value                           m_active_mask;
+	const Inst*                     m_failed_value = nullptr;
 	ResourcePlan::EvaluationContext& m_context;
+	// The last raw read that failed, for RefreshFlatBuffer's report.
+	const char* m_read_failure         = nullptr;
+	uint64_t    m_read_failure_address = 0;
+	uint64_t    m_read_failure_offset  = 0;
+	uint64_t    m_read_failure_size    = 0;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

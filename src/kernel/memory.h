@@ -115,8 +115,18 @@ int MapAutomaticMemory(uint64_t vaddr, size_t size, int type, int prot);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size);
+[[nodiscard]] const uint8_t* FindGpuCleanBacking(uint64_t vaddr, uint64_t size);
+// Any thread, for a read that faulted at fault_vaddr on a page protected because the GPU wrote to
+// it: reads [vaddr, vaddr + size) from the backing store when none of those bytes is GPU-written.
+bool TryReadCleanFaultingBytes(uint64_t fault_vaddr, uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
+// Like ClampRangeSize, but 0 for a range that starts outside committed memory instead of EXIT.
+[[nodiscard]] uint64_t TryClampRangeSize(uint64_t vaddr, uint64_t size);
+// Whether every byte of the range is committed guest memory, by the kernel's own table of guest
+// mappings (what sceKernelVirtualQuery reports), without asking the host. An empty range is, and
+// so is every range before the kernel's memory is set up (unit tests).
+[[nodiscard]] bool     IsCommittedRange(uint64_t vaddr, uint64_t size);
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;

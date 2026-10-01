@@ -265,6 +265,8 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->checkBox_fullscreen->setChecked(info.fullscreen_enabled);
 	m_ui->checkBox_readback->setChecked(info.readback_linear_images);
 	m_ui->checkBox_tessellation->setChecked(info.tessellation_enabled);
+	m_ui->checkBox_bindless->setChecked(info.bindless_images_enabled);
+	m_ui->lineEdit_skip_shaders->setText(info.skip_shader_hashes);
 	m_ui->spinBox_vblank_frequency->setValue(info.vblank_frequency);
 	m_ui->comboBox_console_language->clear();
 	m_ui->comboBox_console_language->addItems(CONSOLE_LANGUAGE_NAMES);
@@ -412,6 +414,8 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui) {
 	info.fullscreen_enabled        = ui.checkBox_fullscreen->isChecked();
 	info.readback_linear_images    = ui.checkBox_readback->isChecked();
 	info.tessellation_enabled      = ui.checkBox_tessellation->isChecked();
+	info.bindless_images_enabled   = ui.checkBox_bindless->isChecked();
+	info.skip_shader_hashes        = ui.lineEdit_skip_shaders->text().simplified().remove(' ');
 	info.vblank_frequency          = ui.spinBox_vblank_frequency->value();
 	info.console_language          = ui.comboBox_console_language->currentIndex();
 	info.vulkan_validation_enabled = ui.checkBox_vulkan_validation->isChecked();

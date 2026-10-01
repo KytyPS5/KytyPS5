@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
+#include "graphics/shader/recompiler/ir/BindlessBindings.h"
 
 #include "common/assert.h"
 
@@ -6,7 +7,9 @@
 #include <bit>
 #include <functional>
 #include <optional>
+#include <set>
 #include <type_traits>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
@@ -332,19 +335,583 @@ void PatchStructuredPhis(ValueEmitContext& ctx, StructuredFunctionState& structu
 	}
 }
 
+// Research: a loop watchdog for shaders that read memory through device addresses. A page such
+// a shader touches first reads as zero until the fault buffer maps it for the next dispatch;
+// a list walk fed zeros never ends and the device is lost before that dispatch. Each loop
+// whose continue block branches straight back to its header counts its iterations and leaves
+// through its merge block after LoopWatchdogLimit of them.
+constexpr uint32_t LoopWatchdogLimit = 4096;
+
+struct LoopWatchdog {
+	const IR::Block* header     = nullptr;
+	const IR::Block* cont       = nullptr;
+	const IR::Block* merge      = nullptr;
+	uint32_t         counter    = 0; // phi in the header
+	uint32_t         next       = 0; // counter + 1, defined in the continue block
+	Spirv::DeferredPhi phi {};
+	bool               has_phi  = false;
+	size_t             operands = 0;
+	// The latch branched straight back: its new exit adds a predecessor to the merge block,
+	// whose phis take an undefined value from it (the loop was cut short).
+	bool                                   exit_edge = false;
+	std::unordered_map<uint32_t, uint32_t> undefs; // phi type -> OpUndef in the latch
+};
+
+struct WatchdogExtraIncoming {
+	Spirv::DeferredPhi phi {};
+	uint32_t           type  = 0;
+	size_t             slot  = 0;
+	const IR::Block*   latch = nullptr;
+};
+
+// Research: a tripped watchdog appends a report (layout in BindlessBindings.h) from its merge
+// block, which the header dominates: the shader, the loop, where it ran, user data s0-s7 and
+// the header's phi values (the state of the last iteration) for each lane half.
+void EmitWatchdogReport(ValueEmitContext& ctx, const LoopWatchdog& watchdog, uint32_t loop_index) {
+	auto& state = ctx.state;
+	if (state.bindless_feedback_variable == 0) {
+		return;
+	}
+	const auto store = [&](uint32_t index, uint32_t value) {
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
+		                          pointer, state.bindless_feedback_variable, ConstantU32(state, 0),
+		                          index);
+		state.builder.AddFunction(spv::OpStore, pointer, value);
+	};
+	const auto tripped = Binary(state, spv::OpUGreaterThanEqual, TypeBool(state),
+	                            watchdog.counter, ConstantU32(state, LoopWatchdogLimit - 1u));
+	EmitIfCondition(state, tripped, [&] {
+		const auto counter = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
+		                          counter, state.bindless_feedback_variable, ConstantU32(state, 0),
+		                          ConstantU32(state, IR::WatchdogReportBase));
+		const auto slot = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAtomicIAdd, TypeU32(state), slot, counter,
+		                          ConstantU32(state, spv::ScopeDevice), ConstantU32(state, 0),
+		                          ConstantU32(state, 1));
+		const auto has_room = Binary(state, spv::OpULessThan, TypeBool(state), slot,
+		                             ConstantU32(state, IR::WatchdogReportSlots));
+		EmitIfCondition(state, has_room, [&] {
+			const auto base =
+			    EmitAddU32(state,
+			               EmitBinaryU32(state, spv::OpIMul, slot,
+			                             ConstantU32(state, IR::WatchdogReportWords)),
+			               ConstantU32(state, IR::WatchdogReportBase + IR::WatchdogReportWords));
+			const auto word = [&](uint32_t offset) {
+				return EmitAddU32(state, base, ConstantU32(state, offset));
+			};
+			const auto hash = state.program.shader_hash;
+			store(word(0), ConstantU32(state, 0x57440000u | (loop_index & 0xffffu)));
+			store(word(1), ConstantU32(state, static_cast<uint32_t>(hash)));
+			store(word(2), ConstantU32(state, static_cast<uint32_t>(hash >> 32u)));
+			store(word(3), watchdog.counter);
+			store(word(4), EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 0));
+			store(word(5), EmitSubgroupLocalInvocationId(state));
+			for (uint32_t reg = 0; reg < 8; reg++) {
+				store(word(6 + reg), EmitGetUserData(state, static_cast<IR::ScalarReg>(reg)));
+			}
+			for (uint32_t half = 0; half < state.lane_count; half++) {
+				auto&    lane  = half == 0 ? ctx : *ctx.other_half;
+				uint32_t index = 0;
+				for (const auto& inst: *watchdog.header) {
+					if (inst.GetOpcode() != IR::ValueOpcode::Phi || index >= IR::WatchdogReportPhis) {
+						break;
+					}
+					const auto value = lane.Def(IR::Value(const_cast<IR::Inst*>(&inst)));
+					uint32_t   bits  = 0;
+					switch (inst.GetType()) {
+						case IR::Type::U8:
+						case IR::Type::U16:
+						case IR::Type::U32:
+						case IR::Type::F16: bits = value; break;
+						case IR::Type::F32:
+							bits = state.builder.AllocateId();
+							state.builder.AddFunction(spv::OpBitcast, TypeU32(state), bits, value);
+							break;
+						case IR::Type::U1:
+							bits = state.builder.AllocateId();
+							state.builder.AddFunction(spv::OpSelect, TypeU32(state), bits, value,
+							                          ConstantU32(state, 1), ConstantU32(state, 0));
+							break;
+						case IR::Type::U64:
+							bits = state.builder.AllocateId();
+							state.builder.AddFunction(spv::OpUConvert, TypeU32(state), bits, value);
+							break;
+						default: bits = ConstantU32(state, 0xdeadbeefu); break;
+					}
+					store(word(16 + half * IR::WatchdogReportPhis + index), bits);
+					index++;
+				}
+			}
+		});
+	});
+}
+
 void EmitStructuredFunction(ValueEmitContext& ctx) {
 	const auto& program = ctx.state.program;
 	StructuredFunctionState structured;
+	std::vector<LoopWatchdog>          watchdogs;
+	std::vector<WatchdogExtraIncoming> extra_incomings;
+	if (program.info.uses_dma) {
+		for (size_t index = 0; index < program.blocks.size(); index++) {
+			const auto& term = program.block_info[index].terminator;
+			if (!term.loop_header) {
+				continue;
+			}
+			const auto* header = program.blocks[index];
+			const auto* cont   = TargetBlock(program, term.continue_block);
+			const auto* merge  = TargetBlock(program, term.merge_block);
+			if (cont == nullptr || merge == nullptr || cont == header) {
+				continue;
+			}
+			const auto cont_it = std::ranges::find(program.blocks, cont);
+			if (cont_it == program.blocks.end()) {
+				continue;
+			}
+			const auto& cont_term =
+			    program.block_info[static_cast<size_t>(cont_it - program.blocks.begin())].terminator;
+			const auto  targets_header = [&](uint32_t id) { return TargetBlock(program, id) == header; };
+			const bool  back_edge =
+			    (cont_term.kind == CFG::TerminatorKind::Branch && targets_header(cont_term.true_block)) ||
+			    (cont_term.kind == CFG::TerminatorKind::ConditionalBranch &&
+			     (targets_header(cont_term.true_block) || targets_header(cont_term.false_block)));
+			if (!back_edge || cont_term.loop_header) {
+				continue;
+			}
+			LoopWatchdog watchdog;
+			watchdog.header    = header;
+			watchdog.cont      = cont;
+			watchdog.merge     = merge;
+			watchdog.exit_edge = cont_term.kind == CFG::TerminatorKind::Branch;
+			watchdog.counter = ctx.state.builder.AllocateId();
+			watchdog.next    = ctx.state.builder.AllocateId();
+			watchdogs.push_back(watchdog);
+		}
+	}
 	ctx.state.builder.AddFunction(spv::OpBranch, ctx.Label(program.blocks.front()));
 	for (size_t index = 0; index < program.blocks.size(); index++) {
 		const auto* block = program.blocks[index];
+		const LoopWatchdog* cut_merge = nullptr;
+		for (const auto& watchdog: watchdogs) {
+			if (watchdog.exit_edge && watchdog.merge == block) {
+				cut_merge = &watchdog;
+			}
+		}
 		EmitBlock(ctx, block, [&](ValueEmitContext& lane, const IR::Inst& inst) {
+			if (cut_merge != nullptr && inst.GetOpcode() == IR::ValueOpcode::Phi) {
+				const auto type = TypeId(lane.state, inst.GetType());
+				if (type == 0 || inst.NumArgs() == 0) {
+					lane.Fail(inst, "has no native SPIR-V representation");
+				}
+				const auto phi =
+				    lane.state.builder.AddDeferredPhi(type, lane.Result(inst), inst.NumArgs() + 1u);
+				structured.deferred_phis.push_back({phi, &inst, lane.half});
+				extra_incomings.push_back({phi, type, inst.NumArgs(), cut_merge->cont});
+				return;
+			}
 			EmitStructuredInstruction(lane, structured, inst);
 		});
+		for (auto& watchdog: watchdogs) {
+			if (watchdog.header == block) {
+				// The header is a dedicated empty block: its phis come right after the label.
+				std::vector<const IR::Block*> preds;
+				for (const auto* pred: block->ImmPredecessors()) {
+					if (std::ranges::find(preds, pred) == preds.end()) {
+						preds.push_back(pred);
+					}
+				}
+				watchdog.operands = preds.size();
+				watchdog.phi      = ctx.state.builder.AddDeferredPhi(TypeU32(ctx.state),
+				                                                     watchdog.counter, preds.size());
+				watchdog.has_phi  = true;
+			}
+		}
+		if (program.info.watchdog_reports && !program.block_info[index].terminator.loop_header) {
+			for (const auto& watchdog: watchdogs) {
+				if (watchdog.merge == block) {
+					const auto header_it = std::ranges::find(program.blocks, watchdog.header);
+					EmitWatchdogReport(
+					    ctx, watchdog, static_cast<uint32_t>(header_it - program.blocks.begin()));
+				}
+			}
+		}
 		structured.block_exit_labels.emplace(block, ctx.state.current_label);
-		EmitStructuredTerminator(ctx, block, program.block_info[index]);
+		LoopWatchdog* latch = nullptr;
+		for (auto& watchdog: watchdogs) {
+			if (watchdog.cont == block) {
+				latch = &watchdog;
+			}
+		}
+		if (latch == nullptr) {
+			EmitStructuredTerminator(ctx, block, program.block_info[index]);
+			continue;
+		}
+		auto&       state = ctx.state;
+		const auto& info  = program.block_info[index];
+		const auto& term  = info.terminator;
+		state.builder.AddFunction(spv::OpIAdd, TypeU32(state), latch->next, latch->counter,
+		                          ConstantU32(state, 1u));
+		const auto under = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpULessThan, TypeBool(state), under, latch->next,
+		                          ConstantU32(state, LoopWatchdogLimit));
+		const auto* header = latch->header;
+		const auto* merge  = latch->merge;
+		if (term.kind == CFG::TerminatorKind::Branch) {
+			// One undefined value per phi type of the merge block, for the new edge.
+			for (const auto& inst: *merge) {
+				if (inst.GetOpcode() != IR::ValueOpcode::Phi) {
+					break;
+				}
+				const auto type = TypeId(state, inst.GetType());
+				if (type != 0 && !latch->undefs.contains(type)) {
+					const auto undef = state.builder.AllocateId();
+					state.builder.AddFunction(spv::OpUndef, type, undef);
+					latch->undefs.emplace(type, undef);
+				}
+			}
+			state.builder.AddFunction(spv::OpBranchConditional, under, ctx.Label(header),
+			                          ctx.Label(merge));
+			continue;
+		}
+		const auto* true_block  = TargetBlock(program, term.true_block);
+		const auto* false_block = TargetBlock(program, term.false_block);
+		const auto  condition   = ctx.Def(info.condition);
+		const auto  guarded     = state.builder.AllocateId();
+		if (true_block == header) {
+			// Stay only while the loop wants to and the budget lasts.
+			state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), guarded, condition,
+			                          under);
+		} else {
+			const auto over = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpLogicalNot, TypeBool(state), over, under);
+			state.builder.AddFunction(spv::OpLogicalOr, TypeBool(state), guarded, condition, over);
+		}
+		const auto* exit_block = true_block == header ? false_block : true_block;
+		if (exit_block != merge) {
+			// The loop leaves elsewhere; keep the original branch (the counter still runs).
+			state.builder.AddFunction(spv::OpBranchConditional, condition, ctx.Label(true_block),
+			                          ctx.Label(false_block));
+			continue;
+		}
+		state.builder.AddFunction(spv::OpBranchConditional, guarded, ctx.Label(true_block),
+		                          ctx.Label(false_block));
+	}
+	for (const auto& watchdog: watchdogs) {
+		if (!watchdog.has_phi) {
+			continue;
+		}
+		size_t operand = 0;
+		std::vector<const IR::Block*> preds;
+		for (const auto* pred: watchdog.header->ImmPredecessors()) {
+			if (std::ranges::find(preds, pred) != preds.end()) {
+				continue;
+			}
+			preds.push_back(pred);
+			const auto found = structured.block_exit_labels.find(pred);
+			if (found == structured.block_exit_labels.end()) {
+				continue;
+			}
+			ctx.state.builder.PatchDeferredPhi(
+			    watchdog.phi, operand++,
+			    pred == watchdog.cont ? watchdog.next : ConstantU32(ctx.state, 0u), found->second);
+		}
+	}
+	for (const auto& extra: extra_incomings) {
+		const LoopWatchdog* owner = nullptr;
+		for (const auto& watchdog: watchdogs) {
+			if (watchdog.cont == extra.latch) {
+				owner = &watchdog;
+			}
+		}
+		const auto label = structured.block_exit_labels.find(extra.latch);
+		if (owner == nullptr || label == structured.block_exit_labels.end() ||
+		    !owner->undefs.contains(extra.type)) {
+			EXIT("loop watchdog: merge-block phi has no latch value\n");
+		}
+		ctx.state.builder.PatchDeferredPhi(extra.phi, extra.slot, owner->undefs.at(extra.type),
+		                                   label->second);
 	}
 	PatchStructuredPhis(ctx, structured);
+}
+
+// A guest barrier where a mesh subgroup that runs in passes is cut (see EmitMeshEntryPoint).
+struct MeshSplit {
+	size_t block    = 0; // index in program.blocks
+	size_t position = 0; // the barrier's position in that block
+};
+
+// The program's barriers as split points, or why the program cannot run in passes. A barrier
+// qualifies at the top level only: no edge bypasses or re-enters its block and no loop or
+// selection spans it, so the code before it is a whole region. The guest must also not end
+// before its last barrier, which would leave a later segment running for a finished wave.
+const char* FindMeshSplits(const IR::Program& program, std::vector<MeshSplit>& splits) {
+	splits.clear();
+	if (program.dispatcher_fallback) {
+		return "the control flow needs the dispatcher";
+	}
+	const auto count = program.blocks.size();
+	std::unordered_map<uint32_t, size_t> index_of;
+	for (size_t i = 0; i < count; i++) {
+		index_of.emplace(program.block_info[i].id, i);
+	}
+	const auto index = [&](uint32_t id) {
+		const auto found = index_of.find(id);
+		return found == index_of.end() ? SIZE_MAX : found->second;
+	};
+	// Successors in program order; a block whose terminator returns (as the structured emitter
+	// treats it) is an exit.
+	std::vector<std::vector<size_t>> successors(count);
+	std::vector<bool>                exits(count, false);
+	for (size_t i = 0; i < count; i++) {
+		const auto& info = program.block_info[i];
+		const auto& term = info.terminator;
+		if (term.kind == CFG::TerminatorKind::Branch && index(term.true_block) != SIZE_MAX) {
+			successors[i] = {index(term.true_block)};
+		} else if (term.kind == CFG::TerminatorKind::ConditionalBranch &&
+		           index(term.true_block) != SIZE_MAX && index(term.false_block) != SIZE_MAX &&
+		           !info.condition.IsEmpty()) {
+			successors[i] = {index(term.true_block), index(term.false_block)};
+		} else if (term.kind == CFG::TerminatorKind::IndirectBranch ||
+		           term.kind == CFG::TerminatorKind::Unsupported) {
+			return "an indirect branch";
+		} else {
+			exits[i] = true;
+		}
+	}
+	const auto top_level = [&](size_t k) {
+		for (size_t i = 0; i < count; i++) {
+			for (const auto j: successors[i]) {
+				if ((i < k && j > k) || (i >= k && j <= k)) {
+					return false;
+				}
+			}
+			const auto& term = program.block_info[i].terminator;
+			if (i < k && ((term.merge_block != UINT32_MAX && index(term.merge_block) > k) ||
+			              (term.loop_header && index(term.continue_block) >= k))) {
+				return false;
+			}
+		}
+		return true;
+	};
+	for (size_t k = 0; k < count; k++) {
+		size_t position = 0;
+		for (const auto& inst: *program.blocks[k]) {
+			if (inst.GetOpcode() == IR::ValueOpcode::Barrier) {
+				if (!top_level(k)) {
+					return "a barrier inside a loop or branch";
+				}
+				splits.push_back({k, position});
+			}
+			position++;
+		}
+	}
+	for (size_t i = 0; !splits.empty() && i < splits.back().block; i++) {
+		if (exits[i]) {
+			return "the program can end before a barrier";
+		}
+	}
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			// Scratch lives in Function variables, which do not outlive a segment.
+			if (IR::AddressOpcodeInfoOf(inst.GetOpcode()).access != IR::AddressAccess::None &&
+			    program.memory_info.at(inst.Flags<IR::MemoryFlags>().index).kind ==
+			        IR::ResourceKind::Scratch) {
+				return "scratch memory";
+			}
+		}
+	}
+	return nullptr;
+}
+
+// Which values cross a split: each is kept in a Private array with one element per lane of each
+// pass, stored at the end of the segment that defines it and loaded by every later segment that
+// uses it.
+struct MeshSegmentPlan {
+	std::vector<MeshSplit>                              splits;
+	std::unordered_map<const IR::Inst*, uint32_t>       spills;
+	std::vector<std::vector<const IR::Inst*>>           stores;
+	std::vector<std::vector<const IR::Inst*>>           loads;
+};
+
+MeshSegmentPlan PlanMeshSegments(EmitterState& state, std::vector<MeshSplit> splits) {
+	const auto&     program = state.program;
+	MeshSegmentPlan plan;
+	plan.splits = std::move(splits);
+	plan.stores.resize(plan.splits.size() + 1);
+	plan.loads.resize(plan.splits.size() + 1);
+	std::unordered_map<const IR::Inst*, uint32_t> segment_of;
+	std::vector<uint32_t>                         terminator_segment(program.blocks.size());
+	uint32_t                                      segment = 0;
+	size_t                                        next    = 0;
+	for (size_t block = 0; block < program.blocks.size(); block++) {
+		size_t position = 0;
+		for (const auto& inst: *program.blocks[block]) {
+			if (next < plan.splits.size() && plan.splits[next].block == block &&
+			    plan.splits[next].position == position) {
+				segment++;
+				next++;
+			}
+			segment_of.emplace(&inst, segment);
+			position++;
+		}
+		terminator_segment[block] = segment;
+	}
+	std::set<std::pair<const IR::Inst*, uint32_t>> visited;
+	std::function<void(IR::Value, uint32_t)>       use = [&](IR::Value value, uint32_t user) {
+        value            = value.Resolve();
+        const auto* inst = value.TryInstruction();
+        if (inst == nullptr || !visited.emplace(inst, user).second) {
+            return;
+        }
+        const auto found = segment_of.find(inst);
+        if (found == segment_of.end() || found->second >= user) {
+            return;
+        }
+        if (TypeId(state, inst->GetType()) == 0) {
+            // A handle the emitter reads through its producer: the producer's operands are
+            // what the user's segment loads.
+            for (size_t index = 0; index < inst->NumArgs(); index++) {
+                use(inst->Arg(index), user);
+            }
+            return;
+        }
+        if (!plan.spills.contains(inst)) {
+            const auto slots  = state.lane_count * state.mesh_passes;
+            const auto array  = state.builder.Type(spv::OpTypeArray, TypeId(state, inst->GetType()),
+                                                   ConstantU32(state, slots));
+            plan.spills.emplace(inst, state.builder.DefineGlobalVariable(
+                                          TypePointer(state, spv::StorageClassPrivate, array),
+                                          spv::StorageClassPrivate));
+            plan.stores[found->second].push_back(inst);
+        }
+        plan.loads[user].push_back(inst);
+	};
+	for (size_t block = 0; block < program.blocks.size(); block++) {
+		for (const auto& inst: *program.blocks[block]) {
+			for (size_t index = 0; index < inst.NumArgs(); index++) {
+				use(inst.Arg(index), segment_of.at(&inst));
+			}
+		}
+		const auto& info = program.block_info[block];
+		if (!info.condition.IsEmpty()) {
+			use(info.condition, terminator_segment[block]);
+		}
+		if (!info.indirect_target.IsEmpty()) {
+			use(info.indirect_target, terminator_segment[block]);
+		}
+	}
+	return plan;
+}
+
+// The element of a crossing value's array for this lane in the current pass.
+uint32_t MeshSpillPointer(ValueEmitContext& lane, uint32_t variable, const IR::Inst& inst) {
+	auto&      state = lane.state;
+	const auto pass  = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), pass, state.mesh_pass_variable);
+	const auto slot = Binary(state, spv::OpIAdd, TypeU32(state),
+	                         Binary(state, spv::OpIMul, TypeU32(state), pass,
+	                                ConstantU32(state, state.lane_count)),
+	                         ConstantU32(state, lane.half));
+	const auto pointer = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain,
+	                          TypePointer(state, spv::StorageClassPrivate,
+	                                      TypeId(state, inst.GetType())),
+	                          pointer, variable, slot);
+	return pointer;
+}
+
+// The guest program as one function per segment between its barriers. Each segment emits its
+// blocks once; the block a barrier cuts continues under a fresh label in the next segment.
+void EmitMeshSegmentFunctions(ValueEmitContext& ctx, const MeshSegmentPlan& plan) {
+	auto&       state   = ctx.state;
+	const auto& program = state.program;
+	size_t      block   = 0;
+	size_t      start   = 0;
+	for (size_t segment = 0; segment <= plan.splits.size(); segment++) {
+		const auto function = state.builder.AllocateId();
+		state.mesh_segment_funcs.push_back(function);
+		state.builder.AddFunction(spv::OpFunction, TypeVoid(state), function,
+		                          spv::FunctionControlMaskNone, TypeFunction(state));
+		EmitLabel(state, state.builder.AllocateId());
+		for (uint32_t half = 0; half < state.lane_count; half++) {
+			auto& lane = half == 0 ? ctx : *ctx.other_half;
+			if (lane.scratch_u32_variable != 0) {
+				lane.scratch_u32_variable = state.builder.AllocateId();
+				state.builder.AddFunction(
+				    spv::OpVariable, TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
+				    lane.scratch_u32_variable, spv::StorageClassFunction);
+			}
+		}
+		if (state.gds_variable != 0) {
+			state.gds_length = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpArrayLength, TypeU32(state), state.gds_length,
+			                          state.gds_variable, 0);
+		}
+		EmitMemoryOffsets(state);
+		for (const auto* inst: plan.loads[segment]) {
+			for (uint32_t half = 0; half < state.lane_count; half++) {
+				auto&      lane  = half == 0 ? ctx : *ctx.other_half;
+				const auto value = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpLoad, TypeId(state, inst->GetType()), value,
+				                          MeshSpillPointer(lane, plan.spills.at(inst), *inst));
+				lane.definitions.insert_or_assign(inst, value);
+			}
+		}
+		StructuredFunctionState structured;
+		if (start == 0) {
+			state.builder.AddFunction(spv::OpBranch, ctx.Label(program.blocks[block]));
+		} else {
+			const auto resume = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpBranch, resume);
+			EmitLabel(state, resume);
+		}
+		const auto* end = segment < plan.splits.size() ? &plan.splits[segment] : nullptr;
+		while (block < program.blocks.size()) {
+			const auto* ir_block = program.blocks[block];
+			state.current_block  = ir_block;
+			if (start == 0) {
+				EmitLabel(state, ctx.Label(ir_block));
+			}
+			const auto stop     = end != nullptr && end->block == block ? end->position : SIZE_MAX;
+			size_t     position = 0;
+			for (const auto& inst: *ir_block) {
+				if (position >= start && position < stop &&
+				    inst.GetOpcode() != IR::ValueOpcode::Barrier) {
+					for (uint32_t half = 0; half < state.lane_count; half++) {
+						state.lane_half = half;
+						if (half == 0 || inst.GetOpcode() != IR::ValueOpcode::MeshAllocate) {
+							EmitStructuredInstruction(half == 0 ? ctx : *ctx.other_half, structured,
+							                          inst);
+						}
+					}
+					state.lane_half = 0;
+				}
+				position++;
+			}
+			if (stop != SIZE_MAX) {
+				start = stop + 1;
+				break;
+			}
+			structured.block_exit_labels.emplace(ir_block, state.current_label);
+			EmitStructuredTerminator(ctx, ir_block, program.block_info[block]);
+			block++;
+			start = 0;
+		}
+		if (end != nullptr) {
+			for (const auto* inst: plan.stores[segment]) {
+				for (uint32_t half = 0; half < state.lane_count; half++) {
+					auto& lane = half == 0 ? ctx : *ctx.other_half;
+					state.builder.AddFunction(spv::OpStore,
+					                          MeshSpillPointer(lane, plan.spills.at(inst), *inst),
+					                          lane.Def(IR::Value(const_cast<IR::Inst*>(inst))));
+				}
+			}
+			state.builder.AddFunction(spv::OpReturn);
+		}
+		PatchStructuredPhis(ctx, structured);
+		state.builder.AddFunction(spv::OpFunctionEnd);
+	}
 }
 
 void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState& dispatcher) {
@@ -364,9 +931,23 @@ void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState
 	const auto next_pc = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpPhi, TypeU32(state), pc, initial_pc, initial_parent, next_pc,
 	                          dispatcher.continue_label);
-	const auto done = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpIEqual, TypeBool(state), done, pc,
+	// Research safety net: a guest loop whose trip count comes from bad data (a blur radius read
+	// from a buffer an unemulated pass left unwritten) hung the GPU until the driver reset it.
+	// Leave the dispatcher after a bounded number of block transitions instead: the invocation's
+	// results are wrong, the device survives.
+	constexpr uint32_t MaxDispatcherTransitions = 4096;
+	const auto         iteration                = state.builder.AllocateId();
+	const auto         next_iteration           = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpPhi, TypeU32(state), iteration, ConstantU32(state, 0u),
+	                          initial_parent, next_iteration, dispatcher.continue_label);
+	const auto finished = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpIEqual, TypeBool(state), finished, pc,
 	                          ConstantU32(ctx.state, UINT32_MAX));
+	const auto exhausted = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpUGreaterThanEqual, TypeBool(state), exhausted, iteration,
+	                          ConstantU32(state, MaxDispatcherTransitions));
+	const auto done = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLogicalOr, TypeBool(state), done, finished, exhausted);
 	state.builder.AddFunction(spv::OpLoopMerge, dispatcher.merge_label, dispatcher.continue_label,
 	                          spv::LoopControlMaskNone);
 	state.builder.AddFunction(spv::OpBranchConditional, done, dispatcher.merge_label,
@@ -399,6 +980,8 @@ void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState
 	state.builder.AddFunction(next_pc_words);
 	state.builder.AddFunction(spv::OpBranch, dispatcher.continue_label);
 	EmitLabel(state, dispatcher.continue_label);
+	state.builder.AddFunction(spv::OpIAdd, TypeU32(state), next_iteration, iteration,
+	                          ConstantU32(state, 1u));
 	state.builder.AddFunction(spv::OpBranch, dispatcher.header_label);
 	EmitLabel(state, dispatcher.merge_label);
 	EmitReturn(ctx);
@@ -692,6 +1275,16 @@ void EmitProgram(EmitterState& state) {
 			break;
 		}
 	}
+	if (state.mesh_passes > 1u) {
+		// TranslateProgram gave up on programs that cannot be cut.
+		std::vector<MeshSplit> splits;
+		if (const auto* reason = FindMeshSplits(program, splits); reason != nullptr) {
+			ctx.Fail(reason);
+		}
+		EmitMeshSegmentFunctions(ctx, PlanMeshSegments(state, std::move(splits)));
+		EmitMeshEntryPoint(state);
+		return;
+	}
 	state.builder.AddFunction(spv::OpFunction, TypeVoid(state),
 	                          state.mesh_guest_func != 0 ? state.mesh_guest_func : state.main_func,
 	                          spv::FunctionControlMaskNone, TypeFunction(state));
@@ -759,3 +1352,12 @@ void EmitProgram(EmitterState& state) {
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter
+
+namespace Libs::Graphics::ShaderRecompiler::Spirv {
+
+const char* MeshPassesUnsupported(const IR::Program& program) {
+	std::vector<Emitter::MeshSplit> splits;
+	return Emitter::FindMeshSplits(program, splits);
+}
+
+} // namespace Libs::Graphics::ShaderRecompiler::Spirv

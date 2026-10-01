@@ -113,11 +113,12 @@ static bool IsMultisampledTexture(Prospero::ImageType type) {
 
 static vk::DescriptorBufferInfo
 NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource& source,
-                    const ShaderRecompiler::IR::BufferResource& resource, uint32_t& buffer_offset) {
+                    const ShaderRecompiler::IR::BufferResource&    resource,
+                    const ShaderRecompiler::IR::BufferWriteExtent* extent, uint32_t& buffer_offset) {
 	buffer_offset = 0;
 
 	const auto& [address, size, id] = source;
-	if (address == 0 || size == 0) {
+	if (address < BufferCache::CACHING_PAGESIZE || size == 0) {
 		return {context.GetBufferCache().GetBuffer(NULL_BUFFER_ID).Handle(), 0, 16};
 	}
 	const auto& graphics  = context.GetGraphics();
@@ -125,8 +126,17 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	if (size > graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange) {
 		EXIT("storage buffer range is unsupported\n");
 	}
-	auto [buffer, offset] = context.GetBufferCache().ObtainBuffer(address, size, resource.written,
-	                                                              resource.formatted, id);
+	const bool bounded_write = resource.written && extent != nullptr && extent->valid;
+	const auto written_begin = bounded_write ? std::min(extent->begin, size) : 0u;
+	const auto written_end   = bounded_write ? std::min(extent->end, size) : size;
+	auto [buffer, offset] =
+	    bounded_write
+	        ? context.GetBufferCache().ObtainBufferWritten(address, size, address + written_begin,
+	                                                       written_end - std::min(written_begin,
+	                                                                              written_end),
+	                                                       id)
+	        : context.GetBufferCache().ObtainBuffer(address, size, resource.written,
+	                                                resource.formatted, id);
 	const auto aligned_offset = Common::AlignDown(offset, alignment);
 	const auto adjustment     = offset - aligned_offset;
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
@@ -135,8 +145,9 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	}
 	buffer_offset = static_cast<uint32_t>(adjustment);
 	const vk::DescriptorBufferInfo result {buffer->Handle(), aligned_offset, size + adjustment};
-	if (resource.written) {
-		context.GetTextureCache().InvalidateMemoryFromGPU(address, size);
+	if (resource.written && written_end > written_begin) {
+		context.GetTextureCache().InvalidateMemoryFromGPU(address + written_begin,
+		                                                  written_end - written_begin);
 	}
 	return result;
 }
@@ -311,10 +322,12 @@ void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	const bool raw_sint_storage = format == Prospero::BufferFormat::k32SInt && uint_resource &&
 	                              resource.written && !resource.read && !resource.atomic;
 	const auto numeric_class = Prospero::SampledTextureNumericClass(format);
-	const bool raw_float_atomic = format == Prospero::BufferFormat::k32Float && uint_resource &&
-	                              resource.atomic;
+	const bool raw_atomic_storage = resource.atomic && uint_resource &&
+	                                (format == Prospero::BufferFormat::k32UInt ||
+	                                 format == Prospero::BufferFormat::k32SInt ||
+	                                 format == Prospero::BufferFormat::k32Float);
 	const bool format_ok =
-	    raw_sint_storage || raw_float_atomic ||
+	    raw_sint_storage || raw_atomic_storage ||
 	    (numeric_class != Prospero::TextureNumericClass::Unsupported &&
 	     numeric_class != Prospero::TextureNumericClass::Sint &&
 	     uint_resource == (numeric_class == Prospero::TextureNumericClass::Uint) &&
@@ -369,7 +382,25 @@ static TextureCache::ImageDesc NullTextureDesc(const ShaderRecompiler::IR::Image
 	desc.info.samples         = 1;
 	desc.info.mip_layout[0]   = {0, 0, 1, 1};
 	desc.view_info.format     = desc.info.pixel_format;
-	desc.view_info.type       = vk::ImageViewType::e2D;
+	// Indirect-image tables specialize null entries to their accessed dimension.
+	using Dimension = ShaderRecompiler::Decoder::ImageDimension;
+	switch (resource.dimension) {
+		case Dimension::Dim1D:
+		case Dimension::Dim1DArray:
+			desc.info.type = Prospero::ImageType::kColor1D;
+			desc.view_info.type = resource.dimension == Dimension::Dim1D
+			                          ? vk::ImageViewType::e1D : vk::ImageViewType::e1DArray;
+			break;
+		case Dimension::Dim3D:
+			desc.info.type = Prospero::ImageType::kColor3D;
+			desc.view_info.type = vk::ImageViewType::e3D;
+			break;
+		case Dimension::Dim2DArray:
+		case Dimension::Dim2DMsaaArray:
+			desc.view_info.type = vk::ImageViewType::e2DArray;
+			break;
+		default: desc.view_info.type = vk::ImageViewType::e2D; break;
+	}
 	desc.view_info.aspect     = vk::ImageAspectFlagBits::eColor;
 	desc.view_info.usage      = binding == TextureCache::BindingType::Storage
 	                                ? vk::ImageUsageFlagBits::eStorage
@@ -763,6 +794,207 @@ void RenderExecutor::ResetBindings() {
 	m_bound_images.clear();
 }
 
+static uint32_t BindlessBindingFor(const ShaderRecompiler::IR::ImageResource& resource) {
+	using ShaderRecompiler::Decoder::ImageDimension;
+	if (resource.cube) {
+		return ShaderRecompiler::IR::BindlessImagesCube;
+	}
+	if (resource.dimension == ImageDimension::Dim3D) {
+		return ShaderRecompiler::IR::BindlessImages3D;
+	}
+	if (resource.dimension == ImageDimension::Dim2DArray ||
+	    resource.dimension == ImageDimension::Dim2DMsaaArray) {
+		return ShaderRecompiler::IR::BindlessImages2DArray;
+	}
+	return ShaderRecompiler::IR::BindlessImages2D;
+}
+
+// A heap entry the bindless array of this binding can hold: a float-sampled, single-sample
+// texture of a matching shape. Anything else stays the placeholder rather than reaching
+// ResolveTexture, which exits on descriptors a draw would never bind that way.
+static bool BindlessCompatible(const ShaderTextureResource& descriptor, uint32_t binding) {
+	if (descriptor.IsNull() ||
+	    Prospero::SampledTextureNumericClass(descriptor.Format()) !=
+	        Prospero::TextureNumericClass::Float) {
+		return false;
+	}
+	switch (descriptor.Type()) {
+		case Prospero::ImageType::kColor2D:
+			return binding == ShaderRecompiler::IR::BindlessImages2D ||
+			       binding == ShaderRecompiler::IR::BindlessImages2DArray;
+		case Prospero::ImageType::kColor2DArray:
+			return binding == ShaderRecompiler::IR::BindlessImages2D ||
+			       binding == ShaderRecompiler::IR::BindlessImages2DArray;
+		case Prospero::ImageType::kCube: return binding == ShaderRecompiler::IR::BindlessImagesCube;
+		case Prospero::ImageType::kColor3D: return binding == ShaderRecompiler::IR::BindlessImages3D;
+		default: return false;
+	}
+}
+
+bool RenderExecutor::ResolveBindlessKey(BindlessTable::Heap& heap, uint32_t key) {
+	auto&                                 table = m_context.GetBindlessTable();
+	ShaderRecompiler::IR::DescriptorValue value {};
+	value.dword_count  = 8u;
+	const auto address = heap.base + heap.table_offset + static_cast<uint64_t>(key) * 32u;
+	heap.settled[key]  = 1;
+	if (!Libs::LibKernel::Memory::TryReadBacking(address, value.dwords.data(), 32u)) {
+		table.SetTranslation(heap, key, 0u);
+		return false;
+	}
+	const auto descriptor = DecodeNativeDescriptor<ShaderTextureResource>(value);
+	if (!BindlessCompatible(descriptor, heap.binding)) {
+		table.SetTranslation(heap, key, 0u);
+		return false;
+	}
+	auto binding = ResolveTexture(heap.resource, value);
+	auto& texture_cache = m_context.GetTextureCache();
+	auto* image = texture_cache.m_slot_images.try_get(binding.image_id);
+	if (image == nullptr || image->info.data.Empty()) {
+		table.SetTranslation(heap, key, 0u);
+		return false;
+	}
+	BindImage(binding.image_id, false);
+	const auto view = texture_cache.FindTexture(binding.image_id, binding.desc);
+	image           = texture_cache.m_slot_images.try_get(binding.image_id);
+	const auto slot = table.AllocateSlot(heap.binding);
+	if (image == nullptr || view == nullptr || slot == 0) {
+		table.SetTranslation(heap, key, 0u);
+		return false;
+	}
+	const auto layout = image->info.IsDepth() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
+	                                          : vk::ImageLayout::eShaderReadOnlyOptimal;
+	table.WriteSlot(heap.binding, slot, view, layout);
+	heap.slots[key]         = slot;
+	image->bindless_pinned  = true;
+	image->usage.texture    = true;
+	heap.resolved.push_back(binding.image_id);
+	table.AddImageReference(binding.image_id, heap, key);
+	table.SetTranslation(heap, key, slot);
+	return true;
+}
+
+void RenderExecutor::ResolveBindlessRequests() {
+	const auto frame = m_context.GetGraphics().presented_frames.load(std::memory_order_relaxed);
+	if (frame == m_bindless_frame) {
+		return;
+	}
+	auto& table     = m_context.GetBindlessTable();
+	auto& scheduler = m_context.GetCommandScheduler();
+	// The flags come from a snapshot recorded in an earlier frame. Until the GPU has executed
+	// it, check again at the next bindless draw instead of waiting.
+	if (table.SnapshotRecorded() && !table.SnapshotReady(scheduler)) {
+		return;
+	}
+	m_bindless_frame = frame;
+	m_context.GetBindlessTable().DrainWatchdogReports(frame);
+	if (!table.SnapshotRecorded()) {
+		table.RecordFeedbackSnapshot(scheduler);
+		return;
+	}
+	table.ConsumeSnapshot();
+	// Each texture may upload and detile; spread first sight of a scene over a few frames.
+	constexpr uint32_t Budget   = 128;
+	uint32_t           resolved = 0;
+	for (auto& heap: m_context.GetBindlessTable().Heaps()) {
+		m_bindless_requests.clear();
+		m_context.GetBindlessTable().TakeRequests(heap, m_bindless_requests);
+		for (const auto key: m_bindless_requests) {
+			if (heap.settled[key] != 0) {
+				continue;
+			}
+			if (resolved >= Budget) {
+				break; // still pending: the next frame flags it again
+			}
+			resolved += ResolveBindlessKey(heap, key) ? 1u : 0u;
+		}
+	}
+	table.RecordFeedbackSnapshot(scheduler);
+}
+
+// Bindless samplers: the S# records of each sampler heap a draw indexes are mirrored into the
+// sampler array of set 1, once per frame per heap, and the shader gets the region base and record
+// count. Keys outside it, and heaps that cannot be read, use the default sampler in slot 0.
+void RenderExecutor::PrepareBindlessSamplers(const ShaderStageRuntime& runtime,
+                                             PreparedBindings&         prepared) {
+	const auto& program  = *runtime.program;
+	const auto& snapshot = *runtime.resources;
+	if (snapshot.bindless_sampler_heaps.empty()) {
+		return;
+	}
+	auto& table = m_context.GetBindlessTable();
+	auto& cache = m_context.GetSamplerCache();
+	{
+		ShaderSamplerResource default_sampler;
+		std::ranges::copy(ShaderRecompiler::IR::BindlessDefaultSampler, default_sampler.fields);
+		table.WriteDefaultSampler(cache.GetSampler(default_sampler, false));
+	}
+	const auto frame = m_context.GetGraphics().presented_frames.load(std::memory_order_relaxed);
+	constexpr uint64_t MaxRecords = 1024;
+	for (const auto& use: snapshot.bindless_sampler_heaps) {
+		uint32_t region  = 0;
+		uint32_t entries = 0;
+		if (table.SamplersEnabled() && use.sampler < program.info.samplers.size()) {
+			const auto&    sampler = program.info.samplers[use.sampler];
+			const uint32_t flags =
+			    (sampler.depth_compare ? BindlessTable::SamplerDepthCompare : 0u) |
+			    (sampler.force_point_filtering ? BindlessTable::SamplerPointFiltering : 0u) |
+			    (sampler.integer_border ? BindlessTable::SamplerIntegerBorder : 0u);
+			auto* heap = table.FindOrCreateSamplerHeap(use.base, use.table_offset, flags);
+			if (heap->checked_frame != frame) {
+				heap->checked_frame = frame;
+				const uint64_t available =
+				    use.size > use.table_offset ? (use.size - use.table_offset) / 16u : 0u;
+				std::vector<std::array<uint32_t, 4>> records(std::min(available, MaxRecords));
+				const uint64_t address = use.base + use.table_offset;
+				const uint64_t bytes   = records.size() * sizeof(records[0]);
+				if (!records.empty() &&
+				    !m_context.GetBufferCache().HasGpuDirtyBytes(address, bytes) &&
+				    Libs::LibKernel::Memory::TryReadBacking(address, records.data(), bytes)) {
+					(void)table.MirrorSamplerHeap(*heap, records, cache);
+				}
+			}
+			region  = heap->region;
+			entries = region != 0 ? static_cast<uint32_t>(heap->records.size()) : 0u;
+		}
+		prepared.bindless_patches.push_back({use.mapping_offset, region, entries});
+	}
+}
+
+void RenderExecutor::PrepareBindlessHeaps(const ShaderStageRuntime& runtime,
+                                          PreparedBindings& prepared) {
+	prepared.bindless_patches.clear();
+	prepared.bindless_images.clear();
+	const auto& program  = *runtime.program;
+	const auto& snapshot = *runtime.resources;
+	auto&       table    = m_context.GetBindlessTable();
+	if ((snapshot.bindless_heaps.empty() && snapshot.bindless_sampler_heaps.empty()) ||
+	    !table.Enabled()) {
+		return;
+	}
+	PrepareBindlessSamplers(runtime, prepared);
+	if (snapshot.bindless_heaps.empty()) {
+		return;
+	}
+	ResolveBindlessRequests();
+	for (const auto& use: snapshot.bindless_heaps) {
+		if (use.image >= program.info.images.size()) {
+			continue;
+		}
+		const auto& resource = program.info.images[use.image];
+		const uint64_t span  = use.size > use.table_offset ? use.size - use.table_offset : 0;
+		const auto entries   = static_cast<uint32_t>(std::min<uint64_t>(span / 32u, 1u << 18u));
+		auto* heap = table.FindOrCreateHeap(use.base, use.table_offset, BindlessBindingFor(resource),
+		                                    entries, resource);
+		if (heap == nullptr) {
+			continue; // region 0, count 0: every key samples the placeholder
+		}
+		prepared.bindless_patches.push_back(
+		    {use.mapping_offset, heap->region, std::min(entries, heap->entries)});
+		prepared.bindless_images.insert(prepared.bindless_images.end(), heap->resolved.begin(),
+		                                heap->resolved.end());
+	}
+}
+
 void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
                                      PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
@@ -789,6 +1021,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
 		prepared.samplers.push_back(NativeSampler(m_context, program, i, snapshot.samplers[i]));
 	}
+	PrepareBindlessHeaps(runtime, prepared);
 	prepared.shader_data.reserve(program.bindings.ShaderDataDwords());
 	for (const auto reg: program.bindings.user_data_registers) {
 		prepared.shader_data.push_back(snapshot.user_data[reg - program.user_data_base]);
@@ -817,12 +1050,30 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 	for (const auto resource: resources) {
 		auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[resource]);
 		const auto address = descriptor.Base48();
-		const auto requested_size = descriptor.GetSize();
-		if (address == 0 || requested_size == 0) {
+		// Research: a record count only the shader knows binds a capped range; the shader
+		// applies the real bound itself.
+		constexpr uint64_t GpuRecordsBinding = 64ull << 20u;
+		const auto requested_size = program.info.buffers[resource].gpu_records
+		                                ? std::min(descriptor.GetSize(), GpuRecordsBinding)
+		                                : descriptor.GetSize();
+		if (address < BufferCache::CACHING_PAGESIZE || requested_size == 0) {
 			prepared.buffer_sources.push_back({});
 			continue;
 		}
-		const auto size = Libs::LibKernel::Memory::ClampRangeSize(address, requested_size);
+		const auto size = Libs::LibKernel::Memory::TryClampRangeSize(address, requested_size);
+		if (size == 0) {
+			// Nothing is mapped at the base yet. Streaming titles bind regions they back later (a
+			// dispatch can precede the mapping by thousands of calls), and an unbacked region reads
+			// zero and drops writes on the hardware; binding null gives the same.
+			static std::atomic<uint32_t> reported = 0;
+			if (reported.fetch_add(1) < 8) {
+				LOGF("RenderExecutor: buffer descriptor %u outside mapped memory: stage=%u "
+				     "base=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+				     resource, static_cast<uint32_t>(program.stage), address, requested_size);
+			}
+			prepared.buffer_sources.push_back({});
+			continue;
+		}
 		prepared.buffer_sources.push_back({address, size, cache.FindBuffer(address, size)});
 	}
 }
@@ -840,6 +1091,10 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	EXIT_IF(prepared.shader_data.size() != layout.ShaderDataDwords());
 	std::fill(prepared.shader_data.begin() + layout.memory_offset_dword,
 	          prepared.shader_data.end(), 0);
+	if (layout.has_dispatch_dimensions) {
+		std::copy(prepared.dispatch_dimensions.begin(), prepared.dispatch_dimensions.end(),
+		          prepared.shader_data.begin() + layout.DispatchDimensionsDword());
+	}
 	auto pack_memory_offset = [&](uint32_t index, uint32_t offset) {
 		const auto dword = layout.memory_offset_dword + index / 4u;
 		const auto shift = (index % 4u) * 8u;
@@ -848,14 +1103,34 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	for (uint32_t i = 0; i < layout.memory_offset_count; i++) {
 		const auto resource = layout.descriptors.front().resources[i];
 		uint32_t buffer_offset = 0;
-		prepared.buffers.push_back(NativeStorageBuffer(m_context, prepared.buffer_sources[i],
-		                                               program.info.buffers[resource],
-		                                               buffer_offset));
+		prepared.buffers.push_back(NativeStorageBuffer(
+		    m_context, prepared.buffer_sources[i], program.info.buffers[resource],
+		    resource < snapshot.buffer_write_extents.size() ? &snapshot.buffer_write_extents[resource]
+		                                                    : nullptr,
+		    buffer_offset));
 		pack_memory_offset(i, buffer_offset);
+		// The fallback allocation makes the Vulkan descriptor valid, but an empty guest
+		// buffer still has no accessible elements. In particular, never let a null store
+		// modify the shared fallback and affect subsequent null reads.
+		prepared.shader_data[layout.BufferLengthDword() + i] =
+		    prepared.buffer_sources[i].size == 0
+		        ? 0u
+		        : static_cast<uint32_t>(prepared.buffers.back().range / sizeof(uint32_t));
 	}
 	if (ShaderRecompiler::IR::FindBinding(
 	        layout, ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt) != nullptr) {
-		prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);
+		if (prepared.bindless_patches.empty()) {
+			prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);
+		} else {
+			m_bindless_srt.assign(snapshot.flattened_srt.begin(), snapshot.flattened_srt.end());
+			for (const auto& [offset, region, entries]: prepared.bindless_patches) {
+				if (static_cast<size_t>(offset) + 1u < m_bindless_srt.size()) {
+					m_bindless_srt[offset]      = region;
+					m_bindless_srt[offset + 1u] = entries;
+				}
+			}
+			prepared.flattened_srt = NativeUpload(m_context, m_bindless_srt);
+		}
 	}
 	if (ShaderRecompiler::IR::FindBinding(
 	        program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::ShaderData) != nullptr) {
@@ -996,6 +1271,19 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			    shader_stages, vk::DependencyFlags {}, 0, nullptr, 1, &barrier, 0, nullptr);
 		}
 
+		// Bindless textures are sampled through set 1 with a read-only layout.
+		for (const auto id: descriptors.bindless_images) {
+			auto* image = m_context.GetTextureCache().m_slot_images.try_get(id);
+			if (image == nullptr || !image->registered || image->binding.is_target ||
+			    image->info.data.Empty()) {
+				continue;
+			}
+			const auto layout = image->info.IsDepth() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
+			                                          : vk::ImageLayout::eShaderReadOnlyOptimal;
+			if (image->backing.state.layout != layout) {
+				image->Transit(layout, vk::AccessFlagBits2::eShaderRead, {}, vk_buffer);
+			}
+		}
 		for (uint32_t i = 0; i < program.info.images.size(); i++) {
 			auto& image   = m_context.GetTextureCache().GetImage(descriptors.images[i].image_id);
 			auto& binding = descriptors.images[i];
@@ -1148,6 +1436,12 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout, 0, 1, &set,
 			                             0, nullptr);
 		}
+	}
+	if (pipeline.uses_bindless) {
+		const auto set = m_context.GetGraphics().bindless_set;
+		EXIT_IF(set == nullptr);
+		vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout, 1, 1, &set, 0,
+		                             nullptr);
 	}
 }
 

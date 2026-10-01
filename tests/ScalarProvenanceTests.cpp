@@ -487,11 +487,13 @@ void TestSharedIntegerRuntimeDependencies() {
         "shared integer dependencies hid a floating-point sibling");
 }
 
+// Past num_records a scalar buffer read returns zero without touching memory (PS5 ISA, scalar
+// buffer addressing); the offset components neither misalign nor wrap.
 void TestConstantBufferBounds() {
   struct Case {
     uint32_t offset;
     uint32_t immediate;
-    bool valid;
+    bool in_range;
     uint32_t expected;
   };
   for (const auto &test : {Case{12u, 0u, true, 0xa5a5a5a5u},
@@ -511,9 +513,10 @@ void TestConstantBufferBounds() {
     TestMemory memory_image{{{0x3000u, 0x12345678u}, {0x300cu, 0xa5a5a5a5u}}};
     SrtRuntime runtime{.read_memory = ReadMemory, .userdata = &memory_image};
     std::vector<uint32_t> flat;
-    Check(SrtWalker(fixture.program, runtime).RefreshFlatBuffer(flat) == test.valid,
-          "constant-buffer walk misaligned or wrapped its offset components");
-    Check(test.valid ? flat == std::vector<uint32_t>{test.expected} : memory_image.reads == 0,
+    Check(SrtWalker(fixture.program, runtime).RefreshFlatBuffer(flat),
+          "constant-buffer walk failed");
+    Check(flat == std::vector<uint32_t>{test.expected} &&
+              (test.in_range || memory_image.reads == 0),
           "constant-buffer walk read the wrong word or accessed an out-of-bounds address");
   }
 }

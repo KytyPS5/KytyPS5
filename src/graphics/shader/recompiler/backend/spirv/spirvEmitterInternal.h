@@ -61,15 +61,20 @@ struct SpirvRequirements {
 	bool subgroup_ballot              = false;
 	bool subgroup_shuffle             = false;
 	bool subgroup_local_invocation_id = false;
+	bool subgroup_arithmetic          = false;
 	bool compute_derivatives          = false;
 	bool image_gather_extended        = false;
 	bool function_lds                 = false;
+	// Dwords the function-scope LDS array needs, from bounds on every LDS address; 0 when some
+	// address is unbounded.
+	uint32_t function_lds_dwords      = 0;
 	bool function_scratch             = false;
 	bool pixel_valid_mask             = false;
 	bool buffer_int64_atomics         = false;
 	bool shared_int64_atomics         = false;
 	bool coherent_buffers             = false;
 	bool float64                      = false;
+	bool shader_clock                 = false;
 };
 
 SpirvRequirements AnalyzeProgramRequirements(const IR::Program& program);
@@ -93,6 +98,7 @@ struct EmitterState {
 	uint32_t                                         storage_buffer_variable = 0;
 	uint32_t                                         storage_buffer_u64_variable = 0;
 	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> memory_byte_offsets {};
+	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> memory_dword_lengths {};
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
 	uint32_t                                         bda_pointer_function    = 0;
@@ -105,6 +111,14 @@ struct EmitterState {
 	uint32_t                                         lds_u64_variable        = 0;
 	std::array<uint32_t, 2>                          scratch_variable {};
 	std::array<uint32_t, IR::ImageBindingCount>      image_variables {};
+	// Bindless images: set-1 runtime arrays by image type, the key -> slot translation buffer,
+	// and the slot EmitImage computed for the instruction being emitted (0 when none).
+	std::map<uint32_t, uint32_t>                     bindless_image_variables;
+	uint32_t                                         bindless_translation_variable = 0;
+	uint32_t                                         bindless_feedback_variable    = 0;
+	uint32_t                                         bindless_slot                 = 0;
+	uint32_t                                         bindless_sampler_variable     = 0;
+	uint32_t                                         bindless_sampler_slot         = 0;
 	uint32_t                   sampler_variable                      = 0;
 	uint32_t                   main_func                             = 0;
 	uint32_t                   mesh_guest_func                       = 0;
@@ -112,6 +126,14 @@ struct EmitterState {
 	uint32_t                   mesh_primitive_data                   = 0;
 	uint32_t                   mesh_primitives                       = 0;
 	uint32_t                   mesh_cull                             = 0;
+	uint32_t                   mesh_zero_position_mask               = 0;
+	uint32_t                   mesh_zero_position_words              = 0;
+	// A subgroup larger than the host workgroup runs in mesh_passes passes (ShaderMeshInputInfo):
+	// mesh_pass_variable holds the current pass, and the guest program is cut at its barriers
+	// into mesh_segment_funcs, each called once per pass.
+	uint32_t                   mesh_passes                           = 1;
+	uint32_t                   mesh_pass_variable                    = 0;
+	std::vector<uint32_t>      mesh_segment_funcs;
 	uint32_t                   entry_label                           = 0;
 	uint32_t                   current_label                         = 0;
 	const IR::Block*           current_block                         = nullptr;
@@ -250,6 +272,7 @@ struct ImageSampleLayout {
 	uint32_t lod    = NoImageComponent;
 	uint32_t grad_x = NoImageComponent;
 	uint32_t grad_y = NoImageComponent;
+	uint32_t clamp  = NoImageComponent; // IMAGE_SAMPLE*_CL minimum LOD, the last component
 };
 
 struct F32Class {
@@ -335,6 +358,7 @@ void     EmitMeshEntryPoint(EmitterState& state);
 void     EmitMeshAllocate(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t MeshOutputPointer(EmitterState& state, IR::StageOutputKind kind, uint32_t index = 0);
 uint32_t MeshPrimitivePointer(EmitterState& state);
+uint32_t MeshLaneSlot(EmitterState& state);
 
 DppTargetLane EmitDppPermTargetLane(EmitterState& state, uint32_t subid, uint32_t control,
                                     uint32_t lane_bits);
@@ -370,6 +394,11 @@ inline constexpr auto EmitAddU32 = EmitNative<spv::OpIAdd, IR::Type::U32, uint32
 uint32_t EmitBinaryU32(EmitterState& state, spv::Op opcode, uint32_t lhs, uint32_t rhs);
 
 uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index);
+
+// A thread-dimension compute dispatch whose counts the shader reads from GPU memory.
+[[nodiscard]] bool DispatchDimensionsIndirect(const EmitterState& state);
+// Guest DMA, or DispatchDimensionsIndirect: the module uses physical storage buffer pointers.
+[[nodiscard]] bool UsesPhysicalAddresses(const EmitterState& state);
 
 uint32_t StorageBufferPackedStride(const EmitterState& state, const IR::MemoryInfo& mem);
 

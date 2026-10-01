@@ -618,6 +618,8 @@ struct DrawEmitInfo {
 	int32_t  vertex_offset = 0;
 	uint32_t first_vertex  = 0;
 	uint32_t first_instance = 0;
+	// Research: guest address of indirect arguments the GPU reads itself (0: CPU counts).
+	uint64_t indirect_args = 0;
 };
 
 struct DrawIndexBufferSource {
@@ -891,6 +893,9 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	                  (color_output_mask != 0 ||
 	                   PixelShaderHasDepthOrCoverageSideEffects(shader_regs));
 	RefreshShaders(buffer, draw, color_output_mask, state);
+	if (!state.programs.vertex[0] || (state.ps_active && !state.programs.pixel)) {
+		return false;
+	}
 	uint32_t mrt_mask = 0;
 	if (state.ps_active) {
 		for (const auto& output: state.ps_input_info.stage.program->info.outputs) {
@@ -985,7 +990,19 @@ static void LogDrawStateIfNeeded(const CommandBuffer& buffer, const DrawCallInfo
 }
 
 static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_buffer,
-                               const DrawCallInfo& draw, const DrawEmitInfo& emit) {
+                               const DrawCallInfo& draw, const DrawEmitInfo& emit,
+                               vk::Buffer indirect_buffer = nullptr,
+                               vk::DeviceSize indirect_offset = 0) {
+	if (indirect_buffer) {
+		// The guest records share Vulkan's layouts: {count, instances, first, (vertex offset,)
+		// first instance}.
+		if (draw.IsIndexed()) {
+			vk_buffer.drawIndexedIndirect(indirect_buffer, indirect_offset, 1, 20);
+		} else {
+			vk_buffer.drawIndirect(indirect_buffer, indirect_offset, 1, 16);
+		}
+		return;
+	}
 	switch (ucfg.GetPrimType()) {
 		case Prospero::PrimitiveType::kPointList:
 		case Prospero::PrimitiveType::kLineList:
@@ -1024,7 +1041,58 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
                                          const DrawCallInfo& draw, DrawRenderState& state,
                                          vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
                                          const DrawIndexBufferSource& index_source,
-	                                     bool primitive_restart_enable) {
+                                         bool primitive_restart_enable) {
+	const bool mesh = state.vertex_info[0].stage.program->stage == ShaderType::Mesh;
+	const bool quad =
+	    buffer.GetUserConfig().GetPrimType() == Prospero::PrimitiveType::kQuadListLegacy;
+	if (emit.indirect_args == 0 || (!mesh && !quad)) {
+		ExecutePreparedDrawResolved(submit_id, buffer, draw, state, topology, emit, index_source,
+		                            primitive_restart_enable);
+		return;
+	}
+	// Research: mesh and legacy quad draws expand their counts on the host, so their
+	// GPU-written arguments are read here (a GPU-dirty page drains the queue first).
+	auto resolved_draw  = draw;
+	auto resolved_emit  = emit;
+	auto resolved_index = index_source;
+	resolved_emit.indirect_args = 0;
+	if (draw.IsIndexed()) {
+		vk::DrawIndexedIndirectCommand args {};
+		std::memcpy(&args, reinterpret_cast<const void*>(emit.indirect_args), sizeof(args));
+		if (args.indexCount == 0 || args.instanceCount == 0) {
+			return;
+		}
+		resolved_draw.index_count    = std::min(args.indexCount, draw.index_count);
+		resolved_draw.instance_count = args.instanceCount;
+		resolved_draw.first_instance = args.firstInstance;
+		resolved_index.address += static_cast<uint64_t>(args.firstIndex) *
+		                          index_source.guest_element_size;
+		resolved_index.size = static_cast<uint64_t>(resolved_draw.index_count) *
+		                      index_source.guest_element_size;
+		resolved_emit.vertex_offset  = args.vertexOffset;
+		resolved_emit.first_instance = args.firstInstance;
+	} else {
+		vk::DrawIndirectCommand args {};
+		std::memcpy(&args, reinterpret_cast<const void*>(emit.indirect_args), sizeof(args));
+		if (args.vertexCount == 0 || args.instanceCount == 0) {
+			return;
+		}
+		resolved_draw.index_count    = args.vertexCount;
+		resolved_draw.instance_count = args.instanceCount;
+		resolved_draw.first_instance = args.firstInstance;
+		resolved_emit.first_vertex   = args.firstVertex;
+		resolved_emit.first_instance = args.firstInstance;
+	}
+	ExecutePreparedDrawResolved(submit_id, buffer, resolved_draw, state, topology, resolved_emit,
+	                            resolved_index, primitive_restart_enable);
+}
+
+void RenderExecutor::ExecutePreparedDrawResolved(uint64_t submit_id, CommandBuffer& buffer,
+                                                 const DrawCallInfo& draw, DrawRenderState& state,
+                                                 vk::PrimitiveTopology       topology,
+                                                 const DrawEmitInfo&         emit,
+                                                 const DrawIndexBufferSource& index_source,
+                                                 bool primitive_restart_enable) {
 	auto& ucfg = buffer.GetUserConfig();
 	const auto vertex_stages =
 	    std::span {state.vertex_info.data(), state.programs.VertexStageCount()};
@@ -1086,13 +1154,43 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
 		index_binding   = PrepareIndexBuffer(buffer, index_source);
 	}
+	Buffer*  indirect_buffer = nullptr;
+	uint64_t indirect_offset = 0;
+	if (emit.indirect_args != 0) {
+		EXIT_IF(mesh_active || (emit.indirect_args & 3u) != 0);
+		const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
+		    emit.indirect_args, draw.IsIndexed() ? sizeof(vk::DrawIndexedIndirectCommand)
+		                                         : sizeof(vk::DrawIndirectCommand),
+		    false);
+		EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
+		indirect_buffer = args_buffer;
+		indirect_offset = args_offset;
+	}
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "CreatePipeline");
 	}
-	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(
+	// A draw that writes no memory may be skipped while its new pipeline compiles in the
+	// background; its render targets are not touched. One that writes buffers or storage images
+	// waits for the pipeline, as others may read what it writes.
+	const auto writes_memory = [](const ShaderStageRuntime& runtime) {
+		return HasShaderBufferWrites(runtime) ||
+		       std::ranges::any_of(runtime.program->info.images, [](const auto& image) {
+			       return image.written &&
+			              image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Storage;
+		       });
+	};
+	bool may_defer = !(state.ps_active && writes_memory(state.ps_input_info.stage));
+	for (const auto& stage: vertex_stages) {
+		may_defer = may_defer && !writes_memory(stage.stage);
+	}
+	auto* deferred_pipeline = m_context.GetPipelineCache().TryGetGraphicsPipeline(
 	    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
 	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
-	    state.programs);
+	    state.programs, may_defer);
+	if (deferred_pipeline == nullptr) {
+		return;
+	}
+	auto& pipeline = *deferred_pipeline;
 	vk::ImageAspectFlags feedback_aspects;
 	const auto rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,
@@ -1102,6 +1200,19 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// point onward, every operation targets the current command buffer and cannot touch guest
 	// memory.
 	auto vk_buffer = buffer.Handle();
+	if (indirect_buffer != nullptr) {
+		// Earlier passes wrote the arguments; indirect reads happen outside the render pass.
+		buffer.EndRendering();
+		vk::MemoryBarrier barrier {};
+		barrier.srcAccessMask =
+		    vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
+		barrier.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
+		vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllGraphics |
+		                              vk::PipelineStageFlagBits::eComputeShader |
+		                              vk::PipelineStageFlagBits::eTransfer,
+		                          vk::PipelineStageFlagBits::eDrawIndirect, {}, 1, &barrier, 0,
+		                          nullptr, 0, nullptr);
+	}
 	SetDrawDebugPhase(buffer, submit_id, draw, draw.IsIndexed() ? 0x100u : 0x200u);
 	if (!mesh_active) {
 		CommitVertexBuffers(vk_buffer, vertex_bindings);
@@ -1143,7 +1254,9 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (mesh_active) {
 		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
 	} else {
-		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
+		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit,
+		                   indirect_buffer != nullptr ? indirect_buffer->Handle() : nullptr,
+		                   indirect_offset);
 	}
 
 	if (!draw.IsIndexed()) {
@@ -1183,7 +1296,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	                    reinterpret_cast<uint64_t>(args.index_addr));
 
 	Common::LockGuard lock(m_context.GetMutex());
-	if (args.index_count == 0 || args.instance_count == 0) {
+	if (args.gpu_args == 0 && (args.index_count == 0 || args.instance_count == 0)) {
 		return;
 	}
 
@@ -1273,6 +1386,7 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	DrawEmitInfo emit {};
 	emit.vertex_offset  = vertex_offset + args.base_vertex;
 	emit.first_instance = instance_offset;
+	emit.indirect_args  = args.gpu_args;
 
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source,
 	                    primitive_restart);
@@ -1362,6 +1476,7 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	DrawEmitInfo emit {};
 	emit.first_vertex = static_cast<uint32_t>(vertex_offset + static_cast<int32_t>(args.first_vertex));
 	emit.first_instance = instance_offset;
+	emit.indirect_args  = args.gpu_args;
 
 	DrawIndexBufferSource index_source {};
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source, false);

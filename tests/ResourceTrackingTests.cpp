@@ -1,4 +1,5 @@
 #include "graphics/guest_gpu/gpu_defs.h"
+#include "graphics/shader/recompiler/frontend/translate/Translator.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
@@ -1673,6 +1674,100 @@ void TestComputeBufferFill() {
   Run({.clean = true, .branch = true});
 }
 
+void TestBoundedBufferWrites() {
+  struct Options {
+    bool per_lane_index = false;
+    bool add_tid = false;
+    bool swizzle = false;
+    bool unknown_groups = false;
+  };
+  const auto Run = [](Options options) {
+    Fixture fixture;
+    fixture.program.block_info[0].terminator.kind =
+        Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::Return;
+    const auto buffer =
+        fixture.Buffer({fixture.UserData(0), fixture.UserData(1),
+                        fixture.UserData(2), fixture.UserData(3)});
+    const auto local = fixture.Emit(
+        ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)),
+         Value(0u)});
+    const auto group = fixture.Emit(
+        ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::WorkgroupId)), Value(0u)});
+    // CS 5e04a15a: index = (group << 6) + local + a constant.
+    Value index = fixture.Emit(
+        ValueOpcode::IAdd32,
+        {fixture.Emit(ValueOpcode::IAdd32,
+                      {fixture.Emit(ValueOpcode::ShiftLeftLogical32,
+                                    {group, Value(6u)}),
+                       local}),
+         fixture.UserData(4)});
+    if (options.per_lane_index) {
+      const auto table =
+          fixture.Buffer({fixture.UserData(5), fixture.UserData(6),
+                          fixture.UserData(7), fixture.UserData(8)}, 36);
+      MemoryInfo load;
+      load.kind = ResourceKind::Buffer;
+      load.offen = true;
+      index = fixture.Emit(ValueOpcode::LoadBufferU32,
+                           {table, Value(0u), local, Value(0u), Value(true)},
+                           fixture.AddMemory(load, 4));
+    }
+    const auto predicate =
+        fixture.Emit(ValueOpcode::ULessThan32, {local, Value(32u)});
+    // Lanes the predicate disables keep an unrelated value; they do not store.
+    const auto selected = fixture.Emit(ValueOpcode::SelectU32,
+                                       {predicate, index, Value(0xfffffff0u)});
+    MemoryInfo store;
+    store.kind = ResourceKind::Buffer;
+    store.formatted = true;
+    store.idxen = true;
+    fixture.Emit(ValueOpcode::StoreBufferU32,
+                 {buffer, selected, Value(0u), Value(0u), Value(0u), predicate},
+                 fixture.AddMemory(store, 16));
+    fixture.PlanAndTrack();
+    auto plan = ExtractResourcePlan(fixture.program);
+    std::array<uint32_t, 9> userdata{
+        0x200000u, (16u << 16u) | (options.swizzle ? 1u << 31u : 0u), 0x100000u,
+        0x14204u | (options.add_tid ? 1u << 23u : 0u), 100u,
+        0x300000u, 4u << 16u, 0x1000u, 0x14204u};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    SrtRuntime runtime{.user_data = userdata};
+    runtime.workgroup_count = {options.unknown_groups ? 0u : 4u, 1u, 1u};
+    runtime.workgroup_size = {64u, 1u, 1u};
+    Check(MaterializeResources(plan, runtime, snapshot, specialization),
+          "bounded-write fixture did not materialize");
+    const auto written = std::ranges::find_if(
+        fixture.program.info.buffers,
+        [](const BufferResource &resource) { return resource.written; });
+    Check(written != fixture.program.info.buffers.end(),
+          "bounded-write fixture lost its written buffer");
+    const auto index_of_written = static_cast<size_t>(
+        written - fixture.program.info.buffers.begin());
+    Check(snapshot.buffer_write_extents.size() ==
+              fixture.program.info.buffers.size(),
+          "buffer write extents do not cover every buffer");
+    const auto &extent = snapshot.buffer_write_extents[index_of_written];
+    const bool bounded =
+        !options.per_lane_index && !options.swizzle && !options.unknown_groups;
+    Check(extent.valid == bounded,
+          "a store address was bounded without a proof, or a provable one was not");
+    if (bounded) {
+      // Groups 0..3 of 64 lanes from index 100, 16-byte records, a 16-byte store at most.
+      const uint64_t last = 3u * 64u + 63u + 100u + (options.add_tid ? 63u : 0u);
+      Check(extent.begin == 100u * 16u && extent.end == last * 16u + 16u,
+            "bounded store extent is not the dispatch's index range");
+    }
+  };
+  Run({});
+  Run({.add_tid = true});
+  Run({.per_lane_index = true});
+  Run({.swizzle = true});
+  Run({.unknown_groups = true});
+}
+
 void TestDenseBufferTracking() {
   Fixture fixture;
   std::array<Value, 8> userdata;
@@ -2289,8 +2384,10 @@ void TestDynamicSrtReadRemainsExplicit() {
   Check(fixture.program.bindings.memory_offset_dword ==
                 fixture.program.bindings.user_data_registers.size() &&
             fixture.program.bindings.memory_offset_count == 1u &&
+            fixture.program.bindings.BufferLengthDword() ==
+                fixture.program.bindings.memory_offset_dword + 1u &&
             fixture.program.bindings.ShaderDataDwords() ==
-                fixture.program.bindings.memory_offset_dword + 1u,
+                fixture.program.bindings.BufferLengthDword() + 1u,
         "unified memory-offset layout is inconsistent");
 }
 
@@ -2316,12 +2413,13 @@ void TestPhiValidation() {
                {handle, Value(0u), Value(0u), Value(0u), Value(true)},
                fixture.AddMemory(memory, 20), merge);
 
-  CheckFatal([&] { fixture.PlanAndTrack(); }, "not a valid runtime value",
-             "control-dependent descriptor phi was accepted");
-  Check(!fixture.program.resource_tracking_complete &&
+  // The descriptor is not a runtime value on the CPU, so the DWORD read selects its buffer
+  // on the GPU instead of binding one on the host.
+  fixture.PlanAndTrack();
+  Check(fixture.program.resource_tracking_complete && fixture.program.info.uses_dma &&
             fixture.program.info.buffers.empty() &&
-            fixture.program.descriptor_sources.empty(),
-        "control-dependent descriptor phi was not rejected transactionally");
+            fixture.program.memory_info.back().kind == ResourceKind::IndirectBuffer,
+        "control-dependent descriptor phi did not become a GPU-selected buffer read");
 }
 
 ResourcePlan ConditionalSamplerPlan(bool diamond, bool reverse, bool reverse_phi,
@@ -2480,6 +2578,60 @@ void TestConditionalSamplerPhi() {
         "not a valid runtime value",
         "shader-written sampler predicate was accepted");
   }
+}
+
+// A sampler read from a heap at a GPU-selected key gets a fixed sampler, and the heap reads it
+// strands become planning-only (no load). Six effect shaders also use one of those reads as data
+// (the register is reused after a branch); planning-only, it left that data without a value.
+void TestDefaultSamplerKeepsDataReads() {
+  Libs::Graphics::ShaderRecompiler::Frontend::TranslationNonFatalScope non_fatal(true);
+  Fixture fixture;
+  std::array<Value, 4> heap_words;
+  std::array<Value, 8> image_words;
+  for (uint32_t dword = 0; dword < 4; dword++) {
+    heap_words[dword] = fixture.UserData(dword + 4u);
+  }
+  for (uint32_t dword = 0; dword < 8; dword++) {
+    image_words[dword] = fixture.UserData(dword + 8u);
+  }
+  const auto heap = fixture.Buffer(heap_words, 0x100);
+  const auto invocation = fixture.Emit(
+      ValueOpcode::GetBuiltin,
+      {Value(static_cast<uint32_t>(StageInputKind::GlobalInvocationId)), Value(0u)});
+  const auto key = fixture.Emit(ValueOpcode::ReadFirstLane, {invocation, Value(true)});
+  const auto offset = fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(4u)});
+  std::array<Value, 4> reads;
+  for (uint32_t dword = 0; dword < 4; dword++) {
+    MemoryInfo word;
+    word.kind = ResourceKind::ScalarBuffer;
+    word.offset = dword * sizeof(uint32_t);
+    reads[dword] = fixture.Emit(ValueOpcode::ReadConstBuffer, {heap, offset},
+                                fixture.AddMemory(word, 0x100));
+  }
+  const auto sampler = fixture.Sampler(reads, 0x110);
+  const auto image = fixture.Image(image_words, 0x110);
+  MemoryInfo sample;
+  sample.kind = ResourceKind::Image;
+  sample.image_dimension = Decoder::ImageDimension::Dim2D;
+  const auto sampled = fixture.Emit(ValueOpcode::ImageSampleRaw,
+                                    {image, sampler, fixture.ImageAddress()},
+                                    fixture.AddMemory(sample, 0x110));
+  fixture.Emit(ValueOpcode::ReferenceU32,
+               {fixture.Emit(ValueOpcode::CompositeExtractU32x4, {sampled, Value(0u)})});
+  const auto data = fixture.Emit(ValueOpcode::SelectU32, {invocation, reads[1], Value(0u)});
+  fixture.Emit(ValueOpcode::ReferenceU32, {data});
+  fixture.PlanAndTrack();
+
+  for (uint32_t dword = 0; dword < 4; dword++) {
+    const auto &memory =
+        fixture.program.memory_info[reads[dword].TryInstruction()->Flags<MemoryFlags>().index];
+    Check(memory.planning_only == (dword != 1u),
+          dword == 1u ? "a heap read also used as data became planning-only"
+                      : "a heap read only the sampler used stayed a load");
+  }
+  const auto *handle = sampler.TryInstruction();
+  Check(handle->Arg(0).IsImmediate() && handle->Arg(3).IsImmediate(),
+        "the sampler did not take the fixed sampler");
 }
 
 void TestLoopCycleEnteredThroughRuntimeValue() {
@@ -2847,6 +2999,110 @@ void TestConditionalIndirectImageMaterialization() {
         "taken indirect image branch did not require its descriptor table");
 }
 
+// Research: a goto-structured region merges a bindless descriptor in stages, and one path
+// (which never samples) carries an unrelated value into the merge: PS 5e3edde52562876c.
+// entry -> {with_a, middle}; middle -> {with_b, other}; with_b, other -> inner; with_a, inner
+// -> outer, which samples. The free branch gets key 0; a read of the heap at another record
+// offset on that branch is a real choice between fields and still turns the image down.
+void TestNestedBindlessDescriptorPhi(bool other_reads_heap) {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  Fixture fixture;
+  fixture.program.bindless_images = true;
+  auto *entry = fixture.block;
+  auto *with_a = fixture.AddBlock();
+  auto *middle = fixture.AddBlock();
+  auto *with_b = fixture.AddBlock();
+  auto *other = fixture.AddBlock();
+  auto *inner = fixture.AddBlock();
+  auto *outer = fixture.AddBlock();
+  entry->AddBranch(with_a);
+  entry->AddBranch(middle);
+  middle->AddBranch(with_b);
+  middle->AddBranch(other);
+  with_b->AddBranch(inner);
+  other->AddBranch(inner);
+  with_a->AddBranch(outer);
+  inner->AddBranch(outer);
+  auto &info = fixture.program.block_info;
+  info[0].condition = fixture.Emit(ValueOpcode::INotEqual32, {fixture.UserData(11), Value(0u)});
+  info[0].terminator = {.kind = CFG::TerminatorKind::ConditionalBranch, .true_block = 1, .false_block = 2};
+  info[2].condition =
+      fixture.Emit(ValueOpcode::INotEqual32, {fixture.UserData(12), Value(0u)}, 0, middle);
+  info[2].terminator = {.kind = CFG::TerminatorKind::ConditionalBranch, .true_block = 3, .false_block = 4};
+  info[1].terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = 6};
+  info[3].terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = 5};
+  info[4].terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = 5};
+  info[5].terminator = {.kind = CFG::TerminatorKind::Branch, .true_block = 6};
+  info[6].terminator.kind = CFG::TerminatorKind::Return;
+
+  const auto heap = fixture.Buffer(
+      {fixture.UserData(4), fixture.UserData(5), fixture.UserData(6), fixture.UserData(7)}, 0x10d8);
+  const auto key_a = fixture.UserData(8);
+  const auto key_b = fixture.UserData(9);
+  const auto offset_a = fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key_a, Value(5u)}, 0, with_a);
+  const auto offset_b = fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key_b, Value(5u)}, 0, with_b);
+  const auto counter =
+      fixture.Emit(ValueOpcode::IAdd32, {fixture.UserData(10), Value(1u)}, 0, other);
+  const auto offset_other =
+      fixture.Emit(ValueOpcode::ShiftLeftLogical32, {counter, Value(5u)}, 0, other);
+  std::array<Value, 8> image_words;
+  for (uint32_t dword = 0; dword < image_words.size(); dword++) {
+    const auto read = [&](Block *block, Value offset, uint32_t extra) {
+      MemoryInfo word;
+      word.kind = ResourceKind::ScalarBuffer;
+      word.offset = dword * sizeof(uint32_t) + extra;
+      return fixture.Emit(ValueOpcode::ReadConstBuffer, {heap, offset},
+                          fixture.AddMemory(word, 0x10d8), block);
+    };
+    const auto from_a = read(with_a, offset_a, 0);
+    const auto from_b = read(with_b, offset_b, 0);
+    const auto from_other = other_reads_heap ? read(other, offset_other, 32) : counter;
+    auto &inner_phi = inner->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+    inner_phi.AddPhiOperand(with_b, from_b);
+    inner_phi.AddPhiOperand(other, from_other);
+    auto &outer_phi = outer->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+    outer_phi.AddPhiOperand(with_a, from_a);
+    outer_phi.AddPhiOperand(inner, Value(&inner_phi));
+    image_words[dword] = Value(&outer_phi);
+  }
+  fixture.block = outer;
+  const auto image = fixture.Image(image_words, 0x10f0);
+  const auto sampler = fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)}, 0x10f0);
+  MemoryInfo sample;
+  sample.kind = ResourceKind::Image;
+  sample.image_dimension = Decoder::ImageDimension::Dim2D;
+  const auto sampled = fixture.Emit(ValueOpcode::ImageSampleRaw,
+                                    {image, sampler, fixture.ImageAddress()},
+                                    fixture.AddMemory(sample, 0x10f0));
+  fixture.Emit(ValueOpcode::ReferenceU32,
+               {fixture.Emit(ValueOpcode::CompositeExtractU32x4, {sampled, Value(0u)})});
+  if (other_reads_heap) {
+    CheckFatal([&] { fixture.PlanAndTrack(); }, "not a valid runtime value",
+               "a heap read at another record offset was taken as a free branch");
+    return;
+  }
+  fixture.PlanAndTrack();
+  Check(fixture.program.resource_tracking_complete && fixture.program.info.images.size() == 1,
+        "nested descriptor phi with a free branch was not tracked");
+  const auto source = fixture.program.info.images[0].source;
+  Check(source < fixture.program.descriptor_sources.size() &&
+            fixture.program.descriptor_sources[source].indirect_image.has_value() &&
+            fixture.program.descriptor_sources[source].indirect_image->bindless,
+        "nested descriptor phi did not become a bindless heap lookup");
+  const auto *key = image.ResolveInstruction()->Arg(0).ResolveInstruction();
+  Check(key != nullptr && key->GetOpcode() == ValueOpcode::Phi && key->Parent() == outer &&
+            key->NumArgs() == 2u,
+        "outer key phi missing");
+  const auto *inner_key = key->Arg(1).ResolveInstruction();
+  Check(key->Arg(0).Resolve() == key_a && inner_key != nullptr &&
+            inner_key->GetOpcode() == ValueOpcode::Phi && inner_key->Parent() == inner &&
+            inner_key->Arg(0).Resolve() == key_b && inner_key->Arg(1).IsImmediate() &&
+            inner_key->Arg(1).U32() == 0u,
+        "key phis do not mirror the descriptor phis, with key 0 on the free branch");
+  EliminateDeadCode(fixture.program.blocks);
+  ValidateProgram(fixture.program, true);
+}
+
 void TestShaderInfoAndBindingLayout() {
   Fixture fixture;
   const auto handle = fixture.Buffer(
@@ -3165,6 +3421,7 @@ int main() {
     };
     Run("dense buffers", TestDenseBufferTracking);
     Run("compute buffer fill", TestComputeBufferFill);
+    Run("bounded buffer writes", TestBoundedBufferWrites);
     Run("scalar/vector alias", TestScalarAndVectorBufferAlias);
     Run("runtime unsigned min", TestRuntimeUnsignedMinDescriptor);
     Run("images and samplers", TestImagesSamplersAndAliases);
@@ -3181,6 +3438,7 @@ int main() {
     Run("dynamic SRT", TestDynamicSrtReadRemainsExplicit);
     Run("phi validation", TestPhiValidation);
     Run("conditional sampler phi", TestConditionalSamplerPhi);
+    Run("default sampler keeps data reads", TestDefaultSamplerKeepsDataReads);
     Run("runtime-rooted loop", TestLoopCycleEnteredThroughRuntimeValue);
     Run("invariant loop phi", TestInvariantLoopPhi);
     Run("DMA address materialization", TestDmaAddressMaterialization);
@@ -3189,6 +3447,9 @@ int main() {
     Run("conditional buffer materialization", TestConditionalBufferMaterialization);
     Run("conservative buffer reachability", TestConservativeBufferReachability);
     Run("conditional indirect image", TestConditionalIndirectImageMaterialization);
+    Run("nested bindless descriptor phi", [] { TestNestedBindlessDescriptorPhi(false); });
+    Run("nested bindless descriptor phi, other offset",
+        [] { TestNestedBindlessDescriptorPhi(true); });
     Run("shader info and bindings", TestShaderInfoAndBindingLayout);
     Run("image binding ABI", TestImageBindingAbi);
     Run("graphics push constants", TestGraphicsPushConstantLayout);

@@ -135,7 +135,11 @@ IR::U32 Translator::ReadRawU32(const Decoder::Operand& operand) {
 		case Decoder::OperandKind::IntegerInlineConstant:
 		case Decoder::OperandKind::FloatInlineConstant: return IR::U32(IR::Value(operand.value));
 		case Decoder::OperandKind::Null:
+		case Decoder::OperandKind::SharedBase:
+		case Decoder::OperandKind::PrivateBase:
 		case Decoder::OperandKind::PopsExitingWaveId: return IR::U32(IR::Value(0u));
+		case Decoder::OperandKind::SharedLimit:
+		case Decoder::OperandKind::PrivateLimit: return IR::U32(IR::Value(UINT32_MAX));
 		case Decoder::OperandKind::Sgpr:
 			return ir.GetScalarReg(static_cast<IR::ScalarReg>(operand.reg));
 		case Decoder::OperandKind::Vgpr:
@@ -474,6 +478,14 @@ IR::U32 Translator::ReadU32(const Decoder::Operand& operand) {
 }
 
 std::array<IR::U32, 2> Translator::ReadU32Pair(const Decoder::Operand& operand) {
+	if (operand.kind == Decoder::OperandKind::SharedBase ||
+	    operand.kind == Decoder::OperandKind::SharedLimit) {
+		return {ReadRawU32(operand), IR::U32(IR::Value(IR::SharedApertureHigh))};
+	}
+	if (operand.kind == Decoder::OperandKind::PrivateBase ||
+	    operand.kind == Decoder::OperandKind::PrivateLimit) {
+		return {ReadRawU32(operand), IR::U32(IR::Value(IR::PrivateApertureHigh))};
+	}
 	if (operand.kind == Decoder::OperandKind::ExecLo) {
 		return {ir.GetExecLo(), ir.GetExecHi()};
 	}
@@ -886,16 +898,24 @@ void IncludeInstructionVectorRegisters(const Decoder::Instruction& inst, uint32_
 		case Decoder::Opcode::V_CVT_F64_F32:
 		case Decoder::Opcode::V_CVT_F64_U32: include_vector(inst.dst, 2u); break;
 		case Decoder::Opcode::V_FMA_F64: include_vector(inst.src2, 2u); [[fallthrough]];
+		case Decoder::Opcode::V_ADD_F64:
 		case Decoder::Opcode::V_MUL_F64: include_vector(inst.src1, 2u); [[fallthrough]];
 		case Decoder::Opcode::V_RCP_F64: include_vector(inst.dst, 2u); [[fallthrough]];
 		case Decoder::Opcode::V_CVT_F32_F64: include_vector(inst.src0, 2u); break;
+		case Decoder::Opcode::V_CMP_LE_F64:
+		case Decoder::Opcode::V_CMPX_LE_F64:
+		case Decoder::Opcode::V_CMPX_GE_F64:
+			include_vector(inst.src0, 2u);
+			include_vector(inst.src1, 2u);
+			break;
 		default: break;
 	}
 	if (inst.family == Decoder::Family::DS) {
 		switch (inst.opcode) {
 			case Decoder::Opcode::DS_WRITE_B64:
 			case Decoder::Opcode::DS_WRITE_B96:
-			case Decoder::Opcode::DS_WRITE_B128: include_vector(inst.src1, inst.data_dwords); break;
+			case Decoder::Opcode::DS_WRITE_B128:
+			case Decoder::Opcode::DS_ADD_U64: include_vector(inst.src1, inst.data_dwords); break;
 			case Decoder::Opcode::DS_WRITE2_B32:
 			case Decoder::Opcode::DS_WRITE2ST64_B32:
 			case Decoder::Opcode::DS_WRITE2_B64:
@@ -1072,6 +1092,17 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			    total_threads % 64u != 0u) {
 				initial_exec = entry_ir.ULessThan(builtin(IR::StageInputKind::LocalInvocationIndex),
 				                                  IR::U32(IR::Value(total_threads)));
+			}
+		}
+		if (options.stage == ShaderType::Compute &&
+		    options.input_info.compute->dispatch_thread_dimensions) {
+			// Vulkan dispatches whole workgroups. The guest thread-dimension mode starts
+			// padding lanes with EXEC cleared, while allowing later guest mask changes.
+			for (uint32_t axis = 0; axis < 3u; axis++) {
+				initial_exec = entry_ir.LogicalAnd(
+				    initial_exec,
+				    entry_ir.ULessThan(builtin(IR::StageInputKind::GlobalInvocationId, axis),
+				                      builtin(IR::StageInputKind::DispatchThreadCount, axis)));
 			}
 		}
 		entry_ir.SetExec(initial_exec);

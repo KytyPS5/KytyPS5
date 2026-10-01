@@ -1,0 +1,40 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+
+// DISPATCH_INDIRECT with the thread-dimension initiator: the guest's arguments are thread
+// counts, which the host turns into workgroup counts on the GPU instead of reading them back.
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer ThreadCounts {
+    uint threads[3];
+};
+
+layout(std430, binding = 0) writeonly buffer Groups {
+    uint groups[];
+};
+
+layout(push_constant) uniform Push {
+    uvec2 threads_address;
+    uint  local_size_x;
+    uint  local_size_y;
+    uint  local_size_z;
+    uint  output_dword;
+} pc;
+
+uint GroupCount(uint threads, uint local_size) {
+    return threads == 0u ? 0u : (threads - 1u) / max(local_size, 1u) + 1u;
+}
+
+void main() {
+    ThreadCounts counts = ThreadCounts(pc.threads_address);
+    const uvec3 threads = uvec3(counts.threads[0], counts.threads[1], counts.threads[2]);
+    groups[pc.output_dword + 0u] = GroupCount(threads.x, pc.local_size_x);
+    groups[pc.output_dword + 1u] = GroupCount(threads.y, pc.local_size_y);
+    groups[pc.output_dword + 2u] = GroupCount(threads.z, pc.local_size_z);
+    // The dispatch bounds its threads by this copy (see IndirectDispatchGroups::Result).
+    groups[pc.output_dword + 4u] = threads.x;
+    groups[pc.output_dword + 5u] = threads.y;
+    groups[pc.output_dword + 6u] = threads.z;
+}

@@ -430,10 +430,15 @@ void Translator::V_MOVRELD_B32(const Decoder::Instruction& inst) {
 	const auto m0    = ir.BitwiseAnd(ReadU32(ConditionOperand(Decoder::OperandKind::M0)),
 	                                 IR::U32(IR::Value(0xffu)));
 	for (uint32_t index = base; index < current_vector_limit; index++) {
-		const auto reg   = static_cast<IR::VectorReg>(index);
-		const auto match = ir.IEqual(m0, IR::U32(IR::Value(index - base)));
-		const auto write = ir.LogicalAnd(ir.GetExec(), match);
-		ir.SetVectorReg(reg, ir.Select(write, value, ir.GetVectorReg(reg)));
+		const auto reg      = static_cast<IR::VectorReg>(index);
+		const auto match    = ir.IEqual(m0, IR::U32(IR::Value(index - base)));
+		const auto write    = ir.LogicalAnd(ir.GetExec(), match);
+		const auto selected = ir.Select(write, value, ir.GetVectorReg(reg));
+		if (auto* select = IR::Value(selected).TryInstruction();
+		    select != nullptr && select->GetOpcode() == IR::ValueOpcode::SelectU32) {
+			select->SetFlags(IR::MovRelSelectFlags);
+		}
+		ir.SetVectorReg(reg, selected);
 	}
 }
 

@@ -149,7 +149,10 @@ inline constexpr auto EmitFPCmpClass32 = EmitClassMaskF32;
 EMIT_NATIVE(FPAdd32, OpFAdd, F32, uint32_t, uint32_t)
 EMIT_NATIVE(FPSub32, OpFSub, F32, uint32_t, uint32_t)
 EMIT_NATIVE(FPMul32, OpFMul, F32, uint32_t, uint32_t)
+EMIT_NATIVE(FPAdd64, OpFAdd, F64, uint32_t, uint32_t)
 EMIT_NATIVE(FPMul64, OpFMul, F64, uint32_t, uint32_t)
+EMIT_NATIVE(FPOrdLessThanEqual64, OpFOrdLessThanEqual, U1, uint32_t, uint32_t)
+EMIT_NATIVE(FPOrdGreaterThanEqual64, OpFOrdGreaterThanEqual, U1, uint32_t, uint32_t)
 inline constexpr auto EmitFPFma64 =
     EmitGlsl<GLSLstd450Fma, IR::Type::F64, uint32_t, uint32_t, uint32_t>;
 uint32_t              EmitFPRecip64(EmitterState& state, uint32_t arg0);
@@ -186,13 +189,14 @@ inline constexpr auto EmitSendmsg      = EmitVoid;
 inline constexpr auto EmitTtraceData   = EmitVoid;
 inline constexpr auto EmitInstPrefetch = EmitVoid;
 void                  EmitBarrier(EmitterState& state);
-void                  EmitMeshAllocate(ValueEmitContext& ctx, const IR::Inst& inst);
-uint32_t              EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Inst& inst);
-uint32_t              EmitGetTessellationAttribute(ValueEmitContext& ctx, const IR::Inst& inst);
-void                  EmitSetTessellationAttribute(ValueEmitContext& ctx, const IR::Inst& inst);
-uint32_t              EmitGetUserData(EmitterState& state, IR::ScalarReg reg);
-uint32_t              EmitGetBuiltin(ValueEmitContext& ctx, IR::Value kind, IR::Value index);
-uint32_t              EmitUndefU1(EmitterState& state, const IR::Inst& inst);
+void     EmitShaderTrap(EmitterState& state, uint32_t pc, uint32_t code);
+void     EmitMeshAllocate(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t EmitGetTessellationAttribute(ValueEmitContext& ctx, const IR::Inst& inst);
+void     EmitSetTessellationAttribute(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t EmitGetUserData(EmitterState& state, IR::ScalarReg reg);
+uint32_t EmitGetBuiltin(ValueEmitContext& ctx, IR::Value kind, IR::Value index);
+uint32_t EmitUndefU1(EmitterState& state, const IR::Inst& inst);
 inline constexpr auto EmitUndefU8  = EmitUndefU1;
 inline constexpr auto EmitUndefU16 = EmitUndefU1;
 inline constexpr auto EmitUndefU32 = EmitUndefU1;
@@ -211,6 +215,7 @@ uint32_t              EmitGetAttribute(ValueEmitContext& ctx, const IR::Inst& in
 uint32_t              EmitGetInterpolationParameter(ValueEmitContext& ctx, const IR::Inst& inst);
 void                  EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitGetShaderBase(ValueEmitContext& ctx);
+uint32_t              EmitReadClockRealtime64(ValueEmitContext& ctx);
 inline constexpr auto EmitGetSrtResource     = EmitVoid;
 inline constexpr auto EmitGetBufferResource  = EmitGetSrtResource;
 inline constexpr auto EmitGetAddressResource = EmitGetSrtResource;
@@ -258,6 +263,7 @@ inline constexpr auto EmitBufferAtomicUMin32    = EmitAtomic32;
 inline constexpr auto EmitBufferAtomicSMax32    = EmitAtomic32;
 inline constexpr auto EmitBufferAtomicUMax32    = EmitAtomic32;
 inline constexpr auto EmitBufferAtomicAnd32     = EmitAtomic32;
+inline constexpr auto EmitBufferAtomicAnd64     = EmitBufferAtomic64;
 inline constexpr auto EmitBufferAtomicOr32      = EmitAtomic32;
 inline constexpr auto EmitBufferAtomicOr64      = EmitBufferAtomic64;
 inline constexpr auto EmitBufferAtomicXor32     = EmitAtomic32;
@@ -301,7 +307,9 @@ inline constexpr auto EmitImageSampleRaw       = EmitImage;
 inline constexpr auto EmitImageGatherRaw       = EmitImage;
 inline constexpr auto EmitImageAtomicSwap32    = EmitImage;
 inline constexpr auto EmitImageAtomicIAdd32    = EmitImage;
+inline constexpr auto EmitImageAtomicSMin32    = EmitImage;
 inline constexpr auto EmitImageAtomicUMin32    = EmitImage;
+inline constexpr auto EmitImageAtomicSMax32    = EmitImage;
 inline constexpr auto EmitImageAtomicUMax32    = EmitImage;
 inline constexpr auto EmitImageAtomicAnd32     = EmitImage;
 inline constexpr auto EmitImageAtomicOr32      = EmitImage;

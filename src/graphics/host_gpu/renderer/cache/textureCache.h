@@ -12,6 +12,7 @@
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 
+#include <functional>
 #include <map>
 #include <type_traits>
 #include <unordered_map>
@@ -30,6 +31,8 @@ struct TextureCacheTestAccess;
 
 class TextureCache {
 public:
+	// Called before a bindless-pinned image is unregistered.
+	std::function<void(ImageId)> on_bindless_unregister;
 	enum class BindingType : uint8_t { Texture, Storage, RenderTarget, DepthTarget, VideoOut };
 
 	struct ImageDesc {
@@ -61,6 +64,7 @@ public:
 	                                        uint32_t packed_clear);
 	void               InvalidateMemory(uint64_t address, uint64_t size);
 	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
+	// A writable buffer binding over [address, address + size): the shader may write any of it.
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t address, uint64_t size);
 
 	[[nodiscard]] bool IsMeta(uint64_t address);
@@ -172,7 +176,7 @@ private:
 	BufferCache&                                      m_buffer_cache;
 	Common::SlotVector<Image>                         m_slot_images;
 	ImagePageTable                                    m_image_page_table;
-	std::unordered_map<vk::Format, ImageId>           m_null_images;
+	std::map<std::pair<vk::Format, Prospero::ImageType>, ImageId> m_null_images;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
@@ -181,6 +185,11 @@ private:
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;
 	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
 	uint64_t         m_gc_tick                = 0;
+	uint64_t         m_gc_budget_frame        = 0;
+	uint64_t         m_gc_freed_bytes_frame   = 0;
+	size_t           m_gc_freed_images_frame  = 0;
+	uint64_t         m_gc_written_back_bytes_frame = 0;
+	[[nodiscard]] uint64_t LruClock() const noexcept;
 	mutable uint32_t m_image_query_epoch      = 0;
 	bool             m_readback_linear_images = false;
 

@@ -6,6 +6,7 @@
 #include "common/threads.h"
 #include "graphics/host_gpu/vulkanCommon.h" // IWYU pragma: export
 
+#include <atomic>
 #include <map>
 #include <mutex>
 #include <tuple>
@@ -18,6 +19,23 @@ struct VulkanImage;
 
 inline constexpr uint32_t VULKAN_TARGET_API_VERSION = VK_API_VERSION_1_3;
 
+struct DiagnosticCheckpoint {
+	uint32_t op        = 0;
+	uint64_t submit_id = 0;
+	uint32_t arg0      = 0;
+	uint32_t arg1      = 0;
+	uint32_t arg2      = 0;
+	uint32_t arg3      = 0;
+	uint64_t arg4      = 0;
+	uint64_t sequence  = 0;
+};
+
+struct GraphicContext;
+
+[[nodiscard]] const DiagnosticCheckpoint*
+RecordDiagnosticCheckpoint(const DiagnosticCheckpoint& checkpoint);
+void DumpDeviceLossDiagnostics(GraphicContext& graphics);
+
 struct GraphicContext {
 	vk::Instance                       instance                              = nullptr;
 	vk::DebugUtilsMessengerEXT         debug_messenger                       = nullptr;
@@ -27,6 +45,9 @@ struct GraphicContext {
 	vk::Device                         device                                = nullptr;
 	VmaAllocator                       allocator                             = nullptr;
 	bool                               memory_budget_ext_enabled             = false;
+	bool                               diagnostic_checkpoints_enabled        = false;
+	bool                               device_fault_enabled                  = false;
+	bool                               shader_device_clock_enabled           = false;
 	bool                               compute_subgroup_size_control_enabled = false;
 	bool                               sample_rate_shading_enabled           = false;
 	// bool fp64_denorm_preserve = false; // Temporarily disabled.
@@ -34,6 +55,13 @@ struct GraphicContext {
 	bool                               provoking_vertex_last_enabled         = false;
 	bool                               supports_block_texel_view              = false;
 	bool                                      mesh_shader_enabled                   = false;
+	// Descriptor indexing for bindless images: runtime arrays indexed non-uniformly, partially
+	// bound and updated after bind.
+	bool                               bindless_enabled                      = false;
+	uint32_t                           bindless_max_sampled_images           = 0;
+	uint32_t                           bindless_max_samplers                 = 0;
+	vk::DescriptorSetLayout            bindless_layout                       = nullptr;
+	vk::DescriptorSet                  bindless_set                          = nullptr;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
 	uint32_t                           subgroup_size                         = 0;
 	uint32_t                           min_subgroup_size                     = 0;
@@ -43,6 +71,7 @@ struct GraphicContext {
 	Common::Mutex                      queue_mutex;
 	uint32_t                           queue_family = static_cast<uint32_t>(-1);
 	vk::Queue                          queue        = nullptr;
+	std::atomic<uint64_t>              presented_frames {0};
 
 	[[nodiscard]] const vk::PhysicalDeviceProperties& GetPhysicalDeviceProperties() const {
 		return physical_device_properties;

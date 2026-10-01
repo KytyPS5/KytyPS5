@@ -1,3 +1,4 @@
+#include "graphics/shader/recompiler/frontend/translate/Translator.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/Tessellation.h"
 
@@ -23,6 +24,10 @@
 #include <chrono>
 #include <fmt/format.h>
 #include <map>
+#include <climits>
+#include <cstdlib>
+#include <optional>
+#include <set>
 #include <span>
 #include <utility>
 
@@ -480,9 +485,263 @@ Decoder::Program DecodeFusedProgram(std::span<const uint32_t> front, std::span<c
 	return result;
 }
 
+// Research: S_SWAPPC_B64 through a pointer the dispatch passes in user data (a BVH builder calls
+// a per-geometry index-fetch function this way). Each call site gets its own copy of the callee,
+// appended after the program: the call becomes a branch to the copy, which first sets sD to the
+// return address as the call would, and each of the callee's returns (S_SETPC_B64 sD) becomes a
+// branch back to the instruction after the call. Only callees without further calls, S_GETPC_B64
+// or S_ENDPGM are inlined; anything else leaves the call unsupported, as before.
+namespace Sub {
+constexpr uint32_t Sop1Encoding   = 0x17du;
+constexpr uint32_t SoppEncoding   = 0x17fu;
+constexpr uint32_t Mov32          = 0x03u;
+constexpr uint32_t GetPc          = 0x1fu;
+constexpr uint32_t SetPc          = 0x20u;
+constexpr uint32_t SwapPc         = 0x21u;
+constexpr uint32_t EndPgm         = 0x01u;
+constexpr uint32_t NullSgpr       = 125u; // SGPR_NULL: s_swappc_b64 null, sN is a plain jump
+constexpr uint32_t MaxCalleeWords = 16384;
+constexpr uint32_t MaxScanBack    = 64;
+
+bool IsSop1(uint32_t word, uint32_t op) {
+	return (word >> 23u) == Sop1Encoding && ((word >> 8u) & 0xffu) == op;
+}
+bool IsSopp(uint32_t word, uint32_t op) {
+	return (word >> 23u) == SoppEncoding && ((word >> 16u) & 0x7fu) == op;
+}
+uint32_t Sop1Dst(uint32_t word) {
+	return (word >> 16u) & 0x7fu;
+}
+uint32_t Sop1Src(uint32_t word) {
+	return word & 0xffu;
+}
+bool IsCall(uint32_t word) {
+	return IsSop1(word, SwapPc) && Sop1Dst(word) != NullSgpr;
+}
+// A return through `reg`: s_setpc_b64 reg, or s_swappc_b64 null, reg.
+bool IsReturn(uint32_t word, uint32_t reg) {
+	return Sop1Src(word) == reg &&
+	       (IsSop1(word, SetPc) || (IsSop1(word, SwapPc) && Sop1Dst(word) == NullSgpr));
+}
+bool IsJump(uint32_t word) {
+	return IsSop1(word, SetPc) || (IsSop1(word, SwapPc) && Sop1Dst(word) == NullSgpr);
+}
+uint32_t Sop1Word(uint32_t op, uint32_t dst, uint32_t src) {
+	return (Sop1Encoding << 23u) | (dst << 16u) | (op << 8u) | src;
+}
+std::optional<uint32_t> BranchWord(uint32_t from_pc, uint32_t to_pc) {
+	const auto delta = (static_cast<int64_t>(to_pc) - static_cast<int64_t>(from_pc) - 4) / 4;
+	if (delta < INT16_MIN || delta > INT16_MAX) {
+		return std::nullopt;
+	}
+	return 0xbf820000u | (static_cast<uint32_t>(delta) & 0xffffu);
+}
+
+// The user-data dword a straight-line S_MOV_B32 copied into `reg` before instruction `index`.
+std::optional<uint32_t> UserDataSource(const Decoder::Program& program,
+                                       std::span<const uint32_t> code,
+                                       const std::set<uint32_t>& targets, size_t index,
+                                       uint32_t reg, const CompileOptions& options) {
+	const auto writes = [&](const Decoder::Operand& operand) {
+		return operand.kind == Decoder::OperandKind::Sgpr &&
+		       (operand.reg == reg || operand.reg + 1u == reg);
+	};
+	for (size_t i = index; i-- > 0 && index - i <= MaxScanBack;) {
+		const auto& inst = program.instructions[i];
+		if (Decoder::IsDirectBranch(inst.opcode) || inst.opcode == Decoder::Opcode::S_ENDPGM) {
+			return std::nullopt;
+		}
+		const auto word = code[inst.pc / 4u];
+		if (IsCall(word) && (Sop1Dst(word) == reg || Sop1Dst(word) + 1u == reg)) {
+			return std::nullopt;
+		}
+		if (inst.opcode == Decoder::Opcode::S_MOV_B32 && inst.dst.kind == Decoder::OperandKind::Sgpr &&
+		    inst.dst.reg == reg) {
+			if (inst.src0.kind != Decoder::OperandKind::Sgpr ||
+			    inst.src0.reg < options.user_data_base ||
+			    inst.src0.reg - options.user_data_base >= options.user_data.size()) {
+				return std::nullopt;
+			}
+			return inst.src0.reg - options.user_data_base;
+		}
+		if (writes(inst.dst) || writes(inst.dst2) || targets.contains(inst.pc)) {
+			return std::nullopt;
+		}
+	}
+	return std::nullopt;
+}
+
+// Words [0, end) of the callee up to its last top-level return, and the word index of every
+// return; nullopt when the callee cannot be inlined.
+std::optional<std::pair<uint32_t, std::vector<uint32_t>>> CalleeExtent(
+    std::span<const uint32_t> words, uint32_t return_reg) {
+	uint32_t              furthest_target = 0;
+	std::vector<uint32_t> returns;
+	for (uint32_t index = 0; index < words.size();) {
+		const auto word = words[index];
+		if (IsCall(word) || IsSop1(word, GetPc) || IsSopp(word, EndPgm) ||
+		    (IsJump(word) && !IsReturn(word, return_reg))) {
+			return std::nullopt;
+		}
+		Decoder::Instruction inst;
+		Decoder::DecodeInstruction(words, index, inst);
+		if (index + inst.word_count > words.size()) {
+			return std::nullopt;
+		}
+		if (Decoder::IsDirectBranch(inst.opcode)) {
+			furthest_target = std::max(furthest_target, inst.branch_target);
+		}
+		if (IsReturn(word, return_reg)) {
+			returns.push_back(index);
+			if (inst.pc >= furthest_target) {
+				return std::pair {index + 1u, std::move(returns)};
+			}
+		}
+		index += inst.word_count;
+	}
+	return std::nullopt;
+}
+
+} // namespace Sub
+
+// The program with one copy of the callee in place of every S_SWAPPC_B64 (when all of them can
+// be inlined). Block order follows the PC, so each copy sits where its call was; the program's
+// direct branches are re-encoded for the moved code.
+bool InlineSubroutineCalls(std::span<const uint32_t> code, const Decoder::Program& decoded,
+                           const CompileOptions& options, std::vector<uint32_t>& joined,
+                           std::vector<uint32_t>& call_user_data) {
+	using namespace Sub;
+	std::vector<size_t> sites;
+	std::set<uint32_t>  targets;
+	for (size_t i = 0; i < decoded.instructions.size(); i++) {
+		const auto& inst = decoded.instructions[i];
+		const auto  word = code[inst.pc / 4u];
+		if (IsCall(word)) {
+			sites.push_back(i);
+		}
+		if (Decoder::IsDirectBranch(inst.opcode)) {
+			targets.insert(inst.branch_target);
+		}
+	}
+	if (sites.empty() || !options.read_code) {
+		return false;
+	}
+	// Moving code is safe only when nothing in the program depends on absolute code addresses.
+	for (const auto& inst: decoded.instructions) {
+		const auto word = code[inst.pc / 4u];
+		if (inst.opcode == Decoder::Opcode::S_GETPC_B64 || IsSop1(word, GetPc) || IsJump(word) ||
+		    ((word >> 28u) == 0xbu && ((word >> 23u) & 0x1fu) == 0x16u /* s_call_b64 */)) {
+			LOGF("%s calls at 0x%08x: the program uses code addresses; not inlined\n",
+			     GetDumpLabel(options), inst.pc);
+			return false;
+		}
+	}
+
+	struct Copy {
+		uint32_t              dst = 0;
+		std::span<const uint32_t> body;
+		std::vector<uint32_t> returns;
+	};
+	std::map<uint64_t, std::vector<uint32_t>> callees;
+	std::map<size_t, Copy>                    copies;
+	for (const auto site: sites) {
+		const auto& call = decoded.instructions[site];
+		const auto  word = code[call.pc / 4u];
+		const auto  dst  = Sop1Dst(word);
+		const auto  src  = Sop1Src(word);
+		const auto  lo   = UserDataSource(decoded, code, targets, site, src, options);
+		const auto  hi   = UserDataSource(decoded, code, targets, site, src + 1u, options);
+		if (src >= 104u || dst >= 104u || !lo || !hi) {
+			LOGF("%s call at pc 0x%08x: target is not a user-data pointer\n", GetDumpLabel(options),
+			     call.pc);
+			return false;
+		}
+		const auto address =
+		    (static_cast<uint64_t>(options.user_data[*hi]) << 32u) | options.user_data[*lo];
+		auto found = callees.find(address);
+		if (found == callees.end()) {
+			auto words = options.read_code(address);
+			if (words.size() > MaxCalleeWords) {
+				words.resize(MaxCalleeWords);
+			}
+			found = callees.emplace(address, std::move(words)).first;
+		}
+		auto extent = CalleeExtent(found->second, dst);
+		if (!extent) {
+			LOGF("%s call at pc 0x%08x: callee 0x%016" PRIx64 " cannot be inlined\n",
+			     GetDumpLabel(options), call.pc, address);
+			return false;
+		}
+		const auto body = std::span<const uint32_t>(found->second).first(extent->first);
+		copies[site] = {dst, body, std::move(extent->second)};
+		for (const auto index: {*lo, *hi}) {
+			if (std::ranges::find(call_user_data, index) == call_user_data.end()) {
+				call_user_data.push_back(index);
+			}
+		}
+		LOGF("%s inlined call at pc 0x%08x: callee 0x%016" PRIx64 " (%u words)\n",
+		     GetDumpLabel(options), call.pc, address, extent->first);
+	}
+
+	const auto&           last      = decoded.instructions.back();
+	const auto            end_words = last.pc / 4u + last.word_count;
+	std::vector<uint32_t> moved(end_words + 1u, UINT32_MAX); // old word index -> new byte pc
+	std::vector<std::pair<uint32_t, uint32_t>> fixups;       // (new word index, old target pc)
+	joined.clear();
+	for (size_t i = 0; i < decoded.instructions.size(); i++) {
+		const auto& inst  = decoded.instructions[i];
+		moved[inst.pc / 4u] = static_cast<uint32_t>(joined.size() * 4u);
+		if (const auto copy = copies.find(i); copy != copies.end()) {
+			const auto& c = copy->second;
+			joined.push_back(Sop1Word(Mov32, c.dst, 0xffu)); // s_mov_b32 sD, literal
+			const auto literal = joined.size();
+			joined.push_back(0);
+			joined.push_back(Sop1Word(Mov32, c.dst + 1u, 0x80u)); // s_mov_b32 sD+1, 0
+			const auto body = static_cast<uint32_t>(joined.size());
+			joined.insert(joined.end(), c.body.begin(), c.body.end());
+			const auto after = static_cast<uint32_t>(joined.size() * 4u);
+			joined[literal]  = after; // the return address the call would have written
+			for (const auto ret: c.returns) {
+				const auto back = BranchWord((body + ret) * 4u, after);
+				if (!back) {
+					return false;
+				}
+				joined[body + ret] = *back;
+			}
+			continue;
+		}
+		if (Decoder::IsDirectBranch(inst.opcode)) {
+			fixups.emplace_back(static_cast<uint32_t>(joined.size()), inst.branch_target);
+		}
+		joined.insert(joined.end(), code.begin() + inst.pc / 4u,
+		              code.begin() + inst.pc / 4u + inst.word_count);
+	}
+	moved[end_words] = static_cast<uint32_t>(joined.size() * 4u);
+	for (const auto& [index, target]: fixups) {
+		if (target / 4u >= moved.size() || moved[target / 4u] == UINT32_MAX) {
+			return false;
+		}
+		const auto branch = BranchWord(index * 4u, moved[target / 4u]);
+		if (!branch) {
+			return false;
+		}
+		joined[index] = (joined[index] & 0xffff0000u) | (*branch & 0xffffu);
+	}
+	return true;
+}
+
 } // namespace
 
+// Research: KYTY_TRANSLATE_BVH=1 decodes through IMAGE_BVH_INTERSECT_RAY and translates it in
+// software (frontend/translate/Bvh.cpp) instead of skipping the dispatch. Opt-in: a wrong result
+// can leave a guest traversal loop spinning on the GPU.
+static bool TranslateBvh() {
+	static const bool enabled = std::getenv("KYTY_TRANSLATE_BVH") != nullptr;
+	return enabled;
+}
+
 TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOptions& options) {
+	const Frontend::TranslationNonFatalScope non_fatal_scope(options.non_fatal);
 	if (code.empty()) {
 		EXIT("shader recompiler input is empty\n");
 	}
@@ -507,6 +766,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 
 	Decoder::Program decoded;
 	std::vector<uint32_t> joined_code;
+	std::vector<uint32_t> call_target_user_data;
 	if (!options.back_code.empty()) {
 		decoded = DecodeFusedProgram(code, options.back_code, joined_code);
 	} else if (options.stage == ShaderType::Local) {
@@ -516,16 +776,23 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		handoff.opcode    = Decoder::Opcode::S_ENDPGM;
 		handoff.src_count = 0;
 	} else {
-		Decoder::DecodeProgram(code, decoded);
+		Decoder::DecodeProgram(code, decoded, TranslateBvh());
+		if (InlineSubroutineCalls(code, decoded, options, joined_code, call_target_user_data)) {
+			Decoder::DecodeProgram(joined_code, decoded, TranslateBvh());
+		}
 	}
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " decode instructions=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(decoded.instructions.size()), phase_ms());
 
+	if (decoded.has_bvh && !decoded.bvh_truncated) {
+		LOGF("%s BVH intersection translated in software: hash=0x%016" PRIx64 "\n",
+		     GetDumpLabel(options), options.shader_hash);
+	}
 	// Temporary workaround for games that compile ray-tracing shaders before
 	// the player can select a mode without ray tracing.
-	if (options.stage == ShaderType::Compute && decoded.has_bvh) {
+	if (options.stage == ShaderType::Compute && decoded.bvh_truncated) {
 		static std::atomic_flag warned = ATOMIC_FLAG_INIT;
 		if (!warned.test_and_set(std::memory_order_relaxed)) {
 			const auto& bvh = decoded.instructions.back();
@@ -550,6 +817,13 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	auto native_cfg = CFG::BuildGraph(decoded);
 	CFG::Graph structured_cfg;
 	auto* selected_cfg = &native_cfg;
+	if (options.non_fatal && native_cfg.unsupported && !native_cfg.irreducible) {
+		LOGF("%s gave up hash=0x%016" PRIx64 ": %s\n", GetDumpLabel(options), options.shader_hash,
+		     native_cfg.unsupported_reason.c_str());
+		TranslateResult unsupported_result;
+		unsupported_result.unsupported = true;
+		return unsupported_result;
+	}
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " CFG BuildGraph blocks=%" PRIu64
 	     " loops=%" PRIu64 " back_edges=%" PRIu64 " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
@@ -604,6 +878,13 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
 	auto ir = Frontend::TranslateProgram(decoded, cfg, translate_options);
+	if (options.non_fatal && Frontend::TranslationUnsupported()) {
+		LOGF("%s gave up hash=0x%016" PRIx64 ": no IR translation for an instruction\n",
+		     GetDumpLabel(options), options.shader_hash);
+		TranslateResult unsupported_result;
+		unsupported_result.unsupported = true;
+		return unsupported_result;
+	}
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram blocks=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
@@ -613,6 +894,14 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	IR::ResolveControlFlowIdentities(ir);
 	IR::RemoveIdentities(ir.blocks);
 	IR::EliminateDeadCode(ir.blocks);
+	if (const auto folded = IR::SimplifyBoundedLoopRegisters(ir); folded != 0) {
+		LOGF("%s bounded-loop comparisons: hash=0x%016" PRIx64 " folded=%u\n",
+		     GetDumpLabel(options), options.shader_hash, folded);
+		IR::ConstantPropagationPass(ir.blocks);
+		IR::ResolveControlFlowIdentities(ir);
+		IR::RemoveIdentities(ir.blocks);
+		IR::EliminateDeadCode(ir.blocks);
+	}
 	const auto read_lane_stats = IR::EliminateReadLane(ir, ir.wave_size);
 	if (read_lane_stats.rewritten_reads != 0) {
 		LOGF("%s read-lane elimination: reads=%" PRIu32 "\n", GetDumpLabel(options),
@@ -622,7 +911,24 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		IR::RemoveIdentities(ir.blocks);
 		IR::EliminateDeadCode(ir.blocks);
 	}
-	LowerTessellationMemory(ir, options);
+	if (const auto removed = IR::SimplifyLocalAddressStores(ir); removed != 0) {
+		LOGF("%s local-address proof: hash=0x%016" PRIx64 " removed_global_stores=%u\n",
+		     GetDumpLabel(options), options.shader_hash, removed);
+		IR::EliminateDeadCode(ir.blocks);
+	}
+	if (!LowerTessellationMemory(ir, options)) {
+		if (!options.non_fatal) {
+			EXIT("%s failed hash=0x%016" PRIx64 ": unsupported tessellation memory shape\n",
+			     GetDumpLabel(options), options.shader_hash);
+		}
+		TranslateResult unsupported_result;
+		unsupported_result.unsupported = true;
+		return unsupported_result;
+	}
+	if (IR::RemoveRedundantPhiWebs(ir.blocks)) {
+		IR::RemoveIdentities(ir.blocks);
+		IR::EliminateDeadCode(ir.blocks);
+	}
 	std::string cfg_dump;
 	if (options.dump_ir) {
 		cfg_dump = CFG::GraphToString(cfg);
@@ -631,10 +937,35 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 			     MakeIrDump(cfg_dump, ir).c_str());
 		}
 	}
-	IR::TrackResources(ir, decoded, native_cfg);
+	ir.bindless_images = options.bindless_images;
+	if (!IR::TrackResources(ir, decoded, native_cfg) && options.non_fatal) {
+		LOGF("%s gave up hash=0x%016" PRIx64 ": resource tracking failed\n", GetDumpLabel(options),
+		     options.shader_hash);
+		TranslateResult unsupported_result;
+		unsupported_result.unsupported = true;
+		unsupported_result.decoded_dump = std::move(decoded_dump);
+		return unsupported_result;
+	}
 	IR::EliminateDeadCode(ir.blocks);
+	// A subgroup larger than a host mesh workgroup runs in passes, cut at its barriers.
+	if (options.stage == ShaderType::Mesh && options.input_info.vertex != nullptr &&
+	    options.input_info.vertex->mesh.passes > 1u) {
+		if (const auto* reason = Spirv::MeshPassesUnsupported(ir); reason != nullptr) {
+			if (!options.non_fatal) {
+				EXIT("%s failed hash=0x%016" PRIx64 ": mesh passes: %s\n",
+				     GetDumpLabel(options), options.shader_hash, reason);
+			}
+			LOGF("%s gave up hash=0x%016" PRIx64 ": %u mesh passes, but %s\n",
+			     GetDumpLabel(options), options.shader_hash, options.input_info.vertex->mesh.passes,
+			     reason);
+			TranslateResult unsupported_result;
+			unsupported_result.unsupported = true;
+			return unsupported_result;
+		}
+	}
 	TranslateResult result;
-	result.program = std::move(ir);
+	result.program               = std::move(ir);
+	result.call_target_user_data = std::move(call_target_user_data);
 	if (options.dump_ir) {
 		result.decoded_dump = std::move(decoded_dump);
 		result.cfg_dump     = std::move(cfg_dump);
@@ -682,6 +1013,7 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	IR::EliminateDeadCode(ir.blocks);
 
 	IR::CollectShaderInfo(ir, options.input_info);
+	ir.info.watchdog_reports = ir.bindless_images && ir.info.uses_dma;
 	IR::AllocateBindings(ir, push_data_start_dword);
 	std::string ir_dump;
 	if (options.dump_ir) {

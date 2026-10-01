@@ -70,6 +70,10 @@ constexpr uint32_t ImageSampleAddressComponents(uint32_t flags, ImageDimension d
 	if ((flags & ImageSampleFlagLod) != 0) {
 		components++;
 	}
+	// The _CL clamp is the last body component (RDNA 2 ISA 8.2.5, "Image Opcodes with Sampler").
+	if ((flags & ImageSampleFlagLodClamp) != 0) {
+		components++;
+	}
 	if ((flags & ImageSampleFlagDerivative) != 0) {
 		components += ImageGradientComponents(dimension) * 2u;
 	}
@@ -193,7 +197,9 @@ constexpr MimgGatherInfo MIMG_GATHER_OPCODE_LIST[] = {
 constexpr Detail::OpcodeMap MIMG_ATOMIC_OPCODE_LIST[] = {
     {0x0fu, Opcode::IMAGE_ATOMIC_SWAP},
     {0x11u, Opcode::IMAGE_ATOMIC_ADD},
+    {0x14u, Opcode::IMAGE_ATOMIC_SMIN},
     {0x15u, Opcode::IMAGE_ATOMIC_UMIN},
+    {0x16u, Opcode::IMAGE_ATOMIC_SMAX},
     {0x17u, Opcode::IMAGE_ATOMIC_UMAX},
     {0x18u, Opcode::IMAGE_ATOMIC_AND},
     {0x19u, Opcode::IMAGE_ATOMIC_OR},
@@ -225,6 +231,7 @@ Opcode DecodeMimgOpcode(uint32_t opcode, const MimgSampleInfo* sample, const Mim
 		case 0x09u: return Opcode::IMAGE_STORE_MIP;
 		case 0x0eu: return Opcode::IMAGE_GET_RESINFO;
 		case 0x60u: return Opcode::IMAGE_GET_LOD;
+		case 0xe6u: return Opcode::IMAGE_BVH_INTERSECT_RAY;
 		default: return Opcode::UNSUPPORTED;
 	}
 }
@@ -347,6 +354,18 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	inst.image_address_components =
 	    DecodeMimgAddressComponents(opcode, dimension, sample, gather, atomic);
 	SetRawWords(inst, code, word_index, word_count);
+	if (opcode == 0xe6u) {
+		// BVH addresses are raw DWORDs: only direction and inverse direction use A16.
+		inst.image_address_components = a16 ? 8u : 11u;
+		const uint32_t expected_nsa   = (inst.image_address_components + 2u) / 4u;
+		if (inst.dmask != 0xfu || d16 || !r128 || (word0 & (1u << 12u)) == 0u ||
+		    ((word0 >> 3u) & 7u) != 0u || (word0 & (3u << 16u)) != 0u || ssamp != 0u ||
+		    (nsa_dwords != 0u && nsa_dwords != expected_nsa) ||
+		    (nsa_dwords == 0u && vaddr + inst.image_address_components > 256u) || vdata > 252u) {
+			SetUnsupported(inst, Family::MIMG, opcode, "invalid BVH instruction fields");
+			return;
+		}
+	}
 
 	if (inst.opcode == Opcode::UNSUPPORTED) {
 		SetUnsupported(inst, Family::MIMG, opcode, "MIMG opcode is not implemented");

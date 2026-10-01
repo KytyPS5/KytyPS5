@@ -891,19 +891,53 @@ bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return TryReadBacking(vaddr, data, size);
 }
 
-uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
+const uint8_t* FindGpuCleanBacking(uint64_t vaddr, uint64_t size) {
+	if (g_guest_address_space == nullptr) {
+		return nullptr;
+	}
+	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
+		if (!Graphics::GuestGpu::IsGpuThread() ||
+		    GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size) ||
+		    GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size)) {
+			return nullptr;
+		}
+	}
+	return g_guest_address_space->FindBacking(vaddr, size);
+}
+
+bool TryReadCleanFaultingBytes(uint64_t fault_vaddr, uint64_t vaddr, void* data, uint64_t size) {
+	return g_gpu_resources != nullptr &&
+	       g_gpu_resources->CanServeCleanRead(fault_vaddr, vaddr, size) &&
+	       TryReadBacking(vaddr, data, size);
+}
+
+uint64_t TryClampRangeSize(uint64_t vaddr, uint64_t size) {
 	EXIT_IF(g_virtual_ranges == nullptr);
 
 	const auto clamped_size = g_virtual_ranges->ClampRangeSize(vaddr, size);
+	if (clamped_size != 0 && clamped_size != size) {
+		LOGF("Memory: clamped buffer range addr=0x%016" PRIx64 " size=0x%016" PRIx64
+		     " to 0x%016" PRIx64 "\n",
+		     vaddr, size, clamped_size);
+	}
+	return clamped_size;
+}
+
+bool IsCommittedRange(uint64_t vaddr, uint64_t size) {
+	// No guest memory map (unit tests that drive the libraries on host memory): nothing to check.
+	if (g_virtual_ranges == nullptr) {
+		return true;
+	}
+
+	return size == 0 || g_virtual_ranges->ClampRangeSize(vaddr, size) == size;
+}
+
+uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
+	const auto clamped_size = TryClampRangeSize(vaddr, size);
 	if (clamped_size == 0) {
 		EXIT("Memory: attempted to access invalid address 0x%016" PRIx64 " with size 0x%016" PRIx64
 		     "\n",
 		     vaddr, size);
-	}
-	if (clamped_size != size) {
-		LOGF("Memory: clamped buffer range addr=0x%016" PRIx64 " size=0x%016" PRIx64
-		     " to 0x%016" PRIx64 "\n",
-		     vaddr, size, clamped_size);
 	}
 	return clamped_size;
 }

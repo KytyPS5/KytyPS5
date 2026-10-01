@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/cache/samplerCache.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/pipeline/bindlessTable.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptorHeap.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "kernel/eventQueue.h"
@@ -46,9 +47,14 @@ public:
 	SamplerCache&       GetSamplerCache() { return m_sampler_cache; }
 	BufferCache&        GetBufferCache() { return m_buffer_cache; }
 	TextureCache&       GetTextureCache() { return m_texture_cache; }
+	BindlessTable&      GetBindlessTable() { return m_bindless_table; }
 	RenderExecutor&     GetRenderExecutor() { return m_render_executor; }
 
 	[[nodiscard]] bool HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept;
+	// Any thread: a read of these bytes faulted on a page protected because the GPU wrote to it,
+	// but none of them is GPU-written, so guest memory already holds their value.
+	[[nodiscard]] bool CanServeCleanRead(uint64_t fault_vaddr, uint64_t vaddr,
+	                                     uint64_t size) const noexcept;
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	void               MapMemory(uint64_t vaddr, uint64_t size);
@@ -76,11 +82,14 @@ private:
 	PageManager               m_page_manager;
 	BufferCache               m_buffer_cache;
 	TextureCache              m_texture_cache;
+	BindlessTable             m_bindless_table;
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;
 	std::unique_ptr<GuestGpu> m_gpu;
 	VideoOut::VideoOutDriver* m_video_out = nullptr;
 	bool                      m_fault_process_pending = false;
+	uint64_t                  m_bda_synced_epoch      = 0;
+	uint64_t                  m_bda_synced_submission = 0;
 
 	Common::Mutex                        m_interrupt_mutex;
 	std::vector<InterruptEqRegistration> m_interrupt_eqs;

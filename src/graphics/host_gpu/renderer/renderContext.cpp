@@ -15,8 +15,12 @@ RenderContext::RenderContext(GraphicContext& graphics)
       m_descriptor_heap(graphics, m_command_scheduler.GetMasterSemaphore()),
       m_pipeline_cache(graphics), m_sampler_cache(graphics),
       m_buffer_cache(graphics, m_command_scheduler, m_page_manager, m_texture_cache),
-      m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache) {
+      m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache),
+      m_bindless_table(graphics, m_command_scheduler) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	m_texture_cache.on_bindless_unregister = [this](ImageId id) {
+		m_bindless_table.OnImageUnregistered(id);
+	};
 }
 
 RenderContext::~RenderContext() {
@@ -70,6 +74,12 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	return true;
 }
 
+bool RenderContext::CanServeCleanRead(uint64_t fault_vaddr, uint64_t vaddr,
+                                      uint64_t size) const noexcept {
+	return IsMapped(vaddr, size) && m_page_manager.IsReadWatched(fault_vaddr) &&
+	       m_buffer_cache.IsCleanForConcurrentRead(vaddr, size);
+}
+
 bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (!IsMapped(vaddr, size)) {
 		return false;
@@ -119,10 +129,24 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 }
 
 void RenderContext::PrepareBda() {
-	std::shared_lock lock(m_mapped_ranges_mutex);
-	m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
-		m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
-	});
+	const auto epoch = g_cpu_dirty_epoch.load(std::memory_order_acquire);
+	if (epoch != m_bda_synced_epoch) {
+		const auto submission = g_guest_submission_seq.load(std::memory_order_relaxed);
+		if (submission == m_bda_synced_submission) {
+			m_fault_process_pending = true;
+			return;
+		}
+		m_bda_synced_submission = submission;
+	}
+	if (epoch != m_bda_synced_epoch) {
+		// The guest writes somewhere nearly all the time, so the epoch moves between most
+		// dispatches; walk only the regions holding CPU-dirty pages, not every buffer.
+		std::shared_lock lock(m_mapped_ranges_mutex);
+		m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
+			m_buffer_cache.SynchronizeCpuDirtyBuffersInRange(start, end - start);
+		});
+		m_bda_synced_epoch = epoch;
+	}
 	m_fault_process_pending = true;
 }
 

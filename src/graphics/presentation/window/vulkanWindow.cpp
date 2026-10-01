@@ -19,6 +19,7 @@
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
 #include "graphics/presentation/window/windowInternal.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "kernel/memory.h"
 #include "libs/controller.h"
 #include "loader/systemContent.h"
@@ -80,10 +81,14 @@ static bool HasLayer(const std::vector<vk::LayerProperties>& layers, const char*
 	                   [name](const auto& layer) { return strcmp(layer.layerName, name) == 0; });
 }
 
-static void GetSurfaceCapabilities(vk::PhysicalDevice physical_device, vk::SurfaceKHR surface,
-                                   SurfaceCapabilities& r) {
-	RequireVulkanSuccess(physical_device.getSurfaceCapabilitiesKHR(surface, &r.capabilities),
-	                     "vkGetPhysicalDeviceSurfaceCapabilitiesKHR");
+static bool TryGetSurfaceCapabilities(vk::PhysicalDevice physical_device, vk::SurfaceKHR surface,
+                                      SurfaceCapabilities& r) {
+	const auto result = physical_device.getSurfaceCapabilitiesKHR(surface, &r.capabilities);
+	if (result != vk::Result::eSuccess) {
+		LOGF("vkGetPhysicalDeviceSurfaceCapabilitiesKHR failed: %s (%d)\n",
+		     vk::to_string(result).c_str(), static_cast<int>(result));
+		return false;
+	}
 
 	r.formats = EnumerateVulkan<vk::SurfaceFormatKHR>( // @suppress("Ambiguous problem")
 	    "vkGetPhysicalDeviceSurfaceFormatsKHR", [&](uint32_t* count, vk::SurfaceFormatKHR* values) {
@@ -97,6 +102,14 @@ static void GetSurfaceCapabilities(vk::PhysicalDevice physical_device, vk::Surfa
 		    return physical_device.getSurfacePresentModesKHR(surface, count, values);
 	    });
 	EXIT_NOT_IMPLEMENTED(r.present_modes.empty());
+	return true;
+}
+
+static void GetSurfaceCapabilities(vk::PhysicalDevice physical_device, vk::SurfaceKHR surface,
+                                   SurfaceCapabilities& r) {
+	if (!TryGetSurfaceCapabilities(physical_device, surface, r)) {
+		EXIT("vkGetPhysicalDeviceSurfaceCapabilitiesKHR failed\n");
+	}
 }
 
 static bool CheckFormat(vk::PhysicalDevice device, vk::Format format, bool tile,
@@ -322,9 +335,11 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		}
 
 		SurfaceCapabilities candidate_capabilities;
+		if (!skip_device && !TryGetSurfaceCapabilities(device, surface, candidate_capabilities)) {
+			LOGF("Surface capabilities unavailable, skipping device\n");
+			skip_device = true;
+		}
 		if (!skip_device) {
-			GetSurfaceCapabilities(device, surface, candidate_capabilities);
-
 			if (!(candidate_capabilities.capabilities.supportedUsageFlags &
 			      vk::ImageUsageFlagBits::eTransferDst)) {
 				reject("Surface cannot be destination of blit");
@@ -478,11 +493,26 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		    workgroup_layout.workgroupMemoryExplicitLayout != VK_FALSE));
 	}
 	graphics.mesh_shader_enabled = mesh_extension && supported_mesh.meshShader;
+	graphics.bindless_enabled =
+	    supported_features12.runtimeDescriptorArray == VK_TRUE &&
+	    supported_features12.shaderSampledImageArrayNonUniformIndexing == VK_TRUE &&
+	    supported_features12.descriptorBindingPartiallyBound == VK_TRUE &&
+	    supported_features12.descriptorBindingSampledImageUpdateAfterBind == VK_TRUE &&
+	    supported_features12.descriptorBindingUpdateUnusedWhilePending == VK_TRUE;
+	if (graphics.bindless_enabled) {
+		features12.runtimeDescriptorArray                       = VK_TRUE;
+		features12.shaderSampledImageArrayNonUniformIndexing    = VK_TRUE;
+		features12.descriptorBindingPartiallyBound              = VK_TRUE;
+		features12.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
+		features12.descriptorBindingUpdateUnusedWhilePending    = VK_TRUE;
+	}
 
 	vk::PhysicalDeviceSubgroupSizeControlProperties subgroup_size_control {};
 
+	vk::PhysicalDeviceVulkan12Properties properties12 {};
+	properties12.pNext = &subgroup_size_control;
 	vk::PhysicalDeviceVulkan11Properties properties11 {};
-	properties11.pNext = &subgroup_size_control;
+	properties11.pNext = &properties12;
 
 	vk::PhysicalDeviceFloatControlsProperties float_controls {};
 	float_controls.pNext = &properties11;
@@ -494,6 +524,16 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	}
 	physical_device.getProperties2(&properties2);
 
+	graphics.bindless_max_sampled_images =
+	    graphics.bindless_enabled ? properties12.maxDescriptorSetUpdateAfterBindSampledImages : 0u;
+	graphics.bindless_max_samplers =
+	    graphics.bindless_enabled
+	        ? std::min(properties12.maxDescriptorSetUpdateAfterBindSamplers,
+	                   properties12.maxPerStageDescriptorUpdateAfterBindSamplers)
+	        : 0u;
+	LOGF("Vulkan bindless images: %s (update-after-bind sampled images %u)\n",
+	     graphics.bindless_enabled ? "enabled" : "unsupported",
+	     graphics.bindless_max_sampled_images);
 	graphics.subgroup_size                 = properties11.subgroupSize;
 	graphics.min_subgroup_size             = subgroup_size_control.minSubgroupSize;
 	graphics.max_subgroup_size             = subgroup_size_control.maxSubgroupSize;
@@ -537,6 +577,11 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 #endif
 	device_features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
 	device_features.shaderImageGatherExtended            = VK_TRUE;
+	// Optional: IMAGE_SAMPLE*_CL clamps become the MinLod image operand.
+	const bool shader_resource_min_lod =
+	    supported_features2.features.shaderResourceMinLod == VK_TRUE;
+	device_features.shaderResourceMinLod = shader_resource_min_lod ? VK_TRUE : VK_FALSE;
+	ShaderRecompiler::Spirv::SetHostImageFeatures({.min_lod = shader_resource_min_lod});
 	device_features.independentBlend                     = VK_TRUE;
 	device_features.dualSrcBlend                         = VK_TRUE;
 	device_features.tessellationShader                   = VK_TRUE;
@@ -604,6 +649,50 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		provoking_vertex.pNext = const_cast<void*>(create_info.pNext);
 		provoking_vertex.transformFeedbackPreservesProvokingVertex = VK_FALSE;
 		create_info.pNext = &provoking_vertex;
+	}
+	vk::DeviceDiagnosticsConfigCreateInfoNV       diagnostics_config {};
+	vk::PhysicalDeviceDiagnosticsConfigFeaturesNV diagnostics_features {};
+	if (HasExtension(device_extensions, VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME)) {
+		vk::PhysicalDeviceDiagnosticsConfigFeaturesNV supported_diagnostics {};
+		vk::PhysicalDeviceFeatures2                   diagnostics_query {};
+		diagnostics_query.pNext = &supported_diagnostics;
+		physical_device.getFeatures2(&diagnostics_query);
+		if (supported_diagnostics.diagnosticsConfig) {
+			diagnostics_config.flags =
+			    vk::DeviceDiagnosticsConfigFlagBitsNV::eEnableShaderDebugInfo |
+			    vk::DeviceDiagnosticsConfigFlagBitsNV::eEnableResourceTracking |
+			    vk::DeviceDiagnosticsConfigFlagBitsNV::eEnableShaderErrorReporting;
+			diagnostics_features.diagnosticsConfig = VK_TRUE;
+			diagnostics_features.pNext             = const_cast<void*>(create_info.pNext);
+			diagnostics_config.pNext               = &diagnostics_features;
+			create_info.pNext                      = &diagnostics_config;
+		}
+	}
+	vk::PhysicalDeviceShaderClockFeaturesKHR shader_clock {};
+	if (HasExtension(device_extensions, VK_KHR_SHADER_CLOCK_EXTENSION_NAME)) {
+		vk::PhysicalDeviceShaderClockFeaturesKHR supported_clock {};
+		vk::PhysicalDeviceFeatures2              clock_query {};
+		clock_query.pNext = &supported_clock;
+		physical_device.getFeatures2(&clock_query);
+		if (supported_clock.shaderDeviceClock) {
+			shader_clock.shaderDeviceClock       = VK_TRUE;
+			shader_clock.pNext                   = const_cast<void*>(create_info.pNext);
+			create_info.pNext                    = &shader_clock;
+			graphics.shader_device_clock_enabled = true;
+		}
+	}
+	vk::PhysicalDeviceFaultFeaturesEXT device_fault {};
+	if (HasExtension(device_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
+		vk::PhysicalDeviceFaultFeaturesEXT supported_fault {};
+		vk::PhysicalDeviceFeatures2        fault_query {};
+		fault_query.pNext = &supported_fault;
+		physical_device.getFeatures2(&fault_query);
+		if (supported_fault.deviceFault) {
+			device_fault.deviceFault      = VK_TRUE;
+			device_fault.pNext            = const_cast<void*>(create_info.pNext);
+			create_info.pNext             = &device_fault;
+			graphics.device_fault_enabled = true;
+		}
 	}
 	create_info.pQueueCreateInfos       = &queue_create_info;
 	create_info.queueCreateInfoCount    = 1;
@@ -967,6 +1056,19 @@ void WindowContext::CreateVulkan() {
 		if (HasExtension(available_extensions, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 			graphic_ctx.memory_budget_ext_enabled = true;
+		}
+		if (HasExtension(available_extensions, VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+			graphic_ctx.diagnostic_checkpoints_enabled = true;
+		}
+		if (HasExtension(available_extensions, VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+		}
+		if (HasExtension(available_extensions, VK_KHR_SHADER_CLOCK_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_KHR_SHADER_CLOCK_EXTENSION_NAME);
+		}
+		if (HasExtension(available_extensions, VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME);
 		}
 		for (const auto* extension: {VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
 		                             VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,

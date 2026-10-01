@@ -311,6 +311,7 @@ constexpr int SAVE_STATUS_RUNNING     = 2;
 constexpr int SAVE_STATUS_FINISHED    = 3;
 constexpr int SAVE_RESULT_OK          = 0;
 constexpr int SAVE_BUTTON_ID_OK       = 1;
+constexpr int SAVE_MODE_PROGRESS_BAR  = 5;
 
 struct SaveDataDialogParam {
 	uint8_t  base_param[48];
@@ -380,8 +381,9 @@ int KYTY_SYSV_ABI SaveDataDialogGetStatus() {
 int KYTY_SYSV_ABI SaveDataDialogUpdateStatus() {
 	PRINT_NAME();
 
-	// Some games require a RUNNING update before FINISHED.
-	if (g_save_status == SAVE_STATUS_RUNNING) {
+	// Some games require a RUNNING update before FINISHED. A progress bar has no button: it
+	// runs until the title closes it.
+	if (g_save_status == SAVE_STATUS_RUNNING && g_save_mode != SAVE_MODE_PROGRESS_BAR) {
 		if (g_save_running_polled) {
 			g_save_status = SAVE_STATUS_FINISHED;
 		}
@@ -506,9 +508,11 @@ LIB_NAME("MsgDialog.native", "MsgDialog");
 
 constexpr int STATUS_NONE        = 0;
 constexpr int STATUS_INITIALIZED = 1;
+constexpr int STATUS_RUNNING     = 2;
 constexpr int STATUS_FINISHED    = 3;
 constexpr int RESULT_OK          = 0;
 constexpr int BUTTON_ID_OK       = 1;
+constexpr int MODE_PROGRESS_BAR  = 2;
 
 struct MsgDialogParam {
 	uint8_t  base_param[48];
@@ -559,7 +563,7 @@ int KYTY_SYSV_ABI MsgDialogOpen(const void* param) {
 		     reinterpret_cast<uint64_t>(p->sys_msg_param), p->user_id);
 	}
 
-	g_status = STATUS_FINISHED;
+	g_status = (p != nullptr && p->mode == MODE_PROGRESS_BAR) ? STATUS_RUNNING : STATUS_FINISHED;
 
 	return OK;
 }

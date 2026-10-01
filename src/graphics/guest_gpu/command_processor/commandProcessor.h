@@ -82,7 +82,7 @@ public:
 	void DrawIndirect(uint32_t data_offset, uint32_t draw_initiator, bool indexed);
 	void DrawIndirectMulti(uint32_t data_offset, uint32_t max_count_or_count,
 	                       const volatile uint32_t* count_addr, uint32_t stride_in_bytes,
-	                       uint32_t draw_initiator, bool indexed);
+	                       uint32_t draw_initiator, bool indexed, uint32_t draw_index_register);
 	void WriteAtEndOfPipe32(uint32_t cache_policy, uint32_t event_write_dest,
 	                        uint32_t eop_event_type, uint32_t cache_action, uint32_t event_index,
 	                        uint32_t event_write_source, void* dst_gpu_addr, uint32_t value,
@@ -97,6 +97,9 @@ public:
 	                       uint32_t value);
 	void PrepareCpuFlip(uint64_t request_id);
 	void SynchronizeGpu();
+	// Research (KYTY_LABELS_AFTER_GPU=1): the label is written by the scheduler's completion
+	// thread once the work recorded so far has executed; clock takes the timestamp then.
+	void PublishLabelAtCompletion(void* dst, uint64_t value, uint32_t bytes, bool clock);
 	void EmitGlobalBarrier();
 	void TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id);
 	void DispatchDirect(uint32_t thread_group_x, uint32_t thread_group_y, uint32_t thread_group_z,
@@ -121,6 +124,10 @@ public:
 
 	template <typename T>
 	void WaitRegMem(uint32_t func, const T* addr, T ref, T mask, uint32_t poll, uint32_t wait_op);
+	// A label as the command processor sees it: end-of-pipe writes count once recorded, even
+	// before the CPU can see them (GuestGpu::LabelsAtCompletion).
+	template <typename T>
+	[[nodiscard]] T ReadLabel(const volatile T* addr) const;
 	void WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw_num, uint32_t write_control);
 	void WriteReferenceClock(uint64_t dst_address, uint32_t num_bytes);
 	void DmaData(uint8_t engine, uint8_t dst_sel, uint8_t dst_cache_policy,

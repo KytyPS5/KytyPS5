@@ -91,8 +91,9 @@ bool UsesFlattenedSrt(const Program& program) {
 			return inst.GetOpcode() == ValueOpcode::ReadConst;
 		});
 	}) || std::ranges::any_of(program.info.images, [](const ImageResource& image) {
-		return image.indirect_search_iterations != 0u;
-	});
+		// Research: a bindless image reads its heap region from the flattened SRT.
+		return image.indirect_search_iterations != 0u || image.bindless;
+	}) || std::ranges::any_of(program.info.samplers, &SamplerResource::bindless);
 }
 
 void AllocateBindings(Program& program, uint32_t push_data_start_dword) {
@@ -104,9 +105,18 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword) {
 	BindingLayout next;
 	std::vector<uint32_t> buffers;
 	const bool            uses_gds = CollectMemoryResources(program, buffers);
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			if (inst.GetOpcode() == ValueOpcode::GetBuiltin &&
+			    static_cast<StageInputKind>(inst.Arg(0).U32()) ==
+			        StageInputKind::DispatchThreadCount) {
+				next.has_dispatch_dimensions = true;
+			}
+		}
+	}
 	next.user_data_registers = CollectUserData(program);
 	next.memory_offset_dword = static_cast<uint32_t>(next.user_data_registers.size());
-	next.memory_offset_count       = static_cast<uint32_t>(buffers.size());
+	next.memory_offset_count = static_cast<uint32_t>(buffers.size());
 	next.push_data_start_dword =
 	    PushData::StartFor(push_data_start_dword, next.ShaderDataDwords());
 

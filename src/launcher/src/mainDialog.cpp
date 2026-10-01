@@ -242,6 +242,12 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	if (info.tessellation_enabled) {
 		args << "--tessellation";
 	}
+	if (info.bindless_images_enabled) {
+		args << "--bindless";
+	}
+	if (!info.skip_shader_hashes.isEmpty()) {
+		args << "--skip-shaders" << info.skip_shader_hashes;
+	}
 	args << "--vblank-frequency" << QString::number(info.vblank_frequency);
 	args << "--console-language" << QString::number(info.console_language);
 	args << "--vulkan-validation" << BoolArg(info.vulkan_validation_enabled);

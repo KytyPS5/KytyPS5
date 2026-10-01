@@ -14,9 +14,12 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <utility>
 #include <vector>
 
@@ -71,7 +74,8 @@ void BufferCache::ChangeRegister(BufferId id) {
 		(void)it;
 		EXIT_IF(!inserted);
 		m_total_used_memory += buffer.Size();
-		buffer.lru_id = m_lru_cache.Insert(id, m_gc_tick);
+		g_cpu_dirty_epoch.fetch_add(1, std::memory_order_release);
+		buffer.lru_id = m_lru_cache.Insert(id, LruClock());
 		std::vector<vk::DeviceAddress> addresses;
 		addresses.reserve(size_pages);
 		for (uint64_t i = 0; i < size_pages; ++i) {
@@ -94,7 +98,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 
 void BufferCache::TouchBuffer(const Buffer& buffer) {
 	if (!buffer.is_deleted) {
-		m_lru_cache.Touch(buffer.lru_id, m_gc_tick);
+		m_lru_cache.Touch(buffer.lru_id, LruClock());
 	}
 }
 
@@ -111,6 +115,17 @@ void BufferCache::DeleteBuffer(BufferId id) {
 }
 
 bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	// One reservation cannot exceed the download ring, so a larger range goes in ring-sized
+	// windows; a window that does not fit drains the ring before it is mapped.
+	const auto capacity = m_download_buffer.Size();
+	bool       any      = false;
+	for (uint64_t offset = 0; offset < size; offset += capacity) {
+		any |= DownloadBufferWindow(buffer, vaddr + offset, std::min(capacity, size - offset));
+	}
+	return any;
+}
+
+bool BufferCache::DownloadBufferWindow(Buffer& buffer, uint64_t vaddr, uint64_t size) {
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size     = 0;
 	const auto                  buffer_address = buffer.CpuAddress();
@@ -118,18 +133,47 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	    vaddr, size, [&](uint64_t address, uint64_t bytes) noexcept {
 		    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, address, bytes,
 		                                           "buffer download");
+		    std::unique_lock lock(m_dirty_ranges_mutex);
 		    m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t end) {
 			    copies.emplace_back(start - buffer_address, total_size, end - start);
 			    // Keep packed ranges on separate cache lines, as in shadPS4.
 			    total_size += Common::AlignUp(end - start, 64);
+			    m_downloading_ranges.Add(start, end - start);
 		    });
 		    m_gpu_modified_ranges.Subtract(address, bytes);
 	    });
 	if (copies.empty()) {
 		return false;
 	}
+	const auto capacity = m_download_buffer.Size();
+	for (size_t first = 0; first < copies.size();) {
+		const auto base       = copies[first].dstOffset;
+		auto       last       = first;
+		uint64_t   batch_size = 0;
+		while (last < copies.size()) {
+			const auto end = copies[last].dstOffset - base + Common::AlignUp(copies[last].size, 64);
+			if (end > capacity) {
+				break;
+			}
+			batch_size = end;
+			last++;
+		}
+		EXIT_IF(last == first);
+		std::vector<vk::BufferCopy> batch(copies.begin() + static_cast<std::ptrdiff_t>(first),
+		                                  copies.begin() + static_cast<std::ptrdiff_t>(last));
+		for (auto& copy: batch) {
+			copy.dstOffset -= base;
+		}
+		DownloadBufferCopies(buffer, std::move(batch), batch_size);
+		first = last;
+	}
+	return true;
+}
 
-	auto [mapped, offset] = m_download_buffer.Map(total_size, 64);
+void BufferCache::DownloadBufferCopies(Buffer& buffer, std::vector<vk::BufferCopy> copies,
+                                       uint64_t total_size) {
+	const auto buffer_address = buffer.CpuAddress();
+	auto [mapped, offset]     = m_download_buffer.Map(total_size, 64);
 	std::unique_ptr<Buffer> temporary;
 	if (mapped == nullptr) {
 		temporary = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
@@ -177,8 +221,11 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 			Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
 			                                      mapped + (copy.dstOffset - offset), copy.size);
 		}
+		std::unique_lock lock(m_dirty_ranges_mutex);
+		for (const auto& copy: copies) {
+			m_downloading_ranges.Subtract(buffer_address + copy.srcOffset, copy.size);
+		}
 	});
-	return true;
 }
 
 BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
@@ -237,6 +284,34 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
 }
 
+bool BufferCache::WriteClean(uint64_t vaddr, const void* data, uint64_t size) {
+	if (!GuestGpu::IsGpuThread() || size == 0 || !GuestRange {vaddr, size}.Valid() ||
+	    !m_memory_tracker.IsRegionGpuModified(vaddr, size)) {
+		return false;
+	}
+	{
+		// A download publishes the GPU's older value of these bytes when it lands.
+		std::shared_lock lock(m_dirty_ranges_mutex);
+		if (m_downloading_ranges.Intersects(vaddr, size)) {
+			return false;
+		}
+	}
+
+	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
+	if (owner == nullptr || !*owner || !m_slot_buffers[*owner].IsInBounds(vaddr, size) ||
+	    !Libs::LibKernel::Memory::TryWriteBacking(vaddr, data, size)) {
+		return false;
+	}
+	WriteDataBuffer(m_slot_buffers[*owner], vaddr, data, size);
+	if (HasGpuDirtyBytes(vaddr, size)) {
+		// Overwritten in full: guest memory holds the value the GPU copy will have.
+		std::unique_lock lock(m_dirty_ranges_mutex);
+		m_gpu_modified_ranges.Subtract(vaddr, size);
+	}
+	m_texture_cache.InvalidateMemory(vaddr, size);
+	return true;
+}
+
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
@@ -248,6 +323,22 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			return;
 		}
 		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
+
+		// The page is protected as GPU-written, but none of its bytes are waiting for a download:
+		// the bytes the GPU wrote are elsewhere in the window, or were downloaded with another
+		// page. The page is current, so lift its protection. Downloading the window instead drained
+		// the GPU (~30 ms a fault) for guest reads of structs next to the command processor's
+		// labels.
+		const auto page_begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+		const auto page_end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
+		if (m_memory_tracker.IsRegionGpuModified(page_begin, page_end - page_begin) &&
+		    !HasGpuDirtyBytes(page_begin, page_end - page_begin)) {
+			m_memory_tracker.UnmarkRegionAsGpuModified(page_begin, page_end - page_begin);
+			if (is_write) {
+				m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+			}
+			return;
+		}
 
 		// Widen nearby CPU reads so they share one GPU drain.
 		constexpr uint64_t WindowSize   = 512 * 1024;
@@ -352,6 +443,17 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 	EXIT_IF(m_scheduler.Current().IsInvalid());
 	const auto end = Common::AlignUp(vaddr + size, CACHING_PAGESIZE);
+	if (vaddr < CACHING_PAGESIZE) {
+		// Guest page 0 is never mapped; a request here is a garbage or null descriptor that
+		// slipped past the null checks. The memory tracker cannot hold address 0, so name the
+		// caller now rather than in the garbage collector later.
+		static std::atomic<uint32_t> reported = 0;
+		if (reported.fetch_add(1) < 8) {
+			LOGF("BufferCache: buffer requested in guest page 0: vaddr=0x%016" PRIx64
+			     " size=0x%016" PRIx64 "\n%s",
+			     vaddr, size, Common::HostBacktrace().c_str());
+		}
+	}
 	vaddr = Common::AlignDown(vaddr, CACHING_PAGESIZE);
 	size               = end - vaddr;
 	const auto overlap = ResolveOverlaps(vaddr, size);
@@ -415,6 +517,22 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	return false;
 }
 
+// Reads guest memory for an upload. The guest can unmap memory a cached buffer still covers: AMM
+// maps streaming textures in blocks, and a texture upload once read one byte past the end of the
+// block it had mapped. Such bytes read as zero, like ObtainBufferForImage's direct path.
+static void ReadGuestForUpload(uint8_t* destination, uint64_t address, uint64_t size) {
+	if (!Libs::LibKernel::Memory::TryReadBacking(address, destination, size) &&
+	    !Libs::LibKernel::Memory::TryReadSparseBacking(address, destination, size)) {
+		static std::atomic<uint32_t> reported {0};
+		if (reported.fetch_add(1) < 16) {
+			LOGF("BufferCache: upload of unmapped guest memory 0x%016" PRIx64 " size=0x%" PRIx64
+			     " reads as zero\n",
+			     address, size);
+		}
+		std::memset(destination, 0, static_cast<size_t>(size));
+	}
+}
+
 vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
                                      uint64_t total_size) {
 	if (copies.empty()) {
@@ -425,7 +543,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	if (mapped != nullptr) {
 		for (auto& copy: copies) {
 			const auto address = buffer.CpuAddress() + copy.dstOffset;
-			std::memcpy(mapped + copy.srcOffset, reinterpret_cast<const void*>(address), copy.size);
+			ReadGuestForUpload(mapped + copy.srcOffset, address, copy.size);
 			copy.srcOffset += base_offset;
 		}
 		m_staging_buffer.Commit();
@@ -436,8 +554,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	                                         vk::BufferUsageFlagBits::eTransferSrc, total_size);
 	for (const auto& copy: copies) {
 		const auto address = buffer.CpuAddress() + copy.dstOffset;
-		std::memcpy(temporary->Mapped().data() + copy.srcOffset,
-		            reinterpret_cast<const void*>(address), copy.size);
+		ReadGuestForUpload(temporary->Mapped().data() + copy.srcOffset, address, copy.size);
 	}
 	temporary->Flush(0, total_size);
 	const auto handle = temporary->Handle();
@@ -447,13 +564,14 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
                                                        bool is_written, bool is_texel_buffer,
-                                                       BufferId id) {
+                                                       BufferId id, bool needs_device_address) {
 	auto& command = m_scheduler.Current();
 	if (command.IsInvalid() || !GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
 	}
 
 	if (!is_written && size <= CACHING_PAGESIZE &&
+	    (!needs_device_address || m_stream_buffer.HasDeviceAddress()) &&
 	    !m_memory_tracker.IsRegionGpuModified(vaddr, size) &&
 	    m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
 		const auto alignment = std::max<uint64_t>(
@@ -473,9 +591,35 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	TouchBuffer(buffer);
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
-		m_gpu_modified_ranges.Add(vaddr, size);
+		MarkGpuWritten(vaddr, size);
 	}
 	return {&buffer, buffer.Offset(vaddr)};
+}
+
+std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferWritten(uint64_t vaddr, uint64_t size,
+                                                              uint64_t written_vaddr,
+                                                              uint64_t written_size, BufferId id) {
+	auto& command = m_scheduler.Current();
+	if (command.IsInvalid() || !GuestRange {vaddr, size}.Valid() ||
+	    written_vaddr < vaddr || written_size > size || written_vaddr - vaddr > size - written_size) {
+		EXIT("BufferCache: invalid written-range buffer request\n");
+	}
+	if (IsBufferInvalid(id) || !m_slot_buffers[id].IsInBounds(vaddr, size)) {
+		id = FindBuffer(vaddr, size);
+	}
+	auto& buffer = m_slot_buffers[id];
+	TouchBuffer(buffer);
+	(void)SynchronizeBuffer(buffer, vaddr, size, false, false);
+	if (written_size != 0) {
+		(void)SynchronizeBuffer(buffer, written_vaddr, written_size, true, false);
+		MarkGpuWritten(written_vaddr, written_size);
+	}
+	return {&buffer, buffer.Offset(vaddr)};
+}
+
+void BufferCache::MarkGpuWritten(uint64_t vaddr, uint64_t size) {
+	std::unique_lock lock(m_dirty_ranges_mutex);
+	m_gpu_modified_ranges.Add(vaddr, size);
 }
 
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size) {
@@ -496,8 +640,11 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	}
 
 	auto [staging, stage_offset] = m_staging_buffer.Map(size, 16);
-	if (staging == nullptr || !Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, staging, size)) {
-		EXIT("BufferCache: failed to read mapped guest image backing\n");
+	if (staging == nullptr) {
+		EXIT("BufferCache: staging reservation failed for guest image\n");
+	}
+	if (!Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, staging, size)) {
+		std::memset(staging, 0, static_cast<size_t>(size));
 	}
 	m_staging_buffer.Commit();
 	return {&m_staging_buffer, stage_offset};
@@ -585,13 +732,29 @@ bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
 	return m_gpu_modified_ranges.Intersects(vaddr, size);
 }
 
+bool BufferCache::IsCleanForConcurrentRead(uint64_t vaddr, uint64_t size) const {
+	std::shared_lock lock(m_dirty_ranges_mutex);
+	return !m_gpu_modified_ranges.Intersects(vaddr, size) &&
+	       !m_downloading_ranges.Intersects(vaddr, size);
+}
+
 bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionCpuModified(vaddr, size);
 }
 
+uint64_t BufferCache::LruClock() const noexcept {
+	return m_graphics.presented_frames.load(std::memory_order_relaxed) + m_gc_tick / 512;
+}
+
 void BufferCache::RunGarbageCollector() {
-	const auto tick = m_gc_tick++;
-	if (m_graphics.CanReportMemoryUsage()) {
+	m_gc_tick++;
+	const auto clock = LruClock();
+	// Pressure is judged by this cache's own bytes. Device-wide usage also counts the images
+	// spilled to host memory, which on a 6 GB card keeps it above the critical mark forever
+	// and has the collector destroy and recreate every buffer twice a second (a third of
+	// the GPU thread's time in the world). KYTY_GC_DEVICE_BYTES=1 restores that policy.
+	static const bool device_bytes = std::getenv("KYTY_GC_DEVICE_BYTES") != nullptr;
+	if (device_bytes && m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
 	if (m_total_used_memory < m_trigger_gc_memory) {
@@ -599,20 +762,27 @@ void BufferCache::RunGarbageCollector() {
 	}
 
 	const bool     aggressive = m_total_used_memory >= m_critical_gc_memory;
-	const uint64_t age        = std::min<uint64_t>(aggressive ? 80 : 160, tick);
+	// Ages in frames, as in the texture cache: a buffer used this frame or the last is
+	// never a candidate, whatever the submission count.
+	const uint64_t age        = std::min<uint64_t>(aggressive ? 2 : 4, clock);
 	const size_t   limit      = aggressive ? 64 : 32;
 
 	std::vector<BufferId> dirty_buffers;
 	size_t                retire_count = 0;
-	m_lru_cache.ForEachItemBelow(tick - age, [&](BufferId id) {
+	m_lru_cache.ForEachItemBelow(clock - age, [&](BufferId id) {
 		auto& buffer = m_slot_buffers[id];
 		EXIT_IF(buffer.is_deleted);
-		m_memory_tracker.ValidateGpuDirtyOwnership(m_gpu_modified_ranges, buffer.CpuAddress(),
-		                                           buffer.Size(), "garbage collection");
-		const bool dirty = m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size());
-		if (dirty && !aggressive) {
+		if (buffer.CpuAddress() == 0) {
+			// See CreateBuffer: the tracker rejects address 0, so this one is never collected.
 			return false;
 		}
+		m_memory_tracker.ValidateGpuDirtyOwnership(m_gpu_modified_ranges, buffer.CpuAddress(),
+		                                           buffer.Size(), "garbage collection");
+		// An aged GPU-dirty buffer is downloaded and dropped under either policy. Retaining it
+		// (the non-aggressive rule before) leaves its GPU-written bytes owning the pages
+		// forever, and the images that share those pages are then re-sourced from the
+		// buffer's stale contents: the world renders black. Measured 2026-09-21.
+		const bool dirty = m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size());
 		if (dirty) {
 			EXIT_IF(!DownloadBufferMemory(buffer, buffer.CpuAddress(), buffer.Size()));
 			dirty_buffers.push_back(id);
@@ -645,6 +815,13 @@ void BufferCache::RunGarbageCollector() {
 
 void BufferCache::ProcessFaultBuffer() {
 	m_fault_manager.ProcessFaultBuffer();
+}
+
+void BufferCache::SynchronizeCpuDirtyBuffersInRange(uint64_t vaddr, uint64_t size) {
+	m_memory_tracker.ForEachMaybeCpuDirtyRegion(
+	    vaddr, size, [this](uint64_t address, uint64_t bytes) {
+		    SynchronizeBuffersInRange(address, bytes);
+	    });
 }
 
 void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {

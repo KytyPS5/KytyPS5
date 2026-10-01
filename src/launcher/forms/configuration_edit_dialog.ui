@@ -194,6 +194,23 @@
           <property name="text"><string>Enable tessellation support (experimental)</string></property>
          </widget>
         </item>
+        <item row="8" column="1">
+         <widget class="QCheckBox" name="checkBox_bindless">
+          <property name="toolTip"><string>Sample heap-indexed textures through bindless descriptor arrays instead of enumerating them per draw.</string></property>
+          <property name="text"><string>Bindless textures (experimental)</string></property>
+         </widget>
+        </item>
+        <item row="9" column="0">
+         <widget class="QLabel" name="label_skip_shaders">
+          <property name="text"><string>Skip shaders:</string></property>
+         </widget>
+        </item>
+        <item row="9" column="1">
+         <widget class="QLineEdit" name="lineEdit_skip_shaders">
+          <property name="toolTip"><string>Guest shader hashes (hex, comma-separated) whose draws and dispatches are left out</string></property>
+          <property name="clearButtonEnabled"><bool>true</bool></property>
+         </widget>
+        </item>
        </layout>
       </widget>
      </item>

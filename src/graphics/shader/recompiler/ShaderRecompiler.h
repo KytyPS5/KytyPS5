@@ -6,12 +6,15 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 
+#include <functional>
 #include <span>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler {
 
 struct CompileOptions {
+	bool                        non_fatal = false;
+	bool                        bindless_images = false;
 	ShaderType                  stage           = ShaderType::Compute;
 	uint32_t                    wave_size       = 64;
 	uint32_t                    user_data_base  = 0;
@@ -22,13 +25,21 @@ struct CompileOptions {
 	std::span<const uint32_t>   user_data;
 	std::span<const uint32_t>   back_code;
 	ShaderStageInputInfo        input_info;
+	// Research: reads a subroutine the shader calls (S_SWAPPC_B64 through a pointer in user
+	// data) from guest memory, as many words as are readable up to a bound. Unset, such calls
+	// stay unsupported.
+	std::function<std::vector<uint32_t>(uint64_t address)> read_code;
 };
 
 struct TranslateResult {
+	bool        unsupported = false;
 	IR::Program program;
 	std::string decoded_dump;
 	std::string cfg_dump;
 	bool        skip_dispatch = false;
+	// Research: user-data dwords (indices into CompileOptions::user_data) that held the targets
+	// of inlined calls. The program is valid only while they hold the same values.
+	std::vector<uint32_t> call_target_user_data;
 };
 
 struct CompileResult {

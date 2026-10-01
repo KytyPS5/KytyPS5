@@ -8,6 +8,7 @@
 #include "loader/symbolDatabase.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstddef>
 #include <cstring>
@@ -1660,6 +1661,72 @@ static int KYTY_SYSV_ABI NpEntitlementAccessGetEntitlementKey(
 	return NP_ENTITLEMENT_ACCESS_ERROR_NO_ENTITLEMENT;
 }
 
+// Unified entitlement lists are fetched asynchronously from the network. The emulated console
+// is offline and owns no add-ons, so every request finishes at once with an empty list. Titles
+// poll these every few frames; only the first calls are logged.
+static std::atomic<int64_t>  g_entitlement_request_id {0};
+static std::atomic<uint32_t> g_entitlement_calls_logged {0};
+
+static bool EntitlementLogCall() {
+	return g_entitlement_calls_logged.fetch_add(1, std::memory_order_relaxed) < 16;
+}
+
+static int KYTY_SYSV_ABI NpEntitlementAccessRequestUnifiedEntitlementInfoList(
+    int user_id, uint32_t service_label, const NpUnifiedEntitlementLabel* list, uint32_t list_num,
+    const void* param, int64_t* request_id) {
+	if (EntitlementLogCall()) {
+		PRINT_NAME();
+		LOGF("\t user_id = %d, service_label = %" PRIu32 ", list_num = %" PRIu32 "\n", user_id,
+		     service_label, list_num);
+	}
+	if (request_id == nullptr || (list == nullptr && list_num != 0)) {
+		return NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER;
+	}
+	*request_id = ++g_entitlement_request_id;
+	return 0;
+}
+
+static int KYTY_SYSV_ABI NpEntitlementAccessPollUnifiedEntitlementInfoList(
+    int64_t request_id, int32_t* result, void* list, uint32_t list_num, uint32_t* hit_num,
+    int32_t* next_offset, int32_t* previous_offset) {
+	if (EntitlementLogCall()) {
+		PRINT_NAME();
+		LOGF("\t request_id = %" PRId64 ", list_num = %" PRIu32 "\n", request_id, list_num);
+	}
+	if (result == nullptr) {
+		return NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER;
+	}
+	*result = 0;
+	if (hit_num != nullptr) {
+		*hit_num = 0;
+	}
+	// A page at offset 0 is a real page, so "no page" is -1 for both directions.
+	if (next_offset != nullptr) {
+		*next_offset = -1;
+	}
+	if (previous_offset != nullptr) {
+		*previous_offset = -1;
+	}
+	return 0; // SCE_NP_POLL_ASYNC_RET_FINISHED
+}
+
+static int KYTY_SYSV_ABI NpEntitlementAccessAbortRequest(int64_t request_id) {
+	if (EntitlementLogCall()) {
+		PRINT_NAME();
+		LOGF("\t request_id = %" PRId64 "\n", request_id);
+	}
+	// Requests finish as they are made, so there is nothing left to abort.
+	return 0;
+}
+
+static int KYTY_SYSV_ABI NpEntitlementAccessDeleteRequest(int64_t request_id) {
+	if (EntitlementLogCall()) {
+		PRINT_NAME();
+		LOGF("\t request_id = %" PRId64 "\n", request_id);
+	}
+	return 0;
+}
+
 LIB_DEFINE(InitNet_1_NpEntitlementAccess) {
 	LIB_FUNC("jO8DM8oyego", LibNpEntitlementAccess::NpEntitlementAccessInitialize);
 	LIB_FUNC("lPDO62PpJIA", LibNpEntitlementAccess::NpEntitlementAccessGetSkuFlag);
@@ -1667,6 +1734,12 @@ LIB_DEFINE(InitNet_1_NpEntitlementAccess) {
 	         LibNpEntitlementAccess::NpEntitlementAccessGetAddcontEntitlementInfoList);
 	LIB_FUNC("xddD23+8TfQ", LibNpEntitlementAccess::NpEntitlementAccessGetAddcontEntitlementInfo);
 	LIB_FUNC("5LiMEPuW0DQ", LibNpEntitlementAccess::NpEntitlementAccessGetEntitlementKey);
+	LIB_FUNC("uCZf2L27th8",
+	         LibNpEntitlementAccess::NpEntitlementAccessRequestUnifiedEntitlementInfoList);
+	LIB_FUNC("nAEqawEZG5s",
+	         LibNpEntitlementAccess::NpEntitlementAccessPollUnifiedEntitlementInfoList);
+	LIB_FUNC("HFcQl9TMcFQ", LibNpEntitlementAccess::NpEntitlementAccessAbortRequest);
+	LIB_FUNC("Z0eQj8m7XA8", LibNpEntitlementAccess::NpEntitlementAccessDeleteRequest);
 }
 
 } // namespace LibNpEntitlementAccess

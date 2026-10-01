@@ -295,6 +295,23 @@ add_custom_command(
 	VERBATIM
 )
 list(APPEND kyty_emulator_src "${fault_buffer_shader_header}")
+
+set(dispatch_indirect_groups_shader_source "${gpu_tiler_shader_dir}/dispatch_indirect_groups.comp")
+set(dispatch_indirect_groups_shader_spv "${gpu_tiler_generated_dir}/dispatch_indirect_groups.spv")
+set(dispatch_indirect_groups_shader_header
+	"${gpu_tiler_generated_dir}/dispatch_indirect_groups_spv.h")
+add_custom_command(
+	OUTPUT "${dispatch_indirect_groups_shader_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${dispatch_indirect_groups_shader_spv}" "${dispatch_indirect_groups_shader_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${dispatch_indirect_groups_shader_spv}
+	        -DOUTPUT=${dispatch_indirect_groups_shader_header}
+	        -DSYMBOL=DISPATCH_INDIRECT_GROUPS_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${dispatch_indirect_groups_shader_source}"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${dispatch_indirect_groups_shader_header}")
 list(APPEND kyty_emulator_src ${gpu_tiler_shader_headers})
 
 set(gpu_blit_generated_dir "${PROJECT_BINARY_DIR}/gpu_blit_shaders")
@@ -397,7 +414,7 @@ add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ReadLaneElimination.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
 )
-target_link_libraries(scalar_provenance_tests fmt::fmt)
+target_link_libraries(scalar_provenance_tests fmt::fmt common)
 target_include_directories(scalar_provenance_tests PRIVATE ${inc_headers})
 
 add_executable(page_manager_tests EXCLUDE_FROM_ALL
@@ -416,6 +433,16 @@ target_include_directories(archive_file_tests PRIVATE ${inc_headers})
 add_executable(avplayer_file_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/AvPlayerFileTests.cpp")
 target_link_libraries(avplayer_file_tests common FFmpeg::ffmpeg ZArchive::zarchive)
 target_include_directories(avplayer_file_tests PRIVATE ${inc_headers})
+
+if (WIN32)
+	# Guest loads from protected pages, completed by the instruction emulator (Windows contexts).
+	add_executable(x64_load_emulation_tests EXCLUDE_FROM_ALL
+		"${KYTY_TESTS_DIR}/X64LoadEmulationTests.cpp"
+		"${KYTY_SOURCE_DIR}/loader/x64InstructionEmulator.cpp"
+	)
+	target_link_libraries(x64_load_emulation_tests common Zydis::Zydis)
+	target_include_directories(x64_load_emulation_tests PRIVATE ${inc_headers})
+endif()
 
 add_executable(bit_array_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/BitArrayTests.cpp"
@@ -470,7 +497,7 @@ add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ShaderInfoCollection.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/BindingLayout.cpp"
 )
-target_link_libraries(resource_tracking_tests fmt::fmt)
+target_link_libraries(resource_tracking_tests fmt::fmt common)
 target_include_directories(resource_tracking_tests PRIVATE ${inc_headers})
 
 add_executable(audio_out2_port_tests EXCLUDE_FROM_ALL
@@ -576,6 +603,12 @@ if(NOT KYTY_CLANG_CL)
 			virtual_memory_allocation_tests)
 		target_compile_options(${kyty_exception_test} PRIVATE -fexceptions)
 	endforeach()
+	# Resource tracking gives a shader up by throwing (Fail, caught in TrackResources); utils.cmake
+	# turns exceptions off for clang and GCC, while clang-cl builds have them on (/EHsc). Every
+	# target that compiles the file, the emulator included, needs them on.
+	set_source_files_properties(
+		"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceTracking.cpp"
+		PROPERTIES COMPILE_OPTIONS -fexceptions)
 endif()
 
 if(BUILD_TESTING)
@@ -597,6 +630,9 @@ if(BUILD_TESTING)
 	add_test(NAME page_manager COMMAND $<TARGET_FILE:page_manager_tests>)
 	add_test(NAME archive_file COMMAND $<TARGET_FILE:archive_file_tests>)
 	add_test(NAME avplayer_file COMMAND $<TARGET_FILE:avplayer_file_tests>)
+	if (WIN32)
+		add_test(NAME x64_load_emulation COMMAND $<TARGET_FILE:x64_load_emulation_tests>)
+	endif()
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
 	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
@@ -690,6 +726,9 @@ if(BUILD_TESTING)
 		save_data_dialog_tests
 		http_uri_parse_tests
 	)
+	if (WIN32)
+		add_dependencies(kyty_tests x64_load_emulation_tests)
+	endif()
 endif()
 
 # Test Darwin signal-context restoration for SSE4a instructions.

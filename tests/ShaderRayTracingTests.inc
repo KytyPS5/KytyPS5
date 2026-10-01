@@ -84,4 +84,21 @@ void TestRayTracingDispatchDetection() {
     Check(!compiled.spirv.empty(), "ordinary shader did not compile");
     CheckSpirvBinaryValidates(compiled.spirv);
   }
+
+  // Research: with translate_bvh the decoder continues past a translatable BVH instruction and
+  // still stops at the 64-bit form.
+  D::Program translated;
+  D::DecodeProgram(bvh_code, translated, true);
+  Check(translated.has_bvh && translated.bvh_truncated &&
+            translated.instructions.size() == 2 &&
+            translated.instructions[0].opcode == D::Opcode::IMAGE_BVH_INTERSECT_RAY,
+        "translatable BVH instruction did not decode through to the BVH64 one");
+  const std::array nsa_code{0xf1989f07u, 0x00071001u, 0x3d3e3c15u, 0x38095851u,
+                            0x00003a39u, EncodeSopp(0x01)};
+  D::DecodeProgram(nsa_code, translated, true);
+  Check(translated.has_bvh && !translated.bvh_truncated &&
+            translated.instructions.size() == 2 &&
+            translated.instructions[0].image_address_components == 11u &&
+            translated.instructions[0].image_nsa_addr[9] == 0x3au,
+        "NSA BVH instruction did not decode for translation");
 }

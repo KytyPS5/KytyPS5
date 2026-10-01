@@ -8,12 +8,14 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/shader.h"
 
+#include <array>
 #include <cstddef>
 #include <filesystem>
 #include <memory>
 #include <span>
 #include <type_traits>
 #include <unordered_map>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -103,6 +105,45 @@ struct ShaderProgram {
 	explicit operator bool() const { return id != 0 && module != nullptr; }
 };
 
+// Everything vkCreateGraphicsPipelines reads for one graphics pipeline, owned in one place so the
+// driver compile can run on a worker thread (the structures point into each other: it stays
+// where it was allocated).
+struct GraphicsPipelineBuild {
+	GraphicsPipelineBuild() = default;
+	~GraphicsPipelineBuild();
+	KYTY_CLASS_NO_COPY(GraphicsPipelineBuild);
+
+	vk::Device                                                            device;
+	vk::ShaderModule                                                      tess_control = nullptr;
+	vk::ShaderModule                                                      tess_eval    = nullptr;
+	std::array<vk::PipelineShaderStageCreateInfo, 4>                      stages {};
+	std::array<vk::VertexInputAttributeDescription, ShaderVertexInputInfo::RES_MAX> input_attr {};
+	std::array<vk::VertexInputBindingDescription, ShaderVertexInputInfo::RES_MAX>   input_desc {};
+	vk::PipelineVertexInputStateCreateInfo                                vertex_input_info {};
+	vk::PipelineInputAssemblyStateCreateInfo                              input_assembly {};
+	vk::PipelineViewportDepthClipControlCreateInfoEXT                     depth_clip_control {};
+	vk::PipelineViewportStateCreateInfo                                   viewport_state {};
+	vk::PipelineRasterizationDepthClipStateCreateInfoEXT                  clip_ext {};
+	vk::PipelineRasterizationStateCreateInfo                              rasterizer {};
+	vk::PipelineRasterizationProvokingVertexStateCreateInfoEXT            provoking_vertex {};
+	vk::PipelineMultisampleStateCreateInfo                                multisampling {};
+	std::array<vk::PipelineColorBlendAttachmentState, RENDER_COLOR_ATTACHMENTS_MAX> color_blend {};
+	std::array<vk::Bool32, RENDER_COLOR_ATTACHMENTS_MAX>                  color_write_enable {};
+	vk::PipelineColorWriteCreateInfoEXT                                   color_write {};
+	vk::PipelineColorBlendStateCreateInfo                                 color_blending {};
+	vk::PipelineDepthStencilStateCreateInfo                               depth_stencil {};
+	std::vector<vk::DynamicState>                                         dynamic_states;
+	vk::PipelineDynamicStateCreateInfo                                    dynamic_state {};
+	vk::PipelineTessellationStateCreateInfo                               tessellation {};
+	PipelineRenderingState                                                rendering;
+	vk::PipelineRenderingCreateInfo                                       rendering_info {};
+	vk::GraphicsPipelineCreateInfo                                        pipeline_info {};
+};
+
+// A graphics pipeline a worker thread compiles (see PipelineCache::TryGetGraphicsPipeline).
+struct PendingGraphicsPipeline;
+class PipelineCompiler;
+
 // The owning renderer serializes access, including saves while the GPU is running.
 class PipelineCache {
 public:
@@ -116,6 +157,10 @@ public:
 		vk::Pipeline            pipeline              = nullptr;
 		vk::DescriptorSetLayout descriptor_set_layout = nullptr;
 		bool                    uses_push_descriptors = false;
+		// Samples bindless images: descriptor set 1 is the bindless table.
+		bool                    uses_bindless         = false;
+		// Set while a worker compiles `pipeline`; draws skip it until the compile finishes.
+		std::shared_ptr<PendingGraphicsPipeline> pending;
 	};
 
 	struct GraphicsPrograms {
@@ -142,6 +187,15 @@ public:
 	                              CommandBuffer& command, const ShaderPixelInputInfo* ps_input_info,
 	                              vk::PrimitiveTopology topology, bool primitive_restart_enable,
 	                              const GraphicsPrograms& programs);
+	// As GetGraphicsPipeline; with may_defer, a pipeline the driver does not compile within a
+	// short wait is compiled on a worker thread, and nullptr says to skip this draw.
+	Pipeline* TryGetGraphicsPipeline(std::span<const RenderColorInfo>       colors,
+	                                 const RenderDepthInfo&                 depth,
+	                                 std::span<const ShaderVertexInputInfo> vertex_info,
+	                                 CommandBuffer&                         command,
+	                                 const ShaderPixelInputInfo*            ps_input_info,
+	                                 vk::PrimitiveTopology topology, bool primitive_restart_enable,
+	                                 const GraphicsPrograms& programs, bool may_defer);
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	                             const ShaderProgram&          compute_program);
 
@@ -180,11 +234,26 @@ private:
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
+	std::unique_ptr<PipelineCompiler>                       m_compiler;
 
 	void InitializeDriverCache();
+	// Takes a finished background compile into the pipeline; false while it still runs.
+	bool FinishPending(Pipeline& pipeline);
 };
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);
+// Creates the pipeline's layouts and fills the create info; CreateGraphicsPipeline compiles it.
+std::unique_ptr<GraphicsPipelineBuild>
+PrepareGraphicsPipeline(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                        const PipelineRenderingState&          rendering,
+                        const PipelineVertexInputState&        vertex_input,
+                        std::span<const ShaderVertexInputInfo> vertex_info,
+                        const ShaderPixelInputInfo*            ps_input_info,
+                        const PipelineCache::GraphicsPrograms& programs,
+                        const PipelineStaticParameters&        static_params);
+// Any thread.
+vk::Result CreateGraphicsPipeline(const GraphicsPipelineBuild& build, vk::PipelineCache driver_cache,
+                                  vk::Pipeline* pipeline);
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const PipelineRenderingState&          rendering,
                             const PipelineVertexInputState&        vertex_input,

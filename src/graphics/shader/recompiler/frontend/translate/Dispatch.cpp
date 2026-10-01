@@ -1,9 +1,18 @@
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
 void Translator::FailMissingTranslation(const Decoder::Instruction& inst) {
+	// A non-fatal compile gives up on the shader instead: its draws or dispatches are skipped.
+	// Every missing translation is named, so one log lists all a shader needs.
+	if (TranslationNonFatalFlag()) {
+		LOGF("shader translation: opcode %s at pc 0x%08x has no IR translation\n",
+		     Decoder::InstructionToString(inst).c_str(), inst.pc);
+		TranslationUnsupportedFlag() = true;
+		return;
+	}
 	EXIT("opcode %s at pc 0x%08x has no IR translation",
 	     Decoder::InstructionToString(inst).c_str(), inst.pc);
 }
@@ -15,6 +24,12 @@ void Translator::TranslateInstruction(const Decoder::Instruction& inst) {
 	switch (inst.opcode) {
 		case Decoder::Opcode::UNKNOWN:
 		case Decoder::Opcode::COUNT:
+			if (TranslationNonFatalFlag()) {
+				LOGF("shader translation: decoded opcode at pc 0x%08x has no IR translation\n",
+				     inst.pc);
+				TranslationUnsupportedFlag() = true;
+				return;
+			}
 			EXIT("decoded opcode has no IR translation at pc 0x%08x", inst.pc);
 		case Decoder::Opcode::UNSUPPORTED:
 			EXIT("unsupported decoded instruction: %s", Decoder::InstructionToString(inst).c_str());

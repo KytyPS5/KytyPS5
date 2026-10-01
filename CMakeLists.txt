@@ -603,6 +603,12 @@ if(NOT KYTY_CLANG_CL)
 			virtual_memory_allocation_tests)
 		target_compile_options(${kyty_exception_test} PRIVATE -fexceptions)
 	endforeach()
+	# Resource tracking gives a shader up by throwing (Fail, caught in TrackResources); utils.cmake
+	# turns exceptions off for clang and GCC, while clang-cl builds have them on (/EHsc). Every
+	# target that compiles the file, the emulator included, needs them on.
+	set_source_files_properties(
+		"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceTracking.cpp"
+		PROPERTIES COMPILE_OPTIONS -fexceptions)
 endif()
 
 if(BUILD_TESTING)

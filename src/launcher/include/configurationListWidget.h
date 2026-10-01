@@ -33,6 +33,9 @@ public:
 	ConfigurationItem*                     GetSelectedItem() { return m_selected_item; }
 
 	[[nodiscard]] const QString& GetSettingsFile() const { return m_settings_file; }
+	[[nodiscard]] const QString& GetGlobalControllerColor() const {
+		return m_global_info.controller_color;
+	}
 	[[nodiscard]] std::unique_ptr<Configuration>
 	CreateConfiguration(const ConfigurationItem& item) const;
 
@@ -44,6 +47,7 @@ signals:
 
 	void Run();
 	void Select();
+	void PreviewControllerColor(const QString& color);
 
 protected:
 	void changeEvent(QEvent* event) override;

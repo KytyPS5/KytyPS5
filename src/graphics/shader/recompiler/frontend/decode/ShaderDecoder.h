@@ -154,6 +154,10 @@ enum class Opcode {
 	V_CUBEMA_F32,
 	V_CNDMASK_B32,
 	V_DOT2C_F32_F16,
+	V_CVT_F64_I32,
+	V_CVT_F32_F64,
+	V_CVT_F64_F32,
+	V_CVT_F64_U32,
 	V_CVT_F32_I32,
 	V_CVT_F32_U32,
 	V_CVT_U32_F32,
@@ -173,6 +177,7 @@ enum class Opcode {
 	V_CVT_F32_UBYTE1,
 	V_CVT_F32_UBYTE2,
 	V_CVT_F32_UBYTE3,
+	V_RCP_F64,
 	V_RCP_F32,
 	V_RCP_IFLAG_F32,
 	V_FRACT_F32,
@@ -234,6 +239,8 @@ enum class Opcode {
 	V_MAD_I32_I24,
 	V_MAD_U32_U24,
 	V_MAD_U64_U32,
+	V_FMA_F64,
+	V_MUL_F64,
 	V_FMA_F32,
 	V_FMA_F16,
 	V_PACK_B32_F16,
@@ -354,6 +361,7 @@ enum class Opcode {
 	V_CMPX_GT_F32,
 	V_CMPX_LG_F32,
 	V_CMPX_GE_F32,
+	V_CMPX_O_F32,
 	V_CMPX_NGE_F32,
 	V_CMPX_NLG_F32,
 	V_CMPX_NGT_F32,
@@ -376,6 +384,7 @@ enum class Opcode {
 	V_CMP_GT_I16,
 	V_CMP_NE_I16,
 	V_CMP_GE_I16,
+	V_CMPX_LT_I16,
 	V_CMP_LT_F16,
 	V_CMP_EQ_F16,
 	V_CMP_LE_F16,
@@ -391,6 +400,7 @@ enum class Opcode {
 	V_CMPX_GT_F16,
 	V_CMPX_GE_F16,
 	V_CMPX_NGT_F16,
+	V_CMPX_NLE_F16,
 	V_CMPX_NEQ_F16,
 	V_CMPX_NLT_F16,
 	V_CMPX_LT_I32,
@@ -404,6 +414,7 @@ enum class Opcode {
 	V_CMP_LE_U16,
 	V_CMP_GT_U16,
 	V_CMPX_LT_U16,
+	V_CMPX_EQ_U16,
 	V_CMPX_GT_U16,
 	V_CMP_NE_U16,
 	V_CMP_GE_U16,
@@ -439,6 +450,7 @@ enum class Opcode {
 	S_BUFFER_LOAD_DWORDX4,
 	S_BUFFER_LOAD_DWORDX8,
 	S_BUFFER_LOAD_DWORDX16,
+	S_MEMREALTIME,
 	BUFFER_LOAD_FORMAT_X,
 	BUFFER_LOAD_FORMAT_XY,
 	BUFFER_LOAD_FORMAT_XYZ,
@@ -517,6 +529,7 @@ enum class Opcode {
 	DS_AND_B32,
 	DS_AND_RTN_B32,
 	DS_OR_B32,
+	DS_OR_B64,
 	DS_OR_RTN_B32,
 	DS_XOR_B32,
 	DS_XOR_RTN_B32,
@@ -568,6 +581,8 @@ enum class Opcode {
 	IMAGE_ATOMIC_AND,
 	IMAGE_ATOMIC_OR,
 	IMAGE_ATOMIC_XOR,
+	IMAGE_ATOMIC_FMIN,
+	IMAGE_ATOMIC_FMAX,
 	IMAGE_SAMPLE,
 	IMAGE_GATHER4_L,
 	IMAGE_GATHER4_LZ,
@@ -715,6 +730,7 @@ struct Instruction {
 	bool           formatted                                    = false;
 	bool           gds                                          = false;
 	bool           glc                                          = false;
+	bool           dlc                                          = false;
 	bool           slc                                          = false;
 	bool           idxen                                        = false;
 	bool           offen                                        = false;
@@ -733,16 +749,21 @@ struct Instruction {
 struct Program {
 	std::span<const uint32_t> code;
 	std::vector<Instruction>  instructions;
+	bool                     has_bvh = false;
+	// Decoding stopped at a BVH instruction; instructions.back() is that instruction.
+	bool                     stopped_at_bvh = false;
 };
 
 // Code spans are trusted to contain complete instructions, valid branch targets, and 32-bit PCs.
 Family GetInstructionFamily(uint32_t word);
 // The output object must be freshly initialized.
-void    DecodeInstruction(std::span<const uint32_t> code, uint32_t word_index, Instruction& inst);
+void DecodeInstruction(std::span<const uint32_t> code, uint32_t word_index, Instruction& inst);
 Program DecodeFrontProgram(std::span<const uint32_t> front);
-void    DecodeProgram(std::span<const uint32_t> code, Program& program);
-bool    IsConditionalBranch(Opcode opcode);
-bool    IsDirectBranch(Opcode opcode);
+// With stop_at_bvh unset, decoding continues past BVH instructions the translator can lower.
+void    DecodeProgram(std::span<const uint32_t> code, Program& program, bool stop_at_bvh = true);
+bool    IsLowerableBvh(const Instruction& inst);
+bool IsConditionalBranch(Opcode opcode);
+bool IsDirectBranch(Opcode opcode);
 
 void DecodeScalarSource(uint32_t code, uint32_t pc, Operand& operand);
 void DecodeScalarDestination(uint32_t code, uint32_t pc, Operand& operand);

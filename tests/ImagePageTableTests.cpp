@@ -9,9 +9,9 @@
 namespace {
 
 using Owners     = std::vector<uint32_t>;
-using Table      = Libs::Graphics::MultiLevelPageTable<Owners>;
+using Table      = Libs::Graphics::MultiLevelPageTable<Owners, 20, 44, 14>;
 using PageOwners = Libs::Graphics::InlinePageOwnerList<uint32_t, 16>;
-using OwnerTable = Libs::Graphics::MultiLevelPageTable<PageOwners, 20, 40, 10>;
+using OwnerTable = Libs::Graphics::MultiLevelPageTable<PageOwners, 20, 44, 14>;
 
 void Check(bool value, const char* text) {
 	if (!value) {

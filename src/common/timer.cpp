@@ -38,16 +38,7 @@ bool Timer::IsPaused() const {
 
 // return time in milliseconds
 double Timer::GetTimeMs() const {
-	if (m_is_paused) {
-		return 1000.0 * (static_cast<double>(m_PauseTime - m_StartTime)) /
-		       static_cast<double>(m_Frequency);
-	}
-
-	uint64_t current_time = 0;
-	SysQueryPerformanceCounter(&current_time);
-
-	return 1000.0 * (static_cast<double>(current_time - m_StartTime)) /
-	       static_cast<double>(m_Frequency);
+	return GetTimeS() * 1000.0;
 }
 
 // return time in seconds

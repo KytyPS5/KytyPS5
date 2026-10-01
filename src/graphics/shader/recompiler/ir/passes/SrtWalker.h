@@ -7,9 +7,6 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
-// Conservative mask of bits that may be set in a U32 expression.
-uint32_t PossibleU32Bits(Value value);
-
 class Value;
 
 using SrtMemoryReader = bool (*)(void* userdata, uint64_t address, std::span<uint32_t> values);
@@ -24,9 +21,6 @@ struct SrtRuntime {
 
 enum class RuntimeValueType { Any, Integer };
 
-// Collects reachable ReadConst values. Immediate offsets receive compact flat-buffer slots;
-// dynamic offsets remain explicit and are never assigned a fake slot.
-void BuildSrtPlan(Program& program);
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
                           RuntimeValueType type = RuntimeValueType::Any);
 // Uses the strict reader for values that affect shader specialization.
@@ -46,23 +40,23 @@ public:
 	bool EvaluateDescriptor(uint32_t source, DescriptorValue& result);
 	// An empty span means that all sources are active.
 	std::span<const uint8_t> FindActiveSources();
-	bool                     RefreshFlatBuffer(std::vector<uint32_t>& flat);
+	bool RefreshFlatBuffer(std::vector<uint32_t>& flat);
 
 private:
 	static ResourcePlan::EvaluationContext& AcquireContext(const ResourcePlan& program);
-	static float                            Float32(uint64_t bits);
-	bool                                    EvaluateWide(Value value, uint64_t& result);
-	bool                                    Arg(const Inst& inst, size_t index, uint64_t& result);
-	bool                                    EvaluatePhi(const Inst& inst, uint64_t& result);
-	bool                                    EvaluateExtract(const Inst& inst, uint64_t& result);
-	bool                                    EvaluateRawRead(const Inst& inst, uint64_t& result);
-	bool                                    EvaluateInst(const Inst& inst, uint64_t& result);
+	static float Float32(uint64_t bits);
+	bool EvaluateWide(Value value, uint64_t& result);
+	bool Arg(const Inst& inst, size_t index, uint64_t& result);
+	bool EvaluatePhi(const Inst& inst, uint64_t& result);
+	bool EvaluateExtract(const Inst& inst, uint64_t& result);
+	bool EvaluateRawRead(const Inst& inst, uint64_t& result);
+	bool EvaluateInst(const Inst& inst, uint64_t& result);
 
 	const ResourcePlan&              m_program;
-	SrtRuntime                       m_runtime;
+	SrtRuntime                      m_runtime;
 	std::span<const uint8_t>         m_clean_flat_slots;
-	SrtWalker*                       m_clean_evaluator = nullptr;
-	Value                            m_active_mask;
+	SrtWalker*                      m_clean_evaluator = nullptr;
+	Value                           m_active_mask;
 	ResourcePlan::EvaluationContext& m_context;
 };
 

@@ -5,6 +5,7 @@
 #include "libs/ajm/atrac9_decoder.h"
 #include "libs/ajm/decoder.h"
 #include "libs/ajm/mp3_decoder.h"
+#include "libs/ajm/opus_decoder.h"
 #include "libs/audio.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -75,16 +76,6 @@ struct AjmGetStatisticsResult {
 	uint32_t          memory[6];
 };
 
-struct AjmDecOpusInitializeParameters {
-	uint32_t channel_num;
-	uint32_t sample_rate;
-	uint32_t mapping_family;
-};
-
-struct AjmSidebandDecOpusCodecInfo {
-	uint32_t frames_per_packet;
-};
-
 enum class AjmCodec : uint32_t {
 	DecMp3           = 0,
 	DecAt9           = 1,
@@ -120,8 +111,6 @@ constexpr uint64_t AJM_FLAG_SIDEBAND_STREAM           = 1ull << 47u;
 constexpr uint64_t AJM_INSTANCE_FLAG_FORMAT_OFFSET    = 7u;
 constexpr uint64_t AJM_INSTANCE_FLAG_FORMAT_MASK      = 0x7u;
 constexpr uint64_t AJM_INSTANCE_FLAG_MAX_CHANNEL_MASK = 0x7fu;
-constexpr uint32_t AJM_DEC_OPUS_MAX_CHANNELS_FOR_10CH = 10;
-constexpr uint32_t AJM_DEC_OPUS_FRAME_SAMPLES         = 960;
 
 static std::atomic_uint32_t g_ajm_next_instance {1};
 static std::atomic_uint32_t g_ajm_next_batch {1};
@@ -172,10 +161,8 @@ int KYTY_SYSV_ABI AjmDecAt9ParseConfigData(const void*              config_data,
 		return AJM_ERROR_INVALID_PARAMETER;
 	}
 
-	uint8_t config[ATRAC9_CONFIG_DATA_SIZE] {};
-	std::memcpy(config, config_data, sizeof(config));
 	Atrac9CodecInfo codec_info {};
-	const int       init_result = Atrac9InitDecoder(handle, config);
+	const int       init_result = AjmAt9InitDecoder(handle, static_cast<const uint8_t*>(config_data));
 	const int       info_result =
 	    init_result == 0 ? Atrac9GetCodecInfo(handle, &codec_info) : init_result;
 	Atrac9ReleaseHandle(handle);
@@ -195,134 +182,6 @@ int KYTY_SYSV_ABI AjmDecAt9ParseConfigData(const void*              config_data,
 	config_info->superframe_size = static_cast<uint32_t>(codec_info.superframeSize);
 	return OK;
 }
-
-class AjmOpusDecoder final: public AjmDecoder {
-public:
-	AjmOpusDecoder(uint32_t channels, uint32_t sample_rate, AjmSampleEncoding encoding,
-	               uint64_t flags)
-	    : AjmDecoder(channels, sample_rate, encoding) {
-		(void)flags;
-	}
-
-	AjmDecodeResult Initialize(const void* codec_parameters,
-	                           size_t      codec_parameters_size) override {
-		auto result = MakeResult();
-
-		if (codec_parameters == nullptr ||
-		    codec_parameters_size < sizeof(AjmDecOpusInitializeParameters)) {
-			result.result = AJM_RESULT_INVALID_PARAMETER;
-			return result;
-		}
-
-		const auto* params = static_cast<const AjmDecOpusInitializeParameters*>(codec_parameters);
-		if (params->channel_num == 0 || params->channel_num > AJM_DEC_OPUS_MAX_CHANNELS_FOR_10CH ||
-		    params->sample_rate == 0) {
-			result.result = AJM_RESULT_INVALID_PARAMETER;
-			return result;
-		}
-
-		SetFormat(params->channel_num, params->sample_rate, m_sample_encoding);
-		m_mapping_family        = params->mapping_family;
-		m_total_decoded_samples = 0;
-		m_is_initialized        = true;
-		m_frames_per_packet     = 1;
-
-		LOGF("AJM Opus initialized: %" PRIu32 " Hz, %" PRIu32 " ch, mapping=%" PRIu32 "\n",
-		     params->sample_rate, params->channel_num, params->mapping_family);
-
-		return MakeResult();
-	}
-
-	void Reset() override { m_total_decoded_samples = 0; }
-
-	AjmDecodeResult Decode(const void* input, size_t input_size, void* output, size_t output_size,
-	                       bool multiple_frames, AjmGaplessState* gapless) override {
-		(void)multiple_frames;
-		auto result = MakeResult();
-
-		if (input == nullptr || input_size == 0) {
-			result.result = AJM_RESULT_PARTIAL_INPUT;
-			return result;
-		}
-		if (!m_is_initialized) {
-			result.result = AJM_RESULT_NOT_INITIALIZED;
-			return result;
-		}
-
-		auto samples_to_write = AJM_DEC_OPUS_FRAME_SAMPLES;
-		auto skip_samples     = 0u;
-		if (gapless != nullptr) {
-			skip_samples = std::min<uint32_t>(samples_to_write, gapless->current.skip_samples);
-			samples_to_write -= skip_samples;
-			if (gapless->HasSampleLimit()) {
-				samples_to_write =
-				    std::min<uint32_t>(samples_to_write, gapless->current.total_samples);
-			}
-		}
-
-		const auto output_bytes = static_cast<size_t>(samples_to_write) *
-		                          static_cast<size_t>(m_channels) *
-		                          AjmBytesPerSample(m_sample_encoding);
-		if (output_bytes != 0 && output == nullptr) {
-			result.result = AJM_RESULT_NOT_ENOUGH_ROOM;
-			return result;
-		}
-		if (output_bytes > output_size) {
-			result.result = AJM_RESULT_NOT_ENOUGH_ROOM;
-			return result;
-		}
-
-		if (output_bytes != 0) {
-			std::memset(output, 0, output_bytes);
-		}
-
-		if (gapless != nullptr) {
-			gapless->current.skip_samples =
-			    static_cast<uint16_t>(gapless->current.skip_samples - skip_samples);
-			if (gapless->HasSampleLimit()) {
-				gapless->current.total_samples =
-				    (gapless->current.total_samples > samples_to_write
-				         ? gapless->current.total_samples - samples_to_write
-				         : 0);
-			}
-
-			const auto skipped_samples = AJM_DEC_OPUS_FRAME_SAMPLES - samples_to_write;
-			const auto skipped_total   = std::min<uint32_t>(
-			    std::numeric_limits<uint16_t>::max(),
-			    static_cast<uint32_t>(gapless->current.skipped_samples) + skipped_samples);
-			gapless->current.skipped_samples = static_cast<uint16_t>(skipped_total);
-		}
-
-		result.input_consumed    = input_size;
-		result.output_written    = output_bytes;
-		result.frames            = 1;
-		result.frames_per_packet = m_frames_per_packet;
-		m_total_decoded_samples += samples_to_write;
-		result.total_decoded_samples = m_total_decoded_samples;
-		result.format                = GetFormat();
-		return result;
-	}
-
-	void WriteCodecInfo(void* output, size_t output_size,
-	                    const AjmDecodeResult& result) const override {
-		(void)result;
-		if (output == nullptr || output_size < sizeof(AjmSidebandDecOpusCodecInfo)) {
-			return;
-		}
-
-		auto* info              = static_cast<AjmSidebandDecOpusCodecInfo*>(output);
-		info->frames_per_packet = m_frames_per_packet;
-	}
-
-	[[nodiscard]] size_t CodecInfoSize() const override {
-		return sizeof(AjmSidebandDecOpusCodecInfo);
-	}
-
-private:
-	bool     m_is_initialized    = false;
-	uint32_t m_mapping_family    = 0;
-	uint32_t m_frames_per_packet = 1;
-};
 
 struct AjmInstanceState {
 	uint32_t                    context = 0;
@@ -376,7 +235,7 @@ static std::unique_ptr<AjmDecoder> AjmCreateDecoder(uint32_t codec, uint64_t fla
 		case static_cast<uint32_t>(AjmCodec::DecM4aac):
 			return std::make_unique<AjmAacDecoder>(channels, 48000, encoding, flags);
 		case static_cast<uint32_t>(AjmCodec::DecOpus):
-			return std::make_unique<AjmOpusDecoder>(channels, 48000, encoding, flags);
+			return std::make_unique<AjmOpusDecoder>(channels, encoding);
 		default: break;
 	}
 
@@ -682,16 +541,9 @@ static AjmDecodeResult AjmControlInstance(uint32_t instance, uint64_t flags,
 
 static AjmDecodeResult AjmSetGaplessDecode(uint32_t instance, const void* gapless_decode,
                                            int reset) {
-	std::scoped_lock lock(g_ajm_instances_mutex);
-	auto*            state = AjmFindInstanceLocked(instance);
-	if (state == nullptr || state->decoder == nullptr || gapless_decode == nullptr) {
-		AjmDecodeResult result {};
-		result.result = AJM_RESULT_INVALID_PARAMETER;
-		return result;
-	}
-
-	state->gapless.Set(*static_cast<const AjmSidebandGaplessDecode*>(gapless_decode), reset != 0);
-	return state->decoder->MakeResult();
+	const auto flags = AJM_FLAG_SIDEBAND_GAPLESS | (reset != 0 ? AJM_FLAG_CONTROL_RESET : 0);
+	return AjmControlInstance(instance, flags, gapless_decode, sizeof(AjmSidebandGaplessDecode),
+	                          nullptr, nullptr);
 }
 
 static AjmDecodeResult AjmGetGaplessDecode(uint32_t                  instance,
@@ -930,18 +782,8 @@ int KYTY_SYSV_ABI AjmBatchJobClearContext(AjmBatchInfo* info, uint32_t instance,
 	PRINT_NAME();
 	EXIT_NOT_IMPLEMENTED(info == nullptr);
 
-	AjmDecodeResult decode_result {};
-	{
-		std::scoped_lock lock(g_ajm_instances_mutex);
-		auto*            state = AjmFindInstanceLocked(instance);
-		if (state != nullptr && state->decoder != nullptr) {
-			state->gapless.Reset();
-			state->decoder->Reset();
-			decode_result = state->decoder->MakeResult();
-		} else {
-			decode_result.result = AJM_RESULT_INVALID_PARAMETER;
-		}
-	}
+	const auto decode_result =
+	    AjmControlInstance(instance, AJM_FLAG_CONTROL_RESET, nullptr, 0, nullptr, nullptr);
 
 	AjmWriteResult(result, AJM_SIDEBAND_RESULT_SIZE, decode_result);
 	LOGF("\t instance = 0x%08" PRIx32 "\n", instance);

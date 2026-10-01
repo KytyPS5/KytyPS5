@@ -106,12 +106,12 @@ void Translator::EXP(const Decoder::Instruction& inst) {
 	ir.Emit(IR::ValueOpcode::SetAttribute, {data, ir.GetExec()}, AddExportInfo(inst));
 }
 
-bool Translator::EmitInterpolation(const Decoder::Instruction& inst) {
+void Translator::EmitInterpolation(const Decoder::Instruction& inst) {
 	switch (inst.opcode) {
-		case Decoder::Opcode::V_INTERP_P1_F32: V_INTERP_P1_F32(); return true;
-		case Decoder::Opcode::V_INTERP_P2_F32: V_INTERP_P2_F32(inst); return true;
-		case Decoder::Opcode::V_INTERP_MOV_F32: V_INTERP_MOV_F32(inst); return true;
-		default: return false;
+		case Decoder::Opcode::V_INTERP_P1_F32: V_INTERP_P1_F32(); return;
+		case Decoder::Opcode::V_INTERP_P2_F32: V_INTERP_P2_F32(inst); return;
+		case Decoder::Opcode::V_INTERP_MOV_F32: V_INTERP_MOV_F32(inst); return;
+		default: return FailMissingTranslation(inst);
 	}
 }
 

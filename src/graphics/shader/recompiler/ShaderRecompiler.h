@@ -18,6 +18,8 @@ struct CompileOptions {
 	uint64_t                    shader_hash     = 0;
 	bool                        dump_ir                    = true;
 	bool                        early_dump                 = false;
+	// Lower supported BVH intersections instead of skipping dispatches that contain them.
+	bool                        software_bvh               = false;
 	const char*                 dump_label                 = nullptr;
 	std::span<const uint32_t>   user_data;
 	std::span<const uint32_t>   back_code;
@@ -28,6 +30,7 @@ struct TranslateResult {
 	IR::Program program;
 	std::string decoded_dump;
 	std::string cfg_dump;
+	bool        skip_dispatch = false;
 };
 
 struct CompileResult {

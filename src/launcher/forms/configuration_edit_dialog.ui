@@ -72,6 +72,27 @@
           <property name="toolTip"><string>Language</string></property>
          </widget>
         </item>
+        <item row="3" column="0">
+         <widget class="QLabel" name="label_controller_color">
+          <property name="text"><string>DualSense lightbar:</string></property>
+         </widget>
+        </item>
+        <item row="3" column="1">
+         <layout class="QHBoxLayout" name="controllerColorLayout">
+          <item>
+           <widget class="QPushButton" name="button_controller_color">
+            <property name="toolTip"><string>Choose and preview a fixed LED color. Bluetooth DualSense may take several seconds to update.</string></property>
+            <property name="text"><string>Custom</string></property>
+           </widget>
+          </item>
+          <item>
+           <widget class="QPushButton" name="button_controller_color_reset">
+            <property name="toolTip"><string>Let the game control the lightbar</string></property>
+            <property name="text"><string>Default</string></property>
+           </widget>
+          </item>
+         </layout>
+        </item>
        </layout>
       </widget>
      </item>
@@ -171,6 +192,12 @@
          <widget class="QCheckBox" name="checkBox_tessellation">
           <property name="toolTip"><string>Draw tessellated geometry. Disabled by default; unsupported tessellation may cause crashes.</string></property>
           <property name="text"><string>Enable tessellation support (experimental)</string></property>
+         </widget>
+        </item>
+        <item row="8" column="1">
+         <widget class="QCheckBox" name="checkBox_software_bvh">
+          <property name="toolTip"><string>Run ray-tracing BVH intersections in software. Disabled by default: compute dispatches that use them are skipped. Large ray-tracing shaders can take minutes to compile.</string></property>
+          <property name="text"><string>Enable software ray tracing (experimental)</string></property>
          </widget>
         </item>
        </layout>

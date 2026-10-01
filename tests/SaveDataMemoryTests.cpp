@@ -27,8 +27,8 @@ bool SystemContentParamSfoGetString(const char*, std::string* value) {
 }
 void SymbolDatabase::Add(const SymbolResolve&, uint64_t, const std::string&) {}
 namespace Timer {
-Common::Time GetTime() {
-	return Common::Time(0);
+double GetTimeMs() {
+	return 0.0;
 }
 } // namespace Timer
 } // namespace Loader

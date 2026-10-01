@@ -5,10 +5,11 @@
 #include <algorithm>
 #include <fmt/format.h>
 #include <iterator>
+#include <deque>
+#include <list>
 #include <map>
 #include <set>
 #include <span>
-#include <stack>
 
 namespace Libs::Graphics::ShaderRecompiler::CFG {
 namespace {
@@ -598,39 +599,6 @@ bool Contains(const std::vector<uint32_t>& values, uint32_t value) {
 	return std::find(values.begin(), values.end(), value) != values.end();
 }
 
-bool ReplaceValue(std::vector<uint32_t>& values, uint32_t old_value, uint32_t new_value) {
-	bool changed = false;
-	for (auto& value: values) {
-		if (value == old_value) {
-			value   = new_value;
-			changed = true;
-		}
-	}
-	if (changed) {
-		SortUnique(values);
-	}
-	return changed;
-}
-
-bool RemoveValue(std::vector<uint32_t>& values, uint32_t value) {
-	const auto old_size = values.size();
-	values.erase(std::remove(values.begin(), values.end(), value), values.end());
-	return values.size() != old_size;
-}
-
-bool ReplaceTerminatorTarget(Terminator& terminator, uint32_t old_value, uint32_t new_value) {
-	bool changed = false;
-	if (terminator.true_block == old_value) {
-		terminator.true_block = new_value;
-		changed               = true;
-	}
-	if (terminator.false_block == old_value) {
-		terminator.false_block = new_value;
-		changed                = true;
-	}
-	return changed;
-}
-
 uint32_t RemapId(uint32_t id, const std::vector<uint32_t>& id_map) {
 	return id != UINT32_MAX && id < id_map.size() ? id_map[id] : id;
 }
@@ -700,7 +668,6 @@ void PruneUnreachableBlocks(Graph& graph) {
 		RemapIds(block.successors, id_map);
 		block.predecessors.clear();
 		block.dominators.clear();
-		block.post_dominators.clear();
 		auto& terminator          = block.terminator;
 		terminator.true_block     = RemapId(terminator.true_block, id_map);
 		terminator.false_block    = RemapId(terminator.false_block, id_map);
@@ -748,37 +715,6 @@ void ComputeDominators(Graph& graph) {
 			if (next != block.dominators) {
 				block.dominators = std::move(next);
 				changed          = true;
-			}
-		}
-	}
-}
-
-void ComputePostDominators(Graph& graph) {
-	const auto count = static_cast<uint32_t>(graph.blocks.size());
-	const auto all   = AllBlockIds(count);
-
-	for (auto& block: graph.blocks) {
-		block.post_dominators = block.successors.empty() ? std::vector<uint32_t> {block.id} : all;
-	}
-
-	bool changed = true;
-	while (changed) {
-		changed = false;
-		for (auto& block: graph.blocks) {
-			std::vector<uint32_t> next;
-			if (block.successors.empty()) {
-				next = {block.id};
-			} else {
-				next = graph.blocks[block.successors.front()].post_dominators;
-				for (uint32_t i = 1; i < block.successors.size(); i++) {
-					next = IntersectSorted(next, graph.blocks[block.successors[i]].post_dominators);
-				}
-				AddUnique(next, block.id);
-				SortUnique(next);
-			}
-			if (next != block.post_dominators) {
-				block.post_dominators = std::move(next);
-				changed               = true;
 			}
 		}
 	}
@@ -841,31 +777,9 @@ void ComputeNaturalLoops(Graph& graph) {
 		edge.natural = natural;
 
 		NaturalLoop loop;
-		loop.header         = edge.to;
-		loop.latch          = edge.from;
-		loop.continue_block = edge.from;
-		loop.body_blocks    = std::move(body);
-
-		for (auto block_id: loop.body_blocks) {
-			const auto* block = graph.FindBlock(block_id);
-			if (block == nullptr) {
-				continue;
-			}
-			for (auto succ: block->successors) {
-				if (!Contains(loop.body_blocks, succ)) {
-					AddUnique(loop.exit_blocks, succ);
-				}
-			}
-		}
-		SortUnique(loop.exit_blocks);
-
-		if (!loop.exit_blocks.empty()) {
-			uint32_t merge = loop.exit_blocks.front();
-			for (uint32_t i = 1; i < loop.exit_blocks.size(); i++) {
-				merge = graph.FindNearestCommonPostDominator(merge, loop.exit_blocks[i]);
-			}
-			loop.merge = merge;
-		}
+		loop.header      = edge.to;
+		loop.latch       = edge.from;
+		loop.body_blocks = std::move(body);
 		graph.natural_loops.push_back(std::move(loop));
 	}
 }
@@ -965,7 +879,6 @@ void ComputeComponents(Graph& graph) {
 
 void RecomputeAnalyses(Graph& graph) {
 	ComputeDominators(graph);
-	ComputePostDominators(graph);
 	ComputeBackEdges(graph);
 	ComputeNaturalLoops(graph);
 	ComputeComponents(graph);
@@ -984,7 +897,6 @@ std::vector<uint32_t> ApplyBlockOrder(Graph& graph, std::vector<BasicBlock> bloc
 		RemapIds(block.predecessors, id_map);
 		RemapIds(block.successors, id_map);
 		RemapIds(block.dominators, id_map);
-		RemapIds(block.post_dominators, id_map);
 		block.terminator.true_block     = RemapId(block.terminator.true_block, id_map);
 		block.terminator.false_block    = RemapId(block.terminator.false_block, id_map);
 		block.terminator.merge_block    = RemapId(block.terminator.merge_block, id_map);
@@ -992,549 +904,6 @@ std::vector<uint32_t> ApplyBlockOrder(Graph& graph, std::vector<BasicBlock> bloc
 	}
 
 	return id_map;
-}
-
-uint32_t MoveBlockBefore(Graph& graph, uint32_t block_id, uint32_t before_id) {
-	if (block_id == before_id || block_id >= graph.blocks.size() ||
-	    before_id >= graph.blocks.size()) {
-		return block_id;
-	}
-
-	const auto              block_pos  = block_id;
-	const auto              before_pos = before_id;
-	std::vector<BasicBlock> old_blocks = std::move(graph.blocks);
-	std::vector<BasicBlock> new_blocks;
-	new_blocks.reserve(old_blocks.size());
-
-	for (uint32_t i = 0; i < old_blocks.size(); i++) {
-		if (i == before_pos) {
-			new_blocks.push_back(std::move(old_blocks[block_pos]));
-		}
-		if (i != block_pos) {
-			new_blocks.push_back(std::move(old_blocks[i]));
-		}
-	}
-
-	const auto id_map = ApplyBlockOrder(graph, std::move(new_blocks));
-
-	return RemapId(block_id, id_map);
-}
-
-std::vector<uint32_t> DominatedBlocks(const Graph& graph, uint32_t header,
-                                      uint32_t stop_block = UINT32_MAX) {
-	std::vector<uint32_t> blocks;
-	std::vector<uint32_t> stack = {header};
-	blocks.reserve(graph.blocks.size());
-	stack.reserve(graph.blocks.size());
-
-	while (!stack.empty()) {
-		const auto block_id = stack.back();
-		stack.pop_back();
-		if (block_id == stop_block || Contains(blocks, block_id) ||
-		    !graph.Dominates(header, block_id)) {
-			continue;
-		}
-
-		const auto* block = graph.FindBlock(block_id);
-		if (block == nullptr) {
-			continue;
-		}
-
-		AddUnique(blocks, block_id);
-		for (auto succ: block->successors) {
-			if (succ != stop_block && graph.Dominates(header, succ)) {
-				stack.push_back(succ);
-			}
-		}
-	}
-
-	SortUnique(blocks);
-	return blocks;
-}
-
-uint32_t AppendSyntheticBranchBlock(Graph& graph, uint32_t target) {
-	const auto* target_block = graph.FindBlock(target);
-
-	BasicBlock block;
-	block.id                    = static_cast<uint32_t>(graph.blocks.size());
-	block.start_pc              = target_block != nullptr ? target_block->start_pc : 0u;
-	block.end_pc                = block.start_pc;
-	block.inst_begin            = target_block != nullptr ? target_block->inst_begin : 0u;
-	block.inst_end              = block.inst_begin;
-	block.successors            = {target};
-	block.terminator.kind       = TerminatorKind::Branch;
-	block.terminator.condition  = BranchCondition::Always;
-	block.terminator.true_block = target;
-	graph.blocks.push_back(std::move(block));
-	return graph.blocks.back().id;
-}
-
-bool IsolateSemanticLoopHeader(Graph& graph, uint32_t old_header) {
-	const auto* header = graph.FindBlock(old_header);
-	if (header == nullptr || header->inst_begin == header->inst_end) {
-		return false;
-	}
-
-	const auto predecessors = header->predecessors;
-	const auto new_header   = AppendSyntheticBranchBlock(graph, old_header);
-	for (auto pred: predecessors) {
-		auto* block = graph.FindBlock(pred);
-		if (block != nullptr) {
-			ReplaceValue(block->successors, old_header, new_header);
-			ReplaceTerminatorTarget(block->terminator, old_header, new_header);
-		}
-	}
-	if (graph.entry_block == old_header) {
-		graph.entry_block = new_header;
-	}
-	MoveBlockBefore(graph, new_header, old_header);
-	RebuildPredecessors(graph);
-	RecomputeAnalyses(graph);
-	return true;
-}
-
-const NaturalLoop* FindInnermostContainingLoop(const Graph& graph, uint32_t block_id) {
-	const NaturalLoop* innermost = nullptr;
-	for (const auto& loop: graph.natural_loops) {
-		if (Contains(loop.body_blocks, block_id) &&
-		    (innermost == nullptr || loop.body_blocks.size() < innermost->body_blocks.size())) {
-			innermost = &loop;
-		}
-	}
-	return innermost;
-}
-
-bool IsInsideLoopConstruct(const Graph& graph, const NaturalLoop& loop, uint32_t block_id) {
-	return block_id != UINT32_MAX && block_id != loop.merge && block_id != loop.continue_block &&
-	       graph.Dominates(loop.header, block_id) && !graph.Dominates(loop.merge, block_id);
-}
-
-bool IsLoopControlGateway(const Graph& graph, const NaturalLoop& loop, uint32_t block_id) {
-	const auto* block = graph.FindBlock(block_id);
-	if (block == nullptr || block->terminator.kind != TerminatorKind::ConditionalBranch) {
-		return false;
-	}
-	const auto is_control_target = [&](uint32_t target) {
-		return target == loop.merge || target == loop.continue_block;
-	};
-	return is_control_target(block->terminator.true_block) &&
-	       is_control_target(block->terminator.false_block);
-}
-
-bool HasLinearPathToTerminal(const Graph& graph, uint32_t start) {
-	std::vector<bool> visited(graph.blocks.size(), false);
-	for (auto block_id = start;;) {
-		const auto* block = graph.FindBlock(block_id);
-		if (block == nullptr || block_id >= visited.size() || visited[block_id]) {
-			return false;
-		}
-		if (block->successors.empty()) {
-			return true;
-		}
-		if (block->successors.size() != 1) {
-			return false;
-		}
-		visited[block_id] = true;
-		block_id          = block->successors.front();
-	}
-}
-
-bool IsEnclosingLinearExit(const Graph& graph, uint32_t header, uint32_t block_id) {
-	// AGC commonly lowers nested early returns through a terminal epilogue shared with an
-	// enclosing conditional. Such a path is an exit boundary, not part of the inner selection.
-	if (!HasLinearPathToTerminal(graph, block_id)) {
-		return false;
-	}
-	const auto* block = graph.FindBlock(block_id);
-	while (block != nullptr && graph.Dominates(header, block->id) &&
-	       block->successors.size() == 1u) {
-		block = graph.FindBlock(block->successors.front());
-	}
-	if (block == nullptr || graph.Dominates(header, block->id) || block->predecessors.empty()) {
-		return false;
-	}
-	return std::ranges::all_of(block->predecessors, [&](uint32_t predecessor) {
-		return graph.Dominates(header, predecessor) || graph.Dominates(predecessor, header);
-	});
-}
-
-bool CanReachBefore(const Graph& graph, uint32_t start, uint32_t target, uint32_t stop) {
-	std::vector<uint32_t> pending = {start};
-	std::vector<bool>     visited(graph.blocks.size(), false);
-	while (!pending.empty()) {
-		const auto block_id = pending.back();
-		pending.pop_back();
-		if (block_id == target) {
-			return true;
-		}
-		if (block_id == stop || block_id >= visited.size() || visited[block_id]) {
-			continue;
-		}
-		visited[block_id] = true;
-		const auto* block = graph.FindBlock(block_id);
-		if (block != nullptr) {
-			pending.insert(pending.end(), block->successors.begin(), block->successors.end());
-		}
-	}
-	return false;
-}
-
-uint32_t FindSelectionMerge(const Graph& graph, const BasicBlock& block) {
-	const auto  global_merge = graph.FindNearestCommonPostDominator(block.terminator.true_block,
-	                                                                block.terminator.false_block);
-	const auto* loop         = FindInnermostContainingLoop(graph, block.id);
-	if (loop == nullptr) {
-		const auto* global_block = graph.FindBlock(global_merge);
-		const auto  true_target  = block.terminator.true_block;
-		const auto  false_target = block.terminator.false_block;
-		if (global_block == nullptr || global_block->successors.empty()) {
-			const bool false_reaches_true =
-			    CanReachBefore(graph, false_target, true_target, global_merge);
-			const bool true_reaches_false =
-			    CanReachBefore(graph, true_target, false_target, global_merge);
-			if (false_reaches_true != true_reaches_false) {
-				return false_reaches_true ? true_target : false_target;
-			}
-			if (global_merge == UINT32_MAX) {
-				// An enclosing selection's shared return needs its own inner merge
-				// gateway; the other arm can return directly without joining live state.
-				if (IsEnclosingLinearExit(graph, block.id, true_target)) {
-					return true_target;
-				}
-				if (IsEnclosingLinearExit(graph, block.id, false_target)) {
-					return false_target;
-				}
-				// A return can leave a selection without reaching its merge. Keep the
-				// continuing arm as the merge. Shared continuations receive a dedicated
-				// gateway in SplitSharedMergeBlock before structured control is emitted.
-				if (HasLinearPathToTerminal(graph, true_target)) {
-					return false_target;
-				}
-				if (HasLinearPathToTerminal(graph, false_target)) {
-					return true_target;
-				}
-			}
-		}
-		return global_merge;
-	}
-
-	// A selection can join at the loop-control gateway even when another arm breaks directly to
-	// the enclosing loop merge. Global post-dominance sees that break and incorrectly expands the
-	// selection through the backedge.
-	const auto true_target  = block.terminator.true_block;
-	const auto false_target = block.terminator.false_block;
-	if (IsLoopControlGateway(graph, *loop, true_target) && graph.Dominates(block.id, true_target) &&
-	    IsInsideLoopConstruct(graph, *loop, false_target)) {
-		return true_target;
-	}
-	if (IsLoopControlGateway(graph, *loop, false_target) &&
-	    graph.Dominates(block.id, false_target) &&
-	    IsInsideLoopConstruct(graph, *loop, true_target)) {
-		return false_target;
-	}
-	return global_merge;
-}
-
-bool IsInnermostLoopControlConditional(const Graph& graph, const BasicBlock& block) {
-	if (block.terminator.kind != TerminatorKind::ConditionalBranch) {
-		return false;
-	}
-	const auto* loop = FindInnermostContainingLoop(graph, block.id);
-	if (loop == nullptr || loop->merge == UINT32_MAX || loop->continue_block == UINT32_MAX) {
-		return false;
-	}
-	const auto true_target  = block.terminator.true_block;
-	const auto false_target = block.terminator.false_block;
-	if (block.id == loop->continue_block) {
-		const auto is_repeat_target = [&](uint32_t target) {
-			return target == loop->header || target == loop->merge;
-		};
-		return is_repeat_target(true_target) && is_repeat_target(false_target);
-	}
-	// An exit tail is outside the natural-loop body but is not a SPIR-V loop exit.
-	// Only direct merge/continue edges may omit the selection merge.
-	const auto is_control_target = [&](uint32_t target) {
-		return target == loop->merge || target == loop->continue_block;
-	};
-	return (is_control_target(true_target) &&
-	        (is_control_target(false_target) ||
-	         IsInsideLoopConstruct(graph, *loop, false_target))) ||
-	       (is_control_target(false_target) && IsInsideLoopConstruct(graph, *loop, true_target));
-}
-
-bool MergeLeavesContainingLoop(const Graph& graph, uint32_t header, uint32_t merge) {
-	for (const auto& loop: graph.natural_loops) {
-		if (loop.header != header && IsInsideLoopConstruct(graph, loop, header) &&
-		    !IsInsideLoopConstruct(graph, loop, merge)) {
-			return true;
-		}
-	}
-	return false;
-}
-
-bool CanonicalizeNaturalLoops(Graph& graph) {
-	const auto rewrite_budget = graph.blocks.size() * 2u + 16u;
-	for (size_t rewrite = 0; rewrite < rewrite_budget; rewrite++) {
-		bool changed = false;
-		for (const auto& loop: graph.natural_loops) {
-			std::vector<uint32_t> latches;
-			for (const auto& edge: graph.back_edges) {
-				if (edge.to == loop.header) {
-					AddUnique(latches, edge.from);
-				}
-			}
-			if (latches.size() <= 1u) {
-				continue;
-			}
-
-			const auto continue_block = AppendSyntheticBranchBlock(graph, loop.header);
-			for (auto latch: latches) {
-				auto* block = graph.FindBlock(latch);
-				if (block != nullptr) {
-					ReplaceValue(block->successors, loop.header, continue_block);
-					ReplaceTerminatorTarget(block->terminator, loop.header, continue_block);
-				}
-			}
-			RebuildPredecessors(graph);
-			RecomputeAnalyses(graph);
-			changed = true;
-			break;
-		}
-		if (changed) {
-			continue;
-		}
-
-		for (const auto& loop: graph.natural_loops) {
-			const auto* header                 = graph.FindBlock(loop.header);
-			const auto  is_loop_control_target = [&](uint32_t target) {
-				return target == loop.merge || target == loop.continue_block;
-			};
-			if (header == nullptr || header->terminator.kind != TerminatorKind::ConditionalBranch ||
-			    is_loop_control_target(header->terminator.true_block) ||
-			    is_loop_control_target(header->terminator.false_block) ||
-			    !Contains(loop.body_blocks, header->terminator.true_block) ||
-			    !Contains(loop.body_blocks, header->terminator.false_block)) {
-				continue;
-			}
-
-			IsolateSemanticLoopHeader(graph, loop.header);
-			changed = true;
-			break;
-		}
-		if (!changed) {
-			return true;
-		}
-	}
-
-	SetFailure(graph, FailureKind::StructuredControlFlow, graph.entry_block,
-	           "CFG loop canonicalization exceeded rewrite budget");
-	return false;
-}
-
-bool IsolateSemanticLoopHeaders(Graph& graph) {
-	const auto isolation_budget = graph.natural_loops.size() + 1u;
-	for (size_t isolation = 0; isolation < isolation_budget; isolation++) {
-		const auto loop = std::find_if(
-		    graph.natural_loops.begin(), graph.natural_loops.end(), [&](const auto& value) {
-			    const auto* header = graph.FindBlock(value.header);
-			    return header != nullptr && header->inst_begin != header->inst_end;
-		    });
-		if (loop == graph.natural_loops.end()) {
-			return true;
-		}
-
-		// SPIR-V requires OpLoopMerge and its branch to remain in the loop header's
-		// physical block. Keep that header as a dedicated control node, exactly like
-		// a separate Loop node in a structured AST. Guest instructions live
-		// in the body so later translation may introduce bounds/EXEC control flow without
-		// displacing OpLoopMerge into a helper-created block.
-		if (!IsolateSemanticLoopHeader(graph, loop->header)) {
-			SetFailure(graph, FailureKind::StructuredControlFlow, loop->header,
-			           fmt::format("failed to isolate semantic loop header {}", loop->header));
-			return false;
-		}
-	}
-
-	SetFailure(graph, FailureKind::StructuredControlFlow, graph.entry_block,
-	           "CFG semantic loop-header isolation exceeded rewrite budget");
-	return false;
-}
-
-bool SplitSharedMergeBlock(Graph& graph, uint32_t merge,
-                           const std::vector<uint32_t>& construct_blocks,
-                           bool                         force_split = false) {
-	if (merge == UINT32_MAX || merge >= graph.blocks.size() || Contains(construct_blocks, merge)) {
-		return false;
-	}
-
-	const auto* merge_block = graph.FindBlock(merge);
-	if (merge_block == nullptr) {
-		return false;
-	}
-
-	std::vector<uint32_t> construct_predecessors;
-	bool                  has_external_predecessor = false;
-	for (auto pred: merge_block->predecessors) {
-		if (Contains(construct_blocks, pred)) {
-			AddUnique(construct_predecessors, pred);
-		} else {
-			has_external_predecessor = true;
-		}
-	}
-
-	if (construct_predecessors.empty() || (!force_split && !has_external_predecessor)) {
-		return false;
-	}
-	const auto synthetic_merge = AppendSyntheticBranchBlock(graph, merge);
-	auto*      synthetic_block = graph.FindBlock(synthetic_merge);
-	if (synthetic_block != nullptr) {
-		synthetic_block->predecessors = construct_predecessors;
-		SortUnique(synthetic_block->predecessors);
-	}
-
-	for (auto pred: construct_predecessors) {
-		auto* block = graph.FindBlock(pred);
-		if (block == nullptr) {
-			continue;
-		}
-		ReplaceValue(block->successors, merge, synthetic_merge);
-		ReplaceTerminatorTarget(block->terminator, merge, synthetic_merge);
-	}
-
-	auto* old_merge = graph.FindBlock(merge);
-	if (old_merge != nullptr) {
-		for (auto pred: construct_predecessors) {
-			RemoveValue(old_merge->predecessors, pred);
-		}
-		AddUnique(old_merge->predecessors, synthetic_merge);
-		SortUnique(old_merge->predecessors);
-	}
-
-	MoveBlockBefore(graph, synthetic_merge, merge);
-	return true;
-}
-
-bool SplitOneLoopMerge(Graph& graph) {
-	const auto& loops = graph.natural_loops;
-	for (const auto& loop: loops) {
-		const auto construct_blocks = DominatedBlocks(graph, loop.header, loop.merge);
-		const auto force_split      = MergeLeavesContainingLoop(graph, loop.header, loop.merge);
-		if (SplitSharedMergeBlock(graph, loop.merge, construct_blocks, force_split)) {
-			return true;
-		}
-	}
-	return false;
-}
-
-std::vector<uint32_t> SelectionRegion(const Graph& graph, const BasicBlock& header,
-                                      uint32_t merge) {
-	std::vector<uint32_t> region;
-	std::vector<uint32_t> pending = {header.terminator.true_block, header.terminator.false_block};
-	const auto*           loop    = FindInnermostContainingLoop(graph, header.id);
-	while (!pending.empty()) {
-		const auto block_id = pending.back();
-		pending.pop_back();
-		if (block_id == merge || Contains(region, block_id) ||
-		    (loop != nullptr && (block_id == loop->merge || block_id == loop->continue_block))) {
-			continue;
-		}
-		const auto* block = graph.FindBlock(block_id);
-		if (block == nullptr) {
-			continue;
-		}
-		// A return terminates its own block; a branch to a shared return still has to
-		// obey selection entry/exit rules, just like any other branch.
-		AddUnique(region, block_id);
-		pending.insert(pending.end(), block->successors.begin(), block->successors.end());
-	}
-	SortUnique(region);
-	return region;
-}
-
-bool SplitOneSelectionMerge(Graph& graph) {
-	std::vector<uint32_t> loop_headers;
-	loop_headers.reserve(graph.natural_loops.size());
-	for (const auto& loop: graph.natural_loops) {
-		AddUnique(loop_headers, loop.header);
-	}
-
-	std::vector<uint32_t> selection_headers;
-	for (const auto& block: graph.blocks) {
-		if (block.terminator.kind == TerminatorKind::ConditionalBranch &&
-		    !Contains(loop_headers, block.id)) {
-			selection_headers.push_back(block.id);
-		}
-	}
-	std::sort(selection_headers.begin(), selection_headers.end(), [&](uint32_t lhs, uint32_t rhs) {
-		const auto* lhs_block = graph.FindBlock(lhs);
-		const auto* rhs_block = graph.FindBlock(rhs);
-		const auto  lhs_depth = lhs_block != nullptr ? lhs_block->dominators.size() : 0u;
-		const auto  rhs_depth = rhs_block != nullptr ? rhs_block->dominators.size() : 0u;
-		return lhs_depth != rhs_depth ? lhs_depth > rhs_depth : lhs < rhs;
-	});
-
-	for (const auto block_id: selection_headers) {
-		const auto* block = graph.FindBlock(block_id);
-		if (block == nullptr) {
-			continue;
-		}
-		if (IsInnermostLoopControlConditional(graph, *block)) {
-			continue;
-		}
-
-		const auto merge = FindSelectionMerge(graph, *block);
-		if (merge == UINT32_MAX || graph.FindBlock(merge) == nullptr) {
-			continue;
-		}
-		const auto region   = SelectionRegion(graph, *block, merge);
-		const auto external = std::find_if(region.begin(), region.end(), [&](uint32_t member) {
-			const auto* member_block = graph.FindBlock(member);
-			return member_block != nullptr &&
-			       std::ranges::any_of(member_block->predecessors, [&](uint32_t predecessor) {
-				       return predecessor != block_id && !Contains(region, predecessor);
-			       });
-		});
-		if (external != region.end()) {
-			SetFailure(
-			    graph, FailureKind::StructuredControlFlow, block_id,
-			    fmt::format("selection header block {} has externally entered region block {}; "
-			                "semantic block cloning is disabled",
-			                block_id, *external));
-			return false;
-		}
-		const auto construct_blocks = DominatedBlocks(graph, block_id, merge);
-		const auto force_split      = MergeLeavesContainingLoop(graph, block_id, merge);
-		if (SplitSharedMergeBlock(graph, merge, construct_blocks, force_split)) {
-			return true;
-		}
-	}
-	return false;
-}
-
-bool SplitSharedMergeBlocks(Graph& graph) {
-	const auto original_block_count = static_cast<uint32_t>(graph.blocks.size());
-	const auto split_budget         = std::max<uint32_t>(16u, original_block_count * 4u);
-	for (uint32_t splits = 0; splits < split_budget; splits++) {
-		if (!SplitOneLoopMerge(graph) && !SplitOneSelectionMerge(graph)) {
-			return !graph.unsupported;
-		}
-		RebuildPredecessors(graph);
-		RecomputeAnalyses(graph);
-	}
-	SetFailure(graph, FailureKind::StructuredControlFlow, graph.entry_block,
-	           fmt::format("CFG shared merge splitting exceeded budget: original_blocks={} "
-	                       "current_blocks={} split_budget={}",
-	                       original_block_count, static_cast<uint64_t>(graph.blocks.size()),
-	                       split_budget));
-	return false;
-}
-
-void ClearStructuredTerminators(Graph& graph) {
-	for (auto& block: graph.blocks) {
-		block.terminator.merge_block    = UINT32_MAX;
-		block.terminator.continue_block = UINT32_MAX;
-		block.terminator.loop_header    = false;
-	}
 }
 
 std::string VectorToString(const std::vector<uint32_t>& values) {
@@ -1584,292 +953,495 @@ bool Graph::Dominates(uint32_t dominator, uint32_t block) const {
 	return target != nullptr && Contains(target->dominators, dominator);
 }
 
-bool Graph::PostDominates(uint32_t post_dominator, uint32_t block) const {
-	const auto* target = FindBlock(block);
-	return target != nullptr && Contains(target->post_dominators, post_dominator);
-}
-
-uint32_t Graph::FindNearestCommonPostDominator(uint32_t block_a, uint32_t block_b) const {
-	const auto* a = FindBlock(block_a);
-	const auto* b = FindBlock(block_b);
-	if (a == nullptr || b == nullptr) {
-		return UINT32_MAX;
-	}
-
-	const auto common = IntersectSorted(a->post_dominators, b->post_dominators);
-	for (auto candidate: common) {
-		bool nearest = true;
-		for (auto other: common) {
-			if (other != candidate && !PostDominates(other, candidate)) {
-				nearest = false;
-				break;
-			}
-		}
-		if (nearest) {
-			return candidate;
-		}
-	}
-	return common.empty() ? UINT32_MAX : common.front();
-}
-
 namespace {
 
-struct GotoRouteBlocks {
-	uint32_t              before = UINT32_MAX;
-	std::vector<uint32_t> blocks;
-};
+// Eliminate gotos by moving them through a structured statement tree. Every Code node
+// retains exactly one guest block; only Boolean route values cross construct boundaries.
+// This follows the outward/inward/lifting transformations used by shadPS4's GotoPass.
+class GotoStructurizer {
+	using ExprOp = ConditionExpression::Op;
+	enum class Kind { Root, Code, Label, Goto, If, Loop, Break, Return, Set };
+	struct Node;
+	using List = std::list<Node*>;
+	struct Node {
+		Kind kind;
+		Node* parent = nullptr;
+		Node* target = nullptr;
+		List children;
+		List::iterator position;
+		uint32_t condition = 1;
+		uint32_t id = UINT32_MAX;
+	};
 
-void PlaceGotoRouteBlocks(Graph& graph, uint32_t original_block_count,
-                          const GotoRouteBlocks& route) {
-	std::vector<BasicBlock> old_blocks = std::move(graph.blocks);
-	std::vector<BasicBlock> new_blocks;
-	new_blocks.reserve(old_blocks.size());
-	for (uint32_t block_id = 0; block_id < original_block_count; block_id++) {
-		if (block_id == route.before) {
-			for (const auto route_block: route.blocks) {
-				new_blocks.push_back(std::move(old_blocks[route_block]));
-			}
+public:
+	explicit GotoStructurizer(const Graph& source): m_source(source) {
+		m_graph.expressions = {{ExprOp::Constant, 0}, {ExprOp::Constant, 1}};
+		m_graph.code_table_load_pcs = source.code_table_load_pcs;
+		m_root = New(Kind::Root);
+		std::vector<Node*> labels;
+		for (const auto& block: source.blocks) {
+			auto* label = Insert(m_root, m_root->children.end(), Kind::Label);
+			label->id = block.id;
+			labels.push_back(label);
 		}
-		new_blocks.push_back(std::move(old_blocks[block_id]));
-	}
-
-	ApplyBlockOrder(graph, std::move(new_blocks));
-}
-
-uint32_t AppendGotoSelectBlock(Graph& graph, uint32_t route_variable, uint32_t true_target,
-                               uint32_t false_target) {
-	const auto* target = graph.FindBlock(false_target);
-	BasicBlock  block;
-	block.id                       = static_cast<uint32_t>(graph.blocks.size());
-	block.start_pc                 = target != nullptr ? target->start_pc : 0u;
-	block.end_pc                   = block.start_pc;
-	block.inst_begin               = target != nullptr ? target->inst_begin : 0u;
-	block.inst_end                 = block.inst_begin;
-	block.successors               = {true_target, false_target};
-	block.terminator.kind          = TerminatorKind::ConditionalBranch;
-	block.terminator.condition     = BranchCondition::GotoVariable;
-	block.terminator.true_block    = true_target;
-	block.terminator.false_block   = false_target;
-	block.terminator.goto_variable = route_variable;
-	graph.blocks.push_back(std::move(block));
-	return graph.blocks.back().id;
-}
-
-uint32_t AppendGotoSetBlock(Graph& graph, uint32_t route_variable, bool value, uint32_t target) {
-	const auto block_id             = AppendSyntheticBranchBlock(graph, target);
-	auto*      block                = graph.FindBlock(block_id);
-	block->terminator.goto_variable = route_variable;
-	block->terminator.goto_value    = value ? 1 : 0;
-	return block_id;
-}
-
-void AppendEnclosingRouteBlocks(Graph& graph, uint32_t original_block_count,
-                                uint32_t route_variable, uint32_t shared, uint32_t other,
-                                uint32_t route_select, uint32_t route_root,
-                                std::vector<uint32_t>& route_blocks) {
-	for (uint32_t depth = 0; depth < original_block_count; depth++) {
-		uint32_t predecessor = UINT32_MAX;
-		uint32_t leaf        = UINT32_MAX;
-		for (uint32_t candidate = 0; candidate < original_block_count; candidate++) {
-			const auto* candidate_block = graph.FindBlock(candidate);
-			if (candidate_block == nullptr ||
-			    candidate_block->terminator.kind != TerminatorKind::ConditionalBranch ||
-			    IsInnermostLoopControlConditional(graph, *candidate_block)) {
-				continue;
+		// Give every natural loop one backedge before eliminating gotos. Otherwise
+		// multiple latches become nested loops that retest the same exit predicate.
+		struct Continue { uint32_t header; uint32_t after; size_t body_size; Node* label; };
+		std::vector<Continue> continues;
+		for (const auto& loop: source.natural_loops) {
+			if (std::ranges::any_of(continues, [&](const auto& value) { return value.header == loop.header; }) ||
+			    std::ranges::count(source.natural_loops, loop.header, &NaturalLoop::header) < 2) continue;
+			std::vector<uint32_t> body;
+			for (const auto& member: source.natural_loops) {
+				if (member.header == loop.header)
+					body.insert(body.end(), member.body_blocks.begin(), member.body_blocks.end());
 			}
-			const auto candidate_true  = candidate_block->terminator.true_block;
-			const auto candidate_false = candidate_block->terminator.false_block;
-			if (candidate_true == route_root &&
-			    (candidate_false == shared || candidate_false == other)) {
-				predecessor = candidate;
-				leaf        = candidate_false;
-				break;
-			}
-			if (candidate_false == route_root &&
-			    (candidate_true == shared || candidate_true == other)) {
-				predecessor = candidate;
-				leaf        = candidate_true;
-				break;
-			}
+			SortUnique(body);
+			auto* label = New(Kind::Label);
+			label->id = static_cast<uint32_t>(labels.size());
+			labels.push_back(label);
+			continues.push_back({loop.header, body.back(), body.size(), label});
 		}
-		if (predecessor == UINT32_MAX) {
-			break;
-		}
-
-		const auto routed_leaf =
-		    AppendGotoSetBlock(graph, route_variable, leaf == other, route_select);
-		auto* predecessor_block = graph.FindBlock(predecessor);
-		ReplaceValue(predecessor_block->successors, leaf, routed_leaf);
-		ReplaceTerminatorTarget(predecessor_block->terminator, leaf, routed_leaf);
-		route_blocks.push_back(routed_leaf);
-		route_root = predecessor;
-	}
-}
-
-// Turn H0 -> shared/H1, H1 -> shared/other into nested selections whose empty
-// forwarding blocks set one typed SSA route value. Guest semantic blocks remain unique.
-// Preserve loop-control branches just as SplitOneSelectionMerge does. Moving a loop
-// exit through the route selector can create an inner cycle whose merge is also the
-// enclosing loop merge, so splitting that shared exit can never separate the loops.
-bool RouteOneSharedArm(Graph& graph, uint32_t original_block_count, uint32_t outer_id,
-                       uint32_t route_variable, GotoRouteBlocks& route) {
-	auto* outer = graph.FindBlock(outer_id);
-	if (outer == nullptr || outer->inst_begin == outer->inst_end ||
-	    outer->terminator.kind != TerminatorKind::ConditionalBranch ||
-	    IsInnermostLoopControlConditional(graph, *outer)) {
-		return false;
-	}
-
-	for (const bool inner_is_true: {true, false}) {
-		const auto inner_id =
-		    inner_is_true ? outer->terminator.true_block : outer->terminator.false_block;
-		const auto shared =
-		    inner_is_true ? outer->terminator.false_block : outer->terminator.true_block;
-		const auto* inner = graph.FindBlock(inner_id);
-		if (inner == nullptr || inner->inst_begin == inner->inst_end ||
-		    inner->predecessors.size() != 1u || inner->predecessors.front() != outer_id ||
-		    inner->terminator.kind != TerminatorKind::ConditionalBranch ||
-		    IsInnermostLoopControlConditional(graph, *inner)) {
-			continue;
-		}
-
-		const bool true_is_shared  = inner->terminator.true_block == shared;
-		const bool false_is_shared = inner->terminator.false_block == shared;
-		if (true_is_shared != false_is_shared) {
-			const auto other =
-			    true_is_shared ? inner->terminator.false_block : inner->terminator.true_block;
-			if (other == outer_id || other == inner_id || other == shared) {
-				continue;
-			}
-			const auto first_arm = std::min(shared, other);
-			if (first_arm >= original_block_count || outer_id >= inner_id ||
-			    inner_id >= first_arm) {
-				continue;
-			}
-
-			const auto route_select = AppendGotoSelectBlock(graph, route_variable, other, shared);
-			const auto inner_merge  = AppendSyntheticBranchBlock(graph, route_select);
-			const auto outer_shared =
-			    AppendGotoSetBlock(graph, route_variable, false, route_select);
-			const auto inner_shared = AppendGotoSetBlock(graph, route_variable, false, inner_merge);
-			const auto inner_other  = AppendGotoSetBlock(graph, route_variable, true, inner_merge);
-
-			outer                         = graph.FindBlock(outer_id);
-			auto* mutable_inner           = graph.FindBlock(inner_id);
-			outer->terminator.true_block  = inner_is_true ? inner_id : outer_shared;
-			outer->terminator.false_block = inner_is_true ? outer_shared : inner_id;
-			outer->successors = {outer->terminator.true_block, outer->terminator.false_block};
-			mutable_inner->terminator.true_block  = true_is_shared ? inner_shared : inner_other;
-			mutable_inner->terminator.false_block = true_is_shared ? inner_other : inner_shared;
-			mutable_inner->successors             = {mutable_inner->terminator.true_block,
-			                                         mutable_inner->terminator.false_block};
-
-			std::vector<uint32_t> route_blocks = {inner_shared, inner_other, inner_merge,
-			                                      outer_shared};
-			AppendEnclosingRouteBlocks(graph, original_block_count, route_variable, shared, other,
-			                           route_select, outer_id, route_blocks);
-			route_blocks.push_back(route_select);
-			route = {first_arm, std::move(route_blocks)};
-			return true;
-		}
-
-		// H0 -> arm/H1, H1 -> exit/body, and both arms reach a common continuation.
-		// Route exit/continuation after joining H0 and H1 so neither has a nonlocal edge.
-		for (const bool exit_is_true: {true, false}) {
-			const auto other =
-			    exit_is_true ? inner->terminator.true_block : inner->terminator.false_block;
-			const auto body =
-			    exit_is_true ? inner->terminator.false_block : inner->terminator.true_block;
-			if (other == outer_id || other == inner_id || other == shared || body == outer_id ||
-			    body == inner_id || body == shared || !graph.Dominates(inner_id, body)) {
-				continue;
-			}
-
-			const auto  continuation       = graph.FindNearestCommonPostDominator(shared, body);
-			const auto* continuation_block = graph.FindBlock(continuation);
-			if (continuation_block == nullptr || continuation == other ||
-			    CanReachBefore(graph, other, continuation, UINT32_MAX)) {
-				continue;
-			}
-			std::vector<uint32_t> outer_predecessors;
-			std::vector<uint32_t> inner_predecessors;
-			bool                  external_predecessor = false;
-			for (const auto predecessor: continuation_block->predecessors) {
-				if (predecessor == outer_id || graph.Dominates(shared, predecessor)) {
-					outer_predecessors.push_back(predecessor);
-				} else if (predecessor == inner_id || graph.Dominates(body, predecessor)) {
-					inner_predecessors.push_back(predecessor);
-				} else {
-					external_predecessor = true;
+		std::ranges::sort(continues, [](const auto& a, const auto& b) {
+			return a.after != b.after ? a.after < b.after : a.body_size < b.body_size;
+		});
+		m_route_expressions.resize(labels.size(), UINT32_MAX);
+		for (const auto& block: source.blocks) {
+			auto* label = labels.at(block.id);
+			const auto end = std::next(label->position);
+			auto* code = Insert(m_root, end, Kind::Code);
+			code->id = block.id;
+			const auto add_goto = [&](uint32_t condition, uint32_t target) {
+				auto* node = Insert(m_root, end, Kind::Goto);
+				node->condition = condition;
+				node->target = labels.at(target);
+				for (const auto& value: continues) {
+					if (value.header == target && source.Dominates(target, block.id))
+						node->target = value.label;
 				}
-			}
-			const auto first_arm = std::min(continuation, other);
-			if (outer_predecessors.empty() || inner_predecessors.empty() || external_predecessor ||
-			    first_arm >= original_block_count || outer_id >= inner_id ||
-			    inner_id >= first_arm) {
-				continue;
-			}
-
-			const auto route_select =
-			    AppendGotoSelectBlock(graph, route_variable, other, continuation);
-			const auto inner_merge = AppendSyntheticBranchBlock(graph, route_select);
-			const auto outer_continue =
-			    AppendGotoSetBlock(graph, route_variable, false, route_select);
-			const auto inner_continue =
-			    AppendGotoSetBlock(graph, route_variable, false, inner_merge);
-			const auto inner_other = AppendGotoSetBlock(graph, route_variable, true, inner_merge);
-
-			auto* mutable_inner = graph.FindBlock(inner_id);
-			if (exit_is_true) {
-				mutable_inner->terminator.true_block = inner_other;
+				m_gotos.push_back(node);
+			};
+			const auto& term = block.terminator;
+			if (term.kind == TerminatorKind::ConditionalBranch) {
+				// Capture at the semantic block, before movement can pass an SCC/EXEC write.
+				const auto condition = Expression(ExprOp::Variable, CaptureVariable(block.id));
+				add_goto(condition, term.true_block);
+				add_goto(1, term.false_block);
+			} else if (term.kind == TerminatorKind::Branch) {
+				add_goto(1, term.true_block);
+			} else if (term.kind == TerminatorKind::Return) {
+				Insert(m_root, end, Kind::Return);
 			} else {
-				mutable_inner->terminator.false_block = inner_other;
+				Fail("indirect control flow requires dispatcher lowering");
 			}
-			ReplaceValue(mutable_inner->successors, other, inner_other);
-			for (const auto predecessor: outer_predecessors) {
-				auto* predecessor_block = graph.FindBlock(predecessor);
-				ReplaceValue(predecessor_block->successors, continuation, outer_continue);
-				ReplaceTerminatorTarget(predecessor_block->terminator, continuation,
-				                        outer_continue);
+			for (const auto& value: continues) {
+				if (value.after != block.id) continue;
+				value.label->parent = m_root;
+				value.label->position = m_root->children.insert(end, value.label);
+				auto* repeat = Insert(m_root, end, Kind::Goto);
+				repeat->target = labels[value.header];
+				m_gotos.push_back(repeat);
 			}
-			for (const auto predecessor: inner_predecessors) {
-				auto* predecessor_block = graph.FindBlock(predecessor);
-				ReplaceValue(predecessor_block->successors, continuation, inner_continue);
-				ReplaceTerminatorTarget(predecessor_block->terminator, continuation,
-				                        inner_continue);
-			}
-
-			std::vector<uint32_t> route_blocks = {inner_continue, inner_other, inner_merge,
-			                                      outer_continue};
-			if (continuation == shared) {
-				AppendEnclosingRouteBlocks(graph, original_block_count, route_variable, shared,
-				                           other, route_select, outer_id, route_blocks);
-			}
-			route_blocks.push_back(route_select);
-			route = {first_arm, std::move(route_blocks)};
-			return true;
 		}
 	}
-	return false;
-}
 
-bool RouteSharedSelectionArm(Graph& graph, uint32_t route_variable) {
-	if (graph.irreducible) {
+	Graph Run() {
+		for (auto it = m_gotos.rbegin(); it != m_gotos.rend() && m_failure == nullptr; ++it) {
+			Eliminate(*it);
+		}
+		if (m_failure != nullptr) return Failed();
+		const auto entry = Allocate();
+		m_graph.entry_block = entry;
+		Place(entry);
+		Branch(Visit(m_root, entry, UINT32_MAX), UINT32_MAX);
+		if (m_failure != nullptr) return Failed();
+		std::vector<BasicBlock> ordered;
+		ordered.reserve(m_order.size());
+		for (const auto id: m_order) {
+			ordered.push_back(std::move(m_graph.blocks[id]));
+		}
+		ApplyBlockOrder(m_graph, std::move(ordered));
+		RebuildPredecessors(m_graph);
+		if (std::ranges::any_of(m_graph.blocks, [&](const auto& block) {
+			    return block.id != m_graph.entry_block && block.predecessors.empty();
+			})) {
+			Fail("structured control flow requires an unreachable merge");
+			return Failed();
+		}
+		RecomputeAnalyses(m_graph);
+		if (m_graph.irreducible) {
+			Fail("goto elimination produced irreducible control flow");
+			return Failed();
+		}
+		return std::move(m_graph);
+	}
+
+private:
+	void Fail(const char* reason) { m_failure = reason; }
+	Graph Failed() {
+		SetFailure(m_graph, FailureKind::StructuredControlFlow, UINT32_MAX, m_failure);
+		return std::move(m_graph);
+	}
+	uint32_t CaptureVariable(uint32_t block) const {
+		return static_cast<uint32_t>(m_route_expressions.size()) + block;
+	}
+	Node* New(Kind kind) {
+		m_nodes.emplace_back();
+		m_nodes.back().kind = kind;
+		return &m_nodes.back();
+	}
+	Node* Insert(Node* parent, List::iterator before, Kind kind) {
+		auto* node = New(kind);
+		node->parent = parent;
+		node->position = parent->children.insert(before, node);
+		return node;
+	}
+	void Erase(Node* node) { node->parent->children.erase(node->position); }
+	uint32_t Expression(ExprOp op, uint32_t lhs, uint32_t rhs = UINT32_MAX) {
+		if (op == ExprOp::Not) {
+			const auto& inner = m_graph.expressions[lhs];
+			if (inner.op == ExprOp::Constant) return inner.lhs ? 0 : 1;
+			if (inner.op == ExprOp::Not) return inner.lhs;
+		}
+		if (op == ExprOp::Or) {
+			if (lhs == 1 || rhs == 1) return 1;
+			if (lhs == 0 || lhs == rhs) return rhs;
+			if (rhs == 0) return lhs;
+		}
+		const auto result = static_cast<uint32_t>(m_graph.expressions.size());
+		m_graph.expressions.push_back({op, lhs, rhs});
+		return result;
+	}
+	uint32_t RouteVariable(Node* label) {
+		auto& expression = m_route_expressions[label->id];
+		if (expression == UINT32_MAX) {
+			expression = Expression(ExprOp::Variable, label->id);
+			// SSA initializes route variables to false; clear them again on each label visit.
+			auto* reset = Insert(label->parent, std::next(label->position), Kind::Set);
+			reset->id = label->id;
+			reset->condition = 0;
+		}
+		return expression;
+	}
+	static size_t Depth(Node* node) {
+		size_t depth = 0;
+		for (; node->parent != nullptr; node = node->parent) ++depth;
+		return depth;
+	}
+	static bool Related(Node* a, Node* b) {
+		auto a_depth = Depth(a);
+		auto b_depth = Depth(b);
+		while (a_depth > b_depth) { a = a->parent; --a_depth; }
+		while (b_depth > a_depth) { b = b->parent; --b_depth; }
+		return a->parent == b->parent;
+	}
+	static bool Ordered(Node* a, Node* b) {
+		for (auto it = a->position; it != a->parent->children.end(); ++it) {
+			if (*it == b) return true;
+		}
 		return false;
 	}
-	const auto block_count = static_cast<uint32_t>(graph.blocks.size());
-	// Route later/deeper candidates first so earlier shared arms remain structured.
-	for (uint32_t block_id = block_count; block_id-- > 0;) {
-		GotoRouteBlocks route;
-		if (RouteOneSharedArm(graph, block_count, block_id, route_variable, route)) {
-			PlaceGotoRouteBlocks(graph, block_count, route);
-			RebuildPredecessors(graph);
-			RecomputeAnalyses(graph);
-			return true;
+	static Node* Sibling(Node* uncle, Node* nephew) {
+		while (nephew->parent != uncle->parent) nephew = nephew->parent;
+		return nephew;
+	}
+	static void Adopt(Node* parent) {
+		for (auto* child: parent->children) child->parent = parent;
+	}
+	void SetBefore(Node* node, uint32_t id, uint32_t expression) {
+		auto* set = Insert(node->parent, node->position, Kind::Set);
+		set->id = id;
+		set->condition = expression;
+	}
+	Node* GotoAfter(Node* construct, Node* label, uint32_t condition) {
+		auto* node = Insert(construct->parent, std::next(construct->position), Kind::Goto);
+		node->target = label;
+		node->condition = condition;
+		return node;
+	}
+	Node* Outward(Node* node) {
+		auto* parent = node->parent;
+		auto* target = node->target;
+		const auto variable = RouteVariable(target);
+		SetBefore(node, target->id, node->condition);
+		if (parent->kind == Kind::If) {
+			auto* rest = Insert(parent, node->position, Kind::If);
+			rest->condition = Expression(ExprOp::Not, variable);
+			rest->children.splice(rest->children.end(), parent->children,
+			                      std::next(node->position), parent->children.end());
+			Adopt(rest);
+		} else if (parent->kind == Kind::Loop) {
+			auto* stop = Insert(parent, node->position, Kind::Break);
+			stop->condition = variable;
+		} else {
+			Fail("goto has no enclosing selection or loop");
+			return node;
+		}
+		Erase(node);
+		return GotoAfter(parent, target, variable);
+	}
+	Node* Inward(Node* node) {
+		auto* parent = node->parent;
+		auto* target = node->target;
+		auto* nested = Sibling(node, target);
+		const auto variable = RouteVariable(target);
+		SetBefore(node, target->id, node->condition);
+		auto* rest = Insert(parent, node->position, Kind::If);
+		rest->condition = Expression(ExprOp::Not, variable);
+		rest->children.splice(rest->children.end(), parent->children,
+		                      std::next(node->position), nested->position);
+		Adopt(rest);
+		Erase(node);
+		if (nested->kind == Kind::If) {
+			nested->condition = Expression(ExprOp::Or, variable, nested->condition);
+		} else if (nested->kind != Kind::Loop) {
+			Fail("goto target has no enclosing construct");
+			return node;
+		}
+		auto* moved = Insert(nested, nested->children.begin(), Kind::Goto);
+		moved->target = target;
+		moved->condition = variable;
+		return moved;
+	}
+	Node* Lift(Node* node) {
+		auto* parent = node->parent;
+		auto* target = node->target;
+		auto* nested = Sibling(node, target);
+		const auto variable = RouteVariable(target);
+		auto* loop = Insert(parent, node->position, Kind::Loop);
+		loop->condition = variable;
+		loop->children.splice(loop->children.end(), parent->children,
+		                      nested->position, loop->position);
+		Adopt(loop);
+		if (std::ranges::any_of(loop->children, [](auto* child) { return child->kind == Kind::Break; })) {
+			Fail("goto lifting would capture an enclosing loop exit");
+			return node;
+		}
+		auto* moved = Insert(loop, loop->children.begin(), Kind::Goto);
+		moved->target = target;
+		moved->condition = variable;
+		auto* set = Insert(loop, loop->children.end(), Kind::Set);
+		set->id = target->id;
+		set->condition = node->condition;
+		Erase(node);
+		return moved;
+	}
+	void Eliminate(Node* node) {
+		auto* target = node->target;
+		while (node->parent != target->parent && m_failure == nullptr) {
+			if (!Related(node, target) || Depth(node) > Depth(target)) {
+				node = Outward(node);
+			} else if (Ordered(Sibling(node, target), node)) {
+				node = Lift(node);
+			} else {
+				node = Inward(node);
+			}
+		}
+		if (m_failure != nullptr) return;
+		if (std::next(node->position) == target->position) {
+			Erase(node);
+			return;
+		}
+		auto* parent = node->parent;
+		if (Ordered(node, target)) {
+			auto* selection = Insert(parent, node->position, Kind::If);
+			selection->condition = Expression(ExprOp::Not, node->condition);
+			selection->children.splice(selection->children.end(), parent->children,
+			                           std::next(node->position), target->position);
+			Adopt(selection);
+		} else {
+			auto* loop = Insert(parent, node->position, Kind::Loop);
+			loop->condition = node->condition;
+			loop->children.splice(loop->children.end(), parent->children,
+			                      target->position, loop->position);
+			Adopt(loop);
+		}
+		Erase(node);
+	}
+
+	uint32_t Allocate() {
+		BasicBlock block;
+		block.id = static_cast<uint32_t>(m_graph.blocks.size());
+		m_graph.blocks.push_back(std::move(block));
+		return m_graph.blocks.back().id;
+	}
+	void Place(uint32_t block) { m_order.push_back(block); }
+	void Branch(uint32_t from, uint32_t to) {
+		if (from == UINT32_MAX) return;
+		auto& block = m_graph.blocks[from];
+		block.terminator.kind = to == UINT32_MAX ? TerminatorKind::Return : TerminatorKind::Branch;
+		block.terminator.true_block = to;
+		block.successors = to == UINT32_MAX ? std::vector<uint32_t> {} : std::vector<uint32_t> {to};
+	}
+	void Conditional(uint32_t block_id, uint32_t condition, uint32_t yes, uint32_t no,
+	                 uint32_t merge = UINT32_MAX) {
+		auto& block = m_graph.blocks[block_id];
+		auto& term = block.terminator;
+		term.kind = TerminatorKind::ConditionalBranch;
+		term.expression = condition;
+		term.condition = BranchCondition::Expression;
+		term.true_block = yes;
+		term.false_block = no;
+		term.merge_block = merge;
+		block.successors = {yes, no};
+	}
+	uint32_t Advance(uint32_t current) {
+		const auto next = Allocate();
+		Branch(current, next);
+		Place(next);
+		return next;
+	}
+	bool RefersTo(uint32_t expression, uint32_t variable) const {
+		const auto& value = m_graph.expressions[expression];
+		switch (value.op) {
+			case ExprOp::Variable: return value.lhs == variable;
+			case ExprOp::Not: return RefersTo(value.lhs, variable);
+			case ExprOp::Or: return RefersTo(value.lhs, variable) || RefersTo(value.rhs, variable);
+			default: return false;
 		}
 	}
-	return false;
-}
+	bool Modifies(Node* node, uint32_t expression) const {
+		if (node->kind == Kind::Set && RefersTo(expression, node->id)) return true;
+		if (node->kind == Kind::Code &&
+		    m_source.blocks[node->id].terminator.kind == TerminatorKind::ConditionalBranch &&
+		    RefersTo(expression, CaptureVariable(node->id))) return true;
+		return std::ranges::any_of(node->children, [&](auto* child) { return Modifies(child, expression); });
+	}
+	bool Complements(uint32_t first, uint32_t second) const {
+		const auto& a = m_graph.expressions[first];
+		const auto& b = m_graph.expressions[second];
+		return (a.op == ExprOp::Not && a.lhs == second) ||
+		       (b.op == ExprOp::Not && b.lhs == first);
+	}
+	uint32_t Visit(Node* parent, uint32_t current, uint32_t break_block) {
+		for (auto it = parent->children.begin(); it != parent->children.end(); ++it) {
+			auto* node = *it;
+			if (node->kind == Kind::Label) continue;
+			if (current == UINT32_MAX) {
+				current = Allocate();
+				Place(current);
+			}
+			switch (node->kind) {
+				case Kind::Code: {
+					const auto& source = m_source.blocks[node->id];
+					const auto& previous = m_graph.blocks[current];
+					// Route assignments cannot observe guest writes; native predicates must stay at their original Code.
+					const bool captures_native = std::ranges::any_of(previous.assignments, [&](const auto& assignment) {
+						return m_graph.expressions[assignment.expression].op == ExprOp::Native;
+					});
+					if (captures_native ||
+					    (previous.inst_begin != previous.inst_end && previous.inst_end != source.inst_begin)) {
+						current = Advance(current);
+					}
+					auto& block = m_graph.blocks[current];
+					if (block.inst_begin == block.inst_end) {
+						block.start_pc = source.start_pc;
+						block.inst_begin = source.inst_begin;
+					}
+					block.end_pc = source.end_pc;
+					block.inst_end = source.inst_end;
+					if (source.terminator.kind == TerminatorKind::ConditionalBranch) {
+						block.assignments.push_back({CaptureVariable(source.id),
+						    Expression(ExprOp::Native, static_cast<uint32_t>(source.terminator.condition))});
+					}
+					break;
+				}
+				case Kind::Set: {
+					m_graph.blocks[current].assignments.push_back({node->id, node->condition});
+					break;
+				}
+				case Kind::If: {
+					if (node->condition == 0 || node->children.empty()) break;
+					if (node->condition == 1) {
+						current = Visit(node, current, break_block);
+						break;
+					}
+					auto next = std::next(it);
+					while (next != parent->children.end() && (*next)->kind == Kind::Label) ++next;
+					Node* other = next != parent->children.end() ? *next : nullptr;
+					const bool paired = other != nullptr && other->kind == Kind::If &&
+					                    Complements(node->condition, other->condition) &&
+					                    !Modifies(node, node->condition);
+					const auto body = Allocate();
+					const auto merge = Allocate();
+					const auto alternative = paired ? Allocate() : merge;
+					Conditional(current, node->condition, body, alternative, merge);
+					Place(body);
+					Branch(Visit(node, body, break_block), merge);
+					if (paired) {
+						Place(alternative);
+						Branch(Visit(other, alternative, break_block), merge);
+						it = next;
+					}
+					Place(merge);
+					current = merge;
+					break;
+				}
+				case Kind::Loop: {
+					const auto& previous = m_graph.blocks[current];
+					const bool empty = previous.inst_begin == previous.inst_end &&
+					                   previous.assignments.empty();
+					const auto header = empty ? current : Advance(current);
+					const auto body = Allocate();
+					const auto merge = Allocate();
+					Branch(header, body);
+					Place(body);
+					auto repeat = Visit(node, body, merge);
+					// A construct merge belongs to the loop body, not its continue construct.
+					if (repeat == UINT32_MAX || std::ranges::any_of(m_graph.blocks, [&](const auto& block) {
+						    return block.terminator.merge_block == repeat;
+						})) {
+						repeat = Advance(repeat);
+					}
+					auto& term = m_graph.blocks[header].terminator;
+					term.loop_header = true;
+					term.merge_block = merge;
+					term.continue_block = repeat;
+					if (node->condition <= 1) Branch(repeat, node->condition ? header : merge);
+					else Conditional(repeat, node->condition, header, merge);
+					Place(merge);
+					current = merge;
+					break;
+				}
+				case Kind::Break: {
+					if (break_block == UINT32_MAX) {
+						Fail("break outside a loop");
+						return UINT32_MAX;
+					}
+					if (node->condition == 0) break;
+					if (node->condition == 1) {
+						Branch(current, break_block);
+						current = UINT32_MAX;
+					} else {
+						const auto next = Allocate();
+						Conditional(current, node->condition, break_block, next);
+						Place(next);
+						current = next;
+					}
+					break;
+				}
+				case Kind::Return:
+					Branch(current, UINT32_MAX);
+					current = UINT32_MAX;
+					break;
+				default:
+					Fail("uneliminated control-flow statement");
+					return UINT32_MAX;
+			}
+			if (m_failure != nullptr) return UINT32_MAX;
+		}
+		return current;
+	}
+
+	const char* m_failure = nullptr;
+	const Graph& m_source;
+	Graph m_graph;
+	std::deque<Node> m_nodes;
+	Node* m_root = nullptr;
+	std::vector<Node*> m_gotos;
+	std::vector<uint32_t> m_route_expressions;
+	std::vector<uint32_t> m_order;
+};
 
 } // namespace
 
@@ -2102,125 +1674,13 @@ Graph BuildGraph(const Decoder::Program& program) {
 	return graph;
 }
 
-namespace {
-
-bool StructurizeImpl(Graph& graph) {
+Graph Structurize(const Graph& graph) {
 	if (graph.unsupported || graph.irreducible) {
-		if (graph.unsupported_reason.empty()) {
-			graph.unsupported_reason = "unsupported CFG";
-		}
-		return false;
+		Graph failed;
+		SetFailure(failed, graph.failure_kind, graph.failure_block, graph.unsupported_reason);
+		return failed;
 	}
-
-	if (!CanonicalizeNaturalLoops(graph)) {
-		return false;
-	}
-	if (!SplitSharedMergeBlocks(graph)) {
-		return false;
-	}
-	if (!IsolateSemanticLoopHeaders(graph)) {
-		return false;
-	}
-	ClearStructuredTerminators(graph);
-
-	std::map<uint32_t, uint32_t> merge_headers;
-	auto                         reserve_merge_block = [&](uint32_t header, uint32_t merge) {
-		const auto [it, inserted] = merge_headers.emplace(merge, header);
-		if (!inserted && it->second != header) {
-			SetFailure(
-			    graph, FailureKind::StructuredControlFlow, header,
-			    fmt::format(
-			        "duplicate structured merge block {} for header {} (already used by header {})",
-			        merge, header, it->second));
-			return false;
-		}
-		return true;
-	};
-
-	for (const auto& loop: graph.natural_loops) {
-		auto* header = graph.FindBlock(loop.header);
-		if (header == nullptr || loop.merge == UINT32_MAX || loop.continue_block == UINT32_MAX) {
-			SetFailure(
-			    graph, FailureKind::StructuredControlFlow, loop.header,
-			    fmt::format("loop at block {} has no structured merge/continue", loop.header));
-			return false;
-		}
-		if (header->inst_begin != header->inst_end ||
-		    header->terminator.kind != TerminatorKind::Branch) {
-			SetFailure(
-			    graph, FailureKind::StructuredControlFlow, loop.header,
-			    fmt::format("loop header {} is not a dedicated empty control block", loop.header));
-			return false;
-		}
-		if (!reserve_merge_block(loop.header, loop.merge)) {
-			return false;
-		}
-		header->terminator.loop_header    = true;
-		header->terminator.merge_block    = loop.merge;
-		header->terminator.continue_block = loop.continue_block;
-	}
-
-	for (auto& block: graph.blocks) {
-		if (block.terminator.kind != TerminatorKind::ConditionalBranch ||
-		    block.terminator.loop_header) {
-			continue;
-		}
-		if (IsInnermostLoopControlConditional(graph, block)) {
-			continue;
-		}
-
-		const auto merge = FindSelectionMerge(graph, block);
-		if (merge == UINT32_MAX) {
-			SetFailure(graph, FailureKind::StructuredControlFlow, block.id,
-			           fmt::format("conditional block {} has no structured merge", block.id));
-			return false;
-		}
-
-		if (!reserve_merge_block(block.id, merge)) {
-			return false;
-		}
-		block.terminator.merge_block = merge;
-	}
-
-	return true;
-}
-
-} // namespace
-
-bool Structurize(Graph& graph) {
-	Graph structured = graph;
-	if (StructurizeImpl(structured)) {
-		graph = std::move(structured);
-		return true;
-	}
-
-	const auto failure_kind = structured.failure_kind;
-	// Structurization inserts and renumbers blocks. Recover source identity for a
-	// semantic block; a synthetic block has no corresponding original diagnostic ID.
-	const auto* failed         = structured.FindBlock(structured.failure_block);
-	const auto  original       = std::ranges::find_if(graph.blocks, [&](const BasicBlock& block) {
-		return failed != nullptr && failed->inst_begin != failed->inst_end &&
-		       block.inst_begin == failed->inst_begin && block.inst_end == failed->inst_end &&
-		       block.start_pc == failed->start_pc && block.end_pc == failed->end_pc;
-	});
-	const auto  failure_block  = original != graph.blocks.end() ? original->id : UINT32_MAX;
-	auto        failure_reason = std::move(structured.unsupported_reason);
-	Graph       routed         = graph;
-	const auto  route_budget   = static_cast<uint32_t>(graph.blocks.size());
-	// Apply one route at a time and retry. Eagerly routing every matching diamond can
-	// rewrite unrelated selections that were already structurally valid.
-	for (uint32_t route_variable = 0; route_variable < route_budget; route_variable++) {
-		if (!RouteSharedSelectionArm(routed, route_variable)) {
-			break;
-		}
-		structured = routed;
-		if (StructurizeImpl(structured)) {
-			graph = std::move(structured);
-			return true;
-		}
-	}
-	SetFailure(graph, failure_kind, failure_block, failure_reason);
-	return false;
+	return GotoStructurizer(graph).Run();
 }
 
 std::string BranchConditionToString(BranchCondition condition) {
@@ -2233,7 +1693,7 @@ std::string BranchConditionToString(BranchCondition condition) {
 		case BranchCondition::ExecZero: return "execz";
 		case BranchCondition::ExecNonZero: return "execnz";
 		case BranchCondition::ScalarInstruction: return "scalar_instruction";
-		case BranchCondition::GotoVariable: return "goto_variable";
+		case BranchCondition::Expression: return "expression";
 		default: return "unknown";
 	}
 }
@@ -2270,13 +1730,11 @@ std::string GraphToString(const Graph& graph) {
 		text += fmt::format("  predecessors=[{}] successors=[{}]\n",
 		                    VectorToString(block.predecessors).c_str(),
 		                    VectorToString(block.successors).c_str());
-		text += fmt::format("  dominators=[{}] post_dominators=[{}]\n",
-		                    VectorToString(block.dominators).c_str(),
-		                    VectorToString(block.post_dominators).c_str());
+		text += fmt::format("  dominators=[{}]\n", VectorToString(block.dominators).c_str());
 		text += fmt::format(
 		    "  terminator={} condition={} true={} false={} merge={} continue={} loop_header={} "
 		    "indirect_sgpr={} indirect_selector={} indirect_targets=[{}] selector_values=[{}] "
-		    "goto_variable={} goto_value={}\n",
+		    "expression={}\n",
 		    static_cast<uint32_t>(block.terminator.kind),
 		    BranchConditionToString(block.terminator.condition).c_str(),
 		    block.terminator.true_block, block.terminator.false_block, block.terminator.merge_block,
@@ -2284,7 +1742,14 @@ std::string GraphToString(const Graph& graph) {
 		    block.terminator.indirect_pc_sgpr, block.terminator.indirect_selector_code,
 		    VectorToString(block.terminator.indirect_targets).c_str(),
 		    VectorToString(block.terminator.indirect_selector_values).c_str(),
-		    block.terminator.goto_variable, block.terminator.goto_value);
+		    block.terminator.expression);
+		for (const auto& assignment: block.assignments) {
+			text += fmt::format("  variable_{} = expression_{}", assignment.variable, assignment.expression);
+			const auto& expression = graph.expressions[assignment.expression];
+			if (expression.op == ConditionExpression::Op::Native)
+				text += fmt::format(" condition={}", BranchConditionToString(static_cast<BranchCondition>(expression.lhs)));
+			text += "\n";
+		}
 	}
 
 	for (const auto& edge: graph.back_edges) {
@@ -2292,10 +1757,8 @@ std::string GraphToString(const Graph& graph) {
 		                    edge.natural ? 1u : 0u);
 	}
 	for (const auto& loop: graph.natural_loops) {
-		text += fmt::format("loop header={} latch={} merge={} continue={} body=[{}] exits=[{}]\n",
-		                    loop.header, loop.latch, loop.merge, loop.continue_block,
-		                    VectorToString(loop.body_blocks).c_str(),
-		                    VectorToString(loop.exit_blocks).c_str());
+		text += fmt::format("loop header={} latch={} body=[{}]\n", loop.header, loop.latch,
+		                    VectorToString(loop.body_blocks).c_str());
 	}
 	for (const auto& component: graph.components) {
 		text += fmt::format("scc blocks=[{}] entries=[{}] irreducible={}\n",

@@ -7,33 +7,9 @@
 #include <bit>
 #include <cmath>
 #include <cstring>
-#include <fmt/format.h>
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
-uint32_t PossibleU32Bits(Value value) {
-	value = value.Resolve();
-	if (value.IsImmediate()) {
-		return value.GetType() == Type::U32 ? value.U32() : UINT32_MAX;
-	}
-	const auto* inst = value.TryInstruction();
-	if (inst == nullptr) {
-		return UINT32_MAX;
-	}
-	switch (inst->GetOpcode()) {
-		case ValueOpcode::BitwiseAnd32:
-			return PossibleU32Bits(inst->Arg(0)) & PossibleU32Bits(inst->Arg(1));
-		case ValueOpcode::BitwiseOr32:
-			return PossibleU32Bits(inst->Arg(0)) | PossibleU32Bits(inst->Arg(1));
-		case ValueOpcode::ShiftLeftLogical32: {
-			const auto shift = inst->Arg(1).Resolve();
-			return shift.IsImmediate() && shift.GetType() == Type::U32
-			           ? PossibleU32Bits(inst->Arg(0)) << (shift.U32() & 31u)
-			           : UINT32_MAX;
-		}
-		default: return UINT32_MAX;
-	}
-}
 
 SrtRuntime CleanRuntime(SrtRuntime runtime) {
 	runtime.read_memory = runtime.read_specialization_memory != nullptr
@@ -45,21 +21,6 @@ SrtRuntime CleanRuntime(SrtRuntime runtime) {
 namespace {
 
 constexpr uint64_t AddressMask = 0x0000ffffffffffffull;
-
-const char* StageName(ShaderType stage) {
-	switch (stage) {
-		case ShaderType::Vertex: return "vertex";
-		case ShaderType::Pixel: return "pixel";
-		case ShaderType::Fetch: return "fetch";
-		case ShaderType::Compute: return "compute";
-		default: return "unknown";
-	}
-}
-
-std::string Diagnostic(const ResourcePlan& program, uint32_t pc, const std::string& message) {
-	return fmt::format("shader SRT: hash=0x{:016x} stage={} pc=0x{:08x} {}", program.shader_hash,
-	                   StageName(program.stage), pc, message);
-}
 
 bool AddSignedAddress(uint64_t base, int64_t offset, uint64_t& result) {
 	if (base > AddressMask) {
@@ -97,30 +58,12 @@ bool IsRawRead(const ResourcePlan& values, const Inst& inst) {
 
 bool IsDescriptorHandle(ValueOpcode opcode) {
 	switch (opcode) {
-		case ValueOpcode::ValidateBvhDescriptor:
 		case ValueOpcode::GetBufferResource:
 		case ValueOpcode::GetAddressResource:
 		case ValueOpcode::GetImageResource:
 		case ValueOpcode::GetSamplerResource: return true;
 		default: return false;
 	}
-}
-
-bool BvhFlagsAreSupported(Value value) {
-	constexpr uint32_t mask     = 0xf1000000u;
-	constexpr uint32_t required = 0x81000000u;
-	value                       = value.Resolve();
-	if (value.IsImmediate())
-		return value.GetType() == Type::U32 && (value.U32() & mask) == required;
-	const auto* inst = value.TryInstruction();
-	if (inst == nullptr || inst->GetOpcode() != ValueOpcode::BitwiseOr32) return false;
-	for (size_t i = 0; i < 2; ++i) {
-		const auto fixed = inst->Arg(i).Resolve();
-		if (fixed.IsImmediate() && fixed.GetType() == Type::U32 &&
-		    (fixed.U32() & mask) == required && (PossibleU32Bits(inst->Arg(1 - i)) & mask) == 0)
-			return true;
-	}
-	return false;
 }
 
 bool IsRuntimeSelect(ValueOpcode op) {
@@ -130,6 +73,7 @@ bool IsRuntimeSelect(ValueOpcode op) {
 
 bool IsRuntimeUniformOp(ValueOpcode op) {
 	switch (op) {
+		case ValueOpcode::ConditionRef:
 		case ValueOpcode::BitCastU32F32:
 		case ValueOpcode::BitCastF32U32:
 		case ValueOpcode::ConvertU32F32:
@@ -353,151 +297,6 @@ private:
 	std::unordered_set<const Inst*> m_validated_dependencies;
 };
 
-class PlanBuilder {
-public:
-	explicit PlanBuilder(Program& program): m_program(program) {}
-
-	void Run() {
-		m_program.srt_reads.clear();
-		m_program.dynamic_reads.clear();
-		for (auto* block: m_program.blocks) {
-			for (auto& inst: *block) {
-				const auto op = inst.GetOpcode();
-				// Discharge proven BVH flags before collecting any descriptor dependencies.
-				if (op == ValueOpcode::ValidateBvhDescriptor && inst.NumArgs() == 4u &&
-				    BvhFlagsAreSupported(inst.Arg(3))) {
-					inst.Invalidate();
-					continue;
-				}
-				if (op == ValueOpcode::LoadAddressU32 || op == ValueOpcode::ReadConstBuffer) {
-					const auto flags = inst.Flags<MemoryFlags>();
-					if (flags.index < m_program.memory_info.size()) {
-						const auto kind       = m_program.memory_info[flags.index].kind;
-						const bool crosswired = (op == ValueOpcode::LoadAddressU32 &&
-						                         kind == ResourceKind::ScalarBuffer) ||
-						                        (op == ValueOpcode::ReadConstBuffer &&
-						                         kind == ResourceKind::ScalarAddress);
-						if (crosswired) {
-							Fail(flags.pc, fmt::format("{} has incompatible scalar memory metadata",
-							                           ValueOpcodeName(op)));
-						}
-					}
-				}
-				// BDA addresses are GPU data; only CPU descriptors start SRT collection.
-				if (IsDescriptorHandle(op) && op != ValueOpcode::GetAddressResource) {
-					for (size_t index = 0; index < inst.NumArgs(); index++) {
-						Collect(inst.Arg(index), 0);
-					}
-				}
-			}
-		}
-		PatchReads();
-	}
-
-private:
-	struct Patch {
-		Inst*    inst = nullptr;
-		uint32_t slot = 0;
-		bool     keep = false;
-	};
-
-	[[noreturn]] void Fail(uint32_t pc, const std::string& message) const {
-		const auto diagnostic = Diagnostic(m_program, pc, message);
-		EXIT("shader SRT planning failed: %s", diagnostic.c_str());
-		std::abort();
-	}
-
-	void Collect(Value value, uint32_t use_pc) {
-		value = value.Resolve();
-		if (value.IsImmediate()) {
-			return;
-		}
-		auto* inst = value.TryInstruction();
-		if (inst == nullptr) {
-			Fail(use_pc, "invalid typed planning value");
-		}
-		const auto cycle = std::ranges::find(m_visiting, inst);
-		if (cycle != m_visiting.end()) {
-			const auto contains_phi = std::any_of(cycle, m_visiting.end(), [](const Inst* value) {
-				return value->GetOpcode() == ValueOpcode::Phi;
-			});
-			if (contains_phi) {
-				return;
-			}
-			Fail(use_pc, fmt::format("cyclic typed planning value {} without a phi",
-			                         ValueOpcodeName(inst->GetOpcode())));
-		}
-		if (std::ranges::find(m_visited, inst) != m_visited.end()) {
-			return;
-		}
-		m_visiting.push_back(inst);
-		for (size_t index = 0; index < inst->NumArgs(); index++) {
-			Collect(inst->Arg(index), use_pc);
-		}
-		m_visiting.pop_back();
-		m_visited.push_back(inst);
-		if (!IsRawRead(m_program, *inst)) {
-			return;
-		}
-		const auto offset = inst->Arg(1).Resolve();
-		// A loop-carried base only exists once the draw runs, so the load has no pre-draw value
-		// to flatten: keep it on the GPU.
-		if (!offset.IsImmediate() || offset.GetType() != Type::U32 ||
-		    !ValidateRuntimeValue(m_program, value)) {
-			if (std::ranges::find(m_program.dynamic_reads, value) ==
-			    m_program.dynamic_reads.end()) {
-				m_program.dynamic_reads.push_back(value);
-			}
-			return;
-		}
-		for (uint32_t slot = 0; slot < m_program.srt_reads.size(); slot++) {
-			if (EquivalentValue(m_program, value, m_program.srt_reads[slot].value)) {
-				m_patches.push_back({inst, slot, false});
-				return;
-			}
-		}
-		const auto slot = static_cast<uint32_t>(m_program.srt_reads.size());
-		m_program.srt_reads.push_back({value, slot});
-		m_patches.push_back({inst, slot, true});
-	}
-
-	void PatchReads() {
-		for (const auto& patch: m_patches) {
-			auto* block = patch.inst->Parent();
-			auto& list  = block->Instructions();
-			auto  where =
-			    std::ranges::find_if(list, [&](const Inst& inst) { return &inst == patch.inst; });
-			const auto resource =
-			    Value(&*block->PrependNewInst(where, ValueOpcode::GetSrtResource));
-			const auto flat = Value(&*block->PrependNewInst(where, ValueOpcode::ReadConst,
-			                                                {resource, Value(patch.slot)}));
-			const auto uses = patch.inst->Uses();
-			for (const auto& use: uses) {
-				use.user->SetArg(use.operand, flat);
-			}
-			for (auto& info: m_program.block_info) {
-				if (info.condition.Resolve() == Value(patch.inst)) {
-					info.condition = flat;
-				}
-				if (info.indirect_target.Resolve() == Value(patch.inst)) {
-					info.indirect_target = flat;
-				}
-			}
-			if (patch.keep) {
-				const auto memory = patch.inst->Flags<MemoryFlags>().index;
-				if (memory < m_program.memory_info.size()) {
-					m_program.memory_info[memory].planning_only = true;
-				}
-				block->AppendNewInst(ValueOpcode::ReferenceU32, {Value(patch.inst)});
-			}
-		}
-	}
-
-	Program&           m_program;
-	std::vector<Inst*> m_visiting;
-	std::vector<Inst*> m_visited;
-	std::vector<Patch> m_patches;
-};
 
 } // namespace
 
@@ -508,9 +307,7 @@ SrtWalker::SrtWalker(const ResourcePlan& program, const SrtRuntime& runtime,
       m_clean_evaluator(clean_evaluator), m_active_mask(active_mask.Resolve()),
       m_context(AcquireContext(program)) {}
 
-SrtWalker::~SrtWalker() {
-	--m_program.evaluation_depth;
-}
+SrtWalker::~SrtWalker() { --m_program.evaluation_depth; }
 
 bool SrtWalker::Evaluate(Value value, uint32_t& result) {
 	uint64_t wide = 0;
@@ -551,8 +348,8 @@ bool SrtWalker::EvaluateWide(Value value, uint64_t& result) {
 	if (inst == nullptr) {
 		return false;
 	}
-	if (!m_active_mask.IsEmpty() && IsRuntimeSelect(inst->GetOpcode()) && inst->NumArgs() == 3 &&
-	    inst->Arg(0).Resolve() == m_active_mask) {
+	if (!m_active_mask.IsEmpty() && IsRuntimeSelect(inst->GetOpcode()) &&
+	    inst->NumArgs() == 3 && inst->Arg(0).Resolve() == m_active_mask) {
 		return EvaluateWide(inst->Arg(1), result);
 	}
 	const auto index = inst->EvaluationIndex(m_program.evaluation_value_count);
@@ -568,8 +365,8 @@ bool SrtWalker::EvaluateWide(Value value, uint64_t& result) {
 		return false;
 	}
 	m_context.values[index].generation = m_context.generation | 1u;
-	uint64_t   out                     = 0;
-	const bool evaluated               = EvaluateInst(*inst, out);
+	uint64_t out = 0;
+	const bool evaluated = EvaluateInst(*inst, out);
 	// Recursive evaluation may grow the dense memo vector.
 	auto& memo = m_context.values[index];
 	if (!evaluated) {
@@ -578,7 +375,7 @@ bool SrtWalker::EvaluateWide(Value value, uint64_t& result) {
 	}
 	memo.value      = out;
 	memo.generation = m_context.generation;
-	result          = out;
+	result = out;
 	return true;
 }
 
@@ -623,7 +420,8 @@ bool SrtWalker::EvaluateExtract(const Inst& inst, uint64_t& result) {
 		}
 		const auto sum =
 		    static_cast<uint64_t>(static_cast<uint32_t>(lhs)) + static_cast<uint32_t>(rhs);
-		result = component == 0u ? static_cast<uint32_t>(sum) : static_cast<uint32_t>(sum >> 32u);
+		result =
+		    component == 0u ? static_cast<uint32_t>(sum) : static_cast<uint32_t>(sum >> 32u);
 		return true;
 	}
 	return false;
@@ -657,19 +455,19 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 		if (immediate < 0) {
 			return false;
 		}
-		const auto byte_offset = static_cast<uint64_t>(immediate) + static_cast<uint32_t>(offset);
-		const auto aligned     = byte_offset & ~uint64_t {3};
-		const auto stride      = (static_cast<uint32_t>(high) >> 16u) & 0x3fffu;
+		const auto byte_offset =
+		    (static_cast<uint64_t>(immediate) & ~uint64_t {3}) + (static_cast<uint32_t>(offset) & ~3u);
+		const auto stride  = (static_cast<uint32_t>(high) >> 16u) & 0x3fffu;
 		const auto size = stride == 0u
 		                      ? static_cast<uint64_t>(static_cast<uint32_t>(records))
 		                      : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
-		if (aligned > size || size - aligned < sizeof(uint32_t)) {
+		if (byte_offset > size || size - byte_offset < sizeof(uint32_t)) {
 			return false;
 		}
-		address = ((base & ~uint64_t {3}) + byte_offset) & ~uint64_t {3};
+		address = (base & ~uint64_t {3}) + byte_offset;
 	} else {
-		const auto relative =
-		    (immediate & ~int64_t {3}) + static_cast<int64_t>(static_cast<uint32_t>(offset) & ~3u);
+		const auto relative = (immediate & ~int64_t {3}) +
+		                      static_cast<int64_t>(static_cast<uint32_t>(offset) & ~3u);
 		if (!AddSignedAddress(base & ~uint64_t {3}, relative, address)) {
 			return false;
 		}
@@ -691,7 +489,9 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 	uint64_t   b       = 0;
 	uint64_t   c       = 0;
 	const auto binary  = [&]() { return Arg(inst, 0, a) && Arg(inst, 1, b); };
-	const auto ternary = [&]() { return Arg(inst, 0, a) && Arg(inst, 1, b) && Arg(inst, 2, c); };
+	const auto ternary = [&]() {
+		return Arg(inst, 0, a) && Arg(inst, 1, b) && Arg(inst, 2, c);
+	};
 	switch (inst.GetOpcode()) {
 		case ValueOpcode::GetUserData: {
 			const auto reg = RegIndex(inst.Arg(0).ScalarRegister());
@@ -707,7 +507,8 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 		case ValueOpcode::ReadFirstLane: {
 			const auto clean_runtime = CleanRuntime(m_runtime);
 			SrtWalker  clean_active(m_program, clean_runtime, {}, nullptr, inst.Arg(1));
-			SrtWalker  active(m_program, m_runtime, m_clean_flat_slots, &clean_active, inst.Arg(1));
+			SrtWalker  active(m_program, m_runtime, m_clean_flat_slots, &clean_active,
+			                  inst.Arg(1));
 			return active.EvaluateWide(inst.Arg(0), result);
 		}
 		case ValueOpcode::BitCastU32F32:
@@ -718,8 +519,8 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 			if (!binary()) {
 				return false;
 			}
-			result =
-			    static_cast<uint32_t>(a) | (static_cast<uint64_t>(static_cast<uint32_t>(b)) << 32u);
+			result = static_cast<uint32_t>(a) |
+			         (static_cast<uint64_t>(static_cast<uint32_t>(b)) << 32u);
 			return true;
 		case ValueOpcode::ReadConst: {
 			const auto slot = inst.Arg(1).Resolve();
@@ -727,8 +528,8 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 			    slot.U32() >= m_program.srt_reads.size()) {
 				return false;
 			}
-			if (slot.U32() < m_clean_flat_slots.size() && m_clean_flat_slots[slot.U32()] != 0u &&
-			    m_clean_evaluator != nullptr) {
+			if (slot.U32() < m_clean_flat_slots.size() &&
+			    m_clean_flat_slots[slot.U32()] != 0u && m_clean_evaluator != nullptr) {
 				return m_clean_evaluator->EvaluateWide(m_program.srt_reads[slot.U32()].value,
 				                                       result);
 			}
@@ -818,14 +619,18 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 			}
 			return false;
 		case ValueOpcode::FPOrdLessThanEqual32:
-			if (binary()) {
-				result = Float32(a) <= Float32(b);
-				return true;
-			}
-			return false;
 		case ValueOpcode::FPOrdGreaterThanEqual32:
 			if (binary()) {
-				result = Float32(a) >= Float32(b);
+				const auto operand = [&](uint64_t bits) {
+					if (inst.Flags<FPCompareFlags>().flush_input_denorms &&
+					    (bits & 0x7fffffffu) < 0x00800000u) {
+						bits &= 0x80000000u;
+					}
+					return Float32(bits);
+				};
+				result = inst.GetOpcode() == ValueOpcode::FPOrdLessThanEqual32
+				             ? operand(a) <= operand(b)
+				             : operand(a) >= operand(b);
 				return true;
 			}
 			return false;
@@ -885,8 +690,8 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 			return false;
 		case ValueOpcode::ShiftRightArithmetic32:
 			if (binary()) {
-				result = static_cast<uint32_t>(std::bit_cast<int32_t>(static_cast<uint32_t>(a)) >>
-				                               (b & 31u));
+				result = static_cast<uint32_t>(
+				    std::bit_cast<int32_t>(static_cast<uint32_t>(a)) >> (b & 31u));
 				return true;
 			}
 			return false;
@@ -906,7 +711,7 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 				const auto mask = width == 32u  ? UINT32_MAX
 				                  : width == 0u ? 0u
 				                                : (uint32_t {1} << width) - 1u;
-				result          = width == 0u ? 0u : (static_cast<uint32_t>(a) >> offset) & mask;
+				result = width == 0u ? 0u : (static_cast<uint32_t>(a) >> offset) & mask;
 				return true;
 			}
 			return false;
@@ -944,9 +749,10 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 				result = static_cast<uint32_t>(a);
 				return true;
 			}
-			const auto mask = width == 32u ? UINT32_MAX : ((uint32_t {1} << width) - 1u) << offset;
-			result =
-			    (static_cast<uint32_t>(a) & ~mask) | ((static_cast<uint32_t>(b) << offset) & mask);
+			const auto mask =
+			    width == 32u ? UINT32_MAX : ((uint32_t {1} << width) - 1u) << offset;
+			result = (static_cast<uint32_t>(a) & ~mask) |
+			         ((static_cast<uint32_t>(b) << offset) & mask);
 			return true;
 		}
 		case ValueOpcode::SelectU32:
@@ -1007,6 +813,7 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 				return true;
 			}
 			return false;
+		case ValueOpcode::ConditionRef: return Arg(inst, 0, result);
 		case ValueOpcode::LogicalNot:
 			if (Arg(inst, 0, a)) {
 				result = a == 0u;
@@ -1027,8 +834,8 @@ bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
 		return false;
 	}
 	const auto& descriptor = m_program.descriptor_sources[source];
-	result                 = {};
-	result.dword_count     = descriptor.dword_count;
+	result = {};
+	result.dword_count = descriptor.dword_count;
 	for (uint32_t index = 0; index < descriptor.dword_count; ++index) {
 		if (!Evaluate(descriptor.dwords[index], result.dwords[index])) {
 			return false;
@@ -1059,7 +866,7 @@ std::span<const uint8_t> SrtWalker::FindActiveSources() {
 		if (visited.at(index)) {
 			continue;
 		}
-		visited[index]    = 1u;
+		visited[index] = 1u;
 		const auto& block = m_program.control_flow[index];
 		for (const auto source: block.sources) {
 			active[source] = 1u;
@@ -1083,13 +890,11 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 	for (const auto& read: m_program.srt_reads) {
 		const bool clean = read.flat_offset < m_clean_flat_slots.size() &&
 		                   m_clean_flat_slots[read.flat_offset] != 0u;
-		if (clean &&
-		    (m_clean_evaluator == nullptr || m_runtime.read_specialization_memory == nullptr)) {
+		if (clean && (m_clean_evaluator == nullptr || m_runtime.read_specialization_memory == nullptr)) {
 			return false;
 		}
 		auto& evaluator = clean ? *m_clean_evaluator : *this;
-		if (read.flat_offset >= flat.size() ||
-		    !evaluator.Evaluate(read.value, flat[read.flat_offset])) {
+		if (read.flat_offset >= flat.size() || !evaluator.Evaluate(read.value, flat[read.flat_offset])) {
 			return false;
 		}
 	}
@@ -1100,13 +905,5 @@ bool ValidateRuntimeValue(const ResourcePlan& program, Value value, RuntimeValue
 	return RuntimeValidator(program, type).Run(value);
 }
 
-void BuildSrtPlan(Program& program) {
-	if (program.resource_tracking_complete) {
-		EXIT("shader SRT planning failed: cannot rebuild SRT after resource tracking");
-	}
-	program.srt_plan_complete = false;
-	PlanBuilder(program).Run();
-	program.srt_plan_complete = true;
-}
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

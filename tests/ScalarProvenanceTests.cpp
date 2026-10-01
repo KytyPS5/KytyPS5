@@ -2,6 +2,7 @@
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <cstdlib>
@@ -71,7 +72,7 @@ struct Fixture {
     return static_cast<uint32_t>(program.memory_info.size() - 1u);
   }
 
-  void Plan() { BuildSrtPlan(program); }
+  void Plan() { TrackResources(program, {}, {}); }
 };
 
 struct TestMemory {
@@ -102,6 +103,16 @@ Value RawRead(Fixture &fixture, Value address, Value offset, uint32_t memory,
                             0x80, block);
 }
 
+void LoadBuffer(Fixture &fixture, std::array<Value, 4> words) {
+  const auto handle = fixture.Emit(ValueOpcode::GetBufferResource,
+                                   {words[0], words[1], words[2], words[3]});
+  const auto loaded = fixture.EmitMemory(
+      ValueOpcode::LoadBufferU32,
+      {handle, Value(0u), Value(0u), Value(0u), Value(true)},
+      fixture.AddMemory(ResourceKind::Buffer));
+  fixture.Emit(ValueOpcode::ReferenceU32, {loaded});
+}
+
 void TestImmediateFlatteningAndGvn() {
   Fixture fixture;
   const auto memory = fixture.AddMemory(ResourceKind::ScalarAddress, 0x20);
@@ -109,14 +120,11 @@ void TestImmediateFlatteningAndGvn() {
       fixture, Address(fixture, Value(0x1000u), Value(0u)), Value(0u), memory);
   const auto second = RawRead(
       fixture, Address(fixture, Value(0x1000u), Value(0u)), Value(0u), memory);
-  fixture.Emit(ValueOpcode::GetBufferResource,
-               {first, second, Value(16u), Value(0u)});
+  LoadBuffer(fixture, {first, second, Value(16u), Value(0u)});
 
   fixture.Plan();
   Check(fixture.program.srt_reads.size() == 1,
         "equivalent typed scalar reads were not coalesced");
-  Check(fixture.program.dynamic_reads.empty(),
-        "immediate scalar read was classified as dynamic");
   Check(fixture.program.memory_info[memory].planning_only,
         "flattened raw read was not kept as a planning-only root");
 
@@ -133,8 +141,7 @@ void TestRawScalarComponentAlignment() {
   const auto memory = fixture.AddMemory(ResourceKind::ScalarAddress, 2);
   const auto read = RawRead(
       fixture, Address(fixture, Value(0x1003u), Value(0u)), Value(2u), memory);
-  fixture.Emit(ValueOpcode::GetBufferResource,
-               {read, Value(0u), Value(16u), Value(0u)});
+  LoadBuffer(fixture, {read, Value(0u), Value(16u), Value(0u)});
   fixture.Plan();
 
   TestMemory memory_image{{{0x1000u, 0x12345678u}}};
@@ -150,7 +157,7 @@ void TestScalarMemoryDomainMismatchFails() {
   Fixture raw;
   const auto raw_memory = raw.AddMemory(ResourceKind::ScalarBuffer);
   RawRead(raw, Address(raw, Value(0x1000u), Value(0u)), Value(0u), raw_memory);
-  CheckFatal([&] { BuildSrtPlan(raw.program); },
+  CheckFatal([&] { TrackResources(raw.program, {}, {}); },
              "incompatible scalar memory metadata",
              "raw scalar load accepted descriptor-buffer metadata");
 
@@ -161,7 +168,7 @@ void TestScalarMemoryDomainMismatchFails() {
                   {Value(0x1000u), Value(0u), Value(16u), Value(0u)});
   buffer.EmitMemory(ValueOpcode::ReadConstBuffer, {resource, Value(0u)},
                     buffer_memory);
-  CheckFatal([&] { BuildSrtPlan(buffer.program); },
+  CheckFatal([&] { TrackResources(buffer.program, {}, {}); },
              "incompatible scalar memory metadata",
              "descriptor scalar load accepted raw-address metadata");
 }
@@ -173,12 +180,12 @@ void TestDynamicReadRemainsTyped() {
                                    {Value(static_cast<ScalarReg>(2))});
   const auto read = RawRead(
       fixture, Address(fixture, Value(0x1000u), Value(0u)), offset, memory);
-  fixture.Emit(ValueOpcode::GetBufferResource,
-               {read, Value(0u), Value(16u), Value(0u)});
+  LoadBuffer(fixture, {read, Value(0u), Value(16u), Value(0u)});
 
   fixture.Plan();
   Check(fixture.program.srt_reads.empty() &&
-            fixture.program.dynamic_reads == std::vector<Value>{read},
+            read.ResolveInstruction()->GetOpcode() == ValueOpcode::LoadAddressU32 &&
+            !fixture.program.memory_info[memory].planning_only,
         "dynamic scalar read received a fake flattened slot");
 }
 
@@ -189,8 +196,7 @@ void TestNestedSrtWalk() {
       fixture, Address(fixture, Value(0x1000u), Value(0u)), Value(0u), memory);
   const auto value =
       RawRead(fixture, Address(fixture, pointer, Value(0u)), Value(0u), memory);
-  fixture.Emit(ValueOpcode::GetBufferResource,
-               {value, Value(0u), Value(16u), Value(0u)});
+  LoadBuffer(fixture, {value, Value(0u), Value(16u), Value(0u)});
   fixture.Plan();
 
   TestMemory memory_image{{{0x1000u, 0x2000u}, {0x2000u, 0xabcdef01u}}};
@@ -211,7 +217,7 @@ void TestShaderBaseAndUserData() {
   const auto user = fixture.Emit(ValueOpcode::GetUserData,
                                  {Value(static_cast<ScalarReg>(2))});
   const auto sum = fixture.Emit(ValueOpcode::IAdd32, {user, Value(4u)});
-  fixture.Plan();
+
   fixture.program.descriptor_sources.push_back(
       {.dwords = {low, high, sum}, .dword_count = 3});
 
@@ -239,7 +245,7 @@ void TestCarryAndBitFields() {
                    {Value(0u), Value(0x89abcdefu), Value(0u), Value(32u)});
   const auto sign = fixture.Emit(ValueOpcode::BitFieldSExtract,
                                  {Value(0x000000f0u), Value(4u), Value(4u)});
-  fixture.Plan();
+
   fixture.program.descriptor_sources.push_back(
       {.dwords = {low, high, inserted, sign}, .dword_count = 4});
 
@@ -261,7 +267,7 @@ void TestInvariantAndDivergentPhi() {
   divergent.SetFlags(Type::U32);
   divergent.AddPhiOperand(&fixture.BlockAt(0), Value(7u));
   divergent.AddPhiOperand(&fixture.BlockAt(1), Value(9u));
-  fixture.Plan();
+
   fixture.program.descriptor_sources.push_back(
       {.dwords = {Value(&invariant)}, .dword_count = 1});
   fixture.program.descriptor_sources.push_back(
@@ -285,6 +291,7 @@ void TestControlDependentStandaloneLoadStaysTyped() {
   const auto read =
       RawRead(fixture, Address(fixture, Value(&base), Value(0u), 2), Value(0u),
               memory, 2);
+  fixture.Emit(ValueOpcode::ReferenceU32, {read}, 0, 2);
   fixture.Plan();
   Check(fixture.program.srt_reads.empty() &&
             read.ResolveInstruction()->GetOpcode() ==
@@ -307,8 +314,9 @@ void TestDynamicBvhAddressStaysOnGpu() {
   const auto size = fixture.Emit(ValueOpcode::BitwiseAnd32, {read, Value(0x3ffu)}, 0, 2);
   const auto flags = fixture.Emit(ValueOpcode::BitwiseOr32, {size, Value(0x81000000u)}, 0, 2);
   auto& marker = fixture.BlockAt(2).AppendNewInst(ValueOpcode::ValidateBvhDescriptor, {read, Value(0u), Value(0u), flags});
+  fixture.Emit(ValueOpcode::ReferenceU32, {read}, 0, 2);
   fixture.Plan();
-  Check(marker.GetOpcode() == ValueOpcode::Void, "known BVH flags were not removed before SRT planning");
+  Check(fixture.program.bvh_sources.empty(), "known BVH flags were not removed before SRT planning");
   Check(fixture.program.srt_reads.empty(),
         "loop-dependent BVH address was flattened into a CPU snapshot");
   Check(read.ResolveInstruction()->GetOpcode() == ValueOpcode::LoadAddressU32 && !fixture.program.memory_info[memory].planning_only,
@@ -335,7 +343,8 @@ void TestGpuDataPointersAreNotSnapshotted() {
   TestMemory memory;
   SrtRuntime runtime{.read_memory = ReadMemory, .userdata = &memory};
   std::vector<uint32_t> flat;
-  Check(SrtWalker(fixture.program, runtime).RefreshFlatBuffer(flat) && flat.empty() && memory.reads == 0,
+  SrtWalker walker(fixture.program, runtime);
+  Check(walker.RefreshFlatBuffer(flat) && flat.empty() && memory.reads == 0,
         "GPU data pointer was dereferenced during resource materialization");
 }
 
@@ -352,7 +361,7 @@ void TestRuntime64BitDescriptorOps() {
       fixture.Emit(ValueOpcode::CompositeExtractU64, {combined, Value(0u)});
   const auto high =
       fixture.Emit(ValueOpcode::CompositeExtractU64, {combined, Value(1u)});
-  fixture.Plan();
+
   fixture.program.descriptor_sources.push_back(
       {.dwords = {low, high}, .dword_count = 2});
 
@@ -419,7 +428,6 @@ void TestUniformFirstLaneSamplerLod() {
                                   {packed, active});
   const auto divergent = fixture.Emit(
       ValueOpcode::ReadFirstLane, {stale, active});
-  fixture.Plan();
 
   Check(ValidateRuntimeValue(fixture.program, first),
         "uniform sampler LOD construction was rejected");
@@ -439,6 +447,49 @@ void TestUniformFirstLaneSamplerLod() {
   Check(SrtWalker(fixture.program, runtime).EvaluateDescriptor(0, result) &&
             result.dwords[0] == 0x00ffffffu,
         "uniform sampler LOD clamp evaluated incorrectly");
+}
+
+void TestFloatComparisonDescriptorInputs() {
+  struct Input {
+    uint32_t bits;
+    uint32_t less_equal;
+    uint32_t greater_equal;
+  };
+  constexpr std::array inputs = {
+      Input{0x00000001u, 0, 1}, Input{0x80000001u, 1, 0},
+      Input{0x007fffffu, 0, 1}, Input{0x807fffffu, 1, 0},
+      Input{0x00800000u, 0, 1}, Input{0x80800000u, 1, 0},
+      Input{0x00000000u, 1, 1}, Input{0x80000000u, 1, 1},
+      Input{0x7fc00000u, 0, 0}};
+  for (const bool flush : {false, true}) {
+    Fixture fixture;
+    const auto user = fixture.Emit(
+        ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(2))});
+    const auto value = fixture.Emit(ValueOpcode::BitCastF32U32, {user});
+    const auto less_equal = fixture.Emit(ValueOpcode::FPOrdLessThanEqual32,
+                                         {value, Value::F32(0.0f)});
+    const auto greater_equal = fixture.Emit(ValueOpcode::FPOrdGreaterThanEqual32,
+                                            {value, Value::F32(0.0f)});
+    less_equal.Instruction()->SetFlags(FPCompareFlags{flush});
+    greater_equal.Instruction()->SetFlags(FPCompareFlags{flush});
+    const auto low = fixture.Emit(ValueOpcode::SelectU32,
+                                  {less_equal, Value(1u), Value(0u)});
+    const auto high = fixture.Emit(ValueOpcode::SelectU32,
+                                   {greater_equal, Value(1u), Value(0u)});
+    fixture.program.descriptor_sources.push_back(
+        {.dwords = {low, high}, .dword_count = 2});
+
+    for (size_t index = 0; index < inputs.size(); index++) {
+      const auto &input = inputs[index];
+      const std::array user_data{input.bits};
+      DescriptorValue result;
+      Check(SrtWalker(fixture.program, {.user_data = user_data})
+                    .EvaluateDescriptor(0, result) &&
+                result.dwords[0] == (flush && index < 4 ? 1 : input.less_equal) &&
+                result.dwords[1] == (flush && index < 4 ? 1 : input.greater_equal),
+            "descriptor comparison disagrees with native FP32 input mode");
+    }
+  }
 }
 
 void TestSharedIntegerRuntimeDependencies() {
@@ -484,37 +535,34 @@ void TestSharedIntegerRuntimeDependencies() {
 }
 
 void TestConstantBufferBounds() {
-  Fixture fixture;
-  const auto memory = fixture.AddMemory(ResourceKind::ScalarBuffer);
-  const auto buffer =
-      fixture.Emit(ValueOpcode::GetBufferResource,
-                   {Value(0x3000u), Value(0u), Value(16u), Value(0u)});
-  const auto read = fixture.EmitMemory(ValueOpcode::ReadConstBuffer,
-                                       {buffer, Value(12u)}, memory);
-  fixture.Emit(ValueOpcode::GetBufferResource,
-               {read, Value(0u), Value(16u), Value(0u)});
-  fixture.Plan();
+  struct Case {
+    uint32_t offset;
+    uint32_t immediate;
+    bool valid;
+    uint32_t expected;
+  };
+  for (const auto &test : {Case{12u, 0u, true, 0xa5a5a5a5u},
+                           Case{3u, 1u, true, 0x12345678u},
+                           Case{0xfffffffcu, 4u, false, 0u},
+                           Case{16u, 0u, false, 0u}}) {
+    Fixture fixture;
+    const auto memory = fixture.AddMemory(ResourceKind::ScalarBuffer, test.immediate);
+    const auto buffer =
+        fixture.Emit(ValueOpcode::GetBufferResource,
+                     {Value(0x3000u), Value(0u), Value(16u), Value(0u)});
+    const auto read = fixture.EmitMemory(ValueOpcode::ReadConstBuffer,
+                                         {buffer, Value(test.offset)}, memory);
+    LoadBuffer(fixture, {read, Value(0u), Value(16u), Value(0u)});
+    fixture.Plan();
 
-  TestMemory memory_image{{{0x300cu, 0xa5a5a5a5u}}};
-  SrtRuntime runtime{.read_memory = ReadMemory, .userdata = &memory_image};
-  std::vector<uint32_t> flat;
-  Check(SrtWalker(fixture.program, runtime).RefreshFlatBuffer(flat) &&
-            flat == std::vector<uint32_t>{0xa5a5a5a5u},
-        "constant-buffer SRT walk failed");
-
-  Fixture overflow;
-  const auto overflow_memory = overflow.AddMemory(ResourceKind::ScalarBuffer);
-  const auto overflow_buffer =
-      overflow.Emit(ValueOpcode::GetBufferResource,
-                    {Value(0x3000u), Value(0u), Value(16u), Value(0u)});
-  const auto overflow_read =
-      overflow.EmitMemory(ValueOpcode::ReadConstBuffer,
-                          {overflow_buffer, Value(16u)}, overflow_memory);
-  overflow.Emit(ValueOpcode::GetBufferResource,
-                {overflow_read, Value(0u), Value(16u), Value(0u)});
-  overflow.Plan();
-  Check(!SrtWalker(overflow.program, runtime).RefreshFlatBuffer(flat),
-        "out-of-bounds constant-buffer walk was accepted");
+    TestMemory memory_image{{{0x3000u, 0x12345678u}, {0x300cu, 0xa5a5a5a5u}}};
+    SrtRuntime runtime{.read_memory = ReadMemory, .userdata = &memory_image};
+    std::vector<uint32_t> flat;
+    Check(SrtWalker(fixture.program, runtime).RefreshFlatBuffer(flat) == test.valid,
+          "constant-buffer walk misaligned or wrapped its offset components");
+    Check(test.valid ? flat == std::vector<uint32_t>{test.expected} : memory_image.reads == 0,
+          "constant-buffer walk read the wrong word or accessed an out-of-bounds address");
+  }
 }
 
 void TestReadLaneElimination() {
@@ -597,7 +645,7 @@ void TestControlFlowValueSurvivesReadLaneFolding() {
 void TestUndefinedRuntimeValueFails() {
   Fixture fixture;
   const auto undef = fixture.Emit(ValueOpcode::UndefU32);
-  fixture.Plan();
+
   fixture.program.descriptor_sources.push_back(
       {.dwords = {undef}, .dword_count = 1});
   DescriptorValue result;
@@ -638,6 +686,7 @@ int main() {
     TestGpuDataPointersAreNotSnapshotted();
     TestRuntime64BitDescriptorOps();
     TestUniformFirstLaneSamplerLod();
+    TestFloatComparisonDescriptorInputs();
     TestSharedIntegerRuntimeDependencies();
     TestConstantBufferBounds();
     TestReadLaneElimination();
@@ -658,6 +707,7 @@ int main() {
 #include "../src/graphics/shader/recompiler/ir/Program.cpp"
 #include "../src/graphics/shader/recompiler/ir/Type.cpp"
 #include "../src/graphics/shader/recompiler/ir/Value.cpp"
+#include "../src/graphics/shader/recompiler/ir/passes/ResourceTracking.cpp"
 #include "../src/graphics/shader/recompiler/ir/opcodes/ValueOpcodes.cpp"
 #include "../src/graphics/shader/recompiler/ir/passes/ConstantPropagation.cpp"
 #include "../src/graphics/shader/recompiler/ir/passes/DeadCodeElimination.cpp"

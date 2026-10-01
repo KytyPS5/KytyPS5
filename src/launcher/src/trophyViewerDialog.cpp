@@ -1,13 +1,14 @@
 #include "trophyViewerDialog.h"
 
+#include "common/archive.h"
 #include "configuration.h"
+#include "gameContent.h"
 
 #include <QAbstractItemView>
 #include <QBrush>
 #include <QByteArray>
 #include <QDialogButtonBox>
 #include <QDir>
-#include <QFile>
 #include <QFileInfo>
 #include <QFont>
 #include <QHeaderView>
@@ -39,12 +40,14 @@
 
 namespace {
 
-constexpr quint32 UCP_MAGIC      = 0xb228c60a;
-constexpr quint32 UCP_VERSION    = 1;
-constexpr int     UCP_HEADER_LEN = 0x40;
-constexpr int     UCP_TOC_SKIP   = 0x20;
-constexpr int     UCP_ENTRY_LEN  = 0x40;
-constexpr int     UCP_NAME_LEN   = 0x20;
+constexpr quint32 UCP_MAGIC              = 0xb228c60a;
+constexpr quint32 UCP_VERSION            = 1;
+constexpr int     UCP_HEADER_LEN         = 0x40;
+constexpr int     UCP_TOC_SKIP           = 0x20;
+constexpr int     UCP_ENTRY_LEN          = 0x40;
+constexpr int     UCP_NAME_LEN           = 0x20;
+constexpr quint32 UCP_MAX_FILES          = 4096;
+constexpr quint64 UCP_MAX_EXTRACTED_SIZE = quint64 {64} << 20u;
 
 struct UcpEntry {
 	QString name;
@@ -98,14 +101,22 @@ static QString ReadFixedString(const QByteArray& data, qsizetype offset, qsizety
 	return QString::fromLatin1(data.constData() + offset, len);
 }
 
+static bool IsUsedUcpEntry(const QString& name) {
+	const auto lower = name.toCaseFolded();
+	return lower == QStringLiteral("tropconf.json") || lower == QStringLiteral("tropmeta.json") ||
+	       (lower.startsWith(QStringLiteral("tropmeta_")) &&
+	        lower.endsWith(QStringLiteral(".json"))) ||
+	       (lower.startsWith(QStringLiteral("trop")) && lower.endsWith(QStringLiteral(".png")));
+}
+
 static bool ReadUcp(const QString& file_name, QMap<QString, QByteArray>& files, QString& error) {
-	QFile file(file_name);
-	if (!file.open(QIODevice::ReadOnly)) {
+	const QByteArray data =
+	    GameContent::ReadPath(GameContent::ToPath(file_name), GameContent::MaxTrophyPackageSize);
+	if (data.isEmpty()) {
 		error = QObject::tr("Could not open %1").arg(QDir::toNativeSeparators(file_name));
 		return false;
 	}
 
-	const QByteArray data = file.readAll();
 	if (data.size() < UCP_HEADER_LEN) {
 		error = QObject::tr("%1 is too small to be a trophy package.")
 		            .arg(QFileInfo(file_name).fileName());
@@ -127,14 +138,18 @@ static bool ReadUcp(const QString& file_name, QMap<QString, QByteArray>& files, 
 	}
 
 	const auto declared_size = qFromBigEndian<quint64>(data.constData() + 0x08);
-	if (declared_size > static_cast<quint64>(data.size())) {
+	if (declared_size < UCP_HEADER_LEN || declared_size > static_cast<quint64>(data.size())) {
 		error = QObject::tr("%1 is truncated.").arg(QFileInfo(file_name).fileName());
 		return false;
 	}
 
 	const auto file_count = qFromBigEndian<quint32>(data.constData() + 0x10);
+	if (file_count > UCP_MAX_FILES) {
+		error = QObject::tr("%1 contains too many files.").arg(QFileInfo(file_name).fileName());
+		return false;
+	}
 	const auto toc_offset = static_cast<quint64>(qFromBigEndian<quint32>(data.constData() + 0x14));
-	const auto data_size  = static_cast<quint64>(data.size());
+	const auto data_size  = declared_size;
 
 	const quint64 table_size = UCP_TOC_SKIP + static_cast<quint64>(file_count) * UCP_ENTRY_LEN;
 	if (toc_offset > data_size || table_size > data_size - toc_offset ||
@@ -144,6 +159,7 @@ static bool ReadUcp(const QString& file_name, QMap<QString, QByteArray>& files, 
 		return false;
 	}
 
+	quint64 extracted_size = 0;
 	for (quint32 i = 0; i < file_count; i++) {
 		const auto entry_offset = static_cast<qsizetype>(toc_offset + UCP_TOC_SKIP +
 		                                                 static_cast<quint64>(i) * UCP_ENTRY_LEN);
@@ -161,9 +177,22 @@ static bool ReadUcp(const QString& file_name, QMap<QString, QByteArray>& files, 
 			            .arg(QFileInfo(file_name).fileName(), entry.name);
 			return false;
 		}
+		if (!IsUsedUcpEntry(entry.name)) {
+			continue;
+		}
+
+		const auto entry_limit = entry.name.endsWith(QStringLiteral(".png"), Qt::CaseInsensitive)
+		                             ? GameContent::MaxImageSize
+		                             : GameContent::MaxMetadataSize;
+		if (entry.size > entry_limit || entry.size > UCP_MAX_EXTRACTED_SIZE - extracted_size) {
+			error = QObject::tr("%1 contains an oversized entry for %2.")
+			            .arg(QFileInfo(file_name).fileName(), entry.name);
+			return false;
+		}
 
 		files.insert(entry.name.toCaseFolded(), data.mid(static_cast<qsizetype>(entry.offset),
 		                                                 static_cast<qsizetype>(entry.size)));
+		extracted_size += entry.size;
 	}
 
 	return true;
@@ -392,30 +421,31 @@ static QStringList FindTrophyFiles(const Configuration* info) {
 		return {};
 	}
 
-	const QDir trophy_dir(QDir(info->basedir).filePath(QStringLiteral("sce_sys/trophy2")));
-	if (!trophy_dir.exists()) {
-		return {};
+	QStringList files;
+	for (const auto& file:
+	     GameContent::ListFiles(info->basedir, QStringLiteral("sce_sys/trophy2"))) {
+		const auto name = QFileInfo(file).fileName();
+		if (name.startsWith(QStringLiteral("trophy"), Qt::CaseInsensitive) &&
+		    name.endsWith(QStringLiteral(".ucp"), Qt::CaseInsensitive)) {
+			files.append(file);
+		}
 	}
-
-	const auto files =
-	    trophy_dir.entryInfoList({QStringLiteral("Trophy*.ucp"), QStringLiteral("trophy*.ucp")},
-	                             QDir::Files | QDir::NoSymLinks, QDir::Name | QDir::IgnoreCase);
+	files.sort(Qt::CaseInsensitive);
 
 	QStringList   trophy_files;
 	QSet<QString> seen;
 	for (const auto& file: files) {
-		auto key = file.canonicalFilePath();
+		auto key = QFileInfo(file).canonicalFilePath();
 		if (key.isEmpty()) {
-			key = file.absoluteFilePath();
+			key = file;
 		}
 		key = QDir::cleanPath(key).toCaseFolded();
 
 		if (!seen.contains(key)) {
 			seen.insert(key);
-			trophy_files.append(file.absoluteFilePath());
+			trophy_files.append(file);
 		}
 	}
-
 	return trophy_files;
 }
 
@@ -506,6 +536,7 @@ void TrophyViewerDialog::ShowForGame(const Configuration* info, QWidget* parent)
 }
 
 bool TrophyViewerDialog::LoadGame(const Configuration& info, QString& error) {
+	const auto reader = Common::OpenArchive(GameContent::ToPath(info.basedir));
 	const auto trophy_files = FindTrophyFiles(&info);
 	if (trophy_files.isEmpty()) {
 		error = tr("No trophy package found in sce_sys/trophy2.");

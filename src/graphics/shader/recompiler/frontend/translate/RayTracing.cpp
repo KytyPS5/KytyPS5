@@ -5,13 +5,10 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
-bool Translator::IMAGE_BVH_INTERSECT_RAY(const Decoder::Instruction& inst) {
+void Translator::IMAGE_BVH_INTERSECT_RAY(const Decoder::Instruction& inst) {
 	// RTIP 1.1 reference: AMD GPURT IntersectCommon.hlsl (fast_intersect_triangle,
 	// SwizzleBarycentrics, IntersectNodeBvh4). Triangle return mode 1 returns numerators.
-	EXIT_IF(inst.opcode != Decoder::Opcode::IMAGE_BVH_INTERSECT_RAY || inst.data_bits != 32 ||
-	        inst.dmask != 15 || !inst.image_r128 ||
-	        inst.image_dimension != Decoder::ImageDimension::Dim1D ||
-	        (inst.image_sample_flags & Decoder::ImageSampleFlagA16) != 0);
+	EXIT_IF(!Decoder::IsLowerableBvh(inst));
 	using IR::Value;
 	using IR::ValueOpcode;
 	const auto u      = [](uint32_t value) { return IR::U32(Value(value)); };
@@ -187,7 +184,6 @@ bool Translator::IMAGE_BVH_INTERSECT_RAY(const Decoder::Instruction& inst) {
 		    u(0xffffffff));
 		WriteRawU32(OffsetOperand(PlainOperand(inst.dst), i), value);
 	}
-	return true;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Frontend

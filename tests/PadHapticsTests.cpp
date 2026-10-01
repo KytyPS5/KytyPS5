@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
+#include <numeric>
 #include <vector>
 
 namespace {
@@ -24,23 +25,28 @@ struct Rumble {
 	Uint16 large, small;
 	Uint32 duration;
 };
-std::vector<Device>                 devices;
-std::vector<SDL_AudioStream*>       streams;
-Rumble                              rumble {};
-Uint64                              now        = 1000;
-int                                 audio_refs = 0, opens = 0, rumble_calls = 0;
-bool                                fail_open = false, fail_resume = false;
-int                                 actual_channels = 4;
-SDL_AudioDeviceID                   opened_device   = 0;
-SDL_AudioSpec                       opened_spec {};
-std::array<Rumble, 4>               pad_rumble {};
-std::array<std::vector<uint8_t>, 4> effects;
-std::vector<SDL_JoystickID>         connected_pads {1};
-std::array<Rumble, 4>               cached_rumble {};
-bool                                fail_effect = false, wireless = false;
-SDL_AudioStream*                   default_stream = nullptr;
-bool                               fail_default_resume = false;
-int                                active_controller = 1;
+std::vector<Device>                   devices;
+std::vector<SDL_AudioStream*>         streams;
+Rumble                                rumble {};
+Uint64                                now        = 1000;
+int                                   audio_refs = 0, opens = 0, rumble_calls = 0;
+bool                                  fail_open = false, fail_resume = false;
+int                                   actual_channels = 4;
+SDL_AudioDeviceID                     opened_device   = 0;
+SDL_AudioSpec                         opened_spec {};
+std::array<Rumble, 4>                 pad_rumble {};
+std::array<std::vector<uint8_t>, 4>   effects;
+std::vector<SDL_JoystickID>           connected_pads {1};
+std::array<Rumble, 4>                 cached_rumble {};
+bool                                  fail_effect = false, wireless = false, wireless_pad3 = false;
+bool                                  hid_available = false, fail_hid_write = false;
+bool                                  duplicate_hid  = false;
+int                                   hid_opens      = 0;
+int                                   opened_hid_pad = 0;
+std::vector<std::array<uint8_t, 547>> hid_reports;
+SDL_AudioStream*                      default_stream      = nullptr;
+bool                                  fail_default_resume = false;
+int                                   active_controller   = 1;
 } // namespace
 
 namespace Fake {
@@ -116,8 +122,9 @@ void DestroyAudioStream(SDL_AudioStream* stream) {
 		return;
 	}
 	const auto it = std::find(streams.begin(), streams.end(), stream);
-	Check(it != streams.end(), "stream destroyed twice");
-	streams.erase(it);
+	if (it != streams.end()) {
+		streams.erase(it);
+	}
 	if (stream == default_stream) {
 		default_stream = nullptr;
 	}
@@ -134,6 +141,59 @@ SDL_Gamepad* GetGamepadFromID(SDL_JoystickID id) {
 	return id == 1 || id == 3 ? reinterpret_cast<SDL_Gamepad*>(static_cast<uintptr_t>(id))
 	                          : nullptr;
 }
+SDL_GamepadType GetGamepadType(SDL_Gamepad* pad) {
+	return GetGamepadTypeForID(static_cast<SDL_JoystickID>(reinterpret_cast<uintptr_t>(pad)));
+}
+Uint16 GetGamepadVendor(SDL_Gamepad*) {
+	return 0x054c;
+}
+Uint16 GetGamepadProduct(SDL_Gamepad*) {
+	return 0x0ce6;
+}
+const char* GetGamepadSerial(SDL_Gamepad* pad) {
+	return reinterpret_cast<uintptr_t>(pad) == 3 ? "aa-bb-cc-dd-ee-03" : "aa-bb-cc-dd-ee-01";
+}
+Uint64 GetTicksNS() {
+	return now * 1000000;
+}
+SDL_Thread* CreateThread(SDL_ThreadFunction, const char*, void*) {
+	return reinterpret_cast<SDL_Thread*>(1);
+}
+void                 WaitThread(SDL_Thread*, int*) {}
+SDL_hid_device_info* HidEnumerate(unsigned short, unsigned short) {
+	if (!hid_available) {
+		return nullptr;
+	}
+	static wchar_t             serial1[] = L"AA:BB:CC:DD:EE:01";
+	static wchar_t             serial3[] = L"AA:BB:CC:DD:EE:03";
+	static char                path1[]   = "pad-1";
+	static char                path3[]   = "pad-3";
+	static SDL_hid_device_info pad3 {}, pad1 {};
+	pad3.path          = path3;
+	pad3.serial_number = duplicate_hid ? serial1 : serial3;
+	pad3.bus_type      = SDL_HID_API_BUS_BLUETOOTH;
+	pad1.path          = path1;
+	pad1.serial_number = serial1;
+	pad1.bus_type      = SDL_HID_API_BUS_BLUETOOTH;
+	pad1.next          = &pad3;
+	return &pad1;
+}
+void            HidFreeEnumeration(SDL_hid_device_info*) {}
+SDL_hid_device* HidOpenPath(const char* path) {
+	hid_opens++;
+	opened_hid_pad = path[4] == '1' ? 1 : 3;
+	return reinterpret_cast<SDL_hid_device*>(static_cast<uintptr_t>(opened_hid_pad));
+}
+void HidClose(SDL_hid_device*) {}
+int  HidWrite(SDL_hid_device*, const unsigned char* data, size_t size) {
+	if (fail_hid_write || size != 547) {
+		return -1;
+	}
+	std::array<uint8_t, 547> report {};
+	std::copy_n(data, report.size(), report.begin());
+	hid_reports.push_back(report);
+	return static_cast<int>(size);
+}
 SDL_JoystickID* GetGamepads(int* count) {
 	*count    = static_cast<int>(connected_pads.size());
 	auto* ids = static_cast<SDL_JoystickID*>(
@@ -142,8 +202,10 @@ SDL_JoystickID* GetGamepads(int* count) {
 	ids[connected_pads.size()] = 0;
 	return ids;
 }
-SDL_JoystickConnectionState GetGamepadConnectionState(SDL_Gamepad*) {
-	return wireless ? SDL_JOYSTICK_CONNECTION_WIRELESS : SDL_JOYSTICK_CONNECTION_WIRED;
+SDL_JoystickConnectionState GetGamepadConnectionState(SDL_Gamepad* pad) {
+	return wireless || (wireless_pad3 && reinterpret_cast<uintptr_t>(pad) == 3)
+	           ? SDL_JOYSTICK_CONNECTION_WIRELESS
+	           : SDL_JOYSTICK_CONNECTION_WIRED;
 }
 bool RumbleGamepad(SDL_Gamepad* pad, Uint16 large, Uint16 small, Uint32 duration) {
 	const auto id = reinterpret_cast<uintptr_t>(pad);
@@ -173,22 +235,36 @@ bool SendGamepadEffect(SDL_Gamepad* pad, const void* data, int size) {
 }
 } // namespace Fake
 
-#define SDL_GetTicks                  Fake::GetTicks
-#define SDL_InitSubSystem             Fake::InitSubSystem
-#define SDL_QuitSubSystem             Fake::QuitSubSystem
-#define SDL_GetAudioPlaybackDevices   Fake::GetAudioPlaybackDevices
-#define SDL_GetAudioDeviceName        Fake::GetAudioDeviceName
-#define SDL_GetAudioDeviceFormat      Fake::GetAudioDeviceFormat
-#define SDL_OpenAudioDeviceStream     Fake::OpenAudioDeviceStream
-#define SDL_ResumeAudioStreamDevice   Fake::ResumeAudioStreamDevice
-#define SDL_DestroyAudioStream        Fake::DestroyAudioStream
-#define SDL_GetAudioStreamDevice      Fake::GetAudioStreamDevice
-#define SDL_GetGamepadTypeForID       Fake::GetGamepadTypeForID
+#define SDL_GetTicks                Fake::GetTicks
+#define SDL_InitSubSystem           Fake::InitSubSystem
+#define SDL_QuitSubSystem           Fake::QuitSubSystem
+#define SDL_GetAudioPlaybackDevices Fake::GetAudioPlaybackDevices
+#define SDL_GetAudioDeviceName      Fake::GetAudioDeviceName
+#define SDL_GetAudioDeviceFormat    Fake::GetAudioDeviceFormat
+#define SDL_OpenAudioDeviceStream   Fake::OpenAudioDeviceStream
+#define SDL_ResumeAudioStreamDevice Fake::ResumeAudioStreamDevice
+#define SDL_DestroyAudioStream      Fake::DestroyAudioStream
+#define SDL_GetAudioStreamDevice    Fake::GetAudioStreamDevice
+#define SDL_GetGamepadTypeForID     Fake::GetGamepadTypeForID
+#define SDL_GetGamepadType          Fake::GetGamepadType
+#define SDL_GetGamepadVendor        Fake::GetGamepadVendor
+#define SDL_GetGamepadProduct       Fake::GetGamepadProduct
+#define SDL_GetGamepadSerial        Fake::GetGamepadSerial
+#define SDL_GetTicksNS              Fake::GetTicksNS
+#undef SDL_CreateThread
+#define SDL_CreateThread              Fake::CreateThread
+#define SDL_WaitThread                Fake::WaitThread
+#define SDL_hid_enumerate             Fake::HidEnumerate
+#define SDL_hid_free_enumeration      Fake::HidFreeEnumeration
+#define SDL_hid_open_path             Fake::HidOpenPath
+#define SDL_hid_close                 Fake::HidClose
+#define SDL_hid_write                 Fake::HidWrite
 #define SDL_GetGamepadFromID          Fake::GetGamepadFromID
 #define SDL_RumbleGamepad             Fake::RumbleGamepad
 #define SDL_SendGamepadEffect         Fake::SendGamepadEffect
 #define SDL_GetGamepads               Fake::GetGamepads
 #define SDL_GetGamepadConnectionState Fake::GetGamepadConnectionState
+#include "libs/dualSenseBluetooth.cpp"
 #include "libs/dualSenseHaptics.cpp"
 #include "libs/audio.cpp"
 #undef SDL_GetTicks
@@ -202,6 +278,18 @@ bool SendGamepadEffect(SDL_Gamepad* pad, const void* data, int size) {
 #undef SDL_DestroyAudioStream
 #undef SDL_GetAudioStreamDevice
 #undef SDL_GetGamepadTypeForID
+#undef SDL_GetGamepadType
+#undef SDL_GetGamepadVendor
+#undef SDL_GetGamepadProduct
+#undef SDL_GetGamepadSerial
+#undef SDL_GetTicksNS
+#undef SDL_CreateThread
+#undef SDL_WaitThread
+#undef SDL_hid_enumerate
+#undef SDL_hid_free_enumeration
+#undef SDL_hid_open_path
+#undef SDL_hid_close
+#undef SDL_hid_write
 #undef SDL_GetGamepadFromID
 #undef SDL_RumbleGamepad
 #undef SDL_SendGamepadEffect
@@ -240,11 +328,16 @@ struct Fixture {
 		cached_rumble  = {};
 		effects        = {};
 		connected_pads = {1};
-		fail_effect = wireless = false;
-		default_stream = nullptr;
+		fail_effect = wireless = wireless_pad3 = false;
+		hid_available = fail_hid_write = false;
+		duplicate_hid                  = false;
+		hid_opens                      = 0;
+		opened_hid_pad                 = 0;
+		hid_reports.clear();
+		default_stream      = nullptr;
 		fail_default_resume = false;
-		active_controller = 1;
-		now                    = 1000;
+		active_controller   = 1;
+		now                 = 1000;
 		opens = rumble_calls = 0;
 		fail_open = fail_resume = false;
 		actual_channels         = 4;
@@ -516,6 +609,122 @@ void TestSpeakerRequiresUnambiguousUsbDevice() {
 	      "USB to Bluetooth change retained the USB speaker");
 }
 
+void TestBluetoothAudioAndIdentity() {
+	Fixture f;
+	wireless = hid_available = true;
+	connected_pads           = {1, 3};
+	devices.clear(); // Bluetooth does not enumerate a quad USB audio endpoint.
+	auto               vibration = Open();
+	auto               speaker   = Open(true);
+	std::vector<float> haptic(2048, 0.5f);
+	std::vector<float> sound(2048, 0.25f);
+	Check(Haptics::SetVibration(1, 100, 80) && pad_rumble[1].large == 100 * 0x101,
+	      "Bluetooth controller did not receive normal rumble");
+	Check(Haptics::Queue(vibration.get(), 1, haptic.data(), 1024, 2, true, unity.data()) != 0,
+	      "Bluetooth haptics did not open");
+	Check(Haptics::Queue(speaker.get(), 1, sound.data(), 1024, 2, true, unity.data()) != 0,
+	      "Bluetooth speaker did not open");
+	Check(hid_opens == 1 && opened_hid_pad == 1 && effects[1][7] == 0x30,
+	      "Bluetooth audio was not matched to the active controller");
+	Check(pad_rumble[1].large == 0, "Bluetooth haptics did not suppress motor rumble");
+	auto pending = Libs::Controller::DualSenseBluetooth::Prepare(now * 1000000);
+	Check(pending.size() == 1, "Bluetooth streams were not combined in one report");
+	Libs::Controller::DualSenseBluetooth::Send(pending);
+	Check(hid_reports.size() == 1, "Bluetooth audio report was not sent");
+	const auto& report = hid_reports.back();
+	Check(report[0] == 0x39 && report[2] == 0x91 && report[3] == 6 && report[4] == 0x7e &&
+	          report[10] == 0xd2 && report[11] == 64 && report[140] == 0xd3 && report[141] == 200,
+	      "Bluetooth audio sub-packets are malformed");
+	Check(report[12] > 0 && report[13] > 0,
+	      "haptic waveform was not downsampled into the actuator channels");
+	uint8_t prefix = 0xa2;
+	auto    crc    = SDL_crc32(0, &prefix, 1);
+	crc            = SDL_crc32(crc, report.data(), report.size() - 4);
+	for (size_t i = 0; i < 4; i++) {
+		Check(report[report.size() - 4 + i] == static_cast<uint8_t>(crc >> (8 * i)),
+		      "Bluetooth audio CRC is invalid");
+	}
+	int   opus_error = OPUS_OK;
+	auto* decoder    = opus_decoder_create(48000, 2, &opus_error);
+	Check(decoder != nullptr && opus_error == OPUS_OK, "Opus decoder unavailable in test");
+	std::array<float, 960> decoded {};
+	Check(opus_decode_float(decoder, report.data() + 142, 200, decoded.data(), 480, 0) == 480,
+	      "Bluetooth speaker packet could not be decoded");
+	opus_decoder_destroy(decoder);
+	const auto mean = std::accumulate(decoded.begin(), decoded.end(), 0.0f) / decoded.size();
+	Check(mean > 0.05f && mean < 0.35f, "Bluetooth speaker audio was not preserved");
+	Check(Libs::Controller::DualSenseBluetooth::Prepare(now * 1000000).empty(),
+	      "Bluetooth sender ignored report pacing");
+	now += 300;
+	Haptics::UpdateBluetoothRumble();
+	Check(pad_rumble[1].large == 100 * 0x101,
+	      "Bluetooth haptics did not restore normal rumble afterward");
+
+	// A different active DualSense has a different HID address, even if both are
+	// paired.
+	Check(Haptics::Queue(vibration.get(), 3, haptic.data(), 1024, 2, true, unity.data()) != 0 &&
+	          opened_hid_pad == 3,
+	      "Bluetooth stream followed the wrong controller");
+	Check(Haptics::Queue(speaker.get(), 3, sound.data(), 1024, 2, true, unity.data()) != 0,
+	      "Bluetooth speaker did not follow the selected controller");
+	Check(effects[1][7] == 0, "old Bluetooth controller remained speaker-routed");
+	wireless       = false;
+	connected_pads = {3};
+	devices        = {{20, "Speakers (DualSense Wireless Controller)", 4}};
+	Check(Haptics::Queue(speaker.get(), 3, sound.data(), 1024, 2, true, unity.data()) != 0 &&
+	          opened_device == 20 && effects[3][7] == 0x30,
+	      "Bluetooth to USB change did not reopen the USB speaker immediately");
+	speaker.reset();
+	vibration.reset();
+}
+
+void TestBluetoothFailureFallsBack() {
+	Fixture f;
+	wireless = hid_available   = true;
+	auto               speaker = Open(true);
+	std::vector<float> sound(2048, 0.25f);
+	Check(Haptics::Queue(speaker.get(), 1, sound.data(), 1024, 2, true, unity.data()) != 0,
+	      "Bluetooth port did not initially open");
+	fail_hid_write = true;
+	auto pending   = Libs::Controller::DualSenseBluetooth::Prepare(now * 1000000);
+	Libs::Controller::DualSenseBluetooth::Send(pending);
+	Check(Haptics::Queue(speaker.get(), 1, sound.data(), 1024, 2, true, unity.data()) == 0 &&
+	          effects[1][7] == 0,
+	      "failed HID write did not restore the normal audio fallback");
+	speaker.reset();
+}
+
+void TestBluetoothAmbiguousDevice() {
+	Fixture f;
+	wireless = hid_available = duplicate_hid = true;
+	auto speaker                             = Open(true);
+	Check(Haptics::Queue(speaker.get(), 1, pcm.data(), 2, 2, true, unity.data()) == 0 &&
+	          hid_opens == 0 && effects[1].empty(),
+	      "ambiguous Bluetooth devices were routed arbitrarily");
+	speaker.reset();
+}
+
+void TestUsbAndBluetoothFeatureParity() {
+	Fixture f;
+	connected_pads = {1, 3};
+	wireless_pad3 = hid_available       = true;
+	auto               wired_speaker    = Open(true);
+	auto               wireless_speaker = Open(true);
+	std::vector<float> sound(2048, 0.25f);
+	Check(Haptics::Queue(wired_speaker.get(), 1, sound.data(), 1024, 2, true, unity.data()) != 0 &&
+	          opened_device == 10,
+	      "Bluetooth pad disabled the wired pad speaker");
+	Check(Haptics::Queue(wireless_speaker.get(), 3, sound.data(), 1024, 2, true, unity.data()) !=
+	              0 &&
+	          opened_hid_pad == 3,
+	      "wired pad disabled the Bluetooth speaker");
+	Check(Haptics::Queue(wired_speaker.get(), 1, sound.data(), 1024, 2, true, unity.data()) != 0 &&
+	          effects[1][7] == 0x30 && effects[3][7] == 0,
+	      "returning to the wired speaker left Bluetooth routing active");
+	wireless_speaker.reset();
+	wired_speaker.reset();
+}
+
 void TestAudioSpeakerFallback() {
 	Fixture f;
 	Libs::Audio::Audio audio;
@@ -545,6 +754,26 @@ void TestAudioSpeakerRouting() {
 	ExpectPcm({0.5f, 0.5f, 0, 0, 0.5f, 0.5f, 0, 0});
 }
 
+void TestBluetoothAudioSpeakerRouting() {
+	Fixture f;
+	wireless = hid_available = true;
+	devices.clear();
+	Libs::Audio::Audio audio;
+	const auto port = audio.AudioOutOpen(4, 1024, 48000, Libs::Audio::Audio::Format::FloatStereo);
+	Check(port.IsValid() && default_stream != nullptr, "Bluetooth pad speaker port did not open");
+	std::vector<float> sound(2048, 0.25f);
+	Libs::Audio::Audio::OutputParam output {port, sound.data()};
+	Check(audio.AudioOutOutputs(&output, 1, false) == 1024 && hid_opens == 1 &&
+	          SDL_GetAudioStreamQueued(default_stream) == 0,
+	      "Bluetooth pad speaker also played on the host output");
+	fail_hid_write = true;
+	auto pending = Libs::Controller::DualSenseBluetooth::Prepare(now * 1000000);
+	Libs::Controller::DualSenseBluetooth::Send(pending);
+	Check(audio.AudioOutOutputs(&output, 1, false) == 1024 &&
+	          SDL_GetAudioStreamQueued(default_stream) > 0,
+	      "Bluetooth write failure did not use the normal speaker output");
+}
+
 void TestAudioDefaultResumeFailure() {
 	Fixture f;
 	Libs::Audio::Audio audio;
@@ -564,6 +793,7 @@ int main() {
 	SDL_SetHint(SDL_HINT_AUDIO_DRIVER, "dummy");
 	TestAudioSpeakerFallback();
 	TestAudioSpeakerRouting();
+	TestBluetoothAudioSpeakerRouting();
 	TestAudioDefaultResumeFailure();
 	TestFormatsAndVolume();
 	TestDiscoveryAndHotplug();
@@ -571,6 +801,10 @@ int main() {
 	TestSpeakerUnplug();
 	TestSpeakerSwitchAndFailures();
 	TestSpeakerRequiresUnambiguousUsbDevice();
+	TestBluetoothAudioAndIdentity();
+	TestBluetoothFailureFallsBack();
+	TestBluetoothAmbiguousDevice();
+	TestUsbAndBluetoothFeatureParity();
 	TestFailuresAndBoundedQueue();
 	TestRumbleLeaseAndDuration();
 	TestSwitchStopsOldRumble();

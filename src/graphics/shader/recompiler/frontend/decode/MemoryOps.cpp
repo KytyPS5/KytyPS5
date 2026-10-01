@@ -21,6 +21,7 @@ constexpr MemoryOpcodeInfo SMEM_OPCODE_LIST[] = {
     {0x04u, Opcode::S_LOAD_DWORDX16, 16, 32},      {0x08u, Opcode::S_BUFFER_LOAD_DWORD, 1, 32},
     {0x09u, Opcode::S_BUFFER_LOAD_DWORDX2, 2, 32}, {0x0au, Opcode::S_BUFFER_LOAD_DWORDX4, 4, 32},
     {0x0bu, Opcode::S_BUFFER_LOAD_DWORDX8, 8, 32}, {0x0cu, Opcode::S_BUFFER_LOAD_DWORDX16, 16, 32},
+    {0x25u, Opcode::S_MEMREALTIME, 2, 32},
 };
 
 constexpr MemoryOpcodeInfo MUBUF_OPCODE_LIST[] = {
@@ -105,6 +106,7 @@ constexpr MemoryOpcodeInfo DS_OPCODE_LIST[] = {
     {0x39u, Opcode::DS_READ_I8, 1, 8, true},     {0x3au, Opcode::DS_READ_U8, 1, 8},
     {0x3bu, Opcode::DS_READ_I16, 1, 16, true},   {0x3cu, Opcode::DS_READ_U16, 1, 16},
     {0x3du, Opcode::DS_CONSUME, 1, 32},          {0x3eu, Opcode::DS_APPEND, 1, 32},
+    {0x4au, Opcode::DS_OR_B64, 2, 32},
     {0x4du, Opcode::DS_WRITE_B64, 2, 32},        {0x4eu, Opcode::DS_WRITE2_B64, 4, 32},
     {0x4fu, Opcode::DS_WRITE2ST64_B64, 4, 32},   {0x76u, Opcode::DS_READ_B64, 2, 32},
     {0x77u, Opcode::DS_READ2_B64, 4, 32},        {0x78u, Opcode::DS_READ2ST64_B64, 4, 32},
@@ -184,6 +186,7 @@ bool IsDsAtomicOpcode(Opcode opcode) {
 		case Opcode::DS_AND_B32:
 		case Opcode::DS_AND_RTN_B32:
 		case Opcode::DS_OR_B32:
+		case Opcode::DS_OR_B64:
 		case Opcode::DS_OR_RTN_B32:
 		case Opcode::DS_XOR_B32:
 		case Opcode::DS_XOR_RTN_B32:
@@ -245,6 +248,10 @@ void DecodeSmem(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	}
 
 	DecodeScalarDestination(sdst, pc, inst.dst);
+	if (inst.opcode == Opcode::S_MEMREALTIME) {
+		inst.src_count = 0;
+		return;
+	}
 	// SMEM encodes SBASE in SGPR pairs. Scalar-buffer loads still use the same
 	// pair index; their descriptor operand consumes four SGPRs from that base.
 	DecodeScalarSource(sbase * 2u, pc, inst.src0);
@@ -268,6 +275,7 @@ void DecodeMubuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_inde
 	inst.idxen       = ((word0 >> 13u) & 1u) != 0;
 	inst.offen       = ((word0 >> 12u) & 1u) != 0;
 	inst.glc         = ((word0 >> 14u) & 1u) != 0;
+	inst.dlc         = ((word0 >> 15u) & 1u) != 0;
 	inst.slc         = ((word1 >> 22u) & 1u) != 0;
 	inst.family      = Family::MUBUF;
 	inst.opcode_id   = opcode;
@@ -303,6 +311,7 @@ void DecodeMtbuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_inde
 	inst.idxen         = ((word0 >> 13u) & 1u) != 0;
 	inst.offen         = ((word0 >> 12u) & 1u) != 0;
 	inst.glc           = ((word0 >> 14u) & 1u) != 0;
+	inst.dlc           = ((word0 >> 15u) & 1u) != 0;
 	inst.slc           = ((word1 >> 22u) & 1u) != 0;
 	inst.family        = Family::MTBUF;
 	inst.opcode_id     = opcode;

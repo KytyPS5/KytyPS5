@@ -31,6 +31,9 @@ public:
 	void                      SetGameDirectories(const QStringList& dirs);
 	[[nodiscard]] QStringList GetGameDirectories() const;
 
+signals:
+	void PreviewControllerColor(const QString& color);
+
 private:
 	Ui::ConfigurationEditDialog* m_ui = nullptr;
 	Configuration&               m_info;

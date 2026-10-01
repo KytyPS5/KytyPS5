@@ -91,14 +91,14 @@ private:
 	};
 
 	using ImageIds       = InlinePageOwnerList<ImageId, 16>;
-	using ImagePageTable = MultiLevelPageTable<ImageIds, 20, 40, 10>;
+	using ImagePageTable = MultiLevelPageTable<ImageIds, 20, 44, 14>;
 
-	// Callers have validated the nonempty 40-bit range with TryGetPageRange.
+	// Callers have validated the nonempty 44-bit range with TryGetPageRange.
 	template <typename Func>
 	static void ForEachPage(uint64_t address, size_t size, Func&& func) {
-		using FuncReturn                   = typename std::invoke_result<Func, uint64_t>::type;
+		using FuncReturn = typename std::invoke_result<Func, uint64_t>::type;
 		static constexpr bool RETURNS_BOOL = std::is_same_v<FuncReturn, bool>;
-		const uint64_t        page_end     = (address + size - 1) >> ImagePageTable::kPageBits;
+		const uint64_t page_end = (address + size - 1) >> ImagePageTable::kPageBits;
 		for (uint64_t page = address >> ImagePageTable::kPageBits; page <= page_end; ++page) {
 			if constexpr (RETURNS_BOOL) {
 				if (func(page)) {
@@ -128,7 +128,6 @@ private:
 	[[nodiscard]] static bool SameBacking(const ImageInfo& cached, const ImageInfo& requested,
 	                                      bool exact_format);
 	[[nodiscard]] static BindingType UploadBinding(const Image& image);
-	[[nodiscard]] bool               SafeToDownload(const Image& image);
 
 	// Caller holds m_lock; it also serializes the per-image query epoch.
 	[[nodiscard]] ImageIds      FindImagesInRegion(uint64_t address, uint64_t size,
@@ -139,14 +138,15 @@ private:
 	                                                ImageId cached);
 	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
 	void                        RefreshImage(ImageId id);
-	void MaterializeDccClear(ImageId id, const ImageDesc& desc, uint32_t metadata_base_layer);
-	void InitializeImage(ImageId id);
-	[[nodiscard]] TextureTransfer BuildTextureTransfer(const Image& image, BindingType binding,
-	                                                   TransferDirection direction) const;
-	[[nodiscard]] ImageDownload   BuildDownload(const Image& image) const;
-	void                          UploadImage(Image& image, Buffer& source, uint64_t source_offset);
+	void                        MaterializeColorClear(ImageId id, const ImageDesc& desc,
+	                                                uint32_t metadata_base_layer);
+	void                        InitializeImage(ImageId id);
+	[[nodiscard]] TextureTransfer
+	BuildTextureTransfer(const Image& image, BindingType binding, TransferDirection direction) const;
+	[[nodiscard]] ImageDownload BuildDownload(const Image& image) const;
+	void UploadImage(Image& image, Buffer& source, uint64_t source_offset);
 	void DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
-	                   uint64_t destination_size, ImageDownload transfer);
+	                       uint64_t destination_size, ImageDownload transfer);
 	void DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset);
 	void CommitGpuWrite(Image& image);
 	// Caller holds m_lock. Volume layer ranges select depth slices.
@@ -154,8 +154,8 @@ private:
 	                const vk::ImageSubresourceRange& range, const vk::ClearValue& clear);
 	void PrepareImageCopy(Image& image);
 	void RefreshCopySource(ImageId id);
-	[[nodiscard]] bool    CopyD16(Image& destination, Image& source);
-	void                  CopyImage(ImageId destination, ImageId source);
+	[[nodiscard]] bool CopyD16(Image& destination, Image& source);
+	void               CopyImage(ImageId destination, ImageId source);
 	[[nodiscard]] ImageId AssociateStencil(ImageId depth, GuestRange stencil);
 	void CopyImageMip(ImageId destination, ImageId source, uint32_t mip, uint32_t layer);
 	void ValidateImageDesc(const ImageDesc& desc) const;

@@ -65,12 +65,14 @@ const SymbolRecord* SymbolDatabase::Find(const SymbolResolve& s) const {
 	return &m_symbols[index];
 }
 
-const SymbolRecord* SymbolDatabase::FindByNid(const std::string& nid, SymbolType type) const {
+const SymbolRecord* SymbolDatabase::FindByNid(const std::string& nid, SymbolType type,
+                                                uint64_t vaddr) const {
 	auto prefix = nid + "[";
 	auto suffix = fmt::format("[{}]", magic_enum::enum_name(type));
 
 	for (const auto& symbol: m_symbols) {
-		if (symbol.name.starts_with(prefix) && symbol.name.ends_with(suffix)) {
+		if ((vaddr == 0 || symbol.vaddr == vaddr) && symbol.name.starts_with(prefix) &&
+		    symbol.name.ends_with(suffix)) {
 			return &symbol;
 		}
 	}

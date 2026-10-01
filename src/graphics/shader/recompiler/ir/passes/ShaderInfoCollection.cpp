@@ -326,6 +326,8 @@ void CollectBuiltinInputs(const Program& program, ShaderInfo& info) {
 }
 
 void CollectOutputs(const Program& program, ShaderStageInputInfo input_info, ShaderInfo& info) {
+	const bool alpha_remap = program.stage == ShaderType::Pixel && input_info.pixel != nullptr &&
+	                         input_info.pixel->alpha_blend_source_remap;
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			if (inst.GetOpcode() != ValueOpcode::SetAttribute) {
@@ -362,8 +364,7 @@ void CollectOutputs(const Program& program, ShaderStageInputInfo input_info, Sha
 						const auto output = DecodePositionExportComponent(
 						    input_info.vertex->pa_cl_vs_out_cntl, export_info.index, component);
 						if (output.viewport) {
-							AddOutput(info, StageOutputKind::ViewportIndex, 0, 0,
-							          "gl_ViewportIndex");
+							AddOutput(info, StageOutputKind::ViewportIndex, 0, 0, "gl_ViewportIndex");
 						}
 						if (output.point_size) {
 							AddOutput(info, StageOutputKind::PointSize, 0, 0, "gl_PointSize");
@@ -386,8 +387,14 @@ void CollectOutputs(const Program& program, ShaderStageInputInfo input_info, Sha
 					          export_info.index, fmt::format("out_param_{}", export_info.index));
 					break;
 				case ExportTargetKind::Mrt:
+					if (alpha_remap && export_info.index != 0) {
+						break;
+					}
 					AddOutput(info, StageOutputKind::Mrt, export_info.index, export_info.index,
 					          fmt::format("out_mrt_{}", export_info.index));
+					if (alpha_remap) {
+						AddOutput(info, StageOutputKind::Mrt, 1, 1, "out_mrt_1");
+					}
 					break;
 				default: break;
 			}

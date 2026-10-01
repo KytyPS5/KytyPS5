@@ -4,7 +4,6 @@
 #include "common/common.h"
 
 #include <cstdint>
-#include <optional>
 #include <tracy/Tracy.hpp> // IWYU pragma: export
 
 namespace profiler::colors {
@@ -23,22 +22,6 @@ inline constexpr uint32_t DeepOrangeA200 = 0xff6e40;
 
 namespace Profiler {
 
-class ScopedBlock {
-public:
-	explicit ScopedBlock(const tracy::SourceLocationData* source_location);
-	ScopedBlock(const ScopedBlock&)            = delete;
-	ScopedBlock& operator=(const ScopedBlock&) = delete;
-	ScopedBlock(ScopedBlock&&)                 = delete;
-	ScopedBlock& operator=(ScopedBlock&&)      = delete;
-	~ScopedBlock();
-
-	void End();
-
-private:
-	std::optional<tracy::ScopedZone> m_zone;
-};
-
-void EndBlock();
 void SetThreadName(const char* name);
 
 void Initialize();
@@ -66,19 +49,11 @@ struct Lifecycle {
 	    kyty_profiler_source_location_, line) {name, TracyFunction, TracyFile,                     \
 	                                           static_cast<uint32_t>(line),                        \
 	                                           KYTY_PROFILER_COLOR_OR_DEFAULT(0, __VA_ARGS__)};    \
-	Profiler::ScopedBlock KYTY_PROFILER_CONCAT(kyty_profiler_block_, line)(                        \
-	    &KYTY_PROFILER_CONCAT(kyty_profiler_source_location_, line))
+	tracy::ScopedZone KYTY_PROFILER_CONCAT(kyty_profiler_block_, line)(                           \
+	    &KYTY_PROFILER_CONCAT(kyty_profiler_source_location_, line),                              \
+	    TRACY_CALLSTACK, tracy::ProfilerAvailable())
 
-#define KYTY_PROFILER_FUNCTION(...) KYTY_PROFILER_FUNCTION_IMPL(__LINE__ __VA_OPT__(, ) __VA_ARGS__)
-#define KYTY_PROFILER_FUNCTION_IMPL(line, ...)                                                     \
-	static constexpr tracy::SourceLocationData KYTY_PROFILER_CONCAT(                               \
-	    kyty_profiler_source_location_, line) {nullptr, TracyFunction, TracyFile,                  \
-	                                           static_cast<uint32_t>(line),                        \
-	                                           KYTY_PROFILER_COLOR_OR_DEFAULT(0, __VA_ARGS__)};    \
-	Profiler::ScopedBlock KYTY_PROFILER_CONCAT(kyty_profiler_block_, line)(                        \
-	    &KYTY_PROFILER_CONCAT(kyty_profiler_source_location_, line))
-
-#define KYTY_PROFILER_END_BLOCK Profiler::EndBlock()
+#define KYTY_PROFILER_FUNCTION(...) KYTY_PROFILER_BLOCK(nullptr __VA_OPT__(, ) __VA_ARGS__)
 
 #define KYTY_PROFILER_THREAD(name) Profiler::SetThreadName(name)
 

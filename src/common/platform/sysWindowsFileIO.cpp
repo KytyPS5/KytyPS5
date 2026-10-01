@@ -266,19 +266,27 @@ uint64_t SysFileSize(sys_file_t& f) {
 	return 0;
 }
 
-uint64_t SysFileSize(const std::filesystem::path& file_name) {
-	LARGE_INTEGER             s;
-	WIN32_FILE_ATTRIBUTE_DATA a;
-
-	auto wide = file_name.wstring();
-	if (GetFileAttributesExW(wide.c_str(), GetFileExInfoStandard, &a) == 0) {
-		return 0;
+bool SysFileGetInfo(const std::filesystem::path& name, bool* is_file, uint64_t* size) {
+	const bool directory_path = !name.empty() && !name.has_filename() && name != name.root_path();
+	WIN32_FILE_ATTRIBUTE_DATA info {};
+	if (GetFileAttributesExW(directory_path ? name.parent_path().c_str() : name.c_str(),
+	                         GetFileExInfoStandard, &info) == 0) {
+		return false;
 	}
+	const bool file = (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+	if (directory_path && file) {
+		return false;
+	}
+	*is_file = file;
+	*size = *is_file ? ((static_cast<uint64_t>(info.nFileSizeHigh) << 32u) | info.nFileSizeLow) : 0;
+	return true;
+}
 
-	s.HighPart = static_cast<LONG>(a.nFileSizeHigh);
-	s.LowPart  = a.nFileSizeLow;
-
-	return s.QuadPart;
+uint64_t SysFileSize(const std::filesystem::path& file_name) {
+	bool is_file;
+	uint64_t size = 0;
+	SysFileGetInfo(file_name, &is_file, &size);
+	return size;
 }
 
 bool SysFileTruncate(sys_file_t& f, uint64_t size) {
@@ -346,17 +354,15 @@ bool SysFileIsError(sys_file_t& f) {
 }
 
 bool SysFileIsDirectoryExisting(const std::filesystem::path& path) {
-	auto  wide = path.wstring();
-	DWORD a    = GetFileAttributesW(wide.c_str());
-	return a != INVALID_FILE_ATTRIBUTES &&
-	       ((a & static_cast<DWORD>(FILE_ATTRIBUTE_DIRECTORY)) != 0u);
+	bool is_file;
+	uint64_t size;
+	return SysFileGetInfo(path, &is_file, &size) && !is_file;
 }
 
 bool SysFileIsFileExisting(const std::filesystem::path& name) {
-	auto  wide = name.wstring();
-	DWORD a    = GetFileAttributesW(wide.c_str());
-	return a != INVALID_FILE_ATTRIBUTES &&
-	       ((a & static_cast<DWORD>(FILE_ATTRIBUTE_DIRECTORY)) == 0u);
+	bool is_file;
+	uint64_t size;
+	return SysFileGetInfo(name, &is_file, &size) && is_file;
 }
 
 bool SysFileCreateDirectory(const std::filesystem::path& path) {

@@ -70,6 +70,10 @@ constexpr uint32_t ImageSampleAddressComponents(uint32_t flags, ImageDimension d
 	if ((flags & ImageSampleFlagLod) != 0) {
 		components++;
 	}
+	// The _CL clamp is the last body component (RDNA 2 ISA 8.2.5, "Image Opcodes with Sampler").
+	if ((flags & ImageSampleFlagLodClamp) != 0) {
+		components++;
+	}
 	if ((flags & ImageSampleFlagDerivative) != 0) {
 		components += ImageGradientComponents(dimension) * 2u;
 	}

@@ -16700,6 +16700,9 @@ private:
     vk::PhysicalDeviceFeatures device_features{};
     device_features.shaderStorageImageWriteWithoutFormat = true;
     device_features.shaderImageGatherExtended = true;
+    device_features.shaderResourceMinLod = available_features.shaderResourceMinLod;
+    ShaderRecompiler::Spirv::SetHostImageFeatures(
+        {.min_lod = available_features.shaderResourceMinLod == VK_TRUE});
     device_features.sampleRateShading = true;
     device_features.shaderInt64 = true;
     device_features.shaderFloat64 = available_features.shaderFloat64;
@@ -29438,8 +29441,7 @@ TestCase ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu() {
   using O = ShaderOpcode;
 
   std::vector<u32> code;
-  AppendVMovU32(&code, 20,
-                1); // Non-constant +1 X offset is not a SPIR-V ConstOffset.
+  AppendVMovU32(&code, 20, 1); // +1 X texel offset, a full 32-bit dword even with A16.
   AppendVMovLiteral(&code, 21, 0x36003900u); // x=0.625, y=0.375 packed as f16.
   AppendVMovU32(&code, 22, 0);
   code.push_back(EncodeMimg0(0x30, 0xf));
@@ -29449,8 +29451,11 @@ TestCase ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu() {
   }
   AppendEnd(&code);
 
+  // The coordinates select texel (2,1); the offset moves the read to texel (3,1).
   auto image = MakeRgbaImage(4, 4);
-  SetRgbaPixel(&image, 4, 2, 1, 0x3f800000u, 0x40000000u, 0x40400000u,
+  SetRgbaPixel(&image, 4, 2, 1, 0x40a00000u, 0x40c00000u, 0x40e00000u,
+               0x41000000u);
+  SetRgbaPixel(&image, 4, 3, 1, 0x3f800000u, 0x40000000u, 0x40400000u,
                0x40800000u);
 
   TestCase test;
@@ -29460,7 +29465,8 @@ TestCase ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu() {
   test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
   test.sampled_image_rgba = image;
-  test.required_spirv = {"UnpackHalf2x16"};
+  // The offset written under the result's EXEC is the literal: a ConstOffset.
+  test.required_spirv = {"UnpackHalf2x16", "ConstOffset"};
   test.forbidden_spirv = {"OpBitFieldSExtract"};
   return test;
 }

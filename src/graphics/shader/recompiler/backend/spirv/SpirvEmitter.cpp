@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <optional>
 #include <vector>
@@ -412,6 +413,18 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 		    static_cast<uint32_t>((function_lds_bytes + sizeof(uint32_t) - 1u) / sizeof(uint32_t));
 	}
 	return requirements;
+}
+
+namespace {
+std::atomic_bool g_image_min_lod {false};
+} // namespace
+
+void SetHostImageFeatures(const HostImageFeatures& features) {
+	g_image_min_lod.store(features.min_lod, std::memory_order_relaxed);
+}
+
+HostImageFeatures GetHostImageFeatures() {
+	return {.min_lod = g_image_min_lod.load(std::memory_order_relaxed)};
 }
 
 std::vector<uint32_t> EmitProgram(const IR::Program& program,

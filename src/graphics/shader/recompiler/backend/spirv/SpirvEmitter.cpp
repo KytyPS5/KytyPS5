@@ -321,6 +321,8 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program,
 	IR::ValidateProgram(program, true);
 	EmitterState state(program, input_info);
 	const auto* workgroup = ShaderWorkgroupInput(program.stage, input_info);
+	state.packed_wave32 =
+	    workgroup != nullptr && program.wave_size == 32u && workgroup->host_subgroup_size == 64u;
 	state.lane_count =
 	    workgroup != nullptr && program.wave_size == 64u && workgroup->host_subgroup_size == 32u
 	        ? 2u

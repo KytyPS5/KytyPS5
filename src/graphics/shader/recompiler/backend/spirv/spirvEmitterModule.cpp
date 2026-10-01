@@ -482,8 +482,33 @@ void DefineInputs(EmitterState& state) {
 	}
 }
 
+void AddAliasParameterOutputs(EmitterState& state) {
+	if (state.program.stage != ShaderType::Vertex || !state.program.info.parameter_plan_valid) {
+		return;
+	}
+	for (const auto& alias: state.program.info.parameter_aliases) {
+		const auto source = alias.second;
+		const auto found  = std::find_if(
+		    state.program.info.outputs.begin(), state.program.info.outputs.end(),
+		    [source](const IR::StageOutput& output) {
+			    return output.kind == IR::StageOutputKind::Parameter && output.index == source;
+		    });
+		if (found == state.program.info.outputs.end()) {
+			EXIT("alias output has no source parameter %u to copy from\n", source);
+		}
+		OutputBinding binding;
+		static_cast<IR::StageOutput&>(binding) = *found;
+		binding.index                          = alias.first;
+		binding.location                       = alias.first;
+		binding.debug_name   = "out_param_" + std::to_string(alias.first) + "_alias";
+		binding.alias_source = source;
+		state.outputs.push_back(binding);
+	}
+}
+
 void DefineOutputs(EmitterState& state) {
 	state.outputs.reserve(state.program.info.outputs.size());
+	AddAliasParameterOutputs(state);
 	uint32_t clip_distance_count = 0;
 	uint32_t cull_distance_count = 0;
 	for (const auto& output: state.program.info.outputs) {

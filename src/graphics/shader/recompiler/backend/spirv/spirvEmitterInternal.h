@@ -32,6 +32,7 @@ struct InputBinding : IR::StageInput {
 struct OutputBinding : IR::StageOutput {
 	uint32_t variable_id        = 0;
 	uint32_t mesh_data_variable = 0;
+	uint32_t alias_source       = UINT32_MAX;
 };
 
 using ImageDimension = Decoder::ImageDimension;

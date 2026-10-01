@@ -816,6 +816,16 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 				const auto end   = results[db * 2u + 1u];
 				if ((begin & end & ready_bit) == 0) {
 					if (wait_op == 0) {
+						// Host query results reach guest memory once the GPU finished them: make
+						// sure it does and they are published, once per wait.
+						if (!m_occlusion_wait_requested) {
+							m_occlusion_wait_requested = true;
+							auto& queries = m_renderer.GetOcclusionQueries();
+							if (queries.HasPendingDumps()) {
+								GetScheduler().Finish();
+								queries.PublishCompleted(true);
+							}
+						}
 						SuspendPm4();
 					} else {
 						m_predicate_skip = false;
@@ -824,6 +834,7 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 				}
 				value += end - begin;
 			}
+			m_occlusion_wait_requested = false;
 		} break;
 		case 0x03:
 			// The wait selector applies only to Z-pass query readiness.
@@ -1327,15 +1338,19 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 				     "\n",
 				     event_index, event_address);
 			}
+			auto& queries = m_renderer.GetOcclusionQueries();
+			if (queries.Enabled()) {
+				queries.Dump(GetScheduler(), event_address);
+				break;
+			}
 			static std::once_flag warning_once;
 			std::call_once(warning_once, [] {
 				std::printf("Warning: game uses occlusion queries, which are currently treated as "
 				            "always visible; GPU usage may be higher and FPS may be lower.\n");
 			});
 
-			// Until host occlusion queries are implemented, publish an always-visible result. The
-			// PS5 layout contains one interleaved begin/end pair per DB, and bit 63 marks a result
-			// ready.
+			// Without host occlusion queries, publish an always-visible result. The PS5 layout
+			// contains one interleaved begin/end pair per DB, and bit 63 marks a result ready.
 			constexpr uint64_t ready_bit    = 1ull << 63u;
 			constexpr uint64_t counter_mask = ready_bit - 1u;
 			auto*              results      = reinterpret_cast<volatile uint64_t*>(event_address);
@@ -1357,6 +1372,7 @@ void CommandProcessor::Flip() {
 	}
 
 	auto& command = CurrentBuffer();
+	m_renderer.GetOcclusionQueries().OnFrame();
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                         m_flip.flip_arg);
 	Sync::WriteAtEndOfPipeOnlyFlip(m_submit_id, command, m_flip.handle, m_flip.index,
@@ -1375,6 +1391,7 @@ void CommandProcessor::Flip(void* dst_gpu_addr, uint32_t value) {
 	}
 
 	std::memcpy(dst_gpu_addr, &value, sizeof(value));
+	m_renderer.GetOcclusionQueries().OnFrame();
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                         m_flip.flip_arg);
 	Sync::WriteAtEndOfPipeWithFlip32(m_submit_id, command, static_cast<uint32_t*>(dst_gpu_addr),
@@ -1400,6 +1417,7 @@ void CommandProcessor::FlipWithInterrupt(uint32_t eop_event_type, uint32_t cache
 		EXIT("unknown event type\n");
 	}
 	std::memcpy(dst_gpu_addr, &value, sizeof(value));
+	m_renderer.GetOcclusionQueries().OnFrame();
 	auto request = Sync::PrepareVideoOutFlip(command, m_flip.handle, m_flip.index, m_flip.flip_mode,
 	                                         m_flip.flip_arg);
 	Sync::WriteAtEndOfPipeWithInterruptWriteBackFlip32(

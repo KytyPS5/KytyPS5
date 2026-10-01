@@ -103,16 +103,20 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	rendering.pColorAttachments    = colors.data();
 	rendering.pDepthAttachment     = depth_stencil.has_depth ? &depth : nullptr;
 	rendering.pStencilAttachment   = depth_stencil.has_stencil ? &stencil : nullptr;
-	Handle().beginRendering(rendering);
+	const auto recorder = Handle();
+	recorder.beginRendering(rendering);
 	m_render_state = state;
 	m_rendering    = true;
+	m_context.GetOcclusionQueries().OnBeginRendering(recorder);
 }
 
 void CommandBuffer::EndRendering() const {
 	if (!m_rendering) {
 		return;
 	}
-	Handle().endRendering();
+	const auto recorder = Handle();
+	m_context.GetOcclusionQueries().OnEndRendering(recorder);
+	recorder.endRendering();
 	m_rendering    = false;
 	m_render_state = {};
 }

@@ -190,12 +190,22 @@ static bool ReadGuestWideCString(uint64_t addr, char* out, size_t out_size) {
 	return false;
 }
 
+// A UTF-16 path read as 8-bit text stops after its first character. The UTF-16 reading counts
+// only when it is longer and all ASCII (every high byte zero): an 8-bit "/" followed by other text
+// reads as non-ASCII code units.
+static bool IsWidePathReading(const char* wide, size_t narrow_len) {
+	const auto len = std::strlen(wide);
+	return len > narrow_len &&
+	       std::all_of(wide, wide + len, [](char ch) { return static_cast<unsigned char>(ch) < 0x80; });
+}
+
 static bool ReadGuestPathText(uint64_t addr, char* out, size_t out_size) {
 	std::array<char, 1024> narrow {};
 	if (ReadGuestCString(addr, narrow.data(), std::min(narrow.size(), out_size))) {
 		const auto narrow_len = std::strlen(narrow.data());
-		if (narrow_len > 1 || !ReadGuestWideCString(addr, out, out_size)) {
-			std::memcpy(out, narrow.data(), std::strlen(narrow.data()) + 1);
+		if (narrow_len > 1 || !ReadGuestWideCString(addr, out, out_size) ||
+		    !IsWidePathReading(out, narrow_len)) {
+			std::memcpy(out, narrow.data(), narrow_len + 1);
 		}
 		return true;
 	}
@@ -204,6 +214,16 @@ static bool ReadGuestPathText(uint64_t addr, char* out, size_t out_size) {
 		return true;
 	}
 	return false;
+}
+
+// Like ReadGuestPathText, but an empty prefix is valid: the paths are then used as they are.
+static bool ReadGuestPrefix(uint64_t addr, char* out, size_t out_size) {
+	if (out != nullptr && out_size != 0 && addr != 0 && IsGuestRangeCommitted(addr, 1) &&
+	    *reinterpret_cast<const char*>(static_cast<uintptr_t>(addr)) == '\0') {
+		out[0] = '\0';
+		return true;
+	}
+	return ReadGuestPathText(addr, out, out_size);
 }
 
 static bool ReadPathPointer(uint64_t pointer_addr, char* out, size_t out_size) {
@@ -323,21 +343,16 @@ static bool JoinPrefixPath(const char* prefix, const char* path, char* out, size
 		return true;
 	}
 
+	// The SDK concatenates prefix and path as they are ("/app0/" + "test1.dat"): no separator.
 	const auto prefix_len = std::strlen(prefix);
 	const auto path_len   = std::strlen(path);
-	const bool needs_sep  = prefix_len != 0 && path_len != 0 && prefix[prefix_len - 1] != '/' &&
-	                        prefix[prefix_len - 1] != '\\' && path[0] != '/' && path[0] != '\\';
-	const auto total_len  = prefix_len + (needs_sep ? 1u : 0u) + path_len;
+	const auto total_len  = prefix_len + path_len;
 	if (total_len + 1u > out_size) {
 		return false;
 	}
 
 	std::memcpy(out, prefix, prefix_len);
-	auto pos = prefix_len;
-	if (needs_sep) {
-		out[pos++] = '/';
-	}
-	std::memcpy(out + pos, path, path_len);
+	std::memcpy(out + prefix_len, path, path_len);
 	out[total_len] = '\0';
 	return true;
 }
@@ -647,7 +662,7 @@ static int KYTY_SYSV_ABI ResolveFilepathsWithPrefixToIds(const char* prefix, con
 	PRINT_NAME();
 
 	char prefix_buf[1024] {};
-	if (prefix != nullptr && !AprShared::ReadGuestPathText(reinterpret_cast<uint64_t>(prefix),
+	if (prefix != nullptr && !AprShared::ReadGuestPrefix(reinterpret_cast<uint64_t>(prefix),
 	                                                       prefix_buf, sizeof(prefix_buf))) {
 		return KernelSyscallResult(LibKernel::KERNEL_ERROR_EFAULT);
 	}
@@ -663,7 +678,7 @@ static int KYTY_SYSV_ABI ResolveFilepathsWithPrefixToIdsAndFileSizes(const char*
 	PRINT_NAME();
 
 	char prefix_buf[1024] {};
-	if (prefix != nullptr && !AprShared::ReadGuestPathText(reinterpret_cast<uint64_t>(prefix),
+	if (prefix != nullptr && !AprShared::ReadGuestPrefix(reinterpret_cast<uint64_t>(prefix),
 	                                                       prefix_buf, sizeof(prefix_buf))) {
 		return KernelSyscallResult(LibKernel::KERNEL_ERROR_EFAULT);
 	}
@@ -695,7 +710,7 @@ static int KYTY_SYSV_ABI ResolveFilepathsWithPrefixToIdsForEach(const char* pref
 	PRINT_NAME();
 
 	char prefix_buf[1024] {};
-	if (prefix != nullptr && !AprShared::ReadGuestPathText(reinterpret_cast<uint64_t>(prefix),
+	if (prefix != nullptr && !AprShared::ReadGuestPrefix(reinterpret_cast<uint64_t>(prefix),
 	                                                       prefix_buf, sizeof(prefix_buf))) {
 		return KernelSyscallResult(LibKernel::KERNEL_ERROR_EFAULT);
 	}
@@ -709,7 +724,7 @@ static int KYTY_SYSV_ABI ResolveFilepathsWithPrefixToIdsAndFileSizesForEach(
 	PRINT_NAME();
 
 	char prefix_buf[1024] {};
-	if (prefix != nullptr && !AprShared::ReadGuestPathText(reinterpret_cast<uint64_t>(prefix),
+	if (prefix != nullptr && !AprShared::ReadGuestPrefix(reinterpret_cast<uint64_t>(prefix),
 	                                                       prefix_buf, sizeof(prefix_buf))) {
 		return KernelSyscallResult(LibKernel::KERNEL_ERROR_EFAULT);
 	}

@@ -1169,10 +1169,28 @@ void RenderExecutor::ExecutePreparedDrawResolved(uint64_t submit_id, CommandBuff
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "CreatePipeline");
 	}
-	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(
+	// A draw that writes no memory may be skipped while its new pipeline compiles in the
+	// background; its render targets are not touched. One that writes buffers or storage images
+	// waits for the pipeline, as others may read what it writes.
+	const auto writes_memory = [](const ShaderStageRuntime& runtime) {
+		return HasShaderBufferWrites(runtime) ||
+		       std::ranges::any_of(runtime.program->info.images, [](const auto& image) {
+			       return image.written &&
+			              image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Storage;
+		       });
+	};
+	bool may_defer = !(state.ps_active && writes_memory(state.ps_input_info.stage));
+	for (const auto& stage: vertex_stages) {
+		may_defer = may_defer && !writes_memory(stage.stage);
+	}
+	auto* deferred_pipeline = m_context.GetPipelineCache().TryGetGraphicsPipeline(
 	    std::span {state.color_info, state.color_count}, state.depth_info, vertex_stages, buffer,
 	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
-	    state.programs);
+	    state.programs, may_defer);
+	if (deferred_pipeline == nullptr) {
+		return;
+	}
+	auto& pipeline = *deferred_pipeline;
 	vk::ImageAspectFlags feedback_aspects;
 	const auto rendering =
 	    AcquireRenderTargets(buffer, state.color_info, state.color_count, state.depth_info,

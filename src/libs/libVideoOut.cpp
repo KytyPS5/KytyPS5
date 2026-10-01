@@ -39,6 +39,8 @@ LIB_DEFINE(InitVideoOut_1) {
 	LIB_FUNC("Mt4QHHkxkOc", VideoOut::VideoOutGetEventCount);
 	LIB_FUNC("j6RaAUlaLv0", VideoOut::VideoOutWaitVblank);
 	LIB_FUNC("utPrVdxio-8", VideoOut::VideoOutGetOutputStatus);
+	LIB_FUNC("5tRaBjtdTzY", VideoOut::VideoOutVrrPegToFixedRate);
+	LIB_FUNC("T4ucGB8CsnM", VideoOut::VideoOutVrrUnpegFromFixedRate);
 	LIB_FUNC("+I4K03i3EL0", VideoOut::VideoOutInitializeOutputOptions);
 	LIB_FUNC("Nv8c-Kb+DUM", VideoOut::VideoOutIsOutputSupported);
 	LIB_FUNC("w0hLuNarQxY", VideoOut::VideoOutConfigureOutput);
@@ -46,6 +48,7 @@ LIB_DEFINE(InitVideoOut_1) {
 	LIB_FUNC("MCJ8SkzsQxY", VideoOut::VideoOutLatencyMeasureSetStartPoint);
 	LIB_FUNC("DYhhWbJSeRg", VideoOut::VideoOutColorSettingsSetGamma);
 	LIB_FUNC("pv9CI5VC+R0", VideoOut::VideoOutAdjustColor);
+	LIB_FUNC("w7Ipp9Xl7hg", VideoOut::VideoOutAllowOutputResolutionWqhdDetection);
 }
 
 } // namespace LibGen5

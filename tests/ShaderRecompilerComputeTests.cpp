@@ -2402,6 +2402,232 @@ public:
     std::printf("[host]    %-32s ok\n", "StreamBufferRing");
   }
 
+  void CheckGpuSuspendPoint() {
+    constexpr const char *name = "GpuSuspendPoint";
+    EnsureRuntimeContext();
+    auto &context = Renderer();
+    context.InitializeGpu(nullptr);
+    auto &gpu = context.GetGpu();
+    auto &scheduler = context.GetCommandScheduler();
+    CommandProcessor setup(context, 0);
+
+    vk::SemaphoreTypeCreateInfo timeline_type{};
+    timeline_type.sType = vk::StructureType::eSemaphoreTypeCreateInfo;
+    timeline_type.semaphoreType = vk::SemaphoreType::eTimeline;
+    vk::SemaphoreCreateInfo timeline_create{};
+    timeline_create.sType = vk::StructureType::eSemaphoreCreateInfo;
+    timeline_create.pNext = &timeline_type;
+    vk::Semaphore gate = nullptr;
+    Require(name, "timeline create",
+            m_runtime_context.device.createSemaphore(
+                &timeline_create, nullptr, &gate) == vk::Result::eSuccess,
+            "failed to create the native completion gate");
+    const auto signal = [&](uint64_t value) {
+      vk::SemaphoreSignalInfo info{};
+      info.sType = vk::StructureType::eSemaphoreSignalInfo;
+      info.semaphore = gate;
+      info.value = value;
+      Require(name, "timeline signal",
+              m_runtime_context.device.signalSemaphore(&info) ==
+                  vk::Result::eSuccess,
+              "failed to release native GPU work");
+    };
+    const auto finish = [&] {
+      gpu.WaitForIdle();
+      gpu.SendCommandSync([&] {
+        scheduler.Finish();
+        scheduler.WaitPriorityOperations(scheduler.CurrentTick() - 1);
+      });
+    };
+    const auto write = [](uint32_t *packet, uint32_t *destination,
+                          uint32_t value, bool predicated = false) {
+      const auto address = reinterpret_cast<uint64_t>(destination);
+      packet[0] = KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0) | uint32_t{predicated};
+      packet[1] = 0;
+      packet[2] = static_cast<uint32_t>(address);
+      packet[3] = static_cast<uint32_t>(address >> 32u);
+      packet[4] = value;
+    };
+
+    gpu.SendCommandSync([&] {
+      setup.BufferInit();
+      SubmitInfo blocked;
+      blocked.AddWait(gate, 1);
+      scheduler.Flush(blocked);
+    });
+    std::binary_semaphore first_returned{0};
+    std::jthread first([&] {
+      gpu.SuspendPoint();
+      first_returned.release();
+    });
+    const bool first_nonblocking =
+        first_returned.try_acquire_for(std::chrono::seconds(2));
+    if (!first_nonblocking) {
+      signal(1);
+    }
+    first.join();
+    Require(name, "first call", first_nonblocking,
+            "the first suspend point waited for native GPU completion");
+
+    // Let the marker reach Vulkan while its completion remains gated.
+    std::binary_semaphore marker_parsed{0};
+    std::jthread parser([&] {
+      gpu.WaitForIdle();
+      marker_parsed.release();
+    });
+    const bool parser_nonblocking =
+        marker_parsed.try_acquire_for(std::chrono::seconds(2));
+    if (!parser_nonblocking) {
+      signal(1);
+    }
+    parser.join();
+    Require(name, "marker insertion", parser_nonblocking,
+            "inserting a suspend point blocked the GPU command thread");
+
+    std::binary_semaphore second_entered{0};
+    std::binary_semaphore second_returned{0};
+    std::jthread second([&] {
+      second_entered.release();
+      gpu.SuspendPoint();
+      second_returned.release();
+    });
+    second_entered.acquire();
+    const bool second_overtook_completion =
+        second_returned.try_acquire_for(std::chrono::milliseconds(100));
+
+    uint32_t compute_value = 0;
+    std::array<uint32_t, 5> compute_commands{};
+    write(compute_commands.data(), &compute_value, 33);
+    bool host_lane_responded = false;
+    std::binary_semaphore compute_progress{0};
+    std::jthread compute([&] {
+      gpu.SubmitCompute(0x20, compute_commands);
+      gpu.SendCommandSync([&] { host_lane_responded = true; });
+      gpu.WaitForIdle();
+      compute_progress.release();
+    });
+    const bool compute_did_not_wait =
+        compute_progress.try_acquire_for(std::chrono::seconds(2));
+    signal(1);
+    second.join();
+    compute.join();
+    finish();
+    Require(name, "one outstanding point", !second_overtook_completion,
+            "a second suspend point returned before the first native completion");
+    Require(name, "independent queue progress",
+            compute_did_not_wait && host_lane_responded && compute_value == 33,
+            "waiting for a previous suspend point blocked compute submissions "
+            "or the host command lane");
+    Require(name, "frame count", gpu.GetFrameNum() == 2,
+            "suspend-point insertion did not advance the frame counter once");
+
+    // A marker must stay behind a stalled graphics stream, then clear its
+    // predicate before the next stream. Async compute releases that stream.
+    alignas(16) uint64_t predicate = 0;
+    uint32_t label = 0;
+    uint32_t prefix = 0;
+    uint32_t skipped = 0;
+    uint32_t after_reset = 0;
+    const auto predicate_address = reinterpret_cast<uint64_t>(&predicate);
+    const auto label_address = reinterpret_cast<uint64_t>(&label);
+    std::array<uint32_t, 21> before{};
+    before[0] = KYTY_PM4(4, Pm4::IT_SET_PREDICATION, 0);
+    before[1] = (3u << 16u) | (1u << 8u);
+    before[2] = static_cast<uint32_t>(predicate_address);
+    before[3] = static_cast<uint32_t>(predicate_address >> 32u);
+    write(before.data() + 4, &skipped, 11, true);
+    write(before.data() + 9, &prefix, 22);
+    before[14] = KYTY_PM4(7, Pm4::IT_WAIT_REG_MEM, 0);
+    before[15] = 0x10u | 3u;
+    before[16] = static_cast<uint32_t>(label_address);
+    before[17] = static_cast<uint32_t>(label_address >> 32u);
+    before[18] = 1;
+    before[19] = UINT32_MAX;
+    std::array<uint32_t, 5> after{};
+    write(after.data(), &after_reset, 44, true);
+    std::binary_semaphore lane_entered{0};
+    std::binary_semaphore release_lane{0};
+    gpu.SendCommand([&] {
+      lane_entered.release();
+      release_lane.acquire();
+    });
+    lane_entered.acquire();
+    gpu.Submit(before, {});
+    std::binary_semaphore queued_returned{0};
+    std::jthread queued([&] {
+      gpu.SuspendPoint();
+      queued_returned.release();
+    });
+    const bool queued_nonblocking =
+        queued_returned.try_acquire_for(std::chrono::seconds(2));
+    if (!queued_nonblocking) {
+      release_lane.release();
+      gpu.SendCommandSync([&] { label = 1; });
+      queued.join();
+      finish();
+      Require(name, "queued insertion", false,
+              "suspend-point insertion drained pending guest graphics");
+    }
+    queued.join();
+    gpu.Submit(after, {});
+    release_lane.release();
+    bool prefix_reached = false;
+    bool graphics_ordered = false;
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::seconds(2);
+    do {
+      gpu.SendCommandSync([&] {
+        prefix_reached = prefix == 22;
+        graphics_ordered = skipped == 0 && after_reset == 0;
+      });
+      std::this_thread::yield();
+    } while (!prefix_reached && std::chrono::steady_clock::now() < deadline);
+    std::array<uint32_t, 5> release_graphics{};
+    write(release_graphics.data(), &label, 1);
+    gpu.SubmitCompute(0x20, release_graphics);
+    finish();
+    Require(name, "graphics FIFO",
+            prefix_reached && graphics_ordered && skipped == 0,
+            "suspend point or later graphics overtook a stalled graphics stream");
+    Require(name, "graphics reset", after_reset == 44,
+            "suspend point preserved the previous frame's predicate");
+
+    // Delay the completion callback beyond the owner's shutdown when possible.
+    // Its credit must remain alive independently of the GuestGpu object.
+    std::binary_semaphore priority_entered{0};
+    std::binary_semaphore release_priority{0};
+    gpu.SendCommandSync([&] {
+      scheduler.DeferPriorityOperation([&] {
+        priority_entered.release();
+        release_priority.acquire();
+      });
+      SubmitInfo blocked;
+      blocked.AddWait(gate, 2);
+      scheduler.Flush(blocked);
+    });
+    gpu.SuspendPoint();
+    gpu.WaitForIdle();
+    std::binary_semaphore shutdown_returned{0};
+    std::jthread shutdown([&] {
+      context.ShutdownGpu();
+      shutdown_returned.release();
+    });
+    const bool shutdown_overtook_native =
+        shutdown_returned.try_acquire_for(std::chrono::milliseconds(100));
+    signal(2);
+    priority_entered.acquire();
+    if (!shutdown_overtook_native) {
+      (void)shutdown_returned.try_acquire_for(std::chrono::seconds(2));
+    }
+    release_priority.release();
+    shutdown.join();
+    scheduler.DrainPriorityOperations();
+    m_runtime_context.device.destroySemaphore(gate, nullptr);
+    Require(name, "shutdown native completion", !shutdown_overtook_native,
+            "shutdown returned while the suspend point was still executing");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   void CheckGpuCommandLane() {
     EnsureRuntimeContext();
     auto &context = Renderer();
@@ -2647,7 +2873,7 @@ public:
     graphics_gate_entered.acquire();
     live_graphics_commands[4] = 22;
     graphics_gate_release.release();
-    gpu.Done();
+    gpu.WaitForIdle();
     Require("GpuCommandLane", "borrowed graphics commands",
             live_graphics_value == 22,
             "graphics submission executed a copied PM4 stream");
@@ -2665,7 +2891,7 @@ public:
     compute_gate_entered.acquire();
     live_compute_commands[4] = 44;
     compute_gate_release.release();
-    gpu.Done();
+    gpu.WaitForIdle();
     Require("GpuCommandLane", "borrowed compute commands",
             live_compute_value == 44,
             "compute submission executed a copied PM4 stream");
@@ -2721,7 +2947,7 @@ public:
     write_packet(no_interrupt_graphics_commands.data(),
                  &no_interrupt_graphics_value, 55);
     gpu.Submit(no_interrupt_graphics_commands, {});
-    gpu.Done();
+    gpu.WaitForIdle();
     finish_gpu();
 
     LibKernel::EventQueue::KernelEvent interrupt_event{};
@@ -2745,7 +2971,7 @@ public:
     interrupt_gate_entered.acquire();
     live_interrupt_commands[2] = 0;
     interrupt_gate_release.release();
-    gpu.Done();
+    gpu.WaitForIdle();
     finish_gpu();
 
     interrupt_count = 0;
@@ -2761,7 +2987,7 @@ public:
     auto graphics_interrupt_commands = make_interrupt_packet(
         1, 1, &graphics_interrupt_label, 0x11223344u, 0);
     gpu.Submit(graphics_interrupt_commands, {});
-    gpu.Done();
+    gpu.WaitForIdle();
     finish_gpu();
 
     interrupt_count = 0;
@@ -2787,7 +3013,7 @@ public:
     compute_interrupt_gate_entered.acquire();
     compute_interrupt_commands[2] |= 1u << 24u;
     compute_interrupt_gate_release.release();
-    gpu.Done();
+    gpu.WaitForIdle();
     finish_gpu();
 
     interrupt_count = 0;
@@ -2803,7 +3029,7 @@ public:
     auto compute_clock_commands = make_interrupt_packet(
         3, 1, &compute_clock_label, 0, 0x567u);
     gpu.SubmitCompute(0x20, compute_clock_commands);
-    gpu.Done();
+    gpu.WaitForIdle();
     finish_gpu();
 
     interrupt_count = 0;
@@ -2821,7 +3047,7 @@ public:
         2, 2, &compute_done_label, compute_done_value, 0x678u);
     compute_done_commands[1] = 0x62fu; // CS_DONE, shader-done index, no GCR action.
     gpu.SubmitCompute(0x20, compute_done_commands);
-    gpu.Done();
+    gpu.WaitForIdle();
     finish_gpu();
 
     interrupt_count = 0;
@@ -2896,7 +3122,7 @@ public:
       });
       std::this_thread::yield();
     }
-    gpu.Done();
+    gpu.WaitForIdle();
     Require("GpuCommandLane", "packet-boundary command polling",
             packet_marker_a_at_callback == 11 &&
                 packet_marker_b_at_callback == 0 && packet_marker_a == 11 &&
@@ -2934,21 +3160,21 @@ public:
     uint32_t ordered_suffix = 0;
     std::jthread ordered([&] {
       ordered_started.release();
-      gpu.Done();
+      gpu.WaitForIdle();
       ordered_suffix = suffix;
       ordered_finished = true;
     });
     ordered_started.acquire();
     gpu.SendCommandSync([&] {
-      Require("GpuCommandLane", "submit done barrier", !ordered_finished.load(),
-              "submit done returned before a queued submission");
+      Require("GpuCommandLane", "guest queue idle fence", !ordered_finished.load(),
+              "idle fence returned before a queued submission");
       label = 1;
     });
     ordered.join();
     Require("GpuCommandLane", "ordered completion",
             prefix == 11 && suffix == 22 && ordered_suffix == 22 &&
                 ordered_finished.load(),
-            "submit done did not drain prior PM4 work");
+            "idle fence did not drain prior PM4 work");
 
     auto &resources = context;
     constexpr uint64_t empty_unmap_base = 0x0000000200400000ull;
@@ -2971,7 +3197,7 @@ public:
       unmap_complete.acquire();
     }
     unmap_thread.join();
-    gpu.Done();
+    gpu.WaitForIdle();
     Require("GpuCommandLane", "unmap queue progress",
             unmap_returned &&
                 !resources.IsMapped(empty_unmap_base, empty_unmap_size) &&
@@ -3098,7 +3324,7 @@ public:
             dma_cursor == dma_commands.size(),
             "DMA_DATA packet stream has the wrong size");
     gpu.Submit(dma_commands, {});
-    gpu.Done();
+    gpu.WaitForIdle();
     constexpr uint32_t clean_fill_value = 0xdecafbad;
     gpu.SendCommandSync([&] {
       auto &buffer_cache = resources.GetBufferCache();
@@ -3336,15 +3562,12 @@ public:
     std::binary_semaphore command_entered{0};
     std::binary_semaphore release_command{0};
     std::atomic<bool> shutdown_complete{false};
-    std::atomic<bool> submission_lane_entered{false};
     bool shutdown_owner_visible = false;
     resources.MapMemory(empty_unmap_base, empty_unmap_size);
     gpu.SendCommand([&] {
       command_entered.release();
       release_command.acquire();
       shutdown_owner_visible = &context.GetGpu() == &gpu;
-      gpu.Done();
-      submission_lane_entered = true;
     });
     command_entered.acquire();
     std::jthread shutdown_thread([&] {
@@ -3360,8 +3583,7 @@ public:
     shutdown_thread.join();
     Require(
         "GpuCommandLane", "owned shutdown completion",
-        shutdown_complete.load() && submission_lane_entered.load() &&
-            shutdown_owner_visible,
+        shutdown_complete.load() && shutdown_owner_visible,
         "GPU owner did not remain available while draining queued work");
     resources.UnmapMemory(empty_unmap_base, empty_unmap_size);
     Require("GpuCommandLane", "unmap after shutdown",
@@ -23539,6 +23761,158 @@ TestCase VectorVopcCmpxLtU16CapturedSdwaExecMask() {
   return test;
 }
 
+TestCase VectorVopcCmpxLtI16CapturedSdwaExecMask() {
+  using O = ShaderOpcode;
+  enum Encoding { Captured, Compact, Vop3, HighLhs, HighRhs, SdwaOperands };
+  struct CompareCase {
+    u32 lhs;
+    u32 rhs;
+    u32 expected_exec;
+    Encoding encoding = Captured;
+    u32 incoming_exec = 1;
+    u32 src0_sel = 6;
+    u32 src1_sel = 6;
+    u32 src0_sext = 0;
+    u32 src1_sext = 0;
+  };
+  const std::array<CompareCase, 30> cases{{
+      {0xffff000eu, 15u, 1}, // Ignore the high half: 14 < 15.
+      {0x8000000fu, 15u, 0}, // Equality is false despite a negative high half.
+      {0x00000010u, 15u, 0},
+      {0x7fff0000u, 15u, 1},
+      {0x0000ffffu, 15u, 1}, // Signed -1, not unsigned 65535.
+      {0x00008000u, 15u, 1}, // Minimum signed halfword.
+      {0x00007fffu, 15u, 0}, // Maximum signed halfword.
+      {0x0000fff0u, 15u, 1},
+      {0x0000ffffu, 15u, 0, Captured, 0}, // Cannot reactivate an inactive lane.
+      {0xffff000fu, 15u, 0, Captured, 0},
+      {0x1234ffffu, 0xabcd0000u, 1, Compact}, // -1 < 0.
+      {0xffff0000u, 0x0000ffffu, 0, Compact}, // 0 < -1 is false.
+      {0xabcd8000u, 0x12347fffu, 1, Vop3},
+      {0x12347fffu, 0xabcd8000u, 0, Vop3},
+      {0xffff0010u, 15u, 1, HighLhs}, // Select -1 in WORD_1.
+      {0x0010ffffu, 15u, 0, HighLhs}, // Select 16, not the negative low half.
+      {0x1234fffeu, 0xffff8000u, 1, HighRhs}, // -2 < selected -1.
+      {0x1234ffffu, 0xabcd0000u, 1, SdwaOperands, 1, 4, 4, 1, 1},
+      {0x12345680u, 0u, 1, SdwaOperands, 1, 0, 6, 1, 0}, // BYTE_0 SEXT: -128.
+      {0x1234567fu, 0u, 0, SdwaOperands, 1, 0, 6, 1, 0}, // +127.
+      {0x12345680u, 0u, 0, SdwaOperands, 1, 0, 6, 0, 0}, // Without SEXT: +128.
+      {0x12348000u, 0u, 1, SdwaOperands, 1, 1, 6, 1, 0},
+      {0x12803456u, 0u, 1, SdwaOperands, 1, 2, 6, 1, 0},
+      {0x80345678u, 0u, 1, SdwaOperands, 1, 3, 6, 1, 0},
+      {0x0000ffffu, 0x12345680u, 0, SdwaOperands, 1, 6, 0, 0, 1}, // -1 < -128 is false.
+      {0x0000ff7fu, 0x12345680u, 1, SdwaOperands, 1, 6, 0, 0, 1}, // -129 < -128.
+      {0x0000ffffu, 0x12347f00u, 1, SdwaOperands, 1, 6, 1, 0, 1},
+      {0u, 0x12803456u, 0, SdwaOperands, 1, 6, 2, 0, 1},
+      {0u, 0x80345678u, 0, SdwaOperands, 1, 6, 3, 0, 1},
+      {0xff000001u, 0x000100ffu, 1, SdwaOperands, 1, 3, 2, 1, 1},
+  }};
+  constexpr u32 vcc_lo = 0x76543210u;
+  constexpr u32 vcc_hi = 0x89abcdefu;
+  TestCase test;
+  test.name = "VectorVopcCmpxLtI16CapturedSdwaExecMask";
+  for (const auto &entry : cases) {
+    test.initial.push_back(entry.lhs);
+  }
+  test.expected = test.initial;
+  auto &code = test.code;
+  for (u32 i = 0; i < cases.size(); ++i) {
+    const auto &entry = cases[i];
+    AppendVMovU32(&code, 30, i * 4u);
+    AppendBufferLoadDword(&code, 1, 30); // Runtime input prevents constant folding.
+    AppendVMovU32(&code, 2, entry.rhs);
+    AppendSMovLiteral(&code, 106, vcc_lo);
+    AppendSMovLiteral(&code, 107, vcc_hi);
+    code.push_back(EncodeSMovB32(126, InlineU32(entry.incoming_exec)));
+    switch (entry.encoding) {
+    case Compact: code.push_back(0x7d320501u); break;
+    case Vop3: code.insert(code.end(), {0xd499007eu, 0x00020501u}); break;
+    case HighLhs: code.insert(code.end(), {0x7d331ef9u, 0x86050001u}); break;
+    case HighRhs:
+      code.push_back(EncodeVopc(0x99u, 249u, 2u));
+      code.push_back(EncodeVopcSdwa(1u, 0u, 0u, 6u, 5u));
+      break;
+    case SdwaOperands:
+      code.push_back(EncodeVopc(0x99u, 249u, 2u));
+      code.push_back(EncodeVopcSdwa(1u, 0u, 0u, entry.src0_sel, entry.src1_sel,
+                                  entry.src0_sext, entry.src1_sext));
+      break;
+    default: code.insert(code.end(), {0x7d331ef9u, 0x86060001u}); break;
+    }
+    code.push_back(EncodeSMovB32(20, 126)); // Snapshot EXEC before restoring it.
+    code.push_back(EncodeSMovB32(21, 127));
+    code.push_back(EncodeSMovB32(126, InlineU32(1)));
+    const u32 out = static_cast<u32>(cases.size()) + i * 4u;
+    AppendStoreSgprPair(&code, 20, out);
+    AppendStoreSgprPair(&code, 106, out + 2u); // CMPX preserves both VCC halves.
+    test.expected.insert(test.expected.end(),
+                         {entry.expected_exec, 0u, vcc_lo, vcc_hi});
+  }
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::BUFFER_LOAD_DWORD,
+                  O::V_CMPX_LT_I16, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.decoded_counts = {{"V_CMPX_LT_I16", cases.size()}};
+  test.required_spirv = {"OpSLessThan", "OpBitFieldSExtract"};
+  return test;
+}
+
+TestCase VectorVopcCmpxLtI16WaveMasks(u32 wave_size) {
+  using O = ShaderOpcode;
+  constexpr u32 marker = 0xfeedabcdu;
+  constexpr u32 vcc_lo = 0x01234567u;
+  constexpr u32 vcc_hi = 0x89abcdefu;
+  constexpr u32 expected_exec_lo = 0xaaaaaaaau;
+  const u32 expected_exec_hi = wave_size == 64u ? 0x33333333u : 0u;
+  TestCase test;
+  test.name = wave_size == 32u ? "VectorVopcCmpxLtI16Wave32Masks"
+                              : "VectorVopcCmpxLtI16Wave64Masks";
+  test.initial.assign(6u * wave_size, 0xdeadbeefu);
+  constexpr u32 inputs[] = {0xffff000eu, 0x0000ffffu, 0x8000000fu, 0x12348000u};
+  for (u32 lane = 0; lane < wave_size; ++lane) {
+    test.initial[lane] = inputs[lane % 4u];
+  }
+  test.expected = test.initial;
+  for (u32 lane = 0; lane < wave_size; ++lane) {
+    test.expected[wave_size + lane] = expected_exec_lo;
+    test.expected[2u * wave_size + lane] = expected_exec_hi;
+    test.expected[3u * wave_size + lane] = vcc_lo;
+    test.expected[4u * wave_size + lane] = vcc_hi;
+    const u32 mask = lane < 32u ? expected_exec_lo : expected_exec_hi;
+    if ((mask & (1u << (lane % 32u))) != 0u) {
+      test.expected[5u * wave_size + lane] = marker;
+    }
+  }
+  auto &code = test.code;
+  code.push_back(EncodeVop2(0x1a, 30, InlineU32(2), 0));
+  AppendBufferLoadDword(&code, 1, 30);
+  AppendVMovLiteral(&code, 4, marker);
+  code.push_back(EncodeSop1(0x04, 10, 126)); // Save the full incoming EXEC.
+  AppendSMovLiteral(&code, 106, vcc_lo);
+  AppendSMovLiteral(&code, 107, vcc_hi);
+  AppendSMovLiteral(&code, 126, 0xeeeeeeeeu);
+  AppendSMovLiteral(&code, 127, 0x77777777u);
+  code.insert(code.end(), {0x7d331ef9u, 0x86060001u});
+  code.push_back(EncodeSMovB32(20, 126));
+  code.push_back(EncodeSMovB32(21, 127));
+  AppendStoreVgprAtLaneDwordOffset(&code, 4, 0, 5u * wave_size);
+  code.push_back(EncodeSop1(0x04, 126, 10)); // Restore lanes to inspect the raw masks.
+  AppendStoreSgprAtLaneDwordOffset(&code, 20, 0, wave_size);
+  AppendStoreSgprAtLaneDwordOffset(&code, 21, 0, 2u * wave_size);
+  AppendStoreSgprAtLaneDwordOffset(&code, 106, 0, 3u * wave_size);
+  AppendStoreSgprAtLaneDwordOffset(&code, 107, 0, 4u * wave_size);
+  AppendEnd(&code);
+  test.compute_info.threads_num[0] = wave_size;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::S_MOV_B64, O::V_LSHLREV_B32,
+                  O::V_ADD_NC_U32, O::BUFFER_LOAD_DWORD, O::V_CMPX_LT_I16,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpSLessThan", "OpBitFieldSExtract"};
+  return test;
+}
+
 TestCase VectorVopcCmpxEqU16SdwaCompactVop3ExecMask() {
   using O = ShaderOpcode;
   struct CompareCase {
@@ -23546,9 +23920,9 @@ TestCase VectorVopcCmpxEqU16SdwaCompactVop3ExecMask() {
     u32 rhs;
     u32 incoming_exec;
     u32 expected_exec;
-    u32 encoding = 0; // 0: SDWA, 1: compact, 2: VOP3, 3: SDWA sign-extend.
+    u32 encoding = 0; // SDWA, compact, VOP3, sign-extended words/bytes.
   };
-  const std::array<CompareCase, 12> cases{{
+  const std::array<CompareCase, 16> cases{{
       {0x12340000u, 0x56780000u, 1, 1}, // Equal low half; ignore high half.
       {0xffff0001u, 0xabcd0001u, 1, 1},
       {0x00000000u, 0x12340000u, 1, 1},
@@ -23561,6 +23935,10 @@ TestCase VectorVopcCmpxEqU16SdwaCompactVop3ExecMask() {
       {0x00008000u, 0x0000ffffu, 1, 0, 2},
       {0x0001ffffu, 0x12340001u, 1, 0, 3}, // Sign-extended low halves differ.
       {0x00000001u, 0x00010001u, 0, 0}, // CMPX cannot reactivate an inactive lane.
+      {0x12345680u, 0x0000ff80u, 1, 1, 4}, // SEXT BYTE_0 is unsigned U16 0xff80.
+      {0x123456ffu, 0x0000ffffu, 1, 1, 4},
+      {0x0000ff80u, 0x12348000u, 1, 1, 5}, // SEXT BYTE_1 on src1.
+      {0x1234ffffu, 0x5678ffffu, 1, 1, 6}, // SEXT WORD_0 versus DWORD low half.
   }};
   constexpr u32 vcc_hi = 0x89abcdefu;
   TestCase test;
@@ -23584,6 +23962,18 @@ TestCase VectorVopcCmpxEqU16SdwaCompactVop3ExecMask() {
     case 3:
       code.push_back(EncodeVopc(0xba, 249u, 1u));
       code.push_back(EncodeVopcSdwa(0u, 0u, 0u, 6u, 6u, 1u, 1u));
+      break;
+    case 4:
+      code.push_back(EncodeVopc(0xba, 249u, 1u));
+      code.push_back(EncodeVopcSdwa(0u, 0u, 0u, 0u, 6u, 1u, 0u));
+      break;
+    case 5:
+      code.push_back(EncodeVopc(0xba, 249u, 1u));
+      code.push_back(EncodeVopcSdwa(0u, 0u, 0u, 6u, 1u, 0u, 1u));
+      break;
+    case 6:
+      code.push_back(EncodeVopc(0xba, 249u, 1u));
+      code.push_back(EncodeVopcSdwa(0u, 0u, 0u, 4u, 6u, 1u, 0u));
       break;
     default:
       code.push_back(EncodeVopc(0xba, 249u, 1u));
@@ -30372,6 +30762,10 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorVopcSdwaCmpxWritesExecMask);
   AddCase(VectorVopcCmpxGtU16CapturedSdwaExecMask);
   AddCase(VectorVopcCmpxLtU16CapturedSdwaExecMask);
+  AddCase(VectorVopcCmpxLtI16CapturedSdwaExecMask);
+  for (u32 wave_size : {32u, 64u}) {
+    cases.push_back(VectorVopcCmpxLtI16WaveMasks(wave_size));
+  }
   AddCase(VectorVopcCmpxEqU16SdwaCompactVop3ExecMask);
   AddCase(VectorVopcCmpNgtF16CapturedSdwaAndEdges);
   AddCase(VectorVopcCmpNltF16CapturedSdwaAndEdges);
@@ -33981,12 +34375,15 @@ void CheckPm4Predication(RenderContext &renderer) {
                          uint32_t wait, const void *source, bool skip) {
     predicated = unconditional = 0;
     const auto packet = commands(op, condition, wait, source);
+    const auto tick = renderer.GetCommandScheduler().CurrentTick();
     Pm4Execution execution;
     Require(name, stage,
             processor.Process(execution, packet) == Pm4ProcessResult::Complete &&
                 processor.ShouldSkipPredicatedPackets() == skip &&
                 predicated == (skip ? 0u : 11u) && unconditional == 22,
             "predicate polarity, tagged packet execution, or packet consumption is wrong");
+    Require(name, stage, renderer.GetCommandScheduler().CurrentTick() == tick,
+            "predication unnecessarily submitted and drained the host queue");
   };
   struct Case {
     uint64_t delta;
@@ -35290,6 +35687,13 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, VectorVopcCmpxEqU16SdwaCompactVop3ExecMask());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--cmpx-lt-i16-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, VectorVopcCmpxLtI16CapturedSdwaExecMask());
+    RunCase(&vulkan, VectorVopcCmpxLtI16WaveMasks(32));
+    RunCase(&vulkan, VectorVopcCmpxLtI16WaveMasks(64));
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--cmpx-lt-u16-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorVopcCmpxLtU16CapturedSdwaExecMask());
@@ -35504,6 +35908,11 @@ int main(int argc, char **argv) {
     CheckPm4WaitResume(vulkan.RuntimeRenderer());
     CheckPm4RewindResume(vulkan.RuntimeRenderer());
     CheckPm4CeCompletion(vulkan.RuntimeRenderer());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--suspend-point-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckGpuSuspendPoint();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--alignbyte-only") == 0) {
@@ -35915,6 +36324,7 @@ int main(int argc, char **argv) {
   for (const auto &test : graphics_tests) {
     RunGraphicsCase(&vulkan, test);
   }
+  vulkan.CheckGpuSuspendPoint();
   vulkan.CheckGpuCommandLane();
   if (skipped_device_checks) {
     std::printf(

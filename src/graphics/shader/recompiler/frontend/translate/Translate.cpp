@@ -560,6 +560,12 @@ IR::U32 Translator::ReadU16LaneRaw(const Decoder::Operand& operand, bool high_la
 	} else if (operand.sdwa_sel == 4u || operand.sdwa_sel == 5u) {
 		offset = operand.sdwa_sel == 5u ? 16u : 0u;
 	}
+	if (width == 8u && operand.sdwa_sext) {
+		// Extend the selected byte into the 16-bit operand before halfword modifiers.
+		const auto value = IR::U32(
+		    ir.Emit(IR::ValueOpcode::BitFieldSExtract, {bits, IR::Value(offset), IR::Value(width)}));
+		return ir.BitwiseAnd(value, IR::U32(IR::Value(0xffffu)));
+	}
 	return IR::U32(
 	    ir.Emit(IR::ValueOpcode::BitFieldUExtract, {bits, IR::Value(offset), IR::Value(width)}));
 }
@@ -567,7 +573,7 @@ IR::U32 Translator::ReadU16LaneRaw(const Decoder::Operand& operand, bool high_la
 IR::U32 Translator::ReadU16LaneAsU32(const Decoder::Operand& operand, bool high_lane,
                                      bool sign_extend) {
 	auto value = Read16LaneBits(operand, high_lane);
-	if (sign_extend || operand.sdwa_sext) {
+	if (sign_extend) {
 		value = IR::U32(
 		    ir.Emit(IR::ValueOpcode::BitFieldSExtract, {value, IR::Value(0u), IR::Value(16u)}));
 	}

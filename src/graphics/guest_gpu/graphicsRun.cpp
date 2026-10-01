@@ -35,7 +35,6 @@ namespace Libs::Graphics {
 
 static thread_local CommandProcessor* g_current_processor = nullptr;
 static thread_local Pm4Execution*     g_current_execution = nullptr;
-static thread_local bool              g_gpu_mutex_owned   = false;
 static thread_local bool              g_gpu_thread        = false;
 static thread_local GuestGpu*         g_gpu_state         = nullptr;
 
@@ -54,27 +53,6 @@ struct DrawIndexedIndirectArgs {
 	uint32_t start_instance_location;
 };
 
-class GpuMutexLock final {
-public:
-	explicit GpuMutexLock(Common::Mutex& mutex): m_mutex(mutex) {
-		if (g_gpu_mutex_owned) {
-			EXIT("recursive GPU mutex acquisition\n");
-		}
-		g_gpu_mutex_owned = true;
-		m_mutex.Lock();
-	}
-	~GpuMutexLock() {
-		if (!g_gpu_mutex_owned) {
-			EXIT("invalid GPU mutex release\n");
-		}
-		m_mutex.Unlock();
-		g_gpu_mutex_owned = false;
-	}
-
-private:
-	Common::Mutex& m_mutex;
-};
-
 static bool GraphicsRunDebugDumpEnabled() {
 	return Config::GraphicsDebugDumpEnabled() &&
 	       Config::GetPrintfDirection() != Config::LogDirection::Silent;
@@ -84,6 +62,7 @@ GuestGpu::GuestGpu(RenderContext& renderer): m_renderer(renderer) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	GraphicsInitJmpTables();
 	m_gfx_cp = std::make_unique<CommandProcessor>(renderer, 0);
+	m_gfx_cp->Reset();
 	m_thread = std::jthread(ThreadRun, this);
 }
 
@@ -160,20 +139,16 @@ void GuestGpu::Submit(std::span<const uint32_t> draw_commands,
 	if (draw_commands.empty()) {
 		return;
 	}
-	GpuMutexLock lock(m_submission_mutex);
-	Submission   submission;
+	Submission submission;
 	submission.type              = SubmissionType::Graphics;
 	submission.queue_id          = 0;
 	submission.commands          = draw_commands;
 	submission.constant_commands = constant_commands;
-	submission.reset_processor   = m_graphics_done;
-	m_graphics_done              = false;
 	Enqueue(std::move(submission));
 }
 
 void GuestGpu::SubmitCompute(uint32_t queue, std::span<const uint32_t> commands) {
 	EXIT_IF(commands.empty());
-	GpuMutexLock lock(m_submission_mutex);
 
 	EXIT_NOT_IMPLEMENTED(queue < ComputeQueueBase || queue >= ComputeQueueBase + ComputeQueueCount);
 
@@ -186,22 +161,21 @@ void GuestGpu::SubmitCompute(uint32_t queue, std::span<const uint32_t> commands)
 }
 
 void GuestGpu::SubmitFlipPreparation(uint64_t request_id) {
-	GpuMutexLock lock(m_submission_mutex);
-	Submission   submission;
+	Submission submission;
 	submission.type            = SubmissionType::FlipPreparation;
 	submission.queue_id        = 0;
-	submission.reset_processor = m_graphics_done;
 	submission.flip_request_id = request_id;
-	m_graphics_done            = false;
 	Enqueue(std::move(submission));
 }
 
-void GuestGpu::Done() {
-	GpuMutexLock lock(m_submission_mutex);
-	if (!IsGpuThread()) {
-		WaitForIdle();
-	}
-	m_graphics_done = true;
+void GuestGpu::SuspendPoint() {
+	EXIT_IF(IsGpuThread() || CommandScheduler::InDeferredOperation());
+	// Do not hold a queue lock while waiting: asynchronous work may be needed to
+	// finish the preceding graphics frame. The first point returns immediately.
+	m_suspend_point_ready->acquire();
+	Submission submission;
+	submission.type = SubmissionType::SuspendPoint;
+	Enqueue(std::move(submission));
 	m_done_num++;
 }
 
@@ -229,6 +203,9 @@ void CommandProcessor::Reset() {
 	m_context_state_pushed             = false;
 	m_index_type_and_size              = 0;
 	m_index_buffer_size                = 0;
+	m_index_base_addr                  = 0;
+	m_num_instances                    = 1;
+	m_predicate_skip                   = false;
 	m_user_data_marker                 = HW::UserSgprType::Unknown;
 	m_draw_indirect_args_base_addr     = 0;
 	m_dispatch_indirect_args_base_addr = 0;
@@ -266,10 +243,6 @@ void CommandProcessor::BufferInit() {
 
 void CommandProcessor::BufferFlush() {
 	GetScheduler().Flush();
-}
-
-void CommandProcessor::BufferFlushAndWait() {
-	GetScheduler().FlushAndWait();
 }
 
 void CommandProcessor::BufferWait() {
@@ -459,6 +432,7 @@ void GuestGpu::Enqueue(Submission submission) {
 }
 
 void GuestGpu::WaitForIdle() {
+	EXIT_IF(IsGpuThread() || CommandScheduler::InDeferredOperation());
 	Common::LockGuard lock(m_queue_mutex);
 	while (m_processing || !m_commands.empty() || m_submission_count != 0) {
 		m_idle.Wait(&m_queue_mutex);
@@ -564,11 +538,7 @@ void GuestGpu::ThreadRun(void* data) {
 
 bool GuestGpu::Process(Submission& submission) {
 	const bool first_slice = !submission.started;
-	auto& cp = GetProcessor(submission.queue_id);
-
-	if (first_slice && submission.reset_processor) {
-		cp.Reset();
-	}
+	auto&      cp          = GetProcessor(submission.queue_id);
 
 	if (first_slice) {
 		submission.started = true;
@@ -644,6 +614,13 @@ bool GuestGpu::Process(Submission& submission) {
 		case SubmissionType::FlipPreparation:
 			m_renderer.RunGarbageCollector();
 			cp.PrepareCpuFlip(submission.flip_request_id);
+			break;
+		case SubmissionType::SuspendPoint:
+			cp.EmitGlobalBarrier();
+			m_renderer.GetCommandScheduler().DeferPriorityOperation(
+			    [ready = m_suspend_point_ready] { ready->release(); });
+			cp.BufferFlush();
+			cp.Reset();
 			break;
 	}
 
@@ -849,9 +826,7 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 			}
 		} break;
 		case 0x03:
-			if (wait_op != 0) {
-				BufferFlushAndWait();
-			}
+			// The wait selector applies only to Z-pass query readiness.
 			EXIT_NOT_IMPLEMENTED(address == nullptr);
 			value = *reinterpret_cast<const volatile uint64_t*>(address);
 			break;
@@ -1034,9 +1009,6 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 	m_sh_ctx.SetCsWaveSize(Pm4::ComputeWaveSize(mode));
 
 	uint32_t frame_num = 0;
-	// uint32_t local_x   = 1;
-	// uint32_t local_y   = 1;
-	// uint32_t local_z   = 1;
 
 	{
 		frame_num = m_renderer.GetGpu().GetFrameNum();
@@ -1058,35 +1030,9 @@ void CommandProcessor::DispatchDirect(uint32_t thread_group_x, uint32_t thread_g
 			}
 		}
 
-		const auto& cs = m_sh_ctx.GetCs().cs_regs;
-		// local_x        = std::max(cs.num_thread_x, 1u);
-		// local_y        = std::max(cs.num_thread_y, 1u);
-		// local_z        = std::max(cs.num_thread_z, 1u);
 		m_renderer.GetRenderExecutor().DispatchDirect(m_submit_id, CurrentBuffer(), thread_group_x,
 		                                              thread_group_y, thread_group_z, mode);
 	}
-
-	/*constexpr uint32_t DispatchInitiatorUseThreadDimensions = 1u << 5u;
-	auto               group_count = [](uint32_t threads, uint32_t group_size) {
-	    return (threads == 0
-	                ? 0u
-	                : (threads + std::max(group_size, 1u) - 1u) / std::max(group_size, 1u));
-	};
-
-	auto groups_x = thread_group_x;
-	auto groups_y = thread_group_y;
-	auto groups_z = thread_group_z;
-	if ((mode & DispatchInitiatorUseThreadDimensions) != 0) {
-	    groups_x = group_count(thread_group_x, local_x);
-	    groups_y = group_count(thread_group_y, local_y);
-	    groups_z = group_count(thread_group_z, local_z);
-	}
-
-	const uint64_t invocations =
-	    static_cast<uint64_t>(groups_x) * groups_y * groups_z * local_x * local_y * local_z;
-	if (invocations != 0) {
-	    BufferFlushAndWait();
-	}*/
 }
 
 void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {

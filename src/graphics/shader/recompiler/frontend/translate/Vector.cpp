@@ -156,6 +156,9 @@ void Translator::EmitVector(const Decoder::Instruction& inst) {
 		case O::V_CMP_LT_I16:
 			EmitInteger16Compare(inst, IR::ValueOpcode::SLessThan32, true, false);
 			return;
+		case O::V_CMPX_LT_I16:
+			EmitInteger16Compare(inst, IR::ValueOpcode::SLessThan32, true, true);
+			return;
 		case O::V_CMP_LE_I16:
 			EmitInteger16Compare(inst, IR::ValueOpcode::SLessThanEqual32, true, false);
 			return;

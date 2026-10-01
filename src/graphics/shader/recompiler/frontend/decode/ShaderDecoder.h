@@ -575,6 +575,7 @@ enum class Opcode {
 	IMAGE_STORE,
 	IMAGE_STORE_MIP,
 	IMAGE_ATOMIC_SWAP,
+	IMAGE_ATOMIC_CMPSWAP,
 	IMAGE_ATOMIC_ADD,
 	IMAGE_ATOMIC_UMIN,
 	IMAGE_ATOMIC_UMAX,
@@ -745,17 +746,17 @@ struct Instruction {
 struct Program {
 	std::span<const uint32_t> code;
 	std::vector<Instruction>  instructions;
-	bool                     has_bvh = false;
+	bool                      has_bvh = false;
 };
 
 // Code spans are trusted to contain complete instructions, valid branch targets, and 32-bit PCs.
 Family GetInstructionFamily(uint32_t word);
 // The output object must be freshly initialized.
-void DecodeInstruction(std::span<const uint32_t> code, uint32_t word_index, Instruction& inst);
+void    DecodeInstruction(std::span<const uint32_t> code, uint32_t word_index, Instruction& inst);
 Program DecodeFrontProgram(std::span<const uint32_t> front);
-void DecodeProgram(std::span<const uint32_t> code, Program& program);
-bool IsConditionalBranch(Opcode opcode);
-bool IsDirectBranch(Opcode opcode);
+void    DecodeProgram(std::span<const uint32_t> code, Program& program);
+bool    IsConditionalBranch(Opcode opcode);
+bool    IsDirectBranch(Opcode opcode);
 
 void DecodeScalarSource(uint32_t code, uint32_t pc, Operand& operand);
 void DecodeScalarDestination(uint32_t code, uint32_t pc, Operand& operand);

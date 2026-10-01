@@ -29876,6 +29876,49 @@ TestCase ImageStoreAndAtomicShareTypedBinding() {
   return test;
 }
 
+// RDNA 2 MIMG opcode 0x10: replacement at VDATA, comparison at VDATA+1.
+TestCase ImageAtomicCompareSwapGlcAndExec() {
+  TestCase test;
+  test.name = "ImageAtomicCompareSwapGlcAndExec";
+  auto &code = test.code;
+  code.push_back(EncodeSop1(0x04, 12, 126)); // Preserve EXEC.
+  AppendVMovU32(&code, 20, 2);
+  AppendVMovU32(&code, 21, 1);
+  const auto exchange = [&](u32 replacement, u32 comparison, bool glc, u32 output) {
+    AppendVMovLiteral(&code, 0, replacement);
+    AppendVMovLiteral(&code, 1, comparison);
+    code.push_back(EncodeMimg0(0x10, 3, 0, glc));
+    code.push_back(EncodeMimg1(0, 20));
+    AppendStoreVgpr(&code, 0, output);
+    AppendStoreVgpr(&code, 1, output + 1);
+  };
+  exchange(0x12345678u, 0xdeadbeefu, true, 0); // Match; return original bits.
+  exchange(0x87654321u, 0xdeadbeefu, true, 2); // Mismatch; preserve texel.
+  exchange(0xabcdef01u, 0x12345678u, false, 4); // GLC=0 preserves VDATA.
+  AppendVMovLiteral(&code, 0, 0x11111111u);
+  AppendVMovLiteral(&code, 1, 0xabcdef01u);
+  code.push_back(EncodeSop1(0x04, 126, InlineU32(0))); // Disable EXEC.
+  code.push_back(EncodeMimg0(0x10, 3, 0, true));
+  code.push_back(EncodeMimg1(0, 20));
+  code.push_back(EncodeSop1(0x04, 126, 12));
+  AppendStoreVgpr(&code, 0, 6);
+  AppendStoreVgpr(&code, 1, 7);
+  AppendEnd(&code);
+  test.expected = {0xdeadbeefu, 0xdeadbeefu, 0x12345678u, 0xdeadbeefu,
+                   0xabcdef01u, 0x12345678u, 0x11111111u, 0xabcdef01u};
+  test.opcodes = {ShaderOpcode::V_MOV_B32, ShaderOpcode::S_MOV_B64,
+                 ShaderOpcode::IMAGE_ATOMIC_CMPSWAP, ShaderOpcode::BUFFER_STORE_DWORD,
+                 ShaderOpcode::S_ENDPGM};
+  test.user_data = MakeStorageTextureData(Prospero::BufferFormat::k32UInt);
+  test.has_user_data = true;
+  test.storage_image_r32ui = std::vector<u32>(16, 0);
+  test.storage_image_r32ui[6] = 0xdeadbeefu;
+  test.expected_storage_image_r32ui = test.storage_image_r32ui;
+  test.expected_storage_image_r32ui[6] = 0xabcdef01u;
+  test.required_spirv = {"OpAtomicCompareExchange", "OpImageTexelPointer"};
+  return test;
+}
+
 TestCase ImageAtomicSwapReturnsPreviousTexel() {
   using O = ShaderOpcode;
 
@@ -30951,6 +30994,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageStorePackedUintHonorsSparseDmask);
   AddCase(ComputeTgSizeSgprUsesWaveMetadata);
   AddCase(ImageStoreAndAtomicShareTypedBinding);
+  AddCase(ImageAtomicCompareSwapGlcAndExec);
   AddCase(ImageAtomicSwapReturnsPreviousTexel);
   AddCase(ImageStoreAndAtomicUseSeparateBindings);
   AddCase(ImageAtomicVariants);
@@ -35874,6 +35918,13 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cmpswap-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, BufferAtomicCmpSwapExactRaw());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--image-cmpswap-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, ImageAtomicCompareSwapGlcAndExec());
+    RunCase(&vulkan, ImageAtomicSwapReturnsPreviousTexel());
+    RunCase(&vulkan, ImageAtomicVariants());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--ds-atomics-only") == 0) {

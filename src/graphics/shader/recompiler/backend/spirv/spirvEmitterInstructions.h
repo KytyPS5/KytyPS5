@@ -119,31 +119,32 @@ EMIT_NATIVE(LogicalNot, OpLogicalNot, U1, uint32_t)
 template <spv::Op opcode>
 uint32_t EmitFloatCompare32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	// SPIR-V's DenormFlushToZero mode does not require comparison operands to flush.
-	const bool flush = inst.Flags<IR::FPCompareFlags>().flush_input_denorms;
+	const bool flush   = inst.Flags<IR::FPCompareFlags>().flush_input_denorms;
 	const auto operand = [&](size_t index) {
 		const auto value = inst.Arg(index);
 		if (flush && value.IsImmediate()) {
 			const auto bits = std::bit_cast<uint32_t>(value.F32Value());
-			return ConstantF32(ctx.state, (bits & 0x7fffffffu) < 0x00800000u
-			                                  ? bits & 0x80000000u : bits);
+			return ConstantF32(ctx.state,
+			                   (bits & 0x7fffffffu) < 0x00800000u ? bits & 0x80000000u : bits);
 		}
 		const auto id = ctx.Arg(inst, index);
 		return flush ? EmitFlushF32DenormToSignedZero(ctx.state, id) : id;
 	};
 	return EmitNative<opcode, IR::Type::U1>(ctx.state, operand(0), operand(1));
 }
-inline constexpr auto EmitFPOrdEqual32 = EmitFloatCompare32<spv::OpFOrdEqual>;
-inline constexpr auto EmitFPUnordEqual32 = EmitFloatCompare32<spv::OpFUnordEqual>;
-inline constexpr auto EmitFPOrdNotEqual32 = EmitFloatCompare32<spv::OpFOrdNotEqual>;
-inline constexpr auto EmitFPUnordNotEqual32 = EmitFloatCompare32<spv::OpFUnordNotEqual>;
-inline constexpr auto EmitFPOrdLessThan32 = EmitFloatCompare32<spv::OpFOrdLessThan>;
-inline constexpr auto EmitFPUnordLessThan32 = EmitFloatCompare32<spv::OpFUnordLessThan>;
-inline constexpr auto EmitFPOrdGreaterThan32 = EmitFloatCompare32<spv::OpFOrdGreaterThan>;
-inline constexpr auto EmitFPUnordGreaterThan32 = EmitFloatCompare32<spv::OpFUnordGreaterThan>;
-inline constexpr auto EmitFPOrdLessThanEqual32 = EmitFloatCompare32<spv::OpFOrdLessThanEqual>;
-inline constexpr auto EmitFPUnordLessThanEqual32 = EmitFloatCompare32<spv::OpFUnordLessThanEqual>;
+inline constexpr auto EmitFPOrdEqual32            = EmitFloatCompare32<spv::OpFOrdEqual>;
+inline constexpr auto EmitFPUnordEqual32          = EmitFloatCompare32<spv::OpFUnordEqual>;
+inline constexpr auto EmitFPOrdNotEqual32         = EmitFloatCompare32<spv::OpFOrdNotEqual>;
+inline constexpr auto EmitFPUnordNotEqual32       = EmitFloatCompare32<spv::OpFUnordNotEqual>;
+inline constexpr auto EmitFPOrdLessThan32         = EmitFloatCompare32<spv::OpFOrdLessThan>;
+inline constexpr auto EmitFPUnordLessThan32       = EmitFloatCompare32<spv::OpFUnordLessThan>;
+inline constexpr auto EmitFPOrdGreaterThan32      = EmitFloatCompare32<spv::OpFOrdGreaterThan>;
+inline constexpr auto EmitFPUnordGreaterThan32    = EmitFloatCompare32<spv::OpFUnordGreaterThan>;
+inline constexpr auto EmitFPOrdLessThanEqual32    = EmitFloatCompare32<spv::OpFOrdLessThanEqual>;
+inline constexpr auto EmitFPUnordLessThanEqual32  = EmitFloatCompare32<spv::OpFUnordLessThanEqual>;
 inline constexpr auto EmitFPOrdGreaterThanEqual32 = EmitFloatCompare32<spv::OpFOrdGreaterThanEqual>;
-inline constexpr auto EmitFPUnordGreaterThanEqual32 = EmitFloatCompare32<spv::OpFUnordGreaterThanEqual>;
+inline constexpr auto EmitFPUnordGreaterThanEqual32 =
+    EmitFloatCompare32<spv::OpFUnordGreaterThanEqual>;
 uint32_t              EmitFPIsNan32(EmitterState& state, uint32_t arg0);
 inline constexpr auto EmitFPCmpClass32 = EmitClassMaskF32;
 EMIT_NATIVE(FPAdd32, OpFAdd, F32, uint32_t, uint32_t)
@@ -293,21 +294,22 @@ inline constexpr auto EmitDataAppend            = EmitAppendConsume;
 inline constexpr auto EmitDataConsume           = EmitAppendConsume;
 uint32_t              EmitSwizzleU32(ValueEmitContext& ctx, const IR::Inst& inst);
 void                  EmitImage(ValueEmitContext& ctx, const IR::Inst& inst);
-inline constexpr auto EmitImageQueryDimensions = EmitImage;
-inline constexpr auto EmitImageQueryLod        = EmitImage;
-inline constexpr auto EmitImageRead            = EmitImage;
-inline constexpr auto EmitImageWrite           = EmitImage;
-inline constexpr auto EmitImageSampleRaw       = EmitImage;
-inline constexpr auto EmitImageGatherRaw       = EmitImage;
-inline constexpr auto EmitImageAtomicSwap32    = EmitImage;
-inline constexpr auto EmitImageAtomicIAdd32    = EmitImage;
-inline constexpr auto EmitImageAtomicUMin32    = EmitImage;
-inline constexpr auto EmitImageAtomicUMax32    = EmitImage;
-inline constexpr auto EmitImageAtomicAnd32     = EmitImage;
-inline constexpr auto EmitImageAtomicOr32      = EmitImage;
-inline constexpr auto EmitImageAtomicXor32     = EmitImage;
-inline constexpr auto EmitImageAtomicFMin32    = EmitImage;
-inline constexpr auto EmitImageAtomicFMax32    = EmitImage;
+inline constexpr auto EmitImageQueryDimensions     = EmitImage;
+inline constexpr auto EmitImageQueryLod            = EmitImage;
+inline constexpr auto EmitImageRead                = EmitImage;
+inline constexpr auto EmitImageWrite               = EmitImage;
+inline constexpr auto EmitImageSampleRaw           = EmitImage;
+inline constexpr auto EmitImageGatherRaw           = EmitImage;
+inline constexpr auto EmitImageAtomicCompareSwap32 = EmitImage;
+inline constexpr auto EmitImageAtomicSwap32        = EmitImage;
+inline constexpr auto EmitImageAtomicIAdd32        = EmitImage;
+inline constexpr auto EmitImageAtomicUMin32        = EmitImage;
+inline constexpr auto EmitImageAtomicUMax32        = EmitImage;
+inline constexpr auto EmitImageAtomicAnd32         = EmitImage;
+inline constexpr auto EmitImageAtomicOr32          = EmitImage;
+inline constexpr auto EmitImageAtomicXor32         = EmitImage;
+inline constexpr auto EmitImageAtomicFMin32        = EmitImage;
+inline constexpr auto EmitImageAtomicFMax32        = EmitImage;
 void                  EmitUnreachable(ValueEmitContext& ctx, const IR::Inst& inst);
 inline constexpr auto EmitPhi                        = EmitUnreachable;
 inline constexpr auto EmitTessellationBase           = EmitUnreachable;

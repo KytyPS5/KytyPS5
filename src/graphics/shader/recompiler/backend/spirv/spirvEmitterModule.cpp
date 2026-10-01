@@ -6,19 +6,32 @@
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
 uint32_t TypeVoid(EmitterState& state) {
-	return state.builder.Type(spv::OpTypeVoid);
+	if (state.void_type == 0) {
+		state.void_type = state.builder.Type(spv::OpTypeVoid);
+	}
+	return state.void_type;
 }
 
 uint32_t TypeBool(EmitterState& state) {
-	return state.builder.Type(spv::OpTypeBool);
+	if (state.bool_type == 0) {
+		state.bool_type = state.builder.Type(spv::OpTypeBool);
+	}
+	return state.bool_type;
 }
 
 uint32_t TypeBoolVector(EmitterState& state, uint32_t components) {
-	return state.builder.Type(spv::OpTypeVector, TypeBool(state), components);
+	auto& type = state.bool_vector_types[components - 2u];
+	if (type == 0) {
+		type = state.builder.Type(spv::OpTypeVector, TypeBool(state), components);
+	}
+	return type;
 }
 
 uint32_t TypeU32(EmitterState& state) {
-	return state.builder.Type(spv::OpTypeInt, 32, 0);
+	if (state.u32_type == 0) {
+		state.u32_type = state.builder.Type(spv::OpTypeInt, 32, 0);
+	}
+	return state.u32_type;
 }
 
 uint32_t TypeU64(EmitterState& state) {
@@ -26,33 +39,55 @@ uint32_t TypeU64(EmitterState& state) {
 }
 
 uint32_t TypeScalarU64(EmitterState& state) {
-	return state.builder.Type(spv::OpTypeInt, 64, 0);
+	if (state.native_u64_type == 0) {
+		state.native_u64_type = state.builder.Type(spv::OpTypeInt, 64, 0);
+	}
+	return state.native_u64_type;
 }
 
 uint32_t TypeU32Pair(EmitterState& state) {
-	const auto element = TypeU32(state);
-	return state.builder.Type(spv::OpTypeStruct, element, element);
+	if (state.u32_pair_type == 0) {
+		const auto element = TypeU32(state);
+		state.u32_pair_type = state.builder.Type(spv::OpTypeStruct, element, element);
+	}
+	return state.u32_pair_type;
 }
 
 uint32_t TypeI32(EmitterState& state) {
-	return state.builder.Type(spv::OpTypeInt, 32, 1);
+	if (state.i32_type == 0) {
+		state.i32_type = state.builder.Type(spv::OpTypeInt, 32, 1);
+	}
+	return state.i32_type;
 }
 
 uint32_t TypeI32Pair(EmitterState& state) {
-	const auto element = TypeI32(state);
-	return state.builder.Type(spv::OpTypeStruct, element, element);
+	if (state.i32_pair_type == 0) {
+		const auto element = TypeI32(state);
+		state.i32_pair_type = state.builder.Type(spv::OpTypeStruct, element, element);
+	}
+	return state.i32_pair_type;
 }
 
 uint32_t TypeF32(EmitterState& state) {
-	return state.builder.Type(spv::OpTypeFloat, 32);
+	if (state.f32_type == 0) {
+		state.f32_type = state.builder.Type(spv::OpTypeFloat, 32);
+	}
+	return state.f32_type;
 }
 
 uint32_t TypeF64(EmitterState& state) {
-	return state.builder.Type(spv::OpTypeFloat, 64);
+	if (state.f64_type == 0) {
+		state.f64_type = state.builder.Type(spv::OpTypeFloat, 64);
+	}
+	return state.f64_type;
 }
 
 uint32_t TypeU32Vector(EmitterState& state, uint32_t components) {
-	return state.builder.Type(spv::OpTypeVector, TypeU32(state), components);
+	auto& type = state.u32_vector_types[components - 2u];
+	if (type == 0) {
+		type = state.builder.Type(spv::OpTypeVector, TypeU32(state), components);
+	}
+	return type;
 }
 
 uint32_t TypeU32Composite(EmitterState& state, uint32_t components) {
@@ -61,11 +96,19 @@ uint32_t TypeU32Composite(EmitterState& state, uint32_t components) {
 }
 
 uint32_t TypeI32Vector(EmitterState& state, uint32_t components) {
-	return state.builder.Type(spv::OpTypeVector, TypeI32(state), components);
+	auto& type = state.i32_vector_types[components - 2u];
+	if (type == 0) {
+		type = state.builder.Type(spv::OpTypeVector, TypeI32(state), components);
+	}
+	return type;
 }
 
 uint32_t TypeF32Vector(EmitterState& state, uint32_t components) {
-	return state.builder.Type(spv::OpTypeVector, TypeF32(state), components);
+	auto& type = state.f32_vector_types[components - 2u];
+	if (type == 0) {
+		type = state.builder.Type(spv::OpTypeVector, TypeF32(state), components);
+	}
+	return type;
 }
 
 uint32_t TypePointer(EmitterState& state, spv::StorageClass storage_class, uint32_t pointee) {
@@ -73,7 +116,10 @@ uint32_t TypePointer(EmitterState& state, spv::StorageClass storage_class, uint3
 }
 
 uint32_t TypeFunction(EmitterState& state) {
-	return state.builder.Type(spv::OpTypeFunction, TypeVoid(state));
+	if (state.function_type == 0) {
+		state.function_type = state.builder.Type(spv::OpTypeFunction, TypeVoid(state));
+	}
+	return state.function_type;
 }
 
 uint32_t StorageRuntimeArrayType(EmitterState& state) {

@@ -219,6 +219,56 @@ void TestUnbasedFlatCacheHitMaterializes() {
         "unbased FLAT plan produced unexpected descriptors");
 }
 
+void TestWrittenDescriptorUsesStrictReaderOnce() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = true;
+  program.resource_tracking_complete = true;
+  auto &block = AddValueBlock(program);
+  program.memory_info.push_back({.kind = ResourceKind::ScalarAddress});
+  auto &handle = block.AppendNewInst(ValueOpcode::GetAddressResource,
+                                     {Value(0x1000u), Value(0u)});
+  auto &offset = block.AppendNewInst(ValueOpcode::GetUserData,
+                                     {Value(static_cast<ScalarReg>(0))});
+  auto &read = block.AppendNewInst(ValueOpcode::LoadAddressU32,
+      {Value(&handle), Value(&offset), Value(0u), Value(false)});
+  read.SetFlags(MemoryFlags{.index = 0});
+  DescriptorSource source;
+  source.dwords = {Value(&read), Value(0u), Value(4u), Value(0u)};
+  source.dword_count = 4;
+  program.descriptor_sources.push_back(source);
+  program.info.buffers.push_back({.source = 0, .written = true});
+  auto plan = ExtractResourcePlan(program);
+  struct Reads { uint32_t ordinary = 0; uint32_t strict = 0; bool clean = false; } reads;
+  const std::array<uint32_t, 1> user_data{4u};
+  const SrtRuntime runtime{
+      .user_data = user_data,
+      .read_memory = +[](void *data, uint64_t, std::span<uint32_t> words) {
+        ++static_cast<Reads *>(data)->ordinary;
+        words[0] = 0x8000u;
+        return true;
+      },
+      .userdata = &reads,
+      .read_specialization_memory = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+        auto &reads = *static_cast<Reads *>(data);
+        ++reads.strict;
+        if (!reads.clean || address != 0x1004u) return false;
+        words[0] = 0x8000u;
+        return true;
+      }};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization) &&
+            reads.ordinary == 0 && reads.strict == 1,
+        "GPU-dirty dynamic writable descriptor bypassed strict provenance");
+  reads.clean = true;
+  reads.strict = 0;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            reads.ordinary == 0 && reads.strict == 1 && snapshot.buffers[0].dwords[0] == 0x8000u,
+        "writable descriptor was evaluated twice or scalar EXEC suppressed its read");
+}
+
 void TestFailedMaterializationRejectsStage() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   auto plan = UserDataBufferPlan();
@@ -262,6 +312,7 @@ int main() {
   TestMappedSrtUsesDirectReaderByDefault();
   TestIntegerRuntimeValueFollowsSrtReads();
   TestUnbasedFlatCacheHitMaterializes();
+  TestWrittenDescriptorUsesStrictReaderOnce();
   TestFailedMaterializationRejectsStage();
   TestMixedSamplerDuplicatesTheCorrectSnapshot();
   std::puts("ResourceMaterializationTests: all cases passed");

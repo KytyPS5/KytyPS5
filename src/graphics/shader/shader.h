@@ -49,6 +49,12 @@ namespace ShaderRecompiler::IR {
 struct CompiledShaderInfo;
 } // namespace ShaderRecompiler::IR
 
+// Offline compilation assumes support; the renderer supplies the enabled device features.
+struct ShaderHostFeatures {
+	bool buffer_int64_atomics = true;
+	bool cull_distance        = true;
+};
+
 struct ShaderStageRuntime {
 	const ShaderRecompiler::IR::CompiledShaderInfo* program = nullptr;
 	const ShaderRecompiler::IR::ResourceSnapshot*   resources = nullptr;

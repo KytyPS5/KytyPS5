@@ -63,16 +63,34 @@ uint32_t LdsDwordCount(const EmitterState& state) {
 	return workgroup != nullptr ? workgroup->lds_size_dwords : 8192u;
 }
 
-static void EnsureLdsStorage(EmitterState& state) {
+void EnsureLdsStorage(EmitterState& state) {
 	if (state.lds_variable != 0) {
 		return;
 	}
 	if (ShaderWorkgroupInput(state.program.stage, state.input_info) == nullptr) {
 		EXIT("function LDS was not prepared before SPIR-V function emission\n");
 	}
-	state.lds_variable = state.builder.DefineGlobalVariable(
-	    TypeU32ArrayPointer(state, spv::StorageClassWorkgroup, LdsDwordCount(state)),
-	    spv::StorageClassWorkgroup);
+	const auto define = [&](uint32_t type, uint32_t bytes) {
+		const auto array = state.builder.DecoratedType(
+		    spv::OpTypeArray, {{spv::OpDecorate, {spv::DecorationArrayStride, bytes}}}, type,
+		    ConstantU32(state, std::max(LdsDwordCount(state) * 4u / bytes, 1u)));
+		const auto block = state.builder.DecoratedType(
+		    spv::OpTypeStruct, {{spv::OpMemberDecorate, {0, spv::DecorationOffset, 0}},
+		                        {spv::OpDecorate, {spv::DecorationBlock}}}, array);
+		const auto variable = state.builder.DefineGlobalVariable(
+		    TypePointer(state, spv::StorageClassWorkgroup, block), spv::StorageClassWorkgroup);
+		state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationAliased);
+		return variable;
+	};
+	if (state.requirements.shared_int64_atomics) {
+		state.lds_variable = define(TypeU32(state), 4u);
+		state.lds_u64_variable = define(TypeScalarU64(state), 8u);
+		state.builder.AddName(state.lds_u64_variable, "lds_qwords");
+	} else {
+		state.lds_variable = state.builder.DefineGlobalVariable(
+		    TypeU32ArrayPointer(state, spv::StorageClassWorkgroup, LdsDwordCount(state)),
+		    spv::StorageClassWorkgroup);
+	}
 	state.builder.AddName(state.lds_variable, "lds_dwords");
 }
 
@@ -167,6 +185,11 @@ uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAcces
 		    : ShaderWorkgroupInput(state.program.stage, state.input_info) != nullptr
 		        ? spv::StorageClassWorkgroup
 		        : spv::StorageClassFunction;
+		if (access.kind == IR::ResourceKind::Lds && state.requirements.shared_int64_atomics) {
+			state.builder.AddFunction(spv::OpAccessChain, TypeU32ElementPointer(state, storage_class),
+			                          pointer, access.object_pointer, ConstantU32(state, 0), index);
+			return pointer;
+		}
 		state.builder.AddFunction(spv::OpAccessChain, TypeU32ElementPointer(state, storage_class),
 		                          pointer, access.object_pointer, index);
 		return pointer;

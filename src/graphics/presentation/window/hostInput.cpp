@@ -1,11 +1,12 @@
 #include "graphics/presentation/window/hostInput.h"
 
+#include <SDL3/SDL.h>
+
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "libs/controller.h"
 
-#include <SDL3/SDL.h>
 #include <algorithm>
 #include <array>
 #include <cmath>

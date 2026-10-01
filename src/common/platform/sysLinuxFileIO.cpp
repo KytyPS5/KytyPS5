@@ -54,7 +54,7 @@ struct sys_file_t {
 #endif
 
 static std::filesystem::path get_internal_name(const std::filesystem::path& name) {
-	return name.is_absolute() ? name : (std::filesystem::path(".") / name);
+	return name.empty() || name.is_absolute() ? name : (std::filesystem::path(".") / name);
 }
 
 // Pass access-pattern hints to the host.
@@ -297,10 +297,21 @@ uint64_t SysFileSize(sys_file_t& f) {
 	return 0;
 }
 
+bool SysFileGetInfo(const std::filesystem::path& name, bool* is_file, uint64_t* size) {
+	const auto path = get_internal_name(name);
+	struct stat info {};
+	if (stat(path.c_str(), &info) != 0) {
+		return false;
+	}
+	*is_file = !S_ISDIR(info.st_mode);
+	*size = *is_file ? static_cast<uint64_t>(info.st_size) : 0;
+	return true;
+}
+
 uint64_t SysFileSize(const std::filesystem::path& file_name) {
-	sys_file_t* f    = SysFileOpenR(file_name);
-	uint64_t    size = SysFileSize(*f);
-	SysFileClose(f);
+	bool is_file;
+	uint64_t size = 0;
+	SysFileGetInfo(file_name, &is_file, &size);
 	return size;
 }
 
@@ -353,29 +364,15 @@ bool SysFileIsError(sys_file_t& f) {
 }
 
 bool SysFileIsDirectoryExisting(const std::filesystem::path& path) {
-	auto real_name     = get_internal_name(path);
-	auto real_name_str = real_name.string();
-
-	struct stat s {};
-
-	if (0 != stat(real_name_str.c_str(), &s)) {
-		return false;
-	}
-
-	return S_ISDIR(s.st_mode); // NOLINT
+	bool is_file;
+	uint64_t size;
+	return SysFileGetInfo(path, &is_file, &size) && !is_file;
 }
 
 bool SysFileIsFileExisting(const std::filesystem::path& name) {
-	auto real_name     = get_internal_name(name);
-	auto real_name_str = real_name.string();
-
-	struct stat s {};
-
-	if (0 != stat(real_name_str.c_str(), &s)) {
-		return false;
-	}
-
-	return !S_ISDIR(s.st_mode); // NOLINT
+	bool is_file;
+	uint64_t size;
+	return SysFileGetInfo(name, &is_file, &size) && is_file;
 }
 
 bool SysFileCreateDirectory(const std::filesystem::path& path) {

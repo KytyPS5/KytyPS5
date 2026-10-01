@@ -34,7 +34,7 @@ bool MeshOutputIsConsumed(const EmitterState& state, const OutputBinding& output
 	}
 	const auto* pixel = state.input_info.vertex->pixel_input;
 	if (pixel == nullptr || pixel->input_num > std::size(pixel->interpolator_settings) ||
-	    pixel->parameter_plan.valid || !pixel->parameter_plan.aliases.empty()) {
+	    !pixel->parameter_plan.valid || !pixel->parameter_plan.aliases.empty()) {
 		return true;
 	}
 	std::array<bool, 32> consumed_locations {};
@@ -58,7 +58,7 @@ void DefineMeshOutputs(EmitterState& state) {
 		    output.kind != IR::StageOutputKind::Layer) {
 			EXIT("unsupported mesh output kind=%u\n", static_cast<uint32_t>(output.kind));
 		}
-		const auto type = MeshOutputType(state, output.kind);
+		const auto type    = MeshOutputType(state, output.kind);
 		// Only Layer is read by another invocation, through the primitive's provoking vertex.
 		const bool shared = output.kind == IR::StageOutputKind::Layer;
 		output.mesh_data_variable =
@@ -167,7 +167,7 @@ void EmitMeshEntryPoint(EmitterState& state) {
 				if (output.kind == IR::StageOutputKind::Layer || output.variable_id == 0) {
 					continue;
 				}
-				const auto type = MeshOutputType(state, output.kind);
+				const auto type  = MeshOutputType(state, output.kind);
 				const auto value =
 				    MeshLoad(state, output.mesh_data_variable, spv::StorageClassPrivate, type,
 				             ConstantU32(state, half));

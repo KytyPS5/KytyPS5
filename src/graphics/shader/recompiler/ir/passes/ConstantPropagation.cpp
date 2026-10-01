@@ -630,6 +630,11 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 				}
 			}
 			return;
+		case ValueOpcode::ConditionRef: {
+			const auto value = Arg(inst, 0);
+			if (IsImmediate(value, Type::U1)) Replace(inst, value);
+			return;
+		}
 		case ValueOpcode::LogicalNot: {
 			const auto value = Arg(inst, 0);
 			if (IsImmediate(value, Type::U1)) {

@@ -72,6 +72,9 @@ LIB_DEFINE(InitRtc_1);
 
 namespace LibGen5 {
 LIB_DEFINE(InitVideoOut_1);
+namespace VrrStatus {
+LIB_DEFINE(InitVideoOutVrrStatus_1);
+} // namespace VrrStatus
 } // namespace LibGen5
 
 LIB_DEFINE(InitAppContent_1);
@@ -88,6 +91,7 @@ LIB_DEFINE(InitNet_1);
 LIB_DEFINE(InitPad_1);
 LIB_DEFINE(InitPlayGo_1);
 LIB_DEFINE(InitPngDec_1);
+LIB_DEFINE(InitPngEnc_1);
 LIB_DEFINE(InitPlatform_1);
 LIB_DEFINE(InitRudp_1);
 LIB_DEFINE(InitSaveData_1);
@@ -126,6 +130,7 @@ void InitAll(Loader::SymbolDatabase* s) {
 	InitPlayGo_1(s);
 	LibPsml::InitPsml_1(s);
 	InitPngDec_1(s);
+	InitPngEnc_1(s);
 	InitPlatform_1(s);
 	InitRudp_1(s);
 	LibRtc::InitRtc_1(s);
@@ -138,6 +143,7 @@ void InitAll(Loader::SymbolDatabase* s) {
 	InitUserService_1(s);
 	VideoDec2::InitVideoDec2_1(s);
 	LibGen5::InitVideoOut_1(s);
+	LibGen5::VrrStatus::InitVideoOutVrrStatus_1(s);
 	InitWebBrowserDialog_1(s);
 }
 

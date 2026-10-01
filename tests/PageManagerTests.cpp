@@ -1,3 +1,4 @@
+#include "MachTestMemory.h"
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/pageManager.h"
 
@@ -192,14 +193,8 @@ uint8_t *Allocate(uint64_t size, uint32_t protection = PAGE_READWRITE,
   Check(memory == reinterpret_cast<void *>(test_address),
         "fixed low VirtualAlloc failed");
 #elif defined(__APPLE__)
-  mach_vm_address_t raw = test_address;
-  Check(mach_vm_allocate(mach_task_self(), &raw, size, VM_FLAGS_FIXED) ==
-            KERN_SUCCESS &&
-            mach_vm_protect(mach_task_self(), raw, size, false,
-                            static_cast<vm_prot_t>(ToHostProt(protection))) ==
-                KERN_SUCCESS,
-        "fixed low mach_vm_allocate failed");
-  auto *memory = reinterpret_cast<uint8_t *>(raw);
+  auto* memory = static_cast<uint8_t*>(TestMemory::Allocate(test_address, size, static_cast<vm_prot_t>(ToHostProt(protection))));
+  Check(memory != nullptr, "low mach allocation failed");
   AllocationSizes()[memory] = static_cast<size_t>(size);
 #else
   void *raw = ::mmap(reinterpret_cast<void *>(test_address), size,
@@ -649,6 +644,9 @@ int main(int argc, char **argv) {
   if (argc == 3 && std::strcmp(argv[1], "--death") == 0) {
     RunDeathCase(argv[2]);
   }
+#if defined(__APPLE__)
+  Check(TestMemory::CheckOccupiedPreferredAddress(), "occupied preferred address was not safely relocated");
+#endif
   TestWatchAndUnwatch();
   TestWatchAndUnwatch(Libs::LibKernel::Memory::kExtendedMemoryBase);
   TestSharedWatcherCounts();

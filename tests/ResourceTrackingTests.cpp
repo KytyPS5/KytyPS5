@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <limits>
@@ -3784,6 +3785,106 @@ void TestDmaPointerFromSrt() {
         "the prefetch slots do not name the two pointer dwords");
 }
 
+// Slots follow the planning walk's post-order, not emission order.
+void TestScalarReadSlotOrder() {
+  Fixture fixture;
+  const auto base =
+      fixture.Address(fixture.UserData(0), fixture.UserData(1), 4);
+  MemoryInfo scalar;
+  scalar.kind = ResourceKind::ScalarAddress;
+  const auto read = [&](Value table, uint32_t offset, uint32_t pc) {
+    return fixture.Emit(ValueOpcode::LoadAddressU32,
+                        {table, Value(offset), Value(0u), Value(true)},
+                        fixture.AddMemory(scalar, pc));
+  };
+  const auto a = read(base, 0, 8);
+  const auto b = read(base, 4, 12);
+  const auto c = read(base, 8, 16);
+  const auto d = read(base, 12, 20);
+  const auto low = read(base, 16, 24);
+  const auto high = read(base, 20, 28);
+  const auto nested = read(fixture.Address(low, high, 32), 8, 36);
+  const auto word0 = fixture.Emit(ValueOpcode::IAdd32,
+                                  {fixture.Emit(ValueOpcode::IAdd32, {c, a}),
+                                   fixture.Emit(ValueOpcode::IAdd32, {b, d})});
+  MemoryInfo buffer;
+  buffer.kind = ResourceKind::Buffer;
+  fixture.Emit(ValueOpcode::LoadBufferU32,
+               {fixture.Buffer({word0, nested, Value(64u), a}, 40), Value(0u),
+                Value(0u), Value(0u), Value(true)},
+               fixture.AddMemory(buffer, 40));
+  fixture.PlanAndTrack();
+
+  const std::array expected{low, high, c, a, b, d, nested};
+  const auto &reads = fixture.program.srt_reads;
+  Check(reads.size() == expected.size(),
+        "scalar reads were not each given one flat SRT slot");
+  for (uint32_t slot = 0; slot < expected.size(); ++slot) {
+    Check(reads[slot].flat_offset == slot &&
+              reads[slot].value.Resolve() == expected[slot].Resolve(),
+          "flat SRT slots are not in the order the planning walk finishes the "
+          "reads");
+  }
+}
+
+// Deep enough to overflow a recursive walk; the leading per-lane operand stops
+// the validator.
+void TestDeepPlanningValueChain() {
+  constexpr uint32_t kDepth = 50000;
+  Fixture fixture;
+  const auto table =
+      fixture.Address(fixture.UserData(0), fixture.UserData(1), 4);
+  MemoryInfo scalar;
+  scalar.kind = ResourceKind::ScalarAddress;
+  const auto root = fixture.Emit(ValueOpcode::LoadAddressU32,
+                                 {table, Value(0u), Value(0u), Value(true)},
+                                 fixture.AddMemory(scalar, 8));
+  const auto lane = fixture.Emit(ValueOpcode::LaneId);
+  auto chain = root;
+  for (uint32_t i = 0; i < kDepth; ++i) {
+    chain = fixture.Emit(ValueOpcode::IAdd32, {lane, chain});
+  }
+  MemoryInfo global;
+  global.kind = ResourceKind::Global;
+  fixture.Emit(ValueOpcode::LoadAddressU32,
+               {fixture.Address(chain, fixture.UserData(2), 12), Value(0u),
+                Value(0u), Value(true)},
+               fixture.AddMemory(global, 12));
+  fixture.PlanAndTrack();
+
+  Check(fixture.program.srt_reads.size() == 1 &&
+            fixture.program.srt_reads[0].value.Resolve() == root.Resolve(),
+        "the scalar read at the bottom of a deep chain was not flattened");
+  Check(fixture.program.info.uses_dma,
+        "the per-lane global address did not use DMA");
+}
+
+// A uniform chain the validator accepts throughout, so validation and evaluation both walk it.
+void TestDeepUniformValueChain() {
+  constexpr uint32_t kDepth = 50000;
+  Fixture fixture;
+  auto chain = fixture.UserData(0);
+  for (uint32_t i = 0; i < kDepth; ++i) {
+    chain = fixture.Emit(ValueOpcode::IAdd32, {chain, fixture.UserData(2)});
+  }
+  MemoryInfo global;
+  global.kind = ResourceKind::Global;
+  fixture.Emit(ValueOpcode::LoadAddressU32,
+               {fixture.Address(chain, fixture.UserData(1), 12), Value(0u),
+                Value(0u), Value(true)},
+               fixture.AddMemory(global, 12));
+  fixture.PlanAndTrack();
+
+  Check(ValidateRuntimeValue(fixture.program, chain, RuntimeValueType::Integer),
+        "a deep uniform chain was not accepted as a runtime value");
+  const std::array<uint32_t, 3> user_data{0x1000u, 0u, 3u};
+  uint32_t value = 0;
+  Check(SrtWalker(fixture.program, {.user_data = user_data})
+                .Evaluate(chain, value) &&
+            value == 0x1000u + kDepth * 3u,
+        "a deep uniform chain did not evaluate");
+}
+
 void TestDynamicFlatAddressesUseDma() {
   Fixture fixture;
   const auto low_root = fixture.UserData(0);
@@ -4020,12 +4121,9 @@ void TestGuardedScalarDescriptorReads() {
       scalar.offset = 28;
       const auto flag = fixture.Emit(ValueOpcode::ReadConstBuffer, {control, Value(0u)},
                                      fixture.AddMemory(scalar, 4));
-      const auto lane = fixture.Emit(ValueOpcode::GetBuiltin,
-          {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)});
-      const auto varying = fixture.Emit(ValueOpcode::INotEqual32, {lane, Value(0u)});
-      const auto enabled = fixture.Emit(ValueOpcode::INotEqual32, {flag, Value(0u)});
-      fixture.program.blocks[0]->condition =
-          fixture.Emit(ValueOpcode::LogicalAnd, {varying, enabled});
+      // A lane-varying operand would make the chain walk give up on the whole condition.
+      fixture.program.block_info[0].condition =
+          fixture.Emit(ValueOpcode::INotEqual32, {flag, Value(0u)});
       const auto root = fixture.Address(fixture.UserData(4), Value(0u));
       const auto Load = [&](Block *block) {
         fixture.block = block;
@@ -5091,6 +5189,194 @@ void TestBallotDescriptorDword() {
         "a lane-indexed ballot did not re-execute its predicate per lane");
 }
 
+void TestBallotLaneSweepForgetsLaneValues() {
+  auto fixture = std::make_unique<Fixture>();
+  fixture->program.wave_size = 64u;
+  const auto base =
+      fixture->Address(fixture->UserData(0), fixture->UserData(1), 4);
+  MemoryInfo scalar;
+  scalar.kind = ResourceKind::ScalarAddress;
+  const auto loaded = fixture->Emit(ValueOpcode::LoadAddressU32,
+                                    {base, Value(0u), Value(0u), Value(true)},
+                                    fixture->AddMemory(scalar, 4));
+  const auto shared =
+      fixture->Emit(ValueOpcode::IAdd32, {loaded, fixture->UserData(2)});
+  const auto lane_sum = fixture->Emit(
+      ValueOpcode::IAdd32, {fixture->Emit(ValueOpcode::LaneId), shared});
+  const auto odd =
+      fixture->Emit(ValueOpcode::BitwiseAnd32, {lane_sum, Value(1u)});
+  const auto half =
+      fixture->Emit(ValueOpcode::ShiftRightLogical32, {lane_sum, Value(1u)});
+  const auto mixed = fixture->Emit(
+      ValueOpcode::IAdd32,
+      {half, fixture->Emit(ValueOpcode::IMul32, {odd, Value(100u)})});
+  const auto selected = fixture->Emit(
+      ValueOpcode::SelectU32,
+      {fixture->Emit(ValueOpcode::IEqual32, {fixture->UserData(5), Value(0u)}),
+       mixed, shared});
+  const auto predicate =
+      fixture->Emit(ValueOpcode::LogicalNot,
+                    {fixture->Emit(ValueOpcode::UGreaterThanEqual32,
+                                   {selected, fixture->UserData(3)})});
+  const auto ballot = fixture->Emit(ValueOpcode::Ballot, {predicate});
+  const auto low =
+      fixture->Emit(ValueOpcode::CompositeExtractU32x4, {ballot, Value(0u)});
+  const auto high =
+      fixture->Emit(ValueOpcode::CompositeExtractU32x4, {ballot, Value(1u)});
+  const auto buffer =
+      fixture->Buffer({fixture->UserData(4), Value(64u), low, high}, 0x80);
+  MemoryInfo memory_info;
+  memory_info.kind = ResourceKind::Buffer;
+  fixture->Emit(ValueOpcode::LoadBufferU32,
+                {buffer, Value(0u), Value(0u), Value(0u), Value(true)},
+                fixture->AddMemory(memory_info, 0x80));
+  fixture->PlanAndTrack();
+
+  const auto Expected = [](uint32_t word, uint32_t addend, uint32_t limit) {
+    uint64_t mask = 0;
+    for (uint32_t lane = 0; lane < 64u; lane++) {
+      const uint32_t sum = lane + word + addend;
+      const uint32_t chosen = (sum >> 1u) + (sum & 1u) * 100u;
+      if (chosen < limit)
+        mask |= uint64_t{1} << lane;
+    }
+    return mask;
+  };
+  const auto Check64 = [&](uint32_t word, uint32_t addend, uint32_t limit) {
+    TestMemory memory;
+    memory.words[0] = word;
+    std::array<uint32_t, 6> user_data{0x1000u, 0u, addend, limit, 0x5000u, 0u};
+    const SrtRuntime runtime{.user_data = user_data,
+                             .read_memory = ReadTestMemory,
+                             .userdata = &memory,
+                             .read_specialization_memory = ReadTestMemory};
+    DescriptorValue descriptor;
+    const auto mask = Expected(word, addend, limit);
+    Check(EvaluateDescriptorSource(fixture->program,
+                                   fixture->program.info.buffers[0].source,
+                                   runtime, descriptor) &&
+              descriptor.dwords[0] == 0x5000u &&
+              descriptor.dwords[2] == static_cast<uint32_t>(mask) &&
+              descriptor.dwords[3] == static_cast<uint32_t>(mask >> 32u),
+          "a ballot sweep reused a lane-dependent value in a later lane");
+    return memory.reads;
+  };
+  Check(Expected(6u, 4u, 20u) != ~uint64_t{0} && Expected(6u, 4u, 20u) != 0u,
+        "lane sweep fixture does not separate the lanes");
+  const auto reads = Check64(6u, 4u, 20u);
+  Check64(7u, 0u, 9u);
+  Check64(0u, 0u, 64u);
+  const char *off = std::getenv("KYTY_NO_LANE_SWEEP_SHARING");
+  Check((off != nullptr && std::strcmp(off, "0") != 0) || reads < 64u,
+        "a ballot sweep re-read a lane-free value on every lane");
+}
+
+void TestClosedBallotCache() {
+  const auto Build = [](bool reads_user_data) {
+    auto fixture = std::make_unique<Fixture>();
+    fixture->program.wave_size = 64u;
+    const auto lane = fixture->Emit(ValueOpcode::LaneId);
+    const auto exec = fixture->Emit(ValueOpcode::Ballot, {Value(true)});
+    const auto active = fixture->Emit(
+        ValueOpcode::IAdd32,
+        {fixture->Emit(ValueOpcode::BitCount32,
+                       {fixture->Emit(ValueOpcode::CompositeExtractU32x4,
+                                      {exec, Value(0u)})}),
+         fixture->Emit(ValueOpcode::BitCount32,
+                       {fixture->Emit(ValueOpcode::CompositeExtractU32x4,
+                                      {exec, Value(1u)})})});
+    const auto limit =
+        reads_user_data
+            ? fixture->Emit(ValueOpcode::UMin32, {fixture->UserData(1), active})
+            : fixture->Emit(ValueOpcode::ShiftRightLogical32,
+                            {active, Value(2u)});
+    const auto rank = fixture->Emit(
+        ValueOpcode::SelectU32,
+        {fixture->Emit(ValueOpcode::ULessThan32, {lane, Value(32u)}), lane,
+         fixture->Emit(ValueOpcode::ISub32, {lane, Value(1u)})});
+    const auto predicate =
+        fixture->Emit(ValueOpcode::ULessThan32, {rank, limit});
+    const auto ballot = fixture->Emit(ValueOpcode::Ballot, {predicate});
+    const auto low =
+        fixture->Emit(ValueOpcode::CompositeExtractU32x4, {ballot, Value(0u)});
+    const auto high =
+        fixture->Emit(ValueOpcode::CompositeExtractU32x4, {ballot, Value(1u)});
+    const auto buffer =
+        fixture->Buffer({fixture->UserData(0), Value(64u), low, high}, 0x90);
+    MemoryInfo memory_info;
+    memory_info.kind = ResourceKind::Buffer;
+    fixture->Emit(ValueOpcode::LoadBufferU32,
+                  {buffer, Value(0u), Value(0u), Value(0u), Value(true)},
+                  fixture->AddMemory(memory_info, 0x90));
+    fixture->PlanAndTrack();
+    return fixture;
+  };
+  const auto Expected = [](uint32_t limit) {
+    uint64_t mask = 0;
+    for (uint32_t lane = 0; lane < 64u; lane++) {
+      if ((lane < 32u ? lane : lane - 1u) < limit)
+        mask |= uint64_t{1} << lane;
+    }
+    return mask;
+  };
+  const auto Walk = [](const ResourcePlan &plan, uint32_t limit,
+                       bool with_clean, DescriptorValue &descriptor) {
+    std::array<uint32_t, 2> user_data{0x3000u, limit};
+    const SrtRuntime runtime{.user_data = user_data};
+    SrtWalker clean(plan, CleanRuntime(runtime));
+    SrtWalker walker(plan, runtime, {}, with_clean ? &clean : nullptr);
+    return walker.EvaluateDescriptor(plan.info.buffers[0].source, descriptor);
+  };
+  const auto Matches = [](const DescriptorValue &descriptor, uint64_t mask) {
+    return descriptor.dwords[0] == 0x3000u &&
+           descriptor.dwords[2] == static_cast<uint32_t>(mask) &&
+           descriptor.dwords[3] == static_cast<uint32_t>(mask >> 32u);
+  };
+  const auto Known = [](const ResourcePlan &plan) {
+    return std::ranges::count_if(plan.closed_ballots, [](const auto &entry) {
+      return entry.state == ResourcePlan::ClosedBallot::Known;
+    });
+  };
+  const char *off = std::getenv("KYTY_NO_CLOSED_BALLOT_CACHE");
+  const bool caching = off == nullptr || std::strcmp(off, "0") == 0;
+  DescriptorValue descriptor;
+
+  auto closed = Build(false);
+  const auto plan = ExtractResourcePlan(closed->program);
+  Check(plan.frozen_values && !closed->program.frozen_values,
+        "only an extracted plan may keep facts about its values");
+  Check(!Walk(plan, 0u, true, descriptor) && Known(plan) == 0,
+        "a walk with a clean evaluator used the closed-ballot cache");
+  for (int pass = 0; pass < 3; pass++) {
+    Check(Walk(plan, 0u, false, descriptor) &&
+              Matches(descriptor, Expected(16u)),
+          "a closed ballot did not keep its per-lane mask");
+  }
+  Check(Known(plan) == (caching ? 2 : 0),
+        "a closed ballot and the exec ballot inside it were not both kept");
+  Check(!Walk(plan, 0u, true, descriptor),
+        "the closed-ballot cache answered for a walk with a clean evaluator");
+  {
+    std::array<uint32_t, 2> user_data{0x3000u, 0u};
+    const SrtRuntime runtime{.user_data = user_data};
+    SrtWalker walker(closed->program, runtime);
+    Check(walker.EvaluateDescriptor(closed->program.info.buffers[0].source,
+                                    descriptor) &&
+              Matches(descriptor, Expected(16u)) && Known(closed->program) == 0,
+          "a Program kept a closed ballot");
+  }
+
+  auto open = Build(true);
+  const auto open_plan = ExtractResourcePlan(open->program);
+  for (const uint32_t limit : {5u, 40u, 0u, 64u, 5u}) {
+    Check(Walk(open_plan, limit, false, descriptor) &&
+              Matches(descriptor, Expected(limit)),
+          "a ballot over user data was served a mask from another draw");
+  }
+  Check(Known(open_plan) == (caching ? 1 : 0),
+        "only the exec ballot of a user-data predicate is closed");
+}
+
 // A DWORDX4 vector load of a V# stored in a buffer, taken apart into the four descriptor dwords.
 // The address carries no lane identity, so the host reads the same four words the GPU does.
 void TestUniformDwordX4DescriptorLoad() {
@@ -5211,6 +5497,9 @@ int main() {
     Run("bounded relative register writes", TestBoundedRelativeRegisterWrites);
     Run("DMA address materialization", TestDmaAddressMaterialization);
     Run("DMA pointer from SRT", TestDmaPointerFromSrt);
+    Run("scalar read slot order", TestScalarReadSlotOrder);
+    Run("deep planning value chain", TestDeepPlanningValueChain);
+    Run("deep uniform value chain", TestDeepUniformValueChain);
     Run("dynamic FLAT address", TestDynamicFlatAddressesUseDma);
     Run("buffer swizzle specialization", TestBufferSwizzleSpecialization);
     Run("conditional buffer materialization", TestConditionalBufferMaterialization);
@@ -5233,6 +5522,9 @@ int main() {
     Run("malformed memory kinds", TestMalformedMemoryKindsRejected);
     Run("lane mask descriptor dword", TestLaneMaskDescriptorDword);
     Run("ballot descriptor dword", TestBallotDescriptorDword);
+    Run("ballot lane sweep forgets lane values",
+        TestBallotLaneSweepForgetsLaneValues);
+    Run("closed ballot cache", TestClosedBallotCache);
     Run("uniform DWORDX4 descriptor load", TestUniformDwordX4DescriptorLoad);
   } catch (const std::exception &exception) {
     std::cerr << "resource tracking test failed: " << exception.what() << '\n';

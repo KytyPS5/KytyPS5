@@ -3,6 +3,8 @@
 
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
+#include <algorithm>
+#include <functional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -181,6 +183,56 @@ struct LaneScope {
 	bool     dependent = false;
 };
 
+class InstSet {
+public:
+	[[nodiscard]] bool empty() const { return m_items.empty(); }
+	[[nodiscard]] bool contains(const Inst* inst) const {
+		return std::binary_search(m_items.begin(), m_items.end(), inst, std::less<const Inst*> {});
+	}
+	void insert(const Inst* inst) {
+		const auto at =
+		    std::lower_bound(m_items.begin(), m_items.end(), inst, std::less<const Inst*> {});
+		if (at == m_items.end() || *at != inst) {
+			m_items.insert(at, inst);
+		}
+	}
+
+private:
+	std::vector<const Inst*> m_items;
+};
+
+class InstValueMap {
+public:
+	using Entry = std::pair<const Inst*, uint64_t>;
+
+	[[nodiscard]] bool            empty() const { return m_items.empty(); }
+	[[nodiscard]] const uint64_t* find(const Inst* inst) const {
+		const auto at = LowerBound(inst);
+		return at != m_items.end() && at->first == inst ? &at->second : nullptr;
+	}
+	[[nodiscard]] bool contains(const Inst* inst) const { return find(inst) != nullptr; }
+	uint64_t           emplace(const Inst* inst, uint64_t value) {
+		const auto at = LowerBound(inst);
+		if (at != m_items.end() && at->first == inst) {
+			return at->second;
+		}
+		m_items.insert(at, Entry {inst, value});
+		return value;
+	}
+	[[nodiscard]] auto begin() const { return m_items.begin(); }
+	[[nodiscard]] auto end() const { return m_items.end(); }
+
+private:
+	[[nodiscard]] std::vector<Entry>::const_iterator LowerBound(const Inst* inst) const {
+		return std::lower_bound(m_items.begin(), m_items.end(), inst,
+		                        [](const Entry& entry, const Inst* key) {
+			                        return std::less<const Inst*> {}(entry.first, key);
+		                        });
+	}
+
+	std::vector<Entry> m_items;
+};
+
 // One memoized evaluation session shared by the entire shader resource refresh.
 class SrtWalker {
 public:
@@ -209,6 +261,15 @@ private:
 	bool EvaluateRawRead(const Inst& inst, uint64_t& result, uint32_t component_bytes = 0u);
 	bool EvaluateInst(const Inst& inst, uint64_t& result);
 	bool EvaluateInstRule(const Inst& inst, uint64_t& result);
+	bool        EvaluateChain(const Inst& root, uint64_t& result);
+	const Inst* ColdPlainOperand(Value value, uint32_t& index);
+	static bool LaneSweepSharing();
+	void        ForgetLaneValues();
+	static bool ClosedBallotCaching();
+	uint32_t    ClosedBallotIndex(const Inst& ballot);
+	[[nodiscard]] LaneScope* DependenceScope() const {
+		return m_lane != nullptr ? m_lane : m_suspended_lane;
+	}
 
 	const ResourcePlan&              m_program;
 	SrtRuntime                      m_runtime;
@@ -217,11 +278,14 @@ private:
 	Value                           m_active_mask;
 	ResourcePlan::EvaluationContext& m_context;
 	// Loop-carried phi values taken on trust, inherited by any trial this walk starts.
-	std::unordered_map<const Inst*, uint64_t> m_assumed;
-	std::unordered_set<const Inst*>           m_barred;
+	InstValueMap m_assumed;
+	InstSet      m_barred;
 	// Non-null only inside the per-lane sweep a readfirstlane runs, which is the one place a
 	// lane index has a value. Owned by the sweep, shared with any walk it starts.
 	LaneScope*                                m_lane = nullptr;
+	LaneScope*                                m_suspended_lane = nullptr;
+	bool                                      m_shares_lanes   = false;
+	std::vector<uint32_t>                     m_lane_entries;
 	// The last guest read this walk refused, kept so a flat refresh can name the address rather
 	// than only the slot.
 	uint64_t                                  m_refused_read     = 0;

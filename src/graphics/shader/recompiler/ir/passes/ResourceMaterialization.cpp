@@ -1187,6 +1187,10 @@ void CanonicalizeIndirectImageTables(const ResourcePlan& program, ResourceSnapsh
 // Null candidates for shapes the heap lacks yet, so streaming never reaches the module.
 void PadIndirectImageShapes(const ResourcePlan& program, ResourceSnapshot& snapshot,
                             ResourceSpecialization& specialization) {
+	const auto roots = program.info.images.size();
+	if (specialization.images.size() <= roots) {
+		return;
+	}
 	struct Table {
 		size_t    end;
 		ShapeList shapes;
@@ -1195,7 +1199,6 @@ void PadIndirectImageShapes(const ResourcePlan& program, ResourceSnapshot& snaps
 	std::array<Table, ShaderInfo::MaxImages> tables;
 	size_t                                   table_count = 0;
 	size_t                                   added       = 0;
-	const auto                               roots       = program.info.images.size();
 	for (size_t index = roots; index < specialization.images.size();) {
 		const auto root = specialization.images[index].indirect_root;
 		if (root >= roots) {
@@ -1762,6 +1765,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	plan.source_reads               = program.source_reads;
 	plan.srt_plan_complete          = program.srt_plan_complete;
 	plan.resource_tracking_complete = program.resource_tracking_complete;
+	plan.frozen_values              = true;
 
 	std::unordered_map<const Inst*, Inst*> cloned;
 	std::function<Value(Value)>            Clone = [&](Value value) -> Value {

@@ -775,8 +775,9 @@ struct UniformFillPlan {
 struct ResourcePlan {
 	struct EvaluationContext {
 		struct Entry {
-			uint64_t value      = 0;
-			uint64_t generation = 0;
+			uint64_t value          = 0;
+			uint64_t generation     = 0;
+			bool     lane_dependent = false;
 		};
 
 		std::vector<Entry> values;
@@ -834,12 +835,19 @@ struct ResourcePlan {
 	UniformFillPlan       uniform_fill;
 	// GPU-thread scratch for nested clean/EXEC memos, activity and material keys.
 	mutable std::deque<EvaluationContext> evaluation_contexts;
-	mutable uint32_t                       evaluation_value_count = 0;
-	mutable uint32_t                       evaluation_depth       = 0;
-	mutable std::vector<uint8_t>            active_sources;
-	mutable std::vector<uint8_t>            visited_blocks;
-	mutable std::vector<uint32_t>           pending_blocks;
-	mutable std::vector<uint32_t>           material_keys;
+	mutable uint32_t                      evaluation_value_count = 0;
+	mutable uint32_t                      evaluation_depth       = 0;
+	mutable std::vector<uint8_t>          active_sources;
+	mutable std::vector<uint8_t>          visited_blocks;
+	mutable std::vector<uint32_t>         pending_blocks;
+	mutable std::vector<uint32_t>         material_keys;
+	bool                                  frozen_values = false;
+	struct ClosedBallot {
+		enum State : uint8_t { Unknown, Open, Closed, Known };
+		State    state = Unknown;
+		uint64_t mask  = 0;
+	};
+	mutable std::vector<ClosedBallot> closed_ballots;
 };
 
 struct Program: ResourcePlan {

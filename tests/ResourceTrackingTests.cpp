@@ -8972,6 +8972,153 @@ void TestDmaPointerFromSrt() {
         "a user-data DMA read pointer was not named for prefetch");
 }
 
+// Slots follow the planning walk's post-order, not emission order.
+void TestScalarReadSlotOrder() {
+  Fixture fixture;
+  const auto base = fixture.Address(fixture.UserData(0), fixture.UserData(1), 4);
+  MemoryInfo scalar;
+  scalar.kind = ResourceKind::ScalarAddress;
+  const auto read = [&](Value table, uint32_t offset, uint32_t pc) {
+    return fixture.Emit(ValueOpcode::LoadAddressU32,
+                        {table, Value(offset), Value(0u), Value(true)},
+                        fixture.AddMemory(scalar, pc));
+  };
+  const auto a = read(base, 0, 8);
+  const auto b = read(base, 4, 12);
+  const auto c = read(base, 8, 16);
+  const auto d = read(base, 12, 20);
+  const auto low = read(base, 16, 24);
+  const auto high = read(base, 20, 28);
+  const auto nested = read(fixture.Address(low, high, 32), 8, 36);
+  const auto word0 = fixture.Emit(ValueOpcode::IAdd32,
+                                  {fixture.Emit(ValueOpcode::IAdd32, {c, a}),
+                                   fixture.Emit(ValueOpcode::IAdd32, {b, d})});
+  MemoryInfo buffer;
+  buffer.kind = ResourceKind::Buffer;
+  fixture.Emit(ValueOpcode::LoadBufferU32,
+               {fixture.Buffer({word0, nested, Value(64u), a}, 40), Value(0u), Value(0u),
+                Value(0u), Value(true)},
+               fixture.AddMemory(buffer, 40));
+  fixture.PlanAndTrack();
+
+  const std::array expected{low, high, c, a, b, d, nested};
+  const auto &reads = fixture.program.srt_reads;
+  Check(reads.size() == expected.size(), "scalar reads were not each given one flat SRT slot");
+  for (uint32_t slot = 0; slot < expected.size(); ++slot) {
+    Check(reads[slot].flat_offset == slot && reads[slot].value.Resolve() == expected[slot].Resolve(),
+          "flat SRT slots are not in the order the planning walk finishes the reads");
+  }
+}
+
+// Deep enough to overflow a recursive walk; the leading per-lane operand stops the validator.
+void TestDeepPlanningValueChain() {
+  constexpr uint32_t kDepth = 50000;
+  Fixture fixture;
+  const auto table = fixture.Address(fixture.UserData(0), fixture.UserData(1), 4);
+  MemoryInfo scalar;
+  scalar.kind = ResourceKind::ScalarAddress;
+  const auto root = fixture.Emit(ValueOpcode::LoadAddressU32,
+                                 {table, Value(0u), Value(0u), Value(true)},
+                                 fixture.AddMemory(scalar, 8));
+  const auto lane = fixture.Emit(ValueOpcode::LaneId);
+  auto chain = root;
+  for (uint32_t i = 0; i < kDepth; ++i) {
+    chain = fixture.Emit(ValueOpcode::IAdd32, {lane, chain});
+  }
+  MemoryInfo global;
+  global.kind = ResourceKind::Global;
+  fixture.Emit(ValueOpcode::LoadAddressU32,
+               {fixture.Address(chain, fixture.UserData(2), 12), Value(0u), Value(0u),
+                Value(true)},
+               fixture.AddMemory(global, 12));
+  fixture.PlanAndTrack();
+
+  Check(fixture.program.srt_reads.size() == 1 &&
+            fixture.program.srt_reads[0].value.Resolve() == root.Resolve(),
+        "the scalar read at the bottom of a deep chain was not flattened");
+  Check(fixture.program.info.uses_dma, "the per-lane global address did not use DMA");
+}
+
+// A constant-offset scalar read through a loop-carried descriptor is not flattened.
+void TestCarriedDescriptorReadIsNotFlattened() {
+  Fixture fixture;
+  auto *entry = fixture.block;
+  auto *loop = fixture.AddBlock();
+  entry->AddBranch(loop);
+  loop->AddBranch(loop);
+  auto &phi = loop->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+  const auto carried = fixture.Emit(ValueOpcode::IAdd32, {Value(&phi), Value(48u)}, 0, loop);
+  phi.AddPhiOperand(entry, fixture.UserData(0));
+  phi.AddPhiOperand(loop, carried);
+  const auto carried_table = fixture.Emit(
+      ValueOpcode::GetBufferResource,
+      {Value(&phi), fixture.UserData(1), fixture.UserData(2), fixture.UserData(3)},
+      MemoryFlags{0, 0x20}, loop);
+  MemoryInfo scalar;
+  scalar.kind = ResourceKind::ScalarBuffer;
+  scalar.offset = 16u;
+  const auto carried_read = fixture.Emit(ValueOpcode::ReadConstBuffer, {carried_table, Value(0u)},
+                                         fixture.AddMemory(scalar, 0x24), loop);
+  const auto carried_handle = fixture.Emit(
+      ValueOpcode::GetBufferResource, {carried_read, carried_read, carried_read, carried_read},
+      MemoryFlags{0, 0x28}, loop);
+  MemoryInfo load;
+  load.kind = ResourceKind::Buffer;
+  fixture.Emit(ValueOpcode::LoadBufferU32,
+               {carried_handle, Value(0u), Value(0u), Value(0u), Value(true)},
+               fixture.AddMemory(load, 0x28), loop);
+  const auto steady_table = fixture.Emit(
+      ValueOpcode::GetBufferResource,
+      {fixture.UserData(4), fixture.UserData(5), fixture.UserData(6), fixture.UserData(7)},
+      MemoryFlags{0, 0x30}, loop);
+  auto steady_scalar = scalar;
+  steady_scalar.offset = 32u;
+  const auto steady_read = fixture.Emit(ValueOpcode::ReadConstBuffer, {steady_table, Value(0u)},
+                                        fixture.AddMemory(steady_scalar, 0x34), loop);
+  const auto steady_handle = fixture.Emit(
+      ValueOpcode::GetBufferResource, {steady_read, steady_read, steady_read, steady_read},
+      MemoryFlags{0, 0x38}, loop);
+  fixture.Emit(ValueOpcode::LoadBufferU32,
+               {steady_handle, Value(0u), Value(0u), Value(0u), Value(true)},
+               fixture.AddMemory(load, 0x38), loop);
+  (void)fixture.TryPlanAndTrack();
+  Check(FlatSlotKind(fixture.program, carried_read) == -1,
+        "a read through a loop-carried descriptor was hoisted into the flattened SRT");
+  Check(FlatSlotKind(fixture.program, steady_read) >= 0,
+        "a read through an invariant descriptor stopped being hoisted");
+
+  // A raw address read through a carried pointer stays native; its V# is decoded in the shader.
+  Fixture address;
+  auto *address_entry = address.block;
+  auto *address_loop = address.AddBlock();
+  address_entry->AddBranch(address_loop);
+  address_loop->AddBranch(address_loop);
+  auto &address_phi =
+      address_loop->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+  address_phi.AddPhiOperand(address_entry, address.UserData(0));
+  address_phi.AddPhiOperand(
+      address_loop,
+      address.Emit(ValueOpcode::IAdd32, {Value(&address_phi), Value(8u)}, 0, address_loop));
+  const auto carried_address =
+      address.Emit(ValueOpcode::GetAddressResource, {Value(&address_phi), address.UserData(1)},
+                   MemoryFlags{0, 0x40}, address_loop);
+  MemoryInfo address_word;
+  address_word.kind = ResourceKind::ScalarAddress;
+  const auto address_read =
+      address.Emit(ValueOpcode::LoadAddressU32, {carried_address, Value(0u), Value(0u), Value(true)},
+                   address.AddMemory(address_word, 0x44), address_loop);
+  const auto address_handle = address.Emit(
+      ValueOpcode::GetBufferResource, {address_read, address_read, address_read, address_read},
+      MemoryFlags{0, 0x48}, address_loop);
+  address.Emit(ValueOpcode::LoadBufferU32,
+               {address_handle, Value(0u), Value(0u), Value(0u), Value(true)},
+               address.AddMemory(load, 0x48), address_loop);
+  const auto status = address.TryPlanAndTrack();
+  Check(status.ok && FlatSlotKind(address.program, address_read) == -1 &&
+            StoresDecodedInShader(address.program),
+        "a load through a V# read via a carried pointer was not decoded in the shader");
+}
+
 // A captured scalar read of a written buffer leaves the overlap list only if no store precedes it.
 } // namespace
 
@@ -9052,6 +9199,11 @@ int main() {
     Run("live shader data collection", TestLiveShaderDataCollection);
     Run("resource limit", TestResourceLimitIsTransactional);
     Run("malformed memory kinds", TestMalformedMemoryKindsRejected);
+    Run("DMA pointer from SRT", TestDmaPointerFromSrt);
+    Run("scalar read slot order", TestScalarReadSlotOrder);
+    Run("deep planning value chain", TestDeepPlanningValueChain);
+    Run("deep uniform value chain", TestDeepUniformValueChain);
+    Run("carried descriptor read is not flattened", TestCarriedDescriptorReadIsNotFlattened);
   } catch (const std::exception &exception) {
     std::cerr << "resource tracking test failed: " << exception.what() << '\n';
     return 1;

@@ -25,18 +25,6 @@ Value Value::F32(float value) {
 	return Value(Type::F32, std::bit_cast<uint32_t>(value));
 }
 
-bool Value::IsEmpty() const {
-	return type == Type::Void;
-}
-
-bool Value::IsImmediate() const {
-	return type != Type::Opaque;
-}
-
-bool Value::IsIdentity() const {
-	return type == Type::Opaque && inst->GetOpcode() == ValueOpcode::Identity;
-}
-
 bool Value::IsPhi() const {
 	return type == Type::Opaque && inst->GetOpcode() == ValueOpcode::Phi;
 }
@@ -56,17 +44,9 @@ Inst* Value::Instruction() const {
 	return inst;
 }
 
-Inst* Value::TryInstruction() const {
-	return type == Type::Opaque ? inst : nullptr;
-}
-
 Inst* Value::ResolveInstruction() const {
 	EXIT_IF(type != Type::Opaque);
 	return IsIdentity() ? inst->Arg(0).ResolveInstruction() : inst;
-}
-
-Value Value::Resolve() const {
-	return IsIdentity() ? inst->Arg(0).Resolve() : *this;
 }
 
 ScalarReg Value::ScalarRegister() const {
@@ -152,10 +132,6 @@ Inst::~Inst() {
 	ClearArgs();
 }
 
-ValueOpcode Inst::GetOpcode() const {
-	return opcode;
-}
-
 Type Inst::GetType() const {
 	if (opcode == ValueOpcode::Phi) {
 		return static_cast<Type>(flags);
@@ -178,20 +154,8 @@ size_t Inst::UseCount() const {
 	return uses.size();
 }
 
-size_t Inst::NumArgs() const {
-	return num_args == PhiArity ? phi_args.size() : num_args;
-}
-
 size_t Inst::NumPhiBlocks() const {
 	return num_args == PhiArity ? phi_args.size() : 0;
-}
-
-Value Inst::Arg(size_t index) const {
-	EXIT_IF(index >= NumArgs());
-	if (num_args <= InlineArity) {
-		return fixed_args[index];
-	}
-	return num_args == PhiArity ? phi_args[index].second : large_args[index];
 }
 
 Block* Inst::PhiBlock(size_t index) const {

@@ -9,8 +9,10 @@
 #include <cmath>
 #include <cstring>
 #include <map>
+#include <optional>
 #include <unordered_map>
 #include <unordered_set>
+#include <xbyak/xbyak.h>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
@@ -438,6 +440,34 @@ private:
 	}
 
 	bool Validate(Value value, bool require_uniform = true) {
+		const auto base = m_stack.size();
+		if (const auto entered = Enter(value, require_uniform)) return *entered;
+		bool failed = false;
+		for (;;) {
+			auto& frame = m_stack.back();
+			if (!failed && frame.next < frame.count) {
+				const auto arg     = frame.inst->Arg(frame.next++);
+				const auto entered = Enter(arg, frame.require_uniform);
+				failed             = entered.has_value() && !*entered;
+				continue;
+			}
+			const auto done = frame;
+			m_stack.pop_back();
+			const bool valid = Finish(done.inst, done.require_uniform, done.scope, !failed);
+			if (m_stack.size() == base) return valid;
+			failed = !valid;
+		}
+	}
+
+	bool Finish(const Inst* inst, bool require_uniform, const Scope& scope, bool valid) {
+		m_visiting.erase(inst);
+		if (valid && !require_uniform) m_validated_dependencies.insert(inst);
+		if (valid && require_uniform) m_validated_uniform[inst].push_back(scope);
+		return valid;
+	}
+
+	// Empty when the operands still have to be walked: their frame is on the stack.
+	std::optional<bool> Enter(Value value, bool require_uniform) {
 		value = value.Resolve();
 		// Host floating-point evaluation does not model shader rounding/denormal modes.
 		if (m_type != RuntimeValueType::Any &&
@@ -471,9 +501,19 @@ private:
 		if (!m_visiting.insert(inst).second) {
 			return !require_uniform;
 		}
-		const auto finish = [&](bool valid) {
-			m_visiting.erase(inst);
-			if (valid && !require_uniform) m_validated_dependencies.insert(inst);
+		const Scope scope {m_active_mask, m_lane_bound};
+		const auto finish = [&](bool valid) { return Finish(inst, require_uniform, scope, valid); };
+		const auto operands = [&](bool uniform) -> std::optional<bool> {
+			m_stack.push_back({inst, scope, 0u, static_cast<uint32_t>(inst->NumArgs()), uniform});
+			return std::nullopt;
+		};
+		const auto under_mask = [&](Value mask, Value operand, bool lane_bound) {
+			const Scope outer {m_active_mask, m_lane_bound};
+			m_active_mask    = mask;
+			m_lane_bound     = lane_bound;
+			const bool valid = Validate(operand);
+			m_active_mask    = outer.active_mask;
+			m_lane_bound     = outer.lane_bound;
 			return valid;
 		};
 		const auto op = inst->GetOpcode();
@@ -493,15 +533,12 @@ private:
 			    slot.U32() >= m_program.srt_reads.size()) {
 				return finish(false);
 			}
-			if (m_type != RuntimeValueType::Any) {
-				const auto active_mask = m_active_mask;
-				m_active_mask          = {};
-				const bool valid       = Validate(m_program.srt_reads[slot.U32()].value);
-				m_active_mask          = active_mask;
-				if (!valid) return finish(false);
+			if (m_type != RuntimeValueType::Any &&
+			    !under_mask({}, m_program.srt_reads[slot.U32()].value, false)) {
+				return finish(false);
 			}
 		}
-		if (!require_uniform) return finish(ValidateArguments(*inst, false));
+		if (!require_uniform) return operands(false);
 		if (!m_active_mask.IsEmpty() && IsRuntimeSelect(op) && inst->NumArgs() == 3 &&
 		    inst->Arg(0).Resolve() == m_active_mask) {
 			// Empty EXEC reads lane zero, so ignored operands still require integer types.
@@ -636,7 +673,7 @@ private:
 		           op != ValueOpcode::LoadAddressU32 && !IsRuntimeUniformOp(op)) {
 			return finish(false);
 		}
-		return finish(ValidateArguments(*inst, true));
+		return operands(true);
 	}
 
 	const ResourcePlan&             m_program;
@@ -963,6 +1000,8 @@ bool SrtWalker::EvaluateWide(Value value, uint64_t& result) {
 		return EvaluateWide(inst->Arg(1), result);
 	}
 	// A value a fixpoint trial assumes answers before the memo.
+	if (const auto* assumed = m_assumed.find(inst); assumed != nullptr) {
+		result = *assumed;
 		return true;
 	}
 	const auto index = inst->EvaluationIndex(m_program.evaluation_value_count);
@@ -970,28 +1009,110 @@ bool SrtWalker::EvaluateWide(Value value, uint64_t& result) {
 		m_context.values.resize(m_program.evaluation_value_count);
 	}
 	if (m_context.values[index].generation == m_context.generation) {
-		result = m_context.values[index].value;
+	auto& entry = m_context.values[index];
+	if (entry.generation == m_context.generation ||
+	    entry.generation == (m_context.generation | 2u)) {
+		if (auto* scope = DependenceScope(); scope != nullptr && entry.lane_dependent) {
+			scope->dependent = true;
+		}
+		if (entry.generation != m_context.generation) {
+			return Refuse(static_cast<SrtRefusal>(entry.value));
+		}
+		result = entry.value;
 		return true;
 	}
-	// Visiting and completed-unknown entries both stop repeated evaluation in this
-	// context. Only completed unknowns are retried when reachability becomes tighter.
-	if (m_context.values[index].generation == (m_context.generation | 1u) ||
-	    m_context.values[index].generation == (m_context.generation | 2u)) {
-		return false;
+	// A value still being evaluated: a cycle, which only a loop phi can close.
+	if (entry.generation == (m_context.generation | 1u)) {
+		m_state->cycle_root = std::min(m_state->cycle_root, entry.value);
+		return Refuse(SrtRefusal::VaryingPhi);
 	}
-	m_context.values[index].generation = m_context.generation | 1u;
-	uint64_t out = 0;
-	const bool evaluated = EvaluateInst(*inst, out);
-	// Recursive evaluation may grow the dense memo vector.
 	auto& memo = m_context.values[index];
-	if (!evaluated) {
-		memo.generation = m_context.generation | 2u;
 		return false;
+	const auto visit     = BeginVisit(entry);
+	uint64_t   out       = 0;
+	const auto plain     = PlainArgCount(inst->GetOpcode());
+	const bool evaluated = plain != 0 && inst->NumArgs() >= plain ? EvaluateChain(*inst, out)
+	                                                              : EvaluateInst(*inst, out);
+	EndVisit(visit, index, evaluated, out);
+	if (evaluated) result = out;
+	return evaluated;
+}
+
+const Inst* SrtWalker::ColdPlainOperand(Value value, uint32_t& index) {
+	value            = value.Resolve();
+	const auto* inst = value.TryInstruction();
+	if (inst == nullptr || (!m_active_mask.IsEmpty() && value == m_active_mask)) {
+		return nullptr;
 	}
-	memo.value      = out;
-	memo.generation = m_context.generation;
-	result = out;
-	return true;
+	const auto count = PlainArgCount(inst->GetOpcode());
+	if (count == 0 || inst->NumArgs() < count || m_assumed.contains(inst)) {
+		return nullptr;
+	}
+	index = inst->EvaluationIndex(m_program.evaluation_value_count);
+	if (index >= m_context.values.size()) {
+		m_context.values.resize(m_program.evaluation_value_count);
+	}
+	const auto generation = m_context.values[index].generation;
+	return (generation | 3u) == (m_context.generation | 3u) ? nullptr : inst;
+}
+
+// EvaluateWide's recursion through plain operations, on an explicit stack in rule operand order.
+bool SrtWalker::EvaluateChain(const Inst& root, uint64_t& result) {
+	struct Frame {
+		const Inst* inst;
+		uint32_t    index;
+		uint32_t    next;
+		uint32_t    count;
+		Visit       visit;
+	};
+	static thread_local std::vector<Frame> stack;
+	struct Unwind {
+		std::vector<Frame>& frames;
+		size_t              base;
+		~Unwind() { frames.resize(base); }
+	} const unwind {stack, stack.size()};
+	const auto base = unwind.base;
+	stack.push_back({&root, 0u, 0u, PlainArgCount(root.GetOpcode()), {}});
+	bool failed = false;
+	// Applies an operand's outcome to the frame that asked for it.
+	const auto settle = [&](bool ok, uint64_t value) {
+		auto&      owner    = stack.back();
+		const auto op       = owner.inst->GetOpcode();
+		const auto argument = ChainArgument(op, owner.next - 1u);
+		if (!ok) {
+			failed = !ToleratesFailedOperand(op);
+		} else if (DecidesResult(op, argument, value)) {
+			owner.next = owner.count;
+		}
+	};
+	for (;;) {
+		auto& frame = stack.back();
+		if (!failed && frame.next < frame.count) {
+			const auto arg = frame.inst->Arg(ChainArgument(frame.inst->GetOpcode(), frame.next++));
+			uint32_t   index = 0;
+			if (const auto* cold = ColdPlainOperand(arg, index)) {
+				const auto visit = BeginVisit(m_context.values[index]);
+				stack.push_back({cold, index, 0u, PlainArgCount(cold->GetOpcode()), visit});
+				continue;
+			}
+			// EvaluateWide can re-enter this walk and grow the stack, so `frame` may dangle.
+			uint64_t   value = 0;
+			const bool ok    = EvaluateWide(arg, value);
+			settle(ok, value);
+			continue;
+		}
+		const auto current   = frame;
+		uint64_t   out       = 0;
+		const bool evaluated = !failed && EvaluateInst(*current.inst, out);
+		if (stack.size() == base + 1u) {
+			result = out;
+			return evaluated;
+		}
+		EndVisit(current.visit, current.index, evaluated, out);
+		stack.pop_back();
+		failed = false;
+		settle(evaluated, out);
+	}
 }
 
 bool SrtWalker::Arg(const Inst& inst, size_t index, uint64_t& result) {
@@ -1033,6 +1154,7 @@ bool SrtWalker::EvaluatePhi(const Inst& inst, uint64_t& result) {
 	trial.m_lane           = m_lane;
 	trial.m_suspended_lane = m_suspended_lane;
 	for (const auto* member: web) {
+		if (trial.m_assumed.emplace(member, candidate) != candidate) {
 			return Refuse(SrtRefusal::VaryingPhi);
 		}
 	}
@@ -1168,6 +1290,69 @@ void SrtWalker::BarAssumptions(SrtWalker& walker) const {
 		walker.m_barred.insert(assumed.first);
 }
 
+uint32_t SrtWalker::ClosedBallotIndex(const Inst& ballot) {
+	const auto index = ballot.EvaluationIndex(m_program.evaluation_value_count);
+	auto&      table = m_program.closed_ballots;
+	if (index >= table.size()) {
+		table.resize(std::max<size_t>(index + 1u, m_program.evaluation_value_count));
+	}
+	auto& entry = table[index];
+	if (entry.state == ResourcePlan::ClosedBallot::Unknown) {
+		entry.state = IsClosedPredicate(ballot.Arg(0)) ? ResourcePlan::ClosedBallot::Closed
+		                                               : ResourcePlan::ClosedBallot::Open;
+	}
+	return entry.state == ResourcePlan::ClosedBallot::Open ? UINT32_MAX : index;
+}
+
+void SrtWalker::ForgetLaneValues() {
+	for (const auto index: m_lane_entries)
+		m_context.values[index].generation = 0;
+	m_lane_entries.clear();
+}
+
+bool SrtWalker::EvaluateBallot(const Inst& inst, uint64_t& result) {
+	// One bit per lane; a predicate that never asks for the lane takes one walk for the wave.
+	const auto lanes = m_program.wave_size;
+	if (lanes == 0u || lanes > 64u) {
+		return Refuse(SrtRefusal::UnsupportedOperand);
+	}
+	const auto wave = lanes == 64u ? ~uint64_t {0} : (uint64_t {1} << lanes) - 1u;
+	// A predicate of the lane index and constants alone has one mask per frozen plan.
+	const auto closed = m_program.frozen_values ? ClosedBallotIndex(inst) : UINT32_MAX;
+	if (closed != UINT32_MAX &&
+	    m_program.closed_ballots[closed].state == ResourcePlan::ClosedBallot::Known) {
+		result = m_program.closed_ballots[closed].mask;
+		return true;
+	}
+	LaneScope scope;
+	SrtWalker clean_lane(*this, Value(true), true, nullptr, true);
+	SrtWalker lane_walk(*this, Value(true), false, &clean_lane, true);
+	for (auto* walker: {&clean_lane, &lane_walk}) {
+		walker->m_lane         = &scope;
+		walker->m_shares_lanes = true;
+		BarAssumptions(*walker);
+	}
+	uint64_t mask = 0;
+	for (scope.lane = 0; scope.lane < lanes; ++scope.lane) {
+		scope.dependent = false;
+		clean_lane.ForgetLaneValues();
+		lane_walk.ForgetLaneValues();
+		uint64_t taken = 0;
+		if (!lane_walk.EvaluateWide(inst.Arg(0), taken)) {
+			return false;
+		}
+		if (scope.lane == 0u && !scope.dependent) {
+			mask = taken != 0u ? wave : 0u;
+			break;
+		}
+		if (taken != 0u) mask |= uint64_t {1} << scope.lane;
+	}
+	if (closed != UINT32_MAX) {
+		m_program.closed_ballots[closed] = {ResourcePlan::ClosedBallot::Known, mask};
+	}
+	result = mask;
+	return true;
+}
 
 bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 	const auto refusals = m_state->refusals;

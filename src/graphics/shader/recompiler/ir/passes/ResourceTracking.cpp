@@ -710,29 +710,71 @@ private:
 		return selected.IsEmpty() ? value : selected;
 	}
 
+	// Iterative: descriptor dwords can sit on SSA chains tens of thousands of values deep.
 	Value LowerDescriptorValue(Value value) {
-		value            = value.Resolve();
-		const auto* inst = value.TryInstruction();
-		if (inst == nullptr) return value;
-		// The scalar planner owns reads and lowers their address handles separately.
-		uint32_t memory_index = 0;
-		if (ScalarReadMemory(*inst, memory_index) != nullptr) return value;
-		const auto [cached, inserted] = m_descriptor_values.emplace(inst, value);
-		if (!inserted) return cached->second;
-		if (inst->GetOpcode() != ValueOpcode::Phi) {
-			Inst* projected = nullptr;
-			for (size_t arg = 0; arg < inst->NumArgs(); ++arg) {
-				const auto lowered = LowerDescriptorValue(inst->Arg(arg));
-				if (lowered == inst->Arg(arg).Resolve()) continue;
-				if (projected == nullptr) {
-					projected = &m_program.value_storage.emplace_back(inst->GetOpcode(), inst->Flags<uint64_t>());
-					for (size_t i = 0; i < inst->NumArgs(); ++i) projected->SetArg(i, inst->Arg(i));
-				}
-				projected->SetArg(arg, lowered);
+		struct Frame {
+			const Inst*                            inst;
+			std::map<const Inst*, Value>::iterator cached;
+			size_t                                 arg       = 0;
+			Inst*                                  projected = nullptr;
+		};
+		std::vector<Frame> stack;
+		Value              lowered;
+		// Returns true with `lowered` set, or pushes a frame whose operands must be lowered first.
+		const auto enter = [&](Value operand) {
+			operand          = operand.Resolve();
+			const auto* inst = operand.TryInstruction();
+			lowered          = operand;
+			if (inst == nullptr) return true;
+			// The scalar planner owns reads and lowers their address handles separately.
+			uint32_t memory_index = 0;
+			if (ScalarReadMemory(*inst, memory_index) != nullptr) return true;
+			const auto [cached, inserted] = m_descriptor_values.emplace(inst, operand);
+			if (!inserted) {
+				lowered = cached->second;
+				return true;
 			}
-			if (projected != nullptr) cached->second = Value(projected);
-			return cached->second;
+			if (inst->GetOpcode() == ValueOpcode::Phi) {
+				cached->second = LowerDescriptorPhi(*inst, operand);
+				lowered        = cached->second;
+				return true;
+			}
+			stack.push_back({inst, cached});
+			return false;
+		};
+		if (enter(value)) return lowered;
+		bool pending = false;
+		for (;;) {
+			auto&       frame = stack.back();
+			const auto* inst  = frame.inst;
+			if (pending) {
+				pending = false;
+				if (lowered != inst->Arg(frame.arg).Resolve()) {
+					if (frame.projected == nullptr) {
+						frame.projected = &m_program.value_storage.emplace_back(
+						    inst->GetOpcode(), inst->Flags<uint64_t>());
+						for (size_t i = 0; i < inst->NumArgs(); ++i)
+							frame.projected->SetArg(i, inst->Arg(i));
+					}
+					frame.projected->SetArg(frame.arg, lowered);
+				}
+				++frame.arg;
+			}
+			if (frame.arg < inst->NumArgs()) {
+				// A pushed frame invalidates `frame` and lowers its own operands first.
+				pending = enter(inst->Arg(frame.arg));
+				continue;
+			}
+			if (frame.projected != nullptr) frame.cached->second = Value(frame.projected);
+			lowered = frame.cached->second;
+			stack.pop_back();
+			if (stack.empty()) return lowered;
+			pending = true;
 		}
+	}
+
+	Value LowerDescriptorPhi(const Inst& phi, Value value) {
+		const auto* inst = &phi;
 		if (inst->NumArgs() != 2u || inst->NumPhiBlocks() != 2u || inst->GetType() != Type::U32) {
 			return value;
 		}
@@ -781,8 +823,7 @@ private:
 		selected.SetArg(0, info.condition);
 		selected.SetArg(1, inst->Arg(true_arg));
 		selected.SetArg(2, inst->Arg(true_arg ^ 1u));
-		cached->second = Value(&selected);
-		return cached->second;
+		return Value(&selected);
 	}
 
 	void MakeSource(const Inst& handle, uint32_t width, bool sampler, bool sample_adjust,
@@ -827,38 +868,70 @@ private:
 		           ? native->src0.reg : UINT32_MAX;
 	}
 
-	void CollectScalarRead(Value value, uint32_t use_pc) {
-		value = value.Resolve();
-		if (value.IsImmediate()) return;
-		auto* inst = value.TryInstruction();
-		if (inst == nullptr) Fail(use_pc, "invalid typed planning value");
-		const auto cycle = std::ranges::find(m_srt_visiting, inst);
-		if (cycle != m_srt_visiting.end()) {
-			if (std::any_of(cycle, m_srt_visiting.end(), [](const Inst* value) {
-				return value->GetOpcode() == ValueOpcode::Phi;
-			})) return;
-			Fail(use_pc, "cyclic typed planning value without a phi");
+	// Iterative: slices run thousands of instructions deep. Post-order fixes m_scalar_reads slots.
+	void CollectScalarRead(Value root, uint32_t root_pc) {
+		struct Frame {
+			Inst*                                   inst;
+			bool                                    hoist;
+			std::vector<std::pair<Value, uint32_t>> operands;
+			size_t                                  next;
+		};
+		std::vector<Frame> stack;
+		const auto         enter = [&](Value value, uint32_t use_pc) {
+			value = value.Resolve();
+			if (value.IsImmediate()) return;
+			auto* inst = value.TryInstruction();
+			if (inst == nullptr) Fail(use_pc, "invalid typed planning value");
+			const auto cycle = std::ranges::find(m_srt_visiting, inst);
+			if (cycle != m_srt_visiting.end()) {
+				if (std::any_of(cycle, m_srt_visiting.end(), [](const Inst* value) {
+					    return value->GetOpcode() == ValueOpcode::Phi;
+				    }))
+					return;
+				Fail(use_pc, "cyclic typed planning value without a phi");
+			}
+			if (m_srt_visited.contains(inst)) return;
+			m_srt_visiting.push_back(inst);
+			uint32_t    memory_index = 0;
+			const auto* memory       = ScalarReadMemory(*inst, memory_index);
+			Frame       frame {inst, false, {}, 0};
+			if (memory != nullptr) {
+				const auto* handle = inst->Arg(0).Resolve().TryInstruction();
+				const auto  width  = memory->kind == ResourceKind::ScalarBuffer ? 4u : 2u;
+				if (handle == nullptr ||
+				    handle->GetOpcode() != (width == 4u ? ValueOpcode::GetBufferResource
+				                                        : ValueOpcode::GetAddressResource))
+					Fail(use_pc, "scalar read has an invalid resource handle");
+				DescriptorSource source;
+				MakeSource(*handle, width, false, false, ScalarReadBase(*inst), source,
+				           inst->Flags<MemoryFlags>().pc);
+				const auto offset = inst->Arg(1).Resolve();
+				// A flat slot holds one word; a carried descriptor names a record per iteration.
+				frame.hoist = offset.IsImmediate() && offset.GetType() == Type::U32 &&
+				              !ReadsThroughCarriedDescriptor(*inst, source);
+				for (uint32_t word = 0; word < width; ++word)
+					frame.operands.emplace_back(source.dwords[word], inst->Flags<MemoryFlags>().pc);
+				for (size_t arg = 1; arg < inst->NumArgs(); ++arg)
+					frame.operands.emplace_back(inst->Arg(arg), use_pc);
+			} else {
+				for (size_t arg = 0; arg < inst->NumArgs(); ++arg)
+					frame.operands.emplace_back(inst->Arg(arg), use_pc);
+			}
+			stack.push_back(std::move(frame));
+		};
+		enter(root, root_pc);
+		while (!stack.empty()) {
+			auto& frame = stack.back();
+			if (frame.next < frame.operands.size()) {
+				const auto [value, use_pc] = frame.operands[frame.next++];
+				enter(value, use_pc);
+				continue;
+			}
+			m_srt_visiting.pop_back();
+			m_srt_visited.insert(frame.inst);
+			if (frame.hoist) m_scalar_reads.push_back(frame.inst);
+			stack.pop_back();
 		}
-		if (std::ranges::find(m_srt_visited, inst) != m_srt_visited.end()) return;
-		m_srt_visiting.push_back(inst);
-		uint32_t memory_index = 0;
-		const auto* memory = ScalarReadMemory(*inst, memory_index);
-		DescriptorSource source;
-		if (memory != nullptr) {
-			const auto* handle = inst->Arg(0).Resolve().TryInstruction();
-			const auto width = memory->kind == ResourceKind::ScalarBuffer ? 4u : 2u;
-			if (handle == nullptr || handle->GetOpcode() !=
-			        (width == 4u ? ValueOpcode::GetBufferResource : ValueOpcode::GetAddressResource))
-				Fail(use_pc, "scalar read has an invalid resource handle");
-			MakeSource(*handle, width, false, false, ScalarReadBase(*inst), source,
-			           inst->Flags<MemoryFlags>().pc);
-			for (uint32_t word = 0; word < width; ++word)
-				CollectScalarRead(source.dwords[word], inst->Flags<MemoryFlags>().pc);
-			for (size_t arg = 1; arg < inst->NumArgs(); ++arg)
-				CollectScalarRead(inst->Arg(arg), use_pc);
-		} else {
-			for (size_t arg = 0; arg < inst->NumArgs(); ++arg)
-				CollectScalarRead(inst->Arg(arg), use_pc);
 	}
 
 	bool CarriedValue(Value value, uint32_t depth, std::vector<const Inst*>& seen) const {
@@ -866,11 +939,6 @@ private:
 		if (depth > MaxCarriedDepth) {
 			return false;
 		}
-		m_srt_visiting.pop_back();
-		m_srt_visited.push_back(inst);
-		if (memory == nullptr) return;
-		const auto offset = inst->Arg(1).Resolve();
-		m_scalar_reads.push_back(inst);
 		value            = value.Resolve();
 		const auto* inst = value.TryInstruction();
 		if (inst == nullptr || std::ranges::find(seen, inst) != seen.end()) {
@@ -4169,7 +4237,7 @@ private:
 	std::vector<Program::ScalarWrite>          m_scalar_writes;
 	std::vector<ResolvedHandle>                m_resolved_handles;
 	std::vector<const Inst*>                   m_srt_visiting;
-	std::vector<const Inst*>                   m_srt_visited;
+	std::unordered_set<const Inst*>                 m_srt_visited;
 	std::vector<Inst*>                         m_scalar_reads;
 	ShaderInfo                                 m_info;
 	std::vector<DescriptorSource>              m_sources;

@@ -4,6 +4,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <algorithm>
+#include <functional>
 #include <span>
 #include <string_view>
 
@@ -92,6 +93,51 @@ struct LaneScope {
 	bool     dependent = false;
 };
 
+class InstSet {
+public:
+	[[nodiscard]] bool contains(const Inst* inst) const {
+		return std::binary_search(m_items.begin(), m_items.end(), inst, std::less<const Inst*> {});
+	}
+	void insert(const Inst* inst) {
+		const auto at =
+		    std::lower_bound(m_items.begin(), m_items.end(), inst, std::less<const Inst*> {});
+		if (at == m_items.end() || *at != inst) m_items.insert(at, inst);
+	}
+
+private:
+	std::vector<const Inst*> m_items;
+};
+
+class InstValueMap {
+public:
+	using Entry = std::pair<const Inst*, uint64_t>;
+
+	[[nodiscard]] const uint64_t* find(const Inst* inst) const {
+		const auto at = LowerBound(inst);
+		return at != m_items.end() && at->first == inst ? &at->second : nullptr;
+	}
+	[[nodiscard]] bool contains(const Inst* inst) const { return find(inst) != nullptr; }
+	// Returns the value already held for `inst`, or inserts and returns `value`.
+	uint64_t emplace(const Inst* inst, uint64_t value) {
+		const auto at = LowerBound(inst);
+		if (at != m_items.end() && at->first == inst) return at->second;
+		m_items.insert(at, Entry {inst, value});
+		return value;
+	}
+	[[nodiscard]] auto begin() const { return m_items.begin(); }
+	[[nodiscard]] auto end() const { return m_items.end(); }
+
+private:
+	[[nodiscard]] std::vector<Entry>::const_iterator LowerBound(const Inst* inst) const {
+		return std::lower_bound(m_items.begin(), m_items.end(), inst,
+		                        [](const Entry& entry, const Inst* key) {
+			                        return std::less<const Inst*> {}(entry.first, key);
+		                        });
+	}
+
+	std::vector<Entry> m_items;
+};
+
 // Nonnegative affine coefficients: element zero is constant, remaining elements are
 // caller-selected leaves. Runtime range proofs must additionally exclude U32 wrap.
 template <size_t Size>
@@ -161,6 +207,9 @@ private:
 	bool EvaluatePhi(const Inst& inst, uint64_t& result);
 	bool EvaluateExtract(const Inst& inst, uint64_t& result);
 	bool EvaluateInst(const Inst& inst, uint64_t& result);
+	void     BarAssumptions(SrtWalker& walker) const;
+	uint32_t ClosedBallotIndex(const Inst& ballot);
+	void     ForgetLaneValues();
 	bool     EvaluateRule(const Inst& inst, uint64_t& result);
 
 	const ResourcePlan&              m_program;
@@ -176,6 +225,8 @@ private:
 	ResourcePlan::EvaluationContext& m_context;
 	SrtRefusal                       m_refusal = SrtRefusal::None;
 	// Loop-carried phi values a fixpoint trial takes on trust, and phis no walk here may assume.
+	InstValueMap m_assumed;
+	InstSet      m_barred;
 	// Set only inside a ballot's per-lane sweep; a flat-slot read or a readfirstlane suspends it.
 };
 

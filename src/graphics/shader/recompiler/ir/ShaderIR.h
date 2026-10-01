@@ -540,6 +540,20 @@ struct SrtRead {
 	bool operator==(const SrtRead& other) const = default;
 };
 
+// A store or atomic on a written buffer whose address operands the host can bound: immediates,
+// values it evaluates, compute invocation IDs, and a few integer operations on them.
+struct BufferWrite {
+	uint32_t buffer    = 0;
+	uint32_t immediate = 0;
+	Value    index;
+	Value    offset;
+	Value    soffset;
+	// The store's lane predicate: a select on it takes the stored lanes' operand.
+	Value    predicate;
+
+	bool operator==(const BufferWrite& other) const = default;
+};
+
 struct ResourceBlock {
 	// Conditional successors are ordered true, false; an empty condition follows every edge.
 	Value                 condition;
@@ -595,6 +609,9 @@ struct ResourcePlan {
 	std::vector<DescriptorSource>       descriptor_sources;
 	std::vector<ResourceBlock>          control_flow;
 	std::vector<SrtRead>                srt_reads;
+	// Per buffer of info.buffers: every store to it is in buffer_writes (bounded write extent).
+	std::vector<uint8_t>                buffer_writes_bounded;
+	std::vector<BufferWrite>            buffer_writes;
 	std::vector<uint8_t>                clean_flat_slots;
 	bool                                requires_specialization_memory = false;
 	bool                                capture_specialization_reads = false;

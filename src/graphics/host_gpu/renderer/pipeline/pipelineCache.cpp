@@ -470,6 +470,12 @@ struct PipelineCache::ProgramCache {
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		    .float_image_atomics        = Config::FloatImageAtomicsEnabled(),
 		};
+		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+			for (uint32_t axis = 0; axis < 3u; axis++) {
+				runtime.workgroup_count[axis] = input_info.dispatch_groups[axis];
+				runtime.workgroup_size[axis]  = input_info.threads_num[axis];
+			}
+		}
 		if (entry != programs.end()) {
 			if (!ShaderRecompiler::IR::MaterializeResources(
 			        entry->second.resource_plan, runtime, entry->second.resources,

@@ -647,7 +647,9 @@ static void ShaderGetStaticInputInfoCS(const HW::ComputeShaderInfo& regs,
 	const bool dispatch_thread_dimensions   = info.dispatch_thread_dimensions;
 	const bool dispatch_dimensions_indirect = info.dispatch_dimensions_indirect;
 	const auto host_subgroup_size           = info.host_subgroup_size;
+	const auto dispatch_groups              = std::to_array(info.dispatch_groups);
 	info                                    = {};
+	std::ranges::copy(dispatch_groups, info.dispatch_groups);
 	info.dispatch_thread_dimensions         = dispatch_thread_dimensions;
 	info.dispatch_dimensions_indirect       = dispatch_dimensions_indirect;
 	info.host_subgroup_size                 = host_subgroup_size;

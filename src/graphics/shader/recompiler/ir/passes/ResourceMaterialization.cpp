@@ -1045,6 +1045,73 @@ static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 	return result;
 }
 
+namespace {
+
+// Integer operations whose result interval follows from their operands' intervals (see
+// WriteInterval).
+bool IsIntervalOperation(ValueOpcode op) {
+	switch (op) {
+		case ValueOpcode::IAdd32:
+		case ValueOpcode::IMul32:
+		case ValueOpcode::ShiftLeftLogical32:
+		case ValueOpcode::ShiftRightLogical32:
+		case ValueOpcode::BitwiseAnd32:
+		case ValueOpcode::BitwiseOr32:
+		case ValueOpcode::UMin32:
+		case ValueOpcode::UMax32:
+		case ValueOpcode::BitFieldUExtract:
+		case ValueOpcode::SelectU32: return true;
+		default: return false;
+	}
+}
+
+bool IsBoundedInvocationId(const ResourcePlan& program, const Inst& inst) {
+	if (inst.GetOpcode() != ValueOpcode::GetBuiltin || program.stage != ShaderType::Compute ||
+	    !inst.Arg(0).IsImmediate() || !inst.Arg(1).IsImmediate() || inst.Arg(1).U32() >= 3u) {
+		return false;
+	}
+	switch (static_cast<StageInputKind>(inst.Arg(0).U32())) {
+		case StageInputKind::WorkgroupId:
+		case StageInputKind::LocalInvocationId:
+		case StageInputKind::LocalInvocationIndex:
+		case StageInputKind::GlobalInvocationId: return true;
+		default: return false;
+	}
+}
+
+// A store address operand the host can bound per dispatch: values it evaluates, compute invocation
+// IDs, and interval operations on them. The select on the store's own predicate only matters for
+// the stored lanes.
+bool BoundableWriteOperand(const Program& program, Value value, Value predicate, uint32_t depth) {
+	value = value.Resolve();
+	if (value.IsImmediate()) {
+		return value.GetType() == Type::U32;
+	}
+	const auto* inst = value.TryInstruction();
+	if (inst == nullptr || depth > 32u) {
+		return false;
+	}
+	if (IsBoundedInvocationId(program, *inst)) {
+		return true;
+	}
+	if (IsIntervalOperation(inst->GetOpcode())) {
+		if (inst->GetOpcode() == ValueOpcode::SelectU32 && inst->Arg(0).Resolve() == predicate) {
+			return BoundableWriteOperand(program, inst->Arg(1), predicate, depth + 1u);
+		}
+		const auto first = inst->GetOpcode() == ValueOpcode::SelectU32 ? 1u : 0u;
+		for (size_t i = first; i < inst->NumArgs(); ++i) {
+			if (!BoundableWriteOperand(program, inst->Arg(i), predicate, depth + 1u)) {
+				return false;
+			}
+		}
+		return true;
+	}
+	return value.GetType() == Type::U32 &&
+	       ValidateRuntimeValue(program, value, RuntimeValueType::Integer);
+}
+
+} // namespace
+
 ResourcePlan ExtractResourcePlan(const Program& program) {
 	ResourcePlan plan;
 	plan.stage                      = program.stage;
@@ -1148,8 +1215,228 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		plan.capture_specialization_reads =
 		    std::ranges::any_of(plan.info.buffers, &BufferResource::written);
 	}
+	// After the decisions above: the clones below must not count as the shader's own reads.
+	// Store addresses bound the bytes a dispatch writes: a title's heap-wide V# otherwise marks
+	// the whole heap GPU-written, and every CPU access to it drains the GPU.
+	const auto buffer_count = program.info.buffers.size();
+	plan.buffer_writes_bounded.assign(buffer_count, 1u);
+	std::vector<uint32_t> listed_writes(buffer_count, 0u);
+	for (uint32_t i = 0; i < buffer_count; ++i) {
+		if (program.info.buffers[i].image_alias != BufferResource::NoImageAlias) {
+			plan.buffer_writes_bounded[i] = 0u;
+		}
+	}
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			const auto access = BufferAccessOf(inst.GetOpcode());
+			if (access != BufferAccess::Write && access != BufferAccess::Atomic) {
+				continue;
+			}
+			const auto flags = inst.Flags<MemoryFlags>();
+			if (flags.index >= program.memory_info.size()) {
+				plan.buffer_writes_bounded.assign(buffer_count, 0u);
+				continue;
+			}
+			const auto& memory = program.memory_info[flags.index];
+			if (memory.kind != ResourceKind::Buffer || memory.resource >= buffer_count) {
+				continue;
+			}
+			const auto buffer = memory.resource;
+			if (plan.buffer_writes_bounded[buffer] == 0u) {
+				continue;
+			}
+			const auto predicate = inst.Arg(inst.NumArgs() - 1u).Resolve();
+			if (!BoundableWriteOperand(program, inst.Arg(1), predicate, 0u) ||
+			    !BoundableWriteOperand(program, inst.Arg(2), predicate, 0u) ||
+			    !BoundableWriteOperand(program, inst.Arg(3), predicate, 0u)) {
+				plan.buffer_writes_bounded[buffer] = 0u;
+				continue;
+			}
+			listed_writes[buffer]++;
+			plan.buffer_writes.push_back({.buffer    = buffer,
+			                              .immediate = memory.offset,
+			                              .index     = Clone(inst.Arg(1)),
+			                              .offset    = Clone(inst.Arg(2)),
+			                              .soffset   = Clone(inst.Arg(3)),
+			                              .predicate = Clone(predicate)});
+		}
+	}
+	for (uint32_t i = 0; i < buffer_count; ++i) {
+		if (listed_writes[i] == 0u) {
+			plan.buffer_writes_bounded[i] = 0u;
+		}
+	}
 	return plan;
 }
+
+namespace {
+
+struct WriteInterval {
+	uint64_t lo = 0;
+	uint64_t hi = 0;
+};
+
+// The unsigned 32-bit range a store address operand takes over the dispatch: invocation IDs range
+// over the workgroup count and size, everything else the host evaluates exactly. Fails on an
+// unknown dispatch size or a range that could wrap.
+bool EvaluateWriteInterval(const ResourcePlan& program, const SrtRuntime& runtime, SrtWalker& walker,
+                           Value value, Value predicate, WriteInterval& out, uint32_t& budget) {
+	constexpr uint64_t Max32 = UINT32_MAX;
+	if (budget == 0u) {
+		return false;
+	}
+	--budget;
+	value = value.Resolve();
+	if (value.IsImmediate()) {
+		if (value.GetType() != Type::U32) {
+			return false;
+		}
+		out = {value.U32(), value.U32()};
+		return true;
+	}
+	const auto* inst = value.TryInstruction();
+	if (inst == nullptr) {
+		return false;
+	}
+	if (IsBoundedInvocationId(program, *inst)) {
+		const auto  axis  = inst->Arg(1).U32();
+		const auto& count = runtime.workgroup_count;
+		const auto& size  = runtime.workgroup_size;
+		uint64_t    total = 0;
+		switch (static_cast<StageInputKind>(inst->Arg(0).U32())) {
+			case StageInputKind::WorkgroupId: total = count[axis]; break;
+			case StageInputKind::LocalInvocationId: total = size[axis]; break;
+			case StageInputKind::LocalInvocationIndex:
+				total = uint64_t {size[0]} * size[1] * size[2];
+				break;
+			case StageInputKind::GlobalInvocationId:
+				total = uint64_t {count[axis]} * size[axis];
+				break;
+			default: return false;
+		}
+		if (total == 0u || total - 1u > Max32) {
+			return false;
+		}
+		out = {0u, total - 1u};
+		return true;
+	}
+	const auto op = inst->GetOpcode();
+	if (!IsIntervalOperation(op)) {
+		uint32_t exact = 0;
+		if (!walker.Evaluate(value, exact)) {
+			return false;
+		}
+		out = {exact, exact};
+		return true;
+	}
+	if (op == ValueOpcode::SelectU32 && inst->Arg(0).Resolve() == predicate) {
+		return EvaluateWriteInterval(program, runtime, walker, inst->Arg(1), predicate, out, budget);
+	}
+	std::array<WriteInterval, 3> args {};
+	const size_t                 first = op == ValueOpcode::SelectU32 ? 1u : 0u;
+	if (inst->NumArgs() > args.size()) {
+		return false;
+	}
+	for (size_t i = first; i < inst->NumArgs(); ++i) {
+		if (!EvaluateWriteInterval(program, runtime, walker, inst->Arg(i), predicate, args[i],
+		                           budget)) {
+			return false;
+		}
+	}
+	const auto& a = args[0];
+	const auto& b = args[1];
+	switch (op) {
+		case ValueOpcode::IAdd32: out = {a.lo + b.lo, a.hi + b.hi}; break;
+		case ValueOpcode::IMul32: out = {a.lo * b.lo, a.hi * b.hi}; break;
+		case ValueOpcode::ShiftLeftLogical32:
+			if (b.hi > 31u) {
+				return false;
+			}
+			out = {a.lo << b.lo, a.hi << b.hi};
+			break;
+		case ValueOpcode::ShiftRightLogical32:
+			if (b.hi > 31u) {
+				return false;
+			}
+			out = {a.lo >> b.hi, a.hi >> b.lo};
+			break;
+		case ValueOpcode::BitwiseAnd32: out = {0u, std::min(a.hi, b.hi)}; break;
+		case ValueOpcode::BitwiseOr32: {
+			const auto high = std::max(a.hi, b.hi);
+			out = {std::max(a.lo, b.lo), (uint64_t {1} << std::bit_width(high)) - 1u};
+			break;
+		}
+		case ValueOpcode::UMin32: out = {std::min(a.lo, b.lo), std::min(a.hi, b.hi)}; break;
+		case ValueOpcode::UMax32: out = {std::max(a.lo, b.lo), std::max(a.hi, b.hi)}; break;
+		case ValueOpcode::BitFieldUExtract: {
+			// (base >> offset) masked to count bits: at most both.
+			if (b.hi > 31u) {
+				return false;
+			}
+			const auto& count = args[2];
+			const auto  mask  = count.hi >= 32u ? Max32 : (uint64_t {1} << count.hi) - 1u;
+			out               = {0u, std::min(mask, a.hi >> b.lo)};
+			break;
+		}
+		case ValueOpcode::SelectU32:
+			out = {std::min(args[1].lo, args[2].lo), std::max(args[1].hi, args[2].hi)};
+			break;
+		default: return false;
+	}
+	return out.hi <= Max32;
+}
+
+// See ResourceSnapshot::buffer_write_extents.
+void ComputeBufferWriteExtents(const ResourcePlan& program, const SrtRuntime& runtime,
+                               SrtWalker& walker, ResourceSnapshot& snapshot) {
+	snapshot.buffer_write_extents.assign(program.info.buffers.size(), {});
+	if (program.buffer_writes.empty()) {
+		return;
+	}
+	std::vector<uint8_t> failed(program.info.buffers.size(), 0u);
+	for (const auto& write: program.buffer_writes) {
+		if (write.buffer >= failed.size() || failed[write.buffer] != 0u) {
+			continue;
+		}
+		auto&                extent = snapshot.buffer_write_extents[write.buffer];
+		ShaderBufferResource descriptor;
+		WriteInterval        index;
+		WriteInterval        offset;
+		WriteInterval        soffset;
+		uint32_t             budget    = 1024u;
+		const auto           predicate = write.predicate.Resolve();
+		if (program.buffer_writes_bounded[write.buffer] == 0u ||
+		    !DecodeBufferDescriptor(snapshot.buffers[write.buffer], descriptor) ||
+		    descriptor.SwizzleEnabled() ||
+		    !EvaluateWriteInterval(program, runtime, walker, write.index, predicate, index, budget) ||
+		    !EvaluateWriteInterval(program, runtime, walker, write.offset, predicate, offset, budget) ||
+		    !EvaluateWriteInterval(program, runtime, walker, write.soffset, predicate, soffset,
+		                           budget)) {
+			failed[write.buffer] = 1u;
+			extent               = {};
+			continue;
+		}
+		if (descriptor.AddTid()) {
+			index.hi += 63u;
+		}
+		// PS5 ISA, buffer addressing: base + soffset + offset + index * stride, at most 16 bytes a
+		// store (dwordx4, format xyzw), and a store outside the descriptor's range is dropped.
+		const uint64_t stride = descriptor.Stride();
+		const uint64_t size   = descriptor.GetSize();
+		const uint64_t begin =
+		    std::min(index.lo * stride + offset.lo + soffset.lo + write.immediate, size);
+		const uint64_t end =
+		    std::min(index.hi * stride + offset.hi + soffset.hi + write.immediate + 16u, size);
+		if (!extent.valid) {
+			extent = {.begin = begin, .end = end, .valid = true};
+		} else {
+			extent.begin = std::min(extent.begin, begin);
+			extent.end   = std::max(extent.end, end);
+		}
+	}
+}
+
+} // namespace
 
 int LastIndirectImageFailureLine() {
 	return g_indirect_failure_line;
@@ -1216,6 +1503,15 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			DescriptorValue strict;
 			if (!clean.EvaluateDescriptor(buffer.source, strict) ||
 			    strict != snapshot.buffers[i]) return FailIndirect(__LINE__);
+		}
+	}
+	{
+		// Write extents only size the GPU-written range; their reads do not specialize the
+		// shader, so they stay out of the specialization-read proof.
+		const auto captured = reads.size();
+		ComputeBufferWriteExtents(program, observed, walker, snapshot);
+		if (capture_reads) {
+			reads.resize(captured);
 		}
 	}
 	snapshot.images.resize(program.info.images.size());

@@ -62,6 +62,12 @@ public:
 	                                                        bool     is_texel_buffer      = false,
 	                                                        BufferId id                   = {},
 	                                                        bool     needs_device_address = false);
+	// A written binding of which the shader's stores reach only [written_vaddr, written_vaddr +
+	// written_size): the whole range is synchronized, only that part becomes GPU-written.
+	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferWritten(uint64_t vaddr, uint64_t size,
+	                                                               uint64_t written_vaddr,
+	                                                               uint64_t written_size,
+	                                                               BufferId id = {});
 	[[nodiscard]] StreamBuffer&                GetUtilityBuffer(MemoryUsage usage) noexcept {
 		switch (usage) {
 			case MemoryUsage::Upload: return m_staging_buffer;
@@ -124,6 +130,8 @@ private:
 	using PageTable = MultiLevelPageTable<BufferId, CACHING_PAGEBITS, 44, 20>;
 	static_assert(CACHING_PAGESIZE == (uint64_t {1} << PageTable::kPageBits));
 	void WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source, uint64_t size);
+	// Records bytes a binding makes GPU-written (after SynchronizeBuffer marked their pages).
+	void MarkGpuWritten(uint64_t vaddr, uint64_t size);
 	void TouchBuffer(const Buffer& buffer);
 	[[nodiscard]] OverlapResult ResolveOverlaps(uint64_t vaddr, uint64_t size);
 	void JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumulate_stream_score);

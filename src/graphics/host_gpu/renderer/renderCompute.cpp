@@ -413,6 +413,17 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	ShaderComputeInputInfo input_info {};
 	const bool use_thread_dimensions      = (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
 	input_info.dispatch_thread_dimensions = use_thread_dimensions;
+	{
+		const std::array<uint32_t, 3> dispatched {thread_group_x, thread_group_y, thread_group_z};
+		const std::array<uint32_t, 3> group_size {cs_regs.cs_regs.num_thread_x,
+		                                          cs_regs.cs_regs.num_thread_y,
+		                                          cs_regs.cs_regs.num_thread_z};
+		for (uint32_t axis = 0; axis < 3u; axis++) {
+			const auto size = std::max(group_size[axis], 1u);
+			input_info.dispatch_groups[axis] =
+			    use_thread_dimensions ? (dispatched[axis] + size - 1u) / size : dispatched[axis];
+		}
+	}
 	const auto compute_program =
 	    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
 	if (!compute_program) {

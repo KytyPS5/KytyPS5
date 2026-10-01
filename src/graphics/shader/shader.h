@@ -167,6 +167,9 @@ struct ShaderVertexInputInfo {
 struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
 	uint8_t            float_mode                 = 0xc0;
 	uint32_t           dispatch_threads_num[3]    = {0, 0, 0};
+	// The workgroup count of a direct dispatch, zero when only the GPU knows it (indirect): it
+	// bounds the bytes the dispatch's buffer stores can write. Not part of the program key.
+	uint32_t           dispatch_groups[3]         = {0, 0, 0};
 	bool               group_id[3]                = {false, false, false};
 	bool               dispatch_thread_dimensions = false;
 	// DispatchThreadCount is read from GPU memory: the shader data holds the device address of

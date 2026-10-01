@@ -52,7 +52,19 @@ struct BindlessSamplerHeapUse {
 	bool operator==(const BindlessSamplerHeapUse&) const = default;
 };
 
+// The bytes of a written buffer a draw or dispatch can store to, relative to the descriptor's
+// base. Valid when every store's address is bounded by values the host knows; otherwise the
+// whole descriptor range counts as written.
+struct BufferWriteExtent {
+	uint64_t begin = 0;
+	uint64_t end   = 0;
+	bool     valid = false;
+
+	bool operator==(const BufferWriteExtent&) const = default;
+};
+
 struct ResourceSnapshot {
+	std::vector<BufferWriteExtent>      buffer_write_extents;
 	std::vector<BindlessHeapUse>        bindless_heaps;
 	std::vector<BindlessSamplerHeapUse> bindless_sampler_heaps;
 	std::vector<DescriptorValue> buffers;

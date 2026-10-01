@@ -591,10 +591,35 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	TouchBuffer(buffer);
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
-		std::unique_lock lock(m_dirty_ranges_mutex);
-		m_gpu_modified_ranges.Add(vaddr, size);
+		MarkGpuWritten(vaddr, size);
 	}
 	return {&buffer, buffer.Offset(vaddr)};
+}
+
+std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferWritten(uint64_t vaddr, uint64_t size,
+                                                              uint64_t written_vaddr,
+                                                              uint64_t written_size, BufferId id) {
+	auto& command = m_scheduler.Current();
+	if (command.IsInvalid() || !GuestRange {vaddr, size}.Valid() ||
+	    written_vaddr < vaddr || written_size > size || written_vaddr - vaddr > size - written_size) {
+		EXIT("BufferCache: invalid written-range buffer request\n");
+	}
+	if (IsBufferInvalid(id) || !m_slot_buffers[id].IsInBounds(vaddr, size)) {
+		id = FindBuffer(vaddr, size);
+	}
+	auto& buffer = m_slot_buffers[id];
+	TouchBuffer(buffer);
+	(void)SynchronizeBuffer(buffer, vaddr, size, false, false);
+	if (written_size != 0) {
+		(void)SynchronizeBuffer(buffer, written_vaddr, written_size, true, false);
+		MarkGpuWritten(written_vaddr, written_size);
+	}
+	return {&buffer, buffer.Offset(vaddr)};
+}
+
+void BufferCache::MarkGpuWritten(uint64_t vaddr, uint64_t size) {
+	std::unique_lock lock(m_dirty_ranges_mutex);
+	m_gpu_modified_ranges.Add(vaddr, size);
 }
 
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size) {

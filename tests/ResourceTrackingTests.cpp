@@ -1674,6 +1674,100 @@ void TestComputeBufferFill() {
   Run({.clean = true, .branch = true});
 }
 
+void TestBoundedBufferWrites() {
+  struct Options {
+    bool per_lane_index = false;
+    bool add_tid = false;
+    bool swizzle = false;
+    bool unknown_groups = false;
+  };
+  const auto Run = [](Options options) {
+    Fixture fixture;
+    fixture.program.block_info[0].terminator.kind =
+        Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::Return;
+    const auto buffer =
+        fixture.Buffer({fixture.UserData(0), fixture.UserData(1),
+                        fixture.UserData(2), fixture.UserData(3)});
+    const auto local = fixture.Emit(
+        ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)),
+         Value(0u)});
+    const auto group = fixture.Emit(
+        ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::WorkgroupId)), Value(0u)});
+    // CS 5e04a15a: index = (group << 6) + local + a constant.
+    Value index = fixture.Emit(
+        ValueOpcode::IAdd32,
+        {fixture.Emit(ValueOpcode::IAdd32,
+                      {fixture.Emit(ValueOpcode::ShiftLeftLogical32,
+                                    {group, Value(6u)}),
+                       local}),
+         fixture.UserData(4)});
+    if (options.per_lane_index) {
+      const auto table =
+          fixture.Buffer({fixture.UserData(5), fixture.UserData(6),
+                          fixture.UserData(7), fixture.UserData(8)}, 36);
+      MemoryInfo load;
+      load.kind = ResourceKind::Buffer;
+      load.offen = true;
+      index = fixture.Emit(ValueOpcode::LoadBufferU32,
+                           {table, Value(0u), local, Value(0u), Value(true)},
+                           fixture.AddMemory(load, 4));
+    }
+    const auto predicate =
+        fixture.Emit(ValueOpcode::ULessThan32, {local, Value(32u)});
+    // Lanes the predicate disables keep an unrelated value; they do not store.
+    const auto selected = fixture.Emit(ValueOpcode::SelectU32,
+                                       {predicate, index, Value(0xfffffff0u)});
+    MemoryInfo store;
+    store.kind = ResourceKind::Buffer;
+    store.formatted = true;
+    store.idxen = true;
+    fixture.Emit(ValueOpcode::StoreBufferU32,
+                 {buffer, selected, Value(0u), Value(0u), Value(0u), predicate},
+                 fixture.AddMemory(store, 16));
+    fixture.PlanAndTrack();
+    auto plan = ExtractResourcePlan(fixture.program);
+    std::array<uint32_t, 9> userdata{
+        0x200000u, (16u << 16u) | (options.swizzle ? 1u << 31u : 0u), 0x100000u,
+        0x14204u | (options.add_tid ? 1u << 23u : 0u), 100u,
+        0x300000u, 4u << 16u, 0x1000u, 0x14204u};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    SrtRuntime runtime{.user_data = userdata};
+    runtime.workgroup_count = {options.unknown_groups ? 0u : 4u, 1u, 1u};
+    runtime.workgroup_size = {64u, 1u, 1u};
+    Check(MaterializeResources(plan, runtime, snapshot, specialization),
+          "bounded-write fixture did not materialize");
+    const auto written = std::ranges::find_if(
+        fixture.program.info.buffers,
+        [](const BufferResource &resource) { return resource.written; });
+    Check(written != fixture.program.info.buffers.end(),
+          "bounded-write fixture lost its written buffer");
+    const auto index_of_written = static_cast<size_t>(
+        written - fixture.program.info.buffers.begin());
+    Check(snapshot.buffer_write_extents.size() ==
+              fixture.program.info.buffers.size(),
+          "buffer write extents do not cover every buffer");
+    const auto &extent = snapshot.buffer_write_extents[index_of_written];
+    const bool bounded =
+        !options.per_lane_index && !options.swizzle && !options.unknown_groups;
+    Check(extent.valid == bounded,
+          "a store address was bounded without a proof, or a provable one was not");
+    if (bounded) {
+      // Groups 0..3 of 64 lanes from index 100, 16-byte records, a 16-byte store at most.
+      const uint64_t last = 3u * 64u + 63u + 100u + (options.add_tid ? 63u : 0u);
+      Check(extent.begin == 100u * 16u && extent.end == last * 16u + 16u,
+            "bounded store extent is not the dispatch's index range");
+    }
+  };
+  Run({});
+  Run({.add_tid = true});
+  Run({.per_lane_index = true});
+  Run({.swizzle = true});
+  Run({.unknown_groups = true});
+}
+
 void TestDenseBufferTracking() {
   Fixture fixture;
   std::array<Value, 8> userdata;
@@ -3327,6 +3421,7 @@ int main() {
     };
     Run("dense buffers", TestDenseBufferTracking);
     Run("compute buffer fill", TestComputeBufferFill);
+    Run("bounded buffer writes", TestBoundedBufferWrites);
     Run("scalar/vector alias", TestScalarAndVectorBufferAlias);
     Run("runtime unsigned min", TestRuntimeUnsignedMinDescriptor);
     Run("images and samplers", TestImagesSamplersAndAliases);

@@ -2688,6 +2688,286 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  // Host occlusion queries behind ZPASS_DONE dumps: a full-screen triangle over a 64x64 render
+  // area without attachments passes 4096 samples, an empty draw none, and a query reads the samples
+  // between its dumps whether they are inside or outside render pass instances.
+  void CheckOcclusionQueries() {
+    constexpr const char *name = "OcclusionQueries";
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &queries = context.GetOcclusionQueries();
+    if (!queries.Enabled()) {
+      std::printf("[host]    %-32s skipped (no host queries)\n", name);
+      return;
+    }
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+
+    const char *vertex_text = R"(
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint Vertex %main "main" %vid %pos
+               OpDecorate %vid BuiltIn VertexIndex
+               OpDecorate %pos BuiltIn Position
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+        %int = OpTypeInt 32 1
+      %float = OpTypeFloat 32
+         %v4 = OpTypeVector %float 4
+       %pint = OpTypePointer Input %int
+        %pv4 = OpTypePointer Output %v4
+        %vid = OpVariable %pint Input
+        %pos = OpVariable %pv4 Output
+         %i1 = OpConstant %int 1
+         %f4 = OpConstant %float 4
+         %f1 = OpConstant %float 1
+        %fm1 = OpConstant %float -1
+         %f0 = OpConstant %float 0
+       %main = OpFunction %void None %fn
+      %label = OpLabel
+          %v = OpLoad %int %vid
+          %a = OpBitwiseAnd %int %v %i1
+          %b = OpShiftRightArithmetic %int %v %i1
+         %af = OpConvertSToF %float %a
+         %bf = OpConvertSToF %float %b
+         %x0 = OpFMul %float %af %f4
+         %y0 = OpFMul %float %bf %f4
+          %x = OpFAdd %float %x0 %fm1
+          %y = OpFAdd %float %y0 %fm1
+          %p = OpCompositeConstruct %v4 %x %y %f0 %f1
+               OpStore %pos %p
+               OpReturn
+               OpFunctionEnd
+)";
+    spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+    std::vector<u32> vertex_spirv;
+    Require(name, "assemble", tools.Assemble(vertex_text, &vertex_spirv),
+            "vertex shader assembly failed");
+    vk::ShaderModuleCreateInfo module_info{};
+    module_info.sType = vk::StructureType::eShaderModuleCreateInfo;
+    module_info.codeSize = vertex_spirv.size() * sizeof(u32);
+    module_info.pCode = vertex_spirv.data();
+    vk::ShaderModule vertex_module = nullptr;
+    RequireVk(name, "module",
+              m_device.createShaderModule(&module_info, nullptr, &vertex_module),
+              "vkCreateShaderModule");
+    vk::PipelineLayoutCreateInfo layout_info{};
+    layout_info.sType = vk::StructureType::ePipelineLayoutCreateInfo;
+    vk::PipelineLayout pipeline_layout = nullptr;
+    RequireVk(name, "layout",
+              m_device.createPipelineLayout(&layout_info, nullptr, &pipeline_layout),
+              "vkCreatePipelineLayout");
+    vk::PipelineShaderStageCreateInfo stage{};
+    stage.sType = vk::StructureType::ePipelineShaderStageCreateInfo;
+    stage.stage = vk::ShaderStageFlagBits::eVertex;
+    stage.module = vertex_module;
+    stage.pName = "main";
+    vk::PipelineVertexInputStateCreateInfo vertex_input{};
+    vertex_input.sType = vk::StructureType::ePipelineVertexInputStateCreateInfo;
+    vk::PipelineInputAssemblyStateCreateInfo input_assembly{};
+    input_assembly.sType = vk::StructureType::ePipelineInputAssemblyStateCreateInfo;
+    input_assembly.topology = vk::PrimitiveTopology::eTriangleList;
+    constexpr uint32_t size = 64;
+    vk::Viewport viewport{0.0f, 0.0f, static_cast<float>(size), static_cast<float>(size),
+                          0.0f, 1.0f};
+    vk::Rect2D scissor{{0, 0}, {size, size}};
+    vk::PipelineViewportStateCreateInfo viewport_state{};
+    viewport_state.sType = vk::StructureType::ePipelineViewportStateCreateInfo;
+    viewport_state.viewportCount = 1;
+    viewport_state.pViewports = &viewport;
+    viewport_state.scissorCount = 1;
+    viewport_state.pScissors = &scissor;
+    vk::PipelineRasterizationStateCreateInfo raster{};
+    raster.sType = vk::StructureType::ePipelineRasterizationStateCreateInfo;
+    raster.polygonMode = vk::PolygonMode::eFill;
+    raster.cullMode = vk::CullModeFlagBits::eNone;
+    raster.lineWidth = 1.0f;
+    vk::PipelineMultisampleStateCreateInfo multisample{};
+    multisample.sType = vk::StructureType::ePipelineMultisampleStateCreateInfo;
+    multisample.rasterizationSamples = vk::SampleCountFlagBits::e1;
+    vk::PipelineRenderingCreateInfo rendering_pipeline{};
+    rendering_pipeline.sType = vk::StructureType::ePipelineRenderingCreateInfo;
+    vk::GraphicsPipelineCreateInfo pipeline_info{};
+    pipeline_info.sType = vk::StructureType::eGraphicsPipelineCreateInfo;
+    pipeline_info.pNext = &rendering_pipeline;
+    pipeline_info.stageCount = 1;
+    pipeline_info.pStages = &stage;
+    pipeline_info.pVertexInputState = &vertex_input;
+    pipeline_info.pInputAssemblyState = &input_assembly;
+    pipeline_info.pViewportState = &viewport_state;
+    pipeline_info.pRasterizationState = &raster;
+    pipeline_info.pMultisampleState = &multisample;
+    pipeline_info.layout = pipeline_layout;
+    vk::Pipeline pipeline = nullptr;
+    RequireVk(name, "pipeline",
+              m_device.createGraphicsPipelines(nullptr, 1, &pipeline_info, nullptr,
+                                               &pipeline),
+              "vkCreateGraphicsPipelines");
+
+    RenderState state{};
+    state.width = size;
+    state.height = size;
+    // Guest counters: one 256-byte block per query.
+    alignas(64) static std::array<uint64_t, 32 * 4> counters{};
+    counters.fill(0);
+    const auto block = [](uint32_t query) {
+      return reinterpret_cast<uint64_t>(counters.data() + query * 32u);
+    };
+    const auto read = [&](uint32_t query, uint64_t &samples) {
+      samples = 0;
+      const auto *words = counters.data() + query * 32u;
+      for (uint32_t db = 0; db < 16; db++) {
+        const auto begin = words[db * 2u];
+        const auto end = words[db * 2u + 1u];
+        if ((begin & end & (uint64_t{1} << 63u)) == 0) {
+          return false;
+        }
+        samples += end - begin;
+      }
+      return true;
+    };
+    auto &command = scheduler.Current();
+    const auto draw = [&](uint32_t vertices) {
+      command.Handle().bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
+      command.Handle().draw(vertices, 1, 0, 0);
+    };
+    // 0: dumps outside rendering around one full draw.
+    queries.Dump(scheduler, block(0));
+    command.BeginRendering(state);
+    draw(3);
+    command.EndRendering();
+    queries.Dump(scheduler, block(0) + 8u);
+    // 1: dumps inside rendering around an empty draw.
+    command.BeginRendering(state);
+    queries.Dump(scheduler, block(1));
+    draw(0);
+    queries.Dump(scheduler, block(1) + 8u);
+    // 2: two render pass instances; 3 nests inside 2 around the second one.
+    queries.Dump(scheduler, block(2));
+    draw(3);
+    command.EndRendering();
+    queries.Dump(scheduler, block(3));
+    command.BeginRendering(state);
+    draw(3);
+    command.EndRendering();
+    queries.Dump(scheduler, block(3) + 8u);
+    queries.Dump(scheduler, block(2) + 8u);
+    uint64_t samples = 0;
+    Require(name, "pending", queries.HasPendingDumps() && !read(0, samples),
+            "counters were published before the GPU finished");
+    const auto dump_tick = scheduler.CurrentTick();
+    scheduler.Finish();
+    // As on the console, the counters reach guest memory once the GPU got past the dumps,
+    // without a frame boundary or a later dump: a completion queued with each dump writes them.
+    scheduler.WaitPriorityOperations(dump_tick);
+    Require(name, "published", !queries.HasPendingDumps(),
+            "a dump did not reach guest memory after the GPU finished");
+    const uint64_t full = uint64_t{size} * size;
+    // Without precise queries Vulkan only guarantees a nonzero count for visible samples.
+    const auto visible = [&](uint64_t count, uint64_t expected) {
+      return m_occlusion_query_precise ? count == expected : count != 0;
+    };
+    Require(name, "full draw", read(0, samples) && visible(samples, full),
+            "full-screen draw: " + std::to_string(samples));
+    Require(name, "empty draw", read(1, samples) && samples == 0,
+            "empty draw: " + std::to_string(samples));
+    Require(name, "two render passes", read(2, samples) && visible(samples, 2 * full),
+            "two render passes: " + std::to_string(samples));
+    Require(name, "nested", read(3, samples) && visible(samples, full),
+            "nested query: " + std::to_string(samples));
+    // The counters of a frame reach guest memory by the next frame's flip, also when the GPU
+    // has not run them by then.
+    counters.fill(0);
+    queries.Dump(scheduler, block(0));
+    command.BeginRendering(state);
+    draw(3);
+    command.EndRendering();
+    queries.Dump(scheduler, block(0) + 8u);
+    queries.OnFrame();
+    Require(name, "own flip", queries.HasPendingDumps(),
+            "counters were published at the flip of their frame before the GPU ran them");
+    queries.OnFrame();
+    Require(name, "next flip",
+            !queries.HasPendingDumps() && read(0, samples) && visible(samples, full),
+            "counters were not published by the next frame's flip: " + std::to_string(samples));
+    scheduler.Shutdown();
+    m_device.destroyPipeline(pipeline, nullptr);
+    m_device.destroyPipelineLayout(pipeline_layout, nullptr);
+    m_device.destroyShaderModule(vertex_module, nullptr);
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // A ZPASS predication that waits (wait_op 0) for host occlusion results the GPU has not
+  // produced yet: the command processor suspends, asks the execution thread to finish the GPU
+  // work, and resumes with the real count (no draws: the predicated packet is skipped).
+  void CheckOcclusionPredicationWait() {
+    constexpr const char *name = "OcclusionPredicationWait";
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    if (!context.GetOcclusionQueries().Enabled()) {
+      std::printf("[host]    %-32s skipped (no host queries)\n", name);
+      return;
+    }
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    auto &gpu = context.GetGpu();
+
+    alignas(64) static std::array<uint64_t, 32> counters{};
+    counters.fill(0);
+    alignas(16) static uint32_t skipped = 0;
+    alignas(16) static uint32_t after = 0;
+    skipped = 0;
+    after = 0;
+    const auto write = [](uint32_t *packet, uint32_t *destination, uint32_t value,
+                          bool predicated = false) {
+      const auto address = reinterpret_cast<uint64_t>(destination);
+      packet[0] = KYTY_PM4(5, Pm4::IT_WRITE_DATA, 0) | uint32_t{predicated};
+      packet[1] = 0;
+      packet[2] = static_cast<uint32_t>(address);
+      packet[3] = static_cast<uint32_t>(address >> 32u);
+      packet[4] = value;
+    };
+    const auto zpass = [](uint32_t *packet, uint64_t address) {
+      packet[0] = KYTY_PM4(4, Pm4::IT_EVENT_WRITE, Pm4::R_ZERO);
+      packet[1] = 0x00000139u;
+      packet[2] = static_cast<uint32_t>(address);
+      packet[3] = static_cast<uint32_t>(address >> 32u);
+    };
+    const auto base = reinterpret_cast<uint64_t>(counters.data());
+    static std::array<uint32_t, 22> packets{};
+    zpass(packets.data(), base);
+    zpass(packets.data() + 4, base + 8u);
+    // Draw if visible (condition 1), wait for the result (wait_op 0), ZPASS op 1.
+    packets[8] = KYTY_PM4(4, Pm4::IT_SET_PREDICATION, 0);
+    packets[9] = (1u << 16u) | (1u << 8u);
+    packets[10] = static_cast<uint32_t>(base);
+    packets[11] = static_cast<uint32_t>(base >> 32u);
+    write(packets.data() + 12, &skipped, 11, true);
+    write(packets.data() + 17, &after, 22);
+    gpu.Submit(packets);
+    bool done = false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    do {
+      gpu.SendCommandSync([&] { done = after == 22; });
+      std::this_thread::yield();
+    } while (!done && std::chrono::steady_clock::now() < deadline);
+    // A predication that never resumes keeps the submission pending: fail before waiting for it.
+    Require(name, "resume", done, "the predication never saw the host query result");
+    gpu.WaitForIdle();
+    gpu.SendCommandSync([&] { scheduler.Finish(); });
+    Require(name, "occluded", skipped == 0,
+            "a query without draws did not skip its predicated packet");
+    context.ShutdownGpu();
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   void CheckSchedulerTimeline() {
     EnsureRuntimeContext();
     CommandScheduler scheduler(Renderer(), m_runtime_context);
@@ -24150,6 +24430,8 @@ public:
 
 private:
   bool m_rasterization_supported = true;
+  bool m_host_query_reset = false;
+  bool m_occlusion_query_precise = false;
   u32   m_skipped_cases          = 0;
 
   RenderContext &Renderer() {
@@ -24200,6 +24482,8 @@ private:
     m_runtime_context.provoking_vertex_last_enabled = m_rasterization_supported;
     m_runtime_context.mesh_shader_enabled = true;
     m_runtime_context.subgroup_size = SubgroupSize();
+    m_runtime_context.occlusion_queries_enabled = m_host_query_reset;
+    m_runtime_context.occlusion_query_precise_enabled = m_occlusion_query_precise;
     const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info{
         .format = vk::Format::eBc1RgbaUnormBlock,
         .type = vk::ImageType::e2D,
@@ -24368,6 +24652,8 @@ private:
     m_physical_device.getProperties2(&properties2);
     Require("VulkanHarness", "dispatch", available_robustness2.nullDescriptor == true,
             "null descriptors are not supported");
+    m_host_query_reset = available_features12.hostQueryReset == VK_TRUE;
+    m_occlusion_query_precise = available_features.occlusionQueryPrecise == VK_TRUE;
     Require("VulkanHarness", "dispatch",
             available_robustness2.robustBufferAccess2 == true &&
                 available_pipeline_robustness.pipelineRobustness == true &&
@@ -24458,6 +24744,7 @@ private:
     auto device_features12 = WindowContext::RequiredVulkan12Features();
     device_features12.shaderSharedInt64Atomics = true;
     device_features12.samplerFilterMinmax = true;
+    device_features12.hostQueryReset = available_features12.hostQueryReset;
     vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR workgroup_layout{};
     workgroup_layout.workgroupMemoryExplicitLayout = true;
     device_features12.pNext = &device_features11;
@@ -24536,6 +24823,7 @@ private:
     device_features.shaderInt64 = true;
     device_features.shaderFloat64 = available_features.shaderFloat64;
     device_features.fillModeNonSolid = m_rasterization_supported;
+    device_features.occlusionQueryPrecise = available_features.occlusionQueryPrecise;
     device_features.tessellationShader = m_rasterization_supported;
     device_features.drawIndirectFirstInstance = m_rasterization_supported;
     device_features.multiDrawIndirect = m_rasterization_supported;
@@ -54553,6 +54841,30 @@ void CheckPm4SyntheticOcclusionCounterDump(RenderContext &renderer) {
     return processor.Process(execution, packet);
   };
 
+  if (renderer.GetOcclusionQueries().Enabled()) {
+    // Host queries: the counters reach guest memory once the GPU finished, and a query
+    // without draws between its dumps reads occluded.
+    const bool begin_ok = dump(&results[0][0]) == Pm4ProcessResult::Complete;
+    const bool end_ok = dump(&results[0][1]) == Pm4ProcessResult::Complete;
+    bool deferred = begin_ok && end_ok;
+    for (const auto &pair : results) {
+      deferred &= pair[0] == untouched && pair[1] == untouched;
+    }
+    renderer.GetCommandScheduler().Finish();
+    renderer.GetOcclusionQueries().PublishCompleted(true);
+    bool published = !renderer.GetOcclusionQueries().HasPendingDumps();
+    uint64_t samples = 0;
+    for (const auto &pair : results) {
+      published &= (pair[0] & pair[1] & ready_bit) != 0;
+      samples += pair[1] - pair[0];
+    }
+    Require("Pm4SyntheticOcclusionCounterDump", "host query result",
+            deferred && published && samples == 0,
+            "EVENT_WRITE did not publish host occlusion counters once the GPU finished");
+    std::printf("[host]    %-32s ok\n", "Pm4SyntheticOcclusionCounterDump");
+    return;
+  }
+
   const auto begin_result = dump(&results[0][0]);
   bool begin_written = begin_result == Pm4ProcessResult::Complete;
   for (const auto &pair : results) {
@@ -56347,10 +56659,11 @@ void CheckComputeDerivativesDevice() {
   std::printf("[host]    %-32s ok\n", name);
 }
 
-// A flip block copies GPU-written storage images back, publishes the dumped
-// occlusion counters, then flips; a wait for a shown buffer names it by its
-// label and returns once its flip is presented, and a blank one waits for
-// nothing.
+// A flip block copies GPU-written storage images back, then flips (the fork
+// publishes the dumped occlusion counters once the GPU finished their queries,
+// by the next frame's flip, so they are not checked); a wait for a shown
+// buffer names it by its label and returns once its flip is presented, and a
+// blank one waits for nothing.
 void CheckPm4Flip() {
   namespace EventQueue = LibKernel::EventQueue;
   constexpr const char *name = "Pm4Flip";
@@ -56396,7 +56709,7 @@ void CheckPm4Flip() {
   const auto image_base = reinterpret_cast<uint64_t>(image_memory);
   renderer.MapMemory(image_base, image_size);
 
-  alignas(16) std::array<uint64_t, OCCLUSION_QUERY_DBS * 2> results{};
+  alignas(16) std::array<uint64_t, 32> results{};
   constexpr int64_t flip_arg = 0x123456789ll;
   std::array<uint32_t, 8 + 64 + 32 + 32> commands{};
   const auto dump = [&](size_t at, const uint64_t *counter) {
@@ -56454,7 +56767,6 @@ void CheckPm4Flip() {
               blank[14] == 0xcb00003fu,
           "the flip or wait packets are not the native ones");
   bool complete = false;
-  bool published = true;
   bool queued = false;
   bool copied = false;
   gpu.SendCommandSync([&] {
@@ -56481,9 +56793,6 @@ void CheckPm4Flip() {
     Pm4Execution execution;
     complete =
         processor.Process(execution, commands) == Pm4ProcessResult::Complete;
-    for (const auto counter : results) {
-      published &= (counter & OCCLUSION_QUERY_READY) != 0;
-    }
     copied = !TextureCacheTestAccess::PendingDownload(texture_cache, image);
     processor.BufferFlush();
   });
@@ -56510,13 +56819,13 @@ void CheckPm4Flip() {
   LibKernel::KernelUseconds timeout = 2'000'000;
   int64_t flipped_arg = -1;
   Require(name, "flip",
-          complete && published &&
+          complete &&
               EventQueue::KernelWaitEqueue(flips, &event, 1, &count,
                                            &timeout) == 0 &&
               count == 1 &&
               VideoOut::VideoOutGetEventData(&event, &flipped_arg) == 0 &&
               flipped_arg == flip_arg,
-          "the flip block did not publish the occlusion counters or flip");
+          "the flip block did not flip");
 
   // A compute queue's flip clears R and releases at the end of the shader.
   constexpr int64_t compute_arg = flip_arg + 1;
@@ -57734,6 +58043,12 @@ int main(int argc, char **argv) {
     CheckReferenceClockScale();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--occlusion-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckOcclusionQueries();
+    vulkan.CheckOcclusionPredicationWait();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--scheduler-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckSchedulerTimeline();
@@ -58494,6 +58809,8 @@ int main(int argc, char **argv) {
   vulkan.CheckCubeFaceStorage();
   if (rasterization) {
     vulkan.CheckGraphicsPushConstantBank();
+    vulkan.CheckOcclusionQueries();
+    vulkan.CheckOcclusionPredicationWait();
     vulkan.CheckRenderExecutorColorDiscovery();
     vulkan.CheckRenderExecutorColor1DArrayDiscovery();
     vulkan.CheckColorResolvePlacedTarget();

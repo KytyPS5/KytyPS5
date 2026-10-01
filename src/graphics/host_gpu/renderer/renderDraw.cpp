@@ -1528,6 +1528,8 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		task_params  = stream.BufferDeviceAddress() + stream.Copy(&params, sizeof(params), 8);
 	}
 
+	// Occlusion counters of the command buffer under the ranges the draw reads.
+	m_context.GetOcclusionQueries().WriteForReaders();
 	// Resource preparation above may synchronously finish and restart the scheduler. From this
 	// point onward, every operation targets the current command buffer and cannot touch guest
 	// memory.
@@ -1588,8 +1590,6 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	}
 	buffer.BeginRendering(rendering);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
-	auto&         occlusion_queries = m_context.GetOcclusionQueries();
-	const int32_t occlusion_query   = occlusion_queries.Begin(vk_buffer);
 	if (mesh_task) {
 		vk_buffer.drawMeshTasksEXT(emit.indirect.count, 1, 1);
 	} else if (mesh_active) {
@@ -1603,7 +1603,6 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		vk_buffer.drawIndirect(args_buffer.first->Handle(), args_buffer.second,
 		                       emit.indirect.count, emit.indirect.stride);
 	}
-	occlusion_queries.End(vk_buffer, occlusion_query);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Draws);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::DrawInstances, draw.instance_count);
 

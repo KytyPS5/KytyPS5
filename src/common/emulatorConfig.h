@@ -110,7 +110,7 @@ struct ConfigOptions {
 	bool                   sync_raw_image_buffers      = false;
 	uint32_t               flush_draws                 = 0; // 0 is off
 	bool                   tessellation_enabled        = false;
-	bool                   occlusion_queries_enabled   = false;
+	bool                   occlusion_queries_enabled   = true;
 	bool                   relaxed_shader_float        = false;
 	bool                   native_rt                   = false;
 	bool                   lod_stats_enabled           = false;

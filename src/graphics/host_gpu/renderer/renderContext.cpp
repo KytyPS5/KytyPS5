@@ -5,6 +5,8 @@
 #include "common/emulatorConfig.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/presentation/videoOut.h"
+#include "graphics/shader/shaderBindings.h"
+#include "kernel/memory.h"
 #include "libs/errno.h"
 
 #include <algorithm>
@@ -19,7 +21,7 @@ RenderContext::RenderContext(GraphicContext& graphics, const std::filesystem::pa
       m_pipeline_cache(graphics, &m_image_heap, shader_store), m_sampler_cache(graphics),
       m_buffer_cache(graphics, m_command_scheduler, m_page_manager, m_texture_cache),
       m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache),
-      m_image_heap(*this, m_page_manager), m_occlusion_queries(graphics, m_command_scheduler) {
+      m_image_heap(*this, m_page_manager) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	if (graphics.ray_query_enabled) {
 		m_ray_tracing = std::make_unique<RayTracing>(*this);
@@ -101,6 +103,65 @@ bool RenderContext::WaitWriteBacks(uint64_t vaddr, uint64_t size) {
 	return true;
 }
 
+void RenderContext::WriteFromCompletion(void* destination, const void* data,
+                                        uint64_t size) noexcept {
+	const auto vaddr = reinterpret_cast<uint64_t>(destination);
+	// Through the backing store the bytes never fault, even on a page the execution thread
+	// hands back to the GPU while the completion runs. The caches then learn of the write as from
+	// a write fault, except that pages the GPU owns stay GPU-owned (a readback of them downloads
+	// only the bytes the GPU wrote).
+	if (GuestRange {vaddr, size}.Valid() && LibKernel::Memory::TryWriteBacking(vaddr, data, size)) {
+		const auto page_size = TRACKER_PAGE_SIZE;
+		for (auto page = vaddr & ~(page_size - 1); page < vaddr + size; page += page_size) {
+			if (m_page_manager.IsWatched(page)) {
+				m_buffer_cache.InvalidateUnlessGpuModified(vaddr, size);
+				m_texture_cache.InvalidateMemory(vaddr, size);
+				m_image_heap.InvalidateMemory(vaddr, size);
+				break;
+			}
+		}
+		return;
+	}
+	if (size == sizeof(uint32_t)) {
+		uint32_t value = 0;
+		std::memcpy(&value, data, sizeof(value));
+		*static_cast<volatile uint32_t*>(destination) = value;
+	} else if (size == sizeof(uint64_t)) {
+		uint64_t value = 0;
+		std::memcpy(&value, data, sizeof(value));
+		*static_cast<volatile uint64_t*>(destination) = value;
+	} else {
+		std::memcpy(destination, data, size);
+	}
+}
+
+void RenderContext::WriteQwordsFromCompletion(void* destination, const uint64_t* values,
+                                              uint32_t count, uint64_t stride) noexcept {
+	const auto vaddr = reinterpret_cast<uint64_t>(destination);
+	if (count == 0) {
+		return;
+	}
+	const auto size = uint64_t {count - 1u} * stride + sizeof(uint64_t);
+	// One lookup of the backing store for all of them; the caches learn of each write as in
+	// WriteFromCompletion().
+	if (GuestRange {vaddr, size}.Valid() &&
+	    LibKernel::Memory::TryWriteBackingQwords(vaddr, values, count, stride)) {
+		for (uint32_t i = 0; i < count; i++) {
+			const auto address = vaddr + i * stride;
+			if (m_page_manager.IsWatched(address & ~(TRACKER_PAGE_SIZE - 1))) {
+				m_buffer_cache.InvalidateUnlessGpuModified(address, sizeof(uint64_t));
+				m_texture_cache.InvalidateMemory(address, sizeof(uint64_t));
+				m_image_heap.InvalidateMemory(address, sizeof(uint64_t));
+			}
+		}
+		return;
+	}
+	for (uint32_t i = count; i-- > 0;) {
+		WriteFromCompletion(static_cast<uint8_t*>(destination) + i * stride, &values[i],
+		                    sizeof(uint64_t));
+	}
+}
+
 void RenderContext::PrepareGpuWrite(const void* destination, uint64_t size) noexcept {
 	const auto vaddr     = reinterpret_cast<uint64_t>(destination);
 	const auto page_size = TRACKER_PAGE_SIZE;
@@ -175,6 +236,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		m_buffer_cache.InvalidateMemory(vaddr, size);
 		m_texture_cache.UnmapMemory(vaddr, size);
 		m_image_heap.UnmapMemory(vaddr, size);
+		m_occlusion_queries.OnUnmap(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
 		m_mapped_ranges_version++;

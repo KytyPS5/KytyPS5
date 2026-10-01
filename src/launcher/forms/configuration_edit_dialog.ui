@@ -187,7 +187,7 @@
             </item>
             <item row="9" column="1">
              <widget class="QCheckBox" name="checkBox_occlusion_queries">
-              <property name="toolTip"><string>Count the samples of occlusion queries on the GPU, so hidden lights and objects stay hidden. Costs some performance.</string></property>
+              <property name="toolTip"><string>Count the samples of occlusion queries on the GPU, so hidden lights and objects stay hidden (GTA V&apos;s sun flare and light glows).</string></property>
               <property name="text"><string>Enable occlusion queries</string></property>
              </widget>
             </item>

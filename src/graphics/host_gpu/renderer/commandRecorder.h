@@ -262,6 +262,33 @@ public:
 		m_stream->Record([](vk::CommandBuffer c) { c.endRendering(); });
 	}
 
+	void beginQuery(vk::QueryPool pool, uint32_t query, vk::QueryControlFlags flags) const {
+		if (m_stream == nullptr) {
+			m_direct.beginQuery(pool, query, flags);
+			return;
+		}
+		m_stream->Record([=](vk::CommandBuffer c) { c.beginQuery(pool, query, flags); });
+	}
+	void endQuery(vk::QueryPool pool, uint32_t query) const {
+		if (m_stream == nullptr) {
+			m_direct.endQuery(pool, query);
+			return;
+		}
+		m_stream->Record([=](vk::CommandBuffer c) { c.endQuery(pool, query); });
+	}
+
+	void copyQueryPoolResults(vk::QueryPool pool, uint32_t first, uint32_t count, vk::Buffer buffer,
+	                          vk::DeviceSize offset, vk::DeviceSize stride,
+	                          vk::QueryResultFlags flags) const {
+		if (m_stream == nullptr) {
+			m_direct.copyQueryPoolResults(pool, first, count, buffer, offset, stride, flags);
+			return;
+		}
+		m_stream->Record([=](vk::CommandBuffer c) {
+			c.copyQueryPoolResults(pool, first, count, buffer, offset, stride, flags);
+		});
+	}
+
 	void dispatch(uint32_t x, uint32_t y, uint32_t z) const {
 		if (m_stream == nullptr) {
 			m_direct.dispatch(x, y, z);

@@ -603,7 +603,8 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 		graphics.physical_device_properties.limits.storageImageSampleCounts =
 		    vk::SampleCountFlagBits::e1;
 	}
-	// Occlusion queries reset their queries from the host and count samples exactly where they can.
+	// Host occlusion queries back the guest's ZPASS_DONE counters: exact sample counts, and slots
+	// reset from the host once their results were read.
 	graphics.occlusion_queries_enabled =
 	    Config::OcclusionQueriesEnabled() && supported12.hostQueryReset;
 	graphics.occlusion_query_precise_enabled =

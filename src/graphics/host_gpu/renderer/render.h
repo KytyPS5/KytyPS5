@@ -130,6 +130,7 @@ public:
 
 	void BeginRendering(const RenderState& state) const;
 	void EndRendering() const;
+	[[nodiscard]] bool IsRendering() const noexcept { return m_rendering; }
 
 	[[nodiscard]] CommandRecorder Handle() const;
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }

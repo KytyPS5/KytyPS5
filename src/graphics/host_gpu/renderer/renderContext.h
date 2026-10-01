@@ -62,6 +62,26 @@ public:
 	// Before the emulated GPU writes guest memory (labels, WRITE_DATA): resolves a tracked page
 	// as its write fault would, without raising the exception.
 	void PrepareGpuWrite(const void* destination, uint64_t size) noexcept;
+	// A completion's store of guest memory (labels, query results). A completion cannot read
+	// memory back and later GPU work may own the page again at any moment, so the bytes go
+	// through the backing store, which never faults; the caches then treat it as a CPU write,
+	// except on pages the GPU owns.
+	void WriteFromCompletion(void* destination, const void* data, uint64_t size) noexcept;
+	// WriteFromCompletion() of values[i] at destination + i * stride (8-byte aligned qwords),
+	// values[0] last.
+	void WriteQwordsFromCompletion(void* destination, const uint64_t* values, uint32_t count,
+	                               uint64_t stride) noexcept;
+	// Execution thread, before each operation (see PrepareBda()).
+	void NoteOperation(uint64_t submit_id, bool after_wait) noexcept {
+		if (submit_id != m_bda_submit || after_wait) {
+			m_bda_submit = submit_id;
+			m_bda_generation++;
+		}
+	}
+	// A small command-processor write that GPU-owned pages would turn into a readback of all
+	// queued GPU work (see BufferCache::WriteAroundGpuWrites()); false when the caller must
+	// PrepareGpuWrite() and store the bytes itself.
+	[[nodiscard]] bool WriteAroundGpuWrites(void* destination, const void* data, uint64_t size);
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsMapped(uint64_t vaddr, uint64_t size) const noexcept;
 	// Advances whenever a range is mapped or unmapped.
@@ -96,8 +116,8 @@ private:
 	BufferCache               m_buffer_cache;
 	TextureCache              m_texture_cache;
 	ImageHeap                 m_image_heap;
-	OcclusionQueries          m_occlusion_queries;
 	IndirectWriteTables       m_indirect_write_tables {*this};
+	OcclusionQueries          m_occlusion_queries {*this};
 	mutable std::shared_mutex m_mapped_ranges_mutex;
 	RangeSet                  m_mapped_ranges;
 	uint64_t                  m_mapped_ranges_version = 0;

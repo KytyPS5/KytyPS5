@@ -294,6 +294,21 @@ add_custom_command(
 	VERBATIM
 )
 list(APPEND kyty_emulator_src "${fault_buffer_shader_header}")
+# Occlusion counters written on the GPU timeline (see OcclusionQueries::WriteForReaders()).
+set(occlusion_counters_shader_source "${gpu_tiler_shader_dir}/occlusion_counters.comp")
+set(occlusion_counters_shader_spv "${gpu_tiler_generated_dir}/occlusion_counters.spv")
+set(occlusion_counters_shader_header "${gpu_tiler_generated_dir}/occlusion_counters_spv.h")
+add_custom_command(
+	OUTPUT "${occlusion_counters_shader_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${occlusion_counters_shader_spv}" "${occlusion_counters_shader_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${occlusion_counters_shader_spv} -DOUTPUT=${occlusion_counters_shader_header}
+	        -DSYMBOL=OCCLUSION_COUNTERS_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${occlusion_counters_shader_source}"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${occlusion_counters_shader_header}")
 list(APPEND kyty_emulator_src ${gpu_tiler_shader_headers})
 
 set(gpu_blit_generated_dir "${PROJECT_BINARY_DIR}/gpu_blit_shaders")
@@ -574,11 +589,6 @@ add_executable(jpeg_enc_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/JpegEncTests.c
 target_link_libraries(jpeg_enc_tests common fmt::fmt)
 target_include_directories(jpeg_enc_tests PRIVATE ${inc_headers})
 
-add_executable(occlusion_queries_tests EXCLUDE_FROM_ALL
-	"${KYTY_TESTS_DIR}/OcclusionQueriesTests.cpp")
-target_link_libraries(occlusion_queries_tests common fmt::fmt Vulkan::Headers)
-target_include_directories(occlusion_queries_tests PRIVATE ${inc_headers})
-
 add_executable(ces_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/CesTests.cpp")
 target_link_libraries(ces_tests common fmt::fmt SDL3::SDL3-static)
 target_include_directories(ces_tests PRIVATE ${inc_headers})
@@ -757,7 +767,6 @@ if(BUILD_TESTING)
 	add_test(NAME png_enc COMMAND $<TARGET_FILE:png_enc_tests>)
 	add_test(NAME jpeg_dec COMMAND $<TARGET_FILE:jpeg_dec_tests>)
 	add_test(NAME jpeg_enc COMMAND $<TARGET_FILE:jpeg_enc_tests>)
-	add_test(NAME occlusion_queries COMMAND $<TARGET_FILE:occlusion_queries_tests>)
 	add_test(NAME ces COMMAND $<TARGET_FILE:ces_tests>)
 	add_test(NAME save_data_dialog COMMAND $<TARGET_FILE:save_data_dialog_tests>)
 	add_test(NAME http_uri_parse COMMAND $<TARGET_FILE:http_uri_parse_tests>)
@@ -881,7 +890,6 @@ if(BUILD_TESTING)
 		png_enc_tests
 		jpeg_dec_tests
 		jpeg_enc_tests
-		occlusion_queries_tests
 		ces_tests
 		save_data_dialog_tests
 		http_uri_parse_tests

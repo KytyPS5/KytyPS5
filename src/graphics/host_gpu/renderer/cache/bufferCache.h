@@ -58,6 +58,11 @@ public:
 	KYTY_CLASS_NO_COPY(BufferCache);
 
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
+	// A guest write faulted on a page the cache protects.
+	void                   InvalidateFaultedPage(uint64_t vaddr);
+	// A CPU write that already reached guest memory, from a thread that cannot read back:
+	// pages the GPU owns stay GPU-owned, the rest become CPU-modified.
+	void                   InvalidateUnlessGpuModified(uint64_t vaddr, uint64_t size) noexcept;
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);

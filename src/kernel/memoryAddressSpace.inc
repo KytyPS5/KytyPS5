@@ -214,6 +214,23 @@ public:
 		    [](uint64_t, uint64_t) {});
 	}
 
+	// Writes values[i] to vaddr + i * stride, values[0] last. Callers hold the state lock, as for
+	// WriteBacking().
+	void WriteBackingQwords(uint64_t vaddr, const uint64_t* values, uint32_t count,
+	                        uint64_t stride) {
+		const auto size = uint64_t {count - 1u} * stride + sizeof(uint64_t);
+		if (const auto* backing = FindBackingPointer(vaddr, size); backing != nullptr) {
+			auto* target = const_cast<uint8_t*>(backing);
+			for (uint32_t i = count; i-- > 0;) {
+				*reinterpret_cast<volatile uint64_t*>(target + i * stride) = values[i];
+			}
+			return;
+		}
+		for (uint32_t i = count; i-- > 0;) {
+			WriteBacking(vaddr + i * stride, &values[i], sizeof(uint64_t));
+		}
+	}
+
 	// Needs no lock: page entries are atomic and buckets live as long as the store.
 	[[nodiscard]] bool IsBacked(uint64_t vaddr, uint64_t size) const {
 		if (size == 0 || UINT64_MAX - vaddr < size) {
@@ -643,6 +660,21 @@ public:
 			return false;
 		}
 		m_backing->WriteBacking(vaddr, data, size);
+		return true;
+	}
+
+	// TryWriteBacking() of `count` qwords `stride` bytes apart (8-byte aligned), values[0] last.
+	bool TryWriteBackingQwords(uint64_t vaddr, const uint64_t* values, uint32_t count,
+	                           uint64_t stride) {
+		const auto size = uint64_t {count - 1u} * stride + sizeof(uint64_t);
+		if (count == 0 || !Owns(vaddr, size)) {
+			return false;
+		}
+		std::shared_lock state(g_memory_state_mutex);
+		if (OverlapsPrivateUnlocked(vaddr, size)) {
+			return false;
+		}
+		m_backing->WriteBackingQwords(vaddr, values, count, stride);
 		return true;
 	}
 

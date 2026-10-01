@@ -843,6 +843,10 @@ bool TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size) {
 	return g_guest_address_space->TryWriteBacking(vaddr, data, size);
 }
 
+bool TryWriteBackingQwords(uint64_t vaddr, const uint64_t* values, uint32_t count, uint64_t stride) {
+	return g_guest_address_space->TryWriteBackingQwords(vaddr, values, count, stride);
+}
+
 bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return g_guest_address_space->TryReadBacking(vaddr, data, size);
 }

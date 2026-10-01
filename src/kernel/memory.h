@@ -135,6 +135,8 @@ int AllocateDirectMemory(int64_t search_start, int64_t search_end, size_t size, 
 int MapAutomaticMemory(uint64_t vaddr, size_t size, int type, int prot);
 int UnmapAmmMemory(uint64_t vaddr, size_t size);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
+// TryWriteBacking() of values[i] at vaddr + i * stride (8-byte aligned qwords), values[0] last.
+bool TryWriteBackingQwords(uint64_t vaddr, const uint64_t* values, uint32_t count, uint64_t stride);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
 // Where the backing store keeps [vaddr, vaddr + size) when one mapping holds it, else null. The

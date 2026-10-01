@@ -631,11 +631,7 @@ void CommandProcessor::BufferInit() {
 }
 
 void CommandProcessor::BufferFlush() {
-	EmitCallback([this] {
-		GetScheduler().Flush();
-		// The occlusion counters reach a guest that polls them without waiting for a later fence.
-		m_renderer.GetOcclusionQueries().Publish();
-	});
+	EmitCallback([this] { GetScheduler().Flush(); });
 }
 
 void CommandProcessor::NoteRecordedWork() {
@@ -846,6 +842,11 @@ void CommandProcessor::ExecuteDmaData(bool dst_gds, uint64_t dst_address_or_offs
 		    dst_address_or_offset, num_bytes,
 		    static_cast<uint32_t>(src_address_or_offset_or_immediate & 0xffffffffu), dst_gds);
 		return;
+	}
+	if (!src_gds) {
+		// The copy reads occlusion counters once the GPU wrote them, as later work does.
+		m_renderer.GetOcclusionQueries().WaitForCounters(src_address_or_offset_or_immediate,
+		                                                 num_bytes);
 	}
 	buffer_cache.CopyBuffer(dst_address_or_offset, src_address_or_offset_or_immediate, num_bytes,
 	                        dst_gds, src_gds);
@@ -1238,9 +1239,6 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 			return;
 		case 0x01: {
 			EXIT_NOT_IMPLEMENTED(address == nullptr);
-			// Dumped counters are published in operation order, before the read below.
-			NoteGuestWrite(EmitCallback([this] { m_renderer.GetOcclusionQueries().Publish(); }),
-			               reinterpret_cast<uint64_t>(address), 32u * sizeof(uint64_t));
 			// One begin/end pair per DB; bit 63 marks each counter ready.
 			constexpr uint64_t      ready_bit = 1ull << 63u;
 			std::array<uint64_t, 32> results {};
@@ -1250,6 +1248,18 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 				const auto end   = results[db * 2u + 1u];
 				if ((begin & end & ready_bit) == 0) {
 					if (wait_op == 0) {
+						// Host query results reach guest memory from the execution thread once
+						// the GPU finished them: make sure it does and they are published.
+						if (!m_occlusion_wait_requested) {
+							m_occlusion_wait_requested = true;
+							EmitCallback([this] {
+								auto& queries = m_renderer.GetOcclusionQueries();
+								if (queries.HasPendingDumps()) {
+									GetScheduler().Finish();
+									queries.PublishCompleted(true);
+								}
+							});
+						}
 						SuspendPm4();
 					} else {
 						m_predicate_skip = false;
@@ -1258,6 +1268,7 @@ void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t 
 				}
 				value += end - begin;
 			}
+			m_occlusion_wait_requested = false;
 		} break;
 		case 0x03:
 			// The wait selector applies only to Z-pass query readiness.
@@ -1658,8 +1669,6 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 void CommandProcessor::ExecuteReleaseMem(uint32_t data_sel, bool interrupt, void* address,
                                          uint64_t data, uint32_t interrupt_context_id) {
 	(void)CurrentBuffer().Handle();
-	// Dumped occlusion counters are written before any end-of-pipe signal reaches the guest.
-	m_renderer.GetOcclusionQueries().Publish();
 
 	// A label beside GPU-written bytes goes to the backing store, so they are not downloaded.
 	// Other labels go through the guest mapping: its fault keeps a clean cached copy current and
@@ -1674,6 +1683,48 @@ void CommandProcessor::ExecuteReleaseMem(uint32_t data_sel, bool interrupt, void
 			std::memcpy(address, value, size);
 		}
 	};
+	// Occlusion counters reach guest memory in a priority completion once the GPU got past
+	// their dump. A label released after a dump tells the guest that the counters are there: GTA
+	// San Andreas DE writes one into every query object after its end dump and reads the query
+	// once it is set. On the console the label lands after the counters, so it goes behind them
+	// through the same completions instead of being written now. Labels keep their order: while
+	// a deferred label is not written yet, later ones follow it through the completions too.
+	// EOP interrupts always go through the priority completions, so they stay in order as well.
+	if (data_sel != 0 && (m_renderer.GetOcclusionQueries().HasPendingDumps() ||
+	                      m_deferred_labels.load(std::memory_order_acquire) != 0)) {
+		const auto     vaddr = reinterpret_cast<uint64_t>(address);
+		const uint64_t size  = data_sel == 1 ? sizeof(uint32_t) : sizeof(uint64_t);
+		if (data_sel <= 3 && GuestRange {vaddr, size}.Valid() &&
+		    !m_renderer.GetBufferCache().IsRegionGpuModified(vaddr, size)) {
+			m_renderer.PrepareGpuWrite(address, size);
+			m_deferred_labels.fetch_add(1, std::memory_order_relaxed);
+			GetScheduler().DeferPriorityOperation(
+			    [this, address, data, data_sel] {
+				    // Later GPU work may own the page again by now (ASTRO BOT, Sky Garden).
+				    if (data_sel == 1) {
+					    const auto value = static_cast<uint32_t>(data);
+					    m_renderer.WriteFromCompletion(address, &value, sizeof(value));
+				    } else {
+					    const uint64_t value = data_sel == 3 ? Sync::ReadReferenceClock() : data;
+					    m_renderer.WriteFromCompletion(address, &value, sizeof(value));
+				    }
+				    m_deferred_labels.fetch_sub(1, std::memory_order_release);
+			    },
+			    vaddr, size);
+			if (interrupt) {
+				DeferEopInterrupt(interrupt_context_id);
+			}
+			return;
+		}
+		// A label that cannot be deferred (GPU-written memory, GDS) behind deferred ones waits
+		// until the GPU and the completions queued before it, those labels included, have run.
+		if (m_deferred_labels.load(std::memory_order_acquire) != 0) {
+			auto&      scheduler = GetScheduler();
+			const auto tick      = scheduler.CurrentTick();
+			scheduler.Wait(tick);
+			scheduler.WaitPriorityOperations(tick);
+		}
+	}
 	// EndOfPipeData: kNone, kImmediate32b, kImmediate64b, kRefClk; 5 reads GDS.
 	switch (data_sel) {
 		case 0: break;
@@ -1785,8 +1836,9 @@ void CommandProcessor::ExecuteTriggerEvent(uint32_t event_type, uint32_t event_i
 				     "\n",
 				     event_index, event_address);
 			}
-			if (auto& queries = m_renderer.GetOcclusionQueries(); queries.Enabled()) {
-				queries.Dump(event_address);
+			auto& queries = m_renderer.GetOcclusionQueries();
+			if (queries.Enabled()) {
+				queries.Dump(GetScheduler(), event_address);
 				break;
 			}
 			static std::once_flag warning_once;
@@ -1838,8 +1890,8 @@ void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_a
 	}
 
 	EmitCallback([this, handle, index, flip_mode, flip_arg] {
-		m_renderer.GetOcclusionQueries().Publish();
 		auto& command = CurrentBuffer();
+		m_renderer.GetOcclusionQueries().OnFrame();
 		auto  request = Sync::PrepareVideoOutFlip(command, handle, index, flip_mode, flip_arg);
 		GetScheduler().DeferHostOperation(
 		    [&renderer = m_renderer, request] { renderer.GetVideoOut().CompleteFlip(request); },

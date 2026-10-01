@@ -100,11 +100,12 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	KYTY_CFG_GET(sync_raw_image_buffers);
 	KYTY_CFG_GET(flush_draws);
 	KYTY_CFG_GET(tessellation_enabled);
-	KYTY_CFG_GET(occlusion_queries_enabled);
+	// On by default, also in configurations saved before the fork turned it on.
+	occlusion_queries_enabled = s.value("occlusion_queries_enabled", true).toBool();
 	KYTY_CFG_GET(relaxed_shader_float);
 	KYTY_CFG_GET(native_rt);
 	shader_cache_enabled = s.value("shader_cache_enabled", shader_cache_enabled).toBool();
-	trophy_enabled       = s.value("trophy_enabled", trophy_enabled).toBool();
+	trophy_enabled   = s.value("trophy_enabled", trophy_enabled).toBool();
 	KYTY_CFG_GET(trophy_duration_seconds);
 	KYTY_CFG_GET(perf_overlay_enabled);
 	KYTY_CFG_GET(skip_notice_screen);

@@ -293,6 +293,32 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	                                  [this, vaddr, size] { ReadMemory(vaddr, size, true); });
 }
 
+void BufferCache::InvalidateUnlessGpuModified(uint64_t vaddr, uint64_t size) noexcept {
+	if (GuestRange {vaddr, size}.Valid()) {
+		m_memory_tracker.InvalidateRegion(vaddr, size, [] {});
+	}
+}
+
+void BufferCache::InvalidateFaultedPage(uint64_t vaddr) {
+	// The guest fills its streaming memory (vertex and constant rings) upwards, and every page it
+	// writes under a cached buffer takes a fault: thousands per frame, each a system call to drop
+	// the protection. When the page below is already writable the guest is filling the range
+	// upwards, so release the pages ahead up to the next 64 KB boundary with this fault; they are
+	// only uploaded again at their next synchronization. A range with pages the GPU wrote must be
+	// read back first, so it keeps to the faulting page.
+	static constexpr uint64_t FaultBlockSize = 64 * 1024;
+	static_assert(TRACKER_REGION_SIZE % FaultBlockSize == 0);
+	const auto page = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	const auto end  = Common::AlignDown(page, FaultBlockSize) + FaultBlockSize;
+	if (page >= TRACKER_PAGE_SIZE && GuestRange {page - TRACKER_PAGE_SIZE, end - page}.Valid() &&
+	    m_memory_tracker.IsRegionCpuModified(page - TRACKER_PAGE_SIZE, TRACKER_PAGE_SIZE) &&
+	    !m_memory_tracker.IsRegionGpuModified(page, end - page)) {
+		InvalidateMemory(page, end - page);
+		return;
+	}
+	InvalidateMemory(vaddr, 1);
+}
+
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "

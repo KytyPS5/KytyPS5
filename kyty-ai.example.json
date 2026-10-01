@@ -1,0 +1,42 @@
+{
+  "repository": {
+    "remote": "origin",
+    "repo": "KytyPS5/KytyPS5"
+  },
+  "ollama": {
+    "url": "http://127.0.0.1:11434",
+    "model": "qwen3.6:27b-mlx",
+    "timeout_seconds": 900,
+    "temperature": 0.1
+  },
+  "integration": {
+    "worktree_root": ".ai/worktrees",
+    "max_repairs": 4,
+    "max_file_bytes": 180000,
+    "max_context_chars": 260000,
+    "protected_branches": [
+      "main",
+      "master"
+    ]
+  },
+  "build": {
+    "configure": [],
+    "build": [
+      "cmake",
+      "--build",
+      "_Build/windows"
+    ],
+    "test": [
+      "ctest",
+      "--test-dir",
+      "_Build/windows",
+      "--output-on-failure"
+    ],
+    "working_directory": ".",
+    "timeout_seconds": 1800
+  },
+  "runtime": {
+    "command": [],
+    "timeout_seconds": 300
+  }
+}

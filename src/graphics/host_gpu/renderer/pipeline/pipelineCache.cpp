@@ -104,6 +104,43 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 	Log::WriteToConsoleAndLog(message);
 }
 
+struct GuestPageReadCache {
+	static constexpr size_t Capacity = 16;
+	struct Entry {
+		uint64_t       page    = 0;
+		const uint8_t* backing = nullptr;
+	};
+	std::array<Entry, Capacity> entries {};
+	size_t                      count = 0;
+	size_t                      next  = 0;
+
+	bool Read(uint64_t address, std::span<uint32_t> values) {
+		const auto page = Common::AlignDown(address, TRACKER_PAGE_SIZE);
+		if (Common::AlignDown(address + values.size_bytes() - 1, TRACKER_PAGE_SIZE) != page) {
+			return false;
+		}
+		const Entry* entry = nullptr;
+		for (size_t i = 0; i < count; i++) {
+			if (entries[i].page == page) {
+				entry = &entries[i];
+				break;
+			}
+		}
+		if (entry == nullptr) {
+			auto& slot = count < Capacity ? entries[count++] : entries[next++ % Capacity];
+			slot       = {.page    = page,
+			              .backing = Libs::LibKernel::Memory::FindGpuCleanBacking(page,
+			                                                                     TRACKER_PAGE_SIZE)};
+			entry      = &slot;
+		}
+		if (entry->backing == nullptr) {
+			return false;
+		}
+		std::memcpy(values.data(), entry->backing + (address - page), values.size_bytes());
+		return true;
+	}
+};
+
 bool UsesShaderClock(const ShaderRecompiler::IR::Program& program) {
 	for (auto* block: program.blocks) {
 		for (const auto& inst: *block) {
@@ -118,9 +155,13 @@ bool UsesShaderClock(const ShaderRecompiler::IR::Program& program) {
 // Ordinary (raw) SRT reads: only memory the guest has committed, read through the guest
 // mapping so a GPU-owned page is refreshed first. Without a reader the walker dereferenced
 // whatever address a descriptor chain produced, including 0 on a path the shader never takes.
-bool ReadShaderGuestMemoryRaw(void*, uint64_t address, std::span<uint32_t> values) {
+bool ReadShaderGuestMemoryRaw(void* userdata, uint64_t address, std::span<uint32_t> values) {
 	if (values.empty()) {
 		return false;
+	}
+	if (auto* cache = static_cast<GuestPageReadCache*>(userdata);
+	    cache != nullptr && cache->Read(address, values)) {
+		return true;
 	}
 	// Bytes the GPU has not written are current in the backing store. Reading them there skips
 	// the tracked-page fault, which drains the GPU to refresh whatever else on the page the GPU
@@ -151,12 +192,15 @@ std::vector<uint32_t> ReadShaderCode(uint64_t address) {
 	return words;
 }
 
-bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
+bool ReadShaderGuestMemory(void* userdata, uint64_t address, std::span<uint32_t> values) {
 	if (values.empty()) {
 		return false;
 	}
-	if (Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, values.data(),
-	                                                    values.size_bytes())) {
+	if (auto* cache = static_cast<GuestPageReadCache*>(userdata);
+	    cache != nullptr && cache->Read(address, values)) {
+		return true;
+	}
+	if (Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, values.data(), values.size_bytes())) {
 		return true;
 	}
 	// The bytes are mapped but GPU-owned. Reading them through the guest mapping takes the
@@ -417,10 +461,12 @@ struct PipelineCache::ProgramCache {
 		if (entry != programs.end() && entry->second.skip_dispatch) {
 			return {};
 		}
-		const ShaderRecompiler::IR::SrtRuntime       runtime {
+		GuestPageReadCache                           clean_read_cache;
+		ShaderRecompiler::IR::SrtRuntime             runtime {
 		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),
 		    .read_memory                = ReadShaderGuestMemoryRaw,
+		    .userdata                   = &clean_read_cache,
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		    .float_image_atomics        = Config::FloatImageAtomicsEnabled(),
 		};

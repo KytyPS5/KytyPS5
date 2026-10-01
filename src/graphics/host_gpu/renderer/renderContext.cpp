@@ -131,6 +131,14 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 void RenderContext::PrepareBda() {
 	const auto epoch = g_cpu_dirty_epoch.load(std::memory_order_acquire);
 	if (epoch != m_bda_synced_epoch) {
+		const auto submission = g_guest_submission_seq.load(std::memory_order_relaxed);
+		if (submission == m_bda_synced_submission) {
+			m_fault_process_pending = true;
+			return;
+		}
+		m_bda_synced_submission = submission;
+	}
+	if (epoch != m_bda_synced_epoch) {
 		// The guest writes somewhere nearly all the time, so the epoch moves between most
 		// dispatches; walk only the regions holding CPU-dirty pages, not every buffer.
 		std::shared_lock lock(m_mapped_ranges_mutex);

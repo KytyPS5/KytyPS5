@@ -238,14 +238,31 @@ struct TrackerHarness {
   MemoryTracker tracker;
 };
 
+uint8_t *AllocateFixedGuestRange(uint64_t size, uintptr_t offset) {
+  // Keep the mapping inside the tracker's guest address space and preserve the
+  // requested region alignment. A fixed address can be occupied by the host
+  // process (notably by the macOS runner's ASLR layout).
+  constexpr uintptr_t first_base = 0x0000000200000000ull;
+  constexpr uintptr_t stride = 0x0000000100000000ull;
+  for (uintptr_t attempt = 0; attempt < 256; attempt++) {
+    auto *wanted = reinterpret_cast<void *>(first_base + offset + attempt * stride);
+    auto *memory = static_cast<uint8_t *>(
+        VirtualAlloc(wanted, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    if (memory == wanted) {
+      return memory;
+    }
+    if (memory != nullptr) {
+      Check(VirtualFree(memory, 0, MEM_RELEASE) != 0,
+            "release unexpected fixed allocation failed");
+    }
+  }
+  Check(false, "no free fixed guest address found");
+  return nullptr;
+}
+
 uint8_t *Allocate(PageManager &manager, uint64_t pages) {
-  constexpr uintptr_t base = 0x0000000200010000ull;
   const auto size = manager.GetPageSize() * pages;
-  auto *memory = static_cast<uint8_t *>(
-      VirtualAlloc(reinterpret_cast<void *>(base), size,
-                   MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-  Check(memory == reinterpret_cast<void *>(base), "fixed VirtualAlloc failed");
-  return memory;
+  return AllocateFixedGuestRange(size, 0x10000);
 }
 
 void Release(uint8_t *memory) {
@@ -386,16 +403,10 @@ void TestCpuDirtyUpload() {
 }
 
 void TestRangeInvalidation() {
-  constexpr uintptr_t base = 0x0000000201000000ull;
   TrackerHarness harness;
   auto &tracker = harness.tracker;
-  auto &page_manager = harness.page_manager;
   constexpr uint64_t size = Libs::Graphics::TRACKER_REGION_SIZE * 2;
-  auto *memory = static_cast<uint8_t *>(
-      VirtualAlloc(reinterpret_cast<void *>(base), size,
-                   MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-  Check(memory == reinterpret_cast<void *>(base),
-        "range invalidation allocation failed");
+  auto *memory = AllocateFixedGuestRange(size, 0x1000000);
   const auto address = reinterpret_cast<uint64_t>(memory);
 
   tracker.ForEachUploadRange(
@@ -614,16 +625,12 @@ void TestGpuDownloadProtectionMirrors() {
 }
 
 void TestCrossRegionUpload() {
-  constexpr uintptr_t base = 0x0000000200010000ull;
   constexpr uint64_t region_size = 4ull * 1024ull * 1024ull;
   TrackerHarness harness;
   auto &tracker = harness.tracker;
   auto &page_manager = harness.page_manager;
   const auto page_size = page_manager.GetPageSize();
-  auto *memory = static_cast<uint8_t *>(
-      VirtualAlloc(reinterpret_cast<void *>(base), region_size * 2,
-                   MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-  Check(memory == reinterpret_cast<void *>(base), "fixed VirtualAlloc failed");
+  auto *memory = AllocateFixedGuestRange(region_size * 2, 0x10000);
   const auto address = reinterpret_cast<uint64_t>(memory);
   const auto boundary = (address + region_size - 1) & ~(region_size - 1);
   uint32_t ranges = 0;

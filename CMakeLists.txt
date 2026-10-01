@@ -55,6 +55,13 @@ set(BUILD_TESTING OFF)
 set(OPUS_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
 set(OPUS_INSTALL_PKG_CONFIG_MODULE OFF CACHE BOOL "" FORCE)
 set(OPUS_INSTALL_CMAKE_CONFIG_MODULE OFF CACHE BOOL "" FORCE)
+if(MSVC AND CMAKE_C_COMPILER_ID STREQUAL "Clang")
+	# Opus assumes MSVC accepts SSE4.1 intrinsics without per-file flags, but
+	# clang-cl rejects them in its baseline x64 files. Its AVX2 dispatch also
+	# depends on the SSE4.1 declarations, so retain the x64 SSE2 baseline only.
+	set(OPUS_X86_MAY_HAVE_SSE4_1 OFF CACHE BOOL "" FORCE)
+	set(OPUS_X86_MAY_HAVE_AVX2 OFF CACHE BOOL "" FORCE)
+endif()
 FetchContent_Declare(opus
 	GIT_REPOSITORY https://github.com/xiph/opus.git
 	GIT_TAG ddbe48383984d56acd9e1ab6a090c54ca6b735a6

@@ -37,7 +37,7 @@ public:
 	void PrepareFlip(uint64_t request_id, Graphics::CommandBuffer& buffer);
 	void CompleteFlip(uint64_t request_id);
 	void SubmitFlipPreparation(uint64_t request_id);
-	void WaitForSubmitSlot();
+	void WaitForSubmitSlot(int handle);
 	void WaitFlipDone(int handle, int index);
 
 	[[nodiscard]] Impl& State() noexcept;
@@ -52,6 +52,9 @@ void                          VideoOutShutdown();
 
 KYTY_SYSV_ABI int  VideoOutOpen(int user_id, int bus_type, int index, const void* param);
 KYTY_SYSV_ABI int  VideoOutClose(int handle);
+KYTY_SYSV_ABI int  VideoOutSetFlipMaster(int slave_handle, int master_handle);
+KYTY_SYSV_ABI void VideoOutAddBufferAttributeOption(VideoOutBufferAttribute2* attribute,
+                                                   uint64_t option);
 KYTY_SYSV_ABI void VideoOutSetBufferAttribute2(VideoOutBufferAttribute2* attribute,
                                                uint64_t pixel_format, uint32_t tiling_mode,
                                                uint32_t width, uint32_t height, uint64_t option,
@@ -87,6 +90,9 @@ KYTY_SYSV_ABI int VideoOutGetEventData(const LibKernel::EventQueue::KernelEvent*
 KYTY_SYSV_ABI int VideoOutGetEventCount(const LibKernel::EventQueue::KernelEvent* ev);
 KYTY_SYSV_ABI int VideoOutWaitVblank(int handle);
 KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* status);
+KYTY_SYSV_ABI int VideoOutAllowOutputResolutionWqhdDetection(int handle);
+KYTY_SYSV_ABI int VideoOutVrrPegToFixedRate(int handle, uint64_t arg1, uint64_t arg2);
+KYTY_SYSV_ABI int VideoOutVrrUnpegFromFixedRate(int handle);
 KYTY_SYSV_ABI int VideoOutInitializeOutputOptions(VideoOutOutputOptions* options);
 KYTY_SYSV_ABI int VideoOutIsOutputSupported(int handle, uint64_t mode,
                                             const VideoOutOutputOptions* options,

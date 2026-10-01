@@ -1226,6 +1226,7 @@ static KYTY_SYSV_ABI KernelModule KernelLoadStartModule(const char* module_file_
 
 	auto* program = rt->FindProgramByFileName(module_path);
 	if (program != nullptr) {
+		++program->load_count;
 		if (res != nullptr) {
 			*res = OK;
 		}
@@ -1240,6 +1241,7 @@ static KYTY_SYSV_ABI KernelModule KernelLoadStartModule(const char* module_file_
 
 	rt->RelocateProgram(program);
 
+	program->load_count = 1;
 	int result = rt->StartModule(program, args, argp, nullptr);
 
 	LOGF("\tmodule_start() result = %d\n", result);
@@ -1269,6 +1271,11 @@ static int KYTY_SYSV_ABI KernelStopUnloadModule(KernelModule handle, size_t args
 
 	if (program == nullptr) {
 		LOGF("\tinvalid module handle = %" PRId32 "\n", handle);
+		return KERNEL_ERROR_ESRCH;
+	}
+
+	if (program->load_count > 1) {
+		--program->load_count;
 		return OK;
 	}
 
@@ -3021,7 +3028,9 @@ LIB_DEFINE(InitLibKernel_1_FS) {
 	LIB_FUNC("Cg4srZ6TKbU", FileSystem::KernelRead);
 	LIB_FUNC("4wSze92BhLI", FileSystem::KernelWrite);
 	LIB_FUNC("+r3rMFwItV4", FileSystem::KernelPread);
+	LIB_FUNC("yTj62I7kw4s", FileSystem::KernelPreadv);
 	LIB_FUNC("nKWi-N2HBV4", FileSystem::KernelPwrite);
+	LIB_FUNC("mBd4AfLP+u8", FileSystem::KernelPwritev);
 	LIB_FUNC("eV9wAD2riIA", FileSystem::KernelStat);
 	LIB_FUNC("kBwCPsYX-m4", FileSystem::KernelFstat);
 	LIB_FUNC("AUXVxWeJU-A", FileSystem::KernelUnlink);

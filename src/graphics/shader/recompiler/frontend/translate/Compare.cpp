@@ -44,15 +44,16 @@ void Translator::EmitFloatCompare(const Decoder::Instruction& inst, IR::ValueOpc
 	    half ? IR::Value(ReadF16AsF32(inst.src0)) : ReadOperand(inst.src0, IR::Type::F32);
 	const auto rhs =
 	    half ? IR::Value(ReadF16AsF32(inst.src1)) : ReadOperand(inst.src1, IR::Type::F32);
-	EmitCompareResult(inst, IR::U1(ir.Emit(opcode, {lhs, rhs})), false, cmpx);
+	const IR::FPCompareFlags flags{.flush_input_denorms = !half && flush_f32_inputs};
+	EmitCompareResult(inst, IR::U1(ir.Emit(opcode, {lhs, rhs}, flags)), false, cmpx);
 }
 
-void Translator::EmitFloatOrderedCompare(const Decoder::Instruction& inst, bool ordered) {
+void Translator::EmitFloatOrderedCompare(const Decoder::Instruction& inst, bool ordered, bool cmpx) {
 	const auto lhs       = IR::F32(ReadOperand(inst.src0, IR::Type::F32));
 	const auto rhs       = IR::F32(ReadOperand(inst.src1, IR::Type::F32));
 	const auto unordered = ir.LogicalOr(IR::U1(ir.Emit(IR::ValueOpcode::FPIsNan32, {lhs})),
 	                                    IR::U1(ir.Emit(IR::ValueOpcode::FPIsNan32, {rhs})));
-	EmitCompareResult(inst, ordered ? ir.LogicalNot(unordered) : unordered, false, false);
+	EmitCompareResult(inst, ordered ? ir.LogicalNot(unordered) : unordered, false, cmpx);
 }
 
 void Translator::EmitFloatClassCompare(const Decoder::Instruction& inst, bool cmpx) {

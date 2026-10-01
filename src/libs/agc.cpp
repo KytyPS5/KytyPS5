@@ -3033,19 +3033,9 @@ uint32_t* KYTY_SYSV_ABI AgcDcbAcquireMem(CommandBuffer* buf, uint8_t engine, uin
 
 	static std::atomic<uint32_t> warning_log_count {0};
 	const bool                   log_warning = (warning_log_count.fetch_add(1) < 64);
-	if (!no_size && (size_bytes & 0xffu) != 0) {
-		if (log_warning) {
-			LOGF_COLOR(Log::Color::Red, "\t warning: size_bytes is not 256-byte aligned\n");
-		}
-	}
 	if (!no_size && (size_bytes >> 40u) != 0) {
 		if (log_warning) {
 			LOGF_COLOR(Log::Color::Red, "\t warning: size_bytes is too large\n");
-		}
-	}
-	if ((vaddr & 0xffu) != 0) {
-		if (log_warning) {
-			LOGF_COLOR(Log::Color::Red, "\t warning: base is not 256-byte aligned\n");
 		}
 	}
 	if ((vaddr >> 40u) != 0) {
@@ -3066,11 +3056,16 @@ uint32_t* KYTY_SYSV_ABI AgcDcbAcquireMem(CommandBuffer* buf, uint8_t engine, uin
 		return nullptr;
 	}
 
+	// COHER_BASE/COHER_SIZE are in 256-byte units; widen an unaligned range so it still covers.
+	const uint64_t coher_base = vaddr & ~uint64_t {0xff};
+	const uint64_t coher_size =
+	    no_size ? 0 : ((vaddr + size_bytes + 0xffu) & ~uint64_t {0xff}) - coher_base;
+
 	cmd[0] = KYTY_PM4(8, Pm4::IT_NOP, Pm4::R_ACQUIRE_MEM);
 	cmd[1] = (static_cast<uint32_t>(engine & 1u) << 31u) | cb_db_op;
-	cmd[2] = (no_size ? 0 : static_cast<uint32_t>(size_bytes >> 8u));
+	cmd[2] = static_cast<uint32_t>(coher_size >> 8u);
 	cmd[3] = 0;
-	cmd[4] = static_cast<uint32_t>(vaddr >> 8u);
+	cmd[4] = static_cast<uint32_t>(coher_base >> 8u);
 	cmd[5] = 0;
 	cmd[6] = poll_cycles / 40;
 	cmd[7] = gcr_cntl;

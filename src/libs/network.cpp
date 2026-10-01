@@ -997,13 +997,31 @@ static int ConvertHostSocketError(int error) {
 		case EAGAIN: posix_error = Posix::POSIX_EWOULDBLOCK; break;
 		case EBADF: posix_error = Posix::POSIX_EBADF; break;
 		case EFAULT: posix_error = Posix::POSIX_EFAULT; break;
+		case EINTR: posix_error = Posix::POSIX_EINTR; break;
 		case EINVAL: posix_error = Posix::POSIX_EINVAL; break;
+		case EISCONN: posix_error = Posix::POSIX_EISCONN; break;
 		case EMFILE: posix_error = Posix::POSIX_EMFILE; break;
+		case EMSGSIZE: posix_error = Posix::POSIX_EMSGSIZE; break;
 		case ENFILE: posix_error = Posix::POSIX_ENFILE; break;
 		case ENOBUFS: posix_error = Posix::POSIX_ENOBUFS; break;
 		case ENOMEM: posix_error = Posix::POSIX_ENOMEM; break;
+		case ENETDOWN: posix_error = Posix::POSIX_ENETDOWN; break;
+		case ENETRESET: posix_error = Posix::POSIX_ENETRESET; break;
+		case ENETUNREACH: posix_error = Posix::POSIX_ENETUNREACH; break;
+		case ENOTCONN: posix_error = Posix::POSIX_ENOTCONN; break;
 		case ENOTSOCK: posix_error = Posix::POSIX_ENOTSOCK; break;
+		case EOPNOTSUPP: posix_error = Posix::POSIX_EOPNOTSUPP; break;
+		case EPIPE: posix_error = Posix::POSIX_EPIPE; break;
 		case EPROTONOSUPPORT: posix_error = Posix::POSIX_EPROTONOSUPPORT; break;
+		case ESHUTDOWN: posix_error = Posix::POSIX_ESHUTDOWN; break;
+		case ETIMEDOUT: posix_error = Posix::POSIX_ETIMEDOUT; break;
+		case ECONNABORTED: posix_error = Posix::POSIX_ECONNABORTED; break;
+		case ECONNREFUSED: posix_error = Posix::POSIX_ECONNREFUSED; break;
+		case ECONNRESET: posix_error = Posix::POSIX_ECONNRESET; break;
+		case EDESTADDRREQ: posix_error = Posix::POSIX_EDESTADDRREQ; break;
+		case EHOSTUNREACH: posix_error = Posix::POSIX_EHOSTUNREACH; break;
+		case EINPROGRESS: posix_error = Posix::POSIX_EINPROGRESS; break;
+		case EALREADY: posix_error = Posix::POSIX_EALREADY; break;
 		default: break;
 	}
 #endif
@@ -2097,17 +2115,22 @@ int KYTY_SYSV_ABI Setsockopt(int s, int level, int optname, const void* optval, 
 		return 0;
 	}
 
-#if defined(_WIN32)
 	constexpr int ORBIS_SO_NBIO = 0x1200;
 	if (ConvertSocketOptionLevel(level) == SOL_SOCKET && optname == ORBIS_SO_NBIO &&
 	    optlen >= sizeof(int)) {
-		u_long enabled = (*static_cast<const int*>(optval) != 0 ? 1 : 0);
-		if (ioctlsocket(socket, FIONBIO, &enabled) == SOCKET_ERROR) {
-			return SetHostSocketError();
-		}
-		return 0;
-	}
+		const bool enabled = *static_cast<const int*>(optval) != 0;
+#if defined(_WIN32)
+		u_long     mode   = enabled ? 1 : 0;
+		const bool failed = ioctlsocket(socket, FIONBIO, &mode) == SOCKET_ERROR;
 #else
+		const int  flags = ::fcntl(socket, F_GETFL, 0);
+		const bool failed =
+		    flags < 0 ||
+		    ::fcntl(socket, F_SETFL, enabled ? (flags | O_NONBLOCK) : (flags & ~O_NONBLOCK)) != 0;
+#endif
+		return failed ? SetHostSocketError() : 0;
+	}
+#if !defined(_WIN32)
 	// Guest TCP options: IPPROTO_TCP=6, TCP_NODELAY=1.
 	if (level != 6 || optname != 1) {
 		return SetGuestSocketError(Posix::POSIX_ENOPROTOOPT);

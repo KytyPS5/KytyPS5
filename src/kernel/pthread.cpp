@@ -512,6 +512,45 @@ static void SchedulerBackoffOnce() {
 #endif
 }
 
+// Waits on a waiter's condition variable until ready() or the deadline, dispatching pending signals.
+// The last 2.5 ms are timed with the high-resolution timer in short slices.
+template <class Lock, class Ready>
+static void CondWaitUntil(Lock& lock, std::condition_variable& cv, const Ready& ready,
+                          std::chrono::steady_clock::time_point deadline) {
+	constexpr auto coarse_margin = std::chrono::microseconds(2500);
+	constexpr auto spin_margin   = std::chrono::microseconds(300);
+	constexpr auto fine_slice    = std::chrono::microseconds(500);
+	while (!ready()) {
+		const auto now = std::chrono::steady_clock::now();
+		if (now >= deadline) {
+			break;
+		}
+		const auto remaining = deadline - now;
+		if (remaining > coarse_margin) {
+			cv.wait_for(lock, std::min<std::chrono::steady_clock::duration>(
+			                      remaining - coarse_margin,
+			                      std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)));
+		} else {
+			lock.unlock();
+			if (remaining > spin_margin) {
+				const auto slice = std::min<std::chrono::steady_clock::duration>(
+				    remaining - spin_margin, fine_slice);
+				Common::Thread::SleepMicro(static_cast<uint32_t>(
+				    std::chrono::duration_cast<std::chrono::microseconds>(slice).count()));
+			} else {
+				std::this_thread::yield();
+			}
+			lock.lock();
+			continue;
+		}
+		if (!ready()) {
+			lock.unlock();
+			KernelDispatchPendingSignalForCurrentThread();
+			lock.lock();
+		}
+	}
+}
+
 static void SleepMicroWithSignalPoll(uint64_t microseconds) {
 	if (microseconds == 0) {
 		KernelDispatchPendingSignalForCurrentThread();
@@ -2875,26 +2914,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwait(PthreadCond* cond, PthreadMutex* mutex,
 	if (usec == 0) {
 		result = ETIMEDOUT;
 	} else {
-		while (!ready()) {
-			const auto now = std::chrono::steady_clock::now();
-			if (now >= deadline) {
-				break;
-			}
-
-			const auto remaining = deadline - now;
-			const auto poll      = (remaining < std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)
-			                            ? remaining
-			                            : std::chrono::steady_clock::duration(
-			                                  std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)));
-			thread->cond_cv.wait_for(cond_lock, poll);
-
-			if (!ready()) {
-				cond_lock.unlock();
-				KernelDispatchPendingSignalForCurrentThread();
-				cond_lock.lock();
-			}
-		}
-
+		CondWaitUntil(cond_lock, thread->cond_cv, ready, deadline);
 		result = (ready() ? OK : ETIMEDOUT);
 	}
 	CondRemoveWaiter(cond_value, thread);
@@ -2960,26 +2980,7 @@ int KYTY_SYSV_ABI PthreadCondTimedwaitAbs(PthreadCond* cond, PthreadMutex* mutex
 
 	auto ready = [thread, thread_sequence] { return thread->cond_sequence != thread_sequence; };
 
-	while (!ready()) {
-		const auto now = std::chrono::steady_clock::now();
-		if (now >= deadline) {
-			break;
-		}
-
-		const auto remaining = deadline - now;
-		const auto poll      = (remaining < std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)
-		                            ? remaining
-		                            : std::chrono::steady_clock::duration(
-		                                  std::chrono::microseconds(SIGNAL_APC_POLL_MICROS)));
-		thread->cond_cv.wait_for(cond_lock, poll);
-
-		if (!ready()) {
-			cond_lock.unlock();
-			KernelDispatchPendingSignalForCurrentThread();
-			cond_lock.lock();
-		}
-	}
-
+	CondWaitUntil(cond_lock, thread->cond_cv, ready, deadline);
 	result = (ready() ? OK : ETIMEDOUT);
 	CondRemoveWaiter(cond_value, thread);
 	cond_lock.unlock();

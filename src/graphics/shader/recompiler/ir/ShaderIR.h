@@ -531,6 +531,15 @@ struct Bindings {
 	bool operator==(const Bindings& other) const = default;
 };
 
+struct DmaPointer {
+	bool     user_data       = false;
+	bool     store           = false;
+	uint32_t lo              = 0;
+	uint32_t hi              = 0;
+
+	bool operator==(const DmaPointer& other) const = default;
+};
+
 struct ShaderInfo {
 	static constexpr uint32_t MaxBufferRoots  = 64;
 	static constexpr uint32_t MaxImages       = 64;
@@ -573,6 +582,7 @@ struct ShaderInfo {
 	bool                            shared_int64_atomics          = false;
 	bool                            coherent_buffers              = false;
 	bool                            float64                       = false;
+	std::vector<DmaPointer>          dma_pointers;
 
 	bool operator==(const ShaderInfo& other) const = default;
 };

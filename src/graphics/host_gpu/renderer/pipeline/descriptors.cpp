@@ -837,6 +837,27 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 		EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
 		const auto& program  = *prepared.runtime->program;
 		const auto& snapshot = *prepared.runtime->resources;
+
+		for (const auto& pointer: program.info.dma_pointers) {
+			uint32_t lo = 0;
+			uint32_t hi = 0;
+			if (pointer.user_data) {
+				if (pointer.lo < program.user_data_base || pointer.hi < program.user_data_base ||
+				    pointer.lo - program.user_data_base >= snapshot.user_data.size() ||
+				    pointer.hi - program.user_data_base >= snapshot.user_data.size()) {
+					continue;
+				}
+				lo = snapshot.user_data[pointer.lo - program.user_data_base];
+				hi = snapshot.user_data[pointer.hi - program.user_data_base];
+			} else {
+				if (pointer.lo >= snapshot.flattened_srt.size() ||
+				    pointer.hi >= snapshot.flattened_srt.size()) {
+					continue;
+				}
+				lo = snapshot.flattened_srt[pointer.lo];
+				hi = snapshot.flattened_srt[pointer.hi];
+			}
+		}
 		const auto& layout = program.bindings;
 		prepared.buffer_sources.resize(layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)]);
 		if (layout.descriptor_counts[static_cast<size_t>(BindingKind::Buffers)] == 0) {

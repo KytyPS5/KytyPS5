@@ -383,6 +383,7 @@ public:
 		m_info.sampled_pairs.clear();
 		m_info.uses_dma   = false;
 		m_info.writes_dma = false;
+		m_info.dma_pointers.clear();
 		m_shader_writes = HasShaderMemoryWrites(program);
 	}
 
@@ -3796,10 +3797,45 @@ private:
 	bool ValidateAddressHandle(Value value, uint32_t pc) const {
 		const auto* handle = value.Resolve().TryInstruction();
 		if (handle == nullptr || handle->GetOpcode() != ValueOpcode::GetAddressResource) {
+			return Reject(pc, "address operation requires GetAddressResource");
 		}
 		if (handle->NumArgs() != 2) {
 			Fail(pc, "GetAddressResource must have two address dwords");
 		}
+		return true;
+	}
+
+	// An unmapped BDA page reads zero and drops stores until its fault is processed.
+	void RecordDmaPointer(const Inst& handle, bool store) {
+		DmaPointer pointer;
+		pointer.store = store;
+		for (uint32_t word = 0; word < 2u; word++) {
+			const auto* source = handle.Arg(word).Resolve().TryInstruction();
+			if (source == nullptr) return;
+			uint32_t index = 0;
+			bool     user  = false;
+			if (source->GetOpcode() == ValueOpcode::ReadConst) {
+				const auto slot = source->Arg(1).Resolve();
+				if (!slot.IsImmediate() || slot.GetType() != Type::U32) return;
+				index = slot.U32();
+			} else if (source->GetOpcode() == ValueOpcode::GetUserData &&
+			           source->Arg(0).GetType() == Type::ScalarReg) {
+				index = RegIndex(source->Arg(0).ScalarRegister());
+				user  = true;
+			} else {
+				return;
+			}
+			if (word == 0u) {
+				pointer.user_data = user;
+				pointer.lo        = index;
+			} else if (user != pointer.user_data) {
+				return;
+			} else {
+				pointer.hi = index;
+			}
+		}
+		if (std::ranges::find(m_info.dma_pointers, pointer) == m_info.dma_pointers.end())
+			m_info.dma_pointers.push_back(pointer);
 	}
 
 	uint32_t AddBuffer(uint32_t source, const MemoryInfo& memory, const Inst& inst, uint32_t pc) {
@@ -4041,8 +4077,11 @@ private:
 				return true;
 			}
 			if (!ValidateAddressHandle(inst.Arg(0), flags.pc)) return false;
+			RecordDmaPointer(*inst.Arg(0).Resolve().TryInstruction(),
+			                 address_info.access == AddressAccess::Write);
 			if (address_info.access == AddressAccess::Write) {
 				m_program.has_address_writes = true;
+				m_info.writes_dma            = true;
 			}
 			m_info.uses_dma = true;
 			return true;

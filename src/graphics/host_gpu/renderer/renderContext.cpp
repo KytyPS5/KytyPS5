@@ -116,6 +116,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		}
 		m_buffer_cache.InvalidateMemory(vaddr, size);
 		m_texture_cache.UnmapMemory(vaddr, size);
+		m_buffer_cache.ForgetBdaResidency(vaddr, size);
 		m_image_heap.UnmapMemory(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
@@ -141,6 +142,23 @@ void RenderContext::PrepareBda(bool stores) {
 		m_buffer_cache.ClearUnmarkedBdaStores();
 	}
 	m_fault_process_pending = true;
+}
+
+void RenderContext::PrefetchBda(uint64_t address, bool store) {
+	constexpr uint64_t Window = 256 * 1024;
+	if (address == 0) {
+		return;
+	}
+	const auto begin = address & ~(BufferCache::CACHING_PAGESIZE - 1);
+	if (begin > UINT64_MAX - Window) {
+		return;
+	}
+	std::shared_lock lock(m_mapped_ranges_mutex);
+	m_mapped_ranges.ForEachInRange(begin, Window, [&](uint64_t start, uint64_t end) {
+		if (start <= address && end > address) {
+			m_buffer_cache.PrefetchBda(start, end - start, store);
+		}
+	});
 }
 
 void RenderContext::RunGarbageCollector() {

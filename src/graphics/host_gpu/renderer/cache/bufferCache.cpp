@@ -729,6 +729,10 @@ void BufferCache::RunGarbageCollector() {
 		EXIT_IF(buffer.is_deleted);
 		m_memory_tracker.ValidateGpuDirtyOwnership(m_gpu_modified_ranges, buffer.CpuAddress(),
 		                                           buffer.Size(), "garbage collection");
+		if (m_bda_pinned_ranges.Intersects(buffer.CpuAddress(), buffer.Size())) {
+			TouchBuffer(buffer);
+			return false;
+		}
 		const bool dirty = m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size());
 		if (dirty && !aggressive) {
 			return false;
@@ -810,6 +814,10 @@ void BufferCache::ResolveBdaFault(uint64_t vaddr, uint64_t size) {
 		m_bda_tracked_ranges.Add(begin, end - begin);
 		m_bda_unmarked_ranges.Add(begin, end - begin);
 	});
+	missing.ForEach([this](uint64_t begin, uint64_t end) {
+		m_bda_pinned_ranges.Add(begin, end - begin);
+		(void)FindBuffer(begin, end - begin);
+	});
 	stored.ForEach([this](uint64_t begin, uint64_t end) {
 		for (auto page = begin; page < end; page += CACHING_PAGESIZE) {
 			const auto* owner = m_page_table.Find(page >> PageTable::kPageBits);
@@ -822,6 +830,36 @@ void BufferCache::ResolveBdaFault(uint64_t vaddr, uint64_t size) {
 			    BDA_STORE_TRACKED_BIT;
 		}
 	});
+}
+
+	const auto begin = vaddr & ~(CACHING_PAGESIZE - 1);
+	const auto end   = (vaddr + size + CACHING_PAGESIZE - 1) & ~(CACHING_PAGESIZE - 1);
+	if (begin >= end || !GuestRange {begin, end - begin}.Valid()) {
+		return;
+	}
+	RangeSet missing;
+	for (auto page = begin; page < end; page += CACHING_PAGESIZE) {
+		const auto* owner = m_page_table.Find(page >> PageTable::kPageBits);
+		if (owner == nullptr || !*owner) {
+			missing.Add(page, CACHING_PAGESIZE);
+		} else {
+			TouchBuffer(m_slot_buffers[*owner]);
+		}
+	}
+	missing.ForEach(
+	    [this](uint64_t first, uint64_t last) { (void)FindBuffer(first, last - first); });
+	if (!store) {
+		return;
+	}
+	for (auto page = begin; page < tracked_end; page += CACHING_PAGESIZE) {
+		if (!m_bda_tracked_ranges.Contains(page, CACHING_PAGESIZE)) {
+			ResolveBdaFault(page, CACHING_PAGESIZE);
+		}
+	}
+}
+
+void BufferCache::ForgetBdaResidency(uint64_t vaddr, uint64_t size) {
+	m_bda_pinned_ranges.Subtract(vaddr, size);
 }
 
 void BufferCache::MarkBdaStoresInMapped(const RangeSet& mapped, bool all_tracked) {

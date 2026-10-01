@@ -89,6 +89,7 @@ public:
 	void               ProcessFaultBuffer();
 	// A BDA fault on an owned page can only come from a store, which promotes the page to tracked.
 	void ResolveBdaFault(uint64_t vaddr, uint64_t size);
+	void ForgetBdaResidency(uint64_t vaddr, uint64_t size);
 	void SynchronizeBda(const RangeSet& mapped);
 	void QueueBdaSync(uint64_t vaddr, uint64_t size) { m_memory_tracker.QueueBdaSync(vaddr, size); }
 	// Marks the tracked pages a BDA store can reach GPU-written, restricted to mapped memory.
@@ -164,6 +165,7 @@ private:
 	RangeSet                m_bda_tracked_ranges;
 	// Tracked since the last mark, so stores that ran before tracking are owned without a rerun.
 	RangeSet m_bda_unmarked_ranges;
+	RangeSet m_bda_pinned_ranges;
 };
 
 } // namespace Libs::Graphics

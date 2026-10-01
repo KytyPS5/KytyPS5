@@ -5625,6 +5625,103 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  void CheckBufferCacheBdaResidency() {
+    constexpr const char *name = "BufferCacheBdaResidency";
+    constexpr uintptr_t base = 0x0000000208000000ull;
+    constexpr uint64_t allocation_size = 0x100000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t page = BufferCache::CACHING_PAGESIZE;
+    constexpr uint64_t bda_offset = 4 * page;
+    constexpr uint64_t host_offset = 12 * page;
+    constexpr uint64_t unlimited = std::numeric_limits<uint64_t>::max();
+    constexpr uint32_t collections = 200;
+
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "BDA-residency direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "BDA-residency fixed direct-memory mapping failed");
+
+    {
+      auto &cache = context.GetBufferCache();
+      context.MapMemory(base, allocation_size);
+      const auto owner_of = [&](uint64_t offset) {
+        return BufferCacheTestAccess::PageOwner(cache, base + offset);
+      };
+      const auto collect = [&](uint64_t critical) {
+        BufferCacheTestAccess::SetGarbageCollectionThresholds(cache, 0, critical);
+        for (uint32_t tick = 0; tick < collections; tick++) {
+        }
+        BufferCacheTestAccess::SetGarbageCollectionThresholds(cache, unlimited, unlimited);
+      };
+
+      const auto host_owner = cache.FindBuffer(base + host_offset, page);
+      Require(name, "fault target unowned",
+              host_owner && owner_of(host_offset) == host_owner && !owner_of(bda_offset),
+              "the setup left the BDA page owned before any fault");
+      cache.ResolveBdaFault(base + bda_offset, page);
+      const auto bda_owner = owner_of(bda_offset);
+      Require(name, "fault resolves", static_cast<bool>(bda_owner),
+              "a BDA fault on an unowned page did not create its owner");
+
+      collect(0);
+      Require(name, "aggressive collection runs", !owner_of(host_offset),
+              "aggressive collection kept an untouched host buffer");
+      Require(name, "aggressive keeps BDA pages",
+              owner_of(bda_offset) == bda_owner &&
+                  BufferCacheTestAccess::IsBufferAllocated(cache, bda_owner),
+              "aggressive collection evicted a page only BDA reaches");
+
+      collect(unlimited);
+      Require(name, "normal keeps BDA pages", owner_of(bda_offset) == bda_owner,
+              "normal collection evicted a page only BDA reaches");
+
+      context.UnmapMemory(base, allocation_size);
+      context.MapMemory(base, allocation_size);
+      Require(name, "unmap keeps owner", owner_of(bda_offset) == bda_owner,
+              "an unmap dropped the owner it should keep for a remap");
+      collect(0);
+      Require(name, "unmap forgets pin", !owner_of(bda_offset),
+              "a BDA pin survived the unmap of its page");
+
+      cache.ResolveBdaFault(base + bda_offset, page);
+      const auto refaulted = owner_of(bda_offset);
+      collect(0);
+      Require(name, "refault pins again",
+              static_cast<bool>(refaulted) && owner_of(bda_offset) == refaulted,
+              "a page faulted back in after an unmap was not pinned");
+
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "BDA-residency direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "BDA-residency direct-memory allocation release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   // A refused program drops its dispatch, stays dropped, and leaves the cache working.
   void CheckRefusedShaderSkipsDispatch() {
     constexpr const char *name = "RefusedShaderSkipsDispatch";
@@ -54044,6 +54141,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-bda-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckBufferCacheBdaStoreOwnership();
+    vulkan.CheckBufferCacheBdaResidency();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--sampled-depth-resource-only") == 0) {
@@ -54301,6 +54399,7 @@ int main(int argc, char **argv) {
     vulkan.CheckRasterization(false, Prospero::BufferFormat::k10_10_10_2UScaled);
     vulkan.CheckBufferCacheDirtyGarbageCollection();
     vulkan.CheckBufferCacheBdaStoreOwnership();
+    vulkan.CheckBufferCacheBdaResidency();
   } else {
     skipped_device_checks = true;
   }

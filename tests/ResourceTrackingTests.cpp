@@ -8925,6 +8925,52 @@ bool StoresDecodedInShader(const Program &program) {
   });
 }
 
+void TestDmaPointerFromSrt() {
+  Fixture fixture;
+  const auto table = fixture.Address(fixture.UserData(0), fixture.UserData(1), 0x10);
+  MemoryInfo word;
+  word.kind = ResourceKind::ScalarAddress;
+  std::array<Value, 2> pointer;
+  for (uint32_t dword = 0; dword < 2; dword++) {
+    pointer[dword] = fixture.Emit(ValueOpcode::LoadAddressU32,
+                                  {table, Value(dword * 4u), Value(0u), Value(true)},
+                                  fixture.AddMemory(word, 0x10 + dword * 4u));
+  }
+  MemoryInfo global;
+  global.kind = ResourceKind::Global;
+  fixture.Emit(ValueOpcode::LoadAddressU32,
+               {fixture.Address(pointer[0], pointer[1], 0x20), Value(0u), Value(0u), Value(true)},
+               fixture.AddMemory(global, 0x20));
+  const auto lane = fixture.Emit(ValueOpcode::UndefU32);
+  fixture.Emit(ValueOpcode::StoreAddressU32,
+               {fixture.Address(pointer[0], pointer[1], 0x28), lane, Value(0u), Value(9u),
+                Value(true)},
+               fixture.AddMemory(global, 0x28));
+  fixture.PlanAndTrack();
+
+  Check(fixture.program.info.writes_dma && fixture.program.has_address_writes,
+        "a FLAT address store did not report a BDA store");
+  const auto &pointers = fixture.program.info.dma_pointers;
+  Check(pointers.size() == 2 && !pointers[0].user_data && !pointers[0].store &&
+            pointers[1].store && pointers[1].lo == pointers[0].lo &&
+            pointers[1].hi == pointers[0].hi,
+        "the SRT-held pointer of a DMA load and a DMA store was not named for prefetch");
+  const auto &reads = fixture.program.srt_reads;
+  Check(pointers[0].lo < reads.size() && pointers[0].hi < reads.size() &&
+            reads[pointers[0].lo].value.Resolve() == pointer[0].Resolve() &&
+            reads[pointers[0].hi].value.Resolve() == pointer[1].Resolve(),
+        "the prefetch slots do not name the two pointer dwords");
+
+  Fixture user;
+  user.Emit(ValueOpcode::LoadAddressU32,
+            {user.Address(user.UserData(0), user.UserData(1), 0x10), Value(0u), Value(0u),
+             Value(true)},
+            user.AddMemory(global, 0x10));
+  user.PlanAndTrack();
+  Check(user.program.info.dma_pointers.size() == 1 &&
+            user.program.info.dma_pointers[0] == DmaPointer{.user_data = true, .lo = 0, .hi = 1},
+        "a user-data DMA read pointer was not named for prefetch");
+}
 
 // A captured scalar read of a written buffer leaves the overlap list only if no store precedes it.
 } // namespace

@@ -84,6 +84,7 @@ public:
 	bool     AudioOutClose(Id handle);
 	bool     AudioOutValid(Id handle);
 	bool     AudioOutHasDevice(Id handle);
+	int64_t  AudioOutQueuedUs(Id handle);
 	bool     AudioOutSetVolume(Id handle, uint32_t bitflag, const int* volume);
 	uint32_t AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking = true);
 	bool     AudioOutGetStatus(Id handle, int* type, int* channels_num);
@@ -165,6 +166,10 @@ void AudioOutClose(int handle) {
 
 bool AudioOutHasDevice(int handle) {
 	return g_audio != nullptr && handle > 0 && g_audio->AudioOutHasDevice(Audio::Id(handle));
+}
+
+int64_t AudioOutQueuedUs(int handle) {
+	return g_audio != nullptr && handle > 0 ? g_audio->AudioOutQueuedUs(Audio::Id(handle)) : -1;
 }
 
 uint32_t AudioOutOutputs(const OutputParam* params, uint32_t num, bool blocking) {
@@ -484,6 +489,25 @@ bool Audio::AudioOutHasDevice(Id handle) {
 
 	return (handle.GetId() >= 0 && handle.GetId() < OUT_PORTS_MAX &&
 	        m_out_ports[handle.GetId()].used && m_out_ports[handle.GetId()].stream != nullptr);
+}
+
+int64_t Audio::AudioOutQueuedUs(Id handle) {
+	Common::LockGuard lock(m_mutex);
+
+	if (handle.GetId() < 0 || handle.GetId() >= OUT_PORTS_MAX) {
+		return -1;
+	}
+	const auto& port = m_out_ports[handle.GetId()];
+	if (!port.used || port.stream == nullptr || port.freq == 0) {
+		return -1;
+	}
+	const auto bytes_per_frame = BytesPerSample(port.format) * OutputChannels(port);
+	const auto queued          = SDL_GetAudioStreamQueued(port.stream);
+	if (queued < 0 || bytes_per_frame == 0) {
+		return -1;
+	}
+	return static_cast<int64_t>(static_cast<uint64_t>(queued) / bytes_per_frame * 1000000u /
+	                            port.freq);
 }
 
 bool Audio::AudioOutGetStatus(Id handle, int* type, int* channels_num) {

@@ -28,6 +28,10 @@ size_t                            g_capture_bytes = 0;
 int                               g_next_device  = 1;
 int                               g_open_waiters = 0;
 bool                              g_block_opens  = false;
+// Off: the fake devices play everything at once. On: they keep every grain (512 samples at
+// 48 kHz) and play nothing, so the queue level grows with each output.
+bool                              g_devices_keep_audio = false;
+int64_t                           g_device_queued_us   = 0;
 
 void Check(bool value, const char* text) {
 	if (!value) {
@@ -318,7 +322,9 @@ void TestSynchronousDevicePushBypassesModelledQueue() {
 	      "device-paced sync push was blocked by modelled queue");
 	const auto calls = OutputCalls();
 	Check(calls.size() == 2, "sync pushes did not reach the device backend");
-	Check(calls[0] && calls[1], "sync pushes lost their blocking mode");
+	// The context's queue level (what the device still has to play) paces a push to a device, so
+	// the backend takes each grain without pacing it again.
+	Check(!calls[0] && !calls[1], "device-paced sync pushes were paced again by the backend");
 
 	AudioOut2::AudioOut2PortDestroy(port);
 	AudioOut2::AudioOut2ContextDestroy(context);
@@ -342,7 +348,7 @@ void TestFloat12ChannelPortOutputsPcm() {
 	ResetOutputCalls();
 	Check(AudioOut2::AudioOut2ContextPush(context, 1) == OK, "12-channel PCM push failed");
 	const auto calls = OutputCalls();
-	Check(calls.size() == 1 && calls[0], "12-channel PCM did not reach the device backend");
+	Check(calls.size() == 1 && !calls[0], "12-channel PCM did not reach the device backend");
 
 	AudioOut2::AudioOut2PortDestroy(port);
 	Check(LiveDeviceCount() == 0, "12-channel port leaked its audio device");
@@ -359,18 +365,31 @@ void TestAsynchronousDevicePushKeepsQueueBounded() {
 	uint32_t pcm[512] {};
 	SetPcm(port, pcm);
 	ResetOutputCalls();
+	{
+		std::lock_guard lock(g_device_mutex);
+		g_devices_keep_audio = true;
+		g_device_queued_us   = 0;
+	}
 
+	// The level is what the device still has to play beyond a 20 ms cushion: at depth 1 two
+	// 512-sample grains (21.3 ms) fill it, and the third async push is refused.
 	Check(AudioOut2::AudioOut2ContextPush(context, 0) == OK, "first async push failed");
+	Check(AudioOut2::AudioOut2ContextPush(context, 0) == OK, "second async push failed");
 	Check(AudioOut2::AudioOut2ContextPush(context, 0) != OK,
 	      "full async queue accepted another buffer");
 	const auto calls = OutputCalls();
-	Check(calls.size() == 1 && !calls[0], "rejected async push reached the device backend");
+	Check(calls.size() == 2 && !calls[0] && !calls[1],
+	      "rejected async push reached the device backend");
 
 	uint32_t queued    = 0;
 	uint32_t available = 0;
 	Check(AudioOut2::AudioOut2ContextGetQueueLevel(context, &queued, &available) == OK,
 	      "queue-level query failed");
 	Check(queued == 1 && available == 0, "async queue level does not match accepted pushes");
+	{
+		std::lock_guard lock(g_device_mutex);
+		g_devices_keep_audio = false;
+	}
 
 	AudioOut2::AudioOut2PortDestroy(port);
 	AudioOut2::AudioOut2ContextDestroy(context);
@@ -464,9 +483,20 @@ bool AudioOutHasDevice(int handle) {
 	       g_device_backed_handles.end();
 }
 
+int64_t AudioOutQueuedUs(int handle) {
+	if (!AudioOutHasDevice(handle)) {
+		return -1;
+	}
+	std::lock_guard lock(g_device_mutex);
+	return g_devices_keep_audio ? g_device_queued_us : 0;
+}
+
 uint32_t AudioOutOutputs(const OutputParam* params, uint32_t num, bool blocking) {
 	std::lock_guard lock(g_device_mutex);
 	g_output_blocking.push_back(blocking);
+	if (g_devices_keep_audio) {
+		g_device_queued_us += 512 * 1000000 / 48000;
+	}
 	if (g_capture_bytes != 0) {
 		for (uint32_t i = 0; i < num; i++) {
 			const auto* bytes = static_cast<const uint8_t*>(params[i].data);

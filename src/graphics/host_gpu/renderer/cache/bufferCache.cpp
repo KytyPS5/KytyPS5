@@ -589,8 +589,14 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionCpuModified(vaddr, size);
 }
 
+void BufferCache::TickFrame() {
+	++m_gc_tick;
+}
+
 void BufferCache::RunGarbageCollector() {
-	const auto tick = m_gc_tick++;
+	// Ages are counted in presented frames. Collection runs after every submission, often dozens
+	// per frame, so counting submissions would retire buffers the game reuses every few frames.
+	const auto tick = m_gc_tick;
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}

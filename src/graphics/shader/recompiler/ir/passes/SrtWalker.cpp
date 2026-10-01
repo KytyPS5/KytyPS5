@@ -384,7 +384,11 @@ bool SrtWalker::Arg(const Inst& inst, size_t index, uint64_t& result) {
 }
 
 bool SrtWalker::EvaluatePhi(const Inst& inst, uint64_t& result) {
-	const auto value = ResolveInvariantPhi(m_program, Value(const_cast<Inst*>(&inst)));
+	auto [cached, inserted] = m_program.invariant_phis.try_emplace(&inst);
+	if (inserted) {
+		cached->second = ResolveInvariantPhi(m_program, Value(const_cast<Inst*>(&inst)));
+	}
+	const auto value = cached->second;
 	return !value.IsEmpty() && EvaluateWide(value, result);
 }
 

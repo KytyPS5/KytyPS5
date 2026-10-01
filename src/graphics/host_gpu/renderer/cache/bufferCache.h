@@ -81,6 +81,7 @@ public:
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               ProcessFaultBuffer();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
+	void               TickFrame();
 	void               RunGarbageCollector();
 
 private:

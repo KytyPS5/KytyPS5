@@ -155,6 +155,31 @@ public:
 
 	[[nodiscard]] constexpr bool Any() const { return !None(); }
 
+	// Equivalent to BitArray(*this, start, end).Any() without materializing the masked copy.
+	[[nodiscard]] constexpr bool AnyInRange(size_t start, size_t end) const {
+		if (start >= end || end > N) {
+			return false;
+		}
+
+		const auto first_word = start / BITS_PER_WORD;
+		const auto last_word  = (end - 1) / BITS_PER_WORD;
+		const auto start_bit  = start % BITS_PER_WORD;
+		const auto end_bit    = (end - 1) % BITS_PER_WORD;
+		const auto start_mask = ~uint64_t {0} << start_bit;
+		const auto end_mask =
+		    end_bit == BITS_PER_WORD - 1 ? ~uint64_t {0} : (uint64_t {1} << (end_bit + 1)) - 1;
+
+		if (first_word == last_word) {
+			return (m_data[first_word] & start_mask & end_mask) != 0;
+		}
+
+		uint64_t combined = (m_data[first_word] & start_mask) | (m_data[last_word] & end_mask);
+		for (auto word = first_word + 1; word < last_word; word++) {
+			combined |= m_data[word];
+		}
+		return combined != 0;
+	}
+
 	[[nodiscard]] constexpr Range FirstRangeFrom(size_t start) const {
 		if (start >= N) {
 			return {N, N};

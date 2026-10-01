@@ -297,6 +297,37 @@ void TestTrackerSizedRandomizedDifferential() {
   }
 }
 
+void TestAnyInRangeMatchesMaskedCopy() {
+  // Exhaustive over every [start, end) of a 256-bit array, including empty
+  // and out-of-bounds ranges, for boundary-heavy and randomized patterns.
+  using RangeBits = Common::BitArray<256>;
+  std::array<RangeBits, 6> patterns{};
+  patterns[1].Fill();
+  patterns[2].Set(0);
+  patterns[3].Set(63);
+  patterns[3].Set(64);
+  patterns[4].Set(255);
+  uint64_t random = 0x2545'f491'4f6c'dd1dull;
+  for (size_t index = 0; index < 256; index++) {
+    random ^= random << 13;
+    random ^= random >> 7;
+    random ^= random << 17;
+    if ((random & 7) == 0) {
+      patterns[5].Set(index);
+    }
+  }
+
+  for (const auto &bits : patterns) {
+    for (size_t start = 0; start <= 257; start++) {
+      for (size_t end = 0; end <= 257; end++) {
+        Check(bits.AnyInRange(start, end) ==
+                  RangeBits(bits, start, end).Any(),
+              "AnyInRange diverged from the masked-copy query");
+      }
+    }
+  }
+}
+
 } // namespace
 
 int main() {
@@ -305,6 +336,7 @@ int main() {
   TestRangeDiscoveryAndIteration();
   TestRandomizedDifferential();
   TestTrackerSizedRandomizedDifferential();
+  TestAnyInRangeMatchesMaskedCopy();
   std::puts("BitArrayTests: all cases passed");
   return 0;
 }

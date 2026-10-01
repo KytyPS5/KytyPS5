@@ -89,19 +89,19 @@ public:
 	[[nodiscard]] bool IsModified(uint64_t offset, uint64_t size) const {
 		const auto [start, end] = GetPageRange(m_cpu_addr + offset, size);
 		const auto& bits        = GetBits<source>();
-		return RegionBits(bits, start, end).Any();
+		return bits.AnyInRange(start, end);
 	}
 
 	template <DirtySource source, bool enable>
 	void ChangeState(uint64_t vaddr, uint64_t size) {
 		const auto [start, end] = GetPageRange(vaddr, size);
 		if constexpr (source == DirtySource::Cpu && enable) {
-			if (RegionBits(m_gpu_dirty, start, end).Any()) {
+			if (m_gpu_dirty.AnyInRange(start, end)) {
 				EXIT("CPU dirty state conflicts with GPU dirty state\n");
 			}
 		}
 		if constexpr (source == DirtySource::Gpu && enable) {
-			if (RegionBits(m_cpu_dirty, start, end).Any()) {
+			if (m_cpu_dirty.AnyInRange(start, end)) {
 				EXIT("GPU dirty state conflicts with CPU dirty state\n");
 			}
 		}

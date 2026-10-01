@@ -54,6 +54,7 @@ public:
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
 	void               PrepareBda();
+	void               TickFrame();
 	void               RunGarbageCollector();
 
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);

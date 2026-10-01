@@ -4243,6 +4243,7 @@ public:
 
       for (uint32_t tick = 0; tick < 160; tick++) {
         cache.RunGarbageCollector();
+        cache.TickFrame();
       }
       Require(name, "age before pressure",
               cache.IsRegionRegistered(base, allocation_size),
@@ -4251,6 +4252,7 @@ public:
           cache, 0, std::numeric_limits<uint64_t>::max());
       const auto gc_submission_tick = scheduler.CurrentTick();
       cache.RunGarbageCollector();
+      cache.TickFrame();
       uint32_t first_before_completion = 0;
       uint32_t second_before_completion = 0;
       Libs::LibKernel::Memory::TryReadBacking(base + first_offset,
@@ -4295,6 +4297,7 @@ public:
         release_older_publication.release();
       });
       cache.RunGarbageCollector();
+      cache.TickFrame();
       gc_returned = true;
       release_publication.join();
       scheduler.WaitPriorityOperations(older_publication_tick);
@@ -4337,6 +4340,7 @@ public:
       }
       for (uint32_t tick = 0; tick < 160; tick++) {
         cache.RunGarbageCollector();
+        cache.TickFrame();
       }
       constexpr uint64_t starvation_clean_offset =
           starvation_offset + starvation_count * starvation_stride;
@@ -4347,10 +4351,12 @@ public:
               "failed to create the clean starvation candidate");
       for (uint32_t tick = 0; tick <= 160; tick++) {
         cache.RunGarbageCollector();
+        cache.TickFrame();
       }
       BufferCacheTestAccess::SetGarbageCollectionThresholds(
           cache, 0, std::numeric_limits<uint64_t>::max());
       cache.RunGarbageCollector();
+      cache.TickFrame();
       Require(
           name, "normal-GC dirty bypass",
           cache.IsRegionRegistered(base + starvation_offset,
@@ -4366,6 +4372,7 @@ public:
       const auto starvation_retired =
           BufferCacheTestAccess::PageOwner(cache, base + starvation_offset);
       cache.RunGarbageCollector();
+      cache.TickFrame();
       Require(name, "critical-GC starvation cleanup",
               !cache.IsRegionRegistered(base + starvation_offset,
                                         sizeof(starvation_value)) &&
@@ -4390,6 +4397,7 @@ public:
           cache.FindBuffer(base + obtained_offset, residency_size);
       for (uint32_t tick = 0; tick <= 160; tick++) {
         cache.RunGarbageCollector();
+        cache.TickFrame();
       }
       Require(name, "lookup-only owner identity",
               cache.FindBuffer(base + lookup_only_offset, residency_size) ==
@@ -4400,6 +4408,7 @@ public:
       BufferCacheTestAccess::SetGarbageCollectionThresholds(
           cache, 0, std::numeric_limits<uint64_t>::max());
       cache.RunGarbageCollector();
+      cache.TickFrame();
       Require(name, "lookup versus acquisition residency",
               !cache.IsRegionRegistered(base + lookup_only_offset,
                                         residency_size) &&
@@ -4500,6 +4509,7 @@ public:
         const auto large_submission_tick = scheduler.CurrentTick();
         for (uint32_t tick = 0; tick <= 160; tick++) {
           cache.RunGarbageCollector();
+          cache.TickFrame();
         }
         // The capacity-sized case can wrap the ring; the oversized case must
         // keep its separate staging allocation alive through publication.
@@ -4561,6 +4571,7 @@ public:
                        grouped_second_value, false);
       for (uint32_t tick = 0; tick <= 160; tick++) {
         cache.RunGarbageCollector();
+        cache.TickFrame();
       }
       Require(name, "per-owner fixed-ring retirement",
               !cache.IsRegionRegistered(base + grouped_first_offset,
@@ -4663,6 +4674,7 @@ public:
       const auto sparse_gc_tick = scheduler.CurrentTick();
       for (uint32_t tick = 0; tick <= 160; ++tick) {
         cache.RunGarbageCollector();
+        cache.TickFrame();
       }
       Require(name, "sparse multi-owner GC submission",
               scheduler.CurrentTick() == sparse_gc_tick + 1 &&
@@ -4691,6 +4703,7 @@ public:
                        disjoint_value, false);
       for (uint32_t tick = 0; tick <= 160; tick++) {
         cache.RunGarbageCollector();
+        cache.TickFrame();
       }
       Require(name, "disjoint synchronized retirement",
               !cache.IsRegionRegistered(base + disjoint_owner_offset,
@@ -4753,6 +4766,7 @@ public:
                        reacquire_value, false);
       for (uint32_t tick = 0; tick <= 160; tick++) {
         cache.RunGarbageCollector();
+        cache.TickFrame();
       }
       Require(name, "reacquire synchronized retirement",
               !cache.IsRegionRegistered(base + reacquire_owner_offset,

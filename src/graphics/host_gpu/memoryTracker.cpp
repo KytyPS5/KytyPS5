@@ -66,10 +66,13 @@ RegionManager* MemoryTracker::GetOrCreateRegion(uint64_t index) {
 	return ptr;
 }
 
+// The dirty queries run for every bound buffer of every draw, so they read the bitmaps without
+// taking the region lock. GPU dirty bits are only written on the GPU thread. CPU dirty bits are
+// also set by write-fault handlers on guest threads; an aligned 64-bit load cannot tear on the
+// supported x86-64 hosts, and a locked read would be just as stale once the lock was released.
 bool MemoryTracker::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
 	return Iterate<true>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-		std::scoped_lock lock(manager->lock);
 		return manager->IsModified<DirtySource::Cpu>(offset, bytes);
 	});
 }
@@ -77,7 +80,6 @@ bool MemoryTracker::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 bool MemoryTracker::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
 	return Iterate<false>(vaddr, size, [](RegionManager* manager, uint64_t offset, uint64_t bytes) {
-		std::scoped_lock lock(manager->lock);
 		return manager->IsModified<DirtySource::Gpu>(offset, bytes);
 	});
 }

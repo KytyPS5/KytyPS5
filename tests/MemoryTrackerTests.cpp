@@ -23,6 +23,8 @@
 #undef min
 #undef max
 #elif defined(__APPLE__)
+#include "macosMemoryTestAllocation.h"
+
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #include <mach-o/dyld.h>
@@ -127,19 +129,12 @@ std::map<void *, size_t> &AllocationSizes() {
 
 void *VirtualAlloc(void *address, size_t size, DWORD, uint32_t protection) {
 #if defined(__APPLE__)
-  mach_vm_address_t raw_address = reinterpret_cast<mach_vm_address_t>(address);
-  const auto flags = address != nullptr ? VM_FLAGS_FIXED : VM_FLAGS_ANYWHERE;
-  if (mach_vm_allocate(mach_task_self(), &raw_address, size, flags) !=
-      KERN_SUCCESS) {
+  void *raw = MacosMemoryTest::Allocate(
+      reinterpret_cast<mach_vm_address_t>(address), size,
+      static_cast<vm_prot_t>(ToHostProt(protection)));
+  if (raw == nullptr) {
     return nullptr;
   }
-  if (mach_vm_protect(mach_task_self(), raw_address, size, false,
-                      static_cast<vm_prot_t>(ToHostProt(protection))) !=
-      KERN_SUCCESS) {
-    mach_vm_deallocate(mach_task_self(), raw_address, size);
-    return nullptr;
-  }
-  void *raw = reinterpret_cast<void *>(raw_address);
   AllocationSizes()[raw] = size;
   return raw;
 #else
@@ -238,19 +233,49 @@ struct TrackerHarness {
   MemoryTracker tracker;
 };
 
+bool IsExpectedAllocation(const void *memory, uintptr_t preferred_address) {
+#if defined(__APPLE__)
+  constexpr auto mask = Libs::Graphics::TRACKER_REGION_SIZE - 1;
+  return memory != nullptr && (reinterpret_cast<uintptr_t>(memory) & mask) ==
+                                  (preferred_address & mask);
+#else
+  return memory == reinterpret_cast<const void *>(preferred_address);
+#endif
+}
+
 uint8_t *Allocate(PageManager &manager, uint64_t pages) {
   constexpr uintptr_t base = 0x0000000200010000ull;
   const auto size = manager.GetPageSize() * pages;
   auto *memory = static_cast<uint8_t *>(
       VirtualAlloc(reinterpret_cast<void *>(base), size,
                    MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-  Check(memory == reinterpret_cast<void *>(base), "fixed VirtualAlloc failed");
+  Check(IsExpectedAllocation(memory, base), "guest test allocation failed");
   return memory;
 }
 
 void Release(uint8_t *memory) {
   Check(VirtualFree(memory, 0, MEM_RELEASE) != 0, "VirtualFree failed");
 }
+
+#if defined(__APPLE__)
+void TestAllocationWithOccupiedAddress() {
+  TrackerHarness harness;
+  const auto size = harness.page_manager.GetPageSize();
+  auto *first = Allocate(harness.page_manager, 1);
+  first[0] = 0x5a;
+  const auto preferred_address = reinterpret_cast<uintptr_t>(first);
+  auto *second = static_cast<uint8_t *>(
+      VirtualAlloc(first, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+  Check(IsExpectedAllocation(second, preferred_address) && second != first,
+        "occupied guest address was not relocated with its region offset");
+  Check(first[0] == 0x5a && second[0] == 0,
+        "relocated allocation changed an existing mapping");
+  second[0] = 0xa5;
+  Check(first[0] == 0x5a, "relocated allocations overlap");
+  Release(second);
+  Release(first);
+}
+#endif
 
 void TestRangeSet() {
   RangeSet ranges;
@@ -394,7 +419,7 @@ void TestRangeInvalidation() {
   auto *memory = static_cast<uint8_t *>(
       VirtualAlloc(reinterpret_cast<void *>(base), size,
                    MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-  Check(memory == reinterpret_cast<void *>(base),
+  Check(IsExpectedAllocation(memory, base),
         "range invalidation allocation failed");
   const auto address = reinterpret_cast<uint64_t>(memory);
 
@@ -623,7 +648,7 @@ void TestCrossRegionUpload() {
   auto *memory = static_cast<uint8_t *>(
       VirtualAlloc(reinterpret_cast<void *>(base), region_size * 2,
                    MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-  Check(memory == reinterpret_cast<void *>(base), "fixed VirtualAlloc failed");
+  Check(IsExpectedAllocation(memory, base), "guest test allocation failed");
   const auto address = reinterpret_cast<uint64_t>(memory);
   const auto boundary = (address + region_size - 1) & ~(region_size - 1);
   uint32_t ranges = 0;
@@ -1010,6 +1035,9 @@ int main(int argc, char **argv) {
   if (argc == 3 && std::strcmp(argv[1], "--death") == 0) {
     RunDeathCase(argv[2]);
   }
+#if defined(__APPLE__)
+  TestAllocationWithOccupiedAddress();
+#endif
   TestGuestRange();
   TestRangeSet();
   TestQueriesDoNotRequireMappedOwnership();

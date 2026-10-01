@@ -4341,8 +4341,8 @@ void TestBvhIntersections() {
       case ValueOpcode::IMul32: result = static_cast<uint32_t>(a * b); break;
       case ValueOpcode::IAdd64: result = a + b; break;
       case ValueOpcode::ISub64: result = a - b; break;
-      case ValueOpcode::ShiftLeftLogical32: result = static_cast<uint32_t>(a << b); break;
-      case ValueOpcode::ShiftRightLogical32: result = static_cast<uint32_t>(a) >> b; break;
+      case ValueOpcode::ShiftLeftLogical32: result = static_cast<uint32_t>(a) << (b & 31u); break;
+      case ValueOpcode::ShiftRightLogical32: result = static_cast<uint32_t>(a) >> (b & 31u); break;
       case ValueOpcode::ShiftLeftLogical64: result = a << b; break;
       case ValueOpcode::ShiftRightLogical64: result = a >> b; break;
       case ValueOpcode::BitwiseAnd32:

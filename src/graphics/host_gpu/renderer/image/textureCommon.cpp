@@ -287,6 +287,123 @@ std::vector<vk::BufferImageCopy> TextureBuildImageCopies(const TextureUploadLayo
 	return regions;
 }
 
+bool TextureDownloadCoversRange(const TextureUploadLayout&           layout,
+                                std::span<const vk::BufferImageCopy> regions,
+                                std::span<const GpuTileInfo> tiles, uint64_t offset,
+                                uint64_t size) {
+	if (size == 0 || offset > UINT64_MAX - size || regions.empty()) {
+		return false;
+	}
+	const auto end = offset + size;
+	if (layout.surface.description.tile_mode == Prospero::TileMode::kLinear) {
+		if (!tiles.empty()) {
+			return false;
+		}
+		TileTextureElementLayout element {};
+		if (!TileGetTextureElementLayout(layout.surface.description.format, element) ||
+		    element.bytes == 0 || element.texel_width == 0 || element.texel_height == 0) {
+			return false;
+		}
+		size_t selected = regions.size();
+		for (uint64_t cursor = offset; cursor < end;) {
+			uint64_t covered_end = cursor;
+			for (size_t index = 0; index < regions.size(); ++index) {
+				if (selected != regions.size() && selected != index) {
+					continue;
+				}
+				const auto& region = regions[index];
+				if (region.imageExtent.depth != 1 || region.imageSubresource.layerCount != 1 ||
+				    region.imageExtent.width == 0 || region.imageExtent.height == 0) {
+					continue;
+				}
+				const uint64_t row_length =
+				    region.bufferRowLength != 0 ? region.bufferRowLength : region.imageExtent.width;
+				const uint64_t row_bytes =
+				    ((row_length + element.texel_width - 1) / element.texel_width) * element.bytes;
+				const uint64_t active_bytes =
+				    ((static_cast<uint64_t>(region.imageExtent.width) + element.texel_width - 1) /
+				     element.texel_width) *
+				    element.bytes;
+				const uint64_t active_rows =
+				    (static_cast<uint64_t>(region.imageExtent.height) + element.texel_height - 1) /
+				    element.texel_height;
+				if (row_bytes == 0 || row_bytes < active_bytes || cursor < region.bufferOffset) {
+					continue;
+				}
+				const auto relative = cursor - region.bufferOffset;
+				const auto row      = relative / row_bytes;
+				const auto column   = relative % row_bytes;
+				if (row < active_rows && column < active_bytes) {
+					selected    = index;
+					covered_end = std::max(covered_end,
+					                       cursor + std::min(active_bytes - column, end - cursor));
+				}
+			}
+			if (covered_end == cursor) {
+				return false;
+			}
+			cursor = std::min(covered_end, end);
+		}
+		return true;
+	}
+
+	if (tiles.size() != regions.size()) {
+		return false;
+	}
+	size_t selected = tiles.size();
+	for (uint64_t cursor = offset; cursor < end;) {
+		uint64_t covered_end = cursor;
+		for (size_t index = 0; index < tiles.size(); ++index) {
+			if (selected != tiles.size() && selected != index) {
+				continue;
+			}
+			const auto&     tile   = tiles[index];
+			const auto&     region = regions[index];
+			TileBlockLayout block {};
+			if (tile.tail || tile.depth != 1 || region.imageExtent.depth != 1 ||
+			    region.imageSubresource.layerCount != 1 || region.bufferImageHeight != 0 ||
+			    tile.tiled_offset > UINT64_MAX - tile.tiled_size ||
+			    !TileGetBlockLayout(tile.family, tile.bytes_per_element, block) ||
+			    block.block_depth != 1 || block.block_size == 0 || cursor < tile.tiled_offset ||
+			    cursor - tile.tiled_offset >= tile.tiled_size) {
+				continue;
+			}
+			const auto texel_width  = layout.surface.texture.texel_width;
+			const auto texel_height = layout.surface.texture.texel_height;
+			if (texel_width == 0 || texel_height == 0 ||
+			    static_cast<uint64_t>(tile.width) * texel_width != region.imageExtent.width ||
+			    static_cast<uint64_t>(tile.height) * texel_height != region.imageExtent.height) {
+				continue;
+			}
+			const uint64_t columns =
+			    (static_cast<uint64_t>(tile.tiled_width) + block.block_width - 1) /
+			    block.block_width;
+			if (columns == 0) {
+				continue;
+			}
+			const auto block_index = (cursor - tile.tiled_offset) / block.block_size;
+			const auto block_x     = block_index % columns;
+			const auto block_y     = block_index / columns;
+			// The tiler writes only dispatched texels. A complete physical tile is safe;
+			// partial edge tiles, packed mip tails, and allocation padding are not.
+			if ((block_x + 1) * block.block_width > tile.width ||
+			    (block_y + 1) * block.block_height > tile.height) {
+				continue;
+			}
+			const auto block_end = tile.tiled_offset + (block_index + 1) * block.block_size;
+			if (block_end <= tile.tiled_offset + tile.tiled_size) {
+				selected    = index;
+				covered_end = std::max(covered_end, block_end);
+			}
+		}
+		if (covered_end == cursor) {
+			return false;
+		}
+		cursor = std::min(covered_end, end);
+	}
+	return true;
+}
+
 bool TextureBuildGpuTileInfos(uint64_t tiled_size, const std::vector<vk::BufferImageCopy>& regions,
                               const TextureUploadLayout& layout, uint32_t levels,
                               std::vector<GpuTileInfo>& out_tile_infos) {

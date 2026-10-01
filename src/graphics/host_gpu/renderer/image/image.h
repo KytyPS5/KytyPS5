@@ -5,6 +5,8 @@
 #include "common/assert.h"
 #include "common/slotVector.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/rangeSet.h"
+#include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 
 #include <compare>
@@ -71,6 +73,9 @@ public:
 
 	void InvalidateCpuWrite(uint64_t vaddr, uint64_t size) {
 		if (ImageRangeOverlaps(info.data.address, info.data.size, vaddr, size)) {
+			if (m_gpu_modified) {
+				m_cpu_write_ranges_after_gpu.Add(vaddr, size);
+			}
 			m_cpu_dirty        = true;
 			m_maybe_cpu_dirty  = false;
 			m_maybe_hash_valid = false;
@@ -114,11 +119,23 @@ public:
 		m_cpu_dirty        = false;
 		m_maybe_cpu_dirty  = false;
 		m_maybe_hash_valid = false;
+		m_cpu_write_ranges_after_gpu.Clear();
 	}
 
 	[[nodiscard]] bool IsGpuModified() const noexcept { return m_gpu_modified; }
 	void               MarkGpuModified() noexcept { m_gpu_modified = true; }
-	void               ClearGpuModified() noexcept { m_gpu_modified = false; }
+	void               ClearGpuModified() noexcept {
+		m_gpu_modified = false;
+		m_cpu_write_ranges_after_gpu.Clear();
+	}
+	[[nodiscard]] bool IsRangeCpuSuperseded(uint64_t address, uint64_t size) const {
+		return m_cpu_write_ranges_after_gpu.Contains(address, size);
+	}
+	[[nodiscard]] bool HasCpuWriteAfterGpuOwnership(uint64_t address, uint64_t size) const {
+		const auto begin = Common::AlignDown(address, TRACKER_PAGE_SIZE);
+		const auto end   = Common::AlignUp(address + size, TRACKER_PAGE_SIZE);
+		return m_cpu_write_ranges_after_gpu.Intersects(begin, end - begin);
+	}
 
 	[[nodiscard]] bool IsBufferModified() const noexcept { return m_buffer_modified; }
 	void               MarkBufferModified() noexcept { m_buffer_modified = true; }
@@ -132,24 +149,28 @@ public:
 	[[nodiscard]] bool SafeToDownload() const noexcept {
 		return IsGpuModified() && !IsBufferModified() && !IsCpuDirty();
 	}
-	[[nodiscard]] bool IsTracked() const noexcept { return track_addr != 0 && track_addr_end != 0; }
+	[[nodiscard]] bool IsTracked() const noexcept { return !tracked_pages.Empty(); }
+	[[nodiscard]] bool IsPageTracked(uint64_t address, uint64_t size) const {
+		const auto begin = Common::AlignDown(address, TRACKER_PAGE_SIZE);
+		const auto end   = Common::AlignUp(address + size, TRACKER_PAGE_SIZE);
+		return tracked_pages.Contains(begin, end - begin);
+	}
 	[[nodiscard]] uint64_t AccountedSize() const noexcept {
 		return backing.image == nullptr ? 0 : Common::AlignUp(info.data.size, 1024);
 	}
 	[[nodiscard]] uint64_t HashGuestEdges() const;
 
-	ImageInfo        info;
-	VulkanImage      backing;
+	ImageInfo                    info;
+	VulkanImage                  backing;
 	std::vector<CachedImageView> views;
-	ImageUsage       usage;
-	ImageBinding     binding;
-	bool             registered     = false;
-	mutable uint32_t query_epoch    = 0;
-	uint64_t         track_addr     = 0;
-	uint64_t         track_addr_end = 0;
-	ImageId          depth_id {};
-	uint64_t         tick_accessed_last = 0;
-	size_t           lru_id             = 0;
+	ImageUsage                   usage;
+	ImageBinding                 binding;
+	bool                         registered  = false;
+	mutable uint32_t             query_epoch = 0;
+	RangeSet                     tracked_pages;
+	ImageId                      depth_id {};
+	uint64_t                     tick_accessed_last = 0;
+	size_t                       lru_id             = 0;
 
 private:
 	friend struct ImageTestAccess;
@@ -168,6 +189,7 @@ private:
 	bool              m_maybe_hash_valid = false;
 	bool              m_gpu_modified     = false;
 	bool              m_buffer_modified  = false;
+	RangeSet          m_cpu_write_ranges_after_gpu;
 };
 
 namespace ImageOps {

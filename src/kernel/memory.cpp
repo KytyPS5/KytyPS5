@@ -68,9 +68,9 @@ constexpr int      PAGE_TABLE_POOL_ENTRIES =
     static_cast<int>(PAGE_TABLE_POOL_SIZE / PAGE_TABLE_GRANULARITY);
 constexpr uint64_t DEFAULT_FLEXIBLE_MEMORY_SIZE = 1ull * 1024ull * 1024ull * 1024ull;
 
-static uint64_t                      g_flexible_memory_size        = DEFAULT_FLEXIBLE_MEMORY_SIZE;
-static bool                          g_flexible_memory_size_frozen = false;
-static Graphics::RenderContext*       g_gpu_resources               = nullptr;
+static uint64_t                 g_flexible_memory_size        = DEFAULT_FLEXIBLE_MEMORY_SIZE;
+static bool                     g_flexible_memory_size_frozen = false;
+static Graphics::RenderContext* g_gpu_resources               = nullptr;
 
 static Graphics::RenderContext& GetGpuResources() {
 	EXIT_IF(g_gpu_resources == nullptr);
@@ -291,17 +291,17 @@ public:
 		return true;
 	}
 
-	bool ReplaceSpan(uint64_t start, uint64_t size, VirtualRangeType expected_type,
-	                 uint64_t offset, int protection, int memory_type, VirtualRangeType type,
-	                 const char* name, bool disallow_merge = false) {
+	bool ReplaceSpan(uint64_t start, uint64_t size, VirtualRangeType expected_type, uint64_t offset,
+	                 int protection, int memory_type, VirtualRangeType type, const char* name,
+	                 bool disallow_merge = false) {
 		Common::LockGuard lock(m_mutex);
 
 		if (start == 0 || size == 0 || size > UINT64_MAX - start) {
 			return false;
 		}
 
-		auto current = start;
-		const auto end = start + size;
+		auto       current = start;
+		const auto end     = start + size;
 		while (current < end) {
 			const Range* candidate = nullptr;
 			for (const auto& r: m_ranges) {
@@ -333,8 +333,8 @@ public:
 		replacement.disallow_merge = disallow_merge;
 		CopyVirtualRangeName(replacement.name, name);
 		RemoveUnlocked(start, size);
-		auto position = LowerBound(start);
-		const auto index = static_cast<size_t>(position - m_ranges.begin());
+		auto       position = LowerBound(start);
+		const auto index    = static_cast<size_t>(position - m_ranges.begin());
 		m_ranges.insert(position, replacement);
 		MergeAroundUnlocked(index);
 		return true;
@@ -891,6 +891,31 @@ bool TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return TryReadBacking(vaddr, data, size);
 }
 
+bool TryReadGpuCoherentBacking(uint64_t vaddr, void* data, uint64_t size) {
+	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
+		if (!Graphics::GuestGpu::IsGpuThread()) {
+			return false;
+		}
+
+		auto& buffers  = GetGpuResources().GetBufferCache();
+		auto& textures = GetGpuResources().GetTextureCache();
+		switch (textures.ReadGpuModifiedRange(vaddr, data, size)) {
+			case Graphics::TextureCache::GpuRangeReadResult::Success: return true;
+			case Graphics::TextureCache::GpuRangeReadResult::Unavailable: return false;
+			case Graphics::TextureCache::GpuRangeReadResult::NotOwned: break;
+		}
+
+		if (buffers.HasGpuDirtyBytes(vaddr, size) || buffers.IsRegionGpuModified(vaddr, size)) {
+			buffers.ReadMemory(vaddr, size, false);
+		}
+		if (buffers.HasGpuDirtyBytes(vaddr, size) || buffers.IsRegionGpuModified(vaddr, size) ||
+		    textures.IsRegionGpuModified(vaddr, size)) {
+			return false;
+		}
+	}
+	return TryReadBacking(vaddr, data, size);
+}
+
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	EXIT_IF(g_virtual_ranges == nullptr);
 
@@ -1116,15 +1141,15 @@ bool PhysicalMemory::Alloc(uint64_t search_start, uint64_t search_end, size_t le
 		}
 
 		AllocatedBlock b {};
-		b.size           = len;
-		b.start_addr     = free_pos;
-		b.gpu_mode       = GpuAccessMode::NoAccess;
-		b.map_size       = 0;
-		b.map_vaddr      = 0;
-		b.prot           = 0;
-		b.mode           = VirtualMemory::Mode::NoAccess;
-		b.memory_type    = memory_type;
-		b.kind           = kind;
+		b.size        = len;
+		b.start_addr  = free_pos;
+		b.gpu_mode    = GpuAccessMode::NoAccess;
+		b.map_size    = 0;
+		b.map_vaddr   = 0;
+		b.prot        = 0;
+		b.mode        = VirtualMemory::Mode::NoAccess;
+		b.memory_type = memory_type;
+		b.kind        = kind;
 
 		RemoveFreeRange(m_free, free_pos, len);
 		EXIT_IF(!m_physical.emplace(b.start_addr, b).second);
@@ -1377,7 +1402,7 @@ bool PhysicalMemory::Map(uint64_t vaddr, uint64_t phys_addr, size_t len, int pro
 	if (next == m_physical.begin()) {
 		return false;
 	}
-	auto first = std::prev(next);
+	auto first         = std::prev(next);
 	bool has_automatic = false;
 	while (current < phys_addr + len) {
 		auto block = m_physical.upper_bound(current);
@@ -1555,8 +1580,8 @@ bool PhysicalMemory::Unmap(uint64_t vaddr, uint64_t size, GpuAccessMode* gpu_mod
 			right.size      = b.map_vaddr + b.map_size - (vaddr + size);
 			right.map_size  = right.size;
 			right.map_vaddr = vaddr + size;
-			b.size     = vaddr - b.map_vaddr;
-			b.map_size = b.size;
+			b.size          = vaddr - b.map_vaddr;
+			b.map_size      = b.size;
 			m_mappings.push_back(right);
 		} else if (vaddr == b.map_vaddr) {
 			b.start_addr += size;
@@ -2362,14 +2387,13 @@ int32_t KYTY_SYSV_ABI KernelMapNamedFlexibleMemory(void** addr_in_out, size_t le
 		return KERNEL_ERROR_ENOMEM;
 	}
 
-	const bool published = reserved_target
-	                           ? g_virtual_ranges->ReplaceSpan(
-	                                 out_addr, len, VirtualRangeType::Reserved, 0, prot, 0,
-	                                 VirtualRangeType::Flexible, name,
-	                                 (map_flags & GUEST_MAP_NO_COALESCE) != 0)
-	                           : g_virtual_ranges->Add(out_addr, len, 0, prot, 0,
-	                                                   VirtualRangeType::Flexible, name,
-	                                                   (map_flags & GUEST_MAP_NO_COALESCE) != 0);
+	const bool published =
+	    reserved_target
+	        ? g_virtual_ranges->ReplaceSpan(out_addr, len, VirtualRangeType::Reserved, 0, prot, 0,
+	                                        VirtualRangeType::Flexible, name,
+	                                        (map_flags & GUEST_MAP_NO_COALESCE) != 0)
+	        : g_virtual_ranges->Add(out_addr, len, 0, prot, 0, VirtualRangeType::Flexible, name,
+	                                (map_flags & GUEST_MAP_NO_COALESCE) != 0);
 	if (!published) {
 		GpuAccessMode rollback_gpu_mode = GpuAccessMode::NoAccess;
 		EXIT_IF(!g_flexible_memory->Unmap(out_addr, len, &rollback_gpu_mode));
@@ -2808,7 +2832,7 @@ int AllocateDirectMemory(int64_t search_start, int64_t search_end, size_t len, s
 		return KERNEL_ERROR_EINVAL;
 	}
 
-	uint64_t addr = 0;
+	uint64_t   addr = 0;
 	const auto kind = automatic ? PhysicalMemory::AllocationKind::Automatic
 	                            : PhysicalMemory::AllocationKind::Direct;
 	if (!g_physical_memory->Alloc(search_start, search_end, len, alignment, &addr, memory_type,
@@ -3111,13 +3135,13 @@ int KYTY_SYSV_ABI KernelMapDirectMemory(void** addr, size_t len, int prot, int f
 
 	PhysicalMemory::AllocatedBlock mapped_block {};
 	g_physical_memory->Find(direct_memory_start, false, &mapped_block);
-	const bool published = reserved_target
-	                           ? g_virtual_ranges->ReplaceSpan(
-	                                 out_addr, len, VirtualRangeType::Reserved, direct_memory_start,
-	                                 prot, mapped_block.memory_type, VirtualRangeType::Direct, "")
-	                           : g_virtual_ranges->Add(out_addr, len, direct_memory_start, prot,
-	                                                   mapped_block.memory_type,
-	                                                   VirtualRangeType::Direct, "");
+	const bool published =
+	    reserved_target
+	        ? g_virtual_ranges->ReplaceSpan(out_addr, len, VirtualRangeType::Reserved,
+	                                        direct_memory_start, prot, mapped_block.memory_type,
+	                                        VirtualRangeType::Direct, "")
+	        : g_virtual_ranges->Add(out_addr, len, direct_memory_start, prot,
+	                                mapped_block.memory_type, VirtualRangeType::Direct, "");
 	if (!published) {
 		GpuAccessMode rollback_gpu_mode = GpuAccessMode::NoAccess;
 		EXIT_IF(!g_physical_memory->Unmap(out_addr, len, &rollback_gpu_mode));

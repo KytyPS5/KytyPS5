@@ -1793,6 +1793,46 @@ std::vector<u32> MakePassthroughVertexSpirv(bool layered, float clip_w = 1.0f) {
 
 } // namespace TestSpv
 
+void CheckShaderSnapshotDownloadCoverage() {
+  constexpr const char *name = "ShaderSnapshotDownloadCoverage";
+
+  TextureUploadLayout linear{};
+  linear.surface.description.format = Prospero::BufferFormat::k32_32UInt;
+  linear.surface.description.tile_mode = Prospero::TileMode::kLinear;
+  vk::BufferImageCopy row{};
+  row.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+  row.imageExtent = {3, 2, 1};
+  row.bufferRowLength = 4;
+  Require(name, "linear coverage",
+          TextureDownloadCoversRange(linear, std::span{&row, 1}, {}, 20, 4) &&
+              !TextureDownloadCoversRange(linear, std::span{&row, 1}, {}, 24, 4),
+          "linear row padding was accepted as downloaded image data");
+
+  TileSizeAlign total{};
+  TileGetTextureSize(Prospero::BufferFormat::k32_32UInt, 256, 256, 1,
+                     Prospero::TileMode::kRenderTarget, &total, nullptr, nullptr);
+  auto tiled = TextureCalcUploadLayout(
+      Prospero::BufferFormat::k32_32UInt, 256, 256, 1, 1,
+      Prospero::TileMode::kRenderTarget, total.size, true, false, name);
+  auto copies = TextureBuildImageCopies(tiled);
+  std::vector<GpuTileInfo> tiles;
+  Require(name, "tiled transfer plan",
+          TextureBuildGpuTileInfos(total.size, copies, tiled, 1, tiles) &&
+              copies.size() == 1 && tiles.size() == 1,
+          "could not construct tiled snapshot coverage fixture");
+  Require(name, "tiled coverage",
+          TextureDownloadCoversRange(tiled, copies, tiles, 0x104, 4),
+          "fully copied tiled bytes were rejected");
+  auto unsupported_tail = tiles;
+  unsupported_tail[0].tail = true;
+  Require(name, "tiled fail closed",
+          !TextureDownloadCoversRange(tiled, copies, unsupported_tail, 0x104, 4) &&
+              !TextureDownloadCoversRange(tiled, copies, tiles,
+                                          tiles[0].tiled_size, 4),
+          "unsupported tail or allocation padding was accepted");
+
+  std::printf("[host]    %-32s ok\n", name);
+}
 class VulkanHarness {
 public:
   VulkanHarness() { Init(); }
@@ -16308,6 +16348,239 @@ public:
                 case_index, format_cases);
   }
 
+  void CheckShaderImageSnapshotCoherence() {
+    constexpr const char *name = "ShaderImageSnapshotCoherence";
+    constexpr uintptr_t base = 0x0000000203600000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint64_t image_offset = 0x10000;
+    constexpr uint64_t target_offset = 0x104;
+    constexpr uint64_t same_page_offset = target_offset + 0x100;
+    constexpr uint32_t stale_value = 0x11223344u;
+    constexpr uint32_t gpu_x = 0xa5b6c7d8u;
+    constexpr uint32_t gpu_y = 0x10293847u;
+    constexpr uint32_t sibling_cpu_value = 0x55667788u;
+    constexpr uint32_t same_page_cpu_value = 0x13579bdfu;
+    constexpr uint32_t target_cpu_value = 0x0badf00du;
+    constexpr uint32_t buffer_gpu_value = 0x89abcdefu;
+    constexpr auto format = Prospero::BufferFormat::k32_32UInt;
+    constexpr auto tile = Prospero::TileMode::kRenderTarget;
+
+    TileSizeAlign total{};
+    TileSizeOffset mip{};
+    TilePaddedSize padded{};
+    TileGetTextureSize(format, 256, 256, 1, tile, &total, &mip, &padded);
+    const uint64_t sibling_offset = total.size - 0x0efc;
+    Require(name, "fixture layout",
+            total.size == 0x80000 &&
+                target_offset / TRACKER_PAGE_SIZE ==
+                    same_page_offset / TRACKER_PAGE_SIZE &&
+                target_offset / TRACKER_PAGE_SIZE !=
+                    sibling_offset / TRACKER_PAGE_SIZE,
+            "mixed Image fixture no longer exposes same- and sibling-page cases");
+
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    auto &gpu = context.GetGpu();
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_size, 0, &direct_offset) == 0,
+            "direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fixed direct-memory mapping failed");
+
+    {
+      auto &resources = context;
+      LibKernel::Memory::InstallGpuResources(&resources);
+      resources.MapMemory(base, allocation_size);
+      auto &texture_cache = resources.GetTextureCache();
+      auto &buffer_cache = resources.GetBufferCache();
+      const auto image_address = base + image_offset;
+
+      std::vector<uint32_t> initial(total.size / sizeof(uint32_t), stale_value);
+      std::memcpy(static_cast<uint8_t *>(mapped) + image_offset, initial.data(),
+                  total.size);
+
+      ImageDesc desc{};
+      desc.type = BindingType::Storage;
+      desc.info.data = {image_address, total.size};
+      desc.info.pixel_format = vk::Format::eR32G32Uint;
+      desc.info.guest_format = format;
+      desc.info.type = Prospero::ImageType::kColor2D;
+      desc.info.extent = {256, 256, 1};
+      desc.info.resources = {1, 1};
+      desc.info.pitch = TileGetTexturePitch(format, 256, tile);
+      desc.info.bytes_per_block = sizeof(uint32_t) * 2;
+      desc.info.samples = 1;
+      desc.info.tile_mode = tile;
+      desc.info.mip_layout[0] = {mip.offset, mip.size, padded.width,
+                                 padded.height};
+      desc.view_info.format = desc.info.pixel_format;
+      desc.view_info.type = vk::ImageViewType::e2D;
+      desc.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+      desc.view_info.layer_count = 1;
+      desc.view_info.level_count = 1;
+      desc.view_info.usage = vk::ImageUsageFlagBits::eStorage;
+
+      const auto image_id = texture_cache.FindImage(desc);
+      (void)texture_cache.FindTexture(image_id, desc);
+      auto &image = texture_cache.GetImage(image_id);
+      image.Transit(vk::ImageLayout::eTransferDstOptimal,
+                    vk::AccessFlagBits2::eTransferWrite, {},
+                    scheduler.Current().Handle());
+      vk::ClearColorValue clear{};
+      clear.uint32[0] = gpu_x;
+      clear.uint32[1] = gpu_y;
+      const vk::ImageSubresourceRange range{
+          vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+      scheduler.Current().Handle().clearColorImage(
+          image.backing.image, vk::ImageLayout::eTransferDstOptimal,
+          clear, range);
+      texture_cache.MarkGpuWritten(image_id);
+
+      const auto Snapshot = [&](uint64_t address, void* destination,
+                                uint64_t size) {
+        bool ok = false;
+        gpu.SendCommandSync([&] {
+          ok = LibKernel::Memory::TryReadGpuCoherentBacking(
+              address, destination, size);
+        });
+        return ok;
+      };
+
+      uint32_t gpu_only = 0;
+      Require(name, "GPU-only target snapshot",
+              Snapshot(image_address + target_offset, &gpu_only,
+                       sizeof(gpu_only)) &&
+                  gpu_only == gpu_y,
+              "GPU-only Image range did not return current GPU bytes");
+
+      Require(name, "CPU sibling invalidate",
+              resources.InvalidateMemory(image_address + sibling_offset,
+                                         sizeof(sibling_cpu_value)),
+              "disjoint sibling CPU invalidation failed");
+      LibKernel::Memory::WriteBacking(image_address + sibling_offset,
+                                      &sibling_cpu_value,
+                                      sizeof(sibling_cpu_value));
+      Require(name, "selective sibling ownership",
+              image.IsGpuModified() && image.IsDefinitelyCpuDirty() &&
+                  image.IsPageTracked(image_address + target_offset,
+                                      sizeof(uint32_t)) &&
+                  !image.IsPageTracked(image_address + sibling_offset,
+                                       sizeof(uint32_t)) &&
+                  !image.HasCpuWriteAfterGpuOwnership(
+                      image_address + target_offset, sizeof(uint32_t)) &&
+                  image.HasCpuWriteAfterGpuOwnership(
+                      image_address + sibling_offset, sizeof(uint32_t)),
+              "CPU sibling write did not preserve page-specific Image ownership");
+
+      uint32_t legacy_observed = 0;
+      bool legacy_ok = false;
+      gpu.SendCommandSync([&] {
+        legacy_ok = LibKernel::Memory::TryReadGpuCleanBacking(
+            image_address + target_offset, &legacy_observed,
+            sizeof(legacy_observed));
+      });
+      Require(name, "legacy path reproduces stale snapshot",
+              legacy_ok && legacy_observed == stale_value,
+              "legacy clean-backing path no longer reproduces the historical stale read");
+
+      uint32_t observed = 0;
+      Require(name, "GPU-current target snapshot",
+              Snapshot(image_address + target_offset, &observed,
+                       sizeof(observed)) &&
+                  observed == gpu_y,
+              "CPU activity on a sibling Image page exposed stale target backing");
+
+      const uint64_t mixed_size =
+          sibling_offset + sizeof(uint32_t) - target_offset;
+      std::vector<uint8_t> mixed(mixed_size);
+      Require(name, "mixed multi-page range fails closed",
+              !Snapshot(image_address + target_offset, mixed.data(),
+                        mixed.size()),
+              "a request spanning GPU-current and CPU-written pages was accepted");
+
+      auto [buffer, buffer_offset] =
+          buffer_cache.ObtainBuffer(image_address + target_offset,
+                                    sizeof(buffer_gpu_value), true, true);
+      Require(name, "Buffer/Texture conflict fixture",
+              buffer != nullptr && image.IsGpuModified() &&
+                  buffer_cache.IsRegionGpuModified(
+                      image_address + target_offset,
+                      sizeof(buffer_gpu_value)),
+              "could not establish simultaneous Buffer and Texture GPU ownership");
+      buffer->Fill(buffer_offset, sizeof(buffer_gpu_value), buffer_gpu_value);
+      uint32_t conflicted = 0;
+      Require(name, "Buffer/Texture conflict fails closed",
+              !Snapshot(image_address + target_offset, &conflicted,
+                        sizeof(conflicted)),
+              "shader snapshot selected one of two conflicting GPU owners");
+      gpu.SendCommandSync([&] {
+        buffer_cache.ReadMemory(image_address + target_offset,
+                                sizeof(buffer_gpu_value), false);
+      });
+
+      Require(name, "same-page CPU invalidate",
+              resources.InvalidateMemory(image_address + same_page_offset,
+                                         sizeof(same_page_cpu_value)),
+              "same-page CPU invalidation failed");
+      LibKernel::Memory::WriteBacking(
+          image_address + same_page_offset, &same_page_cpu_value,
+          sizeof(same_page_cpu_value));
+      Require(name, "same-page ownership becomes ambiguous",
+              !image.IsPageTracked(image_address + target_offset,
+                                   sizeof(uint32_t)) &&
+                  image.HasCpuWriteAfterGpuOwnership(
+                      image_address + target_offset, sizeof(uint32_t)),
+              "same-page CPU write did not invalidate target-page observation");
+      uint32_t ambiguous = 0;
+      Require(name, "same-page ambiguity fails closed",
+              !Snapshot(image_address + target_offset, &ambiguous,
+                        sizeof(ambiguous)),
+              "GPU snapshot trusted a page after a disjoint same-page CPU write");
+
+      Require(name, "exact CPU invalidate",
+              resources.InvalidateMemory(image_address + target_offset,
+                                         sizeof(target_cpu_value)),
+              "exact target CPU invalidation failed");
+      LibKernel::Memory::WriteBacking(image_address + target_offset,
+                                      &target_cpu_value,
+                                      sizeof(target_cpu_value));
+      uint32_t cpu_observed = 0;
+      Require(name, "exact CPU supersession",
+              Snapshot(image_address + target_offset, &cpu_observed,
+                       sizeof(cpu_observed)) &&
+                  cpu_observed == target_cpu_value,
+              "exact CPU write did not supersede older GPU Image bytes");
+
+      resources.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+      LibKernel::Memory::InstallGpuResources(nullptr);
+    }
+
+    context.ShutdownGpu();
+    Require(name, "unmap",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "direct-memory mapping release failed");
+    Require(name, "release",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "direct-memory allocation release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
 private:
   bool m_rasterization_supported = true;
   u32   m_skipped_cases          = 0;
@@ -35612,6 +35885,14 @@ int main(int argc, char **argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
+  if (argc == 2 &&
+      std::strcmp(argv[1], "--shader-image-snapshot-only") == 0) {
+    CheckShaderSnapshotDownloadCoverage();
+    VulkanHarness vulkan;
+    vulkan.CheckShaderImageSnapshotCoherence();
+    return 0;
+  }
+
   if (argc == 2 && std::strcmp(argv[1], "--s-memrealtime-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, ScalarMemRealtimeCapturedPlaceholder());

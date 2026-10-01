@@ -5,6 +5,7 @@
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <span>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -53,6 +54,10 @@ std::vector<vk::BufferImageCopy> TextureBuildImageCopies(const TextureUploadLayo
 bool TextureBuildGpuTileInfos(uint64_t tiled_size, const std::vector<vk::BufferImageCopy>& regions,
                               const TextureUploadLayout& layout, uint32_t levels,
                               std::vector<GpuTileInfo>& out_tile_infos);
+// True only when the image-to-buffer copy and optional tiling pass write every requested byte.
+bool TextureDownloadCoversRange(const TextureUploadLayout&           layout,
+                                std::span<const vk::BufferImageCopy> regions,
+                                std::span<const GpuTileInfo> tiles, uint64_t offset, uint64_t size);
 
 } // namespace Libs::Graphics
 

@@ -116,7 +116,7 @@ constexpr uint32_t kHeavySpirv[] = {
 };
 
 #define FN(name) PFN_##name name
-FN(vkGetInstanceProcAddr); FN(vkCreateInstance); FN(vkEnumeratePhysicalDevices); FN(vkGetPhysicalDeviceMemoryProperties);
+FN(vkGetInstanceProcAddr); FN(vkEnumerateInstanceExtensionProperties); FN(vkCreateInstance); FN(vkEnumeratePhysicalDevices); FN(vkGetPhysicalDeviceMemoryProperties);
 FN(vkCreateDevice); FN(vkGetDeviceProcAddr); FN(vkGetDeviceQueue); FN(vkCreateBuffer); FN(vkDestroyBuffer);
 FN(vkGetBufferMemoryRequirements); FN(vkAllocateMemory); FN(vkFreeMemory); FN(vkBindBufferMemory);
 FN(vkGetBufferDeviceAddress); FN(vkCreateShaderModule); FN(vkCreatePipelineLayout); FN(vkCreateComputePipelines);
@@ -164,16 +164,36 @@ int main(int argc, char** argv) {
 	void*       lib     = dlopen(library != nullptr ? library : "libMoltenVK.dylib", RTLD_NOW | RTLD_LOCAL);
 	if (!lib) { std::printf("dlopen failed\n"); return 2; }
 	vkGetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)dlsym(lib, "vkGetInstanceProcAddr");
+	if (!vkGetInstanceProcAddr) { std::printf("vkGetInstanceProcAddr missing; inconclusive\n"); return 2; }
 #define IL(name) name = (PFN_##name)vkGetInstanceProcAddr(instance, #name)
 	VkInstance instance = VK_NULL_HANDLE;
-	IL(vkCreateInstance);
+	IL(vkCreateInstance); IL(vkEnumerateInstanceExtensionProperties);
 	VkApplicationInfo app {VK_STRUCTURE_TYPE_APPLICATION_INFO}; app.apiVersion = VK_API_VERSION_1_3;
 	VkInstanceCreateInfo ii {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO}; ii.pApplicationInfo = &app;
+	uint32_t extension_count = 0;
+	Check(vkEnumerateInstanceExtensionProperties(nullptr, &extension_count, nullptr), "vkEnumerateInstanceExtensionProperties count");
+	std::vector<VkExtensionProperties> extensions(extension_count);
+	Check(vkEnumerateInstanceExtensionProperties(nullptr, &extension_count, extensions.data()), "vkEnumerateInstanceExtensionProperties");
+	const char* portability = VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME;
+	for (uint32_t i = 0; i < extension_count; ++i) {
+		if (std::strcmp(extensions[i].extensionName, portability) == 0) {
+			ii.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
+			ii.enabledExtensionCount = 1;
+			ii.ppEnabledExtensionNames = &portability;
+			break;
+		}
+	}
 
 
 	Check(vkCreateInstance(&ii, nullptr, &instance), "vkCreateInstance");
 	IL(vkEnumeratePhysicalDevices); IL(vkGetPhysicalDeviceMemoryProperties); IL(vkCreateDevice); IL(vkGetDeviceProcAddr);
-	uint32_t n = 1; VkPhysicalDevice phys; vkEnumeratePhysicalDevices(instance, &n, &phys);
+	uint32_t n = 0;
+	Check(vkEnumeratePhysicalDevices(instance, &n, nullptr), "vkEnumeratePhysicalDevices count");
+	if (n == 0) { std::printf("No Vulkan physical device; inconclusive\n"); return 2; }
+	std::vector<VkPhysicalDevice> devices(n, VK_NULL_HANDLE);
+	Check(vkEnumeratePhysicalDevices(instance, &n, devices.data()), "vkEnumeratePhysicalDevices");
+	if (n == 0 || devices[0] == VK_NULL_HANDLE) { std::printf("No Vulkan physical device; inconclusive\n"); return 2; }
+	VkPhysicalDevice phys = devices[0];
 	vkGetPhysicalDeviceMemoryProperties(phys, &g_mp);
 	float prio = 1.0f;
 	VkDeviceQueueCreateInfo qi {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}; qi.queueCount = 1; qi.pQueuePriorities = &prio;

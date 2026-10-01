@@ -4508,7 +4508,8 @@ void TestHeterogeneousIndirectImageViewSwizzles() {
 
 std::unique_ptr<Fixture> MakeInlineDescriptorFixture(bool ordinary_samplers = false,
                                                     bool image_table = false,
-                                                    bool full_width_images = false) {
+                                                    bool full_width_images = false,
+                                                    bool guarded_selector = false) {
   auto fixture = std::make_unique<Fixture>();
   std::array<Value, 4> material_words;
   std::array<Value, 4> index_words;
@@ -4520,20 +4521,31 @@ std::unique_ptr<Fixture> MakeInlineDescriptorFixture(bool ordinary_samplers = fa
   const auto indices = fixture->Buffer(index_words, 0x24c);
   auto *entry = fixture->block;
   auto *loop = fixture->AddBlock();
+  auto *body = guarded_selector ? fixture->AddBlock() : loop;
+  auto *exit = guarded_selector ? fixture->AddBlock() : nullptr;
   entry->AddBranch(loop);
-  loop->AddBranch(loop);
-  for (auto &info : fixture->program.block_info) {
-    info.terminator.kind =
-        Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::Branch;
-    info.terminator.true_block = 1u;
+  if (guarded_selector) {
+    loop->AddBranch(body);
+    loop->AddBranch(exit);
+    body->AddBranch(loop);
+    fixture->program.block_info[0].terminator.kind = CFG::TerminatorKind::Branch;
+    fixture->program.block_info[0].terminator.true_block = 1u;
+    fixture->program.block_info[1].terminator.kind = CFG::TerminatorKind::ConditionalBranch;
+    fixture->program.block_info[1].terminator.true_block = 2u;
+    fixture->program.block_info[1].terminator.false_block = 3u;
+    fixture->program.block_info[2].terminator.kind = CFG::TerminatorKind::Branch;
+    fixture->program.block_info[2].terminator.true_block = 1u;
+    fixture->program.block_info[3].terminator.kind = CFG::TerminatorKind::Return;
+  } else {
+    loop->AddBranch(loop);
+    for (auto &info : fixture->program.block_info) {
+      info.terminator.kind = CFG::TerminatorKind::Branch;
+      info.terminator.true_block = 1u;
+    }
   }
   fixture->block = loop;
   auto &counter = loop->AppendNewInst(ValueOpcode::Phi, {},
                                       static_cast<uint64_t>(Type::U32));
-  const auto next =
-      fixture->Emit(ValueOpcode::IAdd32, {Value(&counter), Value(1u)});
-  counter.AddPhiOperand(entry, Value(0u));
-  counter.AddPhiOperand(loop, next);
   const auto index_offset =
       fixture->Emit(ValueOpcode::IMul32, {Value(&counter), Value(4u)});
   MemoryInfo scalar;
@@ -4541,6 +4553,17 @@ std::unique_ptr<Fixture> MakeInlineDescriptorFixture(bool ordinary_samplers = fa
   const auto index =
       fixture->Emit(ValueOpcode::ReadConstBuffer, {indices, index_offset},
                     fixture->AddMemory(scalar, 0x260));
+  if (guarded_selector) {
+    const auto bounded = fixture->Emit(ValueOpcode::ULessThan32,
+                                       {index, Value(3u)});
+    fixture->program.block_info[1].condition = fixture->Emit(
+        ValueOpcode::ConditionRef, {bounded}, CFG::BranchCondition::SccNonZero);
+  }
+  fixture->block = body;
+  const auto next =
+      fixture->Emit(ValueOpcode::IAdd32, {Value(&counter), Value(1u)});
+  counter.AddPhiOperand(entry, Value(0u));
+  counter.AddPhiOperand(body, next);
   const auto byte_offset =
       fixture->Emit(ValueOpcode::IMul32,
                     {index, Value(full_width_images ? 440u : 872u)});
@@ -4644,7 +4667,8 @@ std::unique_ptr<Fixture> MakeInlineDescriptorFixture(bool ordinary_samplers = fa
 }
 
 std::unique_ptr<Fixture> MakeInlineBufferDescriptorFixture(
-    bool guarded_selector = true, bool correlated_columns = true) {
+    bool guarded_selector = true, bool correlated_columns = true,
+    bool scc_condition_ref = false) {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   auto fixture = std::make_unique<Fixture>();
   const auto table = fixture->Buffer(
@@ -4673,7 +4697,11 @@ std::unique_ptr<Fixture> MakeInlineBufferDescriptorFixture(
       CFG::TerminatorKind::ConditionalBranch;
   fixture->program.block_info[1].terminator.true_block = 2u;
   fixture->program.block_info[1].terminator.false_block = 3u;
-  fixture->program.block_info[1].condition = bounded;
+  fixture->program.block_info[1].condition =
+      scc_condition_ref
+          ? fixture->Emit(ValueOpcode::ConditionRef, {bounded},
+                          CFG::BranchCondition::SccNonZero, header)
+          : bounded;
 
   fixture->block = body;
   const auto next =
@@ -4707,6 +4735,80 @@ std::unique_ptr<Fixture> MakeInlineBufferDescriptorFixture(
   fixture->program.block_info[2].terminator.true_block = 1u;
   fixture->program.block_info[3].terminator.kind = CFG::TerminatorKind::Return;
   return fixture;
+}
+
+void TestInlineBufferSccConditionRefGuard() {
+  auto fixture = MakeInlineBufferDescriptorFixture(true, true, true);
+  fixture->PlanAndTrack();
+  Check(fixture->program.info.buffers.size() == 1u,
+        "SCC-wrapped inline buffer selector lost its logical resource");
+  const auto& source = fixture->program.descriptor_sources.at(
+      fixture->program.info.buffers[0].source);
+  Check(source.inline_descriptor.has_value() &&
+            source.inline_descriptor->selector_limit == 3u,
+        "SCC-wrapped dominating guard did not prove the three-selector domain");
+}
+
+void TestInlineSelectorGuardPolarityAndSafety() {
+  const auto expect_three = [](std::unique_ptr<Fixture> fixture) {
+    fixture->PlanAndTrack();
+    Check(fixture->program.info.buffers.size() == 1u,
+          "guarded inline buffer lost its logical resource");
+    const auto& source = fixture->program.descriptor_sources.at(
+        fixture->program.info.buffers[0].source);
+    Check(source.inline_descriptor.has_value() &&
+              source.inline_descriptor->selector_limit == 3u,
+          "scalar guard polarity did not preserve the exact selector domain");
+  };
+  const auto expect_rejected = [](std::unique_ptr<Fixture> fixture) {
+    CheckFatal([&] { fixture->PlanAndTrack(); }, "not a valid runtime value",
+               "non-scalar or wrong-edge guard unsafely bounded an inline table");
+  };
+  for (const bool use_greater_equal : {false, true}) {
+    auto fixture = MakeInlineBufferDescriptorFixture(true, true, true);
+    auto& info = fixture->program.block_info[1];
+    auto* header = fixture->program.blocks[1];
+    const auto compare = info.condition.ResolveInstruction()->Arg(0).Resolve();
+    if (use_greater_equal) {
+      const auto selector = compare.ResolveInstruction()->Arg(0);
+      const auto ge = fixture->Emit(ValueOpcode::UGreaterThanEqual32,
+                                    {selector, Value(3u)}, 0u, header);
+      info.condition = fixture->Emit(ValueOpcode::ConditionRef, {ge},
+                                     CFG::BranchCondition::SccNonZero, header);
+    } else {
+      const auto not_less = fixture->Emit(ValueOpcode::LogicalNot,
+                                          {compare}, 0u, header);
+      info.condition = fixture->Emit(ValueOpcode::ConditionRef, {not_less},
+                                     CFG::BranchCondition::SccZero, header);
+    }
+    std::swap(info.terminator.true_block, info.terminator.false_block);
+    expect_three(std::move(fixture));
+  }
+  for (const auto kind : {CFG::BranchCondition::ExecNonZero,
+                          CFG::BranchCondition::VccNonZero}) {
+    auto fixture = MakeInlineBufferDescriptorFixture(true, true, true);
+    auto& info = fixture->program.block_info[1];
+    auto* header = fixture->program.blocks[1];
+    const auto compare = info.condition.ResolveInstruction()->Arg(0).Resolve();
+    info.condition = fixture->Emit(ValueOpcode::ConditionRef, {compare}, kind, header);
+    expect_rejected(std::move(fixture));
+  }
+  {
+    auto fixture = MakeInlineBufferDescriptorFixture(true, true, true);
+    auto& info = fixture->program.block_info[1];
+    std::swap(info.terminator.true_block, info.terminator.false_block);
+    expect_rejected(std::move(fixture));
+  }
+  {
+    auto fixture = MakeInlineBufferDescriptorFixture(true, true, true);
+    auto& info = fixture->program.block_info[1];
+    auto* header = fixture->program.blocks[1];
+    const auto other = fixture->Emit(ValueOpcode::ULessThan32,
+                                     {fixture->UserData(5u), Value(3u)}, 0u, header);
+    info.condition = fixture->Emit(ValueOpcode::ConditionRef, {other},
+                                   CFG::BranchCondition::SccNonZero, header);
+    expect_rejected(std::move(fixture));
+  }
 }
 
 void TestInlineBufferDescriptorTable() {
@@ -4787,6 +4889,65 @@ uint32_t InlineCandidateForKey(const ResourceSnapshot &snapshot,
     }
   }
   return root;
+}
+
+void TestInlineSampledSccConditionRefGuard() {
+  auto fixture = MakeInlineDescriptorFixture(false, false, false, true);
+  fixture->PlanAndTrack();
+  Check(fixture->program.info.images.size() == 1u &&
+            fixture->program.info.samplers.size() == 1u,
+        "SCC-wrapped sampled table lost its image/sampler roots");
+  const auto& image_source = fixture->program.descriptor_sources.at(
+      fixture->program.info.images[0].source);
+  const auto& sampler_source = fixture->program.descriptor_sources.at(
+      fixture->program.info.samplers[0].source);
+  Check(image_source.inline_descriptor.has_value() &&
+            sampler_source.inline_descriptor.has_value() &&
+            image_source.inline_descriptor->selector_limit == 3u &&
+            sampler_source.inline_descriptor->selector_limit == 3u,
+        "SCC-wrapped guard did not bound both sampled descriptor sources");
+
+  std::array<uint32_t, 8> user_data{0x1000u, 872u << 16u, 3u, 0u,
+                                   0x2000u, 0u, 16u, 0u};
+  LinearTestMemory memory;
+  DescriptorValue image;
+  image.dword_count = 8u;
+  image.dwords[1] = static_cast<uint32_t>(
+      Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float) << 20u;
+  image.dwords[2] = 3u | (3u << 14u);
+  image.dwords[3] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+                    (static_cast<uint32_t>(
+                         Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+  DescriptorValue sampler;
+  sampler.dword_count = 4u;
+  for (uint32_t record = 0; record < 3u; ++record) {
+    image.dwords[0] = 0x20u + record * 0x20u;
+    sampler.dwords[0] = record + 1u;
+    for (uint32_t word = 0; word < 4u; ++word) {
+      memory.words[(record * 872u + 136u) / 4u + word] = sampler.dwords[word];
+      memory.words[(record * 872u + 152u) / 4u + word] = image.dwords[word];
+    }
+  }
+  SrtRuntime runtime{.user_data = user_data,
+                     .userdata = &memory,
+                     .read_specialization_memory = ReadLinearTestMemory};
+  memory.fail_address = 0x2000u;
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  const auto plan = ExtractResourcePlan(fixture->program);
+  Check(MaterializeResources(plan, runtime, snapshot, specialization),
+        "bounded sampled table could not materialize without reading its live selector");
+  for (uint32_t record = 0; record < 3u; ++record) {
+    const auto candidate = InlineCandidateForKey(
+        snapshot, specialization, record * 872u);
+    Check(candidate != 0u && snapshot.images[candidate].dwords[0] ==
+                                  0x20u + record * 0x20u &&
+              snapshot.samplers[specialization.images[candidate].indirect_sampler]
+                      .dwords[0] == record + 1u,
+          "bounded sampled table selected the wrong image/sampler pair");
+  }
+  Check(InlineCandidateForKey(snapshot, specialization, 3u * 872u) == 0u,
+        "bounded sampled table admitted an unreachable selector");
 }
 
 void TestInlineDescriptorPairs() {
@@ -7326,6 +7487,21 @@ int main(int argc, char** argv) {
       std::cout << "KYTY_INLINE_BUFFER_TABLE_PASS\n";
       return 0;
     }
+    if (argc == 2 && std::strcmp(argv[1], "--inline-scc-selector-guard-only") == 0) {
+      TestInlineBufferSccConditionRefGuard();
+      std::cout << "KYTY_INLINE_SCC_SELECTOR_GUARD_PASS\n";
+      return 0;
+    }
+    if (argc == 2 && std::strcmp(argv[1], "--inline-sampled-scc-guard-only") == 0) {
+      TestInlineSampledSccConditionRefGuard();
+      std::cout << "KYTY_INLINE_SAMPLED_SCC_GUARD_PASS\n";
+      return 0;
+    }
+    if (argc == 2 && std::strcmp(argv[1], "--inline-selector-guard-safety-only") == 0) {
+      TestInlineSelectorGuardPolarityAndSafety();
+      std::cout << "KYTY_INLINE_SELECTOR_GUARD_SAFETY_PASS\n";
+      return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--finite-selector-srt-proof-only") == 0) {
       TestFiniteSelectorSrtProof();
       std::cout << "KYTY_FINITE_SELECTOR_SRT_PROOF_PASS\n";
@@ -7429,6 +7605,9 @@ int main(int argc, char** argv) {
     Run("runtime unsigned min", TestRuntimeUnsignedMinDescriptor);
     Run("images and samplers", TestImagesSamplersAndAliases);
     Run("inline image mixed samplers", TestInlineImageMixedDynamicAndOrdinarySamplers);
+    Run("inline SCC selector guard", TestInlineBufferSccConditionRefGuard);
+    Run("inline sampled SCC guard", TestInlineSampledSccConditionRefGuard);
+    Run("inline selector guard safety", TestInlineSelectorGuardPolarityAndSafety);
     Run("SampleAdjust sampler scratch", TestSampleAdjustSamplerScratch);
     Run("FMASK load specialization", TestFmaskLoadSpecialization);
     Run("dynamic storage mips", TestDynamicStorageMipTracking);

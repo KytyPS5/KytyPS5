@@ -3068,7 +3068,26 @@ private:
 			    !Dominates(guard, access)) {
 				continue;
 			}
-			const auto* compare = m_program.block_info[index].condition.Resolve().TryInstruction();
+			Value condition = m_program.block_info[index].condition.Resolve();
+			bool inverted = false;
+			std::unordered_set<const Inst*> visited;
+			while (const auto* wrapper = condition.TryInstruction()) {
+				if (!visited.insert(wrapper).second) break;
+				if (wrapper->GetOpcode() == ValueOpcode::LogicalNot && wrapper->NumArgs() == 1u) {
+					inverted = !inverted;
+				} else if (wrapper->GetOpcode() == ValueOpcode::ConditionRef &&
+				           wrapper->NumArgs() == 1u) {
+					const auto kind = wrapper->Flags<CFG::BranchCondition>();
+					// Only SCC carries the scalar comparison as the complete branch
+					// predicate. EXEC/VCC reductions cannot bound every lane's selector.
+					if (kind != CFG::BranchCondition::SccZero &&
+					    kind != CFG::BranchCondition::SccNonZero) break;
+				} else {
+					break;
+				}
+				condition = wrapper->Arg(0).Resolve();
+			}
+			const auto* compare = condition.TryInstruction();
 			if (compare == nullptr || compare->NumArgs() != 2u ||
 			    compare->Arg(0).Resolve() != selector) {
 				continue;
@@ -3077,14 +3096,15 @@ private:
 			if (!ImmediateU32(compare->Arg(1), candidate_limit) || candidate_limit == 0u) {
 				continue;
 			}
-			uint32_t bounded_id = 0;
+			bool bounded_on_true = false;
 			if (compare->GetOpcode() == ValueOpcode::ULessThan32) {
-				bounded_id = term.true_block;
+				bounded_on_true = !inverted;
 			} else if (compare->GetOpcode() == ValueOpcode::UGreaterThanEqual32) {
-				bounded_id = term.false_block;
+				bounded_on_true = inverted;
 			} else {
 				continue;
 			}
+			const auto bounded_id = bounded_on_true ? term.true_block : term.false_block;
 			const auto other_id = bounded_id == term.true_block ? term.false_block : term.true_block;
 			const auto* bounded = BlockById(bounded_id);
 			const auto* other   = BlockById(other_id);

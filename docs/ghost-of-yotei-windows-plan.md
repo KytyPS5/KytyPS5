@@ -1,6 +1,42 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
-Обновлено **28 сентября 2026 года**. Игра: **Ghost of Yōtei, PPSA26344**.
+Checkpoint **2 октября 2026 года** (Windows; рабочее дерево на базе `98a46e46`
+с общим исправлением scalar `ConditionRef` selector guard):
+
+- Native MSVC Developer Environment build/install завершились успешно. Новый
+  `resource_tracking_tests --inline-scc-selector-guard-only` дал ожидаемый RED
+  до изменения `ResourceTracking.cpp` (`not a valid runtime value`), затем тот
+  же тест GREEN. Синтетические CPU проверки image/sampler selector keys и
+  обратной полярности/EXEC/VCC тоже GREEN; полный `resource_tracking_tests`
+  GREEN. Три ограниченных GPU compute-кейса dynamic material pairs/image table
+  pairs/wave64 image loop GREEN. Логи `_Build/logs/inline-*20261002.log*`.
+- Общий CTest: 60/71, `resource_tracking` и `resource_materialization` GREEN;
+  11 других тестов не прошли, включая отдельные renderer/cache проверки и
+  дочерние процессы, которым Windows отказала в резервировании 13,8 ГБ guest
+  direct memory. Полный suite GREEN не заявляется.
+- Retry `_Build/runs/yotei-integrated-20261001-214503-menucheck-gpuav-sync`:
+  tested game path `G:\games\Kyty\PPSA26344\PPSA26344` (as recorded in
+  `run.json`); the originally named `dow[PS5]` path was unavailable in this
+  Windows environment. Это не доказательство идентичности двух копий.
+  installed exe SHA-256 `4FA00D1536F084804A56E62F511BEE29A2BC48881A34592C93EB0B7499384F2D`,
+  1280×720 GPUAV shader instrumentation + SyncDiag, natural exit321,
+  `maxShown=170`. PS `f8927c09f4b928c7` теперь прошёл materialization:
+  386 images / 383 sampled pairs, SPIR-V 295 838 слов; сохранены два `.spv`.
+  Предыдущей ошибки 607/512 в этом запуске нет. Отдельное предупреждение
+  Vulkan validation: запрошено 12 320 sampled-image дескрипторов при pool
+  capacity 8 192; оно не было зарегистрировано как причина завершения.
+- Новая подтверждённая граница: VS `ee4f153aa500d327`, runtime SRT evaluation
+  flat slot 2 failed (`LoadAddressU32`, `raw=true`, `kind=2`, `planning=true`,
+  `slot_kind=0`) на `TrackResources`/`MaterializeResources`; stderr и хвост
+  `_kyty.txt` в указанном run. Нельзя подменять непрочитанный адрес нулём без
+  доказательства optional-null семантики и причин текущего значения.
+- Readback был настроен начиная с кадра 180 и не успел выполниться; `coloredProven=false`.
+  Первый ненулевой кадр на этой ревизии, меню и gameplay остаются PENDING.
+  Процессы запуска и сборки после завершения отсутствуют. Следующий шаг —
+  ограниченная диагностика SRT slot 2, независимый RED и общий фикс, затем
+  повтор игры с проверкой пикселей.
+
+Предыдущий checkpoint **28 сентября 2026 года**. Игра: **Ghost of Yōtei, PPSA26344**.
 Рабочая ветка — `yotei-windows-bringup` в локальном fork `fxpw/KytyPS5`.
 
 Checkpoint реального запуска `8cb79392` **28 сентября 2026 года**:

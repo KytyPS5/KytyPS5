@@ -156,6 +156,28 @@ New runtime boundary is below.
 
 ## Pending sampled pair image admission (2026-09-28)
 
+2026-10-02 regression requirement before changing selector-bound lowering:
+construct a synthetic inline descriptor table whose scalar selector is bounded
+by a dominating unsigned CFG guard. Cover both `selector < limit` on the true
+edge and `selector >= limit` on the false edge when the condition is wrapped in
+`ConditionRef` (including `LogicalNot` polarity). Assert the exact finite
+`selector_limit`, correct materialized image/sampler keys and pairs, and unchanged
+behavior for a raw comparison. Opposite-edge, non-dominating, mismatched-selector
+and EXEC/VCC-wrapped conditions must not yield an unsound finite bound. Exercise
+multiple table roots whose candidate counts accumulate across the 512-image
+budget, including equal/different samplers and exact/plus-one capacity. Obtain
+native CPU RED on the current code before any production fix, then unchanged
+GREEN; follow with a bounded native GPU selection check and game retry.
+The source-level `ConditionRef` mismatch is a hypothesis until the RED/IR trace
+establishes that it caused this runtime table's zero bound.
+Native Windows CPU RED at source `98a46e46` with test-only fixture change:
+`_Build/logs/inline-scc-guard-red-build-20261002.log` built
+`resource_tracking_tests.exe`; `--inline-scc-selector-guard-only` exited 1 in
+`_Build/logs/inline-scc-guard-red-20261002.log.stderr` with `buffer descriptor
+is not a valid runtime value`. The control-flow guard is `selector < 3` on the
+only edge reaching the table; this is the intended planner failure, not a build
+failure. The relation to the game's exact current table remains to be checked.
+
 Completed8cb79392 native Windows retry reaches PSf8927c09f4b928c7 at maxShown119,
 then exit321: `inline sampled pairs exceed the dense image resource limit
 (size=23184 stride=368 probes=1439 pairs=297 images=607)`. Evidence: completed
@@ -169,8 +191,9 @@ whether607 represents necessary distinct typed pairs, duplicates across roots,
 or an overestimated selector domain. Do not collapse images with different
 samplers/types/roots blindly and do not increase MaxImages.
 
-Before any fix: capture candidate identities/domain evidence with bounded
-CPU-only diagnostics; add independent multi-root synthetic tables with overlapping
+Before any future candidate deduplication or capacity change: capture candidate
+identities/domain evidence with bounded CPU-only diagnostics; add independent
+multi-root synthetic tables with overlapping
 and disjoint image/sampler pairs, differing type/dimension/swizzle semantics,
 invalid holes, descriptor extents and exact/plus-one admission. Prove intended
 RED then unchanged GREEN. Native numerical image/sampler selection must preserve
@@ -179,6 +202,43 @@ transactionality. Retry this PS in the game only after that proof.
 Older diagnostic ISA capture:
 `yotei-integrated-20260926-070451-presentfix-gpuav/shaders/original/0168_new_shader_ps_f8927c09f4b928c7.rdna2`;
 current runtime memory values are not reconstructed from that ISA capture.
+
+2026-10-02 GREEN: unchanged `--inline-scc-selector-guard-only` now passes after
+the scalar `ConditionRef` lowering fix. New synthetic sampled image/sampler
+table asserts both exact selector limits and three live pairs;
+`--inline-sampled-scc-guard-only` passes. Polarity (`>=` false edge and nested
+`LogicalNot`), mismatched selector, wrong edge, and EXEC/VCC rejection pass
+`--inline-selector-guard-safety-only`; full `resource_tracking_tests` passes.
+Logs: `_Build/logs/inline-scc-guard-green-20261002.log*`,
+`inline-sampled-scc-guard-20261002.log*`,
+`inline-selector-guard-safety-20261002.log*`, and
+`inline-selector-full-resource-tracking-20261002.log*`. The sampled test was
+added after the minimal shared buffer RED; it has no separate recorded RED.
+Multi-root exact/plus-one image admission and non-dominating guard remain
+synthetic coverage debt. In the native game retry
+`yotei-integrated-20261001-214503-menucheck-gpuav-sync`, this PS did pass
+resource specialization (386 images, 383 pairs) and emitted 295838 SPIR-V
+words; a later VS SRT failure stopped the game before readback.
+
+## Pending planning-only scalar-address SRT slot (2026-10-02)
+
+The completed retry above reaches VS `ee4f153aa500d327` at maxShown170 and
+fails in `RefreshFlatBuffer`: flat slot2 is a raw planning-only
+`LoadAddressU32` (`opcode=209`, `kind=ScalarAddress`, `slot_kind=0`) whose eager
+evaluation fails. Evidence: that run's `stderr.txt:1` and `_kyty.txt:8182384`.
+This is distinct from the now-passed sampled-image admission. An older generic
+null-root correction allowed this shader to emit SPIR-V, but the current
+descriptor value and memory state have not been reconstructed. Do not turn
+arbitrary unreadable planning-only memory into zero.
+
+Before changing production behavior, add an independent CPU regression for a
+planning-only raw scalar-address read from an optional exact-null root that is
+unneeded by the active resource path, plus a used/readable root control.
+Non-null unreadable, dirty, aliased or actively required roots must still fail
+closed without partially committing a resource snapshot. Distinguish a slot
+that is truly unused/deferred from a required descriptor word, then verify the
+same test RED→GREEN, neighboring SRT cases, native GPU where applicable and a
+bounded game retry with source readback before claiming a frame.
 
 ## Pending neighboring unaligned scalar-buffer read (2026-09-28)
 

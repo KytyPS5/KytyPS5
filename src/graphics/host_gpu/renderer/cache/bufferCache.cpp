@@ -19,6 +19,7 @@
 #include <atomic>
 #include <cinttypes>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <utility>
@@ -31,6 +32,14 @@ namespace {
 constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
 constexpr uint64_t MaxFaultMappingSize = 16 * MiB;
+
+bool RefaultPinsOnly() {
+	static const bool enabled = [] {
+		const char* text = std::getenv("KYTY_BDA_REFAULT_PINS");
+		return text != nullptr && std::strcmp(text, "0") != 0;
+	}();
+	return enabled;
+}
 
 // A texture descriptor is guest data: its declared extent may outrun what the game committed, or
 // name a streaming arena released between the descriptor and the draw. The upload binds defined
@@ -713,6 +722,7 @@ void BufferCache::RunGarbageCollector() {
 	const bool     aggressive = m_total_used_memory >= m_critical_gc_memory;
 	const uint64_t age        = std::min<uint64_t>(aggressive ? 80 : 160, tick);
 	const size_t   limit      = aggressive ? 64 : 32;
+	const bool     keep_pins  = !aggressive || !RefaultPinsOnly();
 
 	std::vector<BufferId> dirty_buffers;
 	size_t                retire_count = 0;
@@ -721,6 +731,10 @@ void BufferCache::RunGarbageCollector() {
 		EXIT_IF(buffer.is_deleted);
 		m_memory_tracker.ValidateGpuDirtyOwnership(m_gpu_modified_ranges, buffer.CpuAddress(),
 		                                           buffer.Size(), "garbage collection");
+		if (keep_pins && m_bda_pinned_ranges.Intersects(buffer.CpuAddress(), buffer.Size())) {
+			TouchBuffer(buffer);
+			return false;
+		}
 		const bool dirty = m_memory_tracker.IsRegionGpuModified(buffer.CpuAddress(), buffer.Size());
 		if (dirty && !aggressive) {
 			return false;
@@ -730,6 +744,7 @@ void BufferCache::RunGarbageCollector() {
 			dirty_buffers.push_back(id);
 		} else {
 			m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
+			RecordBdaEviction(buffer);
 			DeleteBuffer(id);
 		}
 		return ++retire_count == limit;
@@ -750,6 +765,7 @@ void BufferCache::RunGarbageCollector() {
 			EXIT("BufferCache: garbage collection retained GPU ownership\n");
 		}
 		m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());
+		RecordBdaEviction(buffer);
 		Unregister(id);
 		m_slot_buffers.erase(id);
 	}
@@ -813,7 +829,13 @@ void BufferCache::ResolveBdaFault(uint64_t vaddr, uint64_t size) {
 		m_bda_tracked_ranges.Add(begin, end - begin);
 		m_bda_unmarked_ranges.Add(begin, end - begin);
 	});
-	missing.ForEach([this](uint64_t begin, uint64_t end) { (void)FindBuffer(begin, end - begin); });
+	missing.ForEach([this](uint64_t begin, uint64_t end) {
+		if (!RefaultPinsOnly() || m_bda_evicted_ranges.Intersects(begin, end - begin)) {
+			m_bda_pinned_ranges.Add(begin, end - begin);
+		}
+		m_bda_resolved_ranges.Add(begin, end - begin);
+		(void)FindBuffer(begin, end - begin);
+	});
 	stored.ForEach([this](uint64_t begin, uint64_t end) {
 		for (auto page = begin; page < end; page += CACHING_PAGESIZE) {
 			const auto* owner = m_page_table.Find(page >> PageTable::kPageBits);
@@ -829,6 +851,47 @@ void BufferCache::ResolveBdaFault(uint64_t vaddr, uint64_t size) {
 			                sizeof(entry));
 		}
 	});
+}
+
+void BufferCache::PrefetchBda(uint64_t vaddr, uint64_t size, bool store) {
+	const auto begin = vaddr & ~(CACHING_PAGESIZE - 1);
+	const auto end   = (vaddr + size + CACHING_PAGESIZE - 1) & ~(CACHING_PAGESIZE - 1);
+	if (begin >= end || !GuestRange {begin, end - begin}.Valid()) {
+		return;
+	}
+	RangeSet missing;
+	for (auto page = begin; page < end; page += CACHING_PAGESIZE) {
+		const auto* owner = m_page_table.Find(page >> PageTable::kPageBits);
+		if (owner == nullptr || !*owner) {
+			missing.Add(page, CACHING_PAGESIZE);
+		} else {
+			TouchBuffer(m_slot_buffers[*owner]);
+		}
+	}
+	missing.ForEach(
+	    [this](uint64_t first, uint64_t last) { (void)FindBuffer(first, last - first); });
+	if (!store) {
+		return;
+	}
+	constexpr uint64_t StoreWindow = 64 * 1024;
+	const auto         tracked_end = std::min(end, begin + StoreWindow);
+	for (auto page = begin; page < tracked_end; page += CACHING_PAGESIZE) {
+		if (!m_bda_tracked_ranges.Contains(page, CACHING_PAGESIZE)) {
+			ResolveBdaFault(page, CACHING_PAGESIZE);
+		}
+	}
+}
+
+void BufferCache::ForgetBdaResidency(uint64_t vaddr, uint64_t size) {
+	m_bda_resolved_ranges.Subtract(vaddr, size);
+	m_bda_evicted_ranges.Subtract(vaddr, size);
+	m_bda_pinned_ranges.Subtract(vaddr, size);
+}
+
+void BufferCache::RecordBdaEviction(const Buffer& buffer) {
+	m_bda_resolved_ranges.ForEachInRange(
+	    buffer.CpuAddress(), buffer.Size(),
+	    [this](uint64_t begin, uint64_t end) { m_bda_evicted_ranges.Add(begin, end - begin); });
 }
 
 void BufferCache::MarkBdaStoresInMapped(const RangeSet& mapped, bool all_tracked) {

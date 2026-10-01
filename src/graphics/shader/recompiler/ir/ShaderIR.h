@@ -593,6 +593,15 @@ struct BindingLayout {
 	bool operator==(const Bindings& other) const = default;
 };
 
+struct DmaPointer {
+	bool     user_data = false;
+	bool     store     = false;
+	uint32_t lo        = 0;
+	uint32_t hi        = 0;
+
+	bool operator==(const DmaPointer& other) const = default;
+};
+
 struct ShaderInfo {
 	static constexpr uint32_t MaxBuffers = 64;
 	// Dense buffer slots a materialized shader may bind: the buffers it tracks plus the candidates
@@ -640,9 +649,10 @@ struct ShaderInfo {
 	std::array<uint8_t, 32>          vertex_fetch_components {};
 	int32_t                          vertex_offset_sgpr   = -1;
 	int32_t                          instance_offset_sgpr = -1;
-	bool                             has_bitwise_xor    = false;
-	bool                             uses_dma           = false;
-	bool                             writes_dma         = false;
+	bool                             has_bitwise_xor      = false;
+	bool                             uses_dma             = false;
+	bool                             writes_dma           = false;
+	std::vector<DmaPointer>          dma_pointers;
 
 	bool operator==(const ShaderInfo& other) const = default;
 };

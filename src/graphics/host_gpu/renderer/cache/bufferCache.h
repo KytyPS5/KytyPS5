@@ -96,6 +96,8 @@ public:
 	void               ProcessFaultBuffer();
 	// A BDA fault on an owned page can only come from a store, which promotes the page to tracked.
 	void               ResolveBdaFault(uint64_t vaddr, uint64_t size);
+	void               PrefetchBda(uint64_t vaddr, uint64_t size, bool store);
+	void               ForgetBdaResidency(uint64_t vaddr, uint64_t size);
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	// Marks the tracked pages a BDA store can reach GPU-written, restricted to mapped memory.
 	void               MarkBdaStoresInMapped(const RangeSet& mapped, bool all_tracked);
@@ -161,6 +163,7 @@ private:
 	template <bool async>
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	void MarkBdaStores(uint64_t vaddr, uint64_t size);
+	void RecordBdaEviction(const Buffer& buffer);
 	void ForgetClassifiedMetadata(uint64_t vaddr, uint64_t size);
 
 	struct ClassifiedMetadata {
@@ -182,6 +185,9 @@ private:
 	RangeSet                                          m_bda_tracked_ranges;
 	// Tracked since the last mark, so stores that ran before tracking are owned without a rerun.
 	RangeSet                                          m_bda_unmarked_ranges;
+	RangeSet                                          m_bda_resolved_ranges;
+	RangeSet                                          m_bda_evicted_ranges;
+	RangeSet                                          m_bda_pinned_ranges;
 	std::map<uint64_t, ClassifiedMetadata>            m_classified_metadata;
 	uint64_t                                          m_classified_span = 0;
 	MemoryTracker                                     m_memory_tracker;

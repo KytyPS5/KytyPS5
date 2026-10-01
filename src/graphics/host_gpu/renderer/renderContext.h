@@ -58,6 +58,7 @@ public:
 	void               ProtectMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode);
 	// Stores own every tracked page up front: the guest may read before the dispatch completes.
 	void               PrepareBda(bool stores);
+	void               PrefetchBda(uint64_t address, bool store);
 	void               RunGarbageCollector();
 
 	void AddInterruptEq(LibKernel::EventQueue::KernelEqueue eq, int event_id);

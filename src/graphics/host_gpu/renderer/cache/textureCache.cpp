@@ -171,6 +171,25 @@ void ReportUploadSourceRefused(const Image& image) {
 	     info.data.address, info.data.size, RefusalReporter::RepeatSuffix(repeat, occurrences));
 }
 
+// A replacement may hold more layers than requested only where its data range covers them.
+bool GrowLayers(ImageInfo& info, const ImageInfo& requested, const ImageInfo& cached) {
+	if (info.resources.levels != 1 || requested.resources.levels != 1 ||
+	    requested.resources.layers == 0 || requested.IsVolume() ||
+	    requested.data.size % requested.resources.layers != 0 ||
+	    requested.mip_layout[0].offset != 0 ||
+	    requested.mip_layout[0].size != requested.data.size ||
+	    cached.data.address != requested.data.address) {
+		return false;
+	}
+	const auto size = requested.data.size / requested.resources.layers * info.resources.layers;
+	if (cached.data.size < size) {
+		return false;
+	}
+	info.data.size          = size;
+	info.mip_layout[0].size = size;
+	return true;
+}
+
 } // namespace
 
 TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler,
@@ -826,6 +845,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		info.tiled_slice_stride  = cached.info.tiled_slice_stride;
 		info.linear_slice_stride = cached.info.linear_slice_stride;
 		info.first_tail_level    = cached.info.first_tail_level;
+		}
 	}
 	const auto replacement_id = InsertImage(info);
 	auto&      replacement    = m_slot_images[replacement_id];
@@ -1064,15 +1084,24 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 			            ? result_id
 			            : ImageId {}};
 		}
+		// The same address reallocated as a bigger surface of the same shape: expand it.
+		if (requested.type == cached.info.type &&
+		    requested.extent.width >= cached.info.extent.width &&
+		    requested.extent.height >= cached.info.extent.height &&
+		    requested.extent.depth >= cached.info.extent.depth) {
+			return {ExpandImage(requested, cached_id)};
+		}
 		EXIT("TextureCache: unresolvable equal-address image overlap, address=0x%016" PRIx64
 		     " requested=%ux%u "
 		     "cached=%ux%u requested_size=0x%016" PRIx64 " cached_size=0x%016" PRIx64
-		     " type=%u/%u tile=%u/%u\n",
+		     " type=%u/%u tile=%u/%u requested_extent=%ux%ux%u cached_extent=%ux%ux%u\n",
 		     requested.data.address, requested.resources.levels, requested.resources.layers,
 		     cached.info.resources.levels, cached.info.resources.layers, requested.data.size,
 		     cached.info.data.size, static_cast<uint32_t>(requested.type),
 		     static_cast<uint32_t>(cached.info.type), static_cast<uint32_t>(requested.tile_mode),
-		     static_cast<uint32_t>(cached.info.tile_mode));
+		     static_cast<uint32_t>(cached.info.tile_mode), requested.extent.width,
+		     requested.extent.height, requested.extent.depth, cached.info.extent.width,
+		     cached.info.extent.height, cached.info.extent.depth);
 	}
 
 	const int32_t requested_mip = requested.MipOf(cached.info);

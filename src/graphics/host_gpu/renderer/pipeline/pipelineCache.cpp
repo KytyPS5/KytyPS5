@@ -460,6 +460,9 @@ struct PipelineCache::ProgramCache {
 		};
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			runtime.workgroup_counts = input_info.workgroup_counts;
+			for (uint32_t axis = 0; axis < 3u; axis++) {
+				runtime.workgroup_size[axis] = input_info.threads_num[axis];
+			}
 		}
 		bool source_changed = false;
 		if (entry != programs.end()) {

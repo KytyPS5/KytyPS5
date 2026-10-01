@@ -110,7 +110,8 @@ static bool IsMultisampledTexture(Prospero::ImageType type) {
 
 static vk::DescriptorBufferInfo
 NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource& source,
-                    const ShaderRecompiler::IR::BufferResource& resource, uint32_t& buffer_offset) {
+                    const ShaderRecompiler::IR::BufferResource&    resource,
+                    const ShaderRecompiler::IR::BufferWriteExtent* extent, uint32_t& buffer_offset) {
 	buffer_offset = 0;
 
 	const auto& [address, size, id] = source;
@@ -122,9 +123,26 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	if (size > graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange) {
 		EXIT("storage buffer range is unsupported\n");
 	}
+<<<<<<< HEAD
 	auto [buffer, offset] = context.GetBufferCache().ObtainBuffer(
 	    address, size, resource.written,
 	    resource.formatted || (resource.read && Config::SyncRawImageBuffersEnabled()), id);
+||||||| parent of 0250ea14 (graphics: mark only the bytes a dispatch's stores can reach as GPU-written)
+	auto [buffer, offset] = context.GetBufferCache().ObtainBuffer(address, size, resource.written,
+	                                                              resource.formatted, id);
+=======
+	const bool bounded_write = resource.written && extent != nullptr && extent->valid;
+	const auto written_begin = bounded_write ? std::min(extent->begin, size) : 0u;
+	const auto written_end   = bounded_write ? std::min(extent->end, size) : size;
+	auto [buffer, offset] =
+	    bounded_write
+	        ? context.GetBufferCache().ObtainBufferWritten(address, size, address + written_begin,
+	                                                       written_end - std::min(written_begin,
+	                                                                              written_end),
+	                                                       id)
+	        : context.GetBufferCache().ObtainBuffer(address, size, resource.written,
+	                                                resource.formatted, id);
+>>>>>>> 0250ea14 (graphics: mark only the bytes a dispatch's stores can reach as GPU-written)
 	const auto aligned_offset = Common::AlignDown(offset, alignment);
 	const auto adjustment     = offset - aligned_offset;
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
@@ -133,8 +151,9 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	}
 	buffer_offset = static_cast<uint32_t>(adjustment);
 	const vk::DescriptorBufferInfo result {buffer->Handle(), aligned_offset, size + adjustment};
-	if (resource.written) {
-		context.GetTextureCache().InvalidateMemoryFromGPU(address, size);
+	if (resource.written && written_end > written_begin) {
+		context.GetTextureCache().InvalidateMemoryFromGPU(address + written_begin,
+		                                                  written_end - written_begin);
 	}
 	return result;
 }
@@ -845,9 +864,37 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		const auto index = resource.descriptor_index;
 		if (index == UINT32_MAX) continue;
 		uint32_t buffer_offset = 0;
+<<<<<<< HEAD
 		prepared.buffers[index] = NativeStorageBuffer(m_context, prepared.buffer_sources[index],
 		                                              resource, buffer_offset);
 		pack_memory_offset(index, buffer_offset);
+||||||| parent of 0250ea14 (graphics: mark only the bytes a dispatch's stores can reach as GPU-written)
+		prepared.buffers.push_back(NativeStorageBuffer(m_context, prepared.buffer_sources[i],
+		                                               program.info.buffers[resource],
+		                                               buffer_offset));
+		pack_memory_offset(i, buffer_offset);
+		// The fallback allocation makes the Vulkan descriptor valid, but an empty guest
+		// buffer still has no accessible elements. In particular, never let a null store
+		// modify the shared fallback and affect subsequent null reads.
+		prepared.shader_data[layout.BufferLengthDword() + i] =
+		    prepared.buffer_sources[i].size == 0
+		        ? 0u
+		        : static_cast<uint32_t>(prepared.buffers.back().range / sizeof(uint32_t));
+=======
+		prepared.buffers.push_back(NativeStorageBuffer(
+		    m_context, prepared.buffer_sources[i], program.info.buffers[resource],
+		    resource < snapshot.buffer_write_extents.size() ? &snapshot.buffer_write_extents[resource]
+		                                                    : nullptr,
+		    buffer_offset));
+		pack_memory_offset(i, buffer_offset);
+		// The fallback allocation makes the Vulkan descriptor valid, but an empty guest
+		// buffer still has no accessible elements. In particular, never let a null store
+		// modify the shared fallback and affect subsequent null reads.
+		prepared.shader_data[layout.BufferLengthDword() + i] =
+		    prepared.buffer_sources[i].size == 0
+		        ? 0u
+		        : static_cast<uint32_t>(prepared.buffers.back().range / sizeof(uint32_t));
+>>>>>>> 0250ea14 (graphics: mark only the bytes a dispatch's stores can reach as GPU-written)
 	}
 	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::FlattenedSrt)] != 0) {
 		prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);

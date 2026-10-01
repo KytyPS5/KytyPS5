@@ -741,6 +741,107 @@ void TestBluetoothEncodingDoesNotBlockAudioQueue() {
 	speaker.reset();
 }
 
+void TestBluetoothSpeakerWaitsForItsAudioBlock() {
+	Fixture f;
+	wireless = hid_available = true;
+	auto vibration = Open();
+	auto speaker = Open(true);
+	std::vector<float> haptic(2048, 0.5f);
+	std::vector<float> sound(2048, 0.25f);
+	Check(Haptics::Queue(vibration.get(), 1, haptic.data(), 1024, 2, true, unity.data()) != 0,
+	      "Bluetooth vibration stream did not open");
+	Check(Libs::Controller::DualSenseBluetooth::Prepare(now * 1000000).empty(),
+	      "haptics sent a silent speaker packet before the audio batch arrived");
+	Check(Haptics::Queue(speaker.get(), 1, sound.data(), 256, 2, true, unity.data()) != 0,
+	      "Bluetooth speaker did not accept a short block");
+	Check(Libs::Controller::DualSenseBluetooth::Prepare(now * 1000000).empty(),
+	      "short Bluetooth speaker block was padded with silence immediately");
+	Check(Haptics::Queue(speaker.get(), 1, sound.data(), 768, 2, true, unity.data()) != 0,
+	      "Bluetooth speaker did not accept the remainder of its block");
+	auto reports = Libs::Controller::DualSenseBluetooth::Prepare(now * 1000000);
+	Check(reports.size() == 1 && reports[0].audio[100] > 0.2f && reports[0].data[12] > 0,
+	      "Bluetooth speaker and haptics were not combined into a complete report");
+	speaker.reset();
+	vibration.reset();
+}
+
+void TestBluetoothShortFinalBlock() {
+	Fixture f;
+	wireless = hid_available = true;
+	auto speaker = Open(true);
+	std::vector<float> sound(2048, 0.25f);
+	Check(Haptics::Queue(speaker.get(), 1, sound.data(), 256, 2, true, unity.data()) != 0,
+	      "Bluetooth speaker did not accept its final short block");
+	Check(Libs::Controller::DualSenseBluetooth::Prepare(now * 1000000).empty(),
+	      "short final Bluetooth block sent before more audio could arrive");
+	Check(Libs::Controller::DualSenseBluetooth::Prepare(now * 1000000 +
+	                                                 Libs::Controller::DualSenseBluetooth::PERIOD_NS)
+	          .size() == 1,
+	      "short final Bluetooth block was never played");
+	speaker.reset();
+}
+
+void TestBluetoothOverflowKeepsRecentAudio() {
+	Fixture f;
+	wireless = hid_available = true;
+	auto speaker = Open(true);
+	std::vector<float> sound(2048);
+	for (int block = 1; block <= 4; ++block) {
+		std::fill(sound.begin(), sound.end(), block * 0.1f);
+		Check(Haptics::Queue(speaker.get(), 1, sound.data(), 1024, 2, true,
+		                     unity.data()) != 0,
+		      "Bluetooth speaker overflow queue failed");
+	}
+	auto first = Libs::Controller::DualSenseBluetooth::Prepare(now * 1000000);
+	Check(first.size() == 1 && first[0].audio[200] > 0.15f && first[0].audio[200] < 0.25f,
+	      "Bluetooth queue overflow lost all buffered audio instead of the oldest block");
+	auto second = Libs::Controller::DualSenseBluetooth::Prepare(now * 1000000 +
+	                                                        Libs::Controller::DualSenseBluetooth::PERIOD_NS);
+	Check(second.size() == 1 && second[0].audio[200] > 0.25f && second[0].audio[200] < 0.35f,
+	      "Bluetooth queue overflow did not preserve the next audio block");
+	speaker.reset();
+}
+
+void TestBluetoothRecoversAfterLateWrite() {
+	Fixture f;
+	wireless = hid_available = true;
+	auto speaker = Open(true);
+	std::vector<float> sound(2048, 0.25f);
+	for (int i = 0; i < 3; ++i) {
+		Check(Haptics::Queue(speaker.get(), 1, sound.data(), 1024, 2, true,
+		                     unity.data()) != 0,
+		      "Bluetooth speaker could not buffer three reports");
+	}
+	const auto base = now * 1000000;
+	const auto period = Libs::Controller::DualSenseBluetooth::PERIOD_NS;
+	Check(Libs::Controller::DualSenseBluetooth::Prepare(base).size() == 1,
+	      "first Bluetooth report was not prepared");
+	Check(Libs::Controller::DualSenseBluetooth::Prepare(base + period + 10000000).size() == 1,
+	      "late Bluetooth report was not prepared");
+	Check(Libs::Controller::DualSenseBluetooth::Prepare(base + 2 * period).size() == 1,
+	      "Bluetooth sender did not recover its schedule after a late write");
+	speaker.reset();
+}
+
+void TestUsbOverflowKeepsRecentAudio() {
+	Fixture f;
+	auto speaker = Open(true);
+	std::vector<float> sound(2048);
+	for (int block = 1; block <= 4; ++block) {
+		std::fill(sound.begin(), sound.end(), block * 0.1f);
+		Check(Haptics::Queue(speaker.get(), 1, sound.data(), 1024, 2, true,
+		                     unity.data()) != 0,
+		      "USB speaker overflow queue failed");
+	}
+	std::array<float, 4> first {};
+	Check(!streams.empty() &&
+	          SDL_GetAudioStreamData(streams.back(), first.data(), sizeof(first)) ==
+	              sizeof(first) &&
+	          first[0] > 0.15f && first[0] < 0.25f,
+	      "USB queue overflow did not preserve the newest buffered audio");
+	speaker.reset();
+}
+
 void TestBluetoothAmbiguousDevice() {
 	Fixture f;
 	wireless = hid_available = duplicate_hid = true;
@@ -851,6 +952,11 @@ int main() {
 	TestBluetoothAudioAndIdentity();
 	TestBluetoothFailureFallsBack();
 	TestBluetoothEncodingDoesNotBlockAudioQueue();
+	TestBluetoothSpeakerWaitsForItsAudioBlock();
+	TestBluetoothShortFinalBlock();
+	TestBluetoothOverflowKeepsRecentAudio();
+	TestBluetoothRecoversAfterLateWrite();
+	TestUsbOverflowKeepsRecentAudio();
 	TestBluetoothAmbiguousDevice();
 	TestUsbAndBluetoothFeatureParity();
 	TestFailuresAndBoundedQueue();

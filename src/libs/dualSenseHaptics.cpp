@@ -375,11 +375,32 @@ uint64_t Queue(Stream* stream, int controller, const void* data, uint32_t frames
 		}
 	}
 	auto queued = std::max(0, SDL_GetAudioStreamQueued(stream->sdl));
-	if (queued > static_cast<int>(stream->freq * FRAME_BYTES * 80 / 1000)) {
-		SDL_ClearAudioStream(stream->sdl);
-		queued = 0;
-	}
 	const int  bytes = static_cast<int>(frames * FRAME_BYTES);
+	const int  max_bytes = static_cast<int>(stream->freq * FRAME_BYTES * 80 / 1000);
+	if (queued + bytes > max_bytes) {
+		// Keep the newest sound after a brief device stall. Clearing the entire
+		// stream produces a gap that is much longer than one audio block.
+		SDL_AudioSpec target {};
+		std::array<uint8_t, 16384> discarded {};
+		if (SDL_GetAudioStreamFormat(stream->sdl, nullptr, &target)) {
+			const int frame_bytes = SDL_AUDIO_FRAMESIZE(target);
+			if (frame_bytes > 0) {
+				const int chunk_frames = std::min<int>(
+				    static_cast<int>(discarded.size()) / frame_bytes,
+				    static_cast<int>((static_cast<uint64_t>(frames) * target.freq + stream->freq - 1) /
+				                     stream->freq));
+				while (queued + bytes > max_bytes && chunk_frames > 0 &&
+				       SDL_GetAudioStreamData(stream->sdl, discarded.data(),
+				                              chunk_frames * frame_bytes) > 0) {
+					queued = std::max(0, SDL_GetAudioStreamQueued(stream->sdl));
+				}
+			}
+		}
+		if (queued + bytes > max_bytes) {
+			SDL_ClearAudioStream(stream->sdl);
+			queued = 0;
+		}
+	}
 	const auto queued_us =
 	    static_cast<uint64_t>(queued + bytes) * 1000000 / (stream->freq * FRAME_BYTES);
 	if (audible && !stream->speaker) {

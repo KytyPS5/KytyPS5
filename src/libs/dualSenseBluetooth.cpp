@@ -32,6 +32,7 @@ constexpr int    OPUS_FRAMES  = 480;
 constexpr int    OPUS_BYTES   = 200;
 constexpr size_t REPORT_BYTES = 547;
 constexpr int    MAX_QUEUE_MS = 80;
+constexpr uint64_t COALESCE_NS = 1000000;
 
 struct Session;
 std::mutex                              g_mutex;
@@ -109,6 +110,8 @@ struct Session {
 	std::atomic<bool>     failed {false};
 	std::atomic<uint64_t> generation {0};
 	uint64_t              next_send = 0;
+	uint64_t              pending_since = 0;
+	uint64_t              pending_deadline = 0;
 	uint8_t               sequence  = 0;
 	uint8_t               counter   = 0;
 
@@ -167,15 +170,46 @@ struct PendingReport {
 	bool                              speaker = false;
 };
 
-bool PrepareReport(Session& session, PendingReport& pending) {
-	bool has_data = false;
+bool PrepareReport(Session& session, PendingReport& pending, uint64_t now) {
+	bool has_data     = false;
+	bool has_speaker  = false;
+	bool speaker_data = false;
+	bool partial      = false;
 	for (const auto* stream: session.streams) {
-		has_data |= SDL_GetAudioStreamAvailable(stream->audio) > 0;
+		const int available = SDL_GetAudioStreamAvailable(stream->audio);
+		has_data |= available > 0;
+		if (stream->speaker) {
+			has_speaker  = true;
+			speaker_data |= available > 0;
+			// SDL holds a few input frames for resampler lookahead. Up to 16
+			// missing output frames at a block boundary are harmless; a genuinely
+			// short block should wait for its remaining samples.
+			partial |= available > 0 &&
+			           available < static_cast<int>((pending.audio.size() - 16 * 2) * sizeof(float));
+		}
 		pending.speaker |= stream->speaker;
 	}
 	if (!has_data) {
+		session.pending_since = 0;
+		session.pending_deadline = 0;
 		return false;
 	}
+	if (partial || (has_speaker && !speaker_data) ||
+	    (session.next_send == 0 && !has_speaker)) {
+		if (session.pending_since == 0) {
+			session.pending_since = now;
+		}
+		// SDL needs a few input frames of lookahead when resampling. Sending as soon
+		// as any samples appear pads most of a short block with silence. When
+		// haptics arrive first, briefly wait for the speaker stream in the same
+		// emulated audio batch.
+		session.pending_deadline = session.pending_since + (partial ? PERIOD_NS : COALESCE_NS);
+		if (now < session.pending_deadline) {
+			return false;
+		}
+	}
+	session.pending_since = 0;
+	session.pending_deadline = 0;
 	std::array<float, 128> haptics {};
 	for (auto* stream: session.streams) {
 		if (stream->speaker) {
@@ -239,9 +273,14 @@ std::vector<PendingReport> Prepare(uint64_t now) {
 				continue;
 			}
 			PendingReport report {session, session->generation.load()};
-			if (PrepareReport(*session, report)) {
+			if (PrepareReport(*session, report, now)) {
 				pending.push_back(std::move(report));
-				session->next_send = std::max(session->next_send + PERIOD_NS, now + PERIOD_NS);
+				// Regain timing after a late HID write without sending reports in a
+				// burst. Reset the cadence only on the first report.
+				session->next_send = session->next_send == 0
+				                         ? now + PERIOD_NS
+				                         : std::max(session->next_send + PERIOD_NS,
+				                                    now + PERIOD_NS / 2);
 			}
 		}
 	}
@@ -287,6 +326,9 @@ int SDLCALL Sender(void*) {
 			for (const auto& [id, session]: g_sessions) {
 				if (session->next_send > now) {
 					wait_ns = std::min(wait_ns, session->next_send - now);
+				}
+				if (session->pending_deadline > now) {
+					wait_ns = std::min(wait_ns, session->pending_deadline - now);
 				}
 			}
 			g_wake.wait_for(lock, std::chrono::nanoseconds(wait_ns));
@@ -334,6 +376,8 @@ Stream* Open(uint32_t freq, bool speaker, int controller, void (*tick)()) {
 	g_tick       = tick;
 	auto* stream = new Stream {session, audio, freq, speaker};
 	session->streams.push_back(stream);
+	session->pending_since = 0;
+	session->pending_deadline = 0;
 	g_sessions[controller] = session;
 	g_wake.notify_one();
 	return stream;
@@ -355,9 +399,20 @@ uint64_t Queue(Stream* stream, const float* stereo, uint32_t frames) {
 	int       queued = std::max(0, SDL_GetAudioStreamQueued(stream->audio));
 	const int bytes  = static_cast<int>(frames * 2 * sizeof(float));
 	if (queued + bytes > static_cast<int>(max_frames * 2 * sizeof(float))) {
-		SDL_ClearAudioStream(stream->audio);
-		queued = 0;
+		// Discard complete old report slots, preserving the newest queued audio.
+		// Clearing the entire stream here creates an audible gap after a brief
+		// Windows Bluetooth write stall.
+		std::array<float, 2 * OPUS_FRAMES * 2> discarded {};
+		const int target = static_cast<int>(max_frames * 2 * sizeof(float)) - bytes;
+		while (queued > target) {
+			if (SDL_GetAudioStreamData(stream->audio, discarded.data(), sizeof(discarded)) <= 0) {
+				SDL_ClearAudioStream(stream->audio);
+				break;
+			}
+			queued = std::max(0, SDL_GetAudioStreamQueued(stream->audio));
+		}
 	}
+	queued = std::max(0, SDL_GetAudioStreamQueued(stream->audio));
 	if (!SDL_PutAudioStreamData(stream->audio, stereo, bytes)) {
 		return 0;
 	}
@@ -375,6 +430,8 @@ void Close(Stream* stream) {
 		auto&           streams = session->streams;
 		streams.erase(std::remove(streams.begin(), streams.end(), stream), streams.end());
 		session->generation++;
+		session->pending_since = 0;
+		session->pending_deadline = 0;
 		if (streams.empty()) {
 			session->active = false;
 			for (auto it = g_sessions.begin(); it != g_sessions.end(); ++it) {

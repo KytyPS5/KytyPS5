@@ -583,9 +583,12 @@ uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking
 		} else if (blocking && port.type == AUDIO_OUT_PORT_TYPE_PADSPK &&
 		           !controller_uses_bluetooth &&
 		           controller_queued_us > AUDIO_OUT_TARGET_LATENCY_US) {
-			// USB speaker audio drains through the OS device queue. Bluetooth transport
-			// latency varies, so pacing the game against its backlog would stutter video.
-			Common::Thread::SleepMicro(controller_queued_us - AUDIO_OUT_TARGET_LATENCY_US);
+			// USB speaker audio drains through the OS device queue. A stalled device
+			// must not hold the game's audio call (and potentially rendering) for the
+			// entire backlog; limit each wait to this port's audio block duration.
+			const uint64_t block_us = 1000000ULL * port.samples_num / port.freq;
+			Common::Thread::SleepMicro(
+			    std::min(controller_queued_us - AUDIO_OUT_TARGET_LATENCY_US, block_us));
 		}
 	}
 

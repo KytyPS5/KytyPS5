@@ -1,7 +1,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
-#include "graphics/shader/recompiler/frontend/decode/ImageOps.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
+#include "graphics/shader/recompiler/frontend/decode/ImageOps.h"
 
 #include <algorithm>
 #include <array>
@@ -90,7 +90,7 @@ ResourceKind MemoryKind(const Decoder::Instruction& decoded) {
 	switch (decoded.family) {
 		case Decoder::Family::SMEM:
 			return IsScalarAddressLoad(decoded.opcode) ? ResourceKind::ScalarAddress
-			                                           : ResourceKind::ScalarBuffer;
+			                                          : ResourceKind::ScalarBuffer;
 		case Decoder::Family::MUBUF:
 		case Decoder::Family::MTBUF: return ResourceKind::Buffer;
 		case Decoder::Family::FLAT: return FlatSegmentResourceKind(decoded.memory_segment);
@@ -129,10 +129,10 @@ IR::MemoryInfo MemoryInfoFromDecoded(const Decoder::Instruction& decoded) {
 	// Vector loads use GLC/DLC to bypass L0/GL1; atomics use GLC only to return data.
 	const bool buffer_atomic = decoded.opcode >= Decoder::Opcode::BUFFER_ATOMIC_SWAP &&
 	                           decoded.opcode <= Decoder::Opcode::BUFFER_ATOMIC_FMAX;
-	memory.coherent =
-	    memory.kind == ResourceKind::Buffer && !buffer_atomic && (decoded.glc || decoded.dlc);
-	memory.resource = ResourceIndexFromOperand(decoded.src1);
-	memory.sampler  = ResourceIndexFromOperand(decoded.src2);
+	memory.coherent = memory.kind == ResourceKind::Buffer && !buffer_atomic &&
+	                  (decoded.glc || decoded.dlc);
+	memory.resource      = ResourceIndexFromOperand(decoded.src1);
+	memory.sampler       = ResourceIndexFromOperand(decoded.src2);
 	if (memory.kind == ResourceKind::ScalarBuffer) {
 		memory.resource = ResourceIndexFromOperand(decoded.src0);
 	} else if (IsAddressResourceKind(memory.kind) || memory.kind == ResourceKind::Lds ||
@@ -153,6 +153,7 @@ IR::MemoryInfo MemoryInfoFromDecoded(const Decoder::Instruction& decoded) {
 	}
 	return memory;
 }
+
 
 bool IsScalarBufferLoad(Decoder::Opcode opcode) {
 	switch (opcode) {
@@ -297,7 +298,8 @@ Translator::AddressOperands Translator::ReadAddressOperands(const Decoder::Instr
 		    high_or_base.kind != Decoder::OperandKind::Vgpr ? ReadU32(high_or_base) : low;
 		return {ir.Emit(IR::ValueOpcode::GetScratchResource), offset, IR::Value(0u)};
 	}
-	if (kind == IR::ResourceKind::Global && high_or_base.kind != Decoder::OperandKind::Vgpr) {
+	if (kind == IR::ResourceKind::Global &&
+	    high_or_base.kind != Decoder::OperandKind::Vgpr) {
 		const auto base_low  = ReadU32(high_or_base);
 		const auto base_high = ReadU32(OffsetOperand(high_or_base, 1u));
 		return {GetAddressResource(base_low, base_high), low, IR::Value(0u)};
@@ -445,7 +447,8 @@ void Translator::BUFFER_LOAD(const Decoder::Instruction& inst) {
 				case 4u: opcode = IR::ValueOpcode::LoadBufferU32x4; break;
 				default:
 					EXIT("opcode %s at pc 0x%08x has unsupported buffer load dword count %u",
-					     Decoder::InstructionToString(inst).c_str(), inst.pc, memory.data_dwords);
+					     Decoder::InstructionToString(inst).c_str(), inst.pc,
+					     memory.data_dwords);
 			}
 			break;
 		default:
@@ -512,7 +515,8 @@ void Translator::BUFFER_STORE(const Decoder::Instruction& inst) {
 					break;
 				default:
 					EXIT("opcode %s at pc 0x%08x has unsupported buffer store dword count %u",
-					     Decoder::InstructionToString(inst).c_str(), inst.pc, memory.data_dwords);
+					     Decoder::InstructionToString(inst).c_str(), inst.pc,
+					     memory.data_dwords);
 			}
 			break;
 		default:
@@ -540,9 +544,10 @@ void Translator::BUFFER_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode
 	} else {
 		const IR::Value value =
 		    memory.data_dwords == 2u ? IR::Value(ReadU64(data_src)) : IR::Value(ReadU32(data_src));
-		result = ir.Emit(
-		    opcode, {resource, address.index, address.offset, address.soffset, value, ir.GetExec()},
-		    flags);
+		result = ir.Emit(opcode,
+		                 {resource, address.index, address.offset, address.soffset, value,
+		                  ir.GetExec()},
+		                 flags);
 	}
 	if (inst.glc) {
 		WriteOperand(inst.dst, result);
@@ -554,15 +559,17 @@ void Translator::IMAGE_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode 
 	const auto resource = GetImageResource(memory);
 	const auto address  = MakeImageAddress(inst, MemorySourceAt(inst, 1));
 	const auto data     = MemorySourceAt(inst, 0);
-	// RDNA 2 IMAGE_ATOMIC_CMPSWAP: VDATA supplies the replacement, VDATA+1
-	// supplies the comparison; GLC writes the previous texel back to VDATA.
-	const auto result = opcode == IR::ValueOpcode::ImageAtomicCompareSwap32
-	                        ? ir.Emit(opcode,
-	                                  {resource, address, ReadU32(data),
-	                                   ReadU32(OffsetOperand(data, 1u)), ir.GetExec()},
-	                                  AddMemoryInfo(memory, inst.pc))
-	                        : ir.Emit(opcode, {resource, address, ReadU32(data), ir.GetExec()},
-	                                  AddMemoryInfo(memory, inst.pc));
+	const auto flags    = AddMemoryInfo(memory, inst.pc);
+	IR::Value  result;
+	if (opcode == IR::ValueOpcode::ImageAtomicCompareSwap32) {
+		// VDATA supplies the replacement; VDATA+1 supplies the comparison.
+		result = ir.Emit(opcode,
+		                 {resource, address, ReadU32(data), ReadU32(OffsetOperand(data, 1u)),
+		                  ir.GetExec()},
+		                 flags);
+	} else {
+		result = ir.Emit(opcode, {resource, address, ReadU32(data), ir.GetExec()}, flags);
+	}
 	if (inst.glc) {
 		WriteOperand(inst.dst, result);
 	}
@@ -570,13 +577,13 @@ void Translator::IMAGE_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode 
 
 void Translator::DS_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
                            bool returns_value) {
-	const auto      memory   = MemoryInfoFromDecoded(inst);
-	const auto      address  = ReadU32(MemorySourceAt(inst, 1));
-	const auto      data_src = MemorySourceAt(inst, 0);
+	const auto memory  = MemoryInfoFromDecoded(inst);
+	const auto address = ReadU32(MemorySourceAt(inst, 1));
+	const auto data_src = MemorySourceAt(inst, 0);
 	const IR::Value value =
 	    memory.data_dwords == 2u ? IR::Value(ReadU64(data_src)) : IR::Value(ReadU32(data_src));
-	const auto result =
-	    ir.Emit(opcode, {address, value, ir.GetExec()}, AddMemoryInfo(memory, inst.pc));
+	const auto result  = ir.Emit(opcode, {address, value, ir.GetExec()},
+	                             AddMemoryInfo(memory, inst.pc));
 	if (returns_value) {
 		WriteOperand(inst.dst, result);
 	}
@@ -850,7 +857,8 @@ void Translator::DS_MINMAX_F32(const Decoder::Instruction& inst, IR::ValueOpcode
 
 void Translator::DS_APPEND_CONSUME(const Decoder::Instruction& inst, IR::ValueOpcode opcode) {
 	const auto memory = MemoryInfoFromDecoded(inst);
-	WriteOperand(inst.dst, ir.Emit(opcode, {ReadU32(MemorySourceAt(inst, 0)), ir.GetExec()},
+	WriteOperand(inst.dst, ir.Emit(opcode,
+	                               {ReadU32(MemorySourceAt(inst, 0)), ir.GetExec()},
 	                               AddMemoryInfo(memory, inst.pc)));
 }
 
@@ -897,8 +905,8 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::S_MEMREALTIME: {
 			static std::atomic_flag warned = ATOMIC_FLAG_INIT;
 			if (!warned.test_and_set(std::memory_order_relaxed)) {
-				Log::WriteToConsoleAndLog("Warning: S_MEMREALTIME uses placeholder UINT64_MAX; "
-				                          "real-time clock not implemented.\n");
+				Log::WriteToConsoleAndLog(
+				    "Warning: S_MEMREALTIME uses placeholder UINT64_MAX; real-time clock not implemented.\n");
 			}
 			for (uint32_t component = 0; component < 2; component++) {
 				WriteOperand(ScalarDestinationOperand(inst.dst, component), IR::Value(UINT32_MAX));

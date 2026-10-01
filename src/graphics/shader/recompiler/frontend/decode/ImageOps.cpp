@@ -160,14 +160,16 @@ constexpr MimgSampleInfo MIMG_SAMPLE_OPCODE_LIST[] = {
     {0xb5u, "image_sample_b_o_a",
      ImageSampleFlagBias | ImageSampleFlagOffset | ImageSampleFlagAdjust},
     {0xb6u, "image_sample_b_cl_o_a",
-     ImageSampleFlagBias | ImageSampleFlagLodClamp | ImageSampleFlagOffset | ImageSampleFlagAdjust},
+     ImageSampleFlagBias | ImageSampleFlagLodClamp | ImageSampleFlagOffset |
+         ImageSampleFlagAdjust},
     {0xb8u, "image_sample_c_o_a",
      ImageSampleFlagCompare | ImageSampleFlagOffset | ImageSampleFlagAdjust},
     {0xb9u, "image_sample_c_cl_o_a",
      ImageSampleFlagCompare | ImageSampleFlagLodClamp | ImageSampleFlagOffset |
          ImageSampleFlagAdjust},
     {0xbdu, "image_sample_c_b_o_a",
-     ImageSampleFlagCompare | ImageSampleFlagBias | ImageSampleFlagOffset | ImageSampleFlagAdjust},
+     ImageSampleFlagCompare | ImageSampleFlagBias | ImageSampleFlagOffset |
+         ImageSampleFlagAdjust},
     {0xbeu, "image_sample_c_b_cl_o_a",
      ImageSampleFlagCompare | ImageSampleFlagBias | ImageSampleFlagLodClamp |
          ImageSampleFlagOffset | ImageSampleFlagAdjust},
@@ -177,20 +179,28 @@ constexpr MimgGatherInfo MIMG_GATHER_OPCODE_LIST[] = {
     {0x44u, Opcode::IMAGE_GATHER4_L, ImageSampleFlagLod},
     {0x47u, Opcode::IMAGE_GATHER4_LZ, ImageSampleFlagLevelZero},
     {0x48u, Opcode::IMAGE_GATHER4_C, ImageSampleFlagCompare},
-    {0x4fu, Opcode::IMAGE_GATHER4_C_LZ, ImageSampleFlagCompare | ImageSampleFlagLevelZero},
-    {0x57u, Opcode::IMAGE_GATHER4_LZ_O, ImageSampleFlagLevelZero | ImageSampleFlagOffset},
-    {0x58u, Opcode::IMAGE_GATHER4_C_O, ImageSampleFlagCompare | ImageSampleFlagOffset},
+    {0x4fu, Opcode::IMAGE_GATHER4_C_LZ,
+     ImageSampleFlagCompare | ImageSampleFlagLevelZero},
+    {0x57u, Opcode::IMAGE_GATHER4_LZ_O,
+     ImageSampleFlagLevelZero | ImageSampleFlagOffset},
+    {0x58u, Opcode::IMAGE_GATHER4_C_O,
+     ImageSampleFlagCompare | ImageSampleFlagOffset},
     {0x5fu, Opcode::IMAGE_GATHER4_C_LZ_O,
      ImageSampleFlagCompare | ImageSampleFlagLevelZero | ImageSampleFlagOffset},
     {0x61u, Opcode::IMAGE_GATHER4H, ImageSampleFlagGatherHorizontal},
 };
 
 constexpr Detail::OpcodeMap MIMG_ATOMIC_OPCODE_LIST[] = {
-    {0x0fu, Opcode::IMAGE_ATOMIC_SWAP}, {0x10u, Opcode::IMAGE_ATOMIC_CMPSWAP},
-    {0x11u, Opcode::IMAGE_ATOMIC_ADD},  {0x15u, Opcode::IMAGE_ATOMIC_UMIN},
-    {0x17u, Opcode::IMAGE_ATOMIC_UMAX}, {0x18u, Opcode::IMAGE_ATOMIC_AND},
-    {0x19u, Opcode::IMAGE_ATOMIC_OR},   {0x1au, Opcode::IMAGE_ATOMIC_XOR},
-    {0x1eu, Opcode::IMAGE_ATOMIC_FMIN}, {0x1fu, Opcode::IMAGE_ATOMIC_FMAX},
+    {0x0fu, Opcode::IMAGE_ATOMIC_SWAP},
+    {0x10u, Opcode::IMAGE_ATOMIC_CMPSWAP},
+    {0x11u, Opcode::IMAGE_ATOMIC_ADD},
+    {0x15u, Opcode::IMAGE_ATOMIC_UMIN},
+    {0x17u, Opcode::IMAGE_ATOMIC_UMAX},
+    {0x18u, Opcode::IMAGE_ATOMIC_AND},
+    {0x19u, Opcode::IMAGE_ATOMIC_OR},
+    {0x1au, Opcode::IMAGE_ATOMIC_XOR},
+    {0x1eu, Opcode::IMAGE_ATOMIC_FMIN},
+    {0x1fu, Opcode::IMAGE_ATOMIC_FMAX},
 };
 
 constexpr auto MIMG_SAMPLE_OPS = Detail::MakeOpcodeTable<0x100>(MIMG_SAMPLE_OPCODE_LIST);

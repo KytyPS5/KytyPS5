@@ -420,7 +420,12 @@ uint32_t EmitUFloatToF32Bits(EmitterState& state, uint32_t raw, uint32_t bits);
 uint32_t NormalizeFormatComponent(EmitterState& state, const Format::BufferFormatInfo& info,
                                   uint32_t component, uint32_t raw);
 
-void EmitDeviceAtomicMemoryBarrier(EmitterState& state);
+spv::Op SpirvAtomicOpcode(IR::ValueOpcode opcode);
+
+uint32_t EmitAtomicOperation(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t pointer,
+                             uint32_t scope);
+
+void EmitAtomicMemoryBarrier(EmitterState& state, IR::ResourceKind kind);
 
 uint32_t EmitFloatAtomicReplacement(EmitterState& state, uint32_t old, uint32_t source,
                                     bool max_value);
@@ -528,14 +533,7 @@ uint32_t EmitValueOrZeroIfCondition(EmitterState& state, uint32_t condition, Fn&
 
 template <typename Fn>
 uint32_t AtomicUpdate(EmitterState& state, uint32_t pointer, IR::ResourceKind kind, Fn&& desired) {
-	const auto scope  = kind == IR::ResourceKind::Lds ? spv::ScopeWorkgroup : spv::ScopeDevice;
-	const auto memory = [&] {
-		switch (kind) {
-			case IR::ResourceKind::Lds: return spv::MemorySemanticsWorkgroupMemoryMask;
-			case IR::ResourceKind::Image: return spv::MemorySemanticsImageMemoryMask;
-			default: return spv::MemorySemanticsUniformMemoryMask;
-		}
-	}();
+	const auto scope     = kind == IR::ResourceKind::Lds ? spv::ScopeWorkgroup : spv::ScopeDevice;
 	const auto preheader = state.builder.AllocateId();
 	const auto header    = state.builder.AllocateId();
 	const auto cont      = state.builder.AllocateId();
@@ -564,8 +562,7 @@ uint32_t AtomicUpdate(EmitterState& state, uint32_t pointer, IR::ResourceKind ki
 	EmitLabel(state, cont);
 	state.builder.AddFunction(spv::OpBranch, header);
 	EmitLabel(state, merge);
-	state.builder.AddFunction(spv::OpMemoryBarrier, ConstantU32(state, scope),
-	                          ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask | memory));
+	EmitAtomicMemoryBarrier(state, kind);
 	return observed;
 }
 

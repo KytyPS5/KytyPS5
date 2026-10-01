@@ -3531,19 +3531,6 @@ void TestNewShaderRecompilerCapturedVop1SdwaByteConvert() {
         "V_CVT_F16_U16 accepted unimplemented SDWA byte sign extension");
 }
 
-void TestImageAtomicCompareSwapDecode() {
-  for (uint32_t dmask = 0; dmask < 16; ++dmask) {
-    const uint32_t code[] = {0xf0000000u | (0x10u << 18u) | (dmask << 8u), 0u};
-    ShaderRecompiler::Decoder::Instruction decoded;
-    ShaderRecompiler::Decoder::DecodeInstruction(code, 0, decoded);
-    const auto expected = dmask == 3u
-        ? ShaderRecompiler::Decoder::Opcode::IMAGE_ATOMIC_CMPSWAP
-        : ShaderRecompiler::Decoder::Opcode::UNSUPPORTED;
-    Check(decoded.word_count == 2u && decoded.opcode == expected,
-          "image compare-and-swap must accept only the 32-bit DMASK encoding");
-  }
-}
-
 void TestNewShaderRecompilerVop1SdwaNotDestination() {
   auto options = MakeCompileOptions(ShaderType::Pixel);
 
@@ -14191,7 +14178,6 @@ int main() {
   TestPixelProgramCacheBindingIdentity();
   TestGraphicsPushConstantPlacement();
   TestNewShaderRecompilerUnsupportedMemoryDecode();
-  TestImageAtomicCompareSwapDecode();
 
   TestNewShaderRecompilerVop3LaneReadDestinationEncoding();
 

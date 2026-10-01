@@ -29915,7 +29915,9 @@ TestCase ImageAtomicCompareSwapGlcAndExec() {
   test.storage_image_r32ui[6] = 0xdeadbeefu;
   test.expected_storage_image_r32ui = test.storage_image_r32ui;
   test.expected_storage_image_r32ui[6] = 0xabcdef01u;
-  test.required_spirv = {"OpAtomicCompareExchange", "OpImageTexelPointer"};
+  // Device scope, AcquireRelease | ImageMemory (0x808).
+  test.required_spirv = {"OpAtomicCompareExchange", "OpImageTexelPointer",
+                         "OpMemoryBarrier %uint_1 %uint_2056"};
   return test;
 }
 

@@ -526,55 +526,6 @@ void StoreWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem) 
 	});
 }
 
-spv::Op SpirvAtomicOpcode(IR::ValueOpcode opcode) {
-	switch (opcode) {
-		case IR::ValueOpcode::BufferAtomicCmpSwap32: return spv::OpAtomicCompareExchange;
-		case IR::ValueOpcode::BufferAtomicSwap32:
-		case IR::ValueOpcode::BufferAtomicSwap64:
-		case IR::ValueOpcode::SharedAtomicSwap32: return spv::OpAtomicExchange;
-		case IR::ValueOpcode::BufferAtomicIAdd32:
-		case IR::ValueOpcode::SharedAtomicIAdd32: return spv::OpAtomicIAdd;
-		case IR::ValueOpcode::BufferAtomicISub32:
-		case IR::ValueOpcode::SharedAtomicISub32: return spv::OpAtomicISub;
-		case IR::ValueOpcode::BufferAtomicSMin32:
-		case IR::ValueOpcode::SharedAtomicSMin32: return spv::OpAtomicSMin;
-		case IR::ValueOpcode::BufferAtomicUMin32:
-		case IR::ValueOpcode::SharedAtomicUMin32: return spv::OpAtomicUMin;
-		case IR::ValueOpcode::BufferAtomicSMax32:
-		case IR::ValueOpcode::SharedAtomicSMax32: return spv::OpAtomicSMax;
-		case IR::ValueOpcode::BufferAtomicUMax32:
-		case IR::ValueOpcode::SharedAtomicUMax32: return spv::OpAtomicUMax;
-		case IR::ValueOpcode::BufferAtomicAnd32:
-		case IR::ValueOpcode::SharedAtomicAnd32: return spv::OpAtomicAnd;
-		case IR::ValueOpcode::BufferAtomicOr32:
-		case IR::ValueOpcode::BufferAtomicOr64:
-		case IR::ValueOpcode::SharedAtomicOr64:
-		case IR::ValueOpcode::SharedAtomicOr32: return spv::OpAtomicOr;
-		case IR::ValueOpcode::BufferAtomicXor32:
-		case IR::ValueOpcode::SharedAtomicXor32: return spv::OpAtomicXor;
-		default: return spv::OpNop;
-	}
-}
-
-uint32_t EmitAtomicOperation(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t pointer,
-                             uint32_t scope) {
-	const auto old = ctx.state.builder.AllocateId();
-	if (inst.GetOpcode() == IR::ValueOpcode::BufferAtomicCmpSwap32) {
-		const auto desired    = ctx.Arg(inst, inst.NumArgs() - 3);
-		const auto comparator = ctx.Arg(inst, inst.NumArgs() - 2);
-		ctx.state.builder.AddFunction(
-		    spv::OpAtomicCompareExchange, TypeU32(ctx.state), old, pointer,
-		    ConstantU32(ctx.state, scope), ConstantU32(ctx.state, spv::MemorySemanticsMaskNone),
-		    ConstantU32(ctx.state, spv::MemorySemanticsMaskNone), desired, comparator);
-	} else {
-		const auto value = ctx.Arg(inst, inst.NumArgs() - 2);
-		ctx.state.builder.AddFunction(SpirvAtomicOpcode(inst.GetOpcode()), TypeU32(ctx.state), old,
-		                              pointer, ConstantU32(ctx.state, scope),
-		                              ConstantU32(ctx.state, spv::MemorySemanticsMaskNone), value);
-	}
-	return old;
-}
-
 template <typename Fn>
 uint32_t EmitAtomicAccess(ValueEmitContext& ctx, const IR::Inst& inst,
                           const IR::MemoryInfo& mem, Fn&& operation) {
@@ -1024,14 +975,7 @@ uint32_t EmitAtomic32(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto scope =
 		    mem.kind == IR::ResourceKind::Lds ? spv::ScopeWorkgroup : spv::ScopeDevice;
 		const auto old = EmitAtomicOperation(ctx, inst, pointer, scope);
-		if (mem.kind == IR::ResourceKind::Lds) {
-			const auto semantics =
-			    spv::MemorySemanticsAcquireReleaseMask | spv::MemorySemanticsWorkgroupMemoryMask;
-			ctx.state.builder.AddFunction(spv::OpMemoryBarrier, ConstantU32(ctx.state, scope),
-			                              ConstantU32(ctx.state, semantics));
-		} else {
-			EmitDeviceAtomicMemoryBarrier(ctx.state);
-		}
+		EmitAtomicMemoryBarrier(ctx.state, mem.kind);
 		return old;
 	});
 }
@@ -1059,7 +1003,7 @@ uint32_t EmitBufferAtomic64(ValueEmitContext& ctx, const IR::Inst& inst) {
 			                                            TypeStorageBufferU64ElementPointer(state)),
 			            ConstantU32(state, spv::ScopeDevice),
 			            ConstantU32(state, spv::MemorySemanticsMaskNone), value);
-			        EmitDeviceAtomicMemoryBarrier(state);
+			        EmitAtomicMemoryBarrier(state, mem.kind);
 			        return Unary(state, spv::OpBitcast, TypeU64(state), old);
 		        });
 	    });

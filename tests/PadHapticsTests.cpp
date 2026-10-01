@@ -1,12 +1,17 @@
 // Exercise the production module with real SDL streams and fake USB endpoints.
 #include <SDL3/SDL.h>
+#include <opus.h>
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
 #include <numeric>
+#include <semaphore>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -44,6 +49,8 @@ bool                                  duplicate_hid  = false;
 int                                   hid_opens      = 0;
 int                                   opened_hid_pad = 0;
 std::vector<std::array<uint8_t, 547>> hid_reports;
+std::atomic_bool                      block_opus_encode {false};
+std::binary_semaphore                 encode_started {0}, allow_encode {0};
 SDL_AudioStream*                      default_stream      = nullptr;
 bool                                  fail_default_resume = false;
 int                                   active_controller   = 1;
@@ -194,6 +201,14 @@ int  HidWrite(SDL_hid_device*, const unsigned char* data, size_t size) {
 	hid_reports.push_back(report);
 	return static_cast<int>(size);
 }
+opus_int32 OpusEncodeFloat(OpusEncoder* encoder, const float* pcm, int frames,
+                           unsigned char* packet, opus_int32 bytes) {
+	if (block_opus_encode.exchange(false)) {
+		encode_started.release();
+		allow_encode.acquire();
+	}
+	return ::opus_encode_float(encoder, pcm, frames, packet, bytes);
+}
 SDL_JoystickID* GetGamepads(int* count) {
 	*count    = static_cast<int>(connected_pads.size());
 	auto* ids = static_cast<SDL_JoystickID*>(
@@ -259,6 +274,7 @@ bool SendGamepadEffect(SDL_Gamepad* pad, const void* data, int size) {
 #define SDL_hid_open_path             Fake::HidOpenPath
 #define SDL_hid_close                 Fake::HidClose
 #define SDL_hid_write                 Fake::HidWrite
+#define opus_encode_float             Fake::OpusEncodeFloat
 #define SDL_GetGamepadFromID          Fake::GetGamepadFromID
 #define SDL_RumbleGamepad             Fake::RumbleGamepad
 #define SDL_SendGamepadEffect         Fake::SendGamepadEffect
@@ -290,6 +306,7 @@ bool SendGamepadEffect(SDL_Gamepad* pad, const void* data, int size) {
 #undef SDL_hid_open_path
 #undef SDL_hid_close
 #undef SDL_hid_write
+#undef opus_encode_float
 #undef SDL_GetGamepadFromID
 #undef SDL_RumbleGamepad
 #undef SDL_SendGamepadEffect
@@ -694,6 +711,36 @@ void TestBluetoothFailureFallsBack() {
 	speaker.reset();
 }
 
+void TestBluetoothEncodingDoesNotBlockAudioQueue() {
+	Fixture f;
+	wireless = hid_available = true;
+	auto speaker = Open(true);
+	std::vector<float> sound(2048, 0.25f);
+	Check(Haptics::Queue(speaker.get(), 1, sound.data(), 1024, 2, true, unity.data()) != 0,
+	      "Bluetooth speaker did not open for concurrent encoding test");
+	block_opus_encode = true;
+	std::thread encoder([&] {
+		auto pending = Libs::Controller::DualSenseBluetooth::Prepare(now * 1000000);
+		Libs::Controller::DualSenseBluetooth::Send(pending);
+	});
+	encode_started.acquire();
+	std::binary_semaphore queue_finished {0};
+	std::atomic_bool      queue_ok {false};
+	std::thread audio([&] {
+		queue_ok = Haptics::Queue(speaker.get(), 1, sound.data(), 1024, 2, true,
+		                          unity.data()) != 0;
+		queue_finished.release();
+	});
+	const bool queued_without_encoder =
+	    queue_finished.try_acquire_for(std::chrono::seconds(2));
+	allow_encode.release();
+	audio.join();
+	encoder.join();
+	Check(queued_without_encoder && queue_ok,
+	      "Bluetooth audio queue waited for Opus encoding");
+	speaker.reset();
+}
+
 void TestBluetoothAmbiguousDevice() {
 	Fixture f;
 	wireless = hid_available = duplicate_hid = true;
@@ -803,6 +850,7 @@ int main() {
 	TestSpeakerRequiresUnambiguousUsbDevice();
 	TestBluetoothAudioAndIdentity();
 	TestBluetoothFailureFallsBack();
+	TestBluetoothEncodingDoesNotBlockAudioQueue();
 	TestBluetoothAmbiguousDevice();
 	TestUsbAndBluetoothFeatureParity();
 	TestFailuresAndBoundedQueue();

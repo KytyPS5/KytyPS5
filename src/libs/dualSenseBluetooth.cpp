@@ -159,25 +159,32 @@ void Mix(SDL_AudioStream* stream, std::array<float, N>& mixed) {
 	}
 }
 
-bool PrepareReport(Session& session, std::array<uint8_t, REPORT_BYTES>& report) {
+struct PendingReport {
+	std::shared_ptr<Session>          session;
+	uint64_t                          generation;
+	std::array<uint8_t, REPORT_BYTES> data {};
+	std::array<float, 2 * OPUS_FRAMES * 2> audio {};
+	bool                              speaker = false;
+};
+
+bool PrepareReport(Session& session, PendingReport& pending) {
 	bool has_data = false;
-	bool speaker  = false;
 	for (const auto* stream: session.streams) {
 		has_data |= SDL_GetAudioStreamAvailable(stream->audio) > 0;
-		speaker |= stream->speaker;
+		pending.speaker |= stream->speaker;
 	}
 	if (!has_data) {
 		return false;
 	}
-	std::array<float, 128>                 haptics {};
-	std::array<float, 2 * OPUS_FRAMES * 2> audio {};
+	std::array<float, 128> haptics {};
 	for (auto* stream: session.streams) {
 		if (stream->speaker) {
-			Mix(stream->audio, audio);
+			Mix(stream->audio, pending.audio);
 		} else {
 			Mix(stream->audio, haptics);
 		}
 	}
+	auto& report     = pending.data;
 	report[0]        = 0x39;
 	report[1]        = static_cast<uint8_t>(session.sequence << 4);
 	session.sequence = (session.sequence + 1) & 0x0f;
@@ -194,43 +201,55 @@ bool PrepareReport(Session& session, std::array<uint8_t, REPORT_BYTES>& report) 
 		report[12 + i]   = static_cast<uint8_t>(
             static_cast<int>(std::lround(std::clamp(value, -1.0f, 1.0f) * 127)));
 	}
-	if (speaker) {
+	if (pending.speaker) {
 		report[140] = 0xd3;
 		report[141] = OPUS_BYTES;
-		for (auto& sample: audio) {
+	}
+	return true;
+}
+
+bool EncodeReport(PendingReport& pending) {
+	if (!pending.session->active || pending.session->failed) {
+		return false;
+	}
+	if (pending.speaker) {
+		for (auto& sample: pending.audio) {
 			sample = std::isfinite(sample) ? std::clamp(sample, -1.0f, 1.0f) : 0.0f;
 		}
 		for (int packet = 0; packet < 2; packet++) {
-			if (opus_encode_float(session.encoder, audio.data() + packet * OPUS_FRAMES * 2,
-			                      OPUS_FRAMES, report.data() + 142 + packet * OPUS_BYTES,
+			if (opus_encode_float(pending.session->encoder,
+			                      pending.audio.data() + packet * OPUS_FRAMES * 2, OPUS_FRAMES,
+			                      pending.data.data() + 142 + packet * OPUS_BYTES,
 			                      OPUS_BYTES) != OPUS_BYTES) {
-				session.failed = true;
+				pending.session->failed = true;
 				return false;
 			}
 		}
 	}
-	FinishReport(report);
+	FinishReport(pending.data);
 	return true;
 }
 
-struct PendingReport {
-	std::shared_ptr<Session>          session;
-	uint64_t                          generation;
-	std::array<uint8_t, REPORT_BYTES> data {};
-};
-
 std::vector<PendingReport> Prepare(uint64_t now) {
 	std::vector<PendingReport> pending;
-	for (auto& [id, session]: g_sessions) {
-		if (session->failed || now < session->next_send) {
-			continue;
-		}
-		PendingReport report {session, session->generation.load()};
-		if (PrepareReport(*session, report.data)) {
-			pending.push_back(std::move(report));
-			session->next_send = std::max(session->next_send + PERIOD_NS, now + PERIOD_NS);
+	{
+		std::lock_guard lock(g_mutex);
+		for (auto& [id, session]: g_sessions) {
+			if (session->failed || now < session->next_send) {
+				continue;
+			}
+			PendingReport report {session, session->generation.load()};
+			if (PrepareReport(*session, report)) {
+				pending.push_back(std::move(report));
+				session->next_send = std::max(session->next_send + PERIOD_NS, now + PERIOD_NS);
+			}
 		}
 	}
+	// Opus encoding can take milliseconds; the emulation audio thread must be able
+	// to queue its next block while this work runs.
+	pending.erase(std::remove_if(pending.begin(), pending.end(),
+	                             [](PendingReport& report) { return !EncodeReport(report); }),
+	              pending.end());
 	return pending;
 }
 
@@ -250,12 +269,11 @@ void Send(const std::vector<PendingReport>& pending) {
 }
 
 int SDLCALL Sender(void*) {
-	(void)SDL_SetCurrentThreadPriority(SDL_THREAD_PRIORITY_HIGH);
 	std::unique_lock lock(g_mutex);
 	while (!g_stopping) {
-		auto pending = Prepare(SDL_GetTicksNS());
-		auto tick    = g_tick;
+		auto tick = g_tick;
 		lock.unlock();
+		auto pending = Prepare(SDL_GetTicksNS());
 		Send(pending);
 		if (tick != nullptr) {
 			tick();
@@ -264,7 +282,14 @@ int SDLCALL Sender(void*) {
 		if (g_sessions.empty()) {
 			g_wake.wait(lock, [] { return g_stopping || !g_sessions.empty(); });
 		} else {
-			g_wake.wait_for(lock, std::chrono::milliseconds(1));
+			const auto now = SDL_GetTicksNS();
+			uint64_t   wait_ns = 10000000; // Check rumble expiry at most 10 ms late.
+			for (const auto& [id, session]: g_sessions) {
+				if (session->next_send > now) {
+					wait_ns = std::min(wait_ns, session->next_send - now);
+				}
+			}
+			g_wake.wait_for(lock, std::chrono::nanoseconds(wait_ns));
 		}
 	}
 	return 0;

@@ -541,10 +541,17 @@ uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking
 	}
 
 	bool any_port_has_device = false;
-	for (uint32_t i = 0; i < num; i++) {
-		if (m_out_ports[params[i].handle.GetId()].stream != nullptr) {
-			any_port_has_device = true;
-			break;
+	{
+		Common::LockGuard lock(m_mutex);
+		for (uint32_t i = 0; i < num; i++) {
+			const auto& port = m_out_ports[params[i].handle.GetId()];
+			// The pad speaker's host stream is idle while Bluetooth HID owns its audio.
+			if (port.stream != nullptr &&
+			    (port.type != AUDIO_OUT_PORT_TYPE_PADSPK ||
+			     !Controller::DualSenseHaptics::UsesBluetooth(port.haptics))) {
+				any_port_has_device = true;
+				break;
+			}
 		}
 	}
 
@@ -559,20 +566,25 @@ uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking
 		auto& port = m_out_ports[params[i].handle.GetId()];
 
 		uint64_t controller_queued_us = 0;
+		bool controller_uses_bluetooth = false;
 		if (port.haptics != nullptr) {
 			// Keep the stream alive against close and volume changes.
 			Common::LockGuard lock(m_mutex);
 			controller_queued_us = Controller::DualSenseHaptics::Queue(
 			    port.haptics, Controller::GetActiveControllerId(), params[i].data, port.samples_num,
 			    static_cast<uint32_t>(port.channels_num), FormatIsFloat(port.format), port.volume);
+			controller_uses_bluetooth =
+			    Controller::DualSenseHaptics::UsesBluetooth(port.haptics);
 		}
 		if (controller_queued_us == 0) {
 			// No DualSense took it (e.g. it was unplugged); a pad speaker port plays on the main
 			// output instead, and a vibration port has none.
 			QueueSdlAudio(&port, params[i].data, blocking);
 		} else if (blocking && port.type == AUDIO_OUT_PORT_TYPE_PADSPK &&
+		           !controller_uses_bluetooth &&
 		           controller_queued_us > AUDIO_OUT_TARGET_LATENCY_US) {
-			// Vibration never paces output; the speaker is audible, so pace it like other ports.
+			// USB speaker audio drains through the OS device queue. Bluetooth transport
+			// latency varies, so pacing the game against its backlog would stutter video.
 			Common::Thread::SleepMicro(controller_queued_us - AUDIO_OUT_TARGET_LATENCY_US);
 		}
 	}

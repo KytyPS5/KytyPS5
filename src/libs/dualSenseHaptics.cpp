@@ -256,6 +256,10 @@ void Close(Stream* stream) {
 	}
 }
 
+bool UsesBluetooth(const Stream* stream) {
+	return stream != nullptr && stream->bluetooth != nullptr;
+}
+
 uint64_t Queue(Stream* stream, int controller, const void* data, uint32_t frames, uint32_t channels,
                bool is_float, const int* volume) {
 	if (stream == nullptr || data == nullptr || frames == 0 || channels == 0 || volume == nullptr) {
@@ -300,8 +304,8 @@ uint64_t Queue(Stream* stream, int controller, const void* data, uint32_t frames
 				return 0;
 			}
 		}
-		std::vector<float> stereo(static_cast<size_t>(frames) * 2);
-		bool               audible = false;
+		stream->buffer.resize(static_cast<size_t>(frames) * 2);
+		bool audible = false;
 		for (uint32_t frame = 0; frame < frames; frame++) {
 			for (uint32_t ch = 0; ch < 2; ch++) {
 				const auto source =
@@ -309,11 +313,12 @@ uint64_t Queue(Stream* stream, int controller, const void* data, uint32_t frames
 				float value = is_float ? static_cast<const float*>(data)[source]
 				                       : static_cast<const int16_t*>(data)[source] / 32768.0f;
 				value *= volume[channels == 1 ? 0 : ch] / 32768.0f;
-				stereo[static_cast<size_t>(frame) * 2 + ch] = value;
+				stream->buffer[static_cast<size_t>(frame) * 2 + ch] = value;
 				audible |= std::isfinite(value) && std::fabs(value) > 1.0f / 1024;
 			}
 		}
-		const auto queued_us = DualSenseBluetooth::Queue(stream->bluetooth, stereo.data(), frames);
+		const auto queued_us =
+		    DualSenseBluetooth::Queue(stream->bluetooth, stream->buffer.data(), frames);
 		if (queued_us == 0) {
 			CloseDevice(stream);
 			stream->next_check = now + 2000;

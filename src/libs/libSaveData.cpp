@@ -3,6 +3,7 @@
 #include "common/common.h"
 #include "common/file.h"
 #include "common/logging/log.h"
+#include "common/path_util.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "kernel/fileSystem.h"
@@ -26,7 +27,6 @@ LIB_VERSION("SaveData", 1, "SaveData", 1, 1);
 namespace SaveData {
 
 // TODO(): specify dir at launcher
-static constexpr char     SAVE_DATA_DIR[]      = "_SaveData";
 static constexpr uint64_t SAVE_DATA_BLOCKS_MIN = 48;
 static constexpr uint64_t SAVE_DATA_BLOCKS_MAX = 16384;
 
@@ -268,10 +268,10 @@ struct SaveDataMemory {
 };
 
 static std::map<std::filesystem::path, SaveDataMemory> g_save_data_memory;
-static int32_t                   g_next_transaction_resource = 1;
-static std::deque<SaveDataEvent> g_save_data_events;
-static SaveDataMountSlots        g_mount_slots;
-static Common::Mutex             g_mount_mutex;
+static int32_t                                         g_next_transaction_resource = 1;
+static std::deque<SaveDataEvent>                       g_save_data_events;
+static SaveDataMountSlots                              g_mount_slots;
+static Common::Mutex                                   g_mount_mutex;
 
 static bool valid_path_component(std::string_view name) {
 	return !name.empty() && name != "." && name != ".." &&
@@ -302,7 +302,7 @@ static std::string memory_dir_name(uint32_t slot_id) {
 
 static std::filesystem::path save_directory(std::string_view title_id, std::string_view dir_name,
                                             int32_t user_id) {
-	const auto directory = std::filesystem::path(SAVE_DATA_DIR) / title_id / dir_name;
+	const auto directory = PathUtil::GetPath(PathUtil::SAVE_DIR) / title_id / dir_name;
 	for (uint32_t slot = 0; slot < 4; slot++) {
 		if (dir_name == memory_dir_name(slot)) {
 			return directory / std::to_string(user_id);
@@ -590,7 +590,7 @@ int KYTY_SYSV_ABI SaveDataDirNameSearch(const SaveDataDirNameSearchCond* cond,
 
 	Common::LockGuard lock(g_mount_mutex);
 	const std::string title_id = cond->title_id != nullptr ? cond->title_id->data : get_title_id();
-	const auto        root     = std::filesystem::path(SAVE_DATA_DIR) / title_id;
+	const auto        root     = PathUtil::GetPath(PathUtil::SAVE_DIR) / title_id;
 	std::vector<std::string> dir_list;
 
 	if (Common::File::IsDirectoryExisting(root)) {
@@ -673,10 +673,10 @@ int KYTY_SYSV_ABI SaveDataMount3(const SaveDataMount3* mount, SaveDataMountResul
 
 	Common::LockGuard lock(g_mount_mutex);
 	const std::string dir_name  = mount->dir_name->data;
-	const auto        mount_dir = save_directory(get_title_id(), dir_name, mount->user_id);
-	const bool create  = ((mount->mount_mode & 4u) != 0);
-	const bool create2 = ((mount->mount_mode & 32u) != 0);
-	const bool open    = (!create && !create2 && ((mount->mount_mode & 3u) != 0));
+	const auto        mount_dir = save_directory(get_title_id(), dir_name, mount->user_id).string();
+	const bool        create    = ((mount->mount_mode & 4u) != 0);
+	const bool        create2   = ((mount->mount_mode & 32u) != 0);
+	const bool        open      = (!create && !create2 && ((mount->mount_mode & 3u) != 0));
 
 	const int slot = g_mount_slots.FindAvailable(mount_dir);
 	if (slot == SaveDataMountSlots::BUSY) {
@@ -913,8 +913,8 @@ int KYTY_SYSV_ABI SaveDataTransferringMount(const SaveDataTransferringMount* mou
 
 	Common::LockGuard lock(g_mount_mutex);
 	const std::string dir_name = mount->dir_name->data;
-	const auto mount_dir = save_directory(mount->title_id->data, dir_name, mount->user_id);
-	const int slot = g_mount_slots.FindAvailable(mount_dir);
+	const auto mount_dir = save_directory(mount->title_id->data, dir_name, mount->user_id).string();
+	const int  slot      = g_mount_slots.FindAvailable(dir_name);
 	if (slot == SaveDataMountSlots::BUSY) {
 		return SAVE_DATA_ERROR_BUSY;
 	}

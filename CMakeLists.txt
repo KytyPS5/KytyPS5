@@ -720,6 +720,17 @@ if(APPLE AND (CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64" OR
 		set_tests_properties(macos_sse4a PROPERTIES TIMEOUT 15)
 		add_dependencies(kyty_tests macos_sse4a_tests)
 	endif()
+	add_executable(macos_wide_store_tests EXCLUDE_FROM_ALL
+		"${KYTY_TESTS_DIR}/macosWideStoreTests.cpp"
+		"${KYTY_SOURCE_DIR}/loader/x64InstructionEmulator.cpp"
+	)
+	target_link_libraries(macos_wide_store_tests common fmt::fmt Zydis::Zydis)
+	target_include_directories(macos_wide_store_tests PRIVATE ${inc_headers})
+	if(BUILD_TESTING)
+		add_test(NAME macos_wide_store COMMAND $<TARGET_FILE:macos_wide_store_tests>)
+		set_tests_properties(macos_wide_store PROPERTIES TIMEOUT 15)
+		add_dependencies(kyty_tests macos_wide_store_tests)
+	endif()
 endif()
 
 add_executable(kyty_emulator "${KYTY_SOURCE_DIR}/main.cpp" ${kyty_emulator_src})

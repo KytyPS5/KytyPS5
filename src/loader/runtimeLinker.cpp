@@ -41,6 +41,7 @@
 #if defined(__APPLE__)
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
+#include <sys/sysctl.h>
 #elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
 #include <sys/uio.h>
 #include <unistd.h>
@@ -80,6 +81,20 @@ static void FreeTlsBlock(ThreadLocalStorage::Block* block) {
 static uint64_t AlignUp(uint64_t value, uint64_t alignment) {
 	return alignment != 0 ? (value + alignment - 1) & ~(alignment - 1) : value;
 }
+
+#if defined(__APPLE__)
+// KYTY_SPLIT_WIDE_STORES=0 turns splitting off and any other value turns it on. Unset, it follows
+// whether this x86-64 process is translated by Rosetta: native Intel Macs execute the stores as is.
+static bool SplitWideStoresEnabled() {
+	if (const char* value = std::getenv("KYTY_SPLIT_WIDE_STORES"); value != nullptr) {
+		return std::strcmp(value, "0") != 0;
+	}
+	int    translated = 0;
+	size_t size       = sizeof(translated);
+	return sysctlbyname("sysctl.proc_translated", &translated, &size, nullptr, 0) == 0 &&
+	       translated == 1;
+}
+#endif
 
 ThreadLocalStorage::~ThreadLocalStorage() {
 	for (auto& [_, block]: tlss) {
@@ -1823,9 +1838,15 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	const bool protect_memory_faults = false;
 #endif
 	const bool patch_guest_instructions = protect_memory_faults || emulate_amd;
+#if defined(__APPLE__)
+	// Rosetta aborts the process on some 256-bit stores (see SplitWideStoresEnabled).
+	const bool split_wide_stores = SplitWideStoresEnabled();
+#else
+	const bool split_wide_stores = false;
+#endif
 
 	constexpr uint64_t INSTRUCTION_TRAMPOLINE_SIZE = 8u * 1024u * 1024u;
-	if (patch_guest_instructions) {
+	if (patch_guest_instructions || split_wide_stores) {
 		EXIT_IF(INSTRUCTION_TRAMPOLINE_SIZE > UINT64_MAX - program->mapped_size);
 		program->mapped_size += INSTRUCTION_TRAMPOLINE_SIZE;
 	}
@@ -1835,12 +1856,15 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	    Common::PathToString(program->file_name.filename()).c_str());
 	EXIT_IF(program->base_vaddr == 0);
 
+	if (patch_guest_instructions || split_wide_stores) {
+		program->instruction_trampoline_vaddr = program->base_vaddr + program->base_size_aligned;
+		program->instruction_trampoline_size  = INSTRUCTION_TRAMPOLINE_SIZE;
+	}
 	if (patch_guest_instructions) {
-		const auto trampoline_addr           = program->base_vaddr + program->base_size_aligned;
-		program->instruction_trampoline_size = INSTRUCTION_TRAMPOLINE_SIZE;
 		RegisterGuestInstructionPatchModule(
 		    reinterpret_cast<void*>(program->base_vaddr), program->base_size_aligned,
-		    reinterpret_cast<void*>(trampoline_addr), program->instruction_trampoline_size);
+		    reinterpret_cast<void*>(program->instruction_trampoline_vaddr),
+		    program->instruction_trampoline_size);
 	}
 	if (!is_shared) {
 		program->tls.handler_vaddr =
@@ -1988,6 +2012,26 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			    fmt::format("AMD CPU compatibility: {} {} ({})\n", module_name, status, details));
 		}
 	}
+
+#if defined(__APPLE__)
+	if (split_wide_stores) {
+		uint64_t cursor = program->instruction_trampoline_vaddr;
+		for (const auto& [segment_addr, segment_size]: executable_segments) {
+			const auto result = X64InstructionEmulator::SplitWideStores(
+			    segment_addr, segment_size, &cursor,
+			    program->instruction_trampoline_vaddr + program->instruction_trampoline_size);
+			Common::VirtualMemory::FlushInstructionCache(segment_addr, segment_size);
+			Common::VirtualMemory::FlushInstructionCache(program->instruction_trampoline_vaddr,
+			                                             program->instruction_trampoline_size);
+			LOGF("Guest 256-bit store splitting: %s, candidates=%" PRIu64 ", patched=%" PRIu64
+			     " (via padding=%" PRIu64 ", ud2=%" PRIu64 ", moved=%" PRIu64 "), short=%" PRIu64
+			     ", unsupported=%" PRIu64 ", trampoline bytes=%" PRIu64 "\n",
+			     Common::PathToString(program->file_name.filename()).c_str(), result.candidates,
+			     result.patched, result.via_cave, result.trapped, result.relocated,
+			     result.too_short, result.unsupported, result.trampoline_bytes);
+		}
+	}
+#endif
 
 	if (!is_shared) {
 		SetupTlsHandler(program);

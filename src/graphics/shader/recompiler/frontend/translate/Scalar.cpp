@@ -155,6 +155,12 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 		case O::S_BREV_B32:
 			return SimpleInteger(inst, IR::ValueOpcode::BitReverse32, IR::Type::U32, false, false,
 			                     false);
+		case O::S_BREV_B64: {
+			const auto value = ReadU32Pair(inst.src0);
+			WriteU32Pair(inst.dst, {IR::U32(ir.Emit(IR::ValueOpcode::BitReverse32, {value[1]})),
+			                        IR::U32(ir.Emit(IR::ValueOpcode::BitReverse32, {value[0]}))});
+			return;
+		}
 		case O::S_BCNT1_I32_B32:
 			return SimpleInteger(inst, IR::ValueOpcode::BitCount32, IR::Type::U32, false, false,
 			                     true);
@@ -231,6 +237,7 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 		case O::S_CBRANCH_EXECZ:
 		case O::S_CBRANCH_EXECNZ:
 		case O::S_CBRANCH_CDBGSYS:
+		case O::S_CBRANCH_CDBGSYS_OR_USER:
 		case O::S_ENDPGM: return;
 		default: return FailMissingTranslation(inst);
 	}

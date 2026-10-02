@@ -539,19 +539,6 @@ uint32_t StoreTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t d
 	return PackImageTexel(ctx, mem, texel);
 }
 
-spv::Op ImageAtomicOpcode(IR::ValueOpcode opcode) {
-	switch (opcode) {
-		case IR::ValueOpcode::ImageAtomicSwap32: return spv::OpAtomicExchange;
-		case IR::ValueOpcode::ImageAtomicIAdd32: return spv::OpAtomicIAdd;
-		case IR::ValueOpcode::ImageAtomicUMin32: return spv::OpAtomicUMin;
-		case IR::ValueOpcode::ImageAtomicUMax32: return spv::OpAtomicUMax;
-		case IR::ValueOpcode::ImageAtomicAnd32: return spv::OpAtomicAnd;
-		case IR::ValueOpcode::ImageAtomicOr32: return spv::OpAtomicOr;
-		case IR::ValueOpcode::ImageAtomicXor32: return spv::OpAtomicXor;
-		default: return spv::OpNop;
-	}
-}
-
 } // namespace
 
 void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
@@ -876,10 +863,9 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		ctx.Define(inst, ResultVector(ctx, result, numeric_class, dref, mem));
 		return;
 	}
-	const auto atomic_opcode = ImageAtomicOpcode(op);
 	if (image_info.access == IR::ImageAccess::Atomic) {
 		const auto dimension = image.dimension;
-		ctx.Define(inst, EmitValueOrZeroIfCondition(state, ctx.Arg(inst, 3), [&]() {
+		ctx.Define(inst, EmitValueOrZeroIfCondition(state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
 			           const auto pointer      = state.builder.AllocateId();
 			           const auto pointer_type = state.builder.Type(
 			               spv::OpTypePointer, spv::StorageClassImage, TypeU32(state));
@@ -896,12 +882,8 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 					                                   op == IR::ValueOpcode::ImageAtomicFMax32);
 				                               });
 			           }
-			           const auto old = state.builder.AllocateId();
-			           state.builder.AddFunction(atomic_opcode, TypeU32(state), old, pointer,
-			                                     ConstantU32(state, spv::ScopeDevice),
-			                                     ConstantU32(state, spv::MemorySemanticsMaskNone),
-			                                     ctx.Arg(inst, 2));
-			           EmitDeviceAtomicMemoryBarrier(state);
+			           const auto old = EmitAtomicOperation(ctx, inst, pointer, spv::ScopeDevice);
+			           EmitAtomicMemoryBarrier(state, IR::ResourceKind::Image);
 			           return old;
 		           }));
 		return;

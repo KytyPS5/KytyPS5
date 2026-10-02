@@ -583,7 +583,7 @@ bool TextureCache::CopyD16(Image& destination, Image& source) {
 	}
 
 	auto                         depth_buffer = m_tiler.GetScratchBuffer(depth_size);
-	auto                         color_buffer = m_tiler.GetScratchBuffer(color_size);
+	auto                         color_buffer = m_tiler.GetScratchBuffer(color_size, depth_buffer.buffer);
 	const TileManager::D16Layout promote_layout {
 	    .width               = depth.info.extent.width,
 	    .height              = depth.info.extent.height,
@@ -1071,7 +1071,7 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 		                     texels_per_slice > UINT64_MAX / transfer_bytes);
 		const uint64_t transfer_slice = texels_per_slice * transfer_bytes;
 		EXIT_NOT_IMPLEMENTED(transfer_slice > UINT64_MAX / layers);
-		auto promoted = m_tiler.GetScratchBuffer(transfer_slice * layers);
+		auto promoted = m_tiler.GetScratchBuffer(transfer_slice * layers, linear.buffer);
 		m_tiler.ConvertD16(
 		    linear, promoted, TileManager::D16Direction::Promote,
 		    info.pixel_format == vk::Format::eD32SfloatS8Uint,
@@ -1679,7 +1679,7 @@ void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t des
 	auto host_linear = m_tiler.GetScratchBuffer(transfer_size);
 	image.Download(copies, host_linear.buffer, 0, host_linear.size);
 	const bool tiled        = info.IsTiled();
-	auto       guest_linear = tiled ? m_tiler.GetScratchBuffer(info.data.size)
+	auto       guest_linear = tiled ? m_tiler.GetScratchBuffer(info.data.size, host_linear.buffer)
 	                                : TileManager::Result {destination.Handle(), destination_offset,
 	                                                       destination.Size() - destination_offset};
 	m_tiler.ConvertD16(host_linear, guest_linear, TileManager::D16Direction::Demote,

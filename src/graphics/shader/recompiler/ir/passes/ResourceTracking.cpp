@@ -44,6 +44,34 @@ uint32_t PossibleU32Bits(Value value) {
 	}
 }
 
+bool IsNoncanonicalFlatAddress(Value high, Value active) {
+	high = high.Resolve();
+	active = active.Resolve();
+	// A predicated VGPR write supplies its new value on exactly the lanes which
+	// execute this access. Do not discard a selection under a different mask.
+	while (const auto* select = high.TryInstruction()) {
+		if (select->GetOpcode() != ValueOpcode::SelectU32 || select->Arg(0).Resolve() != active) break;
+		high = select->Arg(1).Resolve();
+	}
+	uint32_t lower = 0, upper = UINT32_MAX;
+	if (high.IsImmediate() && high.GetType() == Type::U32) {
+		lower = upper = high.U32();
+	} else if (const auto* inst = high.TryInstruction();
+	           inst != nullptr && inst->GetOpcode() == ValueOpcode::UMedTri32) {
+		// The median lies between any two constant inputs, regardless of the third.
+		uint32_t count = 0;
+		for (size_t index = 0; index < inst->NumArgs(); ++index) {
+			const auto value = inst->Arg(index).Resolve();
+			if (!value.IsImmediate() || value.GetType() != Type::U32) continue;
+			if (count++ == 0) lower = upper = value.U32();
+			else { lower = std::min(lower, value.U32()); upper = std::max(upper, value.U32()); }
+		}
+		if (count < 2) return false;
+	}
+	// Leave one high DWORD on each side for the signed instruction offset/carry.
+	return lower > 0x00008000u && upper < 0xffff7fffu;
+}
+
 Value CanonicalizeSampleAdjustDword3(Value value) {
 	for (;;) {
 		value            = value.Resolve();
@@ -1649,6 +1677,10 @@ private:
 
 	void Collect(Inst& inst) {
 		const auto op           = inst.GetOpcode();
+		if (op == ValueOpcode::BvhIntersect) {
+			m_info.uses_dma = true;
+			return;
+		}
 		const auto buffer       = BufferAccessOf(op);
 		const auto address_info = AddressOpcodeInfoOf(op);
 		const auto image_info   = ImageOpcodeInfoOf(op);
@@ -1694,6 +1726,15 @@ private:
 		if (address_info.access != AddressAccess::None) {
 			if (!IsAddressResourceKind(memory.kind)) {
 				Fail(flags.pc, "address operation has invalid resource kind");
+			}
+			if (memory.kind == ResourceKind::Flat && memory.address_is_full &&
+			    IsNoncanonicalFlatAddress(inst.Arg(2), inst.Arg(inst.NumArgs() - 1))) {
+				ValidateAddressHandle(inst.Arg(0), flags.pc);
+				if (memory.data_bits != 32u || m_program.scratch_dwords == 0) {
+					Fail(flags.pc, "local FLAT access requires DWORD data and per-thread scratch storage");
+				}
+				m_program.memory_info[flags.index].kind = ResourceKind::FlatLocal;
+				return;
 			}
 			if (memory.kind == ResourceKind::Scratch) {
 				handle = inst.Arg(0).Resolve().TryInstruction();

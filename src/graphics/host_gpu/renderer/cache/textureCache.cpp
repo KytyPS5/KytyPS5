@@ -1533,7 +1533,7 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 	auto&          image = m_slot_images[selected];
 	vk::ClearValue clear {};
 	if (aspect == vk::ImageAspectFlagBits::eColor) {
-		if (!DecodePackedColorClear(image.info.pixel_format, packed_clear, clear.color)) {
+		if (!DecodeColorDwordFill(image.info.pixel_format, packed_clear, clear.color)) {
 			return false;
 		}
 	} else {

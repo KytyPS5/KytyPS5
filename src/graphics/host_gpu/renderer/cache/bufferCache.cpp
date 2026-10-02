@@ -110,6 +110,7 @@ void BufferCache::DeleteBuffer(BufferId id) {
 	}
 }
 
+template <bool async>
 bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size     = 0;
@@ -170,14 +171,22 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	                       vk::PipelineStageFlagBits::eAllCommands |
 	                           vk::PipelineStageFlagBits::eHost,
 	                       {}, 0, nullptr, 1, &after, 0, nullptr);
-	m_scheduler.DeferPriorityOperation([this, mapped, offset, total_size, buffer_address,
-	                                    copies = std::move(copies), owner = std::move(temporary)] {
+	auto publish = [this, mapped, offset, total_size, buffer_address,
+	                copies = std::move(copies), owner = std::move(temporary)] {
 		(owner ? *owner : m_download_buffer).Invalidate(offset, total_size);
 		for (const auto& copy: copies) {
 			Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
 			                                      mapped + (copy.dstOffset - offset), copy.size);
 		}
-	});
+	};
+	if constexpr (async) {
+		m_scheduler.DeferPriorityOperation(std::move(publish));
+	} else {
+		const auto tick = m_scheduler.CurrentTick();
+		m_scheduler.Wait(tick);
+		m_scheduler.WaitPriorityOperations(tick);
+		publish();
+	}
 	return true;
 }
 
@@ -256,10 +265,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		const auto window_begin = std::max(Common::AlignDown(vaddr, WindowSize), buffer_begin);
 		const auto window_end = std::min(std::max(window_begin + WindowSize, vaddr + size), buffer_end);
 
-		if (DownloadBufferMemory(buffer, window_begin, window_end - window_begin)) {
-			const auto tick = m_scheduler.CurrentTick();
-			m_scheduler.Wait(tick);
-			m_scheduler.WaitPriorityOperations(tick);
+		if (DownloadBufferMemory<false>(buffer, window_begin, window_end - window_begin)) {
 			m_memory_tracker.UnmarkRegionAsGpuModified(window_begin, window_end - window_begin);
 		}
 		if (is_write) {
@@ -614,7 +620,7 @@ void BufferCache::RunGarbageCollector() {
 			return false;
 		}
 		if (dirty) {
-			EXIT_IF(!DownloadBufferMemory(buffer, buffer.CpuAddress(), buffer.Size()));
+			EXIT_NOT_IMPLEMENTED(!DownloadBufferMemory<true>(buffer, buffer.CpuAddress(), buffer.Size()));
 			dirty_buffers.push_back(id);
 		} else {
 			m_memory_tracker.UntrackMemory(buffer.CpuAddress(), buffer.Size());

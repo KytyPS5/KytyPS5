@@ -30,21 +30,14 @@ class TrackingSpinLock final {
 public:
 	void lock() noexcept {
 		const auto thread = CurrentThread();
-		if (m_owner.load(std::memory_order_relaxed) == thread) {
-			EXIT("recursive region tracking lock\n");
-		}
 		while (m_lock.test_and_set(std::memory_order_acquire)) {
-			if (m_owner.load(std::memory_order_relaxed) == thread) {
-				EXIT("recursive region tracking lock while contended\n");
-			}
+			EXIT_NOT_IMPLEMENTED(m_owner.load(std::memory_order_relaxed) == thread);
 			std::atomic_signal_fence(std::memory_order_seq_cst);
 		}
 		m_owner.store(thread, std::memory_order_relaxed);
 	}
 	void unlock() noexcept {
-		if (m_owner.load(std::memory_order_relaxed) != CurrentThread()) {
-			EXIT("region tracking lock released by non-owner\n");
-		}
+		EXIT_NOT_IMPLEMENTED(m_owner.load(std::memory_order_relaxed) != CurrentThread());
 		m_owner.store(0, std::memory_order_relaxed);
 		m_lock.clear(std::memory_order_release);
 	}
@@ -88,8 +81,7 @@ public:
 	template <DirtySource source>
 	[[nodiscard]] bool IsModified(uint64_t offset, uint64_t size) const {
 		const auto [start, end] = GetPageRange(m_cpu_addr + offset, size);
-		const auto& bits        = GetBits<source>();
-		return RegionBits(bits, start, end).Any();
+		return GetBits<source>().FirstRangeFrom(start).first < end;
 	}
 
 	template <DirtySource source, bool enable>

@@ -281,6 +281,61 @@ void TestInvariantAndDivergentPhi() {
         "divergent phi was accepted");
 }
 
+void TestOperandMutationLifecycle() {
+  Fixture fixture(6);
+  const auto definition = fixture.Emit(ValueOpcode::IAdd32, {Value(0x55u), Value(0u)});
+  auto *source = definition.TryInstruction();
+  const auto inserted = fixture.Emit(ValueOpcode::BitFieldInsert,
+      {definition, definition, Value(4u), Value(4u)});
+  Check(source->UseCount() == 2, "inline operands lost distinct reverse-use indices");
+  inserted.TryInstruction()->SetArg(1, Value(3u));
+  Check(source->UseCount() == 1, "inline operand mutation did not detach its old use");
+  source->ReplaceUsesWith(Value(0xaau));
+  uint32_t result = 0;
+  Check(source->UseCount() == 0 &&
+            SrtWalker(fixture.program, {}).Evaluate(inserted, result) && result == 0x3au,
+        "inline operand replacement changed the evaluated value");
+
+  for (const auto opcode : {ValueOpcode::GetImageResource, ValueOpcode::MakeImageAddress}) {
+    auto &large = fixture.program.value_storage.emplace_back(opcode);
+    auto &replacement = fixture.program.value_storage.emplace_back(opcode);
+    const auto count = large.NumArgs();
+    for (size_t index = 0; index < count; ++index) {
+      large.SetArg(index, definition);
+      replacement.SetArg(index, Value(static_cast<uint32_t>(index)));
+    }
+    const auto user = fixture.Emit(ValueOpcode::Identity, {Value(&large)}, 0, 1);
+    Check(source->UseCount() == count, "large operands lost reverse-use indices");
+    large.ReplaceUsesWith(Value(&replacement));
+    Check(source->UseCount() == 0 && large.GetOpcode() == ValueOpcode::Identity &&
+              large.NumArgs() == 1 && large.Arg(0) == Value(&replacement) &&
+              user.Resolve() == Value(&replacement) && replacement.UseCount() == 2,
+          "large operand replacement did not preserve users or detach old operands");
+    large.Invalidate();
+    large.Invalidate();
+    Check(large.NumArgs() == 0 && replacement.UseCount() == 1,
+          "repeated invalidation detached a surviving large-value user");
+  }
+
+  auto &phi = fixture.BlockAt(5).AppendNewInst(ValueOpcode::Phi);
+  phi.SetFlags(Type::U32);
+  for (size_t index = 0; index < 5; ++index) {
+    phi.AddPhiOperand(&fixture.BlockAt(index), definition);
+  }
+  phi.SetArg(3, Value(7u));
+  Check(phi.NumArgs() == 5 && phi.NumPhiBlocks() == 5 && source->UseCount() == 4,
+        "Phi mutation lost its incoming values or reverse uses");
+  for (size_t index = 0; index < 5; ++index) {
+    Check(phi.PhiBlock(index) == &fixture.BlockAt(index),
+          "Phi mutation changed an incoming predecessor");
+  }
+  const auto sum = fixture.Emit(ValueOpcode::IAdd32, {Value(&phi), Value(5u)}, 0, 5);
+  phi.ReplaceUsesWith(Value(6u));
+  Check(source->UseCount() == 0 && phi.NumPhiBlocks() == 0 && phi.NumArgs() == 1 &&
+            SrtWalker(fixture.program, {}).Evaluate(sum, result) && result == 11,
+        "Phi replacement retained incoming uses or changed the consumer value");
+}
+
 void TestControlDependentStandaloneLoadStaysTyped() {
   Fixture fixture(3);
   const auto memory = fixture.AddMemory(ResourceKind::ScalarAddress);
@@ -634,6 +689,7 @@ int main() {
     TestShaderBaseAndUserData();
     TestCarryAndBitFields();
     TestInvariantAndDivergentPhi();
+    TestOperandMutationLifecycle();
     TestControlDependentStandaloneLoadStaysTyped();
     TestRuntime64BitDescriptorOps();
     TestUniformFirstLaneSamplerLod();

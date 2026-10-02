@@ -4208,7 +4208,30 @@ public:
         cache.FillBuffer(base + offset, sizeof(window_value), window_value,
                          false);
       }
+      const auto window_publication_tick = scheduler.CurrentTick();
+      std::binary_semaphore window_publication_entered{0};
+      std::binary_semaphore release_window_publication{0};
+      std::atomic<bool> window_readback_returned{false};
+      scheduler.DeferPriorityOperation([&] {
+        window_publication_entered.release();
+        release_window_publication.acquire();
+        Libs::LibKernel::Memory::WriteBacking(
+            base + window_inside_offset, &window_stale, sizeof(window_stale));
+      });
+      std::jthread release_window_callback([&] {
+        window_publication_entered.acquire();
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::milliseconds(100);
+        while (!window_readback_returned.load() &&
+               std::chrono::steady_clock::now() < deadline) {
+          std::this_thread::yield();
+        }
+        release_window_publication.release();
+      });
       cache.ReadMemory(base + window_fault_offset, sizeof(window_value));
+      window_readback_returned = true;
+      release_window_callback.join();
+      scheduler.WaitPriorityOperations(window_publication_tick);
       uint32_t window_inside_backing = 0;
       uint32_t window_outside_backing = 0;
       Libs::LibKernel::Memory::TryReadBacking(base + window_inside_offset,
@@ -4217,7 +4240,7 @@ public:
       Libs::LibKernel::Memory::TryReadBacking(base + window_outside_offset,
                                               &window_outside_backing,
                                               sizeof(window_outside_backing));
-      Require(name, "widened-window boundary",
+      Require(name, "widened-window publication order and boundary",
               window_inside_backing == window_value &&
                   window_outside_backing == window_stale &&
                   !cache.HasGpuDirtyBytes(base + window_inside_offset,
@@ -4228,7 +4251,8 @@ public:
                                              sizeof(window_value)) &&
                   cache.IsRegionGpuModified(base + window_outside_offset,
                                             sizeof(window_value)),
-              "readback did not honor the clamped half-open 512 KiB window");
+              "readback did not publish after the older overlapping callback "
+              "or honor the clamped half-open 512 KiB window");
       cache.ReadMemory(base + window_outside_offset, sizeof(window_value));
 
       Libs::LibKernel::Memory::WriteBacking(base + first_offset, &first_stale,

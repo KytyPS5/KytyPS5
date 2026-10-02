@@ -872,6 +872,44 @@ void CheckSocketWakeup() {
         "Net receive consumes the requested length after peeking");
   Check(std::memcmp(received.data(), payload, sizeof(payload)) == 0,
         "Net receive returns the same payload after peeking");
+#if defined(_WIN32)
+  // A blocking receiver must not prevent another guest thread from polling the
+  // same socket. The delayed send bounds the old deadlock so this test fails
+  // promptly instead of hanging indefinitely.
+  std::array<char, 1> blocked_receive_data {};
+  std::atomic<bool> blocking_receive_started {false};
+  std::atomic<int> blocking_receive_result {-1};
+  std::thread blocking_receiver([&] {
+    blocking_receive_started.store(true, std::memory_order_release);
+    blocking_receive_result.store(net_recv(reader, blocked_receive_data.data(),
+                                           blocked_receive_data.size(), 0),
+                                  std::memory_order_release);
+  });
+  while (!blocking_receive_started.load(std::memory_order_acquire)) {
+    std::this_thread::yield();
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(25));
+  const char unblock_byte = 'x';
+  std::thread delayed_sender([&] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    Check(net_send(writer, &unblock_byte, sizeof(unblock_byte), 0) ==
+              sizeof(unblock_byte),
+          "send byte that releases the blocking receiver");
+  });
+  readable[reader / 64] = bit;
+  const auto poll_start = std::chrono::steady_clock::now();
+  const int poll_result = Net::Select(reader + 1, readable.data(), nullptr,
+                                      nullptr, immediate.data());
+  const auto poll_elapsed = std::chrono::steady_clock::now() - poll_start;
+  delayed_sender.join();
+  blocking_receiver.join();
+  Check(poll_result == 0 && readable[reader / 64] == 0 &&
+            poll_elapsed < std::chrono::milliseconds(250),
+        "zero-timeout select does not wait behind a blocking receive");
+  Check(blocking_receive_result.load(std::memory_order_acquire) == 1 &&
+            blocked_receive_data[0] == unblock_byte,
+        "blocking receiver completes after select returns");
+#endif
 #if !defined(_WIN32)
   Check(Net::Recv(reader, received.data(), received.size(), 0x80) == -1 &&
             *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EWOULDBLOCK,

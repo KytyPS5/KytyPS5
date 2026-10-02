@@ -865,6 +865,7 @@ struct SocketTransport {
 	NativeSocket socket;
 #if defined(_WIN32)
 	std::mutex        receive_mutex;
+	std::mutex        buffered_receive_mutex;
 	std::vector<char> buffered_receive;
 #endif
 };
@@ -1204,7 +1205,7 @@ static bool HasBufferedReceiveData(const std::shared_ptr<SocketTransport>& trans
 	if (!transport) {
 		return false;
 	}
-	std::lock_guard lock(transport->receive_mutex);
+	std::lock_guard lock(transport->buffered_receive_mutex);
 	return !transport->buffered_receive.empty();
 #else
 	(void)transport;
@@ -2292,24 +2293,37 @@ int64_t KYTY_SYSV_ABI Recvfrom(int s, void* buf, uint64_t len, int flags, void* 
 	if (peek && waitall && is_stream) {
 		// Winsock rejects MSG_PEEK | MSG_WAITALL. Read into Kyty's per-transport
 		// queue until enough data is available, then expose it without consuming it.
+		size_t buffered_size = 0;
+		{
+			std::lock_guard buffer_lock(transport->buffered_receive_mutex);
+			buffered_size = buffered.size();
+		}
 		std::array<char, 64 * 1024> temporary {};
-		while (buffered.size() < static_cast<size_t>(host_len)) {
-			const auto remaining = static_cast<size_t>(host_len) - buffered.size();
-			const auto request   = static_cast<int>(std::min(remaining, temporary.size()));
-			const int  received  = ::recv(socket, temporary.data(), request, 0);
+		std::vector<char>           received_data;
+		while (buffered_size + received_data.size() < static_cast<size_t>(host_len)) {
+			const auto remaining =
+			    static_cast<size_t>(host_len) - buffered_size - received_data.size();
+			const auto request  = static_cast<int>(std::min(remaining, temporary.size()));
+			const int  received = ::recv(socket, temporary.data(), request, 0);
 			if (received == 0) {
 				break;
 			}
 			if (received < 0) {
-				if (buffered.empty()) {
+				if (buffered_size == 0 && received_data.empty()) {
 					return SetHostSocketError();
 				}
 				break;
 			}
-			buffered.insert(buffered.end(), temporary.data(), temporary.data() + received);
+			received_data.insert(received_data.end(), temporary.data(),
+			                     temporary.data() + received);
 		}
-		const auto copied = std::min(buffered.size(), static_cast<size_t>(host_len));
-		std::memcpy(buf, buffered.data(), copied);
+		size_t copied = 0;
+		{
+			std::lock_guard buffer_lock(transport->buffered_receive_mutex);
+			buffered.insert(buffered.end(), received_data.begin(), received_data.end());
+			copied = std::min(buffered.size(), static_cast<size_t>(host_len));
+			std::memcpy(buf, buffered.data(), copied);
+		}
 		if (addr != nullptr) {
 			sockaddr_storage peer_addr {};
 			SocketLength     peer_addrlen = sizeof(peer_addr);
@@ -2322,13 +2336,19 @@ int64_t KYTY_SYSV_ABI Recvfrom(int s, void* buf, uint64_t len, int flags, void* 
 		}
 		return static_cast<int64_t>(copied);
 	}
-	if (!buffered.empty()) {
-		const auto copied = std::min(buffered.size(), static_cast<size_t>(host_len));
-		std::memcpy(buf, buffered.data(), copied);
-		if (!peek) {
-			buffered.erase(buffered.begin(), buffered.begin() + static_cast<ptrdiff_t>(copied));
+	size_t copied = 0;
+	{
+		std::lock_guard buffer_lock(transport->buffered_receive_mutex);
+		copied = std::min(buffered.size(), static_cast<size_t>(host_len));
+		if (copied != 0) {
+			std::memcpy(buf, buffered.data(), copied);
+			if (!peek) {
+				buffered.erase(buffered.begin(), buffered.begin() + static_cast<ptrdiff_t>(copied));
+			}
 		}
-		if (peek && copied < static_cast<size_t>(host_len)) {
+	}
+	if (copied != 0) {
+		if (peek && waitall && copied < static_cast<size_t>(host_len)) {
 			const int received = ::recv(socket, static_cast<char*>(buf) + copied,
 			                            static_cast<int>(host_len - copied), host_flags);
 			if (received < 0 && copied == 0) {

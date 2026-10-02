@@ -910,6 +910,10 @@ static void Ngs2FillDefaultRackOption(uint32_t rack_id, Ngs2RackOptionUnion* opt
 			option->submixer.max_filters                        = 8;
 			option->submixer.max_inputs                         = 1;
 			option->submixer.num_peak_meter_blocks              = 8;
+			option->submixer.max_waveform_blocks                = 4;
+			option->submixer.max_atrac9_decoders                = 256;
+			option->submixer.max_atrac9_channel_works           = 256;
+			option->submixer.max_ajm_atrac9_decoders            = 0;
 			break;
 		case 0x2001:
 			option->reverb.rack_option.size                   = sizeof(Ngs2ReverbRackOption);
@@ -920,6 +924,10 @@ static void Ngs2FillDefaultRackOption(uint32_t rack_id, Ngs2RackOptionUnion* opt
 			option->reverb.rack_option.max_ports              = 8;
 			option->reverb.max_channels                       = 8;
 			option->reverb.reverb_size                        = 1;
+			option->reverb.max_waveform_blocks                = 4;
+			option->reverb.max_atrac9_decoders                = 256;
+			option->reverb.max_atrac9_channel_works           = 256;
+			option->reverb.max_ajm_atrac9_decoders            = 0;
 			break;
 		case 0x3000:
 			option->mastering.rack_option.size                   = sizeof(Ngs2MasteringRackOption);
@@ -930,6 +938,10 @@ static void Ngs2FillDefaultRackOption(uint32_t rack_id, Ngs2RackOptionUnion* opt
 			option->mastering.rack_option.max_ports              = 0;
 			option->mastering.max_channels                       = 8;
 			option->mastering.num_peak_meter_blocks              = 8;
+			option->mastering.max_waveform_blocks                = 4;
+			option->mastering.max_atrac9_decoders                = 256;
+			option->mastering.max_atrac9_channel_works           = 256;
+			option->mastering.max_ajm_atrac9_decoders            = 0;
 			break;
 		case 0x4002:
 			// FIXME: Temporary PS5 progress fallback. This mirrors Prospero reset helper's

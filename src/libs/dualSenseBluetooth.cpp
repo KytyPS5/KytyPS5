@@ -25,6 +25,7 @@ namespace {
 // Each report plays two 32-frame stereo haptic blocks at 3 kHz (21.333 ms).
 constexpr uint64_t PERIOD_NS   = 64000000000ULL / 3000;
 constexpr int      HAPTIC_RATE = 3000;
+constexpr int      HAPTIC_REPORT_FLOATS = 2 * 32 * 2;
 // Two 480-frame Opus packets occupy the same 21.333 ms slot. Resampling
 // 48 kHz input to 45 kHz before encoding at 48 kHz compensates for playback.
 constexpr int    SPEAKER_RATE = 45000;
@@ -210,7 +211,7 @@ bool PrepareReport(Session& session, PendingReport& pending, uint64_t now) {
 	}
 	session.pending_since = 0;
 	session.pending_deadline = 0;
-	std::array<float, 128> haptics {};
+	std::array<float, HAPTIC_REPORT_FLOATS> haptics {};
 	for (auto* stream: session.streams) {
 		if (stream->speaker) {
 			Mix(stream->audio, pending.audio);
@@ -403,9 +404,12 @@ uint64_t Queue(Stream* stream, const float* stereo, uint32_t frames) {
 		// Clearing the entire stream here creates an audible gap after a brief
 		// Windows Bluetooth write stall.
 		std::array<float, 2 * OPUS_FRAMES * 2> discarded {};
+		const int discard_bytes = stream->speaker
+		                              ? static_cast<int>(sizeof(discarded))
+		                              : static_cast<int>(HAPTIC_REPORT_FLOATS * sizeof(float));
 		const int target = static_cast<int>(max_frames * 2 * sizeof(float)) - bytes;
 		while (queued > target) {
-			if (SDL_GetAudioStreamData(stream->audio, discarded.data(), sizeof(discarded)) <= 0) {
+			if (SDL_GetAudioStreamData(stream->audio, discarded.data(), discard_bytes) <= 0) {
 				SDL_ClearAudioStream(stream->audio);
 				break;
 			}

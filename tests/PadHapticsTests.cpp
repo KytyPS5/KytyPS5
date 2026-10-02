@@ -802,6 +802,26 @@ void TestBluetoothOverflowKeepsRecentAudio() {
 	speaker.reset();
 }
 
+void TestBluetoothHapticOverflowKeepsRecentAudio() {
+	Fixture f;
+	wireless = hid_available = true;
+	auto vibration = Open();
+	std::vector<float> haptic(2048);
+	for (int block = 1; block <= 4; ++block) {
+		std::fill(haptic.begin(), haptic.end(), block * 0.1f);
+		Check(Haptics::Queue(vibration.get(), 1, haptic.data(), 1024, 2, true,
+		                     unity.data()) != 0,
+		      "Bluetooth haptic overflow queue failed");
+	}
+	const auto base = now * 1000000;
+	Check(Libs::Controller::DualSenseBluetooth::Prepare(base).empty(),
+	      "haptic-only report skipped its coalescing window");
+	auto first = Libs::Controller::DualSenseBluetooth::Prepare(base + 1000000);
+	Check(first.size() == 1 && first[0].data[12 + 32] > 18 && first[0].data[12 + 32] < 32,
+	      "Bluetooth haptic overflow discarded buffered waveform instead of one report");
+	vibration.reset();
+}
+
 void TestBluetoothRecoversAfterLateWrite() {
 	Fixture f;
 	wireless = hid_available = true;
@@ -955,6 +975,7 @@ int main() {
 	TestBluetoothSpeakerWaitsForItsAudioBlock();
 	TestBluetoothShortFinalBlock();
 	TestBluetoothOverflowKeepsRecentAudio();
+	TestBluetoothHapticOverflowKeepsRecentAudio();
 	TestBluetoothRecoversAfterLateWrite();
 	TestUsbOverflowKeepsRecentAudio();
 	TestBluetoothAmbiguousDevice();

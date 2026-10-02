@@ -83,6 +83,16 @@ void StoreDispatcherPhiEdge(ValueEmitContext& ctx, const DispatcherFunctionState
 	}
 }
 
+uint32_t LoopCapReached(ValueEmitContext& ctx, uint32_t variable) {
+	auto&      state   = ctx.state;
+	const auto counter = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), counter, variable);
+	const auto over = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpUGreaterThanEqual, TypeBool(state), over, counter,
+	                          ConstantU32(state, ShaderLoopLimit()));
+	return over;
+}
+
 // Force an exit the loop already has once its back edges have run ShaderLoopLimit() times.
 uint32_t GuardLoopCondition(ValueEmitContext& ctx, const IR::BlockInfo& info, uint32_t condition) {
 	auto&      state = ctx.state;
@@ -91,13 +101,9 @@ uint32_t GuardLoopCondition(ValueEmitContext& ctx, const IR::BlockInfo& info, ui
 		return condition;
 	}
 	const auto [variable, exit_block] = found->second;
-	const auto counter                = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpLoad, TypeU32(state), counter, variable);
-	const auto over = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpUGreaterThanEqual, TypeBool(state), over, counter,
-	                          ConstantU32(state, ShaderLoopLimit()));
-	const bool exit_when_true = info.terminator.true_block == exit_block;
-	const auto guarded        = state.builder.AllocateId();
+	const auto over                   = LoopCapReached(ctx, variable);
+	const bool exit_when_true         = info.terminator.true_block == exit_block;
+	const auto guarded                = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpSelect, TypeBool(state), guarded, over,
 	                          ConstantBool(state, exit_when_true), condition);
 	return guarded;
@@ -146,6 +152,17 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
 				return;
 			}
 			emit_merge();
+			// An unconditional latch has no exit of its own, so give it one at the cap.
+			const auto latch = ctx.state.loop_counter_variables.find(info.id);
+			if (const auto* exit = latch != ctx.state.loop_counter_variables.end()
+			                           ? TargetBlock(program, latch->second.second)
+			                           : nullptr;
+			    exit != nullptr) {
+				ctx.state.builder.AddFunction(spv::OpBranchConditional,
+				                              LoopCapReached(ctx, latch->second.first),
+				                              ctx.Label(exit), ctx.Label(target));
+				return;
+			}
 			ctx.state.builder.AddFunction(spv::OpBranch, ctx.Label(target));
 			return;
 		}
@@ -807,6 +824,10 @@ void EmitProgram(EmitterState& state) {
 					counter = loop_counters.emplace(target, new_counter()).first;
 				}
 				state.back_edge_counters.emplace(info.id, counter->second);
+				const auto merge = program.block_info[found->second].terminator.merge_block;
+				if (term.kind == CFG::TerminatorKind::Branch && merge != UINT32_MAX) {
+					state.loop_counter_variables.emplace(info.id, std::pair {counter->second, merge});
+				}
 				break;
 			}
 		}

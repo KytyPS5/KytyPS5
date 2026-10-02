@@ -36188,6 +36188,61 @@ void CheckIndirectImageKeySwitch(
   auto spirv = ShaderRecompiler::Spirv::EmitProgram(program,
                                                     {.compute = &compute});
   ValidateSpirv(name, spirv);
+  if (mixed_numeric) {
+    // The dynamic switch samples both the Float root and an integer candidate.
+    // Trace each OpSampledImage sampler load to its descriptor-array index;
+    // pairing metadata alone does not prove that emission uses the point clone.
+    std::vector<std::span<const u32>> definitions(spirv[3]);
+    std::vector<std::span<const u32>> sampled_images;
+    for (size_t offset = 5; offset < spirv.size();) {
+      const auto words = std::span<const u32>(spirv).subspan(offset, spirv[offset] >> 16u);
+      const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
+      if (opcode == spv::OpTypeInt || opcode == spv::OpTypeFloat ||
+          opcode == spv::OpTypeImage || opcode == spv::OpTypeSampledImage) {
+        definitions[words[1]] = words;
+      } else if (opcode == spv::OpConstant || opcode == spv::OpAccessChain ||
+                 opcode == spv::OpLoad || opcode == spv::OpSampledImage) {
+        definitions[words[2]] = words;
+      }
+      if (opcode == spv::OpSampledImage) sampled_images.push_back(words);
+      offset += words.size();
+    }
+    u32 float_pairs = 0;
+    u32 unsigned_pairs = 0;
+    for (const auto sampled : sampled_images) {
+      const auto sampled_type = definitions.at(sampled[1]);
+      const auto image_type = definitions.at(sampled_type[2]);
+      const auto scalar_type = definitions.at(image_type[2]);
+      const auto sampler_load = definitions.at(sampled[4]);
+      const auto sampler_pointer = definitions.at(sampler_load[3]);
+      const auto sampler_index = definitions.at(sampler_pointer[4]);
+      Require(name, "sampled-image sampler index chain",
+              sampled_type.size() >= 3 && image_type.size() >= 3 &&
+                  scalar_type.size() >= 3 && sampler_load.size() >= 4 &&
+                  sampler_pointer.size() >= 5 && sampler_index.size() >= 4 &&
+                  static_cast<spv::Op>(sampler_load[0] & 0xffffu) == spv::OpLoad &&
+                  static_cast<spv::Op>(sampler_pointer[0] & 0xffffu) == spv::OpAccessChain &&
+                  static_cast<spv::Op>(sampler_index[0] & 0xffffu) == spv::OpConstant,
+              "sampled image did not use a constant sampler descriptor index");
+      if (static_cast<spv::Op>(scalar_type[0] & 0xffffu) == spv::OpTypeFloat) {
+        Require(name, "float sampler index", sampler_index[3] == 0u,
+                "float candidate lost its original filtered sampler");
+        ++float_pairs;
+      } else {
+        Require(name, "unsigned sampler type and index",
+                static_cast<spv::Op>(scalar_type[0] & 0xffffu) == spv::OpTypeInt &&
+                    scalar_type[2] == 32u &&
+                    scalar_type[3] == (candidate_numeric_class ==
+                                               Prospero::TextureNumericClass::Sint ? 1u : 0u) &&
+                    sampler_index[3] == 1u,
+                "integer candidate bypassed its point sampler variant");
+        ++unsigned_pairs;
+      }
+    }
+    Require(name, "mixed sampled image pairs",
+            float_pairs == 1u && unsigned_pairs == 1u,
+            "dynamic image switch did not retain both numeric classes");
+  }
   spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
   std::string text;
   Require(name, "SPIR-V disassembly", tools.Disassemble(spirv, &text),
@@ -36208,6 +36263,9 @@ void CheckIndirectImageKeySwitch(
   }
   root.indirect_resources = {0u, 1u, 2u};
   program.info.images = {root, candidate, candidate};
+  if (mixed_numeric) {
+    program.info.sampled_pairs.push_back({2u, 1u, 0x10f0u});
+  }
   for (const bool cube_first : {true, false}) {
     for (u32 resource = 0; resource < 3u; resource++) {
       auto &image_resource = program.info.images[resource];
@@ -36267,6 +36325,8 @@ void CheckIndirectImageKeySwitch(
 void CheckIndirectImageNumericClassSwitch() {
   CheckIndirectImageKeySwitch(Prospero::TextureNumericClass::Uint,
                               "IndirectImageNumericClassSwitch");
+  CheckIndirectImageKeySwitch(Prospero::TextureNumericClass::Sint,
+                              "IndirectImageSignedClassSwitch");
 }
 
 void CheckIndirectStorageImageWriteSwitch() {
@@ -41091,7 +41151,7 @@ void CheckImageSamplerSpecialization() {
           mixed_sampler_program.info.samplers.size() == 3u &&
               !mixed_sampler_program.info.samplers[0].force_point_filtering &&
               !mixed_sampler_program.info.samplers[0].integer_border &&
-              !mixed_sampler_program.info.samplers[1].force_point_filtering &&
+              mixed_sampler_program.info.samplers[1].force_point_filtering &&
               mixed_sampler_program.info.samplers[1].integer_border &&
               mixed_sampler_program.info.samplers[2].force_point_filtering &&
               mixed_sampler_program.info.samplers[2].integer_border &&
@@ -44592,6 +44652,14 @@ if (argc == 1) {
     vulkan.CheckPackedTextureComponents();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--integer-sampler-point-only") == 0) {
+    CheckImageSamplerSpecialization();
+    VulkanHarness vulkan;
+    RunCase(&vulkan, ImageSampleR8UintForcesPointSampler());
+    RunCase(&vulkan, ImageSamplePackedUintConvertsSampleAndGather());
+    RunCase(&vulkan, ImageSampleAndGather());
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--error-dialog-only") == 0) {
     CheckErrorDialogLifecycle();
     return 0;
@@ -45002,6 +45070,10 @@ if (argc == 1) {
     CheckIndirectImageKeySwitch();
     VulkanHarness vulkan;
     RunCase(&vulkan, ImageCubeGradientsPreserveDerivatives());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--indirect-image-numeric-only") == 0) {
+    CheckIndirectImageNumericClassSwitch();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--homogeneous-indirect-image-validation-only") == 0) {

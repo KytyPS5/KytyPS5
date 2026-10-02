@@ -2776,7 +2776,9 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		if (index >= sampler_info.samplers.size()) {
 			samplers.push_back(sampler_info.samplers[binding.source]);
 		}
-		samplers[index].force_point_filtering = binding.type == SamplerClass::PointInteger;
+		// Integer image views cannot assume linear-filter support. Keep the
+		// sampler variant distinct from float images that use the same source.
+		samplers[index].force_point_filtering = binding.type != SamplerClass::Float;
 		samplers[index].integer_border        = binding.type != SamplerClass::Float;
 	}
 	for (auto& pair: sampled_pairs) {

@@ -90,6 +90,22 @@ relevant tests where practical. Windows is the primary target, so a change that 
 should not regress it; changes confined to a platform's own code paths only need to build there. Because KytyPS5 is still evolving quickly, consider opening an issue before
 starting a large change.
 
+### Merging upstream PR #937
+
+To fetch and merge the upstream PR #937 branch into the current branch, run this from a clean
+checkout:
+
+```bash
+./scripts/merge-kytyps5-pr-937.sh
+```
+
+The script preserves upstream commit history with a merge commit and refuses dirty worktrees or
+unrelated histories. It checks for conflicts before starting the merge, leaving the worktree
+untouched if the branches cannot be merged cleanly. Since this repository's branch has diverged
+from upstream, the merge may include upstream ancestors in addition to the PR's 51 commits.
+Preview the fetched head and exact incoming commit count without merging with
+`./scripts/merge-kytyps5-pr-937.sh --dry-run`.
+
 ### Formatting
 
 Set up the clang-format hook after cloning:

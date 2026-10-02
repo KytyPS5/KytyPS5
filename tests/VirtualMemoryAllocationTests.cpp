@@ -2525,6 +2525,100 @@ void TestFixedReserveReplacesPartialDirectMapping() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+void TestFixedArenaChurnKeepsRangesExact() {
+	const char*        test        = "FixedArenaChurnKeepsRangesExact";
+	constexpr uint64_t page        = SceKernelPageSize;
+	constexpr uint64_t arena_size  = page * 4;
+	constexpr uint64_t arena_count = 8;
+	constexpr uint64_t total_size  = arena_size * arena_count;
+
+	int64_t phys_addr = 0;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+	            SceKernelDirectMemoryStart, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+	            total_size, page, SceKernelMtypeC, &phys_addr),
+	        "KernelAllocateDirectMemory");
+	const auto offset  = static_cast<uint64_t>(phys_addr);
+	void*      reserve = nullptr;
+	CheckOk(test, Libs::LibKernel::Memory::KernelReserveVirtualRange(&reserve, total_size, 0, page),
+	        "KernelReserveVirtualRange");
+	const auto base      = reinterpret_cast<uint64_t>(reserve);
+	const auto map_arena = [&](uint64_t index) {
+		void* target = reinterpret_cast<void*>(base + index * arena_size);
+		CheckOk(test,
+		        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(
+		            &target, arena_size, SceKernelProtCpuRw, SceKernelMapFixed,
+		            phys_addr + static_cast<int64_t>(index * arena_size), page, "arena"),
+		        "KernelMapNamedDirectMemory(arena)");
+		Check(test, reinterpret_cast<uint64_t>(target) == base + index * arena_size,
+		      "fixed arena mapping moved");
+	};
+	for (uint64_t index = 0; index < arena_count; index++) {
+		map_arena(index);
+	}
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base + 2 * arena_size, 4 * arena_size),
+	        "KernelMunmap(arenas 2-5)");
+	map_arena(3);
+	ExpectRange(test, Query(test, base + arena_size), base + arena_size, base + 2 * arena_size,
+	            SceKernelProtCpuRw, 0, 1, 0, 1, "arena", offset + arena_size);
+	ExpectUnmapped(test, base + 2 * arena_size);
+	ExpectRange(test, Query(test, base + 3 * arena_size), base + 3 * arena_size,
+	            base + 4 * arena_size, SceKernelProtCpuRw, 0, 1, 0, 1, "arena",
+	            offset + 3 * arena_size);
+	ExpectUnmapped(test, base + 4 * arena_size);
+	ExpectUnmapped(test, base + 5 * arena_size + page);
+	ExpectRange(test, Query(test, base + 6 * arena_size), base + 6 * arena_size,
+	            base + 7 * arena_size, SceKernelProtCpuRw, 0, 1, 0, 1, "arena",
+	            offset + 6 * arena_size);
+
+	// Direct ranges never merge, so a protect across two of them leaves four pieces.
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMprotect(reinterpret_cast<void*>(base + 2 * page),
+	                                                4 * page, SceKernelProtCpuRead),
+	        "KernelMprotect(across arenas 0 and 1)");
+	ExpectRange(test, Query(test, base), base, base + 2 * page, SceKernelProtCpuRw, 0, 1, 0, 1,
+	            "arena", offset);
+	ExpectRange(test, Query(test, base + 2 * page), base + 2 * page, base + 4 * page,
+	            SceKernelProtCpuRead, 0, 1, 0, 1, "arena", offset + 2 * page);
+	ExpectRange(test, Query(test, base + 4 * page), base + 4 * page, base + 6 * page,
+	            SceKernelProtCpuRead, 0, 1, 0, 1, "arena", offset + 4 * page);
+	ExpectRange(test, Query(test, base + 6 * page), base + 6 * page, base + 8 * page,
+	            SceKernelProtCpuRw, 0, 1, 0, 1, "arena", offset + 6 * page);
+
+	// Flexible ranges with equal attributes do merge, so restoring the protection rejoins them.
+	const auto flexible = MapNamedFlexible(test, 4 * page, SceKernelProtCpuRw, "arena_merge");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMprotect(reinterpret_cast<void*>(flexible + page),
+	                                                2 * page, SceKernelProtCpuRead),
+	        "KernelMprotect(flexible middle)");
+	ExpectRange(test, Query(test, flexible), flexible, flexible + page, SceKernelProtCpuRw, 1, 0, 0,
+	            1, "arena_merge");
+	ExpectRange(test, Query(test, flexible + page), flexible + page, flexible + 3 * page,
+	            SceKernelProtCpuRead, 1, 0, 0, 1, "arena_merge");
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMprotect(reinterpret_cast<void*>(flexible + page),
+	                                                2 * page, SceKernelProtCpuRw),
+	        "KernelMprotect(flexible restore)");
+	ExpectRange(test, Query(test, flexible + 3 * page), flexible, flexible + 4 * page,
+	            SceKernelProtCpuRw, 1, 0, 0, 1, "arena_merge");
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(flexible, 4 * page),
+	        "KernelMunmap(flexible)");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base, 2 * arena_size),
+	        "KernelMunmap(arenas 0-1)");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base + 3 * arena_size, arena_size),
+	        "KernelMunmap(arena 3)");
+	CheckOk(test, Libs::LibKernel::Memory::KernelMunmap(base + 6 * arena_size, 2 * arena_size),
+	        "KernelMunmap(arenas 6-7)");
+	ExpectUnmapped(test, base);
+	ExpectUnmapped(test, base + 7 * arena_size);
+	CheckOk(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(phys_addr, total_size),
+	        "KernelReleaseDirectMemory");
+
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 void TestFixedReserveRollbackSkipsUntouchedChunks() {
 	const char*        test       = "FixedReserveRollbackSkipsUntouchedChunks";
 	constexpr uint64_t part_size  = SceKernelPageSize * 2;
@@ -4641,6 +4735,7 @@ int main(int argc, char** argv) {
 	RunTest(TestFixedDirectReplacementPreservesAccess);
 #endif
 	RunTest(TestFixedReserveReplacesPartialDirectMapping);
+	RunTest(TestFixedArenaChurnKeepsRangesExact);
 	RunTest(TestFixedReserveRollbackConsumesRestoredPlaceholder);
 	RunTest(TestFixedReserveRollbackSkipsUntouchedChunks);
 	RunTest(TestFixedReserveRangeAddRollbackKeepsPlaceholder);

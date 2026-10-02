@@ -276,9 +276,7 @@ public:
 			m_ranges.erase(position);
 			return true;
 		}
-		auto removed = RemoveUnlocked(start, size);
-		MergeUnlocked();
-		return removed;
+		return RemoveUnlocked(start, size);
 	}
 
 	bool HasOverlap(uint64_t start, uint64_t size) {
@@ -324,15 +322,8 @@ public:
 		auto current = start;
 		const auto end = start + size;
 		while (current < end) {
-			const Range* candidate = nullptr;
-			for (const auto& r: m_ranges) {
-				if (r.type == expected_type && current >= r.start &&
-				    current < End(r.start, r.size)) {
-					candidate = &r;
-					break;
-				}
-			}
-			if (candidate == nullptr) {
+			const auto* candidate = FindContaining(current);
+			if (candidate == nullptr || candidate->type != expected_type) {
 				return false;
 			}
 			current = std::min(end, End(candidate->start, candidate->size));
@@ -413,8 +404,15 @@ public:
 
 		const auto end     = start + size;
 		auto       current = start;
-		for (const auto& range: m_ranges) {
-			const auto range_end = End(range.start, range.size);
+		auto       first   = std::upper_bound(
+		    m_ranges.begin(), m_ranges.end(), start,
+		    [](uint64_t value, const Range& range) { return value < range.start; });
+		if (first != m_ranges.begin()) {
+			--first;
+		}
+		for (auto it = first; it != m_ranges.end(); ++it) {
+			const auto& range     = *it;
+			const auto  range_end = End(range.start, range.size);
 			if (range_end <= current) {
 				continue;
 			}
@@ -516,23 +514,6 @@ private:
 		       std::strncmp(left.name, right.name, KERNEL_MAXIMUM_NAME_LENGTH) == 0;
 	}
 
-	static void AddPiece(std::vector<Range>* ranges, const Range& source, uint64_t start,
-	                     uint64_t end) {
-		EXIT_IF(ranges == nullptr);
-
-		if (end <= start) {
-			return;
-		}
-
-		Range piece = source;
-		piece.start = start;
-		piece.size  = end - start;
-		if (piece.type == VirtualRangeType::Direct) {
-			piece.offset += start - source.start;
-		}
-		ranges->push_back(piece);
-	}
-
 	std::vector<Range>::iterator LowerBound(uint64_t start) {
 		return std::lower_bound(
 		    m_ranges.begin(), m_ranges.end(), start,
@@ -564,88 +545,76 @@ private:
 		}
 	}
 
+	size_t SplitAtUnlocked(uint64_t address) {
+		auto position = LowerBound(address);
+		if (position != m_ranges.begin()) {
+			auto&      previous     = *std::prev(position);
+			const auto previous_end = End(previous.start, previous.size);
+			if (previous.start < address && address < previous_end) {
+				Range right = previous;
+				right.start = address;
+				right.size  = previous_end - address;
+				if (right.type == VirtualRangeType::Direct) {
+					right.offset += address - previous.start;
+				}
+				previous.size = address - previous.start;
+				position      = m_ranges.insert(position, right);
+			}
+		}
+		return static_cast<size_t>(position - m_ranges.begin());
+	}
+
+	void MergeSpanUnlocked(size_t begin, size_t end) {
+		end = std::min(end, m_ranges.size());
+		for (size_t index = begin; index + 1 < end;) {
+			auto&       current = m_ranges[index];
+			const auto& next    = m_ranges[index + 1];
+			if (End(current.start, current.size) == next.start && SameMergeKey(current, next)) {
+				current.size += next.size;
+				m_ranges.erase(m_ranges.begin() + static_cast<std::ptrdiff_t>(index + 1));
+				end--;
+			} else {
+				index++;
+			}
+		}
+	}
+
 	template <typename EditFunc>
 	void EditUnlocked(uint64_t start, uint64_t size, EditFunc edit) {
 		if (size == 0) {
 			return;
 		}
-
-		std::vector<Range> out;
-		auto               edit_end = End(start, size);
-
-		for (const auto& r: m_ranges) {
-			auto r_end = End(r.start, r.size);
-			if (!VirtualRangesOverlap(start, size, r.start, r.size)) {
-				out.push_back(r);
-				continue;
-			}
-
-			auto mid_start = std::max(start, r.start);
-			auto mid_end   = std::min(edit_end, r_end);
-
-			AddPiece(&out, r, r.start, mid_start);
-
-			Range mid = r;
-			mid.start = mid_start;
-			mid.size  = mid_end - mid_start;
-			if (mid.type == VirtualRangeType::Direct) {
-				mid.offset += mid_start - r.start;
-			}
-			edit(&mid);
-			out.push_back(mid);
-
-			AddPiece(&out, r, mid_end, r_end);
+		const auto first = SplitAtUnlocked(start);
+		const auto last  = SplitAtUnlocked(End(start, size));
+		for (auto index = first; index < last; index++) {
+			edit(&m_ranges[index]);
 		}
-
-		m_ranges = out;
-		MergeUnlocked();
+		MergeSpanUnlocked(first == 0 ? 0 : first - 1, last + 1);
 	}
 
 	bool RemoveUnlocked(uint64_t start, uint64_t size) {
 		if (size == 0) {
 			return false;
 		}
-
-		std::vector<Range> out;
-		bool               removed = false;
-		auto               rem_end = End(start, size);
-
-		for (const auto& r: m_ranges) {
-			auto r_end = End(r.start, r.size);
-			if (!VirtualRangesOverlap(start, size, r.start, r.size)) {
-				out.push_back(r);
-				continue;
-			}
-
-			removed = true;
-			AddPiece(&out, r, r.start, std::max(start, r.start));
-			AddPiece(&out, r, std::min(rem_end, r_end), r_end);
+		const auto first = SplitAtUnlocked(start);
+		const auto last  = SplitAtUnlocked(End(start, size));
+		if (first == last) {
+			return false;
 		}
-
-		m_ranges = out;
-		return removed;
+		m_ranges.erase(m_ranges.begin() + static_cast<std::ptrdiff_t>(first),
+		               m_ranges.begin() + static_cast<std::ptrdiff_t>(last));
+		return true;
 	}
 
-	void MergeUnlocked() {
-		if (m_ranges.size() < 2) {
-			return;
+	const Range* FindContaining(uint64_t address) const {
+		auto next = std::upper_bound(
+		    m_ranges.begin(), m_ranges.end(), address,
+		    [](uint64_t value, const Range& range) { return value < range.start; });
+		if (next == m_ranges.begin()) {
+			return nullptr;
 		}
-
-		std::sort(m_ranges.begin(), m_ranges.end(),
-		          [](const Range& left, const Range& right) { return left.start < right.start; });
-
-		std::vector<Range> merged;
-		for (const auto& r: m_ranges) {
-			if (!merged.empty()) {
-				auto& last = merged[merged.size() - 1];
-				if (End(last.start, last.size) == r.start && SameMergeKey(last, r)) {
-					last.size += r.size;
-					continue;
-				}
-			}
-			merged.push_back(r);
-		}
-		m_ranges = merged;
+		const auto& range = *std::prev(next);
+		return address < End(range.start, range.size) ? &range : nullptr;
 	}
 
 	Range* FindOverlap(uint64_t start, uint64_t size) {

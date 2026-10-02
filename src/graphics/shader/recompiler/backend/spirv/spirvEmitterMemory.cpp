@@ -1,6 +1,5 @@
-#include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
-
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 
 #include <algorithm>
@@ -796,7 +795,58 @@ uint32_t LoadIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_
 	           Select(state, TypeU32(state), add_tid, BufferLane(state), ConstantU32(state, 0)));
 	const auto soffset = ctx.Arg(inst, 3);
 	const auto base    = DeviceAddressFromWords(state, ctx.Arg(handle, 0), field(word1, 0, 16));
-	const auto valid_format    = nonzero(field(word3, 12, 7));
+	const auto format       = field(word3, 12, 7);
+	auto       valid_format = nonzero(format);
+	if (ctx.Memory(inst).formatted) {
+		const auto wide_first  = components == 4u ? Prospero::BufferFormat::k32_32_32_32UInt
+		                                          : Prospero::BufferFormat::k32_32_32UInt;
+		const auto wide_format = AndCondition(
+		    state,
+		    Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), format,
+		           ConstantU32(state, static_cast<uint32_t>(wide_first))),
+		    Binary(state, spv::OpULessThanEqual, TypeBool(state), format,
+		           ConstantU32(state,
+		                       static_cast<uint32_t>(Prospero::BufferFormat::k32_32_32_32Float))));
+		const auto two_word_format = AndCondition(
+		    state,
+		    Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), format,
+		           ConstantU32(state, static_cast<uint32_t>(Prospero::BufferFormat::k32_32UInt))),
+		    Binary(state, spv::OpULessThanEqual, TypeBool(state), format,
+		           ConstantU32(state, static_cast<uint32_t>(Prospero::BufferFormat::k32_32Float))));
+		const auto scalar_format = AndCondition(
+		    state,
+		    Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), format,
+		           ConstantU32(state, static_cast<uint32_t>(Prospero::BufferFormat::k32UInt))),
+		    Binary(state, spv::OpULessThanEqual, TypeBool(state), format,
+		           ConstantU32(state, static_cast<uint32_t>(Prospero::BufferFormat::k32Float))));
+		const auto in_range =
+		    components == 1u ? Binary(state, spv::OpLogicalOr, TypeBool(state), scalar_format,
+		                              Binary(state, spv::OpLogicalOr, TypeBool(state),
+		                                     two_word_format, wide_format))
+		    : components == 2u
+		        ? Binary(state, spv::OpLogicalOr, TypeBool(state), two_word_format, wide_format)
+		        : wide_format;
+		const auto identity_xy = AndCondition(state,
+		                                      Binary(state, spv::OpIEqual, TypeBool(state),
+		                                             field(word3, 0, 3), ConstantU32(state, 4u)),
+		                                      Binary(state, spv::OpIEqual, TypeBool(state),
+		                                             field(word3, 3, 3), ConstantU32(state, 5u)));
+		const auto identity_xyz =
+		    components == 2u ? identity_xy
+		                     : AndCondition(state, identity_xy,
+		                                    Binary(state, spv::OpIEqual, TypeBool(state),
+		                                           field(word3, 6, 3), ConstantU32(state, 6u)));
+		const auto identity = components == 4u
+		                          ? AndCondition(state, identity_xyz,
+		                                         Binary(state, spv::OpIEqual, TypeBool(state),
+		                                                field(word3, 9, 3), ConstantU32(state, 7u)))
+		                          : identity_xyz;
+		const auto selected_identity = components == 1u
+		                                   ? Binary(state, spv::OpIEqual, TypeBool(state),
+		                                            field(word3, 0, 3), ConstantU32(state, 4u))
+		                                   : identity;
+		valid_format                 = AndCondition(state, in_range, selected_identity);
+	}
 	const auto mode            = field(word3, 28, 2);
 	const auto index_in_bounds = Binary(state, spv::OpULessThan, TypeBool(state), index, records);
 	const auto scalar_in_bounds =
@@ -805,6 +855,8 @@ uint32_t LoadIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_
 	const auto raw_index_in_bounds =
 	    Binary(state, spv::OpULessThan, TypeBool(state), index, raw_records);
 	std::array<uint32_t, 4> values {};
+	std::array<uint32_t, 4> guests {}, conditions {};
+	auto                    all_in_bounds = valid_format;
 	for (uint32_t component = 0; component < components; component++) {
 		const auto address = CalculateBufferAddress(state, index, ctx.Arg(inst, 2), soffset,
 		                                            ctx.Memory(inst).offset + component * 4u,
@@ -833,17 +885,26 @@ uint32_t LoadIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_
 		const auto guest =
 		    Binary(state, spv::OpIAdd, TypeScalarU64(state), base,
 		           Unary(state, spv::OpUConvert, TypeScalarU64(state), address.byte));
-		values[component] = LoadBda(ctx, guest, AndCondition(state, valid_format, in_bounds), 32u);
+		guests[component]     = guest;
+		conditions[component] = AndCondition(state, valid_format, in_bounds);
+		all_in_bounds         = AndCondition(state, all_in_bounds, in_bounds);
 	}
-	return ConstructU32Composite(state, components, values);
+	for (uint32_t component = 0; component < components; component++) {
+		values[component] =
+		    LoadBda(ctx, guests[component],
+		            ctx.Memory(inst).formatted ? all_in_bounds : conditions[component], 32u);
+	}
+	return components == 1u ? values[0] : ConstructU32Composite(state, components, values);
 }
 
 uint32_t LoadWideBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
 	auto& state = ctx.state;
 	return EmitValueOrDefaultIfCondition(
-	    state, ctx.Arg(inst, inst.NumArgs() - 1), TypeU32Composite(state, components),
-	    ConstantU32CompositeZero(state, components), [&]() {
-		    const auto mem      = ctx.Memory(inst);
+	    state, ctx.Arg(inst, inst.NumArgs() - 1),
+	    components == 1u ? TypeU32(state) : TypeU32Composite(state, components),
+	    components == 1u ? ConstantU32(state, 0) : ConstantU32CompositeZero(state, components),
+	    [&]() {
+		    const auto mem = ctx.Memory(inst);
 		    if (mem.kind == IR::ResourceKind::IndirectBuffer) {
 			    return LoadIndirectBuffer(ctx, inst, components);
 		    }
@@ -1239,7 +1300,7 @@ void EmitLoadMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	uint32_t   value;
 	if (mem.kind == IR::ResourceKind::FlatLocal)
 		value = LoadLocalFlat(ctx, inst);
-	else if (buffer_components > 1u)
+	else if (mem.kind == IR::ResourceKind::IndirectBuffer || buffer_components > 1u)
 		value = LoadWideBuffer(ctx, inst, buffer_components);
 	else if (shared_components > 1u)
 		value = LoadWideShared(ctx, inst, shared_components);

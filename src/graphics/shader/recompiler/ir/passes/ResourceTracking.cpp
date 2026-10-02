@@ -1733,7 +1733,8 @@ private:
 			auto& image = m_info.images[i];
 			if (image.source == source && image.resource_class == resource_class &&
 			    image.dimension == memory.image_dimension && image.mip_mode == mip &&
-			    image.depth_compare == depth && image.r128 == memory.image_r128) {
+			    image.depth_compare == depth && image.r128 == memory.image_r128 &&
+			    image.packed == memory.image_packed) {
 				Merge(image, op, pc);
 				return i;
 			}
@@ -1742,6 +1743,7 @@ private:
 			return UINT32_MAX;
 		}
 		ImageResource image;
+		image.packed = memory.image_packed;
 		image.source         = source;
 		image.first_use_pc   = pc;
 		image.resource_class = resource_class;
@@ -1857,7 +1859,7 @@ private:
 				if (memory.kind != ResourceKind::Buffer || !memory.SupportsIndirectBufferLoad(op)) {
 					Fail(flags.pc,
 					     "buffer descriptor is not a valid runtime value; GPU-selected access "
-					     "requires a raw DWORD x2/x3/x4 load");
+					     "requires a DWORD x1/x2/x3/x4 load");
 				}
 				m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
 				m_info.uses_dma                         = true;

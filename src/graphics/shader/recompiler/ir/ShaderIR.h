@@ -65,6 +65,7 @@ struct MemoryInfo {
 	bool                    data_signed                                           = false;
 	bool                    typed                                                 = false;
 	bool                    formatted                                             = false;
+	bool                    image_packed = false;
 	bool                    image_has_mip                                         = false;
 	bool                    image_r128                                            = false;
 	bool                    idxen                                                 = false;
@@ -73,9 +74,12 @@ struct MemoryInfo {
 	bool                    planning_only                                         = false;
 
 	[[nodiscard]] bool SupportsIndirectBufferLoad(ValueOpcode opcode) const {
-		return !formatted && !typed && data_bits == 32u &&
-		       (opcode == ValueOpcode::LoadBufferU32x2 || opcode == ValueOpcode::LoadBufferU32x3 ||
-		        opcode == ValueOpcode::LoadBufferU32x4);
+		if (typed || data_bits != 32u) return false;
+		// Only complete DWORD components can use this runtime descriptor path.
+		return (opcode == ValueOpcode::LoadBufferU32 && data_dwords == 1u) ||
+		       (opcode == ValueOpcode::LoadBufferU32x2 && data_dwords == 2u) ||
+		       (opcode == ValueOpcode::LoadBufferU32x3 && data_dwords == 3u) ||
+		       (opcode == ValueOpcode::LoadBufferU32x4 && data_dwords == 4u);
 	}
 
 	bool operator==(const MemoryInfo& other) const = default;
@@ -119,6 +123,7 @@ enum class ImageMipMode { None, DynamicStorage };
 constexpr uint32_t ShaderImageIdentitySwizzle = 0x00000facu;
 
 struct ImageResource {
+	bool packed = false;
 	static constexpr uint32_t NoIndirectImage = UINT32_MAX;
 
 	uint32_t                      source            = 0;

@@ -2301,33 +2301,45 @@ void TestDynamicSrtReadRemainsExplicit() {
 }
 
 void TestPhiValidation() {
-  Fixture fixture;
-  auto *left = fixture.block;
-  auto *right = fixture.AddBlock();
-  auto *merge = fixture.AddBlock();
-  left->AddBranch(merge);
-  right->AddBranch(merge);
-  auto &phi = merge->AppendNewInst(ValueOpcode::Phi, {},
-                                   static_cast<uint64_t>(Type::U32));
-  phi.AddPhiOperand(left, Value(1u));
-  phi.AddPhiOperand(right, Value(2u));
-  const auto word3 =
-      fixture.Emit(ValueOpcode::UMin32, {Value(&phi), Value(0x100u)}, 0, merge);
-  const auto handle = fixture.Emit(ValueOpcode::GetBufferResource,
-                                   {Value(0u), Value(0u), Value(0u), word3},
-                                   MemoryFlags{0, 20}, merge);
-  MemoryInfo memory;
-  memory.kind = ResourceKind::Buffer;
-  fixture.Emit(ValueOpcode::LoadBufferU32,
-               {handle, Value(0u), Value(0u), Value(0u), Value(true)},
-               fixture.AddMemory(memory, 20), merge);
-
-  CheckFatal([&] { fixture.PlanAndTrack(); }, "not a valid runtime value",
-             "control-dependent descriptor phi was accepted");
-  Check(!fixture.program.resource_tracking_complete &&
-            fixture.program.info.buffers.empty() &&
-            fixture.program.descriptor_sources.empty(),
-        "control-dependent descriptor phi was not rejected transactionally");
+  for (const bool store : {false, true}) {
+    Fixture fixture;
+    auto *left = fixture.block;
+    auto *right = fixture.AddBlock();
+    auto *merge = fixture.AddBlock();
+    left->AddBranch(merge);
+    right->AddBranch(merge);
+    auto &phi = merge->AppendNewInst(ValueOpcode::Phi, {},
+                                    static_cast<uint64_t>(Type::U32));
+    phi.AddPhiOperand(left, Value(1u));
+    phi.AddPhiOperand(right, Value(2u));
+    const auto word3 = fixture.Emit(ValueOpcode::UMin32,
+                                    {Value(&phi), Value(0x100u)}, 0, merge);
+    const auto handle = fixture.Emit(ValueOpcode::GetBufferResource,
+                                    {Value(0u), Value(0u), Value(0u), word3},
+                                    MemoryFlags{0, 20}, merge);
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Buffer;
+    const auto flags = fixture.AddMemory(memory, 20);
+    if (store) {
+      fixture.Emit(ValueOpcode::StoreBufferU32,
+                   {handle, Value(0u), Value(0u), Value(0u), Value(7u), Value(true)},
+                   flags, merge);
+      CheckFatal([&] { fixture.PlanAndTrack(); }, "not a valid runtime value",
+                 "unsupported store through a descriptor phi was accepted");
+      Check(!fixture.program.resource_tracking_complete &&
+                fixture.program.info.buffers.empty() &&
+                fixture.program.descriptor_sources.empty(),
+            "unsupported descriptor store was not rejected transactionally");
+    } else {
+      fixture.Emit(ValueOpcode::LoadBufferU32,
+                   {handle, Value(0u), Value(0u), Value(0u), Value(true)}, flags, merge);
+      fixture.PlanAndTrack();
+      Check(fixture.program.resource_tracking_complete &&
+                fixture.program.info.uses_dma &&
+                fixture.program.memory_info[0].kind == ResourceKind::IndirectBuffer,
+            "scalar load through a descriptor phi was not evaluated on the GPU");
+    }
+  }
 }
 
 ResourcePlan ConditionalSamplerPlan(bool diamond, bool reverse, bool reverse_phi,

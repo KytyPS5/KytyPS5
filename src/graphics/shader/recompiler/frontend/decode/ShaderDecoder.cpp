@@ -587,6 +587,7 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::IMAGE_ATOMIC_FMIN:
 		case Opcode::IMAGE_ATOMIC_FMAX:
 		case Opcode::IMAGE_LOAD:
+		case Opcode::IMAGE_LOAD_PCK:
 		case Opcode::IMAGE_LOAD_MIP:
 		case Opcode::IMAGE_GET_RESINFO:
 		case Opcode::IMAGE_GET_LOD:

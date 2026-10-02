@@ -602,7 +602,7 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				                                  descriptor, coord, spv::ImageOperandsLodMask,
 				                                  LodU32(ctx, mem, *address, dimension));
 			        }
-			        return ResultVector(ctx, UnpackImageTexel(ctx, mem, color), numeric_class,
+			        return ResultVector(ctx, image.packed ? color : UnpackImageTexel(ctx, mem, color), numeric_class,
 			                            false, mem);
 		        }));
 		return;

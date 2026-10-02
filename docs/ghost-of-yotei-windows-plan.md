@@ -1,5 +1,41 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **2 октября 2026 года, 16:18 UTC** (native Windows; ветка
+`yotei-windows-bringup`, исходная ревизия `f3f71319` с локальными изменениями,
+впоследствии сохранёнными отдельно как `c1e1ab45` и `9b98861c`):
+
+- Обзор новых открытых PR #977/#976/#975/#973/#968/#959/#955 записан в
+  `docs/open-pr-usefulness-review.md`. Ни один не соответствует доказанным
+  текущим отказам CPU SRT / целочисленного сэмплера и не интегрирован.
+- Clean scalar `ReadConstBuffer` у `7ceb0f3417f926f9`: descriptor с
+  `num_records=0` обязан дать ноль без обращения к backing. Синтетический
+  `resource_tracking_tests --clean-scalar-buffer-oob-only` RED → GREEN;
+  native retry `…-153834-menucheck-gpuav-sync` прошёл этот shader и выпустил
+  SPIR-V. После этого возник Vulkan VUID для R8_UINT с линейным сэмплером.
+- Целочисленный сэмплер: `--integer-sampler-point-only` RED → GREEN для
+  materialization, но retry `…-155304-menucheck-gpuav-sync` показал тот же
+  VUID. Диагностика привязок в `…-160138-menucheck-gpuav-sync` доказала, что
+  point-вариант существует; dynamic-image SPIR-V emitter его обходил для
+  Uint. Новый `--indirect-image-numeric-only` RED (exit 9) → GREEN на той же
+  Float/Uint проверке после общего исправления; соседний Float/Sint dynamic
+  switch тоже GREEN. Временная диагностика удалена.
+  `--integer-sampler-point-only`, `--indirect-image-only`, полные
+  `resource_tracking_tests` и `resource_materialization_tests` GREEN.
+- Native MSVC build/install GREEN; installed exe SHA-256
+  `24c1f4ee5adc8813e375448674410f6d8943dae92508f2700de18c69445c1ebb`.
+  Bounded GPUAV+shader instrumentation+SyncDispatches retry
+  `_Build/runs/yotei-integrated-20261002-161240-menucheck-gpuav-sync`:
+  natural exit 321, `maxShown=135`; прежний R8_UINT VUID не повторился.
+  `ReadbackStart=180`, пиксели не прочитаны, `coloredProven=false`.
+- Новая подтверждённая граница: CS `34e090c623ad611c`, immutable SRT
+  snapshot `0x201347e200+512` пересекается с потенциальной записью buffer 12
+  `0x201347e390+1` (`stderr.txt:1`, `_kyty.txt:7157629`). Нельзя отключать
+  alias guard: текущая проверка не доказывает порядок чтения/записи между
+  invocations. Требуемая синтетическая регрессия и границы указаны в
+  `docs/emulator-test-debt.md`; исправление pending. Первый ненулевой кадр
+  **на этой ревизии**, меню и gameplay остаются PENDING.
+
+
 Checkpoint **2 октября 2026 года** (native Windows; `40582634` + ещё не
 закоммиченное общее исправление достижимости SRT-слотов):
 

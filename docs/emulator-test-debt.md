@@ -1,5 +1,60 @@
 # Emulator regression test debt
 
+## Immutable SRT source aliases a writable buffer (2026-10-02)
+
+Native retry `_Build/runs/yotei-integrated-20261002-161240-menucheck-gpuav-sync`
+on the unsigned-sampler correction exits 321 at shown 135. CS
+`0x34e090c623ad611c` rejects a pre-dispatch immutable SRT snapshot
+`0x201347e200+512`: a writable buffer candidate starts at
+`0x201347e390`, descriptor size 1, contiguous mapped prefix 1, and lies
+inside that source. Its origin is 3, first use PC `0x1d94`, zero stride,
+`max_byte_extent=16`, formatted descriptor-only access. The renderer has an
+explicit dispatch-wide alias guard; current resource tracking does not prove
+read-before-write across invocations. Do not bypass either guard using only
+local CFG order. The one-byte mapped prefix also does not establish that a
+four-byte store is impossible: the current buffer binding rounds the range
+for DWORD storage.
+
+Required synthetic RED before correction: a compute shader with a bounded
+SRT read and a potentially overlapping writable candidate in distinct
+invocations, plus an independent disjoint candidate and exact boundary
+cases. Establish guest ordering/visibility semantics and verify numerical
+GPU results, including write-first/read-first schedules, before choosing a
+shared mechanism such as a coherent runtime read. Preserve rejection for
+unproved cross-invocation aliasing. No production correction for this
+boundary is claimed yet.
+
+## Dynamic unsigned image sampler selection (2026-10-02)
+
+After the clean scalar-buffer out-of-bounds and integer-sampler materialization
+regressions passed, native run
+`_Build/runs/yotei-integrated-20261002-160138-menucheck-gpuav-sync` still exits
+321 at `vkCmdDispatchIndirect`: R8_UINT view has a linear sampler (VUID
+`magFilter-04553`). Temporary binding diagnostics identify shader
+`0x8968b4b53e5a246a`, image resource 48, Uint, paired to sampler 7 with
+`force_point_filtering=1`. The SPIR-V emitter's
+`CompatibleSamplerForImage` recognizes signed and converted images but omits
+plain Uint, so its dynamic candidate can bypass that point variant.
+
+Before changing emission, extend the synthetic indirect-image numeric-class
+switch to assert the sampler descriptor index used by each sampled image:
+float candidate uses the original sampler, Uint candidate uses its point
+variant. Run the unchanged test RED on the current emitter, then GREEN after a
+shared numeric-class correction; validate signed and float neighbors. Retry
+the native game with source readback. The observed binding mismatch does not
+prove a rendered frame or menu.
+
+RED: `_Build/logs/indirect-uint-sampler-red-20261002.log`, exit 9, Uint
+candidate bypassed the point sampler in emitted SPIR-V. GREEN: same
+numeric-class switch with Float index 0 and Uint index 1 after the emitter
+correction (`indirect-uint-sampler-green2-20261002.log`); mixed float/signed/
+unsigned sampler materialization and neighboring indirect-image GPU test
+also pass. A second native test build passes the same dynamic switch for
+signed integer candidates (`indirect-integer-neighbors-20261002.log`). Installed
+emulator SHA-256 `24c1f4ee5adc8813e375448674410f6d8943dae92508f2700de18c69445c1ebb`.
+The real retry passes the previous R8_UINT Vulkan filter VUID and stops on
+the independent immutable-SRT alias above before frame readback.
+
 ## Finite first-active-lane selectors through native EXEC guards (2026-09-28)
 
 Committed 05d10203 retry `yotei-integrated-20260928-181147-menucheck-gpuav-sync`
@@ -262,6 +317,76 @@ actual failing case once its semantics are known; keep descriptor bounds,
 unreadable memory and failed argument evaluation closed and transactional.
 Do not apply ordinary-slot reachability skipping to clean slots: bounded
 wave-uniform resource planning may consume them outside the shader block.
+
+Diagnostic retry `yotei-integrated-20261002-152819-menucheck-gpuav-sync`
+(`f3f71319` plus diagnostic-only SrtWalker diff, installed exe SHA-256
+`421ac459e84c220c8512ecab1884578b57ddb014175429d2b2204b09a7331779`)
+reaches maxShown177 and gives the exact failure: PC `0x294` clean scalar-buffer
+read, descriptor `base=0x5000000000`, `stride=8`, `records=0`, byte offset 0,
+computed extent 0. No guest-memory callback was reached. The AMD RDNA2 ISA
+scalar-buffer contract uses base, stride and num_records for bounds, and the
+existing GPU `EmitReadConstBuffer` path returns zero for an OOB DWORD.
+
+Before changing the CPU evaluator, add a minimal clean flat-slot regression
+with a nonzero base and zero records. It must return the guest's OOB zero with
+no memory probe, while a valid one-DWORD descriptor returns the real memory
+word. Cover an offset at the exact end, one partially covered DWORD, stride
+zero and nonzero, and an in-bounds unreadable/dirty specialization read that
+still fails transactionally. Run unchanged RED with the current evaluator,
+then unchanged GREEN after a shared bounds correction; do not treat invalid
+descriptor shape, negative offset or arbitrary unreadable in-bounds memory as
+an OOB zero. Repeat the native game with readback and pixel evidence.
+
+Completed CPU proof: `resource_tracking_tests --clean-scalar-buffer-oob-only`
+gave intended RED before the evaluator change (`clean-scalar-oob-red-20261002.log`,
+exit 1), then unchanged GREEN. Cases cover zero records with a nonzero base
+and both accepting/rejecting memory callbacks, exact-end and partial-DWORD
+OOB, valid stride-zero/nonzero reads, and transactional in-bounds unreadable
+failure. Full resource tracking/materialization suites GREEN. Native retry
+`yotei-integrated-20261002-153834-menucheck-gpuav-sync` on installed SHA-256
+`555231ceff7f78cd06daf678c18d305ed1385181ff371ca279ed8421d7e48e78`
+emits SPIR-V for `7ceb0f3417f926f9` (`_kyty.txt:6759215`) before the
+separate sampler validation error. This verifies passage of the old SRT
+boundary in that run; it does not prove a visible frame.
+
+## Pending unsigned-integer sampled-image filtering (2026-10-02)
+
+The OOB-corrected retry `yotei-integrated-20261002-153834-menucheck-gpuav-sync`
+passes the old clean SRT read (`7ceb0f3417f926f9` emits SPIR-V), then Vulkan
+validation aborts at maxShown131: a `VK_FORMAT_R8_UINT` sampled view is paired
+with a linear-filter VkSampler in `vkCmdDispatchIndirect` (VUID 04553).
+This is an independent shader specialization/binding issue; no source readback,
+visible frame or menu was proved. `BuildSamplerPlan` maps unconverted `Uint`
+images to `SamplerClass::Integer`, which sets integer border color but leaves
+linear filtering. Signed or converted integer images use `PointInteger`.
+
+Before production change, run the existing `ImageSampleR8UintForcesPointSampler`
+numerical fixture through a focused native CLI and prove its sampler-specialization
+expectation fails on current code. Preserve its output oracle. Cover a float
+sample with the same guest sampler and the packed-integer conversion case so
+point filtering is selected only for integer image bindings. Check Vulkan
+format-feature constraints rather than assuming every integer view supports
+linear filtering. Repeat the exact game profile after unchanged GREEN.
+
+Focused native CLI `--integer-sampler-point-only` gave intended RED before
+production change: `ImageSampleR8UintForcesPointSampler` failed at sampler
+specialization (`integer-sampler-red-20261002.log`). Shared correction forces
+point filtering for unsigned and signed integer sampler variants while
+preserving the float variant. The same R8 UINT numerical oracle, packed UINT
+sample/gather, float sample/gather and mixed float/UINT/SINT one-source
+binding case pass (`integer-sampler-mixed-green-20261002.log`). The mixed
+case's old "UINT may remain linear" expectation was corrected under Vulkan
+VUID 04553. Full resource tracking/materialization suites and native emulator
+build/install also pass. The retry `yotei-integrated-20261002-155304-menucheck-gpuav-sync`
+on SHA-256 `c1950a59fa01337d595dea72246cf5256f533c63f41bf8027e2eb05fbe7e7dda`
+still hits VUID 04553 for `image_10[3]` / `R8_UINT`, maxShown116. Thus the
+focused UINT sampler correction did not cover this runtime binding; retain it
+as test-proven but runtime-unvalidated. Before further production change,
+diagnose the actual binding-10 image resource class, view format and all
+sampled-pair sampler variants for the failing dispatch. The shader has 64
+images and 50 sampled pairs in that specialization; do not infer the bound
+pair from the test's single-image fixture. Make a synthetic RED from the
+identified shared mapping/format mechanism, then retry.
 
 ## Pending prepared-frame diagnostic readback layout (2026-10-02)
 

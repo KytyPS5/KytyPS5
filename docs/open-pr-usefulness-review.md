@@ -2,6 +2,36 @@
 
 # Открытые PR KytyPS5: что полезно для текущего bring-up
 
+## Выборочный обзор 2 октября 2026 года
+
+Свежий список GitHub: PR #977, #976, #975, #973 и #968 открыты 2 октября;
+#959 и #955 открыты 1 октября. Проверены описания, head SHA и изменённые
+файлы; для #976 также просмотрены изменения resource tracking/materialization.
+Первоначальная оценка относилась к запуску
+`yotei-integrated-20261002-150513-menucheck-gpuav-sync`: exit 321,
+maxShown 162, clean SRT `ReadConstBuffer`. Последующие локальные исправления
+проведены через RED/GREEN и native retry. На installed exe
+`24c1f4ee5adc8813e375448674410f6d8943dae92508f2700de18c69445c1ebb`
+`…-161240-menucheck-gpuav-sync` проходит этот отказ и Vulkan R8_UINT sampler
+VUID, затем выходит 321 при `maxShown=135` из-за пересечения immutable SRT
+snapshot с потенциальной записью buffer 12. Ненулевой кадр, меню и gameplay
+на этой ревизии не доказаны. Ни один из рассмотренных PR не содержит
+проверенного решения этого нового alias blocker.
+
+| PR (head) | Что даёт и решение для текущего блокера |
+| --- | --- |
+| [#976](https://github.com/KytyPS5/KytyPS5/pull/976) `140ca9fa` | GPU-selected buffer load DWORD и packed image; полезен при соответствующих будущих shader failures. Текущий отказ — CPU-оценка clean SRT до SPIR-V, поэтому этот PR его не исправляет. Требует независимого RED на нашей ветке перед переносом. |
+| [#977](https://github.com/KytyPS5/KytyPS5/pull/977) `8dd843e6` | Исправляет учёт и поиск кандидатов на eviction при давлении на память. В текущем логе нет отказа cache budget/eviction. Оставить кандидатом для измеренного memory-pressure случая. |
+| [#975](https://github.com/KytyPS5/KytyPS5/pull/975) `c1d22172` | Убирает предупреждения CMake 4 о минимальной версии bundled dependencies; настройка сборки, на runtime не влияет. Текущая native MSVC сборка проходит. |
+| [#973](https://github.com/KytyPS5/KytyPS5/pull/973) | Настройка громкости; не относится к компиляции шейдеров, SRT alias или текущему запуску. |
+| [#959](https://github.com/KytyPS5/KytyPS5/pull/959) `1b986cd2` | Делает fragment barycentric extension необязательным на GPU без поддержки. На текущем стенде Vulkan device уже создаётся и выполняет draw/dispatch, поэтому это не текущая граница. |
+| [#955](https://github.com/KytyPS5/KytyPS5/pull/955) `1dcaffa5` | Экспериментальные cache/IR оптимизации, измерения автора ещё не заполнены. Оценивать после correctness и стабильного повторяемого профиля. |
+| [#968](https://github.com/KytyPS5/KytyPS5/pull/968) `7aaddca2` | NGS2 waveform control для других игр; в текущем Yōtei нет такого NGS2 отказа. |
+
+Ни один PR не интегрирован в этой проверке. Draft [#497](https://github.com/KytyPS5/KytyPS5/pull/497)
+открыт на `f3f71319`, но GitHub помечает его `CONFLICTING` с нынешним `main`;
+это отдельная интеграционная работа после локального регрессионного исправления.
+
 Checkpoint 28.09 `8cb79392`: finite scalar-buffer snapshot budget fix proven
 native CPU/GPU RED→GREEN. Real retry `…-205136-menucheck-gpuav-sync` passes
 CS845790 (81 columns, SPIR-V54523 words, pipeline2041ms), maxShown119, black

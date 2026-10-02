@@ -1047,6 +1047,7 @@ private:
 		descriptor.bounded_buffer->expression = true;
 		descriptor.bounded_buffer->selector_group =
 		    InternBoundedSelector(dependencies.front()->proof.index);
+		descriptor.bounded_buffer->selector = dependencies.front()->proof.index;
 		for (const auto* dependency: dependencies)
 			descriptor.bounded_buffer->dependencies.push_back(dependency->read_id);
 		source = InternSource(descriptor);
@@ -1500,6 +1501,7 @@ private:
 		                           : Value(0u);
 		descriptor.bounded_buffer = DescriptorSource::BoundedBuffer {};
 		descriptor.bounded_buffer->selector_group = InternBoundedSelector(words[0]->proof.index);
+		descriptor.bounded_buffer->selector = words[0]->proof.index;
 		for (uint32_t word = 0; word < words.size(); ++word)
 			descriptor.bounded_buffer->reads[word] = words[word]->read_id;
 		source = InternSource(descriptor);

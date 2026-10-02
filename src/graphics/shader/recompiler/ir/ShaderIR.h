@@ -544,6 +544,8 @@ struct DescriptorSource {
 		// The live shader key selects the corresponding pre-materialized table row.
 		std::vector<std::array<CandidateDword, 4>> wave_candidates;
 		uint32_t selector_group = UINT32_MAX;
+		// Retain the actual bounded row selector for dispatch-wide reachability.
+		Value selector;
 		uint32_t key_arg = 0;
 		bool expression = false;
 		bool wave_uniform = false;

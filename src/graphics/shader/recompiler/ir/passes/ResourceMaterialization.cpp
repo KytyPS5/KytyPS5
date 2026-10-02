@@ -1465,6 +1465,136 @@ bool ExpandBufferTables(const ResourcePlan& program, const MaterializedSnapshot&
 	return true;
 }
 
+// A bounded table enumerates all possible rows so that its host layout is
+// stable, but one dispatch can select fewer rows. Only a selector evaluated
+// for every launched workgroup from coherent, protected inputs may remove a
+// candidate's write footprint. Failure leaves the conservative table intact.
+std::optional<uint8_t> SelectorWorkgroupAxes(const ResourcePlan& program, Value selector) {
+	std::unordered_set<const Inst*> visited;
+	std::function<bool(Value, uint8_t&, uint32_t)> visit =
+	    [&](Value value, uint8_t& axes, uint32_t depth) -> bool {
+		if (depth > 128u) return false;
+		value = value.Resolve();
+		if (value.IsImmediate()) return true;
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr) return false;
+		if (!visited.insert(inst).second) return true;
+		if (inst->GetOpcode() == ValueOpcode::GetBuiltin) {
+			const auto kind = inst->NumArgs() == 2u ? inst->Arg(0).Resolve() : Value{};
+			const auto axis = inst->NumArgs() == 2u ? inst->Arg(1).Resolve() : Value{};
+			if (!kind.IsImmediate() || !axis.IsImmediate() ||
+			    kind.GetType() != Type::U32 || axis.GetType() != Type::U32 ||
+			    kind.U32() != static_cast<uint32_t>(StageInputKind::WorkgroupId) || axis.U32() >= 3u)
+				return false;
+			axes |= uint8_t{1} << axis.U32();
+		}
+		if (inst->GetOpcode() == ValueOpcode::ReadBoundedSrtU32) {
+			const auto id = inst->Flags<uint32_t>();
+			if (id >= program.bounded_srt_reads.size() ||
+			    program.bounded_srt_reads[id].workgroup_axis >= 3u) return false;
+			axes |= uint8_t{1} << program.bounded_srt_reads[id].workgroup_axis;
+		}
+		if (inst->GetOpcode() == ValueOpcode::ReadConst) {
+			const auto slot = inst->NumArgs() == 2u ? inst->Arg(1).Resolve() : Value{};
+			if (!slot.IsImmediate() || slot.GetType() != Type::U32 ||
+			    slot.U32() >= program.srt_reads.size() ||
+			    !visit(program.srt_reads[slot.U32()].value, axes, depth + 1u)) return false;
+		}
+		for (size_t arg = 0; arg < inst->NumArgs(); ++arg)
+			if (!visit(inst->Arg(arg), axes, depth + 1u)) return false;
+		return true;
+	};
+	uint8_t axes = 0u;
+	return visit(selector, axes, 0u) ? std::optional<uint8_t>{axes} : std::nullopt;
+}
+
+void PruneUnselectedBoundedBuffers(const ResourcePlan& program, const SrtRuntime& runtime,
+                                  ResourceSnapshot& snapshot,
+                                  const ResourceSpecialization& specialization) {
+	if (program.stage != ShaderType::Compute || program.info.writes_dma ||
+	    !runtime.compute_workgroups.has_value() ||
+	    !runtime.compute_workgroups_trusted ||
+	    runtime.read_specialization_memory == nullptr ||
+	    snapshot.immutable_srt_ranges.empty()) return;
+	const auto groups = *runtime.compute_workgroups;
+	if (std::ranges::any_of(groups, [](uint32_t count) { return count == 0u; })) return;
+	uint64_t evaluated = 0u;
+	for (uint32_t logical = 0; logical < specialization.buffer_tables.size(); ++logical) {
+		const auto& table = specialization.buffer_tables[logical];
+		if (table.count == 0u || logical >= program.info.buffers.size()) continue;
+		const auto* source = Source(program, program.info.buffers[logical].source);
+		if (source == nullptr || !source->bounded_buffer.has_value() ||
+		    source->bounded_buffer->selector.IsEmpty() ||
+		    source->bounded_buffer->wave_uniform) continue;
+		const auto axes = SelectorWorkgroupAxes(program, source->bounded_buffer->selector);
+		if (!axes.has_value()) continue;
+		std::array<uint32_t, 3> domain{1u, 1u, 1u};
+		uint64_t total = 1u;
+		bool within_budget = true;
+		for (uint32_t axis = 0; axis < 3u; ++axis) {
+			if ((*axes & (uint8_t{1} << axis)) == 0u) continue;
+			if (total > MaxIndirectImageProbes / groups[axis]) {
+				within_budget = false;
+				break;
+			}
+			domain[axis] = groups[axis];
+			total *= groups[axis];
+		}
+		if (!within_budget || evaluated > MaxIndirectImageProbes - total) continue;
+		SnapshotReader reader {runtime};
+		SrtRuntime clean = runtime;
+		clean.read_memory = SnapshotReader::Clean;
+		clean.read_specialization_memory = SnapshotReader::Clean;
+		clean.clamp_memory_range = SnapshotReader::Clamp;
+		clean.userdata = &reader;
+		std::vector<uint8_t> active(snapshot.buffers.size());
+		bool proved = true;
+		for (uint32_t z = 0; z < domain[2] && proved; ++z) {
+			for (uint32_t y = 0; y < domain[1] && proved; ++y) {
+				for (uint32_t x = 0; x < domain[0]; ++x) {
+					clean.evaluation_workgroup_id = std::array<uint32_t, 3>{x, y, z};
+					SrtWalker walker(program, clean, {}, nullptr, {},
+					                 specialization.bounded_srt_reads, snapshot.flattened_srt);
+					uint32_t row = 0;
+					const bool evaluated_row = walker.Evaluate(source->bounded_buffer->selector, row);
+					if (!evaluated_row || row >= table.count ||
+					    uint64_t{table.mapping_flat_offset} + row >= snapshot.flattened_srt.size()) {
+						proved = false;
+						break;
+					}
+					const auto dense = snapshot.flattened_srt[table.mapping_flat_offset + row];
+					if (dense >= active.size()) { proved = false; break; }
+					active[dense] = 1u;
+				}
+			}
+		}
+		if (!proved) continue;
+		// These exact scalar input words are now part of the immutable dispatch
+		// source. Both CPU and renderer guards check them against all live writes.
+		ResourceSnapshot input_reads;
+		reader.Finish(input_reads);
+		snapshot.immutable_srt_ranges.insert(snapshot.immutable_srt_ranges.end(),
+		    input_reads.immutable_srt_ranges.begin(), input_reads.immutable_srt_ranges.end());
+		std::ranges::sort(snapshot.immutable_srt_ranges, {}, &ResourceReadRange::address);
+		std::vector<ResourceReadRange> merged;
+		for (const auto range: snapshot.immutable_srt_ranges) {
+			if (!merged.empty() && range.address <= merged.back().address + merged.back().size) {
+				auto& previous = merged.back();
+				previous.size = std::max(previous.address + previous.size,
+				                         range.address + range.size) - previous.address;
+			} else merged.push_back(range);
+		}
+		snapshot.immutable_srt_ranges = std::move(merged);
+		for (const auto dense: table.resources) {
+			if (dense < active.size() && !active[dense]) {
+				snapshot.buffers[dense].dwords.fill(0u);
+				snapshot.buffers[dense].dword_count = 4u;
+			}
+		}
+		evaluated += total;
+	}
+}
+
 bool ValidateSnapshotBufferWrites(const ResourcePlan& program, const SrtRuntime& runtime,
                                   const ResourceSnapshot& snapshot,
                                   const ResourceSpecialization& specialization) {
@@ -1876,6 +2006,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 	if (!ExpandBufferTables(program, snapshot, runtime, next_snapshot, next_specialization)) {
 		return false;
 	}
+	PruneUnselectedBoundedBuffers(program, runtime, next_snapshot, next_specialization);
 	next_specialization.buffers.reserve(next_snapshot.buffers.size());
 	next_specialization.sampler_origins.resize(program.info.samplers.size());
 	std::iota(next_specialization.sampler_origins.begin(),
@@ -2581,6 +2712,8 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		}
 		target.inline_descriptor = source.inline_descriptor;
 		target.bounded_buffer = source.bounded_buffer;
+		if (target.bounded_buffer.has_value())
+			target.bounded_buffer->selector = Clone(target.bounded_buffer->selector);
 		target.bounded_image = source.bounded_image;
 		target.bounded_sampler = source.bounded_sampler;
 		for (uint32_t dword = 0; dword < source.dword_count; dword++) {
@@ -2695,6 +2828,12 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
 	g_last_specialization_error.clear();
+	if (!runtime.compute_workgroups_trusted &&
+	    std::ranges::any_of(program.bounded_srt_reads, [](const BoundedSrtRead& read) {
+		    return read.workgroup_axis != UINT32_MAX;
+	    })) {
+		return SpecializationFail("bounded SRT requires coherent indirect workgroup counts");
+	}
 	MaterializedSnapshot materialized;
 	if (!MaterializeSnapshot(program, runtime, materialized)) {
 		return false;

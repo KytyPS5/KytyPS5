@@ -1718,6 +1718,16 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 		return Arg(inst, 0, a) && Arg(inst, 1, b) && Arg(inst, 2, c);
 	};
 	switch (inst.GetOpcode()) {
+		case ValueOpcode::GetBuiltin: {
+			if (!m_runtime.evaluation_workgroup_id.has_value() || inst.NumArgs() != 2u ||
+			    !inst.Arg(0).Resolve().IsImmediate() || !inst.Arg(1).Resolve().IsImmediate() ||
+			    inst.Arg(0).Resolve().U32() != static_cast<uint32_t>(StageInputKind::WorkgroupId))
+				return false;
+			const auto axis = inst.Arg(1).Resolve().U32();
+			if (axis >= 3u) return false;
+			result = (*m_runtime.evaluation_workgroup_id)[axis];
+			return true;
+		}
 		case ValueOpcode::GetUserData: {
 			const auto reg = RegIndex(inst.Arg(0).ScalarRegister());
 			if (reg < m_program.user_data_base ||
@@ -1788,20 +1798,27 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 			return true;
 		}
 		case ValueOpcode::ReadBoundedSrtU32: {
-			if (!m_bounded_candidate.has_value()) {
+			const auto id = inst.Flags<uint32_t>();
+			if (id >= m_bounded_layouts.size() || id >= m_program.bounded_srt_reads.size()) {
 				return false;
 			}
-			const auto id = inst.Flags<uint32_t>();
-			if (id >= m_bounded_layouts.size()) {
+			uint32_t candidate = 0;
+			if (m_bounded_candidate.has_value()) {
+				candidate = *m_bounded_candidate;
+			} else if (m_runtime.evaluation_workgroup_id.has_value() &&
+			           m_program.bounded_srt_reads[id].workgroup_axis < 3u) {
+				candidate = (*m_runtime.evaluation_workgroup_id)[
+				    m_program.bounded_srt_reads[id].workgroup_axis];
+			} else {
 				return false;
 			}
 			const auto& layout = m_bounded_layouts[id];
-			if (*m_bounded_candidate >= layout.count ||
+			if (candidate >= layout.count ||
 			    layout.flat_offset > m_bounded_flat.size() ||
-			    *m_bounded_candidate >= m_bounded_flat.size() - layout.flat_offset) {
+			    candidate >= m_bounded_flat.size() - layout.flat_offset) {
 				return false;
 			}
-			result = m_bounded_flat[layout.flat_offset + *m_bounded_candidate];
+			result = m_bounded_flat[layout.flat_offset + candidate];
 			return true;
 		}
 		case ValueOpcode::LoadAddressU32:

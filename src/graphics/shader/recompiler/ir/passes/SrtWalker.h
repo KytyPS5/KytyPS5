@@ -26,6 +26,10 @@ struct SrtRuntime {
 	// Actual guest dispatch counts before host wave partitioning. Absent for graphics
 	// and offline callers that cannot prove a dispatch-dependent snapshot's bound.
 	std::optional<std::array<uint32_t, 3>> compute_workgroups;
+	// False when indirect arguments can still be changed by queued GPU writes.
+	bool compute_workgroups_trusted = true;
+	// Explicit workgroup for bounded, dispatch-wide selector evaluation only.
+	std::optional<std::array<uint32_t, 3>> evaluation_workgroup_id;
 	// Optional renderer address-space query. A zero result means the requested
 	// base cannot be bound; a nonzero result is the contiguous mapped prefix.
 	SrtMemoryRangeClamper clamp_memory_range = nullptr;

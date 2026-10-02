@@ -703,7 +703,8 @@ struct PipelineCache::ProgramCache {
 	template <typename InputInfo>
 	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info,
 	                  uint32_t& push_data_cursor,
- std::optional<std::array<uint32_t, 3>> guest_workgroups = std::nullopt) {
+ std::optional<std::array<uint32_t, 3>> guest_workgroups = std::nullopt,
+ bool compute_workgroups_trusted = true) {
 		ShaderType stage;
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			stage = input_info.logical_stage;
@@ -773,6 +774,7 @@ struct PipelineCache::ProgramCache {
 		    .read_memory                = ReadShaderBacking,
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		    .compute_workgroups         = guest_workgroups,
+		    .compute_workgroups_trusted = compute_workgroups_trusted,
 		    .clamp_memory_range         = ClampShaderGuestMemory,
 		};
 		if (entry != programs.end()) {
@@ -1339,12 +1341,14 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
                                                const HW::ShaderRegisters&   sh,
                                                ShaderComputeInputInfo&      input_info,
- std::optional<std::array<uint32_t, 3>> guest_workgroups) {
+ std::optional<std::array<uint32_t, 3>> guest_workgroups,
+ bool compute_workgroups_trusted) {
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
 	const auto        params      = PrepareProgram(regs, sh, input_info);
 	Common::LockGuard lock(m_mutex);
 	uint32_t          push_data_cursor = 0;
-	return m_program_cache->Get(params, input_info, push_data_cursor, guest_workgroups);
+	return m_program_cache->Get(params, input_info, push_data_cursor, guest_workgroups,
+	                           compute_workgroups_trusted);
 }
 
 bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other) const noexcept {

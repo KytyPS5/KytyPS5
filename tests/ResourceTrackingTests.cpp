@@ -7144,6 +7144,115 @@ Value WorkgroupSrtIndex(Fixture& fixture, uint32_t axis) {
       {Value(static_cast<uint32_t>(StageInputKind::WorkgroupId)), Value(axis)});
 }
 
+void TestUnselectedBoundedBufferWriterCase(bool mutate_input, uint32_t selector_axis = 0u) {
+  Fixture fixture;
+  const auto group = WorkgroupSrtIndex(fixture, selector_axis);
+  const auto input = fixture.Buffer({Value(0x3000u), Value(8u << 16u),
+                                     Value(4u), Value(0u)}, 0x10u);
+  const auto input_offset = fixture.Emit(ValueOpcode::IAdd32,
+      {fixture.Emit(ValueOpcode::ShiftLeftLogical32, {group, Value(3u)}), Value(4u)});
+  MemoryInfo scalar;
+  scalar.kind = ResourceKind::ScalarBuffer;
+  const auto word = fixture.Emit(ValueOpcode::ReadConstBuffer, {input, input_offset},
+                                 fixture.AddMemory(scalar, 0x20u));
+  const auto selector = fixture.Emit(ValueOpcode::BitFieldUExtract,
+                                     {word, Value(16u), Value(5u)});
+  const auto row = fixture.Emit(ValueOpcode::ShiftLeftLogical32,
+                                {selector, Value(4u)});
+  const auto address = fixture.Address(Value(0x1000u), Value(0u), 0x30u);
+  std::array<Value, 4> words;
+  for (uint32_t i = 0; i < words.size(); ++i) {
+    MemoryInfo memory;
+    memory.kind = ResourceKind::ScalarAddress;
+    memory.offset = i * 4u;
+    memory.component_count = 4u;
+    memory.component_index = i;
+    words[i] = fixture.Emit(ValueOpcode::LoadAddressU32,
+        {address, row, Value(0u), Value(true)}, fixture.AddMemory(memory, 0x40u));
+  }
+  const auto target = fixture.Buffer(words, 0x50u);
+  fixture.Emit(ValueOpcode::StoreBufferU32,
+      {target, Value(0u), Value(0u), Value(0u), Value(7u), Value(true)},
+      fixture.AddMemory({.kind=ResourceKind::Buffer, .idxen=true}, 0x50u));
+  if (mutate_input) {
+    const auto mutator = fixture.Buffer({Value(0x3000u), Value(8u << 16u),
+                                         Value(4u), Value(0u)}, 0x60u);
+    fixture.Emit(ValueOpcode::StoreBufferU32,
+        {mutator, Value(0u), Value(0u), Value(0u), Value(17u << 16u), Value(true)},
+        fixture.AddMemory({.kind=ResourceKind::Buffer, .idxen=true}, 0x60u));
+  }
+  fixture.program.block_info[0].terminator.kind = CFG::TerminatorKind::Return;
+  fixture.PlanAndTrack();
+  auto plan = ExtractResourcePlan(fixture.program);
+  Check(plan.info.buffers.size() == (mutate_input ? 2u : 1u) &&
+            plan.bounded_srt_reads.size() >= 4u,
+        "unselected writer fixture did not retain the bounded buffer table");
+  BoundedSnapshotReader reader;
+  reader.generated_descriptors = 32u;
+  for (uint32_t i = 0; i < 4u; ++i)
+    reader.words.emplace_back(0x1000u + 17u * 16u + i * 4u,
+        std::array<uint32_t,4>{0x1000u, 8u << 16u, 64u, 0u}[i]);
+  for (uint32_t group_id = 0; group_id < 4u; ++group_id)
+    reader.words.emplace_back(0x3000u + group_id * 8u + 4u, 0u);
+  const std::array<uint32_t, 1> data{0u};
+  auto runtime = BoundedSnapshotRuntime(reader, data);
+  runtime.compute_workgroups = selector_axis == 0u
+      ? std::array<uint32_t, 3>{4u, 1u, 1u}
+      : std::array<uint32_t, 3>{1u, 4u, 1u};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  const bool accepted = MaterializeResources(plan, runtime, snapshot, specialization);
+  if (mutate_input) {
+    Check(!accepted, "writer of a bounded selector input escaped the immutable SRT guard");
+    return;
+  }
+  Check(accepted, "unselected bounded writer still aliases the immutable SRT snapshot");
+  const auto& table = specialization.buffer_tables[0];
+  Check(table.count == 32u && table.resources.size() == 32u &&
+            snapshot.buffers[snapshot.flattened_srt[table.mapping_flat_offset + 17u]].dwords[0] == 0u,
+        "unselected writer was not disabled in the specialized snapshot");
+  // A GPU-owned indirect argument buffer can still contain more groups than
+  // its stale CPU copy; that copy cannot justify disabling row 17.
+  runtime.compute_workgroups_trusted = false;
+  ResourceSnapshot untrusted_snapshot;
+  ResourceSpecialization untrusted_specialization;
+  Check(!MaterializeResources(plan, runtime, untrusted_snapshot, untrusted_specialization),
+        "GPU-owned indirect grid pruned a possibly selected bounded writer");
+  runtime.compute_workgroups_trusted = true;
+  // Only WorkgroupId.x reaches the selector. A large independent y dimension
+  // must not exhaust the proof budget or make an unreachable row writable.
+  runtime.compute_workgroups = selector_axis == 0u
+      ? std::array<uint32_t, 3>{4u, 20000u, 1u}
+      : std::array<uint32_t, 3>{20000u, 4u, 1u};
+  ResourceSnapshot wide_snapshot;
+  ResourceSpecialization wide_specialization;
+  Check(MaterializeResources(plan, runtime, wide_snapshot, wide_specialization),
+        "independent workgroup axis exhausted bounded selector reachability");
+  runtime.compute_workgroups = selector_axis == 0u
+      ? std::array<uint32_t, 3>{4u, 1u, 1u}
+      : std::array<uint32_t, 3>{1u, 4u, 1u};
+  // Replace the existing coherent source word for one launched workgroup.
+  for (auto& entry : reader.words)
+    if (entry.first == 0x3014u) entry.second = 17u << 16u;
+  ResourceSnapshot selected_snapshot;
+  ResourceSpecialization selected_specialization;
+  Check(!MaterializeResources(plan, runtime, selected_snapshot, selected_specialization),
+        "selected overlapping row escaped the immutable SRT guard");
+  for (auto& entry : reader.words)
+    if (entry.first == 0x3014u) entry.second = 0u;
+  reader.fail_address = 0x300cu;
+  ResourceSnapshot unreadable_snapshot;
+  ResourceSpecialization unreadable_specialization;
+  Check(!MaterializeResources(plan, runtime, unreadable_snapshot, unreadable_specialization),
+        "unreadable selector input was treated as a proved inactive row");
+}
+
+void TestUnselectedBoundedBufferWriter() {
+  TestUnselectedBoundedBufferWriterCase(false);
+  TestUnselectedBoundedBufferWriterCase(false, 1u);
+  TestUnselectedBoundedBufferWriterCase(true);
+}
+
 Value WorkgroupSrtRawRead(Fixture& fixture, Value offset, uint32_t immediate = 0u) {
   fixture.program.block_info[0].terminator.kind =
       Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::Return;
@@ -7786,6 +7895,11 @@ int main(int argc, char** argv) {
       std::cout << "KYTY_ZERO_STRIDE_WRITER_ALIAS_PASS\n";
       return 0;
     }
+    if (argc == 2 && std::strcmp(argv[1], "--unselected-bounded-writer-only") == 0) {
+      TestUnselectedBoundedBufferWriter();
+      std::cout << "KYTY_UNSELECTED_BOUNDED_WRITER_PASS\n";
+      return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--nested-posttest-image-only") == 0) {
       TestNestedPostTestImageLoop();
       return 0;
@@ -7912,6 +8026,7 @@ int main(int argc, char** argv) {
     Run("TestBoundedMaterializationLimitsAreTransactional", TestBoundedMaterializationLimitsAreTransactional);
     Run("TestBoundedMaterializationRejectsWritableAliases", TestBoundedMaterializationRejectsWritableAliases);
     Run("TestZeroStrideOutOfBoundsWriterAlias", TestZeroStrideOutOfBoundsWriterAlias);
+    Run("unselected bounded buffer writer", TestUnselectedBoundedBufferWriter);
     Run("TestBoundedMaterializationNullsForeignBufferSlots",
         TestBoundedMaterializationNullsForeignBufferSlots);
     Run("phi validation", TestPhiValidation);

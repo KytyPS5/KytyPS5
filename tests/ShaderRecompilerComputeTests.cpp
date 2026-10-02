@@ -4785,6 +4785,25 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  void CheckEmptyIndirectDispatch() {
+    constexpr const char *name = "EmptyIndirectDispatch";
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    auto &scheduler = context.GetCommandScheduler();
+    scheduler.Begin(registers, user_config, shaders);
+    shaders.SetCsShader({.data_addr = 1});
+    constexpr std::array<std::array<uint32_t, 3>, 3> empty_dispatches{{
+        {0, 1, 1}, {1, 0, 1}, {1, 1, 0}}};
+    for (const auto &groups : empty_dispatches) {
+      context.GetRenderExecutor().DispatchIndirect(
+          0, scheduler.Current(), reinterpret_cast<uint64_t>(groups.data()), 0x41u);
+    }
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   void CheckComputeMetaClearClassification() {
     constexpr const char *name = "ComputeMetaClearClassification";
     constexpr uint64_t read_only_meta = 0x0000000204201f00ull;
@@ -45082,6 +45101,16 @@ if (argc == 1) {
     vulkan.CheckRenderExecutorColorMetadataClear();
     vulkan.CheckSampledDccClear();
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--empty-indirect-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckEmptyIndirectDispatch();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--native-indirect-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckNativeIndirectDispatch();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--layered-image-only") == 0) {

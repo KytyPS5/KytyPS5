@@ -527,12 +527,22 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	// will use. Thread-dimension packs already redirect to DispatchDirect; here
 	// the indirect args are group counts and are CPU-readable guest memory.
 	const auto* args = reinterpret_cast<const vk::DispatchIndirectCommand*>(args_addr);
+	const bool args_gpu_owned =
+	    m_context.GetBufferCache().IsRegionGpuModified(args_addr, sizeof(*args)) ||
+	    m_context.GetBufferCache().HasGpuDirtyBytes(args_addr, sizeof(*args)) ||
+	    m_context.GetTextureCache().IsRegionGpuModified(args_addr, sizeof(*args));
+	if ((args->x == 0 || args->y == 0 || args->z == 0) && !args_gpu_owned) {
+		// A CPU-owned empty indirect dispatch has no shader invocations. GPU-owned
+		// arguments may still contain nonzero counts despite stale CPU zeros.
+		return;
+	}
 	const auto guest_groups = ShaderRecompiler::ComputeGuestWorkgroups(
 	    {args->x, args->y, args->z},
 	    {cs_regs.cs_regs.num_thread_x, cs_regs.cs_regs.num_thread_y,
 	     cs_regs.cs_regs.num_thread_z}, false);
 	const auto compute_program = m_context.GetPipelineCache().GetComputeProgram(
-	    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info, guest_groups);
+	    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info, guest_groups,
+	    !args_gpu_owned);
 	if (!compute_program) {
 		// Temporary until RT is implemented.
 		return;

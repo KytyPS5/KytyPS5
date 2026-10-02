@@ -14896,6 +14896,15 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
     Check(SpirvInstructionOpcodeCount(guarded_dispatcher.spirv, 245u) == 3u,
           "loop watchdog did not count the dispatcher loop");
   }
+  // A value that is not a plain number must keep the watchdog on, not disable it.
+  for (const char* bad: {"abc", "12x", "-1", "99999999999"}) {
+    setenv("KYTY_SHADER_LOOP_LIMIT", bad, 1);
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    const auto result = RecompileForTest(structured_phi, options);
+    CheckSpirvBinaryValidates(result.spirv);
+    Check(MeasureSpirv(result.spirv).function_variables >= 1u,
+          "non-numeric KYTY_SHADER_LOOP_LIMIT disabled the loop watchdog");
+  }
   setenv("KYTY_SHADER_LOOP_LIMIT", "0", 1);
 }
 

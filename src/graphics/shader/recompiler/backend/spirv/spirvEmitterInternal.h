@@ -368,8 +368,19 @@ uint32_t ConstantBool(EmitterState& state, bool value);
 // hang the GPU. 65536 is the cap measured against a pinned loop (~50 s/frame); a million
 // iterations would turn that same shader into many minutes per frame.
 inline uint32_t ShaderLoopLimit() {
-	const char* value = std::getenv("KYTY_SHADER_LOOP_LIMIT");
-	return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : (1u << 16u);
+	constexpr uint32_t kDefaultLimit = 1u << 16u;
+	const char*        value         = std::getenv("KYTY_SHADER_LOOP_LIMIT");
+	if (value == nullptr || *value == '\0') {
+		return kDefaultLimit;
+	}
+	// Only a plain decimal number overrides the default; anything else keeps the cap on
+	// instead of silently turning the watchdog off.
+	char*      end    = nullptr;
+	const auto parsed = std::strtoull(value, &end, 10);
+	if (*end != '\0' || parsed > UINT32_MAX || *value == '-') {
+		return kDefaultLimit;
+	}
+	return static_cast<uint32_t>(parsed);
 }
 
 uint32_t ConstantU64(EmitterState& state, uint64_t value);

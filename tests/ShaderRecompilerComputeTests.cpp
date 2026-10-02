@@ -29293,6 +29293,21 @@ TestCase ImageLoadR32SintUsesSignedSampledImage() {
   return test;
 }
 
+TestCase ImageLoadPackedPreservesBits() {
+  auto test = ImageLoadR32UintUsesIntegerSampledImage();
+  test.name = "ImageLoadPackedPreservesBits";
+  test.code.clear();
+  AppendVMovU32(&test.code, 20, 2);
+  AppendVMovU32(&test.code, 21, 1);
+  test.code.push_back(EncodeMimg0(0x02, 1));
+  test.code.push_back(EncodeMimg1(0, 20));
+  AppendStoreVgpr(&test.code, 0, 0);
+  AppendEnd(&test.code);
+  test.opcodes[1] = ShaderOpcode::IMAGE_LOAD_PCK;
+  test.user_data = MakeSampledTextureData(Prospero::BufferFormat::k11_11_10Float);
+  return test;
+}
+
 TestCase ImageLoadPackedUintUnpacksAndSwizzles() {
   using O = ShaderOpcode;
 
@@ -31703,6 +31718,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageLoadFmaskUsesNativeSampleMapping);
   AddCase(ImageLoadR32SintUsesSignedSampledImage);
   AddCase(ImageLoadPackedUintUnpacksAndSwizzles);
+  AddCase(ImageLoadPackedPreservesBits);
   AddCase(ImageSamplePackedUintConvertsSampleAndGather);
   AddCase(ImageLoadR128IgnoresAdjacentMaskSgprs);
   AddCase(ImageLoad1DUsesScalarCoordinate);

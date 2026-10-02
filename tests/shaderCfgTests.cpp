@@ -3535,6 +3535,18 @@ void TestNewShaderRecompilerCapturedVop1SdwaByteConvert() {
         "V_CVT_F16_U16 accepted unimplemented SDWA byte sign extension");
 }
 
+void TestPackedImageLoadDecode() {
+  for (uint32_t dmask = 0; dmask < 16; ++dmask) {
+    const uint32_t code[] = {0xf0000000u | (0x02u << 18u) | (dmask << 8u), 0u};
+    ShaderRecompiler::Decoder::Instruction decoded;
+    ShaderRecompiler::Decoder::DecodeInstruction(code, 0, decoded);
+    Check(decoded.opcode == (dmask == 1u
+              ? ShaderRecompiler::Decoder::Opcode::IMAGE_LOAD_PCK
+              : ShaderRecompiler::Decoder::Opcode::UNSUPPORTED),
+          "packed image load must accept only the supported single-DWORD encoding");
+  }
+}
+
 void TestNewShaderRecompilerVop1SdwaNotDestination() {
   auto options = MakeCompileOptions(ShaderType::Pixel);
 
@@ -14425,6 +14437,7 @@ int main() {
   TestPixelProgramCacheBindingIdentity();
   TestGraphicsPushConstantPlacement();
   TestNewShaderRecompilerUnsupportedMemoryDecode();
+  TestPackedImageLoadDecode();
 
   TestNewShaderRecompilerVop3LaneReadDestinationEncoding();
 

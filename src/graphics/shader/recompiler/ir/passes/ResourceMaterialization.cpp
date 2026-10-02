@@ -466,6 +466,9 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			    fmt::format("atomic image descriptor {} uses unsupported format {}", i,
 			                static_cast<uint32_t>(format)));
 		}
+		if (base.packed && Prospero::NumBytesPerElement(format) != 4u) {
+			return SpecializationFail("packed image load requires a 32-bit texel format");
+		}
 		const bool storage      = base.resource_class == ImageResourceClass::Storage;
 		image.fmask             = Prospero::IsFmaskTextureFormat(format);
 		if (image.fmask) {
@@ -483,6 +486,11 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		const bool raw_sint_storage = storage && format == Prospero::BufferFormat::k32SInt &&
 		                              base.written && !base.read && !base.atomic;
 		image.numeric_class         = Prospero::SampledTextureNumericClass(format);
+		if (base.packed) {
+			image.numeric_class = Prospero::TextureNumericClass::Uint;
+			image.conversion_format = Prospero::BufferFormat::kInvalid;
+			image.shader_swizzle = ShaderImageIdentitySwizzle;
+		}
 		if (storage) {
 			if ((!raw_sint_storage && image.numeric_class == Prospero::TextureNumericClass::Sint) ||
 			    image.numeric_class == Prospero::TextureNumericClass::Unsupported) {

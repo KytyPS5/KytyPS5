@@ -65,6 +65,7 @@ struct MemoryInfo {
 	bool                    data_signed                                           = false;
 	bool                    typed                                                 = false;
 	bool                    formatted                                             = false;
+	bool                    image_packed = false;
 	bool                    image_has_mip                                         = false;
 	bool                    image_r128                                            = false;
 	bool                    idxen                                                 = false;
@@ -119,6 +120,7 @@ enum class ImageMipMode { None, DynamicStorage };
 constexpr uint32_t ShaderImageIdentitySwizzle = 0x00000facu;
 
 struct ImageResource {
+	bool packed = false;
 	static constexpr uint32_t NoIndirectImage = UINT32_MAX;
 
 	uint32_t                      source            = 0;

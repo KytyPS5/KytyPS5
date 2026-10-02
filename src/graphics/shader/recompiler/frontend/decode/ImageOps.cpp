@@ -223,6 +223,7 @@ Opcode DecodeMimgOpcode(uint32_t opcode, const MimgSampleInfo* sample, const Mim
 
 	switch (opcode) {
 		case 0x00u: return Opcode::IMAGE_LOAD;
+		case 0x02u: return Opcode::IMAGE_LOAD_PCK;
 		case 0x01u: return Opcode::IMAGE_LOAD_MIP;
 		case 0x08u: return Opcode::IMAGE_STORE;
 		case 0x09u: return Opcode::IMAGE_STORE_MIP;
@@ -262,6 +263,7 @@ uint32_t DecodeMimgAddressComponents(uint32_t opcode, ImageDimension dimension,
 		case 0x01u:
 		case 0x09u: return ImageCoordComponents(dimension) + 1u;
 		case 0x00u:
+		case 0x02u:
 		case 0x08u:
 		case 0x60u: return ImageCoordComponents(dimension);
 		default: return 0;
@@ -355,6 +357,10 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 
 	if (inst.opcode == Opcode::UNSUPPORTED) {
 		SetUnsupported(inst, Family::MIMG, opcode, "MIMG opcode is not implemented");
+	}
+	if (opcode == 0x02u && inst.dmask != 1u) {
+		SetUnsupported(inst, Family::MIMG, opcode,
+		               "packed image load requires a single 32-bit texel");
 	}
 	if (gather != nullptr && !std::has_single_bit(inst.dmask)) {
 		SetUnsupported(inst, Family::MIMG, opcode,

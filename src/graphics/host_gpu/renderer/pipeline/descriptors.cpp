@@ -442,7 +442,7 @@ static ImageViewInfo TextureViewInfo(const ShaderRecompiler::IR::ImageResource& 
 	}
 	view.usage = storage ? vk::ImageUsageFlagBits::eStorage : vk::ImageUsageFlagBits::eSampled;
 	view.mapping =
-	    storage || surface_format.conversion_format != Prospero::BufferFormat::kInvalid
+	    storage || resource.packed || surface_format.conversion_format != Prospero::BufferFormat::kInvalid
 	        ? vk::ComponentMapping {}
 	        : TextureGetComponentMapping(descriptor.DstSelXYZW(), surface_format.host_to_storage);
 	switch (resource.dimension) {
@@ -595,7 +595,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	const auto format         = descriptor.Format();
 	const auto surface_format = TextureGetSurfaceFormatInfo(format);
 	const bool shader_conversion =
-	    surface_format.conversion_format != Prospero::BufferFormat::kInvalid;
+	    !resource.packed && surface_format.conversion_format != Prospero::BufferFormat::kInvalid;
 	const bool sampled_numeric_class =
 	    storage || resource.numeric_class == Prospero::SampledTextureNumericClass(format);
 	if (!storage && resource.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled &&
@@ -644,7 +644,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		ValidateStorageTexture(resource, descriptor, size.size);
 	}
 
-	auto pixel_format = surface_format.vk_format;
+	auto pixel_format = resource.packed ? vk::Format::eR32Uint : surface_format.vk_format;
 	if (resource.depth_compare) {
 		if (const auto* depth_format = FindGuestDepthFormatPolicy(format)) {
 			pixel_format = depth_format->depth_attachment_format;

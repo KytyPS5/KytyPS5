@@ -7548,6 +7548,67 @@ void TestSrtRawFallbackReadability() {
     CheckSrtRawFallbackCase(name);
 }
 
+void TestCleanScalarBufferOutOfBounds() {
+  struct Case {
+    uint32_t stride;
+    uint32_t records;
+    uint32_t offset;
+    bool readable;
+    bool accepted;
+    uint32_t expected;
+    uint32_t probes;
+  };
+  constexpr uint32_t word = 0x13579bdfu;
+  for (const auto input : {
+           Case{8u, 0u, 0u, true, true, 0u, 0u},
+           Case{8u, 0u, 0u, false, true, 0u, 0u},
+           Case{8u, 1u, 8u, true, true, 0u, 0u},
+           Case{0u, 6u, 4u, true, true, 0u, 0u},
+           Case{8u, 1u, 0u, true, true, word, 1u},
+           Case{0u, 4u, 0u, true, true, word, 1u},
+           Case{8u, 1u, 0u, false, false, 0u, 0u},
+       }) {
+    Fixture fixture;
+    MemoryInfo memory_info;
+    memory_info.kind = ResourceKind::ScalarBuffer;
+    memory_info.planning_only = true;
+    const auto handle = fixture.Buffer(
+        {Value(0x1000u), Value(input.stride << 16u), Value(input.records), Value(0u)},
+        0x294u);
+    const auto read = fixture.Emit(ValueOpcode::ReadConstBuffer,
+                                   {handle, Value(input.offset)},
+                                   fixture.AddMemory(memory_info, 0x294u));
+    fixture.program.srt_plan_complete = true;
+    fixture.program.resource_tracking_complete = true;
+    fixture.program.srt_reads.push_back({read, 0u});
+    const auto plan = ExtractResourcePlan(fixture.program);
+    TestMemory backing;
+    backing.words[0] = word;
+    const SrtRuntime runtime{
+        .read_memory = RejectTestMemory,
+        .userdata = &backing,
+        .read_specialization_memory = input.readable ? ReadTestMemory : RejectTestMemory};
+    std::vector<DescriptorValue> descriptors(1);
+    descriptors[0].dwords[0] = 0xfeed1111u;
+    std::vector<uint32_t> flat{0xfeed2222u};
+    const auto saved_descriptors = descriptors;
+    const auto saved_flat = flat;
+    const std::array<uint8_t, 1> clean{ResourcePlan::FlatSlotClean};
+    const bool accepted = EvaluateRuntimeSources(plan, {}, runtime, descriptors, flat, clean);
+    Check(accepted == input.accepted,
+          "clean scalar-buffer read disagreed with descriptor bounds or readability");
+    Check(backing.reads == input.probes,
+          "clean scalar-buffer OOB read probed guest memory");
+    if (accepted) {
+      Check(flat == std::vector<uint32_t>{input.expected},
+            "clean scalar-buffer read returned the wrong DWORD");
+    } else {
+      Check(descriptors == saved_descriptors && flat == saved_flat,
+            "failed clean scalar-buffer read committed a partial snapshot");
+    }
+  }
+}
+
 } // namespace
 
 void TestGpuSelectedRawBufferAdmission() {
@@ -7595,6 +7656,11 @@ void TestGpuSelectedRawBufferAdmission() {
 
 int main(int argc, char** argv) {
   try {
+    if (argc == 2 && std::strcmp(argv[1], "--clean-scalar-buffer-oob-only") == 0) {
+      TestCleanScalarBufferOutOfBounds();
+      std::cout << "KYTY_CLEAN_SCALAR_BUFFER_OOB_PASS\n";
+      return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--conditional-planning-srt-only") == 0) {
       TestConditionalPlanningScalarSlot();
       std::cout << "KYTY_CONDITIONAL_PLANNING_SRT_PASS\n";

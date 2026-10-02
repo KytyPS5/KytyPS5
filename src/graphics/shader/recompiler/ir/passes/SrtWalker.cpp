@@ -1642,31 +1642,37 @@ bool SrtWalker::EvaluateExtract(const Inst& inst, uint64_t& result) {
 
 bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 	const auto flags = inst.Flags<MemoryFlags>();
-	if (flags.index >= m_program.memory_info.size()) {
+	const auto fail = [&](const std::string& reason) {
+		m_last_flat_error = fmt::format("scalar read pc=0x{:x} memory={} opcode={} failed: {}",
+		                                flags.pc, flags.index,
+		                                static_cast<uint32_t>(inst.GetOpcode()), reason);
 		return false;
+	};
+	if (flags.index >= m_program.memory_info.size()) {
+		return fail("memory metadata is missing");
 	}
 	const auto& mem    = m_program.memory_info[flags.index];
 	const auto* handle = inst.Arg(0).ResolveInstruction();
 	if (handle == nullptr) {
-		return false;
+		return fail("descriptor handle is unavailable");
 	}
 	uint64_t low    = 0;
 	uint64_t high   = 0;
 	uint64_t offset = 0;
-	if (!Arg(*handle, 0, low) || !Arg(*handle, 1, high) || !Arg(inst, 1, offset)) {
-		return false;
-	}
+	if (!Arg(*handle, 0, low)) return fail("descriptor base-low evaluation failed");
+	if (!Arg(*handle, 1, high)) return fail("descriptor base-high evaluation failed");
+	if (!Arg(inst, 1, offset)) return fail("offset evaluation failed");
 	const auto base      = ((high << 32u) | static_cast<uint32_t>(low)) & AddressMask;
 	const auto immediate = static_cast<int64_t>(static_cast<int32_t>(mem.offset));
 	uint64_t   address   = 0;
 	if (inst.GetOpcode() == ValueOpcode::ReadConstBuffer) {
 		uint64_t records = 0;
 		uint64_t word3   = 0;
-		if (handle->NumArgs() != 4u || !Arg(*handle, 2, records) || !Arg(*handle, 3, word3)) {
-			return false;
-		}
+		if (handle->NumArgs() != 4u) return fail("scalar-buffer descriptor shape is invalid");
+		if (!Arg(*handle, 2, records)) return fail("record count evaluation failed");
+		if (!Arg(*handle, 3, word3)) return fail("descriptor format evaluation failed");
 		if (immediate < 0) {
-			return false;
+			return fail("negative scalar-buffer offset");
 		}
 		const auto byte_offset =
 		    (static_cast<uint64_t>(immediate) & ~uint64_t {3}) + (static_cast<uint32_t>(offset) & ~3u);
@@ -1675,26 +1681,29 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 		                      ? static_cast<uint64_t>(static_cast<uint32_t>(records))
 		                      : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
 		if (byte_offset > size || size - byte_offset < sizeof(uint32_t)) {
-			return false;
+			// RDNA scalar-buffer reads beyond the descriptor return zero. Match the
+			// shader path without probing the backing address or weakening failures
+			// for an in-bounds read whose memory is unavailable.
+			result = 0u;
+			return true;
 		}
 		address = (base & ~uint64_t {3}) + byte_offset;
 	} else {
 		const auto relative = (immediate & ~int64_t {3}) +
 		                      static_cast<int64_t>(static_cast<uint32_t>(offset) & ~3u);
 		if (!AddSignedAddress(base & ~uint64_t {3}, relative, address)) {
-			return false;
+			return fail("scalar address arithmetic overflow");
 		}
 	}
 	uint32_t word = 0;
 	if (m_runtime.read_memory != nullptr) {
 		if (!m_runtime.read_memory(m_runtime.userdata, address, {&word, 1})) {
-			m_last_flat_error = fmt::format(
-			    "LoadAddress read failed at 0x{:x} (planning={} opcode={})", address,
-			    mem.planning_only, static_cast<uint32_t>(inst.GetOpcode()));
-			return false;
+			return fail(fmt::format("guest memory read at 0x{:x} (planning={})", address,
+			                        mem.planning_only));
 		}
 	} else {
-		if (!HostMemoryReadU32(address, word)) return false;
+		if (!HostMemoryReadU32(address, word))
+			return fail(fmt::format("host memory read at 0x{:x}", address));
 	}
 	result = word;
 	return true;

@@ -559,6 +559,11 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			}
 		}
 	}
+	specialization.unnormalized_samplers.assign(snapshot.samplers.size(), 0u);
+	for (size_t index = 0; index < snapshot.samplers.size(); index++) {
+		specialization.unnormalized_samplers[index] =
+		    ((snapshot.samplers[index].dwords[0] >> 15u) & 1u) != 0u ? 1u : 0u;
+	}
 	ImageRemap(specialization).Apply(snapshot.images);
 	return true;
 }
@@ -1134,6 +1139,10 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		samplers[index].snapshot_index = binding.source;
 		samplers[index].force_point_filtering = binding.type == SamplerClass::PointInteger;
 		samplers[index].integer_border        = binding.type != SamplerClass::Float;
+		// The S# bit is recorded per snapshot sampler; a native variant shares its source's snapshot.
+		samplers[index].force_unnormalized =
+		    binding.source < specialization.unnormalized_samplers.size() &&
+		    specialization.unnormalized_samplers[binding.source] != 0u;
 	}
 	for (auto& pair: sampled_pairs) {
 		const auto type = static_cast<uint32_t>(ClassifySampler(images[pair.image]));

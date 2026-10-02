@@ -135,7 +135,13 @@ vk::Sampler SamplerCache::GetSampler(const ShaderSamplerResource& r, bool intege
 	sampler_info.minLod                  = min_lod;
 	sampler_info.maxLod                  = max_lod;
 	sampler_info.borderColor             = border;
-	sampler_info.unnormalizedCoordinates = (r.ForceUnormCoords() ? VK_TRUE : VK_FALSE);
+	// Never VK_TRUE. Vulkan forbids unnormalizedCoordinates with any OpImageSample* that has
+	// ImplicitLod, Dref or Proj (VUID-vkCmdDrawMeshTasksEXT-None-08610), and the NVIDIA shader
+	// compiler answers that violation with a breakpoint that takes the process down. The guest sets
+	// S# bit 15 (ForceUnormCoords) from uniform data, known only at bind time, so the decision lives
+	// in the shader: the bit is recorded in ResourceSpecialization::unnormalized_samplers and the
+	// emitter divides the texel-space coordinates by the level 0 extent (NormalizeForcedUnormCoord).
+	sampler_info.unnormalizedCoordinates = VK_FALSE;
 
 	if (r.ForceUnormCoords()) {
 		sampler_info.addressModeU     = vk::SamplerAddressMode::eClampToEdge;

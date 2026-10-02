@@ -32,6 +32,8 @@ struct ResourceSpecialization {
 
 	std::vector<Buffer> buffers;
 	std::vector<Image>  images;
+	// One entry per sampler after sampler planning: guest S# ForceUnormCoords.
+	std::vector<uint8_t> unnormalized_samplers;
 
 	bool operator==(const ResourceSpecialization&) const = default;
 };

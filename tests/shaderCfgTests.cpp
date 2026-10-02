@@ -14881,6 +14881,22 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
             SpirvInstructionOpcodeCount(dispatcher_result.spirv, 251u) == 1u,
         "dispatcher size fixture lost its two control Phis or switch");
   CheckSpirvPhiParents(dispatcher_result.spirv);
+
+  // The baselines above run with the loop watchdog off. With it on, the guarded
+  // structured loop and the dispatcher loop must still validate and carry a counter.
+  setenv("KYTY_SHADER_LOOP_LIMIT", "65536", 1);
+  {
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    const auto guarded_structured = RecompileForTest(structured_phi, options);
+    CheckSpirvBinaryValidates(guarded_structured.spirv);
+    Check(MeasureSpirv(guarded_structured.spirv).function_variables >= 1u,
+          "loop watchdog added no counter to a structured loop");
+    const auto guarded_dispatcher = RecompileForTest(dispatcher, options);
+    CheckSpirvBinaryValidates(guarded_dispatcher.spirv);
+    Check(SpirvInstructionOpcodeCount(guarded_dispatcher.spirv, 245u) == 3u,
+          "loop watchdog did not count the dispatcher loop");
+  }
+  setenv("KYTY_SHADER_LOOP_LIMIT", "0", 1);
 }
 
 #include "ShaderRayTracingTests.inc"
@@ -14891,6 +14907,9 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
 int main() {
   using namespace Libs::Graphics;
 
+  // Size baselines count every instruction. They are measured with the loop
+  // watchdog off; TestNewShaderRecompilerSpirvSizeBaselines checks it separately.
+  setenv("KYTY_SHADER_LOOP_LIMIT", "0", 1);
   EnsureConfigInitialized();
   TestRayTracingInstructions();
   TestResourceDescriptorClassification();

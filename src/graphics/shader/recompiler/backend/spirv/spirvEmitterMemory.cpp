@@ -1113,16 +1113,27 @@ void DefineGetBdaPointer(EmitterState& state) {
 	    Binary(state, spv::OpISub, type, address,
 	           ConstantU64(state, LibKernel::Memory::kExtendedMemoryBase - LOWER_ADDRESS_SIZE)),
 	    address);
-	const auto page64        = Binary(state, spv::OpShiftRightLogical, type, packed,
-	                                  ConstantU32(state, BufferCache::CACHING_PAGEBITS));
-	const auto page          = Unary(state, spv::OpUConvert, TypeU32(state), page64);
+	const auto page64 = Binary(state, spv::OpShiftRightLogical, type, packed,
+	                           ConstantU32(state, BufferCache::CACHING_PAGEBITS));
+	// An address past the guest page table must not index it. BDA has no robustness, so an
+	// out-of-range page is a missing page (page 0 is only used as a safe index).
+	const auto in_range = Binary(state, spv::OpULessThan, TypeBool(state), page64,
+	                             ConstantU64(state, BufferCache::CACHING_NUMPAGES));
+	const auto page_raw = Unary(state, spv::OpUConvert, TypeU32(state), page64);
+	const auto page     = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpSelect, TypeU32(state), page, in_range, page_raw,
+	                          ConstantU32(state, 0));
 	const auto entry_pointer = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state, 64),
 	                          entry_pointer, state.bda_pagetable_variable, ConstantU32(state, 0),
 	                          page);
 	const auto base = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpLoad, type, base, entry_pointer);
-	const auto missing = Binary(state, spv::OpIEqual, TypeBool(state), base, ConstantU64(state, 0));
+	const auto null_base =
+	    Binary(state, spv::OpIEqual, TypeBool(state), base, ConstantU64(state, 0));
+	const auto out_of_range = Unary(state, spv::OpLogicalNot, TypeBool(state), in_range);
+	const auto missing =
+	    Binary(state, spv::OpLogicalOr, TypeBool(state), null_base, out_of_range);
 	const auto fault_label     = state.builder.AllocateId();
 	const auto available_label = state.builder.AllocateId();
 	const auto merge_label     = state.builder.AllocateId();

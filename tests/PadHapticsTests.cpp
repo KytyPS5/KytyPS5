@@ -49,8 +49,10 @@ bool                                  duplicate_hid  = false;
 int                                   hid_opens      = 0;
 int                                   opened_hid_pad = 0;
 std::vector<std::array<uint8_t, 547>> hid_reports;
-std::atomic_bool                      block_opus_encode {false};
+std::atomic_bool                      block_opus_encode {false}, block_hid_write {false};
+std::atomic_int                       hid_closes {0};
 std::binary_semaphore                 encode_started {0}, allow_encode {0};
+std::binary_semaphore                 write_started {0}, allow_write {0};
 SDL_AudioStream*                      default_stream      = nullptr;
 bool                                  fail_default_resume = false;
 int                                   active_controller   = 1;
@@ -191,8 +193,14 @@ SDL_hid_device* HidOpenPath(const char* path) {
 	opened_hid_pad = path[4] == '1' ? 1 : 3;
 	return reinterpret_cast<SDL_hid_device*>(static_cast<uintptr_t>(opened_hid_pad));
 }
-void HidClose(SDL_hid_device*) {}
-int  HidWrite(SDL_hid_device*, const unsigned char* data, size_t size) {
+void HidClose(SDL_hid_device*) {
+	hid_closes++;
+}
+int HidWrite(SDL_hid_device*, const unsigned char* data, size_t size) {
+	if (block_hid_write.exchange(false)) {
+		write_started.release();
+		allow_write.acquire();
+	}
 	if (fail_hid_write || size != 547) {
 		return -1;
 	}
@@ -333,6 +341,7 @@ double GetTimeMs() {
 
 namespace {
 namespace Haptics = Libs::Controller::DualSenseHaptics;
+namespace Bluetooth = Libs::Controller::DualSenseBluetooth;
 using Port        = std::unique_ptr<Haptics::Stream, decltype(&Haptics::Close)>;
 constexpr std::array<int, 2>   unity {32768, 32768};
 constexpr std::array<float, 4> pcm {0.5f, 0.5f, 0.5f, 0.5f};
@@ -349,6 +358,7 @@ struct Fixture {
 		hid_available = fail_hid_write = false;
 		duplicate_hid                  = false;
 		hid_opens                      = 0;
+		hid_closes                     = 0;
 		opened_hid_pad                 = 0;
 		hid_reports.clear();
 		default_stream      = nullptr;
@@ -365,8 +375,8 @@ struct Fixture {
 	}
 };
 
-Port Open(bool speaker = false) {
-	auto* stream = Haptics::Open(48000, speaker);
+Port Open(bool speaker = false, uint32_t freq = 48000) {
+	auto* stream = Haptics::Open(freq, speaker);
 	Check(stream != nullptr, "port open failed");
 	return Port(stream, Haptics::Close);
 }
@@ -711,6 +721,25 @@ void TestBluetoothFailureFallsBack() {
 	speaker.reset();
 }
 
+void TestBluetoothFormatsAndRoutingFailure() {
+	Fixture f;
+	wireless = hid_available = fail_effect = true;
+	auto speaker                           = Open(true);
+	Check(Haptics::Queue(speaker.get(), 1, pcm.data(), 2, 2, true, unity.data()) == 0 &&
+	          !Haptics::UsesBluetooth(speaker.get()) && hid_closes == 1 && effects[1].empty(),
+	      "failed Bluetooth speaker routing leaked a session or suppressed fallback");
+	fail_effect = false;
+	now += 2001;
+	std::vector<int16_t> mono(1024, 16384);
+	const int            volume = 16384;
+	Queue(speaker, mono.data(), 1024, 1, false, &volume);
+	auto pending = Bluetooth::Prepare(now * 1000000);
+	Check(pending.size() == 1 && hid_opens == 2 && effects[1][7] == 0x30 &&
+	          std::abs(pending[0].audio[200] - 0.25f) < 1e-4f &&
+	          std::abs(pending[0].audio[201] - 0.25f) < 1e-4f,
+	      "Bluetooth mono int16 volume mapping or speaker routing recovery failed");
+}
+
 void TestBluetoothEncodingDoesNotBlockAudioQueue() {
 	Fixture f;
 	wireless = hid_available = true;
@@ -741,6 +770,87 @@ void TestBluetoothEncodingDoesNotBlockAudioQueue() {
 	speaker.reset();
 }
 
+void TestBluetoothCloseCancelsPreparedReport() {
+	Fixture f;
+	wireless = hid_available     = true;
+	auto               speaker   = Open(true);
+	auto               vibration = Open();
+	std::vector<float> sound(2048, 0.25f);
+	Queue(speaker, sound.data(), 1024);
+	Queue(vibration, sound.data(), 1024);
+	const auto base    = now * 1000000;
+	auto       pending = Bluetooth::Prepare(base);
+	Check(pending.size() == 1, "Bluetooth report was not prepared before stream close");
+	speaker.reset();
+	Bluetooth::Send(pending);
+	Check(hid_reports.empty(), "closed speaker's prepared report was sent");
+	Queue(vibration, sound.data(), 1024);
+	Bluetooth::Send(Bluetooth::Prepare(base + Bluetooth::PERIOD_NS));
+	Check(hid_reports.size() == 1 && hid_reports.back()[140] == 0,
+	      "closing the speaker prevented the remaining haptic stream from sending");
+}
+
+void TestBluetoothCloseDuringEncoding() {
+	Fixture f;
+	wireless = hid_available   = true;
+	auto               speaker = Open(true);
+	std::vector<float> sound(2048, 0.25f);
+	Queue(speaker, sound.data(), 1024);
+	block_opus_encode = true;
+	std::thread encoder([&] { Bluetooth::Send(Bluetooth::Prepare(now * 1000000)); });
+	encode_started.acquire();
+	std::binary_semaphore close_finished {0};
+	std::thread           closer([&] {
+		speaker.reset();
+		close_finished.release();
+	});
+	const bool closed_without_encoder  = close_finished.try_acquire_for(std::chrono::seconds(2));
+	const bool hid_alive_during_encode = hid_closes == 0;
+	allow_encode.release();
+	closer.join();
+	encoder.join();
+	Check(closed_without_encoder && hid_alive_during_encode && hid_closes == 1 &&
+	          hid_reports.empty(),
+	      "closing during encoding blocked, destroyed a live session, or sent stale audio");
+}
+
+void TestBluetoothCloseWaitsForWriteWithoutBlockingQueue() {
+	Fixture f;
+	wireless = hid_available     = true;
+	auto               speaker   = Open(true);
+	auto               vibration = Open();
+	std::vector<float> sound(2048, 0.25f);
+	Queue(speaker, sound.data(), 1024);
+	Queue(vibration, sound.data(), 1024);
+	auto pending = Bluetooth::Prepare(now * 1000000);
+	Check(pending.size() == 1, "Bluetooth report was not prepared before blocked write");
+	block_hid_write = true;
+	std::thread sender([&] { Bluetooth::Send(pending); });
+	write_started.acquire();
+	std::binary_semaphore close_started {0}, close_finished {0}, queue_finished {0};
+	std::thread           closer([&] {
+		close_started.release();
+		speaker.reset();
+		close_finished.release();
+	});
+	close_started.acquire();
+	const bool closed_before_write = close_finished.try_acquire_for(std::chrono::milliseconds(50));
+	std::atomic_bool queue_ok {false};
+	std::thread      audio([&] {
+		queue_ok =
+		    Haptics::Queue(vibration.get(), 1, sound.data(), 1024, 2, true, unity.data()) != 0;
+		queue_finished.release();
+	});
+	const bool       queued_without_write = queue_finished.try_acquire_for(std::chrono::seconds(2));
+	allow_write.release();
+	audio.join();
+	closer.join();
+	sender.join();
+	Check(!closed_before_write && queued_without_write && queue_ok && hid_reports.size() == 1 &&
+	          effects[1][7] == 0,
+	      "close failed to drain the HID write independently of the audio queue");
+}
+
 void TestBluetoothSpeakerWaitsForItsAudioBlock() {
 	Fixture f;
 	wireless = hid_available = true;
@@ -765,20 +875,84 @@ void TestBluetoothSpeakerWaitsForItsAudioBlock() {
 	vibration.reset();
 }
 
-void TestBluetoothShortFinalBlock() {
+void TestBluetoothShortHapticBlock() {
+	Fixture f;
+	wireless = hid_available     = true;
+	auto               vibration = Open();
+	std::vector<float> sound(2048, 0.25f);
+	Queue(vibration, sound.data(), 256);
+	const auto base = now * 1000000;
+	Check(Bluetooth::Prepare(base).empty() && Bluetooth::Prepare(base + 1000000).empty(),
+	      "short haptic block was padded with silence before its remainder arrived");
+	Queue(vibration, sound.data(), 768);
+	Check(Bluetooth::Prepare(base + 1000000).empty(),
+	      "completed haptic block skipped its speaker coalescing window");
+	auto pending = Bluetooth::Prepare(base + 2000000);
+	Check(pending.size() == 1 && pending[0].data[12 + 100] > 0,
+	      "complete haptic block did not play after its remainder arrived");
+}
+
+void TestBluetoothIncrementalBatchCoalesces() {
 	Fixture f;
 	wireless = hid_available = true;
+	auto                   vibration = Open();
 	auto speaker = Open(true);
+	std::array<float, 512> sound;
+	sound.fill(0.25f);
+	for (int block = 0; block < 3; ++block) {
+		Queue(vibration, sound.data(), 256);
+		Queue(speaker, sound.data(), 256);
+		Check(Bluetooth::Prepare(now * 1000000).empty(),
+		      "incremental Bluetooth batch was padded before it was complete");
+		now += 5;
+	}
+	Queue(vibration, sound.data(), 256);
+	Check(Bluetooth::Prepare(now * 1000000).empty(),
+	      "completed haptics sent before the same batch's final speaker block arrived");
+	Queue(speaker, sound.data(), 256);
+	auto pending = Bluetooth::Prepare(now * 1000000);
+	Check(pending.size() == 1 && pending[0].audio[1800] > 0.2f && pending[0].data[12 + 100] > 0,
+	      "completed incremental speaker and haptics batch did not play immediately");
+}
+
+void TestBluetoothLowRateCompleteBlock() {
+	Fixture f;
+	wireless = hid_available           = true;
+	auto                       speaker = Open(true, 8000);
+	std::array<float, 171 * 2> sound;
+	sound.fill(0.25f);
+	Queue(speaker, sound.data(), 171);
+	auto pending = Bluetooth::Prepare(now * 1000000);
+	Check(pending.size() == 1 && pending[0].audio[1000] > 0.2f,
+	      "resampler lookahead delayed a complete low-rate speaker block");
+}
+
+void TestBluetoothCompleteStreamDoesNotWaitForPartialPeer() {
+	Fixture f;
+	wireless = hid_available    = true;
+	auto               complete = Open(true);
+	auto               partial  = Open(true);
 	std::vector<float> sound(2048, 0.25f);
-	Check(Haptics::Queue(speaker.get(), 1, sound.data(), 256, 2, true, unity.data()) != 0,
-	      "Bluetooth speaker did not accept its final short block");
-	Check(Libs::Controller::DualSenseBluetooth::Prepare(now * 1000000).empty(),
-	      "short final Bluetooth block sent before more audio could arrive");
-	Check(Libs::Controller::DualSenseBluetooth::Prepare(now * 1000000 +
-	                                                 Libs::Controller::DualSenseBluetooth::PERIOD_NS)
-	          .size() == 1,
-	      "short final Bluetooth block was never played");
-	speaker.reset();
+	Queue(complete, sound.data(), 1024);
+	Queue(partial, sound.data(), 256);
+	auto pending = Bluetooth::Prepare(now * 1000000);
+	Check(pending.size() == 1 && pending[0].audio[100] > 0.4f && pending[0].audio[1000] > 0.2f,
+	      "complete speaker stream waited for a partial peer instead of mixing available audio");
+}
+
+void TestBluetoothShortFinalBlock() {
+	for (bool speaker: {false, true}) {
+		Fixture f;
+		wireless = hid_available = true;
+		auto               port  = Open(speaker);
+		std::vector<float> sound(2048, 0.25f);
+		Queue(port, sound.data(), 256);
+		const auto base = now * 1000000;
+		Check(Bluetooth::Prepare(base).empty(),
+		      "short final Bluetooth block sent before more audio could arrive");
+		Check(Bluetooth::Prepare(base + Bluetooth::PERIOD_NS).size() == 1,
+		      "short final Bluetooth block was never played");
+	}
 }
 
 void TestBluetoothOverflowKeepsRecentAudio() {
@@ -859,6 +1033,15 @@ void TestUsbOverflowKeepsRecentAudio() {
 	              sizeof(first) &&
 	          first[0] > 0.15f && first[0] < 0.25f,
 	      "USB queue overflow did not preserve the newest buffered audio");
+	// A single oversized input must also preserve only its newest 80 ms.
+	sound.assign(4096 * 2, 0.1f);
+	std::fill(sound.begin() + 256 * 2, sound.end(), 0.5f);
+	const auto queued = Haptics::Queue(speaker.get(), 1, sound.data(), 4096, 2, true, unity.data());
+	Check(queued == 80000 && SDL_GetAudioStreamQueued(streams.back()) == 3840 * 4 * sizeof(float) &&
+	          SDL_GetAudioStreamData(streams.back(), first.data(), sizeof(first)) ==
+	              sizeof(first) &&
+	          first[0] == 0.5f && first[1] == 0.5f,
+	      "oversized USB block did not retain only the newest 80 ms");
 	speaker.reset();
 }
 
@@ -971,8 +1154,16 @@ int main() {
 	TestSpeakerRequiresUnambiguousUsbDevice();
 	TestBluetoothAudioAndIdentity();
 	TestBluetoothFailureFallsBack();
+	TestBluetoothFormatsAndRoutingFailure();
 	TestBluetoothEncodingDoesNotBlockAudioQueue();
+	TestBluetoothCloseCancelsPreparedReport();
+	TestBluetoothCloseDuringEncoding();
+	TestBluetoothCloseWaitsForWriteWithoutBlockingQueue();
 	TestBluetoothSpeakerWaitsForItsAudioBlock();
+	TestBluetoothShortHapticBlock();
+	TestBluetoothIncrementalBatchCoalesces();
+	TestBluetoothLowRateCompleteBlock();
+	TestBluetoothCompleteStreamDoesNotWaitForPartialPeer();
 	TestBluetoothShortFinalBlock();
 	TestBluetoothOverflowKeepsRecentAudio();
 	TestBluetoothHapticOverflowKeepsRecentAudio();

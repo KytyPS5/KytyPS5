@@ -26,7 +26,8 @@ struct Stream {
 
 namespace {
 
-constexpr int      FRAME_BYTES = 4 * sizeof(float);
+constexpr int      FRAME_BYTES  = 4 * sizeof(float);
+constexpr uint32_t MAX_QUEUE_MS = 80;
 Common::Mutex      g_mutex;
 int                g_controller      = -1;
 int                g_haptics_streams = 0;
@@ -153,9 +154,6 @@ bool CanUseDevice(int controller) {
 	// SDL exposes no portable association between a gamepad and its USB audio endpoint.
 	// Require one wired DualSense; guessing with multiple pads could play on the wrong one.
 	SDL_LockJoysticks();
-	auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(controller));
-	bool  usable =
-	    pad != nullptr && SDL_GetGamepadConnectionState(pad) == SDL_JOYSTICK_CONNECTION_WIRED;
 	int   count                 = 0;
 	auto* pads                  = SDL_GetGamepads(&count);
 	int   wired_dualsense_count = 0;
@@ -170,7 +168,7 @@ bool CanUseDevice(int controller) {
 	}
 	SDL_free(pads);
 	SDL_UnlockJoysticks();
-	return usable && found && wired_dualsense_count == 1;
+	return found && wired_dualsense_count == 1;
 }
 
 SDL_AudioDeviceID FindDevice() {
@@ -193,32 +191,42 @@ SDL_AudioDeviceID FindDevice() {
 	return device;
 }
 
-void RefreshDevice(Stream* stream, int controller) {
-	if (stream->controller != controller) {
+void RefreshDevice(Stream* stream, int controller, bool wireless) {
+	if (stream->controller != controller || (wireless && stream->sdl != nullptr) ||
+	    (!wireless && stream->bluetooth != nullptr)) {
 		CloseDevice(stream);
 		stream->controller = controller;
 		stream->next_check = 0;
 	}
 	const auto now = SDL_GetTicks();
-	if (now < stream->next_check) {
+	if (stream->bluetooth != nullptr || now < stream->next_check) {
 		return;
 	}
 	stream->next_check = now + 2000;
-	const auto device  = FindDevice();
+	const auto device  = wireless ? 0 : FindDevice();
 	if (stream->device == device && stream->sdl != nullptr) {
 		return;
 	}
 	CloseDevice(stream);
 	stream->device = device;
-	if (device == 0) {
+	if (!wireless && device == 0) {
 		return;
 	}
-	const SDL_AudioSpec desired {SDL_AUDIO_F32, 4, static_cast<int>(stream->freq)};
-	auto*               sdl = SDL_OpenAudioDeviceStream(device, &desired, UpdateRumble, nullptr);
-	SDL_AudioSpec       actual {};
-	bool                ready = sdl != nullptr &&
-	             SDL_GetAudioDeviceFormat(SDL_GetAudioStreamDevice(sdl), &actual, nullptr) &&
-	             actual.channels == 4 && SDL_ResumeAudioStreamDevice(sdl);
+	SDL_AudioStream*            sdl       = nullptr;
+	DualSenseBluetooth::Stream* bluetooth = nullptr;
+	bool                        ready;
+	if (wireless) {
+		bluetooth = DualSenseBluetooth::Open(stream->freq, stream->speaker, controller,
+		                                     UpdateBluetoothRumble);
+		ready     = bluetooth != nullptr;
+	} else {
+		const SDL_AudioSpec desired {SDL_AUDIO_F32, 4, static_cast<int>(stream->freq)};
+		SDL_AudioSpec       actual {};
+		sdl   = SDL_OpenAudioDeviceStream(device, &desired, UpdateRumble, nullptr);
+		ready = sdl != nullptr &&
+		        SDL_GetAudioDeviceFormat(SDL_GetAudioStreamDevice(sdl), &actual, nullptr) &&
+		        actual.channels == 4 && SDL_ResumeAudioStreamDevice(sdl);
+	}
 	if (ready) {
 		Common::LockGuard lock(g_mutex);
 		if (stream->speaker) {
@@ -231,12 +239,54 @@ void RefreshDevice(Stream* stream, int controller) {
 		}
 	}
 	if (ready) {
-		stream->sdl = sdl;
-		LOGF("DualSenseHaptics: playing on '%s'\n", SDL_GetAudioDeviceName(device));
+		stream->sdl       = sdl;
+		stream->bluetooth = bluetooth;
+		if (!wireless) {
+			LOGF("DualSenseHaptics: playing on '%s'\n", SDL_GetAudioDeviceName(device));
+		}
 	} else {
+		DualSenseBluetooth::Close(bluetooth);
 		SDL_DestroyAudioStream(sdl);
-		LOGF("DualSenseHaptics: cannot open quad output: %s\n", SDL_GetError());
+		if (!wireless) {
+			LOGF("DualSenseHaptics: cannot open quad output: %s\n", SDL_GetError());
+		}
 	}
+}
+
+uint64_t QueueUsbAudio(Stream* stream, uint32_t frames) {
+	auto      queued = std::max(0, SDL_GetAudioStreamQueued(stream->sdl));
+	const int bytes  = static_cast<int>(frames * FRAME_BYTES);
+	const int max_bytes =
+	    static_cast<int>(static_cast<uint64_t>(stream->freq) * FRAME_BYTES * MAX_QUEUE_MS / 1000);
+	if (queued + bytes > max_bytes) {
+		// Keep the newest sound after a brief device stall. Clearing the entire
+		// stream produces a gap that is much longer than one audio block.
+		SDL_AudioSpec              target {};
+		std::array<uint8_t, 16384> discarded {};
+		if (SDL_GetAudioStreamFormat(stream->sdl, nullptr, &target)) {
+			const int frame_bytes = SDL_AUDIO_FRAMESIZE(target);
+			if (frame_bytes > 0) {
+				const int chunk_frames =
+				    std::min<int>(static_cast<int>(discarded.size()) / frame_bytes,
+				                  static_cast<int>((static_cast<uint64_t>(frames) * target.freq +
+				                                    stream->freq - 1) /
+				                                   stream->freq));
+				while (queued + bytes > max_bytes && chunk_frames > 0 &&
+				       SDL_GetAudioStreamData(stream->sdl, discarded.data(),
+				                              chunk_frames * frame_bytes) > 0) {
+					queued = std::max(0, SDL_GetAudioStreamQueued(stream->sdl));
+				}
+			}
+		}
+		if (queued + bytes > max_bytes) {
+			SDL_ClearAudioStream(stream->sdl);
+			queued = 0;
+		}
+	}
+	if (!SDL_PutAudioStreamData(stream->sdl, stream->buffer.data(), bytes)) {
+		return 0;
+	}
+	return static_cast<uint64_t>(queued + bytes) * 1000000 / (stream->freq * FRAME_BYTES);
 }
 
 } // namespace
@@ -265,88 +315,21 @@ uint64_t Queue(Stream* stream, int controller, const void* data, uint32_t frames
 	if (stream == nullptr || data == nullptr || frames == 0 || channels == 0 || volume == nullptr) {
 		return 0;
 	}
-	if (IsWireless(controller)) {
-		if (stream->controller != controller || stream->sdl != nullptr) {
-			CloseDevice(stream);
-			stream->controller = controller;
-			stream->next_check = 0;
-		}
-		const auto now = SDL_GetTicks();
-		if (stream->bluetooth == nullptr && now >= stream->next_check) {
-			stream->next_check = now + 2000;
-			stream->bluetooth  = DualSenseBluetooth::Open(stream->freq, stream->speaker, controller,
-			                                              UpdateBluetoothRumble);
-			if (stream->bluetooth != nullptr) {
-				Common::LockGuard lock(g_mutex);
-				if (stream->speaker) {
-					if (SelectSpeaker(controller)) {
-						g_speaker_streams[controller]++;
-					} else {
-						DualSenseBluetooth::Close(stream->bluetooth);
-						stream->bluetooth = nullptr;
-					}
-				} else {
-					g_haptics_streams++;
-				}
-			}
-		}
-		if (stream->bluetooth == nullptr) {
-			return 0;
-		}
-		if (stream->speaker) {
-			bool routed;
-			{
-				Common::LockGuard lock(g_mutex);
-				routed = SelectSpeaker(controller);
-			}
-			if (!routed) {
-				CloseDevice(stream);
-				return 0;
-			}
-		}
-		stream->buffer.resize(static_cast<size_t>(frames) * 2);
-		bool audible = false;
-		for (uint32_t frame = 0; frame < frames; frame++) {
-			for (uint32_t ch = 0; ch < 2; ch++) {
-				const auto source =
-				    static_cast<size_t>(frame) * channels + (channels == 1 ? 0 : ch);
-				float value = is_float ? static_cast<const float*>(data)[source]
-				                       : static_cast<const int16_t*>(data)[source] / 32768.0f;
-				value *= volume[channels == 1 ? 0 : ch] / 32768.0f;
-				stream->buffer[static_cast<size_t>(frame) * 2 + ch] = value;
-				audible |= std::isfinite(value) && std::fabs(value) > 1.0f / 1024;
-			}
-		}
-		const auto queued_us =
-		    DualSenseBluetooth::Queue(stream->bluetooth, stream->buffer.data(), frames);
-		if (queued_us == 0) {
-			CloseDevice(stream);
-			stream->next_check = now + 2000;
-			return 0;
-		}
-		if (audible && !stream->speaker) {
-			Common::LockGuard lock(g_mutex);
-			SelectController(controller);
-			const bool starting = g_haptics_until <= now;
-			g_haptics_until =
-			    std::max(g_haptics_until, now + std::max<uint64_t>(queued_us / 1000, 250));
-			if (starting) {
-				ApplyRumble();
-			}
-		}
-		return queued_us;
+	const auto max_frames =
+	    static_cast<uint32_t>(static_cast<uint64_t>(stream->freq) * MAX_QUEUE_MS / 1000);
+	const auto first_frame = frames > max_frames ? frames - max_frames : 0;
+	frames -= first_frame;
+	if (frames == 0) {
+		return 0;
 	}
-	if (stream->bluetooth != nullptr) {
-		CloseDevice(stream);
-		stream->next_check = 0;
-	}
-	if (!CanUseDevice(controller)) {
+	const bool wireless = IsWireless(controller);
+	if (!wireless && !CanUseDevice(controller)) {
 		CloseDevice(stream);
 		stream->next_check = 0; // Look for the device as soon as a DualSense is active again.
 		return 0;
 	}
-	RefreshDevice(stream, controller);
-	if (stream->sdl == nullptr) {
+	RefreshDevice(stream, controller, wireless);
+	if (stream->sdl == nullptr && stream->bluetooth == nullptr) {
 		return 0;
 	}
 	if (stream->speaker) {
@@ -360,67 +343,41 @@ uint64_t Queue(Stream* stream, int controller, const void* data, uint32_t frames
 			return 0;
 		}
 	}
-	stream->buffer.assign(static_cast<size_t>(frames) * 4, 0.0f);
+	const uint32_t output_channels = wireless ? 2 : 4;
+	const uint32_t channel_offset  = wireless || stream->speaker ? 0 : 2;
+	stream->buffer.assign(static_cast<size_t>(frames) * output_channels, 0.0f);
 	bool audible = false;
 	for (uint32_t frame = 0; frame < frames; frame++) {
 		for (uint32_t ch = 0; ch < 2; ch++) {
 			const auto src_ch = channels == 1 ? 0 : ch;
-			const auto index  = static_cast<size_t>(frame) * channels + src_ch;
+			const auto index  = (static_cast<size_t>(first_frame) + frame) * channels + src_ch;
 			float      value  = is_float ? static_cast<const float*>(data)[index]
 			                             : static_cast<const int16_t*>(data)[index] / 32768.0f;
 			value *= volume[src_ch] / 32768.0f;
-			// The speaker plays the right front channel; the actuators play the back ones.
-			stream->buffer[static_cast<size_t>(frame) * 4 + ch + (stream->speaker ? 0 : 2)] = value;
-			audible |= std::fabs(value) > 1.0f / 1024;
-		}
-	}
-	auto queued = std::max(0, SDL_GetAudioStreamQueued(stream->sdl));
-	const int  bytes = static_cast<int>(frames * FRAME_BYTES);
-	const int  max_bytes = static_cast<int>(stream->freq * FRAME_BYTES * 80 / 1000);
-	if (queued + bytes > max_bytes) {
-		// Keep the newest sound after a brief device stall. Clearing the entire
-		// stream produces a gap that is much longer than one audio block.
-		SDL_AudioSpec target {};
-		std::array<uint8_t, 16384> discarded {};
-		if (SDL_GetAudioStreamFormat(stream->sdl, nullptr, &target)) {
-			const int frame_bytes = SDL_AUDIO_FRAMESIZE(target);
-			if (frame_bytes > 0) {
-				const int chunk_frames = std::min<int>(
-				    static_cast<int>(discarded.size()) / frame_bytes,
-				    static_cast<int>((static_cast<uint64_t>(frames) * target.freq + stream->freq - 1) /
-				                     stream->freq));
-				while (queued + bytes > max_bytes && chunk_frames > 0 &&
-				       SDL_GetAudioStreamData(stream->sdl, discarded.data(),
-				                              chunk_frames * frame_bytes) > 0) {
-					queued = std::max(0, SDL_GetAudioStreamQueued(stream->sdl));
-				}
-			}
-		}
-		if (queued + bytes > max_bytes) {
-			SDL_ClearAudioStream(stream->sdl);
-			queued = 0;
+			// USB places the speaker in front and the actuators in back; Bluetooth takes stereo.
+			stream->buffer[static_cast<size_t>(frame) * output_channels + ch + channel_offset] =
+			    value;
+			audible |= std::isfinite(value) && std::fabs(value) > 1.0f / 1024;
 		}
 	}
 	const auto queued_us =
-	    static_cast<uint64_t>(queued + bytes) * 1000000 / (stream->freq * FRAME_BYTES);
+	    wireless ? DualSenseBluetooth::Queue(stream->bluetooth, stream->buffer.data(), frames)
+	             : QueueUsbAudio(stream, frames);
+	if (queued_us == 0) {
+		CloseDevice(stream);
+		stream->next_check = SDL_GetTicks() + 2000;
+		return 0;
+	}
 	if (audible && !stream->speaker) {
 		Common::LockGuard lock(g_mutex);
-		if (SDL_GetGamepadTypeForID(static_cast<SDL_JoystickID>(controller)) !=
-		    SDL_GAMEPAD_TYPE_PS5) {
-			return 0;
-		}
 		SelectController(controller);
-		const auto playback_now = SDL_GetTicks();
-		const bool starting     = g_haptics_until <= playback_now;
+		const auto now      = SDL_GetTicks();
+		const bool starting = g_haptics_until <= now;
 		g_haptics_until =
-		    std::max(g_haptics_until, playback_now + std::max<uint64_t>(queued_us / 1000, 250));
+		    std::max(g_haptics_until, now + std::max<uint64_t>(queued_us / 1000, 250));
 		if (starting) {
 			ApplyRumble();
 		}
-	}
-	if (!SDL_PutAudioStreamData(stream->sdl, stream->buffer.data(), bytes)) {
-		CloseDevice(stream);
-		return 0;
 	}
 	return queued_us;
 }

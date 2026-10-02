@@ -110,8 +110,7 @@ struct Session {
 	std::atomic<bool>     active {true};
 	std::atomic<bool>     failed {false};
 	std::atomic<uint64_t> generation {0};
-	uint64_t              next_send = 0;
-	uint64_t              pending_since = 0;
+	uint64_t              next_send        = 0;
 	uint64_t              pending_deadline = 0;
 	uint8_t               sequence  = 0;
 	uint8_t               counter   = 0;
@@ -172,44 +171,38 @@ struct PendingReport {
 };
 
 bool PrepareReport(Session& session, PendingReport& pending, uint64_t now) {
-	bool has_data     = false;
-	bool has_speaker  = false;
-	bool speaker_data = false;
-	bool partial      = false;
+	bool has_data      = false;
+	bool ready         = false;
+	bool speaker_ready = false;
 	for (const auto* stream: session.streams) {
-		const int available = SDL_GetAudioStreamAvailable(stream->audio);
-		has_data |= available > 0;
-		if (stream->speaker) {
-			has_speaker  = true;
-			speaker_data |= available > 0;
-			// SDL holds a few input frames for resampler lookahead. Up to 16
-			// missing output frames at a block boundary are harmless; a genuinely
-			// short block should wait for its remaining samples.
-			partial |= available > 0 &&
-			           available < static_cast<int>((pending.audio.size() - 16 * 2) * sizeof(float));
-		}
+		const bool available = SDL_GetAudioStreamAvailable(stream->audio) > 0;
+		// Both payloads cover 64 / 3000 seconds. Measure input duration so SDL's
+		// resampler lookahead does not make a complete block appear partial.
+		const auto frames =
+		    (static_cast<uint64_t>(stream->freq) * (HAPTIC_REPORT_FLOATS / 2) + HAPTIC_RATE - 1) /
+		    HAPTIC_RATE;
+		const bool full = available && SDL_GetAudioStreamQueued(stream->audio) >=
+		                                   static_cast<int>(frames * 2 * sizeof(float));
+		has_data |= available;
+		ready |= full;
+		speaker_ready |= stream->speaker && full;
 		pending.speaker |= stream->speaker;
 	}
 	if (!has_data) {
-		session.pending_since = 0;
 		session.pending_deadline = 0;
 		return false;
 	}
-	if (partial || (has_speaker && !speaker_data) ||
-	    (session.next_send == 0 && !has_speaker)) {
-		if (session.pending_since == 0) {
-			session.pending_since = now;
-		}
-		// SDL needs a few input frames of lookahead when resampling. Sending as soon
-		// as any samples appear pads most of a short block with silence. When
-		// haptics arrive first, briefly wait for the speaker stream in the same
-		// emulated audio batch.
-		session.pending_deadline = session.pending_since + (partial ? PERIOD_NS : COALESCE_NS);
+	if (!ready || (!speaker_ready && (pending.speaker || session.next_send == 0))) {
+		// Accumulate short blocks for at most one report period. A full stream
+		// must not wait on a partial peer; only briefly coalesce haptics with
+		// speaker audio arriving in the same emulated batch.
+		const auto deadline = now + (ready ? COALESCE_NS : PERIOD_NS);
+		session.pending_deadline =
+		    session.pending_deadline == 0 ? deadline : std::min(session.pending_deadline, deadline);
 		if (now < session.pending_deadline) {
 			return false;
 		}
 	}
-	session.pending_since = 0;
 	session.pending_deadline = 0;
 	std::array<float, HAPTIC_REPORT_FLOATS> haptics {};
 	for (auto* stream: session.streams) {
@@ -377,7 +370,6 @@ Stream* Open(uint32_t freq, bool speaker, int controller, void (*tick)()) {
 	g_tick       = tick;
 	auto* stream = new Stream {session, audio, freq, speaker};
 	session->streams.push_back(stream);
-	session->pending_since = 0;
 	session->pending_deadline = 0;
 	g_sessions[controller] = session;
 	g_wake.notify_one();
@@ -434,7 +426,6 @@ void Close(Stream* stream) {
 		auto&           streams = session->streams;
 		streams.erase(std::remove(streams.begin(), streams.end(), stream), streams.end());
 		session->generation++;
-		session->pending_since = 0;
 		session->pending_deadline = 0;
 		if (streams.empty()) {
 			session->active = false;

@@ -223,7 +223,13 @@ void GameController::CycleSetting(Setting setting) {
 
 float GameController::GetSettingScale(Setting setting) const {
 	const auto step = m_setting_steps[static_cast<size_t>(setting)].load(std::memory_order_relaxed);
-	return setting == Setting::SpeakerVolume ? SPEAKER_VOLUME[step] : INTENSITY[step];
+	if (setting == Setting::SpeakerVolume) {
+		return SPEAKER_VOLUME[step] * (Config::GetControllerSpeakerVolume() / 100.0f);
+	}
+	if (setting == Setting::VibrationIntensity) {
+		return INTENSITY[step] * (Config::GetControllerVibrationIntensity() / 100.0f);
+	}
+	return INTENSITY[step];
 }
 
 static uint8_t Scale(uint8_t value, float scale) {

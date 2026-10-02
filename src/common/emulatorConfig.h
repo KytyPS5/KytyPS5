@@ -48,6 +48,8 @@ struct ConfigOptions {
 	int32_t                user_id                     = DEFAULT_USER_ID;
 	std::string            audio_input_device;
 	std::optional<ControllerColor> controller_color;
+	uint32_t               controller_speaker_volume      = 100;
+	uint32_t               controller_vibration_intensity = 100;
 	PresentMode            present_mode                = PresentMode::Mailbox;
 	int32_t                gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
@@ -86,6 +88,8 @@ const std::string& GetUserName();
 int32_t  GetUserId();
 const std::string& GetAudioInputDevice();
 const std::optional<ControllerColor>& GetControllerColor();
+uint32_t GetControllerSpeakerVolume();
+uint32_t GetControllerVibrationIntensity();
 PresentMode GetPresentMode();
 int32_t GetGpuIndex();
 bool     FullscreenEnabled();

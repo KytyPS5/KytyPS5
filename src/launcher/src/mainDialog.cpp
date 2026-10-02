@@ -231,6 +231,8 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	if (!info.controller_color.isEmpty()) {
 		args << "--controller-color" << info.controller_color;
 	}
+	args << "--controller-volume" << QString::number(info.controller_speaker_volume);
+	args << "--controller-vibration" << QString::number(info.controller_vibration_intensity);
 	args << "--present-mode" << EnumToText(info.present_mode);
 	if (info.gpu_index >= 0) {
 		args << "--gpu" << QString::number(info.gpu_index);

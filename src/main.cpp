@@ -54,6 +54,8 @@ static void PrintUsage() {
 	         Config::DEFAULT_USER_ID);
 	::printf("  --mic <name>                        Capture from this microphone; omit for silence.\n");
 	::printf("  --controller-color <#RRGGBB>        Override the controller lightbar color.\n");
+	::printf("  --controller-volume <0-100>         DualSense speaker volume. Default: 100.\n");
+	::printf("  --controller-vibration <0-100>      DualSense vibration intensity. Default: 100.\n");
 	::printf(
 	    "  --present-mode <value>               Fifo, Mailbox, or Immediate. Default: Mailbox.\n");
 	::printf(
@@ -324,6 +326,18 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				return false;
 			}
 			options.config.controller_color = color;
+		} else if (arg == "--controller-volume") {
+			if (!ParseUint32(value, options.config.controller_speaker_volume) ||
+			    options.config.controller_speaker_volume > 100) {
+				::printf("invalid controller volume: %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--controller-vibration") {
+			if (!ParseUint32(value, options.config.controller_vibration_intensity) ||
+			    options.config.controller_vibration_intensity > 100) {
+				::printf("invalid controller vibration intensity: %s\n", value.c_str());
+				return false;
+			}
 		} else if (arg == "--present-mode") {
 			if (!ParseEnum(value, options.config.present_mode)) {
 				::printf("invalid present mode: %s\n", value.c_str());

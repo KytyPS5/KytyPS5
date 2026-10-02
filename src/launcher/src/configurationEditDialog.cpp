@@ -23,6 +23,7 @@
 #include <QPushButton>
 #include <QResizeEvent>
 #include <QSettings>
+#include <QSlider>
 #include <QSpinBox>
 #include <QStyle>
 #include <QToolButton>
@@ -39,7 +40,7 @@
 
 constexpr char SETTINGS_CFG_DIALOG[]               = "ConfigurationEditDialog";
 constexpr char SETTINGS_CFG_LAST_GEOMETRY[]        = "geometry";
-constexpr int  GLOBAL_SETTINGS_GAME_DIRS_MIN_WIDTH = 560;
+constexpr int  GLOBAL_SETTINGS_GAME_DIRS_MIN_WIDTH = 400;
 
 static void UpdateControllerColorButton(QPushButton* button, const QString& hex) {
 	const QColor color(hex);
@@ -123,6 +124,7 @@ ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* p
       m_info(info) {
 	m_ui->setupUi(this);
 	InitGameDirectories();
+	m_ui->controller_group->setVisible(false);
 
 	connect(m_ui->ok_button, &QPushButton::clicked, this, &ConfigurationEditDialog::save);
 	connect(m_ui->cancel_button, &QPushButton::clicked, this, &QDialog::reject);
@@ -141,6 +143,12 @@ ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* p
 	connect(m_ui->button_controller_color_reset, &QPushButton::clicked, this, [this]() {
 		UpdateControllerColorButton(m_ui->button_controller_color, {});
 		emit PreviewControllerColor({});
+	});
+	connect(m_ui->slider_controller_vibration, &QSlider::valueChanged, this, [this](int value) {
+		m_ui->label_controller_vibration_value->setText(tr("%1%").arg(value));
+	});
+	connect(m_ui->slider_controller_volume, &QSlider::valueChanged, this, [this](int value) {
+		m_ui->label_controller_volume_value->setText(tr("%1%").arg(value));
 	});
 	connect(m_ui->comboBox_shader_log_direction, &QComboBox::currentTextChanged, this,
 	        [this](const QString& text) {
@@ -202,6 +210,8 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->lineEdit_user_name->setText(info.user_name);
 	m_ui->spinBox_user_id->setValue(info.user_id);
 	UpdateControllerColorButton(m_ui->button_controller_color, info.controller_color);
+	m_ui->slider_controller_vibration->setValue(info.controller_vibration_intensity);
+	m_ui->slider_controller_volume->setValue(info.controller_speaker_volume);
 	auto* microphone = m_ui->comboBox_audio_input_device;
 	microphone->clear();
 	microphone->addItem(tr("None"), QString {});
@@ -352,6 +362,7 @@ void ConfigurationEditDialog::SetGameDirectories(const QStringList& dirs) {
 	}
 
 	m_game_dirs_group->setVisible(true);
+	m_ui->controller_group->setVisible(true);
 	update_game_directory_buttons();
 	layout()->activate();
 	resize(size().expandedTo(minimumSizeHint()));
@@ -403,7 +414,11 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui) {
 	info.user_name = ui.lineEdit_user_name->text().trimmed();
 	info.user_id   = ui.spinBox_user_id->value();
 	info.audio_input_device = ui.comboBox_audio_input_device->currentData().toString();
-	info.controller_color   = ui.button_controller_color->property("controllerColor").toString();
+	if (ui.controller_group->isVisible()) {
+		info.controller_color               = ui.button_controller_color->property("controllerColor").toString();
+		info.controller_vibration_intensity = ui.slider_controller_vibration->value();
+		info.controller_speaker_volume      = ui.slider_controller_volume->value();
+	}
 	info.screen_resolution =
 	    TextToEnum<Configuration::Resolution>(ui.comboBox_screen_resolution->currentText());
 	info.present_mode =

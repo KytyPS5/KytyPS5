@@ -23,6 +23,7 @@ void Load(const ConfigOptions& cfg) {
 	EXIT_IF(g_config == nullptr);
 	EXIT_IF(cfg.user_name.empty() || cfg.user_name.size() > MAX_USER_NAME_LENGTH);
 	EXIT_IF(!IsConfiguredUserIdValid(cfg.user_id));
+	EXIT_IF(cfg.controller_speaker_volume > 100 || cfg.controller_vibration_intensity > 100);
 
 	*g_config = cfg;
 }
@@ -49,6 +50,14 @@ const std::string& GetAudioInputDevice() {
 
 const std::optional<ControllerColor>& GetControllerColor() {
 	return g_config->controller_color;
+}
+
+uint32_t GetControllerSpeakerVolume() {
+	return g_config->controller_speaker_volume;
+}
+
+uint32_t GetControllerVibrationIntensity() {
+	return g_config->controller_vibration_intensity;
 }
 
 PresentMode GetPresentMode() {

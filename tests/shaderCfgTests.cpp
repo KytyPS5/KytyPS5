@@ -236,6 +236,14 @@ std::string DisassembleSpirvBinary(const std::vector<uint32_t> &binary) {
   return std::string(source.c_str());
 }
 
+void SetEnvForTest(const char *name, const char *value) {
+#ifdef _WIN32
+  _putenv_s(name, value);
+#else
+  setenv(name, value, 1);
+#endif
+}
+
 uint32_t CountSourceOccurrences(const std::string &source, const char *needle) {
   uint32_t count = 0;
   size_t from = 0;
@@ -14884,13 +14892,28 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
 
   // The baselines above run with the loop watchdog off. With it on, the guarded
   // structured loop and the dispatcher loop must still validate and carry a counter.
-  setenv("KYTY_SHADER_LOOP_LIMIT", "65536", 1);
+  SetEnvForTest("KYTY_SHADER_LOOP_LIMIT", "65536");
   {
     auto options = MakeCompileOptions(ShaderType::Compute);
     const auto guarded_structured = RecompileForTest(structured_phi, options);
     CheckSpirvBinaryValidates(guarded_structured.spirv);
     Check(MeasureSpirv(guarded_structured.spirv).function_variables >= 1u,
           "loop watchdog added no counter to a structured loop");
+    // The break tests the cap, and so does the unconditional latch.
+    const auto guarded_source = DisassembleSpirvBinary(guarded_structured.spirv);
+    Check(CountSourceOccurrences(guarded_source, "OpUGreaterThanEqual") == 2u &&
+              CountSourceOccurrences(guarded_source, "OpSelect") == 1u,
+          "loop watchdog did not guard the structured loop break and latch");
+    const uint32_t endless[] = {
+        EncodeSop2(0x00, 0, 0, 129), // loop: s_add_u32 s0, s0, 1
+        EncodeSopp(0x02, 0xfffeu),   // s_branch loop
+        EncodeSopp(0x01),
+    };
+    const auto guarded_endless = RecompileForTest(endless, options);
+    CheckSpirvBinaryValidates(guarded_endless.spirv);
+    Check(CountSourceOccurrences(DisassembleSpirvBinary(guarded_endless.spirv),
+                                 "OpUGreaterThanEqual") == 1u,
+          "loop watchdog left a loop without any exit unbounded");
     const auto guarded_dispatcher = RecompileForTest(dispatcher, options);
     CheckSpirvBinaryValidates(guarded_dispatcher.spirv);
     Check(SpirvInstructionOpcodeCount(guarded_dispatcher.spirv, 245u) == 3u,
@@ -14898,14 +14921,14 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
   }
   // A value that is not a plain number must keep the watchdog on, not disable it.
   for (const char* bad: {"abc", "12x", "-1", "99999999999"}) {
-    setenv("KYTY_SHADER_LOOP_LIMIT", bad, 1);
+    SetEnvForTest("KYTY_SHADER_LOOP_LIMIT", bad);
     auto options = MakeCompileOptions(ShaderType::Compute);
     const auto result = RecompileForTest(structured_phi, options);
     CheckSpirvBinaryValidates(result.spirv);
     Check(MeasureSpirv(result.spirv).function_variables >= 1u,
           "non-numeric KYTY_SHADER_LOOP_LIMIT disabled the loop watchdog");
   }
-  setenv("KYTY_SHADER_LOOP_LIMIT", "0", 1);
+  SetEnvForTest("KYTY_SHADER_LOOP_LIMIT", "0");
 }
 
 #include "ShaderRayTracingTests.inc"
@@ -14918,7 +14941,7 @@ int main() {
 
   // Size baselines count every instruction. They are measured with the loop
   // watchdog off; TestNewShaderRecompilerSpirvSizeBaselines checks it separately.
-  setenv("KYTY_SHADER_LOOP_LIMIT", "0", 1);
+  SetEnvForTest("KYTY_SHADER_LOOP_LIMIT", "0");
   EnsureConfigInitialized();
   TestRayTracingInstructions();
   TestResourceDescriptorClassification();

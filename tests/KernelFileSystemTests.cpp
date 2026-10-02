@@ -29,6 +29,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #if defined(_WIN32)
@@ -769,15 +770,101 @@ void CheckSocketWakeup() {
                     deadline.data()) == 1 && readable[reader / 64] == bit,
         "select reports the guest descriptor after wake");
   std::array<char, sizeof(payload)> received {};
+  const int initial_waitall_result =
+      net_recv(reader, received.data(), received.size(), 0x40);
+  LogReceiveObservation("WAITALL with all bytes available", initial_waitall_result,
+                        received, *net_errno);
+  Check(initial_waitall_result == sizeof(payload) &&
+            std::memcmp(received.data(), payload, sizeof(payload)) == 0,
+        "WAITALL alone receives the queued TCP payload");
+
+  // WAITALL alone is supported by blocking Winsock TCP receives. Split the
+  // payload across two sends so the receive must wait for its second part.
+  std::atomic<int> split_send_result {-1};
+  std::thread waitall_sender([&] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    const int first = net_send(writer, payload, 2, 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    const int second = net_send(writer, payload + 2, sizeof(payload) - 2, 0);
+    split_send_result.store(first == 2 && second == sizeof(payload) - 2
+                                ? static_cast<int>(sizeof(payload))
+                                : -1,
+                            std::memory_order_release);
+  });
+  const int split_waitall_result =
+      net_recv(reader, received.data(), received.size(), 0x40);
+  waitall_sender.join();
+  LogReceiveObservation("WAITALL with split delivery", split_waitall_result, received,
+                        *net_errno);
+  Check(split_send_result.load(std::memory_order_acquire) == sizeof(payload),
+        "split-delivery sender transmits both payload parts");
+  Check(split_waitall_result == sizeof(payload),
+        "WAITALL waits for the complete split TCP payload");
+  Check(std::memcmp(received.data(), payload, sizeof(payload)) == 0,
+        "WAITALL with split delivery returns the complete payload");
+
+  // PEEK alone copies available bytes while leaving them queued for the next
+  // ordinary receive.
+  Check(net_send(writer, payload, sizeof(payload), 0) == sizeof(payload),
+        "send payload for PEEK-only check");
+  received.fill(0);
+  const int peek_result = net_recv(reader, received.data(), received.size(), 0x02);
+  LogReceiveObservation("PEEK alone", peek_result, received, *net_errno);
+  Check(peek_result == sizeof(payload) &&
+            std::memcmp(received.data(), payload, sizeof(payload)) == 0,
+        "PEEK alone returns available bytes");
+  received.fill(0);
+  Check(net_recv(reader, received.data(), received.size(), 0) == sizeof(payload) &&
+            std::memcmp(received.data(), payload, sizeof(payload)) == 0,
+        "PEEK alone leaves bytes for the following receive");
+
+  Check(net_send(writer, payload, 2, 0) == 2,
+        "send first part for split-delivery PEEK check");
+  received.fill(0);
+  const int split_peek_result =
+      net_recv(reader, received.data(), received.size(), 0x02);
+  LogReceiveObservation("PEEK with split delivery", split_peek_result, received,
+                        *net_errno);
+  Check(split_peek_result == 2 && std::memcmp(received.data(), payload, 2) == 0,
+        "PEEK returns currently available bytes from a split TCP payload");
+  Check(net_send(writer, payload + 2, sizeof(payload) - 2, 0) ==
+            sizeof(payload) - 2,
+        "send remaining part for split-delivery PEEK check");
+  received.fill(0);
+  Check(net_recv(reader, received.data(), received.size(), 0x40) == sizeof(payload) &&
+            std::memcmp(received.data(), payload, sizeof(payload)) == 0,
+        "split-delivery PEEK leaves initial bytes available for WAITALL");
+
+  // Windows rejects MSG_PEEK | MSG_WAITALL. Kyty must reproduce the guest
+  // behavior using its receive buffer, including when the TCP data is split.
+  received.fill(0);
+  split_send_result.store(-1, std::memory_order_relaxed);
+  std::thread peek_waitall_sender([&] {
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    const int first = net_send(writer, payload, 2, 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    const int second = net_send(writer, payload + 2, sizeof(payload) - 2, 0);
+    split_send_result.store(first == 2 && second == sizeof(payload) - 2
+                                ? static_cast<int>(sizeof(payload))
+                                : -1,
+                            std::memory_order_release);
+  });
   const int peek_waitall_result =
       net_recv(reader, received.data(), received.size(), 0x42);
+  peek_waitall_sender.join();
   LogReceiveObservation("PEEK|WAITALL", peek_waitall_result, received, *net_errno);
+  Check(split_send_result.load(std::memory_order_acquire) == sizeof(payload),
+        "split-delivery sender transmits both PEEK|WAITALL payload parts");
   Check(peek_waitall_result == sizeof(payload),
         "Net receive PEEK|WAITALL returns the requested length");
   Check(std::memcmp(received.data(), payload, sizeof(payload)) == 0,
         "Net receive PEEK|WAITALL returns the payload");
   Check(*net_errno == Libs::Posix::POSIX_EINVAL,
         "Net receive PEEK|WAITALL preserves guest errno");
+  readable[reader / 64] = bit;
+  Check(Net::Select(reader + 1, readable.data(), nullptr, nullptr,
+                    immediate.data()) == 1 && readable[reader / 64] == bit,
+        "select reports bytes buffered by PEEK|WAITALL");
   received.fill(0);
   const int waitall_result = net_recv(reader, received.data(), received.size(), 0x40);
   LogReceiveObservation("WAITALL after PEEK", waitall_result, received, *net_errno);

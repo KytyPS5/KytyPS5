@@ -863,6 +863,10 @@ struct SocketTransport {
 #endif
 	}
 	NativeSocket socket;
+#if defined(_WIN32)
+	std::mutex        receive_mutex;
+	std::vector<char> buffered_receive;
+#endif
 };
 
 struct P2pEndpoint {
@@ -1164,7 +1168,8 @@ static int ConvertHostSockaddr(const sockaddr_storage* addr, SocketLength addrle
 	return 0;
 }
 
-static bool GetSocketBackend(int guest_fd, NativeSocket* out, SocketSlot* state = nullptr) {
+static bool GetSocketBackend(int guest_fd, NativeSocket* out, SocketSlot* state = nullptr,
+                             std::shared_ptr<SocketTransport>* transport_out = nullptr) {
 	EXIT_IF(out == nullptr);
 
 	if (guest_fd < 0 || guest_fd >= SOCKET_FD_MAX) {
@@ -1188,7 +1193,23 @@ static bool GetSocketBackend(int guest_fd, NativeSocket* out, SocketSlot* state 
 	if (state != nullptr) {
 		*state = slot;
 	}
+	if (transport_out != nullptr) {
+		*transport_out = slot.transport;
+	}
 	return true;
+}
+
+static bool HasBufferedReceiveData(const std::shared_ptr<SocketTransport>& transport) {
+#if defined(_WIN32)
+	if (!transport) {
+		return false;
+	}
+	std::lock_guard lock(transport->receive_mutex);
+	return !transport->buffered_receive.empty();
+#else
+	(void)transport;
+	return false;
+#endif
 }
 
 bool KYTY_SYSV_ABI IsSocket(int s) {
@@ -1660,12 +1681,21 @@ int KYTY_SYSV_ABI EpollWait(int eid, NetEpollEvent* events, int maxevents, int t
 		host_timeout.tv_usec = timeout % 1000000;
 		host_timeout_ptr     = &host_timeout;
 	}
+	const bool has_buffered_input = std::any_of(
+	    host_registrations.begin(), host_registrations.end(), [](const auto& registration) {
+		    return !registration.state.p2p && (registration.guest.event.events & EPOLL_IN) != 0 &&
+		           HasBufferedReceiveData(registration.state.transport);
+	    });
+	if (has_buffered_input) {
+		host_timeout     = {};
+		host_timeout_ptr = &host_timeout;
+	}
 
 	const int result = ::select(host_nfds, &host_read, &host_write, &host_except, host_timeout_ptr);
 	if (result < 0) {
 		return SetHostSocketError();
 	}
-	if (result == 0) {
+	if (result == 0 && !has_buffered_input) {
 		return 0;
 	}
 
@@ -1673,7 +1703,8 @@ int KYTY_SYSV_ABI EpollWait(int eid, NetEpollEvent* events, int maxevents, int t
 	for (const auto& registration: host_registrations) {
 		uint32_t ready = 0;
 		if ((registration.guest.event.events & EPOLL_IN) != 0 &&
-		    FD_ISSET(registration.socket, &host_read)) {
+		    (FD_ISSET(registration.socket, &host_read) ||
+		     (!registration.state.p2p && HasBufferedReceiveData(registration.state.transport)))) {
 			if (registration.state.p2p) {
 				return SetGuestSocketError(Posix::POSIX_EOPNOTSUPP);
 			}
@@ -2228,7 +2259,12 @@ int64_t KYTY_SYSV_ABI Recvfrom(int s, void* buf, uint64_t len, int flags, void* 
 	}
 
 	NativeSocket socket = INVALID_NATIVE_SOCKET;
+#if defined(_WIN32)
+	std::shared_ptr<SocketTransport> transport;
+	if (!GetSocketBackend(s, &socket, nullptr, &transport)) {
+#else
 	if (!GetSocketBackend(s, &socket)) {
+#endif
 		return -1;
 	}
 
@@ -2239,6 +2275,102 @@ int64_t KYTY_SYSV_ABI Recvfrom(int s, void* buf, uint64_t len, int flags, void* 
 
 	const auto host_len = static_cast<SocketIoLength>(
 	    std::min<uint64_t>(len, std::numeric_limits<SocketIoLength>::max()));
+	if (host_len == 0) {
+		return 0;
+	}
+#if defined(_WIN32)
+	std::unique_lock receive_lock(transport->receive_mutex);
+	auto&            buffered        = transport->buffered_receive;
+	const bool       peek            = (flags & 0x00000002) != 0;
+	const bool       waitall         = (flags & 0x00000040) != 0;
+	int              socket_type     = 0;
+	SocketLength     socket_type_len = sizeof(socket_type);
+	const bool       is_stream =
+	    getsockopt(socket, SOL_SOCKET, SO_TYPE, reinterpret_cast<char*>(&socket_type),
+	               &socket_type_len) == 0 &&
+	    socket_type == SOCK_STREAM;
+	if (peek && waitall && is_stream) {
+		// Winsock rejects MSG_PEEK | MSG_WAITALL. Read into Kyty's per-transport
+		// queue until enough data is available, then expose it without consuming it.
+		std::array<char, 64 * 1024> temporary {};
+		while (buffered.size() < static_cast<size_t>(host_len)) {
+			const auto remaining = static_cast<size_t>(host_len) - buffered.size();
+			const auto request   = static_cast<int>(std::min(remaining, temporary.size()));
+			const int  received  = ::recv(socket, temporary.data(), request, 0);
+			if (received == 0) {
+				break;
+			}
+			if (received < 0) {
+				if (buffered.empty()) {
+					return SetHostSocketError();
+				}
+				break;
+			}
+			buffered.insert(buffered.end(), temporary.data(), temporary.data() + received);
+		}
+		const auto copied = std::min(buffered.size(), static_cast<size_t>(host_len));
+		std::memcpy(buf, buffered.data(), copied);
+		if (addr != nullptr) {
+			sockaddr_storage peer_addr {};
+			SocketLength     peer_addrlen = sizeof(peer_addr);
+			if (getpeername(socket, reinterpret_cast<sockaddr*>(&peer_addr), &peer_addrlen) != 0) {
+				return SetHostSocketError();
+			}
+			if (ConvertHostSockaddr(&peer_addr, peer_addrlen, addr, addrlen) != 0) {
+				return -1;
+			}
+		}
+		return static_cast<int64_t>(copied);
+	}
+	if (!buffered.empty()) {
+		const auto copied = std::min(buffered.size(), static_cast<size_t>(host_len));
+		std::memcpy(buf, buffered.data(), copied);
+		if (!peek) {
+			buffered.erase(buffered.begin(), buffered.begin() + static_cast<ptrdiff_t>(copied));
+		}
+		if (peek && copied < static_cast<size_t>(host_len)) {
+			const int received = ::recv(socket, static_cast<char*>(buf) + copied,
+			                            static_cast<int>(host_len - copied), host_flags);
+			if (received < 0 && copied == 0) {
+				return SetHostSocketError();
+			}
+			const auto total = static_cast<int64_t>(copied) + std::max(received, 0);
+			if (addr != nullptr) {
+				sockaddr_storage peer_addr {};
+				SocketLength     peer_addrlen = sizeof(peer_addr);
+				if (getpeername(socket, reinterpret_cast<sockaddr*>(&peer_addr), &peer_addrlen) !=
+				    0) {
+					return SetHostSocketError();
+				}
+				if (ConvertHostSockaddr(&peer_addr, peer_addrlen, addr, addrlen) != 0) {
+					return -1;
+				}
+			}
+			return total;
+		}
+		if (copied == static_cast<size_t>(host_len) || !waitall) {
+			if (addr != nullptr) {
+				sockaddr_storage peer_addr {};
+				SocketLength     peer_addrlen = sizeof(peer_addr);
+				if (getpeername(socket, reinterpret_cast<sockaddr*>(&peer_addr), &peer_addrlen) !=
+				    0) {
+					return SetHostSocketError();
+				}
+				if (ConvertHostSockaddr(&peer_addr, peer_addrlen, addr, addrlen) != 0) {
+					return -1;
+				}
+			}
+			return static_cast<int64_t>(copied);
+		}
+		const int received = ::recv(socket, static_cast<char*>(buf) + copied,
+		                            static_cast<int>(host_len - copied), host_flags);
+		if (received < 0) {
+			return static_cast<int64_t>(copied) > 0 ? static_cast<int64_t>(copied)
+			                                        : SetHostSocketError();
+		}
+		return static_cast<int64_t>(copied) + received;
+	}
+#endif
 	sockaddr_storage host_addr {};
 	SocketLength     host_addrlen = sizeof(host_addr);
 	int64_t          result       = 0;
@@ -2303,21 +2435,24 @@ int KYTY_SYSV_ABI Select(int nfds, void* readfds, void* writefds, void* exceptfd
 	FD_ZERO(&host_except);
 
 	std::vector<std::pair<int, NativeSocket>> descriptors;
-	int host_nfds = 0;
+	std::vector<int>                          buffered_readable;
+	int                                       host_nfds = 0;
 	for (int fd = 0; fd < nfds; fd++) {
-		const bool read = GuestFdIsSet(readfds, fd);
-		const bool write = GuestFdIsSet(writefds, fd);
+		const bool read   = GuestFdIsSet(readfds, fd);
+		const bool write  = GuestFdIsSet(writefds, fd);
 		const bool except = GuestFdIsSet(exceptfds, fd);
 		if (!read && !write && !except) {
 			continue;
 		}
 		NativeSocket socket = INVALID_NATIVE_SOCKET;
-#if !defined(_WIN32)
+#if defined(_WIN32)
+		std::shared_ptr<SocketTransport> transport;
+		if (!GetSocketBackend(fd, &socket, nullptr, &transport)) {
+#else
 		if (fd < 3) {
 			socket = fd;
-		} else
+		} else if (!GetSocketBackend(fd, &socket)) {
 #endif
-		if (!GetSocketBackend(fd, &socket)) {
 			return -1;
 		}
 #if defined(_WIN32)
@@ -2335,6 +2470,11 @@ int KYTY_SYSV_ABI Select(int nfds, void* readfds, void* writefds, void* exceptfd
 		descriptors.emplace_back(fd, socket);
 		if (read) {
 			FD_SET(socket, &host_read);
+#if defined(_WIN32)
+			if (HasBufferedReceiveData(transport)) {
+				buffered_readable.push_back(fd);
+			}
+#endif
 		}
 		if (write) {
 			FD_SET(socket, &host_write);
@@ -2344,7 +2484,7 @@ int KYTY_SYSV_ABI Select(int nfds, void* readfds, void* writefds, void* exceptfd
 		}
 	}
 
-	timeval host_timeout {};
+	timeval  host_timeout {};
 	timeval* host_timeout_ptr = nullptr;
 	if (timeout != nullptr) {
 		const auto* guest_timeout = static_cast<const NetTimeval*>(timeout);
@@ -2352,16 +2492,23 @@ int KYTY_SYSV_ABI Select(int nfds, void* readfds, void* writefds, void* exceptfd
 		    guest_timeout->tv_usec >= 1'000'000) {
 			return SetGuestSocketError(Posix::POSIX_EINVAL);
 		}
-		host_timeout.tv_sec = static_cast<decltype(host_timeout.tv_sec)>(guest_timeout->tv_sec);
+		host_timeout.tv_sec  = static_cast<decltype(host_timeout.tv_sec)>(guest_timeout->tv_sec);
 		host_timeout.tv_usec = static_cast<decltype(host_timeout.tv_usec)>(guest_timeout->tv_usec);
+		host_timeout_ptr     = &host_timeout;
+	}
+#if defined(_WIN32)
+	if (!buffered_readable.empty()) {
+		host_timeout     = {};
 		host_timeout_ptr = &host_timeout;
 	}
+#endif
 
 	int result = 0;
 #if defined(_WIN32)
 	if (descriptors.empty()) {
-		Sleep(host_timeout_ptr == nullptr ? INFINITE :
-		      static_cast<DWORD>(host_timeout.tv_sec * 1000 + host_timeout.tv_usec / 1000));
+		Sleep(host_timeout_ptr == nullptr
+		          ? INFINITE
+		          : static_cast<DWORD>(host_timeout.tv_sec * 1000 + host_timeout.tv_usec / 1000));
 	} else
 #endif
 	{
@@ -2387,6 +2534,19 @@ int KYTY_SYSV_ABI Select(int nfds, void* readfds, void* writefds, void* exceptfd
 			GuestFdSet(exceptfds, fd);
 		}
 	}
+#if defined(_WIN32)
+	for (const int fd: buffered_readable) {
+		GuestFdSet(readfds, fd);
+		const auto descriptor = std::find_if(descriptors.begin(), descriptors.end(),
+		                                     [fd](const auto& item) { return item.first == fd; });
+		EXIT_IF(descriptor == descriptors.end());
+		if (!FD_ISSET(descriptor->second, &host_read) &&
+		    !FD_ISSET(descriptor->second, &host_write) &&
+		    !FD_ISSET(descriptor->second, &host_except)) {
+			result++;
+		}
+	}
+#endif
 	return result;
 }
 

@@ -101,10 +101,14 @@ void TestUnpatchedAbortsUnderRosetta() {
 	}
 	int status = 0;
 	waitpid(child, &status, 0);
-	// The Rosetta behaviour this patch works around; native x86-64 runs exit cleanly. If a future
-	// Rosetta stops aborting here, this check flags that the split may no longer be needed.
-	Check(!IsRunningUnderRosetta() || WIFSIGNALED(status),
-	      "unpatched crossing store aborts under Rosetta");
+	// The Rosetta behaviour this patch works around; native x86-64 runs must exit cleanly. If a
+	// future Rosetta stops aborting here, this check flags that the split may no longer be needed.
+	if (IsRunningUnderRosetta()) {
+		Check(WIFSIGNALED(status), "unpatched crossing store aborts under Rosetta");
+	} else {
+		Check(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+		      "unpatched crossing store exits cleanly on native x86-64");
+	}
 	if (WIFSIGNALED(status)) {
 		std::printf("unpatched crossing store: child killed by signal %d (expected under Rosetta)\n",
 		            WTERMSIG(status));

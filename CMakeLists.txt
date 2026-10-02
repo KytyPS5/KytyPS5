@@ -488,6 +488,13 @@ add_executable(ngs2_sampler_tests EXCLUDE_FROM_ALL
 target_link_libraries(ngs2_sampler_tests common fmt::fmt LibAtrac9)
 target_include_directories(ngs2_sampler_tests PRIVATE ${inc_headers})
 
+add_executable(ngs2_rack_control_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/Ngs2RackControlTests.cpp"
+	"${KYTY_SOURCE_DIR}/loader/timer.cpp"
+)
+target_link_libraries(ngs2_rack_control_tests common fmt::fmt LibAtrac9)
+target_include_directories(ngs2_rack_control_tests PRIVATE ${inc_headers})
+
 add_executable(pad_haptics_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/PadHapticsTests.cpp"
 )

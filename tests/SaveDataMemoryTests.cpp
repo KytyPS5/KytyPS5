@@ -579,7 +579,8 @@ void TestClassicSaveParams() {
 
 void RunChild(const fs::path& executable, const char* mode) {
 #ifdef _WIN32
-	CHECK(_spawnl(_P_WAIT, executable.string().c_str(), executable.string().c_str(), mode,
+	const std::string quoted = "\"" + executable.string() + "\"";
+	CHECK(_spawnl(_P_WAIT, executable.string().c_str(), quoted.c_str(), mode,
 	              static_cast<char*>(nullptr)) == 0);
 #else
 	const pid_t pid = fork();

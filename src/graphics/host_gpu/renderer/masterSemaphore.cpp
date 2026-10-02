@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
@@ -83,6 +84,7 @@ void MasterSemaphore::ReportDeviceFault() {
 }
 
 void MasterSemaphore::Wait(uint64_t tick) {
+	KYTY_PROFILER_BLOCK("MasterSemaphore::Wait");
 	if (IsFree(tick)) {
 		return;
 	}

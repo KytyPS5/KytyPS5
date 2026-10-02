@@ -88,7 +88,9 @@ public:
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               ProcessFaultBuffer();
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
+	// Queues the uploads; FlushPendingUploads records them behind one barrier pair.
 	void               SynchronizeDirtyBuffersInRange(uint64_t vaddr, uint64_t size);
+	void               FlushPendingUploads();
 	void               RunGarbageCollector();
 
 private:
@@ -140,6 +142,13 @@ private:
 	RangeSet                                          m_gpu_modified_ranges;
 	std::unordered_map<uint64_t, uint64_t>            m_gpu_write_ticks;
 	std::atomic_uint64_t                              m_buffer_epoch {0};
+	struct PendingUpload {
+		vk::Buffer     destination;
+		vk::BufferCopy copy;
+	};
+	std::vector<PendingUpload>                        m_pending_uploads;
+	uint64_t                                          m_pending_upload_bytes = 0;
+	bool                                              m_defer_uploads        = false;
 	MemoryTracker                                     m_memory_tracker;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;

@@ -373,6 +373,16 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 	if (!is_storage) {
 		usage.usage &= ~vk::ImageUsageFlagBits::eStorage;
 	}
+	// A view may only claim usages its own format supports. The R64_UINT view used for 64-bit
+	// image atomics on a two-channel image cannot be sampled on NVIDIA, though the image can.
+	const auto features = m_graphics.GetFormatProperties(normalized.format).optimalTilingFeatures;
+	if (!(features & vk::FormatFeatureFlagBits::eSampledImage)) {
+		usage.usage &= ~(vk::ImageUsageFlagBits::eSampled |
+		                 vk::ImageUsageFlagBits::eAttachmentFeedbackLoopEXT);
+	}
+	if (!(features & vk::FormatFeatureFlagBits::eColorAttachment)) {
+		usage.usage &= ~vk::ImageUsageFlagBits::eColorAttachment;
+	}
 	vk::ImageViewMinLodCreateInfoEXT min_lod {};
 	if (normalized.min_lod != 0) {
 		min_lod.minLod = static_cast<float>(normalized.base_level) +

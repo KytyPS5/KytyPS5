@@ -11,6 +11,7 @@
 #include "common/threads.h"
 #include "common/timer.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/hostMemoryImport.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -1058,6 +1059,16 @@ void WindowContext::CreateVulkan() {
 				device_extensions.push_back(extension);
 			}
 		}
+		if (HasExtension(available_extensions, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+			vk::PhysicalDeviceExternalMemoryHostPropertiesEXT host_props {};
+			vk::PhysicalDeviceProperties2                     props2 {};
+			props2.pNext = &host_props;
+			graphic_ctx.physical_device.getProperties2(&props2);
+			graphic_ctx.external_memory_host_enabled = true;
+			graphic_ctx.min_imported_host_pointer_alignment =
+			    host_props.minImportedHostPointerAlignment;
+		}
 		if (HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME) &&
 		    HasExtension(available_extensions, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
@@ -1076,6 +1087,8 @@ void WindowContext::CreateVulkan() {
 	if (!graphic_ctx.CreateAllocator()) {
 		EXIT("Could not create Vulkan memory allocator");
 	}
+
+	ProbeHostMemoryImport(graphic_ctx);
 
 	render_context = std::make_unique<RenderContext>(graphic_ctx);
 	LibKernel::Memory::InstallGpuResources(render_context.get());

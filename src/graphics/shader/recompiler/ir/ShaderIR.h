@@ -74,7 +74,8 @@ struct MemoryInfo {
 
 	[[nodiscard]] bool SupportsIndirectBufferLoad(ValueOpcode opcode) const {
 		return !formatted && !typed && data_bits == 32u &&
-		       (opcode == ValueOpcode::LoadBufferU32x2 || opcode == ValueOpcode::LoadBufferU32x3 ||
+		       ((opcode == ValueOpcode::LoadBufferU32 && data_dwords == 1u) ||
+		        opcode == ValueOpcode::LoadBufferU32x2 || opcode == ValueOpcode::LoadBufferU32x3 ||
 		        opcode == ValueOpcode::LoadBufferU32x4);
 	}
 

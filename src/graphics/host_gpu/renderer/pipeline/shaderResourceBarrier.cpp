@@ -49,9 +49,11 @@ vk::PipelineStageFlags ShaderPipelineStages(vk::ShaderStageFlags stages) {
 vk::MemoryBarrier MakeShaderWriteDependency() {
 	vk::MemoryBarrier barrier {};
 	barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+	// Indirect reads included: a draw's shader can write the arguments of a later indirect draw.
 	barrier.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite |
 	                        vk::AccessFlagBits::eVertexAttributeRead |
 	                        vk::AccessFlagBits::eIndexRead | vk::AccessFlagBits::eUniformRead |
+	                        vk::AccessFlagBits::eIndirectCommandRead |
 	                        vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite |
 	                        vk::AccessFlagBits::eColorAttachmentRead |
 	                        vk::AccessFlagBits::eColorAttachmentWrite;

@@ -835,7 +835,7 @@ uint32_t LoadIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_
 		           Unary(state, spv::OpUConvert, TypeScalarU64(state), address.byte));
 		values[component] = LoadBda(ctx, guest, AndCondition(state, valid_format, in_bounds), 32u);
 	}
-	return ConstructU32Composite(state, components, values);
+	return components == 1u ? values[0] : ConstructU32Composite(state, components, values);
 }
 
 uint32_t LoadWideBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
@@ -1243,6 +1243,9 @@ void EmitLoadMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 		value = LoadWideBuffer(ctx, inst, buffer_components);
 	else if (shared_components > 1u)
 		value = LoadWideShared(ctx, inst, shared_components);
+	else if (mem.kind == IR::ResourceKind::IndirectBuffer)
+		value = EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1),
+		                                   [&]() { return LoadIndirectBuffer(ctx, inst, 1u); });
 	else if (mem.kind == IR::ResourceKind::ScalarAddress)
 		value = LoadBdaDword(ctx, GuestAddress(ctx, inst, mem));
 	else if (address_info.access == IR::AddressAccess::Read &&

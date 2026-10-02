@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/profiler.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/regionManager.h"
 #include "graphics/presentation/videoOut.h"
@@ -120,6 +121,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 }
 
 void RenderContext::PrepareBda() {
+	KYTY_PROFILER_BLOCK("RenderContext::PrepareBda");
 	if (!m_bda_logged) {
 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
 		m_bda_logged = true;
@@ -139,6 +141,7 @@ void RenderContext::PrepareBda() {
 	m_mapped_ranges.ForEach([this](uint64_t start, uint64_t end) {
 		m_buffer_cache.SynchronizeDirtyBuffersInRange(start, end - start);
 	});
+	m_buffer_cache.FlushPendingUploads();
 	m_fault_process_pending = true;
 }
 

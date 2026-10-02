@@ -679,6 +679,7 @@ void TextureCache::UntrackImageTail(ImageId id) {
 }
 
 void TextureCache::TrackImageDownload(ImageId id, Image& image) {
+	KYTY_PROFILER_BLOCK("TextureCache::TrackImageDownload");
 	// EXPERIMENT (diagnostic, not a fix): the `!image.info.IsTiled()` condition used to stand
 	// here, which excluded every render target, since they are all tiled. The game renders with
 	// the GPU and then reads that memory back as a texture, so with tiled targets barred from
@@ -703,6 +704,7 @@ void TextureCache::TrackImageDownload(ImageId id, Image& image) {
 
 TextureCache::ImageIds TextureCache::FindImagesInRegion(uint64_t address, uint64_t size,
                                                         bool page_overlap) const {
+	KYTY_PROFILER_BLOCK("TextureCache::FindImagesInRegion");
 	ImagePageTable::PageRange pages {};
 	if (!ImagePageTable::TryGetPageRange(address, size, pages)) {
 		return {};
@@ -1278,6 +1280,7 @@ TextureCache::ImageDownload TextureCache::BuildDownload(const Image& image) cons
 }
 
 void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_offset) {
+	KYTY_PROFILER_BLOCK("TextureCache::UploadImage");
 	auto& destination = image.depth_id ? m_slot_images[image.depth_id] : image;
 	const auto binding = image.depth_id ? BindingType::DepthTarget : UploadBinding(image);
 	// Debug: this is the guest-memory -> image path. An instance with no GPU producer and no
@@ -2142,6 +2145,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 }
 
 void TextureCache::RefreshImage(ImageId id) {
+	KYTY_PROFILER_BLOCK("TextureCache::RefreshImage");
 	auto& image = m_slot_images[id];
 	if (image.depth_id &&
 	    (m_slot_images[image.depth_id].info.metadata.stencil_compressed ||
@@ -2225,6 +2229,7 @@ void TextureCache::DropStencilAssociation(ImageId id) {
 }
 
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
+	KYTY_PROFILER_BLOCK("TextureCache::FindImage");
 	auto& command = m_scheduler.Current();
 	if (command.IsInvalid()) {
 		EXIT("TextureCache: image lookup requires a valid command buffer\n");
@@ -2408,6 +2413,7 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 }
 
 vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
+	KYTY_PROFILER_BLOCK("TextureCache::FindTexture");
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
 	TouchImage(image);
@@ -2449,6 +2455,7 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 }
 
 vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) {
+	KYTY_PROFILER_BLOCK("TextureCache::FindRenderTarget");
 	if (desc.type != BindingType::RenderTarget) {
 		EXIT("TextureCache: invalid color-target binding\n");
 	}
@@ -2703,6 +2710,7 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
 }
 
 void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
+	KYTY_PROFILER_BLOCK("TextureCache::InvalidateMemory");
 	if (!GuestRange {address, size}.Valid()) {
 		EXIT("TextureCache: invalid memory-invalidation range\n");
 	}
@@ -2768,6 +2776,7 @@ void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t des
 
 void TextureCache::DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
                                      uint64_t destination_size, ImageDownload transfer) {
+	KYTY_PROFILER_BLOCK("TextureCache::DownloadImage");
 	if (!transfer.valid) {
 		EXIT("TextureCache: invalid image download transfer\n");
 	}
@@ -2868,6 +2877,7 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 }
 
 bool TextureCache::DownloadImageMemory(ImageId id) {
+	KYTY_PROFILER_BLOCK("TextureCache::DownloadImageMemory");
 	auto& image = m_slot_images[id];
 	// Debug: the image -> guest memory direction. A later UploadImage of the same guest range can
 	// only see GPU results if this ran first and covered the bytes. Logged with the reason when
@@ -2959,6 +2969,7 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 }
 
 void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
+	KYTY_PROFILER_BLOCK("TextureCache::InvalidateMemoryFromGPU");
 	if (!GuestRange {address, size}.Valid()) {
 		return;
 	}

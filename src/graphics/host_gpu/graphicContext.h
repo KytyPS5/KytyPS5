@@ -40,6 +40,9 @@ struct GraphicContext {
 	bool                               device_fault_enabled                   = false;
 	// VK_EXT_conditional_rendering: lets fast clears be applied without a CPU readback.
 	bool                               conditional_rendering_enabled          = false;
+	// VK_EXT_external_memory_host: lets guest memory be imported as device memory (zero-copy).
+	bool                               external_memory_host_enabled           = false;
+	uint64_t                           min_imported_host_pointer_alignment    = 0;
 	bool                                      mesh_shader_enabled                   = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
 	uint32_t                           subgroup_size                         = 0;

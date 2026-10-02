@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
 
 #include <algorithm>
@@ -182,6 +183,7 @@ void CommandScheduler::FlushAndWait() {
 }
 
 void CommandScheduler::Finish() {
+	KYTY_PROFILER_BLOCK("CommandScheduler::Finish");
 	CheckActive();
 	if (!m_command.IsInvalid()) {
 		Submit();
@@ -192,6 +194,7 @@ void CommandScheduler::Finish() {
 }
 
 void CommandScheduler::Wait(uint64_t tick) {
+	KYTY_PROFILER_BLOCK("CommandScheduler::Wait");
 	EXIT_IF(tick > CurrentTick());
 	if (tick == CurrentTick()) {
 		CheckActive();
@@ -302,6 +305,7 @@ void CommandScheduler::DrainPriorityOperations() {
 }
 
 void CommandScheduler::WaitPriorityOperations(uint64_t tick) {
+	KYTY_PROFILER_BLOCK("CommandScheduler::WaitPriorityOperations");
 	EXIT_IF(g_deferred_callback_scheduler == this);
 	std::unique_lock lock(m_operation_mutex);
 	m_operation_available.wait(lock, [this, tick] {
@@ -344,6 +348,7 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 }
 
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
+	KYTY_PROFILER_BLOCK("CommandScheduler::Submit");
 	EXIT_IF(m_command.IsInvalid());
 	EXIT_IF(submit.num_wait_semaphores > SubmitInfo::MaxSemaphores ||
 	        submit.num_signal_semaphores >= SubmitInfo::MaxSemaphores);

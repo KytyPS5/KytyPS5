@@ -113,6 +113,7 @@ void BufferCache::DeleteBuffer(BufferId id) {
 }
 
 bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	KYTY_PROFILER_BLOCK("BufferCache::DownloadBufferMemory");
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size     = 0;
 	const auto                  buffer_address = buffer.CpuAddress();
@@ -254,6 +255,7 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
+	KYTY_PROFILER_BLOCK("BufferCache::ReadMemory");
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
@@ -390,6 +392,7 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
                                     bool is_texel_buffer) {
+	KYTY_PROFILER_BLOCK("BufferCache::SynchronizeBuffer");
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
 	vk::Buffer                  source;
@@ -400,6 +403,20 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		    total_size += bytes;
 	    },
 	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
+	// Only staging-ring copies can wait: a temporary upload buffer is released at the current
+	// tick, which a submit before the flush would retire.
+	if (source && m_defer_uploads && source == m_staging_buffer.Handle()) {
+		for (const auto& copy: copies) {
+			m_pending_uploads.push_back({buffer.Handle(), copy});
+		}
+		m_pending_upload_bytes += total_size;
+		// The ring only reuses a region a full lap later; flushing well inside one lap keeps every
+		// queued source intact.
+		if (m_pending_upload_bytes >= m_staging_buffer.Size() / 8) {
+			FlushPendingUploads();
+		}
+		source = nullptr;
+	}
 	if (source) {
 		auto& command = m_scheduler.Current();
 		command.EndRendering();
@@ -434,6 +451,7 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 
 vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
                                      uint64_t total_size) {
+	KYTY_PROFILER_BLOCK("BufferCache::UploadCopies");
 	if (copies.empty()) {
 		return nullptr;
 	}
@@ -465,6 +483,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t size,
                                                        bool is_written, bool is_texel_buffer,
                                                        BufferId id) {
+	KYTY_PROFILER_BLOCK("BufferCache::ObtainBuffer");
 	auto& command = m_scheduler.Current();
 	if (command.IsInvalid() || !GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: buffer request requires a recording command buffer\n");
@@ -520,6 +539,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 }
 
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size) {
+	KYTY_PROFILER_BLOCK("BufferCache::ObtainBufferForImage");
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid image source\n");
 	}
@@ -704,13 +724,56 @@ void BufferCache::ProcessFaultBuffer() {
 }
 
 void BufferCache::SynchronizeDirtyBuffersInRange(uint64_t vaddr, uint64_t size) {
+	KYTY_PROFILER_BLOCK("BufferCache::SynchronizeDirtyBuffersInRange");
 	// Only pages the CPU dirtied can need uploading, so walk those instead of every buffer.
+	m_defer_uploads = true;
 	m_memory_tracker.ForEachCpuDirtyRange(vaddr, size, [this](uint64_t address, uint64_t length) {
 		SynchronizeBuffersInRange(address, length);
 	});
+	m_defer_uploads = false;
+}
+
+void BufferCache::FlushPendingUploads() {
+	if (m_pending_uploads.empty()) {
+		return;
+	}
+	KYTY_PROFILER_BLOCK("BufferCache::FlushPendingUploads");
+	// The menu of a UE5 title dirties thousands of scattered pages per submission. A barrier pair
+	// per page serialized the GPU thousands of times a frame; one pair covers the whole batch.
+	auto& command = m_scheduler.Current();
+	command.EndRendering();
+	const auto        native = command.Handle();
+	vk::MemoryBarrier before {};
+	before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	before.dstAccessMask = vk::AccessFlagBits::eTransferWrite;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                       vk::PipelineStageFlagBits::eTransfer, {}, 1, &before, 0, nullptr, 0,
+	                       nullptr);
+	const auto source = m_staging_buffer.Handle();
+	std::vector<vk::BufferCopy> copies;
+	for (size_t begin = 0; begin < m_pending_uploads.size();) {
+		const auto destination = m_pending_uploads[begin].destination;
+		copies.clear();
+		auto end = begin;
+		for (; end < m_pending_uploads.size() && m_pending_uploads[end].destination == destination;
+		     ++end) {
+			copies.push_back(m_pending_uploads[end].copy);
+		}
+		native.copyBuffer(source, destination, static_cast<uint32_t>(copies.size()), copies.data());
+		begin = end;
+	}
+	vk::MemoryBarrier after {};
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                       vk::PipelineStageFlagBits::eAllCommands, {}, 1, &after, 0, nullptr, 0,
+	                       nullptr);
+	m_pending_uploads.clear();
+	m_pending_upload_bytes = 0;
 }
 
 void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
+	KYTY_PROFILER_BLOCK("BufferCache::SynchronizeBuffersInRange");
 	const auto end = vaddr + size;
 	auto       it  = m_buffers.upper_bound(vaddr);
 	if (it != m_buffers.begin()) {

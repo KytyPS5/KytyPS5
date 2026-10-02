@@ -957,6 +957,11 @@ uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	return clamped_size;
 }
 
+uint64_t GetGuestBackingView(uint64_t* size) {
+	*size = g_guest_address_space != nullptr ? g_guest_address_space->GetBackingSize() : 0;
+	return g_guest_address_space != nullptr ? g_guest_address_space->GetBackingBase() : 0;
+}
+
 void WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept {
 	if (!TryWriteBacking(vaddr, data, size)) {
 		EXIT("Memory: required direct-backing write failed, addr=0x%016" PRIx64

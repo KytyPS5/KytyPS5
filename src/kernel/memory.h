@@ -120,6 +120,9 @@ void                   DebugReportGpuBackingState(uint64_t vaddr, uint64_t size,
                                                   const char* tag);
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
+// The contiguous host view of the whole guest backing section; every guest mapping is a view
+// of it at some backing offset, so aliased guest addresses meet here. Returns 0 if absent.
+uint64_t               GetGuestBackingView(uint64_t* size);
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;

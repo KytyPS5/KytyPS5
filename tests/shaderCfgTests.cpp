@@ -3137,8 +3137,12 @@ void TestNewShaderRecompilerMoreAluFamilies() {
         "SPIR-V binary does not contain OpCompositeExtract");
   Check(SpirvContainsOpcode(result.spirv, 339),
         "SPIR-V binary does not contain OpGroupNonUniformBallot");
-  Check(SpirvContainsOpcode(result.spirv, 343),
-        "SPIR-V binary does not contain OpGroupNonUniformBallotFindLSB");
+  // The first lane comes from FindILsb on the ballot words (OpExtInst), not from
+  // OpGroupNonUniformBallotFindLSB, which Metal rejects in vertex functions.
+  Check(!SpirvContainsOpcode(result.spirv, 343),
+        "SPIR-V binary still contains OpGroupNonUniformBallotFindLSB");
+  Check(SpirvContainsOpcode(result.spirv, 12),
+        "SPIR-V binary does not contain OpExtInst for the ballot's first lane");
   Check(SpirvContainsOpcode(result.spirv, 345),
         "SPIR-V binary does not contain OpGroupNonUniformShuffle");
   CheckSpirvBinaryValidates(result.spirv);

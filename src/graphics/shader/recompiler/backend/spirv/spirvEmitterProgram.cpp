@@ -499,12 +499,10 @@ uint32_t ValueEmitContext::Ballot(IR::Value predicate) {
 }
 
 uint32_t ValueEmitContext::FirstLane(uint32_t ballot) {
-	if (other_half == nullptr) {
-		const auto result = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpGroupNonUniformBallotFindLSB, TypeU32(state), result,
-		                          ConstantU32(state, spv::ScopeSubgroup), ballot);
-		return result;
-	}
+	// Find the lowest set bit of the ballot words directly rather than with
+	// OpGroupNonUniformBallotFindLSB: SPIRV-Cross lowers that to a helper taking the subgroup
+	// size (threads_per_simdgroup), which Metal rejects in vertex functions. Bits past the
+	// subgroup size are zero in a ballot, so the result is the same.
 	const auto low        = state.builder.AllocateId();
 	const auto high       = state.builder.AllocateId();
 	const auto low_first  = state.builder.AllocateId();

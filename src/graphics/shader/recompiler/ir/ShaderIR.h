@@ -543,7 +543,21 @@ struct CompiledShaderInfo {
 	bool                          has_address_writes  = false;
 	ShaderInfo                    info;
 	BindingLayout                 bindings;
+	// For each flat SRT slot, the written info.buffers that a store or atomic of the shader
+	// may update before a read of that slot in program order.
+	std::vector<std::vector<uint32_t>> srt_reads_after_buffer_writes;
+	// The same for each scalar load the shader issues itself, by memory-info index.
+	std::vector<std::vector<uint32_t>> raw_reads_after_buffer_writes;
 };
+
+// Whether a write of the shader to a buffer (an info.buffers index) can be visible to one of
+// its specialization reads. A read that a flattened scalar load made before any write to that
+// buffer in program order is not: the shader consumes the value from the flattened SRT, and
+// each wave performs that load before its own writes, so the dispatch-time snapshot is a value
+// the load observes on hardware.
+bool SpecializationReadFollowsBufferWrite(const CompiledShaderInfo& program,
+                                          const ResourceSnapshot& resources, size_t read,
+                                          uint32_t buffer);
 
 struct UniformFillPlan {
 	UniformFill          fill;
@@ -629,6 +643,9 @@ struct Program: ResourcePlan {
 
 std::string ProgramToString(const Program& program);
 bool        HasShaderMemoryWrites(const Program& program);
+// raw (optional) receives the same per memory-info index of the shader's own scalar loads.
+std::vector<std::vector<uint32_t>> SrtReadsAfterBufferWrites(
+    const Program& program, std::vector<std::vector<uint32_t>>* raw = nullptr);
 
 void  ValidateProgram(const Program& program, bool require_ssa);
 void  ResolveControlFlowIdentities(Program& program);

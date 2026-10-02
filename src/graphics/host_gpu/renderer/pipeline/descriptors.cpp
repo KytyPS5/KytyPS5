@@ -1014,7 +1014,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				EXIT("scalar resource reads cannot be proven disjoint from shader address writes\n");
 			}
 		}
-		for (const auto [address, size]: reads) {
+		for (size_t read = 0; read < reads.size(); ++read) {
+			const auto [address, size] = reads[read];
 			for (const auto id: m_bound_images) {
 				const auto* image = m_context.GetTextureCache().m_slot_images.try_get(id);
 				if (image == nullptr ||
@@ -1033,8 +1034,13 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 					const auto resource = program.bindings.descriptors.front().resources[i];
 					if (!program.info.buffers[resource].written) continue;
 					const auto& written = writer->buffer_sources[i];
-					if (written.size != 0 && ImageRangeOverlaps(address, size,
-					                                          written.address, written.size)) {
+					// A flattened scalar load issued before the shader's own writes to the
+					// buffer may observe its dispatch-time snapshot on hardware.
+					if (written.size != 0 &&
+					    ImageRangeOverlaps(address, size, written.address, written.size) &&
+					    (writer != reader ||
+					     ShaderRecompiler::IR::SpecializationReadFollowsBufferWrite(
+					         program, *reader->runtime->resources, read, resource))) {
 						EXIT("scalar resource reads overlap a shader buffer write\n");
 					}
 				}

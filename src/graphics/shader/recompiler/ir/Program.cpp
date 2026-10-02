@@ -1,6 +1,7 @@
 #include "common/assert.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
+#include <algorithm>
 #include <fmt/format.h>
 #include <map>
 #include <new>
@@ -135,6 +136,8 @@ Program& Program::operator=(Program&& other) noexcept {
 }
 
 CompiledShaderInfo Program::TakeCompiledInfo() && {
+	std::vector<std::vector<uint32_t>> raw_reads_after_writes;
+	auto srt_reads_after_writes = SrtReadsAfterBufferWrites(*this, &raw_reads_after_writes);
 	CompiledShaderInfo result {
 	    .stage           = stage,
 	    .shader_hash     = shader_hash,
@@ -145,6 +148,8 @@ CompiledShaderInfo Program::TakeCompiledInfo() && {
 	    .has_address_writes = has_address_writes,
 	    .info            = std::move(info),
 	    .bindings        = std::move(bindings),
+	    .srt_reads_after_buffer_writes = std::move(srt_reads_after_writes),
+	    .raw_reads_after_buffer_writes = std::move(raw_reads_after_writes),
 	};
 	for (const auto& output: result.info.outputs) {
 		if (output.kind == StageOutputKind::Parameter && output.index < 32) {
@@ -216,6 +221,146 @@ bool HasShaderMemoryWrites(const Program& program) {
 		}
 	}
 	return false;
+}
+
+std::vector<std::vector<uint32_t>> SrtReadsAfterBufferWrites(
+    const Program& program, std::vector<std::vector<uint32_t>>* raw) {
+	const auto buffers = program.info.buffers.size();
+	uint32_t   slots   = static_cast<uint32_t>(program.srt_reads.size());
+	const auto slot_of = [](const Inst& inst) {
+		const auto slot = inst.Arg(1).Resolve();
+		return slot.IsImmediate() && slot.GetType() == Type::U32 ? slot.U32() : NoSrtSlot;
+	};
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			if (inst.GetOpcode() == ValueOpcode::ReadConst && slot_of(inst) != NoSrtSlot) {
+				slots = std::max(slots, slot_of(inst) + 1u);
+			}
+		}
+	}
+	std::vector<std::vector<uint32_t>> result(slots);
+	if (raw != nullptr) {
+		raw->assign(program.memory_info.size(), {});
+	}
+	if (buffers == 0 || (slots == 0 && raw == nullptr)) {
+		return result;
+	}
+	// Marks the buffers a store or atomic updates; one with an unknown target updates them all.
+	const auto apply_write = [&](const Inst& inst, std::vector<uint8_t>& written) {
+		const auto access = BufferAccessOf(inst.GetOpcode());
+		if (access != BufferAccess::Write && access != BufferAccess::Atomic) {
+			return;
+		}
+		const auto index    = inst.Flags<MemoryFlags>().index;
+		const auto kind     = index < program.memory_info.size() ? program.memory_info[index].kind
+		                                                         : ResourceKind::None;
+		const auto resource = kind != ResourceKind::None ? program.memory_info[index].resource : 0u;
+		if (kind == ResourceKind::Lds || kind == ResourceKind::Gds) {
+			return;
+		}
+		if (kind == ResourceKind::Buffer && resource < buffers) {
+			written[resource] = 1u;
+		} else {
+			std::fill(written.begin(), written.end(), uint8_t {1});
+		}
+	};
+	std::unordered_map<const Block*, size_t> indices;
+	for (size_t index = 0; index < program.blocks.size(); index++) {
+		indices.emplace(program.blocks[index], index);
+	}
+	// Buffers that may have been written on some path into each block, loops included.
+	std::vector<std::vector<uint8_t>> written_in(program.blocks.size(),
+	                                             std::vector<uint8_t>(buffers));
+	std::vector<size_t> pending(program.blocks.size());
+	for (size_t index = 0; index < pending.size(); index++) {
+		pending[index] = pending.size() - 1u - index;
+	}
+	std::vector<uint8_t> state;
+	while (!pending.empty()) {
+		const auto index = pending.back();
+		pending.pop_back();
+		state = written_in[index];
+		for (const auto& inst: *program.blocks[index]) {
+			apply_write(inst, state);
+		}
+		for (const auto* successor: program.blocks[index]->ImmSuccessors()) {
+			const auto found = indices.find(successor);
+			if (found == indices.end()) {
+				continue;
+			}
+			auto& target  = written_in[found->second];
+			bool  changed = false;
+			for (size_t buffer = 0; buffer < buffers; buffer++) {
+				if (state[buffer] != 0u && target[buffer] == 0u) {
+					target[buffer] = 1u;
+					changed        = true;
+				}
+			}
+			if (changed) {
+				pending.push_back(found->second);
+			}
+		}
+	}
+	std::vector<std::vector<uint8_t>> after(slots, std::vector<uint8_t>(buffers));
+	std::vector<std::vector<uint8_t>> raw_after(raw != nullptr ? program.memory_info.size() : 0u);
+	for (size_t index = 0; index < program.blocks.size(); index++) {
+		state = written_in[index];
+		for (const auto& inst: *program.blocks[index]) {
+			if (inst.GetOpcode() == ValueOpcode::ReadConst) {
+				const auto slot = slot_of(inst);
+				for (size_t buffer = 0; slot != NoSrtSlot && buffer < buffers; buffer++) {
+					after[slot][buffer] |= state[buffer];
+				}
+			} else if (raw != nullptr && (inst.GetOpcode() == ValueOpcode::LoadAddressU32 ||
+			                              inst.GetOpcode() == ValueOpcode::ReadConstBuffer ||
+			                              inst.GetOpcode() == ValueOpcode::LoadBufferU32)) {
+				const auto memory = inst.Flags<MemoryFlags>().index;
+				if (memory < raw_after.size()) {
+					auto& seen = raw_after[memory];
+					seen.resize(buffers);
+					for (size_t buffer = 0; buffer < buffers; buffer++) {
+						seen[buffer] |= state[buffer];
+					}
+				}
+			}
+			apply_write(inst, state);
+		}
+	}
+	for (size_t memory = 0; memory < raw_after.size(); memory++) {
+		// A load this pass did not see may follow any write.
+		const bool seen = !raw_after[memory].empty();
+		for (uint32_t buffer = 0; buffer < buffers; buffer++) {
+			if (!seen || raw_after[memory][buffer] != 0u) {
+				(*raw)[memory].push_back(buffer);
+			}
+		}
+	}
+	for (uint32_t slot = 0; slot < slots; slot++) {
+		for (uint32_t buffer = 0; buffer < buffers; buffer++) {
+			if (after[slot][buffer] != 0u) {
+				result[slot].push_back(buffer);
+			}
+		}
+	}
+	return result;
+}
+
+bool SpecializationReadFollowsBufferWrite(const CompiledShaderInfo& program,
+                                          const ResourceSnapshot& resources, size_t read,
+                                          uint32_t buffer) {
+	if (read >= resources.specialization_read_slots.size()) {
+		return true;
+	}
+	const auto slot = resources.specialization_read_slots[read];
+	const bool raw  = slot != NoSrtSlot && (slot & RawReadSlotBit) != 0u;
+	const auto index = raw ? slot & ~RawReadSlotBit : slot;
+	const auto& table =
+	    raw ? program.raw_reads_after_buffer_writes : program.srt_reads_after_buffer_writes;
+	if (index >= table.size()) {
+		return true;
+	}
+	const auto& writes = table[index];
+	return std::ranges::find(writes, buffer) != writes.end();
 }
 
 void ValidateProgram(const Program& program, bool require_ssa) {

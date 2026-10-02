@@ -519,17 +519,31 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 		}
 	}
 	uint32_t word = 0;
+	if (m_runtime.read_slot != nullptr) {
+		// A load shared by several slots has no single slot.
+		const auto roots = std::ranges::count_if(m_program.srt_reads, [&](const SrtRead& read) {
+			return read.value.Resolve().TryInstruction() == &inst;
+		});
+		const auto root = std::ranges::find_if(m_program.srt_reads, [&](const SrtRead& read) {
+			return read.value.Resolve().TryInstruction() == &inst;
+		});
+		*m_runtime.read_slot = roots == 1   ? root->flat_offset
+		                       : roots == 0 ? RawReadSlot(inst.Flags<MemoryFlags>().index)
+		                                    : NoSrtSlot;
+	}
+	bool       read   = true;
 	const auto reader = vector ? m_runtime.read_specialization_memory : m_runtime.read_memory;
 	if (reader != nullptr) {
-		if (!reader(m_runtime.userdata, address, {&word, 1})) {
-			return false;
-		}
+		read = reader(m_runtime.userdata, address, {&word, 1});
 	} else {
 		if (vector) return false;
 		std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
 	}
+	if (m_runtime.read_slot != nullptr) {
+		*m_runtime.read_slot = NoSrtSlot;
+	}
 	result = word;
-	return true;
+	return read;
 }
 
 bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {

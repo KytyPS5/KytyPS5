@@ -3175,6 +3175,126 @@ void TestGuardedScalarDescriptorReads() {
   }
 }
 
+// GTA V CS 9df701ab41f8ed18 (Fidelity BVH build) loads the address of a "PSR_BVHL" header
+// with S_LOAD_DWORDX2, then S_LOAD_DWORDs header+0x18 before its BUFFER_ATOMIC_OR_X2 sets
+// a bit in that dword through a V# over the header, and traps when bit 4 of the loaded value
+// is set and then still writes buffers. Other buffers are stored before the load.
+void TestScalarReadBeforeOwnBufferWrite() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  enum class Order { ReadFirst, WriteFirst, Loop };
+  for (const auto order : {Order::ReadFirst, Order::WriteFirst, Order::Loop}) {
+      Fixture fixture;
+      auto *entry = fixture.block;
+      auto *check = order == Order::Loop ? fixture.AddBlock() : entry;
+      auto *trap = fixture.AddBlock();
+      auto *done = fixture.AddBlock();
+      const uint32_t check_index = order == Order::Loop ? 1u : 0u;
+      if (order == Order::Loop) {
+        entry->AddBranch(check);
+        fixture.program.block_info[0].terminator = {.kind = CFG::TerminatorKind::Branch,
+                                                    .true_block = 1};
+      }
+      check->AddBranch(trap);
+      check->AddBranch(done);
+      fixture.program.block_info[check_index].terminator = {
+          .kind = CFG::TerminatorKind::ConditionalBranch,
+          .true_block = check_index + 1u, .false_block = check_index + 2u};
+      // The loop variant updates the header on the way back to the load.
+      if (order == Order::Loop) trap->AddBranch(check);
+      fixture.program.block_info[check_index + 1u].terminator =
+          order == Order::Loop
+              ? CFG::Terminator{.kind = CFG::TerminatorKind::Branch, .true_block = 1}
+              : CFG::Terminator{.kind = CFG::TerminatorKind::Return};
+      fixture.program.block_info[check_index + 2u].terminator.kind = CFG::TerminatorKind::Return;
+
+      MemoryInfo store;
+      store.kind = ResourceKind::Buffer;
+      const auto Store = [&](Value buffer, Block *block) {
+        fixture.Emit(ValueOpcode::StoreBufferU32,
+                     {buffer, Value(0u), Value(0u), Value(0u), Value(1u), Value(true)},
+                     fixture.AddMemory(store, 4), block);
+      };
+      fixture.block = check;
+      const auto other = fixture.Buffer({fixture.UserData(4), fixture.UserData(5),
+                                        fixture.UserData(6), fixture.UserData(7)});
+      Store(other, check);
+      MemoryInfo address;
+      address.kind = ResourceKind::ScalarAddress;
+      address.offset = 136;
+      const auto root = fixture.Address(fixture.UserData(0), fixture.UserData(1));
+      const auto low = fixture.Emit(ValueOpcode::LoadAddressU32,
+          {root, Value(0u), Value(0u), Value(true)}, fixture.AddMemory(address, 8));
+      address.offset = 140;
+      const auto high = fixture.Emit(ValueOpcode::LoadAddressU32,
+          {root, Value(0u), Value(0u), Value(true)}, fixture.AddMemory(address, 8));
+      const auto header = fixture.Buffer(
+          {low, fixture.Emit(ValueOpcode::BitwiseOr32, {high, Value(0x01000000u)}), Value(1u),
+           Value(0x16204u)});
+      if (order == Order::WriteFirst) Store(header, check);
+      address.offset = 24;
+      const auto flags = fixture.Emit(ValueOpcode::LoadAddressU32,
+          {fixture.Address(low, high), Value(0u), Value(0u), Value(true)},
+          fixture.AddMemory(address, 12));
+      Store(header, order == Order::Loop ? trap : check);
+      // A resource access after the trap test keeps its branch in the plan.
+      if (order != Order::Loop) Store(other, trap);
+      fixture.program.block_info[check_index].condition = fixture.Emit(
+          ValueOpcode::INotEqual32,
+          {fixture.Emit(ValueOpcode::BitwiseAnd32, {flags, Value(16u)}), Value(0u)});
+      fixture.PlanAndTrack();
+      auto plan = ExtractResourcePlan(fixture.program);
+      // The header address loads are flattened; the flags load may stay a native raw read.
+      Check(plan.capture_specialization_reads && !plan.control_flow.empty() &&
+                plan.srt_reads.size() >= 2,
+            "BVH header fixture lost its scalar branch or flattened loads");
+
+      LinearTestMemory memory;
+      memory.words[0x88 / 4] = 0x1100u;
+      memory.words[0x118 / 4] = 0x00020034u; // Bit 4 keeps the loop's header store reachable.
+      const std::array<uint32_t, 8> user_data{0x1000u, 0u, 0u, 0u, 0x1400u, 0u, 64u, 0u};
+      const SrtRuntime runtime{.user_data = user_data, .read_memory = ReadLinearTestMemory,
+                               .userdata = &memory,
+                               .read_specialization_memory = ReadLinearTestMemory};
+      ResourceSnapshot snapshot;
+      ResourceSpecialization specialization;
+      Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+                snapshot.specialization_read_slots.size() == snapshot.specialization_reads.size(),
+            "BVH header fixture did not materialize");
+      // A scalar load with no instruction left in the program may follow any write.
+      const auto unseen_load = fixture.AddMemory(address, 16).index;
+      const auto compiled = std::move(fixture.program).TakeCompiledInfo();
+      const auto Buffer = [&](uint32_t base) {
+        for (uint32_t index = 0; index < compiled.info.buffers.size(); ++index) {
+          if (compiled.info.buffers[index].written && snapshot.buffers[index].dwords[0] == base)
+            return index;
+        }
+        return UINT32_MAX;
+      };
+      const auto header_buffer = Buffer(0x1100u);
+      const auto other_buffer = Buffer(0x1400u);
+      Check(header_buffer != UINT32_MAX && other_buffer != UINT32_MAX,
+            "BVH header fixture lost its written buffers");
+      uint32_t flag_reads = 0;
+      for (size_t read = 0; read < snapshot.specialization_reads.size(); ++read) {
+        if (snapshot.specialization_reads[read] != std::pair<uint64_t, uint64_t>{0x1118u, 4u})
+          continue;
+        ++flag_reads;
+        Check(SpecializationReadFollowsBufferWrite(compiled, snapshot, read, header_buffer) ==
+                  (order != Order::ReadFirst),
+              order == Order::ReadFirst
+                  ? "scalar load before its shader's own buffer write was rejected"
+                  : "scalar load after its shader's own buffer write was accepted");
+        Check(SpecializationReadFollowsBufferWrite(compiled, snapshot, read, other_buffer),
+              "scalar load ignored an earlier store to another buffer");
+      }
+      Check(flag_reads != 0, "BVH header flag read was omitted from the overlap check");
+      ResourceSnapshot unseen;
+      unseen.specialization_read_slots = {RawReadSlot(unseen_load)};
+      Check(SpecializationReadFollowsBufferWrite(compiled, unseen, 0, header_buffer),
+            "a scalar load the write analysis did not see was accepted");
+  }
+}
+
 void TestConservativeBufferReachability() {
   std::array<uint32_t, 8> user_data{
       0x1000, 16u << 16u, 1, 0x4dfac,
@@ -3594,6 +3714,7 @@ int main() {
     Run("buffer swizzle specialization", TestBufferSwizzleSpecialization);
     Run("conditional buffer materialization", TestConditionalBufferMaterialization);
     Run("guarded scalar descriptor reads", TestGuardedScalarDescriptorReads);
+    Run("scalar read before own buffer write", TestScalarReadBeforeOwnBufferWrite);
     Run("conservative buffer reachability", TestConservativeBufferReachability);
     Run("conditional indirect image", TestConditionalIndirectImageMaterialization);
     Run("shader info and bindings", TestShaderInfoAndBindingLayout);

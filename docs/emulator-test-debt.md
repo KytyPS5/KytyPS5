@@ -1,5 +1,119 @@
 # Emulator regression test debt
 
+## Driver compiler crash without GPUAV (2026-10-02)
+
+The bounded current-branch run
+`_Build/runs/yotei-integrated-20261002-204937-presentprobe-noval`
+used 2560x1440, no Vulkan core validation and no GPUAV. It crashed before
+`shown=1` with Windows exception `0x80000003` in NVIDIA
+`nvgpucomp64.dll` version `32.0.16.1714` while creating the compute pipeline
+for shader `b90e2024732c6111`; WER Application Error event 1000 records
+offset `0x589eb2`. The two identical emitted SPIR-V copies are in that run's
+`shaders/0070_...spv` and `0071_...spv`. This is a driver compiler boundary,
+not evidence of a visible frame or menu. Avoid repeated uninstrumented game
+launches until a bounded synthetic SPIR-V or emitter regression isolates the
+instruction pattern that triggers the crash. Keep shader validation and GPUAV
+controls to distinguish invalid SPIR-V from a driver defect.
+
+## Zero-sized indirect compute dispatch (2026-10-02)
+
+The bounded GPUAV run
+`_Build/runs/yotei-integrated-20261002-200407-presentprobe-gpuav`
+exited 321 at shown 125 on the same immutable-SRT/writable-buffer alias.
+Temporary diagnostics show the failing specialization has guest grid
+`{0,1,1}`. Its earlier nonempty grids `{4096,1,1}`, `{727,1,1}`,
+`{64,1,1}` and `{320,1,1}` evaluated their selectors and pruned the
+unselected overlapping row. Source readback frames 60–125 remain RGB black.
+
+Required RED: an indirect compute dispatch with a zero group count and an
+unreadable shader address must be skipped before shader specialization, as
+the existing direct-dispatch control does. Cover each zero axis and a
+nonzero control. Before treating CPU-visible indirect args as authoritative,
+check GPU-dirty ownership and pending producer writes: the recorded Vulkan
+dispatch reads the argument buffer later, so a stale CPU zero cannot justify
+skipping a possible GPU-generated nonzero dispatch. Preserve the alias guard
+for any unproved case. Repeat the native game run after a generic fix.
+
+The isolated native `--empty-indirect-only` test (all three zero axes,
+unreadable shader address) was RED on the old path: `ShaderGetInputInfoCS()`
+tried shader address 1 (`_Build/logs/empty-indirect-isolated-red-20261002.*`).
+It passed unchanged after the renderer skipped only CPU-owned zero grids
+(`_Build/logs/empty-indirect-isolated-green-20261002.*`). The existing
+`--native-indirect-only` GPU-produced argument test still fails at its
+asynchronous host-submission assertion (exit 9); its numerical controls
+cannot be counted as passed. Do not weaken that assertion merely to make the
+new shortcut look safe.
+
+Required additional RED: a bounded SRT selector with an apparent small CPU
+grid that would prune an overlapping writer, while the indirect argument
+range is marked GPU-owned. Materialization must refuse the proof because the
+GPU may execute a larger grid; the same exact CPU-owned grid remains the
+positive control. This prevents the new dispatch-wide pruning from treating
+stale indirect counts as authoritative.
+
+That `--unselected-bounded-writer-only` extension was RED on the old
+materializer (`_Build/logs/untrusted-grid-red-20261002.*`) and GREEN once
+GPU-owned counts were marked untrusted and dispatch-wide pruning refused
+them (`_Build/logs/untrusted-grid-green-20261002.*`). Full
+`resource_tracking_tests` and `resource_materialization_tests` pass.
+The final native GPUAV run on source `36bcf354`, exe SHA-256
+`567600051cfd44a3a71ea9f126614abb52ebfc3058a2547aeb8ccab894fa8b80`,
+`_Build/runs/yotei-integrated-20261002-205909-presentprobe-gpuav`, reached
+shown 156 past the old fatal and then stopped by the frame watchdog; source
+RGB frames 130–155 were all black. The next runtime stall remains unproved.
+
+## Unselected bounded buffer writer (2026-10-02)
+
+The bounded GPUAV diagnostic run
+`_Build/runs/yotei-integrated-20261002-185718-presentprobe-gpuav`
+reaches CS `34e090c623ad611c` at shown 142. Its 32-row buffer table has an
+overlapping writable descriptor in row 17, but all 64 launched workgroups
+read selector words with bits 16–20 equal to zero from a separate scalar
+input buffer. The shader therefore selects row 0 in this captured dispatch;
+the row-17 writer is only an enumerated candidate. This is a lead, not yet a
+safe exception: the selector input must be snapshotted coherently and protected
+from every possible shader write.
+
+Required synthetic RED: a compute bounded buffer table with a dynamic
+workgroup-uniform selector read from a scalar input buffer, one disjoint
+selected writer and one overlapping unselected writer. The current admission
+must reject the dispatch. GREEN may admit it only after enumerating every
+workgroup selector, retaining its exact input read ranges, proving those
+ranges cannot be written, and disabling only unreachable candidates for this
+snapshot. Controls must preserve rejection when any workgroup selects the
+overlapping row, when the selector cannot be evaluated or read coherently,
+and when another live writer can mutate the selector input. Verify renderer
+binding admission and repeat the bounded native game run; a black readback
+does not prove a menu.
+
+The first synthetic `--unselected-bounded-writer-only` reproduced the expected
+CPU rejection on the old code and passed after a generic workgroup-selector
+evaluation/pruning change. Its controls preserve rejection for a selected
+overlap, unreadable selector input and a writer of the selector input. Full
+`resource_tracking_tests` and `resource_materialization_tests` passed.
+However, native exe SHA-256
+`13b9913741771a10289d75183541afb68af0d46c8c96769a89dadb001cb59e65`
+in `_Build/runs/yotei-integrated-20261002-192412-presentprobe-gpuav`
+still exited 321 at shown 137 on the same `0x5000f37f80+120` alias
+(dense resource 9). Readback frames 60–136 remained black. Later diagnostics
+below identified the zero-sized indirect dispatch; the selector itself was
+evaluated successfully for nonempty grids.
+
+The bounded diagnostic rerun
+`_Build/runs/yotei-integrated-20261002-193319-presentprobe-gpuav`
+on a diagnostic build again exited 321 (shown 133). Earlier dispatches of
+the same shader proved row 0 or 1 active; immediately before the fatal alias,
+the reachability helper returned before visiting the 32-row table. The
+initial hypothesis was the combined workgroup-count cap. A follow-up RED
+used a synthetic selector
+dependent only on WorkgroupId.x with a large independent y dimension whose
+total grid exceeds 65536; the old helper rejected despite four relevant x
+values. GREEN discovers every WorkgroupId axis transitively used by the
+selector, including nested SRT reads, and enumerates only that Cartesian
+domain. The unchanged x and y tests pass. Later game diagnostics measured
+`{0,1,1}` for the failing dispatch, disproving the count-cap hypothesis as
+its cause; the zero-sized indirect case above is the actual next blocker.
+
 ## Prepared-frame readback layout transition (2026-10-02)
 
 Bounded native retry `_Build/runs/yotei-integrated-20261002-180746-presentprobe-gpuav`

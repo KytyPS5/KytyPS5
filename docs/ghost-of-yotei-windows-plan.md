@@ -1,5 +1,64 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **2 октября 2026 года, 21:12 UTC** (native Windows, branch
+`yotei-windows-bringup`, source commit `36bcf354`, installed exe SHA-256
+`567600051cfd44a3a71ea9f126614abb52ebfc3058a2547aeb8ccab894fa8b80`):
+
+- Снова проверены свежие upstream PR; точные head и выводы в
+  `docs/open-pr-usefulness-review.md`. Новые #978/#931/#925/#928 не меняют
+  доказанный bounded-table/immutable-SRT отказ и не переносились. Сохранённые
+  локальные коммиты отправлены на ветку до этого исправления; этот checkpoint
+  отражает новый локальный source commit.
+- Синтетический bounded writer RED на старом коде → GREEN: для compute
+  dispatch оценивается строка таблицы для каждой рабочей группы по точному
+  selector и согласованному snapshot входных слов. Убираются только
+  недостижимые writer candidates; выбранная пересекающаяся строка,
+  нечитаемый selector, его потенциальный писатель и недостоверная GPU-owned
+  indirect-сетка остаются отказами. Отдельный RED → GREEN ограничил поиск
+  только осями, от которых selector действительно зависит. Нулевой
+  CPU-owned indirect dispatch теперь пропускается до чтения shader;
+  GPU-owned stale zero не считается пустым. Изолированные и полные
+  `resource_tracking_tests`, полные `resource_materialization_tests`,
+  `shader_recompiler_compute_tests --empty-indirect-only` и native build/install
+  GREEN. `--native-indirect-only` остаётся RED (exit 9 на требовании
+  асинхронности); полный compute suite GREEN не заявляется.
+- Диагностика в
+  `_Build/runs/yotei-integrated-20261002-200407-presentprobe-gpuav`
+  уточнила прежний alias: отказ случался при CPU-visible indirect grid
+  `{0,1,1}`, тогда как ненулевые dispatch сетки `{4096,1,1}`, `{727,1,1}`,
+  `{64,1,1}`, `{320,1,1}` доказанно выбирали только непересекающиеся строки.
+  Финальный GPUAV+shader instrumentation запуск с 2560×1440 и source
+  readback `_Build/runs/yotei-integrated-20261002-205909-presentprobe-gpuav`
+  прошёл старую fatal-точку, дошёл до `shown=156`, затем остановлен
+  frame-watchdog 240 s; stderr пуст. Все 26 RGB readback кадров 130–155
+  имеют `colored=0`. Другие ограниченные прогоны этой правки дошли до 159 и
+  163, но тоже не дали ненулевого кадра. **Первый ненулевой кадр на текущей
+  ревизии, меню и gameplay PENDING.** `shown` сам по себе не является кадром.
+- Для проверки предложения откатиться создан отдельный worktree
+  `G:\repos\KytyPS5-nonzero-20260926` на `23e4fd74` (production source как
+  `fb1cc8b`), native exe SHA-256
+  `0332ddc109675f36640ab21f35a9baae97fae567bd77042d6133ef73af1a1df1`.
+  Старый сохранённый запуск
+  `_Build/runs/yotei-integrated-20260926-081515-presentfix-gpuav` действительно
+  доказывает ненулевой спиннер на frame 250/276, но свежий replay старой
+  ревизии в отдельном worktree
+  `G:\repos\KytyPS5-nonzero-20260926\_Build\runs\yotei-integrated-20261002-194933-presentprobe-gpuav`
+  упал с `0xC0000005` при `shown=134`, readback 130–133 чёрный. Поэтому
+  текущий регресс относительно спиннера не доказан воспроизведением.
+- Попытка ускорить текущий запуск без GPUAV
+  `_Build/runs/yotei-integrated-20261002-204937-presentprobe-noval` упала
+  до первого показанного кадра с `0x80000003` внутри NVIDIA
+  `nvgpucomp64.dll` при создании CS pipeline `b90e2024732c6111` (WER event
+  1000, offset `0x589eb2`); две идентичные SPIR-V копии сохранены в
+  `shaders/0070_...spv` и `0071_...spv`. Новая GPU-диагностика этого
+  driver/compiler пути требует сначала ограниченной синтетической регрессии;
+  повторять падение без изменения причины нельзя.
+- Следующее: локализовать остановку около shown 156–163 ограниченными
+  CPU/IR и scheduler проверками, сравнить старую и текущую цепочку без
+  титульных исключений, затем отдельно доказать source RGB ненулевой кадр,
+  меню и управление. Тестовый долг по driver compiler и подготовленному
+  frame readback записан в `docs/emulator-test-debt.md`.
+
 Checkpoint **2 октября 2026 года, 18:19 UTC** (та же native сборка; её
 SHA-256 указан ниже):
 

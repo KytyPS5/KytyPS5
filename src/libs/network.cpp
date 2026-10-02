@@ -1343,6 +1343,12 @@ int KYTY_SYSV_ABI NetResolverDestroy(int rid) {
 	return OK;
 }
 
+int KYTY_SYSV_ABI NetResolverAbort(int rid, int flags) {
+	PRINT_NAME();
+	LOGF("\t rid = %d\n\t flags = 0x%08x\n", rid, flags);
+	return OK;
+}
+
 int KYTY_SYSV_ABI NetResolverStartNtoa(int rid, const char* hostname, void* addr, int timeout,
                                        int retry, int flags) {
 	PRINT_NAME();

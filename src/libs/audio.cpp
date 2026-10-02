@@ -159,8 +159,8 @@ private:
 	static void            OpenSdlDevice(PortIn* port, Format format);
 	static void            CloseSdlDevice(PortIn* port);
 	static const void*     PrepareOutputBuffer(const PortOut& port, const void* data,
-	                                           std::vector<uint8_t>* buffer);
-	static bool            QueueSdlAudio(PortOut* port, const void* data, bool blocking);
+	                                           std::vector<uint8_t>* buffer, float gain);
+	static bool QueueSdlAudio(PortOut* port, const void* data, bool blocking, float gain);
 };
 
 static Audio* g_audio = nullptr;
@@ -302,7 +302,7 @@ void Audio::CloseSdlDevice(PortOut* port) {
 }
 
 const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
-                                       std::vector<uint8_t>* buffer) {
+                                       std::vector<uint8_t>* buffer, float gain) {
 	EXIT_IF(data == nullptr);
 	EXIT_IF(buffer == nullptr);
 
@@ -312,7 +312,7 @@ const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
 	const auto bytes_per_sample = BytesPerSample(port.format);
 	const bool reorder          = channels >= 8 && !FormatIsStd(port.format);
 
-	bool volume_changed = false;
+	bool volume_changed = gain != 1.0f;
 	for (uint32_t ch = 0; ch < channels; ch++) {
 		if (port.volume[ch] != 32768) {
 			volume_changed = true;
@@ -338,7 +338,7 @@ const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
 				const auto src_ch = reorder ? SDL_8CH_MAP[ch] : ch;
 				dst[frame * output_channels + ch] =
 				    src[frame * channels + src_ch] *
-				    (static_cast<float>(port.volume[src_ch]) / 32768.0f);
+				    (static_cast<float>(port.volume[src_ch]) / 32768.0f) * gain;
 			}
 			if (channels == 12) {
 				// Add the four top channels to their front/back channels, turning 12 into 8.
@@ -347,7 +347,7 @@ const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
 				for (uint32_t ch = 0; ch < 4; ch++) {
 					dst[frame * output_channels + HEIGHT_DST[ch]] +=
 					    src[frame * channels + 8 + ch] *
-					    (static_cast<float>(port.volume[8 + ch]) / 32768.0f);
+					    (static_cast<float>(port.volume[8 + ch]) / 32768.0f) * gain;
 				}
 			}
 		}
@@ -360,6 +360,7 @@ const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
 				const auto src_ch = reorder ? SDL_8CH_MAP[ch] : ch;
 				int64_t sample =
 				    static_cast<int64_t>(src[frame * channels + src_ch]) * port.volume[src_ch] / 32768;
+				sample = static_cast<int64_t>(sample * static_cast<double>(gain));
 				if (sample > std::numeric_limits<int16_t>::max()) {
 					sample = std::numeric_limits<int16_t>::max();
 				} else if (sample < std::numeric_limits<int16_t>::min()) {
@@ -373,7 +374,7 @@ const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
 	return buffer->data();
 }
 
-bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking) {
+bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking, float gain) {
 	EXIT_IF(port == nullptr);
 
 	if (port->stream == nullptr || data == nullptr) {
@@ -381,7 +382,7 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking) {
 	}
 
 	std::vector<uint8_t> prepared_buffer;
-	const void*          prepared_data   = PrepareOutputBuffer(*port, data, &prepared_buffer);
+	const void*          prepared_data   = PrepareOutputBuffer(*port, data, &prepared_buffer, gain);
 	const auto           output_channels = OutputChannels(*port);
 	const auto           prepared_size =
 	    BytesPerSample(port->format) * output_channels * port->samples_num;
@@ -554,6 +555,12 @@ uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking
 
 	for (uint32_t i = 0; i < num; i++) {
 		auto& port = m_out_ports[params[i].handle.GetId()];
+		const float gain =
+		    port.type == AUDIO_OUT_PORT_TYPE_PADSPK
+		        ? Controller::GetSettingScale(Controller::Setting::SpeakerVolume)
+		    : port.type == AUDIO_OUT_PORT_TYPE_VIBRATION
+		        ? Controller::GetSettingScale(Controller::Setting::VibrationIntensity)
+		        : 1.0f;
 
 		uint64_t controller_queued_us = 0;
 		bool controller_uses_bluetooth = false;
@@ -562,14 +569,15 @@ uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking
 			Common::LockGuard lock(m_mutex);
 			controller_queued_us = Controller::DualSenseHaptics::Queue(
 			    port.haptics, Controller::GetActiveControllerId(), params[i].data, port.samples_num,
-			    static_cast<uint32_t>(port.channels_num), FormatIsFloat(port.format), port.volume);
+			    static_cast<uint32_t>(port.channels_num), FormatIsFloat(port.format), port.volume,
+			    gain);
 			controller_uses_bluetooth =
 			    Controller::DualSenseHaptics::UsesBluetooth(port.haptics);
 		}
 		if (controller_queued_us == 0) {
 			// No DualSense took it (e.g. it was unplugged); a pad speaker port plays on the main
 			// output instead, and a vibration port has none.
-			if (QueueSdlAudio(&port, params[i].data, blocking)) {
+			if (QueueSdlAudio(&port, params[i].data, blocking, gain)) {
 				any_device = true;
 				paced[i]   = port.queue_primed;
 			}

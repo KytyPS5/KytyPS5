@@ -458,6 +458,9 @@ struct PsShaderResource2 {
 
 struct PsStageRegisters {
 	uint64_t          data_addr = 0;
+	uint64_t          user_data_addr = 0;
+	// Hades II uses PS offsets 4:5 for a byte-addressed descriptor table.
+	uint64_t          auxiliary_table_addr = 0;
 	PsShaderResource1 rsrc1;
 	PsShaderResource2 rsrc2;
 };
@@ -1017,6 +1020,12 @@ public:
 	void SetGsShaderResource2(const GsShaderResource2& rsrc2) { m_vs.gs_regs.rsrc2 = rsrc2; }
 
 	void SetPsShaderBase(uint64_t addr) { m_ps.ps_regs.data_addr = addr; }
+	void SetPsUserDataAddress(uint32_t word, uint32_t value) {
+		SetUserDataAddressWord(m_ps.ps_regs.user_data_addr, word, value);
+	}
+	void SetPsAuxiliaryTableAddress(uint32_t word, uint32_t value) {
+		SetUserDataAddressWord(m_ps.ps_regs.auxiliary_table_addr, word, value);
+	}
 	void SetPsShaderResource1(const PsShaderResource1& rsrc1) { m_ps.ps_regs.rsrc1 = rsrc1; }
 	void SetPsShaderResource2(const PsShaderResource2& rsrc2) { m_ps.ps_regs.rsrc2 = rsrc2; }
 

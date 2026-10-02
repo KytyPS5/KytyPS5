@@ -2488,6 +2488,132 @@ void TestConditionalSamplerPhi() {
   }
 }
 
+void TestFiniteImagePhiCycle() {
+  Fixture fixture;
+  auto *entry = fixture.block;
+  auto *header = fixture.AddBlock();
+  auto *reload = fixture.AddBlock();
+  auto *merge = fixture.AddBlock();
+  entry->AddBranch(header);
+  header->AddBranch(reload);
+  header->AddBranch(merge);
+  reload->AddBranch(merge);
+  merge->AddBranch(header);
+  std::array<Value, 8> words;
+  for (uint32_t word = 0; word < words.size(); ++word) {
+    auto &loop = header->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+    auto &choice = merge->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+    loop.AddPhiOperand(entry, fixture.UserData(word));
+    loop.AddPhiOperand(merge, Value(&choice));
+    // Incoming order is independent for each descriptor DWORD.
+    if (word & 1u) {
+      choice.AddPhiOperand(reload, fixture.UserData(word + 8));
+      choice.AddPhiOperand(header, Value(&loop));
+    } else {
+      choice.AddPhiOperand(header, Value(&loop));
+      choice.AddPhiOperand(reload, fixture.UserData(word + 8));
+    }
+    words[word] = Value(&choice);
+  }
+  fixture.block = merge;
+  const auto image = fixture.Image(words);
+  const auto sampler = fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)});
+  MemoryInfo memory;
+  memory.kind = ResourceKind::Image;
+  memory.image_dimension = Decoder::ImageDimension::Dim2D;
+  fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, fixture.ImageAddress()},
+               fixture.AddMemory(memory, 4));
+  fixture.PlanAndTrack();
+  const auto source = fixture.program.info.images[0].source;
+  const auto &finite = fixture.program.descriptor_sources[source].indirect_image;
+  Check(finite && finite->sources.size() == 2,
+        "cyclic image selection did not retain two complete descriptor candidates");
+  const auto *key = image.Instruction()->Arg(0).Instruction();
+  Check(key->GetOpcode() == ValueOpcode::Phi && key->Parent() == merge,
+        "finite image key lost its original merge block");
+  const auto *loop = key->Arg(0).Instruction();
+  Check(loop->GetOpcode() == ValueOpcode::Phi && loop->Parent() == header &&
+            loop->Arg(1).Resolve() == Value(const_cast<Inst *>(key)) &&
+            loop->Arg(0).U32() == 0 && key->Arg(1).U32() == 1,
+        "finite image key did not preserve the loop-carried selection");
+  std::array<uint32_t, 16> data;
+  for (uint32_t i = 0; i < data.size(); ++i) data[i] = 100u + i;
+  SrtWalker walker(fixture.program, SrtRuntime{.user_data = data});
+  for (uint32_t candidate = 0; candidate < 2; ++candidate) {
+    DescriptorValue descriptor;
+    Check(walker.EvaluateDescriptor(finite->sources[candidate], descriptor),
+          "finite image candidate is not host-readable");
+    for (uint32_t word = 0; word < 8; ++word)
+      Check(descriptor.dwords[word] == data[candidate * 8 + word],
+            "finite image selection mixed descriptor DWORDs across predecessors");
+  }
+}
+
+void TestFiniteImageBitScanSentinel() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  for (const bool nonzero : {false, true}) {
+    Fixture fixture;
+    auto *entry = fixture.block;
+    auto *dispatch = fixture.AddBlock();
+    auto *load = fixture.AddBlock();
+    auto *merge = fixture.AddBlock();
+    auto *exit = fixture.AddBlock();
+    entry->AddBranch(dispatch);
+    entry->AddBranch(exit);
+    dispatch->AddBranch(load);
+    dispatch->AddBranch(merge);
+    load->AddBranch(merge);
+    const auto mask = fixture.Emit(ValueOpcode::GetBuiltin,
+        {Value(uint32_t(StageInputKind::LocalInvocationIndex)), Value(0u)});
+    const auto condition = fixture.Emit(nonzero ? ValueOpcode::INotEqual32 : ValueOpcode::IEqual32,
+                                        {mask, Value(0u)});
+    auto &guard = fixture.program.block_info[0];
+    guard.condition = condition;
+    guard.terminator.kind = CFG::TerminatorKind::ConditionalBranch;
+    guard.terminator.true_block = 1;
+    guard.terminator.false_block = 4;
+    fixture.block = dispatch;
+    const auto first = fixture.Emit(ValueOpcode::FindILsb32, {mask});
+    const auto minimum = fixture.Emit(ValueOpcode::UMin32, {first, Value(32u)});
+    const auto selector = fixture.Emit(ValueOpcode::ShiftLeftLogical32, {minimum, Value(2u)});
+    fixture.Emit(ValueOpcode::ReferenceU32, {selector});
+    auto &table = fixture.program.block_info[1];
+    table.indirect_target = selector;
+    table.terminator.kind = CFG::TerminatorKind::IndirectBranch;
+    table.terminator.indirect_selector_code = 0;
+    table.terminator.indirect_selector_values = {0u, 128u};
+    table.terminator.indirect_selector_targets = {2u, 3u};
+    std::array<Value, 8> words;
+    for (uint32_t word = 0; word < words.size(); ++word) {
+      auto &phi = merge->AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+      phi.AddPhiOperand(dispatch, mask);
+      phi.AddPhiOperand(load, Value(100u + word));
+      words[word] = Value(&phi);
+    }
+    fixture.block = merge;
+    const auto image = fixture.Image(words);
+    const auto sampler = fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)});
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Image;
+    memory.image_dimension = Decoder::ImageDimension::Dim2D;
+    fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, fixture.ImageAddress()},
+                 fixture.AddMemory(memory, 4));
+    if (!nonzero) {
+      CheckFatal([&] { fixture.PlanAndTrack(); }, "not a valid runtime value",
+                 "zero bit scan silently accepted a GPU-valued descriptor sentinel");
+      Check(fixture.program.descriptor_sources.empty() && image.Instruction()->Arg(0) == words[0],
+            "failed finite descriptor analysis partially mutated the resource plan");
+      continue;
+    }
+    fixture.PlanAndTrack();
+    const auto source = fixture.program.info.images[0].source;
+    const auto &finite = fixture.program.descriptor_sources[source].indirect_image;
+    Check(finite && finite->sources.size() == 1 &&
+              image.Instruction()->Arg(0).Instruction()->NumPhiBlocks() == 2,
+          "nonzero bit scan retained its impossible sentinel or removed a Phi edge");
+  }
+}
+
 void TestLoopCycleEnteredThroughRuntimeValue() {
   Fixture fixture;
   auto *entry = fixture.block;
@@ -3292,6 +3418,8 @@ int main() {
     Run("dynamic SRT", TestDynamicSrtReadRemainsExplicit);
     Run("phi validation", TestPhiValidation);
     Run("conditional sampler phi", TestConditionalSamplerPhi);
+    Run("finite image phi cycle", TestFiniteImagePhiCycle);
+    Run("finite image bit scan sentinel", TestFiniteImageBitScanSentinel);
     Run("runtime-rooted loop", TestLoopCycleEnteredThroughRuntimeValue);
     Run("invariant loop phi", TestInvariantLoopPhi);
     Run("DMA address materialization", TestDmaAddressMaterialization);

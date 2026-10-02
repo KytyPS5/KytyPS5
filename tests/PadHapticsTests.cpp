@@ -56,6 +56,7 @@ std::binary_semaphore                 write_started {0}, allow_write {0};
 SDL_AudioStream*                      default_stream      = nullptr;
 bool                                  fail_default_resume = false;
 int                                   active_controller   = 1;
+float                                 speaker_scale = 1.0f, vibration_scale = 1.0f;
 } // namespace
 
 namespace Fake {
@@ -325,6 +326,9 @@ namespace Libs::Controller {
 int GetActiveControllerId() {
 	return active_controller;
 }
+float GetSettingScale(Setting setting) {
+	return setting == Setting::SpeakerVolume ? speaker_scale : vibration_scale;
+}
 } // namespace Libs::Controller
 
 namespace Libs::LibKernel {
@@ -364,6 +368,7 @@ struct Fixture {
 		default_stream      = nullptr;
 		fail_default_resume = false;
 		active_controller   = 1;
+		speaker_scale = vibration_scale = 1.0f;
 		now                 = 1000;
 		opens = rumble_calls = 0;
 		fail_open = fail_resume = false;
@@ -381,8 +386,8 @@ Port Open(bool speaker = false, uint32_t freq = 48000) {
 	return Port(stream, Haptics::Close);
 }
 void Queue(const Port& port, const void* data, uint32_t frames = 2, uint32_t channels = 2,
-           bool is_float = true, const int* volume = unity.data()) {
-	Haptics::Queue(port.get(), 1, data, frames, channels, is_float, volume);
+           bool is_float = true, const int* volume = unity.data(), float gain = 1.0f) {
+	Haptics::Queue(port.get(), 1, data, frames, channels, is_float, volume, gain);
 }
 void Pull() {
 	std::array<float, 64> buffer {};
@@ -412,6 +417,8 @@ void TestFormatsAndVolume() {
 	const std::array<int16_t, 2> mono {16384, -32768};
 	Queue(port, mono.data(), 2, 1, false, volume.data() + 1);
 	ExpectPcm({0, 0, 0.25f, 0.25f, 0, 0, -0.5f, -0.5f});
+	Queue(port, mono.data(), 2, 1, false, volume.data() + 1, 0.5f);
+	ExpectPcm({0, 0, 0.125f, 0.125f, 0, 0, -0.25f, -0.25f});
 	std::array<float, 24> multichannel {};
 	multichannel.fill(0.9f);
 	multichannel[0]  = 0.1f;
@@ -559,6 +566,33 @@ void TestRumbleLeaseAndDuration() {
 	const int calls = rumble_calls;
 	Pull();
 	Check(rumble_calls == calls, "audio pull touched rumble after shutdown");
+}
+
+void TestScaledRumbleDuration() {
+	for (bool bluetooth: {false, true}) {
+		Fixture f;
+		wireless = hid_available = bluetooth;
+		auto               port  = Open();
+		std::vector<float> sound(2048, 0.5f);
+		Haptics::SetVibration(1, 100, 50, 1000);
+		Queue(port, sound.data(), 1024, 2, true, unity.data(), 0.0f);
+		Check(rumble.large == 100 * 0x101, "muted haptics suppressed motor rumble");
+		Queue(port, sound.data(), 1024, 2, true, unity.data(), 0.5f);
+		Check(rumble.large == 0, "scaled haptics did not suppress motor rumble");
+		now += 100;
+		Haptics::SetVibration(1, 50, 25, 900);
+		now += 200;
+		if (bluetooth) {
+			Haptics::UpdateBluetoothRumble();
+		} else {
+			Pull();
+		}
+		Check(rumble.large == 50 * 0x101 && rumble.small == 25 * 0x101 && rumble.duration == 700,
+		      "scaled rumble lost its strength or extended its original expiry");
+		Haptics::SetVibration(1, 50, 25, 0);
+		Check(rumble.large == 0 && rumble.small == 0 && rumble.duration == 0,
+		      "expired rumble was restarted");
+	}
 }
 
 void TestSwitchStopsOldRumble() {
@@ -732,12 +766,12 @@ void TestBluetoothFormatsAndRoutingFailure() {
 	now += 2001;
 	std::vector<int16_t> mono(1024, 16384);
 	const int            volume = 16384;
-	Queue(speaker, mono.data(), 1024, 1, false, &volume);
+	Queue(speaker, mono.data(), 1024, 1, false, &volume, 0.5f);
 	auto pending = Bluetooth::Prepare(now * 1000000);
 	Check(pending.size() == 1 && hid_opens == 2 && effects[1][7] == 0x30 &&
-	          std::abs(pending[0].audio[200] - 0.25f) < 1e-4f &&
-	          std::abs(pending[0].audio[201] - 0.25f) < 1e-4f,
-	      "Bluetooth mono int16 volume mapping or speaker routing recovery failed");
+	          std::abs(pending[0].audio[200] - 0.125f) < 1e-4f &&
+	          std::abs(pending[0].audio[201] - 0.125f) < 1e-4f,
+	      "Bluetooth mono int16 volume/gain mapping or speaker routing recovery failed");
 }
 
 void TestBluetoothEncodingDoesNotBlockAudioQueue() {
@@ -1103,6 +1137,82 @@ void TestAudioSpeakerRouting() {
 	          SDL_GetAudioStreamQueued(default_stream) == 0,
 	      "successful DualSense playback also queued audio on the main output");
 	ExpectPcm({0.5f, 0.5f, 0, 0, 0.5f, 0.5f, 0, 0});
+	speaker_scale = 0.5f;
+	audio.AudioOutOutputs(&output, 1, false);
+	ExpectPcm({0.25f, 0.25f, 0, 0, 0.25f, 0.25f, 0, 0});
+	speaker_scale = 0.0f;
+	audio.AudioOutOutputs(&output, 1, false);
+	ExpectPcm({});
+	active_controller = 2;
+	audio.AudioOutOutputs(&output, 1, false);
+	std::array<float, 4> fallback {};
+	Check(SDL_GetAudioStreamData(default_stream, fallback.data(), sizeof(fallback)) ==
+	              sizeof(fallback) &&
+	          fallback == std::array<float, 4> {},
+	      "unplugging the controller unmuted its speaker fallback");
+}
+
+void TestAudioFallbackGain() {
+	for (bool is_float: {false, true}) {
+		Fixture            f;
+		Libs::Audio::Audio audio;
+		active_controller = 2;
+		speaker_scale     = 0.5f;
+		const std::array<int16_t, 4> integer_pcm {16384, 16384, 16384, 16384};
+		const auto  format = is_float ? Libs::Audio::Audio::Format::FloatStereo
+		                              : Libs::Audio::Audio::Format::Signed16bitStereo;
+		const void* data   = is_float ? static_cast<const void*>(pcm.data()) : integer_pcm.data();
+		for (int type: {0, 4}) {
+			const auto               port = audio.AudioOutOpen(type, 2, 48000, format);
+			const std::array<int, 2> volume {16384, 16384};
+			audio.AudioOutSetVolume(port, 3, volume.data());
+			Libs::Audio::Audio::OutputParam output {port, data};
+			audio.AudioOutOutputs(&output, 1, false);
+			const float          expected = type == 4 ? 0.125f : 0.25f;
+			std::array<float, 4> actual {};
+			if (is_float) {
+				Check(SDL_GetAudioStreamData(default_stream, actual.data(), sizeof(actual)) ==
+				          sizeof(actual),
+				      "float fallback output is missing");
+			} else {
+				std::array<int16_t, 4> integers {};
+				Check(SDL_GetAudioStreamData(default_stream, integers.data(), sizeof(integers)) ==
+				          sizeof(integers),
+				      "integer fallback output is missing");
+				std::transform(integers.begin(), integers.end(), actual.begin(),
+				               [](int16_t value) { return value / 32768.0f; });
+			}
+			Check(std::all_of(actual.begin(), actual.end(),
+			                  [expected](float value) { return value == expected; }),
+			      "speaker setting gain was lost or applied to ordinary audio");
+			audio.AudioOutClose(port);
+		}
+	}
+}
+
+void TestAudioVibrationGain() {
+	for (bool bluetooth: {false, true}) {
+		Fixture f;
+		wireless = hid_available = bluetooth;
+		Libs::Audio::Audio audio;
+		vibration_scale = 0.5f;
+		speaker_scale   = 0.0f;
+		const auto port =
+		    audio.AudioOutOpen(10, 1024, 48000, Libs::Audio::Audio::Format::FloatStereo);
+		std::vector<float>              sound(2048, 0.5f);
+		Libs::Audio::Audio::OutputParam output {port, sound.data()};
+		audio.AudioOutOutputs(&output, 1, false);
+		Check(default_stream == nullptr, "vibration port opened ordinary audio");
+		if (bluetooth) {
+			Check(Bluetooth::Prepare(now * 1000000).empty(),
+			      "Bluetooth vibration skipped its coalescing window");
+			const auto pending = Bluetooth::Prepare((now + 1) * 1000000);
+			Check(pending.size() == 1 && pending[0].data[76] == 32,
+			      "Bluetooth vibration did not apply its own setting gain");
+		} else {
+			ExpectPcm({0, 0, 0.25f, 0.25f, 0, 0, 0.25f, 0.25f});
+		}
+	}
 }
 
 void TestBluetoothAudioSpeakerRouting() {
@@ -1113,12 +1223,15 @@ void TestBluetoothAudioSpeakerRouting() {
 	const auto port = audio.AudioOutOpen(4, 1024, 48000, Libs::Audio::Audio::Format::FloatStereo);
 	Check(port.IsValid() && default_stream != nullptr, "Bluetooth pad speaker port did not open");
 	std::vector<float> sound(2048, 0.25f);
+	speaker_scale = 0.5f;
 	Libs::Audio::Audio::OutputParam output {port, sound.data()};
 	Check(audio.AudioOutOutputs(&output, 1, false) == 1024 && hid_opens == 1 &&
 	          SDL_GetAudioStreamQueued(default_stream) == 0,
 	      "Bluetooth pad speaker also played on the host output");
 	fail_hid_write = true;
 	auto pending = Libs::Controller::DualSenseBluetooth::Prepare(now * 1000000);
+	Check(pending.size() == 1 && std::abs(pending[0].audio[200] - 0.125f) < 1e-4f,
+	      "Bluetooth speaker did not apply its setting gain");
 	Libs::Controller::DualSenseBluetooth::Send(pending);
 	Check(audio.AudioOutOutputs(&output, 1, false) == 1024 &&
 	          SDL_GetAudioStreamQueued(default_stream) > 0,
@@ -1144,6 +1257,8 @@ int main() {
 	SDL_SetHint(SDL_HINT_AUDIO_DRIVER, "dummy");
 	TestAudioSpeakerFallback();
 	TestAudioSpeakerRouting();
+	TestAudioFallbackGain();
+	TestAudioVibrationGain();
 	TestBluetoothAudioSpeakerRouting();
 	TestAudioDefaultResumeFailure();
 	TestFormatsAndVolume();
@@ -1173,6 +1288,7 @@ int main() {
 	TestUsbAndBluetoothFeatureParity();
 	TestFailuresAndBoundedQueue();
 	TestRumbleLeaseAndDuration();
+	TestScaledRumbleDuration();
 	TestSwitchStopsOldRumble();
 	TestCloseRestoresRumble();
 	std::printf("PadHapticsTests: all cases passed\n");

@@ -278,6 +278,101 @@ void TestFailedMaterializationRejectsStage() {
         "missing runtime user data did not reject the cached stage");
 }
 
+void TestFiniteImageRefreshReusesScalarReads() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = true;
+  program.resource_tracking_complete = true;
+  auto &block = AddValueBlock(program);
+  program.memory_info.push_back({.kind = ResourceKind::ScalarAddress});
+  auto &handle = block.AppendNewInst(ValueOpcode::GetAddressResource,
+                                     {Value(0x1000u), Value(0u)});
+  auto &srt = block.AppendNewInst(ValueOpcode::GetSrtResource);
+  for (uint32_t index = 0; index < 3; ++index) {
+    auto &read = block.AppendNewInst(ValueOpcode::LoadAddressU32,
+        {Value(&handle), Value(index * 4u), Value(0u), Value(true)});
+    read.SetFlags(MemoryFlags{.index = 0});
+    program.srt_reads.push_back({Value(&read), index});
+    auto &flat = block.AppendNewInst(ValueOpcode::ReadConst,
+                                     {Value(&srt), Value(index)});
+    DescriptorSource source;
+    source.dword_count = 8;
+    source.dwords.fill(Value(0u));
+    source.dwords[0] = Value(&flat);
+    source.dwords[1] = Value(static_cast<uint32_t>(
+        Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float) << 20u);
+    source.dwords[3] = Value(Libs::Graphics::DstSel(4, 5, 6, 7) |
+        (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u));
+    program.descriptor_sources.push_back(source);
+  }
+  DescriptorSource root;
+  root.dword_count = 8;
+  root.dwords.fill(Value(0u));
+  root.indirect_image.emplace(DescriptorSource::IndirectImage{}).sources = {0, 1, 2, 1};
+  program.descriptor_sources.push_back(root);
+  program.info.images.push_back({
+      .source = 3,
+      .resource_class = ImageResourceClass::Sampled,
+      .numeric_class = Libs::Graphics::Prospero::TextureNumericClass::Float,
+      .dimension = Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension::Dim2D});
+  auto plan = ExtractResourcePlan(program);
+  struct Reads {
+    std::array<uint32_t, 3> words{0x100u, 0x200u, 0x200u};
+    std::array<uint32_t, 3> counts{};
+    uint32_t ordinary = 0;
+  } reads;
+  const SrtRuntime runtime{
+      .read_memory = +[](void *data, uint64_t, std::span<uint32_t>) {
+        ++static_cast<Reads *>(data)->ordinary;
+        return false;
+      },
+      .userdata = &reads,
+      .read_specialization_memory = +[](void *data, uint64_t address,
+                                        std::span<uint32_t> words) {
+        if (words.size() != 1 || address < 0x1000u || address >= 0x100cu ||
+            (address & 3u) != 0) return false;
+        auto &reads = *static_cast<Reads *>(data);
+        const auto index = (address - 0x1000u) / 4u;
+        ++reads.counts[index];
+        words[0] = reads.words[index];
+        return true;
+      }};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  const auto capacities = [&] {
+    return std::array{snapshot.images.capacity(), snapshot.flattened_srt.capacity(),
+                      snapshot.specialization_reads.capacity(), specialization.images.capacity()};
+  };
+  const auto check_mapping = [&](std::array<uint32_t, 4> ordinals) {
+    const auto offset = specialization.images[0].indirect_mapping_offset;
+    Check(snapshot.images.size() == 2 && snapshot.flattened_srt[offset] == 4,
+          "finite image candidates were not deduplicated");
+    for (uint32_t key = 0; key < ordinals.size(); ++key) {
+      Check(snapshot.flattened_srt[offset + 1u + key * 2u] == key &&
+                snapshot.flattened_srt[offset + 2u + key * 2u] == ordinals[key],
+            "finite image selector mapping is stale or incorrect");
+    }
+  };
+  Check(MaterializeResources(plan, runtime, snapshot, specialization),
+        "finite image materialization failed");
+  Check(reads.ordinary == 0 && reads.counts == std::array<uint32_t, 3>{1, 1, 1} &&
+            snapshot.specialization_reads.size() == 3,
+        "finite image candidates repeated scalar reads or bypassed clean provenance");
+  check_mapping({0, 1, 1, 1});
+  const auto warm_capacities = capacities();
+  reads.words = {0x300u, 0x300u, 0x400u};
+  Check(MaterializeResources(plan, runtime, snapshot, specialization),
+        "finite image refresh failed after descriptor changes");
+  Check(reads.ordinary == 0 && reads.counts == std::array<uint32_t, 3>{2, 2, 2} &&
+            snapshot.specialization_reads.size() == 3 &&
+            snapshot.images[0].dwords[0] == 0x300u && snapshot.images[1].dwords[0] == 0x400u,
+        "finite image refresh retained old scalar values or repeated reads");
+  check_mapping({0, 0, 1, 0});
+  Check(capacities() == warm_capacities,
+        "finite image refresh grew reusable resource storage after warmup");
+}
+
 void TestMixedSamplerDuplicatesTheCorrectSnapshot() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   auto plan = MixedSamplerPlan();
@@ -314,6 +409,7 @@ int main() {
   TestUnbasedFlatCacheHitMaterializes();
   TestWrittenDescriptorUsesStrictReaderOnce();
   TestFailedMaterializationRejectsStage();
+  TestFiniteImageRefreshReusesScalarReads();
   TestMixedSamplerDuplicatesTheCorrectSnapshot();
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;

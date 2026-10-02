@@ -152,6 +152,8 @@ public:
 	}
 
 private:
+	friend void EliminateDeadCode(const std::vector<Block*>& blocks);
+
 	void AddUse(Inst* used, size_t operand);
 	void RemoveUse(Inst* used, size_t operand);
 	void ClearArgs();
@@ -161,6 +163,7 @@ private:
 
 	ValueOpcode         opcode;
 	uint8_t             num_args;
+	bool                live = false;
 	mutable uint32_t    evaluation_index = UINT32_MAX;
 	uint64_t            flags;
 	Block*              parent = nullptr;

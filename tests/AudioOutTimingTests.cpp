@@ -135,6 +135,9 @@ namespace Libs::Controller {
 int GetActiveControllerId() {
 	return 0;
 }
+float GetSettingScale(Setting) {
+	return 1.0f;
+}
 
 namespace DualSenseHaptics {
 Stream* Open(uint32_t, bool) {
@@ -145,7 +148,7 @@ void     Close(Stream*) {}
 bool UsesBluetooth(const Stream* stream) {
 	return stream != nullptr && pad_bluetooth;
 }
-uint64_t Queue(Stream* stream, int, const void*, uint32_t, uint32_t, bool, const int*) {
+uint64_t Queue(Stream* stream, int, const void*, uint32_t, uint32_t, bool, const int*, float) {
 	return stream != nullptr ? pad_queue_us : 0;
 }
 } // namespace DualSenseHaptics

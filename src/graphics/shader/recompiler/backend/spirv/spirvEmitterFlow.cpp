@@ -659,20 +659,21 @@ uint32_t EmitConditionRef(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (ctx.half != 0) return ctx.other_half->Def(IR::Value(&inst));
 	const auto kind = inst.Flags<CFG::BranchCondition>();
 	if (kind == CFG::BranchCondition::ScalarInstruction) return ctx.Arg(inst, 0);
-	const auto ballot = ctx.Ballot(inst.Arg(0));
+	const bool zero = kind == CFG::BranchCondition::ExecZero ||
+	                  kind == CFG::BranchCondition::VccZero || kind == CFG::BranchCondition::SccZero;
+	// A "*Zero" branch is taken when every lane holds. Test "no lane fails": a ballot of the
+	// condition itself drops lanes without work (a capture wave past the vertex count), and an
+	// all-ones compare then never succeeds, so the wave stays in the loop.
+	const auto ballot = ctx.Ballot(inst.Arg(0), zero);
 	const auto low = ctx.state.builder.AllocateId();
 	const auto high = ctx.state.builder.AllocateId();
 	const auto combined = ctx.state.builder.AllocateId();
 	const auto result = ctx.state.builder.AllocateId();
 	ctx.state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(ctx.state), low, ballot, 0);
 	ctx.state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(ctx.state), high, ballot, 1);
-	const bool zero = kind == CFG::BranchCondition::ExecZero ||
-	                  kind == CFG::BranchCondition::VccZero || kind == CFG::BranchCondition::SccZero;
-	ctx.state.builder.AddFunction(zero ? spv::OpBitwiseAnd : spv::OpBitwiseOr,
-	                              TypeU32(ctx.state), combined, low, high);
+	ctx.state.builder.AddFunction(spv::OpBitwiseOr, TypeU32(ctx.state), combined, low, high);
 	ctx.state.builder.AddFunction(zero ? spv::OpIEqual : spv::OpINotEqual,
-	                              TypeBool(ctx.state), result, combined,
-	                              ConstantU32(ctx.state, zero ? ~0u : 0u));
+	                              TypeBool(ctx.state), result, combined, ConstantU32(ctx.state, 0u));
 	return result;
 }
 

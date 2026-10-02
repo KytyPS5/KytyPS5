@@ -135,6 +135,8 @@ IR::U32 Translator::ReadRawU32(const Decoder::Operand& operand) {
 		case Decoder::OperandKind::IntegerInlineConstant:
 		case Decoder::OperandKind::FloatInlineConstant: return IR::U32(IR::Value(operand.value));
 		case Decoder::OperandKind::Null:
+		case Decoder::OperandKind::SharedBase:
+		case Decoder::OperandKind::PrivateBase:
 		case Decoder::OperandKind::PopsExitingWaveId: return IR::U32(IR::Value(0u));
 		case Decoder::OperandKind::Sgpr:
 			return ir.GetScalarReg(static_cast<IR::ScalarReg>(operand.reg));
@@ -474,6 +476,12 @@ IR::U32 Translator::ReadU32(const Decoder::Operand& operand) {
 }
 
 std::array<IR::U32, 2> Translator::ReadU32Pair(const Decoder::Operand& operand) {
+	if (operand.kind == Decoder::OperandKind::PrivateBase ||
+	    operand.kind == Decoder::OperandKind::SharedBase) {
+		return {IR::U32(IR::Value(0u)), IR::U32(IR::Value(
+		    operand.kind == Decoder::OperandKind::PrivateBase ? Decoder::PrivateApertureHigh
+		                                                      : Decoder::SharedApertureHigh))};
+	}
 	if (operand.kind == Decoder::OperandKind::ExecLo) {
 		return {ir.GetExecLo(), ir.GetExecHi()};
 	}
@@ -886,13 +894,35 @@ void IncludeInstructionVectorRegisters(const Decoder::Instruction& inst, uint32_
 		case Decoder::Opcode::V_CVT_F64_F32:
 		case Decoder::Opcode::V_CVT_F64_U32: include_vector(inst.dst, 2u); break;
 		case Decoder::Opcode::V_FMA_F64: include_vector(inst.src2, 2u); [[fallthrough]];
+		case Decoder::Opcode::V_ADD_F64:
 		case Decoder::Opcode::V_MUL_F64: include_vector(inst.src1, 2u); [[fallthrough]];
 		case Decoder::Opcode::V_RCP_F64: include_vector(inst.dst, 2u); [[fallthrough]];
 		case Decoder::Opcode::V_CVT_F32_F64: include_vector(inst.src0, 2u); break;
+		case Decoder::Opcode::V_CMP_EQ_F64:
+		case Decoder::Opcode::V_CMP_LE_F64:
+		case Decoder::Opcode::V_CMPX_LE_F64:
+		case Decoder::Opcode::V_CMPX_GE_F64:
+		case Decoder::Opcode::V_CMP_EQ_I64:
+		case Decoder::Opcode::V_CMP_LT_I64:
+		case Decoder::Opcode::V_CMP_LE_I64:
+		case Decoder::Opcode::V_CMP_LT_U64:
+		case Decoder::Opcode::V_CMP_EQ_U64:
+		case Decoder::Opcode::V_CMP_LE_U64:
+		case Decoder::Opcode::V_CMP_GT_U64:
+		case Decoder::Opcode::V_CMP_NE_U64:
+		case Decoder::Opcode::V_CMP_GE_U64:
+		case Decoder::Opcode::V_CMPX_NE_I64:
+		case Decoder::Opcode::V_CMPX_LE_U64:
+		case Decoder::Opcode::V_CMPX_NE_U64:
+			include_vector(inst.src0, 2u);
+			include_vector(inst.src1, 2u);
+			break;
 		default: break;
 	}
 	if (inst.family == Decoder::Family::DS) {
 		switch (inst.opcode) {
+			case Decoder::Opcode::DS_ADD_U64:
+			case Decoder::Opcode::DS_OR_B64:
 			case Decoder::Opcode::DS_WRITE_B64:
 			case Decoder::Opcode::DS_WRITE_B96:
 			case Decoder::Opcode::DS_WRITE_B128: include_vector(inst.src1, inst.data_dwords); break;
@@ -1126,12 +1156,13 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				return entry_ir.ISub(lhs, minimum(lhs, rhs));
 			};
 			const auto local = builtin(IR::StageInputKind::LocalInvocationIndex);
-			const auto primitive_chunk = entry_ir.IMul(builtin(IR::StageInputKind::WorkgroupId, 0),
-			                                           u32(mesh.primitives_per_group));
+			const auto group = builtin(IR::StageInputKind::WorkgroupId, 0);
+			const auto primitive_chunk = mesh.fast_launch ? group :
+			    entry_ir.IMul(group, u32(mesh.primitives_per_group));
 			const auto step  = u32(mesh.InputPrimitiveStep());
 			const auto size  = u32(mesh.InputPrimitiveSize());
-			const auto chunk = entry_ir.IMul(primitive_chunk, step);
-			const auto vertices =
+			const auto chunk = mesh.fast_launch ? group : entry_ir.IMul(primitive_chunk, step);
+			const auto vertices = mesh.fast_launch ? u32(mesh.vertices_per_group) :
 			    minimum(subtract_saturate(draw(0), chunk), u32(mesh.vertices_per_group));
 			const auto primitives = entry_ir.Select(
 			    entry_ir.ULessThan(vertices, size), u32(0),
@@ -1152,56 +1183,64 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			    entry_ir.BitwiseOr(wave_info, entry_ir.BitwiseOr(entry_ir.ShiftLeftLogical(
 			                                                         primitive_count, u32(8)),
 			                                                     vertex_count)));
-			// GS adjacency addresses local ES records in LDS. Fans retain the draw's
-			// center in every subgroup; strip winding follows the global primitive.
-			const auto vertex = entry_ir.IMul(local, step);
-			auto       first  = vertex;
-			auto       second = u32(0);
-			auto       third  = u32(0);
-			if (mesh.InputPrimitiveSize() >= 2u) {
-				second = entry_ir.IAdd(vertex, u32(1));
+			if (mesh.fast_launch) {
+				// Fast launch broadcasts the subgroup's base vertex and instance to every lane.
+				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5), entry_ir.IAdd(draw(1), group));
+				entry_ir.SetVectorReg(
+				    static_cast<IR::VectorReg>(6),
+				    entry_ir.IAdd(draw(2), builtin(IR::StageInputKind::WorkgroupId, 1)));
+			} else {
+				// GS adjacency addresses local ES records in LDS. Fans retain the draw's
+				// center in every subgroup; strip winding follows the global primitive.
+				const auto vertex = entry_ir.IMul(local, step);
+				auto       first  = vertex;
+				auto       second = u32(0);
+				auto       third  = u32(0);
+				if (mesh.InputPrimitiveSize() >= 2u) {
+					second = entry_ir.IAdd(vertex, u32(1));
+				}
+				if (mesh.InputPrimitiveSize() == 3u) {
+					third = entry_ir.IAdd(vertex, u32(2));
+				}
+				auto input_vertex = entry_ir.IAdd(chunk, local);
+				if (mesh.input_primitive == static_cast<uint32_t>(Prospero::PrimitiveType::kTriFan)) {
+					first = u32(0);
+					input_vertex = entry_ir.Select(entry_ir.IEqual(local, u32(0)), u32(0), input_vertex);
+				} else if (mesh.input_primitive == static_cast<uint32_t>(Prospero::PrimitiveType::kTriStrip)) {
+					const auto parity = entry_ir.BitwiseAnd(entry_ir.IAdd(primitive_chunk, local), u32(1));
+					first = entry_ir.IAdd(first, parity);
+					second = entry_ir.ISub(second, parity);
+				}
+				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(0),
+				                      entry_ir.BitwiseOr(entry_ir.ShiftLeftLogical(first, u32(2)),
+				                                         entry_ir.ShiftLeftLogical(second, u32(18))));
+				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(1),
+				                      entry_ir.ShiftLeftLogical(third, u32(2)));
+				const auto index_bytes  = draw(3);
+				const auto indexed      = entry_ir.INotEqual(index_bytes, u32(0));
+				const auto index_low    = draw(4);
+				const auto byte_offset  = entry_ir.IAdd(entry_ir.BitwiseAnd(index_low, u32(3)),
+				                                           entry_ir.IMul(input_vertex, index_bytes));
+				const auto index_resource = entry_ir.Emit(
+				    IR::ValueOpcode::GetAddressResource,
+				    {entry_ir.BitwiseAnd(index_low, u32(~3u)), draw(5)});
+				const auto memory_index = static_cast<uint32_t>(result.memory_info.size());
+				result.memory_info.push_back({.kind = IR::ResourceKind::Global});
+				const auto packed_index = entry_ir.Emit(
+				    IR::ValueOpcode::LoadAddressU32,
+				    {index_resource, entry_ir.BitwiseAnd(byte_offset, u32(~3u)), u32(0),
+				     entry_ir.LogicalAnd(indexed, entry_ir.ULessThan(local, vertices))},
+				    IR::MemoryFlags {.index = memory_index});
+				const auto index = IR::U32(entry_ir.Emit(
+				    IR::ValueOpcode::BitFieldUExtract,
+				    {packed_index, entry_ir.IMul(entry_ir.BitwiseAnd(byte_offset, u32(3)), u32(8)),
+				     entry_ir.IMul(index_bytes, u32(8))}));
+				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5),
+				                      entry_ir.IAdd(draw(1), entry_ir.Select(indexed, index, input_vertex)));
+				entry_ir.SetVectorReg(
+				    static_cast<IR::VectorReg>(8),
+				    entry_ir.IAdd(draw(2), builtin(IR::StageInputKind::WorkgroupId, 1)));
 			}
-			if (mesh.InputPrimitiveSize() == 3u) {
-				third = entry_ir.IAdd(vertex, u32(2));
-			}
-			auto input_vertex = entry_ir.IAdd(chunk, local);
-			if (mesh.input_primitive == static_cast<uint32_t>(Prospero::PrimitiveType::kTriFan)) {
-				first = u32(0);
-				input_vertex = entry_ir.Select(entry_ir.IEqual(local, u32(0)), u32(0), input_vertex);
-			} else if (mesh.input_primitive == static_cast<uint32_t>(Prospero::PrimitiveType::kTriStrip)) {
-				const auto parity = entry_ir.BitwiseAnd(entry_ir.IAdd(primitive_chunk, local), u32(1));
-				first = entry_ir.IAdd(first, parity);
-				second = entry_ir.ISub(second, parity);
-			}
-			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(0),
-			                      entry_ir.BitwiseOr(entry_ir.ShiftLeftLogical(first, u32(2)),
-			                                         entry_ir.ShiftLeftLogical(second, u32(18))));
-			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(1),
-			                      entry_ir.ShiftLeftLogical(third, u32(2)));
-			const auto index_bytes  = draw(3);
-			const auto indexed      = entry_ir.INotEqual(index_bytes, u32(0));
-			const auto index_low    = draw(4);
-			const auto byte_offset  = entry_ir.IAdd(entry_ir.BitwiseAnd(index_low, u32(3)),
-			                                           entry_ir.IMul(input_vertex, index_bytes));
-			const auto index_resource = entry_ir.Emit(
-			    IR::ValueOpcode::GetAddressResource,
-			    {entry_ir.BitwiseAnd(index_low, u32(~3u)), draw(5)});
-			const auto memory_index = static_cast<uint32_t>(result.memory_info.size());
-			result.memory_info.push_back({.kind = IR::ResourceKind::Global});
-			const auto packed_index = entry_ir.Emit(
-			    IR::ValueOpcode::LoadAddressU32,
-			    {index_resource, entry_ir.BitwiseAnd(byte_offset, u32(~3u)), u32(0),
-			     entry_ir.LogicalAnd(indexed, entry_ir.ULessThan(local, vertices))},
-			    IR::MemoryFlags {.index = memory_index});
-			const auto index = IR::U32(entry_ir.Emit(
-			    IR::ValueOpcode::BitFieldUExtract,
-			    {packed_index, entry_ir.IMul(entry_ir.BitwiseAnd(byte_offset, u32(3)), u32(8)),
-			     entry_ir.IMul(index_bytes, u32(8))}));
-			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5),
-			                      entry_ir.IAdd(draw(1), entry_ir.Select(indexed, index, input_vertex)));
-			entry_ir.SetVectorReg(
-			    static_cast<IR::VectorReg>(8),
-			    entry_ir.IAdd(draw(2), builtin(IR::StageInputKind::WorkgroupId, 1)));
 		} else if (options.stage == ShaderType::Local) {
 			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(3), IR::U32(IR::Value(64u)));
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(2),

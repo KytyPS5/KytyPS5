@@ -142,6 +142,7 @@ CompiledShaderInfo Program::TakeCompiledInfo() && {
 	    .user_data_base  = user_data_base,
 	    .user_data_count = user_data_count,
 	    .scratch_dwords  = scratch_dwords,
+	    .has_address_writes = has_address_writes,
 	    .info            = std::move(info),
 	    .bindings        = std::move(bindings),
 	};

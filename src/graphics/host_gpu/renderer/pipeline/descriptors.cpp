@@ -974,6 +974,41 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		        (pipeline_bind_point == vk::PipelineBindPoint::eCompute &&
 		         shader_stage != vk::ShaderStageFlagBits::eCompute));
 	}
+	for (const auto* reader: prepared_bindings) {
+		const auto& reads = reader->runtime->resources->specialization_reads;
+		if (reads.empty()) continue;
+		for (const auto* writer: prepared_bindings) {
+			if (writer->runtime->program->has_address_writes) {
+				EXIT("scalar resource reads cannot be proven disjoint from shader address writes\n");
+			}
+		}
+		for (const auto [address, size]: reads) {
+			for (const auto id: m_bound_images) {
+				const auto* image = m_context.GetTextureCache().m_slot_images.try_get(id);
+				if (image == nullptr ||
+				    (!image->binding.shader_write && !image->binding.is_target)) continue;
+				for (const auto written: {image->info.data, image->info.stencil,
+				                          image->info.metadata.range}) {
+					if (written.size != 0 && ImageRangeOverlaps(address, size,
+					                                          written.address, written.size)) {
+						EXIT("scalar resource reads overlap an image or attachment write\n");
+					}
+				}
+			}
+			for (const auto* writer: prepared_bindings) {
+				const auto& program = *writer->runtime->program;
+				for (uint32_t i = 0; i < writer->buffer_sources.size(); ++i) {
+					const auto resource = program.bindings.descriptors.front().resources[i];
+					if (!program.info.buffers[resource].written) continue;
+					const auto& written = writer->buffer_sources[i];
+					if (written.size != 0 && ImageRangeOverlaps(address, size,
+					                                          written.address, written.size)) {
+						EXIT("scalar resource reads overlap a shader buffer write\n");
+					}
+				}
+			}
+		}
+	}
 	m_descriptor_buffers.clear();
 	m_descriptor_images.clear();
 	m_descriptor_writes.clear();

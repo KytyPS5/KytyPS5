@@ -795,18 +795,26 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 				return true;
 			}
 			return false;
-		case ValueOpcode::LogicalAnd:
-			if (binary()) {
-				result = (a != 0u) && (b != 0u);
+		case ValueOpcode::LogicalAnd: {
+			const bool left = Arg(inst, 0, a);
+			if (left && a == 0u) {
+				result = 0u;
 				return true;
 			}
-			return false;
-		case ValueOpcode::LogicalOr:
-			if (binary()) {
-				result = (a != 0u) || (b != 0u);
+			if (!Arg(inst, 1, b) || (b != 0u && !left)) return false;
+			result = b != 0u;
+			return true;
+		}
+		case ValueOpcode::LogicalOr: {
+			const bool left = Arg(inst, 0, a);
+			if (left && a != 0u) {
+				result = 1u;
 				return true;
 			}
-			return false;
+			if (!Arg(inst, 1, b) || (b == 0u && !left)) return false;
+			result = b != 0u;
+			return true;
+		}
 		case ValueOpcode::LogicalXor:
 			if (binary()) {
 				result = (a != 0u) != (b != 0u);
@@ -844,16 +852,31 @@ bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
 	return true;
 }
 
-std::span<const uint8_t> SrtWalker::FindActiveSources() {
-	if (m_program.control_flow.empty()) {
-		return {};
-	}
+bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
+	if (!m_program.srt_plan_complete) return false;
+	const auto refresh = [&](uint32_t slot) {
+		if (slot >= m_program.srt_reads.size()) return false;
+		const auto& read = m_program.srt_reads[slot];
+		const bool clean = read.flat_offset < m_clean_flat_slots.size() &&
+		                   m_clean_flat_slots[read.flat_offset] != 0u;
+		if (clean && (m_clean_evaluator == nullptr || m_runtime.read_specialization_memory == nullptr))
+			return false;
+		auto& evaluator = clean ? *m_clean_evaluator : *this;
+		return read.flat_offset < flat.size() && evaluator.Evaluate(read.value, flat[read.flat_offset]);
+	};
 	auto& active = m_program.active_sources;
+	if (m_program.control_flow.empty()) {
+		active.clear();
+		flat.resize(m_program.srt_reads.size());
+		for (uint32_t slot = 0; slot < m_program.srt_reads.size(); ++slot) {
+			if (!refresh(slot)) return false;
+		}
+		return true;
+	}
+	flat.assign(m_program.srt_reads.size(), 0u);
 	active.assign(m_program.descriptor_sources.size(), 1u);
 	for (const auto& block: m_program.control_flow) {
-		for (const auto source: block.sources) {
-			active.at(source) = 0u;
-		}
+		for (const auto source: block.sources) active.at(source) = 0u;
 	}
 	auto& visited = m_program.visited_blocks;
 	auto& pending = m_program.pending_blocks;
@@ -863,39 +886,20 @@ std::span<const uint8_t> SrtWalker::FindActiveSources() {
 	while (!pending.empty()) {
 		const auto index = pending.back();
 		pending.pop_back();
-		if (visited.at(index)) {
-			continue;
-		}
+		if (visited.at(index)) continue;
 		visited[index] = 1u;
 		const auto& block = m_program.control_flow[index];
-		for (const auto source: block.sources) {
-			active[source] = 1u;
+		for (const auto source: block.sources) active[source] = 1u;
+		for (const auto slot: block.srt_reads) {
+			if (!refresh(slot)) return false;
 		}
 		uint32_t condition = 0;
+		auto& predicate = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;
 		if (!block.condition.IsEmpty() && m_runtime.read_specialization_memory != nullptr &&
-		    Evaluate(block.condition, condition)) {
+		    predicate.Evaluate(block.condition, condition)) {
 			pending.push_back(block.successors[condition != 0u ? 0u : 1u]);
 		} else {
 			pending.insert(pending.end(), block.successors.begin(), block.successors.end());
-		}
-	}
-	return active;
-}
-
-bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
-	if (!m_program.srt_plan_complete) {
-		return false;
-	}
-	flat.resize(m_program.srt_reads.size());
-	for (const auto& read: m_program.srt_reads) {
-		const bool clean = read.flat_offset < m_clean_flat_slots.size() &&
-		                   m_clean_flat_slots[read.flat_offset] != 0u;
-		if (clean && (m_clean_evaluator == nullptr || m_runtime.read_specialization_memory == nullptr)) {
-			return false;
-		}
-		auto& evaluator = clean ? *m_clean_evaluator : *this;
-		if (read.flat_offset >= flat.size() || !evaluator.Evaluate(read.value, flat[read.flat_offset])) {
-			return false;
 		}
 	}
 	return true;

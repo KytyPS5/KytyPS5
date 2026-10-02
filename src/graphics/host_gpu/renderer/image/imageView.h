@@ -31,20 +31,14 @@ namespace ImageViewOps {
 	       ImageViewOps::IsFormatDepthCompatible(view_format);
 }
 
-[[nodiscard]] inline bool IsValidImageSwizzle(uint32_t swizzle) noexcept {
+[[nodiscard]] inline bool IsValidImageSwizzle(uint32_t swizzle,
+                                             uint32_t component_count = 4) noexcept {
 	if ((swizzle & ~0xfffu) != 0) {
 		return false;
 	}
 	for (uint32_t channel = 0; channel < 4; channel++) {
-		switch (GetDstSel(swizzle, channel)) {
-			case 0:
-			case 1:
-			case 4:
-			case 5:
-			case 6:
-			case 7: break;
-			default: return false;
-		}
+		const auto selector = GetDstSel(swizzle, channel);
+		if (selector > 1 && (selector < 4 || selector >= 4 + component_count)) return false;
 	}
 	return true;
 }
@@ -81,15 +75,8 @@ SelectSampledColorView(vk::Format image_format, vk::Format view_format, uint32_t
 [[nodiscard]] inline bool IsSupportedSampledDepthView(vk::Format image_format,
                                                       vk::Format view_format,
                                                       uint32_t   swizzle) noexcept {
-	if (!IsSupportedSampledDepthFormat(image_format, view_format)) {
-		return false;
-	}
-	switch (swizzle) {
-		case DstSel(4, 4, 4, 4):
-		case DstSel(4, 0, 0, 0):
-		case DstSel(4, 0, 0, 1): return true;
-		default: return false;
-	}
+	return IsSupportedSampledDepthFormat(image_format, view_format) &&
+	       IsValidImageSwizzle(swizzle, 1);
 }
 
 [[nodiscard]] inline bool

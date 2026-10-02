@@ -1984,6 +1984,10 @@ void TextureCache::RunGarbageCollector() {
 		// Deleting depth recursively deletes its stencil association, so finish LRU traversal
 		// first.
 		m_lru_cache.ForEachItemBelow(tick - age, [&](ImageId id) {
+			const auto owner = m_slot_images.try_get(id);
+			// Protected entries must not consume every pass's candidate budget.
+			if (owner != nullptr && owner->registered && !owner->depth_id &&
+			    owner->SafeToDownload() && (owner->info.IsTiled() || !pressured)) return false;
 			candidates.push_back(id);
 			return candidates.size() == deletions;
 		});

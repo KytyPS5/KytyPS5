@@ -18,6 +18,7 @@
 #include "kytyGitVersion.h"
 #include "libs/agc.h"
 #include "libs/audio.h"
+#include "libs/automation.h"
 #include "libs/controller.h"
 #include "libs/libs.h"
 #include "libs/network.h"
@@ -169,6 +170,8 @@ static void LoadElf(const std::filesystem::path& elf, bool dbg_print_reloc = fal
 }
 
 static void Execute(const std::filesystem::path& game_patch) {
+	// No-op unless --automation-dir was given.
+	Libs::Automation::Start();
 	auto           patch_path = game_patch;
 	Common::Thread guest_thread(
 	    [](void* param) {

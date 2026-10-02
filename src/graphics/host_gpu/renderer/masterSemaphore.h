@@ -30,6 +30,8 @@ public:
 
 	void Refresh();
 	void Wait(uint64_t tick);
+	// Reads the timeline without updating KnownGpuTick or exiting on failure; for diagnostics.
+	[[nodiscard]] uint64_t QueryGpuTick() const noexcept;
 
 private:
 	GraphicContext&       m_graphics;

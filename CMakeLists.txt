@@ -473,6 +473,23 @@ add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 target_link_libraries(resource_tracking_tests fmt::fmt)
 target_include_directories(resource_tracking_tests PRIVATE ${inc_headers})
 
+add_executable(shader_capture_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ShaderCaptureTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/shaderCapture.cpp"
+)
+target_link_libraries(shader_capture_tests common fmt::fmt xxhash nlohmann_json::nlohmann_json kyty_git_version)
+target_include_directories(shader_capture_tests PRIVATE ${inc_headers})
+
+add_executable(automation_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/AutomationTests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/automation.cpp"
+)
+target_link_libraries(automation_tests common fmt::fmt nlohmann_json::nlohmann_json Vulkan::Headers kyty_git_version)
+if(LINUX)
+	target_link_libraries(automation_tests Threads::Threads)
+endif()
+target_include_directories(automation_tests PRIVATE ${inc_headers})
+
 add_executable(audio_out2_port_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/AudioOut2PortTests.cpp"
 	"${KYTY_SOURCE_DIR}/libs/libAudio2.cpp"
@@ -599,6 +616,65 @@ if(BUILD_TESTING)
 	add_test(NAME emulator_present_mode_invalid
 	         COMMAND $<TARGET_FILE:kyty_emulator> --help --present-mode Invalid)
 	set_tests_properties(emulator_present_mode_invalid PROPERTIES WILL_FAIL TRUE)
+	add_test(NAME emulator_shader_capture_dir_cli
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --shader-capture-dir _ShaderCaptures)
+	add_test(NAME emulator_automation_dir_cli
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --automation-dir _Automation
+	                 --automation-shot-interval 5)
+	add_test(NAME emulator_automation_interval_invalid
+	         COMMAND $<TARGET_FILE:kyty_emulator> --help --automation-shot-interval soon)
+	set_tests_properties(emulator_automation_interval_invalid PROPERTIES WILL_FAIL TRUE)
+	add_test(NAME emulator_shader_replay_usage COMMAND $<TARGET_FILE:kyty_emulator> --shader-replay)
+	set_tests_properties(emulator_shader_replay_usage PROPERTIES WILL_FAIL TRUE)
+
+	# Offline shader tools. The fixtures are assembled from tests/data/shader_capture/*.s with
+	# tools/shader/asm2capture.py.
+	# Replaying writes replay.log and out.spv next to a capture, so work on a copy.
+	set(kyty_shader_fixtures "${PROJECT_BINARY_DIR}/shader_capture_fixtures")
+	file(COPY "${KYTY_TESTS_DIR}/data/shader_capture/" DESTINATION "${kyty_shader_fixtures}")
+	add_test(NAME shader_disasm
+	         COMMAND $<TARGET_FILE:kyty_emulator> --shader-disasm "${kyty_shader_fixtures}/store_ok"
+	                 --pc 0x4 --window 1)
+	set_tests_properties(shader_disasm PROPERTIES PASS_REGULAR_EXPRESSION "=> .*BUFFER_STORE_DWORD")
+	add_test(NAME shader_replay_store_ok
+	         COMMAND $<TARGET_FILE:kyty_emulator> --shader-replay "${kyty_shader_fixtures}/store_ok"
+	                 --no-dump --out "${PROJECT_BINARY_DIR}/shader_replay_store_ok.spv")
+	set_tests_properties(shader_replay_store_ok PROPERTIES PASS_REGULAR_EXPRESSION "REPLAY OK")
+	# Known recompiler gap: a buffer store through a V# that a waterfall loop selects per lane. When
+	# the recompiler learns to handle it, this replay must start printing REPLAY OK; flip the
+	# expectation then so the shader stays covered.
+	add_test(NAME shader_replay_gpu_selected_store_known_failure
+	         COMMAND $<TARGET_FILE:kyty_emulator> --shader-replay
+	                 "${kyty_shader_fixtures}/gpu_selected_store" --no-dump
+	                 --out "${PROJECT_BINARY_DIR}/shader_replay_gpu_selected_store.spv")
+	set_tests_properties(shader_replay_gpu_selected_store_known_failure PROPERTIES
+	                     PASS_REGULAR_EXPRESSION "GPU-selected access requires a raw DWORD")
+	add_test(NAME shader_replay_all
+	         COMMAND $<TARGET_FILE:kyty_emulator> --shader-replay-all "${kyty_shader_fixtures}")
+	# Both the passing and the known-failing fixture live there, so one failure is expected.
+	set_tests_properties(shader_replay_all PROPERTIES PASS_REGULAR_EXPRESSION
+	                     "REPLAY-ALL 2 captures: 1 ok, 1 failed")
+	add_test(NAME shader_capture
+	         COMMAND $<TARGET_FILE:shader_capture_tests>
+	                 "${PROJECT_BINARY_DIR}/shader_capture_fixture/cs_written")
+	set_tests_properties(shader_capture PROPERTIES FIXTURES_SETUP shader_capture_fixture)
+	add_test(NAME shader_capture_replay
+	         COMMAND $<TARGET_FILE:kyty_emulator> --shader-replay
+	                 "${PROJECT_BINARY_DIR}/shader_capture_fixture/cs_written" --no-dump)
+	set_tests_properties(shader_capture_replay PROPERTIES FIXTURES_REQUIRED shader_capture_fixture
+	                     PASS_REGULAR_EXPRESSION "REPLAY OK")
+	add_test(NAME automation COMMAND $<TARGET_FILE:automation_tests>)
+	set_tests_properties(automation PROPERTIES TIMEOUT 120)
+
+	# The autoplay harness (tools/autoplay). Its end-to-end tests drive a fake emulator through a
+	# shell wrapper and take about a minute; the image tests need Pillow and skip without it.
+	find_package(Python3 COMPONENTS Interpreter QUIET)
+	if(Python3_FOUND AND NOT WIN32)
+		add_test(NAME autoplay_harness
+		         COMMAND ${Python3_EXECUTABLE} -m unittest discover "${CMAKE_CURRENT_SOURCE_DIR}/tools/autoplay/tests")
+		set_tests_properties(autoplay_harness PROPERTIES TIMEOUT 600
+		                     ENVIRONMENT "KYTY_EMULATOR=$<TARGET_FILE:kyty_emulator>")
+	endif()
 	add_test(NAME ime_dialog COMMAND $<TARGET_FILE:ime_dialog_tests>)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
 	add_test(NAME scalar_provenance COMMAND $<TARGET_FILE:scalar_provenance_tests>)
@@ -675,6 +751,8 @@ if(BUILD_TESTING)
 	endif()
 
 	add_custom_target(kyty_tests DEPENDS
+		shader_capture_tests
+		automation_tests
 		ime_dialog_tests
 		shader_cfg_tests
 		scalar_provenance_tests
@@ -766,7 +844,9 @@ elseif(WIN32 OR LINUX)
 	target_link_options(kyty_emulator PRIVATE "-Wl,-Map=${KYTY_EMULATOR_MAP_LINK_PATH}")
 endif()
 
-if(LINUX)
+# Keep the symbol table when the autoplay harness needs gdb backtraces from a hung run.
+option(KYTY_KEEP_DEBUG_SYMBOLS "Do not strip the Linux Release emulator binary" OFF)
+if(LINUX AND NOT KYTY_KEEP_DEBUG_SYMBOLS)
     target_link_options(kyty_emulator PRIVATE
         $<$<CONFIG:Release>:-Wl,--strip-all>
     )

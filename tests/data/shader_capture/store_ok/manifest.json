@@ -1,0 +1,59 @@
+{
+  "format": 1,
+  "stage": "cs",
+  "hash": "0x00000000000000a1",
+  "key": "00000000",
+  "wave_size": 64,
+  "user_data_base": 0,
+  "user_data_count": 4,
+  "code_size_bytes": 16,
+  "back_code_size_bytes": 0,
+  "shader_base": "0x0000000000000000",
+  "static_state": [
+    4,
+    49216,
+    64,
+    1,
+    0,
+    0,
+    0,
+    64,
+    1,
+    1,
+    0,
+    1,
+    0,
+    0
+  ],
+  "input": {
+    "kind": "compute",
+    "workgroup_register": 4,
+    "wave_size": 64,
+    "float_mode": 192,
+    "host_subgroup_size": 64,
+    "thread_ids_num": 1,
+    "lds_size_dwords": 0,
+    "scratch_size_dwords": 0,
+    "dispatch_thread_dimensions": false,
+    "tg_size_en": false,
+    "threads_num": [
+      64,
+      1,
+      1
+    ],
+    "dispatch_threads_num": [
+      0,
+      0,
+      0
+    ],
+    "group_id": [
+      true,
+      false,
+      false
+    ]
+  },
+  "replay": true,
+  "git_revision": "asm2capture",
+  "git_hash": "asm2capture",
+  "build": "asm2capture"
+}

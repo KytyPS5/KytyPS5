@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "imgui.h"
 #include "imgui_impl_vulkan.h"
+#include "libs/automation.h"
 #include "libs/controller.h"
 #include "libs/dialog.h"
 #include "libs/ime.h"
@@ -246,6 +247,7 @@ void RefreshVisibility() {
 	const bool was_controller = std::exchange(g_controller_captured, capture_controller);
 	if (capture_controller || was_controller) {
 		Controller::ResetInputState();
+		Automation::NoteInputReset("system overlay took controller input");
 	}
 	const Uint32 type = g_visibility_event.load(std::memory_order_acquire);
 	if (type != static_cast<Uint32>(-1)) {
@@ -443,6 +445,7 @@ void ShutdownSystemOverlayInput() {
 		g_session                = {};
 		if (std::exchange(g_controller_captured, false)) {
 			Controller::ResetInputState();
+			Automation::NoteInputReset("system overlay released controller input");
 		}
 		g_visibility_event.store(static_cast<Uint32>(-1), std::memory_order_release);
 	}

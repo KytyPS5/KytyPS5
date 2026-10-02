@@ -8,6 +8,7 @@
 #include "common/stringUtils.h"
 #include "common/threads.h"
 #include "kernel/pthread.h"
+#include "libs/automation.h"
 #include "libs/dualSenseHaptics.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -981,6 +982,7 @@ int KYTY_SYSV_ABI PadIsRemoteController(int handle, bool* is_remote) {
 
 int KYTY_SYSV_ABI PadReadState(int handle, PadData* data) {
 	PRINT_NAME();
+	Automation::NotePadRead();
 
 	if (handle != 1) {
 		return PAD_ERROR_INVALID_HANDLE;
@@ -1002,6 +1004,7 @@ int KYTY_SYSV_ABI PadReadState(int handle, PadData* data) {
 
 int KYTY_SYSV_ABI PadRead(int handle, PadData* data, int num) {
 	PRINT_NAME();
+	Automation::NotePadRead();
 
 	EXIT_NOT_IMPLEMENTED(num < 1 || num > 64);
 	if (handle != 1) {

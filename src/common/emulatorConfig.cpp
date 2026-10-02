@@ -147,6 +147,26 @@ bool PlayGoHackEnabled() {
 	return g_config->playgo_hack_enabled;
 }
 
+bool ShaderCaptureEnabled() {
+	return !g_config->shader_capture_dir.empty();
+}
+
+std::filesystem::path GetShaderCaptureDir() {
+	return g_config->shader_capture_dir;
+}
+
+bool AutomationEnabled() {
+	return !g_config->automation_dir.empty();
+}
+
+std::filesystem::path GetAutomationDir() {
+	return g_config->automation_dir;
+}
+
+uint32_t GetAutomationShotInterval() {
+	return g_config->automation_shot_interval;
+}
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 bool RedZoneProtectionEnabled() {
 	return g_config->red_zone_protection_enabled;

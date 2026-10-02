@@ -294,6 +294,12 @@ public:
 		if (m_program.resource_tracking_complete) {
 			Fail(0, "resources already tracked");
 		}
+		// Planning removes dead instructions, so remember the numbering the IR dump printed.
+		for (const auto* block: m_program.blocks) {
+			for (const auto& inst: *block) {
+				m_dump_order.push_back(&inst);
+			}
+		}
 		PlanScalarReads();
 		EliminateDeadCode(m_program.blocks);
 		PlanIndirectImages();
@@ -366,6 +372,20 @@ private:
 		                m_program.shader_hash, StageName(m_program.stage), pc, reason);
 		EXIT("%s", message.c_str());
 		std::abort();
+	}
+
+	// "%N opcode" naming an instruction as the "native IR before resource tracking" dump prints it.
+	// This only feeds failure messages, so a linear search is fine.
+	std::string DescribeInst(const Inst* inst) const {
+		if (inst == nullptr) {
+			return "<constant>";
+		}
+		const auto found = std::ranges::find(m_dump_order, inst);
+		if (found == m_dump_order.end()) {
+			return fmt::format("<new> {}", ValueOpcodeName(inst->GetOpcode()));
+		}
+		return fmt::format("%{} {}", std::distance(m_dump_order.begin(), found) + 1,
+		                   ValueOpcodeName(inst->GetOpcode()));
 	}
 
 	Value NativeDescriptorSource(Value value, uint32_t reg, uint32_t use_pc) const {
@@ -1671,6 +1691,8 @@ private:
 			if (expected == ValueOpcode::GetBufferResource &&
 			    std::all_of(descriptor.dwords.begin(), descriptor.dwords.begin() + width,
 			                [](Value word) { return word.Resolve().GetType() == Type::U32; })) {
+				m_handle_bad_dword = bad_dword;
+				m_handle_bad_value = descriptor.dwords[bad_dword].Resolve().TryInstruction();
 				return false;
 			}
 			Fail(pc, fmt::format("{} dword {} is not a valid runtime value",
@@ -1856,8 +1878,11 @@ private:
 			               memory.resource * 4u, handle, source)) {
 				if (memory.kind != ResourceKind::Buffer || !memory.SupportsIndirectBufferLoad(op)) {
 					Fail(flags.pc,
-					     "buffer descriptor is not a valid runtime value; GPU-selected access "
-					     "requires a raw DWORD x2/x3/x4 load");
+					     fmt::format("buffer descriptor is not a valid runtime value; GPU-selected "
+					                 "access requires a raw DWORD x2/x3/x4 load (op={} handle={} "
+					                 "dword[{}]={})",
+					                 ValueOpcodeName(op), DescribeInst(handle), m_handle_bad_dword,
+					                 DescribeInst(m_handle_bad_value)));
 				}
 				m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
 				m_info.uses_dma                         = true;
@@ -1985,6 +2010,10 @@ private:
 	std::vector<IndirectImagePlan>             m_indirect_images;
 	std::vector<std::pair<const Inst*, Value>> m_descriptor_selections;
 	bool                                       m_shader_writes = false;
+	// Failure-message state only; neither value affects tracking.
+	std::vector<const Inst*>                   m_dump_order;
+	uint32_t                                   m_handle_bad_dword = UINT32_MAX;
+	const Inst*                                m_handle_bad_value = nullptr;
 };
 
 } // namespace

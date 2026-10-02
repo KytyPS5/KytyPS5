@@ -35,6 +35,10 @@ std::shared_ptr<spdlog::logger> MakeLogger(std::string name, spdlog::sink_ptr si
 
 	auto logger = std::make_shared<spdlog::logger>(std::move(name), std::move(sink));
 	logger->set_level(spdlog::level::trace);
+	if (Config::AutomationEnabled()) {
+		// A hung or killed emulator must not lose the tail of its log.
+		logger->flush_on(spdlog::level::info);
+	}
 	return logger;
 }
 

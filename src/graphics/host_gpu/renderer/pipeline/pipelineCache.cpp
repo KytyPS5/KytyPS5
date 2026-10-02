@@ -15,9 +15,11 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/shaderCapture.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
 #include "kytyGitVersion.h"
+#include "libs/automation.h"
 #include "loader/systemContent.h"
 
 #include <algorithm>
@@ -28,6 +30,7 @@
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
+#include <optional>
 #include <span>
 #include <spirv-tools/libspirv.hpp>
 #include <string_view>
@@ -94,8 +97,13 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 }
 
 bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
-	return !values.empty() &&
-	       Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, values.data(), values.size_bytes());
+	const bool ok = !values.empty() && Libs::LibKernel::Memory::TryReadGpuCleanBacking(
+	                                       address, values.data(), values.size_bytes());
+	if (!values.empty()) {
+		// No-op unless the program being prepared is being captured for offline replay.
+		ShaderCapture::RecordRead(address, values, ok);
+	}
+	return ok;
 }
 
 void DumpShaderSpirv(const char* stage_name, uint64_t shader_hash,
@@ -353,6 +361,23 @@ struct PipelineCache::ProgramCache {
 			options.wave_size = input_info.wave_size;
 		}
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code);
+		Automation::NoteShaderCompile(options.shader_hash, stage_name);
+		// Capture before compiling: whichever stage fails or crashes next, the files are on disk.
+		std::optional<ShaderCapture> capture;
+		if (entry == programs.end() && Config::ShaderCaptureEnabled()) {
+			const ShaderCaptureSource source {
+			    .stage          = stage,
+			    .hash           = params.hash,
+			    .wave_size      = options.wave_size,
+			    .user_data_base = options.user_data_base,
+			    .shader_base    = params.Base(),
+			    .code           = params.code,
+			    .back_code      = params.back_code,
+			    .user_data      = user_data,
+			    .static_state   = lookup_key.static_state,
+			};
+			capture.emplace(source, input_info);
+		}
 		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
 		if (entry == programs.end()) {
 			entry = programs.try_emplace(lookup_key,

@@ -7,6 +7,7 @@
 #include "gpu_blit_shaders/gpu_blit_fs_triangle_spv.h"
 #include "gpu_blit_shaders/gpu_video_out_overlay_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -14,11 +15,16 @@
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window/windowInternal.h"
+#include "libs/automation.h"
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <limits>
 #include <memory>
+#include <optional>
+#include <string>
+#include <thread>
 #include <vector>
 #include <vulkan/vk_platform.h>
 
@@ -963,8 +969,75 @@ void Presenter::ClearLayer(int bus) {
 	}
 }
 
+namespace {
+
+// A screenshot being read back from the presented frame. The copy is recorded into the present
+// command buffer, so it shows exactly what was handed to the swapchain.
+struct ScreenshotCopy {
+	std::unique_ptr<Buffer> buffer;
+	Automation::ShotFormat  format = Automation::ShotFormat::Rgba8;
+	uint32_t                width  = 0;
+	uint32_t                height = 0;
+};
+
+std::optional<ScreenshotCopy> RecordScreenshotCopy(GraphicContext& graphics,
+                                                   CommandScheduler& scheduler,
+                                                   CommandBuffer& command,
+                                                   const Presenter::Frame& frame,
+                                                   std::string& error) {
+	ScreenshotCopy copy;
+	switch (frame.image.format) {
+		case vk::Format::eR8G8B8A8Unorm:
+		case vk::Format::eR8G8B8A8Srgb: copy.format = Automation::ShotFormat::Rgba8; break;
+		case vk::Format::eB8G8R8A8Unorm:
+		case vk::Format::eB8G8R8A8Srgb: copy.format = Automation::ShotFormat::Bgra8; break;
+		case vk::Format::eA2B10G10R10UnormPack32:
+			copy.format = Automation::ShotFormat::A2B10G10R10;
+			break;
+		case vk::Format::eA2R10G10B10UnormPack32:
+			copy.format = Automation::ShotFormat::A2R10G10B10;
+			break;
+		default:
+			error = "unsupported frame format " + vk::to_string(frame.image.format);
+			return std::nullopt;
+	}
+	copy.width          = frame.image.extent.width;
+	copy.height         = frame.image.extent.height;
+	const uint64_t size = static_cast<uint64_t>(copy.width) * copy.height * 4u;
+	copy.buffer         = std::make_unique<Buffer>(graphics, scheduler, MemoryUsage::Download, 0,
+	                                               vk::BufferUsageFlagBits::eTransferDst, size);
+
+	auto                vk_command = command.Handle();
+	vk::BufferImageCopy region {};
+	region.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	region.imageExtent      = {copy.width, copy.height, 1};
+	// RecordPresentCommands has already moved the frame to TransferSrcOptimal.
+	vk_command.copyImageToBuffer(frame.image.image, vk::ImageLayout::eTransferSrcOptimal,
+	                             copy.buffer->Handle(), 1, &region);
+	vk::MemoryBarrier barrier {};
+	barrier.sType         = vk::StructureType::eMemoryBarrier;
+	barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+	vk_command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
+	                           vk::DependencyFlags {}, 1, &barrier, 0, nullptr, 0, nullptr);
+	return copy;
+}
+
+} // namespace
+
 void Presenter::Impl::Present() {
 	KYTY_PROFILER_FUNCTION();
+
+	// `stall_present` freezes presentation on purpose so the harness can test its hang detection.
+	if (const auto stall = Automation::TakePresentStallSeconds(); stall != 0) {
+		LOGF("automation: stalling present for %u s\n", stall);
+		std::this_thread::sleep_for(std::chrono::seconds(stall));
+	}
+	// Requested screenshots are served by the first present that has a game frame.
+	std::vector<std::string> shot_names;
+	if (layers[0].frame != nullptr) {
+		shot_names = Automation::TakeScreenshotRequests();
+	}
 
 	const auto overlay_visual = GetSystemOverlayVisualState();
 	// Some window systems keep presenting an old swapchain after a resize.
@@ -977,6 +1050,8 @@ void Presenter::Impl::Present() {
 			RecoverSwapchain(status);
 			continue;
 		}
+		std::optional<ScreenshotCopy> shot;
+		uint64_t                      shot_tick = 0;
 		{
 			Common::LockGuard render_lock(renderer.GetMutex());
 			auto&             command = present_scheduler.BeginCommand();
@@ -984,12 +1059,33 @@ void Presenter::Impl::Present() {
 			    overlay_visual.active && swapchain.PrepareSystemOverlay();
 			swapchain.RecordPresentCommands(command, layers[0].frame, layers[1],
 			                                draw_system_overlay);
+			if (!shot_names.empty()) {
+				std::string error;
+				shot = RecordScreenshotCopy(window.graphic_ctx, present_scheduler, command,
+				                            *layers[0].frame, error);
+				if (!shot) {
+					Automation::ScreenshotFailed(shot_names, error);
+					shot_names.clear();
+				}
+			}
 			const auto tick = swapchain.Submit(present_scheduler);
+			shot_tick       = tick;
 			for (const auto& layer: layers) {
 				if (layer.frame != nullptr) {
 					layer.frame->present_tick = tick;
 				}
 			}
+		}
+		if (shot) {
+			present_scheduler.Wait(shot_tick);
+			const auto size = static_cast<size_t>(shot->width) * shot->height * 4u;
+			shot->buffer->Invalidate(0, size);
+			const auto mapped = shot->buffer->Mapped();
+			Automation::DeliverScreenshot(std::move(shot_names), shot->width, shot->height,
+			                              shot->format,
+			                              std::vector<uint8_t>(mapped.begin(), mapped.begin() + size));
+			shot_names.clear();
+			shot.reset();
 		}
 		status = swapchain.Present();
 		if (status != Swapchain::Status::Success) {
@@ -998,6 +1094,7 @@ void Presenter::Impl::Present() {
 		}
 
 		presented_overlay_revision.store(overlay_visual.revision, std::memory_order_release);
+		Automation::NoteHostPresent();
 		window.UpdateTitle();
 		return;
 	}

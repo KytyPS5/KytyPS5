@@ -7,6 +7,7 @@
 #include "common/threads.h"
 #include "common/virtualMemory.h"
 #include "emulator.h"
+#include "graphics/shader/shaderReplay.h"
 #include "kytyGitVersion.h"
 
 #include <charconv>
@@ -86,6 +87,19 @@ static void PrintUsage() {
 #endif
 	::printf("  --keymap <Control=Input>             DualSense mapping; may be repeated.\n");
 	::printf("  --rd                                 Enable RenderDoc capture.\n");
+	::printf("  --shader-capture-dir <path>          Write every new shader program here before it\n"
+	         "                                       is compiled, for --shader-replay.\n");
+	::printf("  --automation-dir <path>              Accept commands.txt input and write screenshots,\n"
+	         "                                       status.json and events.jsonl here.\n");
+	::printf("  --automation-shot-interval <sec>     Automatic screenshot interval. Default: 0 (only\n"
+	         "                                       when requested).\n");
+	::printf("\nOffline shader tools (no --game needed):\n");
+	::printf("  --shader-replay <capture>            Compile a captured shader again; writes out.spv.\n"
+	         "                                       [--out <file>] [--no-dump] [--no-validate]\n");
+	::printf("  --shader-replay-all <captures>       Replay every capture in a directory, one process\n"
+	         "                                       each. [--jobs N] [--timeout <sec>] [--dump]\n");
+	::printf("  --shader-disasm <code.bin|capture>   Disassemble guest shader code.\n"
+	         "                                       [--pc <hex>] [--window <n>]\n");
 }
 
 static bool NextArg(int argc, char* argv[], int& index, std::string& out) {
@@ -407,6 +421,23 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				return false;
 			}
 			options.config.keymap.push_back(value);
+		} else if (arg == "--shader-capture-dir") {
+			if (value.empty()) {
+				::printf("invalid shader capture directory\n");
+				return false;
+			}
+			options.config.shader_capture_dir = Common::PathFromUtf8(value);
+		} else if (arg == "--automation-dir") {
+			if (value.empty()) {
+				::printf("invalid automation directory\n");
+				return false;
+			}
+			options.config.automation_dir = Common::PathFromUtf8(value);
+		} else if (arg == "--automation-shot-interval") {
+			if (!ParseUint32(value, options.config.automation_shot_interval)) {
+				::printf("invalid screenshot interval: %s\n", value.c_str());
+				return false;
+			}
 		} else {
 			::printf("unknown option: %s\n", arg.c_str());
 			return false;
@@ -430,6 +461,11 @@ static int Main(int argc, char* argv[]) {
 	if (argc < 2) {
 		PrintUsage();
 		return 0;
+	}
+
+	// Offline shader tools run without any emulator subsystem.
+	if (Libs::Graphics::IsShaderToolCommand(argv[1])) {
+		return Libs::Graphics::RunShaderToolCommand(argc, argv);
 	}
 
 	if (!ParseArgs(argc, argv, options, show_help)) {

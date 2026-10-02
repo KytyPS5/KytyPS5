@@ -35,6 +35,12 @@ void MasterSemaphore::Refresh() {
 	}
 }
 
+uint64_t MasterSemaphore::QueryGpuTick() const noexcept {
+	uint64_t   counter = 0;
+	const auto result  = m_graphics.device.getSemaphoreCounterValue(m_semaphore, &counter);
+	return result == vk::Result::eSuccess ? counter : KnownGpuTick();
+}
+
 void MasterSemaphore::Wait(uint64_t tick) {
 	if (IsFree(tick)) {
 		return;

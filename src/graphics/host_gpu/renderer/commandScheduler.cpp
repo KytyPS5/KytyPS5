@@ -1,8 +1,10 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "libs/automation.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -96,9 +98,12 @@ bool CommandScheduler::InDeferredOperation() noexcept {
 CommandScheduler::CommandScheduler(RenderContext& context, GraphicContext& graphics)
     : m_master(graphics), m_context(context), m_graphics(graphics),
       m_command_pool(graphics, m_master), m_command(*this),
-      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {}
+      m_priority_thread([this](std::stop_token stop) { PriorityOperationsThread(stop); }) {
+	Automation::RegisterGpuTicks(&m_master);
+}
 
 CommandScheduler::~CommandScheduler() {
+	Automation::UnregisterGpuTicks(&m_master);
 	Shutdown();
 }
 
@@ -386,6 +391,17 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 		                  m_command.m_debug_arg4);
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+
+	Automation::NoteGpuSubmit(tick, m_command.m_debug_op, m_command.m_debug_submit_id,
+	                          m_command.m_debug_arg0, m_command.m_debug_arg1, m_command.m_debug_arg2,
+	                          m_command.m_debug_arg3, m_command.m_debug_arg4);
+	if (Config::GraphicsDebugDumpEnabled() || Automation::SubmitTraceEnabled()) {
+		LOGF("GPU submit: tick=%" PRIu64 " gpu_tick=%" PRIu64 " debug_op=%u debug_submit=%" PRIu64
+		     " args=%u,%u,%u,%u,0x%016" PRIx64 "\n",
+		     tick, m_master.KnownGpuTick(), m_command.m_debug_op, m_command.m_debug_submit_id,
+		     m_command.m_debug_arg0, m_command.m_debug_arg1, m_command.m_debug_arg2,
+		     m_command.m_debug_arg3, m_command.m_debug_arg4);
+	}
 
 	m_command.m_buffer = nullptr;
 	return tick;

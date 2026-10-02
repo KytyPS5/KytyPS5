@@ -801,8 +801,22 @@ static bool ensure_stb_font(FontState* font) {
 	return font->has_ttf;
 }
 
+// Metrics answer at the scale the title asked for. Some titles set a very large pixel scale on
+// every font (My First Gran Turismo uses 10000) and divide what they read back from FontGetCharGlyphMetrics by it to
+// get em fractions, so a value clamped to the bitmap limit makes every glyph box and advance far
+// too small. Glyph bitmaps still use the clamped size.
+static thread_local bool g_exact_font_scale = false;
+
+struct ExactFontScale {
+	ExactFontScale() { g_exact_font_scale = true; }
+	~ExactFontScale() { g_exact_font_scale = false; }
+};
+
 static float stb_font_pixel_height(const FontState* font) {
 	const float scale = (font != nullptr && font->scale_h > 1.0f ? font->scale_h : 16.0f);
+	if (g_exact_font_scale) {
+		return scale;
+	}
 	return static_cast<float>(std::clamp(static_cast<int>(scale + 0.5f), 8, FONT_BITMAP_MAX_DIM));
 }
 
@@ -2084,6 +2098,7 @@ int KYTY_SYSV_ABI FontGetRenderCharGlyphMetrics(FontHandle font_handle, uint32_t
 int KYTY_SYSV_ABI FontGetCharGlyphMetrics(FontHandle font_handle, uint32_t code,
                                           FontGlyphMetrics* metrics) {
 	PRINT_NAME();
+	const ExactFontScale exact;
 
 	LOGF("\t handle = 0x%016" PRIx64 ", code = 0x%08" PRIx32 ", metrics = 0x%016" PRIx64 "\n",
 	     reinterpret_cast<uint64_t>(font_handle), code, reinterpret_cast<uint64_t>(metrics));

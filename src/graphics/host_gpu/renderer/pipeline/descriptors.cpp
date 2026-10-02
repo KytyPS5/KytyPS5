@@ -943,6 +943,11 @@ static void ValidateImmutableSrtWriteAliases(
 				continue;
 			}
 			const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(stage->resources->buffers[index]);
+			if (!resource.atomic && !resource.scalar && descriptor.Type() == 0u &&
+			    descriptor.OutOfBounds() == 0u && descriptor.Stride() == 0u) {
+				// Guest mode 0 drops every vector store when STRIDE=0.
+				continue;
+			}
 			const uint64_t address = descriptor.Base48();
 			const uint64_t stride = descriptor.Stride();
 			const uint64_t records = descriptor.NumRecords();

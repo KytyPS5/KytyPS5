@@ -1331,6 +1331,13 @@ std::array<u32, 64> MakeNativeUserData(const std::array<u32, 64> *source) {
   data[51] = 3u << 28u;
   if (source != nullptr) {
     data = *source;
+    if (data[48] == 0u && data[49] == 0u && data[51] == 0u) {
+      // Supplied fixture data often only describes input resources. Preserve
+      // the independent raw output descriptor's mode-3 byte bounds when the
+      // fixture leaves its address and mode unspecified.
+      if (data[50] == 0u) data[50] = 1u << 20u;
+      data[51] = 3u << 28u;
+    }
   }
   return data;
 }
@@ -2020,6 +2027,7 @@ constexpr std::array ImmutableSrtScenarios {
     ImmutableSrtScenario{"vertex-snapshot", "immutable SRT snapshot requires compute without DMA writes"},
     ImmutableSrtScenario{"buffer-disjoint", "", true},
     ImmutableSrtScenario{"buffer-stride-zero-disjoint", "", true},
+    ImmutableSrtScenario{"buffer-stride-zero-overlap", "", true},
     ImmutableSrtScenario{"image-padding-disjoint", "", true},
 };
 
@@ -12415,7 +12423,9 @@ void CheckSampledHtileArrayClearDiscovery() {
     const std::string_view selected(mode);
     const bool image_writer = selected.starts_with("image-padding-");
     const bool buffer_writer = selected.starts_with("buffer-");
-    const bool stride_zero_writer = selected == "buffer-stride-zero-disjoint";
+    const bool stride_zero_writer = selected == "buffer-stride-zero-disjoint" ||
+                                    selected == "buffer-stride-zero-overlap";
+    const bool stride_zero_overlap = selected == "buffer-stride-zero-overlap";
     const bool ordered_overlap = selected == "buffer-overlap-ordered";
     const bool graphics = selected == "vertex-snapshot";
     constexpr uintptr_t base = 0x0000000205200000ull;
@@ -12471,7 +12481,8 @@ void CheckSampledHtileArrayClearDiscovery() {
                                    : stride_zero_writer ? 16u
                                                         : buffer_size;
       ResourceReadRange source{
-          base + writer_size - (scenario.allowed && !ordered_overlap ? 0u : 4u), 4u};
+          base + writer_size - (scenario.allowed && !ordered_overlap &&
+                                !stride_zero_overlap ? 0u : 4u), 4u};
       if (!image_writer && !buffer_writer) source={base+0x10000u,4u};
       if (selected == "range-overflow") source={UINT64_MAX-3u,8u};
       if (selected == "range-48bit") source={uint64_t{1}<<48u,4u};
@@ -12497,6 +12508,18 @@ void CheckSampledHtileArrayClearDiscovery() {
         value.dword_count=4u;
         std::copy(std::begin(buffer.fields),std::end(buffer.fields),value.dwords.begin());
         runtime_snapshot.buffers.push_back(value);
+        // Binding allocation follows live memory instructions, not resource
+        // metadata alone. Represent the declared writer in this host fixture.
+        program.block_storage.push_back(std::make_unique<Block>());
+        auto* block = program.block_storage.back().get();
+        program.blocks.push_back(block);
+        program.memory_info.push_back({.kind=ResourceKind::Buffer,.resource=0u});
+        const MemoryFlags flags{0u,0u};
+        uint64_t flag_bits = 0u;
+        std::memcpy(&flag_bits,&flags,sizeof(flags));
+        block->AppendNewInst(ValueOpcode::StoreBufferU32,
+            {Value(0u),Value(0u),Value(0u),Value(0u),Value(0u),Value(true)},
+            flag_bits);
       }
       if (image_writer) {
         ImageResource info{};
@@ -12549,7 +12572,9 @@ void CheckSampledHtileArrayClearDiscovery() {
           executor.RebindImages(prepared);
           Require(name,mode,prepared.buffers.size()==info.info.buffers.size() &&
                       prepared.images.size()==info.info.images.size(),
-                  "disjoint immutable snapshot suppressed a declared writable resource");
+                  fmt::format("immutable snapshot binding count mismatch: buffers={} expected={} images={} expected={}",
+                              prepared.buffers.size(), info.info.buffers.size(),
+                              prepared.images.size(), info.info.images.size()));
           if (buffer_writer) {
             const auto expected_size = stride_zero_writer ? 16u : buffer_size;
             Require(name,mode,prepared.buffers[0].buffer!=nullptr &&
@@ -30850,6 +30875,38 @@ TestCase BufferZeroStrideOobFormatsAndWidths() {
   return test;
 }
 
+TestCase BufferZeroStrideMode0StoreIsOutOfBounds() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "BufferZeroStrideMode0StoreIsOutOfBounds";
+  test.initial.resize(16, 0xdeadbeefu);
+  test.expected = test.initial;
+  test.expected[0] = 0x13579bdfu;
+  test.expected[10] = 0x13579bdfu;
+  test.has_user_data = true;
+  test.user_data = MakeStructuredStorageBufferData(4, test.initial.size());
+  test.user_data[50] = static_cast<u32>(test.initial.size() * sizeof(u32));
+  test.user_data[51] = 3u << 28u; // The independent output uses raw byte bounds.
+  // Both descriptors target the same backing. Mode 0 with STRIDE=0 drops
+  // every vector store; mode 3 is a valid raw control with the same stride.
+  const std::array<u32, 4> out_of_bounds{32u, 0u, 4u, 0u};
+  const std::array<u32, 4> raw_control{40u, 0u, 4u, 3u << 28u};
+  std::copy(out_of_bounds.begin(), out_of_bounds.end(), test.user_data.begin() + 4u);
+  std::copy(raw_control.begin(), raw_control.end(), test.user_data.begin() + 8u);
+  test.buffer_addresses_are_backing_offsets = true;
+  auto& code = test.code;
+  AppendVMovLiteral(&code, 0, 0x13579bdfu);
+  AppendVMovU32(&code, 20, 0u);
+  code.push_back(EncodeMubuf0(0x1cu));
+  code.push_back(EncodeMubuf1(0, 1, 20));
+  code.push_back(EncodeMubuf0(0x1cu));
+  code.push_back(EncodeMubuf1(0, 2, 20));
+  AppendStoreVgpr(&code, 0, 0);
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
 TestCase TBufferLoadVariants() {
   using O = ShaderOpcode;
 
@@ -44658,6 +44715,17 @@ if (argc == 1) {
     RunCase(&vulkan, ImageSampleR8UintForcesPointSampler());
     RunCase(&vulkan, ImageSamplePackedUintConvertsSampleAndGather());
     RunCase(&vulkan, ImageSampleAndGather());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--zero-stride-store-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, BufferZeroStrideMode0StoreIsOutOfBounds());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--bounded-zero-stride-only") == 0) {
+    VulkanHarness vulkan;
+    for (u32 variant = 0; variant < 4u; ++variant)
+      RunCase(&vulkan, BoundedBufferZeroStrideCandidates(variant));
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--error-dialog-only") == 0) {

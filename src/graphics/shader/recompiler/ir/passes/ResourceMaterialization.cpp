@@ -1483,6 +1483,12 @@ bool ValidateSnapshotBufferWrites(const ResourcePlan& program, const SrtRuntime&
 		if (!DecodeBufferDescriptor(snapshot.buffers[resource], descriptor)) {
 			return SpecializationFail("bounded SRT buffer writer has invalid descriptor width");
 		}
+		if (!metadata.atomic && !metadata.scalar && descriptor.Type() == 0u &&
+		    descriptor.OutOfBounds() == 0u && descriptor.Stride() == 0u) {
+			// Every vector store through this candidate is OOB by the guest
+			// descriptor's mode-0 offset check. It cannot mutate a snapshotted byte.
+			continue;
+		}
 		const auto address = descriptor.Base48();
 		const auto size = ScalarBufferSize(descriptor);
 		if (descriptor.Type() != 0u || address == 0u || size == 0u) {

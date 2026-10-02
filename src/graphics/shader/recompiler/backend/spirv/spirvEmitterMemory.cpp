@@ -1692,6 +1692,13 @@ void EmitLoadMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 void EmitStoreMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto  op                = inst.GetOpcode();
 	const auto& mem               = ctx.Memory(inst);
+	if (mem.kind == IR::ResourceKind::Buffer &&
+	    mem.resource < ctx.state.program.info.buffers.size() &&
+	    ctx.state.program.info.buffers[mem.resource].zero_stride_oob) {
+		// OOB_SELECT=0 checks offset >= STRIDE for vector buffer stores.
+		// STRIDE=0 makes every such store out of bounds, including table candidates.
+		return;
+	}
 	const auto  buffer_components = IR::BufferComponentCount(op);
 	const auto  shared_components = IR::SharedComponentCount(op);
 	const auto  type              = inst.Arg(inst.NumArgs() - 2).GetType();

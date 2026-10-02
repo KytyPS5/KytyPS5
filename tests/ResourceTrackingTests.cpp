@@ -6457,7 +6457,7 @@ void TestBoundedMaterializationRejectsWritableAliases() {
     const uint32_t address = overlap ? 0x100cu : oversized ? 0x2000u : 0x1010u;
     const auto writer=AddBoundedSnapshotSource(fixture,
         {Value(address), Value(oversized ? 0x3fffu << 16u : 0u),
-         Value(oversized ? UINT32_MAX : 4u), Value(0u)});
+         Value(oversized ? UINT32_MAX : 4u), Value(3u << 28u)});
     fixture.program.info.buffers.push_back({.source=writer,.written=true});
     auto plan=ExtractResourcePlan(fixture.program);
     BoundedSnapshotReader reader; reader.generated_descriptors=1u;
@@ -6482,7 +6482,7 @@ void TestBoundedMaterializationRejectsWritableAliases() {
   Fixture ordered;
   InitializeBoundedSnapshot(ordered, 4u, true);
   const auto ordered_writer = AddBoundedSnapshotSource(
-      ordered, {Value(0x100cu), Value(0u), Value(4u), Value(0u)});
+      ordered, {Value(0x100cu), Value(0u), Value(4u), Value(3u << 28u)});
   ordered.program.info.buffers.push_back(
       {.source = ordered_writer, .written = true});
   auto ordered_plan = ExtractResourcePlan(ordered.program);
@@ -6528,7 +6528,7 @@ void TestBoundedMaterializationRejectsWritableAliases() {
   Fixture mapped_prefix;
   InitializeBoundedSnapshot(mapped_prefix,4u,true);
   const auto writer=AddBoundedSnapshotSource(mapped_prefix,
-      {Value(0x800u),Value(0u),Value(0x1000u),Value(0u)});
+      {Value(0x800u),Value(0u),Value(0x1000u),Value(3u << 28u)});
   mapped_prefix.program.info.buffers.push_back({.source=writer,.written=true});
   auto mapped_plan=ExtractResourcePlan(mapped_prefix.program);
   BoundedSnapshotReader mapped_reader;
@@ -6559,7 +6559,7 @@ void TestBoundedMaterializationRejectsWritableAliases() {
   BoundedSnapshotReader stride_zero_reader;
   constexpr uint64_t table_address=0x201347c600ull;
   const std::array<uint32_t,4> captured_descriptor{
-      0x132143d0u,0x00000020u,0x13214580u,0x00000020u};
+      0x132143d0u,0x00000020u,0x13214580u,0x30000020u};
   for (uint32_t word=0u; word<captured_descriptor.size(); ++word)
     stride_zero_reader.words.emplace_back(table_address+word*4u,
                                           captured_descriptor[word]);
@@ -6572,6 +6572,45 @@ void TestBoundedMaterializationRejectsWritableAliases() {
                              BoundedSnapshotRuntime(stride_zero_reader,stride_zero_data),
                              stride_zero_snapshot,stride_zero_specialization),
         "bounded stride-zero writer used its unreachable formal tail for aliasing");
+}
+
+void TestZeroStrideOutOfBoundsWriterAlias() {
+  struct Case { uint32_t stride; uint32_t mode; bool atomic; bool accepted; };
+  for (const auto input : {Case{0u, 0u, false, true},
+                           Case{0u, 3u, false, false},
+                           Case{4u, 0u, false, false},
+                           Case{0u, 0u, true, false}}) {
+    Fixture fixture;
+    InitializeBoundedSnapshot(fixture, 4u, true);
+    const auto writer = AddBoundedSnapshotSource(
+        fixture, {Value(0x100cu), Value(input.stride << 16u), Value(4u),
+                  Value(input.mode << 28u)});
+    fixture.program.info.buffers.push_back({.source = writer,
+                                            .written = true,
+                                            .atomic = input.atomic,
+                                            .formatted = true,
+                                            .descriptor_formatted_only = !input.atomic,
+                                            .stride_zero_access_size = 16u,
+                                            .max_byte_extent = 16u});
+    const auto plan = ExtractResourcePlan(fixture.program);
+    BoundedSnapshotReader reader;
+    reader.generated_descriptors = 1u;
+    const std::array<uint32_t, 3> data{1u, 0x1000u, 0u};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    const bool accepted = MaterializeResources(
+        plan, BoundedSnapshotRuntime(reader, data), snapshot, specialization);
+    Check(accepted == input.accepted,
+          "mode-0 zero-stride writer alias was not distinguished from a live store");
+    if (accepted) {
+      Check(snapshot.immutable_srt_ranges.size() == 1u &&
+                snapshot.immutable_srt_ranges[0].address == 0x1000u &&
+                snapshot.immutable_srt_ranges[0].size == 16u &&
+                snapshot.buffers.size() == 2u &&
+                specialization.buffers[1].zero_stride_oob,
+            "admitted no-write buffer lost its immutable source or descriptor proof");
+    }
+  }
 }
 
 void TestBoundedMaterializationNullsForeignBufferSlots() {
@@ -6870,6 +6909,7 @@ void TestFiniteSelectorSrtMaterialization() {
     if (address == 0x1060u) value = 0x106cu;
     if (address == 0x1064u) value = 0u;
     if (address == 0x1068u) value = 4u;
+    if (address == 0x106cu) value = 3u << 28u; // Live raw-byte bounds, not mode-0 zero-stride OOB.
   }
   Check(!MaterializeResources(plan, BoundedSnapshotRuntime(reader, data), snapshot, specialization),
         "finite descriptor candidate could write its immutable source footprint");
@@ -7418,7 +7458,7 @@ void TestWorkgroupSrtWrappedOffsetsAndWriteAliases() {
     Fixture alias;
     InitializeWorkgroupSnapshot(alias,{0u});
     const auto writer = AddBoundedSnapshotSource(alias,
-        {Value(overlap ? 0x1007u : 0x1008u),Value(0u),Value(1u),Value(0u)});
+        {Value(overlap ? 0x1007u : 0x1008u),Value(0u),Value(1u),Value(3u << 28u)});
     alias.program.info.buffers.push_back({.source=writer,.written=true});
     auto alias_plan = ExtractResourcePlan(alias.program);
     reader = {}; reader.words = {{0x1000u,0x11u},{0x1004u,0x22u}};
@@ -7741,6 +7781,11 @@ int main(int argc, char** argv) {
       std::cout << "KYTY_BOUNDED_WRITER_ALIAS_PASS\n";
       return 0;
     }
+    if (argc == 2 && std::strcmp(argv[1], "--zero-stride-writer-alias-only") == 0) {
+      TestZeroStrideOutOfBoundsWriterAlias();
+      std::cout << "KYTY_ZERO_STRIDE_WRITER_ALIAS_PASS\n";
+      return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--nested-posttest-image-only") == 0) {
       TestNestedPostTestImageLoop();
       return 0;
@@ -7866,6 +7911,7 @@ int main(int argc, char** argv) {
     Run("TestBoundedScalarProbeBudget", TestBoundedScalarProbeBudget);
     Run("TestBoundedMaterializationLimitsAreTransactional", TestBoundedMaterializationLimitsAreTransactional);
     Run("TestBoundedMaterializationRejectsWritableAliases", TestBoundedMaterializationRejectsWritableAliases);
+    Run("TestZeroStrideOutOfBoundsWriterAlias", TestZeroStrideOutOfBoundsWriterAlias);
     Run("TestBoundedMaterializationNullsForeignBufferSlots",
         TestBoundedMaterializationNullsForeignBufferSlots);
     Run("phi validation", TestPhiValidation);

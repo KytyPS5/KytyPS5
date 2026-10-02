@@ -1,5 +1,39 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **2 октября 2026 года** (native Windows; `40582634` + ещё не
+закоммиченное общее исправление достижимости SRT-слотов):
+
+- Синтетический `resource_tracking_tests --conditional-planning-srt-only`
+  дал ожидаемый RED на старом `RefreshFlatBuffer`: при невзятой ветке он
+  пытался читать недоступный planning-only scalar slot. Тот же тест после
+  исправления GREEN; дополнительно проверены взятая ветка, общий слот с
+  активным владельцем, неизвестное условие, запись шейдера и обновление
+  `nonzero → inactive zero`. Логи `_Build/logs/conditional-planning-srt-*20261002.log*`.
+  Полные `resource_tracking_tests`, `resource_materialization_tests`, три
+  соседних GPU compute-кейса, native MSVC build/install — GREEN. Полный CTest
+  после этого исправления не запускался; предыдущий checkpoint сообщает 60/71.
+- Installed exe SHA-256
+  `9332B4B37D1091A027F835CA80277D892A63B8F9028FC5AE3F224344CC716755`.
+  Retry `yotei-integrated-20261002-150513-menucheck-gpuav-sync` в 1280×720,
+  GPUAV+SyncDiag, readback с кадра 180: natural exit321, maxShown162, без
+  readback. Прежний VS `ee4f153aa500d327` теперь проходит materialization и
+  выпускает SPIR-V 7628/7632 слов (`_kyty.txt:7796275-7796277`,
+  `:7796347-7796348`). Это подтверждает прохождение прежней границы, но не
+  доказывает видимый кадр или успешное создание каждого graphics pipeline.
+- Новая runtime-граница того же retry: CS `7ceb0f3417f926f9`, clean flat
+  slot31, raw planning-only `ReadConstBuffer`, PC `0x294`, memory index60:
+  `runtime SRT evaluation failed` (`_kyty.txt:7796656`, `stderr.txt:1`).
+  Старые сохранённые SPIR-V этого шейдера существуют, но причина текущего
+  отказа не установлена; требуется адрес/descriptor/extent и отдельный RED.
+- Отдельный retry `yotei-integrated-20261001-220919-menucheck-gpuav-sync`
+  с readback с кадра 1 завершился exit321 при maxShown1: Vulkan validation
+  увидела `TRANSFER_DST_OPTIMAL` вместо ожидаемого `TRANSFER_SRC_OPTIMAL`
+  при `copyImageToBuffer` подготовленного кадра (`stdout.txt:1673`). Это
+  дефект диагностического readback-пути; он не доказывает состояние картинки
+  и не подтверждает выполнение VS/CS выше. `coloredProven=false` в обоих
+  запусках, процессы после каждого отсутствуют. Первый ненулевой кадр, меню
+  и gameplay остаются PENDING.
+
 Checkpoint **2 октября 2026 года** (Windows; рабочее дерево на базе `98a46e46`
 с общим исправлением scalar `ConditionRef` selector guard):
 

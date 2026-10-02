@@ -220,7 +220,7 @@ synthetic coverage debt. In the native game retry
 resource specialization (386 images, 383 pairs) and emitted 295838 SPIR-V
 words; a later VS SRT failure stopped the game before readback.
 
-## Pending planning-only scalar-address SRT slot (2026-10-02)
+## Planning-only scalar-address SRT slot (2026-10-02; regression resolved)
 
 The completed retry above reaches VS `ee4f153aa500d327` at maxShown170 and
 fails in `RefreshFlatBuffer`: flat slot2 is a raw planning-only
@@ -231,14 +231,52 @@ null-root correction allowed this shader to emit SPIR-V, but the current
 descriptor value and memory state have not been reconstructed. Do not turn
 arbitrary unreadable planning-only memory into zero.
 
-Before changing production behavior, add an independent CPU regression for a
+Before the production change, an independent CPU regression was added for a
 planning-only raw scalar-address read from an optional exact-null root that is
 unneeded by the active resource path, plus a used/readable root control.
 Non-null unreadable, dirty, aliased or actively required roots must still fail
 closed without partially committing a resource snapshot. Distinguish a slot
-that is truly unused/deferred from a required descriptor word, then verify the
-same test RED→GREEN, neighboring SRT cases, native GPU where applicable and a
-bounded game retry with source readback before claiming a frame.
+that is truly unused/deferred from a required descriptor word. The native
+`--conditional-planning-srt-only` test gave RED on the old implementation and
+GREEN unchanged after the CFG owner/reachability fix. Active/unreadable,
+unknown-condition, shared-owner, shader-write and repeated-snapshot controls
+are GREEN; full resource tracking/materialization suites, native build/install
+and three neighboring GPU compute cases are GREEN. In the bounded game retry
+VS `ee4f153aa500d327` emitted SPIR-V, while readback and a visible frame
+remain unproved. Logs and run references are in the first launch-plan checkpoint.
+
+## Pending clean scalar-buffer flat slot (2026-10-02)
+
+The next bounded retry stops at CS `7ceb0f3417f926f9`, flat slot31:
+`ReadConstBuffer`, `FlatSlotClean`, planning-only scalar buffer read, PC `0x294`,
+memory index60. `RefreshFlatBuffer` returned failure before SPIR-V for that
+specialization. The current error does not distinguish an invalid descriptor
+extent, unreadable guest address, unavailable argument or another evaluator
+failure. Older saved variants of this shader compiled, but they are not proof
+that the current runtime value is valid.
+
+Before changing production behavior, capture the evaluated descriptor base,
+stride, record count, offset and exact failure reason without exposing guest
+data. Add synthetic RED controls for a required readable clean slot and the
+actual failing case once its semantics are known; keep descriptor bounds,
+unreadable memory and failed argument evaluation closed and transactional.
+Do not apply ordinary-slot reachability skipping to clean slots: bounded
+wave-uniform resource planning may consume them outside the shader block.
+
+## Pending prepared-frame diagnostic readback layout (2026-10-02)
+
+With readback starting at frame1, the game stops at Vulkan validation:
+`copyImageToBuffer` expects `TRANSFER_SRC_OPTIMAL`, but the prepared image is
+still in `TRANSFER_DST_OPTIMAL`. The no-readback retry passes that point. This
+is a diagnostic-presentation blocker, separate from guest SRT and the goal of
+proving actual pixels.
+
+Before changing the capture path, add a bounded synthetic presentation
+regression that prepares a frame by copy and by clear, captures it with Vulkan
+validation, checks the copied bytes and the frame's later presentation, and
+reuses the frame. Include guest-source capture and ensure image layout/access
+transitions are recorded on the command buffer that performs the readback.
+The current game run is a reproduction but is not the minimal synthetic test.
 
 ## Pending neighboring unaligned scalar-buffer read (2026-09-28)
 

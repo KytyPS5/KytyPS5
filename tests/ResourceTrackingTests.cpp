@@ -3796,6 +3796,157 @@ void TestConditionalBufferMaterialization() {
   CheckActive();
 }
 
+ResourcePlan ConditionalPlanningScalarSlotPlan(bool shared_owner = false,
+                                               bool writer = false) {
+  Fixture fixture(ShaderType::Vertex);
+  auto *entry = fixture.block;
+  auto *optional = fixture.AddBlock();
+  auto *done = fixture.AddBlock();
+  entry->AddBranch(optional);
+  entry->AddBranch(done);
+  optional->AddBranch(done);
+  fixture.program.block_info[0].terminator = {
+      .kind = CFG::TerminatorKind::ConditionalBranch,
+      .true_block = 1u, .false_block = 2u};
+  fixture.program.block_info[1].terminator = {
+      .kind = CFG::TerminatorKind::Branch, .true_block = 2u};
+  fixture.program.block_info[2].terminator.kind = CFG::TerminatorKind::Return;
+
+  const auto control = fixture.Buffer(
+      {fixture.UserData(0), fixture.UserData(1), fixture.UserData(2),
+       fixture.UserData(3)}, 4u);
+  const auto flag = fixture.Emit(
+      ValueOpcode::ReadConstBuffer, {control, Value(0u)},
+      fixture.AddMemory({.kind = ResourceKind::ScalarBuffer}, 4u));
+  fixture.program.block_info[0].condition =
+      fixture.Emit(ValueOpcode::INotEqual32, {flag, Value(0u)});
+
+  const auto add_payload = [&](Block *block) {
+    fixture.block = block;
+    const auto address = fixture.Address(fixture.UserData(8), fixture.UserData(9), 8u);
+    const auto raw = fixture.Emit(
+        ValueOpcode::LoadAddressU32,
+        {address, Value(0u), Value(0u), Value(true)},
+        fixture.AddMemory({.kind = ResourceKind::ScalarAddress}, 8u));
+    const auto payload = fixture.Buffer(
+        {fixture.UserData(4), fixture.UserData(5), fixture.UserData(6), raw}, 12u);
+    fixture.Emit(ValueOpcode::LoadBufferU32,
+                 {payload, Value(0u), Value(0u), Value(0u), Value(true)},
+                 fixture.AddMemory({.kind = ResourceKind::Buffer}, 12u));
+    return raw;
+  };
+  const auto raw = add_payload(optional);
+  if (shared_owner) add_payload(done);
+  if (writer) {
+    fixture.Emit(ValueOpcode::StoreBufferU32,
+                 {control, Value(0u), Value(0u), Value(0u), Value(1u),
+                  Value(true)},
+                 fixture.AddMemory({.kind = ResourceKind::Buffer}, 16u), done);
+  }
+  fixture.PlanAndTrack();
+  Check(fixture.program.srt_reads.size() == 1u &&
+            fixture.program.srt_reads[0].value.Resolve() == raw &&
+            fixture.program.memory_info[1].planning_only,
+        "optional scalar descriptor word did not become a planning-only flat slot");
+  auto plan = ExtractResourcePlan(fixture.program);
+  Check(writer ? plan.control_flow.empty() : plan.control_flow.size() == 3u,
+        "optional scalar descriptor has incorrect resource control flow");
+  if (shared_owner) {
+    Check(plan.control_flow[1].flat_slots == std::vector<uint32_t>{0u} &&
+              plan.control_flow[2].flat_slots == std::vector<uint32_t>{0u},
+          "equivalent scalar reads did not share one flat slot across blocks");
+  }
+  return plan;
+}
+
+void TestConditionalPlanningScalarSlot() {
+  auto plan = ConditionalPlanningScalarSlotPlan();
+
+  std::array<uint32_t, 10> user_data{
+      0x1000u, 16u << 16u, 1u, 0x4dfacu,
+      0xc0107600u, 0x8cu, 0x97730000u, 0x100020u,
+      0u, 0u};
+  TestMemory memory;
+  memory.words[0] = 0u;
+  memory.words[1] = user_data[7];
+  SrtRuntime runtime{.user_data = user_data, .read_memory = ReadTestMemory,
+                     .userdata = &memory,
+                     .read_specialization_memory = ReadTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.buffers.size() == 2u &&
+            snapshot.buffers[1].dword_count == 4u &&
+            snapshot.buffers[1].dwords == std::array<uint32_t, 8>{} &&
+            snapshot.flattened_srt == std::vector<uint32_t>{0u} &&
+            memory.reads == 1u,
+        "untaken branch evaluated its unreadable planning-only scalar slot");
+
+  const auto saved_snapshot = snapshot;
+  const auto saved_specialization = specialization;
+  memory.words[0] = 1u;
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization) &&
+            SameResourceSnapshot(snapshot, saved_snapshot) &&
+            specialization == saved_specialization,
+        "taken branch accepted an unreadable scalar descriptor word or changed prior state");
+
+  memory.words[0] = 0u;
+  runtime.read_specialization_memory = RejectTestMemory;
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization) &&
+            SameResourceSnapshot(snapshot, saved_snapshot) &&
+            specialization == saved_specialization,
+        "failed specialization predicate discarded a required scalar slot");
+
+  runtime.read_specialization_memory = nullptr;
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization) &&
+            SameResourceSnapshot(snapshot, saved_snapshot) &&
+            specialization == saved_specialization,
+        "missing specialization predicate discarded a required scalar slot");
+
+  runtime.read_specialization_memory = ReadTestMemory;
+  user_data[8] = 0x1004u;
+  memory.words[0] = 1u;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.buffers.size() == 2u &&
+            snapshot.buffers[1].dwords[3] == user_data[7] &&
+            snapshot.flattened_srt == std::vector<uint32_t>{user_data[7]},
+        "taken branch did not materialize its readable scalar descriptor word");
+
+  user_data[8] = 0u;
+  memory.words[0] = 0u;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.buffers.size() == 2u &&
+            snapshot.buffers[1].dwords == std::array<uint32_t, 8>{} &&
+            snapshot.flattened_srt == std::vector<uint32_t>{0u},
+        "inactive refresh retained a flat value from an earlier active snapshot");
+
+  auto shared_plan = ConditionalPlanningScalarSlotPlan(true);
+  user_data[8] = 0x1004u;
+  ResourceSnapshot shared_snapshot;
+  ResourceSpecialization shared_specialization;
+  Check(MaterializeResources(shared_plan, runtime, shared_snapshot,
+                             shared_specialization) &&
+            shared_snapshot.flattened_srt ==
+                std::vector<uint32_t>{user_data[7]} &&
+            !shared_snapshot.buffers.empty() &&
+            shared_snapshot.buffers.back().dwords[3] == user_data[7],
+        "shared flat slot was skipped despite a reachable owner");
+  user_data[8] = 0u;
+  const auto saved_shared_snapshot = shared_snapshot;
+  const auto saved_shared_specialization = shared_specialization;
+  Check(!MaterializeResources(shared_plan, runtime, shared_snapshot,
+                              shared_specialization) &&
+            SameResourceSnapshot(shared_snapshot, saved_shared_snapshot) &&
+            shared_specialization == saved_shared_specialization,
+        "shared flat slot hid an unreadable value required by its active owner");
+
+  auto writable_plan = ConditionalPlanningScalarSlotPlan(false, true);
+  Check(!MaterializeResources(writable_plan, runtime, snapshot, specialization) &&
+            SameResourceSnapshot(snapshot, saved_snapshot) &&
+            specialization == saved_specialization,
+        "shader write allowed an unsafe reachability proof for a scalar slot");
+}
+
 void TestConservativeBufferReachability() {
   std::array<uint32_t, 8> user_data{
       0x1000, 16u << 16u, 1, 0x4dfac,
@@ -7444,6 +7595,11 @@ void TestGpuSelectedRawBufferAdmission() {
 
 int main(int argc, char** argv) {
   try {
+    if (argc == 2 && std::strcmp(argv[1], "--conditional-planning-srt-only") == 0) {
+      TestConditionalPlanningScalarSlot();
+      std::cout << "KYTY_CONDITIONAL_PLANNING_SRT_PASS\n";
+      return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--conditional-scalar-address-only") == 0) {
       TestConditionalScalarAddressReadRemainsRuntime();
       std::cout << "KYTY_CONDITIONAL_SCALAR_ADDRESS_PASS\n";
@@ -7654,6 +7810,7 @@ int main(int argc, char** argv) {
     Run("dynamic FLAT address", TestDynamicFlatAddressesUseDma);
     Run("buffer swizzle specialization", TestBufferSwizzleSpecialization);
     Run("conditional buffer materialization", TestConditionalBufferMaterialization);
+    Run("conditional planning scalar slot", TestConditionalPlanningScalarSlot);
     Run("conservative buffer reachability", TestConservativeBufferReachability);
     Run("conditional indirect image", TestConditionalIndirectImageMaterialization);
     Run("shader info and bindings", TestShaderInfoAndBindingLayout);

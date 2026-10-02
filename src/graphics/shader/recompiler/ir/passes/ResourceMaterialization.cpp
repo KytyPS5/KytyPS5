@@ -1578,6 +1578,7 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& i
 	SrtWalker clean(program, clean_runtime);
 	SrtWalker walker(program, runtime, program.clean_flat_slots, &clean);
 	const auto active = clean.FindActiveSources();
+	const auto active_flat_slots = clean.ActiveFlatSlots();
 	std::vector<DescriptorValue> values;
 	values.reserve(program.materialization_sources.size());
 	for (const auto source : program.materialization_sources) {
@@ -1604,7 +1605,7 @@ static bool MaterializeSnapshot(const ResourcePlan& program, const SrtRuntime& i
 		values.push_back(value);
 	}
 	std::vector<uint32_t> flattened_srt;
-	if (!walker.RefreshFlatBuffer(flattened_srt)) {
+	if (!walker.RefreshFlatBuffer(flattened_srt, active_flat_slots)) {
 		const auto& detail = walker.LastFlatError();
 		return SpecializationFail(detail.empty() ? "runtime SRT evaluation failed"
 		                                         : fmt::format("runtime SRT evaluation failed: {}",
@@ -2332,6 +2333,13 @@ static std::vector<ResourceBlock> ResourceControlFlow(const Program& program) {
 		}
 		for (const auto& inst: *program.blocks[i]) {
 			const auto op     = inst.GetOpcode();
+			if (op == ValueOpcode::ReadConst) {
+				if (inst.NumArgs() != 2u) return {};
+				const auto slot = inst.Arg(1).Resolve();
+				if (!slot.IsImmediate() || slot.GetType() != Type::U32 ||
+				    slot.U32() >= program.srt_reads.size()) return {};
+				block.flat_slots.push_back(slot.U32());
+			}
 			const auto buffer = BufferAccessOf(op);
 			const auto image  = ImageOpcodeInfoOf(op);
 			if (buffer == BufferAccess::None && image.access == ImageAccess::None) {
@@ -2353,6 +2361,9 @@ static std::vector<ResourceBlock> ResourceControlFlow(const Program& program) {
 		std::ranges::sort(block.sources);
 		block.sources.erase(std::unique(block.sources.begin(), block.sources.end()),
 		                    block.sources.end());
+		std::ranges::sort(block.flat_slots);
+		block.flat_slots.erase(std::unique(block.flat_slots.begin(), block.flat_slots.end()),
+		                       block.flat_slots.end());
 	}
 	if (std::ranges::none_of(
 	        blocks, [](const ResourceBlock& block) { return !block.condition.IsEmpty(); })) {

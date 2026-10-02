@@ -88,7 +88,11 @@ public:
 	bool EvaluateDescriptor(uint32_t source, DescriptorValue& result);
 	// An empty span means that all sources are active.
 	std::span<const uint8_t> FindActiveSources();
-	bool RefreshFlatBuffer(std::vector<uint32_t>& flat);
+	// Result of the latest FindActiveSources call on this plan. Empty means no
+	// control-flow proof and requires eager evaluation of every slot.
+	std::span<const uint8_t> ActiveFlatSlots() const { return m_program.active_flat_slots; }
+	bool RefreshFlatBuffer(std::vector<uint32_t>& flat,
+	                       std::span<const uint8_t> active_flat_slots = {});
 
 private:
 	static ResourcePlan::EvaluationContext& AcquireContext(const ResourcePlan& program);

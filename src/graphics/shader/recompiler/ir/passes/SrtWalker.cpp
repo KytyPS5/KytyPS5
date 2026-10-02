@@ -2117,6 +2117,7 @@ bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
 }
 
 std::span<const uint8_t> SrtWalker::FindActiveSources() {
+	m_program.active_flat_slots.clear();
 	if (m_program.control_flow.empty()) {
 		return {};
 	}
@@ -2151,10 +2152,22 @@ std::span<const uint8_t> SrtWalker::FindActiveSources() {
 			pending.insert(pending.end(), block.successors.begin(), block.successors.end());
 		}
 	}
+	// Preserve eager evaluation for slots with no shader-side owner. A slot
+	// shared by several blocks remains required if any owner can execute.
+	auto& active_flat = m_program.active_flat_slots;
+	active_flat.assign(m_program.srt_reads.size(), 1u);
+	for (const auto& block: m_program.control_flow) {
+		for (const auto slot: block.flat_slots) active_flat[slot] = 0u;
+	}
+	for (uint32_t index = 0; index < m_program.control_flow.size(); ++index) {
+		if (!visited[index]) continue;
+		for (const auto slot: m_program.control_flow[index].flat_slots) active_flat[slot] = 1u;
+	}
 	return active;
 }
 
-bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
+bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat,
+                                 std::span<const uint8_t> active_flat_slots) {
 	m_last_flat_error.clear();
 	if (!m_program.srt_plan_complete) {
 		m_last_flat_error = "SRT plan is incomplete";
@@ -2162,6 +2175,11 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 	}
 	flat.resize(m_program.srt_reads.size());
 	for (const auto& read: m_program.srt_reads) {
+		if (read.flat_offset >= flat.size()) {
+			m_last_flat_error =
+			    fmt::format("flat slot {} exceeds resized buffer {}", read.flat_offset, flat.size());
+			return false;
+		}
 		const auto slot_kind = read.flat_offset < m_clean_flat_slots.size()
 		                           ? m_clean_flat_slots[read.flat_offset]
 		                           : 0u;
@@ -2169,6 +2187,12 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		// bounded snapshot materializes. Eager evaluation would touch GPU-selected
 		// addresses before their coefficients exist.
 		if (slot_kind == ResourcePlan::FlatSlotDeferred) {
+			flat[read.flat_offset] = 0u;
+			continue;
+		}
+		if (slot_kind == ResourcePlan::FlatSlotOrdinary &&
+		    active_flat_slots.size() == m_program.srt_reads.size() &&
+		    !active_flat_slots[read.flat_offset]) {
 			flat[read.flat_offset] = 0u;
 			continue;
 		}
@@ -2181,31 +2205,31 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 			return false;
 		}
 		auto& evaluator = clean ? *m_clean_evaluator : *this;
-		if (read.flat_offset >= flat.size()) {
-			m_last_flat_error =
-			    fmt::format("flat slot {} exceeds resized buffer {}", read.flat_offset, flat.size());
-			return false;
-		}
+		evaluator.m_last_flat_error.clear();
 		if (!evaluator.Evaluate(read.value, flat[read.flat_offset])) {
+			const auto nested = evaluator.LastFlatError();
 			const auto* inst = read.value.Resolve().TryInstruction();
 			std::string detail;
 			if (inst != nullptr && (inst->GetOpcode() == ValueOpcode::LoadAddressU32 ||
 			                        inst->GetOpcode() == ValueOpcode::ReadConstBuffer)) {
-				const auto index = inst->Flags<MemoryFlags>().index;
+				const auto flags = inst->Flags<MemoryFlags>();
+				const auto index = flags.index;
 				const auto kind = index < m_program.memory_info.size()
 				                      ? static_cast<uint32_t>(m_program.memory_info[index].kind)
 				                      : UINT32_MAX;
 				const auto planning = index < m_program.memory_info.size() &&
 				                      m_program.memory_info[index].planning_only;
-				detail = fmt::format(" raw={} kind={} planning={} slot_kind={}",
-				                     IsRawRead(m_program, *inst), kind, planning, slot_kind);
+				detail = fmt::format(" raw={} kind={} planning={} slot_kind={} pc=0x{:x} memory={}",
+				                     IsRawRead(m_program, *inst), kind, planning, slot_kind,
+				                     flags.pc, index);
 			}
 			m_last_flat_error = fmt::format(
-			    "flat slot {} evaluation failed (clean={} opcode={} args={} workgroups={}{})",
+			    "flat slot {} evaluation failed (clean={} opcode={} args={} workgroups={}{}{})",
 			    read.flat_offset, clean,
 			    inst != nullptr ? static_cast<uint32_t>(inst->GetOpcode()) : UINT32_MAX,
 			    inst != nullptr ? inst->NumArgs() : 0u,
-			    m_runtime.compute_workgroups.has_value(), detail);
+			    m_runtime.compute_workgroups.has_value(), detail,
+			    nested.empty() ? "" : fmt::format(" nested={}", nested));
 			return false;
 		}
 	}

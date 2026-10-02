@@ -385,7 +385,9 @@ static void UpdateGraphicsDynamicState(const CommandBuffer& buffer, DynamicState
 #if !defined(__APPLE__)
 	dynamic_state.SetDepthBoundsTestEnabled(depth.depth_bounds_test_enable);
 	if (depth.depth_bounds_test_enable) {
-		dynamic_state.SetDepthBounds(ctx.GetDepthBoundsMin(), ctx.GetDepthBoundsMax());
+		// Without VK_EXT_depth_range_unrestricted the bounds must lie in [0, 1].
+		dynamic_state.SetDepthBounds(std::clamp(ctx.GetDepthBoundsMin(), 0.0f, 1.0f),
+		                             std::clamp(ctx.GetDepthBoundsMax(), 0.0f, 1.0f));
 	}
 #endif
 
@@ -438,7 +440,8 @@ static bool DrawHasValidVertexShader(const HW::Shader& sh_ctx) {
 static bool PixelShaderHasDepthOrCoverageSideEffects(const HW::ShaderRegisters& sh_regs) {
 	const auto& db = sh_regs.db_shader_control;
 	return db.shader_kill_enable || db.shader_z_export_enable || db.shader_mask_export_enable ||
-	       db.shader_dual_export_enable || db.shader_execute_on_noop || sh_regs.AlphaToMask();
+	       db.shader_dual_export_enable || db.shader_execute_on_noop || sh_regs.AlphaToMask() ||
+	       db.shader_stencil_test_val_export_enable || db.shader_stencil_op_val_export_enable;
 }
 
 struct DrawRenderState {

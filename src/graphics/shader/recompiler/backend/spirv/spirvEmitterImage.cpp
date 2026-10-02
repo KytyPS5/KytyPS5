@@ -700,32 +700,6 @@ uint32_t StoreTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t d
 	return PackImageTexel(ctx, mem, texel);
 }
 
-spv::Op ImageAtomicOpcode(IR::ValueOpcode opcode) {
-	switch (opcode) {
-		case IR::ValueOpcode::ImageAtomicSwap32: return spv::OpAtomicExchange;
-		case IR::ValueOpcode::ImageAtomicIAdd32: return spv::OpAtomicIAdd;
-		case IR::ValueOpcode::ImageAtomicISub32: return spv::OpAtomicISub;
-		case IR::ValueOpcode::ImageAtomicSMin32: return spv::OpAtomicSMin;
-		case IR::ValueOpcode::ImageAtomicSMax32: return spv::OpAtomicSMax;
-		case IR::ValueOpcode::ImageAtomicUMin32: return spv::OpAtomicUMin;
-		case IR::ValueOpcode::ImageAtomicUMax32: return spv::OpAtomicUMax;
-		case IR::ValueOpcode::ImageAtomicAnd32: return spv::OpAtomicAnd;
-		case IR::ValueOpcode::ImageAtomicOr32: return spv::OpAtomicOr;
-		case IR::ValueOpcode::ImageAtomicXor32: return spv::OpAtomicXor;
-		case IR::ValueOpcode::ImageAtomicSwap64: return spv::OpAtomicExchange;
-		case IR::ValueOpcode::ImageAtomicIAdd64: return spv::OpAtomicIAdd;
-		case IR::ValueOpcode::ImageAtomicISub64: return spv::OpAtomicISub;
-		case IR::ValueOpcode::ImageAtomicSMin64: return spv::OpAtomicSMin;
-		case IR::ValueOpcode::ImageAtomicSMax64: return spv::OpAtomicSMax;
-		case IR::ValueOpcode::ImageAtomicUMin64: return spv::OpAtomicUMin;
-		case IR::ValueOpcode::ImageAtomicUMax64: return spv::OpAtomicUMax;
-		case IR::ValueOpcode::ImageAtomicAnd64: return spv::OpAtomicAnd;
-		case IR::ValueOpcode::ImageAtomicOr64: return spv::OpAtomicOr;
-		case IR::ValueOpcode::ImageAtomicXor64: return spv::OpAtomicXor;
-		default: return spv::OpNop;
-	}
-}
-
 } // namespace
 
 void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
@@ -1077,7 +1051,6 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		ctx.Define(inst, ResultVector(ctx, result, numeric_class, dref, mem));
 		return;
 	}
-	const auto atomic_opcode = ImageAtomicOpcode(op);
 	if (image_info.access == IR::ImageAccess::Atomic) {
 		const auto dimension = image.dimension;
 		// The texel is a genuine 64-bit scalar, while the IR carries the value as a pair of u32.
@@ -1093,8 +1066,8 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		                                 std::vector<uint32_t> {ConstantU32(state, 0),
 		                                                        ConstantU32(state, 0)})
 		         : ConstantU32(state, 0);
-		ctx.Define(inst, EmitValueOrDefaultIfCondition(state, ctx.Arg(inst, 3), result_type,
-		                                              zero_result, [&]() {
+		ctx.Define(inst, EmitValueOrDefaultIfCondition(state, ctx.Arg(inst, inst.NumArgs() - 1),
+		                                              result_type, zero_result, [&]() {
 			           const auto pointer      = state.builder.AllocateId();
 			           const auto pointer_type = state.builder.Type(
 			               spv::OpTypePointer, spv::StorageClassImage, value_type);
@@ -1111,16 +1084,19 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 					                                   op == IR::ValueOpcode::ImageAtomicFMax32);
 				                               });
 			           }
-			           const auto value =
-			               wide ? Unary(state, spv::OpBitcast, value_type, ctx.Arg(inst, 2))
-			                    : ctx.Arg(inst, 2);
-			           const auto old = state.builder.AllocateId();
-			           state.builder.AddFunction(atomic_opcode, value_type, old, pointer,
+			           if (!wide) {
+				           const auto old = EmitAtomicOperation(ctx, inst, pointer, spv::ScopeDevice);
+				           EmitAtomicMemoryBarrier(state, IR::ResourceKind::Image);
+				           return old;
+			           }
+			           const auto value = Unary(state, spv::OpBitcast, value_type, ctx.Arg(inst, 2));
+			           const auto old   = state.builder.AllocateId();
+			           state.builder.AddFunction(SpirvAtomicOpcode(op), value_type, old, pointer,
 			                                     ConstantU32(state, spv::ScopeDevice),
 			                                     ConstantU32(state, spv::MemorySemanticsMaskNone),
 			                                     value);
-			           EmitDeviceAtomicMemoryBarrier(state);
-			           return wide ? Unary(state, spv::OpBitcast, TypeU64(state), old) : old;
+			           EmitAtomicMemoryBarrier(state, IR::ResourceKind::Image);
+			           return Unary(state, spv::OpBitcast, TypeU64(state), old);
 		           }));
 		return;
 	}

@@ -10,6 +10,10 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Decoder {
 
+// PS5 flat stack addresses use these SH_MEM_BASES aperture tags in VA[63:32].
+constexpr uint32_t PrivateApertureHigh = 0x70000000u;
+constexpr uint32_t SharedApertureHigh = 0x80000000u;
+
 enum class Family {
 	Unknown,
 	SOP1,
@@ -299,6 +303,7 @@ enum class Opcode {
 	V_MAD_I32_I16,
 	V_MUL_LO_U16,
 	V_FMA_F64,
+	V_ADD_F64,
 	V_MUL_F64,
 	V_FMA_F32,
 	V_FMA_F16,
@@ -438,6 +443,10 @@ enum class Opcode {
 	V_CMPX_O_F32,
 	V_CMPX_U_F32,
 	V_CMPX_TRU_F32,
+	V_CMP_EQ_F64,
+	V_CMP_LE_F64,
+	V_CMPX_LE_F64,
+	V_CMPX_GE_F64,
 	V_CMPX_LT_F32,
 	V_CMPX_EQ_F32,
 	V_CMPX_LE_F32,
@@ -479,7 +488,6 @@ enum class Opcode {
 	V_CMP_F_F16,
 	V_CMP_O_F16,
 	V_CMP_U_F16,
-	V_CMP_NGE_F16,
 	V_CMP_NLG_F16,
 	V_CMP_NLE_F16,
 	V_CMP_NLT_F16,
@@ -498,6 +506,7 @@ enum class Opcode {
 	V_CMP_GT_F16,
 	V_CMP_LG_F16,
 	V_CMP_GE_F16,
+	V_CMP_NGE_F16,
 	V_CMP_NGT_F16,
 	V_CMP_NEQ_F16,
 	V_CMPX_LT_F16,
@@ -661,6 +670,7 @@ enum class Opcode {
 	FLAT_STORE_DWORDX3,
 	FLAT_STORE_DWORDX4,
 	DS_ADD_U32,
+	DS_ADD_U64,
 	DS_ADD_RTN_U32,
 	DS_SUB_U32,
 	DS_SUB_RTN_U32,
@@ -723,6 +733,7 @@ enum class Opcode {
 	DS_WRITE_B128,
 	DS_WRITE_ADDTID_B32,
 	DS_READ_ADDTID_B32,
+	IMAGE_BVH_INTERSECT_RAY,
 	IMAGE_GET_RESINFO,
 	IMAGE_GET_LOD,
 	IMAGE_LOAD,
@@ -730,11 +741,12 @@ enum class Opcode {
 	IMAGE_STORE,
 	IMAGE_STORE_MIP,
 	IMAGE_ATOMIC_SWAP,
+	IMAGE_ATOMIC_CMPSWAP,
 	IMAGE_ATOMIC_ADD,
 	IMAGE_ATOMIC_SUB,
 	IMAGE_ATOMIC_SMIN,
-	IMAGE_ATOMIC_SMAX,
 	IMAGE_ATOMIC_UMIN,
+	IMAGE_ATOMIC_SMAX,
 	IMAGE_ATOMIC_UMAX,
 	IMAGE_ATOMIC_AND,
 	IMAGE_ATOMIC_OR,
@@ -829,6 +841,8 @@ enum class OperandKind {
 	Scc,
 	M0,
 	PopsExitingWaveId,
+	SharedBase,
+	PrivateBase,
 	Null,
 	Vgpr,
 };
@@ -940,7 +954,6 @@ struct Instruction {
 struct Program {
 	std::span<const uint32_t> code;
 	std::vector<Instruction>  instructions;
-	bool                     has_bvh = false;
 };
 
 // Code spans are trusted to contain complete instructions, valid branch targets, and 32-bit PCs.

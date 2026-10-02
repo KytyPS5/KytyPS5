@@ -220,7 +220,6 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		std::vector<Permutation>                    permutations;
-		bool                                        skip_dispatch = false;
 	};
 
 	struct ProgramKeyHash {
@@ -300,9 +299,6 @@ struct PipelineCache::ProgramCache {
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, lookup_key.static_state);
 		auto                                         entry = programs.find(lookup_key);
-		if (entry != programs.end() && entry->second.skip_dispatch) {
-			return {};
-		}
 		const ShaderRecompiler::IR::SrtRuntime       runtime {
 		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),
@@ -370,11 +366,6 @@ struct PipelineCache::ProgramCache {
 		}
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code);
 		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
-		if (translated.skip_dispatch) {
-			entry = programs.try_emplace(lookup_key, ShaderRecompiler::IR::ResourcePlan {}).first;
-			entry->second.skip_dispatch = true;
-			return {};
-		}
 		if (entry == programs.end()) {
 			entry = programs.try_emplace(lookup_key,
 			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program)).first;
@@ -753,13 +744,6 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 		}
 		const auto& rt                        = ctx.GetRenderTarget(colors[i].target_slot);
 		const auto& bc                        = ctx.GetBlendControl(colors[i].target_slot);
-		static_params.color_srcblend[slot]       = bc.color_srcblend;
-		static_params.color_comb_fcn[slot]       = bc.color_comb_fcn;
-		static_params.color_destblend[slot]      = bc.color_destblend;
-		static_params.alpha_srcblend[slot]       = bc.alpha_srcblend;
-		static_params.alpha_comb_fcn[slot]       = bc.alpha_comb_fcn;
-		static_params.alpha_destblend[slot]      = bc.alpha_destblend;
-		static_params.separate_alpha_blend[slot] = bc.separate_alpha_blend;
 		const bool alpha_remap =
 		    slot == 0 && ps_input_info != nullptr && ps_input_info->alpha_blend_source_remap;
 		static_params.blend_enable[slot] = bc.enable && !rt.info.blend_bypass;
@@ -777,6 +761,17 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 		}
 		if (alpha_remap) {
 			static_params.blend_alpha_source_remap = true;
+		}
+		if (static_params.blend_enable[slot]) {
+			static_params.color_srcblend[slot]       = bc.color_srcblend;
+			static_params.color_comb_fcn[slot]       = bc.color_comb_fcn;
+			static_params.color_destblend[slot]      = bc.color_destblend;
+			static_params.separate_alpha_blend[slot] = bc.separate_alpha_blend;
+			if (bc.separate_alpha_blend) {
+				static_params.alpha_srcblend[slot]  = bc.alpha_srcblend;
+				static_params.alpha_comb_fcn[slot]  = bc.alpha_comb_fcn;
+				static_params.alpha_destblend[slot] = bc.alpha_destblend;
+			}
 		}
 	}
 	const bool with_depth =

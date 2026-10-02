@@ -564,13 +564,22 @@ void Translator::IMAGE_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode 
 	const auto memory   = MemoryInfoFromDecoded(inst);
 	const auto resource = GetImageResource(memory);
 	const auto address  = MakeImageAddress(inst, MemorySourceAt(inst, 1));
-	// RDNA encodes the width of an image atomic in DMASK rather than the opcode: two enabled
-	// components means one 64-bit value, not two 32-bit ones.
-	const auto      data_src = MemorySourceAt(inst, 0);
-	const bool      wide     = memory.data_dwords == 2u;
-	const IR::Value value    = wide ? IR::Value(ReadU64(data_src)) : IR::Value(ReadU32(data_src));
-	const auto      result   = ir.Emit(wide ? opcode64 : opcode, {resource, address, value, ir.GetExec()},
-	                              AddMemoryInfo(memory, inst.pc));
+	const auto data_src = MemorySourceAt(inst, 0);
+	const auto flags    = AddMemoryInfo(memory, inst.pc);
+	IR::Value  result;
+	if (opcode == IR::ValueOpcode::ImageAtomicCompareSwap32) {
+		// VDATA supplies the replacement; VDATA+1 supplies the comparison.
+		result = ir.Emit(opcode,
+		                 {resource, address, ReadU32(data_src), ReadU32(OffsetOperand(data_src, 1u)),
+		                  ir.GetExec()},
+		                 flags);
+	} else {
+		// RDNA encodes the width of an image atomic in DMASK rather than the opcode: two enabled
+		// components means one 64-bit value, not two 32-bit ones.
+		const bool      wide  = memory.data_dwords == 2u;
+		const IR::Value value = wide ? IR::Value(ReadU64(data_src)) : IR::Value(ReadU32(data_src));
+		result = ir.Emit(wide ? opcode64 : opcode, {resource, address, value, ir.GetExec()}, flags);
+	}
 	if (inst.glc) {
 		WriteOperand(inst.dst, result);
 	}
@@ -893,6 +902,15 @@ void Translator::DS_BPERMUTE_B32(const Decoder::Instruction& inst) {
 
 void Translator::EmitMemory(const Decoder::Instruction& inst) {
 	switch (inst.opcode) {
+		case Decoder::Opcode::IMAGE_BVH_INTERSECT_RAY: {
+			const auto result = ir.Emit(IR::ValueOpcode::BvhIntersect,
+			    {ConstructU32x4(inst.src1, 4), MakeImageAddress(inst, inst.src0), ir.GetExec()});
+			for (uint32_t component = 0; component < 4; ++component) {
+				WriteOperand(OffsetOperand(inst.dst, component),
+				    ir.Emit(IR::ValueOpcode::CompositeExtractU32x4, {result, IR::Value(component)}));
+			}
+			return;
+		}
 		case Decoder::Opcode::S_LOAD_DWORD:
 		case Decoder::Opcode::S_LOAD_DWORDX2:
 		case Decoder::Opcode::S_LOAD_DWORDX4:
@@ -1014,6 +1032,8 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 
 		case Decoder::Opcode::DS_ADD_U32:
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicIAdd32, false);
+		case Decoder::Opcode::DS_ADD_U64:
+			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicIAdd64, false);
 		case Decoder::Opcode::DS_ADD_RTN_U32:
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicIAdd32, true);
 		case Decoder::Opcode::DS_SUB_U32:
@@ -1062,6 +1082,9 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::DS_WRXCHG_RTN_B32:
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicSwap32, true);
 
+		case Decoder::Opcode::IMAGE_ATOMIC_CMPSWAP:
+			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicCompareSwap32,
+			                    IR::ValueOpcode::ImageAtomicCompareSwap32);
 		case Decoder::Opcode::IMAGE_ATOMIC_SWAP:
 			return IMAGE_ATOMIC(inst, IR::ValueOpcode::ImageAtomicSwap32,
 			                    IR::ValueOpcode::ImageAtomicSwap64);

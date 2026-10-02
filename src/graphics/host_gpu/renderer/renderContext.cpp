@@ -120,6 +120,10 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 }
 
 void RenderContext::PrepareBda() {
+	if (!m_bda_logged) {
+		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
+		m_bda_logged = true;
+	}
 	// Synchronizing walks every buffer in every mapped range. Do it once per guest submission, and
 	// again only if the GPU thread dirtied guest memory or a buffer was created since.
 	const auto cpu_epoch    = g_submission_serial.load(std::memory_order_acquire) * 0x100000000ull +

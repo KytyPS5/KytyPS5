@@ -83,6 +83,7 @@ private:
 	bool                      m_fault_process_pending = false;
 	uint64_t                  m_bda_cpu_epoch         = 0;
 	uint64_t                  m_bda_buffer_epoch      = 0;
+	bool                      m_bda_logged = false;
 
 	Common::Mutex                        m_interrupt_mutex;
 	std::vector<InterruptEqRegistration> m_interrupt_eqs;

@@ -30,6 +30,7 @@ enum class ResourceKind {
 	Buffer,
 	IndirectBuffer,
 	Flat,
+	FlatLocal,
 	Global,
 	Scratch,
 	Lds,
@@ -40,7 +41,8 @@ enum class ResourceKind {
 
 [[nodiscard]] constexpr bool IsAddressResourceKind(ResourceKind kind) {
 	return kind == ResourceKind::ScalarAddress || kind == ResourceKind::Flat ||
-	       kind == ResourceKind::Global || kind == ResourceKind::Scratch;
+	       kind == ResourceKind::FlatLocal || kind == ResourceKind::Global ||
+	       kind == ResourceKind::Scratch;
 }
 
 struct MemoryInfo {
@@ -503,6 +505,7 @@ struct ResourceBlock {
 	Value                 condition;
 	std::vector<uint32_t> successors;
 	std::vector<uint32_t> sources;
+	std::vector<uint32_t> srt_reads;
 };
 
 // Stable shader metadata consumed by the renderer after native IR has been discarded.
@@ -517,6 +520,7 @@ struct CompiledShaderInfo {
 	// The structurizer gave up and emitted a block dispatcher loop; drivers can take minutes to
 	// optimize the result, so pipelines built from it are created unoptimized.
 	bool                          dispatcher_fallback = false;
+	bool                          has_address_writes  = false;
 	ShaderInfo                    info;
 	BindingLayout                 bindings;
 };
@@ -571,7 +575,6 @@ struct ResourcePlan {
 	mutable std::vector<uint8_t>            visited_blocks;
 	mutable std::vector<uint32_t>           pending_blocks;
 	mutable std::vector<uint32_t>           material_keys;
-	mutable std::vector<std::pair<uint64_t, uint64_t>> specialization_reads;
 };
 
 struct Program: ResourcePlan {

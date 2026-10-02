@@ -208,6 +208,9 @@ MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::
 			const auto variable = bits == 8u ? state.storage_buffer_u8_variable
 			                      : bits == 16u ? state.storage_buffer_u16_variable
 			                                    : state.storage_buffer_variable;
+			if (mem.direct_address) {
+				EXIT("direct-address buffer access reached the storage-view path\n");
+			}
 			access = PrepareStorageBufferResourceAccess(
 			    state, mem, variable, TypeStorageBufferPointer(state, bits));
 			access.element_bits = bits;

@@ -121,6 +121,12 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	if (address == 0 || size == 0) {
 		return {context.GetBufferCache().GetBuffer(NULL_BUFFER_ID).Handle(), 0, 16};
 	}
+	if (resource.direct_address) {
+		// Every access is a raw direct (BDA) guest load, so no view is bound. Materializing the
+		// window uploads it and enters its pages into the BDA page table before the work runs.
+		(void)context.GetBufferCache().ObtainBuffer(address, size, false, false, id);
+		return {context.GetBufferCache().GetBuffer(NULL_BUFFER_ID).Handle(), 0, 16};
+	}
 	const auto& graphics  = context.GetGraphics();
 	const auto  alignment = graphics.StorageMinAlignment();
 	if (size > graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange) {
@@ -829,7 +835,12 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 			prepared.buffer_sources.push_back({});
 			continue;
 		}
-		const auto size = Libs::LibKernel::Memory::ClampRangeSize(address, requested_size);
+		// A buffer access forms its offset from the descriptor base in 32-bit arithmetic, so no
+		// shader reaches 4 GiB or more past the base. A maximal-range descriptor over a larger
+		// mapping would otherwise materialize memory no access can address.
+		constexpr uint64_t addressable = uint64_t {1} << 32u;
+		const auto         size =
+		    std::min(Libs::LibKernel::Memory::ClampRangeSize(address, requested_size), addressable);
 		prepared.buffer_sources.push_back({address, size, cache.FindBuffer(address, size)});
 	}
 }

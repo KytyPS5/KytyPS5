@@ -642,10 +642,13 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 			const auto op = inst.GetOpcode();
 			uint32_t first = 0;
 			if (op == IR::ValueOpcode::GetBufferResource) {
+				// GPU-selected and direct-address accesses evaluate the V# in the shader.
 				if (std::ranges::any_of(inst.Uses(), [&](const IR::Use& use) {
-					return ir.memory_info[use.user->Flags<IR::MemoryFlags>().index].kind ==
-					       IR::ResourceKind::IndirectBuffer;
-				})) {
+					    const auto& memory =
+					        ir.memory_info[use.user->Flags<IR::MemoryFlags>().index];
+					    return memory.kind == IR::ResourceKind::IndirectBuffer ||
+					           memory.direct_address;
+				    })) {
 					continue;
 				}
 				const auto resource = inst.Flags<uint32_t>();

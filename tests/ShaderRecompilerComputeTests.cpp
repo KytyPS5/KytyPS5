@@ -9724,6 +9724,137 @@ public:
     return result;
   }
 
+  // End to end through the command processor. A raw descriptor with the
+  // maximal-range idiom NUM_RECORDS = -1 and a nonzero stride over a 4 GiB guest
+  // mapping cannot be bound as a storage view (maxStorageBufferRange is a 32-bit
+  // limit), so its loads must read guest memory through direct addressing,
+  // including bytes more than 2 GiB past the base. The output uses the same
+  // idiom over one page; it is written, so it keeps its storage view.
+  void CheckDirectAddressOversizedRawAccess() {
+    constexpr const char *name = "DirectAddressOversizedRawAccess";
+    constexpr uintptr_t window = 0x0000000300000000ull;
+    constexpr uintptr_t output = 0x0000000206400000ull;
+    constexpr uint64_t page = BufferCache::CACHING_PAGESIZE;
+    constexpr uint64_t window_size = uint64_t{1} << 32u;
+    constexpr u32 far_load = 0x80000100u;
+    constexpr u32 top_load = 0xfffffff0u;
+    constexpr u32 preset = 0x11223344u;
+    constexpr u32 far_value = 0x5eed1234u;
+    constexpr u32 top_value = 0x70b0f00du;
+
+    // s[4:7] reads the window and s[8:11] writes the output, both with
+    // {base, stride 4, NUM_RECORDS -1, raw}.
+    std::vector<u32> code;
+    for (const auto [sgpr, base] : {std::pair<u32, uintptr_t>{4, window},
+                                    std::pair<u32, uintptr_t>{8, output}}) {
+      AppendSMovLiteral(&code, sgpr, static_cast<u32>(base));
+      AppendSMovLiteral(&code, sgpr + 1, static_cast<u32>(base >> 32u) | (4u << 16u));
+      code.push_back(EncodeSMovB32(sgpr + 2, 193u));
+      AppendSMovLiteral(&code, sgpr + 3, 0x30005004u);
+    }
+    const auto mubuf = [&](u32 opcode, u32 vdata, u32 vaddr, u32 srsrc,
+                           bool glc = false) {
+      code.push_back(EncodeMubuf0(opcode, 0, false, true, glc));
+      code.push_back(EncodeMubuf1(vdata, srsrc, vaddr));
+    };
+    // GLC dword, unsigned-byte, 2 GiB and near-4 GiB loads, and a scalar load.
+    AppendVMovLiteral(&code, 20, 160u);
+    mubuf(0x0cu, 6, 20, 1, true);
+    AppendVMovLiteral(&code, 21, 161u);
+    mubuf(0x08u, 7, 21, 1);
+    AppendVMovLiteral(&code, 22, far_load);
+    mubuf(0x0cu, 8, 22, 1);
+    AppendVMovLiteral(&code, 23, top_load);
+    mubuf(0x0cu, 9, 23, 1);
+    AppendSMovLiteral(&code, 20, 8u);
+    code.push_back(EncodeSmem0(0x08, 12, 2)); // s_buffer_load_dword s12, s[4:7]
+    code.push_back(EncodeSmem1(152, 20));     // offset 152 + s20
+    code.push_back(EncodeVop1(0x01, 10, 12)); // v10 = s12
+    for (u32 i = 0; i < 5; i++) {
+      AppendVMovU32(&code, 28, 16 + i * 4);
+      mubuf(0x1cu, 6 + i, 28, 2);
+    }
+    AppendEnd(&code);
+    ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+                      {.type = Prospero::ShaderBinaryType::kCs,
+                       .code_size_bytes = static_cast<uint32_t>(code.size() * sizeof(u32))});
+
+    EnsureRuntimeContext();
+    std::array<int64_t, 2> direct_offsets{-1, -1};
+    const std::array<std::pair<uintptr_t, uint64_t>, 2> mappings{
+        std::pair<uintptr_t, uint64_t>{window, window_size}, {output, page}};
+    for (size_t i = 0; i < mappings.size(); i++) {
+      const auto [base, size] = mappings[i];
+      Require(name, "direct allocation",
+              Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                  0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), size, page,
+                  0, &direct_offsets[i]) == 0,
+              "direct allocation failed");
+      void *mapped = reinterpret_cast<void *>(base);
+      Require(name, "direct mapping",
+              Libs::LibKernel::Memory::KernelMapDirectMemory(
+                  &mapped, size, 0x3, 0x10, direct_offsets[i], page) == 0 &&
+                  mapped == reinterpret_cast<void *>(base),
+              "direct mapping failed");
+    }
+    auto *bytes = reinterpret_cast<uint8_t *>(window);
+    for (const u32 offset : {0u, far_load, top_load}) {
+      std::memset(bytes + offset - offset % page, 0, page);
+    }
+    std::memcpy(bytes + 160, &preset, sizeof(preset));
+    std::memcpy(bytes + far_load, &far_value, sizeof(far_value));
+    std::memcpy(bytes + top_load, &top_value, sizeof(top_value));
+    std::memset(reinterpret_cast<void *>(output), 0, page);
+
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      auto &cache = context.GetBufferCache();
+      for (const auto [base, size] : mappings) {
+        context.MapMemory(base, size);
+      }
+      auto &shaders = processor.GetShCtx();
+      shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(code.data()),
+                           .num_thread_x = 1, .num_thread_y = 1, .num_thread_z = 1,
+                           .wave_size = 64, .user_sgpr = 0});
+      processor.DispatchDirect(1, 1, 1, 0x41u);
+
+      const std::array<u32, 5> expected = {preset, 0x33u, far_value, top_value,
+                                           preset};
+      std::array<u32, 5> actual{};
+      cache.ReadMemory(output + 16, sizeof(actual));
+      Require(name, "readback",
+              LibKernel::Memory::TryReadBacking(output + 16, actual.data(),
+                                                sizeof(actual)),
+              "output could not be read back");
+      for (size_t i = 0; i < expected.size(); i++) {
+        Require(name, "direct loads", actual[i] == expected[i],
+                "output dword " + std::to_string(i) + " expected " +
+                    Hex(expected[i]) + ", got " + Hex(actual[i]));
+      }
+      for (const auto [base, size] : mappings) {
+        context.UnmapMemory(base, size);
+      }
+      context.GetCommandScheduler().Finish();
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    for (size_t i = 0; i < mappings.size(); i++) {
+      const auto [base, size] = mappings[i];
+      Require(name, "unmap direct backing",
+              Libs::LibKernel::Memory::KernelMunmap(base, size) == 0,
+              "direct unmap failed");
+      Require(name, "release direct backing",
+              Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offsets[i],
+                                                                 size) == 0,
+              "direct release failed");
+    }
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckNativeIndirectDispatch() {
     constexpr const char *name = "NativeIndirectDispatch";
     constexpr uintptr_t base = 0x0000000204600000ull;
@@ -27859,6 +27990,283 @@ TestCase BufferLoadFormatXGpuSelectedDescriptors() {
   return test;
 }
 
+// A host-evaluable descriptor whose NUM_RECORDS is a constant above 0x7FFFFFFF
+// (here the RDNA2 maximal-range idiom `s_mov_b32 s6, -1` unless given) is
+// accessed through direct (BDA) addressing instead of a storage view.
+void AppendDirectDescriptor(std::vector<u32> *code, uint64_t guest_base,
+                            u32 records = 0xffffffffu) {
+  AppendSMovLiteral(code, 4, static_cast<u32>(guest_base));
+  AppendSMovLiteral(code, 5,
+                    static_cast<u32>((guest_base >> 32u) & 0xffffu) |
+                        (1u << 16u)); // stride 1
+  if (records == 0xffffffffu) {
+    code->push_back(EncodeSMovB32(6, 193u)); // NUM_RECORDS = -1
+  } else {
+    AppendSMovLiteral(code, 6, records);
+  }
+  AppendSMovLiteral(code, 7, 0x30005004u); // OOB_SELECT 3 (raw), DATA_FORMAT 5
+}
+
+void AppendDirectMubuf(std::vector<u32> *code, u32 opcode, u32 vdata, u32 vaddr,
+                       u32 inst_offset = 0, bool glc = false) {
+  code->push_back(EncodeMubuf0(opcode, inst_offset, false, true, glc));
+  code->push_back(EncodeMubuf1(vdata, 1, vaddr)); // srsrc 1 = s[4:7]
+}
+
+// Every raw load shape through an oversized descriptor at an ordinary guest
+// address: dword loads (also through the MUBUF immediate offset), a dword x4
+// load, byte and 16-bit loads (one crossing a dword) and a GLC dword load.
+TestCase DirectAddressRawLoads() {
+  using O = ShaderOpcode;
+  constexpr uint64_t GuestBase = 0x0000000170000000ull;
+  std::vector<u32> code;
+  AppendDirectDescriptor(&code, GuestBase);
+  AppendVMovU32(&code, 20, 16);
+  AppendDirectMubuf(&code, 0x0cu, 1, 20);
+  AppendDirectMubuf(&code, 0x0cu, 2, 20, 4);
+  AppendVMovU32(&code, 21, 32);
+  AppendDirectMubuf(&code, 0x0eu, 10, 21);
+  AppendVMovU32(&code, 22, 49);
+  AppendDirectMubuf(&code, 0x08u, 3, 22);
+  AppendVMovU32(&code, 23, 55);
+  AppendDirectMubuf(&code, 0x0au, 4, 23);
+  AppendVMovU32(&code, 24, 62);
+  AppendDirectMubuf(&code, 0x0au, 5, 24);
+  AppendVMovLiteral(&code, 25, 160u);
+  AppendDirectMubuf(&code, 0x0cu, 6, 25, 0, true);
+  const std::array<u32, 10> loaded = {1, 2, 10, 11, 12, 13, 3, 4, 5, 6};
+  for (u32 i = 0; i < loaded.size(); i++) {
+    AppendStoreVgpr(&code, loaded[i], 48 + i);
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "DirectAddressRawLoads";
+  test.code = std::move(code);
+  test.initial.assign(64, 0u);
+  test.initial[4] = 0xc0027600u;
+  test.initial[5] = 0x0000008eu;
+  test.initial[8] = 0xc0032500u;
+  test.initial[9] = 0x00005c08u;
+  test.initial[10] = 0x00000094u;
+  test.initial[11] = 0x00000095u;
+  test.initial[12] = 0x0000ab00u;
+  test.initial[13] = 0xef000000u;
+  test.initial[14] = 0x000000beu;
+  test.initial[15] = 0x12340000u;
+  test.initial[40] = 0x11223344u;
+  test.expected = test.initial;
+  const std::array<u32, 10> values = {0xc0027600u, 0x0000008eu, 0xc0032500u,
+                                      0x00005c08u, 0x00000094u, 0x00000095u,
+                                      0x000000abu, 0x0000beefu, 0x00001234u,
+                                      0x11223344u};
+  for (u32 i = 0; i < values.size(); i++) {
+    test.expected[48 + i] = values[i];
+  }
+  test.bda_mappings = {{GuestBase, 0}};
+  test.opcodes = {O::S_MOV_B32, O::V_MOV_B32, O::BUFFER_LOAD_DWORD,
+                  O::BUFFER_LOAD_DWORDX4, O::BUFFER_LOAD_UBYTE,
+                  O::BUFFER_LOAD_USHORT, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  // The GLC load keeps its cache bypass on the physical-pointer path.
+  test.required_spirv = {"OpConvertUToPtr", "PhysicalStorageBuffer", "Volatile"};
+  return test;
+}
+
+// The same loads through a descriptor in extended memory, whose BDA page index
+// follows the lower address space.
+TestCase DirectAddressExtendedMemoryLoads() {
+  using O = ShaderOpcode;
+  constexpr uint64_t GuestBase =
+      Libs::LibKernel::Memory::kExtendedMemoryBase + 0x0000000170000000ull;
+  std::vector<u32> code;
+  AppendDirectDescriptor(&code, GuestBase);
+  AppendVMovU32(&code, 21, 32);
+  AppendDirectMubuf(&code, 0x0eu, 10, 21);
+  AppendVMovU32(&code, 22, 50);
+  AppendDirectMubuf(&code, 0x08u, 3, 22);
+  AppendVMovLiteral(&code, 25, 160u);
+  AppendDirectMubuf(&code, 0x0cu, 6, 25);
+  const std::array<u32, 6> loaded = {10, 11, 12, 13, 3, 6};
+  for (u32 i = 0; i < loaded.size(); i++) {
+    AppendStoreVgpr(&code, loaded[i], 48 + i);
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "DirectAddressExtendedMemoryLoads";
+  test.code = std::move(code);
+  test.initial.assign(64, 0u);
+  test.initial[8] = 0xe0000001u;
+  test.initial[9] = 0xe0000002u;
+  test.initial[10] = 0xe0000003u;
+  test.initial[11] = 0xe0000004u;
+  test.initial[12] = 0x005a0000u;
+  test.initial[40] = 0x0e7e0dedu;
+  test.expected = test.initial;
+  const std::array<u32, 6> values = {0xe0000001u, 0xe0000002u, 0xe0000003u,
+                                     0xe0000004u, 0x0000005au, 0x0e7e0dedu};
+  for (u32 i = 0; i < values.size(); i++) {
+    test.expected[48 + i] = values[i];
+  }
+  test.bda_mappings = {{GuestBase, 0}};
+  test.opcodes = {O::S_MOV_B32, O::V_MOV_B32, O::BUFFER_LOAD_DWORDX4,
+                  O::BUFFER_LOAD_UBYTE, O::BUFFER_LOAD_DWORD,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpConvertUToPtr", "PhysicalStorageBuffer"};
+  return test;
+}
+
+// Direct loads keep the descriptor's bounds: with NUM_RECORDS = 0x80000010 raw,
+// only bytes below 0x80000010 are in bounds. Each dword of a dword x2 load is
+// checked on its own, and a byte or 16-bit load must fit entirely. The guest
+// page holding the bound maps to backing dword 0.
+TestCase DirectAddressBounds() {
+  using O = ShaderOpcode;
+  constexpr uint64_t GuestBase = 0x0000000180000000ull;
+  constexpr u32 Records = 0x80000010u;
+  std::vector<u32> code;
+  AppendDirectDescriptor(&code, GuestBase, Records);
+  AppendVMovLiteral(&code, 20, 0x8000000cu);
+  AppendDirectMubuf(&code, 0x0cu, 5, 20);  // in bounds
+  AppendDirectMubuf(&code, 0x0du, 10, 20); // x2: dword 3 in, dword 4 out
+  AppendVMovLiteral(&code, 21, Records);
+  AppendDirectMubuf(&code, 0x0cu, 6, 21);  // out of bounds
+  AppendVMovLiteral(&code, 22, 0x8000000fu);
+  AppendDirectMubuf(&code, 0x08u, 7, 22);  // byte 15: in bounds
+  AppendDirectMubuf(&code, 0x0au, 8, 22);  // 16-bit at 15 crosses the bound
+  AppendVMovLiteral(&code, 23, 0x8000000eu);
+  AppendDirectMubuf(&code, 0x0au, 9, 23);  // 16-bit at 14: in bounds
+  const std::array<u32, 7> loaded = {5, 10, 11, 6, 7, 8, 9};
+  for (u32 i = 0; i < loaded.size(); i++) {
+    AppendStoreVgpr(&code, loaded[i], 32 + i);
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "DirectAddressBounds";
+  test.code = std::move(code);
+  test.initial.assign(64, 0u);
+  test.initial[3] = 0xab111111u;
+  test.initial[4] = 0x0dd0beefu;
+  test.expected = test.initial;
+  const std::array<u32, 7> values = {0xab111111u, 0xab111111u, 0, 0,
+                                     0x000000abu, 0,           0x0000ab11u};
+  for (u32 i = 0; i < values.size(); i++) {
+    test.expected[32 + i] = values[i];
+  }
+  test.bda_mappings = {{GuestBase + 0x80000000ull, 0}};
+  test.opcodes = {O::S_MOV_B32, O::V_MOV_B32, O::BUFFER_LOAD_DWORD,
+                  O::BUFFER_LOAD_DWORDX2, O::BUFFER_LOAD_UBYTE,
+                  O::BUFFER_LOAD_USHORT, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
+// S_BUFFER_LOAD through the oversized descriptor reads the dword the
+// ScalarBuffer view path would, here with the byte offset split between
+// SOFFSET and the immediate.
+TestCase DirectAddressScalarLoad() {
+  using O = ShaderOpcode;
+  constexpr uint64_t GuestBase = 0x0000000174000000ull;
+  std::vector<u32> code;
+  AppendDirectDescriptor(&code, GuestBase);
+  AppendSMovLiteral(&code, 20, 8u);
+  code.push_back(EncodeSmem0(0x08, 8, 2)); // s_buffer_load_dword s8, s[4:7]
+  code.push_back(EncodeSmem1(152, 20));    // offset 152 + s20
+  AppendStoreSgpr(&code, 8, 0);
+  // The same dword through a base two bytes further: scalar memory ignores the
+  // two low address bits.
+  AppendSMovLiteral(&code, 12, static_cast<u32>(GuestBase + 2));
+  AppendSMovLiteral(&code, 13,
+                    static_cast<u32>((GuestBase >> 32u) & 0xffffu) | (1u << 16u));
+  code.push_back(EncodeSMovB32(14, 193u));
+  AppendSMovLiteral(&code, 15, 0x30005004u);
+  code.push_back(EncodeSmem0(0x08, 9, 6)); // s_buffer_load_dword s9, s[12:15]
+  code.push_back(EncodeSmem1(152, 20));
+  AppendStoreSgpr(&code, 9, 1);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "DirectAddressScalarLoad";
+  test.code = std::move(code);
+  test.initial.resize(48);
+  test.initial[40] = 0xcafe1234u;
+  test.initial[41] = 0x5678abcdu;
+  test.expected = {0xcafe1234u, 0xcafe1234u};
+  test.bda_mappings = {{GuestBase, 0}};
+  test.opcodes = {O::S_MOV_B32, O::S_BUFFER_LOAD_DWORD, O::V_MOV_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpConvertUToPtr", "PhysicalStorageBuffer"};
+  return test;
+}
+
+// A BDA access resolves only guest addresses in the lower address space or in
+// extended memory. The page index of any other address must not alias a valid
+// page: the hole above the lower address space would index extended memory, an
+// address beyond extended memory would wrap to a lower page, and a dword that
+// crosses from the last lower page into the hole must not take its upper bytes
+// from extended memory. Those reads, an unmapped page and an access that wraps
+// the 64-bit address space return zero; valid lower and extended pages still
+// read their data.
+TestCase BdaRejectsAddressesOutsideGuestRanges() {
+  using O = ShaderOpcode;
+  constexpr uint64_t Page = BufferCache::CACHING_PAGESIZE;
+  constexpr uint64_t Lower = Libs::Graphics::LOWER_ADDRESS_SIZE;
+  constexpr uint64_t Extended = Libs::LibKernel::Memory::kExtendedMemoryBase;
+  constexpr uint64_t LowBase = 0x0000000110000000ull;
+  // Packs to the 2^32-page wrap of LowBase's page index.
+  constexpr uint64_t WrappedAlias =
+      (uint64_t{1} << (32u + BufferCache::CACHING_PAGEBITS)) + Extended - Lower + LowBase;
+  static_assert(static_cast<u32>((WrappedAlias - (Extended - Lower)) >>
+                                 BufferCache::CACHING_PAGEBITS) ==
+                BufferCache::PageIndex(LowBase));
+  static_assert(((Lower + 4u) >> BufferCache::CACHING_PAGEBITS) ==
+                BufferCache::PageIndex(Extended));
+  const std::array<uint64_t, 7> addresses = {
+      Extended + 4u,        // valid extended page
+      Lower + 4u,           // hole: would index extended memory
+      WrappedAlias,         // beyond extended memory: would wrap to LowBase
+      LowBase,              // valid lower page
+      Lower - 2u,           // crosses from the last lower page into the hole
+      ~uint64_t{1},         // wraps the 64-bit address space
+      LowBase + 2u * Page}; // unmapped page
+  std::vector<u32> code;
+  for (u32 i = 0; i < addresses.size(); i++) {
+    AppendVMovLiteral(&code, 20, static_cast<u32>(addresses[i]));
+    AppendVMovLiteral(&code, 21, static_cast<u32>(addresses[i] >> 32u));
+    code.push_back(EncodeFlat0(0x0c, 2, 0)); // global_load_dword v[i], v[20:21], off
+    code.push_back(EncodeFlat1(i, 0x7d, 0, 20));
+  }
+  for (u32 i = 0; i < addresses.size(); i++) {
+    AppendStoreVgpr(&code, i, i);
+  }
+  AppendEnd(&code);
+
+  // Backing: dword 4095 is the last dword of the lower address space, dword 4096
+  // the first of extended memory (and of the hole's would-be alias), dword 4112
+  // the first of LowBase.
+  TestCase test;
+  test.name = "BdaRejectsAddressesOutsideGuestRanges";
+  test.code = std::move(code);
+  test.initial.assign(4160, 0u);
+  test.initial[4095] = 0x44332211u;
+  test.initial[4096] = 0x88776655u;
+  test.initial[4097] = 0xa1a2a3a4u;
+  test.initial[4112] = 0xb1b2b3b4u;
+  test.expected = test.initial;
+  test.expected[0] = 0xa1a2a3a4u;
+  test.expected[1] = 0;
+  test.expected[2] = 0;
+  test.expected[3] = 0xb1b2b3b4u;
+  test.expected[4] = 0x00004433u;
+  test.expected[5] = 0;
+  test.expected[6] = 0;
+  test.bda_mappings = {{Lower - 8u, 4094u * 4u}, {Extended, 4096u * 4u},
+                       {LowBase, 4112u * 4u}};
+  test.opcodes = {O::V_MOV_B32, O::FLAT_LOAD_DWORD, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  return test;
+}
+
 TestCase BufferStoreDwordx4DropsOnlyOutOfBoundsTail() {
   using O = ShaderOpcode;
 
@@ -35090,6 +35498,11 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferLoadDwordGpuSelectedDescriptors);
   AddCase(BufferLoadDwordx3GpuSelectedDescriptors);
   AddCase(BufferLoadFormatXGpuSelectedDescriptors);
+  AddCase(DirectAddressRawLoads);
+  AddCase(DirectAddressExtendedMemoryLoads);
+  AddCase(DirectAddressBounds);
+  AddCase(DirectAddressScalarLoad);
+  AddCase(BdaRejectsAddressesOutsideGuestRanges);
   AddCase(BufferStoreDwordx4DropsOnlyOutOfBoundsTail);
   AddCase(BufferLoadFormatXyzwRejectsPartialRecord);
   AddCase(BufferStoreFormatXyzwDropsPartialRecord);
@@ -40472,6 +40885,16 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, ScratchIsPrivatePerInvocation());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--direct-address-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, DirectAddressRawLoads());
+    RunCase(&vulkan, DirectAddressExtendedMemoryLoads());
+    RunCase(&vulkan, DirectAddressBounds());
+    RunCase(&vulkan, DirectAddressScalarLoad());
+    RunCase(&vulkan, BdaRejectsAddressesOutsideGuestRanges());
+    vulkan.CheckDirectAddressOversizedRawAccess();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--indirect-buffer-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, ScalarBufferFromLoopReadlane(32));
@@ -41107,6 +41530,7 @@ int main(int argc, char **argv) {
   vulkan.CheckGpuTilerCpuParity();
   vulkan.CheckNativeIndirectDispatch();
   CheckComputeLdsLimit(vulkan);
+  vulkan.CheckDirectAddressOversizedRawAccess();
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckUnifiedImageViewCache();
   vulkan.CheckPackedTextureComponents();

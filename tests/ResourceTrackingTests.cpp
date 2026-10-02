@@ -1722,6 +1722,105 @@ void TestComputeBufferFill() {
   Run({.clean = true, .branch = true});
 }
 
+// A descriptor whose NUM_RECORDS is a compile-time constant above 0x7FFFFFFF is
+// accessed through direct (BDA) addressing when every access through it is a raw
+// load. A smaller or runtime-valued NUM_RECORDS, or any other access through the
+// resource, keeps the storage-view path.
+Value DirectRoutingHandle(Fixture &fixture, uint64_t constant_records) {
+  // UINT64_MAX selects a runtime-valued (user data) NUM_RECORDS dword.
+  const auto records = constant_records == UINT64_MAX
+                           ? fixture.UserData(2)
+                           : Value(static_cast<uint32_t>(constant_records));
+  return fixture.Buffer(
+      {fixture.UserData(0), fixture.UserData(1), records, Value(0x30005004u)}, 4);
+}
+
+MemoryFlags EmitDirectRoutingAccess(Fixture &fixture, Value handle, ValueOpcode op,
+                                    bool formatted, uint32_t pc) {
+  MemoryInfo memory;
+  memory.kind = ResourceKind::Buffer;
+  memory.formatted = formatted;
+  memory.offen = true;
+  const auto flags = fixture.AddMemory(memory, pc);
+  if (op == ValueOpcode::StoreBufferU32) {
+    fixture.Emit(op,
+                 {handle, Value(0u), Value(16u), Value(0u), Value(0xc0027600u),
+                  Value(true)},
+                 flags);
+  } else if (op == ValueOpcode::BufferAtomicIAdd32) {
+    fixture.Emit(op,
+                 {handle, Value(0u), Value(16u), Value(1u), Value(0u), Value(true)},
+                 flags);
+  } else {
+    fixture.Emit(op, {handle, Value(0u), Value(16u), Value(0u), Value(true)},
+                 flags);
+  }
+  return flags;
+}
+
+void TestOversizedConstantBufferRoutesToDirectAddressing() {
+  // 0x80000000 is the first NUM_RECORDS routed to direct addressing.
+  for (const auto records : {uint64_t{0xffffffffu}, uint64_t{0x80000000u}}) {
+    Fixture fixture;
+    const auto handle = DirectRoutingHandle(fixture, records);
+    const auto flags = EmitDirectRoutingAccess(
+        fixture, handle, ValueOpcode::LoadBufferU32, false, 8);
+    fixture.PlanAndTrack();
+    const auto &program = fixture.program;
+    Check(program.memory_info[flags.index].direct_address,
+          "an oversized constant-size raw load was not routed to direct addressing");
+    Check(program.info.buffers.size() == 1 && program.info.buffers[0].direct_address &&
+              program.info.buffers[0].read && !program.info.buffers[0].written,
+          "direct-address resource was not registered for host materialization");
+    Check(program.info.uses_dma, "direct addressing did not request the BDA page table");
+  }
+  for (const auto records : {uint64_t{0x7fffffffu}, UINT64_MAX}) {
+    Fixture fixture;
+    const auto handle = DirectRoutingHandle(fixture, records);
+    const auto flags = EmitDirectRoutingAccess(
+        fixture, handle, ValueOpcode::LoadBufferU32, false, 8);
+    fixture.PlanAndTrack();
+    Check(!fixture.program.memory_info[flags.index].direct_address &&
+              !fixture.program.info.buffers[0].direct_address &&
+              !fixture.program.info.uses_dma,
+          "NUM_RECORDS 0x7FFFFFFF or a runtime value must keep the storage-view path");
+  }
+}
+
+void TestOversizedConstantBufferOtherAccessesKeepStorageView() {
+  struct Case {
+    ValueOpcode op;
+    bool formatted;
+  };
+  for (const auto [op, formatted] : {Case{ValueOpcode::StoreBufferU32, false},
+                                     Case{ValueOpcode::BufferAtomicIAdd32, false},
+                                     Case{ValueOpcode::LoadBufferU32, true}}) {
+    Fixture fixture;
+    const auto handle = DirectRoutingHandle(fixture, 0xffffffffu);
+    const auto flags = EmitDirectRoutingAccess(fixture, handle, op, formatted, 8);
+    fixture.PlanAndTrack();
+    Check(fixture.program.resource_tracking_complete &&
+              !fixture.program.memory_info[flags.index].direct_address &&
+              !fixture.program.info.buffers[0].direct_address,
+          "a store, atomic or formatted access was routed to direct addressing");
+  }
+  {
+    // One store keeps every access through the resource on its storage view.
+    Fixture fixture;
+    const auto handle = DirectRoutingHandle(fixture, 0xffffffffu);
+    const auto load = EmitDirectRoutingAccess(
+        fixture, handle, ValueOpcode::LoadBufferU32, false, 8);
+    const auto store = EmitDirectRoutingAccess(
+        fixture, handle, ValueOpcode::StoreBufferU32, false, 16);
+    fixture.PlanAndTrack();
+    const auto &program = fixture.program;
+    Check(program.info.buffers.size() == 1 && !program.info.buffers[0].direct_address &&
+              !program.memory_info[load.index].direct_address &&
+              !program.memory_info[store.index].direct_address,
+          "a resource mixed direct-address and storage-view accesses");
+  }
+}
+
 void TestDenseBufferTracking() {
   Fixture fixture;
   std::array<Value, 8> userdata;
@@ -3628,6 +3727,10 @@ int main() {
       }
     };
     Run("dense buffers", TestDenseBufferTracking);
+    Run("oversized constant buffer routing",
+        TestOversizedConstantBufferRoutesToDirectAddressing);
+    Run("oversized constant buffer storage-view fallback",
+        TestOversizedConstantBufferOtherAccessesKeepStorageView);
     Run("compute buffer fill", TestComputeBufferFill);
     Run("scalar/vector alias", TestScalarAndVectorBufferAlias);
     Run("runtime unsigned min", TestRuntimeUnsignedMinDescriptor);

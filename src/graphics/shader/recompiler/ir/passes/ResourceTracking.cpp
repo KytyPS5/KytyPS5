@@ -20,6 +20,11 @@ namespace {
 constexpr uint32_t SamplerBorderClampMask    = (1u << 2u) | (1u << 5u) | (1u << 8u);
 constexpr uint32_t SamplerDword3ReservedMask = 0x3ffff000u;
 
+// Largest constant NUM_RECORDS bound through a storage view. No view can exceed
+// maxStorageBufferRange, a 32-bit limit, and an RTX 4070 (driver 610.47) that advertises
+// 0xFFFFFFFF silently drops accesses through views of 2 GiB or more.
+constexpr uint32_t MaxStorageViewRecords = 0x7fffffffu;
+
 uint32_t PossibleU32Bits(Value value) {
 	value = value.Resolve();
 	if (value.IsImmediate()) {
@@ -373,6 +378,7 @@ public:
 				memory.sampler = patch.sampler;
 			}
 		}
+		ResolveDirectAddressing();
 		for (const auto& plan: m_indirect_descriptors) {
 			if (plan.handle->GetOpcode() == ValueOpcode::GetBufferResource) {
 				plan.handle->SetArg(0, plan.key);
@@ -421,6 +427,12 @@ private:
 		uint32_t resource    = 0;
 		uint32_t sampler     = 0;
 		bool     has_sampler = false;
+	};
+
+	struct BufferAccessInfo {
+		uint32_t memory   = 0;
+		uint32_t resource = 0;
+		bool     direct   = false;
 	};
 
 	struct ResolvedHandle {
@@ -2104,6 +2116,37 @@ private:
 		}
 	}
 
+	// A descriptor whose NUM_RECORDS is a constant above MaxStorageViewRecords may cover more
+	// guest memory than a storage view binds. Raw loads through it can use direct (BDA) guest
+	// addressing instead. A runtime-valued NUM_RECORDS keeps the storage view and its host-side
+	// range check.
+	static bool AllowsDirectAddressing(const Inst& handle, const MemoryInfo& memory,
+	                                   BufferAccess access) {
+		const auto records = handle.Arg(2).Resolve();
+		return records.IsImmediate() && records.GetType() == Type::U32 &&
+		       records.U32() > MaxStorageViewRecords && access == BufferAccess::Read &&
+		       !memory.formatted && !memory.typed;
+	}
+
+	// A resource uses direct addressing only when every access through it can, so it binds
+	// either a storage view or none. A store needs the GPU to report the pages it wrote before
+	// the host can own them page by page; without that the whole window would become GPU-written.
+	// Atomics need a BDA atomic path, formatted and typed accesses format conversion. Any of them
+	// keeps the whole resource on its storage view.
+	void ResolveDirectAddressing() {
+		std::vector<bool> direct(m_info.buffers.size(), true);
+		for (const auto& access: m_buffer_accesses) {
+			direct[access.resource] = direct[access.resource] && access.direct;
+		}
+		for (const auto& access: m_buffer_accesses) {
+			if (direct[access.resource]) {
+				m_program.memory_info[access.memory].direct_address = true;
+				m_info.buffers[access.resource].direct_address      = true;
+				m_info.uses_dma                                     = true;
+			}
+		}
+	}
+
 	uint32_t AddBuffer(uint32_t source, const MemoryInfo& memory, ValueOpcode op, uint32_t pc) {
 		for (uint32_t i = 0; i < m_info.buffers.size(); i++) {
 			if (m_info.buffers[i].source == source) {
@@ -2295,6 +2338,8 @@ private:
 			}
 			AddHandlePatch(handle, resource, flags.pc);
 			AddMemoryPatch(flags.index, resource, 0, false, flags.pc);
+			m_buffer_accesses.push_back(
+			    {flags.index, resource, AllowsDirectAddressing(*handle, memory, buffer)});
 			return;
 		}
 		if (address_info.access != AddressAccess::None) {
@@ -2411,7 +2456,8 @@ private:
 	std::vector<DescriptorSource>              m_sources;
 	std::vector<HandlePatch>                   m_handle_patches;
 	std::vector<MemoryPatch>                   m_memory_patches;
-	std::vector<IndirectDescriptorPlan>             m_indirect_descriptors;
+	std::vector<IndirectDescriptorPlan>         m_indirect_descriptors;
+	std::vector<BufferAccessInfo>               m_buffer_accesses;
 	std::vector<std::pair<const Inst*, Value>> m_descriptor_selections;
 	bool                                       m_shader_writes = false;
 };

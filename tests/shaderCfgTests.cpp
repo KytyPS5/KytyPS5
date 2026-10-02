@@ -14920,7 +14920,7 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
           "loop watchdog did not count the dispatcher loop");
   }
   // A value that is not a plain number must keep the watchdog on, not disable it.
-  for (const char* bad: {"abc", "12x", "-1", "99999999999"}) {
+  for (const char* bad: {"abc", "12x", "-1", "+0", " 0", "99999999999"}) {
     SetEnvForTest("KYTY_SHADER_LOOP_LIMIT", bad);
     auto options = MakeCompileOptions(ShaderType::Compute);
     const auto result = RecompileForTest(structured_phi, options);

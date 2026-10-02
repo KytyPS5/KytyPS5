@@ -374,10 +374,14 @@ inline uint32_t ShaderLoopLimit() {
 		return kDefaultLimit;
 	}
 	// Only a plain decimal number overrides the default; anything else keeps the cap on
-	// instead of silently turning the watchdog off.
+	// instead of silently turning the watchdog off. strtoull would accept leading
+	// whitespace and a sign, so the first character has to be a digit.
+	if (*value < '0' || *value > '9') {
+		return kDefaultLimit;
+	}
 	char*      end    = nullptr;
 	const auto parsed = std::strtoull(value, &end, 10);
-	if (*end != '\0' || parsed > UINT32_MAX || *value == '-') {
+	if (*end != '\0' || parsed > UINT32_MAX) {
 		return kDefaultLimit;
 	}
 	return static_cast<uint32_t>(parsed);

@@ -1,0 +1,6 @@
+# No steps: launch the game and watch it until it aborts, hangs, or the timeout hits.
+# `kyty_autoplay.py run` with no --scenario does the same. Use it to reproduce a boot-time failure.
+name = "empty"
+
+[run]
+timeout = "10m"

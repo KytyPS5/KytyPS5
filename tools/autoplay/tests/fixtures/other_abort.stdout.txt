@@ -1,0 +1,6 @@
+Initialized: Config
+loading eboot.bin
+--- Build ---
+Source build e317465-dirty
+--- Fatal Error ---
+Not implemented (result != vk::Result::eSuccess) in /home/user/KytyPS5/src/graphics/host_gpu/renderer/masterSemaphore.cpp:40

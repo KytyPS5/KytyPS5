@@ -1,0 +1,10 @@
+Initialized: Config
+Initialized: Log
+Title ID: PPSA04264
+Vulkan pipeline cache: initialized empty
+Shaders: VS 118 | PS 207 | CS 11 | GS 0 | LS 0 | HS 0 | TES 0
+Shaders: VS 118 | PS 207 | CS 12 | GS 0 | LS 0 | HS 0 | TES 0
+--- Build ---
+Source build e317465-dirty
+--- Error ---
+shader resource tracking: hash=0x6a53456e7ef5d1b0 stage=compute pc=0x0000086c buffer descriptor is not a valid runtime value; GPU-selected access requires a raw DWORD x2/x3/x4 load (op=StoreBufferU32 handle=%412 GetBufferResource dword[1]=%377 ReadConstBuffer) in /home/user/KytyPS5/src/graphics/shader/recompiler/ir/passes/ResourceTracking.cpp:367

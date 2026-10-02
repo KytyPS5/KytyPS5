@@ -1,0 +1,9 @@
+sceKernelUsleep(1000)
+sceVideoOutSubmitFlip()
+Unhandled exception 0xc0000005 at rip=0x0000000800a1b2c3
+  rax=0000000000000000 rbx=00007fff12340000
+  access violation reading 0x0000000000000008
+stack trace:
+  #0 0x0000000800a1b2c3
+  #1 0x0000000800a1b3d4
+shutting down

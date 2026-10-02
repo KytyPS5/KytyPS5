@@ -1,0 +1,4 @@
+--- Build ---
+Source build e317465-dirty
+--- Error ---
+shader resource tracking: hash=0x6a53456e7ef5d1b0 stage=compute pc=0x0000086c buffer descriptor is not a valid runtime value; GPU-selected access requires a raw DWORD x2/x3/x4 load (ResourceTracking.cpp:367)

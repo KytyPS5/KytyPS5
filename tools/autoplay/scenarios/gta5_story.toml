@@ -1,0 +1,59 @@
+# GTA V (PPSA04264): boot to story mode and prove the player is controllable in the prologue.
+#
+# THIS IS A TEMPLATE, NOT A FINISHED SCENARIO. It stops where the game currently stops. Menus past
+# the shader abort only become reachable once that abort is fixed, so the scenario grows one
+# blocker at a time:
+#
+#   1. `kyty_autoplay.py start`, then `shot` to see where the game is.
+#   2. `send "press cross"` etc. to get past the screen, taking a `shot` after each.
+#   3. `kyty_autoplay.py ref <shot.png> --box x0,y0,x1,y1 --out scenarios/refs/<name>.png` crops a
+#      reference image from a screenshot (box as fractions of the frame).
+#   4. Add an `until` step that waits for that reference, pressing buttons while it waits.
+#
+# Without a `verify = "controllable"` step this scenario can never PASS: a run that reaches the end
+# is reported as STUCK ("finished without a verify step").
+
+name = "gta5_story"
+# game = "/path/to/PPSA04264"        # or --game, or a kyty_run.sh next to the emulator
+
+[run]
+timeout = "30m"        # whole run
+hang_seconds = 20      # present count flat this long = HANG
+boot_grace = "5m"      # GTA compiles a lot of shaders before its first frame
+
+[soak]
+# Scripted movement for `run --soak <seconds>`. Commands are the automation commands.
+script = [
+  "stick l 0 1 2500",
+  "stick l 1 0.6 1500",
+  "press cross 150",
+  "stick l 0 -1 1500",
+  "stick l -1 0.6 1500",
+  "stick r 0.8 0 1200",
+]
+
+[[step]]
+wait_frames = 120      # the game has started presenting frames
+
+[[step]]
+checkpoint = "first_frames"
+
+# --- add the real steps below as each screen becomes reachable ---------------------------------
+#
+# [[step]]
+# until = { ref = "refs/main_menu.png", box = [0.30, 0.40, 0.70, 0.60], max_diff = 0.10, timeout = "5m", while_waiting = "press cross every 3s" }
+#
+# [[step]]
+# checkpoint = "main_menu"
+#
+# [[step]]
+# until = { ref = "refs/radar.png", box = [0.01, 0.68, 0.22, 0.99], max_diff = 0.12, timeout = "10m", while_waiting = "press cross every 3s" }
+#
+# [[step]]
+# checkpoint = "free_gameplay"
+#
+# [[step]]
+# verify = "controllable"
+# radar = { ref = "refs/radar.png", box = [0.01, 0.68, 0.22, 0.99], max_diff = 0.12 }
+# stick = "l 0 1 3000"      # held for 3 s; the frame must change more than it does when idle
+# idle = "3s"

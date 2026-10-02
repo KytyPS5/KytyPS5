@@ -1,0 +1,98 @@
+# autoplay
+
+Drives KytyPS5 through a scenario, watches it, and says how the run ended. Everything it needs is
+inside the emulator (input injection, screenshots, heartbeat), so it works on Wayland, needs no
+window focus, and never touches the desktop.
+
+```
+python3 tools/autoplay/kyty_autoplay.py run --scenario tools/autoplay/scenarios/gta5_story.toml \
+    --timeout 30m [--soak 300]
+```
+
+Needs Python 3.11+ and, for screenshot matching, Pillow. Everything else is the standard library.
+
+| exit | result | meaning |
+|---|---|---|
+| 0 | `PASS` | controllable in the prologue; the optional soak finished with no abort or hang |
+| 10 | `SHADER_ABORT` | fatal error naming a shader hash. The capture is replayed offline and disassembled |
+| 11 | `OTHER_ABORT` | any other fatal exit, a signal, or an exit before the scenario finished |
+| 12 | `HANG` | present count flat for `--hang-seconds` (20) while alive; gdb backtraces saved |
+| 13 | `STUCK` | alive and rendering, but a step (or the whole run) timed out |
+| 2 | harness error | bad arguments, broken scenario, a command the emulator rejected |
+
+A run directory (`<build>/_Autoplay/<timestamp>/`) holds `summary.md` (read this first),
+`result.json`, `stdout.txt`, `_kyty.txt` (guest log, flushed per line), `status.jsonl` (heartbeat
+history), `shots/`, `capture/` (every shader program the game compiled), and for hangs `gdb.txt`.
+
+## Commands
+
+| command | |
+|---|---|
+| `run` | play a scenario, classify, exit with the code above |
+| `start` | launch the emulator in the background for interactive use |
+| `send "<cmd>"` | send one automation command and print its ack |
+| `shot [name]` | screenshot of the next presented frame; prints the PNG path |
+| `status` | print the latest heartbeat |
+| `stop` | quit the emulator and write the result |
+| `classify <run>` | rebuild `result.json`/`summary.md` from a run directory |
+| `ref <shot> --box x0,y0,x1,y1 --out refs/x.png` | crop a screenshot into a scenario reference |
+
+The emulator command line comes from `<build>/kyty_run.sh` when it exists (the first line that runs
+`kyty_emulator`), `--game`, the scenario's `game`, and any `--arg=<one argument>` / `--args="<several>"`. The harness always adds
+`--printf-direction File`, `--automation-dir`, `--automation-shot-interval` and
+`--shader-capture-dir`, replacing the same options if the script had them.
+
+## Automation commands
+
+Written one per line to `commands.txt` (the emulator tails it); each is acknowledged in
+`events.jsonl` with the 1-based line number.
+
+```
+press <btn>[+btn] [ms]      press for ms (default 120), then release
+hold <btn>[+btn]            press until released
+release <btn>[+btn]|all
+stick <l|r> <x> <y> [ms]    x,y in -1..1, y=+1 is up/forward; recentered after ms (omit to hold)
+trigger <l|r> <0..1> [ms]
+reset                       release everything, recenter sticks
+shot [name]                 shots/<name>.png and latest.png
+status                      rewrite status.json now
+trace <on|off>              log every GPU submit
+stall_present <seconds>     freeze presentation, to test hang detection
+quit                        flush the log and exit
+```
+
+Buttons: `cross circle square triangle l1 r1 l2 r2 l3 r3 options touchpad up down left right`.
+
+## Scenarios
+
+TOML, steps run in order (see `scenarios/gta5_story.toml`):
+
+```toml
+[[step]]
+wait = "5s"                 # or wait_frames = 300
+[[step]]
+press = "cross"             # also hold, release, send = "stick l 0 1 2000"
+[[step]]
+checkpoint = "main_menu"
+[[step]]
+until = { ref = "refs/radar.png", box = [0.01, 0.68, 0.22, 0.99], max_diff = 0.12, timeout = "5m", while_waiting = "press cross every 3s" }
+[[step]]
+verify = "controllable"
+radar = { ref = "refs/radar.png", box = [0.01, 0.68, 0.22, 0.99] }
+stick = "l 0 1 3000"
+```
+
+A `box` of a live screenshot, shrunk to 32x32 gray, must differ from the reference by at most
+`max_diff` (mean absolute difference, 0 = identical). `verify = "controllable"` checks that the
+radar is visible and that holding the stick changes the frame more than standing still does. A
+scenario with no `verify` step can never PASS.
+
+## Tests
+
+```
+python3 -m unittest discover tools/autoplay/tests
+```
+
+`test_classify.py` classifies fixture logs, `test_scenario.py` covers scenarios and matching, and
+`test_run_fake.py` runs the real harness against `tests/fake_emulator.py`, a stand-in that speaks the
+automation protocol (it uses a built `kyty_emulator` for the shader replay checks when present).

@@ -1,0 +1,7 @@
+ShaderRecompiler PS SPIR-V validation failed hash=0x00000000deadbeef:
+12: 3 (40) some validator message
+--- Build ---
+Source build e317465-dirty
+--- Error ---
+ShaderRecompiler PS failed hash=0x00000000deadbeef: SPIR-V validation failed
+ in /home/user/KytyPS5/src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp:252

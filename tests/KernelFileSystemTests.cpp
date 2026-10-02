@@ -31,6 +31,10 @@
 #include <string_view>
 #include <vector>
 
+#if defined(_WIN32)
+#include <winsock2.h>
+#endif
+
 namespace Libs::LibKernelApr {
 void InitLibKernel_1_Apr(Loader::SymbolDatabase *symbols);
 }
@@ -52,6 +56,19 @@ void Check(bool value, const char *text) {
     std::fprintf(stderr, "KernelFileSystemTests: failed: %s\n", text);
     std::abort();
   }
+}
+
+void LogReceiveObservation(const char *label, int result,
+                           const std::array<char, 5> &received, int guest_errno) {
+  std::fprintf(stderr, "[net diagnostic] %s: result=%d guest_errno=%d bytes=", label,
+               result, guest_errno);
+  for (const auto byte : received) {
+    std::fprintf(stderr, "%02x ", static_cast<unsigned int>(static_cast<unsigned char>(byte)));
+  }
+#if defined(_WIN32)
+  std::fprintf(stderr, "WSAGetLastError=%d", WSAGetLastError());
+#endif
+  std::fprintf(stderr, "\n");
 }
 
 class TempDirectory {
@@ -467,9 +484,9 @@ void CheckDirectoryStream(const std::filesystem::path &root) {
               Libs::LibKernel::KERNEL_ERROR_EINVAL &&
           FileSystem::KernelLseek(fd, -1, 0) ==
               Libs::LibKernel::KERNEL_ERROR_EINVAL &&
-          FileSystem::KernelLseek(fd, std::numeric_limits<int64_t>::min(), 1) ==
+          FileSystem::KernelLseek(fd, (std::numeric_limits<int64_t>::min)(), 1) ==
               Libs::LibKernel::KERNEL_ERROR_EINVAL &&
-          FileSystem::KernelLseek(fd, std::numeric_limits<int64_t>::max(), 1) ==
+          FileSystem::KernelLseek(fd, (std::numeric_limits<int64_t>::max)(), 1) ==
               Libs::LibKernel::KERNEL_ERROR_EOVERFLOW &&
           FileSystem::KernelLseek(fd, 0, 1) == position,
       "invalid and overflowing directory seeks preserve the position");
@@ -490,7 +507,7 @@ void CheckDirectoryStream(const std::filesystem::path &root) {
         "directory enumeration rejects a position beyond EOF");
   Check(FileSystem::KernelRead(
             fd, block.data(),
-            static_cast<size_t>(std::numeric_limits<int>::max()) + 1) ==
+            static_cast<size_t>((std::numeric_limits<int>::max)()) + 1) ==
                 Libs::LibKernel::KERNEL_ERROR_EINVAL &&
             FileSystem::KernelLseek(fd, 0, 1) == end + 512,
         "oversized read fails without changing the directory position");
@@ -752,14 +769,22 @@ void CheckSocketWakeup() {
                     deadline.data()) == 1 && readable[reader / 64] == bit,
         "select reports the guest descriptor after wake");
   std::array<char, sizeof(payload)> received {};
-  Check(net_recv(reader, received.data(), received.size(), 0x42) == sizeof(payload) &&
-            std::memcmp(received.data(), payload, sizeof(payload)) == 0 &&
-            *net_errno == Libs::Posix::POSIX_EINVAL,
-        "Net receive forwards PEEK and WAITALL without consuming bytes");
+  const int peek_waitall_result =
+      net_recv(reader, received.data(), received.size(), 0x42);
+  LogReceiveObservation("PEEK|WAITALL", peek_waitall_result, received, *net_errno);
+  Check(peek_waitall_result == sizeof(payload),
+        "Net receive PEEK|WAITALL returns the requested length");
+  Check(std::memcmp(received.data(), payload, sizeof(payload)) == 0,
+        "Net receive PEEK|WAITALL returns the payload");
+  Check(*net_errno == Libs::Posix::POSIX_EINVAL,
+        "Net receive PEEK|WAITALL preserves guest errno");
   received.fill(0);
-  Check(net_recv(reader, received.data(), received.size(), 0x40) == sizeof(payload) &&
-            std::memcmp(received.data(), payload, sizeof(payload)) == 0,
-        "Net receive consumes the same bytes after peeking");
+  const int waitall_result = net_recv(reader, received.data(), received.size(), 0x40);
+  LogReceiveObservation("WAITALL after PEEK", waitall_result, received, *net_errno);
+  Check(waitall_result == sizeof(payload),
+        "Net receive consumes the requested length after peeking");
+  Check(std::memcmp(received.data(), payload, sizeof(payload)) == 0,
+        "Net receive returns the same payload after peeking");
 #if !defined(_WIN32)
   Check(Net::Recv(reader, received.data(), received.size(), 0x80) == -1 &&
             *Libs::Posix::GetErrorAddr() == Libs::Posix::POSIX_EWOULDBLOCK,

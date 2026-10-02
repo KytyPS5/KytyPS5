@@ -76,6 +76,22 @@ head_sha=$(git rev-parse --short "$fetch_ref")
 printf 'PR #%s head %s has %s commits not yet in branch %s.\n' \
 	"$pr_number" "$head_sha" "$incoming" "$branch"
 
+printf 'Checking whether the merge can be applied cleanly...\n'
+if merge_preview=$(git merge-tree --write-tree HEAD "$fetch_ref" 2>&1); then
+	:
+else
+	merge_tree_status=$?
+	if [ "$merge_tree_status" -eq 1 ]; then
+		printf 'Error: PR #%s conflicts with branch %s; no merge was started.\n' \
+			"$pr_number" "$branch" >&2
+		printf '%s\n' "$merge_preview" | grep '^CONFLICT ' >&2 || true
+		exit 1
+	fi
+	printf 'Error: could not preflight the merge (git merge-tree exited %s):\n%s\n' \
+		"$merge_tree_status" "$merge_preview" >&2
+	exit "$merge_tree_status"
+fi
+
 if [ "$dry_run" = true ]; then
 	printf 'Dry run: no merge was performed.\n'
 	exit 0

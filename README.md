@@ -100,10 +100,11 @@ checkout:
 ```
 
 The script preserves upstream commit history with a merge commit and refuses dirty worktrees or
-unrelated histories. Since this repository's branch has diverged from upstream, the merge may
-include upstream ancestors in addition to the PR's 51 commits. Preview the fetched head and exact
-incoming commit count without merging with `./scripts/merge-kytyps5-pr-937.sh --dry-run`. If Git
-reports conflicts, resolve them and complete the merge as usual.
+unrelated histories. It checks for conflicts before starting the merge, leaving the worktree
+untouched if the branches cannot be merged cleanly. Since this repository's branch has diverged
+from upstream, the merge may include upstream ancestors in addition to the PR's 51 commits.
+Preview the fetched head and exact incoming commit count without merging with
+`./scripts/merge-kytyps5-pr-937.sh --dry-run`.
 
 ### Formatting
 

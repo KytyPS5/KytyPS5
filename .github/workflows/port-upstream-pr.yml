@@ -4,8 +4,8 @@
 #   1. Settings > Actions > General > "Allow GitHub Actions to create and approve pull requests"
 #   2. (Optional) Secret SYNC_PAT   - PAT with repo + workflow scopes. Needed if the PR touches
 #                                     .github/workflows or if you want CI to run on the opened PR.
-#   3. (Optional) Secret ANTHROPIC_API_KEY - enables AI conflict resolution / repair.
-#   4. (Optional) Variable ANTHROPIC_MODEL - defaults to claude-sonnet-5-5.
+#   3. AI uses GitHub Models (free tier) via the built-in GITHUB_TOKEN - no API key needed.
+#   4. (Optional) Variable AI_MODEL - defaults to openai/gpt-4.1 (any id from github.com/marketplace/models).
 #
 # Ladder: cherry-pick -> cherry-pick (patience/rename-aware) -> squashed 3-way apply -> AI for leftovers.
 
@@ -29,7 +29,7 @@ on:
         default: ""
         type: string
       use_ai:
-        description: "Use Claude to resolve leftover conflicts / repair failing verify"
+        description: "Use AI (GitHub Models) to resolve leftover conflicts / repair failing verify"
         required: false
         default: true
         type: boolean
@@ -42,6 +42,7 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  models: read
 
 concurrency:
   group: port-upstream-pr-${{ inputs.pr_number }}
@@ -151,8 +152,8 @@ jobs:
       - name: AI conflict resolution
         if: env.NEEDS_AI == 'true' && inputs.use_ai
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          ANTHROPIC_MODEL: ${{ vars.ANTHROPIC_MODEL }}
+          AI_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AI_MODEL: ${{ vars.AI_MODEL }}
         run: python3 .github/scripts/ai_resolve.py resolve
 
       - name: Commit
@@ -180,8 +181,8 @@ jobs:
         env:
           VERIFY_COMMAND: ${{ inputs.verify_command }}
           USE_AI: ${{ inputs.use_ai }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          ANTHROPIC_MODEL: ${{ vars.ANTHROPIC_MODEL }}
+          AI_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AI_MODEL: ${{ vars.AI_MODEL }}
         run: |
           set +e
           export VERIFY_LOG="$RUNNER_TEMP/verify.log"
@@ -190,7 +191,7 @@ jobs:
             bash -c "$VERIFY_COMMAND" > "$VERIFY_LOG" 2>&1
             if [ $? -eq 0 ]; then VERIFY=passed; break; fi
             tail -n 40 "$VERIFY_LOG"
-            [ "$attempt" -lt 2 ] && [ "$USE_AI" = true ] && [ -n "$ANTHROPIC_API_KEY" ] || break
+            [ "$attempt" -lt 2 ] && [ "$USE_AI" = true ] && [ -n "$AI_TOKEN" ] || break
             python3 .github/scripts/ai_resolve.py repair || break
             git commit -q -m "Adapt ported PR to fork changes (AI repair $((attempt+1)))" || break
           done

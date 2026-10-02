@@ -617,7 +617,6 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		}
 	}
 	IR::TrackResources(ir, decoded, native_cfg);
-	IR::EliminateDeadCode(ir.blocks);
 	TranslateResult result;
 	result.program = std::move(ir);
 	if (options.dump_ir) {

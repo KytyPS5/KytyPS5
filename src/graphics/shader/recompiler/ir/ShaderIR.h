@@ -476,6 +476,7 @@ struct DescriptorSource {
 		uint32_t table_offset    = 0;
 		Value    key_count;
 		Value    selector_mask;
+		std::vector<uint32_t> sources;
 
 		bool operator==(const IndirectImage& other) const = default;
 	};

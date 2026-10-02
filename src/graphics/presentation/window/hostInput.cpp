@@ -25,6 +25,8 @@ struct ControlInfo {
 	Controller::Axis axis     = Controller::Axis::AxisMax;
 	bool             positive = false;
 	float            touch_x  = 0.0f;
+
+	Controller::Setting setting {};
 };
 
 static constexpr std::array CONTROL_INFO = {
@@ -55,6 +57,10 @@ static constexpr std::array CONTROL_INFO = {
     ControlInfo {"RightStickRight", 0, Controller::Axis::RightX, true},
     ControlInfo {"RightStickUp", 0, Controller::Axis::RightY, false},
     ControlInfo {"RightStickDown", 0, Controller::Axis::RightY, true},
+    ControlInfo {.name = "SpeakerVolume", .setting = Controller::Setting::SpeakerVolume},
+    ControlInfo {.name = "VibrationIntensity", .setting = Controller::Setting::VibrationIntensity},
+    ControlInfo {.name    = "TriggerEffectIntensity",
+                 .setting = Controller::Setting::TriggerEffectIntensity},
 };
 
 constexpr std::size_t INVALID_CONTROL = CONTROL_INFO.size();
@@ -242,6 +248,12 @@ void SetStickAxis(Controller::Axis axis, bool negative, bool positive) {
 	Controller::SetAxis(Controller::HOST_INPUT_CONTROLLER_ID, axis, value);
 }
 
+void CycleSettingOnPress(Controller::Setting setting, bool down) {
+	if (down) {
+		Controller::CycleSetting(setting);
+	}
+}
+
 void SetControl(std::size_t control, bool down) {
 	if (control == INVALID_CONTROL) {
 		return;
@@ -254,6 +266,10 @@ void SetControl(std::size_t control, bool down) {
 	}
 	if (info.button != 0) {
 		SetButton(info.button, down);
+		return;
+	}
+	if (info.axis == Controller::Axis::AxisMax) {
+		CycleSettingOnPress(info.setting, down);
 		return;
 	}
 
@@ -280,6 +296,9 @@ void DefaultKeyboardInput(int key_code, bool down) {
 	switch (NormalizeKey(static_cast<SDL_Keycode>(key_code))) {
 		case SDLK_BACKSPACE: SetTouchPad(0.25f, down); return;
 		case SDLK_TAB: SetTouchPad(0.75f, down); return;
+		case SDLK_1: CycleSettingOnPress(Controller::Setting::SpeakerVolume, down); return;
+		case SDLK_2: CycleSettingOnPress(Controller::Setting::VibrationIntensity, down); return;
+		case SDLK_3: CycleSettingOnPress(Controller::Setting::TriggerEffectIntensity, down); return;
 		case SDLK_A:
 			left.left = down;
 			SetStickAxis(Controller::Axis::LeftX, left.left, left.right);

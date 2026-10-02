@@ -412,7 +412,7 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	ValidateOptions(program, input_info);
 	ValidateValueReferences(program, input_info);
 
-	auto next = program.info;
+	auto& next = program.info;
 	next.inputs.clear();
 	next.outputs.clear();
 	next.has_bitwise_xor =
@@ -433,7 +433,6 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	}
 	CollectBuiltinInputs(program, next);
 	CollectOutputs(program, input_info, next);
-	program.info                 = std::move(next);
 	program.shader_info_complete = true;
 }
 

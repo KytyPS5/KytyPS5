@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <vector>
@@ -117,6 +118,8 @@ public:
 	int  GetActiveControllerId();
 	void SetLightBar(uint8_t r, uint8_t g, uint8_t b);
 	bool SetTriggerEffect(const PadTriggerEffectParam& param);
+	void  CycleSetting(Setting setting);
+	float GetSettingScale(Setting setting) const;
 	void ReadState(ControllerState* state, bool* flag, int* count);
 	int  ReadStates(ControllerState* states, int states_num, bool* flag, int* count);
 
@@ -125,6 +128,9 @@ private:
 
 	void CheckActive();
 	void AddState();
+	// Apply cached output without changing its game-requested lifetime; caller holds m_mutex.
+	void ApplyVibration();
+	bool SendTriggerEffect(const PadTriggerEffectParam& param);
 
 	Common::Mutex    m_mutex;
 	std::vector<int> m_connected_ids;
@@ -142,6 +148,12 @@ private:
 	uint32_t         m_states_num    = 0;
 	uint32_t         m_first_state   = 0;
 	uint8_t          m_next_touch_id = 1;
+	// The game's last requests, re-sent when their intensity setting changes.
+	std::array<uint8_t, 2> m_vibration {};
+	uint64_t               m_vibration_until = 0;
+	PadTriggerEffectParam  m_trigger_effect {};
+	// Setting changes share the output lock; audio only needs an atomic scale snapshot.
+	std::array<std::atomic<uint32_t>, 3> m_setting_steps {};
 };
 
 static GameController* g_controller = nullptr;
@@ -183,17 +195,56 @@ static void pad_fill_data(PadData* data, const ControllerState& state, bool conn
 	data->device_unique_data_len = 0;
 }
 
-static bool trigger_effect_zones(uint8_t* effect, const uint8_t* strengths, uint8_t type,
-                                 uint8_t frequency = 0) {
+// In cycle order, starting at the PS5 default.
+constexpr std::array SPEAKER_VOLUME = {1.0f, 0.0f, 0.02f, 0.12f, 0.42f};
+constexpr std::array INTENSITY      = {1.0f, 0.0f, 0.33f, 0.66f};
+
+void CycleSetting(Setting setting) {
+	if (g_controller != nullptr) {
+		g_controller->CycleSetting(setting);
+	}
+}
+
+float GetSettingScale(Setting setting) {
+	return g_controller != nullptr ? g_controller->GetSettingScale(setting) : 1.0f;
+}
+
+void GameController::CycleSetting(Setting setting) {
+	Common::LockGuard lock(m_mutex);
+	auto&             step = m_setting_steps[static_cast<size_t>(setting)];
+	const auto count = setting == Setting::SpeakerVolume ? SPEAKER_VOLUME.size() : INTENSITY.size();
+	step.store((step.load(std::memory_order_relaxed) + 1) % count, std::memory_order_relaxed);
+	if (setting == Setting::VibrationIntensity) {
+		ApplyVibration();
+	} else if (setting == Setting::TriggerEffectIntensity) {
+		(void)SendTriggerEffect(m_trigger_effect);
+	}
+}
+
+float GameController::GetSettingScale(Setting setting) const {
+	const auto step = m_setting_steps[static_cast<size_t>(setting)].load(std::memory_order_relaxed);
+	return setting == Setting::SpeakerVolume ? SPEAKER_VOLUME[step] : INTENSITY[step];
+}
+
+static uint8_t Scale(uint8_t value, float scale) {
+	if (value == 0 || scale == 0.0f) {
+		return 0;
+	}
+	return static_cast<uint8_t>(std::max(1L, std::lround(value * scale)));
+}
+
+static bool trigger_effect_zones(uint8_t* effect, const uint8_t* strengths, float scale,
+                                 uint8_t type, uint8_t frequency = 0) {
 	uint16_t active = 0;
 	uint32_t packed = 0;
 	for (int i = 0; i < 10; i++) {
 		if (strengths[i] > 8) {
 			return false;
 		}
-		if (strengths[i] != 0) {
+		const auto strength = Scale(strengths[i], scale);
+		if (strength != 0) {
 			active |= static_cast<uint16_t>(1u << i);
-			packed |= static_cast<uint32_t>(strengths[i] - 1u) << (3 * i);
+			packed |= static_cast<uint32_t>(strength - 1u) << (3 * i);
 		}
 	}
 
@@ -208,7 +259,8 @@ static bool trigger_effect_zones(uint8_t* effect, const uint8_t* strengths, uint
 	return true;
 }
 
-static bool trigger_effect_to_dualsense(const PadTriggerEffectCommand& command, uint8_t* effect) {
+static bool trigger_effect_to_dualsense(const PadTriggerEffectCommand& command, uint8_t* effect,
+                                        float scale) {
 	std::memset(effect, 0, 11);
 	effect[0] = 0x05;
 
@@ -220,7 +272,7 @@ static bool trigger_effect_to_dualsense(const PadTriggerEffectCommand& command, 
 				return false;
 			}
 			std::fill(strengths + command.data[0], strengths + 10, command.data[1]);
-			return trigger_effect_zones(effect, strengths, 0x21);
+			return trigger_effect_zones(effect, strengths, scale, 0x21);
 		case 2: {
 			const auto start    = command.data[0];
 			const auto end      = command.data[1];
@@ -228,14 +280,15 @@ static bool trigger_effect_to_dualsense(const PadTriggerEffectCommand& command, 
 			if (start < 2 || start > 7 || end <= start || end > 8 || strength > 8) {
 				return false;
 			}
-			if (strength == 0) {
+			const auto scaled = Scale(strength, scale);
+			if (scaled == 0) {
 				return true;
 			}
 			const uint16_t zones = static_cast<uint16_t>((1u << start) | (1u << end));
 			effect[0]            = 0x25;
 			effect[1]            = static_cast<uint8_t>(zones);
 			effect[2]            = static_cast<uint8_t>(zones >> 8u);
-			effect[3]            = strength - 1u;
+			effect[3]            = scaled - 1u;
 			return true;
 		}
 		case 3:
@@ -243,8 +296,8 @@ static bool trigger_effect_to_dualsense(const PadTriggerEffectCommand& command, 
 				return false;
 			}
 			std::fill(strengths + command.data[0], strengths + 10, command.data[1]);
-			return trigger_effect_zones(effect, strengths, 0x26, command.data[2]);
-		case 4: return trigger_effect_zones(effect, command.data, 0x21);
+			return trigger_effect_zones(effect, strengths, scale, 0x26, command.data[2]);
+		case 4: return trigger_effect_zones(effect, command.data, scale, 0x21);
 		case 5: {
 			const int start          = command.data[0];
 			const int end            = command.data[1];
@@ -262,9 +315,9 @@ static bool trigger_effect_to_dualsense(const PadTriggerEffectCommand& command, 
 				             : start_strength +
 				                   (delta + (delta < 0 ? -length / 2 : length / 2)) / length);
 			}
-			return trigger_effect_zones(effect, strengths, 0x21);
+			return trigger_effect_zones(effect, strengths, scale, 0x21);
 		}
-		case 6: return trigger_effect_zones(effect, command.data + 1, 0x26, command.data[0]);
+		case 6: return trigger_effect_zones(effect, command.data + 1, scale, 0x26, command.data[0]);
 		default: return false;
 	}
 }
@@ -355,6 +408,9 @@ void GameController::CheckActive() {
 	m_states_num    = 0;
 	m_first_state   = 0;
 	m_next_touch_id = 1;
+	m_vibration          = {};
+	m_vibration_until    = 0;
+	m_trigger_effect     = {};
 }
 
 void GameController::AddState() {
@@ -600,11 +656,24 @@ void GameController::ReleaseHostPads() {
 	}
 
 	m_connected_ids.clear();
+	CheckActive();
 }
 
 void GameController::SetVibration(uint8_t large_motor, uint8_t small_motor) {
 	Common::LockGuard lock(m_mutex);
-	if (DualSenseHaptics::SetVibration(m_active_id, large_motor, small_motor)) {
+	m_vibration       = {large_motor, small_motor};
+	m_vibration_until = SDL_GetTicks() + RUMBLE_DURATION_MS;
+	ApplyVibration();
+}
+
+void GameController::ApplyVibration() {
+	const auto now = SDL_GetTicks();
+	const auto duration =
+	    m_vibration_until > now ? static_cast<uint32_t>(m_vibration_until - now) : 0;
+	const auto scale       = duration != 0 ? GetSettingScale(Setting::VibrationIntensity) : 0.0f;
+	const auto large_motor = Scale(m_vibration[0], scale);
+	const auto small_motor = Scale(m_vibration[1], scale);
+	if (DualSenseHaptics::SetVibration(m_active_id, large_motor, small_motor, duration)) {
 		return;
 	}
 
@@ -619,7 +688,7 @@ void GameController::SetVibration(uint8_t large_motor, uint8_t small_motor) {
 
 	const auto large = static_cast<uint16_t>(large_motor * 0x101U);
 	const auto small = static_cast<uint16_t>(small_motor * 0x101U);
-	if (!SDL_RumbleGamepad(pad, large, small, RUMBLE_DURATION_MS)) {
+	if (!SDL_RumbleGamepad(pad, large, small, duration)) {
 		LOGF("\t rumble failed: %s\n", SDL_GetError());
 	}
 }
@@ -643,20 +712,35 @@ void GameController::SetLightBar(uint8_t r, uint8_t g, uint8_t b) {
 }
 
 bool GameController::SetTriggerEffect(const PadTriggerEffectParam& param) {
+	Common::LockGuard lock(m_mutex);
+	if (!SendTriggerEffect(param)) {
+		return false;
+	}
+	for (int i = 0; i < 2; i++) {
+		if ((param.trigger_mask & (1u << i)) != 0) {
+			m_trigger_effect.trigger_mask |= static_cast<uint8_t>(1u << i);
+			m_trigger_effect.command[i] = param.command[i];
+		}
+	}
+	return true;
+}
+
+bool GameController::SendTriggerEffect(const PadTriggerEffectParam& param) {
 	if ((param.trigger_mask & ~0x03u) != 0) {
 		return false;
 	}
 
 	DualSenseEffects effect {};
+	const auto       scale = GetSettingScale(Setting::TriggerEffectIntensity);
 	if ((param.trigger_mask & 0x01u) != 0) {
 		effect.enable_bits |= 0x08;
-		if (!trigger_effect_to_dualsense(param.command[0], effect.left_trigger)) {
+		if (!trigger_effect_to_dualsense(param.command[0], effect.left_trigger, scale)) {
 			return false;
 		}
 	}
 	if ((param.trigger_mask & 0x02u) != 0) {
 		effect.enable_bits |= 0x04;
-		if (!trigger_effect_to_dualsense(param.command[1], effect.right_trigger)) {
+		if (!trigger_effect_to_dualsense(param.command[1], effect.right_trigger, scale)) {
 			return false;
 		}
 	}
@@ -664,7 +748,6 @@ bool GameController::SetTriggerEffect(const PadTriggerEffectParam& param) {
 		return true;
 	}
 
-	Common::LockGuard lock(m_mutex);
 	auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(m_active_id));
 	if (pad != nullptr && SDL_GetGamepadType(pad) == SDL_GAMEPAD_TYPE_PS5) {
 		(void)SDL_SendGamepadEffect(pad, &effect, sizeof(effect));

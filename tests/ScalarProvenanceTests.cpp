@@ -650,6 +650,39 @@ void TestControlFlowValueSurvivesReadLaneFolding() {
   ValidateProgram(fixture.program, true);
 }
 
+void TestDeadPhiCyclesAndPlanningRoots() {
+  Fixture fixture(2);
+  auto &entry = fixture.BlockAt(0);
+  auto &loop = fixture.BlockAt(1);
+  entry.AddBranch(&loop);
+  loop.AddBranch(&loop);
+  const auto source = fixture.Emit(ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(2))});
+  const auto identity = fixture.Emit(ValueOpcode::Identity, {source});
+  auto &live = loop.AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+  live.AddPhiOperand(&entry, identity);
+  live.AddPhiOperand(&loop, Value(&live));
+  const auto reference = fixture.Emit(ValueOpcode::ReferenceU32, {Value(&live)}, 0, 1);
+  auto &dead = loop.AppendNewInst(ValueOpcode::Phi, {}, uint64_t(Type::U32));
+  const auto increment = fixture.Emit(ValueOpcode::IAdd32, {Value(&dead), Value(1u)}, 0, 1);
+  dead.AddPhiOperand(&entry, source);
+  dead.AddPhiOperand(&loop, increment);
+  const auto retained = fixture.Emit(ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(3))});
+  auto &planning = fixture.program.value_storage.emplace_back(ValueOpcode::Identity);
+  planning.SetArg(0, retained);
+
+  EliminateDeadCode(fixture.program.blocks);
+  Check(entry.Instructions().size() == 3 && loop.Instructions().size() == 2,
+        "dead Phi cycle survived or a live/planning dependency was removed");
+  Check(identity.Instruction()->Arg(0) == source && live.Arg(0) == identity &&
+            live.Arg(1) == Value(&live) && planning.Arg(0) == retained,
+        "DCE did not preserve direct Identity operands or live Phi recurrence");
+  // Dropping roots must clear prior marks and remove the newly dead SCC safely.
+  reference.Instruction()->Invalidate();
+  planning.Invalidate();
+  EliminateDeadCode(fixture.program.blocks);
+  Check(entry.empty() && loop.empty(), "DCE reused stale marks after removing its roots");
+}
+
 void TestUndefinedRuntimeValueFails() {
   Fixture fixture;
   const auto undef = fixture.Emit(ValueOpcode::UndefU32);
@@ -699,6 +732,7 @@ int main() {
     TestReadLaneElimination();
     TestOptimizationPipeline();
     TestControlFlowValueSurvivesReadLaneFolding();
+    TestDeadPhiCyclesAndPlanningRoots();
     TestUndefinedRuntimeValueFails();
     std::cout << "TypedValuePlanningTests: all cases passed\n";
     return 0;

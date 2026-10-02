@@ -332,7 +332,7 @@ if (KYTY_CLANG_CL)
 	set_source_files_properties(${kyty_emulator_src} PROPERTIES COMPILE_FLAGS "-Wno-pragma-pack -Wno-deprecated-declarations -D_TIMESPEC_DEFINED")
 endif()
 
-set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL3::SDL3-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak)
+set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL3::SDL3-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak opus)
 
 # Linux system libraries.
 if(LINUX)
@@ -495,8 +495,14 @@ target_include_directories(ngs2_sampler_tests PRIVATE ${inc_headers})
 add_executable(pad_haptics_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/PadHapticsTests.cpp"
 )
-target_link_libraries(pad_haptics_tests common fmt::fmt SDL3::SDL3-static)
+target_link_libraries(pad_haptics_tests common fmt::fmt SDL3::SDL3-static opus)
 target_include_directories(pad_haptics_tests PRIVATE ${inc_headers})
+
+add_executable(controller_settings_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ControllerSettingsTests.cpp"
+)
+target_link_libraries(controller_settings_tests common fmt::fmt SDL3::SDL3-static)
+target_include_directories(controller_settings_tests PRIVATE ${inc_headers})
 
 add_executable(save_data_memory_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SaveDataMemoryTests.cpp"
@@ -613,6 +619,7 @@ if(BUILD_TESTING)
 	add_test(NAME audio_out_timing COMMAND $<TARGET_FILE:audio_out_timing_tests>)
 	add_test(NAME ngs2_sampler COMMAND $<TARGET_FILE:ngs2_sampler_tests>)
 	add_test(NAME pad_haptics COMMAND $<TARGET_FILE:pad_haptics_tests>)
+	add_test(NAME controller_settings COMMAND $<TARGET_FILE:controller_settings_tests>)
 	add_test(NAME save_data_memory COMMAND $<TARGET_FILE:save_data_memory_tests>)
 	add_test(NAME png_enc COMMAND $<TARGET_FILE:png_enc_tests>)
 	add_test(NAME ces COMMAND $<TARGET_FILE:ces_tests>)
@@ -690,6 +697,7 @@ if(BUILD_TESTING)
 		audio_out_timing_tests
 		ngs2_sampler_tests
 		pad_haptics_tests
+		controller_settings_tests
 		save_data_memory_tests
 		png_enc_tests
 		ces_tests

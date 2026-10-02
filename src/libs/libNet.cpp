@@ -111,6 +111,10 @@ int KYTY_SYSV_ABI NetResolverDestroy(int rid) {
 	return FinishNetCall(Net::NetResolverDestroy(rid));
 }
 
+int KYTY_SYSV_ABI NetResolverAbort(int rid, int flags) {
+	return FinishNetCall(Net::NetResolverAbort(rid, flags));
+}
+
 int KYTY_SYSV_ABI NetResolverStartNtoa(int rid, const char* hostname, void* addr, int timeout,
                                        int retry, int flags) {
 	return FinishNetCall(Net::NetResolverStartNtoa(rid, hostname, addr, timeout, retry, flags));
@@ -203,6 +207,7 @@ LIB_DEFINE(InitNet_1_Net) {
 	LIB_FUNC("K7RlrTkI-mw", LibNet::NetPoolDestroy);
 	LIB_FUNC("C4UgDHHPvdw", LibNet::NetResolverCreate);
 	LIB_FUNC("kJlYH5uMAWI", LibNet::NetResolverDestroy);
+	LIB_FUNC("AzqoBha7js4", LibNet::NetResolverAbort);
 	LIB_FUNC("Nd91WaWmG2w", LibNet::NetResolverStartNtoa);
 	LIB_FUNC("8Kcp5d-q1Uo", LibNet::NetInetPton);
 	LIB_FUNC("9vA2aW+CHuA", LibNet::NetInetNtop);

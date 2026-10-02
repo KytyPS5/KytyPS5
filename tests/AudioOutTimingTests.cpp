@@ -29,6 +29,8 @@ uint32_t                             oversleep = 0, processing = 0;
 std::vector<uint32_t>                sleeps;
 std::vector<std::unique_ptr<Stream>> streams;
 bool                                 fail_open = false, fail_put = false, stalled = false;
+bool                                 pad_connected = false, pad_bluetooth = false;
+uint64_t                             pad_queue_us = 0;
 int                                  clears = 0;
 
 Stream& GetStream(SDL_AudioStream* stream) {
@@ -133,14 +135,21 @@ namespace Libs::Controller {
 int GetActiveControllerId() {
 	return 0;
 }
+float GetSettingScale(Setting) {
+	return 1.0f;
+}
 
 namespace DualSenseHaptics {
 Stream* Open(uint32_t, bool) {
-	return nullptr;
+	static int pad_stream;
+	return pad_connected ? reinterpret_cast<Stream*>(&pad_stream) : nullptr;
 }
 void     Close(Stream*) {}
-uint64_t Queue(Stream*, int, const void*, uint32_t, uint32_t, bool, const int*) {
-	return 0;
+bool UsesBluetooth(const Stream* stream) {
+	return stream != nullptr && pad_bluetooth;
+}
+uint64_t Queue(Stream* stream, int, const void*, uint32_t, uint32_t, bool, const int*, float) {
+	return stream != nullptr ? pad_queue_us : 0;
 }
 } // namespace DualSenseHaptics
 } // namespace Libs::Controller
@@ -170,6 +179,8 @@ struct Fixture {
 		processing = oversleep = 0;
 		clears                 = 0;
 		fail_open = fail_put = stalled = false;
+		pad_connected = pad_bluetooth = false;
+		pad_queue_us = 0;
 		sleeps.clear();
 	}
 
@@ -336,6 +347,27 @@ void TestFailedQueueUsesFallbackClock() {
 	Check(now - start == 16000, "repeated queue failures reset fallback pacing");
 }
 
+void TestControllerSpeakerPacing() {
+	Fixture f;
+	fail_open     = true; // No PC audio device paces the pad speaker.
+	pad_connected = true;
+	pad_queue_us  = 80000;
+	const auto speaker = f.Open(256, 4);
+
+	pad_bluetooth = true;
+	f.Output(speaker);
+	const auto bluetooth_start = now;
+	f.Output(speaker);
+	Check(now - bluetooth_start >= 5333 && now - bluetooth_start <= 5334,
+	      "Bluetooth speaker waited on its HID queue instead of the sample clock");
+
+	pad_bluetooth = false;
+	const auto usb_start = now;
+	f.Output(speaker);
+	Check(now - usb_start >= 5333 && now - usb_start <= 5334,
+	      "stalled USB speaker waited longer than one audio block");
+}
+
 void TestInvalidBatchSize() {
 	Libs::Audio::AudioOut::AudioOutOutputParam param {};
 	for (const auto count: {0u, 33u}) {
@@ -343,6 +375,16 @@ void TestInvalidBatchSize() {
 		          Libs::Audio::AUDIO_OUT_ERROR_INVALID_SIZE,
 		      "invalid batch size was not rejected before accessing ports");
 	}
+}
+
+void TestZeroOutputFrequency() {
+	Fixture f;
+	Check(Libs::Audio::AudioOut::AudioOutOpen(0, 0, 0, 256, 0, 4) ==
+	          Libs::Audio::AUDIO_OUT_ERROR_INVALID_SAMPLE_FREQ,
+	      "public output open accepted zero frequency");
+	Check(!f.audio.AudioOutOpen(10, 256, 0, Audio::Format::FloatStereo).IsValid(),
+	      "internal output open accepted zero frequency");
+	Check(f.Open().ToInt() == 1, "rejected output port occupied a handle");
 }
 } // namespace
 
@@ -354,7 +396,9 @@ int main() {
 	TestSynchronizedBatchAndInactivePorts();
 	TestFallbackUsesEachPortsPeriod();
 	TestFailedQueueUsesFallbackClock();
+	TestControllerSpeakerPacing();
 	TestInvalidBatchSize();
+	TestZeroOutputFrequency();
 	Check(streams.empty(), "output stream leaked");
 	std::puts("AudioOutTimingTests: all cases passed");
 }

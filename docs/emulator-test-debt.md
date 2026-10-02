@@ -11,18 +11,50 @@ inside that source. Its origin is 3, first use PC `0x1d94`, zero stride,
 `max_byte_extent=16`, formatted descriptor-only access. The renderer has an
 explicit dispatch-wide alias guard; current resource tracking does not prove
 read-before-write across invocations. Do not bypass either guard using only
-local CFG order. The one-byte mapped prefix also does not establish that a
-four-byte store is impossible: the current buffer binding rounds the range
-for DWORD storage.
+local CFG order. The one-byte mapped prefix alone did not establish that a
+four-byte store was impossible: the host binding rounds the range for DWORD
+storage. The guest descriptor's mode-0/zero-stride bounds do establish it.
 
-Required synthetic RED before correction: a compute shader with a bounded
+Required synthetic RED for a **live** overlap: a compute shader with a bounded
 SRT read and a potentially overlapping writable candidate in distinct
 invocations, plus an independent disjoint candidate and exact boundary
 cases. Establish guest ordering/visibility semantics and verify numerical
 GPU results, including write-first/read-first schedules, before choosing a
 shared mechanism such as a coherent runtime read. Preserve rejection for
-unproved cross-invocation aliasing. No production correction for this
-boundary is claimed yet.
+unproved cross-invocation aliasing.
+
+Follow-up diagnosis: the captured writer descriptor has `OOB_SELECT=0` and
+`STRIDE=0`. The AMD RDNA2 ISA specifies mode 0 as out of bounds when
+`offset >= STRIDE` and drops out-of-bounds writes. Existing specialization
+marked this exact combination `zero_stride_oob` but previously applied it only
+to vector reads. Narrower regression: numerical native GPU test with a
+mode-0/stride-zero store aimed inside a sentinel, plus a mode-3/stride-zero
+control store that must write; CPU bounded-SRT snapshot test for an overlapping
+mode-0 candidate and rejecting mode-3/nonzero-stride controls; renderer binding
+admission test for the same ranges. [AMD RDNA2 ISA, vector buffer range
+checking](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf).
+
+The exact no-write condition is now proven separately: native numerical GPU
+`--zero-stride-store-only` RED on the original emitter (sentinel overwritten)
+and GREEN with the same oracle; CPU `--zero-stride-writer-alias-only` RED →
+GREEN, preserving mode-3, nonzero-stride and atomic rejection; renderer
+`buffer-stride-zero-overlap` RED → GREEN. Existing five zero-stride GPU cases,
+four bounded zero-stride GPU candidates, full `resource_tracking_tests` and
+`resource_materialization_tests` pass after correcting old test descriptors
+that unintentionally used OOB mode 0 for live writer/output controls. Logs:
+`_Build/logs/zero-stride-*20261002.log`. The renderer admission group test
+could not pass its Windows child harness because some child processes failed
+to reserve 13.8 GB before reaching the guard; direct targeted overlap and
+atomic rejection children did reach and confirm their expected guard.
+
+Native retry `_Build/runs/yotei-integrated-20261002-175224-presentprobe-gpuav`
+on installed exe SHA-256 `4c92009ed90e9a6a41309c4fb45eff1ae6f6af98f85570d1d6a6832efd742919`
+passes the prior mode-0/zero-stride alias candidate and creates the compute
+pipeline for `34e090c623ad611c`, then exits 321 at shown 133 on a **live**
+candidate: immutable source `0x5000f37f80+120`, writer the identical 120-byte
+range, `STRIDE=8`, `NUM_RECORDS=15`, mode 0, origin 3, PC `0x1d94`.
+This remains a cross-invocation alias problem; do not extend the OOB exception
+to it. Readback starts at frame 180, so no current pixel/menu proof.
 
 ## Dynamic unsigned image sampler selection (2026-10-02)
 

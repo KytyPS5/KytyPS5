@@ -1,5 +1,48 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **2 октября 2026 года, 17:58 UTC** (native Windows; source
+`5c734f0e` + общее исправление `OOB_SELECT=0, STRIDE=0`, впоследствии
+сохранённое локальным коммитом `fea16d46`):
+
+- AMD RDNA2 ISA: при mode 0 нулевой stride делает любой vector buffer store
+  out of bounds; запись отбрасывается. Прежний runtime writer
+  `0x201347e390+1` имел именно этот descriptor. Исправлено исполнение store
+  в общем SPIR-V emitter и учёт no-write candidate в materializer/renderer,
+  без title/hash/address условий. Atomics остаются под alias guard.
+- Нативные регрессии: GPU sentinel+live mode-3 control `--zero-stride-store-only`
+  RED (неверная запись) → GREEN с неизменённым численным oracle; CPU
+  `--zero-stride-writer-alias-only` RED → GREEN при сохранённом отказе для
+  mode 3, ненулевого stride и atomic; renderer
+  `buffer-stride-zero-overlap` RED → GREEN. Соседи `--zero-stride-oob-only`
+  (5 GPU) и `--bounded-zero-stride-only` (4 GPU), полные
+  `resource_tracking_tests`, `resource_materialization_tests` GREEN. Старые
+  контрольные тестовые descriptors, ожидавшие живую запись в OOB mode 0,
+  исправлены на mode 3. Групповой renderer harness остаётся непроверенным:
+  часть дочерних процессов не смогла зарезервировать 13,8 ГБ guest memory;
+  отдельные overlap/atomic rejection cases достигли нужной защиты. Полный
+  `shader_recompiler_compute_tests` остановился на ранее отдельном
+  `ComparisonAliasAdmission` (cross-stage compare/storage positive cases
+  вернули 0 вместо ожидаемого отказа); `zero-stride` тесты выше GREEN,
+  полный compute suite GREEN не заявляется.
+- Native MSVC build/install GREEN; installed exe SHA-256
+  `4c92009ed90e9a6a41309c4fb45eff1ae6f6af98f85570d1d6a6832efd742919`.
+  GPUAV+SyncDispatches run
+  `_Build/runs/yotei-integrated-20261002-173202-menucheck-gpuav-sync`
+  остановлен общим timeout 900 s на `maxShown=128`, без Vulkan/fatal и без
+  readback; последнее залогированное GPU dispatch завершилось. Это не
+  проверка прохождения старого alias.
+- Повтор с GPUAV shader instrumentation без SyncDispatches:
+  `_Build/runs/yotei-integrated-20261002-175224-presentprobe-gpuav`,
+  natural exit321, `maxShown=133`. CS `34e090c623ad611c` создал pipeline;
+  mode-0/zero-stride alias больше не является отказом. Новый **действительный**
+  alias того же shader: immutable SRT source `0x5000f37f80+120` и writer
+  `0x5000f37f80+120`, stride8/records15, mode0, origin3, PC `0x1d94`
+  (`stderr.txt:1`, `_kyty.txt:6565143`). Его нельзя пропускать без
+  синтетического доказательства dispatch-wide порядка/согласованности.
+  `ReadbackStart=180`, пикселей нет; первый ненулевой кадр на этой ревизии,
+  меню и gameplay PENDING. Требуемая регрессия в `docs/emulator-test-debt.md`.
+
+
 Checkpoint **2 октября 2026 года, 16:18 UTC** (native Windows; ветка
 `yotei-windows-bringup`, исходная ревизия `f3f71319` с локальными изменениями,
 впоследствии сохранёнными отдельно как `c1e1ab45` и `9b98861c`):

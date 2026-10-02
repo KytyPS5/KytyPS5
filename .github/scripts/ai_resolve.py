@@ -13,11 +13,13 @@ import time
 import urllib.error
 import urllib.request
 
-API = "https://api.anthropic.com/v1/messages"
-MODEL = os.environ.get("ANTHROPIC_MODEL") or "claude-sonnet-5-5"
-KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-MAX_FILE = 48_000
-MAX_CTX = 14_000
+# GitHub Models (free tier): small request limits, so keep prompts compact.
+API = "https://models.github.ai/inference/chat/completions"
+MODEL = os.environ.get("AI_MODEL") or "openai/gpt-4.1"
+KEY = os.environ.get("AI_TOKEN", "")
+MAX_FILE = int(os.environ.get("AI_MAX_FILE_CHARS", 10_000))
+MAX_CTX = 3_000
+MAX_OUT = 4_000
 REPORT = os.path.join(os.environ.get("RUNNER_TEMP", "/tmp"), "ai_report.json")
 
 MARKER = re.compile(r"^(<{7}|>{7})( .*)?$", re.M)
@@ -55,21 +57,34 @@ def clip(s, n):
 def ask(system, user):
     body = json.dumps({
         "model": MODEL,
-        "max_tokens": 16000,
-        "system": system,
-        "messages": [{"role": "user", "content": user}],
+        "max_tokens": MAX_OUT,
+        "temperature": 0.1,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
     }).encode()
-    for attempt in range(3):
+    for attempt in range(4):
         req = urllib.request.Request(API, body, {
-            "x-api-key": KEY,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
+            "Authorization": f"Bearer {KEY}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "Content-Type": "application/json",
         })
         try:
             with urllib.request.urlopen(req, timeout=300) as r:
                 data = json.load(r)
-            return "".join(b.get("text", "") for b in data["content"] if b.get("type") == "text")
-        except (urllib.error.URLError, TimeoutError) as e:
+            return data["choices"][0]["message"]["content"]
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode(errors="replace")[:300]
+            print(f"::warning::API error {e.code} (attempt {attempt + 1}): {detail}")
+            if e.code == 429:  # free-tier rate limit: honour Retry-After
+                time.sleep(min(int(e.headers.get("Retry-After", 30)), 90))
+            elif e.code in (400, 401, 403, 413):
+                return None  # won't succeed on retry
+            else:
+                time.sleep(5 * (attempt + 1))
+        except (urllib.error.URLError, TimeoutError, KeyError, ValueError) as e:
             print(f"::warning::API call failed (attempt {attempt + 1}): {e}")
             time.sleep(5 * (attempt + 1))
     return None
@@ -111,7 +126,7 @@ def handle(rep, path, src, is_reject):
     pr_delta = clip(sh("git", "diff", os.environ["PR_BASE"], os.environ["PR_REF"], "--", path), MAX_CTX)
     fork_delta = clip(sh("git", "diff", f"{os.environ['FORK_BASE']}..HEAD", "--", path), MAX_CTX)
     try:
-        pr_desc = clip(open(os.environ["PR_BODY_FILE"], encoding="utf-8").read(), 3000)
+        pr_desc = clip(open(os.environ["PR_BODY_FILE"], encoding="utf-8").read(), 1000)
     except OSError:
         pr_desc = ""
 
@@ -158,11 +173,11 @@ def resolve(rep):
 
 
 def repair(rep):
-    log = open(os.environ["VERIFY_LOG"], errors="replace").read()[-8000:]
+    log = open(os.environ["VERIFY_LOG"], errors="replace").read()[-4000:]
     base = os.environ["TARGET_REF"]
     files = [p for p in sh("git", "diff", "--name-only", base, "HEAD").splitlines() if os.path.isfile(p)]
 
-    blocks, budget = [], 60_000
+    blocks, budget = [], MAX_FILE
     for p in files:
         try:
             t = open(p, encoding="utf-8").read()
@@ -174,7 +189,7 @@ def repair(rep):
         blocks.append(f'<file path="{p}">\n{t}\n</file>')
 
     prompt = (f"Verify command output (tail):\n```\n{log}\n```\n\n"
-              f"Ported diff vs fork base:\n```diff\n{clip(sh('git', 'diff', base, 'HEAD'), 20000)}\n```\n\n"
+              f"Ported diff vs fork base:\n```diff\n{clip(sh('git', 'diff', base, 'HEAD'), 6000)}\n```\n\n"
               f"Modifiable files:\n" + "\n".join(blocks))
     out = ask(REPAIR_SYSTEM, prompt)
 
@@ -196,7 +211,7 @@ def repair(rep):
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "resolve"
     if not KEY:
-        print("::warning::ANTHROPIC_API_KEY not set - skipping AI step")
+        print("::warning::AI_TOKEN not set - skipping AI step")
         return 0 if mode == "resolve" else 1
     rep = load_report()
     return repair(rep) if mode == "repair" else resolve(rep)

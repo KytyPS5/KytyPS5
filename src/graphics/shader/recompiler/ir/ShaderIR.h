@@ -74,9 +74,12 @@ struct MemoryInfo {
 	bool                    planning_only                                         = false;
 
 	[[nodiscard]] bool SupportsIndirectBufferLoad(ValueOpcode opcode) const {
-		return !formatted && !typed && data_bits == 32u &&
-		       (opcode == ValueOpcode::LoadBufferU32 || opcode == ValueOpcode::LoadBufferU32x2 ||
-		        opcode == ValueOpcode::LoadBufferU32x3 || opcode == ValueOpcode::LoadBufferU32x4);
+		if (typed || data_bits != 32u) return false;
+		// Only complete DWORD components can use this runtime descriptor path.
+		return (opcode == ValueOpcode::LoadBufferU32 && data_dwords == 1u) ||
+		       (opcode == ValueOpcode::LoadBufferU32x2 && data_dwords == 2u) ||
+		       (opcode == ValueOpcode::LoadBufferU32x3 && data_dwords == 3u) ||
+		       (opcode == ValueOpcode::LoadBufferU32x4 && data_dwords == 4u);
 	}
 
 	bool operator==(const MemoryInfo& other) const = default;

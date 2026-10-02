@@ -25570,6 +25570,70 @@ TestCase BufferLoadDwordx3GpuSelectedDescriptors() {
   return BufferLoadsGpuSelectedDescriptors(true);
 }
 
+TestCase BufferLoadFormatGpuSelectedDescriptors(u32 components) {
+  constexpr uint64_t GuestBase = 0x0000000110000000ull;
+  TestCase test;
+  test.name = components == 1   ? "GpuSelectedFormatX"
+              : components == 2 ? "GpuSelectedFormatXY"
+              : components == 3 ? "GpuSelectedFormatXYZ"
+                                : "GpuSelectedFormatXYZW";
+  test.initial.resize(2048);
+  const Prospero::BufferFormat formats[] = {
+      Prospero::BufferFormat::k32Float, Prospero::BufferFormat::k32_32Float,
+      Prospero::BufferFormat::k32_32_32Float,
+      Prospero::BufferFormat::k32_32_32_32Float};
+  // Load each descriptor through a GPU-selected scalar-buffer table index.
+  // Full/partial records, unsupported format, and non-identity channel order.
+  for (u32 fixture = 0; fixture < 5; ++fixture) {
+    const auto format = fixture == 3
+                            ? Prospero::BufferFormat::k16_16Float
+                            : formats[fixture == 4 ? 3 : components - 1];
+    const u32 stride = fixture == 1 ? 4 : 32;
+    const u32 records = fixture == 2 ? 0 : 1;
+    const u32 swizzle = fixture == 4 ? DstSel(5, 4, 6, 7) : DstSel(4, 5, 6, 7);
+    const std::array<u32, 4> descriptor{
+        static_cast<u32>(GuestBase + 4096), 1u | (stride << 16u), records,
+        (static_cast<u32>(format) << 12u) | swizzle};
+    std::copy(descriptor.begin(), descriptor.end(),
+              test.initial.begin() + 128 + fixture * 4);
+    test.initial[64 + fixture] = fixture;
+    AppendVMovU32(&test.code, 30, (64 + fixture) * 4);
+    AppendBufferLoadDword(&test.code, 0, 30);
+    test.code.push_back(EncodeVop1(0x02, 20, Vgpr(0)));
+    test.code.push_back(EncodeSop2(0x26, 20, 20, 255));
+    test.code.push_back(16);
+    test.code.push_back(EncodeSmem0(0x0a, 8, 0));
+    test.code.push_back(EncodeSmem1(512, 20));
+    AppendVMovU32(&test.code, 21, 0);
+    test.code.push_back(EncodeMubuf0(components - 1, 0, true, false));
+    test.code.push_back(EncodeMubuf1(0, 2, 21));
+    for (u32 c = 0; c < components; ++c) {
+      AppendStoreVgpr(&test.code, c, fixture * components + c);
+      const bool valid = fixture == 0 || (fixture == 1 && components == 1);
+      test.expected.push_back(valid ? std::bit_cast<u32>(float(c + 1)) : 0);
+    }
+  }
+  for (u32 c = 0; c < 4; ++c)
+    test.initial[1024 + c] = std::bit_cast<u32>(float(c + 1));
+  AppendEnd(&test.code);
+  test.bda_mappings = {{GuestBase, 0}};
+  test.required_spirv = {"OpConvertUToPtr", "PhysicalStorageBuffer"};
+  return test;
+}
+
+TestCase GpuSelectedFormatX() {
+  return BufferLoadFormatGpuSelectedDescriptors(1);
+}
+TestCase GpuSelectedFormatXY() {
+  return BufferLoadFormatGpuSelectedDescriptors(2);
+}
+TestCase GpuSelectedFormatXYZ() {
+  return BufferLoadFormatGpuSelectedDescriptors(3);
+}
+TestCase GpuSelectedFormatXYZW() {
+  return BufferLoadFormatGpuSelectedDescriptors(4);
+}
+
 TestCase BufferStoreDwordx4DropsOnlyOutOfBoundsTail() {
   using O = ShaderOpcode;
 
@@ -31584,6 +31648,10 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferLoadDwordx4ZeroesOnlyOutOfBoundsTail);
   AddCase(BufferLoadsGpuSelectedDescriptors);
   AddCase(BufferLoadDwordGpuSelectedDescriptors);
+  AddCase(GpuSelectedFormatX);
+  AddCase(GpuSelectedFormatXY);
+  AddCase(GpuSelectedFormatXYZ);
+  AddCase(GpuSelectedFormatXYZW);
   AddCase(BufferLoadDwordx3GpuSelectedDescriptors);
   AddCase(BufferStoreDwordx4DropsOnlyOutOfBoundsTail);
   AddCase(BufferLoadFormatXyzwRejectsPartialRecord);
@@ -36727,6 +36795,18 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cmpswap-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, BufferAtomicCmpSwapExactRaw());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--rdna2-compat-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, BufferLoadDwordGpuSelectedDescriptors());
+    RunCase(&vulkan, BufferLoadsGpuSelectedDescriptors());
+    RunCase(&vulkan, BufferLoadDwordx3GpuSelectedDescriptors());
+    RunCase(&vulkan, GpuSelectedFormatX());
+    RunCase(&vulkan, GpuSelectedFormatXY());
+    RunCase(&vulkan, GpuSelectedFormatXYZ());
+    RunCase(&vulkan, GpuSelectedFormatXYZW());
+    RunCase(&vulkan, ImageLoadPackedPreservesBits());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--image-cmpswap-only") == 0) {

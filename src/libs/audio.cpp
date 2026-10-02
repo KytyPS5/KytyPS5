@@ -428,6 +428,10 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking) {
 }
 
 Audio::Id Audio::AudioOutOpen(int type, uint32_t samples_num, uint32_t freq, Format format) {
+	if (freq == 0) {
+		return Id::Invalid();
+	}
+
 	Common::LockGuard lock(m_mutex);
 
 	for (int id = 0; id < OUT_PORTS_MAX; id++) {
@@ -848,6 +852,9 @@ int KYTY_SYSV_ABI AudioOutOpen(int user_id, int type, int index, uint32_t len, u
 
 	if (!audio_out_port_type_is_valid(type)) {
 		return AUDIO_OUT_ERROR_INVALID_PORT_TYPE;
+	}
+	if (freq == 0) {
+		return AUDIO_OUT_ERROR_INVALID_SAMPLE_FREQ;
 	}
 	EXIT_NOT_IMPLEMENTED(index != 0);
 

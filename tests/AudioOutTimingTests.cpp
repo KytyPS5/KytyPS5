@@ -373,6 +373,16 @@ void TestInvalidBatchSize() {
 		      "invalid batch size was not rejected before accessing ports");
 	}
 }
+
+void TestZeroOutputFrequency() {
+	Fixture f;
+	Check(Libs::Audio::AudioOut::AudioOutOpen(0, 0, 0, 256, 0, 4) ==
+	          Libs::Audio::AUDIO_OUT_ERROR_INVALID_SAMPLE_FREQ,
+	      "public output open accepted zero frequency");
+	Check(!f.audio.AudioOutOpen(10, 256, 0, Audio::Format::FloatStereo).IsValid(),
+	      "internal output open accepted zero frequency");
+	Check(f.Open().ToInt() == 1, "rejected output port occupied a handle");
+}
 } // namespace
 
 int main() {
@@ -385,6 +395,7 @@ int main() {
 	TestFailedQueueUsesFallbackClock();
 	TestControllerSpeakerPacing();
 	TestInvalidBatchSize();
+	TestZeroOutputFrequency();
 	Check(streams.empty(), "output stream leaked");
 	std::puts("AudioOutTimingTests: all cases passed");
 }

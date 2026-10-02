@@ -1584,7 +1584,7 @@ private:
 		DescriptorSource image_source;
 		image_source.dword_count = 8u;
 		image_source.dwords.fill(Value(0u));
-		image_source.indirect_image.emplace();
+		image_source.indirect_image.emplace(DescriptorSource::IndirectImage{});
 		auto& sources = image_source.indirect_image->sources;
 		for (auto& choice: choices) {
 			if (choice.branch != nullptr) continue;

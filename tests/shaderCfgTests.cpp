@@ -13158,6 +13158,39 @@ void TestSrtWalkerRealSmemTranslation() {
   CheckFlattenedReadSlots(ir, 4, "real SMEM patch used the wrong flat offsets");
 }
 
+bool ReadSrtCountOnly(void* userdata, uint64_t, std::span<uint32_t>) {
+  *static_cast<int*>(userdata) += 1;
+  return false;
+}
+
+void TestSrtWalkerNullPointerReadsZero() {
+  const uint32_t shader[] = {
+      EncodeSMovB32(124, 130),
+      EncodeSmem0(0x02, 0, 4),
+      (124u << 25u) | 2u,
+      EncodeMubuf0(0x1c),
+      EncodeMubuf1(0, 0, 1),
+      EncodeSopp(0x01),
+  };
+  ShaderRecompiler::IR::Program ir;
+  BuildTypedPlan(shader, static_cast<uint32_t>(std::size(shader)), ir);
+  std::array<uint32_t, 16> user_data = {};
+  int reads = 0;
+  const ShaderRecompiler::IR::SrtRuntime runtime{user_data, 0, ReadSrtCountOnly, &reads};
+  std::vector<uint32_t> flat;
+  Check(ShaderRecompiler::IR::SrtWalker(ir, runtime).RefreshFlatBuffer(flat),
+        "null SRT pointer did not read as zero");
+  Check(reads == 0 && flat.size() == 4 &&
+            std::all_of(flat.begin(), flat.end(), [](uint32_t word) { return word == 0; }),
+        "null SRT pointer touched memory or returned a non-zero descriptor");
+
+  user_data[8] = 0x2000u;
+  reads = 0;
+  Check(!ShaderRecompiler::IR::SrtWalker(ir, runtime).RefreshFlatBuffer(flat),
+        "an address on the second page was treated as a null SRT pointer");
+  Check(reads > 0, "an address on the second page did not reach the memory reader");
+}
+
 void TestSrtWalkerVccBaseTranslation() {
   const uint32_t shader[] = {
       EncodeSMovB32(106, 27),   EncodeSMovB32(107, 28),
@@ -14407,6 +14440,7 @@ int main() {
   TestComputeImageFill();
   TestTypedDescriptorRealCarryAndScalarLoads();
   TestSrtWalkerRealSmemTranslation();
+  TestSrtWalkerNullPointerReadsZero();
   TestSrtWalkerVccBaseTranslation();
   TestSrtWalkerRealSBufferTranslation();
   TestScalarMemorySourcesCapturedBeforeWrites();

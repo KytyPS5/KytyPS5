@@ -472,6 +472,12 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 			return false;
 		}
 	}
+	// A null guest pointer (an unset table, because this path is not taken) is a null
+	// descriptor: read it as zero. Only the first page is unmapped.
+	if (address < 0x1000u) {
+		result = 0;
+		return true;
+	}
 	uint32_t word = 0;
 	if (m_runtime.read_memory != nullptr) {
 		if (!m_runtime.read_memory(m_runtime.userdata, address, {&word, 1})) {

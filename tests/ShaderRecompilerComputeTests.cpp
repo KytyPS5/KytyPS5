@@ -25480,7 +25480,7 @@ TestCase BufferLoadDwordx4ZeroesOnlyOutOfBoundsTail() {
   return test;
 }
 
-TestCase BufferLoadsGpuSelectedDescriptors(bool xyz) {
+TestCase BufferLoadsGpuSelectedDescriptors(bool xyz, bool scalar = false) {
   using O = ShaderOpcode;
   constexpr uint64_t GuestBase = 0x0000000110000000ull;
   struct DescriptorCase {
@@ -25505,7 +25505,7 @@ TestCase BufferLoadsGpuSelectedDescriptors(bool xyz) {
       {12, 4, 3, 4, true, true, {}},
   };
   TestCase test;
-  test.name = xyz ? "BufferLoadDwordx3GpuSelectedDescriptors"
+  test.name = scalar ? "BufferLoadDwordGpuSelectedDescriptors" : xyz ? "BufferLoadDwordx3GpuSelectedDescriptors"
                   : "BufferLoadsGpuSelectedDescriptors";
   test.initial.resize(2048);
   for (u32 i = 0; i < std::size(cases); ++i) {
@@ -25532,13 +25532,13 @@ TestCase BufferLoadsGpuSelectedDescriptors(bool xyz) {
     test.code.push_back(EncodeSmem1(520, 20));
     AppendSMovLiteral(&test.code, 22, cases[selected].soffset);
     AppendVMovU32(&test.code, 21, 1);
-    test.code.push_back(EncodeMubuf0(xyz ? 0x0f : 0x0e, 0, true, false));
+    test.code.push_back(EncodeMubuf0(scalar ? 0x0c : xyz ? 0x0f : 0x0e, 0, true, false));
     test.code.push_back(EncodeMubuf1(0, 2, 21, 22));
-    test.code.push_back(EncodeMubuf0(xyz ? 0x0f : 0x0d, xyz ? 12 : 16, true, false));
-    test.code.push_back(EncodeMubuf1(xyz ? 3 : 4, 2, 21, 22));
-    for (u32 component = 0; component < 6; ++component) {
-      AppendStoreVgpr(&test.code, component, i * 6 + component);
-      const u32 expected = cases[selected].expected[component];
+    test.code.push_back(EncodeMubuf0(scalar ? 0x0c : xyz ? 0x0f : 0x0d, scalar || xyz ? 12 : 16, true, false));
+    test.code.push_back(EncodeMubuf1(scalar ? 1 : xyz ? 3 : 4, 2, 21, 22));
+    for (u32 component = 0; component < (scalar ? 2u : 6u); ++component) {
+      AppendStoreVgpr(&test.code, component, i * (scalar ? 2u : 6u) + component);
+      const u32 expected = cases[selected].expected[scalar ? component * 3u : component];
       test.expected.push_back(expected == 0 ? 0 : selected * 100 + expected);
     }
   }
@@ -25547,13 +25547,19 @@ TestCase BufferLoadsGpuSelectedDescriptors(bool xyz) {
   test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::BUFFER_LOAD_DWORD,
                   O::V_READFIRSTLANE_B32, O::S_MUL_I32, O::S_BUFFER_LOAD_DWORDX4,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  if (xyz) {
+  if (scalar) {
+    test.opcodes.push_back(O::BUFFER_LOAD_DWORD);
+  } else if (xyz) {
     test.opcodes.push_back(O::BUFFER_LOAD_DWORDX3);
   } else {
     test.opcodes.insert(test.opcodes.end(), {O::BUFFER_LOAD_DWORDX4, O::BUFFER_LOAD_DWORDX2});
   }
   test.required_spirv = {"OpConvertUToPtr", "PhysicalStorageBuffer"};
   return test;
+}
+
+TestCase BufferLoadDwordGpuSelectedDescriptors() {
+  return BufferLoadsGpuSelectedDescriptors(false, true);
 }
 
 TestCase BufferLoadsGpuSelectedDescriptors() {
@@ -31562,6 +31568,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferLoadDwordx4SnapshotsOverlappingAddress);
   AddCase(BufferLoadDwordx4ZeroesOnlyOutOfBoundsTail);
   AddCase(BufferLoadsGpuSelectedDescriptors);
+  AddCase(BufferLoadDwordGpuSelectedDescriptors);
   AddCase(BufferLoadDwordx3GpuSelectedDescriptors);
   AddCase(BufferStoreDwordx4DropsOnlyOutOfBoundsTail);
   AddCase(BufferLoadFormatXyzwRejectsPartialRecord);

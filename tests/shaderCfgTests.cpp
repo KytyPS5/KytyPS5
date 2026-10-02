@@ -7813,9 +7813,10 @@ void TestNewShaderRecompilerCfgLoopHeaderBufferLoadDispatcher() {
 
   auto options = MakeCompileOptions(ShaderType::Compute);
   options.dump_ir = true;
-  ExpectFatal([&] { (void)RecompileForTest(shader, options); },
-              "self-modifying vector-buffer descriptor did not terminate "
-              "compilation");
+  auto result = RecompileForTest(shader, options);
+  Check(result.program.info.uses_dma,
+        "loop-selected scalar buffer load did not retain GPU descriptor evaluation");
+  CheckSpirvBinaryValidates(result.spirv);
 }
 #endif
 

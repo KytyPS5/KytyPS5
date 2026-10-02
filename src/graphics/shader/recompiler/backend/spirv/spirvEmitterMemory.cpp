@@ -1,6 +1,5 @@
-#include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
-
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 
 #include <algorithm>
@@ -835,15 +834,17 @@ uint32_t LoadIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_
 		           Unary(state, spv::OpUConvert, TypeScalarU64(state), address.byte));
 		values[component] = LoadBda(ctx, guest, AndCondition(state, valid_format, in_bounds), 32u);
 	}
-	return ConstructU32Composite(state, components, values);
+	return components == 1u ? values[0] : ConstructU32Composite(state, components, values);
 }
 
 uint32_t LoadWideBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
 	auto& state = ctx.state;
 	return EmitValueOrDefaultIfCondition(
-	    state, ctx.Arg(inst, inst.NumArgs() - 1), TypeU32Composite(state, components),
-	    ConstantU32CompositeZero(state, components), [&]() {
-		    const auto mem      = ctx.Memory(inst);
+	    state, ctx.Arg(inst, inst.NumArgs() - 1),
+	    components == 1u ? TypeU32(state) : TypeU32Composite(state, components),
+	    components == 1u ? ConstantU32(state, 0) : ConstantU32CompositeZero(state, components),
+	    [&]() {
+		    const auto mem = ctx.Memory(inst);
 		    if (mem.kind == IR::ResourceKind::IndirectBuffer) {
 			    return LoadIndirectBuffer(ctx, inst, components);
 		    }
@@ -1239,7 +1240,7 @@ void EmitLoadMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	uint32_t   value;
 	if (mem.kind == IR::ResourceKind::FlatLocal)
 		value = LoadLocalFlat(ctx, inst);
-	else if (buffer_components > 1u)
+	else if (mem.kind == IR::ResourceKind::IndirectBuffer || buffer_components > 1u)
 		value = LoadWideBuffer(ctx, inst, buffer_components);
 	else if (shared_components > 1u)
 		value = LoadWideShared(ctx, inst, shared_components);

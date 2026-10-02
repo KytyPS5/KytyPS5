@@ -12,6 +12,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/sysctl.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -84,6 +85,13 @@ bool RunCrossingCopy(CopyFunc copy) {
 	return std::memcmp(dst + 0x40, source, 64) == 0;
 }
 
+bool IsRunningUnderRosetta() {
+	int    translated = 0;
+	size_t size       = sizeof(translated);
+	return sysctlbyname("sysctl.proc_translated", &translated, &size, nullptr, 0) == 0 &&
+	       translated == 1;
+}
+
 void TestUnpatchedAbortsUnderRosetta() {
 	const pid_t child = fork();
 	if (child == 0) {
@@ -93,7 +101,10 @@ void TestUnpatchedAbortsUnderRosetta() {
 	}
 	int status = 0;
 	waitpid(child, &status, 0);
-	// Documents the Rosetta behaviour this patch works around; native x86-64 runs exit cleanly.
+	// The Rosetta behaviour this patch works around; native x86-64 runs exit cleanly. If a future
+	// Rosetta stops aborting here, this check flags that the split may no longer be needed.
+	Check(!IsRunningUnderRosetta() || WIFSIGNALED(status),
+	      "unpatched crossing store aborts under Rosetta");
 	if (WIFSIGNALED(status)) {
 		std::printf("unpatched crossing store: child killed by signal %d (expected under Rosetta)\n",
 		            WTERMSIG(status));

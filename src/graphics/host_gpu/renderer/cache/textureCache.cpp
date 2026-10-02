@@ -1967,15 +1967,16 @@ void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 void TextureCache::RunGarbageCollector() {
 	std::scoped_lock lock {m_lock};
 	const uint64_t   tick = m_gc_tick++;
-	if (m_graphics.CanReportMemoryUsage()) {
-		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
-	}
-	if (m_total_used_memory < m_trigger_gc_memory) {
+	// Driver usage includes other caches and allocator reservations. Keep it
+	// separate from the owned-byte counter decremented during unregistration.
+	auto used_memory = m_graphics.CanReportMemoryUsage()
+	    ? m_graphics.GetDeviceMemoryUsage() : m_total_used_memory;
+	if (used_memory < m_trigger_gc_memory) {
 		return;
 	}
 	const auto collect = [&](bool allow_aggressive) {
-		bool           pressured  = m_total_used_memory >= m_pressure_gc_memory;
-		bool           aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
+		bool           pressured  = used_memory >= m_pressure_gc_memory;
+		bool           aggressive = allow_aggressive && used_memory >= m_critical_gc_memory;
 		const uint64_t age       = std::min<uint64_t>(aggressive ? 160 : pressured ? 80 : 16, tick);
 		size_t         deletions = aggressive ? 40 : pressured ? 20 : 10;
 		std::vector<ImageId> candidates;
@@ -2007,19 +2008,20 @@ void TextureCache::RunGarbageCollector() {
 					continue;
 				}
 			}
+			used_memory -= std::min(used_memory, owner->AccountedSize());
 			FreeImage(id);
-			if (m_total_used_memory < m_critical_gc_memory && aggressive) {
+			if (used_memory < m_critical_gc_memory && aggressive) {
 				deletions >>= 2;
 				aggressive = false;
 			}
-			if (m_total_used_memory < m_pressure_gc_memory && pressured) {
+			if (used_memory < m_pressure_gc_memory && pressured) {
 				deletions >>= 1;
 				pressured = false;
 			}
 		}
 	};
 	collect(false);
-	if (m_total_used_memory >= m_critical_gc_memory) {
+	if (used_memory >= m_critical_gc_memory) {
 		collect(true);
 	}
 }

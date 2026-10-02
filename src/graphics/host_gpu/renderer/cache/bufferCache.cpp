@@ -597,14 +597,15 @@ bool BufferCache::IsRegionCpuModified(uint64_t vaddr, uint64_t size) {
 
 void BufferCache::RunGarbageCollector() {
 	const auto tick = m_gc_tick++;
-	if (m_graphics.CanReportMemoryUsage()) {
-		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
-	}
-	if (m_total_used_memory < m_trigger_gc_memory) {
+	// Driver usage includes other caches and allocator reservations. Keep it
+	// separate from the owned-byte counter decremented during unregistration.
+	const auto used_memory = m_graphics.CanReportMemoryUsage()
+	    ? m_graphics.GetDeviceMemoryUsage() : m_total_used_memory;
+	if (used_memory < m_trigger_gc_memory) {
 		return;
 	}
 
-	const bool     aggressive = m_total_used_memory >= m_critical_gc_memory;
+	const bool     aggressive = used_memory >= m_critical_gc_memory;
 	const uint64_t age        = std::min<uint64_t>(aggressive ? 80 : 160, tick);
 	const size_t   limit      = aggressive ? 64 : 32;
 

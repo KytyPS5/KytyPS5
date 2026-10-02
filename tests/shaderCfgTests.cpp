@@ -276,6 +276,23 @@ bool SpirvContainsOpcode(const std::vector<uint32_t> &binary, uint32_t opcode) {
   return false;
 }
 
+// True when some OpBranchConditional has the same label for both targets.
+bool SpirvHasDegenerateBranchConditional(const std::vector<uint32_t> &binary) {
+  for (size_t i = 5; i < binary.size();) {
+    const uint32_t word = binary[i];
+    const uint32_t word_count = word >> 16u;
+    if (word_count == 0 || i + word_count > binary.size()) {
+      return false;
+    }
+    // OpBranchConditional: condition, true label, false label, optional weights.
+    if ((word & 0xffffu) == 250 && word_count >= 4 && binary[i + 2] == binary[i + 3]) {
+      return true;
+    }
+    i += word_count;
+  }
+  return false;
+}
+
 uint32_t SpirvInstructionOpcodeCount(const std::vector<uint32_t> &binary,
                                      uint32_t opcode) {
   uint32_t count = 0;
@@ -7784,6 +7801,46 @@ void TestNewShaderRecompilerCfgPostEndTargetMergePS() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestNewShaderRecompilerCfgIdenticalBranchTargets() {
+  using namespace ShaderRecompiler;
+
+  // An `if` whose arm was emptied leaves a conditional branch with identical targets. The
+  // emitter must lower it to OpBranch: SPIRV-Cross drops everything after a selection whose
+  // OpBranchConditional targets equal its merge.
+  const uint32_t shader[] = {EncodeSopp(0x01)};
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  auto result = RecompileForTest(shader, options);
+  Check(!result.program.dispatcher_fallback,
+        "identical-target fixture did not select structured mode");
+
+  auto program = std::move(result.program);
+  program.blocks.clear();
+  program.block_info.clear();
+  program.block_storage.clear();
+  const auto add_block = [&](uint32_t id) {
+    program.block_storage.push_back(std::make_unique<IR::Block>());
+    program.blocks.push_back(program.block_storage.back().get());
+    program.block_info.push_back({.id = id});
+    return program.block_storage.back().get();
+  };
+  auto *entry = add_block(0);
+  auto *merge = add_block(1);
+  entry->AddBranch(merge);
+  auto &branch = program.block_info[0];
+  branch.terminator.kind = CFG::TerminatorKind::ConditionalBranch;
+  branch.terminator.true_block = 1;
+  branch.terminator.false_block = 1;
+  branch.terminator.merge_block = 1;
+  branch.condition = IR::Value(true);
+  program.block_info[1].terminator.kind = CFG::TerminatorKind::Return;
+
+  const auto spirv = Spirv::EmitProgram(program, options.input_info);
+  Check(!spirv.empty(), "identical-target branch produced no SPIR-V");
+  Check(!SpirvHasDegenerateBranchConditional(spirv),
+        "SPIR-V has OpBranchConditional with identical targets");
+  CheckSpirvBinaryValidates(spirv);
+}
+
 void TestNewShaderRecompilerCfgLoopBreakContinue() {
   const uint32_t shader[] = {
       EncodeSMovB32(0, 128),       // s0 = 0
@@ -14354,6 +14411,7 @@ int main() {
   TestNewShaderRecompilerStructuredU64Phi();
   TestNewShaderRecompilerCfgTerminalExitMergePS();
   TestNewShaderRecompilerCfgPostEndTargetMergePS();
+  TestNewShaderRecompilerCfgIdenticalBranchTargets();
   TestNewShaderRecompilerCfgLoopBreakContinue();
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
   TestNewShaderRecompilerCfgLoopHeaderDynamicScalarBufferLoadStructured();

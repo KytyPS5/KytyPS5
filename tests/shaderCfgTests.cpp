@@ -14283,6 +14283,14 @@ void TestZeroBranchBallotIgnoresInactiveLanes() {
   Check(SpirvInstructionOpcodeCount(zero.spirv, 168u) >
             SpirvInstructionOpcodeCount(nonzero.spirv, 168u),
         "an ExecZero branch on a split wave did not ballot the inverted condition");
+  // The ballot is reduced with OpIEqual (170) for EXECZ and OpINotEqual (171) for EXECNZ; the
+  // fixtures contain no other integer comparisons, so a swapped direction shows in either count.
+  Check(SpirvInstructionOpcodeCount(zero.spirv, 170u) >
+            SpirvInstructionOpcodeCount(nonzero.spirv, 170u),
+        "an ExecZero branch did not reduce the ballot with OpIEqual");
+  Check(SpirvInstructionOpcodeCount(nonzero.spirv, 171u) >
+            SpirvInstructionOpcodeCount(zero.spirv, 171u),
+        "an ExecNonZero branch did not reduce the ballot with OpINotEqual");
 }
 
 #include "ShaderRayTracingTests.inc"

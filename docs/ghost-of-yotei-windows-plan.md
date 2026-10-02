@@ -1,5 +1,24 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **2 октября 2026 года, 18:09 UTC** (та же установленная сборка
+SHA-256 `4c92009ed90e9a6a41309c4fb45eff1ae6f6af98f85570d1d6a6832efd742919`):
+
+- Дополнительный ограниченный запуск с `ReadbackStart=90`:
+  `_Build/runs/yotei-integrated-20261002-180746-presentprobe-gpuav`,
+  `exit=321`, `maxShown=86`, `coloredProven=false`, файла readback нет.
+  При первой попытке чтения кадра Vulkan validation обнаружил несоответствие
+  layout: подготовленный image остаётся `TRANSFER_DST_OPTIMAL`, а capture
+  вызывает `copyImageToBuffer` с `TRANSFER_SRC_OPTIMAL`. Это независимый
+  блокер диагностического readback; необходимая синтетическая регрессия
+  записана в `docs/emulator-test-debt.md`. Видимые пиксели и меню PENDING.
+- Для действительного SRT alias предыдущего запуска IR shader
+  `34e090c623ad611c` показывает семь `StoreBufferU32x4`; индекс одной
+  группы записей зависит от значения, прочитанного из буфера
+  (`ReadConstBuffer` → low16 × 7). Его нельзя объявить out-of-bounds по
+  одному descriptor. Барьер в shader не доказывает порядок между рабочими
+  группами; alias guard сохранён. Требуется численная регрессия для
+  согласованности чтения и записи между invocations.
+
 Checkpoint **2 октября 2026 года, 17:58 UTC** (native Windows; source
 `5c734f0e` + общее исправление `OOB_SELECT=0, STRIDE=0`, впоследствии
 сохранённое локальным коммитом `fea16d46`):

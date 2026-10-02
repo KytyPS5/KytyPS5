@@ -1,5 +1,25 @@
 # Emulator regression test debt
 
+## Prepared-frame readback layout transition (2026-10-02)
+
+Bounded native retry `_Build/runs/yotei-integrated-20261002-180746-presentprobe-gpuav`
+on installed exe SHA-256 `4c92009ed90e9a6a41309c4fb45eff1ae6f6af98f85570d1d6a6832efd742919`
+set `ReadbackStart=90` and exited 321 at shown 86, with no readback file or
+pixel proof. The fatal validation message in `_kyty.txt` reports that a
+`vkQueueSubmit` copy expects a prepared image in `TRANSFER_SRC_OPTIMAL` while
+its current layout is `TRANSFER_DST_OPTIMAL`. This is on the optional
+presentation readback path, before the later immutable-SRT alias seen in a
+run with `ReadbackStart=180`.
+
+`Presenter::Frame::CopyFrom` leaves the frame in transfer-destination layout;
+`CapturePreparedFrame` submits `copyImageToBuffer` with transfer-source layout
+without a transition. Required synthetic RED: exercise the prepared-frame
+copy followed by optional capture with Vulkan validation and assert the
+image layout/transfer access is correct at submission. Cover guest-source
+capture and ordinary presentation when capture is disabled. Only then correct
+the shared presentation readback transition and rerun the same test and a
+bounded game readback. Do not infer visible pixels from `shown`.
+
 ## Immutable SRT source aliases a writable buffer (2026-10-02)
 
 Native retry `_Build/runs/yotei-integrated-20261002-161240-menucheck-gpuav-sync`

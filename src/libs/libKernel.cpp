@@ -1797,6 +1797,12 @@ int KYTY_SYSV_ABI KernelRtldThreadAtexitDecrement(uint64_t* /*c*/) {
 	return 0;
 }
 
+static uint64_t KYTY_SYSV_ABI KernelGetAvailableCpumask() {
+	PRINT_NAME();
+
+	return 0x1fff;
+}
+
 static KYTY_SYSV_ABI int KernelGetCurrentCpu() {
 	PRINT_NAME();
 
@@ -3340,6 +3346,7 @@ LIB_DEFINE(InitLibKernel_1) {
 	LIB_FUNC("vYU8P9Td2Zo", KernelAioInitializeImpl);
 	LIB_FUNC("WhCc1w3EhSI", LibKernel::KernelSetThreadAtexitReport);
 	LIB_FUNC("WkwEd3N7w0Y", LibKernel::KernelInstallExceptionHandler);
+	LIB_FUNC("La9uyZv4Kvw", LibKernel::KernelGetAvailableCpumask);
 	LIB_FUNC("g0VTBxfJyu0", LibKernel::KernelGetCurrentCpu);
 	LIB_FUNC("wzvqT4UqKX8", LibKernel::KernelLoadStartModule);
 	LIB_FUNC("Xjoosiw+XPI", LibKernel::KernelUuidCreate);

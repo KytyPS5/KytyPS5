@@ -428,6 +428,20 @@ inline constexpr std::array<VideoOutFormatPolicy, 7> VIDEO_OUT_FORMAT_POLICIES {
 	return true;
 }
 
+// Unlike a register clear, a DWORD fill repeats the same word across the entire pixel.
+// Keep this separate: the first register word alone cannot describe a 64-bit color.
+[[nodiscard]] inline bool DecodeColorDwordFill(vk::Format format, uint32_t packed,
+                                               vk::ClearColorValue& clear) {
+	if (format == vk::Format::eR16G16B16A16Sfloat) {
+		if (packed != 0) {
+			return false;
+		}
+		clear = vk::ClearColorValue {};
+		return true;
+	}
+	return DecodePackedColorClear(format, packed, clear);
+}
+
 [[nodiscard]] inline bool DecodePackedStencilClear(uint32_t packed, uint8_t& clear) {
 	const auto value = static_cast<uint8_t>(packed);
 	if (packed != static_cast<uint32_t>(value) * 0x01010101u) {

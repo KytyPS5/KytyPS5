@@ -14914,6 +14914,20 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
     Check(CountSourceOccurrences(DisassembleSpirvBinary(guarded_endless.spirv),
                                  "OpUGreaterThanEqual") == 1u,
           "loop watchdog left a loop without any exit unbounded");
+    // A conditional latch that branches straight back to the header: the cap is folded
+    // into the latch condition, so there is one compare and one select.
+    const uint32_t direct_latch[] = {
+        EncodeSopp(0x02, 0),       // loop header -> conditional latch
+        EncodeSopc(0x06, 0, 0),    // s_cmp_eq_u32 s0, s0
+        EncodeSopp(0x05, 0xfffdu), // direct latch backedge -> loop header
+        0xbf810000u,
+    };
+    const auto guarded_latch = RecompileForTest(direct_latch, options);
+    CheckSpirvBinaryValidates(guarded_latch.spirv);
+    const auto guarded_latch_source = DisassembleSpirvBinary(guarded_latch.spirv);
+    Check(CountSourceOccurrences(guarded_latch_source, "OpUGreaterThanEqual") == 1u &&
+              CountSourceOccurrences(guarded_latch_source, "OpSelect") == 1u,
+          "loop watchdog did not guard the direct conditional latch");
     const auto guarded_dispatcher = RecompileForTest(dispatcher, options);
     CheckSpirvBinaryValidates(guarded_dispatcher.spirv);
     Check(SpirvInstructionOpcodeCount(guarded_dispatcher.spirv, 245u) == 3u,

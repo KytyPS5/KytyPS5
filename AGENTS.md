@@ -59,3 +59,32 @@ meaningful fixes, shader batch audits and game retries. Record the tested source
 artifact/log references, current runtime blocker and next required work. Distinguish build,
 CPU audit, GPU regression, rendered frame, menu and gameplay results. Keep untested stages
 explicitly pending; group batch failures by shared cause and note overlapping shader counts.
+
+## Resume Ghost of Yōtei work
+
+When the user says "continue" or another agent takes over this task, use the
+first checkpoint in [the launch plan](docs/ghost-of-yotei-windows-plan.md) as the
+current progress record and [the test debt](docs/emulator-test-debt.md) for
+unproved cases. Treat both as leads to verify, not as a substitute for current
+evidence. Read the shared-context `README.md` and latest KytyPS5 handoff in
+`C:\Users\fxpw\.codex\shared-context` (WSL:
+`/mnt/c/Users/fxpw/.codex/shared-context`); add a new concise handoff after
+meaningful work without replacing older notes.
+
+Before editing, inspect the current branch, commits, `git status` and diff;
+preserve all existing work. Check the newest `_Build/runs/*/run.json`, its
+`stdout.txt`, `stderr.txt`, `_kyty.txt`, any readback, and the exact installed
+executable hash. Check whether the last emulator, test, Ninja or MSBuild process
+is still running; a prior chat may have ended while a bounded run continued.
+Only stop processes owned by this task. A shown-frame counter, compiled SPIR-V
+or successful pipeline does not prove visible pixels or a menu.
+
+For each new blocker, first record the required synthetic regression in the
+test debt, then follow the regression-first rules above. Build the native
+Windows target through `_Build/windows-local.cmd`, which initializes
+`vcvars64.bat`; serialize builds and keep their source inputs fixed. Use bounded
+test and game runs, record their artifact paths and process cleanup, and update
+the launch plan only with verified results. Commit a completed fix separately.
+Push only when the current conversation authorizes it; never force-push to
+resolve a conflict. Keep the first nonzero frame, menu and gameplay as separate
+milestones.

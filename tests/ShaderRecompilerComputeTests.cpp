@@ -35343,11 +35343,13 @@ void CheckPm4NativeTargetGeometryRegisters(RenderContext &renderer) {
                                 g_hw_ctx_indirect_func[0x0314u] == nullptr;
 
   // Removed GCN shader resource/checksum/queue registers. Numeric offsets keep
-  // this check independent of the deleted legacy names.
-  constexpr std::array<uint32_t, 19> legacy_shader_slots{
-      0x000u, 0x001u, 0x002u, 0x003u, 0x030u, 0x0b0u, 0x0bcu, 0x130u,
-      0x14au, 0x14bu, 0x20eu, 0x20fu, 0x210u, 0x211u, 0x216u, 0x217u,
-      0x219u, 0x21au, 0x27du,
+  // this check independent of the deleted legacy names. SH 0x2/0x3 are no
+  // longer holes: Hades II's indirect SH writes made them the PS user-data
+  // address lo/hi words (#964), so they are asserted handled below instead.
+  constexpr std::array<uint32_t, 17> legacy_shader_slots{
+      0x000u, 0x001u, 0x030u, 0x0b0u, 0x0bcu, 0x130u, 0x14au, 0x14bu,
+      0x20eu, 0x20fu, 0x210u, 0x211u, 0x216u, 0x217u, 0x219u, 0x21au,
+      0x27du,
   };
   for (const auto offset : legacy_shader_slots) {
     legacy_slots_are_unhandled &= g_hw_sh_func[offset] == nullptr &&
@@ -35382,6 +35384,11 @@ void CheckPm4NativeTargetGeometryRegisters(RenderContext &renderer) {
           legacy_slots_are_unhandled && native_pace_slots_are_handled &&
               native_index_size_packet_complete,
           "a removed GCN register has a handler or a native packet is not handled");
+  Require("Pm4NativeTargetGeometry", "PS user-data address slots",
+          g_hw_sh_func[0x002u] != nullptr && g_hw_sh_func[0x003u] != nullptr &&
+              g_hw_sh_indirect_func[0x002u] != nullptr &&
+              g_hw_sh_indirect_func[0x003u] != nullptr,
+          "SPI_SHADER_USER_DATA_ADDR_LO/HI_PS lost their handlers");
   std::printf("[host]    %-32s ok\n", "Pm4NativeTargetGeometry");
 }
 

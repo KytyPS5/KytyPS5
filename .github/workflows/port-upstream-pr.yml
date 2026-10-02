@@ -1,0 +1,268 @@
+# Port an upstream PR into this fork, resolve conflicts, and open a review PR.
+#
+# One-time setup
+#   1. Settings > Actions > General > "Allow GitHub Actions to create and approve pull requests"
+#   2. (Optional) Secret SYNC_PAT   - PAT with repo + workflow scopes. Needed if the PR touches
+#                                     .github/workflows or if you want CI to run on the opened PR.
+#   3. (Optional) Secret ANTHROPIC_API_KEY - enables AI conflict resolution / repair.
+#   4. (Optional) Variable ANTHROPIC_MODEL - defaults to claude-sonnet-5-5.
+#
+# Ladder: cherry-pick -> cherry-pick (patience/rename-aware) -> squashed 3-way apply -> AI for leftovers.
+
+name: Port Upstream PR
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Upstream PR number"
+        required: true
+        type: string
+      upstream_repo:
+        description: "owner/repo of upstream (blank = auto-detect fork parent)"
+        required: false
+        default: ""
+        type: string
+      target_branch:
+        description: "Fork branch to base the port on (blank = default branch)"
+        required: false
+        default: ""
+        type: string
+      use_ai:
+        description: "Use Claude to resolve leftover conflicts / repair failing verify"
+        required: false
+        default: true
+        type: boolean
+      verify_command:
+        description: "Optional command to validate the port (e.g. 'npm ci && npm test')"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: port-upstream-pr-${{ inputs.pr_number }}
+  cancel-in-progress: false
+
+jobs:
+  port:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.SYNC_PAT || secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      PR_NUMBER: ${{ inputs.pr_number }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Resolve upstream PR
+        env:
+          UP_INPUT: ${{ inputs.upstream_repo }}
+          TARGET_INPUT: ${{ inputs.target_branch }}
+        run: |
+          set -euo pipefail
+          UP="${UP_INPUT:-$(gh api "repos/$GITHUB_REPOSITORY" --jq '.parent.full_name // empty')}"
+          [ -n "$UP" ] || { echo "::error::Repo is not a fork and no upstream_repo given"; exit 1; }
+          BASE="${TARGET_INPUT:-$(gh api "repos/$GITHUB_REPOSITORY" --jq .default_branch)}"
+          PR_JSON=$(gh api "repos/$UP/pulls/$PR_NUMBER")
+          jq -r '.body // ""' <<<"$PR_JSON" > "$RUNNER_TEMP/pr_body.md"
+          {
+            echo "UP=$UP"
+            echo "BASE=$BASE"
+            echo "TARGET_REF=origin/$BASE"
+            echo "BRANCH=upstream-pr/$PR_NUMBER"
+            echo "PR_TITLE=$(jq -r .title <<<"$PR_JSON" | tr -d '\r\n')"
+            echo "PR_URL=$(jq -r .html_url <<<"$PR_JSON")"
+            echo "PR_STATE=$(jq -r 'if .merged then "merged" else .state end' <<<"$PR_JSON")"
+            echo "AUTHOR=$(jq -r .user.login <<<"$PR_JSON")"
+            echo "AUTHOR_ID=$(jq -r .user.id <<<"$PR_JSON")"
+            echo "UP_BASE_REF=$(jq -r .base.ref <<<"$PR_JSON")"
+            echo "UP_BASE_SHA=$(jq -r .base.sha <<<"$PR_JSON")"
+            echo "PR_BODY_FILE=$RUNNER_TEMP/pr_body.md"
+          } >> "$GITHUB_ENV"
+
+      - name: Fetch PR and prepare branch
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          [ "$PR_STATE" = "open" ] || echo "::warning::Upstream PR is $PR_STATE"
+
+          git remote add upstream "https://github.com/$UP.git"
+          git fetch --no-tags upstream \
+            "+refs/heads/$UP_BASE_REF:refs/remotes/upstream/$UP_BASE_REF" \
+            "+refs/pull/$PR_NUMBER/head:refs/remotes/pr/$PR_NUMBER"
+
+          PR_BASE=$(git merge-base "pr/$PR_NUMBER" "$UP_BASE_SHA" 2>/dev/null \
+                    || git merge-base "pr/$PR_NUMBER" "upstream/$UP_BASE_REF")
+          FORK_BASE=$(git merge-base "origin/$BASE" "upstream/$UP_BASE_REF" 2>/dev/null \
+                      || git rev-list --max-parents=0 "origin/$BASE" | tail -1)
+          {
+            echo "PR_BASE=$PR_BASE"
+            echo "PR_REF=pr/$PR_NUMBER"
+            echo "FORK_BASE=$FORK_BASE"
+          } >> "$GITHUB_ENV"
+
+          git checkout -q -B "$BRANCH" "origin/$BASE"
+
+      - name: Port (merge/rebase ladder)
+        run: |
+          set +e
+          set -u
+          START=$(git rev-parse HEAD)
+          COMMITS=$(git rev-list --reverse --topo-order --no-merges "$PR_BASE..$PR_REF")
+          [ -n "$COMMITS" ] || { echo "::error::PR has no commits to port"; exit 1; }
+
+          reset_tree() { git cherry-pick --abort >/dev/null 2>&1; git reset -q --hard "$START"; git clean -fdq; }
+          pick() { echo "::group::$1"; shift; git cherry-pick -x --empty=drop "$@" $COMMITS; local rc=$?; echo "::endgroup::"; return $rc; }
+          success() { echo "STRATEGY=$1" >> "$GITHUB_ENV"; echo "NEEDS_AI=false" >> "$GITHUB_ENV"; echo "✅ $1"; exit 0; }
+
+          pick "1/3 cherry-pick (default)" \
+            && success "cherry-pick"
+          reset_tree
+
+          pick "2/3 cherry-pick (patience, whitespace-insensitive, rename-aware)" \
+            -X patience -X ignore-space-change -X find-renames=30 \
+            && success "cherry-pick (patience + rename-aware)"
+          reset_tree
+
+          echo "::group::3/3 squashed 3-way apply"
+          git diff --binary "$PR_BASE" "$PR_REF" > "$RUNNER_TEMP/pr.patch"
+          echo "SQUASHED=true" >> "$GITHUB_ENV"
+          echo "STRATEGY=squashed 3-way apply" >> "$GITHUB_ENV"
+          if git apply --3way --whitespace=nowarn "$RUNNER_TEMP/pr.patch"; then
+            echo "NEEDS_AI=false" >> "$GITHUB_ENV"
+          else
+            if [ -z "$(git diff --name-only --diff-filter=U)" ]; then
+              # no text conflicts, patch simply doesn't fit: fall back to rejects
+              git reset -q --hard "$START"; git clean -fdq
+              git apply --reject --whitespace=nowarn "$RUNNER_TEMP/pr.patch"
+            fi
+            echo "NEEDS_AI=true" >> "$GITHUB_ENV"
+          fi
+          echo "::endgroup::"
+          exit 0
+
+      - name: AI conflict resolution
+        if: env.NEEDS_AI == 'true' && inputs.use_ai
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_MODEL: ${{ vars.ANTHROPIC_MODEL }}
+        run: python3 .github/scripts/ai_resolve.py resolve
+
+      - name: Commit
+        run: |
+          set -u
+          if [ "${SQUASHED:-false}" = true ]; then
+            UNRESOLVED=$( { git diff --name-only --diff-filter=U; git ls-files --others --exclude-standard | grep '\.rej$'; } || true )
+            if [ -n "$UNRESOLVED" ]; then
+              echo "MANUAL_REQUIRED=true" >> "$GITHUB_ENV"
+              echo "::warning::Unresolved conflicts remain:"; echo "$UNRESOLVED"
+            fi
+            git add -A
+            git commit -q \
+              --author="$AUTHOR <${AUTHOR_ID}+${AUTHOR}@users.noreply.github.com>" \
+              -m "$PR_TITLE" -m "Ported from upstream PR: $PR_URL" \
+              || { echo "::error::Nothing to commit (already applied?)"; exit 1; }
+          fi
+          if [ "$(git rev-list --count "origin/$BASE..HEAD")" = "0" ]; then
+            echo "::error::Nothing to port - changes appear to be present in the fork already"
+            exit 1
+          fi
+
+      - name: Verify (with optional AI repair)
+        if: inputs.verify_command != ''
+        env:
+          VERIFY_COMMAND: ${{ inputs.verify_command }}
+          USE_AI: ${{ inputs.use_ai }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_MODEL: ${{ vars.ANTHROPIC_MODEL }}
+        run: |
+          set +e
+          export VERIFY_LOG="$RUNNER_TEMP/verify.log"
+          VERIFY=failed
+          for attempt in 0 1 2; do
+            bash -c "$VERIFY_COMMAND" > "$VERIFY_LOG" 2>&1
+            if [ $? -eq 0 ]; then VERIFY=passed; break; fi
+            tail -n 40 "$VERIFY_LOG"
+            [ "$attempt" -lt 2 ] && [ "$USE_AI" = true ] && [ -n "$ANTHROPIC_API_KEY" ] || break
+            python3 .github/scripts/ai_resolve.py repair || break
+            git commit -q -m "Adapt ported PR to fork changes (AI repair $((attempt+1)))" || break
+          done
+          echo "VERIFY=$VERIFY" >> "$GITHUB_ENV"
+          echo "Verify: $VERIFY"
+          exit 0
+
+      - name: Push and open PR
+        run: |
+          set -euo pipefail
+          REPORT="$RUNNER_TEMP/ai_report.json"
+          [ -f "$REPORT" ] || echo '{"resolved":[],"unresolved":[],"repairs":[]}' > "$REPORT"
+          AI_USED=$(jq '((.resolved|length)+(.repairs|length))>0' "$REPORT")
+
+          BODY="$RUNNER_TEMP/port_body.md"
+          {
+            echo "### 🔀 Port of upstream PR"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Upstream PR | $PR_URL |"
+            echo "| Original author | $AUTHOR |"
+            echo "| Based on | \`$BASE\` |"
+            echo "| Strategy | $STRATEGY |"
+            echo "| Verify | ${VERIFY:-skipped} |"
+            echo
+            if [ "$(jq '.resolved|length' "$REPORT")" -gt 0 ]; then
+              echo "#### 🤖 AI-resolved conflicts — please review carefully"
+              jq -r '.resolved[] | "- `\(.path)` — \(.note)"' "$REPORT"; echo
+            fi
+            if [ "$(jq '.repairs|length' "$REPORT")" -gt 0 ]; then
+              echo "#### 🛠️ AI repairs after failed verify"
+              jq -r '.repairs[] | "- \(.files|join(", ")) — \(.note)"' "$REPORT"; echo
+            fi
+            if [ "$(jq '.unresolved|length' "$REPORT")" -gt 0 ] || [ "${MANUAL_REQUIRED:-false}" = true ]; then
+              echo "#### ⚠️ Needs manual resolution"
+              echo "Conflict markers / \`.rej\` files are committed in this branch."
+              jq -r '.unresolved[] | "- `\(.path)` — \(.reason)"' "$REPORT"; echo
+            fi
+            echo "#### Checklist"
+            echo "- [ ] No leftover conflict markers or \`.rej\` files"
+            echo "- [ ] Fork-specific behaviour preserved"
+            echo "- [ ] Tests / CI green"
+            echo
+            echo "<details><summary>Original upstream description</summary>"
+            echo
+            sed -E 's/@([A-Za-z0-9_-])/@\xe2\x80\x8b\1/g' "$PR_BODY_FILE"
+            echo
+            echo "</details>"
+          } > "$BODY"
+
+          git push --force origin "HEAD:refs/heads/$BRANCH"
+
+          for l in "upstream-port:0E8A16" "ai-assisted:8957E5" "needs-manual-resolution:D93F0B"; do
+            gh label create "${l%%:*}" --color "${l##*:}" --force >/dev/null 2>&1 || true
+          done
+          LABELS=(--label upstream-port)
+          DRAFT=()
+          [ "$AI_USED" = true ] && LABELS+=(--label ai-assisted) && DRAFT=(--draft)
+          if [ "${MANUAL_REQUIRED:-false}" = true ] || [ "${VERIFY:-}" = failed ]; then
+            LABELS+=(--label needs-manual-resolution); DRAFT=(--draft)
+          fi
+
+          EXISTING=$(gh pr list --head "$BRANCH" --base "$BASE" --state open --json number --jq '.[0].number // empty')
+          if [ -n "$EXISTING" ]; then
+            gh pr edit "$EXISTING" --title "[upstream #$PR_NUMBER] $PR_TITLE" --body-file "$BODY" "${LABELS[@]}"
+            gh pr comment "$EXISTING" --body "Branch re-synced from upstream PR ($STRATEGY)."
+            URL=$(gh pr view "$EXISTING" --json url --jq .url)
+          else
+            URL=$(gh pr create --base "$BASE" --head "$BRANCH" \
+                    --title "[upstream #$PR_NUMBER] $PR_TITLE" --body-file "$BODY" \
+                    "${LABELS[@]}" "${DRAFT[@]}")
+          fi
+          echo "PR: $URL"
+          { echo "## Ported upstream PR #$PR_NUMBER"; echo; echo "$URL"; echo; cat "$BODY"; } >> "$GITHUB_STEP_SUMMARY"

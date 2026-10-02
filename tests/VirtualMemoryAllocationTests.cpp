@@ -271,6 +271,72 @@ void RunTest(void (*test_func)()) {
 	}
 }
 
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+struct MisalignedSysvHostEntryState {
+	bool      called        = false;
+	uintptr_t sysv_body_rsp = 0;
+	uintptr_t ms_entry_rsp  = 0;
+};
+[[gnu::naked]] static KYTY_MS_ABI uintptr_t CaptureMsAbiEntryRsp() {
+	asm volatile("movq %rsp, %rax\n\t"
+	             "retq");
+}
+
+[[gnu::noinline]] static KYTY_SYSV_ABI void MisalignedSysvHostEntryTarget(
+    MisalignedSysvHostEntryState* state) {
+	asm volatile("movq %%rsp, %0" : "=r"(state->sysv_body_rsp) : : "memory");
+	state->ms_entry_rsp = CaptureMsAbiEntryRsp();
+	asm volatile("" : : : "memory");
+	state->called = true;
+}
+
+void TestWindowsMisalignedSysvHostEntry() {
+	const char* test = "WindowsMisalignedSysvHostEntry";
+	constexpr uint64_t code_size = 0x4000;
+
+	const auto mapping = Libs::LibKernel::Memory::AllocateRuntimeMemory(
+	    0, code_size, Common::VirtualMemory::Mode::ExecuteReadWrite,
+	    "misaligned_sysv_host_entry_test");
+	Check(test, mapping != 0, "failed to allocate executable trampoline");
+
+	Xbyak::CodeGenerator code(code_size, reinterpret_cast<void*>(mapping));
+
+	// This trampoline itself is entered with the Windows x64 ABI. Keep the two
+	// nonvolatile registers balanced while deliberately leaving RSP at 8 mod 16
+	// before CALL. The CALL therefore enters the SysV target at 0 mod 16 instead
+	// of the 8 mod 16 that a normal SysV callee expects.
+	code.push(code.rdi);
+	code.push(code.r12);
+	code.mov(code.rdi, code.rcx);
+	code.mov(code.rax, reinterpret_cast<uint64_t>(&MisalignedSysvHostEntryTarget));
+	code.call(code.rax);
+	code.pop(code.r12);
+	code.pop(code.rdi);
+	code.ret();
+
+	Check(test, Common::VirtualMemory::FlushInstructionCache(mapping, code.getSize()),
+	      "failed to flush generated trampoline");
+
+	using Trampoline = void (*)(MisalignedSysvHostEntryState*);
+	MisalignedSysvHostEntryState state {};
+	reinterpret_cast<Trampoline>(mapping)(&state);
+
+	const bool freed = Libs::LibKernel::Memory::FreeGuestMemory(mapping, code_size);
+
+	Check(test, state.called, "misaligned SysV target was not called");
+	Check(test, (state.ms_entry_rsp & 0x0f) == 0x08,
+	      "SysV host entry propagated a misaligned stack into an MS ABI call");
+	Check(test, freed, "failed to free generated trampoline");
+
+	std::printf("[host]    %-48s sysv_rsp_mod16=%zu ms_rsp_mod16=%zu ok\n", test,
+	            static_cast<size_t>(state.sysv_body_rsp & 0x0f),
+	            static_cast<size_t>(state.ms_entry_rsp & 0x0f));
+}
+#else
+void TestWindowsMisalignedSysvHostEntry() {
+	std::printf("[host]    %-48s skipped\n", "WindowsMisalignedSysvHostEntry");
+}
+#endif
 VirtualQueryInfo Query(const char* test, uint64_t addr, int flags = 0) {
 	VirtualQueryInfo info {};
 	const int ret = Libs::LibKernel::Memory::KernelVirtualQuery(reinterpret_cast<const void*>(addr),
@@ -3279,6 +3345,12 @@ int main(int argc, char** argv) {
 		return g_failed_tests == 0 ? 0 : 1;
 	}
 #endif
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (argc == 2 && std::strcmp(argv[1], "--sysv-align-only") == 0) {
+		RunTest(TestWindowsMisalignedSysvHostEntry);
+		return g_failed_tests == 0 ? 0 : 1;
+	}
+#endif
 	if (argc == 2 && std::strcmp(argv[1], "--red-zone-patcher-only") == 0) {
 		RunTest(TestWindowsGuestRedZoneStaticPatcher);
 		return g_failed_tests == 0 ? 0 : 1;
@@ -3290,6 +3362,7 @@ int main(int argc, char** argv) {
 #if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	RunTest(TestPackedReciprocalSquareRoot);
 #endif
+	RunTest(TestWindowsMisalignedSysvHostEntry);
 	RunTest(TestWindowsGuestRedZoneStaticPatcher);
 	RunTest(TestProsperoArgumentAndInfoSizeContracts);
 	RunTest(TestGuestAddressSpaceOwnsReservationsBeforeBacking);

@@ -309,7 +309,7 @@ void TestFiniteImageRefreshReusesScalarReads() {
   DescriptorSource root;
   root.dword_count = 8;
   root.dwords.fill(Value(0u));
-  root.indirect_image.emplace().sources = {0, 1, 2, 1};
+  root.indirect_image.emplace(DescriptorSource::IndirectImage{}).sources = {0, 1, 2, 1};
   program.descriptor_sources.push_back(root);
   program.info.images.push_back({
       .source = 3,

@@ -270,6 +270,8 @@ int main() {
 	TestPatchedCrossingStore();
         TestShortStoreWithoutPaddingTraps();
         TestShortStoreViaInt3Padding();
+        TestShortStoreViaNopPadding();
+        TestShortStoreViaLongStoreDeadBytes();
         TestRipRelativeStore();
 
 	if (g_failures != 0) {

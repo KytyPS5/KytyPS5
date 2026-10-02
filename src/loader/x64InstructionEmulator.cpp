@@ -1166,10 +1166,13 @@ WideStoreSplitResult SplitWideStores(uint64_t address, uint64_t size, uint64_t* 
 			uint64_t                moved_original = 0;
 			std::array<uint64_t, 4> moved_ips {};
 			uint32_t                moved_count = 0;
-			// KYTY_WIDE_STORE_MOVE=hot limits moving to sites in the hot profile.
+			// Moving instructions is only safe when nothing jumps into them. The sweep sees direct
+			// branch targets only, not jump tables, computed jumps or landing pads, so by default
+			// only sites from the hot profile are moved. KYTY_WIDE_STORE_MOVE=all also moves at
+			// unprofiled sites.
 			static const bool move_all = [] {
 				const char* value = std::getenv("KYTY_WIDE_STORE_MOVE");
-				return value == nullptr || std::strcmp(value, "hot") != 0;
+				return value != nullptr && std::strcmp(value, "all") == 0;
 			}();
 			if (trap && (move_all || std::binary_search(hot_sites.begin(), hot_sites.end(),
 			                                            reinterpret_cast<uint64_t>(code)))) {

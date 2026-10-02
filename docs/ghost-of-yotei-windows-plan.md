@@ -1,5 +1,21 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **2 октября 2026 года, 18:19 UTC** (та же native сборка; её
+SHA-256 указан ниже):
+
+- Для обхода дефекта *диагностического* prepared-frame readback использован
+  существующий режим чтения из guest source: копия bounded runner
+  `_Build/run-menu-check-source-readback-20261002.ps1`, без изменения
+  production-кода. Запуск
+  `_Build/runs/yotei-integrated-20261002-181225-presentprobe-gpuav`
+  завершился `exit=321`, `maxShown=133` на том же действительном SRT alias
+  (в этой специализации dense buffer 6, source и writer
+  `0x5000f37f80+120`). `present-readback.txt` содержит 74 кадра 60–133:
+  каждый имеет `colored=0`, RGB min/max `0`; ненулевых RGB пикселей **нет**.
+  Меню и gameplay PENDING. Задача синтетической регрессии для согласованности
+  SRT остаётся первой; отдельный prepared-frame layout тест нужен для
+  обычного диагностического readback.
+
 Checkpoint **2 октября 2026 года, 18:09 UTC** (та же установленная сборка
 SHA-256 `4c92009ed90e9a6a41309c4fb45eff1ae6f6af98f85570d1d6a6832efd742919`):
 

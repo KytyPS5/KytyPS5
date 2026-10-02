@@ -20,6 +20,14 @@ capture and ordinary presentation when capture is disabled. Only then correct
 the shared presentation readback transition and rerun the same test and a
 bounded game readback. Do not infer visible pixels from `shown`.
 
+The existing guest-source readback option is a diagnostic workaround for this
+prepared-frame path. A copy of the bounded runner under `_Build` enabled it
+without changing production code. Run
+`_Build/runs/yotei-integrated-20261002-181225-presentprobe-gpuav` reached
+the same live SRT alias at shown 133; `present-readback.txt` contains 74
+frames 60–133, all `colored=0` with RGB min/max zero. The prepared-frame
+layout issue remains pending despite this valid source readback.
+
 ## Immutable SRT source aliases a writable buffer (2026-10-02)
 
 Native retry `_Build/runs/yotei-integrated-20261002-161240-menucheck-gpuav-sync`
@@ -75,6 +83,10 @@ candidate: immutable source `0x5000f37f80+120`, writer the identical 120-byte
 range, `STRIDE=8`, `NUM_RECORDS=15`, mode 0, origin 3, PC `0x1d94`.
 This remains a cross-invocation alias problem; do not extend the OOB exception
 to it. Readback starts at frame 180, so no current pixel/menu proof.
+Independent source-image readback of frames 60–133 in
+`_Build/runs/yotei-integrated-20261002-181225-presentprobe-gpuav` confirms
+all are black, then reaches the same alias (dense resource 6 in that
+specialization). There is still no nonzero frame or menu proof.
 
 ## Dynamic unsigned image sampler selection (2026-10-02)
 

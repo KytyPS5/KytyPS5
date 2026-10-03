@@ -132,7 +132,19 @@ void FaultManager::ProcessFaultBuffer() {
 		m_download_buffer.Invalidate(offset, PageFaultAreaSize);
 		RangeSet    fault_ranges;
 		const auto* faults = std::bit_cast<const uint64_t*>(mapped);
-		const auto  count  = static_cast<uint32_t>(faults[0]);
+		// The fault-buffer compute shader stops writing at MAX_PAGE_FAULTS but
+// keeps incrementing the counter, so faults[0] may exceed the number of
+// valid entries. Clamp to the capacity of one fault area to avoid reading
+// past the end of this area into the next area's bytes.
+const auto raw_count = static_cast<uint32_t>(faults[0]);
+const auto count     = (raw_count < MaxPageFaults - 1u)
+                           ? raw_count
+                           : static_cast<uint32_t>(MaxPageFaults - 1u);
+if (raw_count > MaxPageFaults - 1u) {
+	LOGF_COLOR(Log::Color::BrightYellow,
+	           "FaultManager: counter overflow clamped (%u -> %u)\n",
+	           raw_count, count);
+}
 		for (uint32_t index = 1; index <= count; ++index) {
 			const auto address = BufferCache::GuestAddress(faults[index]);
 			fault_ranges.Add(address, BufferCache::CACHING_PAGESIZE);

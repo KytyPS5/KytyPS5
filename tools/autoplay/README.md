@@ -82,6 +82,27 @@ virtualenv (or `python3`, if you installed `mcp` there yourself). Set `KYTY_GAME
 Claude Code, or pass the game to `start_game`. If `kyty` does not connect, register it with an
 absolute path: `claude mcp add kyty -- sh /path/to/KytyPS5/tools/autoplay/mcp_server.sh`.
 
+### Over the web (Cloudflare Tunnel)
+
+To let an agent that is not on this machine (for example a Claude Code cloud session) play, serve
+the same tools over HTTP and put a Cloudflare tunnel in front:
+
+```
+sh tools/autoplay/mcp_server.sh --http                  # prints the key for this run
+cloudflared tunnel --url http://127.0.0.1:8765          # second terminal; prints https://….trycloudflare.com
+```
+
+- The server listens on `127.0.0.1:8765/mcp` only (`--host`/`--port` change that); the tunnel
+  connects to it locally, so nothing is opened on your router.
+- **Every start generates a new random key** and prints it with ready-to-paste connection lines.
+  Requests without `Authorization: Bearer <key>` get 401. The key is never written to disk, so
+  stopping the server revokes it. Share it only with the agent you want to give control.
+- The agent connects with
+  `claude mcp add --transport http kyty https://<tunnel-host>/mcp --header "Authorization: Bearer <key>"`
+  (or the `.mcp.json` entry the banner prints), in a session started after that.
+- Anyone holding the key can start programs and press buttons on this machine until you stop the
+  server. A quick tunnel's URL changes every time `cloudflared` restarts; a named tunnel keeps it.
+
 | tool | |
 |---|---|
 | `start_game(game, args)` / `stop_game()` | launch (an interactive session, as `start`) / quit and get the verdict |

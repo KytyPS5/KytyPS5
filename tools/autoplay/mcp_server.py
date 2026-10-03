@@ -7,6 +7,14 @@ Register it with the `.mcp.json` at the repository root, or:
 
     claude mcp add kyty -- python3 tools/autoplay/mcp_server.py
 
+Over HTTP (for a remote agent, behind a Cloudflare tunnel):
+
+    sh tools/autoplay/mcp_server.sh --http            # listens on 127.0.0.1:8765/mcp
+    cloudflared tunnel --url http://127.0.0.1:8765    # in a second terminal
+
+Every start prints a new random key. Clients must send `Authorization: Bearer <key>`; anything else
+gets 401. The key is never stored, so restarting the server revokes it.
+
 Environment:
     KYTY_BUILD_DIR       build directory with kyty_emulator (default _Build/linux)
     KYTY_EMULATOR        path to kyty_emulator (default <build>/kyty_emulator)
@@ -20,7 +28,10 @@ Needs the `mcp` package (pip install -r tools/autoplay/requirements-mcp.txt); 1.
 from __future__ import annotations
 
 import argparse
+import hmac
+import json
 import os
+import secrets
 import re
 import sys
 import time
@@ -291,8 +302,83 @@ def build_server(tools: Optional[GameTools] = None):
     return server
 
 
-def main() -> None:
-    build_server().run("stdio")
+class BearerAuth:
+    """ASGI middleware: every HTTP request must carry `Authorization: Bearer <key>`."""
+
+    def __init__(self, app: Any, key: str):
+        self.app = app
+        self.expected = f"Bearer {key}".encode()
+
+    async def __call__(self, scope: dict, receive: Any, send: Any) -> None:
+        if scope["type"] == "http":
+            supplied = dict(scope.get("headers") or []).get(b"authorization", b"")
+            if not hmac.compare_digest(supplied, self.expected):
+                body = json.dumps({"error": "missing or wrong key: send Authorization: Bearer <key>, "
+                                   "as printed when the server started"}).encode()
+                await send({"type": "http.response.start", "status": 401,
+                            "headers": [(b"content-type", b"application/json"),
+                                        (b"www-authenticate", b"Bearer"),
+                                        (b"content-length", str(len(body)).encode())]})
+                await send({"type": "http.response.body", "body": body})
+                return
+        await self.app(scope, receive, send)
+
+
+def build_http_app(server: Any, key: str) -> Any:
+    """The streamable-HTTP MCP app behind the key check.
+
+    The SDK's DNS-rebinding protection only accepts localhost Host headers, and a Cloudflare tunnel
+    forwards its public hostname, so that check is replaced by the key: a page in someone's browser
+    cannot know it.
+    """
+    from mcp.server.transport_security import TransportSecuritySettings
+
+    security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
+    try:
+        app = server.streamable_http_app(transport_security=security)        # mcp 2.x
+    except TypeError:
+        server.settings.transport_security = security                        # mcp 1.x
+        app = server.streamable_http_app()
+    return BearerAuth(app, key)
+
+
+def http_banner(host: str, port: int, key: str) -> str:
+    local = f"http://{host}:{port}/mcp"
+    entry = {"mcpServers": {"kyty": {"type": "http", "url": "https://<your-tunnel-host>/mcp",
+                                     "headers": {"Authorization": f"Bearer {key}"}}}}
+    return f"""
+kyty MCP server listening on {local}
+
+  Key for this run (a new one is made on every start; share it only with the agent):
+
+      {key}
+
+  Expose it:     cloudflared tunnel --url http://{host}:{port}
+  Connect a Claude Code session to the tunnel:
+      claude mcp add --transport http kyty https://<your-tunnel-host>/mcp --header "Authorization: Bearer {key}"
+  or in .mcp.json:
+{json.dumps(entry, indent=2)}
+"""
+
+
+def main(argv: Optional[list[str]] = None) -> None:
+    parser = argparse.ArgumentParser(description="kyty MCP server")
+    parser.add_argument("--http", action="store_true",
+                        help="serve streamable HTTP with a per-start key instead of stdio")
+    parser.add_argument("--host", default=os.environ.get("KYTY_MCP_HOST", "127.0.0.1"),
+                        help="address to listen on (default 127.0.0.1; the tunnel connects locally)")
+    parser.add_argument("--port", type=int, default=int(os.environ.get("KYTY_MCP_PORT", "8765")))
+    args = parser.parse_args(argv)
+    server = build_server()
+    if not args.http:
+        server.run("stdio")
+        return
+
+    import uvicorn
+
+    key = secrets.token_urlsafe(32)
+    print(http_banner(args.host, args.port, key), file=sys.stderr, flush=True)
+    uvicorn.run(build_http_app(server, key), host=args.host, port=args.port, log_level="warning")
 
 
 if __name__ == "__main__":

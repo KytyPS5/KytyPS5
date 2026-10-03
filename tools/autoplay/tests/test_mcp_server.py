@@ -288,6 +288,102 @@ class StdioRoundTrip(unittest.TestCase):
             asyncio.run(asyncio.wait_for(scenario(), 120))
 
 
+@unittest.skipUnless(HAVE_MCP, "the mcp package is not installed")
+class HttpServer(unittest.TestCase):
+    """--http: a per-start key guards every request, and a tunnel's Host header is accepted."""
+
+    def setUp(self):
+        import re
+        import socket
+        import subprocess
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            self.port = sock.getsockname()[1]
+        self.proc = subprocess.Popen([sys.executable, str(HERE.parent / "mcp_server.py"), "--http",
+                                      "--port", str(self.port)],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(self.stop)
+        banner = ""
+        # The banner ends with the closing brace of the .mcp.json example.
+        while not banner.endswith("\n}\n"):
+            line = self.proc.stderr.readline()
+            if not line:
+                self.fail(f"server exited before printing its key:\n{banner}")
+            banner += line
+        self.banner = banner
+        self.key = re.search(r"^\s{6}(\S{40,})$", banner, re.M).group(1)
+        self.url = f"http://127.0.0.1:{self.port}/mcp"
+        self.wait_listening()
+
+    def stop(self):
+        self.proc.terminate()
+        try:
+            self.proc.wait(timeout=10)
+        except Exception:
+            self.proc.kill()
+
+    def wait_listening(self):
+        import socket
+        import time
+        for _ in range(100):
+            try:
+                with socket.create_connection(("127.0.0.1", self.port), timeout=0.2):
+                    return
+            except OSError:
+                time.sleep(0.1)
+        self.fail("server never listened")
+
+    def post(self, headers):
+        import urllib.error
+        import urllib.request
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-06-18", "capabilities": {},
+            "clientInfo": {"name": "test", "version": "0"}}}).encode()
+        request = urllib.request.Request(self.url, data=body, headers={
+            "Content-Type": "application/json", "Accept": "application/json, text/event-stream", **headers})
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return response.status
+        except urllib.error.HTTPError as error:
+            return error.code
+
+    def test_key_is_new_on_every_start_and_shown_with_connection_help(self):
+        self.assertIn("cloudflared tunnel --url", self.banner)
+        self.assertIn(f"Authorization: Bearer {self.key}", self.banner)
+        first = self.key
+        self.stop()
+        self.setUp()
+        self.assertNotEqual(first, self.key)
+
+    def test_requests_without_the_key_are_refused(self):
+        self.assertEqual(self.post({}), 401)
+        self.assertEqual(self.post({"Authorization": "Bearer wrong"}), 401)
+        self.assertEqual(self.post({"Authorization": self.key}), 401)          # no "Bearer "
+
+    def test_a_tunnel_hostname_is_accepted_with_the_key(self):
+        status = self.post({"Authorization": f"Bearer {self.key}", "Host": "kyty.example.trycloudflare.com"})
+        self.assertEqual(status, 200)
+
+    def test_mcp_client_with_the_key(self):
+        from mcp import ClientSession
+        from mcp.client.streamable_http import streamable_http_client
+        from mcp.shared._httpx_utils import create_mcp_http_client
+
+        async def scenario():
+            client = create_mcp_http_client(headers={"Authorization": f"Bearer {self.key}"})
+            async with client:
+                async with streamable_http_client(self.url, http_client=client) as streams:
+                    async with ClientSession(streams[0], streams[1]) as session:
+                        await session.initialize()
+                        names = {tool.name for tool in (await session.list_tools()).tools}
+                        self.assertIn("press", names)
+                        result = await session.call_tool("game_status", {})
+                        text = next(item.text for item in result.content if item.type == "text")
+                        self.assertIn("start_game first", json.loads(text)["error"])
+
+        asyncio.run(asyncio.wait_for(scenario(), 60))
+
+
 def launcher_python():
     """The interpreter tools/autoplay/mcp_server.sh would pick."""
     venv = HERE.parent / ".venv" / "bin" / "python"

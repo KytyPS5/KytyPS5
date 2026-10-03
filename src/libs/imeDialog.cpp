@@ -102,6 +102,11 @@ void NotifyVisibility(bool visible, uint64_t generation) {
 	}
 }
 
+void UpdateRevisionLocked() {
+	g_state.revision++;
+	g_revision.store(g_state.revision, std::memory_order_release);
+}
+
 int ValidateExtended(const ExtendedParam* extended) {
 	if (extended == nullptr) {
 		return OK;
@@ -177,6 +182,9 @@ int ValidateParam(const Param* param, const ExtendedParam* extended, std::u16str
 	if (!ReadBounded(param->input_text_buffer, param->max_text_length, initial)) {
 		return ERROR_INVALID_TEXT_BUFFER;
 	}
+	if (!ImeCommon::IsValidInputText(*initial, multiline)) {
+		return ERROR_INVALID_TEXT_BUFFER;
+	}
 	if (!ReadBounded(param->title, IME_DIALOG_MAX_TITLE_LENGTH, title)) {
 		return ERROR_INVALID_TITLE;
 	}
@@ -221,6 +229,7 @@ void ApplyFilterAndCommit() {
 	uint32_t       max_length = 0;
 	uint64_t       generation = 0;
 	uint64_t       revision   = 0;
+	bool           multiline  = false;
 	{
 		std::scoped_lock lock(g_mutex);
 		if (g_state.status == Status::None || (!g_state.input_changed && !g_state.commit_pending)) {
@@ -231,12 +240,14 @@ void ApplyFilterAndCommit() {
 		max_length            = g_state.param.max_text_length;
 		generation            = g_state.generation;
 		revision              = g_state.revision;
+		multiline             = (g_state.param.option & OPTION_MULTILINE) != 0;
 		g_state.input_changed = false;
 	}
 
 	if (filter != nullptr) {
 		std::u16string filtered;
-		if (ImeCommon::RunTextFilter(filter, source, IME_DIALOG_MAX_TEXT_LENGTH, &filtered)) {
+		if (ImeCommon::RunTextFilter(filter, source, IME_DIALOG_MAX_TEXT_LENGTH, &filtered) &&
+		    ImeCommon::IsValidInputText(filtered, multiline)) {
 			source = std::move(filtered);
 			ImeCommon::ClampText(&source, max_length);
 		}
@@ -253,8 +264,9 @@ void ApplyFilterAndCommit() {
 		}
 		return;
 	}
-	if (!g_state.input_changed) {
+	if (!g_state.input_changed && source != g_state.editor.GetText()) {
 		g_state.editor.ReplaceText(std::move(source), g_state.editor.GetCursor());
+		UpdateRevisionLocked();
 	}
 	const auto& committed =
 	    g_state.status == Status::Finished && g_state.end_status != EndStatus::Ok
@@ -278,10 +290,9 @@ bool FinishFromHost(uint64_t generation, EndStatus end_status) {
 		g_state.status         = Status::Finished;
 		g_state.end_status     = end_status;
 		g_state.commit_pending = true;
-		g_state.revision++;
+		UpdateRevisionLocked();
 		notify_generation = g_state.generation;
 		g_status.store(Status::Finished, std::memory_order_release);
-		g_revision.store(g_state.revision, std::memory_order_release);
 	}
 	NotifyVisibility(false, notify_generation);
 	return true;
@@ -554,6 +565,7 @@ bool HostInsertText(uint64_t generation, std::u16string_view text) {
 	}
 	g_state.input_changed  = true;
 	g_state.commit_pending = true;
+	UpdateRevisionLocked();
 	return true;
 }
 
@@ -564,12 +576,17 @@ bool HostBackspace(uint64_t generation) {
 	}
 	g_state.input_changed  = true;
 	g_state.commit_pending = true;
+	UpdateRevisionLocked();
 	return true;
 }
 
 bool HostMoveCursor(uint64_t generation, int delta) {
 	std::scoped_lock lock(g_mutex);
-	return MatchRunningGeneration(generation) && g_state.editor.MoveCursor(delta);
+	if (!MatchRunningGeneration(generation) || !g_state.editor.MoveCursor(delta)) {
+		return false;
+	}
+	UpdateRevisionLocked();
+	return true;
 }
 
 bool HostAccept(uint64_t generation) {

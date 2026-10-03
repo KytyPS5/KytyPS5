@@ -46749,6 +46749,7 @@ void CheckPm4NativeTargetGeometryRegisters(RenderContext &renderer) {
 
   // Removed GCN shader resource/checksum/queue registers. Numeric offsets keep
   // this check independent of the deleted legacy names.
+  // 0x002/0x003 are SPI_SHADER_USER_DATA_ADDR_LO/HI_PS, handled since #964.
   constexpr std::array<uint32_t, 17> legacy_shader_slots{
       0x000u, 0x001u, 0x030u, 0x0b0u, 0x0bcu, 0x130u,
       0x14au, 0x14bu, 0x20eu, 0x20fu, 0x210u, 0x211u, 0x216u, 0x217u,

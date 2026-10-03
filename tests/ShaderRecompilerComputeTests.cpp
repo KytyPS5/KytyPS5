@@ -19242,22 +19242,30 @@ void CheckSampledHtileArrayClearDiscovery() {
         {Prospero::TileMode::kStandard64KB, TileBlockFamily::Standard64KB},
         {Prospero::TileMode::kPrt, TileBlockFamily::Prt64KB},
     };
-    for (const auto format :
-         {Prospero::BufferFormat::k8Srgb, Prospero::BufferFormat::k8_8Srgb,
-          Prospero::BufferFormat::k9_9_9_5Float}) {
+    struct SampledTargetCase {
+      Prospero::BufferFormat format;
+      uint32_t render_target_bytes;
+    };
+    constexpr SampledTargetCase sampled_targets[] = {
+        {Prospero::BufferFormat::k8Srgb, 1},
+        {Prospero::BufferFormat::k8_8Srgb, 2},
+        {Prospero::BufferFormat::k9_9_9_5Float, 0},
+    };
+    for (const auto &test : sampled_targets) {
       TileTextureBlockLayout render_target{};
       TileTextureBlockLayout depth{};
+      const bool depth_supported = TileGetTextureBlockLayout(
+          test.format, Prospero::TileMode::kDepth, false, depth);
       Require(name, "RT sampled-view format policy",
-              TileGetTextureBlockLayout(format,
+              TileGetTextureBlockLayout(test.format,
                                         Prospero::TileMode::kRenderTarget,
                                         false, render_target) &&
                   render_target.block.family ==
                       TileBlockFamily::RenderTarget64KB &&
-                  !TileGetTextureBlockLayout(format,
-                                             Prospero::TileMode::kDepth,
-                                             false, depth),
-              "an uncompressed sampled view could not reuse RT-tiled storage "
-              "or entered the depth tile family");
+                  depth_supported == (test.render_target_bytes != 0) &&
+                  (!depth_supported || depth.block.bytes_per_element ==
+                                           test.render_target_bytes),
+              "RT sampled-view tile geometry or depth-family admission disagrees with format size");
     }
     {
       TileTextureBlockLayout compressed{};
@@ -40454,6 +40462,29 @@ void CheckEmbeddedFetchVertexOffset() {
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 void CheckRenderTargetFormatContract() {
+  const auto r8_srgb = TextureGetRenderTargetFormat(
+      Prospero::ChannelLayout::k8, Prospero::ChannelType::kSrgb,
+      Prospero::ChannelOrder::kStandard);
+  Require("RenderTargetFormat", "R8 SRGB element size",
+          r8_srgb.format == vk::Format::eR8Unorm &&
+              r8_srgb.bytes_per_element == 1u &&
+              Prospero::RenderTargetBytesPerElement(
+                  Prospero::BufferFormat::k8Srgb) == 1u,
+          "single-channel SRGB target lost its one-byte storage footprint");
+  const auto rg8_srgb = TextureGetRenderTargetFormat(
+      Prospero::ChannelLayout::k8_8, Prospero::ChannelType::kSrgb,
+      Prospero::ChannelOrder::kStandard);
+  Require("RenderTargetFormat", "RG8 SRGB element size",
+          rg8_srgb.format == vk::Format::eR8G8Unorm &&
+              rg8_srgb.bytes_per_element == 2u &&
+              Prospero::RenderTargetBytesPerElement(
+                  Prospero::BufferFormat::k8_8Srgb) == 2u,
+          "two-channel SRGB target lost its two-byte storage footprint");
+  Require("RenderTargetFormat", "unsupported 16-bit SRGB",
+          !Prospero::ResolveRenderTargetFormat(Prospero::ChannelLayout::k16,
+                                               Prospero::ChannelType::kSrgb)
+               .IsValid(),
+          "the unsupported 16-bit SRGB encoding was admitted");
   const auto r8_uint = TextureGetRenderTargetFormat(
       Prospero::ChannelLayout::k8, Prospero::ChannelType::kUInt,
       Prospero::ChannelOrder::kStandard);
@@ -42418,25 +42449,27 @@ void CheckRenderTargetTiledSampledFormatLayout() {
     Prospero::BufferFormat sampled;
     Prospero::BufferFormat same_width;
     uint32_t bytes_per_element;
+    bool render_target;
   };
   constexpr FormatCase cases[] = {
-      {Prospero::BufferFormat::k8Srgb, Prospero::BufferFormat::k8UNorm, 1},
-      {Prospero::BufferFormat::k8_8Srgb, Prospero::BufferFormat::k16UNorm, 2},
+      {Prospero::BufferFormat::k8Srgb, Prospero::BufferFormat::k8UNorm, 1, true},
+      {Prospero::BufferFormat::k8_8Srgb, Prospero::BufferFormat::k16UNorm, 2, true},
       {Prospero::BufferFormat::k9_9_9_5Float,
-       Prospero::BufferFormat::k32Float, 4},
+       Prospero::BufferFormat::k32Float, 4, false},
   };
 
   for (const auto &test : cases) {
     TileTextureBlockLayout sampled_block{};
     TileTextureBlockLayout same_width_block{};
     Require(name, "sampled alias block layout",
-            Prospero::RenderTargetBytesPerElement(test.sampled) == 0 &&
+            Prospero::RenderTargetBytesPerElement(test.sampled) ==
+                (test.render_target ? test.bytes_per_element : 0u) &&
                 Prospero::SampledTextureNumericClass(test.sampled) !=
                     Prospero::TextureNumericClass::Unsupported &&
                 TileGetTextureBlockLayout(test.sampled,
                                           Prospero::TileMode::kRenderTarget,
                                           false, sampled_block),
-            "a sampled-only uncompressed format cannot describe RT-tiled memory");
+            "an uncompressed format cannot describe its RT-tiled memory or target size");
     Require(name, "same-width block geometry",
             TileGetTextureBlockLayout(test.same_width,
                                       Prospero::TileMode::kRenderTarget, false,
@@ -42483,10 +42516,12 @@ void CheckRenderTargetTiledSampledFormatLayout() {
 
     TileTextureBlockLayout depth{};
     Require(name, "depth boundary",
-            !TileGetTextureBlockLayout(test.sampled,
-                                       Prospero::TileMode::kDepth, false,
-                                       depth),
-            "a sampled-only color format entered the depth tile family");
+            TileGetTextureBlockLayout(test.sampled,
+                                      Prospero::TileMode::kDepth, false,
+                                      depth) == test.render_target &&
+                (!test.render_target ||
+                 depth.block.bytes_per_element == test.bytes_per_element),
+            "RT/depth tile-family admission or element size disagrees with the format contract");
   }
 
   TileTextureBlockLayout compressed{};

@@ -75,6 +75,7 @@ private:
 	[[nodiscard]] bool HasValidGameDirectory() const;
 
 	ConfigurationItem*            m_selected_item = nullptr;
+	bool                          m_scanning      = false;
 	bool                          m_run_enabled   = true;
 	Ui::ConfigurationListWidget*  m_ui            = nullptr;
 	QString                       m_settings_file;

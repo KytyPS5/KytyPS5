@@ -34,3 +34,5 @@ set(check_headers ${CMAKE_CURRENT_SOURCE_DIR})
 
 clang_tidy_check(common "" "${check_headers}" "${inc_headers}")
 include_what_you_use(common "${inc_headers}")
+
+include("${PROJECT_SOURCE_DIR}/tools/pkg/pkg.cmake")

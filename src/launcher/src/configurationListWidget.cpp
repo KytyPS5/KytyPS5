@@ -6,6 +6,7 @@
 #include "configurationEditDialog.h"
 #include "configurationItem.h"
 #include "gameContent.h"
+#include "gameDiscovery.h"
 #include "gameListTreeWidget.h"
 #include "inputMappingDialog.h"
 #include "mainDialog.h"
@@ -30,6 +31,7 @@
 #include <QJsonObject>
 #include <QJsonParseError>
 #include <QKeySequence>
+#include <QLabel>
 #include <QLineEdit>
 #include <QMenu>
 #include <QMessageBox>
@@ -38,10 +40,12 @@
 #include <QPointer>
 #include <QPushButton>
 #include <QRegularExpression>
+#include <QScopedValueRollback>
 #include <QSet>
 #include <QSettings>
 #include <QSignalBlocker>
 #include <QStyle>
+#include <QTimer>
 #include <QToolButton>
 #include <QTreeWidget>
 #include <QUrl>
@@ -223,8 +227,13 @@ ConfigurationListWidget::ConfigurationListWidget(QWidget* parent)
 	m_ui->cfgs_list->setColumnWidth(GAME_COMMENT_COLUMN, 240);
 	m_ui->cfgs_list->sortItems(GAME_NAME_COLUMN, Qt::AscendingOrder);
 
-	connect(m_ui->refresh_action, &QAction::triggered, this,
-	        &ConfigurationListWidget::ScanGameDirectory);
+	connect(m_ui->refresh_action, &QAction::triggered, this, [this] {
+		if (m_scanning) return;
+		// Paint feedback before potentially expensive package catalog reads.
+		m_ui->refresh_action->setEnabled(false);
+		m_ui->scan_status->setText(tr("Scanning…"));
+		QTimer::singleShot(0, this, &ConfigurationListWidget::ScanGameDirectory);
+	});
 	connect(m_ui->global_settings_button, &QToolButton::clicked, this,
 	        &ConfigurationListWidget::edit_global_settings);
 	connect(m_ui->input_mapping_button, &QToolButton::clicked, this,
@@ -263,16 +272,17 @@ ConfigurationListWidget::~ConfigurationListWidget() {
 
 void ConfigurationListWidget::changeEvent(QEvent* event) {
 	QWidget::changeEvent(event);
-	if (event->type() == QEvent::ApplicationPaletteChange || event->type() == QEvent::PaletteChange) {
+	if (event->type() == QEvent::ApplicationPaletteChange ||
+	    event->type() == QEvent::PaletteChange) {
 		UpdateToolbarIcons();
 	}
 }
 
 void ConfigurationListWidget::UpdateToolbarIcons() {
-	const auto color = palette().color(QPalette::Window).lightness() < 128 ? QColor(Qt::white)
-	                                                                      : QColor(Qt::black);
+	const auto color =
+	    palette().color(QPalette::Window).lightness() < 128 ? QColor(Qt::white) : QColor(Qt::black);
 	const auto set_icon = [&color](QToolButton* button, const QString& resource) {
-		auto pixmap = QIcon(resource).pixmap(button->iconSize(), button->devicePixelRatioF());
+		auto     pixmap = QIcon(resource).pixmap(button->iconSize(), button->devicePixelRatioF());
 		QPainter painter(&pixmap);
 		painter.setCompositionMode(QPainter::CompositionMode_SourceIn);
 		painter.fillRect(pixmap.rect(), color);
@@ -572,6 +582,13 @@ bool ConfigurationListWidget::HasValidGameDirectory() const {
 }
 
 void ConfigurationListWidget::ScanGameDirectory() {
+	if (m_scanning) return;
+	QScopedValueRollback<bool> scanning(m_scanning, true);
+	m_ui->refresh_action->setEnabled(false);
+	m_ui->scan_status->setText(tr("Scanning…"));
+	// Existing open game files retain their reader; metadata is reopened for this scan.
+	Common::InvalidateArchiveCache();
+	int unavailable_archives = 0;
 	// Commit an active inline editor before destroying its row or replacing its data.
 	if (auto* focused = QApplication::focusWidget();
 	    focused != nullptr && m_ui->cfgs_list->isAncestorOf(focused)) {
@@ -601,128 +618,104 @@ void ConfigurationListWidget::ScanGameDirectory() {
 
 	const QString eboot_name = QStringLiteral("eboot.bin");
 	QSet<QString> found_games;
-	const auto add_game = [this, &found_games, &eboot_name,
-	                       &running_items](const QString& base, const QString& game_path,
-	                                       const QString& legacy_game_path, const QString& fallback,
-	                                       bool archive) {
-		const QString game_key = PathKey(game_path);
-		if (game_key.isEmpty() || found_games.contains(game_key)) {
-			return;
-		}
-		// Keep the index and decompression cache alive through validation, metadata and icon
-		// reads, after rejecting duplicate candidates from overlapping game folders.
-		const auto reader = archive ? Common::OpenArchive(GameContent::ToPath(base)) : nullptr;
-		if (archive && (reader == nullptr || !GameContent::FileExists(base, eboot_name))) {
-			return;
-		}
-		found_games.insert(game_key);
+	const auto    add_game = [this, &found_games, &eboot_name, &running_items,
+                           &unavailable_archives](const QString& base, const QString& game_path,
+                                                  const QString& legacy_game_path,
+                                                  const QString& fallback, bool archive) {
+        const QString game_key = PathKey(game_path);
+        if (game_key.isEmpty() || found_games.contains(game_key)) {
+            return;
+        }
+        // Keep the index and decompression cache alive through validation, metadata and icon
+        // reads, after rejecting duplicate candidates from overlapping game folders.
+        const auto reader = archive ? Common::OpenArchive(GameContent::ToPath(base)) : nullptr;
+        if (archive && (reader == nullptr || !GameContent::FileExists(base, eboot_name))) {
+            ++unavailable_archives;
+            return;
+        }
+        found_games.insert(game_key);
 
-		const auto metadata =
-		    GetGameMetadata(GameContent::ReadFile(base, QStringLiteral("sce_sys/param.json"),
-		                                          GameContent::MaxMetadataSize),
-		                    fallback);
-		auto info = std::make_unique<Configuration>();
-		info->custom_settings =
-		    FindCustomInfo(&m_custom_infos, game_path, legacy_game_path) != nullptr;
+        const auto metadata =
+            GetGameMetadata(GameContent::ReadFile(base, QStringLiteral("sce_sys/param.json"),
+		                                             GameContent::MaxMetadataSize),
+		                       fallback);
+        auto info = std::make_unique<Configuration>();
+        info->custom_settings =
+            FindCustomInfo(&m_custom_infos, game_path, legacy_game_path) != nullptr;
 
-		SetGameFiles(*info, base, game_path, metadata, archive);
-		const auto* compatibility = m_compatibility->Find(info->title_id);
-		if (compatibility != nullptr) {
-			info->game_status  = compatibility->status;
-			info->game_comment = compatibility->comment;
-		}
+        SetGameFiles(*info, base, game_path, metadata, archive);
+        const auto* compatibility = m_compatibility->Find(info->title_id);
+        if (compatibility != nullptr) {
+            info->game_status  = compatibility->status;
+            info->game_comment = compatibility->comment;
+        }
 
-		if (auto* item = running_items.value(game_key); item != nullptr) {
-			// Refresh metadata without losing the running row's identity.
-			const QSignalBlocker status_blocker(item->GetStatusCombo());
-			item->GetInfo().CopyGameInfoFrom(*info);
-			item->Update(true);
-			item->SetCompatibilityEditable(m_compatibility->IsLocal() &&
-			                               !item->GetInfo().title_id.trimmed().isEmpty());
-			return;
-		}
+        if (auto* item = running_items.value(game_key); item != nullptr) {
+            // Refresh metadata without losing the running row's identity.
+            const QSignalBlocker status_blocker(item->GetStatusCombo());
+            item->GetInfo().CopyGameInfoFrom(*info);
+            item->Update(true);
+            item->SetCompatibilityEditable(m_compatibility->IsLocal() &&
+			                                  !item->GetInfo().title_id.trimmed().isEmpty());
+            return;
+        }
 
-		auto* item = new ConfigurationItem(std::move(info), m_ui->cfgs_list);
-		item->SetCompatibilityEditable(m_compatibility->IsLocal() &&
-		                               !item->GetInfo().title_id.trimmed().isEmpty());
-		connect(item->GetStatusCombo(), &QComboBox::currentIndexChanged, item,
-		        [this, item](int /*index*/) {
-			        if (!m_compatibility->IsLocal()) {
-				        return;
-			        }
+        auto* item = new ConfigurationItem(std::move(info), m_ui->cfgs_list);
+        item->SetCompatibilityEditable(m_compatibility->IsLocal() &&
+		                                  !item->GetInfo().title_id.trimmed().isEmpty());
+        connect(item->GetStatusCombo(), &QComboBox::currentIndexChanged, item,
+		           [this, item](int /*index*/) {
+                    if (!m_compatibility->IsLocal()) {
+                        return;
+                    }
 
-			        const auto& title_id = item->GetInfo().title_id;
-			        if (title_id.trimmed().isEmpty()) {
-				        return;
-			        }
-			        item->GetInfo().game_status = static_cast<Configuration::GameStatus>(
-			            item->GetStatusCombo()->currentData().toInt());
-			        item->Update();
-			        m_compatibility->SetStatus(title_id, item->GetInfo().game_status);
-			        m_ui->cfgs_list->setCurrentItem(item);
-			        SelectItem(item);
-		        });
-		connect(item->GetCommentEdit(), &QLineEdit::editingFinished, item, [this, item]() {
-			if (!m_compatibility->IsLocal()) {
-				return;
-			}
+                    const auto& title_id = item->GetInfo().title_id;
+                    if (title_id.trimmed().isEmpty()) {
+                        return;
+                    }
+                    item->GetInfo().game_status = static_cast<Configuration::GameStatus>(
+                        item->GetStatusCombo()->currentData().toInt());
+                    item->Update();
+                    m_compatibility->SetStatus(title_id, item->GetInfo().game_status);
+                    m_ui->cfgs_list->setCurrentItem(item);
+                    SelectItem(item);
+                });
+        connect(item->GetCommentEdit(), &QLineEdit::editingFinished, item, [this, item]() {
+            if (!m_compatibility->IsLocal()) {
+                return;
+            }
 
-			const auto& title_id = item->GetInfo().title_id;
-			if (title_id.trimmed().isEmpty()) {
-				return;
-			}
-			item->GetInfo().game_comment = item->GetCommentEdit()->text();
-			item->Update();
-			m_compatibility->SetComment(title_id, item->GetInfo().game_comment);
-			m_ui->cfgs_list->setCurrentItem(item);
-			SelectItem(item);
-		});
+            const auto& title_id = item->GetInfo().title_id;
+            if (title_id.trimmed().isEmpty()) {
+                return;
+            }
+            item->GetInfo().game_comment = item->GetCommentEdit()->text();
+            item->Update();
+            m_compatibility->SetComment(title_id, item->GetInfo().game_comment);
+            m_ui->cfgs_list->setCurrentItem(item);
+            SelectItem(item);
+        });
 	};
-	const auto scan_archives = [&add_game](const QDir& directory, const QDir& root) {
-		const auto entries = directory.entryInfoList(QDir::Files | QDir::NoSymLinks, QDir::Name);
-		for (const auto& archive: entries) {
-			const auto base = archive.absoluteFilePath();
-			if (!Common::IsSupportedArchive(GameContent::ToPath(base))) {
-				continue;
-			}
-			add_game(base, QDir::cleanPath(base), root.relativeFilePath(base),
-			         archive.completeBaseName(), true);
-		}
-	};
-
-	for (const auto& root_path: m_game_dirs) {
-		QDir root(root_path);
-		if (root_path.isEmpty() || !root.exists()) {
-			continue;
-		}
-
-		scan_archives(root, root);
-		QList<QDir> pending_dirs;
-		const auto  root_subdirs =
-		    root.entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot | QDir::NoSymLinks);
-		for (const auto& subdir: root_subdirs) {
-			pending_dirs.append(QDir(subdir.absoluteFilePath()));
-		}
-
-		while (!pending_dirs.isEmpty()) {
-			QDir game_dir = pending_dirs.takeFirst();
-			scan_archives(game_dir, root);
-
-			if (game_dir.exists(eboot_name)) {
-				const QString game_path        = NormalizeGameDirectory(game_dir.absolutePath());
-				const QString legacy_game_path = root.relativeFilePath(game_dir.absolutePath());
-				add_game(game_dir.absolutePath(), game_path, legacy_game_path, game_dir.dirName(),
-				         false);
-				continue;
-			}
-
-			const auto subdirs =
-			    game_dir.entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot | QDir::NoSymLinks);
-			for (const auto& subdir: subdirs) {
-				pending_dirs.append(QDir(subdir.absoluteFilePath()));
-			}
-		}
+	for (const auto& candidate: DiscoverGames(m_game_dirs)) {
+		const QDir      root(candidate.root);
+		const QFileInfo file(candidate.path);
+		const auto      game_path = candidate.archive ? QDir::cleanPath(candidate.path)
+		                                              : NormalizeGameDirectory(candidate.path);
+		add_game(candidate.path, game_path, root.relativeFilePath(candidate.path),
+		         candidate.archive ? file.completeBaseName() : QDir(candidate.path).dirName(),
+		         candidate.archive);
 	}
+	m_ui->scan_status->setText(unavailable_archives == 0 ? tr("%1 games").arg(found_games.size())
+	                                                     : tr("%1 games · %2 archives unavailable")
+	                                                           .arg(found_games.size())
+	                                                           .arg(unavailable_archives));
+	m_ui->scan_status->setToolTip(
+	    unavailable_archives == 0
+	        ? QString()
+	        : tr("An archive could not be opened or has no eboot.bin. Finish copying the file, "
+	             "check that the PKG reader and .NET 10 are installed, then press Refresh again. "
+	             "Unsupported package formats cannot be listed."));
+	m_ui->refresh_action->setEnabled(true);
 
 	m_ui->cfgs_list->setSortingEnabled(sorting_enabled);
 	if (sorting_enabled) {

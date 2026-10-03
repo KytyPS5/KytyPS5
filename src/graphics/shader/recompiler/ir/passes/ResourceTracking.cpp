@@ -12,6 +12,7 @@
 #include <optional>
 #include <span>
 #include <tuple>
+#include <unordered_set>
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -19,6 +20,43 @@ namespace {
 
 constexpr uint32_t SamplerBorderClampMask    = (1u << 2u) | (1u << 5u) | (1u << 8u);
 constexpr uint32_t SamplerDword3ReservedMask = 0x3ffff000u;
+
+// Dword 3 of a sampler S# holds nothing but BorderColorPtr (bits 0-11) and BorderColorType
+// (bits 30-31), and the hardware reads it only when an address mode clamps to a border. ClampX/Y/Z
+// live in dword 0, so prove dword 3 is dead for every fetch through this sampler rather than
+// assume it: dword 0 must be a compile-time immediate, and no axis may select mode 4-7 (the
+// CLAMP_*_BORDER / MIRROR_ONCE_*_BORDER family). Only then may a non-runtime dword 3 be replaced
+// with zero, which changes no result -- Vulkan ignores borderColor on the same condition.
+bool ProveSamplerDword3Unread(const DescriptorSource& descriptor) {
+	const auto mode = descriptor.dwords[0].Resolve();
+	if (!mode.IsImmediate() || mode.GetType() != Type::U32) {
+		return false;
+	}
+	return (mode.U32() & SamplerBorderClampMask) == 0;
+}
+
+// A value is "wave-mask scratch" if it transitively reaches a subgroup ballot, i.e. a lane mask
+// rather than descriptor data. Any operand may carry the mask (it reaches a descriptor word through
+// the multiply that turns a subgroup-relative index into an offset), so operands are walked
+// generically instead of opcode by opcode.
+bool TracesToWaveMask(Value value, std::unordered_set<const Inst*>& visited, uint32_t depth) {
+	if (depth > 64u) {
+		return false;
+	}
+	const auto* inst = value.Resolve().TryInstruction();
+	if (inst == nullptr || !visited.insert(inst).second) {
+		return false;
+	}
+	if (inst->GetOpcode() == ValueOpcode::Ballot) {
+		return true;
+	}
+	for (size_t i = 0; i < inst->NumArgs(); i++) {
+		if (TracesToWaveMask(inst->Arg(i), visited, depth + 1u)) {
+			return true;
+		}
+	}
+	return false;
+}
 
 uint32_t PossibleU32Bits(Value value) {
 	value = value.Resolve();
@@ -1667,11 +1705,35 @@ private:
 		DescriptorSource descriptor;
 		MakeSource(*handle, width, sampler, sample_adjust, base_reg, descriptor, pc);
 		uint32_t bad_dword = 0;
-		if (!ValidateSource(descriptor, bad_dword)) {
+		while (!ValidateSource(descriptor, bad_dword)) {
 			if (expected == ValueOpcode::GetBufferResource &&
 			    std::all_of(descriptor.dwords.begin(), descriptor.dwords.begin() + width,
 			                [](Value word) { return word.Resolve().GetType() == Type::U32; })) {
 				return false;
+			}
+			// A sampler S# dword 3 the shader left holding non-descriptor scratch is dead when no
+			// address mode clamps to a border, so substituting zero changes no result. The emitter
+			// reads the handle's own argument, so rewrite the instruction too.
+			if (expected == ValueOpcode::GetSamplerResource && bad_dword == 3u &&
+			    bad_dword < descriptor.dword_count && ProveSamplerDword3Unread(descriptor) &&
+			    !descriptor.dwords[bad_dword].IsImmediate()) {
+				descriptor.dwords[bad_dword] = Value(0u);
+				handle->SetArg(bad_dword, Value(0u));
+				continue;
+			}
+			// An image or sampler descriptor word that traces to a subgroup ballot is a stale
+			// wave mask left in the register: the fetch reads address/mip data, never a lane
+			// mask. Proving the trace keeps a genuinely divergent descriptor failing loudly.
+			if ((expected == ValueOpcode::GetImageResource ||
+			     expected == ValueOpcode::GetSamplerResource) &&
+			    bad_dword < descriptor.dword_count &&
+			    !descriptor.dwords[bad_dword].IsImmediate()) {
+				std::unordered_set<const Inst*> visited;
+				if (TracesToWaveMask(descriptor.dwords[bad_dword], visited, 0u)) {
+					descriptor.dwords[bad_dword] = Value(0u);
+					handle->SetArg(bad_dword, Value(0u));
+					continue;
+				}
 			}
 			Fail(pc, fmt::format("{} dword {} is not a valid runtime value",
 			                     ValueOpcodeName(expected), bad_dword));

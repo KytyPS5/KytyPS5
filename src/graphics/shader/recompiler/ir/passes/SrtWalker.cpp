@@ -81,6 +81,8 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 		case ValueOpcode::CompositeConstructU64:
 		case ValueOpcode::CompositeExtractU64:
 		case ValueOpcode::CompositeConstructU32x2:
+		case ValueOpcode::CompositeConstructU32x4:
+		case ValueOpcode::CompositeExtractU32x4:
 		case ValueOpcode::CompositeExtractU32x2:
 		case ValueOpcode::BitFieldInsert:
 		case ValueOpcode::BitFieldUExtract:
@@ -104,6 +106,7 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 		case ValueOpcode::BitwiseOr32:
 		case ValueOpcode::BitwiseXor32:
 		case ValueOpcode::BitwiseNot32:
+		case ValueOpcode::BitReverse32:
 		case ValueOpcode::SelectU1:
 		case ValueOpcode::SelectU32:
 		case ValueOpcode::SelectF32:
@@ -270,6 +273,18 @@ private:
 			    index.U32() >= 2u ||
 			    (source->GetOpcode() != ValueOpcode::CompositeConstructU32x2 &&
 			     source->GetOpcode() != ValueOpcode::IAddCarry32)) {
+				return finish(false);
+			}
+		} else if (op == ValueOpcode::CompositeExtractU32x4) {
+			// A four-dword descriptor read out of a vector built from a scalar read (or a subgroup
+			// ballot, a lane mask the fetch never reads).
+			const auto* source = inst->NumArgs() == 2 ? inst->Arg(0).ResolveInstruction() : nullptr;
+			const auto  index  = inst->NumArgs() == 2 ? inst->Arg(1).Resolve() : Value {};
+			if (source == nullptr || !index.IsImmediate() || index.GetType() != Type::U32 ||
+			    index.U32() >= 4u ||
+			    (source->GetOpcode() != ValueOpcode::CompositeConstructU32x4 &&
+			     source->GetOpcode() != ValueOpcode::CompositeExtractU32x2 &&
+			     source->GetOpcode() != ValueOpcode::Ballot)) {
 				return finish(false);
 			}
 		}
@@ -661,6 +676,18 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 		case ValueOpcode::BitwiseNot32:
 			if (Arg(inst, 0, a)) {
 				result = ~static_cast<uint32_t>(a);
+				return true;
+			}
+			return false;
+		case ValueOpcode::BitReverse32:
+			if (Arg(inst, 0, a)) {
+				// PS5 shader compilers leave bit-reversed scratch in sampler S# dwords; folding
+				// it keeps such a dword runtime-evaluable.
+				uint32_t reversed = 0;
+				for (uint32_t bit = 0; bit < 32u; bit++) {
+					reversed |= ((static_cast<uint32_t>(a) >> bit) & 1u) << (31u - bit);
+				}
+				result = reversed;
 				return true;
 			}
 			return false;

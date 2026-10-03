@@ -1,5 +1,34 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **3 октября 2026 года, 10:16 UTC** (native Windows via WSL;
+branch `yotei-windows-bringup`, test-only commit `cc3fa4e4`; installed emulator
+exe SHA-256 `5251cfc12f986dda2e9b3c8c761e0e80b5fe0545493dcc210cad803c2da406da`):
+
+- Новый нативный graphics fixture исполняет 251 разных sampled image через
+  индексированный vertex draw. Проверен численный readback для ключей 0,
+  31, 63, 231, 250 и отсутствующего 251, с 3–120000 уникальными индексами.
+  Последовательные варианты добавляют двухпроходный loop, 13 живых чтений
+  storage buffer, guest wave64, ballot и shuffle активной lane. Малые и
+  большие случаи прошли Vulkan и GPUAV без timeout или DeviceLost; итоговый
+  test exe SHA-256 `033b786da86c98d784a1b071aa0942e310ddd1df237737c1abd120b08a3a4336`.
+  Команды и логи перечислены в `docs/emulator-test-debt.md`.
+- Сохранённый игровой VS `e3125617f3efc38f` имеет более сложный loop,
+  250 выборок и target shuffle 0–63, который существующий graphics wave64
+  lowering ограничивает native lane 0–31. Этот lowering уже описан в test
+  debt как частичная partition-модель; её эквивалентность guest wave64 между
+  двумя native subgroups не доказана. Новый fixture подтверждает только
+  безопасные активные target lanes. Отдельный fixed-lane-31 тест дал ложный
+  RED, потому что lane могла быть неактивна; corrected ballot-selected
+  variant прошёл. Из статического SPIR-V нельзя вывести реально исполненные
+  target lanes или причину DeviceLost.
+- Production-код и установленный exe в этом checkpoint не менялись;
+  повторять тот же game run с reset NVIDIA без новой причины не стали.
+  Следующее: установить для guest wave64 в graphics корректный исполнимый
+  контракт либо доказанный unsupported boundary; затем локализовать
+  фактическую GPU-команду и данные игрового draw ограниченным запуском.
+  Первый ненулевой кадр остаётся подтверждён только на прежнем GPUAV run
+  со спиннером; меню и gameplay **PENDING**.
+
 Checkpoint **3 октября 2026 года, 09:10 UTC** (native Windows; branch
 `yotei-windows-bringup`, test-only commit `0201fa00`; installed emulator exe
 SHA-256 `5251cfc12f986dda2e9b3c8c761e0e80b5fe0545493dcc210cad803c2da406da`):

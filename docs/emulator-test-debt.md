@@ -1,5 +1,80 @@
 # Emulator regression test debt
 
+## GPUAV feature parity for synthetic vertex image selection (2026-10-03)
+
+The first three-index synthetic vertex draw passed native GPU readback but
+GPU assisted validation reported missing `shaderClipDistance` and
+`vertexPipelineStoresAndAtomics` at shader-module/pipeline creation. The
+production Vulkan device enables both features; the standalone test harness
+did not. Before treating this as an emitter regression, enable the same
+supported device features in the harness and rerun the **unchanged** bounded
+three-index case with GPUAV. Then increase index counts only if the small
+case has no validation errors or device loss. The captured validation failure
+is a harness configuration failure, not evidence that the game's DeviceLost
+has been reproduced.
+
+The harness now checks support and enables both features, matching the
+production device. The unchanged three-index GPUAV case passes on native
+test exe SHA-256
+`63c56550880df1cfdaa7878027439733aec815450d34bf88ceb0dc966345c2d1`;
+300, 3000, 12000 and 120000 unique-index variants also pass with GPUAV
+(`_Build/logs/wide-vertex-feature-*-gpuav-20261003*`). These first variants
+used one texture for every descriptor, so they did not numerically prove
+which table entry the vertex shader selected.
+
+The strengthened test exe SHA-256
+`a67459e310dc7bab49fc22fdd1b3fe1ce5007dcbdc12294d219f80062deae1d9`
+uses 251 distinct 4×4 image contents and one unique vertex per index. The
+vertex shader chooses `(VertexIndex / 3) & 255`; the final triangle's color
+proves selected keys 0 (3 indices), 250 (753), 231 (3000), and 63
+(120000). Key 251 (756 indices) correctly falls back to root image 0.
+Native readback passes for all these cases, and GPUAV passes for 753 and
+120000 without a validation error or timeout. Artifacts:
+`_Build/logs/wide-vertex-distinct-{small,753,756,3000,120000}-20261003*`,
+`_Build/logs/wide-vertex-distinct-{753,120000}-gpuav-20261003*`;
+native build `_Build/logs/wide-vertex-distinct-build-20261003.log`.
+The neighboring `--wide-indirect-image-spirv-only` case passes. This is a
+GREEN control, not the game's DeviceLost RED: the synthetic shader has no
+loop, uses no other guest buffers, and samples constant coordinates. Next
+bounded fixture should combine a loop and additional read-only buffer
+descriptors with the image lookup, then increase one dimension at a time.
+
+The follow-up two-iteration loop and thirteen live storage-buffer reads also
+pass native readback and GPUAV at 753 and 120000 unique indices (test exe
+SHA-256 `e3a9e3de3f37c40b9fa154dcd1202487b55ca5f12c30d4bdd2b4c1f90963000d`,
+logs `_Build/logs/wide-vertex-{loop,buffers}-*-20261003*`). The buffer
+contents XOR to zero only when all thirteen loads contribute, preserving the
+selected image oracle. The captured game SPIR-V has one loop and one 250-case
+switch, but also `OpGroupNonUniformBallot`, `OpGroupNonUniformShuffle`, and
+an explicit split at subgroup lane 32; the synthetic fixture used guest
+wave32. Next compare bounded wave64 lowering on the same fixture before
+adding subgroup operations or more complex buffer addressing. Do not infer
+the game's loop bounds or final GPU command from this static inspection.
+
+Test-only commit `cc3fa4e4` adds bounded wave64 vertex variants with the
+same resource bindings. Native 753/120000 index cases pass numerical readback
+and GPUAV with subgroup ballot plus self-lane shuffle; the prior wave64
+loop/buffer control also passes. The final test exe SHA-256 is
+`033b786da86c98d784a1b071aa0942e310ddd1df237737c1abd120b08a3a4336`;
+logs `_Build/logs/wide-vertex-{wave64,subgroup}-*-20261003*` and
+`_Build/logs/wide-vertex-cross-active-*-20261003*`. A first fixed-lane-31
+fixture returned image 0 instead of image 31 at 96 vertices, but its target
+lane was not guaranteed active; this was an invalid oracle, not a shader RED.
+The corrected variant derives a target from the actual ballot mask, shuffles
+that active lane's `LaneId`, and passes 96/120000 native readback plus large
+GPUAV. Neighboring 753-image, loop/buffer and wide SPIR-V cases pass on the
+final test exe. No production GPU change or game retry followed these GREEN
+controls. Menu and gameplay remain unverified.
+
+The captured game VS SPIR-V has one loop, 250 `OpSampledImage` instructions,
+13 buffers, and a shuffle target first masked to 0–63 and then to 0–31 by
+the existing graphics wave64 partition helper. That helper is documented
+below as a limited native32 approximation, not full cross-subgroup wave64
+equivalence. Static SPIR-V cannot prove which target lanes or loop iterations
+the game executed. A semantic fix needs an independent valid guest-wave64
+regression and a feasible host execution model; truncating targets or forcing
+a loop budget does not establish correctness.
+
 ## Windows SysV host-entry stack alignment (2026-10-03)
 
 Upstream PR #990 head `617e728c9309337fda2da0aba9f31bed0207930f`

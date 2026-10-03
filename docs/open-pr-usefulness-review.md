@@ -2,6 +2,18 @@
 
 # Открытые PR KytyPS5: что полезно для текущего bring-up
 
+## Сверка 3 октября 2026 года, 10:18 UTC
+
+Новый [#996](https://github.com/KytyPS5/KytyPS5/pull/996), head
+`30a6dacd4cb38f70d7f1e76b1fe88c2ff64e1e77`, переносит временный
+`kyty_run.sh` Linux launcher в `/tmp` и добавляет Linux тест/CI. Файлы
+изменений и описание проверены через `gh pr view`; Windows emulator,
+SPIR-V и Vulkan draw он не меняет, поэтому для текущего меню Yōtei его не
+переносили. Head прежних #985/#986/#990/#991 в свежем списке не изменился.
+Native synthetic vertex controls теперь доходят до 120000 индексов с
+251 image, loop, 13 buffers и ограниченными wave64 subgroup операциями;
+игровой DeviceLost по ним не воспроизведён. Подробности в launch plan.
+
 ## Сверка 3 октября 2026 года, 09:03 UTC
 
 Свежий `gh pr list` не показал PR новее #991; head #985, #986, #990 и #991

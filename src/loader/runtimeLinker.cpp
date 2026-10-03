@@ -1813,16 +1813,16 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	EXIT_IF(tls_handler_size > UINT64_MAX - program->base_size_aligned);
 	program->mapped_size = program->base_size_aligned + tls_handler_size;
 #if !defined(__APPLE__)
-	const bool emulate_rsqrt = Config::AmdCpuEnabled();
+	const bool emulate_amd = Config::AmdCpuEnabled();
 #else
-	const bool emulate_rsqrt = false;
+	const bool emulate_amd = false;
 #endif
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	const bool protect_memory_faults = Config::RedZoneProtectionEnabled();
 #else
 	const bool protect_memory_faults = false;
 #endif
-	const bool patch_guest_instructions = protect_memory_faults || emulate_rsqrt;
+	const bool patch_guest_instructions = protect_memory_faults || emulate_amd;
 
 	constexpr uint64_t INSTRUCTION_TRAMPOLINE_SIZE = 8u * 1024u * 1024u;
 	if (patch_guest_instructions) {
@@ -1940,18 +1940,15 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 		if (!have_function_starts) {
 			Log::WriteToConsoleAndLog(
 			    fmt::format("{}: {} not patched (function boundaries unavailable)\n",
-			                emulate_rsqrt ? "AMD CPU compatibility" : "Guest red-zone protection",
+			                emulate_amd ? "AMD CPU compatibility" : "Guest red-zone protection",
 			                module_name));
 		}
 		GuestInstructionPatchResult totals {};
 		for (const auto& [segment_addr, segment_size]: executable_segments) {
 			const auto result = PatchGuestInstructions(segment_addr, segment_size, function_starts,
-			                                           protect_memory_faults, emulate_rsqrt);
-			totals.reciprocal_sqrt_instruction_count += result.reciprocal_sqrt_instruction_count;
-			totals.patched_reciprocal_sqrt_instruction_count +=
-			    result.patched_reciprocal_sqrt_instruction_count;
-			totals.trapped_reciprocal_sqrt_instruction_count +=
-			    result.trapped_reciprocal_sqrt_instruction_count;
+			                                           protect_memory_faults, emulate_amd);
+			totals.reciprocal_sqrt += result.reciprocal_sqrt;
+			totals.extrq += result.extrq;
 			if (protect_memory_faults) {
 				LOGF("Windows guest red-zone patching: %s, functions=%" PRIu64 ", red_zone=%" PRIu64
 				     ", memory=%" PRIu64 ", patched=%" PRIu64 ", short=%" PRIu64 ", stack=%" PRIu64
@@ -1965,19 +1962,19 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 				     result.unrelocatable_memory_instruction_count);
 			}
 		}
-		if (emulate_rsqrt && have_function_starts) {
-			const auto  patched = totals.patched_reciprocal_sqrt_instruction_count +
-			                      totals.trapped_reciprocal_sqrt_instruction_count;
-			const auto  skipped = totals.reciprocal_sqrt_instruction_count - patched;
-			const char* status  = totals.reciprocal_sqrt_instruction_count == 0
-			                          ? "no matching instructions"
-			                      : patched == 0 ? "not patched"
-			                      : skipped != 0 ? "partially patched"
-			                                     : "patched";
+		if (emulate_amd && have_function_starts) {
+			const auto  found   = totals.reciprocal_sqrt.found + totals.extrq.found;
+			const auto  skipped = totals.reciprocal_sqrt.Skipped() + totals.extrq.Skipped();
+			const char* status  = found == 0         ? "no matching instructions"
+			                      : skipped == found ? "not patched"
+			                      : skipped != 0     ? "partially patched"
+			                                         : "patched";
 			Log::WriteToConsoleAndLog(fmt::format(
-			    "AMD CPU compatibility: {} {} (VRSQRTPS: native={}, trapped={}, skipped={})\n",
-			    module_name, status, totals.patched_reciprocal_sqrt_instruction_count,
-			    totals.trapped_reciprocal_sqrt_instruction_count, skipped));
+			    "AMD CPU compatibility: {} {} (VRSQRTPS: native={}, trapped={}, skipped={}; "
+			    "EXTRQ: native={}, trapped={}, skipped={})\n",
+			    module_name, status, totals.reciprocal_sqrt.native, totals.reciprocal_sqrt.trapped,
+			    totals.reciprocal_sqrt.Skipped(), totals.extrq.native, totals.extrq.trapped,
+			    totals.extrq.Skipped()));
 		}
 	}
 

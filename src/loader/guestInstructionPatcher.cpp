@@ -132,11 +132,20 @@ struct DecodedFunction {
 	bool                                        requires_conservative_red_zone_tracking {};
 };
 
+enum class InstructionReplacement { None, ReciprocalSquareRoot, ExtractQ };
+
 struct InstructionRewrite {
-	bool protect_red_zone {};
-	bool protected_indirect_call {};
-	bool emulate_rsqrt {};
+	bool                   protect_red_zone {};
+	bool                   protected_indirect_call {};
+	InstructionReplacement replacement {};
 };
+
+InstructionPatchCounts& ReplacementCounts(GuestInstructionPatchResult& result,
+                                          InstructionReplacement       replacement) {
+	ASSERT(replacement != InstructionReplacement::None);
+	return replacement == InstructionReplacement::ReciprocalSquareRoot ? result.reciprocal_sqrt
+	                                                                   : result.extrq;
+}
 
 bool IsStackPointerRegister(ZydisRegister reg) {
 	return reg != ZYDIS_REGISTER_NONE &&
@@ -814,33 +823,108 @@ void GenerateReciprocalSquareRoot(const DecodedCodeInstruction& decoded,
 	generator.L(done);
 }
 
-void CollectReciprocalSquareRoots(const DecodedFunction&                   function,
-                                  std::map<uintptr_t, InstructionRewrite>& rewrite_sites,
-                                  GuestInstructionPatchResult&             result) {
+bool IsSupportedExtractQ(const DecodedCodeInstruction& decoded) {
+	if (decoded.instruction.mnemonic != ZYDIS_MNEMONIC_EXTRQ) {
+		return false;
+	}
+	const auto is_xmm = [](const ZydisDecodedOperand& operand) {
+		return operand.type == ZYDIS_OPERAND_TYPE_REGISTER &&
+		       operand.reg.value >= ZYDIS_REGISTER_XMM0 &&
+		       operand.reg.value <= ZYDIS_REGISTER_XMM15;
+	};
+	const bool immediate = decoded.instruction.operand_count_visible == 3 &&
+	                       decoded.operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
+	                       decoded.operands[2].type == ZYDIS_OPERAND_TYPE_IMMEDIATE;
+	if (!is_xmm(decoded.operands[0]) ||
+	    (!immediate &&
+	     !(decoded.instruction.operand_count_visible == 2 && is_xmm(decoded.operands[1])))) {
+		return false;
+	}
+	// Match the trap handler's encoding support: 66 [REX] 0F 78/79 ModRM [imm8 imm8].
+	const auto*  code   = reinterpret_cast<const u8*>(decoded.address);
+	const size_t opcode = (code[1] & 0xf0u) == 0x40u ? 2 : 1;
+	return code[0] == 0x66 && code[opcode] == 0x0f &&
+	       code[opcode + 1] == (immediate ? 0x78 : 0x79) &&
+	       decoded.instruction.length == opcode + (immediate ? 5 : 3);
+}
+
+void GenerateExtractQ(const DecodedCodeInstruction& decoded, Xbyak::CodeGenerator& generator) {
+	const Xbyak::Xmm destination(decoded.operands[0].reg.value - ZYDIS_REGISTER_XMM0);
+	// Keep spills below the guest red zone on both hosts, and restore all modified flags/GPRs.
+	generator.lea(rsp, ptr[rsp - GuestRedZoneSize]);
+	generator.pushfq();
+	generator.push(rax);
+	generator.push(rcx);
+	generator.push(rdx);
+	if (decoded.operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+		const u32 length = decoded.operands[1].imm.value.u & 63u;
+		const u32 index  = decoded.operands[2].imm.value.u & 63u;
+		const u64 mask   = length == 0 ? UINT64_MAX : (u64 {1} << length) - 1;
+		generator.movq(rax, destination);
+		if (index != 0) {
+			generator.shr(rax, index);
+		}
+		generator.mov(rdx, mask);
+	} else {
+		const Xbyak::Xmm source(decoded.operands[1].reg.value - ZYDIS_REGISTER_XMM0);
+		generator.movq(rax, source);
+		generator.mov(ecx, eax);
+		generator.neg(ecx);
+		generator.mov(rdx, UINT64_MAX);
+		// CL shifts use six bits: -length gives 64-length, with zero retaining all 64 bits.
+		generator.shr(rdx, cl);
+		generator.shr(rax, 8);
+		generator.mov(ecx, eax);
+		generator.movq(rax, destination);
+		generator.shr(rax, cl);
+	}
+	generator.and_(rax, rdx);
+	// Match the emulator: clear the upper XMM half, preserving the upper YMM half.
+	generator.movq(destination, rax);
+	generator.pop(rdx);
+	generator.pop(rcx);
+	generator.pop(rax);
+	generator.popfq();
+	generator.lea(rsp, ptr[rsp + GuestRedZoneSize]);
+}
+
+void CollectAmdInstructions(const DecodedFunction&                   function,
+                            std::map<uintptr_t, InstructionRewrite>& rewrite_sites,
+                            GuestInstructionPatchResult&             result) {
+	static const bool host_lacks_sse4a = !Xbyak::util::Cpu().has(Xbyak::util::Cpu::tSSE4a);
 	for (const auto& [address, decoded]: function.instructions) {
-		const auto& instruction = decoded.instruction;
-		if (instruction.mnemonic != ZYDIS_MNEMONIC_VRSQRTPS ||
-		    instruction.encoding != ZYDIS_INSTRUCTION_ENCODING_VEX ||
-		    instruction.raw.vex.offset != 0 || decoded.operands[0].size != 128 ||
-		    decoded.operands[1].type != ZYDIS_OPERAND_TYPE_REGISTER) {
+		const auto&            instruction = decoded.instruction;
+		InstructionReplacement replacement {};
+		if (instruction.mnemonic == ZYDIS_MNEMONIC_VRSQRTPS &&
+		    instruction.encoding == ZYDIS_INSTRUCTION_ENCODING_VEX &&
+		    instruction.raw.vex.offset == 0 && decoded.operands[0].size == 128 &&
+		    decoded.operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+			replacement = InstructionReplacement::ReciprocalSquareRoot;
+		} else if (host_lacks_sse4a && IsSupportedExtractQ(decoded)) {
+			replacement = InstructionReplacement::ExtractQ;
+		} else {
 			continue;
 		}
-		++result.reciprocal_sqrt_instruction_count;
-		rewrite_sites[address].emulate_rsqrt = true;
+		++ReplacementCounts(result, replacement).found;
+		rewrite_sites[address].replacement = replacement;
 	}
 }
 
-void MarkReciprocalSquareRootTrap(u8* code, const ZydisDecodedInstruction& instruction) {
-	// Clear a reserved VEX.vvvv bit, retaining both register operands for the handler.
-	code[instruction.raw.vex.size - 1] &= ~0x08u;
+void MarkInstructionTrap(u8* code, const ZydisDecodedInstruction& instruction,
+                         InstructionReplacement replacement) {
+	if (replacement == InstructionReplacement::ReciprocalSquareRoot) {
+		// Clear a reserved VEX.vvvv bit, retaining both register operands for the handler.
+		code[instruction.raw.vex.size - 1] &= ~0x08u;
+	}
+	// EXTRQ already raises #UD on hosts without SSE4a; keep its original encoding.
 }
 
-void GenerateReciprocalSquareRootTrap(const DecodedCodeInstruction& decoded,
-                                      Xbyak::CodeGenerator&         generator) {
+void GenerateInstructionTrap(const DecodedCodeInstruction& decoded,
+                             InstructionReplacement replacement, Xbyak::CodeGenerator& generator) {
 	std::array<u8, ZYDIS_MAX_INSTRUCTION_LENGTH> code {};
 	std::memcpy(code.data(), reinterpret_cast<const void*>(decoded.address),
 	            decoded.instruction.length);
-	MarkReciprocalSquareRootTrap(code.data(), decoded.instruction);
+	MarkInstructionTrap(code.data(), decoded.instruction, replacement);
 	generator.db(code.data(), decoded.instruction.length);
 }
 
@@ -852,20 +936,28 @@ bool NeedsTrapRedZoneProtection(const DecodedCodeInstruction& decoded) {
 #endif
 }
 
-void TrapUnrelocatedReciprocalSquareRoots(
-    const PatchModule& module, const DecodedFunction& function,
-    const std::map<uintptr_t, InstructionRewrite>& rewrite_sites,
-    GuestInstructionPatchResult&                   result) {
+void TrapUnrelocatedInstructions(const PatchModule& module, const DecodedFunction& function,
+                                 const std::map<uintptr_t, InstructionRewrite>& rewrite_sites,
+                                 GuestInstructionPatchResult&                   result) {
 	for (const auto& [address, rewrite]: rewrite_sites) {
-		if (!rewrite.emulate_rsqrt || module.patched.contains(reinterpret_cast<u8*>(address))) {
+		if (rewrite.replacement == InstructionReplacement::None ||
+		    module.patched.contains(reinterpret_cast<u8*>(address))) {
 			continue;
 		}
 		const auto& decoded = function.instructions.at(address);
 		if (NeedsTrapRedZoneProtection(decoded)) {
+			if (rewrite.replacement == InstructionReplacement::ExtractQ) {
+				// Unlike VRSQRTPS, leaving EXTRQ unchanged would still trap and corrupt the red
+				// zone.
+				EXIT("AMD CPU compatibility: cannot safely trap EXTRQ at %p (guest red zone is "
+				     "live)\n",
+				     reinterpret_cast<void*>(address));
+			}
 			continue;
 		}
-		MarkReciprocalSquareRootTrap(reinterpret_cast<u8*>(address), decoded.instruction);
-		++result.trapped_reciprocal_sqrt_instruction_count;
+		MarkInstructionTrap(reinterpret_cast<u8*>(address), decoded.instruction,
+		                    rewrite.replacement);
+		++ReplacementCounts(result, rewrite.replacement).trapped;
 	}
 }
 
@@ -877,38 +969,44 @@ void RelocateGuestInstructions(PatchModule* module, const DecodedFunction& funct
 		uintptr_t                                  patch_start {};
 		uintptr_t                                  continuation {};
 		size_t                                     patch_size {};
-		bool                                       trap_rsqrt {};
+		bool                                       trap_replacements {};
 	};
 
 	const auto emit_span = [&](RelocationSpan& span) -> std::optional<size_t> {
 		auto&        generator         = module->trampoline_gen;
 		const size_t trampoline_offset = generator.getSize();
-		const bool   has_rsqrt = std::ranges::any_of(span.instructions, [&](const auto* decoded) {
-			const auto rewrite = rewrite_sites.find(decoded->address);
-			return rewrite != rewrite_sites.end() && rewrite->second.emulate_rsqrt;
-		});
-		for (bool trap_rsqrt: {false, true}) {
-			span.trap_rsqrt = trap_rsqrt;
+		const bool   has_replacements =
+		    std::ranges::any_of(span.instructions, [&](const auto* decoded) {
+			    const auto rewrite = rewrite_sites.find(decoded->address);
+			    return rewrite != rewrite_sites.end() &&
+			           rewrite->second.replacement != InstructionReplacement::None;
+		    });
+		for (bool trap_replacements: {false, true}) {
+			span.trap_replacements = trap_replacements;
 			Xbyak::ClearError();
 			bool encoded = true;
 			for (const auto* decoded: span.instructions) {
-				const auto rewrite = rewrite_sites.find(decoded->address);
-				const bool emulate_rsqrt =
-				    rewrite != rewrite_sites.end() && rewrite->second.emulate_rsqrt;
+				const auto rewrite     = rewrite_sites.find(decoded->address);
+				const auto replacement = rewrite != rewrite_sites.end()
+				                             ? rewrite->second.replacement
+				                             : InstructionReplacement::None;
 				const bool protected_indirect_call =
 				    rewrite != rewrite_sites.end() && rewrite->second.protected_indirect_call;
 				const bool protect_red_zone =
 				    (rewrite != rewrite_sites.end() && rewrite->second.protect_red_zone &&
 				     !protected_indirect_call) ||
-				    (emulate_rsqrt && trap_rsqrt && NeedsTrapRedZoneProtection(*decoded));
+				    (replacement != InstructionReplacement::None && trap_replacements &&
+				     NeedsTrapRedZoneProtection(*decoded));
 				if (protect_red_zone) {
 					generator.lea(rsp, ptr[rsp - GuestRedZoneSize]);
 				}
-				if (emulate_rsqrt) {
-					if (trap_rsqrt) {
-						GenerateReciprocalSquareRootTrap(*decoded, generator);
-					} else {
+				if (replacement != InstructionReplacement::None) {
+					if (trap_replacements) {
+						GenerateInstructionTrap(*decoded, replacement, generator);
+					} else if (replacement == InstructionReplacement::ReciprocalSquareRoot) {
 						GenerateReciprocalSquareRoot(*decoded, generator);
+					} else {
+						GenerateExtractQ(*decoded, generator);
 					}
 				} else if (protected_indirect_call) {
 					encoded = GenerateProtectedIndirectCall(*decoded, generator);
@@ -936,7 +1034,7 @@ void RelocateGuestInstructions(PatchModule* module, const DecodedFunction& funct
 				EXIT("Guest instruction trampoline generation failed: %s\n",
 				     Xbyak::ConvertErrorToString(error));
 			}
-			if (error != Xbyak::ERR_CODE_IS_TOO_BIG || !has_rsqrt) {
+			if (error != Xbyak::ERR_CODE_IS_TOO_BIG || !has_replacements) {
 				break;
 			}
 		}
@@ -953,11 +1051,12 @@ void RelocateGuestInstructions(PatchModule* module, const DecodedFunction& funct
 			if (rewrite->second.protect_red_zone && decoded->accesses_memory) {
 				++result.patched_memory_instruction_count;
 			}
-			if (rewrite->second.emulate_rsqrt) {
-				if (span.trap_rsqrt) {
-					++result.trapped_reciprocal_sqrt_instruction_count;
+			if (rewrite->second.replacement != InstructionReplacement::None) {
+				auto& counts = ReplacementCounts(result, rewrite->second.replacement);
+				if (span.trap_replacements) {
+					++counts.trapped;
 				} else {
-					++result.patched_reciprocal_sqrt_instruction_count;
+					++counts.native;
 				}
 			}
 		}
@@ -1328,9 +1427,9 @@ void RelocateGuestInstructions(PatchModule* module, const DecodedFunction& funct
 
 GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment_size,
                                                    std::span<const uintptr_t> function_starts,
-                                                   bool protect_memory, bool emulate_rsqrt) {
+                                                   bool protect_memory, bool emulate_amd) {
 	GuestInstructionPatchResult result {};
-	if (!protect_memory && !emulate_rsqrt) {
+	if (!protect_memory && !emulate_amd) {
 		return result;
 	}
 	auto*              module = GetContainingModule(reinterpret_cast<void*>(segment_addr));
@@ -1354,7 +1453,7 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
 	const size_t     trampoline_begin = module->trampoline_gen.getSize();
 	bool analyze_red_zone = protect_memory;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	analyze_red_zone |= emulate_rsqrt;
+	analyze_red_zone |= emulate_amd;
 #endif
 	for (size_t function_index = 0; function_index < starts.size(); ++function_index) {
 		const uintptr_t function_start = starts[function_index];
@@ -1380,12 +1479,12 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
 		if (protect_memory) {
 			CollectRedZoneMemoryInstructions(function, rewrite_sites, result);
 		}
-		if (emulate_rsqrt) {
-			CollectReciprocalSquareRoots(function, rewrite_sites, result);
+		if (emulate_amd) {
+			CollectAmdInstructions(function, rewrite_sites, result);
 		}
 		if (!rewrite_sites.empty()) {
 			RelocateGuestInstructions(module, function, rewrite_sites, result);
-			TrapUnrelocatedReciprocalSquareRoots(*module, function, rewrite_sites, result);
+			TrapUnrelocatedInstructions(*module, function, rewrite_sites, result);
 		}
 	}
 	const auto trampoline_addr =

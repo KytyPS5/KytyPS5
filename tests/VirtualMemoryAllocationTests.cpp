@@ -20,6 +20,7 @@
 #include <cmath>
 #include <cinttypes>
 #include <cstdint>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -31,6 +32,7 @@
 #include <csignal>
 #include <immintrin.h>
 #include <xbyak/xbyak.h>
+#include <xbyak/xbyak_util.h>
 #endif
 
 #if defined(__linux__)
@@ -2827,9 +2829,9 @@ void TestModuleRelocationUsesWritableHostMapping() {
 }
 
 #if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-volatile sig_atomic_t g_rsqrt_traps = 0;
+volatile sig_atomic_t g_instruction_traps = 0;
 
-bool EmulateReciprocalSquareRootContext(void* context) {
+bool EmulateInstructionContext(void* context) {
 	const auto host_mxcsr = _mm_getcsr();
 	_mm_setcsr(0x7fe1); // Exercise the handler under a distinct rounding mode and raised flags.
 	const bool emulated        = Loader::X64InstructionEmulator::TryEmulate(context);
@@ -2838,25 +2840,65 @@ bool EmulateReciprocalSquareRootContext(void* context) {
 	if (!emulated || !preserved_mxcsr) {
 		return false;
 	}
-	g_rsqrt_traps = g_rsqrt_traps + 1;
+	g_instruction_traps = g_instruction_traps + 1;
 	return true;
 }
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-LONG CALLBACK ReciprocalSquareRootHandler(EXCEPTION_POINTERS* exception) {
+LONG CALLBACK InstructionHandler(EXCEPTION_POINTERS* exception) {
 	if (exception->ExceptionRecord->ExceptionCode != EXCEPTION_ILLEGAL_INSTRUCTION ||
-	    !EmulateReciprocalSquareRootContext(exception->ContextRecord)) {
+	    !EmulateInstructionContext(exception->ContextRecord)) {
 		return EXCEPTION_CONTINUE_SEARCH;
 	}
 	return EXCEPTION_CONTINUE_EXECUTION;
 }
 #else
-void ReciprocalSquareRootHandler(int, siginfo_t*, void* context) {
-	if (!EmulateReciprocalSquareRootContext(context)) {
+void InstructionHandler(int, siginfo_t*, void* context) {
+	if (!EmulateInstructionContext(context)) {
 		_exit(190);
 	}
 }
 #endif
+
+struct InstructionTestScope {
+	uint64_t mapping;
+	uint64_t size;
+	uint32_t mxcsr = _mm_getcsr();
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	void* handler = nullptr;
+#else
+	struct sigaction previous {};
+	bool             installed = false;
+#endif
+	~InstructionTestScope() {
+		_mm_setcsr(mxcsr);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		if (handler != nullptr) {
+			RemoveVectoredExceptionHandler(handler);
+		}
+#else
+		if (installed) {
+			sigaction(SIGILL, &previous, nullptr);
+		}
+#endif
+		Loader::UnregisterGuestInstructionPatchModule(reinterpret_cast<void*>(mapping));
+		Libs::LibKernel::Memory::FreeGuestMemory(mapping, size);
+	}
+
+	void InstallHandler(const char* test) {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		handler = AddVectoredExceptionHandler(1, InstructionHandler);
+		Check(test, handler != nullptr, "failed to install instruction handler");
+#else
+		struct sigaction action {};
+		action.sa_sigaction = InstructionHandler;
+		action.sa_flags     = SA_SIGINFO;
+		sigemptyset(&action.sa_mask);
+		installed = sigaction(SIGILL, &action, &previous) == 0;
+		Check(test, installed, "failed to install instruction handler");
+#endif
+	}
+};
 
 void TestPackedReciprocalSquareRoot() {
 	const char* test = "PackedReciprocalSquareRoot";
@@ -2865,42 +2907,8 @@ void TestPackedReciprocalSquareRoot() {
 	const auto mapping = Libs::LibKernel::Memory::AllocateProgramMemory(
 	    0x902000000, allocation_size, Common::VirtualMemory::Mode::ExecuteReadWrite, "rsqrt_test");
 	Check(test, mapping != 0, "failed to allocate instruction test code");
-	struct RestoreState {
-		uint64_t mapping;
-		uint64_t size;
-		uint32_t mxcsr;
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		void* handler = nullptr;
-#else
-		struct sigaction previous {};
-		bool installed = false;
-#endif
-		~RestoreState() {
-			_mm_setcsr(mxcsr);
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-			if (handler != nullptr) {
-				RemoveVectoredExceptionHandler(handler);
-			}
-#else
-			if (installed) {
-				sigaction(SIGILL, &previous, nullptr);
-			}
-#endif
-			Loader::UnregisterGuestInstructionPatchModule(reinterpret_cast<void*>(mapping));
-			Libs::LibKernel::Memory::FreeGuestMemory(mapping, size);
-		}
-	} restore {mapping, allocation_size, _mm_getcsr()};
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	restore.handler = AddVectoredExceptionHandler(1, ReciprocalSquareRootHandler);
-	Check(test, restore.handler != nullptr, "failed to install instruction handler");
-#else
-	struct sigaction action {};
-	action.sa_sigaction = ReciprocalSquareRootHandler;
-	action.sa_flags = SA_SIGINFO;
-	sigemptyset(&action.sa_mask);
-	restore.installed = sigaction(SIGILL, &action, &restore.previous) == 0;
-	Check(test, restore.installed, "failed to install instruction handler");
-#endif
+	InstructionTestScope restore {mapping, allocation_size};
+	restore.InstallHandler(test);
 	using GuestFunction = void(KYTY_SYSV_ABI*)(const uint32_t*, uint32_t*);
 	const auto function = reinterpret_cast<GuestFunction>(mapping);
 	const std::array<uintptr_t, 1> function_starts {mapping};
@@ -2987,9 +2995,9 @@ void TestPackedReciprocalSquareRoot() {
 		                                              code.getCode() + allocation_size);
 		const auto disabled = Loader::PatchGuestInstructions(
 		    mapping, code.getSize(), function_starts, false, false);
-		Check(test, Xbyak::GetError() == 0 && disabled.reciprocal_sqrt_instruction_count == 0 &&
-		                disabled.patched_reciprocal_sqrt_instruction_count == 0 &&
-		                disabled.trapped_reciprocal_sqrt_instruction_count == 0 &&
+		Check(test, Xbyak::GetError() == 0 && disabled.reciprocal_sqrt.found == 0 &&
+		                disabled.reciprocal_sqrt.native == 0 &&
+		                disabled.reciprocal_sqrt.trapped == 0 &&
 		                std::equal(original.begin(), original.end(), code.getCode()) &&
 		                std::equal(original_trampoline.begin(), original_trampoline.end(),
 		                           code.getCode() + code_size),
@@ -3005,9 +3013,9 @@ void TestPackedReciprocalSquareRoot() {
 #else
 				const uint64_t expected_traps = instruction_count;
 #endif
-				Check(test, exhausted.reciprocal_sqrt_instruction_count == instruction_count &&
-				                exhausted.patched_reciprocal_sqrt_instruction_count == 0 &&
-				                exhausted.trapped_reciprocal_sqrt_instruction_count == expected_traps,
+				Check(test, exhausted.reciprocal_sqrt.found == instruction_count &&
+				                exhausted.reciprocal_sqrt.native == 0 &&
+				                exhausted.reciprocal_sqrt.trapped == expected_traps,
 				      "exhausted reciprocal-root generation lost fallback coverage");
 				Check(test, Xbyak::GetError() == 0,
 				      "failed trampoline generation leaked Xbyak's thread-local error");
@@ -3015,9 +3023,9 @@ void TestPackedReciprocalSquareRoot() {
 					Check(test, std::equal(original.begin(), original.end(), code.getCode()),
 					      "unsafe fallback modified a live guest red zone site");
 				}
-				const auto traps_before = g_rsqrt_traps;
+				const auto traps_before = g_instruction_traps;
 				function(input.data(), output.data());
-				Check(test, static_cast<uint64_t>(g_rsqrt_traps - traps_before) == expected_traps &&
+				Check(test, static_cast<uint64_t>(g_instruction_traps - traps_before) == expected_traps &&
 				                red_zone_intact() &&
 				                output[0] == (expected_traps ? expected : std::bit_cast<uint32_t>(native)),
 				      "exhaustion fallback changed guest state or failed to execute");
@@ -3031,9 +3039,9 @@ void TestPackedReciprocalSquareRoot() {
 			const auto memory_only = Loader::PatchGuestInstructions(
 			    mapping, code.getSize(), function_starts, true, false);
 			Check(test, Xbyak::GetError() == 0 &&
-			                memory_only.reciprocal_sqrt_instruction_count == 0 &&
-			                memory_only.patched_reciprocal_sqrt_instruction_count == 0 &&
-			                memory_only.trapped_reciprocal_sqrt_instruction_count == 0 &&
+			                memory_only.reciprocal_sqrt.found == 0 &&
+			                memory_only.reciprocal_sqrt.native == 0 &&
+			                memory_only.reciprocal_sqrt.trapped == 0 &&
 			                memory_only.patched_memory_instruction_count > 0,
 			      "memory protection enabled reciprocal-root replacement");
 			function(input.data(), output.data());
@@ -3051,18 +3059,18 @@ void TestPackedReciprocalSquareRoot() {
 			const auto patched = Loader::PatchGuestInstructions(
 			    mapping, code.getSize(), function_starts, protect_memory_sites, true);
 			Check(test, Xbyak::GetError() == 0 &&
-			                patched.reciprocal_sqrt_instruction_count == instruction_count &&
-			                patched.patched_reciprocal_sqrt_instruction_count ==
+			                patched.reciprocal_sqrt.found == instruction_count &&
+			                patched.reciprocal_sqrt.native ==
 			                    (trap_fallback ? 0 : instruction_count) &&
-			                patched.trapped_reciprocal_sqrt_instruction_count ==
+			                patched.reciprocal_sqrt.trapped ==
 			                    (trap_fallback ? instruction_count : 0) &&
 			                patched.unrelocatable_memory_instruction_count == 0 &&
 			                (protect_memory_sites ? patched.patched_memory_instruction_count > 0
 			                                      : patched.patched_memory_instruction_count == 0),
 			      "instruction pass lost reciprocal root or memory patch coverage");
-			const auto traps_before = g_rsqrt_traps;
+			const auto traps_before = g_instruction_traps;
 			function(input.data(), output.data());
-			Check(test, static_cast<uint64_t>(g_rsqrt_traps - traps_before) ==
+			Check(test, static_cast<uint64_t>(g_instruction_traps - traps_before) ==
 			                (trap_fallback ? instruction_count : 0),
 			      "reciprocal-root execution did not match its native/fallback patch count");
 			Check(test, (output[72] & 0x8d5u) == 0x45u, "patched instruction corrupted RFLAGS");
@@ -3139,15 +3147,15 @@ void TestPackedReciprocalSquareRoot() {
 	register_module(code_size);
 	const auto unsupported = Loader::PatchGuestInstructions(
 	    mapping, unsupported_code.getSize(), function_starts, false, true);
-	Check(test, Xbyak::GetError() == 0 && unsupported.reciprocal_sqrt_instruction_count == 1 &&
-	                unsupported.patched_reciprocal_sqrt_instruction_count == 0 &&
-	                unsupported.trapped_reciprocal_sqrt_instruction_count == 1 &&
+	Check(test, Xbyak::GetError() == 0 && unsupported.reciprocal_sqrt.found == 1 &&
+	                unsupported.reciprocal_sqrt.native == 0 &&
+	                unsupported.reciprocal_sqrt.trapped == 1 &&
 	                std::equal(expected_fallback.begin(), expected_fallback.end(),
 	                           unsupported_code.getCode()),
 	      "unsafe native relocation did not select the in-place trap fallback");
-	const auto traps_before = g_rsqrt_traps;
+	const auto traps_before = g_instruction_traps;
 	function(input.data(), output.data());
-	Check(test, g_rsqrt_traps == traps_before + 1 && output[0] == 0x3f800000 &&
+	Check(test, g_instruction_traps == traps_before + 1 && output[0] == 0x3f800000 &&
 	                std::all_of(output.begin() + 4, output.begin() + 8,
 	                            [](uint32_t lane) { return lane == 0; }),
 	      "unsafe native relocation fallback did not execute correctly");
@@ -3220,6 +3228,316 @@ void TestPackedReciprocalSquareRoot() {
 #endif
 	std::printf("[host]    %-48s ok\n", test);
 }
+
+void TestPackedBitFieldExtract() {
+	const char*        test      = "PackedBitFieldExtract";
+	constexpr uint64_t code_size = 0x80000;
+	const auto         mapping   = Libs::LibKernel::Memory::AllocateProgramMemory(
+	    0x904000000, code_size * 2, Common::VirtualMemory::Mode::ExecuteReadWrite, "extrq_test");
+	Check(test, mapping != 0, "failed to allocate EXTRQ test code");
+	InstructionTestScope restore {mapping, code_size * 2};
+	restore.InstallHandler(test);
+	const bool host_sse4a      = Xbyak::util::Cpu().has(Xbyak::util::Cpu::tSSE4a);
+	const auto register_module = [&](uint64_t capacity) {
+		Loader::RegisterGuestInstructionPatchModule(reinterpret_cast<void*>(mapping), code_size,
+		                                            reinterpret_cast<void*>(mapping + code_size),
+		                                            capacity);
+	};
+	// Xbyak has no EXTRQ mnemonic. Emit the two canonical SSE4a encodings directly.
+	const auto extrq = [](Xbyak::CodeGenerator& code, int destination, int source,
+	                      uint8_t length = 0, uint8_t index = 0) {
+		code.db(0x66);
+		const int rex = source < 0 ? (destination >> 3) : ((destination >> 3) << 2) | (source >> 3);
+		if (rex != 0) {
+			code.db(0x40 | rex);
+		}
+		code.db(0x0f);
+		code.db(source < 0 ? 0x78 : 0x79);
+		code.db(source < 0 ? 0xc0 | (destination & 7)
+		                   : 0xc0 | ((destination & 7) << 3) | (source & 7));
+		if (source < 0) {
+			code.db(length);
+			code.db(index);
+		}
+	};
+	// Copy individual source bits so the oracle is independent of the emitter's shift/mask.
+	const auto extract = [](uint64_t value, uint32_t length, uint32_t index) {
+		const uint32_t count  = (length & 63u) == 0 ? 64 : length & 63u;
+		const uint32_t first  = index & 63u;
+		uint64_t       result = 0;
+		for (uint32_t bit = 0; bit < count && first + bit < 64; ++bit) {
+			result |= ((value >> (first + bit)) & 1u) << bit;
+		}
+		return result;
+	};
+	struct Result {
+		std::array<uint64_t, 4>  destination;
+		std::array<uint64_t, 4>  source;
+		std::array<uint64_t, 13> gprs;
+		uint64_t                 flags;
+		uint64_t                 stack_before;
+		uint64_t                 stack_after;
+		std::array<uint64_t, 16> red_zone;
+	};
+	constexpr uint64_t             gpr_sentinel      = 0x8192a3b4c5d6e700ull;
+	constexpr uint64_t             red_zone_sentinel = 0xa1b2c3d4e5f60000ull;
+	std::array<uint64_t, 12>       input {0,
+	                                      0xdeadbeef12345678,
+	                                      0x8877665544332211,
+	                                      0x1122334455667788,
+	                                      0,
+	                                      0x123456789abcdef0,
+	                                      0x13579bdf2468ace0,
+	                                      0xfdb97531eca86420,
+	                                      0x3f8000003f800000,
+	                                      0x3f8000003f800000,
+	                                      0x3f8000003f800000,
+	                                      0x3f8000003f800000};
+	const std::array<uintptr_t, 1> function_starts {mapping};
+	using GuestFunction = void(KYTY_SYSV_ABI*)(const uint64_t*, void*);
+	const auto function = reinterpret_cast<GuestFunction>(mapping);
+	for (const auto registers: {std::array {1, 8}, std::array {8, 9}, std::array {3, 3},
+	                            std::array {15, 0}, std::array {8, -1}}) {
+		const auto           destination = registers[0];
+		const auto           source      = registers[1];
+		Xbyak::CodeGenerator code(code_size, reinterpret_cast<void*>(mapping));
+		const std::array     saved {code.rbx, code.rbp, code.r12, code.r13, code.r14, code.r15};
+		const std::array gprs {code.rax, code.rcx, code.rdx, code.rbx, code.rbp, code.r8, code.r9,
+		                       code.r10, code.r11, code.r12, code.r13, code.r14, code.r15};
+		for (const auto& reg: saved) {
+			code.push(reg);
+		}
+		code.vmovups(Xbyak::Ymm(destination), code.ptr[code.rdi]);
+		if (source >= 0 && source != destination) {
+			code.vmovups(Xbyak::Ymm(source), code.ptr[code.rdi + 32]);
+		}
+		for (uint32_t offset = 8; offset <= 128; offset += 8) {
+			code.mov(code.rax, red_zone_sentinel | offset);
+			code.mov(code.qword[code.rsp - offset], code.rax);
+		}
+		code.mov(code.eax, 0x7fffffff);
+		code.add(code.eax, 1);
+		code.stc(); // CF, PF, AF, SF and OF set; ZF clear.
+		for (size_t index = 0; index < gprs.size(); ++index) {
+			code.mov(gprs[index], gpr_sentinel | index);
+		}
+		code.mov(code.qword[code.rsi + offsetof(Result, stack_before)], code.rsp);
+		extrq(code, destination, source, 0xc8, 0xc4);
+		code.mov(code.qword[code.rsi + offsetof(Result, stack_after)], code.rsp);
+		for (size_t index = 0; index < gprs.size(); ++index) {
+			code.mov(code.qword[code.rsi + offsetof(Result, gprs) + index * 8], gprs[index]);
+		}
+		code.lea(code.rsp, code.ptr[code.rsp - 128]);
+		code.pushfq();
+		code.pop(code.rax);
+		code.lea(code.rsp, code.ptr[code.rsp + 128]);
+		code.mov(code.qword[code.rsi + offsetof(Result, flags)], code.rax);
+		for (uint32_t offset = 8; offset <= 128; offset += 8) {
+			code.mov(code.rax, code.qword[code.rsp - offset]);
+			code.mov(code.qword[code.rsi + offsetof(Result, red_zone) + offset - 8], code.rax);
+		}
+		code.vmovups(code.ptr[code.rsi + offsetof(Result, destination)], Xbyak::Ymm(destination));
+		code.vmovups(code.ptr[code.rsi + offsetof(Result, source)],
+		             Xbyak::Ymm(source < 0 ? destination : source));
+		code.vzeroupper();
+		for (auto reg = saved.rbegin(); reg != saved.rend(); ++reg) {
+			code.pop(*reg);
+		}
+		code.ret();
+		Check(test, Xbyak::GetError() == 0, "failed to generate EXTRQ state fixture");
+		const std::vector<uint8_t> original(code.getCode(), code.getCurr());
+		register_module(code_size);
+		const std::vector<uint8_t> trampoline(code.getCode() + code_size,
+		                                      code.getCode() + code_size * 2);
+		const auto                 disabled =
+		    Loader::PatchGuestInstructions(mapping, code.getSize(), function_starts, false, false);
+		Check(test,
+		      disabled.extrq.found == 0 &&
+		          std::equal(original.begin(), original.end(), code.getCode()) &&
+		          std::equal(trampoline.begin(), trampoline.end(), code.getCode() + code_size),
+		      "disabled AMD patching changed EXTRQ code or trampolines");
+		for (const bool fallback: {false, true}) {
+			std::memcpy(reinterpret_cast<void*>(mapping), original.data(), original.size());
+			register_module(fallback ? 32 : code_size);
+			const auto counts = Loader::PatchGuestInstructions(mapping, code.getSize(),
+			                                                   function_starts, false, true)
+			                        .extrq;
+			if (host_sse4a) {
+				Check(test,
+				      counts.found == 0 &&
+				          std::equal(original.begin(), original.end(), code.getCode()),
+				      "SSE4a host received unnecessary EXTRQ patches");
+				std::printf("[host]    %-48s skipped (native SSE4a host)\n", test);
+				return;
+			}
+			std::printf("[host]    EXTRQ xmm%d,%d %s found=%" PRIu64 " native=%" PRIu64
+			            " trapped=%" PRIu64 "\n",
+			            destination, source, fallback ? "fallback" : "replacement", counts.found,
+			            counts.native, counts.trapped);
+			Check(test,
+			      Xbyak::GetError() == 0 && counts.found == 1 && counts.Skipped() == 0 &&
+			          counts.native == (fallback ? 0u : 1u) &&
+			          counts.trapped == (fallback ? 1u : 0u),
+			      "EXTRQ native/fallback patch counts differ");
+			const auto traps_before = g_instruction_traps;
+			uint64_t   calls        = 0;
+			for (uint32_t length = 0; length < 64; ++length) {
+				for (uint32_t index = 0; index < 64; ++index) {
+					if (source < 0 && (length != 8 || index != 4)) {
+						continue;
+					}
+					for (const uint64_t pattern: {UINT64_MAX, uint64_t {0x0123456789abcdef}}) {
+						const uint64_t controls = (pattern & ~uint64_t {0xffff}) |
+						                          ((index | 0xc0u) << 8) | (length | 0xc0u);
+						input[0]                = source == destination ? controls : pattern;
+						input[4]                = controls;
+						Result output {};
+						_mm_setcsr(0x5fa5);
+						function(input.data(), &output);
+						const auto mxcsr = _mm_getcsr();
+						_mm_setcsr(restore.mxcsr);
+						++calls;
+						Check(test,
+						      output.destination[0] == extract(input[0], length, index) &&
+						          output.destination[1] == 0 && output.destination[2] == input[2] &&
+						          output.destination[3] == input[3],
+						      "EXTRQ result or destination lanes differ");
+						Check(test,
+						      source < 0 || source == destination
+						          ? output.source == output.destination
+						          : std::equal(output.source.begin(), output.source.end(),
+						                       input.begin() + 4),
+						      "EXTRQ changed its separate source register");
+						Check(test,
+						      mxcsr == 0x5fa5 && (output.flags & 0x8d5u) == 0x895u &&
+						          output.stack_before == output.stack_after,
+						      "EXTRQ changed MXCSR, RFLAGS or RSP");
+						for (size_t reg = 0; reg < output.gprs.size(); ++reg) {
+							Check(test, output.gprs[reg] == (gpr_sentinel | reg),
+							      "EXTRQ corrupted a guest GPR");
+						}
+						for (size_t slot = 0; slot < output.red_zone.size(); ++slot) {
+							Check(test,
+							      output.red_zone[slot] == (red_zone_sentinel | ((slot + 1) * 8)),
+							      "EXTRQ corrupted the guest red zone");
+						}
+					}
+				}
+			}
+			Check(test,
+			      static_cast<uint64_t>(g_instruction_traps - traps_before) ==
+			          (fallback ? calls : 0),
+			      "EXTRQ execution did not match native/fallback selection");
+		}
+	}
+
+	// Cover every immediate length/index pair without re-decoding thousands of large fixtures.
+	Xbyak::CodeGenerator   code(code_size, reinterpret_cast<void*>(mapping));
+	std::vector<uintptr_t> starts;
+	for (uint32_t length = 0; length < 64; ++length) {
+		for (uint32_t index = 0; index < 64; ++index) {
+			starts.push_back(mapping + code.getSize());
+			code.vmovups(code.ymm8, code.ptr[code.rdi]);
+			extrq(code, 8, -1, length | 0xc0, index | 0xc0);
+			code.vmovups(code.ptr[code.rsi], code.ymm8);
+			code.vzeroupper();
+			code.ret();
+		}
+	}
+	Check(test, Xbyak::GetError() == 0, "failed to generate exhaustive immediate EXTRQ fixture");
+	const std::vector<uint8_t> original(code.getCode(), code.getCurr());
+	for (const bool fallback: {false, true}) {
+		std::memcpy(reinterpret_cast<void*>(mapping), original.data(), original.size());
+		register_module(fallback ? 1 : code_size);
+		const auto counts =
+		    Loader::PatchGuestInstructions(mapping, code.getSize(), starts, false, true).extrq;
+		Check(test,
+		      Xbyak::GetError() == 0 && counts.found == starts.size() && counts.Skipped() == 0 &&
+		          counts.native == (fallback ? 0 : starts.size()) &&
+		          counts.trapped == (fallback ? starts.size() : 0),
+		      "immediate EXTRQ coverage was lost");
+		const auto traps_before = g_instruction_traps;
+		for (size_t entry = 0; entry < starts.size(); ++entry) {
+			for (const uint64_t pattern: {UINT64_MAX, uint64_t {0x0123456789abcdef}}) {
+				input[0] = pattern;
+				std::array<uint64_t, 4> output {};
+				reinterpret_cast<GuestFunction>(starts[entry])(input.data(), output.data());
+				Check(test,
+				      output[0] == extract(pattern, entry / 64, entry % 64) && output[1] == 0 &&
+				          output[2] == input[2] && output[3] == input[3],
+				      "immediate EXTRQ bit slice differs");
+			}
+		}
+		Check(test,
+		      static_cast<uint64_t>(g_instruction_traps - traps_before) ==
+		          (fallback ? starts.size() * 2 : 0),
+		      "immediate EXTRQ did not execute its selected path");
+	}
+
+	// An indirect branch prevents relocating this four-byte register form; retain its natural trap.
+	code.reset();
+	Xbyak::Label continuation;
+	code.vmovups(code.ymm1, code.ptr[code.rdi]);
+	code.vmovups(code.ymm2, code.ptr[code.rdi + 32]);
+	code.lea(code.rax, code.ptr[code.rip + continuation]);
+	extrq(code, 1, 2);
+	code.jmp(code.rax);
+	code.L(continuation);
+	code.vmovups(code.ptr[code.rsi], code.ymm1);
+	code.vzeroupper();
+	code.ret();
+	Check(test, Xbyak::GetError() == 0, "failed to generate unrelocatable EXTRQ fixture");
+	const std::vector<uint8_t> unsafe_original(code.getCode(), code.getCurr());
+	register_module(code_size);
+	const auto unsafe =
+	    Loader::PatchGuestInstructions(mapping, code.getSize(), function_starts, false, true).extrq;
+	Check(test,
+	      unsafe.found == 1 && unsafe.native == 0 && unsafe.trapped == 1 &&
+	          std::equal(unsafe_original.begin(), unsafe_original.end(), code.getCode()),
+	      "unrelocatable EXTRQ did not retain its natural trap");
+	input[0] = 0x0123456789abcdef;
+	input[4] = 0xffffc4c8;
+	std::array<uint64_t, 8> output {};
+	const auto              traps_before = g_instruction_traps;
+	function(input.data(), output.data());
+	Check(test, g_instruction_traps == traps_before + 1 && output[0] == extract(input[0], 8, 4),
+	      "unrelocatable EXTRQ fallback did not execute");
+
+	// Neighboring replacement kinds must share the same relocation/fallback span safely.
+	code.reset();
+	code.vmovups(code.ymm1, code.ptr[code.rdi]);
+	code.vmovups(code.ymm2, code.ptr[code.rdi + 32]);
+	code.vmovups(code.ymm3, code.ptr[code.rdi + 64]);
+	extrq(code, 1, 2);
+	code.vrsqrtps(code.xmm4, code.xmm3);
+	code.vmovups(code.ptr[code.rsi], code.ymm1);
+	code.vmovups(code.ptr[code.rsi + 32], code.ymm4);
+	code.vzeroupper();
+	code.ret();
+	Check(test, Xbyak::GetError() == 0, "failed to generate mixed AMD instruction fixture");
+	const std::vector<uint8_t> mixed_original(code.getCode(), code.getCurr());
+	for (const bool fallback: {false, true}) {
+		std::memcpy(reinterpret_cast<void*>(mapping), mixed_original.data(), mixed_original.size());
+		register_module(fallback ? 48 : code_size);
+		const auto mixed =
+		    Loader::PatchGuestInstructions(mapping, code.getSize(), function_starts, false, true);
+		for (const auto counts: {mixed.extrq, mixed.reciprocal_sqrt}) {
+			Check(test,
+			      counts.found == 1 && counts.native == (fallback ? 0u : 1u) &&
+			          counts.trapped == (fallback ? 1u : 0u),
+			      "mixed AMD instruction counts differ");
+		}
+		const auto before = g_instruction_traps;
+		function(input.data(), output.data());
+		Check(test,
+		      g_instruction_traps == before + (fallback ? 2 : 0) &&
+		          output[0] == extract(input[0], 8, 4) && output[4] == 0x3f8000003f800000 &&
+		          output[5] == 0x3f8000003f800000 && output[6] == 0 && output[7] == 0,
+		      "mixed native/fallback AMD instructions lost their results");
+	}
+	std::printf("[host]    %-48s ok (all 4096 length/index pairs)\n", test);
+}
+
 #endif
 
 #if defined(__x86_64__) || defined(_M_X64)
@@ -3396,6 +3714,10 @@ int main(int argc, char** argv) {
 	}
 #endif
 #if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (argc == 2 && std::strcmp(argv[1], "--extrq-only") == 0) {
+		RunTest(TestPackedBitFieldExtract);
+		return g_failed_tests == 0 ? 0 : 1;
+	}
 	if (argc == 2 && std::strcmp(argv[1], "--rsqrt-only") == 0) {
 		RunTest(TestPackedReciprocalSquareRoot);
 		return g_failed_tests == 0 ? 0 : 1;
@@ -3411,6 +3733,7 @@ int main(int argc, char** argv) {
 #endif
 #if defined(__linux__) || KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	RunTest(TestPackedReciprocalSquareRoot);
+	RunTest(TestPackedBitFieldExtract);
 #endif
 	RunTest(TestWindowsGuestRedZoneStaticPatcher);
 	RunTest(TestProsperoArgumentAndInfoSizeContracts);

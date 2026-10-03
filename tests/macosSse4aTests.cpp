@@ -1,6 +1,8 @@
 #include "common/hostException.h"
+#include "loader/guestInstructionPatcher.h"
 #include "loader/x64InstructionEmulator.h"
 
+#include <array>
 #include <atomic>
 #include <bit>
 #include <cstddef>
@@ -244,6 +246,116 @@ void TestUnknownInstructionRefused() {
 	g_refuse_skip.store(0, std::memory_order_relaxed);
 }
 
+// The loader rewrites SSE4a instructions into native trampolines when the patcher is enabled. The
+// trampoline area lives right behind the code page, like it does behind a mapped guest module.
+struct PatchedCode {
+	void                               *code = nullptr;
+	Loader::GuestInstructionPatchResult result {};
+};
+
+template <size_t N>
+PatchedCode MapPatchedCode(const uint8_t (&blob)[N], bool emulate_amd) {
+	void *area = ::mmap(nullptr, 2 * kPageSize, PROT_READ | PROT_WRITE | PROT_EXEC,
+	                    MAP_PRIVATE | MAP_ANON, -1, 0);
+	Check(area != MAP_FAILED, "map RWX code and trampoline area");
+	std::memcpy(area, blob, N);
+	auto *trampoline = static_cast<uint8_t *>(area) + kPageSize;
+	Loader::RegisterGuestInstructionPatchModule(area, kPageSize, trampoline, kPageSize);
+	const std::array<uintptr_t, 1> function_starts {reinterpret_cast<uintptr_t>(area)};
+	// A host without SSE4a, RDPID and CLWB, which is what Rosetta presents.
+	const Loader::GuestInstructionHostFeatures host {false, false, false};
+	PatchedCode patched;
+	patched.code   = area;
+	patched.result = Loader::PatchGuestInstructions(reinterpret_cast<uintptr_t>(area), N, function_starts,
+	                                                false, emulate_amd, host);
+	Loader::UnregisterGuestInstructionPatchModule(area);
+	return patched;
+}
+
+using PatchCounts = Loader::InstructionPatchCounts Loader::GuestInstructionPatchResult::*;
+
+// Runs the blob through the SIGILL emulator (reference) and through the patched copy, which must
+// produce the same bytes. EXTRQ becomes a native trampoline without a single SIGILL. INSERTQ is
+// marked as a trap by the patcher and keeps going through the signal emulator.
+template <typename Fn, size_t N, typename Invoke>
+void CheckPatchedMatchesEmulator(const uint8_t (&blob)[N], PatchCounts counts, bool native,
+                                 Invoke invoke, const char *text) {
+	uint64_t  reference[2] {};
+	const int before_reference = IllegalHits();
+	invoke(MapCode<Fn>(blob), reference);
+	Check(IllegalHits() > before_reference, text);
+
+	const auto unpatched = MapPatchedCode(blob, false);
+	Check((unpatched.result.*counts).found == 0, "patcher stays off without emulate_amd");
+	uint64_t  unpatched_out[2] {};
+	const int before_off = IllegalHits();
+	invoke(reinterpret_cast<Fn>(unpatched.code), unpatched_out);
+	Check(IllegalHits() > before_off, "unpatched copy still raises SIGILL");
+
+	const auto patched = MapPatchedCode(blob, true);
+	Check((patched.result.*counts).found == 1, text);
+	Check((patched.result.*counts).native == (native ? 1u : 0u), "native trampoline count");
+	Check((patched.result.*counts).trapped == (native ? 0u : 1u), "trapped (signal path) count");
+	uint64_t  out[2] {};
+	const int before = IllegalHits();
+	invoke(reinterpret_cast<Fn>(patched.code), out);
+	if (native) {
+		Check(IllegalHits() == before, "patched code raises no SIGILL");
+	} else {
+		Check(IllegalHits() > before, "trapped instruction still goes through the signal emulator");
+	}
+	Check(out[0] == reference[0] && out[1] == reference[1], "patched result equals emulated result");
+}
+
+void TestPatchedExtrqImmediate() {
+	CheckPatchedMatchesEmulator<BlobFn>(
+	    kExtrqXmm2Len40Index0, &Loader::GuestInstructionPatchResult::extrq, true,
+	    [](BlobFn fn, uint64_t *out) { fn(out, 0.0, 0.0, std::bit_cast<double>(0xaabbccddeeff1122ull)); },
+	    "EXTRQ immediate found by the patcher");
+}
+
+void TestPatchedExtrqRexHigh() {
+	CheckPatchedMatchesEmulator<LoadBlobFn>(
+	    kExtrqXmm10Len40Index0, &Loader::GuestInstructionPatchResult::extrq, true,
+	    [](LoadBlobFn fn, uint64_t *out) {
+		    const uint64_t in[2] {0xaabbccddeeff1122ull, 0x5555555555555555ull};
+		    fn(out, in);
+	    },
+	    "REX EXTRQ found by the patcher");
+}
+
+void TestPatchedInsertqImmediate() {
+	CheckPatchedMatchesEmulator<BlobFn>(
+	    kInsertqXmm2Xmm0Len32Index0, &Loader::GuestInstructionPatchResult::insertq, false,
+	    [](BlobFn fn, uint64_t *out) {
+		    fn(out, std::bit_cast<double>(0x1122334455667788ull), 0.0,
+		       std::bit_cast<double>(0x0123456789abcdefull));
+	    },
+	    "INSERTQ immediate found by the patcher");
+}
+
+void TestPatchedInsertqIndexedRexHigh() {
+	CheckPatchedMatchesEmulator<PairBlobFn>(
+	    kInsertqXmm10Xmm9Len16Index8, &Loader::GuestInstructionPatchResult::insertq, false,
+	    [](PairBlobFn fn, uint64_t *out) {
+		    const uint64_t src[2] {0x8877665544332211ull, 0xdeadbeefcafebabeull};
+		    const uint64_t dest[2] {0xaaaaaaaaaaaaaaaaull, 0xbbbbbbbbbbbbbbbbull};
+		    fn(out, src, dest);
+	    },
+	    "indexed REX INSERTQ found by the patcher");
+}
+
+void TestPatchedInsertqRegister() {
+	CheckPatchedMatchesEmulator<PairBlobFn>(
+	    kInsertqXmm10Xmm9, &Loader::GuestInstructionPatchResult::insertq, false,
+	    [](PairBlobFn fn, uint64_t *out) {
+		    const uint64_t src[2] {0x0123456789abcdefull, 0xdeadbeef0000c4c8ull};
+		    const uint64_t dest[2] {0x8877665544332211ull, 0xfedcba9876543210ull};
+		    fn(out, src, dest);
+	    },
+	    "register INSERTQ found by the patcher");
+}
+
 } // namespace
 
 int main() {
@@ -256,6 +368,11 @@ int main() {
 	TestRexHighRegisterInsertqWithIndex();
 	TestInsertqRegister();
 	TestUnknownInstructionRefused();
+	TestPatchedExtrqImmediate();
+	TestPatchedExtrqRexHigh();
+	TestPatchedInsertqImmediate();
+	TestPatchedInsertqIndexedRexHigh();
+	TestPatchedInsertqRegister();
 	std::printf("macosSse4aTests: all passed\n");
 	return 0;
 }

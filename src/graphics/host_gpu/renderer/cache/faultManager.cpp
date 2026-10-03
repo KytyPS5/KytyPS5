@@ -31,7 +31,8 @@ FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler
       m_fault_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
                      BufferCache::CACHING_NUMPAGES / 8),
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 0, AllFlags,
-                        MaxPendingFaults * PageFaultAreaSize) {
+                        MaxPendingFaults * PageFaultAreaSize),
+      m_fault_list(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, PageFaultAreaSize) {
 	SetVulkanObjectNameF(m_graphics.device, m_fault_buffer.Handle(), "Fault Buffer");
 
 	const vk::DescriptorSetLayoutBinding bindings[] {
@@ -106,7 +107,7 @@ void FaultManager::ProcessFaultBuffer() {
 
 	const vk::DescriptorBufferInfo infos[] {
 	    {m_fault_buffer.Handle(), 0, m_fault_buffer.Size()},
-	    {m_download_buffer.Handle(), offset, PageFaultAreaSize},
+	    {m_fault_list.Handle(), 0, PageFaultAreaSize},
 	};
 	std::array<vk::WriteDescriptorSet, 2> writes {};
 	for (uint32_t index = 0; index < writes.size(); ++index) {
@@ -118,6 +119,26 @@ void FaultManager::ProcessFaultBuffer() {
 
 	m_scheduler.EndRendering();
 	auto command = m_scheduler.Current().Handle();
+	vk::BufferMemoryBarrier2 list_barrier {};
+	list_barrier.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands;
+	list_barrier.srcAccessMask =
+	    vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+	list_barrier.dstStageMask  = vk::PipelineStageFlagBits2::eClear;
+	list_barrier.dstAccessMask = vk::AccessFlagBits2::eTransferWrite;
+	list_barrier.buffer        = m_fault_list.Handle();
+	list_barrier.offset        = 0;
+	list_barrier.size          = PageFaultAreaSize;
+	vk::DependencyInfo list_dependency {};
+	list_dependency.bufferMemoryBarrierCount = 1;
+	list_dependency.pBufferMemoryBarriers    = &list_barrier;
+	command.pipelineBarrier2(list_dependency);
+	command.fillBuffer(m_fault_list.Handle(), 0, PageFaultAreaSize, 0);
+	list_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eClear;
+	list_barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+	list_barrier.dstStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
+	list_barrier.dstAccessMask =
+	    vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite;
+	command.pipelineBarrier2(list_dependency);
 	vk::DependencyInfo dependency {};
 	dependency.dependencyFlags          = vk::DependencyFlagBits::eByRegion;
 	dependency.bufferMemoryBarrierCount = 1;
@@ -132,6 +153,23 @@ void FaultManager::ProcessFaultBuffer() {
 	command.dispatch(static_cast<uint32_t>(num_workgroups), 1, 1);
 	dependency.pBufferMemoryBarriers = &post_barrier;
 	command.pipelineBarrier2(dependency);
+	list_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
+	list_barrier.srcAccessMask = vk::AccessFlagBits2::eShaderWrite;
+	list_barrier.dstStageMask  = vk::PipelineStageFlagBits2::eCopy;
+	list_barrier.dstAccessMask = vk::AccessFlagBits2::eTransferRead;
+	command.pipelineBarrier2(list_dependency);
+	const vk::BufferCopy copy {0, offset, PageFaultAreaSize};
+	command.copyBuffer(m_fault_list.Handle(), m_download_buffer.Handle(), 1, &copy);
+	vk::BufferMemoryBarrier2 host_barrier {};
+	host_barrier.srcStageMask             = vk::PipelineStageFlagBits2::eCopy;
+	host_barrier.srcAccessMask            = vk::AccessFlagBits2::eTransferWrite;
+	host_barrier.dstStageMask             = vk::PipelineStageFlagBits2::eHost;
+	host_barrier.dstAccessMask            = vk::AccessFlagBits2::eHostRead;
+	host_barrier.buffer                   = m_download_buffer.Handle();
+	host_barrier.offset                   = offset;
+	host_barrier.size                     = PageFaultAreaSize;
+	list_dependency.pBufferMemoryBarriers = &host_barrier;
+	command.pipelineBarrier2(list_dependency);
 
 	const auto area = m_current_area;
 	m_scheduler.DeferOperation([this, mapped, offset, area] {

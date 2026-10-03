@@ -56,15 +56,30 @@ constexpr size_t WATCHES_RESERVE_CHUNK   = 0x1000;
 } // namespace
 
 Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
-               uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size)
+               uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size,
+               bool sparse_residency)
     : m_graphics(&graphics), m_scheduler(&scheduler), m_usage(usage), m_cpu_address(cpu_address),
-      m_size(size) {
+      m_size(size), m_sparse(sparse_residency) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(graphics.allocator == nullptr || size == 0);
 
 	vk::BufferCreateInfo buffer_info {};
 	buffer_info.size        = size;
 	buffer_info.usage       = flags;
+
+	if (sparse_residency) {
+		EXIT_IF(!graphics.sparse_residency_buffer_enabled || usage != MemoryUsage::DeviceLocal);
+		buffer_info.flags =
+		    vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency;
+		EXIT_NOT_IMPLEMENTED(graphics.device.createBuffer(&buffer_info, nullptr, &m_buffer) !=
+		                     vk::Result::eSuccess);
+		if (flags & vk::BufferUsageFlagBits::eShaderDeviceAddress) {
+			vk::BufferDeviceAddressInfo address_info {};
+			address_info.buffer = m_buffer;
+			m_device_address    = graphics.device.getBufferAddress(address_info);
+		}
+		return;
+	}
 
 	const bool with_bda = bool(flags & vk::BufferUsageFlagBits::eShaderDeviceAddress);
 	VmaAllocationCreateInfo allocation_info {};
@@ -134,7 +149,9 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 }
 
 Buffer::~Buffer() {
-	if (m_buffer != nullptr) {
+	if (m_buffer != nullptr && m_sparse) {
+		m_graphics->device.destroyBuffer(m_buffer, nullptr);
+	} else if (m_buffer != nullptr) {
 		vmaDestroyBuffer(m_graphics->allocator, m_buffer, m_allocation);
 	}
 }

@@ -138,6 +138,7 @@ private:
 	template <bool async>
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	void               MarkBdaStores(uint64_t vaddr, uint64_t size);
+	void               MakePageTableResident(uint64_t table_offset, uint64_t size);
 	void               ForgetColorMetadataChecks(uint64_t vaddr, uint64_t size);
 
 	GraphicContext&                                   m_graphics;
@@ -158,6 +159,10 @@ private:
 	// Downloads without submitting the recording in progress; false leaves all state unchanged.
 	[[nodiscard]] bool TryDownloadDetached(Buffer& buffer, uint64_t vaddr, uint64_t size);
 
+	uint64_t                                           m_bda_table_chunk        = 0;
+	uint32_t                                           m_bda_table_memory_types = 0;
+	std::vector<VmaAllocation>                         m_bda_table_chunks;
+	vk::Fence                                          m_bda_table_fence = nullptr;
 	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_lru_cache;
 	BufferMap                                         m_buffers;
 	PageTable                                         m_page_table;

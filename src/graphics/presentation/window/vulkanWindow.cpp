@@ -687,6 +687,20 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	device_features.fillModeNonSolid                      = VK_TRUE;
 	device_features.vertexPipelineStoresAndAtomics       = VK_TRUE;
 	graphics.draw_indirect_count_enabled                  = features12.drawIndirectCount;
+	{
+		vk::PhysicalDeviceProperties properties {};
+		physical_device.getProperties(&properties);
+		const bool sparse_queue = static_cast<bool>(queue_families[queue_family].queueFlags &
+		                                            vk::QueueFlagBits::eSparseBinding);
+		const bool sparse_residency_buffer =
+		    supported_features2.features.sparseBinding == VK_TRUE &&
+		    supported_features2.features.sparseResidencyBuffer == VK_TRUE &&
+		    properties.sparseProperties.residencyNonResidentStrict == VK_TRUE && sparse_queue;
+		device_features.sparseBinding            = sparse_residency_buffer ? VK_TRUE : VK_FALSE;
+		device_features.sparseResidencyBuffer    = sparse_residency_buffer ? VK_TRUE : VK_FALSE;
+		graphics.sparse_residency_buffer_enabled = sparse_residency_buffer;
+		LOGF("\tsparse residency buffers: %s\n", sparse_residency_buffer ? "true" : "false");
+	}
 	// Storage image sample counts beyond 1x require the feature.
 	if (!device_features.shaderStorageImageMultisample) {
 		graphics.physical_device_properties.limits.storageImageSampleCounts =

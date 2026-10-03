@@ -161,6 +161,7 @@ void BufferCache::ChangeRegister(BufferId id) {
 				        BDA_STORE_TRACKED_BIT;
 			    }
 		    });
+		MakePageTableResident(table_offset, addresses.size() * sizeof(vk::DeviceAddress));
 		// Queue after the registration, so a drain racing this sees the buffer it must fill.
 		m_memory_tracker.QueueBdaSync(buffer.CpuAddress(), buffer.Size());
 	} else {
@@ -179,6 +180,87 @@ void BufferCache::ChangeRegister(BufferId id) {
 }
 
 void BufferCache::TouchBuffer(const Buffer& buffer) {
+void BufferCache::MakePageTableResident(uint64_t table_offset, uint64_t size) {
+	if (!m_bda_pagetable_buffer.IsSparse() || size == 0) {
+		return;
+	}
+	const auto first = table_offset / m_bda_table_chunk;
+	const auto last  = (table_offset + size - 1) / m_bda_table_chunk;
+	EXIT_IF(last >= m_bda_table_chunks.size());
+	std::vector<size_t> fresh;
+	for (auto chunk = first; chunk <= last; chunk++) {
+		if (m_bda_table_chunks[chunk] == nullptr) {
+			fresh.push_back(static_cast<size_t>(chunk));
+		}
+	}
+	if (fresh.empty()) {
+		return;
+	}
+	VmaAllocationCreateInfo create {};
+	create.requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+	VkMemoryRequirements requirements {};
+	requirements.size           = m_bda_table_chunk;
+	requirements.alignment      = m_bda_table_chunk;
+	requirements.memoryTypeBits = m_bda_table_memory_types;
+	std::vector<vk::SparseMemoryBind> binds;
+	std::vector<vk::Buffer>           zeroing;
+	binds.reserve(fresh.size());
+	zeroing.reserve(fresh.size());
+	for (const auto chunk: fresh) {
+		VmaAllocation     allocation = nullptr;
+		VmaAllocationInfo info {};
+		EXIT_NOT_IMPLEMENTED(vmaAllocateMemory(m_graphics.allocator, &requirements, &create,
+		                                       &allocation, &info) != VK_SUCCESS);
+		m_bda_table_chunks[chunk] = allocation;
+		vk::SparseMemoryBind bind {};
+		bind.resourceOffset = chunk * m_bda_table_chunk;
+		bind.size           = m_bda_table_chunk;
+		bind.memory         = info.deviceMemory;
+		bind.memoryOffset   = info.offset;
+		binds.push_back(bind);
+		VkBufferCreateInfo alias_info {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+		alias_info.size  = m_bda_table_chunk;
+		alias_info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+		VkBuffer alias   = VK_NULL_HANDLE;
+		EXIT_NOT_IMPLEMENTED(vmaCreateAliasingBuffer(m_graphics.allocator, allocation, &alias_info,
+		                                             &alias) != VK_SUCCESS);
+		zeroing.push_back(alias);
+	}
+	m_scheduler.RunDetached(0, [&](vk::CommandBuffer command) {
+		for (const auto alias: zeroing) {
+			command.fillBuffer(alias, 0, VK_WHOLE_SIZE, 0);
+		}
+		vk::MemoryBarrier barrier {};
+		barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+		barrier.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+		command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+		                        vk::PipelineStageFlagBits::eAllCommands, {}, 1, &barrier, 0,
+		                        nullptr, 0, nullptr);
+	});
+	for (const auto alias: zeroing) {
+		m_graphics.device.destroyBuffer(alias, nullptr);
+	}
+	vk::SparseBufferMemoryBindInfo buffer_bind {};
+	buffer_bind.buffer    = m_bda_pagetable_buffer.Handle();
+	buffer_bind.bindCount = static_cast<uint32_t>(binds.size());
+	buffer_bind.pBinds    = binds.data();
+	vk::BindSparseInfo bind_info {};
+	bind_info.bufferBindCount = 1;
+	bind_info.pBufferBinds    = &buffer_bind;
+	const auto queue =
+	    m_graphics.readback_queue != nullptr ? m_graphics.readback_queue : m_graphics.queue;
+	vk::Result result;
+	{
+		Common::LockGuard lock(m_graphics.queue_mutex);
+		result = queue.bindSparse(1, &bind_info, m_bda_table_fence);
+	}
+	if (result == vk::Result::eSuccess) {
+		result = m_graphics.device.waitForFences(1, &m_bda_table_fence, VK_TRUE, UINT64_MAX);
+	}
+	EXIT_IF(result != vk::Result::eSuccess);
+	EXIT_IF(m_graphics.device.resetFences(1, &m_bda_table_fence) != vk::Result::eSuccess);
+}
+
 	if (!buffer.is_deleted) {
 		m_lru_cache.Touch(buffer.lru_id, m_gc_tick);
 	}
@@ -422,7 +504,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
     : m_graphics(graphics), m_scheduler(scheduler), m_fault_manager(graphics, scheduler, *this),
       m_gds_buffer(graphics, scheduler, MemoryUsage::Stream, 0, AllFlags, GdsBufferSize),
       m_bda_pagetable_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
-                             BDA_PAGETABLE_SIZE),
+                             BDA_PAGETABLE_SIZE, graphics.sparse_residency_buffer_enabled),
       m_memory_tracker(page_manager),
       m_staging_buffer(graphics, scheduler, MemoryUsage::Upload, 512 * MiB),
       m_stream_buffer(graphics, scheduler, MemoryUsage::Stream, 64 * MiB),
@@ -433,9 +515,25 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
 	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer.Handle(),
 	                     "BDA Page Table Buffer");
+	if (m_bda_pagetable_buffer.IsSparse()) {
+		vk::MemoryRequirements requirements {};
+		m_graphics.device.getBufferMemoryRequirements(m_bda_pagetable_buffer.Handle(),
+		                                              &requirements);
+		m_bda_table_chunk        = std::max<uint64_t>(requirements.alignment, 64 * 1024);
+		m_bda_table_memory_types = requirements.memoryTypeBits;
+		m_bda_table_chunks.assign(
+		    static_cast<size_t>((BDA_PAGETABLE_SIZE + m_bda_table_chunk - 1) / m_bda_table_chunk),
+		    nullptr);
+		vk::FenceCreateInfo fence_info {};
+		EXIT_NOT_IMPLEMENTED(m_graphics.device.createFence(
+		                         &fence_info, nullptr, &m_bda_table_fence) != vk::Result::eSuccess);
+	}
 	m_scheduler.BeginCommand();
 	for (auto* buffer: {&m_bda_pagetable_buffer, m_fault_manager.GetFaultBuffer()}) {
-		buffer->Fill(0, buffer->Size(), 0);
+		// A sparse page table is zeroed chunk by chunk as MakePageTableResident binds it.
+		if (!buffer->IsSparse()) {
+			buffer->Fill(0, buffer->Size(), 0);
+		}
 	}
 	const auto null_id =
 	    m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 16);
@@ -459,6 +557,15 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 }
 
 BufferCache::~BufferCache() {
+	if (m_bda_table_fence != nullptr) {
+		m_graphics.device.destroyFence(m_bda_table_fence, nullptr);
+	}
+	for (auto& chunk: m_bda_table_chunks) {
+		if (chunk != nullptr) {
+			vmaFreeMemory(m_graphics.allocator, chunk);
+			chunk = nullptr;
+		}
+	}
 	if (!m_gpu_modified_ranges.Empty()) {
 		EXIT("BufferCache: destroyed with pending GPU-modified ranges\n");
 	}

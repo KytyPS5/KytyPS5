@@ -106,17 +106,17 @@ namespace {
 using namespace Libs::Controller;
 
 struct Controller {
-	explicit Controller(bool check_defaults = true) {
+	Controller() {
 		now                    = 1000;
 		haptics_handles_rumble = false;
 		Initialize();
 		Connect(1);
-		if (check_defaults) {
-			Check(GetSettingScale(Setting::SpeakerVolume) == 1.0f &&
-			          GetSettingScale(Setting::VibrationIntensity) == 1.0f &&
-			          GetSettingScale(Setting::TriggerEffectIntensity) == 1.0f,
-			      "controller initialization retained old settings");
-		}
+		Check(GetSettingScale(Setting::SpeakerVolume) ==
+		              Config::GetControllerSpeakerVolume() / 100.0f &&
+		          GetSettingScale(Setting::VibrationIntensity) ==
+		              Config::GetControllerVibrationIntensity() / 100.0f &&
+		          GetSettingScale(Setting::TriggerEffectIntensity) == 1.0f,
+		      "controller initialization retained old settings");
 		rumble.clear();
 		haptics.clear();
 		effects.clear();
@@ -169,7 +169,7 @@ void TestGlobalControllerLevels() {
 	options.controller_vibration_intensity = 25;
 	Config::Load(options);
 	{
-		Controller controller(false);
+		Controller controller;
 		Check(GetSettingScale(Setting::SpeakerVolume) == 0.5f &&
 		          GetSettingScale(Setting::VibrationIntensity) == 0.25f &&
 		          GetSettingScale(Setting::TriggerEffectIntensity) == 1.0f,
@@ -182,12 +182,19 @@ void TestGlobalControllerLevels() {
 		Check(GetSettingScale(Setting::SpeakerVolume) == 0.0f &&
 		          GetSettingScale(Setting::VibrationIntensity) == 0.0f,
 		      "cycle hotkeys did not mute globally scaled outputs");
+		CycleSetting(Setting::SpeakerVolume);
+		CycleSetting(Setting::VibrationIntensity);
+		Check(GetSettingScale(Setting::SpeakerVolume) == 0.01f &&
+		          GetSettingScale(Setting::VibrationIntensity) == 0.0825f,
+		      "cycle hotkeys did not multiply the global controller levels");
+		Check(rumble.back().large == 17 * 257 && rumble.back().small == 8 * 257,
+		      "cycling vibration did not apply the combined intensity to cached rumble");
 	}
 	options.controller_speaker_volume      = 0;
 	options.controller_vibration_intensity = 0;
 	Config::Load(options);
 	{
-		Controller controller(false);
+		Controller controller;
 		Check(GetSettingScale(Setting::SpeakerVolume) == 0.0f &&
 		          GetSettingScale(Setting::VibrationIntensity) == 0.0f,
 		      "zero global controller levels did not mute outputs");

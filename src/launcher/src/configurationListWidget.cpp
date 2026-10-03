@@ -17,7 +17,6 @@
 #include <QAction>
 #include <QApplication>
 #include <QComboBox>
-#include <QColor>
 #include <QCoreApplication>
 #include <QCursor>
 #include <QDesktopServices>
@@ -315,9 +314,7 @@ void ConfigurationListWidget::WriteSettings() {
 	s->remove(CONF_GLOBAL);
 	s->beginGroup(CONF_GLOBAL);
 	m_global_info.WriteSettings(s.get());
-	s->setValue("controller_color", m_global_info.controller_color);
-	s->setValue("controller_speaker_volume", m_global_info.controller_speaker_volume);
-	s->setValue("controller_vibration_intensity", m_global_info.controller_vibration_intensity);
+	m_global_info.controller.WriteSettings(s.get());
 	s->endGroup();
 
 	s->remove(CONF_SECTION_NAME);
@@ -361,17 +358,7 @@ void ConfigurationListWidget::ReadSettings() {
 	if (!s->childKeys().isEmpty()) {
 		m_global_info.ReadSettings(s.get());
 	}
-	const QColor controller_color(s->value("controller_color").toString());
-	m_global_info.controller_color =
-	    controller_color.isValid() ? controller_color.name(QColor::HexRgb) : QString {};
-	const auto read_controller_percent = [&s](const char* key) {
-		bool ok = false;
-		const int value = s->value(key, 100).toInt(&ok);
-		return ok ? qBound(0, value, 100) : 100;
-	};
-	m_global_info.controller_speaker_volume = read_controller_percent("controller_speaker_volume");
-	m_global_info.controller_vibration_intensity =
-	    read_controller_percent("controller_vibration_intensity");
+	m_global_info.controller.ReadSettings(s.get());
 	s->endGroup();
 
 	qDeleteAll(m_custom_infos);
@@ -424,9 +411,7 @@ ConfigurationListWidget::CreateConfiguration(const ConfigurationItem& item) cons
 	const auto* custom = m_custom_infos.value(item.GetInfo().game_path);
 	info->CopyGameInfoFrom(item.GetInfo());
 	info->CopyEmulatorSettingsFrom(custom != nullptr ? *custom : m_global_info);
-	info->controller_color               = m_global_info.controller_color;
-	info->controller_speaker_volume      = m_global_info.controller_speaker_volume;
-	info->controller_vibration_intensity = m_global_info.controller_vibration_intensity;
+	info->controller = m_global_info.controller;
 	if (custom != nullptr && !custom->elf.isEmpty()) {
 		info->elf = custom->elf;
 	}
@@ -805,22 +790,18 @@ void ConfigurationListWidget::delete_configuartion() {
 void ConfigurationListWidget::edit_global_settings() {
 	Configuration info;
 	info.CopyEmulatorSettingsFrom(m_global_info);
-	info.controller_color               = m_global_info.controller_color;
-	info.controller_speaker_volume      = m_global_info.controller_speaker_volume;
-	info.controller_vibration_intensity = m_global_info.controller_vibration_intensity;
+	info.controller = m_global_info.controller;
 	info.name = tr("Global settings");
 
 	ConfigurationEditDialog dlg(info, this);
 	dlg.setWindowTitle(tr("Global settings"));
-	dlg.SetGameDirectories(m_game_dirs);
+	dlg.SetGlobalSettings(m_game_dirs);
 	connect(&dlg, &ConfigurationEditDialog::PreviewControllerColor, this,
 	        &ConfigurationListWidget::PreviewControllerColor);
 
 	if (dlg.exec() == QDialog::Accepted) {
 		m_global_info.CopyEmulatorSettingsFrom(info);
-		m_global_info.controller_color               = info.controller_color;
-		m_global_info.controller_speaker_volume      = info.controller_speaker_volume;
-		m_global_info.controller_vibration_intensity = info.controller_vibration_intensity;
+		m_global_info.controller     = info.controller;
 		const auto game_dirs         = NormalizeGameDirectories(dlg.GetGameDirectories());
 		const bool game_dirs_changed = game_dirs != m_game_dirs;
 		m_game_dirs                  = game_dirs;

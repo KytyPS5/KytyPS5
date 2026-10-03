@@ -5,6 +5,7 @@
 
 #include <QByteArray>
 #include <QChar>
+#include <QColor>
 #include <QMetaEnum>
 #include <QMetaType>
 #include <QObject>
@@ -45,6 +46,30 @@ QString EnumToText(T value) {
 	                                                                     : key);
 }
 
+struct ControllerSettings {
+	QString color;
+	int     speaker_volume      = 100;
+	int     vibration_intensity = 100;
+
+	void WriteSettings(QSettings* s) const {
+		s->setValue("controller_color", color);
+		s->setValue("controller_speaker_volume", speaker_volume);
+		s->setValue("controller_vibration_intensity", vibration_intensity);
+	}
+
+	void ReadSettings(QSettings* s) {
+		const QColor saved_color(s->value("controller_color").toString());
+		color = saved_color.isValid() ? saved_color.name(QColor::HexRgb) : QString {};
+		const auto read_percent = [s](const char* key) {
+			bool      ok    = false;
+			const int value = s->value(key, 100).toInt(&ok);
+			return ok ? qBound(0, value, 100) : 100;
+		};
+		speaker_volume      = read_percent("controller_speaker_volume");
+		vibration_intensity = read_percent("controller_vibration_intensity");
+	}
+};
+
 class Configuration: public QObject {
 	Q_OBJECT
 
@@ -84,14 +109,13 @@ public:
 	GameStatus game_status     = GameStatus::Unknown;
 	QString    game_comment;
 
+	// Controller preferences always come from the global configuration.
+	ControllerSettings controller;
+
 	Resolution             screen_resolution           = Resolution::R1280X720;
 	QString                user_name                   = "Kyty";
 	int                    user_id                     = Config::DEFAULT_USER_ID;
 	QString                audio_input_device;
-	// These preferences come from GlobalConfiguration even when a game has custom settings.
-	QString                controller_color;
-	int                    controller_speaker_volume      = 100;
-	int                    controller_vibration_intensity = 100;
 	PresentMode            present_mode                = PresentMode::Mailbox;
 	int                    gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;

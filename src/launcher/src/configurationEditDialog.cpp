@@ -209,9 +209,9 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->lineEdit_user_name->setMaxLength(static_cast<int>(Config::MAX_USER_NAME_LENGTH));
 	m_ui->lineEdit_user_name->setText(info.user_name);
 	m_ui->spinBox_user_id->setValue(info.user_id);
-	UpdateControllerColorButton(m_ui->button_controller_color, info.controller_color);
-	m_ui->slider_controller_vibration->setValue(info.controller_vibration_intensity);
-	m_ui->slider_controller_volume->setValue(info.controller_speaker_volume);
+	UpdateControllerColorButton(m_ui->button_controller_color, info.controller.color);
+	m_ui->slider_controller_vibration->setValue(info.controller.vibration_intensity);
+	m_ui->slider_controller_volume->setValue(info.controller.speaker_volume);
 	auto* microphone = m_ui->comboBox_audio_input_device;
 	microphone->clear();
 	microphone->addItem(tr("None"), QString {});
@@ -352,8 +352,8 @@ void ConfigurationEditDialog::InitGameDirectories() {
 	update_game_directory_buttons();
 }
 
-void ConfigurationEditDialog::SetGameDirectories(const QStringList& dirs) {
-	m_show_game_dirs = true;
+void ConfigurationEditDialog::SetGlobalSettings(const QStringList& dirs) {
+	m_global_settings = true;
 	m_game_dirs_list->clear();
 	m_game_dirs_group->setMinimumWidth(GLOBAL_SETTINGS_GAME_DIRS_MIN_WIDTH);
 
@@ -370,7 +370,7 @@ void ConfigurationEditDialog::SetGameDirectories(const QStringList& dirs) {
 
 QStringList ConfigurationEditDialog::GetGameDirectories() const {
 	QStringList dirs;
-	if (!m_show_game_dirs) {
+	if (!m_global_settings) {
 		return dirs;
 	}
 
@@ -410,14 +410,14 @@ void ConfigurationEditDialog::resizeEvent(QResizeEvent* event) {
 	g_last_geometry = saveGeometry();
 }
 
-static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui) {
+static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, bool global_settings) {
 	info.user_name = ui.lineEdit_user_name->text().trimmed();
 	info.user_id   = ui.spinBox_user_id->value();
 	info.audio_input_device = ui.comboBox_audio_input_device->currentData().toString();
-	if (ui.controller_group->isVisible()) {
-		info.controller_color               = ui.button_controller_color->property("controllerColor").toString();
-		info.controller_vibration_intensity = ui.slider_controller_vibration->value();
-		info.controller_speaker_volume      = ui.slider_controller_volume->value();
+	if (global_settings) {
+		info.controller.color = ui.button_controller_color->property("controllerColor").toString();
+		info.controller.vibration_intensity = ui.slider_controller_vibration->value();
+		info.controller.speaker_volume      = ui.slider_controller_volume->value();
 	}
 	info.screen_resolution =
 	    TextToEnum<Configuration::Resolution>(ui.comboBox_screen_resolution->currentText());
@@ -468,7 +468,7 @@ void ConfigurationEditDialog::save() {
 		return;
 	}
 
-	UpdateInfo(m_info, *m_ui);
+	UpdateInfo(m_info, *m_ui, m_global_settings);
 
 	emit accept();
 }
@@ -476,9 +476,9 @@ void ConfigurationEditDialog::save() {
 void ConfigurationEditDialog::clear() {
 	Configuration default_info;
 	Init(default_info);
-	emit PreviewControllerColor({});
 
-	if (m_show_game_dirs) {
+	if (m_global_settings) {
+		emit PreviewControllerColor({});
 		m_game_dirs_list->clear();
 		update_game_directory_buttons();
 	}

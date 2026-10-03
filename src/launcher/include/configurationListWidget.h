@@ -34,7 +34,7 @@ public:
 
 	[[nodiscard]] const QString& GetSettingsFile() const { return m_settings_file; }
 	[[nodiscard]] const QString& GetGlobalControllerColor() const {
-		return m_global_info.controller_color;
+		return m_global_info.controller.color;
 	}
 	[[nodiscard]] std::unique_ptr<Configuration>
 	CreateConfiguration(const ConfigurationItem& item) const;

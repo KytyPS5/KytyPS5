@@ -363,6 +363,65 @@ launches until a bounded synthetic SPIR-V or emitter regression isolates the
 instruction pattern that triggers the crash. Keep shader validation and GPUAV
 controls to distinguish invalid SPIR-V from a driver defect.
 
+## Generic image lookup after a sampled HTile clear import (2026-10-03)
+
+The bounded GPUAV run
+`_Build/runs/yotei-integrated-20261003-141139-presentfix-gpuav-sync`
+stopped at `shown=195` in `TextureCache::FindImage`:
+`sampled HTile import requires its metadata-aware lookup path`. This guard
+sees an overlap with a previously imported virtual depth clear, but the log
+does not identify whether the new request is a sampled texture, storage image,
+color target, or depth target. The temporary Vertex loop cap was still active;
+the run had no pixel readback and does not prove a visible frame.
+
+The diagnostic retry
+`_Build/runs/yotei-integrated-20261003-143757-presentfix-gpuav-sync`
+identified an exact `DepthTarget` rebinding: both owner and request used
+data `0x5053070000+0x1000000`, HTile `0x5054070000+0x40000`, D32 format,
+and 2048×2048, one layer. It exited 321 at `shown=192`; the counter is not
+pixel proof. The diagnostic patch was reverted after capture.
+
+The independent native `--sampled-htile-depth-promotion-only` fixture uses
+uniform HTile clear1 over stale raw depth, numerically samples the logical
+depth, binds the exact same allocation as a native depth target, clears it to
+zero, and numerically samples the new pixels. It was RED at the original
+`FindImage` guard (`_Build/logs/htile-depth-promotion-red2-20261003.*`) and
+GREEN with exact-owner promotion
+(`_Build/logs/htile-depth-promotion-final-green-20261003.*`). A different
+HTile range remains rejected with exit 321
+(`_Build/logs/htile-depth-mismatch-final-20261003.*`). Neighboring array
+clear and native HTile subset fixtures pass
+(`_Build/logs/htile-array-neighbor-20261003.*`,
+`_Build/logs/native-htile-subset-neighbor-20261003.*`). The first test design
+using the older clear-discovery fixture stopped before the transition at its
+unrelated pattern-fill setup and is not counted as RED. Game retry is pending;
+this test does not prove a menu.
+
+Two later bounded game retries did not verify the exact-owner path. The first
+(`_Build/runs/yotei-integrated-20261003-150014-presentfix-gpuav-sync`)
+closed by a 900-second shown-frame watchdog at `shown=153` while compiling
+instrumented pipelines. The warm retry
+(`_Build/runs/yotei-integrated-20261003-152203-presentfix-gpuav-sync`)
+reached `shown=193` and hit the same guard. Detailed diagnosis in
+`_Build/runs/yotei-integrated-20261003-154734-presentfix-gpuav-sync` shows
+an overlapping depth target with pitch 4096 and a 64 MiB mip footprint,
+versus the imported owner's pitch 2048 and 16 MiB footprint; its HTile range
+also differs. This is a different allocation layout, not the exact-owner
+transition proved above. Required RED before changing it: a synthetic
+metadata-aware imported clear followed by a larger overlapping depth target,
+with numerical proof that the target sees the correct guest memory layout and
+no stale raw depth bytes. Keep the mismatch guard until such a transfer is
+proven; gather the full request/owner ranges and clear/load state first.
+The full-range retry
+`_Build/runs/yotei-integrated-20261003-155620-presentfix-gpuav-sync`
+confirmed the alias precisely: both start at `0x50540b0000`; owner data is
+16 MiB at 2048×2048, target data 64 MiB at 4096×4096; both HTile ranges
+start at `0x50580b0000`, but owner uses 256 KiB and target 1 MiB. Neither
+source has CPU- or buffer-dirty pixels at the guard. This is a coherent
+native clear that must be materialized into the overlapping guest layout
+before the larger target can acquire it; blindly accepting the owner would
+use the wrong pitch and extent.
+
 ## GPU-produced indirect workgroup bounds for bounded SRT (2026-10-03)
 
 The bounded GPUAV run `_Build/runs/yotei-integrated-20261003-125433-presentfix-gpuav-sync`

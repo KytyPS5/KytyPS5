@@ -1,5 +1,33 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **3 октября 2026 года, 16:04 UTC** (native Windows via WSL;
+branch `yotei-windows-bringup`, pushed head `54573cb4` plus uncommitted
+HTile exact-owner fix and temporary Vertex cap; installed exe SHA-256
+`f839228c69a5cb5d692d5440cef749823936987630cf291c9723da2426d3c462`
+still has temporary diagnostic text and must be replaced):
+
+- Independent native test proved exact reuse of a sampled HTile clear as a
+  depth target with numerical depth comparison before and after a native
+  clear. The old guard failed, the exact-owner correction passed. A different
+  metadata range remains rejected; array and native HTile neighbors pass.
+  Commands and logs are in `docs/emulator-test-debt.md`.
+- Two bounded game retries with this correction failed to validate the exact
+  case: the first closed at `shown=153` after a 900-second watchdog while
+  compiling instrumented pipelines; the warm retry reached `shown=193` and
+  hit the guard again. Three variants of CS `54904fb419d79e49` took about
+  258 seconds each inside `vkCreateComputePipelines`; CPU shader preparation
+  was milliseconds. The pipeline cache was accepted and grew to 168 MiB.
+- Diagnostic retries identified a distinct 2048×2048 → 4096×4096 depth
+  alias at the same guest base: 16 MiB/256 KiB HTile owner versus 64 MiB/1 MiB
+  HTile target. Neither owner CPU nor buffer is dirty. The exact-owner fix
+  intentionally rejects this different layout. Required next: synthetic RED
+  for materializing the virtual clear into guest backing before acquiring
+  the larger target, with numerical layout proof. Then rerun the game.
+  Readback was disabled in these runs: `shown` is not pixel proof. First
+  nonzero frame from earlier runs remains the only visual milestone; menu
+  and gameplay **PENDING**. Remove the temporary Vertex cap and rebuild a
+  clean executable after diagnostic work.
+
 Checkpoint **3 октября 2026 года, 14:32 UTC** (native Windows via WSL;
 branch `yotei-windows-bringup`, pushed head `c9fa8d6b` plus uncommitted
 indirect-grid fix and temporary Vertex loop cap; installed exe SHA-256

@@ -1547,9 +1547,29 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		    FindImagesInRegion(desc.info.data.address, desc.info.data.size, false);
 
 		for (const auto id: candidates) {
-			if (m_slot_images[id].sampled_htile_clear_import) {
+			auto& imported = m_slot_images[id];
+			if (!imported.sampled_htile_clear_import) {
+				continue;
+			}
+			const auto& owner = imported.info;
+			// The HTile clear has already been materialized into this native D32
+			// image. An exact depth-attachment binding can take over that image
+			// without reading stale guest depth bytes or changing its pixels.
+			const bool same_depth_owner = desc.type == BindingType::DepthTarget &&
+			    owner.IsDepth() && desc.info.IsDepth() &&
+			    SameBacking(owner, desc.info, true) && owner.resources == desc.info.resources &&
+			    owner.guest_format == desc.info.guest_format && owner.pitch == desc.info.pitch &&
+			    owner.mip_layout == desc.info.mip_layout && owner.stencil == desc.info.stencil &&
+			    owner.metadata.kind == ImageMetadataKind::Htile &&
+			    desc.info.metadata.kind == ImageMetadataKind::Htile &&
+			    owner.metadata.range == desc.info.metadata.range &&
+			    owner.metadata.compression == desc.info.metadata.compression &&
+			    owner.metadata.stencil_compressed == desc.info.metadata.stencil_compressed &&
+			    !imported.IsCpuDirty() && !imported.IsBufferModified();
+			if (!same_depth_owner) {
 				EXIT("sampled HTile import requires its metadata-aware lookup path\n");
 			}
+			imported.sampled_htile_clear_import = false;
 		}
 		for (const auto id: candidates) {
 			const auto& image = m_slot_images[id];

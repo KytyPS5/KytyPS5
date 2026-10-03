@@ -12118,6 +12118,141 @@ void CheckSampledHtileClearDiscovery(const char* negative_scenario = nullptr) {
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
+void CheckSampledHtileDepthTargetPromotion(bool mismatched_metadata = false) {
+  constexpr const char* name = "SampledHtileDepthTargetPromotion";
+  constexpr uintptr_t base = 0x0000000204a00000ull;
+  constexpr uint64_t allocation_size = 0x20000;
+  constexpr uint64_t depth_size = 0x10000;
+  constexpr uint64_t metadata_address = base + depth_size;
+  constexpr uint64_t metadata_size = 0x8000;
+  constexpr uint32_t width = 64;
+  constexpr uint32_t height = 64;
+  EnsureRuntimeContext();
+  TileSizeAlign stencil_layout{}, htile_layout{}, depth_layout{};
+  Require(name, "HTile footprint",
+          TileGetDepthSize(width, height, 0, Prospero::DepthFormat::kZ32F,
+                           Prospero::StencilFormat::kInvalid, true,
+                           stencil_layout, htile_layout, depth_layout, 0) &&
+              depth_layout.size == depth_size && htile_layout.size == metadata_size,
+          "fixture HTile geometry is unsupported");
+  int64_t direct_offset = -1;
+  Require(name, "direct allocation",
+          Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+              0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+              allocation_size, 0x10000, 0, &direct_offset) == 0,
+          "HTile allocation failed");
+  void* mapped = reinterpret_cast<void*>(base);
+  Require(name, "direct mapping",
+          Libs::LibKernel::Memory::KernelMapDirectMemory(
+              &mapped, allocation_size, 0x3, 0x10, direct_offset, 0x10000) == 0 &&
+              mapped == reinterpret_cast<void*>(base),
+          "HTile mapping failed");
+  std::vector<uint32_t> raw_depth(depth_size / 4u, 0x3e800000u);
+  std::vector<uint32_t> raw_htile(metadata_size / 4u, 0xfffffff0u);
+  std::memcpy(mapped, raw_depth.data(), depth_size);
+  std::memcpy(reinterpret_cast<uint8_t*>(mapped) + depth_size,
+              raw_htile.data(), metadata_size);
+  {
+    RenderContext context(m_runtime_context);
+    auto& scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    context.MapMemory(base, allocation_size);
+    auto& cache = context.GetTextureCache();
+    auto& executor = context.GetRenderExecutor();
+
+    ShaderTextureResource descriptor{};
+    descriptor.fields[0] = static_cast<uint32_t>(base >> 8u);
+    descriptor.fields[1] = static_cast<uint32_t>(base >> 40u) |
+        (static_cast<uint32_t>(Prospero::BufferFormat::k32Float) << 20u) |
+        (((width - 1u) & 3u) << 30u);
+    descriptor.fields[2] = ((width - 1u) >> 2u) | ((height - 1u) << 14u);
+    descriptor.fields[3] = DstSel(4, 4, 4, 4) |
+        (static_cast<uint32_t>(Prospero::TileMode::kDepth) << 20u) |
+        (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u);
+    descriptor.fields[5] = 0x00700000u;
+    descriptor.fields[6] = 0x00280000u |
+        (static_cast<uint32_t>((metadata_address >> 8u) & 0xffu) << 24u);
+    descriptor.fields[7] = static_cast<uint32_t>(metadata_address >> 16u);
+    ShaderRecompiler::IR::DescriptorValue value{};
+    value.dword_count = 8;
+    std::copy(std::begin(descriptor.fields), std::end(descriptor.fields),
+              value.dwords.begin());
+    ShaderRecompiler::IR::ImageResource resource{};
+    resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+    resource.numeric_class = Prospero::TextureNumericClass::Float;
+    resource.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+    resource.read = true;
+    resource.depth_compare = true;
+
+    auto sampled = RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
+    const auto imported = sampled.image_id;
+    Require(name, "virtual clear owner",
+            cache.GetImage(imported).sampled_htile_clear_import &&
+                cache.GetImage(imported).info.data.address == base,
+            "uniform HTile clear did not import a depth owner");
+    auto sample_view = cache.FindTexture(imported, sampled.desc);
+    cache.GetImage(imported).Transit(vk::ImageLayout::eShaderReadOnlyOptimal,
+        vk::AccessFlagBits2::eShaderRead, {}, scheduler.Current().Handle());
+    constexpr std::array<float, 2> left_uv{0.5f / width, 0.5f / height};
+    constexpr std::array<float, 2> right_uv{63.5f / width, 0.5f / height};
+    Require(name, "logical clear before depth binding",
+            ProbeDepthComparison(name, scheduler, sample_view,
+                vk::ImageLayout::eShaderReadOnlyOptimal, left_uv, right_uv,
+                0.75f, vk::Filter::eNearest) == std::array{1.0f, 1.0f, 1.0f},
+            "sampled depth used stale raw bytes");
+    auto depth_target = sampled.desc;
+    depth_target.type = BindingType::DepthTarget;
+    depth_target.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+    if (mismatched_metadata) {
+      depth_target.info.metadata.range.address += metadata_size;
+      std::printf("KYTY_SAMPLED_HTILE_DEPTH_MISMATCH_READY\n");
+      std::fflush(stdout);
+      (void)cache.FindImage(depth_target);
+      Require(name, "mismatched HTile metadata rejected", false,
+              "depth target changed HTile ownership without a matching range");
+    }
+    std::printf("KYTY_SAMPLED_HTILE_DEPTH_PROMOTION_READY\n");
+    std::fflush(stdout);
+    const auto depth_id = cache.FindImage(depth_target);
+    Require(name, "promoted native depth owner",
+            depth_id == imported &&
+                !cache.GetImage(depth_id).sampled_htile_clear_import &&
+                cache.FindDepthTarget(depth_id, depth_target) != nullptr,
+            "depth target lost the imported logical clear");
+    vk::ClearValue native_zero{};
+    native_zero.depthStencil = vk::ClearDepthStencilValue{0.0f, 0};
+    TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), depth_id,
+        {vk::ImageAspectFlagBits::eDepth, 0, 1, 0, 1}, native_zero);
+    sampled = RenderExecutorTestAccess::ResolveTexture(executor, resource, value);
+    Require(name, "native owner after clear", sampled.image_id == depth_id,
+            "sampled HTile rediscovery replaced native depth pixels");
+    sample_view = cache.FindTexture(sampled.image_id, sampled.desc);
+    cache.GetImage(depth_id).Transit(vk::ImageLayout::eShaderReadOnlyOptimal,
+        vk::AccessFlagBits2::eShaderRead, {}, scheduler.Current().Handle());
+    Require(name, "native clear visible to comparison",
+            ProbeDepthComparison(name, scheduler, sample_view,
+                vk::ImageLayout::eShaderReadOnlyOptimal, left_uv, right_uv,
+                0.125f, vk::Filter::eNearest) == std::array{0.0f, 0.0f, 0.0f},
+            "sampled HTile reused stale metadata after native depth write");
+    RenderExecutorTestAccess::ResetBindings(executor);
+    context.UnmapMemory(base, allocation_size);
+    scheduler.Finish();
+    context.ShutdownGpu();
+  }
+  Require(name, "unmap direct backing",
+          Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+          "HTile mapping release failed");
+  Require(name, "release direct backing",
+          Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+              direct_offset, allocation_size) == 0,
+          "HTile allocation release failed");
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
 void CheckSampledHtileArrayClearDiscovery() {
   constexpr const char* name = "SampledHtileArrayClearDiscovery";
   constexpr uintptr_t base = 0x0000000206000000ull;
@@ -45195,6 +45330,18 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--sampled-htile-clear-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckSampledHtileClearDiscovery();
+    return 0;
+  }
+  if (argc == 2 &&
+      std::strcmp(argv[1], "--sampled-htile-depth-promotion-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckSampledHtileDepthTargetPromotion();
+    return 0;
+  }
+  if (argc == 2 &&
+      std::strcmp(argv[1], "--sampled-htile-depth-mismatch-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckSampledHtileDepthTargetPromotion(true);
     return 0;
   }
   if (argc == 2 &&

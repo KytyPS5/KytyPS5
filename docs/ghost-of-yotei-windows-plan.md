@@ -1,5 +1,23 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **3 октября 2026 года, 09:10 UTC** (native Windows; branch
+`yotei-windows-bringup`, test-only commit `0201fa00`; installed emulator exe
+SHA-256 `5251cfc12f986dda2e9b3c8c761e0e80b5fe0545493dcc210cad803c2da406da`):
+
+- Добавлен bounded native Vulkan indexed-draw контроль с публичным
+  passthrough VS и проверяемым цветом одного пикселя. Треугольник с 3 и
+  120000 индексами дал одинаковый ожидаемый readback; длинный draw также
+  прошёл GPU assisted validation. Соседний неиндексированный вариант GREEN.
+  Test exe SHA-256 `b42fd19cdd79c1dc874433123c2961cddad311257a1f6401b78730756ca844bd`;
+  логи в `docs/emulator-test-debt.md`. Круглое число 120000 выбрано как
+  синтетический масштаб; игровой draw имел 119856 индексов.
+- Это показывает, что количество индексов **само по себе** не воспроизводит
+  DeviceLost на простом VS. Нужен следующий fixture, где тот же bounded
+  индексированный draw использует многоресурсный vertex shader и реальные
+  descriptor bindings; затем RED и только после него общий GPU fix.
+  Текущая игра по-прежнему доказана только до спиннера на прежней GPUAV
+  сборке. Меню и gameplay **PENDING**.
+
 Checkpoint **3 октября 2026 года, 09:03 UTC** (native Windows; branch
 `yotei-windows-bringup`; installed emulator exe SHA-256
 `5251cfc12f986dda2e9b3c8c761e0e80b5fe0545493dcc210cad803c2da406da`):

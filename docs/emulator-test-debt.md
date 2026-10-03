@@ -33,6 +33,22 @@ to the synthetic ABI failure.
 
 ## DeviceLost on large indirect-image vertex draw (2026-10-03)
 
+Native indexed-draw control added in test-only commit `0201fa00` after the
+full compute switch passed. It extends the existing Vulkan graphics harness
+with an optional explicit uint32 index buffer, draws a repeated public
+triangle and compares the same one-pixel output as the neighboring ordinary
+`GraphicsPositionWExport` case. Counts 3 and 120000 both pass; the large
+case also passes bundled-layer GPU assisted validation without a validation
+error. Test exe SHA-256
+`b42fd19cdd79c1dc874433123c2961cddad311257a1f6401b78730756ca844bd`;
+native build `_Build/logs/indexed-control-final-build-20261003.log`, runs
+`_Build/logs/indexed-{neighbor,small,large,large-gpuav}-final-20261003.log*`
+all exit 0 without timeout. 120000 is a round synthetic bound above the
+observed 119856 game indices. The control uses a simple passthrough VS,
+so it does **not** execute the game's image table, vertex inputs, pipeline
+bindings or descriptor state. It narrows the next test to their combination;
+it is not a RED and does not justify a production workaround.
+
 The same native exe SHA-256 `4b93dd3d2dd2c7964dbbb30446bcdad21506eba1e792a56405bfd479bae9ebf6`
 gave two separate GPUAV+shader-instrumentation runs with nonzero loading
 spinner pixels, then `vkWaitSemaphores` `ErrorDeviceLost`: shown 203 / tick

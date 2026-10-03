@@ -158,6 +158,9 @@ struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
 	// Output of GetComputeProgram: the shader selects descriptors by workgroup z and has to be
 	// requested once per z slice (fixed_group_z), instead of as a whole.
 	bool               needs_group_z              = false;
+	// Output of GetComputeProgram: the shader calls functions (so far only ray tracing shaders),
+	// which are not translated, so no program is produced and its dispatches are not run.
+	bool               uses_function_calls        = false;
 	ShaderStageRuntime stage;
 };
 

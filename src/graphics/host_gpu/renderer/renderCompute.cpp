@@ -285,6 +285,10 @@ void RenderExecutor::DispatchDirectSlice(uint64_t submit_id, CommandBuffer& buff
 	input_info.fixed_group_z              = fixed_group_z;
 	const auto compute_program =
 	    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
+	if (!compute_program && input_info.uses_function_calls) {
+		ResetBindings();
+		return;
+	}
 	if (!compute_program && input_info.needs_group_z && want_slices != nullptr &&
 	    indirect_args == 0 && !use_thread_dimensions && thread_group_z >= 1 &&
 	    thread_group_z <= 16) {
@@ -491,6 +495,10 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	ShaderComputeInputInfo input_info {};
 	const auto compute_program = m_context.GetPipelineCache().GetComputeProgram(
 	    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
+	if (!compute_program && input_info.uses_function_calls) {
+		ResetBindings();
+		return;
+	}
 	EXIT_IF(!compute_program);
 	buffer.EndRendering();
 	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);

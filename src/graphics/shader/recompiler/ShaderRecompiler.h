@@ -29,6 +29,9 @@ struct TranslateResult {
 	// The shader selects descriptors by its workgroup z index, so it has to be compiled once per
 	// z slice (CompileOptions input_info.compute->fixed_group_z). Not a failure.
 	bool        needs_group_z = false;
+	// The shader calls through S_SWAPPC_B64 with a return address (callable shaders, i.e. ray
+	// tracing). Function calls are not translated, so the program is not produced.
+	bool        uses_function_calls = false;
 	std::string decoded_dump;
 	std::string cfg_dump;
 };

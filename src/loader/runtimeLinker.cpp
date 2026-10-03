@@ -1670,11 +1670,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	uint64_t tls_handler_size = is_shared ? 0 : Jit::SafeCall::GetSize();
 	EXIT_IF(tls_handler_size > UINT64_MAX - program->base_size_aligned);
 	program->mapped_size = program->base_size_aligned + tls_handler_size;
-#if !defined(__APPLE__)
 	const bool emulate_amd = Config::AmdCpuEnabled();
-#else
-	const bool emulate_amd = false;
-#endif
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	const bool protect_memory_faults = Config::RedZoneProtectionEnabled();
 #else

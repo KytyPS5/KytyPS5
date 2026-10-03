@@ -21,10 +21,8 @@
 #include <set>
 #include <unordered_set>
 #include <vector>
-#if !defined(__APPLE__)
 #include <xbyak/xbyak.h>
 #include <xbyak/xbyak_util.h>
-#endif
 
 #ifdef min
 #undef min
@@ -33,9 +31,7 @@
 #undef max
 #endif
 
-#if !defined(__APPLE__)
 using namespace Xbyak::util;
-#endif
 
 namespace Loader {
 
@@ -52,7 +48,6 @@ using s64 = int64_t;
 
 constexpr size_t NearJumpSize = 5;
 
-#if !defined(__APPLE__)
 
 struct PatchModule {
 	std::mutex           mutex {};
@@ -1573,18 +1568,6 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
 	return result;
 }
 
-#else
-
-GuestInstructionHostFeatures GetGuestInstructionHostFeatures() {
-	return {};
-}
-
-GuestInstructionPatchResult PatchGuestInstructions(u64, u64, std::span<const uintptr_t>, bool, bool,
-                                                   GuestInstructionHostFeatures) {
-	return {};
-}
-
-#endif
 
 namespace {
 
@@ -1763,7 +1746,6 @@ bool DecodeEhFrameFunctionStarts(uint64_t eh_frame_header_addr, uint64_t eh_fram
 
 void RegisterGuestInstructionPatchModule(void* module_ptr, uint64_t module_size,
                                          void* trampoline_area_ptr, uint64_t trampoline_area_size) {
-#if !defined(__APPLE__)
 	EXIT_IF(module_ptr == nullptr || module_size == 0 || trampoline_area_ptr == nullptr ||
 	        trampoline_area_size == 0);
 	const auto module_addr = reinterpret_cast<u64>(module_ptr);
@@ -1772,20 +1754,10 @@ void RegisterGuestInstructionPatchModule(void* module_ptr, uint64_t module_size,
 	                        std::forward_as_tuple(static_cast<u8*>(module_ptr), module_size,
 	                                              static_cast<u8*>(trampoline_area_ptr),
 	                                              trampoline_area_size));
-#else
-	(void)module_ptr;
-	(void)module_size;
-	(void)trampoline_area_ptr;
-	(void)trampoline_area_size;
-#endif
 }
 
 void UnregisterGuestInstructionPatchModule(void* module_ptr) {
-#if !defined(__APPLE__)
 	g_patch_modules.erase(reinterpret_cast<u64>(module_ptr));
-#else
-	(void)module_ptr;
-#endif
 }
 
 #undef ASSERT

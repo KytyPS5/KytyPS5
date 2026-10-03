@@ -723,6 +723,40 @@ void Translator::IMAGE_GATHER(const Decoder::Instruction& inst) {
 	}
 }
 
+// image_bvh_intersect_ray and image_bvh64_intersect_ray with full-float rays run through the
+// BvhIntersect emulation. The encodings it does not cover - the a16 forms - are an
+// APPROXIMATION, NOT AN IMPLEMENTATION:
+//
+// every such intersection reports a MISS: 0xffffffff in all four result registers. That
+// value is well defined under both readings of the result. As a child pointer it is INVALID_NODE,
+// so the guest traversal loop pushes nothing and drains its stack; as an f32 distance it is a NaN,
+// so every "closer than t_max" compare is false. Traversal therefore terminates and reports no hit
+// instead of spinning or reading uninitialised memory.
+//
+// WHAT IS LOST: every hardware-ray-traced effect renders as if the scene were empty - for UE5 this
+// is Lumen's hardware reflections and GI. The shader still runs and still writes its other
+// outputs, which is why this beats skipping the dispatch outright. The 128-bit srsrc is a BVH
+// descriptor and NOT a T#: it is deliberately never read here, so it can never reach
+// GetImageResource and be bound into a descriptor set.
+void Translator::IMAGE_BVH_INTERSECT_RAY(const Decoder::Instruction& inst) {
+	if ((inst.image_sample_flags & Decoder::ImageSampleFlagA16) == 0u) {
+		const auto result = ir.Emit(IR::ValueOpcode::BvhIntersect,
+		    {ConstructU32x4(inst.src1, 4), MakeImageAddress(inst, inst.src0), ir.GetExec()},
+		    inst.image_address_components - 10u);
+		for (uint32_t component = 0; component < 4; ++component) {
+			WriteOperand(OffsetOperand(inst.dst, component),
+			    ir.Emit(IR::ValueOpcode::CompositeExtractU32x4, {result, IR::Value(component)}));
+		}
+		return;
+	}
+	program.uses_bvh_intersect_stub = true;
+	// data_dwords is pinned to 4 by the decoder: VDataDwords is 4 in both encodings.
+	for (uint32_t index = 0; index < inst.data_dwords; index++) {
+		WriteOperand(OffsetOperand(inst.dst, index), IR::Value(0xffffffffu));
+	}
+	return;
+}
+
 IR::Value Translator::LoadSharedU32(uint32_t width, IR::U32 address, const IR::MemoryInfo& memory,
                                     uint32_t pc) {
 	IR::ValueOpcode opcode;
@@ -938,16 +972,6 @@ void Translator::DS_PERMUTE(const Decoder::Instruction& inst, bool backward) {
 
 void Translator::EmitMemory(const Decoder::Instruction& inst) {
 	switch (inst.opcode) {
-		case Decoder::Opcode::IMAGE_BVH_INTERSECT_RAY: {
-			const auto result = ir.Emit(IR::ValueOpcode::BvhIntersect,
-			    {ConstructU32x4(inst.src1, 4), MakeImageAddress(inst, inst.src0), ir.GetExec()},
-			    inst.image_address_components - 10u);
-			for (uint32_t component = 0; component < 4; ++component) {
-				WriteOperand(OffsetOperand(inst.dst, component),
-				    ir.Emit(IR::ValueOpcode::CompositeExtractU32x4, {result, IR::Value(component)}));
-			}
-			return;
-		}
 		case Decoder::Opcode::S_LOAD_DWORD:
 		case Decoder::Opcode::S_LOAD_DWORDX2:
 		case Decoder::Opcode::S_LOAD_DWORDX4:
@@ -1149,6 +1173,7 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::IMAGE_STORE_MIP: return IMAGE_STORE(inst);
 		case Decoder::Opcode::IMAGE_SAMPLE: return IMAGE_SAMPLE(inst);
 		case Decoder::Opcode::IMAGE_GATHER4: return IMAGE_GATHER(inst);
+		case Decoder::Opcode::IMAGE_BVH_INTERSECT_RAY: return IMAGE_BVH_INTERSECT_RAY(inst);
 
 		case Decoder::Opcode::DS_MIN_F32:
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicFMin32, false);

@@ -123,9 +123,14 @@ std::string ImageSampleFlagsToString(uint32_t flags) {
 }
 
 std::string FormatMimg(const Instruction& inst) {
-	const char* mimg_name = inst.opcode == Opcode::IMAGE_SAMPLE
-	                            ? MimgSampleOpcodeName(inst.opcode_id)
-	                            : MimgGatherOpcodeName(inst.opcode_id);
+	// The three encoding spaces are disjoint, so a plain first-hit lookup is unambiguous.
+	const char* mimg_name = MimgSampleOpcodeName(inst.opcode_id);
+	if (mimg_name == nullptr) {
+		mimg_name = MimgGatherOpcodeName(inst.opcode_id);
+	}
+	if (mimg_name == nullptr) {
+		mimg_name = MimgBvhOpcodeName(inst.opcode_id);
+	}
 	const std::string_view name =
 	    mimg_name != nullptr ? mimg_name : magic_enum::enum_name(inst.opcode);
 	std::string text =
@@ -142,6 +147,7 @@ std::string FormatMimg(const Instruction& inst) {
 	switch (inst.opcode) {
 		case Opcode::IMAGE_SAMPLE:
 		case Opcode::IMAGE_GATHER4:
+		case Opcode::IMAGE_BVH_INTERSECT_RAY:
 			text += fmt::format(" sample_flags={} addr_components={}",
 			                    ImageSampleFlagsToString(inst.image_sample_flags).c_str(),
 			                    inst.image_address_components);
@@ -375,7 +381,14 @@ void DecodeInstruction(std::span<const uint32_t> code, uint32_t word_index, Inst
 		case Family::MIMG: DecodeMimg(pc, code, word_index, inst); return;
 		case Family::EXP: DecodeExp(pc, code, word_index, inst); return;
 		default:
-			EXIT("unknown RDNA2 instruction family at pc 0x%08x, raw=0x%08x", pc, code[word_index]);
+			// Not fatal: an encoding family this decoder does not model is reported the way an
+			// unimplemented opcode inside a known family already is. BuildGraph refuses any program
+			// holding an UNSUPPORTED instruction, so the shader is skipped and named instead of
+			// taking the process down with it.
+			SetRawWords(inst, code, word_index, 1);
+			SetUnsupported(inst, Family::Unknown, code[word_index] >> 26u,
+			               "RDNA2 instruction family is not implemented");
+			return;
 	}
 }
 
@@ -410,7 +423,14 @@ void DecodeProgram(std::span<const uint32_t> code, Program& program) {
 		program.instructions.emplace_back();
 		DecodeInstruction(code, word_index, program.instructions.back());
 
-		const auto& inst = program.instructions.back();
+		auto& inst = program.instructions.back();
+		if (inst.word_count == 0) {
+			// A zero-width instruction would advance nothing and spin here forever, appending a
+			// decode every pass. Refuse the shader and name it instead.
+			SetRawWords(inst, code, word_index, 1);
+			SetUnsupported(inst, Family::Unknown, code[word_index] >> 26u,
+			               "decoder produced a zero-length instruction");
+		}
 		program.has_swap_pc |= inst.opcode == Opcode::S_SWAPPC_B64;
 		word_index += inst.word_count;
 

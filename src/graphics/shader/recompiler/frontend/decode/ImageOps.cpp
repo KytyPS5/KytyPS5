@@ -20,6 +20,15 @@ struct MimgGatherInfo {
 	uint32_t    flags    = 0;
 };
 
+struct MimgBvhInfo {
+	uint32_t    encoding = 0;
+	const char* name     = nullptr;
+	// Address VGPR counts from the RDNA2 encoding: a 64-bit node pointer costs one register more
+	// than a 32-bit one, and a16 packs the three ray vectors into halves.
+	uint32_t address_count     = 0;
+	uint32_t a16_address_count = 0;
+};
+
 struct MimgAtomicInfo {
 	uint32_t encoding    = 0;
 	Opcode   decoded     = Opcode::UNSUPPORTED;
@@ -217,6 +226,13 @@ constexpr MimgGatherInfo MIMG_GATHER_OPCODE_LIST[] = {
     {0x61u, "image_gather4h", ImageSampleFlagGatherHorizontal},
 };
 
+// The RDNA2 hardware ray-tracing primitive. Both encodings hardwire dmask=0xf, unorm=1, r128=1,
+// dim=0, ssamp=0 and d16=0, and return four dwords. srsrc is a 128-bit BVH descriptor, not a T#.
+constexpr MimgBvhInfo MIMG_BVH_OPCODE_LIST[] = {
+    {0xe6u, "image_bvh_intersect_ray", 11u, 8u},
+    {0xe7u, "image_bvh64_intersect_ray", 12u, 9u},
+};
+
 constexpr MimgAtomicInfo MIMG_ATOMIC_OPCODE_LIST[] = {
     {0x0fu, Opcode::IMAGE_ATOMIC_SWAP, true},
     {0x10u, Opcode::IMAGE_ATOMIC_CMPSWAP},
@@ -235,9 +251,14 @@ constexpr MimgAtomicInfo MIMG_ATOMIC_OPCODE_LIST[] = {
 constexpr auto MIMG_SAMPLE_OPS = Detail::MakeOpcodeTable<0x100>(MIMG_SAMPLE_OPCODE_LIST);
 constexpr auto MIMG_GATHER_OPS = Detail::MakeOpcodeTable<0x100>(MIMG_GATHER_OPCODE_LIST);
 constexpr auto MIMG_ATOMIC_OPS = Detail::MakeOpcodeTable<0x100>(MIMG_ATOMIC_OPCODE_LIST);
+constexpr auto MIMG_BVH_OPS    = Detail::MakeOpcodeTable<0x100>(MIMG_BVH_OPCODE_LIST);
+
+const MimgBvhInfo* LookupBvh(uint32_t opcode) {
+	return Detail::FindOpcode(MIMG_BVH_OPS, opcode);
+}
 
 Opcode DecodeMimgOpcode(uint32_t opcode, const MimgSampleInfo* sample, const MimgGatherInfo* gather,
-                        const MimgAtomicInfo* atomic) {
+                        const MimgAtomicInfo* atomic, const MimgBvhInfo* bvh) {
 	if (sample != nullptr) {
 		return Opcode::IMAGE_SAMPLE;
 	}
@@ -246,6 +267,9 @@ Opcode DecodeMimgOpcode(uint32_t opcode, const MimgSampleInfo* sample, const Mim
 	}
 	if (atomic != nullptr) {
 		return atomic->decoded;
+	}
+	if (bvh != nullptr) {
+		return Opcode::IMAGE_BVH_INTERSECT_RAY;
 	}
 
 	switch (opcode) {
@@ -273,7 +297,12 @@ uint32_t DecodeMimgSampleFlags(const MimgSampleInfo* sample, const MimgGatherInf
 
 uint32_t DecodeMimgAddressComponents(uint32_t opcode, ImageDimension dimension,
                                      const MimgSampleInfo* sample, const MimgGatherInfo* gather,
-                                     const MimgAtomicInfo* atomic) {
+                                     const MimgAtomicInfo* atomic, const MimgBvhInfo* bvh,
+                                     bool a16) {
+	if (bvh != nullptr) {
+		// node pointer + ray extent + origin + direction + inverse direction.
+		return a16 ? bvh->a16_address_count : bvh->address_count;
+	}
 	if (sample != nullptr) {
 		return ImageSampleAddressComponents(sample->flags, dimension);
 	}
@@ -356,12 +385,13 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	const auto*    sample = Detail::FindOpcode(MIMG_SAMPLE_OPS, opcode);
 	const auto*    gather = Detail::FindOpcode(MIMG_GATHER_OPS, opcode);
 	const auto*    atomic = Detail::FindOpcode(MIMG_ATOMIC_OPS, opcode);
+	const auto*    bvh    = LookupBvh(opcode);
 
 	inst.pc                 = pc;
 	inst.word_count         = word_count;
 	inst.family             = Family::MIMG;
 	inst.opcode_id          = opcode;
-	inst.opcode             = DecodeMimgOpcode(opcode, sample, gather, atomic);
+	inst.opcode             = DecodeMimgOpcode(opcode, sample, gather, atomic, bvh);
 	inst.dmask              = (word0 >> 8u) & 0xfu;
 	inst.data_components    = gather != nullptr ? 4u : CountDmaskComponents(inst.dmask);
 	inst.data_bits          = d16 ? 16u : 32u;
@@ -372,6 +402,11 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	if (a16) {
 		inst.image_sample_flags |= ImageSampleFlagA16;
 	}
+	if (bvh != nullptr) {
+		// Both BVH encodings hardwire dmask=0xf and VDataDwords=4: the result is always v[N:N+3].
+		inst.data_components = 4u;
+		inst.data_dwords     = 4u;
+	}
 	inst.image_dimension  = dimension;
 	inst.image_r128       = r128;
 	inst.image_nsa_dwords = nsa_dwords;
@@ -379,7 +414,7 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 		inst.image_nsa_addr[i] = (code[word_index + 2u + i / 4u] >> ((i % 4u) * 8u)) & 0xffu;
 	}
 	inst.image_address_components =
-	    DecodeMimgAddressComponents(opcode, dimension, sample, gather, atomic);
+	    DecodeMimgAddressComponents(opcode, dimension, sample, gather, atomic, bvh, a16);
 	SetRawWords(inst, code, word_index, word_count);
 
 	if (inst.opcode == Opcode::UNSUPPORTED) {
@@ -408,10 +443,12 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	if (d16 && !supports_d16) {
 		SetUnsupported(inst, Family::MIMG, opcode, "MIMG opcode does not support D16 data");
 	}
-	if (inst.opcode == Opcode::IMAGE_BVH_INTERSECT_RAY &&
-	    (a16 || !r128 || inst.dmask != 0xfu || (nsa_dwords != 0u && nsa_dwords != 3u))) {
+	if (bvh != nullptr && (!r128 || inst.dmask != 0xfu)) {
+		SetUnsupported(inst, Family::MIMG, opcode, "BVH intersection requires R128/dmask:0xf");
+	}
+	if (bvh != nullptr && !a16 && nsa_dwords != 0u && nsa_dwords != 3u) {
 		SetUnsupported(inst, Family::MIMG, opcode,
-		               "BVH intersection requires full-float ray DWORDs and R128/dmask:0xf");
+		               "BVH intersection requires full-float ray DWORDs");
 	}
 
 	DecodeVectorGpr(vdata, inst.dst);
@@ -429,6 +466,11 @@ const char* MimgSampleOpcodeName(uint32_t opcode) {
 const char* MimgGatherOpcodeName(uint32_t opcode) {
 	const auto* gather = Detail::FindOpcode(MIMG_GATHER_OPS, opcode);
 	return gather != nullptr ? gather->name : nullptr;
+}
+
+const char* MimgBvhOpcodeName(uint32_t opcode) {
+	const auto* bvh = LookupBvh(opcode);
+	return bvh != nullptr ? bvh->name : nullptr;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Decoder

@@ -85,3 +85,23 @@ source is fetched separately and compiled without embedded signing resources.
 The native process communicates with the reader through stdin/stdout pipes.
 See `licenses/AGPL-3.0.txt` and upstream source notices. Distribute corresponding
 source alongside helper binaries as required by those licenses.
+
+## Helper startup failures
+
+PKG helper creation is serialized through closing the child-side pipe ends,
+preventing concurrent PKG launches from inheriting each other's temporary handles.
+Handshake and catalog reads share a 60-second deadline; receiving partial data
+does not reset it. A timeout closes the transport and terminates the helper,
+and the package is reported as unavailable. Ordinary asset reads retain their
+existing behavior. Scanning still runs on the UI thread, so it can remain
+unresponsive until a slow package finishes or its startup deadline expires.
+
+The startup regression uses a native mock helper and needs no .NET runtime:
+
+```sh
+cmake --build _Build/windows --target pkg_startup_tests
+ctest --test-dir _Build/windows -R '^pkg_startup$' --output-on-failure
+```
+
+It covers silent startup, partial handshake, stalled catalog, forced cleanup,
+a successful mount after failure, and EOF during concurrent helper launches.

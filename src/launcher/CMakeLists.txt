@@ -214,3 +214,18 @@ if(BUILD_TESTING AND KYTY_BUILD_PKG_HELPER)
     add_test(NAME pkg_bridge COMMAND "${Python3_EXECUTABLE}"
         "${PROJECT_SOURCE_DIR}/tools/pkg/tests/run_test.py" $<TARGET_FILE:pkg_bridge_tests> --bridge)
 endif()
+
+if(BUILD_TESTING)
+    # Includes the private transport implementation; do not also link common.
+    add_executable(pkg_startup_tests EXCLUDE_FROM_ALL
+        "${PROJECT_SOURCE_DIR}/tools/pkg/tests/StartupTests.cpp")
+    target_include_directories(pkg_startup_tests PRIVATE "${KYTY_SOURCE_DIR}" "${PROJECT_BINARY_DIR}")
+    if(NOT WIN32)
+        find_package(Threads REQUIRED)
+        target_link_libraries(pkg_startup_tests PRIVATE Threads::Threads)
+    endif()
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    add_test(NAME pkg_startup COMMAND "${Python3_EXECUTABLE}"
+        "${PROJECT_SOURCE_DIR}/tools/pkg/tests/run_startup_test.py" $<TARGET_FILE:pkg_startup_tests>)
+    set_tests_properties(pkg_startup PROPERTIES TIMEOUT 40)
+endif()

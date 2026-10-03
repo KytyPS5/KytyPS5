@@ -3,7 +3,9 @@
 
 #include "common/archiveReader.h"
 
+#include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -20,6 +22,7 @@
 #else
 #include <cerrno>
 #include <fcntl.h>
+#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <sys/wait.h>
@@ -84,8 +87,15 @@ public:
 	Pipe(const Pipe&)            = delete;
 	Pipe& operator=(const Pipe&) = delete;
 	~Pipe() { Close(); }
-	void Open(const std::filesystem::path& package) {
+	void Open(const std::filesystem::path& package,
+	          std::chrono::milliseconds    startup_timeout = std::chrono::seconds(60)) {
 		const auto helper = HelperPath();
+		// Cover creation, spawn and closing the child ends: another PKG helper
+		// must never inherit these temporarily inheritable pipe handles.
+		static std::mutex spawn_mutex;
+		std::lock_guard   spawn_lock(spawn_mutex);
+		startup_deadline_ = std::chrono::steady_clock::now() + startup_timeout;
+		starting_         = true;
 #ifdef _WIN32
 		// Windows filenames cannot contain a double quote. Explicit quoted arguments,
 		// not cmd.exe/PowerShell, carry native Unicode package/helper filenames.
@@ -134,8 +144,13 @@ public:
 			close(input[1]);
 			throw std::runtime_error("Cannot create helper output pipe");
 		}
-		for (int fd: {input[0], input[1], output[0], output[1]})
-			fcntl(fd, F_SETFD, FD_CLOEXEC);
+		for (int fd: {input[0], input[1], output[0], output[1]}) {
+			if (fcntl(fd, F_SETFD, FD_CLOEXEC) < 0) {
+				for (int end: {input[0], input[1], output[0], output[1]})
+					close(end);
+				throw std::runtime_error("Cannot protect helper pipe inheritance");
+			}
+		}
 		process_ = fork();
 		if (process_ < 0) {
 			for (int fd: {input[0], input[1], output[0], output[1]})
@@ -188,9 +203,14 @@ public:
 			int status = 0;
 			// Closing the stream normally ends the helper. If it is still busy,
 			// terminate only the child process we spawned and reap it.
-			const auto result = waitpid(process_, &status, WNOHANG);
+			pid_t result;
+			do {
+				result = waitpid(process_, &status, WNOHANG);
+			} while (result < 0 && errno == EINTR);
 			if (result == 0) {
-				kill(process_, SIGTERM);
+				// A stalled helper can ignore SIGTERM. Force termination so cleanup
+				// cannot defeat the startup deadline.
+				kill(process_, SIGKILL);
 				while (waitpid(process_, &status, 0) < 0 && errno == EINTR) {
 				}
 			}
@@ -234,14 +254,49 @@ public:
 			size -= static_cast<size_t>(wrote);
 		}
 	}
+	void FinishStartup() { starting_ = false; }
 	void Read(void* data, size_t size) {
 		auto* p = static_cast<uint8_t*>(data);
 		while (size != 0) {
 #ifdef _WIN32
+			size_t requested = size;
+			if (starting_) {
+				DWORD available = 0;
+				while (true) {
+					CheckStartupDeadline();
+					if (!PeekNamedPipe(output_read_, nullptr, 0, nullptr, &available, nullptr))
+						throw std::runtime_error("Package helper closed the stream");
+					if (available != 0) break;
+					const auto state = WaitForSingleObject(process_, 10);
+					if (state == WAIT_FAILED)
+						throw std::runtime_error("Cannot wait for package helper");
+					if (state == WAIT_OBJECT_0) {
+						if (!PeekNamedPipe(output_read_, nullptr, 0, nullptr, &available,
+						                   nullptr) ||
+						    available == 0)
+							throw std::runtime_error("Package helper closed the stream");
+						break;
+					}
+				}
+				requested = std::min<size_t>(size, available);
+			}
 			DWORD got = 0;
-			if (!ReadFile(output_read_, p, static_cast<DWORD>(size), &got, nullptr) || got == 0)
+			if (!ReadFile(output_read_, p, static_cast<DWORD>(requested), &got, nullptr) ||
+			    got == 0)
 				throw std::runtime_error("Package helper closed the stream");
 #else
+			if (starting_) {
+				CheckStartupDeadline();
+				const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+				                           startup_deadline_ - std::chrono::steady_clock::now())
+				                           .count();
+				pollfd    ready {output_read_, POLLIN, 0};
+				const int result =
+				    poll(&ready, 1, static_cast<int>(std::clamp<int64_t>(remaining, 1, 1000)));
+				if (result < 0 && errno == EINTR) continue;
+				if (result < 0) throw std::runtime_error("Cannot poll package helper");
+				if (result == 0) continue;
+			}
 			const auto got = read(output_read_, p, size);
 			if (got < 0 && errno == EINTR) continue;
 			if (got <= 0) throw std::runtime_error("Package helper closed the stream");
@@ -273,6 +328,12 @@ public:
 	}
 
 private:
+	void CheckStartupDeadline() {
+		if (std::chrono::steady_clock::now() >= startup_deadline_)
+			throw std::runtime_error("Package helper startup/catalog timed out");
+	}
+	bool                                  starting_ = false;
+	std::chrono::steady_clock::time_point startup_deadline_;
 #ifdef _WIN32
 	HANDLE input_write_ = nullptr, output_read_ = nullptr, process_ = nullptr;
 #else
@@ -283,8 +344,10 @@ private:
 
 class PkgArchiveBackend final: public ArchiveReader {
 public:
-	explicit PkgArchiveBackend(const std::filesystem::path& package) {
-		pipe_.Open(package);
+	explicit PkgArchiveBackend(
+	    const std::filesystem::path& package,
+	    std::chrono::milliseconds    startup_timeout = std::chrono::seconds(60)) {
+		pipe_.Open(package, startup_timeout);
 		std::array<char, 4> magic {};
 		pipe_.Read(magic.data(), magic.size());
 		if (std::memcmp(magic.data(), "KPE1", 4) == 0)
@@ -319,6 +382,7 @@ public:
 				throw std::runtime_error("Package member has no directory parent");
 			children_[parent].push_back({name, entry.is_file});
 		}
+		pipe_.FinishStartup();
 		std::fprintf(stderr, "PKG mounted read-only: %zu entries (on-demand reads)\n",
 		             entries_.size());
 	}

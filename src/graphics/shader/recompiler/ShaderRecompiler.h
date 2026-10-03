@@ -26,6 +26,9 @@ struct CompileOptions {
 
 struct TranslateResult {
 	IR::Program program;
+	// The shader selects descriptors by its workgroup z index, so it has to be compiled once per
+	// z slice (CompileOptions input_info.compute->fixed_group_z). Not a failure.
+	bool        needs_group_z = false;
 	std::string decoded_dump;
 	std::string cfg_dump;
 };

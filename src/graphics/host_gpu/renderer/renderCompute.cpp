@@ -195,9 +195,34 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 	return true;
 }
 
+// Some shaders select their image/buffer descriptors by the workgroup's z index, which the host
+// cannot know when it resolves descriptors once per dispatch. Such a dispatch is issued as one
+// dispatch per z slice, each compiled with that slice index folded in.
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
-                                    uint32_t thread_group_z, uint32_t mode) {
+                                    uint32_t thread_group_z, uint32_t mode,
+                                    uint64_t indirect_args) {
+	bool want_slices = false;
+	DispatchDirectSlice(submit_id, buffer, thread_group_x, thread_group_y, thread_group_z, mode,
+	                    indirect_args, UINT32_MAX, &want_slices);
+	if (want_slices) {
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+			LOGF("GraphicsRenderDispatchDirect: splitting %ux%ux%u dispatch into %u z slices\n",
+			     thread_group_x, thread_group_y, thread_group_z, thread_group_z);
+		}
+		for (uint32_t z = 0; z < thread_group_z; ++z) {
+			DispatchDirectSlice(submit_id, buffer, thread_group_x, thread_group_y, 1, mode, 0, z,
+			                    nullptr);
+		}
+	}
+}
+
+void RenderExecutor::DispatchDirectSlice(uint64_t submit_id, CommandBuffer& buffer,
+                                         uint32_t thread_group_x, uint32_t thread_group_y,
+                                         uint32_t thread_group_z, uint32_t mode,
+                                         uint64_t indirect_args, uint32_t fixed_group_z,
+                                         bool* want_slices) {
 	EXIT_IF(buffer.IsInvalid());
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ctx    = buffer.GetRegisters();
@@ -207,7 +232,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	                    thread_group_x, thread_group_y, thread_group_z, mode,
 	                    sh_ctx.GetCs().cs_regs.data_addr);
 
-	if (thread_group_x == 0 || thread_group_y == 0 || thread_group_z == 0) {
+	// An indirect dispatch carries its counts in a GPU-written buffer, so the CPU-side copy can be
+	// stale or zero. Leave the decision to the device in that case.
+	if (indirect_args == 0 &&
+	    (thread_group_x == 0 || thread_group_y == 0 || thread_group_z == 0)) {
 		static std::atomic<uint32_t> log_count {0};
 		if (log_count.fetch_add(1, std::memory_order_relaxed) < 32) {
 			LOGF("GraphicsRenderDispatchDirect: skipping zero-sized dispatch groups=%ux%ux%u "
@@ -254,8 +282,21 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	ShaderComputeInputInfo input_info {};
 	const bool use_thread_dimensions = (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
 	input_info.dispatch_thread_dimensions = use_thread_dimensions;
+	input_info.fixed_group_z              = fixed_group_z;
 	const auto compute_program =
 	    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
+	if (!compute_program && input_info.needs_group_z && want_slices != nullptr &&
+	    indirect_args == 0 && !use_thread_dimensions && thread_group_z >= 1 &&
+	    thread_group_z <= 16) {
+		*want_slices = true;
+		ResetBindings();
+		return;
+	}
+	if (!compute_program) {
+		EXIT("compute shader 0x%016" PRIx64 " needs per-slice compilation that this dispatch cannot use "
+		     "(indirect, thread dimensions or more than 16 z groups)\n",
+		     sh_ctx.GetCs().cs_regs.data_addr);
+	}
 	if (use_thread_dimensions) {
 		input_info.dispatch_threads_num[0]    = thread_group_x;
 		input_info.dispatch_threads_num[1]    = thread_group_y;
@@ -264,7 +305,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	const auto& program   = *input_info.stage.program;
 	const auto& resources = *input_info.stage.resources;
-	if (resources.specialization_reads.empty() &&
+// The clear paths below rewrite the dispatch into a plain clear, which needs the CPU-visible
+	// group counts. An indirect dispatch does not have trustworthy ones, so leave it alone.
+	if (resources.specialization_reads.empty() && indirect_args == 0 &&
 	    (TryConsumeComputeMetaClear(input_info, buffer) ||
 	     TryConsumeComputeImageClear(input_info, buffer, thread_group_x, thread_group_y,
 	                                 thread_group_z, mode))) {
@@ -334,6 +377,19 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 	}
 
+	if (use_thread_dimensions && indirect_args != 0) {
+		// USE_THREAD_DIMENSIONS wants thread counts converted through the workgroup size, but an
+		// indirect dispatch only has group counts, and they live in a GPU-written buffer we cannot
+		// trust on the CPU. Hand the address to the device and let it do both steps.
+		static std::atomic<uint32_t> indirect_thread_log_count {0};
+		if (indirect_thread_log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+			LOGF("GraphicsRenderDispatchDirect: indirect dispatch with thread dimensions at "
+			     "0x%016" PRIx64 " uses host-read counts\n",
+			     indirect_args);
+		}
+		indirect_args = 0;
+	}
+
 	if (use_thread_dimensions) {
 		auto groups_from_threads = [](uint32_t threads, uint32_t group_size) {
 			return (threads == 0
@@ -390,7 +446,29 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
-	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+	if (indirect_args != 0) {
+		// The counts sit in a buffer the GPU wrote; reading them with dispatchIndirect is what
+		// makes the dispatch see the values that dispatch was actually issued with.
+		auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
+		    indirect_args, 3u * sizeof(uint32_t), false, false, BufferId {});
+		vk::BufferMemoryBarrier args_barrier {};
+		args_barrier.sType         = vk::StructureType::eBufferMemoryBarrier;
+		args_barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite |
+		                             vk::AccessFlagBits::eTransferWrite |
+		                             vk::AccessFlagBits::eMemoryWrite;
+		args_barrier.dstAccessMask       = vk::AccessFlagBits::eIndirectCommandRead;
+		args_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		args_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		args_barrier.buffer              = args_buffer->Handle();
+		args_barrier.offset              = args_offset;
+		args_barrier.size                = 3u * sizeof(uint32_t);
+		vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+		                          vk::PipelineStageFlagBits::eDrawIndirect,
+		                          vk::DependencyFlags {}, 0, nullptr, 1, &args_barrier, 0, nullptr);
+		vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
+	} else {
+		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+	}
 
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
@@ -413,6 +491,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	ShaderComputeInputInfo input_info {};
 	const auto compute_program = m_context.GetPipelineCache().GetComputeProgram(
 	    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
+	EXIT_IF(!compute_program);
 	buffer.EndRendering();
 	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
 	auto& bindings = m_compute_bindings;

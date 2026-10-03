@@ -18,6 +18,10 @@
 #include "graphics/shader/recompiler/ir/passes/SsaRewrite.h"
 
 #include <algorithm>
+#include <unordered_set>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <array>
 #include <chrono>
 #include <fmt/format.h>
@@ -481,6 +485,37 @@ Decoder::Program DecodeFusedProgram(std::span<const uint32_t> front, std::span<c
 
 } // namespace
 
+// True when the workgroup z index flows into a descriptor (image, sampler, buffer or address
+// resource): the host resolves descriptors once per dispatch and cannot know z at that point.
+bool WorkgroupZSelectsDescriptor(const IR::Program& ir) {
+	std::vector<const IR::Inst*> work;
+	std::unordered_set<const IR::Inst*> seen;
+	for (auto* block: ir.blocks) {
+		for (auto& inst: *block) {
+			if (inst.GetOpcode() == IR::ValueOpcode::GetBuiltin &&
+			    inst.Arg(0) == IR::Value(static_cast<uint32_t>(IR::StageInputKind::WorkgroupId)) &&
+			    inst.Arg(1) == IR::Value(2u)) {
+				work.push_back(&inst);
+			}
+		}
+	}
+	while (!work.empty()) {
+		const auto* inst = work.back();
+		work.pop_back();
+		if (!seen.insert(inst).second) continue;
+		for (const auto& use: inst->Uses()) {
+			switch (use.user->GetOpcode()) {
+				case IR::ValueOpcode::GetImageResource:
+				case IR::ValueOpcode::GetSamplerResource:
+				case IR::ValueOpcode::GetBufferResource:
+				case IR::ValueOpcode::GetAddressResource: return true;
+				default: work.push_back(use.user); break;
+			}
+		}
+	}
+	return false;
+}
+
 TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOptions& options) {
 	if (code.empty()) {
 		EXIT("shader recompiler input is empty\n");
@@ -614,6 +649,26 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		if (options.early_dump) {
 			LOGF("%s native IR before resource tracking:\n%s", GetDumpLabel(options),
 			     MakeIrDump(cfg_dump, ir).c_str());
+		}
+	}
+	if (options.stage == ShaderType::Compute && options.input_info.compute != nullptr &&
+	    options.input_info.compute->fixed_group_z == UINT32_MAX && WorkgroupZSelectsDescriptor(ir)) {
+		TranslateResult slice_result;
+		slice_result.needs_group_z = true;
+		return slice_result;
+	}
+	if (options.stage == ShaderType::Compute && options.input_info.compute != nullptr &&
+	    options.input_info.compute->fixed_group_z != UINT32_MAX) {
+		// Fold the workgroup z index in, so descriptors selected by it resolve on the host.
+		const auto z = IR::Value(options.input_info.compute->fixed_group_z);
+		for (auto* block: ir.blocks) {
+			for (auto& inst: *block) {
+				if (inst.GetOpcode() != IR::ValueOpcode::GetBuiltin ||
+				    inst.Arg(0) != IR::Value(static_cast<uint32_t>(IR::StageInputKind::WorkgroupId)) ||
+				    inst.Arg(1) != IR::Value(2u)) continue;
+				const auto uses = inst.Uses();
+				for (const auto& use: uses) use.user->SetArg(use.operand, z);
+			}
 		}
 	}
 	IR::TrackResources(ir, decoded, native_cfg);

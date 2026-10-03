@@ -219,7 +219,7 @@ bool IsFmaskTextureFormat(BufferFormat format) {
 	return format >= BufferFormat::kFmask8_S2_F1 && format <= BufferFormat::kFmask64_S16_F8;
 }
 
-bool IsKnownBufferFormat(BufferFormat format) {
+bool IsDefinedBufferFormat(BufferFormat format) {
 	return FindFormatInfo(format) != nullptr;
 }
 

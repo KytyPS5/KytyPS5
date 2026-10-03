@@ -81,7 +81,7 @@ bool ValidImageDescriptor(const DescriptorValue& descriptor, bool r128 = false) 
 	// The range above leaves the encoding's gaps open, and a value such as 139, which lies between
 	// 136 and 156 and names nothing, used to pass here and abort the emulator further down instead of
 	// being treated as what it is: eight dwords that are not a descriptor.
-	if (!Prospero::IsKnownBufferFormat(format)) {
+	if (!Prospero::IsDefinedBufferFormat(format)) {
 		return false;
 	}
 	if (r128 && type != Prospero::ImageType::kColor1D && type != Prospero::ImageType::kColor2D &&
@@ -1064,9 +1064,11 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			}
 			if (!ValidImageDescriptor(snapshot.images[i], image.r128)) {
 				// A null image keeps the draw alive, but the walk read something that is not a
-				// descriptor, so say so once per slot instead of hiding it.
+				// descriptor, so say so once per slot instead of hiding it. All-zero dwords are an
+				// unbound slot rather than a wrong read, and were rejected here before as well.
 				static std::set<std::pair<uint64_t, uint32_t>> reported;
-				if (reported.size() < 64 && reported.emplace(program.shader_hash, i).second) {
+				if (!NullImageDescriptor(snapshot.images[i]) && reported.size() < 64 &&
+				    reported.emplace(program.shader_hash, i).second) {
 					const auto& words = snapshot.images[i].dwords;
 					printf("image descriptor %u of shader 0x%016" PRIx64
 					       " is not a descriptor, binding null: "

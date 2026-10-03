@@ -94,6 +94,10 @@ constexpr OpcodeMap SOPK_OPCODE_LIST[] = {
 constexpr OpcodeMap SOPP_OPCODE_LIST[] = {
     {0x00u, Opcode::S_NOP},
     {0x01u, Opcode::S_ENDPGM},
+    // RDNA keeps s_endpgm at 0x1f and pads the tail of the code section with it. Without this
+    // entry the decode runs past the real code into the padding and the literal pool, and the
+    // translator turns that filler into a huge pile of nonsense instructions.
+    {0x1fu, Opcode::S_ENDPGM},
     {0x02u, Opcode::S_BRANCH},
     {0x04u, Opcode::S_CBRANCH_SCC0},
     {0x05u, Opcode::S_CBRANCH_SCC1},

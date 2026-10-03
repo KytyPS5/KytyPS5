@@ -36062,16 +36062,27 @@ TestCase NestedPostTestImageDescriptorLoop() {
   return test;
 }
 
-TestCase WideIndirectImageTableSample() {
+TestCase WideIndirectImageTableSample(u32 active_count = 3u) {
   using O = ShaderOpcode;
   constexpr u32 table_count = 250u;
   constexpr u32 index_base = 64u;
   constexpr u32 table_base = 4096u;
   constexpr uint64_t image_base = 0x100000u;
-  constexpr std::array<u32, 3> indices{0u, 125u, 249u};
+  std::vector<u32> indices;
+  if (active_count == 3u) {
+    indices = {0u, 125u, 249u};
+  } else {
+    Require("WideIndirectImageTableSample", "active image count",
+            active_count > 0u && active_count <= table_count,
+            "active image count exceeds the synthetic table");
+    for (u32 index = 0; index < active_count; ++index)
+      indices.push_back(index);
+  }
 
   TestCase test;
-  test.name = "WideIndirectImageTableSample";
+  test.name = active_count == table_count ? "WideIndirectImageTableFullSample"
+              : active_count == 16u ? "WideIndirectImageTable16Sample"
+                                    : "WideIndirectImageTableSample";
   test.bda_mappings = {{0, 0}};
   test.has_user_data = true;
   test.has_compute_info = true;
@@ -36118,6 +36129,7 @@ TestCase WideIndirectImageTableSample() {
   AppendVMovLiteral(&code, 24, std::bit_cast<u32>(1.3125f));
   AppendVMovLiteral(&code, 25, std::bit_cast<u32>(0.375f));
   code.push_back(EncodeSMovB32(32, InlineU32(0)));
+  AppendSMovLiteral(&code, 34, active_count);
   const auto loop = code.size();
   code.push_back(EncodeSop2(0x1e, 33, 32, InlineU32(2)));
   code.push_back(EncodeSmem0(0x08, 60, 4));
@@ -36130,7 +36142,7 @@ TestCase WideIndirectImageTableSample() {
   code.push_back(EncodeVop1(0x01, 30, 33));
   AppendBufferStoreDword(&code, 0, 30);
   code.push_back(EncodeSop2(0x00, 32, 32, InlineU32(1)));
-  code.push_back(EncodeSopc(0x0a, 32, InlineU32(static_cast<u32>(indices.size()))));
+  code.push_back(EncodeSopc(0x0a, 32, 34));
   const auto branch = code.size();
   code.push_back(EncodeSopp(0x05, static_cast<u32>(
       static_cast<int64_t>(loop) - static_cast<int64_t>(branch + 1u))));
@@ -45284,6 +45296,22 @@ if (argc == 1) {
   if (argc == 2 && std::strcmp(argv[1], "--wide-indirect-image-table-gpu-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, WideIndirectImageTableSample());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--wide-indirect-image-table-16-gpu-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, WideIndirectImageTableSample(16u));
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--wide-indirect-image-table-full-compile-only") == 0) {
+    auto test = WideIndirectImageTableSample(250u);
+    test.compile_only = true;
+    RunCase(nullptr, test);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--wide-indirect-image-table-full-gpu-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, WideIndirectImageTableSample(250u));
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--indirect-image-numeric-only") == 0) {

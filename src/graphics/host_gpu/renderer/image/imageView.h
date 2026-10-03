@@ -75,7 +75,7 @@ SelectSampledColorView(vk::Format image_format, vk::Format view_format, uint32_t
 [[nodiscard]] inline bool IsSupportedSampledDepthView(vk::Format image_format,
                                                       vk::Format view_format,
                                                       uint32_t   swizzle) noexcept {
-	return IsSupportedSampledDepthFormat(image_format, view_format) &&
+return IsSupportedSampledDepthFormat(image_format, view_format) &&
 	       IsValidImageSwizzle(swizzle, 1);
 }
 

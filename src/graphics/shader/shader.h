@@ -173,10 +173,6 @@ struct ShaderPixelInputInfo {
 	uint32_t                                       ps_perspective_center_vgpr   = UINT32_MAX;
 	uint32_t                                       ps_perspective_sample_vgpr   = UINT32_MAX;
 	uint32_t                                       ps_perspective_centroid_vgpr = UINT32_MAX;
-	// PERSP_SAMPLE has no builtin of its own, but its pair still has to be seeded: left unseeded
-	// it reads zero, the weights fold to (1, 0, 0) and every interpolated attribute resolves to
-	// vertex 0 of the primitive.
-	uint32_t                                       ps_perspective_sample_vgpr   = UINT32_MAX;
 	uint8_t                                        target_output_mode[8]        = {};
 	uint32_t                                       target_shader_mask           = UINT32_MAX;
 	std::array<Prospero::ColorComponentMapping, 8> target_export_mapping        = {};
@@ -207,12 +203,6 @@ struct ShaderPixelInputInfo {
 
 	bool HasPositionInput() const { return ps_pos_x || ps_pos_y || ps_pos_z || ps_pos_w; }
 };
-
-// SPI_PS_IN_CONTROL.PS_W32_EN runs the pixel stage as 32-lane waves, which leaves the upper
-// halves of EXEC and VCC free for the shader to use as ordinary scalar registers.
-constexpr uint32_t ShaderPixelWaveSize(uint32_t ps_in_control) {
-	return (ps_in_control & 0x8000u) != 0 ? 32u : 64u;
-}
 
 union ShaderStageInputInfo {
 	const ShaderVertexInputInfo*  vertex;

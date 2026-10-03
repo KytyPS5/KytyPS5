@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <fmt/format.h>
+#include <span>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
@@ -97,22 +98,9 @@ void CollectPixelInputs(const ShaderPixelInputInfo* pixel, ShaderInfo& info,
 	if (pixel->ps_front_face) {
 		AddInput(info, StageInputKind::FrontFacing, 0, 1, "gl_FrontFacing");
 	}
-	std::array<bool, 32> per_vertex {};
-	std::array<bool, 32> interpolated {};
-	for (const auto* block: program.blocks) {
-		for (const auto& inst: *block) {
-			if (inst.GetOpcode() == ValueOpcode::GetAttribute) {
-				interpolated[inst.Arg(0).U32()] = true;
-			} else if (inst.GetOpcode() == ValueOpcode::GetInterpolationParameter) {
-				const auto input = inst.Arg(0).U32();
-				const auto mode  = inst.Arg(2).U32();
-				per_vertex[input] =
-				    per_vertex[input] || mode < 2u || !ShaderPixelParameterIsFlat(*pixel, input);
-			}
-		}
-	}
-	// Aliases of a vertex output share one SPIR-V interface variable. If any
-	// alias reads raw vertices, interpolate the other aliases from those too.
+	// Mixed interpolation modes share raw vertices at their guest export slot.
+	// Rectangle expansion alone supplies separate flat and smooth outputs.
+	// A flat input aliased with a custom one is not flat as a group, so it reads raw vertices.
 	std::array<uint32_t, 32> active_inputs {};
 	uint32_t                 active_count = 0;
 	for (uint32_t input = 0; input < pixel->input_num; input++) {
@@ -129,11 +117,12 @@ void CollectPixelInputs(const ShaderPixelInputInfo* pixel, ShaderInfo& info,
 	}
 	for (const auto input: active) {
 		for (const auto alias: active) {
+			const bool same_mode = ShaderPixelParameterGroupIsFlat(*pixel, active, input) ==
+			                       ShaderPixelParameterGroupIsFlat(*pixel, active, alias);
 			if (ShaderPixelParameterMappedLocation(*pixel, input) ==
 			        ShaderPixelParameterMappedLocation(*pixel, alias) &&
-			    ShaderPixelParameterGroupIsFlat(*pixel, active, input) ==
-			        ShaderPixelParameterGroupIsFlat(*pixel, active, alias)) {
-				per_vertex[input] = per_vertex[input] || per_vertex[alias];
+			    (pixel->parameter_mode != ShaderPixelParameterMode::Rectangle || same_mode)) {
+				per_vertex[input] = per_vertex[input] || per_vertex[alias] || !same_mode;
 			}
 		}
 	}
@@ -142,7 +131,7 @@ void CollectPixelInputs(const ShaderPixelInputInfo* pixel, ShaderInfo& info,
 		         per_vertex[input]);
 	}
 	for (const auto input: active) {
-		if (interpolated[input] && per_vertex[input]) {
+		if (used_components[input] != 0 && per_vertex[input]) {
 			const auto kind = pixel->ps_no_perspective ? StageInputKind::BaryCoordNoPerspective
 			                                           : StageInputKind::BaryCoordSmooth;
 			AddInput(info, kind, 0, 3,
@@ -229,6 +218,11 @@ void CollectOutput(const Program& program, ShaderStageInputInfo input_info,
 		    input_info.pixel->ps_sample_mask_export_enable) {
 			AddOutput(info, StageOutputKind::SampleMask, 0, 0, "gl_SampleMask");
 		}
+		if (program.stage == ShaderType::Pixel && (export_info.en & 0x2u) != 0 &&
+		    (input_info.pixel->ps_stencil_test_val_export_enable ||
+		     input_info.pixel->ps_stencil_op_val_export_enable)) {
+			AddOutput(info, StageOutputKind::Stencil, 0, 0, "gl_FragStencilRefARB");
+		}
 		return;
 	}
 	if (export_info.en == 0) {
@@ -293,6 +287,47 @@ void CollectOutput(const Program& program, ShaderStageInputInfo input_info,
 	}
 }
 
+// Writes a flat copy of an interpolated parameter at each location the pixel stage reads it flat.
+void CollectParameterDuplicates(const Program& program, ShaderStageInputInfo input_info,
+                                ShaderInfo& info) {
+	const bool feeds_rasterizer = program.stage == ShaderType::Vertex ||
+	                              program.stage == ShaderType::TessellationEvaluation ||
+	                              program.stage == ShaderType::Mesh;
+	if (!feeds_rasterizer || input_info.vertex == nullptr ||
+	    input_info.vertex->param_duplicate_mask == 0) {
+		return;
+	}
+	const auto& vertex = *input_info.vertex;
+	const auto  used   = [&](uint32_t location) {
+		return (vertex.param_duplicate_mask & (1u << location)) != 0 ||
+		       std::ranges::any_of(info.outputs, [&](const StageOutput& output) {
+			       return output.kind == StageOutputKind::Parameter && output.location == location;
+		       });
+	};
+	for (uint32_t location = 0; location < 32u; location++) {
+		const auto source = vertex.param_duplicate_source[location];
+		if ((vertex.param_duplicate_mask & (1u << location)) == 0 ||
+		    !HasOutput(info, StageOutputKind::Parameter, source)) {
+			continue;
+		}
+		const auto occupant = std::ranges::find_if(info.outputs, [&](const StageOutput& output) {
+			return output.kind == StageOutputKind::Parameter && output.location == location;
+		});
+		if (occupant != info.outputs.end()) {
+			uint32_t free = 0;
+			while (free < 32u && used(free)) {
+				free++;
+			}
+			if (free == 32u) {
+				continue;
+			}
+			occupant->location = free;
+		}
+		info.outputs.push_back({StageOutputKind::Parameter, source, location,
+		                        fmt::format("out_param_{}_at_{}", source, location)});
+	}
+}
+
 struct InputUsage {
 	std::array<uint8_t, 32> components {};
 	std::array<bool, 32> per_vertex {};
@@ -328,21 +363,30 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 		}
 		const auto& memory = program.memory_info[index];
 		const auto kind = memory.kind;
+		// A dynamic V# keeps no host buffer alive, and its resource index is still the raw SRSRC
+		// operand, so it neither marks a buffer live nor reaches the resource checks below.
+		const bool dynamic_buffer = memory.dynamic_buffer && kind == ResourceKind::Buffer;
 		if (!memory.planning_only) {
 			info.uses_lds |= kind == ResourceKind::FlatLocal;
 			if (shared_access != SharedAccess::None) {
 				info.uses_lds |= kind == ResourceKind::Lds;
 				info.uses_gds |= kind == ResourceKind::Gds;
-			} else if (kind == ResourceKind::Buffer || kind == ResourceKind::ScalarBuffer) {
-				if (memory.resource >= info.buffers.size() || memory.resource >= ShaderInfo::MaxBuffers) {
+			} else if (!memory.dynamic_buffer &&
+			           (kind == ResourceKind::Buffer || kind == ResourceKind::ScalarBuffer)) {
+				// MaxBuffers caps what a shader tracks; an expanded table materializes up to
+				// MaxDenseBuffers.
+				if (memory.resource >= info.buffers.size() ||
+				    memory.resource >= ShaderInfo::MaxDenseBuffers) {
 					return Fail("buffer operation has invalid resource metadata");
 				}
-				info.live_buffers |= uint64_t{1} << memory.resource;
+				info.live_buffers.set(memory.resource);
+				// Nothing names a candidate, so without this the binding and the descriptor write
+				// disagree.
 				for (const auto child: info.buffers[memory.resource].indirect_resources) {
 					if (child >= info.buffers.size()) {
 						return Fail("indirect buffer operation has invalid resource metadata");
 					}
-					info.live_buffers |= uint64_t{1} << child;
+					info.live_buffers.set(child);
 				}
 			}
 		}
@@ -354,9 +398,8 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 				info.function_scratch = true;
 				info.function_lds |= kind == ResourceKind::FlatLocal &&
 				                     program.stage != ShaderType::Compute && program.stage != ShaderType::Mesh;
-			} else if (address_access == AddressAccess::Write) {
-				return Fail("writable FLAT/GLOBAL addresses require GPU ownership tracking");
-			} else {
+			} else if (address_access != AddressAccess::Write) {
+				// Writable FLAT/GLOBAL addresses store through the BDA page table.
 				info.coherent_buffers |= memory.coherent;
 			}
 		}
@@ -364,18 +407,24 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 			if (kind == ResourceKind::IndirectBuffer && op != ValueOpcode::ReadConstBuffer) {
 				info.subgroup_local_invocation_id = true;
 			}
-			if (kind == ResourceKind::Buffer) {
+			// A planning-only read is never tracked or emitted; its resource is still a register.
+			if (!memory.planning_only && dynamic_buffer) {
+				// A dynamic V# has no host resource for the checks below, and needs the lane id.
+				info.subgroup_local_invocation_id = true;
+			} else if (!memory.planning_only && kind == ResourceKind::Buffer) {
 				info.coherent_buffers |= memory.coherent;
+				// A glc DWORDX2 goes through the u64 alias as one access, see LoadWideBuffer.
+				if (memory.glc && BufferComponentCount(op) == 2u) {
+					info.buffer_int64_atomics = true;
+				}
 				if (memory.resource >= info.buffers.size()) {
 					return Fail("buffer operation has invalid resource metadata");
 				}
 				const auto bits = StorageBufferElementBits(program, memory);
 				info.buffer_u8 |= bits == 8u;
 				info.buffer_u16 |= bits == 16u;
+				// ADD_TID outside compute is refused by the backend, not here.
 				if ((info.buffers[memory.resource].packed_stride & (1u << 20u)) != 0u) {
-					if (program.stage != ShaderType::Compute) {
-						return Fail("buffer ADD_TID is only valid for compute shaders");
-					}
 					info.subgroup_local_invocation_id = true;
 				}
 			}
@@ -384,10 +433,9 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 			if (kind != ResourceKind::Lds && kind != ResourceKind::Gds) {
 				return Fail("shared operation has invalid resource kind");
 			}
-			if (shared_access == SharedAccess::Atomic && SharedComponentCount(op) == 2u) {
-				if (kind != ResourceKind::Lds || program.stage != ShaderType::Compute) {
-					return Fail("64-bit shared atomics require compute LDS");
-				}
+			// 64-bit shared atomics outside compute LDS are refused by the backend, not here.
+			if (shared_access == SharedAccess::Atomic &&
+			    (SharedComponentCount(op) == 2u || inst.GetType() == Type::U64)) {
 				info.shared_int64_atomics = true;
 			}
 			info.function_lds |= kind == ResourceKind::Lds &&
@@ -493,33 +541,10 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 			inputs.AddBuiltin(kind);
 			break;
 		}
-	}
-}
-
-void CollectOutputs(const Program& program, ShaderStageInputInfo input_info, ShaderInfo& info) {
-	const bool alpha_remap = program.stage == ShaderType::Pixel && input_info.pixel != nullptr &&
-	                         input_info.pixel->alpha_blend_source != ShaderAlphaBlendSource::None;
-	for (const auto* block: program.blocks) {
-		for (const auto& inst: *block) {
-			if (inst.GetOpcode() != ValueOpcode::SetAttribute) {
-				continue;
-			}
-			const auto& export_info = program.export_info[inst.Flags<ExportFlags>().index];
-			if (export_info.kind == ExportTargetKind::MrtZ) {
-				if (program.stage == ShaderType::Pixel && (export_info.en & 0x1u) != 0 &&
-				    input_info.pixel->ps_depth_export_enable) {
-					AddOutput(info, StageOutputKind::Depth, 0, 0, "gl_FragDepth");
-				}
-				if (program.stage == ShaderType::Pixel && (export_info.en & 0x4u) != 0 &&
-				    input_info.pixel->ps_sample_mask_export_enable) {
-					AddOutput(info, StageOutputKind::SampleMask, 0, 0, "gl_SampleMask");
-				}
-				if (program.stage == ShaderType::Pixel && (export_info.en & 0x2u) != 0 &&
-				    (input_info.pixel->ps_stencil_test_val_export_enable ||
-				     input_info.pixel->ps_stencil_op_val_export_enable)) {
-					AddOutput(info, StageOutputKind::Stencil, 0, 0, "gl_FragStencilRefARB");
-				}
-				continue;
+		case ValueOpcode::SetAttribute: {
+			const auto index = inst.Flags<ExportFlags>().index;
+			if (index >= program.export_info.size()) {
+				return Fail("typed export metadata index is out of range");
 			}
 			const auto& exp = program.export_info[index];
 			if (exp.kind == ExportTargetKind::Position && exp.index != 0 && exp.en != 0 &&
@@ -544,9 +569,6 @@ void CollectOutputs(const Program& program, ShaderStageInputInfo input_info, Sha
 			inputs.user_data[index] = true;
 			break;
 		}
-		case ValueOpcode::GetDispatchThreadExtent:
-			info.uses_dispatch_threads |= inst.HasUses();
-			break;
 		case ValueOpcode::ReadConst: info.uses_flattened_srt = true; break;
 		case ValueOpcode::BitwiseXor32: info.has_bitwise_xor = true; break;
 		case ValueOpcode::StoreCompletion: info.subgroup_barrier = true; break;
@@ -596,43 +618,6 @@ void CollectOutputs(const Program& program, ShaderStageInputInfo input_info, Sha
 			break;
 		default: break;
 	}
-	const bool feeds_rasterizer = program.stage == ShaderType::Vertex ||
-	                              program.stage == ShaderType::TessellationEvaluation ||
-	                              program.stage == ShaderType::Mesh;
-	if (feeds_rasterizer && input_info.vertex != nullptr &&
-	    input_info.vertex->param_duplicate_mask != 0) {
-		const auto& vertex = *input_info.vertex;
-		const auto  used   = [&](uint32_t location) {
-			return (vertex.param_duplicate_mask & (1u << location)) != 0 ||
-			       std::ranges::any_of(info.outputs, [&](const StageOutput& output) {
-				       return output.kind == StageOutputKind::Parameter &&
-				              output.location == location;
-			       });
-		};
-		for (uint32_t location = 0; location < 32u; location++) {
-			const auto source = vertex.param_duplicate_source[location];
-			if ((vertex.param_duplicate_mask & (1u << location)) == 0 ||
-			    !HasOutput(info, StageOutputKind::Parameter, source)) {
-				continue;
-			}
-			const auto occupant =
-			    std::ranges::find_if(info.outputs, [&](const StageOutput& output) {
-				    return output.kind == StageOutputKind::Parameter && output.location == location;
-			    });
-			if (occupant != info.outputs.end()) {
-				uint32_t free = 0;
-				while (free < 32u && used(free)) {
-					free++;
-				}
-				if (free == 32u) {
-					continue;
-				}
-				occupant->location = free;
-			}
-			info.outputs.push_back({StageOutputKind::Parameter, source, location,
-			                        fmt::format("out_param_{}_at_{}", source, location)});
-		}
-	}
 }
 
 } // namespace
@@ -644,13 +629,13 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	}
 	ValidateOptions(program, input_info);
 	auto& info = program.info;
-	if (info.buffers.size() > ShaderInfo::MaxBuffers) {
+	if (info.buffers.size() > ShaderInfo::MaxDenseBuffers) {
 		return Fail("buffer resource limit exceeded");
 	}
 	info.inputs.clear();
 	info.outputs.clear();
 	info.user_data_registers.clear();
-	info.live_buffers = 0;
+	info.live_buffers.reset();
 	info.has_bitwise_xor = info.uses_lds = info.uses_gds = info.uses_flattened_srt =
 	    info.uses_dispatch_threads = info.uses_swizzle = false;
 	info.bvh = info.subgroup_ballot = info.subgroup_barrier = info.subgroup_shuffle =
@@ -669,8 +654,11 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	const auto uses_mapping = [](const auto& resource) {
 		return resource.indirect_root != UINT32_MAX;
 	};
-	info.uses_flattened_srt |= std::ranges::any_of(info.buffers, uses_mapping) ||
-	                           std::ranges::any_of(info.images, uses_mapping);
+	// A bindless image reads its heap slot out of the flattened SRT.
+	info.uses_flattened_srt |=
+	    std::ranges::any_of(info.buffers, uses_mapping) ||
+	    std::ranges::any_of(info.images, uses_mapping) ||
+	    std::ranges::any_of(info.images, [](const ImageResource& image) { return image.bindless; });
 	switch (program.stage) {
 		case ShaderType::Vertex:
 		case ShaderType::Local: CollectVertexInputs(input_info.vertex, info, inputs.components); break;
@@ -686,6 +674,7 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	for (uint32_t i = 0; i < inputs.builtin_count; i++) {
 		AddBuiltinInput(info, inputs.builtins[i]);
 	}
+	CollectParameterDuplicates(program, input_info, info);
 	program.shader_info_complete = true;
 }
 

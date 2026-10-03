@@ -1543,8 +1543,9 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 			pixel_info.parameter_mode = ShaderPixelParameterMode::FirstVertex;
 		}
 		const auto& blend = context.GetBlendControl(0);
+		const bool  export0_to_cb0 = pixel_info.target_slot[0] == 0;
 		pixel_info.dual_source_blending =
-		    blend.enable && !context.GetRenderTarget(0).info.blend_bypass &&
+		    export0_to_cb0 && blend.enable && !context.GetRenderTarget(0).info.blend_bypass &&
 		    (BlendFactorIsDualSource(blend.color_srcblend) ||
 		     BlendFactorIsDualSource(blend.color_destblend) ||
 		     (blend.separate_alpha_blend && (BlendFactorIsDualSource(blend.alpha_srcblend) ||
@@ -1553,7 +1554,9 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 			// MRT1 supplies the second blend source for target 0.
 			pixel_info.target_output_mode[1]    = pixel_info.target_output_mode[0];
 			pixel_info.target_export_mapping[1] = pixel_info.target_export_mapping[0];
-		} else if (blend.enable && !context.GetRenderTarget(0).info.blend_bypass &&
+			pixel_info.target_slot[1]           = 1;
+		} else if (export0_to_cb0 && blend.enable &&
+		           !context.GetRenderTarget(0).info.blend_bypass &&
 		           pixel_info.target_output_mode[0] != 0 && pixel_info.target_output_mode[0] != 7 &&
 		           std::all_of(std::begin(pixel_info.target_output_mode) + 1,
 		                       std::end(pixel_info.target_output_mode),

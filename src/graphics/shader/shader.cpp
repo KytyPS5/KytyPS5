@@ -523,7 +523,6 @@ static void ShaderGetStaticInputInfoPS(
 	if ((sh.ps_in_control & 0x8000u) != 0) {
 		ps_info.wave_size = 32;
 	}
-	ps_info.wave_size            = ShaderPixelWaveSize(sh.ps_in_control);
 	EXIT_NOT_IMPLEMENTED(ps_info.input_num > std::size(ps_info.interpolator_settings));
 	ps_info.ps_system_input_base = ShaderCalcPsSystemInputBase(sh);
 	const uint32_t active_inputs = sh.ps_input_ena & sh.ps_input_addr;
@@ -576,7 +575,7 @@ static void ShaderGetStaticInputInfoPS(
 	for (int i = 0; i < 8; i++) {
 		const auto slot = ShaderPixelExportTarget(ps_info.target_shader_mask, i);
 		ps_info.target_output_mode[i]    = sh.target_output_mode[i];
-		ps_info.target_export_mapping[i] = sh.target_output_mode[i] != 0 && slot < 8
+		ps_info.target_export_mapping[i] = sh.target_output_mode[i] != 0 && slot < 8u
 		                                       ? target_export_mapping[slot]
 		                                       : Prospero::ColorComponentMapping {};
 	}
@@ -676,7 +675,6 @@ void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>
 	key.push_back(info.ps_perspective_center_vgpr);
 	key.push_back(info.ps_perspective_sample_vgpr);
 	key.push_back(info.ps_perspective_centroid_vgpr);
-	key.push_back(info.ps_perspective_sample_vgpr);
 	key.push_back(static_cast<uint32_t>(info.ps_pos_x));
 	key.push_back(static_cast<uint32_t>(info.ps_pos_y));
 	key.push_back(static_cast<uint32_t>(info.ps_pos_z));
@@ -830,6 +828,7 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 	    .user_vgpr1_enabled      = user_vgpr.vgpr1,
 	    .user_vgpr2_enabled      = user_vgpr.vgpr2,
 	    .user_vgpr3_enabled      = user_vgpr.vgpr3,
+	    .native_ngg              = native_ngg,
 	};
 	ShaderGsAssemblyNotes notes;
 	std::string           error;
@@ -991,7 +990,8 @@ void ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info) {
 	     "\t ps_early_z           = %s\n"
 	     "\t ps_execute_on_noop   = %s\n",
 	     info.input_num, info.wave_size, info.ps_system_input_base, info.custom_interpolation_mask,
-	     info.ps_perspective_center_vgpr, info.ps_perspective_centroid_vgpr,
+	     info.ps_perspective_center_vgpr, info.ps_perspective_sample_vgpr,
+	     info.ps_perspective_centroid_vgpr,
 	     info.ps_pos_x ? "true" : "false",
 
 	     info.ps_pos_y ? "true" : "false", info.ps_pos_z ? "true" : "false",

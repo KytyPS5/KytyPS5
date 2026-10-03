@@ -290,12 +290,10 @@ uint32_t ExportVector(ValueEmitContext& ctx, uint32_t data, const IR::ExportInfo
                       bool uint_output) {
 	auto& state = ctx.state;
 	if (exp.compr && !uint_output) {
-		auto unpack = GLSLstd450UnpackHalf2x16;
-		switch (MrtOutputMode(state, exp)) {
-			case 5: unpack = GLSLstd450UnpackUnorm2x16; break;
-			case 6: unpack = GLSLstd450UnpackSnorm2x16; break;
-			default: break;
-		}
+		const auto mode   = MrtOutputMode(state, exp);
+		const auto unpack = mode == 5u   ? GLSLstd450UnpackUnorm2x16
+		                    : mode == 6u ? GLSLstd450UnpackSnorm2x16
+		                                 : GLSLstd450UnpackHalf2x16;
 		uint32_t f32[4] = {ConstantF32(state, 0), ConstantF32(state, 0), ConstantF32(state, 0),
 		                   ConstantF32(state, 0x3f800000u)};
 		for (uint32_t pair = 0; pair < 2u; pair++) {

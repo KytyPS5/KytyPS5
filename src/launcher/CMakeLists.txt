@@ -19,6 +19,19 @@ add_executable(launcher WIN32
 	resources.qrc
 )
 
+if(LINUX)
+	target_sources(launcher PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/linux/linuxRunScript.cpp")
+	if(BUILD_TESTING)
+		add_executable(launcher_run_script_tests EXCLUDE_FROM_ALL
+			"${KYTY_TESTS_DIR}/LauncherRunScriptTests.cpp"
+			"${CMAKE_CURRENT_SOURCE_DIR}/linux/linuxRunScript.cpp")
+		target_include_directories(launcher_run_script_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+		target_link_libraries(launcher_run_script_tests Qt6::Core)
+		add_test(NAME launcher_run_script COMMAND $<TARGET_FILE:launcher_run_script_tests>)
+		add_dependencies(kyty_tests launcher_run_script_tests)
+	endif()
+endif()
+
 
 target_link_libraries(launcher Qt6::Concurrent Qt6::Network Qt6::Widgets Vulkan::Headers SDL3::SDL3-static kyty_git_version common)
 if(WIN32)

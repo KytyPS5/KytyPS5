@@ -90,10 +90,22 @@ void CollectPixelInputs(const ShaderPixelInputInfo* pixel, ShaderInfo& info,
 	}
 	// Mixed interpolation modes share raw vertices at their guest export slot.
 	// Rectangle expansion alone supplies separate flat and smooth outputs.
+	std::array<uint32_t, 32> active_inputs {};
+	uint32_t                 active_count = 0;
 	for (uint32_t input = 0; input < pixel->input_num; input++) {
-		for (uint32_t alias = 0; alias < pixel->input_num; alias++) {
-			const bool same_mode = ShaderPixelParameterIsFlat(*pixel, input) ==
-			                       ShaderPixelParameterIsFlat(*pixel, alias);
+		if (!ShaderPixelParameterIsDefault(*pixel, input)) {
+			active_inputs[active_count++] = input;
+		}
+	}
+	const auto active = std::span<const uint32_t> {active_inputs.data(), active_count};
+	for (const auto input: active) {
+		if (ShaderPixelParameterIsFlat(*pixel, input) &&
+		    !ShaderPixelParameterGroupIsFlat(*pixel, active, input)) {
+			per_vertex[input] = true;
+		}
+	}
+	for (const auto input: active) {
+		for (const auto alias: active) {
 			if (ShaderPixelParameterMappedLocation(*pixel, input) ==
 			        ShaderPixelParameterMappedLocation(*pixel, alias) &&
 			    (pixel->parameter_mode != ShaderPixelParameterMode::Rectangle || same_mode)) {
@@ -101,13 +113,11 @@ void CollectPixelInputs(const ShaderPixelInputInfo* pixel, ShaderInfo& info,
 			}
 		}
 	}
-	for (uint32_t input = 0; input < pixel->input_num; input++) {
+	for (const auto input: active) {
 		AddInput(info, StageInputKind::Parameter, input, 4, fmt::format("in_param_{}", input),
 		         per_vertex[input]);
 	}
-	for (uint32_t input = 0; input < pixel->input_num; input++) {
-		if (used_components[input] != 0 && per_vertex[input] &&
-		    !ShaderPixelParameterIsFlat(*pixel, input)) {
+	for (const auto input: active) {
 			const auto kind = pixel->ps_no_perspective ? StageInputKind::BaryCoordNoPerspective
 			                                           : StageInputKind::BaryCoordSmooth;
 			AddInput(info, kind, 0, 3,

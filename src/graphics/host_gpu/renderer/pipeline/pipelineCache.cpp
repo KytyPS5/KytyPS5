@@ -980,6 +980,9 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping, bool pixel_active,
     std::array<ShaderVertexInputInfo, 3>& vertex_info, ShaderPixelInputInfo& pixel_info) {
 	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
+	for (auto& stage: vertex_info) {
+		stage.param_duplicate_mask = 0;
+	}
 	std::array<ShaderParams, 3> vertex_params;
 	if (tess_active) {
 		vertex_params = PrepareTessellationPrograms(vertex_regs, context, vertex_info);
@@ -1156,9 +1159,24 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 			GetStencilBitPrograms(pixel_params, pixel_info, pixel_cursor, push_data_cursor, wants,
 			                      result);
 		}
+		if (pixel_info.stage.program != nullptr) {
+			std::array<uint32_t, 32> active {};
+			uint32_t                 active_count = 0;
+			for (const auto& input: pixel_info.stage.program->info.inputs) {
+				if (input.kind == ShaderRecompiler::IR::StageInputKind::Parameter &&
+				    active_count < active.size()) {
+					active[active_count++] = input.location;
+				}
+			}
+			auto& last = vertex_info[tess_active ? 2u : 0u];
+			ShaderPixelParameterDuplicates(pixel_info, {active.data(), active_count},
+			                               last.param_duplicate_mask, last.param_duplicate_source);
+		}
 	}
 	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
 		result.vertex[i] = m_program_cache->Get(vertex_params[i], vertex_info[i], push_data_cursor);
+		if (!result.vertex[i]) {
+			return {};
 		}
 	}
 	return result;

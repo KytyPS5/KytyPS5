@@ -159,6 +159,8 @@ struct ShaderVertexInputInfo {
 	ShaderClipSpaceTransform clip_space;
 	ShaderMeshInputInfo      mesh;
 	ShaderTessellationInputInfo tess;
+	uint32_t                    param_duplicate_mask = 0;
+	uint8_t                     param_duplicate_source[32] {};
 	bool                    fetch_external      = false;
 	bool                    fetch_embedded      = false;
 };
@@ -247,6 +249,14 @@ uint32_t ShaderPixelParameterLocation(const ShaderPixelInputInfo& info,
                                       std::span<const uint32_t> active_inputs, uint32_t input);
 bool     ShaderPixelParameterIsFlat(const ShaderPixelInputInfo& info, uint32_t input);
 bool     ShaderPixelParameterIsCustom(const ShaderPixelInputInfo& info, uint32_t input);
+bool     ShaderPixelParameterGroupIsFlat(const ShaderPixelInputInfo& info,
+                                         std::span<const uint32_t> active_inputs, uint32_t input);
+bool     ShaderPixelParameterIsDefault(const ShaderPixelInputInfo& info, uint32_t input);
+uint32_t ShaderPixelParameterDefaultComponent(const ShaderPixelInputInfo& info, uint32_t input,
+                                              uint32_t component);
+void     ShaderPixelParameterDuplicates(const ShaderPixelInputInfo& info,
+                                        std::span<const uint32_t> active_inputs, uint32_t& mask,
+                                        uint8_t (&source)[32]);
 
 struct ShaderSharp {
 	uint16_t offset_dw : 15;

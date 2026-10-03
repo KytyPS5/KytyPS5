@@ -116,6 +116,13 @@ void DefineMeshOutputs(EmitterState& state) {
 		}
 		// Per-primitive outputs are read by another invocation, through the provoking vertex.
 		const bool per_primitive = MeshPerPrimitive(output.kind);
+		const auto original = std::ranges::find_if(state.outputs, [&](const OutputBinding& other) {
+			return other.kind == output.kind && other.index == output.index;
+		});
+		if (output.kind == IR::StageOutputKind::Parameter && &*original != &output) {
+			output.mesh_data_variable = original->mesh_data_variable;
+			continue;
+		}
 		output.mesh_data_variable =
 		    MeshArray(state, per_primitive ? spv::StorageClassWorkgroup : spv::StorageClassPrivate,
 		              type, per_primitive ? mesh.max_vertices : state.lane_count);

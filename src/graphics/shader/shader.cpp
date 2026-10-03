@@ -446,6 +446,11 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 		                       mesh.scratch_size_dwords, mesh.input_primitive,
 		                       mesh.primitives_per_group, mesh.vertices_per_group,
 		                       mesh.max_vertices, mesh.max_primitives, mesh.provoking_vertex,
+	key.push_back(info.param_duplicate_mask);
+	for (uint32_t location = 0; location < 32u; location++) {
+		if ((info.param_duplicate_mask & (1u << location)) != 0) {
+			key.push_back(info.param_duplicate_source[location]);
+		}
 	}
 	key.push_back(info.tess.input_control_points);
 	if (info.tess.input_control_points != 0) {

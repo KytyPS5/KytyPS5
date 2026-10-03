@@ -7002,6 +7002,227 @@ void TestCustomVintrpMovTranslation() {
   CheckSpirvBinaryValidates(mixed_linear_result.spirv);
 }
 
+void TestFlatAliasOfCustomInput() {
+  const uint32_t shader[] = {
+      EncodeVintrp(2, 12, 1, 0, 2), // v_interp_mov_f32 v12, p0, attr1.x (custom)
+      EncodeVintrp(2, 13, 1, 1, 0), // v_interp_mov_f32 v13, p10, attr1.y (custom)
+      EncodeVintrp(2, 14, 2, 2, 2), // v_interp_mov_f32 v14, p0, attr2.z (flat alias)
+      EncodeExp0(0x00, 0x7),
+      EncodeExp1(12, 13, 14, 0),
+      0xbf810000u,
+  };
+  ShaderPixelInputInfo ps_info{};
+  ps_info.input_num = 3;
+  ps_info.custom_interpolation_mask = 0x3u;
+  SetIdentityInterpolatorSettings(&ps_info);
+  ps_info.interpolator_settings[2] = 0x00000400u | 1u;
+
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.input_info.pixel = &ps_info;
+  auto result = RecompileForTest(shader, options);
+  Check(!SpirvHasDecorationValue(result.spirv, 30u, 2u),
+        "flat alias of a custom input moved to a location no vertex stage writes");
+  Check(SpirvDecorationValueCount(result.spirv, 30u, 1u) == 1u,
+        "flat alias of a custom input did not share the custom input's variable");
+  Check(SpirvHasDecorationValueWithDecoration(result.spirv, 30u, 1u, 5285u),
+        "shared custom/flat variable is not PerVertexKHR");
+  Check(!SpirvHasDecorationValueWithDecoration(result.spirv, 30u, 1u, 14u),
+        "shared custom/flat variable was decorated Flat");
+  const auto source = DisassembleSpirvBinary(result.spirv);
+  Check(SpirvSourceHasInstructionUsing(source, "OpAccessChain", "in_param_1 %uint_0 %uint_2"),
+        "flat alias did not read the provoking vertex of the shared variable");
+  CheckSpirvBinaryValidates(result.spirv);
+
+  const uint32_t interpolated_shader[] = {
+      EncodeVintrp(2, 12, 1, 0, 2), // v_interp_mov_f32 v12, p0, attr1.x (custom)
+      EncodeVintrp(0, 14, 2, 2, 0), // v_interp_p1_f32 v14, v0, attr2.z (flat alias)
+      EncodeVintrp(1, 14, 2, 2, 1), // v_interp_p2_f32 v14, v1, attr2.z
+      EncodeExp0(0x00, 0x3),
+      EncodeExp1(12, 14, 0, 0),
+      0xbf810000u,
+  };
+  auto interpolated = RecompileForTest(interpolated_shader, options);
+  const auto interpolated_source = DisassembleSpirvBinary(interpolated.spirv);
+  Check(!SpirvHasDecorationValue(interpolated.spirv, 30u, 2u) &&
+            SpirvSourceHasInstructionUsing(interpolated_source, "OpAccessChain",
+                                           "in_param_1 %uint_0 %uint_2") &&
+            !SpirvSourceHasInstructionUsing(interpolated_source, "OpAccessChain",
+                                            "in_param_1 %uint_1 %uint_2"),
+        "interpolated flat alias of a custom input was not read from the provoking vertex");
+  CheckSpirvBinaryValidates(interpolated.spirv);
+
+  ps_info.custom_interpolation_mask = 0;
+  // Outside rectangle expansion a flat alias reads its smooth input's provoking vertex.
+  auto smooth = RecompileForTest(shader, options);
+  const auto smooth_source = DisassembleSpirvBinary(smooth.spirv);
+  Check(!SpirvHasDecorationValue(smooth.spirv, 30u, 2u) &&
+            SpirvDecorationValueCount(smooth.spirv, 30u, 1u) == 1u &&
+            SpirvHasDecorationValueWithDecoration(smooth.spirv, 30u, 1u, 5285u) &&
+            SpirvSourceHasInstructionUsing(smooth_source, "OpAccessChain",
+                                           "in_param_1 %uint_0 %uint_2"),
+        "flat alias of a smooth input did not read the first vertex of the shared variable");
+  CheckSpirvBinaryValidates(smooth.spirv);
+  ps_info.parameter_mode = ShaderPixelParameterMode::LastVertex;
+  auto last = RecompileForTest(shader, options);
+  Check(SpirvSourceHasInstructionUsing(DisassembleSpirvBinary(last.spirv), "OpAccessChain",
+                                       "in_param_1 %uint_2 %uint_2"),
+        "flat alias of a smooth input did not read the last provoking vertex");
+  CheckSpirvBinaryValidates(last.spirv);
+  // Rectangle expansion alone gives the flat alias its own flat output.
+  ps_info.parameter_mode = ShaderPixelParameterMode::Rectangle;
+  auto rectangle = RecompileForTest(shader, options);
+  Check(SpirvHasDecorationValueWithDecoration(rectangle.spirv, 30u, 2u, 14u),
+        "flat alias of a smooth input lost its separate flat location");
+  CheckSpirvBinaryValidates(rectangle.spirv);
+}
+
+void TestFlatAliasOfSmoothInputDuplicates() {
+  ShaderPixelInputInfo ps{};
+  ps.input_num = 2;
+  ps.interpolator_settings[0] = 1u;               // smooth, vertex output 1
+  ps.interpolator_settings[1] = 0x00000400u | 1u; // flat, vertex output 1
+  const std::array<uint32_t, 2> active{0u, 1u};
+  uint32_t mask = 0;
+  uint8_t source[32]{};
+  // Provoking-vertex modes share the vertex output (upstream b38b7454a): nothing to duplicate.
+  ShaderPixelParameterDuplicates(ps, active, mask, source);
+  Check(mask == 0u, "flat alias of a smooth input asked for a duplicate outside rectangles");
+  ps.parameter_mode = ShaderPixelParameterMode::Rectangle;
+  ShaderPixelParameterDuplicates(ps, active, mask, source);
+  Check(mask == 1u && source[0] == 1u,
+        "flat alias of a smooth input did not ask for a duplicate of output 1 at location 0");
+  ps.custom_interpolation_mask = 1u; // the custom group reads the flat value per vertex
+  ShaderPixelParameterDuplicates(ps, active, mask, source);
+  Check(mask == 0u, "flat alias of a custom input still asked for a duplicate");
+  ps.custom_interpolation_mask = 0;
+  ps.interpolator_settings[1] = 2u; // separate outputs: nothing to duplicate
+  ShaderPixelParameterDuplicates(ps, active, mask, source);
+  Check(mask == 0u, "distinct vertex outputs asked for a duplicate");
+
+  const uint32_t vertex_shader[] = {
+      EncodeExp0(0x0c, 0xf), EncodeExp1(0, 1, 2, 3),     // POS0
+      EncodeExp0(0x20, 0xf), EncodeExp1(4, 5, 6, 7),     // PARAM0
+      EncodeExp0(0x21, 0xf), EncodeExp1(8, 9, 10, 11),   // PARAM1
+      EncodeExp0(0x22, 0xf), EncodeExp1(12, 13, 14, 15), // PARAM2
+      0xbf810000u,
+  };
+  ShaderVertexInputInfo vertex{};
+  auto options = MakeCompileOptions(ShaderType::Vertex);
+  options.input_info.vertex = &vertex;
+  auto plain = RecompileForTest(vertex_shader, options);
+  Check(!SpirvHasDecorationValue(plain.spirv, 30u, 3u),
+        "vertex shader without duplicates wrote an extra location");
+  CheckSpirvBinaryValidates(plain.spirv);
+
+  vertex.param_duplicate_mask = 1u << 3u;
+  vertex.param_duplicate_source[3] = 1u;
+  auto duplicated = RecompileForTest(vertex_shader, options);
+  const auto duplicated_source = DisassembleSpirvBinary(duplicated.spirv);
+  Check(SpirvHasDecorationValue(duplicated.spirv, 30u, 3u) &&
+            SpirvSourceHasInstructionUsing(duplicated_source, "OpStore", "%out_param_1_at_3"),
+        "vertex shader did not write the duplicate of output 1 at location 3");
+  CheckSpirvBinaryValidates(duplicated.spirv);
+
+  vertex.param_duplicate_mask = 1u << 2u;
+  vertex.param_duplicate_source[2] = 0u;
+  auto moved = RecompileForTest(vertex_shader, options);
+  const auto moved_source = DisassembleSpirvBinary(moved.spirv);
+  Check(SpirvDecorationValueCount(moved.spirv, 30u, 2u) == 1u &&
+            SpirvHasDecorationValue(moved.spirv, 30u, 3u) &&
+            SpirvSourceHasInstructionUsing(moved_source, "OpStore", "%out_param_0_at_2"),
+        "duplicate did not displace the export at its location");
+  CheckSpirvBinaryValidates(moved.spirv);
+
+  using ShaderRecompiler::IR::PushData;
+  const uint32_t mesh_shader[] = {
+      EncodeSMovB32(12, 255), 0x1003u,
+      EncodeSMovB32(124, 12), EncodeSopp(0x10, 9), // GS allocation
+      EncodeExp0(0x0c, 0xf, false), EncodeExp1(0, 0, 0, 0),
+      EncodeExp0(0x20, 0xf, false), EncodeExp1(0, 0, 0, 0),
+      EncodeExp0(0x21, 0xf, false), EncodeExp1(0, 0, 0, 0),
+      EncodeExp0(0x14, 0x1), EncodeExp1(0, 0, 0, 0), // primitive
+      EncodeSopp(0x01),
+  };
+  ShaderVertexInputInfo mesh_input{};
+  auto &mesh = mesh_input.mesh;
+  mesh.threads_num[0] = 192;
+  mesh.threads_num[1] = mesh.threads_num[2] = 1;
+  mesh.lds_size_dwords = 3840;
+  mesh.primitives_per_group = 62;
+  mesh.vertices_per_group = 64;
+  mesh.max_vertices = 192;
+  mesh.max_primitives = 176;
+  mesh.host_subgroup_size = 32;
+  ShaderRecompiler::CompileOptions mesh_options{};
+  mesh_options.stage = ShaderType::Mesh;
+  mesh_options.input_info.vertex = &mesh_input;
+  mesh_options.emit_debug_info = true; // The check finds the duplicate output by its OpName.
+  auto mesh_plain = RecompileForTest(mesh_shader, mesh_options, nullptr, nullptr,
+                                     PushData::MeshDrawDwordCount);
+  CheckSpirvBinaryValidates(mesh_plain.spirv);
+  Check(!SpirvHasDecorationValue(mesh_plain.spirv, 30u, 5u),
+        "mesh shader without duplicates wrote an extra location");
+  mesh_input.param_duplicate_mask = 1u << 5u;
+  mesh_input.param_duplicate_source[5] = 1u;
+  auto mesh_duplicated = RecompileForTest(mesh_shader, mesh_options, nullptr, nullptr,
+                                          PushData::MeshDrawDwordCount);
+  CheckSpirvBinaryValidates(mesh_duplicated.spirv);
+  const auto mesh_source = DisassembleSpirvBinary(mesh_duplicated.spirv);
+  Check(SpirvHasDecorationValue(mesh_duplicated.spirv, 30u, 5u) &&
+            SpirvSourceHasInstructionUsing(mesh_source, "OpAccessChain", "%out_param_1_at_5"),
+        "mesh shader did not copy out the duplicate of output 1 at location 5");
+}
+
+void TestPixelDefaultValueInputs() {
+  ShaderPixelInputInfo ps{};
+  ps.input_num = 2;
+  SetIdentityInterpolatorSettings(&ps);
+  ps.interpolator_settings[1] = 0x00000020u | (1u << 8u); // DEFAULT_VAL 0001
+  Check(ShaderPixelParameterIsDefault(ps, 1) && !ShaderPixelParameterIsDefault(ps, 0),
+        "OFFSET bit 5 without FLAT_SHADE was not read as a default value");
+  Check(ShaderPixelParameterDefaultComponent(ps, 1, 3) == 0x3f800000u &&
+            ShaderPixelParameterDefaultComponent(ps, 1, 0) == 0u,
+        "DEFAULT_VAL 1 did not decode to (0,0,0,1)");
+  auto explicit_ps = ps;
+  explicit_ps.interpolator_settings[1] = 0x00000420u | 1u;
+  Check(!ShaderPixelParameterIsDefault(explicit_ps, 1),
+        "explicit (flat, OFFSET bit 5) input was read as a default value");
+  auto fp16_ps = ps;
+  fp16_ps.interpolator_settings[1] |= 0x00080000u;
+  Check(!ShaderPixelParameterIsDefault(fp16_ps, 1), "FP16 input was read as a default value");
+  auto two = ps;
+  two.interpolator_settings[1] = 0x00000020u | (2u << 8u);
+  Check(ShaderPixelParameterDefaultComponent(two, 1, 0) == 0x3f800000u &&
+            ShaderPixelParameterDefaultComponent(two, 1, 3) == 0u,
+        "DEFAULT_VAL 2 did not decode to (1,1,1,0)");
+
+  const uint32_t shader[] = {
+      EncodeVintrp(2, 12, 0, 0, 2), // v_interp_mov_f32 v12, p0, attr0.x
+      EncodeVintrp(2, 13, 1, 3, 2), // v_interp_mov_f32 v13, p0, attr1.w (default)
+      EncodeVintrp(0, 14, 1, 0, 0), // v_interp_p1_f32 v14, v0, attr1.x (default)
+      EncodeVintrp(1, 14, 1, 0, 1), // v_interp_p2_f32 v14, v1, attr1.x
+      EncodeExp0(0x00, 0x7),
+      EncodeExp1(12, 13, 14, 0),
+      0xbf810000u,
+  };
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.input_info.pixel = &ps;
+  auto result = RecompileForTest(shader, options);
+  const auto source = DisassembleSpirvBinary(result.spirv);
+  Check(!SpirvHasDecorationValue(result.spirv, 30u, 1u) &&
+            source.find("in_param_1") == std::string::npos,
+        "default-value input still declared an interface variable");
+  Check(source.find("%uint_1065353216") != std::string::npos,
+        "default-value input did not read its DEFAULT_VAL constant");
+  CheckSpirvBinaryValidates(result.spirv);
+
+  ps.interpolator_settings[1] = 1u;
+  auto mapped = RecompileForTest(shader, options);
+  Check(SpirvHasDecorationValue(mapped.spirv, 30u, 1u),
+        "an ordinary input lost its vertex output");
+  CheckSpirvBinaryValidates(mapped.spirv);
+}
+
 void TestVop3F16InterpolationTranslation() {
   // v_interp_p1ll_f16 v21, v0, attr0.w high; v_interp_p2_f16 v14, v1, attr0.w, v21 high
   // v_interp_p1ll_f16 v15, v0, attr0.z;      v_interp_p2_f16 v14, v1, attr0.z, v15 (op_sel[3])
@@ -17833,6 +18054,9 @@ int main() {
   TestNewShaderRecompilerNativeBindingPlan();
   TestNewShaderRecompilerStageInputInfo();
   TestCustomVintrpMovTranslation();
+  TestFlatAliasOfCustomInput();
+  TestFlatAliasOfSmoothInputDuplicates();
+  TestPixelDefaultValueInputs();
   TestVop3F16InterpolationTranslation();
   TestPerspectiveCentroidInputs();
   TestPerspectiveSampleInputs();

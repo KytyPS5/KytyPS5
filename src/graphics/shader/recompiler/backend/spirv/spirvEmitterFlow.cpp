@@ -211,6 +211,11 @@ uint32_t EmitPixelAttribute(EmitterState& state, const InputBinding& input, uint
 }
 
 uint32_t EmitAttribute(EmitterState& state, uint32_t attr, uint32_t chan) {
+	if (state.program.stage == ShaderType::Pixel &&
+	    ShaderPixelParameterIsDefault(*state.input_info.pixel, attr)) {
+		return ConstantU32(
+		    state, ShaderPixelParameterDefaultComponent(*state.input_info.pixel, attr, chan));
+	}
 	const auto* input = InputBindingForParameter(state, attr);
 	if (input == nullptr || input->variable_id == 0) {
 		return ConstantU32(state, 0);
@@ -226,8 +231,15 @@ uint32_t EmitAttribute(EmitterState& state, uint32_t attr, uint32_t chan) {
 
 uint32_t EmitInterpolationParameter(ValueEmitContext& ctx, uint32_t attr, uint32_t chan,
                                     uint32_t mode) {
-	auto&       state = ctx.state;
+	auto& state = ctx.state;
+	if (ShaderPixelParameterIsDefault(*state.input_info.pixel, attr)) {
+		// The constant sits in P0; the vertex deltas of a constant are zero.
+		return mode == 2u ? EmitAttribute(state, attr, chan) : ConstantU32(state, 0);
+	}
 	const auto* input = InputBindingForParameter(state, attr);
+	if (input == nullptr) {
+		return ConstantU32(state, 0);
+	}
 	if (!input->per_vertex) {
 		return EmitAttribute(ctx.state, attr, chan);
 	}
@@ -692,6 +704,15 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 			state.builder.AddFunction(spv::OpStore, pointer, value);
 		} else {
 			state.builder.AddFunction(spv::OpStore, variable, value);
+			if (exp.kind == IR::ExportTargetKind::Parameter) {
+				for (const auto& binding: state.outputs) {
+					if (binding.kind == IR::StageOutputKind::Parameter &&
+					    binding.index == exp.index && binding.variable_id != variable &&
+					    binding.variable_id != 0) {
+						state.builder.AddFunction(spv::OpStore, binding.variable_id, value);
+					}
+				}
+			}
 		}
 	});
 }

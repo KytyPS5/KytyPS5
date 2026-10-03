@@ -1524,6 +1524,8 @@ struct TestCase {
   std::vector<std::pair<std::string, size_t>> ir_counts;
   u32 expected_mip_descriptors = 0;
   std::optional<std::vector<u32>> expected_buffer_resources;
+  // Lets specialization read `initial` too, as an indirect table's enumeration must.
+  bool specialization_memory = false;
   size_t max_spirv_words = 0;
 };
 
@@ -1866,10 +1868,9 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
       .read_specialization_memory = ReadTestMemory,
       .workgroup_counts = workgroup_counts,
   };
-  Require(test.name, "resource materialization",
-          ShaderRecompiler::IR::MaterializeResources(
-              resource_plan, runtime, resources, specialization),
-          "translated resources could not be materialized");
+  Require(test.name, "resource materialization", materialized,
+          "translated resources could not be materialized: " +
+              std::string(ShaderRecompiler::IR::LastMaterializeFailure()));
   auto result = ShaderRecompiler::CompileProgram(
       std::move(translated), options, specialization);
   for (const auto &[text, expected] : test.decoded_counts) {
@@ -15726,7 +15727,7 @@ public:
         image.numeric_class = Prospero::TextureNumericClass::Float;
         image.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
       }
-      ShaderRecompiler::IR::ApplyResourceSpecialization(
+      (void)ShaderRecompiler::IR::ApplyResourceSpecialization(
           null_program, null_specialization);
       null_program.info.images.back().mip_mode = ShaderRecompiler::IR::ImageMipMode::Dynamic;
       null_program.info.images.back().mip_count = 3;
@@ -18191,7 +18192,7 @@ public:
                  return true;
                }}, stencil_snapshot, stencil_specialization),
           "captured stencil shader could not resolve its clear byte");
-      ShaderRecompiler::IR::ApplyResourceSpecialization(stencil_translated.program,
+      (void)ShaderRecompiler::IR::ApplyResourceSpecialization(stencil_translated.program,
                                                        stencil_specialization);
       ShaderRecompiler::IR::CompiledShaderInfo stencil_program{};
       stencil_program.stage = ShaderType::Compute;
@@ -45469,6 +45470,22 @@ TestCase DispatcherIrreducibleControlFlow() {
 }
 
 #include "ShaderRayTracingGpuTests.inc"
+
+// Translating the same wave64 dispatcher shader twice must emit identical bytes.
+void CheckDispatcherModuleDeterminism() {
+  constexpr const char *name = "DispatcherModuleDeterminism";
+  const auto test = DispatcherIrreducibleControlFlow();
+  // Every copy stays alive, so no two translations share addresses.
+  std::vector<CompiledShader> copies;
+  for (u32 copy = 0; copy < 8u; copy++) {
+    copies.push_back(CompileCase(test, 32u));
+  }
+  for (const auto &copy : copies) {
+    Require(name, "identical module", copy.spirv == copies[0].spirv,
+            "two translations of one dispatcher shader emitted different SPIR-V");
+  }
+  std::printf("[host]    %-32s ok\n", name);
+}
 
 // An a16 intersect lowers to a constant miss; the rest of the dispatch still reaches memory.
 TestCase RayTracingIntersectStillWritesOtherOutputs() {

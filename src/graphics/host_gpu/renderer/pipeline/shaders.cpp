@@ -191,22 +191,31 @@ static void AddLayoutBindings(std::vector<vk::DescriptorSetLayoutBinding>& descr
 	}
 }
 
-static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                                    std::span<const vk::DescriptorSetLayoutBinding> bindings) {
-	const auto& limits = graphics.GetPhysicalDeviceProperties().limits;
-	uint64_t descriptor_count = 0;
+// maxDescriptorSet* bounds the whole pipeline layout, not one set of it.
+                                        std::span<const vk::DescriptorSetLayoutBinding> bindings) {
+	const auto&              limits          = graphics.GetPhysicalDeviceProperties().limits;
 	uint64_t storage_buffers = 0;
 	uint64_t samplers = 0;
+	uint64_t                 sampled_images  = 0;
+	uint64_t                 storage_images  = 0;
 	std::array<uint64_t, 32> stage_buffers {}, stage_resources {}, stage_samplers {};
+	std::array<uint64_t, 32> stage_sampled_images {}, stage_storage_images {};
 	for (const auto& binding: bindings) {
 		descriptor_count += binding.descriptorCount;
 		const bool storage = binding.descriptorType == vk::DescriptorType::eStorageBuffer;
 		const bool sampler = binding.descriptorType == vk::DescriptorType::eSampler;
+		const bool sampled_image = binding.descriptorType == vk::DescriptorType::eSampledImage;
+		const bool storage_image = binding.descriptorType == vk::DescriptorType::eStorageImage;
 		if (storage) storage_buffers += binding.descriptorCount;
 		if (sampler) samplers += binding.descriptorCount;
+		if (sampled_image) sampled_images += binding.descriptorCount;
+		if (storage_image) storage_images += binding.descriptorCount;
 		for (auto stages = static_cast<uint32_t>(binding.stageFlags); stages != 0; stages &= stages - 1u) {
 			const auto stage = std::countr_zero(stages);
 			if (storage) stage_buffers[stage] += binding.descriptorCount;
+			if (sampled_image) stage_sampled_images[stage] += binding.descriptorCount;
+			if (storage_image) stage_storage_images[stage] += binding.descriptorCount;
 			if (sampler) stage_samplers[stage] += binding.descriptorCount;
 			else
 				stage_resources[stage] += binding.descriptorCount;
@@ -217,6 +226,13 @@ static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipe
 				     "/%u resources=%" PRIu64 "/%u samplers=%" PRIu64 "/%u\n", stage, stage_buffers[stage],
 				     limits.maxPerStageDescriptorStorageBuffers, stage_resources[stage], limits.maxPerStageResources,
 				     stage_samplers[stage], limits.maxPerStageDescriptorSamplers);
+			}
+			if (stage_sampled_images[stage] > limits.maxPerStageDescriptorSampledImages ||
+			    stage_storage_images[stage] > limits.maxPerStageDescriptorStorageImages) {
+				EXIT("native descriptor stage %u exceeds device image limits: sampled=%" PRIu64
+				     "/%u storage=%" PRIu64 "/%u\n",
+				     stage, stage_sampled_images[stage], limits.maxPerStageDescriptorSampledImages,
+				     stage_storage_images[stage], limits.maxPerStageDescriptorStorageImages);
 			}
 		}
 	}
@@ -229,6 +245,14 @@ static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipe
 		     samplers, limits.maxDescriptorSetSamplers);
 	}
 	pipeline.uses_push_descriptors = descriptor_count <= graphics.max_push_descriptors;
+	if (sampled_images > limits.maxDescriptorSetSampledImages ||
+	    storage_images > limits.maxDescriptorSetStorageImages) {
+		EXIT("native image descriptors exceed device limits: sampled=%" PRIu64
+		     "/%u storage=%" PRIu64 "/%u\n",
+		     sampled_images, limits.maxDescriptorSetSampledImages, storage_images,
+		     limits.maxDescriptorSetStorageImages);
+	}
+}
 
 	vk::DescriptorSetLayoutCreateInfo create {};
 	create.flags        = pipeline.uses_push_descriptors

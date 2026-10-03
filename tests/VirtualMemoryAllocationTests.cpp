@@ -4,6 +4,7 @@
 #include "common/subsystems.h"
 #include "common/threads.h"
 #include "common/virtualMemory.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
@@ -1624,6 +1625,24 @@ void TestDirectMapQueryOffsetAndPartialMunmap() {
 	      Libs::LibKernel::Memory::ClampRangeSize(base + SceKernelPageSize - 0xf30, 0x1560) ==
 	          0xf30,
 	      "ClampRangeSize did not stop at an unmapped span");
+	// RE9 binds descriptors whose base is unmapped; that must report zero, not abort.
+	Check(test,
+	      Libs::LibKernel::Memory::ClampRangeSize(base + SceKernelPageSize, SceKernelPageSize) == 0,
+	      "ClampRangeSize did not report an unmapped base as zero");
+	// Reading an unmapped guest pointer from the descriptor evaluator must refuse, not fault.
+	uint32_t evaluator_word = 0xc0ffee;
+	Check(test,
+	      !Libs::LibKernel::Memory::TryReadGpuCleanBacking(base + SceKernelPageSize,
+	                                                      &evaluator_word,
+	                                                      sizeof(evaluator_word)),
+	      "the descriptor read accepted an unmapped guest address");
+	Check(test, evaluator_word == 0xc0ffee,
+	      "a refused descriptor read modified its destination");
+	uint32_t mapped_word = 0;
+	Check(test,
+	      Libs::LibKernel::Memory::TryReadGpuCleanBacking(base, &mapped_word,
+	                                                     sizeof(mapped_word)),
+	      "the descriptor read refused a mapped guest address");
 
 	info = Query(test, base + SceKernelPageSize, SceKernelVqFindNext);
 	ExpectRange(test, info, base + SceKernelPageSize * 2, base + SceKernelPageSize * 4,

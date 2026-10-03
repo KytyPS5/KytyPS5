@@ -761,8 +761,6 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 							if (read_size == 0) continue;
 							if (read_address > address) {
 								size = std::min(size, read_address - address);
-							} else if (address - read_address < read_size) {
-								EXIT("scalar resource reads overlap a shader buffer write\n");
 							}
 						}
 					}
@@ -777,6 +775,8 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 			// Finite GPU descriptors can span sparse PRT holes; clamp only oversized/sentinel ranges.
 			if (size >= (uint64_t {1} << 30u) || descriptor.NumRecords() == UINT32_MAX) {
 				size = Libs::LibKernel::Memory::ClampRangeSize(address, size);
+			if (size == 0) {
+				continue;
 			}
 			source = {address, size, cache.FindBuffer(address, size)};
 		}

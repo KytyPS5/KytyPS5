@@ -5,10 +5,12 @@
 #include <algorithm>
 #include <bit>
 #include <functional>
+#include <mutex>
 #include <optional>
 #include <type_traits>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -62,8 +64,13 @@ struct DispatcherFunctionState {
 	uint32_t                                      merge_label        = 0;
 };
 
-void StoreDispatcherPhiEdge(ValueEmitContext& ctx, const DispatcherFunctionState& dispatcher,
-                            const IR::Block* from, const IR::Block* to) {
+// Slot, value: a terminator's phi update is one parallel copy.
+using DispatcherPhiCopies = std::vector<std::pair<uint32_t, uint32_t>>;
+
+// Only collects: a phi may read another target's phi, so stores wait for the whole terminator.
+void CollectDispatcherPhiEdge(ValueEmitContext& ctx, const DispatcherFunctionState& dispatcher,
+                              const IR::Block* from, const IR::Block* to,
+                              DispatcherPhiCopies& copies) {
 	if (to == nullptr) {
 		return;
 	}
@@ -73,11 +80,16 @@ void StoreDispatcherPhiEdge(ValueEmitContext& ctx, const DispatcherFunctionState
 		}
 		for (size_t index = 0; index < phi.NumArgs(); index++) {
 			if (phi.PhiBlock(index) == from) {
-				ctx.state.builder.AddFunction(spv::OpStore, dispatcher.spills[ctx.half].at(&phi),
-				                              ctx.Def(phi.Arg(index)));
+				copies.emplace_back(dispatcher.spills[ctx.half].at(&phi), ctx.Def(phi.Arg(index)));
 				break;
 			}
 		}
+	}
+}
+
+void StoreDispatcherPhiCopies(ValueEmitContext& ctx, const DispatcherPhiCopies& copies) {
+	for (const auto& [slot, value]: copies) {
+		ctx.state.builder.AddFunction(spv::OpStore, slot, value);
 	}
 }
 
@@ -139,36 +151,40 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block) {
 	}
 }
 
-void EmitDispatcherTarget(ValueEmitContext& ctx, const DispatcherFunctionState& dispatcher,
-                          const IR::Block* from, const IR::Block* block) {
+void CollectDispatcherTarget(ValueEmitContext& ctx, const DispatcherFunctionState& dispatcher,
+                             DispatcherPhiCopies& copies) {
 	if (block != nullptr) {
-		StoreDispatcherPhiEdge(ctx, dispatcher, from, block);
+		CollectDispatcherPhiEdge(ctx, dispatcher, from, block, copies);
 		if (ctx.other_half != nullptr) {
-			StoreDispatcherPhiEdge(*ctx.other_half, dispatcher, from, block);
+			CollectDispatcherPhiEdge(*ctx.other_half, dispatcher, from, block, copies);
 		}
 	}
 }
 
+// The phi stores go last: the condition and selector may still load from a spill slot.
 uint32_t EmitDispatcherNextPc(ValueEmitContext& ctx, const DispatcherFunctionState& dispatcher,
                               const IR::Block* block) {
-	const auto& term = block->terminator;
+	DispatcherPhiCopies copies;
+	const auto          finish = [&](uint32_t selected) {
+		StoreDispatcherPhiCopies(ctx, copies);
+		return selected;
+	};
 	switch (term.kind) {
 		case CFG::TerminatorKind::Branch:
-			EmitDispatcherTarget(ctx, dispatcher, block, term.true_block);
-			return ConstantU32(ctx.state, term.true_block->id);
+			CollectDispatcherTarget(ctx, dispatcher, block, term.true_block, copies);
 		case CFG::TerminatorKind::ConditionalBranch: {
-			EmitDispatcherTarget(ctx, dispatcher, block, term.true_block);
-			EmitDispatcherTarget(ctx, dispatcher, block, term.false_block);
+			CollectDispatcherTarget(ctx, dispatcher, block, term.true_block, copies);
+			CollectDispatcherTarget(ctx, dispatcher, block, term.false_block, copies);
 			const auto selected = ctx.state.builder.AllocateId();
 			ctx.state.builder.AddFunction(spv::OpSelect, TypeU32(ctx.state), selected,
 			                              ctx.Def(block->condition),
 			                              ConstantU32(ctx.state, term.true_block->id),
 			                              ConstantU32(ctx.state, term.false_block->id));
-			return selected;
+			return finish(selected);
 		}
 		case CFG::TerminatorKind::IndirectBranch: {
 			for (const auto* target: block->ImmSuccessors()) {
-				EmitDispatcherTarget(ctx, dispatcher, block, target);
+				CollectDispatcherTarget(ctx, dispatcher, block, target, copies);
 			}
 			uint32_t selected = ConstantU32(ctx.state, UINT32_MAX);
 			if (!block->indirect_target.IsEmpty()) {
@@ -184,9 +200,9 @@ uint32_t EmitDispatcherNextPc(ValueEmitContext& ctx, const DispatcherFunctionSta
 					selected = next;
 				}
 			}
-			return selected;
+			return finish(selected);
 		}
-		default: return ConstantU32(ctx.state, UINT32_MAX);
+		default: return finish(ConstantU32(ctx.state, UINT32_MAX));
 	}
 }
 

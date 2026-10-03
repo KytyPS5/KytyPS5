@@ -468,6 +468,7 @@ uint32_t ConvertPositionToClipSpace(EmitterState& state, uint32_t position) {
 }
 
 } // namespace
+// TypeU64 is a uvec2: the constants below are per-32-bit-half, so every shift is componentwise.
 uint32_t EmitWqmU64(EmitterState& state, uint32_t value) {
 	const auto shifted_one = state.builder.AllocateId();
 	const auto merged_one  = state.builder.AllocateId();

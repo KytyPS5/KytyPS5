@@ -192,6 +192,7 @@ private:
 
 	void InitializeDriverCache();
 	void CheckpointDriverCache();
+	void DestroyPipelineObjects(const Pipeline& pipeline);
 };
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);

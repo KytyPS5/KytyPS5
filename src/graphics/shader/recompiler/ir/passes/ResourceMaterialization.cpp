@@ -13,7 +13,9 @@
 #include <fmt/format.h>
 #include <functional>
 #include <numeric>
+#include <optional>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -300,6 +302,9 @@ bool IsBoundedDescriptorTable(const ResourcePlan& program,
 	       (indirect.key_count.IsEmpty() || indirect.table_maximum) && indirect.workgroup_axis == UINT32_MAX &&
 	       table != nullptr && table->dword_count == 4u;
 }
+
+// A table the GPU wrote is decoded in the shader: a host snapshot of it can name a stale record.
+bool BufferTableGpuWritten(const DescriptorValue& table_value, const SrtRuntime& runtime) {
 
 bool CanReadIndexedSelector(const ShaderBufferResource& material, uint32_t offset) {
 	if (material.Type() != 0u || material.SwizzleEnabled() || material.AddTid() ||
@@ -856,6 +861,16 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 	return true;
 }
 
+bool ValidGatherLodSampler(const DescriptorValue& sampler) {
+	const auto control  = sampler.dwords[2];
+	const auto filter   = (control >> 26u) & 3u;
+	const auto perf_mip = (sampler.dwords[1] >> 24u) & 15u;
+	// MipNone always selects the base level. Point/linear selection requires zero
+	// primary/secondary bias; linear mip snapping is not implemented.
+	return !(filter > 2u || (filter != 0u && (control & 0xfffffu) != 0u) ||
+	         (filter == 2u && perf_mip != 0u));
+}
+
 } // namespace
 
 struct SamplerPlan {
@@ -927,6 +942,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			                                  : Prospero::TextureNumericClass::Float;
 			image.dimension     = Decoder::ImageDimension::Dim2D;
 			image.cube          = false;
+			// A null sampled view reads zero whatever its shape, so any module serves it.
 			continue;
 		}
 		const auto descriptor_dimension = DescriptorDimension(descriptor, base.dimension);
@@ -1677,6 +1693,19 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		buffer.zero_stride_oob    = descriptor.OutOfBounds() == 0u && stride == 0u;
 		buffer.scalar_empty       = base.scalar && descriptor.GetSize() == 0u;
 	}
+	std::array<uint32_t, 3> workgroup_counts {};
+	if (runtime.indirect_args_address != 0u) {
+		for (uint32_t source = 0; source < program.descriptor_sources.size(); ++source) {
+			if ((!active.empty() && !active[source]) ||
+			    !uses_workgroup_count(program.descriptor_sources[source])) continue;
+			if ((runtime.indirect_args_address & 3u) != 0u ||
+			    !ReadTable(runtime.indirect_args_address, sizeof(workgroup_counts), 0u, observed,
+			               workgroup_counts))
+				return SpecializationFail("indirect dispatch arguments are unreadable");
+			observed.workgroup_counts = workgroup_counts;
+			break;
+		}
+	}
 			auto& evaluator = capture_reads && written ? clean : walker;
 			return evaluator.EvaluateDescriptor(source, value) ||
 			       SpecializationFail(fmt::format("descriptor evaluation source={}: {}", source,
@@ -1754,21 +1783,68 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 				if (!evaluate(source, snapshot.samplers[i])) return false;
 			}
 		}
-		if (program.info.samplers[base_index].gather_lod) {
-			const auto control = snapshot.samplers[i].dwords[2];
 			const auto filter = (control >> 26u) & 3u;
-			const auto perf_mip = (snapshot.samplers[i].dwords[1] >> 24u) & 15u;
-			// MipNone always selects the base level. Point/linear selection requires zero
-			// primary/secondary bias; linear mip snapping is not implemented.
-			if (filter > 2u || (filter != 0u && (control & 0xfffffu) != 0u) ||
-			    (filter == 2u && perf_mip != 0u)) {
 				return SpecializationFail(
-				    "explicit-LOD gather requires None, unbiased Point, or unbiased Linear without mip snapping");
-			}
+		if (program.info.samplers[base_index].gather_lod &&
+		    !ValidGatherLodSampler(snapshot.samplers[i])) {
+			return SpecializationFail("explicit-LOD gather requires None, unbiased Point, or "
+			                          "unbiased Linear without mip snapping");
 		}
 	}
 	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
 	return BuildResourceSpecialization(program, snapshot, specialization);
+}
+
+static void ClearMaterialization(ResourceSnapshot&       snapshot,
+                                 ResourceSpecialization& specialization) {
+	snapshot.buffers.clear();
+	snapshot.images.clear();
+	snapshot.samplers.clear();
+	snapshot.flattened_srt.clear();
+	snapshot.user_data.clear();
+	snapshot.specialization_reads.clear();
+	snapshot.specialization_read_slots.clear();
+	snapshot.uniform_fill = {};
+	snapshot.buffer_copy  = {};
+	specialization.buffers.clear();
+	specialization.images.clear();
+	specialization.samplers.clear();
+	specialization.unbound_buffers.clear();
+	specialization.unbound_images.clear();
+}
+
+bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
+                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
+                          std::vector<uint32_t>* refused_tables) {
+	static thread_local ResourceSnapshot       next;
+	static thread_local ResourceSpecialization next_specialization;
+	static thread_local std::vector<uint8_t>   conditions;
+	const auto                                 refuse = [&] {
+		snapshot = next;
+		return false;
+	};
+	MaterializeFailure().clear();
+	ClearMaterialization(next, next_specialization);
+	if (!MaterializeInto(program, runtime, next, next_specialization, conditions, refused_tables)) {
+		return refuse();
+	}
+	if (CapturedReadsOverlapWrites(program, next, conditions)) {
+		// A condition read from a written buffer cannot prune blocks: walk them all.
+		if (runtime.walk_restarted != nullptr) runtime.walk_restarted(runtime.userdata);
+		auto unpruned                  = runtime;
+		unpruned.read_condition_memory = RefuseRead;
+		ClearMaterialization(next, next_specialization);
+		if (!MaterializeInto(program, unpruned, next, next_specialization, conditions,
+		                     refused_tables)) {
+			return refuse();
+		}
+		CapturedReadsOverlapWrites(program, next, conditions);
+	}
+	snapshot       = next;
+	specialization = next_specialization;
+	return true;
+}
+
 }
 
 uint32_t ImageHeapKind(const ImageResource& root, DescriptorValue& value) {
@@ -1808,11 +1884,12 @@ ImageResource ImageHeapResource(const ImageResource& root, uint32_t kind) {
 	return resource;
 }
 
-void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization) {
+bool ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization) {
 	EXIT_IF(!program.resource_tracking_complete || program.shader_info_complete);
-	EXIT_IF(program.info.buffers.size() > specialization.buffers.size() ||
-	        program.info.images.size() > specialization.images.size() ||
-	        program.info.samplers.size() > specialization.samplers.size());
+	    program.info.images.size() > specialization.images.size() ||
+	    program.info.samplers.size() > specialization.samplers.size()) {
+		return false;
+	}
 
 	auto& buffers = program.info.buffers;
 	const auto original_buffer_count = buffers.size();
@@ -2058,6 +2135,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		}
 	}
 	image_remap.Apply(images);
+	return true;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

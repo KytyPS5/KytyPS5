@@ -25,7 +25,10 @@ struct UniformFill {
 	std::array<uint32_t, 3> group_stride {};
 	uint32_t                 words        = 0;
 	uint32_t                 value        = 0;
+	// Elements each invocation writes; group_stride[0] == local_size_x * stores.
 	uint32_t                 bounded_elements = 0;
+
+	static constexpr uint32_t MaxStores = 64;
 
 	bool operator==(const UniformFill&) const = default;
 };

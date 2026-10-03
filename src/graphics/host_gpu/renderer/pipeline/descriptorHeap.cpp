@@ -10,8 +10,8 @@ namespace {
 
 constexpr uint32_t   DescriptorHeapCount = 1024;
 constexpr std::array DescriptorPoolSizes = {
-    vk::DescriptorPoolSize {vk::DescriptorType::eStorageBuffer, 8192},
-    vk::DescriptorPoolSize {vk::DescriptorType::eSampledImage, 8192},
+    vk::DescriptorPoolSize {vk::DescriptorType::eStorageBuffer, 16384},
+    vk::DescriptorPoolSize {vk::DescriptorType::eSampledImage, 262144},
     vk::DescriptorPoolSize {vk::DescriptorType::eStorageImage, 1024},
     vk::DescriptorPoolSize {vk::DescriptorType::eSampler, 1024},
 };

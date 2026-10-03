@@ -14,6 +14,7 @@
 #include <span>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #define XXH_INLINE_ALL
 #include <xxhash.h>
@@ -3751,7 +3752,8 @@ private:
 						for (const auto& previous: m_indirect_descriptors) {
 							if (plan.reads[0] != nullptr && previous.reads[0] == plan.reads[0] &&
 							    !EquivalentValue(m_program, previous.key, plan.key))
-								Fail(flags.pc, "shared descriptor read has incompatible keys");
+								return void(Reject(flags.pc,
+								                   "shared descriptor read has incompatible keys"));
 						}
 						m_indirect_descriptors.push_back(std::move(plan));
 					}
@@ -3784,11 +3786,14 @@ private:
 			                [](Value word) { return word.Resolve().GetType() == Type::U32; })) {
 				return false;
 			}
+			return Reject(pc, fmt::format("{} dword {} is not a valid runtime value",
+			                              ValueOpcodeName(expected), bad_dword));
 		}
 		source = InternSource(descriptor);
 		return true;
 	}
 
+	bool ValidateAddressHandle(Value value, uint32_t pc) const {
 		const auto* handle = value.Resolve().TryInstruction();
 		if (handle == nullptr || handle->GetOpcode() != ValueOpcode::GetAddressResource) {
 		}

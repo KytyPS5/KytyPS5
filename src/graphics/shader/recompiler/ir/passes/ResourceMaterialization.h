@@ -58,7 +58,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
 
 // Applies an already-derived specialization to native IR before layout and emission.
-void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization);
+bool ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization);
 
 // Kind of an image heap entry as root sees it, or 0 (and a zeroed value) when root reads it as
 // null. Entries of one kind specialize identically.

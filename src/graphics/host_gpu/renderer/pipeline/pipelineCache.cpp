@@ -602,13 +602,14 @@ struct PipelineCache::ProgramCache {
 	}
 
 	ProgramCache(GraphicContext& graphics, ShaderRecompiler::IR::ImageHeapSource* image_heap)
-	    : graphics(graphics), image_heap(image_heap),
+	    : host_subgroup_size(graphics.subgroup_size == 0u ? 64u : graphics.subgroup_size),
+	      robust_buffer_access2(graphics.robust_buffer_access2_enabled), graphics(graphics),
+	      image_heap(image_heap),
 	      // AMD GPUs (vendor 0x1002) run NMin/NMax as v_min/v_max, which give the guest's NaN and
 	      // signed-zero results; GLSL.std.450 alone does not order -0 below +0.
-	      profile {.maintenance8 = graphics.maintenance8_enabled,
-		           .native_float_min_max =
-		               graphics.physical_device_properties.vendorID == 0x1002u,
-		           .device_clock_period_ps = graphics.device_clock_period_ps} {
+	      profile {.maintenance8         = graphics.maintenance8_enabled,
+	               .native_float_min_max = graphics.physical_device_properties.vendorID == 0x1002u,
+	               .device_clock_period_ps = graphics.device_clock_period_ps} {
 		lookup_key.static_state.reserve(MaxStaticKeyWords);
 	}
 	~ProgramCache() {
@@ -624,6 +625,7 @@ struct PipelineCache::ProgramCache {
 	std::unordered_set<uint64_t>                                reported_shaders;
 	std::unordered_set<uint64_t>                                stubbed_shaders;
 	ProgramKey                                                  lookup_key;
+	uint32_t                                                    host_subgroup_size    = 64;
 	GraphicContext&                                             graphics;
 	ShaderRecompiler::IR::ImageHeapSource*                      image_heap;
 	const ShaderRecompiler::Spirv::Profile                      profile;

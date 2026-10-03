@@ -322,6 +322,11 @@ bool CommandScheduler::IsFree(uint64_t tick) {
 	return m_master.IsFree(tick);
 }
 
+bool CommandScheduler::AcceptsOperations() {
+	std::lock_guard lock(m_operation_mutex);
+	return m_operation_state == OperationState::Open;
+}
+
 void CommandScheduler::CheckActive() const {
 	EXIT_IF(!Active());
 }

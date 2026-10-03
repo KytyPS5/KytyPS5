@@ -151,6 +151,11 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 		case ValueOpcode::BitwiseOr32:
 		case ValueOpcode::BitwiseXor32:
 		case ValueOpcode::BitwiseNot32:
+		case ValueOpcode::BitReverse32:
+		case ValueOpcode::BitCount32:
+		case ValueOpcode::FindUMsb32:
+		case ValueOpcode::FindILsb32:
+		case ValueOpcode::WqmU64:
 		case ValueOpcode::SelectU1:
 		case ValueOpcode::SelectU32:
 		case ValueOpcode::SelectF32:
@@ -999,6 +1004,51 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 		case ValueOpcode::BitwiseNot32:
 			if (Arg(inst, 0, a)) {
 				result = ~static_cast<uint32_t>(a);
+				return true;
+			}
+			return false;
+		case ValueOpcode::BitReverse32:
+			if (Arg(inst, 0, a)) {
+				auto value = static_cast<uint32_t>(a);
+				value      = ((value & 0x55555555u) << 1u) | ((value >> 1u) & 0x55555555u);
+				value      = ((value & 0x33333333u) << 2u) | ((value >> 2u) & 0x33333333u);
+				value      = ((value & 0x0f0f0f0fu) << 4u) | ((value >> 4u) & 0x0f0f0f0fu);
+				value      = ((value & 0x00ff00ffu) << 8u) | ((value >> 8u) & 0x00ff00ffu);
+				result     = (value << 16u) | (value >> 16u);
+				return true;
+			}
+			return false;
+		case ValueOpcode::BitCount32:
+			if (Arg(inst, 0, a)) {
+				result = static_cast<uint32_t>(std::popcount(static_cast<uint32_t>(a)));
+				return true;
+			}
+			return false;
+		case ValueOpcode::FindUMsb32:
+			if (Arg(inst, 0, a)) {
+				const auto value = static_cast<uint32_t>(a);
+				result =
+				    value == 0u ? UINT32_MAX : static_cast<uint32_t>(31 - std::countl_zero(value));
+				return true;
+			}
+			return false;
+		case ValueOpcode::FindILsb32:
+			if (Arg(inst, 0, a)) {
+				const auto value = static_cast<uint32_t>(a);
+				result = value == 0u ? UINT32_MAX : static_cast<uint32_t>(std::countr_zero(value));
+				return true;
+			}
+			return false;
+		case ValueOpcode::WqmU64:
+			// S_WQM_B64: every group of four mask bits becomes all ones if any of them is set.
+			if (Arg(inst, 0, a)) {
+				const auto quads = [](uint32_t word) {
+					auto bits = word | (word >> 1u);
+					bits |= bits >> 2u;
+					return static_cast<uint32_t>((bits & 0x11111111u) * 0x0fu);
+				};
+				result = quads(static_cast<uint32_t>(a)) |
+				         (static_cast<uint64_t>(quads(static_cast<uint32_t>(a >> 32u))) << 32u);
 				return true;
 			}
 			return false;

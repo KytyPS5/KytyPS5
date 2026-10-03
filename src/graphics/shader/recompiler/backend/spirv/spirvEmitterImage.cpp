@@ -1231,6 +1231,8 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			                          std::span<const uint32_t>(sample_operands).first(sample_operand_count));
 			return sample;
 		};
+			const auto& candidate = state.program.info.images[resource];
+		};
 		ctx.Define(inst, EmitImageResult(ctx, inst, EmitSample));
 		return;
 	}

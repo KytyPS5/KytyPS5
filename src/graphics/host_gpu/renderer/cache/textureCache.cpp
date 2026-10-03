@@ -38,6 +38,17 @@ constexpr uint64_t NumFramesBeforeRemoval = 32;
 // Largest GPU-written tiled image (in texels) that is written back to guest memory on submit.
 constexpr uint64_t SmallTiledReadbackTexels = 64 * 64;
 
+// Pool surfaces are never unmapped, so age is the only sign an image stopped owning its bytes.
+[[nodiscard]] bool ImageAbandoned(const Image& image, uint64_t current_frame) {
+	return current_frame - std::min(current_frame, image.frame_accessed_last) >
+	       NumFramesBeforeRemoval;
+}
+
+// A live tiled image has never written its pixels to guest memory.
+[[nodiscard]] bool ImageOwnsGuestBytes(const Image& image) {
+	return !image.info.IsTiled();
+}
+
 [[nodiscard]] bool DecodeColorClear(const TextureCache::ImageDesc& desc, uint8_t code,
                                   vk::ClearColorValue& clear) {
 	const auto& metadata = desc.info.metadata;
@@ -725,6 +736,12 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	    requested.type == cached.info.type && requested.pitch == cached.info.pitch &&
 	    !requested.HasStencil() && !cached.info.HasStencil() && !requested.HasMetadata() &&
 	    !cached.info.HasMetadata();
+	// PPSA30803: a pooled depth address reused for a color texture is a different surface.
+	if (binding == BindingType::Texture && cached.info.IsDepth() && !requested.IsDepth() &&
+	    !raw_d16_texture &&
+	    !IsSupportedSampledDepthFormat(cached.info.pixel_format, requested.pixel_format)) {
+		return {};
+	}
 	// PPSA04264, PPSA04288
 	// A partial view retains the entire matching array layout. HTile belongs to
 	// the depth source, independently of the data slices copied into color storage.
@@ -881,9 +898,9 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		BcAlias::Resolve(*this, cached_id, merged_id);
 		return {merged_id};
 	}
-	auto&      cached       = *owner;
+	auto&      cached = *owner;
 	const bool safe_to_delete =
-	    current_tick - std::min(current_tick, cached.tick_accessed_last) > NumFramesBeforeRemoval &&
+	    ImageAbandoned(cached, m_frame_index.load(std::memory_order_relaxed)) &&
 	    cached.heap_refs.load(std::memory_order_relaxed) == 0u;
 
 	const uint32_t requested_block = requested.bytes_per_block * requested.samples;
@@ -2158,6 +2175,8 @@ bool TextureCache::IsRegionGpuModified(uint64_t address, uint64_t size) {
 	for (const auto id: FindImagesInRegion(address, size, false)) {
 		const auto& image = m_slot_images[id];
 		// PPSA17168: shader data read over a reused render target's memory.
+		if (!image.depth_id && image.IsGpuModified() && !image.IsDefinitelyCpuDirty() &&
+		    ImageOwnsGuestBytes(image)) {
 			return true;
 		}
 	}

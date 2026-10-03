@@ -11,6 +11,9 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 class Value;
 
 using SrtMemoryReader = bool (*)(void* userdata, uint64_t address, std::span<uint32_t> values);
+// Bytes readable from address, capped at size.
+using SrtExtentQuery = uint64_t (*)(void* userdata, uint64_t address, uint64_t size);
+using SrtBlockReader = bool (*)(void* userdata, uint64_t address, void* data, uint64_t size);
 
 // Image descriptors at base + first + k * step, k < count, within size bytes that a sampled
 // root selects by GPU-computed byte offset. The host keeps them resident instead of
@@ -47,7 +50,7 @@ struct SrtRuntime {
 	SrtMemoryReader           read_specialization_memory = nullptr;
 	std::span<const uint32_t> workgroup_counts;
 	uint64_t                  indirect_args_address = 0;
-	ImageHeapSource*          image_heap            = nullptr;
+	SrtOwnershipQuery         gpu_owned             = nullptr;
 };
 
 class SrtReadCapture {

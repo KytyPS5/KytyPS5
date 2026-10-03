@@ -173,14 +173,23 @@ void RecordBdaFault(EmitterState& state, uint32_t page) {
 	const auto bit =
 	    Binary(state, spv::OpShiftLeftLogical, TypeU32(state), ConstantU32(state, 1),
 	           Binary(state, spv::OpBitwiseAnd, TypeU32(state), page, ConstantU32(state, 31)));
+	// Lanes faulting pages of one word set their bits together; a load/or/store loses some.
 	const auto pointer = FaultElementPointer(state, word);
-	const auto value   = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
-	state.builder.AddFunction(spv::OpStore, pointer,
-	                          Binary(state, spv::OpBitwiseOr, TypeU32(state), value, bit));
+	const auto old     = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAtomicOr, TypeU32(state), old, pointer,
+	                          ConstantU32(state, spv::ScopeDevice),
+	                          ConstantU32(state, spv::MemorySemanticsMaskNone), bit);
 }
 
-uint32_t LoadBdaDword(ValueEmitContext& ctx, uint32_t address, bool coherent = false) {
+uint32_t GetBdaStorePointer(ValueEmitContext& ctx, uint32_t address) {
+	auto&      state  = ctx.state;
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpFunctionCall, TypeU64(state), result,
+	                          state.bda_store_pointer_function, address);
+	return result;
+}
+
+uint32_t LoadBdaDword(ValueEmitContext& ctx, uint32_t address) {
 	auto&      state   = ctx.state;
 	const auto bda     = GetBdaPointer(state, address);
 	const auto present =
@@ -246,6 +255,106 @@ uint32_t LoadBda(ValueEmitContext& ctx, uint32_t address, uint32_t active, uint3
 		return bits == 32u ? merged
 		                   : Binary(state, spv::OpBitwiseAnd, TypeU32(state), merged,
 		                            ConstantU32(state, bits == 8u ? 0xffu : 0xffffu));
+	});
+}
+
+// An unmapped page faults and drops the write; an untracked mapped page faults but keeps it.
+void StoreBdaDword(ValueEmitContext& ctx, uint32_t address, uint32_t data) {
+	auto&      state   = ctx.state;
+	const auto bda     = GetBdaStorePointer(ctx, address);
+	const auto present = Binary(state, spv::OpINotEqual, TypeBool(state), bda,
+	                            ConstantU64(state, 0));
+	EmitIfCondition(state, present, [&]() {
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer,
+		                          bda);
+		state.builder.AddFunction(spv::OpStore, pointer, data, spv::MemoryAccessAlignedMask,
+		                          static_cast<uint32_t>(sizeof(uint32_t)));
+	});
+}
+
+// Not atomic: two lanes touching different bytes of one dword can lose a write, where hardware
+// merges them in the memory pipeline.
+void StoreBdaMasked(ValueEmitContext& ctx, uint32_t address, uint32_t mask, uint32_t value) {
+	auto&      state   = ctx.state;
+	const auto bda     = GetBdaStorePointer(ctx, address);
+	const auto present = Binary(state, spv::OpINotEqual, TypeBool(state), bda,
+	                            ConstantU64(state, 0));
+	EmitIfCondition(state, present, [&]() {
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer,
+		                          bda);
+		const auto old = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), old, pointer,
+		                          spv::MemoryAccessAlignedMask,
+		                          static_cast<uint32_t>(sizeof(uint32_t)));
+		const auto kept = Binary(state, spv::OpBitwiseAnd, TypeU32(state), old,
+		                         Unary(state, spv::OpNot, TypeU32(state), mask));
+		state.builder.AddFunction(spv::OpStore, pointer,
+		                          Binary(state, spv::OpBitwiseOr, TypeU32(state), kept, value),
+		                          spv::MemoryAccessAlignedMask,
+		                          static_cast<uint32_t>(sizeof(uint32_t)));
+	});
+}
+
+void StoreBda(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
+              uint32_t bits) {
+	auto&      state   = ctx.state;
+	const auto address = GuestAddress(ctx, inst, mem);
+	const auto data    = ctx.Arg(inst, inst.NumArgs() - 2);
+	const auto active  = ctx.Arg(inst, inst.NumArgs() - 1);
+	const auto u32     = TypeU32(state);
+	EmitIfCondition(state, active, [&]() {
+		const auto aligned = Binary(state, spv::OpBitwiseAnd, TypeScalarU64(state), address,
+		                            ConstantDeviceAddress(state, ~uint64_t {3}));
+		const auto byte    = Binary(state, spv::OpBitwiseAnd, u32,
+		                            Unary(state, spv::OpUConvert, u32, address),
+		                            ConstantU32(state, 3));
+		const auto shift =
+		    Binary(state, spv::OpShiftLeftLogical, u32, byte, ConstantU32(state, 3));
+		const auto width   = ConstantU32(state, bits == 8u    ? 0xffu
+		                                        : bits == 16u ? 0xffffu
+		                                                      : 0xffffffffu);
+		const auto payload =
+		    bits == 32u ? data : Binary(state, spv::OpBitwiseAnd, u32, data, width);
+		const auto next_dword = [&]() {
+			return Binary(state, spv::OpIAdd, TypeU64(state), aligned,
+			              ConstantU64(state, sizeof(uint32_t)));
+		};
+		const auto upper_shift = [&]() {
+			return Binary(state, spv::OpShiftLeftLogical, u32,
+			              Binary(state, spv::OpISub, u32, ConstantU32(state, 4), byte),
+			              ConstantU32(state, 3));
+		};
+		if (bits == 32u) {
+			const auto is_aligned =
+			    Binary(state, spv::OpIEqual, TypeBool(state), byte, ConstantU32(state, 0));
+			EmitIfCondition(state, is_aligned, [&]() { StoreBdaDword(ctx, aligned, payload); });
+			EmitIfCondition(
+			    state, Unary(state, spv::OpLogicalNot, TypeBool(state), is_aligned), [&]() {
+				    StoreBdaMasked(ctx, aligned,
+				                   Binary(state, spv::OpShiftLeftLogical, u32, width, shift),
+				                   Binary(state, spv::OpShiftLeftLogical, u32, payload, shift));
+				    const auto upper = upper_shift();
+				    StoreBdaMasked(ctx, next_dword(),
+				                   Binary(state, spv::OpShiftRightLogical, u32, width, upper),
+				                   Binary(state, spv::OpShiftRightLogical, u32, payload, upper));
+			    });
+			return;
+		}
+		StoreBdaMasked(ctx, aligned, Binary(state, spv::OpShiftLeftLogical, u32, width, shift),
+		               Binary(state, spv::OpShiftLeftLogical, u32, payload, shift));
+		if (bits == 8u) {
+			return;
+		}
+		const auto crosses =
+		    Binary(state, spv::OpUGreaterThan, TypeBool(state), byte, ConstantU32(state, 2));
+		EmitIfCondition(state, crosses, [&]() {
+			const auto upper = upper_shift();
+			StoreBdaMasked(ctx, next_dword(),
+			               Binary(state, spv::OpShiftRightLogical, u32, width, upper),
+			               Binary(state, spv::OpShiftRightLogical, u32, payload, upper));
+		});
 	});
 }
 
@@ -1129,18 +1238,17 @@ uint32_t GetBdaPointer(EmitterState& state, uint32_t address) {
 	return result;
 }
 
-void DefineGetBdaPointer(EmitterState& state) {
-	if (!state.program.info.uses_dma) {
-		return;
-	}
-	const auto type            = TypeU64(state);
-	const auto function_type   = state.builder.Type(spv::OpTypeFunction, type, type);
-	state.bda_pointer_function = state.builder.AllocateId();
-	const auto address         = state.builder.AllocateId();
-	const auto entry_label     = state.builder.AllocateId();
-	state.builder.AddName(state.bda_pointer_function, "get_bda_pointer");
-	state.builder.AddFunction(spv::OpFunction, type, state.bda_pointer_function,
-	                          spv::FunctionControlMaskNone, function_type);
+namespace {
+
+uint32_t BeginBdaPointerFunction(EmitterState& state, uint32_t function, const char* name,
+                                 uint32_t& page, uint32_t& offset) {
+	const auto type          = TypeU64(state);
+	const auto function_type = state.builder.Type(spv::OpTypeFunction, type, type);
+	const auto address       = state.builder.AllocateId();
+	const auto entry_label   = state.builder.AllocateId();
+	state.builder.AddName(function, name);
+	state.builder.AddFunction(spv::OpFunction, type, function, spv::FunctionControlMaskNone,
+	                          function_type);
 	state.builder.AddFunction(spv::OpFunctionParameter, type, address);
 	EmitLabel(state, entry_label);
 
@@ -1152,15 +1260,63 @@ void DefineGetBdaPointer(EmitterState& state) {
 	           ConstantU64(state, LibKernel::Memory::kExtendedMemoryBase - LOWER_ADDRESS_SIZE)),
 	    address);
 	const auto page64        = Binary(state, spv::OpShiftRightLogical, type, packed,
-	                                  ConstantU32(state, BufferCache::CACHING_PAGEBITS));
-	const auto page          = Unary(state, spv::OpUConvert, TypeU32(state), page64);
+	                                  ConstantU64(state, BufferCache::CACHING_PAGEBITS));
+	page                     = Unary(state, spv::OpUConvert, TypeU32(state), page64);
+	offset                   = Binary(state, spv::OpBitwiseAnd, type, address,
+	                                  ConstantU64(state, BufferCache::CACHING_PAGESIZE - 1));
 	const auto entry_pointer = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state, 64),
 	                          entry_pointer, state.bda_pagetable_variable, ConstantU32(state, 0),
 	                          page);
 	const auto base = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpLoad, type, base, entry_pointer);
-	const auto missing = Binary(state, spv::OpIEqual, TypeBool(state), base, ConstantU64(state, 0));
+	return base;
+}
+
+uint32_t UntaggedBdaBase(EmitterState& state, uint32_t base) {
+	return Binary(state, spv::OpBitwiseAnd, TypeU64(state), base,
+	              ConstantU64(state, ~BufferCache::BDA_STORE_TRACKED_BIT));
+}
+
+// Faults on every page whose entry lacks the tracked tag, so the host learns which pages to own.
+void DefineGetBdaStorePointer(EmitterState& state) {
+	const auto type                  = TypeU64(state);
+	state.bda_store_pointer_function = state.builder.AllocateId();
+	uint32_t   page                  = 0;
+	uint32_t   offset                = 0;
+	const auto base = BeginBdaPointerFunction(state, state.bda_store_pointer_function,
+	                                          "get_bda_store_pointer", page, offset);
+	const auto untracked =
+	    Binary(state, spv::OpIEqual, TypeBool(state),
+	           Binary(state, spv::OpBitwiseAnd, type, base,
+	                  ConstantU64(state, BufferCache::BDA_STORE_TRACKED_BIT)),
+	           ConstantU64(state, 0));
+	EmitIfCondition(state, untracked, [&]() { RecordBdaFault(state, page); });
+	const auto missing =
+	    Binary(state, spv::OpIEqual, TypeBool(state), base, ConstantU64(state, 0));
+	const auto available = Binary(state, spv::OpIAdd, type, UntaggedBdaBase(state, base), offset);
+	const auto result    = Select(state, type, missing, ConstantU64(state, 0), available);
+	state.builder.AddFunction(spv::OpReturnValue, result);
+	state.builder.AddFunction(spv::OpFunctionEnd);
+}
+
+} // namespace
+
+void DefineGetBdaPointer(EmitterState& state) {
+	if (!state.program.info.uses_dma) {
+		return;
+	}
+	if (state.program.info.writes_dma) {
+		DefineGetBdaStorePointer(state);
+	}
+	const auto type            = TypeU64(state);
+	state.bda_pointer_function = state.builder.AllocateId();
+	uint32_t   page            = 0;
+	uint32_t   offset          = 0;
+	const auto base =
+	    BeginBdaPointerFunction(state, state.bda_pointer_function, "get_bda_pointer", page, offset);
+	const auto missing =
+	    Binary(state, spv::OpIEqual, TypeBool(state), base, ConstantU64(state, 0));
 	const auto fault_label     = state.builder.AllocateId();
 	const auto available_label = state.builder.AllocateId();
 	const auto merge_label     = state.builder.AllocateId();
@@ -1172,9 +1328,7 @@ void DefineGetBdaPointer(EmitterState& state) {
 	state.builder.AddFunction(spv::OpBranch, merge_label);
 
 	EmitLabel(state, available_label);
-	const auto offset    = Binary(state, spv::OpBitwiseAnd, type, address,
-	                              ConstantU64(state, BufferCache::CACHING_PAGESIZE - 1));
-	const auto available = Binary(state, spv::OpIAdd, type, base, offset);
+	const auto available = Binary(state, spv::OpIAdd, type, UntaggedBdaBase(state, base), offset);
 	state.builder.AddFunction(spv::OpBranch, merge_label);
 
 	EmitLabel(state, merge_label);
@@ -1416,12 +1570,16 @@ void EmitStoreMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto  buffer_components = IR::BufferComponentCount(op);
 	const auto  shared_components = IR::SharedComponentCount(op);
 	const auto  type              = inst.Arg(inst.NumArgs() - 2).GetType();
+	const auto  address_info      = IR::AddressOpcodeInfoOf(op);
 	if (mem.kind == IR::ResourceKind::FlatLocal)
 		StoreLocalFlat(ctx, inst);
 	else if (buffer_components > 1u)
 		StoreWideBuffer(ctx, inst, buffer_components);
 	else if (shared_components > 1u)
 		StoreWideShared(ctx, inst, shared_components);
+	else if (address_info.access == IR::AddressAccess::Write &&
+	         mem.kind != IR::ResourceKind::Scratch)
+		StoreBda(ctx, inst, mem, address_info.data_bits);
 	else if (op == IR::ValueOpcode::StoreBufferU32 && mem.formatted)
 		FormattedStore(ctx, inst, mem);
 	else if (type == IR::Type::U8)

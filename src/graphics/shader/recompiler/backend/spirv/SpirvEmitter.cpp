@@ -142,19 +142,152 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 			}
 		}
 	}
-	using Kind = IR::DescriptorBindingKind;
-	std::array<uint32_t, static_cast<size_t>(Kind::Count)> expected {};
-	auto& buffer_count = expected[static_cast<size_t>(Kind::Buffers)];
-	for (uint32_t index = 0; index < program.info.buffers.size(); ++index) {
-		const auto slot = (live_buffers & (uint64_t{1} << index)) != 0 ? buffer_count++ : UINT32_MAX;
-		if (program.info.buffers[index].descriptor_index != slot) {
-			Fail(program, "native buffer descriptor index does not match shader topology");
+}
+
+} // namespace
+
+Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program& program) {
+	SpirvRequirements requirements {};
+	const auto refuse = [&](const IR::Inst& inst, const char* reason) {
+		if (requirements.refusal == nullptr) {
+			requirements.refusal      = reason;
+			requirements.refused_inst = &inst;
 		}
-	}
-	for (const auto& image: program.info.images) {
-		const auto kind = IR::DescriptorBindingForImage(image);
-		if (!kind.has_value()) {
-			Fail(program, "native shader plan has an invalid image class");
+	};
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			requirements.float64 |= inst.GetType() == IR::Type::F64;
+			if (IR::BufferAccessOf(inst.GetOpcode()) == IR::BufferAccess::Atomic &&
+			    inst.GetType() == IR::Type::U64) {
+				requirements.buffer_int64_atomics = true;
+			}
+			const auto address_access = IR::AddressOpcodeInfoOf(inst.GetOpcode()).access;
+			if (address_access != IR::AddressAccess::None) {
+				const auto memory_index = inst.Flags<IR::MemoryFlags>().index;
+				if (memory_index >= program.memory_info.size()) {
+					Fail(program, "address operation has invalid memory metadata");
+				}
+				const auto kind = program.memory_info[memory_index].kind;
+				if (kind == IR::ResourceKind::Scratch || kind == IR::ResourceKind::FlatLocal) {
+					if (program.scratch_dwords == 0) {
+						Fail(program, "scratch operation has no per-thread storage");
+					}
+					requirements.function_scratch = true;
+					if (kind == IR::ResourceKind::FlatLocal && program.stage != ShaderType::Compute &&
+					    program.stage != ShaderType::Mesh) {
+						requirements.function_lds = true;
+					}
+				}
+			}
+			if (IR::BufferAccessOf(inst.GetOpcode()) != IR::BufferAccess::None) {
+				const auto memory_index = inst.Flags<IR::MemoryFlags>().index;
+				if (memory_index >= program.memory_info.size()) {
+					Fail(program, "buffer operation has invalid memory metadata");
+				}
+				const auto& memory = program.memory_info[memory_index];
+				if (memory.kind == IR::ResourceKind::IndirectBuffer &&
+				    inst.GetOpcode() != IR::ValueOpcode::ReadConstBuffer) {
+					requirements.subgroup_local_invocation_id = true;
+				}
+				if (memory.kind == IR::ResourceKind::Buffer) {
+					requirements.coherent_buffers |= memory.coherent;
+					if (memory.resource >= program.info.buffers.size()) {
+						Fail(program, "buffer operation has invalid resource metadata");
+					}
+					const auto bits = StorageBufferElementBits(program, memory);
+					requirements.buffer_u8 |= bits == 8u;
+					requirements.buffer_u16 |= bits == 16u;
+					if ((program.info.buffers[memory.resource].packed_stride & (1u << 20u)) != 0u) {
+						if (program.stage != ShaderType::Compute) {
+							refuse(inst, "buffer ADD_TID is only valid for compute shaders");
+						}
+						requirements.subgroup_local_invocation_id = true;
+					}
+				}
+			}
+			const auto shared_access = IR::SharedAccessOf(inst.GetOpcode());
+			if (shared_access != IR::SharedAccess::None) {
+				const auto index = inst.Flags<IR::MemoryFlags>().index;
+				if (index >= program.memory_info.size()) {
+					Fail(program, "shared operation has invalid memory metadata");
+				}
+				const auto kind = program.memory_info[index].kind;
+				if (kind != IR::ResourceKind::Lds && kind != IR::ResourceKind::Gds) {
+					Fail(program, "shared operation has invalid resource kind");
+				}
+				if (shared_access == IR::SharedAccess::Atomic &&
+				    IR::SharedComponentCount(inst.GetOpcode()) == 2u) {
+					if (kind != IR::ResourceKind::Lds || program.stage != ShaderType::Compute) {
+						refuse(inst, "64-bit shared atomics require compute LDS");
+					}
+					requirements.shared_int64_atomics = true;
+				}
+				if (program.stage != ShaderType::Compute && program.stage != ShaderType::Mesh &&
+				    kind == IR::ResourceKind::Lds) {
+					requirements.function_lds = true;
+				}
+				if (shared_access == IR::SharedAccess::Append ||
+				    shared_access == IR::SharedAccess::Consume) {
+					requirements.subgroup_ballot              = true;
+					requirements.subgroup_shuffle             = true;
+					requirements.subgroup_local_invocation_id = true;
+				}
+			}
+			switch (inst.GetOpcode()) {
+				case IR::ValueOpcode::StoreCompletion: requirements.subgroup_barrier = true; break;
+				case IR::ValueOpcode::BvhIntersect: requirements.bvh = true; break;
+				case IR::ValueOpcode::Ballot: requirements.subgroup_ballot = true; break;
+				case IR::ValueOpcode::DppMoveU32:
+				case IR::ValueOpcode::ReadFirstLane:
+				case IR::ValueOpcode::ReadLane: {
+					requirements.subgroup_ballot  = true;
+					requirements.subgroup_shuffle = true;
+					if (inst.GetOpcode() == IR::ValueOpcode::DppMoveU32) {
+						requirements.subgroup_local_invocation_id = true;
+					}
+					break;
+				}
+				case IR::ValueOpcode::DppUpdateU32:
+				case IR::ValueOpcode::WriteLane: {
+					requirements.subgroup_ballot              = true;
+					requirements.subgroup_local_invocation_id = true;
+					break;
+				}
+				case IR::ValueOpcode::Permlane16U32: {
+					requirements.subgroup_ballot              = true;
+					requirements.subgroup_shuffle             = true;
+					requirements.subgroup_local_invocation_id = true;
+					break;
+				}
+				case IR::ValueOpcode::SwizzleU32:
+				case IR::ValueOpcode::PermuteU32:
+				case IR::ValueOpcode::BpermuteU32: {
+					requirements.subgroup_ballot              = true;
+					requirements.subgroup_shuffle             = true;
+					requirements.subgroup_local_invocation_id = true;
+					break;
+				}
+				case IR::ValueOpcode::LaneId:
+					requirements.subgroup_local_invocation_id |=
+					    program.stage != ShaderType::TessellationControl;
+					break;
+				case IR::ValueOpcode::ImageQueryLod: requirements.compute_derivatives = true; break;
+				case IR::ValueOpcode::ImageGatherRaw:
+					requirements.image_gather_extended = true;
+					break;
+				case IR::ValueOpcode::SetAttribute: {
+					const auto index = inst.Flags<IR::ExportFlags>().index;
+					if (index >= program.export_info.size()) {
+						Fail(program, "attribute export has invalid metadata");
+					}
+					if (program.stage == ShaderType::Pixel &&
+					    program.export_info[index].vm) {
+						requirements.pixel_valid_mask = true;
+					}
+					break;
+				}
+				default: break;
+			}
 		}
 		if (image.mip_count == 0u ||
 		    (image.mip_mode != IR::ImageMipMode::Dynamic && image.mip_count != 1u)) {

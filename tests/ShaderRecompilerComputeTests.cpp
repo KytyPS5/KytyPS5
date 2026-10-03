@@ -1320,6 +1320,7 @@ void CheckLeastRecentlyUsedCacheOrdering() {
 struct BdaMapping {
   uint64_t guest_base = 0;
   u32 backing_offset = 0;
+  bool store_tracked = false;
 };
 
 struct TestCase {
@@ -1365,6 +1366,7 @@ struct TestCase {
   size_t storage_buffer_range_bytes = 0;
   std::vector<u32> storage_buffer_offsets;
   std::vector<BdaMapping> bda_mappings;
+  std::optional<u32> expected_bda_fault_word0;
   bool expand_shader_data_storage = false;
   bool expected_force_point_sampler = false;
   float expected_float_tolerance = 0.0f;
@@ -5085,6 +5087,263 @@ public:
                 direct_offset, allocation_size) == 0,
             "dirty-GC direct-memory allocation release failed");
     std::printf("[host]    %-32s ok\n", name);
+  }
+
+  void CheckBufferCacheBdaStoreOwnership() {
+    constexpr const char *name = "BufferCacheBdaStoreOwnership";
+    constexpr uintptr_t base = 0x0000000204000000ull;
+    constexpr uint64_t allocation_size = 0x100000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t page = BufferCache::CACHING_PAGESIZE;
+    constexpr uint64_t stored_offset = page + 0x40;
+    constexpr uint64_t plain_offset = 2 * page + 0x40;
+    constexpr u32 stale_value = 0x0badf00du;
+    constexpr u32 first_store = 0x5eed0001u;
+    constexpr u32 cpu_value = 0xc0ffee00u;
+    constexpr u32 second_store = 0x5eed0002u;
+
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "BDA-store direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "BDA-store fixed direct-memory mapping failed");
+    auto *memory = static_cast<uint8_t *>(mapped);
+    std::memcpy(memory + stored_offset, &stale_value, sizeof(stale_value));
+    std::memcpy(memory + plain_offset, &stale_value, sizeof(stale_value));
+
+    {
+      auto &cache = context.GetBufferCache();
+      context.MapMemory(base, allocation_size);
+
+      const auto ReadPageEntry = [&](uint64_t address) {
+        auto readback =
+            CreateHostBuffer(name, sizeof(uint64_t),
+                             vk::BufferUsageFlagBits::eTransferDst, {0, 0});
+        const vk::BufferCopy copy{
+            (address >> BufferCache::CACHING_PAGEBITS) * sizeof(uint64_t), 0,
+            sizeof(uint64_t)};
+        scheduler.Current().Handle().copyBuffer(
+            cache.GetBdaPageTableBuffer()->Handle(), readback.buffer, 1, &copy);
+        vk::BufferMemoryBarrier barrier{};
+        barrier.sType = vk::StructureType::eBufferMemoryBarrier;
+        barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+        barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.buffer = readback.buffer;
+        barrier.size = readback.size;
+        scheduler.Current().Handle().pipelineBarrier(
+            vk::PipelineStageFlagBits::eTransfer,
+            vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1, &barrier, 0,
+            nullptr);
+        scheduler.Finish();
+        const auto words = ReadBuffer(name, readback, 2);
+        DestroyBuffer(&readback);
+        return uint64_t{words[0]} | (uint64_t{words[1]} << 32u);
+      };
+      const auto StoreOnGpu = [&](BufferId owner, uint64_t address, u32 value) {
+        auto &buffer = cache.GetBuffer(owner);
+        buffer.Fill(buffer.Offset(address), sizeof(value), value);
+      };
+      const auto ReadBacking = [&](uint64_t address) {
+        u32 value = 0;
+        Libs::LibKernel::Memory::TryReadBacking(address, &value, sizeof(value));
+        return value;
+      };
+
+      const auto owner = cache.FindBuffer(base, 4 * page);
+      const auto untracked_entry = ReadPageEntry(base + stored_offset);
+      Require(name, "untracked entry",
+              owner && untracked_entry != 0 &&
+                  (untracked_entry & BufferCache::BDA_STORE_TRACKED_BIT) == 0,
+              "a freshly registered page was already tagged as BDA-stored");
+
+      // Untracked pages are only learned from the fault the store records.
+      context.PrepareBda(true);
+      StoreOnGpu(owner, base + stored_offset, first_store);
+      Require(name, "untracked store window",
+              !cache.IsRegionGpuModified(base + stored_offset,
+                                         sizeof(first_store)) &&
+                  !cache.HasUnmarkedBdaStores(),
+              "an untracked page was owned before any store faulted on it");
+      cache.ResolveBdaFault(base + page, page);
+      const auto tracked_entry = ReadPageEntry(base + stored_offset);
+      Require(name, "fault promotes page",
+              tracked_entry ==
+                      (untracked_entry | BufferCache::BDA_STORE_TRACKED_BIT) &&
+                  (ReadPageEntry(base + plain_offset) &
+                   BufferCache::BDA_STORE_TRACKED_BIT) == 0 &&
+                  cache.HasUnmarkedBdaStores() &&
+                  cache.IsRegionRegistered(base, 4 * page),
+              "a store fault on an owned page did not tag exactly that page");
+
+      context.RunGarbageCollector();
+      Require(name, "late ownership",
+              cache.IsRegionGpuModified(base + stored_offset,
+                                        sizeof(first_store)) &&
+                  cache.HasGpuDirtyBytes(base + stored_offset,
+                                         sizeof(first_store)) &&
+                  !cache.IsRegionGpuModified(base + plain_offset,
+                                             sizeof(first_store)) &&
+                  !cache.HasUnmarkedBdaStores(),
+              "the promoted page was not marked GPU-written before collection");
+      Require(name, "late ownership readback",
+              context.HandleFault(PageFaultAccess::Read,
+                                  base + stored_offset) &&
+                  ReadBacking(base + stored_offset) == first_store &&
+                  ReadBacking(base + plain_offset) == stale_value &&
+                  !cache.HasGpuDirtyBytes(base + stored_offset,
+                                          sizeof(first_store)),
+              "a CPU read did not see the value a BDA store wrote");
+
+      Require(name, "guest rewrite",
+              context.InvalidateMemory(base + stored_offset, sizeof(cpu_value)),
+              "failed to invalidate the stored page for a CPU write");
+      Libs::LibKernel::Memory::WriteBacking(base + stored_offset, &cpu_value,
+                                            sizeof(cpu_value));
+
+      context.PrepareBda(true);
+      Require(name, "tracked store ownership",
+              cache.IsRegionGpuModified(base + stored_offset,
+                                        sizeof(second_store)) &&
+                  cache.HasGpuDirtyBytes(base + stored_offset,
+                                         sizeof(second_store)) &&
+                  !cache.IsRegionGpuModified(base + plain_offset,
+                                             sizeof(second_store)) &&
+                  !cache.HasGpuDirtyBytes(base + plain_offset,
+                                          sizeof(second_store)),
+              "a BDA-store dispatch did not own exactly its tracked pages");
+      StoreOnGpu(owner, base + stored_offset, second_store);
+      Require(name, "tracked store upload order",
+              ReadBacking(base + stored_offset) == cpu_value,
+              "the guest copy changed before the GPU store was read back");
+
+      BufferCacheTestAccess::SetGarbageCollectionThresholds(
+          cache, 0, std::numeric_limits<uint64_t>::max());
+      for (uint32_t tick = 0; tick <= 160; tick++) {
+        cache.RunGarbageCollector();
+      }
+      Require(name, "dirty retention",
+              cache.IsRegionRegistered(base, 4 * page) &&
+                  cache.IsRegionGpuModified(base + stored_offset,
+                                            sizeof(second_store)),
+              "normal collection retired a buffer holding BDA-stored bytes");
+      BufferCacheTestAccess::SetGarbageCollectionThresholds(
+          cache, std::numeric_limits<uint64_t>::max(),
+          std::numeric_limits<uint64_t>::max());
+
+      cache.ReadMemory(base + stored_offset, sizeof(second_store));
+      Require(name, "tracked store readback",
+              ReadBacking(base + stored_offset) == second_store &&
+                  !cache.IsRegionGpuModified(base + stored_offset,
+                                             sizeof(second_store)),
+              "a CPU read did not see the upload-then-store result");
+
+      context.PrepareBda(false);
+      Require(name, "read-only dispatch",
+              !cache.IsRegionGpuModified(base + stored_offset,
+                                         sizeof(second_store)),
+              "a BDA dispatch without stores took GPU ownership");
+
+      const auto merged = cache.FindBuffer(base, 8 * page);
+      const auto merged_entry = ReadPageEntry(base + stored_offset);
+      Require(name, "merged owner keeps tag",
+              merged && merged != owner &&
+                  (merged_entry & BufferCache::BDA_STORE_TRACKED_BIT) != 0 &&
+                  (ReadPageEntry(base + plain_offset) &
+                   BufferCache::BDA_STORE_TRACKED_BIT) == 0,
+              "re-registering a tracked page dropped its BDA-store tag");
+
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "BDA-store direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "BDA-store direct-memory allocation release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // A refused program drops its dispatch, stays dropped, and leaves the cache working.
+  void CheckRefusedShaderSkipsDispatch() {
+    constexpr const char *name = "RefusedShaderSkipsDispatch";
+    EnsureRuntimeContext();
+    // The CS registers leave float mode at 0, which FP64 cannot be emitted under.
+    static const auto refused = Float64ConversionCode();
+    static const auto accepted = [] {
+      std::vector<u32> code;
+      AppendEnd(&code);
+      return code;
+    }();
+    for (const auto *code : {&refused, &accepted}) {
+      ShaderMapUserData(reinterpret_cast<uint64_t>(code->data()),
+          {.type = Prospero::ShaderBinaryType::kCs,
+           .code_size_bytes = static_cast<uint32_t>(code->size() * sizeof(u32))});
+    }
+    static std::array<u32, 8> memory{};
+    const auto base = reinterpret_cast<uint64_t>(memory.data());
+    const std::array<u32, 4> descriptor{static_cast<u32>(base),
+                                        static_cast<u32>(base >> 32u) & 0xffffu,
+                                        static_cast<u32>(sizeof(memory)), 3u << 28u};
+
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    const auto select = [&](const std::vector<u32> &code) {
+      shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(code.data()),
+                           .num_thread_x = 64, .num_thread_y = 1, .num_thread_z = 1,
+                           .wave_size = 64, .user_sgpr = 4, .tgid_x_en = true});
+      for (uint32_t i = 0; i < descriptor.size(); i++) {
+        shaders.SetCsUserSgpr(i, descriptor[i], HW::UserSgprType::Unknown);
+      }
+    };
+    const auto lookup = [&](ShaderComputeInputInfo &input) {
+      return context.GetPipelineCache().GetComputeProgram(
+          shaders.GetCs(), registers.GetShaderRegisters(), input);
+    };
+
+    select(refused);
+    for (const char *attempt : {"first lookup", "skip-set lookup"}) {
+      ShaderComputeInputInfo input{};
+      const auto program = lookup(input);
+      Require(name, attempt, !program && !input.stage,
+              "a program the backend refused was handed to a dispatch");
+    }
+    context.GetRenderExecutor().DispatchDirect(0, scheduler.Current(), 1, 1, 1, 0x41u);
+    Require(name, "dispatch dropped", memory == std::array<u32, 8>{},
+            "the refused dispatch reached guest memory");
+
+    select(accepted);
+    ShaderComputeInputInfo input{};
+    const auto program = lookup(input);
+    Require(name, "cache still compiles", program && input.stage,
+            "a refusal disabled the program cache for other shaders");
+    scheduler.Finish();
+    std::printf("[gpu]     %-32s ok\n", name);
   }
 
   void CheckComputeMetaClearClassification() {
@@ -15946,7 +16205,8 @@ public:
       cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
                           vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr,
                           1, barriers.data(), 0, nullptr);
-      for (const auto &[guest_base, backing] : test.bda_mappings) {
+      for (const auto &[guest_base, backing, store_tracked] :
+           test.bda_mappings) {
         const auto page_offset = guest_base &
                                  (BufferCache::CACHING_PAGESIZE - 1);
         Require(test.name, "dispatch",
@@ -15959,9 +16219,12 @@ public:
         auto address = buffer.device_address + backing - page_offset;
         auto page = BufferCache::PageIndex(guest_base);
         for (uint64_t mapped = 0; mapped < pages; mapped++) {
+          const vk::DeviceAddress entry =
+              address |
+              (store_tracked ? BufferCache::BDA_STORE_TRACKED_BIT : 0u);
           cmd.updateBuffer(m_bda_pagetable_buffer.buffer,
                            (page + mapped) * sizeof(vk::DeviceAddress),
-                           sizeof(address), &address);
+                           sizeof(entry), &entry);
           address += BufferCache::CACHING_PAGESIZE;
         }
       }
@@ -15983,7 +16246,28 @@ public:
     }
     cmd.dispatch(test.dispatch_x, test.dispatch_y, test.dispatch_z);
 
-    if (Count(Kind::Buffers) != 0) {
+    Buffer fault_readback;
+    if (test.expected_bda_fault_word0.has_value()) {
+      Require(test.name, "dispatch", uses_bda,
+              "BDA fault expectation on a shader without BDA access");
+      fault_readback = CreateHostBuffer(
+          test.name, sizeof(u32), vk::BufferUsageFlagBits::eTransferDst, {});
+      const vk::BufferCopy copy{0, 0, sizeof(u32)};
+      cmd.copyBuffer(m_fault_buffer.buffer, fault_readback.buffer, 1, &copy);
+      vk::BufferMemoryBarrier barrier{};
+      barrier.sType = vk::StructureType::eBufferMemoryBarrier;
+      barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+      barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+      barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.buffer = fault_readback.buffer;
+      barrier.size = fault_readback.size;
+      cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                          vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1,
+                          &barrier, 0, nullptr);
+    }
+
+    if (buffers != nullptr) {
       vk::BufferMemoryBarrier barrier{};
       barrier.sType = vk::StructureType::eBufferMemoryBarrier;
       barrier.srcAccessMask =
@@ -16016,6 +16300,13 @@ public:
     EndSubmitAndFree(test.name, "dispatch", cmd);
     for (const auto view : sampled_mip_views) {
       m_device.destroyImageView(view, nullptr);
+    }
+    if (fault_readback.buffer != nullptr) {
+      const auto fault_word = ReadBuffer(test.name, fault_readback, 1)[0];
+      DestroyBuffer(&fault_readback);
+      Require(test.name, "BDA faults",
+              fault_word == *test.expected_bda_fault_word0,
+              "BDA accesses recorded unexpected page faults");
     }
     if (flattened_buffer.buffer != nullptr) {
       DestroyBuffer(&flattened_buffer);
@@ -19176,7 +19467,8 @@ private:
       return;
     }
     const auto usage = vk::BufferUsageFlagBits::eStorageBuffer |
-                       vk::BufferUsageFlagBits::eTransferDst;
+                       vk::BufferUsageFlagBits::eTransferDst |
+                       vk::BufferUsageFlagBits::eTransferSrc;
     m_bda_pagetable_buffer =
         CreateDeviceBuffer(shader_name, BufferCache::BDA_PAGETABLE_SIZE, usage);
     m_fault_buffer = CreateDeviceBuffer(
@@ -32053,7 +32345,6 @@ TestCase ScratchIsPrivatePerInvocation() {
   return test;
 }
 
-#if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 TestCase FlatStoreVariants() {
   using O = ShaderOpcode;
 
@@ -32099,9 +32390,27 @@ TestCase FlatStoreVariants() {
                 {O::V_MOV_B32, O::FLAT_STORE_BYTE, O::FLAT_STORE_SHORT,
                  O::FLAT_STORE_DWORD, O::FLAT_STORE_DWORDX2,
                  O::FLAT_STORE_DWORDX3, O::FLAT_STORE_DWORDX4, O::S_ENDPGM}};
+  test.bda_mappings = {{0, 0}};
+  // An untracked page keeps the stores and reports itself for promotion.
+  test.expected_bda_fault_word0 = 1u;
   return test;
 }
-#endif
+
+TestCase FlatStoreVariantsThroughTrackedPage() {
+  auto test = FlatStoreVariants();
+  test.name = "FlatStoreVariantsThroughTrackedPage";
+  test.bda_mappings[0].store_tracked = true;
+  test.expected_bda_fault_word0 = 0u;
+  return test;
+}
+
+TestCase FlatLoadVariantsThroughTrackedPage() {
+  auto test = FlatLoadVariants();
+  test.name = "FlatLoadVariantsThroughTrackedPage";
+  test.bda_mappings[0].store_tracked = true;
+  test.expected_bda_fault_word0 = 0u;
+  return test;
+}
 
 TestCase DsReadWriteVariants() {
   using O = ShaderOpcode;
@@ -37923,6 +38232,9 @@ std::vector<TestCase> MakeCases() {
   AddCase(FlatVirtualAddressRebasesGuestAllocation);
   AddCase(GlobalSignedImmediateRebasesBeforeSaddr);
   AddCase(FlatSegmentIgnoresSaddrAndMasksOffsetMsb);
+  AddCase(FlatStoreVariants);
+  AddCase(FlatStoreVariantsThroughTrackedPage);
+  AddCase(FlatLoadVariantsThroughTrackedPage);
   AddCase(ScratchIsPrivatePerInvocation);
   cases.push_back(FlatStackApertures(32));
   cases.push_back(FlatStackApertures(64));
@@ -40794,11 +41106,6 @@ void CheckShaderRecompilerFatalContracts() {
   ExpectFatal("InvalidDescriptorBindingRejection", [] {
     (void)NativeDescriptorType(
         ShaderRecompiler::IR::DescriptorBindingKind::Count);
-  });
-
-  ExpectFatal("WritableFlatStoreRejection", [] {
-    const auto test = FlatStoreVariants();
-    (void)CompileCase(test);
   });
 
   ExpectFatal("GdsOrB64Rejection", [] {
@@ -44221,6 +44528,11 @@ int main(int argc, char **argv) {
     vulkan.CheckSamplerBorderColors();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-bda-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckBufferCacheBdaStoreOwnership();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--sampled-depth-resource-only") == 0) {
     VulkanHarness vulkan;
     CheckSampledDepthResource();
@@ -44429,6 +44741,8 @@ int main(int argc, char **argv) {
     vulkan.CheckRasterization(false, Prospero::BufferFormat::k11_11_10Float);
     vulkan.CheckRasterization(false, Prospero::BufferFormat::k10_10_10_2UScaled);
     vulkan.CheckBufferCacheDirtyGarbageCollection();
+    vulkan.CheckBufferCacheBdaStoreOwnership();
+#endif
   } else {
     skipped_device_checks = true;
   }

@@ -32,6 +32,8 @@ public:
 	static constexpr uint64_t CACHING_NUMPAGES  = (LOWER_ADDRESS_SIZE + LibKernel::Memory::kExtendedMemorySize) >> CACHING_PAGEBITS;
 	static constexpr uint64_t BDA_PAGETABLE_SIZE =
 	    CACHING_NUMPAGES * sizeof(vk::DeviceAddress);
+	// Device addresses stay below bit 63, which tags pages whose BDA stores the host owns.
+	static constexpr uint64_t BDA_STORE_TRACKED_BIT = uint64_t {1} << 63;
 
 	static constexpr uint64_t PageIndex(uint64_t address) {
 		return (address < LOWER_ADDRESS_SIZE
@@ -89,7 +91,13 @@ public:
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               ProcessFaultBuffer();
+	// A BDA fault on an owned page can only come from a store, which promotes the page to tracked.
+	void               ResolveBdaFault(uint64_t vaddr, uint64_t size);
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
+	// Marks the tracked pages a BDA store can reach GPU-written; the caller passes mapped memory.
+	void               MarkBdaStoresInRange(uint64_t vaddr, uint64_t size, bool all_tracked);
+	[[nodiscard]] bool HasUnmarkedBdaStores() const { return !m_bda_unmarked_ranges.Empty(); }
+	void               ClearUnmarkedBdaStores() { m_bda_unmarked_ranges.Clear(); }
 	void               RunGarbageCollector();
 
 private:
@@ -139,6 +147,7 @@ private:
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
 	template <bool async>
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	void MarkBdaStores(uint64_t vaddr, uint64_t size);
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
@@ -151,6 +160,9 @@ private:
 	BufferMap                                         m_buffers;
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
+	RangeSet                                          m_bda_tracked_ranges;
+	// Tracked since the last mark, so stores that ran before tracking are owned without a rerun.
+	RangeSet                                          m_bda_unmarked_ranges;
 	MemoryTracker                                     m_memory_tracker;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;

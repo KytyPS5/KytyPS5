@@ -2957,6 +2957,8 @@ void TestDmaAddressMaterialization() {
 
   Check(fixture.program.info.uses_dma,
         "typed address operations did not enable DMA");
+  Check(fixture.program.info.writes_dma,
+        "a FLAT address store did not report a BDA store");
   std::array<uint32_t, 2> user_data{0x2008u, 0u};
   SrtRuntime runtime{.user_data = user_data};
   ResourceSnapshot snapshot;
@@ -2990,6 +2992,8 @@ void TestDynamicFlatAddressesUseDma() {
 
   Check(fixture.program.info.uses_dma,
         "exec-masked FLAT address did not enable DMA");
+  Check(!fixture.program.info.writes_dma,
+        "a FLAT address load reported a BDA store");
   std::array<uint32_t, 3> user_data{0x23456780u, 1u, 1u};
   SrtRuntime runtime{.user_data = user_data};
   ResourceSnapshot snapshot;

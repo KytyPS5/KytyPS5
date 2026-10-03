@@ -16033,15 +16033,26 @@ public:
         {Prospero::TileMode::kStandard64KB, TileBlockFamily::Standard64KB},
         {Prospero::TileMode::kPrt, TileBlockFamily::Prt64KB},
     };
-    for (const auto format :
-         {Prospero::BufferFormat::k8Srgb, Prospero::BufferFormat::k8_8Srgb,
-          Prospero::BufferFormat::k9_9_9_5Float}) {
+    struct RenderTargetFormatCase {
+      Prospero::BufferFormat format;
+      u32 bytes_per_element;
+    };
+    constexpr RenderTargetFormatCase render_target_formats[] = {
+        {Prospero::BufferFormat::k8Srgb, 1},
+        {Prospero::BufferFormat::k8_8Srgb, 2},
+        {Prospero::BufferFormat::k9_9_9_5Float, 0},
+    };
+    for (const auto &test : render_target_formats) {
       for (const auto tile :
            {Prospero::TileMode::kDepth, Prospero::TileMode::kRenderTarget}) {
         TileTextureBlockLayout texture{};
+        const bool supported =
+            TileGetTextureBlockLayout(test.format, tile, false, texture);
         Require(name, "RT format policy",
-                !TileGetTextureBlockLayout(format, tile, false, texture),
-                "non-render-target format admitted by an RT/depth tile family");
+                supported == (test.bytes_per_element != 0) &&
+                    (!supported || texture.block.bytes_per_element ==
+                                       test.bytes_per_element),
+                "RT/depth tile format support or element size is incorrect");
       }
     }
     {

@@ -276,6 +276,22 @@ bool SpirvContainsOpcode(const std::vector<uint32_t> &binary, uint32_t opcode) {
   return false;
 }
 
+size_t SpirvCountOpcode(const std::vector<uint32_t> &binary, uint32_t opcode) {
+  size_t count = 0;
+  for (size_t i = 5; i < binary.size();) {
+    const uint32_t word = binary[i];
+    const uint32_t word_count = word >> 16u;
+    if (word_count == 0 || i + word_count > binary.size()) {
+      break;
+    }
+    if ((word & 0xffffu) == opcode) {
+      count++;
+    }
+    i += word_count;
+  }
+  return count;
+}
+
 // True when some OpBranchConditional has the same label for both targets.
 bool SpirvHasDegenerateBranchConditional(const std::vector<uint32_t> &binary) {
   for (size_t i = 5; i < binary.size();) {
@@ -7838,6 +7854,10 @@ void TestNewShaderRecompilerCfgIdenticalBranchTargets() {
   Check(!spirv.empty(), "identical-target branch produced no SPIR-V");
   Check(!SpirvHasDegenerateBranchConditional(spirv),
         "SPIR-V has OpBranchConditional with identical targets");
+  Check(!SpirvContainsOpcode(spirv, 250),
+        "identical-target branch left an OpBranchConditional");
+  Check(SpirvCountOpcode(spirv, 249) >= 2,
+        "identical-target branch was not lowered to OpBranch (entry and merge edges)");
   CheckSpirvBinaryValidates(spirv);
 }
 

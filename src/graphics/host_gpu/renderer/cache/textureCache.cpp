@@ -31,7 +31,7 @@ namespace Libs::Graphics {
 
 namespace {
 
-constexpr uint64_t NumFramesBeforeRemoval = 32;
+constexpr uint64_t NumFramesBeforeRemoval = 2048;
 
 [[nodiscard]] bool DecodeColorClear(const TextureCache::ImageDesc& desc, uint8_t code,
                                   vk::ClearColorValue& clear) {
@@ -154,9 +154,12 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 		constexpr int64_t GiB = 1024ll * 1024 * 1024;
 		const auto        budget =
 		    static_cast<int64_t>(std::min<uint64_t>(m_graphics.GetTotalMemoryBudget(), INT64_MAX));
-		const auto threshold = std::min<int64_t>(budget, 8 * GiB);
+		// Leave more headroom than a fixed 8 GiB before the pressure threshold, and start the
+		// collector later. An aggressive threshold unregisters images that are still bound, and
+		// the next view acquisition then finds them unregistered and gives up.
+		const auto threshold = budget - 1 * GiB;
 		m_pressure_gc_memory = static_cast<uint64_t>(
-		    std::max<int64_t>(std::min(budget - 6 * threshold / 10, budget - GiB), GiB + GiB / 2));
+		    std::max<int64_t>(std::min(budget - 5 * threshold / 10, budget - GiB), GiB + GiB / 2));
 		m_critical_gc_memory = static_cast<uint64_t>(
 		    std::max<int64_t>(std::min(budget - 2 * threshold / 10, budget - GiB / 2), 3 * GiB));
 		m_trigger_gc_memory = static_cast<uint64_t>(std::max<int64_t>((budget - threshold) / 2, 0));
@@ -711,12 +714,12 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	    !requested.HasStencil() && !cached.info.HasStencil() && !requested.HasMetadata() &&
 	    !cached.info.HasMetadata();
 	bool recreate = cached.info.resources < requested.resources;
-	switch (binding) {
-		case BindingType::Texture:
-			recreate |= requested.IsDepth() && !cached.info.IsDepth();
 	// A 3D view cannot be built on a 2D image, or the reverse (the cache never arranges a
 	// compatibility flag for it), so a dimensionality mismatch always needs its own image.
 	recreate |= requested.IsVolume() != cached.info.IsVolume();
+	switch (binding) {
+		case BindingType::Texture:
+			recreate |= requested.IsDepth() && !cached.info.IsDepth();
 			recreate |= raw_d16_texture;
 			break;
 		case BindingType::Storage: recreate |= cached.info.IsDepth(); break;
@@ -1294,14 +1297,15 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			} else if (resolved.info.resources < desc.info.resources) {
 				FreeImage(result);
 				result = {};
-			}
-		}
-		if (!result) {
 			} else if (resolved.info.IsVolume() != desc.info.IsVolume()) {
 				// Reusing a 2D image for a 3D view (or the reverse) builds an incompatible view,
 				// so drop it and insert a fresh image sized for the requested dimensionality.
 				FreeImage(result);
 				result = {};
+			}
+		}
+		bool inserted_image = false;
+		if (!result) {
 			result         = InsertImage(desc.info);
 			auto& inserted = m_slot_images[result];
 			if (m_buffer_cache.HasGpuDirtyBytes(inserted.info.data.address,
@@ -1388,7 +1392,16 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	TouchImage(image);
 	if (!image.info.data.Empty()) {
 		if (!image.registered || image.depth_id || image.binding.needs_rebind) {
-			EXIT("TextureCache: texture requires rediscovery before final acquisition\n");
+			EXIT("TextureCache: texture requires rediscovery before final acquisition: "
+			     "id=%u registered=%d depth_id=%u needs_rebind=%d is_bound=%d is_target=%d "
+			     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 " guest_format=%u type=%u\n",
+			     id.index, image.registered ? 1 : 0,
+			     image.depth_id ? image.depth_id.index : 0u,
+			     image.binding.needs_rebind ? 1 : 0,
+			     image.binding.is_bound ? 1 : 0, image.binding.is_target ? 1 : 0,
+			     image.info.data.address, image.info.data.size,
+			     static_cast<uint32_t>(image.info.guest_format),
+			     static_cast<uint32_t>(image.info.type));
 		}
 	}
 	if (desc.type == BindingType::Storage) {

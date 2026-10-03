@@ -799,6 +799,13 @@ static bool GetDrawTopology(const HW::UserConfig& ucfg, vk::PrimitiveTopology& t
 		case Prospero::PrimitiveType::kQuadListLegacy:
 			topology = vk::PrimitiveTopology::eTriangleFan;
 			break;
+		case Prospero::PrimitiveType::kPolygon:
+			// A polygon list is a fan: the hardware states that for N>=0 the vertices
+			// [0, N+1, N+2] make one triangle, so a fan with the same vertex order is the same
+			// primitive. Drawing it instead of dropping the call is the difference between a
+			// missing polygon and the polygon.
+			topology = vk::PrimitiveTopology::eTriangleFan;
+			break;
 		default: {
 			static std::atomic_bool logged = false;
 			if (!logged.exchange(true, std::memory_order_relaxed)) {
@@ -1014,6 +1021,20 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 					vk_buffer.draw(4, draw.instance_count, i + emit.first_vertex,
 					               emit.first_instance);
 				}
+			}
+			break;
+		case Prospero::PrimitiveType::kPolygon:
+			// A fan over the whole list, which is what a polygon list is on this hardware:
+			// for N>=0 the vertices [0, N+1, N+2] form one triangle. The topology for it was
+			// already decided to be a triangle fan, so the same count goes through untouched.
+			// This used to reach the default arm and take the process down with it, which is
+			// how a single draw call ended the title.
+			if (draw.IsIndexed()) {
+				vk_buffer.drawIndexed(draw.index_count, draw.instance_count, 0, emit.vertex_offset,
+				                      emit.first_instance);
+			} else {
+				vk_buffer.draw(draw.index_count, draw.instance_count, emit.first_vertex,
+				               emit.first_instance);
 			}
 			break;
 		default: EXIT("unknown primitive type: %u\n", static_cast<uint32_t>(ucfg.GetPrimType()));

@@ -1302,17 +1302,76 @@ def resolve_run_dir(cfg: Config, args: argparse.Namespace) -> Path:
     return Path(pointer["run_dir"])
 
 
-def command_start(args: argparse.Namespace) -> int:
-    cfg = Config(args)
+# Button names people use for an Xbox-style pad, mapped to the DualSense names the emulator knows.
+BUTTON_ALIASES = {
+    "rb": "r1", "lb": "l1", "rt": "r2", "lt": "l2", "r1": "r1", "l1": "l1", "r2": "r2", "l2": "l2",
+    "a": "cross", "b": "circle", "x": "square", "y": "triangle",
+    "start": "options", "menu": "options", "select": "touchpad", "back": "touchpad", "view": "touchpad",
+    "dpad_up": "up", "dpad_down": "down", "dpad_left": "left", "dpad_right": "right",
+    "rs": "r3", "ls": "l3",
+}
+PAD_BUTTONS = {"cross", "circle", "square", "triangle", "l1", "r1", "l2", "r2", "l3", "r3", "options",
+               "touchpad", "up", "down", "left", "right"}
+
+
+def normalize_buttons(text: str) -> str:
+    """'RB', 'rb+a' or 'r1' -> the emulator's names ('r1', 'r1+cross'). Raises on unknown names."""
+    names = []
+    for part in re.split(r"[+,\s]+", text.strip().lower()):
+        if not part:
+            continue
+        name = BUTTON_ALIASES.get(part, part)
+        if name not in PAD_BUTTONS:
+            raise HarnessError(f"unknown button {part!r}; use one of {', '.join(sorted(PAD_BUTTONS))} "
+                               f"or {', '.join(sorted(k for k in BUTTON_ALIASES if k not in PAD_BUTTONS))}")
+        names.append(name)
+    if not names:
+        raise HarnessError("no button given")
+    return "+".join(names)
+
+
+def normalize_command(text: str) -> str:
+    """Resolve button aliases in press/hold/release commands ('press RB' -> 'press r1')."""
+    words = text.split()
+    if len(words) >= 2 and words[0] in ("press", "hold", "release") and words[1] != "all":
+        try:
+            words[1] = normalize_buttons(words[1])
+        except HarnessError:
+            pass            # let the emulator report it in its ack
+    return " ".join(words)
+
+
+def make_config(**values: Any) -> Config:
+    """A Config without a command line (for the MCP server and tests)."""
+    defaults = {"build_dir": None, "emulator": None, "replay_emulator": None, "root": None, "game": None,
+                "run_script": None, "arg": None, "args": None}
+    defaults.update(values)
+    return Config(argparse.Namespace(**defaults))
+
+
+def last_event_seq(run_dir: Path) -> int:
+    seq = 0
+    for line in read_text(run_dir / "events.jsonl").splitlines():
+        try:
+            seq = max(seq, int(json.loads(line).get("seq", 0)))
+        except (ValueError, AttributeError, TypeError):
+            continue
+    return seq
+
+
+def start_session(cfg: Config, *, scenario: Optional[Scenario] = None, cwd: Optional[str] = None,
+                  hang_seconds: float = DEFAULT_HANG_SECONDS,
+                  boot_grace: float = DEFAULT_BOOT_GRACE_SECONDS, shot_interval: int = 10,
+                  wait: float = 60.0) -> dict:
+    """Launch the emulator under a detached supervisor; returns as soon as it has a heartbeat."""
     cfg.check_emulator()
-    scenario = load_scenario(Path(args.scenario) if args.scenario else None)
     game_args = cfg.game_args(scenario)
     run_dir = cfg.new_run_dir()
-    command = build_command(cfg.emulator, run_dir, game_args, args.shot_interval)
+    command = build_command(cfg.emulator, run_dir, game_args, shot_interval)
     # A detached supervisor owns the emulator, so it can record how it exits after we are gone.
     supervisor = [sys.executable, str(Path(__file__).resolve()), "_supervise", "--run", str(run_dir),
-                  "--cwd", str(args.cwd or cfg.build_dir), "--hang-seconds", str(args.hang_seconds),
-                  "--boot-grace", str(args.boot_grace), "--emulator", str(cfg.emulator),
+                  "--cwd", str(cwd or cfg.build_dir), "--hang-seconds", str(hang_seconds),
+                  "--boot-grace", str(boot_grace), "--emulator", str(cfg.emulator),
                   "--replay-emulator", str(cfg.replay_emulator), "--build-dir", str(cfg.build_dir)]
     write_json(run_dir / "supervisor.json", {"command": command})
     out = open(run_dir / "supervisor.log", "wb")
@@ -1320,11 +1379,10 @@ def command_start(args: argparse.Namespace) -> int:
                      start_new_session=True)
     out.close()
     write_json(current_pointer(cfg), {"run_dir": str(run_dir)})
-    deadline = time.monotonic() + args.wait
+    deadline = time.monotonic() + wait
     while time.monotonic() < deadline:
         if (run_dir / "status.json").exists():
-            print(json.dumps({"run_dir": str(run_dir), "status": "running"}))
-            return 0
+            return {"run_dir": str(run_dir), "status": "running"}
         if (run_dir / "exit.json").exists():
             break
         time.sleep(0.25)
@@ -1335,12 +1393,91 @@ def command_start(args: argparse.Namespace) -> int:
                 break
             time.sleep(0.1)
         result = read_json(run_dir / "result.json", {})
-        print(json.dumps({"run_dir": str(run_dir), "status": "exited early", "result": result.get("result"),
-                          "reason": result.get("reason")}))
-        return result.get("code", EXIT_OTHER_ABORT) or EXIT_OTHER_ABORT
-    print(json.dumps({"run_dir": str(run_dir), "status": "started; no heartbeat yet "
-                      "(the game may still be loading)"}))
-    return 0
+        return {"run_dir": str(run_dir), "status": "exited early", "result": result.get("result"),
+                "reason": result.get("reason"), "code": result.get("code", EXIT_OTHER_ABORT) or EXIT_OTHER_ABORT}
+    return {"run_dir": str(run_dir), "status": "started; no heartbeat yet (the game may still be loading)"}
+
+
+def send_command(run_dir: Path, text: str, timeout: float = ACK_TIMEOUT_SECONDS) -> dict:
+    """Append one automation command and return its ack (or {"ack": None, "error": ...})."""
+    path = run_dir / "commands.txt"
+    line = len(read_text(path).splitlines()) + 1
+    with open(path, "a") as handle:
+        handle.write(text.strip() + "\n")
+    ack = wait_for_event(run_dir, lambda e: e.get("event") == "ack" and e.get("line") == line, timeout)
+    if ack is None:
+        return {"line": line, "cmd": text.strip(), "ok": False, "ack": None,
+                "error": "no ack (is the game running and loaded?)"}
+    return ack
+
+
+def take_shot(run_dir: Path, name: str = "", timeout: float = SHOT_TIMEOUT_SECONDS) -> Path:
+    """Screenshot of the next presented frame. Raises HarnessError if none arrives."""
+    name = re.sub(r"[^A-Za-z0-9_.-]", "_", name or time.strftime("shot_%H%M%S"))
+    after = last_event_seq(run_dir)       # an older shot with the same name does not count
+    with open(run_dir / "commands.txt", "a") as handle:
+        handle.write(f"shot {name}\n")
+    event = wait_for_event(run_dir, lambda e: e.get("event") == "shot" and e.get("name") == name
+                           and int(e.get("seq", 0)) > after, timeout)
+    if event is None or not event.get("ok"):
+        raise HarnessError(f"no screenshot: {event.get('error') if event else 'timed out (is the game presenting frames?)'}")
+    return Path(event["path"])
+
+
+def read_session_status(run_dir: Path) -> dict:
+    status = read_json(run_dir / "status.json")
+    exit_json = read_json(run_dir / "exit.json")
+    meta = read_json(run_dir / "meta.json", {})
+    report = {"run_dir": str(run_dir), "pid": meta.get("pid"), "running": exit_json is None,
+              "status": status}
+    if exit_json is not None:
+        result = read_json(run_dir / "result.json", {})
+        report["exit"] = exit_json
+        report["result"] = result.get("result")
+        report["reason"] = result.get("reason")
+    return report
+
+
+def stop_session(run_dir: Path, timeout: float = 60.0) -> dict:
+    if (run_dir / "result.json").exists() and (run_dir / "exit.json").exists():
+        result = read_json(run_dir / "result.json", {})
+        return {"run_dir": str(run_dir), "result": result.get("result"), "reason": result.get("reason"),
+                "note": "the game had already exited"}
+    (run_dir / "stop.request").write_text("stop\n")
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if (run_dir / "result.json").exists():
+            result = read_json(run_dir / "result.json", {})
+            return {"run_dir": str(run_dir), "result": result.get("result"), "reason": result.get("reason")}
+        time.sleep(0.25)
+    raise HarnessError(f"the supervisor of {run_dir} did not finish in {timeout:.0f} s")
+
+
+def make_reference(shot: Path, out: Path, box: Optional[list[float]] = None,
+                   pixels: Optional[list[int]] = None) -> dict:
+    """Crop a screenshot into a reference image for an `until` or `verify` step."""
+    Image = _pillow()
+    with Image.open(shot) as image:
+        if pixels:
+            region = image.crop(tuple(int(v) for v in pixels))
+        elif box:
+            region = crop_fraction(image, [float(v) for v in box])
+        else:
+            raise HarnessError("give a box (fractions) or pixels")
+        out.parent.mkdir(parents=True, exist_ok=True)
+        region.save(out)
+        return {"path": str(out), "size": list(region.size), "source": str(shot),
+                "source_size": list(image.size)}
+
+
+def command_start(args: argparse.Namespace) -> int:
+    cfg = Config(args)
+    scenario = load_scenario(Path(args.scenario) if args.scenario else None)
+    started = start_session(cfg, scenario=scenario, cwd=args.cwd, hang_seconds=args.hang_seconds,
+                            boot_grace=args.boot_grace, shot_interval=args.shot_interval, wait=args.wait)
+    code = started.pop("code", 0)
+    print(json.dumps(started))
+    return code
 
 
 def command_supervise(args: argparse.Namespace) -> int:
@@ -1377,15 +1514,7 @@ def command_supervise(args: argparse.Namespace) -> int:
 
 def command_send(args: argparse.Namespace) -> int:
     cfg = Config(args)
-    run_dir = resolve_run_dir(cfg, args)
-    path = run_dir / "commands.txt"
-    line = len(read_text(path).splitlines()) + 1
-    with open(path, "a") as handle:
-        handle.write(args.text.strip() + "\n")
-    ack = wait_for_event(run_dir, lambda e: e.get("event") == "ack" and e.get("line") == line, args.timeout)
-    if ack is None:
-        print(json.dumps({"line": line, "ack": None, "error": "no ack (is the game running and loaded?)"}))
-        return EXIT_HARNESS
+    ack = send_command(resolve_run_dir(cfg, args), normalize_command(args.text), args.timeout)
     print(json.dumps(ack))
     return 0 if ack.get("ok") else EXIT_HARNESS
 
@@ -1409,66 +1538,28 @@ def wait_for_event(run_dir: Path, match: Callable[[dict], bool], timeout: float)
 
 def command_shot(args: argparse.Namespace) -> int:
     cfg = Config(args)
-    run_dir = resolve_run_dir(cfg, args)
-    name = re.sub(r"[^A-Za-z0-9_.-]", "_", args.name or time.strftime("shot_%H%M%S"))
-    path = run_dir / "commands.txt"
-    with open(path, "a") as handle:
-        handle.write(f"shot {name}\n")
-    event = wait_for_event(run_dir, lambda e: e.get("event") == "shot" and e.get("name") == name, args.timeout)
-    if event is None or not event.get("ok"):
-        print(f"no screenshot: {event.get('error') if event else 'timed out (is the game presenting frames?)'}",
-              file=sys.stderr)
-        return EXIT_HARNESS
-    print(event["path"])
+    print(take_shot(resolve_run_dir(cfg, args), args.name or "", args.timeout))
     return 0
 
 
 def command_status(args: argparse.Namespace) -> int:
     cfg = Config(args)
-    run_dir = resolve_run_dir(cfg, args)
-    status = read_json(run_dir / "status.json")
-    exit_json = read_json(run_dir / "exit.json")
-    pointer = read_json(run_dir / "meta.json", {})
-    report = {"run_dir": str(run_dir), "pid": pointer.get("pid"), "running": exit_json is None,
-              "status": status}
-    if exit_json is not None:
-        report["exit"] = exit_json
-        report["result"] = read_json(run_dir / "result.json", {}).get("result")
-    print(json.dumps(report, indent=2))
+    print(json.dumps(read_session_status(resolve_run_dir(cfg, args)), indent=2))
     return 0
 
 
 def command_stop(args: argparse.Namespace) -> int:
     cfg = Config(args)
-    run_dir = resolve_run_dir(cfg, args)
-    (run_dir / "stop.request").write_text("stop\n")
-    deadline = time.monotonic() + args.timeout
-    while time.monotonic() < deadline:
-        if (run_dir / "result.json").exists():
-            result = read_json(run_dir / "result.json", {})
-            print(json.dumps({"run_dir": str(run_dir), "result": result.get("result"),
-                              "reason": result.get("reason")}))
-            return 0
-        time.sleep(0.25)
-    print(json.dumps({"run_dir": str(run_dir), "error": "supervisor did not finish in time"}))
-    return EXIT_HARNESS
+    print(json.dumps(stop_session(resolve_run_dir(cfg, args), args.timeout)))
+    return 0
 
 
 def command_ref(args: argparse.Namespace) -> int:
-    Image = _pillow()
-    shot = Path(args.shot)
-    with Image.open(shot) as image:
-        if args.pixels:
-            x0, y0, x1, y1 = [int(v) for v in args.pixels.split(",")]
-            region = image.crop((x0, y0, x1, y1))
-        else:
-            box = [float(v) for v in args.box.split(",")]
-            region = crop_fraction(image, box)
-        out = Path(args.out)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        region.save(out)
-        size = image.size
-    print(f"{out}: {region.size[0]}x{region.size[1]} crop of {shot.name} ({size[0]}x{size[1]})")
+    pixels = [int(v) for v in args.pixels.split(",")] if args.pixels else None
+    box = [float(v) for v in args.box.split(",")] if args.box else None
+    made = make_reference(Path(args.shot), Path(args.out), box=box, pixels=pixels)
+    print(f"{made['path']}: {made['size'][0]}x{made['size'][1]} crop of {Path(made['source']).name} "
+          f"({made['source_size'][0]}x{made['source_size'][1]})")
     return 0
 
 

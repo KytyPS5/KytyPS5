@@ -1,6 +1,6 @@
 ---
 name: kyty-autoplay
-description: Launch KytyPS5 (GTA V, PPSA04264) and drive it with tools/autoplay, catch shader aborts, other aborts, hangs and stuck scenarios, replay a captured shader offline in about a second, and iterate until the prologue is controllable. Use when asked to run or reproduce the game, diagnose a shader abort or hang, fix a recompiler failure, or extend the autoplay scenario.
+description: Launch KytyPS5 (GTA V, PPSA04264) and drive it with tools/autoplay or the kyty MCP server (with a local Ollama vision model), catch shader aborts, other aborts, hangs and stuck scenarios, replay a captured shader offline in about a second, and iterate until the prologue is controllable. Use when asked to run or reproduce the game, diagnose a shader abort or hang, fix a recompiler failure, or extend the autoplay scenario.
 ---
 
 # KytyPS5 autonomous diagnosis loop
@@ -72,6 +72,29 @@ spirv-val --target-env vulkan1.3 $CAP/out.spv
   `shader_replay_gpu_selected_store_known_failure` so it expects `REPLAY OK`.
 - Captures of vertex, pixel and other non-compute stages hold a raw dump of the stage input struct,
   so replay them with the same build that captured them (the tool warns otherwise).
+
+## Navigate with the `kyty` MCP server (preferred for exploring)
+
+When the `kyty` MCP server is connected (`.mcp.json`; setup in `tools/autoplay/README.md`), play
+the game through its tools instead of the CLI:
+
+1. `start_game` (it uses `KYTY_GAME` or `kyty_run.sh` when no game is given). Boot can take minutes
+   while shaders compile; `wait` and `game_status` until frames are presented.
+2. `look` asks the local vision model to describe the screen: what kind of screen it is, its text,
+   the selected item, the button prompts, and whether the player is controllable. Pass a `question`
+   when you need something specific.
+3. Decide from the prompts on screen, then `press` (`press("rb", times=2)`), `stick` or `trigger`.
+   Give the game a moment (`wait(1)`), then `look` again.
+4. The vision model is small and can misread. When an answer is surprising or you are about to do
+   something irreversible, check it yourself with `screenshot`.
+5. If `game_status` shows it is no longer running, read the `summary` it points to and follow the
+   exit-code branch above (a shader abort is fixed offline, then relaunched).
+6. When a path through the menus works, make it replayable: `save_reference` a crop that only that
+   screen has, and add the matching `until` (with `while_waiting` presses) and `checkpoint` steps
+   to `scenarios/gta5_story.toml`. Once free gameplay is reached, add the
+   `verify = "controllable"` step. `kyty_autoplay.py run` can then repeat the whole thing without
+   the model.
+7. `stop_game` when you are done.
 
 ## Interactive mode (for stuck runs and for writing scenarios)
 

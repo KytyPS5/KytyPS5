@@ -63,6 +63,45 @@ quit                        flush the log and exit
 
 Buttons: `cross circle square triangle l1 r1 l2 r2 l3 r3 options touchpad up down left right`.
 
+## Playing through MCP (Claude Code + a local vision model)
+
+`mcp_server.py` lets Claude Code play the game: it starts the emulator, presses buttons, and asks a
+local [Ollama](https://ollama.com) vision model what is on screen. The repository's `.mcp.json`
+registers it as `kyty` for Claude Code.
+
+```
+pip install -r tools/autoplay/requirements-mcp.txt     # mcp + pillow, for the python3 in .mcp.json
+ollama pull qwen2.5vl:3b
+export KYTY_GAME=/path/to/PPSA04264                     # or a kyty_run.sh next to the emulator
+claude mcp list                                         # kyty should show as connected
+```
+
+If `python3` is not the interpreter with `mcp` installed, or the server cannot find its script,
+register it with absolute paths instead:
+`claude mcp add kyty -- /path/to/venv/bin/python /path/to/KytyPS5/tools/autoplay/mcp_server.py`.
+
+| tool | |
+|---|---|
+| `start_game(game, args)` / `stop_game()` | launch (an interactive session, as `start`) / quit and get the verdict |
+| `game_status()` | running?, fps, presents, last shader, and why it stopped |
+| `press(button, times, ms, gap_ms)` | e.g. `press("rb", times=2)`; `"l1+r1"` presses both |
+| `hold`, `release`, `stick(side, x, y, ms)`, `trigger(side, value, ms)`, `send_raw(command)` | the other inputs |
+| `wait(seconds)` | let the game run (up to 120 s), then status |
+| `screenshot(name)` | the next frame, returned as an image |
+| `look(question)` | the vision model describes the screen (type, text, selection, button prompts, controllable?) |
+| `save_reference(name, box)` | crop the last screenshot into `scenarios/refs/<name>.png` |
+
+Button names are the DualSense ones; Xbox names work too (`a b x y lb rb lt rt start`).
+
+Environment: `KYTY_BUILD_DIR`, `KYTY_EMULATOR`, `KYTY_GAME`, `KYTY_EMULATOR_ARGS`, `KYTY_BOOT_GRACE`
+(seconds before the first frame, default 300), `OLLAMA_HOST`, `KYTY_VISION_MODEL`,
+`KYTY_VISION_MAX_WIDTH` (default 1280), `KYTY_VISION_TIMEOUT` (default 120).
+
+**Choosing the model.** The game and the model share the GPU. On an 8 GB card such as an RTX 2070,
+keep the model small: `qwen2.5vl:3b` (the default, roughly 3 GB) or `gemma3:4b`. `qwen2.5vl:7b`
+reads screens better but needs about 6 GB, so run it on the CPU or another GPU. Check what is
+loaded with `ollama ps` while the game runs.
+
 ## Scenarios
 
 TOML, steps run in order (see `scenarios/gta5_story.toml`):
@@ -96,3 +135,5 @@ python3 -m unittest discover tools/autoplay/tests
 `test_classify.py` classifies fixture logs, `test_scenario.py` covers scenarios and matching, and
 `test_run_fake.py` runs the real harness against `tests/fake_emulator.py`, a stand-in that speaks the
 automation protocol (it uses a built `kyty_emulator` for the shader replay checks when present).
+`test_mcp_server.py` drives the MCP tools against the fake emulator and a fake Ollama, and does one
+stdio round trip when the `mcp` package is installed.

@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "kyty": {
+      "command": "python3",
+      "args": ["tools/autoplay/mcp_server.py"],
+      "env": {
+        "KYTY_GAME": "${KYTY_GAME:-}",
+        "KYTY_EMULATOR_ARGS": "${KYTY_EMULATOR_ARGS:-}",
+        "OLLAMA_HOST": "${OLLAMA_HOST:-http://localhost:11434}",
+        "KYTY_VISION_MODEL": "${KYTY_VISION_MODEL:-qwen2.5vl:3b}"
+      }
+    }
+  }
+}

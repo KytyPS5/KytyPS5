@@ -15,6 +15,8 @@
 
 #include <atomic>
 #include <map>
+#include <mutex>
+#include <string>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
@@ -133,6 +135,9 @@ public:
 	void               InvalidateMemory(uint64_t address, uint64_t size);
 	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t address, uint64_t size);
+	// Names the image holding a guest read back, so a refusal can say whether it is a live surface
+	// or one left over a pool address the engine has since reused. Empty when nothing blocks.
+	[[nodiscard]] std::string DescribeGpuModifiedRegion(uint64_t address, uint64_t size);
 
 	// Inside a registered metadata surface, not only at its base: layers are cleared one by one.
 	[[nodiscard]] bool IsMeta(uint64_t address);

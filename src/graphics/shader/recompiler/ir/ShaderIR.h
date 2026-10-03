@@ -106,8 +106,9 @@ struct ExportInfo {
 };
 
 struct BufferResource {
-	static constexpr uint32_t NoImageAlias = UINT32_MAX;
-	static constexpr uint32_t NoIndirectBuffer = UINT32_MAX;
+	static constexpr uint32_t NoImageAlias       = UINT32_MAX;
+	static constexpr uint32_t NoIndirectFeedback = UINT32_MAX;
+	static constexpr uint32_t NoIndirectBuffer   = UINT32_MAX;
 
 	uint32_t               source             = 0;
 	uint32_t               descriptor_index   = UINT32_MAX;
@@ -117,15 +118,23 @@ struct BufferResource {
 	Prospero::BufferFormat descriptor_format  = Prospero::BufferFormat::kInvalid;
 	uint32_t               descriptor_swizzle = DstSel(4, 5, 6, 7);
 	uint32_t               image_alias        = NoImageAlias;
+	// Where in the flattened SRT this table records the heap keys it selects, and how many it can
+	// name. A table too large to enumerate is served from what the GPU reports instead.
+	uint32_t               indirect_feedback_offset = NoIndirectFeedback;
+	uint32_t               indirect_feedback_keys   = 0;
+	// A table the shader indexes at runtime binds every record it can select as its own dense
+	// buffer, and the access picks one with a switch. The root names itself; a candidate names the
+	// root it was expanded from. Mapping and iterations describe the key search in the flattened
+	// SRT, laid out exactly as the image table's is.
+	uint32_t               indirect_root              = NoIndirectBuffer;
+	uint32_t               indirect_mapping_offset    = 0;
+	uint32_t               indirect_search_iterations = 0;
+	std::vector<uint32_t>  indirect_resources;
 	bool                   read               = false;
 	bool                   written            = false;
 	bool                   atomic             = false;
 	bool                   formatted          = false;
 	bool                   scalar             = false;
-	uint32_t               indirect_root              = NoIndirectBuffer;
-	uint32_t               indirect_mapping_offset    = 0;
-	uint32_t               indirect_search_iterations = 0;
-	std::vector<uint32_t>  indirect_resources;
 
 	bool operator==(const BufferResource& other) const = default;
 };
@@ -135,7 +144,8 @@ enum class ImageMipMode { None, Dynamic };
 constexpr uint32_t ShaderImageIdentitySwizzle = 0x00000facu;
 
 struct ImageResource {
-	static constexpr uint32_t NoIndirectImage = UINT32_MAX;
+	static constexpr uint32_t NoIndirectImage    = UINT32_MAX;
+	static constexpr uint32_t NoIndirectFeedback = UINT32_MAX;
 
 	uint32_t                      source            = 0;
 	uint32_t                      descriptor_index  = UINT32_MAX;
@@ -157,6 +167,9 @@ struct ImageResource {
 	uint32_t                      indirect_root     = NoIndirectImage;
 	uint32_t                      indirect_mapping_offset   = 0;
 	uint32_t                      indirect_search_iterations = 0;
+	// Where in the flattened SRT this table records the keys it selects, and how many it can name.
+	uint32_t                      indirect_feedback_offset  = NoIndirectFeedback;
+	uint32_t                      indirect_feedback_keys    = 0;
 	std::vector<uint32_t>         indirect_resources;
 
 	bool operator==(const ImageResource& other) const = default;
@@ -303,6 +316,21 @@ inline constexpr uint32_t FirstImageBinding           = 1u;
 inline constexpr uint32_t FirstComparisonImageBinding = 22u;
 inline constexpr uint32_t FirstStorageImageBinding    = 29u;
 inline constexpr uint32_t ImageBindingCount           = 48u;
+
+// Fixed length, so neither module nor layout moves with the heap; ShaderInfo::MaxImages.
+inline constexpr uint32_t IndexedImageBindingElements = 256u;
+// An element of such a binding past the images it holds; the host binds its first element there.
+inline constexpr uint32_t PaddingImageResource = UINT32_MAX;
+// Bounds the looped search for any 32-bit key count; the key count never picks a permutation.
+inline constexpr uint32_t IndirectSearchIterations = 33u;
+
+// After the key/ordinal pairs: a count, then per ordinal shape << 16 | element.
+[[nodiscard]] constexpr uint32_t IndirectImageShape(Decoder::ImageDimension dimension, bool cube) {
+	return (static_cast<uint32_t>(dimension) << 1u) | (cube ? 1u : 0u);
+}
+[[nodiscard]] constexpr uint32_t IndirectImageSlot(uint32_t shape, uint32_t element) {
+	return (shape << 16u) | element;
+}
 
 enum class DescriptorBindingKind : uint32_t {
 	Buffers  = 0u,
@@ -458,7 +486,37 @@ struct Bindings {
 
 struct ShaderInfo {
 	static constexpr uint32_t MaxBuffers      = 64;
-	static constexpr uint32_t MaxImages       = 64;
+	// Dense buffer slots a materialized shader may bind: the buffers it tracks plus the candidates
+	// an indirect buffer table expands into. 64 was the largest count whose packed memory offsets
+	// still fit the 32-dword push constant block beside 16 user-data registers - a threshold, not a
+	// ceiling: past it a shader takes the shader-data storage buffer instead, which is one more
+	// upload and one more descriptor write per dispatch. Unlike MaxImages below, this one really is
+	// a push-constant number: AllocateBindings packs only the buffers' memory offsets.
+	// A table reserves its candidate count rounded up to a power of two, so this is really a bucket
+	// plus the buffers a shader tracks: 128 candidate slots and the 11 buffers RE9's two indirect
+	// tables track. 64 candidate slots would serve 63 keys, and both of those tables have already
+	// been measured reporting more than that (67 and 75). The device limits that bound it are the
+	// storage-buffer ones CreateDescriptorLayout now checks, and the emitted switch, which indexes
+	// contiguous candidates of one shape and costs an arm per candidate per access site otherwise.
+	static constexpr uint32_t MaxDenseBuffers = 138;
+	// Dense image slots a materialized shader may bind: the images it tracks plus the candidates an
+	// indirect image table expands into. Unlike MaxDenseBuffers above this is not a push-constant
+	// threshold - AllocateBindings packs only the buffers' memory offsets into the shader-data
+	// block, so an image costs no push dword - and it is not a binding count either: images are
+	// grouped into at most ImageBindingCount bindings whose descriptorCount carries the rest. What
+	// an image does cost is one Vulkan descriptor per draw, so the real ceiling is the device's
+	// maxPerStageDescriptorSampledImages / maxDescriptorSetSampledImages / maxPerStageResources -
+	// CreateDescriptorLayout checks all three against the layout it is about to build - and the
+	// emitted switch, at roughly 95 SPIR-V words per candidate per access site.
+	// 128 was measured starving RE9's menu: its background pixel shader carries four tables and
+	// they are served in order out of this one count, so the first two took 54 and 53 candidates
+	// and left the last two 11 to 17 slots for the 31 keys they had observed - 21 of them past
+	// the budget, sampling black on every draw, and the count moving frame to frame as the
+	// earlier tables grew is what made the same surface black in one frame and lit in the next.
+	// 256 covers the 145 candidates those four tables converge on with headroom; the ceiling no
+	// budget can need is the heap's own 266 distinct descriptors, which a census of all 32768 of
+	// its records measured.
+	static constexpr uint32_t MaxImages       = 256;
 	static constexpr uint32_t MaxSamplers     = 32;
 	static constexpr uint32_t MaxSampledPairs = 64;
 
@@ -480,7 +538,23 @@ struct ShaderInfo {
 	bool operator==(const ShaderInfo& other) const = default;
 };
 
+static_assert(IndexedImageBindingElements == ShaderInfo::MaxImages);
+
+struct BlockInfo {
+	uint32_t        id       = 0;
+	uint32_t        start_pc = 0;
+	uint32_t        end_pc   = 0;
+	CFG::Terminator terminator;
+	Value           condition;
+	Value           indirect_target;
+};
+
 struct DescriptorSource {
+	// How the shader turns its wave-uniform selector into a byte offset into the material table.
+	// Stride names offset + k*stride; Mask names every value whose bits outside the mask are clear,
+	// which is what an alignment mask on an already-scaled index reaches.
+	enum class SelectorKind : uint32_t { Stride, Mask };
+
 	struct IndirectDescriptor {
 		struct SelectorRead {
 			uint32_t source = UINT32_MAX;
@@ -501,6 +575,16 @@ struct DescriptorSource {
 		Value                 selector_first;
 		Value    selector_mask;
 		std::vector<uint32_t> sources;
+		// The static immediate on the material read; the enumeration adds it to every probe.
+		uint32_t material_offset = 0;
+		// The heap record the key names. 32 bytes is one image descriptor, which is what a
+		// table of plain T# holds, but an engine may stride its table differently.
+		uint32_t heap_stride     = 32;
+		uint32_t record_offset   = 0;
+		// A mask the shader applies to the material word before indexing the heap. It only ever
+		// narrows the key, so the enumeration stays bounded. All ones when the shader applies
+		// none.
+		uint32_t key_mask        = 0xffffffffu;
 
 		bool operator==(const IndirectDescriptor& other) const = default;
 	};

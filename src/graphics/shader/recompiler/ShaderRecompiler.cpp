@@ -913,7 +913,16 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
                              uint32_t push_data_start_dword) {
 	const auto emit_begin = std::chrono::steady_clock::now();
 	auto& ir = translated.program;
-	IR::ApplyResourceSpecialization(ir, specialization);
+	if (!IR::ApplyResourceSpecialization(ir, specialization)) {
+		// Derived from a different tracking of this shader; refuse the permutation the way the
+		// backend refuses one it cannot express.
+		CompileResult refused;
+		refused.status.ok     = false;
+		refused.status.pc     = 0;
+		refused.status.reason = "resource specialization does not describe this translation";
+		refused.program       = std::move(ir);
+		return refused;
+	}
 	// The resource plan owns host descriptor evaluation now. Keep only dependencies consumed
 	// by GPU memory operations; bound descriptor dwords must not retain shader instructions.
 	for (auto& inst: ir.value_storage) {
@@ -930,11 +939,13 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 				})) {
 					continue;
 				}
+				// A buffer table's root carries the runtime key in arg 0, as an image table's does.
 				const auto resource = inst.Flags<uint32_t>();
-				first               = resource < ir.info.buffers.size() &&
-				                              ir.info.buffers[resource].indirect_root == resource
-				                          ? 1u
-				                          : 0u;
+				first = resource < ir.info.buffers.size() &&
+				                ir.info.buffers[resource].indirect_root == resource &&
+				                ir.info.buffers[resource].indirect_search_iterations != 0u
+				            ? 1u
+				            : 0u;
 			} else if (op == IR::ValueOpcode::GetImageResource) {
 				const auto resource = inst.Flags<uint32_t>();
 				first = resource < ir.info.images.size() &&

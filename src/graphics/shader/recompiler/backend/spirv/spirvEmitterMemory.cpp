@@ -370,14 +370,19 @@ void StoreBda(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo&
 
 uint32_t ByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
 	if (mem.kind == IR::ResourceKind::Buffer) {
-		const auto resource = ctx.state.program.info.buffers.at(mem.resource).descriptor_index;
-		const auto prefix = ctx.state.memory_byte_offsets[resource];
-		const auto address = Binary(ctx.state, spv::OpIAdd, TypeU32(ctx.state),
+		auto&      state   = ctx.state;
+		const bool dynamic = state.dynamic_buffer_index != 0 &&
+		                     mem.resource == state.dynamic_buffer_resource;
+		const auto prefix =
+		    dynamic ? state.dynamic_buffer_byte_offset
+		            : state.memory_byte_offsets[ResourceForDescriptor(
+		                  state, IR::DescriptorBindingKind::Buffers, mem.resource)];
+		const auto address = Binary(state, spv::OpIAdd, TypeU32(state),
 		                            BufferByteAddress(ctx, inst, mem), prefix);
 		// The host binding prefix must not wrap an out-of-range guest address into the buffer.
-		return Select(ctx.state, TypeU32(ctx.state),
-		              Binary(ctx.state, spv::OpUGreaterThanEqual, TypeBool(ctx.state), address, prefix),
-		              address, ConstantU32(ctx.state, UINT32_MAX));
+		return Select(state, TypeU32(state),
+		              Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), address, prefix),
+		              address, ConstantU32(state, UINT32_MAX));
 	}
 	if (mem.kind == IR::ResourceKind::Lds || mem.kind == IR::ResourceKind::Gds) {
 		if (mem.offset == 0u) {

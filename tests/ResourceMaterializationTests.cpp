@@ -753,7 +753,11 @@ void TestFiniteImageRefreshReusesScalarReads() {
                       snapshot.specialization_reads.capacity(), specialization.images.capacity()};
   };
   const auto check_mapping = [&](std::array<uint32_t, 4> ordinals) {
-    const auto offset = specialization.images[0].indirect_mapping_offset;
+    // The specialization names a directory slot; the slot holds the mapping
+    // offset.
+    const auto offset =
+        snapshot
+            .flattened_srt[specialization.images[0].indirect_mapping_offset];
     Check(snapshot.images.size() == 2 && snapshot.flattened_srt[offset] == 4,
           "finite image candidates were not deduplicated");
     for (uint32_t key = 0; key < ordinals.size(); ++key) {

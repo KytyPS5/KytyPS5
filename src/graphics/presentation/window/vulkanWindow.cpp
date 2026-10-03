@@ -62,6 +62,12 @@ vk::PhysicalDeviceVulkan12Features WindowContext::RequiredVulkan12Features() noe
 	features.bufferDeviceAddress       = VK_TRUE;
 	features.shaderBufferInt64Atomics  = VK_TRUE;
 	features.storageBuffer8BitAccess   = VK_TRUE;
+	// An indirect buffer table picks one of its candidate descriptors with an index the shader
+	// computes. The index is wave-uniform at best, never provably uniform across the workgroup, so
+	// it is emitted decorated NonUniform - which this feature is what permits.
+	features.shaderStorageBufferArrayNonUniformIndexing = VK_TRUE;
+	// The same for an indirect image table: its candidates are elements of one sampled-image
+	// binding and the sample picks one with an index the shader computes.
 	features.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
 	return features;
 }
@@ -281,8 +287,11 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		              required_features12.bufferDeviceAddress);
 		check_feature(features12.shaderBufferInt64Atomics, "shaderBufferInt64Atomics",
 		              required_features12.shaderBufferInt64Atomics);
+		check_feature(features12.shaderStorageBufferArrayNonUniformIndexing,
+		              "shaderStorageBufferArrayNonUniformIndexing (runtime-selected buffer descriptors)",
+		              required_features12.shaderStorageBufferArrayNonUniformIndexing);
 		check_feature(features12.shaderSampledImageArrayNonUniformIndexing,
-		              "shaderSampledImageArrayNonUniformIndexing",
+		              "shaderSampledImageArrayNonUniformIndexing (runtime-selected image descriptors)",
 		              required_features12.shaderSampledImageArrayNonUniformIndexing);
 		check_feature(features13.robustImageAccess, "robustImageAccess");
 		check_feature(features13.dynamicRendering, "dynamicRendering",

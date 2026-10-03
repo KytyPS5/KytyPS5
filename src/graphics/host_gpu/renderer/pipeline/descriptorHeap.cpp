@@ -9,9 +9,16 @@ namespace Libs::Graphics {
 namespace {
 
 constexpr uint32_t   DescriptorHeapCount = 1024;
+// A set costs one descriptor per resource its shaders bind, so a pool holds size/per-set sets, not
+// DescriptorHeapCount of them; past that Commit rotates or creates a pool, which waits on the
+// master semaphore. The sampled-image entry is sized to keep the sets-per-pool it had when a
+// shader could bind at most 64 images, now that ShaderInfo::MaxImages allows four times that, and
+// the storage-buffer entry for the same reason: an indirect table that reserves a 128-slot
+// candidate bucket takes 130 of these, against the 65 a 64-slot binding took. An indirect image
+// table now always takes whole IndexedImageBindingElements bindings, hence four times more again.
 constexpr std::array DescriptorPoolSizes = {
-    vk::DescriptorPoolSize {vk::DescriptorType::eStorageBuffer, 8192},
-    vk::DescriptorPoolSize {vk::DescriptorType::eSampledImage, 8192},
+    vk::DescriptorPoolSize {vk::DescriptorType::eStorageBuffer, 16384},
+    vk::DescriptorPoolSize {vk::DescriptorType::eSampledImage, 262144},
     vk::DescriptorPoolSize {vk::DescriptorType::eStorageImage, 1024},
     vk::DescriptorPoolSize {vk::DescriptorType::eSampler, 1024},
 };

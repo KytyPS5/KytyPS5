@@ -137,24 +137,38 @@ uint32_t ImageViewSizeType(EmitterState& state, ImageDimension dimension) {
 	}
 }
 
-namespace {
-void DecorateNonUniformDescriptor(EmitterState& state, uint32_t id) {
-	state.builder.RequireExtension("SPV_EXT_descriptor_indexing");
-	state.builder.RequireCapability(spv::CapabilityShaderNonUniform);
-	state.builder.RequireCapability(spv::CapabilitySampledImageArrayNonUniformIndexing);
-	state.builder.AddAnnotation(spv::OpDecorate, id, spv::DecorationNonUniform);
-}
-} // namespace
-
-uint32_t LoadImageDescriptor(EmitterState& state, uint32_t resource, uint32_t mip,
-                             uint32_t array_index) {
-	const auto pointer = ImageDescriptorPointer(state, resource, mip, array_index);
+uint32_t LoadImageDescriptor(EmitterState& state, uint32_t resource, uint32_t mip) {
+	const auto& image_resource = state.program.info.images.at(resource);
+	// An indirect image table resolves one sample against whichever candidate its key search
+	// picked, so the slot is an id rather than a literal. Every candidate sharing this access has
+	// the same ImageResource, hence the same binding and the same OpTypeImage; only the element
+	// differs. The index is wave-uniform at best, which is what NonUniform states - and Vulkan
+	// wants the decoration on the thing the sample reads, not only on the index, so it follows
+	// the pointer and the loaded image out of here to the OpSampledImage.
+	const bool dynamic =
+	    state.dynamic_image_index != 0 && resource == state.dynamic_image_resource;
+	uint32_t pointer = 0;
+	if (dynamic) {
+		const auto kind = IR::DescriptorBindingForImage(image_resource);
+		EXIT_IF(!kind.has_value());
+		const auto variable     = state.image_variables[IR::ImageBindingIndex(*kind)];
+		const auto pointer_type = state.builder.Type(
+		    spv::OpTypePointer, spv::StorageClassUniformConstant, ImageType(state, image_resource));
+		if (variable == 0) {
+			ExitDescriptorBindingFailure(state, *kind, resource,
+			                             "sampled image descriptor array was not emitted");
+		}
+		pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, pointer_type, pointer, variable,
+		                          state.dynamic_image_index);
+		state.builder.AddAnnotation(spv::OpDecorate, pointer, spv::DecorationNonUniform);
+	} else {
+		pointer = ImageDescriptorPointer(state, resource, mip);
+	}
 	const auto image = state.builder.AllocateId();
-	const auto kind = *IR::DescriptorBindingForImage(state.program.info.images[resource]);
-	state.builder.AddFunction(spv::OpLoad, state.images[IR::ImageBindingIndex(kind)].type,
-	                          image, pointer);
-	if (array_index != 0u) {
-		DecorateNonUniformDescriptor(state, image);
+	state.builder.AddFunction(spv::OpLoad, ImageType(state, image_resource), image, pointer);
+	if (dynamic) {
+		state.builder.AddAnnotation(spv::OpDecorate, image, spv::DecorationNonUniform);
 	}
 	return image;
 }
@@ -174,11 +188,10 @@ uint32_t LoadSamplerDescriptor(EmitterState& state, uint32_t sampler, uint32_t a
 	return sampler_id;
 }
 
-uint32_t MakeSampledImage(EmitterState& state, uint32_t resource, uint32_t sampler_id, uint32_t mip,
-                          uint32_t array_index, bool sampler_dynamic) {
+uint32_t MakeSampledImage(EmitterState& state, uint32_t resource, uint32_t sampler_id, uint32_t mip) {
 	const auto& image_resource = state.program.info.images.at(resource);
 	EXIT_IF(image_resource.resource_class != IR::ImageResourceClass::Sampled);
-	const auto  image          = LoadImageDescriptor(state, resource, mip, array_index);
+	const auto  image          = LoadImageDescriptor(state, resource, mip);
 	const auto  sampled_image = state.builder.AllocateId();
 	const auto kind = *IR::DescriptorBindingForImage(image_resource);
 	auto& sampled_type = state.images[IR::ImageBindingIndex(kind)].sampled_type;
@@ -187,24 +200,27 @@ uint32_t MakeSampledImage(EmitterState& state, uint32_t resource, uint32_t sampl
 		    spv::OpTypeSampledImage, state.images[IR::ImageBindingIndex(kind)].type);
 	}
 	state.builder.AddFunction(spv::OpSampledImage, sampled_type, sampled_image, image, sampler_id);
-	if (array_index != 0u || sampler_dynamic) {
-		DecorateNonUniformDescriptor(state, sampled_image);
+	// "If an instruction loads from or stores to a resource ... and the resource descriptor being
+	// accessed is not dynamically uniform, then that operand must be decorated with NonUniform" -
+	// the operand an OpImageSample* reads is this sampled image, so the decoration has to reach it
+	// and not stop at the pointer.
+	if (state.dynamic_image_index != 0 && resource == state.dynamic_image_resource) {
+		state.builder.AddAnnotation(spv::OpDecorate, sampled_image, spv::DecorationNonUniform);
 	}
 	return sampled_image;
 }
 
-uint32_t ImageDescriptorPointer(EmitterState& state, uint32_t resource, uint32_t mip,
-                                uint32_t array_index) {
+uint32_t ImageDescriptorPointer(EmitterState& state, uint32_t resource, uint32_t mip) {
 	const auto& image = state.program.info.images.at(resource);
 	EXIT_IF(mip >= image.mip_count);
 	const auto kind = IR::DescriptorBindingForImage(image);
 	EXIT_IF(!kind.has_value());
-	if (array_index == 0u) {
-		array_index = ConstantU32(state, image.descriptor_index + mip);
-	}
-	const auto& definition = state.images[IR::ImageBindingIndex(*kind)];
-	return DescriptorElementPointer(state, definition.pointer_type, definition.variable,
-	                                array_index, *kind, resource,
+	const auto array_index =
+	    ConstantU32(state, ResourceForDescriptor(state, *kind, resource) + mip);
+	const auto pointer_type = state.builder.Type(
+	    spv::OpTypePointer, spv::StorageClassUniformConstant, ImageType(state, image));
+	const auto variable = state.image_variables[IR::ImageBindingIndex(*kind)];
+	return DescriptorElementPointer(state, pointer_type, variable, array_index, *kind, resource,
 	                                "image descriptor array was not emitted");
 }
 

@@ -312,8 +312,10 @@ void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	const bool descriptor_ok = IsSupportedStorageTextureDescriptor(resource, descriptor);
 	const bool encoding_ok   = IsSupportedStorageTextureEncoding(resource, descriptor);
 	const bool uint_resource    = resource.numeric_class == Prospero::TextureNumericClass::Uint;
+	// The storage view of a k32SInt image is R32_UINT, so its 32-bit atomics are the same bits.
 	const bool raw_sint_storage = format == Prospero::BufferFormat::k32SInt && uint_resource &&
-	                              resource.written && !resource.read && !resource.atomic;
+	                              !resource.atomic64 &&
+	                              (resource.atomic || (resource.written && !resource.read));
 	const auto numeric_class = Prospero::SampledTextureNumericClass(format);
 	const bool raw_float_atomic = format == Prospero::BufferFormat::k32Float && uint_resource &&
 	                              resource.atomic && !resource.atomic64;
@@ -375,7 +377,11 @@ static TextureCache::ImageDesc NullTextureDesc(const ShaderRecompiler::IR::Image
 	desc.info.samples         = 1;
 	desc.info.mip_layout[0]   = {0, 0, 1, 1};
 	desc.view_info.format     = resource.atomic64 ? vk::Format::eR64Uint : desc.info.pixel_format;
-	desc.view_info.type       = vk::ImageViewType::e2D;
+	// An indirect table's null candidate can sit in a 2D-array binding, cube shapes included.
+	desc.view_info.type =
+	    resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DArray
+	        ? vk::ImageViewType::e2DArray
+	        : vk::ImageViewType::e2D;
 	desc.view_info.aspect     = vk::ImageAspectFlagBits::eColor;
 	desc.view_info.usage      = binding == TextureCache::BindingType::Storage
 	                                ? vk::ImageUsageFlagBits::eStorage
@@ -797,7 +803,11 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 				}
 			}
 			size = Libs::LibKernel::Memory::ClampRangeSize(address, size);
-			source = {address, size, cache.FindBuffer(address, size)};
+			if (size == 0) {
+				prepared.buffer_sources.push_back({});
+				continue;
+			}
+			prepared.buffer_sources.push_back({address, size, cache.FindBuffer(address, size)});
 		}
 	}
 }
@@ -829,6 +839,12 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	}
 	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::FlattenedSrt)] != 0) {
 		prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);
+		for (const auto& feedback: snapshot.key_feedback) {
+			m_context.GetIndirectKeyFeedback().Queue(
+			    feedback.signature, prepared.flattened_srt.buffer,
+			    prepared.flattened_srt.offset + feedback.srt_offset * sizeof(uint32_t),
+			    feedback.words);
+		}
 	}
 	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::ShaderData)] != 0) {
 		prepared.shader_data_buffer = NativeUpload(m_context, prepared.shader_data);
@@ -1069,8 +1085,15 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			const auto image_start = image_cursor;
 			if (ShaderRecompiler::IR::ImageBindingResourceClass(kind) !=
 			    ShaderRecompiler::IR::ImageResourceClass::None) {
-				image_starts[ShaderRecompiler::IR::ImageBindingIndex(kind)] = image_start;
-				image_cursor += write.descriptorCount;
+				for (const auto resource: binding.resources) {
+					if (resource == ShaderRecompiler::IR::PaddingImageResource) {
+						const auto first = m_descriptor_images[image_start];
+						m_descriptor_images.push_back(first);
+						continue;
+					}
+					m_descriptor_images.push_back(MakeImageInfo(
+					    descriptors.images.at(resource), m_image_occurrences.at(resource)++));
+				}
 			} else {
 				switch (kind) {
 					case BindingKind::Buffers:

@@ -129,7 +129,14 @@ struct EmitterState {
 	uint32_t                                         storage_buffer_u8_variable = 0;
 	uint32_t                                         storage_buffer_u16_variable = 0;
 	uint32_t                                         storage_buffer_u64_variable = 0;
-	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> memory_byte_offsets {};
+	std::array<uint32_t, IR::ShaderInfo::MaxDenseBuffers> memory_byte_offsets {};
+	// While non-zero, a storage-buffer access to dynamic_buffer_resource indexes the descriptor
+	// array with this id rather than with that resource's own constant slot. An indirect buffer
+	// table sets it around the one access every candidate of a shape shares.
+	uint32_t                                         dynamic_buffer_index    = 0;
+	uint32_t                                         dynamic_buffer_resource = 0;
+	// That slot's unpacked byte offset, read once for the whole access rather than per component.
+	uint32_t                                         dynamic_buffer_byte_offset = 0;
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
 	uint32_t                                         bda_pointer_function    = 0;
@@ -145,7 +152,13 @@ struct EmitterState {
 	uint32_t                                         lds_variable            = 0;
 	uint32_t                                         lds_u64_variable        = 0;
 	std::array<uint32_t, 2>                          scratch_variable {};
-	std::array<ImageDefinition, IR::ImageBindingCount> images {};
+	std::array<uint32_t, IR::ImageBindingCount>      image_variables {};
+	// While non-zero, a sampled-image load naming dynamic_image_resource indexes its descriptor
+	// array with this id rather than with that resource's own constant slot. An indirect image
+	// table sets it around the one sample every candidate of a shape shares. The same reasoning
+	// as dynamic_buffer_index above, in the other descriptor class.
+	uint32_t                   dynamic_image_index                   = 0;
+	uint32_t                   dynamic_image_resource                = 0;
 	uint32_t                   sampler_variable                      = 0;
 	uint32_t                   sampler_type                          = 0;
 	uint32_t                   sampler_pointer_type                  = 0;
@@ -158,6 +171,8 @@ struct EmitterState {
 	uint32_t                   entry_label                           = 0;
 	uint32_t                   current_label                         = 0;
 	const IR::Block*           current_block                         = nullptr;
+	// Key searches emitted at a block's top level, reused by later accesses in that block.
+	std::map<std::pair<const IR::Block*, std::array<uint32_t, 4>>, uint32_t> block_key_searches;
 	uint32_t                   pixel_valid_mask_variable             = 0;
 	uint32_t                   subgroup_local_invocation_id_variable = 0;
 	uint32_t                   per_vertex_variable                   = 0;
@@ -353,17 +368,14 @@ uint32_t ImageType(EmitterState& state, const IR::ImageResource& image);
 
 uint32_t ImageViewSizeType(EmitterState& state, ImageDimension dimension);
 
-uint32_t ImageDescriptorPointer(EmitterState& state, uint32_t resource, uint32_t mip = 0,
-                                uint32_t array_index = 0);
+uint32_t ImageDescriptorPointer(EmitterState& state, uint32_t resource, uint32_t mip = 0);
 
-uint32_t LoadImageDescriptor(EmitterState& state, uint32_t resource, uint32_t mip = 0,
-                             uint32_t array_index = 0);
+uint32_t LoadImageDescriptor(EmitterState& state, uint32_t resource, uint32_t mip = 0);
 
 uint32_t LoadSamplerDescriptor(EmitterState& state, uint32_t sampler, uint32_t array_index = 0);
 
 uint32_t MakeSampledImage(EmitterState& state, uint32_t resource, uint32_t sampler_id,
-                          uint32_t mip = 0, uint32_t array_index = 0,
-                          bool sampler_dynamic = false);
+                          uint32_t mip = 0);
 
 void EmitStorageImageWrite(EmitterState& state, uint32_t resource, uint32_t mip_lod, uint32_t coord,
                            uint32_t texel);
@@ -430,6 +442,14 @@ uint32_t EmitBinaryU32(EmitterState& state, spv::Op opcode, uint32_t lhs, uint32
 
 uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index);
 
+// EmitShaderDataDwordLoad for an index the shader computes. Push constants and the shader-data
+// storage buffer are both plain arrays, so indexing either one dynamically needs no feature.
+uint32_t EmitShaderDataDwordLoadDynamic(EmitterState& state, uint32_t dword_index);
+
+// The packed per-buffer byte offset EmitMemoryOffsets unpacks at entry, for a resource slot the
+// shader picks at runtime. One byte per dense buffer, four to a shader-data dword.
+uint32_t EmitDynamicMemoryByteOffset(EmitterState& state, uint32_t resource_index);
+
 uint32_t StorageBufferPackedStride(const EmitterState& state, const IR::MemoryInfo& mem);
 
 Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::MemoryInfo& mem);
@@ -446,6 +466,7 @@ struct MemoryResourceAccess {
 	uint32_t              byte_offset      = 0;
 	uint32_t              element_bits     = 32;
 	spv::MemoryAccessMask memory_access    = spv::MemoryAccessMaskNone;
+
 	// glc=1: only storage buffers and raw pointers have a cache to bypass.
 	bool             coherent         = false;
 };
@@ -469,6 +490,27 @@ uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAcces
 
 uint32_t EmitStorageBufferElementPointer(EmitterState& state, const MemoryResourceAccess& access,
                                          uint32_t index, uint32_t pointer_type);
+
+// One word of the flattened SRT by constant index.
+uint32_t LoadFlattenedSrtWord(EmitterState& state, uint32_t index);
+
+struct IndirectCandidateSearch {
+	uint32_t selected = 0;
+	uint32_t mapping  = 0;
+	uint32_t count    = 0;
+};
+
+// Unrolled: a loop per access made large buffer-table modules compile for seconds.
+// `matched`, when given, receives whether any mapping entry equalled the key.
+uint32_t EmitUnrolledCandidateSearch(EmitterState& state, uint32_t mapping_slot,
+                                     uint32_t iterations, uint32_t key,
+                                     uint32_t* matched = nullptr);
+
+// A loop, so the key count never reaches the module; image tables only.
+// `mapping_slot` indexes the flattened SRT's directory, which holds the table's real mapping
+// offset. The offset itself never reaches the module - see ResourceMaterialization.cpp.
+IndirectCandidateSearch EmitIndirectCandidateSearch(EmitterState& state, uint32_t mapping_slot,
+                                                    uint32_t key);
 
 uint32_t EmitTBufferBitcastU32ToI32(EmitterState& state, uint32_t value);
 

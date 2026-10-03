@@ -30,6 +30,9 @@ class UserConfig;
 struct ComputeShaderInfo;
 } // namespace HW
 
+// The raw read the descriptor evaluator runs for every word of a descriptor chain. The address is
+// guest data and may point anywhere, so an unmapped one refuses rather than faulting the caller.
+
 #pragma pack(push, 1)
 
 struct PipelineStaticParameters {
@@ -194,6 +197,7 @@ private:
 	void InitializeDriverCache();
 	bool WriteDriverCacheLocked();
 	void MaybeSaveDriverCacheLocked();
+	void DestroyPipelineObjects(const Pipeline& pipeline);
 };
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);

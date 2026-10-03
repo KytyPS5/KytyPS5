@@ -26,8 +26,82 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 	const auto uses_mapping = [](const auto& resource) {
 		return resource.indirect_root != UINT32_MAX;
 	};
-	bool uses_flattened_srt = std::ranges::any_of(program.info.buffers, uses_mapping) ||
-	                          std::ranges::any_of(program.info.images, uses_mapping);
+	for (uint32_t i = 0; i < program.info.images.size(); i++) {
+		const auto kind = IR::DescriptorBindingForImage(program.info.images[i]);
+		if (!kind.has_value()) {
+			Fail(program, "native shader plan has an invalid image class");
+		}
+		present[static_cast<size_t>(*kind)] = true;
+		const auto dynamic = program.info.images[i].mip_mode == IR::ImageMipMode::Dynamic;
+		const auto count   = dynamic ? program.info.images[i].mip_count : 1u;
+		if (count == 0u || (!dynamic && program.info.images[i].mip_count != 1u)) {
+			Fail(program, "native shader plan has an invalid image mip descriptor count");
+		}
+		expected[static_cast<size_t>(*kind)].insert(expected[static_cast<size_t>(*kind)].end(),
+		                                            count, i);
+	}
+	for (uint32_t group = 0; group < IR::ImageBindingCount; group++) {
+		auto& resources = expected[IR::FirstImageBinding + group];
+		if (!resources.empty()) {
+			IR::PadIndexedImageBinding(program.info, resources);
+		}
+	}
+	if (!program.info.samplers.empty()) {
+		Expect(Kind::Samplers, Dense(program.info.samplers.size()));
+	}
+	auto& buffers = expected[static_cast<size_t>(Kind::Buffers)];
+	const auto shared = IR::CollectMemoryResources(program, buffers);
+	present[static_cast<size_t>(Kind::Buffers)] = !buffers.empty();
+	if (shared.gds) {
+		Expect(Kind::Gds);
+	}
+	if (shared.lds && lds_storage) {
+		Expect(Kind::SharedMemory);
+	}
+	if (program.info.uses_dma) {
+		Expect(Kind::BdaPagetable);
+		Expect(Kind::FaultBuffer);
+	}
+	if (IR::UsesFlattenedSrt(program)) {
+		Expect(Kind::FlattenedSrt);
+	}
+	if (program.bindings.ShaderDataDwords() != 0 && !program.bindings.UsesPushData()) {
+		Expect(Kind::ShaderData);
+	}
+
+	std::array<bool, KindCount> seen {};
+	for (const auto& binding: program.bindings.descriptors) {
+		const auto kind = static_cast<size_t>(binding.kind);
+		if (kind >= KindCount || seen[kind] || !present[kind] ||
+		    binding.resources != expected[kind]) {
+			Fail(program, "native descriptor groups do not match shader topology");
+		}
+		seen[kind] = true;
+	}
+	for (size_t i = 0; i < KindCount; i++) {
+		if (present[i] != seen[i]) {
+			Fail(program, "native shader plan is missing a required descriptor group");
+		}
+	}
+	const auto has_shader_data_storage = present[static_cast<size_t>(Kind::ShaderData)];
+	const auto shader_data_dwords = program.bindings.ShaderDataDwords();
+	const auto user_data_dwords = program.bindings.user_data_registers.size();
+	const bool has_dispatch_threads = program.bindings.dispatch_thread_dword != IR::PushData::NoStart;
+	if ((program.bindings.UsesPushData() &&
+	     !IR::PushData::CanFit(program.bindings.push_data_start_dword, shader_data_dwords)) ||
+	    (has_dispatch_threads && (program.stage != ShaderType::Compute ||
+	                              program.bindings.dispatch_thread_dword != user_data_dwords)) ||
+	    program.bindings.memory_offset_dword != user_data_dwords + (has_dispatch_threads ? 3u : 0u) ||
+	    program.bindings.memory_offset_count != buffers.size() ||
+	    has_shader_data_storage != (shader_data_dwords != 0 && !program.bindings.UsesPushData()) ||
+	    !std::is_sorted(program.bindings.user_data_registers.begin(),
+	                    program.bindings.user_data_registers.end()) ||
+	    std::adjacent_find(program.bindings.user_data_registers.begin(),
+	                       program.bindings.user_data_registers.end()) !=
+	        program.bindings.user_data_registers.end()) {
+		Fail(program, "native shader-data layout is inconsistent");
+	}
+
 	const auto planning_only_handle = [&](const IR::Inst& handle) {
 		return !handle.Uses().empty() &&
 		       std::ranges::all_of(handle.Uses(), [&](const IR::Use& use) {
@@ -191,12 +265,15 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 					requirements.subgroup_local_invocation_id = true;
 				}
 				// Must match the emitter's predicate, or a module can use the alias undeclared.
-				if (IR::BufferAccessOf(inst.GetOpcode()) != IR::BufferAccess::Atomic &&
+				if (!memory.planning_only &&
+				    IR::BufferAccessOf(inst.GetOpcode()) != IR::BufferAccess::Atomic &&
 				    Emitter::CoherentBufferAccess(memory)) {
 					requirements.coherent_buffers = true;
 				}
-				if (memory.kind == IR::ResourceKind::Buffer) {
+				// A planning-only read is never tracked or emitted; its resource is still a register.
+				if (!memory.planning_only && memory.kind == IR::ResourceKind::Buffer) {
 					requirements.coherent_buffers |= memory.coherent;
+
 					if (memory.resource >= program.info.buffers.size()) {
 						Fail(program, "buffer operation has invalid resource metadata");
 					}

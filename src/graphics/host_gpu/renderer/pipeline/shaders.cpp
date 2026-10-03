@@ -19,7 +19,7 @@
 #include "graphics/shader/shader.h"
 
 #include <algorithm>
-#include <bit>
+#include <array>
 #include <limits>
 #include <span>
 #include <vector>
@@ -190,8 +190,82 @@ static void AddLayoutBindings(std::vector<vk::DescriptorSetLayoutBinding>& descr
 	}
 }
 
+// The recompiler budgets its dense resources against host-independent constants
+// (ShaderInfo::MaxImages, MaxDenseBuffers), and nothing in the tree used to read the device limits
+// those constants have to live inside. A layout that exceeds one of them fails inside
+// vkCreateDescriptorSetLayout or vkCreatePipelineLayout with nothing to say which limit it was, so
+// name it here, where both counts are in hand. Every binding carries exactly one stage flag
+// (AddLayoutBindings sets it per program), so a per-stage total is a sum over the bindings of that
+// stage.
+static void CheckDescriptorLayoutLimits(GraphicContext&                                graphics,
+                                        std::span<const vk::DescriptorSetLayoutBinding> bindings) {
+	const auto& limits = graphics.GetPhysicalDeviceProperties().limits;
+	struct Counts {
+		vk::ShaderStageFlags stage {};
+		uint32_t             sampled_image  = 0;
+		uint32_t             storage_image  = 0;
+		uint32_t             storage_buffer = 0;
+		uint32_t             sampler        = 0;
+		uint32_t             total          = 0;
+	};
+	std::array<Counts, 4> stages {};
+	uint32_t              stage_count = 0;
+	Counts                whole_set {};
+	for (const auto& binding: bindings) {
+		Counts* counts = nullptr;
+		for (uint32_t index = 0; index < stage_count; index++) {
+			if (stages[index].stage == binding.stageFlags) {
+				counts = &stages[index];
+				break;
+			}
+		}
+		if (counts == nullptr) {
+			if (stage_count == stages.size()) {
+				EXIT("shader descriptor layout uses more stages than a pipeline can have\n");
+			}
+			stages[stage_count].stage = binding.stageFlags;
+			counts                    = &stages[stage_count++];
+		}
+		for (auto* entry: {counts, &whole_set}) {
+			switch (binding.descriptorType) {
+				case vk::DescriptorType::eSampledImage: entry->sampled_image += binding.descriptorCount; break;
+				case vk::DescriptorType::eStorageImage: entry->storage_image += binding.descriptorCount; break;
+				case vk::DescriptorType::eStorageBuffer: entry->storage_buffer += binding.descriptorCount; break;
+				case vk::DescriptorType::eSampler: entry->sampler += binding.descriptorCount; break;
+				default: break;
+			}
+			entry->total += binding.descriptorCount;
+		}
+	}
+	const auto Require = [](const char* what, uint32_t needed, uint32_t limit) {
+		if (needed > limit) {
+			EXIT("shader descriptor layout needs %u %s, the device allows %u\n", needed, what,
+			     limit);
+		}
+	};
+	for (uint32_t index = 0; index < stage_count; index++) {
+		const auto& counts = stages[index];
+		Require("per-stage sampled images", counts.sampled_image,
+		        limits.maxPerStageDescriptorSampledImages);
+		Require("per-stage storage images", counts.storage_image,
+		        limits.maxPerStageDescriptorStorageImages);
+		Require("per-stage storage buffers", counts.storage_buffer,
+		        limits.maxPerStageDescriptorStorageBuffers);
+		Require("per-stage samplers", counts.sampler, limits.maxPerStageDescriptorSamplers);
+		Require("per-stage resources", counts.total, limits.maxPerStageResources);
+	}
+	Require("sampled images in one set", whole_set.sampled_image,
+	        limits.maxDescriptorSetSampledImages);
+	Require("storage images in one set", whole_set.storage_image,
+	        limits.maxDescriptorSetStorageImages);
+	Require("storage buffers in one set", whole_set.storage_buffer,
+	        limits.maxDescriptorSetStorageBuffers);
+	Require("samplers in one set", whole_set.sampler, limits.maxDescriptorSetSamplers);
+}
+
 static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                                    std::span<const vk::DescriptorSetLayoutBinding> bindings) {
+	CheckDescriptorLayoutLimits(graphics, bindings);
 	uint32_t descriptor_count = 0;
 	for (const auto& binding: bindings) {
 		descriptor_count += binding.descriptorCount;

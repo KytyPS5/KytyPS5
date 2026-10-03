@@ -235,6 +235,12 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 	Log::WriteToConsoleAndLog(message);
 }
 
+// A descriptor may declare an arena far larger than the pages behind it, and enumerating the
+// declared size probes memory that cannot answer. Report what is actually mapped instead.
+uint64_t ReadableShaderExtent(void*, uint64_t address, uint64_t size) {
+	return Libs::LibKernel::Memory::ClampRangeSize(address, size);
+}
+
 bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
 	// Scalar and unformatted buffer dependencies use the same backing as native raw loads.
 	// Image synchronization belongs to formatted buffer bindings, not these reads.
@@ -777,6 +783,12 @@ struct PipelineCache::ProgramCache {
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
 				return permutation->handle;
 			}
+			// The shader is cached and a permutation of it is about to be rebuilt. Both halves of
+			// the search can reject a candidate, and they are different bugs with different fixes,
+			// so count which one did it and - when it was the specialization - what actually
+			// differed. This is measurement: a run's own answer to how much of its recompilation
+			// is the resource shape changing and how much is not.
+			ReportPermutationMiss(entry->second.permutations, specialization, push_data_cursor);
 		}
 
 		ShaderStageInputInfo stage_input {};
@@ -882,6 +894,66 @@ struct PipelineCache::ProgramCache {
 		            counts[static_cast<size_t>(ShaderType::TessellationControl)],
 		            counts[static_cast<size_t>(ShaderType::TessellationEvaluation)]);
 		return permutation.handle;
+	}
+
+	// Why the permutation search rejected every cached permutation of a shader it had already
+	// translated. A candidate that matches the specialization but not the push-data start is the
+	// vertex stage's start moving with whichever pixel shader it was paired with; one that matches
+	// the start but not the specialization is named by the first field that differs. "table offset"
+	// must stay at zero - the table offsets are directory slots now and cannot differ for one
+	// program, so a count there means that regression is back.
+	static void ReportPermutationMiss(const std::vector<Permutation>& permutations,
+	                                  const ShaderRecompiler::IR::ResourceSpecialization& wanted,
+	                                  uint32_t push_data_cursor) {
+		if (permutations.empty()) {
+			return;
+		}
+		bool        push_data_only = false;
+		const char* difference     = nullptr;
+		for (const auto& candidate: permutations) {
+			const auto& layout = candidate.program.bindings;
+			const bool  start_matches =
+			    layout.push_data_start_dword ==
+			    ShaderRecompiler::IR::PushData::StartFor(push_data_cursor,
+			                                             layout.ShaderDataDwords());
+			if (candidate.specialization == wanted) {
+				// Same module state, rejected only for where its push data starts.
+				push_data_only = true;
+				break;
+			}
+			if (start_matches && difference == nullptr) {
+				difference = ShaderRecompiler::IR::FirstSpecializationDifference(
+				    candidate.specialization, wanted);
+			}
+		}
+		static std::mutex                      mutex;
+		static uint64_t                        push_data_misses = 0;
+		static uint64_t                        specialization_misses = 0;
+		static uint64_t                        reported = 0;
+		static std::map<std::string, uint64_t> fields;
+		std::string                            line;
+		{
+			const std::lock_guard<std::mutex> lock(mutex);
+			if (push_data_only) {
+				push_data_misses++;
+			} else {
+				specialization_misses++;
+				fields[difference != nullptr ? difference : "unclassified"]++;
+			}
+			const auto total = push_data_misses + specialization_misses;
+			// First sighting and every doubling, so a run that misses thousands of times does not
+			// pay for a line each one.
+			if ((total & (total - 1u)) != 0u || total == reported) {
+				return;
+			}
+			reported = total;
+			line     = fmt::format("PermutationMiss: push_data={} specialization={}",
+			                       push_data_misses, specialization_misses);
+			for (const auto& [field, count]: fields) {
+				line += fmt::format(" | {}={}", field, count);
+			}
+		}
+		std::printf("%s\n", line.c_str());
 	}
 
 	explicit ProgramCache(vk::Device device, uint32_t subgroup_size)

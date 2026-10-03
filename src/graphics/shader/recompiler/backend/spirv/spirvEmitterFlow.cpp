@@ -452,6 +452,19 @@ uint32_t ConvertPositionToClipSpace(EmitterState& state, uint32_t position) {
 }
 
 } // namespace
+// S_WQM_B64, RDNA 2 SOP1 opcode 10: "for i in 0 ... opcode_size_in_bits - 1 do
+//     D[i] = (S0[(i & ~3):(i | 3)] != 0); endfor" - every group of four bits becomes all ones if any
+// of them is set. OR the word down by one and then by two so that bit 4k carries its whole nibble,
+// keep those bits, and spread each one back over the nibble it came from.
+//
+// The constants read like two packed 32-bit halves because that is exactly what they are: `TypeU64`
+// here is `OpTypeVector %uint 2`, not a 64-bit integer, and `ConstantU64` splits its argument into
+// one `OpConstantComposite` component per half. So 0x0000000100000001 is the vector (1, 1) and every
+// operation below is componentwise - a shift of one bit in each half, never a 64-bit shift, so no
+// shift amount ever reaches the operand's width. Replacing them with 1, 2 and 0xf shifts the high
+// half by zero and multiplies it by zero, which drops the whole upper wave: see
+// ScalarWqmB64Wave64ExpandsQuadsInPlace. A nibble never crosses the 32-bit boundary, so this is the
+// same answer ConstantPropagation and SrtWalker compute one half at a time.
 uint32_t EmitWqmU64(EmitterState& state, uint32_t value) {
 	const auto shifted_one = state.builder.AllocateId();
 	const auto merged_one  = state.builder.AllocateId();

@@ -87,9 +87,19 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 		const auto& resource   = program.info.buffers[i];
 		const auto  descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
-		// A metadata resource that is also read is not proven to be a full overwrite. Execute it
-		// conservatively instead of replacing the dispatch with a coarse full-surface clear.
-		if ((!resource.written || resource.read) && cache.IsMeta(descriptor.Base48())) {
+		const bool  is_meta    = cache.IsMeta(descriptor.Base48());
+		if (!resource.written && !resource.atomic) {
+			// A clear may read its value from a side buffer, but reading metadata back means the
+			// dispatch derives something from it instead of clearing it.
+			if (is_meta) {
+				return false;
+			}
+			continue;
+		}
+		if (resource.read || resource.atomic || !is_meta) {
+			// A read/modify/write is not a clear, and the registry outlives the guest allocation,
+			// so a base that is still registered is only a hint. Any other store is real work that
+			// consuming the dispatch would silently drop.
 			return false;
 		}
 		metadata_writes++;
@@ -124,7 +134,11 @@ bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t grou
 	    descriptor.Base48() == 0) {
 		return false;
 	}
-	if (input.threads_num[0] == 0 || input.threads_num[0] != fill.group_stride[0] ||
+	// Each invocation writes `stores` elements, so a workgroup covers local_size_x * stores of
+	// them. The one-store shape is local_size_x, exactly as before.
+	if (fill.stores == 0 || fill.stores > ShaderRecompiler::IR::UniformFill::MaxStores ||
+	    input.threads_num[0] == 0 ||
+	    static_cast<uint64_t>(input.threads_num[0]) * fill.stores != fill.group_stride[0] ||
 	    input.threads_num[1] != 1 || input.threads_num[2] != 1 || group_x == 0 || group_y != 1 ||
 	    group_z != 1 || mode != (input.dispatch_thread_dimensions ? 0x61u : 0x41u)) {
 		return false;
@@ -132,8 +146,9 @@ bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t grou
 	const uint64_t invocations = input.dispatch_thread_dimensions
 	                                 ? group_x
 	                                 : static_cast<uint64_t>(group_x) * input.threads_num[0];
+	const uint64_t elements    = invocations * fill.stores;
 	const auto     size        = descriptor.GetSize();
-	if (invocations != descriptor.NumRecords() || size == 0 || size > UINT32_MAX ||
+	if (elements != descriptor.NumRecords() || size == 0 || size > UINT32_MAX ||
 	    (input.dispatch_thread_dimensions &&
 	     (group_x % input.threads_num[0] != 0 || input.dispatch_threads_num[0] != group_x ||
 	      input.dispatch_threads_num[1] != 1 || input.dispatch_threads_num[2] != 1))) {
@@ -402,7 +417,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	const bool                   has_sampler = !program.info.samplers.empty();
 	static std::atomic<uint32_t> dispatch_log_count {0};
 	if ((large_workgroup || has_sampler) &&
-	    dispatch_log_count.fetch_add(1, std::memory_order_relaxed) < 512) {
+	    dispatch_log_count.fetch_add(1, std::memory_order_relaxed) < 512u) {
 		const auto sampled_images = std::count_if(
 		    program.info.images.begin(), program.info.images.end(), [](const auto& image) {
 			    return image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled;
@@ -527,6 +542,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+	m_context.GetIndirectKeyFeedback().Flush(vk_buffer);
 
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);

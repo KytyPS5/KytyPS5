@@ -25,18 +25,35 @@ struct UniformFill {
 	std::array<uint32_t, 3> group_stride {};
 	uint32_t                 words        = 0;
 	uint32_t                 value        = 0;
+	// Elements each invocation writes, one per store. The stores tile the workgroup's range, so
+	// group_stride[0] == local_size_x * stores. One store per invocation is the common shape.
+	uint32_t                 stores       = 1;
+
+	static constexpr uint32_t MaxStores = 64;
 
 	bool operator==(const UniformFill&) const = default;
 };
 
+// A bitmap the draw writes its selected descriptor-heap keys into, for a table too large for the
+// host to enumerate. It lives in the flattened SRT because that buffer is already bound, writable
+// and sized per draw; the host reads it back once the submit retires.
+struct IndirectKeyFeedback {
+	uint64_t signature  = 0;
+	uint32_t srt_offset = 0;
+	uint32_t words      = 0;
+
+	bool operator==(const IndirectKeyFeedback&) const = default;
+};
+
 struct ResourceSnapshot {
-	std::vector<DescriptorValue> buffers;
-	std::vector<DescriptorValue> images;
-	std::vector<DescriptorValue> samplers;
-	std::vector<uint32_t>        flattened_srt;
-	std::vector<uint32_t>        user_data;
+	std::vector<DescriptorValue>               buffers;
+	std::vector<DescriptorValue>               images;
+	std::vector<DescriptorValue>               samplers;
+	std::vector<uint32_t>                      flattened_srt;
+	std::vector<uint32_t>                      user_data;
 	std::vector<std::pair<uint64_t, uint64_t>> specialization_reads;
-	UniformFill                 uniform_fill;
+	UniformFill                                uniform_fill;
+	std::vector<IndirectKeyFeedback>           key_feedback;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

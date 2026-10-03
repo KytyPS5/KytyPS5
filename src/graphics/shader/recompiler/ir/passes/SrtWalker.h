@@ -11,12 +11,26 @@ class Value;
 
 using SrtMemoryReader = bool (*)(void* userdata, uint64_t address, std::span<uint32_t> values);
 
+// Bytes readable from address, capped at size. A guest descriptor may declare an arena far larger
+// than the pages behind it, and enumerating the declared size probes memory that cannot answer.
+using SrtExtentQuery = uint64_t (*)(void* userdata, uint64_t address, uint64_t size);
+
+// Names why a read refused, for the refusal message only. Optional: the walk never consults it.
+using SrtReadRefusalDescriber = const char* (*)(void* userdata, uint64_t address);
+
+// Reads a contiguous block. Every single-word read re-checks GPU ownership of its four bytes, which
+// costs a cache lock and a region search; enumerating a table pays that tens of thousands of times.
+using SrtBlockReader = bool (*)(void* userdata, uint64_t address, void* data, uint64_t size);
+
 struct SrtRuntime {
 	std::span<const uint32_t> user_data;
 	uint64_t                  shader_base                = 0;
 	SrtMemoryReader           read_memory                = nullptr;
 	void*                     userdata                   = nullptr;
 	SrtMemoryReader           read_specialization_memory = nullptr;
+	SrtExtentQuery            readable_extent            = nullptr;
+	SrtReadRefusalDescriber   describe_read_refusal      = nullptr;
+	SrtBlockReader            read_specialization_block  = nullptr;
 	std::span<const uint32_t> workgroup_counts;
 };
 

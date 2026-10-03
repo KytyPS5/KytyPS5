@@ -34,8 +34,24 @@ namespace {
 
 constexpr uint64_t NumFramesBeforeRemoval = 32;
 
+// Surfaces come from pools the engine never unmaps, so reusing those bytes for something that is
+// not an image displaces no cache entry. Age is the only signal that one has stopped speaking for
+// the memory under it.
+[[nodiscard]] bool ImageAbandoned(const Image& image, uint64_t current_frame) {
+	return current_frame - std::min(current_frame, image.frame_accessed_last) >
+	       NumFramesBeforeRemoval;
+}
+
+// Only an untiled image is ever enrolled for download, and the one place that writes a tiled
+// image back - the collector's eviction step - destroys it in the same pass. So no *live* tiled
+// image has ever put its pixels into guest memory. It cannot hold the newest bytes there, and no
+// drain can change that, so it must not withhold a read of what the guest wrote itself.
+[[nodiscard]] bool ImageOwnsGuestBytes(const Image& image) {
+	return !image.info.IsTiled();
+}
+
 [[nodiscard]] bool DecodeColorClear(const TextureCache::ImageDesc& desc, uint8_t code,
-                                  vk::ClearColorValue& clear) {
+                                    vk::ClearColorValue& clear) {
 	const auto& metadata = desc.info.metadata;
 	const auto  format   = desc.info.IsDepth()
 	                           ? TextureGetSurfaceFormatInfo(desc.info.guest_format).vk_format
@@ -802,9 +818,13 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	    requested.type == cached.info.type && requested.pitch == cached.info.pitch &&
 	    !requested.HasStencil() && !cached.info.HasStencil() && !requested.HasMetadata() &&
 	    !cached.info.HasMetadata();
-	// PPSA04264, PPSA04288
-	// A partial view retains the entire matching array layout. HTile belongs to
-	// the depth source, independently of the data slices copied into color storage.
+	// PPSA30803: a pooled depth address reused for a color texture is a different surface.
+	if (binding == BindingType::Texture && cached.info.IsDepth() && !requested.IsDepth() &&
+	    !raw_d16_texture &&
+	    !IsSupportedSampledDepthFormat(cached.info.pixel_format, requested.pixel_format)) {
+		return {};
+	}
+	// PPSA04264
 	const bool retain_cached_layout =
 	    requested.samples == 1 && cached.info.samples == 1 && cached.backing.samples == 1 &&
 	    requested.bytes_per_block == cached.info.bytes_per_block &&
@@ -960,10 +980,9 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		BcAlias::Resolve(*this, cached_id, merged_id);
 		return {merged_id};
 	}
-	auto&      cached       = *owner;
-	const auto current_frame = m_frame_index.load(std::memory_order_relaxed);
+	auto&      cached = *owner;
 	const bool safe_to_delete =
-	    current_frame - std::min(current_frame, cached.frame_accessed_last) > NumFramesBeforeRemoval;
+	    ImageAbandoned(cached, m_frame_index.load(std::memory_order_relaxed));
 
 	const uint32_t requested_block = requested.bytes_per_block * requested.samples;
 	const uint32_t cached_block    = cached.info.bytes_per_block * cached.info.samples;
@@ -2213,11 +2232,33 @@ bool TextureCache::IsRegionGpuModified(uint64_t address, uint64_t size) {
 		// PPSA17168: S_LOAD_DWORD reads shader data at an address overlapping an old
 		// render target whose memory the CPU has reused. The cached image still retains
 		// its earlier GPU-modified flag.
-		if (!image.depth_id && image.IsGpuModified() && !image.IsDefinitelyCpuDirty()) {
+		if (!image.depth_id && image.IsGpuModified() && !image.IsDefinitelyCpuDirty() &&
+		    ImageOwnsGuestBytes(image)) {
 			return true;
 		}
 	}
 	return false;
+}
+
+std::string TextureCache::DescribeGpuModifiedRegion(uint64_t address, uint64_t size) {
+	if (!GuestRange {address, size}.Valid()) {
+		return {};
+	}
+	std::scoped_lock lock {m_lock};
+	for (const auto id: FindImagesInRegion(address, size, false)) {
+		const auto& image = m_slot_images[id];
+		if (image.depth_id || !image.IsGpuModified() || !ImageOwnsGuestBytes(image)) {
+			continue;
+		}
+		return fmt::format("image 0x{:016x}+0x{:x} {}x{} rt={} storage={} video_out={} "
+		                   "texture={} buffer_modified={} cpu_dirty={} registered={}",
+		                   image.info.data.address, image.info.data.size, image.info.extent.width,
+		                   image.info.extent.height, image.usage.render_target ? 1 : 0,
+		                   image.usage.storage ? 1 : 0, image.usage.video_out ? 1 : 0,
+		                   image.usage.texture ? 1 : 0, image.IsBufferModified() ? 1 : 0,
+		                   image.IsCpuDirty() ? 1 : 0, image.registered ? 1 : 0);
+	}
+	return {};
 }
 
 void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {

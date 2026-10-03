@@ -106,6 +106,32 @@ bool IsUniformBufferRead(const ResourcePlan& values, const Inst& inst) {
 	return true;
 }
 
+// The one read the walk lets name a record rather than only a byte offset. RDNA 2 ISA 8.1.5
+// builds a buffer address out of three parts and spells the two this adds:
+//
+//   Index = (inst_idxen ? vgpr_index : 0) + (const_add_tid_enable ? thread_id[5:0] : 0)
+//   Offset = (inst_offen ? vgpr_offset : 0) + inst_offset
+//
+// so an index and a per-lane offset are ordinary terms of the address, not lane identity: the
+// only lane term is add_tid, which EvaluateRawRead already refuses outright. RESIDENT EVIL
+// REQUIEM reaches its descriptor heaps that way and no other - across the 208 dumped RE9 pixel
+// shaders, every one of the 61 BUFFER_LOAD_DWORDX4 instructions is `idxen=1, offen=0`, and not
+// one is the unindexed shape the predicate above accepts. So the walk re-executes the two terms
+// instead of refusing the read for carrying them, and ValidateArguments then holds them to the
+// same wave-uniform standard as the descriptor words and the scalar offset beside them: a value
+// no lane can move is a record the whole wave agrees on.
+//
+// Scoped to the DWORDX4 form on purpose. LoadBufferU32 is also a raw read (IsRawRead), and
+// PlanBuilder hoists those into flat SRT slots on the strength of an immediate offset alone -
+// one uploaded word standing for the whole dispatch. An index does not survive that; findings 35,
+// 37 and 38 are all about a selector that differs per iteration being bound as if it did not. A
+// DWORDX4 read is never flattened ("A uniform DWORDX4 load is deliberately not one"), so widening
+// it cannot reach the planner.
+bool IsDescriptorDwordX4Load(const ResourcePlan& values, const Inst& inst) {
+	return inst.GetOpcode() == ValueOpcode::LoadBufferU32x4 &&
+	       IsUniformBufferRead(values, inst);
+}
+
 // Which argument carries the read's dynamic byte offset. The scalar reads put it
 // second; a MUBUF load puts the index and the per-lane offset there and the scalar
 // offset fourth.
@@ -185,6 +211,7 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 		case ValueOpcode::BitwiseOr32:
 		case ValueOpcode::BitwiseXor32:
 		case ValueOpcode::BitwiseNot32:
+		case ValueOpcode::WqmU64:
 		case ValueOpcode::SelectU1:
 		case ValueOpcode::SelectU32:
 		case ValueOpcode::SelectF32:
@@ -548,6 +575,7 @@ SrtWalker::SrtWalker(const ResourcePlan& program, const SrtRuntime& runtime,
     : m_program(program), m_runtime(runtime), m_clean_evaluator(clean_evaluator),
       m_active_mask(active_mask.Resolve()),
       m_context(AcquireContext(program)) {}
+
 
 SrtWalker::~SrtWalker() { --m_program.evaluation_depth; }
 
@@ -1044,6 +1072,26 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 		case ValueOpcode::BitwiseNot32:
 			if (Arg(inst, 0, a)) {
 				result = ~static_cast<uint32_t>(a);
+				return true;
+			}
+			return false;
+		case ValueOpcode::WqmU64:
+			// S_WQM_B64, RDNA 2 SOP1 opcode 10: "for i in 0 ... opcode_size_in_bits - 1 do
+			// D[i] = (S0[(i & ~3):(i | 3)] != 0)" - every group of four bits becomes all ones
+			// if any of them is set. A total function of one scalar word, with no lane
+			// identity of its own: the quad grouping is fixed by bit position, not by which
+			// lane is asking. So the walk re-executes it exactly rather than refusing it, and
+			// exactly is what it takes - a mask with one lane live per quad is wave-wide only
+			// after the expansion, which is how RESIDENT EVIL REQUIEM pixel shader
+			// 0xaba519e634a11781 builds an image descriptor behind s_wqm_b64.
+			if (Arg(inst, 0, a)) {
+				const auto quads = [](uint32_t word) {
+					auto bits = word | (word >> 1u);
+					bits |= bits >> 2u;
+					return static_cast<uint32_t>((bits & 0x11111111u) * 0x0fu);
+				};
+				result = quads(static_cast<uint32_t>(a)) |
+				         (static_cast<uint64_t>(quads(static_cast<uint32_t>(a >> 32u))) << 32u);
 				return true;
 			}
 			return false;

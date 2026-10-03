@@ -1027,6 +1027,8 @@ std::string Hex(u32 value) {
 
 void Require(const char *shader_name, const char *stage, bool value,
              const std::string &message);
+// Upstream capabilities this branch does not carry (see the rebase decision log). Their tests
+// stay compiled for the port and are skipped until then.
 
 void EnsureConfigInitialized() {
   static bool config_initialized = false;
@@ -1497,6 +1499,10 @@ struct TestCase {
   std::vector<std::pair<std::string, size_t>> ir_counts;
   u32 expected_mip_descriptors = 0;
   std::optional<std::vector<u32>> expected_buffer_resources;
+  // Lets specialization read `initial` too, as an indirect table's enumeration must.
+  bool specialization_memory = false;
+  // Binds the one sampled image in every sampled binding, for shape arms no key reaches.
+  bool shared_sampled_image = false;
 };
 
 struct GraphicsCase {
@@ -1804,10 +1810,11 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
       .userdata = const_cast<std::vector<u32> *>(&test.initial),
       .read_specialization_memory = ReadTestMemory,
   };
-  Require(test.name, "resource materialization",
-          ShaderRecompiler::IR::MaterializeResources(
-              resource_plan, runtime, resources, specialization),
-          "translated resources could not be materialized");
+  const bool materialized = ShaderRecompiler::IR::MaterializeResources(
+      resource_plan, runtime, resources, specialization);
+  Require(test.name, "resource materialization", materialized,
+          "translated resources could not be materialized: " +
+              std::string(ShaderRecompiler::IR::LastMaterializeFailure()));
   auto result = ShaderRecompiler::CompileProgram(
       std::move(translated), options, specialization);
   for (const auto &[text, expected] : test.decoded_counts) {
@@ -13731,7 +13738,7 @@ public:
         image.numeric_class = Prospero::TextureNumericClass::Float;
         image.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
       }
-      ShaderRecompiler::IR::ApplyResourceSpecialization(
+      (void)ShaderRecompiler::IR::ApplyResourceSpecialization(
           null_program, null_specialization);
       set_image_bindings(null_program);
       ShaderRecompiler::IR::CompiledShaderInfo null_info{};
@@ -16151,7 +16158,7 @@ public:
                  return true;
                }}, stencil_snapshot, stencil_specialization),
           "captured stencil shader could not resolve its clear byte");
-      ShaderRecompiler::IR::ApplyResourceSpecialization(stencil_translated.program,
+      (void)ShaderRecompiler::IR::ApplyResourceSpecialization(stencil_translated.program,
                                                        stencil_specialization);
       ShaderRecompiler::IR::CompiledShaderInfo stencil_program{};
       stencil_program.stage = ShaderType::Compute;
@@ -16903,8 +16910,7 @@ public:
                 const Image *storage_image = nullptr,
                 const Image *storage_image_uint = nullptr,
                 vk::Sampler sampler = nullptr,
-                std::span<const Image> sampled_resources = {},
-                std::span<const vk::Sampler> sampler_resources = {}) {
+                const std::function<const Image *(u32)> &sampled_for_resource = {}) {
     using Kind = ShaderRecompiler::IR::DescriptorBindingKind;
     const auto &layout = compiled.program.bindings;
     auto shader_data = compiled.packed_user_data;
@@ -17046,7 +17052,7 @@ public:
 
     std::vector<vk::WriteDescriptorSet> writes;
     std::vector<vk::DescriptorBufferInfo> buffer_infos;
-    std::array<std::vector<vk::DescriptorImageInfo>, ShaderRecompiler::IR::ImageBindingCount> image_infos;
+    std::vector<std::vector<vk::DescriptorImageInfo>> sampled_infos;
     std::vector<vk::ImageView> sampled_mip_views;
     std::vector<vk::DescriptorImageInfo> sampler_infos;
     Buffer flattened_buffer;
@@ -17166,44 +17172,70 @@ public:
       write.pBufferInfo = &gds_info;
       writes.push_back(write);
     }
-    Require(test.name, "dispatch", sampled_resources.empty() ||
-                sampled_resources.size() == compiled.program.info.images.size(),
-            "sampled resources must match the logical images");
-    for (u32 resource = 0; resource < compiled.program.info.images.size(); ++resource) {
-      const auto &image = compiled.program.info.images[resource];
-      const auto kind = *ShaderRecompiler::IR::DescriptorBindingForImage(image);
-      auto &infos = image_infos[ShaderRecompiler::IR::ImageBindingIndex(kind)];
-      infos.resize(Count(kind));
-      const bool sampled = image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled;
-      const auto *source_image = sampled
-          ? (sampled_resources.empty() ? sampled_image : &sampled_resources[resource])
-          : (image.numeric_class == Prospero::TextureNumericClass::Float
-                 ? storage_image : storage_image_uint);
-      Require(test.name, "dispatch", source_image != nullptr,
-              "image descriptor requested but no matching image was provided");
-      for (u32 mip_index = 0; mip_index < image.mip_count; ++mip_index) {
-        auto &info = infos[image.descriptor_index + mip_index];
-        info.imageView = source_image->view;
-        info.imageLayout = source_image->layout;
-        if (sampled && image.mip_mode == ShaderRecompiler::IR::ImageMipMode::Dynamic) {
-          const auto mip = test.sampled_image_view_base_mip + mip_index;
-          Require(test.name, "dispatch", mip < source_image->mip_levels,
+    std::vector<const ShaderRecompiler::IR::DescriptorBinding *> sampled;
+    const ShaderRecompiler::IR::DescriptorBinding *storage = nullptr;
+    const ShaderRecompiler::IR::DescriptorBinding *storage_uint = nullptr;
+    const ShaderRecompiler::IR::DescriptorBinding *storage_atomic = nullptr;
+    for (const auto &binding : layout.descriptors) {
+      const auto resource_class =
+          ShaderRecompiler::IR::ImageBindingResourceClass(binding.kind);
+      if (resource_class == ShaderRecompiler::IR::ImageResourceClass::None) {
+        continue;
+      }
+      const auto &image =
+          compiled.program.info.images.at(binding.resources.front());
+      if (resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled) {
+        // An indirect table's shape arms each take a binding its keys may never reach.
+        Require(test.name, "dispatch",
+                sampled.empty() || sampled_for_resource || test.shared_sampled_image,
+                "Vulkan test harness needs separate sampled images for mixed "
+                "descriptor classes");
+        sampled.push_back(&binding);
+      } else if (image.atomic) {
+        storage_atomic = &binding;
+      } else if (image.numeric_class == Prospero::TextureNumericClass::Float) {
+        storage = &binding;
+      } else {
+        storage_uint = &binding;
+      }
+    }
+    sampled_infos.resize(sampled.size());
+    std::vector<u32> mip_indices(compiled.program.info.images.size());
+    for (size_t group = 0; group < sampled.size(); group++) {
+      const auto &resources = sampled[group]->resources;
+      auto &infos = sampled_infos[group];
+      for (const auto resource : resources) {
+        const auto *image =
+            !sampled_for_resource ? sampled_image
+            : sampled_for_resource(resource == ShaderRecompiler::IR::PaddingImageResource
+                                       ? resources.front()
+                                       : resource);
+        Require(test.name, "dispatch", image != nullptr,
+                "sampled image descriptor requested but no sampled image was "
+                "provided");
+        vk::DescriptorImageInfo info{nullptr, image->view, image->layout};
+        if (resource != ShaderRecompiler::IR::PaddingImageResource &&
+            compiled.program.info.images[resource].mip_mode ==
+                ShaderRecompiler::IR::ImageMipMode::Dynamic) {
+          const auto mip = test.sampled_image_view_base_mip + mip_indices[resource]++;
+          Require(test.name, "dispatch", mip < image->mip_levels,
                   "sampled mip descriptor exceeds the supplied image");
           vk::ImageViewCreateInfo view{};
-          view.image = source_image->image;
+          view.image = image->image;
           view.viewType = test.sampled_image_view_type;
-          view.format = source_image->format;
+          view.format = image->format;
           view.subresourceRange = {
               vk::ImageAspectFlagBits::eColor, mip, 1,
               test.sampled_image_view_base_layer,
               test.sampled_image_view_layers != 0
                   ? test.sampled_image_view_layers
-                  : source_image->layers - test.sampled_image_view_base_layer};
+                  : image->layers - test.sampled_image_view_base_layer};
           RequireVk(test.name, "dispatch",
                     m_device.createImageView(&view, nullptr, &info.imageView),
                     "vkCreateImageView(sampled mip)");
           sampled_mip_views.push_back(info.imageView);
         }
+        infos.push_back(info);
       }
     }
     for (u32 group = 0; group < image_infos.size(); ++group) {
@@ -17212,9 +17244,9 @@ public:
       const auto kind = static_cast<Kind>(ShaderRecompiler::IR::FirstImageBinding + group);
       vk::WriteDescriptorSet write{};
       write.dstSet = descriptor_set;
-      write.dstBinding = Native(kind);
+      write.dstBinding = Native(sampled[group]->kind);
       write.descriptorCount = static_cast<u32>(infos.size());
-      write.descriptorType = NativeDescriptorType(kind);
+      write.descriptorType = vk::DescriptorType::eSampledImage;
       write.pImageInfo = infos.data();
       writes.push_back(write);
     }
@@ -20791,6 +20823,58 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
   vulkan->DestroyBuffer(&gds_buffer);
   vulkan->DestroyBuffer(&buffer);
   CompareWords(test, "readback", test.expected, actual);
+  std::printf("[compute] %-32s ok\n", test.name);
+}
+
+TestCase IndirectImageTableSamples();
+
+// Whichever key the device searches, it must sample that key's candidate.
+void CheckIndirectImageTableSelects(VulkanHarness *vulkan) {
+  using namespace ShaderRecompiler::IR;
+  auto test = IndirectImageTableSamples();
+  test.name = "IndirectImageTableSelects";
+  const auto compiled = CompileCase(test, vulkan->SubgroupSize());
+  // A 2D request can meet 2D and cube records, so a table of 2D records still carries a cube arm.
+  const auto sampled = std::ranges::count_if(
+      compiled.program.bindings.descriptors, [](const DescriptorBinding &binding) {
+        return ImageBindingResourceClass(binding.kind) == ImageResourceClass::Sampled &&
+               binding.resources.size() == IndexedImageBindingElements;
+      });
+  Require(test.name, "indexed bindings", sampled == 2,
+          "the table's shapes did not take two full-length bindings");
+  // A candidate's texels hold its key; a null descriptor's hold zero.
+  const auto KeyOf = [&](u32 resource) {
+    const auto word = compiled.resources.images.at(resource).dwords[0];
+    return word == 0u ? 0u : (word - 0x10000u) / 0x100u;
+  };
+  std::array<VulkanHarness::Image, 6> textures;
+  for (u32 key = 0; key < textures.size(); key++) {
+    textures[key] = vulkan->CreateImage2D(
+        test.name, 4, 4, vk::Format::eR32G32B32A32Sfloat, vk::ImageUsageFlagBits::eSampled,
+        std::vector<u32>(16u * 4u, std::bit_cast<u32>(static_cast<float>(key))), 4,
+        vk::ImageLayout::eShaderReadOnlyOptimal);
+  }
+  const auto TextureOf = [&](u32 resource) { return &textures[KeyOf(resource)]; };
+  const auto sampler = vulkan->CreateSampler(test.name);
+  // Six is enumerated but names a null record; seven was never enumerated.
+  for (u32 key = 1; key <= 7u; key++) {
+    auto memory = test.initial;
+    memory[1] = key;
+    auto buffer = vulkan->CreateStorageBuffer(test.name, memory, memory.size());
+    vulkan->Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr, nullptr, sampler,
+                     TextureOf);
+    const auto actual = vulkan->ReadBuffer(test.name, buffer, 4);
+    const auto expected = std::bit_cast<u32>(static_cast<float>(key <= 5u ? key : 0u));
+    Require(test.name, "selected candidate",
+            std::ranges::all_of(actual, [&](u32 word) { return word == expected; }),
+            "key " + std::to_string(key) + " sampled another candidate's texture: " +
+                std::to_string(std::bit_cast<float>(actual[0])));
+    vulkan->DestroyBuffer(&buffer);
+  }
+  vulkan->Device().destroySampler(sampler, nullptr);
+  for (auto &texture : textures) {
+    vulkan->DestroyImage(&texture);
+  }
   std::printf("[compute] %-32s ok\n", test.name);
 }
 
@@ -36283,6 +36367,70 @@ TestCase ImageCubeGradientsPreserveDerivatives() {
   return test;
 }
 
+// The looped search, slot word and NonUniform element must reach the candidate's texel.
+TestCase IndirectImageTableSamples() {
+  using O = ShaderOpcode;
+  constexpr u32 kMaterialBase = 0x1000u;
+  constexpr u32 kMaterialStride = 224u;
+  constexpr u32 kHeapBase = 0x2000u;
+  constexpr u32 kHeapRecords = 16u;
+  TestCase test;
+  test.name = "IndirectImageTableSamples";
+  test.code = {
+      EncodeVop1(0x02, 16, Vgpr(0)),             // v_readfirstlane_b32 s16, v0
+      EncodeSop2(0x26, 17, 16, 255u),            // s_mul_i32 s17, s16, 224
+      kMaterialStride,
+      EncodeSmem0(0x08, 18, 6), EncodeSmem1(4, 17), // s_buffer_load_dword s18, s[12:15], s17 offset:4
+      EncodeSop2(0x1e, 19, 18, InlineU32(5)),    // s_lshl_b32 s19, s18, 5
+      EncodeSmem0(0x0b, 24, 2), EncodeSmem1(0, 19), // s_buffer_load_dwordx8 s[24:31], s[4:7], s19
+      EncodeVop1(0x01, 20, 240u),                // v_mov_b32 v20, 0.5
+      EncodeVop1(0x01, 21, 240u),                // v_mov_b32 v21, 0.5
+      EncodeMimg0(0x27, 0xf), EncodeMimg1(0, 20, 6, 2), // image_sample_lz v[0:3], v[20:21], s[24:31], s[8:11]
+  };
+  for (u32 channel = 0; channel < 4u; channel++) {
+    AppendStoreVgpr(&test.code, channel, channel);
+  }
+  AppendEnd(&test.code);
+  test.opcodes = {O::V_READFIRSTLANE_B32, O::S_MUL_I32, O::S_BUFFER_LOAD_DWORD,
+                  O::S_LSHL_B32,          O::S_BUFFER_LOAD_DWORDX8, O::V_MOV_B32,
+                  O::IMAGE_SAMPLE,        O::BUFFER_STORE_DWORD,  O::S_ENDPGM};
+  test.has_user_data = true;
+  test.user_data[4] = kHeapBase;
+  test.user_data[5] = 32u << 16u;
+  test.user_data[6] = kHeapRecords;
+  test.user_data[12] = kMaterialBase;
+  test.user_data[13] = kMaterialStride << 16u;
+  test.user_data[14] = 2u;
+  test.user_data[50] = 4u * sizeof(u32);
+  // Five keys name T#s, a sixth a null record; the key sits in word 1.
+  test.initial.assign((kHeapBase + kHeapRecords * 32u) / 4u, 0u);
+  test.initial[1] = 1u;
+  for (u32 probe = 0; probe < 2u * kMaterialStride / 32u; probe++) {
+    test.initial[(kMaterialBase + 4u + probe * 32u) / 4u] = 1u + probe % 6u;
+  }
+  for (u32 key = 1; key <= 5u; key++) {
+    const auto at = (kHeapBase + key * 32u) / 4u;
+    test.initial[at + 0u] = 0x10000u + key * 0x100u;
+    test.initial[at + 1u] = static_cast<u32>(Prospero::BufferFormat::k32_32_32_32Float) << 20u;
+    test.initial[at + 2u] = 3u | (3u << 14u);
+    test.initial[at + 3u] =
+        DstSel(4, 5, 6, 7) | (static_cast<u32>(Prospero::ImageType::kColor2D) << 28u);
+  }
+  constexpr std::array texel{0.25f, 0.5f, 0.75f, 1.0f};
+  for (u32 pixel = 0; pixel < 16u; pixel++) {
+    for (const auto channel : texel) {
+      test.sampled_image_rgba.push_back(std::bit_cast<u32>(channel));
+    }
+  }
+  for (const auto channel : texel) {
+    test.expected.push_back(std::bit_cast<u32>(channel));
+  }
+  test.required_spirv = {"OpLoopMerge", "SampledImageArrayNonUniformIndexing"};
+  test.specialization_memory = true;
+  test.shared_sampled_image = true;
+  return test;
+}
+
 TestCase ImageGatherExplicitLod() {
   using O = ShaderOpcode;
   std::vector<u32> code;
@@ -37069,8 +37217,7 @@ void CheckIndirectBufferStore(VulkanHarness &vulkan) {
   candidate.indirect_search_iterations = 0;
   candidate.indirect_resources.clear();
   program.descriptor_sources.resize(1);
-  program.descriptor_sources[0].indirect_descriptor =
-      DescriptorSource::IndirectDescriptor{.table_stride = 16};
+  program.descriptor_sources[0].indirect_descriptor.emplace().heap_stride = 16;
   ShaderComputeInputInfo compute;
   compute.wave_size = 32;
   compute.host_subgroup_size = vulkan.SubgroupSize();
@@ -37108,7 +37255,8 @@ void CheckIndirectBufferStore(VulkanHarness &vulkan) {
       if (null_buffers != 0u && swapped) continue;
       // Repeated keys select two distinct logical buffers within one native allocation.
       // Keys below, between and above the live keys must not select either buffer.
-      compiled.resources.flattened_srt = {0u, 0u, 0u, 0u, 3u,
+      // Slot 4 is the root's directory word; its mapping follows at 5.
+      compiled.resources.flattened_srt = {0u, 0u, 0u, 0u, 5u, 3u,
                                          10u, swapped ? 0u : 1u,
                                          12u, swapped ? 1u : 0u,
                                          14u, swapped ? 0u : 1u};
@@ -37247,6 +37395,9 @@ void CheckFiniteInlineSamplerPhi(VulkanHarness &vulkan) {
 void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
   constexpr const char *name = "IndirectImageKeySwitch";
   constexpr uint32_t mapping_capacity = 1793u;
+  // A non-zero slot: with slot 0 the directory hop and the mapping hop read the same word,
+  // and a one-hop search looks correct.
+  constexpr uint32_t kMappingSlot = 7u;
   using namespace ShaderRecompiler::IR;
 
   Program program{};
@@ -37296,10 +37447,8 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
   program.descriptor_sources.resize(2);
   program.descriptor_sources[0].dword_count = 8;
   program.descriptor_sources[0].indirect_descriptor =
-      DescriptorSource::IndirectDescriptor{
-          .selector = DescriptorSource::IndirectDescriptor::SelectorRead{
-              .source = 0, .stride = 224, .offset = 12},
-          .table_source = 0, .table_stride = 32};
+      DescriptorSource::IndirectDescriptor{.material_source = 0, .table_source = 0,
+          .selector_stride = 224, .selector_offset = 12, .heap_stride = 32};
   program.descriptor_sources[1].dword_count = 4;
 
   ImageResource root{};
@@ -37310,7 +37459,7 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
   root.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
   root.read = true;
   root.indirect_root = 0;
-  root.indirect_mapping_offset = 0;
+  root.indirect_mapping_offset = kMappingSlot;
 	root.indirect_search_iterations = std::bit_width(mapping_capacity);
   root.indirect_resources = {0u, 1u};
   auto candidate = root;
@@ -37330,57 +37479,48 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
   std::string text;
   Require(name, "SPIR-V disassembly", tools.Disassemble(spirv, &text),
           "failed to disassemble indirect image shader");
-  Require(name, "homogeneous image array",
+  // One shape: a looped search and one sample through a runtime-indexed, full-length binding.
+  Require(name, "key search",
           text.find("OpSwitch") == std::string::npos &&
+              CountText(text, "OpLoopMerge") == 1 &&
               CountText(text, "OpImageSampleExplicitLod") == 1 &&
-              text.find("SampledImageArrayNonUniformIndexing") != std::string::npos,
-          "homogeneous image keys did not select one descriptor array sample");
-  u32 sampled_image = 0;
-  std::vector<u32> nonuniform;
-  for (size_t offset = 5; offset < spirv.size();) {
-    const auto words = std::span<const u32>(spirv).subspan(offset, spirv[offset] >> 16u);
-    const auto opcode = static_cast<spv::Op>(words[0] & 0xffffu);
-    if (opcode == spv::OpDecorate && words[2] == spv::DecorationNonUniform)
-      nonuniform.push_back(words[1]);
-    if (opcode == spv::OpImageSampleExplicitLod) sampled_image = words[3];
-    offset += words.size();
-  }
-  Require(name, "nonuniform sampled image operand",
-          sampled_image != 0u && std::ranges::find(nonuniform, sampled_image) != nonuniform.end(),
-          "the sample operand lacks its nonuniform decoration");
+              CountText(text, "OpIEqual") == 1 &&
+              CountText(text, "NonUniform\n") >= 3 &&
+              text.find("OpCapability SampledImageArrayNonUniformIndexing") != std::string::npos &&
+              text.find("OpConstant %uint 256\n") != std::string::npos,
+          "dynamic image key did not index one full-length binding after a looped search");
 
-  program.info.images[0].indirect_search_iterations = 0;
-  program.shader_info_complete = false;
-  CollectShaderInfo(program, {.compute = &compute});
-  spirv = ShaderRecompiler::Spirv::EmitProgram(program, {.compute = &compute});
-  ValidateSpirv("DenseIndirectImageTable", spirv);
-  Require(name, "dense image map disassembly", tools.Disassemble(spirv, &text),
-          "failed to disassemble dense image table shader");
-  Require(name, "bounded dense image selection",
-          CountText(text, "OpULessThan") == 1 &&
-              CountText(text, "OpImageSampleExplicitLod") == 1 &&
-              text.find("SampledImageArrayNonUniformIndexing") != std::string::npos,
-          "dense image selection lost its bounds check or native nonuniform array");
-
-  // Materialized children follow all native roots, including unrelated images.
-  root.indirect_resources = {0u};
-  program.info.images = {root, candidate};
-  program.info.images[1].indirect_root = ImageResource::NoIndirectImage;
-  for (u32 ordinal = 1; ordinal < 189u; ++ordinal) {
-    root.indirect_resources.push_back(static_cast<u32>(program.info.images.size()));
-    program.info.images.push_back(candidate);
+  // Two hops: load the slot, then index the key table from what it held. One hop short reads the
+  // directory region instead, which no count of instructions can see - hence a shape assertion.
+  {
+    const auto id_after = [&](const std::string &needle) {
+      const auto at = text.find(needle);
+      if (at == std::string::npos) {
+        return std::string();
+      }
+      const auto line_start = text.rfind('\n', at) + 1;
+      const auto percent = text.find('%', line_start);
+      if (percent == std::string::npos || percent > at) {
+        return std::string();
+      }
+      const auto end = text.find_first_of(" \t", percent);
+      return text.substr(percent, end - percent);
+    };
+    const auto slot_id = id_after("OpConstant %uint " + std::to_string(kMappingSlot) + "\n");
+    Require(name, "directory slot constant", !slot_id.empty(),
+            "the mapping slot never reached the module as a constant");
+    const auto first_chain = id_after("OpAccessChain %_ptr_StorageBuffer_uint %flattened_srt "
+                                      "%uint_0 " + slot_id + "\n");
+    Require(name, "directory hop", !first_chain.empty(),
+            "the runtime search did not address the directory slot");
+    const auto mapping_id = id_after("OpLoad %uint " + first_chain + "\n");
+    Require(name, "directory load", !mapping_id.empty(),
+            "the directory slot was addressed but never loaded");
+    Require(name, "mapping hop",
+            text.find("OpAccessChain %_ptr_StorageBuffer_uint %flattened_srt %uint_0 " +
+                      mapping_id) != std::string::npos,
+            "the key table was indexed from the slot itself instead of from the offset it holds");
   }
-  program.info.images[0] = root;
-  program.shader_info_complete = false;
-  CollectShaderInfo(program, {.compute = &compute});
-  spirv = ShaderRecompiler::Spirv::EmitProgram(program, {.compute = &compute});
-  ValidateSpirv(name, spirv);
-  Require(name, "large image array disassembly", tools.Disassemble(spirv, &text),
-          "failed to disassemble the materialized image array");
-  Require(name, "large homogeneous image array",
-          text.find("OpSwitch") == std::string::npos &&
-              CountText(text, "OpImageSampleExplicitLod") == 1,
-          "materialized images expanded into per-candidate samples");
 
   program.info.images[root.indirect_resources[103]].dimension =
       ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
@@ -37435,7 +37575,8 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
       } else if (opcode == spv::OpImageSampleExplicitLod) {
         const auto coord = definitions[words[4]];
         const auto lod = definitions[words[6]];
-        const auto components = samples == (cube_first ? 1u : 0u) ? 2u : 3u;
+        // Arms are ordered by shape, and 2D sorts first whichever candidate holds it.
+        const auto components = samples == 0u ? 2u : 3u;
         Require(name, "mixed coordinate and LOD layout",
                 !coord.empty() && definitions[coord[1]][3] == components &&
                     words[5] == spv::ImageOperandsLodMask && lod.size() == 4u &&
@@ -37611,6 +37752,200 @@ void CheckIndirectImageKeySwitch(VulkanHarness &vulkan) {
   }
   vulkan.Device().destroySampler(native_sampler);
   for (auto &texture : textures) vulkan.DestroyImage(&texture);
+}
+
+// An RE Engine shaped indirect image table must emit one module whatever its heap holds.
+void CheckIndirectImageModuleStability() {
+  constexpr const char *name = "IndirectImageModuleStability";
+  using namespace ShaderRecompiler::IR;
+  constexpr u32 kMaterialBase = 0x1000u;
+  constexpr u32 kMaterialStride = 224u;
+  constexpr u32 kHeapBase = 0x10000u;
+  constexpr u32 kHeapRecords = 512u;
+
+  std::vector<u32> code{
+      EncodeVop1(0x02, 16, Vgpr(0)),             // v_readfirstlane_b32 s16, v0
+      EncodeSop2(0x26, 17, 16, 255u),            // s_mul_i32 s17, s16, 224
+      kMaterialStride,
+      EncodeSmem0(0x08, 18, 0), EncodeSmem1(4, 17), // s_buffer_load_dword s18, s[0:3], s17 offset:4
+      EncodeSop2(0x1e, 19, 18, InlineU32(5)),    // s_lshl_b32 s19, s18, 5
+      EncodeSmem0(0x0b, 24, 2), EncodeSmem1(0, 19), // s_buffer_load_dwordx8 s[24:31], s[4:7], s19
+      EncodeVop1(0x01, 20, 240u),                // v_mov_b32 v20, 0.5
+      EncodeVop1(0x01, 21, 240u),                // v_mov_b32 v21, 0.5
+      EncodeMimg0(0x27, 0xf), EncodeMimg1(0, 20, 6, 2), // image_sample_lz v[0:3], v[20:21], s[24:31], s[8:11]
+  };
+  AppendStoreVgpr(&code, 0, 0);
+  AppendEnd(&code);
+
+  // Keys 1..`distinct` name T#s: `cubes` cube ones, `unorm` another format of the class.
+  struct Variant {
+    const char *label;
+    u32 distinct;
+    u32 keys;
+    std::vector<u32> cubes;
+    std::vector<u32> unorm;
+  };
+  struct Compiled {
+    std::vector<u32> spirv;
+    ResourceSpecialization specialization;
+    ResourceSnapshot snapshot;
+    Program program;
+  };
+  const auto compile = [&](const Variant &variant) {
+    const u32 records = (variant.keys * 32u + kMaterialStride - 1u) / kMaterialStride + 1u;
+    auto user_data = MakeNativeUserData(nullptr);
+    user_data[0] = kMaterialBase;
+    user_data[1] = kMaterialStride << 16u;
+    user_data[2] = records;
+    user_data[3] = 0u;
+    user_data[4] = kHeapBase;
+    user_data[5] = 32u << 16u;
+    user_data[6] = kHeapRecords;
+    user_data[7] = 0u;
+    std::vector<u32> memory((kHeapBase + kHeapRecords * 32u) / 4u, 0u);
+    for (u32 probe = 0; probe < records * kMaterialStride / 32u; probe++) {
+      memory[(kMaterialBase + 4u + probe * 32u) / 4u] = 1u + probe % variant.keys;
+    }
+    for (u32 key = 1; key <= variant.distinct; key++) {
+      const auto at = (kHeapBase + key * 32u) / 4u;
+      const bool cube = std::ranges::find(variant.cubes, key) != variant.cubes.end();
+      const bool unorm = std::ranges::find(variant.unorm, key) != variant.unorm.end();
+      memory[at + 0u] = 0x10000u + key * 0x100u;
+      memory[at + 1u] =
+          static_cast<u32>(unorm ? Prospero::BufferFormat::k8_8_8_8UNorm
+                                 : Prospero::BufferFormat::k32_32_32_32Float)
+              << 20u |
+          (cube ? 3u << 30u : 0u);
+      memory[at + 2u] = cube ? 3u << 14u : 3u | (3u << 14u);
+      memory[at + 3u] = DstSel(4, 5, 6, 7) |
+                        (static_cast<u32>(cube ? Prospero::ImageType::kCube
+                                               : Prospero::ImageType::kColor2D)
+                         << 28u);
+      memory[at + 4u] = cube ? 11u : 0u;
+    }
+    ShaderComputeInputInfo compute{};
+    ShaderRecompiler::CompileOptions options;
+    options.stage = ShaderType::Compute;
+    options.user_data = user_data;
+    options.input_info.compute = &compute;
+    auto translated = ShaderRecompiler::TranslateProgram(code, options);
+    Require(name, "translation", translated.status.ok,
+            "pc " + Hex(translated.status.pc) + ": " + translated.status.reason);
+    const auto plan = ExtractResourcePlan(translated.program);
+    Require(name, "table recognition",
+            std::ranges::any_of(plan.descriptor_sources,
+                                [](const auto &source) {
+                                  return source.indirect_descriptor.has_value();
+                                }),
+            "the heap read was not recognized as an indirect image table");
+    Compiled result;
+    const SrtRuntime runtime{.user_data = user_data,
+                             .read_memory = ReadTestMemory,
+                             .userdata = &memory,
+                             .read_specialization_memory = ReadTestMemory};
+    const bool materialized =
+        MaterializeResources(plan, runtime, result.snapshot, result.specialization);
+    Require(name, "materialization", materialized,
+            std::string(variant.label) + ": the table did not materialize: " +
+                std::string(LastMaterializeFailure()));
+    auto compiled = ShaderRecompiler::CompileProgram(std::move(translated), options,
+                                                     result.specialization);
+    Require(name, "compilation", compiled.status.ok, compiled.status.reason);
+    ValidateSpirv(name, compiled.spirv);
+    result.spirv = std::move(compiled.spirv);
+    result.program = std::move(compiled.program);
+
+    // Every key, walked the way the module walks it: search, slot word, shape arm, element.
+    const auto &images = result.program.info.images;
+    const auto &flat = result.snapshot.flattened_srt;
+    const auto root = static_cast<u32>(std::ranges::find_if(images, [&](const auto &image) {
+                                         return static_cast<ptrdiff_t>(image.indirect_root) ==
+                                                &image - images.data();
+                                       }) -
+                                       images.begin());
+    Require(name, "table root", root < images.size(), "no image became the table's root");
+    const auto mapping = flat.at(images[root].indirect_mapping_offset);
+    const auto count = flat.at(mapping);
+    const auto words = flat.at(mapping + 1u + count * 2u);
+    for (u32 key = 0; key <= variant.keys + 1u; key++) {
+      u32 low = 0;
+      u32 high = count;
+      u32 selected = 0;
+      while (low < high) {
+        const auto mid = low + (high - low) / 2u;
+        const auto entry = mapping + 1u + mid * 2u;
+        if (flat.at(entry) == key) selected = flat.at(entry + 1u);
+        if (flat.at(entry) < key) low = mid + 1u;
+        else high = mid;
+      }
+      Require(name, "slot word", selected < words, "an ordinal fell past its slot words");
+      const auto slot = flat.at(mapping + 2u + count * 2u + selected);
+      const auto arm = std::ranges::find_if(images[root].indirect_resources, [&](u32 resource) {
+        return IndirectImageShape(images[resource].dimension, images[resource].cube) ==
+               slot >> 16u;
+      });
+      Require(name, "shape arm", arm != images[root].indirect_resources.end(),
+              "a slot word named a shape the table has no arm for");
+      const auto *binding =
+          FindBinding(result.program.bindings, *DescriptorBindingForImage(images[*arm]));
+      const auto element = slot & 0xffffu;
+      Require(name, "binding element",
+              binding != nullptr && binding->resources.size() == IndexedImageBindingElements &&
+                  element < binding->resources.size() &&
+                  binding->resources[element] != PaddingImageResource,
+              "a slot word named no image of its arm's full-length binding");
+      const auto image = binding->resources[element];
+      const auto &descriptor = result.snapshot.images.at(image).dwords;
+      const bool named = key != 0u && key <= variant.distinct;
+      Require(name, "selection",
+              IndirectImageShape(images[image].dimension, images[image].cube) == slot >> 16u &&
+                  (named ? descriptor[0] == 0x10000u + key * 0x100u
+                         : std::ranges::all_of(descriptor, [](u32 word) { return word == 0u; })),
+              std::string(variant.label) + ": key " + std::to_string(key) +
+                  " did not select exactly its own descriptor");
+    }
+    return result;
+  };
+
+  // Every variant changes only heap contents, so all of them share one module.
+  const std::vector<std::vector<Variant>> groups{
+      {{"5 of 6 keys", 5u, 6u, {}, {}},
+       {"5 of 20 keys", 5u, 20u, {}, {}},
+       {"7 of 14 keys", 7u, 14u, {}, {}},
+       {"9 of 14 keys", 9u, 14u, {}, {}},
+       {"40 of 300 keys", 40u, 300u, {}, {}},
+       {"unorm among float", 5u, 6u, {}, {2u, 4u}},
+       {"one cube early", 6u, 8u, {2u}, {}},
+       {"one cube late", 6u, 8u, {5u}, {}},
+       {"two cubes", 7u, 8u, {2u, 5u}, {}},
+       {"three cubes of 20", 20u, 40u, {3u, 7u, 11u}, {}}},
+  };
+  std::vector<std::vector<Compiled>> modules;
+  for (const auto &group : groups) {
+    auto &compiled = modules.emplace_back();
+    for (const auto &variant : group) {
+      compiled.push_back(compile(variant));
+      const char *difference = compiled.size() == 1u
+                                   ? nullptr
+                                   : FirstSpecializationDifference(
+                                         compiled.front().specialization,
+                                         compiled.back().specialization);
+      std::printf("[host]    %-32s %-20s words=%zu images=%zu same=%d first-difference=%s\n",
+                  name, variant.label, compiled.back().spirv.size(),
+                  compiled.back().snapshot.images.size(),
+                  compiled.back().spirv == compiled.front().spirv ? 1 : 0,
+                  difference != nullptr ? difference : "-");
+    }
+  }
+  for (size_t group = 0; group < groups.size(); group++) {
+    for (size_t variant = 1; variant < groups[group].size(); variant++) {
+      Require(name, groups[group][variant].label,
+              modules[group][variant].spirv == modules[group][0].spirv,
+              std::string("the module moved with the heap: ") + groups[group][variant].label +
+                  " against " + groups[group][0].label);
+    }
+  }
+  std::printf("[host]    %-32s ok\n", name);
 }
 
 // glc=1 asks for memory the rest of the device can see, which a spin on
@@ -39111,6 +39446,22 @@ TestCase DispatcherIrreducibleControlFlow() {
 }
 
 #include "ShaderRayTracingGpuTests.inc"
+// Translating the same wave64 dispatcher shader twice must emit identical bytes.
+void CheckDispatcherModuleDeterminism() {
+  constexpr const char *name = "DispatcherModuleDeterminism";
+  const auto test = DispatcherIrreducibleControlFlow();
+  // Every copy stays alive, so no two translations share addresses.
+  std::vector<CompiledShader> copies;
+  for (u32 copy = 0; copy < 8u; copy++) {
+    copies.push_back(CompileCase(test, 32u));
+  }
+  for (const auto &copy : copies) {
+    Require(name, "identical module", copy.spirv == copies[0].spirv,
+            "two translations of one dispatcher shader emitted different SPIR-V");
+  }
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 // A compute shader that traces a ray also writes everything else it computes. An a16 intersect
 // lowers to a constant miss (0xffffffff in all four result registers), and the rest of the
 // dispatch - here an ordinary value in a register the intersect never touches - still has to
@@ -39624,6 +39975,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageGatherLodPerLane<6>);
   AddCase(ImageGatherLodPerLane<7>);
   AddCase(ImageGatherLodPerLane<8>);
+  AddCase(IndirectImageTableSamples);
   AddCase(ImageD16GatherPacksHalfPairs);
   AddCase(ImageSampleA16SamplerCoordsOnGpu);
   AddCase(ImageSampleOpcodeAliasUsesNormalCoords);
@@ -42100,7 +42452,7 @@ void CheckImageSamplerSpecialization() {
               mixed_sampler_plan, {}, mixed_sampler_snapshot,
               mixed_sampler_specialization),
           "mixed sampler descriptors could not be materialized");
-  ShaderRecompiler::IR::ApplyResourceSpecialization(
+  (void)ShaderRecompiler::IR::ApplyResourceSpecialization(
       mixed_sampler_program, mixed_sampler_specialization);
   Require("ImageSamplerSpecialization", "mixed sampler variant",
           mixed_sampler_program.info.samplers.size() == 3u &&
@@ -42236,13 +42588,14 @@ void CheckImageSamplerSpecialization() {
     Require(name, "bounded native material plan",
             plan.capture_specialization_reads && !translated.program.has_address_writes &&
                 MaterializeResources(plan, runtime, snapshot, specialization) &&
-                snapshot.images.size() == count + 1u,
+                snapshot.images.size() >= count + 1u,
             "GPU-selected material descriptors did not expand beyond native root capacity");
-    const auto offset = specialization.images[0].indirect_mapping_offset;
-    const auto ordinal = [&](u32 byte_offset) {
-      const auto word = byte_offset >> 2u;
-      return word < snapshot.flattened_srt[offset]
-                 ? snapshot.flattened_srt[offset + 1u + word] : 0u;
+    const auto offset = snapshot.flattened_srt[specialization.images[0].indirect_mapping_offset];
+    const auto ordinal = [&](u32 key) {
+      for (u32 i = 0; i < snapshot.flattened_srt[offset]; ++i)
+        if (snapshot.flattened_srt[offset + 1u + 2u * i] == key)
+          return snapshot.flattened_srt[offset + 2u + 2u * i];
+      return UINT32_MAX;
     };
     Require(name, "dense table map and coherent snapshot",
             specialization.images[0].indirect_search_iterations == 0u &&
@@ -42256,7 +42609,7 @@ void CheckImageSamplerSpecialization() {
     memory[table_base / 4u + 8u] += 0x10000u;
     Require(name, "runtime descriptor refresh",
             MaterializeResources(plan, runtime, snapshot, specialization) &&
-                specialization == previous && snapshot.images[ordinal(32u)].dwords[0] == 0x11100u,
+                specialization == previous && snapshot.images[ordinal(1u)].dwords[0] == 0x11100u,
             "descriptor addresses were frozen or entered the shader specialization");
     auto compiled = ShaderRecompiler::CompileProgram(std::move(translated), options, specialization);
     ValidateSpirv(name, compiled.spirv);
@@ -46003,6 +46356,8 @@ int main(int argc, char **argv) {
     CheckIndirectImageKeySwitch(vulkan);
     CheckFiniteInlineSamplerPhi(vulkan);
     RunCase(&vulkan, ImageCubeGradientsPreserveDerivatives());
+    RunCase(&vulkan, IndirectImageTableSamples());
+    CheckIndirectImageTableSelects(&vulkan);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--readlane-key-guard-only") == 0) {
@@ -46222,6 +46577,7 @@ int main(int argc, char **argv) {
   for (const auto &test : tests) {
     RunCase(&vulkan, test);
   }
+  CheckIndirectImageTableSelects(&vulkan);
   for (const auto &test : graphics_tests) {
     RunGraphicsCase(&vulkan, test);
   }

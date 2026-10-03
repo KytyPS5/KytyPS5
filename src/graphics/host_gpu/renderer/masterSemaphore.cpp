@@ -3,7 +3,15 @@
 #include "common/assert.h"
 #include "graphics/host_gpu/graphicContext.h"
 
+#include <cinttypes>
+#include <cstdio>
+#include <vector>
+
 namespace Libs::Graphics {
+
+namespace {
+
+} // namespace
 
 MasterSemaphore::MasterSemaphore(GraphicContext& graphics): m_graphics(graphics) {
 	vk::SemaphoreTypeCreateInfo type_info {};
@@ -26,7 +34,11 @@ MasterSemaphore::~MasterSemaphore() {
 void MasterSemaphore::Refresh() {
 	uint64_t   counter = 0;
 	const auto result  = m_graphics.device.getSemaphoreCounterValue(m_semaphore, &counter);
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	if (result != vk::Result::eSuccess) {
+		const auto known_tick = m_gpu_tick.load(std::memory_order_acquire);
+		EXIT("MasterSemaphore::Refresh failed: %s (gpu tick %" PRIu64 ")\n",
+		     vk::to_string(result).c_str(), known_tick);
+	}
 
 	auto known = m_gpu_tick.load(std::memory_order_acquire);
 	while (known < counter &&
@@ -50,7 +62,13 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	wait_info.pValues        = &tick;
 
 	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	// Name the result: with an infinite timeout this cannot be eTimeout, so a failure here is a
+	// lost device or an allocation failure, and those need completely different investigations.
+	if (result != vk::Result::eSuccess) {
+		const auto known_tick = m_gpu_tick.load(std::memory_order_acquire);
+		EXIT("MasterSemaphore::Wait failed: %s (tick %" PRIu64 ", gpu tick %" PRIu64 ")\n",
+		     vk::to_string(result).c_str(), tick, known_tick);
+	}
 	Refresh();
 }
 

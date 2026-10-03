@@ -43,6 +43,7 @@ void CommandBuffer::Begin() {
 void CommandBuffer::End() const {
 	EndRendering();
 	auto buffer = Handle();
+	m_context.GetIndirectKeyFeedback().Flush(buffer);
 
 	auto result = buffer.end();
 

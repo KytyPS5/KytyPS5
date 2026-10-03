@@ -131,7 +131,37 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	const auto adjustment     = offset - aligned_offset;
 	const auto max_range      = graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange;
 	if (adjustment % sizeof(uint32_t) != 0 || adjustment >= 256 || size > max_range - adjustment) {
-		EXIT("storage buffer offset adjustment is unsupported\n");
+		// The shader packs each buffer's byte offset into 8 bits, so a base that is not dword
+		// aligned (or sits 256+ bytes past the aligned offset) cannot be expressed. Read-only
+		// data is bound from a private aligned copy in the stream ring instead: the copy is made
+		// on the GPU, so contents the GPU produced survive, and the shader sees zero adjustment.
+		if (!resource.written) {
+			auto& stream                 = context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
+			auto [mapped, stream_offset] = stream.Map(size, alignment);
+			auto& command                = context.GetCommandScheduler().Current();
+			if (mapped != nullptr && !command.IsInvalid() &&
+			    (stream_offset & (alignment - 1u)) == 0) {
+				stream.CopyFrom(command, *buffer, offset, stream_offset, size);
+				stream.Commit();
+				static std::atomic_uint realign_log_count {0};
+				if (realign_log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+					LOGF("descriptors: realigned storage buffer via stream copy: "
+					     "address=0x%016" PRIx64 " size=0x%016" PRIx64 " adjustment=0x%016" PRIx64
+					     "\n",
+					     static_cast<uint64_t>(address), static_cast<uint64_t>(size),
+					     static_cast<uint64_t>(adjustment));
+				}
+				buffer_offset = 0;
+				return {stream.Handle(), stream_offset, size};
+			}
+		}
+		EXIT("storage buffer offset adjustment is unsupported: address=0x%016" PRIx64
+		     " size=0x%016" PRIx64 " offset=0x%016" PRIx64 " alignment=0x%016" PRIx64
+		     " adjustment=0x%016" PRIx64 " max_range=0x%016" PRIx64 " written=%d formatted=%d\n",
+		     static_cast<uint64_t>(address), static_cast<uint64_t>(size),
+		     static_cast<uint64_t>(offset), static_cast<uint64_t>(alignment),
+		     static_cast<uint64_t>(adjustment), static_cast<uint64_t>(max_range),
+		     resource.written ? 1 : 0, resource.formatted ? 1 : 0);
 	}
 	buffer_offset = static_cast<uint32_t>(adjustment);
 	const vk::DescriptorBufferInfo result {buffer->Handle(), aligned_offset, size + adjustment};

@@ -714,6 +714,9 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	switch (binding) {
 		case BindingType::Texture:
 			recreate |= requested.IsDepth() && !cached.info.IsDepth();
+	// A 3D view cannot be built on a 2D image, or the reverse (the cache never arranges a
+	// compatibility flag for it), so a dimensionality mismatch always needs its own image.
+	recreate |= requested.IsVolume() != cached.info.IsVolume();
 			recreate |= raw_d16_texture;
 			break;
 		case BindingType::Storage: recreate |= cached.info.IsDepth(); break;
@@ -1294,6 +1297,11 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			}
 		}
 		if (!result) {
+			} else if (resolved.info.IsVolume() != desc.info.IsVolume()) {
+				// Reusing a 2D image for a 3D view (or the reverse) builds an incompatible view,
+				// so drop it and insert a fresh image sized for the requested dimensionality.
+				FreeImage(result);
+				result = {};
 			result         = InsertImage(desc.info);
 			auto& inserted = m_slot_images[result];
 			if (m_buffer_cache.HasGpuDirtyBytes(inserted.info.data.address,

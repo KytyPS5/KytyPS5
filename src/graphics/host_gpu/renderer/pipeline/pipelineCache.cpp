@@ -618,8 +618,10 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		           std::all_of(std::begin(pixel_info.target_output_mode) + 1,
 		                       std::end(pixel_info.target_output_mode),
 		                       [](uint8_t mode) { return mode == 0; }) &&
-		           ClassifyBlendMapping(blend, pixel_info.target_export_mapping[0]) ==
-		               BlendMappingSupport::SourceAlpha) {
+		           ClassifyBlendMapping(blend, pixel_info.target_export_mapping[0]) !=
+		               BlendMappingSupport::Direct &&
+		           ClassifyBlendMapping(blend, pixel_info.target_export_mapping[0]) !=
+		               BlendMappingSupport::Unsupported) {
 			// Preserve logical alpha when the export mapping moves it.
 			pixel_info.alpha_blend_source_remap = true;
 			pixel_info.dual_source_blending     = true;
@@ -730,8 +732,14 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 		const bool alpha_remap =
 		    slot == 0 && ps_input_info != nullptr && ps_input_info->alpha_blend_source_remap;
 		static_params.blend_enable[slot] = bc.enable && !rt.info.blend_bypass;
-		if (static_params.blend_enable[slot] && !alpha_remap &&
-		    ClassifyBlendMapping(bc, colors[i].export_mapping) != BlendMappingSupport::Direct) {
+		// A permuted export mapping leaves the shader's alpha in a known component, so the blend
+		// can be expressed: put that component in the second blend source and let the alpha slot
+		// read it. Vulkan's SrcAlpha is bound to the alpha byte, so without this the equation is
+		// either wrong or switched off entirely and the draw loses its compositing.
+		const auto mapping_support = ClassifyBlendMapping(bc, colors[i].export_mapping);
+		const bool second_alpha    = mapping_support == BlendMappingSupport::PermutedSourceAlpha;
+		if (static_params.blend_enable[slot] && !alpha_remap && !second_alpha &&
+		    mapping_support != BlendMappingSupport::Direct) {
 			static_params.blend_enable[slot] = false;
 			static std::atomic_bool warned = false;
 			if (!warned.exchange(true, std::memory_order_relaxed)) {
@@ -742,7 +750,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 				    bc.alpha_srcblend, bc.alpha_destblend, bc.separate_alpha_blend ? 1 : 0));
 			}
 		}
-		if (alpha_remap) {
+		if (alpha_remap || second_alpha) {
 			static_params.blend_alpha_source_remap = true;
 		}
 		if (static_params.blend_enable[slot]) {

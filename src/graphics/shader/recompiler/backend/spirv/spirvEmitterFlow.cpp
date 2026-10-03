@@ -645,20 +645,20 @@ uint32_t EmitConditionRef(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (kind == CFG::BranchCondition::ScalarInstruction ||
 	    (split_compute && (kind == CFG::BranchCondition::SccZero ||
 	                       kind == CFG::BranchCondition::SccNonZero))) return ctx.Arg(inst, 0);
-	const auto ballot = ctx.Ballot(inst.Arg(0));
+	const bool zero = kind == CFG::BranchCondition::ExecZero ||
+	                  kind == CFG::BranchCondition::VccZero || kind == CFG::BranchCondition::SccZero;
+	// Inactive lanes do not vote. A zero branch holds when no active lane fails,
+	// not when every physical lane contributes a one to the ballot.
+	const auto ballot = ctx.Ballot(inst.Arg(0), zero);
 	const auto low = ctx.state.builder.AllocateId();
 	const auto high = ctx.state.builder.AllocateId();
 	const auto combined = ctx.state.builder.AllocateId();
 	const auto result = ctx.state.builder.AllocateId();
 	ctx.state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(ctx.state), low, ballot, 0);
 	ctx.state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(ctx.state), high, ballot, 1);
-	const bool zero = kind == CFG::BranchCondition::ExecZero ||
-	                  kind == CFG::BranchCondition::VccZero || kind == CFG::BranchCondition::SccZero;
-	ctx.state.builder.AddFunction(zero ? spv::OpBitwiseAnd : spv::OpBitwiseOr,
-	                              TypeU32(ctx.state), combined, low, high);
+	ctx.state.builder.AddFunction(spv::OpBitwiseOr, TypeU32(ctx.state), combined, low, high);
 	ctx.state.builder.AddFunction(zero ? spv::OpIEqual : spv::OpINotEqual,
-	                              TypeBool(ctx.state), result, combined,
-	                              ConstantU32(ctx.state, zero ? ~0u : 0u));
+	                              TypeBool(ctx.state), result, combined, ConstantU32(ctx.state, 0u));
 	return result;
 }
 

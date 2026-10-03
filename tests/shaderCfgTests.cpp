@@ -18208,6 +18208,53 @@ void TestRepeatedExportsHaveOneInterface() {
         "repeated exports duplicated Position or its clipping-error plane");
 }
 
+void TestZeroBranchBallotIgnoresInactiveLanes() {
+  const uint32_t execz[] = {
+      EncodeSMovB32(0, 128),
+      EncodeSop2(0x00, 0, 0, 129),
+      EncodeSopp(0x08, 0xfffeu),
+      EncodeSopp(0x01),
+  };
+  const uint32_t execnz[] = {
+      EncodeSMovB32(0, 128),
+      EncodeSop2(0x00, 0, 0, 129),
+      EncodeSopp(0x09, 0xfffeu),
+      EncodeSopp(0x01),
+  };
+  ShaderComputeInputInfo compute{};
+  compute.host_subgroup_size = 32;
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.input_info.compute = &compute;
+  options.wave_size = 64;
+  const auto zero = RecompileForTest(execz, options);
+  const auto nonzero = RecompileForTest(execnz, options);
+  CheckSpirvBinaryValidates(zero.spirv);
+  CheckSpirvBinaryValidates(nonzero.spirv);
+  const auto compares_with_all_ones = [](const std::vector<uint32_t> &binary) {
+    std::unordered_set<uint32_t> all_ones_constants;
+    for (size_t at = 5; at < binary.size();) {
+      const auto count = binary[at] >> 16u;
+      const auto opcode = binary[at] & 0xffffu;
+      Check(count != 0 && at + count <= binary.size(),
+            "zero-branch test received malformed SPIR-V");
+      if (opcode == spv::OpConstant && count == 4u && binary[at + 3u] == ~0u)
+        all_ones_constants.insert(binary[at + 2u]);
+      at += count;
+    }
+    for (size_t at = 5; at < binary.size();) {
+      const auto count = binary[at] >> 16u;
+      const auto opcode = binary[at] & 0xffffu;
+      if (opcode == spv::OpIEqual && count == 5u &&
+          (all_ones_constants.contains(binary[at + 3u]) ||
+           all_ones_constants.contains(binary[at + 4u]))) return true;
+      at += count;
+    }
+    return false;
+  };
+  Check(!compares_with_all_ones(zero.spirv),
+        "ExecZero required inactive lanes to vote as all ones");
+}
+
 void TestNewShaderRecompilerSpirvSizeBaselines() {
   const auto compile = [](const char *name, std::span<const uint32_t> shader,
                           const SpirvMetrics &budget,
@@ -18556,6 +18603,12 @@ int RunShaderBatchAudit(int argc, char* argv[]);
 
 
 int main(int argc, char* argv[]) {
+  if (argc == 2 && std::strcmp(argv[1], "--zero-branch-ballot-only") == 0) {
+    Libs::Graphics::EnsureConfigInitialized();
+    Libs::Graphics::TestZeroBranchBallotIgnoresInactiveLanes();
+    std::puts("KYTY_ZERO_BRANCH_BALLOT_PASS");
+    return 0;
+  }
   if (argc == 3 &&
       (std::strcmp(argv[1], "--spirv-optimize-file") == 0 ||
        std::strcmp(argv[1], "--spirv-optimize-cooperative-file") == 0)) {

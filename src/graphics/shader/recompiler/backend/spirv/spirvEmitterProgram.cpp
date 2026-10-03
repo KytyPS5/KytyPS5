@@ -821,22 +821,29 @@ uint32_t ValueEmitContext::HalfArg(const IR::Inst& inst, size_t index, uint32_t 
 	return lane_half == half ? Arg(inst, index) : other_half->Arg(inst, index);
 }
 
-uint32_t ValueEmitContext::Ballot(IR::Value predicate) {
+uint32_t ValueEmitContext::Ballot(IR::Value predicate, bool negate) {
+	const auto voted_value = [&](uint32_t value) {
+		if (!negate) return value;
+		const auto inverted = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLogicalNot, TypeBool(state), inverted, value);
+		return inverted;
+	};
 	if (state.compute_execution.IsSplitWave64() || other_half == nullptr) {
-		return EmitWaveBallot(state, Def(predicate));
+		return EmitWaveBallot(state, voted_value(Def(predicate)));
 	}
 	const auto ballot_type = TypeU32Vector(state, 4);
 	const auto scope       = ConstantU32(state, spv::ScopeSubgroup);
 	const auto low         = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpGroupNonUniformBallot, ballot_type, low, scope,
-	                          other_half == nullptr || half == 0 ? Def(predicate)
-	                                                             : other_half->Def(predicate));
+	                          voted_value(half == 0 ? Def(predicate)
+	                                                : other_half->Def(predicate)));
 	const auto high      = state.builder.AllocateId();
 	const auto low_word  = state.builder.AllocateId();
 	const auto high_word = state.builder.AllocateId();
 	const auto ballot    = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpGroupNonUniformBallot, ballot_type, high, scope,
-	                          half == 1 ? Def(predicate) : other_half->Def(predicate));
+	                          voted_value(half == 1 ? Def(predicate)
+	                                                : other_half->Def(predicate)));
 	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), low_word, low, 0);
 	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), high_word, high, 0);
 	state.builder.AddFunction(spv::OpCompositeConstruct, ballot_type, ballot, low_word, high_word,

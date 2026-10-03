@@ -5,6 +5,9 @@
 #include "configurationListWidget.h"
 #include "controllerLightbar.h"
 #include "gameContent.h"
+#if defined(__linux__)
+#include "linuxRunScript.h"
+#endif
 #include "patchesDialog.h"
 #include "updateChecker.h"
 
@@ -15,7 +18,6 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
-#include <QIODevice>
 #include <QLabel>
 #include <QMessageBox>
 #include <QObject>
@@ -25,7 +27,6 @@
 #include <QRegularExpression>
 #include <QSettings>
 #include <QStringList>
-#include <QTextStream>
 #include <QVariant>
 #include <QtCore>
 
@@ -51,8 +52,6 @@ constexpr char EMULATOR_EXE[] = "kyty_emulator";
 
 #if defined(_WIN32)
 constexpr char CMD_EXE[] = "cmd.exe";
-#elif defined(__linux__)
-constexpr char KYTY_BASH_FILE[] = "kyty_run.sh";
 #endif
 #if defined(_WIN32)
 constexpr DWORD CMD_X_CHARS = 175;
@@ -286,95 +285,6 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	return args;
 }
 
-#ifdef __linux__
-static QString BashQuote(QString value) {
-	value.replace('\'', "'\\''");
-	return QStringLiteral("'") + value + QStringLiteral("'");
-}
-
-static bool CreateBashScript(const QString& interpreter, const QStringList& args,
-                             const QString& file_name) {
-	QFile file(file_name);
-	if (file.open(QIODevice::WriteOnly | QIODevice::Text)) {
-		QTextStream s(&file);
-
-		s << "#!/bin/bash\n";
-		s << BashQuote(interpreter);
-		for (const auto& arg: args) {
-			s << " " << BashQuote(arg);
-		}
-		s << "\n";
-		s << "echo Press any key...\n";
-		s << "read -n1\n";
-
-		file.close();
-
-		return file.setPermissions(file.permissions() | QFile::ExeUser | QFile::ExeOwner |
-		                           QFile::ExeGroup);
-	}
-	return false;
-}
-
-// Find a terminal and its command separator.
-static bool FindTerminal(QString* program, QStringList* prefix) {
-	struct TerminalSpec {
-		const char* executable;
-		const char* separator; // nullptr when the command follows immediately
-	};
-
-	static const TerminalSpec candidates[] = {
-	    {"x-terminal-emulator", "-e"},
-	    {"gnome-terminal", "--"},
-	    {"konsole", "-e"},
-	    {"xfce4-terminal", "-x"},
-	    {"mate-terminal", "--"},
-	    {"tilix", "-e"},
-	    {"alacritty", "-e"},
-	    {"kitty", nullptr},
-	    {"foot", nullptr},
-	    {"wezterm", "-e"},
-	    {"urxvt", "-e"},
-	    {"xterm", "-e"},
-	};
-
-	const auto try_candidate = [program, prefix](const QString& executable, const char* separator) {
-		const auto resolved = QStandardPaths::findExecutable(executable);
-		if (resolved.isEmpty()) {
-			return false;
-		}
-		*program = resolved;
-		prefix->clear();
-		if (separator != nullptr) {
-			*prefix << QString::fromLatin1(separator);
-		}
-		return true;
-	};
-
-	if (const auto from_env = qEnvironmentVariable("TERMINAL"); !from_env.isEmpty()) {
-		// Reuse the known separator for an explicit terminal.
-		const auto  env_name  = QFileInfo(from_env).fileName();
-		const char* separator = "-e";
-		for (const auto& candidate: candidates) {
-			if (env_name == QLatin1String(candidate.executable)) {
-				separator = candidate.separator;
-				break;
-			}
-		}
-		if (try_candidate(from_env, separator)) {
-			return true;
-		}
-	}
-
-	for (const auto& candidate: candidates) {
-		if (try_candidate(QString::fromLatin1(candidate.executable), candidate.separator)) {
-			return true;
-		}
-	}
-
-	return false;
-}
-#endif
-
 #if defined(_WIN32)
 // Quote one token for cmd.exe so paths with spaces survive /K parsing.
 static QString WinCmdQuote(QString value) {
@@ -406,25 +316,11 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
 	}
 
 #ifdef __linux__
-	auto bash_file_name = dir.filePath(KYTY_BASH_FILE);
-	if (!CreateBashScript(interpreter, args, bash_file_name)) {
-		QMessageBox::critical(this, tr("Error"), tr("Can't create file:\n") + bash_file_name);
+	QString bash_file_name;
+	if (!LinuxRunScript::Prepare(process, interpreter, args, &bash_file_name)) {
+		QMessageBox::critical(this, tr("Error"), tr("Can't create temporary launcher script"));
 		QApplication::quit();
 		return;
-	}
-
-	{
-		QString     terminal;
-		QStringList terminal_prefix;
-		// Pass the script as a file argument (not bash -c) so paths with spaces work.
-		if (FindTerminal(&terminal, &terminal_prefix)) {
-			process->setProgram(terminal);
-			process->setArguments(terminal_prefix + QStringList {"bash", bash_file_name});
-		} else {
-			// Run without a terminal as a fallback.
-			process->setProgram(QStringLiteral("bash"));
-			process->setArguments({bash_file_name});
-		}
 	}
 #elif defined(_WIN32)
 	{
@@ -456,6 +352,11 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info) {
 #if !defined(_WIN32)
 	// Report immediate launch failures.
 	if (!process->waitForStarted(5000)) {
+#if defined(__linux__)
+		if (process->error() == QProcess::FailedToStart) {
+			QFile::remove(bash_file_name);
+		}
+#endif
 		QMessageBox::critical(
 		    this, tr("Error"),
 		    tr("Failed to start:\n%1\n\n%2").arg(process->program(), process->errorString()));

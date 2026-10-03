@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <LangVersion>14.0</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <NoWarn>$(NoWarn);CS1591</NoWarn>
+    <ProsperoSource Condition="'$(ProsperoSource)' == ''">$(MSBuildProjectDirectory)/../vendor/LibProsperoPKG</ProsperoSource>
+  </PropertyGroup>
+  <!-- Compile upstream source WITHOUT its signing keys or embedded right.sprx.
+       This reader supports the diagnostic plaintext/no-auth profile only.
+       This helper is a separate process; preserve all upstream GPL/AGPL notices. -->
+  <ItemGroup>
+    <Compile Include="$(ProsperoSource)/src/LibProsperoPkg/**/*.cs"
+             Exclude="$(ProsperoSource)/src/LibProsperoPkg/obj/**/*.cs;$(ProsperoSource)/src/LibProsperoPkg/bin/**/*.cs" />
+  </ItemGroup>
+  <Target Name="CheckSource" BeforeTargets="BeforeBuild">
+    <Error Condition="!Exists('$(ProsperoSource)/src/LibProsperoPkg/PKG/ProsperoPackageExtractor.cs')"
+           Text="Run python setup.py first to fetch the pinned LibProsperoPKG source." />
+  </Target>
+</Project>

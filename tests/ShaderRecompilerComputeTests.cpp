@@ -51,6 +51,7 @@
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
 #include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
@@ -15490,6 +15491,127 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  void CheckStencilPlaneEqualFootprint() {
+    constexpr const char *name = "StencilPlaneEqualFootprint";
+    constexpr uintptr_t base = 0x0000000209400000ull;
+    constexpr uint64_t allocation_size = 0x400000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t plane_size = 0x10000;
+    constexpr vk::Extent3D extent{64, 64, 1};
+    EnsureRuntimeContext();
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "stencil plane direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "stencil plane fixed mapping failed");
+    std::memset(mapped, 0, allocation_size);
+
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      context.InitializeGpu(nullptr);
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(base, allocation_size);
+      auto &texture_cache = context.GetTextureCache();
+
+      const auto make_desc = [&](uint64_t address, uint64_t size, vk::Format format,
+                                 Prospero::BufferFormat guest_format,
+                                 uint32_t bytes_per_block) {
+        TextureCache::ImageDesc desc{};
+        desc.type = TextureCache::BindingType::Texture;
+        desc.info.data = {address, size};
+        desc.info.pixel_format = format;
+        desc.info.guest_format = guest_format;
+        desc.info.type = Prospero::ImageType::kColor2D;
+        desc.info.extent = extent;
+        desc.info.resources = {1, 1};
+        desc.info.pitch = extent.width;
+        desc.info.bytes_per_block = bytes_per_block;
+        desc.info.samples = 1;
+        desc.info.tile_mode = Prospero::TileMode::kLinear;
+        desc.info.mip_layout[0] = {0, size, extent.width, extent.height};
+        desc.view_info.format = format;
+        desc.view_info.type = vk::ImageViewType::e2D;
+        desc.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+        desc.view_info.layer_count = 1;
+        desc.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+        return desc;
+      };
+      const auto render_depth = [&](uint64_t depth_address, uint64_t stencil_address) {
+        auto depth = make_desc(depth_address, plane_size * 4, vk::Format::eD32SfloatS8Uint,
+                               Prospero::BufferFormat::k32Float, 4);
+        depth.type = TextureCache::BindingType::DepthTarget;
+        depth.info.stencil = {stencil_address, plane_size};
+        depth.view_info.aspect =
+            vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
+        depth.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+        const auto depth_image = texture_cache.FindImage(depth);
+        Require(name, "depth acquisition",
+                texture_cache.FindDepthTarget(depth_image, depth) != nullptr,
+                "the depth target produced no view");
+        return depth_image;
+      };
+      const auto plane = [&](uint64_t stencil_address) {
+        return make_desc(stencil_address, plane_size, vk::Format::eR8Uint,
+                         Prospero::BufferFormat::k8UInt, 1);
+      };
+
+      const auto depth_image = render_depth(base, base + 0x100000);
+      auto first_read = plane(base + 0x100000);
+      const auto first = texture_cache.FindImage(first_read);
+      Require(name, "first equal-footprint stencil read",
+              texture_cache.GetImage(first).depth_id == depth_image,
+              "an equal-footprint stencil sample created an R8 image from guest bytes instead "
+              "of reading the rendered depth target");
+
+      const auto attached_depth = render_depth(base + 0x180000, base + 0x1c0000);
+      texture_cache.GetImage(attached_depth).binding.is_target = true;
+      auto attached_read = plane(base + 0x1c0000);
+      const auto attached = texture_cache.FindImage(attached_read);
+      Require(name, "attached depth keeps the ordinary lookup",
+              !texture_cache.GetImage(attached).depth_id,
+              "a stencil sample in a draw that has the depth target attached was redirected "
+              "into a feedback loop");
+      texture_cache.GetImage(attached_depth).binding = {};
+
+      const auto later_depth = render_depth(base + 0x200000, base + 0x300000);
+      auto storage = plane(base + 0x300000);
+      const auto storage_image = texture_cache.FindImage(storage);
+      texture_cache.MarkGpuWritten(storage_image);
+      auto later_read = plane(base + 0x300000);
+      const auto later = texture_cache.FindImage(later_read);
+      Require(name, "newer colour write kept",
+              later == storage_image && !texture_cache.GetImage(later).depth_id &&
+                  later_depth != storage_image,
+              "an R8 surface written after the depth target lost its read to the depth "
+              "owner");
+
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+      context.ShutdownGpu();
+    }
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "stencil plane direct mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "stencil plane direct-memory allocation release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   void CheckRenderExecutorStencilBindingDiscovery() {
     constexpr const char *name = "RenderExecutorStencilBindingDiscovery";
     constexpr uintptr_t base = 0x0000000203600000ull;
@@ -19045,7 +19167,7 @@ public:
     view_info.image = ret.image;
     view_info.viewType = view_type;
     view_info.format = view_format == vk::Format::eUndefined ? format : view_format;
-    view_info.subresourceRange.aspectMask = vk::ImageAspectFlagBits::eColor;
+    view_info.subresourceRange.aspectMask = ImageAspectFor(format);
     Require(shader_name, "dispatch", view_base_mip < ret.mip_levels,
             "image view base mip is out of bounds");
     view_info.subresourceRange.baseMipLevel = view_base_mip;
@@ -19145,8 +19267,11 @@ public:
   }
 
   vk::Sampler CreateSampler(const char *shader_name, u32 mip_levels = 1,
-                            vk::Filter filter = vk::Filter::eNearest) {
+                            vk::Filter filter = vk::Filter::eNearest,
+                            std::optional<vk::CompareOp> compare = std::nullopt) {
     vk::SamplerCreateInfo sampler_info{};
+    sampler_info.compareEnable = compare.has_value();
+    sampler_info.compareOp = compare.value_or(vk::CompareOp::eNever);
     sampler_info.sType = vk::StructureType::eSamplerCreateInfo;
     sampler_info.magFilter = filter;
     sampler_info.minFilter = filter;
@@ -23534,12 +23659,20 @@ private:
     m_device.freeCommandBuffers(m_command_pool, 1, &cmd);
   }
 
+  // A depth image is uploaded and viewed through its depth aspect.
+  static vk::ImageAspectFlags ImageAspectFor(vk::Format format) {
+    return format == vk::Format::eD16Unorm || format == vk::Format::eD32Sfloat
+               ? vk::ImageAspectFlagBits::eDepth
+               : vk::ImageAspectFlagBits::eColor;
+  }
+
   void AddImageBarrier(vk::CommandBuffer cmd, vk::Image image,
                        vk::ImageLayout old_layout, vk::ImageLayout new_layout,
                        vk::PipelineStageFlags src_stage,
                        vk::PipelineStageFlags dst_stage,
                        vk::AccessFlags src_access, vk::AccessFlags dst_access,
-                       u32 mip_levels = 1, u32 layers = 1) {
+                       u32 mip_levels = 1, u32 layers = 1,
+                       vk::ImageAspectFlags aspect = vk::ImageAspectFlagBits::eColor) {
     vk::ImageMemoryBarrier barrier{};
     barrier.sType = vk::StructureType::eImageMemoryBarrier;
     barrier.srcAccessMask = src_access;
@@ -23549,7 +23682,7 @@ private:
     barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.image = image;
-    barrier.subresourceRange.aspectMask = vk::ImageAspectFlagBits::eColor;
+    barrier.subresourceRange.aspectMask = aspect;
     barrier.subresourceRange.baseMipLevel = 0;
     barrier.subresourceRange.levelCount = mip_levels;
     barrier.subresourceRange.baseArrayLayer = 0;
@@ -23579,19 +23712,20 @@ private:
   void UploadImageMips(const char *shader_name, Image *image,
                        vk::Buffer staging, vk::ImageLayout final_layout) {
     vk::CommandBuffer cmd = BeginCommands(shader_name, "dispatch");
+    const auto aspect = ImageAspectFor(image->format);
     AddImageBarrier(cmd, image->image, vk::ImageLayout::eUndefined,
                     vk::ImageLayout::eTransferDstOptimal,
                     vk::PipelineStageFlagBits::eTopOfPipe,
                     vk::PipelineStageFlagBits::eTransfer, {},
                     vk::AccessFlagBits::eTransferWrite, image->mip_levels,
-                    image->layers);
+                    image->layers, aspect);
     std::vector<vk::BufferImageCopy> copies;
     copies.reserve(image->mip_levels);
     vk::DeviceSize offset = 0;
     for (u32 level = 0; level < image->mip_levels; level++) {
       vk::BufferImageCopy copy{};
       copy.bufferOffset = offset;
-      copy.imageSubresource.aspectMask = vk::ImageAspectFlagBits::eColor;
+      copy.imageSubresource.aspectMask = aspect;
       copy.imageSubresource.mipLevel = level;
       copy.imageSubresource.baseArrayLayer = 0;
       copy.imageSubresource.layerCount = image->layers;
@@ -23612,7 +23746,7 @@ private:
                     vk::PipelineStageFlagBits::eComputeShader,
                     vk::AccessFlagBits::eTransferWrite,
                     AccessForLayout(final_layout), image->mip_levels,
-                    image->layers);
+                    image->layers, aspect);
     EndSubmitAndFree(shader_name, "dispatch", cmd);
     image->layout = final_layout;
   }
@@ -40793,6 +40927,81 @@ TestCase ImageLoad1DArrayDescriptorUsesSelectedLayer() {
   return test;
 }
 
+void CheckNull1DImageBindings(VulkanHarness *vulkan) {
+  constexpr const char *name = "Null1DImageBindings";
+  using ShaderRecompiler::Decoder::ImageDimension;
+  struct Case {
+    TestCase test;
+    ImageDimension dimension;
+    vk::ImageViewType view;
+  };
+  const std::array cases{
+      Case{ImageLoad1DUsesScalarCoordinate(), ImageDimension::Dim1D, vk::ImageViewType::e1D},
+      Case{ImageLoad1DArrayUsesLayerCoordinate(), ImageDimension::Dim1DArray,
+           vk::ImageViewType::e1DArray},
+  };
+  for (const auto &entry : cases) {
+    const auto compiled = CompileCase(entry.test, vulkan->SubgroupSize());
+    Require(name, entry.test.name,
+            compiled.program.info.images.size() == 1u &&
+                compiled.program.info.images[0].dimension == entry.dimension,
+            "the module did not declare the expected 1D image");
+
+    RenderContext context(vulkan->RuntimeContext());
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    context.InitializeGpu(nullptr);
+    scheduler.Begin(registers, user_config, shaders);
+    auto &executor = context.GetRenderExecutor();
+
+    ShaderRecompiler::IR::Program program{};
+    program.stage = ShaderType::Compute;
+    program.resource_tracking_complete = true;
+    program.info.images.push_back(compiled.program.info.images[0]);
+    program.info.images[0].source = 0;
+    program.shader_info_complete = true;
+    ShaderRecompiler::IR::CompiledShaderInfo info{};
+    info.stage = program.stage;
+    info.info = std::move(program.info);
+    info.bindings = std::move(program.bindings);
+    ShaderRecompiler::IR::ResourceSnapshot snapshot{};
+    ShaderRecompiler::IR::DescriptorValue null_descriptor{};
+    null_descriptor.dword_count = 8;
+    snapshot.images.push_back(null_descriptor);
+    ShaderStageRuntime runtime{&info, &snapshot};
+    PreparedBindings prepared;
+    executor.PrepareBindings(runtime, prepared);
+    executor.RebindImages(prepared);
+    Require(name, entry.test.name, prepared.images.size() == 1u,
+            "the null image was not bound");
+    const auto pipeline =
+        RenderExecutorTestAccess::CommitBindings(executor, scheduler.Current(), prepared);
+    scheduler.Finish();
+    const auto &binding = prepared.images[0];
+
+    VulkanHarness::Image view{};
+    view.view = binding.image_view;
+    view.layout = binding.layout;
+    view.format = binding.desc.view_info.format;
+    auto memory = std::vector<u32>(4, 0x12345678u);
+    auto buffer = vulkan->CreateStorageBuffer(name, memory, memory.size());
+    vulkan->Dispatch(entry.test, compiled, buffer, nullptr, &view);
+    const auto actual = vulkan->ReadBuffer(name, buffer, 1);
+    vulkan->DestroyBuffer(&buffer);
+
+    Require(name, entry.test.name,
+            !binding.image_id && binding.desc.info.data.Empty(),
+            "the null 1D binding was given an image instead of the native null descriptor");
+    Require(name, entry.test.name, actual[0] == 0u,
+            "the null 1D image did not read zero: " + std::to_string(actual[0]));
+    RenderExecutorTestAccess::DestroyDescriptorPipelines(executor, std::span{&pipeline, 1u});
+    context.ShutdownGpu();
+  }
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 TestCase ImageLoadMipUsesVaddr2Lod2D() {
   using O = ShaderOpcode;
 
@@ -52909,6 +53118,11 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, ImageAtomicSignedMinMax<true>());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--null-1d-image-only") == 0) {
+    VulkanHarness vulkan;
+    CheckNull1DImageBindings(&vulkan);
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--s-memrealtime-only") == 0) {
     VulkanHarness vulkan;
     for (const auto &test : ScalarMemRealtimeCases()) {
@@ -53854,6 +54068,7 @@ int main(int argc, char **argv) {
     CheckFiniteFirstLaneImageChoice(vulkan);
     CheckFiniteInlineSamplerPhi(vulkan);
     RunCase(&vulkan, ImageCubeGradientsPreserveDerivatives());
+    CheckNull1DImageBindings(&vulkan);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--readlane-key-guard-only") == 0) {
@@ -54077,6 +54292,7 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorColorStandardTileDiscovery();
     vulkan.CheckRenderExecutorColorDepthTileDiscovery();
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
+    vulkan.CheckStencilPlaneEqualFootprint();
     vulkan.CheckRenderExecutorStencilAliasRediscovery();
     vulkan.CheckBgra16Readback();
     vulkan.CheckLargeImageReadback();
@@ -54094,6 +54310,7 @@ int main(int argc, char **argv) {
   for (const auto &test : tests) {
     RunCase(&vulkan, test);
   }
+  CheckNull1DImageBindings(&vulkan);
   for (const auto &test : graphics_tests) {
     RunGraphicsCase(&vulkan, test);
   }

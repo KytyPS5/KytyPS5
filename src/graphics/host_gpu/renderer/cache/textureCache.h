@@ -72,6 +72,9 @@ public:
 
 	// Called once per presented frame; image staleness is judged against it, not submissions.
 	void AdvanceFrame() noexcept { m_frame_index.fetch_add(1, std::memory_order_relaxed); }
+	[[nodiscard]] uint64_t FrameIndex() const noexcept {
+		return m_frame_index.load(std::memory_order_relaxed);
+	}
 
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);

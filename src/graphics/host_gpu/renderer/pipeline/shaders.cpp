@@ -191,7 +191,6 @@ static void AddLayoutBindings(std::vector<vk::DescriptorSetLayoutBinding>& descr
 	}
 }
 
-                                   std::span<const vk::DescriptorSetLayoutBinding> bindings) {
 // maxDescriptorSet* bounds the whole pipeline layout, not one set of it.
 static void CheckDescriptorLayoutLimits(GraphicContext&                                 graphics,
                                         std::span<const vk::DescriptorSetLayoutBinding> bindings) {
@@ -278,6 +277,7 @@ CreateOneDescriptorLayout(GraphicContext& graphics, bool push_descriptors,
 static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                                    std::span<const vk::DescriptorSetLayoutBinding> bindings) {
 	CheckDescriptorLayoutLimits(graphics, bindings);
+	pipeline.uses_push_descriptors = DescriptorCount(bindings) <= graphics.max_push_descriptors;
 	pipeline.descriptor_set_layout =
 	    CreateOneDescriptorLayout(graphics, pipeline.uses_push_descriptors, bindings);
 }
@@ -310,6 +310,10 @@ static GraphicsSetLayoutList GraphicsSetLayouts(const GraphicContext&   graphics
 	return list;
 }
 
+static void
+CreateGraphicsDescriptorLayouts(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                                std::span<const vk::DescriptorSetLayoutBinding> vertex_bindings,
+                                std::span<const vk::DescriptorSetLayoutBinding> pixel_bindings,
                                 bool                                            has_pixel_stage) {
 	EXIT_IF(graphics.GetPhysicalDeviceProperties().limits.maxBoundDescriptorSets <
 	        ShaderRecompiler::IR::NativeDescriptorSetCount);

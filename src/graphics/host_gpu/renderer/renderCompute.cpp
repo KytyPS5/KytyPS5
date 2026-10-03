@@ -469,6 +469,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (program.info.uses_dma) {
 		m_context.PrepareBda(program.info.writes_dma);
 	}
+	if (program.info.uses_image_heap) {
+		m_context.GetImageHeap().Rebind(*this);
+	}
 	RebindImages(bindings);
 	BindSharedMemory(m_context, input_info, bindings);
 	RebindBuffers(bindings);

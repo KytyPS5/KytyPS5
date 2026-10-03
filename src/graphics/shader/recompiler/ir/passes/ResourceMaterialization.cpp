@@ -81,6 +81,8 @@ private:
 	void Record(uint64_t address, uint64_t bytes, bool condition = false) {
 		m_ranges.emplace_back(address, bytes);
 		m_slots.push_back(CurrentSrtReadSlot());
+		// Heap tables join the reads without a condition (AddHeapRead).
+		m_conditions.resize(m_ranges.size() - 1u, 0u);
 		m_conditions.push_back(condition ? 1u : 0u);
 	}
 
@@ -822,7 +824,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 				    image.mip_mode != ImageMipMode::Dynamic &&
 				    runtime.image_heap->Acquire({table_base, table_size, step, first, count, &image},
 				                                view)) {
-					snapshot.specialization_reads.emplace_back(table_base, table_size);
+					snapshot.AddHeapRead(table_base, table_size);
 					if (view.kinds.empty()) return true;
 					auto root = root_resource;
 					root.indirect_root = resource_index;
@@ -1714,11 +1716,8 @@ std::string_view LastMaterializeFailure() {
 
 		}
 	}
-	snapshot.uniform_fill = {};
-	const auto& fill = program.uniform_fill;
 	auto words = fill.fill.words;
 	std::array<uint32_t, 4> stored {};
-	bool uniform_fill = words != 0;
 	if (uniform_fill && !fill.pattern_size.IsEmpty())
 		uniform_fill = clean.Evaluate(fill.pattern_size, words) && words >= 1 && words <= 4;
 	uint32_t elements = 0;
@@ -1728,7 +1727,6 @@ std::string_view LastMaterializeFailure() {
 		uniform_fill = clean.Evaluate(fill.values[i], stored[i]) && stored[i] == stored[0];
 	}
 	if (uniform_fill) {
-		snapshot.uniform_fill = fill.fill;
 		snapshot.uniform_fill.value = stored[0];
 		snapshot.uniform_fill.bounded_elements = elements;
 	}
@@ -1740,7 +1738,6 @@ std::string_view LastMaterializeFailure() {
 			return (capture_reads && written ? clean : walker).EvaluateDescriptor(source, value) ||
 			    SpecializationFail(fmt::format("descriptor evaluation source={}", source));
 		}
-		value = {};
 
 static bool SpecializeBuffers(const ResourcePlan& program, ResourceSnapshot& snapshot,
                               ResourceSpecialization& specialization) {
@@ -1834,11 +1831,16 @@ static bool MaterializeInto(const ResourcePlan& program, const SrtRuntime& runti
 			break;
 		}
 	}
+	snapshot.uniform_fill = {};
+	const auto& fill = program.uniform_fill;
+	auto words = fill.fill.words;
+	bool uniform_fill = words != 0;
 			return SpecializationFail(fmt::format("descriptor source {} is missing", source));
 			auto& evaluator = capture_reads && written ? clean : walker;
 			return evaluator.EvaluateDescriptor(source, value) ||
 			       SpecializationFail(fmt::format("descriptor evaluation source={}: {}", source,
 			                                      SrtRefusalName(evaluator.Refusal())));
+		value = {};
 		return MaterializeFailure().empty() ? SpecializationFail(fmt::format(
 		                                          "indirect {} resource={} source={} candidates={}",
 		                                          kind, resource, source, candidates))
@@ -1915,8 +1917,6 @@ static bool MaterializeInto(const ResourcePlan& program, const SrtRuntime& runti
 				if (!evaluate(source, snapshot.samplers[i])) return false;
 			}
 		}
-			const auto filter = (control >> 26u) & 3u;
-				return SpecializationFail(
 		if (program.info.samplers[base_index].gather_lod &&
 		    !ValidGatherLodSampler(snapshot.samplers[i])) {
 			return SpecializationFail("explicit-LOD gather requires None, unbiased Point, or "
@@ -1924,6 +1924,7 @@ static bool MaterializeInto(const ResourcePlan& program, const SrtRuntime& runti
 		}
 	}
 	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
+	conditions.resize(snapshot.specialization_reads.size(), 0u);
 	return BuildResourceSpecialization(program, snapshot, specialization);
 }
 
@@ -1977,6 +1978,24 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	return true;
 }
 
+	    snapshot.images.size() < program.info.images.size() ||
+	    specialization.images.size() != snapshot.images.size() ||
+		// Indirect tables are not replayed; a heap root keeps its kinds, which its replay acquires.
+		const bool indirect = source->indirect_descriptor.has_value();
+		const bool heap     = indirect && specialization.images[i].heap;
+		const auto mapping  = specialization.images[i].indirect_mapping_offset;
+		if (indirect && !heap) return false;
+		if (heap) {
+			// As the heap hook leaves it before BuildResourceSpecialization.
+			specialization.images[i].indirect_root           = i;
+			specialization.images[i].indirect_mapping_offset = mapping;
+			specialization.images[i].heap                    = true;
+		}
+	for (size_t i = program.info.images.size(); i < specialization.images.size(); ++i) {
+		const auto root = specialization.images[i].indirect_root;
+		if (root >= program.info.images.size() || !specialization.images[root].heap) return false;
+		specialization.images[i] = specialization.images[root];
+	}
 }
 
 uint32_t ImageHeapKind(const ImageResource& root, DescriptorValue& value) {
@@ -2021,6 +2040,21 @@ bool ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 	    program.info.images.size() > specialization.images.size() ||
 	    program.info.samplers.size() > specialization.samplers.size()) {
 		return false;
+	}
+	for (const auto& source: specialization.buffers) {
+		if (source.indirect_root != BufferResource::NoIndirectBuffer &&
+		    source.indirect_root >= program.info.buffers.size())
+			return false;
+	}
+	for (const auto& source: specialization.images) {
+		if (source.indirect_root != ImageResource::NoIndirectImage &&
+		    source.indirect_root >= program.info.images.size())
+			return false;
+	}
+	for (const auto& source: specialization.samplers) {
+		if (source.indirect_root != SamplerResource::NoIndirectSampler &&
+		    source.indirect_root >= program.info.samplers.size())
+			return false;
 	}
 
 	auto& buffers = program.info.buffers;

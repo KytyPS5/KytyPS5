@@ -3,6 +3,7 @@
 
 #include <array>
 #include <cstdint>
+#include <ranges>
 #include <utility>
 #include <vector>
 
@@ -33,6 +34,11 @@ struct UniformFill {
 	bool operator==(const UniformFill&) const = default;
 };
 
+// The read slot of a resident image heap's table. The shader samples through the heap's slot
+// buffer, and the T# fetches it replaces are scalar loads that never see the draw's own writes, so
+// the table is a materialization dependency, not a read the draw must keep apart from its writes.
+inline constexpr uint32_t HeapReadSlot = UINT32_MAX - 1u;
+
 struct ResourceSnapshot {
 	std::vector<DescriptorValue> buffers;
 	std::vector<DescriptorValue> images;
@@ -41,6 +47,21 @@ struct ResourceSnapshot {
 	std::vector<uint32_t>        user_data;
 	std::vector<std::pair<uint64_t, uint64_t>> specialization_reads;
 	UniformFill                 uniform_fill;
+
+	void AddHeapRead(uint64_t base, uint64_t size) {
+		specialization_reads.emplace_back(base, size);
+		specialization_read_slots.push_back(HeapReadSlot);
+	}
+	[[nodiscard]] bool HeapRead(size_t index) const {
+		return index < specialization_read_slots.size() &&
+		       specialization_read_slots[index] == HeapReadSlot;
+	}
+	// The specialization reads a draw's writes must not overlap: all but heap tables.
+	[[nodiscard]] auto ScalarReads() const {
+		return std::views::iota(size_t {0}, specialization_reads.size()) |
+		       std::views::filter([this](size_t index) { return !HeapRead(index); }) |
+		       std::views::transform([this](size_t index) { return specialization_reads[index]; });
+	}
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

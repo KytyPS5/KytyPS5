@@ -350,8 +350,6 @@ void DefineDescriptors(EmitterState& state) {
 				}
 				break;
 			default: {
-				EXIT_IF(IR::ImageBindingResourceClass(kind) ==
-				        IR::ImageResourceClass::None);
 				EXIT_IF(IR::ImageBindingResourceClass(kind) == IR::ImageResourceClass::None);
 				auto& definition = state.images[IR::ImageBindingIndex(kind)];
 				DefineImageArray(state, definition, *image_types[IR::ImageBindingIndex(kind)],

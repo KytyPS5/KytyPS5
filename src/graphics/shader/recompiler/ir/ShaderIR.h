@@ -707,7 +707,10 @@ struct ResourcePlan {
 	uint32_t                      user_data_base  = 0;
 	uint32_t                      user_data_count = 64;
 	// On the plan because the host walk re-executes a readfirstlane once per lane.
+	uint32_t wave_size          = 64;
+	uint32_t host_subgroup_size = 64;
 	bool                                                   upper_lane_half_is_ghost = false;
+	bool                                                   robust_buffer_access2    = false;
 	std::list<Inst>                     value_storage;
 	std::vector<MemoryInfo>             memory_info;
 	std::vector<DescriptorSource>       descriptor_sources;
@@ -721,6 +724,7 @@ struct ResourcePlan {
 	bool                                srt_plan_complete          = false;
 	bool                                resource_tracking_complete = false;
 	// `first_use_pc` of each resource a materialization proved the host cannot re-evaluate.
+	std::vector<uint32_t>                 unfoldable_pcs;
 	ShaderInfo                          info;
 	UniformFillPlan                     uniform_fill;
 	std::unique_ptr<Xbyak::CodeGenerator> srt_code;

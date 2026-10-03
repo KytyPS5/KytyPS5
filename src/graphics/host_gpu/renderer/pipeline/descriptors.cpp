@@ -758,6 +758,9 @@ static vk::DescriptorBufferInfo NativeUpload(RenderContext&            context,
 	return {buffer.Handle(), offset, data.size_bytes()};
 }
 
+
+RenderExecutor::~RenderExecutor() = default;
+
 void RenderExecutor::BindImage(ImageId id, bool storage) {
 	if (!id) {
 		return;
@@ -861,6 +864,8 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 					// Sentinel write ranges end before tables captured by any bound stage.
 					for (const auto* reader: stages) {
 						for (const auto [read_address, read_size]: reader->runtime->resources->specialization_reads) {
+						for (const auto [read_address, read_size]:
+						     reader->runtime->resources->ScalarReads()) {
 							if (read_size == 0) continue;
 							if (read_address > address) {
 								size = std::min(size, read_address - address);
@@ -878,6 +883,7 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 			// Finite GPU descriptors can span sparse PRT holes; clamp only oversized/sentinel ranges.
 			if (size >= (uint64_t {1} << 30u) || descriptor.NumRecords() == UINT32_MAX) {
 				size = Libs::LibKernel::Memory::ClampRangeSize(address, size);
+							     reader->runtime->resources->ScalarReads()) {
 			if (size == 0) {
 				continue;
 			}
@@ -912,7 +918,6 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		pack_memory_offset(index, buffer_offset);
 	}
 	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::FlattenedSrt)] != 0) {
-		prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);
 	}
 	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::ShaderData)] != 0) {
 		prepared.shader_data_buffer = NativeUpload(m_context, prepared.shader_data);
@@ -1041,6 +1046,9 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	}
 	if (uses_dma) {
 		m_context.PrepareBda(writes_dma);
+	}
+	if (uses_image_heap) {
+		m_context.GetImageHeap().Rebind(*this);
 	}
 	for (uint32_t pass = 0; pass < IMAGE_RESOLVE_PASSES; pass++) {
 		bool resolved = false;
@@ -1333,6 +1341,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			                             0, nullptr);
 		}
 	}
+	return true;
 }
 
 } // namespace Libs::Graphics

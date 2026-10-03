@@ -7,9 +7,11 @@
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cstring>
+#include <functional>
 #include <iostream>
 #include <limits>
 #include <memory>

@@ -6,6 +6,9 @@
 #include <cstdlib>
 #include <limits>
 #include <memory>
+#include <span>
+#include <string_view>
+#include <vector>
 
 namespace {
 
@@ -1336,6 +1339,169 @@ void TestIndirectImageSamplerClasses(bool mixed) {
   }
 }
 
+// ---- U3: materialization core (unbound shapes, refusals) ----
+
+// One raw or formatted buffer whose V# is user data s[0:3].
+Libs::Graphics::ShaderRecompiler::IR::ResourcePlan UserDataDescriptorPlan(bool unindexed,
+                                                                          bool formatted) {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = true;
+  program.resource_tracking_complete = true;
+  auto &block = AddValueBlock(program);
+  DescriptorSource source;
+  for (uint32_t i = 0; i < 4; i++) {
+    source.dwords[i] = Value(&block.AppendNewInst(ValueOpcode::GetUserData,
+                                                  {Value(static_cast<ScalarReg>(i))}));
+  }
+  source.dword_count = 4;
+  program.descriptor_sources.push_back(source);
+  program.info.buffers.push_back(
+      {.source = 0, .read = true, .formatted = formatted, .unindexed = unindexed});
+  return ExtractResourcePlan(program);
+}
+
+Libs::Graphics::ShaderRecompiler::IR::ResourceSpecialization
+MaterializedDescriptor(const Libs::Graphics::ShaderRecompiler::IR::ResourcePlan &plan,
+                       std::array<uint32_t, 4> words) {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, {.user_data = words}, snapshot, specialization) &&
+            specialization.buffers.size() == 1 && specialization.unbound_buffers.size() == 1,
+        "a user-data V# did not materialize");
+  return specialization;
+}
+
+
+// A frozen plan's cached phi resolution must accept, refuse and carry as the walk does.
+void TestFrozenPhiPlansWalkLikeTheProgram() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  for (const uint32_t stride : {0u, 1u}) {
+    Program program;
+    program.stage = Libs::Graphics::ShaderType::Compute;
+    program.srt_plan_complete = true;
+    program.resource_tracking_complete = true;
+    auto &block = AddValueBlock(program);
+    auto &entry = block.AppendNewInst(ValueOpcode::GetUserData,
+                                      {Value(static_cast<ScalarReg>(0))});
+    auto &loop = block.AppendNewInst(ValueOpcode::Phi, {},
+                                     static_cast<uint64_t>(Type::U32));
+    auto &step =
+        block.AppendNewInst(ValueOpcode::IAdd32, {Value(&loop), Value(stride)});
+    loop.AddPhiOperand(&block, Value(&entry));
+    loop.AddPhiOperand(&block, Value(&step));
+    DescriptorSource source;
+    source.dword_count = 4;
+    source.dwords = {Value(&loop), Value(0u), Value(4u), Value(0u)};
+    program.descriptor_sources.push_back(source);
+    program.info.buffers.push_back({.source = 0});
+    auto plan = ExtractResourcePlan(program);
+    Check(plan.frozen_values && !program.frozen_values,
+          "the fixture did not compare a frozen plan with a program");
+    for (const uint32_t value : {0x10u, 0x20u, 0x10u}) {
+      const std::array<uint32_t, 1> user_data{value};
+      const SrtRuntime runtime{.user_data = user_data};
+      ResourceSnapshot frozen;
+      ResourceSnapshot walked;
+      ResourceSpecialization frozen_specialization;
+      ResourceSpecialization walked_specialization;
+      const bool frozen_ok =
+          MaterializeResources(plan, runtime, frozen, frozen_specialization);
+      const bool walked_ok =
+          MaterializeResources(program, runtime, walked, walked_specialization);
+      Check(frozen_ok == walked_ok && frozen_ok == (stride == 0u),
+            "a frozen phi plan accepted or refused a loop the walk did not");
+      Check(!frozen_ok || (frozen.buffers == walked.buffers &&
+                           frozen.buffers[0].dwords[0] == value),
+            "a frozen phi plan carried another value than the loop does");
+    }
+    Check(plan.phi_plans.size() == 1u,
+          "a phi was resolved more than once on a frozen plan");
+  }
+}
+
+// Plan extraction must copy a descriptor chain far deeper than the native stack allows recursion.
+void TestDeepChainPlanExtraction() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  constexpr uint32_t kDepth = 50000;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = program.resource_tracking_complete = true;
+  auto &block = AddValueBlock(program);
+  const auto UserData = [&](uint32_t reg) {
+    return Value(&block.AppendNewInst(ValueOpcode::GetUserData,
+                                      {Value(static_cast<ScalarReg>(reg))}));
+  };
+  auto chain = UserData(0);
+  const auto step = UserData(1);
+  for (uint32_t i = 0; i < kDepth; ++i) {
+    chain = Value(&block.AppendNewInst(ValueOpcode::IAdd32, {chain, step}));
+  }
+  DescriptorSource source;
+  source.dword_count = 4;
+  source.dwords = {chain, Value(0u), Value(4u), Value(0u)};
+  program.descriptor_sources.push_back(source);
+  program.info.buffers.push_back({.source = 0});
+  auto plan = ExtractResourcePlan(program);
+  Check(plan.value_storage.size() >= kDepth + 2u,
+        "a deep descriptor chain was not copied once per value");
+  const std::array<uint32_t, 2> user_data{0x1000u, 3u};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, {.user_data = user_data}, snapshot, specialization) &&
+            snapshot.buffers.size() == 1u &&
+            snapshot.buffers[0].dwords[0] == 0x1000u + kDepth * 3u,
+        "a deep descriptor chain did not evaluate from its plan");
+}
+
+struct HeapMemory {
+  static constexpr uint64_t base = 0x10000u;
+  std::vector<uint32_t> words;
+  bool gpu_written = false;
+};
+
+bool ReadHeapMemory(void *userdata, uint64_t address, std::span<uint32_t> values) {
+  const auto &memory = *static_cast<HeapMemory *>(userdata);
+  if (address < HeapMemory::base || (address & 3u) != 0u ||
+      (address - HeapMemory::base) / 4u + values.size() > memory.words.size())
+    return false;
+  std::copy_n(memory.words.begin() + (address - HeapMemory::base) / 4u, values.size(),
+              values.begin());
+  return true;
+}
+
+bool HeapGpuOwned(void *userdata, uint64_t, uint64_t) {
+  return static_cast<HeapMemory *>(userdata)->gpu_written;
+}
+
+// A table the GPU wrote, or whose V# the host cannot evaluate, is decoded in the shader.
+
+// A refusal keeps the specialization the permutation lookup compares, and names itself.
+void TestRefusalKeepsSpecialization() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  auto plan = UserDataBufferPlan();
+  const std::array<uint32_t, 1> user_data{0x1000u};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, {.user_data = user_data}, snapshot, specialization) &&
+            LastMaterializeFailure().empty(),
+        "a valid buffer did not materialize");
+  const auto kept = specialization;
+  Check(!MaterializeResources(plan, {}, snapshot, specialization) &&
+            specialization == kept && specialization.buffers.size() == 1u &&
+            !LastMaterializeFailure().empty() &&
+            LastMaterializeFailure().find('\n') == std::string_view::npos,
+        "a refusal changed the specialization or gave no one-line reason");
+
+  auto program = MixedSamplerProgram();
+  ResourceSpecialization shorter;
+  shorter.images.resize(1);
+  Check(!ApplyResourceSpecialization(program, shorter),
+        "a specialization from another tracking was applied");
+}
+
 } // namespace
 
 namespace Common {
@@ -1374,6 +1540,8 @@ int main() {
   TestMixedSamplerVariantsShareRuntimeDescriptor();
   TestSignedStorageSpecialization();
   for (const bool mixed : {false, true}) TestIndirectImageSamplerClasses(mixed);
+  TestDeepChainPlanExtraction();
+  TestRefusalKeepsSpecialization();
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;
 }

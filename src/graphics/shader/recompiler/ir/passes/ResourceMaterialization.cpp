@@ -64,6 +64,9 @@ bool NullImageDescriptor(const DescriptorValue& descriptor) {
 	return descriptor.dwords[0] == 0 && (descriptor.dwords[1] & 0xffu) == 0;
 }
 
+/// Whether the eight dwords are an image descriptor the emulator can bind: reserved bits clear, a
+/// known type, a format the encoding defines, and for an r128 load a 1D or 2D type. Rejected values
+/// are bound as a null image instead of aborting.
 bool ValidImageDescriptor(const DescriptorValue& descriptor, bool r128 = false) {
 	const auto& words = descriptor.dwords;
 	// Reject texture descriptors with nonzero reserved bits.
@@ -949,6 +952,10 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	return plan;
 }
 
+/// Walks the plan's descriptor graph against the guest state in `runtime` and fills `snapshot` with
+/// the buffer, image and sampler descriptors of this call and `specialization` with the properties
+/// that select the shader permutation. Returns false when a value could not be read or a descriptor
+/// cannot be expressed; the caller must not use a failed result.
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
 	if (!program.resource_tracking_complete ||

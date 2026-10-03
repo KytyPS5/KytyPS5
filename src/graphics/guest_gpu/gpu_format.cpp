@@ -219,6 +219,7 @@ bool IsFmaskTextureFormat(BufferFormat format) {
 	return format >= BufferFormat::kFmask8_S2_F1 && format <= BufferFormat::kFmask64_S16_F8;
 }
 
+/// True when the format table has an entry for the value, false for the gaps in the encoding.
 bool IsDefinedBufferFormat(BufferFormat format) {
 	return FindFormatInfo(format) != nullptr;
 }

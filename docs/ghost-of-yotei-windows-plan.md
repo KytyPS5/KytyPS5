@@ -1,5 +1,26 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **3 октября 2026 года, 08:22 UTC** (native Windows; branch
+`yotei-windows-bringup`, source commit `79db93d6`, installed exe SHA-256
+`5251cfc12f986dda2e9b3c8c761e0e80b5fe0545493dcc210cad803c2da406da`):
+
+- Из нового upstream PR #990 перенесено общее выравнивание Windows x64 SysV
+  host entries перед вызовами MS ABI, без условий на игру. Сначала в
+  текущую ветку перенесён только синтетический trampoline-тест: на старом
+  макросе native `--sysv-align-only` дал ожидаемый RED exit 1; на том же
+  тесте после правки GREEN (`entry_mod16=0`, `ms_mod16=8`). Соседние
+  `--fiber-only`, `--rsqrt-only`, `--red-zone-patcher-only` и полный
+  `virtual_memory_allocation_tests` GREEN; native emulator build/install
+  GREEN. Код и тест — отдельный commit `79db93d6`, подробные логи в
+  `docs/emulator-test-debt.md`.
+- **Эта новая сборка в игре ещё не запускалась.** Последнее доказательство
+  видимого спиннера и повторного GPU `ErrorDeviceLost` относится к exe
+  `4b93dd3d…bae9ebf6` и описано в предыдущем checkpoint. ABI-проверка не
+  объясняет GPU DeviceLost. Следующее: сначала безопасная синтетическая
+  регрессия для большого indirect-image VS/indexed draw; только после
+  локализации дефекта — общее исправление и bounded game retry. Меню и
+  gameplay **PENDING**.
+
 Checkpoint **3 октября 2026 года, 08:09 UTC** (native Windows; branch
 `yotei-windows-bringup`, source commit `37b35115`, installed exe SHA-256
 `4b93dd3d2dd2c7964dbbb30446bcdad21506eba1e792a56405bfd479bae9ebf6`):

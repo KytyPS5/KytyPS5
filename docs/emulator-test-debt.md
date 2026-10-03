@@ -1,5 +1,36 @@
 # Emulator regression test debt
 
+## Windows SysV host-entry stack alignment (2026-10-03)
+
+Upstream PR #990 head `617e728c9309337fda2da0aba9f31bed0207930f`
+reports that a guest-to-host SysV call on Windows can enter with RSP at 0
+mod 16, then make an MS ABI call with invalid alignment. This is a generic
+Windows ABI bug with a synthetic upstream test; the newest Yōtei blocker is
+GPU DeviceLost, so do not attribute it to this fault. Before any local ABI
+change, port only the trampoline test into `virtual_memory_allocation_tests`,
+build natively, and prove the unmodified macro fails on the expected
+`ms_entry_rsp` assertion. Then update the shared ABI macro and rerun the
+unchanged test, neighboring red-zone/fiber/memory cases and the native build.
+Keep Windows x64 and other platforms distinct. A host ABI test cannot prove
+menu or gameplay.
+
+Local proof on branch `yotei-windows-bringup`: ported only the upstream
+trampoline test, built with `_Build/windows-local.cmd build-target
+virtual_memory_allocation_tests`, then ran `--sysv-align-only` on the old
+macro. It failed as intended with exit 1 and
+`SysV host entry propagated a misaligned stack into an MS ABI call`
+(`_Build/logs/pr990-sysv-align-red-20261003.log*`, test exe SHA-256
+`1ddcb1f991984d4e3d11286621c10bf39ef8c08c1ebe4e83eb271325a02062e4`).
+Commit `79db93d6` adds `force_align_arg_pointer` only for Windows
+x64. The unchanged test passes with `entry_mod16=0` and `ms_mod16=8`; focused
+fiber, rsqrt and red-zone tests and the complete
+`virtual_memory_allocation_tests` executable all passed (logs
+`_Build/logs/pr990-*-green-20261003.log*`). Native emulator build/install
+passed; installed exe SHA-256
+`5251cfc12f986dda2e9b3c8c761e0e80b5fe0545493dcc210cad803c2da406da`.
+No game retry on this exe yet; the known repeated GPU DeviceLost is unrelated
+to the synthetic ABI failure.
+
 ## DeviceLost on large indirect-image vertex draw (2026-10-03)
 
 The same native exe SHA-256 `4b93dd3d2dd2c7964dbbb30446bcdad21506eba1e792a56405bfd479bae9ebf6`

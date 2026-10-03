@@ -38,6 +38,11 @@ static thread_local Pm4Execution*     g_current_execution = nullptr;
 static thread_local bool              g_gpu_thread        = false;
 static thread_local GuestGpu*         g_gpu_state         = nullptr;
 
+// Hades II [PPSA13179] compatibility: enable workarounds for specific shader behaviors
+static bool g_hades_ii_compat = false;
+inline bool IsHadesIICompatEnabled() { return g_hades_ii_compat; }
+inline void SetHadesIICompatEnabled(bool v) { g_hades_ii_compat = v; }
+
 struct DrawIndirectArgs {
 	uint32_t vertex_count_per_instance;
 	uint32_t instance_count;

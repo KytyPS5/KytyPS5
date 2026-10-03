@@ -287,12 +287,10 @@ uint32_t ResultVector(ValueEmitContext& ctx, uint32_t value,
 	return result;
 }
 
-uint32_t QueryDimensions(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
-                         const IR::Inst& address, uint32_t resource, uint32_t array_index) {
-	const auto  dimension = ctx.state.program.info.images.at(resource).dimension;
-	const auto& info      = ImageDimensionInfoFor(dimension);
-	const auto  image     = LoadImageDescriptor(ctx.state, resource, 0u, array_index);
-	const auto  size      = ctx.state.builder.AllocateId();
+uint32_t QueryImageDimensions(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
+                              const IR::Inst& address, ImageDimension dimension, uint32_t image) {
+	const auto& info = ImageDimensionInfoFor(dimension);
+	const auto  size = ctx.state.builder.AllocateId();
 	if (info.multisampled != 0u) {
 		ctx.state.builder.AddFunction(spv::OpImageQuerySize,
 		                              ImageViewSizeType(ctx.state, dimension), size, image);
@@ -322,6 +320,36 @@ uint32_t QueryDimensions(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
 	ctx.state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(ctx.state, 4), vector,
 	                              result[0], result[1], result[2], result[3]);
 	return vector;
+}
+
+uint32_t QueryDimensions(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::Inst& address,
+                         uint32_t resource, uint32_t array_index) {
+	const auto image = LoadImageDescriptor(ctx.state, resource, 0u, array_index);
+	return QueryImageDimensions(ctx, mem, address,
+	                            ctx.state.program.info.images.at(resource).dimension, image);
+}
+
+// Signed 6-bit texel offsets per spatial dimension at bits 0, 8 and 16.
+bool SpatialOffsets(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::Inst& address,
+                    const ImageSampleLayout& layout, ImageDimension dimension,
+                    uint32_t (&values)[3]) {
+	const auto components = ImageDimensionInfoFor(dimension).spatial_components;
+	const auto zero       = ConstantI32(ctx.state, 0);
+	for (auto& value: values) {
+		value = zero;
+	}
+	if (layout.offset == NoImageComponent || mem.image_address_components <= layout.offset) {
+		return false;
+	}
+	const auto packed = Unary(ctx.state, spv::OpBitcast, TypeI32(ctx.state),
+	                          AddressU32(ctx, mem, address, layout.offset));
+	for (uint32_t index = 0; index < components; index++) {
+		values[index] = ctx.state.builder.AllocateId();
+		ctx.state.builder.AddFunction(spv::OpBitFieldSExtract, TypeI32(ctx.state), values[index],
+		                              packed, ConstantU32(ctx.state, index * 8u),
+		                              ConstantU32(ctx.state, 6));
+	}
+	return true;
 }
 
 uint32_t PackedOffset(ValueEmitContext& ctx, IR::Value value, ImageDimension dimension,
@@ -354,6 +382,86 @@ uint32_t PackedOffset(ValueEmitContext& ctx, IR::Value value, ImageDimension dim
 	const auto result = ctx.state.builder.AllocateId();
 	ctx.state.builder.AddFunction(spv::OpCompositeConstruct, TypeI32Vector(ctx.state, components),
 	                              result, std::span(values).first(components));
+	return result;
+}
+
+// The _L level, rounded to the nearest mip and clamped to the view; level 0 for every other form.
+uint32_t ExplicitLodLevel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::Inst& address,
+                          const ImageSampleLayout& layout, uint32_t image) {
+	auto& state = ctx.state;
+	if (!HasFlag(mem, Decoder::ImageSampleFlagLod) || layout.lod == NoImageComponent) {
+		return ConstantU32(state, 0);
+	}
+	state.builder.RequireCapability(spv::CapabilityImageQuery);
+	const auto rounded = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    spv::OpExtInst, TypeF32(state), rounded, GlslStd450(state), GLSLstd450Floor,
+	    Binary(state, spv::OpFAdd, TypeF32(state), AddressF32(ctx, mem, address, layout.lod),
+	           ConstantF32(state, 0x3f000000u)));
+	const auto positive = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), positive, GlslStd450(state),
+	                          GLSLstd450FMax, rounded, ZeroF32(state));
+	const auto levels = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpImageQueryLevels, TypeU32(state), levels, image);
+	const auto level = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    spv::OpExtInst, TypeU32(state), level, GlslStd450(state), GLSLstd450UMin,
+	    Unary(state, spv::OpConvertFToU, TypeU32(state), positive),
+	    Binary(state, spv::OpISub, TypeU32(state), levels, ConstantU32(state, 1)));
+	return level;
+}
+
+// Offset is gather-only, so a sample offset is folded into the coordinate at the sampled level.
+uint32_t OffsetCoordinate(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::Inst& address,
+                          const ImageSampleLayout& layout, ImageDimension dimension, uint32_t coord,
+	if (ctx.state.program.info.images.at(mem.resource).cube) return coord;
+	uint32_t offsets[3] {};
+	if (!SpatialOffsets(ctx, mem, address, layout, dimension, offsets)) return coord;
+
+	auto&       state = ctx.state;
+	const auto& info  = ImageDimensionInfoFor(dimension);
+	state.builder.RequireCapability(spv::CapabilityImageQuery);
+	if (info.multisampled != 0u) {
+		state.builder.AddFunction(spv::OpImageQuerySize, ImageViewSizeType(state, dimension), size,
+		                          image);
+	} else {
+		state.builder.AddFunction(spv::OpImageQuerySizeLod, ImageViewSizeType(state, dimension),
+		                          size, image, ExplicitLodLevel(ctx, mem, address, layout, image));
+	}
+
+	const auto coord_components   = info.coordinate_components;
+	const auto spatial_components = info.spatial_components;
+	uint32_t   shifted[3] {};
+	for (uint32_t index = 0; index < coord_components; index++) {
+		auto value = coord;
+		if (coord_components > 1u) {
+			value = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), value, coord, index);
+		}
+		if (index < spatial_components) {
+			auto extent = size;
+			if (coord_components > 1u) {
+				extent = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), extent, size,
+				                          index);
+			}
+			const auto scaled =
+			    Binary(state, spv::OpFDiv, TypeF32(state),
+			           Unary(state, spv::OpConvertSToF, TypeF32(state), offsets[index]),
+			           Unary(state, spv::OpConvertUToF, TypeF32(state), extent));
+			value = Binary(state, spv::OpFAdd, TypeF32(state), value, scaled);
+		}
+		shifted[index] = value;
+	}
+	if (coord_components == 1u) return shifted[0];
+	const auto result = state.builder.AllocateId();
+	if (coord_components == 3u) {
+		state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 3), result,
+		                          shifted[0], shifted[1], shifted[2]);
+	} else {
+		state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 2), result,
+		                          shifted[0], shifted[1]);
+	}
 	return result;
 }
 

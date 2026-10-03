@@ -160,8 +160,8 @@ struct EmitterState {
 	uint32_t                   dynamic_image_index                   = 0;
 	uint32_t                   dynamic_image_resource                = 0;
 	uint32_t                   sampler_variable                      = 0;
-	uint32_t                   sampler_type                          = 0;
-	uint32_t                   sampler_pointer_type                  = 0;
+	uint32_t                                                            bindless_arena_variable = 0;
+	std::array<uint32_t, static_cast<size_t>(IR::BindlessShape::Count)> bindless_image_variables {};
 	uint32_t                   main_func                             = 0;
 	uint32_t                   mesh_guest_func                       = 0;
 	uint32_t                   mesh_allocation                       = 0;
@@ -388,6 +388,10 @@ uint32_t LoadSamplerDescriptor(EmitterState& state, uint32_t sampler, uint32_t a
 
 uint32_t MakeSampledImage(EmitterState& state, uint32_t resource, uint32_t sampler_id,
                           uint32_t mip = 0);
+IR::ImageResource BindlessImageResource(IR::BindlessShape shape);
+uint32_t          LoadBindlessImage(EmitterState& state, IR::BindlessShape shape, uint32_t element);
+uint32_t MakeBindlessSampledImage(EmitterState& state, IR::BindlessShape shape, uint32_t image,
+                                  uint32_t sampler);
 
 void EmitStorageImageWrite(EmitterState& state, uint32_t resource, uint32_t mip_lod, uint32_t coord,
                            uint32_t texel);

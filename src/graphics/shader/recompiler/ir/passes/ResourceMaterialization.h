@@ -37,6 +37,7 @@ struct ResourceSpecialization {
 		bool                          fmask                      = false;
 		// A null candidate no key names, there only so its table always has an arm of this shape.
 		bool                          shape_padding              = false;
+		bool                          bindless                       = false;
 		bool                          operator==(const Image&) const = default;
 	};
 

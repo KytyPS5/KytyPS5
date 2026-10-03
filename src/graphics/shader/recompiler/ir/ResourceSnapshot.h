@@ -45,6 +45,15 @@ struct IndirectKeyFeedback {
 	bool operator==(const IndirectKeyFeedback&) const = default;
 };
 
+struct BindlessImageTable {
+	uint32_t                srt_offset    = 0;
+	std::array<uint32_t, 4> heap          = {};
+	uint32_t                stride        = 0;
+	uint32_t                record_offset = 0;
+
+	bool operator==(const BindlessImageTable&) const = default;
+};
+
 struct ResourceSnapshot {
 	std::vector<DescriptorValue>               buffers;
 	std::vector<DescriptorValue>               images;
@@ -54,6 +63,7 @@ struct ResourceSnapshot {
 	std::vector<std::pair<uint64_t, uint64_t>> specialization_reads;
 	UniformFill                                uniform_fill;
 	std::vector<IndirectKeyFeedback>           key_feedback;
+	std::vector<BindlessImageTable>            bindless_tables;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

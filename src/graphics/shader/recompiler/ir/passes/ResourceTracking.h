@@ -20,6 +20,9 @@ struct ResourceTrackingStatus {
 ResourceTrackingStatus TrackResources(Program& program, const Decoder::Program& decoded,
                                       const CFG::Graph& native_cfg);
 
+[[nodiscard]] bool BindlessImageHeapsEnabled();
+void               OverrideBindlessImageHeaps(int enabled);
+
 } // namespace Libs::Graphics::ShaderRecompiler::IR
 
 #endif /* EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_RESOURCETRACKING_H_ */

@@ -27,6 +27,9 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 		return resource.indirect_root != UINT32_MAX;
 	};
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
+		if (program.info.images[i].bindless) {
+			continue;
+		}
 		const auto kind = IR::DescriptorBindingForImage(program.info.images[i]);
 		if (!kind.has_value()) {
 			Fail(program, "native shader plan has an invalid image class");

@@ -1,11 +1,14 @@
+#include "graphics/host_gpu/renderer/cache/bindlessTranslation.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
 #include <bit>
 #include <cstdio>
 #include <cstdlib>
+#include <map>
 #include <limits>
 #include <memory>
+#include <vector>
 
 namespace {
 
@@ -816,6 +819,228 @@ void TestMixedSamplerVariantsShareRuntimeDescriptor() {
         "sampler variants retained stale or duplicated descriptors after refresh");
 }
 
+namespace Bindless = Libs::Graphics::Bindless;
+using Libs::Graphics::Prospero::BufferFormat;
+using Libs::Graphics::Prospero::ImageType;
+using Libs::Graphics::ShaderRecompiler::IR::BindlessShape;
+
+Bindless::TSharp TestTSharp(uint32_t address, BufferFormat format, ImageType type,
+                            uint32_t depth_field = 0) {
+  Bindless::TSharp words{};
+  words[0] = address;
+  words[1] = static_cast<uint32_t>(format) << 20u;
+  words[2] = 3u | (3u << 14u);
+  words[3] = Libs::Graphics::DstSel(4, 5, 6, 7) | (static_cast<uint32_t>(type) << 28u);
+  words[4] = depth_field;
+  return words;
+}
+
+void TestBindlessRecordClassification() {
+  using Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension;
+  const auto Shape = [](const Bindless::TSharp &words) {
+    return Bindless::ClassifyRecord(words);
+  };
+  const auto plain = Shape(TestTSharp(0x100, BufferFormat::k8_8_8_8UNorm, ImageType::kColor2D));
+  Check(plain && plain->array == BindlessShape::Image2D &&
+            plain->dimension == ImageDimension::Dim2D && !plain->cube,
+        "a unorm 2D T# was not served from the 2D array");
+  const auto array =
+      Shape(TestTSharp(0x100, BufferFormat::k32Float, ImageType::kColor2DArray, 3u));
+  Check(array && array->array == BindlessShape::Image2DArray && !array->cube,
+        "a 2D array T# was not served from the 2D array array");
+  const auto cube = Shape(TestTSharp(0x100, BufferFormat::kBc1UNorm, ImageType::kCube, 5u));
+  Check(cube && cube->array == BindlessShape::Image2DArray && cube->cube &&
+            cube->Code() == Libs::Graphics::ShaderRecompiler::IR::IndirectImageShape(
+                                ImageDimension::Dim2DArray, true),
+        "a cube T# was not served as a 2D array with cube coordinates");
+  const auto volume =
+      Shape(TestTSharp(0x100, BufferFormat::k16_16_16_16Float, ImageType::kColor3D));
+  Check(volume && volume->array == BindlessShape::Image3D &&
+            volume->dimension == ImageDimension::Dim3D,
+        "a volume T# was not served from the 3D array");
+  Check(!Shape(Bindless::TSharp{}), "the null T# was served");
+  Check(!Shape(TestTSharp(0x100, BufferFormat::k8UInt, ImageType::kColor2D)),
+        "an unsigned integer T# was served before anything loads integer records");
+  const auto Integer = [](const Bindless::TSharp &words) {
+    return Bindless::ClassifyRecord(words, true);
+  };
+  const auto mask = Integer(TestTSharp(0x100, BufferFormat::k8UInt, ImageType::kColor2D));
+  Check(mask && mask->array == BindlessShape::Uint2D &&
+            mask->numeric == Libs::Graphics::Prospero::TextureNumericClass::Uint &&
+            mask->Code() == (Libs::Graphics::ShaderRecompiler::IR::IndirectImageShape(
+                                 ImageDimension::Dim2D, false) |
+                             Libs::Graphics::ShaderRecompiler::IR::BindlessUintShapeCode),
+        "an unsigned integer T# was not served from the integer 2D array");
+  const auto masks =
+      Integer(TestTSharp(0x100, BufferFormat::k32UInt, ImageType::kColor2DArray, 3u));
+  Check(masks && masks->array == BindlessShape::Uint2DArray && masks->Code() != array->Code(),
+        "an unsigned integer 2D array T# shared the float array's shape code");
+  Check(!Integer(TestTSharp(0x100, BufferFormat::k32SInt, ImageType::kColor2D)),
+        "a signed integer T# was served");
+  const auto line = Shape(TestTSharp(0x100, BufferFormat::k8_8_8_8UNorm, ImageType::kColor1D));
+  Check(line && line->array == BindlessShape::Image1D &&
+            line->dimension == ImageDimension::Dim1D && !line->cube &&
+            line->Code() == Libs::Graphics::ShaderRecompiler::IR::IndirectImageShape(
+                                ImageDimension::Dim1D, false),
+        "a 1D T# was not served from the 1D array");
+  const auto lines =
+      Shape(TestTSharp(0x100, BufferFormat::k16_16_16_16Float, ImageType::kColor1DArray, 3u));
+  Check(lines && lines->array == BindlessShape::Image1D &&
+            lines->dimension == ImageDimension::Dim1D,
+        "a 1D array T# was not served as a 1D view");
+  Check(!Shape(TestTSharp(0x100, BufferFormat::k16_16_16_16Float, ImageType::kColor1DArray,
+                          (5u << 16u) | 3u)),
+        "a 1D array T# whose base layer passes its last layer was served");
+  Check(line->Code() != plain->Code() && line->Code() != array->Code() &&
+            line->Code() != cube->Code() && line->Code() != volume->Code(),
+        "the 1D shape code collides with another shape");
+  const auto mask_line =
+      Integer(TestTSharp(0x100, BufferFormat::k32UInt, ImageType::kColor1D));
+  Check(mask_line && mask_line->array == BindlessShape::Uint1D,
+        "an unsigned integer 1D T# was not served from the integer 1D array");
+  Check(!Shape(TestTSharp(0x100, BufferFormat::k8_8_8_8UNorm, ImageType::kColor2DMsaa)),
+        "an MSAA T# was served");
+  auto reserved = TestTSharp(0x100, BufferFormat::k8_8_8_8UNorm, ImageType::kColor2D);
+  reserved[1] |= 0x20000000u;
+  Check(!Shape(reserved), "a T# with reserved bits set was served");
+  Check(!Shape(TestTSharp(0x100, BufferFormat::k32Float, ImageType::kColor2DArray,
+                          (5u << 16u) | 3u)),
+        "a 2D array T# whose base layer passes its last layer was served");
+  auto mips = TestTSharp(0x100, BufferFormat::k8_8_8_8UNorm, ImageType::kColor2D);
+  mips[3] |= 2u << 16u;
+  mips[5] = 2u << 4u;
+  Check(Shape(mips).has_value(), "a T# with a sane mip range was refused");
+  auto past_max = mips;
+  past_max[5] = 1u << 4u;
+  Check(!Shape(past_max), "a T# whose last level passes its mip count was served");
+  auto inverted = mips;
+  inverted[3] |= 3u << 12u;
+  Check(!Shape(inverted), "a T# whose base level passes its last level was served");
+  auto clamped = mips;
+  clamped[1] |= (2u * 256u + 1u) << 8u;
+  Check(!Shape(clamped), "a T# whose minimum LOD passes its last level was served");
+}
+
+void TestBindlessRecordCount() {
+  Check(Bindless::HeapRecordCount(48u * 8u, 48u, 16u, 1u << 20u) == 8u,
+        "eight 48-byte records were not counted");
+  Check(Bindless::HeapRecordCount(48u * 7u + 16u + 32u, 48u, 16u, 1u << 20u) == 8u,
+        "a last record whose descriptor ends at the heap end was dropped");
+  Check(Bindless::HeapRecordCount(48u * 7u + 16u + 31u, 48u, 16u, 1u << 20u) == 7u,
+        "a last record whose descriptor crosses the heap end was counted");
+  Check(Bindless::HeapRecordCount(48u * 32768u, 48u, 16u, 1000u) == 1000u,
+        "the record count ignored its ceiling");
+  Check(Bindless::HeapRecordCount(16u, 48u, 16u, 1u << 20u) == 0u,
+        "a heap too small for one descriptor had records");
+  Check(Bindless::HeapRecordCount(1024u, 48u, 18u, 1u << 20u) == 0u &&
+            Bindless::HeapRecordCount(1024u, 24u, 0u, 1u << 20u) == 0u &&
+            Bindless::HeapRecordCount(1024u, 48u, 20u, 1u << 20u) == 0u,
+        "a misaligned or overlapping record layout was accepted");
+}
+
+void TestBindlessSlotAllocation() {
+  Bindless::SlotAllocator slots;
+  const auto a = slots.Assign(BindlessShape::Image2D, 0xa);
+  const auto b = slots.Assign(BindlessShape::Image2D, 0xb);
+  const auto again = slots.Assign(BindlessShape::Image2D, 0xa);
+  const auto volume = slots.Assign(BindlessShape::Image3D, 0xa);
+  Check(a == 0u && b == 1u && again == 0u && volume == 0u &&
+            slots.Used(BindlessShape::Image2D) == 2u &&
+            slots.Used(BindlessShape::Image2DArray) == 0u &&
+            slots.Used(BindlessShape::Image3D) == 1u,
+        "elements were not handed out once per view and per array");
+  for (uint32_t key = 2; key < Libs::Graphics::ShaderRecompiler::IR::BindlessImageSlots; key++) {
+    Check(slots.Assign(BindlessShape::Image2D, 0x100 + key).has_value(),
+          "an array refused an element below its length");
+  }
+  Check(!slots.Assign(BindlessShape::Image2D, 0xdead).has_value() &&
+            slots.Assign(BindlessShape::Image2D, 0xa) == 0u,
+        "a full array handed out an element past its length");
+  slots.Reset();
+  Check(slots.Assign(BindlessShape::Image2D, 0xdead) == 0u &&
+            slots.Used(BindlessShape::Image3D) == 0u,
+        "a reset left elements assigned");
+}
+
+void TestBindlessHeapTranslation() {
+  constexpr uint32_t kStride = 48u;
+  constexpr uint32_t kOffset = 16u;
+  constexpr uint32_t kRecords = 12u;
+  std::vector<uint32_t> heap(kRecords * kStride / 4u, 0xcdcdcdcdu);
+  const auto Put = [&](uint32_t record, const Bindless::TSharp &tsharp) {
+    std::copy(tsharp.begin(), tsharp.end(), heap.begin() + (record * kStride + kOffset) / 4u);
+  };
+  const auto a = TestTSharp(0x1000, BufferFormat::k8_8_8_8UNorm, ImageType::kColor2D);
+  const auto b = TestTSharp(0x2000, BufferFormat::k8_8_8_8Srgb, ImageType::kColor2D);
+  const auto volume = TestTSharp(0x3000, BufferFormat::k32Float, ImageType::kColor3D);
+  const auto cube = TestTSharp(0x4000, BufferFormat::k8_8_8_8UNorm, ImageType::kCube, 5u);
+  const auto integer = TestTSharp(0x5000, BufferFormat::k32UInt, ImageType::kColor2D);
+  const auto refused = TestTSharp(0x6000, BufferFormat::k8_8_8_8UNorm, ImageType::kColor2D);
+  const auto later = TestTSharp(0x7000, BufferFormat::k8_8_8_8UNorm, ImageType::kColor2D);
+  Put(0, Bindless::TSharp{});
+  Put(1, a);
+  Put(2, b);
+  Put(3, a);
+  Put(4, volume);
+  Put(5, cube);
+  Put(6, integer);
+  Put(7, refused);
+  Put(8, b);
+  Put(9, later);
+  Put(10, Bindless::TSharp{});
+  Put(11, volume);
+
+  Bindless::TranslationCache cache;
+  Bindless::SlotAllocator slots;
+  std::map<uint32_t, uint32_t> resolved;
+  bool later_ready = false;
+  const Bindless::RecordResolver resolve =
+      [&](const Bindless::TSharp &tsharp,
+          const Bindless::RecordShape &shape) -> std::optional<uint32_t> {
+    resolved[tsharp[0]]++;
+    if (tsharp == refused) {
+      return 0u;
+    }
+    if (tsharp == later && !later_ready) {
+      return std::nullopt;
+    }
+    return Bindless::TranslationWord(shape, *slots.Assign(shape.array, tsharp[0]));
+  };
+  const auto missing = Bindless::MissingRecords(heap, kStride, kOffset, kRecords, cache);
+  Check(missing.size() == 6u,
+        "the missing records were not the distinct servable descriptors of the heap");
+  std::vector<uint32_t> words(kRecords, 0xffffffffu);
+  Bindless::TranslateHeap(heap, kStride, kOffset, kRecords, cache, resolve, words);
+  using Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension;
+  using Libs::Graphics::ShaderRecompiler::IR::IndirectImageShape;
+  using Libs::Graphics::ShaderRecompiler::IR::IndirectImageSlot;
+  const auto Word = [](ImageDimension dimension, bool is_cube, uint32_t element) {
+    return IndirectImageSlot(IndirectImageShape(dimension, is_cube), element);
+  };
+  Check(words[0] == 0u && words[10] == 0u, "a null record named an element");
+  Check(words[1] == Word(ImageDimension::Dim2D, false, 0) && words[3] == words[1],
+        "two records naming one descriptor did not share its element");
+  Check(words[2] == Word(ImageDimension::Dim2D, false, 1) && words[8] == words[2],
+        "a second descriptor did not take the next element");
+  Check(words[4] == Word(ImageDimension::Dim3D, false, 0) && words[11] == words[4],
+        "a volume record did not take its own array's element");
+  Check(words[5] == Word(ImageDimension::Dim2DArray, true, 0),
+        "a cube record did not take a 2D array element with the cube shape");
+  Check(words[6] == 0u && words[7] == 0u && words[9] == 0u,
+        "an unservable, refused or unsettled record named an element");
+  Check(resolved[0x1000] == 1u && resolved[0x2000] == 1u && resolved[0x3000] == 1u &&
+            !resolved.contains(0x5000),
+        "a descriptor was resolved more than once, or an unservable one at all");
+
+  later_ready = true;
+  Check(Bindless::MissingRecords(heap, kStride, kOffset, kRecords, cache).size() == 1u,
+        "only the unsettled record should still be missing");
+  Bindless::TranslateHeap(heap, kStride, kOffset, kRecords, cache, resolve, words);
+  Check(words[9] == Word(ImageDimension::Dim2D, false, 2) && resolved[0x7000] == 2u &&
+            resolved[0x1000] == 1u && resolved[0x6000] == 1u,
+        "the second pass re-resolved cached records or missed the unsettled one");
+}
+
 } // namespace
 
 namespace Common {
@@ -846,6 +1071,10 @@ int main() {
   TestSharedControlPredicates();
   TestFiniteImageRefreshReusesScalarReads();
   TestMixedSamplerVariantsShareRuntimeDescriptor();
+  TestBindlessRecordClassification();
+  TestBindlessRecordCount();
+  TestBindlessSlotAllocation();
+  TestBindlessHeapTranslation();
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;
 }

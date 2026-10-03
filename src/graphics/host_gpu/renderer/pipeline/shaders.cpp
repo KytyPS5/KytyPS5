@@ -6,6 +6,7 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/debug.h"
+#include "graphics/host_gpu/renderer/pipeline/bindlessImageHeap.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
@@ -295,12 +296,34 @@ CreateOneDescriptorLayout(GraphicContext& graphics, bool push_descriptors,
 	return layout;
 }
 
+static void AddBindlessLimitBindings(std::vector<vk::DescriptorSetLayoutBinding>&    bindings,
+                                     const ShaderRecompiler::IR::CompiledShaderInfo& program,
+                                     vk::ShaderStageFlagBits                         stage) {
+	if (program.bindings.uses_bindless) {
+		const auto global = BindlessImageHeap::LayoutBindings(stage);
+		bindings.insert(bindings.end(), global.begin(), global.end());
+	}
+	if (program.bindings.bindless_integer) {
+		const auto integer = BindlessImageHeap::IntegerLayoutBindings(stage);
+		bindings.insert(bindings.end(), integer.begin(), integer.end());
+	}
+}
+
+// Set 3 holds the integer arrays and exists only in a layout whose stages load from a heap.
+static constexpr uint32_t BindlessSetCount(bool bindless, bool integer) {
+	return integer    ? ShaderRecompiler::IR::BindlessIntegerDescriptorSet + 1u
+	       : bindless ? ShaderRecompiler::IR::BindlessDescriptorSet + 1u
+	                  : 0u;
+}
+
 // Set 0 only: the compute path, and the shape the graphics path used to have.
 static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
-                                   std::span<const vk::DescriptorSetLayoutBinding> bindings) {
-	CheckDescriptorLayoutLimits(graphics, bindings);
-	pipeline.uses_push_descriptors =
-	    DescriptorCount(bindings) <= graphics.max_push_descriptors;
+                                   std::span<const vk::DescriptorSetLayoutBinding> bindings,
+                                   std::span<const vk::DescriptorSetLayoutBinding> bindless) {
+	std::vector<vk::DescriptorSetLayoutBinding> checked(bindings.begin(), bindings.end());
+	checked.insert(checked.end(), bindless.begin(), bindless.end());
+	CheckDescriptorLayoutLimits(graphics, checked);
+	pipeline.uses_push_descriptors = DescriptorCount(bindings) <= graphics.max_push_descriptors;
 	pipeline.descriptor_set_layout =
 	    CreateOneDescriptorLayout(graphics, pipeline.uses_push_descriptors, bindings);
 }
@@ -311,17 +334,21 @@ static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipe
 // shader alone (IR::NativeDescriptorSet). The limit check still runs over both sets together,
 // because `maxDescriptorSet*` bounds a pipeline's whole layout and not one set of it, and the
 // per-stage arm of that check was always per-stage anyway.
-static void CreateGraphicsDescriptorLayouts(
-    GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
-    std::span<const vk::DescriptorSetLayoutBinding> vertex_bindings,
-    std::span<const vk::DescriptorSetLayoutBinding> pixel_bindings, bool has_pixel_stage) {
+static void
+CreateGraphicsDescriptorLayouts(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                                std::span<const vk::DescriptorSetLayoutBinding> vertex_bindings,
+                                std::span<const vk::DescriptorSetLayoutBinding> pixel_bindings,
+                                bool                                            has_pixel_stage,
+                                std::span<const vk::DescriptorSetLayoutBinding> bindless) {
 	EXIT_IF(graphics.GetPhysicalDeviceProperties().limits.maxBoundDescriptorSets <
-	        ShaderRecompiler::IR::NativeDescriptorSetCount);
+	        (bindless.empty() ? ShaderRecompiler::IR::NativeDescriptorSetCount
+	                          : ShaderRecompiler::IR::BindlessDescriptorSet + 1u));
 
 	std::vector<vk::DescriptorSetLayoutBinding> all;
-	all.reserve(vertex_bindings.size() + pixel_bindings.size());
+	all.reserve(vertex_bindings.size() + pixel_bindings.size() + bindless.size());
 	all.insert(all.end(), vertex_bindings.begin(), vertex_bindings.end());
 	all.insert(all.end(), pixel_bindings.begin(), pixel_bindings.end());
+	all.insert(all.end(), bindless.begin(), bindless.end());
 	// Combined: maxDescriptorSet* bounds a pipeline layout, not one set of it.
 	CheckDescriptorLayoutLimits(graphics, all);
 
@@ -581,29 +608,50 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	std::vector<vk::DescriptorSetLayoutBinding> vertex_bindings;
 	std::vector<vk::DescriptorSetLayoutBinding> pixel_bindings;
+	std::vector<vk::DescriptorSetLayoutBinding> bindless_bindings;
 	vk::ShaderStageFlags graphics_stages = vk::ShaderStageFlagBits::eFragment;
 	bool                 vertex_bindless = false;
+	bool                 vertex_integer  = false;
 	for (const auto& stage: vertex_info) {
 		const auto native_stage = NativeShaderStage(stage.logical_stage);
 		AddLayoutBindings(vertex_bindings, *stage.stage.program, native_stage);
+		AddBindlessLimitBindings(bindless_bindings, *stage.stage.program, native_stage);
 		graphics_stages |= native_stage;
 		vertex_bindless = vertex_bindless || stage.stage.program->bindings.uses_bindless;
+		vertex_integer  = vertex_integer || stage.stage.program->bindings.bindless_integer;
 	}
 
+	bool pixel_bindless = false;
+	bool pixel_integer  = false;
 	if (ps_active) {
 		EXIT_IF(!ps_input_info->stage);
 		AddLayoutBindings(pixel_bindings, *ps_input_info->stage.program,
 		                  vk::ShaderStageFlagBits::eFragment);
+		AddBindlessLimitBindings(bindless_bindings, *ps_input_info->stage.program,
+		                         vk::ShaderStageFlagBits::eFragment);
+		pixel_bindless = ps_input_info->stage.program->bindings.uses_bindless;
+		pixel_integer  = ps_input_info->stage.program->bindings.bindless_integer;
 	}
-	CreateGraphicsDescriptorLayouts(graphics, pipeline, vertex_bindings, pixel_bindings, ps_active);
+	const bool uses_bindless = !bindless_bindings.empty();
+	const bool uses_integer  = vertex_integer || pixel_integer;
+	EXIT_IF(uses_integer && graphics.GetPhysicalDeviceProperties().limits.maxBoundDescriptorSets <
+	                            BindlessSetCount(true, true));
+	CreateGraphicsDescriptorLayouts(graphics, pipeline, vertex_bindings, pixel_bindings, ps_active,
+	                                bindless_bindings);
 	const vk::PushConstantRange push_constants {graphics_stages, 0,
 
 	                                            ShaderRecompiler::IR::NativePushConstantSize};
 
 	// Set 0 always; set 1 whenever there is a pixel stage, even if it binds nothing, so a layout's
 	// shape follows which stages a pipeline has rather than what they happen to use.
-	const vk::DescriptorSetLayout set_layouts[ShaderRecompiler::IR::NativeDescriptorSetCount] = {
-	    pipeline.descriptor_set_layout, pipeline.pixel_descriptor_set_layout};
+	const vk::DescriptorSetLayout
+	    set_layouts[ShaderRecompiler::IR::BindlessIntegerDescriptorSet + 1u] = {
+	        pipeline.descriptor_set_layout,
+	        pipeline.pixel_descriptor_set_layout != nullptr || !uses_bindless
+	            ? pipeline.pixel_descriptor_set_layout
+	            : BindlessImageHeap::EmptySetLayout(graphics),
+	        uses_bindless ? BindlessImageHeap::SetLayout(graphics) : nullptr,
+	        uses_integer ? BindlessImageHeap::IntegerSetLayout(graphics) : nullptr};
 	vk::PipelineLayoutCreateInfo pipeline_layout_info {};
 	// Not just the libraries': the *linked* pipeline's layout must carry the flag as well, or it is
 	// undefined behaviour that this driver happens to tolerate. Found by the validation layer
@@ -611,9 +659,11 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	if (library_path) {
 		pipeline_layout_info.flags = vk::PipelineLayoutCreateFlagBits::eIndependentSetsEXT;
 	}
-	pipeline_layout_info.setLayoutCount = pipeline.pixel_descriptor_set_layout != nullptr
-	                                          ? ShaderRecompiler::IR::NativeDescriptorSetCount
-	                                          : 1u;
+	const uint32_t native_sets = pipeline.pixel_descriptor_set_layout != nullptr
+	                                 ? ShaderRecompiler::IR::NativeDescriptorSetCount
+	                                 : 1u;
+	pipeline_layout_info.setLayoutCount =
+	    uses_bindless ? BindlessSetCount(true, uses_integer) : native_sets;
 	pipeline_layout_info.pSetLayouts            = set_layouts;
 	pipeline_layout_info.pushConstantRangeCount = 1;
 	pipeline_layout_info.pPushConstantRanges    = &push_constants;
@@ -843,13 +893,14 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 			                                             vertex_bindings);
 
 			const vk::DescriptorSetLayout
-			    pre_raster_sets[ShaderRecompiler::IR::BindlessDescriptorSet + 1u] = {
+			    pre_raster_sets[ShaderRecompiler::IR::BindlessIntegerDescriptorSet + 1u] = {
 			        fresh.set_layout, nullptr,
-			        vertex_bindless ? BindlessImageHeap::SetLayout(graphics) : nullptr};
+			        vertex_bindless ? BindlessImageHeap::SetLayout(graphics) : nullptr,
+			        vertex_integer ? BindlessImageHeap::IntegerSetLayout(graphics) : nullptr};
 			vk::PipelineLayoutCreateInfo pre_raster_layout_info {};
 			pre_raster_layout_info.flags = vk::PipelineLayoutCreateFlagBits::eIndependentSetsEXT;
 			pre_raster_layout_info.setLayoutCount =
-			    vertex_bindless ? ShaderRecompiler::IR::BindlessDescriptorSet + 1u : 1u;
+			    vertex_bindless ? BindlessSetCount(true, vertex_integer) : 1u;
 			pre_raster_layout_info.pSetLayouts            = pre_raster_sets;
 			pre_raster_layout_info.pushConstantRangeCount = 1;
 			pre_raster_layout_info.pPushConstantRanges    = &push_constants;
@@ -886,13 +937,17 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 			fresh.set_layout =
 			    ps_active ? CreateOneDescriptorLayout(graphics, false, pixel_bindings) : nullptr;
 
-			const vk::DescriptorSetLayout fragment_sets[ShaderRecompiler::IR::
-			                                                NativeDescriptorSetCount] = {
-			    nullptr, fresh.set_layout};
+			const vk::DescriptorSetLayout
+			    fragment_sets[ShaderRecompiler::IR::BindlessIntegerDescriptorSet + 1u] = {
+			        nullptr, fresh.set_layout,
+			        pixel_bindless ? BindlessImageHeap::SetLayout(graphics) : nullptr,
+			        pixel_integer ? BindlessImageHeap::IntegerSetLayout(graphics) : nullptr};
 			vk::PipelineLayoutCreateInfo fragment_layout_info {};
 			fragment_layout_info.flags = vk::PipelineLayoutCreateFlagBits::eIndependentSetsEXT;
 			fragment_layout_info.setLayoutCount =
-			    ShaderRecompiler::IR::NativeDescriptorSetCount;
+			    pixel_bindless ? BindlessSetCount(true, pixel_integer)
+			    : ps_active    ? ShaderRecompiler::IR::NativeDescriptorSetCount
+			                   : 0u;
 			fragment_layout_info.pSetLayouts            = fragment_sets;
 			fragment_layout_info.pushConstantRangeCount = 1;
 			fragment_layout_info.pPushConstantRanges    = &push_constants;
@@ -956,15 +1011,28 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	}
 
 	std::vector<vk::DescriptorSetLayoutBinding> descriptor_bindings;
+	std::vector<vk::DescriptorSetLayoutBinding> bindless_bindings;
 	AddLayoutBindings(descriptor_bindings, *input_info.stage.program,
 	                  vk::ShaderStageFlagBits::eCompute);
-	CreateDescriptorLayout(graphics, pipeline, descriptor_bindings);
+	AddBindlessLimitBindings(bindless_bindings, *input_info.stage.program,
+	                         vk::ShaderStageFlagBits::eCompute);
+	CreateDescriptorLayout(graphics, pipeline, descriptor_bindings, bindless_bindings);
 	const vk::PushConstantRange push_constants {vk::ShaderStageFlagBits::eCompute, 0,
 	                                            ShaderRecompiler::IR::NativePushConstantSize};
 
+	const bool uses_bindless = !bindless_bindings.empty();
+	const bool uses_integer  = input_info.stage.program->bindings.bindless_integer;
+	EXIT_IF(uses_bindless && graphics.GetPhysicalDeviceProperties().limits.maxBoundDescriptorSets <
+	                             BindlessSetCount(true, uses_integer));
+	const vk::DescriptorSetLayout
+	    set_layouts[ShaderRecompiler::IR::BindlessIntegerDescriptorSet + 1u] = {
+	        pipeline.descriptor_set_layout,
+	        uses_bindless ? BindlessImageHeap::EmptySetLayout(graphics) : nullptr,
+	        uses_bindless ? BindlessImageHeap::SetLayout(graphics) : nullptr,
+	        uses_integer ? BindlessImageHeap::IntegerSetLayout(graphics) : nullptr};
 	vk::PipelineLayoutCreateInfo pipeline_layout_info {};
-	pipeline_layout_info.setLayoutCount         = 1;
-	pipeline_layout_info.pSetLayouts            = &pipeline.descriptor_set_layout;
+	pipeline_layout_info.setLayoutCount = uses_bindless ? BindlessSetCount(true, uses_integer) : 1u;
+	pipeline_layout_info.pSetLayouts    = set_layouts;
 	pipeline_layout_info.pushConstantRangeCount = 1;
 	pipeline_layout_info.pPushConstantRanges    = &push_constants;
 

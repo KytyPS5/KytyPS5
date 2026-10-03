@@ -518,6 +518,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (program.info.uses_dma) {
 		m_context.PrepareBda(program.info.writes_dma);
 	}
+	PreparedBindings* bindless_stage = &bindings;
+	PrepareBindlessTables(std::span {&bindless_stage, 1u});
 	RebindImages(bindings);
 	BindSharedMemory(m_context, input_info, bindings);
 	RebindBuffers(bindings);
@@ -588,6 +590,8 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		KYTY_PROFILER_BLOCK("DispatchIndirect PrepareBda");
 		m_context.PrepareBda(program.info.writes_dma);
 	}
+	PreparedBindings* bindless_stage = &bindings;
+	PrepareBindlessTables(std::span {&bindless_stage, 1u});
 	BindSharedMemory(m_context, input_info, bindings, args_addr);
 	RebindImages(bindings);
 	// Acquiring arguments can merge cache buffers; finalize shader bindings afterward.

@@ -807,13 +807,12 @@ static bool TryEmulateReciprocalSquareRoot(Context& context) {
 
 static bool IsPlainWideStore(const ZydisDecodedInstruction& instruction,
                              const ZydisDecodedOperand*     operands) {
+	// Only the unaligned forms: a 32-byte aligned store cannot cross a page, and the aligned forms
+	// must keep raising #GP on a misaligned address.
 	switch (instruction.mnemonic) {
 		case ZYDIS_MNEMONIC_VMOVUPS:
-		case ZYDIS_MNEMONIC_VMOVAPS:
 		case ZYDIS_MNEMONIC_VMOVUPD:
-		case ZYDIS_MNEMONIC_VMOVAPD:
-		case ZYDIS_MNEMONIC_VMOVDQU:
-		case ZYDIS_MNEMONIC_VMOVDQA: break;
+		case ZYDIS_MNEMONIC_VMOVDQU: break;
 		default: return false;
 	}
 	return instruction.encoding == ZYDIS_INSTRUCTION_ENCODING_VEX &&
@@ -1027,11 +1026,8 @@ WideStoreSplitResult SplitWideStores(uint64_t address, uint64_t size, uint64_t* 
 		if (instruction.encoding == ZYDIS_INSTRUCTION_ENCODING_VEX) {
 			switch (instruction.mnemonic) {
 				case ZYDIS_MNEMONIC_VMOVUPS:
-				case ZYDIS_MNEMONIC_VMOVAPS:
 				case ZYDIS_MNEMONIC_VMOVUPD:
-				case ZYDIS_MNEMONIC_VMOVAPD:
-				case ZYDIS_MNEMONIC_VMOVDQU:
-				case ZYDIS_MNEMONIC_VMOVDQA: candidates.push_back(offset); break;
+				case ZYDIS_MNEMONIC_VMOVDQU: candidates.push_back(offset); break;
 				default: break;
 			}
 		}

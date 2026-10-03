@@ -268,6 +268,20 @@ void TestRipRelativeStore() {
 	Check(area.code[0x800 + 32] == 0, "RIP-relative store wrote nothing past its target");
 }
 
+void TestAlignedStoresAreNotSplit() {
+	auto area = MakeCode();
+	// vmovaps [rdi], ymm0; vmovapd [rdi], ymm0; vmovdqa [rdi], ymm0; ret
+	const std::array<uint8_t, 13> code = {0xc5, 0xfc, 0x29, 0x07, 0xc5, 0xfd, 0x29, 0x07,
+	                                      0xc5, 0xfd, 0x7f, 0x07, 0xc3};
+	std::memcpy(area.code, code.data(), code.size());
+	auto       cursor = area.trampolines;
+	const auto result = Loader::X64InstructionEmulator::SplitWideStores(
+	    reinterpret_cast<uint64_t>(area.code), code.size(), &cursor, area.end);
+	Check(result.candidates == 0 && result.patched == 0, "aligned 256-bit stores are not candidates");
+	Check(std::memcmp(area.code, code.data(), code.size()) == 0, "aligned stores left unchanged");
+	Check(cursor == area.trampolines, "aligned stores use no trampoline space");
+}
+
 } // namespace
 
 int main() {
@@ -288,6 +302,7 @@ int main() {
         TestShortStoreViaNopPadding();
         TestShortStoreViaLongStoreDeadBytes();
         TestRipRelativeStore();
+	TestAlignedStoresAreNotSplit();
 
 	if (g_failures != 0) {
 		std::fprintf(stderr, "%d check(s) failed\n", g_failures);

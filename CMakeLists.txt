@@ -311,6 +311,7 @@ set(gpu_blit_shader_sources
 	"${gpu_tiler_shader_dir}/gpu_color_clear_uint.frag"
 	"${gpu_tiler_shader_dir}/gpu_color_clear_sint.frag"
 	"${gpu_tiler_shader_dir}/gpu_color_clear_classify.comp"
+	"${gpu_tiler_shader_dir}/gpu_dispatch_threads.comp"
 )
 foreach(shader_source IN LISTS gpu_blit_shader_sources)
 	get_filename_component(shader_name "${shader_source}" NAME_WE)

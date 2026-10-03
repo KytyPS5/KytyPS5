@@ -93,13 +93,9 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 	}
 	const auto has_shader_data_storage = present[static_cast<size_t>(Kind::ShaderData)];
 	const auto shader_data_dwords = program.bindings.ShaderDataDwords();
-	const auto user_data_dwords = program.bindings.user_data_registers.size();
-	const bool has_dispatch_threads = program.bindings.dispatch_thread_dword != IR::PushData::NoStart;
 	if ((program.bindings.UsesPushData() &&
 	     !IR::PushData::CanFit(program.bindings.push_data_start_dword, shader_data_dwords)) ||
-	    (has_dispatch_threads && (program.stage != ShaderType::Compute ||
-	                              program.bindings.dispatch_thread_dword != user_data_dwords)) ||
-	    program.bindings.memory_offset_dword != user_data_dwords + (has_dispatch_threads ? 3u : 0u) ||
+	    program.bindings.memory_offset_dword != program.bindings.user_data_registers.size() ||
 	    program.bindings.memory_offset_count != buffers.size() ||
 	    has_shader_data_storage != (shader_data_dwords != 0 && !program.bindings.UsesPushData()) ||
 	    !std::is_sorted(program.bindings.user_data_registers.begin(),
@@ -566,6 +562,9 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 					    program.stage != ShaderType::TessellationControl;
 					break;
 				case IR::ValueOpcode::ImageQueryLod: requirements.compute_derivatives = true; break;
+				case IR::ValueOpcode::DispatchThreadInRange:
+					requirements.dispatch_thread_limit = true;
+					break;
 				case IR::ValueOpcode::ImageGatherRaw:
 					requirements.image_gather_extended = true;
 					break;

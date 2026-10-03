@@ -19,6 +19,7 @@
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/threadDispatch.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -43,6 +44,15 @@
 #include <vector>
 
 namespace Libs::Graphics {
+static void PushThreadLimit(vk::CommandBuffer command, const PipelineCache::Pipeline& pipeline,
+                            const ThreadDispatcher::Record& record) {
+	const uint32_t words[ShaderRecompiler::IR::PushData::DispatchLimitDwordCount] {
+	    static_cast<uint32_t>(record.limit_address),
+	    static_cast<uint32_t>(record.limit_address >> 32u)};
+	command.pushConstants(pipeline.pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
+	                      sizeof(words), words);
+}
+
 static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::DescriptorValue> sources,
                                 GuestRange destination, uint32_t output_buffer = UINT32_MAX) {
 	for (uint32_t i = 0; i < sources.size(); ++i) {
@@ -284,6 +294,13 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
 		cache.ReadMemory(indirect_args, sizeof(vk::DispatchIndirectCommand));
 		std::memcpy(input.workgroup_counts, reinterpret_cast<const void*>(indirect_args),
 		            sizeof(input.workgroup_counts));
+		if (input.dispatch_thread_dimensions) {
+			for (uint32_t axis = 0; axis < 3u; ++axis) {
+				const auto size = std::max(input.threads_num[axis], 1u);
+				const auto threads = input.workgroup_counts[axis];
+				input.workgroup_counts[axis] = threads / size + (threads % size != 0u);
+			}
+		}
 	}
 	// LDS has no contents to preserve between dispatches. The existing shader hazard
 	// barriers also order other users of this GPU-only utility buffer.
@@ -524,7 +541,13 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	BindSharedMemory(m_context, input_info, bindings);
 	RebindBuffers(bindings);
 
-	auto              vk_buffer        = buffer.Handle();
+	auto                     vk_buffer = buffer.Handle();
+	ThreadDispatcher::Record thread_record {};
+	if (use_thread_dimensions) {
+		thread_record = ThreadDispatch().Write(vk_buffer, {input_info.dispatch_threads_num[0],
+		                                                   input_info.dispatch_threads_num[1],
+		                                                   input_info.dispatch_threads_num[2]});
+	}
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
 	bool has_storage_writes = bindings.shared_memory.buffer != nullptr ||
@@ -543,6 +566,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+	if (use_thread_dimensions) {
+		PushThreadLimit(vk_buffer, pipeline, thread_record);
+	}
 	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
 	m_context.GetIndirectKeyFeedback().Flush(vk_buffer);
 
@@ -554,8 +580,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
                                       uint32_t mode) {
 	KYTY_PROFILER_FUNCTION();
-	EXIT_IF(buffer.IsInvalid() || args_addr == 0 || (args_addr & 3u) != 0 ||
-	        (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0);
+	EXIT_IF(buffer.IsInvalid() || args_addr == 0 || (args_addr & 3u) != 0);
+	const bool thread_dimensions =
+	    (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
 	{
 		KYTY_PROFILER_BLOCK("DispatchIndirect PopPendingOperations");
 		m_context.GetCommandScheduler().PopPendingOperations();
@@ -572,8 +599,8 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 	ShaderComputeInputInfo input_info {};
-	input_info.async_compute = async_compute;
-	const auto compute_program = m_context.GetPipelineCache().GetComputeProgram(
+	input_info.dispatch_thread_dimensions = thread_dimensions;
+	const auto compute_program            = m_context.GetPipelineCache().GetComputeProgram(
 	    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
 	if (!compute_program || !input_info.stage) {
 		ResetBindings();
@@ -602,6 +629,18 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	}();
 	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
 	RebindBuffers(bindings);
+	ThreadDispatcher::Record dispatch_record {args_buffer->Handle(), args_offset, 0};
+	if (thread_dimensions) {
+		const auto& limits = m_context.GetGraphics().physical_device_properties.limits;
+		const std::array<uint32_t, 3> local_size {std::max(cs_regs.cs_regs.num_thread_x, 1u),
+		                                          std::max(cs_regs.cs_regs.num_thread_y, 1u),
+		                                          std::max(cs_regs.cs_regs.num_thread_z, 1u)};
+		const std::array<uint32_t, 3> max_groups {limits.maxComputeWorkGroupCount[0],
+		                                          limits.maxComputeWorkGroupCount[1],
+		                                          limits.maxComputeWorkGroupCount[2]};
+		dispatch_record = ThreadDispatch().Convert(buffer.Handle(), args_buffer->Handle(),
+		                                           args_offset, local_size, max_groups);
+	}
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
 	const auto vk_buffer = buffer.Handle();
@@ -622,7 +661,10 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	        vk::PipelineStageFlagBits::eTransfer,
 	    vk::PipelineStageFlagBits::eDrawIndirect, {}, 1, &barrier, 0, nullptr, 0, nullptr);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
-	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
+	if (thread_dimensions) {
+		PushThreadLimit(vk_buffer, pipeline, dispatch_record);
+	}
+	vk_buffer.dispatchIndirect(dispatch_record.buffer, dispatch_record.groups_offset);
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
 }

@@ -620,6 +620,9 @@ private:
 			m_active_mask          = active_mask;
 			return finish(valid);
 		}
+		if (op == ValueOpcode::DispatchThreadInRange) {
+			return finish(true);
+		}
 		if (op == ValueOpcode::LaneId) {
 			// A descriptor lives in scalar registers, so the only route a lane index has into one
 			// is the readfirstlane that lifts a vector value back into them - in practice the
@@ -807,6 +810,7 @@ bool IsClosedPredicate(Value root) {
 		} else {
 			switch (op) {
 				case ValueOpcode::LaneId:
+				case ValueOpcode::DispatchThreadInRange:
 				case ValueOpcode::Ballot:
 				case ValueOpcode::LogicalNot:
 				case ValueOpcode::SelectU1:
@@ -1669,6 +1673,7 @@ bool SrtWalker::EvaluateInstRule(const Inst& inst, uint64_t& result) {
 			result = mask;
 			return true;
 		}
+		case ValueOpcode::DispatchThreadInRange: result = 1; return true;
 		case ValueOpcode::LaneId:
 			// Only the sweep above binds a lane. Anywhere else the value is per-lane with
 			// nothing to pin it down, and RuntimeValidator refused it for the same reason.

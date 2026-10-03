@@ -1171,15 +1171,11 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				                                  IR::U32(IR::Value(total_threads)));
 			}
 		}
+		// USE_THREAD_DIMENSIONS launches a partial last group with its excess lanes disabled.
 		if (options.stage == ShaderType::Compute &&
 		    options.input_info.compute->dispatch_thread_dimensions) {
-			for (uint32_t axis = 0; axis < 3u; axis++) {
-				const auto extent = IR::U32(entry_ir.Emit(
-				    IR::ValueOpcode::GetDispatchThreadExtent, {IR::Value(axis)}));
-				initial_exec = entry_ir.LogicalAnd(
-				    initial_exec,
-				    entry_ir.ULessThan(builtin(IR::StageInputKind::GlobalInvocationId, axis), extent));
-			}
+			initial_exec = entry_ir.LogicalAnd(
+			    initial_exec, IR::U1(entry_ir.Emit(IR::ValueOpcode::DispatchThreadInRange)));
 		}
 		entry_ir.SetExec(initial_exec);
 		const auto initial_mask = entry_ir.Emit(IR::ValueOpcode::Ballot, {initial_exec});

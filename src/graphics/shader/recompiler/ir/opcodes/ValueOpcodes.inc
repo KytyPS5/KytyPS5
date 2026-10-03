@@ -8,10 +8,10 @@ VALUE_OPCODE(ConditionRef, U1, U1)
 
 // Translation and register-state pseudo operations.
 VALUE_OPCODE(GetUserData, U32, ScalarReg)
-VALUE_OPCODE(GetDispatchThreadExtent, U32, U32)
 VALUE_OPCODE(GetShaderBase, U64)
 VALUE_OPCODE(MeshDrawParameter, U32, U32)
 VALUE_OPCODE(MeshAllocate, Void, U32)
+VALUE_OPCODE(DispatchThreadInRange, U1)
 VALUE_OPCODE(TessellationBase, U32, U32)
 VALUE_OPCODE(GetTessellationAttribute, U32, U32, U32, U1)
 VALUE_OPCODE(SetTessellationAttribute, Void, U32, U32, U32, U1)

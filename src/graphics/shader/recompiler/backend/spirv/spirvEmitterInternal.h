@@ -58,29 +58,28 @@ constexpr std::array<ImageDimensionInfo, 7> ImageDimensions {{
 
 const ImageDimensionInfo& ImageDimensionInfoFor(ImageDimension dimension);
 
+// What the backend needs beyond the requirement flags ShaderInfo collection records.
 struct SpirvRequirements {
-	bool bvh                          = false;
-	bool subgroup_ballot              = false;
-	bool subgroup_barrier             = false;
-	bool subgroup_shuffle             = false;
-	bool subgroup_local_invocation_id = false;
-	bool compute_derivatives          = false;
-	bool image_gather_extended        = false;
-	bool function_lds                 = false;
-	uint32_t function_lds_dwords          = 0;
-	uint32_t function_lds_unbounded_pc    = UINT32_MAX;
-	bool function_scratch             = false;
-	bool pixel_valid_mask             = false;
-	bool buffer_int64_atomics         = false;
-	bool buffer_u8                    = false;
-	bool buffer_u16                   = false;
-	bool shared_int64_atomics         = false;
+	bool     dispatch_thread_limit     = false;
+	uint32_t function_lds_dwords       = 0;
+	uint32_t function_lds_unbounded_pc = UINT32_MAX;
 	// A genuine glc buffer load or store is present, so the Coherent alias is declared.
-	bool coherent_buffers             = false;
-	bool float64                      = false;
+	bool coherent_buffers = false;
+	// A glc DWORDX2 goes through the u64 alias as one access, see LoadWideBuffer.
+	bool wide_glc_buffers = false;
 	// The first guest feature the backend cannot express; the program is refused, not emitted.
 	const char*     refusal      = nullptr;
 	const IR::Inst* refused_inst = nullptr;
+};
+
+SpirvRequirements AnalyzeProgramRequirements(const IR::Program& program);
+
+struct BufferDefinition {
+	uint32_t variable             = 0;
+	uint32_t type                 = 0;
+	uint32_t element_type         = 0;
+	uint32_t pointer_type         = 0;
+	uint32_t element_pointer_type = 0;
 };
 
 struct ImageDefinition {
@@ -93,7 +92,8 @@ struct ImageDefinition {
 struct EmitterState {
 	EmitterState(IR::Program& program_, ShaderStageInputInfo input_info_)
 	    : builder(program_.stage == ShaderType::Mesh ? 0x00010400u : 0x00010300u),
-	      program(program_), input_info(input_info_) {
+	      program(program_), input_info(input_info_),
+	      requirements(AnalyzeProgramRequirements(program_)) {
 		if (ShaderWorkgroupInput(program.stage, input_info) != nullptr) {
 			lds_storage_class = spv::StorageClassWorkgroup;
 		}
@@ -106,6 +106,7 @@ struct EmitterState {
 	Builder                                          builder;
 	IR::Program&                                     program;
 	ShaderStageInputInfo                             input_info;
+	const SpirvRequirements                          requirements;
 	uint32_t                                        void_type = 0;
 	uint32_t                                        bool_type = 0;
 	uint32_t                                        u32_type = 0;
@@ -126,12 +127,10 @@ struct EmitterState {
 
 	uint32_t                                         lane_count              = 1;
 	uint32_t                                         lane_half               = 0;
-	uint32_t                                         storage_buffer_variable = 0;
-	// Alias of the same set and binding, decorated Coherent; only glc accesses use it.
-	uint32_t                                 storage_buffer_coherent_variable = 0;
-	uint32_t                                         storage_buffer_u8_variable = 0;
-	uint32_t                                         storage_buffer_u16_variable = 0;
-	uint32_t                                         storage_buffer_u64_variable = 0;
+	// u8, u16, u32 and u64 views of the one Buffers binding.
+	std::array<BufferDefinition, 4>                  storage_buffers {};
+	// u32 alias of the same set and binding, decorated Coherent; only glc accesses use it.
+	BufferDefinition                                      coherent_storage_buffer {};
 	std::array<uint32_t, IR::ShaderInfo::MaxDenseBuffers> memory_byte_offsets {};
 	// While non-zero, a storage-buffer access to dynamic_buffer_resource indexes the descriptor
 	// array with this id rather than with that resource's own constant slot. An indirect buffer
@@ -155,14 +154,10 @@ struct EmitterState {
 	uint32_t                                         lds_variable            = 0;
 	uint32_t                                         lds_u64_variable        = 0;
 	std::array<uint32_t, 2>                          scratch_variable {};
-	std::array<uint32_t, IR::ImageBindingCount>      image_variables {};
-	// While non-zero, a sampled-image load naming dynamic_image_resource indexes its descriptor
-	// array with this id rather than with that resource's own constant slot. An indirect image
-	// table sets it around the one sample every candidate of a shape shares. The same reasoning
-	// as dynamic_buffer_index above, in the other descriptor class.
-	uint32_t                   dynamic_image_index                   = 0;
-	uint32_t                   dynamic_image_resource                = 0;
+	std::array<ImageDefinition, IR::ImageBindingCount> images {};
 	uint32_t                   sampler_variable                      = 0;
+	uint32_t                   sampler_type                          = 0;
+	uint32_t                   sampler_pointer_type                  = 0;
 	uint32_t                                                            bindless_arena_variable = 0;
 	std::array<uint32_t, static_cast<size_t>(IR::BindlessShape::Count)> bindless_image_variables {};
 	uint32_t                   main_func                             = 0;
@@ -202,7 +197,6 @@ struct EmitterState {
 	std::vector<InputBinding>  inputs;
 	std::vector<OutputBinding> outputs;
 	std::vector<uint32_t>      interface_variables;
-	std::unordered_map<const IR::Block*, uint32_t> labels;
 	// The first construct the backend cannot express; not an emitter invariant.
 	const char*                refusal      = nullptr;
 	const IR::Inst*            refused_inst = nullptr;
@@ -233,9 +227,6 @@ uint32_t TypeI32Vector(EmitterState& state, uint32_t components);
 uint32_t TypeF32Vector(EmitterState& state, uint32_t components);
 uint32_t TypePointer(EmitterState& state, spv::StorageClass storage_class, uint32_t pointee);
 uint32_t TypeFunction(EmitterState& state);
-uint32_t StorageBufferType(EmitterState& state, uint32_t bits = 32);
-uint32_t TypeStorageBufferElement(EmitterState& state, uint32_t bits);
-uint32_t TypeStorageBufferPointer(EmitterState& state, uint32_t bits = 32);
 uint32_t TypeStorageBufferElementPointer(EmitterState& state, uint32_t bits = 32);
 uint32_t TypePhysicalU32Pointer(EmitterState& state);
 uint32_t TypePushConstantElementPointer(EmitterState& state);
@@ -383,14 +374,17 @@ uint32_t ImageType(EmitterState& state, const IR::ImageResource& image);
 
 uint32_t ImageViewSizeType(EmitterState& state, ImageDimension dimension);
 
-uint32_t ImageDescriptorPointer(EmitterState& state, uint32_t resource, uint32_t mip = 0);
+uint32_t ImageDescriptorPointer(EmitterState& state, uint32_t resource, uint32_t mip = 0,
+                                uint32_t array_index = 0);
 
-uint32_t LoadImageDescriptor(EmitterState& state, uint32_t resource, uint32_t mip = 0);
+uint32_t LoadImageDescriptor(EmitterState& state, uint32_t resource, uint32_t mip = 0,
+                             uint32_t array_index = 0);
 
 uint32_t LoadSamplerDescriptor(EmitterState& state, uint32_t sampler, uint32_t array_index = 0);
 
 uint32_t MakeSampledImage(EmitterState& state, uint32_t resource, uint32_t sampler_id,
-                          uint32_t mip = 0);
+                          uint32_t mip = 0, uint32_t array_index = 0,
+                          bool sampler_dynamic = false);
 IR::ImageResource BindlessImageResource(IR::BindlessShape shape);
 uint32_t          LoadBindlessImage(EmitterState& state, IR::BindlessShape shape, uint32_t element);
 uint32_t MakeBindlessSampledImage(EmitterState& state, IR::BindlessShape shape, uint32_t image,

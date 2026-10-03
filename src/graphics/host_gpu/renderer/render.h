@@ -188,6 +188,8 @@ private:
 	friend class CommandScheduler;
 };
 
+class ThreadDispatcher;
+
 class RenderExecutor {
 public:
 	explicit RenderExecutor(RenderContext& context);
@@ -262,6 +264,7 @@ private:
 	[[nodiscard]] bool TryConsumeComputeImageClear(const ShaderComputeInputInfo& input,
 	                                              CommandBuffer& command, uint32_t group_x,
 	                                              uint32_t group_y, uint32_t group_z, uint32_t mode);
+	[[nodiscard]] ThreadDispatcher& ThreadDispatch();
 
 	RenderContext&                        m_context;
 	GraphicsBindings                     m_graphics_bindings;
@@ -271,6 +274,7 @@ private:
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
 	std::vector<uint32_t>                 m_image_occurrences;
 	std::unique_ptr<BindlessImageHeap>    m_bindless;
+	std::unique_ptr<ThreadDispatcher>     m_thread_dispatch;
 
 	friend class CommandProcessor;
 	friend class BindlessImageHeap;

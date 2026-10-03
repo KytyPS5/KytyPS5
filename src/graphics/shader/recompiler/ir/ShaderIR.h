@@ -422,9 +422,10 @@ static_assert(static_cast<uint32_t>(DescriptorBindingKind::Samplers) == 49u);
 static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 56u);
 
 struct PushData {
-	static constexpr uint32_t DwordCount = 32;
-	static constexpr uint32_t MeshDrawDwordCount = 6;
-	static constexpr uint32_t NoStart    = UINT32_MAX;
+	static constexpr uint32_t        DwordCount              = 32;
+	static constexpr uint32_t        MeshDrawDwordCount      = 6;
+	static constexpr uint32_t        DispatchLimitDwordCount = 2;
+	static constexpr uint32_t        NoStart                 = UINT32_MAX;
 	std::array<uint32_t, DwordCount> dwords {};
 
 	[[nodiscard]] static constexpr bool CanFit(uint32_t start, uint32_t size) {
@@ -571,9 +572,8 @@ struct DescriptorBinding {
 
 struct BindingLayout {
 	uint32_t                       push_data_start_dword = PushData::NoStart;
-	uint32_t                       dispatch_thread_dword = PushData::NoStart;
-	uint32_t                       memory_offset_dword = 0;
-	uint32_t                       memory_offset_count = 0;
+	uint32_t                       memory_offset_dword   = 0;
+	uint32_t                       memory_offset_count   = 0;
 	std::vector<uint32_t>          user_data_registers;
 	std::vector<DescriptorBinding> descriptors;
 	bool                           uses_bindless    = false;

@@ -1594,15 +1594,7 @@ static bool IsFullDispatchPredicate(Value value, uint32_t depth = 0) {
 		return IsFullDispatchPredicate(inst->Arg(0), depth + 1) &&
 		       IsFullDispatchPredicate(inst->Arg(1), depth + 1);
 	}
-	if (inst->GetOpcode() != ValueOpcode::ULessThan32) return false;
-	const auto* global = inst->Arg(0).Resolve().TryInstruction();
-	const auto* extent = inst->Arg(1).Resolve().TryInstruction();
-	if (global == nullptr || global->GetOpcode() != ValueOpcode::GetBuiltin ||
-	    global->Arg(0).Resolve() != Value(static_cast<uint32_t>(StageInputKind::GlobalInvocationId)) ||
-	    extent == nullptr || extent->GetOpcode() != ValueOpcode::GetDispatchThreadExtent)
-		return false;
-	const auto axis = global->Arg(1).Resolve();
-	return axis.IsImmediate() && axis.U32() < 3 && extent->Arg(0).Resolve() == axis;
+	return inst->GetOpcode() == ValueOpcode::DispatchThreadInRange;
 }
 
 // Nonnegative affine coefficients for constant, local and workgroup coordinates. Reject modular
@@ -1692,7 +1684,8 @@ static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 		if (program.info.images.size() != 1 || memory.dmask != 1 || memory.data_bits != 32 ||
 		    memory.image_has_mip || memory.image_sample_flags != 0 || memory.image_r128 ||
 		    memory.image_dimension != Decoder::ImageDimension::Dim2DArray ||
-		    store->Arg(3).Resolve() != Value(true)) return {};
+		    !IsFullDispatchPredicate(store->Arg(3)))
+			return {};
 		const auto& image = program.info.images[memory.resource];
 		if (image.read || image.atomic || image.mip_mode != ImageMipMode::None) return {};
 		const auto* address = store->Arg(1).ResolveInstruction();
@@ -1961,17 +1954,11 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		value = value.Resolve();
 		if (value.IsEmpty()) return {};
 		const auto* inst = value.TryInstruction();
-		if (inst == nullptr)
-			return ValidateRuntimeValue(program, value, RuntimeValueType::Integer) ? value : Value {};
-		// Preserve shared EXEC predicates, including subgraphs with no uniform factor.
-		const auto [found, inserted] = predicates.try_emplace(inst);
-		if (!inserted) return found->second;
-		auto& result = found->second;
-		if (ValidateRuntimeValue(program, value, RuntimeValueType::Integer)) {
-			capture_control_reads |=
-			    !ValidateRuntimeValue(program, value, RuntimeValueType::ImmutableInteger);
-			return result = Clone(value);
+		if (inst != nullptr && inst->GetOpcode() == ValueOpcode::DispatchThreadInRange) {
+			return Value(true);
 		}
+		if (ValidateRuntimeValue(program, value, RuntimeValueType::Integer)) return Clone(value);
+		if (inst == nullptr) return {};
 		const auto op = inst->GetOpcode();
 		if (op == ValueOpcode::ConditionRef || op == ValueOpcode::LogicalNot) {
 			const auto operand = ClonePredicate(inst->Arg(0));
@@ -1983,6 +1970,8 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		if (op != ValueOpcode::LogicalAnd && op != ValueOpcode::LogicalOr) return {};
 		auto left  = ClonePredicate(inst->Arg(0));
 		auto right = ClonePredicate(inst->Arg(1));
+		if (op == ValueOpcode::LogicalAnd && left == Value(true)) return right;
+		if (op == ValueOpcode::LogicalAnd && right == Value(true)) return left;
 		if (left.IsEmpty() && right.IsEmpty()) return {};
 		if (left.IsEmpty() || right.IsEmpty()) {
 			if (unknown.IsEmpty())

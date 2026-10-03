@@ -37,6 +37,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/renderDraw.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
+#include "graphics/host_gpu/renderer/threadDispatch.h"
 #include "graphics/host_gpu/renderer/sync.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/window/windowInternal.h"
@@ -1863,7 +1864,10 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
           "translated resources could not be materialized: " +
               std::string(ShaderRecompiler::IR::LastMaterializeFailure()));
   auto result = ShaderRecompiler::CompileProgram(
-      std::move(translated), options, specialization);
+      std::move(translated), options, specialization,
+      compute_info.dispatch_thread_dimensions
+          ? ShaderRecompiler::IR::PushData::DispatchLimitDwordCount
+          : 0u);
   for (const auto &[text, expected] : test.decoded_counts) {
     const auto actual = CountText(result.decoded_dump, text);
     Require(test.name, "decoded RDNA2", actual == expected,
@@ -2344,6 +2348,81 @@ public:
     m_device.destroyPipelineLayout(pipeline_layout, nullptr);
     m_device.destroyDescriptorSetLayout(layout, nullptr);
     std::printf("[host]    %-32s ok\n", "DescriptorHeapLargeSet");
+  }
+
+  void CheckThreadDispatchRecords() {
+    constexpr const char *name = "ThreadDispatchRecords";
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    ThreadDispatcher dispatcher(context);
+
+    struct Case {
+      std::array<u32, 3> threads;
+      std::array<u32, 3> local;
+      std::array<u32, 3> max_groups;
+      std::array<u32, 3> groups;
+    };
+    const std::array<Case, 5> cases{{
+        {{100, 1, 1}, {64, 1, 1}, {65535, 65535, 65535}, {2, 1, 1}},
+        {{8100, 1, 1}, {64, 1, 1}, {65535, 65535, 65535}, {127, 1, 1}},
+        {{0, 1, 1}, {64, 1, 1}, {65535, 65535, 65535}, {0, 1, 1}},
+        {{128, 5, 3}, {64, 2, 1}, {65535, 65535, 65535}, {2, 3, 3}},
+        {{129, 1, 1}, {64, 1, 1}, {2, 65535, 65535}, {0, 0, 0}},
+    }};
+    constexpr u32 stale = 0x0badf00du;
+    constexpr u32 source_word = 5;
+    for (u32 index = 0; index < cases.size(); index++) {
+      const auto &test = cases[index];
+      auto source = CreateHostBuffer(
+          name, 16 * sizeof(u32),
+          vk::BufferUsageFlagBits::eStorageBuffer |
+              vk::BufferUsageFlagBits::eTransferDst,
+          std::vector<u32>(16, stale));
+      auto readback = CreateHostBuffer(name, 8 * sizeof(u32),
+                                       vk::BufferUsageFlagBits::eTransferDst,
+                                       std::vector<u32>(8, stale));
+      auto cmd = scheduler.Current().Handle();
+      cmd.updateBuffer(source.buffer, source_word * sizeof(u32),
+                       sizeof(test.threads), test.threads.data());
+      const auto record =
+          dispatcher.Convert(cmd, source.buffer, source_word * sizeof(u32),
+                             test.local, test.max_groups);
+      const vk::BufferCopy copy{record.groups_offset, 0, 8 * sizeof(u32)};
+      cmd.copyBuffer(record.buffer, readback.buffer, 1, &copy);
+      vk::MemoryBarrier barrier{};
+      barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+      barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+      cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                          vk::PipelineStageFlagBits::eHost, {}, 1, &barrier, 0,
+                          nullptr, 0, nullptr);
+      scheduler.Finish();
+      const auto words = ReadBuffer(name, readback, 8);
+      DestroyBuffer(&readback);
+      DestroyBuffer(&source);
+      const bool groups_match = words[0] == test.groups[0] &&
+                                words[1] == test.groups[1] &&
+                                words[2] == test.groups[2];
+      const bool limit_match = words[4] == test.threads[0] &&
+                               words[5] == test.threads[1] &&
+                               words[6] == test.threads[2];
+      Require(name, "groups", groups_match,
+              "case " + std::to_string(index) + " groups " +
+                  std::to_string(words[0]) + "," + std::to_string(words[1]) +
+                  "," + std::to_string(words[2]));
+      Require(name, "thread limit", limit_match,
+              "case " + std::to_string(index) + " limit " +
+                  std::to_string(words[4]) + "," + std::to_string(words[5]) +
+                  "," + std::to_string(words[6]));
+      Require(name, "limit address",
+              record.limit_address != 0 && (record.limit_address & 3u) == 0,
+              "the record has no device address for the shader");
+    }
+    std::printf("[host]    %-32s ok\n", name);
   }
 
   void CheckGraphicsPushConstantBank() {
@@ -18271,15 +18350,9 @@ public:
     const auto &layout = compiled.program.bindings;
     Require(test.name, "dispatch", !layout.uses_bindless || bindless != nullptr,
             "a program that samples a descriptor heap needs the bindless set");
-    auto shader_data = compiled.packed_user_data;
-    if (layout.dispatch_thread_dword != ShaderRecompiler::IR::PushData::NoStart) {
-      Require(test.name, "dispatch dimensions", test.has_compute_info,
-              "runtime thread extents are required by the compiled shader");
-      std::copy_n(test.compute_info.dispatch_threads_num, 3,
-                  shader_data.begin() + layout.dispatch_thread_dword);
-    }
-    auto Count = [&](Kind kind) {
-      return layout.descriptor_counts[static_cast<size_t>(kind)];
+    const auto &shader_data = compiled.packed_user_data;
+    auto Binding = [&](Kind kind) {
+      return ShaderRecompiler::IR::FindBinding(layout, kind);
     };
     auto Native = [](Kind kind) {
       return ShaderRecompiler::IR::NativeBinding(ShaderType::Compute, kind);
@@ -18374,8 +18447,9 @@ public:
         : layout.uses_bindless       ? ShaderRecompiler::IR::BindlessDescriptorSet + 1u
                                      : 1u;
     pipeline_layout_info.pSetLayouts = set_layouts.data();
+    const bool thread_limit = test.compute_info.dispatch_thread_dimensions;
     vk::PushConstantRange push_range{};
-    if (layout.UsesPushData()) {
+    if (layout.UsesPushData() || thread_limit) {
       push_range.stageFlags = vk::ShaderStageFlagBits::eCompute;
       push_range.offset = 0;
       push_range.size = ShaderRecompiler::IR::NativePushConstantSize;
@@ -18794,10 +18868,28 @@ public:
                              ShaderRecompiler::IR::BindlessDescriptorSet, 1,
                              &bindless_set, 0, nullptr);
     }
-    if (layout.UsesPushData()) {
+    if (integer_set != nullptr) {
+      cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, pipeline_layout,
+                             ShaderRecompiler::IR::BindlessIntegerDescriptorSet, 1, &integer_set,
+                             0, nullptr);
+    }
+    Buffer thread_limit_buffer;
+    if (layout.UsesPushData() || thread_limit) {
       ShaderRecompiler::IR::PushData push_data;
-      std::copy(shader_data.begin(), shader_data.end(),
-                push_data.dwords.begin() + layout.push_data_start_dword);
+      if (layout.UsesPushData()) {
+        std::copy(compiled.packed_user_data.begin(),
+                  compiled.packed_user_data.end(),
+                  push_data.dwords.begin() + layout.push_data_start_dword);
+      }
+      if (thread_limit) {
+        const auto &threads = test.compute_info.dispatch_threads_num;
+        thread_limit_buffer = CreateStorageBuffer(
+            test.name, {threads[0], threads[1], threads[2]}, 3, true);
+        push_data.dwords[0] =
+            static_cast<u32>(thread_limit_buffer.device_address);
+        push_data.dwords[1] =
+            static_cast<u32>(thread_limit_buffer.device_address >> 32u);
+      }
       cmd.pushConstants(pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
                         sizeof(push_data), push_data.dwords.data());
     }
@@ -18870,6 +18962,9 @@ public:
     }
     if (user_data_buffer.buffer != nullptr) {
       DestroyBuffer(&user_data_buffer);
+    }
+    if (thread_limit_buffer.buffer != nullptr) {
+      DestroyBuffer(&thread_limit_buffer);
     }
     DestroyBuffer(&shared_buffer);
     m_device.destroyDescriptorPool(descriptor_pool, nullptr);
@@ -28964,6 +29059,38 @@ TestCase VectorMbcntUsesThreadMask() {
   test.compute_info.workgroup_register = 0;
   test.has_compute_info = true;
   test.dispatch_x = 2;
+  return test;
+}
+
+TestCase ThreadDimensionLastGroupMasked() {
+  auto test = VectorMbcntUsesThreadMask();
+  test.name = "ThreadDimensionLastGroupMasked";
+  test.initial = std::vector<u32>(8, 0xdeadbeefu);
+  test.expected = {0, 1, 2, 3, 0, 1, 0xdeadbeefu, 0xdeadbeefu};
+  test.compute_info.dispatch_thread_dimensions = true;
+  test.compute_info.dispatch_threads_num[0] = 6;
+  test.compute_info.dispatch_threads_num[1] = 1;
+  test.compute_info.dispatch_threads_num[2] = 1;
+  test.required_spirv = {"OpConvertUToPtr", "OpULessThan"};
+  return test;
+}
+
+TestCase ThreadDimensionWaveHalvesMasked(u32 wave_size) {
+  auto test = VectorMbcntUsesThreadMask();
+  test.name = wave_size == 64 ? "ThreadDimensionWave64Masked"
+                              : "ThreadDimensionWave32Masked";
+  test.code[1] = EncodeVop2(0x1a, 1, InlineU32(6), 1);
+  test.initial = std::vector<u32>(128, 0xdeadbeefu);
+  test.expected.assign(128, 0xdeadbeefu);
+  for (u32 i = 0; i < 104; i++) {
+    test.expected[i] = (i % 64u) % wave_size;
+  }
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.wave_size = wave_size;
+  test.compute_info.dispatch_thread_dimensions = true;
+  test.compute_info.dispatch_threads_num[0] = 104;
+  test.compute_info.dispatch_threads_num[1] = 1;
+  test.compute_info.dispatch_threads_num[2] = 1;
   return test;
 }
 
@@ -43703,6 +43830,9 @@ std::vector<TestCase> MakeCases() {
   AddCase(GuestScalarLowestBitIterate);
   AddCase(VectorCarryAndBitCountOps);
   AddCase(VectorMbcntUsesThreadMask);
+  AddCase(ThreadDimensionLastGroupMasked);
+  AddCase([] { return ThreadDimensionWaveHalvesMasked(64); });
+  AddCase([] { return ThreadDimensionWaveHalvesMasked(32); });
   AddCase(VectorAddcWritesPerLaneCarryOut);
   AddCase(VectorAddcUsesPerLaneCarryIn);
   AddCase(VectorSubCoCiU32CompactAndVop3);
@@ -49776,6 +49906,15 @@ int main(int argc, char **argv) {
     CheckWave64ExecZeroLoopExit(&vulkan);
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--thread-dimensions-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, VectorMbcntUsesThreadMask());
+    RunCase(&vulkan, ThreadDimensionLastGroupMasked());
+    RunCase(&vulkan, ThreadDimensionWaveHalvesMasked(64));
+    RunCase(&vulkan, ThreadDimensionWaveHalvesMasked(32));
+    vulkan.CheckThreadDispatchRecords();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--scalar-select-vcc-only") == 0) {
     VulkanHarness vulkan;
     CheckScalarSelectIntoVccFeedsDescriptor(&vulkan);
@@ -50813,6 +50952,7 @@ int main(int argc, char **argv) {
   CheckIndirectImageKeySwitch();
   CheckWave64ExecZeroLoopExit(&vulkan);
   CheckScalarSelectIntoVccFeedsDescriptor(&vulkan);
+  vulkan.CheckThreadDispatchRecords();
   CheckWave64WholeWaveResults();
   CheckGlcBufferAccessIsCoherent();
   CheckEmissionRefusalIsSoft();

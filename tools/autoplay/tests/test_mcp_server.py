@@ -288,5 +288,54 @@ class StdioRoundTrip(unittest.TestCase):
             asyncio.run(asyncio.wait_for(scenario(), 120))
 
 
+def launcher_python():
+    """The interpreter tools/autoplay/mcp_server.sh would pick."""
+    venv = HERE.parent / ".venv" / "bin" / "python"
+    return str(venv) if venv.exists() else "python3"
+
+
+def launcher_has_mcp():
+    import subprocess
+    try:
+        return subprocess.run([launcher_python(), "-c", "import mcp"], capture_output=True).returncode == 0
+    except OSError:
+        return False
+
+
+@unittest.skipUnless(HAVE_MCP and launcher_has_mcp(), "the launcher's interpreter has no mcp package")
+class Launcher(unittest.TestCase):
+    def test_launcher_serves_from_any_directory(self):
+        from mcp import ClientSession
+        from mcp.client.stdio import StdioServerParameters, stdio_client
+
+        params = StdioServerParameters(command="sh", args=[str(HERE.parent / "mcp_server.sh")],
+                                       env=dict(os.environ), cwd=tempfile.gettempdir())
+
+        async def scenario():
+            async with stdio_client(params) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    names = {tool.name for tool in (await session.list_tools()).tools}
+                    self.assertIn("look", names)
+
+        asyncio.run(asyncio.wait_for(scenario(), 60))
+
+    def test_launcher_explains_a_missing_sdk(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            # A copy of the launcher next to no virtualenv, with a python3 that cannot import mcp.
+            launcher = Path(tmp) / "mcp_server.sh"
+            launcher.write_text((HERE.parent / "mcp_server.sh").read_text())
+            shim = Path(tmp) / "bin"
+            shim.mkdir()
+            (shim / "python3").write_text(f'#!/bin/sh\nexec "{sys.executable}" -I -S "$@"\n')
+            (shim / "python3").chmod(0o755)
+            env = {**os.environ, "PATH": f"{shim}:{os.environ.get('PATH', '')}"}
+            done = subprocess.run(["sh", str(launcher)], capture_output=True, text=True, env=env,
+                                  stdin=subprocess.DEVNULL)
+            self.assertEqual(done.returncode, 1)
+            self.assertIn("setup-mcp.sh", done.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

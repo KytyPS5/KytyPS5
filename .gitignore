@@ -8,3 +8,4 @@ cmake-build-debug/
 _PipelineCache/
 __pycache__/
 *.pyc
+tools/autoplay/.venv/

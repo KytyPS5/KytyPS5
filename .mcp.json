@@ -1,8 +1,10 @@
 {
   "mcpServers": {
     "kyty": {
-      "command": "python3",
-      "args": ["tools/autoplay/mcp_server.py"],
+      "command": "sh",
+      "args": [
+        "tools/autoplay/mcp_server.sh"
+      ],
       "env": {
         "KYTY_GAME": "${KYTY_GAME:-}",
         "KYTY_EMULATOR_ARGS": "${KYTY_EMULATOR_ARGS:-}",

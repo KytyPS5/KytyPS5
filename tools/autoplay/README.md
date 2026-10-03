@@ -70,15 +70,17 @@ local [Ollama](https://ollama.com) vision model what is on screen. The repositor
 registers it as `kyty` for Claude Code.
 
 ```
-pip install -r tools/autoplay/requirements-mcp.txt     # mcp + pillow, for the python3 in .mcp.json
+sh tools/autoplay/setup-mcp.sh          # private virtualenv in tools/autoplay/.venv; checks Ollama
 ollama pull qwen2.5vl:3b
-export KYTY_GAME=/path/to/PPSA04264                     # or a kyty_run.sh next to the emulator
-claude mcp list                                         # kyty should show as connected
+export KYTY_GAME=/path/to/PPSA04264     # fish: set -x KYTY_GAME /path/to/PPSA04264
+claude mcp list                         # kyty should show as connected
 ```
 
-If `python3` is not the interpreter with `mcp` installed, or the server cannot find its script,
-register it with absolute paths instead:
-`claude mcp add kyty -- /path/to/venv/bin/python /path/to/KytyPS5/tools/autoplay/mcp_server.py`.
+The setup needs only `python3` with `venv` (Debian/Ubuntu: `sudo apt install python3-venv`); it
+does not touch the system Python. `.mcp.json` starts `tools/autoplay/mcp_server.sh`, which uses that
+virtualenv (or `python3`, if you installed `mcp` there yourself). Set `KYTY_GAME` before starting
+Claude Code, or pass the game to `start_game`. If `kyty` does not connect, register it with an
+absolute path: `claude mcp add kyty -- sh /path/to/KytyPS5/tools/autoplay/mcp_server.sh`.
 
 | tool | |
 |---|---|

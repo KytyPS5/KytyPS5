@@ -75,7 +75,8 @@ spirv-val --target-env vulkan1.3 $CAP/out.spv
 
 ## Navigate with the `kyty` MCP server (preferred for exploring)
 
-When the `kyty` MCP server is connected (`.mcp.json`; setup in `tools/autoplay/README.md`), play
+When the `kyty` MCP server is connected (`.mcp.json`; one-time setup is
+`sh tools/autoplay/setup-mcp.sh`, details in `tools/autoplay/README.md`), play
 the game through its tools instead of the CLI:
 
 1. `start_game` (it uses `KYTY_GAME` or `kyty_run.sh` when no game is given). Boot can take minutes
@@ -125,7 +126,8 @@ stops; a scenario without a `verify = "controllable"` step cannot PASS.
 - A game that never presents is reported as a hang after `--boot-grace` (default 120 s, much longer
   than the 20 s used once it has presented). GTA compiles many shaders before its first frame; raise
   it in the scenario's `[run]` if needed.
-- The harness needs Python 3.11+ and Pillow for screenshot steps (`pip install pillow`).
+- The harness needs Python 3.11+ and Pillow for screenshot steps; `sh tools/autoplay/setup-mcp.sh`
+  puts both (and the MCP SDK) in `tools/autoplay/.venv`.
 - If a `git stash` in your checkout holds an earlier attempt at fixing this GTA V failure
   (`stash@{0}` in the original work), do not reuse its recompiler or renderer changes and leave the
   stash alone; its tooling has been reimplemented here.

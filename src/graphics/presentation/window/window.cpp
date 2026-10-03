@@ -362,27 +362,58 @@ static void GameEventDidEnterForeground(WindowLoopState& game) {
 	SetPause(game, false);
 }
 
+/// Resizes the drawable surface to the given pixel dimensions.
+/// Sets `minimized = false` on a positive size; sets `minimized = true` and returns early on zero.
 void WindowContext::Resize(uint32_t new_width, uint32_t new_height) {
-	EXIT_IF(new_width == 0 || new_height == 0);
+	if (new_width == 0 || new_height == 0) {
+		LOGF("WindowContext::Resize(): ignoring 0-sized resize request (%" PRIu32 "x%" PRIu32
+		     "); window is likely minimized/hidden\n",
+		     new_width, new_height);
+		minimized.store(true, std::memory_order_release);
+		return;
+	}
 	Common::LockGuard lock(mutex);
 	graphic_ctx.screen_width  = new_width;
 	graphic_ctx.screen_height = new_height;
+	minimized.store(false, std::memory_order_release);
 }
 
+/// Queries the current drawable pixel size from SDL and calls Resize() to clear `minimized`.
+/// Skips the call when the window is still minimised or SDL reports a non-positive size.
+void WindowContext::RefreshSizeFromWindow() {
+	if (SDL_GetWindowFlags(window) & SDL_WINDOW_MINIMIZED) {
+		return;
+	}
+	int width  = 0;
+	int height = 0;
+	if (SDL_GetWindowSizeInPixels(window, &width, &height) && width > 0 && height > 0) {
+		Resize(static_cast<uint32_t>(width), static_cast<uint32_t>(height));
+	}
+}
+
+/// Dispatches a single SDL window event and keeps `minimized` up to date.
+/// Sets `minimized = true` on HIDDEN/MINIMIZED or non-positive sizes;
+/// clears it on RESTORED/MAXIMIZED, positive PIXEL_SIZE_CHANGED, SHOWN, or EXPOSED.
 void WindowContext::ProcessWindowEvent(const SDL_WindowEvent& event) {
 	const auto& window_event = event;
 	switch (window_event.type) {
-		case SDL_EVENT_WINDOW_SHOWN:
+		case SDL_EVENT_WINDOW_SHOWN: {
 			LOGF("Window %" PRIu32 " shown\n", window_event.windowID);
+			RefreshSizeFromWindow();
 			break;
+		}
 
-		case SDL_EVENT_WINDOW_HIDDEN:
+		case SDL_EVENT_WINDOW_HIDDEN: {
 			LOGF("Window %" PRIu32 " hidden\n", window_event.windowID);
+			minimized.store(true, std::memory_order_release);
 			break;
+		}
 
-		case SDL_EVENT_WINDOW_EXPOSED:
+		case SDL_EVENT_WINDOW_EXPOSED: {
 			LOGF("Window %" PRIu32 " exposed\n", window_event.windowID);
+			RefreshSizeFromWindow();
 			break;
+		}
 
 		case SDL_EVENT_WINDOW_MOVED:
 			LOGF("Window %" PRIu32 " moved to %" PRId32 ",%" PRId32 "\n", window_event.windowID,
@@ -392,24 +423,44 @@ void WindowContext::ProcessWindowEvent(const SDL_WindowEvent& event) {
 		case SDL_EVENT_WINDOW_RESIZED:
 			LOGF("Window %" PRIu32 " resized to %" PRId32 "x%" PRId32 "\n", window_event.windowID,
 			     window_event.data1, window_event.data2);
+			if (window_event.data1 <= 0 || window_event.data2 <= 0) {
+				LOGF("Window %" PRIu32 " ignoring non-positive resize %" PRId32 "x%" PRId32 "\n",
+				     window_event.windowID, window_event.data1, window_event.data2);
+				minimized.store(true, std::memory_order_release);
+			}
 			break;
 
 		case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
 			LOGF("Window %" PRIu32 " size changed to %" PRId32 "x%" PRId32 "\n",
 			     window_event.windowID, window_event.data1, window_event.data2);
 
-			Resize(window_event.data1, window_event.data2);
+			if (window_event.data1 > 0 && window_event.data2 > 0) {
+				Resize(static_cast<uint32_t>(window_event.data1),
+				       static_cast<uint32_t>(window_event.data2));
+			} else {
+				LOGF("Window %" PRIu32 " ignoring non-positive size change %" PRId32 "x%" PRId32
+				     "\n",
+				     window_event.windowID, window_event.data1, window_event.data2);
+				minimized.store(true, std::memory_order_release);
+			}
 
 			break;
 
 		case SDL_EVENT_WINDOW_MINIMIZED:
 			LOGF("Window %" PRIu32 " minimized\n", window_event.windowID);
+			minimized.store(true, std::memory_order_release);
 			break;
 		case SDL_EVENT_WINDOW_MAXIMIZED:
 			LOGF("Window %" PRIu32 " maximized\n", window_event.windowID);
+			minimized.store(false, std::memory_order_release);
+			// Refresh the cached drawable size in case no PIXEL_SIZE_CHANGED event follows.
+			RefreshSizeFromWindow();
 			break;
 		case SDL_EVENT_WINDOW_RESTORED:
 			LOGF("Window %" PRIu32 " restored\n", window_event.windowID);
+			minimized.store(false, std::memory_order_release);
+			// Refresh the cached drawable size in case no PIXEL_SIZE_CHANGED event follows.
+			RefreshSizeFromWindow();
 			break;
 		case SDL_EVENT_WINDOW_MOUSE_ENTER:
 			LOGF("Mouse entered window %" PRIu32 "\n", window_event.windowID);

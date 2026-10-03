@@ -42,7 +42,10 @@ struct WindowContext {
 	void                                                    RefreshSurfaceCapabilities();
 	void                                                    UpdateIcon();
 	void                                                    UpdateTitle();
-	void                                                    Resize(uint32_t width, uint32_t height);
+	/// Resizes the drawable surface to the given pixel dimensions.
+	/// Sets `minimized = false` on a positive size; sets `minimized = true` and returns early on zero.
+	void Resize(uint32_t width, uint32_t height);
+	/// Dispatches a single SDL window event and keeps `minimized` up to date.
 	void ProcessWindowEvent(const SDL_WindowEvent& event);
 	void ProcessDisplayEvent(const SDL_DisplayEvent& event);
 	void ProcessEvent(double time_seconds);
@@ -55,8 +58,14 @@ struct WindowContext {
 	std::unique_ptr<RenderContext> render_context;
 	std::unique_ptr<Presenter>     presenter;
 	WindowLoopState                loop;
+	std::atomic_bool               minimized     = false;
 
 	Common::Mutex mutex;
+
+private:
+	/// Queries the current drawable size via SDL and calls Resize() to clear `minimized`.
+	/// Does nothing when the window is still minimised or the reported size is non-positive.
+	void RefreshSizeFromWindow();
 };
 
 } // namespace Libs::Graphics

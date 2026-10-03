@@ -1,5 +1,41 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **3 октября 2026 года, 20:47 UTC** (native Windows via WSL;
+branch `yotei-windows-bringup`, source head `2f202943` plus test/docs work):
+
+- A bounded synthetic Vertex mask-draining probe now covers a 32-bit
+  all-ones mask, `ReadLane`, a matching-lane ballot, 32-iteration guard and
+  numerical output marker. GPUAV readback reported an undrained mask at
+  48 indices (and at 96 on the first test build); initializing that mask
+  from `Ballot(true)` instead passed at 48. The existing 96-index long
+  cross-lane/indirect-image control passed. Native test exe SHA-256
+  `2e05fe92170365eda43d0aa44e5e7bf983651166155beecb87ff73d5ca291b90`;
+  logs `_Build/logs/mask-drain-{allones48,active48,neighbor96}-gpuav-20261003*`.
+  This proves a bounded host graphics subgroup mismatch under the test's
+  all-ones mask; it does not prove the same cause of the game's DeviceLost.
+  The game shader's mask source and guest padded-lane contract remain open.
+- Bounded clean installed emulator retry without Vulkan validation or
+  GPUAV: `_Build/runs/yotei-integrated-20261003-204530-presentfix-noval`.
+  Installed exe SHA-256
+  `e95fffb53e48e76f480985c793965d44584314e427c87ac0025c7193d4b8e8f9`.
+  The process exited `-2147483645` before any shown frame, immediately
+  after initial shader activity. This repeats the historical no-GPUAV
+  driver/compiler failure; it supplies no new menu/readback result. The
+  last clean GPUAV readback remains nonzero frames 198–199 followed by
+  `ErrorDeviceLost` around shown 200. Menu and gameplay **PENDING**.
+- Reviewed fresh upstream PRs #1015, #1012, #1019 and the existing #988,
+  #986. #1015 optimizes SPIR-V but reports no game/driver compile timing;
+  #988 caches recompiler plans on warm launches, not first GPUAV driver
+  pipeline creation; #1012 fixes a MoltenVK branch shape; #1019 handles
+  invalid image formats not seen at the current draw. #986 caps loops but
+  changes guest work and is not a semantic fix. None establishes an
+  independently validated correction for this runtime blocker.
+- Next: determine from the captured guest Vertex ISA whether its all-ones
+  loop mask is intentional and how padded lanes execute on guest hardware;
+  then design a shared, testable graphics wave64 path or another proved
+  cause. Avoid another GPU reset from an unbounded shader. Preserve first
+  nonzero, menu and gameplay as separate milestones.
+
 Checkpoint **3 октября 2026 года, 20:25 UTC** (native Windows via WSL;
 branch `yotei-windows-bringup`, pushed test/diagnostic commit `676aa650`):
 

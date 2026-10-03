@@ -36983,7 +36983,8 @@ void CheckIndirectImageKeySwitch(
     bool vertex_loop = false, bool vertex_buffers = false,
     bool vertex_wave64 = false, bool vertex_subgroup = false,
     bool vertex_cross_lane = false, bool vertex_divergent_loop = false,
-    bool vertex_long_loop = false) {
+    bool vertex_long_loop = false, bool vertex_mask_drain = false,
+    bool vertex_mask_seed_live = false) {
   constexpr uint32_t mapping_capacity = 1793u;
   using namespace ShaderRecompiler::IR;
 
@@ -37000,6 +37001,7 @@ void CheckIndirectImageKeySwitch(
   Block *loop_header = nullptr;
   Block *loop_body = nullptr;
   Inst *loop_color = nullptr;
+  Inst *loop_mask = nullptr;
 
   auto &index = vertex
       ? block->AppendNewInst(ValueOpcode::GetBuiltin,
@@ -37028,6 +37030,15 @@ void CheckIndirectImageKeySwitch(
     program.blocks.insert(program.blocks.end(), {loop_header, loop_body, loop_exit});
     for (u32 id = 1u; id <= 3u; ++id)
       program.block_info.push_back({.id = id});
+    Value initial_mask(0xffffffffu);
+    if (vertex_mask_seed_live) {
+      auto &entry_votes = block->AppendNewInst(
+          ValueOpcode::Ballot, {Value(true)});
+      auto &entry_low = block->AppendNewInst(
+          ValueOpcode::CompositeExtractU32x4,
+          {Value(&entry_votes), Value(0u)});
+      initial_mask = Value(&entry_low);
+    }
     block->AddBranch(loop_header);
     program.block_info[0].terminator.kind = ShaderRecompiler::CFG::TerminatorKind::Branch;
     program.block_info[0].terminator.true_block = 1u;
@@ -37036,6 +37047,11 @@ void CheckIndirectImageKeySwitch(
     auto &color = loop_header->AppendNewInst(
         ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32x4));
     loop_color = &color;
+    if (vertex_mask_drain) {
+      loop_mask = &loop_header->AppendNewInst(
+          ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+      loop_mask->AddPhiOperand(block, initial_mask);
+    }
     Value loop_limit(2u);
     if (vertex_divergent_loop) {
       auto &parity = loop_header->AppendNewInst(
@@ -37045,8 +37061,17 @@ void CheckIndirectImageKeySwitch(
           ValueOpcode::IAdd32, {Value(&parity), Value(1u)});
       loop_limit = Value(&limit);
     }
-    auto &within = loop_header->AppendNewInst(
-        ValueOpcode::ULessThan32, {Value(&counter), loop_limit});
+    auto &under_limit = loop_header->AppendNewInst(
+        ValueOpcode::ULessThan32,
+        {Value(&counter), vertex_mask_drain ? Value(32u) : loop_limit});
+    Value within(&under_limit);
+    if (vertex_mask_drain) {
+      auto &has_mask = loop_header->AppendNewInst(
+          ValueOpcode::INotEqual32, {Value(loop_mask), Value(0u)});
+      auto &continue_loop = loop_header->AppendNewInst(
+          ValueOpcode::LogicalAnd, {within, Value(&has_mask)});
+      within = Value(&continue_loop);
+    }
     loop_header->AddBranch(loop_body);
     loop_header->AddBranch(loop_exit);
     auto &header_term = program.block_info[1].terminator;
@@ -37056,7 +37081,7 @@ void CheckIndirectImageKeySwitch(
     header_term.loop_header = true;
     header_term.merge_block = 3u;
     header_term.continue_block = 2u;
-    program.block_info[1].condition = Value(&within);
+    program.block_info[1].condition = within;
     auto &next = loop_body->AppendNewInst(
         ValueOpcode::IAdd32, {Value(&counter), Value(1u)});
     counter.AddPhiOperand(block, Value(0u));
@@ -37144,6 +37169,28 @@ void CheckIndirectImageKeySwitch(
         {Value(&has_valid), Value(&self), Value(0u)});
     image_key = Value(&selected);
   }
+  if (vertex_mask_drain) {
+    // Bound a scalar mask waterfall even when a graphics subgroup has fewer
+    // active invocations than its nominal 32 lanes. The exit export reports
+    // whether all mask bits were actually consumed.
+    auto &first = block->AppendNewInst(
+        ValueOpcode::FindILsb32, {Value(loop_mask)});
+    auto &selected_key = block->AppendNewInst(
+        ValueOpcode::ReadLane, {Value(&key), Value(&first)});
+    auto &matching = block->AppendNewInst(
+        ValueOpcode::IEqual32, {Value(&key), Value(&selected_key)});
+    auto &votes = block->AppendNewInst(
+        ValueOpcode::Ballot, {Value(&matching)});
+    auto &low = block->AppendNewInst(
+        ValueOpcode::CompositeExtractU32x4,
+        {Value(&votes), Value(0u)});
+    auto &not_low = block->AppendNewInst(
+        ValueOpcode::BitwiseNot32, {Value(&low)});
+    auto &remaining = block->AppendNewInst(
+        ValueOpcode::BitwiseAnd32,
+        {Value(loop_mask), Value(&not_low)});
+    loop_mask->AddPhiOperand(loop_body, Value(&remaining));
+  }
   auto &image =
       block->AppendNewInst(ValueOpcode::GetImageResource,
                            {image_key, Value(0u), Value(0u), Value(0u),
@@ -37193,9 +37240,21 @@ void CheckIndirectImageKeySwitch(
     auto &position_export = block->AppendNewInst(
         ValueOpcode::SetAttribute, {Value(&position), Value(true)});
     position_export.SetFlags<ExportFlags>({.index = 0u});
+    Value export_color = vertex_loop ? Value(loop_color) : Value(&sample);
+    if (vertex_mask_drain) {
+      auto &drained = block->AppendNewInst(
+          ValueOpcode::IEqual32, {Value(loop_mask), Value(0u)});
+      auto &red = block->AppendNewInst(
+          ValueOpcode::SelectU32,
+          {Value(&drained), Value(std::bit_cast<u32>(1.0f)), Value(0u)});
+      auto &marker = block->AppendNewInst(
+          ValueOpcode::CompositeConstructU32x4,
+          {Value(&red), Value(std::bit_cast<u32>(0.5f)),
+           Value(std::bit_cast<u32>(0.75f)), Value(std::bit_cast<u32>(1.0f))});
+      export_color = Value(&marker);
+    }
     auto &color_export = block->AppendNewInst(
-        ValueOpcode::SetAttribute,
-        {vertex_loop ? Value(loop_color) : Value(&sample), Value(true)});
+        ValueOpcode::SetAttribute, {export_color, Value(true)});
     color_export.SetFlags<ExportFlags>({.index = 1u});
   } else {
     auto &sample_x = block->AppendNewInst(ValueOpcode::CompositeExtractU32x4,
@@ -46313,6 +46372,9 @@ if (argc == 1) {
        std::strcmp(argv[1], "--wide-vertex-wave64-cross-lane-divergent-indexed-120000-only") == 0 ||
        std::strcmp(argv[1], "--wide-vertex-wave64-cross-lane-long-indexed-96-only") == 0 ||
        std::strcmp(argv[1], "--wide-vertex-wave64-cross-lane-long-indexed-120000-only") == 0 ||
+       std::strcmp(argv[1], "--wide-vertex-wave64-mask-drain-indexed-48-only") == 0 ||
+       std::strcmp(argv[1], "--wide-vertex-wave64-mask-drain-indexed-96-only") == 0 ||
+       std::strcmp(argv[1], "--wide-vertex-wave64-mask-drain-active-indexed-48-only") == 0 ||
        std::strcmp(argv[1], "--wide-vertex-wave64-cross-lane-buffers-indexed-120000-only") == 0 ||
        std::strcmp(argv[1], "--wide-vertex-indexed-300-only") == 0 ||
        std::strcmp(argv[1], "--wide-vertex-indexed-753-only") == 0 ||
@@ -46328,6 +46390,12 @@ if (argc == 1) {
                                 ? 96u
                             : std::strcmp(argv[1], "--wide-vertex-wave64-cross-lane-long-indexed-96-only") == 0
                                 ? 96u
+                            : std::strcmp(argv[1], "--wide-vertex-wave64-mask-drain-indexed-48-only") == 0
+                                ? 48u
+                            : std::strcmp(argv[1], "--wide-vertex-wave64-mask-drain-indexed-96-only") == 0
+                                ? 96u
+                            : std::strcmp(argv[1], "--wide-vertex-wave64-mask-drain-active-indexed-48-only") == 0
+                                ? 48u
                             : std::strcmp(argv[1], "--wide-vertex-loop-indexed-753-only") == 0
                                 ? 753u
                             : std::strcmp(argv[1], "--wide-vertex-loop-buffers-indexed-753-only") == 0
@@ -46364,7 +46432,8 @@ if (argc == 1) {
         std::strncmp(argv[1], "--wide-vertex-loop-buffers-", 27u) == 0;
     const bool vertex_subgroup =
         std::strncmp(argv[1], "--wide-vertex-wave64-subgroup-", 30u) == 0 ||
-        std::strncmp(argv[1], "--wide-vertex-wave64-cross-lane-", 32u) == 0;
+        std::strncmp(argv[1], "--wide-vertex-wave64-cross-lane-", 32u) == 0 ||
+        std::strncmp(argv[1], "--wide-vertex-wave64-mask-drain-", 32u) == 0;
     const bool vertex_cross_lane =
         std::strncmp(argv[1], "--wide-vertex-wave64-cross-lane-", 32u) == 0;
     const bool vertex_divergent_loop =
@@ -46375,18 +46444,25 @@ if (argc == 1) {
     const bool vertex_long_loop =
         std::strcmp(argv[1], "--wide-vertex-wave64-cross-lane-long-indexed-96-only") == 0 ||
         std::strcmp(argv[1], "--wide-vertex-wave64-cross-lane-long-indexed-120000-only") == 0;
+    const bool vertex_mask_drain =
+        std::strncmp(argv[1], "--wide-vertex-wave64-mask-drain-", 32u) == 0;
+    const bool vertex_mask_seed_live =
+        std::strcmp(argv[1], "--wide-vertex-wave64-mask-drain-active-indexed-48-only") == 0;
     CheckIndirectImageKeySwitch(Prospero::TextureNumericClass::Float,
                                 "WideIndirectImageVertexSwitch", true, true, &vertex,
                                 vertex_loop, vertex_buffers, vertex_wave64,
                                 vertex_subgroup, vertex_cross_lane,
-                                vertex_divergent_loop, vertex_long_loop);
+                                vertex_divergent_loop, vertex_long_loop,
+                                vertex_mask_drain, vertex_mask_seed_live);
     auto test = GraphicsInterpolationExport();
     test.name = "WideVertexIndexedSample";
     test.index_count = index_count;
     test.unique_vertex_count = index_count;
     const u32 last_key = ((index_count / 3u) - 1u) & 255u;
     const u32 selected_image = last_key <= 250u ? last_key : 0u;
-    test.expected_pixel = {std::bit_cast<u32>(1.0f + static_cast<float>(selected_image) / 256.0f),
+    test.expected_pixel = {std::bit_cast<u32>(vertex_mask_drain
+                                              ? 1.0f
+                                              : 1.0f + static_cast<float>(selected_image) / 256.0f),
                            std::bit_cast<u32>(0.5f),
                            std::bit_cast<u32>(0.75f), std::bit_cast<u32>(1.0f)};
     VulkanHarness vulkan;

@@ -30,6 +30,38 @@ diagnostic runs.
 
 ## Divergent graphics wave64 loop with indirect images (2026-10-03; pending)
 
+New bounded lead: the identified indexed draw has 119856 indices, leaving
+16 after division by the native 32-lane subgroup size. In saved SPIR-V
+`_Build/analysis/vs-e312-20261003.spvasm`, the loop mask starts as
+`0xffffffff` in both words, then subtracts a native ballot from both words.
+If a final subgroup contains only 16 executing invocations, ballot cannot
+clear bits 16..31 and that loop may continue selecting absent lanes. Vulkan
+does not guarantee full graphics subgroups; the actual invocation grouping
+and the guest shader's mask provenance remain to be verified. Add a synthetic
+Vertex mask-draining loop with a strict 32-iteration guard, subgroup ballot
+and ReadLane, and distinct output when the mask remains after the guard. Run
+small full and partial indexed draws with readback and GPUAV before changing
+production behavior. A RED here would establish the mechanism in the host
+model; it would not alone prove this is the game's device-loss cause.
+
+The bounded synthetic probe is now in `ShaderRecompilerComputeTests.cpp`.
+Native test exe SHA-256 `2e05fe92170365eda43d0aa44e5e7bf983651166155beecb87ff73d5ca291b90`:
+`--wide-vertex-wave64-mask-drain-indexed-48-only` returned exit 9, with
+readback red `0` instead of expected `1` after 32 iterations
+(`_Build/logs/mask-drain-allones48-gpuav-20261003{,.stderr,.run.json}`).
+The 96-index variant also left the mask nonzero on the prior test build,
+so draw count divisible by 32 does not ensure full graphics subgroups.
+The same 48-index case initialized from `Ballot(true)` instead of all ones
+and passed with GPUAV (`mask-drain-active48-gpuav-20261003*`); the preexisting
+96-index cross-lane/long-loop control passed on the all-ones test build
+(`mask-drain-neighbor96-gpuav-20261003*`). No device loss occurred in these
+bounded probes. This is a host graphics subgroup mismatch diagnostic, not a
+verified guest emulation fix: the guest shader's initial mask provenance and
+hardware execution of padded vertices are still unknown. In particular,
+Vulkan `ReadLane` of an inactive target cannot be treated as an oracle.
+Do not mask arbitrary guest scalar values or silently cap the loop. Verify
+the guest ISA path before changing shared lowering.
+
 The clean Yōtei retry at `_Build/runs/yotei-integrated-20261003-181855-presentfix-gpuav`
 lost the device at `shown=200` after nonzero prepared frames 198 and 199.
 An earlier SyncDiag capture points to a large indexed draw using vertex shader

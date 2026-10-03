@@ -178,6 +178,8 @@ private:
 	friend class CommandScheduler;
 };
 
+class ThreadDispatcher;
+
 class RenderExecutor {
 public:
 	explicit RenderExecutor(RenderContext& context);
@@ -249,6 +251,7 @@ private:
 	[[nodiscard]] bool TryConsumeComputeFill(const ShaderComputeInputInfo& input,
 	                                        CommandBuffer& command, uint32_t group_x,
 	                                        uint32_t group_y, uint32_t group_z, uint32_t mode);
+	[[nodiscard]] ThreadDispatcher&     ThreadDispatch();
 
 	RenderContext&                        m_context;
 	GraphicsBindings                     m_graphics_bindings;
@@ -256,6 +259,7 @@ private:
 	std::vector<ImageId>                  m_bound_images;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
+	std::unique_ptr<ThreadDispatcher>     m_thread_dispatch;
 	bool m_mesh_indirect        = true;
 
 	friend class CommandProcessor;

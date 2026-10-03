@@ -371,11 +371,19 @@ static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 58u);
 struct PushData {
 	static constexpr uint32_t DwordCount = 32;
 	static constexpr uint32_t MeshDrawDwordCount = 6;
+	static constexpr uint32_t        DispatchLimitDwordCount = 2;
 	static constexpr uint32_t NoStart    = UINT32_MAX;
 	std::array<uint32_t, DwordCount> dwords {};
 
 	// User clip planes 0..N follow the mesh draw parameters or object ID, four dwords each.
 	static constexpr uint32_t UserClipPlaneDword = MeshDrawDwordCount;
+	// Indices inside INDEX_BUFFER_SIZE from the draw's first index; after the user clip planes.
+	static constexpr uint32_t MeshIndexBoundParameter = MeshDrawDwordCount;
+
+	[[nodiscard]] static constexpr uint32_t MeshIndexBoundDword(uint32_t user_clip_planes) {
+		return user_clip_planes != 0 ? UserClipPlaneDword + 4u * std::bit_width(user_clip_planes)
+		                             : MeshDrawDwordCount;
+	}
 
 	[[nodiscard]] static constexpr uint32_t GraphicsDrawDwords(bool mesh, bool object_id,
 	                                                           uint32_t user_clip_planes = 0) {

@@ -25,6 +25,7 @@
 #include "graphics/host_gpu/renderer/refusalReport.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/threadDispatch.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -760,6 +761,13 @@ static vk::DescriptorBufferInfo NativeUpload(RenderContext&            context,
 
 
 RenderExecutor::~RenderExecutor() = default;
+
+ThreadDispatcher& RenderExecutor::ThreadDispatch() {
+	if (m_thread_dispatch == nullptr) {
+		m_thread_dispatch = std::make_unique<ThreadDispatcher>(m_context);
+	}
+	return *m_thread_dispatch;
+}
 
 void RenderExecutor::BindImage(ImageId id, bool storage) {
 	if (!id) {

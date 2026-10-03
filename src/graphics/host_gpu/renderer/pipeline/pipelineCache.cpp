@@ -1227,7 +1227,10 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 	const auto        params      = PrepareProgram(regs, sh, input_info);
 	input_info.lds_storage = input_info.lds_size_dwords * 4u >
 	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
-	uint32_t          push_data_cursor = 0;
+	// Only a GPU-converted indirect record pushes its thread extents.
+	uint32_t push_data_cursor = input_info.dispatch_thread_limit_on_gpu
+	                                ? ShaderRecompiler::IR::PushData::DispatchLimitDwordCount
+	                                : 0u;
 	return m_program_cache->Get(params, input_info, push_data_cursor);
 }
 

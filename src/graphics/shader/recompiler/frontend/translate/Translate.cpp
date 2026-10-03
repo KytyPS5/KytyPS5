@@ -1159,12 +1159,19 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 		}
 		if (options.stage == ShaderType::Compute &&
 		    options.input_info.compute->dispatch_thread_dimensions) {
-			for (uint32_t axis = 0; axis < 3u; axis++) {
-				const auto extent = IR::U32(entry_ir.Emit(
-				    IR::ValueOpcode::GetDispatchThreadExtent, {IR::Value(axis)}));
+			if (options.input_info.compute->dispatch_thread_limit_on_gpu) {
+				// A GPU-converted indirect dispatch leaves its thread extents in GPU memory.
 				initial_exec = entry_ir.LogicalAnd(
-				    initial_exec,
-				    entry_ir.ULessThan(builtin(IR::StageInputKind::GlobalInvocationId, axis), extent));
+				    initial_exec, IR::U1(entry_ir.Emit(IR::ValueOpcode::DispatchThreadInRange)));
+			} else {
+				for (uint32_t axis = 0; axis < 3u; axis++) {
+					const auto extent = IR::U32(
+					    entry_ir.Emit(IR::ValueOpcode::GetDispatchThreadExtent, {IR::Value(axis)}));
+					initial_exec = entry_ir.LogicalAnd(
+					    initial_exec,
+					    entry_ir.ULessThan(builtin(IR::StageInputKind::GlobalInvocationId, axis),
+					                       extent));
+				}
 			}
 		}
 		entry_ir.SetExec(initial_exec);

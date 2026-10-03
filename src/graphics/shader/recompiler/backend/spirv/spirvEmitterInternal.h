@@ -21,6 +21,7 @@
 #include <string>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -60,12 +61,14 @@ const ImageDimensionInfo& ImageDimensionInfoFor(ImageDimension dimension);
 
 // What the backend needs beyond the requirement flags ShaderInfo collection records.
 struct SpirvRequirements {
+	bool dispatch_thread_limit = false;
 	// The first guest feature the backend cannot express; the program is refused, not emitted.
 	const char*     refusal      = nullptr;
 	const IR::Inst* refused_inst = nullptr;
 };
 
 SpirvRequirements AnalyzeProgramRequirements(const IR::Program& program);
+
 struct BufferDefinition {
 	uint32_t variable             = 0;
 	uint32_t type                 = 0;
@@ -100,6 +103,7 @@ struct EmitterState {
 	ShaderStageInputInfo                             input_info;
 	const Profile&                                      profile;
 	uint32_t                                        debug_source = 0;
+	const SpirvRequirements                             requirements;
 	uint32_t                                        void_type = 0;
 	uint32_t                                        bool_type = 0;
 	uint32_t                                        u32_type = 0;

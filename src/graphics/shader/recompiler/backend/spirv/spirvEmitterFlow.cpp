@@ -769,7 +769,44 @@ uint32_t EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (state.program.stage != ShaderType::Mesh || index >= IR::PushData::MeshDrawDwordCount) {
 		ctx.Fail(inst, "invalid mesh draw parameter");
 	}
-	return EmitPushDataLoad(state, ConstantU32(state, index));
+uint32_t EmitDispatchThreadInRange(EmitterState& state) {
+	const auto load_push = [&](uint32_t index) {
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state),
+		                          pointer, state.push_constant_variable, ConstantU32(state, 0),
+		                          ConstantU32(state, index));
+		const auto value = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+		const auto wide = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpUConvert, TypeU64(state), wide, value);
+		return wide;
+	};
+	const auto high = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpShiftLeftLogical, TypeU64(state), high, load_push(1),
+	                          ConstantU32(state, 32));
+	const auto base = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpBitwiseOr, TypeU64(state), base, load_push(0), high);
+	uint32_t in_range = ConstantBool(state, true);
+	for (uint32_t axis = 0; axis < 3u; axis++) {
+		const auto offset = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpUConvert, TypeU64(state), offset,
+		                          ConstantU32(state, axis * 4u));
+		const auto address = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpIAdd, TypeU64(state), address, base, offset);
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer,
+		                          address);
+		const auto limit = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), limit, pointer,
+		                          spv::MemoryAccessAlignedMask, 4u);
+		const auto thread = EmitBuiltinU32(state, IR::StageInputKind::GlobalInvocationId, axis);
+		const auto below  = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpULessThan, TypeBool(state), below, thread, limit);
+		const auto both = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), both, in_range, below);
+		in_range = both;
+	}
+	return in_range;
 }
 
 uint32_t EmitGetUserData(EmitterState& state, IR::ScalarReg reg) {

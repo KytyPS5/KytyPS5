@@ -247,6 +247,35 @@ bool FoldCompositeExtract(Inst& inst, ValueOpcode construct, size_t components) 
 	return false;
 }
 
+Value WithoutThreadRange(Block& block, Block::iterator at, Value condition, FoldWorklist& worklist,
+                         uint32_t depth = 0) {
+	condition        = condition.Resolve();
+	const auto* inst = condition.TryInstruction();
+	if (inst == nullptr || depth > 8) {
+		return condition;
+	}
+	if (inst->GetOpcode() == ValueOpcode::DispatchThreadInRange) {
+		return Value(true);
+	}
+	if (inst->GetOpcode() != ValueOpcode::LogicalAnd) {
+		return condition;
+	}
+	const auto lhs   = inst->Arg(0).Resolve();
+	const auto rhs   = inst->Arg(1).Resolve();
+	const auto left  = WithoutThreadRange(block, at, lhs, worklist, depth + 1);
+	const auto right = WithoutThreadRange(block, at, rhs, worklist, depth + 1);
+	if (left == lhs && right == rhs) {
+		return condition;
+	}
+	if (left == Value(true)) {
+		return right;
+	}
+	if (right == Value(true)) {
+		return left;
+	}
+	return Value(&*worklist.Prepend(block, at, ValueOpcode::LogicalAnd, {left, right}));
+}
+
 void FoldZeroComparison(Block& block, Block::iterator instruction, FoldWorklist& worklist) {
 	auto& inst = *instruction;
 	Value value;
@@ -300,7 +329,15 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			}
 			return;
 		case ValueOpcode::SelectU32:
-		case ValueOpcode::SelectF32: FoldSelect(inst); return;
+		case ValueOpcode::SelectF32: {
+			const auto condition = Arg(inst, 0);
+			const auto live      = WithoutThreadRange(block, instruction, condition, worklist);
+			if (live != condition) {
+				inst.SetArg(0, live);
+			}
+			FoldSelect(inst);
+			return;
+		}
 		case ValueOpcode::FPCmpClass32: {
 			const auto mask = Arg(inst, 1);
 			if (!IsImmediate(mask, Type::U32)) {

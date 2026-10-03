@@ -1365,6 +1365,7 @@ static bool IsFullDispatchPredicate(Value value, uint32_t depth = 0) {
 		return IsFullDispatchPredicate(inst->Arg(0), depth + 1) &&
 		       IsFullDispatchPredicate(inst->Arg(1), depth + 1);
 	}
+	if (inst->GetOpcode() == ValueOpcode::DispatchThreadInRange) return true;
 	if (inst->GetOpcode() != ValueOpcode::ULessThan32) return false;
 	const auto* global = inst->Arg(0).Resolve().TryInstruction();
 	const auto* extent = inst->Arg(1).Resolve().TryInstruction();
@@ -1424,7 +1425,8 @@ static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 		if (program.info.images.size() != 1 || memory.dmask != 1 || memory.data_bits != 32 ||
 		    memory.image_has_mip || memory.image_sample_flags != 0 || memory.image_r128 ||
 		    memory.image_dimension != Decoder::ImageDimension::Dim2DArray ||
-		    store->Arg(3).Resolve() != Value(true)) return {};
+		    !IsFullDispatchPredicate(store->Arg(3)))
+			return {};
 		const auto& image = program.info.images[memory.resource];
 		if (image.read || image.atomic || image.mip_mode != ImageMipMode::None) return {};
 		const auto* address = store->Arg(1).ResolveInstruction();

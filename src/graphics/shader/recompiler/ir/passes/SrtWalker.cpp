@@ -421,6 +421,7 @@ bool IsClosedPredicate(Value root) {
 		bool       pure  = plain != 0 && inst->NumArgs() >= plain;
 		switch (op) {
 			case ValueOpcode::LaneId:
+			case ValueOpcode::DispatchThreadInRange:
 			case ValueOpcode::Ballot:
 			case ValueOpcode::SelectU1:
 			case ValueOpcode::SelectU32:
@@ -622,6 +623,9 @@ private:
 				return finish(false);
 			}
 			return finish(under_mask(Value(true), inst->Arg(0), true));
+		}
+		if (op == ValueOpcode::DispatchThreadInRange) {
+			return finish(inst->NumArgs() == 0);
 		}
 		if (op == ValueOpcode::LaneId) {
 			// Only a ballot re-executes its predicate per lane; elsewhere the value varies per
@@ -1439,6 +1443,7 @@ bool SrtWalker::EvaluateRule(const Inst& inst, uint64_t& result) {
 			return evaluated;
 		}
 		case ValueOpcode::Ballot: return EvaluateBallot(inst, result);
+		case ValueOpcode::DispatchThreadInRange: result = 1u; return true;
 		case ValueOpcode::LaneId:
 			// Only a per-lane sweep binds the lane; elsewhere the value varies per lane.
 			if (m_lane == nullptr) return Refuse(SrtRefusal::VaryingLane);

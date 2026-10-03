@@ -388,6 +388,7 @@ static void ShaderGetStaticInputInfoCS(const HW::ComputeShaderInfo& regs,
                                        const ShaderMappedData& data, ShaderComputeInputInfo& info) {
 	const bool async_compute             = info.async_compute;
 	const bool dispatch_thread_dimensions = info.dispatch_thread_dimensions;
+	const bool dispatch_thread_limit_on_gpu = info.dispatch_thread_limit_on_gpu;
 	const auto host_subgroup_size         = info.host_subgroup_size;
 	const auto workgroup_counts           = std::to_array(info.workgroup_counts);
 	const auto indirect_args_address      = info.indirect_args_address;

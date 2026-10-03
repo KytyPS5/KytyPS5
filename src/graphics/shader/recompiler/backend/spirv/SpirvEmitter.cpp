@@ -247,6 +247,9 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 					refuse(inst, "64-bit shared atomics require compute LDS");
 				}
 			}
+			if (inst.GetOpcode() == IR::ValueOpcode::DispatchThreadInRange) {
+				requirements.dispatch_thread_limit = true;
+			}
 		}
 	}
 	return requirements;

@@ -386,22 +386,81 @@ uint32_t InverseSwizzle(uint32_t swizzle, uint32_t component) {
 	return UINT32_MAX;
 }
 
+bool IsScaledConversion(const Format::BufferFormatInfo& info) {
+	return info.type == Format::ComponentType::Uscaled ||
+	       info.type == Format::ComponentType::Sscaled;
+}
+
+// Undoes the normalization the host applied when sampling a scaled format as its normalized
+// counterpart, recovering the raw integer magnitude as a float.
+float ScaledComponentRange(const Format::BufferFormatInfo& info, uint32_t component) {
+	const auto bits = info.component_bits[component];
+	return info.type == Format::ComponentType::Sscaled
+	           ? static_cast<float>((1u << (bits - 1u)) - 1u)
+	           : static_cast<float>((1u << bits) - 1u);
+}
+
 Format::BufferFormatInfo ImageConversionFormat(const EmitterState&   state,
                                                const IR::MemoryInfo& mem) {
 	const auto format = state.program.info.images[mem.resource].conversion_format;
 	if (format == Prospero::BufferFormat::kInvalid) return {};
-	const auto info = Format::GetFormatInfo(format);
-	EXIT_IF(Prospero::SampledTextureNumericClass(format) != Prospero::TextureNumericClass::Uint ||
-	        Prospero::RemapTextureFormat(format) == format ||
-	        info.type != Format::ComponentType::Uint || !info.packed_bitfield ||
-	        info.byte_size != sizeof(uint32_t) || info.component_count == 0u ||
-	        info.component_count > 4u);
+	// The layout the shader needs is a property of the guest's own format, so the info has to come
+	// from `format`; the remap exists only to hand the host a viewable format for the same bits.
+	const auto info            = Format::GetFormatInfo(format);
+	const auto remapped_format = Prospero::RemapTextureFormat(format);
+	if (remapped_format == format || info.component_count == 0u || info.component_count > 4u) {
+		return {};
+	}
+	if (IsScaledConversion(info)) {
+		// Scaled formats survive the remap as their normalized counterpart, so the fetch already
+		// produces floats; UnpackImageTexel rescales them back to the integer magnitude.
+		if (Prospero::SampledTextureNumericClass(format) !=
+		    Prospero::TextureNumericClass::Float) {
+			return {};
+		}
+		return info;
+	}
+	if (Prospero::SampledTextureNumericClass(format) != Prospero::TextureNumericClass::Uint ||
+	    info.type != Format::ComponentType::Uint || !info.packed_bitfield ||
+	    info.byte_size != sizeof(uint32_t)) {
+		return {};
+	}
 	return info;
 }
 
 uint32_t UnpackImageTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t texel) {
 	const auto info = ImageConversionFormat(ctx.state, mem);
 	if (info.format == Prospero::BufferFormat::kInvalid) return texel;
+
+	if (IsScaledConversion(info)) {
+		uint32_t scaled[4] {};
+		for (uint32_t component = 0; component < info.component_count; component++) {
+			const auto normalized = ctx.state.builder.AllocateId();
+			ctx.state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(ctx.state), normalized,
+			                              texel, component);
+			scaled[component] = ctx.state.builder.AllocateId();
+			ctx.state.builder.AddFunction(
+			    spv::OpFMul, TypeF32(ctx.state), scaled[component], normalized,
+			    ConstantF32Value(ctx.state, ScaledComponentRange(info, component)));
+		}
+
+		const auto swizzle = ctx.state.program.info.images[mem.resource].shader_swizzle;
+		uint32_t   selected[4] {};
+		for (uint32_t component = 0; component < 4u; component++) {
+			const auto selector = (swizzle >> (component * 3u)) & 7u;
+			if (selector == 1u) {
+				selected[component] = ConstantF32Value(ctx.state, 1.0f);
+			} else if (selector >= 4u && selector - 4u < info.component_count) {
+				selected[component] = scaled[selector - 4u];
+			} else {
+				selected[component] = ConstantF32Value(ctx.state, 0.0f);
+			}
+		}
+		const auto result = ctx.state.builder.AllocateId();
+		ctx.state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(ctx.state, 4),
+		                              result, selected[0], selected[1], selected[2], selected[3]);
+		return result;
+	}
 
 	const auto packed = ctx.state.builder.AllocateId();
 	ctx.state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(ctx.state), packed, texel, 0u);

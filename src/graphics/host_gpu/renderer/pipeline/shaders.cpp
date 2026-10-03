@@ -29,6 +29,9 @@ namespace Libs::Graphics {
 constexpr uint8_t kTemporaryVertexAttribFormat113 =
     static_cast<uint8_t>(Prospero::VertexAttribFormat::k16_16SInt);
 constexpr uint32_t kTemporaryPs5BufferFormat121 = 121u;
+// 64xU64 in AMD's vertex buffer format table: 64-bit unsigned, eight bytes per component. My First Gran Turismo
+// binds it for an indirect vertex stream, so the attribute really is read as a U64.
+constexpr uint32_t kVertexBufferFormat64xU64 = 52u;
 
 static bool NarrowInputFormat(vk::Format& format, uint32_t& size, uint32_t used_components) {
 	if (used_components == 0 || used_components >= size) {
@@ -117,6 +120,17 @@ static void GetInputFormat(const ShaderBufferResource& res, vk::Format& format, 
 		}
 		format = vk::Format::eR16G16Sfloat;
 		size   = 2;
+		return;
+	}
+
+	if (raw_format == kVertexBufferFormat64xU64) {
+		static bool logged_52 = false;
+		if (!logged_52) {
+			LOGF("InputFormat: reading PS5 buffer format 52 (64xU64) as vk::Format::eR64Uint\n");
+			logged_52 = true;
+		}
+		format = vk::Format::eR64Uint;
+		size   = 8;
 		return;
 	}
 

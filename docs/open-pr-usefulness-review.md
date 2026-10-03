@@ -2,6 +2,54 @@
 
 # Открытые PR KytyPS5: что полезно для текущего bring-up
 
+## Сверка 3 октября 2026 года, 17:45 UTC
+
+Уточнение после точной диагностики: [#1003](https://github.com/KytyPS5/KytyPS5/pull/1003)
+`7f0d29b53774560372abd82fb8a343173fc78114` оказался прямо полезен.
+`layout=1` здесь означает `k8`, поэтому его размеры `k8Srgb` 0→1 и
+`k8_8Srgb` 0→2 воспроизведены отдельным native RED/GREEN и адаптированы
+локально. Следующий игровой прогон прошёл этот отказ и дошёл до иного
+ресурсного блокера после 200 подготовленных кадров.
+
+Проверены новые open PR, их head, описание и изменённые файлы через
+`gh pr list/view`. Это оценка по исходникам PR; эти ветки не запускались
+с Ghost of Yōtei в нашей Windows-сборке.
+
+- [#1013](https://github.com/KytyPS5/KytyPS5/pull/1013)
+  `de47e91e3ba714d1d30e23a0c8c77c42b6a69dab` убирает ожидание
+  `SDL_RunOnMainThread` при обновлении заголовка окна и делает обновление
+  раз в секунду. Может сократить накладные расходы на показ кадра; наши
+  многоминутные паузы находятся внутри `vkCreateComputePipelines`, поэтому
+  этот PR не снимает текущий блокер.
+- [#1012](https://github.com/KytyPS5/KytyPS5/pull/1012)
+  `3e1d888458d4bc770243e7521587717e9ff40a0d` заменяет
+  `OpBranchConditional` с одинаковыми целями на `OpBranch`. Автор
+  воспроизвёл ошибку в SPIRV-Cross/MoltenVK; для текущего Windows Vulkan
+  отказа `k8/SRGB` связь не доказана. Патч сам по себе общий и небольшой,
+  но включать его следует с локальным synthetic RED и проверкой CFG.
+- [#1008](https://github.com/KytyPS5/KytyPS5/pull/1008)
+  `03651fbeb483c6bef81bbcf44c49c4c3855ceee0` только поднимает
+  `sizeof(Inst)` assert с 112 до 120 байт. Наша сборка не падает на этом
+  assert; расширение предела не ускорит драйверную компиляцию.
+- [#1007](https://github.com/KytyPS5/KytyPS5/pull/1007)
+  `4e2f15a03045a303ef4d1bc0acb7ac65a151e521` добавляет read-only
+  PKG mount с отдельным .NET helper. Текущий game retry использует уже
+  распакованный каталог, поэтому этот PR не влияет на путь к меню.
+- [#1001](https://github.com/KytyPS5/KytyPS5/pull/1001)
+  `fa7ad32987dad25f99f8b3432de07b10d308110e` исправляет lifecycle
+  swapchain при resize/minimize/fullscreen. Он затрагивает `swapchain.cpp`,
+  но диагностированный нами readback layout и `k8/SRGB` относятся к
+  другим путям; переносить его в текущую отладочную сборку без отдельной
+  проверки не требуется.
+- Повторно просмотрены [#988](https://github.com/KytyPS5/KytyPS5/pull/988)
+  (disk cache resource plans/SPIR-V) и
+  [#982](https://github.com/KytyPS5/KytyPS5/pull/982) (driver cache across
+  revisions). #988 уменьшает повторную CPU-трансляцию, но текущий узкий
+  участок — создание Vulkan pipeline драйвером (~258 с для одного варианта).
+  Локальная ветка уже загружает совместимый cache между сборками и отдельно
+  хранит core/GPUAV-инструментированные blobs; прямой перенос #982
+  дублировал бы эту часть с риском смешать режимы validation.
+
 ## Сверка 3 октября 2026 года, 10:18 UTC
 
 Новый [#996](https://github.com/KytyPS5/KytyPS5/pull/996), head

@@ -64,10 +64,14 @@ public:
 	void Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer, uint64_t offset,
 	              uint64_t size);
 	void CopyImage(Image& source);
-	void Resolve(Image& source, const ImageSubresourceRange& source_range,
+	// Returns false when the guest subresource maps beyond the host mip chain: no transfer was
+	// recorded, so the caller must not claim ownership of new contents.
+	bool Resolve(Image& source, const ImageSubresourceRange& source_range,
 	             const ImageSubresourceRange& destination_range);
 	void CopyImageWithBuffer(Image& source, Buffer& buffer);
-	void CopyMip(Image& source, uint32_t mip, uint32_t layer);
+	// Returns false when the guest mip maps beyond the host mip chain: no copy was recorded, so the
+	// caller must not claim ownership of new contents.
+	bool CopyMip(Image& source, uint32_t mip, uint32_t layer);
 
 	void InvalidateCpuWrite(uint64_t vaddr, uint64_t size) {
 		if (ImageRangeOverlaps(info.data.address, info.data.size, vaddr, size)) {
@@ -174,6 +178,18 @@ namespace ImageOps {
 
 void                                 Validate(const ImageInfo& info);
 [[nodiscard]] Prospero::BufferFormat RenderTargetTransferFormat(uint32_t bytes_per_element);
+
+// Number of levels in the complete host mip chain for an extent. Guest tiled surfaces may describe
+// a deeper tail than the host image can hold, so every host level count is clamped to this.
+[[nodiscard]] uint32_t HostMipChainLength(vk::Extent3D extent);
+
+// Number of levels of the host image created for info, i.e. the guest count clamped to the chain.
+[[nodiscard]] uint32_t HostMipLevels(const ImageInfo& info);
+
+// Reports a request that names guest levels the host image does not have. Guest mip tails are
+// dropped on purpose; the first occurrences are logged so the clamp does not hide guest intent.
+void ReportMipClamp(const char* site, const ImageInfo& info, uint32_t base_level,
+                    uint32_t level_count);
 
 } // namespace ImageOps
 

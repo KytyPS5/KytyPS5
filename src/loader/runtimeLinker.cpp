@@ -2019,19 +2019,22 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 		uint64_t cursor = program->instruction_trampoline_vaddr +
 		                  GetGuestInstructionTrampolineBytesUsed(
 		                      reinterpret_cast<void*>(program->base_vaddr));
+		const uint64_t cursor_begin = cursor;
 		for (const auto& [segment_addr, segment_size]: executable_segments) {
 			const auto result = X64InstructionEmulator::SplitWideStores(
 			    segment_addr, segment_size, &cursor,
 			    program->instruction_trampoline_vaddr + program->instruction_trampoline_size);
 			Common::VirtualMemory::FlushInstructionCache(segment_addr, segment_size);
-			Common::VirtualMemory::FlushInstructionCache(program->instruction_trampoline_vaddr,
-			                                             program->instruction_trampoline_size);
 			LOGF("Guest 256-bit store splitting: %s, candidates=%" PRIu64 ", patched=%" PRIu64
 			     " (via padding=%" PRIu64 ", ud2=%" PRIu64 ", moved=%" PRIu64 "), short=%" PRIu64
 			     ", unsupported=%" PRIu64 ", trampoline bytes=%" PRIu64 "\n",
 			     Common::PathToString(program->file_name.filename()).c_str(), result.candidates,
 			     result.patched, result.via_cave, result.trapped, result.relocated,
 			     result.too_short, result.unsupported, result.trampoline_bytes);
+		}
+		// One flush for the trampolines written by all segments.
+		if (cursor > cursor_begin) {
+			Common::VirtualMemory::FlushInstructionCache(cursor_begin, cursor - cursor_begin);
 		}
 	}
 #endif

@@ -8,11 +8,17 @@ uvec3 block_extent() {
 	uint width = ELEMENT_BYTES <= 2 ? 256u : (ELEMENT_BYTES <= 8 ? 128u : 64u);
 	return uvec3(width, BLOCK_BYTES / (width * ELEMENT_BYTES), 1u);
 }
+// Early returns rather than a ternary chain: a specialization-constant select between uvec4
+// values is miscompiled by some drivers (observed on RADV, Mesa 26.2), see GpuTilerCpuParity.
+uvec4 prt_shifts() {
+	if (ELEMENT_BYTES == 1) return uvec4(7, 7, 6, 6);
+	if (ELEMENT_BYTES == 2) return uvec4(7, 6, 6, 5);
+	if (ELEMENT_BYTES == 4) return uvec4(6, 6, 5, 5);
+	if (ELEMENT_BYTES == 8) return uvec4(6, 5, 5, 4);
+	return uvec4(5, 5, 4, 4);
+}
 uint block_offset(uvec3 p) {
-	uvec4 s = ELEMENT_BYTES == 1 ? uvec4(7, 7, 6, 6) :
-	          ELEMENT_BYTES == 2 ? uvec4(7, 6, 6, 5) :
-	          ELEMENT_BYTES == 4 ? uvec4(6, 6, 5, 5) :
-	          ELEMENT_BYTES == 8 ? uvec4(6, 5, 5, 4) : uvec4(5, 5, 4, 4);
+	uvec4 s = prt_shifts();
 	uint delta = (((p.x >> s.x) & 1u) << 8) ^ (((p.y >> s.y) & 1u) << 9) ^
 	             (((p.x >> s.z) & 1u) << 10) ^ (((p.y >> s.w) & 1u) << 11);
 	return standard64_offset(p.xy) ^ delta;

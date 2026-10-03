@@ -5,11 +5,17 @@ layout(constant_id = 1) const uint TILE = 0u;
 const uint BLOCK_BYTES = 65536u;
 #include "gpu_tiler_standard64_3d.inc"
 uvec3 block_extent() { return standard64_3d_extent(); }
+// Early returns rather than a ternary chain: a specialization-constant select between uvec4
+// values is miscompiled by some drivers (observed on RADV, Mesa 26.2), see GpuTilerCpuParity.
+uvec4 prt_3d_shifts() {
+	if (ELEMENT_BYTES == 1) return uvec4(4, 5, 4, 4);
+	if (ELEMENT_BYTES == 2) return uvec4(4, 4, 3, 4);
+	if (ELEMENT_BYTES == 4) return uvec4(4, 4, 3, 3);
+	if (ELEMENT_BYTES == 8) return uvec4(3, 4, 3, 3);
+	return uvec4(3, 3, 2, 3);
+}
 uint block_offset(uvec3 p) {
-	uvec4 s = ELEMENT_BYTES == 1 ? uvec4(4, 5, 4, 4) :
-	          ELEMENT_BYTES == 2 ? uvec4(4, 4, 3, 4) :
-	          ELEMENT_BYTES == 4 ? uvec4(4, 4, 3, 3) :
-	          ELEMENT_BYTES == 8 ? uvec4(3, 4, 3, 3) : uvec4(3, 3, 2, 3);
+	uvec4 s = prt_3d_shifts();
 	uint delta = (((p.y >> s.x) & 1u) << 10) ^ (((p.x >> s.y) & 1u) << 10) ^
 	             (((p.x >> s.z) & 1u) << 11) ^ (((p.z >> s.w) & 1u) << 11);
 	return standard64_3d_offset(p) ^ delta;

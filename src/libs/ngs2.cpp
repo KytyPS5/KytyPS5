@@ -2352,9 +2352,20 @@ int KYTY_SYSV_ABI Ngs2VoiceControl(uintptr_t voice_handle, const Ngs2VoiceParamH
 			}
 			case 0x1000:
 			case 0x4001: {
+				// Waveform setup is voice-local (SetupSampler touches no rack option
+				// unions), and games drive it on non-sampler racks: Atomfall (Asura
+				// engine) owns only Mastering and CustomSubmixer racks yet sends
+				// control 0x10000000 to a CustomSubmixer-rack voice. Allow every
+				// known rack type; an unknown future type stays a real "not
+				// implemented" signal.
 				EXIT_NOT_IMPLEMENTED(
-				    voice->rack->type !=
-				    (rack_id == 0x1000 ? Ngs2RackType::Sampler : Ngs2RackType::CustomSampler));
+				    voice->rack->type != Ngs2RackType::Sampler &&
+				    voice->rack->type != Ngs2RackType::CustomSampler &&
+				    voice->rack->type != Ngs2RackType::Submixer &&
+				    voice->rack->type != Ngs2RackType::CustomSubmixer &&
+				    voice->rack->type != Ngs2RackType::Reverb &&
+				    voice->rack->type != Ngs2RackType::Mastering &&
+				    voice->rack->type != Ngs2RackType::CustomMastering);
 				switch (param->id & 0xffffu) {
 					case 0: {
 						const auto& format =

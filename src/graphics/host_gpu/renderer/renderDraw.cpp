@@ -956,8 +956,9 @@ bool RenderExecutor::PrepareDrawTargets(CommandBuffer& buffer, const DrawCallInf
 	uint32_t   mrt_mask          = 0;
 	if (state.ps_active) {
 		for (const auto& output: state.ps_input_info.stage.program->info.outputs) {
-			if (output.kind == ShaderRecompiler::IR::StageOutputKind::Mrt ||
-			    output.kind == ShaderRecompiler::IR::StageOutputKind::ObjectPrimitiveId) {
+			if ((output.kind == ShaderRecompiler::IR::StageOutputKind::Mrt ||
+			     output.kind == ShaderRecompiler::IR::StageOutputKind::ObjectPrimitiveId) &&
+			    output.location < RENDER_COLOR_ATTACHMENTS_MAX) {
 				mrt_mask |= 1u << output.location;
 			}
 		}

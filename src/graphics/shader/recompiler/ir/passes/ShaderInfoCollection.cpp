@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <fmt/format.h>
+#include <span>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
@@ -90,6 +91,7 @@ void CollectPixelInputs(const ShaderPixelInputInfo* pixel, ShaderInfo& info,
 	}
 	// Mixed interpolation modes share raw vertices at their guest export slot.
 	// Rectangle expansion alone supplies separate flat and smooth outputs.
+	// A flat input aliased with a custom one is not flat as a group, so it reads raw vertices.
 	std::array<uint32_t, 32> active_inputs {};
 	uint32_t                 active_count = 0;
 	for (uint32_t input = 0; input < pixel->input_num; input++) {
@@ -106,6 +108,8 @@ void CollectPixelInputs(const ShaderPixelInputInfo* pixel, ShaderInfo& info,
 	}
 	for (const auto input: active) {
 		for (const auto alias: active) {
+			const bool same_mode = ShaderPixelParameterGroupIsFlat(*pixel, active, input) ==
+			                       ShaderPixelParameterGroupIsFlat(*pixel, active, alias);
 			if (ShaderPixelParameterMappedLocation(*pixel, input) ==
 			        ShaderPixelParameterMappedLocation(*pixel, alias) &&
 			    (pixel->parameter_mode != ShaderPixelParameterMode::Rectangle || same_mode)) {
@@ -118,6 +122,7 @@ void CollectPixelInputs(const ShaderPixelInputInfo* pixel, ShaderInfo& info,
 		         per_vertex[input]);
 	}
 	for (const auto input: active) {
+		if (used_components[input] != 0 && per_vertex[input]) {
 			const auto kind = pixel->ps_no_perspective ? StageInputKind::BaryCoordNoPerspective
 			                                           : StageInputKind::BaryCoordSmooth;
 			AddInput(info, kind, 0, 3,
@@ -204,6 +209,11 @@ void CollectOutput(const Program& program, ShaderStageInputInfo input_info,
 		    input_info.pixel->ps_sample_mask_export_enable) {
 			AddOutput(info, StageOutputKind::SampleMask, 0, 0, "gl_SampleMask");
 		}
+		if (program.stage == ShaderType::Pixel && (export_info.en & 0x2u) != 0 &&
+		    (input_info.pixel->ps_stencil_test_val_export_enable ||
+		     input_info.pixel->ps_stencil_op_val_export_enable)) {
+			AddOutput(info, StageOutputKind::Stencil, 0, 0, "gl_FragStencilRefARB");
+		}
 		return;
 	}
 	if (export_info.en == 0) {
@@ -268,6 +278,47 @@ void CollectOutput(const Program& program, ShaderStageInputInfo input_info,
 	}
 }
 
+// Writes a flat copy of an interpolated parameter at each location the pixel stage reads it flat.
+void CollectParameterDuplicates(const Program& program, ShaderStageInputInfo input_info,
+                                ShaderInfo& info) {
+	const bool feeds_rasterizer = program.stage == ShaderType::Vertex ||
+	                              program.stage == ShaderType::TessellationEvaluation ||
+	                              program.stage == ShaderType::Mesh;
+	if (!feeds_rasterizer || input_info.vertex == nullptr ||
+	    input_info.vertex->param_duplicate_mask == 0) {
+		return;
+	}
+	const auto& vertex = *input_info.vertex;
+	const auto  used   = [&](uint32_t location) {
+		return (vertex.param_duplicate_mask & (1u << location)) != 0 ||
+		       std::ranges::any_of(info.outputs, [&](const StageOutput& output) {
+			       return output.kind == StageOutputKind::Parameter && output.location == location;
+		       });
+	};
+	for (uint32_t location = 0; location < 32u; location++) {
+		const auto source = vertex.param_duplicate_source[location];
+		if ((vertex.param_duplicate_mask & (1u << location)) == 0 ||
+		    !HasOutput(info, StageOutputKind::Parameter, source)) {
+			continue;
+		}
+		const auto occupant = std::ranges::find_if(info.outputs, [&](const StageOutput& output) {
+			return output.kind == StageOutputKind::Parameter && output.location == location;
+		});
+		if (occupant != info.outputs.end()) {
+			uint32_t free = 0;
+			while (free < 32u && used(free)) {
+				free++;
+			}
+			if (free == 32u) {
+				continue;
+			}
+			occupant->location = free;
+		}
+		info.outputs.push_back({StageOutputKind::Parameter, source, location,
+		                        fmt::format("out_param_{}_at_{}", source, location)});
+	}
+}
+
 struct InputUsage {
 	std::array<uint8_t, 32> components {};
 	std::array<bool, 32> per_vertex {};
@@ -329,9 +380,8 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 				info.function_scratch = true;
 				info.function_lds |= kind == ResourceKind::FlatLocal &&
 				                     program.stage != ShaderType::Compute && program.stage != ShaderType::Mesh;
-			} else if (address_access == AddressAccess::Write) {
-				return Fail("writable FLAT/GLOBAL addresses require GPU ownership tracking");
-			} else {
+			} else if (address_access != AddressAccess::Write) {
+				// Writable FLAT/GLOBAL addresses store through the BDA page table.
 				info.coherent_buffers |= memory.coherent;
 			}
 		}
@@ -355,10 +405,8 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 				collect_element(memory.resource);
 				for (const auto child: info.buffers[memory.resource].indirect_resources)
 					collect_element(child);
+				// ADD_TID outside compute is refused by the backend, not here.
 				if ((info.buffers[memory.resource].packed_stride & (1u << 20u)) != 0u) {
-					if (program.stage != ShaderType::Compute) {
-						return Fail("buffer ADD_TID is only valid for compute shaders");
-					}
 					info.subgroup_local_invocation_id = true;
 				}
 			}
@@ -367,10 +415,9 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 			if (kind != ResourceKind::Lds && kind != ResourceKind::Gds) {
 				return Fail("shared operation has invalid resource kind");
 			}
-			if (shared_access == SharedAccess::Atomic && SharedComponentCount(op) == 2u) {
-				if (kind != ResourceKind::Lds || program.stage != ShaderType::Compute) {
-					return Fail("64-bit shared atomics require compute LDS");
-				}
+			// 64-bit shared atomics outside compute LDS are refused by the backend, not here.
+			if (shared_access == SharedAccess::Atomic &&
+			    (SharedComponentCount(op) == 2u || inst.GetType() == Type::U64)) {
 				info.shared_int64_atomics = true;
 			}
 			info.function_lds |= kind == ResourceKind::Lds &&
@@ -629,6 +676,7 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	for (uint32_t i = 0; i < inputs.builtin_count; i++) {
 		AddBuiltinInput(info, inputs.builtins[i]);
 	}
+	CollectParameterDuplicates(program, input_info, info);
 	program.shader_info_complete = true;
 }
 

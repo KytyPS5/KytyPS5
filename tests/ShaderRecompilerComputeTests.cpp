@@ -1620,6 +1620,11 @@ struct GraphicsCase {
   u32 pixel_perspective_sample_vgpr = UINT32_MAX;
   u32 pixel_perspective_centroid_vgpr = UINT32_MAX;
   u32 pixel_custom_interpolation_mask = 0;
+  std::array<uint8_t, 8> target_output_mode{};
+  u32 cb_shader_mask = 0;
+  vk::Format target_format = vk::Format::eR32G32B32A32Sfloat;
+  u32 target_dwords_per_pixel = 4;
+  u32 target_location = 0;
   u32 width = 1;
   std::vector<u32> object_ids;
 };
@@ -2090,6 +2095,10 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
   pixel_info.ps_perspective_sample_vgpr = test.pixel_perspective_sample_vgpr;
   pixel_info.ps_perspective_centroid_vgpr = test.pixel_perspective_centroid_vgpr;
   pixel_info.custom_interpolation_mask = test.pixel_custom_interpolation_mask;
+  std::copy(test.target_output_mode.begin(), test.target_output_mode.end(),
+            std::begin(pixel_info.target_output_mode));
+  if (test.cb_shader_mask != 0) {
+  }
   pixel_info.object_primitive_id = !test.object_ids.empty();
   for (u32 i = 0; i < std::size(pixel_info.interpolator_settings); i++) {
     pixel_info.interpolator_settings[i] = i;
@@ -21941,13 +21950,15 @@ public:
   std::vector<u32> RenderFragment(const GraphicsCase &test,
                                   const CompiledShader &fragment) {
     const bool object_id = !test.object_ids.empty();
+    Require(test.name, "graphics", !object_id || test.target_location < 7,
+            "the object ID target occupies colour location 7");
     const auto vertex_spirv =
         TestSpv::MakePassthroughVertexSpirv(test.layers > 1, test.vertex_clip_w);
     ValidateSpirv(test.name, vertex_spirv);
 
     Image target =
-        CreateImageMips(test.name, test.width, 1, vk::Format::eR32G32B32A32Sfloat,
-                      vk::ImageUsageFlagBits::eColorAttachment, {}, 4,
+        CreateImageMips(test.name, test.width, 1, test.target_format,
+                      vk::ImageUsageFlagBits::eColorAttachment, {}, test.target_dwords_per_pixel,
                       vk::ImageLayout::eGeneral, vk::ImageType::e2D,
                       test.layers > 1 ? vk::ImageViewType::e2DArray : vk::ImageViewType::e2D,
                       test.layers, 0, 0, test.samples);
@@ -21955,7 +21966,7 @@ public:
     if (test.samples != vk::SampleCountFlagBits::e1) {
       resolved = CreateImageMips(
           test.name, test.width, 1, target.format, vk::ImageUsageFlagBits::eColorAttachment,
-          {}, 4, vk::ImageLayout::eGeneral, vk::ImageType::e2D,
+          {}, test.target_dwords_per_pixel, vk::ImageLayout::eGeneral, vk::ImageType::e2D,
           test.layers > 1 ? vk::ImageViewType::e2DArray : vk::ImageViewType::e2D,
           test.layers);
     }
@@ -22087,13 +22098,15 @@ public:
     }
     vk::PipelineColorBlendStateCreateInfo color_blend{};
     color_blend.sType = vk::StructureType::ePipelineColorBlendStateCreateInfo;
-    color_blend.attachmentCount = object_id ? 8 : 1;
+    color_blend.attachmentCount = object_id ? 8 : test.target_location + 1;
     color_blend.pAttachments = color_attachments.data();
 
     vk::GraphicsPipelineCreateInfo pipeline_info{};
     std::array<vk::Format, 8> color_formats{};
-    color_formats[0] = target.format;
-    color_formats[7] = primitive_target.format;
+    color_formats[test.target_location] = target.format;
+    if (object_id) {
+      color_formats[7] = primitive_target.format;
+    }
     vk::PipelineRenderingCreateInfo rendering_pipeline{};
     rendering_pipeline.sType = vk::StructureType::ePipelineRenderingCreateInfo;
     rendering_pipeline.colorAttachmentCount = color_blend.attachmentCount;
@@ -22116,14 +22129,15 @@ public:
               "vkCreateGraphicsPipelines");
 
     std::array<vk::RenderingAttachmentInfo, 8> colors{};
-    colors[0].imageView = target.view;
-    colors[0].imageLayout = vk::ImageLayout::eGeneral;
-    colors[0].loadOp = vk::AttachmentLoadOp::eClear;
-    colors[0].storeOp = vk::AttachmentStoreOp::eStore;
+    auto &color = colors[test.target_location];
+    color.imageView = target.view;
+    color.imageLayout = vk::ImageLayout::eGeneral;
+    color.loadOp = vk::AttachmentLoadOp::eClear;
+    color.storeOp = vk::AttachmentStoreOp::eStore;
     if (resolved.image != nullptr) {
-      colors[0].resolveMode = vk::ResolveModeFlagBits::eAverage;
-      colors[0].resolveImageView = resolved.view;
-      colors[0].resolveImageLayout = vk::ImageLayout::eGeneral;
+      color.resolveMode = vk::ResolveModeFlagBits::eAverage;
+      color.resolveImageView = resolved.view;
+      color.resolveImageLayout = vk::ImageLayout::eGeneral;
     }
     if (object_id) {
       colors[7].imageView = primitive_target.view;
@@ -24369,6 +24383,163 @@ void RunGraphicsCase(VulkanHarness *vulkan, const GraphicsCase &test) {
   auto compiled = CompileFragmentCase(test);
   auto actual = vulkan->RenderFragment(test, compiled);
   CompareGraphicsWords(test, actual);
+  std::printf("[graphics] %-31s ok\n", test.name);
+}
+
+enum class ExportPacking { Literal, Pkrtz, PknormI16, PknormU16 };
+
+void AppendPackedPair(std::vector<u32> *code, ExportPacking packing, u32 dst, u32 lo) {
+  switch (packing) {
+  case ExportPacking::Pkrtz: code->push_back(EncodeVop2(0x2f, dst, Vgpr(lo), lo + 1)); break;
+  case ExportPacking::PknormI16: AppendVop3(code, 0x368, dst, Vgpr(lo), Vgpr(lo + 1)); break;
+  case ExportPacking::PknormU16: AppendVop3(code, 0x369, dst, Vgpr(lo), Vgpr(lo + 1)); break;
+  case ExportPacking::Literal: break;
+  }
+}
+
+void CheckCompressedExportCase(VulkanHarness *vulkan, const char *name, uint8_t mode,
+                               ExportPacking packing, const std::array<u32, 4> &inputs,
+                               vk::Format format, u32 dwords_per_pixel,
+                               std::vector<u32> expected) {
+  GraphicsCase test{};
+  test.name = name;
+  test.target_output_mode[0] = mode;
+  test.target_format = format;
+  test.target_dwords_per_pixel = dwords_per_pixel;
+  test.expected_pixel = std::move(expected);
+  if (packing == ExportPacking::Literal) {
+    AppendVMovLiteral(&test.fragment_code, 4, inputs[0]);
+    AppendVMovLiteral(&test.fragment_code, 5, inputs[1]);
+  } else {
+    for (u32 i = 0; i < 4; i++) {
+      AppendVMovLiteral(&test.fragment_code, i, inputs[i]);
+    }
+    AppendPackedPair(&test.fragment_code, packing, 4, 0);
+    AppendPackedPair(&test.fragment_code, packing, 5, 2);
+  }
+  test.fragment_code.push_back(EncodeExp0(0, 0xf, true, true, true));
+  test.fragment_code.push_back(EncodeExp1(4, 5, 0, 0));
+  AppendEnd(&test.fragment_code);
+  RunGraphicsCase(vulkan, test);
+}
+
+constexpr u32 kExpOne = 0x3f800000u;
+constexpr u32 kExpMinusOne = 0xbf800000u;
+constexpr u32 kExpHalf = 0x3f000000u;
+constexpr u32 kExpQuarter = 0x3e800000u;
+
+void CheckCompressedExportDecode(VulkanHarness *vulkan) {
+  const std::array<u32, 4> signed_unit{kExpOne, kExpMinusOne, 0u, kExpOne};
+  const auto rgba32f = vk::Format::eR32G32B32A32Sfloat;
+  const auto rgba16_snorm = vk::Format::eR16G16B16A16Snorm;
+  const auto a2b10g10r10 = vk::Format::eA2B10G10R10UnormPack32;
+
+  CheckCompressedExportCase(vulkan, "ExportSnorm16PknormToFloat", 6, ExportPacking::PknormI16,
+                            signed_unit, rgba32f, 4, {kExpOne, kExpMinusOne, 0u, kExpOne});
+  CheckCompressedExportCase(vulkan, "ExportSnorm16PknormToSnorm16", 6,
+                            ExportPacking::PknormI16, signed_unit, rgba16_snorm, 2,
+                            {0x80017fffu, 0x7fff0000u});
+  CheckCompressedExportCase(vulkan, "ExportSnorm16PknormToUnorm10", 6,
+                            ExportPacking::PknormI16, signed_unit, a2b10g10r10, 1,
+                            {0xc00003ffu});
+  CheckCompressedExportCase(vulkan, "ExportSnorm16LiteralToFloat", 6, ExportPacking::Literal,
+                            {0x80017fffu, 0x7fff0000u, 0u, 0u}, rgba32f, 4,
+                            {kExpOne, kExpMinusOne, 0u, kExpOne});
+  CheckCompressedExportCase(vulkan, "ExportUnorm16PknormToFloat", 5, ExportPacking::PknormU16,
+                            {kExpOne, 0u, 0u, kExpOne}, rgba32f, 4, {kExpOne, 0u, 0u, kExpOne});
+  CheckCompressedExportCase(vulkan, "ExportUnorm16LiteralToFloat", 5, ExportPacking::Literal,
+                            {0x0000ffffu, 0xffff0000u, 0u, 0u}, rgba32f, 4,
+                            {kExpOne, 0u, 0u, kExpOne});
+  CheckCompressedExportCase(vulkan, "ExportFp16PkrtzToFloat", 4, ExportPacking::Pkrtz,
+                            {kExpHalf, kExpOne, 0u, kExpOne}, rgba32f, 4,
+                            {kExpHalf, kExpOne, 0u, kExpOne});
+  CheckCompressedExportCase(vulkan, "ExportFp16PkrtzToUnorm10", 4, ExportPacking::Pkrtz,
+                            {kExpOne, 0u, kExpOne, kExpOne}, a2b10g10r10, 1, {0xfff003ffu});
+  CheckCompressedExportCase(vulkan, "ExportFp16LiteralToFloat", 4, ExportPacking::Literal,
+                            {0x3c003800u, 0x3c000000u, 0u, 0u}, rgba32f, 4,
+                            {kExpHalf, kExpOne, 0u, kExpOne});
+}
+
+void CheckColorExportHoleCase(VulkanHarness *vulkan, const char *name, u32 cb_shader_mask,
+                              u32 location, vk::Format format, u32 dwords_per_pixel,
+                              std::vector<u32> expected) {
+  GraphicsCase test{};
+  test.name = name;
+  test.cb_shader_mask = cb_shader_mask;
+  test.target_output_mode = {4, 4, 6, 0, 0, 0, 0, 0};
+  test.target_location = location;
+  test.target_format = format;
+  test.target_dwords_per_pixel = dwords_per_pixel;
+  test.expected_pixel = std::move(expected);
+  const std::array<std::array<u32, 4>, 3> values{{
+      {kExpQuarter, kExpQuarter, kExpQuarter, kExpQuarter},
+      {kExpHalf, kExpHalf, kExpHalf, kExpHalf},
+      {kExpOne, kExpMinusOne, 0u, kExpOne},
+  }};
+  for (u32 mrt = 0; mrt < 3; mrt++) {
+    for (u32 i = 0; i < 4; i++) {
+      AppendVMovLiteral(&test.fragment_code, i, values[mrt][i]);
+    }
+    const auto packing = mrt == 2 ? ExportPacking::PknormI16 : ExportPacking::Pkrtz;
+    const u32 dst = 8 + mrt * 2;
+    AppendPackedPair(&test.fragment_code, packing, dst, 0);
+    AppendPackedPair(&test.fragment_code, packing, dst + 1, 2);
+  }
+  for (u32 mrt = 0; mrt < 3; mrt++) {
+    const bool last = mrt == 2;
+    test.fragment_code.push_back(EncodeExp0(mrt, 0xf, last, true, last));
+    test.fragment_code.push_back(EncodeExp1(8 + mrt * 2, 9 + mrt * 2, 0, 0));
+  }
+  AppendEnd(&test.fragment_code);
+  RunGraphicsCase(vulkan, test);
+}
+
+void CheckColorExportHoles(VulkanHarness *vulkan) {
+          "export N must map to the N-th colour buffer CB_SHADER_MASK enables");
+  const auto rgba32f = vk::Format::eR32G32B32A32Sfloat;
+  const auto rgba16_snorm = vk::Format::eR16G16B16A16Snorm;
+  CheckColorExportHoleCase(vulkan, "ColorExportHoleBuffer1GetsExport0", 0x0000fff0u, 1, rgba32f,
+                           4, {kExpQuarter, kExpQuarter, kExpQuarter, kExpQuarter});
+  CheckColorExportHoleCase(vulkan, "ColorExportHoleBuffer2GetsExport1", 0x0000fff0u, 2, rgba32f,
+                           4, {kExpHalf, kExpHalf, kExpHalf, kExpHalf});
+  CheckColorExportHoleCase(vulkan, "ColorExportHoleBuffer3GetsSnormExport2", 0x0000fff0u, 3,
+                           rgba16_snorm, 2, {0x80017fffu, 0x7fff0000u});
+  CheckColorExportHoleCase(vulkan, "ColorExportMidHoleBuffer2GetsExport1", 0x0000ff0fu, 2,
+                           rgba32f, 4, {kExpHalf, kExpHalf, kExpHalf, kExpHalf});
+  CheckColorExportHoleCase(vulkan, "ColorExportMidHoleBuffer3GetsExport2", 0x0000ff0fu, 3,
+                           rgba16_snorm, 2, {0x80017fffu, 0x7fff0000u});
+  CheckColorExportHoleCase(vulkan, "ColorExportNoHoleBuffer2GetsExport2", 0x0000ffffu, 2,
+                           rgba16_snorm, 2, {0x80017fffu, 0x7fff0000u});
+}
+
+// A pixel shader exporting to several MRTs must keep every export, plain and compressed.
+void CheckMultiMrtExportOutputs(bool compressed) {
+  GraphicsCase test{};
+  test.name = compressed ? "MultiMrtCompressedExports" : "MultiMrtExports";
+  for (u32 i = 0; i < 8; i++) {
+    AppendVMovLiteral(&test.fragment_code, i, 0x3f000000u + i * 0x00080000u);
+  }
+  for (u32 target = 0; target < 4; target++) {
+    const bool last = target == 3;
+    test.fragment_code.push_back(EncodeExp0(target, 0xf, last, compressed, last));
+    test.fragment_code.push_back(compressed
+                                     ? EncodeExp1(target * 2, target * 2 + 1, 0, 0)
+                                     : EncodeExp1(0, 1, 2, 3));
+  }
+  AppendEnd(&test.fragment_code);
+
+  auto compiled = CompileFragmentCase(test);
+  std::vector<u32> slots;
+  for (const auto &output : compiled.program.info.outputs) {
+    if (output.kind == ShaderRecompiler::IR::StageOutputKind::Mrt) {
+      slots.push_back(output.index);
+    }
+  }
+  std::sort(slots.begin(), slots.end());
+  const std::vector<u32> expected{0u, 1u, 2u, 3u};
+  Require(test.name, "mrt outputs", slots == expected,
+          "expected Mrt outputs for slots 0,1,2,3, got " +
+              std::to_string(slots.size()) + " output(s)");
   std::printf("[graphics] %-31s ok\n", test.name);
 }
 
@@ -54623,6 +54794,10 @@ int main(int argc, char **argv) {
     RunGraphicsCase(&vulkan, test);
   }
   vulkan.CheckGpuSuspendPoint();
+  CheckMultiMrtExportOutputs(false);
+  CheckMultiMrtExportOutputs(true);
+  CheckCompressedExportDecode(&vulkan);
+  CheckColorExportHoles(&vulkan);
   vulkan.CheckGpuCommandLane();
   vulkan.CheckScalarLeafCall();
   // Last: its window installs global GPU resources.

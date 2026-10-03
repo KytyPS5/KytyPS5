@@ -600,6 +600,7 @@ ShaderParams PrepareProgram(const HW::VertexShaderInfo& regs, const HW::Context&
 	    .gs_max_vert_out         = sh.m_vgtGsMaxVertOut,
 	    .primitive_group_size    = group.primitive_group_size,
 	    .vertex_group_size       = group.vertex_group_size,
+	    .native_ngg              = native_ngg,
 	};
 	if (const char* error = ShaderBuildGsAssembly(gs_regs, mesh); error != nullptr) {
 		LOGF("\t warning: dropping GS draw: %s\n", error);

@@ -1134,7 +1134,7 @@ static void Ngs2InitModules(Ngs2RackInternal& rack) {
 				    rack.common[m].data(), module.param.data(),           module.work.data(),
 				    fx.user_data,          rack.option.common.max_voices, i};
 				if (fx.setup(&context) != OK) {
-					LOGF("warning: NGS2 voice setup failed for module %u, rack %u\n", m, i);
+					LOGF("warning: NGS2 voice setup failed for module %u, voice %u\n", m, i);
 				}
 			}
 		}

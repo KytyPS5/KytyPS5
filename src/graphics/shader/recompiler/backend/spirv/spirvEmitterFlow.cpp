@@ -252,8 +252,14 @@ uint32_t ExportVector(ValueEmitContext& ctx, uint32_t data, const IR::ExportInfo
                       bool uint_output) {
 	auto& state = ctx.state;
 	if (exp.compr && !uint_output) {
-		const auto unpack =
-		    MrtOutputMode(state, exp) == 5u ? GLSLstd450UnpackUnorm2x16 : GLSLstd450UnpackHalf2x16;
+		// A compressed export carries two 16-bit values per dword, and what they are is set by
+		// SPI_SHADER_COL_FORMAT: 4 = float16, 5 = unorm16, 6 = snorm16. Reading snorm16 pairs
+		// as half floats turns the bit patterns into NaN or ~0, which is how every normal and
+		// tangent a shader packed with V_CVT_PKNORM_I16_F32 came out of the G-buffer as garbage.
+		const auto mode   = MrtOutputMode(state, exp);
+		const auto unpack = mode == 5u   ? GLSLstd450UnpackUnorm2x16
+		                    : mode == 6u ? GLSLstd450UnpackSnorm2x16
+		                                 : GLSLstd450UnpackHalf2x16;
 		uint32_t f32[4] = {ConstantF32(state, 0), ConstantF32(state, 0), ConstantF32(state, 0),
 		                   ConstantF32(state, 0x3f800000u)};
 		for (uint32_t pair = 0; pair < 2u; pair++) {

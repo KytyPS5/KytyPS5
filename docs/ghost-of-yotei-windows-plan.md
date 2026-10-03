@@ -1,5 +1,25 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **3 октября 2026 года, 20:25 UTC** (native Windows via WSL;
+branch `yotei-windows-bringup`, pushed test/diagnostic commit `676aa650`):
+
+- Native `kyty_emulator` built and installed from committed source after both
+  diagnostic caps were removed; installed exe SHA-256
+  `e95fffb53e48e76f480985c793965d44584314e427c87ac0025c7193d4b8e8f9`.
+  Build/install logs: `_Build/logs/yotei-676aa650-clean-{build,install}-20261003.log`.
+  No task-owned emulator, test, Ninja or MSBuild process remained.
+- The second cap run's phase trace corrects the 20:23 checkpoint: repeated
+  `54904…` ResourceTracking phases finished in milliseconds. Neither the
+  phase of the first run's long stall nor a CPU mechanism requiring a fix was
+  established. The clean game was not retried after the test-only commit;
+  its last verified state remains nonzero prepared pixels at frames 198–199,
+  followed by DeviceLost around `shown=200`. Menu/gameplay **PENDING**.
+- Next: derive an independently failing bounded shader/driver case for the
+  large indexed Vertex draw. Keep unsupported wave64 graphics semantics
+  explicit and avoid treating diagnostic caps as a fix. Later revisit the
+  formatted CS descriptor path with real runtime provenance after the clean
+  draw is resolved.
+
 Checkpoint **3 октября 2026 года, 20:23 UTC** (native Windows via WSL;
 branch `yotei-windows-bringup`, source head `1667cfe5` plus test/docs work;
 installed clean-mechanism exe SHA-256

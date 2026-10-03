@@ -60,6 +60,9 @@ struct StructuredFunctionState {
 	std::unordered_map<const IR::Block*,
 	                   std::pair<const IR::Block*, const IR::Block*>>
 	    budgeted_loop_continues;
+	std::unordered_map<const IR::Block*,
+	                   std::pair<const IR::Block*, const IR::Block*>>
+	    budgeted_loop_exit_conditions;
 	std::vector<DeferredContinuePatch>             deferred_continues;
 	std::unordered_map<const IR::Block*, uint32_t> block_exit_labels;
 	std::vector<DeferredPhiPatch>                  deferred_phis;
@@ -263,6 +266,26 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, StructuredFunctionState& st
 				return;
 			}
 			auto condition = ctx.Def(info.condition);
+			if (const auto exit = structured.budgeted_loop_exit_conditions.find(block);
+			    exit != structured.budgeted_loop_exit_conditions.end()) {
+				const auto* cont = exit->second.first;
+				const auto* merge = exit->second.second;
+				const auto within = EmitGraphicsLoopWithinBudget(ctx);
+				if (true_block == cont && false_block == merge) {
+					const auto guarded = ctx.state.builder.AllocateId();
+					ctx.state.builder.AddFunction(
+					    {OpLogicalAnd, TypeBool(ctx.state), guarded, condition, within});
+					condition = guarded;
+				} else if (true_block == merge && false_block == cont) {
+					const auto outside = ctx.state.builder.AllocateId();
+					const auto guarded = ctx.state.builder.AllocateId();
+					ctx.state.builder.AddFunction(
+					    {OpLogicalNot, TypeBool(ctx.state), outside, within});
+					ctx.state.builder.AddFunction(
+					    {OpLogicalOr, TypeBool(ctx.state), guarded, condition, outside});
+					condition = guarded;
+				}
+			}
 			if (const auto loop = structured.budgeted_loop_continues.find(block);
 			    loop != structured.budgeted_loop_continues.end()) {
 				const auto* header = loop->second.first;
@@ -627,7 +650,29 @@ void EmitStructuredFunction(ValueEmitContext& ctx) {
 			const auto* merge  = TargetBlock(ctx.program, info.terminator.merge_block);
 			const auto* cont   = TargetBlock(ctx.program, info.terminator.continue_block);
 			if (merge != nullptr && cont != nullptr) {
-				structured.budgeted_loop_continues.emplace(cont, std::pair {header, merge});
+				const auto has_merge_phi = std::ranges::any_of(*merge, [](const IR::Inst& inst) {
+					return inst.GetOpcode() == IR::ValueOpcode::Phi;
+				});
+				if (has_merge_phi && cont->ImmPredecessors().size() == 1u &&
+				    info.terminator.continue_block < program.block_info.size()) {
+					const auto* predecessor = cont->ImmPredecessors().front();
+					const auto candidate = std::ranges::find(program.blocks, predecessor);
+					if (candidate != program.blocks.end()) {
+						const auto& exit = program.block_info[static_cast<size_t>(candidate - program.blocks.begin())].terminator;
+						if (exit.kind == CFG::TerminatorKind::ConditionalBranch &&
+						    ((TargetBlock(program, exit.true_block) == cont &&
+						      TargetBlock(program, exit.false_block) == merge) ||
+						     (TargetBlock(program, exit.true_block) == merge &&
+						      TargetBlock(program, exit.false_block) == cont))) {
+							structured.budgeted_loop_exit_conditions.emplace(
+							    predecessor, std::pair {cont, merge});
+							continue;
+						}
+					}
+				}
+				if (!has_merge_phi) {
+					structured.budgeted_loop_continues.emplace(cont, std::pair {header, merge});
+				}
 			}
 		}
 	}

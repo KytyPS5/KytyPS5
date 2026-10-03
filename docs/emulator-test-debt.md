@@ -2754,6 +2754,24 @@ nonzero RGB. Menu and gameplay remain separate pending stages.
 
 ## Partitioned graphics loop budget at the structured back-edge
 
+Update 2026-10-03: a temporary Vertex budget of four iterations reached the
+119856-index draw but produced invalid SPIR-V before GPU execution. Validator:
+`OpPhi's number of incoming blocks (2) does not match block's predecessor
+count (3)` in `_Build/runs/yotei-integrated-20261003-120114-presentfix-gpuav-sync`.
+The budgeted back-edge adds a path to the loop merge without updating a merge
+Phi. The new public `shader_cfg_tests
+--partitioned-graphics-loop-merge-phi-only` produced the same validator RED
+before the shared fix (`_Build/logs/loop-merge-phi-red2-20261003.txt.stderr`).
+The emitter now applies the budget at an existing conditional exit when that
+exit is the sole predecessor of the continue block. The unchanged merge Phi
+retains the same predecessor set. If the merge has Phi values but no such
+existing exit, the emitter does not add an invalid direct edge. The same test
+is GREEN (`_Build/logs/partitioned-graphics-loop-merge-phi-green-20261003.txt`),
+including a counter-update check; original partitioned loop, graphics wave64
+collective and nested conditional-latch neighbors are GREEN. A temporary
+Vertex cap still needs a bounded game retry as diagnosis, and is not a
+semantic replacement for wave64.
+
 Status: the synthetic validator regression and the captured game SPIR-V are GREEN;
 the full native suite and nested-loop variants remain deferred.
 

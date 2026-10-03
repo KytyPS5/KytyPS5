@@ -9035,6 +9035,32 @@ void TestPartitionedGraphicsLoopBudgetSpirv() {
   CheckSpirvBinaryValidates(stalled.spirv);
 }
 
+void TestPartitionedGraphicsLoopBudgetMergePhi() {
+  const uint32_t shader[] = {
+      EncodeSopc(0x06, 7, 7),    // entry branch bypasses loop -> exit X
+      EncodeSopp(0x05, 5),       // entry -> X
+      EncodeSopc(0x0a, 0, 129),  // loop: s_cmp_lt_u32 s0, 1
+      EncodeSopp(0x04, 5),       // loop exit -> Y
+      EncodeSopc(0x06, 1, 1),    // inner condition
+      EncodeSopp(0x05, 1),       // nonmerge exit -> X, else continue
+      EncodeSopp(0x02, 0xfffbu), // loop backedge
+      EncodeSMovB32(2, 129),     // X
+      EncodeSopp(0x02, 2),       // X -> end
+      EncodeSMovB32(3, 129),     // Y
+      EncodeSopp(0x02, 0),       // Y -> end
+      EncodeSopp(0x01),
+  };
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.wave_size = 64u;
+  options.compute_workgroup_limits.native_subgroup_size = 32u;
+  options.dump_ir = true;
+  const auto compiled = RecompileForTest(shader, options);
+  const auto metrics = MeasureSpirv(compiled.spirv);
+  Check(metrics.phis != 0u && metrics.stores >= 2u,
+        "synthetic budgeted loop lost its Phi or back-edge counter update");
+  CheckSpirvBinaryValidates(compiled.spirv);
+}
+
 #if KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
 void TestNewShaderRecompilerCfgLoopHeaderDynamicScalarBufferLoadStructured() {
   const uint32_t shader[] = {
@@ -18808,6 +18834,11 @@ int main(int argc, char* argv[]) {
   if (argc == 2 && std::strcmp(argv[1], "--partitioned-graphics-loop-only") == 0) {
     Libs::Graphics::TestPartitionedGraphicsLoopBudgetSpirv();
     std::puts("KYTY_PARTITIONED_GRAPHICS_LOOP_PASS");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--partitioned-graphics-loop-merge-phi-only") == 0) {
+    Libs::Graphics::TestPartitionedGraphicsLoopBudgetMergePhi();
+    std::puts("KYTY_PARTITIONED_GRAPHICS_LOOP_MERGE_PHI_PASS");
     return 0;
   }
   if (argc == 2 &&

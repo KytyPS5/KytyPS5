@@ -1,5 +1,26 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **3 октября 2026 года, 12:26 UTC** (native Windows via WSL;
+branch `yotei-windows-bringup`, parent commit `e39ddf90` plus uncommitted
+loop-emitter fix; installed exe remains temporary Vertex cap diagnostic SHA-256
+`0e0edff431e813ed6e8c6bd5a04429f3972cebf6283903a7b46bb19ecf185ab4`):
+
+- Отдельный GPUAV-lite запуск с пустым новым кэшем всё равно завершился
+  NVIDIA `0x80000003` на CS `b90e…`, `shown=0`. Исправление разделения
+  pipeline cache проверено, но не снимает этот driver compiler blocker.
+- Временный Vertex cap и GPUAV instrumentation дошли до индексированного
+  draw `119856` с VS `e312…`; до исполнения draw эмиттер создал невалидный
+  `OpPhi` (у merge три предшественника, два значения). Бounded run без
+  readback: `_Build/runs/yotei-integrated-20261003-120114-presentfix-gpuav-sync`,
+  `exit=321`, `shown=196`. Первый run с readback остановился раньше на уже
+  известной ошибке layout диагностического захвата при `shown=350`.
+- Общая ошибка budgeted loop с merge Phi воспроизведена независимым
+  синтетическим Pixel shader и исправлена: лимит использует существующий
+  условный выход вместо нового ребра к merge. Native RED/GREEN и соседние
+  проверки перечислены в `docs/emulator-test-debt.md`. Нужно собрать emulator,
+  повторить временный Vertex cap и затем восстановить чистый executable.
+  Меню и gameplay **PENDING**.
+
 Checkpoint **3 октября 2026 года, 11:48 UTC** (native Windows via WSL;
 branch `yotei-windows-bringup`, source revision `3498dce7` plus uncommitted
 cache-identity fix; installed emulator still SHA-256

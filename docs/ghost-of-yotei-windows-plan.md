@@ -1,5 +1,27 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **3 октября 2026 года, 10:33 UTC** (native Windows via WSL;
+branch `yotei-windows-bringup`; installed emulator exe SHA-256
+`be1dbd195b9b9a0ca6454ac2ed77835cd7a08442c27903cb90549a9559cb3623`):
+
+- Регрессионный native тест обнаружил, что флаг
+  `VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT` для cooperative wave64
+  оставался только в policy helper и не попадал в реальный
+  `vk::ComputePipelineCreateInfo`. Исправлен общий путь создания compute
+  pipeline; тест получил ожидаемый RED до изменения и GREEN после него.
+  Соседние проверки оптимизации и допуска cooperative wave64 прошли.
+  Подробные команды, hashes и логи — в `docs/emulator-test-debt.md`.
+- Повтор игры с GPUAV без shader instrumentation
+  `_Build/runs/yotei-integrated-20261003-103053-presentfix-gpuav`
+  завершился `0x80000003` при компиляции CS `b90e2024732c6111`, до
+  показанного кадра. Новая трасса установила `cooperative_wave64=0`,
+  `flags=0x0` для этого CS; следовательно, исправление флага не снимает
+  текущий NVIDIA compiler blocker. Следующее: изолировать этот SPIR-V с
+  production-equivalent descriptor/push layout, затем найти общий
+  compiler-sensitive lowering на синтетическом тесте. Первый ненулевой
+  кадр подтверждён только прежним GPUAV+instrumentation запуском;
+  меню и gameplay **PENDING**.
+
 Checkpoint **3 октября 2026 года, 10:16 UTC** (native Windows via WSL;
 branch `yotei-windows-bringup`, test-only commit `cc3fa4e4`; installed emulator
 exe SHA-256 `5251cfc12f986dda2e9b3c8c761e0e80b5fe0545493dcc210cad803c2da406da`):

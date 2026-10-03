@@ -271,6 +271,34 @@ recorded in the DeviceLost section above.
 
 ## Driver compiler crash without GPUAV (2026-10-02)
 
+Next synthetic regression (2026-10-03): construct the same
+`vk::ComputePipelineCreateInfo` that `CreatePipelineInternal` submits, using
+`CompiledShaderInfo::compute_cooperative_wave64=true`, and assert that its
+`flags` contains `VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT`. Check the
+ordinary compute case remains unflagged. The existing policy-only helper
+test passes even though the submitted create info currently has zero flags;
+record a native RED before changing production behavior. This is a pipeline
+configuration regression, not a standalone reproduction of the NVIDIA crash.
+
+Native RED/GREEN proof: `_Build/windows-local.cmd build-target shader_cfg_tests`
+and `--cooperative-pipeline-flags-only` on test exe SHA-256
+`07d1185f42c3e9dabb881abf9a208409429b012b0e6a04b6b28d6496aca9a0d5`
+failed the intended flag assertion (`_Build/logs/compute-pipeline-flags-red-cfg-20261003.txt*`).
+The same test on exe SHA-256
+`63db5e9003d73e30b05a1fea4077aaa519ffb59dc161fb6f223e20442e24026f`
+passes after routing `CompiledShaderInfo` metadata through the actual
+`vk::ComputePipelineCreateInfo` builder. Neighboring
+`--spirv-optimization-only` and `--cooperative-wave64-admission-only` pass.
+Native emulator build/install passed; installed exe SHA-256
+`be1dbd195b9b9a0ca6454ac2ed77835cd7a08442c27903cb90549a9559cb3623`.
+Bounded game retry `_Build/runs/yotei-integrated-20261003-103053-presentfix-gpuav`
+with GPUAV shader instrumentation disabled stopped again at `shown=0`,
+`exitCode=-2147483645` during the same `b90e2024732c6111`
+`vkCreateComputePipelines`. New trace proves this shader has
+`compute_cooperative_wave64=0` and `flags=0x0`, so the validated pipeline
+flag correction does not address the game compiler crash. Do not repeat this
+mode without a separate compiler/layout reproducer or a relevant shader fix.
+
 New bounded retry on 2026-10-03 with GPUAV enabled but shader
 instrumentation disabled used installed emulator exe SHA-256
 `5251cfc12f986dda2e9b3c8c761e0e80b5fe0545493dcc210cad803c2da406da`.

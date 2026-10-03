@@ -32,8 +32,26 @@ vk::PipelineCreateFlags ComputePipelineCreationFlags(bool cooperative_wave64) {
 	                          : vk::PipelineCreateFlags {};
 }
 
+vk::ComputePipelineCreateInfo BuildComputePipelineCreateInfo(
+    const ShaderComputeInputInfo& input_info, vk::PipelineShaderStageCreateInfo stage,
+    vk::PipelineLayout layout) {
+	vk::ComputePipelineCreateInfo info {};
+	info.flags             = ComputePipelineCreationFlags(
+	    input_info.stage.program->compute_cooperative_wave64);
+	info.stage             = stage;
+	info.layout            = layout;
+	info.basePipelineIndex = -1;
+	return info;
+}
+
 bool ComputePipelineDisablesOptimizationForTest(bool cooperative_wave64) {
-	return static_cast<VkPipelineCreateFlags>(ComputePipelineCreationFlags(cooperative_wave64)) != 0;
+	ShaderRecompiler::IR::CompiledShaderInfo program {};
+	program.compute_cooperative_wave64 = cooperative_wave64;
+	ShaderComputeInputInfo input_info {};
+	input_info.stage.program = &program;
+	const auto info = BuildComputePipelineCreateInfo(input_info, {}, nullptr);
+	return static_cast<VkPipelineCreateFlags>(info.flags) &
+	       VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
 }
 
 // IDK: maybe we can remove it?
@@ -643,15 +661,16 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	EXIT_NOT_IMPLEMENTED(pipeline.pipeline_layout == nullptr);
 
-	vk::ComputePipelineCreateInfo info {};
-	info.stage             = comp_shader_stage_info;
-	info.layout            = pipeline.pipeline_layout;
-	info.basePipelineIndex = -1;
+	const auto info = BuildComputePipelineCreateInfo(input_info, comp_shader_stage_info,
+	                                                 pipeline.pipeline_layout);
 
 	EXIT_IF(pipeline.pipeline != nullptr);
 
-	LOGF("PipelineTrace: vkCreateComputePipelines begin layout=%p\n",
-	     static_cast<void*>(pipeline.pipeline_layout));
+	LOGF("PipelineTrace: vkCreateComputePipelines begin layout=%p shader=0x%016" PRIx64
+	     " cooperative_wave64=%u flags=0x%x\n",
+	     static_cast<void*>(pipeline.pipeline_layout), input_info.stage.program->shader_hash,
+	     input_info.stage.program->compute_cooperative_wave64 ? 1u : 0u,
+	     static_cast<unsigned>(static_cast<VkPipelineCreateFlags>(info.flags)));
 	Log::Flush();
 	const auto pipeline_begin = Common::Timer::QueryPerformanceCounter();
 	result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr,

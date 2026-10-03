@@ -27,6 +27,17 @@ namespace {
 constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
 
+// Thread-local scratch buffer for device addresses, reused across calls to
+// ChangeRegister to avoid a heap allocation per invocation.
+//
+// The function previously allocated a fresh std::vector<vk::DeviceAddress> on
+// every register/unregister, then copied its contents into the page-table
+// staging buffer. Reusing a thread-local vector eliminates both the allocation
+// and the redundant copy while remaining thread-safe (each thread owns its own
+// instance). The buffer is safe to overwrite on the next call because
+// WriteDataBuffer copies the data synchronously before returning.
+thread_local std::vector<vk::DeviceAddress> g_tls_addresses;
+
 } // namespace
 
 void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source,
@@ -71,15 +82,19 @@ void BufferCache::ChangeRegister(BufferId id) {
 		(void)it;
 		EXIT_IF(!inserted);
 		m_total_used_memory += buffer.Size();
-		buffer.lru_id = m_lru_cache.Insert(id, m_gc_tick);
-		std::vector<vk::DeviceAddress> addresses;
-		addresses.reserve(size_pages);
-		for (uint64_t i = 0; i < size_pages; ++i) {
-			addresses.push_back(buffer.BufferDeviceAddress() + (i << CACHING_PAGEBITS));
-		}
-		WriteDataBuffer(m_bda_pagetable_buffer, table_offset,
-		                addresses.data(), addresses.size() * sizeof(vk::DeviceAddress));
-	} else {
+			buffer.lru_id = m_lru_cache.Insert(id, m_gc_tick);
+	// Reuse the thread-local scratch buffer to avoid a heap allocation on
+	// every register call. resize() only reallocates when the requested
+	// size exceeds the current capacity, so steady-state calls are
+	// allocation-free.
+	g_tls_addresses.resize(size_pages);
+	const auto base_addr = buffer.BufferDeviceAddress();
+	for (uint64_t i = 0; i < size_pages; ++i) {
+		g_tls_addresses[i] = base_addr + (i << CACHING_PAGEBITS);
+	}
+	WriteDataBuffer(m_bda_pagetable_buffer, table_offset,
+	                g_tls_addresses.data(), g_tls_addresses.size() * sizeof(vk::DeviceAddress));
+} else {
 		const auto found = m_buffers.find(buffer.CpuAddress());
 		EXIT_IF(found == m_buffers.end() || found->second != id);
 		m_buffers.erase(found);

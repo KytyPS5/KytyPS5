@@ -77,10 +77,17 @@ bool IsDriverCacheSignatureCompatibleForTest(
     std::string_view cached_signature, std::string_view expected_signature);
 std::string DriverCacheFileNameForTest(std::string_view title_id,
                                        bool gpu_assisted_validation);
+std::string DriverCacheFileNameForTest(std::string_view title_id,
+                                       bool gpu_assisted_validation,
+                                       bool shader_instrumentation);
 std::string FormatDriverCacheSignatureForTest(
     std::string_view git_revision, std::string_view worktree_fingerprint, uint32_t vendor_id,
     uint32_t device_id, uint32_t driver_version, std::string_view pipeline_cache_uuid_hex,
     bool gpu_assisted_validation);
+std::string FormatDriverCacheSignatureForTest(
+    std::string_view git_revision, std::string_view worktree_fingerprint, uint32_t vendor_id,
+    uint32_t device_id, uint32_t driver_version, std::string_view pipeline_cache_uuid_hex,
+    bool gpu_assisted_validation, bool shader_instrumentation);
 std::optional<uint64_t> FindReusableShaderProgramIdForTest(
     std::span<const uint64_t> existing_spirv_hashes, std::span<const uint64_t> existing_program_ids,
     uint64_t spirv_hash);
@@ -330,6 +337,33 @@ void TestDriverPipelineCacheValidationModeIdentity() {
         "GPUAV pipeline cache signature rejected itself");
   Check(!IsDriverCacheSignatureCompatibleForTest(core, gpuav),
         "GPUAV and core pipeline cache signatures were treated as compatible");
+}
+
+void TestDriverPipelineCacheShaderInstrumentationIdentity() {
+  constexpr std::string_view revision = "0123456789abcdef0123456789abcdef01234567";
+  constexpr std::string_view fingerprint =
+      "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+  constexpr std::string_view uuid = "90e15239d43c24d0fd532c2a423d6fe9";
+  const auto core = DriverCacheFileNameForTest("SYNTHETIC", false, false);
+  const auto lite = DriverCacheFileNameForTest("SYNTHETIC", true, false);
+  const auto instrumented = DriverCacheFileNameForTest("SYNTHETIC", true, true);
+  Check(core != lite && core != instrumented && lite != instrumented,
+        "distinct validation instrumentation modes shared a driver cache file");
+  const auto signature = [&](bool gpuav, bool instrumentation) {
+    return FormatDriverCacheSignatureForTest(revision, fingerprint, 0x10deu, 0x2d04u,
+                                             0x9a100000u, uuid, gpuav, instrumentation);
+  };
+  const auto core_signature = signature(false, false);
+  const auto lite_signature = signature(true, false);
+  const auto instrumented_signature = signature(true, true);
+  Check(!IsDriverCacheSignatureCompatibleForTest(core_signature, lite_signature) &&
+            !IsDriverCacheSignatureCompatibleForTest(core_signature, instrumented_signature) &&
+            !IsDriverCacheSignatureCompatibleForTest(lite_signature, instrumented_signature),
+        "distinct validation instrumentation modes shared a driver cache signature");
+  Check(IsDriverCacheSignatureCompatibleForTest(lite_signature, lite_signature) &&
+            IsDriverCacheSignatureCompatibleForTest(instrumented_signature,
+                                                     instrumented_signature),
+        "matching validation instrumentation mode rejected its own driver cache");
 }
 
 void TestVideoOutVrrStatusLibraryContract() {
@@ -18675,6 +18709,12 @@ int main(int argc, char* argv[]) {
       std::strcmp(argv[1], "--pipeline-cache-validation-mode-only") == 0) {
     Libs::Graphics::TestDriverPipelineCacheValidationModeIdentity();
     std::puts("KYTY_PIPELINE_CACHE_VALIDATION_MODE_PASS");
+    return 0;
+  }
+  if (argc == 2 &&
+      std::strcmp(argv[1], "--pipeline-cache-instrumentation-only") == 0) {
+    Libs::Graphics::TestDriverPipelineCacheShaderInstrumentationIdentity();
+    std::puts("KYTY_PIPELINE_CACHE_INSTRUMENTATION_PASS");
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--image-gather-variants-only") == 0) {

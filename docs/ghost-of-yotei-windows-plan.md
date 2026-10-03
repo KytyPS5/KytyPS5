@@ -1,5 +1,24 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **3 октября 2026 года, 11:48 UTC** (native Windows via WSL;
+branch `yotei-windows-bringup`, source revision `3498dce7` plus uncommitted
+cache-identity fix; installed emulator still SHA-256
+`be1dbd195b9b9a0ca6454ac2ed77835cd7a08442c27903cb90549a9559cb3623`):
+
+- Сентябрьский `.spv` для `b90e…` в standalone probe тоже дал NVIDIA
+  `0x80000003`; сохранённый файл отличается от реально скомпилированного
+  модуля того успешного GPUAV запуска, поэтому старый/новый SPIR-V пока не
+  образуют корректное A/B сравнение.
+- Обнаружено и исправлено смешение Vulkan pipeline cache между GPUAV с
+  включённым и выключенным shader instrumentation. Native synthetic test
+  `--pipeline-cache-instrumentation-only` получил RED до исправления и GREEN
+  после, соседние проверки кэша прошли. Логи и точные границы доказательства
+  записаны в `docs/emulator-test-debt.md`. Требуется собрать/установить
+  emulator и проверить игру с отдельным кэшем; тест не доказывает, что
+  NVIDIA breakpoint снят.
+- Последняя проверенная стадия игры остаётся ненулевым спиннером в прежнем
+  GPUAV+instrumentation запуске. Меню и gameplay **PENDING**.
+
 Checkpoint **3 октября 2026 года, 10:58 UTC** (native Windows via WSL;
 branch `yotei-windows-bringup`, pushed head `4b4abc7b`; installed emulator
 exe SHA-256 `be1dbd195b9b9a0ca6454ac2ed77835cd7a08442c27903cb90549a9559cb3623`):

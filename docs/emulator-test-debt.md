@@ -2846,6 +2846,28 @@ Remaining validation:
 - Measure steady rendering FPS only after a nonzero frame exists; the current
   figures are startup/compiler progress, not gameplay performance.
 
+## GPUAV shader instrumentation cache identity
+
+Status: **shared cache-identity fix verified in native synthetic test**. Before
+the fix, `DriverCacheFileName` and `FormatDriverCacheSignature` took only the
+GPUAV enabled bit. A GPUAV run with `VK_LAYER_GPUAV_SHADER_INSTRUMENTATION=0`
+and one with `=1` therefore selected the same `-gpuav.bin` blob and `v1`
+signature, although the validation layer can hand different SPIR-V modules to
+the driver.
+The 3 October no-instrumentation run loaded the 306192646-byte GPUAV cache and
+then hit `0x80000003` while creating compute pipeline `b90e2024732c6111`.
+This was a collision in the cache identity, but the crash cause remains
+unproved: an isolated no-layer probe also crashes on that module. The same
+synthetic `shader_cfg_tests --pipeline-cache-instrumentation-only` failed before
+the fix with `distinct validation instrumentation modes shared a driver cache
+file` (`_Build/logs/cache-instrumentation-red-20261003.txt.stderr`) and passed
+after the fix (`_Build/logs/pipeline-cache-instrumentation-green-20261003.txt`).
+The native neighboring validation-mode, revision and build-identity checks also
+passed. The three modes now use `-core.bin`/`v0`, `-gpuav-lite.bin`/`v2`, and
+`-gpuav-instr.bin`/`v3`; the old mixed `v1` signature is rejected. Next: native
+emulator build and a bounded game retry with the new isolated cache. Do not
+interpret the identity test as proof that it fixes the `b90e` compiler crash.
+
 ## GPUAV-sensitive NVIDIA pipeline cache identity
 
 Status: **shared identity fixed** (KytyPC3 + separate `{TITLE}-core.bin` /

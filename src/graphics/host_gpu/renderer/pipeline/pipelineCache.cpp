@@ -114,7 +114,7 @@ bool IsDriverCacheSignatureCompatible(std::string_view cached_signature,
 		}
 
 		const auto identity = signature.substr(fingerprint_end + 1);
-		// vendor:device:driver:uuid:vN\n  — fixed-width mode tag v0/v1
+		// vendor:device:driver:uuid:vN\n  — fixed-width mode tag
 		constexpr size_t identity_size = 8 + 1 + 8 + 1 + 8 + 1 + 32 + 1 + 2 + 1;
 		if (identity.size() != identity_size || identity[8] != ':' ||
 		    identity[17] != ':' || identity[26] != ':' || identity[59] != ':' ||
@@ -123,7 +123,8 @@ bool IsDriverCacheSignatureCompatible(std::string_view cached_signature,
 		    !IsLowerHex(identity.substr(9, 8), 8) ||
 		    !IsLowerHex(identity.substr(18, 8), 8) ||
 		    !IsLowerHex(identity.substr(27, 32), 32) ||
-		    (identity.substr(60, 2) != "v0" && identity.substr(60, 2) != "v1")) {
+		    (identity.substr(60, 2) != "v0" && identity.substr(60, 2) != "v2" &&
+		     identity.substr(60, 2) != "v3")) {
 			return std::nullopt;
 		}
 		return identity;
@@ -135,13 +136,27 @@ bool IsDriverCacheSignatureCompatible(std::string_view cached_signature,
 	       *cached_identity == *expected_identity;
 }
 
-std::string_view DriverCacheValidationModeTag(bool gpu_assisted_validation) {
-	return gpu_assisted_validation ? "v1" : "v0";
+std::string_view DriverCacheValidationModeTag(bool gpu_assisted_validation,
+                                              bool shader_instrumentation) {
+	return !gpu_assisted_validation ? "v0" : shader_instrumentation ? "v3" : "v2";
 }
 
-std::string DriverCacheFileName(std::string_view title_id, bool gpu_assisted_validation) {
+std::string DriverCacheFileName(std::string_view title_id, bool gpu_assisted_validation,
+                                bool shader_instrumentation) {
 	return fmt::format("{}-{}.bin", title_id,
-	                   gpu_assisted_validation ? "gpuav" : "core");
+	                   !gpu_assisted_validation ? "core"
+	                   : shader_instrumentation ? "gpuav-instr"
+	                                            : "gpuav-lite");
+}
+
+bool DriverCacheShaderInstrumentationEnabled() {
+	if (!Config::GpuAssistedValidationEnabled()) {
+		return false;
+	}
+	const auto* setting = std::getenv("VK_LAYER_GPUAV_SHADER_INSTRUMENTATION");
+	// The validation layer instruments shaders by default. The launch scripts set
+	// this variable explicitly when they request the lighter validation mode.
+	return setting == nullptr || std::strcmp(setting, "0") != 0;
 }
 
 std::string FormatDriverCacheSignature(std::string_view git_revision,
@@ -149,11 +164,12 @@ std::string FormatDriverCacheSignature(std::string_view git_revision,
                                        uint32_t vendor_id, uint32_t device_id,
                                        uint32_t driver_version,
                                        std::string_view pipeline_cache_uuid_hex,
-                                       bool gpu_assisted_validation) {
+                                       bool gpu_assisted_validation, bool shader_instrumentation) {
 	return fmt::format("KytyPC3:{}:{}:{:08x}:{:08x}:{:08x}:{}:{}\n", git_revision,
 	                   worktree_fingerprint, vendor_id, device_id, driver_version,
 	                   pipeline_cache_uuid_hex,
-	                   DriverCacheValidationModeTag(gpu_assisted_validation));
+	                   DriverCacheValidationModeTag(gpu_assisted_validation,
+	                                                shader_instrumentation));
 }
 
 std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties) {
@@ -166,7 +182,7 @@ std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties)
 	return FormatDriverCacheSignature(
 	    KYTY_GIT_REVISION, KYTY_GIT_WORKTREE_FINGERPRINT, properties.vendorID,
 	    properties.deviceID, properties.driverVersion, uuid,
-	    Config::GpuAssistedValidationEnabled());
+	    Config::GpuAssistedValidationEnabled(), DriverCacheShaderInstrumentationEnabled());
 }
 
 std::string PipelineCacheTitleId() {
@@ -1048,7 +1064,13 @@ bool IsDriverCacheSignatureCompatibleForTest(std::string_view cached_signature,
 
 std::string DriverCacheFileNameForTest(std::string_view title_id,
                                        bool gpu_assisted_validation) {
-	return DriverCacheFileName(title_id, gpu_assisted_validation);
+	return DriverCacheFileName(title_id, gpu_assisted_validation, gpu_assisted_validation);
+}
+
+std::string DriverCacheFileNameForTest(std::string_view title_id,
+                                       bool gpu_assisted_validation,
+                                       bool shader_instrumentation) {
+	return DriverCacheFileName(title_id, gpu_assisted_validation, shader_instrumentation);
 }
 
 std::string FormatDriverCacheSignatureForTest(
@@ -1057,7 +1079,16 @@ std::string FormatDriverCacheSignatureForTest(
     bool gpu_assisted_validation) {
 	return FormatDriverCacheSignature(git_revision, worktree_fingerprint, vendor_id, device_id,
 	                                  driver_version, pipeline_cache_uuid_hex,
-	                                  gpu_assisted_validation);
+	                                  gpu_assisted_validation, gpu_assisted_validation);
+}
+
+std::string FormatDriverCacheSignatureForTest(
+    std::string_view git_revision, std::string_view worktree_fingerprint, uint32_t vendor_id,
+    uint32_t device_id, uint32_t driver_version, std::string_view pipeline_cache_uuid_hex,
+    bool gpu_assisted_validation, bool shader_instrumentation) {
+	return FormatDriverCacheSignature(git_revision, worktree_fingerprint, vendor_id, device_id,
+	                                  driver_version, pipeline_cache_uuid_hex,
+	                                  gpu_assisted_validation, shader_instrumentation);
 }
 
 void PipelineCache::InitializeDriverCache() {
@@ -1079,7 +1110,8 @@ void PipelineCache::InitializeDriverCache() {
 
 	m_driver_cache_path =
 	    std::filesystem::path("_PipelineCache") /
-	    DriverCacheFileName(title_id, Config::GpuAssistedValidationEnabled());
+	    DriverCacheFileName(title_id, Config::GpuAssistedValidationEnabled(),
+	                        DriverCacheShaderInstrumentationEnabled());
 	const auto path         = Common::PathToString(m_driver_cache_path);
 	const bool cache_exists = Common::File::IsFileExisting(m_driver_cache_path);
 	if (cache_exists) {

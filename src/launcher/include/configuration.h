@@ -126,7 +126,7 @@ public:
 	bool                   readback_storage_images     = false;
 	bool                   sync_raw_image_buffers      = false;
 	int                    flush_draws                 = 0;
-	bool                   tessellation_enabled        = false;
+	bool                   tessellation_enabled        = true;
 	bool                   occlusion_queries_enabled   = true;
 	bool                   relaxed_shader_float        = false;
 	bool                   native_rt                   = false;

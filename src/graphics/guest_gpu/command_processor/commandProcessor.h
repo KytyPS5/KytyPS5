@@ -79,9 +79,11 @@ public:
 	void DrawIndex(DrawIndexArgs args);
 	void DrawIndexOffset(uint32_t index_offset, uint32_t index_count);
 	void DrawIndexAuto(DrawAutoArgs args);
-	void DrawIndirect(uint32_t data_offset, uint32_t draw_initiator, bool indexed);
+	void DrawIndirect(uint32_t data_offset, uint32_t vertex_location, uint32_t instance_location,
+	                  uint32_t draw_initiator, bool indexed);
 	void DrawIndirectMulti(uint32_t data_offset, uint32_t max_count_or_count,
 	                       const volatile uint32_t* count_addr, uint32_t stride_in_bytes,
+	                       uint32_t vertex_location, uint32_t instance_location,
 	                       uint32_t draw_initiator, bool indexed);
 	void WriteAtEndOfPipe32(uint32_t cache_policy, uint32_t event_write_dest,
 	                        uint32_t eop_event_type, uint32_t cache_action, uint32_t event_index,

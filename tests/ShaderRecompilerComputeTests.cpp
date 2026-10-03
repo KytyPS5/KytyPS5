@@ -40053,9 +40053,9 @@ void CheckPm4WaitPackets(RenderContext &renderer) {
 void CheckPm4DrawIndirectMultiPacket(RenderContext &renderer) {
   GraphicsInitJmpTables();
   CommandProcessor processor(renderer, 0);
-  const auto execute = [&](uint32_t *packet, uint32_t size_dw) {
+  const auto execute = [&](std::span<const uint32_t> packet) {
     Pm4Execution execution;
-    return processor.Process(execution, {packet, size_dw}) ==
+    return processor.Process(execution, packet) ==
            Pm4ProcessResult::Complete;
   };
 
@@ -40085,8 +40085,8 @@ void CheckPm4DrawIndirectMultiPacket(RenderContext &renderer) {
   Require("Pm4DrawIndirectMulti", "native packet",
           emitted == packet.data() &&
               dcb.cursor_up == packet.data() + packet.size() &&
-              packet == expected && execute(packet.data(), 3u) &&
-              execute(packet.data() + 13u, 3u) &&
+              packet == expected && execute({packet.data(), 3u}) &&
+              execute({packet.data() + 13u, 3u}) &&
               Gen5::AgcWaitRegMemPatchAddress(packet.data(), count_address) ==
                   packet_mismatch &&
               Gen5::AgcWaitRegMemPatchReference(packet.data(), 0x12345678u) ==
@@ -40108,7 +40108,7 @@ void CheckPm4DrawIndirectMultiPacket(RenderContext &renderer) {
   processor.SetIndexType(0);
   std::array<uint32_t, 5> captured{0xc0032500u, data_offset, 0x94, 0x95, 0};
   Require("Pm4DrawIndirectMulti", "captured indexed single execution",
-          execute(captured.data(), captured.size()),
+          execute(captured),
           "indexed indirect draw rejected native source-select zero");
   // Zero primitive counts still traverse CP argument decoding and renderer entry,
   // while avoiding unrelated shader and attachment requirements.
@@ -40140,17 +40140,77 @@ void CheckPm4DrawIndirectMultiPacket(RenderContext &renderer) {
                     packet[begin + (multi ? 9 : 4)] == initiator,
                 "indirect opcode, source select, or modifier bits differ from the native packet");
         Require("Pm4DrawIndirectMulti", "single/multi argument execution",
-                execute(packet.data(), words),
+                execute({packet.data(), words}),
                 "indirect draw failed shared argument decoding or padded/count-limited traversal");
         if (multi) {
           draw_count = 0;
           Require("Pm4DrawIndirectMulti", "zero indirect count execution",
-                  execute(packet.data(), words), "zero indirect draw count did not complete");
+                  execute({packet.data(), words}), "zero indirect draw count did not complete");
         }
       }
     }
   }
   renderer.GetCommandScheduler().Finish();
+  processor.BufferInit();
+  auto &shaders = processor.GetShCtx();
+  const auto &gs = shaders.GetVs().gs_user_sgpr.value;
+  const auto &hs = shaders.GetVs().hs_user_sgpr.value;
+  const auto check_offsets = [&](std::span<const uint32_t> commands,
+                                 const auto &sgprs,
+                                 std::initializer_list<uint32_t> offsets,
+                                 const char *stage) {
+    Require("Pm4DrawIndirectMulti", stage,
+            execute(commands) && std::equal(offsets.begin(), offsets.end(), sgprs + 6),
+            "indirect draw did not preserve the expected shader offsets");
+  };
+  arguments = {0, 1};
+  shaders.SetGsUserSgpr(6, 2, HW::UserSgprType::Unknown);
+  shaders.SetGsUserSgpr(7, 0x898f3f24u, HW::UserSgprType::Unknown);
+  std::array<uint32_t, 5> indexed_packet{
+      KYTY_PM4(5, Pm4::IT_DRAW_INDEX_INDIRECT, 0), 0,
+      Pm4::SPI_SHADER_USER_DATA_GS_0 + 6,
+      Pm4::SPI_SHADER_USER_DATA_GS_0 + 7, 0};
+  check_offsets(indexed_packet, gs, {0, 0}, "clear stale offsets");
+  arguments = {0, 1, 5, static_cast<uint32_t>(-17), 3};
+  indexed_packet[2] |= (Pm4::SPI_SHADER_USER_DATA_GS_0 + 8) << 16u;
+  indexed_packet[3] |= 1u << 27u;
+  check_offsets(indexed_packet, gs, {static_cast<uint32_t>(-17), 3, 5}, "indexed offsets");
+
+  arguments = {0, 1, 31, 5};
+  std::array<uint32_t, 5> auto_packet{
+      KYTY_PM4(5, Pm4::IT_DRAW_INDIRECT, 0), 0,
+      Pm4::SPI_SHADER_USER_DATA_HS_0 + 6,
+      Pm4::SPI_SHADER_USER_DATA_HS_0 + 7, 2};
+  check_offsets(auto_packet, hs, {31, 5}, "non-indexed offsets");
+  Require("Pm4DrawIndirectMulti", "shader stage", gs[6] == static_cast<uint32_t>(-17),
+          "non-indexed draw patched the wrong shader stage");
+
+  arguments = {0, 1, 6, 41, 7,
+               0, 1, 8, 43, 9,
+               0, 1, 10, 45, 11};
+  uint32_t count = 2;
+  const auto multi_count_address = reinterpret_cast<uint64_t>(&count);
+  std::array<uint32_t, 10> multi_packet{
+      KYTY_PM4(10, Pm4::IT_DRAW_INDEX_INDIRECT_MULTI, 0), 0,
+      indexed_packet[2], indexed_packet[3], 1u << 30u, 3,
+      static_cast<uint32_t>(multi_count_address),
+      static_cast<uint32_t>(multi_count_address >> 32u), 20, 0};
+  check_offsets(multi_packet, gs, {43, 9, 8}, "counted multi-draw offsets");
+  count = 0;
+  check_offsets(multi_packet, gs, {43, 9, 8}, "empty multi-draw");
+
+  arguments = {0, 1, 51, 13, 0, 1, 53, 15};
+  const std::array<uint32_t, 10> auto_multi_packet{
+      KYTY_PM4(10, Pm4::IT_DRAW_INDIRECT_MULTI, 0), 0,
+      auto_packet[2], auto_packet[3], 0, 2, 0, 0, 16, 2};
+  check_offsets(auto_multi_packet, hs, {53, 15}, "non-indexed multi-draw offsets");
+  arguments = {0, 1, 99, 101};
+  auto_packet[2] = Pm4::SH_NOP;
+  check_offsets(auto_packet, hs, {53, 101}, "independent destinations");
+  auto_packet[3] = Pm4::SH_NOP;
+  arguments[3] = 103;
+  check_offsets(auto_packet, hs, {53, 101}, "disabled destinations");
+  processor.BufferFlush();
   std::printf("[host]    %-32s ok\n", "Pm4DrawIndirectMulti");
 }
 

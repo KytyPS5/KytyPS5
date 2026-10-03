@@ -1643,7 +1643,7 @@ KYTY_CP_OP_PARSER(CpOpDrawIndirect) {
 	const auto draw_initiator = buffer[3];
 	const bool indexed        = (cmd_id == 0xc0032500);
 
-	cp.DrawIndirect(data_offset, draw_initiator, indexed);
+	cp.DrawIndirect(data_offset, buffer[1], buffer[2], draw_initiator, indexed);
 
 	return 4;
 }
@@ -1667,7 +1667,7 @@ KYTY_CP_OP_PARSER(CpOpDrawIndirectMulti) {
 	}
 
 	cp.DrawIndirectMulti(data_offset, max_count_or_count, count_addr, stride_in_bytes,
-	                     draw_initiator, indexed);
+	                     buffer[1], buffer[2], draw_initiator, indexed);
 
 	return 9;
 }

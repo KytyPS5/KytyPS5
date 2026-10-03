@@ -76,6 +76,52 @@ public:
 		});
 	}
 
+	// Calls func(address, size) for the runs of pages of [vaddr, vaddr + size) that the CPU may
+	// have written since the previous call over them: pages that became CPU dirty since then, or
+	// are still CPU dirty. Untracked pages start tracking as written. A single consumer owns the
+	// written state.
+	template <typename Func>
+	void ConsumeCpuWrites(uint64_t vaddr, uint64_t size, Func&& func) {
+		CheckNotInUploadCallback();
+		std::vector<std::pair<uint64_t, uint64_t>> runs;
+		Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			std::scoped_lock lock(manager->lock);
+			manager->ConsumeCpuWritten(
+			    manager->GetCpuAddr() + offset, bytes, [&](uint64_t address, uint64_t length) {
+				    if (!runs.empty() && runs.back().first + runs.back().second == address) {
+					    runs.back().second += length;
+				    } else {
+					    runs.emplace_back(address, length);
+				    }
+			    });
+		});
+		const auto end = vaddr + size;
+		for (const auto& [address, length]: runs) {
+			const auto begin  = std::max(address, vaddr);
+			const auto finish = std::min(address + length, end);
+			if (begin < finish) {
+				func(begin, finish - begin);
+			}
+		}
+	}
+
+	// Marks the pages of [vaddr, vaddr + size) GPU modified, except those that are CPU dirty, and
+	// calls func(address, size) for the page runs it marked.
+	template <typename Func>
+	void MarkRegionAsGpuModifiedUnlessCpuDirty(uint64_t vaddr, uint64_t size, Func&& func) {
+		CheckNotInUploadCallback();
+		std::vector<std::pair<uint64_t, uint64_t>> runs;
+		Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+			std::scoped_lock lock(manager->lock);
+			manager->MarkGpuDirtyUnlessCpuDirty(
+			    manager->GetCpuAddr() + offset, bytes,
+			    [&](uint64_t address, uint64_t length) { runs.emplace_back(address, length); });
+		});
+		for (const auto& [address, length]: runs) {
+			func(address, length);
+		}
+	}
+
 	template <typename RangeFunc, typename UploadFunc>
 	void ForEachUploadRange(uint64_t vaddr, uint64_t size, bool is_written, RangeFunc&& range_func,
 	                        UploadFunc&& upload_func) {

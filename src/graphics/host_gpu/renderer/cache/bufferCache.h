@@ -32,6 +32,10 @@ public:
 	static constexpr uint64_t CACHING_NUMPAGES  = (LOWER_ADDRESS_SIZE + LibKernel::Memory::kExtendedMemorySize) >> CACHING_PAGEBITS;
 	static constexpr uint64_t BDA_PAGETABLE_SIZE =
 	    CACHING_NUMPAGES * sizeof(vk::DeviceAddress);
+	// The fault buffer holds two bitmaps of CACHING_NUMPAGES bits: pages that device-address
+	// accesses found without a cached buffer, then pages that V#-table stores wrote.
+	static constexpr uint64_t WRITE_BITMAP_OFFSET = CACHING_NUMPAGES / 8;
+	static constexpr uint64_t FAULT_BUFFER_SIZE   = 2 * WRITE_BITMAP_OFFSET;
 
 	static constexpr uint64_t PageIndex(uint64_t address) {
 		return (address < LOWER_ADDRESS_SIZE
@@ -79,7 +83,30 @@ public:
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
+	void               PrepareFaultBuffer() { m_fault_manager.PrepareFaultBuffer(); }
 	void               ProcessFaultBuffer();
+	void               ProcessWriteBuffer(FaultManager::PagesHandler&& handler) {
+		m_fault_manager.ProcessWriteBuffer(std::move(handler));
+	}
+	// Records stores that a shader made through device addresses, known once it completed: the
+	// bytes of [vaddr, vaddr + size) that a cached buffer holds become GPU modified, except on
+	// pages the CPU dirtied since, whose upload replaces them.
+	void NoteGpuWrites(uint64_t vaddr, uint64_t size);
+	// Calls func(address, size) for the runs of [vaddr, vaddr + size) the CPU may have written
+	// since the previous call over them (see MemoryTracker::ConsumeCpuWrites).
+	template <typename Func>
+	void ConsumeCpuWrites(uint64_t vaddr, uint64_t size, Func&& func) {
+		m_memory_tracker.ConsumeCpuWrites(vaddr, size, std::forward<Func>(func));
+	}
+	// Calls func(address, size) for the ranges whose buffers the garbage collector released since
+	// the previous call, and forgets them; the first call starts recording them. Merging buffers
+	// keeps every address cached.
+	template <typename Func>
+	void ConsumeReleasedRanges(Func&& func) {
+		m_released_ranges.ForEach(func);
+		m_released_ranges.Clear();
+		m_record_released = true;
+	}
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	void               RunGarbageCollector();
 
@@ -131,6 +158,8 @@ private:
 	BufferMap                                         m_buffers;
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
+	RangeSet                                           m_released_ranges;
+	bool                                               m_record_released = false;
 	MemoryTracker                                     m_memory_tracker;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;

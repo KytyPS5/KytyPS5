@@ -20,11 +20,17 @@ layout(std430, binding = 1) buffer output_buf32 {
 void main() {
     const uint id = gl_GlobalInvocationID.x;
     uint word = fault_buffer[id];
-    fault_buffer[id] = 0u;
+    if (word == 0u) {
+        return;
+    }
+    // Entry 0 holds the count; the bound area sets the capacity.
+    const uint capacity = uint(download_buffer.length());
     const uint base_bit = id * 32u;
     while (word != 0u) {
         const uint store_index = atomicAdd(download_buffer32[0], 1u) + 1u;
-        if (store_index >= MAX_PAGE_FAULTS) {
+        if (store_index >= capacity) {
+            // Keep the pages the area has no room for: the next pass reports them.
+            fault_buffer[id] = word;
             return;
         }
         const uint bit = findLSB(word);
@@ -32,4 +38,5 @@ void main() {
         const uint page = base_bit + bit;
         download_buffer[store_index] = uint64_t(page) << CACHING_PAGEBITS;
     }
+    fault_buffer[id] = 0u;
 }

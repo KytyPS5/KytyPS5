@@ -938,11 +938,15 @@ void WindowContext::UpdateTitle() {
 	const auto frequency = Common::Timer::QueryPerformanceFrequency();
 	frame_num++;
 	fps_frames++;
+	// The title shows a once-per-second FPS figure; refresh it only then (and for the first
+	// frame) instead of hopping to the main thread on every presented frame.
 	if (now - fps_start >= frequency) {
 		current_fps = static_cast<double>(fps_frames) * static_cast<double>(frequency) /
 		              static_cast<double>(now - fps_start);
 		fps_start   = now;
 		fps_frames  = 0;
+	} else if (frame_num != 1) {
+		return;
 	}
 
 	const auto* device_name = graphic_ctx.GetPhysicalDeviceProperties().deviceName.data();
@@ -953,15 +957,21 @@ void WindowContext::UpdateTitle() {
 	    device_name, processor_name, frame_num, current_fps);
 
 	struct TitleUpdate {
-		SDL_Window*  window;
-		std::string* text;
-	} update {window, &text};
-	EXIT_IF(!SDL_RunOnMainThread(
-	    [](void* data) {
-		    auto& title = *static_cast<TitleUpdate*>(data);
-		    SDL_SetWindowTitle(title.window, title.text->c_str());
-	    },
-	    &update, true));
+		SDL_Window* window;
+		std::string text;
+	};
+	// Do not wait for the main thread: it may sleep in its event wait for a long time while the
+	// window is in the background, which would stall presentation.
+	auto* update = new TitleUpdate {window, std::move(text)};
+	if (!SDL_RunOnMainThread(
+	        [](void* data) {
+		        const auto* title = static_cast<TitleUpdate*>(data);
+		        SDL_SetWindowTitle(title->window, title->text.c_str());
+		        delete title;
+	        },
+	        update, false)) {
+		delete update;
+	}
 }
 
 } // namespace Libs::Graphics

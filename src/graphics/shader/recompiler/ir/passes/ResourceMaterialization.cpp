@@ -1753,6 +1753,119 @@ static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 	return result;
 }
 
+static std::vector<SrtReadWriteOrder> OrderSrtReadsAgainstWrites(const Program& program) {
+	const auto count = program.blocks.size();
+	if (count == 0u || count != program.block_info.size()) {
+		return {};
+	}
+	std::unordered_map<uint32_t, uint32_t> indices;
+	for (uint32_t i = 0; i < count; i++) {
+		if (!indices.emplace(program.block_info[i].id, i).second) {
+			return {};
+		}
+	}
+	std::vector<std::vector<uint32_t>> successors(count);
+	for (uint32_t i = 0; i < count; i++) {
+		const auto&           terminator = program.block_info[i].terminator;
+		std::vector<uint32_t> targets;
+		switch (terminator.kind) {
+			case CFG::TerminatorKind::Branch: targets.push_back(terminator.true_block); break;
+			case CFG::TerminatorKind::ConditionalBranch:
+				targets = {terminator.true_block, terminator.false_block};
+				break;
+			case CFG::TerminatorKind::IndirectBranch: targets = terminator.indirect_targets; break;
+			case CFG::TerminatorKind::Return: break;
+			default: return {};
+		}
+		for (const auto target: targets) {
+			const auto found = indices.find(target);
+			if (found == indices.end()) {
+				return {};
+			}
+			successors[i].push_back(found->second);
+		}
+	}
+	const auto written = [&](const Inst& inst, SrtReadWriteOrder& order) {
+		const auto op     = inst.GetOpcode();
+		const auto buffer = BufferAccessOf(op);
+		const auto image  = ImageOpcodeInfoOf(op).access;
+		if (image == ImageAccess::Write || image == ImageAccess::Atomic ||
+		    AddressOpcodeInfoOf(op).access == AddressAccess::Write) {
+			order.unknown = true;
+			return;
+		}
+		if (buffer != BufferAccess::Write && buffer != BufferAccess::Atomic) {
+			return;
+		}
+		const auto index = inst.Flags<MemoryFlags>().index;
+		if (index >= program.memory_info.size()) {
+			order.unknown = true;
+			return;
+		}
+		const auto& memory = program.memory_info[index];
+		if (memory.planning_only || memory.dynamic_buffer || memory.kind != ResourceKind::Buffer ||
+		    memory.resource >= program.info.buffers.size() || memory.resource >= 64u) {
+			order.unknown = true;
+			return;
+		}
+		order.buffers |= uint64_t {1} << memory.resource;
+	};
+	std::vector<SrtReadWriteOrder> generated(count, SrtReadWriteOrder {.unknown = false});
+	for (uint32_t i = 0; i < count; i++) {
+		for (const auto& inst: *program.blocks[i]) {
+			written(inst, generated[i]);
+		}
+	}
+	const auto merge = [](SrtReadWriteOrder& into, const SrtReadWriteOrder& from) {
+		const auto before = into;
+		into.buffers |= from.buffers;
+		into.unknown = into.unknown || from.unknown;
+		return into != before;
+	};
+	std::vector<SrtReadWriteOrder> entry(count, SrtReadWriteOrder {.unknown = false});
+	std::vector<uint32_t>          pending(count);
+	std::vector<uint8_t>           queued(count, 1u);
+	for (uint32_t i = 0; i < count; i++) {
+		pending[i] = i;
+	}
+	while (!pending.empty()) {
+		const auto block = pending.back();
+		pending.pop_back();
+		queued[block] = 0u;
+		auto exit     = entry[block];
+		merge(exit, generated[block]);
+		for (const auto next: successors[block]) {
+			if (merge(entry[next], exit) && !queued[next]) {
+				queued[next] = 1u;
+				pending.push_back(next);
+			}
+		}
+	}
+	std::vector<SrtReadWriteOrder> order(program.srt_reads.size());
+	std::vector<uint8_t>           seen(program.srt_reads.size(), 0u);
+	for (uint32_t i = 0; i < count; i++) {
+		auto running = entry[i];
+		for (const auto& inst: *program.blocks[i]) {
+			if (inst.GetOpcode() == ValueOpcode::ReadConst) {
+				const auto slot = inst.Arg(1).Resolve();
+				if (!slot.IsImmediate() || slot.GetType() != Type::U32 ||
+				    slot.U32() >= order.size()) {
+					continue;
+				}
+				auto& into = order[slot.U32()];
+				if (!seen[slot.U32()]) {
+					seen[slot.U32()] = 1u;
+					into             = SrtReadWriteOrder {.unknown = false};
+				}
+				merge(into, running);
+				continue;
+			}
+			written(inst, running);
+		}
+	}
+	return order;
+}
+
 ResourcePlan ExtractResourcePlan(const Program& program) {
 	ResourcePlan plan;
 	plan.stage                      = program.stage;
@@ -1840,6 +1953,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	for (const auto& read: program.srt_reads) {
 		plan.srt_reads.push_back({Clone(read.value), read.flat_offset});
 	}
+	plan.srt_read_order = OrderSrtReadsAgainstWrites(program);
 	// A proven uniform factor can decide a branch even when its other lanes are unknown.
 	// Keep only that Boolean structure, never the varying shader dependency graph.
 	Value                       unknown;
@@ -1956,8 +2070,12 @@ std::string_view LastMaterializeFailure() {
 }
 
 // The renderer treats a captured read inside a buffer the shader writes as fatal.
-static bool CapturedReadsAvoidWrittenBuffers(const ResourcePlan&     program,
-                                             const ResourceSnapshot& snapshot) {
+static bool CapturedReadsAvoidWrittenBuffers(const ResourcePlan& program,
+                                             ResourceSnapshot&   snapshot) {
+	auto&             reads = snapshot.specialization_reads;
+	auto&             slots = snapshot.specialization_read_slots;
+	std::vector<bool> exempt(reads.size(), false);
+	bool              any_exempt = false;
 	for (uint32_t i = 0; i < program.info.buffers.size() && i < snapshot.buffers.size(); ++i) {
 		if (!program.info.buffers[i].written) continue;
 		ShaderBufferResource buffer;
@@ -1965,11 +2083,31 @@ static bool CapturedReadsAvoidWrittenBuffers(const ResourcePlan&     program,
 		const auto base = buffer.Base48();
 		const auto size = buffer.GetSize();
 		if (size == 0u) continue;
-		for (const auto [address, bytes]: snapshot.specialization_reads) {
-			if (bytes != 0u && address < base + size && base < address + bytes) {
+		for (size_t r = 0; r < reads.size(); ++r) {
+			const auto [address, bytes] = reads[r];
+			if (bytes == 0u || address >= base + size || base >= address + bytes) continue;
+			const auto slot = r < slots.size() ? slots[r] : UINT32_MAX;
+			if (program.stage != ShaderType::Compute || slot >= program.srt_read_order.size()) {
 				return false;
 			}
+			const auto& order = program.srt_read_order[slot];
+			if (order.unknown || i >= 64u || ((order.buffers >> i) & 1u) != 0u) {
+				return false;
+			}
+			exempt[r]  = true;
+			any_exempt = true;
 		}
+	}
+	if (any_exempt) {
+		size_t kept = 0;
+		for (size_t r = 0; r < reads.size(); ++r) {
+			if (exempt[r]) continue;
+			reads[kept] = reads[r];
+			if (r < slots.size()) slots[kept] = slots[r];
+			kept++;
+		}
+		reads.resize(kept);
+		slots.resize(std::min(slots.size(), kept));
 	}
 	return true;
 }

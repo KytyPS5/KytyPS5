@@ -5448,6 +5448,100 @@ void TestUniformDwordX4DescriptorLoad() {
 
 } // namespace
 
+void TestOrderedScalarReadOverWrittenBuffer() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  enum class Order { ReadFirst, WriteFirst, WriteInLoop };
+  for (const auto order : {Order::ReadFirst, Order::WriteFirst, Order::WriteInLoop}) {
+    Fixture fixture;
+    auto *entry = fixture.block;
+    auto *later = fixture.AddBlock();
+    auto *done = fixture.AddBlock();
+    entry->AddBranch(later);
+    entry->AddBranch(done);
+    later->AddBranch(done);
+    fixture.program.block_info[0].terminator = {
+        .kind = CFG::TerminatorKind::ConditionalBranch, .true_block = 1, .false_block = 2};
+    fixture.program.block_info[1].terminator = {.kind = CFG::TerminatorKind::Branch,
+                                                .true_block = 2};
+    fixture.program.block_info[2].terminator.kind = CFG::TerminatorKind::Return;
+    if (order == Order::WriteInLoop) {
+      done->AddBranch(entry);
+      done->AddBranch(later);
+      fixture.program.block_info[2].terminator = {
+          .kind = CFG::TerminatorKind::ConditionalBranch, .true_block = 0, .false_block = 1};
+    }
+    const auto control = fixture.Buffer({fixture.UserData(0), fixture.UserData(1),
+                                        fixture.UserData(2), fixture.UserData(3)});
+    MemoryInfo scalar;
+    scalar.kind = ResourceKind::ScalarBuffer;
+    scalar.offset = 28;
+    const auto flag = fixture.Emit(ValueOpcode::ReadConstBuffer, {control, Value(0u)},
+                                   fixture.AddMemory(scalar, 4));
+    fixture.program.block_info[0].condition =
+        fixture.Emit(ValueOpcode::INotEqual32, {flag, Value(0u)});
+    if (order == Order::WriteInLoop) {
+      fixture.program.block_info[2].condition =
+          fixture.Emit(ValueOpcode::INotEqual32, {flag, Value(0u)}, 0, done);
+    }
+    const auto root = fixture.Address(fixture.UserData(4), Value(0u));
+    MemoryInfo address;
+    address.kind = ResourceKind::ScalarAddress;
+    address.offset = 24;
+    const auto low = fixture.Emit(ValueOpcode::LoadAddressU32,
+                                  {root, Value(0u), Value(0u), Value(true)},
+                                  fixture.AddMemory(address, 8));
+    address.offset = 28;
+    const auto high = fixture.Emit(ValueOpcode::LoadAddressU32,
+                                   {root, Value(0u), Value(0u), Value(true)},
+                                   fixture.AddMemory(address, 12));
+    const auto flags = fixture.Buffer({low, high, Value(64u), Value(0u)}, 16);
+    const auto Store = [&](Block *block) {
+      MemoryInfo store;
+      store.kind = ResourceKind::Buffer;
+      store.offset = 24;
+      fixture.Emit(ValueOpcode::StoreBufferU32,
+                   {flags, Value(0u), Value(0u), Value(0u), Value(1u), Value(true)},
+                   fixture.AddMemory(store, 16), block);
+    };
+    if (order == Order::WriteFirst) Store(entry);
+    address.offset = 24;
+    fixture.Emit(ValueOpcode::LoadAddressU32,
+                 {fixture.Address(low, high), Value(0u), Value(0u), Value(true)},
+                 fixture.AddMemory(address, 20));
+    if (order == Order::ReadFirst) Store(later);
+    if (order == Order::WriteInLoop) Store(done);
+    fixture.PlanAndTrack();
+    auto plan = ExtractResourcePlan(fixture.program);
+    Check(plan.capture_specialization_reads && plan.srt_read_order.size() == plan.srt_reads.size(),
+          "ordered-read fixture did not capture its scalar reads");
+    LinearTestMemory memory;
+    memory.words[0x1c / 4] = 1u;
+    memory.words[0x58 / 4] = 0x1100u;
+    const std::array<uint32_t, 5> user_data{0x1000u, 0u, 64u, 0u, 0x1040u};
+    const SrtRuntime runtime{.user_data = user_data, .read_memory = ReadLinearTestMemory,
+                             .userdata = &memory,
+                             .read_specialization_memory = ReadLinearTestMemory};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    const bool materialized = MaterializeResources(plan, runtime, snapshot, specialization);
+    if (order != Order::ReadFirst) {
+      Check(!materialized &&
+                LastMaterializeFailure() == "scalar reads overlap a buffer the shader writes",
+            "a scalar read a store to its buffer can precede was exempted from the overlap check");
+      continue;
+    }
+    Check(materialized, "a scalar read ordered before every store to its buffer was refused");
+    Check(snapshot.specialization_reads.size() == snapshot.specialization_read_slots.size() &&
+              !snapshot.specialization_reads.empty() &&
+              std::ranges::none_of(snapshot.specialization_reads,
+                                   [](const auto &read) {
+                                     return read.first < 0x1140u &&
+                                            0x1100u < read.first + read.second;
+                                   }),
+          "an exempt read stayed in the list the renderer refuses overlaps from");
+  }
+}
+
 int main() {
   OverrideBindlessImageHeaps(0);
   try {
@@ -5504,6 +5598,7 @@ int main() {
     Run("buffer swizzle specialization", TestBufferSwizzleSpecialization);
     Run("conditional buffer materialization", TestConditionalBufferMaterialization);
     Run("guarded scalar descriptor reads", TestGuardedScalarDescriptorReads);
+    Run("ordered scalar read over a written buffer", TestOrderedScalarReadOverWrittenBuffer);
     Run("conservative buffer reachability", TestConservativeBufferReachability);
     Run("strided indirect image table", TestStridedIndirectImageTable);
     Run("bindless heap table", TestBindlessHeapTable);

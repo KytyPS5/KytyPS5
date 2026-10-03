@@ -743,6 +743,13 @@ struct SrtRead {
 	bool operator==(const SrtRead& other) const = default;
 };
 
+struct SrtReadWriteOrder {
+	uint64_t buffers = 0;
+	bool     unknown = true;
+
+	bool operator==(const SrtReadWriteOrder& other) const = default;
+};
+
 struct ResourceBlock {
 	// Conditional successors are ordered true, false; an empty condition follows every edge.
 	Value                 condition;
@@ -814,13 +821,14 @@ struct ResourcePlan {
 	// sources the shader reads. Distinct from an empty description built successfully: a shader
 	// with no condition to prune on reads every source its accesses name, which is reachability
 	// information, just trivial. Only the former may leave an unreadable source null.
-	bool                                control_flow_unknown = false;
-	std::vector<SrtRead>                srt_reads;
-	bool                                requires_specialization_memory = false;
-	std::vector<std::pair<uint64_t, uint64_t>> source_reads;
-	bool                                capture_specialization_reads = false;
-	bool                                srt_plan_complete          = false;
-	bool                                resource_tracking_complete = false;
+	bool                           control_flow_unknown = false;
+	std::vector<SrtRead>           srt_reads;
+	std::vector<SrtReadWriteOrder> srt_read_order;
+	std::vector<uint8_t>           clean_flat_slots;
+	bool                           requires_specialization_memory = false;
+	bool                           capture_specialization_reads   = false;
+	bool                           srt_plan_complete              = false;
+	bool                           resource_tracking_complete     = false;
 	// Resources the materializer has *proven* the host cannot re-evaluate: it tried against real
 	// guest memory, failed, and bound null. Named by `first_use_pc`, which is a property of the
 	// code and so survives a re-translation, where a descriptor-source index would not.

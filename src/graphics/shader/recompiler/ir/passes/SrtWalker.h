@@ -174,6 +174,8 @@ bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
 // Uses the strict reader for values that affect shader specialization.
 SrtRuntime CleanRuntime(SrtRuntime runtime);
 
+uint32_t CurrentSrtReadSlot();
+
 
 // One pass of the per-lane sweep a readfirstlane runs. `dependent` stays clear for an operand
 // that never asks for the lane, which is every shader that does not go through the mask model,

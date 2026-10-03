@@ -51,6 +51,27 @@ SrtRuntime CleanRuntime(SrtRuntime runtime) {
 
 namespace {
 
+thread_local uint32_t g_srt_read_slot = UINT32_MAX;
+
+class SrtReadSlotScope {
+public:
+	explicit SrtReadSlotScope(uint32_t slot): m_saved(g_srt_read_slot) { g_srt_read_slot = slot; }
+	~SrtReadSlotScope() { g_srt_read_slot = m_saved; }
+	SrtReadSlotScope(const SrtReadSlotScope&)            = delete;
+	SrtReadSlotScope& operator=(const SrtReadSlotScope&) = delete;
+
+private:
+	uint32_t m_saved;
+};
+
+} // namespace
+
+uint32_t CurrentSrtReadSlot() {
+	return g_srt_read_slot;
+}
+
+namespace {
+
 constexpr uint64_t AddressMask = 0x0000ffffffffffffull;
 
 bool AddSignedAddress(uint64_t base, int64_t offset, uint64_t& result) {
@@ -1572,6 +1593,7 @@ bool SrtWalker::EvaluateInstRule(const Inst& inst, uint64_t& result) {
 			auto* suspended  = m_suspended_lane;
 			m_suspended_lane = DependenceScope();
 			m_lane           = nullptr;
+			const SrtReadSlotScope scope(slot.U32());
 			const bool read =
 			    slot.U32() < m_clean_flat_slots.size() &&
 			            m_clean_flat_slots[slot.U32()] != 0u && m_clean_evaluator != nullptr
@@ -2214,6 +2236,7 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat, FlatRefreshFailur
 		if (read.flat_offset >= flat.size()) {
 			return refuse(FlatRefreshFailure::Stage::OffsetOutOfRange, read.flat_offset);
 		}
+		const SrtReadSlotScope scope(slot);
 		if (!evaluator.Evaluate(read.value, flat[read.flat_offset])) {
 			if (failure != nullptr) {
 				failure->value_is_expressible = ValidateRuntimeValue(

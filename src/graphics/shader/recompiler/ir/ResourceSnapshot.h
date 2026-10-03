@@ -61,6 +61,7 @@ struct ResourceSnapshot {
 	std::vector<uint32_t>                      flattened_srt;
 	std::vector<uint32_t>                      user_data;
 	std::vector<std::pair<uint64_t, uint64_t>> specialization_reads;
+	std::vector<uint32_t>                      specialization_read_slots;
 	UniformFill                                uniform_fill;
 	std::vector<IndirectKeyFeedback>           key_feedback;
 	std::vector<BindlessImageTable>            bindless_tables;

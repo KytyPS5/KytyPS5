@@ -14887,8 +14887,9 @@ void TestGpuProducedWritableDescriptor() {
   options.user_data = user_data;
   auto translated = ShaderRecompiler::TranslateProgram(shader, options);
   auto plan = ExtractResourcePlan(translated.program);
+  // The written buffer takes the captured overlap check, which the header reads pass.
   Check(plan.info.buffers.size() == 1 && plan.info.buffers[0].written &&
-            !plan.capture_specialization_reads && plan.srt_reads.size() == 3,
+            plan.srt_reads.size() == 3,
         "native GPU-built writable descriptor acquired an unnecessary alias proof");
   struct Reads {
     std::array<uint32_t, 3> header{0x26c0u, 0u, 151u};

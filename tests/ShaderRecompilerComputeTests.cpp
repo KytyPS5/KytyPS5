@@ -36982,7 +36982,8 @@ void CheckIndirectImageKeySwitch(
     bool vertex = false, CompiledShader *vertex_result = nullptr,
     bool vertex_loop = false, bool vertex_buffers = false,
     bool vertex_wave64 = false, bool vertex_subgroup = false,
-    bool vertex_cross_lane = false) {
+    bool vertex_cross_lane = false, bool vertex_divergent_loop = false,
+    bool vertex_long_loop = false) {
   constexpr uint32_t mapping_capacity = 1793u;
   using namespace ShaderRecompiler::IR;
 
@@ -37035,8 +37036,17 @@ void CheckIndirectImageKeySwitch(
     auto &color = loop_header->AppendNewInst(
         ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32x4));
     loop_color = &color;
+    Value loop_limit(2u);
+    if (vertex_divergent_loop) {
+      auto &parity = loop_header->AppendNewInst(
+          ValueOpcode::BitwiseAnd32,
+          {Value(&triangle), Value(vertex_long_loop ? 31u : 1u)});
+      auto &limit = loop_header->AppendNewInst(
+          ValueOpcode::IAdd32, {Value(&parity), Value(1u)});
+      loop_limit = Value(&limit);
+    }
     auto &within = loop_header->AppendNewInst(
-        ValueOpcode::ULessThan32, {Value(&counter), Value(2u)});
+        ValueOpcode::ULessThan32, {Value(&counter), loop_limit});
     loop_header->AddBranch(loop_body);
     loop_header->AddBranch(loop_exit);
     auto &header_term = program.block_info[1].terminator;
@@ -46299,6 +46309,10 @@ if (argc == 1) {
        std::strcmp(argv[1], "--wide-vertex-wave64-subgroup-buffers-indexed-753-only") == 0 ||
        std::strcmp(argv[1], "--wide-vertex-wave64-subgroup-buffers-indexed-120000-only") == 0 ||
        std::strcmp(argv[1], "--wide-vertex-wave64-cross-lane-buffers-indexed-96-only") == 0 ||
+       std::strcmp(argv[1], "--wide-vertex-wave64-cross-lane-divergent-indexed-96-only") == 0 ||
+       std::strcmp(argv[1], "--wide-vertex-wave64-cross-lane-divergent-indexed-120000-only") == 0 ||
+       std::strcmp(argv[1], "--wide-vertex-wave64-cross-lane-long-indexed-96-only") == 0 ||
+       std::strcmp(argv[1], "--wide-vertex-wave64-cross-lane-long-indexed-120000-only") == 0 ||
        std::strcmp(argv[1], "--wide-vertex-wave64-cross-lane-buffers-indexed-120000-only") == 0 ||
        std::strcmp(argv[1], "--wide-vertex-indexed-300-only") == 0 ||
        std::strcmp(argv[1], "--wide-vertex-indexed-753-only") == 0 ||
@@ -46309,6 +46323,10 @@ if (argc == 1) {
     const u32 index_count = std::strcmp(argv[1], "--wide-vertex-indexed-small-only") == 0
                                 ? 3u
                             : std::strcmp(argv[1], "--wide-vertex-wave64-cross-lane-buffers-indexed-96-only") == 0
+                                ? 96u
+                            : std::strcmp(argv[1], "--wide-vertex-wave64-cross-lane-divergent-indexed-96-only") == 0
+                                ? 96u
+                            : std::strcmp(argv[1], "--wide-vertex-wave64-cross-lane-long-indexed-96-only") == 0
                                 ? 96u
                             : std::strcmp(argv[1], "--wide-vertex-loop-indexed-753-only") == 0
                                 ? 753u
@@ -46349,10 +46367,19 @@ if (argc == 1) {
         std::strncmp(argv[1], "--wide-vertex-wave64-cross-lane-", 32u) == 0;
     const bool vertex_cross_lane =
         std::strncmp(argv[1], "--wide-vertex-wave64-cross-lane-", 32u) == 0;
+    const bool vertex_divergent_loop =
+        std::strcmp(argv[1], "--wide-vertex-wave64-cross-lane-divergent-indexed-96-only") == 0 ||
+        std::strcmp(argv[1], "--wide-vertex-wave64-cross-lane-divergent-indexed-120000-only") == 0 ||
+        std::strcmp(argv[1], "--wide-vertex-wave64-cross-lane-long-indexed-96-only") == 0 ||
+        std::strcmp(argv[1], "--wide-vertex-wave64-cross-lane-long-indexed-120000-only") == 0;
+    const bool vertex_long_loop =
+        std::strcmp(argv[1], "--wide-vertex-wave64-cross-lane-long-indexed-96-only") == 0 ||
+        std::strcmp(argv[1], "--wide-vertex-wave64-cross-lane-long-indexed-120000-only") == 0;
     CheckIndirectImageKeySwitch(Prospero::TextureNumericClass::Float,
                                 "WideIndirectImageVertexSwitch", true, true, &vertex,
                                 vertex_loop, vertex_buffers, vertex_wave64,
-                                vertex_subgroup, vertex_cross_lane);
+                                vertex_subgroup, vertex_cross_lane,
+                                vertex_divergent_loop, vertex_long_loop);
     auto test = GraphicsInterpolationExport();
     test.name = "WideVertexIndexedSample";
     test.index_count = index_count;

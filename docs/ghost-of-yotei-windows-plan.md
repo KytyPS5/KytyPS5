@@ -1,5 +1,48 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **3 октября 2026 года, 20:23 UTC** (native Windows via WSL;
+branch `yotei-windows-bringup`, source head `1667cfe5` plus test/docs work;
+installed clean-mechanism exe SHA-256
+`02d8807761a45e154049fa409c84716b1c15b3cb3d370d48c57fd9f7c39805e5`):
+
+- Synthetic Vertex wave64 cases now vary loop length by triangle from 1–2
+  and 1–32 iterations while retaining the 251 distinct images, 13 buffer
+  reads, subgroup ballot/shuffle, and numerical final-triangle readback.
+  Native GPUAV passed at 96 and 120000 unique indices; logs
+  `_Build/logs/wide-vertex-{divergent,long}-*-gpuav-20261003.log`.
+  These are GREEN controls, not a RED for the clean game's DeviceLost.
+- The formatted scalar descriptor test also passed with an extra inner loop
+  and live `Phi` predicate (`_Build/logs/formatted-scalar-nested-red-20261003.log`).
+  An offline audit of saved CS `4d6df08d2d54e0ff` code reproduces a refusal
+  at PC `0x284`, but its capture lacks runtime resource values, so its detailed
+  rejection reason cannot be equated to the game's. No ResourceTracking
+  production change was made.
+- One bounded diagnostic native game run with a temporary four-iteration
+  graphics-loop cap (`_Build/runs/yotei-integrated-20261003-194531-presentfix-gpuav`,
+  diagnostic exe SHA-256 `3b4d70f8e6799fe6f423cbae7111db4b1937a30acb15d99b16cbc7a5c78560a1`)
+  passed the old `shown=200` frontier and reached `shown=373`. A Windows
+  screenshot in the run folder shows a black loading screen with spinner,
+  **not** a menu; prepared readback frames 198–209 were RGB black. The
+  shown-frame watchdog stopped the task-owned process after 900 seconds at
+  373. Its stdout ended midstream near CS `54904fb419d79e49` resource
+  tracking; this marker alone did not identify the expensive phase.
+- A second bounded run with the same temporary cap and
+  `KYTY_RESOURCE_TRACKING_TRACE=1`
+  (`_Build/runs/yotei-integrated-20261003-201438-presentfix-gpuav`)
+  showed all ResourceTracking phases for `54904…` completing in milliseconds,
+  repeatedly. The earlier CPU-blocker attribution was wrong. This run exited
+  321 with `vkWaitSemaphores ErrorDeviceLost` at `shown=202`
+  (`wait_tick=41385`, known GPU tick 41383), so the cap is not a reliable
+  workaround. Neither diagnostic run reached a menu. The saved-code-only
+  `54904…` audit also passed but did not include runtime descriptor values.
+- The diagnostic cap was removed, the native emulator rebuilt and installed,
+  and no task-owned emulator process remains. The clean mechanism still has
+  the `shown=200` GPU DeviceLost blocker; first nonzero prepared pixels remain
+  the clean frames 198–199 from the previous checkpoint. Menu and gameplay
+  remain **PENDING**. Next: isolate a semantic RED for the clean large indexed
+  Vertex draw. If a future cap run stalls again, use phase timing around
+  specialization/pipeline creation before attributing its cause.
+
 Checkpoint **3 октября 2026 года, 18:37 UTC** (native Windows via WSL;
 branch `yotei-windows-bringup`, clean source build at `22211827`, installed
 exe SHA-256 `8c33160e9bd0d89d67f4d9d9357a7ae2b11b02bc4437d55118fcbf448a703d32`):

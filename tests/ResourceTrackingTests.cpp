@@ -3116,7 +3116,7 @@ struct DispatcherSignedBufferLoopFixture {
 DispatcherSignedBufferLoopFixture MakeDispatcherSignedBufferLoopFixture(
     bool bypass_count_guard = false, uint32_t step = 1u,
     uint32_t row_stride = 196u, uint32_t column_offset = 0u,
-    bool formatted = false) {
+    bool formatted = false, bool nested_loop = false) {
   DispatcherSignedBufferLoopFixture result;
   result.fixture = std::make_unique<Fixture>();
   auto& fixture = *result.fixture;
@@ -3128,6 +3128,7 @@ DispatcherSignedBufferLoopFixture MakeDispatcherSignedBufferLoopFixture(
   auto* body = fixture.AddBlock();
   auto* latch = fixture.AddBlock();
   auto* exit = fixture.AddBlock();
+  auto* inner_latch = nested_loop ? fixture.AddBlock() : nullptr;
   const auto Branch = [&](uint32_t from, uint32_t to) {
     fixture.program.blocks[from]->AddBranch(fixture.program.blocks[to]);
     auto& term = fixture.program.block_info[from].terminator;
@@ -3161,7 +3162,8 @@ DispatcherSignedBufferLoopFixture MakeDispatcherSignedBufferLoopFixture(
       Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch;
   mask_info.terminator.true_block = 4u;
   mask_info.terminator.false_block = 3u;
-  Branch(3u, 4u);
+  Branch(3u, nested_loop ? 6u : 4u);
+  if (nested_loop) Branch(6u, 2u);
   Branch(4u, 1u);
   fixture.program.block_info[5].terminator.kind =
       Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::Return;
@@ -3189,10 +3191,33 @@ DispatcherSignedBufferLoopFixture MakeDispatcherSignedBufferLoopFixture(
                                 {Value(1u), bit_index}, 0, header);
   const auto enabled = fixture.Emit(ValueOpcode::BitwiseAnd32,
                                     {enabled_mask, bit}, 0, header);
+  Value inner_index;
+  Value active = Value(true);
+  if (nested_loop) {
+    auto& index_phi = mask_guard->AppendNewInst(
+        ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+    const auto inner_next = fixture.Emit(ValueOpcode::IAdd32,
+                                         {Value(&index_phi), Value(1u)}, 0, inner_latch);
+    index_phi.AddPhiOperand(header, Value(0u));
+    index_phi.AddPhiOperand(inner_latch, inner_next);
+    inner_index = Value(&index_phi);
+    auto& active_phi = mask_guard->AppendNewInst(
+        ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U1));
+    active_phi.AddPhiOperand(header, compare);
+    active_phi.AddPhiOperand(inner_latch, compare);
+    active = Value(&active_phi);
+  }
   const auto enabled_nonzero = fixture.Emit(ValueOpcode::INotEqual32,
                                             {enabled, Value(0u)}, 0, mask_guard);
+  Value can_enter = enabled_nonzero;
+  if (nested_loop) {
+    const auto within_inner = fixture.Emit(ValueOpcode::ULessThan32,
+                                           {inner_index, Value(2u)}, 0, mask_guard);
+    can_enter = fixture.Emit(ValueOpcode::LogicalAnd,
+                             {enabled_nonzero, within_inner}, 0, mask_guard);
+  }
   mask_info.condition =
-      fixture.Emit(ValueOpcode::LogicalNot, {enabled_nonzero}, 0, mask_guard);
+      fixture.Emit(ValueOpcode::LogicalNot, {can_enter}, 0, mask_guard);
 
   fixture.block = body;
   const auto table = fixture.Buffer(table_descriptor, 0x62d0u);
@@ -3215,7 +3240,7 @@ DispatcherSignedBufferLoopFixture MakeDispatcherSignedBufferLoopFixture(
   load.formatted = formatted;
   const auto value = fixture.Emit(
       formatted ? ValueOpcode::LoadBufferU32 : ValueOpcode::LoadBufferU16,
-      {selected, Value(0u), Value(0u), Value(0u), Value(true)},
+      {selected, Value(0u), Value(0u), Value(0u), active},
       fixture.AddMemory(load, 0x6574u));
   fixture.Emit(ValueOpcode::ReferenceU32,
                {formatted ? value : fixture.Emit(ValueOpcode::ConvertU32U16, {value})});
@@ -3308,11 +3333,11 @@ void TestDispatcherSignedBufferLoop() {
   }
 }
 
-void TestFormattedScalarDescriptorTable() {
+void TestFormattedScalarDescriptorTable(bool nested_loop = false) {
   constexpr uint32_t stride = 488u;
   constexpr uint32_t column = 200u;
   auto accepted = MakeDispatcherSignedBufferLoopFixture(
-      false, 1u, stride, column, true);
+      false, 1u, stride, column, true, nested_loop);
   accepted.fixture->PlanAndTrack();
   const auto& program = accepted.fixture->program;
   Check(program.resource_tracking_complete && program.info.buffers.size() == 1u &&
@@ -3354,7 +3379,7 @@ void TestFormattedScalarDescriptorTable() {
         "formatted scalar descriptor table did not retain two distinct rows");
 
   auto rejected = MakeDispatcherSignedBufferLoopFixture(
-      true, 1u, stride, column, true);
+      true, 1u, stride, column, true, nested_loop);
   BuildSrtPlan(rejected.fixture->program);
   CheckFatal([&] { TrackResources(rejected.fixture->program); },
              "not a valid runtime value",
@@ -7912,6 +7937,11 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::strcmp(argv[1], "--formatted-scalar-table-only") == 0) {
       TestFormattedScalarDescriptorTable();
       std::cout << "KYTY_FORMATTED_SCALAR_TABLE_PASS\n";
+      return 0;
+    }
+    if (argc == 2 && std::strcmp(argv[1], "--formatted-scalar-nested-only") == 0) {
+      TestFormattedScalarDescriptorTable(true);
+      std::cout << "KYTY_FORMATTED_SCALAR_NESTED_PASS\n";
       return 0;
     }
     if (argc == 2 && std::strcmp(argv[1], "--inline-buffer-table-only") == 0) {

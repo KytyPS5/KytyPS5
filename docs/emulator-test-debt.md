@@ -1,6 +1,88 @@
 # Emulator regression test debt
 
+## Large compute shader and diagnostic runtime stalls (2026-10-03; pending)
+
+The bounded diagnostic game run
+`_Build/runs/yotei-integrated-20261003-194531-presentfix-gpuav` used a
+temporary four-iteration graphics-loop cap to pass the clean build's earlier
+Vertex DeviceLost frontier. It reached `shown=373`, then the shown-frame
+watchdog closed the task-owned process after 900 seconds without a new shown
+frame. The last complete phase marker in captured stdout was `IR Normalize` for
+compute shader `54904fb419d79e49` (36,869 instructions); stdout ended
+midstream near `IR TrackResources`. The process was responsive and consumed up
+to about 30 GB while CPU time grew. No menu was visible: a Windows desktop
+screenshot in the run folder shows a loading spinner. This diagnostic result
+does not establish a clean-build runtime advance or an emulator semantic RED.
+
+The saved `54904…` code passes an offline CPU audit in under one second
+(`_Build/logs/cs549-offline-audit-20261003.log`), but the registered capture
+lacks runtime descriptor values and skips materialization. A second bounded
+diagnostic game run with `KYTY_RESOURCE_TRACKING_TRACE=1`
+(`_Build/runs/yotei-integrated-20261003-201438-presentfix-gpuav`) showed all
+seven ResourceTracking phases for `54904…` finishing in milliseconds, repeatedly.
+The previous partial stdout did **not** locate the stall in ResourceTracking.
+This repeat instead exited 321 with `ErrorDeviceLost` at `shown=202`, despite
+the same temporary cap. The cap is not a reliable workaround, and no menu was
+seen. Next isolate the clean large indexed Vertex draw and the long GPUAV
+pipeline/specialization path separately with bounded synthetic inputs. The
+temporary cap was removed and the native installed exe restored after both
+diagnostic runs.
+
+## Divergent graphics wave64 loop with indirect images (2026-10-03; pending)
+
+The clean Yōtei retry at `_Build/runs/yotei-integrated-20261003-181855-presentfix-gpuav`
+lost the device at `shown=200` after nonzero prepared frames 198 and 199.
+An earlier SyncDiag capture points to a large indexed draw using vertex shader
+`e3125617f3efc38f`, but the clean retry did not independently identify the
+draw. This vertex shader has a ballot/shuffle inside a loop and a 250-way
+indirect-image switch. Current synthetic wave64 vertex cases execute the same
+two loop iterations in every lane, so they do not cover a changing active
+mask between iterations.
+
+Add a bounded synthetic vertex case with one or two iterations chosen per
+triangle, subgroup operations inside the loop, distinct image contents and
+numerical readback. Run it on the current native executable with GPU assisted
+validation. A pass is a control, not the required RED for the device loss;
+if it passes, narrow the captured failing draw further before any production
+change. Do not infer a wave64 semantic fix from a runtime timeout or GPU reset.
+
+The one/two-iteration variant passed numerical readback and GPUAV at 96 and
+120000 unique indices on the current source. Logs:
+`_Build/logs/wide-vertex-divergent-{96,120000}-gpuav-20261003.log`;
+native test exe hashes `c4d3c7c5...` and `ce3e07bd...` respectively.
+These are GREEN controls. The saved game SPIR-V updates two mask words after
+each ballot and can make many passes through its loop. Next bounded control
+uses 1–32 iterations per triangle, first at 96 indices and only then at the
+119856-index draw scale if the small case completes normally. A reset or
+timeout alone still cannot justify changing guest semantics.
+
 ## Formatted buffer descriptor selected at runtime (2026-10-03; pending)
+
+Offline audit of the saved shader code at
+`_Build/runs/yotei-immediate-20260926-011827/shaders/registered/cs_4d6df08d2d54e0ff_dccdf4ea82ba8496.bin`
+reproduced the PC `0x284` rejection without launching the game or GPU
+(`_Build/logs/cs4d-offline-audit-20261003.log`). A temporary diagnostic build
+printed the pre-tracking IR to `_Build/logs/cs4d-offline-ir-20261003.log`;
+the diagnostic source change was then removed. The scalar row index is guarded
+by a count check in outer block `$6`, while the descriptor words are read in
+block `$7` and used by formatted loads in block `$11`, inside an additional
+loop whose active predicate passes through `Phi` in block `$8`. The simple
+formatted-table control has one loop but no inner loop. Add a synthetic nested
+loop with the same outer bounded row index, four consecutive scalar descriptor
+words, and two distinct materialized rows. This tests the suspected CFG
+dimension before changing the shared proof. Preserve rejection when the outer
+count guard is bypassed.
+
+The nested synthetic variant passed unchanged production code
+(`_Build/logs/formatted-scalar-nested-red-20261003.log`), so nesting alone is
+not the RED. Diagnostic audit of the saved shader showed its descriptor words
+unproved and reported a cyclic dependency or invalid flat slot
+(`_Build/logs/cs4d-proof-diagnostic-20261003.log.stderr`). That capture says
+`runtime_resources_captured=false`; its translated user data was synthetic
+zeroes. The same PC does not establish the same *reason* as the game run.
+Repeat the bounded diagnostic game launch with runtime user data and trace the
+bounded proof rejection before changing ResourceTracking. The temporary trace
+patch has been removed from source.
 
 The bounded GPUAV retry on the SRGB metadata correction,
 `_Build/runs/yotei-integrated-20261003-180731-presentfix-gpuav`, passed the

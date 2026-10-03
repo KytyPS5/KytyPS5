@@ -175,8 +175,7 @@ SurfaceFormatInfo TextureGetSurfaceFormatInfo(Prospero::BufferFormat format) {
 TextureUploadLayout TextureCalcUploadLayout(Prospero::BufferFormat format, uint32_t width,
                                             uint32_t height, uint32_t levels, uint32_t depth,
                                             Prospero::TileMode tile_mode, uint64_t upload_size,
-                                            bool allow_depth_tile, bool volume_texture,
-                                            const char* owner) {
+                                            bool volume_texture, const char* owner) {
 	TextureUploadLayout layout {};
 	layout.surface.description = {
 	    format,
@@ -204,8 +203,7 @@ TextureUploadLayout TextureCalcUploadLayout(Prospero::BufferFormat format, uint3
 			     static_cast<uint32_t>(format));
 		}
 	} else {
-		if ((tile_mode == Prospero::TileMode::kDepth && !allow_depth_tile) ||
-		    !TileGetTiledTextureLayout(description, layout.surface)) {
+		if (!TileGetTiledTextureLayout(description, layout.surface)) {
 			EXIT("%s: unsupported typed tiled upload: fmt=%u tile=%u "
 			     "size=%" PRIu64 " extent=%ux%u levels=%u\n",
 			     owner, static_cast<uint32_t>(format), static_cast<uint32_t>(tile_mode),

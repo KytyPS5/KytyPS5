@@ -19,6 +19,7 @@
 #include <map>
 #include <spirv/unified1/GLSL.std.450.h>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -58,6 +59,7 @@ constexpr std::array<ImageDimensionInfo, 7> ImageDimensions {{
 const ImageDimensionInfo& ImageDimensionInfoFor(ImageDimension dimension);
 
 struct SpirvRequirements {
+	bool bvh                          = false;
 	bool subgroup_ballot              = false;
 	bool subgroup_shuffle             = false;
 	bool subgroup_local_invocation_id = false;
@@ -83,6 +85,20 @@ struct EmitterState {
 	Builder                                          builder;
 	const IR::Program&                               program;
 	ShaderStageInputInfo                             input_info;
+	uint32_t                                        void_type = 0;
+	uint32_t                                        bool_type = 0;
+	uint32_t                                        u32_type = 0;
+	uint32_t                                        native_u64_type = 0;
+	uint32_t                                        i32_type = 0;
+	uint32_t                                        f32_type = 0;
+	uint32_t                                        f64_type = 0;
+	uint32_t                                        u32_pair_type = 0;
+	uint32_t                                        i32_pair_type = 0;
+	uint32_t                                        function_type = 0;
+	std::array<uint32_t, 3>                          bool_vector_types {};
+	std::array<uint32_t, 3>                          u32_vector_types {};
+	std::array<uint32_t, 3>                          i32_vector_types {};
+	std::array<uint32_t, 3>                          f32_vector_types {};
 	std::array<uint32_t, 6>                          tess_variables {};
 	uint32_t                                         tess_inner_variable = 0;
 	uint32_t                                         tess_patch_base     = 0;
@@ -96,6 +112,7 @@ struct EmitterState {
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
 	uint32_t                                         bda_pointer_function    = 0;
+	uint32_t                                         bvh_intersect_function  = 0;
 	uint32_t                                         gds_variable            = 0;
 	uint32_t                                         gds_length              = 0;
 	uint32_t                                         push_constant_variable  = 0;
@@ -298,13 +315,14 @@ uint32_t ImageType(EmitterState& state, const IR::ImageResource& image);
 
 uint32_t ImageViewSizeType(EmitterState& state, ImageDimension dimension);
 
-uint32_t LoadSampledImageDescriptor(EmitterState& state, uint32_t resource);
+uint32_t ImageDescriptorPointer(EmitterState& state, uint32_t resource, uint32_t mip = 0);
+
+uint32_t LoadImageDescriptor(EmitterState& state, uint32_t resource, uint32_t mip = 0);
 
 uint32_t LoadSamplerDescriptor(EmitterState& state, uint32_t sampler);
 
-uint32_t MakeSampledImage(EmitterState& state, uint32_t resource, uint32_t sampler);
-
-uint32_t StorageImageDescriptorPointer(EmitterState& state, uint32_t resource);
+uint32_t MakeSampledImage(EmitterState& state, uint32_t resource, uint32_t sampler_id,
+                          uint32_t mip = 0);
 
 void EmitStorageImageWrite(EmitterState& state, uint32_t resource, uint32_t mip_lod, uint32_t coord,
                            uint32_t texel);
@@ -420,7 +438,12 @@ uint32_t EmitUFloatToF32Bits(EmitterState& state, uint32_t raw, uint32_t bits);
 uint32_t NormalizeFormatComponent(EmitterState& state, const Format::BufferFormatInfo& info,
                                   uint32_t component, uint32_t raw);
 
-void EmitDeviceAtomicMemoryBarrier(EmitterState& state);
+spv::Op SpirvAtomicOpcode(IR::ValueOpcode opcode);
+
+uint32_t EmitAtomicOperation(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t pointer,
+                             uint32_t scope);
+
+void EmitAtomicMemoryBarrier(EmitterState& state, IR::ResourceKind kind);
 
 uint32_t EmitFloatAtomicReplacement(EmitterState& state, uint32_t old, uint32_t source,
                                     bool max_value);
@@ -487,8 +510,51 @@ uint32_t EmitF16BitsToF32(EmitterState& state, uint32_t bits);
 void EmitProgram(EmitterState& state);
 
 void DefineGetBdaPointer(EmitterState& state);
+void DefineBvhIntersect(EmitterState& state);
+uint32_t GetBdaPointer(EmitterState& state, uint32_t address);
+uint32_t ConstantDeviceAddress(EmitterState& state, uint64_t value);
+uint32_t DeviceAddressFromWords(EmitterState& state, uint32_t low, uint32_t high);
 
 // These templates accept local lambdas from several emitter translation units.
+template <typename Fn>
+auto EmitImageMipSwitch(EmitterState& state, uint32_t mip_lod, uint32_t mip_count,
+                        uint32_t result_type, Fn&& emit) {
+	constexpr bool has_result = !std::is_void_v<std::invoke_result_t<Fn, uint32_t>>;
+	EXIT_IF(mip_count == 0u);
+	const auto merge_label = state.builder.AllocateId();
+	std::vector<uint32_t> labels(mip_count);
+	std::vector<uint32_t> words {spv::OpSwitch, mip_lod, merge_label};
+	for (uint32_t mip = 0; mip < mip_count; mip++) {
+		labels[mip] = state.builder.AllocateId();
+		words.push_back(mip);
+		words.push_back(labels[mip]);
+	}
+	if constexpr (has_result) {
+		words[2] = labels.front();
+	}
+	state.builder.AddFunction(spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone);
+	state.builder.AddFunction(words);
+	std::vector<uint32_t> phi;
+	if constexpr (has_result) {
+		phi = {spv::OpPhi, result_type, state.builder.AllocateId()};
+	}
+	for (uint32_t mip = 0; mip < mip_count; mip++) {
+		EmitLabel(state, labels[mip]);
+		if constexpr (has_result) {
+			phi.push_back(emit(mip));
+			phi.push_back(state.current_label);
+		} else {
+			emit(mip);
+		}
+		state.builder.AddFunction(spv::OpBranch, merge_label);
+	}
+	EmitLabel(state, merge_label);
+	if constexpr (has_result) {
+		state.builder.AddFunction(phi);
+		return phi[2];
+	}
+}
+
 template <typename Fn>
 void EmitIfCondition(EmitterState& state, uint32_t condition, Fn&& fn) {
 	const auto then_label  = state.builder.AllocateId();
@@ -528,14 +594,7 @@ uint32_t EmitValueOrZeroIfCondition(EmitterState& state, uint32_t condition, Fn&
 
 template <typename Fn>
 uint32_t AtomicUpdate(EmitterState& state, uint32_t pointer, IR::ResourceKind kind, Fn&& desired) {
-	const auto scope  = kind == IR::ResourceKind::Lds ? spv::ScopeWorkgroup : spv::ScopeDevice;
-	const auto memory = [&] {
-		switch (kind) {
-			case IR::ResourceKind::Lds: return spv::MemorySemanticsWorkgroupMemoryMask;
-			case IR::ResourceKind::Image: return spv::MemorySemanticsImageMemoryMask;
-			default: return spv::MemorySemanticsUniformMemoryMask;
-		}
-	}();
+	const auto scope     = kind == IR::ResourceKind::Lds ? spv::ScopeWorkgroup : spv::ScopeDevice;
 	const auto preheader = state.builder.AllocateId();
 	const auto header    = state.builder.AllocateId();
 	const auto cont      = state.builder.AllocateId();
@@ -564,8 +623,7 @@ uint32_t AtomicUpdate(EmitterState& state, uint32_t pointer, IR::ResourceKind ki
 	EmitLabel(state, cont);
 	state.builder.AddFunction(spv::OpBranch, header);
 	EmitLabel(state, merge);
-	state.builder.AddFunction(spv::OpMemoryBarrier, ConstantU32(state, scope),
-	                          ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask | memory));
+	EmitAtomicMemoryBarrier(state, kind);
 	return observed;
 }
 

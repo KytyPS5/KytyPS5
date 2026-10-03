@@ -314,6 +314,7 @@ void ConfigurationListWidget::WriteSettings() {
 	s->remove(CONF_GLOBAL);
 	s->beginGroup(CONF_GLOBAL);
 	m_global_info.WriteSettings(s.get());
+	m_global_info.controller.WriteSettings(s.get());
 	s->endGroup();
 
 	s->remove(CONF_SECTION_NAME);
@@ -357,6 +358,7 @@ void ConfigurationListWidget::ReadSettings() {
 	if (!s->childKeys().isEmpty()) {
 		m_global_info.ReadSettings(s.get());
 	}
+	m_global_info.controller.ReadSettings(s.get());
 	s->endGroup();
 
 	qDeleteAll(m_custom_infos);
@@ -409,6 +411,7 @@ ConfigurationListWidget::CreateConfiguration(const ConfigurationItem& item) cons
 	const auto* custom = m_custom_infos.value(item.GetInfo().game_path);
 	info->CopyGameInfoFrom(item.GetInfo());
 	info->CopyEmulatorSettingsFrom(custom != nullptr ? *custom : m_global_info);
+	info->controller = m_global_info.controller;
 	if (custom != nullptr && !custom->elf.isEmpty()) {
 		info->elf = custom->elf;
 	}
@@ -751,6 +754,8 @@ void ConfigurationListWidget::edit_configuration() {
 	auto                    info = CreateConfiguration(*item);
 	ConfigurationEditDialog dlg(*info, this);
 	dlg.setWindowTitle(tr("Edit game settings"));
+	connect(&dlg, &ConfigurationEditDialog::PreviewControllerColor, this,
+	        &ConfigurationListWidget::PreviewControllerColor);
 
 	if (dlg.exec() == QDialog::Accepted) {
 		info->custom_settings           = true;
@@ -761,6 +766,8 @@ void ConfigurationListWidget::edit_configuration() {
 		WriteSettings();
 		item->Update();
 		SelectItem(item);
+	} else {
+		emit Select();
 	}
 }
 
@@ -783,14 +790,18 @@ void ConfigurationListWidget::delete_configuartion() {
 void ConfigurationListWidget::edit_global_settings() {
 	Configuration info;
 	info.CopyEmulatorSettingsFrom(m_global_info);
+	info.controller = m_global_info.controller;
 	info.name = tr("Global settings");
 
 	ConfigurationEditDialog dlg(info, this);
 	dlg.setWindowTitle(tr("Global settings"));
-	dlg.SetGameDirectories(m_game_dirs);
+	dlg.SetGlobalSettings(m_game_dirs);
+	connect(&dlg, &ConfigurationEditDialog::PreviewControllerColor, this,
+	        &ConfigurationListWidget::PreviewControllerColor);
 
 	if (dlg.exec() == QDialog::Accepted) {
 		m_global_info.CopyEmulatorSettingsFrom(info);
+		m_global_info.controller     = info.controller;
 		const auto game_dirs         = NormalizeGameDirectories(dlg.GetGameDirectories());
 		const bool game_dirs_changed = game_dirs != m_game_dirs;
 		m_game_dirs                  = game_dirs;
@@ -799,6 +810,7 @@ void ConfigurationListWidget::edit_global_settings() {
 			ScanGameDirectory();
 		}
 	}
+	emit Select();
 }
 
 void ConfigurationListWidget::edit_input_mapping() {

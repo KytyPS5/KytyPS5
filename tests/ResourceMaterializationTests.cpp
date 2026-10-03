@@ -95,29 +95,33 @@ Libs::Graphics::ShaderRecompiler::IR::ResourcePlan UserDataBufferPlan() {
   return ExtractResourcePlan(program);
 }
 
-Libs::Graphics::ShaderRecompiler::IR::ResourcePlan MixedSamplerPlan() {
+Libs::Graphics::ShaderRecompiler::IR::Program MixedSamplerProgram() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   Program program;
   program.stage = Libs::Graphics::ShaderType::Compute;
   program.srt_plan_complete = true;
   program.resource_tracking_complete = true;
-  AddValueBlock(program);
+  auto &block = AddValueBlock(program);
 
-  const auto AddSource = [&program](uint32_t dword_count, uint32_t first) {
+  const auto AddSource = [&program](uint32_t dword_count) {
     DescriptorSource source;
     source.dword_count = dword_count;
-    source.dwords[0] = Value(first);
-    for (uint32_t i = 1; i < dword_count; i++) {
+    for (uint32_t i = 0; i < dword_count; i++) {
       source.dwords[i] = Value(0u);
     }
     program.descriptor_sources.push_back(source);
     return static_cast<uint32_t>(program.descriptor_sources.size() - 1u);
   };
 
-  const auto image0 = AddSource(8, 0);
-  const auto image1 = AddSource(8, 0);
-  const auto sampler0 = AddSource(4, 0x11111111u);
-  const auto sampler1 = AddSource(4, 0x22222222u);
+  const auto image0 = AddSource(8);
+  const auto image1 = AddSource(8);
+  const auto sampler0 = AddSource(4);
+  const auto sampler1 = AddSource(4);
+  for (uint32_t index = 0; index < 2; ++index) {
+    auto &value = block.AppendNewInst(
+        ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(index))});
+    program.descriptor_sources[sampler0 + index].dwords[0] = Value(&value);
+  }
   program.info.images.push_back(
       {.source = image0,
        .resource_class = ImageResourceClass::Sampled,
@@ -137,7 +141,7 @@ Libs::Graphics::ShaderRecompiler::IR::ResourcePlan MixedSamplerPlan() {
   program.info.sampled_pairs.push_back({.image = 0, .sampler = 0});
   program.info.sampled_pairs.push_back({.image = 0, .sampler = 1});
   program.info.sampled_pairs.push_back({.image = 1, .sampler = 1});
-  return ExtractResourcePlan(program);
+  return program;
 }
 
 // One sampled image whose descriptor carries `format` in the guest format
@@ -280,6 +284,56 @@ void TestUnbasedFlatCacheHitMaterializes() {
         "unbased FLAT plan produced unexpected descriptors");
 }
 
+void TestWrittenDescriptorUsesStrictReaderOnce() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = true;
+  program.resource_tracking_complete = true;
+  auto &block = AddValueBlock(program);
+  program.memory_info.push_back({.kind = ResourceKind::ScalarAddress});
+  auto &handle = block.AppendNewInst(ValueOpcode::GetAddressResource,
+                                     {Value(0x1000u), Value(0u)});
+  auto &offset = block.AppendNewInst(ValueOpcode::GetUserData,
+                                     {Value(static_cast<ScalarReg>(0))});
+  auto &read = block.AppendNewInst(ValueOpcode::LoadAddressU32,
+      {Value(&handle), Value(&offset), Value(0u), Value(false)});
+  read.SetFlags(MemoryFlags{.index = 0});
+  DescriptorSource source;
+  source.dwords = {Value(&read), Value(0u), Value(4u), Value(0u)};
+  source.dword_count = 4;
+  program.descriptor_sources.push_back(source);
+  program.info.buffers.push_back({.source = 0, .written = true});
+  auto plan = ExtractResourcePlan(program);
+  struct Reads { uint32_t ordinary = 0; uint32_t strict = 0; bool clean = false; } reads;
+  const std::array<uint32_t, 1> user_data{4u};
+  const SrtRuntime runtime{
+      .user_data = user_data,
+      .read_memory = +[](void *data, uint64_t, std::span<uint32_t> words) {
+        ++static_cast<Reads *>(data)->ordinary;
+        words[0] = 0x8000u;
+        return true;
+      },
+      .userdata = &reads,
+      .read_specialization_memory = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+        auto &reads = *static_cast<Reads *>(data);
+        ++reads.strict;
+        if (!reads.clean || address != 0x1004u) return false;
+        words[0] = 0x8000u;
+        return true;
+      }};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization) &&
+            reads.ordinary == 0 && reads.strict == 1,
+        "GPU-dirty dynamic writable descriptor bypassed strict provenance");
+  reads.clean = true;
+  reads.strict = 0;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            reads.ordinary == 0 && reads.strict == 1 && snapshot.buffers[0].dwords[0] == 0x8000u,
+        "writable descriptor was evaluated twice or scalar EXEC suppressed its read");
+}
+
 void TestFailedMaterializationRejectsStage() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   auto plan = UserDataBufferPlan();
@@ -289,18 +343,130 @@ void TestFailedMaterializationRejectsStage() {
         "missing runtime user data did not reject the cached stage");
 }
 
-void TestMixedSamplerDuplicatesTheCorrectSnapshot() {
+void TestFiniteImageRefreshReusesScalarReads() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
-  auto plan = MixedSamplerPlan();
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = true;
+  program.resource_tracking_complete = true;
+  auto &block = AddValueBlock(program);
+  program.memory_info.push_back({.kind = ResourceKind::ScalarAddress});
+  auto &handle = block.AppendNewInst(ValueOpcode::GetAddressResource,
+                                     {Value(0x1000u), Value(0u)});
+  auto &srt = block.AppendNewInst(ValueOpcode::GetSrtResource);
+  for (uint32_t index = 0; index < 3; ++index) {
+    auto &read = block.AppendNewInst(ValueOpcode::LoadAddressU32,
+        {Value(&handle), Value(index * 4u), Value(0u), Value(true)});
+    read.SetFlags(MemoryFlags{.index = 0});
+    program.srt_reads.push_back({Value(&read), index});
+    auto &flat = block.AppendNewInst(ValueOpcode::ReadConst,
+                                     {Value(&srt), Value(index)});
+    DescriptorSource source;
+    source.dword_count = 8;
+    source.dwords.fill(Value(0u));
+    source.dwords[0] = Value(&flat);
+    source.dwords[1] = Value(static_cast<uint32_t>(
+        Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float) << 20u);
+    source.dwords[3] = Value(Libs::Graphics::DstSel(4, 5, 6, 7) |
+        (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u));
+    program.descriptor_sources.push_back(source);
+  }
+  DescriptorSource root;
+  root.dword_count = 8;
+  root.dwords.fill(Value(0u));
+  root.indirect_image.emplace(DescriptorSource::IndirectImage{}).sources = {0, 1, 2, 1};
+  program.descriptor_sources.push_back(root);
+  program.info.images.push_back({
+      .source = 3,
+      .resource_class = ImageResourceClass::Sampled,
+      .numeric_class = Libs::Graphics::Prospero::TextureNumericClass::Float,
+      .dimension = Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension::Dim2D});
+  auto plan = ExtractResourcePlan(program);
+  struct Reads {
+    std::array<uint32_t, 3> words{0x100u, 0x200u, 0x200u};
+    std::array<uint32_t, 3> counts{};
+    uint32_t ordinary = 0;
+  } reads;
+  const SrtRuntime runtime{
+      .read_memory = +[](void *data, uint64_t, std::span<uint32_t>) {
+        ++static_cast<Reads *>(data)->ordinary;
+        return false;
+      },
+      .userdata = &reads,
+      .read_specialization_memory = +[](void *data, uint64_t address,
+                                        std::span<uint32_t> words) {
+        if (words.size() != 1 || address < 0x1000u || address >= 0x100cu ||
+            (address & 3u) != 0) return false;
+        auto &reads = *static_cast<Reads *>(data);
+        const auto index = (address - 0x1000u) / 4u;
+        ++reads.counts[index];
+        words[0] = reads.words[index];
+        return true;
+      }};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
-  Check(MaterializeResources(plan, {}, snapshot, specialization),
+  const auto capacities = [&] {
+    return std::array{snapshot.images.capacity(), snapshot.flattened_srt.capacity(),
+                      snapshot.specialization_reads.capacity(), specialization.images.capacity()};
+  };
+  const auto check_mapping = [&](std::array<uint32_t, 4> ordinals) {
+    const auto offset = specialization.images[0].indirect_mapping_offset;
+    Check(snapshot.images.size() == 2 && snapshot.flattened_srt[offset] == 4,
+          "finite image candidates were not deduplicated");
+    for (uint32_t key = 0; key < ordinals.size(); ++key) {
+      Check(snapshot.flattened_srt[offset + 1u + key * 2u] == key &&
+                snapshot.flattened_srt[offset + 2u + key * 2u] == ordinals[key],
+            "finite image selector mapping is stale or incorrect");
+    }
+  };
+  Check(MaterializeResources(plan, runtime, snapshot, specialization),
+        "finite image materialization failed");
+  Check(reads.ordinary == 0 && reads.counts == std::array<uint32_t, 3>{1, 1, 1} &&
+            snapshot.specialization_reads.size() == 3,
+        "finite image candidates repeated scalar reads or bypassed clean provenance");
+  check_mapping({0, 1, 1, 1});
+  const auto warm_capacities = capacities();
+  reads.words = {0x300u, 0x300u, 0x400u};
+  Check(MaterializeResources(plan, runtime, snapshot, specialization),
+        "finite image refresh failed after descriptor changes");
+  Check(reads.ordinary == 0 && reads.counts == std::array<uint32_t, 3>{2, 2, 2} &&
+            snapshot.specialization_reads.size() == 3 &&
+            snapshot.images[0].dwords[0] == 0x300u && snapshot.images[1].dwords[0] == 0x400u,
+        "finite image refresh retained old scalar values or repeated reads");
+  check_mapping({0, 0, 1, 0});
+  Check(capacities() == warm_capacities,
+        "finite image refresh grew reusable resource storage after warmup");
+}
+
+void TestMixedSamplerVariantsShareRuntimeDescriptor() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  auto program = MixedSamplerProgram();
+  auto plan = ExtractResourcePlan(program);
+  std::array<uint32_t, 2> user_data{0x11111111u, 0x22222222u};
+  const SrtRuntime runtime{.user_data = user_data};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization),
         "mixed sampler materialization failed");
-  Check(snapshot.samplers.size() == 3,
-        "mixed sampler materialization appended unrelated samplers");
-  Check(snapshot.samplers[2] == snapshot.samplers[1] &&
-            snapshot.samplers[2] != snapshot.samplers[0],
-        "point sampler variant duplicated the wrong runtime descriptor");
+  ApplyResourceSpecialization(program, specialization);
+  const auto &samplers = program.info.samplers;
+  Check(snapshot.samplers.size() == 2 && samplers.size() == 3 &&
+            samplers[0].snapshot_index == 0 && samplers[1].snapshot_index == 1 &&
+            samplers[2].snapshot_index == 1 &&
+            samplers[0].source == plan.info.samplers[0].source &&
+            samplers[1].source == plan.info.samplers[1].source &&
+            samplers[2].source == samplers[1].source &&
+            !samplers[1].force_point_filtering && samplers[2].force_point_filtering &&
+            program.info.sampled_pairs[2].sampler == 2,
+        "native sampler variants lost their source identity or binding order");
+  const auto capacity = snapshot.samplers.capacity();
+  user_data[1] = 0x33333333u;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.samplers.size() == 2 && snapshot.samplers.capacity() == capacity &&
+            snapshot.samplers[samplers[0].snapshot_index].dwords[0] == user_data[0] &&
+            snapshot.samplers[samplers[1].snapshot_index].dwords[0] == user_data[1] &&
+            snapshot.samplers[samplers[2].snapshot_index].dwords[0] == user_data[1],
+        "sampler variants retained stale or duplicated descriptors after refresh");
 }
 
 } // namespace
@@ -323,8 +489,10 @@ int main() {
   TestMappedSrtUsesDirectReaderByDefault();
   TestIntegerRuntimeValueFollowsSrtReads();
   TestUnbasedFlatCacheHitMaterializes();
+  TestWrittenDescriptorUsesStrictReaderOnce();
   TestFailedMaterializationRejectsStage();
-  TestMixedSamplerDuplicatesTheCorrectSnapshot();
+  TestFiniteImageRefreshReusesScalarReads();
+  TestMixedSamplerVariantsShareRuntimeDescriptor();
   TestNarrowSrgbDescriptorRequestsShaderDecode();
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;

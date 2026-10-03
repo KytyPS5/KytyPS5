@@ -7,6 +7,7 @@
 
 #include <QAbstractItemView>
 #include <QCheckBox>
+#include <QColorDialog>
 #include <QComboBox>
 #include <QCoreApplication>
 #include <QDir>
@@ -22,6 +23,7 @@
 #include <QPushButton>
 #include <QResizeEvent>
 #include <QSettings>
+#include <QSlider>
 #include <QSpinBox>
 #include <QStyle>
 #include <QToolButton>
@@ -38,7 +40,23 @@
 
 constexpr char SETTINGS_CFG_DIALOG[]               = "ConfigurationEditDialog";
 constexpr char SETTINGS_CFG_LAST_GEOMETRY[]        = "geometry";
-constexpr int  GLOBAL_SETTINGS_GAME_DIRS_MIN_WIDTH = 560;
+constexpr int  GLOBAL_SETTINGS_GAME_DIRS_MIN_WIDTH = 400;
+
+static void UpdateControllerColorButton(QPushButton* button, const QString& hex) {
+	const QColor color(hex);
+	if (!color.isValid()) {
+		button->setProperty("controllerColor", QString {});
+		button->setText(QObject::tr("Custom"));
+		button->setStyleSheet({});
+		return;
+	}
+	const auto normalized = color.name(QColor::HexRgb);
+	button->setProperty("controllerColor", normalized);
+	button->setText(normalized.toUpper());
+	button->setStyleSheet(QStringLiteral("background-color: %1; color: %2;")
+	                          .arg(normalized, color.lightness() < 128 ? QStringLiteral("white")
+	                                                                   : QStringLiteral("black")));
+}
 
 const QStringList CONSOLE_LANGUAGE_NAMES = {
     "Japanese",
@@ -106,10 +124,32 @@ ConfigurationEditDialog::ConfigurationEditDialog(Configuration& info, QWidget* p
       m_info(info) {
 	m_ui->setupUi(this);
 	InitGameDirectories();
+	m_ui->controller_group->setVisible(false);
 
 	connect(m_ui->ok_button, &QPushButton::clicked, this, &ConfigurationEditDialog::save);
 	connect(m_ui->cancel_button, &QPushButton::clicked, this, &QDialog::reject);
 	connect(m_ui->clear_button, &QPushButton::clicked, this, &ConfigurationEditDialog::clear);
+	connect(m_ui->button_controller_color, &QPushButton::clicked, this, [this]() {
+		const auto current = m_ui->button_controller_color->property("controllerColor").toString();
+		const auto initial =
+		    current.isEmpty() ? QColor(QStringLiteral("#0070d1")) : QColor(current);
+		const auto color = QColorDialog::getColor(initial, this, tr("DualSense lightbar color"));
+		if (color.isValid()) {
+			const auto hex = color.name(QColor::HexRgb);
+			UpdateControllerColorButton(m_ui->button_controller_color, hex);
+			emit PreviewControllerColor(hex);
+		}
+	});
+	connect(m_ui->button_controller_color_reset, &QPushButton::clicked, this, [this]() {
+		UpdateControllerColorButton(m_ui->button_controller_color, {});
+		emit PreviewControllerColor({});
+	});
+	connect(m_ui->slider_controller_vibration, &QSlider::valueChanged, this, [this](int value) {
+		m_ui->label_controller_vibration_value->setText(tr("%1%").arg(value));
+	});
+	connect(m_ui->slider_controller_volume, &QSlider::valueChanged, this, [this](int value) {
+		m_ui->label_controller_volume_value->setText(tr("%1%").arg(value));
+	});
 	connect(m_ui->comboBox_shader_log_direction, &QComboBox::currentTextChanged, this,
 	        [this](const QString& text) {
 		        auto log = TextToEnum<Configuration::LogDirection>(text);
@@ -169,6 +209,9 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->lineEdit_user_name->setMaxLength(static_cast<int>(Config::MAX_USER_NAME_LENGTH));
 	m_ui->lineEdit_user_name->setText(info.user_name);
 	m_ui->spinBox_user_id->setValue(info.user_id);
+	UpdateControllerColorButton(m_ui->button_controller_color, info.controller.color);
+	m_ui->slider_controller_vibration->setValue(info.controller.vibration_intensity);
+	m_ui->slider_controller_volume->setValue(info.controller.speaker_volume);
 	auto* microphone = m_ui->comboBox_audio_input_device;
 	microphone->clear();
 	microphone->addItem(tr("None"), QString {});
@@ -230,6 +273,7 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	    info.gpu_index >= 0 && info.gpu_index < m_ui->comboBox_gpu->count() - 1 ? info.gpu_index + 1
 	                                                                            : 0);
 	m_ui->checkBox_fullscreen->setChecked(info.fullscreen_enabled);
+	m_ui->checkBox_hide_cursor->setChecked(info.hide_cursor_enabled);
 	m_ui->checkBox_readback->setChecked(info.readback_linear_images);
 	m_ui->checkBox_tessellation->setChecked(info.tessellation_enabled);
 	m_ui->spinBox_vblank_frequency->setValue(info.vblank_frequency);
@@ -309,8 +353,8 @@ void ConfigurationEditDialog::InitGameDirectories() {
 	update_game_directory_buttons();
 }
 
-void ConfigurationEditDialog::SetGameDirectories(const QStringList& dirs) {
-	m_show_game_dirs = true;
+void ConfigurationEditDialog::SetGlobalSettings(const QStringList& dirs) {
+	m_global_settings = true;
 	m_game_dirs_list->clear();
 	m_game_dirs_group->setMinimumWidth(GLOBAL_SETTINGS_GAME_DIRS_MIN_WIDTH);
 
@@ -319,6 +363,7 @@ void ConfigurationEditDialog::SetGameDirectories(const QStringList& dirs) {
 	}
 
 	m_game_dirs_group->setVisible(true);
+	m_ui->controller_group->setVisible(true);
 	update_game_directory_buttons();
 	layout()->activate();
 	resize(size().expandedTo(minimumSizeHint()));
@@ -326,7 +371,7 @@ void ConfigurationEditDialog::SetGameDirectories(const QStringList& dirs) {
 
 QStringList ConfigurationEditDialog::GetGameDirectories() const {
 	QStringList dirs;
-	if (!m_show_game_dirs) {
+	if (!m_global_settings) {
 		return dirs;
 	}
 
@@ -366,16 +411,22 @@ void ConfigurationEditDialog::resizeEvent(QResizeEvent* event) {
 	g_last_geometry = saveGeometry();
 }
 
-static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui) {
+static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, bool global_settings) {
 	info.user_name = ui.lineEdit_user_name->text().trimmed();
 	info.user_id   = ui.spinBox_user_id->value();
 	info.audio_input_device = ui.comboBox_audio_input_device->currentData().toString();
+	if (global_settings) {
+		info.controller.color = ui.button_controller_color->property("controllerColor").toString();
+		info.controller.vibration_intensity = ui.slider_controller_vibration->value();
+		info.controller.speaker_volume      = ui.slider_controller_volume->value();
+	}
 	info.screen_resolution =
 	    TextToEnum<Configuration::Resolution>(ui.comboBox_screen_resolution->currentText());
 	info.present_mode =
 	    TextToEnum<Configuration::PresentMode>(ui.comboBox_present_mode->currentText());
 	info.gpu_index                 = ui.comboBox_gpu->currentIndex() - 1;
 	info.fullscreen_enabled        = ui.checkBox_fullscreen->isChecked();
+	info.hide_cursor_enabled       = ui.checkBox_hide_cursor->isChecked();
 	info.readback_linear_images    = ui.checkBox_readback->isChecked();
 	info.tessellation_enabled      = ui.checkBox_tessellation->isChecked();
 	info.vblank_frequency          = ui.spinBox_vblank_frequency->value();
@@ -419,7 +470,7 @@ void ConfigurationEditDialog::save() {
 		return;
 	}
 
-	UpdateInfo(m_info, *m_ui);
+	UpdateInfo(m_info, *m_ui, m_global_settings);
 
 	emit accept();
 }
@@ -428,7 +479,8 @@ void ConfigurationEditDialog::clear() {
 	Configuration default_info;
 	Init(default_info);
 
-	if (m_show_game_dirs) {
+	if (m_global_settings) {
+		emit PreviewControllerColor({});
 		m_game_dirs_list->clear();
 		update_game_directory_buttons();
 	}

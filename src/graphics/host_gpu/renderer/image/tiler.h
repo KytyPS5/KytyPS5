@@ -6,13 +6,14 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
+#include <memory>
 #include <span>
 #include <vector>
-#include <vk_mem_alloc.h>
 
 namespace Libs::Graphics {
 
 class CommandScheduler;
+class Buffer;
 class Image;
 class StreamBuffer;
 struct GraphicContext;
@@ -62,7 +63,7 @@ public:
 	~TileManager();
 	KYTY_CLASS_NO_COPY(TileManager);
 
-	// The returned device-local buffer remains alive through the current scheduler tick.
+	// Consume scratch results before the next acquisition, or pass their buffer as input.
 	[[nodiscard]] Result Detile(vk::Buffer tiled, uint64_t tiled_offset, uint64_t tiled_capacity,
 	                            uint64_t linear_capacity, std::span<const GpuTileInfo> infos);
 	void Tile(vk::Buffer linear, uint64_t linear_offset, uint64_t linear_capacity, vk::Buffer tiled,
@@ -71,7 +72,7 @@ public:
 	               uint64_t tiled_offset, uint64_t tiled_capacity, uint64_t linear_capacity,
 	               std::span<const GpuTileInfo> infos,
 	               ColorTransform               transform = ColorTransform::None);
-	[[nodiscard]] Result GetScratchBuffer(uint64_t size);
+	[[nodiscard]] Result GetScratchBuffer(uint64_t size, vk::Buffer input = nullptr);
 	void                 ConvertD16(Result source, Result target, D16Direction direction, bool d32,
 	                                const D16Layout& layout);
 	[[nodiscard]] Result SwapBgra16(Result input);
@@ -105,23 +106,16 @@ private:
 		uint32_t pipeline_slot = 0;
 		uint64_t params_offset = 0;
 	};
-	struct Scratch {
-		vk::Buffer    buffer     = nullptr;
-		VmaAllocation allocation = nullptr;
-		uint64_t      size       = 0;
-	};
 	struct StorageBinding {
 		vk::DescriptorBufferInfo info;
 		uint32_t                 base = 0;
 	};
 
-	[[nodiscard]] Scratch         AllocateScratch(uint64_t size);
 	[[nodiscard]] StorageBinding  BindStorage(Result buffer, uint64_t size) const;
 	[[nodiscard]] static uint32_t ConversionRows(uint64_t offset, uint64_t row_stride,
 	                                             uint64_t active, uint32_t remaining,
 	                                             uint64_t alignment, uint64_t max_range,
 	                                             uint32_t max_groups) noexcept;
-	void                          DeferDestroy(Scratch scratch);
 	void Prepare(bool tile, uint64_t tiled_capacity, uint64_t linear_capacity,
 	             std::span<const GpuTileInfo> infos, uint64_t source_base, uint64_t target_base,
 	             std::vector<Dispatch>& dispatches);
@@ -134,6 +128,7 @@ private:
 	GraphicContext&                         m_graphics;
 	CommandScheduler&                       m_scheduler;
 	StreamBuffer&                           m_stream_buffer;
+	std::array<std::unique_ptr<Buffer>, 2>   m_scratch;
 	vk::DescriptorSetLayout                 m_descriptor_layout = nullptr;
 	vk::PipelineLayout                      m_pipeline_layout   = nullptr;
 	std::array<vk::Pipeline, PipelineCount> m_pipelines {};

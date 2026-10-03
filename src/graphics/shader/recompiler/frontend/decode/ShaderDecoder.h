@@ -10,6 +10,10 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Decoder {
 
+// PS5 flat stack addresses use these SH_MEM_BASES aperture tags in VA[63:32].
+constexpr uint32_t PrivateApertureHigh = 0x70000000u;
+constexpr uint32_t SharedApertureHigh = 0x80000000u;
+
 enum class Family {
 	Unknown,
 	SOP1,
@@ -43,6 +47,7 @@ enum class Opcode {
 	S_ABS_I32,
 	S_ABSDIFF_I32,
 	S_BREV_B32,
+	S_BREV_B64,
 	S_BCNT1_I32_B32,
 	S_BCNT1_I32_B64,
 	S_FF1_I32_B32,
@@ -240,6 +245,7 @@ enum class Opcode {
 	V_MAD_U32_U24,
 	V_MAD_U64_U32,
 	V_FMA_F64,
+	V_ADD_F64,
 	V_MUL_F64,
 	V_FMA_F32,
 	V_FMA_F16,
@@ -355,6 +361,10 @@ enum class Opcode {
 	V_CMP_NEQ_F32,
 	V_CMP_NLT_F32,
 	V_CMP_TRU_F32,
+	V_CMP_EQ_F64,
+	V_CMP_LE_F64,
+	V_CMPX_LE_F64,
+	V_CMPX_GE_F64,
 	V_CMPX_LT_F32,
 	V_CMPX_EQ_F32,
 	V_CMPX_LE_F32,
@@ -384,12 +394,19 @@ enum class Opcode {
 	V_CMP_GT_I16,
 	V_CMP_NE_I16,
 	V_CMP_GE_I16,
+	V_CMPX_LT_I16,
+	V_CMPX_EQ_I16,
+	V_CMPX_LE_I16,
+	V_CMPX_GT_I16,
+	V_CMPX_NE_I16,
+	V_CMPX_GE_I16,
 	V_CMP_LT_F16,
 	V_CMP_EQ_F16,
 	V_CMP_LE_F16,
 	V_CMP_GT_F16,
 	V_CMP_LG_F16,
 	V_CMP_GE_F16,
+	V_CMP_NGE_F16,
 	V_CMP_NGT_F16,
 	V_CMP_NEQ_F16,
 	V_CMP_NLT_F16,
@@ -426,11 +443,16 @@ enum class Opcode {
 	V_CMP_GE_U32,
 	V_CMP_T_U32,
 	V_CMP_EQ_I64,
+	V_CMP_LT_I64,
+	V_CMP_LE_I64,
 	V_CMP_LT_U64,
 	V_CMP_EQ_U64,
+	V_CMP_LE_U64,
 	V_CMP_GT_U64,
 	V_CMP_NE_U64,
+	V_CMP_GE_U64,
 	V_CMPX_NE_I64,
+	V_CMPX_LE_U64,
 	V_CMPX_NE_U64,
 	V_CMPX_LT_U32,
 	V_CMPX_EQ_U32,
@@ -490,6 +512,7 @@ enum class Opcode {
 	BUFFER_ATOMIC_SMAX,
 	BUFFER_ATOMIC_UMAX,
 	BUFFER_ATOMIC_AND,
+	BUFFER_ATOMIC_AND_X2,
 	BUFFER_ATOMIC_OR,
 	BUFFER_ATOMIC_OR_X2,
 	BUFFER_ATOMIC_XOR,
@@ -510,6 +533,7 @@ enum class Opcode {
 	FLAT_STORE_DWORDX3,
 	FLAT_STORE_DWORDX4,
 	DS_ADD_U32,
+	DS_ADD_U64,
 	DS_ADD_RTN_U32,
 	DS_SUB_U32,
 	DS_SUB_RTN_U32,
@@ -567,6 +591,7 @@ enum class Opcode {
 	DS_WRITE_B128,
 	DS_WRITE_ADDTID_B32,
 	DS_READ_ADDTID_B32,
+	IMAGE_BVH_INTERSECT_RAY,
 	IMAGE_GET_RESINFO,
 	IMAGE_GET_LOD,
 	IMAGE_LOAD,
@@ -574,8 +599,11 @@ enum class Opcode {
 	IMAGE_STORE,
 	IMAGE_STORE_MIP,
 	IMAGE_ATOMIC_SWAP,
+	IMAGE_ATOMIC_CMPSWAP,
 	IMAGE_ATOMIC_ADD,
+	IMAGE_ATOMIC_SMIN,
 	IMAGE_ATOMIC_UMIN,
+	IMAGE_ATOMIC_SMAX,
 	IMAGE_ATOMIC_UMAX,
 	IMAGE_ATOMIC_AND,
 	IMAGE_ATOMIC_OR,
@@ -607,6 +635,7 @@ enum class Opcode {
 	S_CBRANCH_EXECZ,
 	S_CBRANCH_EXECNZ,
 	S_CBRANCH_CDBGSYS,
+	S_CBRANCH_CDBGSYS_OR_USER,
 	S_SENDMSG,
 	S_SETREG_B32,
 	S_SLEEP,
@@ -633,6 +662,8 @@ enum class OperandKind {
 	Scc,
 	M0,
 	PopsExitingWaveId,
+	SharedBase,
+	PrivateBase,
 	Null,
 	Vgpr,
 };
@@ -744,7 +775,6 @@ struct Instruction {
 struct Program {
 	std::span<const uint32_t> code;
 	std::vector<Instruction>  instructions;
-	bool                     has_bvh = false;
 };
 
 // Code spans are trusted to contain complete instructions, valid branch targets, and 32-bit PCs.

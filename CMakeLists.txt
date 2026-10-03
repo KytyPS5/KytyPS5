@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.18...4.3)
 
 if(CMAKE_VERSION VERSION_GREATER_EQUAL 4.0)
-	set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "Minimum policy version for bundled dependencies")
+	set(CMAKE_POLICY_VERSION_MINIMUM 3.10 CACHE STRING "Minimum policy version for bundled dependencies")
 endif()
 
 get_property(KYTY_GENERATOR_IS_MULTI_CONFIG GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
@@ -332,7 +332,7 @@ if (KYTY_CLANG_CL)
 	set_source_files_properties(${kyty_emulator_src} PROPERTIES COMPILE_FLAGS "-Wno-pragma-pack -Wno-deprecated-declarations -D_TIMESPEC_DEFINED")
 endif()
 
-set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL3::SDL3-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak)
+set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL3::SDL3-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak opus)
 
 # Linux system libraries.
 if(LINUX)
@@ -481,6 +481,10 @@ add_executable(audio_out2_port_tests EXCLUDE_FROM_ALL
 target_link_libraries(audio_out2_port_tests common fmt::fmt)
 target_include_directories(audio_out2_port_tests PRIVATE ${inc_headers})
 
+add_executable(audio_out_timing_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/AudioOutTimingTests.cpp")
+target_link_libraries(audio_out_timing_tests common fmt::fmt SDL3::SDL3-static)
+target_include_directories(audio_out_timing_tests PRIVATE ${inc_headers})
+
 add_executable(ngs2_sampler_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/Ngs2SamplerTests.cpp"
 	"${KYTY_SOURCE_DIR}/loader/timer.cpp"
@@ -491,14 +495,24 @@ target_include_directories(ngs2_sampler_tests PRIVATE ${inc_headers})
 add_executable(pad_haptics_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/PadHapticsTests.cpp"
 )
-target_link_libraries(pad_haptics_tests common fmt::fmt SDL3::SDL3-static)
+target_link_libraries(pad_haptics_tests common fmt::fmt SDL3::SDL3-static opus)
 target_include_directories(pad_haptics_tests PRIVATE ${inc_headers})
+
+add_executable(controller_settings_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ControllerSettingsTests.cpp"
+)
+target_link_libraries(controller_settings_tests common fmt::fmt SDL3::SDL3-static)
+target_include_directories(controller_settings_tests PRIVATE ${inc_headers})
 
 add_executable(save_data_memory_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SaveDataMemoryTests.cpp"
 )
 target_link_libraries(save_data_memory_tests common fmt::fmt)
 target_include_directories(save_data_memory_tests PRIVATE ${inc_headers})
+
+add_executable(png_enc_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/PngEncTests.cpp")
+target_link_libraries(png_enc_tests common fmt::fmt)
+target_include_directories(png_enc_tests PRIVATE ${inc_headers})
 
 add_executable(ces_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/CesTests.cpp")
 target_link_libraries(ces_tests common fmt::fmt SDL3::SDL3-static)
@@ -602,9 +616,12 @@ if(BUILD_TESTING)
 	add_test(NAME kernel_file_system COMMAND $<TARGET_FILE:kernel_file_system_tests>)
 	add_test(NAME sync_on_address COMMAND $<TARGET_FILE:sync_on_address_tests>)
 	add_test(NAME audio_out2_port COMMAND $<TARGET_FILE:audio_out2_port_tests>)
+	add_test(NAME audio_out_timing COMMAND $<TARGET_FILE:audio_out_timing_tests>)
 	add_test(NAME ngs2_sampler COMMAND $<TARGET_FILE:ngs2_sampler_tests>)
 	add_test(NAME pad_haptics COMMAND $<TARGET_FILE:pad_haptics_tests>)
+	add_test(NAME controller_settings COMMAND $<TARGET_FILE:controller_settings_tests>)
 	add_test(NAME save_data_memory COMMAND $<TARGET_FILE:save_data_memory_tests>)
+	add_test(NAME png_enc COMMAND $<TARGET_FILE:png_enc_tests>)
 	add_test(NAME ces COMMAND $<TARGET_FILE:ces_tests>)
 	add_test(NAME save_data_dialog COMMAND $<TARGET_FILE:save_data_dialog_tests>)
 	add_test(NAME http_uri_parse COMMAND $<TARGET_FILE:http_uri_parse_tests>)
@@ -677,9 +694,12 @@ if(BUILD_TESTING)
 		shader_recompiler_compute_tests
 		virtual_memory_allocation_tests
 		audio_out2_port_tests
+		audio_out_timing_tests
 		ngs2_sampler_tests
 		pad_haptics_tests
+		controller_settings_tests
 		save_data_memory_tests
+		png_enc_tests
 		ces_tests
 		save_data_dialog_tests
 		http_uri_parse_tests
@@ -767,6 +787,10 @@ endif()
 install(TARGETS kyty_emulator DESTINATION .)
 if(KYTY_BUILD_LAUNCHER)
 	add_subdirectory("${KYTY_SOURCE_DIR}/launcher" "${CMAKE_CURRENT_BINARY_DIR}/launcher")
+
+	if(LINUX)
+		target_link_options(launcher PRIVATE $<$<CONFIG:Release>:-Wl,--strip-all>)
+	endif()
 endif()
 if(KYTY_CLANG_CL)
 	install(FILES "${KYTY_THIRD_PARTY_DIR}/winpthread/bin/libwinpthread-1.dll" DESTINATION .)

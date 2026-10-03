@@ -140,6 +140,8 @@ constexpr auto MakeShaderDispatchTable() {
 	g_hw_sh_func[Pm4::COMPUTE_PGM_RSRC3]               = HwShSetCsRegisters;
 	g_hw_sh_func[Pm4::COMPUTE_PACE_ID]                 = HwShSetCsRegisters;
 	g_hw_sh_func[Pm4::SPI_GRAPHICS_SHADER_CONTROL_PS]  = HwShSetRegisters;
+	g_hw_sh_func[Pm4::SPI_SHADER_USER_DATA_ADDR_LO_PS] = HwShSetRegisters;
+	g_hw_sh_func[Pm4::SPI_SHADER_USER_DATA_ADDR_HI_PS] = HwShSetRegisters;
 	g_hw_sh_func[Pm4::SPI_GRAPHICS_SHADER_CONTROL_GS]  = HwShSetRegisters;
 	g_hw_sh_func[Pm4::SPI_SHADER_USER_DATA_ADDR_LO_GS] = HwShSetRegisters;
 	g_hw_sh_func[Pm4::SPI_SHADER_USER_DATA_ADDR_HI_GS] = HwShSetRegisters;

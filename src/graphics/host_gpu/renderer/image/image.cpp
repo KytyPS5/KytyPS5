@@ -340,7 +340,9 @@ void Image::CopyImage(Image& source) {
 	EXIT_IF(source.backing.samples != backing.samples);
 	m_scheduler.EndRendering();
 	const uint32_t levels     = std::min(source.backing.mip_levels, backing.mip_levels);
-	const uint32_t base_depth = backing.image_type == vk::ImageType::e3D
+	const uint32_t base_depth = source.backing.image_type == backing.image_type
+	                                ? std::min(source.backing.extent.depth, backing.extent.depth)
+	                            : backing.image_type == vk::ImageType::e3D
 	                                ? backing.extent.depth
 	                                : source.backing.extent.depth;
 	const auto     source_aspect =

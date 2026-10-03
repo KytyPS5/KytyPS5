@@ -88,30 +88,6 @@ TileManager::~TileManager() {
 	}
 }
 
-TileManager::Scratch TileManager::AllocateScratch(uint64_t size) {
-	EXIT_IF(size == 0);
-	vk::BufferCreateInfo create {};
-	create.size  = size;
-	create.usage = vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc |
-	               vk::BufferUsageFlagBits::eTransferDst;
-
-	VmaAllocationCreateInfo allocate {};
-	allocate.usage       = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
-	VkBuffer      buffer = VK_NULL_HANDLE;
-	VmaAllocation memory = nullptr;
-	const auto    raw    = static_cast<VkBufferCreateInfo>(create);
-	RequireVulkanSuccess(static_cast<vk::Result>(vmaCreateBuffer(
-	                         m_graphics.allocator, &raw, &allocate, &buffer, &memory, nullptr)),
-	                     "allocate TileManager scratch buffer");
-	return {buffer, memory, size};
-}
-
-void TileManager::DeferDestroy(Scratch scratch) {
-	auto allocator = m_graphics.allocator;
-	m_scheduler.DeferOperation(
-	    [allocator, scratch] { vmaDestroyBuffer(allocator, scratch.buffer, scratch.allocation); });
-}
-
 void TileManager::Prepare(bool tile, uint64_t tiled_capacity, uint64_t linear_capacity,
                           std::span<const GpuTileInfo> infos, uint64_t source_base,
                           uint64_t target_base, std::vector<Dispatch>& dispatches) {
@@ -369,8 +345,7 @@ TileManager::Result TileManager::Detile(vk::Buffer tiled, uint64_t tiled_offset,
 	const uint64_t        source_base = tiled_offset & (descriptor_alignment - 1);
 	std::vector<Dispatch> dispatches;
 	Prepare(false, tiled_capacity, linear_capacity, infos, source_base, 0, dispatches);
-	auto scratch = AllocateScratch(Common::AlignUp(linear_capacity, 4));
-	DeferDestroy(scratch);
+	auto scratch = GetScratchBuffer(linear_capacity, tiled);
 	Record(tiled, tiled_offset, tiled_capacity, scratch.buffer, 0, scratch.size, dispatches,
 	       true);
 	return {scratch.buffer, 0, linear_capacity};
@@ -400,11 +375,9 @@ void TileManager::TileImage(Image& image, std::span<const vk::BufferImageCopy> r
 	    std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
 	const uint64_t        target_base = tiled_offset & (descriptor_alignment - 1);
 	std::vector<Dispatch> dispatches;
-	// Reserve all stream parameters before creating a scheduler-lived scratch dependency:
-	// StreamBuffer::Map is allowed to submit the current tick when it wraps.
+	// Reserve stream parameters before recording the image download and conversion.
 	Prepare(true, tiled_capacity, linear_capacity, infos, 0, target_base, dispatches);
-	auto linear = AllocateScratch(Common::AlignUp(linear_capacity, 4));
-	DeferDestroy(linear);
+	auto linear = GetScratchBuffer(linear_capacity, tiled);
 	image.Download(regions, linear.buffer, 0, linear.size);
 	Result source {linear.buffer, 0, linear.size};
 	if (transform == ColorTransform::SwapBgra16) {
@@ -414,10 +387,19 @@ void TileManager::TileImage(Image& image, std::span<const vk::BufferImageCopy> r
 	       dispatches, false);
 }
 
-TileManager::Result TileManager::GetScratchBuffer(uint64_t size) {
-	auto scratch = AllocateScratch(Common::AlignUp(size, 4));
-	DeferDestroy(scratch);
-	return {scratch.buffer, 0, scratch.size};
+TileManager::Result TileManager::GetScratchBuffer(uint64_t size, vk::Buffer input) {
+	EXIT_IF(size == 0);
+	size = Common::AlignUp(size, 4);
+	auto& buffer = m_scratch[m_scratch[0] && m_scratch[0]->Handle() == input ? 1 : 0];
+	if (!buffer || buffer->Size() < size) {
+		if (buffer) {
+			m_scheduler.DeferOperation([old = std::move(buffer)]() mutable { old.reset(); });
+		}
+		buffer = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0,
+		    vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc |
+		        vk::BufferUsageFlagBits::eTransferDst, size);
+	}
+	return {buffer->Handle(), 0, size};
 }
 
 TileManager::StorageBinding TileManager::BindStorage(Result buffer, uint64_t size) const {
@@ -668,9 +650,7 @@ void TileManager::SwapBgra16(Result input, Result output, uint32_t pixels) {
 
 TileManager::Result TileManager::SwapBgra16(Result input) {
 	EXIT_NOT_IMPLEMENTED(input.size == 0 || input.size % 8u != 0 || input.size / 8u > UINT32_MAX);
-	auto output = AllocateScratch(input.size);
-	DeferDestroy(output);
-	Result result {output.buffer, 0, output.size};
+	auto result = GetScratchBuffer(input.size, input.buffer);
 	SwapBgra16(input, result, static_cast<uint32_t>(input.size / 8u));
 	return result;
 }

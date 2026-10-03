@@ -114,17 +114,39 @@ void Translator::EmitVector(const Decoder::Instruction& inst) {
 			EmitIntegerCompare(inst, IR::ValueOpcode::INotEqual64, IR::Type::U64, false, true);
 			return;
 
+		case O::V_CMP_LT_I64:
+			EmitIntegerCompare(inst, IR::ValueOpcode::SLessThan64, IR::Type::U64, false, false);
+			return;
+		case O::V_CMP_LE_I64:
+			EmitIntegerCompare(inst, IR::ValueOpcode::SLessThanEqual64, IR::Type::U64, false, false);
+			return;
+		case O::V_CMP_LE_U64:
+			EmitIntegerCompare(inst, IR::ValueOpcode::ULessThanEqual64, IR::Type::U64, false, false);
+			return;
+		case O::V_CMPX_LE_U64:
+			EmitIntegerCompare(inst, IR::ValueOpcode::ULessThanEqual64, IR::Type::U64, false, true);
+			return;
+		case O::V_CMP_GE_U64:
+			EmitIntegerCompare(inst, IR::ValueOpcode::UGreaterThanEqual64, IR::Type::U64, false, false);
+			return;
+
 		case O::V_CMP_EQ_U16:
 			EmitInteger16Compare(inst, IR::ValueOpcode::IEqual32, false, false);
 			return;
 		case O::V_CMP_EQ_I16:
 			EmitInteger16Compare(inst, IR::ValueOpcode::IEqual32, true, false);
 			return;
+		case O::V_CMPX_EQ_I16:
+			EmitInteger16Compare(inst, IR::ValueOpcode::IEqual32, true, true);
+			return;
 		case O::V_CMP_NE_U16:
 			EmitInteger16Compare(inst, IR::ValueOpcode::INotEqual32, false, false);
 			return;
 		case O::V_CMP_NE_I16:
 			EmitInteger16Compare(inst, IR::ValueOpcode::INotEqual32, true, false);
+			return;
+		case O::V_CMPX_NE_I16:
+			EmitInteger16Compare(inst, IR::ValueOpcode::INotEqual32, true, true);
 			return;
 		case O::V_CMP_GT_U16:
 			EmitInteger16Compare(inst, IR::ValueOpcode::UGreaterThan32, false, false);
@@ -150,20 +172,44 @@ void Translator::EmitVector(const Decoder::Instruction& inst) {
 		case O::V_CMP_GT_I16:
 			EmitInteger16Compare(inst, IR::ValueOpcode::SGreaterThan32, true, false);
 			return;
+		case O::V_CMPX_GT_I16:
+			EmitInteger16Compare(inst, IR::ValueOpcode::SGreaterThan32, true, true);
+			return;
 		case O::V_CMP_GE_I16:
 			EmitInteger16Compare(inst, IR::ValueOpcode::SGreaterThanEqual32, true, false);
+			return;
+		case O::V_CMPX_GE_I16:
+			EmitInteger16Compare(inst, IR::ValueOpcode::SGreaterThanEqual32, true, true);
 			return;
 		case O::V_CMP_LT_I16:
 			EmitInteger16Compare(inst, IR::ValueOpcode::SLessThan32, true, false);
 			return;
+		case O::V_CMPX_LT_I16:
+			EmitInteger16Compare(inst, IR::ValueOpcode::SLessThan32, true, true);
+			return;
 		case O::V_CMP_LE_I16:
 			EmitInteger16Compare(inst, IR::ValueOpcode::SLessThanEqual32, true, false);
+			return;
+		case O::V_CMPX_LE_I16:
+			EmitInteger16Compare(inst, IR::ValueOpcode::SLessThanEqual32, true, true);
 			return;
 
 		case O::V_CMP_F_F32: EmitCompareConstant(inst, false, false, false); return;
 		case O::V_CMP_TRU_F32: EmitCompareConstant(inst, true, false, false); return;
 		case O::V_CMP_EQ_F32:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPOrdEqual32, false, false);
+			return;
+		case O::V_CMP_EQ_F64:
+			EmitFloatCompare(inst, IR::ValueOpcode::FPOrdEqual64, false, false);
+			return;
+		case O::V_CMP_LE_F64:
+			EmitFloatCompare(inst, IR::ValueOpcode::FPOrdLessThanEqual64, false, false);
+			return;
+		case O::V_CMPX_LE_F64:
+			EmitFloatCompare(inst, IR::ValueOpcode::FPOrdLessThanEqual64, false, true);
+			return;
+		case O::V_CMPX_GE_F64:
+			EmitFloatCompare(inst, IR::ValueOpcode::FPOrdGreaterThanEqual64, false, true);
 			return;
 		case O::V_CMPX_EQ_F32:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPOrdEqual32, false, true);
@@ -266,6 +312,9 @@ void Translator::EmitVector(const Decoder::Instruction& inst) {
 			return;
 		case O::V_CMPX_LE_F16:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPOrdLessThanEqual32, true, true);
+			return;
+		case O::V_CMP_NGE_F16:
+			EmitFloatCompare(inst, IR::ValueOpcode::FPUnordLessThan32, true, false);
 			return;
 		case O::V_CMP_NGT_F16:
 			EmitFloatCompare(inst, IR::ValueOpcode::FPUnordLessThanEqual32, true, false);
@@ -418,6 +467,7 @@ void Translator::EmitVector(const Decoder::Instruction& inst) {
 		case O::V_SUB_F32: return FloatBinary(inst, IR::ValueOpcode::FPSub32, false);
 		case O::V_SUBREV_F32: return FloatBinary(inst, IR::ValueOpcode::FPSub32, true);
 		case O::V_MUL_F32: return FloatBinary(inst, IR::ValueOpcode::FPMul32, false);
+		case O::V_ADD_F64: return FloatBinary(inst, IR::ValueOpcode::FPAdd64, false);
 		case O::V_MUL_F64: return FloatBinary(inst, IR::ValueOpcode::FPMul64, false);
 		case O::V_MIN_F32: return FloatBinary(inst, IR::ValueOpcode::FPMin32, false);
 		case O::V_MAX_F32: return FloatBinary(inst, IR::ValueOpcode::FPMax32, false);

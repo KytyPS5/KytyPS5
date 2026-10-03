@@ -138,7 +138,13 @@ int KernelEqueuePrivate::GetTriggeredEvents(KernelEvent* ev, int num) {
 
 void KernelEqueuePrivate::TriggerExpiredTimers(uint64_t now_ns) {
 	for (auto& event: m_events) {
-		if (!event.triggered && event.deadline_ns != 0 && event.deadline_ns <= now_ns) {
+		if (event.deadline_ns != 0 && event.deadline_ns <= now_ns) {
+			if (event.event.filter == KERNEL_EVFILT_TIMER) {
+				const auto count = event.interval_ns == 0 ? !event.triggered :
+				    1 + (now_ns - event.deadline_ns) / event.interval_ns;
+				event.event.data += static_cast<intptr_t>(count);
+				event.deadline_ns += count * event.interval_ns;
+			}
 			event.triggered = true;
 		}
 	}
@@ -209,7 +215,9 @@ int KernelEqueuePrivate::AddEvent(const KernelEqueueEvent& event) {
 		                       return e.event.ident == ident && e.event.filter == filter;
 	                       });
 	if (it != m_events.end()) {
+		TriggerExpiredTimers(MonotonicTimeNs());
 		it->deadline_ns = event.deadline_ns;
+		it->interval_ns = event.interval_ns;
 		it->event.udata = event.event.udata;
 		for (auto& pending: it->pending_events) {
 			pending.udata = event.event.udata;
@@ -511,6 +519,22 @@ int KYTY_SYSV_ABI KernelDeleteUserEvent(KernelEqueue eq, int id) {
 	return KernelDeleteEvent(eq, static_cast<uintptr_t>(id), KERNEL_EVFILT_USER);
 }
 
+static int AddTimerEvent(KernelEqueue eq, int id, uint64_t delay_ns, bool periodic, void* udata) {
+	const auto now_ns = MonotonicTimeNs();
+	KernelEqueueEvent event {};
+	event.deadline_ns  = delay_ns <= UINT64_MAX - now_ns ? now_ns + delay_ns : UINT64_MAX;
+	event.interval_ns  = periodic ? delay_ns : 0;
+	event.event.ident  = static_cast<uintptr_t>(id);
+	event.event.filter = periodic ? KERNEL_EVFILT_TIMER : KERNEL_EVFILT_HRTIMER;
+	event.event.flags  = EV_ADD | (periodic ? EV_CLEAR : EV_ONESHOT);
+	event.event.udata  = udata;
+	return KernelAddEvent(eq, event);
+}
+
+int KYTY_SYSV_ABI KernelAddTimerEvent(KernelEqueue eq, int id, KernelUseconds usec, void* udata) {
+	return AddTimerEvent(eq, id, static_cast<uint64_t>(usec) * 1000, true, udata);
+}
+
 int KYTY_SYSV_ABI KernelAddHRTimerEvent(KernelEqueue eq, int id, const KernelTimespec* ts,
                                         void* udata) {
 	if (ts == nullptr) {
@@ -524,17 +548,7 @@ int KYTY_SYSV_ABI KernelAddHRTimerEvent(KernelEqueue eq, int id, const KernelTim
 
 	const auto delay_ns =
 	    static_cast<uint64_t>(ts->tv_sec) * 1000000000ull + static_cast<uint64_t>(ts->tv_nsec);
-	const auto now_ns = MonotonicTimeNs();
-
-	KernelEqueueEvent event {};
-	event.deadline_ns  = delay_ns <= UINT64_MAX - now_ns ? now_ns + delay_ns : UINT64_MAX;
-	event.event.ident  = static_cast<uintptr_t>(id);
-	event.event.filter = KERNEL_EVFILT_HRTIMER;
-	event.event.flags  = EV_ADD | EV_ONESHOT;
-	event.event.fflags = 0;
-	event.event.data   = 0;
-	event.event.udata  = udata;
-	return KernelAddEvent(eq, event);
+	return AddTimerEvent(eq, id, delay_ns, false, udata);
 }
 
 int KYTY_SYSV_ABI KernelDeleteHRTimerEvent(KernelEqueue eq, int id) {

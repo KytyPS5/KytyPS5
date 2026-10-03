@@ -583,7 +583,7 @@ bool TextureCache::CopyD16(Image& destination, Image& source) {
 	}
 
 	auto                         depth_buffer = m_tiler.GetScratchBuffer(depth_size);
-	auto                         color_buffer = m_tiler.GetScratchBuffer(color_size);
+	auto                         color_buffer = m_tiler.GetScratchBuffer(color_size, depth_buffer.buffer);
 	const TileManager::D16Layout promote_layout {
 	    .width               = depth.info.extent.width,
 	    .height              = depth.info.extent.height,
@@ -791,13 +791,6 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		if (const auto depth_id = ResolveDepthOverlap(requested, binding, cached_id)) {
 			return {depth_id};
 		}
-		if (requested.IsBlock() && !cached.info.IsBlock()) {
-			return {ExpandImage(requested, cached_id)};
-		}
-		if (requested.data.size == cached.info.data.size &&
-		    (requested.IsVolume() || cached.info.IsVolume())) {
-			return {ExpandImage(requested, cached_id)};
-		}
 		// Equal pitch does not imply equal mip placement: a changed extent can move
 		// a level into or out of the mip tail. These are separate guest layouts.
 		if (requested.tile_mode != cached.info.tile_mode ||
@@ -807,6 +800,19 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 				FreeImage(cached_id);
 			}
 			return {merged_id};
+		}
+		if (requested.IsBlock() && !cached.info.IsBlock()) {
+			return {ExpandImage(requested, cached_id)};
+		}
+		// Volume depth is not an array-layer count. A larger depth can retain the
+		// same block-slice layout while requiring a larger native image.
+		if ((requested.IsVolume() || cached.info.IsVolume()) &&
+		    (requested.data.size == cached.info.data.size ||
+		     (requested.type == cached.info.type && requested.resources == cached.info.resources &&
+		      requested.extent.width == cached.info.extent.width &&
+		      requested.extent.height == cached.info.extent.height &&
+		      requested.extent.depth > cached.info.extent.depth))) {
+			return {ExpandImage(requested, cached_id)};
 		}
 		// PPSA08394
 		// A view cannot change the native image type or grow its extent.
@@ -878,9 +884,7 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 	RefreshCopySource(source_id);
 	const auto expanded_id = InsertImage(info);
-	auto&      expanded    = m_slot_images[expanded_id];
 	auto&      source      = m_slot_images[source_id];
-	expanded.usage         = source.usage;
 	if (source.binding.is_bound || source.binding.is_target) {
 		source.binding.needs_rebind = true;
 	}
@@ -926,22 +930,12 @@ TextureCache::BuildTextureTransfer(const Image& image, BindingType binding,
 	const bool  upload           = direction == TransferDirection::Upload;
 	const bool  render_target    = binding == BindingType::RenderTarget;
 	const bool  video_out        = binding == BindingType::VideoOut;
-	auto        format           = info.guest_format;
 	uint32_t    layers           = info.TransferLayers();
 	bool        volume           = info.IsVolume();
-	bool        allow_depth_tile = upload;
 	const char* owner            = "TextureCache readback";
 
 	TextureTransfer transfer;
-	transfer.swap_bgra16 = info.bgra16 && (!upload || render_target || video_out);
-	if (render_target) {
-		format = ImageOps::RenderTargetTransferFormat(info.bytes_per_block);
-	}
-	if (video_out) {
-		allow_depth_tile = false;
-	} else if (render_target || binding == BindingType::Storage) {
-		allow_depth_tile = true;
-	}
+	transfer.swap_bgra16 = info.bgra16;
 	if (upload) {
 		if ((render_target || video_out) &&
 		    (info.resources.layers == 0 || info.data.size % info.resources.layers != 0 ||
@@ -963,9 +957,9 @@ TextureCache::BuildTextureTransfer(const Image& image, BindingType binding,
 		}
 	}
 
-	transfer.layout  = TextureCalcUploadLayout(format, info.extent.width, info.extent.height,
-	                                       info.resources.levels, layers, info.tile_mode,
-	                                       info.data.size, allow_depth_tile, volume, owner);
+	transfer.layout = TextureCalcUploadLayout(info.guest_format, info.extent.width,
+	                                         info.extent.height, info.resources.levels, layers,
+	                                         info.tile_mode, info.data.size, volume, owner);
 	transfer.regions = TextureBuildImageCopies(transfer.layout);
 	if (info.IsDepth()) {
 		for (auto& region: transfer.regions) {
@@ -1071,7 +1065,7 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 		                     texels_per_slice > UINT64_MAX / transfer_bytes);
 		const uint64_t transfer_slice = texels_per_slice * transfer_bytes;
 		EXIT_NOT_IMPLEMENTED(transfer_slice > UINT64_MAX / layers);
-		auto promoted = m_tiler.GetScratchBuffer(transfer_slice * layers);
+		auto promoted = m_tiler.GetScratchBuffer(transfer_slice * layers, linear.buffer);
 		m_tiler.ConvertD16(
 		    linear, promoted, TileManager::D16Direction::Promote,
 		    info.pixel_format == vk::Format::eD32SfloatS8Uint,
@@ -1133,7 +1127,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		image.info.metadata = desc.info.metadata;
 		// Native color metadata must not retain a reused HTile/CMask/FMask clear flag.
 		m_surface_metas.erase(range.address);
-		if (range.size == 0 || desc.info.resources.levels != 1 || image.info.resources.levels != 1) {
+		if (range.size == 0 || desc.info.resources.levels != 1) {
 			return;
 		}
 	}
@@ -1181,10 +1175,12 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			           {vk::ImageAspectFlagBits::eColor, view.base_level, view.level_count,
 			            image_first + slice, 1}, clear);
 		}
-		// Native expanded keys own consumption. Existing buffer tracking publishes this CPU
-		// write to future GPU readers; FillBuffer can fault and must run outside the texture lock.
+		// Publish the conversion's expanded keys without treating them as guest writes
+		// to overlapping image data. Invalidate the buffer before updating its backing.
 		if (desc.type != BindingType::VideoOut) {
-			m_buffer_cache.FillBuffer(address, slice_size, UINT32_MAX, false);
+			std::fill(bytes.begin(), bytes.end(), uint8_t {0xff});
+			m_buffer_cache.InvalidateMemory(address, slice_size);
+			LibKernel::Memory::WriteBacking(address, bytes.data(), bytes.size());
 		}
 	}
 }
@@ -1533,7 +1529,7 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 	auto&          image = m_slot_images[selected];
 	vk::ClearValue clear {};
 	if (aspect == vk::ImageAspectFlagBits::eColor) {
-		if (!DecodePackedColorClear(image.info.pixel_format, packed_clear, clear.color)) {
+		if (!DecodeColorDwordFill(image.info.pixel_format, packed_clear, clear.color)) {
 			return false;
 		}
 	} else {
@@ -1679,7 +1675,7 @@ void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t des
 	auto host_linear = m_tiler.GetScratchBuffer(transfer_size);
 	image.Download(copies, host_linear.buffer, 0, host_linear.size);
 	const bool tiled        = info.IsTiled();
-	auto       guest_linear = tiled ? m_tiler.GetScratchBuffer(info.data.size)
+	auto       guest_linear = tiled ? m_tiler.GetScratchBuffer(info.data.size, host_linear.buffer)
 	                                : TileManager::Result {destination.Handle(), destination_offset,
 	                                                       destination.Size() - destination_offset};
 	m_tiler.ConvertD16(host_linear, guest_linear, TileManager::D16Direction::Demote,
@@ -1850,7 +1846,7 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 	std::scoped_lock lock {m_lock};
 	for (const auto id: FindImagesInRegion(address, size, true)) {
 		auto& image = m_slot_images[id];
-		if (!image.Overlaps(address, size)) {
+		if (image.info.data.address != address) {
 			continue;
 		}
 		if (image.IsGpuModified()) {

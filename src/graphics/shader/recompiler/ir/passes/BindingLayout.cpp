@@ -126,7 +126,7 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword) {
 			EXIT("shader binding layout failed: image %u has an unmapped binding class", i);
 		}
 		auto&      resources = image_groups[group];
-		const auto dynamic   = program.info.images[i].mip_mode == ImageMipMode::DynamicStorage;
+		const auto dynamic   = program.info.images[i].mip_mode == ImageMipMode::Dynamic;
 		const auto count     = dynamic ? program.info.images[i].mip_count : 1u;
 		if (count == 0u || (!dynamic && program.info.images[i].mip_count != 1u)) {
 			EXIT("shader binding layout failed: image %u has invalid specialized mip count %u", i,

@@ -44,6 +44,34 @@ uint32_t PossibleU32Bits(Value value) {
 	}
 }
 
+bool IsNoncanonicalFlatAddress(Value high, Value active) {
+	high = high.Resolve();
+	active = active.Resolve();
+	// A predicated VGPR write supplies its new value on exactly the lanes which
+	// execute this access. Do not discard a selection under a different mask.
+	while (const auto* select = high.TryInstruction()) {
+		if (select->GetOpcode() != ValueOpcode::SelectU32 || select->Arg(0).Resolve() != active) break;
+		high = select->Arg(1).Resolve();
+	}
+	uint32_t lower = 0, upper = UINT32_MAX;
+	if (high.IsImmediate() && high.GetType() == Type::U32) {
+		lower = upper = high.U32();
+	} else if (const auto* inst = high.TryInstruction();
+	           inst != nullptr && inst->GetOpcode() == ValueOpcode::UMedTri32) {
+		// The median lies between any two constant inputs, regardless of the third.
+		uint32_t count = 0;
+		for (size_t index = 0; index < inst->NumArgs(); ++index) {
+			const auto value = inst->Arg(index).Resolve();
+			if (!value.IsImmediate() || value.GetType() != Type::U32) continue;
+			if (count++ == 0) lower = upper = value.U32();
+			else { lower = std::min(lower, value.U32()); upper = std::max(upper, value.U32()); }
+		}
+		if (count < 2) return false;
+	}
+	// Leave one high DWORD on each side for the signed instruction offset/carry.
+	return lower > 0x00008000u && upper < 0xffff7fffu;
+}
+
 Value CanonicalizeSampleAdjustDword3(Value value) {
 	for (;;) {
 		value            = value.Resolve();
@@ -293,8 +321,9 @@ public:
 			for (uint32_t dword = 5u; dword < plan.roots.size(); dword++) {
 				plan.handle->SetArg(dword, plan.key);
 			}
-			for (const auto index: plan.memory) {
-				m_program.memory_info[index].planning_only = true;
+			if (plan.reads[0] != nullptr) {
+				for (const auto index: plan.memory)
+					m_program.memory_info[index].planning_only = true;
 			}
 		}
 		m_program.descriptor_sources         = std::move(m_sources);
@@ -734,7 +763,7 @@ private:
 				const auto& b = *descriptor.indirect_image;
 				if (a.material_source != b.material_source || a.table_source != b.table_source ||
 				    a.selector_stride != b.selector_stride || a.selector_offset != b.selector_offset ||
-				    a.table_offset != b.table_offset ||
+				    a.table_offset != b.table_offset || a.sources != b.sources ||
 				    !EquivalentValue(m_program, a.key_count, b.key_count) ||
 				    a.selector_mask.IsEmpty() != b.selector_mask.IsEmpty() ||
 				    (!a.selector_mask.IsEmpty() &&
@@ -1446,6 +1475,152 @@ private:
 		return true;
 	}
 
+	uint32_t SelectorMaximum(Value value) const {
+		value = value.Resolve();
+		if (value.IsImmediate() && value.GetType() == Type::U32) return value.U32();
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr) return UINT32_MAX;
+		if (inst->GetOpcode() == ValueOpcode::FindILsb32)
+			return NonzeroOnEntry(inst->Arg(0), inst->Parent()) ? 31u : UINT32_MAX;
+		if (inst->GetOpcode() == ValueOpcode::UMin32)
+			return std::min(SelectorMaximum(inst->Arg(0)), SelectorMaximum(inst->Arg(1)));
+		uint32_t shift;
+		if (inst->GetOpcode() == ValueOpcode::ShiftLeftLogical32 &&
+		    ImmediateU32(inst->Arg(1), shift) && shift < 32u) {
+			const auto maximum = uint64_t {SelectorMaximum(inst->Arg(0))} << shift;
+			if (maximum <= UINT32_MAX) return static_cast<uint32_t>(maximum);
+		}
+		return UINT32_MAX;
+	}
+
+	bool ImpossibleSwitchEdge(const Block* from, const Block* to) const {
+		const auto from_it = std::ranges::find(m_program.blocks, from);
+		const auto to_it = std::ranges::find(m_program.blocks, to);
+		if (from_it == m_program.blocks.end() || to_it == m_program.blocks.end() ||
+		    m_program.block_info.size() != m_program.blocks.size()) return false;
+		const auto& info = m_program.block_info[from_it - m_program.blocks.begin()];
+		const auto& term = info.terminator;
+		if (term.kind != CFG::TerminatorKind::IndirectBranch ||
+		    term.indirect_selector_code == UINT32_MAX ||
+		    term.indirect_selector_values.empty() ||
+		    term.indirect_selector_values.size() != term.indirect_selector_targets.size()) return false;
+		const auto target = m_program.block_info[to_it - m_program.blocks.begin()].id;
+		const auto maximum = SelectorMaximum(info.indirect_target);
+		bool found = false;
+		for (size_t i = 0; i < term.indirect_selector_values.size(); ++i) {
+			if (term.indirect_selector_targets[i] != target) continue;
+			if (term.indirect_selector_values[i] <= maximum) return false;
+			found = true;
+		}
+		return found;
+	}
+
+	bool TryMakeFiniteImage(Inst& handle, IndirectImagePlan& plan) {
+		if (handle.GetOpcode() != ValueOpcode::GetImageResource || handle.NumArgs() != 8u)
+			return false;
+		if (std::ranges::any_of(handle.Uses(), [](const Use& use) {
+			const auto op = use.user->GetOpcode();
+			return op != ValueOpcode::ImageSampleRaw && op != ValueOpcode::ImageGatherRaw;
+		})) return false;
+		bool has_phi = false;
+		for (size_t word = 0; word < handle.NumArgs(); ++word) has_phi |= handle.Arg(word).Resolve().IsPhi();
+		if (!has_phi) return false;
+		// Normalize the eight synchronized descriptor words to one GPU ordinal.
+		// Build the complete graph before changing IR so an unsupported leaf is transactional.
+		struct Choice {
+			DescriptorSource descriptor;
+			const Inst* branch = nullptr;
+			std::vector<uint32_t> children;
+			Value key;
+		};
+		std::vector<Choice> choices;
+		const auto visit = [&](const auto& self, DescriptorSource descriptor) -> uint32_t {
+			for (auto& word: descriptor.dwords) word = word.Resolve();
+			for (uint32_t i = 0; i < choices.size(); ++i)
+				if (choices[i].descriptor.dwords == descriptor.dwords) return i;
+			const auto index = static_cast<uint32_t>(choices.size());
+			choices.push_back({descriptor});
+			uint32_t bad = 0;
+			if (ValidateSource(descriptor, bad)) return index;
+			const auto* branch = descriptor.dwords[bad].TryInstruction();
+			if (branch == nullptr || branch->Parent() == nullptr ||
+			    branch->GetOpcode() != ValueOpcode::Phi ||
+			    branch->NumPhiBlocks() != branch->NumArgs()) return UINT32_MAX;
+			choices[index].branch = branch;
+			const auto count = branch->NumArgs();
+			for (uint32_t arm = 0; arm < count; ++arm) {
+				// A nonzero bit scan cannot choose its zero-input switch sentinel.
+				// Preserve the Phi edge; its ordinal is never observed at runtime.
+				if (ImpossibleSwitchEdge(branch->PhiBlock(arm), branch->Parent())) {
+					choices[index].children.push_back(UINT32_MAX);
+					continue;
+				}
+				auto child = descriptor;
+				for (uint32_t word = 0; word < child.dword_count; ++word) {
+					const auto* selected = descriptor.dwords[word].TryInstruction();
+					if (selected == nullptr || selected->GetOpcode() != branch->GetOpcode() ||
+					    selected->Parent() != branch->Parent()) {
+						if (!ValidateRuntimeValue(m_program, descriptor.dwords[word])) return UINT32_MAX;
+						continue;
+					}
+					if (selected->NumArgs() != count || selected->NumPhiBlocks() != count)
+						return UINT32_MAX;
+					uint32_t incoming = 0;
+					while (incoming < count && selected->PhiBlock(incoming) != branch->PhiBlock(arm))
+						++incoming;
+					if (incoming == count) return UINT32_MAX;
+					child.dwords[word] = selected->Arg(incoming);
+				}
+				const auto next = self(self, child);
+				if (next == UINT32_MAX) return UINT32_MAX;
+				choices[index].children.push_back(next);
+			}
+			return index;
+		};
+		DescriptorSource root;
+		root.dword_count = 8u;
+		for (uint32_t word = 0; word < root.dword_count; ++word) root.dwords[word] = handle.Arg(word);
+		if (visit(visit, root) == UINT32_MAX || choices.front().branch == nullptr) return false;
+		DescriptorSource image_source;
+		image_source.dword_count = 8u;
+		image_source.dwords.fill(Value(0u));
+		image_source.indirect_image.emplace(DescriptorSource::IndirectImage{});
+		auto& sources = image_source.indirect_image->sources;
+		for (auto& choice: choices) {
+			if (choice.branch != nullptr) continue;
+			const auto source = InternSource(choice.descriptor);
+			auto found = std::ranges::find(sources, source);
+			choice.key = Value(static_cast<uint32_t>(found - sources.begin()));
+			if (found == sources.end()) sources.push_back(source);
+		}
+		if (sources.empty()) return false;
+		for (auto& choice: choices) {
+			if (choice.branch == nullptr) continue;
+			auto* block = choice.branch->Parent();
+			const auto where = std::ranges::find_if(block->Instructions(), [&](const Inst& inst) {
+				return &inst == choice.branch;
+			});
+			auto& key = *block->PrependNewInst(where, choice.branch->GetOpcode());
+			key.SetFlags(Type::U32);
+			choice.key = Value(&key);
+		}
+		for (const auto& choice: choices) {
+			if (choice.branch == nullptr) continue;
+			auto* key = choice.key.Instruction();
+			for (uint32_t arm = 0; arm < choice.children.size(); ++arm) {
+				const auto child = choice.children[arm];
+				const auto value = child == UINT32_MAX ? Value(0u) : choices[child].key;
+				key->AddPhiOperand(choice.branch->PhiBlock(arm), value);
+			}
+		}
+		plan.handle = &handle;
+		plan.source = InternSource(image_source);
+		plan.key = choices.front().key;
+		plan.roots = image_source.dwords;
+		plan.reads.fill(nullptr);
+		return true;
+	}
+
 	const IndirectImagePlan* FindIndirectImage(const Inst& handle) const {
 		const auto found =
 		    std::find_if(m_indirect_images.begin(), m_indirect_images.end(),
@@ -1458,7 +1633,8 @@ private:
 	bool IsIndirectPlanningMemory(uint32_t index) const {
 		return std::any_of(m_indirect_images.begin(), m_indirect_images.end(),
 		                   [&](const IndirectImagePlan& plan) {
-			return std::ranges::find(plan.memory, index) != plan.memory.end();
+			return plan.reads[0] != nullptr &&
+			       std::ranges::find(plan.memory, index) != plan.memory.end();
 		});
 	}
 
@@ -1474,7 +1650,7 @@ private:
 					continue;
 				}
 				IndirectImagePlan plan;
-				if (TryMakeIndirectImage(*handle, plan)) {
+				if (TryMakeIndirectImage(*handle, plan) || TryMakeFiniteImage(*handle, plan)) {
 					m_indirect_images.push_back(std::move(plan));
 				}
 			}
@@ -1549,15 +1725,20 @@ private:
 
 	uint32_t AddImage(uint32_t source, const MemoryInfo& memory, ValueOpcode op, uint32_t pc) {
 		const auto resource_class = ImageOpcodeInfoOf(op).resource_class;
-		const auto mip   = resource_class == ImageResourceClass::Storage && memory.image_has_mip
-		                       ? ImageMipMode::DynamicStorage
-		                       : ImageMipMode::None;
+		const bool atomic64 = ImageOpcodeInfoOf(op).access == ImageAccess::Atomic &&
+		                      memory.data_bits == 64u;
+		const bool dynamic_mip =
+		    (resource_class == ImageResourceClass::Storage && memory.image_has_mip) ||
+		    (op == ValueOpcode::ImageGatherRaw &&
+		     (memory.image_sample_flags & Decoder::ImageSampleFlagLod) != 0u);
+		const auto mip = dynamic_mip ? ImageMipMode::Dynamic : ImageMipMode::None;
 		const bool depth = (memory.image_sample_flags & Decoder::ImageSampleFlagCompare) != 0;
 		for (uint32_t i = 0; i < m_info.images.size(); i++) {
 			auto& image = m_info.images[i];
 			if (image.source == source && image.resource_class == resource_class &&
 			    image.dimension == memory.image_dimension && image.mip_mode == mip &&
-			    image.depth_compare == depth && image.r128 == memory.image_r128) {
+			    image.depth_compare == depth && image.r128 == memory.image_r128 &&
+			    image.atomic64 == atomic64) {
 				Merge(image, op, pc);
 				return i;
 			}
@@ -1573,6 +1754,7 @@ private:
 		image.mip_mode       = mip;
 		image.depth_compare  = depth;
 		image.r128           = memory.image_r128;
+		image.atomic64       = atomic64;
 		Merge(image, op, pc);
 		m_info.images.push_back(image);
 		return static_cast<uint32_t>(m_info.images.size() - 1);
@@ -1649,6 +1831,10 @@ private:
 
 	void Collect(Inst& inst) {
 		const auto op           = inst.GetOpcode();
+		if (op == ValueOpcode::BvhIntersect) {
+			m_info.uses_dma = true;
+			return;
+		}
 		const auto buffer       = BufferAccessOf(op);
 		const auto address_info = AddressOpcodeInfoOf(op);
 		const auto image_info   = ImageOpcodeInfoOf(op);
@@ -1694,6 +1880,15 @@ private:
 		if (address_info.access != AddressAccess::None) {
 			if (!IsAddressResourceKind(memory.kind)) {
 				Fail(flags.pc, "address operation has invalid resource kind");
+			}
+			if (memory.kind == ResourceKind::Flat && memory.address_is_full &&
+			    IsNoncanonicalFlatAddress(inst.Arg(2), inst.Arg(inst.NumArgs() - 1))) {
+				ValidateAddressHandle(inst.Arg(0), flags.pc);
+				if (memory.data_bits != 32u || m_program.scratch_dwords == 0) {
+					Fail(flags.pc, "local FLAT access requires DWORD data and per-thread scratch storage");
+				}
+				m_program.memory_info[flags.index].kind = ResourceKind::FlatLocal;
+				return;
 			}
 			if (memory.kind == ResourceKind::Scratch) {
 				handle = inst.Arg(0).Resolve().TryInstruction();
@@ -1746,6 +1941,9 @@ private:
 			if (sampler == UINT32_MAX) {
 				Fail(flags.pc, "sampler resource limit exceeded");
 			}
+			m_info.samplers[sampler].gather_lod |=
+			    op == ValueOpcode::ImageGatherRaw &&
+			    (memory.image_sample_flags & Decoder::ImageSampleFlagLod) != 0u;
 			AddHandlePatch(sampler_handle, sampler, flags.pc);
 			AddSampledPair(resource, sampler, flags.pc);
 		}

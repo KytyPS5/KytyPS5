@@ -27421,6 +27421,36 @@ TestCase BranchVccnzUsesWaveMask() {
   return test;
 }
 
+TestCase ScalarBranchRestoresInactiveLanes(u32 wave_size, u32 threads) {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = threads < wave_size ? "ScalarBranchRestoresPartialWave"
+              : wave_size == 32 ? "ScalarBranchRestoresInactiveWave32"
+                                : "ScalarBranchRestoresInactiveWave64";
+  auto &code = test.code;
+  code = {EncodeVop1(0x01, 1, InlineU32(32)),
+          EncodeVop2(0x25, 1, Vgpr(0), 1), EncodeSop1(0x04, 8, 126),
+          EncodeSMovB32(20, InlineU32(0)), EncodeSMovB32(126, InlineU32(1)),
+          EncodeSMovB32(127, InlineU32(0)), EncodeSopp(0x08, 4),
+          EncodeSop1(0x28, 10, 126)};
+  AppendVop3(&code, 0x360, 20, Vgpr(1), InlineU32(threads - 1));
+  code.push_back(EncodeSop1(0x04, 126, 10));
+  code.push_back(EncodeSop1(0x04, 126, 8));
+  AppendStoreSgprAtLaneDwordOffset(&code, 20, 0, 0);
+  AppendEnd(&code);
+  test.initial.assign(threads, 0);
+  test.expected.assign(threads, 32 + threads - 1);
+  test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::S_MOV_B32, O::S_MOV_B64,
+                  O::S_CBRANCH_EXECZ, O::S_ORN2_SAVEEXEC_B64, O::V_READLANE_B32,
+                  O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpGroupNonUniformBallot", "OpAll"};
+  test.compute_info.wave_size = wave_size;
+  test.compute_info.threads_num[0] = threads;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase ScalarMemRealtimeCapturedPlaceholder() {
   using O = ShaderOpcode;
   namespace D = ShaderRecompiler::Decoder;
@@ -35458,6 +35488,9 @@ std::vector<TestCase> MakeCases() {
   AddCase(SiblingSharedExitKeepsCapturedConditions);
   AddCase(BranchVccnzUsesWaveMask);
   AddCase(BranchVccnzUsesCarryProducedWaveMask);
+  AddCase([] { return ScalarBranchRestoresInactiveLanes(32, 32); });
+  AddCase([] { return ScalarBranchRestoresInactiveLanes(64, 64); });
+  AddCase([] { return ScalarBranchRestoresInactiveLanes(64, 4); });
   AddCase(ScalarMemRealtimeCapturedPlaceholder);
   AddCase(ScalarMemoryLoadVariants);
   AddCase(ScalarBufferOffsetAlignmentAndCarry);
@@ -41037,6 +41070,9 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--wave64-only") == 0) {
     CheckWave64WholeWaveResults();
     VulkanHarness vulkan;
+    RunCase(&vulkan, ScalarBranchRestoresInactiveLanes(32, 32));
+    RunCase(&vulkan, ScalarBranchRestoresInactiveLanes(64, 64));
+    RunCase(&vulkan, ScalarBranchRestoresInactiveLanes(64, 4));
     RunCase(&vulkan, Wave32VccMasksPreserveOtherHalf());
     RunCase(&vulkan, DsPermuteWave64UsesIndependentHalves());
     RunCase(&vulkan, DsBpermuteWave64UsesIndependentHalves());

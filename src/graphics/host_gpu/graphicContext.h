@@ -97,6 +97,11 @@ struct GraphicContext {
 	void               LogMemoryBudget() const;
 	[[nodiscard]] bool CanReportMemoryUsage() const noexcept { return memory_budget_ext_enabled; }
 	[[nodiscard]] uint64_t GetDeviceMemoryUsage() const;
+	struct MemoryBudget {
+		uint64_t usage  = 0;
+		uint64_t budget = 0;
+	};
+	[[nodiscard]] MemoryBudget GetMemoryBudget() const;
 	[[nodiscard]] uint64_t GetTotalMemoryBudget() const;
 	[[nodiscard]] bool     CreateImage(const vk::ImageCreateInfo& info, VulkanImage& image);
 	void                   DeleteImage(VulkanImage& image);

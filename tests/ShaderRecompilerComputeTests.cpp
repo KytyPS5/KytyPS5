@@ -46,6 +46,7 @@
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
+#include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
 #include "graphics/shader/rectListShader.h"
 #include "graphics/shader/shader.h"
 #include "graphics/shader/shaderCompiler.h"
@@ -1315,6 +1316,7 @@ struct GraphicsCase {
   u32 pixel_perspective_centroid_vgpr = UINT32_MAX;
   u32 pixel_custom_interpolation_mask = 0;
   u32 index_count = 0;
+  u32 unique_vertex_count = 0;
 };
 
 struct CompiledShader {
@@ -17875,9 +17877,12 @@ void CheckSampledHtileArrayClearDiscovery() {
   }
 
   std::vector<u32> RenderFragment(const GraphicsCase &test,
-                                  const CompiledShader &fragment) {
-    const auto vertex_spirv =
+                                  const CompiledShader &fragment,
+                                  const CompiledShader *vertex_fixture = nullptr) {
+    const auto passthrough_spirv =
         TestSpv::MakePassthroughVertexSpirv(test.layers > 1, test.vertex_clip_w);
+    const auto &vertex_spirv = vertex_fixture != nullptr
+                                   ? vertex_fixture->spirv : passthrough_spirv;
     ValidateSpirv(test.name, vertex_spirv);
 
     Image target =
@@ -17900,10 +17905,21 @@ void CheckSampledHtileArrayClearDiscovery() {
         0x3f400000u, 0x3f800000u, 0xbf800000u, 0x40400000u, 0x3e800000u,
         0x3f000000u, 0x3f400000u, 0x3f800000u,
     };
-    const auto &vertices =
-        test.vertices.empty() ? default_vertices : test.vertices;
-    Require(test.name, "graphics", vertices.size() == 18u,
-            "graphics vertex buffer must contain three pos2/color4 vertices");
+    std::vector<u32> generated_vertices;
+    if (test.unique_vertex_count != 0) {
+      Require(test.name, "unique indexed vertices",
+              test.unique_vertex_count == test.index_count &&
+                  test.unique_vertex_count % 3u == 0u,
+              "unique vertex count must match the bounded indexed draw");
+      generated_vertices.resize(static_cast<size_t>(test.unique_vertex_count) * 6u);
+      for (u32 vertex = 0; vertex < test.unique_vertex_count; ++vertex)
+        std::copy_n(default_vertices.begin() + (vertex % 3u) * 6u, 6u,
+                    generated_vertices.begin() + static_cast<size_t>(vertex) * 6u);
+    }
+    const auto &vertices = !generated_vertices.empty() ? generated_vertices
+                           : test.vertices.empty() ? default_vertices : test.vertices;
+    Require(test.name, "graphics", vertices.size() % 18u == 0u,
+            "graphics vertex buffer must contain pos2/color4 triangles");
     auto vertex_buffer =
         CreateHostBuffer(test.name, vertices.size() * sizeof(u32),
                          vk::BufferUsageFlagBits::eVertexBuffer, vertices);
@@ -17913,7 +17929,8 @@ void CheckSampledHtileArrayClearDiscovery() {
               test.index_count % 3u == 0u && test.index_count <= 120000u,
               "indexed triangle count exceeds the bounded fixture");
       std::vector<u32> indices(test.index_count);
-      for (u32 i = 0; i < test.index_count; ++i) indices[i] = i % 3u;
+      for (u32 i = 0; i < test.index_count; ++i)
+        indices[i] = test.unique_vertex_count != 0 ? i : i % 3u;
       index_buffer = CreateHostBuffer(
           test.name, indices.size() * sizeof(u32),
           vk::BufferUsageFlagBits::eIndexBuffer, indices);
@@ -17923,13 +17940,188 @@ void CheckSampledHtileArrayClearDiscovery() {
     vk::ShaderModule fragment_module = CreateShaderModule(test.name, fragment.spirv);
 
     const auto &fragment_bind = fragment.program.bindings;
+    std::vector<Image> vertex_sampled_images;
+    Buffer vertex_data_buffer;
+    Buffer vertex_mapping_buffer;
+    vk::Sampler vertex_sampler = nullptr;
+    vk::DescriptorSetLayout vertex_descriptor_layout = nullptr;
+    vk::DescriptorPool vertex_descriptor_pool = nullptr;
+    vk::DescriptorSet vertex_descriptor_set = nullptr;
+    if (vertex_fixture != nullptr) {
+      using Kind = ShaderRecompiler::IR::DescriptorBindingKind;
+      const auto &bindings = vertex_fixture->program.bindings.descriptors;
+      vertex_sampled_images.resize(vertex_fixture->program.info.images.size());
+      for (u32 image = 0; image < vertex_sampled_images.size(); ++image) {
+        const std::array<u32, 4> color_words{
+            std::bit_cast<u32>(1.0f + static_cast<float>(image) / 256.0f),
+            std::bit_cast<u32>(0.5f), std::bit_cast<u32>(0.75f),
+            std::bit_cast<u32>(1.0f)};
+        std::vector<u32> rgba(4u * 4u * 4u);
+        for (u32 pixel = 0; pixel < 16u; ++pixel)
+          std::copy(color_words.begin(), color_words.end(), rgba.begin() + pixel * 4u);
+        vertex_sampled_images[image] = CreateImage2D(
+            test.name, 4u, 4u, vk::Format::eR32G32B32A32Sfloat,
+            vk::ImageUsageFlagBits::eSampled, rgba, 4u,
+            vk::ImageLayout::eShaderReadOnlyOptimal);
+      }
+      vertex_sampler = CreateNearestSampler(test.name, 1u);
+
+      std::vector<vk::DescriptorSetLayoutBinding> layout_bindings;
+      std::vector<vk::DescriptorPoolSize> pool_sizes;
+      std::vector<vk::DescriptorImageInfo> image_infos;
+      std::vector<vk::DescriptorImageInfo> sampler_infos;
+      std::vector<vk::DescriptorBufferInfo> buffer_infos;
+      std::vector<vk::WriteDescriptorSet> writes;
+      size_t image_count = 0, sampler_count = 0, buffer_count = 0;
+      bool has_mapping = false;
+      for (const auto &binding : bindings) {
+        const auto type = NativeDescriptorType(binding.kind);
+        Require(test.name, "vertex descriptor kind",
+                type == vk::DescriptorType::eSampledImage ||
+                    type == vk::DescriptorType::eSampler ||
+                    ((binding.kind == Kind::FlattenedSrt ||
+                      binding.kind == Kind::Buffers) &&
+                     type == vk::DescriptorType::eStorageBuffer),
+                "synthetic vertex shader requested an unsupported descriptor kind");
+        const auto count = NativeDescriptorCount(binding);
+        layout_bindings.push_back({ShaderRecompiler::IR::NativeBinding(
+                                       ShaderType::Vertex, binding.kind),
+                                   type, count, vk::ShaderStageFlagBits::eVertex});
+        pool_sizes.push_back({type, count});
+        if (type == vk::DescriptorType::eSampledImage)
+          image_count += binding.resources.size();
+        else if (binding.kind == Kind::Samplers)
+          sampler_count += binding.resources.size();
+        else if (binding.kind == Kind::Buffers)
+          buffer_count += binding.resources.size();
+        else if (binding.kind == Kind::FlattenedSrt)
+          has_mapping = true;
+      }
+      Require(test.name, "vertex descriptor layout",
+              image_count == vertex_fixture->program.info.images.size() &&
+                  sampler_count == vertex_fixture->program.info.samplers.size() &&
+                  buffer_count == vertex_fixture->program.info.buffers.size() &&
+                  has_mapping,
+              "wide image fixture did not allocate every descriptor");
+      vertex_mapping_buffer = CreateStorageBuffer(
+          test.name, vertex_fixture->resources.flattened_srt,
+          vertex_fixture->resources.flattened_srt.size());
+      if (buffer_count != 0) {
+        constexpr std::array<u32, 13> values{
+            1u, 2u, 4u, 8u, 16u, 32u, 64u, 128u, 1u, 2u, 4u, 8u, 240u};
+        Require(test.name, "vertex buffer fixture", buffer_count == values.size(),
+                "synthetic vertex shader must read all thirteen buffers");
+        std::vector<u32> words(buffer_count * 64u, 0u);
+        for (size_t slot = 0; slot < buffer_count; ++slot)
+          words[slot * 64u] = values[slot];
+        vertex_data_buffer = CreateHostBuffer(
+            test.name, words.size() * sizeof(u32),
+            vk::BufferUsageFlagBits::eStorageBuffer, words);
+        buffer_infos.resize(buffer_count);
+        for (size_t slot = 0; slot < buffer_count; ++slot)
+          buffer_infos[slot] = {vertex_data_buffer.buffer,
+                                static_cast<vk::DeviceSize>(slot * 256u),
+                                sizeof(u32)};
+      }
+      vk::DescriptorBufferInfo mapping_info{vertex_mapping_buffer.buffer, 0,
+                                            vertex_mapping_buffer.size};
+      vk::DescriptorSetLayoutCreateInfo layout_info{};
+      layout_info.bindingCount = static_cast<u32>(layout_bindings.size());
+      layout_info.pBindings = layout_bindings.data();
+      RequireVk(test.name, "vertex descriptor layout",
+                m_device.createDescriptorSetLayout(&layout_info, nullptr,
+                                                   &vertex_descriptor_layout),
+                "vkCreateDescriptorSetLayout");
+      vk::DescriptorPoolCreateInfo pool_info{};
+      pool_info.maxSets = 1;
+      pool_info.poolSizeCount = static_cast<u32>(pool_sizes.size());
+      pool_info.pPoolSizes = pool_sizes.data();
+      RequireVk(test.name, "vertex descriptor pool",
+                m_device.createDescriptorPool(&pool_info, nullptr,
+                                              &vertex_descriptor_pool),
+                "vkCreateDescriptorPool");
+      vk::DescriptorSetAllocateInfo allocate{};
+      allocate.descriptorPool = vertex_descriptor_pool;
+      allocate.descriptorSetCount = 1;
+      allocate.pSetLayouts = &vertex_descriptor_layout;
+      RequireVk(test.name, "vertex descriptor set",
+                m_device.allocateDescriptorSets(&allocate,
+                                                &vertex_descriptor_set),
+                "vkAllocateDescriptorSets");
+      image_infos.resize(image_count);
+      sampler_infos.resize(sampler_count);
+      size_t image_offset = 0, sampler_offset = 0;
+      for (const auto &binding : bindings) {
+        const auto type = NativeDescriptorType(binding.kind);
+        if (binding.kind == Kind::FlattenedSrt) {
+          vk::WriteDescriptorSet write{};
+          write.dstSet = vertex_descriptor_set;
+          write.dstBinding = ShaderRecompiler::IR::NativeBinding(
+              ShaderType::Vertex, binding.kind);
+          write.descriptorCount = 1;
+          write.descriptorType = type;
+          write.pBufferInfo = &mapping_info;
+          writes.push_back(write);
+          continue;
+        }
+        if (binding.kind == Kind::Buffers) {
+          vk::WriteDescriptorSet write{};
+          write.dstSet = vertex_descriptor_set;
+          write.dstBinding = ShaderRecompiler::IR::NativeBinding(
+              ShaderType::Vertex, binding.kind);
+          write.descriptorCount = static_cast<u32>(buffer_infos.size());
+          write.descriptorType = type;
+          write.pBufferInfo = buffer_infos.data();
+          writes.push_back(write);
+          continue;
+        }
+        auto *infos = type == vk::DescriptorType::eSampledImage
+                          ? image_infos.data() + image_offset
+                          : sampler_infos.data() + sampler_offset;
+        for (size_t slot = 0; slot < binding.resources.size(); ++slot) {
+          infos[slot].imageView = type == vk::DescriptorType::eSampledImage
+                                      ? vertex_sampled_images.at(binding.resources[slot]).view
+                                      : nullptr;
+          infos[slot].imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal;
+          infos[slot].sampler = type == vk::DescriptorType::eSampler
+                                    ? vertex_sampler : nullptr;
+        }
+        vk::WriteDescriptorSet write{};
+        write.dstSet = vertex_descriptor_set;
+        write.dstBinding = ShaderRecompiler::IR::NativeBinding(
+            ShaderType::Vertex, binding.kind);
+        write.descriptorCount = static_cast<u32>(binding.resources.size());
+        write.descriptorType = type;
+        write.pImageInfo = infos;
+        writes.push_back(write);
+        if (type == vk::DescriptorType::eSampledImage)
+          image_offset += binding.resources.size();
+        else
+          sampler_offset += binding.resources.size();
+      }
+      m_device.updateDescriptorSets(static_cast<u32>(writes.size()),
+                                    writes.data(), 0, nullptr);
+    }
     vk::PushConstantRange push_constant_range{};
+    const auto &vertex_bind = vertex_fixture != nullptr
+                                  ? vertex_fixture->program.bindings
+                                  : fragment_bind;
+    if (vertex_fixture != nullptr && vertex_bind.ShaderDataDwords() != 0) {
+      Require(test.name, "vertex push data",
+              vertex_bind.UsesPushData() &&
+                  vertex_bind.memory_offset_count ==
+                      vertex_fixture->program.info.buffers.size(),
+              "synthetic vertex buffer limits do not fit push constants");
+      push_constant_range.stageFlags |= vk::ShaderStageFlagBits::eVertex;
+      push_constant_range.offset = 0;
+      push_constant_range.size = ShaderRecompiler::IR::NativePushConstantSize;
+    }
     if (fragment_bind.UsesPushData()) {
       Require(test.name, "graphics",
               test.push_constants.size() * sizeof(u32) ==
                   fragment_bind.ShaderDataDwords() * sizeof(u32),
               "fragment push constant data size does not match reflection");
-      push_constant_range.stageFlags = vk::ShaderStageFlagBits::eFragment;
+      push_constant_range.stageFlags |= vk::ShaderStageFlagBits::eFragment;
       push_constant_range.offset = 0;
       push_constant_range.size = ShaderRecompiler::IR::NativePushConstantSize;
     }
@@ -17940,6 +18132,10 @@ void CheckSampledHtileArrayClearDiscovery() {
         push_constant_range.size != 0 ? 1u : 0u;
     pipeline_layout_info.pPushConstantRanges =
         push_constant_range.size != 0 ? &push_constant_range : nullptr;
+    if (vertex_fixture != nullptr) {
+      pipeline_layout_info.setLayoutCount = 1;
+      pipeline_layout_info.pSetLayouts = &vertex_descriptor_layout;
+    }
     vk::PipelineLayout pipeline_layout = nullptr;
     RequireVk(test.name, "graphics",
               m_device.createPipelineLayout(&pipeline_layout_info, nullptr,
@@ -18061,7 +18257,18 @@ void CheckSampledHtileArrayClearDiscovery() {
     rendering.pColorAttachments = &color;
     cmd.beginRendering(rendering);
     cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
-    if (push_constant_range.size != 0) {
+    if (vertex_fixture != nullptr)
+      cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, pipeline_layout,
+                             0, 1, &vertex_descriptor_set, 0, nullptr);
+    if (vertex_fixture != nullptr && vertex_bind.ShaderDataDwords() != 0) {
+      ShaderRecompiler::IR::PushData push_data;
+      for (u32 slot = 0; slot < vertex_bind.memory_offset_count; ++slot)
+        push_data.dwords[vertex_bind.push_data_start_dword +
+                         vertex_bind.memory_limit_dword + slot] = sizeof(u32);
+      cmd.pushConstants(pipeline_layout, vk::ShaderStageFlagBits::eVertex, 0,
+                        sizeof(push_data), push_data.dwords.data());
+    }
+    if (fragment_bind.UsesPushData()) {
       ShaderRecompiler::IR::PushData push_data;
       std::copy(test.push_constants.begin(), test.push_constants.end(),
                 push_data.dwords.begin() + fragment_bind.push_data_start_dword);
@@ -18085,6 +18292,16 @@ void CheckSampledHtileArrayClearDiscovery() {
 
     m_device.destroyPipeline(pipeline, nullptr);
     m_device.destroyPipelineLayout(pipeline_layout, nullptr);
+    if (vertex_descriptor_pool != nullptr)
+      m_device.destroyDescriptorPool(vertex_descriptor_pool, nullptr);
+    if (vertex_descriptor_layout != nullptr)
+      m_device.destroyDescriptorSetLayout(vertex_descriptor_layout, nullptr);
+    if (vertex_sampler != nullptr)
+      m_device.destroySampler(vertex_sampler, nullptr);
+    DestroyBuffer(&vertex_mapping_buffer);
+    DestroyBuffer(&vertex_data_buffer);
+    for (auto &image : vertex_sampled_images)
+      DestroyImage(&image);
     m_device.destroyShaderModule(fragment_module, nullptr);
     m_device.destroyShaderModule(vertex_module, nullptr);
     DestroyBuffer(&vertex_buffer);
@@ -19424,6 +19641,8 @@ private:
             "vertex layer output is not supported");
     Require("VulkanHarness", "graphics", available_features.fillModeNonSolid &&
                 available_features.tessellationShader &&
+                available_features.shaderClipDistance &&
+                available_features.vertexPipelineStoresAndAtomics &&
                 available_depth_clip.depthClipEnable && available_clip_control.depthClipControl &&
                 available_color_write.colorWriteEnable &&
                 available_feedback_layout.attachmentFeedbackLoopLayout &&
@@ -19491,6 +19710,8 @@ private:
     device_features.shaderFloat64 = available_features.shaderFloat64;
     device_features.fillModeNonSolid = true;
     device_features.tessellationShader = true;
+    device_features.shaderClipDistance = true;
+    device_features.vertexPipelineStoresAndAtomics = true;
     device_features.shaderFloat64 = available_features.shaderFloat64;
     device_info.pEnabledFeatures = &device_features;
     std::vector<const char *> device_extensions = {
@@ -20126,9 +20347,10 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
   std::printf("[compute] %-32s ok\n", test.name);
 }
 
-void RunGraphicsCase(VulkanHarness *vulkan, const GraphicsCase &test) {
+void RunGraphicsCase(VulkanHarness *vulkan, const GraphicsCase &test,
+                     const CompiledShader *vertex_fixture = nullptr) {
   auto compiled = CompileFragmentCase(test);
-  auto actual = vulkan->RenderFragment(test, compiled);
+  auto actual = vulkan->RenderFragment(test, compiled, vertex_fixture);
   CompareGraphicsWords(test, actual);
   std::printf("[graphics] %-31s ok\n", test.name);
 }
@@ -36266,25 +36488,165 @@ TestCase Images65FromSrtWithDistinctSamplerOrigins() {
 void CheckIndirectImageKeySwitch(
     Prospero::TextureNumericClass candidate_numeric_class =
         Prospero::TextureNumericClass::Float,
-    const char *name = "IndirectImageKeySwitch", bool wide = false) {
+    const char *name = "IndirectImageKeySwitch", bool wide = false,
+    bool vertex = false, CompiledShader *vertex_result = nullptr,
+    bool vertex_loop = false, bool vertex_buffers = false,
+    bool vertex_wave64 = false, bool vertex_subgroup = false,
+    bool vertex_cross_lane = false) {
   constexpr uint32_t mapping_capacity = 1793u;
   using namespace ShaderRecompiler::IR;
 
   Program program{};
-  program.stage = ShaderType::Compute;
-  program.wave_size = 32;
+  program.stage = vertex ? ShaderType::Vertex : ShaderType::Compute;
+  program.wave_size = vertex_wave64 ? 64u : 32u;
   program.srt_plan_complete = true;
   program.resource_tracking_complete = true;
-  program.shader_info_complete = true;
+  program.shader_info_complete = !vertex;
   program.block_storage.push_back(std::make_unique<Block>());
   auto *block = program.block_storage.back().get();
   program.blocks.push_back(block);
   program.block_info.push_back({.id = 0});
+  Block *loop_header = nullptr;
+  Block *loop_body = nullptr;
+  Inst *loop_color = nullptr;
 
-  auto &key = block->AppendNewInst(ValueOpcode::LaneId);
+  auto &index = vertex
+      ? block->AppendNewInst(ValueOpcode::GetBuiltin,
+                             {Value(static_cast<u32>(StageInputKind::VertexIndex)), Value(0u)})
+      : block->AppendNewInst(ValueOpcode::LaneId);
+  auto &triangle = vertex
+      ? block->AppendNewInst(ValueOpcode::UDiv32,
+                             {Value(&index), Value(3u)})
+      : index;
+  auto &key = vertex
+      ? block->AppendNewInst(ValueOpcode::BitwiseAnd32,
+                             {Value(&triangle), Value(255u)})
+      : index;
+  if (vertex_loop) {
+    Require(name, "vertex loop fixture", vertex,
+            "bounded image loop requires a vertex shader");
+    auto &initial_color = block->AppendNewInst(
+        ValueOpcode::CompositeConstructU32x4,
+        {Value(0u), Value(0u), Value(0u), Value(0u)});
+    program.block_storage.push_back(std::make_unique<Block>());
+    loop_header = program.block_storage.back().get();
+    program.block_storage.push_back(std::make_unique<Block>());
+    loop_body = program.block_storage.back().get();
+    program.block_storage.push_back(std::make_unique<Block>());
+    auto *loop_exit = program.block_storage.back().get();
+    program.blocks.insert(program.blocks.end(), {loop_header, loop_body, loop_exit});
+    for (u32 id = 1u; id <= 3u; ++id)
+      program.block_info.push_back({.id = id});
+    block->AddBranch(loop_header);
+    program.block_info[0].terminator.kind = ShaderRecompiler::CFG::TerminatorKind::Branch;
+    program.block_info[0].terminator.true_block = 1u;
+    auto &counter = loop_header->AppendNewInst(
+        ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+    auto &color = loop_header->AppendNewInst(
+        ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32x4));
+    loop_color = &color;
+    auto &within = loop_header->AppendNewInst(
+        ValueOpcode::ULessThan32, {Value(&counter), Value(2u)});
+    loop_header->AddBranch(loop_body);
+    loop_header->AddBranch(loop_exit);
+    auto &header_term = program.block_info[1].terminator;
+    header_term.kind = ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch;
+    header_term.true_block = 2u;
+    header_term.false_block = 3u;
+    header_term.loop_header = true;
+    header_term.merge_block = 3u;
+    header_term.continue_block = 2u;
+    program.block_info[1].condition = Value(&within);
+    auto &next = loop_body->AppendNewInst(
+        ValueOpcode::IAdd32, {Value(&counter), Value(1u)});
+    counter.AddPhiOperand(block, Value(0u));
+    counter.AddPhiOperand(loop_body, Value(&next));
+    color.AddPhiOperand(block, Value(&initial_color));
+    loop_body->AddBranch(loop_header);
+    program.block_info[2].terminator.kind = ShaderRecompiler::CFG::TerminatorKind::Branch;
+    program.block_info[2].terminator.true_block = 1u;
+    block = loop_body;
+  }
+  Value image_key(&key);
+  if (vertex_buffers) {
+    Require(name, "vertex buffer fixture", vertex_loop,
+            "the multi-buffer case must exercise the bounded vertex loop");
+    for (u32 resource = 0u; resource < 13u; ++resource) {
+      BufferResource info{};
+      info.source = resource + 2u;
+      info.read = true;
+      info.max_byte_extent = sizeof(u32);
+      program.info.buffers.push_back(info);
+      auto &handle = block->AppendNewInst(
+          ValueOpcode::GetBufferResource,
+          {Value(resource), Value(0u), Value(4u), Value(0u)});
+      MemoryInfo buffer_memory{};
+      buffer_memory.kind = ResourceKind::Buffer;
+      buffer_memory.resource = resource;
+      program.memory_info.push_back(buffer_memory);
+      auto &word = block->AppendNewInst(
+          ValueOpcode::LoadBufferU32,
+          {Value(&handle), Value(0u), Value(0u), Value(0u), Value(true)},
+          static_cast<uint64_t>(program.memory_info.size() - 1u));
+      auto &mixed = block->AppendNewInst(
+          ValueOpcode::BitwiseXor32, {image_key, Value(&word)});
+      image_key = Value(&mixed);
+    }
+  }
+  if (vertex_subgroup) {
+    Require(name, "vertex subgroup fixture", vertex_wave64,
+            "subgroup image selection requires the wave64 control");
+    auto &lane = block->AppendNewInst(ValueOpcode::LaneId);
+    if (vertex_cross_lane) {
+      auto &active_mask = block->AppendNewInst(
+          ValueOpcode::Ballot, {Value(true)});
+      auto &active_low = block->AppendNewInst(
+          ValueOpcode::CompositeExtractU32x4,
+          {Value(&active_mask), Value(0u)});
+      auto &active_high = block->AppendNewInst(
+          ValueOpcode::CompositeExtractU32x4,
+          {Value(&active_mask), Value(1u)});
+      auto &has_low = block->AppendNewInst(
+          ValueOpcode::INotEqual32, {Value(&active_low), Value(0u)});
+      auto &first_low = block->AppendNewInst(
+          ValueOpcode::FindILsb32, {Value(&active_low)});
+      auto &first_high = block->AppendNewInst(
+          ValueOpcode::FindILsb32, {Value(&active_high)});
+      auto &high_lane = block->AppendNewInst(
+          ValueOpcode::IAdd32, {Value(&first_high), Value(32u)});
+      auto &target_lane = block->AppendNewInst(
+          ValueOpcode::SelectU32,
+          {Value(&has_low), Value(&first_low), Value(&high_lane)});
+      auto &selected_lane = block->AppendNewInst(
+          ValueOpcode::ReadLane, {Value(&lane), Value(&target_lane)});
+      auto &difference = block->AppendNewInst(
+          ValueOpcode::BitwiseXor32,
+          {Value(&selected_lane), Value(&target_lane)});
+      auto &cross_key = block->AppendNewInst(
+          ValueOpcode::BitwiseXor32, {image_key, Value(&difference)});
+      image_key = Value(&cross_key);
+    }
+    auto &self = block->AppendNewInst(
+        ValueOpcode::ReadLane, {image_key, Value(&lane)});
+    auto &valid = block->AppendNewInst(
+        ValueOpcode::ULessThanEqual32, {Value(&self), Value(250u)});
+    auto &mask = block->AppendNewInst(ValueOpcode::Ballot, {Value(&valid)});
+    auto &low = block->AppendNewInst(
+        ValueOpcode::CompositeExtractU32x4, {Value(&mask), Value(0u)});
+    auto &high = block->AppendNewInst(
+        ValueOpcode::CompositeExtractU32x4, {Value(&mask), Value(1u)});
+    auto &active = block->AppendNewInst(
+        ValueOpcode::BitwiseOr32, {Value(&low), Value(&high)});
+    auto &has_valid = block->AppendNewInst(
+        ValueOpcode::INotEqual32, {Value(&active), Value(0u)});
+    auto &selected = block->AppendNewInst(
+        ValueOpcode::SelectU32,
+        {Value(&has_valid), Value(&self), Value(0u)});
+    image_key = Value(&selected);
+  }
   auto &image =
       block->AppendNewInst(ValueOpcode::GetImageResource,
-                           {Value(&key), Value(0u), Value(0u), Value(0u),
+                           {image_key, Value(0u), Value(0u), Value(0u),
                             Value(0u), Value(0u), Value(0u), Value(0u)});
   image.SetFlags<uint32_t>(0u);
   auto &sampler =
@@ -36305,21 +36667,51 @@ void CheckIndirectImageKeySwitch(
   memory.image_dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
   memory.image_address_components = 3;
   program.memory_info.push_back(memory);
-  const MemoryFlags memory_flags{0u, 0x10f0u};
+  const MemoryFlags memory_flags{static_cast<u32>(program.memory_info.size() - 1u),
+                                 0x10f0u};
   uint64_t memory_flag_bits = 0;
   std::memcpy(&memory_flag_bits, &memory_flags, sizeof(memory_flags));
   auto &sample = block->AppendNewInst(
       ValueOpcode::ImageSampleRaw,
       {Value(&image), Value(&sampler), Value(&address)}, memory_flag_bits);
-  auto &sample_x = block->AppendNewInst(ValueOpcode::CompositeExtractU32x4,
-                                        {Value(&sample), Value(0u)});
-  block->AppendNewInst(ValueOpcode::ReferenceU32, {Value(&sample_x)});
+  if (vertex_loop) {
+    loop_color->AddPhiOperand(loop_body, Value(&sample));
+    block = program.blocks[3];
+  }
+  if (vertex) {
+    auto &x = block->AppendNewInst(ValueOpcode::GetAttribute,
+                                   {Value(0u), Value(0u)});
+    auto &y = block->AppendNewInst(ValueOpcode::GetAttribute,
+                                   {Value(0u), Value(1u)});
+    auto &position = block->AppendNewInst(
+        ValueOpcode::CompositeConstructU32x4,
+        {Value(&x), Value(&y), Value(0u), Value(std::bit_cast<u32>(1.0f))});
+    program.export_info.push_back({.kind = ExportTargetKind::Position,
+                                   .target = 0xcu, .index = 0u, .en = 0xfu});
+    program.export_info.push_back({.kind = ExportTargetKind::Parameter,
+                                   .target = 0x20u, .index = 0u, .en = 0xfu});
+    auto &position_export = block->AppendNewInst(
+        ValueOpcode::SetAttribute, {Value(&position), Value(true)});
+    position_export.SetFlags<ExportFlags>({.index = 0u});
+    auto &color_export = block->AppendNewInst(
+        ValueOpcode::SetAttribute,
+        {vertex_loop ? Value(loop_color) : Value(&sample), Value(true)});
+    color_export.SetFlags<ExportFlags>({.index = 1u});
+  } else {
+    auto &sample_x = block->AppendNewInst(ValueOpcode::CompositeExtractU32x4,
+                                          {Value(&sample), Value(0u)});
+    block->AppendNewInst(ValueOpcode::ReferenceU32, {Value(&sample_x)});
+  }
 
-  program.descriptor_sources.resize(2);
+  program.descriptor_sources.resize(vertex_buffers ? 15u : 2u);
   program.descriptor_sources[0].dword_count = 8;
   program.descriptor_sources[0].indirect_image =
       DescriptorSource::IndirectImage{0u, 0u, 224u, 12u, 0u};
   program.descriptor_sources[1].dword_count = 4;
+  if (vertex_buffers) {
+    for (u32 resource = 0u; resource < 13u; ++resource)
+      program.descriptor_sources[resource + 2u].dword_count = 4u;
+  }
 
   ImageResource root{};
   root.source = 0;
@@ -36360,6 +36752,12 @@ void CheckIndirectImageKeySwitch(
     program.info.sampled_pairs.push_back({1u, 1u, 0x10f0u});
   }
 
+  ShaderVertexInputInfo vertex_info{};
+  if (vertex) {
+    vertex_info.resources_num = 1;
+    vertex_info.wave_size = program.wave_size;
+    CollectShaderInfo(program, {.vertex = &vertex_info});
+  }
   AllocateBindings(program);
   const auto root_binding = DescriptorBindingForImage(root);
   const auto candidate_binding = DescriptorBindingForImage(candidate);
@@ -36384,8 +36782,10 @@ void CheckIndirectImageKeySwitch(
   }
   specialization.sampler_depth_compare_funcs.resize(program.info.samplers.size());
   ShaderComputeInputInfo compute{};
-  auto spirv = ShaderRecompiler::Spirv::EmitProgram(program,
-                                                    {.compute = &compute});
+  ShaderStageInputInfo input_info{};
+  if (vertex) input_info.vertex = &vertex_info;
+  else input_info.compute = &compute;
+  auto spirv = ShaderRecompiler::Spirv::EmitProgram(program, input_info);
   ValidateSpirv(name, spirv);
   if (mixed_numeric) {
     // The dynamic switch samples both the Float root and an integer candidate.
@@ -36450,8 +36850,19 @@ void CheckIndirectImageKeySwitch(
     Require(name, "wide indirect image switch",
             CountText(text, "OpSwitch") == 1u &&
                 CountText(text, "OpImageSampleExplicitLod") == 251u &&
-                CountText(text, "OpSampledImage ") == 251u,
+                CountText(text, "OpSampledImage ") == 251u &&
+                (!vertex_loop || CountText(text, "OpLoopMerge") == 1u),
             "wide image table did not preserve every typed candidate");
+    if (vertex_result != nullptr) {
+      *vertex_result = {std::move(spirv), std::move(program), {}, {}, 1u};
+      auto &mapping = vertex_result->resources.flattened_srt;
+      mapping.resize(1u + 250u * 2u);
+      mapping[0] = 250u;
+      for (u32 index = 1u; index <= 250u; ++index) {
+        mapping[1u + (index - 1u) * 2u] = index;
+        mapping[2u + (index - 1u) * 2u] = index;
+      }
+    }
     return;
   }
   Require(name, "key switch",
@@ -45319,6 +45730,89 @@ if (argc == 1) {
   if (argc == 2 && std::strcmp(argv[1], "--wide-indirect-image-spirv-only") == 0) {
     CheckIndirectImageKeySwitch(Prospero::TextureNumericClass::Float,
                                 "WideIndirectImageKeySwitch", true);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--wide-indirect-image-vertex-spirv-only") == 0) {
+    CheckIndirectImageKeySwitch(Prospero::TextureNumericClass::Float,
+                                "WideIndirectImageVertexSwitch", true, true);
+    return 0;
+  }
+  if (argc == 2 &&
+      (std::strcmp(argv[1], "--wide-vertex-indexed-small-only") == 0 ||
+       std::strcmp(argv[1], "--wide-vertex-loop-indexed-753-only") == 0 ||
+       std::strcmp(argv[1], "--wide-vertex-loop-indexed-120000-only") == 0 ||
+       std::strcmp(argv[1], "--wide-vertex-loop-buffers-indexed-753-only") == 0 ||
+       std::strcmp(argv[1], "--wide-vertex-loop-buffers-indexed-120000-only") == 0 ||
+       std::strcmp(argv[1], "--wide-vertex-wave64-loop-buffers-indexed-753-only") == 0 ||
+       std::strcmp(argv[1], "--wide-vertex-wave64-loop-buffers-indexed-120000-only") == 0 ||
+       std::strcmp(argv[1], "--wide-vertex-wave64-subgroup-buffers-indexed-753-only") == 0 ||
+       std::strcmp(argv[1], "--wide-vertex-wave64-subgroup-buffers-indexed-120000-only") == 0 ||
+       std::strcmp(argv[1], "--wide-vertex-wave64-cross-lane-buffers-indexed-96-only") == 0 ||
+       std::strcmp(argv[1], "--wide-vertex-wave64-cross-lane-buffers-indexed-120000-only") == 0 ||
+       std::strcmp(argv[1], "--wide-vertex-indexed-300-only") == 0 ||
+       std::strcmp(argv[1], "--wide-vertex-indexed-753-only") == 0 ||
+       std::strcmp(argv[1], "--wide-vertex-indexed-756-only") == 0 ||
+       std::strcmp(argv[1], "--wide-vertex-indexed-3000-only") == 0 ||
+       std::strcmp(argv[1], "--wide-vertex-indexed-12000-only") == 0 ||
+       std::strcmp(argv[1], "--wide-vertex-indexed-120000-only") == 0)) {
+    const u32 index_count = std::strcmp(argv[1], "--wide-vertex-indexed-small-only") == 0
+                                ? 3u
+                            : std::strcmp(argv[1], "--wide-vertex-wave64-cross-lane-buffers-indexed-96-only") == 0
+                                ? 96u
+                            : std::strcmp(argv[1], "--wide-vertex-loop-indexed-753-only") == 0
+                                ? 753u
+                            : std::strcmp(argv[1], "--wide-vertex-loop-buffers-indexed-753-only") == 0
+                                ? 753u
+                            : std::strcmp(argv[1], "--wide-vertex-wave64-loop-buffers-indexed-753-only") == 0
+                                ? 753u
+                            : std::strcmp(argv[1], "--wide-vertex-wave64-subgroup-buffers-indexed-753-only") == 0
+                                ? 753u
+                            : std::strcmp(argv[1], "--wide-vertex-loop-indexed-120000-only") == 0
+                                ? 120000u
+                            : std::strcmp(argv[1], "--wide-vertex-loop-buffers-indexed-120000-only") == 0
+                                ? 120000u
+                            : std::strcmp(argv[1], "--wide-vertex-wave64-loop-buffers-indexed-120000-only") == 0
+                                ? 120000u
+                            : std::strcmp(argv[1], "--wide-vertex-wave64-subgroup-buffers-indexed-120000-only") == 0
+                                ? 120000u
+                            : std::strcmp(argv[1], "--wide-vertex-indexed-300-only") == 0
+                                ? 300u
+                            : std::strcmp(argv[1], "--wide-vertex-indexed-753-only") == 0
+                                ? 753u
+                            : std::strcmp(argv[1], "--wide-vertex-indexed-756-only") == 0
+                                ? 756u
+                            : std::strcmp(argv[1], "--wide-vertex-indexed-3000-only") == 0
+                                ? 3000u
+                            : std::strcmp(argv[1], "--wide-vertex-indexed-12000-only") == 0
+                                ? 12000u : 120000u;
+    CompiledShader vertex;
+    const bool vertex_wave64 =
+        std::strncmp(argv[1], "--wide-vertex-wave64-", 21u) == 0;
+    const bool vertex_loop = vertex_wave64 ||
+        std::strncmp(argv[1], "--wide-vertex-loop-", 19u) == 0;
+    const bool vertex_buffers =
+        vertex_wave64 ||
+        std::strncmp(argv[1], "--wide-vertex-loop-buffers-", 27u) == 0;
+    const bool vertex_subgroup =
+        std::strncmp(argv[1], "--wide-vertex-wave64-subgroup-", 30u) == 0 ||
+        std::strncmp(argv[1], "--wide-vertex-wave64-cross-lane-", 32u) == 0;
+    const bool vertex_cross_lane =
+        std::strncmp(argv[1], "--wide-vertex-wave64-cross-lane-", 32u) == 0;
+    CheckIndirectImageKeySwitch(Prospero::TextureNumericClass::Float,
+                                "WideIndirectImageVertexSwitch", true, true, &vertex,
+                                vertex_loop, vertex_buffers, vertex_wave64,
+                                vertex_subgroup, vertex_cross_lane);
+    auto test = GraphicsInterpolationExport();
+    test.name = "WideVertexIndexedSample";
+    test.index_count = index_count;
+    test.unique_vertex_count = index_count;
+    const u32 last_key = ((index_count / 3u) - 1u) & 255u;
+    const u32 selected_image = last_key <= 250u ? last_key : 0u;
+    test.expected_pixel = {std::bit_cast<u32>(1.0f + static_cast<float>(selected_image) / 256.0f),
+                           std::bit_cast<u32>(0.5f),
+                           std::bit_cast<u32>(0.75f), std::bit_cast<u32>(1.0f)};
+    VulkanHarness vulkan;
+    RunGraphicsCase(&vulkan, test, &vertex);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--wide-indirect-image-table-compile-only") == 0) {

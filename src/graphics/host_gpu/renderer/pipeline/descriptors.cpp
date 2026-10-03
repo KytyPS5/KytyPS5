@@ -807,6 +807,8 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.gds = {nullptr, 0, VK_WHOLE_SIZE};
 	prepared.flattened_srt = {};
 	prepared.shader_data_buffer = {};
+	prepared.buffer_sources.clear();
+	prepared.buffers.clear();
 	prepared.shared_memory = {};
 	prepared.images.resize(program.info.images.size());
 	prepared.samplers.clear();

@@ -4,6 +4,9 @@
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
 
+#include <cinttypes>
+#include <cstring>
+
 namespace Libs {
 
 namespace LibGen5 {
@@ -63,8 +66,49 @@ static KYTY_SYSV_ABI int VideoOutVrrStatus_kP2L8t3j_aM() {
 	return OK;
 }
 
+static KYTY_SYSV_ABI int VideoOutVrrStatus_LibwuIonIBw(LibKernel::EventQueue::KernelEqueue eq,
+                                                       int handle, void* udata) {
+	PRINT_NAME();
+
+	LOGF("\t eq     = 0x%016" PRIx64 "\n", static_cast<uint64_t>(eq));
+	LOGF("\t handle = %d\n", handle);
+	LOGF("\t udata  = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(udata));
+
+	return OK;
+}
+
+static KYTY_SYSV_ABI int VideoOutVrrStatus__q_vbO859Tw(LibKernel::EventQueue::KernelEqueue eq,
+                                                       int                                 handle) {
+	PRINT_NAME();
+
+	LOGF("\t eq     = 0x%016" PRIx64 "\n", static_cast<uint64_t>(eq));
+	LOGF("\t handle = %d\n", handle);
+
+	return OK;
+}
+
+static KYTY_SYSV_ABI int VideoOutVrrStatus_gWT7X8H0bYs(int handle, void* status) {
+	PRINT_NAME();
+
+	LOGF("\t handle = %d\n", handle);
+	LOGF("\t status = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(status));
+
+	if (status == nullptr) {
+		return VideoOut::VIDEO_OUT_ERROR_INVALID_ADDRESS;
+	}
+
+	// Flags bit 4 stays clear (VRR off), so the guest skips the VRR range at +0x30.
+	memset(status, 0, 0x38);
+
+	return VideoOut::VideoOutGetOutputStatus(handle,
+	                                         static_cast<VideoOut::VideoOutOutputStatus*>(status));
+}
+
 LIB_DEFINE(InitVideoOutVrrStatus_1) {
 	LIB_FUNC("kP2L8t3j-aM", VideoOutVrrStatus_kP2L8t3j_aM);
+	LIB_FUNC("LibwuIonIBw", VideoOutVrrStatus_LibwuIonIBw);
+	LIB_FUNC("-q-vbO859Tw", VideoOutVrrStatus__q_vbO859Tw);
+	LIB_FUNC("gWT7X8H0bYs", VideoOutVrrStatus_gWT7X8H0bYs);
 }
 
 } // namespace LibGen5::VrrStatus

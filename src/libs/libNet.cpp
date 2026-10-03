@@ -1670,6 +1670,7 @@ LIB_VERSION("NpEntitlementAccess", 1, "NpEntitlementAccess", 1, 1);
 constexpr int      NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER      = -2122514430; /* 0x817D0002 */
 constexpr int      NP_ENTITLEMENT_ACCESS_ERROR_NO_ENTITLEMENT = -2122514425; /* 0x817D0007 */
 constexpr uint32_t NP_ENTITLEMENT_ACCESS_SKU_FLAG_FULL        = 3;
+constexpr uint32_t NP_ENTITLEMENT_ACCESS_GAME_TRIALS_FLAG_OFF = 0;
 
 struct NpEntitlementAccessInitParam {
 	char reserved[32];
@@ -1693,6 +1694,47 @@ struct NpEntitlementAccessAddcontEntitlementInfo {
 struct NpEntitlementAccessEntitlementKey {
 	uint8_t data[16];
 };
+
+struct NpEntitlementAccessTransactionId {
+	char data[72];
+};
+
+static std::mutex                 g_np_entitlement_request_mutex;
+static int64_t                    g_np_entitlement_next_request_id  = 1;
+static uint64_t                   g_np_entitlement_next_transaction = 1;
+static std::map<int64_t, int32_t> g_np_entitlement_requests;
+
+static int np_entitlement_create_request(int32_t result, int64_t* request_id) {
+	if (request_id == nullptr) {
+		return NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER;
+	}
+
+	std::scoped_lock lock(g_np_entitlement_request_mutex);
+
+	const int64_t id              = g_np_entitlement_next_request_id++;
+	g_np_entitlement_requests[id] = result;
+	*request_id                   = id;
+
+	LOGF("\t request_id = %" PRId64 "\n", id);
+
+	return 0;
+}
+
+static int np_entitlement_poll_request(int64_t request_id, int32_t* result) {
+	if (result == nullptr) {
+		return NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER;
+	}
+
+	std::scoped_lock lock(g_np_entitlement_request_mutex);
+
+	auto it = g_np_entitlement_requests.find(request_id);
+	if (it == g_np_entitlement_requests.end()) {
+		return NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER;
+	}
+
+	*result = it->second;
+	return 0;
+}
 
 static constexpr NpEntitlementAccessAddcontEntitlementInfo NP_ENTITLEMENT_ACCESS_ADDON_LIST[] = {
     {{{"85y-je"}, {}}, 3, 4}, // GTA V hash 0xf4315381
@@ -1721,6 +1763,218 @@ static int KYTY_SYSV_ABI NpEntitlementAccessGetSkuFlag(uint32_t* sku_flag) {
 	}
 
 	*sku_flag = NP_ENTITLEMENT_ACCESS_SKU_FLAG_FULL;
+	return 0;
+}
+
+static int KYTY_SYSV_ABI NpEntitlementAccessGetGameTrialsFlag(uint32_t* flag) {
+	PRINT_NAME();
+
+	LOGF("\t flag = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(flag));
+
+	if (flag == nullptr) {
+		return NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER;
+	}
+
+	*flag = NP_ENTITLEMENT_ACCESS_GAME_TRIALS_FLAG_OFF;
+	return 0;
+}
+
+static int KYTY_SYSV_ABI
+NpEntitlementAccessGenerateTransactionId(NpEntitlementAccessTransactionId* transaction_id) {
+	PRINT_NAME();
+
+	LOGF("\t transaction_id = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(transaction_id));
+
+	if (transaction_id == nullptr) {
+		return NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER;
+	}
+
+	uint64_t serial = 0;
+	{
+		std::scoped_lock lock(g_np_entitlement_request_mutex);
+		serial = g_np_entitlement_next_transaction++;
+	}
+
+	memset(transaction_id, 0, sizeof(*transaction_id));
+	std::snprintf(transaction_id->data, sizeof(transaction_id->data), "6b797479%024" PRIx64,
+	              serial);
+
+	LOGF("\t id = %s\n", transaction_id->data);
+
+	return 0;
+}
+
+static int KYTY_SYSV_ABI NpEntitlementAccessRequestUnifiedEntitlementInfoList(
+    int32_t user_id, uint32_t service_label, const void* arg2, uint64_t arg3, const void* param,
+    int64_t* request_id) {
+	PRINT_NAME();
+
+	LOGF("\t user_id       = %" PRId32 "\n", user_id);
+	LOGF("\t service_label = %" PRIu32 "\n", service_label);
+	LOGF("\t arg2          = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(arg2));
+	LOGF("\t arg3          = 0x%016" PRIx64 "\n", arg3);
+	LOGF("\t param         = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(param));
+	LOGF("\t request_id    = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(request_id));
+
+	return np_entitlement_create_request(0, request_id);
+}
+
+static int KYTY_SYSV_ABI NpEntitlementAccessRequestServiceEntitlementInfoList(
+    int32_t user_id, uint32_t service_label, const void* arg2, uint64_t arg3, const void* param,
+    int64_t* request_id) {
+	PRINT_NAME();
+
+	LOGF("\t user_id       = %" PRId32 "\n", user_id);
+	LOGF("\t service_label = %" PRIu32 "\n", service_label);
+	LOGF("\t arg2          = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(arg2));
+	LOGF("\t arg3          = 0x%016" PRIx64 "\n", arg3);
+	LOGF("\t param         = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(param));
+	LOGF("\t request_id    = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(request_id));
+
+	return np_entitlement_create_request(0, request_id);
+}
+
+static int KYTY_SYSV_ABI NpEntitlementAccessRequestUnifiedEntitlementInfo(
+    int32_t user_id, uint32_t service_label, const NpUnifiedEntitlementLabel* entitlement_label,
+    int64_t* request_id) {
+	PRINT_NAME();
+
+	LOGF("\t user_id           = %" PRId32 "\n", user_id);
+	LOGF("\t service_label     = %" PRIu32 "\n", service_label);
+	LOGF("\t entitlement_label = %.17s\n",
+	     entitlement_label != nullptr ? entitlement_label->data : "(null)");
+	LOGF("\t request_id        = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(request_id));
+
+	if (entitlement_label == nullptr) {
+		return NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER;
+	}
+
+	return np_entitlement_create_request(NP_ENTITLEMENT_ACCESS_ERROR_NO_ENTITLEMENT, request_id);
+}
+
+static int KYTY_SYSV_ABI NpEntitlementAccessRequestConsumeUnifiedEntitlement(
+    int32_t user_id, uint32_t service_label, const NpUnifiedEntitlementLabel* entitlement_label,
+    const NpEntitlementAccessTransactionId* transaction_id, uint32_t use_count,
+    int64_t* request_id) {
+	PRINT_NAME();
+
+	LOGF("\t user_id           = %" PRId32 "\n", user_id);
+	LOGF("\t service_label     = %" PRIu32 "\n", service_label);
+	LOGF("\t entitlement_label = %.17s\n",
+	     entitlement_label != nullptr ? entitlement_label->data : "(null)");
+	LOGF("\t transaction_id    = %.72s\n",
+	     transaction_id != nullptr ? transaction_id->data : "(null)");
+	LOGF("\t use_count         = %" PRIu32 "\n", use_count);
+	LOGF("\t request_id        = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(request_id));
+
+	if (entitlement_label == nullptr || transaction_id == nullptr) {
+		return NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER;
+	}
+
+	return np_entitlement_create_request(NP_ENTITLEMENT_ACCESS_ERROR_NO_ENTITLEMENT, request_id);
+}
+
+static int np_entitlement_poll_list(int64_t request_id, int32_t* result, void* list,
+                                    uint32_t list_num, uint32_t* hit_num, uint32_t* arg5,
+                                    uint32_t* arg6) {
+	LOGF("\t request_id = %" PRId64 "\n", request_id);
+	LOGF("\t result     = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(result));
+	LOGF("\t list       = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(list));
+	LOGF("\t list_num   = %" PRIu32 "\n", list_num);
+	LOGF("\t hit_num    = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(hit_num));
+	LOGF("\t arg5       = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(arg5));
+	LOGF("\t arg6       = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(arg6));
+
+	if (int ret = np_entitlement_poll_request(request_id, result); ret != 0) {
+		return ret;
+	}
+
+	if (hit_num != nullptr) {
+		*hit_num = 0;
+	}
+	if (arg5 != nullptr) {
+		*arg5 = 0;
+	}
+	if (arg6 != nullptr) {
+		*arg6 = 0;
+	}
+
+	return 0;
+}
+
+static int KYTY_SYSV_ABI NpEntitlementAccessPollUnifiedEntitlementInfoList(
+    int64_t request_id, int32_t* result, void* list, uint32_t list_num, uint32_t* hit_num,
+    uint32_t* arg5, uint32_t* arg6) {
+	PRINT_NAME();
+
+	return np_entitlement_poll_list(request_id, result, list, list_num, hit_num, arg5, arg6);
+}
+
+static int KYTY_SYSV_ABI NpEntitlementAccessPollServiceEntitlementInfoList(
+    int64_t request_id, int32_t* result, void* list, uint32_t list_num, uint32_t* hit_num,
+    uint32_t* arg5, uint32_t* arg6) {
+	PRINT_NAME();
+
+	return np_entitlement_poll_list(request_id, result, list, list_num, hit_num, arg5, arg6);
+}
+
+static int KYTY_SYSV_ABI NpEntitlementAccessPollUnifiedEntitlementInfo(int64_t  request_id,
+                                                                       int32_t* result,
+                                                                       void*    info) {
+	PRINT_NAME();
+
+	LOGF("\t request_id = %" PRId64 "\n", request_id);
+	LOGF("\t result     = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(result));
+	LOGF("\t info       = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(info));
+
+	return np_entitlement_poll_request(request_id, result);
+}
+
+static int KYTY_SYSV_ABI NpEntitlementAccessPollConsumeEntitlement(int64_t   request_id,
+                                                                   int32_t*  result,
+                                                                   uint32_t* use_limit) {
+	PRINT_NAME();
+
+	LOGF("\t request_id = %" PRId64 "\n", request_id);
+	LOGF("\t result     = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(result));
+	LOGF("\t use_limit  = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(use_limit));
+
+	if (int ret = np_entitlement_poll_request(request_id, result); ret != 0) {
+		return ret;
+	}
+
+	if (use_limit != nullptr) {
+		*use_limit = 0;
+	}
+
+	return 0;
+}
+
+static int KYTY_SYSV_ABI NpEntitlementAccessAbortRequest(int64_t request_id) {
+	PRINT_NAME();
+
+	LOGF("\t request_id = %" PRId64 "\n", request_id);
+
+	std::scoped_lock lock(g_np_entitlement_request_mutex);
+
+	if (g_np_entitlement_requests.find(request_id) == g_np_entitlement_requests.end()) {
+		return NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER;
+	}
+
+	return 0;
+}
+
+static int KYTY_SYSV_ABI NpEntitlementAccessDeleteRequest(int64_t request_id) {
+	PRINT_NAME();
+
+	LOGF("\t request_id = %" PRId64 "\n", request_id);
+
+	std::scoped_lock lock(g_np_entitlement_request_mutex);
+
+	if (g_np_entitlement_requests.erase(request_id) == 0) {
+		return NP_ENTITLEMENT_ACCESS_ERROR_PARAMETER;
+	}
+
 	return 0;
 }
 
@@ -1805,6 +2059,24 @@ LIB_DEFINE(InitNet_1_NpEntitlementAccess) {
 	         LibNpEntitlementAccess::NpEntitlementAccessGetAddcontEntitlementInfoList);
 	LIB_FUNC("xddD23+8TfQ", LibNpEntitlementAccess::NpEntitlementAccessGetAddcontEntitlementInfo);
 	LIB_FUNC("5LiMEPuW0DQ", LibNpEntitlementAccess::NpEntitlementAccessGetEntitlementKey);
+	LIB_FUNC("y7JD1gfwyfA", LibNpEntitlementAccess::NpEntitlementAccessGetGameTrialsFlag);
+	LIB_FUNC("IQtb-TaIjSM", LibNpEntitlementAccess::NpEntitlementAccessGenerateTransactionId);
+	LIB_FUNC("uCZf2L27th8",
+	         LibNpEntitlementAccess::NpEntitlementAccessRequestUnifiedEntitlementInfoList);
+	LIB_FUNC("brbRxzr7qyI",
+	         LibNpEntitlementAccess::NpEntitlementAccessRequestServiceEntitlementInfoList);
+	LIB_FUNC("jautSRs4OdQ",
+	         LibNpEntitlementAccess::NpEntitlementAccessRequestUnifiedEntitlementInfo);
+	LIB_FUNC("eOxGbG3sPb0",
+	         LibNpEntitlementAccess::NpEntitlementAccessRequestConsumeUnifiedEntitlement);
+	LIB_FUNC("nAEqawEZG5s",
+	         LibNpEntitlementAccess::NpEntitlementAccessPollUnifiedEntitlementInfoList);
+	LIB_FUNC("aFv8qms6XTM",
+	         LibNpEntitlementAccess::NpEntitlementAccessPollServiceEntitlementInfoList);
+	LIB_FUNC("M4XlLFnzQaQ", LibNpEntitlementAccess::NpEntitlementAccessPollUnifiedEntitlementInfo);
+	LIB_FUNC("69u+XqsoNd0", LibNpEntitlementAccess::NpEntitlementAccessPollConsumeEntitlement);
+	LIB_FUNC("HFcQl9TMcFQ", LibNpEntitlementAccess::NpEntitlementAccessAbortRequest);
+	LIB_FUNC("Z0eQj8m7XA8", LibNpEntitlementAccess::NpEntitlementAccessDeleteRequest);
 }
 
 } // namespace LibNpEntitlementAccess

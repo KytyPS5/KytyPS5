@@ -276,7 +276,7 @@ uint32_t DecodeMimgSampleFlags(const MimgSampleInfo* sample, const MimgGatherInf
 
 uint32_t DecodeMimgAddressComponents(uint32_t opcode, ImageDimension dimension,
                                      const MimgSampleInfo* sample, const MimgGatherInfo* gather,
-                                     const MimgAtomicInfo* atomic) {
+                                     const MimgAtomicInfo* atomic, bool a16) {
 	if (sample != nullptr) {
 		return ImageSampleAddressComponents(sample->flags, dimension);
 	}
@@ -288,8 +288,9 @@ uint32_t DecodeMimgAddressComponents(uint32_t opcode, ImageDimension dimension,
 	}
 
 	switch (opcode) {
-		case 0xe6u: return 11u;
-		case 0xe7u: return 12u;
+		// a16 packs the ray extent, origin and both direction vectors into halves.
+		case 0xe6u: return a16 ? 8u : 11u;
+		case 0xe7u: return a16 ? 9u : 12u;
 		case 0x0eu: return 1u;
 		case 0x01u:
 		case 0x09u: return ImageCoordComponents(dimension) + 1u;
@@ -385,7 +386,7 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 		inst.image_nsa_addr[i] = (code[word_index + 2u + i / 4u] >> ((i % 4u) * 8u)) & 0xffu;
 	}
 	inst.image_address_components =
-	    DecodeMimgAddressComponents(opcode, dimension, sample, gather, atomic);
+	    DecodeMimgAddressComponents(opcode, dimension, sample, gather, atomic, a16);
 	SetRawWords(inst, code, word_index, word_count);
 
 	if (inst.opcode == Opcode::UNSUPPORTED) {
@@ -414,8 +415,9 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	if (d16 && !supports_d16) {
 		SetUnsupported(inst, Family::MIMG, opcode, "MIMG opcode does not support D16 data");
 	}
+	// a16 rays are accepted; the translator reports them as a miss.
 	if (inst.opcode == Opcode::IMAGE_BVH_INTERSECT_RAY &&
-	    (a16 || !r128 || inst.dmask != 0xfu || (nsa_dwords != 0u && nsa_dwords != 3u))) {
+	    (!r128 || inst.dmask != 0xfu || (!a16 && nsa_dwords != 0u && nsa_dwords != 3u))) {
 		SetUnsupported(inst, Family::MIMG, opcode,
 		               "BVH intersection requires full-float ray DWORDs and R128/dmask:0xf");
 	}
@@ -430,6 +432,14 @@ void DecodeMimg(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 const char* MimgSampleOpcodeName(uint32_t opcode) {
 	const auto* sample = Detail::FindOpcode(MIMG_SAMPLE_OPS, opcode);
 	return sample != nullptr ? sample->name : nullptr;
+}
+
+const char* MimgBvhOpcodeName(uint32_t opcode) {
+	switch (opcode) {
+		case 0xe6u: return "image_bvh_intersect_ray";
+		case 0xe7u: return "image_bvh64_intersect_ray";
+		default: return nullptr;
+	}
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Decoder

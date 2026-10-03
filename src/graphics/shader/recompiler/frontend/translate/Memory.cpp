@@ -948,6 +948,14 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 			ir.Emit(IR::ValueOpcode::DataCacheInvalidate);
 			return;
 		case Decoder::Opcode::IMAGE_BVH_INTERSECT_RAY: {
+			if ((inst.image_sample_flags & Decoder::ImageSampleFlagA16) != 0u) {
+				// No a16 BvhIntersect: report a miss (INVALID_NODE pointers, NaN distances).
+				program.uses_bvh_intersect_stub = true;
+				for (uint32_t component = 0; component < 4; ++component) {
+					WriteOperand(OffsetOperand(inst.dst, component), IR::Value(0xffffffffu));
+				}
+				return;
+			}
 			const auto result = ir.Emit(IR::ValueOpcode::BvhIntersect,
 			    {ConstructU32x4(inst.src1, 4), MakeImageAddress(inst, inst.src0), ir.GetExec()},
 			    inst.image_address_components - 10u);

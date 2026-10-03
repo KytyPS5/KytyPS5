@@ -43920,6 +43920,29 @@ TestCase DispatcherIrreducibleControlFlow() {
 
 #include "ShaderRayTracingGpuTests.inc"
 
+// An a16 intersect lowers to a constant miss; the rest of the dispatch still reaches memory.
+TestCase RayTracingIntersectStillWritesOtherOutputs() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 4, 0x1234u);
+  // image_bvh64_intersect_ray v[0:3], v[5:13], s[0:3] a16
+  code.push_back(EncodeMimg0(0xe7u, 0xf, 0, false, 0, true));
+  code.push_back(EncodeMimg1(0, 5) | (1u << 30u));
+  AppendStoreVgpr(&code, 4, 0);
+  AppendStoreVgpr(&code, 0, 1);
+  AppendStoreVgpr(&code, 3, 2);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "RayTracingIntersectStillWritesOtherOutputs";
+  test.code = code;
+  test.expected = {0x1234u, 0xffffffffu, 0xffffffffu};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_BVH_INTERSECT_RAY,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
 std::vector<TestCase> MakeCases() {
   std::vector<TestCase> cases;
   cases.reserve(128);
@@ -44512,6 +44535,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageAtomicGlc0DoesNotReturnOldValue);
   AddCase(MultipleWorkitemsGlobalId);
   AddCase(DispatcherIrreducibleControlFlow);
+  AddCase(RayTracingIntersectStillWritesOtherOutputs);
 
   return cases;
 }
@@ -51065,6 +51089,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--waitcnt-depctr-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, ScalarWaitcntDepctrCapturedVmVsrc());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--bvh-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, RayTracingIntersectStillWritesOtherOutputs());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--sff1-b64-only") == 0) {

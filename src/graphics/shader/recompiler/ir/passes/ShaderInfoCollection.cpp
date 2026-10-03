@@ -97,26 +97,52 @@ void CollectPixelInputs(const ShaderPixelInputInfo* pixel, ShaderInfo& info,
 	if (pixel->ps_front_face) {
 		AddInput(info, StageInputKind::FrontFacing, 0, 1, "gl_FrontFacing");
 	}
-	// Mixed interpolation modes share raw vertices at their guest export slot.
-	// Rectangle expansion alone supplies separate flat and smooth outputs.
-	for (uint32_t input = 0; input < pixel->input_num; input++) {
-		for (uint32_t alias = 0; alias < pixel->input_num; alias++) {
-			const bool same_mode = ShaderPixelParameterIsFlat(*pixel, input) ==
-			                       ShaderPixelParameterIsFlat(*pixel, alias);
-			if (ShaderPixelParameterMappedLocation(*pixel, input) ==
-			        ShaderPixelParameterMappedLocation(*pixel, alias) &&
-			    (pixel->parameter_mode != ShaderPixelParameterMode::Rectangle || same_mode)) {
-				per_vertex[input] = per_vertex[input] || per_vertex[alias] || !same_mode;
+	std::array<bool, 32> per_vertex {};
+	std::array<bool, 32> interpolated {};
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			if (inst.GetOpcode() == ValueOpcode::GetAttribute) {
+				interpolated[inst.Arg(0).U32()] = true;
+			} else if (inst.GetOpcode() == ValueOpcode::GetInterpolationParameter) {
+				const auto input = inst.Arg(0).U32();
+				const auto mode  = inst.Arg(2).U32();
+				per_vertex[input] =
+				    per_vertex[input] || mode < 2u || !ShaderPixelParameterIsFlat(*pixel, input);
 			}
 		}
 	}
+	// Aliases of a vertex output share one SPIR-V interface variable. If any
+	// alias reads raw vertices, interpolate the other aliases from those too.
+	std::array<uint32_t, 32> active_inputs {};
+	uint32_t                 active_count = 0;
 	for (uint32_t input = 0; input < pixel->input_num; input++) {
+		if (!ShaderPixelParameterIsDefault(*pixel, input)) {
+			active_inputs[active_count++] = input;
+		}
+	}
+	const auto active = std::span<const uint32_t> {active_inputs.data(), active_count};
+	for (const auto input: active) {
+		if (ShaderPixelParameterIsFlat(*pixel, input) &&
+		    !ShaderPixelParameterGroupIsFlat(*pixel, active, input)) {
+			per_vertex[input] = true;
+		}
+	}
+	for (const auto input: active) {
+		for (const auto alias: active) {
+			if (ShaderPixelParameterMappedLocation(*pixel, input) ==
+			        ShaderPixelParameterMappedLocation(*pixel, alias) &&
+			    ShaderPixelParameterGroupIsFlat(*pixel, active, input) ==
+			        ShaderPixelParameterGroupIsFlat(*pixel, active, alias)) {
+				per_vertex[input] = per_vertex[input] || per_vertex[alias];
+			}
+		}
+	}
+	for (const auto input: active) {
 		AddInput(info, StageInputKind::Parameter, input, 4, fmt::format("in_param_{}", input),
 		         per_vertex[input]);
 	}
-	for (uint32_t input = 0; input < pixel->input_num; input++) {
-		if (used_components[input] != 0 && per_vertex[input] &&
-		    !ShaderPixelParameterIsFlat(*pixel, input)) {
+	for (const auto input: active) {
+		if (interpolated[input] && per_vertex[input]) {
 			const auto kind = pixel->ps_no_perspective ? StageInputKind::BaryCoordNoPerspective
 			                                           : StageInputKind::BaryCoordSmooth;
 			AddInput(info, kind, 0, 3,
@@ -569,6 +595,43 @@ void CollectOutputs(const Program& program, ShaderStageInputInfo input_info, Sha
 			info.image_gather_extended = true;
 			break;
 		default: break;
+	}
+	const bool feeds_rasterizer = program.stage == ShaderType::Vertex ||
+	                              program.stage == ShaderType::TessellationEvaluation ||
+	                              program.stage == ShaderType::Mesh;
+	if (feeds_rasterizer && input_info.vertex != nullptr &&
+	    input_info.vertex->param_duplicate_mask != 0) {
+		const auto& vertex = *input_info.vertex;
+		const auto  used   = [&](uint32_t location) {
+			return (vertex.param_duplicate_mask & (1u << location)) != 0 ||
+			       std::ranges::any_of(info.outputs, [&](const StageOutput& output) {
+				       return output.kind == StageOutputKind::Parameter &&
+				              output.location == location;
+			       });
+		};
+		for (uint32_t location = 0; location < 32u; location++) {
+			const auto source = vertex.param_duplicate_source[location];
+			if ((vertex.param_duplicate_mask & (1u << location)) == 0 ||
+			    !HasOutput(info, StageOutputKind::Parameter, source)) {
+				continue;
+			}
+			const auto occupant =
+			    std::ranges::find_if(info.outputs, [&](const StageOutput& output) {
+				    return output.kind == StageOutputKind::Parameter && output.location == location;
+			    });
+			if (occupant != info.outputs.end()) {
+				uint32_t free = 0;
+				while (free < 32u && used(free)) {
+					free++;
+				}
+				if (free == 32u) {
+					continue;
+				}
+				occupant->location = free;
+			}
+			info.outputs.push_back({StageOutputKind::Parameter, source, location,
+			                        fmt::format("out_param_{}_at_{}", source, location)});
+		}
 	}
 }
 

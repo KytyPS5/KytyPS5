@@ -643,6 +643,12 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 		                       static_cast<uint32_t>(mesh.fast_launch),
 		                       mesh.gs_vgpr_component_count, mesh.es_vgpr_component_count});
 	}
+	key.push_back(info.param_duplicate_mask);
+	for (uint32_t location = 0; location < 32u; location++) {
+		if ((info.param_duplicate_mask & (1u << location)) != 0) {
+			key.push_back(info.param_duplicate_source[location]);
+		}
+	}
 	key.push_back(info.tess.input_control_points);
 	if (info.tess.input_control_points != 0) {
 		const auto& tess = info.tess;

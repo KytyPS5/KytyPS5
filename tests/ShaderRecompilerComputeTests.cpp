@@ -1314,6 +1314,7 @@ struct GraphicsCase {
   bool pixel_depth_export = false;
   u32 pixel_perspective_centroid_vgpr = UINT32_MAX;
   u32 pixel_custom_interpolation_mask = 0;
+  u32 index_count = 0;
 };
 
 struct CompiledShader {
@@ -17906,6 +17907,17 @@ void CheckSampledHtileArrayClearDiscovery() {
     auto vertex_buffer =
         CreateHostBuffer(test.name, vertices.size() * sizeof(u32),
                          vk::BufferUsageFlagBits::eVertexBuffer, vertices);
+    Buffer index_buffer;
+    if (test.index_count != 0) {
+      Require(test.name, "indexed graphics fixture",
+              test.index_count % 3u == 0u && test.index_count <= 120000u,
+              "indexed triangle count exceeds the bounded fixture");
+      std::vector<u32> indices(test.index_count);
+      for (u32 i = 0; i < test.index_count; ++i) indices[i] = i % 3u;
+      index_buffer = CreateHostBuffer(
+          test.name, indices.size() * sizeof(u32),
+          vk::BufferUsageFlagBits::eIndexBuffer, indices);
+    }
 
     vk::ShaderModule vertex_module = CreateShaderModule(test.name, vertex_spirv);
     vk::ShaderModule fragment_module = CreateShaderModule(test.name, fragment.spirv);
@@ -18058,7 +18070,12 @@ void CheckSampledHtileArrayClearDiscovery() {
     }
     vk::DeviceSize offset = 0;
     cmd.bindVertexBuffers(0, 1, &vertex_buffer.buffer, &offset);
-    cmd.draw(3, test.layers, 0, 0);
+    if (test.index_count != 0) {
+      cmd.bindIndexBuffer(index_buffer.buffer, 0, vk::IndexType::eUint32);
+      cmd.drawIndexed(test.index_count, test.layers, 0, 0, 0);
+    } else {
+      cmd.draw(3, test.layers, 0, 0);
+    }
     cmd.endRendering();
     EndSubmitAndFree(test.name, "graphics", cmd);
     target.layout = vk::ImageLayout::eGeneral;
@@ -18071,6 +18088,7 @@ void CheckSampledHtileArrayClearDiscovery() {
     m_device.destroyShaderModule(fragment_module, nullptr);
     m_device.destroyShaderModule(vertex_module, nullptr);
     DestroyBuffer(&vertex_buffer);
+    DestroyBuffer(&index_buffer);
     DestroyImage(&resolved);
     DestroyImage(&target);
     return pixel;
@@ -44928,6 +44946,22 @@ if (argc == 1) {
   if (argc == 2 && std::strcmp(argv[1], "--position-w-only") == 0) {
     VulkanHarness vulkan;
     RunGraphicsCase(&vulkan, GraphicsPositionWExport());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--indexed-draw-small-only") == 0) {
+    auto test = GraphicsPositionWExport();
+    test.name = "IndexedDrawThreeIndices";
+    test.index_count = 3u;
+    VulkanHarness vulkan;
+    RunGraphicsCase(&vulkan, test);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--indexed-draw-large-only") == 0) {
+    auto test = GraphicsPositionWExport();
+    test.name = "IndexedDraw120000Indices";
+    test.index_count = 120000u;
+    VulkanHarness vulkan;
+    RunGraphicsCase(&vulkan, test);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--centroid-only") == 0) {

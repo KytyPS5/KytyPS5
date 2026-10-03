@@ -4794,6 +4794,14 @@ void TestImageAtomicWidthDecoder() {
       }
     }
   }
+  const uint32_t add64[] = {EncodeMimg0(0x11u, 3u), captured[1]};
+  DecodeInstruction(add64, 0, decoded);
+  Check(decoded.opcode == Opcode::IMAGE_ATOMIC_ADD && decoded.data_bits == 64u,
+        "64-bit image atomic add was not decoded");
+  const uint32_t unsupported[] = {EncodeMimg0(0x14u, 3u), captured[1]};
+  DecodeInstruction(unsupported, 0, decoded);
+  Check(decoded.opcode == Opcode::UNSUPPORTED && decoded.data_bits == 64u,
+        "unsupported 64-bit image atomic silently decoded as 32-bit");
 }
 
 void TestNewShaderDecoderArchitecture() {

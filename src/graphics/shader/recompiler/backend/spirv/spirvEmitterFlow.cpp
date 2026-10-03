@@ -595,9 +595,17 @@ void EmitBarrier(EmitterState& state) {
 }
 
 uint32_t EmitLaneId(EmitterState& state) {
-	return state.program.stage == ShaderType::TessellationControl
-	           ? EmitBuiltinU32(state, IR::StageInputKind::InvocationId, 0)
-	           : EmitSubgroupLocalInvocationId(state);
+	if (state.program.stage == ShaderType::TessellationControl) {
+		return EmitBuiltinU32(state, IR::StageInputKind::InvocationId, 0);
+	}
+	if (state.lane_count == 2) {
+		// The guest lane id spans a 64 lane wave while the host subgroup only holds 32 of them,
+		// and the body runs once per half. Without the wave base every lane of the second half
+		// answers as its first-half counterpart, which makes masks, ballot results and the LDS
+		// addresses the shader derives from its own lane id all collapse onto one lane.
+		return EmitGuestLaneInWave(state);
+	}
+	return EmitSubgroupLocalInvocationId(state);
 }
 
 uint32_t EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Inst& inst) {

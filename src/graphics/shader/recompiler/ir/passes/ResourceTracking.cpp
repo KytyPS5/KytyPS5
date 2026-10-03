@@ -380,7 +380,8 @@ public:
 		m_info.images.clear();
 		m_info.samplers.clear();
 		m_info.sampled_pairs.clear();
-		m_info.uses_dma = false;
+		m_info.uses_dma   = false;
+		m_info.writes_dma = false;
 		m_shader_writes = HasShaderMemoryWrites(program);
 	}
 

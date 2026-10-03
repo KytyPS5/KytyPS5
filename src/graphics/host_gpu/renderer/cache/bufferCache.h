@@ -33,6 +33,8 @@ public:
 	static constexpr uint64_t CACHING_NUMPAGES  = (LOWER_ADDRESS_SIZE + LibKernel::Memory::kExtendedMemorySize) >> CACHING_PAGEBITS;
 	static constexpr uint64_t BDA_PAGETABLE_SIZE =
 	    CACHING_NUMPAGES * sizeof(vk::DeviceAddress);
+	// Device addresses stay below bit 63, which tags pages whose BDA stores the host owns.
+	static constexpr uint64_t BDA_STORE_TRACKED_BIT = uint64_t {1} << 63;
 
 	static constexpr uint64_t PageIndex(uint64_t address) {
 		return (address < LOWER_ADDRESS_SIZE
@@ -85,10 +87,12 @@ public:
 	void               MarkColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys);
 	[[nodiscard]] bool IsColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys) const;
 	void               ProcessFaultBuffer();
-	void               SynchronizeBda(const RangeSet& mapped);
-	void               QueueBdaSync(uint64_t vaddr, uint64_t size) {
-		m_memory_tracker.QueueBdaSync(vaddr, size);
-	}
+	// A BDA fault on an owned page can only come from a store, which promotes the page to tracked.
+	void ResolveBdaFault(uint64_t vaddr, uint64_t size);
+	void SynchronizeBda(const RangeSet& mapped);
+	void QueueBdaSync(uint64_t vaddr, uint64_t size) { m_memory_tracker.QueueBdaSync(vaddr, size); }
+	[[nodiscard]] bool HasUnmarkedBdaStores() const { return !m_bda_unmarked_ranges.Empty(); }
+	void               ClearUnmarkedBdaStores() { m_bda_unmarked_ranges.Clear(); }
 	void               RunGarbageCollector();
 
 private:
@@ -130,6 +134,7 @@ private:
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
 	template <bool async>
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	void               MarkBdaStores(uint64_t vaddr, uint64_t size);
 	void               ForgetColorMetadataChecks(uint64_t vaddr, uint64_t size);
 
 	GraphicContext&                                   m_graphics;
@@ -143,7 +148,6 @@ private:
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
 	// One per TileManager::ColorClearSlots key slot.
-	std::array<RangeSet, 8>                           m_checked_color_metadata;
 	MemoryTracker                                     m_memory_tracker;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;
@@ -154,6 +158,10 @@ private:
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;
+	std::array<RangeSet, 8> m_checked_color_metadata;
+	RangeSet                m_bda_tracked_ranges;
+	// Tracked since the last mark, so stores that ran before tracking are owned without a rerun.
+	RangeSet m_bda_unmarked_ranges;
 };
 
 } // namespace Libs::Graphics

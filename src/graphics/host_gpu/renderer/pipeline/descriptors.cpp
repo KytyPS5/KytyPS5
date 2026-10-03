@@ -858,17 +858,10 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	}
 }
 
-void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
                                              std::span<RenderColorInfo> colors) {
-	bool uses_dma        = false;
-	bool uses_image_heap = false;
-	FindBuffers(stages);
-	for (auto* stage: stages) {
-		uses_dma |= stage->runtime->program->info.uses_dma;
-		uses_image_heap |= stage->runtime->program->info.uses_image_heap;
+
 	}
 	if (uses_dma) {
-		m_context.PrepareBda();
 	}
 	if (uses_image_heap) {
 		m_context.GetImageHeap().Rebind(*this);

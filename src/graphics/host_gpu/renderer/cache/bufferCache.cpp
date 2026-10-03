@@ -127,6 +127,13 @@ void BufferCache::ChangeRegister(BufferId id) {
 		}
 		WriteDataBuffer(m_bda_pagetable_buffer, table_offset,
 		                addresses.data(), addresses.size() * sizeof(vk::DeviceAddress));
+		m_bda_tracked_ranges.ForEachInRange(
+		    buffer.CpuAddress(), buffer.Size(), [&](uint64_t begin, uint64_t end) {
+			    for (auto page = begin; page < end; page += CACHING_PAGESIZE) {
+				    addresses[(page - buffer.CpuAddress()) >> CACHING_PAGEBITS] |=
+				        BDA_STORE_TRACKED_BIT;
+			    }
+		    });
 		m_memory_tracker.QueueBdaSync(buffer.CpuAddress(), buffer.Size());
 	} else {
 		const auto found = m_buffers.find(buffer.CpuAddress());
@@ -720,6 +727,53 @@ void BufferCache::RunGarbageCollector() {
 
 void BufferCache::ProcessFaultBuffer() {
 	m_fault_manager.ProcessFaultBuffer();
+}
+
+void BufferCache::ResolveBdaFault(uint64_t vaddr, uint64_t size) {
+	}
+	RangeSet stored;
+	RangeSet missing;
+	for (auto page = vaddr; page < vaddr + size; page += CACHING_PAGESIZE) {
+		const auto* owner = m_page_table.Find(page >> PageTable::kPageBits);
+		(owner != nullptr && *owner ? stored : missing).Add(page, CACHING_PAGESIZE);
+	}
+	stored.ForEach([this](uint64_t begin, uint64_t end) {
+		m_bda_tracked_ranges.Add(begin, end - begin);
+		m_bda_unmarked_ranges.Add(begin, end - begin);
+	});
+	stored.ForEach([this](uint64_t begin, uint64_t end) {
+		for (auto page = begin; page < end; page += CACHING_PAGESIZE) {
+			const auto* owner = m_page_table.Find(page >> PageTable::kPageBits);
+			if (owner == nullptr || !*owner) {
+				continue;
+			}
+			const auto&             buffer = m_slot_buffers[*owner];
+			const vk::DeviceAddress entry =
+			    (buffer.BufferDeviceAddress() + (page - buffer.CpuAddress())) |
+			    BDA_STORE_TRACKED_BIT;
+		}
+	});
+}
+
+
+void BufferCache::MarkBdaStores(uint64_t vaddr, uint64_t size) {
+	const auto end = vaddr + size;
+	auto       it  = m_buffers.upper_bound(vaddr);
+	if (it != m_buffers.begin()) {
+		--it;
+	}
+	for (; it != m_buffers.end() && it->first < end; ++it) {
+		auto&      buffer = m_slot_buffers[it->second];
+		const auto start  = std::max(buffer.CpuAddress(), vaddr);
+		const auto finish = std::min(buffer.CpuAddress() + buffer.Size(), end);
+		if (start >= finish) {
+			continue;
+		}
+		TouchBuffer(buffer);
+		(void)SynchronizeBuffer(buffer, start, finish - start, true, false);
+		m_gpu_modified_ranges.Add(start, finish - start);
+		ForgetColorMetadataChecks(start, finish - start);
+	}
 }
 
 void BufferCache::SynchronizeBda(const RangeSet& mapped) {

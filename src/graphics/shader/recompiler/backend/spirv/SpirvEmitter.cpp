@@ -45,7 +45,7 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 	const auto indirect_buffer_handle = [&](const IR::Inst& handle) {
 		return program.info.uses_dma && handle.NumArgs() == 4u && !handle.Uses().empty() &&
 		       std::ranges::all_of(handle.Uses(), [&](const IR::Use& use) {
-			       if (IR::BufferAccessOf(use.user->GetOpcode()) != IR::BufferAccess::Read) {
+			       if (IR::BufferAccessOf(use.user->GetOpcode()) == IR::BufferAccess::None) {
 				       return false;
 			       }
 			       const auto index = use.user->Flags<IR::MemoryFlags>().index;
@@ -205,6 +205,51 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 }
 
 } // namespace
+
+Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program& program) {
+	SpirvRequirements requirements {};
+	const auto        refuse = [&](const IR::Inst& inst, const char* reason) {
+		if (requirements.refusal == nullptr) {
+			requirements.refusal      = reason;
+			requirements.refused_inst = &inst;
+		}
+	};
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			if (IR::BufferAccessOf(inst.GetOpcode()) != IR::BufferAccess::None) {
+				const auto memory_index = inst.Flags<IR::MemoryFlags>().index;
+				if (memory_index >= program.memory_info.size()) {
+					Fail(program, "buffer operation has invalid memory metadata");
+				}
+				const auto& memory = program.memory_info[memory_index];
+				if (!memory.planning_only && memory.kind == IR::ResourceKind::Buffer) {
+					if (memory.resource >= program.info.buffers.size()) {
+						Fail(program, "buffer operation has invalid resource metadata");
+					}
+					if ((program.info.buffers[memory.resource].packed_stride & (1u << 20u)) != 0u &&
+					    program.stage != ShaderType::Compute) {
+						refuse(inst, "buffer ADD_TID is only valid for compute shaders");
+					}
+				}
+			}
+			const auto shared_access = IR::SharedAccessOf(inst.GetOpcode());
+			if (shared_access == IR::SharedAccess::Atomic) {
+				const auto index = inst.Flags<IR::MemoryFlags>().index;
+				if (index >= program.memory_info.size()) {
+					Fail(program, "shared operation has invalid memory metadata");
+				}
+				const auto kind = program.memory_info[index].kind;
+				// The 64-bit LDS view is a Workgroup block, which only compute LDS has.
+				if ((IR::SharedComponentCount(inst.GetOpcode()) == 2u ||
+				     inst.GetType() == IR::Type::U64) &&
+				    (kind != IR::ResourceKind::Lds || program.stage != ShaderType::Compute)) {
+					refuse(inst, "64-bit shared atomics require compute LDS");
+				}
+			}
+		}
+	}
+	return requirements;
+}
 
 std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo input_info,
                                   uint32_t push_data_start_dword, const Profile& profile,

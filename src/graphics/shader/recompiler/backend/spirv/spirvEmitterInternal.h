@@ -58,6 +58,13 @@ constexpr std::array<ImageDimensionInfo, 7> ImageDimensions {{
 
 const ImageDimensionInfo& ImageDimensionInfoFor(ImageDimension dimension);
 
+// What the backend needs beyond the requirement flags ShaderInfo collection records.
+struct SpirvRequirements {
+	// The first guest feature the backend cannot express; the program is refused, not emitted.
+	const char*     refusal      = nullptr;
+	const IR::Inst* refused_inst = nullptr;
+};
+SpirvRequirements AnalyzeProgramRequirements(const IR::Program& program);
 struct BufferDefinition {
 	uint32_t variable             = 0;
 	uint32_t type                 = 0;
@@ -76,7 +83,8 @@ struct ImageDefinition {
 struct EmitterState {
 	EmitterState(IR::Program& program_, ShaderStageInputInfo input_info_, const Profile& profile_)
 	    : builder(program_.stage == ShaderType::Mesh ? 0x00010400u : 0x00010300u),
-	      program(program_), input_info(input_info_), profile(profile_) {
+	      program(program_), input_info(input_info_), profile(profile_),
+	      requirements(AnalyzeProgramRequirements(program_)) {
 		if (ShaderWorkgroupInput(program.stage, input_info) != nullptr) {
 			lds_storage_class = spv::StorageClassWorkgroup;
 		}
@@ -115,6 +123,7 @@ struct EmitterState {
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
 	uint32_t                                         bda_pointer_function    = 0;
+	uint32_t                                           bda_store_pointer_function        = 0;
 	uint32_t                                         indirect_format_function = 0;
 	uint32_t                                         indirect_format_geometry_function = 0;
 	std::map<std::array<uint32_t, 3>, uint32_t>        indirect_buffer_load_functions;

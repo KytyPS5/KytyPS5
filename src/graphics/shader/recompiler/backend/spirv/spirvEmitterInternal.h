@@ -133,6 +133,10 @@ struct EmitterState {
 	uint32_t                   current_label                         = 0;
 	const IR::Block*           current_block                         = nullptr;
 	uint32_t                   pixel_valid_mask_variable             = 0;
+	// Loop watchdog: function-storage counter per structured loop header (by block id),
+	// and the latch block that increments it.
+	std::unordered_map<uint32_t, std::pair<uint32_t, uint32_t>> loop_counter_variables;
+	std::unordered_map<uint32_t, uint32_t>                      back_edge_counters;
 	uint32_t                   subgroup_local_invocation_id_variable = 0;
 	uint32_t                   per_vertex_variable                   = 0;
 	uint32_t                   point_size_variable                   = 0;
@@ -338,6 +342,30 @@ uint32_t ConstantF32(EmitterState& state, uint32_t bits);
 uint32_t ConstantF32Value(EmitterState& state, float value);
 
 uint32_t ConstantBool(EmitterState& state, bool value);
+
+// Iteration cap for emitted loops (KYTY_SHADER_LOOP_LIMIT, default 1 << 16; 0 disables).
+// A loop that runs past it takes an exit it already has, so a shader fed bad data cannot
+// hang the GPU. 65536 is the cap measured against a pinned loop (~50 s/frame); a million
+// iterations would turn that same shader into many minutes per frame.
+inline uint32_t ShaderLoopLimit() {
+	constexpr uint32_t kDefaultLimit = 1u << 16u;
+	const char*        value         = std::getenv("KYTY_SHADER_LOOP_LIMIT");
+	if (value == nullptr || *value == '\0') {
+		return kDefaultLimit;
+	}
+	// Only a plain decimal number overrides the default; anything else keeps the cap on
+	// instead of silently turning the watchdog off. strtoull would accept leading
+	// whitespace and a sign, so the first character has to be a digit.
+	if (*value < '0' || *value > '9') {
+		return kDefaultLimit;
+	}
+	char*      end    = nullptr;
+	const auto parsed = std::strtoull(value, &end, 10);
+	if (*end != '\0' || parsed > UINT32_MAX) {
+		return kDefaultLimit;
+	}
+	return static_cast<uint32_t>(parsed);
+}
 
 uint32_t ConstantU64(EmitterState& state, uint64_t value);
 
@@ -611,13 +639,28 @@ uint32_t AtomicUpdate(EmitterState& state, uint32_t pointer, IR::ResourceKind ki
 	EmitLabel(state, header);
 	state.builder.AddFunction(spv::OpPhi, TypeU32(state), observed, initial, preheader, exchanged,
 	                          cont);
+	// Give up after ShaderLoopLimit() failed exchanges so a CAS that never lands cannot spin.
+	const auto iteration      = state.builder.AllocateId();
+	const auto next_iteration = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpPhi, TypeU32(state), iteration, ConstantU32(state, 0),
+	                          preheader, next_iteration, cont);
 	const auto next = desired(observed);
 	state.builder.AddFunction(spv::OpAtomicCompareExchange, TypeU32(state), exchanged, pointer,
 	                          ConstantU32(state, scope),
 	                          ConstantU32(state, spv::MemorySemanticsMaskNone),
 	                          ConstantU32(state, spv::MemorySemanticsMaskNone), next, observed);
-	const auto success = state.builder.AllocateId();
+	auto success = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpIEqual, TypeBool(state), success, exchanged, observed);
+	state.builder.AddFunction(spv::OpIAdd, TypeU32(state), next_iteration, iteration,
+	                          ConstantU32(state, 1));
+	if (ShaderLoopLimit() != 0) {
+		const auto over = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpUGreaterThanEqual, TypeBool(state), over, iteration,
+		                          ConstantU32(state, ShaderLoopLimit()));
+		const auto stop = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLogicalOr, TypeBool(state), stop, success, over);
+		success = stop;
+	}
 	state.builder.AddFunction(spv::OpLoopMerge, merge, cont, spv::LoopControlMaskNone);
 	state.builder.AddFunction(spv::OpBranchConditional, success, merge, cont);
 	EmitLabel(state, cont);

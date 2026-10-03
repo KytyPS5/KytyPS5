@@ -6,8 +6,13 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
+#include <cstdlib>
+#include <cstring>
 #include <fmt/format.h>
+#include <optional>
 #include <string_view>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
@@ -222,6 +227,209 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 	}
 }
 
+class LdsAddressRange {
+public:
+	struct Range {
+		uint64_t max  = 0;
+		uint64_t bits = 0;
+	};
+
+	explicit LdsAddressRange(IR::Value predicate): m_predicate(predicate.Resolve()) {}
+
+	std::optional<Range> Of(IR::Value value) {
+		value = value.Resolve();
+		if (value.IsImmediate()) {
+			if (value.GetType() != IR::Type::U32) {
+				return std::nullopt;
+			}
+			return Range {value.U32(), value.U32()};
+		}
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr || m_path.size() >= 64u ||
+		    std::ranges::find(m_path, inst) != m_path.end()) {
+			return std::nullopt;
+		}
+		m_path.push_back(inst);
+		auto result = Compute(*inst);
+		m_path.pop_back();
+		if (result.has_value()) {
+			result->max = std::min(result->max, result->bits);
+		}
+		return result;
+	}
+
+private:
+	static constexpr uint64_t Word = 0xffffffffull;
+
+	static std::optional<Range> UpTo(uint64_t max) {
+		if (max > Word) {
+			return std::nullopt;
+		}
+		return Range {max, max == 0 ? 0 : (uint64_t {1} << std::bit_width(max)) - 1u};
+	}
+
+	std::optional<uint32_t> Immediate(const IR::Inst& inst, size_t index) const {
+		const auto operand = inst.Arg(index).Resolve();
+		if (operand.IsImmediate() && operand.GetType() == IR::Type::U32) {
+			return operand.U32();
+		}
+		return std::nullopt;
+	}
+
+	std::optional<Range> Compute(const IR::Inst& inst) {
+		const auto arg = [&](size_t index) { return Of(inst.Arg(index)); };
+		switch (inst.GetOpcode()) {
+			case IR::ValueOpcode::LaneId: return UpTo(63u);
+			case IR::ValueOpcode::BitCount32: return UpTo(32u);
+			case IR::ValueOpcode::BitCount64: return UpTo(64u);
+			case IR::ValueOpcode::IAdd32: {
+				const auto a = arg(0);
+				const auto b = a ? arg(1) : std::nullopt;
+				return a && b ? UpTo(a->max + b->max) : std::nullopt;
+			}
+			case IR::ValueOpcode::IMul32: {
+				const auto a = arg(0);
+				const auto b = a ? arg(1) : std::nullopt;
+				if (!a || !b || (a->max != 0 && b->max > Word / a->max)) {
+					return std::nullopt;
+				}
+				return UpTo(a->max * b->max);
+			}
+			case IR::ValueOpcode::BitwiseAnd32: {
+				const auto a = arg(0);
+				const auto b = arg(1);
+				if (a && b) {
+					return Range {std::min(a->max, b->max), a->bits & b->bits};
+				}
+				return a ? a : b;
+			}
+			case IR::ValueOpcode::UMin32: {
+				const auto a = arg(0);
+				const auto b = arg(1);
+				if (a && b) {
+					return UpTo(std::min(a->max, b->max));
+				}
+				return a ? a : b;
+			}
+			case IR::ValueOpcode::BitwiseOr32:
+			case IR::ValueOpcode::BitwiseXor32: {
+				const auto a = arg(0);
+				const auto b = a ? arg(1) : std::nullopt;
+				if (!a || !b) {
+					return std::nullopt;
+				}
+				const auto bits = a->bits | b->bits;
+				return Range {std::min(bits, a->max + b->max), bits};
+			}
+			case IR::ValueOpcode::ShiftLeftLogical32: {
+				const auto a     = arg(0);
+				const auto shift = Immediate(inst, 1);
+				if (!a || !shift || *shift >= 32u || (a->bits << *shift) > Word) {
+					return std::nullopt;
+				}
+				return Range {a->max << *shift, a->bits << *shift};
+			}
+			case IR::ValueOpcode::ShiftRightLogical32: {
+				const auto a     = arg(0);
+				const auto shift = Immediate(inst, 1);
+				if (a && shift && *shift < 32u) {
+					return Range {a->max >> *shift, a->bits >> *shift};
+				}
+				return a;
+			}
+			case IR::ValueOpcode::BitFieldUExtract: {
+				const auto offset = Immediate(inst, 1);
+				const auto count  = Immediate(inst, 2);
+				if (!count || *count > 32u) {
+					return std::nullopt;
+				}
+				const uint64_t field = (uint64_t {1} << *count) - 1u;
+				const auto     a     = arg(0);
+				if (a && offset && *offset < 32u) {
+					const auto bits = (a->bits >> *offset) & field;
+					return Range {std::min(bits, a->max >> *offset), bits};
+				}
+				return Range {field, field};
+			}
+			case IR::ValueOpcode::SelectU32: {
+				if (inst.Arg(0).Resolve() == m_predicate) {
+					return arg(1);
+				}
+				const auto a = arg(1);
+				const auto b = a ? arg(2) : std::nullopt;
+				if (!a || !b) {
+					return std::nullopt;
+				}
+				return Range {std::max(a->max, b->max), a->bits | b->bits};
+			}
+			case IR::ValueOpcode::Phi: {
+				if (inst.NumArgs() == 0) {
+					return std::nullopt;
+				}
+				Range merged {};
+				for (size_t index = 0; index < inst.NumArgs(); index++) {
+					const auto incoming = arg(index);
+					if (!incoming) {
+						return std::nullopt;
+					}
+					merged.max = std::max(merged.max, incoming->max);
+					merged.bits |= incoming->bits;
+				}
+				return merged;
+			}
+			default: return std::nullopt;
+		}
+	}
+
+	IR::Value                    m_predicate;
+	std::vector<const IR::Inst*> m_path;
+};
+
+uint32_t FunctionLdsDwords(const IR::Program& program, uint32_t& unbounded_pc) {
+	uint64_t end_bytes = 0;
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			const auto op     = inst.GetOpcode();
+			const auto shared = IR::SharedAccessOf(op);
+			const bool flat   = IR::AddressOpcodeInfoOf(op).access != IR::AddressAccess::None;
+			if (shared == IR::SharedAccess::None && !flat) {
+				continue;
+			}
+			const auto flags = inst.Flags<IR::MemoryFlags>();
+			if (flags.index >= program.memory_info.size()) {
+				continue;
+			}
+			const auto& memory = program.memory_info[flags.index];
+			if (flat) {
+				// A flat access in the LDS aperture addresses LDS with a runtime offset.
+				if (memory.kind == IR::ResourceKind::FlatLocal) {
+					unbounded_pc = flags.pc;
+					return 0;
+				}
+				continue;
+			}
+			if (memory.kind != IR::ResourceKind::Lds) {
+				continue;
+			}
+			if (shared != IR::SharedAccess::Read && shared != IR::SharedAccess::Write &&
+			    shared != IR::SharedAccess::Atomic) {
+				unbounded_pc = flags.pc;
+				return 0;
+			}
+			// Every LDS operation's last operand is the predicate it runs under.
+			LdsAddressRange range(inst.Arg(inst.NumArgs() - 1));
+			const auto      address = range.Of(inst.Arg(0));
+			if (!address.has_value()) {
+				unbounded_pc = flags.pc;
+				return 0;
+			}
+			end_bytes = std::max(end_bytes, address->max + memory.offset +
+			                                    4ull * IR::SharedComponentCount(op));
+		}
+	}
+	return static_cast<uint32_t>(std::clamp<uint64_t>((end_bytes + 3u) / 4u, 1u, 8192u));
+}
+
 } // namespace
 
 Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program& program) {
@@ -413,6 +621,19 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 	    std::adjacent_find(registers.begin(), registers.end()) != registers.end()) {
 		Fail(program, "native shader-data layout is inconsistent");
 	}
+	if (requirements.function_lds && !FunctionLdsDefaultForced()) {
+		requirements.function_lds_dwords =
+		    FunctionLdsDwords(program, requirements.function_lds_unbounded_pc);
+	}
+	return requirements;
+}
+
+bool Emitter::FunctionLdsDefaultForced() {
+	static const bool forced = [] {
+		const char* text = std::getenv("KYTY_FUNCTION_LDS_DEFAULT");
+		return text != nullptr && std::strcmp(text, "0") != 0;
+	}();
+	return forced;
 }
 
 std::vector<uint32_t> EmitProgram(const IR::Program& program, ShaderStageInputInfo input_info,

@@ -152,7 +152,11 @@ void EmitMemoryOffsets(EmitterState& state) {
 
 uint32_t LdsDwordCount(const EmitterState& state) {
 	const auto* workgroup = ShaderWorkgroupInput(state.program.stage, state.input_info);
-	return workgroup != nullptr ? workgroup->lds_size_dwords : 8192u;
+	if (workgroup != nullptr) {
+		return workgroup->lds_size_dwords;
+	}
+	return state.requirements.function_lds_dwords != 0 ? state.requirements.function_lds_dwords
+	                                                   : 8192u;
 }
 
 void EnsureLdsStorage(EmitterState& state) {

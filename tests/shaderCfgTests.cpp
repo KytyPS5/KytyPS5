@@ -1408,6 +1408,105 @@ void TestNormalizedImageContracts() {
         "Vulkan image-view compatibility classes diverged from production");
 }
 
+void TestFunctionLdsIsSizedFromItsAddresses() {
+  using namespace ShaderRecompiler::IR;
+  struct Fixture {
+    Program program;
+    Block *block = nullptr;
+    explicit Fixture(uint32_t offset, ResourceKind kind = ResourceKind::Lds) {
+      program.stage = ShaderType::Pixel;
+      program.block_storage.push_back(std::make_unique<Block>());
+      block = program.block_storage.back().get();
+      program.blocks.push_back(block);
+      program.memory_info.push_back({.kind = kind, .offset = offset});
+      // ShaderInfoCollection sets this for every LDS or flat-local access.
+      program.info.function_lds = true;
+    }
+    Inst &Add(ValueOpcode op, std::initializer_list<Value> args) {
+      return block->AppendNewInst(op, args);
+    }
+    void Access(Inst &inst, uint32_t pc) { inst.SetFlags(MemoryFlags{.index = 0, .pc = pc}); }
+    ShaderRecompiler::Spirv::Emitter::SpirvRequirements Analyze() const {
+      return ShaderRecompiler::Spirv::Emitter::AnalyzeProgramRequirements(program);
+    }
+  };
+
+  {
+    Fixture f(1024);
+    auto &lane = f.Add(ValueOpcode::LaneId, {});
+    auto &address = f.Add(ValueOpcode::ShiftLeftLogical32, {Value(&lane), Value(2u)});
+    f.Access(f.Add(ValueOpcode::WriteSharedU32, {Value(&address), Value(0u), Value(true)}),
+             0x10);
+    const auto requirements = f.Analyze();
+    Check(requirements.function_lds_dwords == (1024 + 63 * 4 + 4) / 4,
+          "a lane-indexed LDS write was not sized to offset + 4 * lane");
+  }
+
+  {
+    Fixture f(0);
+    auto &lane = f.Add(ValueOpcode::LaneId, {});
+    auto &active = f.Add(ValueOpcode::ULessThan32, {Value(&lane), Value(32u)});
+    auto &vertex = f.Add(ValueOpcode::GetBuiltin, {Value(0u), Value(0u)});
+    auto &index = f.Add(ValueOpcode::SelectU32, {Value(&active), Value(&lane), Value(&vertex)});
+    auto &address = f.Add(ValueOpcode::IMul32, {Value(12u), Value(&index)});
+    f.Access(f.Add(ValueOpcode::LoadSharedU32, {Value(&address), Value(&active)}), 0x20);
+    const auto requirements = f.Analyze();
+    Check(requirements.function_lds_dwords == (12 * 63 + 4) / 4,
+          "a select on the access's own predicate widened the LDS bound");
+
+    f.Access(f.Add(ValueOpcode::LoadSharedU32, {Value(&address), Value(true)}), 0x24);
+    const auto unbounded = f.Analyze();
+    Check(unbounded.function_lds_dwords == 0 && unbounded.function_lds_unbounded_pc == 0x24,
+          "an LDS address reaching a vertex index was bounded");
+  }
+
+  {
+    Fixture f(0);
+    auto &lane = f.Add(ValueOpcode::LaneId, {});
+    auto &low = f.Add(ValueOpcode::ShiftLeftLogical32, {Value(&lane), Value(2u)});
+    auto &high = f.Add(ValueOpcode::ShiftLeftLogical32, {Value(&low), Value(16u)});
+    auto &packed = f.Add(ValueOpcode::BitwiseOr32, {Value(&low), Value(&high)});
+    auto &field =
+        f.Add(ValueOpcode::BitFieldUExtract, {Value(&packed), Value(2u), Value(14u)});
+    auto &address = f.Add(ValueOpcode::IMul32, {Value(&field), Value(12u)});
+    f.Access(f.Add(ValueOpcode::LoadSharedU32, {Value(&address), Value(true)}), 0x30);
+    Check(f.Analyze().function_lds_dwords == (63 * 12 + 4) / 4,
+          "a field extract of packed lane offsets was not bounded by the field it extracts");
+  }
+
+  {
+    Fixture f(0);
+    auto &loaded = f.Add(ValueOpcode::LoadSharedU32, {Value(0u), Value(true)});
+    f.Access(loaded, 0x40);
+    f.Access(f.Add(ValueOpcode::LoadSharedU32, {Value(&loaded), Value(true)}), 0x44);
+    const auto requirements = f.Analyze();
+    Check(requirements.function_lds_dwords == 0 &&
+              requirements.function_lds_unbounded_pc == 0x44,
+          "a data-dependent LDS address was bounded");
+  }
+  {
+    Fixture f(0, ResourceKind::FlatLocal);
+    f.program.scratch_dwords = 4;
+    auto &handle = f.Add(ValueOpcode::GetAddressResource, {Value(0u), Value(0u)});
+    f.Access(f.Add(ValueOpcode::LoadAddressU32,
+                   {Value(&handle), Value(0u), Value(0u), Value(true)}),
+             0x50);
+    const auto requirements = f.Analyze();
+    Check(requirements.function_lds_dwords == 0 &&
+              requirements.function_lds_unbounded_pc == 0x50,
+          "a flat access that may address LDS was given a bound");
+  }
+
+  {
+    Fixture f(0);
+    auto &lane = f.Add(ValueOpcode::LaneId, {});
+    auto &address = f.Add(ValueOpcode::IAdd32, {Value(&lane), Value(0xfffffff0u)});
+    f.Access(f.Add(ValueOpcode::LoadSharedU32, {Value(&address), Value(true)}), 0x60);
+    Check(f.Analyze().function_lds_dwords == 0,
+          "an LDS address that can wrap past 2^32 was bounded");
+  }
+}
+
 void TestShaderFeatureCollection() {
   using namespace ShaderRecompiler::IR;
 
@@ -5001,35 +5100,92 @@ void TestNewShaderDecoderArchitecture() {
         "VOP2 DPP V_PK_FMAC_F16 lost its implicit packed modifiers");
 }
 
-void TestNewShaderRecompilerRejectsDppOn64BitCompares() {
-  const uint32_t opcodes[] = {
-      0xa2u, 0xa5u, 0xb5u, 0xe2u, 0xe4u, 0xe5u,
-      0xf5u}; // eq_i64, ne_i64, cmpx_ne_i64, eq_u64, gt_u64, ne_u64, cmpx_ne_u64
-  for (const auto opcode : opcodes) {
-    const uint32_t shader[] = {
-        EncodeVopc(opcode, 250u, 0u), // DPP escape in SRC0
-        EncodeVop2Dpp(0u),
-        0xbf810000u,
-    };
-
-    ShaderRecompiler::Decoder::Program program;
-    ShaderRecompiler::Decoder::DecodeProgram(shader, program);
-    Check(program.instructions.size() == 2u,
-          "64-bit VOPC DPP decode did not consume its modifier word");
-    const auto &compare = program.instructions.front();
-    Check(compare.opcode == ShaderRecompiler::Decoder::Opcode::UNSUPPORTED,
-          "64-bit VOPC illegally accepted a DPP modifier");
-    Check((compare.unsupported_reason.find("VOPC DPP modifier is not supported for opcode") != std::string::npos),
-          "64-bit VOPC DPP rejection reason was not explicit");
+void TestNewShaderRecompilerInteger64CompareEncodings() {
+  namespace D = ShaderRecompiler::Decoder;
+  using O = D::Opcode;
+  const O families[][8] = {
+      {O::V_CMP_F_I64, O::V_CMP_LT_I64, O::V_CMP_EQ_I64, O::V_CMP_LE_I64,
+       O::V_CMP_GT_I64, O::V_CMP_NE_I64, O::V_CMP_GE_I64, O::V_CMP_T_I64},
+      {O::V_CMPX_F_I64, O::V_CMPX_LT_I64, O::V_CMPX_EQ_I64, O::V_CMPX_LE_I64,
+       O::V_CMPX_GT_I64, O::V_CMPX_NE_I64, O::V_CMPX_GE_I64, O::V_CMPX_T_I64},
+      {O::V_CMP_F_U64, O::V_CMP_LT_U64, O::V_CMP_EQ_U64, O::V_CMP_LE_U64,
+       O::V_CMP_GT_U64, O::V_CMP_NE_U64, O::V_CMP_GE_U64, O::V_CMP_T_U64},
+      {O::V_CMPX_F_U64, O::V_CMPX_LT_U64, O::V_CMPX_EQ_U64, O::V_CMPX_LE_U64,
+       O::V_CMPX_GT_U64, O::V_CMPX_NE_U64, O::V_CMPX_GE_U64, O::V_CMPX_T_U64}};
+  const uint32_t bases[] = {0xa0u, 0xb0u, 0xe0u, 0xf0u};
+  for (uint32_t family = 0; family < std::size(families); ++family) {
+    const bool update_exec = (family % 2) != 0;
+    for (uint32_t predicate = 0; predicate < 8; ++predicate) {
+      const auto encoding = bases[family] + predicate;
+      for (const bool vop3 : {false, true}) {
+        const std::array<uint32_t, 2> words = vop3
+            ? std::array{EncodeVop3Word0(encoding, 20),
+                         EncodeVop3Word1(257, 259, 0)}
+            : std::array{EncodeVopc(encoding, 257, 3), 0xbf810000u};
+        D::Instruction compare;
+        D::DecodeInstruction(words, 0, compare);
+        const auto destination = update_exec ? D::OperandKind::ExecLo
+            : vop3 ? D::OperandKind::Sgpr : D::OperandKind::VccLo;
+        Check(compare.family == (vop3 ? D::Family::VOP3 : D::Family::VOPC) &&
+                  compare.opcode == families[family][predicate] &&
+                  compare.opcode_id == encoding &&
+                  compare.word_count == (vop3 ? 2u : 1u) &&
+                  compare.dst.kind == destination &&
+                  (!vop3 || update_exec || compare.dst.reg == 20) &&
+                  compare.src_count == 2 &&
+                  compare.src0.kind == D::OperandKind::Vgpr && compare.src0.reg == 1 &&
+                  compare.src1.kind == D::OperandKind::Vgpr && compare.src1.reg == 3,
+              "64-bit integer compare decoded incorrectly");
+        for (const bool high_src0 : {false, true}) {
+          // Only the compare's pair width makes v13 reachable by MOVRELD,
+          // including predicates F/T that never read their operands.
+          const uint32_t src0 = high_src0 ? 268u : 266u;
+          const uint32_t src1 = high_src0 ? 10u : 12u;
+          std::vector<uint32_t> shader{EncodeVop1(0x42, 12, 256)};
+          if (vop3) {
+            shader.push_back(EncodeVop3Word0(encoding, 20));
+            shader.push_back(EncodeVop3Word1(src0, src1 + 256, 0));
+          } else {
+            shader.push_back(EncodeVopc(encoding, src0, src1));
+          }
+          shader.push_back(EncodeSopp(0x01));
+          D::Program decoded;
+          D::DecodeProgram(shader, decoded);
+          ShaderComputeInputInfo compute{};
+          ShaderRecompiler::Frontend::TranslateOptions options{.stage = ShaderType::Compute};
+          options.input_info.compute = &compute;
+          const auto program = ShaderRecompiler::Frontend::TranslateProgram(
+              decoded, ShaderRecompiler::CFG::BuildGraph(decoded), options);
+          bool includes_high_word = false;
+          for (const auto *block : program.blocks) {
+            for (const auto &inst : *block) {
+              includes_high_word |=
+                  inst.GetOpcode() == ShaderRecompiler::IR::ValueOpcode::SetVectorRegister &&
+                  ShaderRecompiler::IR::RegIndex(inst.Arg(0).VectorRegister()) == 13;
+            }
+          }
+          Check(includes_high_word, "64-bit compare omitted a VGPR pair's high word");
+        }
+      }
+      for (const bool dpp : {false, true}) {
+        const uint32_t shader[] = {
+            EncodeVopc(encoding, dpp ? 250u : 249u, 3),
+            dpp ? EncodeVop2Dpp(1) : EncodeVopcSdwa(1),
+            0xbf810000u};
+        D::Program program;
+        D::DecodeProgram(shader, program);
+        Check(program.instructions.size() == 2u &&
+                  program.instructions.back().opcode == O::S_ENDPGM,
+              "64-bit VOPC decode did not consume its modifier word");
+        const auto &compare = program.instructions.front();
+        const auto reason = dpp ? "VOPC DPP modifier is not supported for opcode"
+                                : "VOPC SDWA modifier is not supported for opcode";
+        Check(compare.opcode == O::UNSUPPORTED && compare.word_count == 2u &&
+                  compare.unsupported_reason.find(reason) != std::string::npos,
+              "64-bit VOPC did not explicitly reject an illegal modifier");
+      }
+    }
   }
-  const uint32_t sdwa[] = {EncodeVopc(0xa5u, 249u, 0u), 0x06060000u};
-  ShaderRecompiler::Decoder::Instruction compare;
-  ShaderRecompiler::Decoder::DecodeInstruction(sdwa, 0u, compare);
-  Check(compare.opcode == ShaderRecompiler::Decoder::Opcode::UNSUPPORTED &&
-            compare.word_count == 2u &&
-            compare.unsupported_reason.find("VOPC SDWA is not encodable for 64-bit compares") !=
-                std::string::npos,
-        "V_CMP_NE_I64 accepted an illegal SDWA encoding");
 }
 
 void TestNewShaderRecompilerCapturedVopcSdwaCmpxClass() {
@@ -6745,10 +6901,29 @@ void TestFlatAliasOfCustomInput() {
   CheckSpirvBinaryValidates(interpolated.spirv);
 
   ps_info.custom_interpolation_mask = 0;
+  // Outside rectangle expansion a flat alias shares its smooth input's per-vertex variable and
+  // reads the provoking vertex (upstream b38b7454a).
   auto smooth = RecompileForTest(shader, options);
-  Check(SpirvHasDecorationValueWithDecoration(smooth.spirv, 30u, 2u, 14u),
-        "flat alias of a smooth input lost its separate flat location");
+  const auto smooth_source = DisassembleSpirvBinary(smooth.spirv);
+  Check(!SpirvHasDecorationValue(smooth.spirv, 30u, 2u) &&
+            SpirvDecorationValueCount(smooth.spirv, 30u, 1u) == 1u &&
+            SpirvHasDecorationValueWithDecoration(smooth.spirv, 30u, 1u, 5285u) &&
+            SpirvSourceHasInstructionUsing(smooth_source, "OpAccessChain",
+                                           "in_param_1 %uint_0 %uint_2"),
+        "flat alias of a smooth input did not read the first vertex of the shared variable");
   CheckSpirvBinaryValidates(smooth.spirv);
+  ps_info.parameter_mode = ShaderPixelParameterMode::LastVertex;
+  auto last = RecompileForTest(shader, options);
+  Check(SpirvSourceHasInstructionUsing(DisassembleSpirvBinary(last.spirv), "OpAccessChain",
+                                       "in_param_1 %uint_2 %uint_2"),
+        "flat alias of a smooth input did not read the last provoking vertex");
+  CheckSpirvBinaryValidates(last.spirv);
+  // Rectangle expansion alone gives the flat alias its own flat output.
+  ps_info.parameter_mode = ShaderPixelParameterMode::Rectangle;
+  auto rectangle = RecompileForTest(shader, options);
+  Check(SpirvHasDecorationValueWithDecoration(rectangle.spirv, 30u, 2u, 14u),
+        "flat alias of a smooth input lost its separate flat location");
+  CheckSpirvBinaryValidates(rectangle.spirv);
 }
 
 void TestFlatAliasOfSmoothInputDuplicates() {
@@ -6759,6 +6934,10 @@ void TestFlatAliasOfSmoothInputDuplicates() {
   const std::array<uint32_t, 2> active{0u, 1u};
   uint32_t mask = 0;
   uint8_t source[32]{};
+  // Provoking-vertex modes share the vertex output (upstream b38b7454a): nothing to duplicate.
+  ShaderPixelParameterDuplicates(ps, active, mask, source);
+  Check(mask == 0u, "flat alias of a smooth input asked for a duplicate outside rectangles");
+  ps.parameter_mode = ShaderPixelParameterMode::Rectangle;
   ShaderPixelParameterDuplicates(ps, active, mask, source);
   Check(mask == 1u && source[0] == 1u,
         "flat alias of a smooth input did not ask for a duplicate of output 1 at location 0");
@@ -14865,8 +15044,9 @@ void TestUniformSelectedDescriptorLoadAddress() {
     words[0] = descriptor[(address - base) / 4u];
     return true;
   };
+  // The descriptor is written, so it is read through the strict reader (c6ff4a35e).
   const SrtRuntime runtime{.user_data = user_data, .read_memory = read,
-                           .userdata = &user_data[0]};
+                           .userdata = &user_data[0], .read_specialization_memory = read};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
   for (const uint32_t flag : {0u, 1u, 0u}) {
@@ -14917,9 +15097,12 @@ void TestBoundedScalarMaterialImageKeys() {
         "scalar material fields lost their distinct image roots or clean read capture");
   for (const auto &image : plan.info.images) {
     const auto &source = plan.descriptor_sources[image.source].indirect_descriptor;
-    Check(source && source->selector && source->selector->stride == 160u &&
-              (source->selector->offset == 0x7cu || source->selector->offset == 0x94u) &&
-              source->table_stride == 32u && !source->table_scalar &&
+    Check(source &&
+              source->material_source !=
+                  DescriptorSource::IndirectDescriptor::NoMaterialTable &&
+              source->selector_stride == 160u &&
+              (source->selector_offset == 0x7cu || source->selector_offset == 0x94u) &&
+              source->heap_stride == 32u &&
               source->key_count.ResolveInstruction()->GetOpcode() == ValueOpcode::UMin32,
           "scalar material image selection fell back to the whole heap");
   }
@@ -14974,19 +15157,25 @@ void TestBoundedScalarMaterialImageKeys() {
     }
     return false;
   };
-  const SrtRuntime runtime{.user_data = user_data, .userdata = &memory,
+  // The loop count is read through the ordinary reader (c6ff4a35e: a GPU-written count must
+  // drain GPU-owned memory), so this runtime supplies both readers.
+  const SrtRuntime runtime{.user_data = user_data, .read_memory = read, .userdata = &memory,
                            .read_specialization_memory = read};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
   for (const uint32_t stride : {160u, 16u}) {
     memory = {.stride = stride, .records = stride == 160u ? 409u : 20u};
     Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-              memory.keys == 4 && memory.images == 4 && snapshot.images.size() == 4,
+              // Each root keeps a null placeholder ahead of its two candidates.
+              memory.keys == 4 && memory.images == 4 && snapshot.images.size() == 6,
           "scalar material selection used V# stride as its instruction stride or scanned unused keys");
     for (uint32_t root = 0; root < plan.info.images.size(); ++root) {
-      const auto &selector = *plan.descriptor_sources[plan.info.images[root].source].indirect_descriptor->selector;
-      const uint32_t first = selector.offset == 0x94u ? 5573u : 5567u;
-      const auto offset = specialization.images[root].indirect_mapping_offset;
+      const auto &indirect =
+          *plan.descriptor_sources[plan.info.images[root].source].indirect_descriptor;
+      const uint32_t first = indirect.selector_offset == 0x94u ? 5573u : 5567u;
+      // The slot holds the mapping's offset; the mapping's first word is its key count.
+      const auto offset =
+          snapshot.flattened_srt[specialization.images[root].indirect_mapping_offset];
       Check(snapshot.flattened_srt[offset] == 2u &&
                 snapshot.flattened_srt[offset + 1u] == first &&
                 snapshot.flattened_srt[offset + 3u] == first + 15u,
@@ -14997,10 +15186,13 @@ void TestBoundedScalarMaterialImageKeys() {
     memory = {.count = same_key ? 2u : 1u, .same_key = same_key};
     Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
               memory.keys == (same_key ? 4u : 2u) && memory.images == 2 &&
-              snapshot.images.size() == 2 &&
-              std::ranges::all_of(specialization.images, [](const auto &image) {
-                return image.indirect_root == ImageResource::NoIndirectImage;
-              }), "single-candidate scalar material loop retained an indirect image mapping");
+              // Ordinal 0 stays null here (an unenumerated key must not sample a real texture),
+              // so one candidate is a one-child mapping rather than upstream's direct image.
+              snapshot.images.size() == 4 && specialization.images.size() == 4 &&
+              specialization.images[0].indirect_root == 0u &&
+              specialization.images[1].indirect_root == 1u &&
+              specialization.images[2].indirect_root != specialization.images[3].indirect_root,
+          "single-candidate scalar material loop did not bind exactly one child per root");
   }
   memory = {.count = 0};
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
@@ -15022,9 +15214,10 @@ void TestBoundedScalarMaterialImageKeys() {
   Check(MaterializeResources(plan, runtime, snapshot, specialization),
         "native scalar material image selection did not recover after rejected candidates");
   ApplyResourceSpecialization(translated.program, specialization);
-  Check(translated.program.info.images.size() == 4 &&
-            translated.program.info.images[0].indirect_resources.size() == 2 &&
-            translated.program.info.images[1].indirect_resources.size() == 2,
+  // Each root lists its null ordinal-0 self plus its two candidates.
+  Check(translated.program.info.images.size() == 6 &&
+            translated.program.info.images[0].indirect_resources.size() == 3 &&
+            translated.program.info.images[1].indirect_resources.size() == 3,
         "native image reads lost their distinct material field dispatches");
 }
 
@@ -16550,6 +16743,7 @@ int main() {
   TestNativeShaderResourceDependencies();
   TestNormalizedImageContracts();
   TestShaderFeatureCollection();
+  TestFunctionLdsIsSizedFromItsAddresses();
   TestTypedSpirvSerialization();
   TestDeferredSpirvPhiPatching();
   TestCompilerStageInputOwnership();
@@ -16670,6 +16864,8 @@ int main() {
   TestNewShaderRecompilerSetpcBranch();
   TestPlainSetpcThroughS6DecodesFollowingCode();
   TestFrontHalfDecodeStopsAtHandoff();
+  TestGraphicsComputeGetreg();
+  TestMemoryFedScalarLeafCall();
   TestFusedShaderHandoffPreservesRegisters();
   TestMeshExportStorage();
   TestMeshAuxiliaryPositionOutputs();

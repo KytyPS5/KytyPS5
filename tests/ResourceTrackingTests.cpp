@@ -9120,6 +9120,152 @@ void TestCarriedDescriptorReadIsNotFlattened() {
 }
 
 // A captured scalar read of a written buffer leaves the overlap list only if no store precedes it.
+void TestOrderedScalarReadOverWrittenBuffer() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  enum class Order { ReadFirst, WriteFirst, WriteInLoop };
+  for (const auto order : {Order::ReadFirst, Order::WriteFirst, Order::WriteInLoop}) {
+    Fixture fixture;
+    auto *entry = fixture.block;
+    auto *later = fixture.AddBlock();
+    auto *done = fixture.AddBlock();
+    entry->AddBranch(later);
+    entry->AddBranch(done);
+    later->AddBranch(done);
+    if (order == Order::WriteInLoop) {
+      done->AddBranch(entry);
+      done->AddBranch(later);
+    }
+    // A uniform branch condition read from memory makes the plan capture its scalar reads.
+    const auto control = fixture.Buffer({fixture.UserData(0), fixture.UserData(1),
+                                        fixture.UserData(2), fixture.UserData(3)});
+    MemoryInfo scalar;
+    scalar.kind = ResourceKind::ScalarBuffer;
+    scalar.offset = 28;
+    const auto flag = fixture.Emit(ValueOpcode::ReadConstBuffer, {control, Value(0u)},
+                                   fixture.AddMemory(scalar, 4));
+    if (order == Order::WriteInLoop) {
+    }
+    const auto root = fixture.Address(fixture.UserData(4), Value(0u));
+    MemoryInfo address;
+    address.kind = ResourceKind::ScalarAddress;
+    address.offset = 24;
+    const auto low = fixture.Emit(ValueOpcode::LoadAddressU32,
+                                  {root, Value(0u), Value(0u), Value(true)},
+                                  fixture.AddMemory(address, 8));
+    address.offset = 28;
+    const auto high = fixture.Emit(ValueOpcode::LoadAddressU32,
+                                   {root, Value(0u), Value(0u), Value(true)},
+                                   fixture.AddMemory(address, 12));
+    const auto flags = fixture.Buffer({low, high, Value(64u), Value(0u)}, 16);
+    const auto Store = [&](Block *block) {
+      MemoryInfo store;
+      store.kind = ResourceKind::Buffer;
+      store.offset = 24;
+      const auto memory = fixture.AddMemory(store, 16);
+      fixture.Emit(ValueOpcode::StoreBufferU32,
+                   {flags, Value(0u), Value(0u), Value(0u), Value(1u), Value(true)}, memory, block);
+      return memory;
+    };
+    if (order == Order::WriteFirst) Store(entry);
+    address.offset = 24;
+    const auto read = fixture.Emit(ValueOpcode::LoadAddressU32,
+                                   {fixture.Address(low, high), Value(0u), Value(0u), Value(true)},
+                                   fixture.AddMemory(address, 20));
+    // A store in the branch arm also keeps the memory condition from folding as an empty detour.
+    const auto store_flags = Store(later);
+    if (order == Order::WriteInLoop) Store(done);
+    fixture.PlanAndTrack();
+    const auto &program = fixture.program;
+    Check(program.srt_read_order.size() == program.srt_reads.size(),
+          "the ordered-read fixture has no order per flat slot");
+    uint32_t slot = UINT32_MAX;
+    for (uint32_t i = 0; i < program.srt_reads.size(); ++i)
+      if (program.srt_reads[i].value.Resolve() == read.Resolve()) slot = i;
+    const auto written = program.memory_info[store_flags.index].resource;
+    Check(slot != UINT32_MAX && written < program.info.buffers.size() &&
+              program.info.buffers[written].written,
+          "the ordered-read fixture lost its read or its written buffer");
+    const auto &proof = program.srt_read_order[slot];
+    const bool preceded = proof.unknown || ((proof.buffers >> written) & 1u) != 0u;
+    Check(preceded == (order != Order::ReadFirst),
+          order == Order::ReadFirst ? "a read no store can precede was ordered after one"
+                                    : "a read a store can precede was proven to come first");
+
+    auto plan = ExtractResourcePlan(program);
+    Check(plan.capture_specialization_reads && plan.srt_read_order.size() == plan.srt_reads.size(),
+          "the ordered-read fixture did not capture its scalar reads");
+    LinearTestMemory memory;
+    memory.words[0x1c / 4] = 1u;
+    memory.words[0x58 / 4] = 0x1100u;
+    const std::array<uint32_t, 5> user_data{0x1000u, 0u, 64u, 0u, 0x1040u};
+    const SrtRuntime runtime{.user_data = user_data, .read_memory = ReadLinearTestMemory,
+                             .userdata = &memory,
+                             .read_specialization_memory = ReadLinearTestMemory};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              snapshot.specialization_reads.size() == snapshot.specialization_read_slots.size() &&
+              !snapshot.specialization_reads.empty(),
+          "a scalar read over a written buffer refused the materialization");
+    const bool listed = std::ranges::any_of(snapshot.specialization_reads, [](const auto &range) {
+      return range.first < 0x1140u && 0x1100u < range.first + range.second;
+    });
+    Check(listed == (order != Order::ReadFirst),
+          order == Order::ReadFirst ? "a read no store can precede stayed in the overlap list"
+                                    : "a read a store can precede left the overlap list");
+  }
+}
+
+
+
+
+
+// A store through a V# that does not come from memory has nothing a shader decode could read.
+void TestLoopPhiStoreDescriptorIsRefused() {
+  Fixture fixture;
+  auto *entry = fixture.block;
+  auto *loop = fixture.AddBlock();
+  entry->AddBranch(loop);
+  loop->AddBranch(loop);
+  auto &phi = loop->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+  phi.AddPhiOperand(entry, fixture.UserData(0));
+  phi.AddPhiOperand(loop, fixture.Emit(ValueOpcode::IAdd32, {Value(&phi), Value(4u)}, 0, loop));
+  const auto handle = fixture.Emit(ValueOpcode::GetBufferResource,
+                                   {Value(&phi), Value(0u), Value(0u), Value(0u)},
+                                   MemoryFlags{0, 16}, loop);
+  MemoryInfo memory;
+  memory.kind = ResourceKind::Buffer;
+  fixture.Emit(ValueOpcode::StoreBufferU32,
+               {handle, Value(0u), Value(0u), Value(0u), Value(1u), Value(true)},
+               fixture.AddMemory(memory, 16), loop);
+  const auto status = fixture.TryPlanAndTrack();
+  Check(!status.ok && status.pc == 16 && status.reason.find("not a valid runtime value") !=
+                                             std::string::npos &&
+            !fixture.program.resource_tracking_complete,
+        "an advancing descriptor phi under a store was not refused with its reason");
+}
+
+// A lane index without readfirstlane has no host descriptor, so the V# is decoded in the shader.
+void TestLaneMaskDescriptorDword() {
+  Fixture fixture;
+  const auto lane = fixture.Emit(ValueOpcode::LaneId);
+  const auto bit = fixture.Emit(
+      ValueOpcode::INotEqual32,
+      {fixture.Emit(ValueOpcode::BitwiseAnd32, {lane, Value(1u)}), Value(0u)});
+  const auto records = fixture.Emit(ValueOpcode::SelectU32, {bit, Value(0x400u), Value(0x800u)});
+  MemoryInfo memory;
+  memory.kind = ResourceKind::Buffer;
+  fixture.Emit(ValueOpcode::LoadBufferU32,
+               {fixture.Buffer({fixture.UserData(0), fixture.UserData(1), records,
+                                fixture.UserData(3)},
+                               0x15c),
+                Value(0u), Value(0u), Value(0u), Value(true)},
+               fixture.AddMemory(memory, 0x15c));
+  fixture.PlanAndTrack();
+  Check(fixture.program.info.buffers.empty() && StoresDecodedInShader(fixture.program),
+        "a lane index outside a readfirstlane reached a host descriptor");
+}
+
 } // namespace
 
 int main() {
@@ -9204,6 +9350,9 @@ int main() {
     Run("deep planning value chain", TestDeepPlanningValueChain);
     Run("deep uniform value chain", TestDeepUniformValueChain);
     Run("carried descriptor read is not flattened", TestCarriedDescriptorReadIsNotFlattened);
+    Run("ordered scalar read over a written buffer", TestOrderedScalarReadOverWrittenBuffer);
+    Run("loop phi store descriptor is refused", TestLoopPhiStoreDescriptorIsRefused);
+    Run("lane mask descriptor dword", TestLaneMaskDescriptorDword);
   } catch (const std::exception &exception) {
     std::cerr << "resource tracking test failed: " << exception.what() << '\n';
     return 1;

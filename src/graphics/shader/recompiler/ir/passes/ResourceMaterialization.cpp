@@ -1522,9 +1522,6 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 			}
 		}
 		if (const auto found = cloned.find(source); found != cloned.end()) {
-			return Value(found->second);
-		}
-		auto& target =
 		    plan.value_storage.emplace_back(source->GetOpcode(), source->Flags<uint64_t>());
 		if (source->GetOpcode() == ValueOpcode::LoadAddressU32 ||
 		    source->GetOpcode() == ValueOpcode::ReadConstBuffer ||
@@ -1532,17 +1529,10 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 			target.SetFlags(SrtReadFlags {.index = source->Flags<MemoryFlags>().index});
 		}
 		cloned.emplace(source, &target);
-		if (source->GetOpcode() == ValueOpcode::Phi) {
-			for (size_t index = 0; index < source->NumArgs(); index++) {
 				target.AddPhiOperand(nullptr, Clone(source->Arg(index)));
-			}
-		} else {
-			for (size_t index = 0; index < source->NumArgs(); index++) {
 				target.SetArg(index, Clone(source->Arg(index)));
-			}
-		}
-		return Value(&target);
 	};
+	plan.srt_read_order  = program.srt_read_order;
 
 	bool capture_indirect_reads = false;
 	plan.descriptor_sources.reserve(program.descriptor_sources.size());
@@ -1716,28 +1706,60 @@ std::string_view LastMaterializeFailure() {
 
 		}
 	}
-	auto words = fill.fill.words;
-	std::array<uint32_t, 4> stored {};
-	if (uniform_fill && !fill.pattern_size.IsEmpty())
-		uniform_fill = clean.Evaluate(fill.pattern_size, words) && words >= 1 && words <= 4;
-	uint32_t elements = 0;
-	if (uniform_fill && !fill.element_count.IsEmpty())
-		uniform_fill = clean.Evaluate(fill.element_count, elements) && elements != 0;
-	for (uint32_t i = 0; i < words && uniform_fill; ++i) {
 		uniform_fill = clean.Evaluate(fill.values[i], stored[i]) && stored[i] == stored[0];
-	}
-	if (uniform_fill) {
 		snapshot.uniform_fill.value = stored[0];
-		snapshot.uniform_fill.bounded_elements = elements;
+// Drops captured reads no write can precede; true when a refusable branch condition read remains.
+static bool CapturedReadsOverlapWrites(const ResourcePlan& program, ResourceSnapshot& snapshot,
+                                       std::vector<uint8_t>& conditions) {
+	auto&             reads = snapshot.specialization_reads;
+	auto&             slots = snapshot.specialization_read_slots;
+	std::vector<bool> exempt(reads.size(), false);
+	bool              any_exempt = false;
+	bool              overlap    = false;
+	for (uint32_t i = 0; i < program.info.buffers.size() && i < snapshot.buffers.size(); ++i) {
+		if (!program.info.buffers[i].written) continue;
+		ShaderBufferResource buffer;
+		if (!DecodeBufferDescriptor(snapshot.buffers[i], buffer)) continue;
+		const auto base     = buffer.Base48();
+		const auto size     = buffer.GetSize();
+		const bool sentinel = buffer.NumRecords() == UINT32_MAX;
+		if (base == 0u || size == 0u) continue;
+		// The leading ranges are the linked code. They only detect a changed leaf.
+		for (size_t r = program.source_reads.size(); r < reads.size(); ++r) {
+			const auto [address, bytes] = reads[r];
+			if (bytes == 0u || exempt[r] || snapshot.HeapRead(r) ||
+			    (sentinel ? address > base || base - address >= bytes
+			              : address >= base + size || base >= address + bytes))
+				continue;
+			const auto  slot = r < slots.size() ? slots[r] : UINT32_MAX;
+			const auto* order =
+			    program.stage == ShaderType::Compute && slot < program.srt_read_order.size()
+			        ? &program.srt_read_order[slot]
+			        : nullptr;
+			if (order == nullptr || order->unknown || i >= 64u ||
+			    ((order->buffers >> i) & 1u) != 0u) {
+				overlap = overlap || (r < conditions.size() && conditions[r] != 0u);
+				continue;
+			}
+			exempt[r]  = true;
+			any_exempt = true;
+		}
 	}
-	const auto evaluate = [&](uint32_t source, DescriptorValue& value, bool written = false) {
-		if (source >= program.descriptor_sources.size()) {
-			return false;
+	if (any_exempt) {
+		size_t kept = 0;
+		for (size_t r = 0; r < reads.size(); ++r) {
+			if (exempt[r]) continue;
+			reads[kept] = reads[r];
+			if (r < slots.size()) slots[kept] = slots[r];
+			if (r < conditions.size()) conditions[kept] = conditions[r];
+			kept++;
 		}
-		if (active.empty() || active[source]) {
-			return (capture_reads && written ? clean : walker).EvaluateDescriptor(source, value) ||
-			    SpecializationFail(fmt::format("descriptor evaluation source={}", source));
-		}
+		reads.resize(kept);
+		slots.resize(std::min(slots.size(), kept));
+		conditions.resize(std::min(conditions.size(), kept));
+	}
+	return overlap;
+}
 
 static bool SpecializeBuffers(const ResourcePlan& program, ResourceSnapshot& snapshot,
                               ResourceSpecialization& specialization) {

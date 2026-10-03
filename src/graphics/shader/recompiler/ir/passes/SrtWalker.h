@@ -87,6 +87,26 @@ void CompileSrtWalker(ResourcePlan& program);
 // Uses the strict reader for values that affect shader specialization.
 SrtRuntime CleanRuntime(SrtRuntime runtime);
 
+// Why a walk refused, for the one-line refusal report.
+enum class SrtRefusal : uint8_t {
+	None,
+	UnsupportedOpcode,
+	UnsupportedOperand,
+	UndefinedValue,
+	VaryingPhi,
+	PhiNoEntry,
+	PhiMerge,
+	ReadOutOfBounds,
+	ReadRefused,
+	GpuOwned,
+	VaryingLane,
+};
+
+[[nodiscard]] std::string_view SrtRefusalName(SrtRefusal reason);
+
+// The flat SRT slot whose walk is reading now; UINT32_MAX outside one.
+uint32_t CurrentSrtReadSlot();
+
 // The lane a per-lane sweep is on; `dependent` is set once a walk asks for it.
 struct LaneScope {
 	uint32_t lane      = 0;

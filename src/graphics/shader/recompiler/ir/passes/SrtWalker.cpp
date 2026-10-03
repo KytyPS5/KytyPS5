@@ -54,6 +54,39 @@ SrtRuntime CleanRuntime(SrtRuntime runtime) {
 
 namespace {
 
+thread_local uint32_t            g_srt_read_slot  = UINT32_MAX;
+thread_local const RawReadEvent* g_raw_read_event = nullptr;
+
+class SrtReadSlotScope {
+public:
+	explicit SrtReadSlotScope(uint32_t slot): m_saved(g_srt_read_slot) { g_srt_read_slot = slot; }
+	~SrtReadSlotScope() { g_srt_read_slot = m_saved; }
+	SrtReadSlotScope(const SrtReadSlotScope&)            = delete;
+	SrtReadSlotScope& operator=(const SrtReadSlotScope&) = delete;
+
+private:
+	uint32_t m_saved;
+};
+
+std::string_view SrtRefusalName(SrtRefusal reason) {
+	switch (reason) {
+		case SrtRefusal::None: return "no recorded reason";
+		case SrtRefusal::UnsupportedOpcode: return "unsupported opcode";
+		case SrtRefusal::UnsupportedOperand: return "unsupported operand";
+		case SrtRefusal::UndefinedValue: return "undefined value";
+		case SrtRefusal::VaryingPhi: return "loop-carried value varies per iteration";
+		case SrtRefusal::PhiNoEntry: return "loop-carried value has no entry value";
+		case SrtRefusal::PhiMerge: return "loop-carried value has disagreeing entry values";
+		case SrtRefusal::ReadOutOfBounds: return "read address out of range";
+		case SrtRefusal::ReadRefused: return "guest read refused";
+		case SrtRefusal::GpuOwned: return "GPU-owned data";
+		case SrtRefusal::VaryingLane: return "value varies per lane";
+	}
+	return "unknown reason";
+}
+
+namespace {
+
 constexpr uint64_t AddressMask = 0x0000ffffffffffffull;
 
 bool AddSignedAddress(uint64_t base, int64_t offset, uint64_t& result) {
@@ -2002,6 +2035,7 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat, bool prune, SrtWa
 			return fail(SrtRefusal::ReadRefused);
 		auto& evaluator = clean ? *m_clean_evaluator : *this;
 		if (read.flat_offset >= flat.size()) return fail(SrtRefusal::UnsupportedOperand);
+		const SrtReadSlotScope scope(slot);
 		if (evaluator.Evaluate(read.value, flat[read.flat_offset])) return true;
 		if (gpu_owned_slots != nullptr && evaluator.m_refusal == SrtRefusal::GpuOwned) {
 		return fail(evaluator.m_refusal);

@@ -547,6 +547,7 @@ public:
 				for (const auto& use: uses) use.user->SetArg(use.operand, key);
 			}
 		}
+		m_program.srt_read_order             = OrderSrtReadsAgainstWrites();
 		m_program.descriptor_sources         = std::move(m_sources);
 		m_program.info                       = std::move(m_info);
 		m_program.resource_tracking_complete = true;
@@ -554,6 +555,89 @@ public:
 	}
 
 private:
+	// Per flat SRT slot, the buffers a store can have written before a read of that slot.
+	std::vector<SrtReadWriteOrder> OrderSrtReadsAgainstWrites() const {
+		const auto                                 count = m_program.blocks.size();
+		std::unordered_map<const Block*, uint32_t> indices;
+		for (uint32_t i = 0; i < count; i++)
+			indices.emplace(m_program.blocks[i], i);
+		const auto written = [&](const Inst& inst, SrtReadWriteOrder& order) {
+			const auto op     = inst.GetOpcode();
+			const auto buffer = BufferAccessOf(op);
+			const auto image  = ImageOpcodeInfoOf(op).access;
+			if (image == ImageAccess::Write || image == ImageAccess::Atomic ||
+			    AddressOpcodeInfoOf(op).access == AddressAccess::Write) {
+				order.unknown = true;
+				return;
+			}
+			if (buffer != BufferAccess::Write && buffer != BufferAccess::Atomic) return;
+			const auto index = inst.Flags<MemoryFlags>().index;
+			if (index >= m_program.memory_info.size()) {
+				order.unknown = true;
+				return;
+			}
+			const auto& memory = m_program.memory_info[index];
+			if (memory.planning_only || memory.kind != ResourceKind::Buffer ||
+			    memory.resource >= m_info.buffers.size() || memory.resource >= 64u) {
+				order.unknown = true;
+				return;
+			}
+			order.buffers |= uint64_t {1} << memory.resource;
+		};
+		const auto merge = [](SrtReadWriteOrder& into, const SrtReadWriteOrder& from) {
+			const auto before = into;
+			into.buffers |= from.buffers;
+			into.unknown = into.unknown || from.unknown;
+			return into != before;
+		};
+		std::vector<SrtReadWriteOrder> generated(count, SrtReadWriteOrder {.unknown = false});
+		for (uint32_t i = 0; i < count; i++)
+			for (const auto& inst: *m_program.blocks[i])
+				written(inst, generated[i]);
+		std::vector<SrtReadWriteOrder> entry(count, SrtReadWriteOrder {.unknown = false});
+		std::vector<uint32_t>          pending(count);
+		std::vector<uint8_t>           queued(count, 1u);
+		for (uint32_t i = 0; i < count; i++)
+			pending[i] = i;
+		while (!pending.empty()) {
+			const auto block = pending.back();
+			pending.pop_back();
+			queued[block] = 0u;
+			auto exit     = entry[block];
+			merge(exit, generated[block]);
+			for (const auto* successor: m_program.blocks[block]->ImmSuccessors()) {
+				const auto next = indices.find(successor);
+				if (next == indices.end()) return {};
+				if (merge(entry[next->second], exit) && !queued[next->second]) {
+					queued[next->second] = 1u;
+					pending.push_back(next->second);
+				}
+			}
+		}
+		std::vector<SrtReadWriteOrder> order(m_program.srt_reads.size());
+		std::vector<uint8_t>           seen(order.size(), 0u);
+		for (uint32_t i = 0; i < count; i++) {
+			auto running = entry[i];
+			for (const auto& inst: *m_program.blocks[i]) {
+				if (inst.GetOpcode() == ValueOpcode::ReadConst) {
+					const auto slot = inst.Arg(1).Resolve();
+					if (!slot.IsImmediate() || slot.GetType() != Type::U32 ||
+					    slot.U32() >= order.size())
+						continue;
+					auto& into = order[slot.U32()];
+					if (!seen[slot.U32()]) {
+						seen[slot.U32()] = 1u;
+						into             = SrtReadWriteOrder {.unknown = false};
+					}
+					merge(into, running);
+					continue;
+				}
+				written(inst, running);
+			}
+		}
+		return order;
+	}
+
 	struct HandlePatch {
 		Inst*    handle   = nullptr;
 		uint32_t resource = 0;

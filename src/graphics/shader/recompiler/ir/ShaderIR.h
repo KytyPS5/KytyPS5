@@ -653,6 +653,13 @@ struct SrtRead {
 	bool operator==(const SrtRead& other) const = default;
 };
 
+struct SrtReadWriteOrder {
+	uint64_t buffers = 0;
+	bool     unknown = true;
+
+	bool operator==(const SrtReadWriteOrder& other) const = default;
+};
+
 struct ResourceBlock {
 	// Conditional successors are ordered true, false; an empty condition follows every edge.
 	Value                 condition;
@@ -730,6 +737,7 @@ struct ResourcePlan {
 	std::vector<ResourceBlock>          control_flow;
 	std::unordered_map<const Inst*, std::vector<uint32_t>> control_phi_predecessors;
 	std::vector<SrtRead>                srt_reads;
+	std::vector<SrtReadWriteOrder>                         srt_read_order;
 	bool                                requires_specialization_memory = false;
 	std::vector<std::pair<uint64_t, uint64_t>> source_reads;
 	bool                                capture_specialization_reads = false;

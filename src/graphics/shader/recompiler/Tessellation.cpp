@@ -12,6 +12,7 @@
 #include <array>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler {
 namespace {
@@ -23,8 +24,16 @@ struct TessellationAddress {
 	uint32_t constant    = 0;
 };
 
+struct TessellationPatchRange {
+	uint32_t begin = UINT32_MAX;
+	uint32_t end   = 0;
+};
+
+// Also reports the range of the HS's per-patch outputs: constant stores past the control
+// point records.
 uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
-                                   uint32_t control_points, uint32_t input_stride) {
+                                   uint32_t control_points, uint32_t input_stride,
+                                   TessellationPatchRange* patch = nullptr) {
 	using namespace Decoder;
 	using Address = TessellationAddress;
 	using Kind    = Address::Kind;
@@ -79,14 +88,47 @@ uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
 		           ? value
 		           : Address {};
 	};
+	const auto same = [](const Address& lhs, const Address& rhs) {
+		return lhs.kind == rhs.kind && lhs.coefficient == rhs.coefficient &&
+		       lhs.constant == rhs.constant;
+	};
+	// Forward branches to an internal join: at the join, a register keeps its address only if
+	// every incoming path agrees on it.
+	std::vector<std::pair<uint32_t, std::array<Address, IR::NumVectorRegs>>> joins;
+	std::vector<TessellationPatchRange> constant_stores;
 	uint32_t stride = 0;
+	// Cleared after an unconditional branch: until a join, no path reaches the instructions.
+	bool reachable = true;
 	for (const auto& inst: program.instructions) {
-		// Stage exits preserve the active path's definitions. An internal join
-		// would require merging register definitions.
-		EXIT_NOT_IMPLEMENTED(IsDirectBranch(inst.opcode) &&
-		                     inst.branch_target != program.instructions.back().pc);
+		for (auto join = joins.begin(); join != joins.end();) {
+			if (join->first != inst.pc) {
+				++join;
+				continue;
+			}
+			if (!reachable) {
+				registers = join->second;
+				reachable = true;
+			} else {
+				for (size_t reg = 0; reg < registers.size(); reg++) {
+					if (!same(registers[reg], join->second[reg])) registers[reg] = {};
+				}
+			}
+			join = joins.erase(join);
+		}
+		if (!reachable) continue;
+		// Stage exits preserve the active path's definitions.
+		if (IsDirectBranch(inst.opcode) && inst.branch_target != program.instructions.back().pc) {
+			EXIT_NOT_IMPLEMENTED(inst.branch_target <= inst.pc);
+			joins.emplace_back(inst.branch_target, registers);
+		}
+		if (inst.opcode == Opcode::S_BRANCH || inst.opcode == Opcode::S_ENDPGM) {
+			reachable = false;
+			continue;
+		}
 		const bool local_store =
-		    inst.opcode == Opcode::DS_WRITE_B32 || inst.opcode == Opcode::DS_WRITE2_B32;
+		    inst.opcode == Opcode::DS_WRITE_B32 || inst.opcode == Opcode::DS_WRITE2_B32 ||
+		    inst.opcode == Opcode::DS_WRITE_B64 || inst.opcode == Opcode::DS_WRITE2_B64 ||
+		    inst.opcode == Opcode::DS_WRITE_B96 || inst.opcode == Opcode::DS_WRITE_B128;
 		const bool buffer_store = inst.opcode == Opcode::BUFFER_STORE_DWORD ||
 		                          inst.opcode == Opcode::BUFFER_STORE_DWORDX2 ||
 		                          inst.opcode == Opcode::BUFFER_STORE_DWORDX3 ||
@@ -94,12 +136,18 @@ uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
 		const bool control_store =
 		    !local && buffer_store && inst.src2.kind == OperandKind::Sgpr && inst.src2.reg == 2u;
 		const bool control_read =
-		    !local && (inst.opcode == Opcode::DS_READ_B32 || inst.opcode == Opcode::DS_READ2_B32);
+		    !local && (inst.opcode == Opcode::DS_READ_B32 || inst.opcode == Opcode::DS_READ2_B32 ||
+		               inst.opcode == Opcode::DS_READ_B64 || inst.opcode == Opcode::DS_READ2_B64 ||
+		               inst.opcode == Opcode::DS_READ_B96 || inst.opcode == Opcode::DS_READ_B128);
 		if ((local && local_store) || control_store || control_read) {
 			const auto address = read(inst.src0);
 			if (address.kind != Kind::Affine) {
 				EXIT("%s tessellation address is not affine at pc 0x%08x\n", local ? "LS" : "HS",
 				     inst.pc);
+			}
+			if (control_store && address.coefficient == 0u) {
+				const auto begin = address.constant + inst.offset;
+				constant_stores.push_back({begin, begin + 4u * std::max(inst.data_dwords, 1u)});
 			}
 			if (address.coefficient != 0u) {
 				const auto expected = control_read ? input_stride : stride;
@@ -123,6 +171,18 @@ uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
 					if (rhs.constant == 0u && third.constant == 8u) value = constant(0u);
 				}
 				break;
+			case Opcode::V_AND_B32: {
+				// The packed HS ID's low byte is the patch ordinal: zero for the logical patch.
+				const auto mask_of = [](Address operand) {
+					return operand.kind == Kind::Affine && operand.coefficient == 0u &&
+					       (operand.constant & ~0xffu) == 0u;
+				};
+				if ((lhs.kind == Kind::PackedControlPoint && mask_of(rhs)) ||
+				    (rhs.kind == Kind::PackedControlPoint && mask_of(lhs)))
+					value = constant(0u);
+				break;
+			}
+			case Opcode::V_ADD_NC_U32: value = add(lhs, rhs); break;
 			case Opcode::V_MUL_U32_U24: value = multiply(low24(lhs), low24(rhs)); break;
 			case Opcode::V_MAD_U32_U24: value = add(multiply(low24(lhs), low24(rhs)), third); break;
 			case Opcode::V_LSHL_ADD_U32:
@@ -150,6 +210,14 @@ uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
 		registers.at(inst.dst.reg) = value;
 	}
 	EXIT_NOT_IMPLEMENTED(stride == 0u);
+	if (patch != nullptr) {
+		for (const auto& store: constant_stores) {
+			if (store.begin >= stride * control_points) {
+				patch->begin = std::min(patch->begin, store.begin);
+				patch->end   = std::max(patch->end, store.end);
+			}
+		}
+	}
 	return stride;
 }
 
@@ -173,14 +241,25 @@ IR::Value ActiveAddress(IR::Block& block, IR::Block::iterator before, IR::Value 
 		           ? ActiveAddress(block, before, source->Arg(1), predicate, resolved)
 		           : value;
 	}
-	if (source->GetOpcode() != ValueOpcode::IAdd32 && source->GetOpcode() != ValueOpcode::ISub32)
+	const auto opcode = source->GetOpcode();
+	if (opcode != ValueOpcode::IAdd32 && opcode != ValueOpcode::ISub32 &&
+	    opcode != ValueOpcode::IMul32 && opcode != ValueOpcode::ShiftLeftLogical32 &&
+	    opcode != ValueOpcode::BitFieldUExtract)
 		return value;
-	const auto lhs = ActiveAddress(block, before, source->Arg(0), predicate, resolved);
-	const auto rhs = ActiveAddress(block, before, source->Arg(1), predicate, resolved);
-	if (lhs != source->Arg(0).Resolve() || rhs != source->Arg(1).Resolve()) {
-		auto copy = block.PrependNewInst(before, source->GetOpcode(), {lhs, rhs},
-		                                 source->Flags<uint64_t>());
-		value     = Value(&*copy);
+	// Address arithmetic; 24-bit multiplies also extract their operands' low bits.
+	std::array<Value, 3> args {};
+	bool                 changed = false;
+	for (size_t index = 0; index < source->NumArgs(); index++) {
+		args[index] = ActiveAddress(block, before, source->Arg(index), predicate, resolved);
+		changed |= args[index] != source->Arg(index).Resolve();
+	}
+	if (changed) {
+		auto copy =
+		    source->NumArgs() == 3u
+		        ? block.PrependNewInst(before, opcode, {args[0], args[1], args[2]},
+		                               source->Flags<uint64_t>())
+		        : block.PrependNewInst(before, opcode, {args[0], args[1]}, source->Flags<uint64_t>());
+		value = Value(&*copy);
 	}
 	resolved.emplace(source, value);
 	return value;
@@ -194,10 +273,17 @@ void AnalyzeTessellationPrograms(std::span<const uint32_t> local, std::span<cons
 	Decoder::Program control_program;
 	Decoder::DecodeProgram(control, control_program);
 	info.ls_stride = ReflectTessellationStride(local_program, true, info.input_control_points, 0u);
+	TessellationPatchRange patch;
 	info.hs_stride = ReflectTessellationStride(control_program, false, info.output_control_points,
-	                                           info.ls_stride);
-	LOGF("Tessellation interface: input_cp=%u output_cp=%u ls_stride=%u hs_stride=%u\n",
-	     info.input_control_points, info.output_control_points, info.ls_stride, info.hs_stride);
+	                                           info.ls_stride, &patch);
+	if (patch.begin < patch.end) {
+		info.patch_base = patch.begin;
+		info.patch_size = patch.end - patch.begin;
+	}
+	LOGF("Tessellation interface: input_cp=%u output_cp=%u ls_stride=%u hs_stride=%u "
+	     "patch=0x%x+0x%x\n",
+	     info.input_control_points, info.output_control_points, info.ls_stride, info.hs_stride,
+	     info.patch_base, info.patch_size);
 }
 
 void LowerTessellationMemory(IR::Program& program, const CompileOptions& options) {
@@ -266,10 +352,11 @@ void LowerTessellationMemory(IR::Program& program, const CompileOptions& options
 					EXIT_NOT_IMPLEMENTED(write
 					                         ? options.stage != ShaderType::TessellationControl
 					                         : options.stage != ShaderType::TessellationEvaluation);
-					if (address.IsImmediate() &&
-					    address.U32() >= tess.hs_stride * tess.output_control_points) {
-						EXIT_NOT_IMPLEMENTED(!write);
-						kind = TessellationAttribute::PatchOutput;
+					// The instruction offset is part of the byte address, as in the reflection.
+					if (address.IsImmediate() && address.U32() + memory.offset >=
+					                                 tess.hs_stride * tess.output_control_points) {
+						kind = write ? TessellationAttribute::PatchOutput
+						             : TessellationAttribute::PatchInput;
 					}
 				}
 			} else {

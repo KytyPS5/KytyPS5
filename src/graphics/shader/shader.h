@@ -121,6 +121,9 @@ struct ShaderTessellationInputInfo {
 	uint32_t domain                = 0;
 	uint32_t partitioning          = 0;
 	uint32_t output_topology       = 0;
+	// Per-patch HS outputs (offchip ring), shared by the HS writes and the TES reads.
+	uint32_t patch_base            = 0;
+	uint32_t patch_size            = 0;
 };
 
 struct ShaderVertexInputInfo {

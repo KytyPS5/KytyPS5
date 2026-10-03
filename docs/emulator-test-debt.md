@@ -85,6 +85,34 @@ GPU-owned selector to keep the full table live, establish a small numerical
 GPU control, then increase only within a safe bound to find a failing draw
 without repeated driver resets. Missing/sparse keys remain uncovered.
 
+Follow-up test-only commit `38b4fa6c` extends the same coherent guest fixture:
+the index list can contain 16 or all 250 distinct keys, so materialization
+retains 16 or 250 live sampled pairs and SPIR-V has the matching number of
+sample operations. The full case executes one bounded compute dispatch and
+compares **all 250** independently assigned floating-point texture values.
+Native test exe SHA-256
+`cb502a5715ca0048d7c792f77c973c01cdfbd66d32fa21775c221012270df6a0`.
+`_Build/logs/wide-indirect-full-compile-20261003.log*`,
+`wide-indirect-16-gpu-20261003.log*`,
+`wide-indirect-full-gpu-20261003.log*`,
+`wide-indirect-16-proper-gpuav-20261003.log*`, and
+`wide-indirect-full-proper-gpuav-20261003.log*` all have `exitCode=0`,
+`timedOut=false`. The previous three-choice GPU case also passes unchanged
+(`wide-indirect-three-recheck-20261003.log*`). The GPUAV run used
+`_Build/run-regression-gpuav.ps1` and its bundled validation layer; a first
+attempt with `KYTY_TEST_GPU_ASSISTED_VALIDATION=1` but no `VK_LAYER_PATH`
+failed at `vkCreateInstance ErrorLayerNotPresent` and is not a shader RED
+(`wide-indirect-full-gpuav-20261003.log*`). No driver reset occurred.
+
+This covers the full 250-way **compute** switch on the current GPU, including
+first, middle, and last keys, but not a vertex shader or indexed draw. The
+GPU selector is read from a coherent CPU-visible guest buffer; GPU-owned
+selector semantics and missing/sparse keys remain unproved. The next required
+synthetic regression is a bounded native vertex fixture with explicit image
+descriptors, a small indexed draw control and progressive index/resource
+counts, GPU readback, and GPUAV. Keep the first actual failure as the RED;
+do not infer that this passing compute test fixes the game DeviceLost.
+
 A diagnostic attempt to hide only the CPU index words from the clean
 specialization reader did **not** produce such a control. Materialization
 correctly rejected `bounded SRT read 0 index 0 cannot read coherent source at

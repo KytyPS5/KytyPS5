@@ -1,5 +1,26 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **3 октября 2026 года, 08:57 UTC** (native Windows; branch
+`yotei-windows-bringup`, test-only commit `38b4fa6c`; установленный emulator
+exe по-прежнему SHA-256 `5251cfc12f986dda2e9b3c8c761e0e80b5fe0545493dcc210cad803c2da406da`):
+
+- Синтетическая гостевая таблица теперь проверяет не только три CPU-visible
+  индекса, но и все 250 активных вариантов. Тот же ресурсный план сохраняет
+  250 sampled pairs и 250 `OpImageSampleExplicitLod`; один ограниченный native
+  compute dispatch последовательно выбирает все 250 разных 4×4 текстур и
+  сравнивает точные значения всех 250 выходов. Компиляция, 16-вариантный
+  контроль, полный GPU readback и полный GPU assisted validation GREEN на
+  test exe SHA-256 `cb502a5715ca0048d7c792f77c973c01cdfbd66d32fa21775c221012270df6a0`.
+  Логи и команды записаны в `docs/emulator-test-debt.md`. Сброса драйвера в
+  этих тестах не было.
+- Это исключает простой дефект 250-way переключателя в **compute** пути на
+  данном GPU, но не доказывает vertex stage, indexed draw с 119856 индексами
+  или совместное состояние остальных ресурсов игрового pipeline. Следующее:
+  собрать bounded native vertex/indexed-draw fixture с растущими числами
+  ресурсов и индексов, readback и GPUAV; найти минимальный RED без повторного
+  TDR. Затем исправить общий механизм и повторить игру. Меню и gameplay
+  **PENDING**; новая установленная сборка игры пока не проверялась.
+
 Checkpoint **3 октября 2026 года, 08:42 UTC** (native Windows; branch
 `yotei-windows-bringup`, test-only commit `12baacd3` после production
 `79db93d6`; установленный emulator exe всё ещё

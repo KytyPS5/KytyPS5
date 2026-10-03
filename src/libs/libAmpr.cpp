@@ -1193,7 +1193,10 @@ static int ExecuteCommand(const CommandBufferState::Command& entry) {
 	               std::get_if<CommandBufferState::KernelEventCommand>(&entry.data)) {
 		const auto& command = *payload;
 		const auto  eq      = static_cast<LibKernel::EventQueue::KernelEqueue>(command.eq);
-		auto        result  = LibKernel::EventQueue::KernelTriggerUserEvent(
+		// The APR worker registered this completion through KernelAddAmprEvent, which files it
+		// under KERNEL_EVFILT_AMPR. Triggering it as a user event looks for KERNEL_EVFILT_USER
+		// instead, finds nothing, and leaves the title waiting on a completion that never arrives.
+		auto        result  = LibKernel::EventQueue::KernelTriggerAmprEvent(
 		    eq, command.id, reinterpret_cast<void*>(command.data));
 		if (result != OK) {
 			LOGF("\tAPR submit event failed: eq=0x%016" PRIx64 ", id=%" PRId32

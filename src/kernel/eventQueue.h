@@ -18,6 +18,9 @@ constexpr int16_t KERNEL_EVFILT_FILE      = -4;
 constexpr int16_t KERNEL_EVFILT_GRAPHICS  = -14;
 constexpr int16_t KERNEL_EVFILT_VIDEO_OUT = -13;
 constexpr int16_t KERNEL_EVFILT_HRTIMER   = -15;
+// Asynchronous page-read completion. A title's APR worker dispatches on the filter it gets back, so
+// an AMPR completion reported as a plain user event is silently dropped and the read never completes.
+constexpr int16_t KERNEL_EVFILT_AMPR      = -25;
 
 class KernelEqueuePrivate;
 struct KernelEqueueEvent;
@@ -79,6 +82,7 @@ int KYTY_SYSV_ABI KernelAddHRTimerEvent(KernelEqueue eq, int id, const KernelTim
                                         void* udata);
 int KYTY_SYSV_ABI KernelDeleteHRTimerEvent(KernelEqueue eq, int id);
 int KYTY_SYSV_ABI KernelAddAmprEvent(KernelEqueue eq, int id, void* udata);
+int KYTY_SYSV_ABI KernelTriggerAmprEvent(KernelEqueue eq, int id, void* udata);
 int KYTY_SYSV_ABI KernelAddAmprSystemEvent(KernelEqueue eq, int id, void* udata);
 int KYTY_SYSV_ABI KernelDeleteAmprEvent(KernelEqueue eq, int id);
 int KYTY_SYSV_ABI KernelDeleteAmprSystemEvent(KernelEqueue eq, int id);

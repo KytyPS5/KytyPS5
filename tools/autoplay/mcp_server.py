@@ -21,20 +21,24 @@ Environment:
     KYTY_GAME            game directory, used when start_game gets none (or use kyty_run.sh)
     KYTY_EMULATOR_ARGS   extra kyty_emulator arguments, e.g. "--gpu 0"
     KYTY_BOOT_GRACE      seconds allowed before the first frame (default 300)
-    OLLAMA_HOST, KYTY_VISION_MODEL, KYTY_VISION_MAX_WIDTH, KYTY_VISION_TIMEOUT: see vision.py
+    OLLAMA_HOST, KYTY_VISION_MODEL, KYTY_VISION_MAX_WIDTH, KYTY_VISION_TIMEOUT,
+    KYTY_VISION_NUM_CTX, KYTY_VISION_NUM_PREDICT: see vision.py
 
 Needs the `mcp` package (pip install -r tools/autoplay/requirements-mcp.txt); 1.x and 2.x work.
 """
 from __future__ import annotations
 
 import argparse
+import base64
 import hmac
+import io
 import json
 import os
 import secrets
 import re
 import sys
 import time
+import zipfile
 from pathlib import Path
 from typing import Any, Optional
 
@@ -46,6 +50,8 @@ import vision  # noqa: E402
 REFS_DIR = Path(__file__).resolve().parent / "scenarios" / "refs"
 MAX_WAIT_SECONDS = 120.0
 MAX_PRESS_TIMES = 20
+MAX_SHADER_ZIP = 16 * 1024 * 1024
+CAPTURE_NAME = re.compile(r"^[a-z]+_[0-9a-f]+_[0-9a-f]+$")
 
 INSTRUCTIONS = """Plays a PS5 game (GTA V) inside the KytyPS5 emulator.
 
@@ -54,9 +60,10 @@ yourself), decide, press/stick, wait, and look again. Always stop_game when done
 
 Buttons: cross circle square triangle l1 r1 l2 r2 l3 r3 options touchpad up down left right. Xbox
 names work too: a=cross b=circle x=square y=triangle lb=l1 rb=r1 lt=l2 rt=r2 start=options.
-Sticks: x,y in -1..1, y=+1 is forward/up. The vision model can be wrong; check with screenshot when
-an answer looks surprising. When a sequence works, save_reference a crop that identifies the screen so
-it can become a replayable step in tools/autoplay/scenarios/gta5_story.toml."""
+Sticks: x,y in -1..1, y=+1 is forward/up. If look returns unsure or truncated, call screenshot before
+an irreversible press. When the game stops, call summary for the verdict and shader for the capture;
+those are files on this machine. When a sequence works, save_reference a crop that identifies the
+screen so it can become a replayable step in tools/autoplay/scenarios/gta5_story.toml."""
 
 
 def _env_float(name: str, default: float) -> float:
@@ -196,8 +203,63 @@ class GameTools:
             described = vision.describe(shot, question)
         except vision.VisionError as error:
             return {"error": str(error), "screenshot": str(shot)}
-        return {"description": described["answer"], "screenshot": str(shot),
-                "model": described["model"], "seconds": described["seconds"]}
+        described["screenshot"] = str(shot)
+        return described
+
+    def summary(self) -> dict:
+        """summary.md is written just after result.json, so wait out that gap."""
+        run_dir = self._session()
+        path = run_dir / "summary.md"
+        if not path.is_file() and (run_dir / "result.json").is_file():
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline and not path.is_file():
+                time.sleep(0.05)
+        if not path.is_file():
+            return {"error": "no summary.md yet; the game is still running "
+                    "(it is written when the game exits)", "path": str(path)}
+        return {"markdown": path.read_text(), "path": str(path)}
+
+    def _capture_dir(self, run_dir: Path, name: str) -> Path | dict:
+        root = run_dir / "capture"
+        name = name.strip()
+        if name:
+            path = root / name
+            if not CAPTURE_NAME.fullmatch(name) or not path.is_dir():
+                return {"error": f"no capture {name!r}"}
+            return path
+        result = ka.read_json(run_dir / "result.json", {})
+        listed = (result.get("shader") or {}).get("captures") or []
+        if listed:
+            path = Path(listed[0])
+            if path.is_dir() and CAPTURE_NAME.fullmatch(path.name) and path.resolve().parent == root.resolve():
+                return path
+        last = ((ka.read_json(run_dir / "status.json", {}) or {}).get("last_shader") or {}).get("hash") or ""
+        digest = str(last).lower().removeprefix("0x")
+        found = (ka.find_captures(root, digest.rjust(16, "0"))
+                 if re.fullmatch(r"[0-9a-f]{1,16}", digest) else [])
+        if len(found) == 1:
+            return found[0]
+        if len(found) > 1:
+            return {"error": "several captures match; pass name", "names": [p.name for p in found]}
+        return {"error": "no shader capture for this run"}
+
+    def shader(self, name: str = "") -> dict:
+        run_dir = self._session()
+        capture = self._capture_dir(run_dir, name)
+        if isinstance(capture, dict):
+            return capture
+        blob = io.BytesIO()
+        files = []
+        with zipfile.ZipFile(blob, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for path in sorted(p for p in capture.iterdir() if p.is_file()):
+                files.append(path.name)
+                archive.write(path, path.name)
+        data = blob.getvalue()
+        if len(data) > MAX_SHADER_ZIP:
+            return {"error": f"capture {capture.name} is {len(data)} bytes, over the 16 MB limit",
+                    "name": capture.name, "bytes": len(data)}
+        return {"name": capture.name, "files": files, "path": str(capture),
+                "zip_base64": base64.b64encode(data).decode()}
 
     def save_reference(self, name: str, box: list[float], screenshot: str = "") -> dict:
         source = Path(screenshot) if screenshot else self.last_shot
@@ -289,9 +351,22 @@ def build_server(tools: Optional[GameTools] = None):
 
     @server.tool()
     def look(question: str = "") -> dict:
-        """Ask the local vision model what is on screen: screen type, text, selected item, button
-        prompts, and whether the player is controllable. Optionally ask a specific question."""
+        """Ask the local vision model about the screen. Returns screen, text, selected, prompts,
+        state, and answer. Any of those may be "unsure". If truncated is true, or a field is
+        unsure, call screenshot before an irreversible press."""
         return guarded(tools.look, question)
+
+    @server.tool()
+    def summary() -> dict:
+        """Text of this run's summary.md. Written when the game exits."""
+        return guarded(tools.summary)
+
+    @server.tool()
+    def shader(name: str = "") -> dict:
+        """Zip (base64) of one shader capture: code.bin, user_data.bin, reads.bin, manifest.json.
+        No name: the capture the abort replayed, or the last shader if the run is not classified.
+        name is the capture directory, such as cs_0123abcd_00."""
+        return guarded(tools.shader, name)
 
     @server.tool()
     def save_reference(name: str, box: list[float], screenshot: str = "") -> dict:

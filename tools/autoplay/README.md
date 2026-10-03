@@ -111,14 +111,17 @@ cloudflared tunnel --url http://127.0.0.1:8765          # second terminal; print
 | `hold`, `release`, `stick(side, x, y, ms)`, `trigger(side, value, ms)`, `send_raw(command)` | the other inputs |
 | `wait(seconds)` | let the game run (up to 120 s), then status |
 | `screenshot(name)` | the next frame, returned as an image |
-| `look(question)` | the vision model describes the screen (type, text, selection, button prompts, controllable?) |
+| `look(question)` | screen, text, selection, prompts, and state; `unsure` if it cannot tell, `truncated` if the read was cut off |
+| `summary()` | text of this run's `summary.md` (written when the game exits) |
+| `shader(name)` | zip of one capture directory (the abort's shader, or `name`) |
 | `save_reference(name, box)` | crop the last screenshot into `scenarios/refs/<name>.png` |
 
 Button names are the DualSense ones; Xbox names work too (`a b x y lb rb lt rt start`).
 
 Environment: `KYTY_BUILD_DIR`, `KYTY_EMULATOR`, `KYTY_GAME`, `KYTY_EMULATOR_ARGS`, `KYTY_BOOT_GRACE`
 (seconds before the first frame, default 300), `OLLAMA_HOST`, `KYTY_VISION_MODEL`,
-`KYTY_VISION_MAX_WIDTH` (default 1280), `KYTY_VISION_TIMEOUT` (default 120).
+`KYTY_VISION_MAX_WIDTH` (default 1280), `KYTY_VISION_TIMEOUT` (default 120),
+`KYTY_VISION_NUM_CTX` (default 8192), `KYTY_VISION_NUM_PREDICT` (default 512).
 
 **Choosing the model.** The game and the model share the GPU. On an 8 GB card such as an RTX 2070,
 keep the model small: `qwen2.5vl:3b` (the default, roughly 3 GB) or `gemma3:4b`. `qwen2.5vl:7b`

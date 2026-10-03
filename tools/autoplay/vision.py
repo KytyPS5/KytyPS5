@@ -2,10 +2,12 @@
 
 Standard library only; Pillow, when installed, shrinks the screenshot before it is sent.
 
-    OLLAMA_HOST          default http://localhost:11434
-    KYTY_VISION_MODEL    default qwen2.5vl:3b (small enough to share an 8 GB GPU with the game)
-    KYTY_VISION_MAX_WIDTH  default 1280
-    KYTY_VISION_TIMEOUT  seconds, default 120
+    OLLAMA_HOST             default http://localhost:11434
+    KYTY_VISION_MODEL       default qwen2.5vl:3b (small enough to share an 8 GB GPU with the game)
+    KYTY_VISION_MAX_WIDTH   default 1280
+    KYTY_VISION_TIMEOUT     seconds, default 120
+    KYTY_VISION_NUM_CTX     default 8192 (image tokens count against this; Ollama otherwise clips the prompt)
+    KYTY_VISION_NUM_PREDICT default 512
 """
 from __future__ import annotations
 
@@ -13,6 +15,7 @@ import base64
 import io
 import json
 import os
+import re
 import time
 import urllib.error
 import urllib.request
@@ -20,18 +23,22 @@ from pathlib import Path
 
 DEFAULT_MODEL = "qwen2.5vl:3b"
 DEFAULT_HOST = "http://localhost:11434"
+DEFAULT_NUM_CTX = 8192
+DEFAULT_NUM_PREDICT = 512
+# prompt_eval_count this close to num_ctx means Ollama dropped the front of the prompt.
+TRUNCATION_MARGIN = 8
 
-NAVIGATION_PROMPT = """You are looking at one screenshot of a video game (Grand Theft Auto V, running in a \
-PlayStation 5 emulator). Someone who cannot see the screen will decide which controller button to press \
-from your answer, so be literal and only report what is visible. Answer in exactly this format:
+SCREENS = ("black", "loading", "logo/intro", "legal text", "main menu", "pause menu",
+           "dialog box", "cutscene", "free gameplay", "error", "unsure")
+STATES = ("controllable", "waiting", "loading", "error", "unsure")
 
-SCREEN: what kind of screen this is (black, loading, logo/intro, legal text, main menu, pause menu, \
-dialog box, cutscene, free gameplay, error) and anything distinctive
-TEXT: the readable text on screen, most prominent first (titles, menu items, messages)
-SELECTED: the highlighted or selected menu item, or "none"
-PROMPTS: button prompts shown on screen and what they do, e.g. "X Accept, O Back", or "none"
-STATE: is the player character visible and controllable (minimap/radar in the bottom-left corner), \
-or is the game waiting for input, loading, or showing an error"""
+NAVIGATION_PROMPT = f"""Describe this GTA V screenshot as JSON. Use "unsure" when you cannot tell. Do not guess.
+screen: {", ".join(SCREENS)}
+text: readable text, most prominent first, or ""
+selected: the highlighted item, "none", or "unsure"
+prompts: button prompts such as "X Accept, O Back", "none", or "unsure"
+state: {", ".join(STATES)} (controllable means the radar is in the bottom-left)
+answer: the reply to the question below, or "" """
 
 
 class VisionError(Exception):
@@ -44,6 +51,8 @@ def settings() -> dict:
         "model": os.environ.get("KYTY_VISION_MODEL", DEFAULT_MODEL),
         "max_width": int(os.environ.get("KYTY_VISION_MAX_WIDTH", "1280")),
         "timeout": float(os.environ.get("KYTY_VISION_TIMEOUT", "120")),
+        "num_ctx": int(os.environ.get("KYTY_VISION_NUM_CTX", DEFAULT_NUM_CTX)),
+        "num_predict": int(os.environ.get("KYTY_VISION_NUM_PREDICT", DEFAULT_NUM_PREDICT)),
     }
 
 
@@ -64,23 +73,79 @@ def encode_image(path: Path, max_width: int) -> str:
     return base64.b64encode(data).decode()
 
 
+def _json_object(text: str) -> dict | None:
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.IGNORECASE | re.DOTALL).strip()
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        start, end = text.find("{"), text.rfind("}")
+        if start < 0 or end <= start:
+            return None
+        try:
+            data = json.loads(text[start:end + 1])
+        except json.JSONDecodeError:
+            return None
+    return data if isinstance(data, dict) else None
+
+
+def _text(value: object) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        return ", ".join(str(item).strip() for item in value if str(item).strip())
+    return ""
+
+
+def _choice(value: object, allowed: tuple[str, ...]) -> str:
+    text = _text(value).lower()
+    return text if text in allowed else "unsure"
+
+
+def _field(data: dict, name: str) -> object:
+    for key, value in data.items():
+        if str(key).lower() == name:
+            return value
+    return None
+
+
+def parse_description(content: str) -> dict:
+    """The model's JSON, or screen "unsure" plus a short raw snippet when it is not JSON."""
+    data = _json_object(content)
+    if data is None:
+        return {"screen": "unsure", "text": "", "selected": "unsure", "prompts": "unsure",
+                "state": "unsure", "answer": "", "raw": content.strip()[:300]}
+    selected = _text(_field(data, "selected"))
+    prompts = _text(_field(data, "prompts"))
+    return {
+        "screen": _choice(_field(data, "screen"), SCREENS),
+        "text": _text(_field(data, "text")),
+        "selected": selected or "unsure",
+        "prompts": prompts or "unsure",
+        "state": _choice(_field(data, "state"), STATES),
+        "answer": _text(_field(data, "answer")),
+    }
+
+
 def describe(image: Path, question: str = "", *, model: str | None = None, host: str | None = None,
              timeout: float | None = None, max_width: int | None = None) -> dict:
-    """Send a screenshot to Ollama and return {"answer", "model", "seconds"}."""
+    """Send a screenshot to Ollama and return the parsed screen description."""
     config = settings()
     model = model or config["model"]
     host = (host or config["host"]).rstrip("/")
     timeout = timeout if timeout is not None else config["timeout"]
     max_width = max_width if max_width is not None else config["max_width"]
+    num_ctx = config["num_ctx"]
+    num_predict = config["num_predict"]
 
     prompt = NAVIGATION_PROMPT
     if question.strip():
-        prompt += f"\n\nThen answer this question about the screenshot:\n{question.strip()}"
+        prompt += f"\nQuestion: {question.strip()}"
     body = json.dumps({
         "model": model,
         "messages": [{"role": "user", "content": prompt, "images": [encode_image(image, max_width)]}],
         "stream": False,
-        "options": {"temperature": 0},
+        "format": "json",
+        "options": {"temperature": 0, "num_ctx": num_ctx, "num_predict": num_predict},
     }).encode()
     request = urllib.request.Request(f"{host}/api/chat", data=body,
                                      headers={"Content-Type": "application/json"})
@@ -108,4 +173,10 @@ def describe(image: Path, question: str = "", *, model: str | None = None, host:
     answer = (reply.get("message") or {}).get("content", "").strip()
     if not answer:
         raise VisionError("Ollama returned an empty answer")
-    return {"answer": answer, "model": model, "seconds": round(time.monotonic() - started, 1)}
+    parsed = parse_description(answer)
+    counted = reply.get("prompt_eval_count")
+    parsed["truncated"] = reply.get("done_reason") == "length" or (
+        isinstance(counted, int) and num_ctx - counted <= TRUNCATION_MARGIN)
+    parsed["model"] = model
+    parsed["seconds"] = round(time.monotonic() - started, 1)
+    return parsed

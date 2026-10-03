@@ -36,11 +36,16 @@ except ImportError:
 FAKE = HERE / "fake_emulator.py"
 
 
+OK_SCREEN = {"screen": "main menu", "text": "Story", "selected": "Story",
+             "prompts": "X Accept", "state": "waiting", "answer": "Story"}
+
+
 class FakeOllama:
     """Answers /api/chat like Ollama and remembers the last request."""
 
-    def __init__(self, mode="ok"):
+    def __init__(self, mode="ok", prompt_eval_count=100):
         self.mode = mode
+        self.prompt_eval_count = prompt_eval_count
         self.requests = []
         owner = self
 
@@ -51,8 +56,11 @@ class FakeOllama:
                 if owner.mode == "missing":
                     payload, code = {"error": f"model \"{body['model']}\" not found, try pulling it first"}, 404
                 else:
+                    content = "not json" if owner.mode == "garbage" else json.dumps(OK_SCREEN)
                     payload, code = {"model": body["model"], "message": {
-                        "role": "assistant", "content": "SCREEN: main menu\nPROMPTS: X Accept"}, "done": True}, 200
+                        "role": "assistant", "content": content}, "done": True,
+                        "done_reason": "length" if owner.mode == "length" else "stop",
+                        "prompt_eval_count": owner.prompt_eval_count}, 200
                 data = json.dumps(payload).encode()
                 self.send_response(code)
                 self.send_header("Content-Type", "application/json")
@@ -94,16 +102,41 @@ class VisionClient(unittest.TestCase):
         ollama = FakeOllama()
         self.addCleanup(ollama.close)
         result = vision.describe(self.png, "Which item is highlighted?", host=ollama.url, model="m:1")
-        self.assertEqual(result["answer"], "SCREEN: main menu\nPROMPTS: X Accept")
+        self.assertEqual(result["screen"], "main menu")
+        self.assertEqual(result["answer"], "Story")
+        self.assertFalse(result["truncated"])
         self.assertEqual(result["model"], "m:1")
         path, body = ollama.requests[-1]
         self.assertEqual(path, "/api/chat")
         self.assertEqual(body["model"], "m:1")
+        self.assertEqual(body["format"], "json")
         self.assertFalse(body["stream"])
+        self.assertEqual(body["options"]["num_ctx"], 8192)
+        self.assertEqual(body["options"]["num_predict"], 512)
         message = body["messages"][0]
         self.assertIn("Which item is highlighted?", message["content"])
-        self.assertIn("PROMPTS:", message["content"])
+        self.assertIn("unsure", message["content"])
         self.assertTrue(base64.b64decode(message["images"][0]).startswith(b"\x89PNG"))
+
+    def test_a_cut_off_reply_is_marked_truncated(self):
+        ollama = FakeOllama("length")
+        self.addCleanup(ollama.close)
+        result = vision.describe(self.png, host=ollama.url, model="m:1")
+        self.assertTrue(result["truncated"])
+        self.assertEqual(result["screen"], "main menu")
+
+    def test_a_prompt_that_fills_the_context_is_truncated(self):
+        ollama = FakeOllama(prompt_eval_count=8188)
+        self.addCleanup(ollama.close)
+        result = vision.describe(self.png, host=ollama.url, model="m:1")
+        self.assertTrue(result["truncated"])
+
+    def test_non_json_is_unsure(self):
+        ollama = FakeOllama("garbage")
+        self.addCleanup(ollama.close)
+        result = vision.describe(self.png, host=ollama.url, model="m:1")
+        self.assertEqual(result["screen"], "unsure")
+        self.assertIn("not json", result["raw"])
 
     def test_missing_model(self):
         ollama = FakeOllama("missing")
@@ -203,9 +236,15 @@ class GameToolsAgainstFakeEmulator(unittest.TestCase):
         again = tools.screenshot("menu")              # same name: a new screenshot, not the old event
         self.assertTrue(again.is_file())
 
+        early = tools.summary()
+        self.assertIn("still running", early["error"])
+
         looked = tools.look("What is selected?")
-        self.assertEqual(looked["description"], "SCREEN: main menu\nPROMPTS: X Accept")
+        self.assertEqual(looked["screen"], "main menu")
+        self.assertEqual(looked["prompts"], "X Accept")
+        self.assertEqual(looked["state"], "waiting")
         self.assertEqual(looked["model"], "fake-vision")
+        self.assertFalse(looked["truncated"])
         self.assertTrue(Path(looked["screenshot"]).is_file())
         _, body = self.ollama.requests[-1]
         self.assertIn("What is selected?", body["messages"][0]["content"])
@@ -221,6 +260,8 @@ class GameToolsAgainstFakeEmulator(unittest.TestCase):
         stopped = tools.stop_game()
         self.assertEqual(stopped["result"], "STOPPED")
         self.assertTrue(stopped["summary"].endswith("summary.md"))
+        report = tools.summary()
+        self.assertTrue(report["markdown"].startswith("# STOPPED"))
 
     def test_look_reports_an_unreachable_ollama(self):
         os.environ["OLLAMA_HOST"] = free_port_url()
@@ -240,6 +281,36 @@ class GameToolsAgainstFakeEmulator(unittest.TestCase):
         status = self.tools.game_status()
         self.assertFalse(status["running"])
         self.assertEqual(status["result"], "OTHER_ABORT")
+
+    def test_shader_capture_downloads_as_a_zip(self):
+        import zipfile
+        fixture = HERE.parents[2] / "tests" / "data" / "shader_capture" / "gpu_selected_store"
+        fatal = Path(self.tmp.name) / "fatal.txt"
+        fatal.write_text("--- Build ---\nSource build test\n--- Error ---\n"
+                         "shader resource tracking: hash=0x00000000000000b2 stage=compute pc=0x10 "
+                         "buffer descriptor is not a valid runtime value in /tmp/x.cpp:1\n")
+        os.environ["FAKE_BEHAVIOR"] = "shader_abort"
+        os.environ["FAKE_FATAL_FILE"] = str(fatal)
+        os.environ["FAKE_CAPTURE_DIR"] = str(fixture)
+        started = self.tools.start_game(wait_seconds=30)
+        self.assertEqual(started["result"], "SHADER_ABORT", started)
+        got = self.tools.shader()
+        self.assertEqual(got["name"], "cs_00000000000000b2_00000000")
+        self.assertIn("manifest.json", got["files"])
+        self.assertIn("code.bin", got["files"])
+        with zipfile.ZipFile(io.BytesIO(base64.b64decode(got["zip_base64"]))) as archive:
+            self.assertEqual(json.loads(archive.read("manifest.json"))["hash"], "0x00000000000000b2")
+            self.assertTrue(archive.read("code.bin"))
+        self.assertIn("no capture", self.tools.shader("../secret")["error"])
+        saved = mcp_server.MAX_SHADER_ZIP
+        mcp_server.MAX_SHADER_ZIP = 1
+        try:
+            over = self.tools.shader()
+        finally:
+            mcp_server.MAX_SHADER_ZIP = saved
+        self.assertIn("16 MB", over["error"])
+        self.assertGreater(over["bytes"], 1)
+        self.assertNotIn("zip_base64", over)
 
 
 @unittest.skipUnless(HAVE_MCP and HAVE_PILLOW, "the mcp package or Pillow is not installed")
@@ -270,7 +341,7 @@ class StdioRoundTrip(unittest.TestCase):
                         await session.initialize()
                         names = {tool.name for tool in (await session.list_tools()).tools}
                         self.assertTrue({"start_game", "stop_game", "press", "look", "screenshot",
-                                         "game_status", "save_reference"} <= names)
+                                         "game_status", "save_reference", "summary", "shader"} <= names)
                         idle = await session.call_tool("game_status", {})
                         self.assertIn("start_game first", payload(idle)["error"])
                         await session.call_tool("start_game", {"wait_seconds": 30})
@@ -299,9 +370,12 @@ class HttpServer(unittest.TestCase):
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
             self.port = sock.getsockname()[1]
+        self.build = tempfile.TemporaryDirectory()
+        self.addCleanup(self.build.cleanup)
+        env = {**os.environ, "KYTY_BUILD_DIR": self.build.name}
         self.proc = subprocess.Popen([sys.executable, str(HERE.parent / "mcp_server.py"), "--http",
                                       "--port", str(self.port)],
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, env=env)
         self.addCleanup(self.stop)
         banner = ""
         # The banner ends with the closing brace of the .mcp.json example.

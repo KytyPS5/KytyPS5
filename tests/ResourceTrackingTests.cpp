@@ -3114,7 +3114,9 @@ struct DispatcherSignedBufferLoopFixture {
 };
 
 DispatcherSignedBufferLoopFixture MakeDispatcherSignedBufferLoopFixture(
-    bool bypass_count_guard = false, uint32_t step = 1u) {
+    bool bypass_count_guard = false, uint32_t step = 1u,
+    uint32_t row_stride = 196u, uint32_t column_offset = 0u,
+    bool formatted = false) {
   DispatcherSignedBufferLoopFixture result;
   result.fixture = std::make_unique<Fixture>();
   auto& fixture = *result.fixture;
@@ -3195,11 +3197,11 @@ DispatcherSignedBufferLoopFixture MakeDispatcherSignedBufferLoopFixture(
   fixture.block = body;
   const auto table = fixture.Buffer(table_descriptor, 0x62d0u);
   const auto row = fixture.Emit(ValueOpcode::IMul32,
-                                {result.index, Value(196u)});
+                                {result.index, Value(row_stride)});
   for (uint32_t word = 0u; word < result.descriptor_words.size(); ++word) {
     MemoryInfo memory;
     memory.kind = ResourceKind::ScalarBuffer;
-    memory.offset = word * sizeof(uint32_t);
+    memory.offset = column_offset + word * sizeof(uint32_t);
     memory.component_count = 4u;
     memory.component_index = word;
     result.descriptor_words[word] = fixture.Emit(
@@ -3210,12 +3212,13 @@ DispatcherSignedBufferLoopFixture MakeDispatcherSignedBufferLoopFixture(
   MemoryInfo load;
   load.kind = ResourceKind::Buffer;
   load.idxen = true;
+  load.formatted = formatted;
   const auto value = fixture.Emit(
-      ValueOpcode::LoadBufferU16,
+      formatted ? ValueOpcode::LoadBufferU32 : ValueOpcode::LoadBufferU16,
       {selected, Value(0u), Value(0u), Value(0u), Value(true)},
       fixture.AddMemory(load, 0x6574u));
   fixture.Emit(ValueOpcode::ReferenceU32,
-               {fixture.Emit(ValueOpcode::ConvertU32U16, {value})});
+               {formatted ? value : fixture.Emit(ValueOpcode::ConvertU32U16, {value})});
   return result;
 }
 
@@ -3303,6 +3306,59 @@ void TestDispatcherSignedBufferLoop() {
               rejected.fixture->program.info.buffers.empty(),
           "rejected dispatcher loop partially changed resource tracking");
   }
+}
+
+void TestFormattedScalarDescriptorTable() {
+  constexpr uint32_t stride = 488u;
+  constexpr uint32_t column = 200u;
+  auto accepted = MakeDispatcherSignedBufferLoopFixture(
+      false, 1u, stride, column, true);
+  accepted.fixture->PlanAndTrack();
+  const auto& program = accepted.fixture->program;
+  Check(program.resource_tracking_complete && program.info.buffers.size() == 1u &&
+            program.bounded_srt_reads.size() == 4u && !program.info.uses_dma,
+        "formatted scalar descriptor rows did not form a bounded buffer table");
+  Check(std::ranges::all_of(program.bounded_srt_reads,
+                            [](const BoundedSrtRead& read) {
+                              return read.count_signed && read.offset_scale == stride &&
+                                     read.memory_offset >= column &&
+                                     read.memory_offset < column + 16u;
+                            }),
+        "formatted scalar descriptor rows lost their 488-byte stride or 200-byte column");
+
+  const auto plan = ExtractResourcePlan(program);
+  LinearTestMemory table;
+  table.words.resize((2u * stride + column + 16u) / sizeof(uint32_t));
+  for (uint32_t row = 0u; row < 2u; ++row) {
+    const std::array<uint32_t, 4> descriptor{
+        0x30000u + row * 0x100u, 4u << 16u, 4u, 0u};
+    for (uint32_t word = 0u; word < descriptor.size(); ++word)
+      table.words[(row * stride + column) / sizeof(uint32_t) + word] = descriptor[word];
+  }
+  std::array<uint32_t, 6> user_data{
+      static_cast<uint32_t>(table.base), 0u,
+      static_cast<uint32_t>(table.words.size() * sizeof(uint32_t)), 0u, 2u,
+      0xffffffffu};
+  const SrtRuntime runtime{.user_data = user_data,
+                           .read_memory = ReadLinearTestMemory,
+                           .userdata = &table,
+                           .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            specialization.buffer_tables.size() == 1u &&
+            specialization.buffer_tables[0].count == 2u &&
+            snapshot.buffers.size() == 2u &&
+            snapshot.buffers[0].dwords[0] == 0x30000u &&
+            snapshot.buffers[1].dwords[0] == 0x30100u,
+        "formatted scalar descriptor table did not retain two distinct rows");
+
+  auto rejected = MakeDispatcherSignedBufferLoopFixture(
+      true, 1u, stride, column, true);
+  BuildSrtPlan(rejected.fixture->program);
+  CheckFatal([&] { TrackResources(rejected.fixture->program); },
+             "not a valid runtime value",
+             "formatted scalar descriptor table bypassed its count guard");
 }
 
 void TestPhiValidation() {
@@ -7851,6 +7907,11 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::strcmp(argv[1], "--dispatcher-signed-buffer-loop-only") == 0) {
       TestDispatcherSignedBufferLoop();
       std::cout << "KYTY_DISPATCHER_SIGNED_BUFFER_LOOP_PASS\n";
+      return 0;
+    }
+    if (argc == 2 && std::strcmp(argv[1], "--formatted-scalar-table-only") == 0) {
+      TestFormattedScalarDescriptorTable();
+      std::cout << "KYTY_FORMATTED_SCALAR_TABLE_PASS\n";
       return 0;
     }
     if (argc == 2 && std::strcmp(argv[1], "--inline-buffer-table-only") == 0) {

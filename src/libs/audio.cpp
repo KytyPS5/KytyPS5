@@ -398,11 +398,6 @@ uint32_t min_queued_size = 0;
 		}
 	}
 
-	// Ensure minimum queued size to prevent audio buffer underruns (popping)
-	if (!port->queue_primed && SDL_GetAudioStreamQueued(port->stream) < static_cast<int>(min_queued_size)) {
-		port->queue_primed = true;
-	}
-
 	if (!SDL_PutAudioStreamData(port->stream, prepared_data, static_cast<int>(prepared_size))) {
 		LOGF("AudioOut: SDL_PutAudioStreamData failed: %s\n", SDL_GetError());
 		return false;

@@ -1,5 +1,90 @@
 # Emulator regression test debt
 
+## DeviceLost on large indirect-image vertex draw (2026-10-03)
+
+The same native exe SHA-256 `4b93dd3d2dd2c7964dbbb30446bcdad21506eba1e792a56405bfd479bae9ebf6`
+gave two separate GPUAV+shader-instrumentation runs with nonzero loading
+spinner pixels, then `vkWaitSemaphores` `ErrorDeviceLost`: shown 203 / tick
+41560 in `_Build/runs/yotei-integrated-20261002-212649-presentprobe-gpuav`,
+and shown 381 / tick 54581 in
+`_Build/runs/yotei-integrated-20261003-075610-presentprobe-gpuav`. The
+second run exited 321 by itself; its `run.json` is finalized. Windows System
+log has `nvlddmkm` event 153 at the second loss. No validation error or
+stderr preceded the loss. Its last CPU shader log is VS
+`e3125617f3efc38f` with 251 image resources / 250 sampled pairs. Earlier
+SyncDiag evidence (see section below) put the GPU wait on the first indexed
+draw with this VS, 119856 indices, and a specific PS. That is a strong lead,
+but the new runs did not enable per-draw SyncDiag, so their last submitted GPU
+operation is not independently identified.
+
+Required synthetic regression before an emitter/descriptor fix: construct a
+public vertex fixture with an indirect image table large enough to exercise
+the same mechanism, without copying a game shader. Prove SPIR-V validation
+and selected image values for first, middle, last and missing keys with
+distinct texture contents, including sparse table entries. Bound a native
+indexed draw at increasing table and index counts, capture GPU output and
+synchronization result, and find the smallest failing combination without
+repeated driver resets. Compare shader instrumentation on/off only after a
+safe isolated probe; verify descriptor-indexing/device capability requirements
+and preserve heterogeneous-image rejection. A pass of CPU validation or a
+pipeline build is not a draw result. Do not change the 250-way selection to
+an opaque `OpSampledImage` Phi; that prior variant was invalid. Until the
+failing mechanism is reproduced, no production workaround is justified.
+
+## Wave-wide zero branches with inactive lanes (2026-10-02)
+
+Upstream PR #985 head `139a260e4975dd612cfc4e84d84c002bfa9c2b39`
+describes a shared shader-emitter defect: a `*Zero` scalar branch compares
+the ballot of the condition with all ones, although inactive lanes do not
+vote. A partial final wave can therefore remain in a loop. This is a lead
+for the current Yōtei stall near shown 156–163, not a proven attribution.
+Required synthetic RED: compile a small `s_cbranch_execz` loop for a guest
+wave64 split into host wave32 and verify its SPIR-V tests that no *active*
+lane fails; compare `s_cbranch_execnz` and existing neighboring branch tests.
+Then make the shared emitter correction, run the unchanged test GREEN and
+neighboring branch/ballot cases, and retry the bounded native game. A loop
+cap as in PR #986 is a separate safety bound and cannot replace correct
+branch semantics or prove a visible frame.
+
+The initial opcode-count test passed before the fix and was too weak. The
+strengthened test identified `OpIEqual` against a `0xffffffff` constant in
+the emitted ExecZero loop and failed with exit 9
+(`_Build/logs/zero-branch-structural-red-20261002.*`). The corrected emitter
+ballots the inverted predicate and tests for zero; the unchanged test passed
+(`_Build/logs/zero-branch-green-20261002.*`). Targeted
+`--wave64-condition-ref-only`, graphics collective routing and scalar-mask
+branch checks passed. `--single-wave64-ballot-spirv-only` still fails on a
+separate native subgroup ballot expectation; its ordinary ballot path was
+unchanged by this correction, so the full CFG suite is not yet green.
+The final test source was rebuilt with `_Build/windows-local.cmd build-target
+shader_cfg_tests`; `--zero-branch-ballot-only` and those three neighboring
+cases passed again in `_Build/logs/zero-branch-final-*-20261003.log.run.json`
+using test exe SHA-256 `295e981a8e1a91dc5c00103f1e0c3473d984f85ee63a22dfe4e598f3fb05b40c`.
+The code and test are committed as `37b35115`.
+
+Later inspection of the Yōtei run narrowed the visible stall more directly:
+the last logged call before shown stopped at 156 is
+`vkCreateComputePipelines` for CS `54904fb419d79e49`, after an emitted
+771986-word SPIR-V (`_Build/runs/yotei-integrated-20261002-205909-presentprobe-gpuav`,
+`_kyty.txt:7609520-7609525`). No completion line follows before the 240 s
+watchdog. This establishes a pipeline-creation stall, not a proven runtime
+loop in that shader. Assess the large binary and the driver's compiler
+separately; do not attribute the stall to #985 without a native retry.
+
+The first bounded native retry with this correction, exe SHA-256
+`4b93dd3d2dd2c7964dbbb30446bcdad21506eba1e792a56405bfd479bae9ebf6`,
+eventually compiled that 773030-word shader (`vkCreateComputePipelines`
+`elapsed_ms=287593`) and other huge variants. Source readback in
+`_Build/runs/yotei-integrated-20261002-212649-presentprobe-gpuav` proved
+the first current-branch RGB pixels at frame 201 (`colored=10`) and reached
+frame 203 (`colored=92`); then the device returned `ErrorDeviceLost` at GPU
+tick 41560. The launching monitor ended before it could finalize `run.json`,
+so use the log/readback rather than its stale `stopReason`/`maxShown` fields.
+This proves that the earlier 240 s watchdog was too short for cold GPUAV
+pipeline creation; it does not prove #985 caused the color progress or that a
+menu was rendered. The separately bounded warm retry's final result is
+recorded in the DeviceLost section above.
+
 ## Driver compiler crash without GPUAV (2026-10-02)
 
 The bounded current-branch run

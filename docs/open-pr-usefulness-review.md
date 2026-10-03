@@ -2,6 +2,86 @@
 
 # Открытые PR KytyPS5: что полезно для текущего bring-up
 
+## Повторная проверка 3 октября 2026 года, 08:00 UTC
+
+Через `gh pr list/view` повторно проверены открытые PR и точные head. После
+предыдущего обзора появились [#990](https://github.com/KytyPS5/KytyPS5/pull/990)
+`617e728c9309337fda2da0aba9f31bed0207930f` и
+[#991](https://github.com/KytyPS5/KytyPS5/pull/991)
+`bae42bcfcecdc464b8d252375551555db7dc1b7d`.
+
+- #990 исправляет выравнивание стека при входе в host SysV-функцию на
+  Windows. В PR есть отдельный native RED/GREEN с намеренно неверным
+  выравниванием; это полезная общая ABI-правка для CPU access violation.
+  Текущий Yōtei дошёл до ненулевых RGB кадров, а зафиксированный новый
+  отказ — Vulkan `ErrorDeviceLost`, без доказанного CPU alignment fault.
+  Поэтому #990 не объявлен исправлением этого отказа и пока не переносился.
+- #991 исправляет противоречивое ожидание PM4-теста для занятых после #964
+  SH-регистров `0x002/0x003`; production-файлов не меняет. Он полезен для
+  полноты compute suite, но не влияет на исполнение игры.
+- [#985](https://github.com/KytyPS5/KytyPS5/pull/985) обновлён до
+  `daff547ea478875d4394b3c58d038f4b59c65aa5`. Наша адаптация
+  zero-branch semantics сохранена в `37b35115` с более строгим SPIR-V RED;
+  её native прогон действительно прошёл прежнюю остановку и дал ненулевой
+  source RGB, но меню ещё не подтверждено. #986 также обновлён до
+  `44a858b40407991f790381300b57bafdf62db153`; предел циклов не
+  переносился.
+
+## Повторная проверка 2 октября 2026 года, 21:15 UTC
+
+После предыдущего обзора upstream открыл #982–#988. Проверены точные head,
+описания и изменённые файлы через `gh pr view`; #497 после push имеет head
+`4b92e0c57c6914e992e04fef11f1722372a41353`, остаётся draft/open и
+`CONFLICTING` с `main`.
+
+- [#985](https://github.com/KytyPS5/KytyPS5/pull/985)
+  `139a260e4975dd612cfc4e84d84c002bfa9c2b39` исправляет `*Zero`
+  ветвление в split wave: ballot активных lanes нельзя сравнивать с
+  `0xffffffff`. Это общий семантический дефект, воспроизведённый на нашей
+  ветке отдельным синтетическим SPIR-V RED; адаптация для текущего
+  split-wave64 backend проверяется отдельно. Связь с нынешней остановкой
+  Yōtei не установлена: последний лог показывает незавершённый
+  `vkCreateComputePipelines` на SPIR-V в 771986 слов.
+- [#986](https://github.com/KytyPS5/KytyPS5/pull/986)
+  `2ec78118ddaadc17cfcb3cdda73ef55e9cc1ac33` добавляет предел
+  итераций шейдерных циклов и BDA retry. Он полезен как предохранитель от
+  GPU hang, но может досрочно завершить действительный guest loop и не
+  исправляет неверный branch или компиляцию огромного pipeline. Не перенесён.
+- [#977](https://github.com/KytyPS5/KytyPS5/pull/977)
+  `8dd843e6ab90ca39642a5747f74a1022048a7813` исправляет учёт
+  аллокаций и поиск кандидатов на вытеснение под давлением памяти. В
+  текущем процессе наблюдался рабочий набор около 30 ГБ, но последний
+  зафиксированный участок — компилятор pipeline, а не cache eviction;
+  полезность для этого отказа не доказана. Автор проверил Linux/Clang и
+  синтетический cache case, native Windows тест ещё нужен.
+- [#988](https://github.com/KytyPS5/KytyPS5/pull/988)
+  `a8c1050bfff6d92d3ffc1347429dad58a253a4a4` сохраняет IR-план и
+  SPIR-V на диск между запусками. Это может сократить повторную трансляцию,
+  но `MaterializeResources` остаётся runtime, а найденный stall находится
+  внутри драйверного `vkCreateComputePipelines` после эмиссии. Объёмная
+  сериализация `ResourcePlan` пересекается с новой логикой selector нашей
+  ветки; перенос без round-trip регрессий опасен.
+- [#982](https://github.com/KytyPS5/KytyPS5/pull/982)
+  `67aec222ac2542ab4861b620edde77d09ed09566` сохраняет драйверный
+  pipeline cache между ревизиями по версии формата. Наша ветка уже имеет
+  собственный формат `KytyPC3` и fingerprint worktree; прямой cherry-pick
+  конфликтует с этим контрактом. Холодную компиляцию нового 3-МБ SPIR-V
+  старый cache всё равно не устраняет.
+- [#987](https://github.com/KytyPS5/KytyPS5/pull/987)
+  `54db7d12efe98a49d92fc6dc037ab076c9e7d5b0` читает null SRT pointer
+  как нулевой descriptor. Это требует отдельной проверки guest null ABI;
+  в текущем логе подтверждённый адрес SRT ненулевой. [#983](https://github.com/KytyPS5/KytyPS5/pull/983)
+  `44dd44bcd76f3377d59d0c0ebcebfee75965b01b` обходит Metal vertex
+  compiler ограничение для ballot first lane; [#984](https://github.com/KytyPS5/KytyPS5/pull/984)
+  `8934d8d01a66cb4a76ecf8b765c608de5038743a` касается Rosetta;
+  [#981](https://github.com/KytyPS5/KytyPS5/pull/981)
+  `2c59de54697165098356541f0e082cfaedfb6a67` — Windows sockets.
+  Эти три PR не соответствуют последнему GPU pipeline blocker.
+
+Остальные ранее рассмотренные PR не изменили head. Ни один новый PR не
+вливался целиком; семантическая часть #985 проверяется на нашей ветке по
+правилу regression-first.
+
 ## Повторная проверка 2 октября 2026 года, 19:25 UTC
 
 Свежий список upstream `KytyPS5/KytyPS5` через GitHub CLI содержит новый

@@ -1,5 +1,47 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **3 октября 2026 года, 08:09 UTC** (native Windows; branch
+`yotei-windows-bringup`, source commit `37b35115`, installed exe SHA-256
+`4b93dd3d2dd2c7964dbbb30446bcdad21506eba1e792a56405bfd479bae9ebf6`):
+
+- Повторно просмотрены upstream PR: новые #990 (общий Windows SysV ABI
+  alignment, с отдельным RED/GREEN) и #991 (только корректировка PM4-теста),
+  а также обновлённые head #985/#986. Точные выводы записаны в
+  `docs/open-pr-usefulness-review.md`. Общая правка #985 для `*Zero`
+  branch адаптирована в `37b35115`: старый emitter требовал ballot all-ones
+  даже при неактивных lanes; новая проверка инвертирует predicate и требует
+  отсутствие active failures. Синтетический SPIR-V RED exit 9 → GREEN,
+  затем native rebuild и повторный GREEN для zero-branch, wave64 condition,
+  graphics collective routing и scalar-mask branch. Отдельный
+  `--single-wave64-ballot-spirv-only` всё ещё RED; полный CFG suite не
+  заявляется GREEN.
+- Долгий GPUAV+shader instrumentation запуск
+  `_Build/runs/yotei-integrated-20261002-212649-presentprobe-gpuav`
+  прошёл прежнюю остановку: `vkCreateComputePipelines` для большого CS
+  завершился за 287593 ms. Source readback 480×270 впервые на **текущей
+  ветке** доказал RGB `colored=10` на frame 201, затем 62/92 на 202/203.
+  После этого GPU сообщил `ErrorDeviceLost` (tick 41560). Внешний монитор
+  не успел финализировать `run.json`, поэтому его `stopReason=null` и
+  `maxShown=0` устарели; доказательства — `_kyty.txt` и
+  `present-readback.txt`. Это первый ненулевой RGB, но **не меню**.
+- Повторный bounded запуск на том же exe
+  `_Build/runs/yotei-integrated-20261003-075610-presentprobe-gpuav`
+  (`timeout=1200 s`, frame watchdog 360 s, continue after color) завершился
+  сам с `exit=321`, `maxShown=381`, `coloredProven=true`. Source readback
+  содержит ненулевые кадры 252–272, максимум `colored=242`. Внеэкранный
+  захват **только окна игры** `offscreen-window.png` и
+  `offscreen-shown375.png` визуально подтверждает белый загрузочный спиннер
+  на чёрном фоне; это rendered-frame milestone, **не меню**. После shown381
+  Vulkan вернул `ErrorDeviceLost` на tick 54581; Windows System log в этот
+  момент содержит `nvlddmkm` event 153. Последние CPU-логи скомпилировали
+  VS `e3125617f3efc38f` с 251 image / 250 sampled pairs, уже связанный
+  с DeviceLost прежним SyncDiag, но без SyncDiag в этом прогоне точная
+  последняя GPU-команда не подтверждена. `stderr.txt` пуст; game и runner
+  завершены, task-owned процессов не осталось. Следующее: синтетически
+  локализовать стоимость/семантику большого indirect-image VS и его
+  indexed draw, затем исправлять общий emitter/descriptor path. Не
+  повторять GPU reset ради одинакового отказа. Меню и gameplay **PENDING**.
+
 Checkpoint **2 октября 2026 года, 21:12 UTC** (native Windows, branch
 `yotei-windows-bringup`, source commit `36bcf354`, installed exe SHA-256
 `567600051cfd44a3a71ea9f126614abb52ebfc3058a2547aeb8ccab894fa8b80`):

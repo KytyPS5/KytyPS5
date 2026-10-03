@@ -1,5 +1,31 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **3 октября 2026 года, 08:42 UTC** (native Windows; branch
+`yotei-windows-bringup`, test-only commit `12baacd3` после production
+`79db93d6`; установленный emulator exe всё ещё
+`5251cfc12f986dda2e9b3c8c761e0e80b5fe0545493dcc210cad803c2da406da`):
+
+- Для DeviceLost на большом VS добавлены независимые synthetic тесты без
+  игровых байтов. IR-модуль с 250 альтернативами сохраняет один SPIR-V
+  `OpSwitch` и 251 typed sample operations, проходит SPIR-V validation.
+  Отдельная гостевая таблица из 250 разных текстур с CPU-visible ключами
+  0/125/249 корректно сужается до трёх ресурсов; native GPU readback
+  подтвердил точные значения всех трёх. Компиляция, GPU-тест и соседние
+  indirect-image случаи GREEN; команды, SHA test exe и артефакты в
+  `docs/emulator-test-debt.md`. Это **не** воспроизведение GPU DeviceLost:
+  полный 250-кандидатный switch ещё не выполнялся на GPU, большой indexed
+  vertex draw не проверялся. Production GPU-код в этом checkpoint не менялся.
+- Первые видимые RGB пиксели и окно со спиннером подтверждены только на
+  предыдущей установленной сборке `4b93dd3d…bae9ebf6`. Сборка с ABI
+  исправлением #990 `5251cfc1…406da` не запускалась в игре из-за двух
+  уже подтверждённых driver resets на том же draw path. Попытка сделать
+  только слова scalar selector нечитаемыми для CPU правильно остановилась
+  на защитном `cannot read coherent source`; диагностическая правка теста
+  убрана. Следующее: GPU-execution fixture для уже валидированного IR
+  switch с явными дескрипторами либо честно согласованный producer/consumer
+  index; затем безопасно локализовать размер/стадию indexed draw и
+  исправить общий механизм только после RED. Меню и gameplay **PENDING**.
+
 Checkpoint **3 октября 2026 года, 08:22 UTC** (native Windows; branch
 `yotei-windows-bringup`, source commit `79db93d6`, installed exe SHA-256
 `5251cfc12f986dda2e9b3c8c761e0e80b5fe0545493dcc210cad803c2da406da`):

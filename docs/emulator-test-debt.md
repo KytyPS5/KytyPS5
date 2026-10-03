@@ -62,6 +62,40 @@ pipeline build is not a draw result. Do not change the 250-way selection to
 an opaque `OpSampledImage` Phi; that prior variant was invalid. Until the
 failing mechanism is reproduced, no production workaround is justified.
 
+Synthetic progress at test commit `12baacd3`, native test exe SHA-256
+`92ba731d43692969b360ec60cc4bc850ec3e694048191ceeeb853439aecf866d`:
+`--wide-indirect-image-spirv-only` builds an independent IR image table with
+251 typed choices (root plus 250 cases); SPIR-V validates and retains one
+`OpSwitch` and 251 sample operations. `--wide-indirect-image-table-compile-only`
+and `--wide-indirect-image-table-gpu-only` use a guest compute fixture with
+250 distinct 4×4 textures; CPU-visible indices 0, 125, 249 are correctly
+pruned to three pairs, and a bounded GPU invocation returns their distinct
+expected values. All three exit 0; neighboring `--indirect-image-only`,
+`--indirect-image-numeric-only` and
+`--homogeneous-indirect-image-validation-only` also exit 0. Logs are
+`_Build/logs/wide-indirect-final-*-20261003.log*` and
+`_Build/logs/wide-indirect-table-*-20261003.log*`. An earlier material-stride
+variant was discarded: it scanned 27233 speculative positions and hit the
+separate pair limit 513 before shader execution, so it was not a valid RED.
+
+These passing checks narrow the problem: a legal 250-case switch and three
+actual texture selections work independently. They do not execute a
+250-candidate switch on the GPU or a large vertex/indexed draw. Next use a
+GPU-owned selector to keep the full table live, establish a small numerical
+GPU control, then increase only within a safe bound to find a failing draw
+without repeated driver resets. Missing/sparse keys remain uncovered.
+
+A diagnostic attempt to hide only the CPU index words from the clean
+specialization reader did **not** produce such a control. Materialization
+correctly rejected `bounded SRT read 0 index 0 cannot read coherent source at
+0x40` (`_Build/logs/wide-indirect-unknown-compile-20261003.log.stderr`).
+The attempted harness change was removed; it was not a RED for the draw and
+no GPU run was made. The next fixture must either provide a genuinely
+coherent producer/consumer contract for that guest scalar read, or execute
+the already validated synthetic IR module with a GPU-generated key and
+explicit Vulkan descriptors. Preserve the refusal for unreadable planning
+inputs.
+
 ## Wave-wide zero branches with inactive lanes (2026-10-02)
 
 Upstream PR #985 head `139a260e4975dd612cfc4e84d84c002bfa9c2b39`

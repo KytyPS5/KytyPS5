@@ -1503,6 +1503,14 @@ int KYTY_SYSV_ABI FontAttachDeviceCacheBuffer(FontLibrary library, void* buffer,
 	return OK;
 }
 
+int KYTY_SYSV_ABI FontDettachDeviceCacheBuffer(FontLibrary library) {
+	PRINT_NAME();
+
+	LOGF("\t library = 0x%016" PRIx64 "\n", reinterpret_cast<uint64_t>(library));
+
+	return OK;
+}
+
 int KYTY_SYSV_ABI FontTextSourceInit(FontTextSource* font_text_source, const void* text_address,
                                      uint32_t text_size_byte, FontTextParseFunction text_parser,
                                      void* text_object) {
@@ -2095,6 +2103,36 @@ int KYTY_SYSV_ABI FontGetRenderCharGlyphMetrics(FontHandle font_handle, uint32_t
 	return OK;
 }
 
+// The pair adjustment between two characters. The title reads the result to place the next glyph,
+// so a call that leaves it unwritten hands it whatever was on the stack as a position.
+struct FontKerning {
+	float offset_x;
+	float offset_y;
+	float position_x;
+	float position_y;
+};
+
+int KYTY_SYSV_ABI FontGetKerning(FontHandle font_handle, uint32_t pre_code, uint32_t code,
+                                 FontKerning* kerning) {
+	PRINT_NAME();
+
+	if (kerning == nullptr) {
+		return -1;
+	}
+	*kerning = {};
+
+	auto* font = static_cast<FontState*>(font_handle);
+	if (font != nullptr && ensure_stb_font(font)) {
+		const float scale = stb_font_scale(font);
+		const int   pair  = stbtt_GetCodepointKernAdvance(
+            &font->font_info, static_cast<int>(stb_supported_codepoint(font, pre_code)),
+            static_cast<int>(stb_supported_codepoint(font, code)));
+		kerning->offset_x = static_cast<float>(pair) * scale;
+	}
+
+	return OK;
+}
+
 int KYTY_SYSV_ABI FontGetCharGlyphMetrics(FontHandle font_handle, uint32_t code,
                                           FontGlyphMetrics* metrics) {
 	PRINT_NAME();
@@ -2231,6 +2269,7 @@ int KYTY_SYSV_ABI FontRenderCharGlyphImageHorizontal(FontHandle font_handle, uin
 	const auto top_y = y - draw_metrics->horizontal.bearing_y;
 	draw_to_surface(font->trans_image, surf, top_x, top_y);
 
+
 	LOGF("\t handle = 0x%016" PRIx64 ", code = 0x%08" PRIx32 ", surf = 0x%016" PRIx64
 	     ", x = %f, y = %f, result = 0x%016" PRIx64 "\n",
 	     reinterpret_cast<uint64_t>(font_handle), code, reinterpret_cast<uint64_t>(surf),
@@ -2243,6 +2282,7 @@ int KYTY_SYSV_ABI FontRenderCharGlyphImageHorizontal(FontHandle font_handle, uin
 
 LIB_DEFINE(InitFont_1) {
 	LIB_FUNC("CUKn5pX-NVY", Font::FontAttachDeviceCacheBuffer);
+	LIB_FUNC("UuY-OJF+f0k", Font::FontDettachDeviceCacheBuffer);
 	LIB_FUNC("vzHs3C8lWJk", Font::FontCloseFont);
 	LIB_FUNC("WaSFJoRWXaI", Font::FontCreateRendererWithEdition);
 	LIB_FUNC("exAxkyVLt0s", Font::FontDestroyRenderer);
@@ -2268,6 +2308,7 @@ LIB_DEFINE(InitFont_1) {
 	LIB_FUNC("FXP359ygujs", Font::FontDestroyLibrary);
 	LIB_FUNC("C-4Qw5Srlyw", Font::FontGenerateCharGlyph);
 	LIB_FUNC("L97d+3OgMlE", Font::FontGetCharGlyphMetrics);
+	LIB_FUNC("sDuhHGNhHvE", Font::FontGetKerning);
 	LIB_FUNC("IQtleGLL5pQ", Font::FontGetRenderCharGlyphMetrics);
 	LIB_FUNC("8-zmgsxkBek", Font::FontGlyphDefineAttribute);
 	LIB_FUNC("whrS4oksXc4", Font::FontMemoryInit);

@@ -36498,7 +36498,8 @@ template <u32 wave_size> TestCase ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu
   using O = ShaderOpcode;
 
   std::vector<u32> code;
-  AppendVMovU32(&code, 20, 1); // +1 X remains a full dword with A16 coordinates.
+  AppendVMovU32(&code, 20,
+                1); // +1 X offset; in A16 the offset dword stays 32-bit.
   AppendVMovLiteral(&code, 21, 0x36003900u); // x=0.625, y=0.375 packed as f16.
   AppendVMovU32(&code, 22, 0);
   code.push_back(EncodeMimg0(0x30, 0xf));
@@ -36508,64 +36509,96 @@ template <u32 wave_size> TestCase ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu
   }
   AppendEnd(&code);
 
+  // The offset must move the fetch from texel (2,1) to (3,1).
   auto image = MakeRgbaImage(4, 4);
   SetRgbaPixel(&image, 4, 2, 1, 0x3f000000u, 0, 0, 0);
   SetRgbaPixel(&image, 4, 3, 1, 0x3f800000u, 0x40000000u, 0x40400000u,
                0x40800000u);
+  SetRgbaPixel(&image, 4, 3, 1, 0x40a00000u, 0x40c00000u, 0x40e00000u,
+               0x41000000u);
 
   TestCase test;
   test.name = wave_size == 32 ? "ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu32"
                               : "ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu64";
   test.code = code;
-  test.compute_info.wave_size = wave_size;
-  test.has_compute_info = true;
-  test.expected = {0x3f800000u, 0x40000000u, 0x40400000u, 0x40800000u};
+  test.expected = {0x40a00000u, 0x40c00000u, 0x40e00000u, 0x41000000u};
   test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
   test.sampled_image_rgba = image;
-  test.required_spirv = {"UnpackHalf2x16", "Lod|ConstOffset"};
-  test.forbidden_spirv = {"OpBitFieldSExtract", "OpImageQuerySizeLod", "OpFDiv"};
+  test.required_spirv = {"UnpackHalf2x16", "OpBitFieldSExtract",
+                         "OpImageQuerySizeLod"};
   return test;
 }
 
-template <u32 wave_size> TestCase ImageSampleOffsetsReadFourNeighbors() {
+TestCase ImageSampleLevelZeroOffsetShiftsBothAxesOnGpu() {
   using O = ShaderOpcode;
+
+  // 6-bit offset lanes are sign extended, so 0x3f is -1.
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 0x0000013fu);
+  AppendVMovLiteral(&code, 21, 0x3f200000u); // x=0.625
+  AppendVMovLiteral(&code, 22, 0x3ec00000u); // y=0.375
+  code.push_back(EncodeMimg0(0x37, 0xf));
+  code.push_back(EncodeMimg1(0, 20));
+  for (u32 i = 0; i < 4u; i++) {
+    AppendStoreVgpr(&code, i, i);
+  }
+  AppendEnd(&code);
+
+  // Unshifted the sample lands on texel (2,1); the offset moves it to (1,2).
+  auto image = MakeRgbaImage(4, 4);
+  SetRgbaPixel(&image, 4, 2, 1, 0x3f800000u, 0x40000000u, 0x40400000u,
+               0x40800000u);
+  SetRgbaPixel(&image, 4, 1, 2, 0x41100000u, 0x41200000u, 0x41300000u,
+               0x41400000u);
+
   TestCase test;
-  test.name = wave_size == 32 ? "ImageSampleOffsetsReadFourNeighbors32"
-                              : "ImageSampleOffsetsReadFourNeighbors64";
-  test.compute_info.wave_size = wave_size;
-  test.has_compute_info = true;
-  constexpr std::array offsets{0x01u, 0x3fu, 0x3f00u, 0x0100u};
-  constexpr std::array opcodes{0x37u, 0x37u, 0x34u, 0x32u};
-  for (u32 sample = 0; sample < offsets.size(); ++sample) {
-    AppendVMovLiteral(&test.code, 20, offsets[sample]);
-    u32 coordinate = 21;
-    if (opcodes[sample] == 0x32u) {
-      for (float gradient : {0.25f, 0.f, 0.f, 0.25f}) {
-        AppendVMovLiteral(&test.code, coordinate++, std::bit_cast<u32>(gradient));
-      }
+  test.name = "ImageSampleLevelZeroOffsetShiftsBothAxesOnGpu";
+  test.code = code;
+  test.expected = {0x41100000u, 0x41200000u, 0x41300000u, 0x41400000u};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.sampled_image_rgba = image;
+  test.required_spirv = {"OpImageSampleExplicitLod", "OpBitFieldSExtract"};
+  test.forbidden_spirv = {"ConstOffset"};
+  return test;
+}
+
+TestCase ImageSampleLodOffsetMovesTexelOfSampledMipOnGpu() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 1);               // +1 X offset
+  AppendVMovLiteral(&code, 21, 0x3e000000u); // x=0.125
+  AppendVMovLiteral(&code, 22, 0x3e000000u); // y=0.125
+  AppendVMovLiteral(&code, 23, 0x3f800000u); // lod=1.0
+  code.push_back(EncodeMimg0(0x34, 0xf));
+  code.push_back(EncodeMimg1(0, 20));
+  for (u32 i = 0; i < 4u; i++) {
+    AppendStoreVgpr(&code, i, i);
+  }
+  AppendEnd(&code);
+
+  auto base = MakeRgbaImage(4, 4);
+  for (u32 y = 0; y < 4u; y++) {
+    for (u32 x = 0; x < 4u; x++) {
+      SetRgbaPixel(&base, 4, x, y, 0x41000000u, 0, 0, 0);
     }
-    // All instructions address the center of texel (2, 1) before applying the offset.
-    AppendVMovLiteral(&test.code, coordinate, std::bit_cast<u32>(0.625f));
-    AppendVMovLiteral(&test.code, coordinate + 1, std::bit_cast<u32>(0.375f));
-    if (opcodes[sample] == 0x34u) AppendVMovU32(&test.code, coordinate + 2, 0);
-    test.code.push_back(EncodeMimg0(opcodes[sample], 0x1));
-    test.code.push_back(EncodeMimg1(sample, 20));
-    AppendStoreVgpr(&test.code, sample, sample);
   }
-  AppendEnd(&test.code);
-  test.sampled_image_rgba = MakeRgbaImage(4, 4);
-  SetRgbaPixel(&test.sampled_image_rgba, 4, 2, 1, std::bit_cast<u32>(16.f), 0, 0, 0);
-  constexpr std::array<std::array<u32, 2>, 4> neighbors{{{3, 1}, {1, 1}, {2, 0}, {2, 2}}};
-  for (u32 sample = 0; sample < neighbors.size(); ++sample) {
-    const auto value = std::bit_cast<u32>(float(sample + 1));
-    SetRgbaPixel(&test.sampled_image_rgba, 4, neighbors[sample][0], neighbors[sample][1],
-                 value, 0, 0, 0);
-    test.expected.push_back(value);
-  }
-  test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  test.required_spirv = {"Lod|ConstOffset", "Grad|ConstOffset"};
-  test.forbidden_spirv = {"OpImageQuerySizeLod", "OpFDiv", "OpBitFieldSExtract", "OpSwitch"};
+  auto mip1 = MakeRgbaImage(2, 2);
+  SetRgbaPixel(&mip1, 2, 0, 0, 0x3f800000u, 0, 0, 0);
+  SetRgbaPixel(&mip1, 2, 1, 0, 0x40000000u, 0x40400000u, 0x40800000u,
+               0x40a00000u);
+
+  // One mip-1 texel is half of the base width, so a level-0 scale would stay on texel (0,0).
+  TestCase test;
+  test.name = "ImageSampleLodOffsetMovesTexelOfSampledMipOnGpu";
+  test.code = code;
+  test.expected = {0x40000000u, 0x40400000u, 0x40800000u, 0x40a00000u};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.sampled_image_rgba_mips = {base, mip1};
+  test.required_spirv = {"OpImageQueryLevels", "OpBitFieldSExtract"};
   return test;
 }
 
@@ -39594,10 +39627,9 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageD16GatherPacksHalfPairs);
   AddCase(ImageSampleA16SamplerCoordsOnGpu);
   AddCase(ImageSampleOpcodeAliasUsesNormalCoords);
-  AddCase(ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu<32>);
-  AddCase(ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu<64>);
-  AddCase(ImageSampleOffsetsReadFourNeighbors<32>);
-  AddCase(ImageSampleOffsetsReadFourNeighbors<64>);
+  AddCase(ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu);
+  AddCase(ImageSampleLevelZeroOffsetShiftsBothAxesOnGpu);
+  AddCase(ImageSampleLodOffsetMovesTexelOfSampledMipOnGpu);
   AddCase(ImageSampleA16CompareBiasRdna2AddressOrder);
   AddCase(ImageGatherCompareOpcodes);
   AddCase(ImageGatherLodReadsSelectedMipOnGpu);

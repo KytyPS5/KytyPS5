@@ -323,35 +323,121 @@ uint32_t QueryDimensions(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
 	return vector;
 }
 
-uint32_t PackedOffset(ValueEmitContext& ctx, IR::Value value, ImageDimension dimension,
-                      uint32_t& mask) {
+// Signed 6-bit texel offsets per spatial dimension at bits 0, 8 and 16.
+bool SpatialOffsets(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::Inst& address,
+                    const ImageSampleLayout& layout, ImageDimension dimension,
+                    uint32_t (&values)[3]) {
 	const auto components = ImageDimensionInfoFor(dimension).spatial_components;
-	uint32_t values[3] {};
-	if (value.IsImmediate()) {
-		// RDNA2 packs signed six-bit texel offsets into the low bits of each byte.
-		for (uint32_t index = 0; index < components; index++) {
-			const auto bits = (value.U32() >> (index * 8u)) & 0x3fu;
-			values[index] = ConstantI32(ctx.state, static_cast<int32_t>(bits ^ 0x20u) - 0x20);
-		}
-		mask |= spv::ImageOperandsConstOffsetMask;
-		return components == 1u
-		           ? values[0]
-		           : ctx.state.builder.Constant(spv::OpConstantComposite,
-		                                        TypeI32Vector(ctx.state, components),
-		                                        std::span(values).first(components));
+	const auto zero       = ConstantI32(ctx.state, 0);
+	for (auto& value: values) {
+		value = zero;
 	}
-	mask |= spv::ImageOperandsOffsetMask;
-	const auto packed = Unary(ctx.state, spv::OpBitcast, TypeI32(ctx.state), ctx.Def(value));
+	if (layout.offset == NoImageComponent || mem.image_address_components <= layout.offset) {
+		return false;
+	}
+	const auto packed = Unary(ctx.state, spv::OpBitcast, TypeI32(ctx.state),
+	                          AddressU32(ctx, mem, address, layout.offset));
 	for (uint32_t index = 0; index < components; index++) {
 		values[index] = ctx.state.builder.AllocateId();
 		ctx.state.builder.AddFunction(spv::OpBitFieldSExtract, TypeI32(ctx.state), values[index],
 		                              packed, ConstantU32(ctx.state, index * 8u),
 		                              ConstantU32(ctx.state, 6));
 	}
+	return true;
+}
+
+uint32_t PackedOffset(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::Inst& address,
+                      const ImageSampleLayout& layout, ImageDimension dimension) {
+	const auto components = ImageDimensionInfoFor(dimension).spatial_components;
+	uint32_t   values[3] {};
+	SpatialOffsets(ctx, mem, address, layout, dimension, values);
 	if (components == 1u) return values[0];
 	const auto result = ctx.state.builder.AllocateId();
 	ctx.state.builder.AddFunction(spv::OpCompositeConstruct, TypeI32Vector(ctx.state, components),
 	                              result, std::span(values).first(components));
+	return result;
+}
+
+// The _L level, rounded to the nearest mip and clamped to the view; level 0 for every other form.
+uint32_t ExplicitLodLevel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::Inst& address,
+                          const ImageSampleLayout& layout, uint32_t image) {
+	auto& state = ctx.state;
+	if (!HasFlag(mem, Decoder::ImageSampleFlagLod) || layout.lod == NoImageComponent) {
+		return ConstantU32(state, 0);
+	}
+	state.builder.RequireCapability(spv::CapabilityImageQuery);
+	const auto rounded = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    spv::OpExtInst, TypeF32(state), rounded, GlslStd450(state), GLSLstd450Floor,
+	    Binary(state, spv::OpFAdd, TypeF32(state), AddressF32(ctx, mem, address, layout.lod),
+	           ConstantF32(state, 0x3f000000u)));
+	const auto positive = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), positive, GlslStd450(state),
+	                          GLSLstd450FMax, rounded, ZeroF32(state));
+	const auto levels = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpImageQueryLevels, TypeU32(state), levels, image);
+	const auto level = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    spv::OpExtInst, TypeU32(state), level, GlslStd450(state), GLSLstd450UMin,
+	    Unary(state, spv::OpConvertFToU, TypeU32(state), positive),
+	    Binary(state, spv::OpISub, TypeU32(state), levels, ConstantU32(state, 1)));
+	return level;
+}
+
+// Offset is gather-only, so a sample offset is folded into the coordinate at the sampled level.
+uint32_t OffsetCoordinate(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::Inst& address,
+                          const ImageSampleLayout& layout, ImageDimension dimension, uint32_t coord,
+                          uint32_t resource) {
+	if (ctx.state.program.info.images.at(mem.resource).cube) return coord;
+	uint32_t offsets[3] {};
+	if (!SpatialOffsets(ctx, mem, address, layout, dimension, offsets)) return coord;
+
+	auto&       state = ctx.state;
+	const auto& info  = ImageDimensionInfoFor(dimension);
+	state.builder.RequireCapability(spv::CapabilityImageQuery);
+	const auto image = LoadImageDescriptor(state, resource);
+	const auto size  = state.builder.AllocateId();
+	if (info.multisampled != 0u) {
+		state.builder.AddFunction(spv::OpImageQuerySize, ImageViewSizeType(state, dimension), size,
+		                          image);
+	} else {
+		state.builder.AddFunction(spv::OpImageQuerySizeLod, ImageViewSizeType(state, dimension),
+		                          size, image, ExplicitLodLevel(ctx, mem, address, layout, image));
+	}
+
+	const auto coord_components   = info.coordinate_components;
+	const auto spatial_components = info.spatial_components;
+	uint32_t   shifted[3] {};
+	for (uint32_t index = 0; index < coord_components; index++) {
+		auto value = coord;
+		if (coord_components > 1u) {
+			value = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), value, coord, index);
+		}
+		if (index < spatial_components) {
+			auto extent = size;
+			if (coord_components > 1u) {
+				extent = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), extent, size,
+				                          index);
+			}
+			const auto scaled =
+			    Binary(state, spv::OpFDiv, TypeF32(state),
+			           Unary(state, spv::OpConvertSToF, TypeF32(state), offsets[index]),
+			           Unary(state, spv::OpConvertUToF, TypeF32(state), extent));
+			value = Binary(state, spv::OpFAdd, TypeF32(state), value, scaled);
+		}
+		shifted[index] = value;
+	}
+	if (coord_components == 1u) return shifted[0];
+	const auto result = state.builder.AllocateId();
+	if (coord_components == 3u) {
+		state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 3), result,
+		                          shifted[0], shifted[1], shifted[2]);
+	} else {
+		state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 2), result,
+		                          shifted[0], shifted[1]);
+	}
 	return result;
 }
 
@@ -940,12 +1026,20 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			    CoordF32(ctx, mem, *address, layout.coord,
 			             ImageDimensionInfoFor(candidate.dimension).coordinate_components,
 			             candidate.cube);
-			const auto sampled = MakeSampledImage(state, resource, sampler_id, 0u, array_index,
-			                                      sampler_index != 0u);
-			const auto sample = state.builder.AllocateId();
-			state.builder.AddFunction(opcode, result_type, sample, sampled, coord,
-			                          std::span(&dref_value, dref ? 1u : 0u),
-			                          std::span<const uint32_t>(sample_operands).first(sample_operand_count));
+			const auto sampled = MakeSampledImage(state, resource, sampler_id);
+			const auto shifted =
+			    OffsetCoordinate(ctx, mem, *address, layout, candidate.dimension, coord, resource);
+			const auto            sample = state.builder.AllocateId();
+			std::vector<uint32_t> sample_operands {result_type, sample, sampled, shifted};
+
+			if (dref) {
+				sample_operands.push_back(dref_value);
+			}
+			if (operand_mask != 0u) {
+				sample_operands.push_back(operand_mask);
+				sample_operands.insert(sample_operands.end(), operands.begin(), operands.end());
+			}
+			state.builder.AddFunction(opcode, sample_operands);
 			return sample;
 		};
 		auto result = EmitImageAccess(ctx, inst, result_type, EmitSample);

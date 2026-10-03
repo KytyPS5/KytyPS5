@@ -7,7 +7,8 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 
 // Completes the immutable shader interface after resource tracking. On failure Program::info and
 // all completion state remain unchanged.
-void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info);
+void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info,
+                       bool fragment_shader_barycentric = true);
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
 

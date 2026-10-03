@@ -164,6 +164,7 @@ private:
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	void MarkBdaStores(uint64_t vaddr, uint64_t size);
 	void RecordBdaEviction(const Buffer& buffer);
+	void               MakePageTableResident(uint64_t table_offset, uint64_t size);
 	void ForgetClassifiedMetadata(uint64_t vaddr, uint64_t size);
 
 	// The tick of the recording that last wrote a range, kept until that tick completes.
@@ -189,6 +190,10 @@ private:
 	bool                                              m_device_state_cleared = false;
 	Buffer                                            m_gds_buffer;
 	Buffer                                            m_bda_pagetable_buffer;
+	uint64_t                                           m_bda_table_chunk        = 0;
+	uint32_t                                           m_bda_table_memory_types = 0;
+	std::vector<VmaAllocation>                         m_bda_table_chunks;
+	vk::Fence                                          m_bda_table_fence = nullptr;
 	Common::SlotVector<Buffer>                        m_slot_buffers;
 	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_lru_cache;
 	BufferMap                                         m_buffers;

@@ -760,6 +760,20 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	graphics.draw_indirect_first_instance_enabled = device_features.drawIndirectFirstInstance;
 	graphics.multi_draw_indirect_enabled          = device_features.multiDrawIndirect;
 	graphics.draw_indirect_count_enabled          = features12.drawIndirectCount;
+	{
+		vk::PhysicalDeviceProperties properties {};
+		physical_device.getProperties(&properties);
+		const bool sparse_queue = static_cast<bool>(queue_families[queue_family].queueFlags &
+		                                            vk::QueueFlagBits::eSparseBinding);
+		const bool sparse_residency_buffer =
+		    supported_features2.features.sparseBinding == VK_TRUE &&
+		    supported_features2.features.sparseResidencyBuffer == VK_TRUE &&
+		    properties.sparseProperties.residencyNonResidentStrict == VK_TRUE && sparse_queue;
+		device_features.sparseBinding            = sparse_residency_buffer ? VK_TRUE : VK_FALSE;
+		device_features.sparseResidencyBuffer    = sparse_residency_buffer ? VK_TRUE : VK_FALSE;
+		graphics.sparse_residency_buffer_enabled = sparse_residency_buffer;
+		LOGF("\tsparse residency buffers: %s\n", sparse_residency_buffer ? "true" : "false");
+	}
 	graphics.sample_rate_shading_enabled                 = true;
 	device_features.shaderInt64 = VK_TRUE;
 	device_features.shaderFloat64 =

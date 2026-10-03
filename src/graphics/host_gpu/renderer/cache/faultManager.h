@@ -28,6 +28,7 @@ private:
 	BufferCache&                               m_buffer_cache;
 	Buffer                                     m_fault_buffer;
 	Buffer                                     m_download_buffer;
+	Buffer                                     m_fault_list;
 	std::array<uint64_t, MaxPendingFaults>      m_fault_areas {};
 	uint32_t                                   m_current_area = 0;
 	vk::DescriptorSetLayout                    m_fault_process_desc_layout = nullptr;

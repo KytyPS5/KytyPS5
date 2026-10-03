@@ -103,6 +103,9 @@ struct Graph {
 	bool                                    unsupported   = false;
 	FailureKind                             failure_kind  = FailureKind::None;
 	uint32_t                                failure_block = UINT32_MAX;
+	// Guest PC the build rejection was raised at. Only a build failure sets it; a structurizer
+	// failure describes a block, not an instruction.
+	uint32_t                                failure_pc    = UINT32_MAX;
 	std::string                             unsupported_reason;
 
 	const BasicBlock* FindBlock(uint32_t id) const;
@@ -112,6 +115,9 @@ struct Graph {
 	bool              Dominates(uint32_t dominator, uint32_t block) const;
 };
 
+// A guest program the builder cannot model is not fatal: the returned graph then has
+// unsupported set, with failure_kind, failure_pc and unsupported_reason describing why, and an
+// empty block list so nothing downstream can walk a half-built graph. Check unsupported first.
 Graph       BuildGraph(const Decoder::Program& program);
 bool MayWriteScalarRegister(const Decoder::Instruction& inst, uint32_t code);
 uint32_t FindScalarDefinition(const Decoder::Program& program, const Graph& graph,

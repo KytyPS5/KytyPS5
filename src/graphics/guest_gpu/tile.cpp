@@ -360,8 +360,10 @@ bool TileGetTiledTextureLayout(const TileSurfaceDescription& description, TileSu
 		    ((description.width >> level) + texture.texel_width - 1u) / texture.texel_width, 1u);
 		mip.height = std::max(
 		    ((description.height >> level) + texture.texel_height - 1u) / texture.texel_height, 1u);
-		mip.padded_width  = Common::AlignUp(std::max(ShiftCeil(width0, level), 1u), block.block_width);
-		mip.padded_height = Common::AlignUp(std::max(ShiftCeil(height0, level), 1u), block.block_height);
+		mip.padded_width =
+		    Common::AlignUp(std::max(ShiftCeil(width0, level), 1u), block.block_width);
+		mip.padded_height =
+		    Common::AlignUp(std::max(ShiftCeil(height0, level), 1u), block.block_height);
 		mip.size = static_cast<uint64_t>(block.block_depth) * mip.padded_width * mip.padded_height *
 		           block.bytes_per_element;
 		result.block_slice_size += mip.size;
@@ -1214,8 +1216,8 @@ bool TileGetRenderTargetSize(uint32_t width, uint32_t height, uint32_t pitch,
 }
 
 static bool TileGetColorMetadataSize(uint32_t width, uint32_t height, uint32_t slices,
-                                      uint32_t block_width, uint32_t block_height,
-                                      TileSizeAlign& total_size) {
+                                     uint32_t block_width, uint32_t block_height,
+                                     TileSizeAlign& total_size) {
 	if (width == 0 || height == 0 || slices == 0) {
 		return false;
 	}
@@ -1230,12 +1232,12 @@ static bool TileGetColorMetadataSize(uint32_t width, uint32_t height, uint32_t s
 	return true;
 }
 
-bool TileGetDccSize(uint32_t width, uint32_t height, uint32_t slices,
-                    uint32_t bytes_per_element, uint32_t levels, Prospero::TileMode tile,
-                    TileSizeAlign& total_size, uint32_t num_fragments_log2) {
+bool TileGetDccSize(uint32_t width, uint32_t height, uint32_t slices, uint32_t bytes_per_element,
+                    uint32_t levels, Prospero::TileMode tile, TileSizeAlign& total_size,
+                    uint32_t num_fragments_log2) {
 	total_size = {};
-	if (levels != 1 || num_fragments_log2 != 0 ||
-	    !std::has_single_bit(bytes_per_element) || bytes_per_element > 16 ||
+	if (levels != 1 || num_fragments_log2 != 0 || !std::has_single_bit(bytes_per_element) ||
+	    bytes_per_element > 16 ||
 	    (tile != Prospero::TileMode::kRenderTarget && tile != Prospero::TileMode::kDepth)) {
 		return false;
 	}

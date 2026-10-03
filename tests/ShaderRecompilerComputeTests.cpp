@@ -967,6 +967,17 @@ void AppendStoreSgprPair(std::vector<u32> *code, u32 value_sgpr,
 
 void AppendEnd(std::vector<u32> *code) { code->push_back(0xbf810000u); }
 
+// FP64 arithmetic translates, but the backend only expresses it under float mode 0xc0.
+std::vector<u32> Float64ConversionCode() {
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 7, 63u);
+  code.push_back(0x7e060907u); // V_CVT_F64_I32 v[3:4], v7
+  code.push_back(0x7e041f03u); // V_CVT_F32_F64 v2, v[3:4]
+  AppendStoreVgpr(&code, 2, 0);
+  AppendEnd(&code);
+  return code;
+}
+
 std::string Hex(u32 value) {
   char buffer[32] = {};
   std::snprintf(buffer, sizeof(buffer), "0x%08" PRIx32, value);
@@ -43658,13 +43669,10 @@ int main(int argc, char **argv) {
     }
     return 0;
   }
-  if (argc == 2 && std::strcmp(argv[1], "--scalar-sext-only") == 0) {
+  if (argc == 2 && std::strcmp(argv[1], "--shader-refusal-only") == 0) {
+    CheckEmissionRefusalIsSoft();
     VulkanHarness vulkan;
-    for (const u32 bits : {8u, 16u}) {
-      RunCase(&vulkan, ScalarSextMasks(bits, 32));
-      RunCase(&vulkan, ScalarSextMasks(bits, 64));
-    }
-    RunCase(&vulkan, ScalarSextConstantsAndAliases());
+    vulkan.CheckRefusedShaderSkipsDispatch();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--flat-d16-only") == 0) {
@@ -43673,18 +43681,6 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, FlatStoreSlcCaptured());
     RunCase(&vulkan, FlatLoadDlcCaptured(32));
     RunCase(&vulkan, FlatLoadDlcCaptured(64));
-    RunCase(&vulkan, GlobalLoadShortD16Captured(32));
-    RunCase(&vulkan, GlobalLoadShortD16Captured(64));
-    RunCase(&vulkan, FlatLoadShortD16AddressSegments());
-    RunCase(&vulkan, FlatSubdwordLoadsApplyByteOffset());
-    RunCase(&vulkan, FlatVirtualAddressRebasesGuestAllocation());
-    RunCase(&vulkan, GlobalSignedImmediateRebasesBeforeSaddr());
-    RunCase(&vulkan, FlatSegmentIgnoresSaddrAndMasksOffsetMsb());
-    RunCase(&vulkan, ScratchIsPrivatePerInvocation());
-    return 0;
-  }
-  if (argc == 2 && std::strcmp(argv[1], "--flat-d16-only") == 0) {
-    VulkanHarness vulkan;
     RunCase(&vulkan, GlobalLoadShortD16Captured(32));
     RunCase(&vulkan, GlobalLoadShortD16Captured(64));
     RunCase(&vulkan, FlatLoadShortD16AddressSegments());
@@ -44413,7 +44409,7 @@ int main(int argc, char **argv) {
   vulkan.CheckGpuTilerCpuParity();
   vulkan.CheckNativeIndirectDispatch();
   CheckComputeLdsLimit(vulkan);
-  vulkan.CheckBdaPageTableUploads();
+  vulkan.CheckRefusedShaderSkipsDispatch();
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckUnifiedImageViewCache();
   vulkan.CheckPackedTextureComponents();

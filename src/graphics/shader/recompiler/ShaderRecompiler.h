@@ -4,7 +4,7 @@
 #include "common/common.h"
 #include "common/stringUtils.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
-#include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 #include "graphics/shader/shader.h"
 
 #include <array>
@@ -27,10 +27,22 @@ struct CompileOptions {
 	ShaderStageInputInfo        input_info;
 };
 
+// Why a guest shader could not be recompiled: a CFG-build or resource-tracking rejection that
+// describes the guest program, not a broken emulator invariant. The emulator is built without
+// exceptions, so a rejection travels back as a value and the caller drops the draw.
+struct RecompileStatus {
+	bool        ok = true;
+	uint32_t    pc = 0;
+	std::string reason;
+};
+
 struct TranslateResult {
 	IR::Program program;
 	std::string decoded_dump;
 	std::string cfg_dump;
+	// Not ok when the guest shader could not be recompiled. The program is then unusable - either
+	// empty, or left half-rewritten by the rejected pass - and the caller skips the draw.
+	RecompileStatus status;
 };
 
 struct CompileResult {
@@ -38,6 +50,9 @@ struct CompileResult {
 	std::string            decoded_dump;
 	std::string            ir_dump;
 	IR::Program            program;
+	// Not ok when the backend cannot express the guest program. The shader is then dropped, the
+	// same way a rejected translation is, rather than ending the session.
+	RecompileStatus        status;
 };
 
 // Decoded source and typed scalar call queries are retained once per cache source.

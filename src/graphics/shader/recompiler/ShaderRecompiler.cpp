@@ -481,18 +481,29 @@ Decoder::Program DecodeFusedProgram(std::span<const uint32_t> front, std::span<c
 	return result;
 }
 
+// Links only a single compute S_SWAPPC_B64 whose target the host can re-execute. Anything else
+// leaves `source.call` empty, and the translator keeps the any-hit stub for that call.
 void PrepareCallTarget(ShaderSource& source, const CompileOptions& options) {
 	using namespace IR;
+	uint32_t calls = 0;
 	for (uint32_t i = 0; i < source.decoded.instructions.size(); ++i) {
 		if (source.decoded.instructions[i].opcode != Decoder::Opcode::S_SWAPPC_B64) continue;
-		EXIT_NOT_IMPLEMENTED(source.call.has_value() || options.stage != ShaderType::Compute);
 		source.call = ShaderSource::Call {.instruction = i};
+		calls++;
 	}
-	EXIT_IF(options.input_info.compute == nullptr);
+	if (calls != 1u || options.stage != ShaderType::Compute ||
+	    options.input_info.compute == nullptr) {
+		source.call.reset();
+		return;
+	}
 	const auto& call = source.decoded.instructions[source.call->instruction];
-	EXIT_NOT_IMPLEMENTED(call.src0.kind != Decoder::OperandKind::Sgpr ||
-	                     call.dst.kind != Decoder::OperandKind::Sgpr ||
-	                     call.src0.reg != call.dst.reg || call.dst.reg >= 105u);
+	if (call.src0.kind != Decoder::OperandKind::Sgpr ||
+	    call.dst.kind != Decoder::OperandKind::Sgpr || call.src0.reg != call.dst.reg ||
+	    call.dst.reg >= 105u) {
+		source.call.reset();
+		return;
+	}
+	bool       failed = false;
 	const auto graph = CFG::BuildGraph(source.decoded);
 	Program query;
 	query.stage = options.stage;
@@ -526,7 +537,11 @@ void PrepareCallTarget(ShaderSource& source, const CompileOptions& options) {
 	Register = [&](uint32_t before, uint32_t code) -> Value {
 		const auto index = CFG::FindScalarDefinition(source.decoded, graph, before, code);
 		if (index == UINT32_MAX) {
-			EXIT_IF(code < query.user_data_base || code - query.user_data_base >= query.user_data_count);
+			if (code < query.user_data_base ||
+			    code - query.user_data_base >= query.user_data_count) {
+				failed = true;
+				return Value(0u);
+			}
 			return IREmitter(&block).GetUserData(static_cast<ScalarReg>(code));
 		}
 		auto [entry, inserted] = producers.try_emplace(index);
@@ -554,12 +569,18 @@ void PrepareCallTarget(ShaderSource& source, const CompileOptions& options) {
 			block.Instructions().splice(block.end(), translated.Instructions());
 			producer.ready = true;
 		}
-		EXIT_IF(!producer.ready || !producer.values.contains(code));
+		if (!producer.ready || !producer.values.contains(code)) {
+			failed = true;
+			return Value(0u);
+		}
 		return producer.values.at(code).Resolve();
 	};
 	for (uint32_t i = 0; i < 2u; ++i) {
 		const auto value = Register(source.call->instruction, call.src0.reg + i);
-		EXIT_IF(!ValidateRuntimeValue(query, value, RuntimeValueType::Integer));
+		if (failed || !ValidateRuntimeValue(query, value, RuntimeValueType::Integer)) {
+			source.call.reset();
+			return;
+		}
 		auto& root = query.value_storage.emplace_back(ValueOpcode::ReferenceU32);
 		root.SetArg(0, value);
 		source.call->target[i] = Value(&root);
@@ -570,10 +591,9 @@ void PrepareCallTarget(ShaderSource& source, const CompileOptions& options) {
 	EliminateDeadCode(query.blocks);
 	for (auto& value: source.call->target) value = value.Instruction()->Arg(0).Resolve();
 	query.value_storage.clear();
+	// The retained reads keep their MemoryFlags, which is what the SRT walker reads them by.
 	for (auto& inst: block) {
 		inst.SetParent(nullptr);
-		if (inst.GetOpcode() == ValueOpcode::LoadAddressU32 || inst.GetOpcode() == ValueOpcode::ReadConstBuffer)
-			inst.SetFlags(SrtReadFlags {.index = inst.Flags<MemoryFlags>().index});
 	}
 	query.value_storage.splice(query.value_storage.end(), block.Instructions());
 	source.call_targets = std::move(static_cast<ResourcePlan&>(query));
@@ -583,7 +603,11 @@ void PrepareCallTarget(ShaderSource& source, const CompileOptions& options) {
 
 ShaderSource PrepareShaderSource(std::span<const uint32_t> code, const CompileOptions& options) {
 	EXIT_IF(code.empty());
-	ShaderSource source;
+	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " code_words=%" PRIu64 " decode\n",
+	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
+	     static_cast<uint64_t>(code.size()));
+	const Decoder::DecodeContextScope decode_context(options.shader_hash, code.data());
+	ShaderSource                      source;
 	if (!options.back_code.empty()) {
 		source.decoded = DecodeFusedProgram(code, options.back_code, source.code);
 	} else if (options.stage == ShaderType::Local) {
@@ -594,10 +618,15 @@ ShaderSource PrepareShaderSource(std::span<const uint32_t> code, const CompileOp
 	} else {
 		Decoder::DecodeProgram(code, source.decoded);
 	}
+	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " decode instructions=%" PRIu64 "\n",
+	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
+	     static_cast<uint64_t>(source.decoded.instructions.size()));
 	if (source.decoded.has_swap_pc) {
 		PrepareCallTarget(source, options);
-		source.code.assign(code.begin(), code.end());
-		source.decoded.code = source.code;
+		if (source.call) {
+			source.code.assign(code.begin(), code.end());
+			source.decoded.code = source.code;
+		}
 	}
 	return source;
 }
@@ -605,16 +634,22 @@ ShaderSource PrepareShaderSource(std::span<const uint32_t> code, const CompileOp
 const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtRuntime& runtime) {
 	auto& reads = source.reads;
 	reads.clear();
+	// An unlinked call keeps the translator's any-hit stub.
+	if (!source.call) return source.decoded;
 	IR::SrtReadCapture capture(runtime, reads);
-	const auto clean = IR::CleanRuntime(capture.ObservedRuntime());
-	IR::SrtWalker walker(source.call_targets, clean);
-	uint32_t low = 0, high = 0;
-	const auto& call = source.decoded.instructions[source.call->instruction];
-	if (!walker.Evaluate(source.call->target[0], low) || !walker.Evaluate(source.call->target[1], high))
-		EXIT("shader call at pc 0x%08x has an unavailable scalar target", call.pc);
+	const auto         clean = IR::CleanRuntime(capture.ObservedRuntime());
+	IR::SrtWalker      walker(source.call_targets, clean);
+	uint32_t           low = 0, high = 0;
+	const auto&        call = source.decoded.instructions[source.call->instruction];
+	if (!walker.Evaluate(source.call->target[0], low) ||
+	    !walker.Evaluate(source.call->target[1], high)) {
+		LOGF("shader call at pc 0x%08x has an unavailable scalar target; using the stub\n",
+		     call.pc);
+		return source.decoded;
+	}
 	// SWAPPC reads the old aliased pair and ignores the target's low two bits.
 	const auto address = ((uint64_t {high} << 32u) | low) & ~uint64_t {3};
-	EXIT_IF(address == 0u);
+	if (address == 0u) return source.decoded;
 	const auto query_reads = reads.size();
 	if (source.linked) {
 		auto& linked = *source.linked;
@@ -625,30 +660,39 @@ const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtR
 		}
 		reads.resize(query_reads);
 	}
-	ShaderSource::Linked linked {.code = source.code,
-	                             .decoded = source.decoded};
-	const auto& last = source.decoded.instructions.back();
-	EXIT_NOT_IMPLEMENTED(last.opcode != Decoder::Opcode::S_ENDPGM);
+	ShaderSource::Linked linked {.code = source.code, .decoded = source.decoded};
+	const auto&          last = source.decoded.instructions.back();
+	// A call this linker cannot follow keeps the stub: only a scalar leaf that returns through
+	// the call's own register pair is inlined.
+	const auto unlinked = [&](const char* reason) -> const Decoder::Program& {
+		LOGF("shader call at pc 0x%08x not linked (%s); using the stub\n", call.pc, reason);
+		reads.resize(query_reads);
+		return source.decoded;
+	};
+	if (last.opcode != Decoder::Opcode::S_ENDPGM) return unlinked("program does not end");
 	// Keep the caller's data/footer bytes at their native offsets. The leaf's virtual CFG
 	// PCs follow decoded instructions; its physical code is independently read and owned.
 	const auto function_pc = last.pc + last.word_count * sizeof(uint32_t);
 	for (uint32_t index = 0;;) {
 		// The observed queue helper is a scalar leaf. Scalar encodings need at most one literal.
-		EXIT_IF(index >= 64u || address > UINT64_MAX - (uint64_t {index} + 2u) * sizeof(uint32_t));
+		if (index >= 64u || address > UINT64_MAX - (uint64_t {index} + 2u) * sizeof(uint32_t))
+			return unlinked("leaf too long");
 		std::array<uint32_t, 2> words {};
 		if (!clean.read_memory(clean.userdata, address + uint64_t {index} * sizeof(uint32_t),
 		                       std::span(words).first(1)))
-			EXIT("shader call at pc 0x%08x cannot read leaf code", call.pc);
+			return unlinked("leaf code unreadable");
 		const auto family = Decoder::GetInstructionFamily(words[0]);
-		EXIT_NOT_IMPLEMENTED(family != Decoder::Family::SOP1 && family != Decoder::Family::SOP2 &&
-		                     family != Decoder::Family::SOPC && family != Decoder::Family::SOPK &&
-		                     family != Decoder::Family::SOPP);
+		if (family != Decoder::Family::SOP1 && family != Decoder::Family::SOP2 &&
+		    family != Decoder::Family::SOPC && family != Decoder::Family::SOPK &&
+		    family != Decoder::Family::SOPP)
+			return unlinked("leaf is not scalar");
 		Decoder::Instruction inst;
 		Decoder::DecodeInstruction(words, 0u, inst);
 		if (inst.word_count == 2u) {
-			if (!clean.read_memory(clean.userdata, address + uint64_t {index + 1u} * sizeof(uint32_t),
+			if (!clean.read_memory(clean.userdata,
+			                       address + uint64_t {index + 1u} * sizeof(uint32_t),
 			                       std::span(words).last(1)))
-				EXIT("shader call at pc 0x%08x cannot read leaf literal", call.pc);
+				return unlinked("leaf literal unreadable");
 			inst = {};
 			Decoder::DecodeInstruction(words, 0u, inst);
 		}
@@ -656,17 +700,20 @@ const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtR
 		if (Decoder::IsDirectBranch(inst.opcode)) inst.branch_target += inst.pc;
 		linked.code.insert(linked.code.end(), inst.raw, inst.raw + inst.word_count);
 		index += inst.word_count;
-		EXIT_NOT_IMPLEMENTED(inst.opcode == Decoder::Opcode::S_SWAPPC_B64 ||
-		                     inst.opcode == Decoder::Opcode::S_GETPC_B64 ||
-		                     inst.opcode == Decoder::Opcode::S_ENDPGM);
-		EXIT_IF(CFG::MayWriteScalarRegister(inst, call.dst.reg) || CFG::MayWriteScalarRegister(inst, call.dst.reg + 1u));
+		if (inst.opcode == Decoder::Opcode::S_SWAPPC_B64 ||
+		    inst.opcode == Decoder::Opcode::S_GETPC_B64 || inst.opcode == Decoder::Opcode::S_ENDPGM)
+			return unlinked("leaf calls, reads its PC or ends the program");
+		if (CFG::MayWriteScalarRegister(inst, call.dst.reg) ||
+		    CFG::MayWriteScalarRegister(inst, call.dst.reg + 1u))
+			return unlinked("leaf overwrites its return address");
 		const bool returns = inst.opcode == Decoder::Opcode::S_SETPC_B64;
 		if (returns) {
-			EXIT_NOT_IMPLEMENTED(inst.src0.kind != Decoder::OperandKind::Sgpr || inst.src0.reg != call.dst.reg);
-			inst.opcode = Decoder::Opcode::S_BRANCH;
+			if (inst.src0.kind != Decoder::OperandKind::Sgpr || inst.src0.reg != call.dst.reg)
+				return unlinked("leaf returns elsewhere");
+			inst.opcode        = Decoder::Opcode::S_BRANCH;
 			inst.branch_target = call.pc + call.word_count * sizeof(uint32_t);
 		} else if (Decoder::IsDirectBranch(inst.opcode)) {
-			EXIT_IF(inst.branch_target > UINT32_MAX - function_pc);
+			if (inst.branch_target > UINT32_MAX - function_pc) return unlinked("branch overflows");
 			inst.branch_target += function_pc;
 		}
 		inst.pc += function_pc;
@@ -675,10 +722,12 @@ const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtR
 	}
 	const auto function_end = linked.decoded.instructions.back().pc +
 	                          linked.decoded.instructions.back().word_count * sizeof(uint32_t);
-	for (size_t i = source.decoded.instructions.size(); i + 1u < linked.decoded.instructions.size(); ++i) {
+	for (size_t i = source.decoded.instructions.size(); i + 1u < linked.decoded.instructions.size();
+	     ++i) {
 		const auto& inst = linked.decoded.instructions[i];
-		if (Decoder::IsDirectBranch(inst.opcode))
-			EXIT_IF(inst.branch_target < function_pc || inst.branch_target >= function_end);
+		if (Decoder::IsDirectBranch(inst.opcode) &&
+		    (inst.branch_target < function_pc || inst.branch_target >= function_end))
+			return unlinked("leaf branches out of itself");
 	}
 	reads.resize(query_reads);
 	reads.emplace_back(address, (linked.code.size() - source.code.size()) * sizeof(uint32_t));
@@ -697,10 +746,13 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 
 TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileOptions& options) {
 	EXIT_IF(decoded.instructions.empty());
+	// An unlinked call (branch_target still UINT32_MAX) translates as the any-hit stub; only a
+	// linked leaf becomes control flow inside this program.
+	bool linked_call = false;
 	if (decoded.has_swap_pc) {
 		for (const auto& inst: decoded.instructions) {
-			if (inst.opcode == Decoder::Opcode::S_SWAPPC_B64 && inst.branch_target == UINT32_MAX)
-				EXIT("shader call at pc 0x%08x must be linked before translation", inst.pc);
+			linked_call |=
+			    inst.opcode == Decoder::Opcode::S_SWAPPC_B64 && inst.branch_target != UINT32_MAX;
 		}
 	}
 	if (options.stage != ShaderType::Compute && options.stage != ShaderType::Vertex &&
@@ -736,6 +788,23 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	     static_cast<uint64_t>(native_cfg.blocks.size()),
 	     static_cast<uint64_t>(native_cfg.natural_loops.size()),
 	     static_cast<uint64_t>(native_cfg.back_edges.size()), phase_ms());
+	// A shader the CFG builder cannot model - an undecodable instruction, a branch into nothing -
+	// is dropped, not fatal. Only a build failure sets unsupported here: the irreducible path
+	// clears it inside BuildGraph, and the structurizer has not run yet.
+	if (native_cfg.unsupported) {
+		LOGF("%s CFG build rejected: stage=%s hash=0x%016" PRIx64 " pc=0x%08" PRIx32 " %s\n",
+		     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
+		     native_cfg.failure_pc, native_cfg.unsupported_reason.c_str());
+		TranslateResult result;
+		result.status.ok     = false;
+		result.status.pc     = native_cfg.failure_pc;
+		result.status.reason = native_cfg.unsupported_reason;
+		if (options.dump_ir) {
+			result.decoded_dump = std::move(decoded_dump);
+			result.cfg_dump     = CFG::GraphToString(native_cfg);
+		}
+		return result;
+	}
 	if (native_cfg.irreducible) {
 		LogDispatcherFallback(options, native_cfg, "build");
 	} else {
@@ -802,7 +871,7 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 		IR::RemoveIdentities(ir.blocks);
 		IR::EliminateDeadCode(ir.blocks);
 	}
-	if (decoded.has_swap_pc) {
+	if (linked_call) {
 		// Leaf returns are resolved CFG edges; native PC values must not escape into GPU data.
 		for (const auto* block: ir.blocks)
 			for (const auto& inst: *block)
@@ -817,8 +886,19 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 			     MakeIrDump(cfg_dump, ir).c_str());
 		}
 	}
-	IR::TrackResources(ir, decoded, native_cfg);
+	auto tracking = IR::TrackResources(ir, decoded, native_cfg);
 	TranslateResult result;
+	if (!tracking.ok) {
+		LOGF("%s resource tracking rejected: stage=%s hash=0x%016" PRIx64 " pc=0x%08" PRIx32
+		     " %s\n",
+		     GetDumpLabel(options), StageName(options.stage), options.shader_hash, tracking.pc,
+		     tracking.reason.c_str());
+		result.status.ok     = false;
+		result.status.pc     = tracking.pc;
+		result.status.reason = std::move(tracking.reason);
+		result.program       = std::move(ir);
+		return result;
+	}
 	result.program = std::move(ir);
 	if (options.dump_ir) {
 		result.decoded_dump = std::move(decoded_dump);
@@ -885,7 +965,18 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram\n",
 	     GetDumpLabel(options), StageName(ir.stage), ir.shader_hash);
-	auto spirv = Spirv::EmitProgram(ir, options.input_info, push_data_start_dword);
+	std::string refusal;
+	auto        spirv = Spirv::EmitProgram(ir, options.input_info, push_data_start_dword, &refusal);
+	if (!refusal.empty()) {
+		LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram refused: %s\n",
+		     GetDumpLabel(options), StageName(ir.stage), ir.shader_hash, refusal.c_str());
+		CompileResult refused;
+		refused.status.ok     = false;
+		refused.status.pc     = 0;
+		refused.status.reason = std::move(refusal);
+		refused.program       = std::move(ir);
+		return refused;
+	}
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram words=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(ir.stage), ir.shader_hash,

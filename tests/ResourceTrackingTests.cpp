@@ -31,6 +31,13 @@ void Check(bool condition, const char *message) {
 }
 
 template <typename F>
+void CheckTrackingRejected(F &fixture, std::string_view expected,
+                           const char *message) {
+  const auto status = fixture.TryPlanAndTrack();
+  Check(!status.ok && status.reason.find(expected) != std::string::npos, message);
+}
+
+template <typename F>
 void CheckFatal(F &&function, std::string_view expected, const char *message) {
   try {
     function();
@@ -125,9 +132,9 @@ struct Fixture {
                  Value(0u), Value(0u), Value(0u)});
   }
 
-  void PlanAndTrack() {
-    for (size_t index = 0; index < program.blocks.size(); ++index) {
-      const auto condition = program.blocks[index]->condition;
+  ResourceTrackingStatus TryPlanAndTrack() {
+    for (size_t index = 0; index < program.block_info.size(); ++index) {
+      const auto condition = program.block_info[index].condition;
       if (!condition.IsEmpty())
         Emit(ValueOpcode::Reference, {condition}, 0, program.blocks[index]);
     }
@@ -147,7 +154,14 @@ struct Fixture {
         Emit(ValueOpcode::ReferenceU32, {value}, 0, target);
       }
     }
-    TrackResources(program, {}, {});
+    return TrackResources(program, {}, {});
+  }
+
+  void PlanAndTrack() {
+    const auto status = TryPlanAndTrack();
+    if (!status.ok) {
+      throw std::runtime_error(status.reason);
+    }
   }
 };
 
@@ -383,179 +397,78 @@ void TestInvariantIndirectImageMaterialization() {
         "malformed image table tracking was not transactional");
 }
 
-void TestBoundedImageViewEligibility() {
-  using Type = Libs::Graphics::Prospero::ImageType;
-  auto fixture = MakeIndirectImageFixture(false, 48u, 0u, 16u);
-  fixture->PlanAndTrack();
-  auto plan = ExtractResourcePlan(fixture->program);
-  std::array<uint32_t, 8> data{0x3000u, 16u << 16u, 1u, 0u,
-                              0x2000u, 48u << 16u, 5u, 0u};
-  LinearTestMemory memory;
-  memory.fail_address = 0x3000u;
-  const auto descriptor = [](uint32_t identity, Type type) {
-    return std::array<uint32_t, 8>{identity, 75u << 20u, 3u | (3u << 14u),
-        Libs::Graphics::DstSel(4, 5, 6, 7) | (static_cast<uint32_t>(type) << 28u),
-        0u, 0u, 0u, 0u};
-  };
-  const std::array types{Type::kColor2D, Type::kCube, Type::kColor3D,
-                         Type::kColor2DArray, Type::kColor2D};
-  for (uint32_t row = 0; row < types.size(); ++row) {
-    const auto value = descriptor(0x20u + row, types[row]);
-    std::copy(value.begin(), value.end(), memory.words.begin() + (0x1010u + row * 48u) / 4u);
-  }
-  SrtRuntime runtime{.user_data = data, .userdata = &memory,
-                     .read_specialization_memory = ReadLinearTestMemory};
-  ResourceSnapshot snapshot;
-  ResourceSpecialization specialization;
-  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            snapshot.images.size() == 4u && memory.reads == 1u,
-        "unrelated cube/3D heap entries prevented a typed 2D table view");
-  const auto mapping = specialization.images[0].indirect_mapping_offset;
-  Check(snapshot.flattened_srt[mapping] == 53u &&
-            snapshot.flattened_srt[mapping + 5u] == 1u &&
-            snapshot.flattened_srt[mapping + 17u] == 0u &&
-            snapshot.flattened_srt[mapping + 29u] == 0u &&
-            snapshot.flattened_srt[mapping + 41u] == 2u &&
-            snapshot.flattened_srt[mapping + 53u] == 3u &&
-            snapshot.images[1].dwords == descriptor(0x20u, Type::kColor2D) &&
-            snapshot.images[2].dwords == descriptor(0x23u, Type::kColor2DArray) &&
-            snapshot.images[3].dwords == descriptor(0x24u, Type::kColor2D),
-        "typed table eligibility changed byte offsets or discarded compatible views");
+  CheckTrackingRejected(*malformed, "not a valid runtime value",
+                        "malformed indirect image pattern was accepted");
+  Check(!malformed->program.resource_tracking_complete &&
+            malformed->program.info.images.empty() &&
+            malformed->program.descriptor_sources.empty(),
+        "malformed indirect image pattern was partially accepted");
 
-  // An explicitly selected descriptor is not an unrelated entry in a broad heap.
-  const auto image_source = plan.info.images[0].source;
-  std::vector<uint32_t> selected;
-  for (auto type : {Type::kColor2D, Type::kColor3D}) {
-    DescriptorSource source;
-    source.dword_count = 8u;
-    const auto value = descriptor(0x30u, type);
-    for (uint32_t word = 0; word < value.size(); ++word) source.dwords[word] = Value(value[word]);
-    selected.push_back(static_cast<uint32_t>(plan.descriptor_sources.size()));
-    plan.descriptor_sources.push_back(source);
-  }
-  plan.descriptor_sources[image_source].indirect_descriptor->sources = std::move(selected);
-  Check(!MaterializeResources(plan, runtime, snapshot, specialization),
-        "explicitly selected incompatible descriptor was silently normalized to null");
-}
+  auto negative_immediate = MakeIndirectImageFixture(false, 0xfffffffcu);
+  CheckFatal([&] { negative_immediate->PlanAndTrack(); },
+             "not a valid runtime value",
+             "negative scalar immediate entered the indirect image proof");
 
-void TestWaterfallImageTable() {
-  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
-  const auto make = [](bool equality, bool scalar) {
-    auto fixture = std::make_unique<Fixture>();
-    auto *entry = fixture->block;
-    auto *body = fixture->AddBlock();
-    auto *exit = fixture->AddBlock();
-    entry->AddBranch(body);
-    entry->AddBranch(exit);
-    body->AddBranch(exit);
-    std::array<Value, 4> words;
-    for (uint32_t i = 0; i < 4u; ++i) words[i] = fixture->UserData(i);
-    const auto table = fixture->Buffer(words);
-    const auto lane_value = fixture->Emit(ValueOpcode::GetAttribute, {Value(0u), Value(0u)});
-    const auto active = fixture->Emit(ValueOpcode::INotEqual32, {lane_value, Value(0u)});
-    const auto index = fixture->UserData(4u);
-    std::array<Value, 8> image_words;
-    auto guard = active;
-    for (uint32_t group = 0; group < 2u; ++group) {
-      MemoryInfo memory;
-      memory.kind = ResourceKind::Buffer;
-      memory.idxen = true;
-      memory.data_dwords = 4u;
-      memory.offset = 16u + group * 16u;
-      const auto loaded = fixture->Emit(ValueOpcode::LoadBufferU32x4,
-          {table, index, Value(0u), Value(0u), active}, fixture->AddMemory(memory, 0x850u));
-      for (uint32_t component = 0; component < 4u; ++component) {
-        const auto word = group * 4u + component;
-        const auto local = fixture->Emit(ValueOpcode::SelectU32,
-            {active, fixture->Emit(ValueOpcode::CompositeExtractU32x4,
-                                  {loaded, Value(component)}), Value(0xdeadu)});
-        image_words[word] = fixture->Emit(ValueOpcode::ReadLane, {local, Value(0u)});
-        if (equality || word != 7u)
-          guard = fixture->Emit(ValueOpcode::LogicalAnd,
-              {guard, fixture->Emit(ValueOpcode::IEqual32, {image_words[word], local})});
-      }
-    }
-    fixture->program.blocks[0]->condition = guard;
-    fixture->program.blocks[0]->terminator = {
-        .kind = CFG::TerminatorKind::ConditionalBranch,
-        .true_block = fixture->program.blocks[1u],
-        .false_block = fixture->program.blocks[2u]};
-    const auto sample = [&](Value image, Block *block) {
-      const auto sampler = fixture->Sampler({Value(0u), Value(0u), Value(0u), Value(0u)});
-      MemoryInfo memory;
-      memory.kind = ResourceKind::Image;
-      memory.image_dimension = Decoder::ImageDimension::Dim2D;
-      const auto value = fixture->Emit(ValueOpcode::ImageSampleRaw,
-          {image, sampler, fixture->ImageAddress(), block == entry ? active : guard},
-          fixture->AddMemory(memory, 0x92cu), block);
-      fixture->Emit(ValueOpcode::ReferenceU32,
-          {fixture->Emit(ValueOpcode::CompositeExtractU32x4, {value, Value(0u)}, 0, block)}, 0, block);
-    };
-    if (scalar) {
-      const auto key = fixture->Emit(ValueOpcode::ReadFirstLane, {lane_value, active});
-      const auto offset = fixture->Emit(ValueOpcode::IAdd32,
-          {fixture->Emit(ValueOpcode::IMul32, {key, Value(48u)}), Value(16u)});
-      std::array<Value, 8> scalar_words;
-      for (uint32_t word = 0; word < 8u; ++word) {
-        MemoryInfo memory;
-        memory.kind = ResourceKind::ScalarBuffer;
-        memory.offset = word * 4u;
-        scalar_words[word] = fixture->Emit(ValueOpcode::ReadConstBuffer, {table, offset},
-                                           fixture->AddMemory(memory, 0x7bcu));
-      }
-      sample(fixture->Image(scalar_words), entry);
-    }
-    const auto image = fixture->Emit(ValueOpcode::GetImageResource,
-        {image_words[0], image_words[1], image_words[2], image_words[3],
-         image_words[4], image_words[5], image_words[6], image_words[7]}, 0, body);
-    sample(image, body);
-    return fixture;
-  };
-  auto fixture = make(true, true);
-  fixture->PlanAndTrack();
-  auto plan = ExtractResourcePlan(fixture->program);
-  Check(plan.info.images.size() == 1u &&
-            plan.descriptor_sources[plan.info.images[0].source].indirect_descriptor->table_record_bytes == 48u,
-        "scalar and waterfall uses did not share their native image table");
-  std::array<uint32_t, 5> data{0x2000u, 48u << 16u, 2u, 0x5204u, 1u};
-  LinearTestMemory memory;
-  const std::array<uint32_t, 8> descriptor{0x20u, 75u << 20u, 3u | (3u << 14u),
-      Libs::Graphics::DstSel(4, 5, 6, 7) | (9u << 28u), 0u, 0u, 0u, 0u};
-  std::copy(descriptor.begin(), descriptor.end(), memory.words.begin() + 0x1010u / 4u);
-  SrtRuntime runtime{.user_data = data, .userdata = &memory,
-                     .read_specialization_memory = ReadLinearTestMemory};
-  ResourceSnapshot snapshot;
-  ResourceSpecialization specialization;
-  Check(MaterializeResources(plan, runtime, snapshot, specialization) && memory.reads == 1u &&
-            snapshot.images.size() == 2u,
-        "shared scalar/waterfall table repeated its coherent bulk read");
-  const auto handle = std::ranges::find_if(*fixture->program.blocks[1], [](const Inst &inst) {
-    return inst.GetOpcode() == ValueOpcode::GetImageResource;
-  });
-  for (const auto [index, format, expected] :
-       {std::array{1u, 0x5204u, 64u}, std::array{2u, 0x5204u, UINT32_MAX},
-        std::array{UINT32_MAX, 0x5204u, UINT32_MAX}, std::array{0u, 0u, UINT32_MAX}}) {
-    data[4] = index;
-    data[3] = format;
-    SrtWalker walker(fixture->program, runtime);
-    uint32_t offset = 0;
-    Check(walker.Evaluate(handle->Arg(0), offset) && offset == expected,
-          "VMEM table projection lost record bounds, format disable or multiplication carry");
+  for (const auto [immediate, member, first, stride] :
+       {std::array{0u, 4u, 4u, 224u}, std::array{4u, 4u, 8u, 224u},
+        std::array{36u, 0u, 36u, 224u}, std::array{1u, 3u, 0u, 224u},
+        std::array{1u, 3u, 0u, 1u}, std::array{1u, 3u, 0u, 2u}}) {
+    auto split_offset = MakeIndirectImageFixture(false, immediate, false, member, stride);
+    split_offset->PlanAndTrack();
+    const auto split_plan = ExtractResourcePlan(split_offset->program);
+    LinearTestMemory split_memory;
+    std::copy(image_descriptor.begin(), image_descriptor.end(),
+              split_memory.words.begin() + 0x1000u / 4u);
+    split_memory.fail_address = first == 36u ? 0x1004u : UINT64_MAX;
+    split_memory.watched_address = split_memory.base + first;
+    user_data[1] = stride << 16u;
+    user_data[2] = stride < 4u ? 8u / stride : 1u;
+    SrtRuntime split_runtime{.user_data = user_data,
+                             .userdata = &split_memory,
+                             .read_specialization_memory = ReadLinearTestMemory};
+    Check(MaterializeResources(split_plan, split_runtime, snapshot, specialization) &&
+              snapshot.images.size() == 1 &&
+              snapshot.images[0].dwords == image_descriptor &&
+              split_memory.watched_reads == 1u,
+          "indirect scalar offsets did not align and bound their components independently");
   }
-  auto disabled = make(true, false);
-  disabled->PlanAndTrack();
-  const auto disabled_plan = ExtractResourcePlan(disabled->program);
-  data[3] = 0u;
-  memory.fail_address = 0x2000u;
-  Check(MaterializeResources(disabled_plan, runtime, snapshot, specialization) &&
-            snapshot.images.size() == 1u &&
-            specialization.images[0].indirect_root == ImageResource::NoIndirectImage,
-        "disabled VMEM descriptor table read its unavailable backing");
-  Check(!MaterializeResources(plan, runtime, snapshot, specialization),
-        "VMEM format disable incorrectly disabled a shared scalar descriptor read");
-  auto malformed = make(false, false);
-  CheckFatal([&] { malformed->PlanAndTrack(); }, "not a valid runtime value",
-             "waterfall without all descriptor equality witnesses was accepted");
+
+  // The shader packs flags above a 15-bit cube-image key in the final DWORD of
+  // each 64-byte material record; the image occupies bytes 16..47 of its record.
+  auto packed = MakeIndirectImageFixture(false, 60u, false, 0u, 64u, 0x7fffu, 48u, 16u);
+  packed->PlanAndTrack();
+  const auto packed_plan = ExtractResourcePlan(packed->program);
+  LinearTestMemory packed_memory;
+  std::array<uint32_t, 8> packed_data{0x1000u, 64u << 16u, 3u, 0u,
+                                      0x2000u, 48u << 16u, 2u, 0u};
+  for (uint32_t i = 0; i < 3u; ++i)
+    packed_memory.words[(i * 64u + 60u) / 4u] = (0xffffu << 15u) | (i & 1u);
+  for (uint32_t i = 0; i < 2u; ++i) {
+    auto descriptor = image_descriptor;
+    descriptor[0] += i;
+    std::copy(descriptor.begin(), descriptor.end(),
+              packed_memory.words.begin() + (0x1000u + i * 48u + 16u) / 4u);
+  }
+  SrtRuntime packed_runtime{.user_data = packed_data, .userdata = &packed_memory,
+                            .read_specialization_memory = ReadLinearTestMemory};
+  Check(MaterializeResources(packed_plan, packed_runtime, snapshot, specialization) &&
+            snapshot.images.size() == 2u && snapshot.images[0].dwords == image_descriptor &&
+            snapshot.images[1].dwords[0] == image_descriptor[0] + 1u &&
+            snapshot.flattened_srt[specialization.images[0].indirect_mapping_offset] == 2u,
+        "packed material flags changed the table key or 48-byte descriptor addressing");
+  packed_memory.words[60u / 4u] = 0xffff8002u;
+  packed_memory.fail_address = 0x2070u;
+  Check(MaterializeResources(packed_plan, packed_runtime, snapshot, specialization) &&
+            snapshot.images.size() == 3u &&
+            std::ranges::all_of(snapshot.images[2].dwords, [](uint32_t word) { return word == 0u; }),
+        "masked out-of-range descriptor did not return zero without reading past table bounds");
+  packed_memory.fail_address = 0x205cu;
+  Check(!MaterializeResources(packed_plan, packed_runtime, snapshot, specialization),
+        "unreadable in-range DWORD in a 48-byte descriptor record was accepted");
+  auto overflowing = MakeIndirectImageFixture(false, 60u, false, 0u, 64u,
+                                               UINT32_MAX, 48u, 16u);
+  CheckFatal([&] { overflowing->PlanAndTrack(); }, "not a valid runtime value",
+             "unbounded table offset conflated shader U32 wrap with scalar immediate addition");
 }
 
 void TestGuardedDirectImageTable() {
@@ -2000,8 +1913,7 @@ void TestSampleAdjustSamplerScratch() {
                   {rejected_image, rejected_sampler, rejected.ImageAddress(), Value(true)},
                   rejected.AddMemory(rejected_memory, 0x200));
 
-    CheckFatal([&] { rejected.PlanAndTrack(); },
-               "not a valid runtime value", message);
+    CheckTrackingRejected(rejected, "not a valid runtime value", message);
   };
   CheckRejected(0u, 12u,
                 "ordinary sampling accepted SampleAdjust reserved scratch");
@@ -2419,7 +2331,7 @@ void TestWritableDescriptorPhi() {
                {handle, Value(0u), Value(0u), Value(0u), Value(1u), Value(true)},
                fixture.AddMemory(memory, 20), merge);
 
-  CheckFatal([&] { fixture.PlanAndTrack(); }, "not a valid runtime value",
+  CheckTrackingRejected(fixture, "not a valid runtime value",
              "control-dependent writable descriptor phi was accepted");
   Check(!fixture.program.resource_tracking_complete &&
             fixture.program.info.buffers.empty() &&
@@ -3658,9 +3570,8 @@ void TestResourceLimitIsTransactional() {
                  fixture.AddMemory(memory, index * 4u));
   }
 
-  CheckFatal([&] { fixture.PlanAndTrack(); },
-             "buffer resource limit exceeded",
-             "resource-limit failure was not reported");
+  CheckTrackingRejected(fixture, "buffer resource limit exceeded",
+                        "resource-limit failure was not reported");
   Check(!fixture.program.resource_tracking_complete &&
             fixture.program.info.buffers.empty() &&
             fixture.program.descriptor_sources.empty(),
@@ -3677,9 +3588,8 @@ void TestMalformedMemoryKindsRejected() {
                  {address, Value(0u), Value(0u), Value(1u), Value(true)},
                  fixture.AddMemory(memory, 4));
 
-    CheckFatal(
-        [&] { fixture.PlanAndTrack(); },
-        "address operation has invalid resource kind",
+    CheckTrackingRejected(
+        fixture, "address operation has invalid resource kind",
         "resource tracking accepted an address opcode with buffer metadata");
   }
   {
@@ -3694,9 +3604,8 @@ void TestMalformedMemoryKindsRejected() {
                  {image, fixture.ImageAddress(), Value(true)},
                  fixture.AddMemory(memory, 8));
 
-    CheckFatal(
-        [&] { fixture.PlanAndTrack(); },
-        "image operation has invalid resource kind",
+    CheckTrackingRejected(
+        fixture, "image operation has invalid resource kind",
         "resource tracking accepted an image opcode with address metadata");
   }
 }

@@ -286,6 +286,9 @@ void EmitBlock(ValueEmitContext& ctx, const IR::Block* block, EmitInstruction&& 
 	EmitLabel(ctx.state, block->Definition());
 	bool emitted_non_phi = false;
 	for (const auto& inst: *block) {
+		if (ctx.state.Refused()) {
+			return;
+		}
 		if (inst.GetOpcode() == IR::ValueOpcode::Phi) {
 			if (emitted_non_phi) {
 				ctx.Fail(inst, "appears after a non-Phi instruction");
@@ -343,7 +346,11 @@ void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState
 	EmitBlock(ctx, entry, [&](ValueEmitContext& lane, const IR::Inst& inst) {
 		EmitDispatcherInstruction(lane, dispatcher, inst);
 	});
-	const auto initial_pc     = EmitDispatcherNextPc(ctx, dispatcher, entry);
+	if (state.Refused()) {
+		return;
+	}
+	const auto initial_pc =
+	    EmitDispatcherNextPc(ctx, dispatcher, entry, state.program.block_info.front());
 	const auto initial_parent = state.current_label;
 	state.builder.AddFunction(spv::OpBranch, dispatcher.header_label);
 
@@ -377,7 +384,11 @@ void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState
 		          [&](ValueEmitContext& lane, const IR::Inst& inst) {
 			          EmitDispatcherInstruction(lane, dispatcher, inst);
 		          });
-		const auto selected = EmitDispatcherNextPc(ctx, dispatcher, state.program.blocks[index]);
+		if (state.Refused()) {
+			return;
+		}
+		const auto selected = EmitDispatcherNextPc(ctx, dispatcher, state.program.blocks[index],
+		                                           state.program.block_info[index]);
 		next_pc_words.push_back(selected);
 		next_pc_words.push_back(state.current_label);
 		state.builder.AddFunction(spv::OpBranch, dispatcher.after_switch_label);
@@ -588,6 +599,11 @@ const IR::ExportInfo& ValueEmitContext::Export(const IR::Inst& inst) const {
 	std::abort();
 }
 
+uint32_t ValueEmitContext::Refuse(const IR::Inst& inst, const char* reason) const {
+	state.Refuse(reason, &inst);
+	return 0;
+}
+
 void EmitProgram(EmitterState& state) {
 	const auto&      program = state.program;
 	ValueEmitContext ctx(state);
@@ -742,6 +758,9 @@ void EmitProgram(EmitterState& state) {
 		EmitDispatcherFunction(ctx, *dispatcher);
 	} else {
 		EmitStructuredFunction(ctx);
+	}
+	if (state.Refused()) {
+		return;
 	}
 	state.builder.AddFunction(spv::OpFunctionEnd);
 	if (state.program.stage == ShaderType::Mesh) {

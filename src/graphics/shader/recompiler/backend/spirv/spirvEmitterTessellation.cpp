@@ -16,10 +16,11 @@ uint32_t TessellationPointer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto storage = input ? spv::StorageClassInput : spv::StorageClassOutput;
 	const auto pointer = state.builder.AllocateId();
 	if (kind == Attribute::Factor) {
-		EXIT_NOT_IMPLEMENTED(!inst.Arg(1).IsImmediate());
+		if (!inst.Arg(1).IsImmediate() || inst.Arg(1).U32() / 4u >= 4u) {
+			return ctx.Refuse(inst, "tessellation factor needs a constant index below 4");
+		}
 		const auto index = inst.Arg(1).U32() / 4u;
 		const auto outer = index < 3u;
-		EXIT_NOT_IMPLEMENTED(index >= 4u);
 		state.builder.AddFunction(spv::OpAccessChain, TypePointer(state, storage, TypeF32(state)),
 		                          pointer, outer ? variable : state.tess_inner_variable,
 		                          ConstantU32(state, outer ? index : index - 3u));
@@ -70,7 +71,10 @@ void DefineTessellationInterfaces(EmitterState& state) {
 			const auto kind = inst.Arg(0).U32();
 			used.at(kind)   = true;
 			if (kind == static_cast<uint32_t>(Attribute::PatchOutput)) {
-				EXIT_NOT_IMPLEMENTED(!inst.Arg(1).IsImmediate());
+				if (!inst.Arg(1).IsImmediate()) {
+					state.Refuse("patch output needs a constant address", &inst);
+					return;
+				}
 				patch_begin = std::min(patch_begin, inst.Arg(1).U32());
 				patch_end   = std::max(patch_end, inst.Arg(1).U32() + 4u);
 			}
@@ -124,8 +128,9 @@ void DefineTessellationInterfaces(EmitterState& state) {
 
 void DefineTessellationExecutionModes(EmitterState& state) {
 	const auto& tess = state.input_info.vertex->tess;
-	EXIT_NOT_IMPLEMENTED(tess.domain != 1u || tess.partitioning != 2u ||
-	                     tess.output_topology != 2u);
+	if (tess.domain != 1u || tess.partitioning != 2u || tess.output_topology != 2u) {
+		state.Refuse("only triangle-domain fractional-odd tessellation is supported");
+	}
 	state.builder.RequireCapability(spv::CapabilityTessellation);
 	if (state.program.stage == ShaderType::TessellationControl) {
 		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeOutputVertices,

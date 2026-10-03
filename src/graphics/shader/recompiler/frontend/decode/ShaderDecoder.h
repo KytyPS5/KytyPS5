@@ -872,6 +872,18 @@ const char* ImageDimensionToString(ImageDimension dimension);
 std::string InstructionToString(const Instruction& inst);
 std::string ProgramToString(const Program& program);
 
+class DecodeContextScope {
+public:
+	DecodeContextScope(uint64_t hash, const void* code);
+	~DecodeContextScope();
+	DecodeContextScope(const DecodeContextScope&)            = delete;
+	DecodeContextScope& operator=(const DecodeContextScope&) = delete;
+
+private:
+	uint64_t    m_previous_hash = 0;
+	const void* m_previous_code = nullptr;
+};
+
 } // namespace Libs::Graphics::ShaderRecompiler::Decoder
 
 template <>

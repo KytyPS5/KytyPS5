@@ -6,6 +6,8 @@
 
 #include <algorithm>
 #include <array>
+#include <fmt/format.h>
+#include <string_view>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
@@ -194,10 +196,8 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 	}
 }
 
-} // namespace
-
-std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo input_info,
-                                  uint32_t push_data_start_dword) {
+std::vector<uint32_t> EmitProgram(const IR::Program& program, ShaderStageInputInfo input_info,
+                                  std::string* refusal) {
 	using namespace Emitter;
 
 	if (program.stage != ShaderType::Compute && program.stage != ShaderType::Vertex &&
@@ -216,15 +216,35 @@ std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo inp
 	IR::ValidateProgram(program, true);
 	program.bindings = {.push_data_start_dword = push_data_start_dword};
 	EmitterState state(program, input_info);
+	const auto refused = [&]() -> std::vector<uint32_t> {
+		const auto* inst = state.refused_inst;
+		auto        text = fmt::format("SPIR-V emission refused: opcode={} reason={}",
+		                               inst != nullptr ? IR::ValueOpcodeName(inst->GetOpcode())
+		                                               : std::string_view {"none"},
+		                               state.refusal);
+		if (refusal == nullptr) {
+			EXIT("%s hash=0x%016" PRIx64 " stage=%u\n", text.c_str(), program.shader_hash,
+			     static_cast<unsigned>(program.stage));
+		}
+		*refusal = std::move(text);
+		return {};
+	};
+	if (state.requirements.refusal != nullptr) {
+		state.Refuse(state.requirements.refusal, state.requirements.refused_inst);
+		return refused();
+	}
 	const auto* workgroup = ShaderWorkgroupInput(program.stage, input_info);
 	state.lane_count =
 	    workgroup != nullptr && program.wave_size == 64u && workgroup->host_subgroup_size == 32u
 	        ? 2u
 	        : 1u;
 	DefineModule(state);
-	ValidateNativeProgram(program, program.stage == ShaderType::Compute &&
-	                                   input_info.compute != nullptr && input_info.compute->lds_storage);
-	EmitProgram(state);
+	if (!state.Refused()) {
+		EmitProgram(state);
+	}
+	if (state.Refused()) {
+		return refused();
+	}
 	state.builder.AddEntryPoint(ExecutionModelForStage(state.program.stage), state.main_func,
 	                            "main", state.interface_variables);
 

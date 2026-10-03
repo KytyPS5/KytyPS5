@@ -797,14 +797,14 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		}
 		if (dref && state.program.info.images[mem.resource].conversion_format !=
 		                Prospero::BufferFormat::kInvalid) {
-			ctx.Fail(inst, "uses depth comparison with a converted image");
+			ctx.Refuse(inst, "uses depth comparison with a packed integer image");
 			return;
 		}
 		if (op == IR::ValueOpcode::ImageGatherRaw) {
 			if (dimension == ImageDimension::Dim1D) {
 				if (dref || HasFlag(mem, Decoder::ImageSampleFlagOffset) ||
 				    HasFlag(mem, Decoder::ImageSampleFlagGatherHorizontal)) {
-					ctx.Fail(inst, "has an unsupported 1D gather variant");
+					ctx.Refuse(inst, "has an unsupported 1D gather variant");
 					return;
 				}
 				const auto sampler_id = LoadSamplerDescriptor(state, mem.sampler);
@@ -823,7 +823,7 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				return;
 			}
 			if (dimension == ImageDimension::Dim1DArray) {
-				ctx.Fail(inst, "has an unsupported 1D-array gather");
+				ctx.Refuse(inst, "has an unsupported 1D-array gather");
 				return;
 			}
 			const auto result_numeric_class = dref ? Prospero::TextureNumericClass::Float
@@ -984,7 +984,7 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		           }));
 		return;
 	}
-	ctx.Fail(inst, "has no image SPIR-V emitter");
+	ctx.Refuse(inst, "has no image SPIR-V emitter");
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter

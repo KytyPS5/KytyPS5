@@ -34,11 +34,21 @@ void SetFailure(Graph& graph, FailureKind kind, uint32_t block_id, const std::st
 	graph.unsupported_reason = message;
 }
 
-[[noreturn]] void ExitBuildFailure(Graph& graph, FailureKind kind, uint32_t block_id,
-                                   const std::string& message) {
+// A build rejection describes the guest program, not a broken emulator invariant, so it is
+// reported through the returned graph instead of killing the process. The emulator is built
+// without exceptions, so this unwinds by return value. The partially built block list is dropped
+// so a caller that ignores unsupported fails loudly instead of walking half a graph.
+Graph BuildFailure(Graph& graph, FailureKind kind, uint32_t block_id, uint32_t pc,
+                   const std::string& message) {
 	SetFailure(graph, kind, block_id, message);
-	EXIT("shader CFG build failed: %s", message.c_str());
-	std::abort();
+	graph.failure_pc = pc;
+	graph.blocks.clear();
+	graph.back_edges.clear();
+	graph.natural_loops.clear();
+	graph.components.clear();
+	graph.code_table_load_pcs.clear();
+	graph.entry_block = UINT32_MAX;
+	return std::move(graph);
 }
 
 uint32_t InstructionEndPc(const Instruction& inst) {
@@ -1446,8 +1456,8 @@ private:
 Graph BuildGraph(const Decoder::Program& program) {
 	Graph graph;
 	if (program.instructions.empty()) {
-		ExitBuildFailure(graph, FailureKind::InvalidLabel, UINT32_MAX,
-		                 "cannot build CFG for empty shader");
+		return BuildFailure(graph, FailureKind::InvalidLabel, UINT32_MAX, 0,
+		                    "cannot build CFG for empty shader");
 	}
 
 	const auto first_pc = program.instructions.front().pc;
@@ -1455,8 +1465,8 @@ Graph BuildGraph(const Decoder::Program& program) {
 
 	for (const auto& inst: program.instructions) {
 		if (inst.opcode == Opcode::UNSUPPORTED) {
-			ExitBuildFailure(
-			    graph, FailureKind::UnsupportedInstruction, UINT32_MAX,
+			return BuildFailure(
+			    graph, FailureKind::UnsupportedInstruction, UINT32_MAX, inst.pc,
 			    fmt::format("unsupported decoded instruction in CFG at pc 0x{:08x}: {}", inst.pc,
 			                Decoder::InstructionToString(inst).c_str()));
 		}
@@ -1471,9 +1481,10 @@ Graph BuildGraph(const Decoder::Program& program) {
 		if (Decoder::IsDirectBranch(inst.opcode) ||
 		    (inst.opcode == Opcode::S_SWAPPC_B64 && inst.branch_target != UINT32_MAX)) {
 			if (!IsValidTarget(inst.branch_target, program.instructions, end_pc)) {
-				ExitBuildFailure(graph, FailureKind::InvalidBranchTarget, UINT32_MAX,
-				                 fmt::format("branch at pc 0x{:08x} targets invalid pc 0x{:08x}",
-				                             inst.pc, inst.branch_target));
+				return BuildFailure(
+				    graph, FailureKind::InvalidBranchTarget, UINT32_MAX, inst.pc,
+				    fmt::format("branch at pc 0x{:08x} targets invalid pc 0x{:08x}", inst.pc,
+				                inst.branch_target));
 			}
 			labels.push_back(inst.branch_target);
 			if (next_pc <= end_pc) {
@@ -1482,8 +1493,8 @@ Graph BuildGraph(const Decoder::Program& program) {
 		} else if (inst.opcode == Opcode::S_SETPC_B64) {
 			SetpcTargetInfo target_info;
 			if (!ResolveSetpcTargets(program, i, target_info)) {
-				ExitBuildFailure(
-				    graph, FailureKind::InvalidBranchTarget, UINT32_MAX,
+				return BuildFailure(
+				    graph, FailureKind::InvalidBranchTarget, UINT32_MAX, inst.pc,
 				    fmt::format("unsupported dynamic S_SETPC_B64 at pc 0x{:08x}", inst.pc));
 			}
 			const auto target_pcs = target_info.indirect
@@ -1491,8 +1502,8 @@ Graph BuildGraph(const Decoder::Program& program) {
 			                            : std::span<const uint32_t>(&target_info.target, 1);
 			for (const auto target: target_pcs) {
 				if (!IsValidTarget(target, program.instructions, end_pc)) {
-					ExitBuildFailure(
-					    graph, FailureKind::InvalidBranchTarget, UINT32_MAX,
+					return BuildFailure(
+					    graph, FailureKind::InvalidBranchTarget, UINT32_MAX, inst.pc,
 					    fmt::format("S_SETPC_B64 at pc 0x{:08x} targets invalid pc 0x{:08x}",
 					                inst.pc, target));
 				}
@@ -1516,8 +1527,8 @@ Graph BuildGraph(const Decoder::Program& program) {
 		}
 		const auto begin = std::ranges::lower_bound(program.instructions, start, {}, &Instruction::pc);
 		if (start != end_pc && (begin == program.instructions.end() || begin->pc != start)) {
-			ExitBuildFailure(
-			    graph, FailureKind::InvalidLabel, UINT32_MAX,
+			return BuildFailure(
+			    graph, FailureKind::InvalidLabel, UINT32_MAX, start,
 			    fmt::format("CFG label does not start on an instruction: 0x{:08x}", start));
 		}
 
@@ -1588,8 +1599,8 @@ Graph BuildGraph(const Decoder::Program& program) {
 			block.terminator.true_block = block_at_pc(last.branch_target);
 			const auto fallthrough      = block_at_pc(next_pc);
 			if (fallthrough == UINT32_MAX) {
-				ExitBuildFailure(
-				    graph, FailureKind::MissingFallthrough, block.id,
+				return BuildFailure(
+				    graph, FailureKind::MissingFallthrough, block.id, last.pc,
 				    fmt::format("conditional branch at pc 0x{:08x} has no fallthrough block",
 				                last.pc));
 			}
@@ -1741,10 +1752,11 @@ std::string FailureKindToString(FailureKind kind) {
 
 std::string GraphToString(const Graph& graph) {
 	std::string text;
-	text +=
-	    fmt::format("entry_block={} irreducible={} unsupported={} failure={} failure_block={}\n",
-	                graph.entry_block, graph.irreducible ? 1u : 0u, graph.unsupported ? 1u : 0u,
-	                FailureKindToString(graph.failure_kind).c_str(), graph.failure_block);
+	text += fmt::format(
+	    "entry_block={} irreducible={} unsupported={} failure={} failure_block={} "
+	    "failure_pc=0x{:08x}\n",
+	    graph.entry_block, graph.irreducible ? 1u : 0u, graph.unsupported ? 1u : 0u,
+	    FailureKindToString(graph.failure_kind).c_str(), graph.failure_block, graph.failure_pc);
 	if (!graph.unsupported_reason.empty()) {
 		text += "unsupported_reason=";
 		text += graph.unsupported_reason;

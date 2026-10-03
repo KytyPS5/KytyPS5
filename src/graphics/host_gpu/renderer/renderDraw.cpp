@@ -859,7 +859,8 @@ static bool ResolvePrimitiveRestart(const CommandBuffer& buffer,
 	return false;
 }
 
-static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
+// False when a stage's descriptors could not be derived. The draw is then dropped.
+static bool RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
                            uint32_t color_output_mask, DrawRenderState& state) {
 	auto& ctx    = buffer.GetRegisters();
 	auto& sh_ctx = buffer.GetShaders();
@@ -888,6 +889,16 @@ static void RefreshShaders(CommandBuffer& buffer, const DrawCallInfo& draw,
 	state.programs = pipeline_cache.GetGraphicsPrograms(
 	    vertex_shader_info, pixel_shader_info, shader_regs, ctx, buffer.GetUserConfig(),
 	    target_export_mapping, state.ps_active, state.vertex_info, state.ps_input_info);
+	// Every active vertex stage has to have produced both a program and a bound input stage;
+	// a merged pipeline can carry three, and a refusal on any of them drops the draw.
+	bool vertex_ready = true;
+	for (uint32_t stage = 0; stage < state.programs.VertexStageCount(); stage++) {
+		vertex_ready = vertex_ready && static_cast<bool>(state.programs.vertex[stage]) &&
+		               static_cast<bool>(state.vertex_info[stage].stage);
+	}
+	const bool pixel_ready = !state.ps_active || (static_cast<bool>(state.programs.pixel) &&
+	                                              static_cast<bool>(state.ps_input_info.stage));
+	return vertex_ready && pixel_ready;
 }
 
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCallInfo& draw,
@@ -898,7 +909,9 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, const DrawCal
 	state.ps_active = buffer.GetShaders().GetPs().ps_regs.data_addr != 0 &&
 	                  (color_output_mask != 0 ||
 	                   PixelShaderHasDepthOrCoverageSideEffects(shader_regs));
-	RefreshShaders(buffer, draw, color_output_mask, state);
+	if (!RefreshShaders(buffer, draw, color_output_mask, state)) {
+		return false;
+	}
 	uint32_t mrt_mask = 0;
 	if (state.ps_active) {
 		for (const auto& output: state.ps_input_info.stage.program->info.outputs) {

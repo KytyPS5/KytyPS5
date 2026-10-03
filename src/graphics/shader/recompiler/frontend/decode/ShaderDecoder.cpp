@@ -9,10 +9,14 @@
 
 #include <algorithm>
 #include <bit>
+#include <cinttypes>
 #include <fmt/format.h>
 
 namespace Libs::Graphics::ShaderRecompiler::Decoder {
 namespace {
+
+thread_local uint64_t    t_decode_hash = 0;
+thread_local const void* t_decode_code = nullptr;
 
 bool HasLiteral(const Instruction& inst) {
 	return inst.src0.kind == OperandKind::LiteralConstant ||
@@ -267,7 +271,10 @@ void DecodeScalarSource(uint32_t code, uint32_t pc, Operand& operand) {
 		case 252u: operand.kind = OperandKind::ExecZ; return;
 		case 253u: operand.kind = OperandKind::Scc; return;
 		case 255u: operand.kind = OperandKind::LiteralConstant; return;
-		default: EXIT("unsupported scalar source operand 0x%08x at pc 0x%08x", code, pc);
+		default:
+			EXIT("unsupported scalar source operand 0x%08x at pc 0x%08x, shader hash 0x%016" PRIx64
+			     " code 0x%016" PRIx64,
+			     code, pc, t_decode_hash, reinterpret_cast<uint64_t>(t_decode_code));
 	}
 }
 
@@ -287,7 +294,10 @@ void DecodeScalarDestination(uint32_t code, uint32_t pc, Operand& operand) {
 		case 125u: operand.kind = OperandKind::Null; return;
 		case 126u: operand.kind = OperandKind::ExecLo; return;
 		case 127u: operand.kind = OperandKind::ExecHi; return;
-		default: EXIT("unsupported scalar destination operand 0x%08x at pc 0x%08x", code, pc);
+		default:
+			EXIT("unsupported scalar destination operand 0x%08x at pc 0x%08x, shader hash "
+			     "0x%016" PRIx64 " code 0x%016" PRIx64,
+			     code, pc, t_decode_hash, reinterpret_cast<uint64_t>(t_decode_code));
 	}
 }
 
@@ -447,7 +457,9 @@ void DecodeProgram(std::span<const uint32_t> code, Program& program) {
 		}
 	}
 
-	EXIT("shader decode reached the code boundary before S_ENDPGM");
+	EXIT("shader decode reached the code boundary before S_ENDPGM, shader hash 0x%016" PRIx64
+	     " code 0x%016" PRIx64,
+	     t_decode_hash, reinterpret_cast<uint64_t>(t_decode_code));
 }
 
 std::string OperandToString(const Operand& operand) {
@@ -757,6 +769,17 @@ std::string InstructionToString(const Instruction& inst) {
 		case Opcode::DS_READ_ADDTID_B32: return WithUnsupportedReason(inst, FormatMemory(inst));
 		default: return WithUnsupportedReason(inst, FormatBinary(inst));
 	}
+}
+
+DecodeContextScope::DecodeContextScope(uint64_t hash, const void* code)
+    : m_previous_hash(t_decode_hash), m_previous_code(t_decode_code) {
+	t_decode_hash = hash;
+	t_decode_code = code;
+}
+
+DecodeContextScope::~DecodeContextScope() {
+	t_decode_hash = m_previous_hash;
+	t_decode_code = m_previous_code;
 }
 
 std::string ProgramToString(const Program& program) {

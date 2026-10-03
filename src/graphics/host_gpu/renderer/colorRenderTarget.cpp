@@ -71,8 +71,14 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 
 		return;
 	}
-	const auto samples = render_sample_count(rt.attrib.num_fragments);
-	if (samples == 0 || rt.attrib.num_samples != rt.attrib.num_fragments) {
+	uint32_t sample_log2 = rt.attrib.num_fragments;
+	uint32_t samples     = render_sample_count(sample_log2);
+	if (samples == 0 || (rt.attrib.num_samples != rt.attrib.num_fragments &&
+	!(rt.attrib.num_samples > rt.attrib.num_fragments &&
+	  !rt.info.fmask_compression_enable && !rt.info.fmask_data_compression_disable &&
+	  !rt.info.fmask_one_frag_mode && !rt.info.cmask_fast_clear_enable &&
+	  !rt.info.dcc_compression_enable && rt.cmask.addr == 0 && rt.fmask.addr == 0 &&
+	  rt.dcc_addr.addr == 0))) {
 		EXIT("unsupported render-target sample configuration: samples=%u fragments=%u\n",
 		     rt.attrib.num_samples, rt.attrib.num_fragments);
 	}

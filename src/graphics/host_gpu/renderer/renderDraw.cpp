@@ -1133,12 +1133,26 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
 	if (mesh_active) {
+		// A non-indexed draw carries no index buffer, but the mesh shader still pulls its
+		// per-lane data from a guest address handed over in the draw packet. Hand it the vertex
+		// buffer the draw would have read through a vertex input: a null address makes every
+		// lane read zero, and the mesh comes out empty for the whole frame.
+		uint64_t mesh_address = index_source.address;
+		if (mesh_address == 0) {
+			const auto& mesh_input = state.vertex_info[0];
+			for (int i = 0; i < mesh_input.buffers_num; i++) {
+				if (mesh_input.buffers[i].addr != 0) {
+					mesh_address = mesh_input.buffers[i].addr;
+					break;
+				}
+			}
+		}
 		const uint32_t draw_data[] {
 		    draw.index_count,
 		    draw.IsIndexed() ? static_cast<uint32_t>(emit.vertex_offset) : emit.first_vertex,
 		    emit.first_instance, index_source.guest_element_size,
-		    static_cast<uint32_t>(index_source.address),
-		    static_cast<uint32_t>(index_source.address >> 32u)};
+		    static_cast<uint32_t>(mesh_address),
+		    static_cast<uint32_t>(mesh_address >> 32u)};
 		static_assert(std::size(draw_data) == ShaderRecompiler::IR::PushData::MeshDrawDwordCount);
 		vk_buffer.pushConstants(pipeline.pipeline_layout,
 		                        vk::ShaderStageFlagBits::eMeshEXT |

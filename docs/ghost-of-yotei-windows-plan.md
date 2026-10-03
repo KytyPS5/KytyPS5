@@ -1,5 +1,28 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **3 октября 2026 года, 09:03 UTC** (native Windows; branch
+`yotei-windows-bringup`; installed emulator exe SHA-256
+`5251cfc12f986dda2e9b3c8c761e0e80b5fe0545493dcc210cad803c2da406da`):
+
+- Один bounded game retry без GPUAV shader instrumentation проверил новую
+  установленную сборку. Артефакт
+  `_Build/runs/yotei-integrated-20261003-090128-presentprobe-gpuav`:
+  `run.json` финализирован, `process-exit`, exit `-2147483645`
+  (`0x80000003`), `maxShown=0`, `coloredProven=false`.
+  `vkCreateComputePipelines` для CS `b90e2024732c6111` не завершился;
+  Windows Application Error 1000 указывает `nvgpucomp64.dll`
+  `32.0.16.1714`, offset `0x589eb2`. В этом запуске
+  `gpuAvShaderInstrumentation=false`; драйверный compiler breakpoint
+  повторяет отдельную границу прежнего no-GPUAV запуска, а не поздний
+  `ErrorDeviceLost` на indexed VS. Сохранённые две копии этого SPIR-V
+  совпадают между собой (SHA-256 `53dbb68a…092c`), но отличаются от
+  прежнего no-GPUAV модуля.
+- Этот запуск **не** опровергает видимый спиннер прежней GPUAV сборки и не
+  доказывает меню. Не повторять тот же uninstrumented compiler crash без
+  нового ограниченного воспроизведения; для позднего GPU blocker нужен
+  vertex/indexed-draw fixture из следующего checkpoint. Меню и gameplay
+  **PENDING**.
+
 Checkpoint **3 октября 2026 года, 08:57 UTC** (native Windows; branch
 `yotei-windows-bringup`, test-only commit `38b4fa6c`; установленный emulator
 exe по-прежнему SHA-256 `5251cfc12f986dda2e9b3c8c761e0e80b5fe0545493dcc210cad803c2da406da`):

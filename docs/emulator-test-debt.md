@@ -180,6 +180,26 @@ recorded in the DeviceLost section above.
 
 ## Driver compiler crash without GPUAV (2026-10-02)
 
+New bounded retry on 2026-10-03 with GPUAV enabled but shader
+instrumentation disabled used installed emulator exe SHA-256
+`5251cfc12f986dda2e9b3c8c761e0e80b5fe0545493dcc210cad803c2da406da`.
+`_Build/runs/yotei-integrated-20261003-090128-presentprobe-gpuav/run.json`
+finalized with `process-exit`, `exitCode=-2147483645` (`0x80000003`),
+`maxShown=0`, `coloredProven=false`. `_kyty.txt` ends at
+`vkCreateComputePipelines begin` for CS `b90e2024732c6111`; Windows
+Application Error 1000 again names NVIDIA `nvgpucomp64.dll` version
+`32.0.16.1714`, offset `0x589eb2`. The two new captured SPIR-V copies are
+identical (SHA-256
+`53dbb68a1f5886a99b1009df507931f4134dab806ef0c8f4843ea4572690092c`),
+but differ from the 2026-10-02 module (SHA-256
+`0900d7d8fc9da9acf8b9ba47c1b25b2bbedc9704a9fc45bfd57a44e3c4ec99c9`).
+Their instruction histograms differ by 11 each of SPIR-V opcodes 168, 197
+and 199; the compiler fault persists. This run is not a vertex-draw reproduction or
+evidence that the Windows SysV ABI fix changed GPU behavior. Before another
+uninstrumented game retry, isolate a failing generic compiler pattern in a
+bounded standalone probe with a layout matching the production pipeline;
+the older probe's layout did not reproduce game behavior reliably.
+
 The bounded current-branch run
 `_Build/runs/yotei-integrated-20261002-204937-presentprobe-noval`
 used 2560x1440, no Vulkan core validation and no GPUAV. It crashed before

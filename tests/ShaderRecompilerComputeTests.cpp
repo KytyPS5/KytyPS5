@@ -22614,6 +22614,233 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
   std::printf("[compute] %-32s ok\n", test.name);
 }
 
+TestCase Wave64ExecZeroLoopExit() {
+  TestCase test;
+  test.name = "Wave64ExecZeroLoopExit";
+  auto &code = test.code;
+  code.push_back(EncodeVop2(0x1b, 1, InlineU32(3), 0)); // v_and_b32 v1, 3, v0
+  code.push_back(EncodeVop2(0x25, 1, InlineU32(1), 1)); // v_add_nc_u32 v1, 1, v1
+  AppendVMovU32(&code, 2, 0);
+  code.push_back(EncodeSMovB32(22, InlineU32(0)));
+  const auto header = static_cast<u32>(code.size());
+  code.push_back(EncodeVopc(0xd1, 22, 1)); // v_cmpx_lt_u32 exec, s22, v1
+  const auto exit_branch = static_cast<u32>(code.size());
+  code.push_back(0);                                      // s_cbranch_execz exit
+  code.push_back(EncodeVop2(0x25, 2, InlineU32(1), 2));   // v_add_nc_u32 v2, 1, v2
+  code.push_back(EncodeSop2(0x02, 22, 22, InlineU32(1))); // s_add_i32 s22, s22, 1
+  code.push_back(EncodeSopp(
+      0x02, static_cast<u32>(static_cast<int32_t>(header) -
+                             static_cast<int32_t>(code.size()) - 1) & 0xffffu)); // s_branch header
+  code[exit_branch] = EncodeSopp(0x08, static_cast<u32>(code.size()) - exit_branch - 1u);
+  code.push_back(EncodeSop1(0x04, 126, 193)); // s_mov_b64 exec, -1
+  AppendStoreVgprAtLaneDwordOffset(&code, 2, 0, 0);
+  AppendEnd(&code);
+  test.opcodes = {ShaderOpcode::V_AND_B32,          ShaderOpcode::V_ADD_NC_U32,
+                  ShaderOpcode::V_MOV_B32,          ShaderOpcode::S_MOV_B32,
+                  ShaderOpcode::V_CMPX_LT_U32,      ShaderOpcode::S_CBRANCH_EXECZ,
+                  ShaderOpcode::S_ADD_I32,          ShaderOpcode::S_BRANCH,
+                  ShaderOpcode::S_MOV_B64,          ShaderOpcode::V_LSHLREV_B32,
+                  ShaderOpcode::BUFFER_STORE_DWORD, ShaderOpcode::S_ENDPGM};
+  test.decoded_counts = {{"S_CBRANCH_EXECZ", 1}};
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = 64;
+  test.has_compute_info = true;
+  test.initial.assign(64, 0x5a5a5a5au);
+  for (u32 lane = 0; lane < 64; ++lane) {
+    test.expected.push_back((lane & 3u) + 1u);
+  }
+  return test;
+}
+
+bool ReturnHostInvocation31AtEntry(std::vector<u32> &spirv, std::string &error) {
+  spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+  std::string text;
+  if (!tools.Disassemble(spirv, &text,
+                         SPV_BINARY_TO_TEXT_OPTION_FRIENDLY_NAMES |
+                             SPV_BINARY_TO_TEXT_OPTION_NO_HEADER)) {
+    error = "disassembly failed";
+    return false;
+  }
+  std::vector<std::string> lines;
+  {
+    std::istringstream stream(text);
+    for (std::string line; std::getline(stream, line);) {
+      lines.push_back(line);
+    }
+  }
+  const auto trim = [](const std::string &line) {
+    const auto begin = line.find_first_not_of(' ');
+    return begin == std::string::npos ? std::string() : line.substr(begin);
+  };
+  const auto result_of = [&](const std::string &line, std::string_view op) -> std::string {
+    const auto body = trim(line);
+    const auto eq = body.find(" = ");
+    if (eq == std::string::npos || body.compare(eq + 3, op.size(), op) != 0) {
+      return {};
+    }
+    const auto after = eq + 3 + op.size();
+    if (after < body.size() && body[after] != ' ') {
+      return {};
+    }
+    return body.substr(0, eq);
+  };
+  std::string main_id, bool_type, uint_type, index_variable, input_uint_pointer;
+  size_t entry_point = SIZE_MAX, first_decorate = SIZE_MAX, first_function = SIZE_MAX;
+  for (size_t i = 0; i < lines.size(); ++i) {
+    const auto body = trim(lines[i]);
+    if (body.rfind("OpEntryPoint GLCompute ", 0) == 0) {
+      entry_point = i;
+      std::istringstream tokens(body);
+      std::string op, model;
+      tokens >> op >> model >> main_id;
+    } else if (body.rfind("OpDecorate ", 0) == 0) {
+      if (first_decorate == SIZE_MAX) {
+        first_decorate = i;
+      }
+      if (body.ends_with(" BuiltIn LocalInvocationIndex")) {
+        index_variable = body.substr(11, body.find(' ', 11) - 11);
+      }
+    } else if (first_function == SIZE_MAX && !result_of(lines[i], "OpFunction").empty()) {
+      first_function = i;
+    }
+    if (const auto id = result_of(lines[i], "OpTypeBool"); !id.empty()) {
+      bool_type = id;
+    }
+    if (body.ends_with(" = OpTypeInt 32 0")) {
+      uint_type = result_of(lines[i], "OpTypeInt");
+    }
+  }
+  if (entry_point == SIZE_MAX || first_decorate == SIZE_MAX || first_function == SIZE_MAX ||
+      bool_type.empty() || uint_type.empty()) {
+    error = "module shape not recognised";
+    return false;
+  }
+  for (size_t i = 0; i < first_function; ++i) {
+    if (trim(lines[i]).ends_with(" = OpTypePointer Input " + uint_type)) {
+      input_uint_pointer = result_of(lines[i], "OpTypePointer");
+    }
+  }
+  std::vector<std::string> globals = {"%kx_31 = OpConstant " + uint_type + " 31"};
+  if (index_variable.empty()) {
+    index_variable = "%kx_index";
+    if (input_uint_pointer.empty()) {
+      input_uint_pointer = "%kx_ptr";
+      globals.push_back("%kx_ptr = OpTypePointer Input " + uint_type);
+    }
+    globals.push_back("%kx_index = OpVariable " + input_uint_pointer + " Input");
+    lines[entry_point] += " %kx_index";
+    lines.insert(lines.begin() + static_cast<std::ptrdiff_t>(first_decorate),
+                 "OpDecorate %kx_index BuiltIn LocalInvocationIndex");
+    ++first_function;
+  }
+  lines.insert(lines.begin() + static_cast<std::ptrdiff_t>(first_function), globals.begin(),
+               globals.end());
+  size_t function = SIZE_MAX;
+  for (size_t i = 0; i < lines.size(); ++i) {
+    if (result_of(lines[i], "OpFunction") == main_id) {
+      function = i;
+    }
+  }
+  if (function == SIZE_MAX || function + 1 >= lines.size()) {
+    error = "entry function not found";
+    return false;
+  }
+  const auto entry_label = result_of(lines[function + 1], "OpLabel");
+  if (entry_label.empty()) {
+    error = "entry block not found";
+    return false;
+  }
+  auto split = function + 2;
+  while (split < lines.size() && !result_of(lines[split], "OpVariable").empty()) {
+    ++split;
+  }
+  const std::vector<std::string> guard = {
+      "%kx_loaded = OpLoad " + uint_type + " " + index_variable,
+      "%kx_hit = OpIEqual " + bool_type + " %kx_loaded %kx_31",
+      "OpSelectionMerge %kx_cont None",
+      "OpBranchConditional %kx_hit %kx_ret %kx_cont",
+      "%kx_ret = OpLabel",
+      "OpReturn",
+      "%kx_cont = OpLabel"};
+  lines.insert(lines.begin() + static_cast<std::ptrdiff_t>(split), guard.begin(), guard.end());
+  for (size_t i = split + guard.size(); i < lines.size(); ++i) {
+    if (trim(lines[i]).rfind("OpFunctionEnd", 0) == 0) {
+      break;
+    }
+    if (result_of(lines[i], "OpPhi").empty()) {
+      continue;
+    }
+    for (size_t at = 0; (at = lines[i].find(entry_label, at)) != std::string::npos;) {
+      const auto end = at + entry_label.size();
+      if (end == lines[i].size() || lines[i][end] == ' ') {
+        lines[i].replace(at, entry_label.size(), "%kx_cont");
+        at += 8;
+      } else {
+        at = end;
+      }
+    }
+  }
+  std::string patched;
+  for (const auto &line : lines) {
+    patched += line;
+    patched += '\n';
+  }
+  std::vector<u32> binary;
+  if (!tools.Assemble(patched, &binary) || binary.size() < 5u) {
+    error = "reassembly failed";
+    return false;
+  }
+  binary[1] = spirv[1];
+  spirv = std::move(binary);
+  return true;
+}
+
+void CheckWave64ExecZeroLoopExit(VulkanHarness *vulkan) {
+  const auto base = Wave64ExecZeroLoopExit();
+  if (vulkan->SubgroupSize() != 32u) {
+    std::printf("[compute] %-32s skipped (host subgroup %u, two halves needs 32)\n", base.name,
+                vulkan->SubgroupSize());
+    return;
+  }
+  RunCase(vulkan, base);
+
+  auto test = base;
+  test.name = "Wave64ExecZeroLoopExitPartial";
+  auto compiled = CompileCase(test, 32u);
+  spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+  std::string text;
+  Require(test.name, "SPIR-V disassembly", tools.Disassemble(compiled.spirv, &text),
+          "failed to disassemble emitted SPIR-V");
+  // One vote per emulated half decides the scalar branch, instead of a materialized wave mask
+  // compared against the active lanes; KYTY_NO_LANE_VOTE_BRANCH=1 keeps the mask form.
+  const bool mask_branch = std::getenv("KYTY_NO_LANE_VOTE_BRANCH") != nullptr;
+  Require(test.name, "scalar branch votes",
+          mask_branch ? (CountText(text, "OpGroupNonUniformAll ") == 0 &&
+                         CountText(text, "OpGroupNonUniformBallot ") != 0)
+                      : (CountText(text, "OpGroupNonUniformAll ") == 2 &&
+                         CountText(text, "OpGroupNonUniformBallot ") == 0),
+          "the execz branch did not take the configured scalar-branch form");
+  if (text.find("loop_budget") == std::string::npos) {
+    std::printf("[compute] %-32s skipped (needs KYTY_CS_LOOP_BUDGET: --execz-loop-exit-only)\n",
+                test.name);
+    return;
+  }
+  std::string error;
+  Require(test.name, "partial subgroup rewrite",
+          ReturnHostInvocation31AtEntry(compiled.spirv, error), error);
+  ValidateSpirv(test.name, compiled.spirv);
+  test.expected = base.expected;
+  test.expected[31] = test.expected[63] = base.initial[31];
+  auto buffer = vulkan->CreateStorageBuffer(test.name, test.initial, test.expected.size());
+  vulkan->Dispatch(test, compiled, buffer);
+  const auto actual = vulkan->ReadBuffer(test.name, buffer, test.expected.size());
+  vulkan->DestroyBuffer(&buffer);
+  CompareWords(test, "partial subgroup readback", test.expected, actual);
+  std::printf("[compute] %-32s ok\n", test.name);
+}
+
 TestCase IndirectImageTableSamples();
 
 // Whichever key the device searches, it must sample that key's candidate.
@@ -36606,6 +36833,77 @@ TestCase DsReadWriteVariants() {
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+// SH2's Nanite raster: s_orn2_saveexec re-enables every lane inside an execz region and
+// v_readlane reads one of them.
+TestCase WholeWaveReadlaneCase(u32 groups) {
+  using O = ShaderOpcode;
+  std::vector<u32> code;
+  code.push_back(EncodeVop1(0x01, 7, 0));                  // v7 = s0 (workgroup)
+  code.push_back(EncodeVop2(0x1a, 7, InlineU32(5), 7));    // v7 <<= 5
+  code.push_back(EncodeVop2(0x25, 7, Vgpr(0), 7));         // v7 += lane
+  code.push_back(EncodeVop2(0x1a, 8, InlineU32(2), 7));    // v8 = byte address
+  code.push_back(EncodeVop2(0x25, 1, InlineU32(5), 0));    // v1 = lane + 5
+  code.push_back(EncodeSop2(0x0e, 2, 0, InlineU32(31)));   // s2 = s0 & 31
+  code.push_back(EncodeVopc(0xd4, 2, 0));                  // v_cmpx_gt_u32 exec, s2, v0
+  const size_t skip = code.size();
+  code.push_back(0);                                       // s_cbranch_execz
+  code.push_back(EncodeSop1(0x40, 106, 126));              // s_orn2_saveexec_b32 vcc_lo, exec_lo
+  code.push_back(EncodeVop2(0x01, 5, 193, 1));             // v_cndmask_b32 v5, -1, v1, vcc
+  AppendVop3(&code, 0x360, 3, Vgpr(5), InlineU32(31));    // v_readlane_b32 s3, v5, 31
+  code.push_back(EncodeSMovB32(126, 106));                 // s_mov_b32 exec_lo, vcc_lo
+  code.push_back(EncodeVop1(0x01, 6, 3));                  // v6 = s3
+  AppendBufferStoreDword(&code, 6, 8);
+  code[skip] = EncodeSopp(0x08, static_cast<u32>(code.size() - skip - 1));
+  code.push_back(EncodeSMovB32(126, 193));                 // s_mov_b32 exec_lo, -1
+  AppendEnd(&code);
+  TestCase test;
+  test.name = "WholeWaveReadlaneInRegion";
+  test.code = code;
+  test.opcodes = {O::V_MOV_B32, O::V_LSHLREV_B32, O::V_ADD_NC_U32, O::S_AND_B32,
+                  O::V_CMPX_GT_U32, O::S_CBRANCH_EXECZ, O::S_ORN2_SAVEEXEC_B32,
+                  O::V_CNDMASK_B32, O::V_READLANE_B32, O::S_MOV_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 32;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.group_id[0] = true;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.workgroup_register = 0;
+  test.compute_info.wave_size = 32;
+  test.has_compute_info = true;
+  test.dispatch_x = groups;
+  test.initial.assign(groups * 32u, 0xdeadbeefu);
+  test.expected = test.initial;
+  for (u32 g = 0; g < groups; g++) {
+    for (u32 lane = 0; lane < (g & 31u); lane++) {
+      test.expected[g * 32u + lane] = 0xffffffffu;
+    }
+  }
+  return test;
+}
+
+void CheckWholeWaveReadlane(VulkanHarness *vulkan) {
+  constexpr const char *name = "WholeWaveReadlaneInRegion";
+  if (vulkan->SubgroupSize() != 32u) {
+    std::printf("[gpu]     %-32s skipped (host subgroup %u)\n", name, vulkan->SubgroupSize());
+    return;
+  }
+  constexpr u32 groups = 1024;
+  auto test = WholeWaveReadlaneCase(groups);
+  auto compiled = CompileCase(test, vulkan->SubgroupSize());
+  auto buffer = vulkan->CreateStorageBuffer(name, test.initial, test.initial.size());
+  vulkan->Dispatch(test, compiled, buffer);
+  const auto actual = vulkan->ReadBuffer(name, buffer, test.expected.size());
+  vulkan->DestroyBuffer(&buffer);
+  uint64_t wrong = 0;
+  for (size_t i = 0; i < actual.size(); i++) {
+    wrong += actual[i] != test.expected[i] ? 1u : 0u;
+  }
+  Require(name, "readback", wrong == 0,
+          "a lane a guest wave re-enabled inside a skipped region was not running");
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
 TestCase DsReadU16D16CapturedPreservesHighHalf() {
   using O = ShaderOpcode;
 
@@ -48608,6 +48906,13 @@ int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);
+  if (argc == 2 && std::strcmp(argv[1], "--execz-loop-exit-only") == 0) {
+#ifdef _WIN32
+    _putenv_s("KYTY_CS_LOOP_BUDGET", "4096");
+#else
+    setenv("KYTY_CS_LOOP_BUDGET", "4096", 1);
+#endif
+  }
   EnsureConfigInitialized();
   ShaderRecompiler::IR::OverrideBindlessImageHeaps(0);
   CheckLeastRecentlyUsedCacheOrdering();
@@ -48669,6 +48974,21 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, BufferAtomicAndX2GlcAndExec());
     RunCase(&vulkan, ImageAtomicSignedMinMax<false>());
     RunCase(&vulkan, ImageAtomicSignedMinMax<true>());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--execz-loop-exit-only") == 0) {
+    VulkanHarness vulkan;
+    CheckWave64ExecZeroLoopExit(&vulkan);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--stencil-plane-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckStencilPlaneEqualFootprint(true);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--stencil-plane-default-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckStencilPlaneEqualFootprint(std::nullopt);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--null-1d-image-only") == 0) {
@@ -49687,12 +50007,13 @@ int main(int argc, char **argv) {
   CheckIndirectBufferStore(vulkan);
   CheckRuntimeBufferRecords(vulkan);
   CheckComputeThreadDimensions(vulkan);
-  CheckIndirectImageKeySwitch(vulkan);
-  CheckFiniteInlineSamplerPhi(vulkan);
+  CheckIndirectImageKeySwitch();
+  CheckWave64ExecZeroLoopExit(&vulkan);
   CheckWave64WholeWaveResults();
   CheckGlcBufferAccessIsCoherent();
   CheckEmissionRefusalIsSoft();
   CheckPs5GameExampleImageClearRuntimeShape();
+  CheckWholeWaveReadlane(&vulkan);
   vulkan.CheckSchedulerTimeline();
   vulkan.CheckHostImageAllocation();
   vulkan.CheckDescriptorHeapLargeSet();

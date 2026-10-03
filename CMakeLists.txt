@@ -731,6 +731,16 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --compute-meta-clear-only)
 	add_test(NAME texture_cache_meta_slice_clear
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --meta-slice-clear-only)
+	add_test(NAME shader_wave64_execz_loop_exit
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --execz-loop-exit-only)
+	add_test(NAME texture_cache_stencil_plane_equal_footprint
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --stencil-plane-only)
+	add_test(NAME texture_cache_stencil_plane_default_on
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --stencil-plane-default-only)
+	add_test(NAME texture_cache_stencil_plane_kill_switch
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --stencil-plane-default-only)
+	set_tests_properties(texture_cache_stencil_plane_kill_switch
+		PROPERTIES ENVIRONMENT "KYTY_NO_STENCIL_PLANE_REDIRECT=1")
 	add_test(NAME buffer_cache_dirty_gc
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-gc-only)
 	add_test(NAME color_render_target_1d

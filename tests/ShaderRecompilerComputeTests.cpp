@@ -1633,7 +1633,9 @@ CompiledShader CompileCase(const TestCase &test,
   if (test.expected_sampled_pairs != 0) {
     Require(test.name, "sampled pair topology",
             result.program.info.sampled_pairs.size() == test.expected_sampled_pairs,
-            "image/sampler pairs did not retain their expected count");
+            "image/sampler pairs: actual=" +
+                std::to_string(result.program.info.sampled_pairs.size()) +
+                " expected=" + std::to_string(test.expected_sampled_pairs));
   }
   if (test.expected_shader_data_storage) {
     Require(test.name, "shader data storage fallback",
@@ -36060,6 +36062,86 @@ TestCase NestedPostTestImageDescriptorLoop() {
   return test;
 }
 
+TestCase WideIndirectImageTableSample() {
+  using O = ShaderOpcode;
+  constexpr u32 table_count = 250u;
+  constexpr u32 index_base = 64u;
+  constexpr u32 table_base = 4096u;
+  constexpr uint64_t image_base = 0x100000u;
+  constexpr std::array<u32, 3> indices{0u, 125u, 249u};
+
+  TestCase test;
+  test.name = "WideIndirectImageTableSample";
+  test.bda_mappings = {{0, 0}};
+  test.has_user_data = true;
+  test.has_compute_info = true;
+  test.compute_info.threads_num[0] = 1;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.wave_size = 32;
+  test.use_runtime_samplers = true;
+  test.buffer_addresses_are_backing_offsets = true;
+  test.expected_sampled_pairs = static_cast<u32>(indices.size());
+  test.initial.resize((table_base + table_count * 32u) / sizeof(u32));
+  std::copy(indices.begin(), indices.end(), test.initial.begin() + index_base / sizeof(u32));
+  const std::array index_descriptor{index_base, 4u << 16u,
+                                    static_cast<u32>(indices.size()), 0u};
+  std::copy(index_descriptor.begin(), index_descriptor.end(), test.user_data.begin() + 8u);
+  test.user_data[24] = table_base;
+  test.user_data[50] = static_cast<u32>(indices.size() * sizeof(u32));
+  test.sampled_image_fixtures.push_back({0u, MakeRgbaImage(4, 4)});
+  for (u32 index = 0; index < table_count; ++index) {
+    const uint64_t address = image_base + index * 0x1000ull;
+    const std::array<u32, 8> descriptor{
+        static_cast<u32>(address >> 8u),
+        (static_cast<u32>(Prospero::BufferFormat::k32_32_32_32Float) << 20u) |
+            (3u << 30u),
+        3u << 14u,
+        DstSel(4, 5, 6, 7) |
+            (static_cast<u32>(Prospero::ImageType::kColor2D) << 28u),
+        0u, 0x00700000u, 0u, 0u};
+    std::copy(descriptor.begin(), descriptor.end(),
+              test.initial.begin() + table_base / sizeof(u32) + index * 8u);
+    auto image = MakeRgbaImage(4, 4);
+    const auto value = std::bit_cast<u32>(100.0f + static_cast<float>(index));
+    SetRgbaPixel(&image, 4, 1, 1, value, 0u, 0u, 0u);
+    SetRgbaPixel(&image, 4, 3, 1, value, 0u, 0u, 0u);
+    test.sampled_image_fixtures.push_back({address, std::move(image)});
+  }
+  for (const u32 index : indices)
+    test.expected.push_back(std::bit_cast<u32>(100.0f + static_cast<float>(index)));
+
+  auto &code = test.code;
+  const auto clamp = static_cast<u32>(Prospero::SamplerClampMode::kClampLastTexel);
+  AppendSMovLiteral(&code, 76, clamp | (clamp << 3u) | (clamp << 6u));
+  for (u32 reg = 77; reg < 80; ++reg) code.push_back(EncodeSMovB32(reg, InlineU32(0)));
+  AppendVMovLiteral(&code, 24, std::bit_cast<u32>(1.3125f));
+  AppendVMovLiteral(&code, 25, std::bit_cast<u32>(0.375f));
+  code.push_back(EncodeSMovB32(32, InlineU32(0)));
+  const auto loop = code.size();
+  code.push_back(EncodeSop2(0x1e, 33, 32, InlineU32(2)));
+  code.push_back(EncodeSmem0(0x08, 60, 4));
+  code.push_back(EncodeSmem1(0, 33));
+  code.push_back(EncodeSop2(0x1e, 63, 60, InlineU32(5)));
+  code.push_back(EncodeSmem0(0x03, 16, 12));
+  code.push_back(EncodeSmem1(0, 63));
+  code.push_back(EncodeMimg0(0x27, 0x1, 0, false, 1, false));
+  code.push_back(EncodeMimg1(0, 24, 4, 19));
+  code.push_back(EncodeVop1(0x01, 30, 33));
+  AppendBufferStoreDword(&code, 0, 30);
+  code.push_back(EncodeSop2(0x00, 32, 32, InlineU32(1)));
+  code.push_back(EncodeSopc(0x0a, 32, InlineU32(static_cast<u32>(indices.size()))));
+  const auto branch = code.size();
+  code.push_back(EncodeSopp(0x05, static_cast<u32>(
+      static_cast<int64_t>(loop) - static_cast<int64_t>(branch + 1u))));
+  AppendEnd(&code);
+  test.opcodes = {O::S_LOAD_DWORDX8, O::S_BUFFER_LOAD_DWORD, O::IMAGE_SAMPLE,
+                  O::BUFFER_STORE_DWORD, O::S_CBRANCH_SCC1};
+  test.required_spirv = {"OpLoopMerge", "OpSwitch", "OpImageSampleExplicitLod"};
+  test.spirv_counts = {{"OpImageSampleExplicitLod", indices.size()}};
+  return test;
+}
+
 TestCase ImageSampleR128DynamicMaterialPairs() {
   return MakeImageSampleDynamicMaterials(MaterialImageSampleMode::CompactDynamicSampler);
 }
@@ -36154,7 +36236,7 @@ TestCase Images65FromSrtWithDistinctSamplerOrigins() {
 void CheckIndirectImageKeySwitch(
     Prospero::TextureNumericClass candidate_numeric_class =
         Prospero::TextureNumericClass::Float,
-    const char *name = "IndirectImageKeySwitch") {
+    const char *name = "IndirectImageKeySwitch", bool wide = false) {
   constexpr uint32_t mapping_capacity = 1793u;
   using namespace ShaderRecompiler::IR;
 
@@ -36220,14 +36302,25 @@ void CheckIndirectImageKeySwitch(
   root.indirect_mapping_offset = 0;
   root.indirect_search_iterations = std::bit_width(mapping_capacity);
   root.indirect_resources = {0u, 1u};
+  if (wide) {
+    root.indirect_resources.clear();
+    for (u32 index = 0; index <= 250u; ++index)
+      root.indirect_resources.push_back(index);
+  }
   auto candidate = root;
   candidate.numeric_class = candidate_numeric_class;
-  candidate.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim1D;
+  candidate.dimension = wide ? ShaderRecompiler::Decoder::ImageDimension::Dim2D
+                             : ShaderRecompiler::Decoder::ImageDimension::Dim1D;
   candidate.indirect_search_iterations = 0;
   candidate.indirect_resources.clear();
   program.info.images = {root, candidate};
+  if (wide) program.info.images.resize(251u, candidate);
   program.info.samplers.push_back({1u, 0x10f0u});
   program.info.sampled_pairs.push_back({0u, 0u, 0x10f0u});
+  if (wide) {
+    for (u32 index = 1u; index <= 250u; ++index)
+      program.info.sampled_pairs.push_back({index, 0u, 0x10f0u});
+  }
   const bool mixed_numeric =
       candidate_numeric_class != Prospero::TextureNumericClass::Float;
   if (mixed_numeric) {
@@ -36323,6 +36416,14 @@ void CheckIndirectImageKeySwitch(
   std::string text;
   Require(name, "SPIR-V disassembly", tools.Disassemble(spirv, &text),
           "failed to disassemble indirect image shader");
+  if (wide) {
+    Require(name, "wide indirect image switch",
+            CountText(text, "OpSwitch") == 1u &&
+                CountText(text, "OpImageSampleExplicitLod") == 251u &&
+                CountText(text, "OpSampledImage ") == 251u,
+            "wide image table did not preserve every typed candidate");
+    return;
+  }
   Require(name, "key switch",
           text.find("OpSwitch") != std::string::npos &&
               text.find("OpPhi") != std::string::npos &&
@@ -45167,6 +45268,22 @@ if (argc == 1) {
     CheckIndirectImageKeySwitch();
     VulkanHarness vulkan;
     RunCase(&vulkan, ImageCubeGradientsPreserveDerivatives());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--wide-indirect-image-spirv-only") == 0) {
+    CheckIndirectImageKeySwitch(Prospero::TextureNumericClass::Float,
+                                "WideIndirectImageKeySwitch", true);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--wide-indirect-image-table-compile-only") == 0) {
+    auto test = WideIndirectImageTableSample();
+    test.compile_only = true;
+    RunCase(nullptr, test);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--wide-indirect-image-table-gpu-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, WideIndirectImageTableSample());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--indirect-image-numeric-only") == 0) {

@@ -1777,6 +1777,20 @@ void UnregisterGuestInstructionPatchModule(void* module_ptr) {
 #endif
 }
 
+uint64_t GetGuestInstructionTrampolineBytesUsed(void* module_ptr) {
+#if !defined(__APPLE__)
+	const auto found = g_patch_modules.find(reinterpret_cast<u64>(module_ptr));
+	if (found == g_patch_modules.end()) {
+		return 0;
+	}
+	// Keep whatever follows 16-byte aligned, like the code the patcher emits.
+	return (found->second.trampoline_gen.getSize() + 15u) & ~static_cast<uint64_t>(15u);
+#else
+	(void)module_ptr;
+	return 0;
+#endif
+}
+
 #undef ASSERT
 
 } // namespace Loader

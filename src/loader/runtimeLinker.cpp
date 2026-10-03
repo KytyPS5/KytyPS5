@@ -2015,7 +2015,10 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 
 #if defined(__APPLE__)
 	if (split_wide_stores) {
-		uint64_t cursor = program->instruction_trampoline_vaddr;
+		// The AMD CPU patcher fills this area from its start, so the split continues behind it.
+		uint64_t cursor = program->instruction_trampoline_vaddr +
+		                  GetGuestInstructionTrampolineBytesUsed(
+		                      reinterpret_cast<void*>(program->base_vaddr));
 		for (const auto& [segment_addr, segment_size]: executable_segments) {
 			const auto result = X64InstructionEmulator::SplitWideStores(
 			    segment_addr, segment_size, &cursor,

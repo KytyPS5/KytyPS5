@@ -262,6 +262,20 @@ class Outcome:
         return self.label or RESULT_NAMES.get(self.code, "UNKNOWN")
 
 
+def usage_error(output: str) -> Optional[str]:
+    """The message kyty_emulator printed before its usage text, or None if it did not print usage.
+
+    PrintUsage prints the build string, then `kyty_emulator --game <dir|elf|zar> [options]`; a
+    rejected argument is reported on the line above the build string.
+    """
+    lines = output.splitlines()
+    for index, line in enumerate(lines):
+        if line.startswith("kyty_emulator --game <dir|elf|zar>"):
+            before = [l for l in lines[max(0, index - 3):index - 1] if l.strip()]
+            return before[-1].strip() if before else "(no message)"
+    return None
+
+
 def classify(exit_info: ExitInfo, output: str, progress: Progress) -> Outcome:
     """Decide how a run ended from the exit status, everything the emulator printed, and how far
     the scenario got. `output` is stdout plus the guest log; pure, so it can be tested on fixtures.
@@ -270,6 +284,14 @@ def classify(exit_info: ExitInfo, output: str, progress: Progress) -> Outcome:
     fatal = fatals[0] if fatals else None
     shader = parse_shader_failure(fatal) if fatal else None
     code = exit_info.returncode
+
+    # The emulator rejected its command line: it prints why, then its usage, and exits 1.
+    complaint = usage_error(output)
+    if complaint is not None and code == 1 and not exit_info.killed_for:
+        hint = ""
+        if "unknown option" in complaint:
+            hint = " (is kyty_emulator older than the harness? rebuild it)"
+        return Outcome(EXIT_HARNESS, f"kyty_emulator rejected its command line: {complaint}{hint}")
 
     # Cases where the harness ended the run.
     if exit_info.killed_for == "hang":

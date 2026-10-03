@@ -180,6 +180,14 @@ class Classification(unittest.TestCase):
         outcome = ka.classify(ka.ExitInfo(returncode=65), fixture("other_abort.stdout.txt"), progress)
         self.assertEqual(outcome.code, ka.EXIT_OTHER_ABORT)
 
+    def test_rejected_command_line_is_reported_with_its_reason(self):
+        output = ("unknown option: --automation-dir\nRelease, clang-lld, ver = 0.3.0, git = e317465, "
+                  "date = 2026.10.02\nkyty_emulator --game <dir|elf|zar> [options]\n\nOptions:\n")
+        outcome = ka.classify(ka.ExitInfo(returncode=1), output, ka.Progress())
+        self.assertEqual(outcome.code, ka.EXIT_HARNESS)
+        self.assertIn("unknown option: --automation-dir", outcome.reason)
+        self.assertIn("rebuild", outcome.reason)
+
     def test_scenario_error_is_a_harness_error(self):
         outcome = ka.classify(ka.ExitInfo(killed_for="scenario_error", note="rejected `dance`"), "", ka.Progress())
         self.assertEqual(outcome.code, ka.EXIT_HARNESS)

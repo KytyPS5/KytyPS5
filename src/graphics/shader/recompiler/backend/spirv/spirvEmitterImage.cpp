@@ -718,7 +718,7 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 				const auto sampled = MakeSampledImage(state, mem.resource, sampler_id, mip);
 				const auto sample = state.builder.AllocateId();
 				std::vector<uint32_t> words {
-				    dref ? spv::OpImageDrefGather : spv::OpImageGather, result_type,
+				    static_cast<uint32_t>(dref ? spv::OpImageDrefGather : spv::OpImageGather), result_type,
 				    sample, sampled, coord, component_or_dref};
 				if (operand_mask != 0u) {
 					words.push_back(operand_mask);

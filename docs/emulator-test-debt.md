@@ -1,5 +1,42 @@
 # Emulator regression test debt
 
+## Formatted buffer descriptor selected at runtime (2026-10-03; pending)
+
+The bounded GPUAV retry on the SRGB metadata correction,
+`_Build/runs/yotei-integrated-20261003-180731-presentfix-gpuav`, passed the
+previous `k8Srgb` render-target rejection and exited 321 after `shown=200`.
+Compute shader `0x4d6df08d2d54e0ff` fails resource tracking at PC `0x284`:
+`BUFFER_LOAD_FORMAT_X`, one formatted DWORD, with descriptor in `s20` and
+vector index enabled. The existing GPU-selected buffer fallback permits only
+raw DWORD x2/x3/x4 reads, so this formatted access remains rejected. No
+prepared-frame readback or menu was captured; the run spent 340 seconds total,
+including new GPUAV instrumented pipeline compilation.
+
+Before changing production behavior, identify the four descriptor words and
+their provenance at this PC, including any bounded table, scalar loop or
+wave-uniform source. Add a synthetic formatted-load regression with distinct
+numeric results for at least two descriptor choices and explicit bounds/OOB
+controls. Preserve the rejection for arbitrary unbounded GPU-selected
+formatted descriptors, typed stores and invalid format combinations. Run
+the test RED against current source before extending the shared resource
+tracking/materialization or GPU descriptor path; then retry the same game.
+
+A first independent native control, `resource_tracking_tests
+--formatted-scalar-table-only`, is GREEN on current source
+(`_Build/logs/formatted-scalar-table-baseline-20261003.log`). It uses a signed
+scalar loop, a 488-byte row stride, four consecutive descriptor words at
+offset 200, a formatted load, and two distinct synthetic descriptor bases.
+It also rejects a path that bypasses the count guard. This proves the simple
+bounded-table mechanism already handles the observed geometry. It is **not**
+the required RED: the game has additional EXEC/VCC masks and nested control
+flow. Capture the failed descriptor's source/rejection with the existing
+`KYTY_SHADER_PHASE_TRACE` before selecting the next synthetic variant.
+The clean exe without the temporary Vertex cap instead lost the GPU at
+`shown=200` after prepared frames 198 and 199 had nonzero RGB pixels
+(`_Build/runs/yotei-integrated-20261003-181855-presentfix-gpuav`). Thus this
+formatted-descriptor blocker is currently reached only in a diagnostic mode;
+the clean GPU loss below is the earlier runtime frontier.
+
 ## GPUAV feature parity for synthetic vertex image selection (2026-10-03)
 
 The first three-index synthetic vertex draw passed native GPU readback but
@@ -107,6 +144,19 @@ No game retry on this exe yet; the known repeated GPU DeviceLost is unrelated
 to the synthetic ABI failure.
 
 ## DeviceLost on large indirect-image vertex draw (2026-10-03)
+
+Clean-source retry on commit `22211827`, installed exe SHA-256
+`8c33160e9bd0d89d67f4d9d9357a7ae2b11b02bc4437d55118fcbf448a703d32`:
+`_Build/runs/yotei-integrated-20261003-181855-presentfix-gpuav` finalized
+`run.json` with exit 321, `shown=200`, 18m22s elapsed. Prepared readback
+was RGB black through frame 197, then `colored=10` at frame 198 and
+`colored=62` at frame 199. `vkWaitSemaphores` returned `ErrorDeviceLost` at
+wait tick 41333, known GPU tick 41331. No validation error preceded it.
+This corroborates the old frontier but did not use per-draw SyncDiag, so
+the exact submitted operation in this run remains unproved. The clean
+retry is not evidence that the diagnostic formatted-descriptor failure
+has been fixed or reached. Avoid repeating the driver reset until a
+bounded synthetic Vertex regression isolates the cause.
 
 Native indexed-draw control added in test-only commit `0201fa00` after the
 full compute switch passed. It extends the existing Vulkan graphics harness
@@ -395,26 +445,43 @@ captured frame had zero RGB. It later reached `shown=197` and the separate
 16-bit SRGB color-target guard. These readbacks prove the layout fix and
 black pixels for that interval only; they do not prove a menu.
 
-## 16-bit SRGB color-target register state after expanded HTile alias (2026-10-03)
+## 8-bit SRGB render-target element size after expanded HTile alias (2026-10-03)
 
 The bounded GPUAV run
 `_Build/runs/yotei-integrated-20261003-161215-presentfix-gpuav-sync`
 passed the previous HTile guard and exited 321 at `shown=192` with
 `unsupported render-target format combination: layout=1 type=6 order=0`
-in `textureCommon.cpp:138`. The local enums decode this as a single 16-bit
-channel with SRGB number type and standard order. The existing format table
-does not map 16-bit SRGB; upstream PR #1003 changes RT byte sizes for 8-bit
-SRGB layouts and does not cover this combination. The run had no pixel
-readback, so this is only a runtime blocker, not visible progress proof.
+in `textureCommon.cpp:138`. The initial interpretation as 16-bit was wrong:
+the current `ChannelLayout` enum assigns `1` to `k8`; `6` is `kSrgb`.
+The bounded diagnostic run
+`_Build/runs/yotei-integrated-20261003-174110-presentfix-gpuav` proved
+`origin=RefreshShaders valid=1 buffer=128 components=1`, i.e. the valid
+guest encoding is `k8Srgb`. The host mapping is R8 UNorm, but the format
+table gives its render-target element size as zero, so the tuple is
+rejected. Upstream PR #1003 changes this element size from 0 to 1 and
+does the corresponding 8+8 SRGB correction from 0 to 2. No readback was
+requested in this particular run; prior bounded runs measured prepared
+RGB black on frames 120–135 and 180–195.
 
-Required diagnosis before any production change: capture the color slot,
-target base/mask, pixel shader MRT exports and relevant render-control state
-for this draw. Determine from guest hardware semantics whether the register
-combination is a valid write, a stale inactive target, or an unsupported
-encoding. Then write a synthetic RED for the actual admission or format
-conversion behavior, preserving the existing rejection of unsupported
-formats. Do not map 16-bit SRGB to UNorm without evidence of matching write
-and read semantics.
+Required synthetic RED before the production change: request the actual
+`k8/kSrgb/standard` render-target tuple through
+`TextureGetRenderTargetFormat`, require one byte and R8 UNorm backing, and
+also cover `k8_8/kSrgb` with two bytes and R8G8 UNorm. Retain a negative
+unsupported 16-bit SRGB encoding. Run the same test unchanged GREEN after
+correcting shared format metadata, then retry the game.
+
+Completed native RED/GREEN: `--reverse-rt-only` built successfully, then
+failed with exit 321 at the exact `k8/kSrgb/standard` tuple before the
+metadata change (`_Build/logs/srgb-rt-red-20261003.run.json`). The unchanged
+test passed after applying the two element sizes from upstream PR #1003
+(`_Build/logs/srgb-rt-green-20261003.run.json`); its 16-bit SRGB negative
+encoding remains invalid. Neighboring tile tests initially exposed stale
+sampled-only assumptions; the adjusted assertions preserve `k9_9_9_5Float`
+as non-target and check exact BPE for both SRGB layouts. Final native
+`--rt-tiled-sampled-format-only` passed and `--gpu-tiler-only` passed 330
+cases / 236 format-mode pairs (`_Build/logs/srgb-rt-tiled-final-20261003.run.json`,
+`_Build/logs/srgb-rt-gpu-tiler-final-20261003.run.json`). Game retry is
+still required before claiming this reaches a spinner or menu.
 
 ## Generic image lookup after a sampled HTile clear import (2026-10-03)
 

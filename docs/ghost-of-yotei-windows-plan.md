@@ -1,5 +1,102 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **3 октября 2026 года, 18:37 UTC** (native Windows via WSL;
+branch `yotei-windows-bringup`, clean source build at `22211827`, installed
+exe SHA-256 `8c33160e9bd0d89d67f4d9d9357a7ae2b11b02bc4437d55118fcbf448a703d32`):
+
+- All temporary render-target diagnostics and the four-iteration Vertex cap
+  were removed before the native build/install. `--reverse-rt-only`,
+  `--rt-tiled-sampled-format-only`, and `--gpu-tiler-only` passed; the
+  last covered 330 cases / 236 format-mode pairs. The SRGB correction is
+  commit `22211827`, pushed with subsequent PR review and table-control
+  commits through `eea31e15`.
+- Bounded clean GPUAV+shader-instrumentation run
+  `_Build/runs/yotei-integrated-20261003-181855-presentfix-gpuav`
+  took 18m22s and exited 321 at `shown=200`. Prepared-frame readback
+  was black through frame 197, then showed RGB nonzero pixels at frame
+  198 (`colored=10`, max channel 45) and 199 (`colored=62`, max channel
+  113). This re-proves visible loading progress after the SRGB fix;
+  no menu or gameplay frame was observed.
+- The clean run stopped at `vkWaitSemaphores ErrorDeviceLost`, wait tick
+  41333, known GPU tick 41331, without a preceding Vulkan validation
+  message. This is consistent with the already documented large indexed
+  Vertex draw frontier, but the run did not enable per-draw SyncDiag and
+  does not independently identify the failing draw. In contrast, the
+  earlier diagnostic exe with a temporary Vertex cap avoided this device
+  loss and reached CS `4d6df08d2d54e0ff`'s formatted descriptor
+  rejection at shown 200. That later resource blocker remains separate
+  and cannot be claimed as reachable by the clean exe yet.
+- Next: use the existing SyncDiag capture and synthetic wave64/indirect
+  image test debt to isolate a bounded GPU RED for the clean DeviceLost;
+  preserve exact image-selection and loop semantics. Avoid repeated GPU
+  resets without a smaller repro. Once corrected, re-run the clean game,
+  then address the formatted descriptor case with its own RED. Menu and
+  gameplay remain **PENDING**.
+
+Checkpoint **3 октября 2026 года, 18:13 UTC** (native Windows via WSL;
+branch `yotei-windows-bringup`, pushed head `5834f3cd` plus uncommitted
+SRGB metadata fix and temporary diagnostics/Vertex cap; installed exe
+SHA-256 `9a50dc17fb2b01fa49d315435dc77954b013992c09442b3032b2f873a9ea8454`):
+
+- Bounded GPUAV run `…-180731-presentfix-gpuav` passed the old `k8Srgb`
+  render-target rejection and reached `shown=200` in 340 seconds. It then
+  exited 321 at CS `4d6df08d2d54e0ff`, PC `0x284`, where a formatted
+  `BUFFER_LOAD_FORMAT_X` needs a runtime buffer descriptor outside the
+  current raw DWORD x2/x3/x4 GPU-selected admission. No prepared readback
+  was captured at `ReadbackStart=200`; first nonzero frame, menu and gameplay
+  remain unproved in this run.
+- Record and prove the synthetic formatted-descriptor RED described in test
+  debt before a shared behavior change. Remove temporary diagnostics and
+  the Vertex cap, build/install a clean exe, and check its hash. The SRGB
+  metadata fix itself has native RED/GREEN and neighboring tests; commit it
+  separately with the clean source. Driver pipeline compilation remains the
+  dominant elapsed time in this run, not native C++ compilation.
+
+Checkpoint **3 октября 2026 года, 18:04 UTC** (native Windows via WSL;
+branch `yotei-windows-bringup`, pushed head `5834f3cd` plus uncommitted
+SRGB metadata fix and temporary diagnostics/Vertex cap):
+
+- The late `layout=1 type=6 order=0` rejection was decoded correctly only
+  after direct fatal-path instrumentation: `ChannelLayout::k8`,
+  `ChannelType::kSrgb`, `origin=RefreshShaders`, guest encoding valid,
+  `BufferFormat::k8Srgb` (128). The initial 16-bit reading was wrong.
+  Its host mapping is R8 UNorm; the shared format table had zero target BPE.
+  Upstream PR #1003 changes that value to 1 and `k8_8Srgb` to 2.
+- Native `--reverse-rt-only` reproduced the exact fatal tuple (exit 321)
+  before the metadata correction, then passed unchanged. The adjusted
+  `--rt-tiled-sampled-format-only` and GPU tiler neighbors passed; the latter
+  covered 330 cases / 236 format-mode pairs. See test debt and `_Build/logs/`
+  for commands/artifacts. A bounded game retry with readback from prepared
+  frame 200 is next. No menu or gameplay has been observed.
+- Preserve the previously verified readback fix in commit `5834f3cd`.
+  Remove all temporary format diagnostics and the Vertex cap after the
+  diagnostic run, rebuild/install the clean native executable, and verify
+  the exact exe hash before a final runtime claim.
+
+Checkpoint **3 октября 2026 года, 17:42 UTC** (native Windows via WSL;
+branch `yotei-windows-bringup`, pushed head `5834f3cd`; temporary Vertex cap
+and render-target diagnostics still applied to the installed diagnostic exe):
+
+- Native `--prepared-frame-readback-only` failed on the old destination
+  layout after a successful build, then passed unchanged after the shared
+  prepared-image transition, with four numerical RGBA pixels and a repeat
+  readback from an already-source image. Commit `5834f3cd` is pushed. The
+  bounded game run `…-170145-presentfix-gpuav` confirmed that the old Vulkan
+  layout error is gone; prepared frames 120–135 were RGB black. Another run
+  `…-172113-presentfix-gpuav` reached `shown=200` with prepared frames
+  180–195 still RGB black, then hit `layout=1 type=6 order=0` again. Neither
+  interval proves a regression from the older spinner at prepared frame 250.
+- The currently running bounded diagnostic `…-174110-presentfix-gpuav` uses
+  installed exe SHA-256 `8cdd2b1f5d1a58dadf0f2ff41ed7e787e7b7862870f6aa44757d33367411e4e7`
+  and logs the render-target format call origin directly in the fatal path.
+  Its result and synthetic RED for that specific mechanism are pending.
+- Full GPUAV shader instrumentation is still required to pass the early
+  `b90e…` driver compiler boundary. Individual `vkCreateComputePipelines`
+  calls for `54904…` took 258743 ms, so a 480-second shown-frame watchdog
+  cut off sequential variants; the diagnostic retries use 1200 seconds.
+  Menu and gameplay **PENDING**. Remove temporary diagnostics and Vertex cap,
+  then rebuild/install a clean native exe before claiming a final result.
+
 Checkpoint **3 октября 2026 года, 16:13 UTC** (native Windows via WSL;
 branch `yotei-windows-bringup`, pushed head `bafbb4c6` plus uncommitted
 expanded-HTile fix and temporary Vertex cap; installed exe SHA-256

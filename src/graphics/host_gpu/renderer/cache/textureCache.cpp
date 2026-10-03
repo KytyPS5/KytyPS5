@@ -1538,6 +1538,60 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		return GetNullImage(desc);
 	}
 	const auto metadata_base_layer = desc.view_info.base_layer;
+	// A sampled HTile clear owns native pixels while the raw depth allocation
+	// remains stale. A larger depth attachment at the same guest base changes
+	// the tile pitch, so a native image copy would map those pixels to the wrong
+	// guest bytes. Publish the smaller image to its original tiled backing
+	// before the ordinary larger-image upload acquires the overlapping range.
+	ImageId expanded_htile_alias {};
+	if (desc.type == BindingType::DepthTarget) {
+		std::scoped_lock lock {m_lock};
+		for (const auto id:
+		     FindImagesInRegion(desc.info.data.address, desc.info.data.size, false)) {
+			const auto& image = m_slot_images[id];
+			const auto& owner = image.info;
+			const bool expandable = image.sampled_htile_clear_import &&
+			    image.SafeToDownload() && owner.IsDepth() && desc.info.IsDepth() &&
+			    owner.data.address == desc.info.data.address &&
+			    owner.data.size < desc.info.data.size &&
+			    owner.metadata.kind == ImageMetadataKind::Htile &&
+			    desc.info.metadata.kind == ImageMetadataKind::Htile &&
+			    owner.metadata.range.address == desc.info.metadata.range.address &&
+			    owner.metadata.range.size < desc.info.metadata.range.size &&
+			    owner.pixel_format == desc.info.pixel_format &&
+			    owner.guest_format == desc.info.guest_format && owner.type == desc.info.type &&
+			    owner.tile_mode == desc.info.tile_mode &&
+			    owner.bytes_per_block == desc.info.bytes_per_block &&
+			    owner.samples == desc.info.samples && owner.resources == desc.info.resources &&
+			    owner.resources.levels == 1 && owner.resources.layers == 1 &&
+			    !owner.HasStencil() && !desc.info.HasStencil() &&
+			    owner.extent.depth == 1 && desc.info.extent.depth == 1 &&
+			    owner.extent.width < desc.info.extent.width &&
+			    owner.extent.height < desc.info.extent.height &&
+			    owner.pitch < desc.info.pitch &&
+			    owner.metadata.compression == desc.info.metadata.compression &&
+			    owner.metadata.stencil_compressed == desc.info.metadata.stencil_compressed;
+			if (expandable) {
+				if (expanded_htile_alias) {
+					EXIT("multiple sampled HTile imports overlap an expanded depth target\n");
+				}
+				expanded_htile_alias = id;
+			}
+		}
+		if (expanded_htile_alias && !DownloadImageMemory(expanded_htile_alias)) {
+			EXIT("sampled HTile depth alias could not publish its native pixels\n");
+		}
+	}
+	if (expanded_htile_alias) {
+		m_scheduler.FlushAndWait();
+		std::scoped_lock lock {m_lock};
+		const auto owner = m_slot_images.try_get(expanded_htile_alias);
+		if (owner == nullptr || !owner->registered ||
+		    !owner->sampled_htile_clear_import) {
+			EXIT("sampled HTile depth alias owner changed during publication\n");
+		}
+		FreeImage(expanded_htile_alias);
+	}
 
 	ImageId result {};
 	bool    inserted_new = false;

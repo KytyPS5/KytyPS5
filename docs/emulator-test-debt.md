@@ -363,6 +363,27 @@ launches until a bounded synthetic SPIR-V or emitter regression isolates the
 instruction pattern that triggers the crash. Keep shader validation and GPUAV
 controls to distinguish invalid SPIR-V from a driver defect.
 
+## 16-bit SRGB color-target register state after expanded HTile alias (2026-10-03)
+
+The bounded GPUAV run
+`_Build/runs/yotei-integrated-20261003-161215-presentfix-gpuav-sync`
+passed the previous HTile guard and exited 321 at `shown=192` with
+`unsupported render-target format combination: layout=1 type=6 order=0`
+in `textureCommon.cpp:138`. The local enums decode this as a single 16-bit
+channel with SRGB number type and standard order. The existing format table
+does not map 16-bit SRGB; upstream PR #1003 changes RT byte sizes for 8-bit
+SRGB layouts and does not cover this combination. The run had no pixel
+readback, so this is only a runtime blocker, not visible progress proof.
+
+Required diagnosis before any production change: capture the color slot,
+target base/mask, pixel shader MRT exports and relevant render-control state
+for this draw. Determine from guest hardware semantics whether the register
+combination is a valid write, a stale inactive target, or an unsupported
+encoding. Then write a synthetic RED for the actual admission or format
+conversion behavior, preserving the existing rejection of unsupported
+formats. Do not map 16-bit SRGB to UNorm without evidence of matching write
+and read semantics.
+
 ## Generic image lookup after a sampled HTile clear import (2026-10-03)
 
 The bounded GPUAV run
@@ -421,6 +442,29 @@ source has CPU- or buffer-dirty pixels at the guard. This is a coherent
 native clear that must be materialized into the overlapping guest layout
 before the larger target can acquire it; blindly accepting the owner would
 use the wrong pitch and extent.
+The independent native `--sampled-htile-expanded-alias-only` case now
+materializes a 512×512 HTile clear over stale raw bytes, then acquires a
+1024×1024 depth target at the same data/metadata bases with larger footprints.
+Its two numerical probes require the first target texel to retain clear1 and
+the far tail to retain raw 0.25. It is RED at the existing guard, after the
+first logical clear was sampled successfully
+(`_Build/logs/htile-expanded-alias-red-20261003.*`). Required GREEN: coherent
+download of the imported native depth to guest backing, retirement of that
+owner, then ordinary larger-target upload without losing metadata ownership.
+The shared texture cache now performs that transfer only for a clean,
+single-layer D32 depth owner and a larger attachment at the same data and
+HTile bases with compatible format/layout identity. It flushes and waits for
+the guest backing write before retiring the old owner. The unchanged
+numerical alias fixture is GREEN
+(`_Build/logs/htile-expanded-alias-final-green-20261003.*`); a different
+HTile base still fails closed with exit 321
+(`_Build/logs/htile-expanded-mismatch-final-20261003.*`). The exact-owner
+and array-clear neighbors pass after this change
+(`_Build/logs/htile-exact-neighbor-after-expanded-20261003.*`,
+`_Build/logs/htile-array-neighbor-after-expanded-20261003.*`). The bounded
+game retry passed the old HTile guard and reached the 16-bit SRGB format
+blocker described above. The retry did not numerically check the real
+2048→4096 transfer or prove visible pixels.
 
 ## GPU-produced indirect workgroup bounds for bounded SRT (2026-10-03)
 

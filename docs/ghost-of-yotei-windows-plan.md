@@ -1,5 +1,30 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **3 октября 2026 года, 16:13 UTC** (native Windows via WSL;
+branch `yotei-windows-bringup`, pushed head `bafbb4c6` plus uncommitted
+expanded-HTile fix and temporary Vertex cap; installed exe SHA-256
+`f057182b326b7b2c5cd57a2b4c1ced53183af31d9a1723c230a47e590e2398b2`):
+
+- Детальный game capture подтвердил larger depth alias: один guest base,
+  owner 2048×2048/16 MiB и target 4096×4096/64 MiB; HTile base одинаков,
+  диапазон 256 KiB → 1 MiB. Синтетический тест сначала численно прочитал
+  HTile clear поверх устаревшего raw depth, получил RED на прежнем guard,
+  затем GREEN после когерентной выгрузки owner и загрузки большего target.
+  Отрицательный случай несовместимого metadata base и соседние тесты прошли.
+- Bounded GPUAV game retry
+  `_Build/runs/yotei-integrated-20261003-161215-presentfix-gpuav-sync`
+  прошёл прежний HTile guard, но остановился на новом отказе
+  `unsupported render-target format combination: layout=1 type=6 order=0`
+  в `textureCommon.cpp:138`, `shown=192`. Это 16-bit/SRGB/standard по
+  локальным enum; в текущей таблице комбинация не поддержана. Нужны
+  диагностический capture slot/mask/PS export и synthetic RED фактической
+  семантики. PR #1003 касается только 8-bit SRGB размеров, не этого случая.
+  Readback отсутствовал, меню и gameplay **PENDING**.
+- После диагностики убрать временный Vertex cap и собрать чистый native
+  executable. Не считать принятый pipeline cache или `shown` доказательством
+  изображения; сохранённый кэш сокращает повторное ожидание, но новые
+  варианты CS `54904…` всё ещё могут компилироваться по ~258 секунд.
+
 Checkpoint **3 октября 2026 года, 16:04 UTC** (native Windows via WSL;
 branch `yotei-windows-bringup`, pushed head `54573cb4` plus uncommitted
 HTile exact-owner fix and temporary Vertex cap; installed exe SHA-256

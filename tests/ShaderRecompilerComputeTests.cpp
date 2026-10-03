@@ -9555,6 +9555,267 @@ public:
     return result;
   }
 
+  // Unmapping the guest memory behind a depth/stencil target through the kernel must retire
+  // exactly the cache state that memory backed. Depth data, stencil plane and HTILE metadata
+  // live in separate allocations, as games allocate them, and each allocation is unmapped
+  // and its address reused with new contents while the others stay mapped.
+  void CheckDepthStencilUnmapRetirement() {
+    constexpr const char *name = "DepthStencilUnmapRetirement";
+    constexpr uintptr_t depth_va = 0x0000000208000000ull;
+    constexpr uintptr_t stencil_va = 0x0000000208400000ull;
+    constexpr uintptr_t htile_va = 0x0000000208800000ull;
+    constexpr uint64_t allocation_size = 0x10000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint32_t width = 16;
+    constexpr uint32_t height = 4;
+    constexpr uint32_t texels = width * height;
+    constexpr uint64_t depth_bytes = uint64_t{texels} * sizeof(float);
+    constexpr uint64_t stencil_bytes = texels;
+    constexpr uint64_t htile_bytes = 0x80;
+    constexpr float gpu_depth = 0.375f;
+    constexpr uint8_t gpu_stencil = 0x5a;
+    const auto DepthPattern = [](float base) {
+      std::vector<u32> words(texels);
+      for (uint32_t index = 0; index < texels; ++index) {
+        words[index] = std::bit_cast<u32>(base + static_cast<float>(index) / 256.0f);
+      }
+      return words;
+    };
+    const auto StencilPattern = [](uint8_t base) {
+      std::vector<uint8_t> bytes(stencil_bytes);
+      for (uint32_t index = 0; index < texels; ++index) {
+        bytes[index] = static_cast<uint8_t>(base + index);
+      }
+      return bytes;
+    };
+    const auto old_depth = DepthPattern(0.125f);
+    const auto new_depth = DepthPattern(0.625f);
+    const auto old_stencil = StencilPattern(0x10);
+    const auto new_stencil = StencilPattern(0xa0);
+
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    auto &texture_cache = context.GetTextureCache();
+
+    const auto total_direct = Libs::LibKernel::Memory::KernelGetDirectMemorySize();
+    std::array<int64_t, 6> allocations{};
+    for (auto &allocation : allocations) {
+      allocation = -1;
+      Require(name, "direct allocation",
+              Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                  0, total_direct, allocation_size, allocation_alignment, 0,
+                  &allocation) == 0,
+              "direct-memory allocation failed");
+    }
+    const auto [depth_old, depth_new, stencil_old, stencil_new, htile_old, htile_new] =
+        allocations;
+    const auto MapAt = [&](uintptr_t address, int64_t direct_offset) {
+      void *mapped = reinterpret_cast<void *>(address);
+      return Libs::LibKernel::Memory::KernelMapDirectMemory(
+                 &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                 allocation_alignment) == 0 &&
+             mapped == reinterpret_cast<void *>(address);
+    };
+    const auto Unmap = [&](uintptr_t address) {
+      return Libs::LibKernel::Memory::KernelMunmap(address, allocation_size) == 0;
+    };
+    // The GPU resources are installed before mapping, so only the kernel reports the
+    // mappings and unmappings below to the caches.
+    LibKernel::Memory::InstallGpuResources(&context);
+    Require(name, "mapping",
+            MapAt(depth_va, depth_old) && MapAt(stencil_va, stencil_old) &&
+                MapAt(htile_va, htile_old),
+            "fixed direct-memory mapping failed");
+    const auto WriteDepth = [&](const std::vector<u32> &words) {
+      std::memcpy(reinterpret_cast<void *>(depth_va), words.data(), depth_bytes);
+    };
+    const auto WriteStencil = [&](const std::vector<uint8_t> &bytes) {
+      std::memcpy(reinterpret_cast<void *>(stencil_va), bytes.data(), stencil_bytes);
+    };
+    WriteDepth(old_depth);
+    WriteStencil(old_stencil);
+    std::memset(reinterpret_cast<void *>(htile_va), 0, htile_bytes);
+
+    ImageDesc desc{};
+    desc.type = BindingType::DepthTarget;
+    desc.info.data = {depth_va, depth_bytes};
+    desc.info.pixel_format = vk::Format::eD32SfloatS8Uint;
+    desc.info.guest_format = Prospero::BufferFormat::k32Float;
+    desc.info.type = Prospero::ImageType::kColor2D;
+    desc.info.extent = {width, height, 1};
+    desc.info.resources = {1, 1};
+    desc.info.pitch = width;
+    desc.info.bytes_per_block = 4;
+    desc.info.samples = 1;
+    desc.info.tile_mode = Prospero::TileMode::kLinear;
+    desc.info.mip_layout[0] = {0, depth_bytes, width, height};
+    desc.info.stencil = {stencil_va, stencil_bytes};
+    desc.info.metadata.kind = ImageMetadataKind::Htile;
+    desc.info.metadata.range = {htile_va, htile_bytes};
+    desc.info.htile_clear_mask = 0;
+    desc.view_info.format = vk::Format::eD32SfloatS8Uint;
+    desc.view_info.type = vk::ImageViewType::e2D;
+    desc.view_info.aspect =
+        vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
+    desc.view_info.layer_count = 1;
+    desc.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+    const auto Acquire = [&] {
+      auto acquire = desc;
+      const auto id = texture_cache.FindImage(acquire);
+      Require(name, "depth target view",
+              texture_cache.FindDepthTarget(id, acquire) != nullptr,
+              "the depth target could not be acquired");
+      return id;
+    };
+    const auto ReadAspect = [&](ImageId id, vk::ImageAspectFlagBits aspect) {
+      auto &image = texture_cache.GetImage(id);
+      const uint64_t bytes =
+          aspect == vk::ImageAspectFlagBits::eDepth ? depth_bytes : stencil_bytes;
+      auto probe = CreateHostBuffer(name, bytes, vk::BufferUsageFlagBits::eTransferDst, {});
+      scheduler.Current().EndRendering();
+      image.Transit(vk::ImageLayout::eTransferSrcOptimal,
+                    vk::AccessFlagBits2::eTransferRead, {},
+                    scheduler.Current().Handle());
+      vk::BufferImageCopy copy{};
+      copy.imageSubresource = {aspect, 0, 0, 1};
+      copy.imageExtent = {width, height, 1};
+      scheduler.Current().Handle().copyImageToBuffer(
+          image.backing.image, vk::ImageLayout::eTransferSrcOptimal, probe.buffer, 1,
+          &copy);
+      vk::BufferMemoryBarrier barrier{};
+      barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+      barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+      barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.buffer = probe.buffer;
+      barrier.size = probe.size;
+      scheduler.Current().Handle().pipelineBarrier(
+          vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {},
+          0, nullptr, 1, &barrier, 0, nullptr);
+      scheduler.Finish();
+      const auto words = ReadBuffer(name, probe, (bytes + 3) / 4);
+      DestroyBuffer(&probe);
+      return words;
+    };
+    const auto StencilWords = [](const std::vector<uint8_t> &bytes) {
+      std::vector<u32> words((bytes.size() + 3) / 4, 0);
+      std::memcpy(words.data(), bytes.data(), bytes.size());
+      return words;
+    };
+    const auto NoOwner = [&](uint64_t address, uint64_t size) {
+      return TextureCacheTestAccess::FindImages(texture_cache, address, size, false)
+          .empty();
+    };
+
+    const auto depth_id = Acquire();
+    Require(name, "guest upload",
+            ReadAspect(depth_id, vk::ImageAspectFlagBits::eDepth) == old_depth &&
+                ReadAspect(depth_id, vk::ImageAspectFlagBits::eStencil) ==
+                    StencilWords(old_stencil),
+            "the depth target did not start from the guest depth and stencil");
+    vk::ClearValue gpu_clear{};
+    gpu_clear.depthStencil = vk::ClearDepthStencilValue{gpu_depth, gpu_stencil};
+    TextureCacheTestAccess::ClearImage(
+        texture_cache, scheduler.Current(), depth_id,
+        {vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil, 0, 1, 0, 1},
+        gpu_clear);
+    const std::vector<u32> gpu_depth_words(texels, std::bit_cast<u32>(gpu_depth));
+    const auto gpu_stencil_words = StencilWords(std::vector<uint8_t>(stencil_bytes, gpu_stencil));
+    // A depth clear records its result in HTILE, as RenderExecutor does for clearing draws.
+    Require(name, "GPU contents and HTILE clear",
+            ReadAspect(depth_id, vk::ImageAspectFlagBits::eDepth) == gpu_depth_words &&
+                ReadAspect(depth_id, vk::ImageAspectFlagBits::eStencil) ==
+                    gpu_stencil_words &&
+                texture_cache.ClearMeta(htile_va) &&
+                texture_cache.IsMetaCleared(htile_va, 0),
+            "the GPU clear or its HTILE clear state was not observable");
+
+    // Stencil allocation: only the stencil plane is retired. The reused address supplies
+    // the new stencil, and the depth plane keeps its GPU contents.
+    Require(name, "stencil unmap", Unmap(stencil_va), "stencil munmap failed");
+    Require(name, "stencil retirement",
+            NoOwner(stencil_va, stencil_bytes) &&
+                TextureCacheTestAccess::Contains(texture_cache, depth_id),
+            "unmapping the stencil plane kept its proxy or retired the depth image");
+    Require(name, "stencil remap", MapAt(stencil_va, stencil_new), "stencil remap failed");
+    WriteStencil(new_stencil);
+    Require(name, "depth identity after stencil reuse", Acquire() == depth_id,
+            "the depth target was replaced although its memory stayed mapped");
+    Require(name, "reused stencil contents",
+            ReadAspect(depth_id, vk::ImageAspectFlagBits::eStencil) ==
+                    StencilWords(new_stencil) &&
+                ReadAspect(depth_id, vk::ImageAspectFlagBits::eDepth) == gpu_depth_words,
+            "the reused stencil address kept the old stencil plane, or the depth plane "
+            "lost its GPU contents");
+
+    // HTILE allocation: its clear state must not outlive the mapping. A stale entry makes
+    // the next depth load a clear, and makes writes to the reused address look like
+    // metadata clears.
+    Require(name, "HTILE clear before unmap", texture_cache.IsMetaCleared(htile_va, 0),
+            "the HTILE clear state was lost before the unmap");
+    Require(name, "HTILE unmap", Unmap(htile_va), "HTILE munmap failed");
+    Require(name, "HTILE retirement",
+            !texture_cache.IsMeta(htile_va) &&
+                TextureCacheTestAccess::Contains(texture_cache, depth_id),
+            "unmapped HTILE memory kept its metadata authority");
+    Require(name, "HTILE remap", MapAt(htile_va, htile_new), "HTILE remap failed");
+    std::memset(reinterpret_cast<void *>(htile_va), 0, htile_bytes);
+    Require(name, "reused HTILE address", !texture_cache.IsMeta(htile_va),
+            "a reused HTILE address inherited the old metadata authority");
+    Require(name, "rebound HTILE state",
+            Acquire() == depth_id && texture_cache.IsMeta(htile_va) &&
+                !texture_cache.IsMetaCleared(htile_va, 0) &&
+                ReadAspect(depth_id, vk::ImageAspectFlagBits::eDepth) == gpu_depth_words,
+            "rebinding the reused HTILE address restored the old clear state");
+
+    // Depth allocation: the depth image retires with its stencil proxy and HTILE state, and
+    // GPU work still recorded against it is ordered by the unmap itself.
+    TextureCacheTestAccess::ClearImage(
+        texture_cache, scheduler.Current(), depth_id,
+        {vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil, 0, 1, 0, 1},
+        gpu_clear);
+    Require(name, "HTILE clear before depth unmap",
+            texture_cache.ClearMeta(htile_va) && texture_cache.IsMetaCleared(htile_va, 0),
+            "the HTILE clear state could not be set");
+    Require(name, "depth unmap", Unmap(depth_va), "depth munmap failed");
+    Require(name, "depth retirement",
+            NoOwner(depth_va, depth_bytes) && NoOwner(stencil_va, stencil_bytes) &&
+                !texture_cache.IsMeta(htile_va) &&
+                !TextureCacheTestAccess::Contains(texture_cache, depth_id),
+            "unmapping the depth data kept the image, its stencil proxy, or its HTILE "
+            "state");
+    Require(name, "depth remap", MapAt(depth_va, depth_new), "depth remap failed");
+    WriteDepth(new_depth);
+    const auto replacement = Acquire();
+    Require(name, "reused depth contents",
+            replacement != depth_id &&
+                ReadAspect(replacement, vk::ImageAspectFlagBits::eDepth) == new_depth &&
+                ReadAspect(replacement, vk::ImageAspectFlagBits::eStencil) ==
+                    StencilWords(new_stencil) &&
+                !texture_cache.IsMetaCleared(htile_va, 0),
+            "the reused depth address was served by, or inherited state from, the old "
+            "depth target");
+
+    Require(name, "final unmap",
+            Unmap(depth_va) && Unmap(stencil_va) && Unmap(htile_va), "final munmap failed");
+    scheduler.Finish();
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    for (const auto allocation : allocations) {
+      Require(name, "release allocation",
+              Libs::LibKernel::Memory::KernelReleaseDirectMemory(allocation,
+                                                                 allocation_size) == 0,
+              "direct-memory allocation could not be released");
+    }
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   void CheckNativeIndirectDispatch() {
     constexpr const char *name = "NativeIndirectDispatch";
     constexpr uintptr_t base = 0x0000000204600000ull;
@@ -37655,6 +37916,11 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--depth-stencil-unmap-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckDepthStencilUnmapRetirement();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--layered-image-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckUnifiedImageViewCache();
@@ -37862,6 +38128,7 @@ int main(int argc, char **argv) {
   CheckPs5GameExampleImageClearRuntimeShape();
   vulkan.CheckSchedulerTimeline();
   vulkan.CheckHostImageAllocation();
+  vulkan.CheckDepthStencilUnmapRetirement();
   vulkan.CheckDescriptorHeapLargeSet();
   vulkan.CheckGpuMappedRangeLifecycle();
   vulkan.CheckStreamBufferRing();

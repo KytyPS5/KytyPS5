@@ -39,6 +39,7 @@
 #include "graphics/shader/recompiler/Tessellation.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvOptimizer.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
@@ -1571,7 +1572,9 @@ void CheckSpirvText(const TestCase &test, const std::vector<u32> &spirv) {
   }
 }
 
-CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
+CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64,
+                          Config::ShaderOptimizationType optimization =
+                              Config::ShaderOptimizationType::None) {
   auto user_data =
       MakeNativeUserData(test.has_user_data ? &test.user_data : nullptr);
   const auto uses_image =
@@ -1589,6 +1592,7 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
     user_data[2] = static_cast<u32>(test.initial.size() * sizeof(u32));
   }
   ShaderRecompiler::CompileOptions options;
+  options.optimization_type = optimization;
   options.stage = ShaderType::Compute;
   options.dump_ir = true;
   auto compute_info = test.compute_info;
@@ -1678,7 +1682,9 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   Require(test.name, "SPIR-V emit", !result.spirv.empty(),
           "recompiler returned empty SPIR-V");
   ValidateSpirv(test.name, result.spirv);
-  CheckSpirvText(test, result.spirv);
+  if (optimization == Config::ShaderOptimizationType::None) {
+    CheckSpirvText(test, result.spirv);
+  }
   const auto *buffer_binding = ShaderRecompiler::IR::FindBinding(
       result.program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::Buffers);
   if (test.expected_buffer_resources) {
@@ -1745,7 +1751,9 @@ std::string StorageUint2DImageBindingName(bool atomic) {
   return "image_" + std::to_string(static_cast<uint32_t>(*binding));
 }
 
-CompiledShader CompileFragmentCase(const GraphicsCase &test) {
+CompiledShader CompileFragmentCase(const GraphicsCase &test,
+                                  Config::ShaderOptimizationType optimization =
+                                      Config::ShaderOptimizationType::None) {
   const auto user_data =
       MakeNativeUserData(test.has_user_data ? &test.user_data : nullptr);
   ShaderPixelInputInfo pixel_info{};
@@ -1771,6 +1779,7 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
   }
 
   ShaderRecompiler::CompileOptions options;
+  options.optimization_type = optimization;
   options.stage = ShaderType::Pixel;
   options.dump_ir = false;
   options.input_info.pixel = &pixel_info;
@@ -16950,6 +16959,8 @@ private:
     }
     Require("VulkanHarness", "dispatch", m_physical_device != nullptr,
             "no Vulkan graphics+compute device with fragment barycentrics and 64-bit LDS/image atomics");
+    std::printf("VulkanHarness device: %s\n",
+                m_physical_device.getProperties().deviceName.data());
     m_physical_device.getMemoryProperties(&m_memory_properties);
 
     vk::PhysicalDeviceFeatures available_features{};
@@ -17475,8 +17486,11 @@ void CompareGraphicsWords(const GraphicsCase &test,
   Fail(test.name, "graphics readback", out.str());
 }
 
-void RunCase(VulkanHarness *vulkan, const TestCase &test) {
-  auto compiled = CompileCase(test, vulkan != nullptr ? vulkan->SubgroupSize() : 64u);
+void RunCase(VulkanHarness *vulkan, const TestCase &test,
+             Config::ShaderOptimizationType optimization =
+                 Config::ShaderOptimizationType::None) {
+  auto compiled = CompileCase(test, vulkan != nullptr ? vulkan->SubgroupSize() : 64u,
+                              optimization);
   if (test.image_descriptor_swizzle != DstSel(4, 5, 6, 7) &&
       !compiled.program.info.images.empty()) {
     Require(test.name, "resource specialization",
@@ -17604,12 +17618,14 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
   std::printf("[compute] %-32s ok\n", test.name);
 }
 
-void RunGraphicsCase(VulkanHarness *vulkan, const GraphicsCase &test) {
+void RunGraphicsCase(VulkanHarness *vulkan, const GraphicsCase &test,
+                     Config::ShaderOptimizationType optimization =
+                         Config::ShaderOptimizationType::None) {
   if (vulkan != nullptr && !vulkan->RasterizationSupported()) {
     vulkan->SkipRasterizationCases(1);
     return;
   }
-  auto compiled = CompileFragmentCase(test);
+  auto compiled = CompileFragmentCase(test, optimization);
   auto actual = vulkan->RenderFragment(test, compiled);
   CompareGraphicsWords(test, actual);
   std::printf("[graphics] %-31s ok\n", test.name);
@@ -37101,6 +37117,47 @@ int main(int argc, char **argv) {
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
+  if (argc == 2 && std::strcmp(argv[1], "--shader-optimization-only") == 0) {
+    VulkanHarness vulkan;
+    const std::vector<TestCase> cases = {IntegerAddSubMul(),
+                                         BitwiseOps(),
+                                         VectorCompareF64Edges(),
+                                         VectorCompareExecWaveMasks(32),
+                                         VectorCompareExecWaveMasks(64),
+                                         PackedMinMaxF16NanAndSignedZeroEdges(),
+                                         BufferWorkgroupPublication(32),
+                                         BufferWorkgroupPublication(64),
+                                         DsAtomic64Contention(true, 32),
+                                         DsAtomic64Contention(true, 64),
+                                         BvhIntersections(true, true, 1)};
+    for (const auto mode : {Config::ShaderOptimizationType::None,
+                            Config::ShaderOptimizationType::Size,
+                            Config::ShaderOptimizationType::Performance}) {
+      std::printf("Shader optimization mode: %d\n", static_cast<int>(mode));
+      for (const auto &test : cases) {
+        auto baseline = CompileCase(test, vulkan.SubgroupSize());
+        auto optimized = CompileCase(test, vulkan.SubgroupSize(), mode);
+        auto expected = baseline.spirv;
+        std::string diagnostics;
+        Require(test.name, "SPIR-V optimization",
+                ShaderRecompiler::Spirv::Optimize(expected, mode, diagnostics),
+                diagnostics);
+        Require(test.name, "compiler optimization option",
+                optimized.spirv == expected,
+                "compiler did not apply the requested optimizer mode");
+        std::printf("[optimization] %s mode=%d words=%zu->%zu\n", test.name,
+                    static_cast<int>(mode), baseline.spirv.size(),
+                    optimized.spirv.size());
+        RunCase(&vulkan, test, mode);
+      }
+      for (const auto &test :
+           {GraphicsPositionWExport(), GraphicsPackedHalfCentroid(),
+            GraphicsSmoothRawInputAlias()}) {
+        RunGraphicsCase(&vulkan, test, mode);
+      }
+    }
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--lds-limit-only") == 0) {
     VulkanHarness vulkan;
     CheckComputeLdsLimit(vulkan);

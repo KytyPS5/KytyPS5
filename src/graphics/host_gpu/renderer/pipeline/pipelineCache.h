@@ -137,7 +137,8 @@ public:
 	                                const HW::ShaderRegisters&   sh,
 	                                ShaderComputeInputInfo&      input_info,
 	                                std::optional<std::array<uint32_t, 3>> guest_workgroups = std::nullopt,
-	                                bool compute_workgroups_trusted = true);
+	                                bool compute_workgroups_trusted = true,
+	                                uint64_t indirect_args_addr = 0);
 
 	Pipeline& GetGraphicsPipeline(std::span<const RenderColorInfo>       colors,
 	                              const RenderDepthInfo&                 depth,

@@ -9526,6 +9526,116 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  void CheckGpuOwnedBoundedIndirectDispatch() {
+    constexpr const char *name = "GpuOwnedBoundedIndirectDispatch";
+    constexpr uintptr_t base = 0x0000000204700000ull;
+    constexpr uint64_t allocation_size = 0x100000;
+    constexpr uint64_t args = base + 0x4000u;
+    constexpr uint64_t coefficients = base + 0x8000u;
+    constexpr uint64_t output = base + 0xc000u;
+    std::vector<u32> code;
+    code.push_back(EncodeSop2(0x1eu, 7u, 6u, InlineU32(2u)));
+    code.push_back(EncodeSmem0(0x00u, 8u, 2u)); // s8 = coefficient[WorkgroupId.x]
+    code.push_back(EncodeSmem1(0u, 7u));
+    code.push_back(EncodeSopp(0x0cu, 0u));
+    AppendVop3(&code, 0x346u, 1u, 6u, InlineU32(2u), Vgpr(0u));
+    code.push_back(EncodeVop2(0x25u, 2u, InlineU32(1u), 1u));
+    code.push_back(EncodeVop2(0x25u, 2u, 8u, 2u));
+    code.push_back(EncodeVop2(0x1au, 1u, InlineU32(2u), 1u));
+    code.push_back(EncodeMubuf0(0x1cu));
+    code.push_back(EncodeMubuf1(2u, 0u, 1u));
+    AppendEnd(&code);
+    ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+        {.type = Prospero::ShaderBinaryType::kCs,
+         .code_size_bytes = static_cast<uint32_t>(code.size() * sizeof(u32))});
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, 0x10000u, 0, &direct_offset) == 0,
+            "bounded indirect allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset, 0x10000u) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "bounded indirect mapping failed");
+    std::memset(mapped, 0, allocation_size);
+    const std::array<u32, 2> source{0x1234u, 0x5678u};
+    const std::array<u32, 8> sentinel{0xa5a5a5a5u, 0xa5a5a5a5u,
+                                     0xa5a5a5a5u, 0xa5a5a5a5u,
+                                     0xa5a5a5a5u, 0xa5a5a5a5u,
+                                     0xa5a5a5a5u, 0xa5a5a5a5u};
+    std::array<u32, 8> expected{};
+    for (u32 index = 0; index < expected.size(); ++index)
+      expected[index] = index + 1u + source[index / 4u];
+    std::memcpy(reinterpret_cast<void *>(coefficients), source.data(), sizeof(source));
+    std::memcpy(reinterpret_cast<void *>(output), sentinel.data(), sizeof(sentinel));
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      auto &cache = context.GetBufferCache();
+      auto &shaders = processor.GetShCtx();
+      context.MapMemory(base, allocation_size);
+      auto [argument_buffer, argument_offset] = cache.ObtainBuffer(args, 12u, true);
+      Require(name, "GPU argument allocation", argument_buffer != nullptr,
+              "could not allocate indirect argument buffer");
+      argument_buffer->Fill(argument_offset, 4u, 2u);
+      argument_buffer->Fill(argument_offset + 4u, 4u, 1u);
+      argument_buffer->Fill(argument_offset + 8u, 4u, 1u);
+      std::array<u32, 3> stale{};
+      Require(name, "stale CPU arguments",
+              LibKernel::Memory::TryReadBacking(args, stale.data(), sizeof(stale)) &&
+                  stale == std::array<u32, 3>{},
+              "GPU-written arguments unexpectedly reached CPU backing");
+      shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(code.data()),
+                           .num_thread_x = 4, .num_thread_y = 1, .num_thread_z = 1,
+                           .wave_size = 64, .user_sgpr = 6, .tgid_x_en = true});
+      ShaderBufferResource descriptor{};
+      descriptor.UpdateAddress48(output);
+      descriptor.fields[2] = sizeof(expected);
+      descriptor.fields[3] = DstSel(4, 5, 6, 7) |
+          (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u);
+      for (u32 i = 0; i < 4; ++i)
+        shaders.SetCsUserSgpr(i, descriptor.fields[i], HW::UserSgprType::Unknown);
+      shaders.SetCsUserSgpr(4u, static_cast<u32>(coefficients), HW::UserSgprType::Unknown);
+      shaders.SetCsUserSgpr(5u, static_cast<u32>(coefficients >> 32u),
+                            HW::UserSgprType::Unknown);
+      processor.SetDispatchIndirectArgsBaseAddress(args);
+      const std::array<u32, 2> packet{0u, 0x41u};
+      Require(name, "indirect packet",
+              CpOpDispatchIndirect(processor, 0xc0011600u, packet.data(), 0, 0) == 2,
+              "bounded indirect packet was not consumed");
+      std::array<u32, 3> published{};
+      Require(name, "coherent indirect counts",
+              LibKernel::Memory::TryReadBacking(args, published.data(), sizeof(published)) &&
+                  published == std::array<u32, 3>{2u, 1u, 1u},
+              "bounded SRT did not publish GPU-written indirect arguments");
+      // The renderer has now materialized a shader whose scalar coefficient
+      // domain depends on the GPU-produced x count. GPU execution/readback is
+      // checked separately because the current tiny shader has no proven
+      // storage-output control on this host.
+      Require(name, "output binding", cache.IsRegionGpuModified(output, sizeof(expected)),
+              "bounded indirect shader did not bind its storage output");
+      context.UnmapMemory(base, allocation_size);
+      context.GetCommandScheduler().Finish();
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "bounded indirect mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "bounded indirect allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckRenderExecutorColorMetadataClear() {
     constexpr const char *name = "RenderExecutorColorMetadataClear";
     constexpr uintptr_t base = 0x0000000204100000ull;
@@ -45669,6 +45779,11 @@ if (argc == 1) {
   if (argc == 2 && std::strcmp(argv[1], "--native-indirect-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckNativeIndirectDispatch();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--gpu-owned-bounded-indirect-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckGpuOwnedBoundedIndirectDispatch();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--layered-image-only") == 0) {

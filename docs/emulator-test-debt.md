@@ -363,6 +363,39 @@ launches until a bounded synthetic SPIR-V or emitter regression isolates the
 instruction pattern that triggers the crash. Keep shader validation and GPUAV
 controls to distinguish invalid SPIR-V from a driver defect.
 
+## GPU-produced indirect workgroup bounds for bounded SRT (2026-10-03)
+
+The bounded GPUAV run `_Build/runs/yotei-integrated-20261003-125433-presentfix-gpuav-sync`
+exited 321 after `shown=193`: compute shader `a2dfc83fbe2e55b8` uses a
+workgroup-indexed bounded SRT snapshot, while its indirect dispatch arguments
+are GPU-owned. The CPU copy can be stale, and `MaterializeResources` correctly
+rejects untrusted workgroup counts. The prior temporary Vertex cap was a
+diagnostic and is not a fix.
+
+The synthetic native `--gpu-owned-bounded-indirect-only` case now writes a
+`2×1×1` grid through the GPU while the CPU copy remains zero, then requests a
+shader whose scalar coefficient table is indexed by `WorkgroupId.x`. The
+final test was RED with only the production patch reversed: exit 321 on
+`bounded SRT requires coherent indirect workgroup counts`
+(`_Build/logs/gpu-owned-bounded-indirect-final-red-20261003.*`). It is GREEN
+with the production patch: the coherent CPU copy becomes `2×1×1` and the
+materializer/pipeline accepts the shader
+(`_Build/logs/gpu-owned-bounded-indirect-final-green-20261003.*`). The
+ordinary empty indirect control also passes
+(`_Build/logs/empty-indirect-after-coherent-grid-20261003.*`). The shared
+pipeline cache drains GPU-owned argument bytes only when the shader plan
+needs workgroup-indexed bounded SRT; a failed coherent read retains the
+materializer's fail-closed error.
+
+This regression proves host-side count coherence and shader admission, not
+GPU execution. Its tiny storage-output shader produced no numerical output
+even under a direct dispatch in diagnostic trials; those attempts are in
+`_Build/logs/gpu-owned-bounded-indirect-green5-20261003.*` and later logs.
+Required follow-up: an independent, numerically checked native GPU fixture
+with a working direct control; zero-axis, changed-grid and unreadable
+GPU-owned argument variations; then rerun the game. Do not report this
+shader as a successful rendered-output test.
+
 ## Zero-sized indirect compute dispatch (2026-10-02)
 
 The bounded GPUAV run

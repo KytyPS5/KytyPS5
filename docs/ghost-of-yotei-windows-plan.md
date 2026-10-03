@@ -1,5 +1,29 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **3 октября 2026 года, 14:32 UTC** (native Windows via WSL;
+branch `yotei-windows-bringup`, pushed head `c9fa8d6b` plus uncommitted
+indirect-grid fix and temporary Vertex loop cap; installed exe SHA-256
+`c82bf80df8ef6754eccaf33d63698c206e05ceb830ef293639e76967a46905a`):
+
+- Синтетический native RED/GREEN доказал, что GPU-owned indirect аргументы
+  надо сделать когерентными перед materialization shader с bounded SRT,
+  индексируемым номером workgroup. Поправка запрашивает readback только для
+  такого плана. Тест доказывает допуск shader и публикацию `2×1×1`, но его
+  численный GPU output пока не подтверждён. Логи и ограничение — в
+  `docs/emulator-test-debt.md`.
+- Два ограниченных GPUAV+instrumentation запуска после поправки:
+  `_Build/runs/yotei-integrated-20261003-134734-presentfix-gpuav-sync`
+  завершён по watchdog при `shown=151`, затем
+  `_Build/runs/yotei-integrated-20261003-141139-presentfix-gpuav-sync`
+  дошёл до `shown=195` и остановился на
+  `sampled HTile import requires its metadata-aware lookup path` в
+  `textureCache.cpp:1551`. Не доказано, что ранее падавший `a2df…`
+  выполнен; readback отключён, поэтому `shown` не подтверждает цветные
+  пиксели. Меню и gameplay **PENDING**.
+- Следующее: установить тип и геометрию HTile обращения, написать
+  синтетический RED, исправить общий путь с сохранением владения depth,
+  повторить игру. Убрать временный Vertex cap, собрать чистый executable.
+
 Checkpoint **3 октября 2026 года, 12:26 UTC** (native Windows via WSL;
 branch `yotei-windows-bringup`, parent commit `e39ddf90` plus uncommitted
 loop-emitter fix; installed exe remains temporary Vertex cap diagnostic SHA-256

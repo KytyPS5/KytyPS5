@@ -542,7 +542,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	     cs_regs.cs_regs.num_thread_z}, false);
 	const auto compute_program = m_context.GetPipelineCache().GetComputeProgram(
 	    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info, guest_groups,
-	    !args_gpu_owned);
+	    !args_gpu_owned, args_gpu_owned ? args_addr : 0);
 	if (!compute_program) {
 		// Temporary until RT is implemented.
 		return;

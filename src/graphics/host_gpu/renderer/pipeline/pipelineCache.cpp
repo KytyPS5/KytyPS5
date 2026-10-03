@@ -720,7 +720,7 @@ struct PipelineCache::ProgramCache {
 	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info,
 	                  uint32_t& push_data_cursor,
  std::optional<std::array<uint32_t, 3>> guest_workgroups = std::nullopt,
- bool compute_workgroups_trusted = true) {
+ bool compute_workgroups_trusted = true, uint64_t indirect_args_addr = 0) {
 		ShaderType stage;
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			stage = input_info.logical_stage;
@@ -784,7 +784,7 @@ struct PipelineCache::ProgramCache {
 		if (entry != programs.end() && entry->second.skip_dispatch) {
 			return {};
 		}
-		const ShaderRecompiler::IR::SrtRuntime       runtime {
+		ShaderRecompiler::IR::SrtRuntime       runtime {
 		    .user_data                  = user_data,
 		    .shader_base                = params.Base(),
 		    .read_memory                = ReadShaderBacking,
@@ -793,7 +793,22 @@ struct PipelineCache::ProgramCache {
 		    .compute_workgroups_trusted = compute_workgroups_trusted,
 		    .clamp_memory_range         = ClampShaderGuestMemory,
 		};
+		const auto refresh_indirect_grid = [&](const ShaderRecompiler::IR::ResourcePlan& plan) {
+			if (runtime.compute_workgroups_trusted || indirect_args_addr == 0 ||
+			    !std::ranges::any_of(plan.bounded_srt_reads, [](const auto& read) {
+				    return read.workgroup_axis != UINT32_MAX;
+			    })) {
+				return;
+			}
+			std::array<uint32_t, 3> groups {};
+			if (Libs::LibKernel::Memory::TryReadGpuCoherentBacking(
+			        indirect_args_addr, groups.data(), sizeof(groups))) {
+				runtime.compute_workgroups = groups;
+				runtime.compute_workgroups_trusted = true;
+			}
+		};
 		if (entry != programs.end()) {
+			refresh_indirect_grid(entry->second.resource_plan);
 			if (!ShaderRecompiler::IR::MaterializeResources(
 			        entry->second.resource_plan, runtime, entry->second.resources,
 			        entry->second.specialization)) {
@@ -943,6 +958,7 @@ struct PipelineCache::ProgramCache {
 		if (entry == programs.end()) {
 			entry = programs.try_emplace(lookup_key,
 			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program)).first;
+			refresh_indirect_grid(entry->second.resource_plan);
 			if (!ShaderRecompiler::IR::MaterializeResources(
 			        entry->second.resource_plan, runtime, entry->second.resources,
 			        entry->second.specialization)) {
@@ -1374,13 +1390,13 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
                                                const HW::ShaderRegisters&   sh,
                                                ShaderComputeInputInfo&      input_info,
  std::optional<std::array<uint32_t, 3>> guest_workgroups,
- bool compute_workgroups_trusted) {
+ bool compute_workgroups_trusted, uint64_t indirect_args_addr) {
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
 	const auto        params      = PrepareProgram(regs, sh, input_info);
 	Common::LockGuard lock(m_mutex);
 	uint32_t          push_data_cursor = 0;
 	return m_program_cache->Get(params, input_info, push_data_cursor, guest_workgroups,
-	                           compute_workgroups_trusted);
+	                           compute_workgroups_trusted, indirect_args_addr);
 }
 
 bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other) const noexcept {

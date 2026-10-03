@@ -481,13 +481,28 @@ Decoder::Program DecodeFusedProgram(std::span<const uint32_t> front, std::span<c
 	return result;
 }
 
+// An unresolvable call is a ray-tracing any-hit call: it accepts every hit (s16 = EXEC).
+void StubCall(Decoder::Program& program, uint32_t instruction) {
+	program.instructions[instruction].call_stub = true;
+}
+
 void PrepareCallTargets(ShaderSource& source, const CompileOptions& options) {
 	using namespace IR;
-	EXIT_NOT_IMPLEMENTED(options.stage != ShaderType::Compute);
 	for (uint32_t i = 0; i < source.decoded.instructions.size(); ++i) {
 		if (source.decoded.instructions[i].opcode != Decoder::Opcode::S_SWAPPC_B64) continue;
 		source.calls.push_back({.instruction = i});
 	}
+	const auto stub_all = [&] {
+		for (const auto& site: source.calls)
+			StubCall(source.decoded, site.instruction);
+		source.calls.clear();
+	};
+	// Only compute targets are re-executed on the host.
+	if (options.stage != ShaderType::Compute || options.input_info.compute == nullptr) {
+		stub_all();
+		return;
+	}
+	bool       failed = false;
 	const auto graph = CFG::BuildGraph(source.decoded);
 	Program query;
 	query.stage = options.stage;
@@ -521,11 +536,19 @@ void PrepareCallTargets(ShaderSource& source, const CompileOptions& options) {
 	Register = [&](uint32_t before, uint32_t code) -> Value {
 		std::vector<uint32_t> crossed_calls;
 		const auto index = CFG::FindScalarDefinition(source.decoded, graph, before, code, crossed_calls);
+		if (index == CFG::AmbiguousScalarDefinition) {
+			failed = true;
+			return Value(0u);
+		}
 		for (const auto crossed: crossed_calls) {
 			std::ranges::find(source.calls, crossed, &ShaderSource::Call::instruction)->preserved_registers.set(code);
 		}
 		if (index == UINT32_MAX) {
-			EXIT_IF(code < query.user_data_base || code - query.user_data_base >= query.user_data_count);
+			if (code < query.user_data_base ||
+			    code - query.user_data_base >= query.user_data_count) {
+				failed = true;
+				return Value(0u);
+			}
 			return IREmitter(&block).GetUserData(static_cast<ScalarReg>(code));
 		}
 		auto [entry, inserted] = producers.try_emplace(index);
@@ -553,27 +576,40 @@ void PrepareCallTargets(ShaderSource& source, const CompileOptions& options) {
 			block.Instructions().splice(block.end(), translated.Instructions());
 			producer.ready = true;
 		}
-		EXIT_IF(!producer.ready || !producer.values.contains(code));
+		if (!producer.ready || !producer.values.contains(code)) {
+			failed = true;
+			return Value(0u);
+		}
 		return producer.values.at(code).Resolve();
 	};
 	for (auto& site: source.calls) {
 		const auto& call = source.decoded.instructions[site.instruction];
-		EXIT_NOT_IMPLEMENTED(call.src0.kind != Decoder::OperandKind::Sgpr ||
-		                     call.dst.kind != Decoder::OperandKind::Sgpr ||
-		                     call.src0.reg != call.dst.reg || call.dst.reg >= 105u);
+		if (call.src0.kind != Decoder::OperandKind::Sgpr ||
+		    call.dst.kind != Decoder::OperandKind::Sgpr || call.src0.reg != call.dst.reg ||
+		    call.dst.reg >= 105u) {
+			StubCall(source.decoded, site.instruction);
+			continue;
+		}
 		for (uint32_t i = 0; i < 2u; ++i) {
 			const auto value = Register(site.instruction, call.src0.reg + i);
-			if (!ValidateRuntimeValue(query, value, RuntimeValueType::Integer)) {
-				EXIT_IF(value.Instruction()->GetOpcode() != ValueOpcode::ReadConstBuffer);
-				source.unsupported_call_pc = call.pc;
-				source.calls.clear();
+			// A producer the host could not build poisons every later query: stub them all.
+			if (failed) {
+				stub_all();
 				return;
+			}
+			if (!ValidateRuntimeValue(query, value, RuntimeValueType::Integer)) {
+				StubCall(source.decoded, site.instruction);
+				break;
 			}
 			auto& root = query.value_storage.emplace_back(ValueOpcode::ReferenceU32);
 			root.SetArg(0, value);
 			site.target[i] = Value(&root);
 		}
 	}
+	// Removed only now: a later site's register search records crossed calls by instruction.
+	std::erase_if(source.calls, [&](const ShaderSource::Call& site) {
+		return source.decoded.instructions[site.instruction].call_stub;
+	});
 	RewriteToSsa(query.blocks);
 	ConstantPropagationPass(query.blocks, query.wave_size);
 	RemoveIdentities(query);
@@ -607,31 +643,48 @@ ShaderSource PrepareShaderSource(std::span<const uint32_t> code, const CompileOp
 	}
 	if (source.decoded.has_swap_pc) {
 		PrepareCallTargets(source, options);
-		source.code.assign(code.begin(), code.end());
-		source.decoded.code = source.code;
+		if (!source.calls.empty()) {
+			source.code.assign(code.begin(), code.end());
+			source.decoded.code = source.code;
+		}
 	}
 	return source;
 }
 
 const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtRuntime& runtime) {
-	EXIT_IF(source.unsupported_call_pc != UINT32_MAX);
 	auto& reads = source.reads;
 	reads.clear();
+	// Every call site is an any-hit stub: nothing to link.
+	if (source.calls.empty()) return source.decoded;
 	IR::SrtReadCapture capture(runtime, reads);
 	const auto clean = IR::CleanRuntime(capture.ObservedRuntime());
 	IR::SrtWalker walker(source.call_targets, clean);
+	// An unlinkable call takes the any-hit stub; the next refresh tries to link it again.
+	const auto stubbed = [&]() -> const Decoder::Program& {
+		if (source.linked && source.linked->functions.empty()) return source.linked->decoded;
+		ShaderSource::Linked stub {.code = source.code, .decoded = source.decoded};
+		for (const auto& site: source.calls)
+			StubCall(stub.decoded, site.instruction);
+		source.linked               = std::move(stub);
+		source.linked->decoded.code = source.linked->code;
+		++source.revision;
+		return source.linked->decoded;
+	};
 	for (auto& site: source.calls) {
 		uint32_t low = 0, high = 0;
 		if (!walker.Evaluate(site.target[0], low) || !walker.Evaluate(site.target[1], high))
-			EXIT("shader call at pc 0x%08x has an unavailable scalar target",
-			     source.decoded.instructions[site.instruction].pc);
+			return stubbed();
 		// SWAPPC reads the old aliased pair and ignores the target's low two bits.
 		const auto address = ((uint64_t {high} << 32u) | low) & ~uint64_t {3};
-		EXIT_IF(address == 0u);
+		if (address == 0u) return stubbed();
 		site.address = address;
 	}
 	const auto query_reads = reads.size();
-	if (source.linked) {
+	const auto unlinked_leaf = [&]() -> const Decoder::Program& {
+		reads.resize(query_reads);
+		return stubbed();
+	};
+	if (source.linked && !source.linked->functions.empty()) {
 		auto& linked = *source.linked;
 		bool unchanged = true;
 		for (size_t i = 0; i < source.calls.size(); ++i) {
@@ -657,7 +710,7 @@ const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtR
 	}
 	ShaderSource::Linked linked {.code = source.code, .decoded = source.decoded};
 	const auto& last = source.decoded.instructions.back();
-	EXIT_NOT_IMPLEMENTED(last.opcode != Decoder::Opcode::S_ENDPGM);
+	if (last.opcode != Decoder::Opcode::S_ENDPGM) return unlinked_leaf();
 	// Keep the caller's data/footer at native offsets. Expand leaf CFGs per call site
 	// before SSA, so return edges neither require a dispatcher nor merge resource roots.
 	uint32_t function_pc = last.pc + last.word_count * sizeof(uint32_t);
@@ -678,7 +731,7 @@ const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtR
 				for (;;) {
 					if (!clean.read_memory(clean.userdata, address + uint64_t {index} * sizeof(uint32_t),
 					                       std::span(words).first(count)))
-						EXIT("shader call at pc 0x%08x cannot read leaf code", call.pc);
+						return unlinked_leaf();
 					inst = {};
 					Decoder::DecodeInstruction(words, 0u, inst);
 					if (inst.word_count <= count) break;
@@ -687,9 +740,10 @@ const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtR
 				inst.pc = index * sizeof(uint32_t);
 				if (Decoder::IsDirectBranch(inst.opcode)) inst.branch_target += inst.pc;
 				index += inst.word_count;
-				EXIT_NOT_IMPLEMENTED(inst.opcode == Decoder::Opcode::S_SWAPPC_B64 ||
-				                     inst.opcode == Decoder::Opcode::S_GETPC_B64 ||
-				                     inst.opcode == Decoder::Opcode::S_ENDPGM);
+				if (inst.opcode == Decoder::Opcode::S_SWAPPC_B64 ||
+				    inst.opcode == Decoder::Opcode::S_GETPC_B64 ||
+				    inst.opcode == Decoder::Opcode::S_ENDPGM)
+					return unlinked_leaf();
 				function.push_back(inst);
 				if (inst.opcode == Decoder::Opcode::S_SETPC_B64) break;
 			}
@@ -698,19 +752,21 @@ const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtR
 		EXIT_IF(function_pc > UINT32_MAX - function_size);
 		const auto function_offset = static_cast<uint32_t>(linked.code.size());
 		for (auto inst: function) {
-			EXIT_IF(CFG::MayWriteScalarRegister(inst, call.dst.reg) ||
-			        CFG::MayWriteScalarRegister(inst, call.dst.reg + 1u));
+			if (CFG::MayWriteScalarRegister(inst, call.dst.reg) ||
+			    CFG::MayWriteScalarRegister(inst, call.dst.reg + 1u))
+				return unlinked_leaf();
 			for (uint32_t code = 0; code < site.preserved_registers.size(); ++code) {
 				if (site.preserved_registers[code] && CFG::MayWriteScalarRegister(inst, code))
-					EXIT("shader call at pc 0x%08x clobbers scalar target dependency s%u", call.pc, code);
+					return unlinked_leaf();
 			}
 			linked.code.insert(linked.code.end(), inst.raw, inst.raw + inst.word_count);
 			if (inst.opcode == Decoder::Opcode::S_SETPC_B64) {
-				EXIT_NOT_IMPLEMENTED(inst.src0.kind != Decoder::OperandKind::Sgpr || inst.src0.reg != call.dst.reg);
+				if (inst.src0.kind != Decoder::OperandKind::Sgpr || inst.src0.reg != call.dst.reg)
+					return unlinked_leaf();
 				inst.opcode = Decoder::Opcode::S_BRANCH;
 				inst.branch_target = call.pc + call.word_count * sizeof(uint32_t);
 			} else if (Decoder::IsDirectBranch(inst.opcode)) {
-				EXIT_IF(inst.branch_target >= function_size);
+				if (inst.branch_target >= function_size) return unlinked_leaf();
 				inst.branch_target += function_pc;
 			}
 			inst.pc += function_pc;
@@ -742,10 +798,18 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 
 TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileOptions& options) {
 	EXIT_IF(decoded.instructions.empty());
+	bool linked_call = false;
 	if (decoded.has_swap_pc) {
 		for (const auto& inst: decoded.instructions) {
-			if (inst.opcode == Decoder::Opcode::S_SWAPPC_B64 && inst.branch_target == UINT32_MAX)
-				EXIT("shader call at pc 0x%08x must be linked before translation", inst.pc);
+			if (inst.opcode != Decoder::Opcode::S_SWAPPC_B64) continue;
+			if (inst.branch_target == UINT32_MAX && !inst.call_stub) {
+				TranslateResult refused;
+				refused.status.ok     = false;
+				refused.status.pc     = inst.pc;
+				refused.status.reason = "shader call must be linked before translation";
+				return refused;
+			}
+			linked_call |= inst.branch_target != UINT32_MAX;
 		}
 	}
 	if (options.stage != ShaderType::Compute && options.stage != ShaderType::Vertex &&
@@ -803,6 +867,16 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 		     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 		     static_cast<uint64_t>(selected_cfg->blocks.size()),
 		     static_cast<uint64_t>(selected_cfg->natural_loops.size()), phase_ms());
+		TranslateResult result;
+		result.status.ok     = false;
+		result.status.pc     = native_cfg.failure_pc;
+		result.status.reason = native_cfg.unsupported_reason;
+		if (options.dump_ir) {
+			result.decoded_dump = std::move(decoded_dump);
+			result.cfg_dump     = CFG::GraphToString(native_cfg);
+		}
+		return result;
+	}
 	}
 
 	const auto& cfg = *selected_cfg;
@@ -847,11 +921,17 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	}
 	// Cleanup also exposes profitable folds by removing dead predicate consumers.
 	simplify();
-	if (decoded.has_swap_pc) {
+	if (linked_call) {
 		// Leaf returns are resolved CFG edges; native PC values must not escape into GPU data.
-		for (const auto* block: ir.blocks)
-			for (const auto& inst: *block)
-				EXIT_NOT_IMPLEMENTED(inst.GetOpcode() == IR::ValueOpcode::GetShaderBase);
+		for (const auto* block: ir.blocks) {
+			for (const auto& inst: *block) {
+				if (inst.GetOpcode() != IR::ValueOpcode::GetShaderBase) continue;
+				TranslateResult refused;
+				refused.status.ok     = false;
+				refused.status.reason = "a linked call's native return PC reaches GPU data";
+				return refused;
+			}
+		}
 	}
 	LowerTessellationMemory(ir, options);
 	std::string cfg_dump;
@@ -864,6 +944,13 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	}
 	IR::TrackResources(ir, decoded, native_cfg, options.input_info);
 	TranslateResult result;
+	if (!tracking.ok) {
+		result.status.ok     = false;
+		result.status.pc     = tracking.pc;
+		result.status.reason = std::move(tracking.reason);
+		result.program       = std::move(ir);
+		return result;
+	}
 	result.program = std::move(ir);
 	if (options.dump_ir) {
 		result.decoded_dump = std::move(decoded_dump);
@@ -930,8 +1017,17 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram\n",
 	     GetDumpLabel(options), StageName(ir.stage), ir.shader_hash);
+	std::string refusal;
 	auto spirv = Spirv::EmitProgram(ir, options.input_info, push_data_start_dword, *options.profile,
-	                                options.emit_debug_info);
+	                                options.emit_debug_info, &refusal);
+	if (!refusal.empty()) {
+		CompileResult refused;
+		refused.status.ok     = false;
+		refused.status.pc     = 0;
+		refused.status.reason = std::move(refusal);
+		refused.program       = std::move(ir);
+		return refused;
+	}
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram words=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(ir.stage), ir.shader_hash,

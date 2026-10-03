@@ -134,6 +134,7 @@ struct Fixture {
 
   void PlanAndTrack() { PlanAndTrack({.compute = &compute_info}); }
 
+  // A guest shape tracking refuses reports a status; tests that expect a refusal see it as fatal.
   void PlanAndTrack(Libs::Graphics::ShaderStageInputInfo input) {
     for (size_t index = 0; index < program.blocks.size(); ++index) {
       const auto condition = program.blocks[index]->condition;

@@ -384,7 +384,7 @@ public:
 		m_shader_writes = HasShaderMemoryWrites(program);
 	}
 
-	void Run() {
+	ResourceTrackingStatus Run() {
 		if (m_program.resource_tracking_complete) {
 			Fail(0, "resources already tracked");
 		}
@@ -395,7 +395,7 @@ public:
 		PlanIndirectDescriptors();
 		for (auto* block: m_program.blocks) {
 			for (auto& inst: *block) {
-				Collect(inst);
+				if (!Collect(inst)) return m_status;
 			}
 		}
 		LinkImageAliases();
@@ -546,6 +546,7 @@ public:
 		m_program.descriptor_sources         = std::move(m_sources);
 		m_program.info                       = std::move(m_info);
 		m_program.resource_tracking_complete = true;
+		return m_status;
 	}
 
 private:
@@ -3732,28 +3733,26 @@ private:
 	               bool sample_adjust = false) {
 		handle = value.Resolve().TryInstruction();
 		if (handle == nullptr || handle->GetOpcode() != expected) {
-			Fail(pc, fmt::format("memory operation requires {}", ValueOpcodeName(expected)));
+			return Reject(pc,
+			              fmt::format("memory operation requires {}", ValueOpcodeName(expected)));
 		}
 		DescriptorSource descriptor;
 		MakeSource(*handle, width, sampler, sample_adjust, base_reg, descriptor, pc);
 		uint32_t bad_dword = 0;
 		if (!ValidateSource(descriptor, bad_dword)) {
+			// The caller decodes an all-DWORD buffer descriptor in the shader instead.
 			if (expected == ValueOpcode::GetBufferResource &&
 			    std::all_of(descriptor.dwords.begin(), descriptor.dwords.begin() + width,
 			                [](Value word) { return word.Resolve().GetType() == Type::U32; })) {
 				return false;
 			}
-			Fail(pc, fmt::format("{} dword {} is not a valid runtime value",
-			                     ValueOpcodeName(expected), bad_dword));
 		}
 		source = InternSource(descriptor);
 		return true;
 	}
 
-	void ValidateAddressHandle(Value value, uint32_t pc) const {
 		const auto* handle = value.Resolve().TryInstruction();
 		if (handle == nullptr || handle->GetOpcode() != ValueOpcode::GetAddressResource) {
-			Fail(pc, "address operation requires GetAddressResource");
 		}
 		if (handle->NumArgs() != 2) {
 			Fail(pc, "GetAddressResource must have two address dwords");
@@ -3886,20 +3885,21 @@ private:
 		m_info.sampled_pairs.push_back({image, sampler, pc});
 	}
 
-	void AddHandlePatch(Inst* handle, uint32_t resource, uint32_t pc) {
+	bool AddHandlePatch(Inst* handle, uint32_t resource, uint32_t pc) {
 		for (const auto& patch: m_handle_patches) {
 			if (patch.handle == handle) {
 				if (patch.resource != resource) {
-					Fail(pc, fmt::format("{} is reused with incompatible resource classes",
-					                     ValueOpcodeName(handle->GetOpcode())));
+					return Reject(pc, fmt::format("{} is reused with incompatible resource classes",
+					                              ValueOpcodeName(handle->GetOpcode())));
 				}
-				return;
+				return true;
 			}
 		}
 		m_handle_patches.push_back({handle, resource});
+		return true;
 	}
 
-	void AddMemoryPatch(uint32_t index, uint32_t resource, uint32_t sampler, bool has_sampler,
+	bool AddMemoryPatch(uint32_t index, uint32_t resource, uint32_t sampler, bool has_sampler,
 	                    uint32_t pc) {
 		for (auto& patch: m_memory_patches) {
 			if (patch.index != index) {
@@ -3907,29 +3907,31 @@ private:
 			}
 			if (patch.resource != resource ||
 			    (has_sampler && patch.has_sampler && patch.sampler != sampler)) {
-				Fail(pc, "memory metadata is reused with incompatible resources");
+				return Reject(pc, "memory metadata is reused with incompatible resources");
 			}
 			if (has_sampler) {
 				patch.sampler     = sampler;
 				patch.has_sampler = true;
 			}
-			return;
+			return true;
 		}
 		m_memory_patches.push_back({index, resource, sampler, has_sampler});
+		return true;
 	}
 
-	void Collect(Inst& inst) {
+
+	bool Collect(Inst& inst) {
 		const auto op           = inst.GetOpcode();
 		if (op == ValueOpcode::BvhIntersect) {
 			m_info.uses_dma = true;
-			return;
+			return true;
 		}
 		const auto buffer       = BufferAccessOf(op);
 		const auto address_info = AddressOpcodeInfoOf(op);
 		const auto image_info   = ImageOpcodeInfoOf(op);
 		if (buffer == BufferAccess::None && address_info.access == AddressAccess::None &&
 		    image_info.access == ImageAccess::None) {
-			return;
+			return true;
 		}
 		const auto flags = inst.Flags<MemoryFlags>();
 		if (flags.index >= m_program.memory_info.size()) {
@@ -3940,7 +3942,7 @@ private:
 		}
 		const auto& memory = m_program.memory_info[flags.index];
 		if (memory.planning_only || IsIndirectPlanningMemory(flags.index)) {
-			return;
+			return true;
 		}
 		Inst*    handle   = nullptr;
 		uint32_t source   = 0;
@@ -3962,28 +3964,28 @@ private:
 				}
 				m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
 				m_info.uses_dma                         = true;
-				return;
 			}
 			resource = AddBuffer(source, memory, inst, flags.pc);
 			if (resource == UINT32_MAX) {
-				Fail(flags.pc, "buffer resource limit exceeded");
+				return Reject(flags.pc, "buffer resource limit exceeded");
 			}
-			AddHandlePatch(handle, resource, flags.pc);
-			AddMemoryPatch(flags.index, resource, 0, false, flags.pc);
-			return;
+			return AddHandlePatch(handle, resource, flags.pc) &&
+			       AddMemoryPatch(flags.index, resource, 0, false, flags.pc);
 		}
 		if (address_info.access != AddressAccess::None) {
 			if (!IsAddressResourceKind(memory.kind)) {
-				Fail(flags.pc, "address operation has invalid resource kind");
+				return Reject(flags.pc, "address operation has invalid resource kind");
 			}
 			if (memory.kind == ResourceKind::Flat && memory.address_is_full &&
 			    IsNoncanonicalFlatAddress(inst.Arg(2), inst.Arg(inst.NumArgs() - 1))) {
-				ValidateAddressHandle(inst.Arg(0), flags.pc);
+				if (!ValidateAddressHandle(inst.Arg(0), flags.pc)) return false;
 				if (memory.data_bits != 32u || m_program.scratch_dwords == 0) {
-					Fail(flags.pc, "local FLAT access requires DWORD data and per-thread scratch storage");
+					return Reject(
+					    flags.pc,
+					    "local FLAT access requires DWORD data and per-thread scratch storage");
 				}
 				m_program.memory_info[flags.index].kind = ResourceKind::FlatLocal;
-				return;
+				return true;
 			}
 			if (memory.kind == ResourceKind::Scratch) {
 				handle = inst.Arg(0).Resolve().TryInstruction();
@@ -3992,35 +3994,36 @@ private:
 					Fail(flags.pc, "scratch operation requires GetScratchResource");
 				}
 				if (m_program.scratch_dwords == 0) {
-					Fail(flags.pc, "scratch operation requires a nonzero AGC per-thread size");
+					return Reject(flags.pc,
+					              "scratch operation requires a nonzero AGC per-thread size");
 				}
-				return;
+				return true;
 			}
-			ValidateAddressHandle(inst.Arg(0), flags.pc);
+			if (!ValidateAddressHandle(inst.Arg(0), flags.pc)) return false;
 			if (address_info.access == AddressAccess::Write) {
 				m_program.has_address_writes = true;
 			}
 			m_info.uses_dma = true;
-			return;
+			return true;
 		}
 
 		if (memory.kind != ResourceKind::Image ||
 		    image_info.resource_class == ImageResourceClass::None) {
-			Fail(flags.pc, "image operation has invalid resource kind");
+			return Reject(flags.pc, "image operation has invalid resource kind");
 		}
 		handle               = inst.Arg(0).Resolve().TryInstruction();
 		const auto* indirect = handle != nullptr ? FindIndirectDescriptor(*handle) : nullptr;
 		if (indirect != nullptr) {
 			source = indirect->source;
-		} else {
-			GetHandle(inst.Arg(0), ValueOpcode::GetImageResource, 8, flags.pc,
-			          memory.resource * 4u, handle, source);
+		} else if (!GetHandle(inst.Arg(0), ValueOpcode::GetImageResource, 8, flags.pc,
+		                      memory.resource * 4u, handle, source)) {
+			return false;
 		}
 		resource = AddImage(source, memory, op, flags.pc);
 		if (resource == UINT32_MAX) {
-			Fail(flags.pc, "image resource limit exceeded");
+			return Reject(flags.pc, "image resource limit exceeded");
 		}
-		AddHandlePatch(handle, resource, flags.pc);
+		if (!AddHandlePatch(handle, resource, flags.pc)) return false;
 		uint32_t sampler = 0;
 		if (image_info.needs_sampler) {
 			if (inst.NumArgs() < 2) {
@@ -4035,21 +4038,19 @@ private:
 			    ? FindIndirectDescriptor(*sampler_handle) : nullptr;
 			if (selected_sampler != nullptr) {
 				sampler_source = selected_sampler->source;
-			} else {
-				GetHandle(inst.Arg(1), ValueOpcode::GetSamplerResource, 4, flags.pc,
-				          memory.sampler * 4u, sampler_handle, sampler_source, true, sample_adjust);
+				return false;
 			}
 			sampler = AddSampler(sampler_source, flags.pc);
 			if (sampler == UINT32_MAX) {
-				Fail(flags.pc, "sampler resource limit exceeded");
+				return Reject(flags.pc, "sampler resource limit exceeded");
 			}
 			m_info.samplers[sampler].gather_lod |=
 			    op == ValueOpcode::ImageGatherRaw &&
 			    (memory.image_sample_flags & Decoder::ImageSampleFlagLod) != 0u;
-			AddHandlePatch(sampler_handle, sampler, flags.pc);
+			if (!AddHandlePatch(sampler_handle, sampler, flags.pc)) return false;
 			AddSampledPair(resource, sampler, flags.pc);
 		}
-		AddMemoryPatch(flags.index, resource, sampler, image_info.needs_sampler, flags.pc);
+		return AddMemoryPatch(flags.index, resource, sampler, image_info.needs_sampler, flags.pc);
 	}
 
 	const DescriptorSource* Source(uint32_t source) const {
@@ -4097,6 +4098,7 @@ private:
 	std::vector<IndirectDescriptorPlan>             m_indirect_descriptors;
 	std::map<const Inst*, Value>              m_descriptor_values;
 	bool                                       m_shader_writes = false;
+	mutable ResourceTrackingStatus                  m_status;
 };
 
 UniformFillPlan RecognizePatternFill(Program& program, const Decoder::Program& decoded,
@@ -4160,10 +4162,11 @@ UniformFillPlan RecognizePatternFill(Program& program, const Decoder::Program& d
 
 } // namespace
 
-void TrackResources(Program& program, const Decoder::Program& decoded, const CFG::Graph& native_cfg,
-                    ShaderStageInputInfo input) {
-	Tracker(program, decoded, native_cfg, input).Run();
-	program.uniform_fill = RecognizePatternFill(program, decoded, input);
+ResourceTrackingStatus TrackResources(Program& program, const Decoder::Program& decoded,
+                                      const CFG::Graph& native_cfg, ShaderStageInputInfo input) {
+	auto status = Tracker(program, decoded, native_cfg, input).Run();
+	if (status.ok) program.uniform_fill = RecognizePatternFill(program, decoded, input);
+	return status;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

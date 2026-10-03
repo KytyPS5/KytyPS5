@@ -33,6 +33,7 @@
 #include <span>
 #include <spirv-tools/libspirv.hpp>
 #include <string_view>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <xxhash.h>
@@ -228,6 +229,7 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		ShaderRecompiler::IR::CompiledShaderInfo     program;
 		ShaderProgram                                handle;
+		std::string                                  reason;
 	};
 
 	struct SourceEntry {
@@ -278,6 +280,37 @@ struct PipelineCache::ProgramCache {
 		bool                                       skip_dispatch = false;
 	};
 
+	static const char* StageShortName(ShaderType stage) {
+		switch (stage) {
+			case ShaderType::Vertex: return "vs";
+			case ShaderType::Mesh: return "ms";
+			case ShaderType::Pixel: return "ps";
+			case ShaderType::Compute: return "cs";
+			case ShaderType::Local: return "ls";
+			case ShaderType::TessellationControl: return "hs";
+			case ShaderType::TessellationEvaluation: return "ds";
+			default: return "unknown";
+		}
+	}
+
+	void Skip(const ProgramKey& key, ShaderType stage, uint64_t hash, uint32_t pc,
+			return;
+		}
+		PipelineCacheLog("!!! SHADER SKIP !!! shader=0x{:016x} stage={} pc=0x{:08x} reason={}; its "
+		                 "draws and dispatches are dropped, rendering is incomplete",
+		                 hash, StageShortName(stage), pc,
+		                 reason.empty() ? std::string_view {"no recorded reason"} : reason);
+	}
+
+	void ReportStubbed(ShaderType stage, uint64_t hash) {
+		if (!stubbed_shaders.insert(hash).second) {
+			return;
+		}
+		PipelineCacheLog("hardware ray tracing stubbed to a permanent miss: hash=0x{:016x} "
+		                 "stage={}",
+		                 hash, StageShortName(stage));
+	}
+
 	struct ProgramKeyHash {
 		std::size_t operator()(const ProgramKey& key) const {
 			std::size_t hash = static_cast<std::size_t>(key.stage);
@@ -307,6 +340,12 @@ struct PipelineCache::ProgramCache {
 		                                         Common::DebugCounters::Peak::ShaderCompileNs);
 		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 		                                               specialization, push_data_start_dword);
+		if (!result.status.ok) {
+			Permutation rejected;
+			rejected.specialization = std::move(specialization);
+			rejected.reason         = std::move(result.status.reason);
+			return rejected;
+		}
 		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv,
 		                         options.profile->maintenance8)) {
 			DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
@@ -363,12 +402,10 @@ struct PipelineCache::ProgramCache {
 		if (entry != programs.end()) {
 			auto& cached = entry->second;
 			if (cached.skip_dispatch) return {};
-			Permutation* permutation = nullptr;
 			if (cached.call_source) {
 				source_changed = cached.RefreshCallSource(runtime);
-				if (!source_changed) permutation = cached.FindPermutation<true>(runtime, push_data_cursor);
 			} else {
-				permutation = cached.FindPermutation<false>(runtime, push_data_cursor);
+			}
 			}
 			if (permutation != nullptr) {
 				input_info.stage = {.program = &permutation->program, .resources = &entry->second.resources};
@@ -421,7 +458,6 @@ struct PipelineCache::ProgramCache {
 		}
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code);
 		ShaderRecompiler::ShaderSource source;
-		if (entry == programs.end()) source = ShaderRecompiler::PrepareShaderSource(params.code, options);
 		if (source.unsupported_call_pc != UINT32_MAX) {
 			PipelineCacheLog("!!! TEMPORARY COMPUTE DISPATCH SKIP !!! shader=0x{:016x} pc=0x{:08x} "
 			                 "reason=unsupported GPU-selected callable target; rendering is incomplete",
@@ -435,7 +471,6 @@ struct PipelineCache::ProgramCache {
 		if (current != nullptr) {
 			if (!current->calls.empty()) {
 				if (entry == programs.end()) ShaderRecompiler::RefreshShaderSource(*current, runtime);
-				translated = ShaderRecompiler::TranslateProgram(current->linked->decoded, options);
 				translated.program.source_reads = current->reads;
 			} else {
 				translated = ShaderRecompiler::TranslateProgram(current->decoded, options);
@@ -443,25 +478,33 @@ struct PipelineCache::ProgramCache {
 		} else {
 			translated = ShaderRecompiler::TranslateProgram(params.code, options);
 		}
+		if (!translated.status.ok) {
+			refuse(translated.status.pc, translated.status.reason);
+			return {};
+		}
+		if (translated.program.uses_bvh_intersect_stub) {
+			ReportStubbed(stage, params.hash);
+		}
 		if (entry == programs.end()) {
 			auto retained = !source.calls.empty() ? std::make_unique<ShaderRecompiler::ShaderSource>(std::move(source)) : nullptr;
 			entry = programs.try_emplace(lookup_key,
 			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program), std::move(retained)).first;
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    entry->second.resource_plan, runtime, entry->second.resources,
-			    entry->second.specialization));
+			if (!entry->second.Materialize(runtime, refused)) {
 		} else if (source_changed) {
 			entry->second.resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
-			if (const auto* permutation = entry->second.FindPermutation<true>(runtime, push_data_cursor)) {
 				input_info.stage = {.program = &permutation->program, .resources = &entry->second.resources};
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
 				return permutation->handle;
 			}
 		}
 		entry->second.permutations.push_back(CompilePermutation(
-		    stage_name, options, std::move(translated), entry->second.specialization, push_data_cursor,
 		    entry->second.FunctionCode()));
 		const auto& permutation = entry->second.permutations.back();
+		if (!entry->second.permutations.back().handle) {
+			const auto reason = std::move(entry->second.permutations.back().reason);
+			entry->second.permutations.pop_back();
+			return {};
+		}
 		input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
 
@@ -501,6 +544,7 @@ struct PipelineCache::ProgramCache {
 	}
 
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
+	std::unordered_set<uint64_t>                                stubbed_shaders;
 	ProgramKey                                                  lookup_key;
 	GraphicContext&                                             graphics;
 	ShaderRecompiler::IR::ImageHeapSource*                      image_heap;
@@ -719,8 +763,16 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		    mesh.max_vertices > limits.maxMeshOutputVertices ||
 		    mesh.max_primitives > limits.maxMeshOutputPrimitives ||
 		    mesh.lds_size_dwords * sizeof(uint32_t) > limits.maxMeshSharedMemorySize) {
-			EXIT("mesh shader exceeds host limits: threads=%u vertices=%u primitives=%u LDS=%u\n",
-			     host_threads, mesh.max_vertices, mesh.max_primitives, mesh.lds_size_dwords);
+			static std::mutex                   mutex;
+			static std::unordered_set<uint64_t> reported;
+			const std::lock_guard<std::mutex>   lock(mutex);
+			if (reported.insert(vertex_params[0].hash).second) {
+				PipelineCacheLog("mesh shader exceeds host limits, skipping draws: hash=0x{:016x} "
+				                 "threads={} vertices={} primitives={} LDS={}",
+				                 vertex_params[0].hash, host_threads, mesh.max_vertices,
+				                 mesh.max_primitives, mesh.lds_size_dwords);
+			}
+			return {};
 		}
 	}
 	ShaderParams pixel_params;
@@ -819,6 +871,9 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	GraphicsPrograms  result;
 	if (pixel_active) {
 		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
+		if (!result.pixel) {
+			return {};
+		}
 	}
 	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
 		result.vertex[i] = m_program_cache->Get(vertex_params[i], vertex_info[i], push_data_cursor);

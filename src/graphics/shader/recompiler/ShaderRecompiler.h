@@ -29,12 +29,18 @@ struct CompileOptions {
 	std::span<const uint32_t>   user_data;
 	std::span<const uint32_t>   back_code;
 	ShaderStageInputInfo        input_info;
+// A guest shader the recompiler refuses; the caller drops its draws.
+struct RecompileStatus {
+	bool        ok = true;
+	uint32_t    pc = 0;
+	std::string reason;
 };
 
 struct TranslateResult {
 	IR::Program program;
 	std::string decoded_dump;
 	std::string cfg_dump;
+	RecompileStatus status;
 };
 
 struct CompileResult {
@@ -42,6 +48,7 @@ struct CompileResult {
 	std::string            decoded_dump;
 	std::string            ir_dump;
 	IR::Program            program;
+	RecompileStatus        status;
 };
 
 // Decoded source and typed scalar call queries are retained once per cache source.

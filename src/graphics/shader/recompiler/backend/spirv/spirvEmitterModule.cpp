@@ -703,7 +703,9 @@ void DefineOutputs(EmitterState& state) {
 				const bool dual_source = binding.kind == IR::StageOutputKind::Mrt &&
 				                         state.program.stage == ShaderType::Pixel &&
 				                         state.input_info.pixel->dual_source_blending;
-				EXIT_NOT_IMPLEMENTED(dual_source && binding.index > 1);
+				if (dual_source && binding.index > 1) {
+					state.Refuse("dual-source blending with an export past MRT1");
+				}
 				state.builder.AddAnnotation(spv::OpDecorate, binding.variable_id,
 				                            spv::DecorationLocation,
 				                            dual_source ? 0u : binding.location);
@@ -725,6 +727,9 @@ void DefineModule(EmitterState& state) {
 	DefineInputs(state);
 	DefineOutputs(state);
 	DefineTessellationInterfaces(state);
+	if (state.Refused()) {
+		return;
+	}
 	DefineDescriptors(state);
 	if (state.program.info.function_lds) {
 		state.lds_variable = state.builder.AllocateId();
@@ -838,8 +843,10 @@ void DefineModule(EmitterState& state) {
 	state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeSignedZeroInfNanPreserve,
 	                               32u);
 	if (state.program.info.float64) {
-		EXIT_NOT_IMPLEMENTED(state.program.stage == ShaderType::Compute &&
-		                     state.input_info.compute->float_mode != 0xc0);
+		if (state.program.stage == ShaderType::Compute &&
+		    state.input_info.compute->float_mode != 0xc0) {
+			state.Refuse("FP64 compute requires float mode 0xc0");
+		}
 		// Use native rounding for MODE=0xc0, consistent with ordinary FP32 arithmetic.
 		state.builder.RequireCapability(spv::CapabilityFloat64);
 		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeSignedZeroInfNanPreserve,

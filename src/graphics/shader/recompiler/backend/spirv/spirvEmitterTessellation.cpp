@@ -28,10 +28,9 @@ uint32_t TessellationPointer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	    IsTessellationInput(kind) ? spv::StorageClassInput : spv::StorageClassOutput;
 	const auto pointer = state.builder.AllocateId();
 	if (kind == Attribute::Factor) {
-		EXIT_NOT_IMPLEMENTED(!inst.Arg(1).IsImmediate());
 		const auto index = inst.Arg(1).U32() / 4u;
 		const auto outer = index < 3u;
-		EXIT_NOT_IMPLEMENTED(index >= 4u);
+		}
 		state.builder.AddFunction(spv::OpAccessChain, TypePointer(state, storage, TypeF32(state)),
 		                          pointer, outer ? variable : state.tess_inner_variable,
 		                          ConstantU32(state, outer ? index : index - 3u));
@@ -128,10 +127,7 @@ void DefineTessellationInterfaces(EmitterState& state) {
 
 void DefineTessellationExecutionModes(EmitterState& state) {
 	const auto& tess = state.input_info.vertex->tess;
-	// CxVgtTfParam: triangles, integer or fractional-odd partitioning, clockwise output.
-	EXIT_NOT_IMPLEMENTED(tess.domain != 1u ||
-	                     (tess.partitioning != 0u && tess.partitioning != 2u) ||
-	                     tess.output_topology != 2u);
+	}
 	state.builder.RequireCapability(spv::CapabilityTessellation);
 	if (state.program.stage == ShaderType::TessellationControl) {
 		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeOutputVertices,

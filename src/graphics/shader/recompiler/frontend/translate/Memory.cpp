@@ -254,6 +254,7 @@ Decoder::Operand MemorySourceAt(const Decoder::Instruction& decoded, uint32_t in
 			case Decoder::Opcode::DS_WRITE2ST64_B32:
 			case Decoder::Opcode::DS_WRITE2_B64:
 			case Decoder::Opcode::DS_WRITE2ST64_B64:
+			case Decoder::Opcode::DS_MSKOR_B32:
 				return index == 0u ? decoded.src1 : index == 1u ? decoded.src0 : decoded.src2;
 			default: return decoded.src0;
 		}

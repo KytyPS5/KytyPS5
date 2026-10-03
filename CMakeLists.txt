@@ -712,8 +712,9 @@ if(APPLE AND (CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64" OR
 	add_executable(macos_sse4a_tests EXCLUDE_FROM_ALL
 		"${KYTY_TESTS_DIR}/macosSse4aTests.cpp"
 		"${KYTY_SOURCE_DIR}/loader/x64InstructionEmulator.cpp"
+		"${KYTY_SOURCE_DIR}/loader/guestInstructionPatcher.cpp"
 	)
-	target_link_libraries(macos_sse4a_tests common fmt::fmt Zydis::Zydis)
+	target_link_libraries(macos_sse4a_tests common fmt::fmt Zydis::Zydis xbyak::xbyak)
 	target_include_directories(macos_sse4a_tests PRIVATE ${inc_headers})
 	if(BUILD_TESTING)
 		add_test(NAME macos_sse4a COMMAND $<TARGET_FILE:macos_sse4a_tests>)

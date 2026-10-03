@@ -1,5 +1,28 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **3 октября 2026 года, 10:58 UTC** (native Windows via WSL;
+branch `yotei-windows-bringup`, pushed head `4b4abc7b`; installed emulator
+exe SHA-256 `be1dbd195b9b9a0ca6454ac2ed77835cd7a08442c27903cb90549a9559cb3623`):
+
+- Внешний ограниченный Vulkan-пробник с layout сохранённого CS
+  `b90e2024732c6111` повторил `0x80000003` при
+  `vkCreateComputePipelines`, без исполнения игры и команд GPU. Исходный
+  SPIR-V проходит `spirv-val`. Пробник с `DISABLE_OPTIMIZATION`, SPIR-V `-O`
+  и несколько эквивалентных перестроений BDA-загрузки также падают.
+  Диагностическое удаление одной BDA-загрузки снимает сбой, но удаление
+  всех вызовов BDA-helper вместе с самой функцией — нет; первопричина
+  не локализована. Подробности и артефакты в `docs/emulator-test-debt.md`.
+- Ранее сохранённый VS `e3125617f3efc38f` имеет wave64 ballot/shuffle
+  внутри loop; на native subgroup32 эмиттер зеркалит нижнее 32-битное
+  ballot-слово в верхнее. Это существующая частичная модель, а не
+  доказанная эквивалентность 64 lane. Нового GPU запуска не было:
+  прежние bounded GPUAV+instrumentation пробы уже дважды дали DeviceLost
+  на draw с 119856 индексами, а синтетический RED причины не получен.
+  Следующее: независимый синтетический compiler/guest-semantics RED и
+  общий корректный путь для native32 graphics wave64; только затем
+  повторить игру. Первый ненулевой кадр остаётся прежним спиннером;
+  меню и gameplay **PENDING**.
+
 Checkpoint **3 октября 2026 года, 10:33 UTC** (native Windows via WSL;
 branch `yotei-windows-bringup`; installed emulator exe SHA-256
 `be1dbd195b9b9a0ca6454ac2ed77835cd7a08442c27903cb90549a9559cb3623`):

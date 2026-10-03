@@ -299,6 +299,37 @@ with GPUAV shader instrumentation disabled stopped again at `shown=0`,
 flag correction does not address the game compiler crash. Do not repeat this
 mode without a separate compiler/layout reproducer or a relevant shader fix.
 
+Isolated compiler reproduction on 2026-10-03: the saved, validator-clean
+39173-word module from `_Build/runs/yotei-integrated-20261003-090128-presentprobe-gpuav`
+also exits `0x80000003` in a bounded native Vulkan probe using the module's
+seven descriptor bindings (including array counts), one push-descriptor set,
+and 128-byte compute push-constant range. The disposable probe source and
+binary are `_Build/analysis/vk_spv_probe-layout-20261003.cpp` and
+`_Build/windows/vk_spv_probe_layout.exe` (SHA-256
+`36563888bd5b96eddd335c37d0dee8532523c2c0bdfb03a10ccde92b6b685c85`).
+Probe build used a temporary CMake target and `_Build/windows-local.cmd`;
+the temporary CMake change was removed. Logs:
+`_Build/logs/vk-spv-b90e-layout-probe-20261003.txt*` and
+`vk-spv-b90e-layout-noopt-20261003.txt*`. Disabling driver pipeline
+optimization still crashes. The probe does not model all production device
+state, but it reproduces the same pipeline creation boundary without game
+execution, command submission or a GPU watchdog.
+
+Diagnostic copies under `_Build/analysis/b90e-layout-20261003` all pass
+`spirv-val --target-env vulkan1.3`. Replacing all storage-buffer loads, or
+just the first load from `bda_pagetable` in `get_bda_pointer`, with `OpUndef`
+allows pipeline creation. That is **not** a valid fix: it removes guest
+address translation. Replacing all calls to that helper and eliminating the
+unused helper still crashes; therefore the individual load is not an
+established unique cause. `Volatile`, explicit alignment, `OpAtomicLoad`,
+two 32-bit components, constant page index, select instead of return Phi,
+SPIR-V `-O`, and exhaustive inlining leave the compiler crash intact.
+Artifacts are `vk-spv-b90e-*-20261003.txt*`; no transformed SPIR-V was
+installed in the emulator. Before a production change, build a public
+synthetic module with the relevant storage-buffer/BDA and control-flow
+shape that reproduces the compiler fault or an independently wrong guest
+result, then prove RED/GREEN without zeroing memory or suppressing the fault.
+
 New bounded retry on 2026-10-03 with GPUAV enabled but shader
 instrumentation disabled used installed emulator exe SHA-256
 `5251cfc12f986dda2e9b3c8c761e0e80b5fe0545493dcc210cad803c2da406da`.
@@ -1434,6 +1465,17 @@ SyncDiag + GPUAV8: DeviceLost on first draw using VS `0xe3125617f3efc38f`
 SpecializationCompile: `images=251 sampled_pairs=250`,
 `indirect_search_iterations=9`. Neighboring VS specialize with `images=0`.
 Prior same-PS draws with ES `0x803fba0000` complete. Menu blocked here.
+
+Read-only SPIR-V inspection on 2026-10-03: the VS loop selects a lane from
+two 32-bit masks, normalizes the guest target to native 0..31, shuffles,
+then uses `OpGroupNonUniformBallot` whose lower 32-bit word is duplicated
+into both guest words. The duplicated words clear both loop masks. This is
+the documented partial native32 graphics wave64 model; static inspection
+does not prove the loop hangs in the observed draw. The existing 256-iteration
+diagnostic budget applies to Pixel only, not Vertex. Before attributing
+DeviceLost to this loop, add a bounded synthetic Vertex case with
+independently expected high/low masks and a completion signal. A silent
+vertex-loop cap would discard guest work and cannot be shipped as a fix.
 
 Contract: preserve candidate selection and valid Vulkan SPIR-V. Opaque
 `OpSampledImage` values cannot be merged by `OpPhi` or consumed across blocks.

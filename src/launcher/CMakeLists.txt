@@ -197,3 +197,35 @@ list(APPEND inc_headers
 include_what_you_use_with_mappings(launcher "${inc_headers}" "${iwyu_maps}")
 
 clang_tidy_check(launcher "" "${tidy_dirs}" "${inc_headers}")
+
+if(BUILD_TESTING AND KYTY_BUILD_PKG_HELPER)
+    add_executable(pkg_discovery_tests EXCLUDE_FROM_ALL
+        "${PROJECT_SOURCE_DIR}/tools/pkg/tests/DiscoveryTests.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/gameDiscovery.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/gameContent.cpp")
+    target_include_directories(pkg_discovery_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    target_link_libraries(pkg_discovery_tests PRIVATE common Qt6::Core)
+    add_executable(pkg_bridge_tests EXCLUDE_FROM_ALL
+        "${PROJECT_SOURCE_DIR}/tools/pkg/tests/BridgeProbe.cpp")
+    target_link_libraries(pkg_bridge_tests PRIVATE common)
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    add_test(NAME pkg_discovery COMMAND "${Python3_EXECUTABLE}"
+        "${PROJECT_SOURCE_DIR}/tools/pkg/tests/run_test.py" $<TARGET_FILE:pkg_discovery_tests>)
+    add_test(NAME pkg_bridge COMMAND "${Python3_EXECUTABLE}"
+        "${PROJECT_SOURCE_DIR}/tools/pkg/tests/run_test.py" $<TARGET_FILE:pkg_bridge_tests> --bridge)
+endif()
+
+if(BUILD_TESTING)
+    # Includes the private transport implementation; do not also link common.
+    add_executable(pkg_startup_tests EXCLUDE_FROM_ALL
+        "${PROJECT_SOURCE_DIR}/tools/pkg/tests/StartupTests.cpp")
+    target_include_directories(pkg_startup_tests PRIVATE "${KYTY_SOURCE_DIR}" "${PROJECT_BINARY_DIR}")
+    if(NOT WIN32)
+        find_package(Threads REQUIRED)
+        target_link_libraries(pkg_startup_tests PRIVATE Threads::Threads)
+    endif()
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    add_test(NAME pkg_startup COMMAND "${Python3_EXECUTABLE}"
+        "${PROJECT_SOURCE_DIR}/tools/pkg/tests/run_startup_test.py" $<TARGET_FILE:pkg_startup_tests>)
+    set_tests_properties(pkg_startup PROPERTIES TIMEOUT 40)
+endif()

@@ -1,5 +1,7 @@
 #include "common/archive.h"
 
+#include "common/archiveReader.h"
+#include "common/pkgArchive.h"
 #include "common/stringUtils.h"
 
 #include <algorithm>
@@ -21,22 +23,6 @@
 #endif
 
 namespace Common {
-
-// Backends expose immutable metadata and offset-based reads. Cursor management, path routing,
-// reader lifetime and the host-stack worker are shared by every archive format.
-class ArchiveReader {
-public:
-	struct Entry {
-		uint64_t id;
-		uint64_t size;
-		bool     is_file;
-	};
-
-	virtual ~ArchiveReader()                                                       = default;
-	virtual std::optional<Entry>        Find(std::string_view member)              = 0;
-	virtual std::vector<File::DirEntry> List(std::string_view member)              = 0;
-	virtual uint64_t Read(uint64_t id, uint64_t offset, uint32_t size, void* data) = 0;
-};
 
 namespace {
 
@@ -92,8 +78,9 @@ struct ArchiveFormat {
 	std::shared_ptr<ArchiveReader> (*open)(const std::filesystem::path&);
 };
 
-constexpr ArchiveFormat Formats[] = {{".zar", OpenZArchive}};
-using NativeView                  = std::basic_string_view<std::filesystem::path::value_type>;
+constexpr ArchiveFormat Formats[] = {
+    {".zar", OpenZArchive}, {".pkg", OpenPkgArchive}, {".fpkg", OpenPkgArchive}};
+using NativeView = std::basic_string_view<std::filesystem::path::value_type>;
 
 const ArchiveFormat* FindFormat(NativeView path) {
 	for (const auto& format: Formats) {
@@ -141,7 +128,8 @@ std::optional<ParsedPath> ParsePath(const std::filesystem::path& path) {
 	while (!remaining.empty()) {
 		const auto separator = remaining.find('/');
 		const auto component = remaining.substr(0, separator);
-		remaining.remove_prefix(separator == std::string_view::npos ? remaining.size() : separator + 1);
+		remaining.remove_prefix(separator == std::string_view::npos ? remaining.size()
+		                                                            : separator + 1);
 		if (component.empty() || component == ".") {
 			continue;
 		}
@@ -322,6 +310,11 @@ std::filesystem::path GetArchiveHostPath(const std::filesystem::path& path) {
 	                                  : std::filesystem::path(path.native().substr(0, marker));
 }
 
+void InvalidateArchiveCache() {
+	std::lock_guard lock(g_readers_mutex);
+	g_readers.clear();
+}
+
 std::shared_ptr<ArchiveReader> OpenArchive(const std::filesystem::path& path) {
 	const auto  archive = IsArchivePath(path) ? GetArchiveHostPath(path) : path;
 	const auto* format  = FindFormat(archive.native());
@@ -388,9 +381,9 @@ std::unique_ptr<ArchiveFile> OpenArchiveFile(const std::filesystem::path& path) 
 	if (!entry || !entry->is_file) {
 		return {};
 	}
-	auto p     = std::make_unique<ArchiveFile::Private>();
-	p->reader  = std::move(reader);
-	p->entry   = *entry;
+	auto p    = std::make_unique<ArchiveFile::Private>();
+	p->reader = std::move(reader);
+	p->entry  = *entry;
 	return std::unique_ptr<ArchiveFile>(new ArchiveFile(std::move(p)));
 }
 

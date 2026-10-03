@@ -32,14 +32,17 @@ private:
 };
 
 // Virtual paths use "archive.ext!/member" and retain native host-path encoding.
-[[nodiscard]] std::filesystem::path       MakeArchivePath(const std::filesystem::path& archive,
-                                                          const std::filesystem::path& member = {});
-[[nodiscard]] bool                        IsSupportedArchive(const std::filesystem::path& path);
-[[nodiscard]] bool                        IsArchivePath(const std::filesystem::path& path);
-[[nodiscard]] std::optional<File::Info>   GetArchiveInfo(const std::filesystem::path& path);
-[[nodiscard]] std::vector<File::DirEntry> GetArchiveDirEntries(const std::filesystem::path& path);
-[[nodiscard]] std::filesystem::path       GetArchiveHostPath(const std::filesystem::path& path);
+[[nodiscard]] std::filesystem::path        MakeArchivePath(const std::filesystem::path& archive,
+                                                           const std::filesystem::path& member = {});
+[[nodiscard]] bool                         IsSupportedArchive(const std::filesystem::path& path);
+[[nodiscard]] bool                         IsArchivePath(const std::filesystem::path& path);
+[[nodiscard]] std::optional<File::Info>    GetArchiveInfo(const std::filesystem::path& path);
+[[nodiscard]] std::vector<File::DirEntry>  GetArchiveDirEntries(const std::filesystem::path& path);
+[[nodiscard]] std::filesystem::path        GetArchiveHostPath(const std::filesystem::path& path);
 [[nodiscard]] std::unique_ptr<ArchiveFile> OpenArchiveFile(const std::filesystem::path& path);
+
+// Forget cached lookup handles for a new metadata scan; existing open files stay valid.
+void InvalidateArchiveCache();
 
 // Retain this handle while a mount or metadata scan is active to reuse the index and block cache.
 // Accepts either a host archive filename or a virtual path inside the archive.

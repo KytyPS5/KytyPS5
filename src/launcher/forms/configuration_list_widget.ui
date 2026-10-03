@@ -67,6 +67,11 @@
           </widget>
          </item>
          <item>
+          <widget class="QLabel" name="scan_status">
+           <property name="text"><string/></property>
+          </widget>
+         </item>
+         <item>
           <widget class="QToolButton" name="global_settings_button">
            <property name="minimumSize">
            <size>

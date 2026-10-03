@@ -5186,6 +5186,24 @@ public:
       sampled.view_info.aspect = vk::ImageAspectFlagBits::eColor;
       sampled.view_info.usage = vk::ImageUsageFlagBits::eSampled;
 
+      auto many_layers = sampled;
+      many_layers.info.data = {base + 0x2780000, 0x4000};
+      many_layers.info.resources.layers = 32;
+      many_layers.info.tile_mode = Prospero::TileMode::kDepth;
+      many_layers.info.mip_layout[0].size = many_layers.info.data.size;
+      many_layers.view_info.layer_count = 32;
+      const auto many_layers_id = texture_cache.FindImage(many_layers);
+      auto fewer_layers = many_layers;
+      fewer_layers.info.data.size = 0x8000;
+      fewer_layers.info.resources.layers = 2;
+      fewer_layers.info.mip_layout[0].size = fewer_layers.info.data.size;
+      fewer_layers.view_info.layer_count = 2;
+      const auto fewer_layers_id = texture_cache.FindImage(fewer_layers);
+      Require(name, "different layer layout", fewer_layers_id &&
+                  fewer_layers_id != many_layers_id &&
+                  texture_cache.GetImage(fewer_layers_id).info.data == fewer_layers.info.data,
+              "equal-address images with different layer strides shared a cache entry");
+
       auto &command = scheduler.Current();
       auto first_desc = sampled;
       const auto first = texture_cache.FindImage(first_desc);

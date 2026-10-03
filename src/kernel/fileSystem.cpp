@@ -22,6 +22,7 @@
 #include <cstring>
 #include <filesystem>
 #include <random>
+#include <string_view>
 #include <system_error>
 #include <vector>
 
@@ -154,6 +155,19 @@ static std::vector<uint8_t> PackDirents(const std::vector<Common::File::DirEntry
 		*last_reclen += static_cast<uint16_t>(dirents.size() - offset);
 	}
 	return dirents;
+}
+
+// Lists a host directory with the names the guest created, undoing EncodeHostFilename.
+static std::vector<Common::File::DirEntry> GetGuestDirEntries(const std::filesystem::path& path) {
+	auto entries = Common::File::GetDirEntries(path);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (!Common::IsArchivePath(path)) {
+		for (auto& entry: entries) {
+			entry.name = DecodeHostFilename(entry.name);
+		}
+	}
+#endif
+	return entries;
 }
 
 static uint64_t ReadDirectory(File* file, void* buf, uint64_t count) {
@@ -327,11 +341,91 @@ static std::filesystem::path ResolvePathIgnoringCase(const std::filesystem::path
 
 	return resolved;
 }
-#else
-static bool HasWindowsForbiddenFilenameCharacter(const std::string& relative_path) {
-	return relative_path.find_first_of("<>:\"|?*") != std::string::npos;
-}
 #endif
+
+static bool IsHostForbiddenFilenameCharacter(unsigned char ch) {
+	constexpr std::string_view Forbidden = "<>:\"|?*";
+	return (ch != 0 && ch < 0x20) ||
+	       Forbidden.find(static_cast<char>(ch)) != std::string_view::npos;
+}
+
+// Characters EncodeHostFilename may store as %XX: forbidden ones, a '%' that would otherwise read
+// as an escape, and a trailing '.' or ' ' that Windows would strip from a path component.
+static bool IsHostEscapedCharacter(unsigned char ch) {
+	return IsHostForbiddenFilenameCharacter(ch) || ch == '%' || ch == '.' || ch == ' ';
+}
+
+static int HexDigitValue(char ch) {
+	if (ch >= '0' && ch <= '9') {
+		return ch - '0';
+	}
+	if (ch >= 'A' && ch <= 'F') {
+		return ch - 'A' + 10;
+	}
+	if (ch >= 'a' && ch <= 'f') {
+		return ch - 'a' + 10;
+	}
+	return -1;
+}
+
+// Returns the character that the escape at text[pos] stands for, or -1 if there is none there.
+// Hex digits match in either case because NTFS compares names case-insensitively.
+static int DecodeHostEscape(std::string_view text, size_t pos) {
+	if (text[pos] != '%' || pos + 2 >= text.size()) {
+		return -1;
+	}
+	const int high = HexDigitValue(text[pos + 1]);
+	const int low  = HexDigitValue(text[pos + 2]);
+	if (high < 0 || low < 0) {
+		return -1;
+	}
+	const auto ch = static_cast<unsigned char>((high << 4) | low);
+	return IsHostEscapedCharacter(ch) ? ch : -1;
+}
+
+std::string EncodeHostFilename(std::string_view guest_name) {
+	constexpr char Hex[] = "0123456789ABCDEF";
+
+	std::string out;
+	out.reserve(guest_name.size());
+	size_t component_begin = 0;
+	for (size_t i = 0; i < guest_name.size(); i++) {
+		const auto ch     = static_cast<unsigned char>(guest_name[i]);
+		bool       escape = IsHostForbiddenFilenameCharacter(ch);
+		if (ch == '%') {
+			escape = DecodeHostEscape(guest_name, i) >= 0;
+		} else if (ch == '.' || ch == ' ') {
+			const bool component_end = i + 1 == guest_name.size() || guest_name[i + 1] == '/';
+			const auto component     = guest_name.substr(component_begin, i + 1 - component_begin);
+			escape                   = component_end && component != "." && component != "..";
+		} else if (ch == '/') {
+			component_begin = i + 1;
+		}
+
+		if (escape) {
+			out += '%';
+			out += Hex[ch >> 4u];
+			out += Hex[ch & 0xfu];
+		} else {
+			out += static_cast<char>(ch);
+		}
+	}
+	return out;
+}
+
+std::string DecodeHostFilename(std::string_view host_name) {
+	std::string out;
+	out.reserve(host_name.size());
+	for (size_t i = 0; i < host_name.size(); i++) {
+		if (const int ch = DecodeHostEscape(host_name, i); ch >= 0) {
+			out += static_cast<char>(ch);
+			i += 2;
+		} else {
+			out += host_name[i];
+		}
+	}
+	return out;
+}
 
 std::filesystem::path MountPoints::ResolvePath(const std::string& mounted_name) {
 	Common::LockGuard lock(m_mutex);
@@ -354,10 +448,7 @@ std::filesystem::path MountPoints::ResolvePath(const std::string& mounted_name) 
 		}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		if (HasWindowsForbiddenFilenameCharacter(rel_path)) {
-			::printf("FileSystem: Windows-incompatible guest filename: %s\n", mounted_name.c_str());
-		}
-		return p.dir / native_rel_path;
+		return p.dir / Common::PathFromUtf8(EncodeHostFilename(rel_path));
 #else
 		return ResolvePathIgnoringCase(p.dir / native_rel_path);
 #endif
@@ -501,7 +592,7 @@ int KYTY_SYSV_ABI KernelOpen(const char* path, int flags, uint16_t mode) {
 		EXIT_NOT_IMPLEMENTED(!directory && rw_mode != Common::File::Mode::Read);
 		EXIT_NOT_IMPLEMENTED(!directory && (trunc || creat));
 
-		const auto entries = Common::File::GetDirEntries(file->real_name);
+		const auto entries = GetGuestDirEntries(file->real_name);
 		file->dirents      = PackDirents(entries);
 		file->dents_offset = 0;
 		file->directory    = true;
@@ -1089,8 +1180,7 @@ int KYTY_SYSV_ABI KernelStat(const char* path, FileStat* sb) {
 	auto wt = at;
 
 	if (is_dir) {
-		stat.st_size =
-		    static_cast<int64_t>(PackDirents(Common::File::GetDirEntries(real_file_name)).size());
+		stat.st_size = static_cast<int64_t>(PackDirents(GetGuestDirEntries(real_file_name)).size());
 		stat.st_blksize = 512;
 		stat.st_blocks  = stat.st_size / 512;
 	} else {

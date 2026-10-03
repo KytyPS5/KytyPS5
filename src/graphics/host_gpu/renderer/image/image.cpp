@@ -353,8 +353,10 @@ void Image::CopyImage(Image& source) {
 	std::vector<vk::ImageCopy> copies;
 	copies.reserve(levels);
 	for (uint32_t level = 0; level < levels; level++) {
-		const auto width  = std::max(source.backing.extent.width >> level, 1u);
-		const auto height = std::max(source.backing.extent.height >> level, 1u);
+		const auto width =
+		    std::max(std::min(source.backing.extent.width, backing.extent.width) >> level, 1u);
+		const auto height =
+		    std::max(std::min(source.backing.extent.height, backing.extent.height) >> level, 1u);
 		const auto depth  = std::max(base_depth >> level, 1u);
 		const auto [source_layers, destination_layers] = SanitizeCopyLayers(source, *this, depth);
 		vk::ImageCopy copy {};

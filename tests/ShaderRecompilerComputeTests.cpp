@@ -13995,6 +13995,110 @@ public:
         RenderExecutorTestAccess::ResetBindings(executor);
       }
 
+      for (const auto tile_mode : {linear, Prospero::TileMode::kRenderTarget}) {
+        constexpr uint64_t image_size = 2 * target_mip_size;
+        const uint32_t sampled_width = tile_mode == linear ? 100 : 60;
+        const vk::Offset3D sampled_edge{static_cast<int32_t>(sampled_width - 1), 32, 0};
+        const auto address = base + 0x800000 + static_cast<uint32_t>(tile_mode) * image_size;
+        auto wide_target = make_target_desc(address, image_size, {128, 33, 1});
+        wide_target.info.extent.width = 120;
+        wide_target.info.tile_mode = tile_mode;
+        wide_target.info.resources.layers = 2;
+        wide_target.view_info.type = vk::ImageViewType::e2DArray;
+        wide_target.view_info.layer_count = 2;
+        const auto wide_id = texture_cache.FindImage(wide_target);
+        (void)texture_cache.FindRenderTarget(wide_id, wide_target);
+        vk::ClearValue clear{};
+        clear.color.uint32[0] = storage_native_value;
+        TextureCacheTestAccess::ClearImage(
+            texture_cache, scheduler.Current(), wide_id,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 2}, clear);
+
+        auto sampled = wide_target;
+        sampled.info.extent.width = sampled_width;
+        Require(name, "smaller render area retains backing",
+                texture_cache.FindImage(sampled) == wide_id,
+                "a smaller render area replaced its compatible larger backing");
+        sampled.type = BindingType::Texture;
+        sampled.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+        const auto sampled_id = texture_cache.FindImage(sampled);
+        const auto view = texture_cache.FindTexture(sampled_id, sampled);
+        const auto &image = texture_cache.GetImage(sampled_id);
+        Require(name, "equal-allocation sampled extent",
+                view != nullptr && sampled_id != wide_id &&
+                    !TextureCacheTestAccess::Contains(texture_cache, wide_id) &&
+                    image.info.extent == sampled.info.extent &&
+                    image.backing.extent == sampled.info.extent && image.IsGpuModified(),
+                "normalized sampling retained pixels outside the requested extent");
+        Require(name, "sampled extent preserves GPU contents",
+                ReadCachedTexel(name, context, sampled_id, sampled_edge) ==
+                    std::vector<u32>{storage_native_value},
+                "shrinking a sampled backing lost its rendered edge texel");
+
+        constexpr uint32_t updated_value = 0xa1b2c3d4u;
+        clear.color.uint32[0] = updated_value;
+        TextureCacheTestAccess::ClearImage(
+            texture_cache, scheduler.Current(), sampled_id,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, clear);
+
+        auto widened = sampled;
+        widened.info.extent.width = wide_target.info.extent.width;
+        const auto widened_id = texture_cache.FindImage(widened);
+        (void)texture_cache.FindTexture(widened_id, widened);
+        Require(name, "widened image preserves full GPU contents",
+                ReadCachedTexel(name, context, widened_id, sampled_edge) ==
+                    std::vector<u32>{updated_value} &&
+                    ReadCachedTexel(name, context, widened_id, {119, 32, 0}) ==
+                        std::vector<u32>{storage_native_value} &&
+                    ReadCachedTexel(name, context, widened_id, {119, 32, 0}, {1, 1, 1}, 1) ==
+                        std::vector<u32>{storage_native_value},
+                "widening an image lost its updated interior or preserved outer texels");
+        const auto narrowed_id = texture_cache.FindImage(sampled);
+        (void)texture_cache.FindTexture(narrowed_id, sampled);
+
+        TileTextureBlockLayout layout{};
+        if (tile_mode != linear) {
+          Require(name, "narrowed image tile layout",
+                  TileGetTextureBlockLayout(wide_target.info.guest_format, tile_mode, false,
+                                            layout),
+                  "narrowed image tile layout is unavailable");
+        }
+        const auto [buffer, buffer_offset] = resources.GetBufferCache().ObtainBuffer(
+            address, image_size, false, true);
+        auto readback = CreateHostBuffer(name, 3 * sizeof(uint32_t),
+                                        vk::BufferUsageFlagBits::eTransferDst, {0, 0, 0});
+        const std::array probes{std::pair{sampled_width - 1, 0u}, std::pair{119u, 0u},
+                                std::pair{119u, 1u}};
+        std::array<vk::BufferCopy, probes.size()> copies{};
+        for (size_t i = 0; i < probes.size(); ++i) {
+          const auto [x, layer] = probes[i];
+          uint32_t offset = (32 * wide_target.info.pitch + x) * sizeof(uint32_t);
+          if (tile_mode != linear) {
+            uint32_t block_xor = 0;
+            Require(name, "narrowed image texel offset",
+                    TileGetBlockOffset(layout.block, x, 32, 0, offset) &&
+                        TileGetBlockXor(layout.block, 0, 0, layer, block_xor),
+                    "narrowed image texel offset is unavailable");
+            offset ^= block_xor;
+          }
+          copies[i] = {buffer_offset + layer * target_mip_size + offset,
+                       i * sizeof(uint32_t), sizeof(uint32_t)};
+        }
+        scheduler.Current().Handle().copyBuffer(buffer->Handle(), readback.buffer,
+                                                copies.size(), copies.data());
+        host_read_barrier(readback);
+        scheduler.Finish();
+        const auto pixels = ReadBuffer(name, readback, 3);
+        Require(name, "narrowed image buffer contents",
+                pixels == std::vector<u32>{updated_value, storage_native_value, storage_native_value},
+                "a buffer read lost GPU-written pixels outside the narrowed image: tile=" +
+                    std::to_string(static_cast<uint32_t>(tile_mode)) + " inner=" +
+                    std::to_string(pixels[0]) + " outer=" + std::to_string(pixels[1]));
+        DestroyBuffer(&readback);
+
+        resources.GetBufferCache().ReadMemory(address, image_size);
+      }
+
       auto colliding_msaa_texture = array_texture;
       colliding_msaa_texture.fields[3] =
           DstSel(4, 5, 6, 7) | (1u << 16u) |

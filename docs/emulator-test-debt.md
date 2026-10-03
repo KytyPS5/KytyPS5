@@ -363,6 +363,38 @@ launches until a bounded synthetic SPIR-V or emitter regression isolates the
 instruction pattern that triggers the crash. Keep shader validation and GPUAV
 controls to distinguish invalid SPIR-V from a driver defect.
 
+## Prepared-frame readback layout after a guest flip (2026-10-03)
+
+The bounded full-GPUAV retry
+`_Build/runs/yotei-integrated-20261003-163915-presentfix-gpuav` reached
+`shown=150` and then failed Vulkan validation on the first requested
+prepared-frame readback: `copyImageToBuffer` required
+`VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL`, but the image remained in
+`VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL`. `Presenter::Frame::CopyFrom` leaves
+the prepared image in transfer-destination state, while
+`CapturePreparedFrame` copies from it without a transition.
+
+Required synthetic regression: create a small native prepared-format image,
+clear it in transfer-destination layout, call the same readback recorder used
+by presentation, and require both transfer-source state and the numerical
+clear color in the downloaded buffer. Run RED against the existing recorder,
+then GREEN after adding the source transition. Retain the actual game retry
+as a separate runtime check.
+
+The native `--prepared-frame-readback-only` fixture used a 2×2 RGBA8 image
+cleared to `(0.25, 0.5, 1, 1)`. With the old recorder it failed after a
+successful build at `source layout before readback` (exit `0xC0000409`,
+`_Build/logs/prepared-frame-readback-red-20261003.stderr`). After routing
+the recorder through the prepared-image transition, the unchanged test
+passed with numerical pixels and a second readback from an already-source
+image (`_Build/logs/prepared-frame-readback-green-20261003.run.json` and
+`_Build/logs/prepared-frame-readback-neighbor-20261003.run.json`). The bounded
+game retry `_Build/runs/yotei-integrated-20261003-170145-presentfix-gpuav`
+captured 16 prepared frames, 120–135, without the old layout error; every
+captured frame had zero RGB. It later reached `shown=197` and the separate
+16-bit SRGB color-target guard. These readbacks prove the layout fix and
+black pixels for that interval only; they do not prove a menu.
+
 ## 16-bit SRGB color-target register state after expanded HTile alias (2026-10-03)
 
 The bounded GPUAV run

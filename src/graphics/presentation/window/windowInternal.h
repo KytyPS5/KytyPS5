@@ -18,6 +18,10 @@ namespace Libs::Graphics {
 class Presenter;
 class RenderContext;
 
+// Records a copy of a prepared presentation image into a host readback buffer.
+void RecordPreparedFrameReadback(vk::CommandBuffer command, VulkanImage& image,
+                                 vk::Buffer download, vk::Extent3D extent);
+
 struct SurfaceCapabilities {
 	vk::SurfaceCapabilitiesKHR        capabilities {};
 	std::vector<vk::SurfaceFormatKHR> formats;

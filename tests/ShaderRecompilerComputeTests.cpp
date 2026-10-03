@@ -2165,6 +2165,105 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  void CheckPreparedFrameReadback() {
+    constexpr const char *name = "PreparedFrameReadback";
+    auto &graphics = RuntimeContext();
+    RenderContext context(graphics);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+
+    VulkanImage image;
+    vk::ImageCreateInfo create{};
+    create.imageType = vk::ImageType::e2D;
+    create.format = vk::Format::eR8G8B8A8Unorm;
+    create.extent = {2, 2, 1};
+    create.mipLevels = 1;
+    create.arrayLayers = 1;
+    create.samples = vk::SampleCountFlagBits::e1;
+    create.tiling = vk::ImageTiling::eOptimal;
+    create.usage = vk::ImageUsageFlagBits::eTransferSrc |
+                   vk::ImageUsageFlagBits::eTransferDst;
+    create.initialLayout = vk::ImageLayout::eUndefined;
+    Require(name, "create prepared image", graphics.CreateImage(create, image),
+            "could not allocate the synthetic presentation image");
+    auto readback = CreateHostBuffer(name, 16,
+                                     vk::BufferUsageFlagBits::eTransferDst,
+                                     {0, 0, 0, 0});
+    auto repeated_readback = CreateHostBuffer(name, 16,
+                                              vk::BufferUsageFlagBits::eTransferDst,
+                                              {0, 0, 0, 0});
+    auto command = scheduler.Current().Handle();
+    vk::ImageMemoryBarrier2 to_destination{};
+    to_destination.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands;
+    to_destination.dstStageMask = vk::PipelineStageFlagBits2::eTransfer;
+    to_destination.dstAccessMask = vk::AccessFlagBits2::eTransferWrite;
+    to_destination.oldLayout = vk::ImageLayout::eUndefined;
+    to_destination.newLayout = vk::ImageLayout::eTransferDstOptimal;
+    to_destination.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_destination.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_destination.image = image.image;
+    to_destination.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+    vk::DependencyInfo dependency{};
+    dependency.imageMemoryBarrierCount = 1;
+    dependency.pImageMemoryBarriers = &to_destination;
+    command.pipelineBarrier2(dependency);
+    image.state = {vk::PipelineStageFlagBits2::eTransfer,
+                   vk::AccessFlagBits2::eTransferWrite,
+                   vk::ImageLayout::eTransferDstOptimal};
+    vk::ClearColorValue clear{};
+    clear.float32[0] = 0.25f;
+    clear.float32[1] = 0.5f;
+    clear.float32[2] = 1.0f;
+    clear.float32[3] = 1.0f;
+    command.clearColorImage(image.image, vk::ImageLayout::eTransferDstOptimal,
+                            clear, to_destination.subresourceRange);
+
+    RecordPreparedFrameReadback(command, image, readback.buffer, {2, 2, 1});
+    Require(name, "source layout before readback",
+            image.state.layout == vk::ImageLayout::eTransferSrcOptimal &&
+                image.state.access_mask == vk::AccessFlagBits2::eTransferRead,
+            "prepared frame remained in transfer-destination state");
+    RecordPreparedFrameReadback(command, image, repeated_readback.buffer,
+                                {2, 2, 1});
+    vk::BufferMemoryBarrier2 to_host{};
+    to_host.srcStageMask = vk::PipelineStageFlagBits2::eTransfer;
+    to_host.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+    to_host.dstStageMask = vk::PipelineStageFlagBits2::eHost;
+    to_host.dstAccessMask = vk::AccessFlagBits2::eHostRead;
+    to_host.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_host.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_host.buffer = readback.buffer;
+    to_host.size = 16;
+    dependency = {};
+    dependency.bufferMemoryBarrierCount = 1;
+    dependency.pBufferMemoryBarriers = &to_host;
+    command.pipelineBarrier2(dependency);
+    to_host.buffer = repeated_readback.buffer;
+    dependency.pBufferMemoryBarriers = &to_host;
+    command.pipelineBarrier2(dependency);
+    scheduler.Finish();
+    const auto pixels = ReadBuffer(name, readback, 4);
+    for (const auto pixel : pixels) {
+      const auto *channel = reinterpret_cast<const uint8_t *>(&pixel);
+      Require(name, "numerical clear color",
+              channel[0] >= 63 && channel[0] <= 65 &&
+                  channel[1] >= 127 && channel[1] <= 129 &&
+                  channel[2] == 255 && channel[3] == 255,
+              "prepared-frame readback lost the synthetic clear color");
+    }
+    Require(name, "already-source repeat",
+            ReadBuffer(name, repeated_readback, 4) == pixels,
+            "reusing transfer-source layout changed the readback pixels");
+    graphics.DeleteImage(image);
+    DestroyBuffer(&readback);
+    DestroyBuffer(&repeated_readback);
+    CheckValidation(name);
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   void CheckDescriptorHeapLargeSet() {
     EnsureRuntimeContext();
     std::array<vk::DescriptorSetLayoutBinding, 3> bindings{};
@@ -45815,6 +45914,11 @@ if (argc == 1) {
     vulkan.CheckHostImageAllocation();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--prepared-frame-readback-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckPreparedFrameReadback();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--occlusion-dump-only") == 0) {
     VulkanHarness vulkan;
     CheckPm4SyntheticOcclusionCounterDump(vulkan.RuntimeRenderer());
@@ -46408,6 +46512,7 @@ if (argc == 1) {
   CheckPs5GameExampleImageClearRuntimeShape();
   vulkan.CheckSchedulerTimeline();
   vulkan.CheckHostImageAllocation();
+  vulkan.CheckPreparedFrameReadback();
   vulkan.CheckDescriptorHeapLargeSet();
   vulkan.CheckGraphicsPushConstantBank();
   vulkan.CheckGpuMappedRangeLifecycle();

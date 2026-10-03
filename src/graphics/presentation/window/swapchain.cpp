@@ -44,6 +44,53 @@ uint64_t PresentReadbackEnvU64(const char* name, uint64_t fallback) {
 	return static_cast<uint64_t>(parsed);
 }
 
+static void TransitPreparedFrameImage(vk::CommandBuffer command, VulkanImage& image,
+                                      vk::ImageLayout layout, vk::AccessFlags2 access) {
+	const auto     stage  = access == vk::AccessFlagBits2::eTransferRead ||
+	                                access == vk::AccessFlagBits2::eTransferWrite
+	                            ? vk::PipelineStageFlagBits2::eTransfer
+	                            : vk::PipelineStageFlagBits2::eAllCommands;
+	constexpr auto writes = vk::AccessFlagBits2::eTransferWrite |
+	                        vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eMemoryWrite;
+	if (image.state.layout == layout && image.state.access_mask == access &&
+	    !static_cast<bool>(image.state.access_mask & writes)) {
+		return;
+	}
+	vk::ImageMemoryBarrier2 barrier {};
+	barrier.srcStageMask                    = image.state.pl_stage;
+	barrier.srcAccessMask                   = image.state.access_mask;
+	barrier.dstStageMask                    = stage;
+	barrier.dstAccessMask                   = access;
+	barrier.oldLayout                       = image.state.layout;
+	barrier.newLayout                       = layout;
+	barrier.srcQueueFamilyIndex             = VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex             = VK_QUEUE_FAMILY_IGNORED;
+	barrier.image                           = image.image;
+	barrier.subresourceRange.aspectMask     = vk::ImageAspectFlagBits::eColor;
+	barrier.subresourceRange.baseMipLevel   = 0;
+	barrier.subresourceRange.levelCount     = VK_REMAINING_MIP_LEVELS;
+	barrier.subresourceRange.baseArrayLayer = 0;
+	barrier.subresourceRange.layerCount     = VK_REMAINING_ARRAY_LAYERS;
+	vk::DependencyInfo dependency {};
+	dependency.imageMemoryBarrierCount = 1;
+	dependency.pImageMemoryBarriers    = &barrier;
+	command.pipelineBarrier2(dependency);
+	image.state = {stage, access, layout};
+	image.subresource_states.clear();
+}
+
+void RecordPreparedFrameReadback(vk::CommandBuffer command, VulkanImage& image,
+                                 vk::Buffer download, vk::Extent3D extent) {
+	TransitPreparedFrameImage(command, image, vk::ImageLayout::eTransferSrcOptimal,
+	                          vk::AccessFlagBits2::eTransferRead);
+	vk::BufferImageCopy copy {};
+	copy.bufferRowLength = extent.width;
+	copy.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+	copy.imageExtent = extent;
+	command.copyImageToBuffer(image.image, vk::ImageLayout::eTransferSrcOptimal, download, 1,
+	                          &copy);
+}
+
 struct Presenter::Frame {
 	VulkanImage   image;
 	vk::ImageView view         = nullptr;
@@ -219,37 +266,7 @@ void Presenter::Frame::Configure(GraphicContext& graphics, vk::Extent2D extent, 
 
 void Presenter::Frame::Transit(vk::CommandBuffer command, vk::ImageLayout layout,
                                vk::AccessFlags2 access) {
-	const auto     stage  = access == vk::AccessFlagBits2::eTransferRead ||
-	                                access == vk::AccessFlagBits2::eTransferWrite
-	                            ? vk::PipelineStageFlagBits2::eTransfer
-	                            : vk::PipelineStageFlagBits2::eAllCommands;
-	constexpr auto writes = vk::AccessFlagBits2::eTransferWrite |
-	                        vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eMemoryWrite;
-	if (image.state.layout == layout && image.state.access_mask == access &&
-	    !static_cast<bool>(image.state.access_mask & writes)) {
-		return;
-	}
-	vk::ImageMemoryBarrier2 barrier {};
-	barrier.srcStageMask                    = image.state.pl_stage;
-	barrier.srcAccessMask                   = image.state.access_mask;
-	barrier.dstStageMask                    = stage;
-	barrier.dstAccessMask                   = access;
-	barrier.oldLayout                       = image.state.layout;
-	barrier.newLayout                       = layout;
-	barrier.srcQueueFamilyIndex             = VK_QUEUE_FAMILY_IGNORED;
-	barrier.dstQueueFamilyIndex             = VK_QUEUE_FAMILY_IGNORED;
-	barrier.image                           = image.image;
-	barrier.subresourceRange.aspectMask     = vk::ImageAspectFlagBits::eColor;
-	barrier.subresourceRange.baseMipLevel   = 0;
-	barrier.subresourceRange.levelCount     = VK_REMAINING_MIP_LEVELS;
-	barrier.subresourceRange.baseArrayLayer = 0;
-	barrier.subresourceRange.layerCount     = VK_REMAINING_ARRAY_LAYERS;
-	vk::DependencyInfo dependency {};
-	dependency.imageMemoryBarrierCount = 1;
-	dependency.pImageMemoryBarriers    = &barrier;
-	command.pipelineBarrier2(dependency);
-	image.state = {stage, access, layout};
-	image.subresource_states.clear();
+	TransitPreparedFrameImage(command, image, layout, access);
 }
 
 void Presenter::Frame::CopyFrom(CommandBuffer& command_buffer, Image& source) {
@@ -344,7 +361,7 @@ struct Presenter::Impl {
 	void CapturePreparedFrame(Presenter::Frame& frame) {
 		const char* path = std::getenv("KYTY_PRESENT_READBACK_PATH");
 		const bool capture_source = std::getenv("KYTY_PRESENT_READBACK_SOURCE") != nullptr;
-		const auto* source_image =
+		auto* source_image =
 		    capture_source && frame.guest_source != nullptr ? frame.guest_source : nullptr;
 		const auto capture_format =
 		    source_image != nullptr ? source_image->backing.format : frame.image.format;
@@ -352,8 +369,7 @@ struct Presenter::Impl {
 		                                ? source_image->backing.extent
 		                                : vk::Extent3D {frame.image.extent.width,
 		                                                frame.image.extent.height, 1};
-		const auto capture_handle =
-		    source_image != nullptr ? source_image->backing.image : frame.image.image;
+		auto& capture_image = source_image != nullptr ? source_image->backing : frame.image;
 		static uint32_t trace_count = 0;
 		if (path != nullptr && *path != '\0' && trace_count < 16) {
 			std::printf("PresentReadback: guest=%d format=%d extent=%ux%u count=%" PRIu64 "\n",
@@ -383,12 +399,12 @@ struct Presenter::Impl {
 		Buffer download(window.graphic_ctx, present_scheduler, MemoryUsage::Download, 0,
 		                vk::BufferUsageFlagBits::eTransferDst, size);
 		auto& command = present_scheduler.BeginCommand();
-		vk::BufferImageCopy copy {};
-		copy.bufferRowLength = capture_extent.width;
-		copy.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
-		copy.imageExtent = capture_extent;
-		command.Handle().copyImageToBuffer(capture_handle, vk::ImageLayout::eTransferSrcOptimal,
-		                                   download.Handle(), 1, &copy);
+		if (source_image != nullptr) {
+			source_image->Transit(vk::ImageLayout::eTransferSrcOptimal,
+			                      vk::AccessFlagBits2::eTransferRead, {}, command.Handle());
+		}
+		RecordPreparedFrameReadback(command.Handle(), capture_image, download.Handle(),
+		                            capture_extent);
 		vk::BufferMemoryBarrier2 barrier {};
 		barrier.srcStageMask        = vk::PipelineStageFlagBits2::eTransfer;
 		barrier.srcAccessMask       = vk::AccessFlagBits2::eTransferWrite;

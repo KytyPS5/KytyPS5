@@ -25,7 +25,7 @@ FetchContent_MakeAvailable(opus)
 set(BUILD_TESTING "${kyty_build_testing_saved}")
 install(FILES "${opus_SOURCE_DIR}/COPYING" DESTINATION "licenses/opus")
 
-# The Windows guest red-zone patcher needs a decoder/encoder and a small
+# The guest instruction patcher needs a decoder/encoder and a small
 # trampoline assembler. Pin the same revisions used by shadPS4's implementation.
 set(XBYAK_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
@@ -48,6 +48,7 @@ FetchContent_Declare(
 )
 
 FetchContent_MakeAvailable(xbyak zydis)
+target_compile_definitions(xbyak INTERFACE XBYAK_NO_EXCEPTION)
 
 # ZArchive provides random-access reads for compressed game dumps. Build only
 # the reader/writer library and its zstd dependency; the command-line tool is

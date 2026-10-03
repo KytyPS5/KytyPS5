@@ -17,8 +17,8 @@
 #include "kernel/pthread.h"
 #include "loader/elf.h"
 #include "loader/gamePatch.h"
+#include "loader/guestInstructionPatcher.h"
 #include "loader/jit.h"
-#include "loader/redZonePatcher.h"
 #include "loader/symbolDatabase.h"
 #include "loader/x64InstructionEmulator.h"
 
@@ -1812,38 +1812,39 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	uint64_t tls_handler_size = is_shared ? 0 : Jit::SafeCall::GetSize();
 	EXIT_IF(tls_handler_size > UINT64_MAX - program->base_size_aligned);
 	program->mapped_size = program->base_size_aligned + tls_handler_size;
+#if !defined(__APPLE__)
 	const bool emulate_rsqrt = Config::AmdCpuEnabled();
-
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	const bool         protect_memory_faults   = Config::RedZoneProtectionEnabled();
-	const bool         use_red_zone_protection = protect_memory_faults || emulate_rsqrt;
-	constexpr uint64_t RED_ZONE_TRAMPOLINE_SIZE = 8u * 1024u * 1024u;
-	if (use_red_zone_protection) {
-		EXIT_IF(RED_ZONE_TRAMPOLINE_SIZE > UINT64_MAX - program->mapped_size);
-		program->mapped_size += RED_ZONE_TRAMPOLINE_SIZE;
-	}
+#else
+	const bool emulate_rsqrt = false;
 #endif
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	const bool protect_memory_faults = Config::RedZoneProtectionEnabled();
+#else
+	const bool protect_memory_faults = false;
+#endif
+	const bool patch_guest_instructions = protect_memory_faults || emulate_rsqrt;
+
+	constexpr uint64_t INSTRUCTION_TRAMPOLINE_SIZE = 8u * 1024u * 1024u;
+	if (patch_guest_instructions) {
+		EXIT_IF(INSTRUCTION_TRAMPOLINE_SIZE > UINT64_MAX - program->mapped_size);
+		program->mapped_size += INSTRUCTION_TRAMPOLINE_SIZE;
+	}
 
 	program->base_vaddr = Libs::LibKernel::Memory::AllocateProgramMemory(
 	    g_desired_base_addr, program->mapped_size, Common::VirtualMemory::Mode::ExecuteReadWrite,
 	    Common::PathToString(program->file_name.filename()).c_str());
 	EXIT_IF(program->base_vaddr == 0);
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	if (use_red_zone_protection) {
-		program->red_zone_trampoline_vaddr = program->base_vaddr + program->base_size_aligned;
-		program->red_zone_trampoline_size  = RED_ZONE_TRAMPOLINE_SIZE;
-		RegisterRedZonePatchModule(reinterpret_cast<void*>(program->base_vaddr),
-		                           program->base_size_aligned,
-		                           reinterpret_cast<void*>(program->red_zone_trampoline_vaddr),
-		                           program->red_zone_trampoline_size);
+	if (patch_guest_instructions) {
+		const auto trampoline_addr           = program->base_vaddr + program->base_size_aligned;
+		program->instruction_trampoline_size = INSTRUCTION_TRAMPOLINE_SIZE;
+		RegisterGuestInstructionPatchModule(
+		    reinterpret_cast<void*>(program->base_vaddr), program->base_size_aligned,
+		    reinterpret_cast<void*>(trampoline_addr), program->instruction_trampoline_size);
 	}
-#endif
 	if (!is_shared) {
-		program->tls.handler_vaddr = program->base_vaddr + program->base_size_aligned;
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		program->tls.handler_vaddr += program->red_zone_trampoline_size;
-#endif
+		program->tls.handler_vaddr =
+		    program->base_vaddr + program->base_size_aligned + program->instruction_trampoline_size;
 	}
 
 	g_desired_base_addr += CODE_BASE_INCR * (1 + program->mapped_size / CODE_BASE_INCR);
@@ -1863,10 +1864,8 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	}
 
 	std::vector<std::pair<uint64_t, uint64_t>> executable_segments;
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	uint64_t                                   eh_frame_header_addr = 0;
 	uint64_t                                   eh_frame_header_size = 0;
-#endif
 
 	for (Elf64_Half i = 0; i < ehdr->e_phnum; i++) {
 		if (phdr[i].p_memsz != 0 && (phdr[i].p_type == PT_LOAD || phdr[i].p_type == PT_OS_RELRO)) {
@@ -1925,52 +1924,60 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 			program->proc_param_vaddr = phdr[i].p_vaddr + program->base_vaddr;
 		}
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		if (use_red_zone_protection && phdr[i].p_type == PT_GNU_EH_FRAME) {
+		if (patch_guest_instructions && phdr[i].p_type == PT_GNU_EH_FRAME) {
 			eh_frame_header_addr = phdr[i].p_vaddr + program->base_vaddr;
 			eh_frame_header_size = phdr[i].p_memsz;
 		}
-#endif
 	}
 
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	std::vector<uintptr_t> function_starts;
-	if (use_red_zone_protection) {
-		if (!DecodeEhFrameFunctionStarts(eh_frame_header_addr, eh_frame_header_size,
-		                                 &function_starts)) {
-			LOGF("Windows guest red-zone patching could not decode function boundaries for %s\n",
-			     Common::PathToString(program->file_name).c_str());
+	if (patch_guest_instructions) {
+		std::vector<uintptr_t> function_starts;
+		const bool             have_function_starts =
+		    DecodeEhFrameFunctionStarts(eh_frame_header_addr, eh_frame_header_size,
+		                                &function_starts) &&
+		    !function_starts.empty();
+		const auto module_name = Common::PathToString(program->file_name.filename());
+		if (!have_function_starts) {
+			Log::WriteToConsoleAndLog(
+			    fmt::format("{}: {} not patched (function boundaries unavailable)\n",
+			                emulate_rsqrt ? "AMD CPU compatibility" : "Guest red-zone protection",
+			                module_name));
 		}
-	}
-#endif
-	for (const auto& [segment_addr, segment_size]: executable_segments) {
-		uint64_t reciprocal_sqrt_count = 0;
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		if (use_red_zone_protection) {
-			const auto result =
-			    PatchGuestInstructions(segment_addr, segment_size, function_starts,
-			                           protect_memory_faults, emulate_rsqrt);
-			LOGF("Windows guest red-zone patching: %s, functions=%" PRIu64 ", red_zone=%" PRIu64
-			     ", memory=%" PRIu64 ", patched=%" PRIu64 ", short=%" PRIu64 ", stack=%" PRIu64
-			     ", control=%" PRIu64 ", unrelocatable=%" PRIu64 "\n",
-			     Common::PathToString(program->file_name.filename()).c_str(), result.function_count,
-			     result.red_zone_function_count, result.memory_instruction_count,
-			     result.patched_memory_instruction_count, result.short_memory_instruction_count,
-			     result.stack_dependent_memory_instruction_count,
-			     result.control_flow_memory_instruction_count,
-			     result.unrelocatable_memory_instruction_count);
-			reciprocal_sqrt_count = result.reciprocal_sqrt_instruction_count;
+		GuestInstructionPatchResult totals {};
+		for (const auto& [segment_addr, segment_size]: executable_segments) {
+			const auto result = PatchGuestInstructions(segment_addr, segment_size, function_starts,
+			                                           protect_memory_faults, emulate_rsqrt);
+			totals.reciprocal_sqrt_instruction_count += result.reciprocal_sqrt_instruction_count;
+			totals.patched_reciprocal_sqrt_instruction_count +=
+			    result.patched_reciprocal_sqrt_instruction_count;
+			totals.trapped_reciprocal_sqrt_instruction_count +=
+			    result.trapped_reciprocal_sqrt_instruction_count;
+			if (protect_memory_faults) {
+				LOGF("Windows guest red-zone patching: %s, functions=%" PRIu64 ", red_zone=%" PRIu64
+				     ", memory=%" PRIu64 ", patched=%" PRIu64 ", short=%" PRIu64 ", stack=%" PRIu64
+				     ", control=%" PRIu64 ", unrelocatable=%" PRIu64 "\n",
+				     module_name.c_str(),
+				     result.function_count, result.red_zone_function_count,
+				     result.memory_instruction_count, result.patched_memory_instruction_count,
+				     result.short_memory_instruction_count,
+				     result.stack_dependent_memory_instruction_count,
+				     result.control_flow_memory_instruction_count,
+				     result.unrelocatable_memory_instruction_count);
+			}
 		}
-#else
-		if (emulate_rsqrt) {
-			reciprocal_sqrt_count =
-			    X64InstructionEmulator::PatchReciprocalSquareRoots(segment_addr, segment_size);
-			Common::VirtualMemory::FlushInstructionCache(segment_addr, segment_size);
-		}
-#endif
-		if (reciprocal_sqrt_count != 0) {
-			LOGF("Guest VRSQRTPS emulation: %s, instructions=%" PRIu64 "\n",
-			     Common::PathToString(program->file_name.filename()).c_str(), reciprocal_sqrt_count);
+		if (emulate_rsqrt && have_function_starts) {
+			const auto  patched = totals.patched_reciprocal_sqrt_instruction_count +
+			                      totals.trapped_reciprocal_sqrt_instruction_count;
+			const auto  skipped = totals.reciprocal_sqrt_instruction_count - patched;
+			const char* status  = totals.reciprocal_sqrt_instruction_count == 0
+			                          ? "no matching instructions"
+			                      : patched == 0 ? "not patched"
+			                      : skipped != 0 ? "partially patched"
+			                                     : "patched";
+			Log::WriteToConsoleAndLog(fmt::format(
+			    "AMD CPU compatibility: {} {} (VRSQRTPS: native={}, trapped={}, skipped={})\n",
+			    module_name, status, totals.patched_reciprocal_sqrt_instruction_count,
+			    totals.trapped_reciprocal_sqrt_instruction_count, skipped));
 		}
 	}
 
@@ -1999,11 +2006,9 @@ void RuntimeLinker::DeleteProgram(Program* p) {
 
 	if (program->base_vaddr != 0 || program->mapped_size != 0) {
 		EXIT_IF(program->base_vaddr == 0 || program->mapped_size == 0);
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		if (program->red_zone_trampoline_size != 0) {
-			UnregisterRedZonePatchModule(reinterpret_cast<void*>(program->base_vaddr));
+		if (program->instruction_trampoline_size != 0) {
+			UnregisterGuestInstructionPatchModule(reinterpret_cast<void*>(program->base_vaddr));
 		}
-#endif
 		EXIT_IF(
 		    !Libs::LibKernel::Memory::FreeGuestMemory(program->base_vaddr, program->mapped_size));
 	}

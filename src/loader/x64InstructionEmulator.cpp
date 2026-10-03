@@ -2,7 +2,6 @@
 
 #include "common/common.h"
 
-#include <Zydis/Zydis.h>
 #include <bit>
 #include <cstring>
 #if !defined(__APPLE__)
@@ -713,46 +712,6 @@ static bool TryEmulateReciprocalSquareRoot(Context& context) {
 
 #endif
 
-bool IsReciprocalSquareRoot(const ZydisDecodedInstruction& instruction,
-                            const ZydisDecodedOperand* operands) {
-	return instruction.mnemonic == ZYDIS_MNEMONIC_VRSQRTPS &&
-	       instruction.encoding == ZYDIS_INSTRUCTION_ENCODING_VEX &&
-	       instruction.raw.vex.offset == 0 && operands[0].size == 128 &&
-	       operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER;
-}
-
-uint64_t PatchReciprocalSquareRoots(uint64_t address, uint64_t size) {
-	uint64_t patched = 0;
-#if !defined(__APPLE__)
-	ZydisDecoder decoder {};
-	if (!ZYAN_SUCCESS(
-	        ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64))) {
-		return 0;
-	}
-	for (uint64_t offset = 0; offset < size;) {
-		auto*                   code = reinterpret_cast<uint8_t*>(address + offset);
-		ZydisDecodedInstruction instruction {};
-		ZydisDecodedOperand     operands[ZYDIS_MAX_OPERAND_COUNT] {};
-		if (!ZYAN_SUCCESS(
-		        ZydisDecoderDecodeFull(&decoder, code, size - offset, &instruction, operands))) {
-			++offset;
-			continue;
-		}
-		if (IsReciprocalSquareRoot(instruction, operands)) {
-			// vvvv is reserved (must be 1111b). Clear one bit to route this
-			// otherwise intact instruction through the illegal-instruction emulator.
-			code[instruction.raw.vex.size - 1] &= ~0x08u;
-			++patched;
-		}
-		offset += instruction.length;
-	}
-#else
-	(void)address;
-	(void)size;
-#endif
-	return patched;
-}
-
 bool TryEmulate(void* native_context) {
 	if (native_context == nullptr) {
 		return false;
@@ -769,11 +728,8 @@ bool TryEmulate(void* native_context) {
 	Context context {static_cast<ucontext_t*>(native_context)};
 #endif
 #if !defined(__APPLE__)
-	if (TryEmulateReciprocalSquareRoot(context)) {
-		return true;
-	}
-	return TryEmulateMonitorxMwaitx(context) || TryEmulateSse4a(context) ||
-	       TryEmulateShaNi(context);
+	return TryEmulateReciprocalSquareRoot(context) || TryEmulateMonitorxMwaitx(context) ||
+	       TryEmulateSse4a(context) || TryEmulateShaNi(context);
 #else
 	return TryEmulateSse4a(context);
 #endif

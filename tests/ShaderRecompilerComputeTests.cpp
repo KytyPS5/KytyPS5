@@ -13920,7 +13920,19 @@ public:
               "backing");
       RenderExecutorTestAccess::ResetBindings(executor);
 
-      {
+      const auto host_read_barrier = [&](const Buffer &buffer) {
+        vk::BufferMemoryBarrier barrier{};
+        barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+        barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+        barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.buffer = buffer.buffer;
+        barrier.size = buffer.size;
+        scheduler.Current().Handle().pipelineBarrier(
+            vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
+            {}, 0, nullptr, 1, &barrier, 0, nullptr);
+      };
+
+      for (const bool formatted : {true, false}) {
         constexpr uint32_t before = 0x13579bdfu;
         constexpr uint32_t guard = 0x2468ace0u;
         constexpr uint32_t after = 0xa1b2c3d4u;
@@ -13935,7 +13947,7 @@ public:
             {vk::ImageAspectFlagBits::eColor, 0, 1, 1, 1}, clear);
 
         const auto buffer_program = make_buffer_program(
-            ShaderType::Vertex, {.read = true, .formatted = true});
+            ShaderType::Vertex, {.read = true, .formatted = formatted});
 
         constexpr uint64_t buffer_size = 2 * target_mip_size;
         static_assert(buffer_size > BufferCache::CACHING_PAGESIZE);
@@ -13958,13 +13970,13 @@ public:
         RenderExecutorTestAccess::PrepareGraphicsBindings(
             executor, stages, std::span{&target, 1u});
         const auto &buffer = buffer_bindings.buffers[0];
-        Require(name, "rediscovered target formatted-buffer read",
+        Require(name, "rediscovered target shader-buffer read",
                 target.image_id == expanded_array_id &&
                     buffer.range == buffer_size &&
                     buffer_bindings.images.empty() &&
                     texture_cache.GetImage(target.image_id).backing.state.layout ==
                         vk::ImageLayout::eTransferSrcOptimal,
-                "target discovery did not precede the formatted image-to-buffer copy");
+                "target discovery did not precede the shader image-to-buffer copy");
         auto readback = CreateHostBuffer(name, 2 * sizeof(uint32_t),
                                         vk::BufferUsageFlagBits::eTransferDst, {0, 0});
         const std::array copies{
@@ -13973,25 +13985,16 @@ public:
                            sizeof(uint32_t)}};
         scheduler.Current().Handle().copyBuffer(buffer.buffer, readback.buffer,
                                                 copies.size(), copies.data());
-        vk::BufferMemoryBarrier readback_barrier{};
-        readback_barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
-        readback_barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
-        readback_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        readback_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        readback_barrier.buffer = readback.buffer;
-        readback_barrier.size = readback.size;
-        scheduler.Current().Handle().pipelineBarrier(
-            vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
-            {}, 0, nullptr, 1, &readback_barrier, 0, nullptr);
+        host_read_barrier(readback);
 
         const auto rendering = RenderExecutorTestAccess::AcquireRenderTargets(
             executor, scheduler.Current(), &target, 1, no_array_depth);
-        Require(name, "attachment layout after formatted-buffer read",
+        Require(name, "attachment layout after shader-buffer read",
                 rendering.color_attachments[0].image_layout ==
                     vk::ImageLayout::eColorAttachmentOptimal &&
                     texture_cache.GetImage(target.image_id).backing.state.layout ==
                         vk::ImageLayout::eColorAttachmentOptimal,
-                "the formatted buffer copy left the render attachment in its transfer layout");
+                "the shader buffer copy left the render attachment in its transfer layout");
         vk::ClearAttachment clear_attachment{};
         clear_attachment.aspectMask = vk::ImageAspectFlagBits::eColor;
         clear_attachment.colorAttachment = 0;
@@ -14001,11 +14004,11 @@ public:
         scheduler.Current().Handle().clearAttachments(1, &clear_attachment, 1, &clear_rect);
         scheduler.EndRendering();
         scheduler.Finish();
-        Require(name, "formatted alias observes prior GPU contents",
+        Require(name, "shader buffer alias observes prior GPU contents",
                 ReadBuffer(name, readback, 2) == std::vector<u32>{before, guard},
-                "formatted buffer acquisition copied stale guest bytes instead of the image");
+                "shader buffer acquisition copied stale guest bytes instead of the image");
         DestroyBuffer(&readback);
-        Require(name, "rendering after formatted-buffer acquisition",
+        Require(name, "rendering after shader-buffer acquisition",
                 ReadCachedTexel(name, context, target.image_id) == std::vector<u32>{after} &&
                     ReadCachedTexel(name, context, target.image_id, {}, {1, 1, 1}, 1) ==
                         std::vector<u32>{guard},
@@ -14115,6 +14118,71 @@ public:
         DestroyBuffer(&readback);
 
         resources.GetBufferCache().ReadMemory(address, image_size);
+      }
+
+      {
+        constexpr uint64_t address = base + 0x500000;
+        constexpr uint32_t native_value = 0x7ac135e9u;
+        auto value = array_descriptor;
+        value.dwords[0] = static_cast<uint32_t>(address >> 8u);
+        value.dwords[1] = (value.dwords[1] & 0xffffff00u) |
+                          static_cast<uint32_t>(address >> 40u);
+        value.dwords[2] = (255u >> 2u) | (255u << 14u);
+        value.dwords[3] =
+            DstSel(4, 5, 6, 7) | (4u << 16u) |
+            (static_cast<uint32_t>(Prospero::TileMode::kRenderTarget) << 20u) |
+            (static_cast<uint32_t>(Prospero::ImageType::kColor2DArray) << 28u);
+        value.dwords[4] = 5;
+        value.dwords[5] = (7u << 20u) | (4u << 4u);
+        const auto binding = RenderExecutorTestAccess::ResolveTexture(executor, array_resource, value);
+        const auto image_id = binding.image_id;
+        const auto &info = texture_cache.GetImage(image_id).info;
+        Require(name, "strided array mip fixture",
+                info.resources == ImageSubresources{5, 6} && info.data.size == 0x240000,
+                "tiled array did not retain its full slice stride");
+        vk::ClearValue clear{};
+        clear.color.uint32[0] = native_value;
+        TextureCacheTestAccess::ClearImage(
+            texture_cache, scheduler.Current(), image_id,
+            {vk::ImageAspectFlagBits::eColor, 0, 5, 0, 6}, clear);
+        RenderExecutorTestAccess::ResetBindings(executor);
+
+        const auto program = make_buffer_program(ShaderType::Compute, {.read = true});
+        ShaderBufferResource descriptor{};
+        descriptor.UpdateAddress48(address);
+        descriptor.fields[2] = info.data.size;
+        ShaderRecompiler::IR::ResourceSnapshot buffer_snapshot;
+        auto &buffer_value = buffer_snapshot.buffers.emplace_back();
+        std::memcpy(buffer_value.dwords.data(), descriptor.fields, sizeof(descriptor.fields));
+        buffer_value.dword_count = 4;
+        const ShaderStageRuntime buffer_runtime{&program, &buffer_snapshot};
+        PreparedBindings buffer_bindings;
+        executor.PrepareBindings(buffer_runtime, buffer_bindings);
+        std::array<PreparedBindings *, 1> buffer_stages{&buffer_bindings};
+        executor.FindBuffers(buffer_stages);
+        executor.RebindBuffers(buffer_bindings);
+        const auto &buffer = buffer_bindings.buffers[0];
+        const auto layout = TextureCalcUploadLayout(
+            info.guest_format, info.extent.width, info.extent.height,
+            info.resources.levels, info.resources.layers, info.tile_mode, info.data.size,
+            false, name);
+        const uint32_t last_layer = info.resources.layers - 1;
+        uint32_t texel_offset = 0;
+        Require(name, "last array slice offset",
+                TileGetBlockXor(layout.surface.texture.block, 0, 0, last_layer, texel_offset),
+                "last array slice has no tile offset");
+        const uint64_t last_slice = layout.surface.mips[0].offset +
+                                    last_layer * layout.source_slice_stride + texel_offset;
+        auto readback = CreateHostBuffer(name, sizeof(uint32_t),
+                                        vk::BufferUsageFlagBits::eTransferDst, {0});
+        const vk::BufferCopy copy{buffer.offset + last_slice, 0, sizeof(uint32_t)};
+        scheduler.Current().Handle().copyBuffer(buffer.buffer, readback.buffer, 1, &copy);
+        host_read_barrier(readback);
+        scheduler.Finish();
+        Require(name, "raw buffer reads last array slice",
+                ReadBuffer(name, readback, 1) == std::vector<u32>{native_value},
+                "raw buffer read truncated the tiled array backing");
+        DestroyBuffer(&readback);
       }
 
       auto colliding_msaa_texture = array_texture;

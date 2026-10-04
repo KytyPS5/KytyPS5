@@ -69,6 +69,8 @@ bool BufferUsesDwordOffset(const EmitterState& state, const IR::MemoryInfo& mem)
 }
 
 void EmitMemoryOffsets(EmitterState& state) {
+	state.memory_byte_offsets.resize(state.program.bindings.memory_offset_count);
+	state.memory_byte_limits.resize(state.program.bindings.memory_offset_count);
 	uint32_t word = 0;
 	for (uint32_t i = 0; i < state.program.bindings.memory_offset_count; i++) {
 		if (i % 4u == 0u)

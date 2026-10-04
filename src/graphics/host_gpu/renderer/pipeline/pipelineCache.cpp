@@ -1,4 +1,5 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pipeline/DescriptorBudget.h"
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
@@ -793,6 +794,7 @@ struct PipelineCache::ProgramCache {
 		    .compute_workgroups         = guest_workgroups,
 		    .compute_workgroups_trusted = compute_workgroups_trusted,
 		    .clamp_memory_range         = ClampShaderGuestMemory,
+		    .max_dense_buffers          = dense_buffer_capacity,
 		};
 		const auto refresh_indirect_grid = [&](const ShaderRecompiler::IR::ResourcePlan& plan) {
 			if (runtime.compute_workgroups_trusted || indirect_args_addr == 0 ||
@@ -1015,6 +1017,7 @@ struct PipelineCache::ProgramCache {
 	explicit ProgramCache(const GraphicContext& graphics): device(graphics.device) {
 		host_profile = graphics.shader_host_profile;
 		const auto& limits                       = graphics.GetPhysicalDeviceProperties().limits;
+		dense_buffer_capacity = StorageBufferDescriptorCeiling(limits);
 		compute_workgroup_limits.max_size        = {limits.maxComputeWorkGroupSize[0],
 		                                            limits.maxComputeWorkGroupSize[1],
 		                                            limits.maxComputeWorkGroupSize[2]};
@@ -1040,6 +1043,7 @@ struct PipelineCache::ProgramCache {
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
 	ShaderRecompiler::ShaderHostProfile host_profile;
 	ShaderRecompiler::ComputeWorkgroupLimits compute_workgroup_limits;
+	uint32_t dense_buffer_capacity = 0;
 	ProgramKey                                                  lookup_key;
 	vk::Device                                                  device;
 	uint64_t                                                    next_shader_id = 0;

@@ -1,7 +1,83 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
-Checkpoint **4 октября 2026 года, 16:12 UTC** (native Windows via WSL;
-branch `yotei-windows-bringup`, parent8d04ad39, derived source-work budget):
+Checkpoint **4 октября 2026 года, 17:50 UTC** (native Windows via WSL;
+branch `yotei-windows-bringup`, parent4481e348, host dense-buffer capacity):
+
+- The generic host-limit correction passed native full ResourceTracking
+  (`dense-buffer-host-final-full-cpu-20261004.log`, final SHA
+  `5bd6017cafbc78b272ee4494ebf49d1a4fb4b0482865549dab76515ca0445391`),
+  DescriptorBudget and unchanged numerical GPU test on RTX5060Ti. The GPU
+  fixture checked515 distinct finite SSBO candidates, keys0/512/514/515,
+  last-candidate write and full backing; exit0 in66.2s, SHA
+  `7b849109b85fe32be8f35e78920457442d69a843f915048a190ae68c679fb06d`.
+  Neighboring finite descriptor extent, wrapped alias and full snapshot domain
+  numerical GPU cases also passed on the same test executable.
+  GPUAV-instrumented version timed out120s during shader instrumentation and
+  pipeline creation, so that mode remains unproved. Native emulator build and
+  install passed; installed SHA
+  `045ceb1b29e313ce236335a65008debdfc69c26902c02fbd651ada77f25dcbc6`.
+- Four bounded 1280x720 game runs exposed an earlier compiler frontier.
+  `yotei-integrated-20261004-173254-presentfix-gpuav` (GPUAV lite) ended at
+  shown0: NVIDIA `nvgpucomp64.dll` 0x80000003/offset0x589eb2 while creating
+  CS b90e2024732c6111. Full GPUAV descriptor instrumentation reached shown255
+  in run173407, but readback150-254 was black; an access violation stopped
+  CS753c552fae650ec4 pipeline creation. Run174018 reproduced the latter at
+  shown128 and captured exact8358-word SPIR-V in its `shaders/` directory.
+  Turning off only descriptor checks in run174908 returned to the b90e NVIDIA
+  crash at shown0. All task processes exited; no menu or 1280x720 nonzero
+  readback. The earlier 2560x1440 spinner proof remains valid only for that run.
+- Isolated probe on the exact CS753c module: valid matching push-descriptor
+  layout and pipeline flag pass without GPUAV; with game-equivalent descriptor
+  instrumentation, `VkLayer_khronos_validation.dll` crashes at offset0x890cb4,
+  matching the game exception. Disabling only descriptor checks makes the probe
+  pass; toggling pipeline optimization does not. An invalid earlier probe
+  without push-descriptor extension was discarded. See
+  `cs753c-valid-layout-plain-probe-20261004.log`,
+  `cs753c-valid-game-gpuav-probe-20261004.log` and
+  `cs753c-valid-lite-gpuav-probe-20261004.log` under
+  `_Build/logs`. CS8457 was not reached in these new game attempts, so the
+  real 513/512 correction is still pending game-path validation.
+- Next: use bounded isolated probes to minimize the wave64/barrier/LDS/image
+  interaction for b90e without descriptor instrumentation and the CS753c
+  GPUAV descriptor-check crash. Add synthetic RED before changing shared
+  lowering; then build, retry 1280x720 and inspect pixels/menu separately.
+  **Menu/gameplay PENDING.**
+
+
+Checkpoint **4 октября 2026 года, 17:08 UTC** (native Windows via WSL;
+branch `yotei-windows-bringup`, parent4481e348, explicit host buffer capacity):
+
+- Diagnostic4481+trace run163905 naturally exits321 at16:45:20.549UTC;
+  PID42104 exited, shown219/firstRGB spinner-scale, no menu/DeviceLost.
+  Installed diagnostic SHA `b174a05d307500c539f06e4c554666533ed2ae2bc484902f84df6b1618e230ef`.
+  CS8457 complete81column/5308444word snapshot has88533unique source words.
+  Dense admission fails at513/512: root1=6/root2=373/root3=133 at rejection.
+  No useful non-null payload overlap or non-buffer descriptor types among those
+  roots, so sharing/null normalization cannot clear this actual frontier.
+- Native CPU independent RED513 valid descriptors despite explicit host513,
+  unchanged focused + full ResourceTracking GREEN5.135s; exact513/1024/512/1
+  values/maps/immutable footprint/live bindings and cap+1/zero rollback.
+  Logs `dense-buffer-host-{cpu-red,full-cpu-green}-20261004.log{,.stderr}`;
+  GREEN SHA `523f98bbf7e0d375b4a8d39b7d4fc4c4823ab250b4a3a567ad8fa64590fc971e`.
+- Shared correction takes dense native SSBO ceiling from actual min(stage/set/
+  all-resource limits), retaining offline/logical-root512 policy. Dense binding
+  and emitter arrays become admitted-shape vectors; final DescriptorBudget still
+  counts auxiliaries/classes/stages. No guessed larger global cap/descriptor drop.
+  Native budget tests PASS `dense-buffer-host-budget-green-20261004.log`.
+  Device reports SSBO1048576 stage/set. Full vulkaninfo format dump timed out,
+  with acquired limits preserved; test harness independently checks properties.
+- Final GPU RED `dense-buffer-host-gpu-final-red-retry-20261004.log.stderr`,
+  SHA `209b53556ed1001bc22f5e321641a7d92a9f4ff903fab80f20b1923cdd789f7c`,
+  with ONLY core admission reverted rejects513/512. Revised515-stride fixture
+  fits harness eight-bit adjustment; unchanged numerical GREEN still pending.
+  Previous attempt was blocked by host Windows commit headroom, not semantic
+  failure. WSL clean-file cache drop restored headroom; guest reserve unchanged.
+  Core reversal restored. Native GPU GREEN/build/install/game retry next;
+  other-game runtime and new actual wave64 shader remain unproved.
+  **Menu/gameplay PENDING.**
+
+Checkpoint **4 октября 2026 года, 16:36 UTC** (native Windows via WSL;
+branch `yotei-windows-bringup`, pushed4481e348, derived source-work budget):
 
 - Native8d04 retry154518 naturally exited321 at15:54:58UTC onCS8457read59:
  65537 DISTINCT source words exceed the inherited global65536-word quota.
@@ -34,8 +110,20 @@ branch `yotei-windows-bringup`, parent8d04ad39, derived source-work budget):
   Same exe passes wrapped-selector/SRD-extent GPUAV neighbors. Fixture wave32;
   actual wave64 CS8457, other-game runtime and worst-case all-distinct64MiB
   cache memory/performance remain unproved. No guessed larger quota constant.
-- Native emulator build/install, actual quota-frontier retry and further rendering
-  remain pending. Existing fullCFG baseline debts/d0c NVIDIA breakpoint persist.
+- Native emulator build/install passed (`bounded-snapshot-domain-emulator-{build,install}-20261004.log`).
+  Committed/pushed/remote-readback `4481e3489bbf8464ba1df39c9cdba98ab2318b28`;
+  installed SHA256 `be25325d7fcc17efb7edd12d674b75b3457ea9a87ba392fcc84bfd0d6b9bcc2d`.
+  Bounded retry FINISHED: `yotei-integrated-20261004-161735-presentfix-gpuav`,
+  natural exit321 at16:24:48UTC, PID38036 exited. Shown224/firstRGB210
+  (spinner-scale pixels, no menu); no DeviceLost observed. CS8457 retains
+  all81columns/5308444logical words/88533distinct coherent source DWORDs,
+  clearing the previous source quota. Next failure: bounded buffer3 needs
+  dense binding513/512 (65536rows, stride592,133 candidates at rejection).
+  Static CPU audit `cs8457-buffer-plan-audit-20261004.log` PASS with header
+  provenance; logical3 is read+written, not atomic. No actual descriptor
+  payload overlap captured yet. Diagnose sharing/ownership before changing
+  admission; no blind limit increase. FullCFG baseline debts/d0c breakpoint
+  persist. Native game/build/GPU processes absent at16:29UTC.
   **Menu/gameplay PENDING.**
 
 Checkpoint **4 октября 2026 года, 15:53 UTC** (native Windows via WSL;

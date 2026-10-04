@@ -180,6 +180,30 @@ void TestDynamicBuffers() {
 	}
 }
 
+void TestDenseStorageBufferCeiling() {
+	auto limits = GenerousLimits();
+	limits.maxPerStageDescriptorStorageBuffers = 513u;
+	limits.maxDescriptorSetStorageBuffers = 1024u;
+	limits.maxPerStageResources = 515u;
+	Check(StorageBufferDescriptorCeiling(limits) == 513u, "stage ceiling was not preserved");
+	const std::array bindings {
+	    DescriptorBudgetBinding{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 513u, VK_SHADER_STAGE_COMPUTE_BIT},
+	    DescriptorBudgetBinding{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2u, VK_SHADER_STAGE_COMPUTE_BIT},
+	};
+	ExpectFailure(bindings, limits, "maxPerStageDescriptorStorageBuffers", 515u, 513u,
+	              VK_SHADER_STAGE_COMPUTE_BIT);
+	limits.maxPerStageDescriptorStorageBuffers = 515u;
+	Check(!ValidateDescriptorBudget(bindings, limits), "exact dense plus auxiliary budget rejected");
+	limits.maxDescriptorSetStorageBuffers = 512u;
+	Check(StorageBufferDescriptorCeiling(limits) == 512u, "set ceiling was not preserved");
+	ExpectFailure(bindings, limits, "maxDescriptorSetStorageBuffers", 515u, 512u, 0u);
+	limits.maxDescriptorSetStorageBuffers = 1024u;
+	limits.maxPerStageResources = 511u;
+	Check(StorageBufferDescriptorCeiling(limits) == 511u, "resource ceiling was not preserved");
+	limits.maxPerStageResources = 0u;
+	Check(StorageBufferDescriptorCeiling(limits) == 0u, "zero descriptor ceiling was not preserved");
+}
+
 void TestFragmentColorAttachments() {
 	auto limits = GenerousLimits();
 	const std::array bindings {
@@ -213,6 +237,7 @@ int main() {
 	TestSeparateSampledOperandBudget();
 	TestTexelBufferAndInputTypes();
 	TestDynamicBuffers();
+	TestDenseStorageBufferCeiling();
 	TestFragmentColorAttachments();
 	TestWideCountsAndUnsupportedTypes();
 	std::puts("DescriptorBudgetTests: passed");

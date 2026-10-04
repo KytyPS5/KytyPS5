@@ -29,6 +29,7 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
+#include "graphics/host_gpu/renderer/pipeline/DescriptorBudget.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/debug.h"
@@ -1565,7 +1566,8 @@ void CheckSpirvText(const TestCase &test, const std::vector<u32> &spirv) {
 
 CompiledShader CompileCase(const TestCase &test,
     const ShaderRecompiler::ComputeWorkgroupLimits& workgroup_limits = {},
-    const ShaderRecompiler::ShaderHostProfile& host_profile = {}) {
+    const ShaderRecompiler::ShaderHostProfile& host_profile = {},
+    u32 max_dense_buffers = ShaderRecompiler::IR::ShaderInfo::MaxBuffers) {
   auto user_data =
       MakeNativeUserData(test.has_user_data ? &test.user_data : nullptr);
   const auto uses_image =
@@ -1609,6 +1611,7 @@ CompiledShader CompileCase(const TestCase &test,
       .read_specialization_memory =
           test.buffer_addresses_are_backing_offsets ? ReadTestMemory : nullptr,
       .compute_workgroups = std::array{test.dispatch_x, test.dispatch_y, test.dispatch_z},
+      .max_dense_buffers = max_dense_buffers,
   };
   Require(test.name, "resource materialization",
           ShaderRecompiler::IR::MaterializeResources(
@@ -2074,6 +2077,18 @@ public:
   };
 
   [[nodiscard]] vk::Device Device() const { return m_device; }
+  [[nodiscard]] u32 DenseBufferCapacity() const {
+    return StorageBufferDescriptorCeiling(m_physical_device.getProperties().limits);
+  }
+  void CheckDescriptorCapacity(const TestCase& test, const CompiledShader& compiled) const {
+    std::vector<DescriptorBudgetBinding> bindings;
+    for (const auto& binding : compiled.program.bindings.descriptors)
+      bindings.push_back({static_cast<VkDescriptorType>(NativeDescriptorType(binding.kind)),
+                          NativeDescriptorCount(binding), VK_SHADER_STAGE_COMPUTE_BIT});
+    const auto limits = m_physical_device.getProperties().limits;
+    Require(test.name, "native descriptor budget", !ValidateDescriptorBudget(bindings, limits),
+            "specialized descriptor layout exceeds the actual device limits");
+  }
   void CheckValidation(const char* name) const {
     Require(name, "GPU-assisted validation", m_validation_errors.load() == 0u,
             "validation reported an error; see the GPUAV callback log");
@@ -20681,7 +20696,7 @@ void CompareGraphicsWords(const GraphicsCase &test,
 
 void RunCase(VulkanHarness *vulkan, const TestCase &test) {
   if (test.companion_check != nullptr) test.companion_check();
-  auto compiled = CompileCase(test, vulkan != nullptr ? vulkan->WorkgroupLimits() : ShaderRecompiler::ComputeWorkgroupLimits{}, vulkan != nullptr ? vulkan->HostProfile() : ShaderRecompiler::ShaderHostProfile{});
+  auto compiled = CompileCase(test, vulkan != nullptr ? vulkan->WorkgroupLimits() : ShaderRecompiler::ComputeWorkgroupLimits{}, vulkan != nullptr ? vulkan->HostProfile() : ShaderRecompiler::ShaderHostProfile{}, vulkan != nullptr ? vulkan->DenseBufferCapacity() : ShaderRecompiler::IR::ShaderInfo::MaxBuffers);
   if (test.image_descriptor_swizzle != DstSel(4, 5, 6, 7) &&
       !compiled.program.info.images.empty()) {
     Require(test.name, "resource specialization",
@@ -20700,6 +20715,7 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
     std::printf("[compute] %-32s ok\n", test.name);
     return;
   }
+  vulkan->CheckDescriptorCapacity(test, compiled);
   using Kind = ShaderRecompiler::IR::DescriptorBindingKind;
   auto Has = [&](Kind kind) {
     return ShaderRecompiler::IR::FindBinding(compiled.program.bindings, kind) !=
@@ -31397,6 +31413,77 @@ TestCase FiniteScalarBufferDescriptorExtent(bool wrapped_aliases = false, bool f
   return test;
 }
 
+// Distinct native SSBO operands above the offline 512-root policy. Read the
+// first/high/last candidates, then write the last one; preserve every other byte.
+TestCase FiniteScalarBufferHostCapacity() {
+  using O = ShaderOpcode;
+  constexpr u32 rows = 515u;
+  constexpr u32 table_base = 16384u;
+  TestCase test;
+  test.name = "FiniteScalarBufferHostCapacity";
+  test.has_compute_info = test.has_user_data = true;
+  test.compute_info = {};
+  test.compute_info.threads_num[0] = 4;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = 32;
+  test.buffer_addresses_are_backing_offsets = true;
+  test.bda_mappings = {{0, 0}};
+  test.user_data = MakeStructuredStorageBufferData(4, 16);
+  test.user_data[8] = table_base;
+  test.user_data[10] = rows*16u;
+  test.user_data[24] = 192u;
+  test.user_data[25] = 4u<<16u;
+  test.user_data[26] = 16u;
+  test.initial.assign(table_base/4u + rows*4u, 0xdeadbeefu);
+  // The harness represents the byte adjustment in eight bits. Distinct legal
+  // strides supply independent descriptors while keeping the shared base128.
+  for (u32 index = 32u; index < 32u + rows*4u; ++index)
+    test.initial[index] = 10000u + index;
+  for (u32 row = 0; row < rows; ++row) {
+    const std::array descriptor{128u, (4u*(row+1u))<<16u, 4u, 0u};
+    std::copy(descriptor.begin(), descriptor.end(), test.initial.begin()+table_base/4u+row*4u);
+  }
+  const std::array<u32,4> keys{0u,512u,514u,515u};
+  for (u32 step = 0; step < keys.size(); ++step)
+    for (u32 lane = 0; lane < 4u; ++lane)
+      test.initial[48u+step*4u+lane] = (keys[step]<<16u)|0x1234u;
+  test.expected = test.initial;
+  auto& code = test.code;
+  for (u32 step = 0; step < keys.size(); ++step) {
+    AppendVMovLiteral(&code,7,step*4u);
+    code.push_back(EncodeVop2(0x25,7,Vgpr(0),7));
+    code.push_back(EncodeMubuf0(0x0c,0,true,false));
+    code.push_back(EncodeMubuf1(4,6,7));
+    code.push_back(EncodeSopp(0x0c,0));
+    code.push_back(EncodeVop2(0x16,4,InlineU32(16),4));
+    code.push_back(EncodeVop1(0x02,20,Vgpr(4)));
+    code.push_back(EncodeSop2(0x1e,21,20,InlineU32(4)));
+    code.push_back(EncodeSmem0(0x0a,32,4));
+    code.push_back(EncodeSmem1(0,21));
+    code.push_back(EncodeSopp(0x0c,0));
+    code.push_back(EncodeMubuf0(0x0c,0,true,false));
+    code.push_back(EncodeMubuf1(8,8,0));
+    code.push_back(EncodeMubuf0(0x1c,0,true,false));
+    code.push_back(EncodeMubuf1(8,0,7));
+    for (u32 lane = 0; lane < 4u; ++lane)
+      test.expected[step*4u+lane] = keys[step] < rows ? 10000u+32u+(keys[step]+1u)*lane : 0u;
+    if (step == 2u) {
+      AppendVMovLiteral(&code,9,700u);
+      code.push_back(EncodeVop2(0x25,9,Vgpr(0),9));
+      code.push_back(EncodeMubuf0(0x1c,0,true,false));
+      code.push_back(EncodeMubuf1(9,8,0));
+      for (u32 lane = 0; lane < 4u; ++lane) test.expected[32u+515u*lane] = 700u+lane;
+    }
+  }
+  AppendEnd(&code);
+  test.required_spirv = {"OpSwitch"};
+  test.opcodes = {O::V_MOV_B32,O::V_ADD_NC_U32,O::BUFFER_LOAD_DWORD,
+                  O::V_LSHRREV_B32,O::V_READFIRSTLANE_B32,O::S_LSHL_B32,
+                  O::S_BUFFER_LOAD_DWORDX4,O::S_WAITCNT,O::BUFFER_STORE_DWORD,O::S_ENDPGM};
+  return test;
+}
+
 TestCase BoundedBufferScalarLoopStore(u32 count, bool sparse) {
   using O = ShaderOpcode;
   TestCase test;
@@ -39916,6 +40003,7 @@ std::vector<TestCase> MakeCases() {
   AddCase([] { return FiniteScalarBufferDescriptorExtent(); });
   AddCase([] { return FiniteScalarBufferDescriptorExtent(true); });
   AddCase([] { return FiniteScalarBufferDescriptorExtent(false, true); });
+  AddCase(FiniteScalarBufferHostCapacity);
   AddCase(Wave64ImageReadLoopAccumulatesWithoutFeedback);
   AddCase(Wave64SingleWaveImageFeedbackWithBound);
   AddCase(ScalarMaskWaterfallSparseExecAndReactivation);

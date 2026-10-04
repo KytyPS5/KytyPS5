@@ -489,9 +489,9 @@ struct BufferTableLayout {
 };
 
 struct ShaderInfo {
-	// Bounded/inline buffer tables expand unique dense descriptors from large SRT
-	// candidate counts (Yōtei CS 0x8457901d… walks count=65536). Match the MaxImages
-	// compiler budget of 512; Vulkan DescriptorBudget remains the hard device gate.
+	// Logical resource roots and the default offline materialization budget.
+	// Finite-table expansion may use an explicit native descriptor ceiling;
+	// dynamic binding/backend storage follows the admitted dense shape.
 	static constexpr uint32_t MaxBuffers      = 512;
 	// Inline sampled tables (Yōtei PS f8927c09) expand to ~115 dense images /
 	// pairs after selector-limited probes; keep a compiler budget of 512 with

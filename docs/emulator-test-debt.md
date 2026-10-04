@@ -1,6 +1,136 @@
 # Emulator regression test debt
 
-## Bounded snapshot source domain versus storage capacity (2026-10-04; native CPU/GPU proved, actual retry pending)
+## Dense buffer capacity supplied by the host (2026-10-04; native CPU/GPU proved, game path pending)
+
+Diagnostic native4481+trace run163905 naturally exits321 at16:45:20.549UTC,
+shown219/first RGB spinner scale; no menu/DeviceLost. Installed diagnostic SHA
+b174a05d307500c539f06e4c554666533ed2ae2bc484902f84df6b1618e230ef.
+CS8457 complete snapshot88533unique source words. Trace shows root1 six,
+root2 373 and root3 133 candidates at failure (one direct buffer); no non-null
+cross-root payload matches among those roots and no non-buffer descriptor types.
+Thus neither compatible sharing nor early non-buffer null normalization resolves
+this actual capacity frontier. Trace/analyzer are ignored diagnostic artifacts.
+
+Required native RED: one synthetic finite table contains513 genuinely distinct
+valid buffer descriptors with an explicit host admission capacity513. Check
+all raw backing descriptors, logical row mappings, origin metadata and immutable
+source footprint. Current materializer incorrectly applies unrelated fixed512.
+Keep default offline/logical-root policy512, and reject exact host-capacity+1
+transactionally, including zero/low capacities. Replace dense backend arrays
+with admitted-shape storage; no guessed larger global constant. Native renderer
+must supply actual min(stage/set storage-buffer limits); final DescriptorBudget
+still includes auxiliary descriptors and all resource classes/stages. Numerical
+GPUAV should read distinct rows beyond512, write through a final candidate,
+verify all outputs and full backing, and pass actual device descriptor checks.
+
+Native CPU RED `dense-buffer-host-cpu-red-20261004.log.stderr`, SHA
+f755cdcb20e8decec404f3e72d0b033373c1a10cee22c9eb3b6d9e94756aa06a,
+rejects513 valid unique candidates despite explicit host capacity513.
+Unchanged focused and FULL ResourceTracking GREEN5.135s, SHA
+523f98bbf7e0d375b4a8d39b7d4fc4c4823ab250b4a3a567ad8fa64590fc971e:
+513/1024/512/1 exact values/maps/footprints/live binding storage; host plus-one
+and zero capacity preserve caller outputs. Native DescriptorBudget PASS SHA
+aac7fedca7c041590467b8345270fb67fb48ef89a8be39ae6f2260f272725d4d:
+stage/set/all-resource ceilings, dense513+two auxiliary exact/overflow checks.
+
+Final numerical GPU RED `dense-buffer-host-gpu-final-red-retry-20261004.log.stderr`,
+SHA209b53556ed1001bc22f5e321641a7d92a9f4ff903fab80f20b1923cdd789f7c:
+with ONLY core admission guard reverted, rejects513/512 before dispatch.
+Fixture has515 distinct legal strides at shared base128; keys0/512/514/515,
+last-candidate write and whole backing oracle. Earlier large-address fixture
+GREEN attempt stopped at the harness eight-bit adjustment constraint (not a
+production failure/valid GREEN); revised oracle was rerun RED unchanged.
+Initial final RED attempt failed guest reserve13.5GiB due Windows commit
+pressure, not a semantic RED. Task log cache eviction and one WSL clean-file
+cache drop restored headroom; no application stopped or guest reserve reduced.
+Scoped core reversal restored from ignored fixed backup after final RED.
+Native device query reports RTX5060Ti stage/set SSBO1048576 and resources
+4294967295. Bounded vulkaninfo full format dump timed out30s/killed/drained;
+acquired properties are evidence, not an exhaustive query PASS. GPU fixture
+also obtains actual properties and checks the full native descriptor budget.
+
+Unchanged final numerical GPU GREEN without GPUAV shader instrumentation:
+`dense-buffer-host-gpu-final-plain-green-20261004.log{,.run.json}`,
+SHA7b849109b85fe32be8f35e78920457442d69a843f915048a190ae68c679fb06d,
+66.2s, exit0. The fixture checks keys0/512/514/515, last-candidate write,
+full backing and actual device descriptor budget. Neighboring
+FiniteScalarBufferDescriptorExtent, FiniteScalarBufferWrappedAliases and
+FiniteScalarBufferFullSnapshotDomain numerical GPU cases passed on the same
+test SHA (`dense-buffer-host-neighbor-{extent,wrapped,full-domain}-20261004.log`).
+GPUAV-instrumented attempt
+`dense-buffer-host-gpu-final-gpuav-green-20261004.log{,.run.json}` timed out
+at120s inside `vkCreateComputePipelines` after thousands of descriptor/OOB
+instrumentation passes; it is neither a numerical failure nor GPUAV GREEN.
+Final native full ResourceTracking run also passed on rebuilt SHA
+5bd6017cafbc78b272ee4494ebf49d1a4fb4b0482865549dab76515ca0445391
+(`dense-buffer-host-final-full-cpu-20261004.log`). Native emulator
+build/install passed; installed SHA
+045ceb1b29e313ce236335a65008debdfc69c26902c02fbd651ada77f25dcbc6.
+The 1280x720 game attempts below stopped before CS8457 materialization, so
+the real 513/512 frontier remains unverified after this correction.
+
+## Wave64 pipeline compiler and GPUAV instrumentation (2026-10-04; isolated, mechanism pending)
+
+On installed SHA045ceb1b29e313ce236335a65008debdfc69c26902c02fbd651ada77f25dcbc6,
+1280x720 run `yotei-integrated-20261004-173254-presentfix-gpuav` with GPUAV
+shader instrumentation off crashed in `nvgpucomp64.dll` at
+`vkCreateComputePipelines` for CS b90e2024732c6111 (Windows exception
+0x80000003, module offset0x589eb2); shown0. With instrumentation and descriptor
+checks on, `yotei-integrated-20261004-173407-presentfix-gpuav` reached shown255,
+but readback150-254 was black and `VkLayer_khronos_validation.dll` access
+violation stopped CS753c552fae650ec4 pipeline creation. A second bounded
+capture run `yotei-integrated-20261004-174018-presentfix-gpuav` reproduced the
+same CS753c failure, shown128, and saved exact8358-word SPIR-V at
+`shaders/0000_new_shader_cs_753c552fae650ec4.spv` (SHA256
+99a7bd0ab9e87f79c42b4145737d9fdeb26fa8ddd2af42791fa52c5150d8dfc0).
+The previous 2560x1440 run163905 had created this pipeline successfully;
+that does not prove the 1280x720 path or descriptor specialization.
+
+Bounded isolated probe on the exact module with a valid push-descriptor layout
+(bindings3 sampled image,41 storage image,49 sampler,51-53 storage buffers),
+128-byte push constants, and disable-optimization flag: without GPUAV passes;
+with game-equivalent GPUAV descriptor checks crashes in
+`VkLayer_khronos_validation.dll` at offset0x890cb4, matching the game's
+exception PC offset; changing the optimization flag does not help. Switching
+only GPUAV descriptor checks off makes the probe pass. An earlier probe without
+the required push-descriptor extension also crashed in validation and is not
+valid evidence. Game run `yotei-integrated-20261004-174908-presentfix-gpuav`
+with descriptor checks off returned to the b90e NVIDIA crash, shown0. No mode
+currently proves both pipelines on this 1280x720 path.
+
+Required regression before a production change: minimize the saved modules
+through isolated bounded probes, identify the SPIR-V operation/interaction
+that provokes each compiler, then encode it as reusable synthetic wave64,
+barrier/LDS/image cases with a meaningful pre-fix RED and unchanged post-fix
+GREEN. Preserve descriptor and execution semantics, test affected wave32 and
+multi-wave neighbors, and verify core Vulkan/GPUAV modes separately. Do not
+special-case either hash or suppress required GPU work. A driver/layer crash
+alone is diagnostic; avoid repeated full-game crashes or GPU resets while the
+smaller probe can answer the question.
+
+## Cross-root dense buffer admission (2026-10-04; diagnosis, regression pending)
+
+Native4481e348 run161735 naturally exits321 at16:24:48UTC on
+CS8457901d80b91921: logical buffer3,65536rows/stride592,133 candidates
+at dense binding513/512. Shown224/firstRGB210; no menu/DeviceLost.
+The preceding bounded snapshot succeeds with88533distinct source words.
+Static header-only CPU audit `cs8457-buffer-plan-audit-20261004.log` PASS:
+logical1/2 read-only; failing logical3 is read+written, not atomic. The163905 trace disproves useful non-null overlap among roots1/2/3. Diagnostics may
+capture full four-word candidates and semantic metadata before admission.
+
+Required synthetic regression once the mechanism is confirmed: independent
+finite descriptor roots can reference identical backing with different row
+orders. Verify each root's key-to-dense mapping and exact values. Reuse only
+semantically compatible descriptors, retaining source coherence, all rows,
+null defaults, metadata distinctions and the actual512 unique binding limit.
+If sharing writable candidates, prove union of per-root selection/write
+footprints: an unselected alias in one root must not zero a resource selected
+by another; failed selector proof keeps conservative writes. Preserve protected
+source overlap rejection and transactional failure. Native numerical GPUAV
+must check both roots' outputs/backing, with compatibility and cap controls.
+No production correction before an intended native RED. No blind cap increase.
+
+## Bounded snapshot source domain versus storage capacity (2026-10-04; native CPU/GPU proved, actual source quota cleared)
 
 Native8d04ad39 retry154518 naturally exits321 at15:54:58UTC onCS8457:
 read59 reaches65537 DISTINCT source words. Alias correction is independently
@@ -54,8 +184,10 @@ Unchanged numerical native GPUAV GREEN `bounded-snapshot-domain-gpuav-green-2026
 full65536-row/four-column SRD has262144 genuinely distinct source DWORDs;
 keys0/1/65535 all return100+lane. All12outputs and entire1MiB backing checked;
 dense descriptor identity remains1. Same exe passes wrapped aliases/SRD extent
-GPUAV neighbors. Fixture wave32; actualCS8457 wave64 retry, other-game runtime,
-and worst-case all-distinct64MiB cache memory/performance remain unproved.
+GPUAV neighbors. Fixture wave32; actual4481 retry161735 retains81columns/5308444words/
+88533unique words, then fails independently at dense buffer513/512. Full
+actual shader specialization, other-game runtime and worst-case all-distinct
+64MiB cache memory/performance remain unproved.
 
 ## Bounded SRT snapshot aliases (2026-10-04; native CPU/GPU proved, actual retry pending)
 

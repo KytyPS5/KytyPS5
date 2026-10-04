@@ -2,12 +2,20 @@
 
 #include <vulkan/vulkan_core.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <optional>
 #include <span>
 
 namespace Libs::Graphics {
+
+// A ceiling for one stage's dense SSBO operands, before the complete layout
+// charges auxiliary descriptors, other resource classes and shared stages.
+inline uint32_t StorageBufferDescriptorCeiling(const VkPhysicalDeviceLimits& limits) {
+	return std::min({limits.maxPerStageDescriptorStorageBuffers,
+	                 limits.maxDescriptorSetStorageBuffers, limits.maxPerStageResources});
+}
 
 struct DescriptorBudgetBinding {
 	VkDescriptorType   type;

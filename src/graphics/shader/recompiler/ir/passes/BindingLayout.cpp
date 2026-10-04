@@ -49,7 +49,7 @@ void AddBinding(BindingLayout& layout, DescriptorBindingKind kind,
 } // namespace
 
 bool CollectMemoryResources(const Program& program, std::vector<uint32_t>& buffers) {
-	std::array<bool, ShaderInfo::MaxBuffers> live_buffers {};
+	std::vector<bool> live_buffers(program.info.buffers.size());
 	bool uses_gds = false;
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {

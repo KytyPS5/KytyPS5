@@ -33,6 +33,10 @@ struct SrtRuntime {
 	// Optional renderer address-space query. A zero result means the requested
 	// base cannot be bound; a nonzero result is the contiguous mapped prefix.
 	SrtMemoryRangeClamper clamp_memory_range = nullptr;
+	// Dense finite-table candidates are native storage-buffer descriptors. The
+	// renderer supplies its actual stage/set ceiling; offline callers retain
+	// the conservative compiler policy. The final layout budget includes extras.
+	uint32_t max_dense_buffers = ShaderInfo::MaxBuffers;
 };
 
 // A raw scalar read bounded by a loop guard or one actual dispatch axis.

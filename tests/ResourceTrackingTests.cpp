@@ -7061,6 +7061,72 @@ void TestBoundedMaterializationLimitsAreTransactional() {
   CheckBoundedTransaction(snapshot,dense_saved,specialization,dense_specialization);
 }
 
+// Logical resource roots and physical descriptors have different capacities.
+// A renderer-provided ceiling must bound actual distinct dense candidates.
+void TestBoundedBufferHostCapacity() {
+  for (const uint32_t capacity : {513u, 1024u, 512u, 1u}) {
+    Fixture fixture;
+    InitializeBoundedSnapshot(fixture, 4u, true);
+    fixture.program.info.buffers[0].read = true;
+    fixture.program.info.buffers[0].written = true;
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Buffer;
+    memory.buffer_table = 0u;
+    const auto flags = fixture.AddMemory(memory, 4u);
+    const auto handle = fixture.Buffer({Value(0u), Value(0u), Value(0u), Value(0u)}, 4u);
+    fixture.Emit(ValueOpcode::LoadBufferU32,
+        {handle, Value(0u), Value(0u), Value(0u), Value(true)}, flags);
+    const auto plan = ExtractResourcePlan(fixture.program);
+    BoundedSnapshotReader reader;
+    reader.generated_descriptors = capacity + 1u;
+    const std::array<uint32_t, 3> data{capacity, 0x1000u, 0u};
+    auto runtime = BoundedSnapshotRuntime(reader, data);
+    runtime.max_dense_buffers = capacity;
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization),
+          "valid dense buffer table within the explicit host capacity was rejected");
+    Check(snapshot.buffers.size() == capacity && specialization.buffers.size() == capacity &&
+              specialization.buffer_tables[0].count == capacity &&
+              reader.reads.size() == uint64_t{capacity} * 4u &&
+              snapshot.immutable_srt_ranges == std::vector<ResourceReadRange>{{0x1000u, uint64_t{capacity}*16u}},
+          "host-sized table lost descriptors or coherent source footprint");
+    const auto& table = specialization.buffer_tables[0];
+    for (uint32_t row = 0; row < capacity; ++row) {
+      const auto dense = snapshot.flattened_srt[table.mapping_flat_offset + row];
+      const std::array<uint32_t, 4> expected{0x20000u + row*256u, 4u<<16u, 4u, 0u};
+      Check(dense < capacity && specialization.buffer_origins[dense] == 0u &&
+                snapshot.buffers[dense].dword_count == 4u &&
+                std::equal(expected.begin(), expected.end(), snapshot.buffers[dense].dwords.begin()),
+            "host-sized table changed a candidate value, row mapping or origin");
+    }
+    const auto saved_snapshot = snapshot;
+    const auto saved_specialization = specialization;
+    const std::array<uint32_t, 3> excess{capacity + 1u, 0x1000u, 0u};
+    runtime.user_data = excess;
+    Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+          "explicit host descriptor ceiling plus one was accepted");
+    CheckBoundedTransaction(snapshot, saved_snapshot, specialization, saved_specialization);
+    runtime.user_data = data;
+    runtime.max_dense_buffers = 0u;
+    Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+          "zero host descriptor capacity admitted a buffer");
+    CheckBoundedTransaction(snapshot, saved_snapshot, specialization, saved_specialization);
+
+    ApplyResourceSpecialization(fixture.program, saved_specialization);
+    fixture.program.shader_info_complete = true;
+    AllocateBindings(fixture.program);
+    const auto* binding = FindBinding(fixture.program.bindings, DescriptorBindingKind::Buffers);
+    Check(binding != nullptr && binding->resources.size() == capacity &&
+              fixture.program.bindings.memory_offset_count == capacity &&
+              (capacity <= 1u || !fixture.program.bindings.UsesPushData()),
+          "host-sized table did not retain every live descriptor and shader-data range");
+    for (uint32_t row = 0; row < capacity; ++row)
+      Check(binding->resources[row] == row, "dense descriptor collection lost a high resource index");
+  }
+  std::cout << "KYTY_BOUNDED_BUFFER_HOST_CAPACITY_PASS\n";
+}
+
 void TestBoundedMaterializationRejectsWritableAliases() {
   struct Scenario {
     bool overlap;
@@ -8542,6 +8608,10 @@ int main(int argc, char** argv) {
       std::cout << "KYTY_FINITE_SELECTOR_SRT_MATERIALIZATION_PASS\n";
       return 0;
     }
+    if (argc == 2 && std::strcmp(argv[1], "--bounded-buffer-host-capacity-only") == 0) {
+      TestBoundedBufferHostCapacity();
+      return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--bounded-writer-alias-only") == 0) {
       TestBoundedMaterializationCandidatesAndRemap();
       TestBoundedMaterializationRejectsWritableAliases();
@@ -8720,6 +8790,7 @@ int main(int argc, char** argv) {
     Run("comparison binding isolation", TestComparisonBindingsAreIsolated);
     Run("image binding ABI", TestImageBindingAbi);
     Run("graphics push constants", TestGraphicsPushConstantLayout);
+    Run("bounded buffer host capacity", TestBoundedBufferHostCapacity);
     Run("bounded buffer binding collection", TestBoundedBufferBindingCollection);
     Run("bounded vector table specialization", TestBoundedVectorTableSpecialization);
     Run("sampled pair operand domain", TestSampledPairOperandDomain);

@@ -1445,11 +1445,11 @@ bool ExpandBufferTables(const ResourcePlan& program, const MaterializedSnapshot&
 			});
 			uint32_t resource = 0;
 			if (candidate == table.resources.end()) {
-				if (buffers.size() >= ShaderInfo::MaxBuffers) {
+				if (buffers.size() >= runtime.max_dense_buffers) {
 					return SpecializationFail(fmt::format(
 					    "bounded buffer {} exceeds the dense buffer limit (count={} stride={} candidates={} buffers={} limit={})",
 					    logical, count, diagnostic_stride, table.resources.size() + 1u,
-					    buffers.size() + 1u, ShaderInfo::MaxBuffers));
+					    buffers.size() + 1u, runtime.max_dense_buffers));
 				}
 				resource = static_cast<uint32_t>(buffers.size());
 				buffers.push_back(descriptor);
@@ -1461,7 +1461,7 @@ bool ExpandBufferTables(const ResourcePlan& program, const MaterializedSnapshot&
 			snapshot.flattened_srt.push_back(resource);
 		}
 	}
-	if (buffers.size() > ShaderInfo::MaxBuffers) {
+	if (buffers.size() > runtime.max_dense_buffers) {
 		return SpecializationFail("specialized buffers exceed the dense buffer limit");
 	}
 	snapshot.buffers = std::move(buffers);

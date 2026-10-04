@@ -2,6 +2,99 @@
 
 ## Large CS pipeline before the shared-table frontier (2026-10-04; bounded runtime diagnosis)
 
+Current shared correction preserves Function variables/initializers in main and
+passes the original objects as typed Function-pointer arguments. No Private
+reclassification remains. The entry arithmetic invariant has valid native RED
+(67/529 entry adds, `cooperative-segment-valid-red-20261005.log`,
+SHA `d928d185964d31fe5e3eed5a0bfd500e807d79d39c4049d6995b05decafff609`)
+and unchanged GREEN (1/1). Function-lifetime RED against the Private prototype:
+`cooperative-outline-lifetime-red-20261005.stderr`, SHA
+`8af9a8e23df6814931ecdd2239fc825fc754088d1f61c872cdce741c9c74b00f`; GREEN preserves the
+initializer/interface in SPIR-V1.3/1.4 and passes the original object to both
+helpers. Merge-Phi RED validates the source then rejects the transformed
+predecessors (`cooperative-outline-merge-red-20261005.log.stderr`, SHA
+`91e9a48fb45fcb85b2dc31a4723d9895143d691251f09c593a05bec32497ad20`).
+The ABI now retains arms whose SSA values/labels escape to other entry blocks;
+merge-Phi GREEN uses the unchanged source. Atomic RMW arms, imported derived
+pointers and interfaces exceeding the universal255-argument limit retain the
+original dispatcher; no operations or resources are dropped.
+
+Final focused CPU GREEN through `cooperative-outline-merge-green-20261005.log`
+(test SHA `30e71c0a922647c958f9eabb6132fa6c5621cd7d17702fe8344e60e974da73d0`).
+Neighbor guard/phase/collective/admission/buffer-cycle/autopromotion/scalar-branch/
+shared-bounds/optimizer selectors pass on the Function-pointer variant.
+`--cooperative-spill-reuse-only` still fails its older duplicate-guard assertion;
+scoped removal of only this outlining effect also fails identically
+(`cooperative-outline-spill-baseline-20261005.log.stderr`, SHA
+`e19b0896a838dad3dc47edef6c0192c5f217d52bd007f5e748f30d37bd87325d`).
+Do not report a fully green CFG suite.
+
+Final native numerical GPUAV Function-pointer variant (compute SHA
+`24433adb518a5a5eea5ee67e3b5e8852950d08af45e6981da5a1940fce0a3384`)
+passes all9 `--wave64-multiwave-lds-only` controls, including the previously
+DeviceLost atomic reduction: `cooperative-outline-final-gpuav-wave64-multiwave-lds-only-20261005.log`.
+Cyclic guest barriers, cyclic scalar/physical addresses, BDA coefficients and
+cooperative SSBO producer/consumer also pass with independent backing/readback
+oracles (`cooperative-outline-final-gpuav-*-20261005.log`).
+Unaligned scalar load still returns the old1024/1032 wrong DWORDs
+(0xdf579bdf instead of0x13579bdf), matching the separate2026-09-28 debt below;
+this neighboring case is not GREEN.
+
+Exact CS54904 diagnostic Function-pointer rewrite validates, outlines856 arms
+and retains4 atomic arms. The same exact-layout pipeline probe completes in
+106s at about2.3GiB sampled working set, flags disable-optimization:
+`cs54904-function-pointers-pipeline-20261005.log/.run.json`.
+This is pipeline-only evidence on a diagnostic rewrite. Native emitter game
+execution, actual large CS8457 and menu remain pending.
+
+2026-10-05 continuation: exact current module captured at
+`_Build/runs/yotei-integrated-20261004-210755-cs54904-capture-noval/shaders/0001_new_shader_cs_54904fb419d79e49.spv`.
+It validates for Vulkan1.3, has860 dispatcher arms and352 Function variables;
+buffers binding0 has27 descriptors, auxiliary bindings51–54 have one each.
+Exact-layout native probe times out60s with both driver optimization modes;
+moving Function spills to invocation-private globals alone also times out60s.
+Diagnostic outlining of all860 complete arms, with typed SSA imports, private
+spills and unchanged barriers/branches/operations, validates and creates its
+pipeline in88.3s with disable-optimization (`cs54904-isolated-outlined-disableopt-20261005.log`).
+This is compiler evidence, not numerical execution or a menu.
+
+GPUAV on the first outline prototype passes LDS exchange128/256, then returns
+DeviceLost during `Wave64MultiWaveLdsAtomicReduction`
+(`cooperative-outline-gpuav-wave64-multiwave-lds-only-20261005.log`, test SHA
+`b5aba09949ed0b884e8830a26ccd32149c40f24ebb8a209676f35b0d7b0d511e`).
+Do not repeat the unbounded failing path to obtain another driver reset.
+Required CPU boundary regression before refinement: a synthetic two-arm
+dispatcher contains a workgroup atomic read-modify-write in one arm and ordinary
+arithmetic in the other. Preserve both operations and valid SPIR-V, but keep
+the RMW in the original uniform entry dispatcher rather than crossing a new
+non-inlined function call boundary. Then unchanged GREEN and original numerical
+GPUAV controls must pass. This is a conservative outlining boundary; it is not
+proof that Vulkan forbids atomic operations in functions or a diagnosed driver
+root cause. Original supported guest atomics must remain intact.
+
+Keeping RMW segments in the entry dispatcher alone still returns DeviceLost in
+the same numerical fixture (SHA `16c4f7a598a470e81ff12108e043768668841cc4b68f7d59b8153f02d30b43cd`).
+Stop GPU retries of this prototype. Next CPU lifetime RED: the original Function
+variable and initializer must retain their storage/lifetime, and each outlined
+use must refer to that original object through an explicit Function-pointer
+parameter. The Private reclassification prototype must fail this contract.
+SPIR-V1.3/1.4 validation must cover the retained initializer and interface, and
+derived pointer arguments must retain the original path unless their required
+capability is proved. This changes the earlier implementation-specific Private
+expectation to a source-lifetime invariant; the guest arithmetic oracle remains
+unchanged. Do not call either failed Private prototype a completed fix.
+
+Required synthetic RED before implementing: compare cooperative dispatchers
+with2 and16 synthetic guest blocks, each containing the same observable
+arithmetic chain and retaining guest barriers/transitions. The entry function's
+arithmetic body must stay independent of the number of dispatched segments,
+while the module retains all arithmetic work. Require valid SPIR-V before
+the intended isolation assertion fails. Then unchanged GREEN plus numerical
+cyclic LDS, scalar/buffer-address, EXEC/collective, Phi and multi-workgroup
+cases must prove invocation-private state and typed function imports. Preserve
+initializer lifetime and SPIR-V1.4+ entry interfaces. Contract:
+[SPIR-V storage and functions](https://registry.khronos.org/SPIR-V/specs/unified1/SPIRV.html).
+
 Local fix `2bfde86d` is built/installed with native Windows SHA
 `801a4195145dab7466efc9aeb81bf7fe27a67401df861ff79e05db2a0aeb8707`.
 Run `_Build/runs/yotei-integrated-20261004-205642-sharedbuffer-noval`

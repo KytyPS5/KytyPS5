@@ -573,6 +573,7 @@ struct CooperativeFunctionState {
 CooperativeFunctionState PrepareCooperativeFunction(ValueEmitContext& ctx);
 void DeclareCooperativeFunctionVariables(ValueEmitContext& ctx, const CooperativeFunctionState& function);
 void EmitCooperativeFunction(ValueEmitContext& ctx, const CooperativeFunctionState& function);
+std::vector<uint32_t> OutlineCooperativeSegments(std::vector<uint32_t> binary, uint32_t entry);
 void EmitDirectValueInstruction(ValueEmitContext& ctx, const IR::Inst& inst);
 
 enum class VertexInputScalarKind { Float, Sint, Uint };

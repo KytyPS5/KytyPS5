@@ -1,5 +1,46 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+
+Checkpoint **4 октября 2026 года, 22:14 UTC** (native Windows synthetic GPUAV
+via WSL; cooperative segment outlining, based on `9824bbab`, branch
+`yotei-windows-bringup`; emulator build/install and game retry NEXT):
+
+- Exact current CS54904 captured under
+  `_Build/runs/yotei-integrated-20261004-210755-cs54904-capture-noval/shaders/`:
+  568075words,860dispatcher arms,352Function variables. Original exact-layout
+  pipeline probes time out60s. Diagnostic Function-pointer outlining validates
+  and completes pipeline106s, disable-optimization, about2.3GiB sampled working
+  set (`cs54904-function-pointers-pipeline-20261005.log`). This is diagnostic
+  compiler evidence, not native emitter game execution or numerical proof.
+- Shared emitter correction retains the original Function objects and
+  initializers, passes typed original-object/SSA arguments and outlines complete
+  compatible segments with `DontInline`. Atomic RMW, derived pointer imports,
+  >255argument interfaces and escaping SSA/labels keep the original entry path.
+  No guest operation, candidate, branch, bounds check or barrier is dropped.
+  Earlier Private-global prototypes failed numerical atomic reduction with
+  DeviceLost and were replaced, not installed or presented as fixes.
+- Native synthetic entry-body RED67/529 arithmetic instructions -> unchanged
+  GREEN1/1; source-lifetime/initializer/interface and exported merge-Phi
+  RED/GREEN pass. Final focused CFG SHA
+  `30e71c0a922647c958f9eabb6132fa6c5621cd7d17702fe8344e60e974da73d0`.
+  Final numerical compute SHA
+  `24433adb518a5a5eea5ee67e3b5e8852950d08af45e6981da5a1940fce0a3384`
+  passes GPUAV all9multiwave LDS cases (including atomic reduction), cyclic
+  barriers, cyclic scalar/physical addresses, BDA coefficients and SSBO
+  producer/consumer. Logs `cooperative-outline-final-gpuav-*-20261005.log`;
+  exact RED revisions/commands and failed prototypes in test debt.
+- Neighbor CPU guard/phase/collective/admission/cycle/autopromotion/shared-bound/
+  optimizer checks pass. Older cooperative-spill-reuse assertion reproduces
+  without the outlining effect; unaligned scalar read still gives the older
+  1024/1032wrong words. These and the older default CFG literal assertion
+  remain open; no full-suite or cross-game-runtime claim.
+- Next: commit this completed shared fix separately, native emulator build
+  and install through `windows-local.cmd`, verify its hash, retry the original
+  game with bounded process/memory/frame guards and inspect actual readback
+  images. Verify emitted CS54904 compile completion and the later large CS8457.
+  Installed emulator is still2bfde86d at this checkpoint. **Menu/gameplay
+  PENDING.** User explicitly requests work through menu; no push authorized.
+
 Checkpoint **4 октября 2026 года, 21:01 UTC** (native Windows via WSL;
 local source commit `2bfde86d`, branch `yotei-windows-bringup`; installed SHA-256
 `801a4195145dab7466efc9aeb81bf7fe27a67401df861ff79e05db2a0aeb8707`):

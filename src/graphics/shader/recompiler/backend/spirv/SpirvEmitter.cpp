@@ -409,7 +409,10 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program, ShaderStageInputIn
 	state.builder.AddEntryPoint(ExecutionModelForStage(state.program.stage), state.main_func,
 	                            "main", state.interface_variables);
 
-	return state.builder.Build();
+	auto binary = state.builder.Build();
+	if (state.compute_execution.IsCooperativeWave64())
+		binary = OutlineCooperativeSegments(std::move(binary), state.main_func);
+	return binary;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv

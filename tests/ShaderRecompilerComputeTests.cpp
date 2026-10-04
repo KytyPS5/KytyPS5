@@ -46214,6 +46214,13 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, LdsSameAddressB96Full256Loop());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--wave64-multiwave-lds-atomic-compile-only") == 0) {
+    VulkanHarness vulkan;
+    auto test = Wave64MultiWaveLdsAtomicReduction();
+    test.compile_only = true;
+    RunCase(&vulkan, test);
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--wave64-multiwave-lds-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, Wave64MultiWaveLdsExchange128());

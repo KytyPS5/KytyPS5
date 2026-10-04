@@ -596,6 +596,9 @@ if(BUILD_TESTING)
 	set_tests_properties(emulator_present_mode_invalid PROPERTIES WILL_FAIL TRUE)
 	add_test(NAME ime_dialog COMMAND $<TARGET_FILE:ime_dialog_tests>)
 	add_test(NAME shader_cfg COMMAND $<TARGET_FILE:shader_cfg_tests>)
+	add_test(NAME shader_cooperative_segment_isolation
+	         COMMAND $<TARGET_FILE:shader_cfg_tests> --cooperative-segment-isolation-only)
+	set_tests_properties(shader_cooperative_segment_isolation PROPERTIES TIMEOUT 60)
 	add_test(NAME graphics_wave64_collective_routing
 	         COMMAND $<TARGET_FILE:shader_cfg_tests> --graphics-wave64-collective-routing-only)
 	add_test(NAME homogeneous_indirect_image_validation

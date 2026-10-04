@@ -11573,6 +11573,216 @@ void TestCooperativeWave64ConsecutiveLdsReadsSharePhase() {
         "cooperative LDS read/write hazards lost their phase boundaries");
 }
 
+void TestCooperativeSegmentBodyIsolation() {
+  using F = CooperativeExecutionFixture;
+  using O = F::O;
+  using V = F::V;
+  const auto compile = [](uint32_t count) {
+    F f;
+    f.Emit(0, O::Barrier);
+    for (uint32_t index = 1; index < count; ++index) f.AddBlock();
+    for (uint32_t index = 0; index < count; ++index) {
+      auto value = f.Emit(index, O::IAdd32, {f.local, f.lane});
+      for (uint32_t step = 0; step < 32u; ++step)
+        value = f.Emit(index, O::IAdd32, {value, V(step + index + 1u)});
+      f.Emit(index, O::ReferenceU32, {value});
+      if (index + 1u < count) f.Branch(index, index + 1u);
+    }
+    Check(f.Plan().IsCooperativeWave64(), "segment isolation fixture lost cooperative scheduling");
+    ShaderRecompiler::IR::BuildSrtPlan(f.program);
+    ShaderRecompiler::IR::TrackResources(f.program);
+    ShaderRecompiler::TranslateResult translated;
+    translated.program = std::move(f.program);
+    auto options = MakeCompileOptions(ShaderType::Compute);
+    options.wave_size = 64u;
+    options.input_info.compute = &f.compute;
+    options.compute_workgroup_limits = f.limits;
+    auto compiled = ShaderRecompiler::CompileProgram(std::move(translated), options, {}, 0u);
+    CheckSpirvBinaryValidates(compiled.spirv);
+    return compiled.spirv;
+  };
+  const auto entry_adds = [](const std::vector<uint32_t>& words) {
+    uint32_t entry = 0, function = 0, adds = 0;
+    for (size_t at = 5; at < words.size(); at += words[at] >> 16u) {
+      const auto op = words[at] & 0xffffu;
+      if (op == 15u) entry = words[at + 2u];
+      if (op == 54u) function = words[at + 2u];
+      if (op == 128u && function == entry) ++adds;
+    }
+    return adds;
+  };
+  const auto small = compile(2u), large = compile(16u);
+  Check(SpirvInstructionOpcodeCount(large, 128u) >
+            SpirvInstructionOpcodeCount(small, 128u),
+        "segment isolation fixture discarded the larger guest workload");
+  std::fprintf(stderr, "isolation main adds=%u/%u functions=%u/%u\n", entry_adds(small), entry_adds(large), SpirvInstructionOpcodeCount(small,54u), SpirvInstructionOpcodeCount(large,54u));
+  Check(entry_adds(large) == entry_adds(small),
+        "cooperative entry function grows with every dispatched arithmetic body");
+}
+
+void TestCooperativeOutlineInterfacesAndInitializers() {
+  const char* source = R"(
+    OpCapability Shader
+    OpMemoryModel Logical GLSL450
+    OpEntryPoint GLCompute %main "main"
+    OpExecutionMode %main LocalSize 1 1 1
+    %void = OpTypeVoid
+    %uint = OpTypeInt 32 0
+    %fn = OpTypeFunction %void
+    %local_ptr = OpTypePointer Function %uint
+    %private_ptr = OpTypePointer Private %uint
+    %seven = OpConstant %uint 7
+    %two = OpConstant %uint 2
+    %main = OpFunction %void None %fn
+    %entry = OpLabel
+    %spill = OpVariable %local_ptr Function %seven
+    %seed = OpLoad %uint %spill
+    %key = OpUMod %uint %seed %two
+    OpSelectionMerge %merge None
+    OpSwitch %key %invalid 0 %first 1 %last
+    %invalid = OpLabel
+    OpUnreachable
+    %first = OpLabel
+    %sum = OpIAdd %uint %seed %two
+    OpStore %spill %sum
+    OpBranch %merge
+    %last = OpLabel
+    %product = OpIMul %uint %seed %two
+    OpStore %spill %product
+    OpBranch %merge
+    %merge = OpLabel
+    OpReturn
+    OpFunctionEnd
+  )";
+  for (const auto environment : {SPV_ENV_UNIVERSAL_1_3, SPV_ENV_UNIVERSAL_1_4}) {
+    spvtools::SpirvTools assembler(environment);
+    std::vector<uint32_t> original;
+    Check(assembler.Assemble(source, &original), "outline lifetime fixture did not assemble");
+    CheckSpirvBinaryValidates(original);
+    uint32_t entry = 0, spill = 0, initializer = 0;
+    for (size_t at = 5; at < original.size(); at += original[at] >> 16u) {
+      if ((original[at] & 0xffffu) == 15u) entry = original[at + 2u];
+      if ((original[at] & 0xffffu) == 59u) {
+        spill = original[at + 2u]; initializer = original[at + 4u];
+      }
+    }
+    const auto outlined = ShaderRecompiler::Spirv::Emitter::OutlineCooperativeSegments(original, entry);
+    CheckSpirvBinaryValidates(outlined);
+    Check(SpirvInstructionOpcodeCount(outlined, 128u) == 1u &&
+              SpirvInstructionOpcodeCount(outlined, 132u) == 1u,
+          "outlining changed observable arithmetic");
+    bool retained_initializer = false, exposed_private = false;
+    uint32_t object_arguments = 0;
+    for (size_t at = 5; at < outlined.size(); at += outlined[at] >> 16u) {
+      if ((outlined[at] & 0xffffu) == 59u && outlined[at + 2u] == spill)
+        retained_initializer = outlined[at + 3u] == 7u && outlined[at + 4u] == initializer;
+      if ((outlined[at] & 0xffffu) == 15u) {
+        for (size_t operand = 4; operand < (outlined[at] >> 16u); ++operand)
+          exposed_private |= outlined[at + operand] == spill;
+      }
+      if ((outlined[at] & 0xffffu) == 57u) {
+        for (size_t operand = 4; operand < (outlined[at] >> 16u); ++operand)
+          object_arguments += outlined[at + operand] == spill;
+      }
+    }
+    Check(retained_initializer, "outlining changed the original Function state lifetime");
+    Check(!exposed_private, "entry interface exposed call-local Function state");
+    Check(object_arguments == 2u,
+          "outlined stores did not receive the original Function memory object");
+  }
+}
+
+void TestCooperativeOutlineAtomicBoundary() {
+  const char* source = R"(
+    OpCapability Shader
+    OpMemoryModel Logical GLSL450
+    OpEntryPoint GLCompute %main "main"
+    OpExecutionMode %main LocalSize 1 1 1
+    %void = OpTypeVoid
+    %uint = OpTypeInt 32 0
+    %fn = OpTypeFunction %void
+    %ptr = OpTypePointer Workgroup %uint
+    %shared = OpVariable %ptr Workgroup
+    %one = OpConstant %uint 1
+    %two = OpConstant %uint 2
+    %zero = OpConstant %uint 0
+    %main = OpFunction %void None %fn
+    %entry = OpLabel
+    OpSelectionMerge %merge None
+    OpSwitch %one %invalid 0 %first 1 %last
+    %invalid = OpLabel
+    OpUnreachable
+    %first = OpLabel
+    %sum = OpIAdd %uint %one %two
+    OpBranch %merge
+    %last = OpLabel
+    %old = OpAtomicIAdd %uint %shared %two %zero %one
+    OpBranch %merge
+    %merge = OpLabel
+    OpReturn
+    OpFunctionEnd
+  )";
+  spvtools::SpirvTools assembler(SPV_ENV_UNIVERSAL_1_3);
+  std::vector<uint32_t> original;
+  Check(assembler.Assemble(source, &original), "atomic boundary fixture did not assemble");
+  CheckSpirvBinaryValidates(original);
+  uint32_t entry = 0;
+  for (size_t at = 5; at < original.size(); at += original[at] >> 16u)
+    if ((original[at] & 0xffffu) == 15u) entry = original[at + 2u];
+  const auto outlined = ShaderRecompiler::Spirv::Emitter::OutlineCooperativeSegments(original, entry);
+  CheckSpirvBinaryValidates(outlined);
+  Check(SpirvInstructionOpcodeCount(outlined, 234u) == 1u &&
+            SpirvInstructionOpcodeCount(outlined, 128u) == 1u,
+        "atomic boundary removed guest work");
+  uint32_t function = 0;
+  for (size_t at = 5; at < outlined.size(); at += outlined[at] >> 16u) {
+    const auto op = outlined[at] & 0xffffu;
+    if (op == 54u) function = outlined[at + 2u];
+    if (op == 234u) Check(function == entry,
+        "cooperative atomic RMW crossed an unproved outlined call boundary");
+  }
+}
+
+void TestCooperativeOutlineMergeValues() {
+  const char* source = R"(
+    OpCapability Shader
+    OpMemoryModel Logical GLSL450
+    OpEntryPoint GLCompute %main "main"
+    OpExecutionMode %main LocalSize 1 1 1
+    %void = OpTypeVoid
+    %uint = OpTypeInt 32 0
+    %fn = OpTypeFunction %void
+    %one = OpConstant %uint 1
+    %two = OpConstant %uint 2
+    %main = OpFunction %void None %fn
+    %entry = OpLabel
+    OpSelectionMerge %merge None
+    OpSwitch %one %invalid 0 %first 1 %last
+    %invalid = OpLabel
+    OpUnreachable
+    %first = OpLabel
+    %sum = OpIAdd %uint %one %two
+    OpBranch %merge
+    %last = OpLabel
+    %product = OpIMul %uint %one %two
+    OpBranch %merge
+    %merge = OpLabel
+    %value = OpPhi %uint %sum %first %product %last
+    OpReturn
+    OpFunctionEnd
+  )";
+  spvtools::SpirvTools assembler(SPV_ENV_UNIVERSAL_1_3);
+  std::vector<uint32_t> original;
+  Check(assembler.Assemble(source, &original), "outline merge fixture did not assemble");
+  CheckSpirvBinaryValidates(original);
+  uint32_t entry = 0;
+  for (size_t at = 5; at < original.size(); at += original[at] >> 16u)
+    if ((original[at] & 0xffffu) == 15u) entry = original[at + 2u];
+  const auto outlined = ShaderRecompiler::Spirv::Emitter::OutlineCooperativeSegments(original, entry);
+  CheckSpirvBinaryValidates(outlined);
+  Check(outlined == original, "outlining lost values exported to the entry merge");
+}
+
 void TestCooperativeWave64CollectivesUseSharedFunctions() {
   using namespace ShaderRecompiler;
   using O = IR::ValueOpcode;
@@ -11619,7 +11829,18 @@ void TestCooperativeWave64CollectivesUseSharedFunctions() {
   translated.program = std::move(program);
   const auto compiled = CompileProgram(std::move(translated), options, {}, 0u);
   CheckSpirvBinaryValidates(compiled.spirv);
-  Check(SpirvInstructionOpcodeCount(compiled.spirv, 57u) == 6u,
+  std::set<uint32_t> collective_functions;
+  for (size_t at = 5; at < compiled.spirv.size(); at += compiled.spirv[at] >> 16u) {
+    if ((compiled.spirv[at] & 0xffffu) != 5u) continue;
+    const std::string name(reinterpret_cast<const char*>(&compiled.spirv[at + 2u]));
+    if (name == "cooperative_wave64_ballot" || name == "cooperative_wave64_read_lane")
+      collective_functions.insert(compiled.spirv[at + 1u]);
+  }
+  uint32_t collective_calls = 0;
+  for (size_t at = 5; at < compiled.spirv.size(); at += compiled.spirv[at] >> 16u)
+    if ((compiled.spirv[at] & 0xffffu) == 57u &&
+        collective_functions.contains(compiled.spirv[at + 3u])) ++collective_calls;
+  Check(collective_calls == 6u,
         "cooperative wave64 collectives were duplicated instead of calling shared functions");
   Check(SpirvInstructionOpcodeCount(compiled.spirv, 360u) == 1u,
         "cooperative wave64 ballot duplicated its subgroup reduction body");
@@ -19010,6 +19231,14 @@ int RunShaderBatchAudit(int argc, char* argv[]);
 
 
 int main(int argc, char* argv[]) {
+  if (argc == 2 && std::strcmp(argv[1], "--cooperative-segment-isolation-only") == 0) {
+    Libs::Graphics::EnsureConfigInitialized();
+    Libs::Graphics::TestCooperativeSegmentBodyIsolation();
+    Libs::Graphics::TestCooperativeOutlineInterfacesAndInitializers();
+    Libs::Graphics::TestCooperativeOutlineAtomicBoundary();
+    Libs::Graphics::TestCooperativeOutlineMergeValues();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--ngg-vertex-entry-only") == 0) {
     Libs::Graphics::EnsureConfigInitialized();
     Libs::Graphics::TestNggVertexEntryState();

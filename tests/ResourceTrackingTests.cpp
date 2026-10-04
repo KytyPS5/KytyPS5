@@ -18,6 +18,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <unordered_set>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -6874,6 +6875,83 @@ void TestBoundedMaterializationCandidatesAndRemap() {
   }
 }
 
+// Dense selector rows may alias the same immutable DWORD. The memory-work
+// budget covers distinct coherent source words; every logical row still exists.
+void TestBoundedSnapshotUniqueWords() {
+  struct Reader {
+    std::unordered_set<uint64_t> reads;
+    uint64_t fail = UINT64_MAX;
+    static bool Clean(void* data, uint64_t address, std::span<uint32_t> out) {
+      auto& self = *static_cast<Reader*>(data);
+      Check(out.size() == 1u && address >= 0x1000u && address < 0x50000u,
+            "unique snapshot reader escaped its backing");
+      Check(self.reads.insert(address).second, "immutable source DWORD was read twice");
+      if (address == self.fail) return false;
+      out[0] = 0x13579bdfu ^ (uint32_t((address - 0x1000u) / 4u) * 0x10201u);
+      return true;
+    }
+  };
+  const auto check = [](uint32_t count, uint32_t scale, uint32_t bias,
+                        bool scalar, uint32_t bytes, uint32_t unique, bool accepted,
+                        uint64_t fail = UINT64_MAX) {
+    Fixture fixture;
+    InitializeBoundedSnapshot(fixture, 2u, false);
+    const auto source = scalar
+        ? AddBoundedSnapshotSource(fixture, {Value(0x1000u), Value(0u), Value(bytes), Value(0u)})
+        : AddBoundedSnapshotSource(fixture, {Value(0x1000u), Value(0u)});
+    for (uint32_t col = 0; col < 2u; ++col) {
+      auto& read = fixture.program.bounded_srt_reads[col];
+      read.address_source = source;
+      read.offset_scale = scale;
+      read.offset_bias = col * bias;
+    }
+    auto plan = ExtractResourcePlan(fixture.program);
+    Reader reader;
+    reader.fail = fail;
+    const std::array<uint32_t, 1> data{count};
+    SrtRuntime runtime{.user_data=data, .read_memory=RejectTestMemory,
+                       .userdata=&reader, .read_specialization_memory=Reader::Clean};
+    ResourceSnapshot snapshot;
+    snapshot.user_data = {0xfeedu};
+    ResourceSpecialization specialization;
+    const auto old_snapshot = snapshot;
+    const auto old_specialization = specialization;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) == accepted,
+          "bounded immutable aliases were charged as distinct source probes");
+    if (!accepted) {
+      CheckBoundedTransaction(snapshot, old_snapshot, specialization, old_specialization);
+      Check(reader.reads.size() <= 65536u, "unique-word budget read its plus-one source");
+      Check(fail == UINT64_MAX ? reader.reads.size() == 65536u
+                              : reader.reads.contains(fail),
+            "bounded source rejection did not reach its required boundary");
+      return;
+    }
+    Check(reader.reads.size() == unique && snapshot.flattened_srt.size() == uint64_t(count)*2u,
+          "bounded alias snapshot dropped rows or lost source caching");
+    for (uint32_t col = 0; col < 2u; ++col) {
+      Check(specialization.bounded_srt_reads[col] == BoundedSrtLayout{count, col*count},
+            "alias snapshot changed live selector layout");
+      for (uint32_t row = 0; row < count; ++row) {
+        const uint32_t offset = (row*scale + col*bias) & ~3u;
+        const uint32_t expected = scalar && uint64_t(offset)+4u > bytes ? 0u
+            : 0x13579bdfu ^ ((offset/4u)*0x10201u);
+        Check(snapshot.flattened_srt[uint64_t(col)*count + row] == expected,
+              "alias snapshot changed a live row or descriptor OOB result");
+      }
+    }
+    uint64_t captured = 0;
+    for (const auto& range : snapshot.immutable_srt_ranges) captured += range.size;
+    Check(captured == uint64_t(unique)*4u, "immutable alias footprint lost unique words");
+  };
+  check(65536u, 0u, 4u, true, 8u, 2u, true); // Intended pre-fix RED.
+  check(65536u, 0u, 4u, false, 0u, 2u, true);
+  check(32769u, 4u, 4u, false, 0u, 32770u, true); // Partial column overlap.
+  check(65536u, 0x80000000u, 4u, true, 8u, 2u, true); // Wrapped re-entry / OOB.
+  check(32768u, 8u, 4u, false, 0u, 65536u, true);
+  check(32769u, 8u, 4u, false, 0u, 0u, false);
+  check(65536u, 0u, 4u, true, 8u, 0u, false, 0x1004u);
+}
+
 void TestBoundedScalarProbeBudget() {
   const auto check = [](uint32_t count, uint32_t scale, uint32_t bytes,
                         uint32_t columns, bool expected) {
@@ -6927,8 +7005,8 @@ void TestBoundedScalarProbeBudget() {
   check(6u, 0x80000000u, 8u, 2u, true); // Wrapped offsets re-enter the descriptor.
   check(0u, 16u, 8u, 2u, true);
   check(65536u, 16u, 0u, 2u, true);
-  check(32768u, 0u, 8u, 2u, true); // Exactly 65536 probes despite cache reuse.
-  check(32769u, 0u, 8u, 2u, false);
+  check(32768u, 0u, 8u, 2u, true); // Two unique coherent words.
+  check(32769u, 0u, 8u, 2u, true);
   check(65536u, 16u, 0u, 256u, true); // Existing 64 MiB storage cap.
   check(65536u, 16u, 0u, 257u, false);
 }
@@ -6936,21 +7014,21 @@ void TestBoundedScalarProbeBudget() {
 void TestBoundedMaterializationLimitsAreTransactional() {
   Fixture fixture;
   InitializeBoundedSnapshot(fixture,2u,false);
-  for (auto& read : fixture.program.bounded_srt_reads) { read.offset_scale=0u; read.offset_bias=0u; }
+  // Distinct interleaved source DWORDs exercise the actual memory-work budget.
   auto plan = ExtractResourcePlan(fixture.program);
   BoundedSnapshotReader reader;
-  reader.words={{0x1000u,0x1234u}};
+  reader.generated_descriptors = 16385u;
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
   const std::array<uint32_t,3> at_limit{32768u,0x1000u,0u};
   Check(MaterializeResources(plan,BoundedSnapshotRuntime(reader,at_limit),snapshot,specialization) &&
-            snapshot.flattened_srt.size()==65536u && reader.reads.size()==1u,
-        "exact total 65536-probe bounded snapshot failed");
+            snapshot.flattened_srt.size()==65536u && reader.reads.size()==65536u,
+        "exact total 65536-unique-word bounded snapshot failed");
   const auto saved_snapshot=snapshot;
   const auto saved_specialization=specialization;
   const std::array<uint32_t,3> over_limit{32769u,0x1000u,0u};
   Check(!MaterializeResources(plan,BoundedSnapshotRuntime(reader,over_limit),snapshot,specialization),
-        "total bounded probes exceeded 65536 across columns");
+        "distinct bounded source words exceeded 65536 across columns");
   CheckBoundedTransaction(snapshot,saved_snapshot,specialization,saved_specialization);
 
   Fixture dense;
@@ -8508,6 +8586,11 @@ int main(int argc, char** argv) {
       std::cout << "KYTY_BOUNDED_WRITE_ALIAS_PASS\n";
       return 0;
     }
+    if (argc == 2 && std::strcmp(argv[1], "--bounded-unique-words-only") == 0) {
+      TestBoundedSnapshotUniqueWords();
+      std::cout << "KYTY_BOUNDED_UNIQUE_WORDS_PASS\n";
+      return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--bounded-scalar-probe-budget-only") == 0) {
       TestBoundedScalarProbeBudget();
       TestBoundedMaterializationLimitsAreTransactional();
@@ -8591,6 +8674,7 @@ int main(int argc, char** argv) {
     Run("TestBoundedMaterializationZerosUnmappedScalarRows",
         TestBoundedMaterializationZerosUnmappedScalarRows);
     Run("TestBoundedMaterializationCandidatesAndRemap", TestBoundedMaterializationCandidatesAndRemap);
+    Run("TestBoundedSnapshotUniqueWords", TestBoundedSnapshotUniqueWords);
     Run("TestBoundedScalarProbeBudget", TestBoundedScalarProbeBudget);
     Run("TestBoundedMaterializationLimitsAreTransactional", TestBoundedMaterializationLimitsAreTransactional);
     Run("TestBoundedMaterializationRejectsWritableAliases", TestBoundedMaterializationRejectsWritableAliases);

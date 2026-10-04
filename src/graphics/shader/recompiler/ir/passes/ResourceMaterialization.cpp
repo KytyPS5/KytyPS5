@@ -13,6 +13,7 @@
 #include <array>
 #include <bit>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <functional>
@@ -27,7 +28,7 @@ namespace {
 constexpr uint64_t AddressMask            = 0x0000ffffffffffffull;
 constexpr uint64_t RegisteredBufferAddressLimit = uint64_t{1} << 40u;
 constexpr uint64_t MaxIndirectImageProbes = 65536u;
-// Storage reservations and logical probe counts have separate budgets.
+// Dense logical rows and distinct coherent source DWORDs have separate budgets.
 constexpr uint64_t MaxBoundedSnapshotProbes = 65536u;
 constexpr uint64_t MaxBoundedSnapshotBytes = 64u * 1024u * 1024u;
 constexpr uint64_t MaxBoundedSnapshotWords = MaxBoundedSnapshotBytes / sizeof(uint32_t);
@@ -849,7 +850,9 @@ bool MaterializeBoundedReads(const ResourcePlan& program, const SrtRuntime& runt
 		flat.assign(static_cast<size_t>(reserved_words), 0u);
 	}
 
-	uint64_t snapshot_probes = 0;
+	// Repeated selector rows/columns observe one immutable word. Charge memory
+	// work once per resolved address; dense output work still has the storage cap.
+	std::unordered_map<uint64_t, uint32_t> bounded_words;
 	uint32_t workgroup_slot = 0;
 	for (uint32_t id = 0; id < program.bounded_srt_reads.size(); id++) {
 		const auto& read = program.bounded_srt_reads[id];
@@ -932,21 +935,6 @@ bool MaterializeBoundedReads(const ResourcePlan& program, const SrtRuntime& runt
 		const auto buffer_in_bounds = [&](uint64_t offset) {
 			return offset <= bytes && bytes - offset >= sizeof(uint32_t);
 		};
-		uint64_t probes = size;
-		if (scalar_buffer) {
-			// Descriptor-proven OOB words consume dense storage, but never read memory.
-			// Keep every logical selector row: wrapped offsets can re-enter the extent.
-			probes = 0;
-			for (uint32_t index = 0; index < size; ++index) {
-				probes += buffer_in_bounds(buffer_offset(index));
-			}
-		}
-		if (snapshot_probes > MaxBoundedSnapshotProbes - probes) {
-			return SpecializationFail(fmt::format(
-			    "bounded SRT read {} exceeds snapshot probe limit (probes={} probe_limit={})",
-			    id, snapshot_probes + probes, MaxBoundedSnapshotProbes));
-		}
-		snapshot_probes += probes;
 		for (uint32_t index = 0; index < size; index++) {
 			const uint32_t dynamic = index * read.offset_scale + read.offset_bias;
 			int64_t offset = 0;
@@ -982,13 +970,23 @@ bool MaterializeBoundedReads(const ResourcePlan& program, const SrtRuntime& runt
 			// Unmapped foreign rows keep table width with a zero word — same guest
 			// result as a scalar buffer load past its mapped extent.
 			uint32_t word = 0;
-			if (runtime.clamp_memory_range != nullptr &&
-			    runtime.clamp_memory_range(runtime.userdata, address, sizeof(uint32_t)) == 0u) {
-				word = 0u;
-			} else if (!ReadSpecializationWord(runtime, address, word)) {
-				return SpecializationFail(fmt::format(
-				    "bounded SRT read {} index {} cannot read coherent source at 0x{:x}", id, index,
-				    address));
+			if (const auto found = bounded_words.find(address); found != bounded_words.end()) {
+				word = found->second;
+			} else {
+				if (bounded_words.size() >= MaxBoundedSnapshotProbes) {
+					return SpecializationFail(fmt::format(
+					    "bounded SRT read {} exceeds unique source-word limit (words={} word_limit={})",
+					    id, bounded_words.size() + 1u, MaxBoundedSnapshotProbes));
+				}
+				if (runtime.clamp_memory_range != nullptr &&
+				    runtime.clamp_memory_range(runtime.userdata, address, sizeof(uint32_t)) == 0u) {
+					word = 0u;
+				} else if (!ReadSpecializationWord(runtime, address, word)) {
+					return SpecializationFail(fmt::format(
+					    "bounded SRT read {} index {} cannot read coherent source at 0x{:x}", id,
+					    index, address));
+				}
+				bounded_words.emplace(address, word);
 			}
 			if (workgroup_column) {
 				flat[start + index] = word;
@@ -996,6 +994,10 @@ bool MaterializeBoundedReads(const ResourcePlan& program, const SrtRuntime& runt
 				flat.push_back(word);
 			}
 		}
+	}
+	if (std::getenv("KYTY_SHADER_AUDIT_BOUNDED_WORDS") != nullptr) {
+		std::fprintf(stderr, "shader bounded snapshot: columns=%zu stored_words=%zu unique_words=%zu\n",
+		             program.bounded_srt_reads.size(), flat.size(), bounded_words.size());
 	}
 	return true;
 }

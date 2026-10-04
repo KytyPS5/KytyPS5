@@ -31334,10 +31334,11 @@ TestCase BufferStoreFormatXDropsOutOfRangeRecord() {
 // A bounded scalar loop selects writable descriptors from an immutable SRT.
 // A full 16-bit GPU selector indexes a descriptor containing just one row.
 // OOB rows must retain their zero descriptor, with no host memory probes.
-TestCase FiniteScalarBufferDescriptorExtent() {
+TestCase FiniteScalarBufferDescriptorExtent(bool wrapped_aliases = false) {
   using O = ShaderOpcode;
   TestCase test;
-  test.name = "FiniteScalarBufferDescriptorExtent";
+  test.name = wrapped_aliases ? "FiniteScalarBufferWrappedAliases"
+                              : "FiniteScalarBufferDescriptorExtent";
   test.has_compute_info = test.has_user_data = true;
   test.compute_info = {};
   test.compute_info.threads_num[0] = 4;
@@ -31346,17 +31347,19 @@ TestCase FiniteScalarBufferDescriptorExtent() {
   test.compute_info.wave_size = 32;
   test.buffer_addresses_are_backing_offsets = true;
   test.bda_mappings = {{0, 0}};
-  test.user_data = MakeStructuredStorageBufferData(4, 12);
+  test.user_data = MakeStructuredStorageBufferData(4, wrapped_aliases ? 20 : 12);
   test.user_data[8] = 512u; // Immutable scalar-buffer SRD, byte extent 16.
   test.user_data[10] = 16u;
   test.user_data[24] = 192u; // Read-only selector input SRD.
   test.user_data[25] = 4u << 16u;
-  test.user_data[26] = 12u;
+  test.user_data[26] = wrapped_aliases ? 20u : 12u;
   test.initial.assign(136u, 0xdeadbeefu);
   const std::array descriptor{128u, 4u << 16u, 4u, 0u};
   std::copy(descriptor.begin(), descriptor.end(), test.initial.begin() + 128u);
   for (u32 lane = 0; lane < 4u; ++lane) test.initial[32u + lane] = 100u + lane;
-  constexpr std::array keys{0u, 1u, 65535u};
+  const std::vector<u32> keys = wrapped_aliases
+      ? std::vector<u32>{0u, 1u, 2u, 65534u, 65535u}
+      : std::vector<u32>{0u, 1u, 65535u};
   for (u32 step = 0; step < keys.size(); ++step)
     for (u32 lane = 0; lane < 4u; ++lane)
       test.initial[48u + step * 4u + lane] = (keys[step] << 16u) | 0x1234u;
@@ -31370,7 +31373,7 @@ TestCase FiniteScalarBufferDescriptorExtent() {
     code.push_back(EncodeSopp(0x0c, 0));
     code.push_back(EncodeVop2(0x16, 4, InlineU32(16), 4)); // V_LSHRREV_B32.
     code.push_back(EncodeVop1(0x02, 20, Vgpr(4)));
-    code.push_back(EncodeSop2(0x1e, 21, 20, InlineU32(4)));
+    code.push_back(EncodeSop2(0x1e, 21, 20, InlineU32(wrapped_aliases ? 31u : 4u)));
     code.push_back(EncodeSmem0(0x0a, 32, 4));
     code.push_back(EncodeSmem1(0, 21));
     code.push_back(EncodeSopp(0x0c, 0));
@@ -31379,7 +31382,8 @@ TestCase FiniteScalarBufferDescriptorExtent() {
     code.push_back(EncodeMubuf0(0x1c, 0, true, false));
     code.push_back(EncodeMubuf1(8, 0, 7));
     for (u32 lane = 0; lane < 4u; ++lane)
-      test.expected[step * 4u + lane] = step == 0u ? 100u + lane : 0u;
+      test.expected[step * 4u + lane] =
+          (wrapped_aliases ? (keys[step] & 1u) == 0u : step == 0u) ? 100u + lane : 0u;
   }
   AppendEnd(&code);
   test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::BUFFER_LOAD_DWORD,
@@ -39905,7 +39909,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(Wave64ReadLaneAcrossAllHalves);
   AddCase(Wave64SparseWaterfallIndependentWaves);
   AddCase(Wave64MultidimensionalGuestGeometry);
-  AddCase(FiniteScalarBufferDescriptorExtent);
+  AddCase([] { return FiniteScalarBufferDescriptorExtent(); });
+  AddCase([] { return FiniteScalarBufferDescriptorExtent(true); });
   AddCase(Wave64ImageReadLoopAccumulatesWithoutFeedback);
   AddCase(Wave64SingleWaveImageFeedbackWithBound);
   AddCase(ScalarMaskWaterfallSparseExecAndReactivation);

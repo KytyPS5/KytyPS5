@@ -1,5 +1,41 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **4 октября 2026 года, 15:42 UTC** (native Windows via WSL;
+branch `yotei-windows-bringup`, parentdf835e1e, bounded snapshot alias correction):
+
+- Previous native retry151821 naturally exited321 on CS8457901d80b91921:
+  boundedread59 charged65580 logical references against65536 probes.
+  ActualCS0102 passed3buffers/SPIR-V3283words/pipeline66ms. Shown210,
+  firstRGB201/max214colored pixels; offscreenwindow1523black. No menu or
+  DeviceLost observed; PID37208 exited.
+- Independent native CPU RED `bounded-unique-words-red-20261004.log.stderr`
+  rejects131072 references to just2 coherent DWORDs. Shared bounded snapshots
+  now cache and charge distinct resolved source words; every logical row,
+  descriptor extent/U32 wrap/address validation and immutable source range
+  remains. Limits unchanged:65536 unique words/per-column keys and64MiB storage;
+  workgroup reservations and actual dense descriptor capacities stay bounded.
+- Unchanged primary CPU oracle and full ResourceTracking pass
+  `bounded-unique-words-final-resource-suite-20261004.log` (5.75s, nativeSHA
+  `9c5b5e65b32ac78e396147ff6c813b6cfed6ff12a2ef8267834b9c5aa217e3bb`).
+  Covers65536 DISTINCT words/plus-one/transactional failure, overlapping columns,
+  wrapped rows/OOB zeros, failed coherent callback and immutable footprints.
+  Old quota test counting cached aliases is replaced by genuinely distinct
+  source addresses; no row or backing-value oracle is dropped.
+- Native GPU RED with ONLY core patch absent rejects98304references at third
+  column (`bounded-unique-words-gpu-red-20261004.log.stderr`). Unchanged
+  numerical GPUAV GREEN `bounded-unique-words-gpuav-green-20261004.log`:
+  finite16-bit keys shifted31bits return to the same4 descriptor words for
+  even keys; odd keys are SRD OOB. All20outputs and full backing checked.
+  NativeSHA `c24756300940223520f7689dd3cd80e8cb584d73e9631ad5768c08fac72b3071`.
+  Descriptor extent/sparse scalar-loop and4 zero-stride GPUAV neighbors pass.
+  Fixture wave32;
+  actual wave64 CS8457 and other-game runtime remain unproved.
+- Build/install and bounded original retry pending; use
+  `KYTY_SHADER_AUDIT_BOUNDED_WORDS` to measure actual source-word count.
+  Core restored after RED; no temporary reversal remains. Existing fullCFG
+  baseline debts and independent d0c NVIDIA compiler breakpoint remain.
+  **Menu/gameplay PENDING.**
+
 Checkpoint **4 октября 2026 года, 15:15 UTC** (native Windows via WSL;
 branch `yotei-windows-bringup`, parenta1ae8a8d, cyclic buffer-return fix):
 
@@ -33,10 +69,19 @@ branch `yotei-windows-bringup`, parenta1ae8a8d, cyclic buffer-return fix):
   `cyclic-buffer-atomic-{baseline-neighbors,feedback-baseline}-20261004.log.stderr`.
   Their oracles remain unchanged and debt pending. Existing full CFG literal
   assertion remains pending too; do not describe the full suite as GREEN.
-- Next: commit/push the completed correction, native emulator build/install and
-  original game retry; record actualCS0102 pipeline/new blocker and pixels.
-  Installed executable is stilla1ae8a8d. Independent d0c compiler breakpoint
-  remains. **Menu/gameplay PENDING.**
+- Native emulator build/install passed (`cyclic-buffer-atomic-emulator-{build,install}-20261004.log`).
+  Pushed and remote-readback source `df835e1eb5f5a981b01389f53314a690983be1e3`;
+  installed SHA256 `fb2f2ced9e612c0db18a7f92d402c7630a2c4a191b41cab10b40330021024fbd`.
+  Bounded retry FINISHED: `yotei-integrated-20261004-151821-presentfix-gpuav`,
+  PID37208/driverexec69450 naturally exited321 at15:27:21UTC. Shown210,
+  firstRGB201 (10pixels), max214colored pixels at207;208/209black.
+  Offscreenwindow1523black. ActualCS0102 now passes3buffers/SPIR-V3283words
+  and pipeline creation66ms. New blockerCS8457901d80b91921:
+  boundedSRTread59 charges65580 logical in-bounds references against65536.
+  No DeviceLost observed; no native task remains. Required independent alias/
+  unique-word regression is recorded in test debt. Independent d0c breakpoint
+  persists separately.
+  **Menu/gameplay PENDING.**
 
 Checkpoint **4 октября 2026 года, 14:34 UTC** (native Windows via WSL;
 branch `yotei-windows-bringup`, parent8a496a73, sampled operand-domain fix):

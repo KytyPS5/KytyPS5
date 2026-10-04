@@ -1,6 +1,54 @@
 # Emulator regression test debt
 
-## Cyclic single-wave buffer atomic returns (2026-10-04; synthetic CPU/GPU proved, original retry pending)
+## Bounded SRT snapshot aliases (2026-10-04; native CPU/GPU proved, actual retry pending)
+
+Native df835e1e retry151821 exits321 at15:27:21UTC on CS8457901d80b91921:
+read59 charges65580 logical in-bounds references against65536 probes.
+Shown210, firstRGB201/max214colored pixels; offscreenwindow1523black, no menu.
+No DeviceLost; PID37208 exited. CS0102 passes3buffers/SPIR-V3283words/pipeline66ms.
+
+Required synthetic RED: two finite65536-row columns alias two coherent source
+DWORDs; preserve every logical value/offset while reading each source once.
+Also test overlapping columns, U32 wrap and SRD OOB zeros, raw addresses,
+exact65536 distinct source words and plus-one rejection, failed source reads,
+transactionality/immutable ranges and the existing64MiB storage bound.
+Keep the65536 unique-word budget and per-column selector/workgroup reserves.
+The existing SnapshotReader caches coherent DWORDs by address; alias references
+are dense output work already bounded by storage, not additional memory probes.
+Do not change quota constants or discard rows. CPU RED/GREEN and native GPU
+numerical readback are required before retry; actual CS8457 alias count remains
+to verify. Earlier repeated-address quota tests must be replaced by genuinely
+distinct-word quota controls, with the reason recorded.
+
+Native CPU RED on productiondf835e1e: `bounded-unique-words-red-20261004.log.stderr`
+rejects131072 logical references despite2 source words; nativeSHA
+c8f57d7e5619381b6bface2597b3d02468cf4728ac577a0e62a2cc3b4002aa8b.
+Unchanged primary oracle GREEN and full ResourceTracking pass
+`bounded-unique-words-final-resource-suite-20261004.log` (5.75s, nativeSHA
+9c5b5e65b32ac78e396147ff6c813b6cfed6ff12a2ef8267834b9c5aa217e3bb).
+Exact65536 DISTINCT raw source words/plus-one, failed callback/rollback,
+overlapping/wrapped/zero rows, immutable ranges and existing storage/workgroup
+reserves pass. Previous repeated-address quota expectation is superseded:
+SnapshotReader already returns one coherent cached value per address; distinct
+resolved words consume memory work, dense aliases consume bounded output storage.
+The constants remain65536 unique words,65536 per-column keys and64MiB storage.
+Mapped/foreign clamped addresses conservatively occupy a unique slot too.
+
+Native GPU RED with ONLY this core correction absent:
+`bounded-unique-words-gpu-red-20261004.log.stderr`, SHA
+ d43da004b340227c2b5dd15c3b16792dc98a536469ce03b03dd0d72c22e45fd7,
+rejects third column98304references before dispatch. Unchanged numerical
+GPUAV GREEN `bounded-unique-words-gpuav-green-20261004.log`, nativeSHA
+c24756300940223520f7689dd3cd80e8cb584d73e9631ad5768c08fac72b3071.
+Finite16-bit keys0/1/2/65534/65535 shifted31bits wrap even keys to the same
+four descriptor words, odd keys are SRD OOB. All20 outputs and full backing
+are checked; this independent GPU fixture uses wave32. Existing descriptor
+extent, sparse three-row scalar-loop and4 zero-stride candidate GPUAV neighbors
+pass on the same exe.
+Original CS8457 unique-word count/pipeline, native emulator retry and other-game
+runtime remain pending; no menu/gameplay claim.
+
+## Cyclic single-wave buffer atomic returns (2026-10-04; synthetic CPU/GPU and actual CS0102 pipeline proved)
 
 Native a1ae8a8d run143716 naturally exits321 at14:45:08UTC on
 CS01025cd5c3102c4c: wave64 splitting does not support live BufferAtomicIAdd32
@@ -61,7 +109,9 @@ Same native exe SHA578c5186a19b122de66274e31a9ae59ffa7b72ab836e27197264028accc68
 passes9 cooperative LDS/barrier/image-atomic neighbors and buffer integer
 atomic family/GLC0 tests in `cyclic-buffer-atomic-{cooperative-gpu-neighbors,family-gpu-neighbor,glc0-gpu-neighbor}-20261004.log`.
 No core emitter changes, no work/return dropped, no guest-specific branches.
-Original native game retry and other-game runtime remain pending.
+Native df835e1e retry151821 confirms actualCS0102 passes3buffers, SPIR-V3283words
+and pipeline66ms before the later CS8457 snapshot blocker. NonzeroRGB201/
+shown210/window1523black; menu/gameplay and other-game runtime remain pending.
 
 ## Sampled pair graph versus separate operand descriptors (2026-10-04; synthetic and actual CS596 pipeline proved; menu pending)
 

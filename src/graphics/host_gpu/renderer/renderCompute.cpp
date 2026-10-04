@@ -195,9 +195,32 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 	return true;
 }
 
+// Some shaders select their image/buffer descriptors by the workgroup's z index, which the host
+// cannot know when it resolves descriptors once per dispatch. Such a dispatch is issued as one
+// dispatch per z slice, each compiled with that slice index folded in.
 void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode) {
+	bool want_slices = false;
+	DispatchDirectSlice(submit_id, buffer, thread_group_x, thread_group_y, thread_group_z, mode,
+	                    UINT32_MAX, &want_slices);
+	if (want_slices) {
+		static std::atomic<uint32_t> logged {0};
+		if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+			LOGF("GraphicsRenderDispatchDirect: splitting %ux%ux%u dispatch into %u z slices\n",
+			     thread_group_x, thread_group_y, thread_group_z, thread_group_z);
+		}
+		for (uint32_t z = 0; z < thread_group_z; ++z) {
+			DispatchDirectSlice(submit_id, buffer, thread_group_x, thread_group_y, 1, mode, z,
+			                    nullptr);
+		}
+	}
+}
+
+void RenderExecutor::DispatchDirectSlice(uint64_t submit_id, CommandBuffer& buffer,
+                                         uint32_t thread_group_x, uint32_t thread_group_y,
+                                         uint32_t thread_group_z, uint32_t mode,
+                                         uint32_t fixed_group_z, bool* want_slices) {
 	EXIT_IF(buffer.IsInvalid());
 	m_context.GetCommandScheduler().PopPendingOperations();
 	auto& ctx    = buffer.GetRegisters();
@@ -254,8 +277,24 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	ShaderComputeInputInfo input_info {};
 	const bool use_thread_dimensions = (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
 	input_info.dispatch_thread_dimensions = use_thread_dimensions;
+	input_info.fixed_group_z              = fixed_group_z;
 	const auto compute_program =
 	    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
+	if (!compute_program && input_info.uses_function_calls) {
+		ResetBindings();
+		return;
+	}
+	if (!compute_program && input_info.needs_group_z && want_slices != nullptr &&
+	    !use_thread_dimensions && thread_group_z >= 1 && thread_group_z <= 16) {
+		*want_slices = true;
+		ResetBindings();
+		return;
+	}
+	if (!compute_program) {
+		EXIT("compute shader 0x%016" PRIx64 " needs per-slice compilation that this dispatch cannot use "
+		     "(thread dimensions or more than 16 z groups)\n",
+		     sh_ctx.GetCs().cs_regs.data_addr);
+	}
 	if (use_thread_dimensions) {
 		input_info.dispatch_threads_num[0]    = thread_group_x;
 		input_info.dispatch_threads_num[1]    = thread_group_y;
@@ -413,6 +452,11 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	ShaderComputeInputInfo input_info {};
 	const auto compute_program = m_context.GetPipelineCache().GetComputeProgram(
 	    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
+	if (!compute_program && input_info.uses_function_calls) {
+		ResetBindings();
+		return;
+	}
+	EXIT_IF(!compute_program);
 	buffer.EndRendering();
 	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
 	auto& bindings = m_compute_bindings;

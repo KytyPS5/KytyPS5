@@ -286,6 +286,16 @@ struct PipelineCache::ProgramCache {
 		lookup_key.user_data_count = params.user_data_count;
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		BuildStageStaticKey(input_info, lookup_key.static_state);
+		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+			if (needs_group_z.contains(lookup_key)) {
+				input_info.needs_group_z = true;
+				return ShaderProgram {};
+			}
+			if (uses_function_calls.contains(lookup_key)) {
+				input_info.uses_function_calls = true;
+				return ShaderProgram {};
+			}
+		}
 		auto                                         entry = programs.find(lookup_key);
 		const ShaderRecompiler::IR::SrtRuntime       runtime {
 		    .user_data                  = user_data,
@@ -354,6 +364,26 @@ struct PipelineCache::ProgramCache {
 		}
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code);
 		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
+		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
+			if (translated.needs_group_z) {
+				needs_group_z.insert(lookup_key);
+				input_info.needs_group_z = true;
+				LOGF("ProgramCache: compute hash=0x%016" PRIx64
+				     " selects descriptors by workgroup z, compiled per z slice\n",
+				     params.hash);
+				return ShaderProgram {};
+			}
+			if (translated.uses_function_calls) {
+				uses_function_calls.insert(lookup_key);
+				input_info.uses_function_calls = true;
+				LOGF("ProgramCache: compute hash=0x%016" PRIx64
+				     " calls functions (ray tracing shader, not supported yet), its dispatches are not run\n",
+				     params.hash);
+				return ShaderProgram {};
+			}
+		} else {
+			EXIT_IF(translated.uses_function_calls);
+		}
 		if (entry == programs.end()) {
 			entry = programs.try_emplace(lookup_key,
 			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program)).first;
@@ -396,6 +426,8 @@ struct PipelineCache::ProgramCache {
 	}
 
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
+	std::unordered_set<ProgramKey, ProgramKeyHash>              needs_group_z;
+	std::unordered_set<ProgramKey, ProgramKeyHash>              uses_function_calls;
 	ProgramKey                                                  lookup_key;
 	vk::Device                                                  device;
 	uint64_t                                                    next_shader_id = 0;

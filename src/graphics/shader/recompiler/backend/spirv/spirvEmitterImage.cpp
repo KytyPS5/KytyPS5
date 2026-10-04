@@ -467,6 +467,65 @@ uint32_t UnpackImageGather(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uin
 	return result;
 }
 
+// A sampler the guest marked ForceUnormCoords takes texel-space coordinates. The host sampler is
+// always normalized, so the spatial components are divided by the level 0 extent here.
+// Divides the spatial components of a texel-space value by the level 0 extent: a coordinate
+// (all of its spatial components) or, with `gradient`, an explicit derivative.
+uint32_t NormalizeForcedUnormValue(ValueEmitContext& ctx, uint32_t resource, uint32_t sampler,
+                                   uint32_t coord, bool gradient) {
+	auto&       state     = ctx.state;
+	const auto& samplers  = state.program.info.samplers;
+	const auto& candidate = state.program.info.images[resource];
+	if (sampler >= samplers.size() || !samplers[sampler].force_unnormalized || candidate.cube) {
+		return coord;
+	}
+	const auto& info = ImageDimensionInfoFor(candidate.dimension);
+	if (info.multisampled != 0u) {
+		return coord;
+	}
+	state.builder.RequireCapability(spv::CapabilityImageQuery);
+	const auto image = LoadImageDescriptor(state, resource);
+	const auto size  = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpImageQuerySizeLod, ImageViewSizeType(state, candidate.dimension),
+	                          size, image, ConstantU32(state, 0));
+	const uint32_t components = gradient ? info.spatial_components : info.coordinate_components;
+	uint32_t       parts[4]   = {};
+	for (uint32_t index = 0; index < components; index++) {
+		auto value = coord;
+		auto extent = size;
+		if (components != 1u) {
+			value = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), value, coord, index);
+			extent = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), extent, size, index);
+		}
+		if (index < info.spatial_components) {
+			const auto extent_f = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpConvertUToF, TypeF32(state), extent_f, extent);
+			value = Binary(state, spv::OpFDiv, TypeF32(state), value, extent_f);
+		}
+		parts[index] = value;
+	}
+	if (components == 1u) {
+		return parts[0];
+	}
+	const auto result = state.builder.AllocateId();
+	std::vector<uint32_t> words {TypeF32Vector(state, components), result};
+	words.insert(words.end(), parts, parts + components);
+	state.builder.AddFunction(spv::OpCompositeConstruct, words);
+	return result;
+}
+
+uint32_t NormalizeForcedUnormCoord(ValueEmitContext& ctx, uint32_t resource, uint32_t sampler,
+                                   uint32_t coord) {
+	return NormalizeForcedUnormValue(ctx, resource, sampler, coord, false);
+}
+
+uint32_t NormalizeForcedUnormGradient(ValueEmitContext& ctx, uint32_t resource, uint32_t sampler,
+                                      uint32_t gradient) {
+	return NormalizeForcedUnormValue(ctx, resource, sampler, gradient, true);
+}
+
 uint32_t EmitOneDimensionalGatherLz(ValueEmitContext& ctx, const IR::MemoryInfo& mem,
                                     uint32_t coord, Prospero::TextureNumericClass numeric_class) {
 	auto& state = ctx.state;
@@ -673,8 +732,10 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			return;
 		}
 		if (op == IR::ValueOpcode::ImageGatherRaw) {
-			const auto coord = CoordF32(ctx, mem, *address, layout.coord,
-			                            dimension_info.coordinate_components, image.cube);
+			const auto coord = NormalizeForcedUnormCoord(
+			    ctx, mem.resource, mem.sampler,
+			    CoordF32(ctx, mem, *address, layout.coord, dimension_info.coordinate_components,
+			             image.cube));
 			if (dimension == ImageDimension::Dim1D) {
 				if (dref || !HasFlag(mem, Decoder::ImageSampleFlagLevelZero) ||
 				    HasFlag(mem, Decoder::ImageSampleFlagOffset) ||
@@ -760,10 +821,12 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		std::vector<uint32_t> operands;
 		if (HasFlag(mem, Decoder::ImageSampleFlagDerivative)) {
 			operand_mask |= spv::ImageOperandsGradMask;
-			operands.push_back(
-			    CoordF32(ctx, mem, *address, layout.grad_x, dimension_info.spatial_components));
-			operands.push_back(
-			    CoordF32(ctx, mem, *address, layout.grad_y, dimension_info.spatial_components));
+			operands.push_back(NormalizeForcedUnormGradient(
+			    ctx, mem.resource, mem.sampler,
+			    CoordF32(ctx, mem, *address, layout.grad_x, dimension_info.spatial_components)));
+			operands.push_back(NormalizeForcedUnormGradient(
+			    ctx, mem.resource, mem.sampler,
+			    CoordF32(ctx, mem, *address, layout.grad_y, dimension_info.spatial_components)));
 		} else if (explicit_lod) {
 			operand_mask |= spv::ImageOperandsLodMask;
 			auto lod = ZeroF32(state);
@@ -778,10 +841,11 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto sampler_id = LoadSamplerDescriptor(state, mem.sampler);
 		const auto EmitSample = [&](uint32_t resource) {
 			const auto& candidate = state.program.info.images[resource];
-			const auto coord =
+			const auto coord = NormalizeForcedUnormCoord(
+			    ctx, resource, mem.sampler,
 			    CoordF32(ctx, mem, *address, layout.coord,
 			             ImageDimensionInfoFor(candidate.dimension).coordinate_components,
-			             candidate.cube);
+			             candidate.cube));
 			const auto            sampled = MakeSampledImage(state, resource, sampler_id);
 			const auto            sample  = state.builder.AllocateId();
 			std::vector<uint32_t> sample_operands {result_type, sample, sampled, coord};

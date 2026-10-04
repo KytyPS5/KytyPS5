@@ -182,6 +182,23 @@ uint32_t EmitLocalInvocationIndex(EmitterState& state) {
 	return value;
 }
 
+// Guest lane inside its 64 lane wave, always in [0, 64). EmitLocalInvocationIndex instead returns
+// the index across the whole workgroup, which compute thread ids are derived from and must keep
+// the wave base; lane ids and mesh staging slots want the in-wave lane.
+uint32_t EmitGuestLaneInWave(EmitterState& state) {
+	const auto variable = InputVariableForKind(state, IR::StageInputKind::LocalInvocationIndex);
+	if (variable == 0) {
+		return ConstantU32(state, 0);
+	}
+	const auto value = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, variable);
+	if (state.lane_count == 2) {
+		const auto lane = EmitBinaryU32(state, spv::OpBitwiseAnd, value, ConstantU32(state, 31u));
+		return EmitAddU32(state, lane, ConstantU32(state, state.lane_half * 32));
+	}
+	return value;
+}
+
 uint32_t EmitVertexParameterComponentU32(EmitterState& state, const InputBinding& input,
                                          uint32_t component) {
 	const auto count = VertexParameterComponentCount(input);

@@ -91,6 +91,9 @@ constexpr OpcodeMap VOP1_OPCODE_LIST[] = {
     {0x0fu, Opcode::V_CVT_F32_F64},
     {0x10u, Opcode::V_CVT_F64_F32},
     {0x16u, Opcode::V_CVT_F64_U32},
+    {0x17u, Opcode::V_TRUNC_F64},
+    {0x18u, Opcode::V_CEIL_F64},
+    {0x1au, Opcode::V_FLOOR_F64},
     {0x2fu, Opcode::V_RCP_F64},
     {0x05u, Opcode::V_CVT_F32_I32},
     {0x06u, Opcode::V_CVT_F32_U32},
@@ -155,6 +158,9 @@ constexpr OpcodeMap VOP3_ENCODED_VOP1_OPCODE_LIST[] = {
     {0x0fu, Opcode::V_CVT_F32_F64},
     {0x10u, Opcode::V_CVT_F64_F32},
     {0x16u, Opcode::V_CVT_F64_U32},
+    {0x17u, Opcode::V_TRUNC_F64},
+    {0x18u, Opcode::V_CEIL_F64},
+    {0x1au, Opcode::V_FLOOR_F64},
     {0x2fu, Opcode::V_RCP_F64},
     {0x05u, Opcode::V_CVT_F32_I32},
     {0x06u, Opcode::V_CVT_F32_U32},
@@ -287,8 +293,10 @@ constexpr OpcodeMap VOP3_OPCODE_LIST[] = {
     {0x147u, Opcode::V_CUBEMA_F32},
     {0x14bu, Opcode::V_FMA_F32},
     {0x14cu, Opcode::V_FMA_F64},
-    {0x164u, Opcode::V_ADD_F64},
+{0x164u, Opcode::V_ADD_F64},
     {0x165u, Opcode::V_MUL_F64},
+    {0x166u, Opcode::V_MIN_F64},
+    {0x167u, Opcode::V_MAX_F64},
     {0x148u, Opcode::V_BFE_U32},
     {0x149u, Opcode::V_BFE_I32},
     {0x14au, Opcode::V_BFI_B32},
@@ -477,6 +485,9 @@ bool IsVop1FloatSourceOpcode(Opcode opcode) {
 		case Opcode::V_CVT_F32_F64:
 		case Opcode::V_CVT_F64_F32:
 		case Opcode::V_RCP_F64:
+		case Opcode::V_TRUNC_F64:
+		case Opcode::V_CEIL_F64:
+		case Opcode::V_FLOOR_F64:
 		case Opcode::V_MOV_B32:
 		case Opcode::V_CVT_F32_F16:
 		case Opcode::V_CVT_U32_F32:
@@ -737,7 +748,8 @@ void DecodeVop1Dpp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_in
                    uint32_t opcode, uint32_t vdst, Instruction& inst) {
 	if (inst.opcode == Opcode::V_CVT_F64_I32 || inst.opcode == Opcode::V_CVT_F32_F64 ||
 	    inst.opcode == Opcode::V_CVT_F64_F32 || inst.opcode == Opcode::V_CVT_F64_U32 ||
-	    inst.opcode == Opcode::V_RCP_F64) {
+	    inst.opcode == Opcode::V_RCP_F64 || inst.opcode == Opcode::V_TRUNC_F64 ||
+	    inst.opcode == Opcode::V_CEIL_F64 || inst.opcode == Opcode::V_FLOOR_F64) {
 		SetUnsupported(inst, Family::VOP1, opcode, "FP64 instructions do not support DPP");
 		return;
 	}
@@ -1100,8 +1112,10 @@ void DecodeVop2Dpp(uint32_t pc, std::span<const uint32_t> code, uint32_t word_in
 	DecodeVectorGpr(vsrc1, inst.src1);
 	DecodeScalarSource(src0 + 256u, pc, inst.src0);
 	ApplyDppModifier(inst.src0, modifier, code[word_index] & 0x1ffu);
-	inst.src1.negate       = ((modifier >> 22u) & 0x1u) != 0u;
-	inst.src1.absolute     = ((modifier >> 23u) & 0x1u) != 0u;
+	// DPP8 carries its lane selects where DPP16 keeps the source modifiers.
+	const bool dpp8        = inst.src0.dpp8;
+	inst.src1.negate       = !dpp8 && ((modifier >> 22u) & 0x1u) != 0u;
+	inst.src1.absolute     = !dpp8 && ((modifier >> 23u) & 0x1u) != 0u;
 	const bool packed_fmac = inst.opcode == Opcode::V_PK_FMAC_F16;
 	if (packed_fmac) {
 		inst.src0.negate_hi = inst.src0.negate;
@@ -1221,6 +1235,8 @@ uint32_t NativeVop3SourceCount(Opcode opcode) {
 	switch (opcode) {
 		case Opcode::V_ADD_F64:
 		case Opcode::V_MUL_F64:
+		case Opcode::V_MIN_F64:
+		case Opcode::V_MAX_F64:
 		case Opcode::V_MUL_LO_U32:
 		case Opcode::V_MUL_HI_U32:
 		case Opcode::V_MUL_LO_I32:
@@ -1373,6 +1389,8 @@ bool SupportsNativeVop3SourceModifiers(Opcode opcode) {
 		case Opcode::V_MAD_F32:
 		case Opcode::V_ADD_F64:
 		case Opcode::V_MUL_F64:
+		case Opcode::V_MIN_F64:
+		case Opcode::V_MAX_F64:
 		case Opcode::V_FMA_F64:
 		case Opcode::V_FMA_F32:
 		case Opcode::V_PACK_B32_F16:
@@ -1552,6 +1570,7 @@ void DecodeVop2(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	}
 	switch (src0) {
 		case 249u: DecodeVop2Sdwa(pc, code, word_index, opcode, vdst, vsrc1, inst); return;
+		case 233u:
 		case 250u: DecodeVop2Dpp(pc, code, word_index, opcode, vdst, vsrc1, inst); return;
 		default: break;
 	}

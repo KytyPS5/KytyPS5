@@ -153,6 +153,14 @@ struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
 	int                thread_ids_num             = 0;
 	int                workgroup_register         = 0;
 	bool               tg_size_en                 = false;
+	// When not UINT32_MAX, the program is compiled for this single workgroup z index.
+	uint32_t           fixed_group_z              = UINT32_MAX;
+	// Output of GetComputeProgram: the shader selects descriptors by workgroup z and has to be
+	// requested once per z slice (fixed_group_z), instead of as a whole.
+	bool               needs_group_z              = false;
+	// Output of GetComputeProgram: the shader calls functions (so far only ray tracing shaders),
+	// which are not translated, so no program is produced and its dispatches are not run.
+	bool               uses_function_calls        = false;
 	ShaderStageRuntime stage;
 };
 

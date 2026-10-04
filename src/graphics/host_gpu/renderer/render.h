@@ -157,6 +157,9 @@ public:
 
 	void DispatchDirect(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
 	                    uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode);
+	void DispatchDirectSlice(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
+	                         uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode,
+	                         uint32_t fixed_group_z, bool* want_slices);
 	void DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
 	                      uint32_t mode);
 

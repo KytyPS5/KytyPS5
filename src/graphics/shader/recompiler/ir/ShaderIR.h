@@ -154,6 +154,9 @@ struct SamplerResource {
 	bool     depth_compare         = false;
 	bool     integer_border        = false;
 	bool     gather_lod            = false;
+	// The guest S# sets ForceUnormCoords (bit 15): texel-space coordinates. Known at bind time and
+	// carried by the specialization, since the host sampler cannot be unnormalized.
+	bool     force_unnormalized    = false;
 
 	bool operator==(const SamplerResource& other) const = default;
 };

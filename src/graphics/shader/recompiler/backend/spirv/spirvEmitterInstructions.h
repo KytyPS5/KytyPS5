@@ -157,6 +157,10 @@ EMIT_NATIVE(FPSub32, OpFSub, F32, uint32_t, uint32_t)
 EMIT_NATIVE(FPMul32, OpFMul, F32, uint32_t, uint32_t)
 EMIT_NATIVE(FPAdd64, OpFAdd, F64, uint32_t, uint32_t)
 EMIT_NATIVE(FPMul64, OpFMul, F64, uint32_t, uint32_t)
+inline constexpr auto EmitFPMin64 =
+    EmitGlsl<GLSLstd450FMin, IR::Type::F64, uint32_t, uint32_t>;
+inline constexpr auto EmitFPMax64 =
+    EmitGlsl<GLSLstd450FMax, IR::Type::F64, uint32_t, uint32_t>;
 inline constexpr auto EmitFPFma64 =
     EmitGlsl<GLSLstd450Fma, IR::Type::F64, uint32_t, uint32_t, uint32_t>;
 uint32_t              EmitFPRecip64(EmitterState& state, uint32_t arg0);
@@ -175,6 +179,9 @@ uint32_t EmitFPExp2(EmitterState& state, uint32_t arg0);
 uint32_t EmitFPLog2(EmitterState& state, uint32_t arg0);
 uint32_t EmitFPLdexp(EmitterState& state, uint32_t arg0, uint32_t arg1);
 inline constexpr auto EmitFPRoundEven32 = EmitGlsl<GLSLstd450RoundEven, IR::Type::F32, uint32_t>;
+inline constexpr auto EmitFPTrunc64     = EmitGlsl<GLSLstd450Trunc, IR::Type::F64, uint32_t>;
+inline constexpr auto EmitFPCeil64      = EmitGlsl<GLSLstd450Ceil, IR::Type::F64, uint32_t>;
+inline constexpr auto EmitFPFloor64     = EmitGlsl<GLSLstd450Floor, IR::Type::F64, uint32_t>;
 inline constexpr auto EmitFPFloor32     = EmitGlsl<GLSLstd450Floor, IR::Type::F32, uint32_t>;
 inline constexpr auto EmitFPCeil32      = EmitGlsl<GLSLstd450Ceil, IR::Type::F32, uint32_t>;
 inline constexpr auto EmitFPTrunc32     = EmitGlsl<GLSLstd450Trunc, IR::Type::F32, uint32_t>;

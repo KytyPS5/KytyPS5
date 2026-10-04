@@ -1273,6 +1273,7 @@ struct TestCase {
   u32 image_descriptor_swizzle = DstSel(4, 5, 6, 7);
   bool compile_only = false;
   size_t storage_buffer_range_dwords = 0;
+  bool use_descriptor_buffer_ranges = false;
   std::vector<u32> storage_buffer_offsets;
   std::vector<BdaMapping> bda_mappings;
   bool expand_shader_data_storage = false;
@@ -17203,26 +17204,32 @@ void CheckSampledHtileArrayClearDiscovery() {
     }
 
     const auto *buffers = Binding(Kind::Buffers);
+    const auto buffer_byte_limit = [&](u32 resource) -> vk::DeviceSize {
+      if (test.use_descriptor_buffer_ranges) {
+        Require(test.name, "dispatch", test.buffer_addresses_are_backing_offsets,
+                "descriptor extents need fixture backing addresses");
+        ShaderBufferResource descriptor{};
+        const auto& words = compiled.resources.buffers.at(resource).dwords;
+        std::copy_n(words.begin(), 4, descriptor.fields);
+        return descriptor.Base48() + descriptor.GetSize();
+      }
+      const auto offset = resource < test.storage_buffer_offsets.size()
+                              ? test.storage_buffer_offsets[resource] : 0u;
+      return test.storage_buffer_range_dwords != 0
+                 ? test.storage_buffer_range_dwords * sizeof(u32) + offset : buffer.size;
+    };
     if (buffers != nullptr) {
       buffer_infos.resize(buffers->resources.size());
       for (u32 i = 0; i < buffer_infos.size(); i++) {
         auto &info = buffer_infos[i];
         info.buffer = buffer.buffer;
         info.offset = 0;
-        info.range = buffer.size;
-        if (test.storage_buffer_range_dwords != 0) {
-          const auto resource = buffers->resources[i];
-          const auto offset = resource < test.storage_buffer_offsets.size()
-                                  ? test.storage_buffer_offsets[resource]
-                                  : 0u;
-          const auto byte_limit =
-              test.storage_buffer_range_dwords * sizeof(u32) + offset;
-          // NativeStorageBuffer exposes complete uint elements while publishing
-          // the exact unpadded byte limit separately to the shader.
-          info.range = static_cast<vk::DeviceSize>((byte_limit + 3u) & ~3u);
-          Require(test.name, "dispatch", info.range <= buffer.size,
-                  "storage buffer descriptor range exceeds backing buffer");
-        }
+        const auto byte_limit = buffer_byte_limit(buffers->resources[i]);
+        // Keep the exact byte limit in shader data; the Vulkan descriptor
+        // exposes complete uint elements and needs a nonzero dummy range.
+        info.range = std::max<vk::DeviceSize>(4, (byte_limit + 3u) & ~vk::DeviceSize{3});
+        Require(test.name, "dispatch", info.range <= buffer.size,
+                "storage buffer descriptor range exceeds backing buffer");
       }
       vk::WriteDescriptorSet write{};
       write.sType = vk::StructureType::eWriteDescriptorSet;
@@ -17250,12 +17257,7 @@ void CheckSampledHtileArrayClearDiscovery() {
     }
     for (u32 i = 0; i < layout.memory_offset_count; i++) {
       const auto resource = buffers->resources[i];
-      const auto offset = resource < test.storage_buffer_offsets.size()
-                              ? test.storage_buffer_offsets[resource]
-                              : 0u;
-      const auto range = test.storage_buffer_range_dwords != 0
-                             ? test.storage_buffer_range_dwords * sizeof(u32) + offset
-                             : buffer.size;
+      const auto range = buffer_byte_limit(resource);
       Require(test.name, "dispatch",
               layout.memory_limit_dword + i < packed_user_data.size() &&
                   range <= UINT32_MAX,
@@ -31437,6 +31439,97 @@ TestCase BoundedBufferScalarLoopStore(u32 count, bool sparse) {
   return test;
 }
 
+// Immutable scalar-buffer rows behind a preliminary EXEC guard and a count
+// guard. Observe distinct formats' values, inactive lanes and descriptor OOB.
+TestCase FormattedBufferExecCountGuard(u32 count, u32 mask, u32 wave_size = 32, bool vcc_guard = false) {
+  using O = ShaderOpcode;
+  const u32 lanes = wave_size == 64 ? 64u : 4u;
+  const u32 input_base = wave_size == 64 ? 0u : 128u;
+  const u32 output_base = wave_size == 64 ? 64u : 0u;
+  const u32 table_base = wave_size == 64 ? 1024u : 512u;
+  TestCase test;
+  test.name = mask == 0 ? "FormattedExecGuardEmptyExec"
+            : count == 0 ? "FormattedExecGuardZeroRows"
+            : count == 1 ? "FormattedExecGuardOneRow"
+            : mask == 5 ? "FormattedExecGuardTwoRowsSparse"
+                        : "FormattedExecGuardTwoRowsFull";
+  if (wave_size == 64) test.name = mask == 5 ? "FormattedExecGuardWave64SparseBothHalves"
+                                                       : "FormattedExecGuardWave64Full";
+  if (vcc_guard) test.name = wave_size == 64 ? "FormattedVccGuardWave64Full"
+                                                         : "FormattedVccGuardTwoRowsSparse";
+  test.has_compute_info = test.has_user_data = true;
+  test.compute_info = {};
+  test.compute_info.threads_num[0] = lanes;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = wave_size;
+  test.initial.resize(table_base / 4 + 8, 0xdeadbeefu);
+  const std::array<u32, 4> payload{0x3fc00000u, 0x40200000u, 0x40e80000u, 0x41040000u};
+  std::copy_n(payload.begin(), 2, test.initial.begin() + input_base / 4);
+  std::copy_n(payload.begin() + 2, 2, test.initial.begin() + input_base / 4 + 8);
+  const u32 format = BufferFormat(Prospero::BufferFormat::k32Float);
+  for (u32 row = 0; row < 2; ++row) {
+    const std::array<u32, 4> descriptor{input_base + row * 32u, 4u << 16u, 2u,
+        (format << 12u) | DstSel(4, 5, 6, 7) | (1u << 24u)};
+    std::copy(descriptor.begin(), descriptor.end(), test.initial.begin() + table_base / 4 + row * 4);
+  }
+  test.expected = test.initial;
+  test.user_data = MakeStructuredStorageBufferData(4, lanes * 2);
+  test.user_data[0] = output_base;
+  test.user_data[8] = table_base; test.user_data[9] = 0;
+  test.user_data[10] = 32; test.user_data[11] = 0;
+  test.user_data[12] = count;
+  test.buffer_addresses_are_backing_offsets = true;
+  test.use_descriptor_buffer_ranges = true;
+  if (count != 0 && mask != 0) test.required_spirv = {"OpSwitch"};
+  auto& code = test.code;
+  AppendSMovLiteral(&code, 20, 0);
+  if (wave_size == 64 && mask == 15) code.push_back(EncodeSop1(0x04, 126, 193));
+  else {
+    code.push_back(EncodeSop1(0x04, 126, InlineU32(mask)));
+    if (wave_size == 64) code.push_back(EncodeSMovB32(127, InlineU32(mask)));
+  }
+  code.push_back(EncodeSop1(0x04, 60, 126));
+  const size_t header = code.size();
+  code.push_back(EncodeSop1(0x04, 126, 60));
+  const size_t mask_exit = code.size(); code.push_back(0);
+  code.push_back(EncodeSopc(0x0a, 20, 12)); // Scalar i<count.
+  code.push_back(EncodeSop2(0x0b, vcc_guard ? 106 : 126, 60, InlineU32(0))); // EXEC = count_ok ? mask : 0.
+  const size_t count_exit = code.size(); code.push_back(0);
+  code.push_back(EncodeSop2(0x1e, 21, 20, InlineU32(4)));
+  code.push_back(EncodeSmem0(0x0a, 24, 4)); // S_BUFFER_LOAD_DWORDX4 table[i].
+  code.push_back(EncodeSmem1(0, 21));
+  code.push_back(EncodeSopp(0x0c, 0));
+  code.push_back(EncodeMubuf0(0x00, 0, true, false)); // Formatted X, index lane.
+  code.push_back(EncodeMubuf1(8, 6, 0));
+  code.push_back(EncodeVop1(0x01, 4, 20));
+  code.push_back(EncodeVop2(0x1a, 4, InlineU32(wave_size == 64 ? 6 : 2), 4));
+  code.push_back(EncodeVop2(0x25, 4, Vgpr(0), 4));
+  code.push_back(EncodeMubuf0(0x1c, 0, true, false));
+  code.push_back(EncodeMubuf1(8, 0, 4));
+  code.push_back(EncodeSop2(0x00, 20, 20, InlineU32(1)));
+  code.push_back(EncodeSopp(0x02, static_cast<u32>(static_cast<int32_t>(header) -
+                                               static_cast<int32_t>(code.size() + 1))));
+  for (const auto branch : {mask_exit, count_exit})
+    code[branch] = EncodeSopp(vcc_guard && branch == count_exit ? 0x06 : 0x08,
+                             code.size() - branch - 1);
+  AppendEnd(&code);
+  for (u32 row = 0; row < count; ++row)
+    for (u32 lane = 0; lane < lanes; ++lane)
+      if ((wave_size == 64 && mask == 15) || (mask & (1u << (lane & 31))) != 0)
+        test.expected[output_base / 4 + row * lanes + lane] = lane < 2 ? payload[row * 2 + lane] : 0;
+  test.opcodes = {O::S_MOV_B32, O::S_MOV_B64, O::S_CBRANCH_EXECZ,
+      O::S_CMP_LT_U32, O::S_CSELECT_B64, O::S_LSHL_B32, O::S_BUFFER_LOAD_DWORDX4,
+      O::S_WAITCNT, O::BUFFER_LOAD_FORMAT_X, O::V_MOV_B32, O::V_LSHLREV_B32,
+      O::V_ADD_NC_U32, O::BUFFER_STORE_DWORD, O::S_ADD_U32, O::S_BRANCH, O::S_ENDPGM};
+  test.decoded_counts = {{"S_CBRANCH_EXECZ", vcc_guard ? 1u : 2u}, {"BUFFER_LOAD_FORMAT_X ", 1}};
+  if (vcc_guard) {
+    test.opcodes.push_back(O::S_CBRANCH_VCCZ);
+    test.decoded_counts.push_back({"S_CBRANCH_VCCZ", 1});
+  }
+  return test;
+}
+
 // Dispatch-uniform descriptors from an immutable two-entry SRT. Only the
 // selected zero-stride mode-0 entry is OOB; sparse EXEC preserves inactive VGPRs.
 TestCase BoundedBufferZeroStrideCandidates(u32 variant) {
@@ -39800,6 +39893,10 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferZeroStrideOobFormatsAndWidths);
   for (u32 variant = 0; variant < 4; ++variant)
     cases.push_back(BoundedBufferZeroStrideCandidates(variant));
+  cases.push_back(FormattedBufferExecCountGuard(2, 15));
+  cases.push_back(FormattedBufferExecCountGuard(2, 5));
+  cases.push_back(FormattedBufferExecCountGuard(0, 15));
+  cases.push_back(FormattedBufferExecCountGuard(2, 0));
   for (const auto count : {1u, 3u}) {
     cases.push_back(BoundedBufferScalarLoopStore(count, false));
     cases.push_back(BoundedBufferScalarLoopStore(count, true));
@@ -45917,6 +46014,19 @@ if (argc == 1) {
   if (argc == 2 && std::strcmp(argv[1], "--zero-stride-store-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, BufferZeroStrideMode0StoreIsOutOfBounds());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--formatted-exec-count-guard-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, FormattedBufferExecCountGuard(2, 15));
+    RunCase(&vulkan, FormattedBufferExecCountGuard(2, 5));
+    RunCase(&vulkan, FormattedBufferExecCountGuard(1, 15));
+    RunCase(&vulkan, FormattedBufferExecCountGuard(0, 15));
+    RunCase(&vulkan, FormattedBufferExecCountGuard(2, 0));
+    RunCase(&vulkan, FormattedBufferExecCountGuard(2, 15, 64));
+    RunCase(&vulkan, FormattedBufferExecCountGuard(2, 5, 64));
+    RunCase(&vulkan, FormattedBufferExecCountGuard(2, 5, 32, true));
+    RunCase(&vulkan, FormattedBufferExecCountGuard(2, 15, 64, true));
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--bounded-zero-stride-only") == 0) {

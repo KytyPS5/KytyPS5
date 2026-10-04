@@ -1,5 +1,50 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **4 октября 2026 года, 12:36 UTC** (native Windows via WSL;
+branch `yotei-windows-bringup`, source parent `3f80eaf1` plus the scalar-table fix):
+
+- Shared SRT planning now proves a canonical uniform zero/+1 row index from
+  an unavoidable nonempty EXEC/VCC conjunction containing unsigned `i<count`.
+  A preliminary mask guard no longer hides the later bound. OR predicates,
+  per-lane counts/control, signed wraparound, malformed zero-mask recipes and
+  bypass paths remain rejected. Native synthetic EXEC RED/GREEN is
+  `formatted-exec-count-final-{red,green}-20261004.log`; additional VCC
+  RED/GREEN is `formatted-vcc-count-{red,green}-20261004.log` in `_Build/logs`.
+  Full ResourceTracking passes (`formatted-mask-count-final-resource-suite-20261004.log`).
+- The same guest-level GPU fixture exposed a second compiler defect before
+  dispatch: its two exit guards left generated selections inside an invalid
+  continue construct. The shared SPIR-V emitter now places a dedicated
+  continue bridge after a proven single-entry linear chain's unique backedge
+  body. Early-continue/nested/multiple-entry shapes keep conservative handling.
+  SPIR-V validator RED is `formatted-exec-count-gpuav-scalar-20261004.log.stderr`.
+  Native GPUAV GREEN is `formatted-mask-count-final-gpuav-20261004.log`:
+  nine cases cover two distinct float rows, OOB zero, zero rows, empty/sparse
+  EXEC, EXEC/VCC guards and actual wave64 full/sparse halves. Test binding
+  extents use each real descriptor size; temporary IR instrumentation is gone.
+  Four neighboring zero-stride raw/formatted/D16/scalar GPU cases also pass.
+- Existing nested conditional latch, shared merge and partitioned graphics
+  loop/merge-Phi CPU selectors pass (`formatted-mask-*-20261004.log`). The
+  full CFG suite stops on its literal-word assertion; scoped reversal of both
+  new production changes reproduces the exact same failure
+  (`formatted-mask-cfg-baseline-suite-20261004.log.stderr`). That existing
+  test debt is not a passing suite. No other game's runtime was tested.
+- Saved-game CPU audit now passes former CS `4d6df08d2d54e0ff` PC `0x284`
+  and stops at the next formatted descriptor, PC `0x41c`
+  (`formatted-mask-cs4d-final-audit-20261004.log`). Its user data remains
+  synthetic; verify the next reason with a native game retry before fixing it.
+  Installed game executable is still source `3eb16e4b` pending new build/install.
+- All previous native runs have finished. Clean source3eb retries `113840`
+  and `115058` exited 321 due to ResourceTracking at PC0x284, not DeviceLost.
+  Final traced run `_Build/runs/yotei-integrated-20261004-115058-presentfix-gpuav`
+  first nonzero readback is frame195 and shown200. Earlier d0c capture112511
+  finished: its identical valid 40239-word modules reproduce NVIDIA compiler
+  breakpoint 0x80000003 in a bounded pipeline-only probe. Removing RTE64 only
+  in a diagnostic copy makes creation pass but weakens the required rounding
+  contract; no production precision change was made. Preserve this separate
+  blocker (`_Build/logs/d0c555-pipeline-*-20261004.log*`).
+  Next: build/install the committed fix, bounded retry with runtime proof
+  trace, then reproduce any new blocker independently. **Menu/gameplay PENDING.**
+
 Checkpoint **4 октября 2026 года, 11:26 UTC** (native Windows via WSL;
 source fix `3eb16e4b`, branch `yotei-windows-bringup`):
 

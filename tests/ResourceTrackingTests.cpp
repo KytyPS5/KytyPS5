@@ -3116,11 +3116,12 @@ struct DispatcherSignedBufferLoopFixture {
 DispatcherSignedBufferLoopFixture MakeDispatcherSignedBufferLoopFixture(
     bool bypass_count_guard = false, uint32_t step = 1u,
     uint32_t row_stride = 196u, uint32_t column_offset = 0u,
-    bool formatted = false, bool nested_loop = false) {
+    bool formatted = false, bool nested_loop = false, bool exec_count_guard = false,
+    bool vcc_count_guard = false) {
   DispatcherSignedBufferLoopFixture result;
   result.fixture = std::make_unique<Fixture>();
   auto& fixture = *result.fixture;
-  fixture.program.dispatcher_fallback = true;
+  fixture.program.dispatcher_fallback = !exec_count_guard;
 
   auto* entry = fixture.block;
   auto* header = fixture.AddBlock();
@@ -3155,12 +3156,12 @@ DispatcherSignedBufferLoopFixture MakeDispatcherSignedBufferLoopFixture(
       Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch;
   header_info.terminator.true_block = 5u;
   header_info.terminator.false_block = 2u;
-  mask_guard->AddBranch(latch);
+  mask_guard->AddBranch(exec_count_guard ? exit : latch);
   mask_guard->AddBranch(body);
   auto& mask_info = fixture.program.block_info[2];
   mask_info.terminator.kind =
       Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch;
-  mask_info.terminator.true_block = 4u;
+  mask_info.terminator.true_block = exec_count_guard ? 5u : 4u;
   mask_info.terminator.false_block = 3u;
   Branch(3u, nested_loop ? 6u : 4u);
   if (nested_loop) Branch(6u, 2u);
@@ -3181,7 +3182,7 @@ DispatcherSignedBufferLoopFixture MakeDispatcherSignedBufferLoopFixture(
                                  {result.index, Value(step)}, 0, latch);
   phi.AddPhiOperand(entry, Value(0u));
   phi.AddPhiOperand(latch, next);
-  const auto compare = fixture.Emit(ValueOpcode::SLessThan32,
+  const auto compare = fixture.Emit(exec_count_guard ? ValueOpcode::ULessThan32 : ValueOpcode::SLessThan32,
                                     {result.index, count}, 0, header);
   header_info.condition =
       fixture.Emit(ValueOpcode::LogicalNot, {compare}, 0, header);
@@ -3218,6 +3219,20 @@ DispatcherSignedBufferLoopFixture MakeDispatcherSignedBufferLoopFixture(
   }
   mask_info.condition =
       fixture.Emit(ValueOpcode::LogicalNot, {can_enter}, 0, mask_guard);
+  if (exec_count_guard) {
+    // A separate preliminary mask branch precedes the real bound. The
+    // successful EXEC edge implies the uniform i<count conjunct even when
+    // the other conjunct is a per-lane predicate.
+    header_info.condition = fixture.Emit(ValueOpcode::IEqual32,
+                                          {enabled_mask, Value(0u)}, 0, header);
+    const auto lane_active = fixture.Emit(ValueOpcode::ULessThan32,
+        {fixture.Emit(ValueOpcode::LaneId, {}, 0, mask_guard), Value(16u)}, 0, mask_guard);
+    const auto predicate = fixture.Emit(ValueOpcode::LogicalAnd,
+                                         {compare, lane_active}, 0, mask_guard);
+    const auto inactive = fixture.Emit(ValueOpcode::LogicalNot, {predicate}, 0, mask_guard);
+    mask_info.condition = fixture.Emit(ValueOpcode::ConditionRef, {inactive},
+                                       vcc_count_guard ? CFG::BranchCondition::VccZero : CFG::BranchCondition::ExecZero, mask_guard);
+  }
 
   fixture.block = body;
   const auto table = fixture.Buffer(table_descriptor, 0x62d0u);
@@ -3333,19 +3348,20 @@ void TestDispatcherSignedBufferLoop() {
   }
 }
 
-void TestFormattedScalarDescriptorTable(bool nested_loop = false) {
+void TestFormattedScalarDescriptorTable(bool nested_loop = false, bool exec_count_guard = false,
+                                        bool vcc_count_guard = false) {
   constexpr uint32_t stride = 488u;
   constexpr uint32_t column = 200u;
   auto accepted = MakeDispatcherSignedBufferLoopFixture(
-      false, 1u, stride, column, true, nested_loop);
+      false, 1u, stride, column, true, nested_loop, exec_count_guard, vcc_count_guard);
   accepted.fixture->PlanAndTrack();
   const auto& program = accepted.fixture->program;
   Check(program.resource_tracking_complete && program.info.buffers.size() == 1u &&
             program.bounded_srt_reads.size() == 4u && !program.info.uses_dma,
         "formatted scalar descriptor rows did not form a bounded buffer table");
   Check(std::ranges::all_of(program.bounded_srt_reads,
-                            [](const BoundedSrtRead& read) {
-                              return read.count_signed && read.offset_scale == stride &&
+                            [&](const BoundedSrtRead& read) {
+                              return read.count_signed == !exec_count_guard && read.offset_scale == stride &&
                                      read.memory_offset >= column &&
                                      read.memory_offset < column + 16u;
                             }),
@@ -3379,11 +3395,45 @@ void TestFormattedScalarDescriptorTable(bool nested_loop = false) {
         "formatted scalar descriptor table did not retain two distinct rows");
 
   auto rejected = MakeDispatcherSignedBufferLoopFixture(
-      true, 1u, stride, column, true, nested_loop);
+      true, 1u, stride, column, true, nested_loop, exec_count_guard, vcc_count_guard);
   BuildSrtPlan(rejected.fixture->program);
   CheckFatal([&] { TrackResources(rejected.fixture->program); },
              "not a valid runtime value",
              "formatted scalar descriptor table bypassed its count guard");
+}
+
+void TestFormattedExecCountGuard(bool vcc = false) {
+  TestFormattedScalarDescriptorTable(false, true, vcc);
+  // Both native EXEC polarities must retain the same bound.
+  auto accepted = MakeDispatcherSignedBufferLoopFixture(false, 1u, 80u, 20u, true, false, true, vcc);
+  auto& fixture = *accepted.fixture;
+  auto* reference = fixture.program.block_info[2].condition.ResolveInstruction();
+  const auto predicate = reference->Arg(0).ResolveInstruction()->Arg(0);
+  reference->SetFlags(vcc ? CFG::BranchCondition::VccNonZero : CFG::BranchCondition::ExecNonZero);
+  reference->SetArg(0, predicate);
+  fixture.program.block_info[2].condition = fixture.Emit(ValueOpcode::LogicalNot,
+      {Value(reference)}, 0, fixture.program.blocks[2]);
+  fixture.PlanAndTrack();
+  Check(fixture.program.bounded_srt_reads.size() == 4u,
+        "inverted EXEC nonzero guard lost its scalar count bound");
+
+  for (uint32_t invalid = 0; invalid < 5; ++invalid) {
+    auto rejected = MakeDispatcherSignedBufferLoopFixture(false, 1u, 80u, 20u, true, false, true, vcc);
+    auto& bad = *rejected.fixture;
+    auto* ref = bad.program.block_info[2].condition.ResolveInstruction();
+    auto* inactive = ref->Arg(0).ResolveInstruction();
+    auto* conjunction = inactive->Arg(0).ResolveInstruction();
+    auto* comparison = conjunction->Arg(0).ResolveInstruction();
+    if (invalid == 0) conjunction->ReplaceOpcode(ValueOpcode::LogicalOr);
+    if (invalid == 1) comparison->SetArg(1, bad.Emit(ValueOpcode::LaneId, {}, 0, bad.program.blocks[1]));
+    if (invalid == 2) comparison->ReplaceOpcode(ValueOpcode::SLessThan32);
+    if (invalid == 3) ref->SetArg(0, Value(conjunction)); // malformed EXEC-zero recipe
+    if (invalid == 4) bad.program.block_info[1].condition = bad.Emit(ValueOpcode::IEqual32,
+        {bad.Emit(ValueOpcode::LaneId, {}, 0, bad.program.blocks[1]), Value(0u)},
+        0, bad.program.blocks[1]);
+    CheckFatal([&] { bad.PlanAndTrack(); }, "not a valid runtime value",
+               "unsafe EXEC count guard formed a descriptor table");
+  }
 }
 
 void TestPhiValidation() {
@@ -7939,6 +7989,16 @@ int main(int argc, char** argv) {
       std::cout << "KYTY_FORMATTED_SCALAR_TABLE_PASS\n";
       return 0;
     }
+    if (argc == 2 && std::strcmp(argv[1], "--formatted-vcc-count-guard-only") == 0) {
+      TestFormattedExecCountGuard(true);
+      std::cout << "KYTY_FORMATTED_VCC_COUNT_GUARD_PASS\n";
+      return 0;
+    }
+    if (argc == 2 && std::strcmp(argv[1], "--formatted-exec-count-guard-only") == 0) {
+      TestFormattedExecCountGuard();
+      std::cout << "KYTY_FORMATTED_EXEC_COUNT_GUARD_PASS\n";
+      return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--formatted-scalar-nested-only") == 0) {
       TestFormattedScalarDescriptorTable(true);
       std::cout << "KYTY_FORMATTED_SCALAR_NESTED_PASS\n";
@@ -8120,6 +8180,8 @@ int main(int argc, char** argv) {
     Run("unselected bounded buffer writer", TestUnselectedBoundedBufferWriter);
     Run("TestBoundedMaterializationNullsForeignBufferSlots",
         TestBoundedMaterializationNullsForeignBufferSlots);
+    Run("formatted EXEC count guard", [] { TestFormattedExecCountGuard(); });
+    Run("formatted VCC count guard", [] { TestFormattedExecCountGuard(true); });
     Run("phi validation", TestPhiValidation);
     Run("conditional sampler phi", TestConditionalSamplerPhi);
     Run("runtime-rooted loop", TestLoopCycleEnteredThroughRuntimeValue);

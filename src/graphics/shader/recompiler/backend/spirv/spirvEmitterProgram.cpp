@@ -57,6 +57,7 @@ struct DeferredContinuePatch {
 
 struct StructuredFunctionState {
 	std::unordered_map<const IR::Block*, uint32_t> dedicated_continues;
+	std::unordered_map<const IR::Block*, uint32_t> dedicated_loop_continues;
 	std::unordered_map<const IR::Block*,
 	                   std::pair<const IR::Block*, const IR::Block*>>
 	    budgeted_loop_continues;
@@ -105,87 +106,46 @@ const IR::Block* TargetBlock(const IR::Program& program, uint32_t id) {
 	return program.blocks[static_cast<size_t>(found - program.block_info.begin())];
 }
 
-// Move only a proved simple while-loop's SPIR-V continue target past its
-// guest body. Generated bounds checks and nested selections in that body can
-// open paths that are not structurally post-dominated by the back-edge; those
-// paths must not belong to the continue construct.
-// More general early-continue/nested-selection graphs retain their existing
-// targets: moving them requires restructuring the selection exits as well.
+// Put a simple while-loop's continue target after its unique backedge body.
+// A single-entry chain may contain several exit guards, each leaving to the
+// same loop merge. Generated selections in the body remain outside the
+// continue construct. Early-continue and nested/multiple-entry graphs retain
+// their existing targets until their selection exits have a matching proof.
 const IR::Block* DedicatedContinueBody(const IR::Program& program, const IR::Block* header,
                                        const IR::BlockInfo& header_info) {
 	const auto& loop = header_info.terminator;
-	if (!loop.loop_header) {
-		return nullptr;
-	}
+	if (!loop.loop_header) return nullptr;
 	const auto* merge = TargetBlock(program, loop.merge_block);
-	const auto* body = TargetBlock(program, loop.continue_block);
-	if (merge == nullptr || body == nullptr || merge == header || body == header || merge == body) {
-		return nullptr;
-	}
+	if (merge == nullptr || merge == header) return nullptr;
 	const auto info_for = [&](const IR::Block* block) -> const IR::BlockInfo* {
 		const auto found = std::ranges::find(program.blocks, block);
 		return found == program.blocks.end() ? nullptr :
 		       &program.block_info[static_cast<size_t>(found - program.blocks.begin())];
 	};
-	const auto* body_info = info_for(body);
-	if (body_info == nullptr || body_info->terminator.loop_header) {
-		return nullptr;
-	}
-	const auto latch_returns_to_header = [&]() {
-		const auto& term = body_info->terminator;
-		if (term.kind == CFG::TerminatorKind::Branch) {
-			return TargetBlock(program, term.true_block) == header;
-		}
-		if (term.kind != CFG::TerminatorKind::ConditionalBranch || body_info->condition.IsEmpty()) {
-			return false;
-		}
-		const auto* on_true = TargetBlock(program, term.true_block);
-		const auto* on_false = TargetBlock(program, term.false_block);
-		return (on_true == header && on_false == merge) || (on_true == merge && on_false == header);
-	};
-	if (!latch_returns_to_header()) {
-		return nullptr;
-	}
-	const auto single_pred_from = [&](const IR::Block* block, const IR::Block* pred) {
-		const auto predecessors = block->ImmPredecessors();
-		return predecessors.size() == 1u && predecessors.front() == pred;
-	};
 	std::unordered_set<const IR::Block*> visited;
 	const auto* guard = header;
 	for (;;) {
-		if (guard == merge || !visited.insert(guard).second) {
-			return nullptr;
-		}
+		if (guard == merge || !visited.insert(guard).second) return nullptr;
 		const auto* info = info_for(guard);
-		if (info == nullptr || (guard != header && info->terminator.loop_header)) {
-			return nullptr;
-		}
+		if (info == nullptr || (guard != header && info->terminator.loop_header)) return nullptr;
 		const auto& term = info->terminator;
-		if (term.kind == CFG::TerminatorKind::ConditionalBranch) {
+		const IR::Block* next = nullptr;
+		if (term.kind == CFG::TerminatorKind::Branch) {
+			next = TargetBlock(program, term.true_block);
+		} else if (term.kind == CFG::TerminatorKind::ConditionalBranch) {
 			const auto* on_true = TargetBlock(program, term.true_block);
 			const auto* on_false = TargetBlock(program, term.false_block);
 			if (info->condition.IsEmpty() ||
-			    (guard != header && term.merge_block != UINT32_MAX) ||
-			    !((on_true == body && on_false == merge) || (on_true == merge && on_false == body))) {
+			    (guard != header && term.merge_block != UINT32_MAX && term.merge_block != loop.merge_block))
 				return nullptr;
-			}
-			return single_pred_from(body, guard) ? body : nullptr;
-		}
-		if (term.kind != CFG::TerminatorKind::Branch) {
-			return nullptr;
-		}
-		const auto* next = TargetBlock(program, term.true_block);
-		if (next == nullptr) {
-			return nullptr;
-		}
-		// Empty header that branches straight into the latch/body: still a
-		// simple while with the exit test on the latch.
-		if (next == body) {
-			return single_pred_from(body, guard) ? body : nullptr;
-		}
-		if (next->ImmPredecessors().size() != 1u || next->ImmPredecessors().front() != guard) {
-			return nullptr;
-		}
+			if (on_true == merge) next = on_false;
+			else if (on_false == merge) next = on_true;
+			else return nullptr;
+		} else return nullptr;
+		if (next == header) return guard != header ? guard : nullptr;
+		if (next == nullptr || next == merge) return nullptr;
+		const auto predecessors = next->ImmPredecessors();
+		if (predecessors.size() != 1u || predecessors.front() != guard) return nullptr;
 		guard = next;
 	}
 }
@@ -221,8 +181,8 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, StructuredFunctionState& st
 			const auto* merge = TargetBlock(program, term.merge_block);
 			const auto* cont  = TargetBlock(program, term.continue_block);
 			if (merge != nullptr && cont != nullptr) {
-				const auto bridge = structured.dedicated_continues.find(cont);
-				const auto continue_label = bridge == structured.dedicated_continues.end()
+				const auto bridge = structured.dedicated_loop_continues.find(block);
+				const auto continue_label = bridge == structured.dedicated_loop_continues.end()
 				                                ? ctx.Label(cont) : bridge->second;
 				ctx.state.builder.AddFunction(spv::OpLoopMerge, ctx.Label(merge), continue_label,
 				                              spv::LoopControlMaskNone);
@@ -643,7 +603,9 @@ void EmitStructuredFunction(ValueEmitContext& ctx) {
 		const auto& info = ctx.program.block_info[index];
 		if (const auto* body = DedicatedContinueBody(ctx.program, ctx.program.blocks[index], info);
 		    body != nullptr) {
-			structured.dedicated_continues.emplace(body, ctx.state.builder.AllocateId());
+			const auto label = ctx.state.builder.AllocateId();
+			structured.dedicated_continues.emplace(body, label);
+			structured.dedicated_loop_continues.emplace(ctx.program.blocks[index], label);
 		}
 		if (ctx.state.graphics_loop_counter_variable != 0 && info.terminator.loop_header) {
 			const auto* header = ctx.program.blocks[index];

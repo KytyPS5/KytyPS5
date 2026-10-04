@@ -247,6 +247,60 @@ timeout alone still cannot justify changing guest semantics.
 
 ## Formatted buffer descriptor selected at runtime (2026-10-03; pending)
 
+**2026-10-04 verified shared correction (game retry pending):** EXEC and VCC
+synthetic RED/GREEN, full ResourceTracking, nine native GPUAV formatted
+readbacks and four neighboring zero-stride cases pass. The two-stage fix
+proves uniform induction bounds through a nonempty mask conjunction and
+places the dedicated continue bridge after a linear guard chain's unique
+backedge body. Primary artifacts: `formatted-mask-count-final-{resource-suite,gpuav}-20261004.log`
+and `formatted-mask-{nested-latch,shared-merge,graphics-loop,graphics-loop-phi}-20261004.log`
+in `_Build/logs`. GPU cases include full/sparse wave64 across both halves,
+OOB zero and distinct numeric descriptor choices. Runtime descriptor sizes
+are bound exactly in the test harness. No arbitrary unbounded formatted
+fallback was enabled, and temporary instrumentation is removed.
+Saved-game CPU audit advances PC0x284 to **PC0x41c** with synthetic user data
+(`formatted-mask-cs4d-final-audit-20261004.log`). Required next reproduction:
+trace the new descriptor and its guard with real runtime inputs, then add a
+synthetic fixture for that provenance; do not infer it from zero user data.
+
+
+**2026-10-04 adjacent emitter RED:** the independent native formatted
+EXEC-count fixture now passes tracking, but SPIR-V validation rejects its
+two-exit-guard while loop: continue target is not structurally post-dominated
+by the generated backedge label. No GPU dispatch occurred. Evidence:
+`_Build/logs/formatted-exec-count-gpuav-scalar-20261004.log.stderr` and its
+run JSON (test exe SHA256 C7E4FBBDF1AA477DDEE066B2FE14D9A41638A5B8BC1C863B418C62B7F0134E53).
+Extend the existing dedicated-continue bridge only for a proven single-entry
+linear chain of guards whose failure edges leave to the same loop merge and
+whose unique body returns to the header. Retain conservative handling of
+early-continue, nested selection and multiple-entry graphs. Same fixture
+must validate and read back correctly after the emitter correction.
+
+
+**2026-10-04 mask refinement:** phase diagnostics of the saved shader
+confirm uniform zero/+1 induction, but the required count branch is VCCZero,
+not EXECZero. Add the same independent table/materialization and unsafe
+boundary controls for VCCZero/VCCNonZero before extending the common mask
+conjunction proof. Diagnostic logs are
+`_Build/logs/formatted-exec-count-condition-diagnostic-20261004.log.stderr`;
+temporary instrumentation was removed.
+
+**2026-10-04 runtime refinement:** clean installed source `3eb16e4b` now
+reaches this rejection without a vertex/work cap. Runs `113840` and `115058`
+exit 321 at CS `4d6df08d2d54e0ff`, PC `0x284`; this exit is ResourceTracking,
+not DeviceLost. Runtime phase trace in
+`_Build/runs/yotei-integrated-20261004-115058-presentfix-gpuav/stderr.txt`
+shows all four words as unproved `ReadConstBuffer`, an `IMul32` offset, and
+four `GetUserData` roots. Final readback first nonzero is frame195, shown200;
+no menu. The prior simple/nested controls put the count comparison in the
+first scalar loop guard. Actual normalized CFG first tests an EXEC mask,
+then tests `Any((i < count) && active)` before reading descriptor rows.
+Required RED: an independent canonical scalar induction, a preliminary mask
+guard, and an EXEC-reduced conjunction containing the uniform count bound.
+Check two distinct descriptor rows and guard-bypass/OR/nonuniform-count
+rejections. Preserve arbitrary formatted descriptor and store rejection.
+
+
 Offline audit of the saved shader code at
 `_Build/runs/yotei-immediate-20260926-011827/shaders/registered/cs_4d6df08d2d54e0ff_dccdf4ea82ba8496.bin`
 reproduced the PC `0x284` rejection without launching the game or GPU
@@ -3483,3 +3537,15 @@ Remaining validation:
   not a title branch and not “merge #718 first”.
 - Re-run the accumulated shader/GPU test debt before upstream submission; the
   rendered-pixel milestone does not waive neighboring regressions.
+
+## Existing CFG literal-word assertion (2026-10-04; baseline confirmed)
+
+The full native `shader_cfg_tests` suite fails in its legacy literal-word
+assertion, before later tests. Reversing only the new SRT-bound and continue
+bridge changes reproduces the same failure: logs
+`_Build/logs/formatted-mask-cfg-baseline-suite-20261004.log{,.stderr,.run.json}`.
+Do not describe the full suite as GREEN. The scalar MOV/store fixture needs
+inspection of its valid resource/observable-store setup before changing an
+expectation; the current emulator legitimately may eliminate unreachable
+store operands. Relevant nested latch/shared merge/graphics-loop selectors
+were checked separately and passed.

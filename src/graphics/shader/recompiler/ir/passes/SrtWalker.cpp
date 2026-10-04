@@ -821,6 +821,31 @@ public:
 				}
 			}
 		}
+		// A scalar induction can first pass an EXEC mask guard and only then
+		// execute an EXEC/VCC test of Any((i < N) && active). The zero/+1 recurrence above is uniform
+		// across the wave, and a runtime-evaluable N is uniform too. Nonempty
+		// EXEC/VCC therefore implies i<N even when 'active' varies between lanes.
+		// Do not infer a bound from the empty edge, an OR, or signed comparisons:
+		// masked iterations can advance past INT32_MAX before a later read.
+		if (buffer_read && UniformInductionControl(header, latch)) {
+			for (const auto& candidate : m_program.block_info) {
+				if (candidate.terminator.kind != CFG::TerminatorKind::ConditionalBranch) continue;
+				Value count;
+				bool nonempty_true = false;
+				if (!MaskConjunctBound(candidate.condition, index, count, nonempty_true) ||
+				    !ValidateRuntimeValue(m_program, count)) continue;
+				const auto* guard = m_by_id.at(candidate.id);
+				if (!Dominates(header, guard) || !Dominates(guard, read.Parent()) ||
+				    !RuntimeReadsDominate(count, guard)) continue;
+				const auto* success = m_by_id.at(nonempty_true ? candidate.terminator.true_block
+				                                             : candidate.terminator.false_block);
+				if (Reachable(read.Parent(), nullptr, guard, success)) continue;
+				bool roots_safe = true;
+				for (uint32_t word = 0; word < source_dwords; ++word)
+					roots_safe &= RuntimeReadsDominate(address->Arg(word), read.Parent(), &read);
+				if (roots_safe) return make_proof(count);
+			}
+		}
 		// SSA construction may put the induction Phi in a separate empty header.
 		// Follow only an unavoidable, single-entry unconditional chain to its
 		// guard: every visit to the Phi must execute the same comparison.
@@ -871,6 +896,91 @@ public:
 	}
 
 private:
+	bool UniformInductionControl(const Block* header, const Block* latch) const {
+		// A zero/+1 Phi is not wave-uniform if per-lane CFG branches allow
+		// different lanes to take different numbers of its backedges. Native
+		// SCC/EXEC/VCC references represent the guest wave's one branch decision;
+		// folded predicates must instead be independently runtime-uniform.
+		std::vector<const Block*> work {latch};
+		std::unordered_set<const Block*> visited;
+		while (!work.empty()) {
+			const auto* block = work.back();
+			work.pop_back();
+			if (!visited.insert(block).second) continue;
+			const auto& info = m_program.block_info[m_ids.at(block)];
+			if (info.terminator.kind == CFG::TerminatorKind::ConditionalBranch) {
+				auto condition = info.condition.Resolve();
+				// Keep native references intact; remove only outer negations.
+				std::unordered_set<const Inst*> wrappers;
+				while (const auto* inst = condition.TryInstruction()) {
+					if (inst->GetOpcode() != ValueOpcode::LogicalNot || inst->NumArgs() != 1u) break;
+					if (!wrappers.insert(inst).second) return false;
+					condition = inst->Arg(0).Resolve();
+				}
+				const auto* reference = condition.TryInstruction();
+				bool native = false;
+				if (reference != nullptr && reference->GetOpcode() == ValueOpcode::ConditionRef) {
+					const auto kind = reference->Flags<CFG::BranchCondition>();
+					native = kind == CFG::BranchCondition::SccZero || kind == CFG::BranchCondition::SccNonZero ||
+					         kind == CFG::BranchCondition::ExecZero || kind == CFG::BranchCondition::ExecNonZero ||
+					         kind == CFG::BranchCondition::VccZero || kind == CFG::BranchCondition::VccNonZero;
+				}
+				if (!native && !ValidateRuntimeValue(m_program, info.condition, RuntimeValueType::Any))
+					return false;
+			}
+			if (block == header) continue;
+			for (const auto* predecessor : block->ImmPredecessors())
+				if (Dominates(header, predecessor)) work.push_back(predecessor);
+		}
+		return true;
+	}
+
+	static bool MaskConjunctBound(Value condition, Value index, Value& count,
+	                              bool& nonempty_true) {
+		bool invert = false;
+		std::unordered_set<const Inst*> visited;
+		condition = condition.Resolve();
+		while (const auto* inst = condition.TryInstruction()) {
+			if (inst->GetOpcode() != ValueOpcode::LogicalNot || inst->NumArgs() != 1u) break;
+			if (!visited.insert(inst).second) return false;
+			invert = !invert;
+			condition = inst->Arg(0).Resolve();
+		}
+		const auto* reference = condition.TryInstruction();
+		if (reference == nullptr || reference->GetOpcode() != ValueOpcode::ConditionRef ||
+		    reference->NumArgs() != 1u) return false;
+		const auto kind = reference->Flags<CFG::BranchCondition>();
+		auto predicate = reference->Arg(0).Resolve();
+		if (kind == CFG::BranchCondition::ExecZero || kind == CFG::BranchCondition::VccZero) {
+			const auto* inactive = predicate.TryInstruction();
+			if (inactive == nullptr || inactive->GetOpcode() != ValueOpcode::LogicalNot ||
+			    inactive->NumArgs() != 1u) return false;
+			predicate = inactive->Arg(0).Resolve();
+			nonempty_true = invert;
+		} else if (kind == CFG::BranchCondition::ExecNonZero || kind == CFG::BranchCondition::VccNonZero) {
+			nonempty_true = !invert;
+		} else return false;
+		std::vector<Value> work {predicate};
+		visited.clear();
+		while (!work.empty()) {
+			const auto value = work.back().Resolve();
+			work.pop_back();
+			const auto* inst = value.TryInstruction();
+			if (inst == nullptr || !visited.insert(inst).second || inst->NumArgs() != 2u) continue;
+			if (inst->GetOpcode() == ValueOpcode::ULessThan32 && inst->Arg(0).Resolve() == index)
+				count = inst->Arg(1).Resolve();
+			else if (inst->GetOpcode() == ValueOpcode::UGreaterThan32 && inst->Arg(1).Resolve() == index)
+				count = inst->Arg(0).Resolve();
+			else if (inst->GetOpcode() == ValueOpcode::LogicalAnd) {
+				work.push_back(inst->Arg(0));
+				work.push_back(inst->Arg(1));
+				continue;
+			} else continue;
+			if (count.GetType() == Type::U32) return true;
+		}
+		return false;
+	}
+
 	static bool UnwrapScalarCondition(Value& condition, bool& invert) {
 		std::unordered_set<const Inst*> visited;
 		while (const auto* inst = condition.TryInstruction()) {

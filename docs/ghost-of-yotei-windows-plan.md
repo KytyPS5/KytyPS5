@@ -46,9 +46,14 @@ branch `yotei-windows-bringup`, pushed source fix `3eb16e4b`):
   timeout 1800 s / shown watchdog 1200 s, readback 150+240, continue after
   colored. Resume its driver log
   `_Build/logs/driver-cache-checkpoint-yotei-driver-20261004.log` before
-  starting another build/GPU workload. Next: verify immediate persistence of
-  every expensive successful variant, then inspect the original nonzero/Vertex
-  frontier. Last confirmed nonzero RGB remains old frames 198–199.
+  starting another build/GPU workload. At 11:10 UTC it reached `shown=315`;
+  first nonzero RGB is frame 239 and color continues beyond 300. Offscreen
+  `window-1108.png` visibly shows a loading spinner. CS `54904…` first three
+  variants completed from cache in 45/35/177 ms; the fourth (table length 11)
+  is still creating. No DeviceLost has occurred in this run so far; frame
+  counters differ between retries and do not identify the same guest draw.
+  Next: verify immediate persistence of every expensive successful variant,
+  then inspect subsequent runtime work and menu pixels.
   **Menu and gameplay PENDING.**
 
 Checkpoint **4 октября 2026 года, 10:41 UTC** (native Windows via WSL;

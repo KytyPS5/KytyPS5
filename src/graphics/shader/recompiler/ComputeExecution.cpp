@@ -437,14 +437,21 @@ std::string ProveSplitWaveConvergence(const IR::Program& program, bool partition
 				if (op == O::DataAppend) cyclic_appends.push_back(&inst);
 			}
 			// A single complete guest wave remains one 64-invocation host workgroup.
-			// An acyclic device-buffer, LDS, or GDS atomic therefore produces one
-			// lane-local old value exactly where the direct emitter defines it;
-			// native subgroup splitting does not duplicate or transfer that value
-			// between phases. Keep cyclic, partitioned, cooperative and unsupported
-			// GDS returns behind their separate ordering/publication proofs.
+			// Direct buffer atomics produce lane-local old values once per active
+			// invocation, including loop visits. A complete single guest wave can
+			// retain cyclic DWORD returns by publishing each instruction across both
+			// native32 halves; the convergence proof below still checks every branch.
+			// Cyclic wide/LDS/GDS and cross-wave returns retain their separate guards.
+			const bool cyclic_single_wave_buffer_atomic_return =
+			    !partitions_guest_workgroup && !cooperative && cyclic.contains(block) &&
+			    IR::BufferAccessOf(op) == IR::BufferAccess::Atomic &&
+			    inst.GetType() == IR::Type::U32 && inst.HasUses();
 			const bool direct_single_wave_buffer_atomic_return =
-			    !partitions_guest_workgroup && !cooperative && !cyclic.contains(block) &&
+			    !partitions_guest_workgroup && !cooperative &&
+			    (!cyclic.contains(block) || cyclic_single_wave_buffer_atomic_return) &&
 			    IR::BufferAccessOf(op) == IR::BufferAccess::Atomic;
+			if (cyclic_single_wave_buffer_atomic_return && synchronize_split_wave_memory != nullptr)
+				*synchronize_split_wave_memory = true;
 			const auto shared_index = inst.Flags<IR::MemoryFlags>().index;
 			const bool direct_single_wave_shared_atomic_return =
 			    !partitions_guest_workgroup && !cooperative && !cyclic.contains(block) &&

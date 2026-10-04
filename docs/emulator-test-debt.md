@@ -1,6 +1,69 @@
 # Emulator regression test debt
 
-## Sampled pair graph versus separate operand descriptors (2026-10-04; synthetic proof complete, runtime pending)
+## Cyclic single-wave buffer atomic returns (2026-10-04; synthetic CPU/GPU proved, original retry pending)
+
+Native a1ae8a8d run143716 naturally exits321 at14:45:08UTC on
+CS01025cd5c3102c4c: wave64 splitting does not support live BufferAtomicIAdd32
+return values. PriorCS596 passes258images/752pairs and pipeline8784ms.
+Shown197, source readback through196black, no colored frame/menu/gameplay;
+no DeviceLost. PID19912 exited.
+
+Required bounded synthetic RED: one complete guest wave64/native subgroup32,
+a fixed finite loop with a predicated buffer atomic old value used by stores
+and ReadLane-derived uniform control. Keep one64-invocation host workgroup,
+per-lane old-value ownership and post-instruction publication. Numerical
+native GPU cases must have an independent iteration cap, both physical halves,
+sparse/inactive predicates, multiple counters/alias feedback, and real bounds.
+Reject unproved partitioned/cooperative atomic communication, raw varying
+branches and existing LDS/GDS unsupported loops. Use current shared atomic
+emitter and split-wave publication mechanism; no dropped return or zero stub.
+Atomic RMW is indivisible; the guest GLC return is the value before the update.
+Record native planner RED before admission change, unchanged GREEN/SPIR-V and
+numerical GPUAV neighbors, then retry the game.
+
+Native final synthetic planner RED on unchanged productiona1ae8a8d:
+`cyclic-buffer-atomic-final-red-20261004.log.stderr`, native exe SHA256
+5dae65a4899733cae664718fe390c557de298dd8d842fe1880e0c788fbcb06b6:
+exact rejection is live BufferAtomicIAdd32 return. The correction admits cyclic
+DWORD buffer returns only in one complete direct guest wave and requests the
+existing post-instruction AcquireRelease/UniformMemory workgroup rendezvous.
+Convergence checks still reject raw varying branches; cyclic wide/shared/GDS
+and partitioned/cooperative buffer communication remain guarded. Native
+unchanged GREEN and numerical GPUAV are pending.
+
+Unchanged planner GREEN `cyclic-buffer-atomic-green-20261004.log` and four
+native numerical GPUAV cases pass in `cyclic-buffer-atomic-gpuav-20261004.log`
+(lower/upper ReadLane, sparseEXEC, contended shared counter; native SHA256
+cd01efa0ee6ca15fc212541d6be2e9d817e9ebbc639ff1eb0e8aeb384f639ed2).
+An expanded legacy convergence suite exposed an obsolete barrier expectation:
+scenario8 expected128-thread uniform guest barrier rejection but current
+cooperative planner accepts it. Reversing ONLY the new core patch reproduces
+that same failure (`cyclic-buffer-atomic-baseline-neighbors-20261004.log.stderr`,
+SHA956521a8b22da8f4c5277d4d968805a1cbd5021b81bf68d8b74dac5642d6a029).
+The old expectation is preserved as pending debt, outside the focused neighbor
+gate. A second legacy feedback assertion (scenario4/PollBallot,128invocations)
+expects rejection despite existing cooperative promotion; reversing ONLY the
+new core patch reproduces it too (`cyclic-buffer-atomic-feedback-baseline-20261004.log.stderr`,
+native SHAaefa7c42c850e123b42db98fc347535eacca6ae95ef130e7fd13de9a3a572086).
+Neither legacy oracle is weakened in this correction. SavedCS0102 CPU IR audit
+(`cs0102-resource-ir-audit-20261004.log`) finds a predicated atomic returned
+through ReadFirstLane, with sparse EXEC and per-lane prefix offsets; add lower/
+upper-active ReadFirstLane numerical controls before original retry.
+
+Final native planner/regression and focused existing GDS/LDS/cooperative/image
+publication neighbors pass (`cyclic-buffer-atomic-final-{planner,focused-neighbors}-20261004.log`,
+SHA c1c790f633a60ab421696799e9196a5466cb2f0582b969ac1f5e499c20f0c94c).
+Six numerical native GPUAV cases pass (`cyclic-buffer-atomic-final-gpuav-20261004.log`):
+per-lane old values AND direct ReadLane/ReadFirstLane broadcasts through each
+loop visit, sparse/inactive lanes, upper-only EXEC, contended counter unique
+slot allocation. An independent three-iteration bound prevents GPU hangs.
+Same native exe SHA578c5186a19b122de66274e31a9ae59ffa7b72ab836e27197264028accc6881a
+passes9 cooperative LDS/barrier/image-atomic neighbors and buffer integer
+atomic family/GLC0 tests in `cyclic-buffer-atomic-{cooperative-gpu-neighbors,family-gpu-neighbor,glc0-gpu-neighbor}-20261004.log`.
+No core emitter changes, no work/return dropped, no guest-specific branches.
+Original native game retry and other-game runtime remain pending.
+
+## Sampled pair graph versus separate operand descriptors (2026-10-04; synthetic and actual CS596 pipeline proved; menu pending)
 
 Native source8a496a73 run `yotei-integrated-20261004-140111-presentfix-gpuav`
 naturally exits321 on CS59630740d07d5a1c: specialized sampled pairs exceed512.
@@ -39,7 +102,10 @@ shared-root and compact dynamic-sampler neighbors pass. DescriptorBudget full
 suite passes real exact/over-budget operand checks. Logs are
 `sampled-pair-domain-{final-green,final-resource-suite,gpuav,shared-neighbor,dynamic-neighbor,budget-green}-20261004.log`.
 Native GPU exe SHA25605c56fb2b414fc66ad6b24d78ee1b58452c2eee480c420d1a994e68c5c004c58.
-Original-game runtime retry and other-game runtime remain pending.
+Original-game native a1ae8a8d retry143716 FINISHED exit321. ActualCS596 admitted
+8buffers/258images/752pairs, SPIR-V354059words, pipeline8784ms and immediate
+427958103-byte cache checkpoint; subsequent shaders pass untilCS0102 live cyclic buffer atomic return rejection. No menu/gameplay
+or completed actual dispatch readback yet. Other-game runtime remains pending.
 
 ## Inline sampled-image selector domain and aggregate admission (2026-10-04; pending)
 

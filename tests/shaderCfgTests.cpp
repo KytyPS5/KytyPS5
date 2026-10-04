@@ -12713,6 +12713,81 @@ void TestComputeExecutionPlanningBoundaries() {
         "shader without live wave operations unnecessarily split its LDS workgroup");
 }
 
+void TestSingleWave64CyclicBufferAtomicReturn() {
+  using namespace ShaderRecompiler;
+  using O = IR::ValueOpcode;
+  using V = IR::Value;
+  enum class Scenario { UniformLoop, UpperLane, VaryingBranch, Partitioned, Cooperative };
+  for (const auto scenario : {Scenario::UniformLoop, Scenario::UpperLane,
+       Scenario::VaryingBranch, Scenario::Partitioned, Scenario::Cooperative}) {
+    IR::Program program;
+    program.stage = ShaderType::Compute;
+    program.wave_size = 64u;
+    auto* entry = AddExecutionPlanBlock(program);
+    auto* body = AddExecutionPlanBlock(program);
+    auto* exit = AddExecutionPlanBlock(program);
+    entry->AddBranch(body);
+    program.block_info[0].terminator.kind = CFG::TerminatorKind::Branch;
+    program.block_info[0].terminator.true_block = 1u;
+    body->AddBranch(body);
+    body->AddBranch(exit);
+    program.block_info[1].terminator.kind = CFG::TerminatorKind::ConditionalBranch;
+    program.block_info[1].terminator.true_block = 1u;
+    program.block_info[1].terminator.false_block = 2u;
+    program.block_info[1].terminator.loop_header = true;
+    auto& handle = entry->AppendNewInst(O::GetBufferResource,
+        {V(0u), V(0u), V(1024u), V(0u)});
+    auto& lane = entry->AppendNewInst(O::LaneId);
+    auto& iteration = body->AppendNewInst(O::Phi, {}, static_cast<uint64_t>(IR::Type::U32));
+    iteration.AddPhiOperand(entry, V(0u));
+    IR::MemoryInfo memory{};
+    memory.kind = IR::ResourceKind::Buffer;
+    program.memory_info.push_back(memory);
+    auto& atomic = body->AppendNewInst(O::BufferAtomicIAdd32,
+        {V(&handle), V(0u), V(0u), V(0u), V(1u), V(true)});
+    atomic.SetFlags(IR::MemoryFlags{.index = 0u, .pc = 0x40u});
+    auto& selected = body->AppendNewInst(O::ReadLane,
+        {V(&atomic), V(scenario == Scenario::UpperLane ? 39u : 0u)});
+    auto& predicate = body->AppendNewInst(O::ULessThan32,
+        {scenario == Scenario::VaryingBranch ? V(&atomic) : V(&selected), V(3u)});
+    auto& next = body->AppendNewInst(O::IAdd32, {V(&iteration), V(1u)});
+    iteration.AddPhiOperand(body, V(&next));
+    auto& bounded = body->AppendNewInst(O::ULessThan32, {V(&next), V(3u)});
+    auto& condition = body->AppendNewInst(O::LogicalAnd, {V(&bounded), V(&predicate)});
+    program.block_info[1].condition = V(&condition);
+    if (scenario == Scenario::Cooperative) {
+      IR::MemoryInfo lds{};
+      lds.kind = IR::ResourceKind::Lds;
+      program.memory_info.push_back(lds);
+      auto& read = body->AppendNewInst(O::LoadSharedU32, {V(&lane), V(true)});
+      read.SetFlags(IR::MemoryFlags{.index = 1u, .pc = 0x44u});
+      body->AppendNewInst(O::ReferenceU32, {V(&read)});
+    }
+    IR::ValidateProgram(program, true);
+    ShaderComputeInputInfo compute{};
+    compute.threads_num[0] = scenario == Scenario::Partitioned ||
+                            scenario == Scenario::Cooperative ? 128u : 64u;
+    compute.threads_num[1] = compute.threads_num[2] = 1u;
+    compute.wave_size = 64u;
+    compute.lds_size_dwords = scenario == Scenario::Cooperative ? 64u : 0u;
+    ShaderStageInputInfo input{};
+    input.compute = &compute;
+    const ComputeWorkgroupLimits limits{{1024u, 1024u, 64u}, 1024u, 32u, false};
+    const auto plan = PlanComputeExecution(program, input, limits);
+    const bool accepted = scenario == Scenario::UniformLoop || scenario == Scenario::UpperLane;
+    if (accepted) {
+      if (!plan.error.empty()) std::fprintf(stderr, "cyclic atomic plan: %s\n", plan.error.c_str());
+      Check(plan.error.empty() && plan.IsSplitWave64() && !plan.IsCooperativeWave64() &&
+                plan.wave_partition_factor == 1u &&
+                WorkgroupInvocationCount(plan.layout.host_size) == 64u &&
+                plan.SynchronizesSplitWaveMemory(),
+            "bounded single-wave buffer atomic return lost lane ownership or publication");
+    } else {
+      Check(!plan.error.empty(), "cyclic buffer atomic return bypassed convergence or cross-wave safety");
+    }
+  }
+}
+
 void TestComputeExecutionConvergenceProof() {
   using namespace ShaderRecompiler;
   using O = IR::ValueOpcode;
@@ -12824,6 +12899,9 @@ void TestComputeExecutionConvergenceProof() {
                           scenario == Scenario::LoopRead || scenario == Scenario::Lds ||
                           scenario == Scenario::Dispatcher;
     const auto plan = PlanComputeExecution(program,input,limits);
+    if (plan.error.empty() != accepted)
+      std::fprintf(stderr, "legacy convergence scenario=%u expected=%u error='%s'\n",
+                   static_cast<unsigned>(scenario), accepted ? 1u : 0u, plan.error.c_str());
     Check(plan.error.empty() == accepted, "split-wave convergence proof accepted/rejected the wrong invariant");
     if (scenario == Scenario::Lds)
       Check(plan.IsSplitWave64() && plan.wave_partition_factor == 1u &&
@@ -18916,6 +18994,24 @@ int main(int argc, char* argv[]) {
     std::puts("KYTY_SINGLE_WAVE64_BALLOT_MIXED_CONSUMER_PASS");
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--legacy-wave64-loop-feedback-only") == 0) {
+    Libs::Graphics::TestComputeExecutionLoopReadFeedback();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--single-wave64-buffer-atomic-neighbors-only") == 0) {
+    Libs::Graphics::TestComputeExecutionSingleWaveGdsAtomic();
+    Libs::Graphics::TestComputeExecutionSingleWaveLdsAtomicReturn();
+    Libs::Graphics::TestCooperativeWave64OperationBoundaries();
+    Libs::Graphics::TestCooperativeWave64BufferCycleVisibility();
+    Libs::Graphics::TestSplitWave64CyclicImageSpirvRendezvous();
+    std::puts("KYTY_SINGLE_WAVE64_BUFFER_ATOMIC_NEIGHBORS_PASS");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--single-wave64-cyclic-buffer-atomic-return-only") == 0) {
+    Libs::Graphics::TestSingleWave64CyclicBufferAtomicReturn();
+    std::puts("KYTY_SINGLE_WAVE64_CYCLIC_BUFFER_ATOMIC_RETURN_PASS");
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--split-wave64-cyclic-image-spirv-only") == 0) {
     Libs::Graphics::TestSplitWave64CyclicImageSpirvRendezvous();
     std::puts("KYTY_SPLIT_WAVE64_CYCLIC_IMAGE_SPIRV_PASS");
@@ -19216,6 +19312,7 @@ int main(int argc, char* argv[]) {
   TestComputeExecutionGdsAppendAdmission();
   TestComputeGuestWorkgroups();
   TestComputeExecutionPlanningBoundaries();
+  TestSingleWave64CyclicBufferAtomicReturn();
   TestComputeExecutionConvergenceProof();
   TestSingleWaveLdsSpirvPhaseOrdering();
   TestSingleWaveLdsSpirvPhaseOrdering(true, nullptr, true);

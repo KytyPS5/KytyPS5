@@ -35255,6 +35255,98 @@ TestCase BufferWorkgroupPublication(u32 wave_size, bool dlc_only = false) {
   return test;
 }
 
+TestCase SingleWave64CyclicBufferAtomicReturn(u32 selected_lane = 0u,
+                                                 bool sparse = false,
+                                                 bool shared_counter = false,
+                                                 bool read_first = false) {
+  using O = ShaderOpcode;
+  constexpr u32 lanes = 64u;
+  constexpr u32 iterations = 3u;
+  TestCase test;
+  test.name = read_first ? (sparse ? "Wave64CyclicBufferAtomicReadFirstUpperExec"
+                                    : "Wave64CyclicBufferAtomicReadFirstLane")
+              : shared_counter ? "Wave64CyclicBufferAtomicContendedCounter"
+              : sparse ? "Wave64CyclicBufferAtomicSparseUpperLane"
+              : selected_lane == 0u ? "Wave64CyclicBufferAtomicLowerLane"
+                                    : "Wave64CyclicBufferAtomicUpperLane";
+  test.initial.assign(shared_counter ? 384u : 448u, 0xdeadbeefu);
+  test.expected = test.initial;
+  if (shared_counter) {
+    test.initial[0] = 100u;
+    test.expected[0] = 100u + lanes * iterations;
+    for (u32 old = 100u; old < 100u + lanes * iterations; ++old)
+      test.expected[64u + old] = old + 1000u;
+  } else {
+    for (u32 lane = 0; lane < lanes; ++lane) {
+      const bool active = !sparse || (lane % 4u == 0u && (!read_first || lane >= 32u));
+      test.initial[lane] = 100u + lane;
+      test.expected[lane] = 100u + lane + (active ? iterations : 0u);
+      for (u32 iteration = 0; iteration < iterations; ++iteration) {
+        if (active) {
+          test.expected[64u + iteration * lanes + lane] = 100u + lane + iteration;
+          test.expected[256u + iteration * lanes + lane] = 100u + selected_lane + iteration;
+        }
+      }
+    }
+  }
+  test.compute_info.threads_num[0] = lanes;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1u;
+  test.compute_info.thread_ids_num = 1u;
+  test.compute_info.wave_size = 64u;
+  test.has_compute_info = true;
+  auto& code = test.code;
+  code.push_back(EncodeVop1(0x01, 4, Vgpr(0)));
+  if (shared_counter) AppendVMovU32(&code, 7, 0u);
+  else code.push_back(EncodeVop2(0x1a, 7, InlineU32(2u), 4));
+  code.push_back(EncodeSMovB32(8, InlineU32(0u)));
+  if (sparse) {
+    AppendSMovLiteral(&code, 126, read_first ? 0u : 0x11111111u);
+    AppendSMovLiteral(&code, 127, 0x11111111u);
+  }
+  const auto loop = code.size();
+  AppendVMovU32(&code, 10, 1u);
+  AppendBufferStoreOpcode(&code, 0x32, 10, 7, true); // Returned old DWORD.
+  if (read_first) code.push_back(EncodeVop1(0x02, 9, Vgpr(10)));
+  else AppendVop3(&code, 0x360, 9, Vgpr(10), InlineU32(selected_lane));
+  if (shared_counter) {
+    AppendVMovU32(&code, 11, 64u);
+    code.push_back(EncodeVop2(0x25, 11, Vgpr(10), 11));
+    code.push_back(EncodeVop2(0x1a, 11, InlineU32(2u), 11));
+    AppendVMovU32(&code, 12, 1000u);
+    code.push_back(EncodeVop2(0x25, 12, Vgpr(10), 12));
+    AppendBufferStoreDword(&code, 12, 11);
+  } else {
+    code.push_back(EncodeSop2(0x1e, 16, 8, InlineU32(6u)));
+    code.push_back(EncodeVop1(0x01, 11, 16));
+    code.push_back(EncodeVop2(0x25, 11, Vgpr(4), 11));
+    AppendVMovU32(&code, 12, 64u);
+    code.push_back(EncodeVop2(0x25, 11, Vgpr(12), 11));
+    code.push_back(EncodeVop2(0x1a, 11, InlineU32(2u), 11));
+    AppendBufferStoreDword(&code, 10, 11);
+    // Observe the collective return directly, not only its effect on a capped branch.
+    AppendVMovU32(&code, 13, 192u * 4u);
+    code.push_back(EncodeVop2(0x25, 13, Vgpr(11), 13));
+    code.push_back(EncodeVop1(0x01, 14, 9));
+    AppendBufferStoreDword(&code, 14, 13);
+  }
+  code.push_back(EncodeSop2(0x00, 8, 8, InlineU32(1u)));
+  // Independent hard cap keeps the GPU case bounded even for a wrong atomic return.
+  code.push_back(EncodeSopc(0x09, 8, InlineU32(iterations)));
+  const auto capped_exit = code.size();
+  code.push_back(0u);
+  AppendSMovLiteral(&code, 17, shared_counter ? 400u : 102u + selected_lane);
+  code.push_back(EncodeSopc(0x0a, 9, 17));
+  const auto branch = code.size();
+  code.push_back(EncodeSopp(0x05, static_cast<u32>(
+      static_cast<int64_t>(loop) - static_cast<int64_t>(branch + 1u))));
+  code[capped_exit] = EncodeSopp(0x05, static_cast<u32>(code.size() - capped_exit - 1u));
+  AppendEnd(&code);
+  test.opcodes = {O::BUFFER_ATOMIC_ADD, read_first ? O::V_READFIRSTLANE_B32 : O::V_READLANE_B32, O::S_CMP_GE_U32,
+                  O::S_CMP_LT_U32, O::S_CBRANCH_SCC1, O::BUFFER_STORE_DWORD};
+  test.required_spirv = {"OpAtomicIAdd", "OpLoopMerge", "OpControlBarrier"};
+  return test;
+}
+
 TestCase BufferAtomicVariants() {
   using O = ShaderOpcode;
 
@@ -46656,6 +46748,17 @@ if (argc == 1) {
     vulkan.CheckComparisonDepthTexture();
     vulkan.CheckRasterization(true);
     RunCase(nullptr, ImageSampleA16CompareBiasRdna2AddressOrder());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--single-wave64-cyclic-buffer-atomic-return-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, SingleWave64CyclicBufferAtomicReturn());
+    RunCase(&vulkan, SingleWave64CyclicBufferAtomicReturn(39u));
+    RunCase(&vulkan, SingleWave64CyclicBufferAtomicReturn(32u, true));
+    RunCase(&vulkan, SingleWave64CyclicBufferAtomicReturn(39u, false, true));
+    RunCase(&vulkan, SingleWave64CyclicBufferAtomicReturn(0u, false, false, true));
+    RunCase(&vulkan, SingleWave64CyclicBufferAtomicReturn(32u, true, false, true));
+    std::puts("KYTY_SINGLE_WAVE64_CYCLIC_BUFFER_ATOMIC_RETURN_GPU_PASS");
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--sampled-pair-domain-only") == 0) {

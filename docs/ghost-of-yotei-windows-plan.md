@@ -1,5 +1,43 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **4 октября 2026 года, 15:15 UTC** (native Windows via WSL;
+branch `yotei-windows-bringup`, parenta1ae8a8d, cyclic buffer-return fix):
+
+- Native a1 run143716 naturally exited321 at14:45:08UTC on
+  CS01025cd5c3102c4c: split wave64 rejects live BufferAtomicIAdd32 return
+  inside a loop. CS596 passed258images/752pairs,354059words and pipeline8784ms;
+  its427958103-byte cache checkpoint persisted. Shown197, readback through196
+  black/sawColored=false/window1440black. No DeviceLost; PID19912 exited.
+- Independent native planner RED `cyclic-buffer-atomic-final-red-20261004.log.stderr`
+  captures that exact live-return rejection before production change. The shared
+  planner now admits cyclic DWORD buffer returns only in one complete64-lane
+  direct host workgroup and requests existing post-instruction AcquireRelease/
+  UniformMemory rendezvous across native32 halves. Per-lane old values are kept;
+  all branch convergence, wide/shared/GDS and cross-wave guards remain.
+- Unchanged planner oracle and focused existing LDS/GDS, cooperative atomic and
+  cyclic image-publication neighbors pass `cyclic-buffer-atomic-final-{planner,focused-neighbors}-20261004.log`.
+  SavedCS0102 CPU IR (`cs0102-resource-ir-audit-20261004.log`) contains a
+  predicated BufferAtomicIAdd32, ReadFirstLane and per-lane prefix offsets.
+  This synthetic/header audit does not prove actual guest dispatch execution.
+- Six numerical native GPUAV cases pass `cyclic-buffer-atomic-final-gpuav-20261004.log`:
+  lower/upper ReadLane and ReadFirstLane, sparse/inactive predicates and upper-only
+  EXEC, per-lane counters and contended shared counter. Expected old values,
+  direct broadcasts, final counters and unique output slots are checked;
+  an independent3-iteration bound prevents accidental GPU hangs. Native exe SHA
+  `578c5186a19b122de66274e31a9ae59ffa7b72ab836e27197264028accc6881a`.
+  Same exe passes9 cooperative LDS/barrier/image-atomic GPU neighbors, integer
+  buffer atomic family and GLC0 no-return controls. No other-game runtime proof.
+- Expanded legacy convergence/feedback tests exposed existing stale expectations
+  (128-thread barrier and128-thread PollBallot/cooperative promotion). Scoped
+  reversal of ONLY the new core patch reproduces both:
+  `cyclic-buffer-atomic-{baseline-neighbors,feedback-baseline}-20261004.log.stderr`.
+  Their oracles remain unchanged and debt pending. Existing full CFG literal
+  assertion remains pending too; do not describe the full suite as GREEN.
+- Next: commit/push the completed correction, native emulator build/install and
+  original game retry; record actualCS0102 pipeline/new blocker and pixels.
+  Installed executable is stilla1ae8a8d. Independent d0c compiler breakpoint
+  remains. **Menu/gameplay PENDING.**
+
 Checkpoint **4 октября 2026 года, 14:34 UTC** (native Windows via WSL;
 branch `yotei-windows-bringup`, parent8a496a73, sampled operand-domain fix):
 
@@ -31,7 +69,20 @@ branch `yotei-windows-bringup`, parent8a496a73, sampled operand-domain fix):
   Shared small-root and compact dynamic-sampler GPUAV neighbors pass on the same
   executable. Native DescriptorBudget full suite passes exact257images/2samplers
   and actual image/sampler over-budget rejection (`sampled-pair-domain-budget-green-20261004.log`).
-- Native emulator build/install and original-game retry are next. Other-game
+- Native emulator build/install passed (`sampled-pair-domain-emulator-{build,install}-20261004.log`).
+  Pushed sourcea1ae8a8d3ad2f0a57c77ec7da4f6ca1c04edfee2, installed SHA256
+  `7f0476452f1469810f368efb99df86c121a02aa72b24bd23813fb4a524458709`.
+  Bounded retry FINISHED: `yotei-integrated-20261004-143716-presentfix-gpuav`,
+  PID19912, driver exec88442/log`sampled-pair-domain-yotei-driver-20261004.log`,
+  timeout1500/watchdog800/readback150+1500/continue after colored; selective
+  GPUAV includesCS596. Natural exit321 at14:45:08UTC; PID19912 exited.
+  Actual CS596 now passes:8 buffers/258 images/752 pairs, SPIR-V354059 words,
+  pipeline8784ms and immediate427958103-byte cache checkpoint. Other shaders
+  with752 pair edges also passed. New blocker:CS01025cd5c3102c4c rejects live
+  BufferAtomicIAdd32 return inside a wave64 loop. Shown197/readback through196black,
+  sawColored=false/offscreenwindow1440black. No DeviceLost recorded; no tasks
+  remain. Required bounded planner/GPU regression is recorded in test debt.
+  Other-game
   runtime, the full CFG baseline assertion and independent d0c NVIDIA compiler
   breakpoint remain unproved. **Menu/gameplay PENDING.**
 

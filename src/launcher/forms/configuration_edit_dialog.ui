@@ -359,16 +359,16 @@
        <layout class="QHBoxLayout" name="controllerVolumeLayout">
         <item>
          <widget class="QSlider" name="slider_controller_volume">
-          <property name="toolTip"><string>Scale the DualSense controller speaker over USB and Bluetooth</string></property>
+          <property name="toolTip"><string>Scale the DualSense speaker over USB and Bluetooth. 50% is the previous default; 100% adds 6 dB of gain.</string></property>
           <property name="maximum"><number>100</number></property>
-          <property name="value"><number>100</number></property>
+          <property name="value"><number>50</number></property>
           <property name="orientation"><enum>Qt::Horizontal</enum></property>
          </widget>
         </item>
         <item>
          <widget class="QLabel" name="label_controller_volume_value">
           <property name="minimumSize"><size><width>40</width><height>0</height></size></property>
-          <property name="text"><string>100%</string></property>
+          <property name="text"><string>50%</string></property>
          </widget>
         </item>
        </layout>

@@ -112,7 +112,7 @@ struct Controller {
 		Initialize();
 		Connect(1);
 		Check(GetSettingScale(Setting::SpeakerVolume) ==
-		              Config::GetControllerSpeakerVolume() / 100.0f &&
+		              Config::GetControllerSpeakerVolume() / 50.0f &&
 		          GetSettingScale(Setting::VibrationIntensity) ==
 		              Config::GetControllerVibrationIntensity() / 100.0f &&
 		          GetSettingScale(Setting::TriggerEffectIntensity) == 1.0f,
@@ -165,7 +165,7 @@ void TestSettingCycles() {
 
 void TestGlobalControllerLevels() {
 	Config::ConfigOptions options;
-	options.controller_speaker_volume      = 50;
+	options.controller_speaker_volume      = 25;
 	options.controller_vibration_intensity = 25;
 	Config::Load(options);
 	{
@@ -189,6 +189,23 @@ void TestGlobalControllerLevels() {
 		      "cycle hotkeys did not multiply the global controller levels");
 		Check(rumble.back().large == 17 * 257 && rumble.back().small == 8 * 257,
 		      "cycling vibration did not apply the combined intensity to cached rumble");
+	}
+	options.controller_speaker_volume = 50;
+	Config::Load(options);
+	{
+		Controller controller;
+		Check(GetSettingScale(Setting::SpeakerVolume) == 1.0f,
+		      "speaker midpoint did not preserve the previous default level");
+	}
+	options.controller_speaker_volume = 100;
+	Config::Load(options);
+	{
+		Controller controller;
+		Check(GetSettingScale(Setting::SpeakerVolume) == 2.0f,
+		      "speaker maximum did not add 6 dB of gain");
+		CycleSetting(Setting::SpeakerVolume);
+		Check(GetSettingScale(Setting::SpeakerVolume) == 0.0f,
+		      "speaker maximum prevented the hotkey from muting");
 	}
 	options.controller_speaker_volume      = 0;
 	options.controller_vibration_intensity = 0;

@@ -1140,6 +1140,9 @@ void TestAudioSpeakerRouting() {
 	speaker_scale = 0.5f;
 	audio.AudioOutOutputs(&output, 1, false);
 	ExpectPcm({0.25f, 0.25f, 0, 0, 0.25f, 0.25f, 0, 0});
+	speaker_scale = 2.0f;
+	audio.AudioOutOutputs(&output, 1, false);
+	ExpectPcm({1.0f, 1.0f, 0, 0, 1.0f, 1.0f, 0, 0});
 	speaker_scale = 0.0f;
 	audio.AudioOutOutputs(&output, 1, false);
 	ExpectPcm({});
@@ -1157,7 +1160,7 @@ void TestAudioFallbackGain() {
 		Fixture            f;
 		Libs::Audio::Audio audio;
 		active_controller = 2;
-		speaker_scale     = 0.5f;
+		speaker_scale     = 2.0f;
 		const std::array<int16_t, 4> integer_pcm {16384, 16384, 16384, 16384};
 		const auto  format = is_float ? Libs::Audio::Audio::Format::FloatStereo
 		                              : Libs::Audio::Audio::Format::Signed16bitStereo;
@@ -1168,7 +1171,7 @@ void TestAudioFallbackGain() {
 			audio.AudioOutSetVolume(port, 3, volume.data());
 			Libs::Audio::Audio::OutputParam output {port, data};
 			audio.AudioOutOutputs(&output, 1, false);
-			const float          expected = type == 4 ? 0.125f : 0.25f;
+			const float          expected = type == 4 ? 0.5f : 0.25f;
 			std::array<float, 4> actual {};
 			if (is_float) {
 				Check(SDL_GetAudioStreamData(default_stream, actual.data(), sizeof(actual)) ==
@@ -1223,14 +1226,14 @@ void TestBluetoothAudioSpeakerRouting() {
 	const auto port = audio.AudioOutOpen(4, 1024, 48000, Libs::Audio::Audio::Format::FloatStereo);
 	Check(port.IsValid() && default_stream != nullptr, "Bluetooth pad speaker port did not open");
 	std::vector<float> sound(2048, 0.25f);
-	speaker_scale = 0.5f;
+	speaker_scale = 2.0f;
 	Libs::Audio::Audio::OutputParam output {port, sound.data()};
 	Check(audio.AudioOutOutputs(&output, 1, false) == 1024 && hid_opens == 1 &&
 	          SDL_GetAudioStreamQueued(default_stream) == 0,
 	      "Bluetooth pad speaker also played on the host output");
 	fail_hid_write = true;
 	auto pending = Libs::Controller::DualSenseBluetooth::Prepare(now * 1000000);
-	Check(pending.size() == 1 && std::abs(pending[0].audio[200] - 0.125f) < 1e-4f,
+	Check(pending.size() == 1 && std::abs(pending[0].audio[200] - 0.5f) < 1e-4f,
 	      "Bluetooth speaker did not apply its setting gain");
 	Libs::Controller::DualSenseBluetooth::Send(pending);
 	Check(audio.AudioOutOutputs(&output, 1, false) == 1024 &&

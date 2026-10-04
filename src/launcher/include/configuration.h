@@ -48,7 +48,7 @@ QString EnumToText(T value) {
 
 struct ControllerSettings {
 	QString color;
-	int     speaker_volume      = 100;
+	int     speaker_volume      = 50;
 	int     vibration_intensity = 100;
 
 	void WriteSettings(QSettings* s) const {
@@ -60,13 +60,13 @@ struct ControllerSettings {
 	void ReadSettings(QSettings* s) {
 		const QColor saved_color(s->value("controller_color").toString());
 		color = saved_color.isValid() ? saved_color.name(QColor::HexRgb) : QString {};
-		const auto read_percent = [s](const char* key) {
+		const auto read_percent = [s](const char* key, int fallback) {
 			bool      ok    = false;
-			const int value = s->value(key, 100).toInt(&ok);
-			return ok ? qBound(0, value, 100) : 100;
+			const int value = s->value(key, fallback).toInt(&ok);
+			return ok ? qBound(0, value, 100) : fallback;
 		};
-		speaker_volume      = read_percent("controller_speaker_volume");
-		vibration_intensity = read_percent("controller_vibration_intensity");
+		speaker_volume      = read_percent("controller_speaker_volume", 50);
+		vibration_intensity = read_percent("controller_vibration_intensity", 100);
 	}
 };
 

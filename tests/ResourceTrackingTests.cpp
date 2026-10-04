@@ -3436,6 +3436,171 @@ void TestFormattedExecCountGuard(bool vcc = false) {
   }
 }
 
+enum class WaveTableWitness {
+  Direct, Outside, InvariantPhi, Or, Signed, DifferentSource,
+  ChangingPhi, EmptyEdge, Bypass, LaneCount, MissingActive
+};
+
+DispatcherSignedBufferLoopFixture MakeWaveTableWitnessFixture(
+    WaveTableWitness shape, bool vcc = false, bool invert = false) {
+  DispatcherSignedBufferLoopFixture result;
+  result.fixture = std::make_unique<Fixture>();
+  auto& f = *result.fixture;
+  auto* entry = f.block;
+  auto* header = f.AddBlock();
+  auto* guard = f.AddBlock();
+  auto* body = f.AddBlock();
+  auto* latch = f.AddBlock();
+  f.AddBlock(); // exit
+  const auto Branch = [&](uint32_t from, uint32_t to) {
+    f.program.blocks[from]->AddBranch(f.program.blocks[to]);
+    f.program.block_info[from].terminator = {
+        .kind = CFG::TerminatorKind::Branch, .true_block = to};
+  };
+  const auto Conditional = [&](uint32_t from, uint32_t yes, uint32_t no) {
+    f.program.blocks[from]->AddBranch(f.program.blocks[yes]);
+    f.program.blocks[from]->AddBranch(f.program.blocks[no]);
+    f.program.block_info[from].terminator = {
+        .kind = CFG::TerminatorKind::ConditionalBranch,
+        .true_block = yes, .false_block = no};
+  };
+  if (shape == WaveTableWitness::Bypass) {
+    Conditional(0, 1, 3);
+    f.program.block_info[0].condition = f.Emit(ValueOpcode::IEqual32,
+        {f.UserData(7), Value(0u)});
+  } else Branch(0, 1);
+  Conditional(1, 5, 2);
+  Conditional(2, 5, 3);
+  Branch(3, 4);
+  Branch(4, 1);
+  f.program.block_info[5].terminator.kind = CFG::TerminatorKind::Return;
+  const std::array<Value, 4> descriptor{f.UserData(0), f.UserData(1),
+                                       f.UserData(2), f.UserData(3)};
+  const auto lane = f.Emit(ValueOpcode::LaneId);
+  const auto source = f.Emit(ValueOpcode::IAdd32, {lane, f.UserData(6)});
+  const auto count = shape == WaveTableWitness::LaneCount ? lane : f.UserData(4);
+  const auto active = f.Emit(ValueOpcode::INotEqual32,
+      {f.Emit(ValueOpcode::BitwiseAnd32,
+          {f.Emit(ValueOpcode::ShiftRightLogical32,
+              {f.UserData(5), f.Emit(ValueOpcode::BitwiseAnd32, {lane, Value(31u)})}),
+           Value(1u)}), Value(0u)});
+  Value within;
+  if (shape == WaveTableWitness::Outside || shape == WaveTableWitness::InvariantPhi ||
+      shape == WaveTableWitness::ChangingPhi || shape == WaveTableWitness::MissingActive) {
+    const auto outside = f.Emit(ValueOpcode::ULessThanEqual32, {count, source});
+    const auto excluded = f.Emit(ValueOpcode::LogicalAnd, {active, outside});
+    const auto not_excluded = f.Emit(ValueOpcode::LogicalNot, {excluded});
+    within = shape == WaveTableWitness::MissingActive ? not_excluded :
+        f.Emit(ValueOpcode::LogicalAnd, {active, not_excluded});
+  } else {
+    within = f.Emit(shape == WaveTableWitness::Signed ? ValueOpcode::SLessThan32 :
+        ValueOpcode::ULessThan32, {source, count});
+    within = f.Emit(ValueOpcode::LogicalAnd, {active, within});
+  }
+  auto& iteration = header->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+  iteration.AddPhiOperand(entry, Value(0u));
+  iteration.AddPhiOperand(latch, f.Emit(ValueOpcode::IAdd32, {Value(&iteration), Value(1u)}, 0, latch));
+  f.program.block_info[1].condition = f.Emit(ValueOpcode::UGreaterThanEqual32,
+      {Value(&iteration), Value(2u)}, 0, header);
+  if (shape == WaveTableWitness::InvariantPhi || shape == WaveTableWitness::ChangingPhi) {
+    auto& predicate = header->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U1));
+    predicate.AddPhiOperand(entry, within);
+    predicate.AddPhiOperand(latch, shape == WaveTableWitness::ChangingPhi ? Value(true) : Value(&predicate));
+    within = Value(&predicate);
+  }
+  result.index = f.Emit(ValueOpcode::ReadLane, {source, Value(0u)}, 0,
+      shape == WaveTableWitness::Bypass ? entry : guard);
+  const auto matching_source = shape == WaveTableWitness::DifferentSource ?
+      f.Emit(ValueOpcode::IAdd32, {source, Value(1u)}, 0, guard) : source;
+  const auto equal = f.Emit(ValueOpcode::IEqual32,
+      invert ? std::initializer_list<Value>{matching_source, result.index} :
+               std::initializer_list<Value>{result.index, matching_source}, 0, guard);
+  const auto bucket = f.Emit(shape == WaveTableWitness::Or ? ValueOpcode::LogicalOr :
+      ValueOpcode::LogicalAnd, {within, equal}, 0, guard);
+  const auto reference = f.Emit(ValueOpcode::ConditionRef,
+      {invert ? bucket : f.Emit(ValueOpcode::LogicalNot, {bucket}, 0, guard)},
+      vcc ? (invert ? CFG::BranchCondition::VccNonZero : CFG::BranchCondition::VccZero) :
+            (invert ? CFG::BranchCondition::ExecNonZero : CFG::BranchCondition::ExecZero), guard);
+  f.program.block_info[2].condition = invert ?
+      f.Emit(ValueOpcode::LogicalNot, {reference}, 0, guard) : reference;
+  if (shape == WaveTableWitness::EmptyEdge) {
+    auto& term = f.program.block_info[2].terminator;
+    std::swap(term.true_block, term.false_block);
+  }
+  f.block = body;
+  const auto table = f.Buffer(descriptor, 0x100u);
+  const auto row = f.Emit(ValueOpcode::IMul32, {result.index, Value(80u)});
+  for (uint32_t word = 0; word < 4; ++word) {
+    MemoryInfo memory;
+    memory.kind = ResourceKind::ScalarBuffer;
+    memory.offset = 20u + word * 4u;
+    memory.component_count = 4;
+    memory.component_index = word;
+    result.descriptor_words[word] = f.Emit(ValueOpcode::ReadConstBuffer,
+        {table, row}, f.AddMemory(memory, 0x100u + word * 4u));
+  }
+  MemoryInfo load;
+  load.kind = ResourceKind::Buffer;
+  load.idxen = true;
+  load.formatted = true;
+  f.Emit(ValueOpcode::ReferenceU32, {f.Emit(ValueOpcode::LoadBufferU32,
+      {f.Buffer(result.descriptor_words, 0x120u), Value(0u), Value(0u), Value(0u), bucket},
+      f.AddMemory(load, 0x124u))});
+  return result;
+}
+
+void TestWaveSelectedTableWitness() {
+  for (const auto shape : {WaveTableWitness::Direct, WaveTableWitness::Outside,
+                           WaveTableWitness::InvariantPhi}) {
+    for (const auto vcc : {false, true}) {
+      auto accepted = MakeWaveTableWitnessFixture(shape, vcc, vcc);
+      auto& f = *accepted.fixture;
+      f.program.wave_size = vcc ? 64u : 32u;
+      const auto proof = ProveBoundedSrtRead(f.program, *accepted.descriptor_words[0].ResolveInstruction());
+      Check(proof && proof->index == accepted.index && !proof->count_signed &&
+                proof->count.ResolveInstruction()->GetOpcode() == ValueOpcode::GetUserData &&
+                proof->count.ResolveInstruction()->Arg(0).Resolve() == Value(static_cast<ScalarReg>(4)),
+            "nonempty equality bucket did not bound its wave-selected scalar table row");
+      f.PlanAndTrack();
+      Check(f.program.bounded_srt_reads.size() == 4u && f.program.info.buffers.size() == 1u,
+            "wave-selected descriptor row did not retain a bounded formatted table");
+      for (const auto word : accepted.descriptor_words) {
+        const auto* read = word.ResolveInstruction();
+        Check(read->GetOpcode() == ValueOpcode::ReadBoundedSrtU32 && read->Arg(0).Resolve() == accepted.index,
+              "wave-selected table index was replaced by a host value");
+      }
+      LinearTestMemory table;
+      table.words.resize((2u * 80u + 36u) / 4u);
+      for (uint32_t row = 0; row < 2; ++row) {
+        const std::array<uint32_t, 4> descriptor{0x30000u + row * 0x100u, 4u << 16u, 2u, 0u};
+        for (uint32_t word = 0; word < 4; ++word) table.words[(row * 80u + 20u) / 4u + word] = descriptor[word];
+      }
+      std::array<uint32_t, 8> user_data{static_cast<uint32_t>(table.base), 0u,
+          static_cast<uint32_t>(table.words.size() * 4u), 0u, 2u, 0xffffu, 0u, 0u};
+      const SrtRuntime runtime{.user_data = user_data, .read_memory = ReadLinearTestMemory,
+          .userdata = &table, .read_specialization_memory = ReadLinearTestMemory};
+      ResourceSnapshot snapshot;
+      ResourceSpecialization specialization;
+      Check(MaterializeResources(ExtractResourcePlan(f.program), runtime, snapshot, specialization) &&
+                specialization.buffer_tables.size() == 1u && specialization.buffer_tables[0].count == 2u &&
+                snapshot.buffers.size() == 2u && snapshot.buffers[0].dwords[0] == 0x30000u &&
+                snapshot.buffers[1].dwords[0] == 0x30100u,
+            "wave-selected formatted table lost its distinct descriptor rows");
+    }
+  }
+  for (const auto shape : {WaveTableWitness::Or, WaveTableWitness::Signed,
+      WaveTableWitness::DifferentSource, WaveTableWitness::ChangingPhi,
+      WaveTableWitness::EmptyEdge, WaveTableWitness::Bypass,
+      WaveTableWitness::LaneCount, WaveTableWitness::MissingActive}) {
+    auto rejected = MakeWaveTableWitnessFixture(shape);
+    Check(!ProveBoundedSrtRead(rejected.fixture->program,
+                             *rejected.descriptor_words[0].ResolveInstruction()),
+          "unsafe lane witness bounded a scalar descriptor row");
+    CheckFatal([&] { rejected.fixture->PlanAndTrack(); }, "not a valid runtime value",
+               "unsafe lane witness formed a formatted descriptor table");
+  }
+}
+
 void TestPhiValidation() {
   Fixture fixture;
   auto *left = fixture.block;
@@ -7989,6 +8154,11 @@ int main(int argc, char** argv) {
       std::cout << "KYTY_FORMATTED_SCALAR_TABLE_PASS\n";
       return 0;
     }
+    if (argc == 2 && std::strcmp(argv[1], "--wave-selected-table-witness-only") == 0) {
+      TestWaveSelectedTableWitness();
+      std::cout << "KYTY_WAVE_SELECTED_TABLE_WITNESS_PASS\n";
+      return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--formatted-vcc-count-guard-only") == 0) {
       TestFormattedExecCountGuard(true);
       std::cout << "KYTY_FORMATTED_VCC_COUNT_GUARD_PASS\n";
@@ -8180,6 +8350,7 @@ int main(int argc, char** argv) {
     Run("unselected bounded buffer writer", TestUnselectedBoundedBufferWriter);
     Run("TestBoundedMaterializationNullsForeignBufferSlots",
         TestBoundedMaterializationNullsForeignBufferSlots);
+    Run("wave-selected table witness", TestWaveSelectedTableWitness);
     Run("formatted EXEC count guard", [] { TestFormattedExecCountGuard(); });
     Run("formatted VCC count guard", [] { TestFormattedExecCountGuard(true); });
     Run("phi validation", TestPhiValidation);

@@ -1,5 +1,47 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **4 октября 2026 года, 13:16 UTC** (native Windows via WSL;
+branch `yotei-windows-bringup`, source parent `8ad1ff36` plus the wave-row fix):
+
+- Native `8ad1ff36` retry `yotei-integrated-20261004-124226-presentfix-gpuav`
+  completed at 12:52:25 UTC, exit321. Installed exe SHA-256
+  `78e857bc52e9c01add76e2a3e1b0e9507d1fb24371774098940bd2bd9b34ffc2`.
+  It passed former CS4d6 PC0x284 and stopped on the next descriptor at PC0x41c.
+  First nonzero RGB is frame198; shown207. Offscreen `window-1252.png`
+  shows a loading spinner. Process40756 has exited. No DeviceLost is recorded.
+- Shared SRT proof now bounds a ReadLane SGPR row by an unavoidable nonempty
+  EXEC/VCC bucket containing both `local_key==scalar_key` and unsigned
+  `local_key<count`. It propagates positive AND/NOT facts, including an
+  invariant predicate Phi and `active && !(active && count<=local_key)`.
+  The selected key stays live on GPU; host evaluation snapshots the same
+  bounded table and retains descriptor extents/coherence/materialization limits.
+  The proof relies on the guest instruction's SGPR result, independently of
+  whether its source lane is active; see AMD's
+  [ISA reference](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/sea-islands-instruction-set-architecture_0.pdf).
+- Synthetic native RED is `wave-table-witness-red-20261004.log.stderr`
+  on the unmodified production implementation. The unchanged positive
+  oracle and full ResourceTracking pass after the correction:
+  `wave-table-witness-{green,final-resource-suite}-20261004.log`.
+  OR, signed bounds, different equality sources, changing predicate Phi,
+  empty-edge reads, bypasses, lane-varying count and missing active conjunct
+  remain rejected. The bypass control has a dominating key definition.
+- Eleven native GPUAV cases pass in
+  `wave-table-witness-final-gpuav-20261004.log`: distinct float rows,
+  descriptor OOB zero, N0/N1/N2, empty/sparse EXEC, actual wave64 even/odd
+  halves, inactive leader lanes, and full VCC copies in wave32/wave64.
+  Nine neighboring induction/EXEC/VCC GPUAV cases pass in
+  `wave-table-witness-neighbor-gpuav-20261004.log`. Temporary IR diagnostics
+  are removed. Numeric ballot-to-mask reconstruction, including a wave32
+  VALU write to only VCC-low, remains unsupported by this dynamic proof;
+  initial GPU fixture attempts exposed this limit before dispatch.
+- Saved CS4d6 CPU audit now passes all resource tracking, for both barrier
+  profiles, with 43 buffers (`wave-table-witness-cs4d-audit-20261004.log`).
+  Its runtime inputs are still synthetic; materialization and GPU execution
+  of that actual game shader are pending. Existing full CFG literal-word
+  assertion debt and the independent d0c NVIDIA compiler breakpoint remain.
+  Next: build/install the committed correction and retry the native game.
+  **Menu and gameplay PENDING.**
+
 Checkpoint **4 октября 2026 года, 12:36 UTC** (native Windows via WSL;
 branch `yotei-windows-bringup`, source parent `3f80eaf1` plus the scalar-table fix):
 

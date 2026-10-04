@@ -1,5 +1,52 @@
 # Emulator regression test debt
 
+## Wave-selected scalar table row under an equality bucket (2026-10-04; synthetic proof complete, game retry pending)
+
+Native source `8ad1ff36`, installed exe SHA-256
+`78e857bc52e9c01add76e2a3e1b0e9507d1fb24371774098940bd2bd9b34ffc2`,
+run `yotei-integrated-20261004-124226-presentfix-gpuav` passes the old
+CS4d6 PC0x284 frontier and exits321 at PC0x41c. All four descriptor words
+are scalar buffer reads with a ReadLane-selected row; their direct roots
+are user data. Nonzero RGB starts at frame198, shown207; offscreen
+`window-1252.png` shows only a loading spinner. No menu is proved.
+
+Required synthetic RED: a wave-uniform ReadLane key equals a per-lane
+source in an unavoidable nonempty EXEC/VCC bucket, and that same lane's
+source is unsigned below a host-evaluable count. The key must stay live on
+GPU while two different formatted descriptor rows materialize. Include an
+invariant predicate Phi and the active-and-not-outside boolean recipe.
+Reject OR, signed bounds, unrelated equality sources, changing predicates,
+empty-edge reads, bypasses and per-lane counts. Then native GPUAV readback
+must cover sparse masks and both halves of actual wave64 without weakening
+descriptor limits. The existence of a matching lane, rather than a guess
+about which lane ReadLane selected, establishes the unsigned key bound.
+
+Native RED on the unfixed production source is
+`wave-table-witness-red-20261004.log.stderr` (test exe SHA-256
+`57376576b2910f2f1e5736d07b1eea7c5ee8b646abb54dffd9e918badc26a3cf`).
+The unchanged positive oracle passes after the shared correction; all six
+predicate/polarity variants and eight rejection controls pass. Full
+ResourceTracking is GREEN in `wave-table-witness-final-resource-suite-20261004.log`
+(exe SHA-256 `c80d8b5043c282fb49ddd2472ca233a87da96025b6ef3fca52e56cbd0ac003ce`).
+Eleven native GPUAV readbacks pass (`wave-table-witness-final-gpuav-20261004.log`,
+exe SHA-256 `1c582d5f84ebe449f2cacca1af6503c85f474ba70117fab5c6f70193a3c6f825`),
+including sparse wave64 even/odd masks, inactive leader lanes, N0/N1/N2,
+distinct float descriptors, OOB zero and full VCC copies in wave32/wave64.
+Nine neighboring induction GPUAV cases pass on the same executable.
+Saved CS4d6 now passes the CPU resource audit with both barrier profiles;
+actual game materialization and execution remain pending.
+
+**Separate unproved representation:** initial GPU fixture attempts numerically
+reconstructed a Boolean mask from ballot words, including the wave32 VALU
+VCC-low write. Tracking rejects that shape before dispatch; the new proof
+does not infer local facts through it. Diagnostics are
+`wave-table-witness-{ir-diagnostic,vcc-ir-diagnostic}-20261004.log.stderr`.
+The final guest fixtures use direct CMPX predicates and full VCC copies,
+with the same numeric oracle. Before extending ballot support, add an
+independent RED for the exact current-lane bit extraction, both ballot
+halves and lane indices; reject other-lane bits, mismatched ballots and
+shift-wrapping recipes. Temporary diagnostic source changes are removed.
+
 ## Ordinary compute compiler breakpoint after heavy pipelines (2026-10-04; pending)
 
 Run `yotei-integrated-20261004-110636-presentfix-gpuav` completed the fourth

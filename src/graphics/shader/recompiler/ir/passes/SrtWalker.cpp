@@ -741,6 +741,48 @@ public:
 			    .memory_offset = memory.offset,
 			    .workgroup_axis = workgroup ? offset.index->Arg(1).Resolve().U32() : UINT32_MAX};
 		}
+		const auto index = Value(const_cast<Inst*>(offset.index));
+		const auto make_proof = [&](Value count, bool count_signed = false) {
+			return BoundedSrtReadProof {
+			    .index = index,
+			    .count = count,
+			    .address_low = address->Arg(0).Resolve(),
+			    .address_high = address->Arg(1).Resolve(),
+			    .descriptor_word2 = source_dwords == 4u ? address->Arg(2).Resolve() : Value {},
+			    .descriptor_word3 = source_dwords == 4u ? address->Arg(3).Resolve() : Value {},
+			    .source_dwords = source_dwords,
+			    .offset_scale = offset.scale,
+			    .offset_bias = offset.bias,
+			    .memory_offset = memory.offset,
+			    .count_signed = count_signed};
+		};
+		// V_READLANE produces one SGPR value for the wave. A nonempty equality
+		// bucket can establish a dynamic row bound without interpreting the
+		// lane selection or the per-lane source value on the host.
+		if (buffer_read && offset.index->GetOpcode() == ValueOpcode::ReadLane &&
+		    offset.index->NumArgs() == 2u) {
+			const auto lane_maximum = FiniteMaximum(offset.index->Arg(1));
+			if (!lane_maximum || *lane_maximum >= m_program.wave_size) return {};
+			for (const auto& candidate : m_program.block_info) {
+				if (candidate.terminator.kind != CFG::TerminatorKind::ConditionalBranch) continue;
+				Value predicate;
+				bool nonempty_true = false;
+				if (!NonemptyMaskPredicate(candidate.condition, predicate, nonempty_true)) continue;
+				const auto count = MaskWitnessBound(predicate, index);
+				if (count.IsEmpty()) continue;
+				const auto* guard = m_by_id.at(candidate.id);
+				if (!Dominates(offset.index->Parent(), guard) || !Dominates(guard, read.Parent()) ||
+				    !RuntimeReadsDominate(count, guard, candidate.condition.Resolve().TryInstruction())) continue;
+				const auto* success = m_by_id.at(nonempty_true ? candidate.terminator.true_block
+				                                             : candidate.terminator.false_block);
+				if (Reachable(read.Parent(), nullptr, guard, success)) continue;
+				bool roots_safe = true;
+				for (uint32_t word = 0; word < source_dwords; ++word)
+					roots_safe &= RuntimeReadsDominate(address->Arg(word), read.Parent(), &read);
+				if (roots_safe) return make_proof(count);
+			}
+			return {};
+		}
 		const auto* phi = offset.index;
 		if (phi->GetOpcode() != ValueOpcode::Phi) return {};
 		const auto* header = phi->Parent();
@@ -773,21 +815,6 @@ public:
 			}
 		}
 		if (initial == nullptr || latch == nullptr || initial == latch) return {};
-		const auto index = Value(const_cast<Inst*>(phi));
-		const auto make_proof = [&](Value count, bool count_signed = false) {
-			return BoundedSrtReadProof {
-			    .index = index,
-			    .count = count,
-			    .address_low = address->Arg(0).Resolve(),
-			    .address_high = address->Arg(1).Resolve(),
-			    .descriptor_word2 = source_dwords == 4u ? address->Arg(2).Resolve() : Value {},
-			    .descriptor_word3 = source_dwords == 4u ? address->Arg(3).Resolve() : Value {},
-			    .source_dwords = source_dwords,
-			    .offset_scale = offset.scale,
-			    .offset_bias = offset.bias,
-			    .memory_offset = memory.offset,
-			    .count_signed = count_signed};
-		};
 		// A canonical post-test loop consumes index i and carries i+1 on its
 		// backedge while next < a positive constant. SSA can put the update and
 		// comparison before an empty latch. Update dominance (already established
@@ -935,8 +962,87 @@ private:
 		return true;
 	}
 
-	static bool MaskConjunctBound(Value condition, Value index, Value& count,
-	                              bool& nonempty_true) {
+	Value MaskWitnessBound(Value predicate, Value index) const {
+		// Any(P) supplies one lane on which every fact derived from P holds.
+		// If that lane's local key equals the ReadLane SGPR key and is below a
+		// uniform count, the selected scalar key is below the same count. This
+		// does not assume that ReadLane chose an active lane.
+		std::vector<std::pair<Value, bool>> facts;
+		bool inconsistent = false;
+		const auto normalize = [&](Value value) {
+			const auto invariant = ResolveInvariantPhi(m_program, value);
+			return (invariant.IsEmpty() ? value : invariant).Resolve();
+		};
+		const auto known = [&](Value value, bool positive) {
+			value = normalize(value);
+			return value.IsImmediate() && value.GetType() == Type::U1
+			           ? value.U1() == positive
+			           : std::ranges::find(facts, std::pair {value, positive}) != facts.end();
+		};
+		const auto add = [&](Value value, bool positive) {
+			value = normalize(value);
+			if (value.GetType() != Type::U1) return false;
+			if (known(value, !positive)) inconsistent = true;
+			if (known(value, positive)) return false;
+			facts.emplace_back(value, positive);
+			return true;
+		};
+		add(predicate, true);
+		bool changed = true;
+		while (changed && !inconsistent) {
+			changed = false;
+			for (size_t fact = 0; fact < facts.size(); ++fact) {
+				const auto [value, positive] = facts[fact];
+				const auto* inst = value.TryInstruction();
+				if (inst == nullptr) continue;
+				if (inst->GetOpcode() == ValueOpcode::LogicalNot && inst->NumArgs() == 1u) {
+					changed |= add(inst->Arg(0), !positive);
+				} else if (inst->GetOpcode() == ValueOpcode::LogicalAnd && inst->NumArgs() == 2u) {
+					if (positive) {
+						changed |= add(inst->Arg(0), true);
+						changed |= add(inst->Arg(1), true);
+					} else {
+						// !(A && B) alone gives no bound. With a positive A from
+						// this same witness it establishes !B (and vice versa).
+						if (known(inst->Arg(0), true)) changed |= add(inst->Arg(1), false);
+						if (known(inst->Arg(1), true)) changed |= add(inst->Arg(0), false);
+					}
+				}
+			}
+		}
+		if (inconsistent) return {};
+		const auto equals_index = [&](Value source) {
+			source = source.Resolve();
+			if (source == index) return true;
+			return std::ranges::any_of(facts, [&](const auto& fact) {
+				const auto* inst = fact.first.TryInstruction();
+				return fact.second && inst != nullptr && inst->GetOpcode() == ValueOpcode::IEqual32 &&
+				       inst->NumArgs() == 2u &&
+				       ((inst->Arg(0).Resolve() == index && inst->Arg(1).Resolve() == source) ||
+				        (inst->Arg(1).Resolve() == index && inst->Arg(0).Resolve() == source));
+			});
+		};
+		for (const auto& [value, positive] : facts) {
+			const auto* inst = value.TryInstruction();
+			if (inst == nullptr || inst->NumArgs() != 2u) continue;
+			Value source, count;
+			const auto op = inst->GetOpcode();
+			if ((positive && op == ValueOpcode::ULessThan32) ||
+			    (!positive && op == ValueOpcode::UGreaterThanEqual32)) {
+				source = inst->Arg(0).Resolve();
+				count = inst->Arg(1).Resolve();
+			} else if ((positive && op == ValueOpcode::UGreaterThan32) ||
+			           (!positive && op == ValueOpcode::ULessThanEqual32)) {
+				source = inst->Arg(1).Resolve();
+				count = inst->Arg(0).Resolve();
+			} else continue;
+			if (equals_index(source) && count.GetType() == Type::U32 &&
+			    ValidateRuntimeValue(m_program, count)) return count;
+		}
+		return {};
+	}
+
+	static bool NonemptyMaskPredicate(Value condition, Value& predicate, bool& nonempty_true) {
 		bool invert = false;
 		std::unordered_set<const Inst*> visited;
 		condition = condition.Resolve();
@@ -950,7 +1056,7 @@ private:
 		if (reference == nullptr || reference->GetOpcode() != ValueOpcode::ConditionRef ||
 		    reference->NumArgs() != 1u) return false;
 		const auto kind = reference->Flags<CFG::BranchCondition>();
-		auto predicate = reference->Arg(0).Resolve();
+		predicate = reference->Arg(0).Resolve();
 		if (kind == CFG::BranchCondition::ExecZero || kind == CFG::BranchCondition::VccZero) {
 			const auto* inactive = predicate.TryInstruction();
 			if (inactive == nullptr || inactive->GetOpcode() != ValueOpcode::LogicalNot ||
@@ -960,8 +1066,15 @@ private:
 		} else if (kind == CFG::BranchCondition::ExecNonZero || kind == CFG::BranchCondition::VccNonZero) {
 			nonempty_true = !invert;
 		} else return false;
+		return true;
+	}
+
+	static bool MaskConjunctBound(Value condition, Value index, Value& count,
+	                              bool& nonempty_true) {
+		Value predicate;
+		if (!NonemptyMaskPredicate(condition, predicate, nonempty_true)) return false;
 		std::vector<Value> work {predicate};
-		visited.clear();
+		std::unordered_set<const Inst*> visited;
 		while (!work.empty()) {
 			const auto value = work.back().Resolve();
 			work.pop_back();

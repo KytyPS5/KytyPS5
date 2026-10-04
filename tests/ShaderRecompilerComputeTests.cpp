@@ -31530,6 +31530,84 @@ TestCase FormattedBufferExecCountGuard(u32 count, u32 mask, u32 wave_size = 32, 
   return test;
 }
 
+// A per-lane key is read into an SGPR. The unavoidable nonempty bucket
+// implies both local_key==scalar_key and local_key<count; inactive leader
+// lanes need not belong to the bucket. Two scalar iterations bound the run.
+TestCase FormattedWaveSelectedTableWitness(u32 count, u32 mask, u32 wave_size = 32,
+                                         bool vcc_guard = false, bool leaders_inactive = false) {
+  using O = ShaderOpcode;
+  TestCase test = FormattedBufferExecCountGuard(count, mask, wave_size, vcc_guard);
+  test.name = leaders_inactive ? "FormattedWaveWitnessInactiveLeaders"
+      : vcc_guard ? (wave_size == 64 ? "FormattedWaveWitnessVccWave64" : "FormattedWaveWitnessVcc")
+      : wave_size == 64 ? (mask == 15 ? "FormattedWaveWitnessWave64Full" :
+                            mask == 10 ? "FormattedWaveWitnessWave64Odd" : "FormattedWaveWitnessWave64Even")
+      : count == 0 ? "FormattedWaveWitnessZeroRows"
+      : count == 1 ? "FormattedWaveWitnessOneRow"
+      : mask == 0 ? "FormattedWaveWitnessEmptyExec"
+      : mask == 5 ? "FormattedWaveWitnessSparse" : "FormattedWaveWitnessFull";
+  test.expected = test.initial;
+  test.user_data[13] = 0u; // Runtime key bias; the key itself stays GPU-selected.
+  test.required_spirv.clear();
+  auto& code = test.code;
+  code.clear();
+  code.push_back(EncodeVop2(0x1b, 1, InlineU32(1), 0)); // v1 = lane & 1.
+  code.push_back(EncodeVop2(0x25, 1, 13, 1));          // v1 += runtime key bias.
+  if (leaders_inactive) code.push_back(EncodeVop2(0x16, 2, InlineU32(1), 0)); // lane/2.
+  if (wave_size == 64 && mask == 15) code.push_back(EncodeSop1(0x04, 126, 193));
+  else {
+    code.push_back(EncodeSop1(0x04, 126, InlineU32(mask)));
+    if (wave_size == 64) code.push_back(EncodeSMovB32(127, InlineU32(mask)));
+  }
+  code.push_back(EncodeSop1(0x04, 60, 126)); // Original sparse EXEC.
+  code.push_back(EncodeSMovB32(22, InlineU32(0)));
+  const size_t header = code.size();
+  code.push_back(EncodeSop1(0x04, 126, 60));
+  code.push_back(EncodeSopc(0x0a, 22, InlineU32(2)));
+  const size_t exit_branch = code.size(); code.push_back(0);
+  code.push_back(EncodeVopc(0xd4, 12, 1)); // EXEC &= count > local_key.
+  AppendVop3(&code, 0x360, 20, Vgpr(1), 22);
+  code.push_back(EncodeVopc(0xd2, 20, 1)); // EXEC &= matching local key.
+  // A full VCC copy preserves predicate provenance in both guest wave sizes.
+  if (vcc_guard) code.push_back(EncodeSop1(0x04, 106, 126));
+  const size_t skip_empty = code.size(); code.push_back(0);
+  code.push_back(EncodeSop2(0x1e, 21, 20, InlineU32(4)));
+  code.push_back(EncodeSmem0(0x0a, 24, 4));
+  code.push_back(EncodeSmem1(0, 21));
+  code.push_back(EncodeSopp(0x0c, 0));
+  code.push_back(EncodeMubuf0(0x00, 0, true, false));
+  code.push_back(EncodeMubuf1(8, 6, leaders_inactive ? 2 : 0));
+  code.push_back(EncodeVop1(0x01, 4, 20));
+  code.push_back(EncodeVop2(0x1a, 4, InlineU32(wave_size == 64 ? 6 : 2), 4));
+  code.push_back(EncodeVop2(0x25, 4, Vgpr(0), 4));
+  code.push_back(EncodeMubuf0(0x1c, 0, true, false));
+  code.push_back(EncodeMubuf1(8, 0, 4));
+  const size_t latch = code.size();
+  code.push_back(EncodeSop2(0x00, 22, 22, InlineU32(1)));
+  code.push_back(EncodeSopp(0x02, static_cast<u32>(static_cast<int32_t>(header) -
+                                               static_cast<int32_t>(code.size() + 1))));
+  code[exit_branch] = EncodeSopp(0x04, code.size() - exit_branch - 1);
+  code[skip_empty] = EncodeSopp(vcc_guard ? 0x06 : 0x08, latch - skip_empty - 1);
+  AppendEnd(&code);
+  const u32 lanes = wave_size == 64 ? 64u : 4u;
+  const u32 output_base = wave_size == 64 ? 64u : 0u;
+  const std::array<u32, 4> payload{0x3fc00000u, 0x40200000u, 0x40e80000u, 0x41040000u};
+  for (u32 lane = 0; lane < lanes; ++lane) {
+    const u32 key = lane & 1u;
+    const u32 element = leaders_inactive ? lane / 2 : lane;
+    if (key < count && ((wave_size == 64 && mask == 15) || (mask & (1u << (lane & 31))) != 0))
+      test.expected[output_base / 4 + key * lanes + lane] = element < 2 ? payload[key * 2 + element] : 0;
+  }
+  test.opcodes = {O::V_AND_B32, O::V_ADD_NC_U32, O::V_CMPX_GT_U32, O::S_MOV_B32,
+      O::S_MOV_B64, O::S_CMP_LT_U32, O::S_CBRANCH_SCC0,
+      O::V_READLANE_B32, O::V_CMPX_EQ_U32, O::S_LSHL_B32, O::S_BUFFER_LOAD_DWORDX4,
+      O::S_WAITCNT, O::BUFFER_LOAD_FORMAT_X, O::V_MOV_B32, O::V_LSHLREV_B32,
+      O::BUFFER_STORE_DWORD, O::S_ADD_U32, O::S_BRANCH, O::S_ENDPGM,
+      vcc_guard ? O::S_CBRANCH_VCCZ : O::S_CBRANCH_EXECZ};
+  if (leaders_inactive) test.opcodes.push_back(O::V_LSHRREV_B32);
+  test.decoded_counts = {{"V_READLANE_B32", 1u}, {"BUFFER_LOAD_FORMAT_X ", 1u}};
+  return test;
+}
+
 // Dispatch-uniform descriptors from an immutable two-entry SRT. Only the
 // selected zero-stride mode-0 entry is OOB; sparse EXEC preserves inactive VGPRs.
 TestCase BoundedBufferZeroStrideCandidates(u32 variant) {
@@ -39893,6 +39971,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferZeroStrideOobFormatsAndWidths);
   for (u32 variant = 0; variant < 4; ++variant)
     cases.push_back(BoundedBufferZeroStrideCandidates(variant));
+  cases.push_back(FormattedWaveSelectedTableWitness(2, 15));
   cases.push_back(FormattedBufferExecCountGuard(2, 15));
   cases.push_back(FormattedBufferExecCountGuard(2, 5));
   cases.push_back(FormattedBufferExecCountGuard(0, 15));
@@ -46014,6 +46093,21 @@ if (argc == 1) {
   if (argc == 2 && std::strcmp(argv[1], "--zero-stride-store-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, BufferZeroStrideMode0StoreIsOutOfBounds());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--wave-selected-table-witness-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, FormattedWaveSelectedTableWitness(2, 15));
+    RunCase(&vulkan, FormattedWaveSelectedTableWitness(2, 5));
+    RunCase(&vulkan, FormattedWaveSelectedTableWitness(1, 15));
+    RunCase(&vulkan, FormattedWaveSelectedTableWitness(0, 15));
+    RunCase(&vulkan, FormattedWaveSelectedTableWitness(2, 0));
+    RunCase(&vulkan, FormattedWaveSelectedTableWitness(2, 15, 64));
+    RunCase(&vulkan, FormattedWaveSelectedTableWitness(2, 5, 64));
+    RunCase(&vulkan, FormattedWaveSelectedTableWitness(2, 10, 64));
+    RunCase(&vulkan, FormattedWaveSelectedTableWitness(2, 12, 64, false, true));
+    RunCase(&vulkan, FormattedWaveSelectedTableWitness(2, 5, 32, true));
+    RunCase(&vulkan, FormattedWaveSelectedTableWitness(2, 15, 64, true));
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--formatted-exec-count-guard-only") == 0) {

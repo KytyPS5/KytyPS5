@@ -530,6 +530,16 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 		case ValueOpcode::BitCastF32U32: return Arg(inst, 0, result);
 		case ValueOpcode::CompositeExtractU64:
 		case ValueOpcode::CompositeExtractU32x2: return EvaluateExtract(inst, result);
+		case ValueOpcode::CompositeExtractU32x4: {
+			// A dword of a four-dword descriptor vector built from scalar reads.
+			const auto  index  = inst.Arg(1).Resolve();
+			const auto* source = inst.Arg(0).ResolveInstruction();
+			if (!index.IsImmediate() || index.GetType() != Type::U32 || index.U32() >= 4u ||
+			    source == nullptr || source->GetOpcode() != ValueOpcode::CompositeConstructU32x4) {
+				return false;
+			}
+			return EvaluateWide(source->Arg(index.U32()), result);
+		}
 		case ValueOpcode::CompositeConstructU64:
 			if (!binary()) {
 				return false;

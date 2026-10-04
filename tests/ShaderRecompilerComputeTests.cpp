@@ -31966,6 +31966,65 @@ TestCase Vop1MoveRelDestination() {
   return test;
 }
 
+TestCase Vop1MoveRelDestinationLoopCounter() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  for (u32 dword = 0; dword < 4; dword++) {
+    code.push_back(EncodeVop1(0x01, 30 + dword, 48 + dword));
+  }
+  for (u32 reg = 2; reg <= 8; reg += 2) {
+    AppendVMovLiteral(&code, reg, 0xdead0000u + reg);
+  }
+  code.push_back(EncodeVop2(0x1b, 23, InlineU32(3), 0));  // v23 = lane & 3
+  code.push_back(EncodeVop2(0x25, 23, InlineU32(1), 23)); // v23 += 1, so 1..4
+  code.push_back(EncodeSMovB32(2, InlineU32(0)));
+  const auto header = static_cast<u32>(code.size());
+  code.push_back(EncodeVopc(0xc1, 2, 23)); // v_cmp_lt_u32 vcc, s2, v23
+  const auto exit_branch = static_cast<u32>(code.size());
+  code.push_back(0);                                          // s_cbranch_vccz exit
+  code.push_back(EncodeSop2(0x1e, 3, 2, InlineU32(1)));       // s_lshl_b32 s3, s2, 1
+  code.push_back(EncodeSMovB32(124, 3));                      // s_mov_b32 m0, s3
+  code.push_back(EncodeVop1(0x01, 40, 2));                    // v_mov_b32 v40, s2
+  code.push_back(EncodeVop1(0x42, 2, Vgpr(40)));              // v_movreld_b32 v2, v40
+  code.push_back(EncodeSop2(0x00, 2, 2, InlineU32(1)));       // s_add_u32 s2, s2, 1
+  code.push_back(EncodeSopp(
+      0x02, static_cast<u32>(static_cast<int32_t>(header) -
+                             static_cast<int32_t>(code.size() + 1u)) & 0xffffu));
+  code[exit_branch] = EncodeSopp(0x06, static_cast<u32>(code.size()) - exit_branch - 1u);
+  for (u32 dword = 0; dword < 4; dword++) {
+    code.push_back(EncodeVop1(0x02, 4 + dword, Vgpr(30 + dword))); // s[4:7] = readfirstlane
+  }
+  for (u32 k = 0; k < 4; k++) {
+    AppendVMovU32(&code, 31, k * 4u);
+    code.push_back(EncodeVop2(0x25, 31, Vgpr(0), 31));
+    code.push_back(EncodeVop2(0x1a, 31, InlineU32(2), 31));
+    code.push_back(EncodeMubuf0(0x1cu));
+    code.push_back(EncodeMubuf1(2 + 2 * k, 1, 31)); // buffer_store_dword v(2+2k), v31, s[4:7]
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "Vop1MoveRelDestinationLoopCounter";
+  test.code = code;
+  test.initial.assign(16, 0u);
+  for (u32 k = 0; k < 4; k++) {
+    for (u32 lane = 0; lane < 4; lane++) {
+      test.expected.push_back(k);
+    }
+  }
+  test.opcodes = {O::V_MOV_B32,     O::V_AND_B32,     O::V_ADD_NC_U32, O::S_MOV_B32,
+                  O::V_CMP_LT_U32,  O::S_CBRANCH_VCCZ, O::S_LSHL_B32,  O::V_MOVRELD_B32,
+                  O::S_ADD_U32,     O::S_BRANCH,      O::V_READFIRSTLANE_B32,
+                  O::V_LSHLREV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 4;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase CubeIdCapturedNegationAndOutputScale() {
   using O = ShaderOpcode;
 
@@ -48420,6 +48479,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(Vop3LdexpSourceModifier);
   AddCase(Vop1MoveRelSource);
   AddCase(Vop1MoveRelDestination);
+  AddCase(Vop1MoveRelDestinationLoopCounter);
   AddCase(VectorFloatSpecialOps);
   AddCase(CubeIdCapturedNegationAndOutputScale);
   AddCase(MadMixF16LiteralHalfSourceUsesOpsel);
@@ -55330,6 +55390,7 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, ScalarB32MaskDataflow(64));
     RunCase(&vulkan, ScratchIsPrivatePerInvocation());
     RunCase(&vulkan, Vop1MoveRelDestination());
+    RunCase(&vulkan, Vop1MoveRelDestinationLoopCounter());
     RunCase(&vulkan, BranchVccnzUsesWaveMask());
     RunCase(&vulkan, ScalarBranchRestoresInactiveLanes(32, 32));
     RunCase(&vulkan, ScalarBranchRestoresInactiveLanes(64, 64));

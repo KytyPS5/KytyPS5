@@ -9266,6 +9266,276 @@ void TestLaneMaskDescriptorDword() {
         "a lane index outside a readfirstlane reached a host descriptor");
 }
 
+// SH2's BVH sizes a written V# from a GPU-written count: the store stays an ordinary written buffer.
+void TestWrittenDescriptorSizedByGpuCount() {
+  Fixture fixture;
+  const auto count_buffer = fixture.Buffer(
+      {fixture.UserData(0), fixture.UserData(1), fixture.UserData(2), fixture.UserData(3)}, 4);
+  MemoryInfo count_memory;
+  count_memory.kind = ResourceKind::Buffer;
+  const auto count = fixture.Emit(ValueOpcode::LoadBufferU32,
+                                  {count_buffer, Value(0u), Value(0u), Value(0u), Value(true)},
+                                  fixture.AddMemory(count_memory, 4));
+  const auto records = fixture.Emit(
+      ValueOpcode::ShiftRightLogical32,
+      {fixture.Emit(ValueOpcode::IAdd32, {count, Value(127u)}), Value(7u)});
+  MemoryInfo store;
+  store.kind = ResourceKind::Buffer;
+  fixture.Emit(ValueOpcode::StoreBufferU32,
+               {fixture.Buffer({fixture.UserData(4), fixture.UserData(5), records,
+                                fixture.UserData(7)},
+                               8),
+                Value(0u), Value(0u), Value(0u), Value(1u), Value(true)},
+               fixture.AddMemory(store, 8));
+  fixture.PlanAndTrack();
+  Check(std::ranges::any_of(fixture.program.info.buffers,
+                            [](const BufferResource &buffer) { return buffer.written; }) ||
+            fixture.program.info.writes_dma,
+        "a V# sized by a GPU count lost its store");
+}
+
+// RE9's mesh 0e6382b2f7c0dfab: a decoded V# keeps its raw SRSRC operand as its resource.
+ResourcePlan DecodedBufferPlan(uint32_t raw_resource) {
+  Fixture fixture;
+  auto *decoded = fixture.AddBlock();
+  auto *tracked = fixture.AddBlock();
+  fixture.block->AddBranch(tracked);
+                               .true_block = decoded, .false_block = tracked};
+  const auto control = fixture.Buffer({Value(0x2000u), Value(0u), Value(200u), Value(0u)});
+  MemoryInfo scalar;
+  scalar.kind = ResourceKind::ScalarBuffer;
+  const auto flag = fixture.Emit(ValueOpcode::ReadConstBuffer, {control, Value(196u)},
+      fixture.Emit(ValueOpcode::SGreaterThanEqual32, {flag, Value(0u)});
+  const auto record = fixture.Emit(ValueOpcode::GetAddressResource,
+                                   {fixture.UserData(0), fixture.UserData(1)},
+                                   MemoryFlags{0, 0x20}, decoded);
+  MemoryInfo global;
+  global.kind = ResourceKind::Global;
+  const auto base = fixture.Emit(ValueOpcode::LoadAddressU32,
+                                 {record, Value(0u), Value(0u), Value(true)},
+                                 fixture.AddMemory(global, 0x20), decoded);
+  const auto handle = fixture.Emit(ValueOpcode::GetBufferResource,
+                                   {base, Value(0u), Value(64u), Value(0u)},
+                                   MemoryFlags{0, 0x28}, decoded);
+  MemoryInfo raw;
+  raw.kind = ResourceKind::Buffer;
+  raw.resource = raw_resource;
+  const auto raw_flags = fixture.AddMemory(raw, 0x28);
+  fixture.Emit(ValueOpcode::LoadBufferU32x4,
+               {handle, Value(0u), Value(0u), Value(0u), Value(true)}, raw_flags, decoded);
+  const auto direct = fixture.Emit(
+      ValueOpcode::GetBufferResource,
+      {fixture.UserData(4), fixture.UserData(5), fixture.UserData(6), fixture.UserData(7)},
+      MemoryFlags{0, 0x30}, tracked);
+  MemoryInfo buffer;
+  buffer.kind = ResourceKind::Buffer;
+  fixture.Emit(ValueOpcode::LoadBufferU32,
+               {direct, Value(0u), Value(0u), Value(0u), Value(true)},
+               fixture.AddMemory(buffer, 0x30), tracked);
+  fixture.PlanAndTrack();
+  const auto &memory = fixture.program.memory_info[raw_flags.index];
+  Check(memory.kind == ResourceKind::IndirectBuffer && memory.resource == raw_resource &&
+            fixture.program.info.buffers.size() == 2u,
+        "a raw DWORD x4 load over a GPU-read V# did not take the in-shader decode");
+  return ExtractResourcePlan(fixture.program);
+}
+
+void TestDecodedBufferControlFlow() {
+  const auto past = DecodedBufferPlan(5u);
+  Check(past.control_flow.size() == 3u && past.control_flow[1].sources.empty(),
+        "a decoded V# past the tracked buffers was not planned");
+  const auto inside = DecodedBufferPlan(1u);
+  Check(inside.control_flow.size() == 3u && inside.control_flow[1].sources.empty() &&
+            inside.control_flow[2].sources == std::vector<uint32_t>{inside.info.buffers[1].source},
+        "a decoded V# was planned as the tracked buffer its raw operand names");
+}
+
+// A stack address whose high DWORD ORs a private_base tag: the aperture lies in bits [63:48].
+void TestFlatApertureFromHighDword() {
+  for (const bool tagged : {true, false}) {
+    Fixture fixture;
+    fixture.program.scratch_dwords = 4;
+    const auto padded = fixture.Emit(ValueOpcode::BitwiseAnd32, {fixture.UserData(1), Value(0xffffu)});
+    const auto high = fixture.Emit(
+        ValueOpcode::BitwiseOr32,
+        {padded, Value(tagged ? (Decoder::PrivateApertureHigh & 0xffff0000u) : 0x00100000u)});
+    MemoryInfo flat;
+    flat.kind = ResourceKind::Flat;
+    flat.address_is_full = true;
+    const auto flags = fixture.AddMemory(flat, 0x40);
+    fixture.Emit(ValueOpcode::LoadAddressU32,
+                 {fixture.Address(fixture.UserData(0), high, 0x40), Value(0u), high, Value(true)},
+                 flags);
+    fixture.PlanAndTrack();
+    Check((fixture.program.memory_info[flags.index].kind == ResourceKind::FlatLocal) == tagged,
+          tagged ? "a FLAT address tagged private in its top half was not resolved locally"
+                 : "a FLAT address outside the apertures was resolved locally");
+  }
+}
+
+std::unique_ptr<Fixture> MakeRuntimeKeyHeapFixture(bool lds, bool extra_reader,
+                                                   ValueOpcode op = ValueOpcode::ImageSampleRaw,
+                                                   uint32_t sample_flags = 0u,
+                                                   Decoder::ImageDimension dimension =
+                                                       Decoder::ImageDimension::Dim2D) {
+  auto result = std::make_unique<Fixture>();
+  auto &fixture = *result;
+  std::array<Value, 4> key_words;
+  std::array<Value, 4> heap_words;
+  for (uint32_t dword = 0; dword < 4; dword++) {
+    key_words[dword] = fixture.UserData(dword);
+    heap_words[dword] = fixture.UserData(dword + 4u);
+  }
+  const auto lane = fixture.Emit(
+      ValueOpcode::GetBuiltin,
+      {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)});
+  Value per_lane;
+  if (!lds) {
+    MemoryInfo load;
+    load.kind = ResourceKind::Buffer;
+    per_lane = fixture.Emit(ValueOpcode::LoadBufferU32,
+                            {fixture.Buffer(key_words, 0x0200), lane, Value(0u), Value(0u), Value(true)},
+                            fixture.AddMemory(load, 0x0200));
+  } else {
+    MemoryInfo shared;
+    shared.kind = ResourceKind::Lds;
+    per_lane = fixture.Emit(ValueOpcode::LoadSharedU32, {lane, Value(true)},
+                            fixture.AddMemory(shared, 0x0200));
+  }
+  const auto key = fixture.Emit(ValueOpcode::ReadFirstLane, {per_lane, Value(true)});
+  const auto heap = fixture.Buffer(heap_words, 0x0220);
+  const auto heap_offset = fixture.Emit(ValueOpcode::IMul32, {key, Value(48u)});
+  std::array<Value, 8> image_words;
+  for (uint32_t dword = 0; dword < image_words.size(); dword++) {
+    MemoryInfo component;
+    component.kind = ResourceKind::ScalarBuffer;
+    component.offset = 16u + dword * sizeof(uint32_t);
+    image_words[dword] = fixture.Emit(ValueOpcode::ReadConstBuffer, {heap, heap_offset},
+                                      fixture.AddMemory(component, 0x0228));
+  }
+  if (extra_reader) fixture.Emit(ValueOpcode::ReferenceU32, {image_words[2]});
+  const auto image = fixture.Image(image_words, 0x0240);
+  const auto sampler = fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)}, 0x0240);
+  MemoryInfo sample;
+  sample.kind = ResourceKind::Image;
+  sample.image_dimension = dimension;
+  sample.image_sample_flags = sample_flags;
+  const auto sampled =
+      op == ValueOpcode::ImageGatherRaw
+          ? fixture.Emit(ValueOpcode::ImageGatherRaw,
+                         {image, sampler, fixture.ImageAddress(), Value(0u), Value(0u), Value(0u),
+                          Value(0u), Value(true)},
+                         fixture.AddMemory(sample, 0x0240))
+          : fixture.Emit(op, {image, sampler, fixture.ImageAddress(), Value(true)},
+                         fixture.AddMemory(sample, 0x0240));
+  fixture.Emit(ValueOpcode::ReferenceU32,
+               {fixture.Emit(ValueOpcode::CompositeExtractU32x4, {sampled, Value(0u)})});
+  return result;
+}
+
+const DescriptorSource::IndirectDescriptor *ImageTable(const Program &program) {
+  if (program.info.images.size() != 1u) return nullptr;
+  const auto &source = program.descriptor_sources[program.info.images[0].source];
+  return source.indirect_descriptor ? &*source.indirect_descriptor : nullptr;
+}
+
+// 48-byte heap records with the T# at +16, keyed per lane or from LDS, track as
+// one table.
+void TestRuntimeKeyHeapTable() {
+  for (const bool lds : {false, true}) {
+    for (const bool extra_reader : {false, true}) {
+      auto heap = MakeRuntimeKeyHeapFixture(lds, extra_reader);
+      heap->PlanAndTrack();
+      const auto *indirect = ImageTable(heap->program);
+      Check(indirect != nullptr && indirect->sources.empty(),
+            "the runtime-key heap was not tracked as one image table");
+    }
+  }
+}
+
+// A table indexed through an alignment mask on a byte offset is still a record step.
+void TestAlignedMaterialSelectorIsARecordStep() {
+  for (const uint32_t spelling : {0xfffffff1u, 0xfffffff3u, 0xff00ff00u}) {
+    Fixture fixture;
+    std::array<Value, 4> material_words;
+    std::array<Value, 4> heap_words;
+    for (uint32_t dword = 0; dword < 4; dword++) {
+      material_words[dword] = fixture.UserData(dword);
+      heap_words[dword] = fixture.UserData(dword + 4u);
+    }
+    const auto material = fixture.Buffer(material_words, 0x2000);
+    const auto heap = fixture.Buffer(heap_words, 0x2000);
+    const auto invocation = fixture.Emit(
+        ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::GlobalInvocationId)), Value(0u)});
+    const auto lane = fixture.Emit(ValueOpcode::ReadFirstLane, {invocation, Value(true)});
+    const auto rounded = fixture.Emit(ValueOpcode::BitwiseAnd32, {lane, Value(spelling)});
+    MemoryInfo material_scalar;
+    material_scalar.kind = ResourceKind::ScalarBuffer;
+    const auto key = fixture.Emit(ValueOpcode::ReadConstBuffer, {material, rounded},
+                                  fixture.AddMemory(material_scalar, 0x2000));
+    const auto record = fixture.Emit(ValueOpcode::IMul32, {key, Value(32u)});
+    std::array<Value, 8> descriptor_words;
+    for (uint32_t dword = 0; dword < 8; dword++) {
+      MemoryInfo heap_scalar;
+      heap_scalar.kind = ResourceKind::ScalarBuffer;
+      heap_scalar.offset = dword * 4u;
+      descriptor_words[dword] = fixture.Emit(ValueOpcode::ReadConstBuffer, {heap, record},
+                                             fixture.AddMemory(heap_scalar, 0x2000));
+    }
+    MemoryInfo sample;
+    sample.kind = ResourceKind::Image;
+    sample.image_dimension = Decoder::ImageDimension::Dim2D;
+    const auto sampled = fixture.Emit(
+        ValueOpcode::ImageSampleRaw,
+        {fixture.Image(descriptor_words, 0x2010),
+         fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)}, 0x2010),
+         fixture.ImageAddress(), Value(true)},
+        fixture.AddMemory(sample, 0x2010));
+    fixture.Emit(ValueOpcode::ReferenceU32,
+                 {fixture.Emit(ValueOpcode::CompositeExtractU32x4, {sampled, Value(0u)})});
+    fixture.PlanAndTrack();
+    const auto *indirect = ImageTable(fixture.program);
+    Check(fixture.program.resource_tracking_complete && indirect != nullptr &&
+              indirect->table_stride == 32u,
+          "an alignment-masked material offset was not tracked as one heap table");
+  }
+}
+
+// RE9's heaps step 48 bytes with the T# 16 bytes into the record.
+void TestStridedIndirectImageTable() {
+  auto fixture = MakeIndirectImageFixture(false, 48u, 16u);
+  fixture->PlanAndTrack();
+  EliminateDeadCode(fixture->program.blocks);
+  ValidateProgram(fixture->program, true);
+  const auto *indirect = ImageTable(fixture->program);
+  Check(indirect != nullptr && indirect->table_stride == 48u && indirect->table_immediate == 16u,
+        "strided indirect image table did not record its record step");
+}
+
+// A uniform chain the validator accepts throughout, so validation and evaluation both walk it.
+void TestDeepUniformValueChain() {
+  constexpr uint32_t kDepth = 50000;
+  Fixture fixture;
+  auto chain = fixture.UserData(0);
+  for (uint32_t i = 0; i < kDepth; ++i) {
+    chain = fixture.Emit(ValueOpcode::IAdd32, {chain, fixture.UserData(2)});
+  }
+  MemoryInfo global;
+  global.kind = ResourceKind::Global;
+  fixture.Emit(ValueOpcode::LoadAddressU32,
+               {fixture.Address(chain, fixture.UserData(1), 12), Value(0u), Value(0u), Value(true)},
+               fixture.AddMemory(global, 12));
+  fixture.PlanAndTrack();
+  Check(ValidateRuntimeValue(fixture.program, chain, RuntimeValueType::Integer),
+        "a deep uniform chain was not accepted as a runtime value");
+  const std::array<uint32_t, 3> user_data{0x1000u, 0u, 3u};
+  uint32_t value = 0;
+  Check(SrtWalker(fixture.program, {.user_data = user_data}).Evaluate(chain, value) &&
+            value == 0x1000u + kDepth * 3u,
+        "a deep uniform chain did not evaluate");
+}
+
 } // namespace
 
 int main() {
@@ -9353,6 +9623,12 @@ int main() {
     Run("ordered scalar read over a written buffer", TestOrderedScalarReadOverWrittenBuffer);
     Run("loop phi store descriptor is refused", TestLoopPhiStoreDescriptorIsRefused);
     Run("lane mask descriptor dword", TestLaneMaskDescriptorDword);
+    Run("written descriptor sized by GPU count", TestWrittenDescriptorSizedByGpuCount);
+    Run("decoded buffer control flow", TestDecodedBufferControlFlow);
+    Run("flat aperture from the high dword", TestFlatApertureFromHighDword);
+    Run("runtime key heap table", TestRuntimeKeyHeapTable);
+    Run("aligned material selector", TestAlignedMaterialSelectorIsARecordStep);
+    Run("strided indirect image table", TestStridedIndirectImageTable);
   } catch (const std::exception &exception) {
     std::cerr << "resource tracking test failed: " << exception.what() << '\n';
     return 1;

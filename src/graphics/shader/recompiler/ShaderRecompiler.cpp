@@ -11,6 +11,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
+#include "graphics/shader/recompiler/ir/passes/IndexRangeFold.h"
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
@@ -1461,6 +1462,12 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 		IR::RemoveIdentities(ir);
 		IR::EliminateDeadCode(ir.blocks);
 	};
+	IR::ConstantPropagationPass(ir.blocks, ir.wave_size);
+	if (IR::FoldUnreachableIndexCompares(ir) != 0) {
+		// Twice: the first pass reaches loop phis before their back edges are rewritten.
+		IR::ConstantPropagationPass(ir.blocks, ir.wave_size);
+		IR::ConstantPropagationPass(ir.blocks, ir.wave_size);
+	}
 	simplify();
 	const auto read_lane_stats = IR::EliminateReadLane(ir, ir.wave_size);
 	if (read_lane_stats.rewritten_reads != 0 || read_lane_stats.rewritten_reductions != 0) {

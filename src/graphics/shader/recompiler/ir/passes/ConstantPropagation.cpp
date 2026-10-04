@@ -482,6 +482,23 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			return;
 		case ValueOpcode::BitwiseAnd32:
 			if (!FoldU32(inst, [](uint32_t a, uint32_t b) { return a & b; })) {
+				// A mask that only covers bits below a left shift's amount selects nothing the
+				// shifted value has: (x << s) & m == 0 when m < (1 << s). Tessellation control
+				// shaders mask a packed id this way to read the patch ordinal out of the bits the
+				// emulated entry point leaves clear.
+				for (uint32_t side = 0; side < 2u; side++) {
+					const auto mask  = Arg(inst, side);
+					auto*      shift = Arg(inst, 1u - side).TryInstruction();
+					if (IsImmediate(mask, Type::U32) && shift != nullptr &&
+					    shift->GetOpcode() == ValueOpcode::ShiftLeftLogical32) {
+						const auto amount = Arg(*shift, 1);
+						if (IsImmediate(amount, Type::U32) && amount.U32() < 32u &&
+						    (mask.U32() & (UINT32_MAX << amount.U32())) == 0u) {
+							Replace(inst, Value(0u));
+							return;
+						}
+					}
+				}
 				ReplaceBinaryIdentity(inst, Type::U32, 0xffffffffu);
 			}
 			return;

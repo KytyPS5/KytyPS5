@@ -46,6 +46,7 @@ namespace Libs::Graphics {
 namespace {
 
 constexpr uint32_t DriverCacheCheckpointInterval = 16;
+constexpr uint64_t DriverCacheExpensiveCreationMs = 5000;
 
 bool IsLowerHex(std::string_view value, size_t expected_size) {
 	return value.size() == expected_size &&
@@ -1272,11 +1273,18 @@ bool PipelineCache::SaveDriverCacheLocked(bool checkpoint) {
 	return true;
 }
 
-void PipelineCache::CheckpointDriverCacheLocked() {
+bool DriverCacheCheckpointDue(uint32_t pending_pipelines, uint64_t creation_ms) {
+	// Keep ordinary creations batched, but preserve expensive compiler work
+	// before another pipeline can stall or a bounded run can end.
+	return pending_pipelines >= DriverCacheCheckpointInterval ||
+	       (pending_pipelines != 0 && creation_ms >= DriverCacheExpensiveCreationMs);
+}
+
+void PipelineCache::CheckpointDriverCacheLocked(uint64_t creation_ms) {
 	if (m_driver_cache == nullptr) {
 		return;
 	}
-	if (++m_new_driver_pipelines < DriverCacheCheckpointInterval) {
+	if (!DriverCacheCheckpointDue(++m_new_driver_pipelines, creation_ms)) {
 		return;
 	}
 	m_new_driver_pipelines = 0;
@@ -1559,8 +1567,11 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 
 	auto cached = std::make_unique<Pipeline>();
 	LogPipelineTrace("CreatePipelineInternal begin", vs_id, ps_id);
+	const auto creation_begin = std::chrono::steady_clock::now();
 	CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vertex_info,
 	                       ps_input_info, programs, static_params, m_driver_cache);
+	const auto creation_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+	    std::chrono::steady_clock::now() - creation_begin).count();
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
@@ -1568,7 +1579,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 
 	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
 	EXIT_IF(!inserted);
-	CheckpointDriverCacheLocked();
+	CheckpointDriverCacheLocked(static_cast<uint64_t>(creation_ms));
 
 	return *iter->second;
 }
@@ -1592,14 +1603,17 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	}
 
 	auto cached = std::make_unique<Pipeline>();
+	const auto creation_begin = std::chrono::steady_clock::now();
 	CreatePipelineInternal(m_graphics, *cached, input_info, compute_program.module, m_driver_cache);
+	const auto creation_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+	    std::chrono::steady_clock::now() - creation_begin).count();
 
 	EXIT_NOT_IMPLEMENTED(cached->pipeline == nullptr);
 	EXIT_NOT_IMPLEMENTED(cached->pipeline_layout == nullptr);
 
 	auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(cached));
 	EXIT_IF(!inserted);
-	CheckpointDriverCacheLocked();
+	CheckpointDriverCacheLocked(static_cast<uint64_t>(creation_ms));
 
 	return *iter->second;
 }

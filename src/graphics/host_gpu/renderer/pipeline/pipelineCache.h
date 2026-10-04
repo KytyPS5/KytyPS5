@@ -226,7 +226,7 @@ private:
 
 	void InitializeDriverCache();
 	bool SaveDriverCacheLocked(bool checkpoint);
-	void CheckpointDriverCacheLocked();
+	void CheckpointDriverCacheLocked(uint64_t creation_ms = 0);
 };
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);
@@ -241,6 +241,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
                             const ShaderComputeInputInfo& input_info,
                             vk::ShaderModule compute_module, vk::PipelineCache driver_cache);
+
+[[nodiscard]] bool DriverCacheCheckpointDue(uint32_t pending_pipelines, uint64_t creation_ms);
 
 bool IsDriverCacheBuildIdentityUsableForTest(std::string_view git_hash,
                                              std::string_view git_revision,

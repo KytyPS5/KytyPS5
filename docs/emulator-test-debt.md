@@ -1,5 +1,27 @@
 # Emulator regression test debt
 
+## Persist expensive driver pipeline compilation (2026-10-04; host policy proved)
+
+The warm run `yotei-integrated-20261004-104455-presentfix-gpuav` completed
+CS549 variants in 154 ms (cached), 284842 ms and 291983 ms, then began a
+fourth. The 16-pipeline checkpoint interval saved the second variant but did
+not checkpoint the third before the task-owned stop. Required synthetic
+regression: the actual checkpoint policy must preserve fast-pipeline batching
+and request a checkpoint immediately after an expensive successful creation,
+including when it is the first pending pipeline. Cover the interval and cost
+boundaries independently; retain cache identity checks and atomic file writes.
+`--pipeline-cache-checkpoint-only` got the intended native RED on the original
+16-creation policy, extracted without changing its behavior
+(`driver-cache-checkpoint-red-20261004.log.stderr`: completed expensive pipeline
+waits for 16 creations). The unchanged test is GREEN after measuring successful
+graphics/compute creation and checkpointing at 5000 ms; ordinary creations still
+batch every 16. Identity, validation-mode, instrumentation and revision selectors
+also passed (`_Build/logs/driver-cache-*-green-20261004.log`). Native test exe
+SHA-256 `0ee283548160a3b22d6f86989960ef2481afaffee10ff94bf20cd29fa0ef5af9`.
+The first build had a missing test forward declaration; that build failure is
+not RED evidence. Original workload integration and persistence read-back remain
+pending. This improves repeat-run persistence, not shader semantics or menu rendering.
+
 ## Cooperative pipeline scale after local SSA reuse (2026-10-04; pending)
 
 Next bounded synthetic regression: `shader_recompiler_compute_tests

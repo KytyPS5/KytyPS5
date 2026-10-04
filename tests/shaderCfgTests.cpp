@@ -71,6 +71,7 @@ std::vector<uint32_t> OptimizeShaderSpirvForTest(
 bool ShouldOptimizeShaderSpirvForTest(
     bool dispatcher_fallback, bool cooperative_wave64,
     Config::ShaderOptimizationType optimization);
+bool DriverCacheCheckpointDue(uint32_t pending_pipelines, uint64_t creation_ms);
 bool IsDriverCacheBuildIdentityUsableForTest(
     std::string_view git_hash, std::string_view git_revision,
     std::string_view worktree_fingerprint);
@@ -243,6 +244,18 @@ void TestShaderModuleDebugName() {
   Check(ShaderModuleDebugNameForTest(ShaderType::Pixel, 0x5678ull) ==
             "kyty_shader_ps_0000000000005678",
         "pixel shader debug name lost its stage");
+}
+
+void TestDriverPipelineCacheCheckpointPolicy() {
+  Check(!DriverCacheCheckpointDue(1u, 0u) &&
+            !DriverCacheCheckpointDue(15u, 4999u),
+        "fast pipeline compilation stopped batching cache checkpoints");
+  Check(DriverCacheCheckpointDue(16u, 0u) &&
+            DriverCacheCheckpointDue(17u, 0u),
+        "the ordinary pipeline checkpoint interval was lost");
+  Check(DriverCacheCheckpointDue(1u, 5000u) &&
+            DriverCacheCheckpointDue(2u, 300000u),
+        "a completed expensive pipeline waits for 16 creations before persistence");
 }
 
 void TestDriverPipelineCacheBuildIdentity() {
@@ -18801,6 +18814,11 @@ int main(int argc, char* argv[]) {
   if (argc == 2 && std::strcmp(argv[1], "--shader-debug-name-only") == 0) {
     Libs::Graphics::TestShaderModuleDebugName();
     std::puts("KYTY_SHADER_DEBUG_NAME_PASS");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--pipeline-cache-checkpoint-only") == 0) {
+    Libs::Graphics::TestDriverPipelineCacheCheckpointPolicy();
+    std::puts("KYTY_PIPELINE_CACHE_CHECKPOINT_PASS");
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--pipeline-cache-identity-only") == 0) {

@@ -1,5 +1,42 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **4 октября 2026 года, 19:30 UTC** (native Windows pipeline probes;
+committed/pushed source `9cc8261a`, installed executable SHA
+`503303e14a8293180af9579e17856f67d5cea69a0e36f7a442b6bcc6a2ebee19`):
+
+- A third bounded 1280x720 selective-GPUAV retry captured the exact later
+  CS8457 specialization in
+  `_Build/runs/yotei-integrated-20261004-191348-presentfix-gpuav/shaders/0024_new_shader_cs_8457901d80b91921.spv`
+  (581327 words, SHA-256
+  `bbaeeb1dc1f033bc849233e1dfbf78cb8a88a70f24be9b12da4502eba05c004d`).
+  The run reached shown201 and was stopped by its task-owned capture watcher
+  immediately after writing the shader. Vulkan 1.3 validation passes.
+  With its actual 1527-buffer descriptor layout, the separate native probe
+  reached `vkCreateComputePipelines` but timed out after 60 s
+  (`_Build/logs/cs8457-large-isolated-probe-20261004.log`). This establishes
+  a slow/nonreturning pipeline creation within that bound, not a driver crash.
+- Analysis of the two saved CS8457 variants found 12 resource switches in each.
+  The largest two grow from 106 to 1019 candidate arms; the larger module has
+  1018 repeated atomic-compare-exchange sequences and 1020 memory barriers.
+  Standard aggressive dead-code elimination leaves the original binary
+  unchanged. Diagnostic-only copies that truncate switch arms and eliminate
+  the now-dead blocks compile in 2.64 s for 16 candidates (453308 bytes),
+  25.36 s for 128 (818044 bytes), and exceed a 120 s bound for 512
+  (1711980 bytes). All three copies validate; they change guest behavior and
+  are **not** fixes. Logs are
+  `_Build/logs/cs8457-switch{16,128,512}-diagnostic-probe-20261004.log`.
+  The 512-candidate probe reached about 4.15 GB working set before its bounded
+  stop. No task-owned processes remain.
+- Current next step: make a generic synthetic RED for bounded buffer-table
+  read/subword-write lowering that detects repetition of the complete access
+  body across candidate resources. Preserve candidate-specific stride, byte
+  offset/limit, volatile/atomic semantics, invalid-choice behavior and device
+  feature checks in a shared lowering; validate real GPU data and compiler
+  time before another bounded game retry. The first nonzero loading pixels
+  remain proven; **menu and gameplay are pending**. The full default CFG suite
+  has a separately reproduced older `TestTypedSpirvSerialization` failure,
+  while focused new tests passed.
+
 Checkpoint **4 октября 2026 года, 19:04 UTC** (native Windows via WSL;
 tested source based on `f80f87b0` with the generic reciprocal lowering below,
 installed executable SHA

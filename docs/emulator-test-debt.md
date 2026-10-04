@@ -493,16 +493,46 @@ The two 1280x720 retries reached only shown377 and shown205 respectively,
 both stopped during long CS8457 pipeline creation before d0c was encountered;
 runtime d0c completion and a menu are **not** proved.
 
-Next independent RED: isolate the saved high-word-count CS8457 specialization
-and its real layout in a bounded pipeline-only probe. Record the time and
-memory trend, compare repeated creation with the same cache, and reduce any
-failing SPIR-V structure before changing a shared emitter mechanism. Do not
-substitute a game-hash bypass, a lower resource bound, or an unbounded full-game
-wait. The default `shader_cfg_tests.exe` run at
+## Large bounded buffer-table lowering and native compiler time (2026-10-04; pending)
+
+The exact 581327-word CS8457 SPIR-V saved at
+`_Build/runs/yotei-integrated-20261004-191348-presentfix-gpuav/shaders/0024_new_shader_cs_8457901d80b91921.spv`
+validates for Vulkan 1.3. Its native RTX 5060 Ti pipeline-only probe reached
+`vkCreateComputePipelines` but did not return within 60 s
+(`_Build/logs/cs8457-large-isolated-probe-20261004.log`). This is a bounded
+compiler-time reproduction, not a proven driver crash. The task-owned process
+was stopped. The earlier 120679-word variant of the same guest shader compiled
+in about 12 s with its layout. Its two largest resource switches had 106 arms;
+the new specialization has 1019 arms each, with 1018 atomic compare-exchange
+loops and 1020 memory barriers across the whole module. Aggressive dead-code
+elimination does not shrink the original module. Diagnostic-only arm truncation
+plus dead-branch elimination yields valid SPIR-V: 16-arm copies compile in
+2.64 s (453308 bytes), 128-arm copies in 25.36 s (818044 bytes), and a 512-arm
+copy (1711980 bytes) exceeds a 120 s probe bound. The 512-arm probe used about
+4.15 GB working set before its task-owned stop. These copies change selector
+semantics and are only a cost experiment, never game-path substitutions.
+
+Before changing production lowering, add a synthetic RED for a bounded buffer
+table with many live candidate resources and an observable byte read and
+subword atomic write. Assert that the emitted module does not replicate the
+full access/CAS body per candidate while retaining all candidate choices and
+exact bounds. Include neighboring cases with different packed strides, byte
+offsets/limits, a volatile read, a selection outside the table, and a table
+whose candidates are semantically incompatible with any shared access path.
+An optimization may share only operations whose metadata and semantics it
+proves compatible; otherwise keep the existing specialized path. Check any
+needed Vulkan dynamic-indexing feature before use and keep a valid fallback.
+Run unchanged RED/GREEN, `spirv-val`, numerical GPU read/write tests for first,
+middle and last candidates and an invalid selector, then probe the exact saved
+large shader and retry the bounded 1280x720 game. Do not use a game/hash/address
+exception or truncate real candidate tables.
+
+The default `shader_cfg_tests.exe` run at
 `_Build/logs/f32-seed-final-shader-cfg-20261004.log` fails at the older
 `TestTypedSpirvSerialization` literal-word assertion before reaching the new
-test; establish baseline attribution independently rather than treating it as
-a reciprocal regression.
+reciprocal test. The independent reversal documented in the existing CFG
+literal-word section below reproduces that failure; do not count the full
+suite as GREEN or attribute it to the reciprocal change.
 
 Committed/pushed source `f80f87b0` with installed binary SHA
 045ceb1b29e313ce236335a65008debdfc69c26902c02fbd651ada77f25dcbc6

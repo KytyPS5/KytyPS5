@@ -331,6 +331,27 @@ int RunShaderBatchAudit(int argc, char* argv[]) {
                       Json{{"buffers", std::move(buffers)},
                            {"bounded_srt_reads", std::move(bounded_reads)}}.dump().c_str());
           std::fflush(stdout);
+          Json images = Json::array();
+          for (uint32_t logical = 0; logical < plan.info.images.size(); ++logical) {
+            const auto& image = plan.info.images[logical];
+            Json item{{"logical", logical}, {"source", image.source},
+                      {"pc", image.first_use_pc}, {"class", static_cast<uint32_t>(image.resource_class)},
+                      {"dimension", static_cast<uint32_t>(image.dimension)}};
+            if (image.source < plan.descriptor_sources.size()) {
+              const auto& source = plan.descriptor_sources[image.source];
+              if (source.inline_descriptor) {
+                const auto& table = *source.inline_descriptor;
+                item["inline"] = {{"buffer_source", table.buffer_source},
+                                  {"stride", table.selector_stride},
+                                  {"offset", table.descriptor_offset},
+                                  {"limit", table.selector_limit},
+                                  {"dwords", table.descriptor_dwords}};
+              }
+            }
+            images.push_back(std::move(item));
+          }
+          std::printf("KYTY_SHADER_AUDIT_IMAGE_PLAN %s\n", images.dump().c_str());
+          std::fflush(stdout);
         }
         Json profile{{"needs_lds_barriers", info.needs_lds_barriers},
                      {"blocks", translated.program.blocks.size()},

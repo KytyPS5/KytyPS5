@@ -1,6 +1,63 @@
 # Emulator regression test debt
 
-## Wave-selected scalar table row under an equality bucket (2026-10-04; synthetic proof complete, game retry pending)
+## Inline sampled-image selector domain and aggregate admission (2026-10-04; pending)
+
+Source `79695c15`, native installed SHA256
+`af0e73da0b42541006d955ec101e74c0136f6b8e380bfa0f4ed054d44c4fc91b`,
+completed run `yotei-integrated-20261004-132158-presentfix-gpuav` exits321
+at CS `b629e5773956d33c`: dense image resource limit exceeded
+(size13640 stride440 probes1677 pairs245 accumulated images753).
+The preceding CS4d6 pipeline passed (329910 words, 26247ms); first nonzero
+RGB195/shown199 do not prove a menu. No DeviceLost is recorded.
+
+Required next proof: inspect the live selector's normalized IR and its
+unavoidable guards. If they establish a finite unsigned domain, reproduce
+that domain with independent synthetic inline sampled-image tables, including
+multiple roots and wrapped U32 keys. Reject missing/opposite/bypassed guards,
+per-lane counts and incompatible descriptor/sampler domains. Preserve wrapped
+interior aliases for unbounded selectors and existing aggregate limits.
+Read-only IR finds three full-width inline sampled roots with the same buffer
+and stride440, offsets0/32/224, and no finite selector guard. These domains
+overlap in their wrapped gcd8 offsets. Required admission RED is two synthetic
+roots with 260 distinct full-width images in different key orders: the union
+and separate null defaults fit512; duplicate per-root expansion exceeds512.
+Keep each root mapping/default and ordinary sampler uses, upper descriptor words,
+validation, source coherence, probe budgets and transactionality. Only identical
+descriptors with equal sampled-image semantics may share a dense slot; dynamic
+sampler origins and distinct type/format/swizzle metadata remain separate. Native CPU RED must precede
+a production fix, followed by unchanged GREEN and numerical native GPUAV
+selection/alias/extent neighbors. No blind MaxImages increase or deduplication
+across distinct typed roots. Existing sampled-pair admission debt below remains.
+
+Synthetic native RED on source79695c15 (test exe SHA256
+`1c5f40a96c81d83ca63445b4b6019502bdf98c6e15e5126eb7eb6d3282cd608e`):
+`shared-inline-images-red-20261004.log.stderr`, size114400/stride440,
+260 probes/261 candidates per root, aggregate522. The unchanged positive
+oracle passes after sharing exact non-null descriptors of compatible ordinary-
+sampler inline sampled roots. Each root retains its own ordinal-to-dense vector,
+null/default and wrapped key mapping. Typed metadata, dynamic sampler origins,
+all source reads, clean snapshots and all budgets are retained. Admission now
+charges genuinely allocated dense images; MaxImages and MaxSampledPairs stay512.
+
+`shared-inline-images-final-neighbors-20261004.log` and full ResourceTracking
+`shared-inline-images-final-resource-suite-20261004.log` pass (native exe SHA256
+`c6381bda9556a39a928d794aa3899af11e1a61bf89483ca7b9ebb62eabb979c3`).
+Controls cover changed upper words, incompatible root numeric proof, separate
+ordinary samplers and pair capacity, exact512/plus-one513 distinct admission,
+failed reads of already-duplicated descriptors and transactional snapshots.
+The existing unbounded full-width case now shares two full descriptors across
+both roots while retaining wrapped gcd8 aliases and partial final-dword bounds.
+An initial GPU fixture invocation failed a harness distinct-origin count check
+before dispatch: dense candidates are not distinct SRT sources. Its dense count
+check was corrected without changing expected pixels; this is not GPU RED/GREEN.
+Final native GPUAV selection passes two different key orders and independent
+clamp/repeat samplers (`shared-inline-images-final-gpuav-20261004.log`, native
+exe SHA256 `006291d1f063d213eac8007da293d177d2b8f74536a110db22838e859ca3846a`).
+Dynamic compact sampler, dependent image-table and actual wave64 read-loop
+numerical neighbors pass on the same executable; wide explicit topology SPIR-V
+passes. Final capacity-resource full suite also passes. Original retry pending.
+
+## Wave-selected scalar table row under an equality bucket (2026-10-04; synthetic proof complete, actual pipeline passed)
 
 Native source `8ad1ff36`, installed exe SHA-256
 `78e857bc52e9c01add76e2a3e1b0e9507d1fb24371774098940bd2bd9b34ffc2`,
@@ -34,7 +91,8 @@ including sparse wave64 even/odd masks, inactive leader lanes, N0/N1/N2,
 distinct float descriptors, OOB zero and full VCC copies in wave32/wave64.
 Nine neighboring induction GPUAV cases pass on the same executable.
 Saved CS4d6 now passes the CPU resource audit with both barrier profiles;
-actual game materialization and execution remain pending.
+actual game retry132158 now passes materialization and pipeline creation;
+completed GPU execution is not independently proved.
 
 **Separate unproved representation:** initial GPU fixture attempts numerically
 reconstructed a Boolean mask from ballot words, including the wave32 VALU

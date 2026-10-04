@@ -1,7 +1,43 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
-Checkpoint **4 октября 2026 года, 13:16 UTC** (native Windows via WSL;
-branch `yotei-windows-bringup`, source parent `8ad1ff36` plus the wave-row fix):
+Checkpoint **4 октября 2026 года, 13:57 UTC** (native Windows via WSL;
+branch `yotei-windows-bringup`, source parent79695c15 plus shared image admission fix):
+
+- The last completed game run132158 passed actual CS4d6 materialization and
+  pipeline creation, then stopped on CSb629 inline dense-image admission
+  (size13640 stride440 probes1677 pairs245 aggregate753). Nonzero RGB195 /
+  shown199; no menu/gameplay/DeviceLost. Installed exe is still79695c15.
+- Native synthetic RED `shared-inline-images-red-20261004.log.stderr`
+  reproduces aggregate522 for two independent key tables containing260 distinct
+  full-width images in different orders. Shared materialization now allocates
+  identical non-null read-only inline sampled descriptors once, only when all
+  image semantics agree and no dynamic sampler is attached. Each table retains
+  a separate ordinal-to-dense list, live wrapped keys and its own default.
+  MaxImages/MaxSampledPairs remain512; all descriptor/sampler/source validation,
+  coherence, probe budgets, upper words and partial-word bounds remain checked.
+- The unchanged positive oracle and controls pass; final full ResourceTracking
+  passes (`shared-inline-images-final-capacity-resource-suite-20261004.log`).
+  Exact512/plus-one513 unique images, separate samplers/pair limits, differing
+  upper words/numeric proof, failed duplicate-source reads and transactional
+  snapshots are covered. Existing unbounded full-width table covers gcd8 aliases.
+- Native GPUAV numerical readbacks pass for both root key orders and separate
+  ordinary clamp/repeat samplers (`shared-inline-images-final-gpuav-20261004.log`,
+  exe SHA256 `006291d1f063d213eac8007da293d177d2b8f74536a110db22838e859ca3846a`).
+  Dynamic compact samplers, dependent image tables and actual wave64 read-loop
+  neighbors pass on the same executable; wide explicit topology SPIR-V also
+  passes. An initial harness distinct-source count failure occurred before
+  dispatch; its dense-count check was corrected without changing expected pixels.
+- The bounded CPU audit now reports inline image width/offset/domain metadata.
+  CSb629 has three full-width roots, same material buffer/stride440, offsets
+  0/32/224 and no finite selector guard. Do not infer31 records from buffer size:
+  unrestricted U32 multiplication reaches wrapped interior offsets too.
+  Other-game runtime and existing full CFG literal assertion remain unproved.
+  Next: commit/push the completed fix, native emulator build/install, then
+  bounded original retry with CSb629 phase/GPUAV trace and drained output.
+  Independent d0c NVIDIA compiler breakpoint remains. **Menu/gameplay PENDING.**
+
+Checkpoint **4 октября 2026 года, 13:39 UTC** (native Windows via WSL;
+branch `yotei-windows-bringup`, pushed source fix `79695c15`):
 
 - Native `8ad1ff36` retry `yotei-integrated-20261004-124226-presentfix-gpuav`
   completed at 12:52:25 UTC, exit321. Installed exe SHA-256
@@ -36,10 +72,23 @@ branch `yotei-windows-bringup`, source parent `8ad1ff36` plus the wave-row fix):
   initial GPU fixture attempts exposed this limit before dispatch.
 - Saved CS4d6 CPU audit now passes all resource tracking, for both barrier
   profiles, with 43 buffers (`wave-table-witness-cs4d-audit-20261004.log`).
-  Its runtime inputs are still synthetic; materialization and GPU execution
-  of that actual game shader are pending. Existing full CFG literal-word
+  Its audit runtime inputs are synthetic; the subsequent game retry below
+  proves actual materialization and pipeline creation, not completed shader execution. Existing full CFG literal-word
   assertion debt and the independent d0c NVIDIA compiler breakpoint remain.
-  Next: build/install the committed correction and retry the native game.
+  Native emulator build/install succeeded (`wave-table-witness-emulator-{build,install}-20261004.log`);
+  installed exe SHA-256
+  `af0e73da0b42541006d955ec101e74c0136f6b8e380bfa0f4ed054d44c4fc91b`.
+- Native retry FINISHED at 13:29:22 UTC, exit321:
+  `_Build/runs/yotei-integrated-20261004-132158-presentfix-gpuav`.
+  Actual CS4d6 materialization, SPIR-V329910 words and pipeline creation
+  succeeded (26247ms); cache checkpoint persisted immediately. Further
+  shaders/pipelines succeeded. First nonzero RGB frame195, shown199.
+  New blocker: CS `b629e5773956d33c`, inline sampled pairs exceed dense
+  image resource limit (size13640 stride440 probes1677 pairs245 images753).
+  This is a resource specialization assertion, not DeviceLost. PID43224
+  exited; no native build/test/emulator tasks remain. Required independent
+  domain/admission regression is recorded in test debt. Next: inspect the
+  actual selector proof and reproduce the shared defect before fixing it.
   **Menu and gameplay PENDING.**
 
 Checkpoint **4 октября 2026 года, 12:36 UTC** (native Windows via WSL;

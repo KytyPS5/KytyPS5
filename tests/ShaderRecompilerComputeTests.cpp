@@ -1289,6 +1289,7 @@ struct TestCase {
   u32 expected_buffer_resources = 0;
   std::optional<std::vector<u32>> expected_buffer_binding_resources;
   u32 expected_image_resources = 0;
+  u32 expected_dense_images = 0;
   u32 expected_sampler_resources = 0;
   u32 expected_sampled_pairs = 0;
   bool expected_shader_data_storage = false;
@@ -1634,6 +1635,12 @@ CompiledShader CompileCase(const TestCase &test,
                         test.expected_image_resources, "images");
   CheckResourceOrigins(result.program.info.samplers,
                         test.expected_sampler_resources, "samplers");
+  if (test.expected_dense_images != 0) {
+    Require(test.name, "dense image topology",
+            result.program.info.images.size() == test.expected_dense_images,
+            "dense images: actual=" + std::to_string(result.program.info.images.size()) +
+                " expected=" + std::to_string(test.expected_dense_images));
+  }
   if (test.expected_sampled_pairs != 0) {
     Require(test.name, "sampled pair topology",
             result.program.info.sampled_pairs.size() == test.expected_sampled_pairs,
@@ -46568,6 +46575,32 @@ if (argc == 1) {
     vulkan.CheckComparisonDepthTexture();
     vulkan.CheckRasterization(true);
     RunCase(nullptr, ImageSampleA16CompareBiasRdna2AddressOrder());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--shared-inline-images-only") == 0) {
+    VulkanHarness vulkan;
+    auto shared = ImageSampleLzFullDynamicMaterialStaticSampler();
+    shared.expected_dense_images = 4u;
+    shared.expected_sampled_pairs = 4u;
+    RunCase(&vulkan, shared);
+    auto distinct = ImageSampleLzFullDynamicMaterialStaticSampler();
+    distinct.name = "SharedInlineImagesDistinctOrdinarySamplers";
+    distinct.expected_dense_images = 4u;
+    distinct.expected_sampled_pairs = 6u;
+    std::vector<u32> prefix;
+    for (u32 reg = 80u; reg < 84u; ++reg)
+      prefix.push_back(EncodeSMovB32(reg, InlineU32(0u)));
+    // Only the second image uses the repeat sampler. Its key order is unchanged.
+    for (size_t at = 0; at + 1u < distinct.code.size(); ++at) {
+      if (distinct.code[at] == EncodeMimg0(0x27, 0x1, 0, false, 1, false) &&
+          distinct.code[at + 1u] == EncodeMimg1(1, 24, 6, 19))
+        distinct.code[at + 1u] = EncodeMimg1(1, 24, 6, 20);
+    }
+    distinct.code.insert(distinct.code.begin(), prefix.begin(), prefix.end());
+    for (u32 index = 0; index < 4u; ++index)
+      distinct.expected[4u + index] = std::bit_cast<u32>(index % 2u == 0u ? 2.0f : 20.0f);
+    RunCase(&vulkan, distinct);
+    std::puts("KYTY_SHARED_INLINE_IMAGES_GPU_PASS");
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--indirect-image-only") == 0) {

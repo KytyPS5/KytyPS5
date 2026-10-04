@@ -5322,6 +5322,12 @@ uint32_t InlineCandidateForKey(const ResourceSnapshot &snapshot,
     }
     if (snapshot.flattened_srt[position] == key) {
       const auto candidate = snapshot.flattened_srt[position + 1u];
+      const auto& resources = specialization.images[root].indirect_resources;
+      if (!resources.empty()) {
+        Check(candidate < resources.size() && resources[candidate] < snapshot.images.size(),
+              "inline key selects an absent shared image candidate");
+        return resources[candidate];
+      }
       uint32_t ordinal = 0;
       for (uint32_t image = 0; image < specialization.images.size(); image++) {
         if (specialization.images[image].indirect_root == root) {
@@ -5823,6 +5829,162 @@ void TestInlineImageResourceLimits() {
         "65537 inline probes performed memory reads or mutated prior resources");
 }
 
+// Two independent live-key tables may contain the same typed image descriptors
+// in different orders. Admission must count dense images, preserving each root's
+// ordinal lookup and all eight descriptor words.
+void TestSharedInlineImageCandidates() {
+  constexpr uint32_t rows = 260u;
+  auto fixture = MakeInlineDescriptorFixture(true, false, true, true);
+  for (auto& inst : *fixture->program.blocks[1]) {
+    if (inst.GetOpcode() == ValueOpcode::ULessThan32) inst.SetArg(1u, Value(rows));
+  }
+  fixture->PlanAndTrack();
+  auto plan = ExtractResourcePlan(fixture->program);
+  LinearTestMemory memory;
+  memory.words.resize(rows * 440u / 4u);
+  std::vector<DescriptorValue> descriptors(rows);
+  for (uint32_t row = 0; row < rows; ++row) {
+    auto& image = descriptors[row];
+    image.dword_count = 8u;
+    image.dwords[0] = 0x100u + row;
+    image.dwords[1] = static_cast<uint32_t>(
+        Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float) << 20u;
+    image.dwords[2] = 3u | (3u << 14u);
+    image.dwords[3] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+        (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+    // An independently varying upper word prevents compact-half equality.
+    image.dwords[4] = row + 1u;
+  }
+  for (uint32_t row = 0; row < rows; ++row) {
+    for (uint32_t root = 0; root < 2u; ++root) {
+      const auto& descriptor = descriptors[(row + root) % rows];
+      std::copy_n(descriptor.dwords.begin(), 8u,
+                  memory.words.begin() + (row * 440u + root * 32u) / 4u);
+    }
+  }
+  std::array<uint32_t, 8> user_data{0x1000u, 440u << 16u, rows, 0u,
+                                   0x400000u, 0u, 16u, 0u};
+  SrtRuntime runtime{.user_data = user_data, .userdata = &memory,
+                     .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization),
+        "overlapping inline roots exhausted dense capacity despite 260 distinct images");
+  Check(snapshot.images.size() == rows + 2u &&
+            specialization.sampled_pairs.size() == rows + 2u,
+        "overlapping inline roots did not share their non-null dense images and pairs");
+  ApplyResourceSpecialization(fixture->program, specialization);
+  const auto lookup = [&](uint32_t root, uint32_t key) {
+    const auto& image = fixture->program.info.images[root];
+    const auto offset = image.indirect_mapping_offset;
+    const auto count = snapshot.flattened_srt.at(offset);
+    for (uint32_t entry = 0; entry < count; ++entry) {
+      const auto at = offset + 1u + 2u * entry;
+      if (snapshot.flattened_srt.at(at) == key)
+        return image.indirect_resources.at(snapshot.flattened_srt.at(at + 1u));
+    }
+    return image.indirect_resources.at(0u);
+  };
+  for (uint32_t row = 0; row < rows; ++row) {
+    for (uint32_t root = 0; root < 2u; ++root) {
+      const auto selected = lookup(root, row * 440u);
+      Check(snapshot.images.at(selected) == descriptors[(row + root) % rows],
+            "shared inline image lost its root's key order or upper descriptor words");
+      Check(selected == lookup(1u - root,
+                ((row + (root == 0u ? rows - 1u : 1u)) % rows) * 440u),
+            "identical inline descriptors still occupy different dense slots");
+    }
+  }
+  Check(lookup(0u, UINT32_MAX - 7u) == 0u &&
+            lookup(1u, UINT32_MAX - 7u) == 1u,
+        "shared inline candidates lost separate null defaults");
+  // Read every source even when another table already supplied its descriptor.
+  const auto prior_snapshot = snapshot;
+  const auto prior_specialization = specialization;
+  memory.fail_address = memory.base + 32u + 28u;
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization) &&
+            SameResourceSnapshot(snapshot, prior_snapshot) &&
+            specialization == prior_specialization,
+        "shared candidate skipped a failed source read or partially committed resources");
+  memory.fail_address = UINT64_MAX;
+
+  // Separate ordinary samplers share images but still require distinct pairs.
+  DescriptorSource repeat;
+  repeat.dword_count = 4u;
+  for (uint32_t word = 0; word < 4u; ++word) repeat.dwords[word] = Value(0u);
+  auto sampler = plan.info.samplers[0];
+  sampler.source = static_cast<uint32_t>(plan.descriptor_sources.size());
+  plan.descriptor_sources.push_back(repeat);
+  plan.info.samplers.push_back(sampler);
+  plan.materialization_sources.push_back(sampler.source);
+  plan.info.sampled_pairs[1].sampler = 1u;
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization) &&
+            LastResourceSpecializationError().find("sampled pairs exceed") != std::string_view::npos &&
+            SameResourceSnapshot(snapshot, prior_snapshot) &&
+            specialization == prior_specialization,
+        "sharing images bypassed the independent sampled-pair cap or transactionality");
+  for (auto& source : plan.descriptor_sources) {
+    if (source.inline_descriptor) source.inline_descriptor->selector_limit = 2u;
+  }
+  user_data[2] = 2u;
+  // Use two images in opposite orders for the small sampler/type neighbors.
+  std::copy_n(descriptors[0].dwords.begin(), 8u, memory.words.begin() + (440u + 32u) / 4u);
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.images.size() == 4u && specialization.sampled_pairs.size() == 6u,
+        "different ordinary samplers lost shared image slots or their distinct pairings");
+  const auto small_snapshot = snapshot;
+  const auto small_specialization = specialization;
+  // Only the upper half changes. The descriptor must cease to share.
+  memory.words[(440u + 32u) / 4u + 4u] ^= 0x100u;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.images.size() == 5u,
+        "shared image identity discarded upper descriptor words");
+  std::copy_n(descriptors[0].dwords.begin(), 8u, memory.words.begin() + (440u + 32u) / 4u);
+  const auto saved_semantics = plan.info.images[1];
+  plan.info.images[1].heterogeneous_numeric_compatible = false;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.images.size() == 6u,
+        "shared candidates merged roots with different supported numeric semantics");
+  plan.info.images[1] = saved_semantics;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            SameResourceSnapshot(snapshot, small_snapshot) &&
+            specialization == small_specialization,
+        "restored shared candidates did not recover their original topology");
+
+  // Exactly 512 genuinely distinct images remain admitted; 513 is rejected.
+  plan.info.sampled_pairs[1].sampler = 0u;
+  user_data[2] = 255u;
+  for (auto& source : plan.descriptor_sources) {
+    if (source.inline_descriptor) source.inline_descriptor->selector_limit = 255u;
+  }
+  for (uint32_t row = 0; row < 255u; ++row) {
+    std::copy_n(descriptors[row].dwords.begin(), 8u, memory.words.begin() + row * 440u / 4u);
+    auto distinct = descriptors[row];
+    distinct.dwords[0] += 0x1000u;
+    std::copy_n(distinct.dwords.begin(), 8u, memory.words.begin() + (row * 440u + 32u) / 4u);
+  }
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.images.size() == ShaderInfo::MaxImages &&
+            specialization.sampled_pairs.size() == ShaderInfo::MaxSampledPairs,
+        "shared admission rejected the exact distinct-image capacity");
+  const auto capacity_snapshot = snapshot;
+  const auto capacity_specialization = specialization;
+  for (auto& source : plan.descriptor_sources) {
+    if (source.inline_descriptor && source.inline_descriptor->descriptor_offset == 32u)
+      source.inline_descriptor->selector_limit = 256u;
+  }
+  user_data[2] = 256u;
+  auto excess = descriptors[255u];
+  excess.dwords[0] += 0x1000u;
+  std::copy_n(excess.dwords.begin(), 8u, memory.words.begin() + (255u * 440u + 32u) / 4u);
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization) &&
+            LastResourceSpecializationError().find("dense image resource limit") != std::string_view::npos &&
+            SameResourceSnapshot(snapshot, capacity_snapshot) &&
+            specialization == capacity_specialization,
+        "shared admission accepted distinct-image capacity plus one or partially committed it");
+
+}
+
 void TestInlineFullWidthImages() {
   auto fixture = MakeInlineDescriptorFixture(true, false, true);
   fixture->PlanAndTrack();
@@ -5916,9 +6078,9 @@ void TestInlineFullWidthImages() {
   Check(MaterializeResources(resource_plan, runtime, snapshot, specialization),
         "full-width inline images required CPU evaluation of the live selector");
   memory.fail_address = UINT64_MAX;
-  Check(snapshot.images.size() == 6u && snapshot.samplers.size() == 1u &&
+  Check(snapshot.images.size() == 4u && snapshot.samplers.size() == 1u &&
             specialization.sampler_origins == std::vector<uint32_t>{0u} &&
-            specialization.sampled_pairs.size() == 6u &&
+            specialization.sampled_pairs.size() == 4u &&
             std::ranges::all_of(specialization.images, [](const auto &image) {
               return image.indirect_sampler == UINT32_MAX;
             }),
@@ -8123,13 +8285,20 @@ int main(int argc, char** argv) {
       std::cout << "KYTY_ADDRESS_BACKED_INDIRECT_PASS\n";
       return 0;
     }
+    if (argc == 2 && std::strcmp(argv[1], "--shared-inline-images-only") == 0) {
+      TestSharedInlineImageCandidates();
+      TestInlineFullWidthImages();
+      std::cout << "KYTY_SHARED_INLINE_IMAGES_PASS\n";
+      return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--inline-image-mixed-samplers-only") == 0) {
       TestInlineImageMixedDynamicAndOrdinarySamplers();
       std::cout << "KYTY_INLINE_IMAGE_MIXED_SAMPLERS_PASS\n";
       return 0;
     }
     if (argc == 2 && std::strcmp(argv[1], "--inline-image-sampler-pairs-only") == 0) {
-      TestInlineImageUniformSamplers();
+      TestSharedInlineImageCandidates();
+    TestInlineImageUniformSamplers();
       TestInlineImageMixedDynamicAndOrdinarySamplers();
       std::cout << "KYTY_INLINE_IMAGE_SAMPLER_PAIRS_PASS\n";
       return 0;

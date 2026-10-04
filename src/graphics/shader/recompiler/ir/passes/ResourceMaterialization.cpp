@@ -2011,26 +2011,19 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 	next_specialization.sampler_origins.resize(program.info.samplers.size());
 	std::iota(next_specialization.sampler_origins.begin(),
 	          next_specialization.sampler_origins.end(), 0u);
-	size_t image_count   = program.info.images.size();
+	size_t image_capacity = program.info.images.size();
 	size_t mapping_words = 0;
 	for (const auto& table: snapshot.indirect_images) {
-		if (table.resource >= program.info.images.size() || table.descriptors.size() < 2u ||
-		    image_count + table.descriptors.size() - 1u > ShaderInfo::MaxImages) {
-			if (table.selector_stride != 0u) {
-				return SpecializationFail(fmt::format(
-				    "inline sampled pairs exceed the dense image resource limit (size={} stride={} probes={} pairs={} images={})",
-				    table.buffer_size, table.selector_stride, table.probe_count,
-				    table.descriptors.size(), image_count + table.descriptors.size() - 1u));
-			}
-			return SpecializationFail(
-			    "indirect image candidates exceed the dense image resource limit");
+		if (table.resource >= program.info.images.size() || table.descriptors.size() < 2u) {
+			return SpecializationFail("indirect image candidates have an invalid root or extent");
 		}
-		image_count += table.descriptors.size() - 1u;
+		image_capacity = std::min<size_t>(ShaderInfo::MaxImages,
+		                                 image_capacity + table.descriptors.size() - 1u);
 		mapping_words += 1u + table.keys.size() * 2u;
 	}
-	next_snapshot.images.reserve(image_count);
+	next_snapshot.images.reserve(image_capacity);
 	next_snapshot.flattened_srt.reserve(next_snapshot.flattened_srt.size() + mapping_words);
-	next_specialization.images.reserve(image_count);
+	next_specialization.images.reserve(image_capacity);
 	for (const auto& image: program.info.images) {
 		next_specialization.images.push_back({
 		    .numeric_class              = image.numeric_class,
@@ -2044,8 +2037,26 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 		    .indirect_sampler           = image.indirect_sampler,
 		    .cube                       = image.cube,
 		    .needs_manual_depth_compare = false,
+		    .indirect_resources = image.indirect_resources,
 		});
 	}
+	// Snapshot all table sources before sharing. Only ordinary-sampler, read-only
+	// sampled images share a slot; dynamic sampler origins remain root-specific.
+	const auto shareable = [&](uint32_t root) {
+		const auto& info = program.info.images[root];
+		const auto* source = Source(program, info.source);
+		return source != nullptr && source->inline_descriptor.has_value() &&
+		       info.resource_class == ImageResourceClass::Sampled && !info.depth_compare &&
+		       !info.written && !info.atomic;
+	};
+	const auto same_image_semantics = [&](uint32_t left, uint32_t right) {
+		auto a = program.info.images[left];
+		auto b = program.info.images[right];
+		// Descriptor provenance and diagnostics do not change a sampled image view.
+		a.source = b.source = 0u;
+		a.first_use_pc = b.first_use_pc = 0u;
+		return a == b;
+	};
 	for (const auto& table: snapshot.indirect_images) {
 		const auto root_image = next_specialization.images[table.resource];
 		std::vector<uint32_t> candidate_samplers(table.descriptors.size(), UINT32_MAX);
@@ -2075,14 +2086,44 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 				candidate_samplers[candidate] = sampler;
 			}
 		}
+		std::vector<uint32_t> resources {table.resource};
+		resources.reserve(table.descriptors.size());
 		for (uint32_t candidate = 1; candidate < table.descriptors.size(); candidate++) {
-			auto image          = root_image;
-			image.indirect_root = table.resource;
-			image.indirect_sampler = candidate_samplers[candidate];
-			next_specialization.images.push_back(image);
-			next_snapshot.images.push_back(table.descriptors[candidate]);
+			uint32_t resource = static_cast<uint32_t>(next_specialization.images.size());
+			if (table.sampler_resource == UINT32_MAX && shareable(table.resource) &&
+			    !NullImageDescriptor(table.descriptors[candidate])) {
+				for (uint32_t existing = static_cast<uint32_t>(program.info.images.size());
+				     existing < next_specialization.images.size(); ++existing) {
+					const auto& image = next_specialization.images[existing];
+					if (image.indirect_sampler == UINT32_MAX &&
+					    image.indirect_root < program.info.images.size() &&
+					    shareable(image.indirect_root) &&
+					    same_image_semantics(table.resource, image.indirect_root) &&
+					    next_snapshot.images[existing] == table.descriptors[candidate]) {
+						resource = existing;
+						break;
+					}
+				}
+			}
+			if (resource == next_specialization.images.size()) {
+				if (resource >= ShaderInfo::MaxImages) {
+					return SpecializationFail(fmt::format(
+					    "indirect image candidates exceed the dense image resource limit "
+					    "(size={} stride={} probes={} pairs={} images={})",
+					    table.buffer_size, table.selector_stride, table.probe_count,
+					    table.descriptors.size(), resource + 1u));
+				}
+				auto image = root_image;
+				image.indirect_root = table.resource;
+				image.indirect_sampler = candidate_samplers[candidate];
+				image.indirect_resources.clear();
+				next_specialization.images.push_back(std::move(image));
+				next_snapshot.images.push_back(table.descriptors[candidate]);
+			}
+			resources.push_back(resource);
 		}
 		auto& root                      = next_specialization.images[table.resource];
+		root.indirect_resources         = std::move(resources);
 		root.indirect_root              = table.resource;
 		root.indirect_sampler           = candidate_samplers[0];
 		root.indirect_mapping_offset    = static_cast<uint32_t>(next_snapshot.flattened_srt.size());
@@ -2221,6 +2262,16 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 			                static_cast<uint32_t>(format)));
 		}
 	}
+	// Preserve already-described indirect candidates, including callers supplying
+	// legacy root metadata. New materialized tables carry an explicit ordinal list.
+	for (uint32_t index = 0; index < next_specialization.images.size(); ++index) {
+		auto& root = next_specialization.images[index];
+		if (root.indirect_root != index || !root.indirect_resources.empty()) continue;
+		for (uint32_t candidate = 0; candidate < next_specialization.images.size(); ++candidate) {
+			if (next_specialization.images[candidate].indirect_root == index)
+				root.indirect_resources.push_back(candidate);
+		}
+	}
 	for (uint32_t root_index = 0; root_index < next_specialization.images.size(); root_index++) {
 		auto& root = next_specialization.images[root_index];
 		if (root.indirect_root != root_index) {
@@ -2235,17 +2286,13 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 		        next_snapshot.flattened_srt.size()) {
 			return SpecializationFail("indirect image specialization has an invalid key mapping");
 		}
-		uint32_t exemplar       = ImageResource::NoIndirectImage;
-		uint32_t resource_count = 0;
-		for (uint32_t resource = 0; resource < next_specialization.images.size(); resource++) {
-			if (next_specialization.images[resource].indirect_root != root_index) {
-				continue;
-			}
-			resource_count++;
+		uint32_t exemplar = ImageResource::NoIndirectImage;
+		const auto resource_count = root.indirect_resources.size();
+		for (const auto resource: root.indirect_resources) {
+			if (resource >= next_specialization.images.size())
+				return SpecializationFail("indirect image candidate references an absent dense image");
 			if (exemplar == ImageResource::NoIndirectImage &&
-			    !NullImageDescriptor(next_snapshot.images[resource])) {
-				exemplar = resource;
-			}
+			    !NullImageDescriptor(next_snapshot.images[resource])) exemplar = resource;
 		}
 		const auto* root_source = Source(program, program.info.images[root_index].source);
 		if (exemplar == ImageResource::NoIndirectImage && root_source != nullptr &&
@@ -2259,11 +2306,8 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 		}
 		const auto& image_class = next_specialization.images[exemplar];
 		const auto& root_info   = program.info.images[root_index];
-		for (uint32_t candidate = 0; candidate < next_specialization.images.size(); candidate++) {
+		for (const auto candidate: root.indirect_resources) {
 			auto& image = next_specialization.images[candidate];
-			if (image.indirect_root != root_index) {
-				continue;
-			}
 			if (NullImageDescriptor(next_snapshot.images[candidate])) {
 				image.numeric_class              = image_class.numeric_class;
 				image.dimension                  = image_class.dimension;
@@ -2358,11 +2402,12 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, Materialize
 			return SpecializationFail("sampled pair has an invalid image resource");
 		}
 		const bool indirect = next_specialization.images[pair.image].indirect_root == pair.image;
-		for (uint32_t index = 0; index < next_specialization.images.size(); index++) {
+		const std::vector<uint32_t> direct {pair.image};
+		const auto& candidates = indirect
+		                             ? next_specialization.images[pair.image].indirect_resources
+		                             : direct;
+		for (const auto index: candidates) {
 			const auto& image = next_specialization.images[index];
-			if (indirect ? image.indirect_root != pair.image : index != pair.image) {
-				continue;
-			}
 			const bool dynamic_pair = image.indirect_sampler != UINT32_MAX &&
 			                          image.indirect_sampler < next_specialization.sampler_origins.size() &&
 			                          next_specialization.sampler_origins[image.indirect_sampler] == pair.sampler;
@@ -2889,13 +2934,18 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		image.indirect_search_iterations = source.indirect_search_iterations;
 		image.indirect_sampler           = source.indirect_sampler;
 		image.cube                       = source.cube;
-		image.indirect_resources.clear();
+		image.indirect_resources = source.indirect_resources;
+		for (const auto resource: image.indirect_resources) EXIT_IF(resource >= specialization.images.size());
 	}
-	for (uint32_t index = 0; index < images.size(); index++) {
-		const auto root = images[index].indirect_root;
-		if (root != ImageResource::NoIndirectImage) {
-			EXIT_IF(root >= images.size());
-			images[root].indirect_resources.push_back(index);
+
+	// Older explicit specializations describe ownership without an ordinal list.
+	for (uint32_t index = 0; index < images.size(); ++index) {
+		auto& image = images[index];
+		EXIT_IF(image.indirect_root != ImageResource::NoIndirectImage &&
+		        image.indirect_root >= images.size());
+		if (image.indirect_root != index || !image.indirect_resources.empty()) continue;
+		for (uint32_t candidate = 0; candidate < images.size(); ++candidate) {
+			if (images[candidate].indirect_root == index) image.indirect_resources.push_back(candidate);
 		}
 	}
 

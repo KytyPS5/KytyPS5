@@ -31,6 +31,9 @@ struct ResourceSpecialization {
 		bool                          cube                       = false;
 		bool                          fmask                      = false;
 		bool                          needs_manual_depth_compare = false;
+		// Root-local candidate ordinal -> dense image. Compatible inline roots can
+		// share non-null slots without changing their live keys or null defaults.
+		std::vector<uint32_t>         indirect_resources;
 		bool                          operator==(const Image&) const = default;
 	};
 

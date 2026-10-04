@@ -37078,6 +37078,87 @@ TestCase ImageSampleLzFullDynamicMaterialStaticSampler() {
   return MakeImageSampleDynamicMaterials(MaterialImageSampleMode::FullStaticSampler);
 }
 
+TestCase SampledPairOperandDomain() {
+  using O = ShaderOpcode;
+  constexpr u32 rows = 260u;
+  constexpr u32 material_base = 4096u;
+  constexpr u32 stride = 440u;
+  TestCase test;
+  test.name = "SampledPairOperandDomain";
+  test.has_user_data = true;
+  test.has_compute_info = true;
+  test.compute_info.threads_num[0] = 1u;
+  test.compute_info.threads_num[1] = 1u;
+  test.compute_info.threads_num[2] = 1u;
+  test.compute_info.wave_size = 32u;
+  test.use_runtime_samplers = true;
+  test.buffer_addresses_are_backing_offsets = true;
+  test.expected_dense_images = 262u;
+  test.expected_sampler_resources = 2u;
+  test.expected_sampled_pairs = 522u;
+  test.user_data[4] = material_base;
+  test.user_data[5] = stride << 16u;
+  test.user_data[6] = rows;
+  test.user_data[50] = rows * 2u * sizeof(u32);
+  test.initial.resize((material_base + rows * stride) / sizeof(u32));
+  test.expected.resize(rows * 2u);
+  test.sampled_image_fixtures.push_back({0u, MakeRgbaImage(4, 4)});
+  for (u32 row = 0; row < rows; ++row) {
+    auto image = MakeRgbaImage(4, 4);
+    SetRgbaPixel(&image, 4, 1, 1, std::bit_cast<u32>(float(row + 1u)), 0u, 0u, 0u);
+    SetRgbaPixel(&image, 4, 3, 1, std::bit_cast<u32>(float(4u * (row + 1u))), 0u, 0u, 0u);
+    test.sampled_image_fixtures.push_back({0x100000ull + row * 0x1000ull, std::move(image)});
+    for (u32 root = 0; root < 2u; ++root) {
+      const u32 selected = (row + root) % rows;
+      const uint64_t address = 0x100000ull + selected * 0x1000ull;
+      const std::array<u32, 8> descriptor {
+          static_cast<u32>(address >> 8u),
+          (static_cast<u32>(Prospero::BufferFormat::k32_32_32_32Float) << 20u) | (3u << 30u),
+          3u << 14u, DstSel(4, 5, 6, 7) |
+              (static_cast<u32>(Prospero::ImageType::kColor2D) << 28u),
+          0u, 0x00700000u, 0u, 0u};
+      std::copy(descriptor.begin(), descriptor.end(),
+                test.initial.begin() + (material_base + row * stride + root * 32u) / 4u);
+    }
+    test.expected[row] = std::bit_cast<u32>(float(4u * (row + 1u)));
+    test.expected[rows + row] = std::bit_cast<u32>(float((row + 1u) % rows + 1u));
+  }
+  auto& code = test.code;
+  const auto clamp = static_cast<u32>(Prospero::SamplerClampMode::kClampLastTexel);
+  AppendSMovLiteral(&code, 76, clamp | (clamp << 3u) | (clamp << 6u));
+  for (u32 reg = 77; reg < 84; ++reg) code.push_back(EncodeSMovB32(reg, InlineU32(0u)));
+  AppendVMovLiteral(&code, 24, std::bit_cast<u32>(1.3125f));
+  AppendVMovLiteral(&code, 25, std::bit_cast<u32>(0.375f));
+  code.push_back(EncodeSMovB32(32, InlineU32(0u)));
+  AppendSMovLiteral(&code, 35, rows);
+  const auto loop = code.size();
+  code.push_back(EncodeSop2(0x26, 61, 32, 255u));
+  code.push_back(stride);
+  code.push_back(EncodeSmem0(0x0c, 16, 2));
+  code.push_back(EncodeSmem1(0, 61));
+  code.push_back(EncodeSop2(0x1e, 33, 32, InlineU32(2u)));
+  code.push_back(EncodeMimg0(0x27, 0x1, 0, false, 1, false));
+  code.push_back(EncodeMimg1(0, 24, 4, 19));
+  code.push_back(EncodeVop1(0x01, 30, 33));
+  AppendBufferStoreDword(&code, 0, 30);
+  code.push_back(EncodeMimg0(0x27, 0x1, 0, false, 1, false));
+  code.push_back(EncodeMimg1(1, 24, 6, 20));
+  code.push_back(EncodeSop2(0x00, 34, 33, 255u));
+  code.push_back(rows * 4u);
+  code.push_back(EncodeVop1(0x01, 30, 34));
+  AppendBufferStoreDword(&code, 1, 30);
+  code.push_back(EncodeSop2(0x00, 32, 32, InlineU32(1u)));
+  code.push_back(EncodeSopc(0x0a, 32, 35));
+  const auto branch = code.size();
+  code.push_back(EncodeSopp(0x05, static_cast<u32>(
+      static_cast<int64_t>(loop) - static_cast<int64_t>(branch + 1u))));
+  AppendEnd(&code);
+  test.opcodes = {O::S_BUFFER_LOAD_DWORDX16, O::IMAGE_SAMPLE, O::S_CMP_LT_U32,
+                  O::S_CBRANCH_SCC1, O::BUFFER_STORE_DWORD};
+  test.required_spirv = {"OpLoopMerge", "OpSwitch", "OpImageSampleExplicitLod"};
+  return test;
+}
+
 TestCase Images65FromSrtWithDistinctSamplerOrigins() {
   using O = ShaderOpcode;
   constexpr u32 resource_count = 65u;
@@ -46575,6 +46656,12 @@ if (argc == 1) {
     vulkan.CheckComparisonDepthTexture();
     vulkan.CheckRasterization(true);
     RunCase(nullptr, ImageSampleA16CompareBiasRdna2AddressOrder());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--sampled-pair-domain-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, SampledPairOperandDomain());
+    std::puts("KYTY_SAMPLED_PAIR_OPERAND_DOMAIN_GPU_PASS");
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--shared-inline-images-only") == 0) {

@@ -1,7 +1,42 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
-Checkpoint **4 октября 2026 года, 13:57 UTC** (native Windows via WSL;
-branch `yotei-windows-bringup`, source parent79695c15 plus shared image admission fix):
+Checkpoint **4 октября 2026 года, 14:34 UTC** (native Windows via WSL;
+branch `yotei-windows-bringup`, parent8a496a73, sampled operand-domain fix):
+
+- Actual run140111 naturally exited321 at14:14:42UTC on CS59630740d07d5a1c:
+  specialized sampled pairs exceeded512. CSb629 now passed261 images/504 pairs,
+  SPIR-V265390 words and pipeline9688ms; the415423459-byte checkpoint persisted.
+  Nonzero RGB197/shown199; offscreen window1407 is entirely black. No menu,
+  gameplay or DeviceLost proved; PID26156 exited.
+- Independent native RED `sampled-pair-domain-final-red-20261004.log.stderr`
+  rejects the513rd usage edge with257 valid images and2 samplers. Native
+  specialization RED `sampled-pair-materialization-red-20261004.log.stderr`
+  independently requires262 dense images/2 samplers/522 edges. The backend
+  allocates separate image and sampler descriptors; pairs are local
+  OpSampledImage use edges. Their bounded graph maximum now derives from
+  MaxImages × MaxSamplers. MaxImages512/MaxSamplers32, real device budgets,
+  source validation, coherence, selector/probe bounds and failures remain.
+- The unchanged final RED oracle passes after the correction:
+  `sampled-pair-domain-final-green-20261004.log`. Full ResourceTracking also
+  passes `sampled-pair-domain-final-resource-suite-20261004.log` (3.8s, native
+  exe SHA256 `6f245d2d0c94db4f13c5434befb50cafe35118471136b8e7d8dbcd59434e74d5`).
+  Exact512×32 unique edges and the next invalid image are covered transactionally;
+  existing tests that confused edge count with descriptor count now assert
+  the separate operand capacities. A fixture binding-class omission was corrected
+  with valid full descriptors and normal materialization, then RED/GREEN repeated.
+- Native GPUAV `sampled-pair-domain-gpuav-20261004.log` passes all520 numerical
+  readbacks from260 bounded rows, two differently ordered image roots and clamp/
+  repeat samplers (262 images/2 samplers/522 pairs). Native exe SHA256
+  `05c56fb2b414fc66ad6b24d78ee1b58452c2eee480c420d1a994e68c5c004c58`.
+  Shared small-root and compact dynamic-sampler GPUAV neighbors pass on the same
+  executable. Native DescriptorBudget full suite passes exact257images/2samplers
+  and actual image/sampler over-budget rejection (`sampled-pair-domain-budget-green-20261004.log`).
+- Native emulator build/install and original-game retry are next. Other-game
+  runtime, the full CFG baseline assertion and independent d0c NVIDIA compiler
+  breakpoint remain unproved. **Menu/gameplay PENDING.**
+
+Checkpoint **4 октября 2026 года, 14:28 UTC** (native Windows via WSL;
+branch `yotei-windows-bringup`, pushed fix `8a496a73`):
 
 - The last completed game run132158 passed actual CS4d6 materialization and
   pipeline creation, then stopped on CSb629 inline dense-image admission
@@ -32,8 +67,19 @@ branch `yotei-windows-bringup`, source parent79695c15 plus shared image admissio
   0/32/224 and no finite selector guard. Do not infer31 records from buffer size:
   unrestricted U32 multiplication reaches wrapped interior offsets too.
   Other-game runtime and existing full CFG literal assertion remain unproved.
-  Next: commit/push the completed fix, native emulator build/install, then
-  bounded original retry with CSb629 phase/GPUAV trace and drained output.
+  Native emulator build/install succeeded; installed exe SHA256
+  `f9d96bfd3fb75709419556806762988651fc2b434712628855187fb6a6b1177f`.
+  Bounded retry FINISHED: `yotei-integrated-20261004-140111-presentfix-gpuav`,
+  natural exit321 at14:14:42 UTC; PID26156 exited, no native emulator/build/test
+  tasks remain. Actual CSb629 passed with9 buffers/261 images/504 pairs,
+  SPIR-V265390 words and pipeline9688ms; the415423459-byte cache checkpoint
+  persisted immediately. Several later pipelines also succeeded.
+  First nonzero RGB197/shown199; offscreen `window-1407.png` is entirely black.
+  New blocker: CS59630740d07d5a1c, specialized sampled pairs exceed the512
+  logical-pair cap. Required independent regression is recorded in test debt.
+  Read-only diagnosis: separate sampled-image/sampler bindings are allocated by
+  operand count; pair edges allocate no Vulkan combined descriptor. Prove the
+  supported operand-domain contract before correcting this bookkeeping bound.
   Independent d0c NVIDIA compiler breakpoint remains. **Menu/gameplay PENDING.**
 
 Checkpoint **4 октября 2026 года, 13:39 UTC** (native Windows via WSL;

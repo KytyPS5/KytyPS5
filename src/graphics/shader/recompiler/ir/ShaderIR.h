@@ -498,7 +498,11 @@ struct ShaderInfo {
 	// device checks (documented Yōtei bring-up contract).
 	static constexpr uint32_t MaxImages       = 512;
 	static constexpr uint32_t MaxSamplers     = 32;
-	static constexpr uint32_t MaxSampledPairs = 512;
+	// Logical use edges between separate sampled-image and sampler descriptors.
+	// The backend allocates operands independently and combines them with
+	// OpSampledImage, so every validated operand combination must fit this graph.
+	// Vulkan DescriptorBudget still checks the actual descriptor allocations.
+	static constexpr uint32_t MaxSampledPairs = MaxImages * MaxSamplers;
 
 	std::vector<BoundedSrtLayout>     bounded_srt_reads;
 	std::vector<BufferTableLayout>    buffer_tables;

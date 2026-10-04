@@ -111,6 +111,25 @@ void TestSamplersAndCombinedImages() {
 	ExpectFailure(bindings, limits, "maxDescriptorSetSamplers", 136, 135, 0);
 }
 
+void TestSeparateSampledOperandBudget() {
+	// 257 images x two samplers describe 514 uses, but only 259 descriptors.
+	auto limits = GenerousLimits();
+	const std::array bindings {
+	    DescriptorBudgetBinding {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 257, VK_SHADER_STAGE_COMPUTE_BIT},
+	    DescriptorBudgetBinding {VK_DESCRIPTOR_TYPE_SAMPLER, 2, VK_SHADER_STAGE_COMPUTE_BIT},
+	};
+	limits.maxPerStageDescriptorSampledImages = limits.maxDescriptorSetSampledImages = 257;
+	limits.maxPerStageDescriptorSamplers = limits.maxDescriptorSetSamplers = 2;
+	limits.maxPerStageResources = 257;
+	Check(!ValidateDescriptorBudget(bindings, limits), "usage edges multiplied separate operands");
+	limits.maxPerStageDescriptorSampledImages = 256;
+	ExpectFailure(bindings, limits, "maxPerStageDescriptorSampledImages", 257, 256,
+	              VK_SHADER_STAGE_COMPUTE_BIT);
+	limits.maxPerStageDescriptorSampledImages = 257;
+	limits.maxDescriptorSetSamplers = 1;
+	ExpectFailure(bindings, limits, "maxDescriptorSetSamplers", 2, 1, 0);
+}
+
 void TestTexelBufferAndInputTypes() {
 	auto limits = GenerousLimits();
 	const std::array bindings {
@@ -191,6 +210,7 @@ int main() {
 	TestNativeArraysAndAuxiliaryBuffers();
 	TestGraphicsStagesAndSharedVisibility();
 	TestSamplersAndCombinedImages();
+	TestSeparateSampledOperandBudget();
 	TestTexelBufferAndInputTypes();
 	TestDynamicBuffers();
 	TestFragmentColorAttachments();

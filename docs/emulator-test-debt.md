@@ -1,5 +1,46 @@
 # Emulator regression test debt
 
+## Sampled pair graph versus separate operand descriptors (2026-10-04; synthetic proof complete, runtime pending)
+
+Native source8a496a73 run `yotei-integrated-20261004-140111-presentfix-gpuav`
+naturally exits321 on CS59630740d07d5a1c: specialized sampled pairs exceed512.
+CSb629 now passes261 images/504 pairs and pipeline creation9688ms. RGB197 /
+shown199 and the black offscreen window do not prove a menu.
+
+Required synthetic RED:257 genuinely distinct sampled images with two samplers
+produce514 distinct logical pair edges, but only257 image and2 sampler bindings.
+Also cover inline specialization expansion beyond512 pairs, root-local selection
+and defaults, both samplers, exact operand boundaries and transactional rejection.
+Verify native numerical GPUAV readback of a bounded table with more than512
+pairs and actual device descriptor-budget rejection; retain MaxImages512 and
+MaxSamplers32 and all source/type/coherence/probe checks. The maximum unique
+pair graph is derived from its validated operand domains (images × samplers),
+not an independently guessed descriptor capacity. BindingLayout uses separate
+images and samplers; OpSampledImage creates a local SSA value. Vulkan distinguishes
+[separate and combined descriptor types](https://docs.vulkan.org/refpages/latest/refpages/source/VkDescriptorType.html).
+No production correction until the native synthetic failure is recorded.
+
+Native REDs on unmodified production8a496a73: tracking
+`sampled-pair-domain-red-20261004.log.stderr` rejects required513/limit512;
+specialization `sampled-pair-materialization-red-20261004.log.stderr` rejects
+the independently asserted262 images /2 samplers /522 usage edges.
+The preceding intentional failed-read neighbor also logs its expected error.
+The shared bound now derives from MaxImages × MaxSamplers; actual descriptor
+capacity remains unchanged. Old tests expecting512 usage edges to be an
+independent descriptor limit are corrected to operand counts and plus-one
+image rejection; no existing pixel oracle changes. Final tracking fixture uses valid full descriptors and normal materialization;
+scoped reversal of only the bound reproduces the513rd-edge failure again
+(`sampled-pair-domain-final-red-20261004.log.stderr`, native SHA256
+58c6622cae97084ef32804c84f0599807d4f6324fe3b4f7f97023f409d4c748d).
+Unchanged final GREEN and full ResourceTracking pass (exact512×32/invalid513th
+image transactional boundary included). Native GPUAV passes520 numerical values
+with262 images/2 samplers/522 edges, rotated key order and clamp/repeat; small
+shared-root and compact dynamic-sampler neighbors pass. DescriptorBudget full
+suite passes real exact/over-budget operand checks. Logs are
+`sampled-pair-domain-{final-green,final-resource-suite,gpuav,shared-neighbor,dynamic-neighbor,budget-green}-20261004.log`.
+Native GPU exe SHA25605c56fb2b414fc66ad6b24d78ee1b58452c2eee480c420d1a994e68c5c004c58.
+Original-game runtime retry and other-game runtime remain pending.
+
 ## Inline sampled-image selector domain and aggregate admission (2026-10-04; pending)
 
 Source `79695c15`, native installed SHA256

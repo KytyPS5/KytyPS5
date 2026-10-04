@@ -4670,6 +4670,58 @@ void TestBoundedVectorTableSpecialization() {
   }
 }
 
+void TestSampledPairOperandDomain() {
+  // Usage edges are not descriptors: two samplers may use each of 257 images.
+  constexpr uint32_t image_count = 257u;
+  Fixture fixture;
+  for (uint32_t image_index = 0; image_index < image_count; ++image_index) {
+    const auto image = fixture.Image(
+        {Value(image_index + 1u),
+         Value(static_cast<uint32_t>(Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float) << 20u),
+         Value(3u | (3u << 14u)),
+         Value(Libs::Graphics::DstSel(4, 5, 6, 7) |
+             (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u)),
+         Value(0u), Value(0u), Value(0u), Value(0u)}, image_index * 8u);
+    for (uint32_t sampler_index = 0; sampler_index < 2u; ++sampler_index) {
+      const auto sampler = fixture.Sampler(
+          {Value(sampler_index + 1u), Value(0u), Value(0u), Value(0u)},
+          image_index * 8u + sampler_index * 4u);
+      MemoryInfo memory;
+      memory.kind = ResourceKind::Image;
+      memory.image_dimension = Decoder::ImageDimension::Dim2D;
+      fixture.Emit(ValueOpcode::ImageSampleRaw, {image, sampler, fixture.ImageAddress()},
+                   fixture.AddMemory(memory, image_index * 8u + sampler_index * 4u));
+    }
+  }
+  fixture.PlanAndTrack();
+  Check(fixture.program.info.images.size() == image_count &&
+            fixture.program.info.samplers.size() == 2u &&
+            fixture.program.info.sampled_pairs.size() == 514u,
+        "valid separate descriptor operands lost image/sampler usage edges");
+  for (uint32_t image = 0; image < image_count; ++image) {
+    for (uint32_t sampler = 0; sampler < 2u; ++sampler) {
+      Check(std::ranges::count_if(fixture.program.info.sampled_pairs,
+          [&](const SampledResourcePair& pair) {
+            return pair.image == image && pair.sampler == sampler;
+          }) == 1u, "sampled usage graph dropped or duplicated an operand combination");
+    }
+  }
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(ExtractResourcePlan(fixture.program), {}, snapshot, specialization),
+        "valid separate operands could not be specialized");
+  ApplyResourceSpecialization(fixture.program, specialization);
+  ShaderComputeInputInfo compute{};
+  CollectShaderInfo(fixture.program, {.compute = &compute});
+  AllocateBindings(fixture.program);
+  const auto kind = DescriptorBindingForImage(fixture.program.info.images[0]);
+  const auto* images = kind ? FindBinding(fixture.program.bindings, *kind) : nullptr;
+  const auto* samplers = FindBinding(fixture.program.bindings, DescriptorBindingKind::Samplers);
+  Check(images && samplers && images->resources.size() == image_count &&
+            samplers->resources.size() == 2u,
+        "logical sampled pairs multiplied the separate descriptor bindings");
+}
+
 void TestResourceLimitIsTransactional() {
   // MaxBuffers capacity contract: exact capacity must survive CollectShaderInfo
   // and AllocateBindings without truncating the dense buffer table.
@@ -4710,8 +4762,9 @@ void TestResourceLimitIsTransactional() {
            Case{Limit::Buffers, ShaderInfo::MaxBuffers, "buffer resource limit exceeded"},
            Case{Limit::Images, ShaderInfo::MaxImages, "image resource limit exceeded"},
            Case{Limit::Samplers, ShaderInfo::MaxSamplers, "sampler resource limit exceeded"},
+           // A unique edge beyond the Cartesian product requires an invalid operand.
            Case{Limit::Pairs, ShaderInfo::MaxSampledPairs,
-                "sampled image/sampler pair limit exceeded"}}) {
+                "image resource limit exceeded"}}) {
     for (const uint32_t excess : {0u, 1u}) {
       Fixture fixture;
       for (uint32_t index = 0; index < test.count + excess; index++) {
@@ -5794,7 +5847,7 @@ void TestInlineImageResourceLimits() {
   ResourceSpecialization specialization;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
             snapshot.images.size() == ShaderInfo::MaxImages &&
-            specialization.sampled_pairs.size() == ShaderInfo::MaxSampledPairs &&
+            specialization.sampled_pairs.size() == ShaderInfo::MaxImages &&
             specialization.sampler_origins == std::vector<uint32_t>{0u, 1u} &&
             snapshot.samplers.size() == 2u,
         "inline candidates and ordinary sampler pairs did not fill their configured capacities");
@@ -5832,7 +5885,7 @@ void TestInlineImageResourceLimits() {
 // Two independent live-key tables may contain the same typed image descriptors
 // in different orders. Admission must count dense images, preserving each root's
 // ordinal lookup and all eight descriptor words.
-void TestSharedInlineImageCandidates() {
+void TestSharedInlineImageCandidates(bool pair_domain_regression = false) {
   constexpr uint32_t rows = 260u;
   auto fixture = MakeInlineDescriptorFixture(true, false, true, true);
   for (auto& inst : *fixture->program.blocks[1]) {
@@ -5918,11 +5971,25 @@ void TestSharedInlineImageCandidates() {
   plan.info.samplers.push_back(sampler);
   plan.materialization_sources.push_back(sampler.source);
   plan.info.sampled_pairs[1].sampler = 1u;
-  Check(!MaterializeResources(plan, runtime, snapshot, specialization) &&
-            LastResourceSpecializationError().find("sampled pairs exceed") != std::string_view::npos &&
-            SameResourceSnapshot(snapshot, prior_snapshot) &&
-            specialization == prior_specialization,
-        "sharing images bypassed the independent sampled-pair cap or transactionality");
+  if (pair_domain_regression) {
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              snapshot.images.size() == 262u && snapshot.samplers.size() == 2u &&
+              specialization.sampled_pairs.size() == 522u,
+          "two ordinary samplers over 260 inline images lost valid usage edges");
+    for (uint32_t root = 0; root < 2u; ++root) {
+      for (const auto image : specialization.images[root].indirect_resources) {
+        Check(std::ranges::count_if(specialization.sampled_pairs,
+            [&](const SampledResourcePair& pair) {
+              return pair.image == image && pair.sampler == root;
+            }) == 1u, "expanded inline graph lost a root's sampler or image");
+      }
+    }
+    return;
+  }
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.images.size() == 262u && snapshot.samplers.size() == 2u &&
+            specialization.sampled_pairs.size() == 522u,
+        "separate ordinary samplers lost valid pairs over shared images");
   for (auto& source : plan.descriptor_sources) {
     if (source.inline_descriptor) source.inline_descriptor->selector_limit = 2u;
   }
@@ -5965,7 +6032,7 @@ void TestSharedInlineImageCandidates() {
   }
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
             snapshot.images.size() == ShaderInfo::MaxImages &&
-            specialization.sampled_pairs.size() == ShaderInfo::MaxSampledPairs,
+            specialization.sampled_pairs.size() == ShaderInfo::MaxImages,
         "shared admission rejected the exact distinct-image capacity");
   const auto capacity_snapshot = snapshot;
   const auto capacity_specialization = specialization;
@@ -8285,6 +8352,16 @@ int main(int argc, char** argv) {
       std::cout << "KYTY_ADDRESS_BACKED_INDIRECT_PASS\n";
       return 0;
     }
+    if (argc == 2 && std::strcmp(argv[1], "--sampled-pair-materialization-only") == 0) {
+      TestSharedInlineImageCandidates(true);
+      std::cout << "KYTY_SAMPLED_PAIR_MATERIALIZATION_PASS\n";
+      return 0;
+    }
+    if (argc == 2 && std::strcmp(argv[1], "--sampled-pair-domain-only") == 0) {
+      TestSampledPairOperandDomain();
+      std::cout << "KYTY_SAMPLED_PAIR_OPERAND_DOMAIN_PASS\n";
+      return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--shared-inline-images-only") == 0) {
       TestSharedInlineImageCandidates();
       TestInlineFullWidthImages();
@@ -8475,6 +8552,8 @@ int main(int argc, char** argv) {
     Run("descriptor format provenance", TestDescriptorFormattedBufferProvenance);
     Run("runtime unsigned min", TestRuntimeUnsignedMinDescriptor);
     Run("images and samplers", TestImagesSamplersAndAliases);
+    Run("shared inline images", [] { TestSharedInlineImageCandidates(); });
+    Run("sampled pair materialization", [] { TestSharedInlineImageCandidates(true); });
     Run("inline image mixed samplers", TestInlineImageMixedDynamicAndOrdinarySamplers);
     Run("inline SCC selector guard", TestInlineBufferSccConditionRefGuard);
     Run("inline sampled SCC guard", TestInlineSampledSccConditionRefGuard);
@@ -8539,6 +8618,7 @@ int main(int argc, char** argv) {
     Run("graphics push constants", TestGraphicsPushConstantLayout);
     Run("bounded buffer binding collection", TestBoundedBufferBindingCollection);
     Run("bounded vector table specialization", TestBoundedVectorTableSpecialization);
+    Run("sampled pair operand domain", TestSampledPairOperandDomain);
     Run("resource limit", TestResourceLimitIsTransactional);
     Run("malformed memory kinds", TestMalformedMemoryKindsRejected);
   } catch (const std::exception &exception) {

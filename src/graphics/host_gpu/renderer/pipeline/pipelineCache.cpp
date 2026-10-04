@@ -39,6 +39,7 @@ namespace Libs::Graphics {
 
 namespace {
 
+
 vk::PolygonMode ResolvePolygonMode(const HW::ModeControl& mode, bool cull_front, bool cull_back) {
 	// CxPrimitiveSetup::PolygonMode disables both per-face modes when it is zero.
 	if (mode.poly_mode == 0) {
@@ -711,20 +712,37 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	auto& rendering             = key.rendering;
 	rendering.color_count       = 0;
 	uint32_t attachment_samples = 0;
+	// Vulkan requires one sample count for the whole pass, and My First Gran Turismo mixes 1x colour with 2x depth
+	// (depth-only edge antialiasing). The highest count wins and an attachment with another count
+	// is dropped from the pass (and logged) rather than ending the session.
+	const auto depth_in_use = depth.desc.view_info.format != vk::Format::eUndefined &&
+	                          static_cast<bool>(depth.image_id);
+	uint32_t    kept_color_count = 0;
+	for (uint32_t i = 0; i < color_count; i++) {
+		attachment_samples = std::max(attachment_samples, colors[i].desc.info.samples);
+	}
+	if (depth_in_use) {
+		attachment_samples = std::max(attachment_samples, depth.desc.info.samples);
+	}
 	for (uint32_t i = 0; i < color_count; i++) {
 		const auto slot = colors[i].target_slot;
 		EXIT_IF(slot >= RENDER_COLOR_ATTACHMENTS_MAX);
 		rendering.color_count = std::max(rendering.color_count, slot + 1);
 		EXIT_IF(!colors[i].image_id || colors[i].desc.view_info.format == vk::Format::eUndefined);
+		if (colors[i].desc.info.samples != attachment_samples) {
+			static std::atomic<uint32_t> reported {0};
+			if (reported.fetch_add(1, std::memory_order_relaxed) < 8) {
+				LOGF("Pipeline: colour attachment %u is %ux but the pass runs %ux; dropping it from "
+				     "the pass\n",
+				     slot, colors[i].desc.info.samples, attachment_samples);
+			}
+			static_params.color_mask[slot] = 0;
+			continue;
+		}
 		static_params.color_mask[slot] = colors[i].export_mapping.ApplyMask(
 		    render_target_mask_slot(ctx.GetRenderTargetMask(), colors[i].target_slot));
 		rendering.color_formats[slot] = colors[i].desc.view_info.format;
-		if (attachment_samples == 0) {
-			attachment_samples = colors[i].desc.info.samples;
-		} else if (attachment_samples != colors[i].desc.info.samples) {
-			EXIT("mixed color attachment sample counts are unsupported: %u and %u\n",
-			     attachment_samples, colors[i].desc.info.samples);
-		}
+		kept_color_count++;
 		const auto& rt                        = ctx.GetRenderTarget(colors[i].target_slot);
 		const auto& bc                        = ctx.GetBlendControl(colors[i].target_slot);
 		const bool alpha_remap =
@@ -757,8 +775,15 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 			}
 		}
 	}
-	const bool with_depth =
-	    depth.desc.view_info.format != vk::Format::eUndefined && static_cast<bool>(depth.image_id);
+	const bool depth_mismatched = depth_in_use && depth.desc.info.samples != attachment_samples;
+	if (depth_mismatched) {
+		static std::atomic<uint32_t> reported_depth {0};
+		if (reported_depth.fetch_add(1, std::memory_order_relaxed) < 8) {
+			LOGF("Pipeline: depth is %ux but the pass runs %ux; dropping it from the pass\n",
+			     depth.desc.info.samples, attachment_samples);
+		}
+	}
+	const bool with_depth = depth_in_use && !depth_mismatched;
 	if (with_depth) {
 		const auto aspects       = ImageViewOps::DepthAspectMask(depth.desc.view_info.format);
 		rendering.depth_format   = aspects & vk::ImageAspectFlagBits::eDepth
@@ -767,14 +792,8 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 		rendering.stencil_format = aspects & vk::ImageAspectFlagBits::eStencil
 		                               ? depth.desc.view_info.format
 		                               : vk::Format::eUndefined;
-		if (attachment_samples == 0) {
-			attachment_samples = depth.desc.info.samples;
-		} else if (attachment_samples != depth.desc.info.samples) {
-			EXIT("mixed color/depth sample counts are unsupported: %u and %u\n", attachment_samples,
-			     depth.desc.info.samples);
-		}
 	}
-	if (color_count == 0 && !with_depth) {
+	if (kept_color_count == 0 && !with_depth) {
 		attachment_samples = render_sample_count(ctx.GetAaConfig().msaa_num_samples);
 		EXIT_IF(!static_cast<bool>(
 		    m_graphics.GetPhysicalDeviceProperties().limits.framebufferNoAttachmentsSampleCounts &

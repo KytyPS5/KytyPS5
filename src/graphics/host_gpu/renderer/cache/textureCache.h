@@ -156,7 +156,9 @@ private:
 	[[nodiscard]] bool CopyD16(Image& destination, Image& source);
 	void               CopyImage(ImageId destination, ImageId source);
 	[[nodiscard]] ImageId AssociateStencil(ImageId depth, GuestRange stencil);
-	void CopyImageMip(ImageId destination, ImageId source, uint32_t mip, uint32_t layer);
+	[[nodiscard]] bool CopyImageMip(ImageId destination, ImageId source, uint32_t mip,
+	                                uint32_t layer);
+	void FreeCopySource(ImageId source, bool copied);
 	void ValidateImageDesc(const ImageDesc& desc) const;
 
 	void               InvalidateCpuAliases(uint64_t address, uint64_t size);

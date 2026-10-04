@@ -1,6 +1,65 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
 
+
+
+Checkpoint **4 октября 2026 года, 22:43 UTC** (same installed `00c7df8e`
+Windows executable/cache; no additional emulator change):
+
+- Warm capture retry
+  `_Build/runs/yotei-integrated-20261004-223222-function-outline-warm-capture-noval`
+  accepts the50MB existing core cache. All4 CS54904 variants and CSfc6f complete
+  in9–12ms instead of the preceding98–104s cold creations. Other new wave32
+  pipelines continue compiling; shown stays208, readback150–207 black.
+- Runner stops at its480s no-new-frame guard,22:43:37UTC; graceful close succeeds,
+  exit0. Native process read-back is empty. This is not a DeviceLost or a claim
+  that the later shaders failed validation. Keep the unchanged28GiB memory
+  ceiling and preserve the compiler checkpoints.
+- Actual capture audit:15 unique outlined modules pass Vulkan1.3 SPIR-V validation
+  (`_Build/analysis/cooperative-native-capture-summary-20261005.json`). Original
+  captured568075word CS54904 and new690545word module have identical counts
+  for every nonstructural opcode; only function/type/parameter/call/label/return
+  counts change (`cs54904-original-vs-native-opcounts-20261005.json`). These are
+  structural checks, not numerical proof of proprietary shader output.
+- User requests publishing milestone status to
+  [issue108](https://github.com/KytyPS5/KytyPS5/issues/108), linked to
+  [fxpw PR497](https://github.com/KytyPS5/KytyPS5/pull/497). Workflow is recorded
+  in `AGENTS.md`. First status:
+  [comment5985289085](https://github.com/KytyPS5/KytyPS5/issues/108#issuecomment-5985289085).
+  Current published PR head `cc264198`; local00c7df8e and these latest notes
+  remain unpushed. Publication authorization covers verified milestone comments.
+- Next: complete synthetic derived-pointer and255/256-argument boundary evidence,
+  then same-EXE bounded continuation with the preserved cache. Actual large
+  CS8457, visible new pixels, menu and gameplay remain **PENDING**.
+
+Checkpoint **4 октября 2026 года, 22:30 UTC** (native Windows game via WSL;
+source `00c7df8e`, branch `yotei-windows-bringup`; installed SHA-256
+`a5f6ba5c4c74f22333098693cd0e728a3259c1fac3f217c0b06172034dbe6a9b`):
+
+- Shared cooperative outlining is committed locally; native emulator build and
+  install pass (`cooperative-outline-emulator-{build,install}-20261005.log`).
+  CTest `shader_cooperative_segment_isolation` passes1/1 (four fixtures).
+  Focused RED/GREEN and final numerical GPUAV evidence are recorded below.
+- `_Build/runs/yotei-integrated-20261004-221817-function-outline-noval`
+  ran22:18:17–22:30:20UTC,1280x720/Fifo/optimizationNone, all validation off,
+  total720s/frame480s/memory28GiB. All4 actual CS54904 specializations now
+  complete `vkCreateComputePipelines` in98.010–103.827s; native emitted modules
+  are about690545–690821words. The next cooperative CSfc6f8c56eb7e168f
+  (701179words) also completes97.004s. Expensive compiler work is checkpointed
+  to the existing driver cache. This is actual emitter/driver progress beyond
+  the old28GiB compiler blocker, not a menu or cross-game execution claim.
+- Shown reaches207. Readback150–206 is black; task-window screenshot
+  `window-during-compile.png` is visually black. The existing diagnostic writes
+  frame summaries only, so the older raw-frame decoder cannot supply images
+  for this build. A guarded task-window capture can verify visible pixels.
+  The runner requests graceful close at its time boundary, records exit0 and
+  successful close; read-back finds no emulator/test/probe/Ninja/MSBuild process.
+  No DeviceLost or unmatched compute creation is recorded at the final stop.
+- Next: bounded same-EXE warmed-cache retry with SPIR-V capture, verify accepted
+  cache and completed compiler work are reused, then diagnose the next actual
+  blocker with a synthetic regression. Actual large CS8457 still pending.
+  **Menu/gameplay PENDING.** User requires work through menu; no push authorized.
+
 Checkpoint **4 октября 2026 года, 22:14 UTC** (native Windows synthetic GPUAV
 via WSL; cooperative segment outlining, based on `9824bbab`, branch
 `yotei-windows-bringup`; emulator build/install and game retry NEXT):

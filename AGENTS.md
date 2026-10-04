@@ -60,6 +60,21 @@ artifact/log references, current runtime blocker and next required work. Disting
 CPU audit, GPU regression, rendered frame, menu and gameplay results. Keep untested stages
 explicitly pending; group batch failures by shared cause and note overlapping shader counts.
 
+## Publish Ghost of Yōtei status
+
+The user authorizes publishing verified progress updates to
+[game issue #108](https://github.com/KytyPS5/KytyPS5/issues/108).
+After a meaningful fix, completed audit/game retry, or a changed runtime blocker,
+post a concise checkpoint there and link
+[fxpw's bring-up PR #497](https://github.com/KytyPS5/KytyPS5/pull/497).
+Read the latest issue comments before posting and avoid duplicate updates.
+
+Include the tested revision, validation scope, actual runtime outcome, remaining
+blocker and next action. Distinguish local-only commits from the published PR
+head and CI; keep rendered pixels, menu and gameplay as separate milestones.
+Record the posted comment URL in the launch plan and shared handoff. Publish
+milestone updates rather than individual pipeline/progress-counter samples.
+
 ## Resume Ghost of Yōtei work
 
 When the user says "continue" or another agent takes over this task, use the

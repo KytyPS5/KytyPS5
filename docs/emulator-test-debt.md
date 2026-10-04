@@ -2,6 +2,30 @@
 
 ## Large CS pipeline before the shared-table frontier (2026-10-04; bounded runtime diagnosis)
 
+Additional interface-boundary coverage required (2026-10-05 continuation):
+synthetic Function-array element pointers at indices0/1 must retain the original
+entry path without VariablePointers. A scalar interface with255 arguments may
+outline and validate, while256 arguments must retain the unchanged valid
+original. Validate each source before transformation. Scoped removal of these
+existing guards must produce the intended SPIR-V pointer/argument-limit RED;
+restore the guards and run the identical fixtures GREEN. No GPU dispatch is
+needed to reproduce either admission boundary.
+
+Native game retry on committed `00c7df8e` / installed SHA
+`a5f6ba5c4c74f22333098693cd0e728a3259c1fac3f217c0b06172034dbe6a9b`
+now completes all4 CS54904 specializations (98.010–103.827s) and the next
+cooperative CSfc6f8c56eb7e168f (97.004s). Run
+`_Build/runs/yotei-integrated-20261004-221817-function-outline-noval`,
+22:18:17–22:30:20UTC, stops at720s with graceful close/exit0, shown207,
+readback150–206 black. No unmatched compute creation remains at stop; native
+process read-back is empty. Existing driver-cache checkpoints preserve the
+completed work. No menu, GPUAV game validation or cross-game runtime proof.
+Command: `_Build/run-yotei-function-outline-20261005.ps1 -ExpectedHash <above>
+-TimeoutSeconds 720 -FrameWatchdogSeconds 480 -ReadbackStart 150
+-ReadbackLimit 1000 -MaxWorkingSetGiB 28 -NoVulkanValidation -ContinueAfterColored`
+CTest focused
+isolation1/1 passes; four synthetic fixtures are run by that entry.
+
 Current shared correction preserves Function variables/initializers in main and
 passes the original objects as typed Function-pointer arguments. No Private
 reclassification remains. The entry arithmetic invariant has valid native RED
@@ -44,8 +68,8 @@ Exact CS54904 diagnostic Function-pointer rewrite validates, outlines856 arms
 and retains4 atomic arms. The same exact-layout pipeline probe completes in
 106s at about2.3GiB sampled working set, flags disable-optimization:
 `cs54904-function-pointers-pipeline-20261005.log/.run.json`.
-This is pipeline-only evidence on a diagnostic rewrite. Native emitter game
-execution, actual large CS8457 and menu remain pending.
+This is pipeline-only evidence on a diagnostic rewrite. Actual native emitter
+pipeline completions are recorded above; large CS8457 and menu remain pending.
 
 2026-10-05 continuation: exact current module captured at
 `_Build/runs/yotei-integrated-20261004-210755-cs54904-capture-noval/shaders/0001_new_shader_cs_54904fb419d79e49.spv`.

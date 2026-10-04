@@ -27,7 +27,9 @@ Windows executable/cache; no additional emulator change):
   in `AGENTS.md`. First status:
   [comment5985289085](https://github.com/KytyPS5/KytyPS5/issues/108#issuecomment-5985289085).
   Current published PR head `cc264198`; local00c7df8e and these latest notes
-  remain unpushed. Publication authorization covers verified milestone comments.
+  remain unpushed. The user subsequently restricted further issue updates to
+  visually confirmed menu and then confirmed entry into the game. Intermediate
+  fixes, tests, retries and blockers are recorded locally only.
 - Next: complete synthetic derived-pointer and255/256-argument boundary evidence,
   then same-EXE bounded continuation with the preserved cache. Actual large
   CS8457, visible new pixels, menu and gameplay remain **PENDING**.

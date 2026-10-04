@@ -64,16 +64,19 @@ explicitly pending; group batch failures by shared cause and note overlapping sh
 
 The user authorizes publishing verified progress updates to
 [game issue #108](https://github.com/KytyPS5/KytyPS5/issues/108).
-After a meaningful fix, completed audit/game retry, or a changed runtime blocker,
-post a concise checkpoint there and link
+The user defines the only publication milestones as a visually confirmed menu
+and, afterwards, confirmed entry into the game. Post a concise checkpoint only
+after reaching each of these milestones and link
 [fxpw's bring-up PR #497](https://github.com/KytyPS5/KytyPS5/pull/497).
 Read the latest issue comments before posting and avoid duplicate updates.
 
 Include the tested revision, validation scope, actual runtime outcome, remaining
 blocker and next action. Distinguish local-only commits from the published PR
 head and CI; keep rendered pixels, menu and gameplay as separate milestones.
-Record the posted comment URL in the launch plan and shared handoff. Publish
-milestone updates rather than individual pipeline/progress-counter samples.
+Record the posted comment URL in the launch plan and shared handoff. Keep
+intermediate fixes, tests, audits, retries and blockers in local records; they
+do not authorize another issue comment. The initial status comment predates
+this narrower user instruction; do not repost it or publish a clarification.
 
 ## Resume Ghost of Yōtei work
 

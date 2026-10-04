@@ -879,26 +879,38 @@ void IncludeInstructionVectorRegisters(const Decoder::Instruction& inst, uint32_
 		case Decoder::Opcode::V_CMP_LE_F64:
 		case Decoder::Opcode::V_CMPX_LE_F64:
 		case Decoder::Opcode::V_CMPX_GE_F64:
-		case Decoder::Opcode::V_CMP_EQ_I64:
+		case Decoder::Opcode::V_CMP_F_I64:
 		case Decoder::Opcode::V_CMP_LT_I64:
+		case Decoder::Opcode::V_CMP_EQ_I64:
 		case Decoder::Opcode::V_CMP_LE_I64:
+		case Decoder::Opcode::V_CMP_GT_I64:
 		case Decoder::Opcode::V_CMP_NE_I64:
+		case Decoder::Opcode::V_CMP_GE_I64:
+		case Decoder::Opcode::V_CMP_T_I64:
+		case Decoder::Opcode::V_CMP_F_U64:
 		case Decoder::Opcode::V_CMP_LT_U64:
 		case Decoder::Opcode::V_CMP_EQ_U64:
 		case Decoder::Opcode::V_CMP_LE_U64:
 		case Decoder::Opcode::V_CMP_GT_U64:
 		case Decoder::Opcode::V_CMP_NE_U64:
 		case Decoder::Opcode::V_CMP_GE_U64:
+		case Decoder::Opcode::V_CMP_T_U64:
+		case Decoder::Opcode::V_CMPX_F_I64:
 		case Decoder::Opcode::V_CMPX_LT_I64:
 		case Decoder::Opcode::V_CMPX_EQ_I64:
 		case Decoder::Opcode::V_CMPX_LE_I64:
+		case Decoder::Opcode::V_CMPX_GT_I64:
 		case Decoder::Opcode::V_CMPX_NE_I64:
+		case Decoder::Opcode::V_CMPX_GE_I64:
+		case Decoder::Opcode::V_CMPX_T_I64:
+		case Decoder::Opcode::V_CMPX_F_U64:
 		case Decoder::Opcode::V_CMPX_LT_U64:
 		case Decoder::Opcode::V_CMPX_EQ_U64:
 		case Decoder::Opcode::V_CMPX_LE_U64:
 		case Decoder::Opcode::V_CMPX_GT_U64:
 		case Decoder::Opcode::V_CMPX_NE_U64:
 		case Decoder::Opcode::V_CMPX_GE_U64:
+		case Decoder::Opcode::V_CMPX_T_U64:
 			include_vector(inst.src0, 2u);
 			include_vector(inst.src1, 2u);
 			break;

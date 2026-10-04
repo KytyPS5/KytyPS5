@@ -498,6 +498,8 @@ uint32_t UnpackImageTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint
 uint32_t UnpackImageGather(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t gathered) {
 	const auto info = ImageConversionFormat(ctx.state, mem);
 	if (info.format == Prospero::BufferFormat::kInvalid) return gathered;
+	// Scaled formats are rescaled for plain fetches only; a gather would need its own float path.
+	EXIT_NOT_IMPLEMENTED(IsScaledConversion(info));
 
 	const auto component = ImageGatherComponent(mem.dmask);
 	const auto selector =
@@ -574,6 +576,8 @@ uint32_t EmitOneDimensionalGatherLz(ValueEmitContext& ctx, const IR::MemoryInfo&
 uint32_t PackImageTexel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, uint32_t texel) {
 	const auto info = ImageConversionFormat(ctx.state, mem);
 	if (info.format == Prospero::BufferFormat::kInvalid) return texel;
+	// Scaled formats are rescaled for plain fetches only; a write would need float-to-normalized packing.
+	EXIT_NOT_IMPLEMENTED(IsScaledConversion(info));
 
 	auto packed = ConstantU32(ctx.state, 0u);
 	for (uint32_t component = 0; component < info.component_count; component++) {

@@ -46,7 +46,11 @@ BlendMappingSupport ClassifyBlendMapping(const HW::BlendControl&                
 	    (blend.alpha_srcblend != blend.color_srcblend ||
 	     blend.alpha_destblend != blend.color_destblend || blend.alpha_comb_fcn != blend.color_comb_fcn);
 	// Moving alpha requires the same equation for all channels unless the permutation lets the
-	// caller restore the alpha slot.
+	// caller restore the alpha slot. That only fixes the source alpha factor: Vulkan still applies
+	// the colour equation to the first three host channels and the alpha equation to the fourth, so
+	// with different equations the channel that moved into the alpha slot gets the alpha equation
+	// and the logical alpha gets the colour one. It is the closest fixed-function blending gets;
+	// switching blending off instead would overwrite every channel.
 	if (alpha_differs && !permutation) {
 		return BlendMappingSupport::Unsupported;
 	}

@@ -732,14 +732,10 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 		const bool alpha_remap =
 		    slot == 0 && ps_input_info != nullptr && ps_input_info->alpha_blend_source_remap;
 		static_params.blend_enable[slot] = bc.enable && !rt.info.blend_bypass;
-		// A permuted export mapping leaves the shader's alpha in a known component, so the blend
-		// can be expressed: put that component in the second blend source and let the alpha slot
-		// read it. Vulkan's SrcAlpha is bound to the alpha byte, so without this the equation is
-		// either wrong or switched off entirely and the draw loses its compositing.
-		const auto mapping_support = ClassifyBlendMapping(bc, colors[i].export_mapping);
-		const bool second_alpha    = mapping_support == BlendMappingSupport::PermutedSourceAlpha;
-		if (static_params.blend_enable[slot] && !alpha_remap && !second_alpha &&
-		    mapping_support != BlendMappingSupport::Direct) {
+		// A mapping that moves alpha is only blended when the pixel shader supplies the logical
+		// alpha in the second blend source (alpha_remap, target 0 only); otherwise blending is off.
+		if (static_params.blend_enable[slot] && !alpha_remap &&
+		    ClassifyBlendMapping(bc, colors[i].export_mapping) != BlendMappingSupport::Direct) {
 			static_params.blend_enable[slot] = false;
 			static std::atomic_bool warned = false;
 			if (!warned.exchange(true, std::memory_order_relaxed)) {
@@ -750,7 +746,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 				    bc.alpha_srcblend, bc.alpha_destblend, bc.separate_alpha_blend ? 1 : 0));
 			}
 		}
-		if (alpha_remap || second_alpha) {
+		if (alpha_remap) {
 			static_params.blend_alpha_source_remap = true;
 		}
 		if (static_params.blend_enable[slot]) {

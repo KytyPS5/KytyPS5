@@ -845,8 +845,9 @@ private:
 				if (a.material_source != b.material_source || a.table_source != b.table_source ||
 				    a.selector_stride != b.selector_stride || a.selector_offset != b.selector_offset ||
 				    a.selector_shift != b.selector_shift || a.selector_bits != b.selector_bits ||
-				    a.table_offset != b.table_offset || a.table_stride != b.table_stride ||
-				    a.workgroup_axis != b.workgroup_axis || a.sources != b.sources ||
+				    a.table_offset != b.table_offset || a.table_immediate != b.table_immediate ||
+				    a.sources != b.sources || a.table_stride != b.table_stride ||
+				    a.workgroup_axis != b.workgroup_axis || a.indexed_table != b.indexed_table ||
 				    !EquivalentValue(m_program, a.key_count, b.key_count) ||
 				    a.selector_first.IsEmpty() != b.selector_first.IsEmpty() ||
 				    (!a.selector_first.IsEmpty() &&
@@ -1045,7 +1046,8 @@ private:
 		return axis;
 	}
 
-	bool MatchTableOffset(Value value, Value& key, uint32_t& offset, uint32_t& stride) const {
+	bool MatchTableOffset(Value value, Value& key, uint32_t& offset, uint32_t& stride,
+	                      bool allow_shift = true) const {
 		offset = 0;
 		for (;;) {
 			const auto* inst = value.Resolve().TryInstruction();
@@ -1053,7 +1055,7 @@ private:
 				return false;
 			}
 			uint32_t immediate;
-			if (inst->GetOpcode() == ValueOpcode::ShiftLeftLogical32 &&
+			if (allow_shift && inst->GetOpcode() == ValueOpcode::ShiftLeftLogical32 &&
 			    ImmediateU32(inst->Arg(1), immediate) && immediate < 32u) {
 				key = inst->Arg(0).Resolve();
 				stride = 1u << immediate;
@@ -1692,6 +1694,123 @@ private:
 		return true;
 	}
 
+	bool TryMakeIndexedImage(Inst& handle, IndirectDescriptorPlan& plan) {
+		if (handle.GetOpcode() != ValueOpcode::GetImageResource || handle.NumArgs() != 8u ||
+		    handle.Parent() == nullptr)
+			return false;
+		const auto* first = handle.Arg(0).Resolve().TryInstruction();
+		const bool scalar = first != nullptr && first->GetOpcode() == ValueOpcode::ReadConstBuffer;
+		const Inst* first_read = nullptr;
+		uint32_t table_offset = 0, table_stride = 0, immediate = 0;
+		Value index;
+		if (scalar) {
+			for (uint32_t word = 0; word < 8u; ++word) {
+				const auto* read = handle.Arg(word).Resolve().TryInstruction();
+				uint32_t memory_index = 0;
+				const auto* memory = read != nullptr ? ScalarReadMemory(*read, memory_index) : nullptr;
+				if (memory == nullptr || memory->kind != ResourceKind::ScalarBuffer ||
+				    memory->offset > INT32_MAX || (memory->offset & 3u) != 0u) return false;
+				if (word == 0u) {
+					if (!MatchTableOffset(read->Arg(1), index, table_offset, table_stride, false) ||
+					    (table_stride & 3u) != 0u || (table_offset & 3u) != 0u) return false;
+					first_read = read;
+					immediate = memory->offset;
+				} else if (!EquivalentValue(m_program, first_read->Arg(0), read->Arg(0)) ||
+				           !EquivalentValue(m_program, first_read->Arg(1), read->Arg(1)) ||
+				           uint64_t {memory->offset} != uint64_t {immediate} + word * 4u) {
+					return false;
+				}
+			}
+		} else {
+			const auto guard = PositiveLaneWitness(handle.Parent());
+			if (guard.IsEmpty()) return false;
+			Value lane, table;
+			for (uint32_t word = 0; word < 8u; ++word) {
+				const auto* broadcast = handle.Arg(word).Resolve().TryInstruction();
+				if (broadcast == nullptr || broadcast->GetOpcode() != ValueOpcode::ReadLane)
+					return false;
+				Value component = broadcast->Arg(0).Resolve();
+				// Sampling lanes compare every local word with the broadcast descriptor.
+				if (!EquivalentValue(m_program, EqualLocalKey(guard, handle.Arg(word)), component))
+					return false;
+				const auto* selection = component.TryInstruction();
+				Value       active;
+				if (selection != nullptr && selection->GetOpcode() == ValueOpcode::SelectU32) {
+					active    = selection->Arg(0);
+					component = selection->Arg(1).Resolve();
+				}
+				const auto* extract = component.TryInstruction();
+				if (extract == nullptr || extract->GetOpcode() != ValueOpcode::CompositeExtractU32x4)
+					return false;
+				uint32_t component_index = 0;
+				if (!ImmediateU32(extract->Arg(1), component_index) || component_index >= 4u)
+					return false;
+				const auto* read = extract->Arg(0).Resolve().TryInstruction();
+				if (read == nullptr || read->GetOpcode() != ValueOpcode::LoadBufferU32x4) return false;
+				const auto flags = read->Flags<MemoryFlags>();
+				if (flags.index >= m_program.memory_info.size()) return false;
+				const auto& memory = m_program.memory_info[flags.index];
+				uint32_t    zero   = 0;
+				if (memory.kind != ResourceKind::Buffer || !memory.idxen || memory.offen ||
+				    memory.typed || memory.formatted || memory.offset > INT32_MAX ||
+				    !ImmediateU32(read->Arg(2), zero) || zero != 0u ||
+				    !ImmediateU32(read->Arg(3), zero) || zero != 0u ||
+				    (!active.IsEmpty() && !EquivalentValue(m_program, active, read->Arg(4))) ||
+				    !Implies(guard, read->Arg(4)))
+					return false;
+				const uint64_t offset = uint64_t {memory.offset} + component_index * 4u;
+				if (word == 0u) {
+					lane         = broadcast->Arg(1);
+					index        = read->Arg(1);
+					table        = read->Arg(0);
+					table_offset = static_cast<uint32_t>(offset);
+					first_read   = read;
+				} else if (!EquivalentValue(m_program, lane, broadcast->Arg(1)) ||
+				           !EquivalentValue(m_program, index, read->Arg(1)) ||
+				           !EquivalentValue(m_program, table, read->Arg(0)) ||
+				           offset != uint64_t {table_offset} + word * 4u)
+					return false;
+			}
+		}
+		DescriptorSource table_source;
+		if (!MakeRuntimeTableSource(*first_read, table_source) || table_source.dword_count != 4u)
+			return false;
+		DescriptorSource image_source;
+		image_source.dword_count = 8u;
+		image_source.dwords.fill(Value(0u));
+		std::copy_n(table_source.dwords.begin(), 4u, image_source.dwords.begin() + 4u);
+		image_source.indirect_descriptor =
+		    DescriptorSource::IndirectDescriptor {.table_source    = InternSource(table_source),
+		                                          .table_offset    = table_offset,
+		                                          .table_immediate = immediate,
+		                                          .indexed_table   = true,
+		                                          .table_stride    = table_stride};
+		plan.handle          = &handle;
+		plan.source          = InternSource(image_source);
+		auto& instructions = handle.Parent()->Instructions();
+		const auto where = std::ranges::find_if(instructions, [&](const Inst& inst) { return &inst == &handle; });
+		const auto emit = [&](ValueOpcode opcode, std::initializer_list<Value> args) {
+			return Value(&*handle.Parent()->PrependNewInst(where, opcode, args));
+		};
+		if (scalar) {
+			plan.key = first_read->Arg(1);
+			if (immediate != 0u) {
+				const auto address = emit(ValueOpcode::IAdd32, {plan.key, Value(immediate)});
+				const auto overflow = emit(ValueOpcode::ULessThan32, {address, plan.key});
+				plan.key = emit(ValueOpcode::SelectU32, {overflow, Value(UINT32_MAX), address});
+			}
+		} else {
+			const auto stride = emit(ValueOpcode::BitFieldUExtract, {table_source.dwords[1], Value(16u), Value(14u)});
+			const auto offset = emit(ValueOpcode::IMul32, {index, stride});
+			const auto address = emit(ValueOpcode::IAdd32, {offset, Value(table_offset)});
+			const auto valid = emit(ValueOpcode::ULessThan32, {index, table_source.dwords[2]});
+			plan.key = emit(ValueOpcode::SelectU32, {valid, address, Value(UINT32_MAX)});
+		}
+		plan.roots = image_source.dwords;
+		plan.reads.fill(nullptr);
+		return true;
+	}
+
 	bool TryMakeIndirectImage(Inst& handle, const DescriptorSource& descriptor,
 	                          IndirectDescriptorPlan& plan) {
 		if (handle.GetOpcode() != ValueOpcode::GetImageResource || handle.NumArgs() != 8u) return false;
@@ -2059,7 +2178,8 @@ private:
 				if (ValidateSource(descriptor, bad_dword)) continue;
 				IndirectDescriptorPlan plan;
 				if (TryMakeIndirectImage(*handle, descriptor, plan) || TryMakeFiniteImage(*handle, plan) ||
-				    TryMakeIndirectBuffer(*handle, descriptor, plan)) {
+				    TryMakeIndirectBuffer(*handle, descriptor, plan) ||
+				    TryMakeIndexedImage(*handle, plan)) {
 					for (const auto& previous: m_indirect_descriptors) {
 						if (plan.reads[0] != nullptr && previous.reads[0] == plan.reads[0] &&
 						    !EquivalentValue(m_program, previous.key, plan.key))

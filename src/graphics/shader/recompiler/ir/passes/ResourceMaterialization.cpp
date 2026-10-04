@@ -19,8 +19,10 @@
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
 
-constexpr uint64_t AddressMask            = 0x0000ffffffffffffull;
+constexpr uint64_t AddressMask                 = 0x0000ffffffffffffull;
 constexpr uint64_t MaxIndirectDescriptorProbes = 65536u;
+constexpr uint64_t MaxIndexedImageProbes       = 262144u;
+constexpr uint64_t DescriptorReadBatchBytes    = 65536u;
 
 bool SpecializationFail(std::string_view message) {
 	std::fprintf(stderr, "shader resource specialization failed: %.*s\n",
@@ -265,6 +267,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 	};
 	uint64_t table_base = 0;
 	uint64_t table_size = UINT64_MAX; // Scalar addresses have no buffer descriptor bounds.
+	uint64_t batch_stride = 0;
 	if (sources.empty()) {
 		keys.clear();
 		DescriptorValue material_value;
@@ -283,7 +286,36 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		} else {
 			return false;
 		}
-		if (indirect.material_source == UINT32_MAX) {
+		if (indirect.indexed_table) {
+			const bool scalar = indirect.table_stride != 0u;
+			if (table_value.dword_count != 4u || table.Type() != 0u ||
+			    table_size > uint64_t {UINT32_MAX} + 1u ||
+			    (indirect.table_offset & 3u) != 0u || (indirect.table_immediate & 3u) != 0u ||
+			    (indirect.table_stride & 3u) != 0u ||
+			    (!scalar && (table.Stride() == 0u || (table.Stride() & 3u) != 0u ||
+			                 (table_base & 3u) != 0u || table.SwizzleEnabled() || table.AddTid() ||
+			                 table.OutOfBounds() != 0u ||
+			                 uint64_t {indirect.table_offset} + descriptor_bytes > table.Stride()))) {
+				return SpecializationFail(
+				    fmt::format("indexed table stride={} records={} offset={} has unsupported layout",
+				                table.Stride(), table.NumRecords(), indirect.table_offset));
+			}
+			// Shader U32 arithmetic wraps; the scalar memory immediate is added without wrapping.
+			const auto step = scalar ? std::gcd<uint64_t>(indirect.table_stride, uint64_t {1} << 32u)
+			                         : table.Stride();
+			const uint64_t first = scalar ? uint64_t {indirect.table_offset % step} + indirect.table_immediate
+			                              : indirect.table_offset;
+			const auto count = table_size > first ? (table_size - 1u - first) / step + 1u : 0u;
+			if (count > MaxIndexedImageProbes) {
+				return SpecializationFail(fmt::format(
+				    "indexed image table needs {} probes; limit is {}", count, MaxIndexedImageProbes));
+			}
+			keys.reserve(count + 1u);
+			for (uint64_t offset = first; offset < table_size; offset += step)
+				keys.push_back(static_cast<uint32_t>(offset));
+			keys.push_back(UINT32_MAX);
+			if (step == table.Stride() && first + descriptor_bytes <= step) batch_stride = step;
+		} else if (indirect.material_source == UINT32_MAX) {
 			uint32_t key_count = 0;
 			if (indirect.workgroup_axis != UINT32_MAX) {
 				if (indirect.workgroup_axis >= runtime.workgroup_counts.size()) return false;
@@ -376,6 +408,11 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 	const auto mapping_offset = snapshot.flattened_srt.size();
 	const auto root_resource  = specializations[resource_index];
 	const auto key_count = sources.empty() ? keys.size() : sources.size();
+	auto& ordinals = program.descriptor_ordinals;
+	ordinals.clear();
+	if (key_count > ordinals.bucket_count() * ordinals.max_load_factor()) ordinals.reserve(key_count);
+	auto& words = program.descriptor_words;
+	uint32_t batch_entry = 0, batch_count = 0;
 	snapshot.flattened_srt.resize(mapping_offset + 1u + key_count * 2u);
 	snapshot.flattened_srt[mapping_offset] = static_cast<uint32_t>(key_count);
 	for (uint32_t entry = 0; entry < key_count; ++entry) {
@@ -384,23 +421,37 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 		candidate.dword_count = dword_count;
 		if (sources.empty()) {
 			const auto table_offset =
+			    indirect.indexed_table ? key :
 			    static_cast<uint32_t>(key * indirect.table_stride) + indirect.table_offset;
-			if (!ReadScalarTable(table_base, table_size, table_offset, runtime,
-			                     std::span(candidate.dwords).first(dword_count))) {
-				return false;
+			if (!(indirect.indexed_table && key == UINT32_MAX)) {
+				if (batch_stride != 0u) {
+					if (entry == batch_entry + batch_count) {
+						batch_entry = entry;
+						batch_count = static_cast<uint32_t>(std::min<uint64_t>(
+						    (DescriptorReadBatchBytes - descriptor_bytes) / batch_stride + 1u,
+						    key_count - 1u - entry));
+						words.resize((batch_count - 1u) * batch_stride / sizeof(uint32_t) + dword_count);
+						if (!ReadScalarTable(table_base, table_size, key, runtime, words)) return false;
+					}
+					std::copy_n(words.begin() + (entry - batch_entry) * batch_stride / sizeof(uint32_t),
+					            dword_count, candidate.dwords.begin());
+				} else if (!ReadScalarTable(table_base, table_size, table_offset, runtime,
+				                            std::span(candidate.dwords).first(dword_count))) {
+					return false;
+				}
 			}
 		} else if (!clean.EvaluateDescriptor(sources[entry], candidate)) {
 			return false;
 		}
 		if (!normalize(candidate)) return false;
 		uint32_t ordinal = 0;
-		if (entry == 0) {
+		if (entry == 0 && !indirect.indexed_table) {
 			descriptors[resource_index] = candidate;
 		} else if (descriptors[resource_index] != candidate) {
-			const auto found =
-			    std::find(descriptors.begin() + children_begin, descriptors.end(), candidate);
-			ordinal = static_cast<uint32_t>(found - descriptors.begin() - children_begin + 1u);
-			if (found == descriptors.end()) {
+			const auto [found, inserted] = ordinals.try_emplace(
+			    candidate, static_cast<uint32_t>(descriptors.size() - children_begin + 1u));
+			ordinal = found->second;
+			if (inserted) {
 				if (descriptors.size() >= maximum_resources) {
 					return false;
 				}
@@ -1026,7 +1077,8 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		if (!source.indirect_descriptor.has_value()) continue;
 		const auto& indirect                = *source.indirect_descriptor;
 		plan.requires_specialization_memory = true;
-		capture_indirect_reads |= indirect.material_source != UINT32_MAX || !indirect.sources.empty();
+		capture_indirect_reads |= indirect.indexed_table || indirect.material_source != UINT32_MAX ||
+		                          !indirect.sources.empty();
 		MarkCleanFlatSlots(plan, Source(plan, indirect.material_source), plan.clean_flat_slots,
 		                   indirect.selector_mask);
 		MarkCleanFlatSlots(plan, nullptr, plan.clean_flat_slots, indirect.selector_first);

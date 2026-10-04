@@ -19,6 +19,7 @@
 #include <memory>
 #include <optional>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -491,6 +492,8 @@ struct DescriptorSource {
 		uint32_t selector_stride = 0;
 		uint32_t selector_offset = 0;
 		uint32_t table_offset    = 0;
+		uint32_t table_immediate = 0;
+		bool     indexed_table   = false;
 		uint32_t table_stride    = 0;
 		uint32_t workgroup_axis  = UINT32_MAX;
 		uint32_t selector_shift  = 0;
@@ -588,7 +591,16 @@ struct ResourcePlan {
 	bool                                resource_tracking_complete = false;
 	ShaderInfo                          info;
 	UniformFillPlan                     uniform_fill;
-	// GPU-thread scratch for nested clean/EXEC memos, activity and material keys.
+	struct DescriptorHash {
+		size_t operator()(const DescriptorValue& value) const {
+			size_t hash = value.dword_count;
+			for (const auto word: value.dwords) {
+				hash ^= word + static_cast<size_t>(0x9e3779b97f4a7c15ull) + (hash << 6u) + (hash >> 2u);
+			}
+			return hash;
+		}
+	};
+	// GPU-thread scratch for nested clean/EXEC memos, activity and descriptor tables.
 	mutable std::deque<EvaluationContext> evaluation_contexts;
 	mutable uint32_t                       evaluation_value_count = 0;
 	mutable uint32_t                       evaluation_depth       = 0;
@@ -596,6 +608,8 @@ struct ResourcePlan {
 	mutable std::vector<uint8_t>            visited_blocks;
 	mutable std::vector<uint32_t>           pending_blocks;
 	mutable std::vector<uint32_t>           material_keys;
+	mutable std::vector<uint32_t>           descriptor_words;
+	mutable std::unordered_map<DescriptorValue, uint32_t, DescriptorHash> descriptor_ordinals;
 };
 
 struct Program: ResourcePlan {

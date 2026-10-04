@@ -101,6 +101,16 @@ struct Fixture {
                 MemoryFlags{0, pc});
   }
 
+  Value UserDataBuffer() {
+    return Buffer({UserData(0), UserData(1), UserData(2), UserData(3)});
+  }
+
+  Value GlobalInvocationId() {
+    return Emit(ValueOpcode::GetBuiltin,
+                {Value(static_cast<uint32_t>(StageInputKind::GlobalInvocationId)),
+                 Value(0u)});
+  }
+
   Value Address(Value low, Value high, uint32_t pc = 0) {
     return Emit(ValueOpcode::GetAddressResource, {low, high},
                 MemoryFlags{0, pc});
@@ -124,6 +134,24 @@ struct Fixture {
                 {Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
                  Value(0u), Value(0u), Value(0u), Value(0u), Value(0u),
                  Value(0u), Value(0u), Value(0u)});
+  }
+
+  Value ScalarImage(Value table, Value offset, uint32_t immediate, uint32_t pc) {
+    std::array<Value, 8> words;
+    for (uint32_t word = 0; word < words.size(); ++word) {
+      MemoryInfo memory;
+      memory.kind = ResourceKind::ScalarBuffer;
+      memory.offset = immediate + word * 4u;
+      words[word] = Emit(ValueOpcode::ReadConstBuffer, {table, offset}, AddMemory(memory, pc));
+    }
+    return Image(words);
+  }
+
+  Value SampleImage(Value image, Value sampler, uint32_t pc) {
+    MemoryInfo memory;
+    memory.kind = ResourceKind::Image;
+    memory.image_dimension = Decoder::ImageDimension::Dim2D;
+    return Emit(ValueOpcode::ImageSampleRaw, {image, sampler, ImageAddress()}, AddMemory(memory, pc));
   }
 
   void PlanAndTrack() {
@@ -281,16 +309,306 @@ MakeIndirectImageFixture(bool malformed, uint32_t material_immediate = 4,
   const auto image = fixture->Image(image_words, 0x10f0);
   const auto sampler =
       fixture->Sampler({Value(0u), Value(0u), Value(0u), Value(0u)}, 0x10f0);
-  MemoryInfo sample;
-  sample.kind = ResourceKind::Image;
-  sample.image_dimension = Decoder::ImageDimension::Dim2D;
-  const auto sampled = fixture->Emit(ValueOpcode::ImageSampleRaw,
-                                     {image, sampler, fixture->ImageAddress()},
-                                     fixture->AddMemory(sample, 0x10f0));
+  const auto sampled = fixture->SampleImage(image, sampler, 0x10f0);
   const auto sampled_x =
       fixture->Emit(ValueOpcode::CompositeExtractU32x4, {sampled, Value(0u)});
   fixture->Emit(ValueOpcode::ReferenceU32, {sampled_x});
   return fixture;
+}
+
+std::array<uint32_t, 8> MakeTestImageDescriptor() {
+  return {0x20u,
+          static_cast<uint32_t>(Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float) << 20u,
+          3u | (3u << 14u),
+          Libs::Graphics::DstSel(4, 5, 6, 7) |
+              (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u)};
+}
+
+uint32_t ImageOrdinal(const ResourceSnapshot &snapshot,
+                      const ResourceSpecialization &specialization, uint32_t key) {
+  const auto mapping = specialization.images[0].indirect_mapping_offset;
+  for (uint32_t entry = 0; entry < snapshot.flattened_srt[mapping]; ++entry) {
+    if (snapshot.flattened_srt[mapping + 1u + entry * 2u] == key)
+      return snapshot.flattened_srt[mapping + 2u + entry * 2u];
+  }
+  return UINT32_MAX;
+}
+
+void TestIndexedScalarImageTable() {
+  for (const uint32_t immediate : {0u, 16u, 1u, 4u, 32u}) {
+    Fixture fixture;
+    const auto table = fixture.UserDataBuffer();
+    const auto invocation = fixture.GlobalInvocationId();
+    const auto key = fixture.Emit(ValueOpcode::ReadFirstLane, {invocation, Value(true)});
+    const auto scaled = fixture.Emit(ValueOpcode::IMul32, {key, Value(48u)});
+    const auto offset = fixture.Emit(
+        ValueOpcode::IAdd32, {scaled, Value(16u - immediate)});
+    const auto image = fixture.ScalarImage(table, offset, immediate, 0x834u);
+    fixture.Emit(ValueOpcode::ReferenceU32, {image.ResolveInstruction()->Arg(7)});
+    const auto sampler = fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)});
+    fixture.SampleImage(image, sampler, 0x840u);
+    if (immediate == 1u) {
+      CheckFatal([&] { fixture.PlanAndTrack(); }, "not a valid runtime value",
+                 "scalar offsets were combined before aligning their components");
+      continue;
+    }
+    fixture.PlanAndTrack();
+    Check(fixture.program.srt_reads.empty(),
+          "GPU scalar record index was incorrectly evaluated on the host");
+    const auto source = fixture.program.info.images[0].source;
+    const auto &indirect = *fixture.program.descriptor_sources[source].indirect_descriptor;
+    Check(indirect.indexed_table && indirect.table_stride == 48u &&
+              indirect.table_offset == 16u - immediate &&
+              indirect.table_immediate == immediate,
+          "scalar strided image table was not tracked");
+    Check(!fixture.program.memory_info[7].planning_only,
+          "indexed fallback discarded a live scalar descriptor read");
+    auto plan = ExtractResourcePlan(fixture.program);
+    EliminateDeadCode(fixture.program.blocks);
+    ValidateProgram(fixture.program, true);
+    std::array<uint32_t, 4> user_data{0x1000u, 64u << 16u, 2u, 0u};
+    LinearTestMemory memory;
+    const auto descriptor = MakeTestImageDescriptor();
+    std::copy(descriptor.begin(), descriptor.end(), memory.words.begin() + 32u / 4u);
+    SrtRuntime runtime{.user_data = user_data, .userdata = &memory,
+                       .read_specialization_memory = ReadLinearTestMemory};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              snapshot.images.size() == 2u &&
+              ImageOrdinal(snapshot, specialization, 32u) == 1u,
+          "scalar indexed table failed to materialize without evaluating its GPU key");
+    scaled.ResolveInstruction()->SetArg(0, Value(0xaaaaaaabu));
+    uint32_t wrapped_offset = 0;
+    Check(SrtWalker(fixture.program, runtime)
+                  .Evaluate(image.ResolveInstruction()->Arg(0), wrapped_offset) &&
+              wrapped_offset == 32u,
+          "scalar image key lost U32 multiplication wraparound");
+    if (immediate != 0u) {
+      Check(ImageOrdinal(snapshot, specialization, 0u) == UINT32_MAX,
+            "scalar table probed below its memory immediate");
+    }
+    scaled.ResolveInstruction()->SetArg(0, Value(0x55555555u));
+    uint32_t overflow_offset = 0;
+    Check(SrtWalker(fixture.program, runtime)
+                  .Evaluate(image.ResolveInstruction()->Arg(0), overflow_offset) &&
+              overflow_offset == (immediate == 0u ? 0u : UINT32_MAX),
+          "scalar memory immediate wrapped like shader U32 arithmetic");
+  }
+}
+
+void TestIndexedVectorImageTable() {
+  enum class Pattern { Valid, MissingEquality, InactiveLoad, SplitIndex, SplitLane, SplitOffset };
+  for (const auto pattern : {Pattern::Valid, Pattern::MissingEquality, Pattern::InactiveLoad,
+                             Pattern::SplitIndex, Pattern::SplitLane, Pattern::SplitOffset}) {
+    Fixture fixture;
+    auto *sample = fixture.AddBlock();
+    fixture.block->AddBranch(sample);
+    const auto index = fixture.GlobalInvocationId();
+    const auto active = fixture.Emit(ValueOpcode::ULessThan32, {index, Value(32u)});
+    const auto table = fixture.UserDataBuffer();
+    std::array<Value, 8> words;
+    auto guard = active;
+    for (uint32_t half = 0; half < 2; ++half) {
+      MemoryInfo memory;
+      memory.kind = ResourceKind::Buffer;
+      memory.idxen = true;
+      memory.data_dwords = 4;
+      memory.offset = 16u + half * 16u;
+      if (pattern == Pattern::SplitOffset && half == 1u) memory.offset += 4u;
+      const auto record = pattern == Pattern::SplitIndex && half == 1u
+          ? fixture.Emit(ValueOpcode::IAdd32, {index, Value(1u)}) : index;
+      const auto enabled = pattern == Pattern::InactiveLoad ? Value(false) : active;
+      const auto read =
+          fixture.Emit(ValueOpcode::LoadBufferU32x4,
+                       {table, record, Value(0u), Value(0u), enabled},
+                       fixture.AddMemory(memory, 0x854u + half * 8u));
+      for (uint32_t component = 0; component < 4; ++component) {
+        const uint32_t word = half * 4 + component;
+        const auto local =
+            fixture.Emit(ValueOpcode::SelectU32,
+                         {active,
+                          fixture.Emit(ValueOpcode::CompositeExtractU32x4,
+                                       {read, Value(component)}),
+                          Value(0u)});
+        const auto lane = pattern == Pattern::SplitLane && word == 7u ? 1u : 0u;
+        words[word] = fixture.Emit(ValueOpcode::ReadLane, {local, Value(lane)});
+        if (pattern != Pattern::MissingEquality || word != 7u) {
+          guard = fixture.Emit(ValueOpcode::LogicalAnd,
+                               {guard, fixture.Emit(ValueOpcode::IEqual32,
+                                                    {local, words[word]})});
+        }
+      }
+    }
+    fixture.program.block_info[0].condition = guard;
+    fixture.program.block_info[0].terminator = {
+        .kind = Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::
+            ConditionalBranch,
+        .true_block = 1u,
+        .false_block = 2u};
+    auto *exit = fixture.AddBlock();
+    fixture.block->AddBranch(exit);
+    fixture.block = sample;
+    const auto image = fixture.Image(words);
+    const auto sampler = fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)});
+    fixture.SampleImage(image, sampler, 0x904u);
+    if (pattern != Pattern::Valid) {
+      CheckFatal([&] { fixture.PlanAndTrack(); }, "not a valid runtime value",
+                 "incomplete indexed descriptor proof was accepted");
+      continue;
+    }
+    fixture.PlanAndTrack();
+    Check(fixture.program.info.buffers.size() == 1 &&
+              fixture.program.info.images.size() == 1,
+          "indexed image lost its buffer or image resource");
+    const auto source = fixture.program.info.images[0].source;
+    Check(fixture.program.descriptor_sources[source]
+                  .indirect_descriptor->indexed_table &&
+              image.ResolveInstruction()
+                      ->Arg(0)
+                      .ResolveInstruction()
+                      ->GetOpcode() == ValueOpcode::SelectU32 &&
+              !fixture.program.memory_info[0].planning_only,
+          "indexed image did not retain the lane's record index and vector "
+          "loads");
+    auto plan = ExtractResourcePlan(fixture.program);
+    EliminateDeadCode(fixture.program.blocks);
+    ValidateProgram(fixture.program, true);
+    std::array<uint32_t, 4> user_data{0x1000u, 48u << 16u, 3u, 0u};
+    LinearTestMemory memory;
+    const auto descriptor = MakeTestImageDescriptor();
+    for (uint32_t record = 0; record < 3u; ++record) {
+      std::copy(descriptor.begin(), descriptor.end(),
+                memory.words.begin() + (16u + record * 48u) / 4u);
+    }
+    memory.words[(16u + 48u) / 4u] ^= 1u;
+    SrtRuntime runtime{.user_data = user_data,
+                       .userdata = &memory,
+                       .read_specialization_memory = ReadLinearTestMemory};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              snapshot.images.size() == 3,
+          "strided vector descriptor table failed to materialize");
+    Check(ImageOrdinal(snapshot, specialization, 16u) == 1u &&
+              ImageOrdinal(snapshot, specialization, 64u) == 2u &&
+              ImageOrdinal(snapshot, specialization, 112u) == 1u &&
+              ImageOrdinal(snapshot, specialization, UINT32_MAX) == 0u,
+          "duplicate indexed descriptors did not share their image ordinal");
+    Check(snapshot.flattened_srt[specialization.images[0].indirect_mapping_offset] == 4u,
+          "vector table mapping lost a record or its null sentinel");
+    index.ResolveInstruction()->ReplaceUsesWith(Value(0xaaaaaaabu));
+    uint32_t invalid_offset = 0;
+    Check(
+        SrtWalker(fixture.program, runtime)
+                .Evaluate(image.ResolveInstruction()->Arg(0), invalid_offset) &&
+            invalid_offset == UINT32_MAX,
+        "out-of-range vector index wrapped onto a valid image");
+    for (const auto &layout : {
+             std::array{0x1000u, 0u, 3u, 0u},
+             std::array{0x1000u, 16u << 16u, 3u, 0u},
+             std::array{0x1000u, 49u << 16u, 3u, 0u},
+             std::array{0x1000u, (48u << 16u) | 0x80000000u, 3u, 0u},
+             std::array{0x1000u, 48u << 16u, 3u, 1u << 23u},
+             std::array{0x1000u, 48u << 16u, 3u, 1u << 28u},
+             std::array{0x1000u, 48u << 16u, 3u, 2u << 28u},
+             std::array{0x1000u, 48u << 16u, 3u, 3u << 28u},
+             std::array{0x1000u, 48u << 16u, 3u, 1u << 30u},
+             std::array{0x1001u, 48u << 16u, 3u, 0u}}) {
+      user_data = layout;
+      Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+            "unsupported indexed vector descriptor layout was accepted");
+    }
+  }
+}
+
+void TestIndexedImageReadBatches() {
+  Fixture fixture;
+  const auto table = fixture.UserDataBuffer();
+  const auto index = fixture.GlobalInvocationId();
+  const auto offset = fixture.Emit(
+      ValueOpcode::IAdd32,
+      {fixture.Emit(ValueOpcode::IMul32, {index, Value(64u)}), Value(16u)});
+  const auto image = fixture.ScalarImage(table, offset, 0u, 0x834u);
+  const auto sampler = fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)});
+  fixture.SampleImage(image, sampler, 0x840u);
+  fixture.PlanAndTrack();
+  auto plan = ExtractResourcePlan(fixture.program);
+  Check(plan.capture_specialization_reads,
+        "indexed table reads bypassed write-overlap tracking");
+  fixture.program.has_address_writes = true;
+  Check(!ExtractResourcePlan(fixture.program).resource_tracking_complete,
+        "indexed descriptors accepted unbounded shader address writes");
+  LinearTestMemory memory;
+  constexpr uint32_t records = 1025u;
+  memory.words.resize(records * 64u / sizeof(uint32_t));
+  auto descriptor = MakeTestImageDescriptor();
+  const auto write_descriptor = [&](uint32_t offset) {
+    std::copy(descriptor.begin(), descriptor.end(), memory.words.begin() + offset / sizeof(uint32_t));
+  };
+  for (uint32_t record = 0; record < records; ++record) {
+    if (record == 1u) continue;
+    descriptor[7] = record == records - 1u ? 1u : record + 1u;
+    write_descriptor(record * 64u + 16u);
+  }
+  descriptor[7] = records;
+  std::array<uint32_t, 4> user_data{0x1000u, 64u << 16u, records, 0u};
+  const SrtRuntime runtime{.user_data = user_data, .userdata = &memory,
+                           .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  const auto refresh = [&] {
+    return MaterializeResources(plan, runtime, snapshot, specialization);
+  };
+  Check(refresh() && snapshot.images.size() == records - 1u,
+        "large indexed table lost distinct descriptor words or duplicated images");
+  Check(memory.reads == 2u && snapshot.specialization_reads.size() == 2u &&
+            snapshot.specialization_reads.front().first == memory.base + 16u &&
+            snapshot.specialization_reads.back().second == 32u &&
+            snapshot.specialization_reads.back().first +
+                    snapshot.specialization_reads.back().second ==
+                memory.base + memory.words.size() * sizeof(uint32_t) - 16u,
+        "descriptor batching exceeded its table or issued one read per record");
+  for (const auto &read : snapshot.specialization_reads) {
+    Check(read.second <= 65536u, "descriptor read batch exceeded its scratch bound");
+  }
+  Check(ImageOrdinal(snapshot, specialization, 16u) == 1u &&
+            ImageOrdinal(snapshot, specialization, 80u) == 0u &&
+            ImageOrdinal(snapshot, specialization, 144u) == 2u &&
+            ImageOrdinal(snapshot, specialization, (records - 1u) * 64u + 16u) == 1u &&
+            ImageOrdinal(snapshot, specialization, UINT32_MAX) == 0u,
+        "hashed descriptors lost deterministic ordinals or the null sentinel");
+  memory.fail_address = memory.base + 1024u * 64u + 16u;
+  Check(!refresh(), "failed descriptor read batch was accepted");
+  memory.fail_address = UINT64_MAX;
+  std::fill(memory.words.begin(), memory.words.end(), 0u);
+  Check(refresh() && snapshot.images.size() == 1u,
+        "descriptor refresh retained stale images");
+  write_descriptor(16u);
+  user_data[2] = 1u;
+  Check(refresh() && snapshot.images.size() == 2u && ImageOrdinal(snapshot, specialization, 16u) == 1u,
+        "descriptor refresh reused an ordinal from the previous table");
+  auto boundary_runtime = runtime;
+  boundary_runtime.read_specialization_memory =
+      +[](void *userdata, uint64_t, std::span<uint32_t> words) {
+        ++static_cast<LinearTestMemory *>(userdata)->reads;
+        std::fill(words.begin(), words.end(), 0u);
+        return true;
+      };
+  user_data[2] = 262144u;
+  memory.reads = 0u;
+  Check(MaterializeResources(plan, boundary_runtime, snapshot, specialization) &&
+            memory.reads == 256u && snapshot.images.size() == 1u,
+        "indexed image scan rejected its exact probe limit or read the null sentinel");
+  ++user_data[2];
+  memory.reads = 0u;
+  Check(!MaterializeResources(plan, boundary_runtime, snapshot, specialization) &&
+            memory.reads == 0u,
+        "indexed image scan read beyond its probe limit");
+  user_data[2] = 67108865u;
+  Check(!MaterializeResources(plan, boundary_runtime, snapshot, specialization) &&
+            memory.reads == 0u,
+        "indexed image keys wrapped a table larger than their U32 address range");
 }
 
 void TestInvariantIndirectImageMaterialization() {
@@ -324,17 +642,7 @@ void TestInvariantIndirectImageMaterialization() {
   std::array<uint32_t, 9> user_data{0x1000u,    224u << 16u, 2u, 0u, 0x2000u,
                                     16u << 16u, 4u,          0u, 7u};
   LinearTestMemory memory;
-  std::array<uint32_t, 8> image_descriptor{};
-  image_descriptor[0] = 0x20u;
-  image_descriptor[1] =
-      static_cast<uint32_t>(
-          Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float)
-      << 20u;
-  image_descriptor[2] = 3u | (3u << 14u);
-  image_descriptor[3] =
-      Libs::Graphics::DstSel(4, 5, 6, 7) |
-      (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D)
-       << 28u);
+  const auto image_descriptor = MakeTestImageDescriptor();
   for (uint32_t dword = 0; dword < image_descriptor.size(); dword++) {
     memory.words[(0x2000u - memory.base) / 4u + dword] =
         image_descriptor[dword];
@@ -555,9 +863,14 @@ void TestInvariantIndirectImageMaterialization() {
         "malformed indirect image pattern was partially accepted");
 
   auto negative_immediate = MakeIndirectImageFixture(false, 0xfffffffcu);
-  CheckFatal([&] { negative_immediate->PlanAndTrack(); },
-             "not a valid runtime value",
-             "negative scalar immediate entered the indirect image proof");
+  negative_immediate->PlanAndTrack();
+  const auto &negative_image = negative_immediate->program.info.images.front();
+  const auto &negative_source =
+      negative_immediate->program.descriptor_sources[negative_image.source];
+  Check(negative_source.indirect_descriptor &&
+            negative_source.indirect_descriptor->indexed_table &&
+            negative_source.indirect_descriptor->material_source == UINT32_MAX,
+        "negative scalar immediate entered the indirect material proof");
 
   for (const auto [immediate, member, first, stride] :
        {std::array{0u, 4u, 4u, 224u}, std::array{4u, 4u, 8u, 224u},
@@ -617,8 +930,15 @@ void TestInvariantIndirectImageMaterialization() {
         "unreadable in-range DWORD in a 48-byte descriptor record was accepted");
   auto overflowing = MakeIndirectImageFixture(false, 60u, false, 0u, 64u,
                                                UINT32_MAX, 48u, 16u);
-  CheckFatal([&] { overflowing->PlanAndTrack(); }, "not a valid runtime value",
-             "unbounded table offset conflated shader U32 wrap with scalar immediate addition");
+  overflowing->PlanAndTrack();
+  const auto &overflow_image = overflowing->program.info.images.front();
+  const auto &overflow_source =
+      overflowing->program.descriptor_sources[overflow_image.source];
+  Check(overflow_source.indirect_descriptor &&
+            overflow_source.indirect_descriptor->indexed_table &&
+            overflow_source.indirect_descriptor->table_stride == 48u &&
+            overflow_source.indirect_descriptor->table_immediate == 16u,
+        "unbounded table offset conflated shader U32 wrap with scalar immediate addition");
 }
 
 void TestGuardedDirectImageTable() {
@@ -3637,6 +3957,9 @@ int main() {
     Run("gather LOD sampler validation", TestGatherLodSamplerValidation);
     Run("dynamic storage mips", TestDynamicStorageMipTracking);
     Run("invariant indirect images", TestInvariantIndirectImageMaterialization);
+    Run("indexed scalar image table", TestIndexedScalarImageTable);
+    Run("indexed vector image table", TestIndexedVectorImageTable);
+    Run("indexed image read batches", TestIndexedImageReadBatches);
     Run("guarded direct image table", TestGuardedDirectImageTable);
     Run("bounded compute image loop", TestBoundedComputeImageLoop);
     Run("uniformized material image keys", TestUniformizedMaterialImageKeys);

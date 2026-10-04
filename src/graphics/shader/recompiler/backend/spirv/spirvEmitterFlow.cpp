@@ -580,8 +580,13 @@ void EmitBarrier(EmitterState& state) {
 		// Independent graphics invocations have no native workgroup left to synchronize.
 		return;
 	}
-	const auto memory_scope = tessellation ? spv::ScopeInvocation : spv::ScopeWorkgroup;
-	const auto semantics    = tessellation ? spv::MemorySemanticsMaskNone
+	// A tessellation control barrier has to publish the control-point outputs the other invocations
+	// of the patch read back, which takes workgroup memory scope and OutputMemory semantics (what
+	// GLSL's barrier() emits there). With invocation scope and no semantics the barrier only
+	// synchronizes execution and the reads race the writes.
+	const auto memory_scope = spv::ScopeWorkgroup;
+	const auto semantics    = tessellation ? spv::MemorySemanticsAcquireReleaseMask |
+	                                             spv::MemorySemanticsOutputMemoryMask
 	                                       : spv::MemorySemanticsAcquireReleaseMask |
 	                                             spv::MemorySemanticsWorkgroupMemoryMask;
 	state.builder.AddFunction(spv::OpControlBarrier, ConstantU32(state, spv::ScopeWorkgroup),

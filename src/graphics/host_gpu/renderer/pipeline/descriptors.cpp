@@ -118,7 +118,9 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 
 	const auto& [address, size, id] = source;
 	if (address == 0 || size == 0) {
-		return {context.GetBufferCache().GetBuffer(NULL_BUFFER_ID).Handle(), 0, 16};
+		buffer_offset = ShaderRecompiler::IR::NullBufferByteOffset;
+		return {context.GetBufferCache().GetBuffer(NULL_BUFFER_ID).Handle(), 0,
+		        ShaderRecompiler::IR::NullBufferRange};
 	}
 	const auto& graphics  = context.GetGraphics();
 	const auto  alignment = graphics.StorageMinAlignment();

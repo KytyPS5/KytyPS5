@@ -2860,10 +2860,15 @@ private:
 		return true;
 	}
 
-	uint32_t AddBuffer(uint32_t source, const MemoryInfo& memory, ValueOpcode op, uint32_t pc) {
+	uint32_t AddBuffer(uint32_t source, const MemoryInfo& memory, const Inst& inst, uint32_t pc) {
+		const auto op    = inst.GetOpcode();
+		const auto index = inst.NumArgs() > 1 ? inst.Arg(1).Resolve() : Value(0u);
+		const bool indexed =
+		    op != ValueOpcode::ReadConstBuffer && !(index.IsImmediate() && index.U32() == 0u);
 		for (uint32_t i = 0; i < m_info.buffers.size(); i++) {
 			if (m_info.buffers[i].source == source) {
 				Merge(m_info.buffers[i], memory, op, pc);
+				m_info.buffers[i].unindexed = m_info.buffers[i].unindexed && !indexed;
 				return i;
 			}
 		}
@@ -2873,6 +2878,7 @@ private:
 		BufferResource resource;
 		resource.source       = source;
 		resource.first_use_pc = pc;
+		resource.unindexed    = !indexed;
 		Merge(resource, memory, op, pc);
 		m_info.buffers.push_back(resource);
 		return static_cast<uint32_t>(m_info.buffers.size() - 1);
@@ -3089,7 +3095,16 @@ private:
 				source = indirect->source;
 				m_applied_indirect_buffers.insert(root);
 			}
-			resource = AddBuffer(source, memory, op, flags.pc);
+			// A descriptor materialization named as unprovable is decoded in the shader on rebuild.
+			if (handle != nullptr && !m_applied_indirect_buffers.contains(handle) &&
+			    std::ranges::find(m_program.unfoldable_pcs, flags.pc) !=
+			        m_program.unfoldable_pcs.end() &&
+			    CarriesLoopPhi(*handle) &&
+			    (TakeDynamicBuffer(handle, memory, flags.index, buffer, flags.pc) ||
+			     take_indirect_load())) {
+				return true;
+			}
+			resource = AddBuffer(source, memory, inst, flags.pc);
 			if (resource == UINT32_MAX) {
 				return Reject(flags.pc, "buffer resource limit exceeded");
 			}

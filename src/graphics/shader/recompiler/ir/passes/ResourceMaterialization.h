@@ -1,8 +1,10 @@
 #ifndef EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_RESOURCEMATERIALIZATION_H_
 #define EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_RESOURCEMATERIALIZATION_H_
 
-#include <string_view>
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
+
+#include <span>
+#include <string_view>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
@@ -14,11 +16,11 @@ struct ResourceSpecialization {
 		Prospero::BufferFormat descriptor_format               = Prospero::BufferFormat::kInvalid;
 		uint32_t               descriptor_swizzle              = DstSel(4, 5, 6, 7);
 		bool                   zero_stride_oob                 = false;
-		uint32_t               indirect_feedback_offset = BufferResource::NoIndirectFeedback;
+		uint32_t               indirect_feedback_offset        = BufferResource::NoIndirectFeedback;
 		uint32_t               indirect_feedback_keys          = 0;
-		uint32_t               indirect_root              = BufferResource::NoIndirectBuffer;
-		uint32_t               indirect_mapping_offset    = 0;
-		uint32_t               indirect_search_iterations = 0;
+		uint32_t               indirect_root                   = BufferResource::NoIndirectBuffer;
+		uint32_t               indirect_mapping_offset         = 0;
+		uint32_t               indirect_search_iterations      = 0;
 		bool                   operator==(const Buffer&) const = default;
 	};
 
@@ -31,20 +33,24 @@ struct ResourceSpecialization {
 		uint32_t                      indirect_root              = ImageResource::NoIndirectImage;
 		uint32_t                      indirect_mapping_offset    = 0;
 		uint32_t                      indirect_search_iterations = 0;
-		uint32_t                      indirect_feedback_offset   = ImageResource::NoIndirectFeedback;
-		uint32_t                      indirect_feedback_keys     = 0;
-		bool                          cube                       = false;
-		bool                          fmask                      = false;
+		uint32_t                      indirect_feedback_offset = ImageResource::NoIndirectFeedback;
+		uint32_t                      indirect_feedback_keys   = 0;
+		bool                          cube                     = false;
+		bool                          fmask                    = false;
 		// A null candidate no key names, there only so its table always has an arm of this shape.
-		bool                          shape_padding              = false;
-		bool                          bindless                       = false;
-		bool                          operator==(const Image&) const = default;
+		bool shape_padding                  = false;
+		bool bindless                       = false;
+		bool operator==(const Image&) const = default;
 	};
 
 	std::vector<Buffer> buffers;
 	std::vector<Image>  images;
+	std::vector<bool>   unbound_buffers;
+	std::vector<bool>   unbound_images;
 
-	bool operator==(const ResourceSpecialization&) const = default;
+	bool operator==(const ResourceSpecialization& other) const {
+		return buffers == other.buffers && images == other.images;
+	}
 };
 
 // Extracts the descriptor/SRT value graph before resource specialization. The returned plan owns
@@ -62,7 +68,11 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 // Names the first field two specializations differ in, or nullptr when they match. Reporting
 // only, but it is what tells a redundant permutation apart from a genuinely new one.
 [[nodiscard]] const char* FirstSpecializationDifference(const ResourceSpecialization& before,
-                                                       const ResourceSpecialization& after);
+                                                        const ResourceSpecialization& after);
+[[nodiscard]] bool        SpecializationServes(const ResourceSpecialization& built,
+                                               const ResourceSpecialization& wanted);
+void InheritUnboundShapes(std::span<const ResourceSpecialization* const> donors,
+                          ResourceSpecialization&                        wanted);
 // False when the specialization does not describe this translation of the program.
 [[nodiscard]] bool ApplyResourceSpecialization(Program&                      program,
                                                const ResourceSpecialization& specialization);

@@ -866,16 +866,25 @@ struct PipelineCache::ProgramCache {
 				return {};
 			}
 			KYTY_PROFILER_BLOCK("ProgramCache permutation search");
-			if (const auto permutation = std::ranges::find_if(
-			        entry->second.permutations,
-			        [&](const Permutation& candidate) {
-				        const auto& layout = candidate.program.bindings;
-				        return layout.push_data_start_dword ==
-				                   ShaderRecompiler::IR::PushData::StartFor(
-				                       push_data_cursor, layout.ShaderDataDwords()) &&
-				               candidate.specialization == entry->second.specialization;
-			        });
-			    permutation != entry->second.permutations.end()) {
+			const auto search = [&](bool exact_start) {
+				return std::ranges::find_if(
+				    entry->second.permutations, [&](const Permutation& candidate) {
+					    const auto& layout = candidate.program.bindings;
+					    return (exact_start
+					                ? layout.push_data_start_dword ==
+					                      ShaderRecompiler::IR::PushData::StartFor(
+					                          push_data_cursor, layout.ShaderDataDwords())
+					                : ShaderRecompiler::IR::PushData::StartServes(
+					                      layout.push_data_start_dword, push_data_cursor)) &&
+					           ShaderRecompiler::IR::SpecializationServes(
+					               candidate.specialization, entry->second.specialization);
+				    });
+			};
+			auto permutation = search(true);
+			if (permutation == entry->second.permutations.end() && stage != ShaderType::Pixel) {
+				permutation = search(false);
+			}
+			if (permutation != entry->second.permutations.end()) {
 				input_info.stage = {.program   = &permutation->program,
 				                    .resources = &entry->second.resources};
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
@@ -995,9 +1004,18 @@ struct PipelineCache::ProgramCache {
 		// before the compile, because `options.unfoldable_pcs` is a span over `proven.pcs` and a
 		// rollback below rewrites that vector.
 		const bool channel_rebuild = !options.unfoldable_pcs.empty();
+		auto       specialization  = entry->second.specialization;
+		{
+			std::vector<const ShaderRecompiler::IR::ResourceSpecialization*> donors;
+			donors.reserve(entry->second.permutations.size());
+			for (const auto& built: entry->second.permutations) {
+				donors.push_back(&built.specialization);
+			}
+			ShaderRecompiler::IR::InheritUnboundShapes(donors, specialization);
+		}
 		entry->second.permutations.push_back(
 		    CompilePermutation(stage_name, options, std::move(translated),
-		                       entry->second.specialization, push_data_cursor));
+		                       std::move(specialization), push_data_cursor));
 		if (!entry->second.permutations.back().handle) {
 			auto rejected = std::move(entry->second.permutations.back());
 			entry->second.permutations.pop_back();
@@ -1054,7 +1072,7 @@ struct PipelineCache::ProgramCache {
 			const bool  start_matches =
 			    layout.push_data_start_dword == ShaderRecompiler::IR::PushData::StartFor(
 			                                        push_data_cursor, layout.ShaderDataDwords());
-			if (candidate.specialization == wanted) {
+			if (ShaderRecompiler::IR::SpecializationServes(candidate.specialization, wanted)) {
 				// Same module state, rejected only for where its push data starts.
 				push_data_only = true;
 				break;

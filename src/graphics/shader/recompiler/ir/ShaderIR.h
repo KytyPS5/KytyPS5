@@ -135,6 +135,7 @@ struct BufferResource {
 	bool                  atomic    = false;
 	bool                  formatted = false;
 	bool                  scalar    = false;
+	bool                  unindexed = false;
 
 	bool operator==(const BufferResource& other) const = default;
 };
@@ -434,7 +435,14 @@ struct PushData {
 	[[nodiscard]] static constexpr uint32_t StartFor(uint32_t cursor, uint32_t size) {
 		return CanFit(cursor, size) ? cursor : NoStart;
 	}
+	[[nodiscard]] static constexpr bool StartServes(uint32_t start, uint32_t cursor) {
+		return start == NoStart || start >= cursor;
+	}
 };
+
+// A null V# binds one dword at this offset, so every index lies past it: reads zero, writes drop.
+inline constexpr uint32_t NullBufferByteOffset = 252;
+inline constexpr uint32_t NullBufferRange      = 4;
 
 static_assert(sizeof(PushData) == 128);
 constexpr uint32_t NativePushConstantSize = sizeof(PushData);

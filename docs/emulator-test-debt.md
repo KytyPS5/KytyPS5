@@ -511,6 +511,11 @@ plus dead-branch elimination yields valid SPIR-V: 16-arm copies compile in
 copy (1711980 bytes) exceeds a 120 s probe bound. The 512-arm probe used about
 4.15 GB working set before its task-owned stop. These copies change selector
 semantics and are only a cost experiment, never game-path substitutions.
+A second diagnostic copy preserves all selector arms, values and access bodies
+while nesting switches into groups of at most 64 cases. It validates for
+Vulkan 1.3 but still exceeds a 120 s native pipeline-probe bound
+(`_Build/logs/cs8457-sharded64-equivalent-probe-20261004.log`). Do not adopt
+switch sharding alone as a claimed compiler fix.
 
 Before changing production lowering, add a synthetic RED for a bounded buffer
 table with many live candidate resources and an observable byte read and

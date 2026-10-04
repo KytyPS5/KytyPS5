@@ -27,6 +27,13 @@ committed/pushed source `9cc8261a`, installed executable SHA
   `_Build/logs/cs8457-switch{16,128,512}-diagnostic-probe-20261004.log`.
   The 512-candidate probe reached about 4.15 GB working set before its bounded
   stop. No task-owned processes remain.
+- A diagnostic-only **semantics-preserving** rewrite split every switch with
+  more than 64 cases into nested 64-case groups, keeping every arm, result Phi
+  and buffer operation. Vulkan 1.3 validation passed, but its native probe
+  also exceeded 120 s in `vkCreateComputePipelines`
+  (`_Build/logs/cs8457-sharded64-equivalent-probe-20261004.log`). Merely
+  reshaping the control-flow tree has no demonstrated benefit at this bound;
+  no production sharding was made and its task-owned probe was stopped.
 - Current next step: make a generic synthetic RED for bounded buffer-table
   read/subword-write lowering that detects repetition of the complete access
   body across candidate resources. Preserve candidate-specific stride, byte

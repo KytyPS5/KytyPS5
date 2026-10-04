@@ -219,6 +219,10 @@ bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor, bo
 	       descriptor.TileMode() == Prospero::TileMode::kDepth;
 }
 
+[[nodiscard]] static bool
+ValidateSampledDepthBinding(const ShaderRecompiler::IR::ImageResource& resource,
+                            const ShaderTextureResource& descriptor, const Image& image,
+                            vk::Format view_format, uint64_t size) {
 	const bool resource_ok = IsSupportedSampledDepthResource(resource);
 	// Comparison sampling changes the host format, not the guest metadata encoding.
 	const bool encoding_ok = descriptor.TileMode() != Prospero::TileMode::kDepth ||
@@ -241,9 +245,8 @@ bool IsSupportedDepthTextureEncoding(const ShaderTextureResource& descriptor, bo
 	     "guest_format=%u swizzle=0x%03x image_format=%d view_format=%d image_layers=%u "
 	     "descriptor_type=%u base_array=%u depth=%u descriptor_pitch=%u target_pitch=%u "
 	     "addr=0x%016" PRIx64 " size=0x%016" PRIx64
-	     resource_ok, encoding_ok, view_ok,
-	     static_cast<uint32_t>(resource.resource_class),
 	     " dwords=%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x%s\n",
+	     resource_ok, encoding_ok, view_ok, static_cast<uint32_t>(resource.resource_class),
 	     static_cast<uint32_t>(resource.numeric_class), static_cast<uint32_t>(resource.dimension),
 	     static_cast<uint32_t>(resource.mip_mode), resource.read, resource.written, resource.atomic,
 	     resource.depth_compare, static_cast<uint32_t>(descriptor.Format()),
@@ -673,8 +676,9 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		desc.info.metadata.range         = {descriptor.MetaAddr() << 8u, metadata_size.size};
 		desc.info.metadata.dcc_alpha_msb = descriptor.DccAlphaPos();
 	}
-	desc.view_info = TextureViewInfo(resource, descriptor, view_format, surface_format, storage,
 	bool view_refused = false;
+	desc.view_info    = TextureViewInfo(resource, descriptor, view_format, surface_format, storage,
+	                                    view_levels, desc.info.resources.layers, &view_refused);
 	if (view_refused) {
 		char repeat[32] = "";
 		if (ShouldReportTextureRefusal(address, desc.info.data.size, TextureRefusal::ViewInfo,
@@ -880,6 +884,9 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 			const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[resource]);
 			const auto address = descriptor.Base48();
 			auto size = descriptor.GetSize();
+			if (descriptor.Stride() != 0 || metadata.max_byte_extent < sizeof(uint32_t)) {
+				size = Common::AlignUp(size, sizeof(uint32_t));
+			}
 			if (size != 0 && descriptor.Stride() == 0 && descriptor.OutOfBounds() == 2 &&
 			    !metadata.scalar) {
 				// OOB_SELECT=2 only tests NumRecords != 0; a zero-stride fetch
@@ -894,7 +901,6 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 				if (program.info.buffers[resource].written) {
 					// Sentinel write ranges end before tables captured by any bound stage.
 					for (const auto* reader: stages) {
-						for (const auto [read_address, read_size]: reader->runtime->resources->specialization_reads) {
 						for (const auto [read_address, read_size]:
 						     reader->runtime->resources->ScalarReads()) {
 							if (read_size == 0) continue;
@@ -914,6 +920,10 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 			// Finite GPU descriptors can span sparse PRT holes; clamp only oversized/sentinel ranges.
 			if (size >= (uint64_t {1} << 30u) || descriptor.NumRecords() == UINT32_MAX) {
 				size = Libs::LibKernel::Memory::ClampRangeSize(address, size);
+					const auto  limit =
+					    uint64_t {
+					        graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange} -
+					    (graphics.StorageMinAlignment() - 1);
 							     reader->runtime->resources->ScalarReads()) {
 			if (size == 0) {
 				continue;
@@ -1028,7 +1038,6 @@ void RenderExecutor::AcquireStageImageViews(PreparedBindings& prepared) {
 	}
 }
 
-                                             std::span<RenderColorInfo> colors) {
 static constexpr uint32_t IMAGE_RESOLVE_PASSES = 4;
 
 void RenderExecutor::RebindImages(PreparedBindings& prepared) {
@@ -1066,6 +1075,7 @@ bool RenderExecutor::ResolveColorTargets(std::span<RenderColorInfo> colors) {
 }
 
 void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
+                                             std::span<RenderColorInfo>         colors) {
 	bool uses_dma        = false;
 	bool writes_dma      = false;
 	bool uses_image_heap = false;
@@ -1146,27 +1156,17 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		if (reads.empty()) continue;
 		for (const auto* writer: prepared_bindings) {
 			if (writer->runtime->program->has_address_writes) {
-				EXIT("scalar resource reads cannot be proven disjoint from shader address writes\n");
 			}
 		}
 		for (const auto [address, size]: reads) {
 			for (const auto id: m_bound_images) {
 				const auto* image = m_context.GetTextureCache().m_slot_images.try_get(id);
-				if (image == nullptr ||
-				    (!image->binding.shader_write && !image->binding.is_target)) continue;
-				for (const auto written: {image->info.data, image->info.stencil,
-				                          image->info.metadata.range}) {
-					if (written.size != 0 && ImageRangeOverlaps(address, size,
-					                                          written.address, written.size)) {
 						EXIT("scalar resource reads overlap an image or attachment write\n");
 					}
 				}
 			}
 			for (const auto* writer: prepared_bindings) {
 				const auto& program = *writer->runtime->program;
-				for (const auto& resource: program.info.buffers) {
-					if (!resource.written || resource.descriptor_index == UINT32_MAX) continue;
-					const auto& written = writer->buffer_sources[resource.descriptor_index];
 					// ADD_TID and swizzle move fixed-offset writes past write_extent.
 					const bool linear = (resource.packed_stride & ((1u << 14u) | (1u << 20u))) == 0u;
 					const auto written_size =

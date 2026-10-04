@@ -1,5 +1,34 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **4 октября 2026 года, 11:26 UTC** (native Windows via WSL;
+source fix `3eb16e4b`, branch `yotei-windows-bringup`):
+
+- Native game retry `_Build/runs/yotei-integrated-20261004-110636-presentfix-gpuav`
+  has finished. Same installed exe SHA-256
+  `81c2055bbe4efe823d5c407ccb39771bab42f8460dc5f1af583f2bf55b3297f6`.
+  First three CS549 variants reused cache in 45/35/177 ms; fourth completed
+  in 294965 ms, immediately followed by a 356345341-byte cache checkpoint.
+  CS `fc6f8c56eb7e168f` emitted 569553 words (formerly 775890), completed
+  in 327456 ms and immediately checkpointed 358485977 bytes. This verifies
+  the expensive-creation persistence fix in the original workload.
+- The run reached `shown=356`; numeric readback first nonzero is frame239
+  and continues into the 300s. Offscreen `window-1108.png` shows a loading
+  spinner. It exited `0x80000003` while creating ordinary CS
+  `d0c5556e1c26cb1c` (40239 words, cooperative=false, flags0). Windows
+  Application event1000 identifies `nvgpucomp64.dll` 32.0.16.1714,
+  offset0x589eb2. No DeviceLost is recorded; this is a compiler breakpoint
+  lead, not proof that the earlier graphics wave64 limitation is solved.
+  **Menu and gameplay PENDING.**
+- Current bounded capture retry is active:
+  `_Build/runs/yotei-integrated-20261004-112511-presentfix-gpuav`, PID39636,
+  driver `_Build/logs/d0c555-capture-driver-20261004.log`, timeout900 /
+  watchdog300. It uses the same installed build and stops upon saving the
+  target pre-driver SPIR-V. Resume/clean it before another build/GPU task.
+  Next: validate the captured module and actual Vulkan layout, then isolate
+  the compiler trigger with a bounded pipeline-only/synthetic regression.
+  Preserve guest work and resource bounds; no production patch for this new
+  blocker has been made. The prior run's process is gone.
+
 Checkpoint **4 октября 2026 года, 11:07 UTC** (native Windows via WSL;
 branch `yotei-windows-bringup`, pushed source fix `3eb16e4b`):
 

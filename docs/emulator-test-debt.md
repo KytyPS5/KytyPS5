@@ -1,5 +1,23 @@
 # Emulator regression test debt
 
+## Ordinary compute compiler breakpoint after heavy pipelines (2026-10-04; pending)
+
+Run `yotei-integrated-20261004-110636-presentfix-gpuav` completed the fourth
+CS549 variant in 294965 ms and CSfc6f in 327456 ms, with immediate driver-cache
+checkpoints after both. It reached shown356 and nonzero RGB from frame239;
+`window-1108.png` visibly shows a loading spinner. It then exited
+`0x80000003` at `vkCreateComputePipelines` for ordinary CS `d0c5556e1c26cb1c`
+(40239 words, cooperative=false, flags0). Windows Application event1000
+identifies `nvgpucomp64.dll` 32.0.16.1714, offset0x589eb2; the log does not
+record DeviceLost. This is a new compiler reproduction lead, not yet an
+emulator semantic defect or a valid synthetic RED.
+
+Next: capture the pre-driver SPIR-V without dispatching it, validate it, derive
+the actual descriptor/push layout, and use one bounded pipeline-only probe.
+Then isolate its trigger in a reusable synthetic ordinary compute fixture
+(the guest CFG has 3 loops / 36 blocks). Preserve BDA/resource bounds and
+errors. No production behavior change before a meaningful synthetic RED.
+
 ## Persist expensive driver pipeline compilation (2026-10-04; host policy proved)
 
 The warm run `yotei-integrated-20261004-104455-presentfix-gpuav` completed
@@ -19,8 +37,12 @@ batch every 16. Identity, validation-mode, instrumentation and revision selector
 also passed (`_Build/logs/driver-cache-*-green-20261004.log`). Native test exe
 SHA-256 `0ee283548160a3b22d6f86989960ef2481afaffee10ff94bf20cd29fa0ef5af9`.
 The first build had a missing test forward declaration; that build failure is
-not RED evidence. Original workload integration and persistence read-back remain
-pending. This improves repeat-run persistence, not shader semantics or menu rendering.
+not RED evidence. Original workload integration is now proved on source
+`3eb16e4b`: CS549's fourth variant completed in 294965 ms, immediately followed
+by a 356345341-byte checkpoint; CSfc6f completed in 327456 ms and immediately
+checkpointed 358485977 bytes in run `...-110636-presentfix-gpuav`. Subsequent
+read-back on a warm launch remains pending. This improves repeat-run persistence,
+not shader semantics or menu rendering.
 
 ## Cooperative pipeline scale after local SSA reuse (2026-10-04; pending)
 

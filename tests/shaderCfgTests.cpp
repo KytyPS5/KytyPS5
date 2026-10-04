@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvDriverSimplify.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
@@ -310,6 +311,14 @@ void CheckSpirvBinaryValidates(const std::vector<uint32_t> &binary) {
 
   if (!tools.Validate(binary)) {
     std::fprintf(stderr, "SPIR-V binary validation failed:\n%s\n",
+                 messages.c_str());
+    std::abort();
+  }
+  // The driver simplification of every module these tests build must validate too.
+  auto simplified = binary;
+  if (ShaderRecompiler::Spirv::SimplifyForDriver(simplified) &&
+      !tools.Validate(simplified)) {
+    std::fprintf(stderr, "driver-simplified SPIR-V validation failed:\n%s\n",
                  messages.c_str());
     std::abort();
   }
@@ -13188,6 +13197,232 @@ void TestTypedSpirvSerialization() {
                       0x80000000u);
 }
 
+// Guarded buffer/LDS loads are speculated; a guarded store and volatile load keep their branches.
+void TestDriverSimplifySpeculatesGuardedLoads() {
+  const char *text = R"(
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %main "main" %gid %buf %lds
+               OpExecutionMode %main LocalSize 64 1 1
+               OpDecorate %gid BuiltIn GlobalInvocationId
+               OpDecorate %arr ArrayStride 4
+               OpMemberDecorate %blk 0 Offset 0
+               OpDecorate %blk Block
+               OpDecorate %buf DescriptorSet 0
+               OpDecorate %buf Binding 0
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+        %u32 = OpTypeInt 32 0
+       %bool = OpTypeBool
+         %v3 = OpTypeVector %u32 3
+        %pv3 = OpTypePointer Input %v3
+        %gid = OpVariable %pv3 Input
+        %arr = OpTypeRuntimeArray %u32
+        %blk = OpTypeStruct %arr
+       %pblk = OpTypePointer StorageBuffer %blk
+        %buf = OpVariable %pblk StorageBuffer
+       %pu32 = OpTypePointer StorageBuffer %u32
+         %c0 = OpConstant %u32 0
+         %c1 = OpConstant %u32 1
+        %c64 = OpConstant %u32 64
+    %lds_arr = OpTypeArray %u32 %c64
+       %plds = OpTypePointer Workgroup %lds_arr
+        %lds = OpVariable %plds Workgroup
+      %pwu32 = OpTypePointer Workgroup %u32
+       %main = OpFunction %void None %fn
+      %entry = OpLabel
+          %g = OpLoad %v3 %gid
+          %x = OpCompositeExtract %u32 %g 0
+        %len = OpArrayLength %u32 %buf 0
+        %inb = OpULessThan %bool %x %len
+               OpSelectionMerge %m1 None
+               OpBranchConditional %inb %t1 %m1
+         %t1 = OpLabel
+         %p1 = OpAccessChain %pu32 %buf %c0 %x
+         %v1 = OpLoad %u32 %p1
+               OpBranch %m1
+         %m1 = OpLabel
+         %r1 = OpPhi %u32 %v1 %t1 %c0 %entry
+        %odd = OpBitwiseAnd %u32 %x %c1
+       %even = OpIEqual %bool %odd %c0
+               OpSelectionMerge %m2 None
+               OpBranchConditional %even %m2 %t2
+         %t2 = OpLabel
+         %p2 = OpAccessChain %pwu32 %lds %x
+         %v2 = OpLoad %u32 %p2
+               OpBranch %m2
+         %m2 = OpLabel
+         %r2 = OpPhi %u32 %c1 %m1 %v2 %t2
+         %s1 = OpSelect %u32 %even %r1 %r2
+         %a1 = OpIAdd %u32 %s1 %c1
+         %s2 = OpSelect %u32 %even %a1 %s1
+               OpSelectionMerge %m3 None
+               OpBranchConditional %inb %t3 %m3
+         %t3 = OpLabel
+         %p3 = OpAccessChain %pu32 %buf %c0 %x
+         %w3 = OpLoad %u32 %p3 Volatile
+               OpBranch %m3
+         %m3 = OpLabel
+         %r3 = OpPhi %u32 %w3 %t3 %c0 %m2
+         %s3 = OpIAdd %u32 %s2 %r3
+               OpSelectionMerge %m4 None
+               OpBranchConditional %inb %t4 %m4
+         %t4 = OpLabel
+         %p4 = OpAccessChain %pu32 %buf %c0 %x
+               OpStore %p4 %s3
+               OpBranch %m4
+         %m4 = OpLabel
+               OpReturn
+               OpFunctionEnd
+)";
+  spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+  std::vector<uint32_t> binary;
+  Check(tools.Assemble(text, &binary), "driver simplify fixture did not assemble");
+  CheckSpirvBinaryValidates(binary);
+
+  Check(ShaderRecompiler::Spirv::SimplifyForDriver(binary),
+        "driver simplify refused a module it emitted the shape of");
+  CheckSpirvBinaryValidates(binary);
+
+  const auto source = DisassembleSpirvBinary(binary);
+  const auto count = [&](const char *needle) {
+    size_t n = 0;
+    for (auto at = source.find(needle); at != std::string::npos;
+         at = source.find(needle, at + 1)) {
+      n++;
+    }
+    return n;
+  };
+  Check(count("OpSelectionMerge") == 2,
+        "driver simplify: the volatile load or the store lost its branch");
+  Check(count("OpPhi") == 1, "driver simplify: a speculated merge kept its phi");
+  Check(count("Volatile") == 1, "driver simplify: the volatile load changed");
+  Check(count("OpStore") == 1, "driver simplify: the store changed");
+
+  // Running it again finds nothing more to speculate and changes nothing.
+  auto again = binary;
+  Check(ShaderRecompiler::Spirv::SimplifyForDriver(again) && again == binary,
+        "driver simplify is not idempotent");
+}
+
+// Bit-exact value replacements; loads, decorated arithmetic and sibling-branch values stay.
+void TestDriverSimplifyFoldsValues() {
+  const char *text = R"(
+               OpCapability Shader
+       %glsl = OpExtInstImport "GLSL.std.450"
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %main "main" %gid %buf
+               OpExecutionMode %main LocalSize 64 1 1
+               OpDecorate %gid BuiltIn GlobalInvocationId
+               OpDecorate %arr ArrayStride 4
+               OpMemberDecorate %blk 0 Offset 0
+               OpDecorate %blk Block
+               OpDecorate %buf DescriptorSet 0
+               OpDecorate %buf Binding 0
+               OpDecorate %exact NoContraction
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+        %u32 = OpTypeInt 32 0
+        %f32 = OpTypeFloat 32
+        %v2f = OpTypeVector %f32 2
+       %bool = OpTypeBool
+         %v3 = OpTypeVector %u32 3
+        %pv3 = OpTypePointer Input %v3
+        %gid = OpVariable %pv3 Input
+        %arr = OpTypeRuntimeArray %u32
+        %blk = OpTypeStruct %arr
+       %pblk = OpTypePointer StorageBuffer %blk
+        %buf = OpVariable %pblk StorageBuffer
+       %pu32 = OpTypePointer StorageBuffer %u32
+         %c0 = OpConstant %u32 0
+         %c1 = OpConstant %u32 1
+        %c16 = OpConstant %u32 16
+      %cffff = OpConstant %u32 65535
+       %fone = OpConstant %f32 1
+       %main = OpFunction %void None %fn
+      %entry = OpLabel
+          %g = OpLoad %v3 %gid
+          %x = OpCompositeExtract %u32 %g 0
+         %p0 = OpAccessChain %pu32 %buf %c0 %x
+         %v0 = OpLoad %u32 %p0
+        %v0b = OpLoad %u32 %p0
+         %f0 = OpBitcast %f32 %v0
+        %f0s = OpFAdd %f32 %f0 %fone
+         %b0 = OpBitcast %u32 %f0s
+         %f1 = OpBitcast %f32 %b0
+      %exact = OpFMul %f32 %f1 %f1
+      %loose = OpFMul %f32 %f1 %f1
+     %loose2 = OpFMul %f32 %f1 %f1
+         %lo = OpBitFieldUExtract %u32 %v0b %c0 %c16
+        %lom = OpBitwiseAnd %u32 %lo %cffff
+         %hi = OpBitFieldUExtract %u32 %v0b %c16 %c16
+         %ul = OpExtInst %v2f %glsl UnpackHalf2x16 %lom
+         %el = OpCompositeExtract %f32 %ul 0
+         %uh = OpExtInst %v2f %glsl UnpackHalf2x16 %hi
+         %eh = OpCompositeExtract %f32 %uh 0
+        %sum = OpFAdd %f32 %el %eh
+        %cmp = OpULessThan %bool %x %c16
+               OpSelectionMerge %merge None
+               OpBranchConditional %cmp %then %else
+       %then = OpLabel
+         %d1 = OpBitcast %f32 %v0
+         %t1 = OpFAdd %f32 %d1 %sum
+               OpBranch %merge
+       %else = OpLabel
+         %s1 = OpBitcast %f32 %x
+               OpBranch %merge
+      %merge = OpLabel
+         %ph = OpPhi %f32 %t1 %then %s1 %else
+         %s2 = OpBitcast %f32 %x
+         %a1 = OpFAdd %f32 %ph %exact
+         %a2 = OpFAdd %f32 %a1 %loose
+         %a3 = OpFAdd %f32 %a2 %loose2
+         %a4 = OpFAdd %f32 %a3 %s2
+         %w0 = OpBitcast %u32 %v0b
+         %a5 = OpBitcast %f32 %w0
+         %a6 = OpFAdd %f32 %a4 %a5
+        %out = OpBitcast %u32 %a6
+               OpStore %p0 %out
+               OpReturn
+               OpFunctionEnd
+)";
+  spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+  std::vector<uint32_t> binary;
+  Check(tools.Assemble(text, &binary), "value fold fixture did not assemble");
+  CheckSpirvBinaryValidates(binary);
+
+  Check(ShaderRecompiler::Spirv::SimplifyForDriver(binary),
+        "driver simplify refused the value fold fixture");
+  CheckSpirvBinaryValidates(binary);
+
+  const auto source = DisassembleSpirvBinary(binary);
+  const auto count = [&](const char *needle) {
+    size_t n = 0;
+    for (auto at = source.find(needle); at != std::string::npos;
+         at = source.find(needle, at + 1)) {
+      n++;
+    }
+    return n;
+  };
+  // Kept: f0, the sibling-branch s1, the merge-block s2, a5 and the stored result.
+  Check(count("OpBitcast") == 5, "value fold: wrong bitcasts left (round trip, "
+                                 "dominated duplicate, sibling)");
+  Check(count("UnpackHalf2x16") == 1,
+        "value fold: the two halves do not share one unpack");
+  Check(count("OpBitwiseAnd") == 0,
+        "value fold: the mask after a 16-bit extract stayed");
+  Check(count("OpBitFieldUExtract") == 0,
+        "value fold: an extract feeding an unpack stayed");
+  Check(count("OpLoad") == 3, "value fold: a load was merged or dropped");
+  Check(count("OpFMul") == 2, "value fold: the decorated multiply was merged, "
+                              "or the plain duplicate was not");
+  Check(count("NoContraction") == 1, "value fold: the decoration changed");
+
+  auto again = binary;
+  Check(ShaderRecompiler::Spirv::SimplifyForDriver(again) && again == binary,
+        "value fold is not idempotent");
+}
+
 void TestDeferredSpirvPhiPatching() {
   ShaderRecompiler::Spirv::Builder builder;
   const auto type = builder.Type(spv::OpTypeInt, 32u, 0u);
@@ -14756,7 +14991,7 @@ void TestAutomaticObjectPrimitiveId() {
   options.user_data = user_data;
   const auto prefix = PushData::GraphicsDrawDwords(false, true);
   Check(prefix == 1 && PushData::GraphicsDrawDwords(false, false) == 0 &&
-            PushData::GraphicsDrawDwords(true, false) == PushData::MeshDrawDwordCount,
+            PushData::GraphicsDrawDwords(true, false) == PushData::MeshIndexBoundDword(0) + 1,
         "graphics draw data reserved an incorrect prefix");
   for (const uint32_t start : {prefix, PushData::DwordCount}) {
     const auto result = RecompileForTest(shader, options, nullptr, nullptr, start);
@@ -17868,6 +18103,8 @@ int main() {
   using namespace Libs::Graphics;
 
   EnsureConfigInitialized();
+  // These cases read the module before driver simplification.
+  ShaderRecompiler::Spirv::SetDriverSimplifyMinWords(UINT32_MAX);
   TestRayTracingInstructions();
   TestStructurizedCfgIsCachedByBody();
   TestResourceDescriptorClassification();
@@ -17878,6 +18115,8 @@ int main() {
   TestShaderFeatureCollection();
   TestTypedSpirvSerialization();
   TestDeferredSpirvPhiPatching();
+  TestDriverSimplifySpeculatesGuardedLoads();
+  TestDriverSimplifyFoldsValues();
   TestCompilerStageInputOwnership();
   TestSpirvRepeatedEmission();
   TestSpirvConditionVotes();

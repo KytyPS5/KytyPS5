@@ -48,6 +48,7 @@
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/Tessellation.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvDriverSimplify.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
@@ -24230,6 +24231,8 @@ private:
     conditional_rendering.pNext = &robustness2;
     device_info.pNext = &conditional_rendering;
     vk::PhysicalDeviceFeatures device_features{};
+    // The emulator requires and enables it; speculated buffer loads rely on it.
+    device_features.robustBufferAccess = true;
     device_features.shaderStorageImageWriteWithoutFormat = true;
     device_features.shaderStorageImageMultisample = available_features.shaderStorageImageMultisample;
     device_features.shaderImageGatherExtended = true;
@@ -54878,6 +54881,15 @@ int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);
+  // Every test shader goes through the driver simplification.
+  ShaderRecompiler::Spirv::SetDriverSimplifyMinWords(0);
+  if (argc == 2 && std::strcmp(argv[1], "--execz-loop-exit-only") == 0) {
+#ifdef _WIN32
+    _putenv_s("KYTY_CS_LOOP_BUDGET", "4096");
+#else
+    setenv("KYTY_CS_LOOP_BUDGET", "4096", 1);
+#endif
+  }
   EnsureConfigInitialized();
   CheckLeastRecentlyUsedCacheOrdering();
   if (argc == 2 && std::strcmp(argv[1], "--cvt-pkrtz-only") == 0) {

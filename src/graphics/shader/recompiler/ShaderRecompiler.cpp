@@ -1,8 +1,9 @@
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
-#include "graphics/shader/recompiler/Tessellation.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "graphics/shader/recompiler/Tessellation.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvDriverSimplify.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
@@ -1441,13 +1442,6 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 		}
 	}
 	Frontend::TranslateOptions translate_options {
-	    .stage            = options.stage,
-	    .wave_size        = options.wave_size,
-	    .shader_hash      = options.shader_hash,
-	    .user_data_base   = options.user_data_base,
-	    .user_data_count  = static_cast<uint32_t>(options.user_data.size()),
-	    .input_info       = options.input_info,
-	    .embedded_fetch   = embedded_fetch.loads.empty() ? nullptr : &embedded_fetch,
 	};
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
@@ -1602,6 +1596,9 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 		refused.status.reason = std::move(refusal);
 		refused.program       = std::move(ir);
 		return refused;
+	}
+	if (spirv.size() >= Spirv::DriverSimplifyMinWords()) {
+		Spirv::SimplifyForDriver(spirv);
 	}
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram words=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",

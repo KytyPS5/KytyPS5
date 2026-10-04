@@ -18,6 +18,7 @@ void EmitSetTessellationFactor(ValueEmitContext& ctx, const IR::Inst& inst, uint
 	EXIT_IF(variable == 0);
 	const bool     quad  = state.input_info.vertex->tess.domain == 2u;
 	const uint32_t outer = quad ? 4u : 3u;
+	const uint32_t inner = quad ? 2u : 1u;
 	const auto     type  = TypePointer(state, spv::StorageClassOutput, TypeF32(state));
 	const auto store_at = [&](uint32_t array_variable, uint32_t index) {
 		const auto pointer = state.builder.AllocateId();
@@ -40,10 +41,13 @@ void EmitSetTessellationFactor(ValueEmitContext& ctx, const IR::Inst& inst, uint
 	});
 	EmitIfCondition(state, EmitCompareU32Constant(state, spv::OpUGreaterThanEqual, index, outer), [&] {
 		const auto inner_index = EmitBinaryU32(state, spv::OpISub, index, ConstantU32(state, outer));
-		const auto pointer     = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpAccessChain, type, pointer, state.tess_inner_variable,
-		                          inner_index);
-		state.builder.AddFunction(spv::OpStore, pointer, value);
+		// An index past the inner factors writes nothing.
+		EmitIfCondition(state, EmitCompareU32Constant(state, spv::OpULessThan, inner_index, inner), [&] {
+			const auto pointer = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpAccessChain, type, pointer, state.tess_inner_variable,
+			                          inner_index);
+			state.builder.AddFunction(spv::OpStore, pointer, value);
+		});
 	});
 }
 
@@ -253,7 +257,9 @@ void EmitSetTessellationAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 		if (inst.Arg(0).U32() == static_cast<uint32_t>(IR::TessellationAttribute::Factor)) {
 			auto floating = ctx.state.builder.AllocateId();
 			ctx.state.builder.AddFunction(spv::OpBitcast, TypeF32(ctx.state), floating, value);
-			value = floating;
+			// Factor stores go through the helper: it also handles an index only known at runtime.
+			EmitSetTessellationFactor(ctx, inst, floating);
+			return;
 		}
 		ctx.state.builder.AddFunction(spv::OpStore, TessellationPointer(ctx, inst), value);
 	});

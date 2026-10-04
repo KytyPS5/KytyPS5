@@ -3825,8 +3825,43 @@ bool ProtectGuestMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode,
 }
 
 bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
-	return g_guest_address_space != nullptr &&
-	       g_guest_address_space->ProtectTransient(vaddr, size, mode);
+	if (g_guest_address_space == nullptr || size == 0 || size > UINT64_MAX - vaddr) {
+		return false;
+	}
+	if (g_virtual_ranges == nullptr || mode == VirtualMemory::Mode::NoAccess ||
+	    VirtualMemory::IsExecute(mode)) {
+		return g_guest_address_space->ProtectTransient(vaddr, size, mode);
+	}
+
+	// GPU tracking temporarily restricts reads/writes, not the guest's right to
+	// execute code. Use the current semantic ranges: host protections may already
+	// be NoAccess, and a permanent partial mprotect can revoke execution. A mixed
+	// span must not inherit an executable neighbor's permissions.
+	const auto end = vaddr + size;
+	for (auto current = vaddr; current < end;) {
+		VirtualRanges::Range range {};
+		if (!g_virtual_ranges->Query(current, 1, &range) || range.start >= end) {
+			return g_guest_address_space->ProtectTransient(current, end - current, mode);
+		}
+		if (range.start > current) {
+			// Keep the owner's existing sparse-placeholder no-op behavior.
+			if (!g_guest_address_space->ProtectTransient(current, range.start - current, mode)) {
+				return false;
+			}
+			current = range.start;
+		}
+		const auto part_end = std::min(end, range.start + range.size);
+		const auto part_mode = (range.protection & PROT_CPU_EXEC) != 0
+		                           ? static_cast<VirtualMemory::Mode>(
+		                                 static_cast<uint32_t>(mode) |
+		                                 static_cast<uint32_t>(VirtualMemory::Mode::Execute))
+		                           : mode;
+		if (!g_guest_address_space->ProtectTransient(current, part_end - current, part_mode)) {
+			return false;
+		}
+		current = part_end;
+	}
+	return true;
 }
 
 bool FreeGuestMemory(uint64_t vaddr, uint64_t size) {

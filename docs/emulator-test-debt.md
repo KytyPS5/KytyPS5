@@ -1,5 +1,60 @@
 # Emulator regression test debt
 
+## Executable guest pages under GPU cache protection (2026-10-05; diagnosis)
+
+New frontier after same-EXE cache continuation: native run
+`yotei-integrated-20261004-225751-function-outline-cache-continuation-noval`
+completes404 compute pipelines, reaches CS424, then neither pipelines nor
+shown203 advances for480s. Exit0/graceful close23:09:18UTC. CPU thread samples
+hit guest code and `BufferCache::DownloadBufferMemory`; window capture remains
+black. External read-only VirtualQueryEx at a sampled guest PC reports host
+protection0x2 (PAGE_READONLY), allocation protection0x40 (PAGE_EXECUTE_READWRITE).
+`thread-pcs{,-second}.json` and `window-after-cs424.png` are local artifacts.
+This suggests lost execute permission under tracker protection; it is not yet
+proof of the full runtime cause.
+
+Native synthetic RED confirmed on the existing implementation:
+`gpu-exec-protection-red-20261005.log(.stderr/.run.json)`, selector
+`--gpu-executable-protection-only`, SHA
+`ebb2807f3cd4a4a4dab8335071fabe158269d9d9a9427c067c1e192df8d0567b`,
+exit1/no timeout; actual PAGE_EXECUTE_READWRITE allocation becomes PAGE_READONLY
+under temporary read tracking. This is the intended assertion, not a crash.
+Shared `Memory::ProtectGuestHostMemory` now preserves execution from current
+semantic range permissions, processing mixed spans independently. NoAccess
+remains NoAccess; guest permissions are not rewritten; sparse no-ops preserved.
+Unchanged native GREEN: `gpu-exec-protection-green-20261005.log`, SHA
+`c5058191d18c1e57263872d56fa24cecb30ddd2294995bda404ee9e379710832`,
+exit0/no timeout. It checks actual Windows protections, executes a tiny bounded
+function returning42, covers NoAccess/release, mixed executable/data pages and
+permanent partial revocation. Full native virtual_memory_allocation_tests also
+passes (`gpu-exec-protection-memory-neighbors-20261005.log`, sameSHA,8.44s).
+CTest guest_gpu_executable_protection+memory_tracker+page_manager passes3/3.
+
+GPUAV `--buffer-cache-range-only` remains RED at the older compressed video-out
+metadata alias assertion recorded2026-09-28 below. Current test SHA
+`54e71d80e496319356a6189b48d4b9b58434e06937746bfac4b188f2e0173c80`,
+log `gpu-exec-protection-gpuav-buffer-cache-range-only-20261005.log.stderr`.
+Removing ONLY this memory fix reproduces the identical assertion, baseline SHA
+`aec32086729c72e52a0aa95fb234eb2f6c2b5ef1519dcfd64fd16a06d89d6d62`,
+`gpu-exec-protection-cache-baseline-20261005.log.stderr`. Fix restored exactly;
+full GPU cache suite is not GREEN. Independent `--buffer-cache-gc-only`
+passes numerical dirty-buffer publication/readback, CPU fault, ring, partial-unmap
+and GC controls under GPUAV, log
+`gpu-exec-protection-gpuav-buffer-cache-gc-only-20261005.log`, compute SHA
+`c5e755b7a0f6a8ae4e859d7d6849a8024f6665a53961891fc1f7048dbe2f9cc4`,
+exit0/no timeout. Native game retry still pending. No issue108 update until actual menu/game entry.
+
+Synthetic contract exercised: allocate executable
+and nonexecutable program memory without any game addresses. Temporary host
+read tracking must preserve executable permission while blocking writes;
+NoAccess must still block access, and releasing it must restore the executable
+baseline. Cover mixed spans and a permanent partial permission change so the
+tracker neither grants execution to data nor restores revoked execution. Check
+actual native Windows page permissions and execute a bounded tiny synthetic
+function only after permission assertions. Preserve semantic guest queries,
+sparse placeholder no-ops and existing memory allocation tests. No GPU hang
+needed for RED; future game retry only after native unchanged GREEN.
+
 ## Large CS pipeline before the shared-table frontier (2026-10-04; bounded runtime diagnosis)
 
 Interface-boundary coverage completed (2026-10-05, native Windows CPU):

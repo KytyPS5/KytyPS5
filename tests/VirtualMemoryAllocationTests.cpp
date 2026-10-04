@@ -2965,6 +2965,89 @@ void TestProgramMemoryAllocationAndProtection() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+void TestGpuTrackingPreservesExecutablePages() {
+  const char* test = "GpuTrackingPreservesExecutablePages";
+  using Common::VirtualMemory::Mode;
+  constexpr uint64_t size = SceKernelPageSize * 3;
+  const auto base = Libs::LibKernel::Memory::AllocateProgramMemory(
+      0, size, Mode::ExecuteReadWrite, "synthetic_exec_tracking");
+  Check(test, base != 0, "synthetic executable allocation failed");
+  const auto host_protection = [&](uint64_t address) {
+    MEMORY_BASIC_INFORMATION info {};
+    Check(test, VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info)) != 0,
+          "host protection query failed");
+    return info.Protect;
+  };
+  const uint8_t function[] = {0xb8, 0x2a, 0, 0, 0, 0xc3}; // return 42
+  std::memcpy(reinterpret_cast<void*>(base), function, sizeof(function));
+  Check(test, FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(base),
+                                    sizeof(function)) != FALSE,
+        "synthetic instruction cache flush failed");
+  Check(test, host_protection(base) == PAGE_EXECUTE_READWRITE,
+        "synthetic executable baseline is not executable");
+  const auto read_only = [&](uint64_t address, uint64_t bytes) {
+    Check(test, Libs::LibKernel::Memory::ProtectGuestHostMemory(address, bytes, Mode::Read),
+          "temporary read tracking failed");
+  };
+  read_only(base, size);
+  Check(test, host_protection(base) == PAGE_EXECUTE_READ,
+        "GPU write tracking removed executable permission from guest code");
+  Check(test, reinterpret_cast<uint32_t(*)()>(base)() == 42u,
+        "write-tracked synthetic code returned a wrong value");
+  Check(test, Query(test, base).protection ==
+                  (SceKernelProtCpuRead | SceKernelProtCpuRw | SceKernelProtCpuExec),
+        "temporary tracking changed semantic guest permissions");
+  Check(test, Libs::LibKernel::Memory::ProtectGuestHostMemory(base, size, Mode::NoAccess),
+        "temporary read tracking failed");
+  Check(test, host_protection(base) == PAGE_NOACCESS,
+        "read tracking failed to prohibit access");
+  read_only(base, size);
+  Check(test, host_protection(base) == PAGE_EXECUTE_READ,
+        "restoring read access lost the executable baseline after NoAccess");
+  Check(test, Libs::LibKernel::Memory::ProtectGuestHostMemory(base, size, Mode::ReadWrite),
+        "tracking release failed");
+  Check(test, host_protection(base) == PAGE_EXECUTE_READWRITE,
+        "tracking release failed to restore executable permission");
+
+  // Permanently revoke execution from the middle page, then track the mixed
+  // span. Permission restoration must follow current semantics for each part.
+  Check(test, Libs::LibKernel::Memory::ProtectGuestMemory(
+                  base + SceKernelPageSize, SceKernelPageSize, Mode::ReadWrite),
+        "permanent partial permission change failed");
+  read_only(base, size);
+  Check(test, host_protection(base) == PAGE_EXECUTE_READ &&
+                  host_protection(base + SceKernelPageSize) == PAGE_READONLY &&
+                  host_protection(base + SceKernelPageSize * 2) == PAGE_EXECUTE_READ,
+        "mixed tracking span lost execution or granted it to nonexecutable data");
+  Check(test, Libs::LibKernel::Memory::ProtectGuestHostMemory(base, size, Mode::NoAccess) &&
+                  Libs::LibKernel::Memory::ProtectGuestHostMemory(base, size, Mode::ReadWrite),
+        "mixed tracking span release failed");
+  Check(test, host_protection(base) == PAGE_EXECUTE_READWRITE &&
+                  host_protection(base + SceKernelPageSize) == PAGE_READWRITE &&
+                  host_protection(base + SceKernelPageSize * 2) == PAGE_EXECUTE_READWRITE,
+        "tracking release restored execution that had been revoked");
+  Check(test, Libs::LibKernel::Memory::FreeGuestMemory(base, size),
+        "synthetic executable cleanup failed");
+
+  const auto data = Libs::LibKernel::Memory::AllocateRuntimeMemory(
+      0, SceKernelPageSize, Mode::ReadWrite, "synthetic_data_tracking");
+  Check(test, data != 0, "synthetic nonexecutable allocation failed");
+  read_only(data, SceKernelPageSize);
+  Check(test, host_protection(data) == PAGE_READONLY,
+        "temporary tracking granted execution to data");
+  Check(test, Libs::LibKernel::Memory::ProtectGuestHostMemory(data, SceKernelPageSize,
+                                                            Mode::ReadWrite),
+        "data tracking release failed");
+  Check(test, host_protection(data) == PAGE_READWRITE,
+        "data tracking release granted execution");
+  Check(test, Libs::LibKernel::Memory::FreeGuestMemory(data, SceKernelPageSize),
+        "synthetic data cleanup failed");
+  std::printf("[host]    %-48s ok\n", test);
+}
+#endif
+
 void TestModuleRelocationUsesWritableHostMapping() {
 	const char* test = "ModuleRelocationUsesWritableHostMapping";
 	Check(test, Loader::TestModuleRelocationUsesWritableHostMapping(),
@@ -3413,6 +3496,12 @@ void TestSmallFiberStacksAndMigration() {
 
 int main(int argc, char** argv) {
 	InitSubsystems();
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  if (argc == 2 && std::strcmp(argv[1], "--gpu-executable-protection-only") == 0) {
+    RunTest(TestGpuTrackingPreservesExecutablePages);
+    return g_failed_tests == 0 ? 0 : 1;
+  }
+#endif
 #if defined(__x86_64__) || defined(_M_X64)
 	if (argc == 2 && std::strcmp(argv[1], "--fiber-only") == 0) {
 		RunTest(TestSmallFiberStacksAndMigration);
@@ -3498,6 +3587,9 @@ int main(int argc, char** argv) {
 	RunTest(TestMemoryPoolMultiRangeDecommit);
 	RunTest(TestMemoryPoolCommitDecommitQueryFlags);
 	RunTest(TestProgramMemoryAllocationAndProtection);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	RunTest(TestGpuTrackingPreservesExecutablePages);
+#endif
 	RunTest(TestModuleRelocationUsesWritableHostMapping);
 
 	if (g_failed_tests != 0) {

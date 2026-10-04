@@ -3,6 +3,45 @@
 
 
 
+Checkpoint **4 октября 2026 года, 23:20 UTC** (native Windows via WSL;
+source `b5f04de3` plus the regression-proved shared executable-protection fix;
+new native emulator build/retry pending):
+
+- Same-installed-EXE cache continuation
+  `_Build/runs/yotei-integrated-20261004-225751-function-outline-cache-continuation-noval`
+  accepts the preserved cache, reuses old pipelines in milliseconds, completes404
+  compute pipelines and reaches CS424 (previous413). No incomplete compute
+  creation remains, but shown203 stops. Progress guard480s stops the task-owned
+  emulator23:09:18UTC, graceful close/exit0. Readback150–202 and verified window
+  `window-after-cs424.png` remain black; **menu/game entry PENDING**.
+- Thread-PC samples (`thread-pcs{,-second}.json`) hit guest code plus
+  `BufferCache::DownloadBufferMemory`. Read-only native query at a sampled guest
+  code PC reports PAGE_READONLY despite PAGE_EXECUTE_READWRITE allocation.
+  This is a runtime diagnosis lead; the full menu cause is not yet proven.
+- A synthetic native regression independently proves temporary GPU write tracking
+  drops execution: `gpu-exec-protection-red-20261005.log`, SHAebb2807f, exit1,
+  intended permission assertion. Shared host-protection correction preserves
+  execution from current semantic guest permissions, separately for mixed spans;
+  no game/address exceptions, NoAccess retained, permanently revoked execution
+  and data pages stay nonexecutable.
+- The unchanged test passes and executes a bounded synthetic function returning42;
+  NoAccess/release, mixed spans and permanent partial revocation controls pass.
+  Full native memory-allocation/protection suite passes, SHA c5058191,8.44s.
+  CTest executable_protection+memory_tracker+page_manager passes3/3.
+  Numerical dirty-buffer/readback/fault/unmap/GC controls pass GPUAV, compute SHA
+  c5e755b7. See `docs/emulator-test-debt.md` for full artifact hashes/commands.
+- Unified cache selector still fails the older compressed VideoOut metadata alias
+  assertion; removing only this fix reproduces the identical failure. It remains
+  separate debt, not a newly passing test. No full-suite or cross-game claim.
+- Next: commit this completed shared fix separately, build/install native emulator
+  through `windows-local.cmd`, confirm artifact hash, then bounded actual game
+  retry with the preserved core cache. No pipeline-cache bypass/change is needed:
+  its existing compatibility check retains driver data across source revisions
+  while keeping driver/UUID/validation-mode boundaries.
+- User limits further issue108 status comments to a visually confirmed menu and
+  afterwards confirmed entry into the game, always linked to PR497. Intermediate
+  progress is local-only; no new issue comment or push is authorized here.
+
 Checkpoint **4 октября 2026 года, 22:43 UTC** (same installed `00c7df8e`
 Windows executable/cache; no additional emulator change):
 

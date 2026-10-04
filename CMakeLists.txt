@@ -602,6 +602,11 @@ if(BUILD_TESTING)
 	add_test(NAME shader_cooperative_outline_boundaries
 	         COMMAND $<TARGET_FILE:shader_cfg_tests> --cooperative-outline-boundaries-only)
 	set_tests_properties(shader_cooperative_outline_boundaries PROPERTIES TIMEOUT 60)
+	if(WIN32)
+		add_test(NAME guest_gpu_executable_protection
+		         COMMAND $<TARGET_FILE:virtual_memory_allocation_tests> --gpu-executable-protection-only)
+		set_tests_properties(guest_gpu_executable_protection PROPERTIES TIMEOUT 60)
+	endif()
 	add_test(NAME graphics_wave64_collective_routing
 	         COMMAND $<TARGET_FILE:shader_cfg_tests> --graphics-wave64-collective-routing-only)
 	add_test(NAME homogeneous_indirect_image_validation

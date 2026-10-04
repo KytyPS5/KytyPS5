@@ -438,7 +438,15 @@ void TestDiscoveryAndHotplug() {
 	devices[0].channels = 4;
 	now += 2001;
 	Queue(port, pcm.data());
-	Check(streams.size() == 1 && opened_device == 10, "late USB connection was not discovered");
+	devices.clear();
+	now += 2001;
+	Queue(port, pcm.data());
+	Check(streams.empty(), "disconnected endpoint retained its stream");
+	devices = {{10, "Wireless Controller", 4}};
+	now += 2001;
+	Queue(port, pcm.data());
+	Check(streams.size() == 1 && opened_device == 10,
+	      "Linux Wireless Controller endpoint was not discovered");
 	devices.clear();
 	now += 2001;
 	Queue(port, pcm.data());

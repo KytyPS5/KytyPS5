@@ -209,12 +209,15 @@ uint32_t EmitNativeFma64(EmitterState& state, uint32_t a, uint32_t b, uint32_t c
 uint32_t EmitNativeReciprocal64(EmitterState& state, uint32_t source) {
 	const auto type = TypeNativeF64(state);
 	const auto one = state.builder.Constant(OpConstant, type, {0u, 0x3ff00000u});
-	// Vulkan only promises at least single-precision accuracy for double FDiv.
-	// A fused Newton correction reduces that bounded initial relative error
-	// quadratically, meeting RDNA2 RCP_F64's 2^29 binary64-ULP bound. The input
-	// certificate restricts this path to proved nonzero converted32 integers;
-	// all correction operands/results are zero or normal in that range.
-	const auto estimate = Binary(state, OpFDiv, type, one, source);
+	// The certificate restricts this path to proved nonzero converted32 integers.
+	// Their magnitudes fit in normal F32, as do their reciprocals. A normal F32
+	// estimate is enough for two fused F64 Newton corrections to meet RDNA2
+	// RCP_F64's 2^29 binary64-ULP bound without relying on a native F64 divide.
+	const auto source_f32 = Unary(state, OpFConvert, TypeF32(state), source);
+	const auto seed_f32 = Binary(state, OpFDiv, TypeF32(state),
+	                             ConstantF32(state, 0x3f800000u), source_f32);
+	state.builder.AddAnnotation({OpDecorate, seed_f32, DecorationNoContraction});
+	const auto estimate = Unary(state, OpFConvert, type, seed_f32);
 	state.builder.AddAnnotation({OpDecorate, estimate, DecorationNoContraction});
 	const auto negative_source = Unary(state, OpFNegate, type, source);
 	const auto residual = EmitNativeFma64(state, negative_source, estimate, one);

@@ -12384,6 +12384,73 @@ void TestF64CertificateReciprocalNonzeroProof() {
   }
 }
 
+void TestSplitWave64IntegerReciprocalSeedSpirv() {
+  using namespace ShaderRecompiler;
+  using O = IR::ValueOpcode;
+  using V = IR::Value;
+  F64CertificateFixture fixture;
+  fixture.program.wave_size = 64u;
+  const auto odd = fixture.Emit(O::BitwiseOr32, {fixture.UnknownU32(), V(1u)});
+  const auto reciprocal = fixture.Emit(O::FPRecip64, {fixture.Convert(odd)});
+  fixture.Keep64(reciprocal);
+  const auto lane = fixture.Emit(O::LaneId);
+  const auto ballot = fixture.Emit(O::Ballot,
+                                   {fixture.Emit(O::ULessThan32, {lane, V(32u)})});
+  fixture.Emit(O::ReferenceU32,
+               {fixture.Emit(O::CompositeExtractU32x4, {ballot, V(0u)})});
+  IR::ValidateProgram(fixture.program, true);
+  IR::BuildSrtPlan(fixture.program);
+  IR::TrackResources(fixture.program);
+
+  ShaderComputeInputInfo compute{};
+  compute.threads_num[0] = 64u;
+  compute.threads_num[1] = compute.threads_num[2] = 1u;
+  compute.wave_size = 64u;
+  compute.initial_fp_state = fixture.initial;
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.wave_size = 64u;
+  options.input_info.compute = &compute;
+  options.compute_workgroup_limits = {{1024, 1024, 64}, 1024, 32, false};
+  options.host_profile = fixture.host;
+  TranslateResult translated;
+  translated.program = std::move(fixture.program);
+  const auto compiled = CompileProgram(std::move(translated), options, {}, 0u);
+  CheckSpirvBinaryValidates(compiled.spirv);
+
+  uint32_t float32_type = 0, float64_type = 0;
+  uint32_t f32_divisions = 0, f64_divisions = 0, f64_fmas = 0;
+  bool rte64 = false;
+  for (size_t offset = 5; offset < compiled.spirv.size();) {
+    const auto header = compiled.spirv[offset];
+    const auto count = header >> 16;
+    const auto opcode = header & 0xffffu;
+    Check(count > 0 && offset + count <= compiled.spirv.size(),
+          "reciprocal fixture contains a truncated SPIR-V instruction");
+    if (opcode == 22u && count >= 3u) {
+      if (compiled.spirv[offset + 2] == 32u) float32_type = compiled.spirv[offset + 1];
+      if (compiled.spirv[offset + 2] == 64u) float64_type = compiled.spirv[offset + 1];
+    }
+    if (opcode == 16u && count >= 4u && compiled.spirv[offset + 2] == 4462u &&
+        compiled.spirv[offset + 3] == 64u) rte64 = true;
+    offset += count;
+  }
+  for (size_t offset = 5; offset < compiled.spirv.size();) {
+    const auto header = compiled.spirv[offset];
+    const auto count = header >> 16;
+    const auto opcode = header & 0xffffu;
+    const auto type = count >= 2u ? compiled.spirv[offset + 1] : 0u;
+    if (opcode == 136u && type == float32_type) ++f32_divisions;
+    if (opcode == 136u && type == float64_type) ++f64_divisions;
+    if (opcode == 4427u && type == float64_type) ++f64_fmas;
+    offset += count;
+  }
+  Check(rte64 && f64_fmas >= 2u &&
+            SpirvInstructionOpcodeCount(compiled.spirv, 360u) >= 1u,
+        "synthetic split-wave reciprocal lost RTE64, correction or subgroup lowering");
+  Check(f32_divisions >= 1u && f64_divisions == 0u,
+        "bounded integer reciprocal still seeds its FP64 correction with FP64 division");
+}
+
 
 void TestF64CertificatePhiPredecessorProvenance() {
   using F = F64CertificateFixture;
@@ -19093,6 +19160,11 @@ int main(int argc, char* argv[]) {
     std::puts("KYTY_F64_CERTIFICATE_PASS");
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--split-wave64-reciprocal-seed-only") == 0) {
+    Libs::Graphics::TestSplitWave64IntegerReciprocalSeedSpirv();
+    std::puts("KYTY_SPLIT_WAVE64_RECIPROCAL_SEED_PASS");
+    return 0;
+  }
   using namespace Libs::Graphics;
 
   if (argc > 1 && std::strcmp(argv[1], "--audit-shader") == 0) {
@@ -19307,6 +19379,7 @@ int main(int argc, char* argv[]) {
   TestF64CertificatePairProvenance();
   TestF64CertificateModeAndHostBoundaries();
   TestF64CertificateReciprocalNonzeroProof();
+  TestSplitWave64IntegerReciprocalSeedSpirv();
   TestF64CertificatePhiPredecessorProvenance();
   TestUnusedNativeF64EmissionHasCompleteRequirements();
   TestComputeExecutionGdsAppendAdmission();

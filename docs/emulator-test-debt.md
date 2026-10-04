@@ -453,6 +453,67 @@ shift-wrapping recipes. Temporary diagnostic source changes are removed.
 
 ## Ordinary compute compiler breakpoint after heavy pipelines (2026-10-04; pending)
 
+The saved d0c module validates under Vulkan 1.3 and reproduces the NVIDIA
+pipeline-creation breakpoint in the bounded `_Build/windows/vk_spv_d0c_probe.exe`
+without starting the game. A 22008-byte reduced module still crashes; deleting
+its single `OpGroupNonUniformBitwiseOr` makes that reduced module compile, but
+replacing all 13 subgroup OR operations in the full module does **not** fix the
+full-module crash. Thus the subgroup opcode is not a sufficient production
+target. In the full module, replacing the initial FP64 `OpFDiv` of the
+integer-derived reciprocal with FP32 conversion, FP32 division, and widening
+back to FP64 lets the unchanged FP64 FMA correction and RTE64 mode compile.
+This diagnostic binary mutation is not yet a numerical proof or production fix;
+see `_Build/analysis/d0c-diagnostic-f32-reciprocal-estimate-20261004.spv`.
+
+Before changing the shared reciprocal lowering, add a synthetic regression
+covering a proven nonzero integer-derived FP64 reciprocal in a wave64 compute
+shader. The emitted Vulkan module must retain `RoundingModeRTE 64` and fused
+FP64 corrections while seeding the reciprocal with FP32 work, without a native
+FP64 `OpFDiv`; the current backend is expected to fail this compiler-portability
+invariant. Then run the existing independent GPU readback intervals for odd
+integers and the reciprocal/FMA/narrowing chain, plus new signed/boundary
+inputs if admitted. Check zero/unknown denominators remain rejected and
+neighboring FP64 multiply/FMA/narrowing cases remain unchanged. Finally probe
+the saved d0c module emitted by the fixed backend and retry the bounded game.
+Do not infer numerical correctness or a menu from pipeline creation alone.
+
+Result on 2026-10-04: the synthetic split-wave64/SPIR-V seed test reached the
+existing emitter and failed at its FP64-division portability assertion (RED
+log `_Build/logs/split-wave64-reciprocal-seed-red2-20261004.log`), then passed
+unchanged after the shared integer-domain seed used FP32 division and retained
+two FP64 FMA corrections and RTE64 (GREEN log
+`_Build/logs/f32-seed-final-synthetic-20261004.log`). Native GPU readback
+passed the existing positive reciprocal and FMA chain oracles, the new signed
+negative reciprocal intervals, and neighboring FP64 arithmetic/conversion
+tests (`_Build/logs/f32-seed-signed-gpu-arithmetic-20261004.log`,
+`_Build/logs/f32-seed-final-conversion-20261004.log`). The installed native
+binary SHA is
+`503303e14a8293180af9579e17856f67d5cea69a0e36f7a442b6bcc6a2ebee19`.
+The two 1280x720 retries reached only shown377 and shown205 respectively,
+both stopped during long CS8457 pipeline creation before d0c was encountered;
+runtime d0c completion and a menu are **not** proved.
+
+Next independent RED: isolate the saved high-word-count CS8457 specialization
+and its real layout in a bounded pipeline-only probe. Record the time and
+memory trend, compare repeated creation with the same cache, and reduce any
+failing SPIR-V structure before changing a shared emitter mechanism. Do not
+substitute a game-hash bypass, a lower resource bound, or an unbounded full-game
+wait. The default `shader_cfg_tests.exe` run at
+`_Build/logs/f32-seed-final-shader-cfg-20261004.log` fails at the older
+`TestTypedSpirvSerialization` literal-word assertion before reaching the new
+test; establish baseline attribution independently rather than treating it as
+a reciprocal regression.
+
+Committed/pushed source `f80f87b0` with installed binary SHA
+045ceb1b29e313ce236335a65008debdfc69c26902c02fbd651ada77f25dcbc6
+reproduced this breakpoint in bounded 1280x720 selective-GPUAV run
+`yotei-integrated-20261004-175633-presentfix-gpuav`: first nonzero RGB at
+frame209, shown230, then `nvgpucomp64.dll` 0x80000003/offset0x589eb2 while
+creating the same CS d0c5556e1c26cb1c. CS8457 created11 prior variants
+(17–232 dense buffers), but the 513th-binding variant was not reached. The
+previous diagnostic RTE64 removal does not preserve the FP64 rounding
+contract; minimize before a shared production correction. No menu proof.
+
 Run `yotei-integrated-20261004-110636-presentfix-gpuav` completed the fourth
 CS549 variant in 294965 ms and CSfc6f in 327456 ms, with immediate driver-cache
 checkpoints after both. It reached shown356 and nonzero RGB from frame239;

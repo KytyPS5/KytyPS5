@@ -1,5 +1,73 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **4 октября 2026 года, 19:04 UTC** (native Windows via WSL;
+tested source based on `f80f87b0` with the generic reciprocal lowering below,
+installed executable SHA
+`503303e14a8293180af9579e17856f67d5cea69a0e36f7a442b6bcc6a2ebee19`):
+
+- Isolated saved d0c SPIR-V still reproduces NVIDIA's pipeline breakpoint.
+  Diagnostic-only replacement of its integer-derived FP64 reciprocal seed
+  with FP32 conversion/division/widening makes that full module compile while
+  retaining RTE64 and FP64 FMA correction
+  (`_Build/logs/d0c-f32-seed-diagnostic-probe-20261004.log`). The shared
+  lowering now uses this seed for the certificate-proved nonzero converted32
+  integer domain. Synthetic
+  split-wave64/SPIR-V test failed before the change at the intended FP64-divide
+  assertion, then passed unchanged. Native GPU interval readbacks for positive
+  and negative converted-integer reciprocals, reciprocal/FMA/narrowing, and
+  adjacent F64 arithmetic/conversion cases passed; see
+  `_Build/logs/split-wave64-reciprocal-seed-red2-20261004.log`,
+  `_Build/logs/f32-seed-final-synthetic-20261004.log`, and
+  `_Build/logs/f32-seed-signed-gpu-arithmetic-20261004.log`.
+- Two bounded 1280x720 selective-GPUAV game retries used that installed
+  executable. `_Build/runs/yotei-integrated-20261004-184030-presentfix-gpuav`
+  reached shown377 and nonzero readback from frame246; the final unmatched
+  pipeline creation was a large CS8457 variant. Its process was stopped after
+  several minutes at shown377 and about25 GB working set.
+  `_Build/runs/yotei-integrated-20261004-185016-presentfix-gpuav` reached
+  shown205 and nonzero readback from frame199, then remained inside another
+  CS8457 pipeline creation; its task-owned process was stopped after about
+  nine minutes at shown205 and about30 GB working set. Both exit codes `-1`
+  reflect these manual stops, not driver exceptions. No processes remain.
+  Readbacks were 480x270 and showed only small loading-colored regions;
+  **no menu or gameplay** is confirmed. Neither retry reached the d0c shader,
+  so its runtime fix remains unverified despite the isolated probe result.
+- Current observed blocker is very expensive/nonreturning NVIDIA pipeline
+  creation for certain large CS8457 specializations, before d0c. Do not infer
+  a guest-audio fault from concurrent file reads. Next: obtain a bounded
+  pipeline-only reproduction for the saved CS8457 variant, distinguish slow
+  compiler completion from a driver stall, and reduce only a proven shared
+  SPIR-V mechanism. Preserve cache checkpoints and the existing 513-binding
+  game frontier as unverified. Full default `shader_cfg_tests.exe` currently
+  fails at an earlier `TestTypedSpirvSerialization` literal assertion;
+  baseline attribution is pending, while focused F64 tests pass.
+
+Checkpoint **4 октября 2026 года, 18:01 UTC** (native Windows via WSL;
+branch `yotei-windows-bringup`, committed/pushed source `f80f87b0`, installed
+binary SHA `045ceb1b29e313ce236335a65008debdfc69c26902c02fbd651ada77f25dcbc6`):
+
+- Bounded 1280x720 selective-GPUAV run
+  `_Build/runs/yotei-integrated-20261004-175633-presentfix-gpuav` ended with
+  NVIDIA `nvgpucomp64.dll` 0x80000003/offset0x589eb2 while creating ordinary
+  CS `d0c5556e1c26cb1c` (40239 SPIR-V words, flags0). PID43516 exited;
+  no build/test/game process remains. Selection of only the earlier b90e CS
+  and e312 VS for GPUAV instrumentation was confined to the ignored launch
+  script; this is diagnostic configuration, not a hash branch in the emulator.
+- The game reached `shown=230`; first 1280x720 nonzero RGB readback is frame209
+  (10 colored pixels). Readback grew to219 colored pixels at frame224, then
+  faded by frame229. This is spinner-scale loading output, **not a menu**.
+  CS8457 created11 specialized pipelines successfully (17–232 dense buffer
+  operands), with no materialization failure. The previous 513th-binding
+  variant was not encountered before the d0c crash, so the game's 513/512
+  frontier is still unverified on the committed fix.
+- The d0c compiler crash is an older independently captured blocker. Its
+  exact saved module and bounded probe are in the 11:26/12:36 checkpoints;
+  removing `RoundingModeRTE 64` in a diagnostic copy makes pipeline creation
+  succeed but weakens required FP64 rounding, so it is not a production fix.
+  Next: minimize the RTE64 interaction, add a synthetic semantic RED, correct
+  shared lowering without losing rounding, then rebuild and retry to menu.
+  **Menu/gameplay PENDING.**
+
 Checkpoint **4 октября 2026 года, 17:50 UTC** (native Windows via WSL;
 branch `yotei-windows-bringup`, parent4481e348, host dense-buffer capacity):
 

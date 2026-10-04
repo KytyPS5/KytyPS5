@@ -39815,7 +39815,7 @@ TestCase FmaF64FiniteSignedZeroRules() {
   return test;
 }
 
-TestCase RcpF64OddConvertedIntegersWithinIsaError() {
+TestCase MakeRcpF64ConvertedIntegersWithinIsaError(bool signed_input) {
   struct Oracle { u32 input; uint64_t minimum, maximum, nearest; };
   constexpr Oracle values[] = {
       {0x00000000u, 0x3fefffffc0000000ull, 0x3ff0000020000000ull, 0x3ff0000000000000ull},
@@ -39827,16 +39827,23 @@ TestCase RcpF64OddConvertedIntegersWithinIsaError() {
       {0x7ffffffeu, 0x3dffffffc0400001ull, 0x3e00000020200000ull, 0x3e00000000200000ull},
       {0xfffffffeu, 0x3defffffc0200001ull, 0x3df0000020100000ull, 0x3df0000000100000ull},
   };
-  auto test = MakeF64ArithmeticBase("RcpF64OddConvertedIntegersWithinIsaError", 1, 5);
+  auto test = MakeF64ArithmeticBase(
+      signed_input ? "RcpF64SignedConvertedIntegersWithinIsaError"
+                   : "RcpF64OddConvertedIntegersWithinIsaError", 1, 5);
   for (u32 lane = 0; lane < 32; ++lane) {
-    const auto& v = values[lane % std::size(values)];
-    test.initial[lane] = test.expected[lane] = v.input;
-    test.expected[32 + lane] = static_cast<u32>(v.nearest);
-    test.expected[64 + lane] = static_cast<u32>(v.nearest >> 32);
-    test.expected[96 + lane] = v.input | 1u;
+    // Complementing an even positive input gives the corresponding negative
+    // odd signed integer. The last unsigned endpoint exceeds signed range.
+    const auto& v = values[lane % (signed_input ? 7u : std::size(values))];
+    const u32 input = signed_input ? ~v.input : v.input;
+    const uint64_t sign = signed_input ? 0x8000000000000000ull : 0ull;
+    test.initial[lane] = test.expected[lane] = input;
+    test.expected[32 + lane] = static_cast<u32>(v.nearest | sign);
+    test.expected[64 + lane] = static_cast<u32>((v.nearest | sign) >> 32);
+    test.expected[96 + lane] = input | 1u;
     test.expected[128 + lane] = 0x13579bdfu;
     test.expected[160 + lane] = 0x2468ace0u;
-    test.readback_intervals.push_back({32 + lane, 64 + lane, v.minimum, v.maximum});
+    test.readback_intervals.push_back(
+        {32 + lane, 64 + lane, v.minimum | sign, v.maximum | sign});
   }
   auto& code = test.code;
   AppendVMovLiteral(&code, 6, 0x13579bdfu);
@@ -39845,7 +39852,7 @@ TestCase RcpF64OddConvertedIntegersWithinIsaError() {
   AppendBufferLoadDword(&code, 5, 20);
   code.push_back(0xbf8c0000u);
   code.push_back(EncodeVop2(0x1c, 5, InlineU32(1), 5)); // OR1 proves nonzero
-  code.push_back(EncodeVop1(0x16, 3, Vgpr(5)));
+  code.push_back(EncodeVop1(signed_input ? 0x04u : 0x16u, 3, Vgpr(5)));
   code.push_back(EncodeVop1(0x2f, 7, Vgpr(3)));
   AppendStoreVgprAtLaneDwordOffset(&code, 7, 0, 32);
   AppendStoreVgprAtLaneDwordOffset(&code, 8, 0, 64);
@@ -39853,8 +39860,17 @@ TestCase RcpF64OddConvertedIntegersWithinIsaError() {
   AppendStoreVgprAtLaneDwordOffset(&code, 6, 0, 128);
   AppendStoreVgprAtLaneDwordOffset(&code, 9, 0, 160);
   AppendEnd(&code);
-  test.decoded_counts = {{"V_CVT_F64_U32", 1}, {"V_RCP_F64", 1}};
+  test.decoded_counts = {{signed_input ? "V_CVT_F64_I32" : "V_CVT_F64_U32", 1},
+                         {"V_RCP_F64", 1}};
   return test;
+}
+
+TestCase RcpF64OddConvertedIntegersWithinIsaError() {
+  return MakeRcpF64ConvertedIntegersWithinIsaError(false);
+}
+
+TestCase RcpF64SignedConvertedIntegersWithinIsaError() {
+  return MakeRcpF64ConvertedIntegersWithinIsaError(true);
 }
 
 TestCase F64IntegerDerivedReciprocalFmaChain() {
@@ -40104,6 +40120,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorMed3F32NanUsesMin3Path);
   AddCase(VectorFloatConversionOps);
   AddCase(RcpF64OddConvertedIntegersWithinIsaError);
+  AddCase(RcpF64SignedConvertedIntegersWithinIsaError);
   AddCase(F64IntegerDerivedReciprocalFmaChain);
   AddCase(MulF64ConvertedIntegersExact);
   AddCase(FmaF64IsFusedWithSourceNegation);
@@ -46131,6 +46148,7 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, FmaF64FiniteSignedZeroRules());
     RunCase(&vulkan, CvtF32F64NormalRteBoundaries());
     RunCase(&vulkan, RcpF64OddConvertedIntegersWithinIsaError());
+    RunCase(&vulkan, RcpF64SignedConvertedIntegersWithinIsaError());
     RunCase(&vulkan, F64IntegerDerivedReciprocalFmaChain());
     return 0;
   }

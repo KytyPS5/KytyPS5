@@ -2116,6 +2116,9 @@ int KYTY_SYSV_ABI FontGetKerning(FontHandle font_handle, uint32_t pre_code, uint
                                  FontKerning* kerning) {
 	PRINT_NAME();
 
+	// Kerning is in the same units as the glyph metrics, so it uses the scale the title asked for.
+	const ExactFontScale exact;
+
 	if (kerning == nullptr) {
 		return -1;
 	}

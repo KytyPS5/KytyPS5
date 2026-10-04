@@ -1584,6 +1584,12 @@ struct TestCase {
   bool compile_only = false;
   size_t storage_buffer_range_bytes = 0;
   std::vector<u32> storage_buffer_offsets;
+  // Per resource, overrides the range above with this many bytes from the descriptor start.
+  std::vector<u32> storage_buffer_resource_range_bytes;
+  // Runs on the materialized specialization before the module is compiled from it.
+  std::function<void(ShaderRecompiler::IR::ResourceSnapshot &,
+                     ShaderRecompiler::IR::ResourceSpecialization &)>
+      adjust_specialization;
   std::vector<std::pair<u32, u32>> storage_buffer_ranges;
   std::vector<BdaMapping> bda_mappings;
   std::optional<u32> expected_bda_fault_word0;
@@ -1952,6 +1958,9 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   Require(test.name, "resource materialization", materialized,
           "translated resources could not be materialized: " +
               std::string(ShaderRecompiler::IR::LastMaterializeFailure()));
+  if (test.adjust_specialization) {
+    test.adjust_specialization(resources, specialization);
+  }
   auto result = ShaderRecompiler::CompileProgram(
       std::move(translated), options, specialization,
       compute_info.dispatch_thread_limit_on_gpu
@@ -20221,6 +20230,10 @@ public:
                                   : 0u;
           info.range = static_cast<vk::DeviceSize>(
               test.storage_buffer_range_bytes + offset);
+          if (resource < test.storage_buffer_resource_range_bytes.size() &&
+              test.storage_buffer_resource_range_bytes[resource] != 0) {
+            info.range = test.storage_buffer_resource_range_bytes[resource];
+          }
           Require(test.name, "dispatch", info.range <= buffer.size,
                   "storage buffer descriptor range exceeds backing buffer");
         }
@@ -38324,6 +38337,89 @@ TestCase BufferZeroStrideOobFormatsAndWidths() {
   return test;
 }
 
+// A null V# under a reused permutation's indexed shape: both loads read zero, the store drops.
+TestCase UnboundBufferThroughBoundShape() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "UnboundBufferThroughBoundShape";
+  test.initial = {0xdeadbeefu, 0x11111111u, 0x22222222u, 0x33333333u};
+  test.expected = {0xdeadbeefu, 0u, 0u, 0x33333333u};
+  test.user_data = MakeNativeUserData(nullptr);
+  test.has_user_data = true;
+  test.storage_buffer_range_bytes = test.initial.size() * sizeof(u32);
+  test.storage_buffer_offsets = {ShaderRecompiler::IR::NullBufferByteOffset, 0};
+  test.storage_buffer_resource_range_bytes = {ShaderRecompiler::IR::NullBufferRange, 0};
+  test.adjust_specialization = [](const ShaderRecompiler::IR::ResourceSnapshot &snapshot,
+                                  ShaderRecompiler::IR::ResourceSpecialization &specialization) {
+    using namespace ShaderRecompiler::IR;
+    const char *name = "UnboundBufferThroughBoundShape";
+    Require(name, "specialization",
+            snapshot.buffers.size() == 2 &&
+                std::ranges::all_of(snapshot.buffers[0].dwords, [](u32 w) { return w == 0; }) &&
+                specialization.unbound_buffers[0],
+            "the null V# is not resource 0, or was not unbound");
+    auto donor = specialization;
+    donor.buffers[0].packed_stride = 16;
+    donor.unbound_buffers[0] = false;
+    const std::array<const ResourceSpecialization *, 1> donors{&donor};
+    InheritUnboundShapes(donors, specialization);
+    Require(name, "specialization",
+            SpecializationServes(donor, specialization) &&
+                specialization.buffers[0].packed_stride == 16,
+            "the null slot did not take the bound shape");
+  };
+  auto &code = test.code;
+  AppendVMovU32(&code, 20, 1);
+  AppendVMovU32(&code, 21, 0);
+  code.push_back(EncodeMubuf0(0x0cu, 0, true, false));
+  code.push_back(EncodeMubuf1(1, 1, 20));
+  code.push_back(EncodeMubuf0(0x0cu, 0, true, false));
+  code.push_back(EncodeMubuf1(2, 1, 21));
+  AppendVMovLiteral(&code, 3, 0xabcdef01u);
+  code.push_back(EncodeMubuf0(0x1cu, 0, true, false));
+  code.push_back(EncodeMubuf1(3, 1, 21));
+  AppendStoreVgpr(&code, 1, 1);
+  AppendStoreVgpr(&code, 2, 2);
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
+// The stride keys a permutation only where an access scales an index by it.
+TestCase UnindexedBufferKeysNoStride() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "UnindexedBufferKeysNoStride";
+  test.initial = {10, 11, 12, 13, 14, 15, 16, 17};
+  test.expected = {10, 11, 12, 13, 14, 15, 12, 14};
+  test.user_data = MakeNativeUserData(nullptr);
+  for (u32 base : {4u, 8u}) {
+    test.user_data[base + 1] = 16u << 16u;
+    test.user_data[base + 2] = 2;
+    test.user_data[base + 3] = DstSel(4, 5, 6, 7) | (3u << 28u);
+  }
+  test.has_user_data = true;
+  test.adjust_specialization = [](const ShaderRecompiler::IR::ResourceSnapshot &snapshot,
+                                  ShaderRecompiler::IR::ResourceSpecialization &specialization) {
+    Require("UnindexedBufferKeysNoStride", "specialization",
+            snapshot.buffers.size() == 3 && specialization.buffers[0].packed_stride == 0 &&
+                specialization.buffers[1].packed_stride == 16,
+            "an offset-only buffer keyed its stride, or an indexed one lost it");
+  };
+  auto &code = test.code;
+  AppendVMovU32(&code, 20, 8);
+  code.push_back(EncodeMubuf0(0x0cu));
+  code.push_back(EncodeMubuf1(1, 1, 20));
+  AppendVMovU32(&code, 21, 1);
+  code.push_back(EncodeMubuf0(0x0cu, 0, true, false));
+  code.push_back(EncodeMubuf1(2, 2, 21));
+  AppendStoreVgpr(&code, 1, 6);
+  AppendStoreVgpr(&code, 2, 7);
+  AppendEnd(&code);
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
 TestCase TBufferLoadVariants() {
   using O = ShaderOpcode;
 
@@ -48490,6 +48586,10 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferFormatStoreVariants);
   AddCase(BufferStoreFormatXResource16UintWritesHalfword);
   AddCase(BufferStoreFormatXResource16UintPreservesAdjacentLanes);
+  AddCase(BufferStoreFormatXyzResource111110FloatPacksSmallFloats);
+  AddCase(BufferStoreFormatXyzResource111110FloatSaturatesSpecials);
+  AddCase(BufferStoreFormatXyzResource111110FloatRoundsSubnormalAndNan);
+  AddCase(BufferStoreFormatXyzwResource8888SnormRoundTripsThroughLoad);
   AddCase(BufferStoreFormatXyzwPackedUnormSkinningVectors);
   AddCase(BufferStoreFormatXZeroFillsPackedRecord);
   AddCase(BufferStoreFormatXyzwFloat16ConvertsComponents);
@@ -48522,6 +48622,8 @@ std::vector<TestCase> MakeCases() {
   AddCase([] { return TBufferCapturedZeroStrideOob(true); });
   AddCase([] { return TBufferCapturedZeroStrideOob(false, true); });
   AddCase(BufferZeroStrideOobFormatsAndWidths);
+  AddCase(UnboundBufferThroughBoundShape);
+  AddCase(UnindexedBufferKeysNoStride);
   AddCase(TBufferLoadFormatXyzwSnapshotsOverlappingAddress);
   AddCase(TBufferLoadFormatXyzwPackedSnapshotsOverlappingAddress);
   AddCase(TBufferLoadFormatX8UintZeroExtendsByte);

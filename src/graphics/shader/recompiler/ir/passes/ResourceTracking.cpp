@@ -3991,9 +3991,13 @@ private:
 	}
 
 	uint32_t AddBuffer(uint32_t source, const MemoryInfo& memory, const Inst& inst, uint32_t pc) {
+		const auto index   = inst.Arg(1).Resolve();
+		const bool indexed = inst.GetOpcode() != ValueOpcode::ReadConstBuffer &&
+		                     !(index.IsImmediate() && index.U32() == 0u);
 		for (uint32_t i = 0; i < m_info.buffers.size(); i++) {
 			if (m_info.buffers[i].source == source) {
 				Merge(m_info.buffers[i], memory, inst, pc);
+				m_info.buffers[i].unindexed = m_info.buffers[i].unindexed && !indexed;
 				return i;
 			}
 		}
@@ -4003,6 +4007,7 @@ private:
 		BufferResource resource;
 		resource.source       = source;
 		resource.first_use_pc = pc;
+		resource.unindexed    = !indexed;
 		Merge(resource, memory, inst, pc);
 		m_info.buffers.push_back(resource);
 		return static_cast<uint32_t>(m_info.buffers.size() - 1);

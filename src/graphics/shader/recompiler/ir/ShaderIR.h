@@ -140,6 +140,7 @@ struct BufferResource {
 	uint32_t               indirect_mapping_offset    = 0;
 	uint32_t               indirect_search_iterations = 0;
 	std::vector<uint32_t>  indirect_resources;
+	bool                   unindexed = false;
 
 	bool operator==(const BufferResource& other) const = default;
 };
@@ -387,10 +388,13 @@ struct PushData {
 
 	[[nodiscard]] static constexpr uint32_t GraphicsDrawDwords(bool mesh, bool object_id,
 	                                                           uint32_t user_clip_planes = 0) {
+		if (mesh) {
+			return MeshIndexBoundDword(user_clip_planes) + 1u;
+		}
 		if (user_clip_planes != 0) {
 			return UserClipPlaneDword + 4u * std::bit_width(user_clip_planes);
 		}
-		return mesh ? MeshDrawDwordCount : static_cast<uint32_t>(object_id);
+		return static_cast<uint32_t>(object_id);
 	}
 
 	[[nodiscard]] static constexpr bool CanFit(uint32_t start, uint32_t size) {
@@ -399,7 +403,14 @@ struct PushData {
 	[[nodiscard]] static constexpr uint32_t StartFor(uint32_t cursor, uint32_t size) {
 		return CanFit(cursor, size) ? cursor : NoStart;
 	}
+	[[nodiscard]] static constexpr bool StartServes(uint32_t start, uint32_t cursor) {
+		return start == NoStart || start >= cursor;
+	}
 };
+
+// A null V# binds one dword at this offset, so every index lies past it: reads zero, writes drop.
+inline constexpr uint32_t NullBufferByteOffset = 252;
+inline constexpr uint32_t NullBufferRange      = 4;
 
 static_assert(sizeof(PushData) == 128);
 constexpr uint32_t NativePushConstantSize = sizeof(PushData);

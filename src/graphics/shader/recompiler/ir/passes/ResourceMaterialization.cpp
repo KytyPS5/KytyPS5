@@ -1067,6 +1067,9 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			image.dimension     = Decoder::ImageDimension::Dim2D;
 			image.cube          = false;
 			// A null sampled view reads zero whatever its shape, so any module serves it.
+			specialization.unbound_images[i] =
+			    image.indirect_root == ImageResource::NoIndirectImage &&
+			    base.resource_class != ImageResourceClass::Storage && !base.written && !base.atomic;
 			continue;
 		}
 		const auto descriptor_dimension = DescriptorDimension(descriptor, base.dimension);
@@ -2019,6 +2022,92 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		const auto root = specialization.images[i].indirect_root;
 		if (root >= program.info.images.size() || !specialization.images[root].heap) return false;
 		specialization.images[i] = specialization.images[root];
+	}
+}
+
+namespace {
+
+bool SelectsOne(uint32_t swizzle) {
+	for (uint32_t component = 0; component < 4; component++) {
+		if (GetDstSel(swizzle, component) == 1u) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// Out of bounds, a read is zero except where dst_sel names the constant one.
+bool UnboundBufferServes(const ResourceSpecialization::Buffer& built,
+                         const ResourceSpecialization::Buffer& wanted) {
+	auto shape               = wanted;
+	shape.packed_stride      = built.packed_stride;
+	shape.descriptor_format  = built.descriptor_format;
+	shape.descriptor_swizzle = built.descriptor_swizzle;
+	shape.zero_stride_oob    = built.zero_stride_oob;
+	return shape == built && (built == wanted || (!SelectsOne(built.descriptor_swizzle) &&
+	                                              !SelectsOne(wanted.descriptor_swizzle)));
+}
+
+bool UnboundImageServes(const ResourceSpecialization::Image& built,
+                        const ResourceSpecialization::Image& wanted) {
+	auto shape      = wanted;
+	shape.dimension = built.dimension;
+	return shape == built && built.dimension != Decoder::ImageDimension::Unknown &&
+	       built.dimension != Decoder::ImageDimension::Dim2DMsaa &&
+	       built.dimension != Decoder::ImageDimension::Dim2DMsaaArray;
+}
+
+bool Unbound(const std::vector<bool>& flags, size_t index) {
+	return index < flags.size() && flags[index];
+}
+
+} // namespace
+
+bool SpecializationServes(const ResourceSpecialization& built,
+                          const ResourceSpecialization& wanted) {
+	if (built.buffers.size() != wanted.buffers.size() ||
+	    built.images.size() != wanted.images.size() || built.samplers != wanted.samplers) {
+		return false;
+	}
+	for (size_t index = 0; index < wanted.buffers.size(); index++) {
+		if (!(Unbound(wanted.unbound_buffers, index)
+		          ? UnboundBufferServes(built.buffers[index], wanted.buffers[index])
+		          : built.buffers[index] == wanted.buffers[index])) {
+			return false;
+		}
+	}
+	for (size_t index = 0; index < wanted.images.size(); index++) {
+		if (!(Unbound(wanted.unbound_images, index)
+		          ? UnboundImageServes(built.images[index], wanted.images[index])
+		          : built.images[index] == wanted.images[index])) {
+			return false;
+		}
+	}
+	return true;
+}
+
+void InheritUnboundShapes(std::span<const ResourceSpecialization* const> donors,
+                          ResourceSpecialization&                        wanted) {
+	for (auto donor = donors.rbegin(); donor != donors.rend(); ++donor) {
+		const auto& from = **donor;
+		if (from.buffers.size() != wanted.buffers.size() ||
+		    from.images.size() != wanted.images.size() || from.samplers != wanted.samplers) {
+			continue;
+		}
+		for (size_t index = 0; index < wanted.buffers.size(); index++) {
+			if (Unbound(wanted.unbound_buffers, index) && !Unbound(from.unbound_buffers, index) &&
+			    UnboundBufferServes(from.buffers[index], wanted.buffers[index])) {
+				wanted.buffers[index]         = from.buffers[index];
+				wanted.unbound_buffers[index] = false;
+			}
+		}
+		for (size_t index = 0; index < wanted.images.size(); index++) {
+			if (Unbound(wanted.unbound_images, index) && !Unbound(from.unbound_images, index) &&
+			    UnboundImageServes(from.images[index], wanted.images[index])) {
+				wanted.images[index]         = from.images[index];
+				wanted.unbound_images[index] = false;
+			}
+		}
 	}
 }
 

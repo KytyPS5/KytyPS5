@@ -3,6 +3,9 @@
 
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
+#include <span>
+#include <string_view>
+
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
 // Canonical module-affecting resource state. Runtime addresses and descriptor payloads remain in
@@ -45,8 +48,13 @@ struct ResourceSpecialization {
 	std::vector<Buffer> buffers;
 	std::vector<Image>  images;
 	std::vector<Sampler> samplers;
+	// A slot whose descriptor is null or unread; any shape serves it, so equality ignores these.
+	std::vector<bool> unbound_buffers;
+	std::vector<bool> unbound_images;
 
-	bool operator==(const ResourceSpecialization&) const = default;
+	bool operator==(const ResourceSpecialization& other) const {
+		return buffers == other.buffers && images == other.images && samplers == other.samplers;
+	}
 };
 
 // Extracts the descriptor/SRT value graph before resource specialization. The returned plan owns
@@ -59,6 +67,10 @@ std::string_view LastMaterializeFailure();
 // Refreshes cached resources and specialization. A refusal leaves the specialization untouched.
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
+[[nodiscard]] bool SpecializationServes(const ResourceSpecialization& built,
+                                        const ResourceSpecialization& wanted);
+void               InheritUnboundShapes(std::span<const ResourceSpecialization* const> donors,
+                                        ResourceSpecialization&                        wanted);
 
 // Applies an already-derived specialization to native IR before layout and emission.
 bool ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization);

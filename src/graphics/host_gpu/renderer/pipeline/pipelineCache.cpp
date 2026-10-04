@@ -639,6 +639,15 @@ struct PipelineCache::ProgramCache {
 				return permutation->handle;
 			}
 		}
+		auto specialization = entry->second.specialization;
+		{
+			std::vector<const ShaderRecompiler::IR::ResourceSpecialization*> donors;
+			donors.reserve(entry->second.permutations.size());
+			for (const auto& built: entry->second.permutations) {
+				donors.push_back(&built.specialization);
+			}
+			ShaderRecompiler::IR::InheritUnboundShapes(donors, specialization);
+		}
 		entry->second.permutations.push_back(CompilePermutation(
 		    entry->second.FunctionCode()));
 		const auto& permutation = entry->second.permutations.back();

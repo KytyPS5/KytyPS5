@@ -30,6 +30,10 @@ namespace LibKeyboard {
 LIB_DEFINE(InitKeyboard_1);
 } // namespace LibKeyboard
 
+LIB_DEFINE(InitBluetoothHid_1);
+LIB_DEFINE(InitDeviceService_1);
+LIB_DEFINE(InitUsbd_1);
+
 namespace Ime {
 LIB_DEFINE(InitPlatform_1_Ime);
 } // namespace Ime
@@ -120,6 +124,9 @@ void InitAll(Loader::SymbolDatabase* s) {
 	InitFont_1(s);
 	InitFontFt_1(s);
 	InitAgcDriver_1(s);
+	InitBluetoothHid_1(s);
+	InitDeviceService_1(s);
+	InitUsbd_1(s);
 	InitHmd2_1(s);
 	InitLibKernel_1(s);
 	LibMouse::InitMouse_1(s);

@@ -30,6 +30,65 @@ diagnostic runs.
 
 ## Divergent graphics wave64 loop with indirect images (2026-10-03; pending)
 
+The dispatched wave64 vertex shader captured on 2026-10-04 derives EXEC from
+the low byte of SGPR3 (`ESVertCount`) before copying EXEC into its scalar loop
+mask. Current vertex translation initializes that byte to the fixed guest wave
+size, including for a native 32-lane graphics subgroup with fewer active
+invocations. AMD's RDNA2 ISA defines the byte as ESVertCount and specifies
+that combined ES+GS shaders calculate real EXEC from initialized SGPRs;
+Vulkan permits partially populated graphics subgroups. Add a synthetic vertex
+entry-state regression for wave32/native32, wave64/native32 and wave64/native64:
+the low byte must follow actual launched lanes, while unrelated SGPR3 bits
+remain intact. Prove the old fixed value fails before changing translation.
+Then validate a partial indexed draw with GPUAV readback. Vulkan does not
+guarantee that a graphics subgroup stays within one draw; this remains a
+compatibility limit of the existing wave64 partition model and must not be
+presented as full guest wave64 emulation.
+
+The synthetic entry-state regression is `shader_cfg_tests
+--ngg-launched-lanes-only`. On `5a46caf4` with only host-size metadata
+plumbed through, it failed as intended with `vertex ESVertCount is fixed
+instead of following launched lanes` (`_Build/logs/ngg-launched-lanes-red-20261004.log`).
+The shared vertex entry now uses the entry ballot's population count for
+SGPR3's low byte, counting one physical half for guest wave64/native32.
+The unchanged failure oracle passes after the fix. Extended checks substitute
+synthetic 16/32/48/64-lane ballots, verify SGPR3's high bits, validate emitted
+SPIR-V, and pass the older NGG entry fixture. Logs:
+`_Build/logs/ngg-launched-lanes-spv-20261004.log` and
+`_Build/logs/ngg-vertex-entry-neighbor-20261004.log`. The 48-index GPUAV
+active-ballot control still passes, but its standalone test executable predates
+this translation fix and is only a downstream control.
+
+Installed emulator SHA-256 `27ab5e00a5720cd39adfcfd93045dfc3c52ea72522dc84fc1040dbac3653f9a4`.
+The GPUAV-instrumented game retry
+`_Build/runs/yotei-integrated-20261004-013304-presentfix-gpuav` stopped at
+`shown=169` after its 300-second frame watchdog. The last shader pipeline
+trace is `vkCreateComputePipelines begin` for CS `fc6f8c56eb7e168f`, whose
+emitted SPIR-V has 775890 words; no `done` trace or readback followed.
+The GPUAV run without shader instrumentation
+`_Build/runs/yotei-integrated-20261004-014304-presentfix-gpuav` exited
+`-2147483645` at `shown=0` during `vkCreateComputePipelines` for the prior
+CS `b90e2024732c6111`. Neither retry reached the changed Vertex draw, so
+the game's device-loss cause, menu and gameplay remain unverified. The next
+bounded check must first get past those compute pipeline creation blockers;
+do not count the CPU regression as game progress.
+
+Selective instrumentation of the early `b90e…` CS allowed pipeline creation,
+but the silent selective run
+`_Build/runs/yotei-integrated-20261004-015524-presentfix-gpuav` remained at
+`shown=154` for its full 600-second frame watchdog while creating cooperative
+CS `54904fb419d79e49`. A bounded follow-up captured its pre-driver module
+at `_Build/runs/yotei-integrated-20261004-020758-presentfix-gpuav/shaders/0000_new_shader_cs_54904fb419d79e49.spv`.
+It has 773030 words and 197953 instructions, including 62605 `OpLoad` and
+42894 `OpStore` instructions. Existing cooperative and general SPIR-V
+optimizer recipes reduce it to 755593 and 750947 words respectively
+(`_Build/logs/cs54904-opt-{coop,general}-20261004.log`); neither is a
+measured driver-compile solution. Before changing shared emission, construct
+a bounded synthetic cooperative wave64 program with an indirect image switch
+and enough nested control flow to reproduce the module growth; measure its
+SPIR-V size and isolated pipeline creation time on current source. Keep the
+captured proprietary module outside tracked tests and source.
+
 New bounded lead: the identified indexed draw has 119856 indices, leaving
 16 after division by the native 32-lane subgroup size. In saved SPIR-V
 `_Build/analysis/vs-e312-20261003.spvasm`, the loop mask starts as

@@ -1,5 +1,56 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **4 октября 2026 года, 02:12 UTC** (native Windows via WSL;
+branch `yotei-windows-bringup`, committed source `d6bbd37a`;
+the installed game-test executable was built from those production sources):
+
+- Captured dispatched guest VS `e3125617f3efc38f` at
+  `_Build/runs/yotei-integrated-20261004-011607-presentfix-gpuav/shaders/dispatched/`.
+  Its prologue derives EXEC from SGPR3 `ESVertCount`; later it copies EXEC
+  into the loop mask. The previous translation hardcoded that byte to 64 even
+  when a native32 Vulkan graphics subgroup had fewer active invocations.
+  The shared Vertex entry now counts its actual entry ballot, with one physical
+  half counted for partitioned wave64/native32. This is a correction within
+  the existing partition model, not full wave64 graphics emulation.
+- Synthetic native regression `--ngg-launched-lanes-only`: RED on the old
+  fixed count (`_Build/logs/ngg-launched-lanes-red-20261004.log`), GREEN after
+  the fix for synthetic 16/32/48/64-lane masks with SPIR-V validation
+  (`ngg-launched-lanes-spv-20261004.log`). Neighboring NGG entry, graphics
+  collective routing and partitioned-loop selectors passed. The full
+  `shader_cfg_tests` remains stopped by the older unrelated SPIR-V literal
+  assertion before reaching these cases. Installed emulator SHA-256
+  `27ab5e00a5720cd39adfcfd93045dfc3c52ea72522dc84fc1040dbac3653f9a4`.
+- Bounded GPUAV+instrumentation game retry
+  `_Build/runs/yotei-integrated-20261004-013304-presentfix-gpuav` stopped at
+  `shown=169` by its 300-second frame watchdog during native pipeline
+  creation for CS `fc6f8c56eb7e168f` (775890 emitted SPIR-V words).
+  No new readback or `DeviceLost` was recorded. GPUAV without shader
+  instrumentation (`...-014304-presentfix-gpuav`) exited
+  `-2147483645` at `shown=0` during the prior CS `b90e2024732c6111`
+  driver-compiler path. These runs did not exercise the fixed Vertex draw.
+  Last verified nonzero RGB remains frames 198–199 from the earlier clean
+  GPUAV run. **Menu and gameplay PENDING.**
+- Next: find a bounded way through CS pipeline creation, then retry the
+  119856-index Vertex draw with GPUAV/readback. Keep the compute driver
+  crashes and the later graphics device loss as separate blockers. Vulkan
+  does not guarantee that graphics subgroups map one-to-one to draws, so
+  cross-draw wave64 behavior remains unsupported by this entry-count fix.
+- Additional selective GPUAV retries proved `b90e…` creates successfully
+  when that shader is instrumented, but a silent run then spent 600 seconds
+  without advancing past `shown=154` while creating CS `54904fb419d79e49`
+  (`_Build/runs/yotei-integrated-20261004-015524-presentfix-gpuav`). The
+  exact pre-driver SPIR-V was captured in
+  `_Build/runs/yotei-integrated-20261004-020758-presentfix-gpuav/shaders/0000_new_shader_cs_54904fb419d79e49.spv`:
+  773030 words, 197953 instructions, SHA-256
+  `42f8f562e2a5a4911ee385fcffe3b2f209c53f2a1764476d6d3e3378c9c3e4e8`.
+  The existing bounded cooperative optimizer reduces it only to 755593
+  words; the broader recipe reaches 750947. PR #1015 also applies
+  conservative SPIR-V passes and has no measured driver compilation time,
+  so its word-count improvement does not establish a fix for this blocker.
+  Next test debt: a reusable cooperative wave64/indirect-image synthetic
+  case that reproduces the oversized compiler input and has a bounded
+  pipeline-creation probe, before changing shared emission.
+
 Checkpoint **3 октября 2026 года, 20:47 UTC** (native Windows via WSL;
 branch `yotei-windows-bringup`, source head `2f202943` plus test/docs work):
 

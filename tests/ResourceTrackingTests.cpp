@@ -2,6 +2,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
+#include "graphics/shader/recompiler/ir/passes/IndexRangeFold.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
@@ -5542,6 +5543,185 @@ void TestOrderedScalarReadOverWrittenBuffer() {
   }
 }
 
+void TestWrittenDescriptorSizedByGpuCount() {
+  Fixture fixture;
+  const auto count_buffer = fixture.Buffer(
+      {fixture.UserData(0), fixture.UserData(1), fixture.UserData(2), fixture.UserData(3)}, 4);
+  MemoryInfo count_memory;
+  count_memory.kind = ResourceKind::Buffer;
+  const auto count = fixture.Emit(ValueOpcode::LoadBufferU32,
+                                  {count_buffer, Value(0u), Value(0u), Value(0u), Value(true)},
+                                  fixture.AddMemory(count_memory, 4));
+  const auto records = fixture.Emit(
+      ValueOpcode::ShiftRightLogical32,
+      {fixture.Emit(ValueOpcode::IAdd32, {count, Value(127u)}), Value(7u)});
+  const auto status = fixture.Buffer(
+      {fixture.UserData(4), fixture.UserData(5), records, fixture.UserData(7)}, 8);
+  MemoryInfo store;
+  store.kind = ResourceKind::Buffer;
+  fixture.Emit(ValueOpcode::StoreBufferU32,
+               {status, Value(0u), Value(0u), Value(0u), Value(1u), Value(true)},
+               fixture.AddMemory(store, 8));
+  fixture.PlanAndTrack();
+  auto plan = ExtractResourcePlan(fixture.program);
+  uint32_t written = UINT32_MAX;
+  for (uint32_t i = 0; i < plan.info.buffers.size(); ++i) {
+    if (plan.info.buffers[i].written) written = i;
+  }
+  Check(written != UINT32_MAX, "the status buffer was not tracked as written");
+  struct Memory {
+    std::array<uint32_t, 1> cpu{};
+    std::array<uint32_t, 1> gpu{};
+    bool gpu_readable = true;
+  } memory;
+  memory.cpu[0] = 0x80u;
+  memory.gpu[0] = 0x2a0u;
+  const auto Cpu = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+    auto &memory = *static_cast<Memory *>(data);
+    if (address != 0x1000u || words.size() != 1u) return false;
+    words[0] = memory.cpu[0];
+    return true;
+  };
+  const auto Gpu = +[](void *data, uint64_t address, std::span<uint32_t> words) {
+    auto &memory = *static_cast<Memory *>(data);
+    if (!memory.gpu_readable || address != 0x1000u || words.size() != 1u) return false;
+    words[0] = memory.gpu[0];
+    return true;
+  };
+  const std::array<uint32_t, 8> user_data{0x1000u, 0u, 4u, 0x30000000u,
+                                          0x2000u, 20u << 16u, 0u, 0x30000000u};
+  const SrtRuntime runtime{.user_data = user_data, .read_memory = Cpu, .userdata = &memory,
+                           .read_specialization_memory = Gpu};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            snapshot.buffers[written].dwords[2] == 6u,
+        "a written descriptor took its size from the stale copy instead of the GPU's");
+  memory.gpu_readable = false;
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization) &&
+            LastMaterializeFailure().find("(written)") != std::string_view::npos,
+        "a written descriptor fell back to the stale copy when the GPU's could not be read");
+}
+
+void TestRelativeIndexRangeFold() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  enum class Variant { Bounded, UnboundedLimit, AllLanes, LaneCounter, Unguarded };
+  for (const auto variant : {Variant::Bounded, Variant::UnboundedLimit, Variant::AllLanes,
+                             Variant::LaneCounter, Variant::Unguarded}) {
+    Fixture fixture;
+    auto *entry = fixture.block;
+    auto *header = fixture.AddBlock();
+    auto *test = fixture.AddBlock();
+    auto *body = fixture.AddBlock();
+    auto *exit = fixture.AddBlock();
+    entry->AddBranch(header);
+    header->AddBranch(test);
+    test->AddBranch(exit);
+    test->AddBranch(body);
+    body->AddBranch(header);
+    fixture.program.block_info[0].terminator = {.kind = CFG::TerminatorKind::Branch,
+                                                .true_block = 1};
+    fixture.program.block_info[1].terminator = {.kind = CFG::TerminatorKind::Branch,
+                                                .true_block = 2};
+    fixture.program.block_info[2].terminator = {
+        .kind = CFG::TerminatorKind::ConditionalBranch, .true_block = 4, .false_block = 3};
+    fixture.program.block_info[3].terminator = {.kind = CFG::TerminatorKind::Branch,
+                                                .true_block = 1};
+    fixture.program.block_info[4].terminator.kind = CFG::TerminatorKind::Return;
+    const auto lane = fixture.Emit(ValueOpcode::LaneId, {}, 0, entry);
+    const auto odd = fixture.Emit(ValueOpcode::INotEqual32,
+        {fixture.Emit(ValueOpcode::BitwiseAnd32, {lane, Value(1u)}, 0, entry), Value(0u)}, 0,
+        entry);
+    const auto width = fixture.Emit(ValueOpcode::SelectU32, {odd, Value(512u), Value(64u)}, 0,
+                                    entry);
+    const auto limit = variant == Variant::UnboundedLimit
+        ? fixture.UserData(0)
+        : fixture.Emit(ValueOpcode::ShiftRightLogical32, {width, Value(6u)}, 0, entry);
+    auto &counter = header->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+    const auto start = variant == Variant::LaneCounter ? lane : Value(0u);
+    const auto exec = fixture.Emit(ValueOpcode::GetExec, {}, 0, test);
+    const auto below = fixture.Emit(ValueOpcode::ULessThan32, {Value(&counter), limit}, 0, test);
+    const auto vcc = fixture.Emit(ValueOpcode::LogicalAnd, {exec, below}, 0, test);
+    const auto kind = CFG::BranchCondition::VccZero;
+    fixture.program.block_info[2].condition = variant == Variant::AllLanes
+        ? fixture.Emit(ValueOpcode::ConditionRef, {vcc}, kind, test)
+        : fixture.Emit(ValueOpcode::ConditionRef,
+                       {fixture.Emit(ValueOpcode::LogicalNot, {vcc}, 0, test)}, kind, test);
+    if (variant == Variant::AllLanes) {
+      fixture.program.block_info[2].terminator.true_block = 3;
+      fixture.program.block_info[2].terminator.false_block = 4;
+    }
+    auto *site = variant == Variant::Unguarded ? header : body;
+    const auto index = fixture.Emit(ValueOpcode::BitwiseAnd32,
+        {fixture.Emit(ValueOpcode::ShiftLeftLogical32, {Value(&counter), Value(1u)}, 0, site),
+         Value(0xffu)}, 0, site);
+    const auto reachable = fixture.Emit(ValueOpcode::IEqual32, {index, Value(14u)}, 0, site);
+    const auto unreachable = fixture.Emit(ValueOpcode::IEqual32, {index, Value(16u)}, 0, site);
+    fixture.Emit(ValueOpcode::ReferenceU32,
+                 {fixture.Emit(ValueOpcode::SelectU32, {reachable, Value(1u), Value(2u)}, 0, site)},
+                 0, site);
+    fixture.Emit(ValueOpcode::ReferenceU32,
+                 {fixture.Emit(ValueOpcode::SelectU32, {unreachable, Value(3u), Value(4u)}, 0, site)},
+                 0, site);
+    const auto next = fixture.Emit(ValueOpcode::IAdd32, {Value(&counter), Value(1u)}, 0, body);
+    counter.AddPhiOperand(entry, start);
+    counter.AddPhiOperand(body, next);
+    const auto folded = FoldUnreachableIndexCompares(fixture.program);
+    const bool expect = variant == Variant::Bounded;
+    Check(folded == (expect ? 1u : 0u) &&
+              (unreachable.Resolve() == Value(false)) == expect &&
+              reachable.Resolve().TryInstruction() != nullptr,
+          variant == Variant::Bounded ? "a MOVREL index bounded by its guarded loop counter was not folded"
+          : variant == Variant::UnboundedLimit ? "a compare against an unbounded loop limit was folded"
+          : variant == Variant::AllLanes ? "an all-lanes guard was trusted to bound a counter"
+          : variant == Variant::LaneCounter ? "a per-lane counter was bounded by one lane's guard"
+                                            : "a compare outside the guarded body was folded");
+  }
+}
+
+// The guard's limit is defined in the last block of the sweep, so the first bound of the guarded
+// index is taken against a limit that has not been raised yet. Nothing else the index reads moves
+// after that, so only the limit's own raise can send the solver back to it.
+void TestIndexRangeFoldRevisitsLateGuardLimit() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  Fixture fixture;
+  auto *entry = fixture.block;
+  auto *site = fixture.AddBlock();
+  auto *exit = fixture.AddBlock();
+  entry->AddBranch(site);
+  entry->AddBranch(exit);
+  site->AddBranch(exit);
+  fixture.program.block_info[0].terminator = {
+      .kind = CFG::TerminatorKind::ConditionalBranch, .true_block = 1, .false_block = 2};
+  fixture.program.block_info[1].terminator = {.kind = CFG::TerminatorKind::Branch,
+                                              .true_block = 2};
+  fixture.program.block_info[2].terminator.kind = CFG::TerminatorKind::Return;
+  const auto value =
+      fixture.Emit(ValueOpcode::BitwiseAnd32, {fixture.UserData(0), Value(0xffu)}, 0, entry);
+  const auto limit = fixture.Emit(
+      ValueOpcode::BitwiseAnd32,
+      {fixture.Emit(ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(1))}, 0, exit),
+       Value(8u)},
+      0, exit);
+  const auto below = fixture.Emit(ValueOpcode::ULessThan32, {value, limit}, 0, entry);
+  fixture.program.block_info[0].condition =
+      fixture.Emit(ValueOpcode::ConditionRef, {below}, CFG::BranchCondition::SccNonZero, entry);
+  const auto index =
+      fixture.Emit(ValueOpcode::ShiftLeftLogical32, {value, Value(1u)}, 0, site);
+  const auto reachable = fixture.Emit(ValueOpcode::IEqual32, {index, Value(14u)}, 0, site);
+  const auto unreachable = fixture.Emit(ValueOpcode::IEqual32, {index, Value(16u)}, 0, site);
+  fixture.Emit(ValueOpcode::ReferenceU32,
+               {fixture.Emit(ValueOpcode::SelectU32, {reachable, Value(1u), Value(2u)}, 0, site)},
+               0, site);
+  fixture.Emit(ValueOpcode::ReferenceU32,
+               {fixture.Emit(ValueOpcode::SelectU32, {unreachable, Value(3u), Value(4u)}, 0, site)},
+               0, site);
+  const auto folded = FoldUnreachableIndexCompares(fixture.program);
+  Check(folded == 1u && unreachable.Resolve() == Value(false) &&
+            reachable.Resolve().TryInstruction() != nullptr,
+        "an index bounded by a guard whose limit was raised later kept the stale bound");
+}
+
 int main() {
   OverrideBindlessImageHeaps(0);
   try {
@@ -5599,6 +5779,9 @@ int main() {
     Run("conditional buffer materialization", TestConditionalBufferMaterialization);
     Run("guarded scalar descriptor reads", TestGuardedScalarDescriptorReads);
     Run("ordered scalar read over a written buffer", TestOrderedScalarReadOverWrittenBuffer);
+    Run("written descriptor sized by a gpu count", TestWrittenDescriptorSizedByGpuCount);
+    Run("relative index range fold", TestRelativeIndexRangeFold);
+    Run("index range fold late guard limit", TestIndexRangeFoldRevisitsLateGuardLimit);
     Run("conservative buffer reachability", TestConservativeBufferReachability);
     Run("strided indirect image table", TestStridedIndirectImageTable);
     Run("bindless heap table", TestBindlessHeapTable);

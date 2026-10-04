@@ -168,22 +168,21 @@ private:
 	[[nodiscard]] ImageId       StencilPlaneOwner(const ImageDesc& desc) const;
 	[[nodiscard]] OverlapResult ResolveOverlap(const ImageInfo& requested, BindingType binding,
 	                                           ImageId cached, ImageId merged);
-	[[nodiscard]] ImageId       ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
-	                                                ImageId cached);
-	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
-	void                        RefreshImage(ImageId id);
-	void                        MaterializeColorClear(ImageId id, const ImageDesc& desc,
-	                                                uint32_t metadata_base_layer);
-	void                        InitializeImage(ImageId id);
-	[[nodiscard]] bool          CanDownload(const Image& image) const;
-	void UploadImage(Image& image, Buffer& source, uint64_t source_offset);
-	void DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
-	                   uint64_t destination_size, uint32_t levels);
 	// Displaces an unresolvable overlap victim: parks it when guest memory cannot reproduce it.
 	void                  RetireOverlap(ImageId id, bool abandoned);
 	[[nodiscard]] bool    ParkImage(ImageId id);
 	bool                  UnparkImage(ImageId id);
 	void                  WakeImage(ImageId id, const ImageIds& candidates);
+	[[nodiscard]] ImageId ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
+	                                          ImageId cached);
+	[[nodiscard]] ImageId ExpandImage(const ImageInfo& info, ImageId source);
+	void RefreshImage(ImageId id);
+	void MaterializeColorClear(ImageId id, const ImageDesc& desc, uint32_t metadata_base_layer);
+	void InitializeImage(ImageId id);
+	[[nodiscard]] bool CanDownload(const Image& image) const;
+	void               UploadImage(Image& image, Buffer& source, uint64_t source_offset);
+	void               DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
+	                                 uint64_t destination_size, uint32_t levels);
 	void DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset);
 	void               DownloadColorRegions(Image& image, std::vector<vk::BufferImageCopy>& regions,
 	void               DownloadDepthRegions(Image& image, std::vector<vk::BufferImageCopy>& regions,
@@ -225,19 +224,19 @@ private:
 	ImagePageTable                                    m_image_page_table;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
-	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
-	uint64_t                                          m_total_used_memory  = 0;
-	uint64_t                                          m_trigger_gc_memory  = 0;
-	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;
-	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
-	uint64_t         m_gc_tick                = 0;
 	// Evicted images stay registered until their download lands; m_evict_published has a leaf lock.
 	std::unordered_map<ImageId, uint64_t>  m_evict_pending;
 	std::unordered_map<ImageId, uint64_t>  m_evict_backoff;
 	std::unordered_map<uint64_t, uint64_t> m_evicted_addresses;
 	std::mutex                             m_evict_published_lock;
 	std::vector<ImageId>                   m_evict_published;
+	std::map<uint64_t, MetaDataInfo>       m_surface_metas;
 	std::unordered_map<uint64_t, ImageId>  m_stencil_planes;
+	uint64_t                               m_total_used_memory  = 0;
+	uint64_t                               m_trigger_gc_memory  = 0;
+	uint64_t                               m_pressure_gc_memory = 1536ull * 1024 * 1024;
+	uint64_t                               m_critical_gc_memory = 3ull * 1024 * 1024 * 1024;
+	uint64_t                               m_gc_tick            = 0;
 	uint64_t                               m_gc_frame           = UINT64_MAX;
 	mutable uint32_t m_image_query_epoch      = 0;
 	bool             m_readback_linear_images = false;

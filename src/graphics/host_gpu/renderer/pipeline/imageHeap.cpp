@@ -123,16 +123,19 @@ bool ImageHeap::Acquire(const IR::ImageHeapRequest& request, IR::ImageHeapView& 
 		return false;
 	}
 	auto memory = std::ranges::find_if(m_memories, [&](const auto& candidate) {
-		return candidate->base == request.base && candidate->size == size;
+		return candidate->base == request.base && candidate->table == size;
 	});
 	if (memory == m_memories.end()) {
-		if (!m_context.IsMapped(request.base, size)) return false;
+		// Guests declare tables they map only a prefix of; keys past it select the null slot.
+		const auto mapped = MappedPrefix(request.base, size);
+		if (mapped == 0u) return false;
 		auto created   = std::make_unique<Memory>();
 		created->base  = request.base;
-		created->size  = size;
-		created->words.resize(size / 4u);
-		created->dead.resize(size / 4u);
-		created->dirty_pages.assign((Common::AlignUp(request.base + size, TRACKER_PAGE_SIZE) -
+		created->size  = mapped;
+		created->table = size;
+		created->words.resize(mapped / 4u);
+		created->dead.resize(mapped / 4u);
+		created->dirty_pages.assign((Common::AlignUp(request.base + mapped, TRACKER_PAGE_SIZE) -
 		                             Common::AlignDown(request.base, TRACKER_PAGE_SIZE)) /
 		                                TRACKER_PAGE_SIZE,
 		                            uint8_t {1});
@@ -142,46 +145,93 @@ bool ImageHeap::Acquire(const IR::ImageHeapRequest& request, IR::ImageHeapView& 
 	// A draw refreshes a table and a view takes its changes once, so all programs of the draw see
 	// one snapshot and one set of kinds.
 	if ((*memory)->draw != m_draw) {
+		Grow(**memory);
 		if (!Refresh(**memory)) return false;
 		(*memory)->draw = m_draw;
 	}
+	const auto mapped = (*memory)->size;
+	const auto count  = std::min(
+	    request.count,
+	    mapped >= request.first + 4u ? (mapped - request.first - 4u) / request.step + 1u : 0u);
+	if (count == 0u) return false;
 	auto&      views   = (*memory)->views;
 	const auto profile = IR::ImageHeapResource(*request.root, 0u);
 	auto       view    = std::ranges::find_if(views, [&](const auto& candidate) {
 		return candidate->step == request.step && candidate->first == request.first &&
-		       candidate->count == request.count && candidate->profile == profile;
+		       candidate->count == count && candidate->profile == profile;
 	});
 	if (view == views.end()) {
 		const auto epoch   = Image::heap_epoch.load(std::memory_order_relaxed);
 		auto       created = std::make_unique<View>(View {.memory        = **memory,
 		                                                  .step          = request.step,
 		                                                  .first         = request.first,
-		                                                  .count         = request.count,
+		                                                  .count         = count,
 		                                                  .profile       = profile,
 		                                                  .resolve_epoch = epoch,
 		                                                  .layout_epoch  = epoch});
-		created->slots.resize(size / 4u + 1u);
+		created->slots.resize(mapped / 4u + 1u);
 		created->buffer = std::make_unique<Buffer>(
 		    m_context.GetGraphics(), m_context.GetCommandScheduler(), MemoryUsage::DeviceLocal, 0,
 		    vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eStorageBuffer |
 		        vk::BufferUsageFlagBits::eShaderDeviceAddress,
-		    size + 4u);
-		UpdateProbes(*created, 0u, size);
+		    mapped + 4u);
+		UpdateProbes(*created, 0u, mapped);
 		// The first upload also clears the slots no probe selects.
 		created->dirty_begin = 0;
 		created->dirty_end   = created->slots.size();
 		view = views.insert(views.end(), std::move(created));
+	} else if ((*view)->full) {
+		// Elements freed since may now hold the probes that went null.
+		(*view)->full = false;
+		UpdateProbes(**view, 0u, mapped);
+		(*view)->changed_begin = (*view)->changed_end = 0;
 	} else {
 		// Empty after the first acquire in a draw, since the table refreshes once per draw.
 		UpdateProbes(**view, (*view)->changed_begin, (*view)->changed_end);
 		(*view)->changed_begin = (*view)->changed_end = 0;
 	}
+	if ((*view)->full) {
+		// Out of elements: sampling the null slots would be wrong, so the table enumerates.
+		Drop(**view);
+		views.erase(view);
+		return false;
+	}
+	(*view)->frame = m_context.GetTextureCache().FrameIndex();
 	if (std::ranges::find(m_active, view->get()) == m_active.end()) m_active.push_back(view->get());
 	const auto& selected = **view;
 	result = {.slots      = selected.buffer->BufferDeviceAddress(),
 	          .slot_count = static_cast<uint32_t>(selected.slots.size() - 1u),
 	          .kinds      = selected.kinds};
 	return true;
+}
+
+uint64_t ImageHeap::MappedPrefix(uint64_t base, uint64_t size) const {
+	if (m_context.IsMapped(base, size)) return size;
+	// Mappings are page granular: find the most pages from base's page that are all mapped.
+	const auto origin = Common::AlignDown(base, TRACKER_PAGE_SIZE);
+	uint64_t   low    = 0;
+	uint64_t high = (Common::AlignUp(base + size, TRACKER_PAGE_SIZE) - origin) / TRACKER_PAGE_SIZE;
+	while (high - low > 1u) {
+		const auto middle = low + (high - low) / 2u;
+		(m_context.IsMapped(base, origin + middle * TRACKER_PAGE_SIZE - base) ? low : high) =
+		    middle;
+	}
+	return low == 0u ? 0u : origin + low * TRACKER_PAGE_SIZE - base;
+}
+
+void ImageHeap::Grow(Memory& memory) {
+	// Views keep the prefix they were created with; requests over the longer one make new views.
+	if (memory.size == memory.table || !m_context.IsMapped(memory.base + memory.size, 4u)) return;
+	const auto       mapped = MappedPrefix(memory.base, memory.table);
+	std::scoped_lock lock {m_mutex};
+	memory.words.resize(mapped / 4u);
+	memory.dead.resize(mapped / 4u);
+	// A clamped prefix ends on a page boundary, so the new pages are whole and unread.
+	memory.dirty_pages.resize((Common::AlignUp(memory.base + mapped, TRACKER_PAGE_SIZE) -
+	                           Common::AlignDown(memory.base, TRACKER_PAGE_SIZE)) /
+	                              TRACKER_PAGE_SIZE,
+	                          uint8_t {1});
+	memory.size = mapped;
 }
 
 bool ImageHeap::Refresh(Memory& memory) {
@@ -206,7 +256,11 @@ bool ImageHeap::Refresh(Memory& memory) {
 		const auto [address, end] = PageRange(memory.base, memory.size, m_runs[run].first,
 		                                      m_runs[run].second);
 		m_scratch.resize((end - address) / 4u);
-		if (!LibKernel::Memory::TryReadBufferBacking(address, m_scratch.data(), end - address)) {
+		// Private mappings and the unbacked pages of a sparse mapping have no buffer backing; holes
+		// read as zero until a mapping invalidates them; GPU bytes left undownloaded fail.
+		if (!LibKernel::Memory::TryReadBufferBacking(address, m_scratch.data(), end - address) &&
+		    (m_context.GetBufferCache().HasGpuDirtyBytes(address, end - address) ||
+		     !LibKernel::Memory::CopySparseMemory(address, m_scratch.data(), end - address))) {
 			std::scoped_lock lock {m_mutex};
 			for (; run < m_runs.size(); ++run) {
 				MarkDirty(memory, m_runs[run].first, m_runs[run].second);
@@ -319,19 +373,23 @@ void ImageHeap::Bury() {
 }
 
 uint32_t ImageHeap::Intern(View& view, uint32_t kind, const DescriptorValue& value) {
-	const auto arm = static_cast<uint32_t>(std::ranges::find(view.kind_keys, kind) -
-	                                       view.kind_keys.begin());
-	if (arm == view.kind_keys.size()) {
-		view.kind_keys.push_back(kind);
-		view.kinds.push_back(value);
-	}
 	auto [found, inserted] = view.elements.try_emplace(value, 0u);
 	if (inserted) {
-		found->second    = Allocate();
+		if (found->second == 0u) {
+			view.elements.erase(found);
+			view.full = true;
+			return 0u;
+		}
 		auto& element    = m_elements[found->second];
 		element.value    = value;
 		element.kind     = kind;
 		view.pending.push_back(found->second);
+	}
+	const auto arm =
+	    static_cast<uint32_t>(std::ranges::find(view.kind_keys, kind) - view.kind_keys.begin());
+	if (arm == view.kind_keys.size()) {
+		view.kind_keys.push_back(kind);
+		view.kinds.push_back(value);
 	}
 	++m_elements[found->second].refs;
 	return arm << IR::ImageHeapKindShift | found->second;
@@ -363,9 +421,8 @@ uint32_t ImageHeap::Allocate() {
 		m_retired.pop_front();
 	}
 	if (m_free.empty()) {
-		if (m_elements.size() == IR::ImageHeapCapacity) {
-			EXIT("image heaps exceed %u resident images\n", IR::ImageHeapCapacity);
-		}
+		// Element 0 is the null image, so 0 reports exhaustion.
+		if (m_elements.size() >= m_capacity) return 0u;
 		m_elements.emplace_back();
 		return static_cast<uint32_t>(m_elements.size() - 1u);
 	}
@@ -381,6 +438,33 @@ void ImageHeap::Retire(View& view) {
 	view.released.clear();
 }
 
+void ImageHeap::Drop(View& view) {
+	std::erase(m_active, &view);
+	for (const auto& [value, index]: view.elements) {
+		Unreference(m_elements[index]);
+		view.released.push_back(index);
+	}
+	Retire(view);
+	if (auto& scheduler = m_context.GetCommandScheduler(); scheduler.Active()) {
+		scheduler.DeferOperation([buffer = std::move(view.buffer)] {});
+	}
+}
+
+void ImageHeap::EvictIdle() {
+	// Resident images skip the texture cache's collector, so views of tables the guest stopped
+	// sampling let go of them.
+	const auto frame = m_context.GetTextureCache().FrameIndex();
+	if (frame == m_evict_frame) return;
+	m_evict_frame = frame;
+	for (const auto& memory: m_memories) {
+		std::erase_if(memory->views, [&](const std::unique_ptr<View>& view) {
+			if (frame - view->frame <= IdleFrames) return false;
+			Drop(*view);
+			return true;
+		});
+	}
+}
+
 void ImageHeap::Rebind(RenderExecutor& executor) {
 	KYTY_PROFILER_FUNCTION();
 	auto&      textures = m_context.GetTextureCache();
@@ -394,7 +478,7 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 				const auto& binding = m_elements[index].binding;
 				if (!binding.image_id) continue;
 				const auto* image = textures.m_slot_images.try_get(binding.image_id);
-				if (image == nullptr || !image->registered || image->depth_id ||
+				if (image == nullptr || !image->registered || image->dormant || image->depth_id ||
 				    image->binding.needs_rebind) {
 					mark(index);
 				} else {

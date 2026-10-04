@@ -126,7 +126,7 @@ public:
 		m_buffer_write_epoch = epoch;
 		HeapChanged();
 	}
-	void               ClearBufferModified() noexcept { m_buffer_modified = false; }
+	void ClearBufferModified() noexcept { m_buffer_modified = false; }
 
 	[[nodiscard]] bool Overlaps(uint64_t address, uint64_t size,
 	                            bool pages = false) const noexcept {
@@ -156,17 +156,17 @@ public:
 
 	static inline std::atomic<uint64_t> heap_epoch {0};
 
-	ImageInfo        info;
-	VulkanImage      backing;
 	[[nodiscard]] static bool FormatHasStencil(vk::Format format) noexcept;
 	// vkCmdCopyImage needs matching aspect masks, so only identical formats carry stencil.
 	[[nodiscard]] static bool CopyCarriesStencil(vk::Format source,
 	                                             vk::Format destination) noexcept;
 
+	ImageInfo                    info;
+	VulkanImage                  backing;
 	std::vector<CachedImageView> views;
-	ImageUsage       usage;
-	ImageBinding     binding;
-	bool             registered     = false;
+	ImageUsage                   usage;
+	ImageBinding                 binding;
+	bool                         registered = false;
 	// Parked: registered and collectable, but no longer an answer to an overlapping lookup.
 	bool             dormant        = false;
 	mutable uint32_t query_epoch    = 0;

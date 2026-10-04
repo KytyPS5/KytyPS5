@@ -257,6 +257,8 @@ struct ImageHeapTestAccess {
   static ImageId ImageOf(const ImageHeap &heap, uint32_t entry) {
     return Element(heap, entry).binding.image_id;
   }
+  static constexpr uint64_t IdleFrames = ImageHeap::IdleFrames;
+  static void SetCapacity(ImageHeap &heap, uint32_t capacity) { heap.m_capacity = capacity; }
 };
 
 struct TextureCacheTestAccess {
@@ -403,6 +405,16 @@ struct TextureCacheTestAccess {
   static void DeleteImage(TextureCache &cache, ImageId id) {
     std::lock_guard lock(cache.m_lock);
     cache.DeleteImage(id);
+  }
+
+  static void FreeImage(TextureCache &cache, ImageId id) {
+    std::lock_guard lock(cache.m_lock);
+    cache.FreeImage(id);
+  }
+
+  static bool ParkImage(TextureCache &cache, ImageId id) {
+    std::lock_guard lock(cache.m_lock);
+    return cache.ParkImage(id);
   }
 
   static const Image *Owner(const TextureCache &cache, ImageId id) {
@@ -1909,7 +1921,8 @@ void CheckSpirvEmission(const TestCase &test, const std::vector<u32> &spirv) {
   }
 }
 
-CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
+CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64,
+                           ShaderRecompiler::IR::ImageHeapSource *image_heap = nullptr) {
   auto user_data =
       MakeNativeUserData(test.has_user_data ? &test.user_data : nullptr);
   const auto uses_image =
@@ -1955,6 +1968,7 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
       .userdata = const_cast<std::vector<u32> *>(&test.initial),
       .read_specialization_memory = ReadTestMemory,
       .workgroup_counts = workgroup_counts,
+      .image_heap = image_heap,
   };
   Require(test.name, "resource materialization", materialized,
           "translated resources could not be materialized: " +
@@ -6357,6 +6371,362 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // A 4x4 linear 2D texture descriptor, as CheckResidentImageHeap writes them.
+  static std::array<uint32_t, 8> HeapTextureDescriptor(
+      uint64_t address, Prospero::BufferFormat format = Prospero::BufferFormat::k8_8_8_8UNorm) {
+    std::array<uint32_t, 8> words{};
+    words[0] = static_cast<uint32_t>(address >> 8u);
+    words[1] = static_cast<uint32_t>(address >> 40u) | (static_cast<uint32_t>(format) << 20u);
+    words[2] = 3u | (3u << 14u);
+    words[3] = DstSel(4, 5, 6, 7) | (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u);
+    return words;
+  }
+
+  // Runs body(context, draw) on a fresh RenderContext with a compute layout holding the heap set.
+  template <typename Body> void WithImageHeap(const char *name, Body &&body) {
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    auto &device = context.GetGraphics().device;
+    const vk::DescriptorSetLayoutCreateInfo empty_info{};
+    vk::DescriptorSetLayout empty = nullptr;
+    vk::PipelineLayout layout = nullptr;
+    Require(name, "set 0 layout",
+            device.createDescriptorSetLayout(&empty_info, nullptr, &empty) == vk::Result::eSuccess,
+            "could not create the set 0 layout");
+    const std::array set_layouts{empty, context.GetGraphics().image_heap_layout};
+    vk::PipelineLayoutCreateInfo layout_info{};
+    layout_info.setLayoutCount = 2;
+    layout_info.pSetLayouts = set_layouts.data();
+    Require(name, "pipeline layout",
+            device.createPipelineLayout(&layout_info, nullptr, &layout) == vk::Result::eSuccess,
+            "could not create a pipeline layout with the heap set");
+    auto &heap = context.GetImageHeap();
+    const auto draw = [&] {
+      heap.Rebind(context.GetRenderExecutor());
+      heap.Commit(scheduler.Current(), vk::PipelineBindPoint::eCompute, layout);
+      scheduler.Finish();
+      heap.BeginDraw();
+    };
+    body(context, draw);
+    scheduler.Finish();
+    device.destroyPipelineLayout(layout, nullptr);
+    device.destroyDescriptorSetLayout(empty, nullptr);
+  }
+
+  // A table declared longer than its mapping serves the mapped prefix, and a longer prefix once
+  // the guest maps more of it.
+  void CheckImageHeapMappedPrefix() {
+    constexpr const char *name = "ImageHeapMappedPrefix";
+    constexpr uint64_t base = 0x0000000206c00000ull;
+    constexpr uint64_t reserved = 0x200000;
+    constexpr uint64_t page = 0x10000;
+    constexpr uint64_t table = base + 0x100000;
+    constexpr uint64_t table_size = 0x40000;
+    constexpr uint64_t mapped = table + page - base;
+    namespace IR = ShaderRecompiler::IR;
+    EnsureRuntimeContext();
+    void *reservation = reinterpret_cast<void *>(base);
+    Require(name, "reservation",
+            LibKernel::Memory::KernelReserveVirtualRange(&reservation, reserved, 0x10, page) == 0,
+            "table reservation failed");
+    int64_t direct = -1;
+    Require(name, "direct allocation",
+            LibKernel::Memory::KernelAllocateDirectMemory(
+                0, LibKernel::Memory::KernelGetDirectMemorySize(), mapped + page, page, 0,
+                &direct) == 0,
+            "table allocation failed");
+    const auto map = [&](uint64_t address, uint64_t size, int64_t offset) {
+      void *at = reinterpret_cast<void *>(address);
+      Require(name, "map", LibKernel::Memory::KernelMapDirectMemory(&at, size, 0x3, 0x10,
+                                                                     direct + offset, page) == 0,
+              "table mapping failed");
+      std::memset(at, 0, size);
+    };
+    const auto texture = [](uint32_t index) { return base + 0x10000u + index * 0x1000u; };
+    map(base, mapped, 0);
+    for (uint32_t probe = 0; probe < 2u; ++probe) {
+      const auto words = HeapTextureDescriptor(texture(probe));
+      std::memcpy(reinterpret_cast<void *>(table + probe * 32u), words.data(), sizeof(words));
+    }
+    WithImageHeap(name, [&](RenderContext &context, const auto &draw) {
+      context.MapMemory(base, mapped);
+      auto &heap = context.GetImageHeap();
+      auto &textures = context.GetTextureCache();
+      IR::ImageResource sampled{};
+      sampled.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      sampled.unfiltered_access_only = false;
+      IR::ImageHeapView view{};
+      const auto acquire = [&] {
+        return heap.Acquire({table, table_size, 32u, 0u, table_size / 32u, &sampled}, view);
+      };
+      // The heap creates the table memory on its first acquire.
+      const auto views = [&]() -> const auto & { return ImageHeapTestAccess::Views(heap); };
+      Require(name, "mapped prefix",
+              acquire() && view.slot_count == page / 4u && view.kinds.size() == 1u &&
+                  views().size() == 1u && views()[0]->count == page / 32u &&
+                  views()[0]->slots[0] != 0u && views()[0]->slots[8] != 0u &&
+                  views()[0]->slots[0] != views()[0]->slots[8],
+              "a partly mapped table was declined or served past its mapped prefix");
+      draw();
+      const auto resident = ImageHeapTestAccess::ImageOf(heap, views()[0]->slots[8]);
+      Require(name, "prefix images",
+              resident && textures.GetImage(resident).heap_refs.load() == 1u,
+              "the mapped prefix did not resolve its images");
+
+      // The guest maps the next 64 KiB of the table.
+      map(table + page, page, mapped);
+      const auto grown = HeapTextureDescriptor(texture(2));
+      std::memcpy(reinterpret_cast<void *>(table + page), grown.data(), sizeof(grown));
+      context.MapMemory(table + page, page);
+      Require(name, "grown prefix",
+              acquire() && view.slot_count == 2u * page / 4u && views().size() == 2u &&
+                  views()[1]->count == 2u * page / 32u && views()[1]->slots[0] != 0u &&
+                  views()[1]->slots[page / 4u] != 0u,
+              "a table did not take the pages mapped after its first acquire");
+      draw();
+      Require(name, "grown images",
+              static_cast<bool>(ImageHeapTestAccess::ImageOf(heap, views()[1]->slots[page / 4u])),
+              "a descriptor in the newly mapped pages was not resolved");
+      context.UnmapMemory(base, mapped + page);
+    });
+    Require(name, "unmap", LibKernel::Memory::KernelMunmap(base, reserved) == 0,
+            "table unmap failed");
+    Require(name, "release",
+            LibKernel::Memory::KernelReleaseDirectMemory(direct, mapped + page) == 0,
+            "table release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // A table over a mapped range with unbacked pages, as in a sparse aperture, reads them as null
+  // descriptors and rereads them once they are mapped.
+  void CheckImageHeapSparseTable() {
+    constexpr const char *name = "ImageHeapSparseTable";
+    constexpr uint64_t base = 0x0000000206c00000ull;
+    constexpr uint64_t reserved = 0x200000;
+    constexpr uint64_t page = 0x4000;
+    constexpr uint64_t table = base + 0x100000;
+    constexpr uint64_t table_size = 0x10000;
+    constexpr uint64_t hole = table + page;
+    constexpr uint64_t after = hole + page;
+    constexpr uint64_t direct_size = table_size + 0x100000;
+    namespace IR = ShaderRecompiler::IR;
+    EnsureRuntimeContext();
+    void *reservation = reinterpret_cast<void *>(base);
+    Require(name, "reservation",
+            LibKernel::Memory::KernelReserveVirtualRange(&reservation, reserved, 0x10, 0x10000) ==
+                0,
+            "table reservation failed");
+    int64_t direct = -1;
+    Require(name, "direct allocation",
+            LibKernel::Memory::KernelAllocateDirectMemory(
+                0, LibKernel::Memory::KernelGetDirectMemorySize(), direct_size, 0x10000, 0,
+                &direct) == 0,
+            "table allocation failed");
+    const auto map = [&](uint64_t address, uint64_t size) {
+      void *at = reinterpret_cast<void *>(address);
+      Require(name, "map", LibKernel::Memory::KernelMapDirectMemory(&at, size, 0x3, 0x10,
+                                                                     direct + (address - base),
+                                                                     page) == 0,
+              "table mapping failed");
+      std::memset(at, 0, size);
+    };
+    const auto texture = [](uint32_t index) { return base + 0x10000u + index * 0x1000u; };
+    const auto put = [](uint64_t address, const std::array<uint32_t, 8> &words) {
+      std::memcpy(reinterpret_cast<void *>(address), words.data(), sizeof(words));
+    };
+    map(base, hole - base);
+    map(after, table + table_size - after);
+    put(table, HeapTextureDescriptor(texture(0)));
+    put(after, HeapTextureDescriptor(texture(1)));
+    WithImageHeap(name, [&](RenderContext &context, const auto &draw) {
+      // The GPU sees the whole range mapped, the hole included.
+      context.MapMemory(base, table + table_size - base);
+      auto &heap = context.GetImageHeap();
+      IR::ImageResource sampled{};
+      sampled.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      sampled.unfiltered_access_only = false;
+      IR::ImageHeapView view{};
+      const auto acquire = [&] {
+        return heap.Acquire({table, table_size, 32u, 0u, table_size / 32u, &sampled}, view);
+      };
+      // The heap creates the table memory on its first acquire.
+      const auto views = [&]() -> const auto & { return ImageHeapTestAccess::Views(heap); };
+      const auto slot = [](uint64_t address) { return (address - table) / 4u; };
+      Require(name, "sparse table",
+              acquire() && view.slot_count == table_size / 4u && views().size() == 1u &&
+                  views()[0]->slots[slot(table)] != 0u && views()[0]->slots[slot(after)] != 0u &&
+                  views()[0]->slots[slot(hole)] == 0u,
+              "a table over unbacked pages was declined or read the hole as a descriptor");
+      draw();
+      Require(name, "sparse images",
+              static_cast<bool>(ImageHeapTestAccess::ImageOf(heap, views()[0]->slots[slot(after)])),
+              "a descriptor after the hole was not resolved");
+
+      // A mapping fills the hole without a write fault.
+      map(hole, page);
+      put(hole, HeapTextureDescriptor(texture(2)));
+      context.MapMemory(hole, page);
+      Require(name, "filled hole", acquire() && views()[0]->slots[slot(hole)] != 0u,
+              "a page mapped into the hole was not read again");
+      draw();
+      Require(name, "filled image",
+              static_cast<bool>(ImageHeapTestAccess::ImageOf(heap, views()[0]->slots[slot(hole)])),
+              "the descriptor mapped into the hole was not resolved");
+      context.UnmapMemory(base, table + table_size - base);
+    });
+    Require(name, "unmap", LibKernel::Memory::KernelMunmap(base, reserved) == 0,
+            "table unmap failed");
+    Require(name, "release", LibKernel::Memory::KernelReleaseDirectMemory(direct, direct_size) == 0,
+            "table release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // Maps base..base + 2 MiB with two 64-KiB descriptor tables at +1 MiB, runs body, and unmaps.
+  template <typename Body> void WithImageHeapTable(const char *name, Body &&body) {
+    constexpr uintptr_t base = 0x0000000206c00000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    EnsureRuntimeContext();
+    int64_t direct = -1;
+    Require(name, "direct allocation",
+            LibKernel::Memory::KernelAllocateDirectMemory(
+                0, LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size,
+                allocation_size, 0, &direct) == 0,
+            "image heap allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            LibKernel::Memory::KernelMapDirectMemory(&mapped, allocation_size, 0x3, 0x10, direct,
+                                                     allocation_size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "image heap mapping failed");
+    std::memset(mapped, 0, allocation_size);
+    WithImageHeap(name, [&](RenderContext &context, const auto &draw) {
+      context.MapMemory(base, allocation_size);
+      body(context, draw, uint64_t{base});
+      context.UnmapMemory(base, allocation_size);
+    });
+    Require(name, "unmap", LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "image heap unmap failed");
+    Require(name, "release",
+            LibKernel::Memory::KernelReleaseDirectMemory(direct, allocation_size) == 0,
+            "image heap release failed");
+  }
+
+  // A view no draw acquires for more than ImageHeap::IdleFrames frames releases its images to the
+  // texture cache's collector; views in use stay.
+  void CheckImageHeapIdleViews() {
+    constexpr const char *name = "ImageHeapIdleViews";
+    namespace IR = ShaderRecompiler::IR;
+    WithImageHeapTable(name, [&](RenderContext &context, const auto &draw, uint64_t base) {
+      const uint64_t table = base + 0x100000;
+      constexpr uint64_t table_size = 0x10000;
+      const auto words = HeapTextureDescriptor(base + 0x10000u);
+      std::memcpy(reinterpret_cast<void *>(table), words.data(), sizeof(words));
+      auto &heap = context.GetImageHeap();
+      auto &textures = context.GetTextureCache();
+      IR::ImageResource sampled{};
+      sampled.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      sampled.unfiltered_access_only = false;
+      auto unfiltered = sampled;
+      unfiltered.unfiltered_access_only = true;
+      IR::ImageHeapView view{};
+      const auto acquire = [&](const IR::ImageResource &root) {
+        return heap.Acquire({table, table_size, 32u, 0u, table_size / 32u, &root}, view);
+      };
+      // The heap creates the table memory on its first acquire.
+      const auto views = [&]() -> const auto & { return ImageHeapTestAccess::Views(heap); };
+      Require(name, "sampled view", acquire(sampled), "the table was declined");
+      Require(name, "unfiltered view", acquire(unfiltered) && views().size() == 2u,
+              "a second root profile did not get its own view");
+      draw();
+      const auto resident = ImageHeapTestAccess::ImageOf(heap, views()[0]->slots[0]);
+      const auto refs = [&] { return textures.GetImage(resident).heap_refs.load(); };
+      Require(name, "resident image", resident && refs() == 2u, "the views did not pin the image");
+      const auto frame = [&] {
+        textures.AdvanceFrame();
+        heap.BeginDraw();
+        Require(name, "used view", acquire(unfiltered), "the used view was declined");
+        draw();
+      };
+      for (uint64_t pass = 0; pass < ImageHeapTestAccess::IdleFrames; ++pass) frame();
+      Require(name, "recently used", views().size() == 2u && refs() == 2u,
+              "a view was evicted before it was idle for the full frame count");
+      frame();
+      Require(name, "idle view",
+              views().size() == 1u && views()[0]->profile.unfiltered_access_only && refs() == 1u,
+              "an idle view kept its images pinned, or a used view was evicted");
+      Require(name, "reacquired view", acquire(sampled) && views().size() == 2u,
+              "an evicted view was not created again");
+      draw();
+      Require(name, "repinned image",
+              ImageHeapTestAccess::ImageOf(heap, views()[1]->slots[0]) == resident && refs() == 2u,
+              "a recreated view did not pin its image again");
+    });
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // Running out of heap elements declines the table instead of exiting, and a view whose
+  // rediscovery ran out takes the elements freed since on its next acquire.
+  void CheckImageHeapOverflow() {
+    constexpr const char *name = "ImageHeapOverflow";
+    namespace IR = ShaderRecompiler::IR;
+    WithImageHeapTable(name, [&](RenderContext &context, const auto &draw, uint64_t base) {
+      const uint64_t table = base + 0x100000;
+      constexpr uint64_t table_size = 0x10000;
+      const auto texture = [&](uint32_t index) { return base + 0x10000u + index * 0x1000u; };
+      for (uint32_t probe = 0; probe < 4u; ++probe) {
+        const auto words = HeapTextureDescriptor(texture(probe));
+        std::memcpy(reinterpret_cast<void *>(table + probe * 32u), words.data(), sizeof(words));
+      }
+      auto &heap = context.GetImageHeap();
+      auto &scheduler = context.GetCommandScheduler();
+      IR::ImageResource sampled{};
+      sampled.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      sampled.unfiltered_access_only = false;
+      IR::ImageHeapView view{};
+      const auto acquire = [&] {
+        return heap.Acquire({table, table_size, 32u, 0u, table_size / 32u, &sampled}, view);
+      };
+      // The heap creates the table memory on its first acquire.
+      const auto views = [&]() -> const auto & { return ImageHeapTestAccess::Views(heap); };
+      // The null element and two more.
+      ImageHeapTestAccess::SetCapacity(heap, 3u);
+      Require(name, "over capacity",
+              !acquire() && views().empty() && ImageHeapTestAccess::ElementCount(heap) == 3u,
+              "a table with more images than the heap holds was not declined");
+      scheduler.Finish();
+      heap.BeginDraw();
+      ImageHeapTestAccess::SetCapacity(heap, 5u);
+      Require(name, "within capacity",
+              acquire() && views().size() == 1u && views()[0]->slots[0] != 0u &&
+                  views()[0]->slots[8] != 0u && views()[0]->slots[16] != 0u &&
+                  views()[0]->slots[24] != 0u && ImageHeapTestAccess::ElementCount(heap) == 5u,
+              "a table that fits was declined or did not reuse the declined view's elements");
+      draw();
+      const auto first = ImageHeapTestAccess::ImageOf(heap, views()[0]->slots[0]);
+      Require(name, "resolved", static_cast<bool>(first), "the first image was not resolved");
+
+      // Rediscovering a freed image needs a new element while every element is taken.
+      context.GetTextureCache().UnmapMemory(texture(0), 0x1000u);
+      Require(name, "stale view", acquire(), "the view was declined");
+      heap.Rebind(context.GetRenderExecutor());
+      Require(name, "full rediscovery", views()[0]->slots[0] == 0u && views()[0]->slots[8] != 0u,
+              "a rediscovery without a free element did not leave its probe null");
+      draw();
+      Require(name, "refilled view",
+              acquire() && views().size() == 1u && views()[0]->slots[0] != 0u,
+              "a view left short of elements did not take the freed ones");
+      draw();
+      Require(name, "refilled image",
+              static_cast<bool>(ImageHeapTestAccess::ImageOf(heap, views()[0]->slots[0])),
+              "the refilled probe was not resolved");
+    });
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   void CheckResidentImageHeap() {
     constexpr const char *name = "ResidentImageHeap";
     constexpr uintptr_t base = 0x0000000206800000ull;
@@ -6640,8 +7010,1296 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  // Parking, unregistering or re-associating a resident image moves its slots onto whatever
+  // now answers the descriptor.
+  void CheckImageHeapRetiredImages() {
+    constexpr const char *name = "ImageHeapRetiredImages";
+    constexpr uintptr_t base = 0x0000000207400000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint64_t table = base + 0x100000;
+    constexpr uint64_t table_size = 0x10000;
+    namespace IR = ShaderRecompiler::IR;
+    using Format = Prospero::BufferFormat;
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_size, 0, &direct_offset) == 0,
+            "image heap allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_size) == 0 && mapped == reinterpret_cast<void *>(base),
+            "image heap mapping failed");
+    std::memset(mapped, 0, allocation_size);
+    const auto texture = [](uint32_t index) { return base + 0x10000u + index * 0x1000u; };
+    // A 4x4 linear 2D texture per index.
+    const auto descriptor = [&](uint32_t index, Format format) {
+      std::array<uint32_t, 8> words{};
+      words[0] = static_cast<uint32_t>(texture(index) >> 8u);
+      words[1] = static_cast<uint32_t>(texture(index) >> 40u) |
+                 (static_cast<uint32_t>(format) << 20u) | (3u << 30u);
+      words[2] = 3u << 14u;
+      words[3] = DstSel(4, 5, 6, 7) |
+                 (static_cast<uint32_t>(Prospero::ImageType::kColor2D) << 28u);
+      return words;
+    };
+    const auto put = [&](uint64_t probe, const std::array<uint32_t, 8> &words) {
+      std::memcpy(reinterpret_cast<void *>(table + probe * 32u), words.data(), sizeof(words));
+    };
+    put(0, descriptor(0, Format::k8_8_8_8UNorm));
+    put(2, descriptor(1, Format::k8UNorm));
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(base, allocation_size);
+      auto &heap = context.GetImageHeap();
+      auto &executor = context.GetRenderExecutor();
+      auto &textures = context.GetTextureCache();
+      auto &device = context.GetGraphics().device;
+      const vk::DescriptorSetLayoutCreateInfo empty_info{};
+      vk::DescriptorSetLayout empty = nullptr;
+      vk::PipelineLayout layout = nullptr;
+      Require(name, "set 0 layout",
+              device.createDescriptorSetLayout(&empty_info, nullptr, &empty) ==
+                  vk::Result::eSuccess,
+              "could not create the set 0 layout");
+      const std::array set_layouts{empty, context.GetGraphics().image_heap_layout};
+      vk::PipelineLayoutCreateInfo layout_info{};
+      layout_info.setLayoutCount = 2;
+      layout_info.pSetLayouts = set_layouts.data();
+      Require(name, "pipeline layout",
+              device.createPipelineLayout(&layout_info, nullptr, &layout) == vk::Result::eSuccess,
+              "could not create a pipeline layout with the heap set");
+
+      IR::ImageResource sampled{};
+      sampled.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      sampled.unfiltered_access_only = false;
+      IR::ImageHeapView view{};
+      const auto draw = [&] {
+        Require(name, "acquire",
+                heap.Acquire({table, table_size, 32u, 0u, table_size / 32u, &sampled}, view),
+                "the table was declined");
+        heap.Rebind(executor);
+        heap.Commit(scheduler.Current(), vk::PipelineBindPoint::eCompute, layout);
+        scheduler.Finish();
+        heap.BeginDraw();
+      };
+      constexpr uint32_t color_slot = 0u;
+      constexpr uint32_t plane_slot = 16u;
+      draw();
+      const auto &slots = ImageHeapTestAccess::Views(heap)[0]->slots;
+      const auto first = ImageHeapTestAccess::ImageOf(heap, slots[color_slot]);
+      Require(name, "resident image",
+              first && textures.GetImage(first).heap_refs.load() == 1u,
+              "the descriptor did not resolve to a pinned image");
+
+      // A parked image no longer answers its descriptor; the live one at its address does.
+      const auto replacement =
+          TextureCacheTestAccess::InsertImage(textures, textures.GetImage(first).info);
+      Require(name, "park", TextureCacheTestAccess::ParkImage(textures, first),
+              "the resident image could not be parked");
+      draw();
+      Require(name, "parked image",
+              ImageHeapTestAccess::ImageOf(heap, slots[color_slot]) == replacement &&
+                  textures.GetImage(first).heap_refs.load() == 0u &&
+                  textures.GetImage(replacement).heap_refs.load() == 1u,
+              "the slot kept sampling a parked image");
+
+      // Unregistering the replacement hands the descriptor back to the parked image.
+      TextureCacheTestAccess::FreeImage(textures, replacement);
+      draw();
+      Require(name, "unregistered image",
+              ImageHeapTestAccess::ImageOf(heap, slots[color_slot]) == first &&
+                  textures.GetImage(first).registered && !textures.GetImage(first).dormant,
+              "the slot kept sampling an unregistered image");
+
+      // A depth image claiming the R8 image as its stencil plane turns it into a proxy.
+      const auto plane_entry = slots[plane_slot];
+      const auto plane = ImageHeapTestAccess::ImageOf(heap, plane_entry);
+      Require(name, "plane image", static_cast<bool>(plane), "the R8 descriptor did not resolve");
+      const auto stencil = textures.GetImage(plane).info.data;
+      const auto extent = textures.GetImage(plane).info.extent;
+      auto depth = MakeLinearDesc(texture(8), 4u * extent.width * extent.height,
+                                  vk::Format::eD32SfloatS8Uint, Format::k32Float,
+                                  Prospero::ImageType::kColor2D, extent, 1, 4, 1);
+      depth.type = TextureCache::BindingType::DepthTarget;
+      depth.info.stencil = stencil;
+      depth.view_info.aspect = vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
+      depth.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+      const auto depth_id = textures.FindImage(depth);
+      TextureCacheTestAccess::AssociateStencil(textures, depth_id, stencil);
+      Require(name, "stencil proxy", textures.GetImage(plane).depth_id == depth_id,
+              "the depth image did not claim the R8 image as its stencil plane");
+      draw();
+      const auto color = ImageHeapTestAccess::ImageOf(heap, slots[plane_slot]);
+      Require(name, "associated image",
+              slots[plane_slot] != plane_entry && color && color != plane &&
+                  !textures.GetImage(color).depth_id &&
+                  textures.GetImage(plane).heap_refs.load() == 0u,
+              "the slot kept sampling an image that became a stencil proxy");
+
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+      device.destroyPipelineLayout(layout, nullptr);
+      device.destroyDescriptorSetLayout(empty, nullptr);
+    }
+    Require(name, "unmap", Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "image heap unmap failed");
+    Require(name, "release", Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "image heap release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // A dispatch that samples an image through the heap sees the write of the dispatch before it.
+  // It must not join the writer's barrier group: its heap commit uploads slot words.
+  void CheckImageHeapDispatchBarrier() {
+    constexpr const char *name = "ImageHeapDispatchBarrier";
+    constexpr uintptr_t base = 0x0000000207600000ull;
+    constexpr uint64_t size = 0x200000;
+    constexpr uint64_t texture = base + 0x10000;
+    constexpr uint64_t output = base + 0x20000;
+    constexpr uint64_t table = base + 0x100000;
+    constexpr u32 stride = 48;
+    constexpr u32 records = 2048; // Large enough for the heap to keep the table resident.
+    constexpr u32 key = 5;
+    constexpr std::array written{1.5f, 2.5f, 3.5f, 4.5f};
+    // Stores the key for every lane; the reader's per-lane load keeps it from the host.
+    std::vector<u32> keyer;
+    AppendVMovU32(&keyer, 1, key);
+    keyer.insert(keyer.end(), {EncodeVop2(0x1a, 30, InlineU32(2), 0), // v_lshlrev_b32 v30, 2, v0
+                               EncodeMubuf0(0x1c), EncodeMubuf1(1, 3, 30)});
+    AppendEnd(&keyer);
+    // Lane 0 stores texel (0, 0).
+    std::vector<u32> writer{EncodeVopc(0xd2, InlineU32(0), 0), EncodeVop1(0x01, 21, InlineU32(0)),
+                            EncodeVop1(0x01, 22, InlineU32(0))};
+    for (u32 i = 0; i < 4; ++i)
+      AppendVMovLiteral(&writer, 1 + i, std::bit_cast<u32>(written[i]));
+    writer.insert(writer.end(), {EncodeMimg0(0x08, 0xf), EncodeMimg1(1, 21)});
+    AppendEnd(&writer);
+    // Samples texel (0, 0) of the record the key selects.
+    std::vector<u32> reader;
+    reader.insert(reader.end(), {
+        EncodeVop2(0x1a, 30, InlineU32(2), 0),         // v_lshlrev_b32 v30, 2, v0
+        EncodeMubuf0(0x0c), EncodeMubuf1(1, 3, 30),    // buffer_load_dword v1, v30, s[12:15]
+        0xbf8c3f70u,                                   // s_waitcnt vmcnt(0)
+        EncodeVop1(0x02, 18, Vgpr(1)),                 // v_readfirstlane_b32 s18, v1
+        EncodeSop2(0x26, 20, 18, 255u), stride,        // s_mul_i32 s20, s18, 48
+        EncodeSmem0(0x0b, 24, 2), EncodeSmem1(16, 20), // s_buffer_load_dwordx8 s[24:31], s[4:7]
+        0xbf8cc07fu});                                 // s_waitcnt lgkmcnt(0)
+    AppendVMovLiteral(&reader, 20, std::bit_cast<u32>(0.125f));
+    AppendVMovLiteral(&reader, 21, std::bit_cast<u32>(0.125f));
+    reader.insert(reader.end(), {EncodeMimg0(0x27, 0xf), EncodeMimg1(2, 20, 6, 2), 0xbf8c3f70u});
+    AppendVMovU32(&reader, 30, 256);
+    reader.insert(reader.end(), {EncodeMubuf0(0x1e), EncodeMubuf1(2, 3, 30)});
+    AppendEnd(&reader);
+    for (const auto *code : {&keyer, &writer, &reader})
+      ShaderMapUserData(reinterpret_cast<uint64_t>(code->data()),
+          {.type = Prospero::ShaderBinaryType::kCs,
+           .code_size_bytes = static_cast<u32>(code->size() * sizeof(u32))});
+
+    EnsureRuntimeContext();
+    int64_t physical = -1;
+    Require(name, "allocate", LibKernel::Memory::KernelAllocateDirectMemory(
+        0, LibKernel::Memory::KernelGetDirectMemorySize(), size, size, 0, &physical) == 0,
+        "image heap allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "map", LibKernel::Memory::KernelMapDirectMemory(
+        &mapped, size, 0x3, 0x10, physical, size) == 0 && mapped == reinterpret_cast<void *>(base),
+        "image heap mapping failed");
+    std::memset(mapped, 0, size);
+    // A 4x4 linear float texture.
+    std::array<u32, 8> tsharp{};
+    tsharp[0] = static_cast<u32>(texture >> 8u);
+    tsharp[1] = static_cast<u32>(texture >> 40u) |
+                (static_cast<u32>(Prospero::BufferFormat::k32_32_32_32Float) << 20u) | (3u << 30u);
+    tsharp[2] = 3u << 14u;
+    tsharp[3] = DstSel(4, 5, 6, 7) | (static_cast<u32>(Prospero::TileMode::kLinear) << 20u) |
+                (static_cast<u32>(Prospero::ImageType::kColor2D) << 28u);
+    std::memcpy(reinterpret_cast<void *>(table + key * stride + 16u), tsharp.data(),
+                sizeof(tsharp));
+    std::array<u32, 16> sgprs{};
+    sgprs[4] = static_cast<u32>(table);
+    sgprs[5] = static_cast<u32>(table >> 32u) | (stride << 16u);
+    sgprs[6] = records;
+    sgprs[8] = 0x92u;
+    sgprs[9] = 0x00fff000u;
+    ShaderBufferResource buffer{};
+    buffer.UpdateAddress48(output);
+    buffer.fields[2] = 512u;
+    buffer.fields[3] = DstSel(4, 5, 6, 7) |
+        (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u) | (3u << 28u);
+    std::copy_n(buffer.fields, 4, sgprs.begin() + 12);
+    auto writer_sgprs = sgprs;
+    std::copy(tsharp.begin(), tsharp.end(), writer_sgprs.begin());
+
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      context.MapMemory(base, size);
+      auto &shaders = processor.GetShCtx();
+      const auto dispatch = [&](const std::vector<u32> &code, const std::array<u32, 16> &user) {
+        for (u32 sgpr = 0; sgpr < 16; ++sgpr)
           shaders.SetCsUserSgpr(sgpr, user[sgpr]);
+        shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(code.data()),
+                             .num_thread_x = 64, .num_thread_y = 1, .num_thread_z = 1,
+                             .wave_size = 64, .user_sgpr = 16});
+        processor.DispatchDirect(1, 1, 1, 0x41u);
+      };
+      dispatch(keyer, sgprs);
+      // The writer opens its own barrier group, which the reader's buffer access does not meet.
+      context.GetCommandScheduler().Current().FlushDeferredBarrier();
+      dispatch(writer, writer_sgprs);
+      dispatch(reader, sgprs);
+      std::array<u32, 4> actual{};
+      context.GetBufferCache().ReadMemory(output + 256u, sizeof(actual));
+      Require(name, "heap sample",
+              ImageHeapTestAccess::MemoryCount(context.GetImageHeap()) == 1u,
+              "the reader did not sample through the resident heap");
+      Require(name, "sampled write",
+              LibKernel::Memory::TryReadBacking(output + 256u, actual.data(), sizeof(actual)) &&
+                  actual == std::bit_cast<std::array<u32, 4>>(written),
+              "the heap sample did not see the previous dispatch's image write");
+      context.UnmapMemory(base, size);
+      context.GetCommandScheduler().Finish();
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "release",
+            LibKernel::Memory::KernelCheckedReleaseDirectMemory(physical, size) == 0,
+            "image heap release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // The heap rig: a guest table of HeapRigRecords 48-byte records with each T# at +16, the RE
+  // engine heap layout, at +1 MiB; per-lane keys at +64 KiB (key k at +k * 256) with the results
+  // at keys + HeapRigOutput; textures from +256 KiB, 16 KiB apart.
+  static constexpr uint64_t HeapRigBase = 0x000000020d000000ull;
+  static constexpr uint64_t HeapRigSize = 0x200000;
+  static constexpr uint64_t HeapRigTable = HeapRigBase + 0x100000;
+  static constexpr uint64_t HeapRigKeys = HeapRigBase + 0x10000;
+  static constexpr u32 HeapRigOutput = 0x800;
+  static constexpr u32 HeapRigStride = 48;
+  static constexpr u32 HeapRigRecords = 2048; // 96 KiB, past the heap's minimum table size.
+
+  static constexpr uint64_t HeapRigTexture(u32 index) {
+    return HeapRigBase + 0x40000 + index * 0x4000ull;
+  }
+
+  // A linear T# of `type` with a width x height top level.
+  static std::array<u32, 8> HeapRigDescriptor(uint64_t address, Prospero::BufferFormat format,
+                                              Prospero::ImageType type, u32 width = 4,
+                                              u32 height = 4, u32 depth_field = 0,
+                                              u32 last_level = 0) {
+    std::array<u32, 8> words{};
+    words[0] = static_cast<u32>(address >> 8u);
+    words[1] = static_cast<u32>(address >> 40u) | (static_cast<u32>(format) << 20u) |
+               ((width - 1u) << 30u);
+    words[2] = ((width - 1u) >> 2u) | ((height - 1u) << 14u);
+    words[3] = DstSel(4, 5, 6, 7) | (last_level << 16u) | (static_cast<u32>(type) << 28u);
+    words[4] = depth_field;
+    words[5] = last_level << 4u;
+    return words;
+  }
+
+  // Before the rig's context exists: plain stores into the mapping.
+  static void HeapRigPut(u32 record, const std::array<u32, 8> &words,
+                         uint64_t table = HeapRigTable) {
+    std::memcpy(reinterpret_cast<void *>(table + record * HeapRigStride + 16u), words.data(),
+                sizeof(words));
+  }
+
+  static void HeapRigFill(u32 texture, u32 value) {
+    std::fill_n(reinterpret_cast<u32 *>(HeapRigTexture(texture)), 0x4000u / 4u, value);
+  }
+
+  // A guest write the renderer sees, as a CPU store into a watched table would fault.
+  static void HeapRigWrite(RenderContext &context, uint64_t address, const void *data,
+                           uint64_t size) {
+    LibKernel::Memory::WriteBacking(address, data, size);
+    Require("ImageHeapRig", "write", context.InvalidateMemory(address, size),
+            "the heap rig was not mapped");
+  }
+
+  static void HeapRigWriteRecord(RenderContext &context, u32 record,
+                                 const std::array<u32, 8> &words, uint64_t table = HeapRigTable) {
+    HeapRigWrite(context, table + record * HeapRigStride + 16u, words.data(), sizeof(words));
+  }
+
+  // Key `index`, read per lane so the host cannot evaluate it, selects the record whose T# lands
+  // in s[24 + 8 * index : 31 + 8 * index]. v30 keeps the lane's key offset.
+  static void AppendHeapRigKey(std::vector<u32> *code, u32 index) {
+    code->insert(code->end(), {
+        EncodeVop2(0x1a, 30, InlineU32(2), 0),                          // v_lshlrev_b32 v30, 2, v0
+        EncodeMubuf0(0x0c, index * 256u), EncodeMubuf1(1, 3, 30),       // buffer_load_dword v1
+        0xbf8c3f70u,                                                    // s_waitcnt vmcnt(0)
+        EncodeVop1(0x02, 18 + index, Vgpr(1)),                          // v_readfirstlane_b32
+        EncodeSop2(0x26, 20 + index, 18 + index, 255u), HeapRigStride,  // s_mul_i32 by 48
+        EncodeSmem0(0x0b, 24 + 8 * index, 2), EncodeSmem1(16, 20 + index), // s_buffer_load_dwordx8
+        0xbf8cc07fu});                                                  // s_waitcnt lgkmcnt(0)
+  }
+
+  // Stores v[first, first + count) to the result dwords and ends the program.
+  static void AppendHeapRigStores(std::vector<u32> *code, u32 first, u32 count) {
+    code->push_back(0xbf8c3f70u);
+    AppendVMovU32(code, 31, 0);
+    for (u32 index = 0; index < count; ++index) {
+      code->insert(code->end(), {EncodeMubuf0(0x1c, HeapRigOutput + index * 4u),
+                                 EncodeMubuf1(first + index, 3, 31)});
+    }
+    AppendEnd(code);
+  }
+
+  // The user SGPRs of a rig dispatch: s[4:7] the table V#, s[8:11] a sampler, s[12:15] the keys.
+  static std::array<u32, 16> HeapRigUserData(uint64_t table = HeapRigTable,
+                                             u32 records = HeapRigRecords, u32 sampler = 0x92u) {
+    std::array<u32, 16> sgprs{};
+    sgprs[4] = static_cast<u32>(table);
+    sgprs[5] = static_cast<u32>(table >> 32u) | (HeapRigStride << 16u);
+    sgprs[6] = records;
+    sgprs[8] = sampler;
+    sgprs[9] = 0x00fff000u;
+    ShaderBufferResource buffer{};
+    buffer.UpdateAddress48(HeapRigKeys);
+    buffer.fields[2] = 0x1000u;
+    buffer.fields[3] = DstSel(4, 5, 6, 7) |
+                       (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u) | (3u << 28u);
+    std::copy_n(buffer.fields, 4, sgprs.begin() + 12);
+    return sgprs;
+  }
+
+  // Two samples, a 2D one by key 0 into v[0:3] and a 3D one by key 1 into v[4:7], at the centre.
+  static std::vector<u32> HeapRigSelectsCode() {
+    std::vector<u32> code;
+    AppendHeapRigKey(&code, 0);
+    AppendHeapRigKey(&code, 1);
+    code.insert(code.end(), {
+        EncodeVop1(0x01, 20, 240u), EncodeVop1(0x01, 21, 240u), EncodeVop1(0x01, 22, 240u),
+        EncodeMimg0(0x27, 0xf), EncodeMimg1(0, 20, 6, 2),                // image_sample_lz dim:2d
+        EncodeMimg0(0x27, 0xf, 0, false, 2), EncodeMimg1(4, 20, 8, 2)}); // image_sample_lz dim:3d
+    AppendHeapRigStores(&code, 0, 8);
+    return code;
+  }
+
+  int64_t MapHeapRig(const char *name) {
+    EnsureRuntimeContext();
+    int64_t direct = -1;
+    Require(name, "direct allocation",
+            LibKernel::Memory::KernelAllocateDirectMemory(
+                0, LibKernel::Memory::KernelGetDirectMemorySize(), HeapRigSize, HeapRigSize, 0,
+                &direct) == 0,
+            "heap rig allocation failed");
+    void *mapped = reinterpret_cast<void *>(HeapRigBase);
+    Require(name, "direct mapping",
+            LibKernel::Memory::KernelMapDirectMemory(&mapped, HeapRigSize, 0x3, 0x10, direct,
+                                                     HeapRigSize) == 0 &&
+                mapped == reinterpret_cast<void *>(HeapRigBase),
+            "heap rig mapping failed");
+    std::memset(mapped, 0, HeapRigSize);
+    return direct;
+  }
+
+  static void ReleaseHeapRig(const char *name, int64_t direct) {
+    Require(name, "unmap", LibKernel::Memory::KernelMunmap(HeapRigBase, HeapRigSize) == 0,
+            "heap rig unmap failed");
+    Require(name, "release",
+            LibKernel::Memory::KernelReleaseDirectMemory(direct, HeapRigSize) == 0,
+            "heap rig release failed");
+  }
+
+  // Host level: setup() fills the rig, then body(context, draw) as in WithImageHeap.
+  template <typename Setup, typename Body>
+  void WithImageHeapRig(const char *name, Setup &&setup, Body &&body) {
+    const auto direct = MapHeapRig(name);
+    setup();
+    WithImageHeap(name, [&](RenderContext &context, const auto &draw) {
+      context.MapMemory(HeapRigBase, HeapRigSize);
+      body(context, draw);
+      context.UnmapMemory(HeapRigBase, HeapRigSize);
+    });
+    ReleaseHeapRig(name, direct);
+  }
+
+  // End to end through the command processor: setup() fills the rig, then body(context, run)
+  // where run(code, keys, sampler) dispatches one wave and returns the 16 result dwords.
+  template <typename Setup, typename Body>
+  void WithImageHeapDispatches(const char *name, Setup &&setup, Body &&body) {
+    const auto direct = MapHeapRig(name);
+    setup();
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      context.MapMemory(HeapRigBase, HeapRigSize);
+      auto &shaders = processor.GetShCtx();
+      const auto run = [&](const std::vector<u32> &code, std::initializer_list<u32> keys,
+                           u32 sampler = 0x92u) {
+        ShaderMapUserData(reinterpret_cast<uint64_t>(code.data()),
+                          {.type = Prospero::ShaderBinaryType::kCs,
+                           .code_size_bytes = static_cast<u32>(code.size() * sizeof(u32))});
+        // Every lane holds the same key; the results start cleared.
+        std::array<u32, (HeapRigOutput + 64u) / 4u> lanes{};
+        u32 slot = 0;
+        for (const auto key : keys) std::fill_n(lanes.begin() + 64u * slot++, 64u, key);
+        HeapRigWrite(context, HeapRigKeys, lanes.data(), sizeof(lanes));
+        const auto sgprs = HeapRigUserData(HeapRigTable, HeapRigRecords, sampler);
+        for (u32 sgpr = 0; sgpr < 16; ++sgpr)
           shaders.SetCsUserSgpr(sgpr, sgprs[sgpr]);
+        shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(code.data()),
+                             .num_thread_x = 64, .num_thread_y = 1, .num_thread_z = 1,
+                             .wave_size = 64, .user_sgpr = 16});
+        processor.DispatchDirect(1, 1, 1, 0x41u);
+        std::array<u32, 16> actual{};
+        context.GetBufferCache().ReadMemory(HeapRigKeys + HeapRigOutput, sizeof(actual));
+        Require(name, "results",
+                LibKernel::Memory::TryReadBacking(HeapRigKeys + HeapRigOutput, actual.data(),
+                                                  sizeof(actual)),
+                "the dispatch results could not be read");
+        return actual;
+      };
+      body(context, run);
+      Require(name, "resident heap",
+              ImageHeapTestAccess::MemoryCount(context.GetImageHeap()) == 1u,
+              "the table was not sampled through the resident image heap");
+      context.UnmapMemory(HeapRigBase, HeapRigSize);
+      context.GetCommandScheduler().Finish();
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    ReleaseHeapRig(name, direct);
+  }
+
+  // Compares result dwords [first, first + expected.size()) against expected values.
+  static void RequireHeapRigResults(const char *name, const char *stage,
+                                    const std::array<u32, 16> &actual, u32 first,
+                                    std::initializer_list<u32> expected, const std::string &probe) {
+    u32 channel = first;
+    for (const auto value : expected) {
+      Require(name, stage, actual[channel] == value,
+              probe + " result " + std::to_string(channel) + " read " + Hex(actual[channel]) +
+                  ", expected " + Hex(value));
+      ++channel;
+    }
+  }
+
+  static u32 HeapRigBits(float value) { return std::bit_cast<u32>(value); }
+
+  // GPU-computed keys select records of a 48-byte RE engine heap per access shape (RE9/RE8 heaps):
+  // the matching record samples, and a volume under a 2D access, a plane under a 3D one, a cube
+  // under either, an empty record and keys past the table all sample null.
+  void CheckImageHeapTableSelects() {
+    constexpr const char *name = "ImageHeapTableSelects";
+    using Type = Prospero::ImageType;
+    const auto code = HeapRigSelectsCode();
+    const auto setup = [] {
+      const auto record = [](u32 key, Type type, u32 depth_field = 0) {
+        HeapRigFill(key, HeapRigBits(static_cast<float>(key)));
+        HeapRigPut(key, HeapRigDescriptor(HeapRigTexture(key),
+                                          Prospero::BufferFormat::k32_32_32_32Float, type, 4, 4,
+                                          depth_field));
+      };
+      record(1, Type::kColor2D);
+      record(2, Type::kColor2D);
+      record(3, Type::kColor2D);
+      record(4, Type::kColor3D);
+      record(6, Type::kColor2DArray, 1);
+      record(7, Type::kCube, 5);
+      HeapRigFill(9, HeapRigBits(9.0f));
+    };
+    WithImageHeapDispatches(name, setup, [&](RenderContext &context, const auto &run) {
+      struct Probe {
+        u32 key_2d;
+        u32 key_3d;
+        float expected_2d;
+        float expected_3d;
+      };
+      const auto check = [&](const Probe &probe) {
+        const auto actual = run(code, {probe.key_2d, probe.key_3d});
+        const auto plane = HeapRigBits(probe.expected_2d);
+        const auto volume = HeapRigBits(probe.expected_3d);
+        RequireHeapRigResults(
+            name, "selected record", actual, 0,
+            {plane, plane, plane, plane, volume, volume, volume, volume},
+            "keys " + std::to_string(probe.key_2d) + "/" + std::to_string(probe.key_3d));
+      };
+      // A 2D access reads layer 0 of a 2D-array record; the cube is null (F10, upstream's rule).
+      const std::array probes{
+          Probe{1, 4, 1.0f, 4.0f}, Probe{2, 4, 2.0f, 4.0f}, Probe{3, 1, 3.0f, 0.0f},
+          Probe{4, 4, 0.0f, 4.0f}, Probe{6, 6, 6.0f, 0.0f}, Probe{7, 7, 0.0f, 0.0f},
+          Probe{5, 0, 0.0f, 0.0f}, Probe{HeapRigRecords, 7, 0.0f, 0.0f},
+          Probe{0xffffffffu, 0xffffffffu, 0.0f, 0.0f}};
+      for (const auto &probe : probes) check(probe);
+      Require(name, "views", ImageHeapTestAccess::Views(context.GetImageHeap()).size() == 2u,
+              "the 2D and 3D accesses did not each get one view of the table");
+      // Records rewritten between dispatches sample their new textures (RE8's close-ups).
+      HeapRigWriteRecord(context, 1,
+                         HeapRigDescriptor(HeapRigTexture(9),
+                                           Prospero::BufferFormat::k32_32_32_32Float,
+                                           Type::kColor2D));
+      HeapRigWriteRecord(context, 2, {});
+      check({1, 4, 9.0f, 4.0f});
+      check({2, 4, 0.0f, 4.0f});
+      check({3, 4, 3.0f, 4.0f});
+    });
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // 1D and 1D-array records serve a 1D access, a 2D record under it is null, and the 2D access
+  // beside it does not take the 1D records.
+  void CheckImageHeapTable1D() {
+    constexpr const char *name = "ImageHeapTable1D";
+    using Type = Prospero::ImageType;
+    std::vector<u32> code;
+    AppendHeapRigKey(&code, 0);
+    AppendHeapRigKey(&code, 1);
+    code.insert(code.end(), {
+        EncodeVop1(0x01, 20, 240u), EncodeVop1(0x01, 21, 240u),
+        EncodeMimg0(0x27, 0xf, 0, false, 0), EncodeMimg1(0, 20, 6, 2), // image_sample_lz dim:1d
+        EncodeMimg0(0x27, 0xf), EncodeMimg1(4, 20, 8, 2)});             // image_sample_lz dim:2d
+    AppendHeapRigStores(&code, 0, 8);
+    const auto setup = [] {
+      constexpr auto format = Prospero::BufferFormat::k32_32_32_32Float;
+      for (const u32 key : {1u, 2u}) {
+        HeapRigFill(key, HeapRigBits(static_cast<float>(key)));
+        HeapRigPut(key, HeapRigDescriptor(HeapRigTexture(key), format, Type::kColor1D, 4, 1));
+      }
+      HeapRigFill(3, HeapRigBits(3.0f));
+      HeapRigPut(3, HeapRigDescriptor(HeapRigTexture(3), format, Type::kColor2D));
+      // Two one-row layers, 256 bytes apart: 4 then 40.
+      HeapRigFill(4, HeapRigBits(40.0f));
+      std::fill_n(reinterpret_cast<u32 *>(HeapRigTexture(4)), 64u, HeapRigBits(4.0f));
+      HeapRigPut(4, HeapRigDescriptor(HeapRigTexture(4), format, Type::kColor1DArray, 4, 1, 1));
+    };
+    WithImageHeapDispatches(name, setup, [&](RenderContext &, const auto &run) {
+      struct Probe {
+        u32 key_1d;
+        u32 key_2d;
+        float expected_1d;
+        float expected_2d;
+      };
+      const std::array probes{
+          Probe{1, 3, 1.0f, 3.0f}, Probe{2, 3, 2.0f, 3.0f}, Probe{3, 1, 0.0f, 0.0f},
+          Probe{4, 4, 4.0f, 0.0f}, Probe{5, 0, 0.0f, 0.0f}, Probe{HeapRigRecords, 7, 0.0f, 0.0f},
+          Probe{0xffffffffu, 2, 0.0f, 0.0f}};
+      for (const auto &probe : probes) {
+        const auto actual = run(code, {probe.key_1d, probe.key_2d});
+        const auto line = HeapRigBits(probe.expected_1d);
+        const auto plane = HeapRigBits(probe.expected_2d);
+        RequireHeapRigResults(name, "selected record", actual, 0,
+                              {line, line, line, line, plane, plane, plane, plane},
+                              "keys " + std::to_string(probe.key_1d) + "/" +
+                                  std::to_string(probe.key_2d));
+      }
+    });
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // Gathers and depth compares through the heap: float and integer records gather their own
+  // texels, a compare passes against its record, and mismatched, integer-compared or out of
+  // range keys read null.
+  void CheckImageHeapGatherAndCompare() {
+    using Type = Prospero::ImageType;
+    using Format = Prospero::BufferFormat;
+    // Texel (x, y) of key k holds k * 100 + y * 2 + x + 1.
+    const auto texel = [](u32 key, u32 x, u32 y) { return key * 100u + y * 2u + x + 1u; };
+    {
+      constexpr const char *name = "ImageHeapTableGather";
+      std::vector<u32> code;
+      AppendHeapRigKey(&code, 0);
+      AppendVMovU32(&code, 20, HeapRigBits(0.5f));
+      AppendVMovU32(&code, 21, HeapRigBits(0.5f));
+      // image_gather4_lz v[0:3], v[20:21], s[24:31], s[8:11] dmask:0x1 dim:2d
+      code.insert(code.end(), {EncodeMimg0(0x47, 0x1), EncodeMimg1(0, 20, 6, 2)});
+      AppendHeapRigStores(&code, 0, 4);
+      const auto setup = [&] {
+        for (const u32 key : {1u, 2u}) {
+          auto *texels = reinterpret_cast<u32 *>(HeapRigTexture(key));
+          for (u32 y = 0; y < 2u; ++y) {
+            for (u32 x = 0; x < 2u; ++x) {
+              const auto value = texel(key, x, y);
+              std::fill_n(texels + (y * 256u + x * 16u) / 4u, 4u,
+                          key == 2u ? value : HeapRigBits(static_cast<float>(value)));
+            }
+          }
+          HeapRigPut(key, HeapRigDescriptor(HeapRigTexture(key),
+                                            key == 2u ? Format::k32_32_32_32UInt
+                                                      : Format::k32_32_32_32Float,
+                                            Type::kColor2D, 2, 2));
+        }
+        HeapRigFill(3, HeapRigBits(3.0f));
+        HeapRigPut(3, HeapRigDescriptor(HeapRigTexture(3), Format::k32_32_32_32Float,
+                                        Type::kColor3D, 2, 2));
+      };
+      WithImageHeapDispatches(name, setup, [&](RenderContext &, const auto &run) {
+        for (const u32 key : {1u, 2u, 3u, 5u, HeapRigRecords}) {
+          const auto actual = run(code, {key});
+          // Gather order at the centre of a 2x2 image: (0,1), (1,1), (1,0), (0,0).
+          constexpr std::array<std::array<u32, 2>, 4> order{{{0, 1}, {1, 1}, {1, 0}, {0, 0}}};
+          std::array<u32, 4> expected{};
+          for (u32 corner = 0; corner < 4u; ++corner) {
+            const auto value = texel(key, order[corner][0], order[corner][1]);
+            expected[corner] = key == 1u   ? HeapRigBits(static_cast<float>(value))
+                               : key == 2u ? value
+                                           : 0u;
+          }
+          RequireHeapRigResults(name, "gathered texel", actual, 0,
+                                {expected[0], expected[1], expected[2], expected[3]},
+                                "key " + std::to_string(key));
+        }
+      });
+      std::printf("[gpu]     %-32s ok\n", name);
+    }
+    {
+      constexpr const char *name = "ImageHeapTableCompare";
+      std::vector<u32> code;
+      AppendHeapRigKey(&code, 0);
+      // The reference is key slot 1.
+      code.insert(code.end(), {EncodeMubuf0(0x0c, 256u), EncodeMubuf1(20, 3, 30), 0xbf8c3f70u});
+      AppendVMovU32(&code, 21, HeapRigBits(0.5f));
+      AppendVMovU32(&code, 22, HeapRigBits(0.5f));
+      // image_sample_c_lz v0, v[20:22], s[24:31], s[8:11] dim:2d
+      code.insert(code.end(), {EncodeMimg0(0x2f, 0x1), EncodeMimg1(0, 20, 6, 2)});
+      AppendHeapRigStores(&code, 0, 1);
+      const auto setup = [] {
+        // Depth records need a depth swizzle (X001) to bind; 0.5 and 0.25 everywhere.
+        const auto depth = [](u32 key, Format format, u32 value) {
+          HeapRigFill(key, value);
+          auto words = HeapRigDescriptor(HeapRigTexture(key), format, Type::kColor2D, 2, 2);
+          words[3] = (words[3] & ~0xfffu) | DstSel(4, 0, 0, 1);
+          HeapRigPut(key, words);
+        };
+        depth(1, Format::k32Float, HeapRigBits(0.5f));
+        depth(2, Format::k32UInt, 1u);
+        depth(4, Format::k16UNorm, 0x40004000u);
+        HeapRigFill(3, HeapRigBits(0.5f));
+        HeapRigPut(3, HeapRigDescriptor(HeapRigTexture(3), Format::k32Float, Type::kColor3D, 2, 2));
+      };
+      WithImageHeapDispatches(name, setup, [&](RenderContext &, const auto &run) {
+        struct Probe {
+          u32 key;
+          float reference;
+          float expected;
+        };
+        // LESS: the reference passes against a texel only below it. Integer records are no
+        // comparison kind and the volume is no 2D record, so both read null.
+        for (const auto &probe : {Probe{1, 0.25f, 1.0f}, Probe{1, 0.75f, 0.0f},
+                                  Probe{4, 0.125f, 1.0f}, Probe{4, 0.375f, 0.0f},
+                                  Probe{1, 0.375f, 1.0f}, Probe{2, 0.25f, 0.0f},
+                                  Probe{3, 0.25f, 0.0f}, Probe{HeapRigRecords, 0.25f, 0.0f}}) {
+          const auto actual =
+              run(code, {probe.key, HeapRigBits(probe.reference)}, 0x92u | (1u << 12u));
+          RequireHeapRigResults(name, "compared texel", actual, 0, {HeapRigBits(probe.expected)},
+                                "key " + std::to_string(probe.key) + " reference " +
+                                    std::to_string(probe.reference));
+        }
+      });
+      std::printf("[gpu]     %-32s ok\n", name);
+    }
+  }
+
+  // Texel (x, y) of level `mip` of key k's layer `layer`.
+  static float HeapRigLoadTexel(u32 key, u32 mip, u32 layer, u32 x, u32 y) {
+    return static_cast<float>(key * 1000u + mip * 100u + layer * 50u + y * 4u + x);
+  }
+
+  // Loads, mip loads and samples share one heap table: each fetches its own record's level,
+  // integer records read typed, and records the 2D access does not take read null.
+  void CheckImageHeapTableLoads() {
+    constexpr const char *name = "ImageHeapTableLoads";
+    using Type = Prospero::ImageType;
+    using Format = Prospero::BufferFormat;
+    std::vector<u32> code;
+    AppendHeapRigKey(&code, 0);
+    AppendHeapRigKey(&code, 1);
+    AppendVMovU32(&code, 20, 1);
+    AppendVMovU32(&code, 21, 1);
+    AppendVMovU32(&code, 22, 1);
+    AppendVMovU32(&code, 23, HeapRigBits(0.625f));
+    AppendVMovU32(&code, 24, HeapRigBits(0.875f));
+    code.insert(code.end(), {
+        EncodeMimg0(0x00, 0xf), EncodeMimg1(0, 20, 6),    // image_load v[0:3], v[20:21], key 0
+        EncodeMimg0(0x01, 0xf), EncodeMimg1(4, 20, 8),    // image_load_mip v[4:7], v[20:22], key 1
+        EncodeMimg0(0x27, 0xf), EncodeMimg1(8, 23, 6, 2), // image_sample_lz v[8:11], key 0
+    });
+    AppendHeapRigStores(&code, 0, 12);
+    const auto setup = [] {
+      // Two levels: level 1 (2x2) first, then level 0 (4x4) at +512, 256-byte rows.
+      const auto record = [](u32 key, Type type, u32 layers, u32 depth_field,
+                             Format format = Format::k32_32_32_32Float) {
+        auto *texels = reinterpret_cast<u32 *>(HeapRigTexture(key));
+        for (u32 layer = 0; layer < layers; ++layer) {
+          for (u32 mip = 0; mip < 2u; ++mip) {
+            const auto extent = 4u >> mip;
+            for (u32 y = 0; y < extent; ++y) {
+              for (u32 x = 0; x < extent; ++x) {
+                const auto value = HeapRigLoadTexel(key, mip, layer, x, y);
+                std::fill_n(texels + (layer * 1536u + (mip == 0u ? 512u : 0u) + y * 256u +
+                                      x * 16u) / 4u,
+                            4u,
+                            format == Format::k32_32_32_32UInt ? static_cast<u32>(value)
+                                                               : HeapRigBits(value));
+              }
+            }
+          }
+        }
+        HeapRigPut(key, HeapRigDescriptor(HeapRigTexture(key), format, type, 4, 4, depth_field, 1));
+      };
+      record(1, Type::kColor2D, 1, 0);
+      record(2, Type::kColor2D, 1, 0);
+      record(3, Type::kColor2DArray, 2, 1);
+      HeapRigFill(4, HeapRigBits(4.0f));
+      HeapRigPut(4, HeapRigDescriptor(HeapRigTexture(4), Format::k32_32_32_32Float,
+                                      Type::kColor3D));
+      record(5, Type::kCube, 1, 5);
+      record(7, Type::kColor2D, 1, 0, Format::k32_32_32_32UInt);
+    };
+    WithImageHeapDispatches(name, setup, [&](RenderContext &, const auto &run) {
+      // A volume, a cube (F10: upstream's rule), an empty record or a key past the table reads
+      // zero; the integer record reads its integer texel, also when sampled.
+      const auto expected = [](u32 key, u32 mip, u32 x, u32 y) -> u32 {
+        if (key == 7u) return static_cast<u32>(HeapRigLoadTexel(key, mip, 0, x, y));
+        return key >= 1u && key <= 3u ? HeapRigBits(HeapRigLoadTexel(key, mip, 0, x, y)) : 0u;
+      };
+      struct Probe {
+        u32 load_key;
+        u32 mip_key;
+      };
+      for (const auto &probe : {Probe{1, 2}, Probe{2, 1}, Probe{3, 3}, Probe{1, 5}, Probe{4, 1},
+                                Probe{6, 3}, Probe{HeapRigRecords, 4},
+                                Probe{0xffffffffu, 5}, Probe{7, 7}, Probe{2, 7}}) {
+        const auto actual = run(code, {probe.load_key, probe.mip_key});
+        const auto load = expected(probe.load_key, 0, 1, 1);
+        const auto mip = expected(probe.mip_key, 1, 1, 1);
+        const auto sample = expected(probe.load_key, 0, 2, 3);
+        RequireHeapRigResults(name, "fetched texel", actual, 0,
+                              {load, load, load, load, mip, mip, mip, mip, sample, sample, sample,
+                               sample},
+                              "keys " + std::to_string(probe.load_key) + "/" +
+                                  std::to_string(probe.mip_key));
+      }
+    });
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // One sampled root meets float, unsigned and signed records as three typed kinds: samples and
+  // loads read each record's own value, where the old heap read integer records as zero.
+  void CheckImageHeapIntegerRecords() {
+    constexpr const char *name = "ImageHeapIntegerRecords";
+    namespace IR = ShaderRecompiler::IR;
+    using Format = Prospero::BufferFormat;
+    using Class = Prospero::TextureNumericClass;
+    std::vector<u32> code;
+    AppendHeapRigKey(&code, 0);
+    code.insert(code.end(), {EncodeVop1(0x01, 20, 240u), EncodeVop1(0x01, 21, 240u)});
+    AppendVMovU32(&code, 22, 1);
+    AppendVMovU32(&code, 23, 1);
+    code.insert(code.end(), {
+        EncodeMimg0(0x27, 0xf), EncodeMimg1(0, 20, 6, 2), // image_sample_lz v[0:3], v[20:21]
+        EncodeMimg0(0x00, 0xf), EncodeMimg1(4, 22, 6)});  // image_load v[4:7], v[22:23]
+    AppendHeapRigStores(&code, 0, 8);
+    constexpr std::array<std::pair<Format, u32>, 3> records{
+        {{Format::k32Float, 0x3fc00000u}, {Format::k32UInt, 7u}, {Format::k32SInt, 0xfffffffbu}}};
+    const auto setup = [&] {
+      for (u32 key = 1; key <= records.size(); ++key) {
+        HeapRigFill(key, records[key - 1u].second);
+        HeapRigPut(key, HeapRigDescriptor(HeapRigTexture(key), records[key - 1u].first,
+                                          Prospero::ImageType::kColor2D));
+      }
+    };
+    WithImageHeapDispatches(name, setup, [&](RenderContext &context, const auto &run) {
+      for (const u32 key : {1u, 2u, 3u, 5u, HeapRigRecords}) {
+        const auto actual = run(code, {key});
+        const auto value = key <= records.size() ? records[key - 1u].second : 0u;
+        Require(name, "typed record", actual[0] == value && actual[4] == value,
+                "key " + std::to_string(key) + " sampled " + Hex(actual[0]) + " and loaded " +
+                    Hex(actual[4]) + ", expected " + Hex(value));
+      }
+      const auto &views = ImageHeapTestAccess::Views(context.GetImageHeap());
+      auto kinds = views.at(0)->kind_keys;
+      std::ranges::sort(kinds);
+      const auto kind = [](Class numeric) { return 1u + static_cast<u32>(numeric) * 2u; };
+      Require(name, "kinds",
+              views.size() == 1u && kinds == std::vector<u32>{kind(Class::Float),
+                                                              kind(Class::Uint),
+                                                              kind(Class::Sint)},
+              "the root did not keep one typed kind per numeric class");
+    });
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // Under a 1D root a 1D record becomes a 1D image and a 1D-array record a layered 1D image; under
+  // a 1D-array root only the array record serves. 2D records serve neither.
+  void CheckImageHeap1DRecords() {
+    constexpr const char *name = "ImageHeap1DRecords";
+    namespace IR = ShaderRecompiler::IR;
+    using Type = Prospero::ImageType;
+    constexpr auto format = Prospero::BufferFormat::k32_32_32_32Float;
+    const auto setup = [] {
+      HeapRigPut(1, HeapRigDescriptor(HeapRigTexture(1), format, Type::kColor1D, 4, 1));
+      HeapRigPut(2, HeapRigDescriptor(HeapRigTexture(2), format, Type::kColor1DArray, 4, 1, 1));
+      HeapRigPut(3, HeapRigDescriptor(HeapRigTexture(3), format, Type::kColor2D));
+    };
+    WithImageHeapRig(name, setup, [&](RenderContext &context, const auto &draw) {
+      auto &heap = context.GetImageHeap();
+      auto &textures = context.GetTextureCache();
+      IR::ImageResource line{};
+      line.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim1D;
+      line.unfiltered_access_only = false;
+      auto lines = line;
+      lines.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim1DArray;
+      IR::ImageHeapView view{};
+      const auto acquire = [&](const IR::ImageResource &root) {
+        return heap.Acquire({HeapRigTable, HeapRigRecords * HeapRigStride, 16u, 0u,
+                             HeapRigRecords * HeapRigStride / 16u, &root},
+                            view);
+      };
+      Require(name, "acquire", acquire(line) && acquire(lines), "the 1D table was declined");
+      draw();
+      const auto &views = ImageHeapTestAccess::Views(heap);
+      const auto image = [&](u32 index, u32 record) -> const Libs::Graphics::Image * {
+        const auto id = ImageHeapTestAccess::ImageOf(
+            heap, views.at(index)->slots[(16u + record * HeapRigStride) / 4u]);
+        return id ? &textures.GetImage(id) : nullptr;
+      };
+      const auto *single = image(0, 1);
+      Require(name, "1D record",
+              single != nullptr && single->backing.image_type == vk::ImageType::e1D &&
+                  single->info.resources.layers == 1,
+              "the 1D record did not become a 1D image");
+      const auto *layered = image(0, 2);
+      Require(name, "1D-array record",
+              layered != nullptr && layered->backing.image_type == vk::ImageType::e1D &&
+                  layered->info.resources.layers == 2 && image(1, 2) == layered,
+              "the 1D-array record did not become a two-layer 1D image under both roots");
+      Require(name, "mismatched records",
+              image(0, 3) == nullptr && image(1, 1) == nullptr && image(1, 3) == nullptr,
+              "a 1D root took a 2D record, or a 1D-array root a plain 1D record");
+    });
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // A table write re-probes only the probes it covers, and after any number of rescans every slot
+  // selects the element of its probe's current descriptor (RE8's close-up wrong textures).
+  void CheckImageHeapIncrementalRescan() {
+    constexpr const char *name = "ImageHeapIncrementalRescan";
+    namespace IR = ShaderRecompiler::IR;
+    using Type = Prospero::ImageType;
+    constexpr auto format = Prospero::BufferFormat::k32_32_32_32Float;
+    const auto descriptor = [](u32 texture) {
+      return HeapRigDescriptor(HeapRigTexture(texture), format, Type::kColor2D);
+    };
+    WithImageHeapRig(name, [&] { HeapRigPut(1, descriptor(1)); },
+                     [&](RenderContext &context, const auto &draw) {
+      auto &heap = context.GetImageHeap();
+      auto &textures = context.GetTextureCache();
+      IR::ImageResource sampled{};
+      sampled.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      sampled.unfiltered_access_only = false;
+      auto unfiltered = sampled;
+      unfiltered.unfiltered_access_only = true;
+      IR::ImageHeapView view{};
+      // The record grid: one probe per record.
+      const auto acquire = [&](const IR::ImageResource &root) {
+        return heap.Acquire({HeapRigTable, HeapRigRecords * HeapRigStride, HeapRigStride, 16u,
+                             HeapRigRecords, &root},
+                            view);
+      };
+      const auto slot = [](u32 record) { return (16u + record * HeapRigStride) / 4u; };
+      const auto rescan = [&] {
+        Require(name, "acquire", acquire(sampled), "the table was declined");
+        draw();
+        return ImageHeapTestAccess::Views(heap).at(0)->slots;
+      };
+      const auto changed = [](const std::vector<uint32_t> &before,
+                              const std::vector<uint32_t> &after) {
+        std::vector<size_t> slots;
+        for (size_t index = 0; index < before.size(); ++index)
+          if (before[index] != after[index]) slots.push_back(index);
+        return slots;
+      };
+      // Every slot selects the element of the descriptor its probe reads now, or null for none.
+      const auto consistent = [&](const std::vector<uint32_t> &slots) {
+        for (u32 record = 0; record < HeapRigRecords; ++record) {
+          std::array<u32, 8> words{};
+          std::memcpy(words.data(),
+                      reinterpret_cast<const void *>(HeapRigTable + record * HeapRigStride + 16u),
+                      sizeof(words));
+          const auto entry = slots[slot(record)];
+          if (entry == 0u ? words != std::array<u32, 8>{}
+                          : ImageHeapTestAccess::Element(heap, entry).value.dwords != words) {
+            return false;
+          }
+          const auto id = ImageHeapTestAccess::ImageOf(heap, entry);
+          if (entry != 0u && (!id || textures.GetImage(id).info.data.address !=
+                                         (uint64_t{words[0]} << 8u))) {
+            return false;
+          }
+        }
+        return true;
+      };
+      const auto ImageAt = [&](u32 texture) {
+        for (const auto id : TextureCacheTestAccess::FindImages(textures, HeapRigTexture(texture),
+                                                                64, false)) {
+          if (textures.GetImage(id).info.data.address == HeapRigTexture(texture)) return id;
+        }
+        return ImageId{};
+      };
+
+      const auto start = rescan();
+      const auto first = ImageHeapTestAccess::ImageOf(heap, start[slot(1)]);
+      Require(name, "scanned", first && consistent(start), "the first record did not resolve");
+
+      HeapRigWriteRecord(context, 2, descriptor(2));
+      const auto added = rescan();
+      Require(name, "added",
+              changed(start, added) == std::vector<size_t>{slot(2)} && consistent(added) &&
+                  textures.GetImage(first).heap_refs.load() == 1u,
+              "a record written into the table changed other slots or was not resolved");
+
+      HeapRigWriteRecord(context, 1, {});
+      const auto cleared = rescan();
+      Require(name, "cleared",
+              changed(added, cleared) == std::vector<size_t>{slot(1)} && cleared[slot(1)] == 0u &&
+                  consistent(cleared) && textures.GetImage(first).heap_refs.load() == 0u,
+              "a cleared record kept its element, or another slot moved");
+
+      const auto second = ImageAt(2);
+      Require(name, "second image", static_cast<bool>(second), "no image for the second record");
+      TextureCacheTestAccess::FreeImage(textures, second);
+      const auto rebound = rescan();
+      Require(name, "re-resolved",
+              ImageHeapTestAccess::ImageOf(heap, rebound[slot(2)]) == ImageAt(2) &&
+                  ImageAt(2) != second && consistent(rebound),
+              "a record whose image died was not re-resolved onto its new image");
+
+      // Rotating descriptors through the records: slots never name an earlier assignment.
+      for (u32 round = 0; round < 3u; ++round) {
+        for (u32 record = 1; record <= 8u; ++record)
+          HeapRigWriteRecord(context, record, descriptor((record + round) % 9u + 1u));
+        Require(name, "rotated", consistent(rescan()),
+                "after rescans a slot selected an element of another descriptor");
+      }
+      // A fresh view probes the whole table: the incremental one must agree with it.
+      Require(name, "fresh view", acquire(unfiltered), "the table was declined");
+      draw();
+      const auto &views = ImageHeapTestAccess::Views(heap);
+      Require(name, "matches a full probe",
+              views.size() == 2u && consistent(views[1]->slots) && consistent(views[0]->slots),
+              "the incrementally rescanned view differs from a full probe");
+    });
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // Commit returns resident images to their read layout after a write, a copy or a target use
+  // elsewhere, and leaves an image this draw binds as a target alone.
+  void CheckImageHeapSampledLayouts() {
+    constexpr const char *name = "ImageHeapSampledLayouts";
+    namespace IR = ShaderRecompiler::IR;
+    const auto setup = [] {
+      HeapRigPut(1, HeapRigDescriptor(HeapRigTexture(1), Prospero::BufferFormat::k32Float,
+                                      Prospero::ImageType::kColor2D));
+    };
+    WithImageHeapRig(name, setup, [&](RenderContext &context, const auto &draw) {
+      auto &heap = context.GetImageHeap();
+      auto &textures = context.GetTextureCache();
+      auto &scheduler = context.GetCommandScheduler();
+      IR::ImageResource sampled{};
+      sampled.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+      sampled.unfiltered_access_only = false;
+      IR::ImageHeapView view{};
+      const auto commit = [&] {
+        Require(name, "acquire",
+                heap.Acquire({HeapRigTable, HeapRigRecords * HeapRigStride, 16u, 0u,
+                              HeapRigRecords * HeapRigStride / 16u, &sampled},
+                             view),
+                "the table was declined");
+        draw();
+      };
+      commit();
+      const auto id = ImageHeapTestAccess::ImageOf(
+          heap, ImageHeapTestAccess::Views(heap).at(0)->slots[(16u + HeapRigStride) / 4u]);
+      Require(name, "resolved", static_cast<bool>(id), "the record did not resolve");
+      auto &image = textures.GetImage(id);
+      const auto Sampled = [&] {
+        return image.backing.subresource_states.empty() &&
+               image.backing.state.layout == image.ReadLayout() &&
+               image.backing.state.access_mask == vk::AccessFlagBits2::eShaderRead;
+      };
+      Require(name, "brought", Sampled(), "a new element was not brought to its read layout");
+
+      image.Transit(vk::ImageLayout::eGeneral, vk::AccessFlagBits2::eShaderWrite, {},
+                    scheduler.Current().Handle());
+      commit();
+      Require(name, "rebrought", Sampled(), "an element written elsewhere was not brought back");
+
+      image.binding.is_target = true;
+      image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {},
+                    scheduler.Current().Handle());
+      commit();
+      Require(name, "target skipped",
+              image.backing.state.layout == vk::ImageLayout::eTransferDstOptimal,
+              "an element bound as a target this draw was transitioned by the heap");
+      image.binding = {};
+      commit();
+      Require(name, "target released", Sampled(),
+              "an element stopped being a target and was not brought back");
+
+      image.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
+                    scheduler.Current().Handle());
+      commit();
+      Require(name, "copied", Sampled(), "an element read by a copy was not brought back");
+    });
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // Null records, records the heap rejects and keys past the table read zero through float and
+  // integer arms, from the one null element (robustness2 null descriptor) every such slot selects.
+  void CheckImageHeapNullImages() {
+    constexpr const char *name = "ImageHeapNullImages";
+    using Type = Prospero::ImageType;
+    using Format = Prospero::BufferFormat;
+    std::vector<u32> code;
+    AppendHeapRigKey(&code, 0);
+    AppendHeapRigKey(&code, 1);
+    code.insert(code.end(), {EncodeVop1(0x01, 20, 240u), EncodeVop1(0x01, 21, 240u)});
+    AppendVMovU32(&code, 22, 1);
+    AppendVMovU32(&code, 23, 1);
+    code.insert(code.end(), {
+        EncodeMimg0(0x27, 0xf), EncodeMimg1(0, 20, 6, 2), // image_sample_lz v[0:3], key 0
+        EncodeMimg0(0x00, 0xf), EncodeMimg1(4, 22, 8)});  // image_load v[4:7], key 1
+    AppendHeapRigStores(&code, 0, 8);
+    const auto setup = [] {
+      HeapRigFill(1, HeapRigBits(2.0f));
+      HeapRigPut(1, HeapRigDescriptor(HeapRigTexture(1), Format::k32_32_32_32Float,
+                                      Type::kColor2D));
+      HeapRigFill(2, 9u);
+      HeapRigPut(2, HeapRigDescriptor(HeapRigTexture(2), Format::k32_32_32_32UInt,
+                                      Type::kColor2D));
+      // A format the heap rejects, and a descriptor with reserved bits set.
+      HeapRigFill(3, 0x12345678u);
+      HeapRigPut(3, HeapRigDescriptor(HeapRigTexture(3), Format::k11_11_10UNorm, Type::kColor2D));
+      auto reserved = HeapRigDescriptor(HeapRigTexture(4), Format::k32_32_32_32Float,
+                                        Type::kColor2D);
+      reserved[1] |= 0x20000000u;
+      HeapRigFill(4, HeapRigBits(4.0f));
+      HeapRigPut(4, reserved);
+    };
+    WithImageHeapDispatches(name, setup, [&](RenderContext &context, const auto &run) {
+      const auto two = HeapRigBits(2.0f);
+      RequireHeapRigResults(name, "live records", run(code, {1, 2}), 0,
+                            {two, two, two, two, 9u, 9u, 9u, 9u}, "keys 1/2");
+      for (const u32 key : {3u, 4u, 5u, HeapRigRecords, 0xffffffffu}) {
+        RequireHeapRigResults(name, "null record", run(code, {key, key}), 0,
+                              {0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u}, "key " + std::to_string(key));
+      }
+      const auto &heap = context.GetImageHeap();
+      const auto &null = ImageHeapTestAccess::Element(heap, 0u).binding;
+      Require(name, "null element",
+              !null.image_id && !null.image_view &&
+                  null.layout == vk::ImageLayout::eShaderReadOnlyOptimal,
+              "the null element is not the native null descriptor");
+      for (const auto &view : ImageHeapTestAccess::Views(heap)) {
+        for (const u32 record : {3u, 4u, 5u}) {
+          Require(name, "null slots",
+                  view->slots[(16u + record * HeapRigStride) / 4u] == 0u &&
+                      view->slots.back() == 0u,
+                  "a rejected or empty record, or the trailing slot, did not select null");
+        }
+      }
+    });
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // 1D and 1D-array accesses read zero through the heap for empty records and keys past the
+  // table, and their own texels otherwise.
+  void CheckImageHeapNull1DImages() {
+    constexpr const char *name = "ImageHeapNull1DImages";
+    using Type = Prospero::ImageType;
+    constexpr auto format = Prospero::BufferFormat::k32UInt;
+    std::vector<u32> code;
+    AppendHeapRigKey(&code, 0);
+    AppendHeapRigKey(&code, 1);
+    AppendVMovU32(&code, 20, 1);
+    AppendVMovU32(&code, 21, 1);
+    code.insert(code.end(), {
+        EncodeMimg0(0x00, 0xf, 0, false, 0), EncodeMimg1(0, 20, 6),  // image_load dim:1d
+        EncodeMimg0(0x00, 0xf, 0, false, 4), EncodeMimg1(4, 20, 8)}); // image_load dim:1d_array
+    AppendHeapRigStores(&code, 0, 8);
+    const auto setup = [] {
+      auto *line = reinterpret_cast<u32 *>(HeapRigTexture(1));
+      line[1] = 0xcafebabeu;
+      HeapRigPut(1, HeapRigDescriptor(HeapRigTexture(1), format, Type::kColor1D, 4, 1));
+      // Two one-row layers, 256 bytes apart.
+      auto *lines = reinterpret_cast<u32 *>(HeapRigTexture(2));
+      lines[1] = 0xdeadbeefu;
+      lines[64 + 1] = 0xcafebabeu;
+      HeapRigPut(2, HeapRigDescriptor(HeapRigTexture(2), format, Type::kColor1DArray, 4, 1, 1));
+    };
+    WithImageHeapDispatches(name, setup, [&](RenderContext &, const auto &run) {
+      struct Probe {
+        u32 key_1d;
+        u32 key_array;
+        u32 expected_1d;
+        u32 expected_array;
+      };
+      // A 1D access reads layer 0 of the array record; a 1D record is null to the array access.
+      for (const auto &probe : {Probe{1, 2, 0xcafebabeu, 0xcafebabeu},
+                                Probe{2, 1, 0xdeadbeefu, 0u}, Probe{3, 4, 0u, 0u},
+                                Probe{HeapRigRecords, 0xffffffffu, 0u, 0u}}) {
+        const auto actual = run(code, {probe.key_1d, probe.key_array});
+        RequireHeapRigResults(name, "1D texel", actual, 0, {probe.expected_1d}, "1D key " +
+                                  std::to_string(probe.key_1d));
+        RequireHeapRigResults(name, "1D-array texel", actual, 4, {probe.expected_array},
+                              "1D-array key " + std::to_string(probe.key_array));
+      }
+    });
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  // A heap shader's module depends only on the kinds its views met: rewriting, clearing,
+  // lengthening or moving the table within those kinds, and mapping more of a partly mapped
+  // table, compile the same SPIR-V; only the slot words in the flattened SRT follow the table.
+  void CheckImageHeapModuleStability() {
+    constexpr const char *name = "ImageHeapModuleStability";
+    namespace IR = ShaderRecompiler::IR;
+    using Type = Prospero::ImageType;
+    using Format = Prospero::BufferFormat;
+    TestCase test;
+    test.name = name;
+    test.code = HeapRigSelectsCode();
+    test.has_user_data = true;
+    const auto table = [&](uint64_t base, u32 records) {
+      const auto sgprs = HeapRigUserData(base, records);
+      std::copy(sgprs.begin(), sgprs.end(), test.user_data.begin());
+    };
+    table(HeapRigTable, HeapRigRecords);
+    const auto descriptor = [](u32 texture, Type type, Format format = Format::k32_32_32_32Float) {
+      return HeapRigDescriptor(HeapRigTexture(texture), format, type);
+    };
+    const auto setup = [&] {
+      for (const u32 key : {1u, 2u, 3u}) HeapRigPut(key, descriptor(key, Type::kColor2D));
+      HeapRigPut(4, descriptor(4, Type::kColor3D));
+    };
+    // A table that ends 64 KiB past the rig: only its first 64 KiB are mapped at first.
+    constexpr uint64_t tail_table = HeapRigBase + HeapRigSize - 0x10000;
+    constexpr uint64_t tail = HeapRigBase + HeapRigSize;
+    constexpr uint64_t tail_size = 0x10000;
+    WithImageHeapRig(name, setup, [&](RenderContext &context, const auto &) {
+      auto &heap = context.GetImageHeap();
+      const auto compile = [&] {
+        heap.BeginDraw();
+        return CompileCase(test, 64, &heap);
+      };
+      const auto roots = [](const CompiledShader &compiled) {
+        std::vector<const IR::ImageResource *> found;
+        for (u32 index = 0; index < compiled.program.info.images.size(); ++index) {
+          const auto &image = compiled.program.info.images[index];
+          if (image.heap && image.indirect_root == index) found.push_back(&image);
+        }
+        return found;
+      };
+      const auto slot_counts = [&](const CompiledShader &compiled) {
+        std::vector<u32> counts;
+        for (const auto *root : roots(compiled))
+          counts.push_back(compiled.resources.flattened_srt.at(root->indirect_mapping_offset));
+        return counts;
+      };
+      const auto first = compile();
+      Require(name, "heap roots",
+              first.program.info.uses_image_heap && roots(first).size() == 2u &&
+                  slot_counts(first) ==
+                      std::vector<u32>(2u, HeapRigRecords * HeapRigStride / 4u),
+              "the 2D and 3D accesses were not served by the resident heap");
+      const auto Same = [&](const char *label, const CompiledShader &compiled) {
+        Require(name, label, compiled.spirv == first.spirv && roots(compiled).size() == 2u,
+                std::string(label) + ": the module changed with the table");
+      };
+      const auto write = [&](u32 record, const std::array<u32, 8> &words,
+                             uint64_t base = HeapRigTable) {
+        HeapRigWriteRecord(context, record, words, base);
+      };
+
+      for (const u32 key : {1u, 2u, 3u}) write(key, descriptor(key + 10u, Type::kColor2D));
+      write(4, descriptor(14, Type::kColor3D));
+      Same("rewritten records", compile());
+      for (u32 key = 1; key <= 4u; ++key) write(key, {});
+      Same("cleared table", compile());
+      for (const u32 key : {1u, 2u, 3u}) write(key, descriptor(key, Type::kColor2D));
+      write(4, descriptor(4, Type::kColor3D));
+      table(HeapRigTable, HeapRigRecords * 2u);
+      Same("longer table", compile());
+      constexpr uint64_t moved = HeapRigTable + 0x40000;
+      write(2, descriptor(2, Type::kColor2D), moved);
+      write(4, descriptor(4, Type::kColor3D), moved);
+      table(moved, HeapRigRecords);
+      Same("moved table", compile());
+
+      // A partly mapped table, then the guest maps the rest of it.
+      write(1, descriptor(1, Type::kColor2D), tail_table);
+      write(4, descriptor(4, Type::kColor3D), tail_table);
+      table(tail_table, HeapRigRecords);
+      const auto prefix = compile();
+      Same("mapped prefix", prefix);
+      Require(name, "prefix slots",
+              slot_counts(prefix) == std::vector<u32>(2u, static_cast<u32>(tail_size / 4u)),
+              "the partly mapped table was not served from its mapped prefix");
+      int64_t direct = -1;
+      Require(name, "tail allocation",
+              LibKernel::Memory::KernelAllocateDirectMemory(
+                  0, LibKernel::Memory::KernelGetDirectMemorySize(), tail_size, tail_size, 0,
+                  &direct) == 0,
+              "tail allocation failed");
+      void *mapped = reinterpret_cast<void *>(tail);
+      Require(name, "tail mapping",
+              LibKernel::Memory::KernelMapDirectMemory(&mapped, tail_size, 0x3, 0x10, direct,
+                                                       tail_size) == 0 &&
+                  mapped == reinterpret_cast<void *>(tail),
+              "tail mapping failed");
+      std::memset(mapped, 0, tail_size);
+      context.MapMemory(tail, tail_size);
+      write(1400, descriptor(5, Type::kColor2D), tail_table);
+      const auto grown = compile();
+      Same("grown prefix", grown);
+      Require(name, "grown slots",
+              slot_counts(grown) ==
+                  std::vector<u32>(2u, HeapRigRecords * HeapRigStride / 4u),
+              "the table did not take the pages mapped after its first compile");
+      context.UnmapMemory(tail, tail_size);
+      Require(name, "tail unmap", LibKernel::Memory::KernelMunmap(tail, tail_size) == 0,
+              "tail unmap failed");
+      Require(name, "tail release",
+              LibKernel::Memory::KernelReleaseDirectMemory(direct, tail_size) == 0,
+              "tail release failed");
+
+      // A new kind is a new module once, bounded by the kinds a root admits; changes within the
+      // grown set keep it.
+      table(HeapRigTable, HeapRigRecords);
+      write(5, descriptor(5, Type::kColor2D, Format::k32_32_32_32UInt));
+      const auto integer = compile();
+      Require(name, "new kind",
+              integer.spirv != first.spirv && roots(integer).size() == 2u &&
+                  integer.program.info.images.size() == first.program.info.images.size() + 1u,
+              "a record of a new kind did not add exactly one kind to its root");
+      write(5, descriptor(6, Type::kColor2D, Format::k32_32_32_32UInt));
+      write(1, descriptor(7, Type::kColor2D));
+      Require(name, "known kinds", compile().spirv == integer.spirv,
+              "the module changed within the kinds its view already met");
+    });
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   void CheckComputeMetaClearClassification() {
     constexpr const char *name = "ComputeMetaClearClassification";
     constexpr uint64_t read_only_meta = 0x0000000204201f00ull;
@@ -55963,7 +57621,24 @@ int main(int argc, char **argv) {
     CheckNestedPointerImageTable(vulkan);
     CheckGuardedRecordImageTable(vulkan);
     CheckIndirectImageKeySwitch(vulkan);
+    vulkan.CheckImageHeapMappedPrefix();
+    vulkan.CheckImageHeapSparseTable();
+    vulkan.CheckImageHeapIdleViews();
+    vulkan.CheckImageHeapOverflow();
     vulkan.CheckResidentImageHeap();
+    vulkan.CheckImageHeapRetiredImages();
+    vulkan.CheckImageHeapDispatchBarrier();
+    vulkan.CheckImageHeapTableSelects();
+    vulkan.CheckImageHeapTable1D();
+    vulkan.CheckImageHeapGatherAndCompare();
+    vulkan.CheckImageHeapTableLoads();
+    vulkan.CheckImageHeapIntegerRecords();
+    vulkan.CheckImageHeap1DRecords();
+    vulkan.CheckImageHeapIncrementalRescan();
+    vulkan.CheckImageHeapSampledLayouts();
+    vulkan.CheckImageHeapNullImages();
+    vulkan.CheckImageHeapNull1DImages();
+    vulkan.CheckImageHeapModuleStability();
     CheckFiniteFirstLaneImageChoice(vulkan);
     CheckFiniteInlineSamplerPhi(vulkan);
     RunCase(&vulkan, ImageCubeGradientsPreserveDerivatives());
@@ -56152,7 +57827,24 @@ int main(int argc, char **argv) {
   CheckNestedPointerImageTable(vulkan);
   CheckGuardedRecordImageTable(vulkan);
   CheckIndirectImageKeySwitch(vulkan);
+  vulkan.CheckImageHeapMappedPrefix();
+  vulkan.CheckImageHeapSparseTable();
+  vulkan.CheckImageHeapIdleViews();
+  vulkan.CheckImageHeapOverflow();
   vulkan.CheckResidentImageHeap();
+  vulkan.CheckImageHeapRetiredImages();
+  vulkan.CheckImageHeapDispatchBarrier();
+  vulkan.CheckImageHeapTableSelects();
+  vulkan.CheckImageHeapTable1D();
+  vulkan.CheckImageHeapGatherAndCompare();
+  vulkan.CheckImageHeapTableLoads();
+  vulkan.CheckImageHeapIntegerRecords();
+  vulkan.CheckImageHeap1DRecords();
+  vulkan.CheckImageHeapIncrementalRescan();
+  vulkan.CheckImageHeapSampledLayouts();
+  vulkan.CheckImageHeapNullImages();
+  vulkan.CheckImageHeapNull1DImages();
+  vulkan.CheckImageHeapModuleStability();
   CheckDynamicSampleOffsets(vulkan, 32u);
   CheckDynamicSampleOffsets(vulkan, 64u);
   CheckFiniteFirstLaneImageChoice(vulkan);

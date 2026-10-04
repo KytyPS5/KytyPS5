@@ -36,6 +36,7 @@ public:
 	void BeginDraw() {
 		++m_draw;
 		Bury();
+		EvictIdle();
 	}
 	bool Acquire(const ShaderRecompiler::IR::ImageHeapRequest& request,
 	             ShaderRecompiler::IR::ImageHeapView&          result) override;
@@ -85,11 +86,13 @@ private:
 		size_t                  changed_end   = 0;
 		uint64_t                resolve_epoch = 0;
 		uint64_t                layout_epoch  = 0;
+		uint64_t                frame         = 0;     // Last frame that acquired it.
+		bool                    full          = false; // A probe went null for want of an element.
 	};
 
 	struct Memory {
-		uint64_t                           base = 0;
-		uint64_t                           size = 0;
+		uint64_t                           size  = 0; // The mapped prefix of the table.
+		uint64_t                           table = 0; // The requested table size.
 		std::vector<uint32_t>              words;
 		std::vector<uint8_t>               dirty_pages; // Unwatched, so unread since a write.
 		std::vector<uint64_t>              dead;        // Per word, a buried descriptor's hash.
@@ -97,6 +100,11 @@ private:
 		std::vector<std::unique_ptr<View>> views;
 	};
 
+	// Views not acquired for more frames than this release their elements and images.
+	static constexpr uint64_t IdleFrames = 32;
+
+	[[nodiscard]] uint64_t MappedPrefix(uint64_t base, uint64_t size) const;
+	void                   Grow(Memory& memory);
 	[[nodiscard]] bool Refresh(Memory& memory);
 	void               MarkDirty(Memory& memory, size_t begin, size_t end);
 	template <bool track>
@@ -111,6 +119,8 @@ private:
 	void     Unreference(Element& element);
 	uint32_t Allocate();
 	void     Retire(View& view);
+	void     Drop(View& view);
+	void     EvictIdle();
 	void     WriteDescriptors();
 
 	RenderContext&                       m_context;
@@ -129,6 +139,8 @@ private:
 	vk::DescriptorSetLayout                   m_layout = nullptr;
 	vk::DescriptorPool                        m_pool   = nullptr;
 	vk::DescriptorSet                         m_set    = nullptr;
+	uint64_t                                  m_evict_frame = 0;
+	uint32_t                                  m_capacity = ShaderRecompiler::IR::ImageHeapCapacity;
 
 	friend struct ImageHeapTestAccess;
 };

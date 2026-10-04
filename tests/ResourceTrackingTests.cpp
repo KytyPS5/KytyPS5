@@ -6877,13 +6877,13 @@ void TestBoundedMaterializationCandidatesAndRemap() {
 
 // Dense selector rows may alias the same immutable DWORD. The memory-work
 // budget covers distinct coherent source words; every logical row still exists.
-void TestBoundedSnapshotUniqueWords() {
+void TestBoundedSnapshotUniqueWords(bool storage_domain = false) {
   struct Reader {
     std::unordered_set<uint64_t> reads;
     uint64_t fail = UINT64_MAX;
     static bool Clean(void* data, uint64_t address, std::span<uint32_t> out) {
       auto& self = *static_cast<Reader*>(data);
-      Check(out.size() == 1u && address >= 0x1000u && address < 0x50000u,
+      Check(out.size() == 1u && address >= 0x1000u && address < 0x90000u,
             "unique snapshot reader escaped its backing");
       Check(self.reads.insert(address).second, "immutable source DWORD was read twice");
       if (address == self.fail) return false;
@@ -6920,9 +6920,8 @@ void TestBoundedSnapshotUniqueWords() {
           "bounded immutable aliases were charged as distinct source probes");
     if (!accepted) {
       CheckBoundedTransaction(snapshot, old_snapshot, specialization, old_specialization);
-      Check(reader.reads.size() <= 65536u, "unique-word budget read its plus-one source");
-      Check(fail == UINT64_MAX ? reader.reads.size() == 65536u
-                              : reader.reads.contains(fail),
+      Check(count > 65536u ? reader.reads.empty()
+                           : fail != UINT64_MAX && reader.reads.contains(fail),
             "bounded source rejection did not reach its required boundary");
       return;
     }
@@ -6943,12 +6942,20 @@ void TestBoundedSnapshotUniqueWords() {
     for (const auto& range : snapshot.immutable_srt_ranges) captured += range.size;
     Check(captured == uint64_t(unique)*4u, "immutable alias footprint lost unique words");
   };
+  if (storage_domain) {
+    // One 16-bit domain per column, with a U32 global flat offset. These
+    // genuinely distinct words fit the existing bounded SSBO storage policy.
+    check(32769u, 8u, 4u, false, 0u, 65538u, true);
+    check(65536u, 8u, 4u, false, 0u, 131072u, true);
+    check(65537u, 0u, 4u, false, 0u, 0u, false); // Per-column domain still bounded.
+    return;
+  }
   check(65536u, 0u, 4u, true, 8u, 2u, true); // Intended pre-fix RED.
   check(65536u, 0u, 4u, false, 0u, 2u, true);
   check(32769u, 4u, 4u, false, 0u, 32770u, true); // Partial column overlap.
   check(65536u, 0x80000000u, 4u, true, 8u, 2u, true); // Wrapped re-entry / OOB.
   check(32768u, 8u, 4u, false, 0u, 65536u, true);
-  check(32769u, 8u, 4u, false, 0u, 0u, false);
+  check(32769u, 8u, 4u, false, 0u, 65538u, true);
   check(65536u, 0u, 4u, true, 8u, 0u, false, 0x1004u);
 }
 
@@ -7027,9 +7034,16 @@ void TestBoundedMaterializationLimitsAreTransactional() {
   const auto saved_snapshot=snapshot;
   const auto saved_specialization=specialization;
   const std::array<uint32_t,3> over_limit{32769u,0x1000u,0u};
+  // This address is a valid next source word. Callback failure, rather than an
+  // unrelated 16-bit global quota, must reject without mutating caller output.
+  reader.fail_address = 0x41000u;
   Check(!MaterializeResources(plan,BoundedSnapshotRuntime(reader,over_limit),snapshot,specialization),
-        "distinct bounded source words exceeded 65536 across columns");
+        "failed distinct source callback did not reject the next bounded row");
   CheckBoundedTransaction(snapshot,saved_snapshot,specialization,saved_specialization);
+  reader.fail_address = UINT64_MAX;
+  Check(MaterializeResources(plan,BoundedSnapshotRuntime(reader,over_limit),snapshot,specialization) &&
+            snapshot.flattened_srt.size() == 65538u,
+        "valid distinct source row beyond the old global quota was lost");
 
   Fixture dense;
   InitializeBoundedSnapshot(dense,4u,true);
@@ -8586,6 +8600,11 @@ int main(int argc, char** argv) {
       std::cout << "KYTY_BOUNDED_WRITE_ALIAS_PASS\n";
       return 0;
     }
+    if (argc == 2 && std::strcmp(argv[1], "--bounded-snapshot-storage-domain-only") == 0) {
+      TestBoundedSnapshotUniqueWords(true);
+      std::cout << "KYTY_BOUNDED_SNAPSHOT_STORAGE_DOMAIN_PASS\n";
+      return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--bounded-unique-words-only") == 0) {
       TestBoundedSnapshotUniqueWords();
       std::cout << "KYTY_BOUNDED_UNIQUE_WORDS_PASS\n";
@@ -8674,7 +8693,8 @@ int main(int argc, char** argv) {
     Run("TestBoundedMaterializationZerosUnmappedScalarRows",
         TestBoundedMaterializationZerosUnmappedScalarRows);
     Run("TestBoundedMaterializationCandidatesAndRemap", TestBoundedMaterializationCandidatesAndRemap);
-    Run("TestBoundedSnapshotUniqueWords", TestBoundedSnapshotUniqueWords);
+    Run("TestBoundedSnapshotUniqueWords", [] { TestBoundedSnapshotUniqueWords(); });
+    Run("bounded snapshot storage domain", [] { TestBoundedSnapshotUniqueWords(true); });
     Run("TestBoundedScalarProbeBudget", TestBoundedScalarProbeBudget);
     Run("TestBoundedMaterializationLimitsAreTransactional", TestBoundedMaterializationLimitsAreTransactional);
     Run("TestBoundedMaterializationRejectsWritableAliases", TestBoundedMaterializationRejectsWritableAliases);

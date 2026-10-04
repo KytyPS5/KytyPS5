@@ -1,5 +1,62 @@
 # Emulator regression test debt
 
+## Bounded snapshot source domain versus storage capacity (2026-10-04; native CPU/GPU proved, actual retry pending)
+
+Native8d04ad39 retry154518 naturally exits321 at15:54:58UTC onCS8457:
+read59 reaches65537 DISTINCT source words. Alias correction is independently
+proved but does not solve this actual variant. Shown221/firstRGB206,
+window1550 visibly shows loading spinner, no menu/DeviceLost; PID42744 exited.
+
+Required synthetic RED: two independent finite scalar columns have32769 keys
+and65538 distinct source DWORDs, all values/layout/immutable ranges checked.
+Then65536 keys ×2 disjoint columns (131072 words); both comfortably below
+existing64MiB snapshot capacity. Numerical GPU RED/GREEN: full16-bit selector
+reads four genuinely distinct columns from65536 valid repeated descriptor rows
+(262144 source DWORDs,1MiB), keys0/1/65535 all return real backing values.
+Descriptors themselves deduplicate normally; do not alter descriptor limits.
+Preserve per-column key65536, workgroup reservations, failed callback/rollback,
+SRD OOB/U32 wrap, and exact64MiB/plus-one storage controls. Source-work bound
+must derive from already admitted dense rows: each distinct source DWORD
+corresponds to at least one stored row, therefore unique_words <= stored_rows
+<= MaxBoundedSnapshotWords. Do not guess a new larger probe constant.
+
+Contract checks: FlattenedSrt is one SSBO; LoadBoundedFlatWord uses U32 count/
+offset. NativeUpload copies data.size_bytes() into the64MiB stream buffer;
+StreamBuffer::Map rejects requests larger than backing. Vulkan's
+[maxStorageBufferRange](https://docs.vulkan.org/spec/latest/chapters/limits.html)
+minimum is128MiB, so64MiB policy remains below that hardware contract. The
+old independent65536 global probe quota is a software policy inherited from
+single selector domains, not a U16 flat index or a descriptor/API capacity.
+Worst-case coherent snapshot/cache work remains bounded by admitted rows;
+full worst-case all-distinct64MiB cache memory/performance is not yet measured.
+No production change before valid native RED.
+
+Native CPU RED `bounded-snapshot-domain-cpu-red-20261004.log.stderr`, SHA
+9d8fb1b502d258ad4f1fb4fa0220ec8f64e07a4750b71990b54ddeeaf6b9633b:
+rejects65537th unique word in65538-word/256KiB fixture. Native GPU RED
+`bounded-snapshot-domain-gpu-red-20261004.log.stderr`, SHA
+c945a54e0605cd7950462570c1cc36f9bb90a1b5dd0177fcf699585db1ac7f5c:
+rejects65537th word before dispatch of1MiB/full-selector fixture. Both REDs
+are on production8d04ad39, before the shared budget correction.
+
+Shared guard now derives from MaxBoundedSnapshotWords (existing64MiB/4),
+using the invariant unique bounded source words <= admitted logical rows.
+No guessed larger quota, no descriptor/per-column/workgroup/storage cap changes,
+no skipped row/read. Old global65536 quota oracles are superseded by positive
+cross-boundary values and an actual failed-source callback/rollback test.
+Full native ResourceTracking GREEN `bounded-snapshot-domain-full-cpu-green-20261004.log`
+(4.825s), nativeSHA b84355f8e70b1ef4a6d291f0d7ad8cfed05fa6e174eddcc1e57570c122c2ddb1:
+unchanged new65538/131072-value oracle, per-column65537 rejection before reads,
+exact64MiB/plus-one storage, immutable ranges and affected existing cases pass.
+
+Unchanged numerical native GPUAV GREEN `bounded-snapshot-domain-gpuav-green-20261004.log`
+(0.70s), SHA ec5866ca46b6259c9d7d7d40a4904e7ca3f5eb99baae938dd51f5dc3a54af855:
+full65536-row/four-column SRD has262144 genuinely distinct source DWORDs;
+keys0/1/65535 all return100+lane. All12outputs and entire1MiB backing checked;
+dense descriptor identity remains1. Same exe passes wrapped aliases/SRD extent
+GPUAV neighbors. Fixture wave32; actualCS8457 wave64 retry, other-game runtime,
+and worst-case all-distinct64MiB cache memory/performance remain unproved.
+
 ## Bounded SRT snapshot aliases (2026-10-04; native CPU/GPU proved, actual retry pending)
 
 Native df835e1e retry151821 exits321 at15:27:21UTC on CS8457901d80b91921:

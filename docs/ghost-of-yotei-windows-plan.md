@@ -1,7 +1,45 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
-Checkpoint **4 октября 2026 года, 15:42 UTC** (native Windows via WSL;
-branch `yotei-windows-bringup`, parentdf835e1e, bounded snapshot alias correction):
+Checkpoint **4 октября 2026 года, 16:12 UTC** (native Windows via WSL;
+branch `yotei-windows-bringup`, parent8d04ad39, derived source-work budget):
+
+- Native8d04 retry154518 naturally exited321 at15:54:58UTC onCS8457read59:
+ 65537 DISTINCT source words exceed the inherited global65536-word quota.
+  Alias correction is independently proved but did not unblock this variant.
+  Shown221/firstRGB206/window1550 visibly shows upper-right loading spinner;
+  no menu/DeviceLost observed. PID42744 exited, no native task remains.
+- Backend contract verified: bounded flat loads have U32 counts/offsets and one
+  FlattenedSrt SSBO. NativeUpload uses data.size_bytes() and a64MiB stream
+  buffer whose Map rejects larger requests. Vulkan storage-buffer range minimum
+ 128MiB leaves the existing64MiB policy within the hardware contract.
+  Each distinct bounded source word supplies at least one logical stored row;
+  therefore source work derives from MaxBoundedSnapshotWords, not a separate
+  global16-bit quota. Per-column65536 keys, workgroup reservations, descriptor
+  capacities,64MiB storage and all source/extent/alias/transaction guards remain.
+- Independent native REDs on production8d04ad39:
+  `bounded-snapshot-domain-{cpu,gpu}-red-20261004.log.stderr`; both reject65537th
+  source word in valid256KiB CPU /1MiB GPU snapshots before production change.
+  Unchanged new CPU value/layout/footprint oracle and full ResourceTracking
+  pass `bounded-snapshot-domain-full-cpu-green-20261004.log` (4.825s), SHA
+  `b84355f8e70b1ef4a6d291f0d7ad8cfed05fa6e174eddcc1e57570c122c2ddb1`.
+  Includes65538/131072 distinct words, per-column65537 rejection, exact64MiB/
+  plus-one storage, failed coherent callback/rollback and existing neighbors.
+  Old independent global65536 quota oracle is replaced by real storage/domain
+  boundaries and failed-source checks; values/rows are preserved.
+- Native numerical GPUAV `bounded-snapshot-domain-gpuav-green-20261004.log`
+  passes (0.70s):65536 valid rows ×4 distinct columns (1MiB source), keys0/1/
+ 65535 all return100+lane. All12outputs AND entire backing checked; identical
+  descriptors still deduplicate to1. NativeSHA
+  `ec5866ca46b6259c9d7d7d40a4904e7ca3f5eb99baae938dd51f5dc3a54af855`.
+  Same exe passes wrapped-selector/SRD-extent GPUAV neighbors. Fixture wave32;
+  actual wave64 CS8457, other-game runtime and worst-case all-distinct64MiB
+  cache memory/performance remain unproved. No guessed larger quota constant.
+- Native emulator build/install, actual quota-frontier retry and further rendering
+  remain pending. Existing fullCFG baseline debts/d0c NVIDIA breakpoint persist.
+  **Menu/gameplay PENDING.**
+
+Checkpoint **4 октября 2026 года, 15:53 UTC** (native Windows via WSL;
+branch `yotei-windows-bringup`, pushed8d04ad39, bounded snapshot alias correction):
 
 - Previous native retry151821 naturally exited321 on CS8457901d80b91921:
   boundedread59 charged65580 logical references against65536 probes.
@@ -30,9 +68,23 @@ branch `yotei-windows-bringup`, parentdf835e1e, bounded snapshot alias correctio
   Descriptor extent/sparse scalar-loop and4 zero-stride GPUAV neighbors pass.
   Fixture wave32;
   actual wave64 CS8457 and other-game runtime remain unproved.
-- Build/install and bounded original retry pending; use
-  `KYTY_SHADER_AUDIT_BOUNDED_WORDS` to measure actual source-word count.
-  Core restored after RED; no temporary reversal remains. Existing fullCFG
+- Native emulator build/install passed (`bounded-unique-words-emulator-{build,install}-20261004.log`).
+  Committed/pushed/readback `8d04ad39950cbd6fc9bcee7b76cdaf7aeea3382b`;
+  installed SHA256 `ac26f0cb4ab428df3d2215b040a670f62a7d4083b808a31a34a798ae7fe9755a`.
+  Bounded original retry FINISHED: `yotei-integrated-20261004-154518-presentfix-gpuav`,
+  PID42744/driverexec4353, timeout1500/watchdog800/readback150+1500/
+  ContinueAfterColored; Vulkan validation/selectiveGPUAV includesCS8457.
+  `KYTY_SHADER_AUDIT_BOUNDED_WORDS` measures actual source-word count.
+  Natural exit321 at15:54:58UTC; PID42744 exited. Shown221/firstRGB206;
+  offscreen `window-1550.png` visibly shows a loading spinner, no menu.
+  Earlier81-column snapshots retain5308444words with up to14580unique words;
+  CS8457 pipelines successfully created (one selectiveGPUAV variant21281ms).
+  The previously failing variant now proves65537 genuinely distinct source
+  words atread59 and still exceeds the independent global65536 quota.
+  Alias correction does not solve that capacity frontier. No DeviceLost observed.
+  Required new RED and derived row/storage-bound contract are recorded in debt;
+  no native game/build/GPU task remains. Core restored after RED;
+  no temporary reversal remains. Existing fullCFG
   baseline debts and independent d0c NVIDIA compiler breakpoint remain.
   **Menu/gameplay PENDING.**
 

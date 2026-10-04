@@ -31334,10 +31334,11 @@ TestCase BufferStoreFormatXDropsOutOfRangeRecord() {
 // A bounded scalar loop selects writable descriptors from an immutable SRT.
 // A full 16-bit GPU selector indexes a descriptor containing just one row.
 // OOB rows must retain their zero descriptor, with no host memory probes.
-TestCase FiniteScalarBufferDescriptorExtent(bool wrapped_aliases = false) {
+TestCase FiniteScalarBufferDescriptorExtent(bool wrapped_aliases = false, bool full_extent = false) {
   using O = ShaderOpcode;
   TestCase test;
-  test.name = wrapped_aliases ? "FiniteScalarBufferWrappedAliases"
+  test.name = full_extent ? "FiniteScalarBufferFullSnapshotDomain"
+                         : wrapped_aliases ? "FiniteScalarBufferWrappedAliases"
                               : "FiniteScalarBufferDescriptorExtent";
   test.has_compute_info = test.has_user_data = true;
   test.compute_info = {};
@@ -31349,13 +31350,16 @@ TestCase FiniteScalarBufferDescriptorExtent(bool wrapped_aliases = false) {
   test.bda_mappings = {{0, 0}};
   test.user_data = MakeStructuredStorageBufferData(4, wrapped_aliases ? 20 : 12);
   test.user_data[8] = 512u; // Immutable scalar-buffer SRD, byte extent 16.
-  test.user_data[10] = 16u;
+  test.user_data[10] = full_extent ? 65536u*16u : 16u;
   test.user_data[24] = 192u; // Read-only selector input SRD.
   test.user_data[25] = 4u << 16u;
   test.user_data[26] = wrapped_aliases ? 20u : 12u;
-  test.initial.assign(136u, 0xdeadbeefu);
+  test.initial.assign(full_extent ? 128u + 65536u*4u : 136u, 0xdeadbeefu);
   const std::array descriptor{128u, 4u << 16u, 4u, 0u};
-  std::copy(descriptor.begin(), descriptor.end(), test.initial.begin() + 128u);
+  // Distinct source addresses carry identical valid descriptors: resource
+  // deduplication must still leave all 16-bit selector rows readable.
+  for (u32 row = 0; row < (full_extent ? 65536u : 1u); ++row)
+    std::copy(descriptor.begin(), descriptor.end(), test.initial.begin() + 128u + row*4u);
   for (u32 lane = 0; lane < 4u; ++lane) test.initial[32u + lane] = 100u + lane;
   const std::vector<u32> keys = wrapped_aliases
       ? std::vector<u32>{0u, 1u, 2u, 65534u, 65535u}
@@ -31383,7 +31387,7 @@ TestCase FiniteScalarBufferDescriptorExtent(bool wrapped_aliases = false) {
     code.push_back(EncodeMubuf1(8, 0, 7));
     for (u32 lane = 0; lane < 4u; ++lane)
       test.expected[step * 4u + lane] =
-          (wrapped_aliases ? (keys[step] & 1u) == 0u : step == 0u) ? 100u + lane : 0u;
+          (full_extent || (wrapped_aliases ? (keys[step] & 1u) == 0u : step == 0u)) ? 100u + lane : 0u;
   }
   AppendEnd(&code);
   test.opcodes = {O::V_MOV_B32, O::V_ADD_NC_U32, O::BUFFER_LOAD_DWORD,
@@ -39911,6 +39915,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(Wave64MultidimensionalGuestGeometry);
   AddCase([] { return FiniteScalarBufferDescriptorExtent(); });
   AddCase([] { return FiniteScalarBufferDescriptorExtent(true); });
+  AddCase([] { return FiniteScalarBufferDescriptorExtent(false, true); });
   AddCase(Wave64ImageReadLoopAccumulatesWithoutFeedback);
   AddCase(Wave64SingleWaveImageFeedbackWithBound);
   AddCase(ScalarMaskWaterfallSparseExecAndReactivation);

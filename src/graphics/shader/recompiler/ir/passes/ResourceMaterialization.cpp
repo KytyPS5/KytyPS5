@@ -28,8 +28,9 @@ namespace {
 constexpr uint64_t AddressMask            = 0x0000ffffffffffffull;
 constexpr uint64_t RegisteredBufferAddressLimit = uint64_t{1} << 40u;
 constexpr uint64_t MaxIndirectImageProbes = 65536u;
-// Dense logical rows and distinct coherent source DWORDs have separate budgets.
-constexpr uint64_t MaxBoundedSnapshotProbes = 65536u;
+// Each resolved source DWORD supplies at least one dense logical row. The
+// existing snapshot storage bound therefore also bounds distinct source work;
+// the 16-bit candidate domain applies separately to each column.
 constexpr uint64_t MaxBoundedSnapshotBytes = 64u * 1024u * 1024u;
 constexpr uint64_t MaxBoundedSnapshotWords = MaxBoundedSnapshotBytes / sizeof(uint32_t);
 
@@ -973,10 +974,10 @@ bool MaterializeBoundedReads(const ResourcePlan& program, const SrtRuntime& runt
 			if (const auto found = bounded_words.find(address); found != bounded_words.end()) {
 				word = found->second;
 			} else {
-				if (bounded_words.size() >= MaxBoundedSnapshotProbes) {
+				if (bounded_words.size() >= MaxBoundedSnapshotWords) {
 					return SpecializationFail(fmt::format(
 					    "bounded SRT read {} exceeds unique source-word limit (words={} word_limit={})",
-					    id, bounded_words.size() + 1u, MaxBoundedSnapshotProbes));
+					    id, bounded_words.size() + 1u, MaxBoundedSnapshotWords));
 				}
 				if (runtime.clamp_memory_range != nullptr &&
 				    runtime.clamp_memory_range(runtime.userdata, address, sizeof(uint32_t)) == 0u) {

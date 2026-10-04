@@ -94,8 +94,8 @@ public:
 		// must never inherit these temporarily inheritable pipe handles.
 		static std::mutex spawn_mutex;
 		std::lock_guard   spawn_lock(spawn_mutex);
-		startup_deadline_ = std::chrono::steady_clock::now() + startup_timeout;
-		starting_         = true;
+		deadline_        = std::chrono::steady_clock::now() + startup_timeout;
+		deadline_active_ = true;
 #ifdef _WIN32
 		// Windows filenames cannot contain a double quote. Explicit quoted arguments,
 		// not cmd.exe/PowerShell, carry native Unicode package/helper filenames.
@@ -108,16 +108,31 @@ public:
 		SECURITY_ATTRIBUTES attributes {sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
 		HANDLE              input_read = nullptr, output_write = nullptr;
 		auto                fail = [&] {
-            if (input_read) CloseHandle(input_read);
-            if (output_write) CloseHandle(output_write);
-            Close();
-            throw std::runtime_error(
-                "Unable to start package helper; check .NET 10 and KYTY_PKG_HELPER");
+			if (input_read) CloseHandle(input_read);
+			if (output_write) CloseHandle(output_write);
+			Close();
+			throw std::runtime_error(
+			    "Unable to start package helper; check .NET 10 and KYTY_PKG_HELPER");
 		};
-		if (!CreatePipe(&input_read, &input_write_, &attributes, 0) ||
-		    !CreatePipe(&output_read_, &output_write, &attributes, 0))
+		// An overlapped parent write handle lets a blocked request obey its deadline.
+		static uint64_t pipe_serial = 0; // Protected by spawn_mutex.
+		const auto pipe_name = L"\\\\.\\pipe\\kyty-pkg-" + std::to_wstring(GetCurrentProcessId()) +
+		                       L"-" + std::to_wstring(++pipe_serial);
+		input_write_         = CreateNamedPipeW(
+		    pipe_name.c_str(),
+		    PIPE_ACCESS_OUTBOUND | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
+		    PIPE_TYPE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS, 1, 4096, 4096, 0, nullptr);
+		if (input_write_ == INVALID_HANDLE_VALUE) {
+			input_write_ = nullptr;
 			fail();
-		if (!SetHandleInformation(input_write_, HANDLE_FLAG_INHERIT, 0) ||
+		}
+		input_read =
+		    CreateFileW(pipe_name.c_str(), GENERIC_READ, 0, &attributes, OPEN_EXISTING, 0, nullptr);
+		if (input_read == INVALID_HANDLE_VALUE) {
+			input_read = nullptr;
+			fail();
+		}
+		if (!CreatePipe(&output_read_, &output_write, &attributes, 0) ||
 		    !SetHandleInformation(output_read_, HANDLE_FLAG_INHERIT, 0))
 			fail();
 		STARTUPINFOW startup {};
@@ -171,6 +186,12 @@ public:
 		}
 		close(input[0]);
 		close(output[1]);
+		if (fcntl(input[1], F_SETFL, O_NONBLOCK) < 0) {
+			close(input[1]);
+			close(output[0]);
+			Close();
+			throw std::runtime_error("Cannot make helper requests nonblocking");
+		}
 		input_write_ = input[1];
 		output_read_ = output[0];
 #endif
@@ -222,11 +243,40 @@ public:
 		auto* p = static_cast<const uint8_t*>(data);
 		while (size != 0) {
 #ifdef _WIN32
+			CheckDeadline();
+			OVERLAPPED operation {};
+			operation.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+			if (!operation.hEvent) throw std::runtime_error("Cannot create helper write event");
 			DWORD wrote = 0;
-			if (!WriteFile(input_write_, p, static_cast<DWORD>(size), &wrote, nullptr) ||
-			    wrote == 0)
-				throw std::runtime_error("Package helper write failed");
+			bool ok = WriteFile(input_write_, p, static_cast<DWORD>(size), &wrote, &operation) != 0;
+			if (!ok && GetLastError() == ERROR_IO_PENDING) {
+				const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+				                           deadline_ - std::chrono::steady_clock::now())
+				                           .count();
+				const auto state     = WaitForSingleObject(
+				    operation.hEvent, static_cast<DWORD>(std::clamp<int64_t>(remaining, 0, 60000)));
+				if (state != WAIT_OBJECT_0) {
+					CancelIoEx(input_write_, &operation);
+					// Cancellation must finish before the OVERLAPPED or buffer goes out of scope.
+					GetOverlappedResult(input_write_, &operation, &wrote, TRUE);
+					CloseHandle(operation.hEvent);
+					throw std::runtime_error("Package helper request timed out or wait failed");
+				}
+				ok = GetOverlappedResult(input_write_, &operation, &wrote, FALSE) != 0;
+			}
+			CloseHandle(operation.hEvent);
+			if (!ok || wrote == 0) throw std::runtime_error("Package helper write failed");
 #else
+			CheckDeadline();
+			pollfd     writable {input_write_, POLLOUT, 0};
+			const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+			                           deadline_ - std::chrono::steady_clock::now())
+			                           .count();
+			const int  ready =
+			    poll(&writable, 1, static_cast<int>(std::clamp<int64_t>(remaining, 1, 1000)));
+			if (ready < 0 && errno == EINTR) continue;
+			if (ready < 0) throw std::runtime_error("Cannot poll helper request");
+			if (ready == 0) continue;
 			// Suppress only this thread's newly generated SIGPIPE, preserving the caller's signal
 			// state.
 			sigset_t blocked, previous, pending;
@@ -247,23 +297,28 @@ public:
 			}
 			pthread_sigmask(SIG_SETMASK, &previous, nullptr);
 			errno = saved_errno;
-			if (wrote < 0 && errno == EINTR) continue;
+			if (wrote < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
 			if (wrote <= 0) throw std::runtime_error("Package helper write failed");
 #endif
 			p += wrote;
 			size -= static_cast<size_t>(wrote);
 		}
 	}
-	void FinishStartup() { starting_ = false; }
+	// A single deadline covers the complete request and response, including partial I/O.
+	void BeginTransaction(std::chrono::milliseconds timeout) {
+		deadline_        = std::chrono::steady_clock::now() + timeout;
+		deadline_active_ = true;
+	}
+	void FinishStartup() { deadline_active_ = false; }
 	void Read(void* data, size_t size) {
 		auto* p = static_cast<uint8_t*>(data);
 		while (size != 0) {
 #ifdef _WIN32
 			size_t requested = size;
-			if (starting_) {
+			if (deadline_active_) {
 				DWORD available = 0;
 				while (true) {
-					CheckStartupDeadline();
+					CheckDeadline();
 					if (!PeekNamedPipe(output_read_, nullptr, 0, nullptr, &available, nullptr))
 						throw std::runtime_error("Package helper closed the stream");
 					if (available != 0) break;
@@ -285,13 +340,13 @@ public:
 			    got == 0)
 				throw std::runtime_error("Package helper closed the stream");
 #else
-			if (starting_) {
-				CheckStartupDeadline();
+			if (deadline_active_) {
+				CheckDeadline();
 				const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
-				                           startup_deadline_ - std::chrono::steady_clock::now())
+				                           deadline_ - std::chrono::steady_clock::now())
 				                           .count();
-				pollfd    ready {output_read_, POLLIN, 0};
-				const int result =
+				pollfd     ready {output_read_, POLLIN, 0};
+				const int  result =
 				    poll(&ready, 1, static_cast<int>(std::clamp<int64_t>(remaining, 1, 1000)));
 				if (result < 0 && errno == EINTR) continue;
 				if (result < 0) throw std::runtime_error("Cannot poll package helper");
@@ -328,12 +383,12 @@ public:
 	}
 
 private:
-	void CheckStartupDeadline() {
-		if (std::chrono::steady_clock::now() >= startup_deadline_)
-			throw std::runtime_error("Package helper startup/catalog timed out");
+	void CheckDeadline() {
+		if (deadline_active_ && std::chrono::steady_clock::now() >= deadline_)
+			throw std::runtime_error("Package helper transaction timed out");
 	}
-	bool                                  starting_ = false;
-	std::chrono::steady_clock::time_point startup_deadline_;
+	bool                                  deadline_active_ = false;
+	std::chrono::steady_clock::time_point deadline_;
 #ifdef _WIN32
 	HANDLE input_write_ = nullptr, output_read_ = nullptr, process_ = nullptr;
 #else
@@ -344,9 +399,10 @@ private:
 
 class PkgArchiveBackend final: public ArchiveReader {
 public:
-	explicit PkgArchiveBackend(
-	    const std::filesystem::path& package,
-	    std::chrono::milliseconds    startup_timeout = std::chrono::seconds(60)) {
+	explicit PkgArchiveBackend(const std::filesystem::path& package,
+	                           std::chrono::milliseconds startup_timeout = std::chrono::seconds(60),
+	                           std::chrono::milliseconds read_timeout    = std::chrono::seconds(60))
+	    : read_timeout_(read_timeout) {
 		pipe_.Open(package, startup_timeout);
 		std::array<char, 4> magic {};
 		pipe_.Read(magic.data(), magic.size());
@@ -398,7 +454,9 @@ public:
 		if (size == 0) return 0;
 		if (data == nullptr || size > 1024 * 1024) return 0;
 		std::lock_guard lock(mutex_);
+		if (failed_) return 0;
 		try {
+			pipe_.BeginTransaction(read_timeout_);
 			pipe_.Number(1, 1);
 			pipe_.Number(id, 8);
 			pipe_.Number(offset, 8);
@@ -414,11 +472,14 @@ public:
 		} catch (const std::exception& ex) {
 			std::fprintf(stderr, "PKG reader failed: %s\n", ex.what());
 			pipe_.Close();
+			failed_ = true;
 			return 0;
 		}
 	}
 
 private:
+	std::chrono::milliseconds                                    read_timeout_;
+	bool                                                         failed_ = false;
 	Pipe                                                         pipe_;
 	std::mutex                                                   mutex_;
 	std::map<std::string, Entry>                                 entries_;

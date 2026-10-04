@@ -62,8 +62,8 @@ game data.
 With helper publishing enabled and Qt available:
 
 ```sh
-cmake --build _Build/windows --target pkg_discovery_tests pkg_bridge_tests
-ctest --test-dir _Build/windows -R '^pkg_' --output-on-failure
+cmake --build _Build/windows --target pkg_discovery_tests pkg_bridge_tests pkg_startup_tests
+ctest --test-dir _Build/windows -R "^pkg_" --output-on-failure
 ```
 
 Tests generate sparse data with more than 5 GB logical size. Use a filesystem
@@ -92,16 +92,20 @@ PKG helper creation is serialized through closing the child-side pipe ends,
 preventing concurrent PKG launches from inheriting each other's temporary handles.
 Handshake and catalog reads share a 60-second deadline; receiving partial data
 does not reset it. A timeout closes the transport and terminates the helper,
-and the package is reported as unavailable. Ordinary asset reads retain their
-existing behavior. Scanning still runs on the UI thread, so it can remain
+and the package is reported as unavailable. Every asset-read request and its complete response also share a 60-second
+deadline. A transport failure permanently disables that reader; subsequent
+reads fail immediately. Other archive requests can then resume. Scanning still runs on the UI thread, so it can remain
 unresponsive until a slow package finishes or its startup deadline expires.
 
 The startup regression uses a native mock helper and needs no .NET runtime:
 
 ```sh
 cmake --build _Build/windows --target pkg_startup_tests
-ctest --test-dir _Build/windows -R '^pkg_startup$' --output-on-failure
+ctest --test-dir _Build/windows -R "^pkg_startup$" --output-on-failure
 ```
 
 It covers silent startup, partial handshake, stalled catalog, forced cleanup,
 a successful mount after failure, and EOF during concurrent helper launches.
+
+Python is optional when helper publishing is disabled. The native mock-helper
+test is registered only when a Python interpreter is available.

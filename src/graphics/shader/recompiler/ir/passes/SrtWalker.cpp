@@ -454,6 +454,16 @@ bool SrtWalker::EvaluateExtract(const Inst& inst, uint64_t& result) {
 	return false;
 }
 
+bool SrtWalker::EvaluateScalarReadAddress(const ScalarReadAddress& read, uint64_t& address) {
+	uint64_t low = 0, high = 0, offset = 0;
+	if (!EvaluateWide(read.base[0], low) || !EvaluateWide(read.base[1], high) ||
+	    !EvaluateWide(read.offset, offset)) return false;
+	const auto base = ((high << 32u) | static_cast<uint32_t>(low)) & AddressMask;
+	const auto relative = (static_cast<int64_t>(read.immediate) & ~int64_t {3}) +
+	                      static_cast<int64_t>(static_cast<uint32_t>(offset) & ~3u);
+	return AddSignedAddress(base & ~uint64_t {3}, relative, address);
+}
+
 bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 	const auto flags = inst.Flags<MemoryFlags>();
 	if (flags.index >= m_program.memory_info.size()) {

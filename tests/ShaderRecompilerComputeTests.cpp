@@ -3962,6 +3962,85 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  void CheckNativeScalarReadResidency() {
+    constexpr const char *name = "NativeScalarReadResidency";
+    constexpr uintptr_t base = 0x0000002034800000ull;
+    constexpr uint64_t allocation_size = 0x8000;
+    constexpr uint64_t scalar_address = base + 0x688c;
+    constexpr uint32_t scalar_value = 0xffffffffu;
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, 0x4000, 0, &direct_offset) == 0,
+            "scalar source allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset, 0x4000) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "scalar source mapping failed");
+    context.MapMemory(base, allocation_size);
+    Libs::LibKernel::Memory::WriteBacking(scalar_address, &scalar_value,
+                                         sizeof(scalar_value));
+    auto &cache = context.GetBufferCache();
+    Require(name, "cold scalar page",
+            !BufferCacheTestAccess::PageOwner(cache, scalar_address),
+            "native scalar source page was already resident");
+    ShaderRecompiler::IR::CompiledShaderInfo program{};
+    program.stage = ShaderType::Compute;
+    ShaderRecompiler::IR::ResourceSnapshot snapshot;
+    snapshot.scalar_read_addresses = {scalar_address};
+    ShaderStageRuntime runtime{&program, &snapshot};
+    PreparedBindings bindings;
+    auto &executor = context.GetRenderExecutor();
+    executor.PrepareBindings(runtime, bindings);
+    std::array<PreparedBindings *, 1> stages{&bindings};
+    executor.FindBuffers(stages);
+    const auto owner = BufferCacheTestAccess::PageOwner(cache, scalar_address);
+    Require(name, "resident scalar page", bool(owner),
+            "native scalar source still requires a delayed GPU page fault");
+    auto &buffer = cache.GetBuffer(owner);
+    auto readback = CreateHostBuffer(name, sizeof(uint32_t),
+                                    vk::BufferUsageFlagBits::eTransferDst, {0});
+    const vk::BufferCopy copy{buffer.Offset(scalar_address), 0, sizeof(uint32_t)};
+    scheduler.Current().Handle().copyBuffer(buffer.Handle(), readback.buffer, 1,
+                                            &copy);
+    vk::BufferMemoryBarrier barrier{};
+    barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+    barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.buffer = readback.buffer;
+    barrier.size = readback.size;
+    scheduler.Current().Handle().pipelineBarrier(
+        vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {},
+        0, nullptr, 1, &barrier, 0, nullptr);
+    scheduler.Finish();
+    Require(name, "first scalar value", ReadBuffer(name, readback, 1)[0] == scalar_value,
+            "native scalar source returned zero on its first dispatch");
+    DestroyBuffer(&readback);
+    context.UnmapMemory(base, allocation_size);
+    scheduler.Finish();
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "scalar source unmap failed");
+    Require(name, "release direct allocation",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "scalar source release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   void CheckBufferCacheDirtyGarbageCollection() {
     constexpr const char *name = "BufferCacheDirtyGarbageCollection";
     constexpr uintptr_t base = 0x0000000200700000ull;
@@ -41573,6 +41652,11 @@ int main(int argc, char **argv) {
     vulkan.CheckUnifiedTextureCacheFlow();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--scalar-read-residency-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckNativeScalarReadResidency();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-gc-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckBufferCacheDirtyGarbageCollection();
@@ -41789,6 +41873,7 @@ int main(int argc, char **argv) {
     vulkan.CheckRasterization(false);
     vulkan.CheckRasterization(false, Prospero::BufferFormat::k11_11_10Float);
     vulkan.CheckRasterization(false, Prospero::BufferFormat::k10_10_10_2UScaled);
+    vulkan.CheckNativeScalarReadResidency();
     vulkan.CheckBufferCacheDirtyGarbageCollection();
 #endif
   } else {

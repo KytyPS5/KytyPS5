@@ -39,6 +39,7 @@ public:
 
 	bool Evaluate(Value value, uint32_t& result);
 	bool EvaluateDescriptor(uint32_t source, DescriptorValue& result);
+	bool EvaluateScalarReadAddress(const ScalarReadAddress& read, uint64_t& address);
 	// Refreshes reachable scalar reads and active descriptor sources in one walk.
 	bool RefreshFlatBuffer(std::vector<uint32_t>& flat);
 

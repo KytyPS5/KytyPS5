@@ -815,6 +815,13 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 		EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
 		const auto& program  = *prepared.runtime->program;
 		const auto& snapshot = *prepared.runtime->resources;
+		// Native scalar loads must see resident pages on their first dispatch.
+		for (const auto address: snapshot.scalar_read_addresses) {
+			uint32_t backing = 0;
+			if (!LibKernel::Memory::TryReadBacking(address, &backing, sizeof(backing))) continue;
+			(void)cache.FindBuffer(address, sizeof(uint32_t));
+			cache.SynchronizeBuffersInRange(address, sizeof(uint32_t));
+		}
 		prepared.buffer_sources.clear();
 		const auto& layout = program.bindings;
 		if (layout.memory_offset_count == 0) {

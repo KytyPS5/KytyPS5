@@ -168,6 +168,63 @@ void TestMappedSrtUsesDirectReaderByDefault() {
         "cache rematerialization did not use the direct reader by default");
 }
 
+void TestNativeScalarReadAddresses() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  auto plan = [] {
+    Program program;
+    program.stage = Libs::Graphics::ShaderType::Compute;
+    program.srt_plan_complete = true;
+    program.resource_tracking_complete = true;
+    auto &block = AddValueBlock(program);
+    auto &low = block.AppendNewInst(ValueOpcode::GetUserData,
+                                   {Value(static_cast<ScalarReg>(0))});
+    auto &high = block.AppendNewInst(ValueOpcode::GetUserData,
+                                    {Value(static_cast<ScalarReg>(1))});
+    auto &handle = block.AppendNewInst(ValueOpcode::GetAddressResource,
+                                      {Value(&low), Value(&high)});
+    program.memory_info.push_back({.kind = ResourceKind::ScalarAddress,
+                                   .offset = static_cast<uint32_t>(-4)});
+    program.memory_info.push_back({.kind = ResourceKind::ScalarAddress,
+                                   .offset = 8});
+    for (const uint32_t index : {0u, 1u, 1u}) {
+      auto &read = block.AppendNewInst(
+          ValueOpcode::LoadAddressU32,
+          {Value(&handle), Value(7u), Value(0u), Value(true)});
+      read.SetFlags(MemoryFlags{.index = index});
+    }
+    auto &lane = block.AppendNewInst(
+        ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)});
+    auto &read = block.AppendNewInst(
+        ValueOpcode::LoadAddressU32,
+        {Value(&handle), Value(&lane), Value(0u), Value(true)});
+    read.SetFlags(MemoryFlags{.index = 1});
+    return ExtractResourcePlan(program);
+  }();
+  Check(plan.scalar_read_addresses.size() == 3,
+        "native address planning retained a varying offset or lost constant reads");
+  std::array<uint32_t, 2> user_data{0x3ffdu, 0x20u};
+  uint32_t reads = 0;
+  const SrtRuntime runtime{.user_data = user_data,
+                           .read_memory = RejectSpecializationRead,
+                           .userdata = &reads};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  for (const uint32_t high : {0x20u, 0x80000020u, 0xffff0020u}) {
+    user_data[1] = high;
+    for (const uint32_t base : {0x3ffdu, 0x7ffdu}) {
+      user_data[0] = base;
+      Check(MaterializeResources(plan, runtime, snapshot, specialization),
+            "native scalar addresses did not refresh");
+      const auto aligned = (uint64_t{0x20u} << 32u) | (base & ~3u);
+      Check(snapshot.scalar_read_addresses ==
+                std::vector<uint64_t>{aligned, aligned + 12u} &&
+                snapshot.flattened_srt.empty() && reads == 0,
+            "native address planning read data, retained stale addresses, or lost masking or alignment");
+    }
+  }
+}
+
 void TestIntegerRuntimeValueFollowsSrtReads() {
   using namespace Libs::Graphics::ShaderRecompiler::IR;
   auto plan = SrtPlan(0x10000);
@@ -566,6 +623,7 @@ void DbgExit(int) { std::abort(); }
 
 int main() {
   TestMappedSrtUsesDirectReaderByDefault();
+  TestNativeScalarReadAddresses();
   TestIntegerRuntimeValueFollowsSrtReads();
   TestUniformVectorDescriptorRead();
   TestExactReciprocalDescriptorArithmetic();

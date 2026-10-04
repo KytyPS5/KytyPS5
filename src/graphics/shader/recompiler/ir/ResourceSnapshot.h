@@ -35,6 +35,7 @@ struct ResourceSnapshot {
 	std::vector<DescriptorValue> samplers;
 	std::vector<uint32_t>        flattened_srt;
 	std::vector<uint32_t>        user_data;
+	std::vector<uint64_t>        scalar_read_addresses;
 	std::vector<std::pair<uint64_t, uint64_t>> specialization_reads;
 	UniformFill                 uniform_fill;
 };

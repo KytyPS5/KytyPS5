@@ -968,6 +968,22 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	for (const auto& read: program.srt_reads) {
 		plan.srt_reads.push_back({Clone(read.value), read.flat_offset});
 	}
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			if (inst.GetOpcode() != ValueOpcode::LoadAddressU32) continue;
+			const auto& memory = program.memory_info[inst.Flags<MemoryFlags>().index];
+			const auto* handle = inst.Arg(0).Resolve().TryInstruction();
+			if (memory.kind != ResourceKind::ScalarAddress || memory.planning_only ||
+			    memory.address_is_full || handle == nullptr ||
+			    handle->GetOpcode() != ValueOpcode::GetAddressResource ||
+			    !ValidateRuntimeValue(program, handle->Arg(0), RuntimeValueType::Integer) ||
+			    !ValidateRuntimeValue(program, handle->Arg(1), RuntimeValueType::Integer) ||
+			    !ValidateRuntimeValue(program, inst.Arg(1), RuntimeValueType::Integer)) continue;
+			plan.scalar_read_addresses.push_back(
+			    {{Clone(handle->Arg(0)), Clone(handle->Arg(1))}, Clone(inst.Arg(1)),
+			     static_cast<int32_t>(memory.offset)});
+		}
+	}
 	// A proven uniform factor can decide a branch even when its other lanes are unknown.
 	// Keep only that Boolean structure, never the varying shader dependency graph.
 	Value unknown;
@@ -1060,6 +1076,18 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	if (!walker.RefreshFlatBuffer(snapshot.flattened_srt)) {
 		return false;
 	}
+	snapshot.scalar_read_addresses.clear();
+	for (const auto& read: program.scalar_read_addresses) {
+		uint64_t address = 0;
+		if (walker.EvaluateScalarReadAddress(read, address) && address != 0 &&
+		    address <= AddressMask - (sizeof(uint32_t) - 1u)) {
+			snapshot.scalar_read_addresses.push_back(address);
+		}
+	}
+	std::ranges::sort(snapshot.scalar_read_addresses);
+	snapshot.scalar_read_addresses.erase(
+	    std::unique(snapshot.scalar_read_addresses.begin(), snapshot.scalar_read_addresses.end()),
+	    snapshot.scalar_read_addresses.end());
 	const auto active = std::span<const uint8_t>(program.active_sources);
 	snapshot.uniform_fill = {};
 	const auto& fill = program.uniform_fill;

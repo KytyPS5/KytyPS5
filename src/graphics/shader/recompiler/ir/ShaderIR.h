@@ -517,6 +517,12 @@ struct SrtRead {
 	bool operator==(const SrtRead& other) const = default;
 };
 
+struct ScalarReadAddress {
+	std::array<Value, 2> base;
+	Value               offset;
+	int32_t             immediate = 0;
+};
+
 struct ResourceBlock {
 	// Conditional successors are ordered true, false; an empty condition follows every edge.
 	Value                 condition;
@@ -574,6 +580,7 @@ struct ResourcePlan {
 	std::vector<DescriptorSource>       descriptor_sources;
 	std::vector<ResourceBlock>          control_flow;
 	std::vector<SrtRead>                srt_reads;
+	std::vector<ScalarReadAddress>      scalar_read_addresses;
 	std::vector<uint8_t>                clean_flat_slots;
 	bool                                requires_specialization_memory = false;
 	bool                                capture_specialization_reads = false;

@@ -618,8 +618,10 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		           std::all_of(std::begin(pixel_info.target_output_mode) + 1,
 		                       std::end(pixel_info.target_output_mode),
 		                       [](uint8_t mode) { return mode == 0; }) &&
-		           ClassifyBlendMapping(blend, pixel_info.target_export_mapping[0]) ==
-		               BlendMappingSupport::SourceAlpha) {
+		           ClassifyBlendMapping(blend, pixel_info.target_export_mapping[0]) !=
+		               BlendMappingSupport::Direct &&
+		           ClassifyBlendMapping(blend, pixel_info.target_export_mapping[0]) !=
+		               BlendMappingSupport::Unsupported) {
 			// Preserve logical alpha when the export mapping moves it.
 			pixel_info.alpha_blend_source_remap = true;
 			pixel_info.dual_source_blending     = true;
@@ -730,6 +732,8 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 		const bool alpha_remap =
 		    slot == 0 && ps_input_info != nullptr && ps_input_info->alpha_blend_source_remap;
 		static_params.blend_enable[slot] = bc.enable && !rt.info.blend_bypass;
+		// A mapping that moves alpha is only blended when the pixel shader supplies the logical
+		// alpha in the second blend source (alpha_remap, target 0 only); otherwise blending is off.
 		if (static_params.blend_enable[slot] && !alpha_remap &&
 		    ClassifyBlendMapping(bc, colors[i].export_mapping) != BlendMappingSupport::Direct) {
 			static_params.blend_enable[slot] = false;

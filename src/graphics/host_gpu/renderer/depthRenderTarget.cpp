@@ -160,11 +160,38 @@ static TextureCache::ImageDesc MakeDepthTargetDesc(const CommandBuffer& buffer,
 			           z.depth_view.slice_max);
 	}
 	// EXPCLEAR permits an HTile acceleration state; the host attachment is already expanded.
-	if (z.z_info.partially_resident ||
-	    z.stencil_info.partially_resident || z.z_info.max_mip_level != 0 ||
-	    z.depth_view.current_mip_level != 0 || unsupported_shading_rate_encoding ||
-	    depth_address == 0 || (depth_address & 0xffffu) != 0) {
-		DepthFatal("unsupported depth register state");
+	// Each condition gets its own message: a title that trips one of them cannot be helped by
+	// guessing which, and one shared string made every hit look like every other.
+	//
+	// PARTIALLY_RESIDENT is an occupancy hint for the compression engine -- it tells the hardware
+	// a tile may have to be fetched on demand. It does not change the depth values written or the
+	// outcome of a depth test, and the host attachment is a fully materialised image with no
+	// partial residency to model. The attachment_unbound heuristic below already counts this bit
+	// as evidence that a surface is bound, exactly as it counts expclear_enabled, so rejecting it
+	// here contradicted that reading. Ignore it, and say so once.
+	if (z.z_info.partially_resident || z.stencil_info.partially_resident) {
+		static std::atomic_bool warned_pr = false;
+		if (!warned_pr.exchange(true, std::memory_order_relaxed)) {
+			LOGF("DepthTarget: ignoring partially_resident (z=%d stencil=%d); the host attachment "
+			     "is always fully resident\n",
+			     z.z_info.partially_resident ? 1 : 0, z.stencil_info.partially_resident ? 1 : 0);
+		}
+	}
+	if (z.z_info.max_mip_level != 0) {
+		DepthFatal("z_info.max_mip_level=%u, only 0 is modelled", z.z_info.max_mip_level);
+	}
+	if (z.depth_view.current_mip_level != 0) {
+		DepthFatal("depth_view.current_mip_level=%u, only 0 is modelled",
+		           z.depth_view.current_mip_level);
+	}
+	if (unsupported_shading_rate_encoding) {
+		DepthFatal("shading_rate_encoding=%u is not modelled", z.shading_rate_encoding);
+	}
+	if (depth_address == 0) {
+		DepthFatal("depth address is zero");
+	}
+	if ((depth_address & 0xffffu) != 0) {
+		DepthFatal("depth address 0x%08x is not 64 KiB aligned", depth_address);
 	}
 	if (has_stencil) {
 		if (z.stencil_info.format != Prospero::StencilFormat::k8UInt || !htile_stencil_compat ||
@@ -299,12 +326,29 @@ void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepth
 		}
 		return;
 	}
-	if (rc.copy_depth_to_color || rc.copy_stencil_to_color || rc.copy_centroid ||
-	    rc.copy_sample != 0 || dc.zfunc > static_cast<uint8_t>(vk::CompareOp::eAlways) ||
-	    (!z.depth_view.depth_write_disable && z.z_write_base_addr != z.z_read_base_addr) ||
-	    (has_stencil && !z.depth_view.stencil_write_disable &&
-	     z.stencil_write_base_addr != z.stencil_read_base_addr)) {
-		DepthFatal("unsupported depth register state");
+	if (rc.copy_depth_to_color) {
+		DepthFatal("copy_depth_to_color is not modelled");
+	}
+	if (rc.copy_stencil_to_color) {
+		DepthFatal("copy_stencil_to_color is not modelled");
+	}
+	if (rc.copy_centroid) {
+		DepthFatal("copy_centroid is not modelled");
+	}
+	if (rc.copy_sample != 0) {
+		DepthFatal("copy_sample=%u is not modelled", rc.copy_sample);
+	}
+	if (dc.zfunc > static_cast<uint8_t>(vk::CompareOp::eAlways)) {
+		DepthFatal("zfunc=%u is past eAlways", dc.zfunc);
+	}
+	if (!z.depth_view.depth_write_disable && z.z_write_base_addr != z.z_read_base_addr) {
+		DepthFatal("depth write base 0x%08x differs from read base 0x%08x", z.z_write_base_addr,
+		           z.z_read_base_addr);
+	}
+	if (has_stencil && !z.depth_view.stencil_write_disable &&
+	    z.stencil_write_base_addr != z.stencil_read_base_addr) {
+		DepthFatal("stencil write base 0x%08x differs from read base 0x%08x",
+		           z.stencil_write_base_addr, z.stencil_read_base_addr);
 	}
 	r.desc = MakeDepthTargetDesc(buffer, z);
 	r.depth_clear_enable      = rc.depth_clear_enable;

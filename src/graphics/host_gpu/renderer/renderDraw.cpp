@@ -721,8 +721,20 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 	for (uint32_t i = 0; i < merged_count; i++) {
 		auto& range = merged_ranges[i];
 		// PPSA20298
+		// A vertex buffer the game names before the region is backed is not an error: on the
+		// hardware an unbacked range reads zero and drops writes, so binding nothing reproduces it.
 		const auto size =
-		    Libs::LibKernel::Memory::ClampRangeSize(range.base_address, range.RequestedSize());
+		    Libs::LibKernel::Memory::TryClampRangeSize(range.base_address, range.RequestedSize());
+		if (size == 0) {
+			static std::atomic<uint32_t> reported = 0;
+			if (reported.fetch_add(1, std::memory_order_relaxed) < 8) {
+				LOGF("PreparedVertexBuffers: vertex buffer %u outside mapped memory: "
+				     "base=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+				     i, range.base_address, range.RequestedSize());
+			}
+			range.acquired_end = range.base_address;
+			continue;
+		}
 		range.acquired_end = range.base_address + size;
 		range.binding      = cache.ObtainBuffer(range.base_address, size, false);
 	}
@@ -797,6 +809,13 @@ static bool GetDrawTopology(const HW::UserConfig& ucfg, vk::PrimitiveTopology& t
 			topology = vk::PrimitiveTopology::ePatchList;
 			break;
 		case Prospero::PrimitiveType::kQuadListLegacy:
+			topology = vk::PrimitiveTopology::eTriangleFan;
+			break;
+		case Prospero::PrimitiveType::kPolygon:
+			// A polygon list is a fan: the hardware states that for N>=0 the vertices
+			// [0, N+1, N+2] make one triangle, so a fan with the same vertex order is the same
+			// primitive. Drawing it instead of dropping the call is the difference between a
+			// missing polygon and the polygon.
 			topology = vk::PrimitiveTopology::eTriangleFan;
 			break;
 		default: {
@@ -1016,6 +1035,20 @@ static void EmitDrawPrimitives(const HW::UserConfig& ucfg, vk::CommandBuffer vk_
 				}
 			}
 			break;
+		case Prospero::PrimitiveType::kPolygon:
+			// A fan over the whole list, which is what a polygon list is on this hardware:
+			// for N>=0 the vertices [0, N+1, N+2] form one triangle. The topology for it was
+			// already decided to be a triangle fan, so the same count goes through untouched.
+			// This used to reach the default arm and take the process down with it, which is
+			// how a single draw call ended the title.
+			if (draw.IsIndexed()) {
+				vk_buffer.drawIndexed(draw.index_count, draw.instance_count, 0, emit.vertex_offset,
+				                      emit.first_instance);
+			} else {
+				vk_buffer.draw(draw.index_count, draw.instance_count, emit.first_vertex,
+				               emit.first_instance);
+			}
+			break;
 		default: EXIT("unknown primitive type: %u\n", static_cast<uint32_t>(ucfg.GetPrimType()));
 	}
 }
@@ -1112,12 +1145,26 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
 	if (mesh_active) {
+		// A non-indexed draw carries no index buffer, but the mesh shader still pulls its
+		// per-lane data from a guest address handed over in the draw packet. Hand it the vertex
+		// buffer the draw would have read through a vertex input: a null address makes every
+		// lane read zero, and the mesh comes out empty for the whole frame.
+		uint64_t mesh_address = index_source.address;
+		if (mesh_address == 0) {
+			const auto& mesh_input = state.vertex_info[0];
+			for (int i = 0; i < mesh_input.buffers_num; i++) {
+				if (mesh_input.buffers[i].addr != 0) {
+					mesh_address = mesh_input.buffers[i].addr;
+					break;
+				}
+			}
+		}
 		const uint32_t draw_data[] {
 		    draw.index_count,
 		    draw.IsIndexed() ? static_cast<uint32_t>(emit.vertex_offset) : emit.first_vertex,
 		    emit.first_instance, index_source.guest_element_size,
-		    static_cast<uint32_t>(index_source.address),
-		    static_cast<uint32_t>(index_source.address >> 32u)};
+		    static_cast<uint32_t>(mesh_address),
+		    static_cast<uint32_t>(mesh_address >> 32u)};
 		static_assert(std::size(draw_data) == ShaderRecompiler::IR::PushData::MeshDrawDwordCount);
 		vk_buffer.pushConstants(pipeline.pipeline_layout,
 		                        vk::ShaderStageFlagBits::eMeshEXT |

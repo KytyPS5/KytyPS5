@@ -21,14 +21,23 @@ struct FormatInfo {
 constexpr FormatInfo kFormatInfo[] = {
 	{BufferFormat::k8UNorm, 1, 0, 1, true, false},
 	{BufferFormat::k8SNorm, 0, 0, 1, false, false},
+	// Scaled formats hold integers in memory but hand the shader the integer magnitude as a float
+	// rather than normalizing it, so they sample as Float, not Uint/Sint.
+	{BufferFormat::k8UScaled, 1, 0, 1, true, false},
+	{BufferFormat::k8SScaled, 1, 0, 1, true, false},
 	{BufferFormat::k8UInt, 1, 0, 1, true, true},
+	{BufferFormat::k8SInt, 1, 0, 1, true, false, true},
 	{BufferFormat::k16UNorm, 2, 0, 2, true, false},
 	{BufferFormat::k16SNorm, 2, 0, 2, true, false},
+	{BufferFormat::k16UScaled, 2, 0, 2, true, false},
+	{BufferFormat::k16SScaled, 2, 0, 2, true, false},
 	{BufferFormat::k16UInt, 2, 0, 2, true, true},
 	{BufferFormat::k16SInt, 2, 0, 2, true, false, true},
 	{BufferFormat::k16Float, 2, 0, 2, true, false},
 	{BufferFormat::k8_8UNorm, 2, 0, 2, true, false},
 	{BufferFormat::k8_8SNorm, 2, 0, 2, true, false},
+	{BufferFormat::k8_8UScaled, 2, 0, 2, true, false},
+	{BufferFormat::k8_8SScaled, 2, 0, 2, true, false},
 	{BufferFormat::k8_8UInt, 2, 0, 2, true, true},
 	{BufferFormat::k8_8SInt, 2, 0, 2, true, false, true},
 	{BufferFormat::k32UInt, 4, 0, 4, true, true},
@@ -36,15 +45,41 @@ constexpr FormatInfo kFormatInfo[] = {
 	{BufferFormat::k32Float, 4, 0, 4, true, false},
 	{BufferFormat::k16_16UNorm, 4, 0, 4, true, false},
 	{BufferFormat::k16_16SNorm, 4, 0, 4, true, false},
+	{BufferFormat::k16_16UScaled, 4, 0, 4, true, false},
+	{BufferFormat::k16_16SScaled, 4, 0, 4, true, false},
 	{BufferFormat::k16_16UInt, 4, 0, 4, true, true},
 	{BufferFormat::k16_16SInt, 4, 0, 4, true, false, true},
 	{BufferFormat::k16_16Float, 4, 0, 4, true, false},
+	{BufferFormat::k11_11_10UNorm, 4, 0, 4, true, false},
+	{BufferFormat::k11_11_10SNorm, 4, 0, 4, true, false},
+	{BufferFormat::k11_11_10UScaled, 4, 0, 4, true, true},
+	{BufferFormat::k11_11_10SScaled, 4, 0, 4, true, false, true},
 	{BufferFormat::k11_11_10UInt, 4, 0, 4, true, true},
+	{BufferFormat::k11_11_10SInt, 4, 0, 4, true, false, true},
 	{BufferFormat::k11_11_10Float, 4, 0, 4, true, false},
+	{BufferFormat::k10_11_11UNorm, 4, 0, 4, true, false},
+	{BufferFormat::k10_11_11SNorm, 4, 0, 4, true, false},
+	{BufferFormat::k10_11_11UScaled, 4, 0, 4, true, true},
+	{BufferFormat::k10_11_11SScaled, 4, 0, 4, true, false, true},
+	{BufferFormat::k10_11_11UInt, 4, 0, 4, true, true},
+	{BufferFormat::k10_11_11SInt, 4, 0, 4, true, false, true},
+	{BufferFormat::k10_11_11Float, 4, 0, 4, true, false},
+	{BufferFormat::k2_10_10_10UNorm, 4, 0, 4, true, false},
+	{BufferFormat::k2_10_10_10SNorm, 4, 0, 4, true, false},
+	{BufferFormat::k2_10_10_10UScaled, 4, 0, 4, true, false},
+	{BufferFormat::k2_10_10_10SScaled, 4, 0, 4, true, false},
+	{BufferFormat::k2_10_10_10UInt, 4, 0, 4, true, true},
+	{BufferFormat::k2_10_10_10SInt, 4, 0, 4, true, false, true},
 	{BufferFormat::k10_10_10_2UNorm, 4, 0, 4, true, false},
+	{BufferFormat::k10_10_10_2SNorm, 4, 0, 4, true, false},
+	{BufferFormat::k10_10_10_2UScaled, 4, 0, 4, true, false},
+	{BufferFormat::k10_10_10_2SScaled, 4, 0, 4, true, false},
 	{BufferFormat::k10_10_10_2UInt, 4, 0, 4, true, true},
+	{BufferFormat::k10_10_10_2SInt, 4, 0, 4, true, false, true},
 	{BufferFormat::k8_8_8_8UNorm, 4, 0, 4, true, false},
 	{BufferFormat::k8_8_8_8SNorm, 4, 0, 4, true, false},
+	{BufferFormat::k8_8_8_8UScaled, 4, 0, 4, true, false},
+	{BufferFormat::k8_8_8_8SScaled, 4, 0, 4, true, false},
 	{BufferFormat::k8_8_8_8UInt, 4, 0, 4, true, true},
 	{BufferFormat::k8_8_8_8SInt, 4, 0, 4, true, false, true},
 	{BufferFormat::k32_32UInt, 8, 0, 8, true, true},
@@ -52,6 +87,8 @@ constexpr FormatInfo kFormatInfo[] = {
 	{BufferFormat::k32_32Float, 8, 0, 8, true, false},
 	{BufferFormat::k16_16_16_16UNorm, 8, 0, 8, true, false},
 	{BufferFormat::k16_16_16_16SNorm, 8, 0, 8, true, false},
+	{BufferFormat::k16_16_16_16UScaled, 8, 0, 8, true, false},
+	{BufferFormat::k16_16_16_16SScaled, 8, 0, 8, true, false},
 	{BufferFormat::k16_16_16_16UInt, 8, 0, 8, true, true},
 	{BufferFormat::k16_16_16_16SInt, 8, 0, 8, true, false, true},
 	{BufferFormat::k16_16_16_16Float, 8, 0, 8, true, false},
@@ -231,7 +268,25 @@ TextureNumericClass SampledTextureNumericClass(BufferFormat format) {
 }
 
 BufferFormat RemapTextureFormat(BufferFormat format) {
-	return format == BufferFormat::k11_11_10UInt ? BufferFormat::k32UInt : format;
+	switch (format) {
+		case BufferFormat::k11_11_10UInt: return BufferFormat::k32UInt;
+		// Hosts generally expose the scaled formats for vertex buffers only, not for sampled
+		// images. Sample the matching normalized format instead -- same bits on the wire -- and let
+		// the shader scale the result back up to the integer magnitude the guest expects.
+		case BufferFormat::k8UScaled: return BufferFormat::k8UNorm;
+		case BufferFormat::k8SScaled: return BufferFormat::k8SNorm;
+		case BufferFormat::k16UScaled: return BufferFormat::k16UNorm;
+		case BufferFormat::k16SScaled: return BufferFormat::k16SNorm;
+		case BufferFormat::k8_8UScaled: return BufferFormat::k8_8UNorm;
+		case BufferFormat::k8_8SScaled: return BufferFormat::k8_8SNorm;
+		case BufferFormat::k16_16UScaled: return BufferFormat::k16_16UNorm;
+		case BufferFormat::k16_16SScaled: return BufferFormat::k16_16SNorm;
+		case BufferFormat::k8_8_8_8UScaled: return BufferFormat::k8_8_8_8UNorm;
+		case BufferFormat::k8_8_8_8SScaled: return BufferFormat::k8_8_8_8SNorm;
+		case BufferFormat::k16_16_16_16UScaled: return BufferFormat::k16_16_16_16UNorm;
+		case BufferFormat::k16_16_16_16SScaled: return BufferFormat::k16_16_16_16SNorm;
+		default: return format;
+	}
 }
 
 } // namespace Libs::Graphics::Prospero

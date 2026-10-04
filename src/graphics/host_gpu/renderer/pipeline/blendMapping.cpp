@@ -31,9 +31,27 @@ BlendMappingSupport ClassifyBlendMapping(const HW::BlendControl&                
 		return BlendMappingSupport::Direct;
 	}
 	// Moving alpha requires the same equation for all channels.
-	if (blend.separate_alpha_blend && (blend.alpha_srcblend != blend.color_srcblend ||
-	                                   blend.alpha_destblend != blend.color_destblend ||
-	                                   blend.alpha_comb_fcn != blend.color_comb_fcn)) {
+	// A mapping that sends all four components to four different slots is a plain permutation:
+	// every component the shader produces still lands somewhere, and the one that landed in alpha
+	// is a known component, so the caller can put the shader's alpha back before blending. With
+	// that available a differing alpha equation stops being fatal -- what moved is the alpha slot,
+	// not the blend becoming inexpressible.
+	uint32_t seen  = 0;
+	for (uint32_t component = 0; component < 4u; component++) {
+		seen |= 1u << mapping.Map(component);
+	}
+	const bool permutation  = seen == 0xfu;
+	const bool alpha_differs =
+	    blend.separate_alpha_blend &&
+	    (blend.alpha_srcblend != blend.color_srcblend ||
+	     blend.alpha_destblend != blend.color_destblend || blend.alpha_comb_fcn != blend.color_comb_fcn);
+	// Moving alpha requires the same equation for all channels unless the permutation lets the
+	// caller restore the alpha slot. That only fixes the source alpha factor: Vulkan still applies
+	// the colour equation to the first three host channels and the alpha equation to the fourth, so
+	// with different equations the channel that moved into the alpha slot gets the alpha equation
+	// and the logical alpha gets the colour one. It is the closest fixed-function blending gets;
+	// switching blending off instead would overwrite every channel.
+	if (alpha_differs && !permutation) {
 		return BlendMappingSupport::Unsupported;
 	}
 	auto support = BlendMappingSupport::Direct;
@@ -51,6 +69,9 @@ BlendMappingSupport ClassifyBlendMapping(const HW::BlendControl&                
 			case Prospero::BlendFactor::kSrcAlphaSaturate: return BlendMappingSupport::Unsupported;
 			default: break;
 		}
+	}
+	if (support == BlendMappingSupport::SourceAlpha && permutation) {
+		return BlendMappingSupport::PermutedSourceAlpha;
 	}
 	return support;
 }

@@ -107,6 +107,8 @@ constexpr int GUEST_HOST_PRIORITY_HIGH   = 0;
 constexpr int GUEST_HOST_PRIORITY_NORMAL = -1;
 constexpr int GUEST_HOST_PRIORITY_LOW    = -2;
 
+/// Maps a guest priority (a smaller value is more important) to the host priority of its band:
+/// <= 478 is high, >= 733 is low, everything in between is normal.
 static int GuestPriorityToHost(int guest_priority) {
 	if (guest_priority <= 478) {
 		return GUEST_HOST_PRIORITY_HIGH;
@@ -117,20 +119,25 @@ static int GuestPriorityToHost(int guest_priority) {
 	return GUEST_HOST_PRIORITY_NORMAL;
 }
 
-// A guest thread pinned to a single core owns that core on the console. A game that starts one such
-// spinning job worker per core shares all of them with the threads that produce their work, on fewer
-// host cores and in the same priority band, and the spinners starve those threads. Such a thread runs
-// one host priority step below its band. Decided once when the thread starts: a main thread may pin
-// itself to one core for a while and must not drop with it.
+/// Tells whether a guest thread with this affinity runs one host priority step below its band.
+///
+/// A guest thread pinned to a single core owns that core on the console. A game that starts one such
+/// spinning job worker per core shares all of them with the threads that produce their work, on fewer
+/// host cores and in the same priority band, and the spinners starve those threads. Decided once when
+/// the thread starts: a main thread may pin itself to one core for a while and must not drop with it.
 static bool LowerCoreBoundThread(KernelCpumask affinity) {
 	return std::has_single_bit(affinity);
 }
 
+/// Host priority a guest thread runs at: the priority of its band, or one step below it (but not
+/// below the lowest band value) when the thread is pinned to a single core.
 static int GuestThreadHostPriority(int guest_priority, bool core_bound) {
 	const int host = GuestPriorityToHost(guest_priority);
 	return core_bound ? std::max(host - 1, -2) : host;
 }
 
+/// Maps a host priority of the guest band back to one of the three classes the guest sees
+/// (256 high, 700 normal, 767 low). The kernel objects use the class to order their waiters.
 static int HostPriorityToGuest(int host_priority) {
 	if (host_priority <= GUEST_HOST_PRIORITY_LOW) {
 		return 767;
@@ -2188,6 +2195,8 @@ int KYTY_SYSV_ABI PthreadAttrSetinheritsched(PthreadAttr* attr, int inherit_sche
 	return OK;
 }
 
+/// Stores the guest priority in the attribute and, on Windows, the host priority of its band in the
+/// native attribute. Fails with EINVAL when the attribute or the parameter is invalid.
 int KYTY_SYSV_ABI PthreadAttrSetschedparam(PthreadAttr* attr, const KernelSchedParam* param) {
 	// PRINT_NAME();
 
@@ -3179,6 +3188,9 @@ bool PthreadGetGuestStack(Pthread thread, uint64_t* stack_addr, uint64_t* stack_
 	return true;
 }
 
+/// Priority class (256, 700 or 767) of a guest thread as the kernel objects use it to order their
+/// waiters. It follows the guest's own priority, not the host step the thread runs at. Returns 700
+/// when the thread is unknown and on every platform but Windows.
 int PthreadGetPriorityForKernel(Pthread thread) {
 	if (thread == nullptr || thread->attr == nullptr) {
 		return 700;
@@ -3215,6 +3227,10 @@ static void CleanupThread(void* arg) {
 	thread->almost_done = true;
 }
 
+/// Entry point of the host thread behind every guest thread: records its identity, applies the guest
+/// priority, then runs the guest entry function on the guest stack and cleans up afterwards.
+/// @param arg the Pthread that this host thread runs
+/// @return the value the guest entry function returned
 static void* RunThread(void* arg) {
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
@@ -3513,6 +3529,8 @@ int KYTY_SYSV_ABI PthreadGetprio(Pthread thread, int* prio) {
 	return OK;
 }
 
+/// Sets the priority of a guest thread: the guest value is stored and, on Windows, the host priority
+/// of its band is applied, one step lower for a thread that started pinned to a single core.
 int KYTY_SYSV_ABI PthreadSetprio(Pthread thread, int prio) {
 	PRINT_NAME();
 

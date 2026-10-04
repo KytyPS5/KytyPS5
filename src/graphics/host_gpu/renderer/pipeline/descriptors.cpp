@@ -857,7 +857,20 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 			prepared.buffer_sources.push_back({});
 			continue;
 		}
-		const auto size = Libs::LibKernel::Memory::ClampRangeSize(address, requested_size);
+		const auto size = Libs::LibKernel::Memory::TryClampRangeSize(address, requested_size);
+		if (size == 0) {
+			// Nothing is mapped at the base yet. Streaming titles bind regions they back later (a
+			// dispatch can precede the mapping by thousands of calls), and an unbacked region reads
+			// zero and drops writes on the hardware; binding null gives the same.
+			static std::atomic<uint32_t> reported = 0;
+			if (reported.fetch_add(1) < 8) {
+				LOGF("RenderExecutor: buffer descriptor %u outside mapped memory: stage=%u "
+				     "base=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+				     resource, static_cast<uint32_t>(program.stage), address, requested_size);
+			}
+			prepared.buffer_sources.push_back({});
+			continue;
+		}
 		prepared.buffer_sources.push_back({address, size, cache.FindBuffer(address, size)});
 	}
 }

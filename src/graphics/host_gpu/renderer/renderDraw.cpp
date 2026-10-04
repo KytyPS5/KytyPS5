@@ -721,8 +721,20 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 	for (uint32_t i = 0; i < merged_count; i++) {
 		auto& range = merged_ranges[i];
 		// PPSA20298
+		// A vertex buffer the game names before the region is backed is not an error: on the
+		// hardware an unbacked range reads zero and drops writes, so binding nothing reproduces it.
 		const auto size =
-		    Libs::LibKernel::Memory::ClampRangeSize(range.base_address, range.RequestedSize());
+		    Libs::LibKernel::Memory::TryClampRangeSize(range.base_address, range.RequestedSize());
+		if (size == 0) {
+			static std::atomic<uint32_t> reported = 0;
+			if (reported.fetch_add(1, std::memory_order_relaxed) < 8) {
+				LOGF("PreparedVertexBuffers: vertex buffer %u outside mapped memory: "
+				     "base=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
+				     i, range.base_address, range.RequestedSize());
+			}
+			range.acquired_end = range.base_address;
+			continue;
+		}
 		range.acquired_end = range.base_address + size;
 		range.binding      = cache.ObtainBuffer(range.base_address, size, false);
 	}

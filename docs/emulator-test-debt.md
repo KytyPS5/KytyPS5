@@ -1,5 +1,24 @@
 # Emulator regression test debt
 
+## Cooperative pipeline scale after local SSA reuse (2026-10-04; pending)
+
+Commit `6dbee0c8` removes redundant Function loads when a cooperative
+instruction is consumed inside the same Guard. The synthetic RED/GREEN and
+GPUAV neighboring cases are recorded in the 09:54 UTC launch-plan checkpoint.
+On the same game CS `54904…`, SPIR-V fell from 773030 to 639478 words and
+OpLoad from 62605 to 29217. The bounded selective-GPUAV retry at
+`_Build/runs/yotei-integrated-20261004-094551-presentfix-gpuav` still spent
+300 seconds at `shown=155` inside `vkCreateComputePipelines` with no completion.
+This is a remaining driver pipeline-creation blocker, not a failed SPIR-V
+emission test or evidence of menu rendering.
+
+Before another production change, create a synthetic cooperative wave64
+program with many direct CFG segments and a bounded pipeline-creation probe.
+The captured module has an 860-case scheduler `OpSwitch`, 87 two-case switches,
+12174 labels and 886 calls. Use several segment counts to locate any steep
+driver-time/memory growth without copying proprietary shader bytes or repeatedly
+stressing the GPU. Keep unsupported semantics and required guest work intact.
+
 ## Large compute shader and diagnostic runtime stalls (2026-10-03; pending)
 
 The bounded diagnostic game run

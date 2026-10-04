@@ -1,5 +1,42 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **4 октября 2026 года, 09:54 UTC** (native Windows via WSL;
+branch `yotei-windows-bringup`, source fix `6dbee0c8`):
+
+- Cooperative SPIR-V emission now reuses an instruction's SSA result inside
+  the same active Guard. Values crossing Guards or software collectives still
+  use Function storage. Synthetic wave64/native32 compute with a guest barrier,
+  a 251-image indirect switch and a 64-operation arithmetic chain reproduced
+  the redundant loads on the prior implementation: `532 -> 596` OpLoad
+  (`_Build/logs/cooperative-image-load-red-20261004.log`). The unchanged
+  assertion passes after the fix: `530 -> 530` OpLoad, validated SPIR-V
+  (`_Build/logs/cooperative_wide_indirect_image_size_only-green-20261004.log`).
+  The existing wide-image SPIR-V selector and GPUAV readback cases for
+  multiwave LDS, cyclic scalar address and cooperative SSBO passed. Native
+  build/install logs: `_Build/logs/cooperative-region-emulator-{build,install}-20261004.log`;
+  installed emulator SHA-256
+  `c9c8e13c6bb4fdeb58031a3a3ed519bb0bf121289ecc1c76b1a56bd1f3830fbe`.
+- The same captured game CS `54904fb419d79e49` emitted 639478 words and
+  29217 OpLoad after this correction, versus 773030 words and 62605 OpLoad
+  before it (−17.3% words, −53.3% loads). New capture:
+  `_Build/runs/yotei-integrated-20261004-094248-presentfix-gpuav/shaders/0000_new_shader_cs_54904fb419d79e49.spv`,
+  SHA-256 `147bc1ec7c04493ddd900fcd8cbcb4a8c12b28c5fbc8f6c123a532ead586c269`.
+  This is a measured compiler-input reduction, not a driver pipeline-time win.
+- Bounded selective-GPUAV game retry
+  `_Build/runs/yotei-integrated-20261004-094551-presentfix-gpuav` reached
+  `shown=155`, then its 300-second shown-frame watchdog closed the process.
+  `_kyty.txt` ended after `vkCreateComputePipelines begin` for this CS
+  (`cooperative_wave64=1`, flags `0x1`), without a matching completion.
+  Readback started at frame 190, so this run supplies no new pixel evidence.
+  No task-owned process remained. The last proven nonzero RGB frames remain
+  198–199 in the older clean GPUAV run. **Menu and gameplay PENDING.**
+- Next: isolate the large cooperative scheduler pipeline with a bounded,
+  reusable synthetic case. The new module still contains one 860-case
+  scheduler `OpSwitch` and 87 two-case switches. Measure driver creation
+  separately from SPIR-V emission before another shared change. Keep the
+  earlier `b90e…` uninstrumented driver crash and later Vertex DeviceLost
+  as separate blockers.
+
 Checkpoint **4 октября 2026 года, 02:12 UTC** (native Windows via WSL;
 branch `yotei-windows-bringup`, committed source `d6bbd37a`;
 the installed game-test executable was built from those production sources):

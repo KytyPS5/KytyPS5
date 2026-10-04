@@ -1,5 +1,56 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **4 октября 2026 года, 11:07 UTC** (native Windows via WSL;
+branch `yotei-windows-bringup`, pushed source fix `3eb16e4b`):
+
+- Shared driver-cache persistence now checkpoints a successful graphics or
+  compute creation taking at least 5000 ms immediately; fast creations retain
+  the 16-pipeline interval. Native synthetic policy RED on the extracted old
+  behavior is `_Build/logs/driver-cache-checkpoint-red-20261004.log.stderr`;
+  unchanged GREEN and cache identity/validation/instrumentation/revision checks
+  are `_Build/logs/driver-cache-*-green-20261004.log`. Native build/install
+  succeeded (`driver-cache-checkpoint-emulator-{build,install}-20261004.log`);
+  installed exe SHA-256
+  `81c2055bbe4efe823d5c407ccb39771bab42f8460dc5f1af583f2bf55b3297f6`.
+  This preserves completed compiler work; it does not shorten a cold compile.
+- The prior warm retry
+  `_Build/runs/yotei-integrated-20261004-104455-presentfix-gpuav` reached
+  `shown=196`. Its final drained log proves CS `54904…` variants completed
+  in 154 ms (cached), 284842 ms and 291983 ms; the fourth began before the
+  task-owned stop. Three bounded-SRT lengths changed 16 → 14 → 19 → 11.
+  The second variant was checkpointed, but the third completed before the
+  next 16-creation checkpoint. Partial live logs had omitted these completions;
+  `run.json` now explicitly records the manual stop and final evidence.
+  Readback frames 150–195 all have RGB zero; no new nonzero/menu evidence.
+- Another bounded synthetic compiler-only diagnostic uses 860 switch arms,
+  352 Function variables and a helper with two workgroup barriers. Its valid
+  604723-word module and native pipeline probe finished successfully in
+  22.029 s for the whole process, versus 19.113 s without the helper (599512
+  words); 128 arms finished in 2.517 s. This does not reproduce the game's
+  285-second cost or prove a semantic fix. Generator and logs are under
+  `_Build/analysis/synthetic-cooperative-liveness-probe-20261004.py` and
+  `_Build/logs/cooperative-liveness-*-20261004.log*`; no GPU dispatch was made.
+- Fresh upstream PR review: [#1034](https://github.com/KytyPS5/KytyPS5/pull/1034)
+  at `8d415360` removes FP32 RoundingModeRTE for an FP64 shader, but this
+  captured CS has neither Float64 nor RoundingModeRTE. Its lane-ID correction
+  is already covered by this branch's cooperative/split routing. Other shader
+  changes remain candidates only for a matching reproduction; the ray-tracing
+  dispatch skip is incompatible with this project's shared-semantics rules.
+  [#1033](https://github.com/KytyPS5/KytyPS5/pull/1033) at `f4704404` concerns
+  host formats/views/buffers and does not locate the current compile frontier.
+  #1032 is tessellation; #1035 drops mismatched attachments; #1026/#1027 use
+  game-specific GPU workarounds. No PR was merged from this review. Captured
+  heads/bodies/files are `_Build/analysis/upstream-pr-*-20261004.json`.
+- New bounded game run is active:
+  `_Build/runs/yotei-integrated-20261004-110636-presentfix-gpuav`, PID 42908,
+  timeout 1800 s / shown watchdog 1200 s, readback 150+240, continue after
+  colored. Resume its driver log
+  `_Build/logs/driver-cache-checkpoint-yotei-driver-20261004.log` before
+  starting another build/GPU workload. Next: verify immediate persistence of
+  every expensive successful variant, then inspect the original nonzero/Vertex
+  frontier. Last confirmed nonzero RGB remains old frames 198–199.
+  **Menu and gameplay PENDING.**
+
 Checkpoint **4 октября 2026 года, 10:41 UTC** (native Windows via WSL;
 branch `yotei-windows-bringup`, source fix `7afddcd8`):
 

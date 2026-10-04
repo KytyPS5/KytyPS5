@@ -44,6 +44,7 @@
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/Tessellation.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvDriverSimplify.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
@@ -22184,6 +22185,8 @@ private:
                         : static_cast<void *>(&derivatives);
     device_info.pNext = &min_lod;
     vk::PhysicalDeviceFeatures device_features{};
+    // The emulator requires and enables it; speculated buffer loads rely on it.
+    device_features.robustBufferAccess = true;
     device_features.shaderStorageImageWriteWithoutFormat = true;
     device_features.shaderImageGatherExtended = true;
     device_features.sampleRateShading = true;
@@ -49990,6 +49993,9 @@ int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);
+  // Every test shader goes through the driver simplification, however small, so the GPU
+  // results below cover it.
+  ShaderRecompiler::Spirv::SetDriverSimplifyMinWords(0);
   if (argc == 2 && std::strcmp(argv[1], "--execz-loop-exit-only") == 0) {
 #ifdef _WIN32
     _putenv_s("KYTY_CS_LOOP_BUDGET", "4096");

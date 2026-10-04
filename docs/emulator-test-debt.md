@@ -2,14 +2,34 @@
 
 ## Large CS pipeline before the shared-table frontier (2026-10-04; bounded runtime diagnosis)
 
-Additional interface-boundary coverage required (2026-10-05 continuation):
-synthetic Function-array element pointers at indices0/1 must retain the original
-entry path without VariablePointers. A scalar interface with255 arguments may
-outline and validate, while256 arguments must retain the unchanged valid
-original. Validate each source before transformation. Scoped removal of these
-existing guards must produce the intended SPIR-V pointer/argument-limit RED;
-restore the guards and run the identical fixtures GREEN. No GPU dispatch is
-needed to reproduce either admission boundary.
+Interface-boundary coverage completed (2026-10-05, native Windows CPU):
+`TestCooperativeOutlineDerivedPointers` tests Function-array element pointers
+at indices0/1 without VariablePointers. `TestCooperativeOutlineArgumentLimit`
+imports254/255 independent loaded scalar values plus the original spill object
+(255/256 total arguments). Each original module validates before transformation;
+loads, arithmetic and stores are preserved. The255-argument cases validate and
+outline;256 retains the exact original module, as do the derived-pointer cases.
+
+Scoped removal of ONLY the two existing admission guards from committed00c7df8e
+produces intended RED: `outline-boundary-pointer-red-20261005.log.stderr`
+rejects an OpFunctionCall pointer operand that is not a memory object declaration;
+`outline-boundary-arguments-red-20261005.log.stderr` rejects a256-argument
+OpTypeFunction. Both use test SHA
+`fce3ddf23864280a08872dae4089436fb41764d73f7977d0e1c14bcbbab4a477`,
+valid original inputs and separate pointer/argument selectors. No GPU dispatch.
+Production source restored byte-for-byte; `git diff --exit-code` confirms no
+production change. Unchanged final GREEN:
+`_Build/run-native-regression.ps1 -ExecutableName shader_cfg_tests.exe
+-Arguments --cooperative-outline-boundaries-only
+-LogName outline-boundaries-final-green-20261005.log -TimeoutSeconds60`, SHA
+`86b415cd31c1a46bce0d6a4a4d77b19b257d1313c81df420d3e0f8b077edc685`,
+exit0/no timeout. Native CTest isolation+outline_boundaries passes2/2.
+Native builds use `windows-local.cmd` through bounded build wrapper; logs
+`outline-boundaries-{initial,red,final-green}-build-20261005.log`.
+The emulator was not rebuilt/reinstalled during these tests; its accepted driver
+cache and executable SHAa5f6ba5c remain intact. Older unrelated failing selectors
+remain debt below. Issue108 is not updated: user limits further publication to
+visually confirmed menu and then entry into the game.
 
 Native game retry on committed `00c7df8e` / installed SHA
 `a5f6ba5c4c74f22333098693cd0e728a3259c1fac3f217c0b06172034dbe6a9b`

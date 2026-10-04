@@ -30,8 +30,12 @@ Windows executable/cache; no additional emulator change):
   remain unpushed. The user subsequently restricted further issue updates to
   visually confirmed menu and then confirmed entry into the game. Intermediate
   fixes, tests, retries and blockers are recorded locally only.
-- Next: complete synthetic derived-pointer and255/256-argument boundary evidence,
-  then same-EXE bounded continuation with the preserved cache. Actual large
+- Additional synthetic derived-pointer (array indices0/1) and255/256-argument
+  boundaries now have native intended RED with only their guards removed, then
+  unchanged GREEN after exact restoration. CTest isolation+boundaries passes2/2;
+  detailed logs/hashes are in `docs/emulator-test-debt.md`. No emulator rebuild
+  or installation change; same EXE and cache preserved.
+- Next: same-EXE bounded continuation with the preserved cache. Actual large
   CS8457, visible new pixels, menu and gameplay remain **PENDING**.
 
 Checkpoint **4 октября 2026 года, 22:30 UTC** (native Windows game via WSL;

@@ -599,6 +599,9 @@ if(BUILD_TESTING)
 	add_test(NAME shader_cooperative_segment_isolation
 	         COMMAND $<TARGET_FILE:shader_cfg_tests> --cooperative-segment-isolation-only)
 	set_tests_properties(shader_cooperative_segment_isolation PROPERTIES TIMEOUT 60)
+	add_test(NAME shader_cooperative_outline_boundaries
+	         COMMAND $<TARGET_FILE:shader_cfg_tests> --cooperative-outline-boundaries-only)
+	set_tests_properties(shader_cooperative_outline_boundaries PROPERTIES TIMEOUT 60)
 	add_test(NAME graphics_wave64_collective_routing
 	         COMMAND $<TARGET_FILE:shader_cfg_tests> --graphics-wave64-collective-routing-only)
 	add_test(NAME homogeneous_indirect_image_validation

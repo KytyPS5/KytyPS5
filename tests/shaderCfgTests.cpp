@@ -11783,6 +11783,123 @@ void TestCooperativeOutlineMergeValues() {
   Check(outlined == original, "outlining lost values exported to the entry merge");
 }
 
+
+void TestCooperativeOutlineDerivedPointers() {
+  for (const uint32_t index : {0u, 1u}) {
+    const std::string source = std::string(R"(
+      OpCapability Shader
+      OpMemoryModel Logical GLSL450
+      OpEntryPoint GLCompute %main "main"
+      OpExecutionMode %main LocalSize 1 1 1
+      %void = OpTypeVoid
+      %uint = OpTypeInt 32 0
+      %fn = OpTypeFunction %void
+      %two = OpConstant %uint 2
+      %seven = OpConstant %uint 7
+      %array = OpTypeArray %uint %two
+      %array_ptr = OpTypePointer Function %array
+      %element_ptr = OpTypePointer Function %uint
+      %initial = OpConstantComposite %array %seven %seven
+      %index = OpConstant %uint )") + std::to_string(index) + R"(
+      %main = OpFunction %void None %fn
+      %entry = OpLabel
+      %backing = OpVariable %array_ptr Function %initial
+      %element = OpAccessChain %element_ptr %backing %index
+      %seed = OpLoad %uint %element
+      OpSelectionMerge %merge None
+      OpSwitch %seed %invalid 0 %first 1 %last
+      %invalid = OpLabel
+      OpUnreachable
+      %first = OpLabel
+      %value0 = OpLoad %uint %element
+      %sum = OpIAdd %uint %value0 %two
+      OpStore %element %sum
+      OpBranch %merge
+      %last = OpLabel
+      %value1 = OpLoad %uint %element
+      %product = OpIMul %uint %value1 %two
+      OpStore %element %product
+      OpBranch %merge
+      %merge = OpLabel
+      OpReturn
+      OpFunctionEnd
+    )";
+    spvtools::SpirvTools assembler(SPV_ENV_UNIVERSAL_1_3);
+    std::vector<uint32_t> original;
+    Check(assembler.Assemble(source, &original), "derived pointer fixture did not assemble");
+    CheckSpirvBinaryValidates(original);
+    uint32_t entry = 0;
+    for (size_t at = 5; at < original.size(); at += original[at] >> 16u)
+      if ((original[at] & 0xffffu) == 15u) entry = original[at + 2u];
+    const auto outlined = ShaderRecompiler::Spirv::Emitter::OutlineCooperativeSegments(original, entry);
+    CheckSpirvBinaryValidates(outlined);
+    Check(outlined == original,
+          "derived Function pointer crossed a call boundary without VariablePointers");
+  }
+}
+
+void TestCooperativeOutlineArgumentLimit() {
+  // Each arm imports every distinct SSA value and the original spill object.
+  // The original main has no parameters and is valid on both sides of the limit.
+  for (const uint32_t scalars : {254u, 255u}) {
+    std::string source = R"(
+      OpCapability Shader
+      OpMemoryModel Logical GLSL450
+      OpEntryPoint GLCompute %main "main"
+      OpExecutionMode %main LocalSize 1 1 1
+      %void = OpTypeVoid
+      %uint = OpTypeInt 32 0
+      %fn = OpTypeFunction %void
+      %ptr = OpTypePointer Function %uint
+      %seven = OpConstant %uint 7
+      %one = OpConstant %uint 1
+      %main = OpFunction %void None %fn
+      %entry = OpLabel
+      %spill = OpVariable %ptr Function %seven
+    )";
+    for (uint32_t i = 0; i < scalars; ++i)
+      source += "%v" + std::to_string(i) + " = OpLoad %uint %spill\n";
+    source += R"(
+      OpSelectionMerge %merge None
+      OpSwitch %one %invalid 0 %first 1 %last
+      %invalid = OpLabel
+      OpUnreachable
+    )";
+    for (uint32_t arm = 0; arm < 2u; ++arm) {
+      source += arm == 0u ? "%first = OpLabel\n" : "%last = OpLabel\n";
+      std::string value = "%seven";
+      for (uint32_t i = 0; i < scalars; ++i) {
+        const std::string next = "%sum" + std::to_string(arm) + "_" + std::to_string(i);
+        source += next + " = OpIAdd %uint " + value + " %v" + std::to_string(i) + "\n";
+        value = next;
+      }
+      source += "OpStore %spill " + value + "\nOpBranch %merge\n";
+    }
+    source += "%merge = OpLabel\nOpReturn\nOpFunctionEnd\n";
+    spvtools::SpirvTools assembler(SPV_ENV_UNIVERSAL_1_3);
+    std::vector<uint32_t> original;
+    Check(assembler.Assemble(source, &original), "argument limit fixture did not assemble");
+    CheckSpirvBinaryValidates(original);
+    uint32_t entry = 0;
+    for (size_t at = 5; at < original.size(); at += original[at] >> 16u)
+      if ((original[at] & 0xffffu) == 15u) entry = original[at + 2u];
+    const auto outlined = ShaderRecompiler::Spirv::Emitter::OutlineCooperativeSegments(original, entry);
+    CheckSpirvBinaryValidates(outlined);
+    Check(SpirvInstructionOpcodeCount(outlined, 128u) == 2u * scalars &&
+              SpirvInstructionOpcodeCount(outlined, 61u) == scalars &&
+              SpirvInstructionOpcodeCount(outlined, 62u) == 2u,
+          "argument boundary changed loads, arithmetic or stores");
+    if (scalars == 254u) {
+      Check(SpirvInstructionOpcodeCount(outlined, 57u) == 2u &&
+                SpirvInstructionOpcodeCount(outlined, 55u) == 510u,
+            "valid 255-argument interface was not retained in both helper calls");
+    } else {
+      Check(outlined == original,
+            "256-argument interface did not retain the valid original dispatcher");
+    }
+  }
+}
+
 void TestCooperativeWave64CollectivesUseSharedFunctions() {
   using namespace ShaderRecompiler;
   using O = IR::ValueOpcode;
@@ -19231,6 +19348,17 @@ int RunShaderBatchAudit(int argc, char* argv[]);
 
 
 int main(int argc, char* argv[]) {
+  if (argc == 2 && (std::strcmp(argv[1], "--cooperative-outline-boundaries-only") == 0 ||
+                    std::strcmp(argv[1], "--cooperative-outline-pointer-only") == 0 ||
+                    std::strcmp(argv[1], "--cooperative-outline-arguments-only") == 0)) {
+    Libs::Graphics::EnsureConfigInitialized();
+    if (std::strcmp(argv[1], "--cooperative-outline-arguments-only") != 0)
+      Libs::Graphics::TestCooperativeOutlineDerivedPointers();
+    if (std::strcmp(argv[1], "--cooperative-outline-pointer-only") != 0)
+      Libs::Graphics::TestCooperativeOutlineArgumentLimit();
+    std::puts("KYTY_COOPERATIVE_OUTLINE_BOUNDARIES_PASS");
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--cooperative-segment-isolation-only") == 0) {
     Libs::Graphics::EnsureConfigInitialized();
     Libs::Graphics::TestCooperativeSegmentBodyIsolation();

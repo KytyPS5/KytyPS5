@@ -46,6 +46,10 @@ constexpr FormatMapping kFormatMappings[] = {
     {Prospero::BufferFormat::k16_16SInt, vk::Format::eR16G16Sint},
     {Prospero::BufferFormat::k16_16Float, vk::Format::eR16G16Sfloat},
     {Prospero::BufferFormat::k11_11_10Float, vk::Format::eB10G11R11UfloatPack32},
+    // Render targets with the 10_11_11 and 2_10_10_10 layouts come with a reversed channel order, which
+    // TextureGetRenderTargetFormat applies as a component mapping on top of the host formats below
+    // (B10G11R11, A2B10G10R10). A plain texture or buffer view of these layouts would see its
+    // fields in the other order.
     {Prospero::BufferFormat::k10_11_11Float, vk::Format::eB10G11R11UfloatPack32},
     {Prospero::BufferFormat::k2_10_10_10UNorm, vk::Format::eA2B10G10R10UnormPack32},
     {Prospero::BufferFormat::k2_10_10_10SNorm, vk::Format::eA2B10G10R10SnormPack32},

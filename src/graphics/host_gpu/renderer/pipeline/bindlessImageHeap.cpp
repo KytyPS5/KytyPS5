@@ -10,6 +10,8 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <xxhash.h>
 
@@ -36,6 +38,15 @@ constexpr uint32_t PoolSets = 8;
 
 constexpr vk::PipelineStageFlags2 SampleStages =
     vk::PipelineStageFlagBits2::eAllGraphics | vk::PipelineStageFlagBits2::eComputeShader;
+
+// KYTY_NO_INCREMENTAL_BINDLESS=1: every heap change re-translates every record.
+bool IncrementalRescans() {
+	static const bool enabled = [] {
+		const char* text = std::getenv("KYTY_NO_INCREMENTAL_BINDLESS");
+		return text == nullptr || text[0] == '\0' || std::strcmp(text, "0") == 0;
+	}();
+	return enabled;
+}
 
 [[nodiscard]] std::optional<BindlessShape> ArrayOfWord(uint32_t word) {
 	const auto code = word >> 16u;
@@ -174,6 +185,7 @@ void BindlessImageHeap::EnableIntegers() {
 	});
 	for (auto& [key, heap]: m_heaps) {
 		heap.stale = true;
+		heap.full  = true;
 	}
 	m_set_dirty = true;
 }
@@ -239,20 +251,83 @@ void BindlessImageHeap::Kill(BindlessShape array, uint32_t slot) {
 	if (!element.live) {
 		return;
 	}
+	const auto killed = static_cast<uint32_t>(index) * IR::BindlessImageSlots + slot;
+	Unwatch(killed, element.id);
 	element.live         = false;
 	element.view         = nullptr;
 	m_infos[index][slot] = {nullptr, m_null[index].view, vk::ImageLayout::eGeneral};
 	m_set_dirty          = true;
-	std::erase_if(m_cache, [&](const auto& entry) {
-		return entry.second != 0u && (entry.second & 0xffffu) == slot &&
-		       ArrayOfWord(entry.second) == array;
-	});
-	for (auto& [key, heap]: m_heaps) {
-		heap.stale = true;
+	if (m_killed_mask.empty()) {
+		m_killed_mask.resize(Arrays * IR::BindlessImageSlots);
+	}
+	if (!m_killed_mask[killed]) {
+		m_killed_mask[killed] = true;
+		m_killed.push_back(killed);
 	}
 }
 
+void BindlessImageHeap::MarkPending(ImageId id, Watched& watched) {
+	if (!watched.pending) {
+		watched.pending = true;
+		m_pending.push_back(id);
+	}
+}
+
+void BindlessImageHeap::Watch(uint32_t element, ImageId id) {
+	auto& watched = m_watched[id];
+	watched.elements.push_back(element);
+	MarkPending(id, watched);
+}
+
+void BindlessImageHeap::Unwatch(uint32_t element, ImageId id) {
+	const auto found = m_watched.find(id);
+	if (found == m_watched.end()) {
+		return;
+	}
+	std::erase(found->second.elements, element);
+	if (found->second.elements.empty()) {
+		m_watched.erase(found);
+	}
+}
+
+void BindlessImageHeap::ForgetKilled() {
+	if (m_killed.empty()) {
+		return;
+	}
+	std::erase_if(m_cache, [&](const auto& entry) {
+		const auto slot  = entry.second & 0xffffu;
+		const auto array = ArrayOfWord(entry.second);
+		return entry.second != 0u && slot < IR::BindlessImageSlots && array.has_value() &&
+		       m_killed_mask[static_cast<uint32_t>(*array) * IR::BindlessImageSlots + slot];
+	});
+	for (auto& [key, heap]: m_heaps) {
+		heap.stale = true;
+		if (heap.full) {
+			continue;
+		}
+		for (uint32_t record = 0; record < heap.words.size(); record++) {
+			const auto word  = heap.words[record];
+			const auto slot  = word & 0xffffu;
+			const auto array = ArrayOfWord(word);
+			if (word != 0u && slot < IR::BindlessImageSlots && array.has_value() &&
+			    m_killed_mask[static_cast<uint32_t>(*array) * IR::BindlessImageSlots + slot]) {
+				heap.dirty.push_back(record);
+			}
+		}
+	}
+	for (const auto killed: m_killed) {
+		m_killed_mask[killed] = false;
+	}
+	m_killed.clear();
+}
+
 void BindlessImageHeap::SweepDeadElements() {
+	// An element only dies with its image, and every way an image dies advances the epoch.
+	const auto epoch = m_context.GetTextureCache().m_retire_epoch;
+	if (epoch == m_swept_epoch) {
+		return;
+	}
+	m_swept_epoch = epoch;
 	for (uint32_t array = 0; array < Arrays; array++) {
 		const auto kind = static_cast<BindlessShape>(array);
 		const auto used = m_slots.Used(kind);
@@ -263,6 +338,7 @@ void BindlessImageHeap::SweepDeadElements() {
 			}
 		}
 	}
+	ForgetKilled();
 }
 
 void BindlessImageHeap::TouchLiveElements() {
@@ -322,6 +398,7 @@ void BindlessImageHeap::RefreshLiveElements() {
 			}
 		}
 	}
+	ForgetKilled();
 }
 
 bool BindlessImageHeap::ReadHeap(const HeapKey& key, uint32_t records,
@@ -339,87 +416,90 @@ bool BindlessImageHeap::ReadHeap(const HeapKey& key, uint32_t records,
 	return true;
 }
 
+TextureBinding BindlessImageHeap::ResolveRecord(const Bindless::TSharp&      tsharp,
+                                                const Bindless::RecordShape& shape) {
+	IR::ImageResource resource;
+	resource.resource_class = IR::ImageResourceClass::Sampled;
+	resource.numeric_class  = shape.numeric;
+	resource.dimension      = shape.dimension;
+	resource.cube           = shape.cube;
+	resource.read           = true;
+	IR::DescriptorValue value;
+	value.dword_count = 8u;
+	value.dwords      = tsharp;
+	return m_executor.ResolveTexture(resource, value);
+}
+
+bool BindlessImageHeap::RecordImageUsable(const TextureBinding& binding) const {
+	const auto* image = m_context.GetTextureCache().m_slot_images.try_get(binding.image_id);
+	return image != nullptr && !binding.desc.info.data.Empty() && image->registered &&
+	       !image->dormant && !image->binding.needs_rebind && !image->depth_id &&
+	       image->backing.image != nullptr;
+}
+
+std::optional<uint32_t> BindlessImageHeap::AdmitRecord(const Bindless::TSharp&      tsharp,
+                                                       const Bindless::RecordShape& shape,
+                                                       const TextureBinding&        binding,
+                                                       bool&                        exhausted) {
+	auto& cache = m_context.GetTextureCache();
+	if (!RecordImageUsable(binding)) {
+		return std::nullopt;
+	}
+	const auto view = cache.FindTexture(binding.image_id, binding.desc);
+	if (view == nullptr) {
+		return std::nullopt;
+	}
+	const auto slot =
+	    m_slots.Assign(shape.array, reinterpret_cast<uint64_t>(static_cast<VkImageView>(view)));
+	if (!slot.has_value()) {
+		exhausted = true;
+		return std::nullopt;
+	}
+	const auto array   = static_cast<size_t>(shape.array);
+	auto&      element = m_elements[array][*slot];
+	if (!element.live || element.view != view) {
+		const auto key = static_cast<uint32_t>(array) * IR::BindlessImageSlots + *slot;
+		if (element.live) {
+			Unwatch(key, element.id);
+		}
+		auto&       image = cache.m_slot_images[binding.image_id];
+		const auto& info  = binding.desc.view_info;
+		element.id        = binding.image_id;
+		element.view      = view;
+		element.desc      = binding.desc;
+		element.range     = {info.base_level, info.level_count, info.base_layer, info.layer_count};
+		element.layout    = image.info.IsDepth() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
+		                                         : vk::ImageLayout::eShaderReadOnlyOptimal;
+		element.live      = true;
+		image.usage.texture   = true;
+		m_infos[array][*slot] = {nullptr, view, element.layout};
+		m_set_dirty           = true;
+		Watch(key, element.id);
+	}
+	const auto word = Bindless::TranslationWord(shape, *slot);
+	m_cache[tsharp] = word;
+	return word;
+}
+
 bool BindlessImageHeap::Rescan(const HeapKey& key, Heap& heap,
                                const std::vector<uint32_t>& dwords) {
-	auto&      cache = m_context.GetTextureCache();
+	if (IncrementalRescans() && heap.scanned && !heap.full && heap.dwords.size() == dwords.size() &&
+	    heap.words.size() == heap.records) {
+		return RescanChanged(key, heap, dwords);
+	}
 	const auto missing =
 	    Bindless::MissingRecords(dwords, key.stride, key.offset, heap.records, m_cache, m_integer);
-	struct Pending {
-		Bindless::TSharp      tsharp;
-		Bindless::RecordShape shape;
-		TextureBinding        binding;
-	};
-	const auto Resolve = [&](const Bindless::TSharp& tsharp, const Bindless::RecordShape& shape) {
-		IR::ImageResource resource;
-		resource.resource_class = IR::ImageResourceClass::Sampled;
-		resource.numeric_class  = shape.numeric;
-		resource.dimension      = shape.dimension;
-		resource.cube           = shape.cube;
-		resource.read           = true;
-		IR::DescriptorValue value;
-		value.dword_count = 8u;
-		value.dwords      = tsharp;
-		return m_executor.ResolveTexture(resource, value);
-	};
-	const auto Usable = [&](const TextureBinding& binding) {
-		const auto* image = cache.m_slot_images.try_get(binding.image_id);
-		return image != nullptr && !binding.desc.info.data.Empty() && image->registered &&
-		       !image->dormant && !image->binding.needs_rebind && !image->depth_id &&
-		       image->backing.image != nullptr;
-	};
-	std::vector<Pending> pending;
-	pending.reserve(missing.size());
 	for (const auto& tsharp: missing) {
 		const auto shape   = Bindless::ClassifyRecord(tsharp, m_integer);
-		auto       binding = Resolve(tsharp, *shape);
+		const auto binding = ResolveRecord(tsharp, *shape);
 		if (binding.desc.info.data.Empty()) {
 			m_cache[tsharp] = 0u;
 			continue;
 		}
-		pending.push_back({tsharp, *shape, std::move(binding)});
-	}
-	for (uint32_t pass = 0; pass < 4u; pass++) {
-		bool churn = false;
-		for (auto& entry: pending) {
-			if (!Usable(entry.binding)) {
-				entry.binding = Resolve(entry.tsharp, entry.shape);
-				churn         = true;
-			}
-		}
-		if (!churn) {
-			break;
-		}
-	}
-	for (auto& entry: pending) {
-		if (!Usable(entry.binding)) {
-			continue;
-		}
-		const auto view = cache.FindTexture(entry.binding.image_id, entry.binding.desc);
-		if (view == nullptr) {
-			continue;
-		}
-		const auto slot = m_slots.Assign(
-		    entry.shape.array, reinterpret_cast<uint64_t>(static_cast<VkImageView>(view)));
-		if (!slot.has_value()) {
+		bool exhausted = false;
+		if (!AdmitRecord(tsharp, *shape, binding, exhausted).has_value() && exhausted) {
 			return false;
 		}
-		const auto array   = static_cast<size_t>(entry.shape.array);
-		auto&      element = m_elements[array][*slot];
-		if (!element.live || element.view != view) {
-			auto&       image = cache.m_slot_images[entry.binding.image_id];
-			const auto& info  = entry.binding.desc.view_info;
-			element.id        = entry.binding.image_id;
-			element.view      = view;
-			element.desc      = entry.binding.desc;
-			element.range  = {info.base_level, info.level_count, info.base_layer, info.layer_count};
-			element.layout = image.info.IsDepth() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
-			                                      : vk::ImageLayout::eShaderReadOnlyOptimal;
-			element.live   = true;
-			image.usage.texture   = true;
-			m_infos[array][*slot] = {nullptr, view, element.layout};
-			m_set_dirty           = true;
-		}
-		m_cache[entry.tsharp] = Bindless::TranslationWord(entry.shape, *slot);
 	}
 	heap.words.assign(heap.records, 0u);
 	Bindless::TranslateHeap(
@@ -431,12 +511,95 @@ bool BindlessImageHeap::Rescan(const HeapKey& key, Heap& heap,
 	heap.scanned  = true;
 	heap.stale    = false;
 	m_arena_dirty = true;
+	NoteUnresolved(key, heap, dwords);
+	return true;
+}
+
+void BindlessImageHeap::NoteUnresolved(const HeapKey& key, Heap& heap,
+                                       const std::vector<uint32_t>& dwords) {
+	heap.dirty.clear();
+	heap.unresolved.clear();
+	if (!IncrementalRescans()) {
+		return;
+	}
+	heap.dwords = dwords;
+	heap.full   = false;
+	for (uint32_t record = 0; record < heap.records; record++) {
+		if (heap.words[record] != 0u) {
+			continue;
+		}
+		const auto tsharp = Bindless::RecordAt(dwords, key.stride, key.offset, record);
+		if (!m_cache.contains(tsharp) && Bindless::ClassifyRecord(tsharp, m_integer).has_value()) {
+			heap.unresolved.push_back(record);
+		}
+	}
+}
+
+bool BindlessImageHeap::RescanChanged(const HeapKey& key, Heap& heap,
+                                      const std::vector<uint32_t>& dwords) {
+	static thread_local std::vector<uint32_t> candidates;
+	candidates.clear();
+	const auto  record_bytes = sizeof(Bindless::TSharp);
+	const auto  heap_bytes   = dwords.size() * sizeof(uint32_t);
+	const auto* now          = reinterpret_cast<const uint8_t*>(dwords.data());
+	const auto* before       = reinterpret_cast<const uint8_t*>(heap.dwords.data());
+	for (uint32_t record = 0; record < heap.records; record++) {
+		const auto first = static_cast<size_t>(record) * key.stride + key.offset;
+		if (first >= heap_bytes) {
+			break;
+		}
+		const auto bytes = std::min<size_t>(record_bytes, heap_bytes - first);
+		if (std::memcmp(now + first, before + first, bytes) != 0) {
+			candidates.push_back(record);
+		}
+	}
+	candidates.insert(candidates.end(), heap.dirty.begin(), heap.dirty.end());
+	candidates.insert(candidates.end(), heap.unresolved.begin(), heap.unresolved.end());
+	std::sort(candidates.begin(), candidates.end());
+	candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
+	for (const auto record: candidates) {
+		const auto tsharp = Bindless::RecordAt(dwords, key.stride, key.offset, record);
+		if (m_cache.contains(tsharp)) {
+			continue;
+		}
+		const auto shape = Bindless::ClassifyRecord(tsharp, m_integer);
+		if (!shape.has_value()) {
+			continue;
+		}
+		const auto binding = ResolveRecord(tsharp, *shape);
+		if (binding.desc.info.data.Empty()) {
+			m_cache[tsharp] = 0u;
+			continue;
+		}
+		bool exhausted = false;
+		if (!AdmitRecord(tsharp, *shape, binding, exhausted).has_value() && exhausted) {
+			return false;
+		}
+	}
+	heap.unresolved.clear();
+	bool changed = false;
+	for (const auto record: candidates) {
+		const auto tsharp = Bindless::RecordAt(dwords, key.stride, key.offset, record);
+		const auto found  = m_cache.find(tsharp);
+		const auto word   = found != m_cache.end() ? found->second : 0u;
+		if (found == m_cache.end() && Bindless::ClassifyRecord(tsharp, m_integer).has_value()) {
+			heap.unresolved.push_back(record);
+		}
+		changed            = changed || heap.words[record] != word;
+		heap.words[record] = word;
+	}
+	heap.dwords = dwords;
+	heap.dirty.clear();
+	heap.stale    = false;
+	m_arena_dirty = m_arena_dirty || changed;
 	return true;
 }
 
 void BindlessImageHeap::ResetElements() {
 	m_slots.Reset();
 	m_cache.clear();
+	m_watched.clear();
+	m_pending.clear();
 	for (uint32_t array = 0; array < ActiveArrays(); array++) {
 		for (uint32_t slot = 0; slot < IR::BindlessImageSlots; slot++) {
 			m_elements[array][slot].live = false;
@@ -446,8 +609,11 @@ void BindlessImageHeap::ResetElements() {
 	}
 	for (auto& [key, heap]: m_heaps) {
 		heap.stale = true;
+		heap.full  = true;
 	}
-	m_set_dirty = true;
+	// Arena words name old slots; a heap whose rescan fails keeps them, so always rebuild.
+	m_arena_dirty = true;
+	m_set_dirty   = true;
 }
 
 void BindlessImageHeap::Prepare(const ShaderRecompiler::IR::BindlessImageTable& table) {
@@ -467,8 +633,9 @@ void BindlessImageHeap::Prepare(const ShaderRecompiler::IR::BindlessImageTable& 
 			heap.rescan_frame = frame;
 			heap.rescans      = 0;
 		}
+		const bool exhausted = heap.scanned && heap.rescans >= MaxRescansPerFrame;
 		static thread_local std::vector<uint32_t> dwords;
-		if (ReadHeap(key, heap.records, dwords)) {
+		if (!exhausted && ReadHeap(key, heap.records, dwords)) {
 			const auto hash  = XXH3_64bits(dwords.data(), dwords.size() * sizeof(uint32_t));
 			const bool moved = !heap.scanned || hash != heap.hash;
 			if ((moved || heap.stale) && (heap.rescans < MaxRescansPerFrame || !heap.scanned)) {
@@ -659,21 +826,35 @@ vk::DescriptorSet BindlessImageHeap::Commit(vk::CommandBuffer command) {
 		    image.GetBarriers(layout, vk::AccessFlagBits2::eShaderRead, SampleStages, range);
 		m_barriers.insert(m_barriers.end(), barriers.begin(), barriers.end());
 	};
-	for (uint32_t array = 0; array < ActiveArrays(); array++) {
-		const auto used = m_slots.Used(static_cast<BindlessShape>(array));
-		for (uint32_t slot = 0; slot < used; slot++) {
-			const auto& element = m_elements[array][slot];
-			if (!element.live) {
-				continue;
-			}
-			auto& image = cache.m_slot_images[element.id];
-			if (image.binding.is_target ||
-			    (image.binding.is_bound &&
-			     (image.binding.shader_write || image.binding.force_general))) {
-				continue;
-			}
+	// Only images whose tracked state changed since they were last brought can need a barrier.
+	for (const auto id: cache.m_sampled_state_changes) {
+		if (const auto found = m_watched.find(id); found != m_watched.end()) {
+			MarkPending(id, found->second);
+		}
+	}
+	cache.m_sampled_state_changes.clear();
+	std::erase_if(m_pending, [&](ImageId id) {
+		const auto found = m_watched.find(id);
+		if (found == m_watched.end()) {
+			return true;
+		}
+		auto& image = cache.m_slot_images[id];
+		if (image.binding.is_target || (image.binding.is_bound && (image.binding.shader_write ||
+		                                                           image.binding.force_general))) {
+			return false;
+		}
+		image.state_watch = nullptr;
+		for (const auto key: found->second.elements) {
+			const auto& element =
+			    m_elements[key / IR::BindlessImageSlots][key % IR::BindlessImageSlots];
 			Bring(image, element.layout, element.range);
 		}
+		image.state_watch     = &cache.m_sampled_state_changes;
+		image.state_watch_id  = id;
+		found->second.pending = false;
+		return true;
+	});
+	for (uint32_t array = 0; array < ActiveArrays(); array++) {
 		Bring(cache.m_slot_images[m_null[array].id], vk::ImageLayout::eGeneral,
 		      m_null[array].range);
 	}

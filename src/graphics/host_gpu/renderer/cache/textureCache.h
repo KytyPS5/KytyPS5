@@ -93,7 +93,7 @@ private:
 namespace BcAlias {
 [[nodiscard]] bool Matches(const ImageInfo& requested, const ImageInfo& cached);
 [[nodiscard]] bool Publish(TextureCache& cache, Image& image);
-void Resolve(TextureCache& cache, ImageId cached, ImageId merged);
+void               Resolve(TextureCache& cache, ImageId cached, ImageId merged);
 } // namespace BcAlias
 
 class TextureCache {
@@ -165,14 +165,10 @@ public:
 private:
 	void FreePublishedEvictions();
 
-	enum class TransferDirection { Upload, Download };
-	struct TextureTransfer;
-	struct ImageDownload;
-
 	struct MetaDataInfo {
 		enum class Type : uint8_t { CMask, FMask, HTile };
 
-		Type     type;
+		Type type;
 		// Footprint of the registered metadata surface, so a writer that touches only part
 		// of it cannot be mistaken for one that cleared the whole thing. The registry is
 		// keyed by base address alone and outlives the guest allocation, so a matching base
@@ -197,9 +193,9 @@ private:
 	// Callers have validated the nonempty 44-bit range with TryGetPageRange.
 	template <typename Func>
 	static void ForEachPage(uint64_t address, size_t size, Func&& func) {
-		using FuncReturn = typename std::invoke_result<Func, uint64_t>::type;
+		using FuncReturn                   = typename std::invoke_result<Func, uint64_t>::type;
 		static constexpr bool RETURNS_BOOL = std::is_same_v<FuncReturn, bool>;
-		const uint64_t page_end = (address + size - 1) >> ImagePageTable::kPageBits;
+		const uint64_t        page_end     = (address + size - 1) >> ImagePageTable::kPageBits;
 		for (uint64_t page = address >> ImagePageTable::kPageBits; page <= page_end; ++page) {
 			if constexpr (RETURNS_BOOL) {
 				if (func(page)) {
@@ -226,14 +222,13 @@ private:
 	void                      UntrackImageTail(ImageId id);
 	void                      MarkAsMaybeDirty(ImageId id, Image& image);
 	void                      TrackImageDownload(ImageId id, Image& image);
-	[[nodiscard]] static bool SameGuestLayout(const ImageInfo& cached,
-	                                          const ImageInfo& requested);
+	[[nodiscard]] static bool SameGuestLayout(const ImageInfo& cached, const ImageInfo& requested);
 	[[nodiscard]] static bool SameBacking(const ImageInfo& cached, const ImageInfo& requested,
 	                                      bool exact_format);
 	[[nodiscard]] static BindingType UploadBinding(const Image& image);
 	// `with_download_plan` asks whether a write-back could be built; only the collector needs it.
 	[[nodiscard]] Headroom::CollectorImageFacts CollectorFacts(const Image& image,
-	                                                           bool with_download_plan);
+	                                                           bool         with_download_plan);
 	// Frees what can be freed with no GPU work. Caller holds m_lock; returns accounted bytes.
 	[[nodiscard]] uint64_t ReclaimForAllocation(uint64_t needed);
 
@@ -247,26 +242,26 @@ private:
 	// two owners answer for the same guest bytes and the merge loop walks both. Freeing is the
 	// cheap way to displace it, and it is correct only while guest memory can still reproduce
 	// the pixels. When it cannot, park the image instead of destroying it.
-	void                        RetireOverlap(ImageId id, bool abandoned);
-	[[nodiscard]] bool          ParkImage(ImageId id);
+	void               RetireOverlap(ImageId id, bool abandoned);
+	[[nodiscard]] bool ParkImage(ImageId id);
 	// Re-admit a parked image and put down whatever claimed its bytes while it was away.
-	bool                        UnparkImage(ImageId id);
-	void                        WakeImage(ImageId id, const ImageIds& candidates);
-	[[nodiscard]] ImageId       ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
-	                                                ImageId cached);
-	[[nodiscard]] ImageId       ExpandImage(const ImageInfo& info, ImageId source);
-	void                        RefreshImage(ImageId id);
-	void                        MaterializeColorClear(ImageId id, const ImageDesc& desc,
-	                                                uint32_t metadata_base_layer);
+	bool                  UnparkImage(ImageId id);
+	void                  WakeImage(ImageId id, const ImageIds& candidates);
+	[[nodiscard]] ImageId ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
+	                                          ImageId cached);
+	[[nodiscard]] ImageId ExpandImage(const ImageInfo& info, ImageId source);
+	void                  RefreshImage(ImageId id);
+	void MaterializeColorClear(ImageId id, const ImageDesc& desc, uint32_t metadata_base_layer);
 	// False when the target cannot take the GPU draw and the metadata must be read back.
-	[[nodiscard]] bool MaterializeColorClearOnGpu(
-	    ImageId id, const ImageDesc& desc, uint32_t first, uint32_t image_first, uint32_t count,
-	    uint64_t slice_size, std::span<const ColorClearHelper::Candidate> candidates);
-	void                        InitializeImage(ImageId id);
-	[[nodiscard]] bool          CanDownload(const Image& image) const;
-	void UploadImage(Image& image, Buffer& source, uint64_t source_offset);
-	void DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
-	                   uint64_t destination_size, uint32_t levels);
+	[[nodiscard]] bool
+	     MaterializeColorClearOnGpu(ImageId id, const ImageDesc& desc, uint32_t first,
+	                                uint32_t image_first, uint32_t count, uint64_t slice_size,
+	                                std::span<const ColorClearHelper::Candidate> candidates);
+	void InitializeImage(ImageId id);
+	[[nodiscard]] bool CanDownload(const Image& image) const;
+	void               UploadImage(Image& image, Buffer& source, uint64_t source_offset);
+	void               DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
+	                                 uint64_t destination_size, uint32_t levels);
 	void DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset);
 	void DownloadColorRegions(Image& image, std::vector<vk::BufferImageCopy>& regions,
 	                          ColorTransform transform, Buffer& destination, uint64_t destination_offset,
@@ -280,8 +275,8 @@ private:
 	                const vk::ImageSubresourceRange& range, const vk::ClearValue& clear);
 	void PrepareImageCopy(Image& image);
 	void RefreshCopySource(ImageId id);
-	[[nodiscard]] bool CopyD16(Image& destination, Image& source);
-	void               CopyImage(ImageId destination, ImageId source);
+	[[nodiscard]] bool    CopyD16(Image& destination, Image& source);
+	void                  CopyImage(ImageId destination, ImageId source);
 	[[nodiscard]] ImageId AssociateStencil(ImageId depth, GuestRange stencil);
 	void CopyImageMip(ImageId destination, ImageId source, uint32_t mip, uint32_t layer);
 	void ValidateImageDesc(const ImageDesc& desc) const;
@@ -289,8 +284,8 @@ private:
 	void               InvalidateCpuAliases(uint64_t address, uint64_t size);
 	[[nodiscard]] bool DownloadImageMemory(ImageId id);
 	// An empty chunk region list downloads the whole transfer in one batch.
-	[[nodiscard]] bool DownloadImageBatch(Image& image, ImageDownload& transfer,
-	                                      const TextureDownloadChunk& chunk, uint64_t alignment);
+	[[nodiscard]] bool DownloadImageBatch(Image& image, const TextureDownloadChunk& chunk,
+	                                      uint64_t alignment);
 
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
@@ -311,18 +306,24 @@ private:
 	// Evicted images held registered until their download reaches guest memory. The priority runner
 	// appends to m_evict_published under its own leaf mutex, never m_lock, which would deadlock a
 	// caller already waiting on a priority operation.
-	std::unordered_map<ImageId, uint64_t>             m_evict_pending;
-	std::unordered_map<ImageId, uint64_t>             m_evict_backoff;
-	std::unordered_map<uint64_t, uint64_t>            m_evicted_addresses;
-	std::mutex                                        m_evict_published_lock;
-	std::vector<ImageId>                              m_evict_published;
-	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
-	std::unordered_map<uint64_t, ImageId>             m_stencil_planes;
-	uint64_t                                          m_total_used_memory  = 0;
-	uint64_t                                          m_trigger_gc_memory  = 0;
-	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;
-	uint64_t         m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
-	uint64_t         m_gc_tick                = 0;
+	std::unordered_map<ImageId, uint64_t>  m_evict_pending;
+	std::unordered_map<ImageId, uint64_t>  m_evict_backoff;
+	std::unordered_map<uint64_t, uint64_t> m_evicted_addresses;
+	std::mutex                             m_evict_published_lock;
+	std::vector<ImageId>                   m_evict_published;
+	std::map<uint64_t, MetaDataInfo>       m_surface_metas;
+	std::unordered_map<uint64_t, ImageId>  m_stencil_planes;
+	std::vector<ImageId>                   m_sampled_state_changes;
+	uint64_t                               m_total_used_memory  = 0;
+	uint64_t                               m_trigger_gc_memory  = 0;
+	uint64_t                               m_pressure_gc_memory = 1536ull * 1024 * 1024;
+	uint64_t                               m_critical_gc_memory = 3ull * 1024 * 1024 * 1024;
+	uint64_t                               m_gc_tick            = 0;
+	uint64_t                               m_gc_frame           = UINT64_MAX;
+	uint64_t                               m_gc_collections     = 0;
+	// Advances whenever a registered image stops being servable: unregistered, parked, stencil
+	// proxy.
+	uint64_t         m_retire_epoch           = 0;
 	mutable uint32_t m_image_query_epoch      = 0;
 	bool             m_readback_linear_images = false;
 
@@ -330,6 +331,9 @@ private:
 	friend class BufferCache;
 	friend class RenderExecutor;
 	friend class BindlessImageHeap;
+	friend bool BcAlias::Matches(const ImageInfo&, const ImageInfo&);
+	friend bool BcAlias::Publish(TextureCache&, Image&);
+	friend void BcAlias::Resolve(TextureCache&, ImageId, ImageId);
 };
 
 } // namespace Libs::Graphics

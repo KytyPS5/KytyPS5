@@ -107,8 +107,6 @@ void SlotAllocator::Reset() {
 	m_next.fill(0u);
 }
 
-namespace {
-
 TSharp RecordAt(std::span<const uint32_t> heap, uint32_t stride, uint32_t offset, uint32_t record) {
 	TSharp     words {};
 	const auto first = (static_cast<size_t>(record) * stride + offset) / sizeof(uint32_t);
@@ -117,8 +115,6 @@ TSharp RecordAt(std::span<const uint32_t> heap, uint32_t stride, uint32_t offset
 	}
 	return words;
 }
-
-} // namespace
 
 void TranslateHeap(std::span<const uint32_t> heap, uint32_t stride, uint32_t offset,
                    uint32_t records, TranslationCache& cache, const RecordResolver& resolve,

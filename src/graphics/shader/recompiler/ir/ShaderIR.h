@@ -338,7 +338,7 @@ inline constexpr uint32_t IndirectSearchIterations = 33u;
 inline constexpr uint32_t BindlessDescriptorSet     = 2u;
 inline constexpr uint32_t BindlessArenaBinding      = 0u;
 inline constexpr uint32_t BindlessFirstImageBinding = 1u;
-inline constexpr uint32_t BindlessImageSlots        = 4096u;
+inline constexpr uint32_t BindlessImageSlots        = 16384u;
 
 inline constexpr uint32_t BindlessIntegerDescriptorSet = 3u;
 

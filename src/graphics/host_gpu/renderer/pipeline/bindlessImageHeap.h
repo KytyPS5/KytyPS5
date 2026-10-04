@@ -80,6 +80,14 @@ private:
 		bool                  stale         = true;
 		uint32_t              arena_base    = 0;
 		std::vector<uint32_t> words;
+		// The heap bytes `words` were translated from, so a rescan re-translates only what changed.
+		std::vector<uint32_t> dwords;
+		// Records to re-translate even if their bytes did not move: their element was killed.
+		std::vector<uint32_t> dirty;
+		// Records no image could be admitted for yet; a full rescan would retry them, so do we.
+		std::vector<uint32_t> unresolved;
+		// The next rescan has to translate every record (new heap, reset or integer arrays).
+		bool full = true;
 	};
 	struct Element {
 		ImageId                 id;
@@ -88,6 +96,10 @@ private:
 		ImageSubresourceRange   range;
 		vk::ImageLayout         layout = vk::ImageLayout::eUndefined;
 		bool                    live   = false;
+	};
+	struct Watched {
+		std::vector<uint32_t> elements;
+		bool                  pending = false;
 	};
 	struct Version {
 		vk::DescriptorSet       set          = nullptr;
@@ -103,6 +115,10 @@ private:
 	void                         CreateNullImages(size_t first, size_t last);
 	[[nodiscard]] bool           ElementAlive(const Element& element);
 	void                         Kill(ShaderRecompiler::IR::BindlessShape array, uint32_t slot);
+	void                         ForgetKilled();
+	void                         Watch(uint32_t element, ImageId id);
+	void                         Unwatch(uint32_t element, ImageId id);
+	void                         MarkPending(ImageId id, Watched& watched);
 	void                         SweepDeadElements();
 	void                         TouchLiveElements();
 	void                         EvictIdleHeaps(uint64_t frame);
@@ -117,6 +133,9 @@ private:
 	[[nodiscard]] bool                    ReadHeap(const HeapKey& key, uint32_t records,
 	                                               std::vector<uint32_t>& dwords) const;
 	[[nodiscard]] bool Rescan(const HeapKey& key, Heap& heap, const std::vector<uint32_t>& dwords);
+	[[nodiscard]] bool RescanChanged(const HeapKey& key, Heap& heap,
+	                                 const std::vector<uint32_t>& dwords);
+	void NoteUnresolved(const HeapKey& key, Heap& heap, const std::vector<uint32_t>& dwords);
 	void               ResetElements();
 	void               BuildArena();
 	void               BuildVersion();
@@ -141,11 +160,18 @@ private:
 	uint64_t                                                 m_refreshed_frame = UINT64_MAX;
 	uint64_t                                                 m_evicted_frame   = 0;
 	uint64_t                                                 m_touched_gc_tick = UINT64_MAX;
+	uint64_t                                                 m_swept_epoch     = UINT64_MAX;
+	std::vector<uint32_t>                                    m_killed;
+	std::vector<bool>                                        m_killed_mask;
+	std::unordered_map<ImageId, Watched>                     m_watched;
+	std::vector<ImageId>                                     m_pending;
 	Version                                                  m_current;
 	std::deque<Version>                                      m_retired;
 	std::vector<vk::DescriptorPool>                          m_pools;
 	std::vector<vk::DescriptorPool>                          m_integer_pools;
 	std::vector<vk::ImageMemoryBarrier2>                     m_barriers;
+
+	friend struct BindlessImageHeapTestAccess;
 };
 
 } // namespace Libs::Graphics

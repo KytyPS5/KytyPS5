@@ -59,6 +59,10 @@ using TranslationCache = std::unordered_map<TSharp, uint32_t, TSharpHash>;
 
 using RecordResolver = std::function<std::optional<uint32_t>(const TSharp&, const RecordShape&)>;
 
+// The T# of one record; dwords past the heap read as zero.
+[[nodiscard]] TSharp RecordAt(std::span<const uint32_t> heap, uint32_t stride, uint32_t offset,
+                              uint32_t record);
+
 void TranslateHeap(std::span<const uint32_t> heap, uint32_t stride, uint32_t offset,
                    uint32_t records, TranslationCache& cache, const RecordResolver& resolve,
                    std::span<uint32_t> words, bool integer = false);

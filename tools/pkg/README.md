@@ -109,3 +109,35 @@ a successful mount after failure, and EOF during concurrent helper launches.
 
 Python is optional when helper publishing is disabled. The native mock-helper
 test is registered only when a Python interpreter is available.
+
+## Compare a failing PKG with a working extracted game
+
+The emulator retains its selected archive reader from argument parsing through
+execution, reusing the catalog and decompression cache across metadata checks.
+Reads shorter than the catalog's remaining file size are reported as errors.
+
+Build the optional native comparison tool:
+
+```sh
+cmake --build _Build/windows --target pkg_compare_folder
+```
+
+On Windows, compare using the helper installed in the build tree:
+
+```bat
+_Build\windows\launcher\pkg_compare_folder.exe "E:\game.pkg" "E:\extracted-game" > pkg-comparison.txt 2>&1
+```
+
+This reads every file through the native PKG bridge and compares it byte-for-byte
+against the folder, reporting missing files, size differences, and the first
+mismatching offset in each file. It can take time for a large game. An optional
+third argument selects one relative filename (for example `eboot.bin`). Extra
+folder files are reported only for a whole-tree comparison. Neither input is
+modified. Exit 0 means no differences, 1 means differences, and 2 means setup
+or other fatal errors. Equality does not prove emulator compatibility.
+
+Regression check (requires the real helper):
+
+```sh
+python tools/pkg/tests/run_compare_test.py _Build/windows/launcher/pkg_compare_folder.exe
+```

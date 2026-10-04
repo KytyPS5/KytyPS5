@@ -31,12 +31,14 @@ static int Helper(const std::string& mode) {
     }
     if (mode == "partial") std::cout.write("KP", 2).flush();
     if (mode == "catalog" || mode == "healthy" || mode == "readstall" || mode == "readpartial") {
-        const char header[] = {'K','P','K','1',1,0,0,0};
+        const char header[] = {'K','P','K','1',static_cast<char>(mode == "catalog" ? 1 : 2),0,0,0};
         std::cout.write(header, sizeof(header)).flush();
         if (mode != "catalog") {
             // Root entry: empty name, zero size, directory.
             const char root[13] = {};
-            std::cout.write(root, sizeof(root)).flush();
+            std::cout.write(root, sizeof(root));
+            const char file[] = {1,0,0,0,'x',4,0,0,0,0,0,0,0,1};
+            std::cout.write(file, sizeof(file)).flush();
             if (mode == "healthy") return 0;
             if (mode == "readpartial") {
                 char request[21]; std::cin.read(request, sizeof(request));
@@ -66,10 +68,10 @@ int main(int argc, char** argv) {
             Common::PkgArchiveBackend reader(mode, 2s, 300ms);
             const auto begin = std::chrono::steady_clock::now();
             char data[4];
-            Check(reader.Read(0, 0, sizeof(data), data) == 0, "stalled response did not fail");
+            Check(reader.Read(1, 0, sizeof(data), data) == 0, "stalled response did not fail");
             Check(std::chrono::steady_clock::now() - begin < 4s, "read deadline/cleanup exceeded bound");
             const auto retry = std::chrono::steady_clock::now();
-            Check(reader.Read(0, 0, sizeof(data), data) == 0, "failed reader reused");
+            Check(reader.Read(1, 0, sizeof(data), data) == 0, "failed reader reused");
             Check(std::chrono::steady_clock::now() - retry < 100ms, "failed reader waited again");
         }
         {

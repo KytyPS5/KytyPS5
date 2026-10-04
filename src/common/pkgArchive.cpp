@@ -435,6 +435,7 @@ public:
 			const auto size = pipe_.Number(8), kind = pipe_.Number(1);
 			if (kind > 1 || !entries_.emplace(name, Entry {id, size, kind == 1}).second)
 				throw std::runtime_error("Duplicate/invalid catalog entry");
+            catalog_index_.push_back(Entry {id, size, kind == 1});
 		}
 		auto root = entries_.find("");
 		if (root == entries_.end() || root->second.is_file)
@@ -467,7 +468,10 @@ public:
 		if (size == 0) return 0;
 		if (data == nullptr || size > 1024 * 1024) return 0;
 		std::lock_guard lock(mutex_);
-		if (failed_) return 0;
+        if (failed_ || id >= catalog_index_.size() || !catalog_index_[id].is_file) return 0;
+        const auto file_size = catalog_index_[id].size;
+        if (offset >= file_size) return 0;
+        const auto expected = static_cast<uint32_t>(std::min<uint64_t>(size, file_size - offset));
 		try {
 			pipe_.BeginTransaction(read_timeout_);
 			pipe_.Number(1, 1);
@@ -479,7 +483,11 @@ public:
 				std::fprintf(stderr, "PKG read failed: %s\n", pipe_.String(65536).c_str());
 				return 0;
 			}
-			if (got > size) throw std::runtime_error("Oversized package read reply");
+			if (got != expected) {
+                std::fprintf(stderr, "PKG short/invalid read: id=%llu offset=%llu expected=%u got=%u\n",
+                    static_cast<unsigned long long>(id), static_cast<unsigned long long>(offset), expected, static_cast<unsigned>(got));
+                throw std::runtime_error("Package read did not match catalog file size");
+            }
 			pipe_.Read(data, static_cast<size_t>(got));
 			return got;
 		} catch (const std::exception& ex) {
@@ -491,6 +499,7 @@ public:
 	}
 
 private:
+	std::vector<Entry> catalog_index_;
 	std::chrono::milliseconds                                    read_timeout_;
 	bool                                                         failed_ = false;
 	Pipe                                                         pipe_;

@@ -181,7 +181,8 @@ static bool ParseUserId(const std::string& value, int32_t& out) {
 	return true;
 }
 
-static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_help) {
+static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_help,
+                      std::shared_ptr<Common::ArchiveReader>& game_archive) {
 	show_help = false;
 
 	for (int i = 1; i < argc; i++) {
@@ -258,7 +259,10 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 				options.app0_dir = path;
 				options.elf      = "/app0/eboot.bin";
 			} else if (Common::IsSupportedArchive(path) && Common::File::IsFileExisting(path)) {
-				const auto root = Common::MakeArchivePath(path);
+				// Keep the catalog and decompression cache alive through initialization and Run.
+                game_archive = Common::OpenArchive(path);
+                if (!game_archive) return false;
+                const auto root = Common::MakeArchivePath(path);
 				if (!Common::File::IsFileExisting(root / "eboot.bin")) {
 					::printf("Archive does not contain eboot.bin: %s\n", value.c_str());
 					return false;
@@ -424,6 +428,7 @@ static int Main(int argc, char* argv[]) {
 	VirtualMemory::Init();
 	InitializeThreads();
 
+	std::shared_ptr<Common::ArchiveReader> game_archive;
 	RunOptions options;
 	bool       show_help = false;
 
@@ -432,7 +437,7 @@ static int Main(int argc, char* argv[]) {
 		return 0;
 	}
 
-	if (!ParseArgs(argc, argv, options, show_help)) {
+	if (!ParseArgs(argc, argv, options, show_help, game_archive)) {
 		PrintUsage();
 		return 1;
 	}

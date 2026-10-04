@@ -231,3 +231,8 @@ if(BUILD_TESTING AND Python3_Interpreter_FOUND)
         "${PROJECT_SOURCE_DIR}/tools/pkg/tests/run_startup_test.py" $<TARGET_FILE:pkg_startup_tests>)
     set_tests_properties(pkg_startup PROPERTIES TIMEOUT 40)
 endif()
+
+# Optional diagnostic: compare native PKG reads with a known-working extracted tree.
+add_executable(pkg_compare_folder EXCLUDE_FROM_ALL
+    "${PROJECT_SOURCE_DIR}/tools/pkg/tests/CompareFolder.cpp")
+target_link_libraries(pkg_compare_folder PRIVATE common)

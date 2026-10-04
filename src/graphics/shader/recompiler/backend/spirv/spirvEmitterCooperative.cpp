@@ -43,13 +43,17 @@ uint32_t ScratchPointer(EmitterState& state, uint32_t index) {
 }
 
 template <typename Body>
-void Guard(EmitterState& state, uint32_t active, Body&& body) {
+void Guard(ValueEmitContext& ctx, uint32_t active, Body&& body) {
+	auto& state = ctx.state;
 	const auto yes = state.builder.AllocateId();
 	const auto merge = state.builder.AllocateId();
 	state.builder.AddFunction({OpSelectionMerge, merge, SelectionControlNone});
 	state.builder.AddFunction({OpBranchConditional, active, yes, merge});
 	EmitLabel(state, yes);
+	const auto previous_region = ctx.cooperative_guard_region;
+	ctx.cooperative_guard_region = ++ctx.cooperative_guard_serial;
 	body();
+	ctx.cooperative_guard_region = previous_region;
 	state.builder.AddFunction({OpBranch, merge});
 	EmitLabel(state, merge);
 }
@@ -82,10 +86,13 @@ bool IsRuntimeScalarRead(const ValueEmitContext& ctx, const IR::Inst& inst) {
 	       !ctx.Memory(inst).planning_only;
 }
 
-void StoreResult(ValueEmitContext& ctx, const CooperativeFunctionState& function, const IR::Inst& inst) {
+void StoreResult(ValueEmitContext& ctx, const CooperativeFunctionState& function,
+                 const IR::Inst& inst, bool defined_in_guard = true) {
 	if (const auto slot = function.spills.find(&inst); slot != function.spills.end()) {
 		const auto value = ctx.definitions.find(&inst);
 		if (value == ctx.definitions.end()) ctx.Fail(inst, "cooperative instruction did not define its result");
+		if (defined_in_guard && ctx.cooperative_guard_region != 0)
+			ctx.cooperative_definition_regions.insert_or_assign(&inst, ctx.cooperative_guard_region);
 		ctx.state.builder.AddFunction({OpStore, slot->second, value->second});
 	}
 }
@@ -104,7 +111,7 @@ void EmitSegmentInstructions(ValueEmitContext& ctx, const CooperativeFunctionSta
 			// the raw host loads first, broadcast this wave's lane zero, then commit
 			// the architectural scalar result for the selected wave.
 			ctx.cooperative_phase = function.phases.at(&inst);
-			Guard(ctx.state, active, [&] {
+			Guard(ctx, active, [&] {
 				EmitDirectValueInstruction(ctx, inst);
 				StoreResult(ctx, function, inst);
 			});
@@ -113,7 +120,7 @@ void EmitSegmentInstructions(ValueEmitContext& ctx, const CooperativeFunctionSta
 			const auto source = ctx.Def(IR::Value(const_cast<IR::Inst*>(&inst)));
 			const auto value = EmitWaveReadLane(ctx.state, source, ConstantU32(ctx.state, 0));
 			ctx.cooperative_collective_active = 0;
-			Guard(ctx.state, active, [&] {
+			Guard(ctx, active, [&] {
 				ctx.state.builder.AddFunction({OpStore, function.spills.at(&inst), value});
 			});
 			++index;
@@ -125,14 +132,14 @@ void EmitSegmentInstructions(ValueEmitContext& ctx, const CooperativeFunctionSta
 			EmitDirectValueInstruction(ctx, inst);
 			ctx.cooperative_collective_active = 0;
 			ctx.cooperative_phase = 0;
-			Guard(ctx.state, active, [&] { StoreResult(ctx, function, inst); });
+			Guard(ctx, active, [&] { StoreResult(ctx, function, inst, false); });
 			++index;
 			continue;
 		}
 		bool lds = false;
 		const auto phase = function.phases.at(segment.instructions[index]);
 		ctx.cooperative_phase = phase;
-		Guard(ctx.state, active, [&] {
+		Guard(ctx, active, [&] {
 			// Coalesce ordinary instructions and consecutive read-only DS accesses
 			// into one selection. Conflicting DS accesses retain separate phases,
 			// so the rendezvous remains outside every wave/EXEC/bounds guard.
@@ -555,7 +562,7 @@ void EmitCooperativeFunction(ValueEmitContext& ctx, const CooperativeFunctionSta
 		}
 		if (fuse_guard) {
 			ctx.cooperative_phase = simple_phase;
-			Guard(state, active, [&] {
+			Guard(ctx, active, [&] {
 				for (const auto* inst : segment.instructions) {
 					if (inst->GetOpcode() == O::Phi) continue;
 					EmitDirectValueInstruction(ctx, *inst);
@@ -566,7 +573,7 @@ void EmitCooperativeFunction(ValueEmitContext& ctx, const CooperativeFunctionSta
 			ctx.cooperative_phase = 0;
 		} else {
 			EmitSegmentInstructions(ctx, function, segment, active);
-			Guard(state, active, emit_transition);
+			Guard(ctx, active, emit_transition);
 		}
 		state.builder.AddFunction({OpBranch, after_switch});
 	}

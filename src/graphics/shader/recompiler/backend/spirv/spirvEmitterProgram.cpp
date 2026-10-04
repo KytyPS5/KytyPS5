@@ -796,6 +796,14 @@ uint32_t ValueEmitContext::Def(IR::Value value) {
 	}
 	if (cooperative_spills != nullptr) {
 		if (const auto slot = cooperative_spills->find(inst); slot != cooperative_spills->end()) {
+			// A value defined earlier in this very Guard dominates its later uses.
+			// Other Guards, even within one scheduler phase, must use the spill.
+			if (cooperative_guard_region != 0 && cooperative_collective_active == 0) {
+				const auto region = cooperative_definition_regions.find(inst);
+				if (region != cooperative_definition_regions.end() &&
+				    region->second == cooperative_guard_region)
+					return Result(*inst);
+			}
 			// Never return the defining Guard's SSA across a later selection with the
 			// same active mask. Same-phase liveness does not imply the same structured
 			// region once scalar reads, collectives or phase splits open a new Guard.

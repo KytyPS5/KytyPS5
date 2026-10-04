@@ -36984,13 +36984,14 @@ void CheckIndirectImageKeySwitch(
     bool vertex_wave64 = false, bool vertex_subgroup = false,
     bool vertex_cross_lane = false, bool vertex_divergent_loop = false,
     bool vertex_long_loop = false, bool vertex_mask_drain = false,
-    bool vertex_mask_seed_live = false) {
+    bool vertex_mask_seed_live = false, bool cooperative_compute = false,
+    u32 arithmetic_chain = 0u, size_t *load_count = nullptr) {
   constexpr uint32_t mapping_capacity = 1793u;
   using namespace ShaderRecompiler::IR;
 
   Program program{};
   program.stage = vertex ? ShaderType::Vertex : ShaderType::Compute;
-  program.wave_size = vertex_wave64 ? 64u : 32u;
+  program.wave_size = vertex_wave64 || cooperative_compute ? 64u : 32u;
   program.srt_plan_complete = true;
   program.resource_tracking_complete = true;
   program.shader_info_complete = !vertex;
@@ -36998,6 +36999,9 @@ void CheckIndirectImageKeySwitch(
   auto *block = program.block_storage.back().get();
   program.blocks.push_back(block);
   program.block_info.push_back({.id = 0});
+  if (cooperative_compute)
+    program.block_info[0].terminator.kind =
+        ShaderRecompiler::CFG::TerminatorKind::Return;
   Block *loop_header = nullptr;
   Block *loop_body = nullptr;
   Inst *loop_color = nullptr;
@@ -37093,6 +37097,11 @@ void CheckIndirectImageKeySwitch(
     block = loop_body;
   }
   Value image_key(&key);
+  for (u32 step = 0u; step < arithmetic_chain; ++step) {
+    auto &next = block->AppendNewInst(
+        ValueOpcode::IAdd32, {image_key, Value(step + 1u)});
+    image_key = Value(&next);
+  }
   if (vertex_buffers) {
     Require(name, "vertex buffer fixture", vertex_loop,
             "the multi-buffer case must exercise the bounded vertex loop");
@@ -37260,6 +37269,8 @@ void CheckIndirectImageKeySwitch(
     auto &sample_x = block->AppendNewInst(ValueOpcode::CompositeExtractU32x4,
                                           {Value(&sample), Value(0u)});
     block->AppendNewInst(ValueOpcode::ReferenceU32, {Value(&sample_x)});
+    if (cooperative_compute)
+      block->AppendNewInst(ValueOpcode::Barrier);
   }
 
   program.descriptor_sources.resize(vertex_buffers ? 15u : 2u);
@@ -37341,10 +37352,20 @@ void CheckIndirectImageKeySwitch(
   }
   specialization.sampler_depth_compare_funcs.resize(program.info.samplers.size());
   ShaderComputeInputInfo compute{};
+  ShaderRecompiler::ComputeWorkgroupLimits cooperative_limits{};
+  if (cooperative_compute) {
+    compute.threads_num[0] = 128u;
+    compute.threads_num[1] = 1u;
+    compute.threads_num[2] = 1u;
+    compute.wave_size = 64u;
+    compute.host_subgroup_size = 32u;
+    cooperative_limits.native_subgroup_size = 32u;
+  }
   ShaderStageInputInfo input_info{};
   if (vertex) input_info.vertex = &vertex_info;
   else input_info.compute = &compute;
-  auto spirv = ShaderRecompiler::Spirv::EmitProgram(program, input_info);
+  auto spirv = ShaderRecompiler::Spirv::EmitProgram(
+      program, input_info, cooperative_limits);
   ValidateSpirv(name, spirv);
   if (mixed_numeric) {
     // The dynamic switch samples both the Float root and an integer candidate.
@@ -37405,9 +37426,11 @@ void CheckIndirectImageKeySwitch(
   std::string text;
   Require(name, "SPIR-V disassembly", tools.Disassemble(spirv, &text),
           "failed to disassemble indirect image shader");
+  if (load_count != nullptr)
+    *load_count = CountText(text, "OpLoad ");
   if (wide) {
     Require(name, "wide indirect image switch",
-            CountText(text, "OpSwitch") == 1u &&
+            CountText(text, "OpSwitch") == (cooperative_compute ? 2u : 1u) &&
                 CountText(text, "OpImageSampleExplicitLod") == 251u &&
                 CountText(text, "OpSampledImage ") == 251u &&
                 (!vertex_loop || CountText(text, "OpLoopMerge") == 1u),
@@ -46350,6 +46373,29 @@ if (argc == 1) {
   if (argc == 2 && std::strcmp(argv[1], "--wide-indirect-image-spirv-only") == 0) {
     CheckIndirectImageKeySwitch(Prospero::TextureNumericClass::Float,
                                 "WideIndirectImageKeySwitch", true);
+    return 0;
+  }
+  if (argc == 2 &&
+      std::strcmp(argv[1], "--cooperative-wide-indirect-image-size-only") == 0) {
+    size_t baseline_loads = 0u;
+    size_t chained_loads = 0u;
+    CheckIndirectImageKeySwitch(Prospero::TextureNumericClass::Float,
+                                "CooperativeWideImageBaseline", true, false,
+                                nullptr, false, false, false, false, false,
+                                false, false, false, false, true, 0u,
+                                &baseline_loads);
+    CheckIndirectImageKeySwitch(Prospero::TextureNumericClass::Float,
+                                "CooperativeWideImageChain", true, false,
+                                nullptr, false, false, false, false, false,
+                                false, false, false, false, true, 64u,
+                                &chained_loads);
+    std::fprintf(stderr, "cooperative indirect image loads: baseline=%zu chain=%zu\n",
+                 baseline_loads, chained_loads);
+    Require("CooperativeWideImageChain", "same-region arithmetic loads",
+            chained_loads <= baseline_loads + 8u,
+            "a 64-operation same-region arithmetic chain reloaded its intermediates: " +
+                std::to_string(baseline_loads) + " -> " +
+                std::to_string(chained_loads));
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--wide-indirect-image-vertex-spirv-only") == 0) {

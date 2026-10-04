@@ -540,6 +540,9 @@ struct ValueEmitContext {
 	const std::unordered_map<const IR::Inst*, uint32_t>* cooperative_phases = nullptr;
 	uint32_t cooperative_phase = 0;
 	uint32_t cooperative_collective_active = 0;
+	uint32_t cooperative_guard_region = 0;
+	uint32_t cooperative_guard_serial = 0;
+	std::unordered_map<const IR::Inst*, uint32_t> cooperative_definition_regions;
 	const IR::Block* current_block = nullptr;
 	const IR::Inst* memory_override_inst = nullptr;
 	const IR::MemoryInfo* memory_override = nullptr;

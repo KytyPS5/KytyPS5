@@ -1,5 +1,25 @@
 # Emulator regression test debt
 
+## Formatted access byte bounds with host backing offsets (2026-10-04; native RED/GREEN)
+
+New shared-table formatted numerical fixture passes plain readback but GPUAV
+reports a CAS DWORD beyond candidate514's 4256-byte descriptor range, lane2.
+The existing formatted bound compares unrebased address against a rebased host
+limit; raw DWORD/byte paths instead include the offset in element indexing.
+The minimized unchanged three-candidate fixture with sharing disabled only in
+its test host profile reproduces GPUAV OOB at bound160/access163 and175 on
+lanes2/3 (`formatted-bounds-baseline-red-20261004.log.stderr`, native test SHA
+`293433c302241085396d81faef4861985b4dc3fcffa9762d6d2cd6ff0e46fa15`).
+This proves the old specialized path's defect independently of nonuniform access.
+The common helper now checks the actual DWORD pointer's host-base adjustment
+and both additions for overflow. Fractional host-offset reconstruction is not
+implemented by this change; retain the older unaligned-access debt below.
+Same fixture GPUAV GREEN, whole-backing oracle unchanged:
+`shared-buffer-final-gpuav-SpecializedBoundedBufferFormattedByteAccess-20261004.log`,
+SHA `03310d19ef4a18ef952c55414f04a99628251f6ea2040176190fb41cfbdc6811`.
+Independent emitted-SSA bounds oracle covers first/last byte, widths1/2/4,
+zero bounds, base-add overflow and end-add overflow in the focused CFG test.
+
 ## Dense buffer capacity supplied by the host (2026-10-04; native CPU/GPU proved, game path pending)
 
 Diagnostic native4481+trace run163905 naturally exits321 at16:45:20.549UTC,
@@ -493,7 +513,52 @@ The two 1280x720 retries reached only shown377 and shown205 respectively,
 both stopped during long CS8457 pipeline creation before d0c was encountered;
 runtime d0c completion and a menu are **not** proved.
 
-## Large bounded buffer-table lowering and native compiler time (2026-10-04; pending)
+## Large bounded buffer-table lowering and native compiler time (2026-10-04; synthetic proved, runtime pending)
+
+Native synthetic RED on parent `cc264198`, with only test/profile scaffolding:
+`shader_cfg_tests.exe --bounded-buffer-shared-access-only` emits a valid
+64-candidate raw volatile byte load/store module, then fails the independent
+one-CAS-body invariant. Log `_Build/logs/shared-buffer-cpu-red2-20261004.log.stderr`,
+test SHA `87f5f5bfafc69f047527a5a1d8d4a5100ff75ef0ecaa7d78cb9a3c6361da0f30`.
+The earlier scaffold topology error is not RED evidence. Candidates have
+different legal strides; unknown logical-device profile must retain the
+specialized path.
+
+Shared correction: on a known logical device with enabled
+`shaderStorageBufferArrayNonUniformIndexing`, select native index, packed stride,
+host offset/limit and compatibility using scalar SSA, then emit the compatible
+access body once. Formatted candidates with different formats/swizzles or
+zero-stride defaults retain specialized accesses. Raw zero-stride OOB uses
+the proved zero bound. Every final load/store/CAS pointer carries NonUniform;
+unknown/disabled feature keeps the previous path. Device creation and test
+harness enable only advertised support; capture metadata records the enabled
+feature. No table truncation, game/hash test or larger guessed descriptor cap.
+Contract: [Vulkan descriptor indexing](https://docs.vulkan.org/samples/latest/samples/extensions/descriptor_indexing/README.html).
+
+Unchanged RED invariant plus unknown-device/ADD_TID/swizzle/formatted controls
+and independent byte-bound/overflow oracle PASS on native CFG SHA
+`d97aa134b65863b98546bb3487917a5cf4bbc9fb3d8cf8342e974122d639fa27`
+(`shared-buffer-final-cpu-bounds-green-20261004.log`). Raw515 and formatted515
+numerical GPUAV tests preserve first/high/last/null selectors, different
+strides/host offsets/exact descriptor limits, volatile reads and full backing;
+raw emits one CAS, formatted emits shared plus incompatible CAS (two total).
+Logs `shared-buffer-final-gpuav-SharedBoundedBuffer{ByteAccess,FormattedByteAccess}-20261004.log`,
+native SHA `03310d19ef4a18ef952c55414f04a99628251f6ea2040176190fb41cfbdc6811`.
+Same SHA passes host-capacity515, zero-stride raw/formatted/D16 and all nine
+formatted EXEC/count/VCC guards including both wave64 halves
+(`shared-buffer-formatted-guards-gpuav-20261004.log`). Earlier tests failed
+because the fixture did not request descriptor ranges; later GPUAV exposed
+the independent formatted-bound defect above. Neither is recorded as GREEN.
+Actual shader compilation time, game/menu and other-game runtime remain pending.
+Default CFG still fails the existing literal-word serialization assertion
+(`shared-buffer-default-cfg-20261004.log.stderr`); focused storage bounds/access
+and split-wave reciprocal selectors pass. No suite-wide GREEN claim.
+Additional numerical GPUAV mixed ADD_TID515 and formatted host-offset overflow
+neighbors PASS on SHA `b2409ff1f6daa62dcba8de3dde91b49a26351d085eda839e398561a3dda68531`
+(`shared-buffer-final-gpuav-SharedBoundedBufferByteAddTidAccess-20261004.log` and
+`shared-buffer-final-gpuav-BufferFormatUint8HostOffsetOverflowStaysOutOfBounds-20261004.log`).
+GPU fixtures retain their numerical oracle on devices without the optional
+indexing feature; only the shared-body shape assertion is feature-dependent.
 
 The exact 581327-word CS8457 SPIR-V saved at
 `_Build/runs/yotei-integrated-20261004-191348-presentfix-gpuav/shaders/0024_new_shader_cs_8457901d80b91921.spv`

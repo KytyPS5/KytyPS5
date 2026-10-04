@@ -381,6 +381,160 @@ void EmitRawDirectInstruction(ValueEmitContext& ctx, const IR::Inst& inst) {
 	}
 }
 
+void EmitBoundedBufferCandidate(ValueEmitContext& ctx, const IR::Inst& inst,
+                                const IR::MemoryInfo& memory, uint32_t resource) {
+	auto specialized = memory;
+	specialized.resource = resource;
+	specialized.buffer_table = UINT32_MAX;
+	const auto* previous_inst = ctx.memory_override_inst;
+	const auto* previous_memory = ctx.memory_override;
+	ctx.memory_override_inst = &inst;
+	ctx.memory_override = &specialized;
+	ctx.definitions.erase(&inst);
+	if (IR::BufferAccessOf(inst.GetOpcode()) == IR::BufferAccess::Read &&
+	    specialized.kind == IR::ResourceKind::Buffer &&
+	    ctx.state.program.info.buffers[resource].zero_stride_oob)
+		ctx.Define(inst, EmitBufferOutOfBoundsRead(ctx, inst));
+	else
+		EmitRawDirectInstruction(ctx, inst);
+	ctx.memory_override_inst = previous_inst;
+	ctx.memory_override = previous_memory;
+}
+
+void EmitSpecializedBoundedBufferMemory(ValueEmitContext& ctx, const IR::Inst& inst,
+                                       const IR::MemoryInfo& memory,
+                                       const IR::BufferTableLayout& table, uint32_t selected) {
+	auto& state = ctx.state;
+	const bool has_result = inst.GetType() != IR::Type::Void;
+	const auto merge = state.builder.AllocateId();
+	const auto invalid = state.builder.AllocateId();
+	std::vector<uint32_t> labels;
+	std::vector<uint32_t> words {OpSwitch, selected, invalid};
+	std::vector<uint32_t> phi {OpPhi, has_result ? TypeId(state, inst.GetType()) : 0u,
+	                         has_result ? state.builder.AllocateId() : 0u};
+	for (const auto resource: table.resources) {
+		labels.push_back(state.builder.AllocateId());
+		words.insert(words.end(), {resource, labels.back()});
+	}
+	state.builder.AddFunction({OpSelectionMerge, merge, SelectionControlNone});
+	state.builder.AddFunction(words);
+	EmitLabel(state, invalid);
+	state.builder.AddFunction({OpUnreachable});
+	for (size_t i = 0; i < table.resources.size(); ++i) {
+		EmitLabel(state, labels[i]);
+		EmitBoundedBufferCandidate(ctx, inst, memory, table.resources[i]);
+		if (has_result) phi.insert(phi.end(), {ctx.definitions.at(&inst), state.current_label});
+		state.builder.AddFunction({OpBranch, merge});
+	}
+	ctx.definitions.erase(&inst);
+	EmitLabel(state, merge);
+	if (has_result) {
+		state.builder.AddFunction(phi);
+		ctx.definitions.emplace(&inst, phi[2]);
+	}
+}
+
+bool EmitSharedBoundedBufferMemory(ValueEmitContext& ctx, const IR::Inst& inst,
+                                   const IR::MemoryInfo& memory,
+                                   const IR::BufferTableLayout& table, uint32_t selected) {
+	auto& state = ctx.state;
+	const auto access = IR::BufferAccessOf(inst.GetOpcode());
+	if (!state.storage_buffer_nonuniform_indexing || table.resources.size() < 2u ||
+	    memory.kind != IR::ResourceKind::Buffer ||
+	    (access != IR::BufferAccess::Read && access != IR::BufferAccess::Write)) return false;
+	const auto representative = std::ranges::find_if(table.resources, [&](uint32_t resource) {
+		return !state.program.info.buffers[resource].zero_stride_oob;
+	});
+	if (representative == table.resources.end()) return false;
+	const auto& first = state.program.info.buffers[*representative];
+	const auto compatible = [&](uint32_t resource) {
+		const auto& candidate = state.program.info.buffers[resource];
+		// Raw accesses use dynamic stride/bounds; formatted accesses also need
+		// identical component conversion, swizzle and OOB default semantics.
+		return !memory.formatted ||
+		       (!candidate.zero_stride_oob &&
+		        candidate.descriptor_format == first.descriptor_format &&
+		        candidate.descriptor_swizzle == first.descriptor_swizzle);
+	};
+	if (std::ranges::count_if(table.resources, compatible) < 2) return false;
+	IR::BufferTableLayout fallback;
+	for (const auto resource: table.resources)
+		if (!compatible(resource)) fallback.resources.push_back(resource);
+	state.builder.RequireExtension("SPV_EXT_descriptor_indexing");
+	state.builder.RequireCapability(spv::CapabilityShaderNonUniformEXT);
+	state.builder.RequireCapability(spv::CapabilityStorageBufferArrayNonUniformIndexingEXT);
+	const auto merge = state.builder.AllocateId();
+	const auto invalid = state.builder.AllocateId();
+	std::vector<uint32_t> labels;
+	std::vector<uint32_t> words {OpSwitch, selected, invalid};
+	std::array<std::vector<uint32_t>, 5> phis;
+	for (size_t i = 0; i < phis.size(); ++i)
+		phis[i] = {OpPhi, i == 4u ? TypeBool(state) : TypeU32(state), state.builder.AllocateId()};
+	for (const auto resource: table.resources) {
+		labels.push_back(state.builder.AllocateId());
+		words.insert(words.end(), {resource, labels.back()});
+	}
+	state.builder.AddFunction({OpSelectionMerge, merge, SelectionControlNone});
+	state.builder.AddFunction(words);
+	EmitLabel(state, invalid);
+	state.builder.AddFunction({OpUnreachable});
+	for (size_t i = 0; i < table.resources.size(); ++i) {
+		EmitLabel(state, labels[i]);
+		const auto resource = table.resources[i];
+		const auto native = ResourceForDescriptor(state, IR::DescriptorBindingKind::Buffers, resource);
+		const std::array values {ConstantU32(state, native),
+		                        ConstantU32(state, state.program.info.buffers[resource].packed_stride),
+		                        state.memory_byte_offsets[native],
+		                        state.program.info.buffers[resource].zero_stride_oob
+		                            ? ConstantU32(state, 0u) : state.memory_byte_limits[native],
+		                        ConstantBool(state, compatible(resource))};
+		for (size_t field = 0; field < phis.size(); ++field)
+			phis[field].insert(phis[field].end(), {values[field], labels[i]});
+		state.builder.AddFunction({OpBranch, merge});
+	}
+	EmitLabel(state, merge);
+	for (const auto& phi: phis) state.builder.AddFunction(phi);
+	const auto finish = state.builder.AllocateId();
+	const auto fallback_label = state.builder.AllocateId();
+	const bool has_result = inst.GetType() != IR::Type::Void;
+	std::vector<uint32_t> result_phi {OpPhi, has_result ? TypeId(state, inst.GetType()) : 0u,
+	                                has_result ? state.builder.AllocateId() : 0u};
+	if (!fallback.resources.empty()) {
+		const auto shared = state.builder.AllocateId();
+		state.builder.AddFunction({OpSelectionMerge, finish, SelectionControlNone});
+		state.builder.AddFunction({OpBranchConditional, phis[4][2], shared, fallback_label});
+		EmitLabel(state, shared);
+	}
+	state.dynamic_buffer_index = phis[0][2];
+	state.dynamic_buffer_stride = phis[1][2];
+	state.dynamic_buffer_offset = phis[2][2];
+	state.dynamic_buffer_limit = phis[3][2];
+	state.dynamic_buffer_add_tid = std::ranges::any_of(table.resources, [&](uint32_t resource) {
+		return (state.program.info.buffers[resource].packed_stride & (1u << 20u)) != 0u;
+	});
+	EmitBoundedBufferCandidate(ctx, inst, memory, *representative);
+	state.dynamic_buffer_index = state.dynamic_buffer_stride = 0;
+	state.dynamic_buffer_offset = state.dynamic_buffer_limit = 0;
+	state.dynamic_buffer_add_tid = false;
+	if (!fallback.resources.empty()) {
+		if (has_result) result_phi.insert(result_phi.end(),
+		                                {ctx.definitions.at(&inst), state.current_label});
+		state.builder.AddFunction({OpBranch, finish});
+		EmitLabel(state, fallback_label);
+		EmitSpecializedBoundedBufferMemory(ctx, inst, memory, fallback, selected);
+		if (has_result) result_phi.insert(result_phi.end(),
+		                                {ctx.definitions.at(&inst), state.current_label});
+		state.builder.AddFunction({OpBranch, finish});
+		ctx.definitions.erase(&inst);
+		EmitLabel(state, finish);
+		if (has_result) {
+			state.builder.AddFunction(result_phi);
+			ctx.definitions.emplace(&inst, result_phi[2]);
+		}
+	}
+	return true;
+}
+
 // A bounded descriptor is a runtime choice among fully specialized native
 // buffers. Emit each access against its own descriptor metadata so formats,
 // strides, bounds, and byte offsets remain tied to the selected resource.
@@ -406,56 +560,14 @@ bool EmitBoundedBufferMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	}
 	const auto selected = EmitBoundedFlatWord(state, ctx.Arg(*handle, 0), table.count,
 	                                          table.mapping_flat_offset);
-	const auto merge_label = state.builder.AllocateId();
-	const auto invalid_label = state.builder.AllocateId();
-	const auto result = has_result ? ctx.Result(inst) : 0u;
-	std::vector<uint32_t> labels;
-	std::vector<uint32_t> switch_words {OpSwitch, selected, invalid_label};
 	for (const auto resource: table.resources) {
 		if (resource >= state.program.info.buffers.size() ||
 		    std::count(table.resources.begin(), table.resources.end(), resource) != 1) {
 			ctx.Fail(inst, "bounded buffer table contains an invalid candidate");
 		}
-		labels.push_back(state.builder.AllocateId());
-		switch_words.push_back(resource);
-		switch_words.push_back(labels.back());
 	}
-	state.builder.AddFunction({OpSelectionMerge, merge_label, SelectionControlNone});
-	state.builder.AddFunction(switch_words);
-	EmitLabel(state, invalid_label);
-	state.builder.AddFunction({OpUnreachable});
-	std::vector<uint32_t> phi {OpPhi, has_result ? TypeId(state, inst.GetType()) : 0u, result};
-	const auto* previous_inst = ctx.memory_override_inst;
-	const auto* previous_memory = ctx.memory_override;
-	for (size_t candidate = 0; candidate < table.resources.size(); ++candidate) {
-		EmitLabel(state, labels[candidate]);
-		auto specialized = memory;
-		specialized.resource = table.resources[candidate];
-		specialized.buffer_table = UINT32_MAX;
-		ctx.memory_override_inst = &inst;
-		ctx.memory_override = &specialized;
-		ctx.definitions.erase(&inst);
-		if (IR::BufferAccessOf(inst.GetOpcode()) == IR::BufferAccess::Read &&
-		    specialized.kind == IR::ResourceKind::Buffer &&
-		    state.program.info.buffers[specialized.resource].zero_stride_oob) {
-			ctx.Define(inst, EmitBufferOutOfBoundsRead(ctx, inst));
-		} else {
-			EmitRawDirectInstruction(ctx, inst);
-		}
-		if (has_result) {
-			phi.push_back(ctx.definitions.at(&inst));
-			phi.push_back(state.current_label);
-		}
-		state.builder.AddFunction({OpBranch, merge_label});
-	}
-	ctx.memory_override_inst = previous_inst;
-	ctx.memory_override = previous_memory;
-	ctx.definitions.erase(&inst);
-	EmitLabel(state, merge_label);
-	if (has_result) {
-		state.builder.AddFunction(phi);
-		ctx.definitions.emplace(&inst, result);
-	}
+	if (EmitSharedBoundedBufferMemory(ctx, inst, memory, table, selected)) return true;
+	EmitSpecializedBoundedBufferMemory(ctx, inst, memory, table, selected);
 	return true;
 }
 

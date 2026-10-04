@@ -93,6 +93,27 @@ uint32_t BufferLane(EmitterState& state) {
 
 uint32_t BufferByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
 	auto&      state  = ctx.state;
+	if (state.dynamic_buffer_stride != 0) {
+		const auto packed = state.dynamic_buffer_stride;
+		const auto stride = EmitAndConstant(state, packed, 0x3fffu);
+		auto index = ctx.Arg(inst, 1);
+		if (state.dynamic_buffer_add_tid) {
+			const auto add_tid = EmitCompareU32Constant(
+			    state, spv::OpINotEqual, EmitAndConstant(state, packed, 1u << 20u), 0u);
+			index = Binary(state, spv::OpIAdd, TypeU32(state), index,
+			               Select(state, TypeU32(state), add_tid, BufferLane(state),
+			                      ConstantU32(state, 0u)));
+		}
+		const auto swizzle = AndCondition(
+		    state, EmitCompareU32Constant(state, spv::OpINotEqual, stride, 0u),
+		    EmitCompareU32Constant(state, spv::OpINotEqual,
+		                           EmitAndConstant(state, packed, 1u << 14u), 0u));
+		const auto index_stride = EmitAndConstant(
+		    state, Binary(state, spv::OpShiftRightLogical, TypeU32(state), packed,
+		                  ConstantU32(state, 16u)), 3u);
+		return CalculateBufferAddress(state, index, ctx.Arg(inst, 2), ctx.Arg(inst, 3),
+		                              mem.offset, stride, swizzle, index_stride).byte;
+	}
 	const auto packed = StorageBufferPackedStride(state, mem);
 	const auto stride = packed & 0x3fffu;
 	auto       index  = ctx.Arg(inst, 1);

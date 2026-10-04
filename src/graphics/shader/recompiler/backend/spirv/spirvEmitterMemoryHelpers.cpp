@@ -133,11 +133,15 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 	MemoryResourceAccess access {
 	    .kind = mem.kind,
 	    .memory_access = mem.coherent ? spv::MemoryAccessVolatileMask : spv::MemoryAccessMaskNone};
+	access.nonuniform = state.dynamic_buffer_index != 0;
 	access.object_pointer = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpAccessChain, pointer_type, access.object_pointer, variable,
-	                          ConstantU32(state, array_index));
-	access.byte_offset = state.memory_byte_offsets[array_index];
-	access.byte_limit  = state.memory_byte_limits[array_index];
+	                          access.nonuniform ? state.dynamic_buffer_index
+	                                            : ConstantU32(state, array_index));
+	access.byte_offset = access.nonuniform ? state.dynamic_buffer_offset
+	                                      : state.memory_byte_offsets[array_index];
+	access.byte_limit = access.nonuniform ? state.dynamic_buffer_limit
+	                                    : state.memory_byte_limits[array_index];
 	// Use the exact renderer-published byte bound; avoid driver-sensitive
 	// OpArrayLength on an array of storage-buffer descriptors.
 	access.length = EmitStorageBufferElementCount(state, access.byte_limit, element_shift);
@@ -205,15 +209,27 @@ uint32_t EmitMemoryElementInBounds(EmitterState& state, const MemoryResourceAcce
 
 uint32_t EmitMemoryByteRangeInBounds(EmitterState& state, const MemoryResourceAccess& access,
                                      uint32_t address, uint32_t byte_count) {
-	const auto end = EmitAddU32(state, address, ConstantU32(state, byte_count));
+	// Match the actual DWORD pointer's base adjustment. Subword extraction uses
+	// address's low bits; the native pointer adds byte_offset >> 2. Fractional
+	// host-offset reconstruction is a separate, still unsupported mechanism.
+	const auto base = EmitBinaryU32(state, OpBitwiseAnd, access.byte_offset,
+	                               ConstantU32(state, ~3u));
+	const auto start = EmitAddU32(state, address, base);
+	const auto base_no_overflow = state.builder.AllocateId();
+	state.builder.AddFunction({OpUGreaterThanEqual, TypeBool(state), base_no_overflow,
+	                           start, address});
+	const auto end = EmitAddU32(state, start, ConstantU32(state, byte_count));
 	const auto no_overflow = state.builder.AllocateId();
-	state.builder.AddFunction({OpUGreaterThanEqual, TypeBool(state), no_overflow, end, address});
+	state.builder.AddFunction({OpUGreaterThanEqual, TypeBool(state), no_overflow, end, start});
 	const auto within_limit = state.builder.AllocateId();
 	state.builder.AddFunction({OpULessThanEqual, TypeBool(state), within_limit, end,
 	                           access.byte_limit});
+	const auto valid_start = state.builder.AllocateId();
+	state.builder.AddFunction({OpLogicalAnd, TypeBool(state), valid_start,
+	                           base_no_overflow, no_overflow});
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction(
-	    {OpLogicalAnd, TypeBool(state), result, no_overflow, within_limit});
+	    {OpLogicalAnd, TypeBool(state), result, valid_start, within_limit});
 	return result;
 }
 
@@ -240,6 +256,10 @@ uint32_t EmitStorageBufferElementPointer(EmitterState& state,
 	const auto pointer = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpAccessChain, pointer_type, pointer, access.object_pointer,
 	                          ConstantU32(state, 0), index);
+	if (access.nonuniform) {
+		// Vulkan requires NonUniform on the final load/store/atomic pointer.
+		state.builder.AddAnnotation(spv::OpDecorate, pointer, spv::DecorationNonUniformEXT);
+	}
 	return pointer;
 }
 

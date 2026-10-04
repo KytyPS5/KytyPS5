@@ -1,5 +1,26 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **4 октября 2026 года, 20:53 UTC** (native synthetic tests via WSL;
+source based on `cc264198`, shared bounded-buffer lowering; game retry pending):
+
+- Native 64-candidate byte load/store RED emitted valid SPIR-V and failed the
+  one-CAS invariant. Unchanged invariant now passes, together with known/unknown
+  device feature gates, mixed stride/swizzle/ADD_TID and formatted fallback
+  controls. Shared lowering selects descriptor/metadata before one compatible
+  body; incompatible formatted candidates retain their own access semantics.
+- Numerical GPUAV raw515 and formatted515 cases pass with complete backing
+  checks, first/high/last/null choices, volatile loads, differing offsets/limits
+  and byte stores. GPUAV also exposed an older formatted-bounds defect; a
+  three-candidate fixture on the specialized path reproduced RED, and the same
+  fixture passes after checked backing-base/end arithmetic. Fractional host
+  offset reconstruction remains separate unproved debt. See
+  `docs/emulator-test-debt.md` for exact commands, hashes and logs.
+- Neighboring host-capacity515, zero-stride raw/formatted/D16 and nine formatted
+  EXEC/count/VCC cases, including wave64, pass GPUAV. Focused CPU bounds/access
+  and reciprocal tests pass; default CFG retains the older literal-word failure.
+  Native emulator build/install, actual heavy-shader compiler time and bounded
+  1280x720 retry are next. **Menu/gameplay PENDING.**
+
 Checkpoint **4 октября 2026 года, 20:00 UTC** (native Windows Release executable;
 source `e8294809`, installed SHA-256
 `503303e14a8293180af9579e17856f67d5cea69a0e36f7a442b6bcc6a2ebee19`):

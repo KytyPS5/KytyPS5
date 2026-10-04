@@ -388,6 +388,8 @@ std::vector<uint32_t> EmitProgram(const IR::Program& program, ShaderStageInputIn
 	}
 	EmitterState state(program, input_info, specialization);
 	state.f64_certificate = f64;
+	state.storage_buffer_nonuniform_indexing =
+	    host_profile.known && host_profile.storage_buffer_nonuniform_indexing;
 	state.stage = program.stage;
 	state.wave_size = program.wave_size;
 	state.native_subgroup_size = compute_workgroup_limits.native_subgroup_size;

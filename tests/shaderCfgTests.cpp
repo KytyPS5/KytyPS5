@@ -12384,6 +12384,130 @@ void TestF64CertificateReciprocalNonzeroProof() {
   }
 }
 
+void TestFormattedBackingByteBounds() {
+  using namespace ShaderRecompiler;
+  using namespace Spirv::Emitter;
+  struct Case { uint32_t address, offset, limit, bytes; };
+  const Case cases[] = {
+      {0u, 128u, 136u, 1u}, {7u, 128u, 136u, 1u},
+      {8u, 128u, 136u, 1u}, {6u, 128u, 136u, 2u},
+      {7u, 128u, 136u, 2u}, {4u, 128u, 136u, 4u},
+      {5u, 128u, 136u, 4u}, {25u, 136u, 160u, 1u},
+      {UINT32_MAX-3u, 128u, 256u, 1u},
+      {UINT32_MAX-1u, 0u, UINT32_MAX, 2u},
+      {0u, 0u, 0u, 1u}};
+  for (const auto c : cases) {
+    IR::Program program;
+    IR::ResourceSpecialization specialization;
+    EmitterState state(program, {}, specialization);
+    MemoryResourceAccess access{.byte_offset = ConstantU32(state, c.offset),
+                                .byte_limit = ConstantU32(state, c.limit)};
+    const auto result = EmitMemoryByteRangeInBounds(
+        state, access, ConstantU32(state, c.address), c.bytes);
+    const auto binary = state.builder.Build();
+    // Evaluate the emitted unsigned SSA check independently of its topology.
+    // The oracle uses unbounded host arithmetic and the actual DWORD base.
+    std::unordered_map<uint32_t, uint32_t> values;
+    for (size_t i = 5; i < binary.size(); i += binary[i] >> 16u) {
+      const auto opcode = binary[i] & 0xffffu;
+      if (opcode == 43u) values[binary[i+2u]] = binary[i+3u];
+      else if (opcode == 41u || opcode == 42u) values[binary[i+2u]] = opcode == 41u;
+      else if (opcode == 128u || opcode == 199u || opcode == 174u ||
+               opcode == 178u || opcode == 167u) {
+        const auto lhs = values.at(binary[i+3u]), rhs = values.at(binary[i+4u]);
+        values[binary[i+2u]] = opcode == 128u ? lhs+rhs : opcode == 199u ? lhs&rhs
+            : opcode == 174u ? lhs>=rhs : opcode == 178u ? lhs<=rhs : lhs && rhs;
+      }
+    }
+    const uint64_t end = uint64_t{c.address} + (uint64_t{c.offset}/4u)*4u + c.bytes;
+    Check(values.at(result) == (end <= c.limit),
+          "formatted byte bound disagrees with the native backing range");
+  }
+}
+
+void TestBoundedBufferSharedAccessSpirv() {
+  using namespace ShaderRecompiler;
+  using O = IR::ValueOpcode;
+  using V = IR::Value;
+  constexpr uint32_t candidates = 64u;
+  F64CertificateFixture f;
+  f.program.block_info[0].terminator.kind = CFG::TerminatorKind::Return;
+  const auto selector = f.UnknownU32();
+  const auto lane = f.Emit(O::LaneId);
+  const auto handle = f.Emit(O::GetBufferResource, {selector, V(0u), V(256u), V(0u)});
+  f.program.memory_info.push_back({.kind = IR::ResourceKind::Buffer, .resource = 0u,
+                                 .buffer_table = 0u, .data_bits = 8u, .coherent = true});
+  auto& load = f.block->AppendNewInst(O::LoadBufferU8,
+      {handle, lane, V(1u), V(0u), V(true)});
+  load.SetFlags(IR::MemoryFlags{.index = 0u});
+  auto& store = f.block->AppendNewInst(O::StoreBufferU8,
+      {handle, lane, V(1u), V(0u), V(&load), V(true)});
+  store.SetFlags(IR::MemoryFlags{.index = 0u});
+  f.program.info.buffers.resize(candidates);
+  IR::BufferTableLayout table{.count = candidates, .mapping_flat_offset = 0u};
+  IR::DescriptorBinding buffers{.kind = IR::DescriptorBindingKind::Buffers};
+  for (uint32_t id = 0; id < candidates; ++id) {
+    f.program.info.buffers[id].packed_stride = 4u * (id + 1u);
+    f.program.info.buffers[id].read = f.program.info.buffers[id].written = true;
+    table.resources.push_back(id);
+    buffers.resources.push_back(id);
+  }
+  f.program.info.buffer_tables.push_back(table);
+  f.program.bindings.descriptors = {buffers,
+      {.kind = IR::DescriptorBindingKind::FlattenedSrt},
+      {.kind = IR::DescriptorBindingKind::ShaderData}};
+  f.program.bindings.user_data_registers = {0u};
+  f.program.bindings.memory_offset_count = candidates;
+  f.program.bindings.memory_offset_dword = 1u;
+  f.program.bindings.memory_limit_dword = 1u + candidates / 4u;
+  f.program.srt_plan_complete = f.program.resource_tracking_complete = true;
+  f.program.shader_info_complete = f.program.binding_layout_complete = true;
+  ShaderComputeInputInfo compute{};
+  compute.threads_num[0] = 32u;
+  compute.threads_num[1] = compute.threads_num[2] = 1u;
+  compute.wave_size = 32u;
+  ShaderStageInputInfo input{};
+  input.compute = &compute;
+  auto host = f.host;
+  host.storage_buffer_nonuniform_indexing = true;
+  const auto binary = Spirv::EmitProgram(f.program, input, {}, host);
+  CheckSpirvBinaryValidates(binary);
+  Check(SpirvInstructionOpcodeCount(binary, 230u) == 1u,
+        "bounded raw byte store replicates its complete CAS body per candidate");
+  const auto fallback = Spirv::EmitProgram(f.program, input);
+  CheckSpirvBinaryValidates(fallback);
+  Check(SpirvInstructionOpcodeCount(fallback, 230u) == candidates,
+        "unknown device lost the specialized bounded-buffer fallback");
+  auto unknown = host;
+  unknown.known = false;
+  const auto unknown_binary = Spirv::EmitProgram(f.program, input, {}, unknown);
+  CheckSpirvBinaryValidates(unknown_binary);
+  Check(SpirvInstructionOpcodeCount(unknown_binary, 230u) == candidates,
+        "an unverified feature bit enabled nonuniform buffer access");
+  // ADD_TID and swizzle have runtime metadata, but still require the declared
+  // lane builtin; the raw byte path must retain one body for mixed strides.
+  f.program.info.buffers[7].packed_stride |= (1u << 20u) | (1u << 14u) | (2u << 16u);
+  const auto mixed = Spirv::EmitProgram(f.program, input, {}, host);
+  CheckSpirvBinaryValidates(mixed);
+  Check(SpirvInstructionOpcodeCount(mixed, 230u) == 1u,
+        "mixed raw address metadata replicated the shared CAS body");
+  // Different formatted candidates retain their own defaults and conversion;
+  // an OOB candidate cannot force valid candidates back to duplicated bodies.
+  load.ReplaceOpcode(O::LoadBufferU32);
+  store.ReplaceOpcode(O::StoreBufferU32);
+  store.SetArg(4, V(&load));
+  f.program.memory_info[0].formatted = true;
+  f.program.memory_info[0].data_bits = 32u;
+  for (auto& buffer : f.program.info.buffers)
+    buffer.descriptor_format = Prospero::BufferFormat::k8UInt;
+  f.program.info.buffers.back().zero_stride_oob = true;
+  f.program.info.buffers[5].descriptor_format = Prospero::BufferFormat::k8SInt;
+  const auto formatted = Spirv::EmitProgram(f.program, input, {}, host);
+  CheckSpirvBinaryValidates(formatted);
+  Check(SpirvInstructionOpcodeCount(formatted, 230u) == 2u,
+        "formatted fallback lost the compatible group or incompatible candidate");
+}
+
 void TestSplitWave64IntegerReciprocalSeedSpirv() {
   using namespace ShaderRecompiler;
   using O = IR::ValueOpcode;
@@ -19160,6 +19284,11 @@ int main(int argc, char* argv[]) {
     std::puts("KYTY_F64_CERTIFICATE_PASS");
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--bounded-buffer-shared-access-only") == 0) {
+    Libs::Graphics::TestFormattedBackingByteBounds();
+    Libs::Graphics::TestBoundedBufferSharedAccessSpirv();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--split-wave64-reciprocal-seed-only") == 0) {
     Libs::Graphics::TestSplitWave64IntegerReciprocalSeedSpirv();
     std::puts("KYTY_SPLIT_WAVE64_RECIPROCAL_SEED_PASS");
@@ -19380,6 +19509,8 @@ int main(int argc, char* argv[]) {
   TestF64CertificateModeAndHostBoundaries();
   TestF64CertificateReciprocalNonzeroProof();
   TestSplitWave64IntegerReciprocalSeedSpirv();
+  Libs::Graphics::TestBoundedBufferSharedAccessSpirv();
+  Libs::Graphics::TestFormattedBackingByteBounds();
   TestF64CertificatePhiPredecessorProvenance();
   TestUnusedNativeF64EmissionHasCompleteRequirements();
   TestComputeExecutionGdsAppendAdmission();

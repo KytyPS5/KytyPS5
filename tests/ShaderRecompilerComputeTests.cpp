@@ -1275,6 +1275,8 @@ struct TestCase {
   bool compile_only = false;
   size_t storage_buffer_range_dwords = 0;
   bool use_descriptor_buffer_ranges = false;
+  bool force_specialized_buffer_access = false;
+  bool check_shared_buffer_access = false;
   std::vector<u32> storage_buffer_offsets;
   std::vector<BdaMapping> bda_mappings;
   bool expand_shader_data_storage = false;
@@ -1591,6 +1593,8 @@ CompiledShader CompileCase(const TestCase &test,
   compute_info.host_subgroup_size = workgroup_limits.can_require_subgroup_size_64 ? 64u : workgroup_limits.native_subgroup_size;
   options.compute_workgroup_limits = workgroup_limits;
   options.host_profile = host_profile;
+  if (test.force_specialized_buffer_access)
+    options.host_profile.storage_buffer_nonuniform_indexing = false;
   options.input_info.compute = &compute_info;
   options.user_data = user_data;
 
@@ -1757,7 +1761,15 @@ CompiledShader CompileCase(const TestCase &test,
       }
     }
   }
-  CheckSpirvText(test, result.spirv);
+  if (test.check_shared_buffer_access &&
+      !(options.host_profile.known && options.host_profile.storage_buffer_nonuniform_indexing)) {
+    auto fallback_expectations = test;
+    std::erase(fallback_expectations.required_spirv, "StorageBufferArrayNonUniformIndexing");
+    fallback_expectations.spirv_counts.clear();
+    CheckSpirvText(fallback_expectations, result.spirv);
+  } else {
+    CheckSpirvText(test, result.spirv);
+  }
   const auto *buffer_binding = ShaderRecompiler::IR::FindBinding(
       result.program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::Buffers);
   if (test.expected_buffer_binding_resources) {
@@ -20181,6 +20193,8 @@ private:
     device_features12.timelineSemaphore = true;
     device_features12.bufferDeviceAddress = true;
     device_features12.shaderOutputLayer = true;
+    device_features12.shaderStorageBufferArrayNonUniformIndexing =
+        available_features12.shaderStorageBufferArrayNonUniformIndexing;
     vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR barycentric{};
     barycentric.sType = vk::StructureType::ePhysicalDeviceFragmentShaderBarycentricFeaturesKHR;
     barycentric.pNext = &device_features12;
@@ -20270,7 +20284,8 @@ private:
               "vkCreateDevice");
     VULKAN_HPP_DEFAULT_DISPATCHER.init(m_device);
     m_shader_host_profile = QueryShaderHostProfile(m_physical_device,
-        device_features.shaderFloat64 == VK_TRUE, enabled_fma.shaderFmaFloat64 == VK_TRUE);
+        device_features.shaderFloat64 == VK_TRUE, enabled_fma.shaderFmaFloat64 == VK_TRUE,
+        device_features12.shaderStorageBufferArrayNonUniformIndexing == VK_TRUE);
     m_device.getQueue(m_queue_family, 0, &m_queue);
 
     vk::CommandPoolCreateInfo pool_info{};
@@ -31484,6 +31499,93 @@ TestCase FiniteScalarBufferHostCapacity() {
   return test;
 }
 
+// Shared raw access: varying strides, offsets/limits, volatile byte reads,
+// first/high/last/null choices, masked byte writes and full-backing oracle.
+TestCase SharedBoundedBufferByteAccess(bool formatted = false, u32 rows = 515u,
+                                     bool add_tid = false) {
+  using O = ShaderOpcode;
+  constexpr u32 table_base = 16384u;
+  TestCase test;
+  test.name = formatted ? "SharedBoundedBufferFormattedByteAccess"
+                       : add_tid ? "SharedBoundedBufferByteAddTidAccess" : "SharedBoundedBufferByteAccess";
+  test.check_shared_buffer_access = true;
+  test.use_descriptor_buffer_ranges = true;
+  test.has_compute_info = test.has_user_data = true;
+  test.compute_info = {};
+  test.compute_info.threads_num[0] = 4;
+  test.compute_info.threads_num[1] = test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = 32;
+  test.buffer_addresses_are_backing_offsets = true;
+  test.bda_mappings = {{0, 0}};
+  test.user_data = MakeStructuredStorageBufferData(4, 16);
+  test.user_data[8] = table_base;
+  test.user_data[10] = rows*16u;
+  test.user_data[24] = 192u;
+  test.user_data[25] = 4u<<16u;
+  test.user_data[26] = 16u;
+  test.initial.assign(table_base/4u + rows*4u, 0xdeadbeefu);
+  // The harness represents the byte adjustment in eight bits. Distinct legal
+  // strides supply independent descriptors while keeping the shared base128.
+  for (u32 index = 32u; index < 32u + rows*4u; ++index)
+    test.initial[index] = 10000u + index;
+  for (u32 row = 0; row < rows; ++row) {
+    const u32 format = BufferFormat(row == rows-1u ? Prospero::BufferFormat::k8SInt : Prospero::BufferFormat::k8UInt);
+    const std::array descriptor{128u + (row%4u)*4u, (4u*(row+1u))<<16u, row == rows-1u ? 2u : 4u,
+        (formatted ? (format << 12u) | DstSel(4,5,6,7) : 0u) |
+            (add_tid && row == 512u ? 1u << 23u : 0u)};
+    std::copy(descriptor.begin(), descriptor.end(), test.initial.begin()+table_base/4u+row*4u);
+  }
+  const std::array<u32,4> keys{0u,rows > 512u ? 512u : rows/2u,rows-1u,rows};
+  for (u32 step = 0; step < keys.size(); ++step)
+    for (u32 lane = 0; lane < 4u; ++lane)
+      test.initial[48u+step*4u+lane] = (keys[step]<<16u)|0x1234u;
+  test.expected = test.initial;
+  auto& code = test.code;
+  for (u32 step = 0; step < keys.size(); ++step) {
+    AppendVMovLiteral(&code,7,step*4u);
+    code.push_back(EncodeVop2(0x25,7,Vgpr(0),7));
+    code.push_back(EncodeMubuf0(0x0c,0,true,false));
+    code.push_back(EncodeMubuf1(4,6,7));
+    code.push_back(EncodeSopp(0x0c,0));
+    code.push_back(EncodeVop2(0x16,4,InlineU32(16),4));
+    code.push_back(EncodeVop1(0x02,20,Vgpr(4)));
+    code.push_back(EncodeSop2(0x1e,21,20,InlineU32(4)));
+    code.push_back(EncodeSmem0(0x0a,32,4));
+    code.push_back(EncodeSmem1(0,21));
+    code.push_back(EncodeSopp(0x0c,0));
+    code.push_back(EncodeMubuf0(formatted ? 0x00 : 0x08,1,true,false) | (1u << 14u));
+    code.push_back(EncodeMubuf1(8,8,0));
+    code.push_back(EncodeMubuf0(0x1c,0,true,false));
+    code.push_back(EncodeMubuf1(8,0,7));
+    for (u32 lane = 0; lane < 4u; ++lane) {
+      const auto index = add_tid && keys[step] == 512u ? 2u*lane : lane;
+      const auto records = keys[step] == rows-1u ? 2u : 4u;
+      test.expected[step*4u+lane] = keys[step] < rows && index < records
+          ? ((10000u+32u+(keys[step]%4u)+(keys[step]+1u)*index) >> 8u) & 255u : 0u;
+    }
+    if (step == 2u) {
+      AppendVMovLiteral(&code,9,700u);
+      code.push_back(EncodeVop2(0x25,9,Vgpr(0),9));
+      code.push_back(EncodeMubuf0(formatted ? 0x04 : 0x18,1,true,false));
+      code.push_back(EncodeMubuf1(9,8,0));
+      for (u32 lane = 0; lane < 2u; ++lane) {
+        auto& word = test.expected[32u+(rows-1u)%4u+rows*lane];
+        word = (word & ~0xff00u) | (((700u+lane)&255u)<<8u);
+      }
+    }
+  }
+  AppendEnd(&code);
+  test.required_spirv = {"StorageBufferArrayNonUniformIndexing", "Volatile"};
+  test.spirv_counts = {{"OpAtomicCompareExchange", formatted ? 2u : 1u}};
+  test.opcodes = {O::V_MOV_B32,O::V_ADD_NC_U32,O::BUFFER_LOAD_DWORD,
+                  O::V_LSHRREV_B32,O::V_READFIRSTLANE_B32,O::S_LSHL_B32,
+                  O::S_BUFFER_LOAD_DWORDX4,O::S_WAITCNT,O::BUFFER_STORE_DWORD,
+                  formatted ? O::BUFFER_LOAD_FORMAT_X : O::BUFFER_LOAD_UBYTE,
+                  formatted ? O::BUFFER_STORE_FORMAT_X : O::BUFFER_STORE_BYTE,O::S_ENDPGM};
+  return test;
+}
+
 TestCase BoundedBufferScalarLoopStore(u32 count, bool sparse) {
   using O = ShaderOpcode;
   TestCase test;
@@ -40020,6 +40122,17 @@ std::vector<TestCase> MakeCases() {
   AddCase([] { return FiniteScalarBufferDescriptorExtent(true); });
   AddCase([] { return FiniteScalarBufferDescriptorExtent(false, true); });
   AddCase(FiniteScalarBufferHostCapacity);
+  AddCase([] { return SharedBoundedBufferByteAccess(); });
+  AddCase([] { return SharedBoundedBufferByteAccess(false, 515u, true); });
+  AddCase([] { return SharedBoundedBufferByteAccess(true); });
+  AddCase([] {
+    auto test = SharedBoundedBufferByteAccess(true, 3u);
+    test.name = "SpecializedBoundedBufferFormattedByteAccess";
+    test.force_specialized_buffer_access = true;
+    test.required_spirv = {"Volatile"};
+    test.spirv_counts.clear();
+    return test;
+  });
   AddCase(Wave64ImageReadLoopAccumulatesWithoutFeedback);
   AddCase(Wave64SingleWaveImageFeedbackWithBound);
   AddCase(ScalarMaskWaterfallSparseExecAndReactivation);

@@ -377,6 +377,14 @@ struct EmitterState {
 	ComputeWorkgroupLayout compute_workgroup;
 	ComputeExecutionPlan compute_execution;
 	IR::F64Certificate f64_certificate;
+	bool storage_buffer_nonuniform_indexing = false;
+	// SSA metadata selected by the bounded table's validated candidate switch.
+	// Nonzero only while emitting one shared buffer instruction.
+	uint32_t dynamic_buffer_index = 0;
+	uint32_t dynamic_buffer_stride = 0;
+	uint32_t dynamic_buffer_offset = 0;
+	uint32_t dynamic_buffer_limit = 0;
+	bool dynamic_buffer_add_tid = false;
 	uint32_t wave_scratch_variable = 0;
 	uint32_t wave_scratch_base_dwords = 0;
 	uint32_t wave_ballot_base_dwords = 0;
@@ -734,6 +742,7 @@ struct MemoryResourceAccess {
 	uint32_t              index_offset     = 0;
 	uint32_t              byte_offset      = 0;
 	bool                  add_index_offset = false;
+	bool                  nonuniform       = false;
 	spv::MemoryAccessMask memory_access    = spv::MemoryAccessMaskNone;
 };
 

@@ -250,16 +250,20 @@ uint32_t SampledComponentZero(EmitterState& state, Prospero::TextureNumericClass
 	EXIT("invalid sampled image numeric class");
 }
 
+// `decode_srgb` is false when the caller already decoded each candidate in its own arm: the
+// merged indirect result must not be decoded a second time with the root image's flag.
 uint32_t ResultVector(ValueEmitContext& ctx, uint32_t value,
                       Prospero::TextureNumericClass numeric_class, bool dref,
-                      const IR::MemoryInfo& mem, bool gather = false) {
+                      const IR::MemoryInfo& mem, bool gather = false,
+                      bool decode_srgb = true) {
 	auto value_class = numeric_class;
 	if (dref) {
 		value_class = Prospero::TextureNumericClass::Float;
 	}
 	const bool integer = value_class == Prospero::TextureNumericClass::Uint ||
 	                     value_class == Prospero::TextureNumericClass::Sint;
-	if (!integer && !dref && ctx.state.program.info.images[mem.resource].srgb_sample_decode) {
+	if (decode_srgb && !integer && !dref &&
+	    ctx.state.program.info.images[mem.resource].srgb_sample_decode) {
 		value = SrgbDecodedVector(ctx.state, value);
 	}
 	if (mem.data_bits == 16u) {
@@ -832,6 +836,18 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			state.builder.AddFunction(opcode, sample_operands);
 			return sample;
 		};
+		// A mixed indirect table may hold both narrow sRGB and linear candidates, so each
+		// candidate decodes its own sample before the OpPhi merge. The integer and depth
+		// guards mirror ResultVector: only floating-point colour samples carry the decode.
+		const auto EmitCandidateSample = [&](uint32_t resource) {
+			const auto sample = EmitSample(resource);
+			if (dref || numeric_class == Prospero::TextureNumericClass::Uint ||
+			    numeric_class == Prospero::TextureNumericClass::Sint ||
+			    !state.program.info.images[resource].srgb_sample_decode) {
+				return sample;
+			}
+			return SrgbDecodedVector(state, sample);
+		};
 		if (image.indirect_root != mem.resource) {
 			const auto sample = EmitSample(mem.resource);
 			auto       result = sample;
@@ -918,14 +934,28 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		state.builder.AddFunction(spv::OpSelectionMerge, merge_label,
 		                          spv::SelectionControlMaskNone);
 		state.builder.AddFunction(switch_words);
+		// When every candidate shares the root's decode flag the merged result is decoded
+		// once, so a uniform table keeps a single decode sequence instead of one per arm.
+		const bool uniform_decode = [&] {
+			const auto root_decode = state.program.info.images[mem.resource].srgb_sample_decode;
+			for (const auto resource : image.indirect_resources) {
+				if (state.program.info.images[resource].srgb_sample_decode != root_decode) {
+					return false;
+				}
+			}
+			return true;
+		}();
+		const auto EmitArmSample = [&](uint32_t resource) {
+			return uniform_decode ? EmitSample(resource) : EmitCandidateSample(resource);
+		};
 		std::vector<uint32_t> phi_words {spv::OpPhi, result_type, state.builder.AllocateId()};
 		EmitLabel(state, default_label);
-		phi_words.push_back(EmitSample(image.indirect_resources[0]));
+		phi_words.push_back(EmitArmSample(image.indirect_resources[0]));
 		phi_words.push_back(default_label);
 		state.builder.AddFunction(spv::OpBranch, merge_label);
 		for (uint32_t candidate = 1; candidate < image.indirect_resources.size(); candidate++) {
 			EmitLabel(state, labels[candidate - 1u]);
-			phi_words.push_back(EmitSample(image.indirect_resources[candidate]));
+			phi_words.push_back(EmitArmSample(image.indirect_resources[candidate]));
 			phi_words.push_back(labels[candidate - 1u]);
 			state.builder.AddFunction(spv::OpBranch, merge_label);
 		}
@@ -935,7 +965,7 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		if (!dref) {
 			result = UnpackImageTexel(ctx, mem, result);
 		}
-		ctx.Define(inst, ResultVector(ctx, result, numeric_class, dref, mem));
+		ctx.Define(inst, ResultVector(ctx, result, numeric_class, dref, mem, false, uniform_decode));
 		return;
 	}
 	if (image_info.access == IR::ImageAccess::Atomic) {

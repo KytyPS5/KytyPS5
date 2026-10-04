@@ -557,11 +557,13 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			}
 			const bool same_coordinates = image.dimension == image_class.dimension &&
 			                              image.cube == image_class.cube;
+			// The sRGB decode is applied per candidate (each switch arm decodes its own
+			// sample), so it is not a table-wide compatibility property: a table may mix
+			// narrow sRGB and linear candidates, which sample as the same float vector.
 			if (image.numeric_class != image_class.numeric_class ||
 			    (!same_coordinates && !(is_2d(image.dimension) && is_2d(image_class.dimension))) ||
 			    image.mip_count != image_class.mip_count ||
 			    image.conversion_format != image_class.conversion_format ||
-			    image.srgb_sample_decode != image_class.srgb_sample_decode ||
 			    image.shader_swizzle != image_class.shader_swizzle) {
 				return SpecializationFail(
 				    fmt::format("indirect image table at pc 0x{:08x} has incompatible candidates",

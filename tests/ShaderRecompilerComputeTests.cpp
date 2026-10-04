@@ -30800,6 +30800,43 @@ void CheckIndirectImageKeySwitch() {
     Require(name, "mixed sample count", samples == 3u,
             "mixed candidate switch did not retain every image");
   }
+
+  // The decode is applied per candidate inside its switch arm, but a uniform table decodes
+  // the merged result once. Cover both polarities plus the uniform case so neither a missed
+  // nor a duplicated decode can slip through.
+  program.memory_info[0].image_dimension =
+      ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+  program.memory_info[0].image_address_components = 3;
+  root.indirect_resources = {0u, 1u};
+  root.cube = false;
+  candidate.cube = false;
+  program.info.images = {root, candidate};
+  const auto decode_pow_count = [&](bool root_decode, bool candidate_decode) {
+    program.info.images[0].srgb_sample_decode = root_decode;
+    program.info.images[1].srgb_sample_decode = candidate_decode;
+    program.binding_layout_complete = false;
+    AllocateBindings(program);
+    const auto emitted =
+        ShaderRecompiler::Spirv::EmitProgram(program, {.compute = &compute});
+    ValidateSpirv(name, emitted);
+    std::string disassembly;
+    Require(name, "mixed sRGB SPIR-V disassembly",
+            tools.Disassemble(emitted, &disassembly),
+            "failed to disassemble mixed sRGB indirect image shader");
+    Require(name, "mixed sRGB sample count",
+            CountText(disassembly, "OpImageSampleExplicitLod") == 2,
+            "mixed sRGB candidates lost a sample");
+    return CountText(disassembly, "Pow");
+  };
+  // A linear root must not suppress the sRGB candidate's decode, and must not add one.
+  Require(name, "linear root, sRGB candidate", decode_pow_count(false, true) == 4,
+          "mixed sRGB/linear candidates did not decode only the sRGB sample");
+  // An sRGB root with a linear candidate must not decode the merged result a second time.
+  Require(name, "sRGB root, linear candidate", decode_pow_count(true, false) == 4,
+          "mixed sRGB/linear candidates decoded the merged result a second time");
+  // A uniform table shares one decode instead of emitting one per switch arm.
+  Require(name, "uniform sRGB candidates", decode_pow_count(true, true) == 4,
+          "uniform sRGB candidates decoded once per switch arm");
 }
 
 TestCase ImageStoreMipSelectsPpsa01340Descriptor() {
@@ -37223,6 +37260,10 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, ImageLoadDecodesNarrowSrgbTexel());
     RunCase(&vulkan, ImageLoadDecodesNarrowSrgbChromaPair());
     RunCase(&vulkan, ImageLoadKeepsLinearTexelsLinear());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--indirect-image-switch-only") == 0) {
+    CheckIndirectImageKeySwitch();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--s-memrealtime-only") == 0) {

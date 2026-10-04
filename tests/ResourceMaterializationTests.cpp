@@ -469,6 +469,72 @@ void TestMixedSamplerVariantsShareRuntimeDescriptor() {
         "sampler variants retained stale or duplicated descriptors after refresh");
 }
 
+// A narrow sRGB and a linear candidate both sample as floats with no conversion format, so the
+// only thing that differs is the shader-side decode. The decode is applied per candidate in the
+// emitter, so such a table must stay compatible instead of failing specialization.
+void TestMixedSrgbIndirectTableKeepsPerCandidateDecode() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Libs::Graphics::Prospero::BufferFormat;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = true;
+  program.resource_tracking_complete = true;
+  auto &block = AddValueBlock(program);
+  program.memory_info.push_back({.kind = ResourceKind::ScalarAddress});
+  auto &handle = block.AppendNewInst(ValueOpcode::GetAddressResource,
+                                     {Value(0x1000u), Value(0u)});
+  auto &srt = block.AppendNewInst(ValueOpcode::GetSrtResource);
+  const std::array formats{BufferFormat::k8Srgb, BufferFormat::k8UNorm};
+  for (uint32_t index = 0; index < formats.size(); ++index) {
+    auto &read = block.AppendNewInst(ValueOpcode::LoadAddressU32,
+        {Value(&handle), Value(index * 4u), Value(0u), Value(true)});
+    read.SetFlags(MemoryFlags{.index = 0});
+    program.srt_reads.push_back({Value(&read), index});
+    auto &flat = block.AppendNewInst(ValueOpcode::ReadConst,
+                                     {Value(&srt), Value(index)});
+    DescriptorSource source;
+    source.dword_count = 8;
+    source.dwords.fill(Value(0u));
+    source.dwords[0] = Value(&flat);
+    source.dwords[1] = Value(static_cast<uint32_t>(formats[index]) << 20u);
+    source.dwords[3] = Value(Libs::Graphics::DstSel(4, 5, 6, 7) |
+        (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u));
+    program.descriptor_sources.push_back(source);
+  }
+  DescriptorSource root;
+  root.dword_count = 8;
+  root.dwords.fill(Value(0u));
+  root.indirect_image.emplace(DescriptorSource::IndirectImage{}).sources = {0, 1};
+  program.descriptor_sources.push_back(root);
+  program.info.images.push_back({
+      .source = 2,
+      .resource_class = ImageResourceClass::Sampled,
+      .numeric_class = Libs::Graphics::Prospero::TextureNumericClass::Float,
+      .dimension = Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension::Dim2D});
+  auto plan = ExtractResourcePlan(program);
+  struct Reads {
+    std::array<uint32_t, 2> words{0x100u, 0x200u};
+  } reads;
+  const SrtRuntime runtime{
+      .userdata = &reads,
+      .read_specialization_memory = +[](void *data, uint64_t address,
+                                        std::span<uint32_t> words) {
+        if (words.size() != 1 || address < 0x1000u || address >= 0x1008u ||
+            (address & 3u) != 0) return false;
+        words[0] = static_cast<Reads *>(data)->words[(address - 0x1000u) / 4u];
+        return true;
+      }};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization),
+        "mixed sRGB/linear indirect image table did not materialize");
+  Check(snapshot.images.size() == 2 && specialization.images.size() == 2,
+        "mixed sRGB/linear indirect image table lost a candidate");
+  Check(specialization.images[0].srgb_sample_decode &&
+            !specialization.images[1].srgb_sample_decode,
+        "mixed sRGB/linear candidates did not keep their own decode flag");
+}
+
 } // namespace
 
 namespace Common {
@@ -494,6 +560,7 @@ int main() {
   TestFiniteImageRefreshReusesScalarReads();
   TestMixedSamplerVariantsShareRuntimeDescriptor();
   TestNarrowSrgbDescriptorRequestsShaderDecode();
+  TestMixedSrgbIndirectTableKeepsPerCandidateDecode();
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;
 }

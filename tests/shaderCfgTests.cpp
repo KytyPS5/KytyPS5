@@ -51,6 +51,7 @@
 #include <span>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -2521,6 +2522,70 @@ void TestNggVertexEntryState() {
     Check(result.program.wave_size == wave_size,
           "NGG wave size was lost during translation");
     CheckSpirvBinaryValidates(result.spirv);
+  }
+}
+
+void TestNggVertexLaunchedLaneCount() {
+  using namespace ShaderRecompiler;
+  // A synthetic ES+GS prologue consumes the hardware SGPR3 ESVertCount byte.
+  // The vertex entry must therefore derive that byte from launched lanes,
+  // including a partially populated graphics subgroup.
+  const uint32_t shader[] = {
+      EncodeSop2(0x0e, 4, 3, 255), // s_and_b32 s4, s3, 0xff
+      EncodeVop1(0x01, 0, 4),      // v_mov_b32 v0, s4
+      EncodeExp0(0x0c, 0x1), EncodeExp1(0, 0, 0, 0), EncodeSopp(0x01),
+  };
+  Decoder::Program decoded;
+  Decoder::DecodeProgram(shader, decoded);
+  ShaderVertexInputInfo vertex{};
+  // Substitute a synthetic entry ballot to check the actual encoded count.
+  // The native32 guest-wave64 ballot mirrors the physical low half.
+  for (const auto &[wave_size, native_size, mask_lo, mask_hi,
+                   expected_lanes, expected_counts] :
+       {std::tuple{32u, 32u, 0x0000ffffu, 0u, 16u, 1u},
+        std::tuple{32u, 32u, 0xffffffffu, 0u, 32u, 1u},
+        std::tuple{64u, 32u, 0x0000ffffu, 0x0000ffffu, 16u, 1u},
+        std::tuple{64u, 64u, 0xffffffffu, 0x0000ffffu, 48u, 2u},
+        std::tuple{64u, 64u, 0xffffffffu, 0xffffffffu, 64u, 2u}}) {
+    Frontend::TranslateOptions options{.stage = ShaderType::Vertex,
+                                       .wave_size = wave_size};
+    options.native_subgroup_size = native_size;
+    options.input_info.vertex = &vertex;
+    auto program = Frontend::TranslateProgram(decoded, CFG::BuildGraph(decoded), options);
+    const IR::Inst *wave_info = nullptr;
+    uint32_t bit_counts = 0;
+    for (const auto &inst : *program.blocks.front()) {
+      if (inst.GetOpcode() == IR::ValueOpcode::BitCount32) ++bit_counts;
+      if (inst.GetOpcode() == IR::ValueOpcode::SetScalarRegister &&
+          IR::RegIndex(inst.Arg(0).ScalarRegister()) == 3u) {
+        wave_info = &inst;
+      }
+    }
+    Check(wave_info != nullptr, "vertex entry omitted SGPR3 wave info");
+    Check(!wave_info->Arg(1).Resolve().IsImmediate() &&
+              bit_counts == expected_counts,
+          "vertex ESVertCount is fixed instead of following launched lanes");
+    auto &entry = *program.blocks.front();
+    bool replaced_ballot = false;
+    for (auto it = entry.begin(); it != entry.end(); ++it) {
+      if (it->GetOpcode() != IR::ValueOpcode::Ballot) continue;
+      auto replacement = entry.PrependNewInst(
+          it, IR::ValueOpcode::CompositeConstructU32x4,
+          {IR::Value(mask_lo), IR::Value(mask_hi), IR::Value(0u), IR::Value(0u)});
+      it->ReplaceUsesWith(IR::Value(&*replacement));
+      replaced_ballot = true;
+      break;
+    }
+    Check(replaced_ballot, "vertex entry omitted active-lane ballot");
+    IR::ConstantPropagationPass(program.blocks);
+    const auto resolved = wave_info->Arg(1).Resolve();
+    Check(resolved.IsImmediate() &&
+              resolved.U32() == ((1u << 28u) | expected_lanes),
+          "vertex SGPR3 did not preserve its high bits and encode live ES vertices");
+    auto compile_options = MakeCompileOptions(ShaderType::Vertex);
+    compile_options.wave_size = wave_size;
+    compile_options.compute_workgroup_limits.native_subgroup_size = native_size;
+    CheckSpirvBinaryValidates(RecompileForTest(shader, compile_options).spirv);
   }
 }
 
@@ -18663,6 +18728,18 @@ int RunShaderBatchAudit(int argc, char* argv[]);
 
 
 int main(int argc, char* argv[]) {
+  if (argc == 2 && std::strcmp(argv[1], "--ngg-vertex-entry-only") == 0) {
+    Libs::Graphics::EnsureConfigInitialized();
+    Libs::Graphics::TestNggVertexEntryState();
+    std::puts("KYTY_NGG_VERTEX_ENTRY_PASS");
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--ngg-launched-lanes-only") == 0) {
+    Libs::Graphics::EnsureConfigInitialized();
+    Libs::Graphics::TestNggVertexLaunchedLaneCount();
+    std::puts("KYTY_NGG_LAUNCHED_LANES_PASS");
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--zero-branch-ballot-only") == 0) {
     Libs::Graphics::EnsureConfigInitialized();
     Libs::Graphics::TestZeroBranchBallotIgnoresInactiveLanes();
@@ -19021,6 +19098,7 @@ int main(int argc, char* argv[]) {
   TestNewShaderRecompilerSMovB32();
   TestShaderStageBarriers();
   TestNggVertexEntryState();
+  TestNggVertexLaunchedLaneCount();
   TestNewShaderRecompilerClipDisabledPosition();
   TestNewShaderRecompilerAuxPositionExports();
   TestNewShaderRecompilerNativeWideScalarMemoryIr();

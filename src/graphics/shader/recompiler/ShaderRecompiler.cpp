@@ -623,6 +623,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	Frontend::TranslateOptions translate_options {
 	    .stage            = options.stage,
 	    .wave_size        = options.wave_size,
+	    .native_subgroup_size = options.compute_workgroup_limits.native_subgroup_size,
 	    .shader_hash      = options.shader_hash,
 	    .user_data_base   = options.user_data_base,
 	    .user_data_count  = static_cast<uint32_t>(options.user_data.size()),

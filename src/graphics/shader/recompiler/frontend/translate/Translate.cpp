@@ -1289,12 +1289,25 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 				                      builtin(IR::StageInputKind::PackedAncillary));
 			}
 		} else if (options.stage == ShaderType::Vertex) {
-			// Vulkan owns primitive assembly; each vertex subgroup is one NGG wave.
-			// Keep its full lane extent: mbcnt(-1) uses lane ordinals, not active counts.
+			// ESVertCount is the number of launched vertices in this wave, including
+			// a partially populated final wave.  The entry ballot is mirrored for
+			// graphics wave64 on native32, so count that physical half only.
+			IR::U32 es_vertex_count = IR::U32(IR::Value(options.wave_size));
+			if (options.native_subgroup_size != 0u) {
+				const auto low = entry_ir.CompositeExtract(initial_mask, 0);
+				es_vertex_count = IR::U32(entry_ir.Emit(IR::ValueOpcode::BitCount32, {low}));
+				if (options.wave_size == 64u && options.native_subgroup_size == 64u) {
+					const auto high = entry_ir.CompositeExtract(initial_mask, 1);
+					es_vertex_count = entry_ir.IAdd(
+				    es_vertex_count,
+				    IR::U32(entry_ir.Emit(IR::ValueOpcode::BitCount32, {high})));
+				}
+			}
 			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(2),
 			                      IR::U32(IR::Value(options.wave_size << 12u)));
 			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(3),
-			                      IR::U32(IR::Value((1u << 28u) | options.wave_size)));
+			                      entry_ir.BitwiseOr(IR::U32(IR::Value(1u << 28u)),
+			                                         es_vertex_count));
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5),
 			                      builtin(IR::StageInputKind::VertexIndex));
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(8),

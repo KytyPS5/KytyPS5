@@ -9749,6 +9749,60 @@ void TestNativeGuardedSamplerSource() {
   }
 }
 
+// A static sampler built by SALU moves whose SGPRs an EXEC mask reuses on an arm that never samples.
+void TestNativeConstantSamplerSource() {
+  constexpr uint32_t nested = 15, sample = 19, join = 21, end = 23;
+  const std::array<uint32_t, 24> guarded{
+      EncodeSopk(0x00, 16, 146),          // s_movk_i32 s16, 146
+      EncodeSop2(0x24, 17, 140, 140),     // s_bfm_b32 s17, 12, 12
+      EncodeSMovB32(18, 255), 0x06500000u,
+      EncodeSMovB32(19, 244),             // s_mov_b32 s19, 2.0
+      EncodeSopc(0x07, 21, 128),
+      EncodeSopp(0x04, end - 6 - 1),
+      EncodeSopc(0x07, 20, 130),
+      EncodeSopp(0x04, sample - 8 - 1),
+      EncodeVop3Word0(0xc5, 16), EncodeVop3Word1(256, 128, 0), // v_cmp_ne_u32 s[16:17], v0, 0
+      EncodeSopc(0x07, 20, 129),
+      EncodeSopp(0x04, nested - 12 - 1),
+      EncodeVop1(0x01, 0, 128),
+      EncodeSopp(0x02, join - 14 - 1),
+      EncodeSMovB32(18, 137), EncodeSMovB32(19, 138),
+      EncodeVop1(0x01, 0, 129),
+      EncodeSopp(0x02, join - 18 - 1),
+      EncodeMimg0(0x20, 0x1), EncodeMimg1(0, 2, 4, 2),
+      EncodeExp0(0x00, 0x1), EncodeExp1(0, 0, 0, 0),
+      EncodeSopp(0x01),
+  };
+  auto user_data = ImageTestUserData();
+  user_data[13] = 1u;
+  const std::array<uint32_t, 4> sampler{146u, 0x00fff000u, 0x06500000u, 0u};
+  for (uint32_t mode = 0; mode != 3; ++mode) {
+    user_data[12] = mode;
+    auto options = MakeCompileOptions(ShaderType::Pixel);
+    options.user_data_base = 8;
+    options.user_data = user_data;
+    Check(ShaderRecompiler::TranslateProgram(guarded, options).status.ok,
+          "a constant sampler the native control flow alone reaches was refused");
+    const auto result = RecompileForTest(guarded, options);
+    const auto expected = mode == 2u ? sampler : std::array<uint32_t, 4>{};
+    Check(result.resources.samplers.size() == 1u &&
+              result.resources.samplers[0].dword_count == expected.size() &&
+              std::equal(expected.begin(), expected.end(),
+                         result.resources.samplers[0].dwords.begin()),
+          "guarded native sample did not bind the constant sampler it reads");
+    CheckSpirvBinaryValidates(result.spirv);
+  }
+
+  // The masked arm now falls into the sample, so the sampler is no longer one constant.
+  auto reached = guarded;
+  reached[14] = EncodeSopp(0x02, sample - 14 - 1);
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.user_data_base = 8;
+  options.user_data = user_data;
+  Check(!ShaderRecompiler::TranslateProgram(reached, options).status.ok,
+        "a sampler an EXEC mask can reach was resolved to a constant");
+}
+
 void TestBoundedMaterialBufferStores(bool scalar_key) {
   // Captured batch search and descriptor waterfall, with deformation arithmetic removed.
   const uint32_t shader[] = {
@@ -16838,6 +16892,7 @@ int main() {
   TestNativeScalarReadDescriptorPlanning();
   TestScalarSelectedVccBufferAddress();
   TestNativeGuardedSamplerSource();
+  TestNativeConstantSamplerSource();
   for (const bool scalar_key : {false, true}) TestBoundedMaterialBufferStores(scalar_key);
   TestNativeDescriptorProvenanceKeepsGpuSelection();
   TestCfgSiblingSharedExit();

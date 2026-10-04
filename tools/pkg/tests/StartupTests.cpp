@@ -24,6 +24,11 @@ static int Helper(const std::string& mode) {
     signal(SIGTERM, SIG_IGN); // Cleanup must not wait forever on a stubborn helper.
 #endif
     if (mode == "exit") return 0;
+    if (mode == "echo") {
+        char byte;
+        while (std::cin.get(byte)) std::cout.put(byte).flush();
+        return 0;
+    }
     if (mode == "partial") std::cout.write("KP", 2).flush();
     if (mode == "catalog" || mode == "healthy" || mode == "readstall" || mode == "readpartial") {
         const char header[] = {'K','P','K','1',1,0,0,0};
@@ -78,6 +83,23 @@ int main(int argc, char** argv) {
                 timeout = std::string(e.what()).find("timed out") != std::string::npos;
             }
             Check(timeout, "blocked request did not time out");
+        }
+        {
+            Common::Pipe pipe;
+            pipe.Open("echo", 2s);
+            // Warm up the child before measuring transport round trips.
+            char sent = 42, received = 0;
+            pipe.Write(&sent, 1); pipe.Read(&received, 1);
+            const auto begin = std::chrono::steady_clock::now();
+            for (int i = 0; i < 256; ++i) {
+                pipe.BeginTransaction(2s);
+                pipe.Write(&sent, 1); pipe.Read(&received, 1);
+                Check(received == sent, "echo data mismatch");
+            }
+            std::cout << "256 helper round trips: "
+                      << std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - begin).count()
+                      << " ms (diagnostic, no machine-dependent timing threshold)\n";
         }
         // Failed startup must not poison a subsequent mount.
         Common::PkgArchiveBackend healthy("healthy", 2s);

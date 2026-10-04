@@ -132,9 +132,22 @@ public:
 			input_read = nullptr;
 			fail();
 		}
-		if (!CreatePipe(&output_read_, &output_write, &attributes, 0) ||
-		    !SetHandleInformation(output_read_, HANDLE_FLAG_INHERIT, 0))
+		// Wake on actual response data, not on a timer polling the child process.
+		const auto response_name = pipe_name + L"-response";
+		output_read_             = CreateNamedPipeW(
+		    response_name.c_str(),
+		    PIPE_ACCESS_INBOUND | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
+		    PIPE_TYPE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS, 1, 65536, 65536, 0, nullptr);
+		if (output_read_ == INVALID_HANDLE_VALUE) {
+			output_read_ = nullptr;
 			fail();
+		}
+		output_write = CreateFileW(response_name.c_str(), GENERIC_WRITE, 0, &attributes,
+		                           OPEN_EXISTING, 0, nullptr);
+		if (output_write == INVALID_HANDLE_VALUE) {
+			output_write = nullptr;
+			fail();
+		}
 		STARTUPINFOW startup {};
 		startup.cb         = sizeof(startup);
 		startup.dwFlags    = STARTF_USESTDHANDLES;
@@ -314,31 +327,31 @@ public:
 		auto* p = static_cast<uint8_t*>(data);
 		while (size != 0) {
 #ifdef _WIN32
-			size_t requested = size;
-			if (deadline_active_) {
-				DWORD available = 0;
-				while (true) {
-					CheckDeadline();
-					if (!PeekNamedPipe(output_read_, nullptr, 0, nullptr, &available, nullptr))
-						throw std::runtime_error("Package helper closed the stream");
-					if (available != 0) break;
-					const auto state = WaitForSingleObject(process_, 10);
-					if (state == WAIT_FAILED)
-						throw std::runtime_error("Cannot wait for package helper");
-					if (state == WAIT_OBJECT_0) {
-						if (!PeekNamedPipe(output_read_, nullptr, 0, nullptr, &available,
-						                   nullptr) ||
-						    available == 0)
-							throw std::runtime_error("Package helper closed the stream");
-						break;
-					}
-				}
-				requested = std::min<size_t>(size, available);
-			}
+			CheckDeadline();
+			OVERLAPPED operation {};
+			operation.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+			if (!operation.hEvent) throw std::runtime_error("Cannot create helper read event");
 			DWORD got = 0;
-			if (!ReadFile(output_read_, p, static_cast<DWORD>(requested), &got, nullptr) ||
-			    got == 0)
-				throw std::runtime_error("Package helper closed the stream");
+			bool  ok  = ReadFile(output_read_, p, static_cast<DWORD>(size), &got, &operation) != 0;
+			if (!ok && GetLastError() == ERROR_IO_PENDING) {
+				const auto  remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+				                            deadline_ - std::chrono::steady_clock::now())
+				                            .count();
+				const DWORD wait_ms =
+				    deadline_active_ ? static_cast<DWORD>(std::clamp<int64_t>(remaining, 0, 60000))
+					                 : INFINITE;
+				const auto state = WaitForSingleObject(operation.hEvent, wait_ms);
+				if (state != WAIT_OBJECT_0) {
+					CancelIoEx(output_read_, &operation);
+					// Drain cancellation before releasing the operation and caller's buffer.
+					GetOverlappedResult(output_read_, &operation, &got, TRUE);
+					CloseHandle(operation.hEvent);
+					throw std::runtime_error("Package helper response timed out or wait failed");
+				}
+				ok = GetOverlappedResult(output_read_, &operation, &got, FALSE) != 0;
+			}
+			CloseHandle(operation.hEvent);
+			if (!ok || got == 0) throw std::runtime_error("Package helper closed the stream");
 #else
 			if (deadline_active_) {
 				CheckDeadline();

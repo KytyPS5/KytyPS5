@@ -314,6 +314,13 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		    compiled_components > 0 ? static_cast<int>(compiled_components) : registers_num;
 		GetInputFormat(vs_input_info.resources[index], input_attr[index].format, attr_size,
 		               static_cast<uint32_t>(used_components));
+		// A vertex attribute format the device cannot fetch (VUID-VkVertexInputAttributeDescription-
+		// format-00623) makes pipeline creation fail, so name it instead.
+		if (!(graphics.GetFormatProperties(input_attr[index].format).bufferFeatures &
+		      vk::FormatFeatureFlagBits::eVertexBuffer)) {
+			EXIT("Pipeline: vertex attribute format %d is not supported by the device\n",
+			     static_cast<int>(input_attr[index].format));
+		}
 
 		if (graphics_debug_dump_enabled()) {
 			static std::atomic_uint log_count = 0;

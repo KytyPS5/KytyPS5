@@ -1,5 +1,29 @@
 # Emulator regression test debt
 
+## Large CS pipeline before the shared-table frontier (2026-10-04; bounded runtime diagnosis)
+
+Local fix `2bfde86d` is built/installed with native Windows SHA
+`801a4195145dab7466efc9aeb81bf7fe27a67401df861ff79e05db2a0aeb8707`.
+Run `_Build/runs/yotei-integrated-20261004-205642-sharedbuffer-noval`
+used1280x720/Fifo/optimizationNone without GPUAV, Vulkan or shader validation.
+It reached shown155, with black source readbacks150–154, then exceeded its
+28GiB working-set guard inside CS54904 `vkCreateComputePipelines`:
+568075 emitted words, cooperative wave64, flags0x1. PID38544 was stopped;
+no task-owned native processes remain. This also blocked the older no-validation
+run before the new change (566635 words); the small word increase does not
+identify the underlying expensive operation. No compiler completion, menu or
+performance improvement for this specialization is proved.
+
+Required next diagnostic: capture this exact emitted module and admitted layout,
+validate it, and run a bounded pipeline-only probe before another long game run.
+Classify repeated resource accesses, execution/control flow and other expensive
+operations using the module, rather than its hash. If production behavior is to
+change, first add a reusable synthetic RED that preserves every candidate,
+address/bound and observable value; use unchanged numerical GPU/GPUAV GREEN
+and affected wave32/wave64 neighbors. Do not raise the memory limit, truncate
+candidates, suppress guest work or specialize by game/hash/address. A compiler
+timeout alone is diagnostic, not a semantic synthetic regression.
+
 ## Formatted access byte bounds with host backing offsets (2026-10-04; native RED/GREEN)
 
 New shared-table formatted numerical fixture passes plain readback but GPUAV
@@ -513,7 +537,7 @@ The two 1280x720 retries reached only shown377 and shown205 respectively,
 both stopped during long CS8457 pipeline creation before d0c was encountered;
 runtime d0c completion and a menu are **not** proved.
 
-## Large bounded buffer-table lowering and native compiler time (2026-10-04; synthetic proved, runtime pending)
+## Large bounded buffer-table lowering and native compiler time (2026-10-04; synthetic proved, large runtime specialization pending)
 
 Native synthetic RED on parent `cc264198`, with only test/profile scaffolding:
 `shader_cfg_tests.exe --bounded-buffer-shared-access-only` emits a valid
@@ -549,7 +573,7 @@ formatted EXEC/count/VCC guards including both wave64 halves
 (`shared-buffer-formatted-guards-gpuav-20261004.log`). Earlier tests failed
 because the fixture did not request descriptor ranges; later GPUAV exposed
 the independent formatted-bound defect above. Neither is recorded as GREEN.
-Actual shader compilation time, game/menu and other-game runtime remain pending.
+Actual large-specialization compilation time, menu and other-game runtime remain pending.
 Default CFG still fails the existing literal-word serialization assertion
 (`shared-buffer-default-cfg-20261004.log.stderr`); focused storage bounds/access
 and split-wave reciprocal selectors pass. No suite-wide GREEN claim.
@@ -559,6 +583,13 @@ neighbors PASS on SHA `b2409ff1f6daa62dcba8de3dde91b49a26351d085eda839e398561a3d
 `shared-buffer-final-gpuav-BufferFormatUint8HostOffsetOverflowStaysOutOfBounds-20261004.log`).
 GPU fixtures retain their numerical oracle on devices without the optional
 indexing feature; only the shared-body shape assertion is feature-dependent.
+
+Committed source `2bfde86d` passed native emulator build/install and the bounded
+game retry described above. Twelve early CS8457 captures have55505–56265 words
+and one CAS each, with largest switches2–9 arms. The new1019-arm specialization
+was not reached because CS54904 hit the memory guard first; its size, complete
+pipeline creation and numerical game result remain unverified. No benchmark
+claim follows from cache-dependent early pipeline completion.
 
 The exact 581327-word CS8457 SPIR-V saved at
 `_Build/runs/yotei-integrated-20261004-191348-presentfix-gpuav/shaders/0024_new_shader_cs_8457901d80b91921.spv`
@@ -582,9 +613,9 @@ Vulkan 1.3 but still exceeds a 120 s native pipeline-probe bound
 (`_Build/logs/cs8457-sharded64-equivalent-probe-20261004.log`). Do not adopt
 switch sharding alone as a claimed compiler fix.
 
-Before changing production lowering, add a synthetic RED for a bounded buffer
+The synthetic RED/GREEN requirement above has been completed for a bounded buffer
 table with many live candidate resources and an observable byte read and
-subword atomic write. Assert that the emitted module does not replicate the
+subword atomic write. Its invariant checks that the emitted module does not replicate the
 full access/CAS body per candidate while retaining all candidate choices and
 exact bounds. Include neighboring cases with different packed strides, byte
 offsets/limits, a volatile read, a selection outside the table, and a table
@@ -592,10 +623,11 @@ whose candidates are semantically incompatible with any shared access path.
 An optimization may share only operations whose metadata and semantics it
 proves compatible; otherwise keep the existing specialized path. Check any
 needed Vulkan dynamic-indexing feature before use and keep a valid fallback.
-Run unchanged RED/GREEN, `spirv-val`, numerical GPU read/write tests for first,
-middle and last candidates and an invalid selector, then probe the exact saved
-large shader and retry the bounded 1280x720 game. Do not use a game/hash/address
-exception or truncate real candidate tables.
+Focused unchanged RED/GREEN, SPIRV-Tools validation and numerical first/high/last/
+invalid-selector GPU tests passed as recorded above. Remaining work: emit and
+probe the actual new large specialization with its full admitted layout, then
+retry the bounded1280x720 game. Do not substitute the old pre-fix binary or
+truncate real candidate tables to claim a fixed compiler frontier.
 
 The default `shader_cfg_tests.exe` run at
 `_Build/logs/f32-seed-final-shader-cfg-20261004.log` fails at the older

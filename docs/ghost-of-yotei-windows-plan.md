@@ -1,5 +1,36 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **4 октября 2026 года, 21:01 UTC** (native Windows via WSL;
+local source commit `2bfde86d`, branch `yotei-windows-bringup`; installed SHA-256
+`801a4195145dab7466efc9aeb81bf7fe27a67401df861ff79e05db2a0aeb8707`):
+
+- Generic shared bounded-buffer lowering and checked formatted backing bounds
+  are committed locally. Native `windows-local.cmd build-target kyty_emulator`
+  and `install` passed (`_Build/logs/shared-buffer-emulator-{build,install}.log`).
+  Synthetic CPU RED/GREEN, numerical GPUAV and neighboring checks are recorded
+  below and in the test debt; the default CFG literal assertion remains failing.
+- Bounded 1280x720 retry, with GPUAV/Vulkan/shader validation off, optimization
+  `None`, Fifo and unchanged memory ceiling, ran20:56:42–21:01:42UTC:
+  `_Build/runs/yotei-integrated-20261004-205642-sharedbuffer-noval`.
+  It reached `shown=155`; source readback frames150–154 were all black.
+  Last unmatched call: `vkCreateComputePipelines` for CS54904
+  (`568075` SPIR-V words, flags`0x1`, cooperative wave64). The task-owned
+  PID38544 was stopped by the28GiB working-set guard (`exitCode=-1`),
+  not a recorded driver exception. Process read-back confirms no emulator,
+  shader test, Ninja, MSBuild or probe remains.
+- Twelve early CS8457 modules were saved under that run's `shaders/`:
+  `55505`–`56265` words and one CAS each; their largest candidate switches
+  have2–9 arms. These are **not** the old1019-arm specialization. Its new
+  emission size and compiler time remain unverified. Differing cache warmth
+  and specialization prohibit interpreting shown155 versus shown162 as a
+  compiler performance comparison. Preserve existing caches and artifacts.
+- Next: obtain the exact CS54904 specialization with a bounded capture/probe,
+  classify the expensive shared mechanism, and require a synthetic semantic
+  RED before changing its lowering. Then verify the real large CS8457 path
+  and retry bounded game execution. Prior loading pixels remain a separate
+  milestone; this retry proves no visible pixels. **Menu/gameplay PENDING.**
+  Commits have not been pushed in this task.
+
 Checkpoint **4 октября 2026 года, 20:53 UTC** (native synthetic tests via WSL;
 source based on `cc264198`, shared bounded-buffer lowering; game retry pending):
 

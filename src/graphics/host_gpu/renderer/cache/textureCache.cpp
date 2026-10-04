@@ -31,7 +31,7 @@ namespace Libs::Graphics {
 
 namespace {
 
-constexpr uint64_t NumFramesBeforeRemoval = 2048;
+constexpr uint64_t NumFramesBeforeRemoval = 32;
 
 [[nodiscard]] bool DecodeColorClear(const TextureCache::ImageDesc& desc, uint8_t code,
                                   vk::ClearColorValue& clear) {
@@ -154,12 +154,9 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
 		constexpr int64_t GiB = 1024ll * 1024 * 1024;
 		const auto        budget =
 		    static_cast<int64_t>(std::min<uint64_t>(m_graphics.GetTotalMemoryBudget(), INT64_MAX));
-		// Leave more headroom than a fixed 8 GiB before the pressure threshold, and start the
-		// collector later. An aggressive threshold unregisters images that are still bound, and
-		// the next view acquisition then finds them unregistered and gives up.
-		const auto threshold = budget - 1 * GiB;
+		const auto threshold = std::min<int64_t>(budget, 8 * GiB);
 		m_pressure_gc_memory = static_cast<uint64_t>(
-		    std::max<int64_t>(std::min(budget - 5 * threshold / 10, budget - GiB), GiB + GiB / 2));
+		    std::max<int64_t>(std::min(budget - 6 * threshold / 10, budget - GiB), GiB + GiB / 2));
 		m_critical_gc_memory = static_cast<uint64_t>(
 		    std::max<int64_t>(std::min(budget - 2 * threshold / 10, budget - GiB / 2), 3 * GiB));
 		m_trigger_gc_memory = static_cast<uint64_t>(std::max<int64_t>((budget - threshold) / 2, 0));
@@ -1304,7 +1301,6 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 				result = {};
 			}
 		}
-		bool inserted_image = false;
 		if (!result) {
 			result         = InsertImage(desc.info);
 			auto& inserted = m_slot_images[result];
@@ -1392,16 +1388,7 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	TouchImage(image);
 	if (!image.info.data.Empty()) {
 		if (!image.registered || image.depth_id || image.binding.needs_rebind) {
-			EXIT("TextureCache: texture requires rediscovery before final acquisition: "
-			     "id=%u registered=%d depth_id=%u needs_rebind=%d is_bound=%d is_target=%d "
-			     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 " guest_format=%u type=%u\n",
-			     id.index, image.registered ? 1 : 0,
-			     image.depth_id ? image.depth_id.index : 0u,
-			     image.binding.needs_rebind ? 1 : 0,
-			     image.binding.is_bound ? 1 : 0, image.binding.is_target ? 1 : 0,
-			     image.info.data.address, image.info.data.size,
-			     static_cast<uint32_t>(image.info.guest_format),
-			     static_cast<uint32_t>(image.info.type));
+			EXIT("TextureCache: texture requires rediscovery before final acquisition\n");
 		}
 	}
 	if (desc.type == BindingType::Storage) {

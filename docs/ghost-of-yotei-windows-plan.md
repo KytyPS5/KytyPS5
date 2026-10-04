@@ -1,5 +1,26 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **4 октября 2026 года, 20:00 UTC** (native Windows Release executable;
+source `e8294809`, installed SHA-256
+`503303e14a8293180af9579e17856f67d5cea69a0e36f7a442b6bcc6a2ebee19`):
+
+- At the user's request, a bounded 1280x720 run used **no GPUAV, no Vulkan
+  validation and no shader validation**, with unchanged shader optimization
+  `None` and Fifo presentation. Artifacts:
+  `_Build/runs/yotei-integrated-20261004-195336-presentfix-noval`.
+  The task-owned PID37488 ran from19:53:36 to20:00:16UTC. It reached
+  `shown=162`; source readback frames150–161 were all black. Its last unmatched
+  pipeline call was CS54904 (`566635` SPIR-V words, flags`0x1`), not the later
+  1019-candidate CS8457. The run stopped at its 28GiB working-set guard
+  (recorded `exitCode=-1`), not a driver exception. No task processes remain.
+- Several earlier specialized pipelines compiled in about0.75–7s, but the
+  large CS54904 call had no completion before the memory guard. Therefore this
+  run does **not** demonstrate faster completion of the costly shaders or
+  progress to visible pixels/menu without debug checks. Core and GPUAV caches
+  are separate and differ in warmth, so frame-count timing between runs is
+  not a controlled compiler benchmark. Preserve both caches. The current
+  shared-lowering CS8457 work below remains pending.
+
 Checkpoint **4 октября 2026 года, 19:30 UTC** (native Windows pipeline probes;
 committed/pushed source `9cc8261a`, installed executable SHA
 `503303e14a8293180af9579e17856f67d5cea69a0e36f7a442b6bcc6a2ebee19`):

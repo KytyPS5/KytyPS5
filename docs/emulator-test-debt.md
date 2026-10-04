@@ -2,6 +2,41 @@
 
 ## Cooperative pipeline scale after local SSA reuse (2026-10-04; pending)
 
+Next bounded synthetic regression: `shader_recompiler_compute_tests
+--cooperative-wide-indirect-image-size-only` must keep a 64-operation
+same-Guard arithmetic chain from emitting per-value Function stores, while
+retaining spills for cross-Guard uses. Before the store correction, the native
+test failed on source `1bc0d04c` with `OpStore 10 -> 74` versus its allowed
+increment of eight (`_Build/logs/cooperative-local-store-red-20261004.log`).
+The shader includes a guest barrier and 251-way indirect image switch; SPIR-V
+validation and the existing same-Guard load check passed in that RED run.
+The unchanged oracle passed after `7afddcd8` with `OpStore 9 -> 9` and
+`OpLoad 530 -> 530`; multiwave LDS, cyclic barrier and cyclic scalar-address
+GPUAV readback selectors also passed. The game module dropped to 566635 words
+and 18629 OpStore, but the second specialization of the same shader still
+blocked pipeline creation at `shown=161`.
+
+The bounded synthetic Vulkan switch probe did not reproduce this driver
+cost: 860 cases with 4 nested diamonds each, 40 Function spill/load pairs
+per case and one enclosing loop produced 558338 words and created a pipeline
+in 1124 ms (`_Build/logs/synthetic-switch-loop-860-20261004.log.stderr`).
+The diagnostic patch is saved outside tracked source at
+`_Build/analysis/synthetic-switch-pipeline-probe-20261004.patch`.
+The actual CS has 32 guest loops, 844 IR blocks, 12174 SPIR-V labels and
+three frequently called helpers; neither its full control flow nor the
+driver-time pathology is covered by the probe. Do not use a word-count-only
+threshold as evidence of menu progress.
+
+The first 566635-word CS pipeline completed after 279999 ms in
+`_Build/runs/yotei-integrated-20261004-102947-presentfix-gpuav`. The next
+specialization had different bounded-SRT/table occupancy and emitted 566871
+words; its pipeline creation did not complete before the 450-second frame
+watchdog. Before changing specialization caching or descriptor layout, add
+two synthetic materializations of one guest shader with varying active table
+lengths. Verify which generated code and bounds genuinely depend on those
+lengths, numerical results for valid indices, and errors for invalid indices.
+Only then decide whether a shared pipeline variant can preserve the contract.
+
 Commit `6dbee0c8` removes redundant Function loads when a cooperative
 instruction is consumed inside the same Guard. The synthetic RED/GREEN and
 GPUAV neighboring cases are recorded in the 09:54 UTC launch-plan checkpoint.

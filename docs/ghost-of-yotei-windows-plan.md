@@ -1,5 +1,50 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **4 октября 2026 года, 10:41 UTC** (native Windows via WSL;
+branch `yotei-windows-bringup`, source fix `7afddcd8`):
+
+- A second shared cooperative emitter correction omits Function spills only
+  for ordinary values whose direct typed consumers are in the same block and
+  phase. Phi, opaque recipes, branch conditions, collectives and runtime scalar
+  reads retain their spills. Synthetic wave64/native32, guest barrier and
+  251-way indirect-image fixture proved RED on `1bc0d04c` (`OpStore 10 -> 74`
+  for a 64-operation chain, `_Build/logs/cooperative-local-store-red-20261004.log`)
+  and GREEN unchanged after the fix (`9 -> 9`, with `OpLoad 530 -> 530`,
+  `_Build/logs/cooperative-local-store-green-20261004.log`). Multiwave LDS,
+  cyclic guest barrier and cyclic scalar-address GPUAV readback selectors
+  passed. Native build and install logs are
+  `_Build/logs/cooperative-local-store-emulator-{build,install}-20261004.log`;
+  installed exe SHA-256
+  `24019bf5af5fc77e184c51c517e5d3f19c89831f44b40c738e8c405c4de90688`.
+- Same game CS `54904fb419d79e49` now emits 566635 SPIR-V words,
+  29217 OpLoad and 18629 OpStore, versus the previous 639478/29217/42894
+  and original 773030/62605/42894. New capture:
+  `_Build/runs/yotei-integrated-20261004-102622-presentfix-gpuav/shaders/0000_new_shader_cs_54904fb419d79e49.spv`,
+  SHA-256 `27681795d5e7363818cd25071a61a2d524033cb8f441668896a17ce520a40147`.
+  A bounded synthetic Vulkan probe with up to 860 switch arms, 4 diamonds per
+  arm, Function loads/stores and one loop created pipelines in about 1.1 s
+  at 558338 words. Those ingredients alone do not reproduce the game stall;
+  its uncommitted diagnostic patch is in
+  `_Build/analysis/synthetic-switch-pipeline-probe-20261004.patch`.
+- Selective-GPUAV game retry
+  `_Build/runs/yotei-integrated-20261004-102947-presentfix-gpuav` showed
+  the first pipeline for this CS **complete in 279999 ms**. The next resource
+  specialization of the same hash changed bounded-SRT table counts (16 to 14
+  in three slots) and emitted 566871 words; its pipeline creation had no
+  completion before the 450-second shown-frame watchdog at `shown=161`.
+  The earlier 639478-word build stayed at `shown=155` for more than 600 s
+  in its long, task-owned run
+  `_Build/runs/yotei-integrated-20261004-101031-presentfix-gpuav`, which was
+  then closed manually. Neither run reached readback frame 190. The last
+  verified nonzero RGB remains old clean GPUAV frames 198–199. **Menu and
+  gameplay PENDING.** No task-owned emulator/test/build process remained.
+- Next: quantify the number and semantic differences of CS `54904…` resource
+  specializations, then make a bounded synthetic two-layout regression before
+  considering any shared specialization reuse. Preserve actual descriptor
+  counts, bounds and unsupported errors; do not pad missing guest resources.
+  The uninstrumented `b90e…` driver crash and later Vertex DeviceLost remain
+  separate blockers after this compute frontier.
+
 Checkpoint **4 октября 2026 года, 09:54 UTC** (native Windows via WSL;
 branch `yotei-windows-bringup`, source fix `6dbee0c8`):
 

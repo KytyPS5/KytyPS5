@@ -36985,7 +36985,8 @@ void CheckIndirectImageKeySwitch(
     bool vertex_cross_lane = false, bool vertex_divergent_loop = false,
     bool vertex_long_loop = false, bool vertex_mask_drain = false,
     bool vertex_mask_seed_live = false, bool cooperative_compute = false,
-    u32 arithmetic_chain = 0u, size_t *load_count = nullptr) {
+    u32 arithmetic_chain = 0u, size_t *load_count = nullptr,
+    size_t *store_count = nullptr) {
   constexpr uint32_t mapping_capacity = 1793u;
   using namespace ShaderRecompiler::IR;
 
@@ -37428,6 +37429,8 @@ void CheckIndirectImageKeySwitch(
           "failed to disassemble indirect image shader");
   if (load_count != nullptr)
     *load_count = CountText(text, "OpLoad ");
+  if (store_count != nullptr)
+    *store_count = CountText(text, "OpStore ");
   if (wide) {
     Require(name, "wide indirect image switch",
             CountText(text, "OpSwitch") == (cooperative_compute ? 2u : 1u) &&
@@ -46379,23 +46382,32 @@ if (argc == 1) {
       std::strcmp(argv[1], "--cooperative-wide-indirect-image-size-only") == 0) {
     size_t baseline_loads = 0u;
     size_t chained_loads = 0u;
+    size_t baseline_stores = 0u;
+    size_t chained_stores = 0u;
     CheckIndirectImageKeySwitch(Prospero::TextureNumericClass::Float,
                                 "CooperativeWideImageBaseline", true, false,
                                 nullptr, false, false, false, false, false,
                                 false, false, false, false, true, 0u,
-                                &baseline_loads);
+                                &baseline_loads, &baseline_stores);
     CheckIndirectImageKeySwitch(Prospero::TextureNumericClass::Float,
                                 "CooperativeWideImageChain", true, false,
                                 nullptr, false, false, false, false, false,
                                 false, false, false, false, true, 64u,
-                                &chained_loads);
+                                &chained_loads, &chained_stores);
     std::fprintf(stderr, "cooperative indirect image loads: baseline=%zu chain=%zu\n",
                  baseline_loads, chained_loads);
+    std::fprintf(stderr, "cooperative indirect image stores: baseline=%zu chain=%zu\n",
+                 baseline_stores, chained_stores);
     Require("CooperativeWideImageChain", "same-region arithmetic loads",
             chained_loads <= baseline_loads + 8u,
             "a 64-operation same-region arithmetic chain reloaded its intermediates: " +
                 std::to_string(baseline_loads) + " -> " +
                 std::to_string(chained_loads));
+    Require("CooperativeWideImageChain", "same-region arithmetic stores",
+            chained_stores <= baseline_stores + 8u,
+            "a 64-operation same-region arithmetic chain spilled its intermediates: " +
+                std::to_string(baseline_stores) + " -> " +
+                std::to_string(chained_stores));
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--wide-indirect-image-vertex-spirv-only") == 0) {

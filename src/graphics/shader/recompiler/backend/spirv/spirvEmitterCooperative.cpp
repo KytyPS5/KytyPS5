@@ -277,12 +277,28 @@ CooperativeFunctionState PrepareCooperativeFunction(ValueEmitContext& ctx) {
 		for (const auto& inst : *block) {
 			// Opaque resource/address recipes are compile-time structures. Planning-only
 			// raw SRT reads never execute. Every other runtime leaf needs Function
-			// storage: cooperative emission can open a new Guard for the same phase
-			// (scalar reads, collectives, LDS rendezvous), and a same-phase SSA value
-			// defined in one selection does not dominate a later sibling selection.
+			// storage if any consumer can run outside its defining Guard.
 			if (TypeId(ctx.state, inst.GetType()) == 0) continue;
 			if ((inst.GetOpcode() == O::LoadAddressU32 || inst.GetOpcode() == O::ReadConstBuffer) &&
 			    ctx.Memory(inst).planning_only) continue;
+			// Ordinary instructions sharing a phase in one IR block are emitted in
+			// one Guard. Keep their SSA results when every direct consumer is in that
+			// same region. Opaque recipes can hide later uses, so retain their spills.
+			const auto local_phase = function.phases.find(&inst);
+			const bool local_only = inst.GetOpcode() != O::Phi &&
+			    local_phase != function.phases.end() &&
+			    !IsCollective(inst.GetOpcode()) && !IsRuntimeScalarRead(ctx, inst) &&
+			    !branch_condition_uses.contains(&inst) &&
+			    std::ranges::all_of(inst.Uses(), [&](const auto& use) {
+				if (use.user == nullptr || use.user->GetOpcode() == O::Phi ||
+				    use.user->Parent() != block || TypeId(ctx.state, use.user->GetType()) == 0 ||
+				    IsCollective(use.user->GetOpcode()) || IsRuntimeScalarRead(ctx, *use.user))
+					return false;
+				const auto consumer_phase = function.phases.find(use.user);
+				return consumer_phase != function.phases.end() &&
+				       consumer_phase->second == local_phase->second;
+			});
+			if (local_only) continue;
 
 			const auto start = positions.at(&inst);
 			auto       end = start;

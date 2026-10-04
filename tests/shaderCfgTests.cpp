@@ -7181,28 +7181,29 @@ void TestNewShaderRecompilerFlatOldBackedTranslation() {
 }
 
 void TestNewShaderRecompilerUnbasedFlatUsesBda() {
-  const uint32_t shader[] = {
-      EncodeFlat0(0x0c, 0, 0),
-      EncodeFlat1(0, 0x7d, 0, 1),
-      EncodeExp0(0x00, 0x1),
-      EncodeExp1(0, 0, 0, 0),
-      EncodeSopp(0x01),
-  };
-
-  auto options = MakeCompileOptions(ShaderType::Pixel);
-
-  auto result = RecompileForTest(shader, options);
-  Check(result.program.info.uses_dma &&
-            ShaderRecompiler::IR::FindBinding(
-                result.program.bindings,
-                ShaderRecompiler::IR::DescriptorBindingKind::BdaPagetable) !=
-                nullptr &&
-            ShaderRecompiler::IR::FindBinding(
-                result.program.bindings,
-                ShaderRecompiler::IR::DescriptorBindingKind::FaultBuffer) !=
-                nullptr,
-        "unbased FLAT did not compile through BDA");
-  CheckSpirvBinaryValidates(result.spirv);
+  using namespace ShaderRecompiler;
+  for (const bool dlc : {false, true}) {
+    const uint32_t shader[] = {
+        dlc ? 0xdc341000u : 0xdc340000u, 0x007d0004u,
+        EncodeExp0(0x00, 0x3), EncodeExp1(0, 1, 0, 0), EncodeSopp(0x01),
+    };
+    Decoder::Instruction decoded;
+    Decoder::DecodeInstruction(shader, 0, decoded);
+    Check(decoded.opcode == Decoder::Opcode::FLAT_LOAD_DWORDX2 && decoded.dlc == dlc &&
+              decoded.dst.reg == 0u && decoded.src0.reg == 4u && decoded.src1.reg == 5u,
+          "captured FLAT load did not preserve operands or cache policy");
+    const auto result = RecompileForTest(shader, MakeCompileOptions(ShaderType::Pixel));
+    Check(result.program.info.uses_dma &&
+              IR::FindBinding(result.program.bindings,
+                              IR::DescriptorBindingKind::BdaPagetable) != nullptr &&
+              IR::FindBinding(result.program.bindings,
+                              IR::DescriptorBindingKind::FaultBuffer) != nullptr,
+          "unbased FLAT did not compile through BDA");
+    const auto source = DisassembleSpirvBinary(result.spirv);
+    Check((source.find("Volatile|Aligned") != std::string::npos) == dlc,
+          "FLAT DLC load did not emit volatile physical memory access");
+    CheckSpirvBinaryValidates(result.spirv);
+  }
 }
 
 void TestNewShaderRecompilerFlatSignedLoadTranslation() {

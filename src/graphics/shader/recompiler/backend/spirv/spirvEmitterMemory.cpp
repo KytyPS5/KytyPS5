@@ -180,7 +180,7 @@ void RecordBdaFault(EmitterState& state, uint32_t page) {
 	                          Binary(state, spv::OpBitwiseOr, TypeU32(state), value, bit));
 }
 
-uint32_t LoadBdaDword(ValueEmitContext& ctx, uint32_t address) {
+uint32_t LoadBdaDword(ValueEmitContext& ctx, uint32_t address, bool coherent = false) {
 	auto&      state   = ctx.state;
 	const auto bda     = GetBdaPointer(state, address);
 	const auto present =
@@ -191,18 +191,21 @@ uint32_t LoadBdaDword(ValueEmitContext& ctx, uint32_t address) {
 		                          bda);
 		const auto         value     = state.builder.AllocateId();
 		constexpr uint32_t alignment = sizeof(uint32_t);
+		const auto access = spv::MemoryAccessAlignedMask |
+		                    (coherent ? spv::MemoryAccessVolatileMask : spv::MemoryAccessMaskNone);
 		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer,
-		                          spv::MemoryAccessAlignedMask, alignment);
+		                          access, alignment);
 		return value;
 	});
 }
 
-uint32_t LoadBda(ValueEmitContext& ctx, uint32_t address, uint32_t active, uint32_t bits) {
+uint32_t LoadBda(ValueEmitContext& ctx, uint32_t address, uint32_t active, uint32_t bits,
+                 bool coherent = false) {
 	auto& state = ctx.state;
 	return EmitValueOrZeroIfCondition(state, active, [&]() {
 		const auto aligned = Binary(state, spv::OpBitwiseAnd, TypeU64(state), address,
 		                            ConstantU64(state, ~uint64_t {3}));
-		const auto first   = LoadBdaDword(ctx, aligned);
+		const auto first   = LoadBdaDword(ctx, aligned, coherent);
 		const auto byte =
 		    Binary(state, spv::OpBitwiseAnd, TypeU32(state),
 		           Unary(state, spv::OpUConvert, TypeU32(state), address), ConstantU32(state, 3));
@@ -212,7 +215,7 @@ uint32_t LoadBda(ValueEmitContext& ctx, uint32_t address, uint32_t active, uint3
 		                        TypeBool(state), byte, ConstantU32(state, bits == 16u ? 2u : 0u));
 		const auto second = EmitValueOrZeroIfCondition(state, crosses, [&]() {
 			return LoadBdaDword(ctx, Binary(state, spv::OpIAdd, TypeU64(state), aligned,
-			                                ConstantU64(state, sizeof(uint32_t))));
+			                                ConstantU64(state, sizeof(uint32_t))), coherent);
 		});
 		const auto shift =
 		    Binary(state, spv::OpShiftLeftLogical, TypeU32(state), byte, ConstantU32(state, 3));
@@ -933,7 +936,7 @@ uint32_t LoadIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_
 		values[component] = EmitValueOrZeroIfCondition(
 		    state, AndCondition(state, valid_format,
 		                        IndirectBufferInBounds(state, buffer, component * 4u, 4u, false)),
-		    [&]() { return LoadBdaDword(ctx, address); });
+		    [&]() { return LoadBdaDword(ctx, address, ctx.Memory(inst).coherent); });
 	}
 	return ConstructU32Composite(state, components, values);
 }
@@ -965,7 +968,7 @@ uint32_t LoadIndirectFormattedX(ValueEmitContext& ctx, const IR::Inst& inst) {
 					                                 ? base
 					                                 : Binary(state, spv::OpIAdd, TypeU64(state),
 					                                          base, ConstantU64(state, offset));
-					        return LoadBda(ctx, address, in_bounds, bits);
+					        return LoadBda(ctx, address, in_bounds, bits, ctx.Memory(inst).coherent);
 				        };
 				        const auto emit_component = [&](uint32_t component) {
 					        return LoadFormattedComponent(
@@ -1355,11 +1358,11 @@ void EmitLoadMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	else if (shared_components > 1u)
 		value = LoadWideShared(ctx, inst, shared_components);
 	else if (mem.kind == IR::ResourceKind::ScalarAddress)
-		value = LoadBdaDword(ctx, GuestAddress(ctx, inst, mem));
+		value = LoadBdaDword(ctx, GuestAddress(ctx, inst, mem), mem.coherent);
 	else if (address_info.access == IR::AddressAccess::Read &&
 	         mem.kind != IR::ResourceKind::Scratch)
 		value = LoadBda(ctx, GuestAddress(ctx, inst, mem), ctx.Arg(inst, inst.NumArgs() - 1),
-		                address_info.data_bits);
+		                address_info.data_bits, mem.coherent);
 	else if (op == IR::ValueOpcode::LoadBufferU32 && mem.formatted)
 		value = mem.kind == IR::ResourceKind::IndirectBuffer ? LoadIndirectFormattedX(ctx, inst)
 		                                                     : FormattedLoad(ctx, inst, mem);

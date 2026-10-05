@@ -48,6 +48,22 @@ the guest contract independently and correct it for all supported inputs.
 - In parallel work, assign file ownership and let diagnosis/test design run independently.
   Production implementation starts only after the reproducer has failed as intended.
 
+## Keep the iteration loop short
+
+- Build only the native target containing the current regression, incrementally in the
+  existing build directory. Preserve compiler artifacts and compatible pipeline caches.
+- During iteration run one intended RED, the same GREEN, and the smallest relevant
+  neighboring cases. Prefer an existing lightweight CPU target when it proves the
+  contract; use bounded native GPU readback when execution semantics require it.
+- Do broader affected tests/corpora once on the completed correction. Repeat checks only
+  after changes to their inputs, an unexpected failure, or an unresolved correctness
+  question. Reuse recorded baseline failures for the same source and configuration;
+  do not rebuild an absent patch repeatedly to reconfirm an unchanged baseline.
+- Build/install the emulator and retry the game after the focused correction passes,
+  rather than after each intermediate edit. Never overlap a native build or GPU test
+  with an active game run. Select exact CTest names or a direct harness mode; keep full
+  suite runs an explicit final check when required by the change or repository rules.
+
 ## Prove correctness beyond the captured case
 
 - Run the same regression after the fix. Preserve its oracle; change an expectation only

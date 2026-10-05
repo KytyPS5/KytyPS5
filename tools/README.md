@@ -2,6 +2,41 @@
 
 The corpus tools inspect shader code and compiler failures without executing shaders on a GPU. The compute fixture runner below executes the existing synthetic GPU tests. Run the Windows commands in PowerShell from the repository root, after following the [Windows build setup](../README.md#build-requirements-windows).
 
+## Focused native iteration
+
+Use one incremental build and an explicitly selected regression while editing a fix:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\check-native-change.ps1 `
+  -Target shader_recompiler_compute_tests `
+  -TestRegex '^texture_cache_protected_gc$' -GpuValidation
+```
+
+For an intended RED, use the direct isolated mode and its semantic failure label:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tools\check-native-change.ps1 `
+  -Target shader_recompiler_compute_tests `
+  -HarnessArguments '--texture-gc-protected-prefix-only' -GpuValidation `
+  -Phase red -ExpectedFailurePattern 'failed at protected-prefix reclaimable tail'
+```
+
+The runner builds only `-Target` through `_Build/windows-local.cmd`, then runs the
+selected check once. `-BuildOnly` builds without testing; `-DryRun` prints the plan
+without executing it. Existing compiler output and compatible driver caches remain
+available. Active game/build/test processes prevent execution. Each owned command
+has a deadline, redirected streams and process-tree cleanup; artifacts go into a
+new `_Build/checks/` directory. A build failure or timeout does not count as RED.
+GPU validation uses the explicit Khronos layer and a process-local empty implicit
+layer directory; it does not change Windows registry or hide validation failures.
+
+During iteration, run the isolated RED/GREEN and the closest affected cases. Run
+broader affected checks and corpora once before completing the correction, as
+required by its scope. Reuse an unchanged baseline result with its exact source
+and configuration. Build/install the emulator and retry the game after the focused
+correction passes. Documentation-only edits do not change the generated native
+version header; source, test and build-configuration edits still do.
+
 ## Build the auditor
 
 ```powershell

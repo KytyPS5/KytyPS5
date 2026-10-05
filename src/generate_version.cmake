@@ -2,9 +2,16 @@ set(KYTY_GIT_VERSION "unknown")
 set(KYTY_GIT_HASH "unknown")
 set(KYTY_GIT_REVISION "unknown")
 set(KYTY_GIT_WORKTREE_FINGERPRINT "unknown")
+# Include native source/test/build inputs. Runtime notes and workflow documentation
+# do not change compiled code and must not rewrite this shared header on every edit.
+set(KYTY_BUILD_INPUT_PATHS
+	CMakeLists.txt src tests 3rdparty cmake resources assets
+	CMakePresets.json CMakeUserPresets.json Makefile
+	vcpkg.json vcpkg-configuration.json .gitmodules .gitattributes
+)
 if(GIT_EXECUTABLE)
 	execute_process(
-		COMMAND "${GIT_EXECUTABLE}" describe --tags --always --dirty
+		COMMAND "${GIT_EXECUTABLE}" describe --tags --always
 		WORKING_DIRECTORY "${GIT_WORKING_DIRECTORY}"
 		OUTPUT_VARIABLE KYTY_GIT_VERSION
 		OUTPUT_STRIP_TRAILING_WHITESPACE
@@ -29,19 +36,17 @@ if(GIT_EXECUTABLE)
 	else()
 		string(SUBSTRING "${KYTY_GIT_REVISION}" 0 7 KYTY_GIT_HASH)
 
-		# A Vulkan pipeline cache contains driver-compiled code and must never be
-		# shared by two different emulator binaries.  The commit identifies clean
-		# builds; the diff and hashes of untracked files make local builds equally
-		# reproducible without putting generated/ignored build output in the key.
+		# The commit plus relevant tracked/untracked inputs identifies local code.
+		# Keep documentation and generated/ignored artifacts out of the code identity.
 		execute_process(
-			COMMAND "${GIT_EXECUTABLE}" diff --binary HEAD --
+			COMMAND "${GIT_EXECUTABLE}" diff --binary HEAD -- ${KYTY_BUILD_INPUT_PATHS}
 			WORKING_DIRECTORY "${GIT_WORKING_DIRECTORY}"
 			OUTPUT_VARIABLE GIT_TRACKED_DIFF
 			RESULT_VARIABLE GIT_DIFF_RESULT
 			ERROR_QUIET
 		)
 		execute_process(
-			COMMAND "${GIT_EXECUTABLE}" ls-files --others --exclude-standard
+			COMMAND "${GIT_EXECUTABLE}" ls-files --others --exclude-standard -- ${KYTY_BUILD_INPUT_PATHS}
 			WORKING_DIRECTORY "${GIT_WORKING_DIRECTORY}"
 			OUTPUT_VARIABLE GIT_UNTRACKED_FILES
 			OUTPUT_STRIP_TRAILING_WHITESPACE
@@ -67,14 +72,14 @@ if(GIT_EXECUTABLE)
 			string(SHA256 KYTY_GIT_WORKTREE_FINGERPRINT "${GIT_WORKTREE_MATERIAL}")
 		endif()
 
-		execute_process(
-			COMMAND "${GIT_EXECUTABLE}" diff-index --quiet HEAD --
-			WORKING_DIRECTORY "${GIT_WORKING_DIRECTORY}"
-			RESULT_VARIABLE GIT_DIRTY_RESULT
-			ERROR_QUIET
-		)
-		if(NOT GIT_DIRTY_RESULT EQUAL 0)
+		# The captured diff already covers staged and unstaged changes. Reuse it
+		# instead of rescanning the whole input tree through diff-index.
+		if(NOT GIT_DIFF_RESULT EQUAL 0 OR NOT GIT_UNTRACKED_RESULT EQUAL 0 OR
+		   NOT GIT_TRACKED_DIFF STREQUAL "" OR NOT GIT_UNTRACKED_FILES STREQUAL "")
 			string(APPEND KYTY_GIT_HASH "-dirty")
+			if(NOT KYTY_GIT_VERSION STREQUAL "unknown")
+				string(APPEND KYTY_GIT_VERSION "-dirty")
+			endif()
 		endif()
 	endif()
 endif()

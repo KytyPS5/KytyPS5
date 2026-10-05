@@ -14429,6 +14429,138 @@ void CheckSampledHtileArrayClearDiscovery() {
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  void CheckImageRebindDimensions(bool depth_only = false) {
+    constexpr const char *name = "ImageRebindDimensions";
+    constexpr uintptr_t base = 0x0000000204300000ull;
+    constexpr uint64_t allocation_size = 0x10000;
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "allocation", Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_size, 0, &direct_offset) == 0,
+            "dimension-alias allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "mapping", Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_size) == 0 && mapped == reinterpret_cast<void *>(base),
+            "dimension-alias mapping failed");
+    std::memset(mapped, 0, allocation_size);
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      context.InitializeGpu(nullptr);
+      scheduler.Begin(registers, user_config, shaders);
+      auto &cache = context.GetTextureCache();
+      auto &executor = context.GetRenderExecutor();
+      context.MapMemory(base, allocation_size);
+      u32 scenario = 0;
+      for (const auto format : {Prospero::BufferFormat::k8UNorm,
+                                Prospero::BufferFormat::k16UNorm}) {
+        if (depth_only && format != Prospero::BufferFormat::k16UNorm) continue;
+        for (const bool reverse : {false, true}) {
+          const uint64_t address = base + (++scenario) * 0x1000;
+          constexpr uint8_t texel = 0x7f;
+          Libs::LibKernel::Memory::WriteBacking(address, &texel, sizeof(texel));
+          u32 expected = texel;
+          if (format == Prospero::BufferFormat::k16UNorm) {
+            ImageDesc depth{};
+            depth.type = BindingType::DepthTarget;
+            depth.info.data = {address, 256};
+            depth.info.pixel_format = vk::Format::eD16Unorm;
+            depth.info.guest_format = format;
+            depth.info.type = Prospero::ImageType::kColor2D;
+            depth.info.extent = {1, 1, 1};
+            depth.info.resources = {1, 1};
+            depth.info.pitch = 128;
+            depth.info.bytes_per_block = 2;
+            depth.info.samples = 1;
+            depth.info.tile_mode = Prospero::TileMode::kLinear;
+            depth.info.mip_layout[0] = {0, 256, 128, 1};
+            depth.view_info.format = vk::Format::eD16Unorm;
+            depth.view_info.type = vk::ImageViewType::e2D;
+            depth.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+            depth.view_info.layer_count = 1;
+            depth.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+            const auto id = cache.FindImage(depth);
+            auto &image = cache.GetImage(id);
+            image.Transit(vk::ImageLayout::eTransferDstOptimal,
+                          vk::AccessFlagBits2::eTransferWrite, {}, scheduler.Current().Handle());
+            const vk::ImageSubresourceRange range{vk::ImageAspectFlagBits::eDepth, 0, 1, 0, 1};
+            scheduler.Current().Handle().clearDepthStencilImage(image.backing.image,
+                vk::ImageLayout::eTransferDstOptimal, vk::ClearDepthStencilValue{1.f, 0}, range);
+            cache.MarkGpuWritten(id);
+            expected = 0xffff;
+          }
+          ShaderRecompiler::IR::CompiledShaderInfo program{};
+          program.stage = ShaderType::Compute;
+          ShaderRecompiler::IR::ResourceSnapshot snapshot;
+          const std::array types = reverse
+              ? std::array{Prospero::ImageType::kColor2D, Prospero::ImageType::kColor3D}
+              : std::array{Prospero::ImageType::kColor3D, Prospero::ImageType::kColor2D};
+          for (const auto type : types) {
+            ShaderRecompiler::IR::ImageResource resource{};
+            resource.resource_class = ShaderRecompiler::IR::ImageResourceClass::Sampled;
+            resource.read = true;
+            resource.numeric_class = Prospero::TextureNumericClass::Float;
+            resource.dimension = type == Prospero::ImageType::kColor3D
+                ? ShaderRecompiler::Decoder::ImageDimension::Dim3D
+                : ShaderRecompiler::Decoder::ImageDimension::Dim2D;
+            program.info.images.push_back(resource);
+            auto &value = snapshot.images.emplace_back();
+            value.dword_count = 8;
+            value.dwords = {static_cast<u32>(address >> 8u),
+                static_cast<u32>(format) << 20u, 0,
+                DstSel(4, 4, 4, 1) | (static_cast<u32>(type) << 28u),
+                0, 0x00700000u, 0, 0};
+          }
+          ShaderStageRuntime runtime{&program, &snapshot};
+          PreparedBindings bindings;
+          executor.PrepareBindings(runtime, bindings);
+          executor.RebindImages(bindings);
+          auto output = CreateHostBuffer(name, 8, vk::BufferUsageFlagBits::eTransferDst, {0, 0});
+          for (u32 i = 0; i < bindings.images.size(); ++i) {
+            const auto &binding = bindings.images[i];
+            auto &image = cache.GetImage(binding.image_id);
+            const auto expected_type = types[i] == Prospero::ImageType::kColor3D
+                ? vk::ImageType::e3D : vk::ImageType::e2D;
+            Require(name, "descriptor dimension and live view",
+                    binding.image_view != nullptr && image.backing.image_type == expected_type,
+                    "alias rediscovery lost a live view or the requested dimension");
+            image.Transit(vk::ImageLayout::eTransferSrcOptimal,
+                          vk::AccessFlagBits2::eTransferRead, {}, scheduler.Current().Handle());
+            vk::BufferImageCopy copy{};
+            copy.bufferOffset = i * sizeof(u32);
+            copy.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+            copy.imageExtent = {1, 1, 1};
+            scheduler.Current().Handle().copyImageToBuffer(image.backing.image,
+                vk::ImageLayout::eTransferSrcOptimal, output.buffer, 1, &copy);
+          }
+          vk::MemoryBarrier barrier{};
+          barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+          barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+          scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+              vk::PipelineStageFlagBits::eHost, {}, 1, &barrier, 0, nullptr, 0, nullptr);
+          RenderExecutorTestAccess::ResetBindings(executor);
+          scheduler.Finish();
+          Require(name, "GPU contents",
+                  ReadBuffer(name, output, 2) == std::vector<u32>{expected, expected},
+                  "dimension-alias replacement lost uploaded or GPU-written bytes");
+          DestroyBuffer(&output);
+        }
+      }
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    Require(name, "release", Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0 &&
+                Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                    direct_offset, allocation_size) == 0,
+            "dimension-alias release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckRenderExecutorStencilBindingDiscovery() {
     constexpr const char *name = "RenderExecutorStencilBindingDiscovery";
     constexpr uintptr_t base = 0x0000000203600000ull;
@@ -47154,6 +47286,16 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, VectorMadF32FlushesDenorms());
     RunCase(&vulkan, Vop3FmacF32NegatedSourceAccumulates());
     RunCase(&vulkan, VectorFloatArithmeticOps());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--image-rebind-dimensions-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckImageRebindDimensions();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--image-rebind-depth-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckImageRebindDimensions(true);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--mad-f32-budget-only") == 0) {

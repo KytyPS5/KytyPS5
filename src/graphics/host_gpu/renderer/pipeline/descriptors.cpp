@@ -1324,6 +1324,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	auto&       images   = prepared.images;
 	EXIT_IF(images.size() != program.info.images.size());
 	auto& texture_cache = m_context.GetTextureCache();
+	// Acquire each view before a later overlapping descriptor can replace its image.
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		const auto old_image = texture_cache.m_slot_images.try_get(images[i].image_id);
 		if (old_image == nullptr || (!old_image->registered && !old_image->info.data.Empty()) ||
@@ -1335,8 +1336,6 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 			BindImage(images[i].image_id,
 			          images[i].desc.type == TextureCache::BindingType::Storage);
 		}
-	}
-	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		auto& binding = images[i];
 		binding.mip_views.clear();
 		const auto& resource = program.info.images[i];

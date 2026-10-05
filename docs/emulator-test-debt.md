@@ -1,5 +1,56 @@
 # Emulator regression test debt
 
+## Overlapping image dimensions and view acquisition (2026-10-05; native RED/GREEN and scoped neighbors proved)
+
+Candidate upstream a2f851788f3f4edc7649c9b31f27215b05febb6d corrects shared
+RebindImages view acquisition and depth overlap dimensional recreation. Current
+source7ace6ff8 still resolves all aliases before creating their views. Required
+synthetic regression: one mapped allocation exposed through 3D then 2D descriptors
+and reverse order, R8 uploaded byte0x7f and R16 GPU-produced D16 depth1.0/rawffff.
+Verify each final native image dimension/live view and exact GPU-transfer readback
+of both aliases after replacement. Independent Vulkan image/view compatibility:
+https://docs.vulkan.org/refpages/latest/refpages/source/VkImageViewCreateInfo.html .
+Native GPUAV RED08:16UTC on unchanged production7ace6ff8/testEXE
+454d698beb7a4f90931017fa7d95f3e635875721d6b78a070bbabe961e85049b:
+--image-rebind-dimensions-only and independent --image-rebind-depth-only both
+exit321 with texture requires rediscovery before final acquisition at
+textureCache.cpp1785. Both streams inspected: no VUID/timeout, intended alias
+retirement error. Logs image-rebind-{dimensions,depth}-red-gpuav-20261005.log.
+Test inserted from ignored draft, both orders/oracles unchanged for GREEN.
+Selective shared RebindImages view acquisition applied after RED. Unchanged
+four cases GREEN08:18UTC/testEXE186c279cfa7d73246a86fc7135d5ee33bcfeeb7e7efff370900b2e096701f311,
+exact native GPU contents/live dimensions and zero VUIDs. Additional upstream
+ResolveDepthOverlap IsVolume condition NOT imported: local existing depth/color
+recreation already passes these R16 cases; no independent RED for that condition.
+No unrelated read-only buffer fixture change. Layered/cube and HTile subset
+neighbors GREEN08:20UTC/zero VUIDs. Existing stencil/mip fixture FAIL at R32 uint
+depth-backed view, expecting same D32 backing. Scoped removal of ONLY saved
+view-acquisition patch reproduces identical failure08:23UTC/testEXEf657c41cc50101b54bd3be7a0e11bbb24d8236364c769241328f27ea2583d945,
+no VUID/timeout; therefore preexisting, not introduced by this fix. Both logs
+image-rebind-neighbor-stencil-mips-gpuav and image-rebind-stencil-baseline-gpuav-
+20261005 retain exact failure. This old fixture does not validate later cases;
+update its depth/color oracle only from independent contract/readback evidence.
+Restored exact owned patch; final native testEXE5a8ee05c1abf867b1d3cf1ece8c748900330e3cc53196ea67f5d513c2a031ede.
+Native GPUAV CTest3/3 PASS08:25UTC: graphics_image_rebind_dimensions,
+shader_scaled_texture_filtering, graphics_packed_float_roundtrip. Log
+image-rebind-final-ctest-gpuav-20261005.log (UTF16). Full suite remains RED;
+actual scene colors/menu/game retry not proved by these synthetic checks. Native bounded GPUAV RED on unfixed source
+must precede a core port; preserve local read-only unaligned-buffer fixture (do
+not copy unrelated upstream change to read/write). Neighbor stencil/depth alias,
+mip-view and layered image tests required after any fix. Relation to Yotei dark
+scene unproved; no menu/color compatibility claim from this candidate.
+
+## Native run finalization race (2026-10-05; workflow diagnosis)
+
+Cold run070232 source7ace6ff8 reaches counter205 by30min deadline; native
+wrapper Kill reports access denied and skips original run.json finalization.
+Later CIM confirms process42480/descendants absent, logs EOF/cache flush,
+but emulator exit code is unverified. Preserve separate observation JSON.
+Prospective ignored warm-origin helper checks original handle after Kill error
+and records/drains/disposes in finally; parser syntax PASS. Workflow-only, not
+an emulator defect RED or a passing menu result. Deadline capture withheld
+on failed foreground acquisition; no settings/input/metadata writer verified.
+
 ## Legacy MAD code-size and native pipeline cost (2026-10-05; native RED/GREEN and GPUAV neighbors proved)
 
 Native source1fd40efc retry061159 remains at black shown157 while creating
@@ -33,7 +84,11 @@ FP64 arithmetic7/conversion10, cooperative BDA1 cases PASS under GPUAV.
 Final targeted CTest5/5 PASS06:56UTC mad-outlined-final-ctest-gpuav-20261005.log.
 A missing test helper argument caused final-build failure, corrected to nullptr
 in test harness; not counted as a regression. Full suite still not green.
-Actual emulator/game performance and corrected scene color pending new build.
+Actual new source7ace6ff8 retry070232: E80 module105989->51437,6cc64dee
+498313->313130, cooperative54904fb4 965060->680914words. First big native
+cooperative pipeline still136641ms versus older107-114s variants. Module-size
+correction is proved; cold-time improvement/scene colors/menu are not. Current
+runtime continues within original30min/480s/28GiB bounds, audio origin pending.
 Khronos SPIR-V Function Control DontInline is only a performance hint:
 https://registry.khronos.org/SPIR-V/specs/unified1/SPIRV.html#_function_control .
 FTZ and product/add NoContraction remain in the function body; no global mode

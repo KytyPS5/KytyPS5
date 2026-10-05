@@ -1,5 +1,141 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **5 октября 2026 года, 08:26 UTC** (shared overlapping-view fix completed; native emulator build next):
+
+- Selective upstream a2f85178: RebindImages acquires each view immediately after
+  its descriptor rediscovery, before a later alias retires its native image.
+  Existing scheduler deferred lifetime retained; no error suppression or title path.
+- Same synthetic four cases (3D/2D both orders; R8 uploaded7f and GPU D16/R16ffff)
+  native GPUAV RED on production7ace6ff8/454d698b, GREEN after single shared loop
+  correction/186c279c. Independent depth-only likewise RED/GREEN; zero VUID/timeout.
+  Oracles unchanged. Extra upstream IsVolume condition/unrelated RW-buffer edit
+  not imported: local depth/color mechanism already passes these cases.
+- Layered views/cube storage and native HTile subset GPUAV GREEN. Large stencil/
+  mip fixture fails identical R32 uint depth-backed view expectation both with
+  and without ONLY this patch; baseline EXEf657c41c/logimage-rebind-stencil-
+  baseline-gpuav-20261005 proves preexisting08:23UTC. Later fixture stages untested;
+  full suite not green, do not reinterpret this as global no-regression proof.
+- Restored exact owned patch and rebuilt final testEXE SHA256
+  5a8ee05c1abf867b1d3cf1ece8c748900330e3cc53196ea67f5d513c2a031ede.
+  Native GPUAV CTest3/3 PASS08:25UTC (new image rebind, scaled texture, packed float),
+  logimage-rebind-final-ctest-gpuav-20261005.log. Build both streams no error.
+- Last game074232 black/shown210/deadline with clean exit and saved360308953B cache.
+  Actual improved scene colors/menu/audio origin pending. Next separate fix commit,
+  native windows-local emulator build/install/hash, bounded warmed-cache game retry.
+  No issue108 update or push; preserve game/save/cache and serialize native/GPU work.
+
+Checkpoint **5 октября 2026 года, 08:22 UTC** (view acquisition RED/GREEN;
+old neighboring fixture baseline build ACTIVE):
+
+- Native GPUAV RED on production7ace6ff8/testEXE454d698b: R8 and independent
+  GPU D16/R16 both exit321, texture requires rediscovery before final acquisition,
+ 08:16UTC; no VUID/timeout. Both descriptor orders and exact0x7f/0xffff oracles.
+- After selective a2f85178 RebindImages single-pass view acquisition, unchanged
+  four cases GREEN08:18UTC/testEXE186c279c, depth-only GREEN08:19UTC. No VUID,
+  native dimensions/live views/readback preserved. No ResolveDepthOverlap port:
+  local existing depth/color recreation already passes these depth cases.
+- Neighbors layered views/cube storage and native HTile subset GREEN08:20UTC.
+  Full stencil/mip fixture FAIL at old R32 uint depth-backed view expectation
+  (expects same D32 native image). Not yet classified preexisting/new regression.
+- Saved exact owned patch _Build/analysis/image-rebind-view-order-proved-
+  20261005.patch and green testEXE _Build/artifacts/image-rebind-view-order-green-
+  186c279c-20261005.exe. ONLY owned core patch temporarily reversed for same
+  neighboring test baseline. Active native build59485/labelimage-rebind-stencil-
+  baseline-build-20261005; core currently7ace6ff8, tests/CMake unchanged. Freeze
+  inputs until build ends; compare exact failure before reapplying saved patch.
+- Warm game074232 ended/clean described below; menu/colors/audio metadata origin
+  still pending. No issue108 update or push; full suite not green.
+
+Checkpoint **5 октября 2026 года, 08:14 UTC** (warm run074232 ended; image alias RED next):
+
+- Same committed7ace6ff8/exact EXEabb68e8c; run07:42:32-08:12:45UTC,
+  timedOut=true/gracefulCloseSucceeded=true/exit0. Last shown210/completed
+  compute pipelines413. Both viewed warm209 and210 captures black, no settings
+  or input. Early203 nonzero10 pixels is spinner evidence only; no menu.
+- Metadata recorder83360 ends0 through bounded deadline/finally; no writes or
+  fault captured. Previous metadata address reads128B zeros07:57:39. No audio
+  production fix, endian contract or early-writer proof. Only last API instance
+  log402e in earlier fault run; owner402f/state flags do not establish its actual
+  instance-create flags. Keep this inference pending.
+- stdout8370B/stderr0 read; pipeline cache saved360308953B. Native CIM confirms
+  own10592/children and emulator/test/Ninja/MSBuild absent08:13UTC; installed
+  hash unchanged. Warm helper finalization now succeeds; prior cold unknown
+  exit remains separately documented. Saves/game/cache preserved.
+- Useful upstream candidate a2f85178: synthetic overlapping dimensions/view
+  acquisition draft prepared. Native bounded GPUAV RED for ordinary R8 alias
+  and separate GPU-produced D16/R16 alias must precede core port. Existing
+  read-only unaligned buffer fixture preserved. Relation to dark scene unproved.
+- Upstream remains72e4989b at08:02UTC. PR497 remote head1fd40efc verified08:04UTC;
+  local7ace6ff8 unpublished, no push performed. Issue108 only after visually
+  verified menu then game entry; current conservative main/title-menu target
+  remains an assumption pending any user clarification. No status comment.
+
+Checkpoint **5 октября 2026 года, 07:59 UTC** (ACTIVE warm retry10592):
+
+- Same committed source7ace6ff810911740d5705bff5769cd21951aadd2/exact installed
+  abb68e8c388af416144b4151bb518a48fc9f740788ffc6039e91fa9a68721d5a; no new
+  production/shader edits. Preserved307885924B pipeline cache, game/save data.
+- Run074232 starts07:42:32UTC/deadline08:12:32UTC,1800s/480s watchdog/28GiB,
+  validationOFF/diagnostic480x270. Runner54590 active; recorder83360 arms79
+  threads07:42:47UTC at prior metadata+0xc. Restore own watches/forward faults.
+- Warm bootstrap reaches counter138 by07:44:11UTC and209 by07:52UTC. Actual
+  viewed window-warm-209.png remains black; bottom-right white area is a Windows
+  notification overlay, not guest pixels. Native compute creation still advances
+  (361 shaders by07:58UTC); no settings/input verified. Previous metadata address
+  0x100952beb0 reads zeros in bounded128B read07:57:39UTC; no watched write yet.
+  Earlier metadata producer/calibrated colors/main menu pending. Warm cache retry
+  targets this unobserved producer after cold deadline, not a known fault repeat.
+- Prior cold wrapper finalization error/unknown emulator exit documented below;
+  native CIM clean before this launch. Prospective warm helper records even
+  Kill/exit race. Serialize native build/GPU tests; no issue108 update or push.
+
+Checkpoint **5 октября 2026 года, 07:37 UTC** (cold run070232 ended;
+same-source warm-cache metadata retry next, no additional shader edits):
+
+- Source7ace6ff8/exact EXEabb68e8c; cold run reaches last shown205/completed
+  compute pipelines229 by1800s deadline. Actual last viewed capture123 black;
+  deadline capture withheld because foreground could not be acquired. No input,
+  visually verified settings/menu/gameplay or matched-color comparison.
+- Wrapper89072 ends1: Kill reports access denied during close/timeout cleanup,
+  skipping original run.json finalization. Do NOT infer emulator exit0; exit
+  code unknown. Both subsequent native CIM checks confirm42480 and descendants
+  absent, no emulator/test/Ninja/MSBuild. stderr0, stdout/guest EOF confirms
+  pipeline cache307885924bytes checkpointed/unchanged. Preserve start-only
+  run.json and separate runner-finalization-observation.json.
+- Recorder79139 ends0 via its deadline/finally/restored watch slots/detach;
+  no metadata writes/fault captured. No audio fix or independent API contract.
+- Prospective ignored warm-origin run helper handles Kill/exit race by waiting
+  on original process handle and recording/draining/disposing in finally;
+  PowerShell parser syntax PASS. Workflow-only; no artificial emulator test.
+- Cache preserved. One bounded same-source warm retry is justified to reach
+  the unobserved earlier metadata writer and actual settings, not to repeat an
+  unchanged known audio fault. Same30min/480s/28GiB limits; native hashes unchanged.
+  No issue108 update/push; calibrated colors/main/title menu still PENDING.
+
+Checkpoint **5 октября 2026 года, 07:03 UTC** (ACTIVE game42480/source7ace6ff8):
+
+- Shared compact MAD/bitcast correction committed7ace6ff810911740d5705bff5769cd21951aadd2.
+  Native emulator build/install PASS, logs mad-outlined-emulator-{build,install}-
+  20261005.log; exact build/install SHA256abb68e8c388af416144b4151bb518a48fc9f740788ffc6039e91fa9a68721d5a.
+  Only Qt translation-catalog install warning; no build error.
+- New run070232 starts07:02:32UTC/deadline07:32:32UTC,1800s/480s watchdog/28GiB,
+  Vulkan validationOFF/480x270 diagnostic guest. Game/save/cache preserved.
+  Runner89072 active; hash-guarded metadata-origin watch79139 attaching to42480.
+- Actual early E80 module emits51437words versus prior MAD inline105989;
+  current native compute pipeline creates successfully1789ms. Capture123 black;
+  later125 shown. This is module-size evidence, not menu/color or controlled
+  whole-run speed proof. Metadata-origin writer still pending.
+- Later compute6cc64dee module313130words versus previous498313. First
+  cooperative54904fb4 module680914 versus previous965060, but actual cold
+  creation136641ms (older variants107-114s): smaller binary is not a proved
+  compilation-time win. Later shown162, source7ace6ff8; runtime stage pending.
+- Same regression budgets/oracle native GPUAV GREEN and CTest5/5 recorded
+  below; full suite still not green. Actual native pipeline cost, matched scene
+  colors, metadata-origin writer, main/title menu/game entry remain PENDING.
+- No issue108 update or push. Freeze installed source; serialize native builds
+  and GPU tests while this game/recorder are active. Capture actual settings
+  before input; hardware watches restored after capture or normal cleanup.
+
 Checkpoint **5 октября 2026 года, 06:57 UTC** (shared MAD code-size correction
 completed; separate fix commit/native emulator build next):
 

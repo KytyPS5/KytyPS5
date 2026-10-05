@@ -29,15 +29,114 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <charconv>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <string_view>
 #include <mutex>
 #include <span>
 #include <unordered_map>
 #include <vector>
 
 namespace Libs::Graphics {
+// Opt-in compute-dispatch buffer inspector for persistent-queue shaders that spin
+// on GPU-produced counters (e.g. Wukong Nanite culling, issue #1072).
+// Set KYTY_DUMP_DISPATCH_BUFFERS to "all" or a comma-separated list of hex shader
+// hashes. Each matching dispatch logs the first 16 dwords of every bound buffer,
+// GPU-accurately: FlushAndWait drains prior work before the "before" snapshot, and
+// again after recording the dispatch for the "after" snapshot. Comparing the two
+// shows whether claim counters and slot markers move or are stale, distinguishing
+// a missed reset/reorder from an atomics-visibility or forward-progress problem.
+// Off by default and capped so logs stay manageable.
+struct DispatchBufferDumpConfig {
+	bool                 enabled = false;
+	bool                 all     = false;
+	std::vector<uint64_t> hashes;
+};
+
+const DispatchBufferDumpConfig& GetDispatchBufferDumpConfig() {
+	static const DispatchBufferDumpConfig config = [] {
+		DispatchBufferDumpConfig cfg;
+		const char*              value = std::getenv("KYTY_DUMP_DISPATCH_BUFFERS");
+		if (value == nullptr || *value == '\0') {
+			return cfg;
+		}
+		cfg.enabled = true;
+		std::string_view rest(value);
+		while (!rest.empty()) {
+			const auto comma = rest.find(',');
+			const auto token =
+			    comma == std::string_view::npos ? rest : rest.substr(0, comma);
+			if (token == "all") {
+				cfg.all = true;
+			} else {
+				uint64_t     hash {};
+				const auto [ptr, ec] =
+				    std::from_chars(token.data(), token.data() + token.size(), hash, 16);
+				if (ec == std::errc() && ptr == token.data() + token.size()) {
+					cfg.hashes.push_back(hash);
+				}
+			}
+			if (comma == std::string_view::npos) {
+				break;
+			}
+			rest = rest.substr(comma + 1);
+		}
+		return cfg;
+	}();
+	return config;
+}
+
+bool DispatchBufferDumpWanted(uint64_t shader_hash) {
+	const auto& config = GetDispatchBufferDumpConfig();
+	if (!config.enabled) {
+		return false;
+	}
+	if (config.all) {
+		return true;
+	}
+	return std::ranges::find(config.hashes, shader_hash) != config.hashes.end();
+}
+
+void DumpDispatchBuffers(RenderContext& context, uint64_t shader_hash,
+                         const PreparedBindings& bindings, const char* phase) {
+	static std::atomic<uint32_t> dump_count {0};
+	if (dump_count.fetch_add(1, std::memory_order_relaxed) >= 16) {
+		return;
+	}
+	// Drain the queue so the snapshot reflects completed GPU work, then pull the
+	// guest ranges back to CPU visibility before reading them.
+	context.GetCommandScheduler().FlushAndWait();
+	auto&       cache      = context.GetBufferCache();
+	constexpr uint64_t kMaxBytes = 16u * sizeof(uint32_t);
+	const uint32_t binding_limit =
+	    static_cast<uint32_t>(std::min<size_t>(bindings.buffer_sources.size(), 8u));
+	for (uint32_t i = 0; i < binding_limit; i++) {
+		const auto& source = bindings.buffer_sources[i];
+		if (source.address == 0 || source.size == 0) {
+			continue;
+		}
+		const uint64_t bytes = std::min(source.size, kMaxBytes);
+		cache.ReadMemory(source.address, bytes);
+		uint32_t words[16] = {};
+		std::memcpy(words, reinterpret_cast<const void*>(source.address),
+		            static_cast<size_t>(bytes));
+		LOGF("DispatchBufferDump: shader=0x%016" PRIx64 " %s binding=%u addr=0x%012" PRIx64
+		     " size=0x%" PRIx64 " dwords0-7=[0x%08" PRIx32 " 0x%08" PRIx32 " 0x%08" PRIx32
+		     " 0x%08" PRIx32 " 0x%08" PRIx32 " 0x%08" PRIx32 " 0x%08" PRIx32 " 0x%08" PRIx32
+		     "]\n",
+		     shader_hash, phase, i, source.address, source.size, words[0], words[1],
+		     words[2], words[3], words[4], words[5], words[6], words[7]);
+		LOGF("DispatchBufferDump: shader=0x%016" PRIx64 " %s binding=%u dwords8-15=[0x%08" PRIx32
+		     " 0x%08" PRIx32 " 0x%08" PRIx32 " 0x%08" PRIx32 " 0x%08" PRIx32 " 0x%08" PRIx32
+		     " 0x%08" PRIx32 " 0x%08" PRIx32 "]\n",
+		     shader_hash, phase, i, words[8], words[9], words[10], words[11],
+		     words[12], words[13], words[14], words[15]);
+	}
+}
+
 static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::DescriptorValue> sources,
                                  GuestRange destination, uint32_t output_buffer = UINT32_MAX) {
 	for (uint32_t i = 0; i < sources.size(); ++i) {
@@ -350,6 +449,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	RebindImages(bindings);
 	BindSharedMemory(m_context, input_info, bindings);
 	RebindBuffers(bindings);
+	const bool dump_dispatch_buffers = DispatchBufferDumpWanted(program.shader_hash);
+	if (dump_dispatch_buffers) {
+		DumpDispatchBuffers(m_context, program.shader_hash, bindings, "before");
+	}
 
 	auto              vk_buffer        = buffer.Handle();
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
@@ -431,6 +534,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+	if (dump_dispatch_buffers) {
+		DumpDispatchBuffers(m_context, program.shader_hash, bindings, "after");
+	}
 
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);

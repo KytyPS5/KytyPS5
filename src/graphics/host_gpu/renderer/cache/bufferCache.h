@@ -204,7 +204,7 @@ private:
 	PageTable                                         m_page_table;
 	RangeSet                                          m_gpu_modified_ranges;
 	// One per TileManager::ColorClearSlots key slot.
-	std::array<RangeSet, 8>                           m_checked_color_metadata;
+	std::array<RangeSet, 16>                          m_checked_color_metadata;
 	RangeSet                                          m_released_ranges;
 	bool                                              m_record_released = false;
 	MemoryTracker                                     m_memory_tracker;

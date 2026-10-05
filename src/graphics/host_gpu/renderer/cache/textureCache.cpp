@@ -44,7 +44,9 @@ constexpr uint64_t SmallTiledReadbackTexels = 64 * 64;
 	                           ? TextureGetSurfaceFormatInfo(desc.info.guest_format).vk_format
 	                           : desc.view_info.format;
 	const bool  cmask    = metadata.kind == ImageMetadataKind::Cmask;
-	if (cmask ? code == 0 : code == 0x20) {
+	// PS5 DCC fast clears to the CB_COLOR_CLEAR_WORD value fill the keys with 0x10, not the
+	// GFX10 0x20.
+	if (cmask ? code == 0 : (code == 0x20 || code == 0x10)) {
 		// Register clears belong to the color buffer; the texture pipe cannot decode them.
 		return desc.type == TextureCache::BindingType::RenderTarget &&
 		       metadata.clear_register_valid &&
@@ -1145,7 +1147,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		uint32_t keys = 0;
 		for (uint32_t key = 0; key < clears.size(); key++) {
 			clears[key].aspectMask = vk::ImageAspectFlagBits::eColor;
-			if (DecodeColorClear(desc, static_cast<uint8_t>(key << 5u),
+			if (DecodeColorClear(desc, static_cast<uint8_t>(key << 4u),
 			                     clears[key].clearValue.color)) {
 				keys |= 1u << key;
 			}

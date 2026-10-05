@@ -54,10 +54,11 @@ public:
 	                                const D16Layout& layout);
 	[[nodiscard]] Result TransformColor(Result input, ColorTransform transform, bool to_host);
 	void TransformColor(Result input, Result output, ColorTransform transform, bool to_host);
-	// Color-clear keys are multiples of 0x20, so key >> 5 selects one of these slots.
-	static constexpr uint32_t ColorClearSlots = 8;
+	// Color-clear keys are multiples of 0x10 (0x10 is the PS5 register clear), so key >> 4
+	// selects one of these slots.
+	static constexpr uint32_t ColorClearSlots = 16;
 	// metadata spans `slices` equal runs `stride` bytes apart. Returns the buffer whose dword
-	// slice * ColorClearSlots + (key >> 5) is set when every byte of that run equals a key whose
+	// slice * ColorClearSlots + (key >> 4) is set when every byte of that run equals a key whose
 	// bit `keys` selects; a hit expands to 0xff when `expand` is set.
 	[[nodiscard]] vk::Buffer CheckColorClear(Result metadata, uint64_t stride, uint32_t slices,
 	                                         uint32_t keys, bool expand);

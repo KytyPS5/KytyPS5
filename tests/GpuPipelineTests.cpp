@@ -2,6 +2,7 @@
 #include "common/spscQueue.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/hostCopyQueue.h"
+#include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/occlusionQueries.h"
 
 #include <array>
@@ -11,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <memory>
 #include <thread>
@@ -523,6 +525,28 @@ void TestOcclusionCounters() {
 	Check(!ageing.Counting(), "dropped after the limit");
 }
 
+void TestPackedColorClear16() {
+	using Libs::Graphics::DecodePackedColorClear;
+	vk::ClearColorValue clear {};
+	// GTA V clears its R16_FLOAT particle depth target to the largest half (0x7bff) with a
+	// register fast clear; dropping it left the MIN-blended target at zero.
+	Check(DecodePackedColorClear(vk::Format::eR16Sfloat, 0x00007bffu, clear) &&
+	          clear.float32[0] == 65504.0f,
+	      "R16_SFLOAT clear decodes the low half");
+	Check(DecodePackedColorClear(vk::Format::eR16G16Sfloat, 0xbc003c00u, clear) &&
+	          clear.float32[0] == 1.0f && clear.float32[1] == -1.0f,
+	      "R16G16_SFLOAT clear decodes R low and G high");
+	Check(DecodePackedColorClear(vk::Format::eR16Sfloat, 0x00000001u, clear) &&
+	          clear.float32[0] == 0x1p-24f,
+	      "R16_SFLOAT clear decodes subnormals");
+	Check(DecodePackedColorClear(vk::Format::eR16Sfloat, 0x00007c00u, clear) &&
+	          clear.float32[0] == std::numeric_limits<float>::infinity(),
+	      "R16_SFLOAT clear decodes infinity");
+	Check(DecodePackedColorClear(vk::Format::eR16G16Unorm, 0x0000ffffu, clear) &&
+	          clear.float32[0] == 1.0f && clear.float32[1] == 0.0f,
+	      "R16G16_UNORM clear decodes both channels");
+}
+
 int main() {
 	TestCommandStreamOrder();
 	TestCommandStreamArraysStayInChunk();
@@ -532,6 +556,7 @@ int main() {
 	TestInlineFunction();
 	TestHostCopyQueue();
 	TestOcclusionCounters();
+	TestPackedColorClear16();
 	std::printf("GpuPipelineTests: all tests passed\n");
 	return 0;
 }

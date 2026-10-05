@@ -1,6 +1,6 @@
 # Emulator regression test debt
 
-## Sampled HTile owner rediscovery (2026-10-05; current runtime blocker)
+## Sampled HTile owner rediscovery (2026-10-05; regression proved, runtime guard passed)
 
 Native source06bfff66/SHA
 `05f4705d791c21484307ce74b9c3cf94c16f580fcc00864694b4887ce4879412`,
@@ -79,6 +79,20 @@ older diagnostic-only0bc61e11 image until the new native build/install. No other
 game tested; no full-suite/menu claim. Next commit this shared fix separately,
 serialize native build/install/hash verification, preserve pipeline cache and
 retry the actual game. Issue108 only actual menu/game entry; no push.
+
+
+Native runtime verification after local commit `f708edc1`: Windows build/install
+PASS, exact EXE SHA
+`c73cc32e4bd75cd75c6ab9784989b1c8c96fe7f03f3a2f0a84ae719b08d8e29c`.
+Run `yotei-integrated-20261005-005102-imported-htile-depth-subviews-noval`
+00:51:02–01:03:12UTC passes the earlier imported-owner guard, VS112/PS97/CS536,
+514 successful compute creations. First nonzero readback frame202; actual task
+window remains very dark with no legible menu. Total720s deadline, graceful close
+exit0, no fatal/DeviceLost; PID43004 gone, streams drained/disposed. Active native
+compiler observed and one cold creation151142ms; module1437 validates Vulkan1.3.
+Cache138390578bytes retained. Next same-EXE bounded warm-cache continuation;
+nonzero pixels are separate from menu/game entry, both still PENDING. Older fill,
+compressed-alias and CFG baseline failures are not resolved by this correction.
 
 ## HTile clear state beyond32 layers (2026-10-05; new runtime frontier)
 

@@ -1,7 +1,29 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **5 октября 2026 года, 01:03 UTC** (native Windows via WSL;
+installed source `f708edc1`, EXE SHA
+`c73cc32e4bd75cd75c6ab9784989b1c8c96fe7f03f3a2f0a84ae719b08d8e29c`):
 
-
+- Imported HTile subview fix committed separately; native Windows build/install
+  PASS (`imported-htile-emulator-{build,install}-20261005.log`); hashes match.
+  Earlier GPUAV RED/GREEN and affected CTest8/8 remain recorded below/in test debt.
+- Actual run `yotei-integrated-20261005-005102-imported-htile-depth-subviews-noval`
+  runs00:51:02–01:03:12UTC. Reaches VS112/PS97/CS536 and514 completed compute
+  creations (runner513 before final shutdown drain). Previous owner guard passed;
+  no fatal/DeviceLost. Total720s deadline closes the task-owned process gracefully,
+  exit0; this is a timed-out observation, not successful game completion.
+- First numerical nonzero readback is frame202; frames202–207 slowly brighten,
+  still very dark (last RGB maxima51/51/49 in10-bit format). Exact task-window
+  captures `window-first-pixels.png` and `window-before-deadline.png` inspected;
+  no legible menu. **Rendered nonzero pixels verified; menu/game entry PENDING.**
+- Cold compute pipelines complete in up to151142ms; thread sampling proves active
+  NVIDIA compiler work, not the former guest execute-page fault. Last captured
+  CS8457 module1437 validates Vulkan1.3. Corecache138390578bytes retained.
+  Runner streams drained/disposed, PID43004 gone; next same-EXE bounded warm-cache
+  continuation, verify actual image/new blocker. No additional behavior fix inferred.
+- Full-suite/other-game results remain unproved; known baseline failures remain
+  separate debt. Issue108 ONLY visually verified menu then confirmed game entry,
+  linked to PR497. All intermediate results local-only; no push authorization.
 
 Checkpoint **5 октября 2026 года, 00:44 UTC** (native Windows via WSL;
 source06bfff66 plus regression-proved imported-array subview correction):

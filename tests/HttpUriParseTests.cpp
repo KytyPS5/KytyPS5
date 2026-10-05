@@ -44,24 +44,11 @@ using HttpUriParse = int(KYTY_SYSV_ABI *)(SceHttpUriElement *, const char *,
 using HttpUriBuild = int(KYTY_SYSV_ABI *)(char *, size_t *, size_t,
                                           const SceHttpUriElement *, uint32_t);
 
-HttpUriBuild GetHttpUriBuild() {
-  Loader::SymbolDatabase symbols;
-  Libs::LibHttp::InitNet_1_Http(&symbols);
-  const auto *record =
-      symbols.FindByNid("5LZA+KPISVA", Loader::SymbolType::Func);
+template <typename T>
+T GetHttpFunction(const Loader::SymbolDatabase &symbols, const char *nid) {
+  const auto *record = symbols.FindByNid(nid, Loader::SymbolType::Func);
   CHECK(record != nullptr);
-  return record != nullptr ? reinterpret_cast<HttpUriBuild>(record->vaddr)
-                           : nullptr;
-}
-
-HttpUriParse GetHttpUriParse() {
-  Loader::SymbolDatabase symbols;
-  Libs::LibHttp::InitNet_1_Http(&symbols);
-  const auto *record =
-      symbols.FindByNid("IWalAn-guFs", Loader::SymbolType::Func);
-  CHECK(record != nullptr);
-  return record != nullptr ? reinterpret_cast<HttpUriParse>(record->vaddr)
-                           : nullptr;
+  return record != nullptr ? reinterpret_cast<T>(record->vaddr) : nullptr;
 }
 
 template <size_t N>
@@ -131,8 +118,6 @@ void TestPresentQuery(HttpUriParse parse) {
   }
 }
 
-// Builds `element` with `option` and returns the text, checking that the size query
-// (out == nullptr) agrees with what the fill call wrote.
 std::string BuildWith(HttpUriBuild build, const SceHttpUriElement &element,
                       uint32_t option) {
   size_t required = 0;
@@ -145,9 +130,6 @@ std::string BuildWith(HttpUriBuild build, const SceHttpUriElement &element,
   return std::string(out.data());
 }
 
-// SCE_HTTP_URI_BUILD_WITH_* selects components. Black Myth: Wukong asks for SCHEME alone and
-// needs "https://" back; a build that ignored the mask returned the whole URL and the game
-// then refused to start any HTTP request.
 void TestBuildHonoursOption(HttpUriParse parse, HttpUriBuild build) {
   constexpr char url[] =
       "https://user:pw@gssdk1.gamesci.com.cn:8443/VersionServerImpl?x=1#frag";
@@ -176,8 +158,6 @@ void TestBuildHonoursOption(HttpUriParse parse, HttpUriBuild build) {
   CHECK(BuildWith(build, element, hostname | port) ==
         "gssdk1.gamesci.com.cn:8443");
 
-  // Everything selected rebuilds the original URL, and a mask with no component bit set keeps
-  // the older "everything" behaviour for callers that never passed one.
   CHECK(BuildWith(build, element, 0xff) == url);
   CHECK(BuildWith(build, element, 0) == url);
 }
@@ -185,8 +165,10 @@ void TestBuildHonoursOption(HttpUriParse parse, HttpUriBuild build) {
 } // namespace
 
 int main() {
-  const auto parse = GetHttpUriParse();
-  const auto build = GetHttpUriBuild();
+  Loader::SymbolDatabase symbols;
+  Libs::LibHttp::InitNet_1_Http(&symbols);
+  const auto parse = GetHttpFunction<HttpUriParse>(symbols, "IWalAn-guFs");
+  const auto build = GetHttpFunction<HttpUriBuild>(symbols, "5LZA+KPISVA");
   if (parse == nullptr || build == nullptr) {
     return 1;
   }

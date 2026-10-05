@@ -599,12 +599,6 @@ static int KYTY_SYSV_ABI HttpUriBuild(char* out, size_t* require, size_t prepare
 		return HTTP_ERROR_INVALID_VALUE;
 	}
 
-	// `option` selects which components of the element make it into the output
-	// (SCE_HTTP_URI_BUILD_WITH_*). Titles use it to pull a single component out of a parsed
-	// URI: Black Myth: Wukong asks for SCHEME alone and requires "https://" back, so a build
-	// that ignores the mask returns the whole URL, fails its http/https check and refuses to
-	// start every request. A mask with none of the eight bits set keeps the old "everything"
-	// behaviour for callers that never passed one.
 	constexpr uint32_t BUILD_WITH_SCHEME   = 0x01;
 	constexpr uint32_t BUILD_WITH_HOSTNAME = 0x02;
 	constexpr uint32_t BUILD_WITH_PORT     = 0x04;
@@ -615,8 +609,8 @@ static int KYTY_SYSV_ABI HttpUriBuild(char* out, size_t* require, size_t prepare
 	constexpr uint32_t BUILD_WITH_FRAGMENT = 0x80;
 	constexpr uint32_t BUILD_WITH_ALL      = 0xff;
 
-	const uint32_t parts         = (option & BUILD_WITH_ALL) != 0 ? (option & BUILD_WITH_ALL)
-	                                                              : BUILD_WITH_ALL;
+	// No component bits preserves the legacy full-URI build.
+	const uint32_t parts         = (option & BUILD_WITH_ALL) == 0 ? BUILD_WITH_ALL : option;
 	const bool     hierarchical  = src_element->opaque == 0 && src_element->hostname != nullptr;
 	const bool     with_hostname = (parts & BUILD_WITH_HOSTNAME) != 0 && hierarchical;
 
@@ -626,8 +620,7 @@ static int KYTY_SYSV_ABI HttpUriBuild(char* out, size_t* require, size_t prepare
 			uri.append(src_element->scheme);
 			uri.push_back(':');
 		}
-		// The authority marker belongs to the scheme chunk, so a scheme-only build is
-		// "https://" and not "https:".
+		// Scheme-only builds include the authority marker.
 		if (hierarchical) {
 			uri.append("//");
 		}
@@ -644,15 +637,13 @@ static int KYTY_SYSV_ABI HttpUriBuild(char* out, size_t* require, size_t prepare
 		}
 		uri.append(src_element->password);
 	}
-	// The '@' separates credentials from the host, so it only appears when both are present.
-	if (with_hostname && (with_username || with_password)) {
-		uri.push_back('@');
-	}
 	if (with_hostname) {
+		if (with_username || with_password) {
+			uri.push_back('@');
+		}
 		uri.append(src_element->hostname);
 	}
 	if ((parts & BUILD_WITH_PORT) != 0 && hierarchical && src_element->port != 0) {
-		// With a host the port follows a ':'. Alone it is returned bare.
 		if (with_hostname) {
 			uri.push_back(':');
 		}

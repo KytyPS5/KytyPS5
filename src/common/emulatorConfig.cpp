@@ -64,6 +64,10 @@ PresentMode GetPresentMode() {
 	return g_config->present_mode;
 }
 
+DlssMode GetDlssMode() {
+	return g_config->dlss_mode;
+}
+
 int32_t GetGpuIndex() {
 	return g_config->gpu_index;
 }

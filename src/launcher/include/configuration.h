@@ -91,6 +91,9 @@ public:
 	enum class PresentMode { Fifo, Mailbox, Immediate };
 	Q_ENUM(PresentMode)
 
+	enum class DlssMode { Off, Quality, Balanced, Performance, UltraPerformance, DLAA };
+	Q_ENUM(DlssMode)
+
 	enum class LogDirection { Silent, Console, File };
 	Q_ENUM(LogDirection)
 
@@ -117,6 +120,7 @@ public:
 	int                    user_id                     = Config::DEFAULT_USER_ID;
 	QString                audio_input_device;
 	PresentMode            present_mode                = PresentMode::Mailbox;
+	DlssMode               dlss_mode                   = DlssMode::Off;
 	int                    gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
 	bool                   hide_cursor_enabled         = false;
@@ -150,6 +154,7 @@ public:
 		user_id                     = other.user_id;
 		audio_input_device          = other.audio_input_device;
 		present_mode                = other.present_mode;
+		dlss_mode                   = other.dlss_mode;
 		gpu_index                   = other.gpu_index;
 		fullscreen_enabled          = other.fullscreen_enabled;
 		hide_cursor_enabled         = other.hide_cursor_enabled;
@@ -198,6 +203,7 @@ public:
 		KYTY_CFG_SET(user_id);
 		KYTY_CFG_SET(audio_input_device);
 		KYTY_CFG_SET(present_mode);
+		KYTY_CFG_SET(dlss_mode);
 		KYTY_CFG_SET(gpu_index);
 		KYTY_CFG_SET(fullscreen_enabled);
 		KYTY_CFG_SET(hide_cursor_enabled);
@@ -239,6 +245,9 @@ public:
 		                         : Config::DEFAULT_USER_ID;
 		audio_input_device = s->value("audio_input_device", audio_input_device).toString();
 		KYTY_CFG_GET(present_mode);
+		// Older settings and invalid values must keep DLSS disabled.
+		const auto saved_dlss = TextToEnum<DlssMode>(s->value("dlss_mode", "Off").toString());
+		dlss_mode = EnumToText(saved_dlss).isEmpty() ? DlssMode::Off : saved_dlss;
 		gpu_index = s->value("gpu_index", -1).toInt();
 		if (EnumToText(present_mode).isEmpty()) {
 			present_mode = PresentMode::Mailbox;

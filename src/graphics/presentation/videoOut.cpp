@@ -1077,10 +1077,12 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 	uint32_t            height  = 0;
 	bool                current = false;
 	bool                premultiplied_alpha = false;
+	bool                process_dlss = false;
 	{
 		Common::LockGuard lock(cfg->mutex);
 		current = cfg->opened && !cfg->closing && cfg->generation == generation;
 		if (current) {
+			process_dlss = cfg->bus == VIDEO_OUT_BUS_TYPE_MAIN;
 			if (special) {
 				width  = cfg->width;
 				height = cfg->height;
@@ -1119,7 +1121,7 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 		frame = &m_presenter.PrepareBlankFrame(width, height, index == VIDEO_OUT_BUFFER_INDEX_BLACK,
 		                                       &buffer);
 	} else {
-		frame = &m_presenter.PrepareFrame(buffer, source_info);
+		frame = &m_presenter.PrepareFrame(buffer, source_info, nullptr, process_dlss);
 	}
 
 	Common::LockGuard lock(m_mutex);

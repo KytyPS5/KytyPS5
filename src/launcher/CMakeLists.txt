@@ -19,6 +19,11 @@ add_executable(launcher WIN32
 	resources.qrc
 )
 
+if(KYTY_ENABLE_DLSS)
+	target_compile_definitions(launcher PRIVATE KYTY_HAS_DLSS=1)
+endif()
+deploy_kyty_dlss(launcher)
+
 
 target_link_libraries(launcher Qt6::Concurrent Qt6::Network Qt6::Widgets Vulkan::Headers SDL3::SDL3-static kyty_git_version common)
 if(LINUX)
@@ -34,6 +39,20 @@ target_link_libraries(launcher pthread)
 endif()
 target_include_directories(launcher PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_SOURCE_DIR}/src")
 set_target_properties(launcher PROPERTIES AUTOUIC ON AUTOMOC ON AUTORCC ON)
+
+if(BUILD_TESTING)
+	add_executable(dlss_settings_tests EXCLUDE_FROM_ALL
+		"${KYTY_TESTS_DIR}/DlssSettingsTests.cpp" include/configuration.h)
+	set_target_properties(dlss_settings_tests PROPERTIES AUTOMOC ON)
+	target_link_libraries(dlss_settings_tests PRIVATE Qt6::Gui common)
+	add_test(NAME dlss_settings COMMAND dlss_settings_tests)
+	if(TARGET kyty_tests)
+		add_dependencies(kyty_tests dlss_settings_tests)
+	endif()
+	if(WIN32)
+		set_tests_properties(dlss_settings PROPERTIES ENVIRONMENT "PATH=$<TARGET_FILE_DIR:Qt6::Core>")
+	endif()
+endif()
 
 if(WIN32 AND NOT KYTY_CLANG_CL)
 	set_target_properties(launcher PROPERTIES LINK_FLAGS "${KYTY_LD_OPTIONS}")

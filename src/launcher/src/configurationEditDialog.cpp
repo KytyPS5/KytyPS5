@@ -238,6 +238,11 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	microphone->setCurrentIndex(microphone->findData(info.audio_input_device));
 	ListInit(m_ui->comboBox_screen_resolution, info.screen_resolution);
 	ListInit(m_ui->comboBox_present_mode, info.present_mode);
+	ListInit(m_ui->comboBox_dlss, info.dlss_mode);
+#if !defined(KYTY_HAS_DLSS)
+	m_ui->comboBox_dlss->setEnabled(false);
+	m_ui->comboBox_dlss->setToolTip(tr("DLSS is unavailable in this build. Build with KYTY_ENABLE_DLSS=ON."));
+#endif
 	m_ui->comboBox_gpu->clear();
 	m_ui->comboBox_gpu->addItem(tr("Auto"));
 	// Keep Auto when Qt is built without Vulkan support.
@@ -423,6 +428,7 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 	    TextToEnum<Configuration::Resolution>(ui.comboBox_screen_resolution->currentText());
 	info.present_mode =
 	    TextToEnum<Configuration::PresentMode>(ui.comboBox_present_mode->currentText());
+	info.dlss_mode = TextToEnum<Configuration::DlssMode>(ui.comboBox_dlss->currentText());
 	info.gpu_index                 = ui.comboBox_gpu->currentIndex() - 1;
 	info.fullscreen_enabled        = ui.checkBox_fullscreen->isChecked();
 	info.hide_cursor_enabled       = ui.checkBox_hide_cursor->isChecked();

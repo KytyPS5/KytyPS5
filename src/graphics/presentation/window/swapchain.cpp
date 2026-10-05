@@ -11,9 +11,12 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/presenter.h"
+#include "graphics/presentation/dlss.h"
+#include "graphics/presentation/emulatorDlssInputs.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window/windowInternal.h"
+#include "graphics/presentation/window/presentationFrame.h"
 
 #include <algorithm>
 #include <array>
@@ -25,18 +28,6 @@
 // IWYU pragma: no_include <intrin.h>
 
 namespace Libs::Graphics {
-
-struct Presenter::Frame {
-	VulkanImage   image;
-	vk::ImageView view         = nullptr;
-	uint64_t      present_tick = 0;
-	bool          busy         = false;
-
-	void Configure(GraphicContext& graphics, vk::Extent2D extent, vk::Format format);
-	void Transit(vk::CommandBuffer command, vk::ImageLayout layout, vk::AccessFlags2 access);
-	void CopyFrom(CommandBuffer& command, Image& source);
-	void Clear(CommandBuffer& command, const vk::ClearColorValue& color);
-};
 
 class FramePool final {
 public:
@@ -146,14 +137,15 @@ private:
 	vk::Format                                     m_format = vk::Format::eUndefined;
 };
 
-void Presenter::Frame::Configure(GraphicContext& graphics, vk::Extent2D extent, vk::Format format) {
+void Presenter::Frame::Configure(GraphicContext& graphics, vk::Extent2D extent, vk::Format format, bool storage) {
 	if (extent.width == 0 || extent.height == 0 || format == vk::Format::eUndefined) {
 		EXIT("unsupported prepared frame, extent=%ux%u format=%d\n", extent.width, extent.height,
 		     static_cast<int>(format));
 	}
 	auto&      dst        = image;
 	const bool compatible = dst.image != nullptr && dst.extent.width == extent.width &&
-	                        dst.extent.height == extent.height && dst.format == format;
+	                        dst.extent.height == extent.height && dst.format == format &&
+	                        (!storage || static_cast<bool>(dst.usage & vk::ImageUsageFlagBits::eStorage));
 	if (compatible) {
 		return;
 	}
@@ -185,6 +177,7 @@ void Presenter::Frame::Configure(GraphicContext& graphics, vk::Extent2D extent, 
 	create.initialLayout = vk::ImageLayout::eUndefined;
 	create.usage = vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst |
 	               vk::ImageUsageFlagBits::eSampled;
+	if (storage) create.usage |= vk::ImageUsageFlagBits::eStorage;
 	create.sharingMode = vk::SharingMode::eExclusive;
 	create.samples     = vk::SampleCountFlagBits::e1;
 	if (!graphics.CreateImage(create, dst)) {
@@ -234,6 +227,19 @@ void Presenter::Frame::CopyFrom(CommandBuffer& command_buffer, Image& source) {
 	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
 	               command);
 	Transit(command, vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite);
+	// Fill the entire output on DLSS failure, including format/size conversion.
+	if (source.backing.format != image.format || source.backing.extent != image.extent) {
+		vk::ImageBlit blit {};
+		blit.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+		blit.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+		blit.srcOffsets[1] = {static_cast<int32_t>(source.backing.extent.width),
+		                      static_cast<int32_t>(source.backing.extent.height), 1};
+		blit.dstOffsets[1] = {static_cast<int32_t>(image.extent.width),
+		                      static_cast<int32_t>(image.extent.height), 1};
+		command.blitImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal,
+		                  image.image, vk::ImageLayout::eTransferDstOptimal, 1, &blit, vk::Filter::eLinear);
+		return;
+	}
 	vk::ImageCopy copy {};
 	copy.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, source.backing.layers};
 	copy.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, image.layers};
@@ -301,10 +307,20 @@ private:
 struct Presenter::Impl {
 	explicit Impl(WindowContext& owner)
 	    : renderer(*owner.render_context), window(owner), swapchain(owner),
-	      present_scheduler(renderer, owner.graphic_ctx), frames(owner, present_scheduler) {
+	      present_scheduler(renderer, owner.graphic_ctx), frames(owner, present_scheduler),
+	      dlss(owner.graphic_ctx, renderer.GetCommandScheduler()),
+	      emulator_inputs(owner.graphic_ctx, renderer.GetCommandScheduler()) {
 		EXIT_IF(owner.render_context == nullptr);
 		swapchain.Create();
 		frames.Initialize(swapchain.ImageCount(), swapchain.Format());
+	}
+
+	~Impl() {
+		// Prepared DLSS outputs can still be referenced by the producer stream
+		// even if they were never presented. Drain it before FramePool destruction.
+		Common::LockGuard render_lock(renderer.GetMutex());
+		auto& scheduler = renderer.GetCommandScheduler();
+		if (scheduler.Active()) scheduler.Finish();
 	}
 
 	void RecoverSwapchain(Swapchain::Status status) {
@@ -344,6 +360,12 @@ struct Presenter::Impl {
 	Common::Mutex         present_mutex;
 	std::array<Layer, 2>  layers {};
 	std::atomic<uint64_t> presented_overlay_revision {0};
+	DlssProcessor         dlss;
+	EmulatorDlssInputs    emulator_inputs;
+	vk::Extent2D          dlss_target_size {};
+	Config::DlssMode      dlss_mode = Config::DlssMode::Off;
+	std::optional<vk::Extent2D> dlss_input_size;
+	bool                  emulator_dlss_logged = false;
 };
 
 void Swapchain::Create() {
@@ -868,7 +890,8 @@ Presenter::Presenter(WindowContext& window): m_impl(std::make_unique<Impl>(windo
 
 Presenter::~Presenter() = default;
 
-Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo& info) {
+Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo& info,
+                                          const DlssFrameInputs* dlss_inputs, bool process_dlss) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(buffer.IsInvalid());
 	auto frame_format = info.pixel_format;
@@ -883,6 +906,65 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	if (image.backing.format == vk::Format::eUndefined) {
 		EXIT("unsupported presentation source, image=%p\n", static_cast<const void*>(&image));
 	}
+	frame->dlss_evaluated = false;
+	std::optional<DlssFrameInputs> generated_inputs;
+	if (process_dlss && m_impl->dlss.Available()) {
+		const vk::Extent2D output_size {Config::GetScreenWidth(), Config::GetScreenHeight()};
+		if (dlss_inputs == nullptr) {
+			if (m_impl->dlss_target_size != output_size || m_impl->dlss_mode != Config::GetDlssMode()) {
+				m_impl->dlss_input_size = m_impl->dlss.OptimalInputExtent(output_size);
+				m_impl->dlss_target_size = output_size;
+				m_impl->dlss_mode = Config::GetDlssMode();
+				m_impl->emulator_inputs.Reset();
+			}
+			if (m_impl->dlss_input_size) {
+				generated_inputs = m_impl->emulator_inputs.Prepare(buffer, image, *m_impl->dlss_input_size);
+				if (generated_inputs) dlss_inputs = &*generated_inputs;
+			}
+		} else {
+			m_impl->emulator_inputs.Reset();
+		}
+	}
+	if (process_dlss && dlss_inputs != nullptr && m_impl->dlss.Available()) {
+		auto& graphics = m_impl->window.graphic_ctx;
+		const auto required = vk::FormatFeatureFlagBits::eStorageImage |
+		                      vk::FormatFeatureFlagBits::eBlitSrc |
+		                      vk::FormatFeatureFlagBits::eBlitDst |
+		                      vk::FormatFeatureFlagBits::eSampledImage |
+		                      vk::FormatFeatureFlagBits::eSampledImageFilterLinear;
+		const auto features = graphics.GetFormatProperties(vk::Format::eR16G16B16A16Sfloat).optimalTilingFeatures;
+		const vk::Extent2D output_size {Config::GetScreenWidth(), Config::GetScreenHeight()};
+		if ((features & required) == required && output_size.width > 0 && output_size.height > 0 &&
+		    output_size.width <= graphics.physical_device_properties.limits.maxImageDimension2D &&
+		    output_size.height <= graphics.physical_device_properties.limits.maxImageDimension2D) {
+			frame->Configure(graphics, output_size, vk::Format::eR16G16B16A16Sfloat, true);
+			if (frame->view == nullptr) {
+				vk::ImageViewCreateInfo view {};
+				view.image = frame->image.image;
+				view.viewType = vk::ImageViewType::e2D;
+				view.format = frame->image.format;
+				view.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+				RequireVulkanSuccess(graphics.device.createImageView(&view, nullptr, &frame->view), "create DLSS output view");
+			}
+			frame->dlss_evaluated = m_impl->dlss.Evaluate(buffer, *dlss_inputs, frame->image, frame->view);
+			if (!frame->dlss_evaluated) {
+				m_impl->emulator_inputs.Reset();
+				frame->CopyFrom(buffer, image);
+			} else if (generated_inputs && !m_impl->emulator_dlss_logged) {
+				Log::WriteToConsoleAndLog(fmt::format(
+				    "DLSS emulator reconstruction active: {}x{} -> {}x{} -> {}x{}; GPU optical flow, final-frame mode\n",
+				    image.backing.extent.width, image.backing.extent.height,
+				    m_impl->dlss_input_size->width, m_impl->dlss_input_size->height,
+				    output_size.width, output_size.height));
+				m_impl->emulator_dlss_logged = true;
+			}
+			return *frame;
+		}
+	}
+	if (process_dlss) {
+		m_impl->dlss.SkipFrame();
+		m_impl->emulator_inputs.Reset();
+	}
 	frame->Configure(m_impl->window.graphic_ctx,
 	                 {image.backing.extent.width, image.backing.extent.height}, frame_format);
 	frame->CopyFrom(buffer, image);
@@ -894,6 +976,7 @@ Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, 
 	KYTY_PROFILER_FUNCTION();
 	auto              format = m_impl->frames.GetFormat();
 	auto*             frame  = m_impl->frames.Acquire({width, height}, format);
+	frame->dlss_evaluated = false;
 	Common::LockGuard render_lock(m_impl->renderer.GetMutex());
 	frame->Configure(m_impl->window.graphic_ctx, {width, height}, format);
 	vk::ClearColorValue clear {};
@@ -998,7 +1081,7 @@ void Presenter::Impl::Present() {
 		}
 
 		presented_overlay_revision.store(overlay_visual.revision, std::memory_order_release);
-		window.UpdateTitle();
+		window.UpdateTitle(layers[0].frame != nullptr && layers[0].frame->dlss_evaluated);
 		return;
 	}
 	LOGF("Vulkan presentation retry exhausted; dropping frame\n");

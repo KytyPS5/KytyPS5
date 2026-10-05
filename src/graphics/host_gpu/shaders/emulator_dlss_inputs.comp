@@ -1,0 +1,24 @@
+#version 450
+layout(local_size_x=8, local_size_y=8) in;
+layout(binding=0) uniform sampler2D source_color;
+layout(binding=2) uniform sampler2D flow;
+layout(binding=3, rgba16f) uniform writeonly image2D target_color;
+layout(binding=4, r32f) uniform writeonly image2D target_depth;
+layout(binding=5, rg16f) uniform writeonly image2D target_motion;
+layout(binding=6, r32f) uniform writeonly image2D target_bias;
+layout(push_constant) uniform Push { vec2 jitter; int history; int coarse; } pc;
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(target_color);
+    if (any(greaterThanEqual(p, size))) return;
+    vec2 uv = (vec2(p)+.5) / vec2(size);
+    // A positive sample displacement appears as a negative camera jitter.
+    vec4 color = textureLod(source_color, uv - pc.jitter / vec2(size), 0);
+    vec4 estimate = textureLod(flow, uv, 0);
+    vec2 motion = estimate.xy * vec2(size) / vec2(textureSize(flow, 0));
+    float bias = pc.history == 0 ? 1 : smoothstep(.005, .08, estimate.z);
+    imageStore(target_color, p, color);
+    imageStore(target_depth, p, vec4(.5)); // Explicit neutral image plane, not scene depth.
+    imageStore(target_motion, p, vec4(motion, 0, 0));
+    imageStore(target_bias, p, vec4(bias));
+}

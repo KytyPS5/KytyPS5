@@ -193,6 +193,8 @@ option(KYTY_BUILD_LAUNCHER "Build Qt launcher" ON)
 
 config_compiler_and_linker()
 
+include("${KYTY_SOURCE_DIR}/dlss.cmake")
+
 add_subdirectory("${KYTY_THIRD_PARTY_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/3rdparty")
 add_subdirectory("${KYTY_SOURCE_DIR}/common" "${CMAKE_CURRENT_BINARY_DIR}/common")
 
@@ -302,6 +304,9 @@ set(gpu_blit_shader_sources
 	"${gpu_tiler_shader_dir}/gpu_blit_fs_triangle.vert"
 	"${gpu_tiler_shader_dir}/gpu_blit_color_to_ms_depth.frag"
 	"${gpu_tiler_shader_dir}/gpu_video_out_overlay.frag"
+	"${gpu_tiler_shader_dir}/emulator_dlss_reduce.comp"
+	"${gpu_tiler_shader_dir}/emulator_dlss_flow.comp"
+	"${gpu_tiler_shader_dir}/emulator_dlss_inputs.comp"
 )
 foreach(shader_source IN LISTS gpu_blit_shader_sources)
 	get_filename_component(shader_name "${shader_source}" NAME_WE)
@@ -332,7 +337,7 @@ if (KYTY_CLANG_CL)
 	set_source_files_properties(${kyty_emulator_src} PROPERTIES COMPILE_FLAGS "-Wno-pragma-pack -Wno-deprecated-declarations -D_TIMESPEC_DEFINED")
 endif()
 
-set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL3::SDL3-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak opus)
+set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL3::SDL3-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak opus kyty_dlss_sdk)
 
 # Linux system libraries.
 if(LINUX)
@@ -389,7 +394,30 @@ function(configure_macos_guest_address_space target)
 	endif()
 endfunction()
 
+function(configure_windows_image_layout target)
+	if(KYTY_CLANG_CL)
+		if(KYTY_ENABLE_DLSS)
+			# NGX's Vulkan extensions fail device creation with ASLR disabled.
+			# Keep the GPU regression executable on the same layout as the engine.
+			target_link_options(${target} PRIVATE "/DYNAMICBASE" "/HIGHENTROPYVA")
+		else()
+			target_link_options(${target} PRIVATE "/DYNAMICBASE:NO")
+		endif()
+	endif()
+endfunction()
+
 add_kyty_full_emulator_test(shader_cfg_tests "${KYTY_TESTS_DIR}/shaderCfgTests.cpp")
+if(KYTY_ENABLE_DLSS)
+	add_kyty_full_emulator_test(dlss_gpu_tests "${KYTY_TESTS_DIR}/DlssGpuTests.cpp")
+	configure_windows_image_layout(dlss_gpu_tests)
+	deploy_kyty_dlss(dlss_gpu_tests)
+	add_test(NAME dlss_gpu COMMAND dlss_gpu_tests)
+	add_test(NAME dlss_window_device COMMAND dlss_gpu_tests --window-device)
+	add_test(NAME dlss_window_device_off COMMAND dlss_gpu_tests --window-device-off)
+	add_test(NAME dlss_emulator_presentation COMMAND dlss_gpu_tests --emulator-presentation)
+	set_tests_properties(dlss_gpu PROPERTIES SKIP_RETURN_CODE 77 LABELS "gpu;dlss")
+	set_tests_properties(dlss_window_device dlss_window_device_off dlss_emulator_presentation PROPERTIES LABELS "gpu;dlss")
+endif()
 
 add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ScalarProvenanceTests.cpp"
@@ -704,6 +732,9 @@ if(BUILD_TESTING)
 		save_data_dialog_tests
 		http_uri_parse_tests
 	)
+	if(KYTY_ENABLE_DLSS)
+		add_dependencies(kyty_tests dlss_gpu_tests)
+	endif()
 endif()
 
 # Test Darwin signal-context restoration for SSE4a instructions.
@@ -723,7 +754,13 @@ if(APPLE AND (CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64" OR
 endif()
 
 add_executable(kyty_emulator "${KYTY_SOURCE_DIR}/main.cpp" ${kyty_emulator_src})
+configure_windows_image_layout(kyty_emulator)
 configure_macos_guest_address_space(kyty_emulator)
+deploy_kyty_dlss(kyty_emulator)
+if(KYTY_ENABLE_DLSS)
+	install(FILES "${KYTY_DLSS_RUNTIME}" DESTINATION .)
+	install(FILES "${KYTY_DLSS_SDK_ROOT}/LICENSE.txt" DESTINATION LICENSES RENAME NVIDIA-DLSS-LICENSE.txt)
+endif()
 
 set(KYTY_TROPHY_UNLOCK_SOUND "${CMAKE_CURRENT_SOURCE_DIR}/assets/sounds/trophy-unlock.wav")
 add_custom_target(kyty_trophy_sound
@@ -762,7 +799,6 @@ set(KYTY_EMULATOR_PDB_LINK_PATH "${CMAKE_CURRENT_BINARY_DIR}/kyty_emulator.pdb")
 
 if(KYTY_CLANG_CL)
 	target_link_options(kyty_emulator PRIVATE
-		"/DYNAMICBASE:NO"
 		"/DEBUG:FULL"
 		"/PDB:${KYTY_EMULATOR_PDB_LINK_PATH}"
 		"/lldmap:${KYTY_EMULATOR_MAP_LINK_PATH}"

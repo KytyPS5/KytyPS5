@@ -173,6 +173,16 @@
           <property name="text"><string>Enable tessellation support (experimental)</string></property>
          </widget>
         </item>
+        <item row="9" column="0">
+         <widget class="QLabel" name="label_dlss">
+          <property name="text"><string>NVIDIA DLSS (experimental):</string></property>
+         </widget>
+        </item>
+        <item row="9" column="1">
+         <widget class="QComboBox" name="comboBox_dlss">
+          <property name="toolTip"><string>Experimental DLSS Super Resolution / DLAA for the emulator's final frame. Requires a supported NVIDIA RTX GPU. Processes the game image and its HUD; artifacts are possible. Adds GPU work without reducing the game's rendering cost.</string></property>
+         </widget>
+        </item>
         <item row="8" column="1">
          <widget class="QCheckBox" name="checkBox_hide_cursor">
           <property name="toolTip"><string>Hide the host cursor after 2 seconds without mouse activity</string></property>

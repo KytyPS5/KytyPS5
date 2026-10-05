@@ -15,6 +15,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/presenter.h"
+#include "graphics/presentation/dlss.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
@@ -648,7 +649,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 
 	auto result = physical_device.createDevice(&create_info, nullptr, &device);
 	if (result != vk::Result::eSuccess) {
-		LOGF("vkCreateDevice failed: %s\n", vk::to_string(result).c_str());
+		Log::WriteToConsoleAndLog(fmt::format("vkCreateDevice failed on {}: {}\n",
+		    graphics.physical_device_properties.deviceName.data(), vk::to_string(result)));
 		return nullptr;
 	}
 
@@ -902,6 +904,8 @@ void WindowContext::CreateVulkan() {
 		LOGF("Vulkan instance: enabled %s\n", VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
 	}
 #endif
+	const bool dlss_instance_extensions =
+	    AppendDlssInstanceExtensions(r.required_extensions, r.available_extensions);
 	inst_info.pApplicationInfo        = &app_info;
 	inst_info.enabledExtensionCount   = static_cast<uint32_t>(r.required_extensions.size());
 	inst_info.ppEnabledExtensionNames = r.required_extensions.data();
@@ -997,6 +1001,10 @@ void WindowContext::CreateVulkan() {
 			        nullptr, count, values);
 		    });
 
+		if (dlss_instance_extensions) {
+			graphic_ctx.dlss_extensions_enabled =
+			    AppendDlssDeviceExtensions(graphic_ctx, device_extensions, available_extensions);
+		}
 		if (HasExtension(available_extensions, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 			graphic_ctx.memory_budget_ext_enabled = true;

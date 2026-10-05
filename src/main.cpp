@@ -61,6 +61,8 @@ static void PrintUsage() {
 	::printf(
 	    "  --gpu <index>                        Vulkan physical device index. Default: auto.\n");
 	::printf("  --fullscreen                         Run in borderless desktop fullscreen.\n");
+	::printf("  --dlss <mode>                        Off, Quality, Balanced, Performance, UltraPerformance, DLAA.\n"
+	         "                                       Requires RTX; experimental final-frame reconstruction. Default: Off.\n");
 	::printf(
 	    "  --hide-cursor                        Hide the cursor after 2 s idle. Default: off.\n");
 	::printf("  --vr                                 Enable the virtual VR headset.\n");
@@ -350,6 +352,11 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		} else if (arg == "--present-mode") {
 			if (!ParseEnum(value, options.config.present_mode)) {
 				::printf("invalid present mode: %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--dlss") {
+			if (!ParseEnum(value, options.config.dlss_mode)) {
+				::printf("invalid DLSS mode: %s\n", value.c_str());
 				return false;
 			}
 		} else if (arg == "--gpu") {

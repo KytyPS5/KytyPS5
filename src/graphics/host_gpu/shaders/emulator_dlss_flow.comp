@@ -1,0 +1,56 @@
+#version 450
+layout(local_size_x=8, local_size_y=8) in;
+layout(binding=0) uniform sampler2D current_color;
+layout(binding=1) uniform sampler2D previous_color;
+layout(binding=2) uniform sampler2D coarse_flow;
+layout(binding=3, rgba16f) uniform writeonly image2D target;
+layout(push_constant) uniform Push { vec2 jitter; int history; int coarse; } pc;
+
+vec3 color(sampler2D image, ivec2 p) {
+    return texelFetch(image, clamp(p, ivec2(0), textureSize(image, 0)-1), 0).rgb;
+}
+float cost(ivec2 p, ivec2 motion) {
+    const ivec2 offsets[5] = ivec2[5](ivec2(0), ivec2(-1,0), ivec2(1,0), ivec2(0,-1), ivec2(0,1));
+    float error = 0;
+    for (int i=0; i<5; ++i) {
+        vec3 diff = color(current_color, p+offsets[i]) - color(previous_color, p+offsets[i]+motion);
+        error += dot(diff, diff) / 15.0;
+    }
+    return error;
+}
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(target);
+    if (any(greaterThanEqual(p, size))) return;
+    if (pc.history == 0) { imageStore(target, p, vec4(0)); return; }
+    ivec2 seed = ivec2(0);
+    if (pc.coarse != 0) {
+        vec2 uv = (vec2(p)+.5) / vec2(size);
+        seed = ivec2(round(textureLod(coarse_flow, uv, 0).xy *
+                          vec2(size) / vec2(textureSize(coarse_flow, 0))));
+    }
+    ivec2 best = seed;
+    float best_error = cost(p, best);
+    float best_score = best_error + .00002 * dot(vec2(best), vec2(best));
+    int radius = pc.coarse != 0 ? 2 : 4;
+    for (int y=-radius; y<=radius; ++y) for (int x=-radius; x<=radius; ++x) {
+        ivec2 delta = ivec2(x,y);
+        ivec2 candidate = seed + delta;
+        float error = cost(p, candidate);
+        // Prefer small motion in untextured/ambiguous regions.
+        float score = error + .00002 * dot(vec2(candidate), vec2(candidate));
+        if (score < best_score) { best_score = score; best_error = error; best = candidate; }
+    }
+    // Coarse levels can alias thin/repeating details. Compare a local search
+    // around zero as well, so an ambiguous coarse match cannot force a jump.
+    if (pc.coarse != 0 && any(notEqual(seed, ivec2(0)))) {
+        for (int y=-4; y<=4; ++y) for (int x=-4; x<=4; ++x) {
+            ivec2 candidate = ivec2(x,y);
+            float error = cost(p, candidate);
+            float score = error + .00002 * dot(vec2(candidate), vec2(candidate));
+            if (score < best_score) { best_score = score; best_error = error; best = candidate; }
+        }
+    }
+    // Direction is current -> previous, in this pyramid level's pixel units.
+    imageStore(target, p, vec4(vec2(best), best_error, 1));
+}

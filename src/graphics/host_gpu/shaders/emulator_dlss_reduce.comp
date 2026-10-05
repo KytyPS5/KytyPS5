@@ -1,0 +1,17 @@
+#version 450
+layout(local_size_x=8, local_size_y=8) in;
+layout(binding=0) uniform sampler2D source_color;
+layout(binding=3, rgba16f) uniform writeonly image2D target;
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(target);
+    if (any(greaterThanEqual(p, size))) return;
+    vec2 uv = (vec2(p) + .5) / vec2(size);
+    // Four taps retain detail across the optical-flow pyramid's downsampling.
+    vec2 offset = .25 / vec2(size);
+    vec4 color = (textureLod(source_color, uv + offset, 0) +
+                  textureLod(source_color, uv - offset, 0) +
+                  textureLod(source_color, uv + vec2(offset.x, -offset.y), 0) +
+                  textureLod(source_color, uv + vec2(-offset.x, offset.y), 0)) * .25;
+    imageStore(target, p, color);
+}

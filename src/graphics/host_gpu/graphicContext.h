@@ -26,6 +26,7 @@ struct GraphicContext {
 	vk::PhysicalDeviceMemoryProperties physical_device_memory_properties     = {};
 	vk::Device                         device                                = nullptr;
 	VmaAllocator                       allocator                             = nullptr;
+	bool                               dlss_extensions_enabled               = false;
 	bool                               memory_budget_ext_enabled             = false;
 	bool                               compute_subgroup_size_control_enabled = false;
 	bool                               sample_rate_shading_enabled           = false;

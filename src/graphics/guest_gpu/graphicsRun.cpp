@@ -875,8 +875,13 @@ void CommandProcessor::DrawIndexOffset(uint32_t index_offset, uint32_t index_cou
 	DrawIndex({.index_count = index_count, .index_addr = index_addr});
 }
 
+static bool IsSupportedIndirectDrawInitiator(uint32_t draw_initiator, bool indexed) {
+	const auto source_select = draw_initiator & ~0x20u;
+	return source_select == 2u || (indexed && source_select == 0u);
+}
+
 void CommandProcessor::DrawIndirect(uint32_t data_offset, uint32_t draw_initiator, bool indexed) {
-	EXIT_NOT_IMPLEMENTED((draw_initiator & ~0x20u) != 2u);
+	EXIT_NOT_IMPLEMENTED(!IsSupportedIndirectDrawInitiator(draw_initiator, indexed));
 	EXIT_NOT_IMPLEMENTED(m_draw_indirect_args_base_addr == 0);
 
 	const auto* args_addr =
@@ -933,7 +938,7 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
                                          const volatile uint32_t* count_addr,
                                          uint32_t stride_in_bytes, uint32_t draw_initiator,
                                          bool indexed) {
-	EXIT_NOT_IMPLEMENTED((draw_initiator & ~0x20u) != 2u);
+	EXIT_NOT_IMPLEMENTED(!IsSupportedIndirectDrawInitiator(draw_initiator, indexed));
 	EXIT_NOT_IMPLEMENTED(m_draw_indirect_args_base_addr == 0);
 
 	uint32_t draw_count = max_count_or_count;

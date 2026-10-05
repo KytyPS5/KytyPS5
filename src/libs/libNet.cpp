@@ -599,34 +599,75 @@ static int KYTY_SYSV_ABI HttpUriBuild(char* out, size_t* require, size_t prepare
 		return HTTP_ERROR_INVALID_VALUE;
 	}
 
-	std::string uri;
-	if (src_element->scheme != nullptr) {
-		uri.append(src_element->scheme);
-		uri.push_back(':');
-	}
+	// `option` selects which components of the element make it into the output
+	// (SCE_HTTP_URI_BUILD_WITH_*). Titles use it to pull a single component out of a parsed
+	// URI: Black Myth: Wukong asks for SCHEME alone and requires "https://" back, so a build
+	// that ignores the mask returns the whole URL, fails its http/https check and refuses to
+	// start every request. A mask with none of the eight bits set keeps the old "everything"
+	// behaviour for callers that never passed one.
+	constexpr uint32_t BUILD_WITH_SCHEME   = 0x01;
+	constexpr uint32_t BUILD_WITH_HOSTNAME = 0x02;
+	constexpr uint32_t BUILD_WITH_PORT     = 0x04;
+	constexpr uint32_t BUILD_WITH_PATH     = 0x08;
+	constexpr uint32_t BUILD_WITH_USERNAME = 0x10;
+	constexpr uint32_t BUILD_WITH_PASSWORD = 0x20;
+	constexpr uint32_t BUILD_WITH_QUERY    = 0x40;
+	constexpr uint32_t BUILD_WITH_FRAGMENT = 0x80;
+	constexpr uint32_t BUILD_WITH_ALL      = 0xff;
 
-	if (src_element->opaque == 0) {
-		if (src_element->hostname != nullptr) {
+	const uint32_t parts         = (option & BUILD_WITH_ALL) != 0 ? (option & BUILD_WITH_ALL)
+	                                                              : BUILD_WITH_ALL;
+	const bool     hierarchical  = src_element->opaque == 0 && src_element->hostname != nullptr;
+	const bool     with_hostname = (parts & BUILD_WITH_HOSTNAME) != 0 && hierarchical;
+
+	std::string uri;
+	if ((parts & BUILD_WITH_SCHEME) != 0) {
+		if (src_element->scheme != nullptr) {
+			uri.append(src_element->scheme);
+			uri.push_back(':');
+		}
+		// The authority marker belongs to the scheme chunk, so a scheme-only build is
+		// "https://" and not "https:".
+		if (hierarchical) {
 			uri.append("//");
-			if (src_element->username != nullptr) {
-				uri.append(src_element->username);
-				if (src_element->password != nullptr) {
-					uri.push_back(':');
-					uri.append(src_element->password);
-				}
-				uri.push_back('@');
-			}
-			uri.append(src_element->hostname);
-			if (src_element->port != 0) {
-				uri.push_back(':');
-				uri.append(std::to_string(src_element->port));
-			}
 		}
 	}
 
-	AppendUriPart(&uri, src_element->path);
-	AppendUriPart(&uri, src_element->query);
-	AppendUriPart(&uri, src_element->fragment);
+	const bool with_username = (parts & BUILD_WITH_USERNAME) != 0 && src_element->username != nullptr;
+	const bool with_password = (parts & BUILD_WITH_PASSWORD) != 0 && src_element->password != nullptr;
+	if (with_username) {
+		uri.append(src_element->username);
+	}
+	if (with_password) {
+		if (with_username) {
+			uri.push_back(':');
+		}
+		uri.append(src_element->password);
+	}
+	// The '@' separates credentials from the host, so it only appears when both are present.
+	if (with_hostname && (with_username || with_password)) {
+		uri.push_back('@');
+	}
+	if (with_hostname) {
+		uri.append(src_element->hostname);
+	}
+	if ((parts & BUILD_WITH_PORT) != 0 && hierarchical && src_element->port != 0) {
+		// With a host the port follows a ':'. Alone it is returned bare.
+		if (with_hostname) {
+			uri.push_back(':');
+		}
+		uri.append(std::to_string(src_element->port));
+	}
+
+	if ((parts & BUILD_WITH_PATH) != 0) {
+		AppendUriPart(&uri, src_element->path);
+	}
+	if ((parts & BUILD_WITH_QUERY) != 0) {
+		AppendUriPart(&uri, src_element->query);
+	}
+	if ((parts & BUILD_WITH_FRAGMENT) != 0) {
+		AppendUriPart(&uri, src_element->fragment);
+	}
 
 	const auto needed = uri.size() + 1;
 	if (require != nullptr) {

@@ -230,10 +230,20 @@ static uint64_t g_invalid_memory    = 0;
 static Program*              g_tls_main_program        = nullptr;
 static thread_local Program* g_tls_cached_main_program = nullptr;
 static thread_local uint8_t* g_tls_cached_main_tcb     = nullptr;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// Process-lifetime slot holding each host thread's guest TCB pointer. Allocated once
+// because the patched guest code reads it directly from the host TEB.
+static const DWORD g_tls_main_tcb_key = [] {
+	const auto key = TlsAlloc();
+	EXIT_IF(key == TLS_OUT_OF_INDEXES);
+	return key;
+}();
+#endif
 
 static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_func_t atexit_func,
                                    void* stack_top) {
 #if defined(__x86_64__) || defined(_M_X64)
+	RuntimeLinker::InitializeMainTlsForCurrentThread();
 	auto* func = reinterpret_cast<entry_func_t>(addr);
 
 	if (stack_top != nullptr) {
@@ -934,7 +944,18 @@ static KYTY_MS_ABI uint8_t* TlsMainGetAddr() {
 	g_tls_cached_main_program = g_tls_main_program;
 	g_tls_cached_main_tcb =
 	    RuntimeLinker::TlsGetAddr(g_tls_main_program) + g_tls_main_program->tls.tcb_offset;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	EXIT_IF(TlsSetValue(g_tls_main_tcb_key, g_tls_cached_main_tcb) == 0);
+#endif
 	return g_tls_cached_main_tcb;
+}
+
+void RuntimeLinker::InitializeMainTlsForCurrentThread() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (g_tls_main_program != nullptr) {
+		(void)TlsMainGetAddr();
+	}
+#endif
 }
 
 static void PatchProgram(Program* program, uint64_t address, uint64_t size) {
@@ -1320,6 +1341,9 @@ void RuntimeLinker::Clear() {
 	g_tls_main_program        = nullptr;
 	g_tls_cached_main_program = nullptr;
 	g_tls_cached_main_tcb     = nullptr;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	EXIT_IF(TlsSetValue(g_tls_main_tcb_key, nullptr) == 0);
+#endif
 	g_desired_base_addr       = SYSTEM_RESERVED + CODE_BASE_OFFSET;
 	m_symbols.reset();
 }
@@ -1553,6 +1577,7 @@ int RuntimeLinker::StartModule(Program* program, size_t args, const void* argp,
 	LOGF_COLOR(Log::Color::BrightYellow, "---\n--- Start module: %s\n---\n",
 	           Common::PathToString(program->file_name).c_str());
 
+	InitializeMainTlsForCurrentThread();
 	return reinterpret_cast<module_ini_fini_func_t>(program->dynamic_info->init_vaddr +
 	                                                program->base_vaddr)(args, argp, func);
 }
@@ -1568,6 +1593,7 @@ int RuntimeLinker::StopModule(Program* program, size_t args, const void* argp, m
 	LOGF_COLOR(Log::Color::BrightYellow, "---\n--- Stop module: %s\n---\n",
 	           Common::PathToString(program->file_name).c_str());
 
+	InitializeMainTlsForCurrentThread();
 	int result = reinterpret_cast<module_ini_fini_func_t>(program->dynamic_info->fini_vaddr +
 	                                                      program->base_vaddr)(args, argp, func);
 
@@ -1620,6 +1646,9 @@ void RuntimeLinker::DeleteTls(Program* program, int thread_id) {
 	if (thread_id == Common::Thread::GetThreadIdUnique() && g_tls_cached_main_program == program) {
 		g_tls_cached_main_program = nullptr;
 		g_tls_cached_main_tcb     = nullptr;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		EXIT_IF(TlsSetValue(g_tls_main_tcb_key, nullptr) == 0);
+#endif
 	}
 
 	Common::LockGuard lock(program->tls.mutex);
@@ -1677,10 +1706,16 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 #endif
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	const bool protect_memory_faults = Config::RedZoneProtectionEnabled();
+	// Guest code reaches its TCB through an absolute fs:[disp] read. Windows cannot host
+	// the guest FS base, so those reads are rewritten to resolve the guest TCB from the
+	// host TLS slot set up below.
+	const bool patch_tcb_accesses = true;
 #else
 	const bool protect_memory_faults = false;
+	const bool patch_tcb_accesses    = false;
 #endif
-	const bool patch_guest_instructions = protect_memory_faults || emulate_amd;
+	const bool patch_guest_instructions =
+	    protect_memory_faults || emulate_amd || patch_tcb_accesses;
 
 	constexpr uint64_t INSTRUCTION_TRAMPOLINE_SIZE = 8u * 1024u * 1024u;
 	if (patch_guest_instructions) {
@@ -1797,14 +1832,23 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 		const auto module_name = Common::PathToString(program->file_name.filename());
 		if (!have_function_starts) {
 			Log::WriteToConsoleAndLog(
-			    fmt::format("{}: {} not patched (function boundaries unavailable)\n",
-			                emulate_amd ? "AMD CPU compatibility" : "Guest red-zone protection",
+			    fmt::format("Guest instruction patching: {} not patched (function boundaries "
+			                "unavailable)\n",
 			                module_name));
 		}
 		GuestInstructionPatchResult totals {};
 		for (const auto& [segment_addr, segment_size]: executable_segments) {
-			const auto result = PatchGuestInstructions(segment_addr, segment_size, function_starts,
-			                                           protect_memory_faults, emulate_amd);
+			const auto result =
+			    PatchGuestInstructions(segment_addr, segment_size, function_starts,
+			                           protect_memory_faults, emulate_amd,
+			                           GetGuestInstructionHostFeatures(), patch_tcb_accesses,
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+			                           g_tls_main_tcb_key
+#else
+			                           0
+#endif
+			    );
+			totals.tcb += result.tcb;
 			totals.reciprocal_sqrt += result.reciprocal_sqrt;
 			totals.extrq += result.extrq;
 			totals.insertq += result.insertq;
@@ -1822,6 +1866,14 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 				     result.control_flow_memory_instruction_count,
 				     result.unrelocatable_memory_instruction_count);
 			}
+		}
+		if (patch_tcb_accesses && have_function_starts) {
+			const char* status = totals.tcb.found == 0       ? "no matching instructions"
+			                     : totals.tcb.Skipped() != 0 ? "partially patched"
+			                                                 : "patched";
+			Log::WriteToConsoleAndLog(
+			    fmt::format("Guest TCB access: {} {} (native={}, skipped={})\n", module_name,
+			                status, totals.tcb.native, totals.tcb.Skipped()));
 		}
 		if (emulate_amd && have_function_starts) {
 			InstructionPatchCounts combined {};
@@ -1862,6 +1914,9 @@ void RuntimeLinker::DeleteProgram(Program* p) {
 	if (g_tls_cached_main_program == program.get()) {
 		g_tls_cached_main_program = nullptr;
 		g_tls_cached_main_tcb     = nullptr;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		EXIT_IF(TlsSetValue(g_tls_main_tcb_key, nullptr) == 0);
+#endif
 	}
 	for (auto& record: g_stubbed_imports) {
 		if (record.patch_vaddr >= program->base_vaddr &&

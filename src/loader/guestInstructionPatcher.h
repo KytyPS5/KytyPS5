@@ -50,6 +50,7 @@ struct GuestInstructionPatchResult {
 	InstructionPatchCounts insertq;
 	InstructionPatchCounts rdpid;
 	InstructionPatchCounts clwb;
+	InstructionPatchCounts tcb;
 };
 
 void RegisterGuestInstructionPatchModule(void* module_ptr, uint64_t module_size,
@@ -57,10 +58,13 @@ void RegisterGuestInstructionPatchModule(void* module_ptr, uint64_t module_size,
 void UnregisterGuestInstructionPatchModule(void* module_ptr);
 
 // Apply enabled instruction fixes using native trampolines or safe trap fallbacks.
+// patch_tcb redirects guest absolute FS reads through the host thread-local storage slot
+// named by tcb_key; it is only honoured on Windows hosts.
 GuestInstructionPatchResult PatchGuestInstructions(
     uint64_t segment_addr, uint64_t segment_size, std::span<const uintptr_t> function_starts,
     bool protect_memory, bool emulate_amd,
-    GuestInstructionHostFeatures host_features = GetGuestInstructionHostFeatures());
+    GuestInstructionHostFeatures host_features = GetGuestInstructionHostFeatures(),
+    bool patch_tcb = false, uint32_t tcb_key = 0);
 
 bool DecodeEhFrameFunctionStarts(uint64_t eh_frame_header_addr, uint64_t eh_frame_header_size,
                                  std::vector<uintptr_t>* function_starts);

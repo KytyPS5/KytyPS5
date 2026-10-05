@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <barrier>
 #include <bit>
 #include <chrono>
 #include <cmath>
@@ -178,6 +179,214 @@ void InitSubsystems() {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 void* g_red_zone_fault_page = nullptr;
 
+void TestWindowsGuestTcbStaticPatcher() {
+	const char*        test              = "WindowsGuestTcbStaticPatcher";
+	constexpr uint64_t CODE_SIZE         = 0x4000;
+	constexpr uint64_t TRAMPOLINE_SIZE   = 0x4000;
+	constexpr uint64_t CANARY            = 0xdeadbeef00000007ull;
+	constexpr uint64_t OTHER_CANARY      = 0x123456789abcdef0ull;
+	constexpr uint64_t REGISTER_SENTINEL = 0x1122334455667788ull;
+	const auto mapping = Libs::LibKernel::Memory::AllocateProgramMemory(
+	    0x0000000901000000ull, CODE_SIZE + TRAMPOLINE_SIZE,
+	    Common::VirtualMemory::Mode::ExecuteReadWrite, "tcb_patcher_test");
+	Check(test, mapping != 0, "failed to allocate TCB patch test code");
+
+	const DWORD key = TlsAlloc();
+	Check(test, key != TLS_OUT_OF_INDEXES, "failed to allocate host TLS slot");
+	Check(test, key < TLS_MINIMUM_AVAILABLE, "failed to allocate direct host TLS slot");
+	std::array<uint64_t, 8> tcb {};
+	tcb[0] = reinterpret_cast<uint64_t>(tcb.data());
+	tcb[5] = CANARY;
+	Check(test, TlsSetValue(key, tcb.data()) != FALSE, "failed to populate host TLS slot");
+
+	Xbyak::CodeGenerator code(CODE_SIZE, reinterpret_cast<void*>(mapping));
+	code.push(code.rbx);
+	code.mov(code.rbx, REGISTER_SENTINEL);
+	code.putSeg(code.fs);
+	code.mov(code.rax, code.ptr[reinterpret_cast<void*>(0x28)]);
+	code.mov(code.qword[code.rdx], code.rax);
+	code.putSeg(code.fs);
+	code.mov(code.r10, code.ptr[reinterpret_cast<void*>(0x28)]);
+	code.mov(code.qword[code.rdx + 8], code.r10);
+	code.mov(code.rax, code.rdi);
+	code.putSeg(code.fs);
+	code.xor_(code.rax, code.ptr[reinterpret_cast<void*>(0x28)]);
+	code.setz(code.cl);
+	code.movzx(code.ecx, code.cl);
+	code.mov(code.qword[code.rdx + 16], code.rax);
+	code.mov(code.qword[code.rdx + 24], code.rcx);
+	code.mov(code.r10, code.rdi);
+	code.putSeg(code.fs);
+	code.xor_(code.r10, code.ptr[reinterpret_cast<void*>(0x28)]);
+	code.setz(code.cl);
+	code.movzx(code.ecx, code.cl);
+	code.mov(code.qword[code.rdx + 32], code.r10);
+	code.mov(code.qword[code.rdx + 40], code.rcx);
+	code.mov(code.rax, code.rdi);
+	code.putSeg(code.fs);
+	code.cmp(code.rax, code.ptr[reinterpret_cast<void*>(0x28)]);
+	code.sete(code.cl);
+	code.movzx(code.ecx, code.cl);
+	code.mov(code.qword[code.rdx + 48], code.rcx);
+	code.mov(code.rax, code.rsi);
+	code.putSeg(code.fs);
+	code.cmp(code.rax, code.ptr[reinterpret_cast<void*>(0x28)]);
+	code.setne(code.cl);
+	code.movzx(code.ecx, code.cl);
+	code.mov(code.qword[code.rdx + 56], code.rcx);
+	code.mov(code.qword[code.rdx + 64], code.rbx);
+	code.pop(code.rbx);
+	code.ret();
+	Check(test, Xbyak::GetError() == 0, "failed to generate TCB access fixture");
+	Check(test, Common::VirtualMemory::FlushInstructionCache(mapping, code.getSize()),
+	      "failed to flush generated TCB fixture");
+
+	using GuestFunction = void(KYTY_SYSV_ABI*)(uint64_t, uint64_t, uint64_t*);
+	std::array<uint64_t, 9> output {};
+
+	Loader::RegisterGuestInstructionPatchModule(
+	    reinterpret_cast<void*>(mapping), CODE_SIZE, reinterpret_cast<void*>(mapping + CODE_SIZE),
+	    TRAMPOLINE_SIZE);
+	const std::array<uintptr_t, 1> function_starts {mapping};
+	const auto result = Loader::PatchGuestInstructions(mapping, code.getSize(), function_starts,
+	                                                   false, false, {}, true, key);
+	Check(test, result.tcb.found == 6 && result.tcb.native == 6 && result.tcb.Skipped() == 0,
+	      "TCB patcher did not cover MOV/XOR/CMP fs:[0x28] accesses");
+	std::printf("[host]    tcb key=%lu found=%llu native=%llu skipped=%llu\n",
+	            static_cast<unsigned long>(key),
+	            static_cast<unsigned long long>(result.tcb.found),
+	            static_cast<unsigned long long>(result.tcb.native),
+	            static_cast<unsigned long long>(result.tcb.Skipped()));
+
+	const auto expected = [](uint64_t value) {
+		return std::array<uint64_t, 9> {value, value, 0, 1, 0, 1, 1, 1, REGISTER_SENTINEL};
+	};
+	// Each host thread owns its own guest TCB, so install one before entering the fixture.
+	const auto install_tcb = [&](uint64_t value) {
+		std::array<uint64_t, 8> local_tcb {};
+		local_tcb[0] = reinterpret_cast<uint64_t>(local_tcb.data());
+		local_tcb[5] = value;
+		return TlsSetValue(key, local_tcb.data()) != FALSE;
+	};
+
+	output.fill(0);
+	Check(test, install_tcb(CANARY), "failed to update host TLS slot");
+	reinterpret_cast<GuestFunction>(mapping)(CANARY, CANARY ^ 1, output.data());
+	Check(test, output == expected(CANARY),
+	      "patched TCB accesses changed their values, flags, or scratch register");
+
+	// Only absolute 64-bit reads inside the guest TCB are rewritten. Wider displacements,
+	// non-TCB segment bases, and narrower destinations must be left alone rather than
+	// receiving an unsafe fallback.
+	{
+		const auto skip_mapping = Libs::LibKernel::Memory::AllocateProgramMemory(
+		    0x0000000901200000ull, CODE_SIZE + TRAMPOLINE_SIZE,
+		    Common::VirtualMemory::Mode::ExecuteReadWrite, "tcb_skip_patcher_test");
+		Check(test, skip_mapping != 0, "failed to allocate TCB skip test code");
+		Xbyak::CodeGenerator skip_code(CODE_SIZE, reinterpret_cast<void*>(skip_mapping));
+		skip_code.putSeg(skip_code.fs);
+		skip_code.mov(skip_code.rax, skip_code.ptr[reinterpret_cast<void*>(0x80)]);
+		skip_code.putSeg(skip_code.fs);
+		skip_code.mov(skip_code.eax, skip_code.ptr[reinterpret_cast<void*>(0x28)]);
+		skip_code.putSeg(skip_code.gs);
+		skip_code.mov(skip_code.rax, skip_code.ptr[reinterpret_cast<void*>(0x28)]);
+		skip_code.putSeg(skip_code.fs);
+		skip_code.mov(skip_code.rax, skip_code.ptr[skip_code.rbx + 0x28]);
+		skip_code.ret();
+		Check(test, Xbyak::GetError() == 0, "failed to generate non-TCB access fixture");
+		Loader::RegisterGuestInstructionPatchModule(
+		    reinterpret_cast<void*>(skip_mapping), CODE_SIZE,
+		    reinterpret_cast<void*>(skip_mapping + CODE_SIZE), TRAMPOLINE_SIZE);
+		const std::array<uintptr_t, 1> skip_starts {skip_mapping};
+		const auto skip_result = Loader::PatchGuestInstructions(
+		    skip_mapping, skip_code.getSize(), skip_starts, false, false, {}, true, key);
+		Check(test, skip_result.tcb.found == 0 && skip_result.tcb.native == 0,
+		      "TCB patcher rewrote a non-TCB fs/gs access");
+		Loader::UnregisterGuestInstructionPatchModule(reinterpret_cast<void*>(skip_mapping));
+		Check(test,
+		      Libs::LibKernel::Memory::FreeGuestMemory(skip_mapping, CODE_SIZE + TRAMPOLINE_SIZE),
+		      "failed to free TCB skip test code");
+	}
+
+	std::array<std::array<uint64_t, 9>, 2> thread_output {};
+	std::array<bool, 2>                    thread_ok {};
+	const std::array<uint64_t, 2>          thread_tcb {0, OTHER_CANARY};
+	std::barrier                           ready(2);
+	std::array<std::thread, 2>             threads;
+	for (size_t index = 0; index < threads.size(); ++index) {
+		threads[index] = std::thread([&, index] {
+			thread_ok[index] = install_tcb(thread_tcb[index]);
+			ready.arrive_and_wait();
+			if (thread_ok[index]) {
+				reinterpret_cast<GuestFunction>(mapping)(thread_tcb[index],
+				                                         thread_tcb[index] ^ 1,
+				                                         thread_output[index].data());
+			}
+			thread_ok[index] &= TlsSetValue(key, nullptr) != FALSE;
+		});
+	}
+	for (auto& thread: threads) {
+		thread.join();
+	}
+	Check(test, thread_ok[0] && thread_ok[1] && thread_output[0] == expected(thread_tcb[0]) &&
+	                thread_output[1] == expected(thread_tcb[1]),
+	      "patched TCB access leaked values between host threads");
+
+	std::vector<DWORD> expansion_keys;
+	do {
+		expansion_keys.push_back(TlsAlloc());
+		Check(test, expansion_keys.back() != TLS_OUT_OF_INDEXES,
+		      "failed to allocate expansion host TLS slot");
+	} while (expansion_keys.back() < TLS_MINIMUM_AVAILABLE);
+	const auto expansion_key = expansion_keys.back();
+	const auto expansion_mapping = Libs::LibKernel::Memory::AllocateProgramMemory(
+	    0x0000000901100000ull, CODE_SIZE + TRAMPOLINE_SIZE,
+	    Common::VirtualMemory::Mode::ExecuteReadWrite, "tcb_expansion_patcher_test");
+	Check(test, expansion_mapping != 0, "failed to allocate expansion TCB patch test code");
+	Xbyak::CodeGenerator expansion_code(CODE_SIZE, reinterpret_cast<void*>(expansion_mapping));
+	expansion_code.putSeg(expansion_code.fs);
+	expansion_code.mov(expansion_code.rax, expansion_code.ptr[reinterpret_cast<void*>(0x28)]);
+	expansion_code.ret();
+	Check(test, Xbyak::GetError() == 0, "failed to generate expansion TCB access fixture");
+	Check(test,
+	      Common::VirtualMemory::FlushInstructionCache(expansion_mapping, expansion_code.getSize()),
+	      "failed to flush expansion TCB fixture");
+	Check(test, TlsSetValue(expansion_key, tcb.data()) != FALSE,
+	      "failed to populate expansion host TLS slot");
+	Loader::RegisterGuestInstructionPatchModule(
+	    reinterpret_cast<void*>(expansion_mapping), CODE_SIZE,
+	    reinterpret_cast<void*>(expansion_mapping + CODE_SIZE), TRAMPOLINE_SIZE);
+	const std::array<uintptr_t, 1> expansion_starts {expansion_mapping};
+	const auto expansion_result = Loader::PatchGuestInstructions(
+	    expansion_mapping, expansion_code.getSize(), expansion_starts, false, false, {}, true,
+	    expansion_key);
+	using ExpansionFunction = uint64_t(KYTY_SYSV_ABI*)();
+	Check(test, expansion_result.tcb.found == 1 && expansion_result.tcb.native == 1 &&
+	                expansion_result.tcb.Skipped() == 0 &&
+	                reinterpret_cast<ExpansionFunction>(expansion_mapping)() == CANARY,
+	      "TCB patcher did not retrieve an expansion host TLS slot");
+	std::printf("[host]    tcb expansion key=%lu found=%llu native=%llu skipped=%llu\n",
+	            static_cast<unsigned long>(expansion_key),
+	            static_cast<unsigned long long>(expansion_result.tcb.found),
+	            static_cast<unsigned long long>(expansion_result.tcb.native),
+	            static_cast<unsigned long long>(expansion_result.tcb.Skipped()));
+	Loader::UnregisterGuestInstructionPatchModule(reinterpret_cast<void*>(expansion_mapping));
+	Check(test,
+	      Libs::LibKernel::Memory::FreeGuestMemory(expansion_mapping, CODE_SIZE + TRAMPOLINE_SIZE),
+	      "failed to free expansion TCB patch test code");
+	for (const auto expansion_index: expansion_keys) {
+		Check(test, TlsFree(expansion_index) != FALSE,
+		      "failed to release expansion host TLS slot");
+	}
+
+	Loader::UnregisterGuestInstructionPatchModule(reinterpret_cast<void*>(mapping));
+	Check(test, TlsSetValue(key, nullptr) != FALSE && TlsFree(key) != FALSE,
+	      "failed to release host TLS slot");
+	Check(test, Libs::LibKernel::Memory::FreeGuestMemory(mapping, CODE_SIZE + TRAMPOLINE_SIZE),
+	      "failed to free TCB patch test code");
+	std::printf("[host]    %-48s ok\n", test);
+}
+
 LONG CALLBACK RedZoneFaultHandler(EXCEPTION_POINTERS* exception) {
 	if (exception == nullptr || exception->ExceptionRecord == nullptr ||
 	    exception->ContextRecord == nullptr ||
@@ -285,6 +494,10 @@ void TestWindowsGuestRedZoneStaticPatcher() {
 	std::printf("[host]    %-48s ok\n", test);
 }
 #else
+void TestWindowsGuestTcbStaticPatcher() {
+	std::printf("[host]    %-48s skipped\n", "WindowsGuestTcbStaticPatcher");
+}
+
 void TestWindowsGuestRedZoneStaticPatcher() {
 	std::printf("[host]    %-48s skipped\n", "WindowsGuestRedZoneStaticPatcher");
 }
@@ -4210,6 +4423,10 @@ int main(int argc, char** argv) {
 		RunTest(TestWindowsGuestRedZoneStaticPatcher);
 		return g_failed_tests == 0 ? 0 : 1;
 	}
+	if (argc == 2 && std::strcmp(argv[1], "--tcb-patcher-only") == 0) {
+		RunTest(TestWindowsGuestTcbStaticPatcher);
+		return g_failed_tests == 0 ? 0 : 1;
+	}
 
 #if defined(__x86_64__) || defined(_M_X64)
 	RunTest(TestSmallFiberStacksAndMigration);
@@ -4222,6 +4439,7 @@ int main(int argc, char** argv) {
 	RunTest(TestCpuExtensionPatches);
 #endif
 	RunTest(TestWindowsGuestRedZoneStaticPatcher);
+	RunTest(TestWindowsGuestTcbStaticPatcher);
 	RunTest(TestProsperoArgumentAndInfoSizeContracts);
 	RunTest(TestGuestAddressSpaceOwnsReservationsBeforeBacking);
 	RunTest(TestSparseBackingReadPreservesResidency);

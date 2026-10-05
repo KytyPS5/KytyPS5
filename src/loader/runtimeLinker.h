@@ -175,6 +175,11 @@ public:
 	static uint8_t* TlsGetAddr(Program* program);
 	static void     DeleteTls(Program* program, int thread_id);
 
+	// Populate this host thread's guest TCB slot before entering guest code. On
+	// Windows the guest FS base cannot be programmed, so patched fs:[disp] reads
+	// resolve the guest TCB through this host TLS slot instead.
+	static void InitializeMainTlsForCurrentThread();
+
 	void StackTrace(uint64_t frame_ptr, uint64_t stack_ptr);
 
 private:

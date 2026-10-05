@@ -1783,6 +1783,67 @@ void TestDenseBufferTracking() {
              "resource tracking allowed a second mutation pass");
 }
 
+// GTA V skinning: the store V# is S_BUFFER_LOAD_DWORDX4 from a V# table at key * 16.
+void EmitVSharpTableStore(Fixture &fixture, std::array<MemoryFlags, 4> &reads,
+                          MemoryFlags &store) {
+  const auto table = fixture.Buffer(
+      {fixture.UserData(0), fixture.UserData(1), fixture.UserData(2),
+       fixture.UserData(3)},
+      4);
+  // The key is lane data made wave-uniform, so the host cannot evaluate the V#.
+  const auto key = fixture.Emit(ValueOpcode::ReadFirstLane,
+                                {fixture.Emit(ValueOpcode::LaneId), Value(true)});
+  const auto offset =
+      fixture.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(4u)});
+  std::array<Value, 4> dwords;
+  for (uint32_t dword = 0; dword < dwords.size(); dword++) {
+    MemoryInfo scalar;
+    scalar.kind = ResourceKind::ScalarBuffer;
+    scalar.offset = 32 + dword * 4;
+    reads[dword] = fixture.AddMemory(scalar, 8);
+    dwords[dword] =
+        fixture.Emit(ValueOpcode::ReadConstBuffer, {table, offset}, reads[dword]);
+  }
+  const auto target = fixture.Buffer(dwords, 12);
+  MemoryInfo vector;
+  vector.kind = ResourceKind::Buffer;
+  store = fixture.AddMemory(vector, 12);
+  fixture.Emit(ValueOpcode::StoreBufferU32,
+               {target, Value(0u), Value(0u), Value(0u), Value(7u), Value(true)},
+               store);
+}
+
+void TestVSharpTableStores() {
+  {
+    Fixture fixture;
+    std::array<MemoryFlags, 4> reads{};
+    MemoryFlags store{};
+    EmitVSharpTableStore(fixture, reads, store);
+    fixture.PlanAndTrack();
+
+    Check(fixture.program.memory_info[store.index].kind ==
+                  ResourceKind::IndirectBuffer &&
+              fixture.program.info.uses_dma,
+          "V# table store did not use the indirect buffer path");
+    Check(fixture.program.info.buffers.size() == 1,
+          "V# table store did not bind exactly the table");
+    const auto &table = fixture.program.info.buffers[0];
+    Check(table.scalar && !table.written && table.indirect_write_table &&
+              table.indirect_table_offset == 32,
+          "V# table was not marked as selecting written targets");
+    Check(fixture.program.memory_info[reads[0].index].resource == 0,
+          "V# table reads were not patched to the table binding");
+  }
+  {
+    Fixture fixture(ShaderType::Pixel);
+    std::array<MemoryFlags, 4> reads{};
+    MemoryFlags store{};
+    EmitVSharpTableStore(fixture, reads, store);
+    CheckFatal([&] { fixture.PlanAndTrack(); }, "GPU-selected access",
+               "graphics stages accepted V# table stores without host preparation");
+  }
+}
+
 void TestScalarAndVectorBufferAlias() {
   Fixture fixture;
   const auto d0 = fixture.UserData(0);
@@ -3630,6 +3691,7 @@ int main() {
     Run("dense buffers", TestDenseBufferTracking);
     Run("compute buffer fill", TestComputeBufferFill);
     Run("scalar/vector alias", TestScalarAndVectorBufferAlias);
+    Run("V# table stores", TestVSharpTableStores);
     Run("runtime unsigned min", TestRuntimeUnsignedMinDescriptor);
     Run("images and samplers", TestImagesSamplersAndAliases);
     Run("SampleAdjust sampler scratch", TestSampleAdjustSamplerScratch);

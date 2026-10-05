@@ -496,6 +496,107 @@ void BenchmarkCleanUploads() {
   Release(memory);
 }
 
+std::vector<std::pair<uint64_t, uint64_t>>
+ConsumeCpuWrites(MemoryTracker &tracker, uint64_t address, uint64_t size) {
+  std::vector<std::pair<uint64_t, uint64_t>> runs;
+  tracker.ConsumeCpuWrites(address, size, [&](uint64_t run, uint64_t bytes) {
+    runs.emplace_back(run, bytes);
+  });
+  return runs;
+}
+
+void TestConsumeCpuWrites() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto &page_manager = harness.page_manager;
+  const auto page_size = page_manager.GetPageSize();
+  auto *memory = Allocate(page_manager, 4);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  const auto upload = [&] {
+    tracker.ForEachUploadRange(
+        address, page_size * 4, false, [](uint64_t, uint64_t) noexcept {},
+        []() noexcept {});
+  };
+
+  // A region the tracker never saw counts as written, clamped to the query.
+  auto runs = ConsumeCpuWrites(tracker, address + 16, page_size * 4 - 32);
+  Check(runs.size() == 1 && runs[0].first == address + 16 &&
+            runs[0].second == page_size * 4 - 32,
+        "untracked pages were not reported as CPU written");
+  // Pages still CPU dirty keep being reported: writes to them do not fault.
+  runs = ConsumeCpuWrites(tracker, address, page_size * 4);
+  Check(runs.size() == 1 && runs[0].second == page_size * 4,
+        "CPU-dirty pages were not reported again");
+  upload();
+  runs = ConsumeCpuWrites(tracker, address, page_size * 4);
+  Check(runs.empty(), "clean pages were reported as CPU written");
+
+  // A write after the upload is reported once the page is clean again.
+  tracker.MarkRegionAsCpuModified(address + page_size, 8);
+  upload();
+  runs = ConsumeCpuWrites(tracker, address, page_size * 4);
+  Check(runs.size() == 1 && runs[0].first == address + page_size &&
+            runs[0].second == page_size,
+        "a CPU write between uploads was not reported");
+  runs = ConsumeCpuWrites(tracker, address, page_size * 4);
+  Check(runs.empty(), "a consumed CPU write was reported twice");
+
+  // A write outside the query stays pending for a later query over it.
+  tracker.MarkRegionAsCpuModified(address + page_size * 3, 8);
+  upload();
+  runs = ConsumeCpuWrites(tracker, address, page_size * 2);
+  Check(runs.empty(), "a CPU write outside the query was reported");
+  runs = ConsumeCpuWrites(tracker, address, page_size * 4);
+  Check(runs.size() == 1 && runs[0].first == address + page_size * 3,
+        "a CPU write outside an earlier query was forgotten");
+  tracker.UntrackMemory(address, page_size * 4);
+  Release(memory);
+}
+
+void TestGpuMarkingSkipsCpuDirtyPages() {
+  TrackerHarness harness;
+  auto &tracker = harness.tracker;
+  auto &page_manager = harness.page_manager;
+  const auto page_size = page_manager.GetPageSize();
+  auto *memory = Allocate(page_manager, 3);
+  const auto address = reinterpret_cast<uint64_t>(memory);
+  tracker.ForEachUploadRange(
+      address, page_size * 3, false, [](uint64_t, uint64_t) noexcept {},
+      []() noexcept {});
+  // The CPU wrote the middle page after the GPU work was recorded.
+  tracker.MarkRegionAsCpuModified(address + page_size, 8);
+
+  std::vector<std::pair<uint64_t, uint64_t>> marked;
+  tracker.MarkRegionAsGpuModifiedUnlessCpuDirty(
+      address + 16, page_size * 3 - 32, [&](uint64_t run, uint64_t bytes) {
+        marked.emplace_back(run, bytes);
+      });
+  Check(marked.size() == 2 && marked[0].first == address &&
+            marked[0].second == page_size &&
+            marked[1].first == address + page_size * 2 &&
+            marked[1].second == page_size,
+        "GPU marking did not skip exactly the CPU-dirty page");
+  Check(tracker.IsRegionGpuModified(address, page_size) &&
+            !tracker.IsRegionGpuModified(address + page_size, page_size) &&
+            tracker.IsRegionGpuModified(address + page_size * 2, page_size) &&
+            tracker.IsRegionCpuModified(address + page_size, page_size),
+        "GPU marking changed the wrong pages");
+  Check(Protection(memory) == PAGE_NOACCESS && IsWritable(memory + page_size) &&
+            Protection(memory + page_size * 2) == PAGE_NOACCESS,
+        "GPU marking did not protect the marked pages only");
+
+  marked.clear();
+  tracker.MarkRegionAsGpuModifiedUnlessCpuDirty(
+      address + page_size, page_size, [&](uint64_t run, uint64_t bytes) {
+        marked.emplace_back(run, bytes);
+      });
+  Check(marked.empty(), "a CPU-dirty page alone was marked GPU modified");
+
+  tracker.UnmarkRegionAsGpuModified(address, page_size * 3);
+  tracker.UntrackMemory(address, page_size * 3);
+  Release(memory);
+}
+
 void TestRangeInvalidation() {
   TrackerHarness harness;
   auto &tracker = harness.tracker;
@@ -1131,6 +1232,8 @@ int main(int argc, char **argv) {
   TestConcurrentRegionPublication();
   TestCpuDirtyUpload();
   TestCleanUploadPreservesOwnership();
+  TestConsumeCpuWrites();
+  TestGpuMarkingSkipsCpuDirtyPages();
   TestRangeInvalidation();
   TestGpuReacquisitionAfterInvalidation();
   TestGpuDirtyBits();

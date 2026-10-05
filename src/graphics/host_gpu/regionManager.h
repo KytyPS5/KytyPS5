@@ -71,6 +71,7 @@ public:
 			EXIT("invalid region tracking manager construction\n");
 		}
 		m_cpu_dirty.Fill();
+		m_cpu_written.Fill();
 		m_writable.Fill();
 		m_readable.Fill();
 	}
@@ -104,6 +105,9 @@ public:
 			bits.UnsetRange(start, end);
 		}
 		if constexpr (source == DirtySource::Cpu) {
+			if constexpr (enable) {
+				m_cpu_written.SetRange(start, end);
+			}
 			UpdateProtection<!enable, false>();
 		} else {
 			UpdateProtection<enable, true>();
@@ -126,6 +130,38 @@ public:
 				UpdateProtection<false, true>();
 			}
 		}
+		for (const auto [first, last]: mask) {
+			func(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
+		}
+	}
+
+	// Calls func(address, size) for the runs of pages in the range that became CPU dirty since
+	// the previous call over them, or are still CPU dirty (further writes to a dirty page do not
+	// fault), and forgets the former. Callers hold the lock.
+	template <typename Func>
+	void ConsumeCpuWritten(uint64_t vaddr, uint64_t size, Func&& func) {
+		const auto [start, end] = GetPageRange(vaddr, size);
+		RegionBits mask(m_cpu_written, start, end);
+		mask |= RegionBits(m_cpu_dirty, start, end);
+		m_cpu_written.UnsetRange(start, end);
+		for (const auto [first, last]: mask) {
+			func(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
+		}
+	}
+
+	// Marks the pages of the range GPU dirty unless they are CPU dirty, and calls func(address,
+	// size) for the runs it marked. Callers hold the lock.
+	template <typename Func>
+	void MarkGpuDirtyUnlessCpuDirty(uint64_t vaddr, uint64_t size, Func&& func) {
+		const auto [start, end] = GetPageRange(vaddr, size);
+		RegionBits mask(~m_cpu_dirty, start, end);
+		if (mask.None()) {
+			return;
+		}
+		for (const auto [first, last]: mask) {
+			m_gpu_dirty.SetRange(first, last);
+		}
+		UpdateProtection<true, true>();
 		for (const auto [first, last]: mask) {
 			func(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
 		}
@@ -177,6 +213,8 @@ private:
 	PageManager& m_page_manager;
 	uint64_t     m_cpu_addr = 0;
 	RegionBits   m_cpu_dirty;
+	// Pages that became CPU dirty since ConsumeCpuWritten last visited them.
+	RegionBits   m_cpu_written;
 	RegionBits   m_gpu_dirty;
 	RegionBits   m_writable;
 	RegionBits   m_readable;

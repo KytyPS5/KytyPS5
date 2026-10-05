@@ -363,6 +363,7 @@ public:
 			}
 		}
 		LinkImageAliases();
+		LinkIndirectWriteTables();
 		for (const auto& patch: m_handle_patches) {
 			patch.handle->SetFlags<uint32_t>(patch.resource);
 		}
@@ -2071,6 +2072,79 @@ private:
 		}
 	}
 
+	// Matches a V# whose four DWORDs are scalar-buffer reads of one descriptor table at
+	// (key << 4) + table_offset + 4 * dword, as emitted for S_BUFFER_LOAD_DWORDX4 selection.
+	bool MatchIndirectWriteTable(const Inst& handle, uint32_t& table_source,
+	                             uint32_t& table_offset) {
+		if (handle.GetOpcode() != ValueOpcode::GetBufferResource || handle.NumArgs() != 4u) {
+			return false;
+		}
+		const Inst* table      = nullptr;
+		const Inst* first_read = nullptr;
+		Value       key;
+		for (uint32_t dword = 0; dword < 4u; ++dword) {
+			const auto* read         = handle.Arg(dword).Resolve().TryInstruction();
+			uint32_t    memory_index = 0;
+			const auto* memory = read != nullptr ? ScalarReadMemory(*read, memory_index) : nullptr;
+			if (memory == nullptr || read->GetOpcode() != ValueOpcode::ReadConstBuffer) {
+				return false;
+			}
+			const auto* current = read->Arg(0).Resolve().TryInstruction();
+			Value       current_key;
+			uint32_t    offset = 0;
+			uint32_t    stride = 0;
+			if (current == nullptr || current->GetOpcode() != ValueOpcode::GetBufferResource ||
+			    (table != nullptr && !EquivalentValue(m_program, Value(const_cast<Inst*>(table)),
+			                                          Value(const_cast<Inst*>(current)))) ||
+			    !MatchTableOffset(read->Arg(1), current_key, offset, stride) || stride != 16u ||
+			    memory->offset > UINT32_MAX - offset) {
+				return false;
+			}
+			offset += memory->offset;
+			if (dword == 0u) {
+				key          = current_key;
+				table_offset = offset;
+				first_read   = read;
+			} else if (!EquivalentValue(m_program, key, current_key) ||
+			           static_cast<uint64_t>(table_offset) + dword * sizeof(uint32_t) != offset) {
+				return false;
+			}
+			table = current;
+		}
+		DescriptorSource descriptor;
+		if (!MakeRuntimeTableSource(*first_read, descriptor)) {
+			return false;
+		}
+		table_source = InternSource(descriptor);
+		return true;
+	}
+
+	void AddIndirectWriteTable(uint32_t source, uint32_t offset, uint32_t pc) {
+		for (const auto& table: m_indirect_write_tables) {
+			if (table.source == source) {
+				if (table.offset != offset) {
+					Fail(pc, "V# table stores use inconsistent table offsets");
+				}
+				return;
+			}
+		}
+		m_indirect_write_tables.push_back({source, offset, pc});
+	}
+
+	void LinkIndirectWriteTables() {
+		for (const auto& table: m_indirect_write_tables) {
+			const auto buffer =
+			    std::ranges::find_if(m_info.buffers, [&](const BufferResource& resource) {
+				    return resource.source == table.source;
+			    });
+			if (buffer == m_info.buffers.end()) {
+				Fail(table.pc, "V# table stores require the table to be a bound buffer");
+			}
+			buffer->indirect_write_table  = true;
+			buffer->indirect_table_offset = table.offset;
+		}
+	}
+
 	bool GetHandle(Value value, ValueOpcode expected, uint32_t width, uint32_t pc,
 	               uint32_t base_reg, Inst*& handle, uint32_t& source, bool sampler = false,
 	               bool sample_adjust = false) {
@@ -2278,12 +2352,23 @@ private:
 				source = indirect->source;
 			} else if (!GetHandle(inst.Arg(0), ValueOpcode::GetBufferResource, 4, flags.pc,
 			               memory.resource * 4u, handle, source)) {
-				if (memory.kind != (op == ValueOpcode::ReadConstBuffer ? ResourceKind::ScalarBuffer
-				                                                        : ResourceKind::Buffer) ||
-				    !memory.SupportsIndirectBufferLoad(op)) {
+				uint32_t table_source = 0;
+				uint32_t table_offset = 0;
+				// The host prepares V# table targets at compute dispatch only.
+				const bool indirect_store =
+				    m_program.stage == ShaderType::Compute && memory.kind == ResourceKind::Buffer &&
+				    memory.SupportsIndirectBufferStore(op) &&
+				    MatchIndirectWriteTable(*handle, table_source, table_offset);
+				if (indirect_store) {
+					AddIndirectWriteTable(table_source, table_offset, flags.pc);
+				} else if (memory.kind != (op == ValueOpcode::ReadConstBuffer
+				                               ? ResourceKind::ScalarBuffer
+				                               : ResourceKind::Buffer) ||
+				           !memory.SupportsIndirectBufferLoad(op)) {
 					Fail(flags.pc,
 					     "buffer descriptor is not a valid runtime value; GPU-selected access "
-					     "requires a scalar, raw DWORD x1/x2/x3/x4, or formatted X load");
+					     "requires a scalar, raw DWORD x1/x2/x3/x4, or formatted X load or a V# "
+					     "table store");
 				}
 				m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
 				m_info.uses_dma                         = true;
@@ -2412,6 +2497,12 @@ private:
 	std::vector<HandlePatch>                   m_handle_patches;
 	std::vector<MemoryPatch>                   m_memory_patches;
 	std::vector<IndirectDescriptorPlan>             m_indirect_descriptors;
+	struct IndirectWriteTable {
+		uint32_t source = 0;
+		uint32_t offset = 0;
+		uint32_t pc     = 0;
+	};
+	std::vector<IndirectWriteTable>            m_indirect_write_tables;
 	std::vector<std::pair<const Inst*, Value>> m_descriptor_selections;
 	bool                                       m_shader_writes = false;
 };

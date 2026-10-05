@@ -20,6 +20,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/rasterScale.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
@@ -364,12 +365,7 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 		viewport.y *= scale_y;
 		viewport.width *= scale_x;
 		viewport.height *= scale_y;
-		const auto right = uint32_t(std::ceil(float(scissor.offset.x + scissor.extent.width) * scale_x));
-		const auto bottom = uint32_t(std::ceil(float(scissor.offset.y + scissor.extent.height) * scale_y));
-		scissor.offset.x = int32_t(std::floor(float(scissor.offset.x) * scale_x));
-		scissor.offset.y = int32_t(std::floor(float(scissor.offset.y) * scale_y));
-		scissor.extent.width = std::min(right, effective.width) - scissor.offset.x;
-		scissor.extent.height = std::min(bottom, effective.height) - scissor.offset.y;
+		scissor = ScaleRasterScissor(scissor, scale_x, scale_y, {effective.width, effective.height});
 	}
 	vk_buffer.setViewportWithCount(viewport_count, viewports.data());
 	vk_buffer.setScissorWithCount(viewport_count, scissors.data());

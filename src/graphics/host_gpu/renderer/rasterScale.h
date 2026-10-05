@@ -8,6 +8,8 @@ namespace Libs::Graphics {
 class CommandScheduler;
 struct GraphicContext;
 
+vk::Rect2D ScaleRasterScissor(vk::Rect2D scissor, float scale_x, float scale_y, vk::Extent2D extent);
+
 // Keep the guest's memory, texture sizes and shader coordinates unchanged.
 // Only raster attachments are reduced; pass completion materializes the result
 // into the cache image before a texture/storage/CPU consumer can observe it.

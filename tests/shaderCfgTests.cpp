@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
+#include "graphics/host_gpu/renderer/rasterScale.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
@@ -14757,6 +14758,23 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
 
 #include "ShaderRayTracingTests.inc"
 
+void TestScaledRasterScissor() {
+  const auto outside = ScaleRasterScissor({{3000, 2000}, {0, 0}}, .5f, .5f, {640, 360});
+  Check(outside.offset == vk::Offset2D(640, 360) && outside.extent == vk::Extent2D(0, 0),
+        "out-of-bounds empty scissor wraps its extent");
+  const auto edge = ScaleRasterScissor({{1279, 719}, {1, 1}}, .5f, .5f, {640, 360});
+  Check(edge.offset == vk::Offset2D(639, 359) && edge.extent == vk::Extent2D(1, 1),
+        "scaled scissor loses the last attachment pixel");
+  const auto clipped = ScaleRasterScissor({{1200, 600}, {200, 200}}, .5f, .5f, {640, 360});
+  Check(clipped.offset == vk::Offset2D(600, 300) && clipped.extent == vk::Extent2D(40, 60),
+        "scaled scissor exceeds the attachment");
+  const auto empty = ScaleRasterScissor({{3, 5}, {0, 0}}, .5f, .5f, {640, 360});
+  Check(empty.extent == vk::Extent2D(0, 0), "fractional scaling expands an empty scissor");
+  const auto negative = ScaleRasterScissor({{-10, -20}, {30, 60}}, .5f, .5f, {640, 360});
+  Check(negative.offset == vk::Offset2D(0, 0) && negative.extent == vk::Extent2D(10, 20),
+        "negative scissor origin wraps during scaling");
+}
+
 } // namespace
 } // namespace Libs::Graphics
 
@@ -14764,6 +14782,7 @@ int main() {
   using namespace Libs::Graphics;
 
   EnsureConfigInitialized();
+  TestScaledRasterScissor();
   TestRayTracingInstructions();
   TestResourceDescriptorClassification();
   TestShaderBufferResourceSize();

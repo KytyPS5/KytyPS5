@@ -4,8 +4,25 @@
 #include "graphics/host_gpu/renderer/image/image.h"
 #include <algorithm>
 #include <array>
+#include <cmath>
 
 namespace Libs::Graphics {
+vk::Rect2D ScaleRasterScissor(vk::Rect2D scissor, float scale_x, float scale_y, vk::Extent2D extent) {
+	const auto clamp = [](double value, uint32_t limit) {
+		return uint32_t(std::clamp(value, 0.0, double(limit)));
+	};
+	const auto x = clamp(std::floor(double(scissor.offset.x) * scale_x), extent.width);
+	const auto y = clamp(std::floor(double(scissor.offset.y) * scale_y), extent.height);
+	// Widen the signed origin before adding the unsigned extent. Clamp before
+	// conversion and preserve empty slots even when scaling rounds outward.
+	const auto right = scissor.extent.width == 0 ? x :
+	    clamp(std::ceil((double(scissor.offset.x) + scissor.extent.width) * scale_x), extent.width);
+	const auto bottom = scissor.extent.height == 0 ? y :
+	    clamp(std::ceil((double(scissor.offset.y) + scissor.extent.height) * scale_y), extent.height);
+	scissor.offset = {int32_t(x), int32_t(y)};
+	scissor.extent = {std::max(right, x) - x, std::max(bottom, y) - y};
+	return scissor;
+}
 namespace {
 uint32_t ScaleDimension(uint32_t size, uint32_t percent) {
 	return std::max(1u, uint32_t(uint64_t(size) * percent / 100));

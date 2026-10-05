@@ -107,6 +107,13 @@ Prospero::BufferFormat ImageConversionFormat(Prospero::BufferFormat format) {
 	                                                      : Prospero::BufferFormat::kInvalid;
 }
 
+// The guest can sample 8-bit sRGB textures, but Vulkan only guarantees sRGB for RGBA8, so those
+// formats are stored in the linear format of the same width and the sRGB decode the guest texture
+// pipe applies to them has to be emulated by the shader.
+bool NeedsSrgbSampleDecode(Prospero::BufferFormat format) {
+	return format == Prospero::BufferFormat::k8Srgb || format == Prospero::BufferFormat::k8_8Srgb;
+}
+
 enum class SamplerClass : uint8_t { Float, Integer, PointInteger };
 
 SamplerClass ClassifySampler(const ImageResource& image) {
@@ -533,7 +540,8 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 				return SpecializationFail("FMASK requires a direct image load");
 			}
 		}
-		image.conversion_format = ImageConversionFormat(format);
+		image.conversion_format  = ImageConversionFormat(format);
+		image.srgb_sample_decode = !storage && NeedsSrgbSampleDecode(format);
 		if (storage || image.conversion_format != Prospero::BufferFormat::kInvalid) {
 			image.shader_swizzle = DescriptorImageSwizzle(descriptor);
 		}
@@ -601,12 +609,16 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 				image.numeric_class     = image_class.numeric_class;
 				image.dimension         = image_class.dimension;
 				image.mip_count         = image_class.mip_count;
-				image.conversion_format = image_class.conversion_format;
-				image.shader_swizzle    = image_class.shader_swizzle;
+				image.conversion_format  = image_class.conversion_format;
+				image.srgb_sample_decode = image_class.srgb_sample_decode;
+				image.shader_swizzle     = image_class.shader_swizzle;
 				image.cube              = image_class.cube;
 			}
 			const bool same_coordinates = image.dimension == image_class.dimension &&
 			                              image.cube == image_class.cube;
+			// The sRGB decode is applied per candidate (each switch arm decodes its own
+			// sample), so it is not a table-wide compatibility property: a table may mix
+			// narrow sRGB and linear candidates, which sample as the same float vector.
 			if (image.numeric_class != image_class.numeric_class ||
 			    (!same_coordinates && !(is_2d(image.dimension) && is_2d(image_class.dimension))) ||
 			    image.mip_count != image_class.mip_count ||
@@ -1136,15 +1148,16 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	for (uint32_t i = 0; i < program.info.images.size(); ++i) {
 		const auto& image = program.info.images[i];
 		specialization.images[i] = {
-		    .numeric_class = image.numeric_class,
-		    .dimension = image.dimension,
-		    .mip_count = image.mip_count,
-		    .conversion_format = image.conversion_format,
-		    .shader_swizzle = image.shader_swizzle,
-		    .indirect_root = image.indirect_root,
-		    .indirect_mapping_offset = image.indirect_mapping_offset,
+		    .numeric_class              = image.numeric_class,
+		    .dimension                  = image.dimension,
+		    .mip_count                  = image.mip_count,
+		    .conversion_format          = image.conversion_format,
+		    .srgb_sample_decode         = image.srgb_sample_decode,
+		    .shader_swizzle             = image.shader_swizzle,
+		    .indirect_root              = image.indirect_root,
+		    .indirect_mapping_offset    = image.indirect_mapping_offset,
 		    .indirect_search_iterations = image.indirect_search_iterations,
-		    .cube = image.cube,
+		    .cube                       = image.cube,
 		};
 		const auto* source = Source(program, image.source);
 		if (source == nullptr) {
@@ -1239,6 +1252,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		image.dimension                  = source.dimension;
 		image.mip_count                  = source.mip_count;
 		image.conversion_format          = source.conversion_format;
+		image.srgb_sample_decode         = source.srgb_sample_decode;
 		image.shader_swizzle             = source.shader_swizzle;
 		image.indirect_root              = source.indirect_root;
 		image.indirect_mapping_offset    = source.indirect_mapping_offset;

@@ -124,6 +124,40 @@ uint32_t GatherMip(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Memory
 	return Select(state, TypeU32(state), mip_none, ConstantU32(state, 0), mip);
 }
 
+// sRGB -> linear decode of one channel, as the guest texture pipe applies it to the samples of the
+// narrow sRGB formats (which the host stores linearly, see NeedsSrgbSampleDecode). The value is
+// clamped to [0, 1] first because the stored texels are limited-range UNORM data.
+uint32_t SrgbDecodedChannel(EmitterState& state, uint32_t value) {
+	const auto clamped = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), clamped, GlslStd450(state),
+	                          GLSLstd450FMax, value, ZeroF32(state));
+	const auto low =
+	    Binary(state, spv::OpFMul, TypeF32(state), clamped, ConstantF32Value(state, 1.0f / 12.92f));
+	const auto base =
+	    Binary(state, spv::OpFMul, TypeF32(state),
+	           Binary(state, spv::OpFAdd, TypeF32(state), clamped, ConstantF32Value(state, 0.055f)),
+	           ConstantF32Value(state, 1.0f / 1.055f));
+	const auto high = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), high, GlslStd450(state),
+	                          GLSLstd450Pow, base, ConstantF32Value(state, 2.4f));
+	const auto is_low = Binary(state, spv::OpFOrdLessThanEqual, TypeBool(state), clamped,
+	                           ConstantF32Value(state, 0.04045f));
+	return Select(state, TypeF32(state), is_low, low, high);
+}
+
+uint32_t SrgbDecodedVector(EmitterState& state, uint32_t value) {
+	uint32_t channels[4] {};
+	for (uint32_t index = 0; index < 4u; index++) {
+		const auto channel = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), channel, value, index);
+		channels[index] = SrgbDecodedChannel(state, channel);
+	}
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 4), result,
+	                          channels[0], channels[1], channels[2], channels[3]);
+	return result;
+}
+
 uint32_t CubeAxis(EmitterState& state, uint32_t value) {
 	return Binary(state, spv::OpFSub, TypeF32(state), value, ConstantF32(state, 0x3f800000u));
 }
@@ -216,15 +250,22 @@ uint32_t SampledComponentZero(EmitterState& state, Prospero::TextureNumericClass
 	EXIT("invalid sampled image numeric class");
 }
 
+// `decode_srgb` is false when the caller already decoded each candidate in its own arm: the
+// merged indirect result must not be decoded a second time with the root image's flag.
 uint32_t ResultVector(ValueEmitContext& ctx, uint32_t value,
                       Prospero::TextureNumericClass numeric_class, bool dref,
-                      const IR::MemoryInfo& mem, bool gather = false) {
+                      const IR::MemoryInfo& mem, bool gather = false,
+                      bool decode_srgb = true) {
 	auto value_class = numeric_class;
 	if (dref) {
 		value_class = Prospero::TextureNumericClass::Float;
 	}
 	const bool integer = value_class == Prospero::TextureNumericClass::Uint ||
 	                     value_class == Prospero::TextureNumericClass::Sint;
+	if (decode_srgb && !integer && !dref &&
+	    ctx.state.program.info.images[mem.resource].srgb_sample_decode) {
+		value = SrgbDecodedVector(ctx.state, value);
+	}
 	if (mem.data_bits == 16u) {
 		uint32_t   packed[4] = {ConstantU32(ctx.state, 0), ConstantU32(ctx.state, 0),
 		                        ConstantU32(ctx.state, 0), ConstantU32(ctx.state, 0)};
@@ -830,6 +871,18 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			state.builder.AddFunction(opcode, sample_operands);
 			return sample;
 		};
+		// A mixed indirect table may hold both narrow sRGB and linear candidates, so each
+		// candidate decodes its own sample before the OpPhi merge. The integer and depth
+		// guards mirror ResultVector: only floating-point colour samples carry the decode.
+		const auto EmitCandidateSample = [&](uint32_t resource) {
+			const auto sample = EmitSample(resource);
+			if (dref || numeric_class == Prospero::TextureNumericClass::Uint ||
+			    numeric_class == Prospero::TextureNumericClass::Sint ||
+			    !state.program.info.images[resource].srgb_sample_decode) {
+				return sample;
+			}
+			return SrgbDecodedVector(state, sample);
+		};
 		if (image.indirect_root != mem.resource) {
 			const auto sample = EmitSample(mem.resource);
 			auto       result = sample;
@@ -903,14 +956,28 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		state.builder.AddFunction(spv::OpSelectionMerge, merge_label,
 		                          spv::SelectionControlMaskNone);
 		state.builder.AddFunction(switch_words);
+		// When every candidate shares the root's decode flag the merged result is decoded
+		// once, so a uniform table keeps a single decode sequence instead of one per arm.
+		const bool uniform_decode = [&] {
+			const auto root_decode = state.program.info.images[mem.resource].srgb_sample_decode;
+			for (const auto resource : image.indirect_resources) {
+				if (state.program.info.images[resource].srgb_sample_decode != root_decode) {
+					return false;
+				}
+			}
+			return true;
+		}();
+		const auto EmitArmSample = [&](uint32_t resource) {
+			return uniform_decode ? EmitSample(resource) : EmitCandidateSample(resource);
+		};
 		std::vector<uint32_t> phi_words {spv::OpPhi, result_type, state.builder.AllocateId()};
 		EmitLabel(state, default_label);
-		phi_words.push_back(EmitSample(image.indirect_resources[0]));
+		phi_words.push_back(EmitArmSample(image.indirect_resources[0]));
 		phi_words.push_back(default_label);
 		state.builder.AddFunction(spv::OpBranch, merge_label);
 		for (uint32_t candidate = 1; candidate < image.indirect_resources.size(); candidate++) {
 			EmitLabel(state, labels[candidate - 1u]);
-			phi_words.push_back(EmitSample(image.indirect_resources[candidate]));
+			phi_words.push_back(EmitArmSample(image.indirect_resources[candidate]));
 			phi_words.push_back(labels[candidate - 1u]);
 			state.builder.AddFunction(spv::OpBranch, merge_label);
 		}
@@ -920,7 +987,7 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		if (!dref) {
 			result = UnpackImageTexel(ctx, mem, result);
 		}
-		ctx.Define(inst, ResultVector(ctx, result, numeric_class, dref, mem));
+		ctx.Define(inst, ResultVector(ctx, result, numeric_class, dref, mem, false, uniform_decode));
 		return;
 	}
 	if (image_info.access == IR::ImageAccess::Atomic) {

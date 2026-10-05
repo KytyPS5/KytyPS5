@@ -1,0 +1,8 @@
+Trophy unlock sound
+
+Title: Positive Blip Effect
+Creator: CogFireStudios
+Source: https://freesound.org/s/531512/
+License: CC0 1.0 Universal (public domain dedication)
+
+The sound is included as assets/sounds/trophy-unlock.wav.

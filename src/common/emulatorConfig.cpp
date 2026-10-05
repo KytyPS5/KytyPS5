@@ -257,6 +257,10 @@ bool LodStatsEnabled() {
 	return g_config->lod_stats_enabled;
 }
 
+bool AsyncPipelinesEnabled() {
+	return g_config->async_pipelines_enabled;
+}
+
 bool TrophyEnabled() {
 	return g_config->trophy_enabled;
 }

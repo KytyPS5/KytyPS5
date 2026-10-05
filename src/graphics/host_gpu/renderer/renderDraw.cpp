@@ -1525,6 +1525,42 @@ bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo&
 	return true;
 }
 
+// Whether a draw may be skipped while the driver compiles its pipeline: the picture is all it
+// changes. Its shaders write no memory, its samples reach no guest occlusion counter and it
+// renders to no linear image (the CPU reads those back, e.g. GTA V's vehicle damage).
+static bool DrawOnlyChangesPicture(RenderContext& context, const DrawRenderState& state,
+                                   const DrawTargets&                     targets,
+                                   std::span<const ShaderVertexInputInfo> vertex_stages) {
+	const auto writes_memory = [](const ShaderStageRuntime& stage) {
+		if (stage.module == nullptr) {
+			return true;
+		}
+		const auto& program = stage.module->info;
+		return program.has_address_writes ||
+		       std::ranges::any_of(program.info.buffers,
+		                           [](const auto& buffer) { return buffer.written; }) ||
+		       std::ranges::any_of(program.info.images,
+		                           [](const auto& image) { return image.written; });
+	};
+	if (context.GetOcclusionQueries().Counting()) {
+		return false;
+	}
+	for (const auto& stage: vertex_stages) {
+		if (writes_memory(stage.stage)) {
+			return false;
+		}
+	}
+	if (state.ps_active && writes_memory(state.ps_input_info.stage)) {
+		return false;
+	}
+	for (uint32_t i = 0; i < targets.color_count; i++) {
+		if (!targets.colors[i].desc.info.IsTiled()) {
+			return false;
+		}
+	}
+	return !static_cast<bool>(targets.depth.image_id) || targets.depth.desc.info.IsTiled();
+}
+
 void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallInfo& draw,
                                          const DrawRenderState& state, const DrawEmitInfo& emit,
                                          const DrawIndexBufferSource& index_source) {
@@ -1569,6 +1605,17 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 			     draw.instance_count);
 		}
 	}
+
+	auto* const pipeline_ptr = m_context.GetPipelineCache().GetGraphicsPipeline(
+	    buffer, state, *m_draw_targets,
+	    Config::AsyncPipelinesEnabled() &&
+	        DrawOnlyChangesPicture(m_context, state, *m_draw_targets, vertex_stages) &&
+	        !SmallColorTargetDraw(buffer.GetRegisters()));
+	if (pipeline_ptr == nullptr) {
+		// Skipped until a background thread created the pipeline.
+		return;
+	}
+	auto& pipeline = *pipeline_ptr;
 
 	// Mesh shaders read the original guest indices in whole DWORDs by device address. Their buffer
 	// exists before the descriptors bind, so creating it merges no buffer this draw binds.
@@ -1618,7 +1665,6 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 			EXIT_IF(count_buffer.first == nullptr || (count_buffer.second & 3u) != 0);
 		}
 	}
-	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(buffer, state, *m_draw_targets);
 	vk::ImageAspectFlags feedback_aspects;
 	const auto rendering = AcquireRenderTargets(buffer, m_draw_targets->colors, m_draw_targets->color_count,
 	                                            m_draw_targets->depth, feedback_aspects, stages);

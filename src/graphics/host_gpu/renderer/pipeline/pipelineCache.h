@@ -27,6 +27,7 @@
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -86,6 +87,7 @@ struct ShaderParams;
 class CommandBuffer;
 
 namespace HW {
+class Context;
 class UserConfig;
 class Shader;
 } // namespace HW
@@ -182,7 +184,14 @@ struct ShaderModule {
 	std::vector<RectListParameter>               rect_parameters;
 	// Indirect mesh draw: a task shader reads the records and launches the groups.
 	bool                                         mesh_task = false;
+	// The size of the module's SPIR-V: small pipelines compile at once (GetGraphicsPipeline).
+	uint32_t                                     spirv_words = 0;
 };
+
+// Whether every color target the draw writes is at most 1024 pixels wide and
+// high (default 1024; 0 = off): glyph atlases and cached UI layers, which a game draws once.
+// Such draws are never skipped while their pipeline compiles.
+[[nodiscard]] bool SmallColorTargetDraw(const HW::Context& context);
 
 // A draw's depth target and its first color_count color targets.
 struct DrawTargets {
@@ -273,8 +282,11 @@ public:
 	                                           ShaderComputeInputInfo&      input_info,
 	                                           ProgramResolution&           ahead);
 
-	Pipeline& GetGraphicsPipeline(const CommandBuffer& command, const DrawRenderState& state,
-	                              const DrawTargets& targets);
+	// With `allow_async`, a pipeline that does not exist yet is created on a background thread
+	// and the lookup returns null until it is there (the draw can be skipped meanwhile);
+	// otherwise the lookup creates the pipeline, or waits for a background thread creating it.
+	Pipeline* GetGraphicsPipeline(const CommandBuffer& command, const DrawRenderState& state,
+	                              const DrawTargets& targets, bool allow_async = false);
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info);
 
 private:
@@ -398,6 +410,38 @@ private:
 	void RunCompileJob(CompileJob& job, InputInfo& input_info);
 	void CompileWorker();
 	void StopWorkers();
+
+	// Pipelines new to the session, created on background threads instead of stalling the
+	// execution thread: graphics pipelines of draws that may be skipped until they are there,
+	// and compute pipelines of modules the compile workers compiled ahead of their dispatch.
+	// Finished pipelines wait in m_async_ready until a lookup takes them; the pending keys are
+	// under m_async_mutex.
+	struct AsyncPipelineJob {
+		bool                               compute = false;
+		GraphicsPipelineKey                key {};
+		std::array<const ShaderModule*, 4> stages {};
+		const ShaderModule*                module = nullptr;
+	};
+	std::unordered_set<GraphicsPipelineKey, GraphicsPipelineKeyHash> m_async_pending_graphics;
+	std::unordered_set<uint64_t>                                     m_async_pending_compute;
+	// Keys a background thread failed to create: their draws create them and report the error.
+	std::unordered_set<GraphicsPipelineKey, GraphicsPipelineKeyHash> m_async_failed_graphics;
+	std::unordered_map<GraphicsPipelineKey, Pipeline, GraphicsPipelineKeyHash> m_async_ready;
+	std::unordered_map<uint64_t, Pipeline>                                     m_async_ready_compute;
+	std::mutex                                                       m_async_mutex;
+	std::condition_variable                                          m_async_available;
+	std::deque<AsyncPipelineJob>                                     m_async_jobs;
+	bool                                                             m_async_stopping = false;
+	std::vector<std::jthread>                                        m_async_threads;
+
+	void QueueAsyncPipeline(const AsyncPipelineJob& job);
+	// Under m_async_mutex: removes a queued job no thread has started; false when none matches.
+	template <typename Matches>
+	bool TakeQueuedAsyncPipeline(Matches&& matches);
+	void AsyncPipelineWorker();
+	void StopAsyncPipelines();
+	// A compile worker added a compute module: its pipeline is created in the background.
+	void CreateComputePipelineAhead(const ShaderModule& module);
 	void InitializeDriverCache();
 	// Marks the driver cache changed and, once per interval, has the store thread write it; sooner
 	// after a slow creation.

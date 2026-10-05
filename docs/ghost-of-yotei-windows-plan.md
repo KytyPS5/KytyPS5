@@ -1,5 +1,26 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **5 октября 2026 года, 03:33 UTC** (native Windows tests;
+color fix committed `2e3637ea`, installed game still `f708edc1`/c73cc32e):
+
+- Upstream color/alpha correction verified by20 numerical cases and GPUAV CTest3/3.
+  No actual-game colors claim before new EXE retry; audio/main-menu blocker remains.
+- ATRAC9 global packed-word conversion candidate disproved: existing run023451
+  contains9807 successful ordinary AJM control initializations with byte configs.
+  Candidate and its unproved ABI oracle discarded before emulator installation or
+  commit; src/libs audio files restored exactly to2e3637ea. No word auto-detection,
+  fabricated metadata, register modification or division skipping.
+- New baseline AJM byte-config coverage passes on unchanged audio production:
+  mono/stereo/96kHz/vibration metadata, invalid/null/reversed/sentinel boundaries,
+  actual control initialize and1024 nonzero-reference native PCM samples with exact
+  consumption/format/lengths. Native test58e5a1e53d5f, neighboring CTest2/2 PASS
+  with existing NGS2 sampler. This is coverage, not an audio behavior fix or valid
+  emulator-defect RED. Required root reproduction still pending in test debt.
+- Next commit baseline coverage separately, native Windows build/install/hash of
+  verified color fix, bounded game colors retry plus expanded read-only integer-fault
+  source-descriptor/header/stack capture. Own prior game/recorder ended/cleaned.
+  Main menu/game entry PENDING, issue108 unchanged; no push, saves/cache preserved.
+
 Checkpoint **5 октября 2026 года, 03:12 UTC** (native Windows tests;
 installed game executable still source `f708edc1`/c73cc32e):
 

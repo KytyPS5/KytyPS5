@@ -60,6 +60,29 @@ Selective upstream logical-alpha integration verified (installed game still old)
   blend factors/operations. Native emulator build/install/game colors comparison
   still pending; don't claim Yōtei darkness resolved from synthetic readback.
 
+## ATRAC9 configuration diagnosis and baseline coverage (2026-10-05)
+
+A candidate packed-word interpretation was disproved by existing runtime evidence:
+run023451 has9807 successful ordinary AJM ATRAC9 initializations using the same
+control API, not NGS2. Global word-to-byte conversion would break those streams.
+Unproved audio candidate was removed before installation/commit; production audio
+restored byte-for-byte to HEAD2e3637ea. The initial packed-word test had an unproved
+ABI oracle; its failure is NOT a demonstrated emulator defect. Do not call this a
+proved RED/GREEN audio fix. No auto-detection/header swapping or fabricated metadata.
+
+New baseline test uses independently constructed MSB-first configurations (mono,
+stereo,96kHz,vibration), metadata/null/error/sentinel boundaries, and real AJM control
+initialization plus synthetic nonzero native PCM against a canonical backend byte
+reference. Explicitly rejects reversed byte order. Native baseline PASS on
+unchanged audio production, test EXE58e5a1e53d5f45c087c35e26b96859af1bca38b0d947f4f6d7a8537fa0d44bdb,
+`ajm-at9-byte-contract-baseline-20261005.log`. Neighbor CTest2/2 PASS
+`ajm-at9-byte-contract-neighbors-ctest-20261005.log` (new AJM plus NGS2 sampler).
+Initial draft build/reference-frame errors were not valid reproductions; corrected
+synthetic superframe flags before this baseline proof. This adds
+coverage without changing behavior; original guest configuration root remains open.
+Required next capture: source audio descriptor/header plus upstream read/API inputs
+at the integer exception, distinguish unsupported format from corrupted metadata.
+
 ## Integer divide exception during initial setup (2026-10-05; diagnosis pending)
 
 Native production/tests source `f708edc1`, installed EXE SHA

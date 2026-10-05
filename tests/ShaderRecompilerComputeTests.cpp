@@ -54,6 +54,8 @@
 #include "kernel/eventQueue.h"
 #include "kernel/memory.h"
 #include "libs/agc.h"
+#include "libs/audio.h"
+#include "libs/ajm/atrac9_decoder.h"
 #include "libs/dialog.h"
 #include "libs/errno.h"
 #include "spirv-tools/libspirv.hpp"
@@ -46561,11 +46563,122 @@ void CheckF64Admission() {
 } // namespace
 } // namespace Libs::Graphics
 
+// AJM configurations are MSB-first byte streams, independently of the numeric
+// NGS2 configuration-word interface. Build fixtures without captured game bytes.
+void CheckAjmAt9Configuration() {
+  using namespace Libs::Audio::Ajm;
+  using Libs::Graphics::Require;
+  constexpr const char* name = "AjmAt9Configuration";
+  const auto bytes = [](uint32_t rate, uint32_t channel, uint32_t frame_bytes, uint32_t superframe) {
+    const auto packed = (0xfeu << 24) | (rate << 20) | (channel << 17) |
+                        ((frame_bytes - 1u) << 5) | (superframe << 3);
+    return std::array<uint8_t, 4>{static_cast<uint8_t>(packed >> 24),
+        static_cast<uint8_t>(packed >> 16), static_cast<uint8_t>(packed >> 8), static_cast<uint8_t>(packed)};
+  };
+  struct Case { uint32_t rate_index, channel_index, frame_bytes, superframe_index;
+                uint32_t channels, rate, frame_samples; };
+  std::string errors;
+  for (const auto test : {Case{7, 0, 96, 2, 1, 48000, 256},
+                          Case{7, 2, 160, 0, 2, 48000, 256},
+                          Case{12, 0, 257, 1, 1, 96000, 128},
+                          Case{7, 6, 32, 2, 1, 48000, 256},
+                          Case{7, 7, 32, 2, 2, 48000, 256}}) {
+    auto config = bytes(test.rate_index, test.channel_index, test.frame_bytes, test.superframe_index);
+    struct Output { AjmDecAt9ConfigDataInfo info; uint32_t sentinel; } output{};
+    output.sentinel = 0x1234abcd;
+    const auto status = AjmDecAt9ParseConfigData(config.data(), &output.info);
+    const auto frames = 1u << test.superframe_index;
+    if (status != 0 || output.info.channels != test.channels || output.info.sample_rate != test.rate ||
+        output.info.frame_samples_per_channel != test.frame_samples ||
+        output.info.superframe_samples_per_channel != frames * test.frame_samples ||
+        output.info.superframe_size != frames * test.frame_bytes || output.sentinel != 0x1234abcd ||
+        config != bytes(test.rate_index, test.channel_index, test.frame_bytes, test.superframe_index)) {
+      errors += "metadata rate=" + std::to_string(test.rate_index) + " channel=" +
+                std::to_string(test.channel_index) + " status=" + std::to_string(status) + "; ";
+    }
+  }
+  // API error boundaries must leave metadata untouched.
+  AjmDecAt9ConfigDataInfo invalid_info;
+  std::memset(&invalid_info, 0x5a, sizeof(invalid_info));
+  const auto original_info = invalid_info;
+  auto extension = bytes(7, 0, 96, 2);
+  extension[1] |= 1;
+  auto reversed = bytes(7, 0, 96, 2);
+  std::reverse(reversed.begin(), reversed.end());
+  for (const auto config : {std::array<uint8_t, 4>{}, extension, reversed}) {
+    Require(name, "invalid config bytes", AjmDecAt9ParseConfigData(config.data(), &invalid_info) != 0 &&
+            std::memcmp(&invalid_info, &original_info, sizeof(invalid_info)) == 0,
+            "invalid config succeeded or changed output");
+  }
+  const auto config = bytes(7, 0, 96, 2);
+  Require(name, "null metadata arguments", AjmDecAt9ParseConfigData(nullptr, &invalid_info) != 0 &&
+          AjmDecAt9ParseConfigData(config.data(), nullptr) != 0, "null config/output accepted");
+
+  // Nonzero synthetic mono spectral coefficient, same fixture used by sampler tests.
+  constexpr std::array<uint8_t, 36> mono_block{0, 0, 0x04, 0x20, 0x04, 0xc0, 0, 0, 0x1f, 0xc0};
+  std::array<uint8_t, 384> encoded{};
+  for (uint32_t frame = 0; frame < 4; ++frame) {
+    std::copy(mono_block.begin(), mono_block.end(), encoded.begin() + frame * mono_block.size());
+    if (frame != 0) encoded[frame * mono_block.size()] |= 0x80;
+  }
+  std::array<float, 1024> expected{}, actual{};
+  std::array<uint8_t, 4> canonical{0xfe, 0x70, 0x0b, 0xf0};
+  auto reference = std::unique_ptr<void, decltype(&Atrac9ReleaseHandle)>(Atrac9GetHandle(), Atrac9ReleaseHandle);
+  Require(name, "canonical byte config", reference && Atrac9InitDecoder(reference.get(), canonical.data()) == 0,
+          "synthetic reference config invalid");
+  size_t offset = 0;
+  for (uint32_t frame = 0; frame < 4; ++frame) {
+    int used = 0;
+    Require(name, "reference PCM", Atrac9DecodeF32(reference.get(), encoded.data() + offset,
+            expected.data() + frame * 256, &used, 0) == 0 && used == mono_block.size(),
+            "synthetic reference decode failed");
+    offset += used;
+  }
+  uint32_t context = 0, instance = 0;
+  Require(name, "AJM instance", AjmInitialize(0, &context) == 0 &&
+          AjmInstanceCreate(context, 1, 1u | (2u << 7), &instance) == 0, "AJM create failed");
+  alignas(void*) std::array<std::byte, 64> info_storage{};
+  auto* batch_info = reinterpret_cast<AjmBatchInfo*>(info_storage.data());
+  std::array<std::byte, 4096> batch_storage{};
+  Require(name, "batch storage", AjmBatchInitialize(batch_storage.data(), batch_storage.size(), batch_info) == 0,
+          "batch initialization failed");
+  struct Params { std::array<uint8_t, 4> config; uint32_t reserved; } params{config, 0};
+  std::array<uint32_t, 16> sideband{};
+  const auto init_status = AjmBatchJobControl(batch_info, instance, (1ull << 14) | (1ull << 11),
+      &params, sizeof(params), sideband.data(), 24);
+  const bool initialized = init_status == 0 && sideband[0] == 0 && sideband[2] == 384 &&
+                           sideband[3] == 4 && sideband[4] == 384 && sideband[5] == 256;
+  const auto init_result = sideband[0];
+  sideband.fill(0);
+  const auto run_status = AjmBatchJobRun(batch_info, instance,
+      (1ull << 11) | (1ull << 12) | (1ull << 46) | (1ull << 47), encoded.data(), encoded.size(),
+      actual.data(), sizeof(actual), sideband.data(), sizeof(sideband));
+  const bool stream = run_status == 0 && sideband[0] == 0 && sideband[6] == 1 &&
+      sideband[8] == 48000 && sideband[9] == 2 && sideband[12] == encoded.size() &&
+      sideband[13] == sizeof(actual) && sideband[14] == actual.size() && sideband[15] == 0;
+  bool pcm = std::ranges::any_of(expected, [](float x) { return std::abs(x) > 0.000001f; });
+  for (size_t sample = 0; sample < actual.size(); ++sample) {
+    pcm = pcm && std::isfinite(actual[sample]) && std::abs(actual[sample] - expected[sample]) < 0.000001f;
+  }
+  Require(name, "instance cleanup", AjmInstanceDestroy(context, instance) == 0 && AjmFinalize(context) == 0,
+          "AJM cleanup failed");
+  if (!initialized || !stream || !pcm) {
+    errors += "control result=" + std::to_string(init_result) + " run result=" +
+              std::to_string(sideband[0]) + " PCM=" + std::to_string(pcm) + "; ";
+  }
+  Require(name, "byte metadata/control/PCM", errors.empty(), errors);
+  std::printf("[host]    %-32s ok\n", name);
+}
+
 int main(int argc, char **argv) {
   using namespace Libs::Graphics;
 
   std::setvbuf(stdout, nullptr, _IONBF, 0);
   EnsureConfigInitialized();
+  if (argc == 2 && std::strcmp(argv[1], "--ajm-at9-config-only") == 0) {
+    CheckAjmAt9Configuration();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--float-image-atomic-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, ImageAtomicFminSpecialValues());

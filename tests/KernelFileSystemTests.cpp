@@ -164,6 +164,50 @@ void TestFileDescriptorFlags() {
   }
 }
 
+// A descriptor closed while another thread is inside a read must make that
+// read fail with EBADF. It must never observe a freed File or a host file
+// that is being closed underneath it.
+void CheckConcurrentCloseDuringRead(const std::filesystem::path &root) {
+  constexpr char Path[] = "/savedata0/concurrent-close.dat";
+  constexpr int Rounds = 256;
+
+  const std::string payload(4096, 'k');
+  {
+    Common::File fixture;
+    Check(fixture.Create(root / "concurrent-close.dat"),
+          "create concurrent-close fixture");
+    fixture.Write(payload.data(), static_cast<uint32_t>(payload.size()));
+    fixture.Close();
+  }
+
+  for (int round = 0; round < Rounds; ++round) {
+    const int fd = FileSystem::KernelOpen(Path, 0, 0);
+    Check(fd >= 3, "open descriptor for concurrent close");
+
+    std::atomic_bool reader_ready{false};
+    std::atomic_bool closer_ready{false};
+
+    auto reader = std::async(std::launch::async, [&] {
+      std::vector<char> buffer(payload.size());
+      reader_ready = true;
+      while (!closer_ready) {
+      }
+      return FileSystem::KernelRead(fd, buffer.data(), buffer.size());
+    });
+
+    while (!reader_ready) {
+    }
+    closer_ready = true;
+    const int closed = FileSystem::KernelClose(fd);
+    const int64_t read = reader.get();
+
+    Check(closed == OK, "close descriptor racing a read");
+    Check(read == static_cast<int64_t>(payload.size()) ||
+              read == Libs::LibKernel::KERNEL_ERROR_EBADF,
+          "racing read either completes or reports a bad descriptor");
+  }
+}
+
 void TestSaveOpenVisibility() {
   constexpr char Path[] = "/savedata0/visible-save.dat";
   constexpr char Payload[] = "saved progress";
@@ -1546,6 +1590,7 @@ int main(int, char**) {
   TestAioBatches();
   CheckSaveRename(temporary.Path(), "first-save");
   CheckSaveRename(temporary.Path(), "replacement-save");
+  CheckConcurrentCloseDuringRead(temporary.Path());
   FileSystem::Shutdown();
   CheckSocketWakeup();
   CheckEtherAddressFormatting();

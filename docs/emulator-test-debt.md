@@ -1,5 +1,52 @@
 # Emulator regression test debt
 
+## Filterable scaled 8-bit textures (2026-10-05; reproduction pending)
+
+Upstream96c067d0 is a useful candidate, not yet a verified local fix. Before any
+production change, add synthetic R8/RG8 UScaled bilinear samples at fractional
+texel coordinates plus gathers of a component and a swizzle constant. Independent
+oracle: interpolate byte values in the scaled domain, retain fractional results,
+and apply selector constants after conversion. Check real runtime sampler mapping,
+nearest-filter integer neighbors and packed-integer extraction. Native RED/GREEN
+and GPUAV required; no build/GPU regression during active game033835/PID7628.
+Use existing explicit readback intervals for fractional floating tolerance only;
+zero/one swizzle constants remain exact. Current installed source2b8e95b0 unchanged.
+
+Initial scaled fixture stops at an existing shader-swizzle internal assertion,
+`scaled-texture-red-gpuav-20261005.log`, EXEa1c2168e6e7140b88334f79e170e32de515577b78fdf0317b0f148c8b931ddce.
+Refine fixture to use its independent numerical swizzle oracle without requiring
+which implementation layer performs the mapping. No production behavior changed;
+rebuild and intended numerical RED still pending. Existing tests keep the assertion.
+
+The initial numerical zero is NOT a valid defect RED: the adapted fixture used
+ssamp0 (texture words) while its real sampler descriptor was in s[8:11]. This
+also explains zero after the candidate production port. Preserve those logs as
+fixture diagnosis, not proof (`scaled-texture-numerical-red-gpuav-20261005.log`,
+EXE35d33de7db85; `scaled-texture-point-admission-green-gpuav-20261005.log`,
+EXEeef94cd9a2b9). Expected colors unchanged. All three instructions now use
+ssamp2, matching the explicit bilinear runtime descriptor. Scoped reversal of
+only four owned production files restores HEAD2b8e95b0; candidate preserved at
+`_Build/analysis/scaled-texture-local-production-20261005.patch`. Corrected native
+RED confirmed on production2b8e95b0: runtime bilinear sample is ~0.2500038
+(0x3e800080), expected63.75±0.01; this now exposes missing scaled conversion.
+`scaled-texture-correct-sampler-red-gpuav-20261005.log`, native EXE
+710c0e88ff1fd97e400be92d1d4a0fd7af1061cc8710e7aec316a69d0e07889a,
+04:20:53–04:21:01UTC, C0000409, no timeout/VUID. Reapplied preserved generic
+candidate, including local sampler point-admission adjustments. Native unchanged numerical
+GREEN R8/RG8 PASS, `scaled-texture-correct-sampler-green-gpuav-20261005.log`,
+EXE08f6c7979449fa63b69361fda37aec36d6f7cfda2d6202586b3f783b317b69b6.
+First integer neighbor exposes a harness gap: runtime sampler creation ignored
+specialized force_point_filtering (production NativeSampler applies it), causing
+VUID04553 for R8_UINT. Align harness descriptor handling with NativeSampler;
+keep all integer and scaled expected outputs unchanged. Final native GPUAV
+integer neighbor and packed texture neighbor PASS; affected CTest4/4 PASS
+(`scaled-texture-color-neighbors-final-ctest-gpuav-20261005.log`). Final test EXE
+fed6305dfe1fb9086a9775365059623e51422bab12fb571c4edf6677675e7d19.
+No second game installed; full suite remains not green. Clamp-to-border/custom
+colors and additional scaled formats are not numerically verified by these fixtures;
+this validates R8/RG8 interior bilinear filtering and component/constant gathers.
+Windows emulator installation and game color comparison still pending.
+
 ## Color pipeline comparison with upstream (2026-10-05; regressions pending)
 
 User requests comparison against andsouzam/main and useful integration, plus
@@ -62,7 +109,7 @@ Selective upstream logical-alpha integration verified (installed game still old)
 
 ## ATRAC9 configuration diagnosis and baseline coverage (2026-10-05)
 
-A candidate packed-word interpretation was disproved by existing runtime evidence:
+A global packed-word conversion candidate was disproved by existing runtime evidence:
 run023451 has9807 successful ordinary AJM ATRAC9 initializations using the same
 control API, not NGS2. Global word-to-byte conversion would break those streams.
 Unproved audio candidate was removed before installation/commit; production audio
@@ -82,6 +129,12 @@ synthetic superframe flags before this baseline proof. This adds
 coverage without changing behavior; original guest configuration root remains open.
 Required next capture: source audio descriptor/header plus upstream read/API inputs
 at the integer exception, distinguish unsupported format from corrupted metadata.
+Successful control initializations do not establish the separate metadata-entry
+ABI. Its opaque pointer declaration and baseline byte-codec tests are not primary
+guest API documentation. Do not infer either a universal byte or universal word
+metadata contract from those successes. Captured guest code submits the same
+object configuration to control and metadata without an intervening byte swap;
+identify the source descriptor/header that produced the invalid byte sequence.
 
 ## Integer divide exception during initial setup (2026-10-05; diagnosis pending)
 

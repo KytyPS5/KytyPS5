@@ -1274,6 +1274,7 @@ struct TestCase {
   std::array<u32, 64> user_data{};
   bool has_user_data = false;
   u32 image_descriptor_swizzle = DstSel(4, 5, 6, 7);
+  bool check_shader_swizzle = true;
   bool compile_only = false;
   size_t storage_buffer_range_dwords = 0;
   bool use_descriptor_buffer_ranges = false;
@@ -21221,7 +21222,7 @@ void CompareGraphicsWords(const GraphicsCase &test,
 void RunCase(VulkanHarness *vulkan, const TestCase &test) {
   if (test.companion_check != nullptr) test.companion_check();
   auto compiled = CompileCase(test, vulkan != nullptr ? vulkan->WorkgroupLimits() : ShaderRecompiler::ComputeWorkgroupLimits{}, vulkan != nullptr ? vulkan->HostProfile() : ShaderRecompiler::ShaderHostProfile{}, vulkan != nullptr ? vulkan->DenseBufferCapacity() : ShaderRecompiler::IR::ShaderInfo::MaxBuffers);
-  if (test.image_descriptor_swizzle != DstSel(4, 5, 6, 7) &&
+  if (test.check_shader_swizzle && test.image_descriptor_swizzle != DstSel(4, 5, 6, 7) &&
       !compiled.program.info.images.empty()) {
     Require(test.name, "resource specialization",
             compiled.program.info.images[0].shader_swizzle ==
@@ -21341,7 +21342,12 @@ void RunCase(VulkanHarness *vulkan, const TestCase &test) {
       const auto& value = compiled.resources.samplers[index];
       ShaderSamplerResource descriptor{};
       std::copy_n(value.dwords.begin(), 4, descriptor.fields);
-      samplers_by_resource.push_back(cache.GetSampler(descriptor, compiled.program.info.samplers.at(index).integer_border));
+      const auto& info = compiled.program.info.samplers.at(index);
+      // Match NativeSampler: use the specialized sampler variant, including
+      // point-only integer formats, rather than the original guest filters.
+      if (!info.depth_compare) descriptor.fields[0] &= ~(0x7u << 12u);
+      if (info.force_point_filtering) descriptor.SetPointFiltering();
+      samplers_by_resource.push_back(cache.GetSampler(descriptor, info.integer_border));
     }
   } else if (needs_sampler) {
     sampler = vulkan->CreateNearestSampler(test.name, sampled_image.mip_levels);
@@ -36766,6 +36772,61 @@ TestCase ImageSamplePackedUintConvertsSampleAndGather() {
   return test;
 }
 
+template <bool rg> TestCase ImageSampleUScaled8() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = rg ? "ImageSampleRG8UScaled" : "ImageSampleR8UScaled";
+  AppendVMovLiteral(&test.code, 20, std::bit_cast<u32>(0.375f));
+  AppendVMovLiteral(&test.code, 21, std::bit_cast<u32>(0.375f));
+  test.code.push_back(EncodeMimg0(0x20, 0xf));
+  test.code.push_back(EncodeMimg1(0, 20, 0, 2));
+  test.code.push_back(EncodeMimg0(0x47, 0x1));
+  test.code.push_back(EncodeMimg1(4, 20, 0, 2));
+  test.code.push_back(EncodeMimg0(0x47, 0x8));
+  test.code.push_back(EncodeMimg1(8, 20, 0, 2));
+  for (u32 component = 0; component < 12; ++component) {
+    AppendStoreVgpr(&test.code, component, component);
+  }
+  AppendEnd(&test.code);
+  // R varies horizontally; G varies vertically in the opposite direction.
+  // A 2x2 image sampled at .375 has weights .75/.25 on each axis.
+  test.image_width = test.image_height = 2;
+  test.sampled_image_rgba = rg ? std::vector<u32>{0xffffff00u, 0x00ff0000u}
+                               : std::vector<u32>{0xff00ff00u};
+  test.sampled_image_format = rg ? vk::Format::eR8G8Unorm : vk::Format::eR8Unorm;
+  test.sampled_image_dwords_per_pixel = 1;
+  test.user_data = MakeSampledTextureData(rg ? Prospero::BufferFormat::k8_8UScaled
+                                            : Prospero::BufferFormat::k8UScaled);
+  test.user_data[1] |= 1u << 30u;
+  test.user_data[2] = 1u << 14u;
+  test.user_data[50] = 12u * sizeof(u32);
+  test.user_data[51] = 3u << 28u;
+  test.user_data[10] =
+      (static_cast<u32>(Prospero::SamplerFilter::kBilinear) << 20u) |
+      (static_cast<u32>(Prospero::SamplerFilter::kBilinear) << 22u);
+  test.has_user_data = true;
+  test.use_runtime_samplers = true;
+  test.image_descriptor_swizzle = DstSel(rg ? 5 : 4, 4, 0, 1);
+  // The numerical oracle checks component mapping independently of which layer
+  // performs it; do not require the shader-specific conversion implementation.
+  test.check_shader_swizzle = false;
+  for (float value : {rg ? 191.25f : 63.75f, 63.75f, 0.0f, 1.0f,
+                      0.0f, rg ? 0.0f : 255.0f, 255.0f, rg ? 255.0f : 0.0f,
+                      1.0f, 1.0f, 1.0f, 1.0f}) {
+    test.expected.push_back(std::bit_cast<u32>(value));
+  }
+  // Host UNorm filtering has limited precision. All other results stay bit exact;
+  // finite, positive float bit patterns are ordered, so NaN/Inf fail these bounds.
+  for (size_t component = 0; component < 2; ++component) {
+    const auto value = std::bit_cast<float>(test.expected[component]);
+    test.readback_intervals.push_back({component, std::nullopt,
+        std::bit_cast<u32>(value - 0.01f), std::bit_cast<u32>(value + 0.01f)});
+  }
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::IMAGE_GATHER4_LZ,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
 TestCase ImageSampleR8UintForcesPointSampler() {
   using O = ShaderOpcode;
 
@@ -40978,6 +41039,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageLoadR32SintUsesSignedSampledImage);
   AddCase(ImageLoadPackedUintUnpacksAndSwizzles);
   AddCase(ImageSamplePackedUintConvertsSampleAndGather);
+  AddCase(ImageSampleUScaled8<false>);
+  AddCase(ImageSampleUScaled8<true>);
   AddCase(ImageSampleR8UintForcesPointSampler);
   AddCase(ImageLoadR128IgnoresAdjacentMaskSgprs);
   AddCase(ImageSampleR128DynamicMaterialPairs);
@@ -47167,6 +47230,12 @@ if (argc == 1) {
     RunCase(&vulkan, VectorCosF16CapturedSdwaAndEdges());
     RunCase(&vulkan, VectorSinF16SdwaAndEdges());
     RunCase(&vulkan, VectorFloatConversionOps());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--scaled-texture-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, ImageSampleUScaled8<false>());
+    RunCase(&vulkan, ImageSampleUScaled8<true>());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--packed-texture-only") == 0) {

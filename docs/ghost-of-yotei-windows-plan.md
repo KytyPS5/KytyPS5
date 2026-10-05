@@ -1,5 +1,85 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **5 октября 2026 года, 04:25 UTC** (native scaled-texture regression
+proved; installed game still source2b8e95b0/EXE7d31c527):
+
+- Selective upstream96c067d0/07c84876 adaptation now native RED/GREEN proved:
+  R8 interior bilinear sample old~0.25 vs expected63.75±0.01; unchanged R8/RG8
+  numeric filtering/component/constant-gather tests pass. Preserve local indirect
+  resource and sampler variants; float-converted textures no forced point sampler.
+- Initial zero-output RED INVALID due fixture sampler-register mismatch; corrected
+  all3 instructions to ssamp2 before valid RED. Debt records discarded evidence.
+  Integer neighbor revealed harness skipped production NativeSampler point-filter
+  specialization; aligned harness without changing expected outputs. Final native
+  GPUAV integer/packed neighbors and affected CTest4/4 PASS, testEXEfed6305dfe1f.
+- Original run033835 ENDED04:03:15UTC/C0000094 after Quality; captures prove
+  Medium/Standard/Quality, no main/title menu or game entry. Shown396/compute663,
+  scene remains dark; no game color-correctness claim. Expanded source capture has
+  NULL header pointer plus configuration field/input/stack; audio root unproved.
+- Next commit completed texture correction separately, build/install native target
+  and record hash, bounded game color comparison; continue audio source/contract
+  diagnosis. No active game/test/build now. Issue108 unchanged, no push; preserve
+  cache/save/game data. Full suite not green; no other game installed.
+
+Checkpoint **5 октября 2026 года, 04:04 UTC** (native run033835 ENDED;
+installed source2b8e95b0, EXE7d31c527 exact):
+
+- Native game runs03:38:35–04:03:15UTC, exit-1073741676/C0000094 before deadline.
+  Actual Medium, Standard256 and Quality359 verified by native window captures;
+  Cross5s04:00:25 confirms Standard, Cross5s04:02:47 confirms Quality before fault.
+  Main/title menu and game entry PENDING; issue108 unchanged, no push.
+- Shown396/compute pipelines663. Initial very dark fade brightens to nearwhite
+  text/fire; scene still dark, no game color-correctness claim from synthetic tests.
+  Game Vulkan validation off, diagnostic480x270, cache/save preserved.
+- Expanded read-only recorder captures first/second chance integer fault04:03:03,
+  object/source descriptor/input/stack in `integer-source-fault/`. Header pointer
+  is null (no header capture possible); configuration is an independent descriptor
+  field. Same codec/divisor0; required responsible source/ABI reproduction pending.
+  Exceptions forwarded, no guest code/register mutation. Both runners complete,
+  streams drained/disposed; current CIM shows no emulator/tests/native build left.
+- New scaled-texture test-only fixture/CMake/debt edits ready; native RED build
+  started after cleanup. Freeze source/tests/CMake until build completes. No
+  production port before an intended failure. Next RED, generic upstream adaptation
+  including converted gather constant types, unchanged GREEN plus GPUAV neighbors;
+  diagnose source audio descriptor and retry once shared root is proved.
+
+Checkpoint **5 октября 2026 года, 03:58 UTC** (ACTIVE native game PID7628; exact
+installed source2b8e95b0/hash7d31c527 unchanged):
+
+- Actual Medium UI visible at shown206–230; white text/fire become brighter as
+  fade progresses. Captures `window-{setup,bounded-input,brightness}-observation.png`
+  are in run033835. Still a dark scene; no proof that the full color problem is fixed.
+- Native Cross5s missed. Bounded45s Cross after visible Medium221 ended03:57:27;
+  at230 Cross prompt disappeared/text starts fading, next screen still pending.
+  Input finally releases key/restores foreground; interactions.json records proof.
+- Prospective scaled-texture synthetic regression added to tests/CMake/debt only,
+  not built/run during active GPU game. No production port before intended RED.
+  Installed EXE source stays2b8e95b0; run source-state-addendum.json distinguishes
+  tracked test edits from installed behavior. Upstream96c067d0 needs07c84876
+  converted-gather constant-type neighbor, preserve local indirect-resource logic.
+- Expanded read-only source fault recorder active, no integer capture yet.
+  Main menu/game entry PENDING; issue108 unchanged, no push. Runtime deadline
+ 04:08:35UTC; verify game/recorder ended and cleanup before native test build.
+
+Checkpoint **5 октября 2026 года, 03:40 UTC** (ACTIVE native Windows run;
+source `2b8e95b09f446640c2564d2b125b66c8dd0085f9`, installed EXE SHA
+`7d31c52748893a154d864a967b16c0b674926c05306f363b834e99387843a3bf`):
+
+- Native emulator build/install PASS (`logical-alpha-emulator-{build,install}-20261005.log`),
+  build and installed hashes match. Previousf708/c73 executable preserved ignored.
+  Production changes are regression-proved alpha mapping/MINMAX correction; audio
+  production is unchanged. Test coverage committed separately, no push.
+- New bounded1800s run `yotei-integrated-20261005-033835-logical-alpha-color-and-audio-source-capture-noval`
+  started03:38:35UTC/PID7628, deadline04:08:35UTC; progress480s/memory28GiB,
+  optimizationNone, game Vulkan/shader validation off, cache/save preserved.
+- Expanded external read-only task-PID/hash-guarded integer recorder attached
+  03:39:31UTC for1750s. Captures object/source descriptor/header/input and bounded
+  stack at integer exception, forwards exceptions; no code/register mutation.
+  Verify process/run.json before any native build/GPU tests. No simultaneous build.
+- Actual colors comparison/menu/game entry PENDING. Earlier20-case synthetic
+  GPUAV CTest3/3 and AJM/NGS2 baseline2/2 do not prove rendered-game correctness.
+  Issue108 unchanged under milestone rule; linkPR497 only on confirmed menu/entry.
+
 Checkpoint **5 октября 2026 года, 03:33 UTC** (native Windows tests;
 color fix committed `2e3637ea`, installed game still `f708edc1`/c73cc32e):
 

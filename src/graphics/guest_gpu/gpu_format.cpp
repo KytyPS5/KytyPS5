@@ -20,6 +20,7 @@ struct FormatInfo {
 
 constexpr FormatInfo kFormatInfo[] = {
 	{BufferFormat::k8UNorm, 1, 0, 1, true, false},
+	{BufferFormat::k8UScaled, 1, 0, 0, true, false},
 	{BufferFormat::k8SNorm, 0, 0, 1, false, false},
 	{BufferFormat::k8UInt, 1, 0, 1, true, true},
 	{BufferFormat::k16UNorm, 2, 0, 2, true, false},
@@ -28,6 +29,7 @@ constexpr FormatInfo kFormatInfo[] = {
 	{BufferFormat::k16SInt, 2, 0, 2, true, false, true},
 	{BufferFormat::k16Float, 2, 0, 2, true, false},
 	{BufferFormat::k8_8UNorm, 2, 0, 2, true, false},
+	{BufferFormat::k8_8UScaled, 2, 0, 0, true, false},
 	{BufferFormat::k8_8SNorm, 2, 0, 2, true, false},
 	{BufferFormat::k8_8UInt, 2, 0, 2, true, true},
 	{BufferFormat::k8_8SInt, 2, 0, 2, true, false, true},
@@ -235,7 +237,12 @@ TextureNumericClass SampledTextureNumericClass(BufferFormat format) {
 }
 
 BufferFormat RemapTextureFormat(BufferFormat format) {
-	return format == BufferFormat::k11_11_10UInt ? BufferFormat::k32UInt : format;
+	switch (format) {
+		case BufferFormat::k8UScaled: return BufferFormat::k8UNorm;
+		case BufferFormat::k8_8UScaled: return BufferFormat::k8_8UNorm;
+		case BufferFormat::k11_11_10UInt: return BufferFormat::k32UInt;
+		default: return format;
+	}
 }
 
 } // namespace Libs::Graphics::Prospero

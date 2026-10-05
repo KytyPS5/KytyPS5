@@ -684,6 +684,9 @@ if(BUILD_TESTING)
 	add_test(NAME graphics_logical_alpha_blending
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --logical-alpha-only)
 	set_tests_properties(graphics_logical_alpha_blending PROPERTIES TIMEOUT 90)
+	add_test(NAME shader_scaled_texture_filtering
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --scaled-texture-only)
+	set_tests_properties(shader_scaled_texture_filtering PROPERTIES TIMEOUT 90)
 	add_test(NAME ajm_at9_configuration
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --ajm-at9-config-only)
 	set_tests_properties(ajm_at9_configuration PROPERTIES TIMEOUT 30)

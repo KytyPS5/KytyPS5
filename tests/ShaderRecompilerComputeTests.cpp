@@ -43953,6 +43953,32 @@ GraphicsCase GraphicsAncillarySampleId() {
   return test;
 }
 
+// SH2's two-sided posters flip their normal with v_cmp_eq_u32 0, v_front_face.
+GraphicsCase GraphicsFrontFaceBits(bool reversed) {
+  GraphicsCase test;
+  test.name = reversed ? "GraphicsFrontFaceBitsReversed" : "GraphicsFrontFaceBits";
+  test.pixel_front_face = true;
+  test.fragment_code.push_back(EncodeVop1(0x01, 0, Vgpr(2)));
+  AppendVMovLiteral(&test.fragment_code, 1, 0);
+  AppendVMovLiteral(&test.fragment_code, 2, 0);
+  AppendVMovLiteral(&test.fragment_code, 3, 0x3f800000u);
+  test.fragment_code.push_back(EncodeExp0(0x00, 0xf));
+  test.fragment_code.push_back(EncodeExp1(0, 1, 2, 3));
+  AppendEnd(&test.fragment_code);
+  test.opcodes = {ShaderOpcode::V_MOV_B32, ShaderOpcode::EXP, ShaderOpcode::S_ENDPGM};
+  test.vertices = {
+      0xbf800000u, 0xbf800000u, 0x3e800000u, 0x3f000000u, 0x3f400000u, 0x3f800000u,
+      0x40400000u, 0xbf800000u, 0x3e800000u, 0x3f000000u, 0x3f400000u, 0x3f800000u,
+      0xbf800000u, 0x40400000u, 0x3e800000u, 0x3f000000u, 0x3f400000u, 0x3f800000u};
+  if (reversed) {
+    std::swap_ranges(test.vertices.begin() + 6, test.vertices.begin() + 12,
+                     test.vertices.begin() + 12);
+  }
+  // The default triangle is back-facing on the host: a back face reads 0, a front face 1.0.
+  test.expected_pixel = {reversed ? 0x3f800000u : 0u, 0, 0, 0x3f800000u};
+  return test;
+}
+
 GraphicsCase GraphicsFlatInterpolatorExport() {
   using O = ShaderOpcode;
 
@@ -44835,6 +44861,8 @@ std::vector<GraphicsCase> MakeGraphicsCases() {
       GraphicsAncillaryLayer(false),
       GraphicsAncillaryLayer(true),
       GraphicsAncillarySampleId(),
+      GraphicsFrontFaceBits(false),
+      GraphicsFrontFaceBits(true),
       GraphicsFlatInterpolatorExport(),
       GraphicsDsAddtidScratchExport(),
       GraphicsDirectSgprPushConstantExport(),

@@ -176,6 +176,25 @@ void RenderContext::PrepareGpuWrite(const void* destination, uint64_t size) noex
 	}
 }
 
+bool RenderContext::WriteAroundGpuWrites(void* destination, const void* data, uint64_t size) {
+	const auto vaddr = reinterpret_cast<uint64_t>(destination);
+	if (size == 0 || !GuestRange {vaddr, size}.Valid()) {
+		return false;
+	}
+	if (m_texture_cache.IsRegionGpuModified(vaddr, size)) {
+		// A write over memory a GPU-written image holds: the faulting path reads the GPU's
+		// buffer writes of the page back (draining the GPU) and leaves the image CPU-dirty. The
+		// write-around keeps the page GPU-owned instead, which needs no readback, and the image
+		// becomes CPU-dirty all the same.
+		if (!m_buffer_cache.WriteAroundGpuWrites(vaddr, data, size)) {
+			return false;
+		}
+		m_texture_cache.InvalidateMemory(vaddr, size);
+		return true;
+	}
+	return m_buffer_cache.WriteAroundGpuWrites(vaddr, data, size);
+}
+
 bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	// Host I/O into the range, even one running past its mapping, would fail on its inaccessible
 	// pages, and a later write-back would overwrite it.
@@ -279,12 +298,15 @@ void RenderContext::CacheDmaBases(const ShaderStageRuntime& runtime) {
 	}
 }
 
-void RenderContext::PrepareBda() {
+void RenderContext::PrepareBda(bool may_write) {
 	[[maybe_unused]] static const bool logged = [] {
 		Log::WriteToConsoleAndLog("GPU: using buffer device address (BDA) shader memory access.\n");
 		return true;
 	}();
 	m_buffer_cache.PrepareFaultBuffer();
+	if (may_write) {
+		m_buffer_cache.NoteDeviceAddressUse();
+	}
 	std::shared_lock lock(m_mapped_ranges_mutex);
 	// Nothing to upload when no page became CPU dirty, no buffer was registered and no range was
 	// mapped since the last synchronization started.

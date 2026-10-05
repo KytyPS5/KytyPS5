@@ -294,6 +294,21 @@ add_custom_command(
 	VERBATIM
 )
 list(APPEND kyty_emulator_src "${fault_buffer_shader_header}")
+
+set(indirect_thread_shader_source "${gpu_tiler_shader_dir}/indirect_thread_dispatch.comp")
+set(indirect_thread_shader_spv "${gpu_tiler_generated_dir}/indirect_thread_dispatch.spv")
+set(indirect_thread_shader_header "${gpu_tiler_generated_dir}/indirect_thread_dispatch_spv.h")
+add_custom_command(
+	OUTPUT "${indirect_thread_shader_header}"
+	COMMAND ${CMAKE_COMMAND} -E make_directory "${gpu_tiler_generated_dir}"
+	COMMAND "${KYTY_GLSLANG_VALIDATOR}" -V --target-env vulkan1.3 -Os
+	        -o "${indirect_thread_shader_spv}" "${indirect_thread_shader_source}"
+	COMMAND ${CMAKE_COMMAND} -DINPUT=${indirect_thread_shader_spv} -DOUTPUT=${indirect_thread_shader_header}
+	        -DSYMBOL=INDIRECT_THREAD_DISPATCH_SPV -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
+	DEPENDS "${indirect_thread_shader_source}"
+	VERBATIM
+)
+list(APPEND kyty_emulator_src "${indirect_thread_shader_header}")
 # Occlusion counters written on the GPU timeline (see OcclusionQueries::WriteForReaders()).
 set(occlusion_counters_shader_source "${gpu_tiler_shader_dir}/occlusion_counters.comp")
 set(occlusion_counters_shader_spv "${gpu_tiler_generated_dir}/occlusion_counters.spv")

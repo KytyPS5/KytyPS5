@@ -64,12 +64,23 @@ public:
 	[[nodiscard]] bool             IsFree(uint64_t tick);
 	[[nodiscard]] MasterSemaphore& GetMasterSemaphore() noexcept { return m_master; }
 	[[nodiscard]] DynamicState&    GetDynamicState() noexcept { return m_dynamic_state; }
+	// The last tick whose command buffer reached vkQueueSubmit: with deferred recording, a tick
+	// the execution thread already submitted may still wait for the recording thread.
+	[[nodiscard]] uint64_t SubmittedTick() const noexcept {
+		return m_submitted_tick.load(std::memory_order_acquire);
+	}
 	[[nodiscard]] RenderContext&   Context() const noexcept { return m_context; }
 	[[nodiscard]] GraphicContext&  Graphics() const noexcept { return m_graphics; }
 	// Copies of guest data into the stream buffer that the execution thread hands off, with
 	// deferred recording (null otherwise). Submissions wait for the copies recorded before them;
 	// the owner of the scheduler drains them before any guest-visible effect.
 	[[nodiscard]] HostCopyQueue* HostCopies() noexcept { return m_host_copies.get(); }
+	// Called before each submission, while its command buffer still takes commands.
+	using SubmitHook = void (*)(void* userdata, CommandBuffer& command);
+	void SetSubmitHook(SubmitHook hook, void* userdata) noexcept {
+		m_submit_hook      = hook;
+		m_submit_hook_data = userdata;
+	}
 
 private:
 	void QueueOperation(Common::UniqueFunction<void>&& operation);
@@ -140,6 +151,7 @@ private:
 	// The tick of the oldest pending operation (UINT64_MAX without any), written under
 	// m_operation_mutex: draws check it without the lock.
 	std::atomic<uint64_t>        m_pending_front_tick {UINT64_MAX};
+	std::atomic<uint64_t>        m_submitted_tick {0};
 	// Calls since draws last queried the GPU timeline for pending operations.
 	std::atomic<uint32_t>        m_pending_skips {0};
 	std::queue<PendingOperation> m_priority_operations;
@@ -158,6 +170,8 @@ private:
 	std::vector<GuestWrite>      m_guest_writes;
 	uint64_t                     m_next_guest_write     = 0;
 	std::unique_ptr<HostCopyQueue> m_host_copies;
+	SubmitHook                     m_submit_hook      = nullptr;
+	void*                          m_submit_hook_data = nullptr;
 	// Replays m_stream when recording is deferred; declared last so it stops first.
 	std::jthread m_recording_thread;
 };

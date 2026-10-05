@@ -5,6 +5,7 @@
 #include "common/debugCounters.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/spscQueue.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
@@ -178,6 +179,11 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferDownloadBytes, total_size);
 
+	if constexpr (!async) {
+		if (DownloadOnReadbackQueue(buffer, copies, total_size)) {
+			return true;
+		}
+	}
 	auto download = m_download_buffer.MapDownload(total_size, 64);
 	for (auto& copy: copies) {
 		copy.dstOffset += download.offset;
@@ -261,6 +267,11 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	    m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 16);
 	EXIT_IF(null_id != NULL_BUFFER_ID);
 	SetVulkanObjectNameF(m_graphics.device, GetBuffer(null_id).Handle(), "Kyty.NullBuffer");
+	m_scheduler.SetSubmitHook(
+	    [](void* self, CommandBuffer& command) {
+		    static_cast<BufferCache*>(self)->RecordMirrorCopies(command);
+	    },
+	    this);
 	if (!m_graphics.CanReportMemoryUsage()) {
 		return;
 	}
@@ -276,6 +287,11 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 }
 
 BufferCache::~BufferCache() {
+	m_scheduler.SetSubmitHook(nullptr, nullptr);
+	if (m_readback.pool) {
+		m_graphics.device.destroyFence(m_readback.fence);
+		m_graphics.device.destroyCommandPool(m_readback.pool);
+	}
 	if (!m_gpu_modified_ranges.Empty()) {
 		EXIT("BufferCache: destroyed with pending GPU-modified ranges\n");
 	}
@@ -427,6 +443,7 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 	}
 	new_buffer.CopyFrom(m_scheduler.Current(), overlap, 0,
 	                    overlap.CpuAddress() - new_buffer.CpuAddress(), overlap.Size());
+	NoteWrite(overlap.CpuAddress(), overlap.Size());
 	DeleteBuffer(overlap_id);
 }
 
@@ -614,6 +631,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		m_gpu_write_generation++;
 		m_gpu_modified_ranges.Add(vaddr, size);
 		ForgetColorMetadataChecks(vaddr, size);
+		NoteWrite(vaddr, size);
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }
@@ -712,6 +730,435 @@ void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t si
 	dst->CopyFrom(command, *src, src_offset, dst_offset, size);
 }
 
+void BufferCache::WriteTicks::Assign(uint64_t begin, uint64_t end, uint64_t tick) {
+	if (begin >= end) {
+		return;
+	}
+	auto it = m_ranges.lower_bound(begin);
+	// Most writes repeat a range of an earlier operation.
+	if (it != m_ranges.end() && it->first == begin && it->second.end == end) {
+		it->second.tick = tick;
+		return;
+	}
+	if (it != m_ranges.begin()) {
+		const auto previous = std::prev(it);
+		if (previous->second.end > begin) {
+			const auto right       = previous->second;
+			previous->second.end = begin;
+			it                     = m_ranges.emplace_hint(it, begin, right);
+		}
+	}
+	while (it != m_ranges.end() && it->first < end) {
+		if (it->second.end > end) {
+			const auto tail = it->second;
+			m_ranges.erase(it);
+			m_ranges.emplace(end, tail);
+			break;
+		}
+		it = m_ranges.erase(it);
+	}
+	m_ranges.emplace(begin, Range {end, tick});
+}
+
+uint64_t BufferCache::WriteTicks::Latest(uint64_t begin, uint64_t end) const {
+	auto it = m_ranges.upper_bound(begin);
+	if (it != m_ranges.begin()) {
+		--it;
+	}
+	uint64_t latest = 0;
+	uint64_t cursor = begin;
+	for (; it != m_ranges.end() && it->first < end && cursor < end; ++it) {
+		if (it->second.end <= cursor) {
+			continue;
+		}
+		if (it->first > cursor) {
+			return UINT64_MAX;
+		}
+		latest = std::max(latest, it->second.tick);
+		cursor = it->second.end;
+	}
+	return cursor >= end ? latest : UINT64_MAX;
+}
+
+void BufferCache::NoteReadbackWait(uint64_t begin, uint64_t end, bool device_address,
+                                   bool drained) {
+	const auto count = ++m_readback_count;
+	if (device_address && (drained || m_device_address_hot != 0)) {
+		m_device_address_hot = count;
+	}
+	std::erase_if(m_readback_hot, [count](const HotReadback& hot) {
+		return count - hot.last_hit >= HotReadbackLifetime;
+	});
+	begin = Common::AlignDown(begin, TRACKER_PAGE_SIZE);
+	end   = Common::AlignUp(end, TRACKER_PAGE_SIZE);
+	for (auto& hot: m_readback_hot) {
+		if (begin < hot.end && hot.begin < end) {
+			hot.begin    = std::min(hot.begin, begin);
+			hot.end      = std::max(hot.end, end);
+			hot.last_hit = count;
+			return;
+		}
+	}
+	if (drained && !device_address) {
+		if (m_readback_hot.size() == MaxHotReadbacks) {
+			m_readback_hot.erase(std::ranges::min_element(m_readback_hot, {}, &HotReadback::last_hit));
+		}
+		m_readback_hot.push_back({begin, end, count});
+	}
+}
+
+bool BufferCache::TakeFlushRequest() {
+	if (!m_flush_requested) {
+		return false;
+	}
+	// The work the request is about went out with a submission made meanwhile.
+	if (m_flush_deferred_tick != 0 && m_scheduler.CurrentTick() != m_flush_deferred_tick) {
+		m_flush_requested     = false;
+		m_flush_deferred_tick = 0;
+		return false;
+	}
+	// A submission costs the recording thread a queue submit. While readbacks keep coming, every
+	// operation that may write what they read asks for one (Demon's Souls: ~2,000 a frame, the
+	// device-address writers of a game whose SRT walks read GPU-written dwords through the
+	// mirror). Submit at most once per interval: a readback then waits at most for the work
+	// recorded since; the request stays for a later operation.
+	const auto now = std::chrono::steady_clock::now();
+	if (now - m_last_requested_flush < MinRequestedFlushInterval) {
+		m_flush_deferred_tick = m_scheduler.CurrentTick();
+		return false;
+	}
+	m_last_requested_flush = now;
+	m_flush_requested      = false;
+	m_flush_deferred_tick  = 0;
+	return true;
+}
+
+bool BufferCache::CommitWriteTicks() {
+	if (m_pending_writes.empty() && !m_device_address_pending) {
+		return TakeFlushRequest();
+	}
+	// The operation's commands are all recorded: they run in the current command buffer or in
+	// one submitted while it was recorded.
+	const auto tick = m_scheduler.CurrentTick();
+	for (const auto& [vaddr, size]: m_pending_writes) {
+		m_write_ticks.Assign(vaddr, vaddr + size, tick);
+	}
+	// Device-address stores name no range: a mirror copy older than them is not used (see
+	// TryReadMirroredGpuWrites()).
+	if (!m_mirror_lines.empty()) {
+		for (const auto& [vaddr, size]: m_pending_writes) {
+			MarkMirrorLinesWritten(vaddr, size, tick);
+		}
+	}
+	m_pending_writes.clear();
+	if (m_device_address_pending) {
+		m_device_address_pending = false;
+		m_device_address_tick    = tick;
+	}
+	return TakeFlushRequest();
+}
+
+void BufferCache::MarkMirrorLinesWritten(uint64_t vaddr, uint64_t size, uint64_t tick) {
+	const auto end = size > UINT64_MAX - vaddr ? UINT64_MAX : vaddr + size;
+	for (auto it = m_mirror_lines.lower_bound(Common::AlignDown(vaddr, MirrorLineSize));
+	     it != m_mirror_lines.end() && it->first < end; ++it) {
+		auto& line = it->second;
+		line.tick  = 0;
+		// A line read recently is read again soon: let the GPU start on its writer now.
+		if (m_mirror_uses - line.last_use < MirrorFlushLifetime) {
+			m_flush_requested = true;
+		}
+		if (line.dirty_tick != tick) {
+			line.dirty_tick = tick;
+			m_mirror_dirty.push_back(it->first);
+		}
+	}
+}
+
+void BufferCache::AddMirrorLine(uint64_t line) {
+	if (m_mirror_free_slots.empty()) {
+		if (m_mirror_lines.size() < MaxMirrorLines) {
+			m_mirror_free_slots.push_back(static_cast<uint32_t>(m_mirror_lines.size()));
+		} else {
+			// Forget the half used least recently; their queued copies are skipped.
+			std::vector<uint64_t> uses;
+			uses.reserve(m_mirror_lines.size());
+			for (const auto& [address, entry]: m_mirror_lines) {
+				uses.push_back(entry.last_use);
+			}
+			std::nth_element(uses.begin(), uses.begin() + uses.size() / 2, uses.end());
+			const auto oldest = uses[uses.size() / 2];
+			for (auto it = m_mirror_lines.begin(); it != m_mirror_lines.end();) {
+				if (it->second.last_use <= oldest) {
+					m_mirror_free_slots.push_back(it->second.slot);
+					it = m_mirror_lines.erase(it);
+				} else {
+					++it;
+				}
+			}
+		}
+	}
+	MirrorLine entry;
+	entry.slot = m_mirror_free_slots.back();
+	m_mirror_free_slots.pop_back();
+	entry.last_use = ++m_mirror_uses;
+	// Nothing recorded the line's bytes yet: copy them at the end of this command buffer.
+	entry.dirty_tick = m_scheduler.CurrentTick();
+	m_mirror_lines.emplace(line, entry);
+	m_mirror_dirty.push_back(line);
+}
+
+bool BufferCache::TryReadMirroredGpuWrites(uint64_t vaddr, void* data, uint64_t size) {
+	if (size == 0 || size > MirrorMaxRead || m_device_address_pending ||
+	    !GuestGpu::IsGpuThread()) {
+		return false;
+	}
+	// Writes of the operation being recorded have no tick yet.
+	for (const auto& [address, bytes]: m_pending_writes) {
+		if (address < vaddr + size && vaddr < address + bytes) {
+			return false;
+		}
+	}
+	// As DownloadOnReadbackQueue(): the submissions that last wrote the bytes, and those that
+	// wrote through device addresses (which name no range).
+	uint64_t needed  = m_device_address_tick;
+	bool     unknown = false;
+	m_gpu_modified_ranges.ForEachInRange(vaddr, size, [&](uint64_t start, uint64_t end) {
+		const auto latest = m_write_ticks.Latest(start, end);
+		unknown |= latest == UINT64_MAX;
+		needed = std::max(needed, latest);
+	});
+	if (unknown) {
+		return false;
+	}
+	const auto first = Common::AlignDown(vaddr, MirrorLineSize);
+	const auto last  = Common::AlignUp(vaddr + size, MirrorLineSize);
+	uint64_t   wait  = 0;
+	bool       held  = true;
+	for (auto line = first; line < last; line += MirrorLineSize) {
+		const auto it = m_mirror_lines.find(line);
+		if (it == m_mirror_lines.end()) {
+			AddMirrorLine(line);
+			held = false;
+			continue;
+		}
+		auto& entry    = it->second;
+		entry.last_use = ++m_mirror_uses;
+		if (entry.tick == 0 || entry.tick < needed) {
+			// Copy it at the end of this command buffer, for the next read.
+			held = false;
+			if (entry.dirty_tick != m_scheduler.CurrentTick()) {
+				entry.dirty_tick = m_scheduler.CurrentTick();
+				m_mirror_dirty.push_back(line);
+			}
+		}
+		wait = std::max(wait, entry.tick);
+	}
+	if (!held || wait >= m_scheduler.CurrentTick()) {
+		return false;
+	}
+	m_scheduler.GetMasterSemaphore().Wait(wait);
+	m_mirror_flush_use = m_mirror_uses;
+	// As a readback: earlier asynchronous publications of these bytes run first, and the bytes
+	// become clean, so later reads take them from the backing store until the GPU writes them
+	// again.
+	m_scheduler.WaitPriorityOperations(needed);
+	if (!Libs::LibKernel::Memory::TryReadBacking(vaddr, data, size)) {
+		return false;
+	}
+	const auto* mapped = m_mirror->Mapped().data();
+	m_gpu_modified_ranges.ForEachInRange(vaddr, size, [&](uint64_t start, uint64_t end) {
+		while (start < end) {
+			const auto line   = Common::AlignDown(start, MirrorLineSize);
+			const auto chunk  = std::min(end, line + MirrorLineSize) - start;
+			const auto slot   = m_mirror_lines.find(line)->second.slot;
+			const auto offset = uint64_t {slot} * MirrorLineSize + (start - line);
+			m_mirror->Invalidate(offset, chunk);
+			std::memcpy(static_cast<uint8_t*>(data) + (start - vaddr), mapped + offset, chunk);
+			Libs::LibKernel::Memory::WriteBacking(start, mapped + offset, chunk);
+			start += chunk;
+		}
+	});
+	m_gpu_modified_ranges.Subtract(vaddr, size);
+	return true;
+}
+
+void BufferCache::RecordMirrorCopies(CommandBuffer& command) {
+	if (m_mirror_dirty.empty() || !GuestGpu::IsGpuThread()) {
+		return;
+	}
+	if (!m_mirror) {
+		m_mirror = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+		                                    vk::BufferUsageFlagBits::eTransferDst,
+		                                    uint64_t {MaxMirrorLines} * MirrorLineSize);
+	}
+	std::sort(m_mirror_dirty.begin(), m_mirror_dirty.end());
+	m_mirror_dirty.erase(std::unique(m_mirror_dirty.begin(), m_mirror_dirty.end()),
+	                     m_mirror_dirty.end());
+	const auto tick = m_scheduler.CurrentTick();
+	command.EndRendering();
+	const auto native = command.Handle();
+	// Every earlier write of the command buffer, and the earlier copies into the mirror slots.
+	vk::MemoryBarrier before {};
+	before.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+	before.dstAccessMask = vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                       vk::PipelineStageFlagBits::eTransfer, {}, 1, &before, 0, nullptr, 0,
+	                       nullptr);
+	std::vector<vk::BufferCopy> copies;
+	const Buffer*               source = nullptr;
+	const auto                  flush  = [&] {
+		if (!copies.empty()) {
+			native.copyBuffer(source->Handle(), m_mirror->Handle(),
+			                  static_cast<uint32_t>(copies.size()), copies.data());
+			copies.clear();
+		}
+	};
+	for (const auto line: m_mirror_dirty) {
+		const auto it = m_mirror_lines.find(line);
+		if (it == m_mirror_lines.end()) {
+			continue;
+		}
+		// Lines outside one cached buffer stay unmirrored (their reads take the readback path).
+		const auto* owner = m_page_table.Find(line >> PageTable::kPageBits);
+		if (owner == nullptr || !*owner) {
+			continue;
+		}
+		const auto& buffer = m_slot_buffers[*owner];
+		if (buffer.is_deleted || !buffer.IsInBounds(line, MirrorLineSize)) {
+			continue;
+		}
+		if (&buffer != source) {
+			flush();
+			source = &buffer;
+		}
+		copies.push_back({buffer.Offset(line), uint64_t {it->second.slot} * MirrorLineSize,
+		                  MirrorLineSize});
+		it->second.tick = tick;
+	}
+	flush();
+	m_mirror_dirty.clear();
+	vk::MemoryBarrier after {};
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eHostRead;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
+	                       {}, 1, &after, 0, nullptr, 0, nullptr);
+}
+
+bool BufferCache::DownloadOnReadbackQueue(Buffer& buffer, std::span<const vk::BufferCopy> copies,
+                                          uint64_t total_size) {
+	if (!m_graphics.readback_queue || m_device_address_pending) {
+		return false;
+	}
+	const auto buffer_address = buffer.CpuAddress();
+	// Writes of the operation being recorded, or through device addresses (which name no range)
+	// since the needed submissions, may still change the bytes.
+	uint64_t needed = m_device_address_tick;
+	const auto readback_begin = buffer_address + copies.front().srcOffset;
+	const auto readback_end   = buffer_address + copies.back().srcOffset + copies.back().size;
+	for (const auto& copy: copies) {
+		const auto begin = buffer_address + copy.srcOffset;
+		const auto end   = begin + copy.size;
+		for (const auto& [vaddr, size]: m_pending_writes) {
+			if (vaddr < end && begin < vaddr + size) {
+				NoteReadbackWait(readback_begin, readback_end, false, true);
+				return false;
+			}
+		}
+		needed = std::max(needed, m_write_ticks.Latest(begin, end));
+	}
+	const bool device_address = needed != 0 && needed == m_device_address_tick;
+	if (needed >= m_scheduler.CurrentTick()) {
+		NoteReadbackWait(readback_begin, readback_end, device_address, true);
+		return false;
+	}
+	NoteReadbackWait(readback_begin, readback_end, device_address, false);
+	// The copy waits for the needed submission on the GPU, but must not be submitted before it:
+	// the driver may then block inside vkQueueSubmit, holding locks a submission of the
+	// recording thread (or a present) needs.
+	while (m_scheduler.SubmittedTick() < needed) {
+		Common::SpinPause();
+	}
+	auto& device = m_graphics.device;
+	if (!m_readback.pool) {
+		vk::CommandPoolCreateInfo pool_info {};
+		pool_info.flags            = vk::CommandPoolCreateFlagBits::eResetCommandBuffer |
+		                             vk::CommandPoolCreateFlagBits::eTransient;
+		pool_info.queueFamilyIndex = m_graphics.readback_family;
+		vk::CommandBufferAllocateInfo allocate {};
+		allocate.level              = vk::CommandBufferLevel::ePrimary;
+		allocate.commandBufferCount = 1;
+		const vk::FenceCreateInfo fence_info {};
+		if (device.createCommandPool(&pool_info, nullptr, &m_readback.pool) != vk::Result::eSuccess ||
+		    (allocate.commandPool = m_readback.pool,
+		     device.allocateCommandBuffers(&allocate, &m_readback.command) != vk::Result::eSuccess) ||
+		    device.createFence(&fence_info, nullptr, &m_readback.fence) != vk::Result::eSuccess) {
+			EXIT("BufferCache: could not create the readback queue resources\n");
+		}
+	}
+	if (!m_readback.staging || m_readback.staging->Size() < total_size) {
+		m_readback.staging = std::make_unique<Buffer>(
+		    m_graphics, m_scheduler, MemoryUsage::Download, 0,
+		    vk::BufferUsageFlagBits::eTransferDst,
+		    std::max<uint64_t>(Common::AlignUp(total_size, 1024 * 1024), 4 * MiB));
+	}
+	auto&                       staging = *m_readback.staging;
+	const auto command = m_readback.command;
+	(void)command.reset({});
+	vk::CommandBufferBeginInfo begin_info {};
+	begin_info.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
+	(void)command.begin(&begin_info);
+	command.copyBuffer(buffer.Handle(), staging.Handle(), static_cast<uint32_t>(copies.size()),
+	                   copies.data());
+	vk::BufferMemoryBarrier after {};
+	after.srcAccessMask       = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask       = vk::AccessFlagBits::eHostRead;
+	after.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	after.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	after.buffer              = staging.Handle();
+	after.offset              = 0;
+	after.size                = total_size;
+	command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost,
+	                        {}, 0, nullptr, 1, &after, 0, nullptr);
+	(void)command.end();
+	// The semaphore wait makes the writes of the needed submissions visible to the copy.
+	const auto                      semaphore = m_scheduler.GetMasterSemaphore().Handle();
+	const vk::PipelineStageFlags    wait_stage = vk::PipelineStageFlagBits::eTransfer;
+	vk::TimelineSemaphoreSubmitInfo timeline {};
+	timeline.waitSemaphoreValueCount = 1;
+	timeline.pWaitSemaphoreValues    = &needed;
+	vk::SubmitInfo submit {};
+	submit.pNext              = &timeline;
+	submit.waitSemaphoreCount = 1;
+	submit.pWaitSemaphores    = &semaphore;
+	submit.pWaitDstStageMask  = &wait_stage;
+	submit.commandBufferCount = 1;
+	submit.pCommandBuffers    = &command;
+	if (m_graphics.readback_queue.submit(1, &submit, m_readback.fence) != vk::Result::eSuccess) {
+		EXIT("BufferCache: readback queue submission failed\n");
+	}
+	for (;;) {
+		const auto status = device.getFenceStatus(m_readback.fence);
+		if (status == vk::Result::eSuccess) {
+			break;
+		}
+		if (status != vk::Result::eNotReady) {
+			EXIT("BufferCache: readback queue wait failed: %s\n", vk::to_string(status).c_str());
+		}
+		Common::SpinPause();
+	}
+	(void)device.resetFences(1, &m_readback.fence);
+	// Earlier asynchronous publications of these bytes run first, as in the queued path.
+	m_scheduler.WaitPriorityOperations(needed);
+	staging.Invalidate(0, total_size);
+	const auto* mapped = staging.Mapped().data();
+	for (const auto& copy: copies) {
+		Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset,
+		                                      mapped + copy.dstOffset, copy.size);
+	}
+	return true;
+}
+
 bool BufferCache::IsRegionRegistered(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid registered-region query\n");
@@ -751,6 +1198,63 @@ void BufferCache::ForgetColorMetadataChecks(uint64_t vaddr, uint64_t size) {
 
 bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
 	return m_memory_tracker.IsRegionGpuModified(vaddr, size);
+}
+
+bool BufferCache::WriteAroundGpuWrites(uint64_t vaddr, const void* data, uint64_t size) {
+	constexpr uint64_t MaxBytes = 4096;
+	if (size == 0 || size > MaxBytes || (vaddr & 3u) != 0 || (size & 3u) != 0 ||
+	    !GuestRange {vaddr, size}.Valid() || !m_memory_tracker.IsRegionGpuModified(vaddr, size)) {
+		return false;
+	}
+	Buffer*    buffer = nullptr;
+	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
+	if (owner != nullptr && *owner && m_slot_buffers[*owner].IsInBounds(vaddr, size)) {
+		buffer = &m_slot_buffers[*owner];
+	} else if (IsRegionRegistered(vaddr, size)) {
+		// Partly cached: the faulting path handles it.
+		return false;
+	}
+	// Bytes the GPU wrote stay GPU-dirty: the copy below orders the new value after the GPU's
+	// writes, and a later read of them reads the buffer back. Without a buffer to copy into,
+	// the GPU's bytes would be lost.
+	if (buffer == nullptr && HasGpuDirtyBytes(vaddr, size)) {
+		return false;
+	}
+	if (!Libs::LibKernel::Memory::TryWriteBacking(vaddr, data, size)) {
+		return false;
+	}
+	if (buffer == nullptr) {
+		return true;
+	}
+	// The cached buffer is what the GPU and later readbacks of the page use: give it the bytes
+	// at this point of the command stream.
+	auto&      stream = GetUtilityBuffer(MemoryUsage::Stream);
+	const auto offset = stream.Copy(data, size, 4);
+	auto&      command = m_scheduler.Current();
+	command.EndRendering();
+	const auto native = command.Handle();
+	vk::BufferMemoryBarrier before {};
+	before.srcAccessMask       = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	before.dstAccessMask       = vk::AccessFlagBits::eTransferWrite;
+	before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	before.buffer              = buffer->Handle();
+	before.offset              = buffer->Offset(vaddr);
+	before.size                = size;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                       vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlagBits::eByRegion,
+	                       0, nullptr, 1, &before, 0, nullptr);
+	const vk::BufferCopy copy {offset, buffer->Offset(vaddr), size};
+	native.copyBuffer(stream.Handle(), buffer->Handle(), 1, &copy);
+	NoteWrite(vaddr, size);
+	auto after          = before;
+	after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                       vk::PipelineStageFlagBits::eAllCommands,
+	                       vk::DependencyFlagBits::eByRegion, 0, nullptr, 1, &after, 0, nullptr);
+	m_gpu_write_generation++;
+	return true;
 }
 
 bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
@@ -843,6 +1347,7 @@ void BufferCache::NoteGpuWrites(uint64_t vaddr, uint64_t size) {
 			continue;
 		}
 		TouchBuffer(buffer);
+		NoteWrite(start, finish - start);
 		m_memory_tracker.MarkRegionAsGpuModifiedUnlessCpuDirty(
 		    start, finish - start, [&](uint64_t page, uint64_t bytes) {
 			    const auto first = std::max(page, start);

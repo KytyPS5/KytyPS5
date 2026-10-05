@@ -671,6 +671,22 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			case CoreAccess::Execute: access = GpuAccess::Execute; break;
 			case CoreAccess::Unknown: return false;
 		}
+		// A walker load of a GPU-owned page reads bytes the GPU did not write from the backing
+		// store instead of reading all the GPU's queued work back.
+		if (access == GpuAccess::Read) {
+			if (const auto length = Libs::Graphics::ShaderRecompiler::IR::SrtWalkerLoadLength(
+			        info->exception_address)) {
+				uint32_t value = 0;
+				if (Libs::LibKernel::Memory::MayFaultOnGpuRead(info->access_violation_vaddr,
+				                                               sizeof(value)) &&
+				    Libs::LibKernel::Memory::TryReadAroundGpuWrites(info->access_violation_vaddr,
+				                                                    &value, sizeof(value))) {
+					Loader::X64InstructionEmulator::CompleteLoad(info->native_context, length,
+					                                             value);
+					return true;
+				}
+			}
+		}
 		// A walk ahead of execution does not resolve faults: the load reads zero and the walk
 		// fails.
 		if (const auto length = Libs::Graphics::ShaderRecompiler::IR::SrtWalkerAheadLoadLength(

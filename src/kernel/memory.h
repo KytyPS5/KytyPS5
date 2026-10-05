@@ -143,6 +143,12 @@ bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t
 // pointer stays readable for the emulator's lifetime and reads what TryReadBacking() reads.
 [[nodiscard]] const void* FindBackingPointer(uint64_t vaddr, uint64_t size);
 bool                   TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size);
+// GPU threads: whether a direct load of the range may fault because the GPU owns its pages.
+bool                   MayFaultOnGpuRead(uint64_t vaddr, uint64_t size);
+// GPU threads: reads [vaddr, vaddr + size) from the backing store when its pages are GPU-owned
+// but the GPU wrote none of its bytes, where a direct load would fault and read back everything
+// the GPU has queued. False when the caller should load the bytes directly.
+bool                   TryReadAroundGpuWrites(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t size);
 // Whether TryReadBacking or TryReadSparseBacking can read the whole range.

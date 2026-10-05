@@ -1,0 +1,35 @@
+#version 450
+
+// Converts DISPATCH_INDIRECT arguments given in threads (DISPATCH_INITIATOR
+// USE_THREAD_DIMENSIONS) into workgroup counts for vkCmdDispatchIndirect, and publishes
+// the thread counts as the shader's dispatch thread limit.
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer args_buf {
+    uint args[];
+};
+
+layout(std430, binding = 1) writeonly buffer groups_buf {
+    uint groups[];
+};
+
+layout(std430, binding = 2) writeonly buffer limit_buf {
+    uint limit[];
+};
+
+layout(push_constant) uniform push_data {
+    uvec3 local_size;
+    uint  args_index;
+    uint  groups_index;
+    uint  limit_index;
+};
+
+void main() {
+    for (uint axis = 0u; axis < 3u; axis++) {
+        const uint threads = args[args_index + axis];
+        const uint size    = max(local_size[axis], 1u);
+        groups[groups_index + axis] = threads / size + ((threads % size) != 0u ? 1u : 0u);
+        limit[limit_index + axis]   = threads;
+    }
+}

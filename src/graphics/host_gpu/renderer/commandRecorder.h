@@ -362,6 +362,49 @@ public:
 			c.drawIndexed(index_count, instance_count, first_index, vertex_offset, first_instance);
 		});
 	}
+	void drawIndirect(vk::Buffer buffer, vk::DeviceSize offset, uint32_t draw_count,
+	                  uint32_t stride) const {
+		if (m_stream == nullptr) {
+			m_direct.drawIndirect(buffer, offset, draw_count, stride);
+			return;
+		}
+		m_stream->Record(
+		    [=](vk::CommandBuffer c) { c.drawIndirect(buffer, offset, draw_count, stride); });
+	}
+	void drawIndexedIndirect(vk::Buffer buffer, vk::DeviceSize offset, uint32_t draw_count,
+	                         uint32_t stride) const {
+		if (m_stream == nullptr) {
+			m_direct.drawIndexedIndirect(buffer, offset, draw_count, stride);
+			return;
+		}
+		m_stream->Record(
+		    [=](vk::CommandBuffer c) { c.drawIndexedIndirect(buffer, offset, draw_count, stride); });
+	}
+	void drawIndirectCount(vk::Buffer buffer, vk::DeviceSize offset, vk::Buffer count_buffer,
+	                       vk::DeviceSize count_offset, uint32_t max_draw_count,
+	                       uint32_t stride) const {
+		if (m_stream == nullptr) {
+			m_direct.drawIndirectCount(buffer, offset, count_buffer, count_offset, max_draw_count,
+			                           stride);
+			return;
+		}
+		m_stream->Record([=](vk::CommandBuffer c) {
+			c.drawIndirectCount(buffer, offset, count_buffer, count_offset, max_draw_count, stride);
+		});
+	}
+	void drawIndexedIndirectCount(vk::Buffer buffer, vk::DeviceSize offset,
+	                              vk::Buffer count_buffer, vk::DeviceSize count_offset,
+	                              uint32_t max_draw_count, uint32_t stride) const {
+		if (m_stream == nullptr) {
+			m_direct.drawIndexedIndirectCount(buffer, offset, count_buffer, count_offset,
+			                                  max_draw_count, stride);
+			return;
+		}
+		m_stream->Record([=](vk::CommandBuffer c) {
+			c.drawIndexedIndirectCount(buffer, offset, count_buffer, count_offset, max_draw_count,
+			                           stride);
+		});
+	}
 	void drawMeshTasksEXT(uint32_t x, uint32_t y, uint32_t z) const {
 		if (m_stream == nullptr) {
 			m_direct.drawMeshTasksEXT(x, y, z);

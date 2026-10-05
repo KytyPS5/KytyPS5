@@ -979,7 +979,20 @@ RenderExecutor::FindTableResolution(const ShaderRecompiler::IR::ImageResource& r
 	return *found;
 }
 
-const TextureBinding&
+// What ResolveTexture checks of the backing for a table candidate (a GPU-modified range needs no
+// backing).
+bool RenderExecutor::TableElementBackingReadable(const TableElementResolution& element) {
+	const auto& data = element.range;
+	const bool  data_readable =
+	    m_context.GetTextureCache().IsRegionGpuModified(data.address, data.size) ||
+	    Libs::LibKernel::Memory::IsBackingReadable(data.address, data.size);
+	return data_readable &&
+	       (element.metadata_range.Empty() ||
+	        Libs::LibKernel::Memory::IsBackingReadable(element.metadata_range.address,
+	                                                   element.metadata_range.size));
+}
+
+RenderExecutor::TableElementResolution&
 RenderExecutor::ResolveTableElement(TableResolution&                             table,
                                     const ShaderRecompiler::IR::DescriptorValue& value,
                                     uint64_t stamp, TableElementResolution* known) {
@@ -1009,7 +1022,11 @@ RenderExecutor::ResolveTableElement(TableResolution&                            
 	if (!inserted && !element.volatile_dcc) {
 		if (element.permanent ||
 		    (element.checked_epoch == set_epoch && element.backing_epoch == backing_epoch)) {
-			return element.texture;
+			return element;
+		}
+		if (element.backing_epoch != backing_epoch && element.backing_checkable &&
+		    TableElementBackingReadable(element) == element.backing_readable) {
+			element.backing_epoch = backing_epoch;
 		}
 		const auto image_epoch =
 		    element.range.Valid()
@@ -1017,7 +1034,7 @@ RenderExecutor::ResolveTableElement(TableResolution&                            
 		        : 0;
 		if (image_epoch <= element.image_epoch && element.backing_epoch == backing_epoch) {
 			element.checked_epoch = set_epoch;
-			return element.texture;
+			return element;
 		}
 	}
 	// Record the epoch before resolving: an image the lookup itself inserts makes the next use
@@ -1039,6 +1056,11 @@ RenderExecutor::ResolveTableElement(TableResolution&                            
 	if (!data.Empty()) {
 		element.range        = data;
 		element.volatile_dcc = element.texture.desc.info.metadata.kind == ImageMetadataKind::Dcc;
+		if (element.texture.desc.info.metadata.kind != ImageMetadataKind::None) {
+			element.metadata_range = element.texture.desc.info.metadata.range;
+		}
+		element.backing_checkable = data.Valid();
+		element.backing_readable  = element.backing_checkable && TableElementBackingReadable(element);
 	} else if (!ShaderRecompiler::IR::ImageTableSlotCompatible(table.root, value)) {
 		element.permanent = true;
 	} else {
@@ -1046,7 +1068,7 @@ RenderExecutor::ResolveTableElement(TableResolution&                            
 		// backing alone (no range examined: only a backing change can alter the outcome).
 		element.range = examined;
 	}
-	return element.texture;
+	return element;
 }
 
 vk::Sampler RenderExecutor::NativeSampler(const ShaderRecompiler::IR::CompiledShaderInfo& program,
@@ -2143,17 +2165,19 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
                                              std::span<RenderColorInfo> colors) {
 	bool uses_dma        = false;
+	bool dma_write       = false;
 	bool uses_image_heap = false;
 	FindBuffers(stages);
 	for (auto* stage: stages) {
 		if (stage->runtime->module->info.info.uses_dma) {
 			m_context.CacheDmaBases(*stage->runtime);
 			uses_dma = true;
+			dma_write |= stage->runtime->module->info.has_address_writes;
 		}
 		uses_image_heap |= stage->runtime->module->info.info.uses_image_heap;
 	}
 	if (uses_dma) {
-		m_context.PrepareBda();
+		m_context.PrepareBda(dma_write);
 	}
 	if (uses_image_heap) {
 		m_context.GetImageHeap().Rebind(*this);
@@ -2502,7 +2526,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			EXIT_IF(table_element + root.table_capacity > descriptors.table_slots.size());
 			for (uint32_t slot = 0; slot < root.table_capacity; slot++) {
 				m_descriptor_images[start + slot] =
-				    MakeImageInfo(descriptors.table_images.at(table_element++), 0u);
+				    m_table_image_infos[descriptors.table_slots[table_element++]];
 			}
 		});
 		if (table_state != nullptr && !descriptors.tables_reused) {

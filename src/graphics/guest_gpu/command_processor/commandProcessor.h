@@ -252,12 +252,13 @@ private:
 	// The instance count of the last executed indirect draw, and the NUM_INSTANCES sequence it
 	// followed.
 	uint32_t m_indirect_instances         = 0;
-	// Nonzero: the draw's records were read by the GPU, so the count is read from them on use.
-	uint64_t m_indirect_instances_addr    = 0;
 	uint64_t m_indirect_instances_sequence = 0;
 	bool     m_has_indirect_instances      = false;
 	// The shader registers of a pipelined indirect draw with its offsets written to user SGPRs.
 	std::unique_ptr<HW::Shader> m_indirect_shaders;
+	// When the GPU read that draw's records: the records, read only if a later draw needs the
+	// count.
+	DrawIndirectArgs m_gpu_indirect_instances {};
 	// Keeps later allocations off the last line of the execution-side state.
 	alignas(64) uint8_t m_end_padding = 0;
 };

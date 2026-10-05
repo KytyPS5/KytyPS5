@@ -382,6 +382,8 @@ void GuestGpu::ExecutionThread() {
 	g_gpu_thread = false;
 }
 
+static bool IndirectDrawOffsets(IndirectDrawRegisters registers, ShaderIndirectOffsets& offsets);
+
 void GuestGpu::ResolveThread() {
 	KYTY_PROFILER_THREAD("Thread_GpuResolve");
 	Config::ConfigureGpuStageThread(Config::GpuStageThread::Resolve);
@@ -400,6 +402,29 @@ void GuestGpu::ResolveThread() {
 			operation->resolved =
 			    executor.ResolveDrawAhead(*operation->state.context, *operation->state.user_config,
 			                              *operation->state.shaders);
+		} else if (operation->kind == GpuOperationKind::DrawIndirect) {
+			// Resolved for the offsets the GPU-read records give the shaders; draws that read
+			// their records on the CPU patch the SGPRs instead and resolve themselves.
+			ShaderIndirectOffsets offsets;
+			if (IndirectDrawOffsets(operation->draw_indirect.registers, offsets)) {
+				operation->resolved = executor.ResolveDrawAhead(
+				    *operation->state.context, *operation->state.user_config,
+				    *operation->state.shaders, offsets, true);
+			}
+		} else if (operation->kind == GpuOperationKind::DispatchDirect) {
+			const uint32_t groups[] = {operation->dispatch.thread_group_x,
+			                           operation->dispatch.thread_group_y,
+			                           operation->dispatch.thread_group_z};
+			operation->resolved = executor.ResolveDispatchAhead(
+			    *operation->state.context, *operation->state.shaders, groups,
+			    operation->dispatch.mode, operation->processor->IsAsyncComputeQueue());
+		} else if (operation->kind == GpuOperationKind::DispatchIndirect) {
+			// The program does not depend on the GPU-written arguments, only on the registers
+			// and the guest memory its resources read.
+			operation->resolved = executor.ResolveIndirectDispatchAhead(
+			    *operation->state.context, *operation->state.shaders, operation->dispatch.mode,
+			    operation->dispatch.args_addr,
+			    operation->processor->IsAsyncComputeQueue());
 		}
 		m_resolved.Push(std::move(*operation));
 	}
@@ -580,6 +605,14 @@ void CommandProcessor::Execute(GpuOperation& operation) {
 			copies->Drain();
 		}
 	}
+	struct CommitWriteTicks {
+		RenderContext& renderer;
+		~CommitWriteTicks() {
+			if (renderer.GetBufferCache().CommitWriteTicks()) {
+				renderer.GetCommandScheduler().Flush();
+			}
+		}
+	} commit_write_ticks {m_renderer};
 	switch (operation.kind) {
 		case GpuOperationKind::DrawIndex:
 		case GpuOperationKind::DrawAuto: {
@@ -598,15 +631,34 @@ void CommandProcessor::Execute(GpuOperation& operation) {
 		}
 		case GpuOperationKind::DrawIndirect:
 			CountDraw();
+			// The resolution serves the first draw of the packet (its programs do not depend on
+			// the arguments); later draws resolve their own.
+			executor.UseResolvedDraw(operation.resolved);
 			ExecuteDrawIndirect(operation);
+			executor.UseResolvedDraw(nullptr);
+			if (operation.resolved != nullptr) {
+				RenderExecutor::ReleaseResolvedDraw(operation.resolved);
+			}
 			break;
 		case GpuOperationKind::DispatchDirect: {
 			const auto& dispatch = operation.dispatch;
+			executor.UseResolvedDraw(operation.resolved);
 			ExecuteDispatchDirect(operation, dispatch.thread_group_x, dispatch.thread_group_y,
 			                      dispatch.thread_group_z, dispatch.mode);
+			executor.UseResolvedDraw(nullptr);
+			if (operation.resolved != nullptr) {
+				RenderExecutor::ReleaseResolvedDraw(operation.resolved);
+			}
 			break;
 		}
-		case GpuOperationKind::DispatchIndirect: ExecuteDispatchIndirect(operation); break;
+		case GpuOperationKind::DispatchIndirect:
+			executor.UseResolvedDraw(operation.resolved);
+			ExecuteDispatchIndirect(operation);
+			executor.UseResolvedDraw(nullptr);
+			if (operation.resolved != nullptr) {
+				RenderExecutor::ReleaseResolvedDraw(operation.resolved);
+			}
+			break;
 		case GpuOperationKind::Callback:
 			if (operation.callback) {
 				operation.callback();
@@ -734,7 +786,12 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 	// Completion labels can be reused immediately; memcpy may write a destination twice, so
 	// publish each word exactly once.
 	const auto sequence = EmitCallback([this, dst, src, dw_num, write_one_address] {
-		m_renderer.PrepareGpuWrite(dst, uint64_t {write_one_address ? 1u : dw_num} * sizeof(uint32_t));
+		const auto* data  = write_one_address ? src + dw_num - 1 : src;
+		const auto  bytes = uint64_t {write_one_address ? 1u : dw_num} * sizeof(uint32_t);
+		if (m_renderer.WriteAroundGpuWrites(dst, data, bytes)) {
+			return;
+		}
+		m_renderer.PrepareGpuWrite(dst, bytes);
 		auto* output = static_cast<volatile uint32_t*>(dst);
 		for (uint32_t i = 0; i < dw_num; i++) {
 			*output = src[i];
@@ -1219,10 +1276,23 @@ uint32_t CommandProcessor::ResolveNumInstances(const GpuOperation& operation) {
 	// position set the persistent count.
 	if (m_has_indirect_instances &&
 	    m_indirect_instances_sequence == operation.num_instances.sequence) {
-		if (m_indirect_instances_addr != 0) {
-			// A draw the GPU read its records for: the count is read when a later draw inherits it.
-			m_indirect_instances      = *reinterpret_cast<const uint32_t*>(m_indirect_instances_addr);
-			m_indirect_instances_addr = 0;
+		const auto& gpu = m_gpu_indirect_instances;
+		if (gpu.address != 0) {
+			// The GPU read the records: read the last draw's instance count when a later draw
+			// inherits it (the second dword of both record layouts), waiting for the GPU work that
+			// wrote it.
+			uint32_t count = gpu.count;
+			if (gpu.count_address != 0) {
+				const uint32_t written =
+				    *reinterpret_cast<const volatile uint32_t*>(gpu.count_address);
+				count = std::min(written, count);
+			}
+			m_indirect_instances =
+			    count != 0 ? *reinterpret_cast<const volatile uint32_t*>(
+			                     gpu.address + uint64_t {count - 1} * gpu.stride +
+			                     offsetof(vk::DrawIndirectCommand, instanceCount))
+			               : m_indirect_instances;
+			m_gpu_indirect_instances = {};
 		}
 		return m_indirect_instances;
 	}
@@ -1459,31 +1529,27 @@ bool CommandProcessor::PatchIndirectDrawOffsets(const GpuOperation& operation,
 // The arguments are read when the draw executes: earlier GPU work may produce them.
 void CommandProcessor::ExecuteDrawIndirect(const GpuOperation& operation) {
 	const auto& indirect = operation.draw_indirect;
-
-	uint32_t draw_count = indirect.max_count;
-	if (indirect.count_addr != nullptr) {
-		draw_count = *indirect.count_addr;
-		if (draw_count > indirect.max_count) {
-			draw_count = indirect.max_count;
-		}
-	}
-	if (draw_count == 0) {
+	if (indirect.max_count == 0) {
 		return;
 	}
-	Common::DebugCounters::Add(Common::DebugCounters::Counter::IndirectDraws, draw_count);
-
 	const auto  args_addr = indirect.args_base + indirect.data_offset;
 	const auto& registers = indirect.registers;
-	// NUM_INSTANCES keeps the last draw's instance count.
-	m_indirect_instances_addr     = args_addr + static_cast<uint64_t>(draw_count - 1) * indirect.stride +
-	                                offsetof(vk::DrawIndirectCommand, instanceCount);
-	m_indirect_instances_sequence = operation.num_instances.sequence;
-	m_has_indirect_instances      = true;
 	// The GPU reads the records if the shaders allow; the VS prolog removes Vulkan's bases
-	// from the index VGPRs and copies them only to the user SGPRs the packet patches.
-	DrawIndirectArgs records {args_addr, draw_count, indirect.stride};
-	if (IndirectDrawOffsets(registers, records.offsets) &&
+	// from the index VGPRs and copies them only to the user SGPRs the packet patches. GPU work
+	// (culling shaders) writes the records and the draw count: the host GPU reads the count too
+	// (vkCmdDraw*IndirectCount), since reading it here would wait for all the GPU work recorded
+	// so far. Like any GPU-read record, the count path draws with indirect_draw shaders.
+	const auto count_address = reinterpret_cast<uint64_t>(indirect.count_addr);
+	DrawIndirectArgs records {args_addr, indirect.max_count, indirect.stride};
+	records.count_address = count_address;
+	if ((count_address == 0 || (m_renderer.GetGraphics().indirect_draws_enabled &&
+	                            (count_address & 3u) == 0)) &&
+	    IndirectDrawOffsets(registers, records.offsets) &&
 	    (!indirect.indexed || indirect.index_buffer_size != 0)) {
+		// NUM_INSTANCES keeps the last draw's instance count.
+		m_gpu_indirect_instances      = records;
+		m_indirect_instances_sequence = operation.num_instances.sequence;
+		m_has_indirect_instances      = true;
 		NoteRecordedWork();
 		auto& executor = m_renderer.GetRenderExecutor();
 		if (indirect.indexed
@@ -1494,9 +1560,24 @@ void CommandProcessor::ExecuteDrawIndirect(const GpuOperation& operation) {
 		                              .index_type_and_size = indirect.index_type,
 		                              .indirect            = records})
 		        : executor.DrawAuto(CurrentBuffer(), {.indirect = records})) {
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::IndirectDraws,
+			                           indirect.max_count);
 			return;
 		}
 	}
+
+	uint32_t draw_count = indirect.max_count;
+	if (indirect.count_addr != nullptr) {
+		draw_count = *indirect.count_addr;
+		if (draw_count > indirect.max_count) {
+			draw_count = indirect.max_count;
+		}
+	}
+	m_gpu_indirect_instances = {};
+	if (draw_count == 0) {
+		return;
+	}
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::IndirectDraws, draw_count);
 
 	const uint32_t max_indices = indirect.index_buffer_size != 0 ? indirect.index_buffer_size : UINT32_MAX;
 	for (uint32_t i = 0; i < draw_count; i++) {
@@ -1507,7 +1588,6 @@ void CommandProcessor::ExecuteDrawIndirect(const GpuOperation& operation) {
 			vk::DrawIndirectCommand args {};
 			std::memcpy(&args, record_addr, sizeof(args));
 			m_indirect_instances          = args.instanceCount;
-			m_indirect_instances_addr     = 0;
 			m_indirect_instances_sequence = operation.num_instances.sequence;
 			m_has_indirect_instances      = true;
 			PatchIndirectDrawOffsets(operation, args.firstVertex, args.firstInstance, 0, i);
@@ -1527,7 +1607,6 @@ void CommandProcessor::ExecuteDrawIndirect(const GpuOperation& operation) {
 		const auto*    index_addr = IndexAddress(indirect.index_base, indirect.index_type, args.firstIndex);
 		const uint32_t index_count = std::min(args.indexCount, max_indices);
 		m_indirect_instances          = args.instanceCount;
-		m_indirect_instances_addr     = 0;
 		m_indirect_instances_sequence = operation.num_instances.sequence;
 		m_has_indirect_instances      = true;
 		ExecuteDrawIndex(operation, {.index_count         = index_count,
@@ -1581,9 +1660,10 @@ void CommandProcessor::ExecuteDispatchIndirect(const GpuOperation& operation) {
 	const auto& dispatch = operation.dispatch;
 	NoteRecordedWork();
 	if ((dispatch.mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0) {
-		// The arguments are read when the dispatch executes: earlier GPU work may produce them.
-		const auto* args = reinterpret_cast<const vk::DispatchIndirectCommand*>(dispatch.args_addr);
-		ExecuteDispatchDirect(operation, args->x, args->y, args->z, dispatch.mode);
+		// Earlier GPU work writes the thread counts: reading them here would wait for it.
+		m_renderer.GetRenderExecutor().DispatchIndirectThreads(CurrentBuffer(), dispatch.args_addr,
+		                                                       dispatch.mode,
+		                                                       IsAsyncComputeQueue());
 		return;
 	}
 	m_renderer.GetRenderExecutor().DispatchIndirect(CurrentBuffer(),

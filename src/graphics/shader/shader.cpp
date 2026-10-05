@@ -577,7 +577,8 @@ void BuildStageStaticKey(const ShaderComputeInputInfo& info, std::vector<uint32_
 	words.push_back(info.lds_size_dwords);
 	words.push_back(info.scratch_size_dwords);
 	words.push_back(static_cast<uint32_t>(info.dispatch_thread_dimensions) |
-	                (static_cast<uint32_t>(info.async_compute) << 1u));
+	                (static_cast<uint32_t>(info.async_compute) << 1u) |
+	                (static_cast<uint32_t>(info.dispatch_indirect_threads) << 2u));
 	for (int i = 0; i < 3; i++) {
 		words.push_back(info.threads_num[i]);
 		words.push_back(static_cast<uint32_t>(info.group_id[i]));

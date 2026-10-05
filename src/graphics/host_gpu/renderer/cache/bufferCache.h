@@ -12,6 +12,8 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <map>
 #include <mutex>
 #include <span>
@@ -93,6 +95,14 @@ public:
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasOnlyGpuDirtyBytes(uint64_t vaddr, uint64_t size);
+	// Execution thread: a small command-processor write (WRITE_DATA) to GPU-owned pages without
+	// reading the GPU's work back first: the bytes go to the backing store and, in stream order,
+	// to the cached buffer. False when the caller must take the faulting path.
+	[[nodiscard]] bool WriteAroundGpuWrites(uint64_t vaddr, const void* data, uint64_t size);
+	// Lock-free: false when no page of the tracking regions the range touches may be GPU dirty.
+	[[nodiscard]] bool MayBeGpuModified(uint64_t vaddr, uint64_t size) const {
+		return m_memory_tracker.MayBeGpuModified(vaddr, size);
+	}
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	// Color metadata the GPU found free of the clear keys in `keys` (bits of code >> 5) stays so
@@ -156,6 +166,35 @@ public:
 		return epoch;
 	}
 	void               RunGarbageCollector();
+	// Execution thread, after each operation: the GPU writes the operation recorded get the
+	// tick of the command buffer that holds them (see DownloadOnReadbackQueue()). True when the
+	// operation wrote memory that readbacks keep waiting for: submitting its command buffer now
+	// lets the GPU run it before the readback comes, which then waits for that submission only
+	// instead of draining everything recorded since.
+	[[nodiscard]] bool CommitWriteTicks();
+	// Execution thread: reads [vaddr, vaddr + size), taking the bytes the GPU wrote from the
+	// host-visible mirror of small ranges the execution thread reads again and again (the headers
+	// that the shaders of a ray-tracing BVH build read from the buffers their predecessors write),
+	// without a GPU round trip. False when the mirror does not hold the GPU's current bytes yet:
+	// the caller reads them back, and the range is mirrored from the next submission on.
+	[[nodiscard]] bool TryReadMirroredGpuWrites(uint64_t vaddr, void* data, uint64_t size);
+	// The operation being recorded writes memory that readbacks often wait for soon after:
+	// submit its command buffer once it is recorded while readbacks keep coming.
+	void RequestFlushForReadbacks() noexcept {
+		if ((m_device_address_hot != 0 &&
+		     m_readback_count - m_device_address_hot < HotReadbackLifetime) ||
+		    m_mirror_uses - m_mirror_flush_use < MirrorFlushLifetime) {
+			m_flush_requested = true;
+		}
+	}
+	// The operation being recorded accesses memory through device addresses.
+	void NoteDeviceAddressUse() noexcept {
+		m_device_address_pending = true;
+		if (m_device_address_hot != 0 &&
+		    m_readback_count - m_device_address_hot < HotReadbackLifetime) {
+			m_flush_requested = true;
+		}
+	}
 
 private:
 	friend struct BufferCacheTestAccess;
@@ -192,7 +231,42 @@ private:
 	template <bool async>
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	void               ForgetColorMetadataChecks(uint64_t vaddr, uint64_t size);
+	// Reads GPU-written bytes whose last writes were already submitted: a copy on the readback
+	// queue waits for those submissions only, not for the work queued after them.
+	[[nodiscard]] bool DownloadOnReadbackQueue(Buffer& buffer, std::span<const vk::BufferCopy> copies,
+	                                           uint64_t total_size);
+	void NoteWrite(uint64_t vaddr, uint64_t size) {
+		// Draws bind the same written ranges again and again.
+		if (m_pending_writes.empty() || m_pending_writes.back() != std::pair {vaddr, size}) {
+			m_pending_writes.emplace_back(vaddr, size);
+			for (const auto& hot: m_readback_hot) {
+				if (vaddr < hot.end && hot.begin < vaddr + size) {
+					m_flush_requested = true;
+					break;
+				}
+			}
+		}
+	}
+	// A readback of [begin, end) waited for writes still being recorded (`drained`) or for
+	// submitted ones; `device_address` when they were device-address writes.
+	void NoteReadbackWait(uint64_t begin, uint64_t end, bool device_address, bool drained);
+	// Whether to submit for a pending flush request now (see CommitWriteTicks()).
+	[[nodiscard]] bool TakeFlushRequest();
 
+	// The tick of the command buffer that last wrote each guest range a cached buffer holds.
+	class WriteTicks {
+	public:
+		void Assign(uint64_t begin, uint64_t end, uint64_t tick);
+		// The latest tick over [begin, end); UINT64_MAX when part of it has no tick.
+		[[nodiscard]] uint64_t Latest(uint64_t begin, uint64_t end) const;
+
+	private:
+		struct Range {
+			uint64_t end  = 0;
+			uint64_t tick = 0;
+		};
+		std::map<uint64_t, Range> m_ranges;
+	};
 	GraphicContext&                                   m_graphics;
 	CommandScheduler&                                 m_scheduler;
 	FaultManager                                      m_fault_manager;
@@ -209,6 +283,62 @@ private:
 	bool                                              m_record_released = false;
 	MemoryTracker                                     m_memory_tracker;
 	uint64_t                                           m_gpu_write_generation = 0;
+	WriteTicks                                        m_write_ticks;
+	std::vector<std::pair<uint64_t, uint64_t>>        m_pending_writes;
+	uint64_t                                          m_device_address_tick    = 0;
+	bool                                              m_device_address_pending = false;
+	// Pages whose readbacks found the writes they need still being recorded, which drains the
+	// GPU: an operation that writes them is submitted at once (see CommitWriteTicks()). An entry
+	// lives while readbacks of it keep coming, up to HotReadbackLifetime readbacks without one.
+	struct HotReadback {
+		uint64_t begin    = 0;
+		uint64_t end      = 0;
+		uint64_t last_hit = 0;
+	};
+	static constexpr uint64_t HotReadbackLifetime = 4096;
+	static constexpr size_t   MaxHotReadbacks     = 32;
+	std::vector<HotReadback>  m_readback_hot;
+	uint64_t                  m_readback_count = 0;
+	// m_readback_count at the last readback that waited for device-address writes (0: none).
+	uint64_t                  m_device_address_hot = 0;
+	bool                      m_flush_requested    = false;
+	// Requested submissions (see TakeFlushRequest()): at most one per interval, and the tick a
+	// request was put off at (0: none put off).
+	static constexpr std::chrono::microseconds MinRequestedFlushInterval {1000};
+	std::chrono::steady_clock::time_point      m_last_requested_flush {};
+	uint64_t                                   m_flush_deferred_tick = 0;
+	struct ReadbackQueue {
+		vk::CommandPool         pool    = nullptr;
+		vk::CommandBuffer       command = nullptr;
+		vk::Fence               fence   = nullptr;
+		std::unique_ptr<Buffer> staging;
+	};
+	ReadbackQueue m_readback;
+	// The mirror: each line holds a copy of its bytes in a cached buffer, recorded at the end of
+	// the command buffer `tick` (0: none since the line's last write) into `slot` of a
+	// host-visible buffer. An operation that writes a line clears its tick and queues it for a
+	// copy at the end of its command buffer (see RecordMirrorCopies()), so a copy whose tick is
+	// at least the line's last write tick holds the GPU's bytes once that tick completed.
+	struct MirrorLine {
+		uint32_t slot       = 0;
+		uint64_t tick       = 0;
+		uint64_t dirty_tick = 0;
+		uint64_t last_use   = 0;
+	};
+	static constexpr uint64_t MirrorLineSize      = 64;
+	static constexpr uint64_t MirrorMaxRead       = 256;
+	static constexpr uint32_t MaxMirrorLines      = 8192;
+	// Mirror reads (m_mirror_uses) within which a line or a hit counts as recent.
+	static constexpr uint64_t MirrorFlushLifetime = 4096;
+	void                      MarkMirrorLinesWritten(uint64_t vaddr, uint64_t size, uint64_t tick);
+	void                      AddMirrorLine(uint64_t line);
+	void                      RecordMirrorCopies(CommandBuffer& command);
+	std::map<uint64_t, MirrorLine> m_mirror_lines;
+	std::vector<uint64_t>          m_mirror_dirty;
+	std::vector<uint32_t>          m_mirror_free_slots;
+	std::unique_ptr<Buffer>        m_mirror;
+	uint64_t                       m_mirror_uses      = 0;
+	uint64_t                       m_mirror_flush_use = 0;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;

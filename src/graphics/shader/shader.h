@@ -35,6 +35,11 @@ enum class ShaderType {
 
 struct ShaderModule;
 
+// Names what the fields of the stage input structures below mean for the files that keep them
+// across sessions and builds (the shader program and pipeline stores). Change it whenever a field
+// is added, removed or reinterpreted, even when no structure changes size.
+inline constexpr std::string_view ShaderInputLayoutTag = "3";
+
 struct ShaderStageRuntime {
 	const ShaderModule*                           module    = nullptr;
 	const ShaderRecompiler::IR::ResourceSnapshot* resources = nullptr;
@@ -173,6 +178,9 @@ struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
 	bool               group_id[3]                = {false, false, false};
 	bool               dispatch_thread_dimensions = false;
 	bool               lds_storage                = false;
+	// An indirect thread-dimension dispatch: the thread limit is written by the GPU, so the
+	// shader data lives in a storage buffer instead of push constants.
+	bool               dispatch_indirect_threads  = false;
 	int                thread_ids_num             = 0;
 	int                workgroup_register         = 0;
 	bool               tg_size_en                 = false;

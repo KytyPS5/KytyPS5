@@ -13,6 +13,7 @@
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/guest_gpu/pm4.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
@@ -456,7 +457,10 @@ static void ValueInitialize(T& object) {
 struct RenderExecutor::ResolvedDraw {
 	DrawRenderStorage storage;
 	ProgramResolution programs;
-	std::atomic_bool  busy {false};
+	// A dispatch resolved ahead: its module and stage input (pointing into `programs`).
+	ShaderComputeInputInfo compute;
+	const ShaderModule*    compute_module = nullptr;
+	std::atomic_bool       busy {false};
 };
 
 // More resolutions than operations can wait between the resolve and execution threads, so the
@@ -716,10 +720,11 @@ DrawRenderState& RenderExecutor::AcquireDrawRenderState(bool tessellation, bool&
 	// The operations before this draw executed: the resolution holds when the guest memory it
 	// read still has the same bytes.
 	auto* resolved = std::exchange(m_resolved_draw, nullptr);
-	// Resolutions ahead of execution read the shaders of direct draws: without GPU-read indirect
-	// records or offsets.
-	shaders_resolved = resolved != nullptr && !tessellation && !indirect_draw &&
-	                   indirect_offsets == ShaderIndirectOffsets {} &&
+	// Resolutions ahead of execution read the shaders with the offsets of GPU-read indirect
+	// records; draws that patch the SGPRs instead resolve themselves.
+	shaders_resolved = resolved != nullptr && resolved->compute_module == nullptr &&
+	                   resolved->storage.state.indirect_offsets == indirect_offsets &&
+	                   resolved->storage.state.indirect_draw == indirect_draw &&
 	                   resolved->programs.reads.StillValid();
 	if (shaders_resolved) {
 		return resolved->storage.state;
@@ -1167,11 +1172,10 @@ static bool ResolvePrimitiveRestart(const CommandBuffer& buffer,
 	return false;
 }
 
-RenderExecutor::ResolvedDraw* RenderExecutor::ResolveDrawAhead(const HW::Context&    context,
-                                                               const HW::UserConfig& user_config,
-                                                               const HW::Shader&     shaders) {
-	if (user_config.GetPrimType() == Prospero::PrimitiveType::kPatch ||
-	    !DrawHasValidVertexShader(shaders)) {
+RenderExecutor::ResolvedDraw* RenderExecutor::ResolveDrawAhead(
+    const HW::Context& context, const HW::UserConfig& user_config, const HW::Shader& shaders,
+    const ShaderIndirectOffsets& indirect_offsets, bool indirect_draw) {
+	if (!DrawHasValidVertexShader(shaders)) {
 		return nullptr;
 	}
 	if (m_resolved_ring == nullptr) {
@@ -1185,9 +1189,14 @@ RenderExecutor::ResolvedDraw* RenderExecutor::ResolveDrawAhead(const HW::Context
 			std::this_thread::yield();
 		}
 	}
-	ring.next   = (ring.next + 1) % ResolvedDrawRing::Size;
-	auto& state = draw.storage.state;
-	ResetDrawRenderState(state, false);
+	ring.next           = (ring.next + 1) % ResolvedDrawRing::Size;
+	draw.compute_module = nullptr;
+	auto& state         = draw.storage.state;
+	ResetDrawRenderState(state, draw.storage.tessellation_stages_written);
+	draw.storage.tessellation_stages_written =
+	    user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
+	state.indirect_offsets = indirect_offsets;
+	state.indirect_draw    = indirect_draw;
 	draw.programs.Reset();
 	if (!m_context.GetPipelineCache().GetGraphicsProgramsAhead(context, user_config, shaders, state,
 	                                                          draw.programs) ||
@@ -1197,6 +1206,103 @@ RenderExecutor::ResolvedDraw* RenderExecutor::ResolveDrawAhead(const HW::Context
 	// Published to the execution thread with the operation that carries it.
 	draw.busy.store(true, std::memory_order_relaxed);
 	return &draw;
+}
+
+RenderExecutor::ResolvedDraw* RenderExecutor::ResolveDispatchAhead(const HW::Context& context,
+                                                                   const HW::Shader&  shaders,
+                                                                   const uint32_t (&groups)[3],
+                                                                   uint32_t mode,
+                                                                   bool async_compute) {
+	(void)context;
+	const auto& cs_regs = shaders.GetCs();
+	if (cs_regs.cs_regs.data_addr == 0) {
+		return nullptr;
+	}
+	if (m_resolved_ring == nullptr) {
+		m_resolved_ring = {new ResolvedDrawRing {}, [](ResolvedDrawRing* ring) { delete ring; }};
+	}
+	auto& ring = *m_resolved_ring;
+	auto& slot = ring.draws[ring.next];
+	// The execution thread releases resolutions in order.
+	for (Common::SpinWait wait; slot.busy.load(std::memory_order_acquire);) {
+		if (!wait.Spin()) {
+			std::this_thread::yield();
+		}
+	}
+	ring.next = (ring.next + 1) % ResolvedDrawRing::Size;
+	slot.programs.Reset();
+	ValueInitialize(slot.compute);
+	slot.compute.async_compute = async_compute;
+	// DISPATCH_INITIATOR.USE_THREAD_DIMENSIONS and the workgroup counts (see DispatchDirect()).
+	slot.compute.dispatch_thread_dimensions = (mode & (1u << 5u)) != 0;
+	const uint32_t group_sizes[] = {cs_regs.cs_regs.num_thread_x, cs_regs.cs_regs.num_thread_y,
+	                                cs_regs.cs_regs.num_thread_z};
+	for (uint32_t axis = 0; axis < 3u; ++axis) {
+		const auto size = slot.compute.dispatch_thread_dimensions ? std::max(group_sizes[axis], 1u) : 1u;
+		slot.compute.workgroup_counts[axis] = groups[axis] / size + (groups[axis] % size != 0u);
+	}
+	slot.compute_module =
+	    m_context.GetPipelineCache().GetComputeProgramAhead(cs_regs, slot.compute, slot.programs);
+	if (slot.programs.reads.Failed() || slot.compute_module == nullptr) {
+		slot.compute_module = nullptr;
+		return nullptr;
+	}
+	// Published to the execution thread with the operation that carries it.
+	slot.busy.store(true, std::memory_order_relaxed);
+	return &slot;
+}
+
+RenderExecutor::ResolvedDraw* RenderExecutor::ResolveIndirectDispatchAhead(
+    const HW::Context& context, const HW::Shader& shaders, uint32_t mode, uint64_t args_addr,
+    bool async_compute) {
+	(void)context;
+	const auto& cs_regs = shaders.GetCs();
+	if (cs_regs.cs_regs.data_addr == 0) {
+		return nullptr;
+	}
+	if (m_resolved_ring == nullptr) {
+		m_resolved_ring = {new ResolvedDrawRing {}, [](ResolvedDrawRing* ring) { delete ring; }};
+	}
+	auto& ring = *m_resolved_ring;
+	auto& slot = ring.draws[ring.next];
+	// The execution thread releases resolutions in order.
+	for (Common::SpinWait wait; slot.busy.load(std::memory_order_acquire);) {
+		if (!wait.Spin()) {
+			std::this_thread::yield();
+		}
+	}
+	ring.next = (ring.next + 1) % ResolvedDrawRing::Size;
+	slot.programs.Reset();
+	ValueInitialize(slot.compute);
+	slot.compute.async_compute = async_compute;
+	// As DispatchIndirect() and DispatchIndirectThreads() look the program up: the workgroup
+	// counts are unknown until the dispatch executes.
+	if ((mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0) {
+		slot.compute.dispatch_thread_dimensions = true;
+		slot.compute.dispatch_indirect_threads  = true;
+	} else {
+		slot.compute.indirect_args_address = args_addr;
+	}
+	slot.compute_module =
+	    m_context.GetPipelineCache().GetComputeProgramAhead(cs_regs, slot.compute, slot.programs);
+	if (slot.programs.reads.Failed() || slot.compute_module == nullptr) {
+		slot.compute_module = nullptr;
+		return nullptr;
+	}
+	slot.busy.store(true, std::memory_order_relaxed);
+	return &slot;
+}
+
+bool RenderExecutor::TakeResolvedDispatch(ShaderComputeInputInfo& input_info,
+                                          const ShaderModule*&    module) {
+	auto* resolved = std::exchange(m_resolved_draw, nullptr);
+	if (resolved == nullptr || resolved->compute_module == nullptr ||
+	    !resolved->programs.reads.StillValid()) {
+		return false;
+	}
+	input_info = resolved->compute;
+	module     = resolved->compute_module;
+	return true;
 }
 
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, bool shaders_resolved,
@@ -1499,12 +1605,18 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		mesh_indices = indices->BufferDeviceAddress() + offset + (index_source.address & 3u);
 	}
 	std::pair<Buffer*, uint64_t> args_buffer {};
+	std::pair<Buffer*, uint64_t> count_buffer {};
 	if (emit.indirect.address != 0) {
 		const auto size = static_cast<uint64_t>(emit.indirect.count - 1) * emit.indirect.stride +
 		                  (draw.indexed ? sizeof(vk::DrawIndexedIndirectCommand)
 		                                : sizeof(vk::DrawIndirectCommand));
 		args_buffer = m_context.GetBufferCache().ObtainBuffer(emit.indirect.address, size, false);
 		EXIT_IF((args_buffer.second & 3u) != 0);
+		if (emit.indirect.count_address != 0) {
+			count_buffer = m_context.GetBufferCache().ObtainBuffer(emit.indirect.count_address,
+			                                                       sizeof(uint32_t), false);
+			EXIT_IF(count_buffer.first == nullptr || (count_buffer.second & 3u) != 0);
+		}
 	}
 	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(buffer, state, *m_draw_targets);
 	vk::ImageAspectFlags feedback_aspects;
@@ -1596,6 +1708,16 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
 	} else if (args_buffer.first == nullptr) {
 		EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
+	} else if (count_buffer.first != nullptr) {
+		if (draw.indexed) {
+			vk_buffer.drawIndexedIndirectCount(args_buffer.first->Handle(), args_buffer.second,
+			                                   count_buffer.first->Handle(), count_buffer.second,
+			                                   emit.indirect.count, emit.indirect.stride);
+		} else {
+			vk_buffer.drawIndirectCount(args_buffer.first->Handle(), args_buffer.second,
+			                            count_buffer.first->Handle(), count_buffer.second,
+			                            emit.indirect.count, emit.indirect.stride);
+		}
 	} else if (draw.indexed) {
 		vk_buffer.drawIndexedIndirect(args_buffer.first->Handle(), args_buffer.second,
 		                              emit.indirect.count, emit.indirect.stride);

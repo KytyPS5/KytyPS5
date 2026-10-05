@@ -18,6 +18,7 @@
 #include <optional>
 #include <span>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -35,6 +36,7 @@ struct DrawIndexBufferSource;
 class RenderContext;
 class CommandScheduler;
 struct RenderExecutorTestAccess;
+struct IndirectThreadPass;
 
 // An image description derived from a T# and a shader's view of it (see ResolveTexture).
 struct TextureDescDerivation {
@@ -63,12 +65,16 @@ enum class DrawOffsetSource : uint8_t {
 	IndirectArgs,
 };
 
-// Nonzero address: the GPU reads count Vulkan indirect draw records, stride bytes apart.
+// Nonzero address: the GPU reads count Vulkan indirect draw records, stride bytes apart. With a
+// count address the GPU reads the number of draws there too (count is then the maximum): GPU work
+// (culling shaders) writes the records and the count, and reading them on the CPU would wait for
+// all the GPU work recorded before the draw.
 struct DrawIndirectArgs {
 	uint64_t              address = 0;
 	uint32_t              count   = 0;
 	uint32_t              stride  = 0;
 	ShaderIndirectOffsets offsets;
+	uint64_t              count_address = 0;
 };
 
 struct DrawIndexArgs {
@@ -186,6 +192,10 @@ public:
 	void DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr, uint32_t mode,
 	                      bool async_compute);
 	void ProcessPssr(CommandBuffer& buffer, const Pssr::Request& request);
+	// DISPATCH_INDIRECT with USE_THREAD_DIMENSIONS: converts the thread counts, which GPU work
+	// writes, on the GPU instead of reading them back.
+	void DispatchIndirectThreads(CommandBuffer& buffer, uint64_t args_addr, uint32_t mode,
+	                             bool async_compute);
 
 	// Shader programs and resources of a draw resolved ahead of its execution.
 	struct ResolvedDraw;
@@ -195,7 +205,24 @@ public:
 	// use: the execution thread releases them in order.
 	[[nodiscard]] ResolvedDraw* ResolveDrawAhead(const HW::Context&    context,
 	                                             const HW::UserConfig& user_config,
-	                                             const HW::Shader&     shaders);
+	                                             const HW::Shader&     shaders,
+	                                             const ShaderIndirectOffsets& indirect_offsets = {},
+	                                             bool indirect_draw = false);
+	// Resolve thread: the compute program of a DISPATCH_DIRECT with the given registers and
+	// initiator; null when the dispatch resolves it itself. Shares the ring of draw resolutions.
+	[[nodiscard]] ResolvedDraw* ResolveDispatchAhead(const HW::Context& context,
+	                                                 const HW::Shader& shaders,
+	                                                 const uint32_t (&groups)[3], uint32_t mode,
+	                                                 bool async_compute);
+	// Resolve thread: the compute program of a DISPATCH_INDIRECT with the given registers and
+	// initiator, which does not depend on the arguments the dispatch reads when it executes.
+	[[nodiscard]] ResolvedDraw* ResolveIndirectDispatchAhead(const HW::Context& context,
+	                                                         const HW::Shader&  shaders,
+	                                                         uint32_t           mode, uint64_t args_addr,
+	                                                         bool               async_compute);
+	// Execution thread: the program a dispatch resolved ahead, when the guest memory the
+	// resolution read still holds the same bytes.
+	bool TakeResolvedDispatch(ShaderComputeInputInfo& input_info, const ShaderModule*& module);
 	// Execution thread: the next draw uses `resolved` when the guest memory it read still holds
 	// the same bytes.
 	void UseResolvedDraw(ResolvedDraw* resolved) noexcept { m_resolved_draw = resolved; }

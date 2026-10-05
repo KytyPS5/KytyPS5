@@ -446,6 +446,9 @@ CommandBuffer& CommandScheduler::BeginCommand() {
 
 uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	EXIT_IF(m_command.IsInvalid());
+	if (m_submit_hook != nullptr) {
+		m_submit_hook(m_submit_hook_data, m_command);
+	}
 
 	m_command.End();
 	// Only this scheduler's owner allocates its ticks, in submission order.
@@ -498,6 +501,8 @@ void CommandScheduler::QueueSubmit(vk::CommandBuffer buffer, SubmitInfo& submit,
 	if (result != vk::Result::eSuccess) {
 		EXIT("vkQueueSubmit failed: %s, tick=%" PRIu64 "\n", vk::to_string(result).c_str(), tick);
 	}
+	// Ticks are submitted in order, by one thread at a time.
+	m_submitted_tick.store(tick, std::memory_order_release);
 }
 
 void CommandScheduler::RecordingThread() {

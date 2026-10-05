@@ -267,6 +267,11 @@ public:
 	// Null skips the dispatch.
 	const ShaderModule* GetComputeProgram(const HW::ComputeShaderInfo& regs,
 	                                      ShaderComputeInputInfo&      input_info);
+	// The resolve thread: as GetGraphicsProgramsAhead, for a dispatch; null when the execution
+	// thread resolves it itself.
+	const ShaderModule* GetComputeProgramAhead(const HW::ComputeShaderInfo& regs,
+	                                           ShaderComputeInputInfo&      input_info,
+	                                           ProgramResolution&           ahead);
 
 	Pipeline& GetGraphicsPipeline(const CommandBuffer& command, const DrawRenderState& state,
 	                              const DrawTargets& targets);

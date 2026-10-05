@@ -615,6 +615,12 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	LOGF("Vulkan occlusion queries: %s, precise: %s\n",
 	     graphics.occlusion_queries_enabled ? "true" : "false",
 	     graphics.occlusion_query_precise_enabled ? "true" : "false");
+	device_features.multiDrawIndirect         = supported2.features.multiDrawIndirect;
+	device_features.drawIndirectFirstInstance = supported2.features.drawIndirectFirstInstance;
+	features12.drawIndirectCount              = supported12.drawIndirectCount;
+	graphics.indirect_draws_enabled = device_features.multiDrawIndirect == VK_TRUE &&
+	                                  device_features.drawIndirectFirstInstance == VK_TRUE &&
+	                                  features12.drawIndirectCount == VK_TRUE;
 	device_features.shaderInt64 = VK_TRUE;
 	device_features.shaderFloat64 =
 	    supported2.features.shaderFloat64 && float_controls.shaderSignedZeroInfNanPreserveFloat64;
@@ -636,12 +642,28 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 	     robustness2.robustImageAccess2 == VK_TRUE ? "true" : "false",
 	     graphics.robust_buffer_access_enabled ? "robustBufferAccess2" : "shader checks");
 
-	const float                     queue_priority = 1.0f;
-	const vk::DeviceQueueCreateInfo queue_create_info {
+	const float                              queue_priority = 1.0f;
+	std::array<vk::DeviceQueueCreateInfo, 2> queue_create_infos {};
+	queue_create_infos[0] = {
 	    .queueFamilyIndex = queue_family, .queueCount = 1, .pQueuePriorities = &queue_priority};
+	// A transfer-only family serves buffer readbacks (GraphicContext::readback_queue).
+	uint32_t   queue_create_count = 1;
+	const auto families           = physical_device.getQueueFamilyProperties();
+	graphics.readback_family      = static_cast<uint32_t>(-1);
+	for (uint32_t family = 0; family < families.size(); family++) {
+		const auto flags = families[family].queueFlags;
+		if (family != queue_family && families[family].queueCount != 0 &&
+		    (flags & vk::QueueFlagBits::eTransfer) &&
+		    !(flags & (vk::QueueFlagBits::eGraphics | vk::QueueFlagBits::eCompute))) {
+			graphics.readback_family = family;
+			queue_create_infos[queue_create_count++] = {
+			    .queueFamilyIndex = family, .queueCount = 1, .pQueuePriorities = &queue_priority};
+			break;
+		}
+	}
 	const auto                 extension_count = static_cast<uint32_t>(device_extensions.size());
-	const vk::DeviceCreateInfo create_info {.queueCreateInfoCount    = 1,
-	                                        .pQueueCreateInfos       = &queue_create_info,
+	const vk::DeviceCreateInfo create_info {.queueCreateInfoCount    = queue_create_count,
+	                                        .pQueueCreateInfos       = queue_create_infos.data(),
 	                                        .enabledExtensionCount   = extension_count,
 	                                        .ppEnabledExtensionNames = device_extensions.data(),
 	                                        .pEnabledFeatures        = &device_features};
@@ -1016,6 +1038,9 @@ void WindowContext::CreateVulkan() {
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
 	graphic_ctx.device.getQueue(graphic_ctx.queue_family, 0, &graphic_ctx.queue);
 	EXIT_IF(graphic_ctx.queue == nullptr);
+	if (graphic_ctx.readback_family != static_cast<uint32_t>(-1)) {
+		graphic_ctx.device.getQueue(graphic_ctx.readback_family, 0, &graphic_ctx.readback_queue);
+	}
 	Dlss::Init(graphic_ctx, VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr,
 	           VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr);
 	Fsr::Init(graphic_ctx, VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr);

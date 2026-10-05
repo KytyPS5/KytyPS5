@@ -173,7 +173,7 @@
         }
         origins.Flush(0, origins.Size());
         if (read == 0) {
-          context.PrepareBda();
+          context.PrepareBda(false);
           read = mirror.Prepare(tlas);
         }
         const struct {

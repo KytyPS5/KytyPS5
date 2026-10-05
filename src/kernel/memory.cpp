@@ -877,8 +877,36 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 		}
 		auto& buffers = GetGpuResources().GetBufferCache();
 		if (buffers.HasGpuDirtyBytes(vaddr, size)) {
+			if (buffers.TryReadMirroredGpuWrites(vaddr, data, size)) {
+				return true;
+			}
 			buffers.ReadMemory(vaddr, size);
 		}
+	}
+	return TryReadBacking(vaddr, data, size);
+}
+
+bool MayFaultOnGpuRead(uint64_t vaddr, uint64_t size) {
+	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) {
+		return false;
+	}
+	auto& buffers = GetGpuResources().GetBufferCache();
+	return buffers.MayBeGpuModified(vaddr, size) && buffers.IsRegionGpuModified(vaddr, size);
+}
+
+bool TryReadAroundGpuWrites(uint64_t vaddr, void* data, uint64_t size) {
+	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size) ||
+	    !Graphics::GuestGpu::IsGpuThread()) {
+		return false;
+	}
+	auto& buffers = GetGpuResources().GetBufferCache();
+	// Pages the GPU does not own do not fault on reads (the region check needs no lock).
+	if (!buffers.MayBeGpuModified(vaddr, size) || !buffers.IsRegionGpuModified(vaddr, size) ||
+	    GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size)) {
+		return false;
+	}
+	if (buffers.HasGpuDirtyBytes(vaddr, size)) {
+		return buffers.TryReadMirroredGpuWrites(vaddr, data, size);
 	}
 	return TryReadBacking(vaddr, data, size);
 }

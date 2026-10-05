@@ -4957,6 +4957,304 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  // An address-only scalar load has no host-visible descriptor for FindBuffers
+  // to discover. Its first access must therefore fault through the production
+  // BDA bitmap, and the next dispatch can succeed only after FaultManager
+  // creates the buffer and ChangeRegister publishes the page-table entry.
+  void CheckBdaFaultResolutionRetry() {
+    constexpr const char *name = "BdaFaultResolutionRetry";
+    constexpr uint64_t allocation_size = 0x100000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t low_base = 0x000000020a000000ull;
+    constexpr uint64_t output_base = 0x000000020c000000ull;
+    constexpr uint64_t region_offset = low_base;
+    constexpr uint64_t extended_base =
+        LibKernel::Memory::kExtendedMemoryBase + region_offset;
+    constexpr uint64_t target_offset = 0x40120;
+    constexpr uint32_t output_sentinel = 0xfeedbabeu;
+    struct Region {
+      const char *label;
+      uint64_t base;
+      uint64_t output;
+      uint32_t expected;
+      int64_t direct = -1;
+    };
+    std::array<Region, 2> regions{{
+        {"low", low_base, output_base + 0x120, 0x6d13a7c5u},
+        {"extended", extended_base, output_base + 0x40120, 0xe4b98271u},
+    }};
+    int64_t output_direct = -1;
+
+    std::vector<u32> code{
+        EncodeSmem0(0x00u, 20, 4), // s_load_dword s20, s[8:9]
+        EncodeSmem1(0, 10),        // a runtime zero prevents host scalar-read flattening
+        EncodeVop1(0x01u, 30, 20), // v_mov_b32 v30, s20
+        EncodeVop1(0x01u, 31, InlineU32(0)),
+        EncodeMubuf0(0x1cu, 0, false, true),
+        EncodeMubuf1(30, 0, 31), // buffer_store_dword v30, v31, s[0:3]
+    };
+    AppendEnd(&code);
+    ShaderMapUserData(
+        reinterpret_cast<uint64_t>(code.data()),
+        {.type = Prospero::ShaderBinaryType::kCs,
+         .code_size_bytes = static_cast<uint32_t>(code.size() * sizeof(u32))});
+
+    EnsureRuntimeContext();
+    const auto total_direct =
+        Libs::LibKernel::Memory::KernelGetDirectMemorySize();
+    for (auto &region : regions) {
+      Require(region.label, "direct allocation",
+              Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                  0, total_direct, allocation_size, allocation_alignment, 0,
+                  &region.direct) == 0,
+              "BDA fault backing allocation failed");
+      void *mapped = reinterpret_cast<void *>(region.base);
+      Require(region.label, "mapping",
+              Libs::LibKernel::Memory::KernelMapDirectMemory(
+                  &mapped, allocation_size, 0x3, 0x10, region.direct,
+                  allocation_alignment) == 0 &&
+                  mapped == reinterpret_cast<void *>(region.base),
+              "fixed BDA fault backing mapping failed");
+      std::memset(mapped, 0, allocation_size);
+      std::memcpy(reinterpret_cast<void *>(region.base + target_offset),
+                  &region.expected, sizeof(region.expected));
+    }
+    Require(name, "output direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, total_direct, allocation_size, allocation_alignment, 0,
+                &output_direct) == 0,
+            "BDA fault output allocation failed");
+    void *output_mapping = reinterpret_cast<void *>(output_base);
+    Require(name, "output mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &output_mapping, allocation_size, 0x3, 0x10, output_direct,
+                allocation_alignment) == 0 &&
+                output_mapping == reinterpret_cast<void *>(output_base),
+            "fixed BDA fault output mapping failed");
+    std::memset(output_mapping, 0, allocation_size);
+    for (const auto &region : regions) {
+      std::memcpy(reinterpret_cast<void *>(region.output), &output_sentinel,
+                  sizeof(output_sentinel));
+    }
+
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      auto &scheduler = context.GetCommandScheduler();
+      auto &cache = context.GetBufferCache();
+      auto &shaders = processor.GetShCtx();
+      for (const auto &region : regions) {
+        context.MapMemory(region.base, allocation_size);
+      }
+      context.MapMemory(output_base, allocation_size);
+
+      const auto ReadTableEntry = [&](uint64_t address) {
+        auto readback =
+            CreateHostBuffer(name, sizeof(uint64_t),
+                             vk::BufferUsageFlagBits::eTransferDst, {0, 0});
+        auto &table = *cache.GetBdaPageTableBuffer();
+        scheduler.Current().EndRendering();
+        const auto command = scheduler.Current().Handle();
+        vk::BufferMemoryBarrier before{};
+        before.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+        before.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+        before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        before.buffer = table.Handle();
+        before.offset = BufferCache::PageIndex(address) * sizeof(uint64_t);
+        before.size = sizeof(uint64_t);
+        command.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+                                vk::PipelineStageFlagBits::eTransfer, {}, 0,
+                                nullptr, 1, &before, 0, nullptr);
+        const vk::BufferCopy copy{before.offset, 0, sizeof(uint64_t)};
+        command.copyBuffer(table.Handle(), readback.buffer, 1, &copy);
+        vk::BufferMemoryBarrier after{};
+        after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+        after.dstAccessMask = vk::AccessFlagBits::eHostRead;
+        after.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        after.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        after.buffer = readback.buffer;
+        after.size = sizeof(uint64_t);
+        command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                                vk::PipelineStageFlagBits::eHost, {}, 0,
+                                nullptr, 1, &after, 0, nullptr);
+        scheduler.Finish();
+        const auto words = ReadBuffer(name, readback, 2);
+        DestroyBuffer(&readback);
+        return uint64_t{words[0]} | (uint64_t{words[1]} << 32u);
+      };
+      const auto SetOutputDescriptor = [&](uint64_t address) {
+        ShaderBufferResource descriptor{};
+        descriptor.UpdateAddress48(address);
+        descriptor.fields[1] |= 4u << 16u;
+        descriptor.fields[2] = 1;
+        descriptor.fields[3] =
+            DstSel(4, 5, 6, 7) |
+            (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u);
+        for (u32 index = 0; index < 4; ++index) {
+          shaders.SetCsUserSgpr(index, descriptor.fields[index],
+                                HW::UserSgprType::Unknown);
+        }
+      };
+      const auto SetTargetAddress = [&](uint64_t address) {
+        shaders.SetCsUserSgpr(8, static_cast<u32>(address),
+                              HW::UserSgprType::Unknown);
+        shaders.SetCsUserSgpr(9, static_cast<u32>(address >> 32u),
+                              HW::UserSgprType::Unknown);
+        shaders.SetCsUserSgpr(10, 0, HW::UserSgprType::Unknown);
+      };
+      const auto SnapshotFaultWord = [&](uint64_t address, Buffer &readback) {
+        auto &fault = *cache.GetFaultBuffer();
+        const auto word = BufferCache::PageIndex(address) / 32u;
+        scheduler.Current().EndRendering();
+        const auto command = scheduler.Current().Handle();
+        vk::BufferMemoryBarrier before{};
+        before.srcAccessMask = vk::AccessFlagBits::eShaderWrite;
+        before.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+        before.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        before.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        before.buffer = fault.Handle();
+        before.offset = word * sizeof(uint32_t);
+        before.size = sizeof(uint32_t);
+        command.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
+                                vk::PipelineStageFlagBits::eTransfer, {}, 0,
+                                nullptr, 1, &before, 0, nullptr);
+        const vk::BufferCopy copy{before.offset, 0, sizeof(uint32_t)};
+        command.copyBuffer(fault.Handle(), readback.buffer, 1, &copy);
+        vk::BufferMemoryBarrier after{};
+        after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+        after.dstAccessMask = vk::AccessFlagBits::eHostRead;
+        after.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        after.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        after.buffer = readback.buffer;
+        after.size = sizeof(uint32_t);
+        command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                                vk::PipelineStageFlagBits::eHost, {}, 0,
+                                nullptr, 1, &after, 0, nullptr);
+      };
+
+      // Use the real register/unregister lifecycle to establish a deterministic
+      // zero entry without relying on the still-separate page-table
+      // initialization change (#1065).
+      for (const auto &region : regions) {
+        (void)cache.FindBuffer(region.base + target_offset, sizeof(uint32_t));
+      }
+      BufferCacheTestAccess::SetGarbageCollectionThresholds(cache, 0, 0);
+      for (uint32_t tick = 0; tick < 100; ++tick) {
+        cache.RunGarbageCollector();
+      }
+      scheduler.Finish();
+      BufferCacheTestAccess::SetGarbageCollectionThresholds(
+          cache, std::numeric_limits<uint64_t>::max(),
+          std::numeric_limits<uint64_t>::max());
+
+      shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(code.data()),
+                           .num_thread_x = 1,
+                           .num_thread_y = 1,
+                           .num_thread_z = 1,
+                           .wave_size = 64,
+                           .user_sgpr = 11});
+      for (const auto &region : regions) {
+        const auto target = region.base + target_offset;
+        const auto output = region.output;
+        Require(region.label, "unresolved precondition",
+                !BufferCacheTestAccess::PageOwner(cache, target) &&
+                    !cache.IsRegionRegistered(target, sizeof(uint32_t)) &&
+                    ReadTableEntry(target) == 0,
+                "target page was already cached or its BDA entry was not zero");
+
+        SetOutputDescriptor(output);
+        SetTargetAddress(target);
+        auto first_fault = CreateHostBuffer(
+            name, sizeof(uint32_t), vk::BufferUsageFlagBits::eTransferDst, {0});
+        processor.DispatchDirect(1, 1, 1, 0x41u);
+        SnapshotFaultWord(target, first_fault);
+        context.RunGarbageCollector();
+        scheduler.Finish();
+
+        const auto page = BufferCache::PageIndex(target);
+        const auto fault_bit = 1u << (page & 31u);
+        const auto observed_fault = ReadBuffer(name, first_fault, 1);
+        std::printf("[gpu]     %-32s %-9s fault 0x%08x expected 0x%08x\n", name,
+                    region.label, observed_fault[0], fault_bit);
+        Require(
+            region.label, "real shader fault",
+            observed_fault == std::vector<u32>{fault_bit},
+            "the first shader access did not record exactly the target page");
+        DestroyBuffer(&first_fault);
+        cache.ReadMemory(output, sizeof(uint32_t));
+        uint32_t first_value = output_sentinel;
+        Require(
+            region.label, "first miss result",
+            LibKernel::Memory::TryReadBacking(output, &first_value,
+                                              sizeof(first_value)) &&
+                first_value == 0,
+            "an unresolved BDA load did not produce the defined zero value");
+
+        const auto owner = BufferCacheTestAccess::PageOwner(cache, target);
+        Require(region.label, "fault resolution",
+                owner && cache.IsRegionRegistered(target, sizeof(uint32_t)),
+                "FaultManager did not create and cache the faulted guest page");
+        const auto &buffer = cache.GetBuffer(owner);
+        const auto page_address =
+            target & ~(BufferCache::CACHING_PAGESIZE - 1u);
+        const auto expected_entry =
+            buffer.BufferDeviceAddress() + page_address - buffer.CpuAddress();
+        Require(region.label, "page-table publication",
+                ReadTableEntry(target) == expected_entry,
+                "ChangeRegister did not publish the resolved buffer address");
+
+        auto retry_fault = CreateHostBuffer(
+            name, sizeof(uint32_t), vk::BufferUsageFlagBits::eTransferDst, {0});
+        processor.DispatchDirect(1, 1, 1, 0x41u);
+        SnapshotFaultWord(target, retry_fault);
+        context.RunGarbageCollector();
+        scheduler.Finish();
+        Require(region.label, "retry has no fault",
+                ReadBuffer(name, retry_fault, 1) == std::vector<u32>{0},
+                "the subsequent dispatch faulted after page-table publication");
+        DestroyBuffer(&retry_fault);
+        cache.ReadMemory(output, sizeof(uint32_t));
+        uint32_t retry_value = 0;
+        Require(region.label, "exact retry value",
+                LibKernel::Memory::TryReadBacking(output, &retry_value,
+                                                  sizeof(retry_value)) &&
+                    retry_value == region.expected,
+                "the subsequent dispatch did not load the exact guest value");
+        std::printf("[gpu]     %-32s %-9s ok\n", name, region.label);
+      }
+
+      for (const auto &region : regions) {
+        context.UnmapMemory(region.base, allocation_size);
+      }
+      context.UnmapMemory(output_base, allocation_size);
+      scheduler.Finish();
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    for (const auto &region : regions) {
+      Require(region.label, "unmap",
+              Libs::LibKernel::Memory::KernelMunmap(region.base,
+                                                    allocation_size) == 0,
+              "BDA fault backing mapping could not be released");
+      Require(region.label, "release allocation",
+              Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                  region.direct, allocation_size) == 0,
+              "BDA fault backing allocation could not be released");
+    }
+    Require(name, "output unmap",
+            Libs::LibKernel::Memory::KernelMunmap(output_base,
+                                                  allocation_size) == 0,
+            "BDA fault output mapping could not be released");
+    Require(name, "output release allocation",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                output_direct, allocation_size) == 0,
+            "BDA fault output allocation could not be released");
+  }
+
   void CheckComputeMetaClearClassification() {
     constexpr const char *name = "ComputeMetaClearClassification";
     constexpr uint64_t read_only_meta = 0x0000000204201f00ull;
@@ -40714,6 +41012,11 @@ int main(int argc, char **argv) {
     vulkan.CheckBufferCacheDirtyGarbageCollection();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--bda-fault-retry-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckBdaFaultResolutionRetry();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--sampler-border-only") == 0) {
     CheckImageSamplerSpecialization();
     VulkanHarness vulkan;
@@ -40902,6 +41205,7 @@ int main(int argc, char **argv) {
   vulkan.CheckDescriptorHeapLargeSet();
   vulkan.CheckGpuMappedRangeLifecycle();
   vulkan.CheckStreamBufferRing();
+  vulkan.CheckBdaFaultResolutionRetry();
   vulkan.CheckGpuTilerCpuParity();
   vulkan.CheckNativeIndirectDispatch();
   CheckComputeLdsLimit(vulkan);

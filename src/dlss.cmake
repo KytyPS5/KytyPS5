@@ -1,14 +1,14 @@
-# The proprietary NVIDIA SDK stays outside the source tree. No network fetch is
-# performed implicitly; see docs/dlss.md for the tested SDK revision.
+# The NVIDIA DLSS SDK is pinned by the 3rdparty/DLSS Git submodule. CMake does
+# not fetch dependencies; see docs/dlss.md for initialization and license terms.
 option(KYTY_ENABLE_DLSS "Enable NVIDIA DLSS Super Resolution (NGX Vulkan)" OFF)
-set(KYTY_DLSS_SDK_ROOT "${KYTY_THIRD_PARTY_DIR}/DLSS" CACHE PATH "NVIDIA/DLSS SDK checkout")
+set(KYTY_DLSS_SDK_ROOT "${KYTY_THIRD_PARTY_DIR}/DLSS" CACHE PATH "NVIDIA/DLSS SDK submodule or custom checkout")
 option(KYTY_ENABLE_DLSS_FG "Enable NVIDIA DLSS Frame Generation (Streamline Vulkan)" OFF)
 set(KYTY_STREAMLINE_SDK_ROOT "${KYTY_THIRD_PARTY_DIR}/Streamline" CACHE PATH "Extracted Streamline SDK release")
 
 add_library(kyty_dlss_sdk INTERFACE)
 if(KYTY_ENABLE_DLSS)
 	if(NOT EXISTS "${KYTY_DLSS_SDK_ROOT}/include/nvsdk_ngx_helpers_vk.h")
-		message(FATAL_ERROR "DLSS SDK not found. Set KYTY_DLSS_SDK_ROOT to a NVIDIA/DLSS checkout; see docs/dlss.md")
+		message(FATAL_ERROR "DLSS SDK not found. Run git submodule update --init --recursive 3rdparty/DLSS, or set KYTY_DLSS_SDK_ROOT to a custom checkout; see docs/dlss.md")
 	endif()
 	if(WIN32 AND KYTY_CLANG_CL)
 		set(ngx_dir "${KYTY_DLSS_SDK_ROOT}/lib/Windows_x86_64")

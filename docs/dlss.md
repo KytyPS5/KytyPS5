@@ -87,20 +87,25 @@ is affecting gameplay.
 
 ## Build
 
-Obtain the official [NVIDIA/DLSS SDK](https://github.com/NVIDIA/DLSS). The tested
-revision is `374959484e79a640feaba44c93ac8cfb0a03f5b5`.
+The official [NVIDIA/DLSS SDK](https://github.com/NVIDIA/DLSS) is included as the
+`3rdparty/DLSS` Git submodule, pinned to the tested revision
+`374959484e79a640feaba44c93ac8cfb0a03f5b5`. A recursive clone of this repository
+initializes it with the other dependencies. For an existing checkout:
 
 ```powershell
-git clone https://github.com/NVIDIA/DLSS.git _Build/dlss-sdk
-git -C _Build/dlss-sdk checkout 374959484e79a640feaba44c93ac8cfb0a03f5b5
-cmake -S . -B _Build/windows -DKYTY_ENABLE_DLSS=ON -DKYTY_DLSS_SDK_ROOT="$PWD/_Build/dlss-sdk"
+git submodule update --init --recursive 3rdparty/DLSS
+cmake -S . -B _Build/windows -DKYTY_ENABLE_DLSS=ON
 cmake --build _Build/windows --target launcher
 cmake --install _Build/windows --prefix _Build/windows/install
 ```
 
 Use the existing clang-cl / Visual Studio developer environment and Qt build
 configuration described in the README. Linux x86_64 also supports the SDK;
-substitute your Linux build directory. Unsupported platforms can build with
+substitute your Linux build directory. CMake defaults to `3rdparty/DLSS`; an
+optional `KYTY_DLSS_SDK_ROOT` override can point to a custom SDK checkout. If an
+existing build caches the old `_Build/dlss-sdk` path, clear it once with
+`cmake -S . -B _Build/windows -U KYTY_DLSS_SDK_ROOT -DKYTY_ENABLE_DLSS=ON`.
+Unsupported platforms can build with
 `KYTY_ENABLE_DLSS=OFF` (default). Without the SDK, the launcher disables the DLSS
 selector and the engine logs a fallback if DLSS is requested on the CLI.
 
@@ -113,17 +118,18 @@ the actual executable layout.
 
 The build copies the **release** Super Resolution runtime next to the engine,
 launcher and GPU test, together with NVIDIA's license. Installation includes
-both the runtime and license. The proprietary SDK is an external dependency,
-not downloaded implicitly or covered by Kyty's license. Its distribution terms
-are in the SDK's `LICENSE.txt`. This software contains source code provided by
-NVIDIA Corporation.
+both the runtime and license. The SDK is initialized by Git's submodule commands;
+CMake does not download it. It is not covered by Kyty's license. Its distribution
+terms are in `3rdparty/DLSS/LICENSE.txt`. This software contains source code
+provided by NVIDIA Corporation.
 
 ## Frame Generation
 
 Enable the independent Windows clang-cl backend with an extracted official
 [Streamline SDK release](https://github.com/NVIDIA-RTX/Streamline/releases/tag/v2.14.1).
 The current build uses matching v2.14.1 headers and production DLLs, on an NVIDIA
-RTX 4090 Laptop GPU. No SDK files are fetched automatically or committed.
+RTX 4090 Laptop GPU. The Streamline release remains a separate dependency;
+its SDK files are not fetched automatically or committed.
 
 ```powershell
 cmake -S . -B _Build/windows -DKYTY_ENABLE_DLSS_FG=ON -DKYTY_STREAMLINE_SDK_ROOT="$PWD/_Build/streamline-release"

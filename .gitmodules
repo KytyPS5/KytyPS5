@@ -42,3 +42,7 @@
 [submodule "3rdparty/imgui"]
 	path = 3rdparty/imgui
 	url = https://github.com/ocornut/imgui.git
+[submodule "3rdparty/DLSS"]
+	path = 3rdparty/DLSS
+	url = https://github.com/NVIDIA/DLSS.git
+	shallow = true

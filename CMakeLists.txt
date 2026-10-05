@@ -681,6 +681,9 @@ if(BUILD_TESTING)
 	add_test(NAME shader_indirect_ushort_load
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --indirect-ushort-only)
 	set_tests_properties(shader_indirect_ushort_load PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE)
+	add_test(NAME shader_workgroup_srt_large_dispatch
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --workgroup-srt-large-dispatch-only)
+	set_tests_properties(shader_workgroup_srt_large_dispatch PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE)
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
 	add_test(NAME shader_recompiler_alignbyte
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --alignbyte-only)

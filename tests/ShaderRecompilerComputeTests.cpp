@@ -36171,6 +36171,51 @@ TestCase Wave64CooperativeBufferProducerConsumer() {
 }
 
 
+// A U32 workgroup-axis domain exceeds descriptor-selector widths. Every group
+// reads a distinct immutable coefficient and writes one independently checked word.
+TestCase WorkgroupSrtLargeDispatchCoefficients() {
+  using O = ShaderOpcode;
+  constexpr u32 groups = 65537u;
+  constexpr u32 coefficients = groups + 16u;
+  constexpr u32 sentinel = 0xa5a5a5a5u;
+  TestCase test;
+  test.name = "WorkgroupSrtLargeDispatchCoefficients";
+  test.initial.assign(coefficients + groups, sentinel);
+  for (u32 group = 0u; group < groups; ++group)
+    test.initial[coefficients + group] = 0x64000000u ^ (group * 17u);
+  test.expected = test.initial;
+  for (u32 group = 0u; group < groups; ++group)
+    test.expected[group + 1u] = 0x64000000u ^ (group * 17u);
+  test.has_compute_info = true;
+  test.compute_info.threads_num[0] = 1u;
+  test.compute_info.threads_num[1] = 1u;
+  test.compute_info.threads_num[2] = 1u;
+  test.compute_info.group_id[0] = true;
+  test.compute_info.workgroup_register = 4u;
+  test.dispatch_x = groups;
+  test.has_user_data = true;
+  test.user_data[8] = coefficients * sizeof(u32);
+  test.user_data[50] = (groups + 2u) * sizeof(u32); // Exclude the immutable coefficient table.
+  test.user_data[51] = 3u << 28u;
+  test.buffer_addresses_are_backing_offsets = true;
+  test.required_spirv = {"\"flattened_srt\""};
+  test.ir_counts = {{"ReadBoundedSrtU32", 1u}};
+  test.forbidden_spirv = {"OpConvertUToPtr"};
+  auto& code = test.code;
+  code.push_back(EncodeSop2(0x1eu, 6u, 4u, InlineU32(2u)));
+  code.push_back(EncodeSmem0(0x00u, 7u, 4u));
+  code.push_back(EncodeSmem1(0u, 6u));
+  code.push_back(EncodeSopp(0x0cu, 0u));
+  code.push_back(EncodeVop1(0x01u, 0u, 7u));
+  code.push_back(EncodeVop1(0x01u, 1u, 6u));
+  code.push_back(EncodeVop2(0x25u, 1u, InlineU32(4u), 1u));
+  AppendBufferStoreDword(&code, 0u, 1u);
+  AppendEnd(&code);
+  test.opcodes = {O::S_LSHL_B32, O::S_LOAD_DWORD, O::S_WAITCNT, O::V_MOV_B32,
+                  O::V_ADD_NC_U32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
 // Two workgroup-dependent scalar coefficient blocks remain guest runtime reads.
 // Public synthetic values, no captured instruction stream or guest addresses.
 TestCase Wave64CooperativeBdaCoefficientsByWorkgroup() {
@@ -48195,6 +48240,11 @@ int main(int argc, char **argv) {
 #endif
   if (argc == 2 && std::strcmp(argv[1], "--f64-admission-positive-only") == 0) {
     CheckF64AdmissionPositive();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--workgroup-srt-large-dispatch-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, WorkgroupSrtLargeDispatchCoefficients());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--cooperative-bda-coefficients-only") == 0) {

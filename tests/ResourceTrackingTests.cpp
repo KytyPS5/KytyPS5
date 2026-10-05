@@ -8095,6 +8095,99 @@ SrtRuntime WorkgroupSnapshotRuntime(BoundedSnapshotReader& reader, std::span<con
   return runtime;
 }
 
+struct DispatchCoefficientReader {
+  static constexpr uint64_t base = 0x200000u;
+  uint32_t count = 0u;
+  uint32_t reads = 0u;
+  uint64_t fail_address = UINT64_MAX;
+  static uint32_t Expected(uint32_t index) { return 0x64000000u ^ (index * 17u); }
+  static bool Clean(void* userdata, uint64_t address, std::span<uint32_t> result) {
+    auto& self = *static_cast<DispatchCoefficientReader*>(userdata);
+    ++self.reads;
+    if (result.size() != 1u || address < base || (address - base) % 4u != 0u ||
+        (address - base) / 4u >= self.count || address == self.fail_address) return false;
+    result[0] = Expected(static_cast<uint32_t>((address - base) / 4u));
+    return true;
+  }
+};
+
+void TestWorkgroupSrtLargeDispatch() {
+  Fixture fixture;
+  InitializeWorkgroupSnapshot(fixture, {0u});
+  const auto plan = ExtractResourcePlan(fixture.program);
+  DispatchCoefficientReader reader{.count = 65537u};
+  const std::array<uint32_t, 2> data{static_cast<uint32_t>(DispatchCoefficientReader::base), 0u};
+  SrtRuntime runtime{.user_data = data, .userdata = &reader,
+                     .read_specialization_memory = DispatchCoefficientReader::Clean,
+                     .compute_workgroups = std::array<uint32_t, 3>{65537u, 1u, 1u}};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization),
+        "32-bit workgroup coefficient domain was incorrectly limited to 65536 rows");
+  Check(snapshot.flattened_srt.size() == 131072u && reader.reads == 65537u &&
+            specialization.bounded_srt_reads == std::vector<BoundedSrtLayout>{{131072u, 0u}} &&
+            snapshot.immutable_srt_ranges ==
+                std::vector<ResourceReadRange>{{DispatchCoefficientReader::base, 65537u * 4u}},
+        "large dispatch lost its bounded layout, exact source domain or clean footprint");
+  for (uint32_t index = 0u; index < snapshot.flattened_srt.size(); ++index)
+    Check(snapshot.flattened_srt[index] ==
+              (index < reader.count ? DispatchCoefficientReader::Expected(index) : 0u),
+          "large dispatch coefficient or unused padding word differs from the independent oracle");
+  const auto first_tier = specialization;
+  for (const uint32_t count : {100000u, 131072u}) {
+    reader.count = count; reader.reads = 0u;
+    runtime.compute_workgroups = std::array<uint32_t, 3>{count, 1u, 1u};
+    Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+              specialization == first_tier && reader.reads == count &&
+              snapshot.flattened_srt[count - 1u] == DispatchCoefficientReader::Expected(count - 1u),
+          "nearby large grids split a capacity tier or lost their last real coefficient");
+  }
+  reader.count = 131073u; reader.reads = 0u;
+  runtime.compute_workgroups = std::array<uint32_t, 3>{reader.count, 1u, 1u};
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
+            specialization.bounded_srt_reads == std::vector<BoundedSrtLayout>{{262144u, 0u}} &&
+            snapshot.flattened_srt[reader.count - 1u] == DispatchCoefficientReader::Expected(reader.count - 1u) &&
+            snapshot.flattened_srt[reader.count] == 0u,
+        "large grid tier transition truncated the U32 coefficient domain");
+  const auto saved_snapshot = snapshot;
+  const auto saved_specialization = specialization;
+  reader.reads = 0u;
+  runtime.compute_workgroups = std::array<uint32_t, 3>{16u * 1024u * 1024u + 1u, 1u, 1u};
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization) && reader.reads == 0u,
+        "over-budget workgroup domain read memory before rejecting its storage footprint");
+  CheckBoundedTransaction(snapshot, saved_snapshot, specialization, saved_specialization);
+  runtime.compute_workgroups = std::array<uint32_t, 3>{65537u, 1u, 1u};
+  reader.fail_address = DispatchCoefficientReader::base + 65536u * 4u;
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization),
+        "unreadable last large-grid coefficient committed a partial snapshot");
+  CheckBoundedTransaction(snapshot, saved_snapshot, specialization, saved_specialization);
+  reader.fail_address = UINT64_MAX; reader.reads = 0u;
+  runtime.user_data = {};
+  runtime.compute_workgroups = std::array<uint32_t, 3>{UINT32_MAX, 0u, 1u};
+  Check(MaterializeResources(plan, runtime, snapshot, specialization) && reader.reads == 0u &&
+            snapshot.immutable_srt_ranges.empty() && snapshot.flattened_srt.size() == 65536u,
+        "empty dispatch reserved or read an unreachable large axis");
+
+  Fixture columns;
+  InitializeWorkgroupSnapshot(columns, {0u, 1u, 2u});
+  reader.count = 22002u; reader.reads = 0u;
+  runtime.user_data = data;
+  runtime.compute_workgroups = std::array<uint32_t, 3>{22000u, 22001u, 22002u};
+  constexpr uint32_t capacity = (65536u / 3u) * 2u;
+  Check(MaterializeResources(ExtractResourcePlan(columns.program), runtime, snapshot, specialization) &&
+            snapshot.flattened_srt.size() == 3u * capacity && reader.reads == reader.count,
+        "large multi-axis snapshot lost shared coherent reads or equal bounded column storage");
+  for (uint32_t column = 0u; column < 3u; ++column) {
+    Check(specialization.bounded_srt_reads[column] == BoundedSrtLayout{capacity, column * capacity},
+          "multi-axis capacity tier has an incorrect offset or extent");
+    const uint32_t count = (*runtime.compute_workgroups)[column];
+    for (uint32_t index = 0u; index < capacity; ++index)
+      Check(snapshot.flattened_srt[column * capacity + index] ==
+                (index < count ? DispatchCoefficientReader::Expected(index) : 0u),
+            "multi-axis tier contains the wrong coefficient or stale padding");
+  }
+}
+
 void TestWorkgroupSrtMaterializationAndSpecialization() {
   Fixture fixture;
   InitializeWorkgroupSnapshot(fixture, {0u,1u,2u});
@@ -8207,8 +8300,13 @@ void TestWorkgroupSrtZeroDispatchAndProbeLimit() {
         "exact combined workgroup snapshot probe budget was rejected");
   const auto old_snapshot = snapshot;
   const auto old_specialization = specialization;
-  Check(!MaterializeResources(plan,WorkgroupSnapshotRuntime(reader,data,{32769u,32768u,1u}),snapshot,specialization),
-        "workgroup columns exceeded the combined 65536-probe budget");
+  Check(MaterializeResources(plan,WorkgroupSnapshotRuntime(reader,data,{32769u,32768u,1u}),snapshot,specialization) &&
+            specialization.bounded_srt_reads ==
+                std::vector<BoundedSrtLayout>{{65536u, 0u}, {65536u, 65536u}},
+        "dispatch axes remained artificially restricted by the descriptor-selector budget");
+  snapshot = old_snapshot; specialization = old_specialization;
+  Check(!MaterializeResources(plan,WorkgroupSnapshotRuntime(reader,data,{8388609u,1u,1u}),snapshot,specialization),
+        "workgroup columns exceeded the existing combined snapshot storage budget");
   CheckBoundedTransaction(snapshot,old_snapshot,specialization,old_specialization);
 }
 
@@ -8655,6 +8753,10 @@ int main(int argc, char** argv) {
       std::cout << "KYTY_FINITE_SELECTOR_ACTIVE_PROOF_PASS\n";
       return 0;
     }
+    if (argc == 2 && std::strcmp(argv[1], "--workgroup-srt-large-dispatch-only") == 0) {
+      TestWorkgroupSrtLargeDispatch();
+      return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--workgroup-srt-proof-only") == 0) {
       TestWorkgroupSrtTrackingProof();
       TestWorkgroupSrtRootExecutionProof();
@@ -8765,6 +8867,7 @@ int main(int argc, char** argv) {
     Run("finite selector native EXEC guard", TestFiniteSelectorNativeExecGuard);
     Run("workgroup SRT proof", TestWorkgroupSrtTrackingProof);
     Run("workgroup SRT root execution", TestWorkgroupSrtRootExecutionProof);
+    Run("workgroup SRT large dispatch", TestWorkgroupSrtLargeDispatch);
     Run("workgroup SRT materialization", TestWorkgroupSrtMaterializationAndSpecialization);
     Run("workgroup SRT zero dispatch and limits", TestWorkgroupSrtZeroDispatchAndProbeLimit);
     Run("workgroup SRT offsets and aliases", TestWorkgroupSrtWrappedOffsetsAndWriteAliases);

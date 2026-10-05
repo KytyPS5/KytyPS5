@@ -823,23 +823,41 @@ bool MaterializeBoundedReads(const ResourcePlan& program, const SrtRuntime& runt
 
 	// Workgroup-axis coefficient tables are indexed by WorkgroupId, so the live
 	// index domain is whatever the current dispatch launches. Baking that count into
-	// ResourceSpecialization forced a new SPIR-V / CreatePipeline per grid size
-	// (Yōtei CS 54904: 4× ~270s GPUAV compiles). Reserve a stable equal share of the
-	// combined probe budget per workgroup-axis column so layout.count / flat_offset
-	// stay pipeline-identity stable while the snapshot still stores only the live
-	// words for this dispatch.
+	// ResourceSpecialization forced a new SPIR-V / CreatePipeline per grid size.
+	// Reserve equal shares in size tiers so nearby dispatch sizes retain the same
+	// pipeline identity. WorkgroupId is a dispatch-bounded U32, not a 16-bit table
+	// selector: larger grids may grow the reserve within the existing storage cap.
 	uint32_t workgroup_columns = 0;
+	uint32_t workgroup_required = 0;
 	for (const auto& read: program.bounded_srt_reads) {
 		if (read.workgroup_axis != UINT32_MAX) {
 			++workgroup_columns;
+			if (read.workgroup_axis >= 3u || read.count_source != UINT32_MAX ||
+			    !runtime.compute_workgroups.has_value()) {
+				return SpecializationFail("workgroup bounded SRT requires actual guest counts and a valid axis");
+			}
+			const auto& groups = *runtime.compute_workgroups;
+			if (std::ranges::all_of(groups, [](uint32_t count) { return count != 0u; })) {
+				workgroup_required = std::max(workgroup_required, groups[read.workgroup_axis]);
+			}
 		}
 	}
-	const uint32_t workgroup_reserve =
+	uint32_t workgroup_reserve =
 	    workgroup_columns == 0
 	        ? 0u
 	        : static_cast<uint32_t>(MaxIndirectImageProbes / workgroup_columns);
 	if (workgroup_columns != 0 && workgroup_reserve == 0u) {
 		return SpecializationFail("workgroup bounded SRT columns exceed the combined probe budget");
+	}
+	if (workgroup_columns != 0) {
+		const uint64_t capacity = MaxBoundedSnapshotWords / workgroup_columns;
+		if (workgroup_required > capacity) {
+			return SpecializationFail("workgroup bounded SRT dispatch exceeds snapshot storage budget");
+		}
+		while (workgroup_reserve < workgroup_required) {
+			workgroup_reserve = static_cast<uint32_t>(
+			    std::min(uint64_t{workgroup_reserve} * 2u, capacity));
+		}
 	}
 
 	auto& flat = snapshot.resources.flattened_srt;
@@ -894,7 +912,7 @@ bool MaterializeBoundedReads(const ResourcePlan& program, const SrtRuntime& runt
 			const auto raw_count = count.dwords[0];
 			size = read.count_signed && static_cast<int32_t>(raw_count) <= 0 ? 0u : raw_count;
 		}
-		if (size > MaxIndirectImageProbes ||
+		if ((!workgroup_column && size > MaxIndirectImageProbes) ||
 		    (!workgroup_column && flat.size() > MaxBoundedSnapshotWords - uint64_t{size})) {
 			return SpecializationFail(fmt::format(
 			    "bounded SRT read {} exceeds candidate/storage limits (count={} stored_words={} word_limit={})",

@@ -1200,9 +1200,7 @@ void EmitProgram(EmitterState& state) {
 	DefineFPMadFunction(state);
 	for (const auto* block: program.blocks) {
 		if (std::ranges::any_of(*block, [](const IR::Inst& inst) {
-			    return inst.GetOpcode() == IR::ValueOpcode::SwizzleU32 ||
-			           inst.GetOpcode() == IR::ValueOpcode::SharedAtomicFMin32 ||
-			           inst.GetOpcode() == IR::ValueOpcode::SharedAtomicFMax32;
+			    return inst.GetOpcode() == IR::ValueOpcode::SwizzleU32;
 		    })) {
 			ctx.scratch_u32_variable = state.builder.AllocateId();
 			if (state.lane_count == 2) {

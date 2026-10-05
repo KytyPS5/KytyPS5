@@ -1516,48 +1516,17 @@ void EmitSharedFloatAtomic(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto access = PrepareMemoryElement(ctx, mem, DwordIndex(ctx, inst, mem));
 		EmitIfCondition(
 		    ctx.state, EmitMemoryElementInBounds(ctx.state, access.resource, access.index), [&]() {
-			    ctx.state.builder.AddFunction(spv::OpStore, ctx.scratch_u32_variable,
-			                                  ctx.Arg(inst, 1));
-			    const auto data = ctx.state.builder.AllocateId();
-			    ctx.state.builder.AddFunction(spv::OpLoad, TypeU32(ctx.state), data,
-			                                  ctx.scratch_u32_variable);
+			    const auto data = ctx.Arg(inst, 1);
+			    const auto replacement = [&](uint32_t old) {
+				    return EmitFloatAtomicReplacement(ctx.state, old, data, max_value);
+			    };
 			    if (UsesPackedLds64(ctx.state, access.resource)) {
 				    AtomicUpdatePackedLdsWord(ctx.state, access.resource.object_pointer,
-				                              access.index, [&](uint32_t old) {
-					        const auto old_f =
-					            Unary(ctx.state, spv::OpBitcast, TypeF32(ctx.state), old);
-					        const auto compare_f =
-					            Unary(ctx.state, spv::OpBitcast, TypeF32(ctx.state), ctx.Arg(inst, 2));
-					        const auto data_f =
-					            Unary(ctx.state, spv::OpBitcast, TypeF32(ctx.state), data);
-					        const auto compare = Binary(
-					            ctx.state,
-					            max_value ? spv::OpFOrdGreaterThan : spv::OpFOrdLessThan,
-					            TypeBool(ctx.state), max_value ? old_f : compare_f,
-					            max_value ? compare_f : old_f);
-					        return Unary(ctx.state, spv::OpBitcast, TypeU32(ctx.state),
-					                     Select(ctx.state, TypeF32(ctx.state), compare, data_f,
-					                            old_f));
-				        });
+				                              access.index, replacement);
 			    } else {
 				    AtomicUpdate(
 				        ctx.state, EmitMemoryElementPointer(ctx.state, access.resource, access.index),
-				        mem.kind, [&](uint32_t old) {
-					        const auto old_f =
-					            Unary(ctx.state, spv::OpBitcast, TypeF32(ctx.state), old);
-					        const auto compare_f =
-					            Unary(ctx.state, spv::OpBitcast, TypeF32(ctx.state), ctx.Arg(inst, 2));
-					        const auto data_f =
-					            Unary(ctx.state, spv::OpBitcast, TypeF32(ctx.state), data);
-					        const auto compare = Binary(
-					            ctx.state,
-					            max_value ? spv::OpFOrdGreaterThan : spv::OpFOrdLessThan,
-					            TypeBool(ctx.state), max_value ? old_f : compare_f,
-					            max_value ? compare_f : old_f);
-					        return Unary(ctx.state, spv::OpBitcast, TypeU32(ctx.state),
-					                     Select(ctx.state, TypeF32(ctx.state), compare, data_f,
-					                            old_f));
-				        });
+				        mem.kind, replacement);
 			    }
 		    });
 	});

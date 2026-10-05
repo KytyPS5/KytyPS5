@@ -34753,7 +34753,127 @@ TestCase DsMiscVariants() {
   return test;
 }
 
-TestCase DsFloatMinMaxUsesSeparateCompareOperand() {
+// AMD machine-readable RDNA2 DS_MIN/MAX_F32: ADDR + DATA0, no DATA1 operand.
+// Finite exact values only; NaN/denormal/signed-zero guest rules need separate proof.
+TestCase DsFloatMinMaxFiniteIgnoresUnusedData1(bool alternate_unused) {
+  using O = ShaderOpcode;
+  struct Cell { u32 opcode, old_bits, data_bits, unused_bits, expected_bits; };
+  constexpr Cell cells[] = {
+      {0x12,0x40800000u,0x40000000u,0x41100000u,0x40000000u}, // min(4,2)=2
+      {0x13,0x40800000u,0x40400000u,0x3f800000u,0x40800000u}, // max(4,3)=4
+      {0x12,0xc0000000u,0xc1100000u,0x41a00000u,0xc1100000u}, // min(-2,-9)=-9
+      {0x13,0xc0000000u,0xbf800000u,0xc1a00000u,0xbf800000u}, // max(-2,-1)=-1
+      {0x12,0x3f800000u,0xc0000000u,0x41a00000u,0xc0000000u}, // min(1,-2)=-2
+      {0x13,0xc0000000u,0x3f800000u,0xc1a00000u,0x3f800000u}, // max(-2,1)=1
+  };
+  TestCase test;
+  test.name = alternate_unused ? "DsMinMaxFiniteUnusedData1Alternate" : "DsMinMaxFiniteUnusedData1";
+  test.initial.assign(std::size(cells),0xdeadbeefu);
+  AppendVMovU32(&test.code,1,0);
+  for (u32 i=0;i<std::size(cells);++i) {
+    const auto cell=cells[i];
+    AppendVMovLiteral(&test.code,2,cell.old_bits);
+    test.code.push_back(EncodeDs0(0x0d,i*4));
+    test.code.push_back(EncodeDs1(0,2,1));
+    test.code.push_back(EncodeSopp(0x0a, 0)); // Publish LDS before native atomic accesses.
+    AppendVMovLiteral(&test.code,3,cell.data_bits);
+    AppendVMovLiteral(&test.code,4,alternate_unused ? cell.old_bits : cell.unused_bits);
+    test.code.push_back(EncodeDs0(cell.opcode,i*4));
+    test.code.push_back(EncodeDs1Ex(0,4,3,1));
+    test.code.push_back(EncodeSopp(0x0a, 0)); // Complete atomics before ordinary LDS reads.
+    test.code.push_back(EncodeDs0(0x36,i*4));
+    test.code.push_back(EncodeDs1(5,0,1));
+    AppendStoreVgpr(&test.code,5,i);
+    test.expected.push_back(cell.expected_bits);
+  }
+  AppendEnd(&test.code);
+  test.opcodes={O::V_MOV_B32,O::S_BARRIER,O::DS_WRITE_B32,O::DS_MIN_F32,O::DS_MAX_F32,O::DS_READ_B32,O::BUFFER_STORE_DWORD,O::S_ENDPGM};
+  test.compute_info.threads_num[0]=1;
+  test.compute_info.threads_num[1]=1;
+  test.compute_info.threads_num[2]=1;
+  test.has_compute_info=true;
+  return test;
+}
+
+// Separate CPU decoder oracle: the AMD encoding has ADDR + DATA0 only.
+void CheckDsFloatMinMaxDecodedInputs() {
+  namespace D = ShaderRecompiler::Decoder;
+  for (const auto opcode : {0x12u, 0x13u}) {
+    const std::vector<u32> code = {EncodeDs0(opcode, 12), EncodeDs1Ex(0, 97, 4, 6)};
+    D::Instruction inst;
+    D::DecodeInstruction(code, 0, inst);
+    Require("DsFloatMinMaxDecodedInputs", "decoder",
+            inst.src_count == 2 && inst.src0.kind == D::OperandKind::Vgpr &&
+            inst.src0.reg == 6 && inst.src1.kind == D::OperandKind::Vgpr && inst.src1.reg == 4,
+            "DS_MIN/MAX_F32 consume ADDR and DATA0; DATA1 is unused");
+  }
+}
+
+// Finite GDS variant also preserves the independent neighboring word.
+TestCase DsFloatMinMaxFiniteGdsUnusedData1() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "DsFloatMinMaxFiniteGdsUnusedData1";
+  test.initial = {0xdeadbeefu};
+  test.expected = test.initial;
+  test.gds_initial = {0x40800000u, 0xc0000000u, 0x12345678u};
+  test.expected_gds = {0x40000000u, 0xbf800000u, 0x12345678u};
+  AppendVMovU32(&test.code, 1, 0);
+  AppendVMovLiteral(&test.code, 3, 0x40000000u);
+  AppendVMovLiteral(&test.code, 4, 0x41100000u);
+  test.code.push_back(EncodeDs0(0x12, 0, true));
+  test.code.push_back(EncodeDs1Ex(0, 4, 3, 1));
+  AppendVMovLiteral(&test.code, 3, 0xbf800000u);
+  AppendVMovLiteral(&test.code, 4, 0x41a00000u);
+  test.code.push_back(EncodeDs0(0x13, 4, true));
+  test.code.push_back(EncodeDs1Ex(0, 4, 3, 1));
+  AppendEnd(&test.code);
+  test.opcodes = {O::V_MOV_B32, O::DS_MIN_F32, O::DS_MAX_F32, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 1;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase DsFloatMinMaxFiniteInactiveExecPreservesLds() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "DsFloatMinMaxFiniteInactiveExecPreservesLds";
+  test.initial = {0xdeadbeefu, 0xcafef00du};
+  test.expected = {0x40800000u, 0x40800000u};
+  AppendVMovU32(&test.code, 1, 0);
+  AppendVMovLiteral(&test.code, 2, 0x40800000u);
+  AppendVMovLiteral(&test.code, 3, 0x40000000u);
+  AppendVMovLiteral(&test.code, 4, 0x41100000u);
+  for (u32 offset : {0u, 4u}) {
+    test.code.push_back(EncodeDs0(0x0d, offset));
+    test.code.push_back(EncodeDs1(0, 2, 1));
+  }
+  test.code.push_back(EncodeSopp(0x0a, 0));
+  test.code.push_back(EncodeSop1(0x04, 126, InlineU32(0)));
+  test.code.push_back(EncodeDs0(0x12, 0));
+  test.code.push_back(EncodeDs1Ex(0, 4, 3, 1));
+  test.code.push_back(EncodeDs0(0x13, 4));
+  test.code.push_back(EncodeDs1Ex(0, 3, 4, 1));
+  test.code.push_back(EncodeSop1(0x04, 126, 193u));
+  test.code.push_back(EncodeSopp(0x0a, 0));
+  for (u32 i = 0; i < 2; ++i) {
+    test.code.push_back(EncodeDs0(0x36, i * 4));
+    test.code.push_back(EncodeDs1(5, 0, 1));
+    AppendStoreVgpr(&test.code, 5, i);
+  }
+  AppendEnd(&test.code);
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B64, O::S_BARRIER, O::DS_WRITE_B32, O::DS_MIN_F32,
+                  O::DS_MAX_F32, O::DS_READ_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 1;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase DsFloatMinMaxIgnoresUnusedData1() {
   using O = ShaderOpcode;
 
   std::vector<u32> code;
@@ -34764,6 +34884,7 @@ TestCase DsFloatMinMaxUsesSeparateCompareOperand() {
   AppendVMovLiteral(&code, 3, 0x40800000u);
   code.push_back(EncodeDs0(0x0d, 4));
   code.push_back(EncodeDs1(0, 3, 1));
+  code.push_back(EncodeSopp(0x0a, 0));
   AppendVMovLiteral(&code, 4, 0x41100000u);
   AppendVMovLiteral(&code, 5, 0x40000000u);
   code.push_back(EncodeDs0(0x12, 0));
@@ -34772,6 +34893,7 @@ TestCase DsFloatMinMaxUsesSeparateCompareOperand() {
   AppendVMovLiteral(&code, 7, 0x40400000u);
   code.push_back(EncodeDs0(0x13, 4));
   code.push_back(EncodeDs1Ex(0, 7, 6, 1));
+  code.push_back(EncodeSopp(0x0a, 0));
   code.push_back(EncodeDs0(0x36, 0));
   code.push_back(EncodeDs1(8, 0, 1));
   code.push_back(EncodeDs0(0x36, 4));
@@ -34781,11 +34903,11 @@ TestCase DsFloatMinMaxUsesSeparateCompareOperand() {
   AppendEnd(&code);
 
   TestCase test;
-  test.name = "DsFloatMinMaxUsesSeparateCompareOperand";
+  test.name = "DsFloatMinMaxIgnoresUnusedData1";
   test.code = code;
   test.initial = std::vector<u32>(2, 0);
-  test.expected = {0x41100000u, 0x3f800000u};
-  test.opcodes = {O::V_MOV_B32,  O::DS_WRITE_B32, O::DS_MIN_F32,
+  test.expected = {0x40800000u, 0x40800000u}; // min(4,9)=4, max(4,1)=4; DATA1 unused.
+  test.opcodes = {O::V_MOV_B32, O::S_BARRIER, O::DS_WRITE_B32, O::DS_MIN_F32,
                   O::DS_MAX_F32, O::DS_READ_B32,  O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
   test.compute_info.threads_num[0] = 1;
@@ -35580,6 +35702,42 @@ TestCase Wave64MultiWaveCyclicGuestBarrier() {
 // barrier makes the final value observable only after every candidate has
 // completed, proving that cooperative wave64 keeps the existing compare/data
 // semantics while serialising the shared update correctly.
+// Positive normal floats are monotonically ordered by their IEEE-754 bits.
+// Every guest lane contributes a distinct candidate to each shared atomic.
+TestCase DsFloatMinMaxFiniteMultiwave(bool maximum) {
+  using O = ShaderOpcode;
+  constexpr u32 local_count = 256;
+  auto test = MakeMultiWaveLdsCase(maximum ? "DsMaxFiniteMultiwave" : "DsMinFiniteMultiwave", local_count, 1u, 1u);
+  auto& code = test.code;
+  AppendMultiWaveLdsIndices(&code, local_count);
+  code.push_back(EncodeVopc(0xc2, InlineU32(0), 6));
+  code.push_back(EncodeSop1(0x04, 126, 106));
+  AppendVMovU32(&code, 10, 0);
+  AppendVMovLiteral(&code, 11, maximum ? 0xff800000u : 0x7f800000u);
+  AppendMultiWaveLdsStore(&code, 11, 10);
+  code.push_back(EncodeSop1(0x04, 126, 193u));
+  AppendMultiWaveGuestBarrier(&code);
+  AppendVMovLiteral(&code, 13, 0x3f800000u);
+  code.push_back(EncodeVop2(0x25, 12, Vgpr(5), 13));
+  AppendVMovLiteral(&code, 15, 0xc1100000u); // Unused DATA1, independently varied from candidate.
+  code.push_back(EncodeDs0(maximum ? 0x13 : 0x12, 0));
+  code.push_back(EncodeDs1Ex(0, 15, 12, 10));
+  AppendMultiWaveGuestBarrier(&code);
+  AppendMultiWaveLdsRead(&code, 14, 10);
+  AppendStoreVgprAtLaneDwordOffset(&code, 14, 4, 4u);
+  AppendEnd(&code);
+  for (u32 group = 0; group < 2; ++group) {
+    const u32 selected = 0x3f801000u + (group << 16u) + (maximum ? local_count - 1u : 0u);
+    for (u32 lane = 0; lane < local_count; ++lane)
+      test.expected[4u + group * local_count + lane] = selected;
+  }
+  test.opcodes = {O::S_MOV_B64, O::V_MOV_B32, O::V_ADD_NC_U32, O::V_CMP_EQ_U32,
+                  O::DS_WRITE_B32, maximum ? O::DS_MAX_F32 : O::DS_MIN_F32,
+                  O::DS_READ_B32, O::S_WAITCNT, O::S_BARRIER, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpAtomicCompareExchange", "OpControlBarrier"};
+  return test;
+}
+
 TestCase Wave64MultiWaveLdsFloatMin() {
   using O = ShaderOpcode;
   constexpr u32 local_count = 256u;
@@ -41614,7 +41772,7 @@ std::vector<TestCase> MakeCases() {
     }
   }
   AddCase(DsMiscVariants);
-  AddCase(DsFloatMinMaxUsesSeparateCompareOperand);
+  AddCase(DsFloatMinMaxIgnoresUnusedData1);
   AddCase(DsSwizzleInvalidSourceLaneZero);
   AddCase(DsBpermuteCapturedExecOffsetAndWrap);
   AddCase(DsBpermuteWave64UsesIndependentHalves);
@@ -47845,9 +48003,30 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, Wave64MultiWaveLdsFloatMin());
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--ds-float-minmax-decoder-contract-only") == 0) {
+    CheckDsFloatMinMaxDecodedInputs();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--ds-float-minmax-finite-contract-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, DsFloatMinMaxFiniteIgnoresUnusedData1(false));
+    RunCase(&vulkan, DsFloatMinMaxFiniteIgnoresUnusedData1(true));
+    RunCase(&vulkan, DsFloatMinMaxFiniteGdsUnusedData1());
+    RunCase(&vulkan, DsFloatMinMaxFiniteInactiveExecPreservesLds());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--ds-float-minmax-neighbors-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, DsFloatMinMaxFiniteMultiwave(false));
+    RunCase(&vulkan, DsFloatMinMaxFiniteMultiwave(true));
+    RunCase(&vulkan, Wave64MultiWaveLdsFloatMin());
+    RunCase(&vulkan, DsGdsSubdwordAndAtomicWrites());
+    RunCase(&vulkan, BufferAtomicCmpSwapExactRaw());
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--ds-float-minmax-only") == 0) {
     VulkanHarness vulkan;
-    RunCase(&vulkan, DsFloatMinMaxUsesSeparateCompareOperand());
+    RunCase(&vulkan, DsFloatMinMaxIgnoresUnusedData1());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-descriptor-neighbors-only") == 0) {

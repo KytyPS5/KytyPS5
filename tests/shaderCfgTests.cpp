@@ -8810,38 +8810,31 @@ void TestNewShaderRecompilerDsAddtidTranslation() {
 }
 
 void TestNewShaderRecompilerDsFloatMinMaxTranslation() {
+  using O = ShaderRecompiler::IR::ValueOpcode;
   const uint32_t shader[] = {
-      EncodeDs0(0x12, 4), EncodeDs1Ex(0, 9, 7, 1),  // ds_min_f32 v7, v9, v1
-      EncodeDs0(0x13, 8), EncodeDs1Ex(0, 10, 8, 1), // ds_max_f32 v8, v10, v1
+      EncodeVop1(0x01, 1, 128u),
+      EncodeVop1(0x01, 7, 255u), 0x40000000u,
+      EncodeVop1(0x01, 8, 255u), 0x40400000u,
+      EncodeDs0(0x12, 4), EncodeDs1Ex(0, 9, 7, 1),
+      EncodeDs0(0x13, 8), EncodeDs1Ex(0, 10, 8, 1),
       0xbf810000u,
   };
-
-  auto options = MakeCompileOptions(ShaderType::Compute);
-  options.dump_ir = true;
-
-  auto result = RecompileForTest(shader, options);
-  Check((result.decoded_dump.find("ds_min_f32") != std::string::npos),
-        "new decoder did not decode DS float min");
-  Check((result.decoded_dump.find("ds_max_f32") != std::string::npos),
-        "new decoder did not decode DS float max");
-  Check((result.ir_dump.find("DsMinF32 null, v7, v1") != std::string::npos),
-        "DS float min did not lower to explicit IR");
-  Check((result.ir_dump.find("DsMaxF32 null, v8, v1") != std::string::npos),
-        "DS float max did not lower to explicit IR");
-  Check((result.ir_dump.find("v9") != std::string::npos),
-        "DS float min did not retain DATA1 compare operand");
-  Check((result.ir_dump.find("v10") != std::string::npos),
-        "DS float max did not retain DATA1 compare operand");
-  Check(SpirvContainsOpcode(result.spirv, 12),
-        "SPIR-V binary does not contain OpExtInst");
-  Check(SpirvContainsOpcode(result.spirv, 61),
-        "SPIR-V binary does not contain OpLoad");
-  Check(SpirvContainsOpcode(result.spirv, 62),
-        "SPIR-V binary does not contain OpStore");
-  Check(SpirvContainsOpcode(result.spirv, 65),
-        "SPIR-V binary does not contain OpAccessChain");
-  Check(SpirvContainsOpcode(result.spirv, 124),
-        "SPIR-V binary does not contain OpBitcast");
+  auto result = RecompileForTest(shader, MakeCompileOptions(ShaderType::Compute));
+  uint32_t minimum = 0, maximum = 0;
+  for (const auto* block : result.program.blocks) {
+    for (const auto& inst : *block) {
+      if (inst.GetOpcode() != O::SharedAtomicFMin32 &&
+          inst.GetOpcode() != O::SharedAtomicFMax32) continue;
+      Check(inst.NumArgs() == 3, "DS min/max IR must contain address, DATA0 and EXEC");
+      const auto data = inst.Arg(1).Resolve();
+      const auto expected = inst.GetOpcode() == O::SharedAtomicFMin32 ? 0x40000000u : 0x40400000u;
+      Check(data.IsImmediate() && data.U32() == expected,
+            "DS min/max IR read unused DATA1 instead of DATA0");
+      if (inst.GetOpcode() == O::SharedAtomicFMin32) ++minimum;
+      else ++maximum;
+    }
+  }
+  Check(minimum == 1 && maximum == 1, "DS float atomics disappeared during translation");
   CheckSpirvBinaryValidates(result.spirv);
 }
 
@@ -19740,6 +19733,12 @@ int main(int argc, char* argv[]) {
     return 0;
   }
 
+  if (argc == 2 && std::strcmp(argv[1], "--ds-float-minmax-translation-only") == 0) {
+    EnsureConfigInitialized();
+    TestNewShaderRecompilerDsFloatMinMaxTranslation();
+    std::puts("KYTY_DS_FLOAT_MINMAX_TRANSLATION_PASS");
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--shared-merge-cfg-only") == 0) {
     EnsureConfigInitialized();
     TestNewShaderRecompilerCfgDuplicateMergeStructuredSplit();

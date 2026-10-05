@@ -878,8 +878,7 @@ void Translator::DS_WRITE2(const Decoder::Instruction& inst) {
 void Translator::DS_MINMAX_F32(const Decoder::Instruction& inst, IR::ValueOpcode opcode) {
 	const auto memory = MemoryInfoFromDecoded(inst);
 	ir.Emit(opcode,
-	        {ReadU32(MemorySourceAt(inst, 1)), ReadU32(MemorySourceAt(inst, 0)),
-	         ReadU32(MemorySourceAt(inst, 2)), ir.GetExec()},
+	        {ReadU32(MemorySourceAt(inst, 1)), ReadU32(MemorySourceAt(inst, 0)), ir.GetExec()},
 	        AddMemoryInfo(memory, inst.pc));
 }
 

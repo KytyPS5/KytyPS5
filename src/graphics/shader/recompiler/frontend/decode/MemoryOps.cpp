@@ -221,9 +221,9 @@ uint32_t DsSourceCount(Opcode opcode) {
 		case Opcode::DS_WRITE2_B32:
 		case Opcode::DS_WRITE2ST64_B32:
 		case Opcode::DS_WRITE2_B64:
-		case Opcode::DS_WRITE2ST64_B64:
+		case Opcode::DS_WRITE2ST64_B64: return 3u;
 		case Opcode::DS_MIN_F32:
-		case Opcode::DS_MAX_F32: return 3u;
+		case Opcode::DS_MAX_F32:
 		case Opcode::DS_BPERMUTE_B32: return 2u;
 		case Opcode::DS_READ_ADDTID_B32:
 		case Opcode::DS_CONSUME:

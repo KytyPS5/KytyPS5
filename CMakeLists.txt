@@ -702,6 +702,18 @@ if(BUILD_TESTING)
 	add_test(NAME shader_snorm_buffer_store_endpoints
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --snorm-buffer-store-endpoints-only)
 	set_tests_properties(shader_snorm_buffer_store_endpoints PROPERTIES TIMEOUT 90)
+	add_test(NAME shader_ds_float_minmax_translation
+		COMMAND $<TARGET_FILE:shader_cfg_tests> --ds-float-minmax-translation-only)
+	set_tests_properties(shader_ds_float_minmax_translation PROPERTIES TIMEOUT 30)
+	add_test(NAME shader_ds_float_minmax_decoder_contract
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --ds-float-minmax-decoder-contract-only)
+	set_tests_properties(shader_ds_float_minmax_decoder_contract PROPERTIES TIMEOUT 30)
+	add_test(NAME shader_ds_float_minmax_finite_contract
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --ds-float-minmax-finite-contract-only)
+	set_tests_properties(shader_ds_float_minmax_finite_contract PROPERTIES TIMEOUT 90)
+	add_test(NAME shader_ds_float_minmax_neighbors
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --ds-float-minmax-neighbors-only)
+	set_tests_properties(shader_ds_float_minmax_neighbors PROPERTIES TIMEOUT 90)
 	add_test(NAME ajm_at9_multistream
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --ajm-at9-multistream-only)
 	set_tests_properties(ajm_at9_multistream PROPERTIES TIMEOUT 30)

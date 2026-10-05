@@ -5105,6 +5105,181 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  void CheckTextureGcProtectedPrefix() {
+    constexpr const char *name = "TextureGcProtectedPrefix";
+    constexpr uintptr_t base = 0x0000000208000000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            LibKernel::Memory::KernelAllocateDirectMemory(
+                0, LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "protected-prefix direct allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 && mapped == reinterpret_cast<void *>(base),
+            "protected-prefix fixed mapping failed");
+    {
+      LibKernel::Memory::InstallGpuResources(&context);
+      context.MapMemory(base, allocation_size);
+      auto &texture_cache = context.GetTextureCache();
+      // Protected GPU-owned textures cannot hide clean entries behind the
+      // candidate budget. The cases straddle the normal ten-entry scan boundary.
+      constexpr std::array<size_t, 4> protected_counts{0, 9, 10, 12};
+      for (size_t variant = 0; variant < protected_counts.size(); ++variant) {
+        const size_t protected_count = protected_counts[variant];
+        const uint64_t offset = 0x10000 + variant * 0x20000;
+        constexpr uint32_t stale = 0x0badf00du;
+        constexpr uint32_t sentinel = 0xdeadbeefu;
+        std::vector<ImageId> oldest;
+        for (size_t index = 0; index < protected_count + 2; ++index) {
+          const auto address = base + offset + index * 0x1000;
+          LibKernel::Memory::WriteBacking(address, &stale, sizeof(stale));
+          LibKernel::Memory::WriteBacking(address + 4, &sentinel, sizeof(sentinel));
+          ImageDesc desc{};
+          desc.type = BindingType::Texture;
+          desc.info.data = {address, sizeof(uint32_t)};
+          desc.info.pixel_format = vk::Format::eR8G8B8A8Unorm;
+          desc.info.guest_format = Prospero::BufferFormat::k8_8_8_8UNorm;
+          desc.info.type = Prospero::ImageType::kColor2D;
+          desc.info.extent = {1, 1, 1};
+          desc.info.resources = {1, 1};
+          desc.info.pitch = 1;
+          desc.info.bytes_per_block = 4;
+          desc.info.samples = 1;
+          desc.info.tile_mode = Prospero::TileMode::kLinear;
+          desc.info.mip_layout[0] = {0, sizeof(uint32_t), 1, 1};
+          desc.view_info.format = desc.info.pixel_format;
+          desc.view_info.type = vk::ImageViewType::e2D;
+          desc.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+          desc.view_info.layer_count = 1;
+          desc.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+          oldest.push_back(texture_cache.FindImage(desc));
+          if (index < protected_count) {
+            Require(name, "protected-prefix GPU setup",
+                    texture_cache.ClearImageFromBuffer(
+                        scheduler.Current(), address, sizeof(uint32_t), 0x10203040u + index),
+                    "could not establish protected GPU contents");
+          }
+        }
+        TextureCacheTestAccess::ConfigureGarbageCollection(
+            texture_cache, oldest, 17, UINT64_MAX);
+        texture_cache.RunGarbageCollector();
+        bool protected_live = true;
+        for (size_t index = 0; index < protected_count; ++index) {
+          protected_live &= TextureCacheTestAccess::Contains(texture_cache, oldest[index]);
+        }
+        Require(name, "protected-prefix reclaimable tail",
+                protected_live &&
+                    !TextureCacheTestAccess::Contains(texture_cache, oldest[protected_count]) &&
+                    !TextureCacheTestAccess::Contains(texture_cache, oldest[protected_count + 1]),
+                fmt::format("protected_count={} hid a clean tail or discarded GPU contents",
+                            protected_count).c_str());
+        // Pressure changes eligibility, not the contents which must reach guest backing.
+        TextureCacheTestAccess::ConfigureGarbageCollection(texture_cache, oldest, 81, 0);
+        texture_cache.RunGarbageCollector();
+        scheduler.Finish();
+        scheduler.DrainPriorityOperations();
+        for (size_t index = 0; index < protected_count + 2; ++index) {
+          uint32_t value = 0, neighbor = 0;
+          const auto address = base + offset + index * 0x1000;
+          LibKernel::Memory::TryReadBacking(address, &value, sizeof(value));
+          LibKernel::Memory::TryReadBacking(address + 4, &neighbor, sizeof(neighbor));
+          Require(name, "protected-prefix pressure readback",
+                  !TextureCacheTestAccess::Contains(texture_cache, oldest[index]) &&
+                      value == (index < protected_count ? 0x10203040u + index : stale) &&
+                      neighbor == sentinel,
+                  "pressure retirement lost a GPU word or overwrote its neighbor");
+        }
+      }
+      // Independent neighbors retain the normal deletion bound and recursive
+      // depth/stencil accounting even when protected entries are skipped.
+      const auto PixelDesc = [](uint64_t address) {
+        ImageDesc desc{};
+        desc.type = BindingType::Texture;
+        desc.info.data = {address, sizeof(uint32_t)};
+        desc.info.pixel_format = vk::Format::eR8G8B8A8Unorm;
+        desc.info.guest_format = Prospero::BufferFormat::k8_8_8_8UNorm;
+        desc.info.type = Prospero::ImageType::kColor2D;
+        desc.info.extent = {1, 1, 1};
+        desc.info.resources = {1, 1};
+        desc.info.pitch = 1;
+        desc.info.bytes_per_block = 4;
+        desc.info.samples = 1;
+        desc.info.tile_mode = Prospero::TileMode::kLinear;
+        desc.info.mip_layout[0] = {0, sizeof(uint32_t), 1, 1};
+        desc.view_info.format = desc.info.pixel_format;
+        desc.view_info.type = vk::ImageViewType::e2D;
+        desc.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+        desc.view_info.layer_count = 1;
+        desc.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+        return desc;
+      };
+      std::array<ImageId, 12> clean{};
+      for (size_t index = 0; index < clean.size(); ++index) {
+        auto desc = PixelDesc(base + 0x90000 + index * 0x1000);
+        clean[index] = texture_cache.FindImage(desc);
+      }
+      TextureCacheTestAccess::ConfigureGarbageCollection(texture_cache, clean, 17, UINT64_MAX);
+      texture_cache.RunGarbageCollector();
+      for (size_t index = 0; index < clean.size(); ++index) {
+        Require(name, "clean deletion budget",
+                TextureCacheTestAccess::Contains(texture_cache, clean[index]) == (index >= 10),
+                "normal GC changed the ten-candidate deletion bound");
+      }
+      std::array<ImageId, 6> depths{}, stencils{};
+      std::array<ImageId, 12> depth_lru{};
+      for (size_t index = 0; index < depths.size(); ++index) {
+        auto desc = PixelDesc(base + 0xb0000 + index * 0x1000);
+        desc.type = BindingType::DepthTarget;
+        desc.info.pixel_format = vk::Format::eD32SfloatS8Uint;
+        desc.info.guest_format = Prospero::BufferFormat::k32Float;
+        desc.info.stencil = {desc.info.data.address + 0x800, sizeof(uint32_t)};
+        desc.view_info.format = desc.info.pixel_format;
+        desc.view_info.aspect = vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
+        desc.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+        depths[index] = texture_cache.FindImage(desc);
+        TextureCacheTestAccess::AssociateStencil(texture_cache, depths[index], desc.info.stencil);
+        stencils[index] = texture_cache.FindImageFromRange(desc.info.stencil.address,
+                                                          desc.info.stencil.size, false);
+        Require(name, "depth budget setup", bool{depths[index]} && bool{stencils[index]},
+                "failed to create a depth/stencil association");
+        depth_lru[index * 2] = depths[index];
+        depth_lru[index * 2 + 1] = stencils[index];
+      }
+      TextureCacheTestAccess::ConfigureGarbageCollection(texture_cache, depth_lru, 17, UINT64_MAX);
+      texture_cache.RunGarbageCollector();
+      for (size_t index = 0; index < depths.size(); ++index) {
+        Require(name, "recursive depth/stencil budget",
+                TextureCacheTestAccess::Contains(texture_cache, depths[index]) == (index == 5) &&
+                    TextureCacheTestAccess::Contains(texture_cache, stencils[index]) == (index == 5),
+                "recursive association retirement changed the ten-candidate budget");
+      }
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+      LibKernel::Memory::InstallGpuResources(nullptr);
+    }
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "protected-prefix unmap failed");
+    Require(name, "release direct backing",
+            LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) == 0,
+            "protected-prefix direct release failed");
+    std::printf("[host]    %-32s ok (0/9/10/12)\n", name);
+  }
+
   void CheckUnifiedTextureCacheFlow() {
     constexpr const char *name = "UnifiedTextureCacheFlow";
     constexpr uintptr_t base = 0x0000000200600000ull;
@@ -48766,6 +48941,11 @@ if (argc == 1) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--partial-mip-upload-only") == 0) {
     CheckPartialMipUploadRange();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--texture-gc-protected-prefix-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckTextureGcProtectedPrefix();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-cache-gc-only") == 0) {

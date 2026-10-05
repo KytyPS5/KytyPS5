@@ -751,6 +751,9 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --depth-readback-only)
 	add_test(NAME compute_meta_clear_classification
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --compute-meta-clear-only)
+	add_test(NAME texture_cache_protected_gc
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --texture-gc-protected-prefix-only)
+	set_tests_properties(texture_cache_protected_gc PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE)
 	add_test(NAME buffer_cache_dirty_gc
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-gc-only)
 

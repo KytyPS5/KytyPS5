@@ -48,10 +48,11 @@ struct LibraryId {
 
 struct ThreadLocalStorage {
 	struct Block {
-		uint8_t*                     ptr        = nullptr;
-		application_heap_free_func_t free_func  = nullptr;
-		bool                         vm_alloc   = false;
-		uint64_t                     alloc_size = 0;
+		uint8_t*                     ptr             = nullptr;
+		application_heap_free_func_t free_func       = nullptr;
+		bool                         vm_alloc        = false;
+		uint64_t                     alloc_size      = 0;
+		int                          owner_thread_id = 0;
 	};
 
 	~ThreadLocalStorage();

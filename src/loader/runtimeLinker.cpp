@@ -31,6 +31,7 @@
 #include <fmt/format.h>
 #include <magic_enum.hpp>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -58,33 +59,84 @@ Program::Program() = default;
 
 Program::~Program() = default;
 
-static void FreeTlsBlock(ThreadLocalStorage::Block* block) {
+// The backing allocation of a TLS block is guest memory for TLS blocks, so releasing a
+// block that has outlived its image can legitimately fail. Deferred release reports that
+// instead of aborting, because there is no remaining owner to fail against.
+static bool ReleaseTlsBlockMemory(ThreadLocalStorage::Block* block) {
 	if (block == nullptr || block->ptr == nullptr) {
-		return;
+		return true;
 	}
 
 	if (block->free_func != nullptr) {
 		block->free_func(block->ptr);
 	} else if (block->vm_alloc) {
-		EXIT_IF(!Libs::LibKernel::Memory::FreeGuestMemory(reinterpret_cast<uint64_t>(block->ptr),
-		                                                  block->alloc_size));
+		if (!Libs::LibKernel::Memory::FreeGuestMemory(reinterpret_cast<uint64_t>(block->ptr),
+		                                              block->alloc_size)) {
+			return false;
+		}
 	} else {
 		delete[] block->ptr;
 	}
 
-	block->ptr        = nullptr;
-	block->free_func  = nullptr;
-	block->vm_alloc   = false;
-	block->alloc_size = 0;
+	*block = {};
+	return true;
 }
 
 static uint64_t AlignUp(uint64_t value, uint64_t alignment) {
 	return alignment != 0 ? (value + alignment - 1) & ~(alignment - 1) : value;
 }
 
+// A program owns one TLS block per thread that used it. Destroying a program used to release
+// every block at once, including blocks still reachable from a live thread: that thread's
+// cached guest TCB pointer, and on Windows the patched guest code, read the guest TCB
+// through the thread's own TLS slot. A block is therefore only released by the thread that
+// owns it. Blocks owned by other threads are parked here until they stop, so the guest TCB
+// stays valid for as long as any thread can still reach it.
+static std::mutex                             g_deferred_tls_mutex;
+static std::vector<ThreadLocalStorage::Block> g_deferred_tls_blocks;
+
+// Release every parked block owned by the calling thread. Only its owner may release a
+// block, so this is the one safe place to do it.
+static void ReleaseDeferredTlsBlocks() {
+	const int thread_id = Common::Thread::GetThreadIdUnique();
+
+	std::vector<ThreadLocalStorage::Block> mine;
+	{
+		std::lock_guard<std::mutex> lock(g_deferred_tls_mutex);
+		for (auto it = g_deferred_tls_blocks.begin(); it != g_deferred_tls_blocks.end();) {
+			if (it->owner_thread_id == thread_id) {
+				mine.push_back(*it);
+				it = g_deferred_tls_blocks.erase(it);
+			} else {
+				++it;
+			}
+		}
+	}
+
+	for (auto& block: mine) {
+		if (!ReleaseTlsBlockMemory(&block)) {
+			LOGF("Deferred TLS block [%p] size=%" PRIu64 " could not be released\n",
+			     static_cast<void*>(block.ptr), block.alloc_size);
+		}
+	}
+}
+
+static void ReleaseTlsBlock(ThreadLocalStorage::Block* block) {
+	if (block == nullptr || block->ptr == nullptr) {
+		return;
+	}
+	if (block->owner_thread_id == Common::Thread::GetThreadIdUnique()) {
+		EXIT_IF(!ReleaseTlsBlockMemory(block));
+		return;
+	}
+	std::lock_guard<std::mutex> lock(g_deferred_tls_mutex);
+	g_deferred_tls_blocks.push_back(*block);
+	*block = {};
+}
+
 ThreadLocalStorage::~ThreadLocalStorage() {
 	for (auto& [_, block]: tlss) {
-		FreeTlsBlock(&block);
+		ReleaseTlsBlock(&block);
 	}
 }
 
@@ -243,6 +295,9 @@ static const DWORD g_tls_main_tcb_key = [] {
 static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_func_t atexit_func,
                                    void* stack_top) {
 #if defined(__x86_64__) || defined(_M_X64)
+	// This thread is about to run guest code again, so any block it parked for a program
+	// that has since been destroyed is no longer reachable.
+	ReleaseDeferredTlsBlocks();
 	RuntimeLinker::InitializeMainTlsForCurrentThread();
 	auto* func = reinterpret_cast<entry_func_t>(addr);
 
@@ -1621,6 +1676,9 @@ uint8_t* RuntimeLinker::TlsGetAddr(Program* program) {
 		tls.free_func  = nullptr;
 		tls.vm_alloc   = true;
 		tls.alloc_size = alloc_size;
+		// The TCB lives in this block and is reachable from this thread's host TLS slot, so
+		// the block may only be released by the thread that owns it.
+		tls.owner_thread_id = Common::Thread::GetThreadIdUnique();
 
 		EXIT_IF(tls.ptr == nullptr);
 
@@ -1654,7 +1712,7 @@ void RuntimeLinker::DeleteTls(Program* program, int thread_id) {
 	Common::LockGuard lock(program->tls.mutex);
 
 	if (auto it = program->tls.tlss.find(thread_id); it != program->tls.tlss.end()) {
-		FreeTlsBlock(&it->second);
+		ReleaseTlsBlock(&it->second);
 		program->tls.tlss.erase(it);
 	}
 }
@@ -2213,6 +2271,10 @@ void RuntimeLinker::DeleteTlss(int thread_id) {
 	for (auto* p: m_programs) {
 		DeleteTls(p, thread_id);
 	}
+
+	// The calling thread is stopping or leaving guest code, so it is the last owner of any
+	// block that outlived a program destroyed while the thread was blocked.
+	ReleaseDeferredTlsBlocks();
 }
 
 void RuntimeLinker::SetApplicationHeapApi(void* const api[10]) {

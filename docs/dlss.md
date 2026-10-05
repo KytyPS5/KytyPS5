@@ -141,10 +141,14 @@ engine and runtime DLLs must come from the same build. Installation preserves
 existing game settings and saves.
 It intercepts Vulkan instance/device/surface/swapchain/present operations,
 enables Reflex, tags frame-owned depth/motion snapshots and supplies per-frame
-constants. Only new MAIN guest frames are eligible. Cached, blank and paused
-presentations turn generation off. Mode changes recreate the swapchain; when
-generation is active, Vulkan uses Immediate presentation because the SDK does
-not support VSync for Vulkan Frame Generation.
+constants. If the selected device lacks `VK_KHR_present_id`, Streamline is shut
+down before device creation and the engine uses native Vulkan presentation.
+Only new MAIN guest frames advance generation history. Cached guest
+frames retain an already active generation mode for overlay refreshes without
+retagging inputs or counting another guest frame. Blank and paused presentations,
+missing inputs and the Off setting disable generation. Mode changes recreate
+the swapchain; when generation is active, Vulkan uses Immediate presentation
+because the SDK does not support VSync for Vulkan Frame Generation.
 
 The inputs share the experimental final-frame optical-flow/neutral-depth
 limitations of Super Resolution; this is not native scene motion/depth. Guest HUD

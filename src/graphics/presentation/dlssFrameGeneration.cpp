@@ -33,6 +33,7 @@ void DlssFgInputs::Wait(GraphicContext& graphics) {
 		wait.pValues = &completion_value;
 		RequireVulkanSuccess(graphics.device.waitSemaphores(&wait, UINT64_MAX), "wait for Frame Generation inputs");
 	} else {
+		Common::LockGuard queue_lock(graphics.queue_mutex);
 		RequireVulkanSuccess(graphics.device.waitIdle(), "drain Frame Generation inputs");
 	}
 	pending = false;
@@ -84,6 +85,7 @@ bool CaptureDlssFgInputs(GraphicContext& graphics, CommandScheduler& scheduler, 
 
 struct DlssFrameGeneration::Impl {
 	bool initialized = false, available = false, enabled = false, logged = false;
+	bool device_extensions_ready = false;
 	uint32_t presented = 0;
 	uint64_t total_presented = 0;
 #if defined(KYTY_HAS_DLSS_FG)
@@ -162,7 +164,12 @@ PFN_vkGetInstanceProcAddr DlssFrameGeneration::Initialize(PFN_vkGetInstanceProcA
 #if defined(KYTY_HAS_DLSS_FG)
 	auto& impl = *m_impl;
 	impl.native = native;
-	impl.directory = std::filesystem::u8path(SDL_GetBasePath()).wstring();
+	const char* base = SDL_GetBasePath();
+	if (base == nullptr) {
+		LOGF("DLSS Frame Generation unavailable: %s\n", SDL_GetError());
+		return native;
+	}
+	impl.directory = std::filesystem::u8path(base).wstring();
 	const auto path = (std::filesystem::path(impl.directory) / "sl.interposer.dll").wstring();
 	if (!sl::security::verifyEmbeddedSignature(path.c_str())) {
 		LOGF("DLSS Frame Generation unavailable: invalid or missing signed Streamline runtime\n");
@@ -259,10 +266,32 @@ vk::Result DlssFrameGeneration::CreateInstance(const vk::InstanceCreateInfo& inf
 	return vk::createInstance(&info, nullptr, &instance);
 }
 
+bool DlssFrameGeneration::ConfigureDeviceExtensions(std::span<const vk::ExtensionProperties> available,
+                                                   std::vector<const char*>& enabled) {
+	auto& impl = *m_impl;
+	if (!impl.initialized) return false;
+	const auto present_id = [](const auto& extension) {
+		return std::strcmp(extension.extensionName, VK_KHR_PRESENT_ID_EXTENSION_NAME) == 0;
+	};
+	if (!std::any_of(available.begin(), available.end(), present_id)) {
+		LOGF("DLSS Frame Generation unavailable: VK_KHR_present_id is unsupported; using native Vulkan\n");
+		Shutdown();
+		return false;
+	}
+	if (std::none_of(enabled.begin(), enabled.end(), [](const char* extension) {
+		return std::strcmp(extension, VK_KHR_PRESENT_ID_EXTENSION_NAME) == 0;
+	})) {
+		// Streamline Reflex's VK_NV_low_latency2 depends on present_id.
+		enabled.push_back(VK_KHR_PRESENT_ID_EXTENSION_NAME);
+	}
+	impl.device_extensions_ready = true;
+	return true;
+}
+
 void DlssFrameGeneration::OnDevice(GraphicContext& graphics) {
 #if defined(KYTY_HAS_DLSS_FG)
 	auto& impl = *m_impl;
-	if (!impl.initialized) return;
+	if (!impl.initialized || !impl.device_extensions_ready) return;
 	impl.graphics = &graphics;
 	sl::AdapterInfo adapter {};
 	adapter.vkPhysicalDevice = static_cast<VkPhysicalDevice>(graphics.physical_device);
@@ -378,11 +407,11 @@ void DlssFrameGeneration::PresentStart() {
 	if (m_impl->enabled) m_impl->Mark(sl::PCLMarker::ePresentStart);
 #endif
 }
-void DlssFrameGeneration::PresentEnd(DlssFgInputs* inputs) {
+void DlssFrameGeneration::PresentEnd(DlssFgInputs* inputs, bool new_frame) {
 #if defined(KYTY_HAS_DLSS_FG)
 	auto& impl = *m_impl;
 	if (!impl.enabled) return;
-	impl.Mark(sl::PCLMarker::ePresentEnd);
+	if (new_frame) impl.Mark(sl::PCLMarker::ePresentEnd);
 	if (inputs) inputs->pending = true;
 	sl::DLSSGState state {};
 	const auto result = impl.state(sl::ViewportHandle(0), state, nullptr);
@@ -391,8 +420,12 @@ void DlssFrameGeneration::PresentEnd(DlssFgInputs* inputs) {
 			inputs->completion = reinterpret_cast<VkSemaphore>(state.inputsProcessingCompletionFence);
 			inputs->completion_value = state.lastPresentInputsProcessingCompletionFenceValue;
 		}
-		impl.presented = state.numFramesActuallyPresented;
-		impl.total_presented += impl.presented;
+		// Cached overlay presents retain the latest input fence, but do not
+		// advance guest history or count the same SDK frame a second time.
+		if (new_frame) {
+			impl.presented = state.numFramesActuallyPresented;
+			impl.total_presented += impl.presented;
+		}
 		if (!impl.logged && impl.frame_index > 20 && impl.total_presented > impl.frame_index) {
 			Log::WriteToConsoleAndLog(fmt::format(
 			    "DLSS Frame Generation active: {} display frames reported for {} submitted guest frames\n",
@@ -411,6 +444,7 @@ void DlssFrameGeneration::PresentEnd(DlssFgInputs* inputs) {
 	}
 #endif
 	(void)inputs;
+	(void)new_frame;
 }
 uint32_t DlssFrameGeneration::PresentedFrames() const { return m_impl->presented; }
 uint64_t DlssFrameGeneration::TotalPresentedFrames() const { return m_impl->total_presented; }
@@ -426,6 +460,7 @@ void DlssFrameGeneration::Shutdown() {
 	auto& impl = *m_impl;
 	if (impl.initialized) impl.shutdown();
 	impl.initialized = impl.available = impl.enabled = false;
+	impl.device_extensions_ready = false;
 	// The global Vulkan dispatcher retains the proxy function addresses until
 	// instance/device destruction completes. Keep the module loaded for that.
 #endif

@@ -2,6 +2,8 @@
 #define KYTY_DLSS_FRAME_GENERATION_H_
 #include "graphics/presentation/dlss.h"
 #include <SDL3/SDL.h>
+#include <span>
+#include <vector>
 
 namespace Libs::Graphics {
 // Frame-owned snapshots. Producer inputs may be reused before presentation.
@@ -29,6 +31,10 @@ public:
 	PFN_vkGetInstanceProcAddr Initialize(PFN_vkGetInstanceProcAddr native);
 	bool CreateSurface(SDL_Window* window, vk::Instance instance, vk::SurfaceKHR& surface);
 	vk::Result CreateInstance(const vk::InstanceCreateInfo& info, vk::Instance& instance);
+	// Negotiate optional FG requirements after selecting the physical device.
+	// False retires Streamline; restore the native dispatcher before device creation.
+	bool ConfigureDeviceExtensions(std::span<const vk::ExtensionProperties> available,
+	                               std::vector<const char*>& enabled);
 	void OnDevice(GraphicContext& graphics);
 	[[nodiscard]] bool Available() const;
 	[[nodiscard]] bool Hooked() const;
@@ -37,7 +43,7 @@ public:
 	bool SetEnabled(bool enabled);
 	bool TagFrame(CommandBuffer& command, DlssFgInputs& inputs, vk::Extent2D output);
 	void PresentStart();
-	void PresentEnd(DlssFgInputs* inputs = nullptr);
+	void PresentEnd(DlssFgInputs* inputs = nullptr, bool new_frame = true);
 	uint32_t PresentedFrames() const;
 	uint64_t TotalPresentedFrames() const;
 	uint32_t TotalSubmittedFrames() const;

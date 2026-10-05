@@ -1112,10 +1112,14 @@ void Presenter::Impl::Present(bool new_frame) {
 	auto* fg = window.frame_generation.get();
 	const bool generate_frame = new_frame && !window.loop.paused.load() && layers[0].frame &&
 	    layers[0].frame->guest_frame && layers[0].frame->fg_inputs;
-	if (fg && fg->Enabled() && (!generate_frame || !Config::DlssFrameGenerationEnabled())) {
+	const bool keep_frame_generation = !new_frame && !window.loop.paused.load() && fg &&
+	    fg->Enabled() && Config::DlssFrameGenerationEnabled() && layers[0].frame &&
+	    layers[0].frame->guest_frame && layers[0].frame->fg_inputs;
+	const bool frame_generation_enabled = generate_frame || keep_frame_generation;
+	if (fg && fg->Enabled() && (!frame_generation_enabled || !Config::DlssFrameGenerationEnabled())) {
 		frames.WaitFrameGenerationInputs();
 	}
-	if (fg && fg->SetEnabled(generate_frame)) {
+	if (fg && fg->SetEnabled(frame_generation_enabled)) {
 		RecoverSwapchain(Swapchain::Status::Recreate);
 	}
 	// Some window systems keep presenting an old swapchain after a resize.
@@ -1151,9 +1155,9 @@ void Presenter::Impl::Present(bool new_frame) {
 			frames.WaitFrameGenerationInputs();
 			recreate_after_present = fg->SetEnabled(false);
 		}
-		if (fg) fg->PresentStart();
+		if (fg && generate_frame) fg->PresentStart();
 		status = swapchain.Present();
-		if (fg) fg->PresentEnd(generate_frame ? layers[0].frame->fg_inputs.get() : nullptr);
+		if (fg) fg->PresentEnd(layers[0].frame ? layers[0].frame->fg_inputs.get() : nullptr, generate_frame);
 		if (status != Swapchain::Status::Success) {
 			RecoverSwapchain(status);
 			continue;

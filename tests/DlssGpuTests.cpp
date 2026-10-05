@@ -447,6 +447,17 @@ void EmulatorPresentationCase(Presenter& presenter, Config::ConfigOptions config
 		    SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr));
 		Check(hwnd != nullptr, "Frame Generation HWND");
 		SDL_free(windows);
+		const auto check_cached = [&] {
+			const auto submitted = presenter.FrameGeneration().TotalSubmittedFrames();
+			const auto presented = presenter.FrameGeneration().TotalPresentedFrames();
+			Check(presenter.PresentLastFrame(), "cached guest presentation failed");
+			Check(presenter.FrameGeneration().Enabled(), "cached guest frame disabled Frame Generation");
+			Check(presenter.FrameGeneration().Available(), "cached guest frame invalidated Frame Generation");
+			Check(presenter.FrameGeneration().TotalSubmittedFrames() == submitted,
+			      "cached presentation advanced Frame Generation history");
+			Check(presenter.FrameGeneration().TotalPresentedFrames() == presented,
+			      "cached presentation inflated generated-frame statistics");
+		};
 		constexpr int count = 180;
 		for (int index = 0; index < count; ++index) {
 			UploadPattern(scheduler, source, index, 0);
@@ -477,6 +488,8 @@ void EmulatorPresentationCase(Presenter& presenter, Config::ConfigOptions config
 				if (attached) AttachThreadInput(this_thread, foreground_thread, FALSE);
 			}
 			presenter.Present(frame);
+			Check(presenter.FrameGeneration().Enabled(), "new guest frame lost Frame Generation");
+			if (index == 60) check_cached(); // The next guest flip must keep the same generation mode.
 			SDL_Event event {};
 			while (SDL_PollEvent(&event)) {}
 			// Leave room for an intermediate scanout even on a 60 Hz display.
@@ -489,6 +502,9 @@ void EmulatorPresentationCase(Presenter& presenter, Config::ConfigOptions config
 		    static_cast<unsigned long long>(presented), submitted, count);
 		std::fflush(stdout);
 		interpolation_succeeded = presented > submitted;
+		for (int repeat = 0; repeat < 3; ++repeat) {
+			check_cached();
+		}
 		// Off resumes ordinary presentation; re-enable prepares a fresh history.
 		config.dlss_frame_generation = false;
 		Config::Load(config);
@@ -524,6 +540,15 @@ void EmulatorPresentationCase(Presenter& presenter, Config::ConfigOptions config
 		    static_cast<unsigned long long>(new_display), new_submissions);
 		interpolation_succeeded = interpolation_succeeded && new_display > new_submissions;
 		Check(presenter.FrameGeneration().Enabled(), "Frame Generation did not re-enable");
+		auto& blank = presenter.PrepareBlankFrame(1360, 768, true);
+		presenter.Present(blank);
+		Check(!presenter.FrameGeneration().Enabled(), "blank frame did not disable generation");
+		Check(presenter.PresentLastFrame(), "cached blank presentation failed");
+		Check(!presenter.FrameGeneration().Enabled(), "cached blank frame re-enabled generation");
+		auto& resumed = presenter.PrepareFrame(scheduler.Current(), info);
+		scheduler.FlushAndWait();
+		presenter.Present(resumed);
+		Check(presenter.FrameGeneration().Enabled(), "guest frame did not resume generation after blank");
 		// A missing native depth input must retire a reused snapshot and present normally.
 		DlssFrameInputs missing {};
 		for (int index = 0; index < 6; ++index) {
@@ -653,6 +678,70 @@ void EmulatorPresentationCase(Presenter& presenter, Config::ConfigOptions config
 	Check(validation_errors == 0, "presentation Vulkan validation errors");
 	std::puts("Emulator presentation: no adapter, actual GPU pixels, overlay, cached frame, modes and resize passed");
 }
+void FrameGenerationExtensionFallbackCase() {
+	static vk::detail::DynamicLoader loader;
+	const auto native = loader.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr");
+	VULKAN_HPP_DEFAULT_DISPATCHER.init(native);
+	DlssFrameGeneration fg;
+	VULKAN_HPP_DEFAULT_DISPATCHER.init(fg.Initialize(native));
+	Check(fg.Hooked(), "extension fallback test did not initialize Streamline");
+	vk::ApplicationInfo app {};
+	app.pApplicationName = "FrameGenerationExtensionFallback";
+	app.apiVersion = VULKAN_TARGET_API_VERSION;
+	vk::InstanceCreateInfo instance_info {};
+	instance_info.pApplicationInfo = &app;
+	vk::Instance instance;
+	RequireVulkanSuccess(fg.CreateInstance(instance_info, instance), "Streamline fallback instance");
+	VULKAN_HPP_DEFAULT_DISPATCHER.init(instance);
+	const auto devices = EnumerateVulkan<vk::PhysicalDevice>("fallback physical devices",
+	    [&](uint32_t* n, vk::PhysicalDevice* p) { return instance.enumeratePhysicalDevices(n, p); });
+	Check(!devices.empty(), "extension fallback test needs a Vulkan device");
+	const auto physical = devices.front();
+	auto available = EnumerateVulkan<vk::ExtensionProperties>("fallback device extensions",
+	    [&](uint32_t* n, vk::ExtensionProperties* p) { return physical.enumerateDeviceExtensionProperties(nullptr, n, p); });
+	std::vector<const char*> enabled;
+	if (std::any_of(available.begin(), available.end(), [](const auto& extension) {
+		return std::strcmp(extension.extensionName, VK_KHR_PRESENT_ID_EXTENSION_NAME) == 0;
+	})) {
+		Check(fg.ConfigureDeviceExtensions(available, enabled), "supported present_id rejected");
+		Check(fg.ConfigureDeviceExtensions(available, enabled) && enabled.size() == 1,
+		      "optional present_id was appended more than once");
+	}
+	// Mask the optional capability on the selected physical device. Keep the
+	// real interposer-created instance to exercise native dispatcher restoration.
+	std::erase_if(available, [](const auto& extension) {
+		return std::strcmp(extension.extensionName, VK_KHR_PRESENT_ID_EXTENSION_NAME) == 0;
+	});
+	enabled.clear();
+	Check(!fg.ConfigureDeviceExtensions(available, enabled), "missing present_id did not fall back");
+	Check(!fg.Hooked() && !fg.Available() && !fg.Enabled() && enabled.empty(),
+	      "unsupported FG left Streamline requirements enabled");
+	VULKAN_HPP_DEFAULT_DISPATCHER.init(native);
+	VULKAN_HPP_DEFAULT_DISPATCHER.init(instance);
+	const auto queues = physical.getQueueFamilyProperties();
+	uint32_t family = UINT32_MAX;
+	for (uint32_t i = 0; i < queues.size(); ++i) {
+		if (queues[i].queueFlags & vk::QueueFlagBits::eGraphics) { family = i; break; }
+	}
+	Check(family != UINT32_MAX, "fallback graphics queue");
+	const float priority = 1;
+	vk::DeviceQueueCreateInfo queue {};
+	queue.queueFamilyIndex = family;
+	queue.queueCount = 1;
+	queue.pQueuePriorities = &priority;
+	vk::DeviceCreateInfo device_info {};
+	device_info.queueCreateInfoCount = 1;
+	device_info.pQueueCreateInfos = &queue;
+	vk::Device device;
+	RequireVulkanSuccess(physical.createDevice(&device_info, nullptr, &device), "native device after missing FG extension");
+	VULKAN_HPP_DEFAULT_DISPATCHER.init(device);
+	vk::Queue graphics_queue;
+	device.getQueue(family, 0, &graphics_queue);
+	Check(graphics_queue != nullptr, "native fallback queue creation");
+	device.destroy(nullptr);
+	instance.destroy(nullptr);
+	std::puts("Frame Generation optional-extension fallback created a native Vulkan device");
+}
 } // namespace
 
 int main(int argc, char** argv) {
@@ -668,7 +757,8 @@ int main(int argc, char** argv) {
 	    std::strcmp(argv[1], "--frame-generation-controlled-off") == 0);
 	const bool frame_generation = fg_controlled || frame_generation_off || (argc == 2 && std::strcmp(argv[1], "--frame-generation") == 0);
 	const bool fg_validation_fallback = argc == 2 && std::strcmp(argv[1], "--frame-generation-validation-fallback") == 0;
-	config.dlss_frame_generation = frame_generation || fg_validation_fallback;
+	const bool fg_extension_fallback = argc == 2 && std::strcmp(argv[1], "--frame-generation-extension-fallback") == 0;
+	config.dlss_frame_generation = frame_generation || fg_validation_fallback || fg_extension_fallback;
 	if (frame_generation_off) config.dlss_mode = Config::DlssMode::Off;
 	const bool emulator_presentation = presentation_regression || frame_generation ||
 	    (argc == 2 && std::strcmp(argv[1], "--emulator-presentation") == 0);
@@ -684,6 +774,10 @@ int main(int argc, char** argv) {
 	}
 	Config::Load(config);
 	subsystems.Initialize<Log::Lifecycle>();
+	if (fg_extension_fallback) {
+		FrameGenerationExtensionFallbackCase();
+		return 0;
+	}
 	if (argc == 2 && std::strcmp(argv[1], "--window-title-timing") == 0) {
 		Check(SDL_InitSubSystem(SDL_INIT_VIDEO), "SDL video initialization");
 		WindowContext window;

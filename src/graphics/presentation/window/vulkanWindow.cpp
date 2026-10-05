@@ -956,10 +956,6 @@ void WindowContext::CreateVulkan() {
 	    VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME,
 	    VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
 	    "VK_KHR_maintenance1"};
-	if (frame_generation->Hooked()) {
-		// VK_NV_low_latency2, requested by Streamline Reflex, depends on present_id.
-		device_extensions.push_back(VK_KHR_PRESENT_ID_EXTENSION_NAME);
-	}
 
 #if defined(__APPLE__)
 	// MoltenVK lacks VK_EXT_depth_clip_enable and VK_EXT_color_write_enable; the renderer
@@ -1018,6 +1014,14 @@ void WindowContext::CreateVulkan() {
 			        nullptr, count, values);
 		    });
 
+		if (frame_generation->Hooked() &&
+		    !frame_generation->ConfigureDeviceExtensions(available_extensions, device_extensions)) {
+			// Streamline must stop injecting plugin requirements into vkCreateDevice.
+			// Its instance and physical-device handles are native Vulkan handles.
+			get_instance_proc_addr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(SDL_Vulkan_GetVkGetInstanceProcAddr());
+			VULKAN_HPP_DEFAULT_DISPATCHER.init(get_instance_proc_addr);
+			VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.instance);
+		}
 		if (dlss_instance_extensions) {
 			graphic_ctx.dlss_extensions_enabled =
 			    AppendDlssDeviceExtensions(graphic_ctx, device_extensions, available_extensions);

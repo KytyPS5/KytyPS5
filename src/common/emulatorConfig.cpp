@@ -68,6 +68,14 @@ DlssMode GetDlssMode() {
 	return g_config->dlss_mode;
 }
 
+uint32_t GetRenderScalePercent() {
+	return std::clamp(g_config->render_scale_percent, 25u, 100u);
+}
+
+bool DlssFrameGenerationEnabled() {
+	return g_config->dlss_frame_generation;
+}
+
 int32_t GetGpuIndex() {
 	return g_config->gpu_index;
 }

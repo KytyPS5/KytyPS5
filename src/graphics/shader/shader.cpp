@@ -644,6 +644,7 @@ void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>
 	EXIT_IF(info.input_num > std::size(info.interpolator_settings));
 	key.clear();
 	key.push_back(info.scratch_size_dwords);
+	key.push_back(info.raster_scale_dword);
 	key.push_back(info.input_num);
 	key.push_back(info.wave_size);
 	key.push_back(info.ps_system_input_base);

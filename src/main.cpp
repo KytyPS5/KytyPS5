@@ -63,6 +63,8 @@ static void PrintUsage() {
 	::printf("  --fullscreen                         Run in borderless desktop fullscreen.\n");
 	::printf("  --dlss <mode>                        Off, Quality, Balanced, Performance, UltraPerformance, DLAA.\n"
 	         "                                       Requires RTX; experimental final-frame reconstruction. Default: Off.\n");
+	::printf("  --render-scale <25-100>             Rasterization resolution percent. Default: 100.\n");
+	::printf("  --dlss-frame-generation <t|f>       NVIDIA DLSS Frame Generation. Default: false.\n");
 	::printf(
 	    "  --hide-cursor                        Hide the cursor after 2 s idle. Default: off.\n");
 	::printf("  --vr                                 Enable the virtual VR headset.\n");
@@ -357,6 +359,17 @@ static bool ParseArgs(int argc, char* argv[], RunOptions& options, bool& show_he
 		} else if (arg == "--dlss") {
 			if (!ParseEnum(value, options.config.dlss_mode)) {
 				::printf("invalid DLSS mode: %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--render-scale") {
+			if (!ParseUint32(value, options.config.render_scale_percent) ||
+			    options.config.render_scale_percent < 25 || options.config.render_scale_percent > 100) {
+				::printf("invalid render scale (expected 25-100): %s\n", value.c_str());
+				return false;
+			}
+		} else if (arg == "--dlss-frame-generation") {
+			if (!ParseBool(value, options.config.dlss_frame_generation)) {
+				::printf("invalid DLSS Frame Generation value: %s\n", value.c_str());
 				return false;
 			}
 		} else if (arg == "--gpu") {

@@ -2,6 +2,8 @@
 # performed implicitly; see docs/dlss.md for the tested SDK revision.
 option(KYTY_ENABLE_DLSS "Enable NVIDIA DLSS Super Resolution (NGX Vulkan)" OFF)
 set(KYTY_DLSS_SDK_ROOT "${KYTY_THIRD_PARTY_DIR}/DLSS" CACHE PATH "NVIDIA/DLSS SDK checkout")
+option(KYTY_ENABLE_DLSS_FG "Enable NVIDIA DLSS Frame Generation (Streamline Vulkan)" OFF)
+set(KYTY_STREAMLINE_SDK_ROOT "${KYTY_THIRD_PARTY_DIR}/Streamline" CACHE PATH "Extracted Streamline SDK release")
 
 add_library(kyty_dlss_sdk INTERFACE)
 if(KYTY_ENABLE_DLSS)
@@ -44,7 +46,51 @@ if(KYTY_ENABLE_DLSS)
 	target_link_libraries(kyty_dlss_sdk INTERFACE "$<IF:$<CONFIG:Debug>,${ngx_debug},${ngx_release}>")
 endif()
 
+if(KYTY_ENABLE_DLSS_FG)
+	if(NOT WIN32 OR NOT KYTY_CLANG_CL)
+		message(FATAL_ERROR "Streamline Frame Generation requires a Windows x64 clang-cl build")
+	endif()
+	set(KYTY_STREAMLINE_RUNTIMES)
+	foreach(runtime sl.interposer sl.common sl.dlss_g sl.reflex sl.pcl nvngx_dlssg NvLowLatencyVk)
+		set(runtime_file "${KYTY_STREAMLINE_SDK_ROOT}/bin/x64/${runtime}.dll")
+		if(NOT EXISTS "${runtime_file}")
+			message(FATAL_ERROR "Missing Streamline production runtime: ${runtime_file}")
+		endif()
+		list(APPEND KYTY_STREAMLINE_RUNTIMES "${runtime_file}")
+	endforeach()
+	if(NOT EXISTS "${KYTY_STREAMLINE_SDK_ROOT}/include/sl_dlss_g.h")
+		message(FATAL_ERROR "Missing Streamline headers in KYTY_STREAMLINE_SDK_ROOT")
+	endif()
+	target_include_directories(kyty_dlss_sdk SYSTEM INTERFACE "${KYTY_STREAMLINE_SDK_ROOT}/include")
+	target_compile_definitions(kyty_dlss_sdk INTERFACE KYTY_HAS_DLSS_FG=1)
+	set(KYTY_STREAMLINE_NGX_LICENSE "${KYTY_STREAMLINE_SDK_ROOT}/bin/x64/nvngx_dlss.license.txt")
+	set(KYTY_STREAMLINE_LICENSES
+		"${KYTY_STREAMLINE_SDK_ROOT}/license.txt"
+		"${KYTY_STREAMLINE_SDK_ROOT}/3rd-party-licenses.md"
+		"${KYTY_STREAMLINE_NGX_LICENSE}"
+		"${KYTY_STREAMLINE_SDK_ROOT}/bin/x64/reflex.license.txt")
+	foreach(license IN LISTS KYTY_STREAMLINE_LICENSES)
+		if(NOT EXISTS "${license}")
+			message(FATAL_ERROR "Missing Streamline license: ${license}")
+		endif()
+	endforeach()
+	install(FILES ${KYTY_STREAMLINE_RUNTIMES} DESTINATION .)
+	install(FILES "${KYTY_STREAMLINE_SDK_ROOT}/license.txt" DESTINATION licenses/streamline)
+	install(FILES "${KYTY_STREAMLINE_SDK_ROOT}/3rd-party-licenses.md" DESTINATION licenses/streamline)
+	install(FILES "${KYTY_STREAMLINE_NGX_LICENSE}" DESTINATION licenses/streamline/ngx)
+	install(FILES "${KYTY_STREAMLINE_SDK_ROOT}/bin/x64/reflex.license.txt" DESTINATION licenses/streamline/reflex)
+endif()
+
 function(deploy_kyty_dlss target)
+	if(KYTY_ENABLE_DLSS_FG)
+		add_custom_command(TARGET ${target} POST_BUILD
+			COMMAND ${CMAKE_COMMAND} -E copy_if_different ${KYTY_STREAMLINE_RUNTIMES} "$<TARGET_FILE_DIR:${target}>"
+			COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:${target}>/licenses/streamline/ngx" "$<TARGET_FILE_DIR:${target}>/licenses/streamline/reflex"
+			COMMAND ${CMAKE_COMMAND} -E copy_if_different "${KYTY_STREAMLINE_SDK_ROOT}/license.txt" "${KYTY_STREAMLINE_SDK_ROOT}/3rd-party-licenses.md" "$<TARGET_FILE_DIR:${target}>/licenses/streamline"
+			COMMAND ${CMAKE_COMMAND} -E copy_if_different "${KYTY_STREAMLINE_NGX_LICENSE}" "$<TARGET_FILE_DIR:${target}>/licenses/streamline/ngx"
+			COMMAND ${CMAKE_COMMAND} -E copy_if_different "${KYTY_STREAMLINE_SDK_ROOT}/bin/x64/reflex.license.txt" "$<TARGET_FILE_DIR:${target}>/licenses/streamline/reflex"
+			VERBATIM)
+	endif()
 	if(KYTY_ENABLE_DLSS)
 		add_custom_command(TARGET ${target} POST_BUILD
 			COMMAND ${CMAKE_COMMAND} -E copy_if_different "${KYTY_DLSS_RUNTIME}" "$<TARGET_FILE_DIR:${target}>"

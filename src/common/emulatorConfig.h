@@ -54,6 +54,8 @@ struct ConfigOptions {
 	uint32_t               controller_vibration_intensity = 100;
 	PresentMode            present_mode                = PresentMode::Mailbox;
 	DlssMode               dlss_mode                   = DlssMode::Off;
+	uint32_t               render_scale_percent        = 100;
+	bool                   dlss_frame_generation       = false;
 	int32_t                gpu_index                   = -1;
 	bool                   fullscreen_enabled          = false;
 	bool                   hide_cursor_enabled         = false;
@@ -97,6 +99,8 @@ uint32_t GetControllerSpeakerVolume();
 uint32_t GetControllerVibrationIntensity();
 PresentMode GetPresentMode();
 DlssMode GetDlssMode();
+uint32_t GetRenderScalePercent();
+bool DlssFrameGenerationEnabled();
 int32_t GetGpuIndex();
 bool     FullscreenEnabled();
 bool     HideCursorEnabled();

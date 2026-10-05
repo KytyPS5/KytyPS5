@@ -8,6 +8,8 @@
 
 namespace Libs::Graphics {
 
+class Image;
+
 static constexpr uint32_t RENDER_COLOR_ATTACHMENTS_MAX = 8;
 
 struct RenderAttachment {
@@ -19,6 +21,10 @@ struct RenderAttachment {
 	bool                    depth_clear   = false;
 	bool                    has_stencil   = false;
 	bool                    stencil_clear = false;
+	// Cache-owned original. Raster scaling restores its contents/layout at pass end.
+	Image*                  image          = nullptr;
+	uint32_t                mip_level      = 0;
+	uint32_t                base_layer     = 0;
 
 	bool operator==(const RenderAttachment&) const = default;
 };
@@ -30,6 +36,7 @@ struct RenderState {
 	uint32_t                                                   height                = 0;
 	uint32_t                                                   num_layers            = 1;
 	uint32_t                                                   num_color_attachments = 0;
+	uint32_t                                                   raster_scale_percent  = 100;
 
 	bool operator==(const RenderState&) const = default;
 };

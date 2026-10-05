@@ -16,6 +16,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/dlss.h"
+#include "graphics/presentation/dlssFrameGeneration.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
@@ -605,6 +606,13 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	}
 
 	auto features13 = WindowContext::RequiredVulkan13Features();
+	// Streamline stores resource metadata in Vulkan private data slots. Its
+	// interposer requests the extension dependencies but the core feature must
+	// also be explicitly enabled by the host before plugin initialization.
+	if (HasExtension(device_extensions, VK_KHR_PRESENT_ID_EXTENSION_NAME)) {
+		EXIT_NOT_IMPLEMENTED(supported_features13.privateData != VK_TRUE);
+		features13.privateData = VK_TRUE;
+	}
 #if defined(__APPLE__)
 	features13.pNext = robustness2_ext_enabled ? static_cast<void*>(&robustness2)
 	                                           : static_cast<void*>(&features12);
@@ -842,6 +850,14 @@ void WindowContext::CreateVulkan() {
 		EXIT("Could not load Vulkan: %s\n", SDL_GetError());
 	}
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(get_instance_proc_addr);
+	frame_generation = std::make_unique<DlssFrameGeneration>();
+	get_instance_proc_addr = frame_generation->Initialize(get_instance_proc_addr);
+	if (frame_generation->Hooked() && (Config::SpirvDebugPrintfEnabled() || Config::GpuAssistedValidationEnabled())) {
+		LOGF("DLSS Frame Generation unavailable with advanced shader validation; using native Vulkan\n");
+		frame_generation->Shutdown();
+		get_instance_proc_addr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(SDL_Vulkan_GetVkGetInstanceProcAddr());
+	}
+	VULKAN_HPP_DEFAULT_DISPATCHER.init(get_instance_proc_addr);
 
 	VulkanExtensions r;
 	VulkanGetExtensions(r);
@@ -880,7 +896,7 @@ void WindowContext::CreateVulkan() {
 	validation_features.pEnabledValidationFeatures     = enabled_features;
 
 	vk::DebugUtilsMessengerCreateInfoEXT dbg_create_info {};
-	dbg_create_info.pNext           = &validation_features;
+	dbg_create_info.pNext           = enabled_features_count ? &validation_features : nullptr;
 	dbg_create_info.messageSeverity = vk::DebugUtilsMessageSeverityFlagBitsEXT::eVerbose |
 	                                  vk::DebugUtilsMessageSeverityFlagBitsEXT::eInfo |
 	                                  vk::DebugUtilsMessageSeverityFlagBitsEXT::eWarning |
@@ -914,7 +930,7 @@ void WindowContext::CreateVulkan() {
 	inst_info.ppEnabledLayerNames =
 	    (r.enable_validation_layers ? r.required_layers.data() : nullptr);
 
-	const vk::Result result = vk::createInstance(&inst_info, nullptr, &graphic_ctx.instance);
+	const vk::Result result = frame_generation->CreateInstance(inst_info, graphic_ctx.instance);
 	switch (result) {
 		case vk::Result::eSuccess: break;
 		case vk::Result::eErrorIncompatibleDriver:
@@ -932,17 +948,18 @@ void WindowContext::CreateVulkan() {
 		}
 	}
 
-	vk::SurfaceKHR::CType native_surface = VK_NULL_HANDLE;
-	if (!SDL_Vulkan_CreateSurface(window, static_cast<vk::Instance::CType>(graphic_ctx.instance),
-	                              nullptr, &native_surface)) {
+	if (!frame_generation->CreateSurface(window, graphic_ctx.instance, surface)) {
 		EXIT("Could not create a Vulkan surface");
 	}
-	surface = native_surface;
 
 	std::vector<const char*> device_extensions = {
 	    VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME,
 	    VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
 	    "VK_KHR_maintenance1"};
+	if (frame_generation->Hooked()) {
+		// VK_NV_low_latency2, requested by Streamline Reflex, depends on present_id.
+		device_extensions.push_back(VK_KHR_PRESENT_ID_EXTENSION_NAME);
+	}
 
 #if defined(__APPLE__)
 	// MoltenVK lacks VK_EXT_depth_clip_enable and VK_EXT_color_write_enable; the renderer
@@ -1032,6 +1049,7 @@ void WindowContext::CreateVulkan() {
 	}
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(graphic_ctx.device);
 	graphic_ctx.device.getQueue(graphic_ctx.queue_family, 0, &graphic_ctx.queue);
+	frame_generation->OnDevice(graphic_ctx);
 	EXIT_IF(graphic_ctx.queue == nullptr);
 
 	if (!graphic_ctx.CreateAllocator()) {
@@ -1054,12 +1072,9 @@ void WindowContext::RecreateSurface() {
 		graphic_ctx.instance.destroySurfaceKHR(surface, nullptr);
 		surface = nullptr;
 	}
-	vk::SurfaceKHR::CType native_surface = VK_NULL_HANDLE;
-	if (!SDL_Vulkan_CreateSurface(window, static_cast<vk::Instance::CType>(graphic_ctx.instance),
-	                              nullptr, &native_surface)) {
+	if (!frame_generation->CreateSurface(window, graphic_ctx.instance, surface)) {
 		EXIT("Could not recreate the Vulkan surface: %s\n", SDL_GetError());
 	}
-	surface = native_surface;
 }
 
 WindowContext::~WindowContext() {
@@ -1070,6 +1085,7 @@ WindowContext::~WindowContext() {
 
 	if (graphic_ctx.device != nullptr) {
 		RequireVulkanSuccess(graphic_ctx.device.waitIdle(), "wait for Vulkan device shutdown");
+		if (frame_generation) frame_generation->Shutdown();
 		graphic_ctx.DestroyAllocator();
 		graphic_ctx.device.destroy(nullptr);
 		graphic_ctx.device = nullptr;

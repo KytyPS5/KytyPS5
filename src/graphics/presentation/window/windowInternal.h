@@ -16,6 +16,7 @@ namespace Libs::Graphics {
 
 class Presenter;
 class RenderContext;
+class DlssFrameGeneration;
 
 struct SurfaceCapabilities {
 	vk::SurfaceCapabilitiesKHR        capabilities {};
@@ -55,6 +56,7 @@ struct WindowContext {
 	SurfaceCapabilities            surface_capabilities;
 	std::unique_ptr<RenderContext> render_context;
 	std::unique_ptr<Presenter>     presenter;
+	std::unique_ptr<DlssFrameGeneration> frame_generation;
 	WindowLoopState                loop;
 	uint64_t title_fps_start = 0, title_frame_number = 0, title_fps_frames = 0;
 	bool title_initialized = false;

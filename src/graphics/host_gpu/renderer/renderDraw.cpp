@@ -319,6 +319,9 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 
 	const auto& ctx = buffer.GetRegisters();
 	const auto&        vp  = ctx.GetScreenViewport();
+	const auto& effective = buffer.EffectiveRenderState();
+	const float scale_x = float(effective.width) / rendering.width;
+	const float scale_y = float(effective.height) / rendering.height;
 	const vk::Extent2D framebuffer_extent {rendering.width, rendering.height};
 	const auto& outputs = vs_input_info.stage.program->info.outputs;
 	const bool  indexed_viewports =
@@ -357,6 +360,16 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 			viewport.width = 1.0f;
 			scissor.extent = {0, 0};
 		}
+		viewport.x *= scale_x;
+		viewport.y *= scale_y;
+		viewport.width *= scale_x;
+		viewport.height *= scale_y;
+		const auto right = uint32_t(std::ceil(float(scissor.offset.x + scissor.extent.width) * scale_x));
+		const auto bottom = uint32_t(std::ceil(float(scissor.offset.y + scissor.extent.height) * scale_y));
+		scissor.offset.x = int32_t(std::floor(float(scissor.offset.x) * scale_x));
+		scissor.offset.y = int32_t(std::floor(float(scissor.offset.y) * scale_y));
+		scissor.extent.width = std::min(right, effective.width) - scissor.offset.x;
+		scissor.extent.height = std::min(bottom, effective.height) - scissor.offset.y;
 	}
 	vk_buffer.setViewportWithCount(viewport_count, viewports.data());
 	vk_buffer.setScissorWithCount(viewport_count, scissors.data());
@@ -463,6 +476,7 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 	feedback_aspects = {};
 	auto&       cache = m_context.GetTextureCache();
 	RenderState state {};
+	state.raster_scale_percent = Config::GetRenderScalePercent();
 	state.width                 = std::numeric_limits<uint32_t>::max();
 	state.height                = std::numeric_limits<uint32_t>::max();
 	state.num_layers            = std::numeric_limits<uint32_t>::max();
@@ -496,6 +510,9 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		auto& attachment            = state.color_attachments[target.target_slot];
 		attachment.image_view   = image_view;
 		attachment.image_layout = layout;
+		attachment.image        = &image;
+		attachment.mip_level    = view.base_level;
+		attachment.base_layer   = view.base_layer;
 	}
 	if (depth.image_id) {
 		const auto owner = cache.m_slot_images.try_get(depth.image_id);
@@ -558,6 +575,9 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		auto&      attachment     = state.depth_stencil_attachment;
 		attachment.image_view     = image_view;
 		attachment.image_layout   = layout;
+		attachment.image          = &image;
+		attachment.mip_level      = view.base_level;
+		attachment.base_layer     = view.base_layer;
 		attachment.clear_value[0] = std::bit_cast<uint32_t>(depth.depth_clear_value);
 		attachment.clear_value[1] = depth.stencil_clear_value;
 		attachment.has_depth      = static_cast<bool>(aspects & vk::ImageAspectFlagBits::eDepth);
@@ -1129,7 +1149,6 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		CommitIndexBuffer(vk_buffer, index_binding);
 	}
 
-	SetGraphicsDynamicParams(buffer, vk_buffer, vertex_stages.back(), state.depth_info, rendering);
 	if (m_context.GetGraphics().attachment_feedback_loop_enabled) {
 		vk_buffer.setAttachmentFeedbackLoopEnableEXT(feedback_aspects);
 	}
@@ -1139,6 +1158,16 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x400u);
 	}
 	m_context.GetCommandScheduler().BeginRendering(rendering);
+	SetGraphicsDynamicParams(buffer, vk_buffer, vertex_stages.back(), state.depth_info, rendering);
+	if (state.ps_active && state.ps_input_info.raster_scale_dword != UINT32_MAX) {
+		const auto& effective = buffer.EffectiveRenderState();
+		const float inverse_scale[] {float(rendering.width) / effective.width,
+		                             float(rendering.height) / effective.height};
+		vk::ShaderStageFlags push_stages = vk::ShaderStageFlagBits::eFragment;
+		for (const auto& stage : vertex_stages) push_stages |= NativeShaderStage(stage.logical_stage);
+		vk_buffer.pushConstants(pipeline.pipeline_layout, push_stages,
+		                        state.ps_input_info.raster_scale_dword * sizeof(uint32_t), sizeof(inverse_scale), inverse_scale);
+	}
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);

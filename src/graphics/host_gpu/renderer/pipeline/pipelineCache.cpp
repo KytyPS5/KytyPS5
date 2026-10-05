@@ -670,6 +670,14 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount : 0;
 	GraphicsPrograms  result;
 	if (pixel_active) {
+		// Keep fragment positions in guest pixel units while the attachment and
+		// viewport rasterize at a reduced resolution. Reserve these before any
+		// shader resource constants, including the mesh draw prefix.
+		pixel_info.raster_scale_dword = UINT32_MAX;
+		if (pixel_info.ps_pos_x || pixel_info.ps_pos_y) {
+			pixel_info.raster_scale_dword = push_data_cursor;
+			push_data_cursor += 2;
+		}
 		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
 	}
 	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {

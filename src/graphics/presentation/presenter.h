@@ -10,6 +10,7 @@ namespace Libs::Graphics {
 
 class CommandBuffer;
 class RenderContext;
+class DlssFrameGeneration;
 struct ImageInfo;
 struct WindowContext;
 struct DlssFrameInputs;
@@ -36,6 +37,7 @@ public:
 	[[nodiscard]] bool           IsGuestPaused() const noexcept;
 	[[nodiscard]] bool           NeedsSystemOverlayRefresh() const noexcept;
 	[[nodiscard]] RenderContext& Renderer() const noexcept;
+	[[nodiscard]] DlssFrameGeneration& FrameGeneration() const noexcept;
 	void                         Present(Frame& frame);
 	void                         Present(std::span<const Layer> layers);
 	void                         ClearLayer(int bus);

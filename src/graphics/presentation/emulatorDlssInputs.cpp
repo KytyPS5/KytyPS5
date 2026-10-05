@@ -8,6 +8,7 @@
 #include "gpu_blit_shaders/emulator_dlss_reduce_spv.h"
 #include "gpu_blit_shaders/emulator_dlss_flow_spv.h"
 #include "gpu_blit_shaders/emulator_dlss_inputs_spv.h"
+#include "gpu_blit_shaders/emulator_dlss_copy_spv.h"
 
 #include <algorithm>
 #include <array>
@@ -78,7 +79,7 @@ struct EmulatorDlssInputs::Impl {
 	vk::DescriptorSetLayout descriptors = nullptr;
 	vk::PipelineLayout layout = nullptr;
 	vk::Sampler sampler = nullptr;
-	std::array<vk::Pipeline, 3> pipelines {};
+	std::array<vk::Pipeline, 4> pipelines {};
 	vk::Extent2D input_extent {}, source_extent {};
 	vk::Format source_format = vk::Format::eUndefined;
 	uint64_t frames = 0, previous_time = 0;
@@ -144,8 +145,9 @@ struct EmulatorDlssInputs::Impl {
 		sampler_info.magFilter = sampler_info.minFilter = vk::Filter::eLinear;
 		sampler_info.addressModeU = sampler_info.addressModeV = sampler_info.addressModeW = vk::SamplerAddressMode::eClampToEdge;
 		RequireVulkanSuccess(graphics.device.createSampler(&sampler_info, nullptr, &sampler), "create emulator DLSS sampler");
-		const std::array<std::span<const uint32_t>, 3> shaders {
-		    EMULATOR_DLSS_REDUCE_SPV, EMULATOR_DLSS_FLOW_SPV, EMULATOR_DLSS_INPUTS_SPV};
+		const std::array<std::span<const uint32_t>, 4> shaders {
+		    EMULATOR_DLSS_REDUCE_SPV, EMULATOR_DLSS_FLOW_SPV, EMULATOR_DLSS_INPUTS_SPV,
+		    EMULATOR_DLSS_COPY_SPV};
 		for (size_t i = 0; i < shaders.size(); ++i) {
 			vk::ShaderModuleCreateInfo module_info {};
 			module_info.codeSize = shaders[i].size_bytes();
@@ -218,6 +220,54 @@ EmulatorDlssInputs::EmulatorDlssInputs(GraphicContext& graphics, CommandSchedule
     : m_impl(std::make_unique<Impl>(graphics, scheduler)) {}
 EmulatorDlssInputs::~EmulatorDlssInputs() = default;
 void EmulatorDlssInputs::Reset() { m_impl->reset = true; }
+
+bool EmulatorDlssInputs::ResampleColor(CommandBuffer& command, Image& source,
+                                       VulkanImage& output, vk::ImageView output_view) {
+	auto& state = *m_impl;
+	if (command.IsInvalid() || &command.GetGraphics() != &state.graphics ||
+	    source.backing.image == nullptr || source.backing.layers != 1 || source.backing.samples != 1 ||
+	    source.backing.image_type != vk::ImageType::e2D || source.backing.extent.depth != 1 ||
+	    !(source.backing.usage & vk::ImageUsageFlagBits::eSampled) ||
+	    !SupportedColor(state.graphics, source.backing.format) ||
+	    output.image == nullptr || output_view == nullptr ||
+	    output.format != vk::Format::eR16G16B16A16Sfloat || output.layers != 1 || output.samples != 1 ||
+	    output.extent.width == 0 || output.extent.height == 0 ||
+	    !(output.usage & vk::ImageUsageFlagBits::eStorage) || !state.Initialize()) return false;
+	command.EndRendering();
+	const auto handle = command.Handle();
+	source.Transit(vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead, {}, handle);
+	vk::ImageMemoryBarrier2 barrier {};
+	barrier.srcStageMask = output.state.pl_stage;
+	barrier.srcAccessMask = output.state.access_mask;
+	barrier.dstStageMask = vk::PipelineStageFlagBits2::eComputeShader;
+	barrier.dstAccessMask = vk::AccessFlagBits2::eShaderWrite;
+	barrier.oldLayout = output.state.layout;
+	barrier.newLayout = vk::ImageLayout::eGeneral;
+	barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.image = output.image;
+	barrier.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+	vk::DependencyInfo dependency {};
+	dependency.imageMemoryBarrierCount = 1;
+	dependency.pImageMemoryBarriers = &barrier;
+	handle.pipelineBarrier2(dependency);
+	output.state = {barrier.dstStageMask, barrier.dstAccessMask, barrier.newLayout};
+	output.subresource_states.clear();
+	const std::array<vk::DescriptorImageInfo, 2> infos {{
+	    {state.sampler, View(source, false), vk::ImageLayout::eShaderReadOnlyOptimal},
+	    {nullptr, output_view, vk::ImageLayout::eGeneral}}};
+	std::array<vk::WriteDescriptorSet, 2> writes {};
+	for (uint32_t i = 0; i < writes.size(); ++i) {
+		writes[i].dstBinding = i == 0 ? 0 : 3;
+		writes[i].descriptorCount = 1;
+		writes[i].descriptorType = i == 0 ? vk::DescriptorType::eCombinedImageSampler : vk::DescriptorType::eStorageImage;
+		writes[i].pImageInfo = &infos[i];
+	}
+	handle.bindPipeline(vk::PipelineBindPoint::eCompute, state.pipelines[3]);
+	handle.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, state.layout, 0,
+	                            static_cast<uint32_t>(writes.size()), writes.data());
+	handle.dispatch((output.extent.width + 7) / 8, (output.extent.height + 7) / 8, 1);
+	return true;
+}
 
 std::optional<DlssFrameInputs> EmulatorDlssInputs::Prepare(CommandBuffer& command, Image& source,
                                                          vk::Extent2D extent) {

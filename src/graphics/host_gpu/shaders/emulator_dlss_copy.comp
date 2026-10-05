@@ -1,0 +1,12 @@
+#version 450
+layout(local_size_x=8, local_size_y=8) in;
+layout(binding=0) uniform sampler2D source_color;
+layout(binding=3, rgba16f) uniform writeonly image2D target_color;
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(target_color);
+    if (any(greaterThanEqual(p, size))) return;
+    // The CPU binds an UNORM view for sRGB sources to preserve encoded color.
+    vec2 uv = (vec2(p) + .5) / vec2(size);
+    imageStore(target_color, p, textureLod(source_color, uv, 0));
+}

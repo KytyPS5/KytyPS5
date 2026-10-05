@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/renderer/rasterScale.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <algorithm>
@@ -17,7 +18,14 @@
 namespace Libs::Graphics {
 
 CommandBuffer::CommandBuffer(CommandScheduler& scheduler)
-    : m_context(scheduler.Context()), m_graphics(scheduler.Graphics()) {}
+    : m_context(scheduler.Context()), m_graphics(scheduler.Graphics()),
+      m_raster_scaler(std::make_unique<RasterScaler>(m_graphics, scheduler)) {}
+
+CommandBuffer::~CommandBuffer() = default;
+
+const RenderState& CommandBuffer::EffectiveRenderState() const {
+	return m_raster_scaler->State();
+}
 
 bool CommandBuffer::IsInvalid() const {
 	return m_buffer == nullptr;
@@ -60,13 +68,14 @@ void CommandBuffer::SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0,
 	m_debug_arg4      = arg4;
 }
 
-void CommandBuffer::BeginRendering(const RenderState& state) const {
-	if (m_rendering && m_render_state == state) {
+void CommandBuffer::BeginRendering(const RenderState& requested) const {
+	if (m_rendering && m_render_state == requested) {
 		return;
 	}
+	EndRendering();
+	const auto& state = m_raster_scaler->Begin(Handle(), requested);
 	EXIT_IF(state.width == 0 || state.height == 0 || state.num_layers == 0 ||
 	        state.num_color_attachments > RENDER_COLOR_ATTACHMENTS_MAX);
-	EndRendering();
 
 	std::array<vk::RenderingAttachmentInfo, RENDER_COLOR_ATTACHMENTS_MAX> colors {};
 	for (uint32_t i = 0; i < state.num_color_attachments; i++) {
@@ -104,7 +113,7 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	rendering.pDepthAttachment     = depth_stencil.has_depth ? &depth : nullptr;
 	rendering.pStencilAttachment   = depth_stencil.has_stencil ? &stencil : nullptr;
 	Handle().beginRendering(rendering);
-	m_render_state = state;
+	m_render_state = requested;
 	m_rendering    = true;
 }
 
@@ -114,6 +123,7 @@ void CommandBuffer::EndRendering() const {
 	}
 	Handle().endRendering();
 	m_rendering    = false;
+	m_raster_scaler->End(Handle());
 	m_render_state = {};
 }
 

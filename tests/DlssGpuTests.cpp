@@ -32,10 +32,12 @@
 using namespace Libs::Graphics;
 namespace {
 std::atomic<int> validation_errors = 0;
+bool interpolation_succeeded = true;
 void Check(bool condition, const char* message) {
 	if (!condition) {
 		std::fprintf(stderr, "DlssGpuTests: %s\n", message);
-		std::exit(1);
+		std::fflush(stderr);
+		std::_Exit(1);
 	}
 }
 VKAPI_ATTR VkBool32 VKAPI_CALL DebugCallback(vk::DebugUtilsMessageSeverityFlagBitsEXT severity,
@@ -55,6 +57,65 @@ ImageInfo Description(vk::Format format, vk::Extent2D size) {
 	info.bytes_per_block = format == vk::Format::eR16G16B16A16Sfloat ? 8 : 4;
 	info.mip_layout[0] = {0, uint64_t(size.width) * size.height * info.bytes_per_block, size.width, size.height};
 	return info;
+}
+
+std::vector<uint8_t> Readback(CommandScheduler& scheduler, VulkanImage& image, uint32_t bytes_per_pixel);
+
+void RasterScaleCase(GraphicContext& graphics, CommandScheduler& scheduler) {
+	for (const auto percent : {25u, 50u, 67u, 100u}) {
+		auto& command = scheduler.Current();
+		Image color(graphics, scheduler, Description(vk::Format::eR8G8B8A8Unorm, {256, 128}));
+		Image depth(graphics, scheduler, Description(vk::Format::eD32Sfloat, {256, 128}));
+		RenderState state {};
+		state.width = 256;
+		state.height = 128;
+		state.num_color_attachments = 1;
+		state.raster_scale_percent = percent;
+		auto& attachment = state.color_attachments[0];
+		attachment.image = &color;
+		attachment.image_layout = vk::ImageLayout::eColorAttachmentOptimal;
+		attachment.is_clear = true;
+		attachment.clear_value = {std::bit_cast<uint32_t>(.25f), std::bit_cast<uint32_t>(.5f), 0, std::bit_cast<uint32_t>(1.f)};
+		ImageViewInfo view {};
+		view.format = color.backing.format;
+		view.usage = vk::ImageUsageFlagBits::eColorAttachment;
+		attachment.image_view = color.FindView(view);
+		auto& db = state.depth_stencil_attachment;
+		db.image = &depth;
+		db.image_layout = vk::ImageLayout::eDepthAttachmentOptimal;
+		db.has_depth = db.depth_clear = true;
+		db.clear_value[0] = std::bit_cast<uint32_t>(.75f);
+		view.format = depth.backing.format;
+		view.aspect = vk::ImageAspectFlagBits::eDepth;
+		view.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+		db.image_view = depth.FindView(view);
+		color.Transit(attachment.image_layout, vk::AccessFlagBits2::eColorAttachmentWrite, {}, command.Handle());
+		depth.Transit(db.image_layout, vk::AccessFlagBits2::eDepthStencilAttachmentWrite, {}, command.Handle());
+		command.BeginRendering(state);
+		const auto& effective = command.EffectiveRenderState();
+		Check(effective.width == 256 * percent / 100 && effective.height == 128 * percent / 100,
+		      "render scale did not reduce actual raster attachments");
+		vk::ClearAttachment clear {};
+		clear.aspectMask = vk::ImageAspectFlagBits::eColor;
+		clear.colorAttachment = 0;
+		clear.clearValue.color.float32 = std::array<float, 4> {1.f, 0.f, 0.f, 1.f};
+		vk::ClearRect rect {};
+		rect.rect.extent = {effective.width / 2, effective.height};
+		rect.layerCount = 1;
+		command.Handle().clearAttachments(1, &clear, 1, &rect);
+		// This consumer computes barriers before EndRendering. It must still see
+		// the upscaled render result, with tracked layouts matching the real GPU.
+		color.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {}, command.Handle());
+		depth.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {}, command.Handle());
+		const auto pixels = Readback(scheduler, color.backing, 4);
+		Check(pixels[0] == 255 && pixels[1] == 0 && pixels[2] == 0, "scaled color not stored into guest image");
+		const auto right = (256 * 64 + 240) * 4;
+		Check(std::abs(int(pixels[right]) - 64) <= 1 && std::abs(int(pixels[right + 1]) - 128) <= 1,
+		      "scaled load clear did not preserve unmodified pixels");
+		// Exercise image retirement on a subsequent pass with a different size.
+		scheduler.FlushAndWait();
+	}
+	std::puts("Raster scale GPU cases passed");
 }
 
 void Clear(CommandBuffer& command, Image& image, std::array<float, 4> value) {
@@ -115,6 +176,32 @@ float Half(uint16_t bits) {
 	                    exponent == 31 ? std::numeric_limits<float>::infinity() :
 	                    std::ldexp(float(1024 + mantissa), exponent - 25);
 	return bits & 0x8000 ? -value : value;
+}
+
+void CheckEncodedResample(const std::vector<uint8_t>& source, vk::Extent2D source_size,
+                          const std::vector<uint8_t>& output, vk::Extent2D output_size,
+                          bool bgra = false) {
+	for (const auto& point : std::array<std::array<uint32_t, 2>, 3> {{{0, 0},
+	         {output_size.width / 2, output_size.height / 2}, {output_size.width - 1, output_size.height - 1}}}) {
+		const float x = std::clamp((point[0] + .5f) * source_size.width / output_size.width - .5f,
+		                           0.f, float(source_size.width - 1));
+		const float y = std::clamp((point[1] + .5f) * source_size.height / output_size.height - .5f,
+		                           0.f, float(source_size.height - 1));
+		const auto x0 = uint32_t(x), y0 = uint32_t(y);
+		const auto x1 = std::min(x0 + 1, source_size.width - 1), y1 = std::min(y0 + 1, source_size.height - 1);
+		for (size_t channel = 0; channel < 4; ++channel) {
+			const auto source_channel = bgra && channel < 3 ? 2 - channel : channel;
+			const auto sample = [&](uint32_t sx, uint32_t sy) {
+				return source[(uint64_t(sy) * source_size.width + sx) * 4 + source_channel] / 255.f;
+			};
+			const float expected = std::lerp(std::lerp(sample(x0, y0), sample(x1, y0), x - x0),
+			                                 std::lerp(sample(x0, y1), sample(x1, y1), x - x0), y - y0);
+			uint16_t actual;
+			std::memcpy(&actual, output.data() + (uint64_t(point[1]) * output_size.width + point[0]) * 8 + channel * 2, 2);
+			Check(std::abs(Half(actual) - expected) < .003f,
+			      "sRGB DLSS fallback changed encoded color or channel order");
+		}
+	}
 }
 
 void UploadPattern(CommandScheduler& scheduler, Image& image, int shift_x, int shift_y) {
@@ -316,7 +403,8 @@ void EvaluateCase(GraphicContext& graphics, RenderContext& renderer, DlssProcess
 	std::printf("DLSS mode %d: %ux%u -> %ux%u, native + emulator GPU output verified\n", static_cast<int>(mode), size->width, size->height, output_size.width, output_size.height);
 }
 
-void EmulatorPresentationCase(Presenter& presenter, Config::ConfigOptions config) {
+void EmulatorPresentationCase(Presenter& presenter, Config::ConfigOptions config,
+                              const char* regression = nullptr) {
 	auto& renderer = presenter.Renderer();
 	auto& scheduler = renderer.GetCommandScheduler();
 	auto& graphics = scheduler.Graphics();
@@ -325,7 +413,9 @@ void EmulatorPresentationCase(Presenter& presenter, Config::ConfigOptions config
 	debug.messageType = vk::DebugUtilsMessageTypeFlagBitsEXT::eValidation | vk::DebugUtilsMessageTypeFlagBitsEXT::ePerformance;
 	debug.pfnUserCallback = DebugCallback;
 	vk::DebugUtilsMessengerEXT messenger;
-	RequireVulkanSuccess(graphics.instance.createDebugUtilsMessengerEXT(&debug, nullptr, &messenger), "presentation validation messenger");
+	if (config.vulkan_validation_enabled) {
+		RequireVulkanSuccess(graphics.instance.createDebugUtilsMessengerEXT(&debug, nullptr, &messenger), "presentation validation messenger");
+	}
 	HW::Context registers {};
 	HW::UserConfig user {};
 	HW::Shader shaders {};
@@ -348,6 +438,172 @@ void EmulatorPresentationCase(Presenter& presenter, Config::ConfigOptions config
 	auto& source = cache.GetImage(id);
 	UploadPattern(scheduler, source, 0, 0);
 	cache.MarkGpuWritten(id);
+	if (config.dlss_frame_generation) {
+		Check(presenter.FrameGeneration().Available(), "Frame Generation unavailable on test device");
+		const auto windows = SDL_GetWindows(nullptr);
+		Check(windows && windows[0], "Frame Generation test window");
+		auto* test_window = windows[0];
+		const auto hwnd = static_cast<HWND>(SDL_GetPointerProperty(SDL_GetWindowProperties(test_window),
+		    SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr));
+		Check(hwnd != nullptr, "Frame Generation HWND");
+		SDL_free(windows);
+		constexpr int count = 180;
+		for (int index = 0; index < count; ++index) {
+			UploadPattern(scheduler, source, index, 0);
+			cache.MarkGpuWritten(id);
+			auto& frame = presenter.PrepareFrame(scheduler.Current(), info);
+			Check(frame.fg_inputs && frame.fg_inputs->motion && frame.fg_inputs->depth,
+			      "Frame Generation inputs were not captured per frame");
+			if (regression && std::strcmp(regression, "fg-controlled") == 0) {
+				// This fixture translates one source pixel per frame. Isolate the
+				// runtime from optical-flow estimation using its exact backward motion.
+				Clear(scheduler.Current(), *frame.fg_inputs->depth, {.5f, 0, 0, 0});
+				Clear(scheduler.Current(), *frame.fg_inputs->motion,
+				      {-float(frame.fg_inputs->motion->backing.extent.width) / 640.f, 0, 0, 0});
+				frame.fg_inputs->jitter_x = frame.fg_inputs->jitter_y = 0;
+				frame.fg_inputs->reset = index == 0;
+			}
+			scheduler.FlushAndWait();
+			// DLSS-G deliberately bypasses interpolation for unfocused windows.
+			// The API runner can take focus while reporting build output. Restore
+			// only this test window before measuring the actual SDK presents.
+			if (GetForegroundWindow() != hwnd) {
+				const auto foreground_thread = GetWindowThreadProcessId(GetForegroundWindow(), nullptr);
+				const auto this_thread = GetCurrentThreadId();
+				const bool attached = foreground_thread && foreground_thread != this_thread &&
+				    AttachThreadInput(this_thread, foreground_thread, TRUE);
+				ShowWindow(hwnd, SW_RESTORE);
+				SetForegroundWindow(hwnd);
+				if (attached) AttachThreadInput(this_thread, foreground_thread, FALSE);
+			}
+			presenter.Present(frame);
+			SDL_Event event {};
+			while (SDL_PollEvent(&event)) {}
+			// Leave room for an intermediate scanout even on a 60 Hz display.
+			std::this_thread::sleep_for(std::chrono::milliseconds(33));
+		}
+		RequireVulkanSuccess(graphics.device.waitIdle(), "wait for generated frames");
+		const auto presented = presenter.FrameGeneration().TotalPresentedFrames();
+		const auto submitted = presenter.FrameGeneration().TotalSubmittedFrames();
+		std::printf("Frame Generation: %llu display frames / %u actual submissions (%d guest frames)\n",
+		    static_cast<unsigned long long>(presented), submitted, count);
+		std::fflush(stdout);
+		interpolation_succeeded = presented > submitted;
+		// Off resumes ordinary presentation; re-enable prepares a fresh history.
+		config.dlss_frame_generation = false;
+		Config::Load(config);
+		Check(presenter.PresentLastFrame(), "Frame Generation disable broke cached presentation");
+		Check(!presenter.FrameGeneration().Enabled(), "Frame Generation remained enabled after Off");
+		config.dlss_frame_generation = true;
+		Config::Load(config);
+		const auto display_before = presenter.FrameGeneration().TotalPresentedFrames();
+		const auto submissions_before = presenter.FrameGeneration().TotalSubmittedFrames();
+		// Re-enable and change output size while previously tagged resources exist.
+		SDL_SetWindowSize(test_window, 1360, 768);
+		SDL_RaiseWindow(test_window);
+		for (int index = count; index < count + 45; ++index) {
+			UploadPattern(scheduler, source, index, 0);
+			cache.MarkGpuWritten(id);
+			auto& next = presenter.PrepareFrame(scheduler.Current(), info);
+			Check(next.fg_inputs != nullptr, "re-enabled Frame Generation lost inputs");
+			if (config.dlss_mode == Config::DlssMode::Off) {
+				Check(next.fg_inputs->jitter_x == 0 && next.fg_inputs->jitter_y == 0,
+				      "unjittered Off color carries reconstruction jitter");
+			}
+			scheduler.FlushAndWait();
+			SetForegroundWindow(hwnd);
+			presenter.Present(next);
+			SDL_Event event {};
+			while (SDL_PollEvent(&event)) {}
+			std::this_thread::sleep_for(std::chrono::milliseconds(33));
+		}
+		RequireVulkanSuccess(graphics.device.waitIdle(), "wait for re-enabled generation");
+		const auto new_display = presenter.FrameGeneration().TotalPresentedFrames() - display_before;
+		const auto new_submissions = presenter.FrameGeneration().TotalSubmittedFrames() - submissions_before;
+		std::printf("Frame Generation re-enable/resize: %llu display frames / %u actual submissions\n",
+		    static_cast<unsigned long long>(new_display), new_submissions);
+		interpolation_succeeded = interpolation_succeeded && new_display > new_submissions;
+		Check(presenter.FrameGeneration().Enabled(), "Frame Generation did not re-enable");
+		// A missing native depth input must retire a reused snapshot and present normally.
+		DlssFrameInputs missing {};
+		for (int index = 0; index < 6; ++index) {
+			auto& invalid = presenter.PrepareFrame(scheduler.Current(), info, &missing);
+			Check(!invalid.fg_inputs, "invalid input reused stale Frame Generation snapshot");
+			scheduler.FlushAndWait();
+			presenter.Present(invalid);
+		}
+		Check(!presenter.FrameGeneration().Enabled(), "invalid inputs did not disable generation");
+		graphics.instance.destroyDebugUtilsMessengerEXT(messenger, nullptr);
+		Check(validation_errors == 0, "Frame Generation Vulkan validation errors");
+		return;
+	}
+	if (regression != nullptr) {
+		const auto original = Readback(scheduler, source.backing, 4);
+		if (std::strcmp(regression, "srgb") == 0) {
+			config.dlss_mode = Config::DlssMode::Off;
+			Config::Load(config);
+			for (bool main_bus : {true, false}) {
+				auto& copied = presenter.PrepareFrame(scheduler.Current(), info, nullptr, main_bus);
+				Check(!copied.dlss_evaluated, "Off/overlay unexpectedly evaluated DLSS");
+				Check(Readback(scheduler, copied.image, 4) == original,
+				      "sRGB Off/overlay presentation changed encoded pixel bytes");
+				presenter.Discard(copied);
+			}
+			Image bgra(graphics, scheduler, Description(vk::Format::eB8G8R8A8Srgb, {37, 19}));
+			UploadPattern(scheduler, bgra, 0, 0);
+			const auto bgra_bytes = Readback(scheduler, bgra.backing, 4);
+			Presenter::Frame copied;
+			copied.Configure(graphics, {37, 19}, vk::Format::eB8G8R8A8Unorm);
+			copied.CopyFrom(scheduler.Current(), bgra);
+			Check(Readback(scheduler, copied.image, 4) == bgra_bytes,
+			      "BGRA sRGB copy changed encoded pixel bytes");
+			graphics.DeleteImage(copied.image);
+		} else if (std::strcmp(regression, "fallback") == 0) {
+			DlssFrameInputs invalid {};
+			auto& fallback = presenter.PrepareFrame(scheduler.Current(), info, &invalid);
+			Check(!fallback.dlss_evaluated, "invalid inputs did not fall back");
+			Check(fallback.image.format == vk::Format::eR16G16B16A16Sfloat,
+			      "fallback did not retain the reconstruction output");
+			const auto output = Readback(scheduler, fallback.image, 8);
+			CheckEncodedResample(original, {640, 360}, output, {960, 540});
+			Image bgra(graphics, scheduler, Description(vk::Format::eB8G8R8A8Srgb, {37, 19}));
+			UploadPattern(scheduler, bgra, 0, 0);
+			const auto bgra_bytes = Readback(scheduler, bgra.backing, 4);
+			EmulatorDlssInputs generator(graphics, scheduler);
+			Check(generator.ResampleColor(scheduler.Current(), bgra, fallback.image, fallback.view),
+			      "BGRA sRGB fallback rejected");
+			CheckEncodedResample(bgra_bytes, {37, 19}, Readback(scheduler, fallback.image, 8), {960, 540}, true);
+			presenter.Discard(fallback);
+		} else if (std::strcmp(regression, "pool") == 0) {
+			auto& blank = presenter.PrepareBlankFrame(960, 540, true);
+			auto& main = presenter.PrepareFrame(scheduler.Current(), info);
+			auto& overlay = presenter.PrepareFrame(scheduler.Current(), info, nullptr, false);
+			scheduler.Finish();
+			const auto main_image = main.image.image;
+			const auto overlay_image = overlay.image.image;
+			presenter.Discard(overlay);
+			presenter.Discard(main);
+			for (int repeat = 0; repeat < 4; ++repeat) {
+				auto& next_main = presenter.PrepareFrame(scheduler.Current(), info);
+				Check(&next_main == &main && next_main.image.image == main_image,
+				      "MAIN DLSS frame stole/reallocated an overlay image");
+				auto& next_overlay = presenter.PrepareFrame(scheduler.Current(), info, nullptr, false);
+				Check(&next_overlay == &overlay && next_overlay.image.image == overlay_image,
+				      "overlay frame stole/reallocated a DLSS image");
+				scheduler.Finish();
+				presenter.Discard(next_overlay);
+				presenter.Discard(next_main);
+			}
+			presenter.Discard(blank);
+		} else {
+			Check(false, "unknown presentation regression case");
+		}
+		scheduler.Finish();
+		graphics.instance.destroyDebugUtilsMessengerEXT(messenger, nullptr);
+		Check(validation_errors == 0, "regression Vulkan validation errors");
+		std::printf("Presentation regression %s passed\n", regression);
+		return;
+	}
 	// No scene adapter, depth or motion is passed to PrepareFrame.
 	auto& frame = presenter.PrepareFrame(scheduler.Current(), info);
 	Check(frame.dlss_evaluated, "ordinary VideoOut color does not activate emulator DLSS");
@@ -405,14 +661,25 @@ int main(int argc, char** argv) {
 	subsystems.Initialize<Config::Lifecycle>();
 	Config::ConfigOptions config;
 	config.dlss_mode = Config::DlssMode::Quality;
-	const bool emulator_presentation = argc == 2 && std::strcmp(argv[1], "--emulator-presentation") == 0;
-	const bool window_device = argc == 2 &&
+	const bool presentation_regression = argc == 3 && std::strcmp(argv[1], "--presentation-regression") == 0;
+	const bool fg_controlled = argc == 2 && (std::strcmp(argv[1], "--frame-generation-controlled") == 0 ||
+	    std::strcmp(argv[1], "--frame-generation-controlled-off") == 0);
+	const bool frame_generation_off = argc == 2 && (std::strcmp(argv[1], "--frame-generation-off") == 0 ||
+	    std::strcmp(argv[1], "--frame-generation-controlled-off") == 0);
+	const bool frame_generation = fg_controlled || frame_generation_off || (argc == 2 && std::strcmp(argv[1], "--frame-generation") == 0);
+	const bool fg_validation_fallback = argc == 2 && std::strcmp(argv[1], "--frame-generation-validation-fallback") == 0;
+	config.dlss_frame_generation = frame_generation || fg_validation_fallback;
+	if (frame_generation_off) config.dlss_mode = Config::DlssMode::Off;
+	const bool emulator_presentation = presentation_regression || frame_generation ||
+	    (argc == 2 && std::strcmp(argv[1], "--emulator-presentation") == 0);
+	const bool window_device = emulator_presentation || fg_validation_fallback || (argc == 2 &&
 	    (std::strcmp(argv[1], "--window-device") == 0 ||
-	     std::strcmp(argv[1], "--window-device-off") == 0 || emulator_presentation);
+	     std::strcmp(argv[1], "--window-device-off") == 0));
 	if (window_device) {
 		config.printf_direction = Config::LogDirection::Console;
-		config.vulkan_validation_enabled = emulator_presentation;
+		config.vulkan_validation_enabled = (emulator_presentation && !frame_generation) || fg_validation_fallback;
 		if (emulator_presentation) { config.screen_width = 960; config.screen_height = 540; }
+		if (frame_generation) { config.screen_width = 1280; config.screen_height = 720; }
 		if (std::strcmp(argv[1], "--window-device-off") == 0) config.dlss_mode = Config::DlssMode::Off;
 	}
 	Config::Load(config);
@@ -473,10 +740,13 @@ int main(int argc, char** argv) {
 		subsystems.Initialize<Libs::LibKernel::FileSystem::Lifecycle>();
 		subsystems.Initialize<Libs::Controller::Lifecycle>();
 		subsystems.Initialize<Libs::Audio::Lifecycle>();
-		auto& presenter = WindowInit(640, 360);
-		if (emulator_presentation) EmulatorPresentationCase(presenter, config);
+		auto& presenter = WindowInit(frame_generation ? 1280 : 640, frame_generation ? 720 : 360);
+		if (fg_validation_fallback) Check(!presenter.FrameGeneration().Available(), "Frame Generation must retain validated Vulkan fallback");
+		if (emulator_presentation) EmulatorPresentationCase(presenter, config,
+		                                                     fg_controlled ? "fg-controlled" : (presentation_regression ? argv[2] : nullptr));
 		std::puts("Production window Vulkan device created successfully");
 		WindowShutdown();
+		Check(interpolation_succeeded, "no intermediate DLSS frames were presented");
 		return 0;
 	}
 	static vk::detail::DynamicLoader loader;
@@ -564,6 +834,7 @@ int main(int argc, char** argv) {
 		HW::Shader shaders {};
 		auto& scheduler = renderer.GetCommandScheduler();
 		scheduler.Begin(registers, user, shaders);
+		RasterScaleCase(graphics, scheduler);
 		EmulatorMotionCase(graphics, scheduler);
 		{
 			DlssProcessor dlss(graphics, scheduler);

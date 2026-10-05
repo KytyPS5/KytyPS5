@@ -14001,6 +14001,18 @@ void TestNewShaderRecompilerStageInputInfo() {
         "SPIR-V lacks interpolant Location 1 decoration");
   CheckSpirvBinaryValidates(ps_result.spirv);
 
+  // The mesh prefix uses dwords 0..5; fragment coordinate compensation must
+  // coexist with it and with resource constants on both native and scaled passes.
+  ps_info.raster_scale_dword = 6;
+  const auto scaled_result = RecompileForTest(shader, ps_options);
+  CheckSpirvBinaryValidates(scaled_result.spirv);
+  std::vector<uint32_t> native_key, scaled_key;
+  BuildStageStaticKey(ps_info, scaled_key);
+  ps_info.raster_scale_dword = UINT32_MAX;
+  BuildStageStaticKey(ps_info, native_key);
+  Check(native_key != scaled_key,
+        "fragment coordinate compensation must have a distinct shader cache key");
+
   ShaderPixelInputInfo ps_pos_y_info{};
   ps_pos_y_info.input_num = 1;
   ps_pos_y_info.ps_system_input_base = 2;

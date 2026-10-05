@@ -313,6 +313,7 @@ set(gpu_blit_shader_sources
 	"${gpu_tiler_shader_dir}/emulator_dlss_reduce.comp"
 	"${gpu_tiler_shader_dir}/emulator_dlss_flow.comp"
 	"${gpu_tiler_shader_dir}/emulator_dlss_inputs.comp"
+	"${gpu_tiler_shader_dir}/emulator_dlss_copy.comp"
 )
 foreach(shader_source IN LISTS gpu_blit_shader_sources)
 	get_filename_component(shader_name "${shader_source}" NAME_WE)
@@ -402,7 +403,7 @@ endfunction()
 
 function(configure_windows_image_layout target)
 	if(KYTY_CLANG_CL)
-		if(KYTY_ENABLE_DLSS)
+		if(KYTY_ENABLE_DLSS OR KYTY_ENABLE_DLSS_FG)
 			# NGX's Vulkan extensions fail device creation with ASLR disabled.
 			# Keep the GPU regression executable on the same layout as the engine.
 			target_link_options(${target} PRIVATE "/DYNAMICBASE" "/HIGHENTROPYVA")
@@ -420,7 +421,17 @@ if(KYTY_ENABLE_DLSS)
 	add_test(NAME dlss_gpu COMMAND dlss_gpu_tests)
 	add_test(NAME dlss_window_device COMMAND dlss_gpu_tests --window-device)
 	add_test(NAME dlss_window_device_off COMMAND dlss_gpu_tests --window-device-off)
+	if(KYTY_ENABLE_DLSS_FG)
+		add_test(NAME dlss_frame_generation COMMAND dlss_gpu_tests --frame-generation)
+		add_test(NAME dlss_frame_generation_off COMMAND dlss_gpu_tests --frame-generation-off)
+		set_tests_properties(dlss_frame_generation dlss_frame_generation_off PROPERTIES TIMEOUT 60 LABELS "gpu;dlss")
+		add_test(NAME dlss_frame_generation_validation_fallback COMMAND dlss_gpu_tests --frame-generation-validation-fallback)
+	endif()
 	add_test(NAME dlss_emulator_presentation COMMAND dlss_gpu_tests --emulator-presentation)
+	foreach(regression srgb fallback pool)
+		add_test(NAME dlss_presentation_${regression} COMMAND dlss_gpu_tests --presentation-regression ${regression})
+		set_tests_properties(dlss_presentation_${regression} PROPERTIES LABELS "gpu;dlss")
+	endforeach()
 	add_test(NAME presentation_window_title COMMAND dlss_gpu_tests --window-title-timing)
 	set_tests_properties(presentation_window_title PROPERTIES TIMEOUT 15)
 	set_tests_properties(dlss_gpu PROPERTIES SKIP_RETURN_CODE 77 LABELS "gpu;dlss")

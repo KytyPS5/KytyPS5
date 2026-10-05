@@ -34,6 +34,9 @@ struct GraphicContext {
 	bool                               attachment_feedback_loop_enabled      = false;
 	bool                               provoking_vertex_last_enabled         = false;
 	bool                               supports_block_texel_view              = false;
+	bool                               image_view_min_lod_enabled            = false;
+	bool                               shader_buffer_int64_atomics_enabled   = false;
+	bool                               shader_cull_distance_enabled          = false;
 	bool                                      mesh_shader_enabled                   = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
 	uint32_t                           subgroup_size                         = 0;

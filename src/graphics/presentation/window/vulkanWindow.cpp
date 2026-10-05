@@ -250,7 +250,15 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 #else
 		check_feature(color_write_ext.colorWriteEnable, "colorWriteEnable");
 #endif
+#if defined(__APPLE__)
+		if (image_view_min_lod.minLod != VK_TRUE) {
+			LOGF("image view minLod is not supported\n");
+		} else {
+			check_feature(image_view_min_lod.minLod, "image view minLod");
+		}
+#else
 		check_feature(image_view_min_lod.minLod, "image view minLod");
+#endif
 
 		check_feature(depth_clip_control.depthClipControl, "depthClipControl");
 #if defined(__APPLE__)
@@ -279,8 +287,17 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		              required_features12.shaderOutputViewportIndex);
 		check_feature(features12.bufferDeviceAddress, "bufferDeviceAddress",
 		              required_features12.bufferDeviceAddress);
+#if defined(__APPLE__)
+		if (features12.shaderBufferInt64Atomics != VK_TRUE) {
+			LOGF("shaderBufferInt64Atomics is not supported\n");
+		} else {
+			check_feature(features12.shaderBufferInt64Atomics, "shaderBufferInt64Atomics",
+			              required_features12.shaderBufferInt64Atomics);
+		}
+#else
 		check_feature(features12.shaderBufferInt64Atomics, "shaderBufferInt64Atomics",
 		              required_features12.shaderBufferInt64Atomics);
+#endif
 		check_feature(features12.shaderSampledImageArrayNonUniformIndexing,
 		              "shaderSampledImageArrayNonUniformIndexing",
 		              required_features12.shaderSampledImageArrayNonUniformIndexing);
@@ -292,7 +309,15 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		check_feature(device_features2.features.sampleRateShading, "sampleRateShading");
 		check_feature(device_features2.features.depthBiasClamp, "depthBiasClamp");
 		check_feature(device_features2.features.shaderClipDistance, "shaderClipDistance");
+#if defined(__APPLE__)
+		if (device_features2.features.shaderCullDistance != VK_TRUE) {
+			LOGF("shaderCullDistance is not supported\n");
+		} else {
+			check_feature(device_features2.features.shaderCullDistance, "shaderCullDistance");
+		}
+#else
 		check_feature(device_features2.features.shaderCullDistance, "shaderCullDistance");
+#endif
 		check_feature(device_features2.features.largePoints, "largePoints");
 		check_feature(device_features2.features.multiViewport, "multiViewport");
 		check_feature(device_features2.features.fillModeNonSolid, "fillModeNonSolid");
@@ -428,8 +453,12 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 
 	vk::PhysicalDeviceDepthClipControlFeaturesEXT depth_clip_control {};
 	vk::PhysicalDeviceImageViewMinLodFeaturesEXT  image_view_min_lod {};
-	image_view_min_lod.minLod = VK_TRUE;
-	depth_clip_control.pNext  = &image_view_min_lod;
+	const bool min_lod_extension =
+	    HasExtension(device_extensions, VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
+	// MoltenVK does not expose VK_EXT_image_view_min_lod at all; only request it when the
+	// extension is present. ImageView creation skips VkImageViewMinLodCreateInfoEXT otherwise.
+	image_view_min_lod.minLod = min_lod_extension ? VK_TRUE : VK_FALSE;
+	depth_clip_control.pNext  = min_lod_extension ? static_cast<void*>(&image_view_min_lod) : nullptr;
 	// MoltenVK lacks VK_EXT_depth_clip_enable and VK_EXT_color_write_enable, so drop those
 	// feature structs from the chain on macOS (the renderer falls back to default depth
 	// clipping and static color-write masks).
@@ -485,11 +514,35 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		image_atomic_int64.pNext = supported_features2.pNext;
 		supported_features2.pNext = &image_atomic_int64;
 	}
+	// Query minLod support only when the extension is enabled; otherwise leave it disabled.
+	vk::PhysicalDeviceImageViewMinLodFeaturesEXT supported_min_lod {};
+	if (min_lod_extension) {
+		supported_min_lod.pNext   = supported_features2.pNext;
+		supported_features2.pNext = &supported_min_lod;
+	}
 	physical_device.getFeatures2(&supported_features2);
 	graphics.shader_image_int64_atomics_enabled = image_atomic_int64.shaderImageInt64Atomics;
+	graphics.image_view_min_lod_enabled = min_lod_extension && supported_min_lod.minLod == VK_TRUE;
+	graphics.shader_buffer_int64_atomics_enabled =
+	    supported_features12.shaderBufferInt64Atomics == VK_TRUE;
+	graphics.shader_cull_distance_enabled =
+	    supported_features2.features.shaderCullDistance == VK_TRUE;
+	if (!graphics.image_view_min_lod_enabled) {
+		LOGF("image view minLod is unavailable; PS5 texture min-LOD will be approximated.\n");
+	}
+	if (!graphics.shader_buffer_int64_atomics_enabled) {
+		LOGF("shaderBufferInt64Atomics is unavailable; 64-bit buffer atomics will use a fallback.\n");
+	}
+	if (!graphics.shader_cull_distance_enabled) {
+		LOGF("shaderCullDistance is unavailable; cull-distance outputs will be dropped.\n");
+	}
 
 	auto features12 = WindowContext::RequiredVulkan12Features();
 	features12.shaderSharedInt64Atomics = supported_features12.shaderSharedInt64Atomics;
+#if defined(__APPLE__)
+	// MoltenVK hardcodes shaderBufferInt64Atomics=false; request only what is supported.
+	features12.shaderBufferInt64Atomics = supported_features12.shaderBufferInt64Atomics;
+#endif
 	vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR workgroup_layout {};
 	workgroup_layout.workgroupMemoryExplicitLayout =
 	    supported_workgroup_layout.workgroupMemoryExplicitLayout;
@@ -572,7 +625,12 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	device_features.sampleRateShading                    = VK_TRUE;
 	device_features.depthBiasClamp                       = VK_TRUE;
 	device_features.shaderClipDistance                   = VK_TRUE;
+#if defined(__APPLE__)
+	device_features.shaderCullDistance =
+	    graphics.shader_cull_distance_enabled ? VK_TRUE : VK_FALSE;
+#else
 	device_features.shaderCullDistance                   = VK_TRUE;
+#endif
 	device_features.largePoints                          = VK_TRUE;
 	device_features.multiViewport                        = VK_TRUE;
 	device_features.fillModeNonSolid                      = VK_TRUE;
@@ -937,8 +995,7 @@ void WindowContext::CreateVulkan() {
 
 	std::vector<const char*> device_extensions = {
 	    VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME,
-	    VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
-	    "VK_KHR_maintenance1"};
+	    VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME, "VK_KHR_maintenance1"};
 
 #if defined(__APPLE__)
 	// MoltenVK lacks VK_EXT_depth_clip_enable and VK_EXT_color_write_enable; the renderer
@@ -949,6 +1006,7 @@ void WindowContext::CreateVulkan() {
 	device_extensions.push_back(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
 	device_extensions.push_back(VK_EXT_COLOR_WRITE_ENABLE_EXTENSION_NAME);
 	device_extensions.push_back(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
+	device_extensions.push_back(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
 #endif
 
 #ifdef KYTY_ENABLE_DEBUG_PRINTF

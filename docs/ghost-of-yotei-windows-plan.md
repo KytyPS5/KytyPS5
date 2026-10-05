@@ -3,6 +3,50 @@
 
 
 
+Checkpoint **5 октября 2026 года, 00:01 UTC** (native Windows via WSL;
+source30488f8d plus regression-proved HTile layer correction; commit/build pending):
+
+- Synthetic native RED independently proves the 32-bit HTile state loss, exact
+  hardware view rejection, and global clear state escaping a selected view.
+  Same original cases pass after shared per-owner layer storage and selected-view
+  clear consumption/materialization, including numerical native depth readback.
+- GPUAV variations cover every texel in33/65/33-layer owners, boundaries31/32/63/64,
+  explicit/uniform/mixed/reversed/consumed clears and outside-view pending state.
+  Native image/format/framebuffer limits and overflow reject before allocation.
+  Final compute test SHA4623b0a1; four new selectors and two affected existing
+  CTests pass6/6 under GPUAV. See test debt for exact hashes and artifacts.
+- Existing native subset/sample-array/promotion/expanded-alias and depth controls
+  pass. Two older compute-fill assertions reproduce identically with only this
+  patch absent; no full-suite green claim. Scoped reversal fully restored.
+- Installed emulator still exact30488f8d/SHA3d332194..., last actual game exits321
+  at HTile32-slice guard, readbacks/window black. **Menu/game entry PENDING.**
+- Next: commit this completed fix separately, build/install native Windows emulator,
+  preserve the118508765-byte core pipeline cache, bounded game retry and visual proof.
+  Issue108 comments ONLY after menu and then game entry, link PR497; no push.
+
+Checkpoint **4 октября 2026 года, 23:30 UTC** (native Windows via WSL;
+source30488f8d, installed SHA
+`3d3321949886d702d655706aea996847a4fa0be0189728648a647895951bf423`):
+
+- Native memory-fix build/install pass, executable hashes match; logs
+  `gpu-exec-protection-emulator-{build,install}-20261005.log`.
+- Actual bounded retry `_Build/runs/yotei-integrated-20261004-232320-gpu-executable-protection-noval`
+  progresses beyond the former repeated code-page fault: sampled prior PC page is
+  executable, guest/NVIDIA compiler profiles progress; VS75/PS93/CS493 and470
+  completed compute pipelines. Larger captured CS8457 variant1250 validates for
+  Vulkan1.3 (pipeline/runtime evidence is separate from module validation).
+- Run23:23:20–23:30:56UTC exits321 at the new guard:
+  `Depth target fatal: HTile clear tracking supports at most32 slices`.
+  No timeout, memory guard or DeviceLost. Task-owned PID27568 gone; runner drains
+  and disposes. Cache loaded99239905bytes and checkpointed118508765bytes, retained.
+- Readback150–205 and visually checked `window-after-execfix.png` remain black.
+  **Menu/game entry PENDING.** No issue108 comment: only actual menu and then
+  game entry are authorized publication milestones, linked to PR497. No push.
+- Next: first prove synthetic HTile high-layer tracking/admission RED, replace
+  fixed32-bit state with bounded per-owner layer state, verify selected-range
+  clears and native neighbor readback under GPUAV, and retry the game. Details
+  and required boundaries recorded at the top of `docs/emulator-test-debt.md`.
+
 Checkpoint **4 октября 2026 года, 23:20 UTC** (native Windows via WSL;
 source `b5f04de3` plus the regression-proved shared executable-protection fix;
 new native emulator build/retry pending):

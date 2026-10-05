@@ -505,19 +505,42 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		}
 		const auto  image_view = cache.FindDepthTarget(depth.image_id, depth.desc);
 		const auto& metadata   = depth.desc.info.metadata;
-		if (metadata.kind == ImageMetadataKind::Htile && depth.depth_clear_enable &&
-		    !cache.ClearMeta(metadata.range.address)) {
-			EXIT("failed to acquire HTile metadata for a depth clear\n");
-		}
-		const bool meta_clear =
-		    metadata.kind == ImageMetadataKind::Htile &&
-		    cache.IsMetaCleared(metadata.range.address, depth.desc.view_info.base_layer);
-		depth.depth_load_clear_enable = depth.depth_clear_enable || meta_clear;
-		if (meta_clear &&
-		    !cache.TouchMeta(metadata.range.address, depth.desc.view_info.base_layer, false)) {
-			EXIT("failed to consume HTile clear state\n");
-		}
 		auto& image = cache.GetImage(depth.image_id);
+		depth.depth_load_clear_enable = depth.depth_clear_enable;
+		if (metadata.kind == ImageMetadataKind::Htile) {
+			const auto& view = depth.desc.view_info;
+			std::vector<uint32_t> pending_layers;
+			for (uint32_t offset = 0; offset < view.layer_count; ++offset) {
+				const auto layer = view.base_layer + offset;
+				if (cache.IsMetaCleared(metadata.range.address, layer)) {
+					pending_layers.push_back(layer);
+				}
+			}
+			depth.depth_load_clear_enable = depth.depth_clear_enable ||
+			                               pending_layers.size() == view.layer_count;
+			if (!depth.depth_load_clear_enable && !pending_layers.empty()) {
+				// LoadOpClear applies to the whole view. Materialize a mixed view's
+				// pending layers separately so its other depth and stencil pixels survive.
+				buffer.EndRendering();
+				const vk::ClearDepthStencilValue value {depth.depth_clear_value, 0};
+				for (const auto layer: pending_layers) {
+					image.Transit(vk::ImageLayout::eTransferDstOptimal,
+					              vk::AccessFlagBits2::eTransferWrite,
+					              ImageSubresourceRange {view.base_level, 1, layer, 1}, buffer.Handle());
+					const vk::ImageSubresourceRange range {vk::ImageAspectFlagBits::eDepth,
+					                                       view.base_level, 1, layer, 1};
+					buffer.Handle().clearDepthStencilImage(image.backing.image,
+					    vk::ImageLayout::eTransferDstOptimal, &value, 1, &range);
+				}
+			}
+			// Explicit DB clears affect this view, while metadata fills affect the
+			// entire owner. Consume every selected layer without touching neighbors.
+			for (uint32_t offset = 0; offset < view.layer_count; ++offset) {
+				if (!cache.TouchMeta(metadata.range.address, view.base_layer + offset, false)) {
+					EXIT("failed to consume HTile clear state\n");
+				}
+			}
+		}
 		EXIT_IF(image_view == nullptr || image.backing.samples != depth.desc.info.samples);
 		const auto draw_writes = depth.AttachmentWriteAspects();
 		vk::ImageAspectFlags sampled_aspects;

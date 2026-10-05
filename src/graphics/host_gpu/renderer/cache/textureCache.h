@@ -84,7 +84,7 @@ private:
 		enum class Type : uint8_t { CMask, FMask, HTile };
 
 		Type     type;
-		uint32_t clear_mask = UINT32_MAX;
+		std::vector<bool> clear_layers;
 		uint32_t fill_value = 0;
 		bool fill_known = false;
 	};

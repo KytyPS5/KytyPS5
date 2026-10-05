@@ -1,5 +1,96 @@
 # Emulator regression test debt
 
+## HTile clear state beyond32 layers (2026-10-05; new runtime frontier)
+
+Native source30488f8d / installed SHA
+`3d3321949886d702d655706aea996847a4fa0be0189728648a647895951bf423`
+passes the previous executable-page fault frontier. Actual run
+`yotei-integrated-20261004-232320-gpu-executable-protection-noval`,
+23:23:20–23:30:56UTC, completes470 compute creations, reaches VS75/PS93/CS493,
+then exits321 at `depthRenderTarget.cpp` with stderr
+"HTile clear tracking supports at most32 slices". No timeout/DeviceLost;
+process27568 gone. Cache loaded99239905bytes and checkpointed118508765bytes.
+Readback150–205 and verified window remain black; menu/game entry pending.
+Sampled code page retains execution; thread profiles show real NVIDIA compilation
+and guest polling. Captured larger CS8457 module1250 validates Vulkan1.3.
+
+Required regression before production changes: independently register a real
+33/65-layer depth/HTile owner, prove clear/touch/query state at31/32/63/64 is
+independent, and reject indices outside the actual owner. Resolve a high-layer
+hardware depth view through the native renderer (not only direct cache APIs).
+Test actual selected-layer clear/readback, neighbor preservation and partial
+selected ranges across32/64; clearing one view must not clear unrelated layers.
+Full metadata fills remain whole-owner operations. Count storage must follow
+actual validated image layers and lifecycle, not another fixed integer mask.
+Cover same-base reuse/expansion/retirement and native host array-layer admission;
+keep mapping/format/unsupported metadata checks and bounded test lifetimes.
+Vulkan contracts: resources image creation maxArrayLayers and clear subresource
+ranges (`docs.vulkan.org/spec/latest/chapters/{resources,clears}.html`). Guest
+DB_DEPTH_VIEW already decodes low and high slice bits;32 is an emulator tracker
+representation limit, not the encoded view limit. No blind cap increase or skipped
+clear is acceptable. Synthetic RED and unchanged GREEN/GPUAV required, then game.
+
+Native synthetic RED (before production changes, source30488f8d + tests):
+`htile-layer-state-serial-red-20261005.log(.stderr/.run.json)`, selector
+`--htile-layer-state-only`, SHA
+`ba76a3065a6f934955be4fbe7c8129ab3a11cba1c872b58bb1161e8090e9649a`,
+valid 33-layer native D32/HTile owner registered before the intended assertion:
+whole-owner fill loses layer32. `htile-low-layer-views-serial-red-20261005.log`
+with the same executable independently fails after explicit two-layer view clear:
+neighboring layers retain incorrectly global clear state. Both assertions are
+bounded harness failures, no timeout or DeviceLost. Initial overlapping launches
+were repeated serially; the unrelated memory-reservation error is not RED evidence.
+A separate hardware-view admission assertion is being captured next. Fixtures use
+reusable synthetic33/65/33-layer allocations (same HTile base reused after owner
+retirement), independent per-layer bit/value checks, and GPU readback of every
+64x64 depth texel for explicit, mixed-deferred and already-consumed view clears.
+AMD PAL programs DB_DEPTH_VIEW from baseArraySlice / arraySize and sets depth
+clear enable on the selected view:
+https://github.com/GPUOpen-Drivers/pal/blob/dev/src/core/hw/gfxip/gfx9/gfx9DepthStencilView.cpp
+
+HTile correction completed locally (2026-10-05 00:01UTC; source30488f8d plus fix):
+final original RED executable SHA
+`8158ff9d924056069fc7961a56b684a63b8ef0e7febef2d944f77255550fe35b`,
+`htile-layer-state-final-red-20261005.log`,
+`htile-low-layer-views-final-red-20261005.log`, and
+`htile-hardware-admission-red-20261005.log` (specific old32-slice fatal).
+The same original cases pass after the correction, SHA
+`f514a6b0c245e53a4c21c37aef2ec8ec17b5299d7924cffd07474af55e5e612d`,
+`htile-{layer-state,layer-views,low-layer-views}-green-gpuav-20261005.log`.
+Shared tracker now stores per-native-owner layer state, bounds queries/touches to
+actual native layers, preserves fill value and consumes selected views only.
+Mixed deferred views materialize only pending depth layers before attachment LOAD;
+whole-view deferred/explicit clears consume every selected layer; full metadata
+fills still affect the entire owner. Host image/format/framebuffer array limits
+and count-overflow checks replace the emulator32-bit representation cap.
+
+Additional neighboring cases keep the original selected-pixel oracle and cover
+pending clears outside the view, uniform selected-view clears and reverse mixed
+state. Every 64x64 D32 texel in every layer is compared across five passes and
+33/65/33 same-base owner retirement/reuse. Native GPUAV final executable SHA
+`4623b0a1e9282cd5afc01987a23ed339798f1192b23ac14331b506429e7d865b`:
+`htile-{layer-state,layer-views,low-layer-views,host-admission}-final-green-gpuav-20261005.log`
+all exit0/no timeout; three host-limit/count-overflow children reject specifically
+before image allocation. Existing native subset, sampled array import,
+metadata-aware promotion, expanded alias, depth footprint and feedback controls
+pass (logs `htile-neighbor-*-20261005.log`, feedback final-green log).
+CTest new four selectors + native_subset/sample_array passes6/6 under GPUAV.
+No other installed game was exercised; no cross-game runtime/menu claim.
+
+Two older compute-fill selectors remain RED: sampled HTile discovery at
+"complete dword-pattern HTile fill was not recognized", and compute-meta clear
+at "bounded read" (snapshot-dependent dispatch incorrectly consumed).
+Removing ONLY this HTile correction and restoring the legacy friend fixture
+representation reproduces both exact assertions, baseline test SHA
+`d3d2fc48b5c9471a6c53c0c11c1d6131e14f7721b85c0256ad8034def39f5ae5`,
+logs `htile-old-fill-baseline-{sampled-htile-clear,compute-meta-clear}-20261005.log`.
+The sampled fixture does not populate the current uniform_fill proof; the runtime
+meta path also permits an unproved coarse clear. These require separate synthetic
+contract work; do not weaken their oracles or call the full suite green. All four
+fixed production files restored byte-for-byte from local backup; no scoped
+baseline reversal remains. Native emulator build/install and game retry pending.
+No issue108 update until visually verified menu/game entry; no push.
+
 ## Executable guest pages under GPU cache protection (2026-10-05; diagnosis)
 
 New frontier after same-EXE cache continuation: native run

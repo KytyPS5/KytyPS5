@@ -720,6 +720,17 @@ if(BUILD_TESTING)
 			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --sampled-htile-clear-only)
 		add_test(NAME sampled_htile_array_clear_import
 			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --sampled-htile-array-clear-only)
+		add_test(NAME htile_host_layer_admission
+			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --htile-host-admission-only)
+		set_tests_properties(htile_host_layer_admission PROPERTIES TIMEOUT 90 RUN_SERIAL TRUE)
+		add_test(NAME htile_layer_state
+			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --htile-layer-state-only)
+		add_test(NAME htile_layer_views
+			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --htile-layer-views-only)
+		add_test(NAME htile_low_layer_views
+			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --htile-low-layer-views-only)
+		set_tests_properties(htile_layer_state htile_layer_views htile_low_layer_views
+			PROPERTIES TIMEOUT 90 RUN_SERIAL TRUE)
 		add_test(NAME native_htile_array_subset
 			COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --native-htile-subset-only)
 		add_test(NAME shader_immutable_srt_binding_admission

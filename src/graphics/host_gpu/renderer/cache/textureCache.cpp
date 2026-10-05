@@ -1430,7 +1430,7 @@ ImageId TextureCache::FindSampledHtileImage(ImageDesc& desc) {
 		     htile_size.size, htile_size.align);
 	}
 	uint32_t clear                = 0;
-	bool     tracked_clear_known = layers <= 32;
+	bool     tracked_clear_known = true;
 	for (uint32_t layer = 0; tracked_clear_known && layer < layers; layer++) {
 		uint32_t layer_fill       = 0;
 		bool     layer_fill_known = false;
@@ -1517,7 +1517,7 @@ ImageId TextureCache::FindSampledHtileImage(ImageDesc& desc) {
 			EXIT("sampled HTile clear state disappeared during materialization\n");
 		}
 		for (uint32_t layer = 0; layer < layers; layer++) {
-			tracked->second.clear_mask &= ~(1u << layer);
+			tracked->second.clear_layers[layer] = false;
 		}
 	}
 	TrackImage(id);
@@ -1833,9 +1833,25 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	image.info.stencil = desc.info.stencil;
 	image.info.metadata = desc.info.metadata;
 	if (desc.info.HasMetadata()) {
-		m_surface_metas.emplace(desc.info.metadata.range.address,
-		                        MetaDataInfo {.type       = MetaDataInfo::Type::HTile,
-		                                      .clear_mask = image.info.htile_clear_mask});
+		auto [metadata, inserted] = m_surface_metas.try_emplace(
+		    desc.info.metadata.range.address, MetaDataInfo {.type = MetaDataInfo::Type::HTile});
+		if (metadata->second.type != MetaDataInfo::Type::HTile) {
+			EXIT("depth target metadata is owned by another surface type\n");
+		}
+		auto& clear_layers = metadata->second.clear_layers;
+		if (inserted) {
+			// The legacy image seed uses UINT32_MAX to mean the entire surface.
+			// State thereafter is bounded by actual native layers, including subviews.
+			clear_layers.resize(image.backing.layers, image.info.htile_clear_mask == UINT32_MAX);
+			if (image.info.htile_clear_mask != UINT32_MAX) {
+				for (uint32_t layer = 0; layer < std::min(image.backing.layers, 32u); ++layer) {
+					clear_layers[layer] = (image.info.htile_clear_mask & (1u << layer)) != 0;
+				}
+			}
+		} else if (clear_layers.size() < image.backing.layers) {
+			// Acquiring a larger owner cannot invent clear state for newly exposed layers.
+			clear_layers.resize(image.backing.layers, false);
+		}
 	}
 	RefreshImage(id);
 	CommitGpuWrite(image);
@@ -2340,12 +2356,12 @@ bool TextureCache::IsMeta(uint64_t address) {
 bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice, uint32_t* fill_value, bool* fill_known) {
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
-	if (found == m_surface_metas.end() || slice >= 32) {
+	if (found == m_surface_metas.end() || slice >= found->second.clear_layers.size()) {
 		return false;
 	}
 	if (fill_value != nullptr) *fill_value = found->second.fill_value;
 	if (fill_known != nullptr) *fill_known = found->second.fill_known;
-	return (found->second.clear_mask & (1u << slice)) != 0;
+	return found->second.clear_layers[slice];
 }
 
 bool TextureCache::ClearMeta(uint64_t address) {
@@ -2354,7 +2370,7 @@ bool TextureCache::ClearMeta(uint64_t address) {
 	if (found == m_surface_metas.end()) {
 		return false;
 	}
-	found->second.clear_mask = UINT32_MAX;
+	std::fill(found->second.clear_layers.begin(), found->second.clear_layers.end(), true);
 	found->second.fill_known = false;
 	return true;
 }
@@ -2365,7 +2381,7 @@ bool TextureCache::ClearMeta(uint64_t address, uint32_t fill_value) {
 	if (found == m_surface_metas.end()) {
 		return false;
 	}
-	found->second.clear_mask = UINT32_MAX;
+	std::fill(found->second.clear_layers.begin(), found->second.clear_layers.end(), true);
 	found->second.fill_value = fill_value;
 	found->second.fill_known = true;
 	return true;
@@ -2374,14 +2390,10 @@ bool TextureCache::ClearMeta(uint64_t address, uint32_t fill_value) {
 bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
-	if (found == m_surface_metas.end() || slice >= 32) {
+	if (found == m_surface_metas.end() || slice >= found->second.clear_layers.size()) {
 		return false;
 	}
-	if (is_clear) {
-		found->second.clear_mask |= 1u << slice;
-	} else {
-		found->second.clear_mask &= ~(1u << slice);
-	}
+	found->second.clear_layers[slice] = is_clear;
 	return true;
 }
 

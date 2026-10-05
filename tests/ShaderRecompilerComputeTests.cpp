@@ -384,7 +384,7 @@ struct TextureCacheTestAccess {
     std::lock_guard lock(cache.m_lock);
     auto &metadata = cache.m_surface_metas[address];
     metadata.type = TextureCache::MetaDataInfo::Type::HTile;
-    metadata.clear_mask = 0;
+    metadata.clear_layers.assign(1, false);
     metadata.fill_known = false;
   }
 
@@ -11677,6 +11677,235 @@ OpFunctionEnd
   std::printf("KYTY_COMPARISON_POSITIVE_RETURNED %s\n", mode);
   std::fflush(nullptr);
   std::_Exit(0);
+}
+
+void CheckHtileHostLayerAdmission(const char* mode) {
+  constexpr const char* name = "HtileHostLayerAdmission";
+  EnsureRuntimeContext();
+  RenderContext context(m_runtime_context);
+  auto& scheduler = context.GetCommandScheduler();
+  HW::Context registers{};
+  HW::UserConfig user_config{};
+  HW::Shader shaders{};
+  scheduler.Begin(registers, user_config, shaders);
+  HW::DepthRenderTarget target{};
+  target.z_info.format = Prospero::DepthFormat::kZ32F;
+  target.z_info.texture_compatibility = Prospero::TextureCompatiblePlaneCompression::kEnable;
+  target.z_info.htile_acceleration = true;
+  target.z_read_base_addr = 0x0000000205900000ull;
+  target.z_write_base_addr = target.z_read_base_addr;
+  target.htile_data_base_addr = 0x0000000205980000ull;
+  target.size = {63, 63, true};
+  const auto& limits = m_runtime_context.GetPhysicalDeviceProperties().limits;
+  target.depth_view.slice_max = std::strcmp(mode, "array-limit") == 0
+      ? limits.maxImageArrayLayers : std::strcmp(mode, "framebuffer-limit") == 0
+      ? limits.maxFramebufferLayers : UINT32_MAX;
+  registers.SetDepthRenderTarget(target);
+  HW::RenderControl render_control{};
+  render_control.depth_clear_enable = true;
+  registers.SetRenderControl(render_control);
+  std::printf("KYTY_HTILE_HOST_LIMIT_READY %s\n", mode);
+  std::fflush(stdout);
+  RenderDepthInfo depth{};
+  RenderExecutorTestAccess::ResolveRenderDepthTarget(
+      context.GetRenderExecutor(), scheduler.Current(), depth);
+  std::printf("KYTY_HTILE_HOST_LIMIT_RETURNED %s\n", mode);
+  std::fflush(stdout);
+  Require(name, "host limits", false, "invalid layer count reached native image allocation");
+}
+
+void CheckHtileLayerState(bool tracking_only = false, bool low_view_only = false) {
+  constexpr const char* name = "HtileLayerState";
+  constexpr uintptr_t base = 0x0000000205200000ull;
+  constexpr uint64_t allocation_size = 0x640000;
+  constexpr uint64_t slice_size = 0x10000;
+  constexpr uint32_t width = 64, height = 64;
+  EnsureRuntimeContext();
+  int64_t direct_offset = -1;
+  Require(name, "allocate", Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+      0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size,
+      slice_size, 0, &direct_offset) == 0, "HTile array allocation failed");
+  void* mapped = reinterpret_cast<void*>(base);
+  Require(name, "map", Libs::LibKernel::Memory::KernelMapDirectMemory(
+      &mapped, allocation_size, 0x3, 0x10, direct_offset, slice_size) == 0 &&
+      mapped == reinterpret_cast<void*>(base), "HTile array mapping failed");
+  std::memset(mapped, 0, allocation_size);
+  const std::array<uint32_t, 3> counts = low_view_only
+      ? std::array<uint32_t, 3>{4, 4, 4} : std::array<uint32_t, 3>{33, 65, 33};
+  for (const uint32_t layers : counts) {
+    RenderContext context(m_runtime_context);
+    auto& scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    context.MapMemory(base, allocation_size);
+    auto& cache = context.GetTextureCache();
+    auto& executor = context.GetRenderExecutor();
+    const uint64_t metadata_address = base + 0x420000;
+    TextureCache::ImageDesc desc{};
+    desc.type = TextureCache::BindingType::DepthTarget;
+    desc.info.data = {base, slice_size * layers};
+    desc.info.pixel_format = vk::Format::eD32Sfloat;
+    desc.info.guest_format = Prospero::BufferFormat::k32Float;
+    desc.info.type = Prospero::ImageType::kColor2D;
+    desc.info.extent = {width, height, 1};
+    desc.info.resources = {1, layers};
+    desc.info.pitch = TileGetDepthPitch(width, 4, 0);
+    desc.info.bytes_per_block = 4;
+    desc.info.samples = 1;
+    desc.info.tile_mode = Prospero::TileMode::kDepth;
+    desc.info.mip_layout[0] = {0, slice_size * layers, desc.info.pitch, height};
+    desc.info.metadata.kind = ImageMetadataKind::Htile;
+    desc.info.metadata.range = {metadata_address, 0x8000 * layers};
+    desc.info.htile_clear_mask = 0;
+    desc.view_info.format = vk::Format::eD32Sfloat;
+    desc.view_info.type = vk::ImageViewType::e2DArray;
+    desc.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+    desc.view_info.level_count = 1;
+    desc.view_info.layer_count = layers;
+    desc.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+    const auto id = cache.FindImage(desc);
+    Require(name, "native owner", cache.FindDepthTarget(id, desc) != nullptr &&
+        cache.GetImage(id).backing.layers == layers && cache.IsMeta(metadata_address),
+        "valid native layered depth owner was not registered");
+    std::printf("KYTY_HTILE_LAYER_OWNER_READY layers=%u\n", layers);
+    std::fflush(stdout);
+    if (tracking_only) {
+      Require(name, "whole-owner fill", cache.ClearMeta(metadata_address, 0xfffffff0u),
+              "registered HTile fill was rejected");
+      for (uint32_t layer = 0; layer < layers; ++layer) {
+        uint32_t value = 0;
+        bool known = false;
+        Require(name, "every registered layer is clear",
+            cache.IsMetaCleared(metadata_address, layer, &value, &known) &&
+                known && value == 0xfffffff0u,
+            "whole-owner HTile fill lost a valid array layer or its fill value");
+      }
+      for (const uint32_t selected : {31u, 32u, 63u, 64u}) {
+        if (selected >= layers) continue;
+        Require(name, "consume selected layer", cache.TouchMeta(metadata_address, selected, false),
+                "valid high-layer clear could not be consumed");
+        for (uint32_t layer = 0; layer < layers; ++layer) {
+          Require(name, "independent layer state",
+              cache.IsMetaCleared(metadata_address, layer) == (layer != selected),
+              "consuming a clear changed a neighboring layer");
+        }
+        Require(name, "restore selected layer", cache.TouchMeta(metadata_address, selected, true),
+                "valid high-layer clear could not be restored");
+      }
+      Require(name, "owner bounds", !cache.IsMetaCleared(metadata_address, layers) &&
+          !cache.TouchMeta(metadata_address, layers, true) &&
+          !cache.TouchMeta(metadata_address, UINT32_MAX, false),
+          "HTile state accepted a layer outside its actual owner");
+    } else {
+      const uint32_t first = low_view_only ? 1u : layers - 2;
+      HW::DepthRenderTarget target{};
+      target.z_info.format = Prospero::DepthFormat::kZ32F;
+      target.z_info.texture_compatibility = Prospero::TextureCompatiblePlaneCompression::kEnable;
+      target.z_info.htile_acceleration = true;
+      target.z_read_base_addr = base;
+      target.z_write_base_addr = base;
+      target.htile_data_base_addr = metadata_address;
+      target.size = {width - 1, height - 1, true};
+      target.depth_view.slice_start = first;
+      target.depth_view.slice_max = first + 1;
+      registers.SetDepthRenderTarget(target);
+      HW::DepthControl control{};
+      control.z_enable = true;
+      control.z_write_enable = true;
+      control.zfunc = static_cast<uint8_t>(vk::CompareOp::eAlways);
+      registers.SetDepthControl(control);
+      registers.SetDepthClearValue(1.0f);
+      RenderDepthInfo admitted{};
+      RenderExecutorTestAccess::ResolveRenderDepthTarget(executor, scheduler.Current(), admitted);
+      Require(name, "hardware high-layer admission", admitted.image_id == id &&
+          admitted.desc.view_info.base_layer == first && admitted.desc.view_info.layer_count == 2,
+          "valid hardware depth view was not admitted");
+      const uint32_t texels = width * height;
+      auto readback = CreateHostBuffer(name, uint64_t(texels) * layers * sizeof(uint32_t) * 5,
+                                      vk::BufferUsageFlagBits::eTransferDst, {});
+      for (uint32_t pass = 0; pass < 5; ++pass) {
+        scheduler.EndRendering();
+        auto& image = cache.GetImage(id);
+        image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
+                      {}, scheduler.Current().Handle());
+        const vk::ImageSubresourceRange all{vk::ImageAspectFlagBits::eDepth, 0, 1, 0, layers};
+        const vk::ClearDepthStencilValue prior{0.25f, 0};
+        scheduler.Current().Handle().clearDepthStencilImage(image.backing.image,
+            vk::ImageLayout::eTransferDstOptimal, &prior, 1, &all);
+        cache.MarkGpuWritten(id);
+        for (uint32_t layer = 0; layer < layers; ++layer) {
+          Require(name, "reset layer", cache.TouchMeta(metadata_address, layer, false),
+                  "registered layer reset was rejected");
+        }
+        // First three unchanged regressions, then uniform and reversed deferred views.
+        Require(name, "outside-view pending clear", cache.TouchMeta(metadata_address, 0, true),
+                "neighbor clear could not be seeded");
+        HW::RenderControl render_control{};
+        render_control.depth_clear_enable = pass == 0;
+        registers.SetRenderControl(render_control);
+        if (pass == 1 || pass == 3) Require(name, "deferred first-layer clear",
+            cache.TouchMeta(metadata_address, first, true), "deferred clear was rejected");
+        if (pass == 3 || pass == 4) Require(name, "deferred last-layer clear",
+            cache.TouchMeta(metadata_address, first + 1, true), "deferred clear was rejected");
+        RenderDepthInfo depth{};
+        RenderExecutorTestAccess::ResolveRenderDepthTarget(executor, scheduler.Current(), depth);
+        Require(name, "hardware view admission", depth.image_id == id &&
+            depth.desc.view_info.base_layer == first && depth.desc.view_info.layer_count == 2,
+            "hardware view changed the existing depth owner or selected layers");
+        RenderColorInfo no_color{};
+        const auto rendering = RenderExecutorTestAccess::AcquireRenderTargets(
+            executor, scheduler.Current(), &no_color, 0, depth);
+        scheduler.BeginRendering(rendering);
+        scheduler.EndRendering();
+        RenderExecutorTestAccess::ResetBindings(executor);
+        for (uint32_t layer = 0; layer < layers; ++layer) {
+          Require(name, "view state consumption", cache.IsMetaCleared(metadata_address, layer) == (layer == 0),
+                  "view acquisition changed unrelated layer state or left a pending clear");
+        }
+        const vk::BufferImageCopy copy{uint64_t(pass) * texels * layers * sizeof(uint32_t), 0, 0,
+            {vk::ImageAspectFlagBits::eDepth, 0, 0, layers}, {}, {width, height, 1}};
+        image.Download(std::span{&copy, 1}, readback.buffer, 0, readback.size);
+      }
+      vk::MemoryBarrier2 barrier{};
+      barrier.srcStageMask = vk::PipelineStageFlagBits2::eTransfer;
+      barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+      barrier.dstStageMask = vk::PipelineStageFlagBits2::eHost;
+      barrier.dstAccessMask = vk::AccessFlagBits2::eHostRead;
+      vk::DependencyInfo dependency{};
+      dependency.memoryBarrierCount = 1;
+      dependency.pMemoryBarriers = &barrier;
+      scheduler.Current().Handle().pipelineBarrier2(dependency);
+      scheduler.Finish();
+      const auto observed = ReadBuffer(name, readback, texels * layers * 5);
+      for (uint32_t pass = 0; pass < 5; ++pass) {
+        for (uint32_t layer = 0; layer < layers; ++layer) {
+          const bool selected = pass == 0 || pass == 3
+              ? (layer == first || layer == first + 1)
+              : (pass == 1 && layer == first) || (pass == 4 && layer == first + 1);
+          const auto expected = std::bit_cast<uint32_t>(selected ? 1.0f : 0.25f);
+          const auto pixels = std::span{observed}.subspan((pass * layers + layer) * texels, texels);
+          Require(name, "selected depth pixels and neighbors",
+              std::ranges::all_of(pixels, [expected](uint32_t pixel) { return pixel == expected; }),
+              "HTile view clear lost selected pixels, changed neighbors, or repeated a clear");
+        }
+      }
+      DestroyBuffer(&readback);
+    }
+    context.UnmapMemory(base, allocation_size);
+    Require(name, "metadata retirement", !cache.IsMeta(metadata_address),
+            "retired native owner left stale HTile state");
+    scheduler.Finish();
+    scheduler.DrainPriorityOperations();
+    context.ShutdownGpu();
+  }
+  Require(name, "unmap", Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+          "HTile fixture unmap failed");
+  Require(name, "release", Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+      direct_offset, allocation_size) == 0, "HTile fixture release failed");
+  std::printf("[gpu]     %-32s ok\n", name);
 }
 
 void CheckNativeHtileArraySubset() {
@@ -46160,6 +46389,38 @@ int main(int argc, char **argv) {
   if (argc == 3 && std::strcmp(argv[1], "--sampled-htile-negative") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckSampledHtileClearDiscovery(argv[2]);
+    return 0;
+  }
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+  if (argc == 3 && std::strcmp(argv[1], "--htile-host-negative") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckHtileHostLayerAdmission(argv[2]);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--htile-host-admission-only") == 0) {
+    constexpr std::array cases {
+        RendererFailureCase{"array-limit", "depth view exceeds host array-layer limits"},
+        RendererFailureCase{"framebuffer-limit", "depth view exceeds host array-layer limits"},
+        RendererFailureCase{"count-overflow", "depth view exceeds host array-layer limits"},
+    };
+    CheckRendererFailureCases("HtileHostLayerAdmission", "--htile-host-negative",
+        "KYTY_HTILE_HOST_LIMIT_READY ", "KYTY_HTILE_HOST_LIMIT_RETURNED ", cases);
+    return 0;
+  }
+#endif
+  if (argc == 2 && std::strcmp(argv[1], "--htile-layer-state-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckHtileLayerState(true);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--htile-layer-views-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckHtileLayerState();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--htile-low-layer-views-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckHtileLayerState(false, true);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--native-htile-subset-only") == 0) {

@@ -1000,6 +1000,16 @@ uint32_t EncodeFormattedStoreComponent(ValueEmitContext& ctx,
 		return Unary(ctx.state, spv::OpConvertFToU, TypeU32(ctx.state),
 		             EmitFPRoundEven32(ctx.state, scaled));
 	}
+	if (bits == 8u && info.type == Format::ComponentType::Snorm) {
+		const auto value = EmitBitCastF32U32(ctx.state, data);
+		const auto clamped = EmitFPMin32(
+		    ctx.state, EmitFPMax32(ctx.state, value, ConstantF32Value(ctx.state, -1.0f)),
+		    ConstantF32Value(ctx.state, 1.0f));
+		const auto scaled = EmitFPMul32(ctx.state, clamped, ConstantF32Value(ctx.state, 127.0f));
+		const auto encoded = Unary(ctx.state, spv::OpConvertFToS, TypeI32(ctx.state),
+		                           EmitFPRoundEven32(ctx.state, scaled));
+		return Unary(ctx.state, spv::OpBitcast, TypeU32(ctx.state), encoded);
+	}
 	if (bits == 16u && (info.type == Format::ComponentType::Snorm ||
 	                    info.type == Format::ComponentType::Float)) {
 		const auto value = EmitBitCastF32U32(ctx.state, data);

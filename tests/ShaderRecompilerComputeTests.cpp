@@ -32137,6 +32137,65 @@ TestCase BufferStoreFormatXyzwFloat16ConvertsComponents() {
   return test;
 }
 
+// RDNA2 formatted stores convert floats to the selected normalized memory format.
+// Exact endpoints and finite clamping avoid relying on fractional tie rounding.
+std::vector<TestCase> NormalizedBufferStoreEndpointCases() {
+  using F = Prospero::BufferFormat;
+  using O = ShaderOpcode;
+  struct Input {
+    const char* names[2];
+    F format;
+    u32 components;
+    std::array<u32, 4> values;
+    u32 expected;
+  };
+  constexpr Input inputs[] = {
+      {{"DescriptorSnorm8EndpointsAndClamp", "TypedSnorm8EndpointsAndClamp"},
+       F::k8_8_8_8SNorm, 4,
+       {0xbf800000u, 0u, 0x3f800000u, 0x40000000u}, 0x7f7f0081u},
+      {{"DescriptorSnorm8PairKeepsOtherBytes", "TypedSnorm8PairKeepsOtherBytes"},
+       F::k8_8SNorm, 2, {0xc0000000u, 0x3f800000u}, 0xffff7f81u},
+      {{"DescriptorSnorm8ScalarKeepsOtherBytes", "TypedSnorm8ScalarKeepsOtherBytes"},
+       F::k8SNorm, 1, {0xbf800000u}, 0xffffff81u},
+      {{"DescriptorSnorm16EndpointsNeighbor", "TypedSnorm16EndpointsNeighbor"},
+       F::k16_16SNorm, 2, {0xbf800000u, 0x3f800000u}, 0x7fff8001u},
+  };
+  constexpr O store_opcodes[2][4] = {
+      {O::BUFFER_STORE_FORMAT_X, O::BUFFER_STORE_FORMAT_XY,
+       O::BUFFER_STORE_FORMAT_XYZ, O::BUFFER_STORE_FORMAT_XYZW},
+      {O::TBUFFER_STORE_FORMAT_X, O::TBUFFER_STORE_FORMAT_XY,
+       O::TBUFFER_STORE_FORMAT_XYZ, O::TBUFFER_STORE_FORMAT_XYZW},
+  };
+  std::vector<TestCase> cases;
+  for (const auto& input : inputs) {
+    for (bool typed : {false, true}) {
+      TestCase test;
+      test.name = input.names[typed];
+      for (u32 component = 0; component < input.components; ++component) {
+        AppendVMovLiteral(&test.code, component, input.values[component]);
+      }
+      AppendVMovU32(&test.code, 20, 4);
+      const u32 opcode = 3 + input.components;
+      if (typed) {
+        const u32 format = BufferFormat(input.format);
+        test.code.push_back(EncodeMtbuf0(opcode, format & 0xfu, format >> 4u));
+        test.code.push_back(EncodeMtbuf1(opcode, 0, 0, 20));
+      } else {
+        test.code.push_back(EncodeMubuf0(opcode));
+        test.code.push_back(EncodeMubuf1(0, 0, 20));
+      }
+      AppendEnd(&test.code);
+      test.initial = {0xdeadbeefu, 0xffffffffu, 0xcafef00du};
+      test.expected = {0xdeadbeefu, input.expected, 0xcafef00du};
+      test.user_data = MakeStructuredStorageBufferData(0, 12, false, BufferFormat(input.format));
+      test.has_user_data = true;
+      test.opcodes = {O::V_MOV_B32, store_opcodes[typed][input.components - 1], O::S_ENDPGM};
+      cases.push_back(std::move(test));
+    }
+  }
+  return cases;
+}
+
 TestCase BufferStoreFormatXyzwSnorm16CapturedSkinningVectors() {
   using O = ShaderOpcode;
 
@@ -41466,6 +41525,9 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferStoreFormatXyzwPackedUnormSkinningVectors);
   AddCase(BufferStoreFormatXZeroFillsPackedRecord);
   AddCase(BufferStoreFormatXyzwFloat16ConvertsComponents);
+  for (const auto& test : NormalizedBufferStoreEndpointCases()) {
+    cases.push_back(test);
+  }
   AddCase(BufferStoreFormatXyzwSnorm16CapturedSkinningVectors);
   AddCase(BufferStoreFormatXSnorm16ClampsRoundsAndPreservesHalfwords);
   AddCase(BufferLoadFormatXResource8UintZeroExtendsByte);
@@ -47720,6 +47782,11 @@ if (argc == 1) {
     }
     RunCase(&vulkan, VectorCompareClassF32());
     RunCase(&vulkan, VectorCompareF16Ops());
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--snorm-buffer-store-endpoints-only") == 0) {
+    VulkanHarness vulkan;
+    for (const auto& test : NormalizedBufferStoreEndpointCases()) RunCase(&vulkan, test);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--buffer-format-store-only") == 0) {

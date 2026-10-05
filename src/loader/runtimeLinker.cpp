@@ -59,6 +59,33 @@ Program::Program() = default;
 
 Program::~Program() = default;
 
+// Per-thread guest TCB cache. TlsMainGetAddr() keys it on the main Program pointer, so it
+// must be invalidated whenever the block holding that TCB is released, including a block
+// released after its program was already destroyed.
+static Program*              g_tls_main_program        = nullptr;
+static thread_local Program* g_tls_cached_main_program = nullptr;
+static thread_local uint8_t* g_tls_cached_main_tcb     = nullptr;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+// Process-lifetime slot holding each host thread's guest TCB pointer. Allocated once
+// because the patched guest code reads it directly from the host TEB.
+static const DWORD g_tls_main_tcb_key = [] {
+	const auto key = TlsAlloc();
+	EXIT_IF(key == TLS_OUT_OF_INDEXES);
+	return key;
+}();
+#endif
+
+// Drop the cached TCB for the calling thread. A block that is about to be released may still
+// back it, and a later Program allocated at the same address would otherwise match the stale
+// cache key and hand the freed TCB back to guest code.
+static void InvalidateCachedMainTcb() {
+	g_tls_cached_main_program = nullptr;
+	g_tls_cached_main_tcb     = nullptr;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	EXIT_IF(TlsSetValue(g_tls_main_tcb_key, nullptr) == 0);
+#endif
+}
+
 // The backing allocation of a TLS block is guest memory for TLS blocks, so releasing a
 // block that has outlived its image can legitimately fail. Deferred release reports that
 // instead of aborting, because there is no remaining owner to fail against.
@@ -111,6 +138,10 @@ static void ReleaseDeferredTlsBlocks() {
 				++it;
 			}
 		}
+	}
+
+	if (!mine.empty()) {
+		InvalidateCachedMainTcb();
 	}
 
 	for (auto& block: mine) {
@@ -278,19 +309,6 @@ constexpr uint64_t INVALID_MEMORY   = SYSTEM_RESERVED + INVALID_OFFSET;
 
 static uint64_t g_desired_base_addr = SYSTEM_RESERVED + CODE_BASE_OFFSET;
 static uint64_t g_invalid_memory    = 0;
-
-static Program*              g_tls_main_program        = nullptr;
-static thread_local Program* g_tls_cached_main_program = nullptr;
-static thread_local uint8_t* g_tls_cached_main_tcb     = nullptr;
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-// Process-lifetime slot holding each host thread's guest TCB pointer. Allocated once
-// because the patched guest code reads it directly from the host TEB.
-static const DWORD g_tls_main_tcb_key = [] {
-	const auto key = TlsAlloc();
-	EXIT_IF(key == TLS_OUT_OF_INDEXES);
-	return key;
-}();
-#endif
 
 static KYTY_SYSV_ABI void RunEntry(uint64_t addr, EntryParams* params, atexit_func_t atexit_func,
                                    void* stack_top) {
@@ -1393,12 +1411,8 @@ void RuntimeLinker::Clear() {
 		EXIT_IF(!Libs::LibKernel::Memory::FreeGuestMemory(g_invalid_memory, 4096));
 		g_invalid_memory = 0;
 	}
-	g_tls_main_program        = nullptr;
-	g_tls_cached_main_program = nullptr;
-	g_tls_cached_main_tcb     = nullptr;
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	EXIT_IF(TlsSetValue(g_tls_main_tcb_key, nullptr) == 0);
-#endif
+	g_tls_main_program = nullptr;
+	InvalidateCachedMainTcb();
 	g_desired_base_addr       = SYSTEM_RESERVED + CODE_BASE_OFFSET;
 	m_symbols.reset();
 }
@@ -1702,11 +1716,7 @@ void RuntimeLinker::DeleteTls(Program* program, int thread_id) {
 	EXIT_IF(program == nullptr);
 
 	if (thread_id == Common::Thread::GetThreadIdUnique() && g_tls_cached_main_program == program) {
-		g_tls_cached_main_program = nullptr;
-		g_tls_cached_main_tcb     = nullptr;
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		EXIT_IF(TlsSetValue(g_tls_main_tcb_key, nullptr) == 0);
-#endif
+		InvalidateCachedMainTcb();
 	}
 
 	Common::LockGuard lock(program->tls.mutex);
@@ -1970,11 +1980,7 @@ void RuntimeLinker::DeleteProgram(Program* p) {
 		g_tls_main_program = nullptr;
 	}
 	if (g_tls_cached_main_program == program.get()) {
-		g_tls_cached_main_program = nullptr;
-		g_tls_cached_main_tcb     = nullptr;
-#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-		EXIT_IF(TlsSetValue(g_tls_main_tcb_key, nullptr) == 0);
-#endif
+		InvalidateCachedMainTcb();
 	}
 	for (auto& record: g_stubbed_imports) {
 		if (record.patch_vaddr >= program->base_vaddr &&

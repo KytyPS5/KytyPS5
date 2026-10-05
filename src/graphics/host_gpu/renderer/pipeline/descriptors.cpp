@@ -807,7 +807,8 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	}
 }
 
-void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
+void RenderExecutor::FindBuffers(PreparedBindings& prepared,
+                                 std::span<PreparedBindings* const> stages) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(prepared.runtime == nullptr || !*prepared.runtime);
 	const auto& program  = *prepared.runtime->program;
@@ -819,15 +820,38 @@ void RenderExecutor::FindBuffers(PreparedBindings& prepared) {
 	if (layout.memory_offset_count == 0) {
 		return;
 	}
+	const auto&    graphics         = m_context.GetGraphics();
+	const uint64_t unbounded_window = std::min<uint64_t>(
+	    256ull << 20u, graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange -
+	                       graphics.StorageMinAlignment());
 	const auto& resources = layout.descriptors.front().resources;
 	prepared.buffer_sources.reserve(resources.size());
 	for (const auto resource: resources) {
 		auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[resource]);
 		const auto address = descriptor.Base48();
-		const auto requested_size = descriptor.GetSize();
+		auto requested_size = descriptor.GetSize();
 		if (address == 0 || requested_size == 0) {
 			prepared.buffer_sources.push_back({});
 			continue;
+		}
+		if (descriptor.NumRecords() == UINT32_MAX && requested_size > unbounded_window) {
+			requested_size = unbounded_window;
+			if (program.info.buffers[resource].written) {
+				const auto clamp_before = [&](const ShaderRecompiler::IR::ResourceSnapshot& reader) {
+					for (const auto [read_address, read_size]: reader.specialization_reads) {
+						if (read_address >= address && read_address - address < requested_size) {
+							requested_size = read_address - address;
+						}
+					}
+				};
+				clamp_before(snapshot);
+				for (const auto* stage: stages) {
+					clamp_before(*stage->runtime->resources);
+				}
+				if (requested_size == 0) {
+					EXIT("unbounded written buffer starts at a scalar resource read\n");
+				}
+			}
 		}
 		const auto size = Libs::LibKernel::Memory::ClampRangeSize(address, requested_size);
 		prepared.buffer_sources.push_back({address, size, cache.FindBuffer(address, size)});
@@ -920,7 +944,7 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
                                              std::span<RenderColorInfo> colors) {
 	bool uses_dma = false;
 	for (auto* stage: stages) {
-		FindBuffers(*stage);
+		FindBuffers(*stage, stages);
 		uses_dma |= stage->runtime->program->info.uses_dma;
 	}
 	if (uses_dma) {

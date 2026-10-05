@@ -46,7 +46,7 @@ bool IsPureUniformOperation(O op) {
 		case O::FPUnordNotEqual32: case O::FPOrdLessThan32: case O::FPUnordLessThan32: case O::FPOrdGreaterThan32:
 		case O::FPUnordGreaterThan32: case O::FPOrdLessThanEqual32: case O::FPUnordLessThanEqual32: case O::FPOrdGreaterThanEqual32:
 		case O::FPUnordGreaterThanEqual32: case O::FPIsNan32: case O::FPCmpClass32: case O::FPAdd32:
-		case O::FPSub32: case O::FPFma32: case O::FPMul32: case O::FPMin32:
+		case O::FPSub32: case O::FPFma32: case O::FPMad32: case O::FPMul32: case O::FPMin32:
 		case O::FPMax32: case O::FPMinTri32: case O::FPMaxTri32: case O::FPMedTri32:
 		case O::FPRecip32: case O::FPRecipIFlag32: case O::FPRecipSqrt32: case O::FPSqrt:
 		case O::FPSin: case O::FPCos: case O::FPExp2: case O::FPLog2:

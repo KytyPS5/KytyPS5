@@ -1,5 +1,58 @@
 # Emulator regression test debt
 
+## Audio metadata source directly proved (2026-10-05; contract RED pending)
+
+Run053914 on7f2a1c71/EXE1c5b8337 reaches Quality570 then C0000094, no main
+menu. Correct task-owned hardware watch records source write3a4e29 at05:53:40:
+R15 original header=0, R12 metadata nonnull. Metadata+0xc contains3072c0fe,
+copied unchanged into descriptor+0x18; other metadata fields are0/skip256/0.
+Unlike prior list-node mistake this proves the actual metadata route. Data watches
+restored after capture, unrelated/fatal guest exceptions forwarded; all own runs
+ended and native CIM clean. Raw proprietary snapshots remain ignored under run
+053914/audio-config-producer. No production audio fix or independent defect RED.
+Required next evidence: producer of metadata and explicit applicable AJM/API byte
+versus numeric-word contract, then synthetic variation/bounds/real PCM regression.
+Ordinary byte-contract baseline passes; do not reinterpret or auto-swap unknown
+configurations merely to bypass this one fault.
+
+## Audio write-watch boundary (2026-10-05; diagnostic correction)
+
+Native run051911 on7f2a1c71 ends after Quality/C0000094, no main menu. The
+first data-watch helper used owner+0x28 (list node), not owner+0x40 (actual
+configuration, descriptor+0x18); its three list-write events are not configuration
+producer evidence. Corrected prospective ignored helper watch-task-packed-audio-
+config-20261005.ps1, retain logs and do not present the offset mistake as a fix.
+Bounded heap capture verifies actual source parent/sourcekind4 and captures input
+plus surroundings/config candidates, but original header still needs direct proof.
+4096B stack read crossed mapping boundary; prospective probe512B restored.
+No production audio change or valid audio defect RED yet. Need actual source
+header and responsible shared contract before a synthetic failure/fix.
+
+## FP32 legacy MAD versus fused FMA (2026-10-05; native RED/GREEN and neighbors proved)
+
+Selective upstreamd8be245c correction is now backed by primary LLVM instruction
+tables: GFX10 legacy0x1f/20/21 versus fused0x2b/2c/2d. LLVM SIISelLowering
+isFMADLegal requires signed denorm flushing; FMAD represents separately rounded
+multiply/add (SelectionDAG ISDOpcodes contract), unlike FMA.
+References: https://github.com/llvm/llvm-project/blob/main/llvm/lib/Target/AMDGPU/VOP2Instructions.td
+and https://github.com/llvm/llvm-project/blob/main/llvm/lib/Target/AMDGPU/SIISelLowering.cpp .
+Independent synthetic cancellation: (1+2^-23)*(1-2^-23)-1 =0 after rounded
+multiply then add, fused result-2^-46 bitsa8800000. Native GPUAV RED on source
+7f2a1c71 before production edits: first five legacy forms wronglya8800000,
+next five fused forms correctlya8800000, no timeout or validation error.
+Log fp32-mad-red-gpuav-20261005.log/.stderr/.run.json,05:59:56-06:00:00UTC,
+testEXE105e8e744fab0feb293c6d0ac8c35c433320b6abb9d37d79ef9436a8639dd149,
+exitC0000409 is test Fail after numeric mismatch, not a valid game failure claim.
+Shared decoder/IR/emitter now distinguish MAD/FMA with intermediate NoContraction
+rounding and explicit signed denorm flushing; local scheduling pure-op classification
+includes the new MAD operation. GREEN unchanged numeric oracle PASS06:03:29UTC, testEXEe7b0e355e4e4c5509a530a0cd672d40e309ddbcb19974fc09d759b52324bf1b7.
+Signed denorm boundaries/mode0xf0, fused negation and ordinary arithmetic PASS.
+FP32 compare/modeC0/E0, seven FP64 arithmetic/narrowing and cooperative BDA
+coefficient neighbors PASS under GPUAV; affected CTest4/4 PASS, no VUID. Final
+coverage metadata corrected; final native MAD and CTest4/4 PASS06:07UTC, testEXE
+dc4d5b62c071da526a89f7ff637ec7bac6b18805f3bbcc7bdef233b1997f1a36. Full suite not green;
+no actual dark-scene/menu/audio fix claimed yet.
+
 ## Packed-float sampling harness boundary (2026-10-05)
 
 Expanded neighbors pass numeric values but GPUAV rejects the fixture's sampled

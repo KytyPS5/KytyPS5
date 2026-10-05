@@ -333,6 +333,24 @@ const IR::Inst* ZeroTestedBitwiseOr(const IR::Inst& compare) {
 }
 
 } // namespace
+uint32_t EmitFPFma32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
+	const auto result = EmitGlsl<GLSLstd450Fma, IR::Type::F32>(state, a, b, c);
+	state.builder.AddAnnotation(spv::OpDecorate, result, spv::DecorationNoContraction);
+	return result;
+}
+
+uint32_t EmitFPMad32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
+	// Legacy MAD/MAC round and flush between multiply and add, irrespective of SP_DENORM.
+	a = EmitFlushF32DenormToSignedZero(state, a);
+	b = EmitFlushF32DenormToSignedZero(state, b);
+	c = EmitFlushF32DenormToSignedZero(state, c);
+	const auto product = EmitFPMul32(state, a, b);
+	state.builder.AddAnnotation(spv::OpDecorate, product, spv::DecorationNoContraction);
+	const auto sum = EmitFPAdd32(state, EmitFlushF32DenormToSignedZero(state, product), c);
+	state.builder.AddAnnotation(spv::OpDecorate, sum, spv::DecorationNoContraction);
+	return EmitFlushF32DenormToSignedZero(state, sum);
+}
+
 uint32_t EmitFPMedTri32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
 	const auto min_ab   = EmitMinMaxF32Value(state, a, b, false);
 	const auto min3     = EmitMinMaxF32Value(state, min_ab, c, false);

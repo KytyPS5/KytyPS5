@@ -21657,6 +21657,9 @@ CoverageClass ClassifyOpcode(ShaderOpcode opcode,
   case Opcode::V_MAC_F32:
   case Opcode::V_MADMK_F32:
   case Opcode::V_MADAK_F32:
+  case Opcode::V_FMAC_F32:
+  case Opcode::V_FMAMK_F32:
+  case Opcode::V_FMAAK_F32:
   case Opcode::V_MIN_F32:
   case Opcode::V_MAX_F32:
   case Opcode::V_MAD_F32:
@@ -27374,6 +27377,85 @@ TestCase VectorDppBoundsControlZeroPreservesDestination() {
   return test;
 }
 
+TestCase VectorMadF32RoundsProduct() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  for (u32 source = 0; source < 3; source++) {
+    AppendVMovU32(&code, 30, source * sizeof(u32));
+    AppendBufferLoadDword(&code, source, 30);
+  }
+  AppendVMovLiteral(&code, 10, 0xbf800000u);
+  AppendVMovLiteral(&code, 11, 0xbf800000u);
+  AppendVMovLiteral(&code, 15, 0xbf800000u);
+  AppendVMovLiteral(&code, 16, 0xbf800000u);
+  code.push_back(EncodeVop2(0x1f, 10, Vgpr(0), 1));
+  AppendVop3(&code, 0x11f, 11, Vgpr(0), Vgpr(1), 0);
+  AppendVop3(&code, 0x141, 12, Vgpr(0), Vgpr(1), Vgpr(2));
+  code.push_back(EncodeVop2(0x20, 13, Vgpr(0), 2));
+  code.push_back(0x3f7ffffeu);
+  code.push_back(EncodeVop2(0x21, 14, Vgpr(0), 1));
+  code.push_back(0xbf800000u);
+  code.push_back(EncodeVop2(0x2b, 15, Vgpr(0), 1));
+  AppendVop3(&code, 0x12b, 16, Vgpr(0), Vgpr(1), 0);
+  AppendVop3(&code, 0x14b, 17, Vgpr(0), Vgpr(1), Vgpr(2));
+  code.push_back(EncodeVop2(0x2c, 18, Vgpr(0), 2));
+  code.push_back(0x3f7ffffeu);
+  code.push_back(EncodeVop2(0x2d, 19, Vgpr(0), 1));
+  code.push_back(0xbf800000u);
+  for (u32 i = 0; i < 10; i++) {
+    AppendStoreVgpr(&code, 10 + i, i);
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "VectorMadF32RoundsProduct";
+  test.code = std::move(code);
+  test.initial = {0x3f800001u, 0x3f7ffffeu, 0xbf800000u};
+  // (1+2^-23)*(1-2^-23)-1 rounds to zero for MAD, but -2^-46 for FMA.
+  test.expected = {0u, 0u, 0u, 0u, 0u, 0xa8800000u, 0xa8800000u,
+                   0xa8800000u, 0xa8800000u, 0xa8800000u};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_MAC_F32,
+                  O::V_MAD_F32, O::V_MADMK_F32, O::V_MADAK_F32,
+                  O::V_FMAC_F32, O::V_FMA_F32, O::V_FMAMK_F32, O::V_FMAAK_F32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  return test;
+}
+
+TestCase VectorMadF32FlushesDenorms() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  for (u32 sample = 0; sample < 5; sample++) {
+    for (u32 source = 0; source < 3; source++) {
+      AppendVMovU32(&code, 30, (sample * 3 + source) * sizeof(u32));
+      AppendBufferLoadDword(&code, source, 30);
+    }
+    AppendVop3(&code, 0x141, 10 + sample, Vgpr(0), Vgpr(1), Vgpr(2));
+  }
+  for (u32 sample = 0; sample < 5; sample++) {
+    AppendStoreVgpr(&code, 10 + sample, sample);
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "VectorMadF32FlushesDenorms";
+  test.code = std::move(code);
+  // Input denorms in each operand, an intermediate denorm, and a negative result denorm.
+  test.initial = {0x00400000u, 0x40000000u, 0u,
+                  0x40000000u, 0x00400000u, 0u,
+                  0u, 0x3f800000u, 0x00400000u,
+                  0x00800000u, 0x3f000000u, 0x00800000u,
+                  0x00800000u, 0x3f800000u, 0x80800001u};
+  test.expected = {0u, 0u, 0u, 0x00800000u, 0x80000000u};
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_MAD_F32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  // Legacy MAD always flushes, even when the shader requests denorm preservation.
+  test.compute_info.float_mode = 0xf0;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase Vop3FmacF32NegatedSourceAccumulates() {
   using O = ShaderOpcode;
 
@@ -27397,7 +27479,7 @@ TestCase Vop3FmacF32NegatedSourceAccumulates() {
                   0x3f800001u, 0x3f7ffffeu, 0x3f800000u};
   // 10 - 2*3 = 4; 1 - (1+2^-23)*(1-2^-23) = 2^-46, not rounded zero.
   test.expected = {0x40800000u, 0x28800000u};
-  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_MAC_F32,
+  test.opcodes = {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_FMAC_F32,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.required_spirv = {"OpFNegate", "Fma"};
   return test;
@@ -40999,6 +41081,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorDppBankMaskPreservesDestination);
   AddCase(VectorDppBoundsControlZeroPreservesDestination);
   AddCase(Vop3FmacF32NegatedSourceAccumulates);
+  AddCase(VectorMadF32RoundsProduct);
+  AddCase(VectorMadF32FlushesDenorms);
   AddCase(Vop3LdexpSourceModifier);
   AddCase(Vop1MoveRelSource);
   AddCase(Vop1MoveRelDestination);
@@ -46953,6 +47037,14 @@ int main(int argc, char **argv) {
   EnsureConfigInitialized();
   if (argc == 2 && std::strcmp(argv[1], "--ajm-at9-config-only") == 0) {
     CheckAjmAt9Configuration();
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--mad-f32-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, VectorMadF32RoundsProduct());
+    RunCase(&vulkan, VectorMadF32FlushesDenorms());
+    RunCase(&vulkan, Vop3FmacF32NegatedSourceAccumulates());
+    RunCase(&vulkan, VectorFloatArithmeticOps());
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--float-image-atomic-only") == 0) {

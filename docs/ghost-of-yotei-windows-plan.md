@@ -1,5 +1,119 @@
 # Ghost of Yōtei в KytyPS5 на Windows: прогресс и план запуска
 
+Checkpoint **5 октября 2026 года, 06:08 UTC** (FP32 MAD/FMA shared correction
+completed; native synthetic RED/GREEN and affected GPUAV/CTest PASS):
+
+- Selective upstreamd8be245c port, primary LLVM GFX10 opcode/rounding/FTZ contracts.
+  Legacy MAD/MAC intermediate product rounded; fused FMAC/FMA remain distinct.
+  NoContraction and explicit signed denorm flushing; local pure-op scheduler
+  classification preserved. No title/hash/address conditions.
+- Numerical native GPUAV RED on7f2a1c71: five legacy forms gavea8800000 instead
+  ofzero, five fused forms correct. Same input/output oracle GREEN plus five
+  denorm/mode0xf0 boundaries, fused negation/ordinary arithmetic. FP32 compare
+  modesC0/E0, FP64 arithmetic/narrowing and cooperative BDA neighbors PASS.
+- Final MAD and affected colors CTest4/4 PASS06:07UTC/testEXE
+  dc4d5b62c071da526a89f7ff637ec7bac6b18805f3bbcc7bdef233b1997f1a36,
+  logs fp32-mad-{red,green,final}-gpuav-20261005.log and
+  fp32-mad-final-ctest-gpuav-20261005.log. Full suite still not green.
+- Installed game still7f2a1c71/1c5b8337; next separate completed-fix commit,
+  native emulator build/install and color comparison. Actual main menu/game entry
+  PENDING; audio production unchanged after proven metadata-source capture.
+- Ignored bounded metadata-origin watch prepared for a next targeted retry;
+  actual earlier metadata producer/API contract not proved. Issue108 unchanged,
+  no push, preserve source/game/save/cache and serialize native build/GPU runs.
+
+Checkpoint **5 октября 2026 года, 05:58 UTC** (configuration producer captured;
+run053914 source7f2a1c71/EXE1c5b8337 ended05:53:54UTC/C0000094):
+
+- Actual Medium211 -> Standard275 -> Quality570 visually verified; Cross45s/
+  Cross5s/Cross5s recorded in run/interactions.json. Shown603/compute635 at exit;
+  main/title menu and game entry remain PENDING. Dark scene still not proved correct.
+- Correct hardware watch hits actual source write05:53:40.8641111UTC at3a4e29:
+  original-header R15=0, metadata R12=100952beb0; metadata+0xc config3072c0fe
+  copied unchanged into descriptor+0x18. This proves the metadata path, not
+  an endian fix. Original header absent in this actual path, not a missing capture.
+- Audio-config-producer artifacts include source-write context/64B metadata/parent,
+  then first/second-chance integer fault at3a502d2, codec metadata block still0.
+  Owned data watches restored after producer capture, exceptions forwarded;
+  recorder39602/runner23615 ended0, native CIM clean. No production audio edits.
+- Next trace metadata creation/responsible ABI using this source proof; establish
+  independent synthetic RED before any audio correction. Do not repeat same game
+  fault without a new targeted capture or proven fix. Issue108 unchanged, no push.
+
+Checkpoint **5 октября 2026 года, 05:40 UTC** (ACTIVE audio configuration-
+producer retry PID16672/source7f2a1c71, installed1c5b8337 exact hash below):
+
+- New run053914 starts05:39:14UTC, deadline06:09:14UTC/1800s/480s watchdog/28GiB,
+  validationOFF/480x270 diagnostic resolution; game/save/cache preserved.
+- Task-hash-guarded temporary hardware data watch corrected to actual config
+  owner+0x40/descriptor+0x18; final source-write header still PENDING. Watches
+  restored after expected producer capture or diagnostic cleanup, no guest byte
+  edits. Prior run's list-watch mistake recorded explicitly, no source proof claim.
+- Native source unchanged; audio contract/independent RED and actualmenu/gameentry
+  pending. Current game and recorder serialize native builds/GPU tests. Issue108
+  unchanged under milestones; no push. Retry purpose is exact source provenance.
+
+Checkpoint **5 октября 2026 года, 05:36 UTC** (native packed-float retry ENDED;
+source7f2a1c71114a6addff1ff063688146bb1ba8a65a, installed EXE1c5b8337 hash below):
+
+- Run051911 ends05:35:03UTC/C0000094 after Quality, shown489/compute626.
+  Medium206/211, Standard275 and Quality431 visually proved. Cross45s05:27:02,
+  StandardCross5s05:30:29, QualityCross5s05:34:32 recorded in interactions.json.
+  Main/title menu/game entry PENDING; background dark, no proven color correction.
+- Temporary hardware diagnostic watched wrong offset: owner+0x28 list node,
+  whereas configuration is descriptor+0x18 = owner+0x40. Three list-write events
+  are not original-header proof. Corrected prospective helper to100ce9ba90;
+  validated actual previous owner slot/vtable and field arithmetic. No core edits.
+- Bounded nearby capture now verifies owner parent100ce9b810/sourcekind4,
+  input3072B plus8192B surroundings and five config candidates. No RIFF/fmt
+  in input surroundings. Candidate metadata alone does not prove provenance.
+  First fault05:34:48.9078623UTC; unhandled exceptions forwarded; no fix yet.
+- Both game runner47320 and final recorder48304 ended0; prior replaced recorder
+ 41885 exit255. Game process gone/current CIM clean. Diagnostic source stack4096B
+  read crossed mapping boundary and failed; corrected prospective stack probe512B.
+- Completed color fix native synthetic RED/GREEN/affected GPUAV neighbors/CTest5/5
+  PASS, full suite not green. Audio still unchanged. Next exact configuration-
+  write source capture using corrected offset before independent audio regression.
+  Issue108 unchanged under menu/entry milestone rule; no push; game/cache/save preserved.
+
+Checkpoint **5 октября 2026 года, 05:34 UTC** (ACTIVE native packed-float retry
+PID21064/source7f2a1c71; installed1c5b8337 hash below):
+
+- Actual Medium206/211, Standard275 and Quality431 visually verified. Cross45s
+  at05:24:51 did not establish acceptance; later Cross45s05:27:02 reached Standard,
+  Cross5s05:30:29 reached Quality. UI white/orange becomes visible after fade;
+  background remains dark, no demonstrated runtime color correction/main menu.
+- Future prior-fault object slot verified with expected guest vtable but currently
+  empty (codec/instanceFFFFFFFF, configuration0), so no original metadata yet.
+  Temporary diagnostic hardware data watch now observes the next configuration
+  write:77 native threads armed05:33:35, task-owned recorder48304, bounded950s.
+  Core guest bytes unchanged; watches restored after source capture/on cleanup,
+  unrelated guest exceptions still forwarded. Not a production fix/regression.
+- Earlier read-only recorder41885/ownPID34368 stopped to replace debugger (exit255);
+  DebugSetProcessKillOnExit(false), emulator remained alive. New recorder includes
+  original fault capture. Game runner47320 remains bounded to05:49:11UTC.
+- Audio header/contract still unproved; issue108 unchanged, no push. Next confirm
+  Quality and inspect actual producer/header before designing independent RED.
+
+Checkpoint **5 октября 2026 года, 05:20 UTC** (ACTIVE native packed-float color
+retry PID21064; source7f2a1c71, installed EXE1c5b8337f77a61ce2895f182c86e6ce2658c6126765fea2bdb0cc8737d528bb5):
+
+- Completed packed-float fix committed separately; native emulator build/install
+  PASS, build and installed hashes match. Original CPU/GPU numeric tests, GPUAV
+  neighbors and affected CTest5/5 PASS before runtime; full suite not green.
+- Run `yotei-integrated-20261005-051911-packed-float-color-and-audio-provenance-capture-noval`
+  starts05:19:11UTC, bounded1800s, frame/compile watchdog480s,28GiB memory cap,
+  Vulkan validation OFF,480x270 diagnostic guest resolution, cache/save preserved.
+- Expanded read-only exception recorder prepared: real descriptor input bytes and
+  surrounding source buffer, bounded10s/32MiB nearby parent/config candidates;
+  list links correctly labelled, candidates are not original-header proof.
+- Actual color improvement/menu/game entry PENDING. Audio production unchanged.
+  Offline first512B of27189 sound files has no matching config/payload prefix;
+  this does not exclude later file regions/other banks. Do not speculate a fix.
+- Serialize build/GPU runs until game/recorder ends and own cleanup verified.
+  Issue108 unchanged under menu/entry milestone rule; linkPR497 once verified;
+  no push authorized.
+
 Checkpoint **5 октября 2026 года, 05:12 UTC** (packed-float native RED/GREEN
 and affected GPUAV neighbors PASS; installed game still567663de/ffc6bfdb):
 

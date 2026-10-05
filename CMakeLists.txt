@@ -427,6 +427,11 @@ if(KYTY_ENABLE_DLSS)
 	set_tests_properties(dlss_window_device dlss_window_device_off dlss_emulator_presentation PROPERTIES LABELS "gpu;dlss")
 endif()
 
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+	add_test(NAME frame_timing_analysis COMMAND ${Python3_EXECUTABLE} -B "${KYTY_TESTS_DIR}/FrameTimingAnalysisTests.py")
+endif()
+
 add_executable(scalar_provenance_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/ScalarProvenanceTests.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/host_gpu/hostMemory.cpp"

@@ -32,7 +32,8 @@ def summarize(path, start, end):
     if len(rows) < 2:
         raise ValueError(f"{path}: fewer than two samples in the selected interval")
     elapsed = (rows[-1]["elapsed_ms"] - rows[0]["elapsed_ms"]) / 1000
-    intervals = [row["frame_ms"] for row in rows if row["frame_ms"] > 0]
+    # The first selected row closes an interval that starts outside the window.
+    intervals = [row["frame_ms"] for row in rows[1:] if row["frame_ms"] > 0]
     present = [row["present_ms"] for row in rows]
     new_frames = sum(int(row["new_frame"]) for row in rows)
     return {

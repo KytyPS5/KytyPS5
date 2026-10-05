@@ -28802,6 +28802,64 @@ TestCase BufferLoadsGpuSelectedDescriptors(u32 width) {
   return test;
 }
 
+// GTA V (PPSA04263) ray tracing shaders read instance data with S_BUFFER_LOAD through a V# they
+// loaded from a table at a GPU-computed offset: the DWORD at (offset & ~3) + immediate, zero past
+// NUM_RECORDS bytes (times the stride of a structured buffer).
+TestCase ScalarLoadsGpuSelectedDescriptors() {
+  using O = ShaderOpcode;
+  constexpr uint64_t GuestBase = 0x0000000110000000ull;
+  struct ScalarCase {
+    u32 stride, records, immediate, soffset;
+    u32 expected_word; // UINT32_MAX: out of bounds, reads zero.
+  };
+  const ScalarCase cases[] = {
+      {0, 64, 8, 0, 2},
+      {0, 64, 60, 0, 15},
+      {0, 64, 64, 0, UINT32_MAX},
+      {0, 64, 4, 12, 4},
+      {0, 64, 0, 6, 1}, // The low two bits of the offset are ignored.
+      {16, 2, 28, 0, 7},
+      {16, 2, 32, 0, UINT32_MAX},
+  };
+  TestCase test;
+  test.name = "ScalarLoadsGpuSelectedDescriptors";
+  test.initial.resize(2048);
+  for (u32 i = 0; i < std::size(cases); ++i) {
+    const auto &input = cases[i];
+    const u32 data_offset = 4096 + i * 128;
+    // 120-byte table entries with a descriptor at byte 8.
+    const std::array<u32, 4> descriptor{static_cast<u32>(GuestBase + data_offset),
+                                        (input.stride << 16u) | 1u, input.records,
+                                        (20u << 12u) | 0x204u};
+    std::copy(descriptor.begin(), descriptor.end(), test.initial.begin() + 130 + i * 30);
+    for (u32 word = 0; word < 32; ++word) {
+      test.initial[data_offset / 4 + word] = i * 100 + word + 1;
+    }
+    // The table entry is selected through a GPU load and readfirstlane, not host constants.
+    test.initial[64 + i] = i;
+    AppendVMovU32(&test.code, 30, (64 + i) * 4);
+    AppendBufferLoadDword(&test.code, 0, 30);
+    test.code.push_back(EncodeVop1(0x02, 20, Vgpr(0)));
+    test.code.push_back(EncodeSop2(0x26, 20, 20, 255)); // s_mul_i32 s20, s20, 120
+    test.code.push_back(120);
+    test.code.push_back(EncodeSmem0(0x0a, 8, 0)); // s_buffer_load_dwordx4 s[8:11], s[0:3]
+    test.code.push_back(EncodeSmem1(520, 20));
+    AppendSMovLiteral(&test.code, 22, input.soffset);
+    test.code.push_back(EncodeSmem0(0x08, 16, 4)); // s_buffer_load_dword s16, s[8:11]
+    test.code.push_back(EncodeSmem1(input.immediate, 22));
+    AppendStoreSgpr(&test.code, 16, i);
+    test.expected.push_back(input.expected_word == UINT32_MAX ? 0u
+                                                               : i * 100 + input.expected_word + 1);
+  }
+  AppendEnd(&test.code);
+  test.bda_mappings = {{GuestBase, 0}};
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::BUFFER_LOAD_DWORD,
+                  O::V_READFIRSTLANE_B32, O::S_MUL_I32, O::S_BUFFER_LOAD_DWORDX4,
+                  O::S_BUFFER_LOAD_DWORD, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpConvertUToPtr", "PhysicalStorageBuffer"};
+  return test;
+}
+
 TestCase BufferLoadsGpuSelectedDescriptors() {
   return BufferLoadsGpuSelectedDescriptors(4u);
 }
@@ -36473,6 +36531,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(BufferLoadDwordGpuSelectedDescriptors);
   AddCase(BufferLoadDwordx3GpuSelectedDescriptors);
   AddCase(BufferLoadFormatXGpuSelectedDescriptors);
+  AddCase(ScalarLoadsGpuSelectedDescriptors);
   AddCase(BufferStoreDwordx4DropsOnlyOutOfBoundsTail);
   AddCase(BufferLoadFormatXyzwRejectsPartialRecord);
   AddCase(BufferStoreFormatXyzwDropsPartialRecord);
@@ -42061,6 +42120,7 @@ int main(int argc, char **argv) {
     RunCase(&vulkan, BufferLoadFormatXGpuSelectedDescriptors());
     RunCase(&vulkan, BufferLoadFormatXRejectsPartialRecord());
     RunCase(&vulkan, BufferLoadFormatXyRejectsPartialRecord());
+    RunCase(&vulkan, ScalarLoadsGpuSelectedDescriptors());
     RunCase(&vulkan, BufferLoadDwordx4SnapshotsOverlappingAddress());
     RunCase(&vulkan, BufferLoadDwordx4ZeroesOnlyOutOfBoundsTail());
     RunCase(&vulkan, BufferLoadDwordIdxenUsesDescriptorStride());

@@ -443,8 +443,10 @@ public:
 				}
 			}
 			if (plan.reads[0] != nullptr) {
-				for (uint32_t word = 0; word < plan.handle->NumArgs(); ++word)
-					m_program.memory_info[plan.memory[word]].planning_only = true;
+				for (uint32_t word = 0; word < plan.handle->NumArgs(); ++word) {
+					if (plan.memory[word] != KeptTableRead)
+						m_program.memory_info[plan.memory[word]].planning_only = true;
+				}
 			}
 		}
 		// Project descriptor-only SSA onto its key. Existing Phis preserve dominance;
@@ -940,6 +942,22 @@ private:
 		}
 		result = value.U32();
 		return true;
+	}
+
+	// The memory index of a T# read that is still emitted (see MatchDescriptorTable).
+	static constexpr uint32_t KeptTableRead = UINT32_MAX;
+
+	// Whether the read is a T# for an image instruction and otherwise only reaches Phis.
+	static bool ImageDescriptorUsesDirectly(const Inst& read) {
+		bool image = false;
+		for (const auto& use: read.Uses()) {
+			if (use.user->GetOpcode() == ValueOpcode::GetImageResource) {
+				image = true;
+			} else if (use.user->GetOpcode() != ValueOpcode::Phi) {
+				return false;
+			}
+		}
+		return image;
 	}
 
 	static bool UsesOnlyImageDescriptors(const Inst& value) {
@@ -1719,9 +1737,13 @@ private:
 			}
 			plan.split_offsets |= !indexed && offset != table_offset;
 			table_handle = current_handle;
+			// A register the shader also uses for other data before or after the T# merges with it
+			// in Phis of those other lifetimes (GTA V's ray tracing any-hit shaders): the read stays
+			// an ordinary scalar load for them and only its image uses take the table path.
+			const bool images_only = handle.NumArgs() != 8u || UsesOnlyImageDescriptors(*read);
 			if (handle.NumArgs() == 8u) {
 				if (memory->kind == ResourceKind::ScalarAddress)
-					plan.retain_reads |= !UsesOnlyImageDescriptors(*read);
+					plan.retain_reads |= !images_only;
 			} else if (std::ranges::any_of(read->Uses(), [](const Use& use) {
 				return use.user->GetOpcode() != ValueOpcode::GetBufferResource ||
 				       std::ranges::any_of(use.user->Uses(), [](const Use& consumer) {
@@ -1730,7 +1752,7 @@ private:
 			    })) {
 				return false;
 			}
-			plan.memory[dword] = memory_index;
+			plan.memory[dword] = images_only ? memory_index : KeptTableRead;
 			plan.reads[dword] = read;
 		}
 
@@ -1801,7 +1823,8 @@ private:
 			    (key_memory == nullptr || key_memory->offset <= INT32_MAX) &&
 			    table_base <= UINT32_MAX && (table_base & 31u) == 0u && address != nullptr &&
 			    std::ranges::all_of(plan.reads, [&](const Inst* read) {
-				    return read != nullptr && UsesOnlyImageDescriptors(*read);
+				    return read != nullptr && (UsesOnlyImageDescriptors(*read) ||
+				                               ImageDescriptorUsesDirectly(*read));
 			    }) &&
 			    std::ranges::all_of(address->Uses(), [&](const Use& use) {
 				    return std::ranges::find(plan.reads, use.user) != plan.reads.end();

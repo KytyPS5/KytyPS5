@@ -43,6 +43,7 @@ public:
 	bool EnsureGameDirectory();
 	void ScanGameDirectory();
 	void ViewTrophies();
+	void ViewTrophyOverview();
 
 signals:
 

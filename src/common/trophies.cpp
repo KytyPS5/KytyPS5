@@ -1,13 +1,15 @@
 #include "common/trophies.h"
 
+#include "common/dateTime.h"
 #include "common/file.h"
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <charconv>
-#include <span>
 #include <fmt/format.h>
 #include <nlohmann/json.hpp>
+#include <span>
 
 namespace Common::Trophies {
 namespace {
@@ -40,6 +42,47 @@ int ReadId(const Json& value) {
 	return error == std::errc {} && end == text.data() + text.size() && id >= 0 ? id : -1;
 }
 
+std::optional<uint64_t> ReadUnsigned(const Json& value) {
+	if (value.is_number_unsigned()) {
+		return value.get<uint64_t>();
+	}
+	if (value.is_number_integer()) {
+		const auto number = value.get<int64_t>();
+		return number >= 0 ? std::optional<uint64_t>(static_cast<uint64_t>(number)) : std::nullopt;
+	}
+	if (!value.is_string()) {
+		return std::nullopt;
+	}
+	const auto& text        = value.get_ref<const std::string&>();
+	uint64_t    number      = 0;
+	const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), number);
+	return error == std::errc {} && end == text.data() + text.size()
+	           ? std::optional<uint64_t>(number)
+	           : std::nullopt;
+}
+
+std::set<std::string> Words(std::string_view text) {
+	static const std::set<std::string_view> ignored {"a",    "an", "and", "at", "by",  "for",
+	                                                 "from", "in", "of",  "on", "the", "to"};
+	std::set<std::string>                   words;
+	std::string                             word;
+	for (const auto character: text) {
+		const auto value = static_cast<unsigned char>(character);
+		if (std::isalnum(value) != 0) {
+			word.push_back(static_cast<char>(std::tolower(value)));
+		} else if (!word.empty()) {
+			if (word.size() > 1 && !ignored.contains(word)) {
+				words.insert(word);
+			}
+			word.clear();
+		}
+	}
+	if (word.size() > 1 && !ignored.contains(word)) {
+		words.insert(word);
+	}
+	return words;
+}
+
 Json ReadJson(const Files& files, std::string_view name) {
 	const auto entry = files.find(name);
 	if (entry == files.end()) {
@@ -48,19 +91,18 @@ Json ReadJson(const Files& files, std::string_view name) {
 	return Json::parse(entry->second.begin(), entry->second.end(), nullptr, false);
 }
 
-Package ParsePackage(std::span<const std::byte> data, int console_language) {
+bool ReadFiles(std::span<const std::byte> data, Files& files, uint64_t& size) {
 	if (data.size() < 0x40 || data.size() > MaxPackageSize ||
 	    ReadBigEndian(data.data(), 4) != 0xb228c60a || ReadBigEndian(data.data() + 4, 4) != 1) {
-		return {};
+		return false;
 	}
-	const auto size  = ReadBigEndian(data.data() + 8, 8);
+	size             = ReadBigEndian(data.data() + 8, 8);
 	const auto count = ReadBigEndian(data.data() + 0x10, 4);
 	const auto toc   = ReadBigEndian(data.data() + 0x14, 4);
 	if (size < 0x40 || size > data.size() || count > 4096 || toc > size ||
 	    0x20 + count * 0x40 > size - toc) {
-		return {};
+		return false;
 	}
-	Files files;
 	for (uint64_t i = 0; i < count; ++i) {
 		const auto*            entry = data.data() + toc + 0x20 + i * 0x40;
 		const auto*            name  = reinterpret_cast<const char*>(entry);
@@ -68,9 +110,18 @@ Package ParsePackage(std::span<const std::byte> data, int console_language) {
 		const auto             offset = ReadBigEndian(entry + 0x20, 8);
 		const auto             length = ReadBigEndian(entry + 0x28, 8);
 		if (offset > size || length > size - offset) {
-			return {};
+			return false;
 		}
 		files.emplace(filename, data.subspan(offset, length));
+	}
+	return true;
+}
+
+Package ParsePackage(std::span<const std::byte> data, int console_language) {
+	Files    files;
+	uint64_t size = 0;
+	if (!ReadFiles(data, files, size)) {
+		return {};
 	}
 	const auto conf = ReadJson(files, "tropconf.json");
 	if (!conf.is_object() || !conf.contains("trophies") || !conf["trophies"].is_array() ||
@@ -129,19 +180,23 @@ Package ParsePackage(std::span<const std::byte> data, int console_language) {
 		trophy.has_reward = definition.contains("hasReward") && definition["hasReward"] == true;
 		if (definition.contains("unlockCondition")) {
 			const auto& condition = definition["unlockCondition"];
-			if (condition.is_object() && condition.contains("progressive") &&
-			    condition["progressive"] == true) {
-				if (!condition.contains("targetValue") || !condition["targetValue"].is_string()) {
+			if (condition.is_object()) {
+				trophy.progressive =
+				    condition.contains("progressive") && condition["progressive"] == true;
+				if (condition.contains("udsStatId")) {
+					trophy.uds_stat_id = ReadUnsigned(condition["udsStatId"]);
+					if (!trophy.uds_stat_id) {
+						return {};
+					}
+				}
+				if (condition.contains("targetValue")) {
+					trophy.target = ReadUnsigned(condition["targetValue"]);
+					if (!trophy.target) {
+						return {};
+					}
+				} else if (trophy.uds_stat_id) {
 					return {};
 				}
-				const auto& value  = condition["targetValue"].get_ref<const std::string&>();
-				uint64_t    target = 0;
-				const auto [end, error] =
-				    std::from_chars(value.data(), value.data() + value.size(), target);
-				if (error != std::errc {} || end != value.data() + value.size()) {
-					return {};
-				}
-				trophy.target = target;
 			}
 		}
 		const auto icon = files.find(fmt::format("trop{:04}.png", trophy.id));
@@ -210,11 +265,11 @@ std::filesystem::path UnlocksPath(const std::filesystem::path& root, std::string
 	    })) {
 		return {};
 	}
-	return root / "_SaveData" / title_id /
+	return root / "_Trophies" / title_id /
 	       fmt::format("trophies_{}_{}.json", user_id, service_label);
 }
 
-std::set<int> LoadUnlocks(const std::filesystem::path& path) {
+UnlockData LoadUnlockData(const std::filesystem::path& path) {
 	File file(path, File::Mode::Read);
 	if (file.IsInvalid() || file.Size() > MaxUnlocksSize) {
 		return {};
@@ -225,21 +280,35 @@ std::set<int> LoadUnlocks(const std::filesystem::path& path) {
 	    !json["unlockedTrophies"].is_array()) {
 		return {};
 	}
-	std::set<int> unlocked;
+	UnlockData unlocks;
 	for (const auto& value: json["unlockedTrophies"]) {
 		const auto id = ReadId(value);
 		if (id >= 0) {
-			unlocked.insert(id);
+			unlocks.unlocked.insert(id);
 		}
 	}
-	return unlocked;
+	if (json.contains("unlockedAt") && json["unlockedAt"].is_object()) {
+		for (auto it = json["unlockedAt"].begin(); it != json["unlockedAt"].end(); ++it) {
+			const auto id = ReadId(Json(it.key()));
+			if (id >= 0 && unlocks.unlocked.contains(id) && it.value().is_string()) {
+				unlocks.dates.emplace(id, it.value().get<std::string>());
+			}
+		}
+	}
+	return unlocks;
 }
 
-bool SaveUnlocks(const std::filesystem::path& path, const std::set<int>& unlocked) {
+bool SaveUnlockData(const std::filesystem::path& path, const UnlockData& unlocks) {
 	if (path.empty() || !File::CreateDirectories(path.parent_path())) {
 		return false;
 	}
-	const auto text      = Json {{"unlockedTrophies", unlocked}}.dump();
+	Json dates = Json::object();
+	for (const auto& [id, date]: unlocks.dates) {
+		if (unlocks.unlocked.contains(id)) {
+			dates[std::to_string(id)] = date;
+		}
+	}
+	const auto text = Json {{"unlockedTrophies", unlocks.unlocked}, {"unlockedAt", dates}}.dump();
 	auto       temporary = path;
 	temporary += ".tmp";
 	File file;
@@ -250,15 +319,99 @@ bool SaveUnlocks(const std::filesystem::path& path, const std::set<int>& unlocke
 	file.Write(text.data(), static_cast<uint32_t>(text.size()), &written);
 	const bool complete = written == text.size() && file.Flush();
 	file.Close();
-	std::error_code error;
-	if (complete) {
-		std::filesystem::rename(temporary, path, error);
-		if (!error) {
-			return true;
-		}
+	if (complete && File::RenameFile(temporary, path)) {
+		return true;
 	}
+	std::error_code error;
 	std::filesystem::remove(temporary, error);
 	return false;
+}
+
+std::map<std::string, std::set<uint64_t>> ParseUdsEventStats(std::span<const std::byte> data) {
+	Files    files;
+	uint64_t size = 0;
+	if (!ReadFiles(data, files, size)) {
+		return {};
+	}
+	const auto rules = ReadJson(files, "stats_extraction.json");
+	if (!rules.is_object() || !rules.contains("statsExtractionRuleArray") || !rules["statsExtractionRuleArray"].is_array()) {
+		return {};
+	}
+	std::map<std::string, std::set<uint64_t>> events;
+	for (const auto& rule: rules["statsExtractionRuleArray"]) {
+		if (!rule.is_object() || !rule.contains("condition") || !rule.contains("action") ||
+		    !rule["condition"].is_object() || !rule["action"].is_object() ||
+		    !rule["condition"].contains("eventName") ||
+		    !rule["condition"]["eventName"].is_string() || !rule["action"].contains("output") ||
+		    !rule["action"]["output"].is_object() ||
+		    !rule["action"]["output"].contains("statId")) {
+			continue;
+		}
+		if (const auto stat = ReadUnsigned(rule["action"]["output"]["statId"])) {
+			events[rule["condition"]["eventName"].get<std::string>()].insert(*stat);
+		}
+	}
+	return events;
+}
+
+std::map<std::string, std::set<uint64_t>> LoadUdsEventStats(const std::filesystem::path& path) {
+	File file(path, File::Mode::Read);
+	if (file.IsInvalid() || file.Size() > MaxPackageSize) {
+		return {};
+	}
+	return ParseUdsEventStats(file.ReadWholeBuffer());
+}
+
+std::filesystem::path UdsPackagePath(uint32_t service_label) {
+	return std::filesystem::path("sce_sys/uds") / fmt::format("uds{:02}.ucp", service_label);
+}
+
+std::vector<int> FindUdsTrophies(const Package& package, std::string_view event_name,
+                                 uint64_t counter) {
+	const auto stat = package.event_stats.find(std::string(event_name));
+	if (stat == package.event_stats.end()) {
+		const auto fallback = FindUdsTrophy(package, event_name, counter);
+		return fallback ? std::vector<int> {*fallback} : std::vector<int> {};
+	}
+	std::vector<int> ids;
+	for (const auto& [id, trophy]: package.trophies) {
+		if (trophy.uds_stat_id && stat->second.contains(*trophy.uds_stat_id) && trophy.target && counter >= *trophy.target) {
+			ids.push_back(id);
+		}
+	}
+	return ids;
+}
+
+std::optional<int> FindUdsTrophy(const Package& package, std::string_view event_name,
+                                 uint64_t counter) {
+	const auto event_words = Words(event_name);
+	if (event_words.size() < 2) {
+		return std::nullopt;
+	}
+	std::optional<int> match;
+	size_t             best_score = 0;
+	bool               ambiguous  = false;
+	for (const auto& [id, trophy]: package.trophies) {
+		if (!trophy.uds_stat_id || !trophy.target || counter < *trophy.target) {
+			continue;
+		}
+		const auto trophy_words = Words(trophy.name + " " + trophy.description);
+		const auto score        = static_cast<size_t>(
+		    std::count_if(event_words.begin(), event_words.end(),
+		                  [&](const auto& word) { return trophy_words.contains(word); }));
+		const auto minimum_score = std::max<size_t>(2, (event_words.size() * 2 + 2) / 3);
+		if (score < minimum_score) {
+			continue;
+		}
+		if (score > best_score) {
+			match      = id;
+			best_score = score;
+			ambiguous  = false;
+		} else if (score == best_score) {
+			ambiguous = true;
+		}
+	}
+	return ambiguous ? std::nullopt : match;
 }
 
 } // namespace Common::Trophies

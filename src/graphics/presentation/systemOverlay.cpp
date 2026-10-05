@@ -1100,56 +1100,68 @@ struct SystemOverlay::Impl {
 		                        static_cast<float>(frame_extent.height) / 1080.0f),
 		               0.65f, 1.25f);
 		const float width = std::max(
-		    0.0f, std::min(440.0f * screen_scale, static_cast<float>(frame_extent.width) - 32.0f));
+		    0.0f, std::min(520.0f * screen_scale, static_cast<float>(frame_extent.width) - 32.0f));
 		const float  height   = 104.0f * screen_scale;
+		const float  rounding = 14.0f * screen_scale;
 		const float  fade_in  = std::clamp(age / 0.22f, 0.0f, 1.0f);
 		const float  fade_out = std::clamp((TOAST_LIFETIME - age) / 0.4f, 0.0f, 1.0f);
 		const float  alpha    = std::min(fade_in, fade_out);
 		const float  slide    = (1.0f - fade_in) * (width + 24.0f);
-		const ImVec2 top_left {static_cast<float>(frame_extent.width) - 24.0f - width + slide,
+		const ImVec2 top_left {static_cast<float>(frame_extent.width) - 32.0f - width + slide,
 		                       32.0f};
 		const ImVec2 bottom_right {top_left.x + width, top_left.y + height};
 		auto*        draw = ImGui::GetForegroundDrawList();
-		draw->AddRectFilled({top_left.x + 5.0f, top_left.y + 6.0f},
-		                    {bottom_right.x + 5.0f, bottom_right.y + 6.0f},
-		                    IM_COL32(0, 0, 0, static_cast<int>(95.0f * alpha)), 10.0f);
-		draw->AddRectFilled(top_left, bottom_right,
-		                    IM_COL32(18, 21, 29, static_cast<int>(242.0f * alpha)), 10.0f);
-		draw->AddRect(top_left, bottom_right,
-		              IM_COL32(190, 154, 78, static_cast<int>(200.0f * alpha)), 10.0f,
-		              ImDrawFlags_RoundCornersAll, 1.5f);
+		const auto   fade = [alpha](int r, int g, int b, int a) {
+            return IM_COL32(r, g, b, static_cast<int>(static_cast<float>(a) * alpha));
+		};
+		draw->AddRectFilled({top_left.x + 3.0f, top_left.y + 5.0f},
+		                    {bottom_right.x + 3.0f, bottom_right.y + 5.0f}, fade(0, 0, 0, 90),
+		                    rounding);
+		draw->AddRectFilled(top_left, bottom_right, fade(24, 26, 32, 235), rounding);
+		draw->AddRect(top_left, bottom_right, fade(255, 255, 255, 28), rounding,
+		              ImDrawFlags_RoundCornersAll, 1.0f);
 
+		const float pad       = 10.0f * screen_scale;
+		const float icon_size = height - 2.0f * pad;
+		float       text_left = top_left.x + 20.0f * screen_scale;
 		if (trophy_notification_image != nullptr) {
-			constexpr float ICON_SIZE = 88.0f;
-			const ImVec2    icon_min {top_left.x + 8.0f * screen_scale,
-			                          top_left.y + (height - ICON_SIZE * screen_scale) * 0.5f};
-			const ImVec2    icon_max {icon_min.x + ICON_SIZE * screen_scale,
-			                          icon_min.y + ICON_SIZE * screen_scale};
-			draw->AddImage(trophy_notification_image->GetTexRef(), icon_min, icon_max, {0, 0},
-			               {1, 1}, IM_COL32(255, 255, 255, static_cast<int>(255.0f * alpha)));
+			const ImVec2 icon_min {top_left.x + pad, top_left.y + pad};
+			const ImVec2 icon_max {icon_min.x + icon_size, icon_min.y + icon_size};
+			draw->AddImageRounded(trophy_notification_image->GetTexRef(), icon_min, icon_max,
+			                      {0, 0}, {1, 1}, fade(255, 255, 255, 255), 8.0f * screen_scale);
+			draw->AddRect(icon_min, icon_max, fade(255, 255, 255, 40), 8.0f * screen_scale,
+			              ImDrawFlags_RoundCornersAll, 1.0f);
+			text_left = icon_max.x + 18.0f * screen_scale;
 		}
 
-		const ImVec2 text_position {top_left.x +
-		                                (trophy_notification_image ? 112.0f : 18.0f) * screen_scale,
-		                            top_left.y + 18.0f * screen_scale};
-		draw->PushClipRect(top_left, {bottom_right.x - 12.0f * screen_scale, bottom_right.y}, true);
-		draw->AddText(nullptr, 13.0f * screen_scale, text_position,
-		              IM_COL32(232, 203, 139, static_cast<int>(255.0f * alpha)), "Trophy earned");
-		draw->AddText(nullptr, 21.0f * screen_scale,
-		              {text_position.x, text_position.y + 22.0f * screen_scale},
-		              IM_COL32(255, 255, 255, static_cast<int>(255.0f * alpha)),
-		              trophy_notification->name.c_str());
-		constexpr std::array GRADE_LABELS {"Platinum", "Gold", "Silver", "Bronze"};
-		constexpr std::array GRADE_COLORS {
-		    IM_COL32(161, 225, 245, 255), IM_COL32(255, 207, 82, 255), IM_COL32(211, 220, 232, 255),
-		    IM_COL32(211, 142, 91, 255)};
-		const int grade = trophy_notification->grade;
-		if (grade > 0 && grade <= static_cast<int>(GRADE_LABELS.size())) {
-			draw->AddText(nullptr, 13.0f * screen_scale,
-			              {text_position.x, text_position.y + 50.0f * screen_scale},
-			              ImGui::GetColorU32(GRADE_COLORS[grade - 1], alpha),
-			              GRADE_LABELS[grade - 1]);
+		constexpr std::array GRADE_COLORS {IM_COL32(161, 225, 245, 255), IM_COL32(255, 207, 82, 255),
+		                                   IM_COL32(211, 220, 232, 255),
+		                                   IM_COL32(211, 142, 91, 255)};
+		const int            grade     = trophy_notification->grade;
+		const float          title_y   = top_left.y + height * 0.5f - 25.0f * screen_scale;
+		float                title_x   = text_left;
+		if (grade > 0 && grade <= static_cast<int>(GRADE_COLORS.size())) {
+			// Small cup glyph tinted with the trophy grade.
+			const ImU32 cup = ImGui::GetColorU32(GRADE_COLORS[grade - 1], alpha);
+			const float u   = screen_scale;
+			const float cx  = text_left + 9.0f * u;
+			const float cy  = title_y + 15.0f * u;
+			draw->AddRectFilled({cx - 8.0f * u, cy - 11.0f * u}, {cx + 8.0f * u, cy + 2.0f * u},
+			                    cup, 2.0f * u, ImDrawFlags_RoundCornersBottom);
+			draw->AddRect({cx - 11.0f * u, cy - 9.0f * u}, {cx - 6.0f * u, cy - 3.0f * u}, cup,
+			              2.0f * u, ImDrawFlags_RoundCornersLeft, 1.8f * u);
+			draw->AddRect({cx + 6.0f * u, cy - 9.0f * u}, {cx + 11.0f * u, cy - 3.0f * u}, cup,
+			              2.0f * u, ImDrawFlags_RoundCornersRight, 1.8f * u);
+			draw->AddRectFilled({cx - 1.5f * u, cy + 2.0f * u}, {cx + 1.5f * u, cy + 7.0f * u}, cup);
+			draw->AddRectFilled({cx - 5.0f * u, cy + 7.0f * u}, {cx + 5.0f * u, cy + 10.0f * u}, cup,
+			                    1.5f * u);
+			title_x += 30.0f * u;
 		}
+		draw->PushClipRect(top_left, {bottom_right.x - 16.0f * screen_scale, bottom_right.y}, true);
+		draw->AddText(nullptr, 26.0f * screen_scale, {title_x, title_y},
+		              fade(255, 255, 255, 255), trophy_notification->name.c_str());
+		draw->AddText(nullptr, 20.0f * screen_scale, {text_left, title_y + 38.0f * screen_scale},
+		              fade(176, 180, 192, 255), "Trophy earned!");
 		draw->PopClipRect();
 	}
 

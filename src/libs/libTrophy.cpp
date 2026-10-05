@@ -1,4 +1,6 @@
+#include "common/dateTime.h"
 #include "common/emulatorConfig.h"
+#include "common/file.h"
 #include "common/trophies.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "kernel/fileSystem.h"
@@ -101,10 +103,11 @@ static_assert(sizeof(NpTrophy2Data) == 32);
 
 namespace Trophies = Common::Trophies;
 using TrophyKey    = std::pair<int, uint32_t>;
+using PackageKey   = std::pair<std::string, uint32_t>;
 
 struct TrophyState {
 	const Trophies::Package* package = nullptr;
-	std::set<int>            unlocked;
+	Trophies::UnlockData     unlocks;
 	std::filesystem::path    path;
 };
 
@@ -113,11 +116,11 @@ struct TrophyContext {
 	TrophyState* state = nullptr;
 };
 
-static std::mutex                            g_trophy_mutex;
-static std::map<uint32_t, Trophies::Package> g_packages;
-static std::map<TrophyKey, TrophyState>      g_states;
-static std::map<int, TrophyContext>          g_contexts;
-static int                                   g_next_context = 1;
+static std::mutex                              g_trophy_mutex;
+static std::map<PackageKey, Trophies::Package> g_packages;
+static std::map<TrophyKey, TrophyState>        g_states;
+static std::map<int, TrophyContext>            g_contexts;
+static int                                     g_next_context = 1;
 
 constexpr int NP_TROPHY2_ERROR_INVALID_ARGUMENT  = static_cast<int>(0x80553904);
 constexpr int NP_TROPHY2_ERROR_INVALID_CONTEXT   = static_cast<int>(0x80553909);
@@ -130,20 +133,34 @@ static TrophyState* LoadTrophyState(TrophyKey key) {
 	if (const auto it = g_states.find(key); it != g_states.end()) {
 		return &it->second;
 	}
-	auto& package = g_packages[key.second];
+	std::string title_id;
+	Loader::SystemContentParamSfoGetString("TITLE_ID", &title_id);
+	auto& package = g_packages[{title_id, key.second}];
 	if (package.trophies.empty()) {
 		const auto filename = "/app0/" + Trophies::PackagePath(key.second).generic_string();
 		package = Trophies::LoadPackage(LibKernel::FileSystem::GetRealFilename(filename),
 		                                Config::GetConsoleLanguage());
 		if (package.trophies.empty()) {
+			LOGF("[Trophy] could not load trophy package %s for %s\n", filename.c_str(),
+			     title_id.c_str());
 			return nullptr;
 		}
+		LOGF("[Trophy] loaded %zu trophy definitions for %s (service %u)\n",
+		     package.trophies.size(), title_id.c_str(), key.second);
+		const auto uds_filename = "/app0/" + Trophies::UdsPackagePath(key.second).generic_string();
+		package.event_stats     = Trophies::LoadUdsEventStats(
+            LibKernel::FileSystem::GetRealFilename(uds_filename));
+		if (package.event_stats.empty()) {
+			LOGF("[Trophy] no usable UDS event mapping in %s; using name matching\n",
+			     uds_filename.c_str());
+		} else {
+			LOGF("[Trophy] loaded %zu UDS event mappings from %s\n", package.event_stats.size(),
+			     uds_filename.c_str());
+		}
 	}
-	std::string title_id;
-	Loader::SystemContentParamSfoGetString("TITLE_ID", &title_id);
 	auto path     = Trophies::UnlocksPath({}, title_id, key.first, key.second);
-	auto unlocked = Trophies::LoadUnlocks(path);
-	return &g_states.emplace(key, TrophyState {&package, std::move(unlocked), std::move(path)})
+	auto unlocks = Trophies::LoadUnlockData(path);
+	return &g_states.emplace(key, TrophyState {&package, std::move(unlocks), std::move(path)})
 	            .first->second;
 }
 
@@ -165,7 +182,7 @@ static void FillTrophyInfo(const TrophyState& state, const Trophies::Trophy& tro
 		details->group_id     = trophy.group_id;
 		details->hidden       = trophy.hidden;
 		details->has_reward   = trophy.has_reward;
-		if (trophy.target) {
+		if (trophy.progressive && trophy.target) {
 			details->target.type  = 1;
 			details->target.value = *trophy.target;
 		}
@@ -177,8 +194,8 @@ static void FillTrophyInfo(const TrophyState& state, const Trophies::Trophy& tro
 	if (data != nullptr) {
 		*data           = {};
 		data->trophy_id = trophy.id;
-		data->unlocked  = state.unlocked.contains(trophy.id);
-		if (trophy.target) {
+		data->unlocked  = state.unlocks.unlocked.contains(trophy.id);
+		if (trophy.progressive && trophy.target) {
 			data->progress.type  = 1;
 			data->progress.value = data->unlocked ? *trophy.target : 0;
 		}
@@ -194,7 +211,7 @@ static void FillTrophyCounts(const TrophyState& state, int group, Details* detai
 			continue;
 		}
 		++total[trophy.grade];
-		if (state.unlocked.contains(id)) {
+		if (state.unlocks.unlocked.contains(id)) {
 			++unlocked[trophy.grade];
 		}
 	}
@@ -231,11 +248,20 @@ static void FillGroupInfo(const TrophyState& state, int group_id, const std::str
 	}
 }
 
-static void RecordTrophyUnlock(TrophyState& state, int trophy_id) {
+static void RecordTrophyUnlock(TrophyState& state, int trophy_id, bool from_counter = false) {
 	const auto found = state.package->trophies.find(trophy_id);
-	if (found == state.package->trophies.end() || found->second.grade == 1 ||
-	    found->second.target || !state.unlocked.insert(trophy_id).second) {
+	if (found == state.package->trophies.end()) {
+		LOGF("[Trophy] ignored unknown trophy ID %d\n", trophy_id);
 		return;
+	}
+	if ((!from_counter && (found->second.grade == 1 || found->second.progressive)) ||
+	    !state.unlocks.unlocked.insert(trophy_id).second) {
+		LOGF("[Trophy] trophy %d already unlocked or requires counter progress\n", trophy_id);
+		return;
+	}
+	const auto date = Common::DateTime::FromSystem().ToString("YYYY-MM-DD HH24:MI:SS");
+	if (!date.empty()) {
+		state.unlocks.dates.emplace(trophy_id, date);
 	}
 	std::vector<int> earned {trophy_id};
 	const auto       platinum_id = found->second.platinum_id;
@@ -243,19 +269,26 @@ static void RecordTrophyUnlock(TrophyState& state, int trophy_id) {
 	    std::all_of(state.package->trophies.begin(), state.package->trophies.end(),
 	                [&](const auto& entry) {
 		                return entry.second.platinum_id != platinum_id ||
-		                       state.unlocked.contains(entry.first);
+		                       state.unlocks.unlocked.contains(entry.first);
 	                }) &&
-	    state.unlocked.insert(platinum_id).second) {
+	    state.unlocks.unlocked.insert(platinum_id).second) {
+		if (!date.empty()) {
+			state.unlocks.dates.emplace(platinum_id, date);
+		}
 		earned.push_back(platinum_id);
 	}
-	if (!Trophies::SaveUnlocks(state.path, state.unlocked)) {
+	if (!Trophies::SaveUnlockData(state.path, state.unlocks)) {
 		LOGF("[Trophy] could not save unlocks to %s\n", state.path.string().c_str());
+	} else {
+		LOGF("[Trophy] recorded unlock %d: %s\n", trophy_id, found->second.name.c_str());
 	}
 	if (Config::TrophyEnabled()) {
 		for (const auto id: earned) {
 			const auto& trophy = state.package->trophies.at(id);
 			Graphics::NotifyTrophyUnlocked(trophy.name, trophy.grade, trophy.icon_png);
 		}
+	} else {
+		LOGF("[Trophy] notification disabled by configuration\n");
 	}
 }
 
@@ -541,12 +574,41 @@ struct NpUniversalDataSystemMemoryStat {
 };
 
 struct NpUniversalDataSystemEventPropertyObject {
-	std::optional<int32_t> trophy_id;
+	std::optional<int32_t>  trophy_id;
+	std::optional<uint64_t> counter;
+	std::optional<uint64_t> counter_base;
 
 	void SetTrophyId(const char* key, std::optional<int32_t> value) {
 		if (std::strcmp(key, "_trophy_id") == 0) {
 			trophy_id = value;
 		}
+	}
+
+	void SetCounter(const char* key, std::optional<uint64_t> value) {
+		if (std::strcmp(key, "counter") == 0) {
+			counter = value;
+		} else if (std::strcmp(key, "counterBase") == 0) {
+			counter_base = value;
+		}
+	}
+
+	void SetInteger(const char* key, int64_t value) {
+		SetTrophyId(key, value >= 0 && value <= INT32_MAX
+		                     ? std::optional<int32_t>(static_cast<int32_t>(value))
+		                     : std::nullopt);
+		SetCounter(key, value >= 0 ? std::optional<uint64_t>(static_cast<uint64_t>(value))
+		                           : std::nullopt);
+	}
+
+	void SetUnsigned(const char* key, uint64_t value) {
+		SetTrophyId(key, value <= INT32_MAX ? std::optional<int32_t>(static_cast<int32_t>(value))
+		                                    : std::nullopt);
+		SetCounter(key, value);
+	}
+
+	void ClearInteger(const char* key) {
+		SetTrophyId(key, std::nullopt);
+		SetCounter(key, std::nullopt);
 	}
 };
 
@@ -647,6 +709,7 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemCreateEvent(
 	}
 	*new_event = new NpUniversalDataSystemEvent {
 	    event_name, prop != nullptr ? *prop : NpUniversalDataSystemEventPropertyObject {}};
+	LOGF("[UDS] created event: %s\n", event_name);
 	if (prop_ptr != nullptr) {
 		*prop_ptr = &(*new_event)->properties;
 	}
@@ -668,6 +731,11 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemPostEvent(int context, int handle,
 		return static_cast<int>(0x80553120); // NOT_REGISTERED
 	}
 	const auto& uds_event = *static_cast<const NpUniversalDataSystemEvent*>(event);
+	LOGF("[UDS] posted event: %s (counter=%s%" PRIu64 ", counterBase=%s%" PRIu64 ")\n",
+	     uds_event.name.c_str(), uds_event.properties.counter ? "" : "<unset>",
+	     uds_event.properties.counter.value_or(0),
+	     uds_event.properties.counter_base ? "" : "<unset>",
+	     uds_event.properties.counter_base.value_or(0));
 	if (uds_event.name == "_UnlockTrophy") {
 		const auto trophy_id = uds_event.properties.trophy_id;
 		if (!trophy_id || *trophy_id < 0) {
@@ -675,6 +743,23 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemPostEvent(int context, int handle,
 		}
 		if (auto* state = LibNpTrophy2::LoadTrophyState(it->second.key); state != nullptr) {
 			LibNpTrophy2::RecordTrophyUnlock(*state, *trophy_id);
+		}
+	} else if (uds_event.properties.counter) {
+		if (auto* state = LibNpTrophy2::LoadTrophyState(it->second.key); state != nullptr) {
+			const auto base = uds_event.properties.counter_base.value_or(0);
+			const auto count =
+			    *uds_event.properties.counter > UINT64_MAX - base
+			        ? UINT64_MAX
+			        : *uds_event.properties.counter + base;
+			const auto ids =
+			    LibNpTrophy2::Trophies::FindUdsTrophies(*state->package, uds_event.name, count);
+			for (const auto trophy_id: ids) {
+				LibNpTrophy2::RecordTrophyUnlock(*state, trophy_id, true);
+			}
+			if (ids.empty()) {
+				LOGF("[Trophy] no trophy match for UDS event %s at counter %" PRIu64 "\n",
+				     uds_event.name.c_str(), count);
+			}
 		}
 	}
 	return 0;
@@ -809,7 +894,7 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyObjectSetString(
 	if (object == nullptr || key == nullptr || value == nullptr) {
 		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
 	}
-	object->SetTrophyId(key, std::nullopt);
+	object->ClearInteger(key);
 
 	return 0;
 }
@@ -826,7 +911,7 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyObjectSetInt32(
 	if (object == nullptr || key == nullptr) {
 		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
 	}
-	object->SetTrophyId(key, value);
+	object->SetInteger(key, value);
 
 	return 0;
 }
@@ -838,7 +923,7 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyObjectSetUInt32(
 	if (object == nullptr || key == nullptr) {
 		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
 	}
-	object->SetTrophyId(key, std::nullopt);
+	object->SetUnsigned(key, value);
 
 	LOGF("\t object = 0x%016" PRIx64 "\n"
 	     "\t key    = %s\n"
@@ -855,7 +940,7 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyObjectSetInt64(
 	if (object == nullptr || key == nullptr) {
 		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
 	}
-	object->SetTrophyId(key, std::nullopt);
+	object->SetInteger(key, value);
 
 	LOGF("\t object = 0x%016" PRIx64 "\n"
 	     "\t key    = %s\n"
@@ -872,7 +957,7 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyObjectSetUInt64(
 	if (object == nullptr || key == nullptr) {
 		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
 	}
-	object->SetTrophyId(key, std::nullopt);
+	object->SetUnsigned(key, value);
 
 	LOGF("\t object = 0x%016" PRIx64 "\n"
 	     "\t key    = %s\n"
@@ -889,7 +974,7 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyObjectSetFloat32(
 	if (object == nullptr || key == nullptr) {
 		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
 	}
-	object->SetTrophyId(key, std::nullopt);
+	object->ClearInteger(key);
 
 	LOGF("\t object = 0x%016" PRIx64 "\n"
 	     "\t key    = %s\n"
@@ -906,7 +991,7 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyObjectSetFloat64(
 	if (object == nullptr || key == nullptr) {
 		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
 	}
-	object->SetTrophyId(key, std::nullopt);
+	object->ClearInteger(key);
 
 	LOGF("\t object = 0x%016" PRIx64 "\n"
 	     "\t key    = %s\n"
@@ -923,7 +1008,7 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyObjectSetBool(
 	if (object == nullptr || key == nullptr) {
 		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
 	}
-	object->SetTrophyId(key, std::nullopt);
+	object->ClearInteger(key);
 
 	LOGF("\t object = 0x%016" PRIx64 "\n"
 	     "\t key    = %s\n"
@@ -941,7 +1026,7 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyObjectSetBinary(
 	if (object == nullptr || key == nullptr || (value == nullptr && value_size != 0)) {
 		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
 	}
-	object->SetTrophyId(key, std::nullopt);
+	object->ClearInteger(key);
 
 	LOGF("\t object     = 0x%016" PRIx64 "\n"
 	     "\t key        = %s\n"
@@ -962,7 +1047,7 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyObjectSetObject(
 	if (object == nullptr || key == nullptr) {
 		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
 	}
-	object->SetTrophyId(key, std::nullopt);
+	object->ClearInteger(key);
 
 	if (value_ptr != nullptr) {
 		*value_ptr =
@@ -996,7 +1081,7 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyObjectSetArray(
 	if (object == nullptr || key == nullptr) {
 		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
 	}
-	object->SetTrophyId(key, std::nullopt);
+	object->ClearInteger(key);
 
 	if (value_ptr != nullptr) {
 		*value_ptr = (value != nullptr ? const_cast<NpUniversalDataSystemEventPropertyArray*>(value)

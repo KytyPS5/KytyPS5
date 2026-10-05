@@ -457,7 +457,7 @@ void ValidateProgram(const Program& program, bool require_ssa) {
 				}
 				if (memory.kind == ResourceKind::IndirectBuffer &&
 				    !memory.SupportsIndirectBufferLoad(inst.GetOpcode())) {
-					return Fail("indirect buffer requires a raw DWORD x2/x3/x4 load");
+					return Fail("indirect buffer requires a raw DWORD x2/x3/x4 or unsigned 16-bit load");
 				}
 				const bool packed_d16 = memory.kind == ResourceKind::Buffer &&
 				                        memory.formatted && memory.data_bits == 16u &&

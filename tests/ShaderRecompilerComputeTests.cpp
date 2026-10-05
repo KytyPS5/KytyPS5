@@ -31752,6 +31752,88 @@ TestCase BufferLoadDwordx3GpuSelectedDescriptors() {
   return BufferLoadsGpuSelectedDescriptors(true);
 }
 
+TestCase BufferLoadUshortGpuSelectedDescriptors() {
+  using O = ShaderOpcode;
+  constexpr uint64_t GuestBase = 0x0000000110000000ull;
+  struct Row { u32 stride, records, mode, soffset, index, offset, expected;
+               bool swizzle = false, valid = true, active = true; };
+  const Row rows[] = {
+      {0, 8, 3, 0, 0, 0, 0x8001},
+      {0, 8, 3, 0, 0, 2, 0xaabb},
+      {0, 8, 3, 0, 0, 3, 0xdcaa}, // Cross a native DWORD, preserving two-byte payload.
+      {0, 8, 3, 0, 0, 6, 0x1234}, // Last complete halfword.
+      {0, 8, 3, 0, 0, 7, 0},
+      {0, 8, 3, 0, 0, 8, 0},
+      {8, 2, 0, 0, 1, 2, 0x7788},
+      {8, 1, 0, 0, 1, 0, 0},
+      {8, 2, 0, 0, 0, 8, 0},
+      {8, 2, 1, 0, 1, 6, 0xbbcc},
+      {8, 1, 1, 0, 1, 0, 0},
+      {8, 0, 2, 0, 0, 0, 0},
+      {8, 1, 2, 0, 1, 0, 0x5566},
+      {0, 10, 3, 2, 0, 6, 0x5566},
+      {0, 9, 3, 2, 0, 6, 0},
+      {0, 1, 3, 2, 0, 0, 0},
+      {8, 2, 0, 0, 1, 0, 0xfedc, true},
+      {8, 8, 3, 0, 1, 0, 0xfedc, true},
+      {0, 8, 3, 0, 0, 0, 0, false, false},
+      {0, 8, 3, 0, 0, 0, 0x13579bdf, false, true, false},
+  };
+  TestCase test;
+  test.name = "BufferLoadUshortGpuSelectedDescriptors";
+  test.initial.resize(2048);
+  test.initial[0] = 0xdeadbeefu;
+  test.initial[std::size(rows) + 1] = 0xcafef00du;
+  test.expected.push_back(0xdeadbeefu);
+  for (u32 i = 0; i < std::size(rows); ++i) {
+    const auto &row = rows[i];
+    const u32 data_offset = 4096 + i * 128;
+    const std::array<u32, 4> descriptor{
+        static_cast<u32>(GuestBase + data_offset),
+        (row.stride << 16u) | (row.swizzle ? 1u << 31u : 0u) | 1u,
+        row.records, (row.valid ? 0x5204u : 0x204u) | (row.mode << 28u)};
+    std::copy(descriptor.begin(), descriptor.end(), test.initial.begin() + 130 + i * 30);
+    const std::array<u32, 4> data{0xaabb8001u, 0x1234fedcu, 0x77885566u, 0xbbcc99aau};
+    std::copy(data.begin(), data.end(), test.initial.begin() + data_offset / 4);
+    const u32 selected = static_cast<u32>(std::size(rows)) - 1 - i;
+    test.initial[64 + i] = selected;
+    AppendVMovU32(&test.code, 30, (64 + i) * 4);
+    AppendBufferLoadDword(&test.code, 0, 30);
+    test.code.push_back(EncodeVop1(0x02, 20, Vgpr(0)));
+    test.code.push_back(EncodeSop2(0x26, 20, 20, 255));
+    test.code.push_back(120);
+    test.code.push_back(EncodeSmem0(0x0a, 8, 0));
+    test.code.push_back(EncodeSmem1(520, 20));
+    const auto &chosen = rows[selected];
+    AppendSMovLiteral(&test.code, 22, chosen.soffset);
+    AppendVMovU32(&test.code, 20, chosen.index);
+    AppendVMovU32(&test.code, 21, chosen.offset);
+    AppendVMovLiteral(&test.code, 2, 0x13579bdfu);
+    if (!chosen.active) {
+      AppendSMovLiteral(&test.code, 126, 0);
+      AppendSMovLiteral(&test.code, 127, 0);
+    }
+    test.code.push_back(EncodeMubuf0(0x0a, 0, true, true));
+    test.code.push_back(EncodeMubuf1(2, 2, 20, 22));
+    if (!chosen.active) {
+      // The harness dispatches one guest thread. Restore its original mask,
+      // rather than activating uninitialized lanes which race the output store.
+      AppendSMovLiteral(&test.code, 126, 1u);
+      AppendSMovLiteral(&test.code, 127, 0u);
+    }
+    AppendStoreVgpr(&test.code, 2, i + 1);
+    test.expected.push_back(chosen.expected);
+  }
+  test.expected.push_back(0xcafef00du);
+  AppendEnd(&test.code);
+  test.bda_mappings = {{GuestBase, 0}};
+  test.opcodes = {O::V_MOV_B32, O::S_MOV_B32, O::BUFFER_LOAD_DWORD,
+                  O::V_READFIRSTLANE_B32, O::S_MUL_I32, O::S_BUFFER_LOAD_DWORDX4,
+                  O::BUFFER_LOAD_USHORT, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.required_spirv = {"OpConvertUToPtr", "PhysicalStorageBuffer"};
+  return test;
+}
+
 TestCase BufferStoreDwordx4DropsOnlyOutOfBoundsTail() {
   using O = ShaderOpcode;
 
@@ -48533,6 +48615,11 @@ if (argc == 1) {
     return 0;
   }
 #endif
+  if (argc == 2 && std::strcmp(argv[1], "--indirect-ushort-only") == 0) {
+    VulkanHarness vulkan;
+    RunCase(&vulkan, BufferLoadUshortGpuSelectedDescriptors());
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--indirect-buffer-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, BufferLoadsGpuSelectedDescriptors());

@@ -8444,8 +8444,14 @@ void TestCleanScalarBufferOutOfBounds() {
 } // namespace
 
 void TestGpuSelectedRawBufferAdmission() {
-  struct Case { ValueOpcode opcode; uint32_t words; bool formatted; bool typed; bool admitted; };
-  for (const auto input : {Case{ValueOpcode::LoadBufferU32x2, 2u, false, false, true},
+  struct Case { ValueOpcode opcode; uint32_t words; bool formatted; bool typed; bool admitted;
+                uint32_t bits = 32; bool signed_data = false; };
+  for (const auto input : {Case{ValueOpcode::LoadBufferU16, 1u, false, false, true, 16u},
+                          Case{ValueOpcode::LoadBufferU16, 1u, true, false, false, 16u},
+                          Case{ValueOpcode::LoadBufferU16, 1u, false, true, false, 16u},
+                          Case{ValueOpcode::LoadBufferU16, 1u, false, false, false, 16u, true},
+                          Case{ValueOpcode::LoadBufferU8, 1u, false, false, false, 8u},
+                          Case{ValueOpcode::LoadBufferU32x2, 2u, false, false, true},
                           Case{ValueOpcode::LoadBufferU32x3, 3u, false, false, true},
                           Case{ValueOpcode::LoadBufferU32x4, 4u, false, false, true},
                           Case{ValueOpcode::LoadBufferU32, 1u, false, false, false},
@@ -8458,6 +8464,8 @@ void TestGpuSelectedRawBufferAdmission() {
     MemoryInfo memory;
     memory.kind = ResourceKind::Buffer;
     memory.data_dwords = input.words;
+    memory.data_bits = input.bits;
+    memory.data_signed = input.signed_data;
     memory.formatted = input.formatted;
     memory.typed = input.typed;
     const auto flags = fixture.AddMemory(memory, 0x40u);
@@ -8488,6 +8496,11 @@ void TestGpuSelectedRawBufferAdmission() {
 
 int main(int argc, char** argv) {
   try {
+    if (argc == 2 && std::strcmp(argv[1], "--gpu-selected-raw-buffer-only") == 0) {
+      TestGpuSelectedRawBufferAdmission();
+      std::cout << "KYTY_GPU_SELECTED_RAW_BUFFER_PASS\n";
+      return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--clean-scalar-buffer-oob-only") == 0) {
       TestCleanScalarBufferOutOfBounds();
       std::cout << "KYTY_CLEAN_SCALAR_BUFFER_OOB_PASS\n";

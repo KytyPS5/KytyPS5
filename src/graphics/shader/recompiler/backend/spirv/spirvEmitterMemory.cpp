@@ -1149,12 +1149,13 @@ uint32_t LoadIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_
 	const auto nonzero = [&](uint32_t value) {
 		return Binary(state, spv::OpINotEqual, TypeBool(state), value, ConstantU32(state, 0));
 	};
-	const auto has_dword = [&](uint32_t offset, uint32_t size) {
+	const auto payload_bytes = ctx.Memory(inst).data_bits / 8u;
+	const auto has_payload = [&](uint32_t offset, uint32_t size) {
 		return AndCondition(
 		    state,
-		    Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), size, ConstantU32(state, 4)),
+		    Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), size, ConstantU32(state, payload_bytes)),
 		    Binary(state, spv::OpULessThanEqual, TypeBool(state), offset,
-		           Binary(state, spv::OpISub, TypeU32(state), size, ConstantU32(state, 4))));
+		           Binary(state, spv::OpISub, TypeU32(state), size, ConstantU32(state, payload_bytes))));
 	};
 	const auto stride       = field(word1, 16, 14);
 	const auto swizzle      = AndCondition(state, nonzero(stride), nonzero(field(word1, 31, 1)));
@@ -1186,8 +1187,8 @@ uint32_t LoadIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_
 		const auto raw_bounds = AndCondition(
 		    state, scalar_in_bounds,
 		    Select(state, TypeBool(state), swizzle,
-		           AndCondition(state, raw_index_in_bounds, has_dword(address.offset, stride)),
-		           has_dword(address.offset, raw_records)));
+		           AndCondition(state, raw_index_in_bounds, has_payload(address.offset, stride)),
+		           has_payload(address.offset, raw_records)));
 		auto in_bounds =
 		    Select(state, TypeBool(state),
 		           Binary(state, spv::OpIEqual, TypeBool(state), mode, ConstantU32(state, 0)),
@@ -1202,9 +1203,10 @@ uint32_t LoadIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_
 		const auto guest =
 		    Binary(state, spv::OpIAdd, TypeScalarU64(state), base,
 		           Unary(state, spv::OpUConvert, TypeScalarU64(state), address.byte));
-		values[component] = LoadBda(ctx, guest, AndCondition(state, valid_format, in_bounds), 32u);
+		values[component] = LoadBda(ctx, guest, AndCondition(state, valid_format, in_bounds),
+		                            ctx.Memory(inst).data_bits);
 	}
-	return ConstructU32Composite(state, components, values);
+	return components == 1u ? values[0] : ConstructU32Composite(state, components, values);
 }
 
 uint32_t LoadWideBuffer(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t components) {
@@ -1668,7 +1670,11 @@ void EmitLoadMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto shared_components = IR::SharedComponentCount(op);
 	const auto address_info      = IR::AddressOpcodeInfoOf(op);
 	uint32_t   value;
-	if (buffer_components > 1u)
+	if (mem.kind == IR::ResourceKind::IndirectBuffer && buffer_components == 1u)
+		value = EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
+			return LoadIndirectBuffer(ctx, inst, 1u);
+		});
+	else if (buffer_components > 1u)
 		value = LoadWideBuffer(ctx, inst, buffer_components);
 	else if (shared_components > 1u)
 		value = LoadWideShared(ctx, inst, shared_components);
